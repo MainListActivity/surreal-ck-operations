@@ -32,15 +32,18 @@ import {
 import type { ClaimResult, CreateTask, PolicyPlanView, PolicySet, PolicyView, TaskView } from '../src/contracts.ts';
 
 const NS = 'sck_agent_company_test_effective_policy';
-const database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
-setDefaultTimeout(240_000);
-const credDir = mkdtempSync(join(tmpdir(), 'sck-effective-policy-'));
-const workforce = new Workforce(database, credDir);
-const enrollment = new LocalEnrollmentAdmin(database);
-const owner = new OwnerDesk(database);
-const projects = new ProjectStore(database.db);
-const core = new SurrealCompanyCore(database, { workforce });
+// The whole suite is gated like the other fork files: without a fork run there is no local
+// database, so the suite must build nothing at import time — reading loadDatabaseConfig() at
+// the module top pointed the gate's plain `bun test` at the product .env and died on the
+// non-local guard. The lazy holder defers both until the first gated hook runs.
+const forkEnv = process.env.RUN_SCK_CHANNEL_FORK_TESTS === '1' || process.env.RUN_SCK_WORKTREE_FORK_TESTS === '1';
+// Same gating shape as tests/deployment-source.fork.test.ts: without a fork run the cases
+// skip instead of touching any database. `beforeEach`/`afterAll` stay no-ops for that run.
+const fork = forkEnv ? test : test.skip;
+let database: CompanyDatabase, workforce: Workforce, enrollment: LocalEnrollmentAdmin, owner: OwnerDesk, projects: ProjectStore, core: SurrealCompanyCore;
 const tokens: Record<string, string> = {};
+let credDirHolder = '';
+setDefaultTimeout(240_000);
 
 const key = () => crypto.randomUUID();
 const PROJECT = 'policy-project';
@@ -49,6 +52,17 @@ let goalId = '';
 let otherGoalId = '';
 
 beforeAll(async () => {
+  // Without a fork run every case is skipped and this hook must stay inert: building the
+  // suite here would read the product .env and trip the non-local-database guard.
+  if (!forkEnv) return;
+  database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
+  const credDir = mkdtempSync(join(tmpdir(), 'sck-effective-policy-'));
+  credDirHolder = credDir;
+  workforce = new Workforce(database, credDir);
+  enrollment = new LocalEnrollmentAdmin(database);
+  owner = new OwnerDesk(database);
+  projects = new ProjectStore(database.db);
+  core = new SurrealCompanyCore(database, { workforce });
   await database.connect();
   await database.db.query(`DEFINE NAMESPACE IF NOT EXISTS ${NS};`);
   await database.db.use({ namespace: NS });
@@ -76,11 +90,13 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  if (!database) return;
   await database.close();
-  rmSync(credDir, { recursive: true, force: true });
+  rmSync(credDirHolder, { recursive: true, force: true });
 });
 
 beforeEach(async () => {
+  if (!forkEnv || !database) return;
   await database.db.query(`UPDATE task SET current_employee = NONE, lease_expires_at = NONE WHERE current_employee != NONE;
     UPDATE employee SET active_task = NONE WHERE active_task != NONE;`);
 });
@@ -115,11 +131,12 @@ const lanePolicy = (over: Partial<PolicySet> = {}) => set({
   payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code'], lanes: ['lane-a'] }, ...over });
 
 beforeEach(async () => {
+  if (!forkEnv || !database) return;
   // 每个用例从"没有生效策略"开始：清掉策略与 epoch，任务里的登记字段保留（它们本身是历史事实）。
   await database.db.query('DELETE policy; UPDATE company_meta:policy_epoch SET value = 0;');
 });
 
-test('AC04/AC01 bootstrap: migration 035 loads on an empty database and the policy table is additive', async () => {
+fork('AC04/AC01 bootstrap: migration 035 loads on an empty database and the policy table is additive', async () => {
   const [task] = await database.db.query<[{ fields?: Record<string, string> }]>('INFO FOR TABLE task;');
   expect(Object.keys(task?.fields ?? {})).toEqual(expect.arrayContaining([
     'policy_version', 'policy_hash', 'policy_contract', 'lease_policy_version', 'lease_policy_hash', 'policy_block_reason']));
@@ -134,7 +151,7 @@ test('AC04/AC01 bootstrap: migration 035 loads on an empty database and the poli
   expect((await core.getTask(tokens.gm, task0.id)).policyContract?.domains).toEqual([]);
 });
 
-test('AC01 register/supersede/history: A then an explicit B, and new actions only see B', async () => {
+fork('AC01 register/supersede/history: A then an explicit B, and new actions only see B', async () => {
   const a = await lanePolicy();
   expect(a.version).toBe(1);
   expect(a.status).toBe('active');
@@ -176,7 +193,7 @@ test('AC01 register/supersede/history: A then an explicit B, and new actions onl
   expect(reread.policyContract?.domains[0]?.payload).toMatchObject({ lanes: ['lane-a'] });
 });
 
-test('AC02 lane whitelist: a code task that declares no lane is refused, at creation and again at claim', async () => {
+fork('AC02 lane whitelist: a code task that declares no lane is refused, at creation and again at claim', async () => {
   // 复现复核发现的绕过：白名单生效时，不声明 lane 的 code 任务曾经照旧放行（判定只看自报字段）。
   // 三种"缺失"都必须失败关闭：没声明 lane、声明了 lane 但任务不在任何目标下、完全不声明意图。
   const policy = await lanePolicy();
@@ -252,7 +269,7 @@ test('AC02 lane whitelist: a code task that declares no lane is refused, at crea
   expect((await core.claim(tokens.qa, control.id)).task.state).toBe('review');
 });
 
-test('AC01 authorization source: a forged owner quote is refused, a registered one is accepted', async () => {
+fork('AC01 authorization source: a forged owner quote is refused, a registered one is accepted', async () => {
   const forged = await failureOf(set({ policyId: 'owner-forged', scope: 'company', domain: 'write_authority',
     source: 'owner', ownerQuote: '老板说任何岗位都能写码（从未登记过这句话）',
     payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code'] } }));
@@ -271,7 +288,7 @@ test('AC01 authorization source: a forged owner quote is refused, a registered o
   expect(real.authorization.employeeId).toBe('p-gm');
 });
 
-test('AC01 supersede permissions: cross-project, cross-goal, cycles and stale targets are refused', async () => {
+fork('AC01 supersede permissions: cross-project, cross-goal, cycles and stale targets are refused', async () => {
   const projectPolicy = await set({ policyId: 'proj-write', scope: 'project', scopeRef: PROJECT, domain: 'write_authority',
     payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code'] } });
   // 跨作用域替代：另一个项目上的新版本不许替代本项目版本。
@@ -300,7 +317,7 @@ test('AC01 supersede permissions: cross-project, cross-goal, cycles and stale ta
   expect(cycle.message).toContain('cycle');
 });
 
-test('AC01 temporary authorization: expiry and revocation stop authorizing, and an in-flight task is isolated', async () => {
+fork('AC01 temporary authorization: expiry and revocation stop authorizing, and an in-flight task is isolated', async () => {
   const temp = await set({ policyId: 'temp-write', scope: 'project', scopeRef: PROJECT, domain: 'write_authority',
     effectiveAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3000).toISOString(),
     payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code'] } });
@@ -327,7 +344,7 @@ test('AC01 temporary authorization: expiry and revocation stop authorizing, and 
   expect(revokedHistory.revokeReason).toContain('紧急收权');
 });
 
-test('AC01 no cross-project expansion: a project policy never governs another project or the company scope', async () => {
+fork('AC01 no cross-project expansion: a project policy never governs another project or the company scope', async () => {
   await set({ policyId: 'proj-only', scope: 'project', scopeRef: PROJECT, domain: 'write_authority',
     payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code'] } });
   expect((await effective(PROJECT)).domains.length).toBe(1);
@@ -340,7 +357,7 @@ test('AC01 no cross-project expansion: a project policy never governs another pr
   expect(inProject.policyContract?.domains.length).toBe(1);
 });
 
-test('AC02 write_authority is enforced at creation and at claim, for a real employee token', async () => {
+fork('AC02 write_authority is enforced at creation and at claim, for a real employee token', async () => {
   const baseline = await set({ policyId: 'company-code', scope: 'company', domain: 'write_authority',
     payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code', 'read'] } });
   const task = await codeTask({ title: '工程岗任务（策略允许）' });
@@ -378,7 +395,7 @@ test('AC02 write_authority is enforced at creation and at claim, for a real empl
   expect(refusedClaim.message).toContain('forbids role engineering');
 });
 
-test('AC02 gate: the owner gate and the required acceptance legs are enforced at creation', async () => {
+fork('AC02 gate: the owner gate and the required acceptance legs are enforced at creation', async () => {
   const gate = await set({ policyId: 'company-gate', scope: 'company', domain: 'gate',
     payload: { kind: 'gate', requireOwnerApproval: true, requireIndependentReviewer: false, requiredCriteriaLegs: ['deploy'] } });
   // 老板关口：gate 与 deploy 类交付必须交老板，交给 qa 一律拒绝（只加强既有验收规则，不放宽）。
@@ -411,7 +428,7 @@ test('AC02 gate: the owner gate and the required acceptance legs are enforced at
   expect(reopened.reviewerRole).toBe('qa');
 });
 
-test('AC02 tool_scope reaches the ops broker entry: a denied tool never runs, an allowed one does', async () => {
+fork('AC02 tool_scope reaches the ops broker entry: a denied tool never runs, an allowed one does', async () => {
   const calls: string[] = [];
   const broker = new OpsBroker({
     core: { opsScope: async () => ({ actor: { employeeId: 'p-eng', role: 'engineering' }, taskId: 'task-x', project: PROJECT } as never),
@@ -447,7 +464,7 @@ test('AC02 tool_scope reaches the ops broker entry: a denied tool never runs, an
   expect(checkToolScope(contract, { tool: 'ops_info', alias: 'QA_OPS', toolNames: ['ops_info'] })).toEqual({ ok: true });
 });
 
-test('AC03 distribution: the claim carries the current contract, and prompt text cannot change a verdict', async () => {
+fork('AC03 distribution: the claim carries the current contract, and prompt text cannot change a verdict', async () => {
   const policy = await set({ policyId: 'company-code', scope: 'company', domain: 'write_authority',
     payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code', 'read'], lanes: ['lane-b'] } });
   // 反差提示词：任务文本在要求"放行 qa 写码、放行 lane-a"，判定只看 policy 表里的字段。
@@ -478,7 +495,7 @@ test('AC03 distribution: the claim carries the current contract, and prompt text
   expect(claimed.task.leasePolicyHash).toBe(claimed.policy?.hash);
 });
 
-test('AC03 distribution: an old lease cannot write after the contract moved, and does not silently switch the task', async () => {
+fork('AC03 distribution: an old lease cannot write after the contract moved, and does not silently switch the task', async () => {
   const a = await lanePolicy();
   const task = await codeTask({ goalId, workIntent: { kind: 'code', lane: 'lane-a' }, title: '旧租约任务' });
   const hashA = (await effective(PROJECT)).hash;
@@ -507,7 +524,7 @@ test('AC03 distribution: an old lease cannot write after the contract moved, and
   expect(reclaim.message).toContain('lane-a');
 });
 
-test('AC03/RB01 isolation: policy_plan shows the affected tasks, policy_enforce lands a state old releases respect', async () => {
+fork('AC03/RB01 isolation: policy_plan shows the affected tasks, policy_enforce lands a state old releases respect', async () => {
   await set({ policyId: 'company-code', scope: 'company', domain: 'write_authority',
     payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code', 'read'] } });
   const inflight = await codeTask({ title: '在办任务（将被收权）' });
@@ -589,7 +606,7 @@ test('AC03/RB01 isolation: policy_plan shows the affected tasks, policy_enforce 
   expect(control.every(entry => entry.code == null)).toBe(true);
 });
 
-test('AC03/RB01 state enumeration: the new isolation state is a state every release already understands', async () => {
+fork('AC03/RB01 state enumeration: the new isolation state is a state every release already understands', async () => {
   // 隔离没有引入新的 state 字面量：用的是旧版就认得的 blocked + blocked_to=gm，另加一个旧版读不到的说明字段
   // policy_block_reason。这里自己造一个隔离样本，再按旧版的读法（只看 state/blocked_to/租约）验证它不会被误派工。
   const policy = await set({ policyId: 'enum-code', scope: 'company', domain: 'write_authority',
@@ -620,7 +637,7 @@ test('AC03/RB01 state enumeration: the new isolation state is a state every rele
   expect(dispatchable ?? []).toEqual([]);
 });
 
-test('AC04 governance entry: the policy tools ride the real MCP/sck channel and read back the same facts', async () => {
+fork('AC04 governance entry: the policy tools ride the real MCP/sck channel and read back the same facts', async () => {
   const service = createMcpHttpService({ core, port: 0 });
   const url = new URL(`http://127.0.0.1:${service.port}/mcp`);
   const connection = await connectCompanyClient({ url, credential: tokens.gm, clientName: 'sys06-policy-test' });
@@ -682,7 +699,7 @@ test('AC04 governance entry: the policy tools ride the real MCP/sck channel and 
   } finally { await connection.close(); await service.close(); }
 });
 
-test('AC05 machine policy classes: all three govern real work through their own execution layer', async () => {
+fork('AC05 machine policy classes: all three govern real work through their own execution layer', async () => {
   // 三类机器策略各自落在自己的执行层入口：写权 → 创建/领取；工具 → ops broker；关口 → 创建关口。
   const trace: string[] = [];
   const write = await set({ policyId: 'cls-write', scope: 'company', domain: 'write_authority',
@@ -713,7 +730,7 @@ test('AC05 machine policy classes: all three govern real work through their own 
   expect((await listPolicies({ includeInactive: true })).filter(row => row.policyId === 'cls-write').length).toBe(2);
   expect((await effective(PROJECT)).version).toBe(4);
 });
-test('R1(b): a plan larger than the 48 KiB budget is paged, not refused — every page fits and the whole list is reachable', async () => {
+fork('R1(b): a plan larger than the 48 KiB budget is paged, not refused — every page fits and the whole list is reachable', async () => {
   // 评审退回（R1(b)）：实现若只是"分页读库 + 视图给 truncated"，清单本身仍会被 48 KiB 响应预算整份拒绝。
   // 这里在真实 fork 库上造 60 条在办任务（真 createTask），先收权出一条大到装不下的受影响清单，再要求：
   //   1) 每一页 answerBytes ≤ RESPONSE_BUDGET_BYTES（MCP 面真的能发出去）；
@@ -769,7 +786,7 @@ test('R1(b): a plan larger than the 48 KiB budget is paged, not refused — ever
   expect(enforced.blocked.filter(id => created.includes(id)).length).toBe(60);
 });
 
-test('R1(b): the MCP tool answers a 60-task plan with a readable page, never response_too_large', async () => {
+fork('R1(b): the MCP tool answers a 60-task plan with a readable page, never response_too_large', async () => {
   const service = createMcpHttpService({ core, port: 0 });
   const url = new URL(`http://127.0.0.1:${service.port}/mcp`);
   const connection = await connectCompanyClient({ url, credential: tokens.gm, clientName: 'sys06-policy-paging' });
@@ -796,7 +813,7 @@ test('R1(b): the MCP tool answers a 60-task plan with a readable page, never res
   } finally { await connection.close(); await service.close(); }
 });
 
-test('R1(b): policy_plan writes no policy and no task state — the one thing a first call may create is its cursor signing key', async () => {
+fork('R1(b): policy_plan writes no policy and no task state — the one thing a first call may create is its cursor signing key', async () => {
   // 评审第 2 轮的退回项 4：MCP 描述原先写 "Writes nothing"，但首次调用会 CREATE company_meta:cursor_key。
   // 这里把真实写入面钉住：策略、任务、审计三类行都不变；唯一可能的写入是游标密钥（首次创建一次，之后不再变）。
   await set({ policyId: 'r1b-writes', scope: 'company', domain: 'write_authority',
