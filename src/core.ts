@@ -45,11 +45,17 @@ import {
   type FaultDiagnostic, type FaultInput, type FaultPhase, type FaultRecord, type FaultTargetKind, type FlowStage,
 } from './faults.ts';
 import { WaitStore, waitRecordOf, type WaitRow } from './wait-store.ts';
+import { GoalGovernanceStore } from './goal-store.ts';
+import type { GoalFinalGateRepairResult, GoalOutcomeView, GoalPageView, GoalScanView, GoalFinalGatePreview } from './goal-store.ts';
+import type { GoalCard, GoalEvidenceFact } from './goal-governance.ts';
+import type { GoalMetricsView } from './goal-metrics.ts';
 import {
-  assertNonSensitive, migrationPreview, normalizeWait, parseInstant, validateEvent, verifyWaitWebhook, waitEventKey, waitKeyOf,
-  webhookPayload, type WaitEvent, type WaitHandoffCard, type WaitInput,
+  assertNonSensitive, isTimeZone, migrationPreview, normalizeWait, parseInstant, validateEvent, verifyWaitWebhook,
+  waitEventKey, waitKeyOf, webhookPayload, type WaitEvent, type WaitHandoffCard, type WaitInput,
 } from './waits.ts';
 import type {
+  GoalConsoleQuery, GoalEvidenceRecordInput, GoalFinalGatePreviewInput, GoalFinalGateRepairRequest,
+  GoalFinalizeInput, GoalMetricsQuery, GoalOutcomeRegisterInput,
   TaskWaitView, WaitActionInput, WaitActionView, WaitEntryInput, WaitListView, WaitMigrationApplyInput,
   WaitMigrationPreviewView, WaitResolveInput, WaitResolveView,
 } from './contracts.ts';
@@ -186,12 +192,12 @@ export const UNLOCK_CHILDREN_SQL = `
 `;
 
 /**
- * Unlocks blocked children of $task whose dependencies are all finished, and closes the goal
- * when its final owner acceptance gate is done. Requires $task and $actor in scope.
+ * Unlocks blocked children of $task whose dependencies are all finished. Goal closure is deliberately NOT a SQL
+ * side effect of any accepted task: SYS07 re-evaluates the final gate and the outcome evidence in
+ * GoalGovernanceStore.finalize, so a void gate, a superseded revision or a missing customer receipt can never
+ * close a goal. Requires $task and $actor in scope.
  */
-export const UNLOCK_SQL = `${UNLOCK_CHILDREN_SQL}
-  UPDATE goal SET state = 'done', done_at = time::now() WHERE state = 'active' AND tasks.acceptance = $task;
-`;
+export const UNLOCK_SQL = UNLOCK_CHILDREN_SQL;
 
 /**
  * Adds $task as a dependency of the goal's first unfinished anchor (manual, then final
@@ -642,6 +648,8 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     this.waits = new WaitStore(database.db);
     this.waitClock = options?.waits?.clock ?? Date.now;
     this.waitWebhookSecret = options?.waits?.webhookSecret ?? process.env.SCK_WAIT_WEBHOOK_SECRET;
+    // SYS07: goal outcome contract, final-gate invariants and read-only business metrics.
+    this.goals = new GoalGovernanceStore(database.db);
   }
   readonly worktrees?: WorktreeRegistry;
   private readonly owner: OwnerDesk;
@@ -661,6 +669,7 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
   private readonly waitClock: () => number;
   /** SYS05: the HMAC secret a webhook must sign with; absent means webhook events are refused, never trusted by default. */
   private readonly waitWebhookSecret?: string;
+  private readonly goals: GoalGovernanceStore;
   private readonly projects: ProjectStore;
   /** Stored listings behind the paged reads (C4). */
   private readonly snapshots: SnapshotStore;
@@ -2232,7 +2241,11 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   private async companyBriefAs(view: EnvView): Promise<CompanyBrief> {
     const brief = await this.owner.brief();
-    return { ...brief, projects: brief.projects.map(project => (view.visible(project.id) ? project : withheldEnvs(project))) };
+    // SYS07 goal cards are a console/daily-brief read with their own paged endpoint. They are not part of the
+    // company block: keeping them here would let 20 goals' blockers and source ids break the SYS01 response budget.
+    const base: CompanyBrief = { ...brief, projects: brief.projects.map(project => (view.visible(project.id) ? project : withheldEnvs(project))) };
+    delete (base as { goalCards?: unknown }).goalCards;
+    return base;
   }
 
   /** Which project environments a reader may see: all for gm; otherwise those of the projects of tasks it holds under a valid lease. */
@@ -2756,6 +2769,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         indep_guards: gate?.guards ?? [],
         policy_hash: policyHashNow ?? null,
       }));
+      if (action === 'accept' && row.goal) await this.goalFinalizeSafe(asId(row.goal), `system:accept:${actor.employeeId}`, asId(row.id));
       return view(row);
     } catch (error) {
       if (idem && digest) {
@@ -4378,6 +4392,199 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       if (replayedAfterFailure) return replayedAfterFailure;
       throw error;
     }
+  }
+
+  // ---------------------------------------------------------------- SYS07: goal governance / metrics
+
+  private async requireGoalManager(credential: Credential): Promise<{ employeeId: string }> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', '只有经理（gm）可以读写目标终验图与成果证据');
+    return actor;
+  }
+
+  private async goalFinalizeSafe(goalId: string | undefined, actor: string, acceptedTaskId?: string): Promise<void> {
+    if (!goalId) return;
+    try {
+      await this.goals.finalize(goalId, actor, acceptedTaskId);
+    } catch (error) {
+      console.warn(`goal finalize failed for ${goalId}: ${(error as Error).message}`);
+    }
+  }
+
+  private async saveGoalIdem(idem: RecordId, digest: string, result: unknown): Promise<void> {
+    await this.db.query('CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $result };',
+      { idem, digest, result }).catch(() => undefined);
+  }
+
+  /** SYS07: one paged read-only goal console. */
+  async goalConsole(credential: Credential, input: GoalConsoleQuery = {}): Promise<GoalPageView> {
+    await this.requireGoalManager(credential);
+    try {
+      return await this.goals.page({
+        ...(input.goalId ? { goalId: input.goalId } : {}),
+        ...(input.includeClosed === undefined ? {} : { includeClosed: input.includeClosed }),
+        ...(input.needsRepairOnly === undefined ? {} : { needsRepairOnly: input.needsRepairOnly }),
+        ...(input.pageSize === undefined ? {} : { pageSize: input.pageSize }),
+        ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+      });
+    } catch (error) {
+      throw new CompanyError('invalid', (error as Error).message);
+    }
+  }
+
+  /** SYS07: read-only dry-run over active, needs_repair and done goals; never changes a goal, task or owner decision. */
+  async goalGovernanceScan(credential: Credential): Promise<GoalScanView> {
+    await this.requireGoalManager(credential);
+    return this.goals.scan();
+  }
+
+  /** SYS07: windowed metrics with explicit denominators, coverage and unknown cost. */
+  async goalMetrics(credential: Credential, input: GoalMetricsQuery = {}): Promise<GoalMetricsView> {
+    await this.requireGoalManager(credential);
+    const now = Date.now();
+    const to = input.to ?? new Date(now).toISOString();
+    const from = input.from ?? new Date(now - 30 * 86_400_000).toISOString();
+    for (const [name, value] of [['from', from], ['to', to]] as const) {
+      if (!/(Z|[+-]\d{2}:\d{2})$/.test(value) || !Number.isFinite(Date.parse(value))) {
+        throw new CompanyError('invalid', `${name} 必须是带时区偏移的绝对时刻`);
+      }
+    }
+    const timezone = input.timezone ?? 'UTC';
+    if (!isTimeZone(timezone)) throw new CompanyError('invalid', 'timezone 必须是 IANA 时区');
+    try {
+      return await this.goals.metrics({ from, to, timezone, explicit: input.from !== undefined || input.to !== undefined,
+        ...(input.goalId ? { goalId: input.goalId } : {}) });
+    } catch (error) {
+      throw new CompanyError('invalid', (error as Error).message);
+    }
+  }
+
+  /** SYS07: register or replace a goal's outcome contract under a version CAS. */
+  async goalOutcomeRegister(credential: Credential, input: GoalOutcomeRegisterInput): Promise<GoalOutcomeView> {
+    const actor = await this.requireGoalManager(credential);
+    requireText(input.goalId, 'goalId', 1, 100);
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 0) {
+      throw new CompanyError('invalid', 'expectedVersion 必须是非负整数');
+    }
+    requireText(input.reason, 'reason', 10, 2000);
+    assertNonSensitive(input.reason, 'reason');
+    const idem = this.idemId(actor.employeeId, 'goal_outcome_register', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ goalId: input.goalId, expectedVersion: input.expectedVersion,
+      expected: input.expected, requiredEvidence: input.requiredEvidence, responsibleRole: input.responsibleRole,
+      deadline: input.deadline, timezone: input.timezone, reason: input.reason }));
+    const prior = await this.replayStored<GoalOutcomeView>(idem, digest);
+    if (prior) return prior;
+    let result: GoalOutcomeView;
+    try {
+      result = await this.goals.registerOutcome({
+        goalId: input.goalId, expectedVersion: input.expectedVersion,
+        outcome: {
+          expected: input.expected, requiredEvidence: input.requiredEvidence, responsibleRole: input.responsibleRole,
+          ...(input.deadline === undefined ? {} : { deadline: input.deadline }),
+          ...(input.timezone === undefined ? {} : { timezone: input.timezone }), reason: input.reason,
+        },
+        actor: `employee:${actor.employeeId}`, source: actor.employeeId, reason: input.reason,
+        auditId: randomUUID(), outboxId: randomUUID(),
+      });
+    } catch (error) {
+      const message = (error as Error).message;
+      if (/already registered|version moved|conflicted with another transaction|transaction conflict/i.test(message)) throw new CompanyError('conflict', message);
+      if (/not available|not found/i.test(message)) throw new CompanyError('not_found', message);
+      throw new CompanyError('invalid', message);
+    }
+    await this.saveGoalIdem(idem, digest, result);
+    return result;
+  }
+
+  /** SYS07: one immutable outcome receipt from an authorized human/external source. */
+  async goalEvidenceRecord(credential: Credential, input: GoalEvidenceRecordInput): Promise<GoalEvidenceFact> {
+    const actor = await this.requireGoalManager(credential);
+    requireText(input.goalId, 'goalId', 1, 100);
+    requireText(input.reason, 'reason', 10, 2000);
+    assertNonSensitive(input.reason, 'reason');
+    const idem = this.idemId(actor.employeeId, 'goal_evidence_record', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ goalId: input.goalId, kind: input.kind, summary: input.summary,
+      source: input.source, confirmedBy: input.confirmedBy, evidenceType: input.evidenceType, at: input.at, taskId: input.taskId, reason: input.reason }));
+    const prior = await this.replayStored<GoalEvidenceFact>(idem, digest);
+    if (prior) return prior;
+    let result: GoalEvidenceFact;
+    try {
+      result = await this.goals.recordEvidence({
+        goalId: input.goalId,
+        evidence: {
+          kind: input.kind, summary: input.summary, source: input.source, confirmedBy: input.confirmedBy,
+          evidenceType: input.evidenceType, ...(input.at === undefined ? {} : { at: input.at }),
+          ...(input.taskId === undefined ? {} : { taskId: input.taskId }), reason: input.reason,
+        },
+        actor: `employee:${actor.employeeId}`, reason: input.reason, auditId: randomUUID(), outboxId: randomUUID(),
+      });
+    } catch (error) {
+      const message = (error as Error).message;
+      if (/already recorded|conflicted with another transaction|transaction conflict/i.test(message)) throw new CompanyError('conflict', message);
+      if (/not found|not in this goal/i.test(message)) throw new CompanyError('not_found', message);
+      throw new CompanyError('invalid', message);
+    }
+    await this.saveGoalIdem(idem, digest, result);
+    return result;
+  }
+
+  /** SYS07: explicit re-evaluation after evidence/approval; marks done or needs_repair. */
+  async goalFinalize(credential: Credential, input: GoalFinalizeInput): Promise<GoalCard> {
+    const actor = await this.requireGoalManager(credential);
+    requireText(input.goalId, 'goalId', 1, 100);
+    try {
+      return (await this.goals.finalize(input.goalId, `employee:${actor.employeeId}`)).card;
+    } catch (error) {
+      const message = (error as Error).message;
+      if (/not found/i.test(message)) throw new CompanyError('not_found', message);
+      throw new CompanyError('conflict', message);
+    }
+  }
+
+  async goalFinalGatePreview(credential: Credential, input: GoalFinalGatePreviewInput): Promise<GoalFinalGatePreview> {
+    await this.requireGoalManager(credential);
+    requireText(input.goalId, 'goalId', 1, 100);
+    try {
+      return await this.goals.finalGatePreview({ goalId: input.goalId,
+        ...(input.candidateTaskId === undefined ? {} : { candidateTaskId: input.candidateTaskId }) });
+    } catch (error) {
+      const message = (error as Error).message;
+      if (/not found/i.test(message)) throw new CompanyError('not_found', message);
+      throw new CompanyError('invalid', message);
+    }
+  }
+
+  async goalFinalGateRepair(credential: Credential, input: GoalFinalGateRepairRequest): Promise<GoalFinalGateRepairResult> {
+    const actor = await this.requireGoalManager(credential);
+    requireText(input.goalId, 'goalId', 1, 100);
+    requireText(input.candidateTaskId, 'candidateTaskId', 1, 200);
+    requireText(input.reason, 'reason', 10, 2000);
+    assertNonSensitive(input.reason, 'reason');
+    if (!Number.isSafeInteger(input.expectedGoalVersion) || input.expectedGoalVersion < 0) {
+      throw new CompanyError('invalid', 'expectedGoalVersion 必须是非负整数');
+    }
+    if (!/^[0-9a-f]{64}$/.test(input.snapshotHash)) throw new CompanyError('invalid', 'snapshotHash 必须来自预览');
+    const idem = this.idemId(actor.employeeId, 'goal_final_gate_repair', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ goalId: input.goalId, candidateTaskId: input.candidateTaskId,
+      expectedOldTaskId: input.expectedOldTaskId, expectedGoalVersion: input.expectedGoalVersion,
+      snapshotHash: input.snapshotHash, reason: input.reason }));
+    const prior = await this.replayStored<GoalFinalGateRepairResult>(idem, digest);
+    if (prior) return prior;
+    let result: GoalFinalGateRepairResult;
+    try {
+      result = await this.goals.finalGateRepair({
+        goalId: input.goalId, candidateTaskId: input.candidateTaskId,
+        ...(input.expectedOldTaskId === undefined ? {} : { expectedOldTaskId: input.expectedOldTaskId }),
+        expectedGoalVersion: input.expectedGoalVersion, snapshotHash: input.snapshotHash,
+        reason: input.reason, actor: `employee:${actor.employeeId}`, idempotencyKey: input.idempotencyKey,
+      });
+    } catch (error) {
+      const message = (error as Error).message;
+      if (/moved|changed/i.test(message)) throw new CompanyError('conflict', message);
+      throw new CompanyError('invalid', message);
+    }
+    await this.saveGoalIdem(idem, digest, result);
+    return result;
   }
 
   /**

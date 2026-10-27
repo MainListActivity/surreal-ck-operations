@@ -48,6 +48,10 @@ const BASE_TOOLS = [
   "bind_task_code_repo",
   // gm only in core (read-only acceptance-reference preview; compare-and-set repair of a quick goal's voided gate).
   "goal_acceptance_preview", "goal_acceptance_repair",
+  // SYS07 goal governance: paged read-only console/scan/metrics, structured outcome and evidence, final-gate
+  // preview/repair and explicit re-evaluation. Core enforces gm+manage; console/scan/metrics never write.
+  "goal_console", "goal_governance_scan", "goal_metrics", "goal_outcome_register", "goal_evidence_record",
+  "goal_finalize", "goal_final_gate_preview", "goal_final_gate_repair",
   // SYS01 bounded reads: gm-only company summary and byte-segment reads of long text (core enforces both).
   "get_admin_summary", "read_task_text", "read_worktree_refs", "record_acceptance_evidence", "acceptance_status", "acceptance_gate", "set_acceptance_gate",
   // gm only in core (record a task's code implementer when the bound one cannot continue; compare-and-set, audited).
@@ -1057,6 +1061,30 @@ export class SidecarPool {
       case "goal_acceptance_repair": return core.goalAcceptanceRepair
         ? core.goalAcceptanceRepair(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose goal_acceptance_repair"), { code: "temporarily_unavailable" }));
+      case "goal_console": return core.goalConsole
+        ? core.goalConsole(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose goal_console"), { code: "temporarily_unavailable" }));
+      case "goal_governance_scan": return core.goalGovernanceScan
+        ? core.goalGovernanceScan(cred)
+        : Promise.reject(Object.assign(new Error("core does not expose goal_governance_scan"), { code: "temporarily_unavailable" }));
+      case "goal_metrics": return core.goalMetrics
+        ? core.goalMetrics(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose goal_metrics"), { code: "temporarily_unavailable" }));
+      case "goal_outcome_register": return core.goalOutcomeRegister
+        ? core.goalOutcomeRegister(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose goal_outcome_register"), { code: "temporarily_unavailable" }));
+      case "goal_evidence_record": return core.goalEvidenceRecord
+        ? core.goalEvidenceRecord(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose goal_evidence_record"), { code: "temporarily_unavailable" }));
+      case "goal_finalize": return core.goalFinalize
+        ? core.goalFinalize(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose goal_finalize"), { code: "temporarily_unavailable" }));
+      case "goal_final_gate_preview": return core.goalFinalGatePreview
+        ? core.goalFinalGatePreview(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose goal_final_gate_preview"), { code: "temporarily_unavailable" }));
+      case "goal_final_gate_repair": return core.goalFinalGateRepair
+        ? core.goalFinalGateRepair(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose goal_final_gate_repair"), { code: "temporarily_unavailable" }));
       case "contributor_dryrun": return core.contributorDryRun
         ? core.contributorDryRun(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose contributor_dryrun"), { code: "temporarily_unavailable" }));

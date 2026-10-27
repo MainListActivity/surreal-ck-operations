@@ -1,5 +1,8 @@
 /** v1 core/adapter boundary. The MCP adapter supplies an opaque credential on every call. */
 import type { WaitHandoffCard, WaitMigrationCandidate } from './waits.ts';
+import type { GoalCard, GoalEvidenceFact, GoalEvidenceInput, GoalOutcomeFact, RequiredEvidenceKind } from './goal-governance.ts';
+import type { GoalMetricsView } from './goal-metrics.ts';
+import type { GoalFinalGatePreview, GoalFinalGateRepairResult, GoalOutcomeView, GoalPageView, GoalScanView } from './goal-store.ts';
 /** 'eval' is a workforce-only judge role: it reads task history and writes scorecards, never claims tasks. */
 export type Role = 'gm' | 'product' | 'engineering' | 'ai-content' | 'concept-design' | 'asset-production' | 'screenwriter' | 'story-author' | 'cinematography' | 'qa' | 'cs' | 'eval';
 export const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs', 'eval'];
@@ -808,6 +811,71 @@ export interface GoalAcceptanceResult {
   repairedAt: string;
 }
 
+// ---- SYS07 P2：目标成果契约、终验图、只读看板与经营指标 ----
+
+export interface GoalConsoleQuery {
+  goalId?: string;
+  includeClosed?: boolean;
+  needsRepairOnly?: boolean;
+  pageSize?: number;
+  cursor?: string;
+}
+
+/** SYS07 write: structured outcome and required evidence for one goal; version-locked scope change. */
+export interface GoalOutcomeRegisterInput {
+  goalId: string;
+  /** 0 when the goal has no contract yet; otherwise the version returned by the last read. */
+  expectedVersion: number;
+  expected: string;
+  requiredEvidence: RequiredEvidenceKind[];
+  responsibleRole: string;
+  /** Absolute instant with an offset, or omitted (unknown deadline, never computed from a duration). */
+  deadline?: string;
+  timezone?: string;
+  reason: string;
+  idempotencyKey: string;
+}
+
+export interface GoalEvidenceRecordInput {
+  goalId: string;
+  kind: GoalEvidenceInput['kind'];
+  summary: string;
+  source: string;
+  confirmedBy: string;
+  evidenceType: GoalEvidenceInput['evidenceType'];
+  at?: string;
+  taskId?: TaskId;
+  reason: string;
+  idempotencyKey: string;
+}
+
+export interface GoalFinalizeInput {
+  goalId: string;
+}
+
+export interface GoalFinalGatePreviewInput {
+  goalId: string;
+  candidateTaskId?: TaskId;
+}
+
+export interface GoalFinalGateRepairRequest {
+  goalId: string;
+  candidateTaskId: TaskId;
+  expectedOldTaskId?: TaskId;
+  expectedGoalVersion: number;
+  snapshotHash: string;
+  reason: string;
+  idempotencyKey: string;
+}
+
+export interface GoalMetricsQuery {
+  /** Absolute instant with offset; omitted means the default last-30-days window. */
+  from?: string;
+  to?: string;
+  timezone?: string;
+  goalId?: string;
+}
+
 /** deliveryId + fence are mandatory for every write after claim. */
 export interface LeaseProof {
   taskId: TaskId;
@@ -1197,6 +1265,22 @@ export interface CompanyCore {
   goalAcceptancePreview?(credential: Credential, input: GoalAcceptancePreview): Promise<GoalAcceptanceView>;
   /** gm (manage): compare-and-set repair of a quick/software goal's acceptance reference; audited and idempotent. */
   goalAcceptanceRepair?(credential: Credential, input: GoalAcceptanceRepair): Promise<GoalAcceptanceResult>;
+  /** SYS07: one paged, read-only goal console (deadline, outcome stages, blockers, gate, evidence). */
+  goalConsole?(credential: Credential, input: GoalConsoleQuery): Promise<GoalPageView>;
+  /** SYS07: read-only dry-run over active goals; never closes, voids or approves anything. */
+  goalGovernanceScan?(credential: Credential): Promise<GoalScanView>;
+  /** SYS07: windowed business metrics with denominators, coverage and unknowns. */
+  goalMetrics?(credential: Credential, input: GoalMetricsQuery): Promise<GoalMetricsView>;
+  /** SYS07: register/replace a goal's structured outcome under a version CAS. */
+  goalOutcomeRegister?(credential: Credential, input: GoalOutcomeRegisterInput): Promise<GoalOutcomeView>;
+  /** SYS07: record one immutable outcome receipt (customer activation/adoption or QA/release record). */
+  goalEvidenceRecord?(credential: Credential, input: GoalEvidenceRecordInput): Promise<GoalEvidenceFact>;
+  /** SYS07: re-evaluate the final gate and evidence; marks done or needs_repair, never approves a task. */
+  goalFinalize?(credential: Credential, input: GoalFinalizeInput): Promise<GoalCard>;
+  /** SYS07: read-only preview of a final-gate reference repair. */
+  goalFinalGatePreview?(credential: Credential, input: GoalFinalGatePreviewInput): Promise<GoalFinalGatePreview>;
+  /** SYS07: CAS repair of the final-gate reference; audited, no lease release, no goal completion. */
+  goalFinalGateRepair?(credential: Credential, input: GoalFinalGateRepairRequest): Promise<GoalFinalGateRepairResult>;
   /** SYS01 bounded reads: optional so older adapters still compile; the sidecar and MCP layers check for them. */
   contextView?(credential: Credential, input: Record<string, unknown>): Promise<ContextView>;
   historyView?(credential: Credential, taskId: TaskId, input: Record<string, unknown>): Promise<HistoryPageView>;
@@ -1471,7 +1555,7 @@ export interface GoalView {
   id: string;
   title: string;
   brief: string;
-  state: 'triage' | 'active' | 'done' | 'cancelled';
+  state: 'triage' | 'active' | 'needs_repair' | 'done' | 'cancelled';
   tier?: GoalTier;
   project?: string;
   /** Production line template this goal runs (software / video / story). */
@@ -1485,6 +1569,9 @@ export interface GoalView {
 export interface CompanyBrief {
   directions: { text: string; source: string; at: string }[];
   goals: GoalView[];
+  /** SYS07: the same goal cards the console/daily brief use; the MCP company block strips them to keep its
+   * bounded response, and callers read them through goal_console instead. */
+  goalCards?: GoalCard[];
   projects: ProjectView[];
   paused: boolean;
 }
