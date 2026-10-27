@@ -34,3 +34,19 @@ run('fork: deterministic ranking persists across reconnect without Jev or overwr
   const [after]=await db.db.query<[any]>('SELECT orders,error FROM ONLY company_meta:model_ranking;');expect(after.orders).toEqual(status.orders);expect(after.error).toBeDefined();
  }finally{await db.close();}
 });
+run('fork: edited weights persist, preview matches next publication and interval-only saves retain them',async()=>{
+ const db=new CompanyDatabase({...loadDatabaseConfig(),namespace:'ranking_weights_fixture',database:'control_plane'});
+ try{
+  await db.connect();await db.bootstrap();let groups={'sck-haiku':['p/fast','p/urgent']};
+  const now=Date.now();const facts=async()=>groups['sck-haiku'].map(id=>({id,aa:{score:60,rank:1},price:{free:false},accounts:[{account:'anon',kind:'plan' as const,remainingPct:80,windows:[{remainingPct:80,resetsAt:new Date(now+(id==='p/urgent'?3600000:7*86400000)).toISOString()}]}],usage:{source:'magpie' as const,period:'7d' as const,scope:'provider-model' as const,collectedAt:new Date(now).toISOString(),requests:10,errors:0,speedSamples:0,ttftSamples:10,ttftMs:id==='p/fast'?100:19000}}));
+  let applyCalls=0;const r=new RankingRefresher({db:db.db,groups:()=>groups,facts,apply:async orders=>{applyCalls++;groups={'sck-haiku':orders['sck-haiku']!};}});
+  await saveRankingSettings(db.db,{rules:'',refreshMinutes:10},r);r.trigger(0);await r.settled();expect(groups['sck-haiku'][0]).toBe('p/fast');
+  const policy=structuredClone(DEFAULT_POLICY);for(const key of Object.keys(policy.weights))policy.weights[key as keyof typeof policy.weights]=key==='pace'?100:0;
+  const preview=await r.preview(policy);expect(preview.tables[0]!.rows[0]!.model).toBe('p/urgent');expect(applyCalls).toBe(1);
+  expect((await rankingSettings(db.db)).policy).toEqual(DEFAULT_POLICY);
+  await saveRankingSettings(db.db,{rules:'',refreshMinutes:10,policy},r);r.trigger(1);await r.settled();expect(groups['sck-haiku']).toEqual(preview.tables[0]!.rows.map(row=>row.model));
+  await saveRankingSettings(db.db,{rules:'',refreshMinutes:2},r);expect(await rankingSettings(db.db)).toMatchObject({refreshMinutes:2,policy});
+  const second=new CompanyDatabase({...loadDatabaseConfig(),namespace:'ranking_weights_fixture',database:'control_plane'});
+  try{await second.connect();await second.useDatabase();expect((await rankingSettings(second.db)).policy).toEqual(policy);}finally{await second.close();}
+ }finally{await db.close();}
+});

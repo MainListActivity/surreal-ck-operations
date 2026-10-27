@@ -27,7 +27,7 @@ export function accountFacts(f:ModelFacts,now:number){
  const quota:RuleDecision['quota']=remaining===undefined?'unknown':remaining===0&&known.length===accounts.length?'exhausted':remaining>10?'available':remaining>0?'low':'unknown';
  const subscription=accounts.some(a=>a.kind==='subscription'||a.kind==='plan');
  const billing:RuleDecision['billing']=subscription?'subscription':accounts.some(a=>a.kind==='api')?'metered':'unknown';
- const paces=known.flatMap(a=>{
+ const paces=known.filter(a=>a.remainingPct!>0).flatMap(a=>{
   const windows=a.windows?.filter(w=>finite(w.remainingPct)&&w.remainingPct>=0&&w.remainingPct<=100&&w.resetsAt&&Date.parse(w.resetsAt)>now)??[];
   // Longest known window, as a weekly/monthly budget; short caps still constrain remainingPct.
   const w=windows.sort((a,b)=>Date.parse(b.resetsAt!)-Date.parse(a.resetsAt!))[0];

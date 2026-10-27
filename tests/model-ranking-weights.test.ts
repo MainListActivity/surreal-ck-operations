@@ -34,10 +34,8 @@ test('unknown metrics get no fabricated values; invalid policies fail closed',()
  const missing=fact('p/missing');delete missing.usage;missing.health={source:'magpie-routing',attempts:1,errors:0,consecutiveErrors:0,excluded:false};
  const d=ruleOrder([missing],[],now,policy('latency'))[0]!.decision;
  expect(d.contributions!.latency!.value).toBeUndefined();expect(d.score).toBe(0);
- for(const p of [{...DEFAULT_POLICY,weights:{}},{...DEFAULT_POLICY,bandWidth:NaN},{...DEFAULT_POLICY,weights:{...DEFAULT_POLICY.weights,pace:-1}},policy('latency')]){
-  if(p===undefined)continue;
-  if(p.weights.latency===100)expect(rankingPolicy(p)).toEqual(p);else expect(()=>rankingPolicy(p)).toThrow();
- }
+ for(const invalid of [{...DEFAULT_POLICY,weights:{}},{...DEFAULT_POLICY,bandWidth:NaN},{...DEFAULT_POLICY,weights:{...DEFAULT_POLICY.weights,pace:-1}}])expect(()=>rankingPolicy(invalid)).toThrow();
+ expect(rankingPolicy(policy('latency'))).toEqual(policy('latency'));
  expect(()=>rankingPolicy({...policy('latency'),weights:Object.fromEntries(Object.keys(DEFAULT_POLICY.weights).map(k=>[k,0]))})).toThrow();
 });
 test('preview uses frozen observations, matches the live engine and never applies or saves anything',async()=>{
@@ -58,4 +56,22 @@ test('exploration requests recheck after 30 seconds, then restore the configured
  r.trigger(0);await r.settled();r.trigger(29999);await r.settled();expect(calls).toBe(1);
  sampled=true;r.trigger(30000);await r.settled();expect(calls).toBe(2);
  r.trigger(60000);await r.settled();expect(calls).toBe(2);r.trigger(630000);await r.settled();expect(calls).toBe(3);
+});
+test('a depleted short-window account cannot inflate the model pace using its positive long window',()=>{
+ const f=fact('p/model');f.accounts=[
+  {account:'blocked',kind:'plan',remainingPct:0,windows:[{remainingPct:0,resetsAt:new Date(now+3600000).toISOString()},{remainingPct:90,resetsAt:new Date(now+24*3600000).toISOString()}]},
+  {account:'usable',kind:'plan',remainingPct:10,windows:[{remainingPct:10,resetsAt:new Date(now+7*86400000).toISOString()}]},
+ ];
+ const d=ruleOrder([f],[],now)[0]!.decision;expect(d.pace).toBeCloseTo(10/168,10);
+ expect(d.contributions!.pace!.value).toBeCloseTo((10/168)/(1+10/168),10);
+});
+test('real routing-log aggregation isolates two sibling models before ranking',async()=>{
+ const {mkdtempSync,writeFileSync,rmSync}=await import('node:fs');const {tmpdir}=await import('node:os');const {join}=await import('node:path');
+ const {readModelHealth}=await import('../src/model-routing/health.ts');const dir=mkdtempSync(join(tmpdir(),'sck-model-health-'));
+ try{
+  writeFileSync(join(dir,'2026-10-27.jsonl'),JSON.stringify({id:'request',tries:[0,1,2].map(i=>({id:'p',model:'bad',done:true,status:503,start:new Date(now-3000+i*1000).toISOString()})).concat([{id:'p',model:'good',done:true,status:200,start:new Date(now-500).toISOString()}])})+'\n');
+  const health=await readModelHealth(now,dir),bad=fact('p/bad'),good=fact('p/good');bad.health=health.get(bad.id);good.health=health.get(good.id);
+  expect(bad.health!.excluded).toBe(true);expect(good.health!.excluded).toBe(false);
+  expect(ruleOrder([bad,good],[],now).map(r=>r.facts.id)).toEqual(['p/good','p/bad']);
+ }finally{rmSync(dir,{recursive:true,force:true});}
 });

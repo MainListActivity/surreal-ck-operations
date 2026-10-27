@@ -1231,8 +1231,8 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy,on
           {wide&&stat("智能分",number(row.aaScore),72)}
           {!mobile&&stat("速度",row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,96)}
           {wide&&stat("额度",quota,64)}
-          <View style={{width:mobile?66:76,alignItems:"flex-end"}}><Text style={[s.muted,{fontSize:9}]}>规则</Text>
-            <Text accessibilityLabel={row.decision?.reason??"等待规则排序"} style={{color:c.score,fontSize:mobile?13:17,lineHeight:mobile?18:23,fontWeight:"700"}}>{rankingRuleLabel(row)}{row.decision?.score===undefined?"":` · ${row.decision.score.toFixed(1)}`}</Text>
+          <View style={{width:mobile?66:76,alignItems:"flex-end"}}><Text style={[s.muted,{fontSize:9}]}>{row.decision?.tail?"置后":row.decision?.coldStart?"试用":row.pinned?"置顶":"综合分"}</Text>
+            <Text accessibilityLabel={row.decision?.reason??"等待规则排序"} style={{color:c.score,fontSize:mobile?13:17,lineHeight:mobile?18:23,fontWeight:"700"}}>{row.decision?.score===undefined?rankingRuleLabel(row):row.decision.score.toFixed(1)}</Text>
           </View><Text style={[s.muted,{width:mobile?18:22,textAlign:"center",fontSize:17}]}>{open?"−":"+"}</Text>
         </Pressable><Pressable accessibilityRole="button" accessibilityLabel={`${row.pinned?"取消置顶":"置顶"} ${row.model}`} disabled={pinBusy||!onPin}
           onPress={()=>void onPin?.(row.model,!row.pinned)} style={{paddingHorizontal:mobile?7:10,minHeight:44,justifyContent:"center",opacity:pinBusy?0.5:1}}>

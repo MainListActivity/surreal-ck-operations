@@ -65,3 +65,9 @@ test('real preview HTTP transport preserves browser origin for pinning and rejec
   expect((await send('http://other.example')).status).toBe(403);expect(f.pins).toHaveLength(1);
  } finally {await server.stop();}
 });
+test('owner preview rejects foreign origins and invalid configuration without changing the live interval',async()=>{
+ const f=fixture();
+ expect((await f.request('api/model-ranking/preview',{policy:{}},'https://other.example')).status).toBe(403);
+ expect((await f.request('api/model-ranking',{rules:'',refreshMinutes:10,policy:{bandWidth:100}},'http://localhost')).status).toBe(400);
+ expect(f.resets).toEqual([]);expect(await (await f.request('api/model-ranking')).json()).toMatchObject({refreshMinutes:5});
+});
