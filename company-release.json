@@ -17,5 +17,5 @@
     "老板网页控制台改为 Relay 版式；目标页仍按活动阻点优先全量呈现并保留分页/字段披露"
   ],
   "migration": "无数据库迁移、无历史改写；仅 goal_governance_scan/goal_metrics 响应增加分页/分段字段，console/brief 改为读取全量快照。",
-  "rollback": "保留健康 active release；用当前受审 release 的 installer 回滚至部署前现役（现为 v0.3.5 c705bded4e561f008f2cfad3cc379d5e00b44bee，以 active 实际 SHA 为准）：active 与插件面同时切回，插件 SOURCE/DIRECTORY 必须等于回滚目标 release/plugin；install 报 plugin repoint failed 时按运维文档 R3 先 remove 再 install 同一被守卫放行的目标。RW06/SYS02/IR06/SYS06 守卫校验兼容后再切；无数据回滚。"
+  "rollback": "保留健康 active release；用当前受审 release 的 installer 回滚至部署前 active 所指固定 release（编写时为 v0.3.5 059b6b9766bcf1725d5bef919119e36cb4bb34cb；执行时以 active 实际 SHA 为准）：active 与插件面同时切回，插件 SOURCE/DIRECTORY 必须等于回滚目标 release/plugin；install 报 plugin repoint failed 时按运维文档 R3 先 remove 再 install 同一被守卫放行的目标。RW06/SYS02/IR06/SYS06 守卫校验兼容后再切；无数据回滚。"
 }
