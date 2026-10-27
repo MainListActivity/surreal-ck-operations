@@ -498,6 +498,24 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.setAcceptanceGate(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
+  server.registerTool('acceptance_mapping_preview', {
+    description: 'SYS-INT, read-only: preview the versioned acceptance mapping for one task — the criteria it carries today, the registry bundle that would apply with the digest an import must echo, the per-SYS required mapping (machine source, human sign-off, RB01 coverage), and every conflict (occupied, terminal state, criteria already present, downgrade, unsupported leg). It never writes.',
+    inputSchema: z.object({ taskId: z.string().min(1).max(200) }),
+  }, async (input, ctx) => run(token(ctx), () => core.acceptanceMappingPreview
+    ? core.acceptanceMappingPreview(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('acceptance_mapping_import', {
+    description: 'SYS-INT, gm only: import one versioned acceptance-mapping bundle onto a legacy gated task. Requires the preview digest, the task expectedVersion (CAS), a reason and an idempotency key; audited. Refuses a stale digest, a downgrade or removal of required baselines, an occupied or done/void row, and a task that already carries versioned criteria. QA and executors cannot self-approve this.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200), mappingKey: z.string().min(3).max(60),
+      digest: z.string().regex(/^[0-9a-f]{64}$/), expectedVersion: z.number().int().positive(),
+      reason: z.string().min(10).max(2000), idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.acceptanceMappingImport
+    ? core.acceptanceMappingImport(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
   server.registerTool('record_owner_decision', {
     description: 'gm only: record an owner decision given in direct conversation (approve/reject a gate, or reply to an owner question). Quote the owner verbatim.',
     inputSchema: z.object({

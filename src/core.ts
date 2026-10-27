@@ -23,7 +23,10 @@ import {
   loadAcceptanceGate, recordAcceptanceEvidenceRow, validateAcceptanceCriteria,
   type AcceptanceActor, type AcceptanceSourceAdapter, type AcceptanceTaskRow, type HumanSignoff,
 } from './acceptance.ts';
-import type { AcceptanceCriterion, AcceptanceEvidenceInput, AcceptanceEvidenceRecord, AcceptanceGateInput, AcceptanceGateView, AcceptanceLeg, AcceptancePhase, AcceptanceStatusView } from './contracts.ts';
+import type { AcceptanceCriterion, AcceptanceEvidenceInput, AcceptanceEvidenceRecord, AcceptanceGateInput, AcceptanceGateView, AcceptanceLeg, AcceptanceMappingImportInput, AcceptanceMappingPreviewView, AcceptancePhase, AcceptanceStatusView } from './contracts.ts';
+import {
+  ACCEPTANCE_MAPPING_KEY, SYS_REQUIRED_MAPPING, mappingBundle, mappingDigest,
+} from './acceptance-mapping.ts';
 import { companyBlock, companyParts } from './company-context.ts';
 import type { PolicyEffectiveInput, PolicyEffectiveView, PolicyEnforceInput, PolicyEnforceView, PolicyListInput, PolicyPlanInput, PolicyPlanPage, PolicyPlanView, PolicyRevoke, PolicySet, PolicyView, ReviewerRole as PolicyReviewerRole } from './contracts.ts';
 import type { AdminSummary, CompanyPart, ContextView, HistoryPageView, PageInfo, ReferencesCut, TaskTextSegment, WorktreePageView, WorktreeRefsSegment } from './contracts.ts';
@@ -2351,6 +2354,117 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       actor: { employeeId: actor.employeeId, role: actor.role ?? '', human: true }, gate,
     });
     return { taskId: input.taskId, gate, verdict };
+  }
+
+  /** SYS-INT: read-only versioned acceptance-mapping preview for one task. The holder, reviewer or gm may read it; it never writes. */
+  async acceptanceMappingPreview(credential: Credential, input: { taskId: TaskId }): Promise<AcceptanceMappingPreviewView> {
+    const actor = await this.authenticate(credential);
+    await this.getTask(credential, input.taskId);
+    const row = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    const leg = acceptanceLegForSubject({ kind: row.kind, workIntent: row.work_intent });
+    const bundle = leg === 'implement' ? mappingBundle(ACCEPTANCE_MAPPING_KEY) : undefined;
+    let current: AcceptanceCriterion[] = [];
+    try { current = validateAcceptanceCriteria(row.acceptance_criteria); } catch { current = []; }
+    const conflicts: string[] = [];
+    if (!bundle) conflicts.push('unsupported-leg');
+    if (row.current_employee) conflicts.push('occupied');
+    if (row.state === 'done' || row.state === 'void') conflicts.push('terminal-state');
+    if (current.length > 0 && !row.acceptance_legacy) conflicts.push('criteria-present');
+    if (bundle) {
+      for (const criterion of current) {
+        if (criterion.required && !bundle.criteria.some(candidate => candidate.id === criterion.id &&
+          candidate.kind === criterion.kind && candidate.evidence === criterion.evidence && candidate.verify === criterion.verify)) {
+          conflicts.push(`downgrade:${criterion.id}`);
+        }
+      }
+    }
+    return {
+      taskId: input.taskId, title: row.title, state: row.state, ...(row.kind ? { kind: row.kind } : {}),
+      ...(row.work_intent ? { workIntent: row.work_intent } : {}),
+      occupied: Boolean(row.current_employee), legacy: Boolean(row.acceptance_legacy), currentCriteria: current,
+      ...(bundle ? {
+        proposal: {
+          key: bundle.key, leg: bundle.leg, version: bundle.version, digest: mappingDigest(bundle),
+          description: bundle.description, criteria: bundle.criteria,
+        },
+      } : {}),
+      sysRequired: SYS_REQUIRED_MAPPING.map(item => ({ ...item })),
+      conflicts,
+      guidance: '只读预览：不写任何数据。导入需 gm 携带本预览的 digest 与目标任务 expectedVersion 走 acceptance_mapping_import；冲突清零前导入会被拒绝，机器源仅为真实 CI 基线，其余为人工独立复核。',
+    };
+  }
+
+  /** SYS-INT: gm-only authorized import of a versioned acceptance-mapping bundle. CAS on the task version, digest-bound to the previewed bundle, audited; refuses stale bundles, downgrades, occupied/done/void rows and never rewrites finished acceptance. */
+  async acceptanceMappingImport(credential: Credential, input: AcceptanceMappingImportInput): Promise<TaskView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may import an acceptance mapping');
+    requireText(input.taskId, 'task', 1, 200);
+    if (!/^[a-z0-9-]{3,60}$/.test(input.mappingKey)) throw new CompanyError('invalid', 'mappingKey must be a registry bundle key');
+    const bundle = mappingBundle(input.mappingKey);
+    if (!bundle) throw new CompanyError('invalid', `unknown acceptance mapping bundle: ${input.mappingKey}`);
+    if (!/^[0-9a-f]{64}$/.test(input.digest) || input.digest !== mappingDigest(bundle)) {
+      throw new CompanyError('invalid', 'stale acceptance mapping: the digest does not match the current registry bundle; re-run the preview');
+    }
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
+    const reason = String(input.reason ?? '').trim();
+    if (reason.length < 10 || reason.length > 2000) throw new CompanyError('invalid', 'reason must be 10..2000 characters');
+    const idemDigest = HASH(JSON.stringify({ taskId: input.taskId, mappingKey: input.mappingKey, bundleDigest: input.digest, expectedVersion: input.expectedVersion, reason }));
+    const idem = this.idemId(actor.employeeId, 'acceptance_mapping_import', input.idempotencyKey);
+    // The replay lookup runs before the row guards: a successful import must replay even though the row now
+    // carries the imported criteria and every guard would refuse a re-run.
+    const replayed = await this.replay(idem, idemDigest);
+    if (replayed) return replayed;
+    const before = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!before) throw new CompanyError('not_found', 'Task not found');
+    if (before.state === 'done' || before.state === 'void') {
+      throw new CompanyError('invalid', 'refused: done/void tasks are historical; a mapping import never rewrites a finished acceptance');
+    }
+    if (before.current_employee) {
+      throw new CompanyError('conflict', 'refused: the task holds an active lease; wait for it to end and re-run the preview');
+    }
+    let current: AcceptanceCriterion[] = [];
+    try { current = validateAcceptanceCriteria(before.acceptance_criteria); } catch { current = []; }
+    if (current.length > 0 && !before.acceptance_legacy) {
+      throw new CompanyError('invalid', 'refused: the task already carries gated versioned criteria; a mapping import never replaces them');
+    }
+    for (const criterion of current) {
+      if (criterion.required && !bundle.criteria.some(candidate => candidate.id === criterion.id &&
+        candidate.kind === criterion.kind && candidate.evidence === criterion.evidence && candidate.verify === criterion.verify)) {
+        throw new CompanyError('invalid', `refused downgrade: required criterion ${criterion.id} is not preserved by the bundle`);
+      }
+    }
+    const evidence = `${reason}\n[map] ${input.mappingKey} v${bundle.version} digest=${input.digest} criteria=${bundle.criteria.length}`;
+    try {
+      const row = await this.txTask(`BEGIN;
+        LET $t = SELECT * FROM ONLY $task;
+        IF $t = NONE { THROW 'task not found' };
+        IF $t.version != $expected { THROW 'task version moved' };
+        IF $t.state = 'done' OR $t.state = 'void' { THROW 'refused: done/void tasks are historical' };
+        IF $t.current_employee != NONE { THROW 'refused: active lease' };
+        IF array::len($t.acceptance_criteria ?? []) > 0 AND $t.acceptance_legacy != true { THROW 'refused: versioned criteria already present' };
+        LET $next = UPDATE ONLY $task SET
+          acceptance_criteria = $criteria, acceptance_version = $criteria_version, acceptance_legacy = false,
+          acceptance_mapping_at = time::now(), acceptance_mapping_digest = $bundle_digest,
+          version = $t.version + 1 RETURN AFTER;
+        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'acceptance_mapping_imported', evidence: $evidence, version: $next.version, at: time::now() };
+        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+        CREATE ONLY $outbox CONTENT { task: $task, kind: 'acceptance_mapped', sequence: $sequence.value,
+          payload: { mapping: $mapping_key, digest: $bundle_digest, version: $next.version }, at: time::now() };
+        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $idem_digest, result: $next };
+        RETURN $next;
+        COMMIT;`, {
+        actor: id('employee', actor.employeeId), task: id('task', input.taskId), expected: input.expectedVersion,
+        criteria: bundle.criteria, criteria_version: ACCEPTANCE_CRITERIA_VERSION, mapping_key: input.mappingKey,
+        bundle_digest: input.digest, evidence, idem, idem_digest: idemDigest,
+        audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+      });
+      return view(row);
+    } catch (error) {
+      const replayed = await this.replay(idem, idemDigest);
+      if (replayed) return replayed;
+      throw error;
+    }
   }
 
   /** SYS02: gm read of the versioned gate record. */

@@ -194,6 +194,8 @@ export interface AcceptanceSubject {
   workIntent?: WorkIntent;
   acceptanceCriteria?: AcceptanceCriterion[];
   acceptanceLegacy?: boolean;
+  /** Set by an authorized SYS-INT mapping import; it deliberately overrides the createdAt cutoff below. */
+  acceptanceMappingAt?: string;
   acceptanceHead?: string;
   acceptanceEnvironment?: string;
   acceptanceAttempt?: number;
@@ -222,6 +224,7 @@ export interface AcceptanceTaskRow {
   work_intent?: WorkIntent;
   acceptance_criteria?: AcceptanceCriterion[];
   acceptance_legacy?: boolean;
+  acceptance_mapping_at?: unknown;
   acceptance_head?: string;
   acceptance_environment?: string;
   acceptance_attempt?: number;
@@ -238,9 +241,11 @@ export function acceptanceSubject(row: AcceptanceTaskRow, head?: string,
   let environment = row.acceptance_environment;
   try { environment = effectiveEnvironment(row.acceptance_criteria ?? [], row.acceptance_environment); }
   catch { /* a legacy/conflicting row keeps its stored value; the evaluator refuses it when a requirement exists */ }
+  const mappingAt = row.acceptance_mapping_at === undefined || row.acceptance_mapping_at === null ? undefined : String(row.acceptance_mapping_at);
   return {
     id: rowId(row.id), kind: row.kind, workIntent: row.work_intent, acceptanceCriteria: row.acceptance_criteria,
-    acceptanceLegacy: row.acceptance_legacy, acceptanceHead: head ?? row.acceptance_head,
+    acceptanceLegacy: row.acceptance_legacy, ...(mappingAt !== undefined ? { acceptanceMappingAt: mappingAt } : {}),
+    acceptanceHead: head ?? row.acceptance_head,
     acceptanceEnvironment: overrides.environment ?? environment,
     acceptanceAttempt: overrides.attempt ?? row.acceptance_attempt ?? 0,
     taskVersion: row.version, submittedBy: row.submitted_by, reviewerRole: row.reviewer_role,
@@ -262,6 +267,10 @@ export function acceptanceTargetAttempt(row: { state?: string; acceptance_attemp
 export function isLegacyAcceptance(subject: AcceptanceSubject, gate: AcceptanceGateView): boolean {
   if (!gate.enabled) return true;
   if (subject.acceptanceLegacy === true) return true;
+  // SYS-INT: an authorized mapping import (gm, digest + CAS + audit) is the one controlled way a pre-gate row
+  // picks up the gate. The createdAt cutoff below keeps enabling the gate from retroactively gating old rows;
+  // an explicit import is not that accident, so the marker overrides it.
+  if (subject.acceptanceMappingAt !== undefined) return false;
   const created = subject.createdAt ? Date.parse(subject.createdAt) : Number.NaN;
   const enabled = gate.enabledAt ? Date.parse(gate.enabledAt) : Number.NaN;
   return Number.isFinite(created) && Number.isFinite(enabled) && created < enabled;

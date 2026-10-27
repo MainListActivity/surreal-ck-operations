@@ -131,6 +131,37 @@ export interface AcceptanceStatusView { taskId: TaskId; gate: AcceptanceGateView
 /** A versioned, reason-audited change of the gate (SYS02 AC06). Only gm may call it. */
 export interface AcceptanceGateInput { enabled: boolean; reason: string; expectedVersion: number; idempotencyKey: string }
 
+/** SYS-INT: read-only preview of the versioned acceptance mapping for one legacy gated row. */
+export interface AcceptanceMappingPreviewView {
+  taskId: TaskId;
+  title: string;
+  state: string;
+  kind?: TaskKind;
+  workIntent?: WorkIntent;
+  occupied: boolean;
+  legacy: boolean;
+  /** The criteria the task carries today (empty for a legacy row). */
+  currentCriteria: AcceptanceCriterion[];
+  /** The registry bundle that would apply, with the digest an import must echo; undefined when the leg is unsupported. */
+  proposal?: { key: string; leg: AcceptanceLeg; version: number; digest: string; description: string; criteria: AcceptanceCriterion[] };
+  /** Per-SYS required mapping: machine source, human sign-off, RB01 coverage. */
+  sysRequired: SysRequiredMappingView[];
+  /** Empty when an import would be accepted right now; otherwise machine-readable refusal reasons. */
+  conflicts: string[];
+  guidance: string;
+}
+export interface SysRequiredMappingView { sys: string; machineEvidence: string; machineVerify: string; humanVerify: string; rb01: boolean; note: string }
+export interface AcceptanceMappingImportInput {
+  taskId: TaskId;
+  mappingKey: string;
+  /** The digest shown by the preview; a stale digest is refused. */
+  digest: string;
+  /** CAS against the task row version read at preview time. */
+  expectedVersion: number;
+  reason: string;
+  idempotencyKey: string;
+}
+
 /** Managed authorization; supplied by task creation, never inferred from prose. */
 export interface WorkIntent { kind: 'read' | 'code' | 'assets'; paths?: string[]; lane?: string }
 export interface WorktreeAssignment {
@@ -1437,6 +1468,10 @@ export interface CompanyCore {
   recordAcceptanceEvidence?(credential: Credential, input: AcceptanceEvidenceInput): Promise<AcceptanceEvidenceRecord>;
   /** SYS02: read the gate and the current verdict for one task (its holder, reviewer, or gm). */
   acceptanceStatus?(credential: Credential, input: { taskId: TaskId }): Promise<AcceptanceStatusView>;
+  /** SYS-INT: read-only versioned acceptance-mapping preview for one task (its holder, reviewer, or gm). */
+  acceptanceMappingPreview?(credential: Credential, input: { taskId: TaskId }): Promise<AcceptanceMappingPreviewView>;
+  /** SYS-INT: gm-only authorized import of a versioned acceptance-mapping bundle under digest + version CAS. */
+  acceptanceMappingImport?(credential: Credential, input: AcceptanceMappingImportInput): Promise<TaskView>;
   /** SYS02: gm read of the versioned gate record. */
   acceptanceGate?(credential: Credential): Promise<AcceptanceGateView>;
   /** SYS02: gm versioned change of the gate; the reason and before/after are audited. */

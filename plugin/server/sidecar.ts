@@ -54,6 +54,8 @@ const BASE_TOOLS = [
   "goal_finalize", "goal_final_gate_preview", "goal_final_gate_repair",
   // SYS01 bounded reads: gm-only company summary and byte-segment reads of long text (core enforces both).
   "get_admin_summary", "read_task_text", "read_worktree_refs", "record_acceptance_evidence", "acceptance_status", "acceptance_gate", "set_acceptance_gate",
+  // SYS-INT mapping preview (read-only) and gm-only authorized import; core enforces both.
+  "acceptance_mapping_preview", "acceptance_mapping_import",
   // gm only in core (record a task's code implementer when the bound one cannot continue; compare-and-set, audited).
   "implementer_takeover",
   "qa_observation_grant", "qa_observation_revoke", "qa_observation_status", "qa_observation_session",
@@ -969,6 +971,12 @@ export class SidecarPool {
       case "set_acceptance_gate": return core.setAcceptanceGate
         ? core.setAcceptanceGate(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose set_acceptance_gate"), { code: "temporarily_unavailable" }));
+      case "acceptance_mapping_preview": return core.acceptanceMappingPreview
+        ? core.acceptanceMappingPreview(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose acceptance_mapping_preview"), { code: "temporarily_unavailable" }));
+      case "acceptance_mapping_import": return core.acceptanceMappingImport
+        ? core.acceptanceMappingImport(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose acceptance_mapping_import"), { code: "temporarily_unavailable" }));
       case "checkpoint": return writeOp(p => core.checkpoint(cred, p, evidence()));
       case "submit": return writeOp(p => core.submit(cred, p, evidence()), true);
       case "review": return writeOp(p => (args.decision === "accept" ? core.accept(cred, p, evidence()) : core.returnTask(cred, p, evidence())), true);

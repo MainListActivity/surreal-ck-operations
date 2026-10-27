@@ -172,6 +172,9 @@ export class CompanyDatabase {
     // 新字段；旧版忽略这些字段和表，历史任务、验收与老板决定不被改写（RB01）。
     await this.db.query(loadSchema('042-goal-governance.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 42 WHERE schema_version < 42;');
+    // SYS-INT：版本化验收映射的导入标记。只新增 task 可选字段；旧版读不到即按 legacy 处理，不误派不误关（RB01）。
+    await this.db.query(loadSchema('043-acceptance-mapping.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 43 WHERE schema_version < 43;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {
