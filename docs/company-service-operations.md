@@ -382,11 +382,11 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plis
 
 四个公开入口为 `group/sck-fable`、`group/sck-opus`、`group/sck-sonnet`、`group/sck-haiku`。员工网关把每个请求改写成一个 magpie 档位分组：租约档位是上限，手动选择可以降到更便宜的档，不能升档；任何具体模型名（含 Claude Code 自带的 `claude/claude-sonnet-5-5` 等）都改写成租约档位分组。网关从不发送具体模型 ID：2026-10-23 曾因固定了一个下架的具体模型，被 magpie 改由 Claude 订阅的 sonnet 应答并继续固定，越出档位。岗位不再拆分能力档和绩效排名。请求名含 Haiku 也属于任务工作，只有 count_tokens 为辅助接口。老板个人配置和压缩窗口471000不改。
 
-`src/model-routing/benchmarks.json` 保留 AA Intelligence Index 来源及采集时间。老板规则：任何档位的模型 AA 分数不得低于 38（`AA_FLOOR`），没有公开分数的模型不进入任何档位，新上架模型同样按此过滤。分界线以模型为锚（老板 2026-10-23 定，`TIER_ANCHORS`），锚模型被 AA 重新打分时分界线随之移动：分数不高于 deepseek-v4.1-flash 的进入 Sonnet，Haiku 与 Sonnet 共用同一组成员；高于 deepseek-v4.1-flash、不高于 claude-sonnet-5.5 的进入 Opus（含 gpt-6.1-sol、claude-sonnet-5.5）；高于 claude-sonnet-5.5 的进入 Fable。Fable 只供老板手动使用，其模型被排除时暂用 Opus 的成员；档位是能力分段，不等同于模型厂商品牌。空档只借用更强档。模型绩效采用统一排名、八任务先验、30天半衰期；相同规范模型名跨账号共享证据。`tierOverrides` 和 `disabledModels` 允许维护时校正和排除。首次四档迁移清除旧三档覆盖，重新按快照初始化。
+`src/model-routing/benchmarks.json` 保留公开 AA 榜单的采集时间、测量等级与价格，生产使用每日刷新快照。老板 2026-10-28 最新规则覆盖旧的固定 38 分与能力上下界：最低能力取最新版本 Luna Max 的实测 AA 分数，不设智能分上界；达到底线后，AA 输入价 ≤$1/M 进入 Haiku，>$1/M 且 ≤$2/M 进入 Sonnet。未知或更贵价格不自动加入员工组，Magpie 免费标签不改写 AA 入组价格。Opus/Fable 手动维护，空档不借用其他组。模型绩效只按完整渠道/模型 ID 汇总，均值、任务趋势及回退排序一致，原始历史评分不删不重写；不同渠道的同款模型不共享执行证据。详细规则见 [渠道绩效与动态准入](channel-performance-admission.md)。
 
-派工器只处理角色/岗位轨、仓库与写入隔离、独立验收、实现人连续性、租约和本机总并发。受管员工复用空闲会话，保留返工接续，不再按订阅额度/账号并发/配置模型漂移或员工分数挑模型，也不再调用 Jev 做二次员工选择。故事作者维持原派工策略。Magpie 负责模型/账号可用性、额度、顺序回退和档内隔离；公司代码只维护 Fable、Sonnet、Haiku；Opus 的成员、顺序和组内配置由老板在 Magpie 手动维护。
+派工器只处理角色/岗位轨、仓库与写入隔离、独立验收、实现人连续性、租约和本机总并发。受管员工复用空闲会话，保留返工接续，不再按订阅额度/账号并发/配置模型漂移或员工分数挑模型，也不再调用 Jev 做二次员工选择。故事作者维持原派工策略。Magpie 负责模型/账号可用性、额度、顺序回退和档内隔离；公司代码只自动维护 Sonnet、Haiku；Opus/Fable 的成员、顺序和组内配置由老板在 Magpie 手动维护。
 
-四个入口为 magpie 分组 `sck-fable/opus/sonnet/haiku`。Opus 完全交由老板在 Magpie 手动维护：公司不创建、重建、删除、添加成员、归一化思考等级、恢复历史排序或改写任何组内配置，缺组或空组也不自动补建。以下自动管理规则仅适用于其余三组（`routing=order`、`stays=session`）。**分组成员归老板管**：自动分档只在 `GROUPING_VERSION` 变化时整体初始化一次，此后只把从未见过的新模型（AA ≥38）放进对应档位；老板在 magpie 里手动增删的成员不会被覆盖，手动移出的模型记入 `model-routing/membership.json` 的已知列表，不会被自动加回，手动加入的模型即使没有 AA 分数也保留。后台每五分钟只按 AA 先验与模型绩效重排各组成员顺序（读取 magpie `providers.json`，写入经 magpie 自身的保存接口）；同一租约用 `x-magpie-session` 由 magpie 保持在同一模型，额度或故障时由 magpie 在组内回退。不再有 magpie 选择中间件、best/explore 中间分组和网关模型固定；升级后首次同步会卸载旧的 `sck-performance` 中间件并删除 `sck-route-*` 分组。故事作者正在使用的旧组保留。请求热路径不查询远端数据库：租约来自 sidecar 内存，执行元数据经本地 fsync+rename 队列入库，不保存提示词/回复/密钥。
+四个入口为 Magpie 分组 `sck-fable/opus/sonnet/haiku`。Opus/Fable 由老板手动维护，公司不创建、重建、删除、添加成员或归一化其配置。Haiku/Sonnet 新模型按动态能力底线与 AA 输入价格独立入组；本次不升级已有成员初始化版本，保留人工增删，不全量重建，空组不跨档补位。自动排序与 Magpie 会话粘性仍按现行规则工作，执行元数据经本地持久队列入库，热路径不查远端数据库。
 
 有效员工会话的模型调用资格与任务写入租约分开：submit/review 成功会立即消耗任务租约，随后 Claude 仍需处理工具结果、输出收尾；工程、产品等已登记会话此时按岗位默认档位继续调用，记录 task 为空、phase=idle，不进入任务模型绩效。GM/eval 的 planning 行为不变。新任务写入和供应商操作仍须原有有效租约；未登记、隔离或过期的在途租约不会获得任务权限。插件重载恢复期间模型网关返回503及 Retry-After:1，恢复完成后才核对会话；未登记会话仍拒绝409。
 
@@ -413,11 +413,11 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plis
 
 实时使用统计取自本机 Magpie `GET http://127.0.0.1:3425/v1/magpie/usage?period=7d`，每轮排序在调用 Jev 之前重新读取一次，不缓存到下一轮。严格按原生 `provider/model` 路径匹配；供应商内嵌路径（如 `remote-magpie/codearts/...`）完整保留，不再用去供应商的模型简称。原生统计按通道汇总历史各思考等级，提示词明确说明该范围；无本通道样本时保持未知，不用别的供应商或远端分组的统计补齐。输出速度直接使用 Magpie 已筛选的 `decode_out / (decode_ms / 1000)`，不从 CSV 的总输出 token/耗时另算；首 token 延迟使用原生平均值。Jev 的 usage 数据同时带来源、7d 窗口及起点、采集时间、测速与延迟样本数；原生 API 失败或格式不符则终止本轮并保留原排序，不用旧快照继续刷新。接口返回的账号、host、key 与会话信息不进入 Jev 数据。
 
-AA 榜单与价格保存在服务目录 `model-routing/aa.json`，每日刷新，失败保留最后可用快照；锚模型不齐或页面解析异常时不替换数据。自动分组版本不变，仅初始化及首次出现的新模型参与分组，仍遵守 AA≥38 和现有锚模型规则；手动增删成员不会因重新评分而重置。Jev 只能排列当前组内成员，不能跨组添加模型。Fable 不参与 Jev 或绩效排序，保留老板顺序。Magpie 自己提供组内回退与会话粘性，网关始终发送原生组名；不设置 effort 上限。
+AA 榜单与价格保存在服务目录 `model-routing/aa.json`，本次格式升级首次重新拉取后每日刷新。网络或页面解析失败保留上次有效快照；成功解析的榜单若最新 Luna 没有 Max 测量，保留旧模型数据并持久记录 `admissionBlocked`，控制器停止分组修改，下一次有效刷新解除。自动入组只处理首次出现的新 ID；原有成员及人工移除决定不因 AA 改分被重置。组内排序由代码完成，不调用 Jev；Jev 只用于尚未裁决的新名称映射。
 
 ### 思考等级与模型对应（老板 2026-10-23 定）
 
-AA 按思考等级分别打分（显示名括号里的 Max/Xhigh/High…，slug 常省略最高档），因此分档用的是**该成员实际发送等级**下的分数：自动管理的 Fable/Sonnet/Haiku 组中，自动入组或成员写成裸 ID 时，控制器按 Magpie 目录 `reasoning_levels` 中能发送的等级，选该模型分数最高的等级，并把成员写成 `provider/model:<等级>` 固定（如 `codex/gpt-6-luna:max`，38.1 分才达门槛）。Magpie 发不出 AA 测分等级的不入组（如只提供 low/high/xhigh 的 deepseek-v4.1-flash）；厂商在模型 ID 里已写死等级的（`gpt-6-luna-max`，无可选等级）按 AA 显示名匹配，不加后缀。老板手动写上的等级保持不变。各组成员若在其发送等级下无分数、低于 38 或分数落在别的档，记入 `company_meta:model_routing_status.issues` 并在「编制 → 模型与 AA 榜单对应」提示，只提示不移除。
+AA 按思考等级分别打分（显示名括号中的 Max/Xhigh/High 等），自动管理的 Haiku/Sonnet 入组使用成员实际发送等级下的 AA 分数。控制器只选 Magpie 目录 `reasoning_levels` 能发送且 AA 已测的等级，并以 `provider/model:<等级>` 固定；厂商已在 ID 写死等级的模型不再加后缀。老板手动写上的等级保留。现有成员若低于动态 Luna Max 底线、无该等级测分或不符价格档，仅在 `company_meta:model_routing_status.issues` 提示，不自动移除。Opus/Fable 不做等级归一化。
 
 名称匹配：AA slug 与显示名（去括号再拼等级）都参与精确匹配；去掉厂商前缀（`zai_glm-5.3-flash`）和 Magpie 上下文变体后缀（`grok-4.7@500k`）；日期快照后缀照旧。规则仍对不上的新模型，每个只问一次 Jev（选择题：按名称相近取 8 个 AA 候选加「都不是」），置信 ≥0.7 才采用，否则只记为建议；结果存 `model-routing/aliases.json`，老板可在同一页面改为某个 slug 或设为不对应，尚未进组的模型下次同步按新分数分组。远端 Magpie 新增模型需要本地重新拉取清单：控制器每天对 `preset=remote-magpie` 的供应商执行一次 `magpie provider refresh`。
 

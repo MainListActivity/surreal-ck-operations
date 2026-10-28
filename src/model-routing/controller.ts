@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { type Surreal } from "surrealdb";
 import {
-  AA_FLOOR,
+  admissionAnchor,
   benchmarkRows,
   classify,
   resolveBenchmark,
@@ -18,8 +18,7 @@ import {
   useAliases,
   TIERS,
   selectedTier,
-  canonicalModel,
-  tierPool,
+  performanceModel,
   digest,
   rank,
   type CatalogModel,
@@ -44,14 +43,15 @@ import type { JevClient } from "../dispatcher/jev.ts";
 const ALIAS_ASKS_PER_SYNC = 6;
 const DAY = 86400000;
 export interface MemberIssue { group: string; member: string; reason: string }
-/** A member breaks the owner's rule when the level it is sent at has no AA score of 38+, or that
- * score belongs to another band. Members are the owner's: issues are reported, never removed. */
+/** Report a member below the dynamic Luna Max floor or outside its AA input-price band; never remove owner members. */
 export function memberIssue(tier: Tier, member: string, levels: string[] | undefined): string | undefined {
   const r = resolveBenchmark(member, levels);
   if (!r) return splitMember(member).effort ? "AA 没有该思考等级的分数" : "AA 没有可用思考等级下的分数";
-  if (r.row.score < AA_FLOOR) return `AA ${r.row.score.toFixed(1)} 低于 ${AA_FLOOR}`;
-  const band = tierOf(r.row.score);
-  if (tier === "fable" ? band === "sonnet" : band !== tierPool(tier))
+  const floor=admissionAnchor();
+  if (r.row.score < floor.score) return `AA ${r.row.score.toFixed(1)} 低于 ${floor.name} (${floor.score.toFixed(2)})`;
+  const band = tierOf(r.row.priceInput);
+  if(band==='opus')return "AA 输入价格未知或超过 $2/M，不自动入组";
+  if (band !== tier)
     return `AA ${r.row.score.toFixed(1)} 属于 ${band} 档`;
   return;
 }
@@ -268,7 +268,7 @@ export class ModelRoutingController {
     const candidates = ids.map((id) => known.get(id) ?? { id, model: id.slice(id.lastIndexOf("/") + 1), tier: "sonnet" as Tier, prior: 2.5, estimated: true, context: 0 });
     const performance = new Map<string, {score:number;samples:number}>();
     for (const candidate of candidates) {
-      const evidence = results.filter(r => canonicalModel(r.model) === canonicalModel(candidate.id));
+      const evidence = results.filter(r => performanceModel(r.model) === performanceModel(candidate.id));
       const samples = evidence.reduce((sum,r) => sum + r.weight, 0);
       if (samples > 0) performance.set(candidate.id,{score:Math.round(evidence.reduce((sum,r)=>sum+r.overall*r.weight,0)/samples*100)/100,samples});
     }
@@ -285,7 +285,7 @@ export class ModelRoutingController {
         trends[name]=metricTrend(raw[name]??[],now,unit,"request");
       // One task is one independent quality observation, even if several employees used this model.
       const tasks = new Map<string,{at:number;sum:number;weight:number}>();
-      for(const r of results.filter(r=>canonicalModel(r.model)===canonicalModel(f.id))) {
+      for(const r of results.filter(r=>performanceModel(r.model)===performanceModel(f.id))) {
         if(!r.task)continue;
         const row=tasks.get(r.task)??{at:Date.parse(r.at),sum:0,weight:0};
         row.sum+=r.overall*r.weight;row.weight+=r.weight;row.at=Math.max(row.at,Date.parse(r.at));tasks.set(r.task,row);
@@ -408,6 +408,7 @@ export class ModelRoutingController {
     await mkdir(dir0, { recursive: true, mode: 0o700 });
     // Daily AA scores and prices, so new models are placed by today's leaderboard, not the bundled one.
     const aa = this.io.command ? loadAa(join(dir0, "aa.json")) : await refreshAa(join(dir0, "aa.json"));
+    if (aa?.admissionBlocked) throw Error("AA 最新 Luna Max 锚点缺失，暂停新增分组，保留现有配置");
     if (aa) useBenchmarks(aa.models);
     let state: { version?: string; known?: string[] } = {};
     try {
@@ -441,9 +442,8 @@ export class ModelRoutingController {
     const models = classify(catalog.data).filter(
       (m) => !config?.disabledModels?.includes(m.id),
     );
-    for (const m of models)
-      if (config?.tierOverrides?.[m.id]) m.tier = selectedTier(config.tierOverrides[m.id]) ?? m.tier;
-    if (!models.length) throw Error("no usable magpie models");
+    // Legacy overrides do not bypass new-model admission; manual group membership stays authoritative.
+
     const results = await readModelResults(this.db);
     const dir = join(this.home, "model-routing");
     await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -470,25 +470,20 @@ export class ModelRoutingController {
     };
     const issues: MemberIssue[] = [];
     const tiers = TIERS;
-    for (const [level, tier] of tiers.entries()) {
-      // Opus belongs to the owner in Magpie: no creation, membership/effort normalization,
+    for (const tier of tiers) {
+      // Manual groups belong to the owner in Magpie: no creation, membership/effort normalization,
       // new-model placement, persisted pins, ranking or routing/stickiness writes.
-      if (tier === "opus") continue;
-      // An empty staff tier borrows the next stronger one: an upgrade, never a silent downgrade.
-      // Fable is owner-only and has nothing stronger; while its models are excluded it serves Opus.
-      const pool = (t: Tier) => models.filter((m) => m.tier === tierPool(t));
-      const bucket =
-        [...tiers.slice(0, level + 1).reverse(), ...(tier === "fable" ? (["opus"] as Tier[]) : [])]
-          .map(pool)
-          .find((b) => b.length) ?? [];
+      if (tier === "opus" || tier === "fable") continue;
+      // Staff groups have independent price bands; an empty group never borrows another band.
+      const bucket = models.filter(m=>m.tier===tier);
       const current = live[`sck-${tier}`];
       const ids = initializing || !current
         ? bucket.map((m) => m.member ?? m.id)
-        : [...current.filter(member=>!generatedModel(member)).map(pinned), ...fresh.filter((m) => tierPool(m.tier) === tierPool(tier) && !holds(current, m.id)).map((m) => m.member ?? m.id)];
+        : [...current.filter(member=>!generatedModel(member)).map(pinned), ...fresh.filter((m) => m.tier === tier && !holds(current, m.id)).map((m) => m.member ?? m.id)];
       if (!ids.length) {
         groups[`sck-${tier}`] = digest("[]");
         routes[`group/sck-${tier}`] = [];
-        if (initializing) throw Error(`magpie tier ${tier} has no models or stronger fallback`);
+
         continue; // emptied by hand: leave it as the owner set it
       }
       // A model added by hand may have no score: it keeps a neutral prior and is still ordered.
@@ -499,15 +494,15 @@ export class ModelRoutingController {
         return { ...(known ?? { model: base.slice(base.lastIndexOf("/") + 1), tier, estimated: true, context: 0 }), id: member, prior };
       });
       const byRank = rank(candidates, results);
-      const jev = tier === "fable" ? [] : this.orders[`sck-${tier}`] ?? [];
+      const jev = this.orders[`sck-${tier}`] ?? [];
       // A member pinned since Jev last ranked keeps its place under its bare id.
       const at = (id: string) => {
         const i = jev.indexOf(id) >= 0 ? jev.indexOf(id) : jev.findIndex((x) => splitMember(x).id === splitMember(id).id);
         return i < 0 ? jev.length : i;
       };
-      const baseOrder = tier === "fable" && !initializing ? candidates.map(m => byRank.find(r => r.id === m.id)!) : byRank;
+      const baseOrder = byRank;
       const ordered = baseOrder.map((m, i) => ({ m, i })).sort((a, b) => at(a.m.id) - at(b.m.id) || a.i - b.i).map((x) => x.m);
-      const members = tier==='fable'||this.ruleOrders.has(`sck-${tier}`)||ranking?.results?.[`sck-${tier}`]?.engine?.startsWith('quality-pace-')
+      const members = this.ruleOrders.has(`sck-${tier}`)||ranking?.results?.[`sck-${tier}`]?.engine?.startsWith('quality-pace-')
         ?ordered.map(m=>m.id):pinnedOrder(ordered.map(m=>m.id),ranking?.pins?.[`sck-${tier}`]);
       const positions = new Map(members.map((id, i) => [id, i]));
       ordered.sort((a,b) => positions.get(a.id)! - positions.get(b.id)!);
@@ -551,7 +546,7 @@ export class ModelRoutingController {
     await saveInventory(inventoryFile,inventory);
     const [storyModels] = await this.db.query<[string[]]>("SELECT VALUE model FROM employee_def WHERE role='story-author';");
     for (const id of Object.keys(previous)) {
-      if (id === 'sck-opus' || !id.startsWith('sck-') || id in groups || storyModels?.includes(`group/${id}`)) continue;
+      if (id === 'sck-opus' || id === 'sck-fable' || !id.startsWith('sck-') || id in groups || storyModels?.includes(`group/${id}`)) continue;
       if (preparing) groups[id] = previous[id]!; // the previous gateway still owns live leases until release switch
       // Already gone is done: a sync that died after removing groups but before writing groups.json
       // (or a concurrent one) must not fail every later sync.

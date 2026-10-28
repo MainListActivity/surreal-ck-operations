@@ -26,7 +26,7 @@ const ROWS:BenchmarkRow[]=[
  {slug:'glm-5-3',name:'GLM-5.3 (Max)',score:44.8},
  {slug:'grok-4-7',name:'Grok 4.7 (Xhigh)',score:46.4},
  {slug:'qwen3-8-flash-next',name:'Qwen3.8-Flash-Next',score:39.8},
-];
+].map(row=>({...row,priceInput:row.slug.includes('sonnet')?2:row.slug.includes('sol')?1.5:0.5}));
 const ALL=['low','medium','high','xhigh','max'];
 
 test('AA names carry the measured level; members carry the level they are sent at',()=>{
@@ -58,18 +58,18 @@ test('a band admitted on a level is served at that level; a level magpie cannot 
  expect(resolveBenchmark('joycode/GLM-5.3-agent',ALL)).toMatchObject({row:{slug:'glm-5-3'},effort:'max'});
  expect(resolveBenchmark('trae-cn/qwen3.8-flash',ALL)).toBeUndefined();
  const c=classify([{id:'codex/gpt-6-luna',reasoning_levels:ALL},{id:'w/gpt-6-luna',reasoning_levels:['xhigh']},{id:'p/deepseek-v4.1-flash',reasoning_levels:['low','high','max']}]);
- expect(c.map(m=>[m.member,m.tier])).toEqual([['p/deepseek-v4.1-flash:max','sonnet'],['codex/gpt-6-luna:max','sonnet']]);
+ expect(c.map(m=>[m.member,m.tier])).toEqual([['p/deepseek-v4.1-flash:max','haiku'],['codex/gpt-6-luna:max','haiku']]);
  // Jev sees the score of the level actually sent.
  expect(modelFacts(['w/gpt-6-luna:xhigh'],{catalog:[{id:'w/gpt-6-luna',reasoning_levels:ALL}],quota:new Map(),usage:new Map(),performance:new Map()})[0]?.aa).toMatchObject({score:34.6,effort:'xhigh'});
 });
 
 test('member issues: below the floor, wrong band, or no score at the pinned level',()=>{
  useBenchmarks(ROWS);
- expect(memberIssue('haiku','w/gpt-6-luna:xhigh',ALL)).toContain('低于 38');
- expect(memberIssue('opus','p/deepseek-v4.1-flash:max',ALL)).toContain('sonnet');
+ expect(memberIssue('haiku','w/gpt-6-luna:xhigh',ALL)).toContain('低于 GPT-6 Luna (Max)');
+ expect(memberIssue('sonnet','p/deepseek-v4.1-flash:max',ALL)).toContain('haiku');
  expect(memberIssue('opus','claude/claude-sonnet-5-5:medium',ALL)).toContain('sonnet');
- expect(memberIssue('opus','codex/gpt-6.1-sol:medium',ALL)).toBeUndefined();
- expect(memberIssue('fable','codex/gpt-6.1-sol:max',ALL)).toBeUndefined();
+ expect(memberIssue('sonnet','codex/gpt-6.1-sol:medium',ALL)).toBeUndefined();
+ expect(memberIssue('sonnet','codex/gpt-6.1-sol:max',ALL)).toBeUndefined();
  expect(memberIssue('opus','grok/grok-4.7:medium',ALL)).toContain('没有该思考等级');
 });
 
@@ -180,7 +180,7 @@ test('below-floor or unavailable reasoning levels are recorded once without a pa
  const home=scratch();const f=controller(home,[...baseCatalog(),{id:'w/gpt-6-luna',reasoning_levels:['xhigh']},{id:'t/deepseek-v4.1-flash',reasoning_levels:['high']}],{});
  await f.c.refresh(true);expect(f.asks()).toBe(0);
  const view=(await f.c.identity()).inventory;
- expect(view.decidedUngrouped.find(m=>m.model==='w/gpt-6-luna')?.reason).toContain('低于 38');
+ expect(view.decidedUngrouped.find(m=>m.model==='w/gpt-6-luna')?.reason).toContain('低于 GPT-6 Luna (Max)');
  expect(view.decidedUngrouped.find(m=>m.model==='t/deepseek-v4.1-flash')?.reason).toContain('没有 AA 已测等级');
  await f.c.refresh(true);expect(f.asks()).toBe(0);
 });

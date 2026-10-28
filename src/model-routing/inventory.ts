@@ -1,6 +1,6 @@
 import {readFile,writeFile,rename} from 'node:fs/promises';
 import {z} from 'zod';
-import {AA_FLOOR,resolveBenchmark,routable,generatedModel,splitMember,type CatalogModel} from './policy.ts';
+import {admissionAnchor,tierOf,resolveBenchmark,routable,generatedModel,splitMember,type CatalogModel} from './policy.ts';
 import type {AliasEntry,AliasFile} from './alias.ts';
 
 const decisionSchema=z.object({
@@ -44,7 +44,7 @@ export function reconcileInventory(inventory:ModelInventory,catalog:CatalogModel
     if(disabled.includes(model.id)){inventory.decisions[model.id]={by:'rule',slug:null,at:now,reason:'已人工禁用'};continue;}
     const match=resolveBenchmark(model.id);if(!match)continue;
     const usable=resolveBenchmark(model.id,model.reasoning_levels);
-    inventory.decisions[model.id]={by:'rule',slug:match.row.slug,at:now,reason:!usable?'当前通道没有 AA 已测等级':usable.row.score<AA_FLOOR?`当前可用等级 AA ${usable.row.score} 低于 ${AA_FLOOR}`:'名称已精确匹配 AA'};
+    inventory.decisions[model.id]={by:'rule',slug:match.row.slug,at:now,reason:!usable?'当前通道没有 AA 已测等级':usable.row.score<admissionAnchor().score?`当前可用等级 AA ${usable.row.score} 低于 ${admissionAnchor().name}`:tierOf(usable.row.priceInput)==='opus'?'AA 输入价格未知或超过 $2/M，不自动入组':'名称已精确匹配 AA'};
   }
 }
 export function inventoryView(inventory:ModelInventory){
