@@ -40,11 +40,22 @@ describe('employee sandbox launcher', () => {
     }
   });
 
+  test.skipIf(process.platform !== 'darwin')('only company Claude loads explicit private settings, even from a project cwd', () => {
+    const root = service();
+    const binary=join(root,'claude'), settings=join(root,'employee-settings.json');
+    writeFileSync(binary, '#!/bin/sh\nprintf "%s\\n" "$@"\n');chmodSync(binary,0o755);
+    writeFileSync(settings, '{}');
+    expect(run(root,{SCK_SANDBOX:'employee',SCK_CLAUDE_SETTINGS:settings},binary,'--model','claude-haiku-5-5')).toMatchObject({code:0,out:`--model\nclaude-haiku-5-5\n--settings\n${settings}\n`});
+    expect(run(root,{SCK_CLAUDE_SETTINGS:settings},binary,'owner')).toMatchObject({code:0,out:'owner\n'});
+    expect(run(root,{SCK_SANDBOX:'employee',SCK_CLAUDE_SETTINGS:'/missing'},binary).code).toBe(78);
+  });
+
   test.skipIf(process.platform !== 'darwin')('inside the sandbox credentials are unreadable, the sandbox cannot be edited, work files still are', () => {
     const root = service();
     const env = { SCK_SANDBOX: 'employee' };
     expect(run(root, env, '/bin/cat', join(root, 'private', 'service.env')).code).not.toBe(0);
     expect(run(root, env, '/usr/bin/touch', join(root, 'sandbox', 'employee.sb')).code).not.toBe(0);
+    expect(run(root, env, '/usr/bin/touch', join(root, 'private', 'employee-agents.json')).code).not.toBe(0);
     expect(run(root, env, '/bin/launchctl', 'list').code).not.toBe(0);
     expect(run(root, env, '/usr/bin/touch', join(root, 'evidence', 'ok')).code).toBe(0);
     expect(run(root, { SCK_COMM_DIR: '/c' }, '/bin/sh', '-c', 'echo $SCK_SANDBOX')).toMatchObject({ code: 0, out: 'employee\n' });

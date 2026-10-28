@@ -105,11 +105,43 @@ describe('goal final-gate invariants (AC01)', () => {
   test('a dependency that exists only in another goal is cross-goal, not a dangling edge', () => {
     const gate = ownerGate({ dependencies: ['ext-1'] });
     const result = assessGoal({ goal: goal(), tasks: [task('manual'), gate], outcome: outcome(), now: NOW,
-      externalDependencies: [{ taskId: 'gate', dependency: 'ext-1', goalId: 'g2' }] });
-    expect(result.graph.crossGoal).toEqual([{ taskId: 'gate', dependency: 'ext-1' }]);
+      externalDependencies: [{ taskId: 'gate', dependency: 'ext-1', goalId: 'g2', state: 'done' }] });
+    expect(result.graph.crossGoal).toEqual([{ taskId: 'gate', dependency: 'ext-1', goalId: 'g2', state: 'done' }]);
     expect(result.graph.dangling).toEqual([]);
     expect(result.repairReasons.map(reason => reason.code)).toContain('dependency_cross_goal');
+    expect(result.repairReasons.find(reason => reason.code === 'dependency_cross_goal')?.message).toContain('done');
     expect(result.readyToComplete).toBe(false);
+  });
+
+  test('a dependency that exists in the whole database with no goal is unscoped, never called missing', () => {
+    const gate = ownerGate({ dependencies: ['ext-done', 'ext-void'] });
+    const result = assessGoal({ goal: goal(), tasks: [task('manual'), gate], outcome: outcome(), now: NOW,
+      externalDependencies: [
+        { taskId: 'gate', dependency: 'ext-done', goalId: null, state: 'done' },
+        { taskId: 'gate', dependency: 'ext-void', goalId: null, state: 'void' },
+      ] });
+    expect(result.graph.unscoped).toEqual([
+      { taskId: 'gate', dependency: 'ext-done', state: 'done' },
+      { taskId: 'gate', dependency: 'ext-void', state: 'void' },
+    ]);
+    expect(result.graph.dangling).toEqual([]);
+    const reason = result.repairReasons.find(item => item.code === 'dependency_unscoped')!;
+    expect(reason.message).not.toContain('不存在');
+    expect(reason.message).toContain('external/unscoped');
+    expect(result.needsRepair).toBe(true);
+  });
+
+  test('a truly missing dependency stays dangling while same-goal edges and cycles are unchanged', () => {
+    const a = task('manual', { state: 'blocked', dependencies: ['gate'] });
+    const b = ownerGate({ state: 'blocked', dependencies: ['manual', 'gone'] });
+    const result = assessGoal({ goal: goal(), tasks: [a, b], outcome: outcome(), now: NOW,
+      externalDependencies: [{ taskId: 'gate', dependency: 'owned-elsewhere', goalId: 'g2' }] });
+    expect(result.graph.dangling).toEqual([{ taskId: 'gate', dependency: 'gone' }]);
+    expect(result.graph.crossGoal).toEqual([]);
+    expect(result.graph.unscoped).toEqual([]);
+    expect(result.graph.cycle).toBe(true);
+    expect(result.repairReasons.map(item => item.code)).toEqual(expect.arrayContaining(['dependency_cycle', 'dependency_dangling']));
+    expect(result.repairReasons.map(item => item.code)).not.toContain('dependency_cross_goal');
   });
 
   test('missing customer evidence blocks completion even after the final gate is done', () => {

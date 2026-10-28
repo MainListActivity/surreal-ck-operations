@@ -1,6 +1,6 @@
 import { RecordId, type Surreal } from "surrealdb";
 import type { ModelAssessment } from "../contracts.ts";
-import { digest, domainOf, type ModelResult } from "./policy.ts";
+import { digest, domainOf, generatedModel, type ModelResult } from "./policy.ts";
 export class ModelAssessmentRequired extends Error {
   constructor(readonly models:string[]) {super('Missing final model assessments')}
 }
@@ -32,13 +32,13 @@ export async function scoreModels(
   );
   const counts = new Map<string, { n: number; domain: string }>();
   for (const r of rows) {
-    if (!r.model) continue;
+    if (!r.model || generatedModel(r.model)) continue;
     const k = `general\0${r.model}`;
     const x = counts.get(k) ?? { n: 0, domain: "general" };
     x.n++;
     counts.set(k, x);
   }
-  const actual = [...new Set(rows.flatMap(r=>r.model?[r.model]:[]))].sort();
+  const actual = [...new Set(rows.flatMap(r=>r.model&&!generatedModel(r.model)?[r.model]:[]))].sort();
   if(counts.size>1 && actual.some(model=>!assessments?.some(a=>a.model===model))) throw new ModelAssessmentRequired(actual);
   // Replace all fractional evidence in one transaction; partial failures leave the previous evaluation intact.
   const vars: Record<string, unknown> = { task, employee };
@@ -70,12 +70,12 @@ export async function scoreModels(
     i++;
   }
   await db.query(sql + "COMMIT;", vars);
-  return [...new Set(rows.flatMap((r) => (r.model ? [r.model] : [])))].sort();
+  return [...new Set(rows.flatMap((r) => (r.model&&!generatedModel(r.model) ? [r.model] : [])))].sort();
 }
 export async function readModelResults(db: Surreal): Promise<ModelResult[]> {
   const [rows] = await db.query<[ModelResult[]]>(
     "SELECT model,domain,overall,weight,<string>at AS at,<string>task AS task FROM model_scorecard WHERE at>time::now()-180d AND task.state='done' ORDER BY at DESC LIMIT 10000;",
   );
-  return rows;
+  return rows.filter(row=>!generatedModel(row.model));
 }
 export { domainOf };

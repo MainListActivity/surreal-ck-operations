@@ -1,6 +1,6 @@
 import {readFile,writeFile,rename} from 'node:fs/promises';
 import {z} from 'zod';
-import {AA_FLOOR,resolveBenchmark,routable,splitMember,type CatalogModel} from './policy.ts';
+import {admissionAnchor,tierOf,resolveBenchmark,routable,generatedModel,splitMember,type CatalogModel} from './policy.ts';
 import type {AliasEntry,AliasFile} from './alias.ts';
 
 const decisionSchema=z.object({
@@ -35,7 +35,7 @@ export function reconcileInventory(inventory:ModelInventory,catalog:CatalogModel
   for(const [model,entry] of Object.entries(aliases))recordDecision(inventory,model,entry);
   for(const [group,members] of Object.entries(groups)){
     if(!/^sck-(fable|opus|sonnet|haiku)$/.test(group))continue;
-    for(const member of members){const model=splitMember(member).id;const held=inventory.grouped[model]??=[];if(!held.includes(group))held.push(group);
+    for(const member of members){const model=splitMember(member).id;if(generatedModel(model))continue;const held=inventory.grouped[model]??=[];if(!held.includes(group))held.push(group);
       inventory.decisions[model]??={by:'group',slug:null,at:now,reason:'已有分组接纳记录'};
     }
   }
@@ -44,14 +44,14 @@ export function reconcileInventory(inventory:ModelInventory,catalog:CatalogModel
     if(disabled.includes(model.id)){inventory.decisions[model.id]={by:'rule',slug:null,at:now,reason:'已人工禁用'};continue;}
     const match=resolveBenchmark(model.id);if(!match)continue;
     const usable=resolveBenchmark(model.id,model.reasoning_levels);
-    inventory.decisions[model.id]={by:'rule',slug:match.row.slug,at:now,reason:!usable?'当前通道没有 AA 已测等级':usable.row.score<AA_FLOOR?`当前可用等级 AA ${usable.row.score} 低于 ${AA_FLOOR}`:'名称已精确匹配 AA'};
+    inventory.decisions[model.id]={by:'rule',slug:match.row.slug,at:now,reason:!usable?'当前通道没有 AA 已测等级':usable.row.score<admissionAnchor().score?`当前可用等级 AA ${usable.row.score} 低于 ${admissionAnchor().name}`:tierOf(usable.row.priceInput)==='opus'?'AA 输入价格未知或超过 $2/M，不自动入组':'名称已精确匹配 AA'};
   }
 }
 export function inventoryView(inventory:ModelInventory){
-  const present=new Set(inventory.present);
+  const present=new Set(inventory.present.filter(model=>!generatedModel(model)));
   return {at:inventory.at,
-    grouped:Object.entries(inventory.grouped).map(([model,groups])=>({model,groups})),
-    decidedUngrouped:Object.entries(inventory.decisions).filter(([model])=>!inventory.grouped[model]).map(([model,d])=>({model,...d,present:present.has(model)})),
-    pending:inventory.present.filter(model=>!inventory.grouped[model]&&!inventory.decisions[model]),
+    grouped:Object.entries(inventory.grouped).filter(([model])=>!generatedModel(model)).map(([model,groups])=>({model,groups})),
+    decidedUngrouped:Object.entries(inventory.decisions).filter(([model])=>!generatedModel(model)&&!inventory.grouped[model]).map(([model,d])=>({model,...d,present:present.has(model)})),
+    pending:inventory.present.filter(model=>!generatedModel(model)&&!inventory.grouped[model]&&!inventory.decisions[model]),
   };
 }

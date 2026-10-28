@@ -1,15 +1,16 @@
 {
-  "version": "0.3.20",
-  "title": "演练 oracle 输出完整记录",
+  "version": "0.3.27",
+  "title": "远端渠道模型回归时自动刷新目录并恢复路由",
   "changes": [
-    "修复 AC04 证据记录缺陷（v0.3.19 生产实测发现）：runner 把 oracle 的 DRILL_ORACLE_OK 摘要截断到 500 字符，阳性对照的 deliveryId 被切断，记录的 oracle 证据无法解析回 JSON；现完整写入该阶段日志",
-    "新增回归：用超过 500 字符的 oracle 摘要断言日志中的摘要能被 JSON.parse 回读并含 leftoverDigestUnchanged 与阳性对照；把切片的旧写法恢复回去该用例立即失败（已实测）",
-    "保留 v0.3.19 的 worker 入口修复（从 serviceHome/active 启动、缺失时点名报错）与 v0.3.18 全部内容：node:net 端口探测、显式 Bun 运行时、frozen lockfile 双依赖、演练库常驻、通道与命名空间隔离、repoint 注入改正、prepare 日志按 release 命名、演练与权限回归接入 sidecar-review 门禁"
+    "组内成员不在 magpie catalog 时强制刷新 remote-magpie 渠道模型清单：不再等每日一次，独立 5 分钟节流，不新增定时器",
+    "适配临时额度窗口：渠道模型随窗口关闭从目录消失、窗口重开时自动被重新看见并按现有排序规则参与路由",
+    "仅 sck-* 组参与判定；owner 自建组、手动移除的成员和已配置的组顺序均不改写"
   ],
   "impact": [
-    "v0.3.19 上生产后真实 deploy_drill_run 已跑通（runId d501cea0，9/9 阶段 ok，两面 health/ready、sck 往返、repoint 拒绝与恢复、oracle 零误派零写入、清理均达成）；本次只补齐 oracle 摘要的完整可读记录，使 AC04 证据可被独立复核",
-    "演练仍不触生产 active/插件登记/MCP 端口/真实库与凭证；不绕过员工沙箱与验收，不新增付费资源"
+    "zcode 等临时额度渠道恢复供应后，无需人工操作即可在数分钟内进入 sck-haiku/sck-sonnet 路由",
+    "目录刷新增加时最多每 5 分钟一次，仅在有组内成员缺失时发生",
+    "不改数据库 schema、派工规则、模型评分与排序算法；回滚安全"
   ],
-  "migration": "无数据库迁移、无历史改写；仅改演练 runner 与测试，数据仍用演练根内独立库。",
-  "rollback": "保留健康 active；用当前受审 release 的 installer 回滚至升级前现役（执行时以 active 实际 SHA 为准），active 与插件面同时切回并过 RW06/SYS02/IR06/SYS06 守卫；演练根互不读取，无数据回滚。"
+  "migration": "无数据库迁移；新增 model-routing/catalog-refresh-missing.json 节流戳。",
+  "rollback": "通过标准安装器恢复上一固定发布。"
 }

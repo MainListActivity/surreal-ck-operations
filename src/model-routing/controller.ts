@@ -7,28 +7,29 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { type Surreal } from "surrealdb";
 import {
-  AA_FLOOR,
+  admissionAnchor,
   benchmarkRows,
   classify,
   resolveBenchmark,
   routable,
+  generatedModel,
   splitMember,
   tierOf,
   useAliases,
   TIERS,
   selectedTier,
-  canonicalModel,
-  tierPool,
+  performanceModel,
   digest,
   rank,
   type CatalogModel,
   type Domain,
   type Tier,
 } from "./policy.ts";
+import { ROUTING_SETTINGS_VERSION } from "./gateway.ts";
 import { setAgentModel } from "../dispatcher/agent-model.ts";
-import { employeeTier } from "./policy.ts";
+import { employeeTier, employeeClientModel } from "./policy.ts";
 import { createPaseoCli } from "../dispatcher/paseo.ts";
-import { GROUP_STAYS, saveMagpieGroups, magpieEnvironment } from "./magpie-admin.ts";
+import { GROUP_STAYS, GROUP_LEVELS, saveMagpieGroups, magpieEnvironment } from "./magpie-admin.ts";
 import { readModelResults } from "./store.ts";
 import { readModelHealth } from "./health.ts";
 import { GaugeHistory, metricTrend, readUsageSamples, type ModelTrends, type Sample } from "./trends.ts";
@@ -42,14 +43,15 @@ import type { JevClient } from "../dispatcher/jev.ts";
 const ALIAS_ASKS_PER_SYNC = 6;
 const DAY = 86400000;
 export interface MemberIssue { group: string; member: string; reason: string }
-/** A member breaks the owner's rule when the level it is sent at has no AA score of 38+, or that
- * score belongs to another band. Members are the owner's: issues are reported, never removed. */
+/** Report a member below the dynamic Luna Max floor or outside its AA input-price band; never remove owner members. */
 export function memberIssue(tier: Tier, member: string, levels: string[] | undefined): string | undefined {
   const r = resolveBenchmark(member, levels);
   if (!r) return splitMember(member).effort ? "AA 没有该思考等级的分数" : "AA 没有可用思考等级下的分数";
-  if (r.row.score < AA_FLOOR) return `AA ${r.row.score.toFixed(1)} 低于 ${AA_FLOOR}`;
-  const band = tierOf(r.row.score);
-  if (tier === "fable" ? band === "sonnet" : band !== tierPool(tier))
+  const floor=admissionAnchor();
+  if (r.row.score < floor.score) return `AA ${r.row.score.toFixed(1)} 低于 ${floor.name} (${floor.score.toFixed(2)})`;
+  const band = tierOf(r.row.priceInput);
+  if(band==='opus')return "AA 输入价格未知或超过 $2/M，不自动入组";
+  if (band !== tier)
     return `AA ${r.row.score.toFixed(1)} 属于 ${band} 档`;
   return;
 }
@@ -57,6 +59,18 @@ const exec = promisify(execFile);
 /** Bump to re-run the one-time grouping (owner rule changes). Otherwise membership is the owner's. */
 export const GROUPING_VERSION = "anchors-2026-10-23";
 /** magpie keeps routing groups in providers.json; read-only here, writes go through its save API. */
+/** Group members the catalog no longer lists: the state a closed-then-reopened vendor window leaves.
+ * Only sck-* groups count — other groups belong to the owner and are never sync-owned. */
+export function missingCatalogMembers(
+  models: Array<{ id: string }>,
+  groups: Record<string, string[]>,
+): boolean {
+  const listed = new Set(models.map((m) => m.id));
+  return Object.entries(groups).some(
+    ([id, members]) =>
+      id.startsWith("sck-") && (members ?? []).some((member) => !listed.has(splitMember(member).id)),
+  );
+}
 export function readMagpieGroups(file = join(homedir(), ".config", "magpie", "providers.json")): Record<string, string[]> {
   try {
     const groups = (JSON.parse(readFileSync(file, "utf8")) as { groups?: Array<{ id: string; members?: string[] }> }).groups ?? [];
@@ -64,6 +78,10 @@ export function readMagpieGroups(file = join(homedir(), ".config", "magpie", "pr
   } catch {
     return {};
   }
+}
+export function readMagpieLevels(file = join(homedir(), ".config/magpie/providers.json")): Record<string, string[]> {
+  const groups = JSON.parse(readFileSync(file, "utf8"))?.groups ?? [];
+  return Object.fromEntries(groups.map((g: {id:string; levels?:string[]}) => [g.id, g.levels ?? []]));
 }
 /** Each group's stickiness as magpie stored it; the default (`auto`) is stored as no field. */
 export function readMagpieAffinity(file = join(homedir(), ".config", "magpie", "providers.json")): Record<string, string> {
@@ -84,6 +102,14 @@ export interface RoutingConfig {
 }
 export function readMagpieProviderRouting(file=join(homedir(),'.config/magpie/providers.json')):Record<string,string>{
  try{const data=JSON.parse(readFileSync(file,'utf8'));return Object.fromEntries((data.providers??[]).map((p:{id:string;routing?:string})=>[p.id,p.routing??'smart']));}catch{return {};}
+}
+const nativeClientSignature = (role: string) => JSON.stringify({model:employeeClientModel(role),thinking:employeeTier(role)==='haiku'?'max':null});
+/** Installing transport settings is not proof that the native client model/effort was migrated. */
+export function needsEmployeeActivation(comm: string, role: string): boolean {
+  try {
+    return readFileSync(join(comm,".sck-model-router"),"utf8") !== ROUTING_SETTINGS_VERSION ||
+      readFileSync(join(comm,".sck-native-client"),"utf8") !== nativeClientSignature(role);
+  } catch {return true;}
 }
 export class ModelRoutingController {
   enabled = false;
@@ -106,6 +132,7 @@ export class ModelRoutingController {
       output?: (args: string[]) => Promise<string>;
       groups?: () => Record<string, string[]>;
       affinity?: () => Record<string, string>;
+      levels?: () => Record<string, string[]>;
       providerRouting?: () => Record<string,string>;
       jev?: JevClient;
       usageLog?: string;
@@ -148,20 +175,40 @@ export class ModelRoutingController {
     return stdout;
   }
   /** magpie fetches a vendor's model list only when asked; a relay's new models stay invisible
-   * until then. Once a day every remote-magpie provider is fetched again. */
-  private async refreshRemoteCatalogs(now = Date.now()): Promise<void> {
-    const stamp = join(this.home, "model-routing", "catalog-refresh.json");
+   * until then. Once a day every remote-magpie provider is fetched again. A forced run (group members
+   * missing from the catalog) keeps its own shorter stamp so a permanently removed model is checked
+   * every few minutes instead of on every sync, without turning the daily refresh into a poll. */
+  private async refreshRemoteCatalogs(now = Date.now(), force = false): Promise<boolean> {
+    const stamp = join(this.home, "model-routing", force ? "catalog-refresh-missing.json" : "catalog-refresh.json");
     try {
-      if (now - JSON.parse(await readFile(stamp, "utf8")).at < DAY) return;
+      if (now - JSON.parse(await readFile(stamp, "utf8")).at < (force ? 5 * 60_000 : DAY)) return false;
     } catch {}
     let providers: Array<{ id: string; preset?: string }> = [];
     try {
       providers = JSON.parse(await readFile(join(homedir(), ".config", "magpie", "providers.json"), "utf8")).providers ?? [];
     } catch {}
     for (const p of providers.filter((p) => p.preset === "remote-magpie"))
-      await this.output(["provider", "refresh", p.id]).catch((e) => console.warn(`magpie provider refresh ${p.id}: ${(e as Error).message.slice(0, 160)}`));
+      // `provider models <id>` is the CLI's fetch-and-list verb; `provider refresh` is not a
+      // subcommand and failed silently inside the catch, leaving the daily refresh a no-op.
+      await this.output(["provider", "models", p.id]).catch((e) => console.warn(`magpie provider models ${p.id}: ${(e as Error).message.slice(0, 160)}`));
     await mkdir(join(this.home, "model-routing"), { recursive: true, mode: 0o700 });
     await writeFile(stamp, JSON.stringify({ at: now }), { mode: 0o600 });
+    // A forced fetch just refreshed every relay provider, so the daily stamp is current too.
+    if (force) await writeFile(join(this.home, "model-routing", "catalog-refresh.json"), JSON.stringify({ at: now }), { mode: 0o600 });
+    return true;
+  }
+  private async fetchCatalog(): Promise<{ data: CatalogModel[] }> {
+    const reply = await (this.io.fetch ?? fetch)(
+      "http://127.0.0.1:3425/v1/models",
+      { signal: AbortSignal.timeout(10000) },
+    );
+    if (!reply.ok) throw Error(`magpie catalog unavailable: ${reply.status}`);
+    return (await reply.json()) as { data: CatalogModel[] };
+  }
+  /** True when an sck-* group still routes to a member the catalog no longer lists (or never listed):
+   * that is exactly the state a closed-then-reopened vendor window leaves behind. */
+  private async catalogMissesMembers(models: CatalogModel[]): Promise<boolean> {
+    return missingCatalogMembers(models, this.io.groups?.() ?? readMagpieGroups());
   }
   /** For the owner's console: every vendor-name decision, and members breaking the band rule. */
   async identity(): Promise<{
@@ -234,6 +281,7 @@ export class ModelRoutingController {
   }
   /** Jev's input for one group: accounts and quota, AA rank and price, 7-day usage, task performance. */
   async rankingFacts(ids: string[]): Promise<ModelFacts[]> {
+    ids = ids.filter(id=>!generatedModel(id));
     const now = this.io.now?.() ?? Date.now();
     const [quota, usage, results, observations, health] = await Promise.all([
       this.rankingQuota(now).catch(() => new Map()),
@@ -252,7 +300,7 @@ export class ModelRoutingController {
     const candidates = ids.map((id) => known.get(id) ?? { id, model: id.slice(id.lastIndexOf("/") + 1), tier: "sonnet" as Tier, prior: 2.5, estimated: true, context: 0 });
     const performance = new Map<string, {score:number;samples:number}>();
     for (const candidate of candidates) {
-      const evidence = results.filter(r => canonicalModel(r.model) === canonicalModel(candidate.id));
+      const evidence = results.filter(r => performanceModel(r.model) === performanceModel(candidate.id));
       const samples = evidence.reduce((sum,r) => sum + r.weight, 0);
       if (samples > 0) performance.set(candidate.id,{score:Math.round(evidence.reduce((sum,r)=>sum+r.overall*r.weight,0)/samples*100)/100,samples});
     }
@@ -269,7 +317,7 @@ export class ModelRoutingController {
         trends[name]=metricTrend(raw[name]??[],now,unit,"request");
       // One task is one independent quality observation, even if several employees used this model.
       const tasks = new Map<string,{at:number;sum:number;weight:number}>();
-      for(const r of results.filter(r=>canonicalModel(r.model)===canonicalModel(f.id))) {
+      for(const r of results.filter(r=>performanceModel(r.model)===performanceModel(f.id))) {
         if(!r.task)continue;
         const row=tasks.get(r.task)??{at:Date.parse(r.at),sum:0,weight:0};
         row.sum+=r.overall*r.weight;row.weight+=r.weight;row.at=Math.max(row.at,Date.parse(r.at));tasks.set(r.task,row);
@@ -345,16 +393,16 @@ export class ModelRoutingController {
     if (!this.enabled || Date.now() - this.sessionsChecked < 30000) return;
     this.sessionsChecked = Date.now();
     const [rows] = await this.db.query<
-      [Array<{ paseo_agent_id: string; workspace_cwd?: string; role:string }>]
+      [Array<{ id: {id:unknown}; paseo_agent_id: string; workspace_cwd?: string; role:string }>]
     >(
-      "SELECT paseo_agent_id,workspace_cwd,role FROM employee WHERE provider='claude' AND role!='story-author' AND retired!=true AND revoked!=true AND paseo_agent_id!=NONE AND active_task=NONE LIMIT 100;",
+      "SELECT id,paseo_agent_id,workspace_cwd,role FROM employee WHERE provider='claude' AND role!='story-author' AND retired!=true AND revoked!=true AND paseo_agent_id!=NONE AND active_task=NONE LIMIT 100;",
     );
     const paseo = createPaseoCli(undefined, { timeoutMs: 5000 });
     const pending = rows
       .filter(
         (row) =>
           row.workspace_cwd &&
-          ( !existsSync(join(row.workspace_cwd, ".sck-model-router")) || readFileSync(join(row.workspace_cwd, ".sck-model-router"),"utf8") !== "v2" ),
+          needsEmployeeActivation(join(this.home,"comm",String(row.id.id)),row.role),
       )
       .slice(0, 3);
     for (const row of pending) {
@@ -362,8 +410,9 @@ export class ModelRoutingController {
         .status(row.paseo_agent_id)
         .catch(() => undefined);
       if (status?.status === "idle" && status.pendingPermissions === 0) {
-        if (!await setAgentModel(row.paseo_agent_id,`group/sck-${employeeTier(row.role)}`)) continue;
+        if (!await setAgentModel(row.paseo_agent_id,employeeClientModel(row.role), {thinkingOptionId:employeeTier(row.role)==='haiku'?'max':undefined})) continue;
         await paseo.reload(row.paseo_agent_id);
+        await writeFile(join(this.home,"comm",String(row.id.id),".sck-native-client"),nativeClientSignature(row.role),{mode:0o600});
       }
     }
   }
@@ -380,17 +429,20 @@ export class ModelRoutingController {
       return;
     }
     if (!this.io.command) await this.refreshRemoteCatalogs();
-    const reply = await (this.io.fetch ?? fetch)(
-      "http://127.0.0.1:3425/v1/models",
-      { signal: AbortSignal.timeout(10000) },
-    );
-    if (!reply.ok) throw Error(`magpie catalog unavailable: ${reply.status}`);
-    const catalog = (await reply.json()) as { data: CatalogModel[] };
+    let catalog = await this.fetchCatalog();
+    // A relay can drop a vendor's models when a trial window closes and bring them back when a new
+    // window opens. Waiting for the daily remote refresh would leave the group routing to members the
+    // catalog cannot see, so any group member missing from the catalog forces a refresh of the relay
+    // providers — rate-limited so a permanently removed model does not poll them on every sync.
+    if (!this.io.command && await this.catalogMissesMembers(catalog.data)) {
+      if (await this.refreshRemoteCatalogs(Date.now(), true)) catalog = await this.fetchCatalog();
+    }
     this.catalog = catalog.data;
     const dir0 = join(this.home, "model-routing");
     await mkdir(dir0, { recursive: true, mode: 0o700 });
     // Daily AA scores and prices, so new models are placed by today's leaderboard, not the bundled one.
     const aa = this.io.command ? loadAa(join(dir0, "aa.json")) : await refreshAa(join(dir0, "aa.json"));
+    if (aa?.admissionBlocked) throw Error("AA 最新 Luna Max 锚点缺失，暂停新增分组，保留现有配置");
     if (aa) useBenchmarks(aa.models);
     let state: { version?: string; known?: string[] } = {};
     try {
@@ -424,9 +476,8 @@ export class ModelRoutingController {
     const models = classify(catalog.data).filter(
       (m) => !config?.disabledModels?.includes(m.id),
     );
-    for (const m of models)
-      if (config?.tierOverrides?.[m.id]) m.tier = selectedTier(config.tierOverrides[m.id]) ?? m.tier;
-    if (!models.length) throw Error("no usable magpie models");
+    // Legacy overrides do not bypass new-model admission; manual group membership stays authoritative.
+
     const results = await readModelResults(this.db);
     const dir = join(this.home, "model-routing");
     await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -436,6 +487,7 @@ export class ModelRoutingController {
     } catch {}
     const groups: Record<string, string> = {};
     const routes: Record<string, Array<{ model: string; score: number; samples: number }>> = {};
+    const groupLevels = this.io.levels?.() ?? (this.io.command ? {} : readMagpieLevels());
     const groupsToSet: Array<{ id: string; models: string[]; signature: string }> = [];
     // Membership is the owner's. Automatic grouping runs once per GROUPING_VERSION and afterwards
     // only places models this controller has never seen; manual adds and removals in magpie stay.
@@ -452,25 +504,20 @@ export class ModelRoutingController {
     };
     const issues: MemberIssue[] = [];
     const tiers = TIERS;
-    for (const [level, tier] of tiers.entries()) {
-      // Opus belongs to the owner in Magpie: no creation, membership/effort normalization,
+    for (const tier of tiers) {
+      // Manual groups belong to the owner in Magpie: no creation, membership/effort normalization,
       // new-model placement, persisted pins, ranking or routing/stickiness writes.
-      if (tier === "opus") continue;
-      // An empty staff tier borrows the next stronger one: an upgrade, never a silent downgrade.
-      // Fable is owner-only and has nothing stronger; while its models are excluded it serves Opus.
-      const pool = (t: Tier) => models.filter((m) => m.tier === tierPool(t));
-      const bucket =
-        [...tiers.slice(0, level + 1).reverse(), ...(tier === "fable" ? (["opus"] as Tier[]) : [])]
-          .map(pool)
-          .find((b) => b.length) ?? [];
+      if (tier === "opus" || tier === "fable") continue;
+      // Staff groups have independent price bands; an empty group never borrows another band.
+      const bucket = models.filter(m=>m.tier===tier);
       const current = live[`sck-${tier}`];
       const ids = initializing || !current
         ? bucket.map((m) => m.member ?? m.id)
-        : [...current.map(pinned), ...fresh.filter((m) => tierPool(m.tier) === tierPool(tier) && !holds(current, m.id)).map((m) => m.member ?? m.id)];
+        : [...current.filter(member=>!generatedModel(member)).map(pinned), ...fresh.filter((m) => m.tier === tier && !holds(current, m.id)).map((m) => m.member ?? m.id)];
       if (!ids.length) {
         groups[`sck-${tier}`] = digest("[]");
         routes[`group/sck-${tier}`] = [];
-        if (initializing) throw Error(`magpie tier ${tier} has no models or stronger fallback`);
+
         continue; // emptied by hand: leave it as the owner set it
       }
       // A model added by hand may have no score: it keeps a neutral prior and is still ordered.
@@ -481,15 +528,15 @@ export class ModelRoutingController {
         return { ...(known ?? { model: base.slice(base.lastIndexOf("/") + 1), tier, estimated: true, context: 0 }), id: member, prior };
       });
       const byRank = rank(candidates, results);
-      const jev = tier === "fable" ? [] : this.orders[`sck-${tier}`] ?? [];
+      const jev = this.orders[`sck-${tier}`] ?? [];
       // A member pinned since Jev last ranked keeps its place under its bare id.
       const at = (id: string) => {
         const i = jev.indexOf(id) >= 0 ? jev.indexOf(id) : jev.findIndex((x) => splitMember(x).id === splitMember(id).id);
         return i < 0 ? jev.length : i;
       };
-      const baseOrder = tier === "fable" && !initializing ? candidates.map(m => byRank.find(r => r.id === m.id)!) : byRank;
+      const baseOrder = byRank;
       const ordered = baseOrder.map((m, i) => ({ m, i })).sort((a, b) => at(a.m.id) - at(b.m.id) || a.i - b.i).map((x) => x.m);
-      const members = tier==='fable'||this.ruleOrders.has(`sck-${tier}`)||ranking?.results?.[`sck-${tier}`]?.engine?.startsWith('quality-pace-')
+      const members = this.ruleOrders.has(`sck-${tier}`)||ranking?.results?.[`sck-${tier}`]?.engine?.startsWith('quality-pace-')
         ?ordered.map(m=>m.id):pinnedOrder(ordered.map(m=>m.id),ranking?.pins?.[`sck-${tier}`]);
       const positions = new Map(members.map((id, i) => [id, i]));
       ordered.sort((a,b) => positions.get(a.id)! - positions.get(b.id)!);
@@ -500,7 +547,7 @@ export class ModelRoutingController {
       const signature = digest(JSON.stringify(members));
       groups[`sck-${tier}`] = signature;
       // A group whose stickiness differs is rewritten too: membership alone would leave it as it was.
-      if (JSON.stringify(current) !== JSON.stringify(members) || (stays[`sck-${tier}`] ?? GROUP_STAYS) !== GROUP_STAYS)
+      if (JSON.stringify(current) !== JSON.stringify(members) || (stays[`sck-${tier}`] ?? GROUP_STAYS) !== GROUP_STAYS || JSON.stringify(groupLevels[`sck-${tier}`] ?? []) !== JSON.stringify(GROUP_LEVELS))
         groupsToSet.push({ id: `sck-${tier}`, models: members, signature });
       routes[`group/sck-${tier}`] = ordered.map((m) => ({ model: m.id, score: m.score, samples: m.samples }));
     }
@@ -517,6 +564,7 @@ export class ModelRoutingController {
           `models=${g.models.join(",")}`,
           "routing=order",
           `stays=${GROUP_STAYS}`,
+          `levels=${GROUP_LEVELS.join(",")}`,
         ]);
       }
     } else await saveMagpieGroups(this.cli, groupsToSet, isCurrent);
@@ -532,7 +580,7 @@ export class ModelRoutingController {
     await saveInventory(inventoryFile,inventory);
     const [storyModels] = await this.db.query<[string[]]>("SELECT VALUE model FROM employee_def WHERE role='story-author';");
     for (const id of Object.keys(previous)) {
-      if (id === 'sck-opus' || !id.startsWith('sck-') || id in groups || storyModels?.includes(`group/${id}`)) continue;
+      if (id === 'sck-opus' || id === 'sck-fable' || !id.startsWith('sck-') || id in groups || storyModels?.includes(`group/${id}`)) continue;
       if (preparing) groups[id] = previous[id]!; // the previous gateway still owns live leases until release switch
       // Already gone is done: a sync that died after removing groups but before writing groups.json
       // (or a concurrent one) must not fail every later sync.

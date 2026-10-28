@@ -7,7 +7,7 @@ import type { ModelTrends } from "./trends.ts";
 import type { ModelHealth } from "./health.ts";
 import type { Surreal } from "surrealdb";
 import type { JevClient, JevResult } from "../dispatcher/jev.ts";
-import { aaRankOfScore, resolveBenchmark, splitMember, type Effort, type Tier } from "./policy.ts";
+import { aaRankOfScore, generatedModel, resolveBenchmark, splitMember, type Effort, type Tier } from "./policy.ts";
 
 /** Opus is maintained entirely in Magpie; only Sonnet and Haiku use deterministic ranking. */
 export const RANKED_TIERS: Tier[] = ["sonnet", "haiku"];
@@ -129,7 +129,7 @@ export function modelFacts(
     performance: Map<string, { score: number; samples: number }>;
   },
 ): ModelFacts[] {
-  return ids.map((id) => {
+  return ids.filter(id=>!generatedModel(id)).map((id) => {
     const base = splitMember(id).id;
     const entry = sources.catalog.find((m) => m.id === base);
     const free = entry?.free === true || (entry?.pricing?.input === 0 && entry?.pricing?.output === 0) || FREE.test(`${id} ${entry?.display_name ?? ""} ${entry?.magpie_label ?? ""} ${entry?.owned_by ?? ""}`);
@@ -188,6 +188,7 @@ const overTtftLimit=(f:ModelFacts|undefined,limit:number|undefined)=>limit!==und
 
 /** One Jev call per group: a priority score per member, highest first; ties keep the current order. */
 export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts: ModelFacts[], beforeAsk?: (payload: RankingRequestPayload) => Promise<void>, afterAnswer?: (result: RankingResultSnapshot) => void, onAttempt?: (attempt:RankingAttempt) => Promise<void>): Promise<string[]> {
+  facts = facts.filter(f=>!generatedModel(f.id));
   const keys = facts.map((_, i) => `m${i}`);
   if (!facts.length) return [];
   const {payload,attempt}=buildRankingInput(jev.model,tier,rules.trim() || DEFAULT_RANKING_RULES,facts,LEVELS);

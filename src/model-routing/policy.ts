@@ -51,18 +51,15 @@ export function taskTier(task: {model_tier?: string; kind?: string; executor_rol
 export function employeeTier(role?: string): Tier {
   return role === "gm" ? "opus" : role === "product" ? "sonnet" : "haiku";
 }
-export function managedModel(def: {provider?: string; model?: string; role?: string} | undefined): boolean {
-  return def?.role !== "story-author" && def?.provider === "claude" && !!def?.model?.startsWith("group/sck-") && !!selectedTier(def.model?.replace(/^group\/sck-(engineering|writing|general)-/, ""));
+/** A client's native name exposes Paseo controls; only the gateway selects the actual task tier. */
+export function employeeClientModel(role?: string): string {
+  return `claude-${employeeTier(role)}-5-5`;
 }
-/** Owner rule: no tier may hold a model scoring below this on the AA Intelligence Index. Unscored is not admitted. */
-export const AA_FLOOR = 38;
+export function managedModel(def: {provider?: string; model?: string; role?: string} | undefined): boolean {
+  return !!def && def.role !== "story-author" && def.provider === "claude";
+}
+/** Staff admission uses the latest measured Luna Max score and AA input prices, never fixed AA points. */
 export const tierRank = (t: Tier) => TIERS.indexOf(t);
-/** Owner rule (2026-10-23): boundaries are models, not numbers, so a rescored anchor moves its line.
- * <= deepseek-v4.1-flash: Sonnet and Haiku (one shared pool); above it up to and including
- * claude-sonnet-5.5: Opus; above sonnet-5.5: Fable. */
-export const TIER_ANCHORS = { opusAbove: "deepseek-v4.1-flash", fableAbove: "claude-sonnet-5-5" } as const;
-/** Haiku has no band of its own; it serves the Sonnet pool. */
-export const tierPool = (t: Tier): Tier => (t === "haiku" ? "sonnet" : t);
 export const EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type Effort = typeof EFFORTS[number];
 /** magpie fixes a member's reasoning with `provider/model:<effort>` (optionally `:fast` after it). */
@@ -81,11 +78,13 @@ const normalize = (s: string) =>
     .replace(/@\d+[km]?$/, "") // magpie's context variant: grok-4.7@500k is grok-4.7
     .replace(/[._\s]+/g, "-")
     .replace(/-free$|:free$/, "");
-/** One model served through several accounts shares its task evidence, whatever level it is pinned to. */
+/** AA name matching only; never use this channel-free key for execution evidence. */
 export const canonicalModel = (id: string) => {
   const base = splitMember(id).id;
   return normalize(base.slice(base.lastIndexOf("/") + 1));
 };
+/** Execution evidence belongs to the exact channel and model; only routing effort suffixes are omitted. */
+export const performanceModel = (id: string): string => splitMember(id).id;
 export interface BenchmarkRow {
   slug: string;
   score: number;
@@ -160,47 +159,67 @@ export const aaRankOfScore = (score: number) => dataset.filter((x) => x.score > 
 export function benchmarkOf(model: string): BenchmarkRow | undefined {
   return resolveBenchmark(model)?.row;
 }
-function anchorScore(model: string): number {
-  const score = benchmarkOf(model)?.score;
-  if (score === undefined) throw Error(`tier anchor ${model} has no AA score`);
-  return score;
+/** Latest numbered Luna version, explicitly measured at Max; aliases and higher scores cannot select the anchor. */
+export function admissionAnchor(rows: readonly BenchmarkRow[] = dataset): BenchmarkRow {
+  const candidates = rows.flatMap(row => {
+    const name = row.name?.match(/^GPT[- ](\d+(?:[.\-]\d+)*)[- ]Luna\s*\(/i);
+    if (!name || !Number.isFinite(row.score)) return [];
+    return [{row,version:name[1]!.split(/[.\-]/).map(Number)}];
+  }).sort((a,b) => {
+    for(let i=0;i<Math.max(a.version.length,b.version.length);i++){
+      const delta=(b.version[i]??0)-(a.version[i]??0);if(delta)return delta;
+    }
+    return a.row.slug.localeCompare(b.row.slug);
+  });
+  if(!candidates.length)throw Error('latest Luna Max anchor has no AA score');
+  const latest=candidates[0]!;
+  const max=candidates.find(c=>c.version.join('.')===latest.version.join('.')&&effortOfName(c.row.name)==='max');
+  if(!max)throw Error('latest Luna Max anchor has no AA score');
+  return max.row;
 }
-export function tierOf(score: number): Tier {
-  return score > anchorScore(TIER_ANCHORS.fableAbove) ? "fable"
-    : score > anchorScore(TIER_ANCHORS.opusAbove) ? "opus" : "sonnet";
+/** No intelligence ceiling. Unknown/expensive AA input prices are not auto-admitted. */
+export function tierOf(priceInput?: number | null): Tier {
+  // Opus is only a reference category here: it is owner-maintained and never auto-populated.
+  if (priceInput == null || !Number.isFinite(priceInput) || priceInput < 0) return 'opus';
+  return priceInput <= 1 ? 'haiku' : priceInput <= 2 ? 'sonnet' : 'opus';
 }
 /** Exact version matches only. A preview/opaque vendor alias never inherits another model's benchmark.
- * Models without a public score, or below AA_FLOOR, are left out of every tier. */
+ * Missing anchor/score/price never silently admits a model. */
 /** A concrete chat model; groups, auto routers and embeddings are never members. */
+/** Magpie-generated routers are not concrete models, including remote-magpie/auto/... wrappers. */
+export function generatedModel(id: string): boolean {
+  return /(?:^|\/)(?:group|auto)(?:\/|$)/.test(splitMember(id).id);
+}
 export const routable = (m: CatalogModel) =>
   m.type !== "embedding" &&
-  !/^(group|auto)\//.test(m.id) &&
-  !/\/group\//.test(m.id) &&
+  !generatedModel(m.id) &&
   !/\/(auto|combo:.*)$/.test(m.id) &&
   (!m.native_endpoints || m.native_endpoints.some((p) => /messages|responses|chat/.test(p)));
 export function classify(catalog: CatalogModel[]): ModelCandidate[] {
+  const floor=admissionAnchor().score;
   return catalog
     .filter(routable)
-    .map<ModelCandidate>((m) => {
+    .flatMap<ModelCandidate>((m) => {
       const model = m.id.slice(m.id.lastIndexOf("/") + 1);
       const resolved = resolveBenchmark(m.id, m.reasoning_levels);
       const b = resolved?.row;
       const score = b?.score;
-      return {
+      if(score === undefined || !Number.isFinite(score) || score < floor)return [];
+      const tier = tierOf(b?.priceInput);
+      return [{
         id: m.id,
         model,
         member: pinEffort(m.id, resolved?.effort),
         effort: resolved?.effort,
-        tier: score === undefined ? "sonnet" : tierOf(score),
+        tier,
         prior:
-          score === undefined ? 2.5 : Math.max(1, Math.min(5, 1 + score / 15)),
+          Math.max(1, Math.min(5, 1 + score / 15)),
         benchmark: b?.slug,
         estimated: b?.estimated ?? true,
         context: m.context_window ?? m.context_length ?? 32768,
         score,
-      };
+      }];
     })
-    .filter((m) => m.score !== undefined && m.score >= AA_FLOOR)
     .sort((a, b) => b.prior - a.prior || a.id.localeCompare(b.id));
 }
 /** Decayed task evidence with an eight-task prior; calls/tokens never become independent quality samples. */
@@ -217,7 +236,7 @@ export function rank(
         samples = 0;
       for (const r of results)
         if (
-          canonicalModel(r.model) === canonicalModel(m.id) &&
+          performanceModel(r.model) === performanceModel(m.id) &&
           Number.isFinite(r.overall) &&
           r.overall >= 1 &&
           r.overall <= 5 &&
@@ -245,8 +264,7 @@ export function modelIdentity(
   if (
     !provider ||
     !model ||
-    /^(group|auto)\//.test(model) ||
-    /\/group\//.test(model)
+    generatedModel(model) || generatedModel(`${provider}/${model}`)
   )
     return undefined;
   return model.startsWith(`${provider}/`) ? model : `${provider}/${model}`;

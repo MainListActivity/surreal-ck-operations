@@ -13,23 +13,36 @@ import {
   ModelRoutingController,
 } from "../src/model-routing/controller.ts";
 import { RecordId } from "surrealdb";
-import { restoreRoutingSettings } from "../src/model-routing/gateway.ts";
+import { restoreEmployeeRoutingSettings } from "../src/model-routing/gateway.ts";
 import { createPaseoCli } from "../src/dispatcher/paseo.ts";
 import { setAgentModel } from "../src/dispatcher/agent-model.ts";
 import { execFileSync } from "node:child_process";
-import { TIERS, employeeTier } from "../src/model-routing/policy.ts";
+import { TIERS, employeeTier, employeeClientModel } from "../src/model-routing/policy.ts";
 import { applyRoutingRoster } from "../src/model-routing/roster.ts";
 import { Workforce } from "../src/workforce.ts";
 const release = resolve(import.meta.dir, "..");
 const { loadServiceEnv, serviceHome } = await import("../plugin/server/env.ts");
 loadServiceEnv();
 const mode = process.argv[2];
-if (!["enable", "migrate", "roster", "disable", "status"].includes(mode ?? ""))
-  throw Error("usage: model-routing-admin.ts enable|migrate|roster|disable|status");
+if (!["enable", "migrate", "roster", "disable", "status", "clients"].includes(mode ?? ""))
+  throw Error("usage: model-routing-admin.ts enable|migrate|roster|disable|status|clients");
 const db = new CompanyDatabase(loadDatabaseConfig());
 try {
   await db.connect();
   await db.useDatabase();
+  if (mode === "clients") {
+    const [config] = await db.db.query<[{paused?:boolean}]>("SELECT paused FROM ONLY company_meta:config;");
+    if (config?.paused !== true) throw Error("Pause dispatch before updating employee client defaults");
+    const workforce = new Workforce(db,join(serviceHome(),"private","credentials"));
+    const defs = (await workforce.defs()).filter(d=>d.provider==='claude'&&d.role!=='story-author');
+    const dir=join(serviceHome(),"model-routing");mkdirSync(dir,{recursive:true,mode:0o700});
+    const backup=join(dir,"employee-native-clients-before.json");
+    if(!existsSync(backup))writeFileSync(backup,JSON.stringify(defs,null,2),{mode:0o600});
+    for(const def of defs) await workforce.upsertDef(def.id,{...def,model:employeeClientModel(def.role),
+      thinking:employeeTier(def.role)==='haiku'?'max':def.thinking});
+    await db.db.query("UPDATE employee SET model = IF role='gm' THEN 'claude-opus-5-5' ELSE IF role='product' THEN 'claude-sonnet-5-5' ELSE 'claude-haiku-5-5' END WHERE provider='claude' AND role!='story-author' AND retired!=true RETURN NONE;");
+    console.log(JSON.stringify({updatedDefinitions:defs.length,runningSessions:'unchanged; native model and v3 settings applied only after lease ends'}));
+  }
   if (mode === "roster") {
     const workforce = new Workforce(db,join(serviceHome(),"private","credentials"));
     const dir=join(serviceHome(),"model-routing");mkdirSync(dir,{recursive:true,mode:0o700});
@@ -59,7 +72,7 @@ try {
     const created = changes.filter(d=>!defs.some(old=>old.id===d.id)).map(d=>new RecordId('employee_def',d.id));
     await db.db.query("UPDATE company_meta:model_routing SET created_defs=array::union(created_defs??[],$created);",{created});
     // Persist Claude employees' new defaults; a busy conversation reloads only after its current lease ends.
-    await db.db.query(`UPDATE employee SET model = IF role='gm' THEN 'group/sck-opus' ELSE IF role='product' THEN 'group/sck-sonnet' ELSE 'group/sck-haiku' END
+    await db.db.query(`UPDATE employee SET model = IF role='gm' THEN 'claude-opus-5-5' ELSE IF role='product' THEN 'claude-sonnet-5-5' ELSE 'claude-haiku-5-5' END
       WHERE provider='claude' AND role!='story-author' AND retired!=true RETURN NONE;`);
     console.log(JSON.stringify({rosterChanges:changes.map(d=>({id:d.id,role:d.role,provider:d.provider,model:d.model,enabled:d.enabled})),storyAuthors:'unchanged'}));
 
@@ -118,8 +131,7 @@ try {
     let restored = 0,
       pending = 0;
     for (const e of employees) {
-      if (e.workspace_cwd?.startsWith(join(serviceHome(), "comm") + "/"))
-        restored += Number(restoreRoutingSettings(e.workspace_cwd));
+      if (e.id) restored += Number(restoreEmployeeRoutingSettings(serviceHome(),String(e.id.id),e.workspace_cwd));
       if (!e.paseo_agent_id) continue;
       const status = await paseo
         .status(e.paseo_agent_id)
