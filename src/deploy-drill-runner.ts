@@ -24,6 +24,8 @@ export interface DrillHost {
   repo: string;
   forkBinary: string;
   /** The parent service home: the pinned runtime-bun is copied from here into the drill root. */
+  /** The Bun every drill child runs under (never Node: process.execPath is Node in the plugin face). */
+  bun: string;
   serviceHome: string;
   exec: DrillExec;
   state: (plan: DrillPlan) => { status: string } | undefined;
@@ -120,14 +122,14 @@ export async function runDrill(plan: DrillPlan, host: DrillHost): Promise<{ repo
         await waitHealthy(exec, `http://127.0.0.1:${plan.mcpPort}/health`);
         await waitHealthy(exec, `http://127.0.0.1:${plan.mcpPort}/ready`);
         const faceLog = join(plan.logsRoot, `plugin-face-${sha.slice(0, 8)}.log`);
-        const facePid = await exec.spawnDetached(process.execPath, [join(release, 'scripts', 'deploy-drill-face.ts'), 'serve', plan.root],
+        const facePid = await exec.spawnDetached(host.bun, [join(release, 'scripts', 'deploy-drill-face.ts'), 'serve', plan.root],
           { env: {}, logFile: faceLog });
         pids.push(facePid);
         await waitHealthy(exec, `http://127.0.0.1:${plan.mcpPort}/ready`);
         // The channel round-trip is the real client-cli -> sidecar -> drill-fork path (`sck call get_context`):
         // a separate client process writes the request and reads the answer, exactly like production `sck call`.
         const channel = JSON.parse(readFileSync(join(plan.root, 'face-channel.json'), 'utf8')) as { SCK_COMM_DIR: string; SCK_COMM_KEY: string };
-        const relay = await exec.run(process.execPath, [join(release, 'src', 'mcp', 'client-cli.ts'), 'call', 'get_context', '{}'],
+        const relay = await exec.run(host.bun, [join(release, 'src', 'mcp', 'client-cli.ts'), 'call', 'get_context', '{}'],
           { env: { SCK_COMM_DIR: channel.SCK_COMM_DIR, SCK_COMM_KEY: channel.SCK_COMM_KEY } });
         if (relay.code !== 0 || !relay.stdout.includes('"principal"')) {
           throw new Error(`plugin-face channel probe failed: ${(relay.stderr || relay.stdout).slice(0, 300)}`);
@@ -153,7 +155,7 @@ export async function runDrill(plan: DrillPlan, host: DrillHost): Promise<{ repo
     await facesUp(plan.candidateSha, 'switch');
     // oracle: seed leftovers on the drill DB, then prove zero misdispatch / zero write with the candidate's own code.
     await drillPhase(plan, host, stages, 'oracle', plan.candidateSha, async log => {
-      const r = await exec.run(process.execPath, [join(plan.releasesRoot, plan.candidateSha, 'scripts', 'deploy-drill-oracle.ts'), plan.root], {}).then(assertOk);
+      const r = await exec.run(host.bun, [join(plan.releasesRoot, plan.candidateSha, 'scripts', 'deploy-drill-oracle.ts'), plan.root], {}).then(assertOk);
       log(r.stdout.trim().slice(0, 500));
     });
     await facesUp(plan.baseSha, 'rollback');
@@ -188,7 +190,7 @@ const drillDbEnv = (plan: DrillPlan) => ({
 async function waitHealthy(exec: DrillExec, url: string): Promise<void> {
   for (let n = 0; n < 200; n++) {
     if (await exec.healthy(url)) return;
-    await Bun.sleep(50);
+    await new Promise(resolve => setTimeout(resolve, 50));
   }
   throw new Error(`drill face did not become healthy: ${url}`);
 }

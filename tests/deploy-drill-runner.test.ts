@@ -51,7 +51,7 @@ const plan = (root: string): DrillPlan => ({
 });
 
 const host = (exec: DrillExec, serviceHome: string, states: unknown[]): DrillHost => ({
-  repo: serviceHome, forkBinary: '/fixture/surreal', serviceHome, exec,
+  repo: serviceHome, forkBinary: '/fixture/surreal', serviceHome, bun: '/fixture/bun', exec,
   state: () => undefined,
   writeState: (_plan, state) => { states.push(state); },
 });
