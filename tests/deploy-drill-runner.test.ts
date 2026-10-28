@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readFileSync as rf, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runDrill, type DrillExec, type DrillHost } from '../src/deploy-drill-runner.ts';
@@ -8,7 +9,9 @@ import type { DrillPlan } from '../src/deploy-drill.ts';
 
 /** The detached worker entry must ship with the runner: startDrill spawns it by path. */
 test('drill worker entry exists and wires runDrillDetached', () => {
-  const entry = new URL('../src/deploy-drill-run.ts', import.meta.url).pathname;
+  // fileURLToPath, not .pathname: the release lives under "Application Support", and .pathname leaves the space
+  // percent-encoded, so existsSync would look for a path that cannot exist.
+  const entry = fileURLToPath(new URL('../src/deploy-drill-run.ts', import.meta.url));
   expect(existsSync(entry)).toBe(true);
   expect(rf(entry, 'utf8')).toContain('runDrillDetached');
 });

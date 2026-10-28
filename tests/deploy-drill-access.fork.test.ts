@@ -8,7 +8,7 @@
 // Every refusal is asserted twice: the error code, and the absence of the side effects a guard placed too late would
 // have produced (a drill root under the service home, and an audit row for deploy_drill_run).
 import { afterAll, beforeAll, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CompanyDatabase } from '../src/database.ts';
@@ -25,7 +25,6 @@ let gm: string, engineer: string, peerEngineer: string, qa: string, product: str
 let launched = 0;
 
 const password = 'drill-access-fixture-only';
-const REPO = join(import.meta.dir, '..');
 
 async function auditCount(): Promise<number> {
   const [rows] = await db.db.query<[Array<{ count: number }>]>("SELECT count() AS count FROM audit WHERE action = 'deploy_drill_run' GROUP ALL;");
@@ -52,7 +51,8 @@ beforeAll(async () => {
   // leaves behind, not what the drill does once started (AC04 covers that with a real run).
   // The seam mirrors startDrill's one filesystem effect (it creates the drill root before spawning), so the
   // replay guard sees the same state a real launch leaves behind.
-  core = new SurrealCompanyCore(db, { companyReleaseRepo: REPO, drillLaunch: (_home, _repo, plan) => {
+  shas();
+  core = new SurrealCompanyCore(db, { companyReleaseRepo: opsRepo, drillLaunch: (_home, _repo, plan) => {
     mkdirSync(plan.root, { recursive: true }); launched += 1; return 4242;
   } });
   const enroll = new LocalEnrollmentAdmin(db);
@@ -78,17 +78,34 @@ async function heldTask(key: string): Promise<{ taskId: string; runId: string; b
   // One lease per employee at a time, so each fixture holder is its own engineering employee.
   const holder = await new LocalEnrollmentAdmin(db).enroll(`access-holder-${key}`, 'engineering', ['execute', 'review']);
   await core.claim(holder, created.id);
-  return { taskId: created.id, runId: UUID(), baseSha: (await shas()).base, candidateSha: (await shas()).candidate, holder };
+  return { taskId: created.id, runId: UUID(), baseSha: shas().base, candidateSha: shas().candidate, holder };
 }
+// A self-contained fixture repo: the gate runs this file from an extracted release tree, which has no .git, so
+// reading the real history would make the test depend on where it runs. Two commits are enough for the plan
+// validator's ancestry and commit-existence checks.
 let shasCache: { base: string; candidate: string } | undefined;
-async function shas() {
+function shas() {
   if (!shasCache) {
-    const out = Bun.spawnSync(['git', '-C', REPO, 'rev-list', '--max-count=2', 'HEAD'], { stdout: 'pipe' }).stdout.toString();
-    const [candidate, base] = out.trim().split('\n');
-    shasCache = { base: base!, candidate: candidate! };
+    const repo = join(dir, 'ops-repo');
+    mkdirSync(repo, { recursive: true });
+    const git = (...args: string[]) => {
+      const result = Bun.spawnSync(['git', '-C', repo, '-c', 'user.name=fixture', '-c', 'user.email=fixture@invalid', ...args], { stdout: 'pipe', stderr: 'pipe' });
+      if (result.exitCode) throw new Error(result.stderr.toString());
+      return result.stdout.toString().trim();
+    };
+    git('init', '-q', '-b', 'main');
+    writeFileSync(join(repo, 'base.txt'), 'base\n');
+    git('add', '.'); git('commit', '-qm', 'base');
+    const base = git('rev-parse', 'HEAD');
+    writeFileSync(join(repo, 'candidate.txt'), 'candidate\n');
+    git('add', '.'); git('commit', '-qm', 'candidate');
+    const candidate = git('rev-parse', 'HEAD');
+    opsRepo = repo;
+    shasCache = { base, candidate };
   }
   return shasCache;
 }
+let opsRepo = '';
 const input = (t: { taskId: string; runId: string; baseSha: string; candidateSha: string }) => ({
   taskId: t.taskId, runId: t.runId, baseSha: t.baseSha, candidateSha: t.candidateSha, idempotencyKey: `drill-${t.runId}`,
 });
