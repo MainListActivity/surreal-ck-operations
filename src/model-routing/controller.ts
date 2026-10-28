@@ -12,6 +12,7 @@ import {
   classify,
   resolveBenchmark,
   routable,
+  generatedModel,
   splitMember,
   tierOf,
   useAliases,
@@ -248,6 +249,7 @@ export class ModelRoutingController {
   }
   /** Jev's input for one group: accounts and quota, AA rank and price, 7-day usage, task performance. */
   async rankingFacts(ids: string[]): Promise<ModelFacts[]> {
+    ids = ids.filter(id=>!generatedModel(id));
     const now = this.io.now?.() ?? Date.now();
     const [quota, usage, results, observations, health] = await Promise.all([
       this.rankingQuota(now).catch(() => new Map()),
@@ -482,7 +484,7 @@ export class ModelRoutingController {
       const current = live[`sck-${tier}`];
       const ids = initializing || !current
         ? bucket.map((m) => m.member ?? m.id)
-        : [...current.map(pinned), ...fresh.filter((m) => tierPool(m.tier) === tierPool(tier) && !holds(current, m.id)).map((m) => m.member ?? m.id)];
+        : [...current.filter(member=>!generatedModel(member)).map(pinned), ...fresh.filter((m) => tierPool(m.tier) === tierPool(tier) && !holds(current, m.id)).map((m) => m.member ?? m.id)];
       if (!ids.length) {
         groups[`sck-${tier}`] = digest("[]");
         routes[`group/sck-${tier}`] = [];

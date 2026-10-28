@@ -1,3 +1,4 @@
+import { generatedModel } from './model-routing/policy.ts';
 import { createHash } from 'node:crypto';
 import { RecordId, type Surreal } from 'surrealdb';
 import { scoreModels } from './model-routing/store.ts';
@@ -105,7 +106,7 @@ export async function collectEvalState(db: Surreal, taskId: TaskId, excludeEmplo
     "SELECT employee,model,fence,phase,<string>at AS at,<string>ended_at AS ended_at FROM model_execution WHERE task=$task AND completed=true AND status>=200 AND status<300 AND phase!='auxiliary' ORDER BY at ASC LIMIT 2001;", {task});
   if (modelExecutions.length>2000) throw new Error("Model evidence exceeds 2000 executions; final evaluation requires a complete timeline");
   return {
-    modelExecutions,
+    modelExecutions:modelExecutions.filter(r=>!r.model||!generatedModel(r.model)),
     timelineTruncated:auditRows.length>TIMELINE_LIMIT,
     taskId, goalId: row.goal ? asId(row.goal) : undefined,
     title: row.title, context: String(row.context ?? '').slice(0, CONTEXT_CHARS),
@@ -127,7 +128,7 @@ export interface ModelEvidence {
 export function summarizeModelEvidence(rows: NonNullable<EvalState['modelExecutions']>): ModelEvidence[] {
   const by = new Map<string, Map<string, ModelEvidence['models'][number]>>();
   for (const r of rows) {
-    if (!r.model) continue;
+    if (!r.model || generatedModel(r.model)) continue;
     const models = by.get(r.employee) ?? new Map();
     by.set(r.employee, models);
     const m = models.get(r.model) ?? { model: r.model, executions: 0, fences: [], phases: [], first: r.at, last: r.at };
@@ -154,13 +155,13 @@ export function validateScores(state: EvalState, scores: EmployeeScore[]): strin
   const dims = ['quality', 'evidence', 'discipline', 'timeliness', 'overall'] as const;
   for (const s of scores) {
     if (!state.participants.includes(s.employee)) return `Not a participant: ${s.employee}`;
-    const required = new Set(state.modelExecutions?.filter(r=>r.employee===s.employee && r.model).map(r=>r.model));
+    const required = new Set(state.modelExecutions?.filter(r=>r.employee===s.employee && r.model && !generatedModel(r.model)).map(r=>r.model));
     // Name the gap: an eval employee is entitled to these models, and a bare refusal turned scoring into guessing.
     const missing = [...required].filter(m=>!s.modelScores?.some(a=>a.model===m)).sort();
     if (required.size>1 && missing.length) return `Missing model assessments: ${s.employee} needs ${missing.join(', ')}`;
     const models = s.modelScores;
     if (models) {
-      const actual = new Set(state.modelExecutions?.filter(r=>r.employee===s.employee && r.model).map(r=>r.model));
+      const actual = new Set(state.modelExecutions?.filter(r=>r.employee===s.employee && r.model && !generatedModel(r.model)).map(r=>r.model));
       if (new Set(models.map(m=>m.model)).size !== models.length) return `Duplicate model assessment: ${s.employee}`;
       for (const m of models) {
         if (!actual.has(m.model)) return `Invalid model assessment: ${m.model} is not a model of ${s.employee} (actual: ${[...actual].sort().join(', ') || 'none'})`;

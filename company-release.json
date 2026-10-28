@@ -1,5 +1,5 @@
 {
-  "version": "0.3.22",
+  "version": "0.3.23",
   "title": "目标治理图外部依赖的真实分类",
   "changes": [
     "目标治理卡对离开本目标的依赖按全库真实事实分类：属于其他 goal 的记 crossGoal 并带 goalId 与引用任务真实状态；存在但无任何 goal 的记 unscoped（external/unscoped）；只有全库查不到的行才记 dangling。",
