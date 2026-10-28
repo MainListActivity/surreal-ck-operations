@@ -514,9 +514,14 @@ export class WaitStore {
         IF $t.blocked_to = 'owner' { THROW 'owner gate still holds' };
         LET $unsat = SELECT VALUE count() FROM $t.dependencies WHERE state NOT IN ['done', 'void'] GROUP ALL;
         IF ($unsat[0] ?? 0) > 0 { THROW 'dependencies incomplete' };
+        LET $manager = $t.dependency_continuation = 'manager';
+        LET $restore_state = IF $t.resume_state = 'review' THEN 'review' ELSE 'ready' END;
         LET $next = UPDATE ONLY $t.id SET
-          state = IF $t.resume_state = 'review' THEN 'review' ELSE 'ready' END,
-          blocked_to = NONE, resume_state = NONE, resume_role = NONE,
+          state = IF $manager THEN 'blocked' ELSE $restore_state END,
+          blocked_to = IF $manager THEN 'gm' ELSE NONE END,
+          resume_state = IF $manager THEN $t.resume_state ELSE NONE END,
+          resume_role = IF $manager THEN $t.resume_role ELSE NONE END,
+          dependency_continuation = NONE,
           current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
           wait_state = NONE, wait_kind = NONE, wait_episode = NONE, wait_not_before = NONE,
           wait_expires_at = NONE, wait_next_check_at = NONE, wait_owner_role = NONE,
@@ -530,11 +535,12 @@ export class WaitStore {
           kind: $event_kind, provider: $provider, external_id: $external_id, at_ms: $at, accepted: true,
           actor: $actor, created_at: time::now() };` : ''}
         CREATE ONLY $audit CONTENT { task: $w.task, actor: $w.entered_by, action: 'wait_released',
-          evidence: $evidence, version: $next.version, at: time::now(),
-          phase: IF $next.state = 'review' THEN 'review' ELSE 'execute' END };
+          evidence: $evidence + IF $manager THEN '（依赖续接=manager，任务回到GM关口）' ELSE '' END, version: $next.version, at: time::now(),
+          phase: IF $next.state = 'review' THEN 'review' ELSE 'execute' END, continuation: IF $manager THEN 'manager' ELSE NONE END };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $w.task, kind: 'wait_released', sequence: $sequence.value,
-          payload: { version: $next.version, state: $next.state, wait_key: $w.wait_key, source: $source }, at: time::now() };
+          payload: { version: $next.version, state: $next.state, wait_key: $w.wait_key, source: $source,
+            continuation: IF $manager THEN 'manager' ELSE NONE END }, at: time::now() };
         RETURN $next;
         COMMIT;`, {
         wait: waitId(row.waitKey), expected: row.version,

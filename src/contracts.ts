@@ -649,6 +649,22 @@ export interface DeferTaskUntil {
   expectedVersion?: number;
 }
 
+/**
+ * gm only: append real prerequisites to an existing execute-phase dependency wait. The original
+ * wait reference and every existing dependency stay in place; the task remains blocked and is
+ * never auto-resumed — when the wait and all prerequisites finish it returns to GM instead.
+ */
+export interface AppendDependencyPrerequisites {
+  taskId: TaskId;
+  /** Real task ids in the same goal; at least one must not already be a dependency. */
+  dependencies: TaskId[];
+  /** Business reason; audited with the before/after snapshot and the preserved wait reference. */
+  text: string;
+  idempotencyKey: string;
+  /** Required optimistic concurrency: refuse when the task version has moved. */
+  expectedVersion: number;
+}
+
 /** gm/product: retire a task to the terminal 'void' state; dependents stop waiting on it. */
 export interface RetireTask {
   taskId: TaskId;
@@ -1310,6 +1326,13 @@ export interface CompanyCore {
   resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView>;
   /** gm only: a gm block becomes a dependency wait — stays blocked for the dispatcher; the last dependency restores ready (execute) or review (provable non-owner review block). */
   deferTaskUntil(credential: Credential, input: DeferTaskUntil): Promise<TaskView>;
+  /**
+   * gm only: append real prerequisites to an existing execute-phase dependency wait under manager
+   * continuation. The wait reference and existing dependencies stay; owner gates, review-phase
+   * waits, live leases, cross-goal/cyclic dependencies and terminal tasks are refused. It never
+   * resumes the task, clears faults/budgets or widens ordinary dispatch. Optional for old adapters.
+   */
+  appendDependencyPrerequisites?(credential: Credential, input: AppendDependencyPrerequisites): Promise<TaskView>;
   /** gm/product: mark a task 'void' (terminal), release any lease on it, and unlock dependents that were waiting only on it. */
   retireTask(credential: Credential, input: RetireTask): Promise<TaskView>;
   /** gm (manage): read-only dry-run of repointing a quick/software goal's acceptance reference; writes nothing. */
