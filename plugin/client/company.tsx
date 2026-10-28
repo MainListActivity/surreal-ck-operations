@@ -598,7 +598,7 @@ function CompanyUpgradeCard({item,ctx,onDone}:{item:import("../shared/types").Up
  const s=makeStyles(ctx),start=useRpc(rpc.upgrade);
  const [feedback,setFeedback]=useState("");
  const mutation=useMutation({mutationFn:()=>start({taskId:item.taskId,taskVersion:item.taskVersion,digest:item.plan.digest}),onSuccess:()=>{setFeedback("升级已启动，完成后自动回复通过");onDone();},onError:e=>setFeedback((e as Error).message)});
- const busy=mutation.isPending||["queued","preparing","checking","installing","verifying"].includes(item.status),done=item.status==="succeeded";
+ const busy=mutation.isPending||["queued","preparing","checking","installing","verifying"].includes(item.status),done=item.status==="succeeded",stale=item.retired===true;
  const rows=(title:string,items:string[])=><View style={{gap:4}}><Text style={s.muted}>{title}</Text>{items.map((t,i)=><Text key={i} style={s.text}>• {t}</Text>)}</View>;
  return <View style={[s.card,{gap:12}]}>
   <Text style={s.muted}>公司系统升级 · {item.phase}</Text>
@@ -607,7 +607,7 @@ function CompanyUpgradeCard({item,ctx,onDone}:{item:import("../shared/types").Up
   {rows("数据变化",[item.plan.migration])}{rows("回退方式",[item.plan.rollback])}
   <ExpandableText text={`提交 SHA：${item.plan.sha}`} lines={1} style={s.muted} ctx={ctx}/>
   {(item.error||feedback)?<Text style={s.text}>{item.error||feedback}</Text>:null}
-  {done?<Text style={s.text}>升级完成，已自动回复通过</Text>:<Pressable accessibilityRole="button" accessibilityLabel={`升级至 v${item.plan.version}`} disabled={busy} style={[s.button,{opacity:busy?0.55:1}]} onPress={()=>mutation.mutate()}><Text style={s.buttonText}>{busy?item.phase:`升级至 v${item.plan.version}`}</Text></Pressable>}
+  {done?<Text style={s.text}>升级完成，已自动回复通过</Text>:stale?<Text style={s.text}>该版本已被现役版本取代，无需再安装；这张旧待办会自动收口。</Text>:<Pressable accessibilityRole="button" accessibilityLabel={`升级至 v${item.plan.version}`} disabled={busy} style={[s.button,{opacity:busy?0.55:1}]} onPress={()=>mutation.mutate()}><Text style={s.buttonText}>{busy?item.phase:`升级至 v${item.plan.version}`}</Text></Pressable>}
  </View>;
 }
 

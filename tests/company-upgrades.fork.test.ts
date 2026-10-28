@@ -137,3 +137,76 @@ run('company version actions bypass Jev routing and approval, including stale di
  const dispatcher=new Dispatcher({workforce:{tasks:async()=>[{kind:'release',state:'review',version:before,row:{company_upgrade:t.companyUpgrade}},{kind:'deploy',state:'blocked',blockedTo:'owner',version:before,row:{company_upgrade:t.companyUpgrade}}],judgeInput:async()=>{calls++;throw Error('must not ask Jev');}},owner:{triagePending:async()=>[]},jev:{model:'fixture',ask:async()=>{calls++;throw Error('must not call Jev');}}} as never);
  await (dispatcher as any).jevDecisions({jevDecisions:true},{decisions:[],errors:[]});expect(calls).toBe(0);
 });
+
+/** A task parked on an owner handoff, exactly as SYS05 leaves it: blocked_to cleared, the condition in task_wait. */
+async function handoffTask(){
+ const taskId=crypto.randomUUID();
+ await db.db.query("CREATE $task CONTENT {title:'公司系统上线交接',context:'fixture',kind:'deploy',executor_role:'engineering',reviewer_role:'qa',state:'ready',version:1,fence:0,dependencies:[],code_repo_path:$repo};",{task:new RecordId('task',taskId),repo});
+ // One employee holds one active task at a time; each handoff gets its own engineer.
+ const who=await new LocalEnrollmentAdmin(db).enroll(`handoff-engineer-${++count}`,  'engineering',['execute','review']);
+ const c=await core.claim(who,taskId);
+ // The real sequence: the engineer submits the merged release, gets it returned for the deployment leg, and then parks
+ // the task on the owner handoff whose pendingAction is the owner's version click — the state 0029e642 is in.
+ const submitted=await core.submit(who,{taskId,deliveryId:c.deliveryId,fence:c.fence,expectedVersion:c.task.version},
+  {...note('公司系统已合入 main，等待老板点升级卡执行双面部署。'),companyUpgrade:{sha:newSha}});
+ const reviewer=await new LocalEnrollmentAdmin(db).enroll(`handoff-qa-${count}`,'qa',['execute','review']);
+ const rc=await core.claim(reviewer,taskId);
+ const returned=await core.returnTask(reviewer,{taskId,deliveryId:rc.deliveryId,fence:rc.fence,expectedVersion:rc.task.version},
+  note('交付未完成：部署腿须由老板点升级卡触发，先按交接等待退回实现人继续收口。'));
+ // The returned task is ready again; the engineer takes it back before parking it on the owner handoff.
+ const again=await core.claim(who,taskId);
+ return core.wait(who,{taskId,deliveryId:again.deliveryId,fence:again.fence,expectedVersion:again.task.version},
+  {text:'fixture: 公司 v0.2.0 已合入 main，部署须由老板点升级卡触发独立升级作业。',idempotencyKey:`handoff-${count}-${taskId}`},
+  {kind:'owner_handoff',reason:'公司版本已合入 main，受控双面部署须由老板点击升级卡触发独立升级作业。',
+   completed:['PR 已合入 origin/main'],pendingAction:'老板在收件箱点击「升级至 v0.2.0」',text:'fixture owner handoff'} as never);
+}
+
+run('an owner handoff task keeps its upgrade card reachable',async()=>{
+ const t=await handoffTask();
+ expect(t.state).toBe('blocked');expect(t.blockedTo).toBeUndefined();
+ const [only]=await db.db.query<[{wait_kind:string;wait_owner_role:string}]>('SELECT wait_kind,wait_owner_role FROM ONLY $t;',{t:new RecordId('task',t.id)});
+ expect(only.wait_kind).toBe('owner_handoff');expect(only.wait_owner_role).toBe('owner');
+ const state=await service.state();
+ const card=state.items.find(i=>i.taskId===t.id);
+ expect(card?.plan.version).toBe('0.2.0');
+ const j=await service.start({taskId:t.id,taskVersion:t.version,digest:card!.plan.digest},'owner:test');
+ await runCompanyUpgrade(service,j.jobId,{run:async(_exe,args)=>{if(args[1]==='install'){rmSync(join(home,'active'));symlinkSync(args[2]!,join(home,'active'));}},verify:async()=>{}});
+ expect((await service.job(j.jobId))!.status).toBe('succeeded');
+ const [after]=await db.db.query<[{state:string;wait_kind?:string;blocked_to?:string}]>(
+  'SELECT state,wait_kind,blocked_to FROM ONLY $t;',{t:new RecordId('task',t.id)});
+ expect(after!.wait_kind).toBeUndefined();expect(after!.state).toBe('ready');
+ const [waits]=await db.db.query<[Array<{state:string}>]>('SELECT state FROM task_wait WHERE task=$t;',{t:new RecordId('task',t.id)});
+ expect(waits.every(w=>w.state==='released')).toBe(true);
+});
+
+run('installing a version closes the pending cards of every older version',async()=>{
+ rmSync(join(home,'active'));symlinkSync(join(home,'releases',oldSha),join(home,'active'));
+ const current=await handoffTask(),pending=await handoffTask();
+ // The second card asks for a version older than the one being installed, so it is an obsoleted TODO.
+ await db.db.query('UPDATE $t SET company_upgrade=$plan;',{t:new RecordId('task',pending.id),
+  plan:{...(await readCompanyRelease(repo,newSha)),version:'0.1.5'}});
+ const j=await service.start({taskId:current.id,taskVersion:current.version,digest:current.companyUpgrade!.digest},'owner:test');
+ await runCompanyUpgrade(service,j.jobId,{run:async(_exe,args)=>{if(args[1]==='install'){rmSync(join(home,'active'));symlinkSync(args[2]!,join(home,'active'));}},verify:async()=>{}});
+ expect((await service.job(j.jobId))!.status).toBe('succeeded');
+ const [closed]=await db.db.query<[{state:string;wait_kind?:string}]>(
+  'SELECT state,wait_kind FROM ONLY $t;',{t:new RecordId('task',pending.id)});
+ expect(closed!.wait_kind).toBeUndefined();expect(closed!.state).toBe('ready');
+ const [waits]=await db.db.query<[Array<{state:string}>]>('SELECT state FROM task_wait WHERE task=$t;',{t:new RecordId('task',pending.id)});
+ expect(waits.every(w=>w.state==='released')).toBe(true);
+});
+
+run('an obsoleted version card is shown as retired and cannot be installed again',async()=>{
+ rmSync(join(home,'active'));symlinkSync(join(home,'releases',newSha),join(home,'active'));
+ // A real older release exists in history, so the plan's version and package.json agree and only the ordering refuses it.
+ const old=git(['rev-parse',`${newSha}~1`]);
+ writeFileSync(join(repo,'package.json'),'{"version":"0.1.5"}');
+ writeFileSync(join(repo,'company-release.json'),JSON.stringify({...notes,version:'0.1.5'}));
+ git(['add','.']);git(['-c','user.name=fixture','-c','user.email=fixture@invalid','commit','-m','older']);const olderSha=git(['rev-parse','HEAD']);
+ git(['fetch','origin','main']);
+ const t=await task();
+ await db.db.query('UPDATE $t SET company_upgrade=$plan;',{t:new RecordId('task',t.id),plan:{...(await readCompanyRelease(repo,olderSha))}});
+ const state=await service.state();
+ const card=state.items.find(i=>i.taskId===t.id);
+ expect(card?.retired).toBe(true);expect(card?.phase).toContain('替代');
+ expect(await service.start({taskId:t.id,taskVersion:t.version,digest:card!.plan.digest},'owner:test').catch((e:{code?:string})=>e.code)).toBe('invalid');
+});

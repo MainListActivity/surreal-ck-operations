@@ -96,8 +96,9 @@ export async function runCompanyUpgrade(service:CompanyUpgrades,id:string,option
    await run('sh',[join(target,'scripts/release-gate.sh'),'slow-pipe',target],home);
    await run('sh',[join(target,'scripts/release-gate.sh'),'sidecar-review',target],home);
    // Revalidate the owner's pending task after preparation; a stale click must not switch anything.
-   const t=await db.select<{version:number;state:string;blocked_to?:string;reviewer_role:string}>(job.task);
-   if(!t||t.version!==job.task_version||!((t.state==='blocked'&&t.blocked_to==='owner')||(t.state==='review'&&t.reviewer_role==='owner')))throw Error('owner task moved');
+   const t=await db.select<{version:number;state:string;blocked_to?:string;reviewer_role:string;wait_kind?:string;wait_owner_role?:string}>(job.task);
+   if(!t||t.version!==job.task_version||!((t.state==='blocked'&&t.blocked_to==='owner')||(t.state==='review'&&t.reviewer_role==='owner')
+     ||(t.state==='blocked'&&t.wait_kind==='owner_handoff'&&t.wait_owner_role==='owner')))throw Error('owner task moved');
    if((await installedRelease(home)).sha!==current.sha)throw Error('another release replaced the current version');
    // Pause ownership and the recovery snapshot are one atomic write. A retry
    // retains the original state only while its pause revision is still current.
@@ -125,6 +126,10 @@ export async function runCompanyUpgrade(service:CompanyUpgrades,id:string,option
   healthy=true;
   await db.query('CREATE audit CONTENT {task:$task,actor:$source,action:"company_upgrade_verified",evidence:$evidence,at:time::now()};',{task:job.task,source:job.source,evidence:`v${job.plan.version} ${job.plan.sha}；固定快照、双门禁、active、健康/ready、插件来源与schema/vendor核验通过。`});
   try{await service.finish(job);}catch{await service.update(id,'awaiting_reply','已升级，自动回复待完成','版本已验证上线，但任务状态已变化或验收条件尚未满足；未替代独立验收。');}
+  // An installed version answers every older pending version card by construction. This runs after the job's own task
+  // is settled and never rolls the install back: a card that cannot be closed stays in the inbox for the next pass.
+  await installedRelease(home).then(now=>service.closeSuperseded({version:now.version,sha:now.sha},job.source))
+    .catch(error=>console.error(`close superseded upgrade cards failed: ${String((error as Error).message??error)}`));
  }catch{
   healthy=false;
   let recovered=false;

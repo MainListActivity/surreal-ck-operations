@@ -21,11 +21,13 @@ function fakeBun(path: string, version: string, label: string) {
   chmodSync(path, 0o755);
 }
 
-// The files the sidecar-review gate runs (scripts/release-gate.sh): the sidecar regression plus the deployment-source association.
+// The files the sidecar-review gate runs (scripts/release-gate.sh): the sidecar regression, the deployment-source
+// association, and the SYS06 effective-policy contract that needs the company fork database.
 const SIDECAR_REVIEW_FILES = [
   'tests/dispatcher-sidecar.fork.test.ts',
   'tests/deployment-source.test.ts',
   'tests/deployment-source.fork.test.ts',
+  'tests/effective-policy.fork.test.ts',
 ];
 
 // A stand-in Bun that writes the arguments it was handed, one per line, so the shape of the call is visible: a quoted
@@ -241,6 +243,8 @@ test.skipIf(!existsSync('/usr/bin/python3'))('a sidecar-review gate run records 
     // SYS02 N1-R: the sidecar-review gate also runs the deployment-source association tests.
     writeFileSync(join(release, 'tests', 'deployment-source.test.ts'), '');
     writeFileSync(join(release, 'tests', 'deployment-source.fork.test.ts'), '');
+    // SYS06: the effective-policy contract regression rides the same gate; it needs the company fork database.
+    writeFileSync(join(release, 'tests', 'effective-policy.fork.test.ts'), '');
     const pinned = join(home, 'runtime-bun', 'bin', 'bun');
     writeFileSync(pinned, '#!/bin/sh\n[ "$1" = --version ] && { echo 1.4.2; exit 0; }\necho "sidecar stand-in, fork=${RUN_SCK_CHANNEL_FORK_TESTS:-0}"\nexit "${FAKE_TEST_RC:-0}"\n');
     chmodSync(pinned, 0o755);
