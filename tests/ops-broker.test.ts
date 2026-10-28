@@ -58,7 +58,7 @@ describe('ops gate', () => {
       'ops_idp_client_info', 'ops_idp_client_register', 'ops_idp_principal_list', 'ops_idp_principal_mint', 'ops_idp_principal_revoke',
       'ops_idp_provision_rotate',
       'ops_info', 'ops_internal_ai_approval_diagnose', 'ops_internal_ai_deliver', 'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_revoke', 'ops_internal_ai_rotate_key', 'ops_internal_ai_trust',
-      'ops_invitation_issue', 'ops_login', 'ops_logout', 'ops_member_add', 'ops_member_list', 'ops_member_remove',
+      'ops_invitation_issue', 'ops_login', 'ops_logout', 'ops_magpie_route_sample', 'ops_magpie_window_prepare', 'ops_member_add', 'ops_member_list', 'ops_member_remove',
       'ops_operator_login', 'ops_origin_health', 'ops_origin_logs', 'ops_origin_status', 'ops_query', 'ops_request', 'ops_supplier_plan_sample', 'ops_workspace_ensure',
     ]);
   });

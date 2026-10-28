@@ -35,6 +35,9 @@ import {
 } from './idp-principals.ts';
 import { productRequest, ProductUnreachable, type ProductResult } from './product.ts';
 import { SUPPLIER_ADAPTER, SUPPLIER_PROVIDER, SUPPLIER_SERVICE, sampleSupplierPlan, supplierAliasFromSecretName } from './supplier.ts';
+import { MAGPIE_ADAPTER, MAGPIE_PROVIDER, magpieWindowFromEvidence, sampleMagpieRoute } from './magpie.ts';
+import { loadProofFiles } from './proof-files.ts';
+import { MAGPIE_EXECUTION_HEADROOM_SECONDS, MAGPIE_SNAPSHOT_MAX_AGE_SECONDS } from './proof-contract.ts';
 import { clip, redactJson, redactText } from './redact.ts';
 import { SessionStore, type OpsSession } from './sessions.ts';
 import { InternalAiProofBridge } from './proof-bridge.ts';
@@ -64,7 +67,7 @@ export const OPS_TOOLS = [
   'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_principal_list', 'ops_idp_admin_request',
   'ops_idp_provision_rotate', 'ops_invitation_issue',
   'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_approval_diagnose', 'ops_internal_ai_deliver', 'ops_internal_ai_revoke', 'ops_internal_ai_trust', 'ops_internal_ai_rotate_key',
-  'ops_supplier_plan_sample', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs',
+  'ops_supplier_plan_sample', 'ops_magpie_route_sample', 'ops_magpie_window_prepare', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
 
@@ -88,6 +91,11 @@ export interface OpsDeps {
   queryAsUser?: QueryAsUser;
   browser?: BrowserInjector;
   originAgent?: OriginAgent;
+  /**
+   * Trusted Magpie wiring. Production leaves this unset and the sampler resolves the owner's
+   * loopback gateway (MAGPIE_ADDR / stash / default); tests inject the fake gateway and config.
+   */
+  magpie?: { base?: string; endpointSource?: 'env' | 'stash' | 'default' | 'injected'; readProviders?: () => Promise<string> };
   /**
    * SYS05: bounded close of one browser task space when the lease ends. Absent means the space is reported as
    * pending cleanup — never claimed as closed. The closer must not expose a token.
@@ -350,6 +358,8 @@ export class OpsBroker {
       ops_idp_provision_rotate: (ctx, args) => this.idpProvisionRotate(ctx, args),
       ops_invitation_issue: (ctx, args) => this.invitationIssue(ctx, args),
       ops_supplier_plan_sample: (ctx, args) => this.supplierPlanSample(ctx, args),
+      ops_magpie_route_sample: (ctx, args) => this.magpieRouteSample(ctx, args),
+      ops_magpie_window_prepare: (ctx, args) => this.magpieWindowPrepare(ctx, args),
       ops_origin_status: (ctx) => this.origin(ctx, { op: 'status' }),
       ops_origin_health: (ctx) => this.origin(ctx, { op: 'health' }),
       ops_origin_logs: (ctx, args) => this.origin(ctx, originLogsRequest(args)),
@@ -627,6 +637,18 @@ export class OpsBroker {
         supplierPlanSampling: {
           provider: SUPPLIER_PROVIDER, adapter: SUPPLIER_ADAPTER, service: SUPPLIER_SERVICE,
           aliases: [...supplierKinds.entries()].map(([alias, kinds]) => ({ alias, credentials: [...kinds].sort() })),
+        },
+        magpieRouteSampling: {
+          provider: MAGPIE_PROVIDER, adapter: MAGPIE_ADAPTER, group: 'group/work',
+          snapshotMaxAgeSeconds: MAGPIE_SNAPSHOT_MAX_AGE_SECONDS, executionHeadroomSeconds: MAGPIE_EXECUTION_HEADROOM_SECONDS,
+          aliases: [...supplierKinds.entries()]
+            .filter(([, kinds]) => kinds.has('USERNAME') && kinds.has('PASSWORD'))
+            .map(([alias]) => alias),
+          disclosures: [
+            'quota windows are percentages plus resetsAt, never an absolute balance',
+            'pricing is observed from the gateway catalog and stays unreviewed until a price decision exists',
+            'unknown cost stays null; the document is local evidence, not a provider commitment',
+          ],
         },
         // Public client identifiers only (never secrets), so employees can align the channels
         // with what the IdP has registered (ops_idp_client_info) and the product hard-binds.
@@ -1607,8 +1629,64 @@ export class OpsBroker {
     };
   }
 
-  // ---------- generic, session-bound ----------
+  /**
+   * `ops_magpie_route_sample {env?, alias, purpose}`: the controlled, read-only Magpie route
+   * snapshot. It reads only the loopback gateway's public surfaces plus providers.json, binds the
+   * sealed supplier identity to the serving gateway account, and writes a v4 evidence document and
+   * receipt. It never calls a model, never reads a credential value out of this process, never
+   * writes to Magpie, and answers `blocked` with structured gaps for every missing fact.
+   */
+  private async magpieRouteSample(ctx: Ctx, args: Args): Promise<Outcome> {
+    const allowed = new Set(['env', 'alias', 'purpose']);
+    const extra = Object.keys(args).filter(key => !allowed.has(key));
+    if (extra.length) throw invalid(`ops_magpie_route_sample accepts only alias and purpose (rejected: ${extra.join(', ')})`);
+    const alias = canonicalAlias(args.alias);
+    const purpose = text(args, 'purpose', 200);
+    if (/[:\\/@]|\b(?:bearer|token|cookie|secret|password|api[-_ ]?key)\b|[A-Za-z0-9_-]{32,}/i.test(purpose)) {
+      throw invalid('purpose must be a short plain-text evidence purpose, not a URL, path or credential');
+    }
+    const result = await sampleMagpieRoute({
+      project: ctx.scope.project, env: ctx.env, taskId: ctx.scope.taskId, alias, purpose,
+      readSealed: name => this.deps.projects.readSealed(ctx.scope.project, ctx.env, name, this.deps.secretKey()),
+      fetch: this.deps.fetch, now: this.now,
+      evidenceDir: join(this.serviceHome(), 'evidence', ctx.scope.taskId),
+      ...(this.deps.magpie?.base ? { base: this.deps.magpie.base, endpointSource: this.deps.magpie.endpointSource ?? 'injected' } : {}),
+      ...(this.deps.magpie?.readProviders ? { readProviders: this.deps.magpie.readProviders } : {}),
+    });
+    return {
+      value: result,
+      audit: {
+        action: 'ops_magpie_sample',
+        evidence: `ops_magpie_route_sample ${alias}（${purpose}）→ ${result.status} accountRef=${result.accountRef ?? 'none'} route=${result.receipt.route.digest?.slice(0, 12) ?? 'none'} doc=${result.documentSha256 ? result.documentSha256.slice(0, 16) : 'none'} gaps=${result.gaps.length}`,
+      },
+    };
+  }
 
+  /**
+   * `ops_magpie_window_prepare {env?, manifestPath, documentPath, approvalTask}`: the missing
+   * window-adapter capability, proxied in this chain. It only reads the immutable v2 manifest and
+   * v4 document, re-checks eligibility, and returns the exact executionWindow a manager could bind
+   * — or the specific blocked fields. It binds nothing itself and never resumes or retries.
+   */
+  private async magpieWindowPrepare(ctx: Ctx, args: Args): Promise<Outcome> {
+    const allowed = new Set(['env', 'manifestPath', 'documentPath', 'approvalTask']);
+    const extra = Object.keys(args).filter(key => !allowed.has(key));
+    if (extra.length) throw invalid(`ops_magpie_window_prepare accepts only manifestPath, documentPath and approvalTask (rejected: ${extra.join(', ')})`);
+    const approvalTask = text(args, 'approvalTask', 128);
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(approvalTask)) throw invalid('approvalTask must be a task id');
+    const files = await loadProofFiles(this.serviceHome(), ctx.scope.taskId, text(args, 'manifestPath', 1024), text(args, 'documentPath', 1024));
+    if (files.manifest.schemaVersion !== 2) throw new CompanyError('invalid', 'the execution-window proxy only accepts a v2 Magpie manifest');
+    const result = magpieWindowFromEvidence(files, approvalTask, this.now());
+    return {
+      value: { ...result, manifestHash: files.manifestHash, documentHash: files.documentHash },
+      audit: {
+        action: 'ops_magpie_window',
+        evidence: `ops_magpie_window_prepare → ${result.eligible ? 'window-ready' : `blocked(${result.blockedReasons.join(',')})`} headroom=${result.headroomSeconds}s`,
+      },
+    };
+  }
+
+  // ---------- generic, session-bound ----------
   private async request(ctx: Ctx, args: Args): Promise<Outcome> {
     const session = this.session(ctx, args);
     const method = text(args, 'method', 10).toUpperCase();

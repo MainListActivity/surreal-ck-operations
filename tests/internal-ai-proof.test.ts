@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { readProofFile, loadProofFiles, evidenceChecks } from '../src/ops/proof-files.ts';
 import { ProofSigner, verifyCompanyProof } from '../src/ops/proof-signer.ts';
-import { TOKEN_PLAN_PLAN_TYPE_FREE, proofToolSchemas, PROOF_AUDIENCE, manifestSchema, evidenceSchema, configurationDigest, tokenPlanEvidenceV3Schema, tokenPlanV3Eligible, sha256, type ProofIdentity } from '../src/ops/proof-contract.ts';
+import { TOKEN_PLAN_PLAN_TYPE_FREE, proofToolSchemas, PROOF_AUDIENCE, manifestSchema, manifestV1Schema, evidenceSchema, configurationDigest, tokenPlanEvidenceV3Schema, tokenPlanV3Eligible, sha256, type ProofIdentity } from '../src/ops/proof-contract.ts';
 import { InternalAiProofBridge } from '../src/ops/proof-bridge.ts';
 import { CompanyProofStore, type ProofRow } from '../src/ops/proof-store.ts';
 import { RecordId, type Surreal } from 'surrealdb';
@@ -14,16 +14,16 @@ import type { OpsScope } from '../src/contracts.ts';
 import { reviewedEvidenceSchema as productSchema } from './fixtures/product-1adf73ae-internal-ai-proof.ts';
 import { disabledSenseNovaFixture } from './support/internal-ai-disabled-fixture.ts';
 const now=Date.now(),sec=Math.floor(now/1000);
-const evidenceModels = () => evidenceSchema.options.map(o => o.shape.model);
+const evidenceModels = () => evidenceSchema.options.flatMap(o => 'model' in o.shape ? [o.shape.model] : []);
 test('actual SenseNova version model parses in both fields and full development-disabled documents', () => {
   const { manifest, evidence } = disabledSenseNovaFixture();
-  expect(manifestSchema.shape.service.shape.model.safeParse('sensenova-6.8-flash-lite').success).toBe(true);
+  expect(manifestV1Schema.shape.service.shape.model.safeParse('sensenova-6.8-flash-lite').success).toBe(true);
   for (const schema of evidenceModels()) expect(schema.safeParse('sensenova-6.8-flash-lite').success).toBe(true);
   expect(manifestSchema.safeParse(manifest).success).toBe(true);
   expect(evidenceSchema.safeParse(evidence).success).toBe(true);
 });
 test('model keeps legacy identifiers and the 128-character bound; unsafe version segments reject', () => {
-  for (const schema of [manifestSchema.shape.service.shape.model, ...evidenceModels()]) {
+  for (const schema of [manifestV1Schema.shape.service.shape.model, ...evidenceModels()]) {
     for (const value of ['sensenova-flash-lite', 'gpt-4o-mini-2024-07-18', 'jev-1.13.0', 'A_B-9', 'a'.repeat(128), 'a'.repeat(126) + '.b']) {
       expect(schema.safeParse(value).success).toBe(true);
     }

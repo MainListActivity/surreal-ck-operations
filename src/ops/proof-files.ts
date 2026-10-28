@@ -2,8 +2,25 @@ import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { resolve, relative, sep, join } from 'node:path';
 import { CompanyError } from '../core-errors.ts';
-import { manifestSchema, evidenceSchema, configurationDigest, sha256, tokenPlanV3Eligible, TOKEN_PLAN_PLAN_TYPE_FREE, type ServiceEvidence, type ProofManifest } from './proof-contract.ts';
+import { manifestSchema, evidenceSchema, configurationDigest, sha256, tokenPlanV3Eligible, magpieEvidenceEligible, TOKEN_PLAN_PLAN_TYPE_FREE, type ServiceEvidence, type ProofManifest } from './proof-contract.ts';
 const denied = () => new CompanyError('forbidden', 'approval file unavailable or unsafe');
+/** v1 binds account/endpoint/model/price; v2 binds the Magpie account/endpoint/route digest/price. */
+function serviceFieldsMatch(evidence: ServiceEvidence, manifest: ProofManifest): boolean {
+  const service = manifest.service;
+  if ('kind' in service) {
+    return evidence.type === 'magpie-controlled-route'
+      && evidence.accountRef === service.accountRef
+      && evidence.endpoint === service.endpoint
+      && evidence.route.group === service.routeId
+      && evidence.route.digest === service.routeDigest
+      && evidence.priceRevision === service.priceRevision;
+  }
+  return evidence.type !== 'magpie-controlled-route'
+    && evidence.accountRef === service.accountRef
+    && evidence.endpoint === service.endpoint
+    && evidence.model === service.model
+    && evidence.priceRevision === service.priceRevision;
+}
 /** No symlink components; hash the same bounded fd that was opened and recheck metadata after reading. */
 export async function readProofFile(home: string, task: string, path: string): Promise<Buffer> {
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(task)) throw denied();
@@ -40,18 +57,20 @@ export function parseProofFiles(rawManifest: Buffer, rawDocument: Buffer) {
   const { configurationDigest: digest, ...rest } = manifest.data;
   return { manifest, evidence, digestValid: digest === configurationDigest(rest),
     documentHashValid: manifest.data.documentHash === sha256(rawDocument),
-    serviceFieldsMatch: evidence.data.accountRef === manifest.data.service.accountRef && evidence.data.endpoint === manifest.data.service.endpoint && evidence.data.model === manifest.data.service.model && evidence.data.priceRevision === manifest.data.service.priceRevision };
+    serviceFieldsMatch: serviceFieldsMatch(evidence.data, manifest.data) };
 }
 function parseJson(bytes: Buffer): unknown { try { return JSON.parse(bytes.toString('utf8')); } catch { return null; } }
 export function evidenceChecks(e: ServiceEvidence, manifest: ProofManifest, now: number) {
   return { sampleNotFuture: Date.parse(e.sampledAt) <= now, evidenceUnexpired: Date.parse(e.expiresAt) > now,
     serviceEvidenceEligible: e.type === 'reviewed-service'
       ? e.serviceApproved && e.balanceNanoUsd >= manifest.budget.totalNanoUsd
-      : e.type === 'reviewed-token-plan'
-        ? e.schemaVersion === 3
-          ? tokenPlanV3Eligible(e, now)
-          : e.serviceApproved && e.quotaAmount > 0 && (e.quotaRemaining == null || e.quotaRemaining > 0) && e.accountPlanType === TOKEN_PLAN_PLAN_TYPE_FREE && now - Date.parse(e.sampledAt) <= 86_400_000
-        : false };
+      : e.type === 'magpie-controlled-route'
+        ? magpieEvidenceEligible(e, now)
+        : e.type === 'reviewed-token-plan'
+          ? e.schemaVersion === 3
+            ? tokenPlanV3Eligible(e, now)
+            : e.serviceApproved && e.quotaAmount > 0 && (e.quotaRemaining == null || e.quotaRemaining > 0) && e.accountPlanType === TOKEN_PLAN_PLAN_TYPE_FREE && now - Date.parse(e.sampledAt) <= 86_400_000
+          : false };
 }
 export async function loadProofFiles(home: string, task: string, manifestPath: string, documentPath: string) {
   const [rawManifest, rawDocument] = await Promise.all([readProofFile(home, task, manifestPath), readProofFile(home, task, documentPath)]);
