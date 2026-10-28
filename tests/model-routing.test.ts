@@ -29,36 +29,36 @@ const models = classify([
   { id: "auto/gpt-6-astra" },
   { id: "remote-magpie/group/x" },
 ]);
-test("catalog matches exact benchmark versions, admits only AA >= 38 and omits group aliases", () => {
+test("catalog matches exact benchmark versions, admits at the Luna Max floor and omits group aliases", () => {
   expect(models.map((m) => m.model).sort()).toEqual(["claude-haiku-5-5", "claude-opus-5-5", "gpt-6-astra", "gpt-6-luna"]);
   expect(models.find((m) => m.model === "claude-opus-5-5")).toMatchObject({
-    tier: "fable",
+    tier: "opus",
     estimated: false,
   });
   expect(models.find((m) => m.model === "claude-haiku-5-5")?.tier).toBe(
-    "sonnet",
+    "haiku",
   );
   // Owner rule: unscored (mystery) and below the floor (mimo-v2.6-flash, 37.9) enter no tier; 38.1 does.
   expect(models.some((m) => m.model === "mystery" || m.model === "mimo-v2.6-flash")).toBe(false);
-  expect(models.find((m) => m.model === "gpt-6-luna")?.tier).toBe("sonnet");
+  expect(models.find((m) => m.model === "gpt-6-luna")?.tier).toBe("haiku");
   expect(classify([{ id: "sn/deepseek-v4.1-flash" }])[0]).toMatchObject({
     benchmark: "deepseek-v4-1-flash-1017",
     estimated: false,
   });
   expect(classify([{ id: "relay/claude-opus-5-5-preview" }])).toEqual([]);
 });
-test("tier lines are the owner's anchor models: deepseek-v4.1-flash and below is Sonnet/Haiku, up to sonnet-5.5 is Opus", () => {
+test("staff bands follow AA input prices, with expensive models left for manual groups", () => {
   const tiers = Object.fromEntries(classify([
     { id: "a/deepseek-v4.1-flash" }, { id: "a/kimi-k3" }, { id: "a/gpt-6.1-sol" },
     { id: "a/gpt-6-astra" }, { id: "a/claude-sonnet-5-5" }, { id: "a/claude-opus-5-5" },
   ]).map((m) => [m.model, m.tier]));
   expect(tiers).toEqual({
-    "deepseek-v4.1-flash": "sonnet", "kimi-k3": "sonnet",
-    "gpt-6.1-sol": "opus", "gpt-6-astra": "opus", "claude-sonnet-5-5": "opus",
-    "claude-opus-5-5": "fable",
+    "deepseek-v4.1-flash": "haiku",
+    "gpt-6.1-sol": "sonnet", "gpt-6-astra": "opus", "claude-sonnet-5-5": "sonnet",
+    "claude-opus-5-5": "opus",
   });
 });
-test("Haiku serves the Sonnet pool, and Fable serves Opus while its own models are excluded", async () => {
+test("Haiku and Sonnet use separate price pools; manual groups are never auto-populated", async () => {
   const { ModelRoutingController } = await import("../src/model-routing/controller.ts");
   const calls: string[][] = [];
   const db = { query: async (sql: string) => (sql.includes("SELECT enabled") ? [{ enabled: true, disabledModels: ["a/claude-opus-5-5"] }] : [[]]) };
@@ -69,8 +69,7 @@ test("Haiku serves the Sonnet pool, and Fable serves Opus while its own models a
   await controller.refresh(true);
   const members = Object.fromEntries(calls.filter((c) => c[1] === "add").map((c) => [c[2], c[3]]));
   expect(members).toEqual({
-    "sck-fable": "models=a/gpt-6.1-sol",
-    "sck-sonnet": "models=a/deepseek-v4.1-flash", "sck-haiku": "models=a/deepseek-v4.1-flash",
+    "sck-sonnet": "models=a/gpt-6.1-sol", "sck-haiku": "models=a/deepseek-v4.1-flash",
   });
 });
 test("after the one-time grouping, membership is the owner's: manual edits stay, only unseen models are placed", async () => {
@@ -84,7 +83,7 @@ test("after the one-time grouping, membership is the owner's: manual edits stay,
     groups: () => store,
   });
   await controller.refresh(true);
-  expect([...store["sck-sonnet"]!].sort()).toEqual(["a/deepseek-v4.1-flash", "a/kimi-k3"]);
+  expect([...store["sck-sonnet"]!].sort()).toEqual(["a/gpt-6.1-sol"]);
   // The owner takes kimi out of Sonnet and puts an unscored model into Haiku by hand.
   store["sck-sonnet"] = ["a/deepseek-v4.1-flash"];
   store["sck-haiku"] = [...store["sck-haiku"]!, "a/hand-picked"];
@@ -93,7 +92,7 @@ test("after the one-time grouping, membership is the owner's: manual edits stay,
   await controller.refresh(true);
   expect(store["sck-sonnet"]!.includes("a/kimi-k3")).toBe(false);
   expect(store["sck-haiku"]).toContain("a/hand-picked");
-  expect(store["sck-sonnet"]).toContain("b/glm-5.3-flash");
+  expect(store["sck-sonnet"]).not.toContain("b/glm-5.3-flash");
   expect(store["sck-haiku"]).toContain("b/glm-5.3-flash");
   expect(store["sck-opus"]).toBeUndefined();
 });
@@ -145,7 +144,7 @@ test("task evidence changes priority without allowing one tiny sample to dominat
     ).every((m) => Number.isFinite(m.score)),
   ).toBe(true);
 });
-test("one model served through several accounts shares its task evidence", () => {
+test("same model on different channels never shares task evidence", () => {
   const [a, b] = classify([
     { id: "codex/gpt-6-astra" },
     { id: "remote-magpie/codex/gpt-6-astra" },
@@ -160,7 +159,8 @@ test("one model served through several accounts shares its task evidence", () =>
   }));
   const ranked = rank([a!, b!, opus], results, "engineering");
   expect(ranked[0]?.id).toBe(opus.id);
-  expect(ranked.find((m) => m.id === b!.id)?.samples).toBe(30);
+  expect(ranked.find((m) => m.id === b!.id)?.samples).toBe(0);
+  expect(ranked.find((m) => m.id === a!.id)?.samples).toBe(30);
 });
 test("actual model identity never turns an unresolved group into a model score", () => {
   expect(modelIdentity("claude", "claude-opus-5-5")).toBe(
@@ -397,13 +397,13 @@ test("controller writes only the automatic magpie tier groups, removes the retir
   await controller.refresh(true);
   expect(status.models.map((m: any) => m.id)).toEqual(["claude/claude-opus-5-5", "claude/claude-haiku-5-5"]);
   const groups = calls.filter((c) => c[0] === "group" && c[1] === "add");
-  expect(groups.map((c) => c[2])).toEqual(["sck-fable", "sck-sonnet", "sck-haiku"]);
+  expect(groups.map((c) => c[2])).toEqual(["sck-haiku"]);
   expect(groups.every((c) => c.includes("routing=order") && c.includes("stays=auto") && c.includes("levels=low,medium,high,xhigh,max"))).toBe(true);
   expect(groups.every((c) => !c.join(" ").includes("mystery"))).toBe(true);
   expect(calls).toContainEqual(["plugin", "rm", join(home, "model-routing", "sck-performance.gateway.js")]);
   expect(calls).toContainEqual(["group", "rm", "sck-route-haiku-best"]);
   expect(calls.some((c) => c[0] === "plugin" && c[1] !== "rm")).toBe(false);
-  expect(status.routes["group/sck-fable"][0].model).toBe("claude/claude-opus-5-5");
+  expect(status.routes["group/sck-fable"]).toBeUndefined();
   const n = calls.length;
   await controller.refresh(true);
   expect(calls.length).toBe(n);
@@ -427,7 +427,7 @@ test("removing a route group that is already gone does not fail the sync", async
     },
   });
   await controller.refresh(true);
-  expect(Object.keys(JSON.parse(readFileSync(join(home, "model-routing", "groups.json"), "utf8")))).toEqual(["sck-fable", "sck-sonnet", "sck-haiku"]);
+  expect(Object.keys(JSON.parse(readFileSync(join(home, "model-routing", "groups.json"), "utf8")))).toEqual(["sck-sonnet", "sck-haiku"]);
 });
 test("durable local queue never waits for remote DB, survives restart and retains completions during a slow flush", async () => {
   const { ExecutionJournal } = await import("../src/model-routing/journal.ts");

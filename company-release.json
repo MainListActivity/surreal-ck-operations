@@ -1,7 +1,8 @@
 {
-  "version": "0.3.23",
-  "title": "QA 评审协同的持久事件唤醒（含排除 Magpie 生成分组）",
+  "version": "0.3.24",
+  "title": "QA 评审协同唤醒、渠道绩效隔离与动态模型准入",
   "changes": [
+    "渠道绩效隔离与动态模型准入：同款模型在不同渠道独立计算任务绩效、趋势及排序，不继承其他渠道分数；新模型最低能力跟随最新 Luna Max 的 AA 分数，按 AA 输入价 ≤$1/M 进入 Haiku、>$1/M 且 ≤$2/M 进入 Sonnet，取消智能分上界；Haiku/Sonnet 分开自动入组",
     "排除 Magpie 生成分组模型：统一排除 group/、auto/ 以及 remote-magpie 等远端包装中的同类分组模型，不再自动入组或进入 Jev 映射判断",
     "新增 review_watch_register/close/status：GM 登记同 goal（源任务, 协同任务）订阅，登记事务落库后立刻读当前复核租约与已有信号并补交付，事件先于登记也不丢唤醒",
     "新增 qa_review_scope_signal：只接受当前 review 持有人（phase/reviewerRole/currentEmployee/fence/活租约/非作者在事务内核对），request 触发 authorization，retract+positiveReady 触发 positive",
@@ -10,11 +11,12 @@
     "schema/044 只新增 qa_review_watch、qa_review_signal、qa_review_wake 三表（schema_version 44）；新增 docs/review-events.md 与五个工具；sidecar-review 门禁加入纯规则与 fork 集成回归"
   ],
   "impact": [
+    "历史评分保留，按完整渠道模型 ID 重新汇总；昂贵或价格未知的新模型不自动进入员工组，手动配置保持不变",
     "只限制生成路由分组，不误伤 autoencoder 等普通模型名；历史生成分组裁决和执行台账保留，但不再作为模型评分和排名证据",
     "解决 3cf7477d v19 固定时间等待错过 QA 窗口：QA 真实领取复核租约或结构化请求时当场唤醒，正向取证完成并撤销请求时再唤醒一次",
     "只做协调：不开放 gm-only 指标、不扩大 subjects、不索 token、不直写库、不绕过独立验收；到点扫描从不释放 feedback 等待，零轮询且不新增 agent/定时器",
     "回滚隔离 RB01：只新增三张表，旧版读不到即忽略，协同任务退回固定时间等待；门禁侧含事件先于登记、20 并发、重启、旧 fence、两阶段与负例"
   ],
-  "migration": "只新增结构：schema/044-review-events.surql 新增三张 SCHEMAFULL 表与索引，schema_version 升到 44；不改写任何既有表、字段或行，协同任务仍用 040 的 task_wait 等待行。0.3.22 的生成分组成员清理（cleanup-generated-group-members.ts --execute）按原步骤发布后执行。",
-  "rollback": "保留健康 active；用当前受审 release 的 installer 回滚至升级前现役（以 active 实际 SHA 为准），active 与插件面同时切回并过 RW06/SYS02/IR06/SYS06 守卫；旧版忽略新表，无数据回滚。生成分组成员如需恢复，使用清理前仅含分组配置的备份经 Magpie API 恢复，不改历史评分或任务证据。"
+  "migration": "只新增结构：schema/044-review-events.surql 新增三张 SCHEMAFULL 表与索引，schema_version 升到 44；不改写任何既有表、字段或行，协同任务仍用 040 的 task_wait 等待行。不修改历史绩效台账，不重建已有分组；首次刷新更新 AA 缓存并重新计算排名。0.3.22 的生成分组成员清理（cleanup-generated-group-members.ts --execute）按原步骤发布后执行。",
+  "rollback": "保留健康 active；用当前受审 release 的 installer 回滚至升级前现役（以 active 实际 SHA 为准），active 与插件面同时切回并过 RW06/SYS02/IR06/SYS06 守卫；旧版忽略新表，无数据回滚。原始绩效台账保持完整，生成分组成员如需恢复使用清理前仅含分组配置的备份经 Magpie API 恢复，不改历史评分或任务证据。"
 }
