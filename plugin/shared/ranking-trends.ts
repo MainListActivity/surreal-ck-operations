@@ -24,9 +24,10 @@ export function rankingHealthMetric(health: ModelRankingTable["rows"][number]["h
 }
 
 /** A rule label, never presented as a probabilistic model score. */
-export function rankingRuleLabel(row:{pinned?:boolean;health?:{excluded:boolean};decision?:{tail?:string;band?:number;coldStart?:boolean}}):string {
+export function rankingRuleLabel(row:{pinned?:boolean;health?:{excluded:boolean};decision?:{urgent?:boolean;tail?:string;band?:number;coldStart?:boolean}}):string {
  if(row.pinned)return '置顶';
  if(row.health?.excluded||row.decision?.tail)return '置后';
+ if(row.decision?.urgent)return '临期优先';
  if(row.decision?.coldStart)return '新模型试用';
  return row.decision?.band===undefined?'待测':`能力档 ${row.decision.band+1}`;
 }

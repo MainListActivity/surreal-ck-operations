@@ -1236,11 +1236,11 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy,on
   return <View style={{gap:mobile?5:8}}>
     <View style={[s.row,{alignItems:"flex-start",justifyContent:"space-between",marginBottom:mobile?7:10}]}>
       <View style={{flex:1}}><Text style={[s.text,{fontSize:mobile?15:17,fontWeight:"700"}]}>{table.group.replace("sck-","").replace(/^./,x=>x.toUpperCase())} 模型</Text>
-        {!mobile&&<Text style={[s.muted,{marginTop:6}]}>手动置顶独立第一层；其余模型中，新模型优先试用，再按能力档和计费层分组，再比较综合分。未置顶模型继续执行故障、额度和20秒置后规则。</Text>}
+        {!mobile&&<Text style={[s.muted,{marginTop:6}]}>手动置顶之后优先消耗临期可用额度；其余模型中，新模型优先试用，再按能力档和计费层分组，再比较综合分。未置顶模型继续执行故障、额度和20秒置后规则。</Text>}
       </View>
       <View style={{backgroundColor:c.surface2,borderColor:c.border,borderWidth:1,borderRadius:999,paddingHorizontal:9,paddingVertical:6}}><Text style={[s.muted,s.accent,{fontSize:10,fontWeight:"700"}]}>{table.rows.length} 个成员</Text></View>
     </View>
-    <View style={{backgroundColor:c.surface2,borderRadius:10,padding:12,gap:5,marginBottom:8}}><Text style={[s.text,{fontWeight:"700"}]}>先比较分层，再比较层内分</Text><Text style={s.muted}>①手动置顶独立第一层 → ②其余模型按安全状态 → 新模型试用 → AA能力档 → 计费类型 → 层内分降序</Text><Text style={s.muted}>手动置顶不再细分层，按置顶先后排列；其余模型的安全状态、试用状态、能力档、计费类型都相同，才是同一层。AA档在同一安全状态内，从最高分开始逐档划分。每层下方列出实际范围和依据。</Text><Text style={s.muted}>{table.rows.some(r=>r.previousRank!==undefined)?"以下分层来自当前预览；保存前不影响线上。":"以下分层来自最近成功排序快照；跨层即使分数更高，也不会提前。"}</Text></View>
+    <View style={{backgroundColor:c.surface2,borderRadius:10,padding:12,gap:5,marginBottom:8}}><Text style={[s.text,{fontWeight:"700"}]}>先比较分层，再比较层内分</Text><Text style={s.muted}>①手动置顶 → ②临期可用额度（综合分降序）→ ③其余模型按安全状态 → 新模型试用 → AA能力档 → 计费类型 → 层内分降序</Text><Text style={s.muted}>手动置顶按先后排列；临期层不再按能力或计费拆分，直接比较综合分，异常模型仍置后。其余模型的安全状态、试用状态、能力档、计费类型都相同，才是同一层。AA档在同一安全状态内，从最高分开始逐档划分。每层下方列出实际范围和依据。</Text><Text style={s.muted}>{table.rows.some(r=>r.previousRank!==undefined)?"以下分层来自当前预览；保存前不影响线上。":"以下分层来自最近成功排序快照；跨层即使分数更高，也不会提前。"}</Text></View>
     {!table.scored&&<Text style={[s.muted,{marginBottom:8}]}>等待下一次请求触发规则排序。</Text>}
     {table.rows.map((row,index)=>{
       const short=row.model.replace(/^remote-magpie\//,"");const slash=short.lastIndexOf("/");
@@ -1252,6 +1252,7 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy,on
         {label:"AA 智能分",value:number(row.aaScore),detail:(row.aaRank===undefined?"暂无排名":`全榜第 ${row.aaRank} 名`)+" · "+rankingTrendDetail(row.trends?.aaScore)},
         {label:"生成速度",value:row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,detail:rankingTrendDetail(row.trends?.tokensPerSecond)},
         {label:"首 token 延迟",value:row.ttftMs===undefined?"未知":`${number(row.ttftMs/1000,2)} 秒`,detail:(row.tailReason?row.tailReason+" · ":"")+rankingTrendDetail(row.trends?.ttftMs)},
+        {label:"临期额度",value:row.urgency?`${row.urgency.amount}${row.urgency.unit} · ${row.urgency.requests}/5条`:"无有效临期额度",detail:row.urgency?`${row.urgency.reason}；截止 ${row.urgency.expiresAt}`:"仅使用明确期限与新鲜额度读数"},
         {label:"剩余额度",value:quota,detail:rankingTrendDetail(row.trends?.remainingPct)},
         {label:"请求稳定性",value:row.stabilityPct===undefined?"未知":`${number(row.stabilityPct)}%`,detail:"错误率趋势："+rankingTrendDetail(row.trends?.errorRate)},
         {label:"路由尝试",...rankingHealthMetric(row.health,row.pinned)},
@@ -1272,7 +1273,7 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy,on
           {wide&&stat("智能分",number(row.aaScore),72)}
           {!mobile&&stat("速度",row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,96)}
           {wide&&stat("额度",quota,64)}
-          <View style={{width:mobile?66:76,alignItems:"flex-end"}}><Text style={[s.muted,{fontSize:9}]}>{row.pinned?"置顶":row.decision?.tail?"置后":row.decision?.coldStart?"试用":"层内分"}</Text>
+          <View style={{width:mobile?66:76,alignItems:"flex-end"}}><Text style={[s.muted,{fontSize:9}]}>{row.pinned?"置顶":row.decision?.tail?"置后":row.decision?.urgent?"临期优先":row.decision?.coldStart?"试用":"层内分"}</Text>
             <Text accessibilityLabel={row.decision?.reason??"等待规则排序"} style={{color:c.score,fontSize:mobile?13:17,lineHeight:mobile?18:23,fontWeight:"700"}}>{row.decision?.score===undefined?rankingRuleLabel(row):row.decision.score.toFixed(1)}</Text>
           </View><Text style={[s.muted,{width:mobile?18:22,textAlign:"center",fontSize:17}]}>{open?"−":"+"}</Text>
         </Pressable><Pressable accessibilityRole="button" accessibilityLabel={`${row.pinned?"取消置顶":"置顶"} ${row.model}`} disabled={pinBusy||!onPin}

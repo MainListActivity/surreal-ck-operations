@@ -1,3 +1,5 @@
+import {createHash} from 'node:crypto';
+import type {UrgencyObservation} from './urgency.ts';
 import {rankingPolicy,DEFAULT_POLICY,type RankingPolicy} from './weights.ts';
 import { RULE_ENGINE, RULE_DESCRIPTION, ruleOrder, type RuleDecision } from './rules.ts';
 import { z } from "zod";
@@ -43,12 +45,15 @@ export interface UsageStat {
   tokensPerSecond?: number;
   ttftMs?: number;
 }
+export interface QuotaAccount {account:string;provider?:string;singleAccount?:boolean;poolKey?:string;kind?:'subscription'|'plan'|'api'|'unknown';readAt?:string;until?:string;renew?:string;remainingPct?:number;windows?:QuotaWindow[]}
+export interface QuotaWindow {pool?:string;nonCarryOver?:boolean;name?:string;model?:string;remainingPct:number;resetsAt?:string;runsOutAt?:string;runsOut?:number;unit?:string;limit?:number;amount?:number}
 export interface ModelFacts {
   trends?: ModelTrends;
   trendSource?: { source: string; available: boolean; invalidLines: number; collectedAt: string };
   id: string;
   /** Accounts behind this model's provider. Labels only: no e-mail or sign-in leaves the machine. */
-  accounts: Array<{ account: string; kind?:'subscription'|'plan'|'api'|'unknown'; remainingPct?: number; windows?:Array<{remainingPct:number;resetsAt?:string}> }>;
+  urgency?:UrgencyObservation;
+  accounts: QuotaAccount[];
   /** The score at the level the member is pinned to (effort), not the model's best. */
   aa?: { rank: number; score: number; effort?: Effort };
   /** USD per 1M tokens; 0 when magpie serves it free. */
@@ -96,16 +101,20 @@ export function usageStats(snapshot: unknown, collectedAt = new Date().toISOStri
 }
 
 /** `magpie quota --json`: per provider, each account's tightest window. */
-export function quotaAccounts(rows: Array<{ provider: string; name?: string; kind?:string; error?:string; readAt?:string; windows?: Array<{ remaining?: number; resetsAt?:string }> }>): Map<string, ModelFacts["accounts"]> {
-  const out = new Map<string, ModelFacts["accounts"]>();
-  for (const q of rows) {
-    const list = out.get(q.provider) ?? [];
-    const windows=q.error?[]:(q.windows??[]).filter(w=>!w.resetsAt||Date.parse(w.resetsAt)>Date.now());
-    const left = windows.map((w) => w.remaining).filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 100);
-    list.push({kind:q.kind==='subscription'||q.kind==='plan'||q.kind==='api'?q.kind:'unknown',windows:windows.flatMap(w=>typeof w.remaining==='number'&&Number.isFinite(w.remaining)&&w.remaining>=0&&w.remaining<=100?[{remainingPct:w.remaining,...(w.resetsAt?{resetsAt:w.resetsAt}:{})}]:[]), account: `${q.provider} #${list.length + 1}`, remainingPct: left.length ? Math.min(...left) : undefined });
-    out.set(q.provider, list);
-  }
-  return out;
+export function quotaAccounts(rows: Array<{ provider:string;name?:string;user?:string;kind?:string;error?:string;readAt?:string;until?:string;renew?:string;windows?:Array<{pool?:string;nonCarryOver?:boolean;name?:string;model?:string;remaining?:number;resetsAt?:string;runsOutAt?:string;runsOut?:number;unit?:string;limit?:number;amount?:number;unlimited?:boolean;text?:boolean}> }>,now=Date.now()):Map<string,QuotaAccount[]> {
+ const out=new Map<string,QuotaAccount[]>();
+ for(const q of rows){
+  const list=out.get(q.provider)??[];
+  const windows:QuotaWindow[]=(q.error?[]:q.windows??[]).flatMap(w=>{
+   if(w.unlimited||w.text||w.resetsAt&&Date.parse(w.resetsAt)<=now||typeof w.remaining!=='number'||!Number.isFinite(w.remaining)||w.remaining<0||w.remaining>100)return [];
+   return [{pool:w.pool,nonCarryOver:w.nonCarryOver??(/(?:^|\/)(claude|codex)$/.test(q.provider)&&/^(weekly|7 days)$/i.test(w.name??'')),name:w.name,model:w.model,remainingPct:w.remaining,resetsAt:w.resetsAt,runsOutAt:w.runsOutAt,runsOut:w.runsOut,unit:w.unit,limit:w.limit,amount:w.amount}];
+  });
+  list.push({provider:q.provider,account:`${q.provider} #${list.length+1}`,poolKey:createHash('sha256').update(q.provider+'|'+(q.user??q.name??String(list.length))).digest('hex'),
+   kind:q.kind==='subscription'||q.kind==='plan'||q.kind==='api'?q.kind:'unknown',readAt:q.error?undefined:q.readAt,until:q.until,renew:q.renew,windows,
+   remainingPct:windows.length?Math.min(...windows.map(w=>w.remainingPct)):undefined});out.set(q.provider,list);
+ }
+ for(const accounts of out.values())for(const a of accounts)a.singleAccount=accounts.length===1;
+ return out;
 }
 
 const providerOf = (id: string) => id.slice(0, id.lastIndexOf("/"));
@@ -128,7 +137,15 @@ export function modelFacts(
     const b = resolved?.row;
     return {
       id,
-      accounts: sources.quota.get(providerOf(base)) ?? [],
+      accounts: (sources.quota.get(providerOf(base))??[]).map(a=>{
+        const model=base.slice(base.lastIndexOf('/')+1),scoped=(a.windows??[]).filter(w=>w.model===model||w.name===model);
+        const knownModels=new Set(sources.catalog.map(m=>m.id.slice(m.id.lastIndexOf('/')+1)));
+        const global=(a.windows??[]).filter(w=>!w.model&&!knownModels.has(w.name??''));
+        const scopedWindows=scoped.map(w=>({...w,model}));
+        const independentTrial=scopedWindows.some(w=>/trial|试用/i.test(w.name??w.model));
+        const windows=independentTrial?scopedWindows:[...global,...scopedWindows];
+        return {...a,windows,remainingPct:windows.length?Math.min(...windows.map(w=>w.remainingPct)):a.windows?.length?undefined:a.remainingPct};
+      }),
       aa: b ? { rank: aaRankOfScore(b.score), score: Math.round(b.score * 10) / 10, effort: resolved.effort } : undefined,
       price: free ? { free, input: 0, output: 0, cacheHit: 0 } : { free, input: b?.priceInput, output: b?.priceOutput, cacheHit: b?.priceCacheHit },
       usage: sources.usage.get(base),
@@ -228,7 +245,7 @@ export interface RankingResultSnapshot {
 export interface RankingGateSnapshot {at:string;facts:ModelFacts[]}
 export type RankingGates=Record<string,RankingGateSnapshot>;
 export interface RankingTableRow {
-  model: string; previousRank?:number; price?:ModelFacts["price"]; pinned?: boolean; tailReason?:string; decision?:RuleDecision;
+  model: string; previousRank?:number; urgency?:UrgencyObservation; price?:ModelFacts["price"]; pinned?: boolean; tailReason?:string; decision?:RuleDecision;
   trends?: ModelTrends; trendSource?: ModelFacts["trendSource"];
   aaScore?: number; aaRank?: number; effort?: string;
   tokensPerSecond?: number; ttftMs?: number; stabilityPct?: number; stabilitySamples?: number;
@@ -263,7 +280,7 @@ export function rankingTables(groups: Record<string,string[]>, results: Record<s
       const facts = excluded ?? judged?.facts ?? result?.pinnedFacts?.find(f => f.id === model) ?? current ?? (!result ? legacy.find(f => f.id === model) : undefined);
       const pinned = (pins[group] ?? []).includes(model);
       const decision=judged?.decision;
-      return { model, price:facts?.price, decision, tailReason:pinned?undefined:decision?.tail??(!pinned&&!excluded&&overTtftLimit(facts,tailLimit)?`老板规则要求末尾：原生平均首token ${facts!.usage!.ttftMs!/1000} 秒 > ${tailLimit!/1000} 秒`:undefined), trends: facts?.trends, trendSource:facts?.trendSource, pinned, health: gate ? current?.health : facts?.health, aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
+      return { model, price:facts?.price, urgency:facts?.urgency, decision, tailReason:pinned?undefined:decision?.tail??(!pinned&&!excluded&&overTtftLimit(facts,tailLimit)?`老板规则要求末尾：原生平均首token ${facts!.usage!.ttftMs!/1000} 秒 > ${tailLimit!/1000} 秒`:undefined), trends: facts?.trends, trendSource:facts?.trendSource, pinned, health: gate ? current?.health : facts?.health, aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
         tokensPerSecond: facts?.usage?.tokensPerSecond, ttftMs: decision?decision.ttftMs:facts?.usage?.ttftMs,
         stabilityPct: facts?.usage?.requests ? Math.max(0,100*(1-facts.usage.errors/facts.usage.requests)) : undefined,
         stabilitySamples: facts?.usage?.requests,
@@ -302,6 +319,7 @@ export class RankingRefresher {
   private stopped = false;
   private pinning?: Promise<void>;
   private warming=false;
+  private urgencyDeadline=Infinity;
   private configuring?:Promise<void>;
   private previewSnapshot?:{at:string;groups:Record<string,string[]>;facts:ModelFacts[]};
   constructor(private readonly deps: RefresherDeps) {}
@@ -313,7 +331,7 @@ export class RankingRefresher {
   stop(): void { this.stopped = true; this.revision++; }
   settled(): Promise<void> { return this.running ?? Promise.resolve(); }
   trigger(now = Date.now()): void {
-    if (this.stopped || this.running || this.pinning || this.configuring || (this.last !== undefined && now - this.last < (this.warming?30000:this.minutes * 60000))) return;
+    if (this.stopped || this.running || this.pinning || this.configuring || (now<this.urgencyDeadline && this.last !== undefined && now - this.last < (this.warming?30000:this.minutes * 60000))) return;
     this.last = now;
     const revision = this.revision;
     this.running = Promise.resolve().then(() => this.run(revision)).catch(() => this.deps.log?.("模型排序刷新失败，保留现有顺序"))
@@ -386,6 +404,7 @@ export class RankingRefresher {
       const pins = await rankingPins(this.deps.db);
       const ids = [...new Set(RANKED_TIERS.flatMap(t => live[`sck-${t}`] ?? []))];
       const allFacts = await this.deps.facts(ids);
+      this.urgencyDeadline=Math.min(Infinity,...allFacts.flatMap(f=>f.urgency?.active?[Date.parse(f.urgency.expiresAt)]:[]));
       const byId = new Map(allFacts.map(f => [f.id, f]));
       const orders: Record<string, string[]> = {};
       const errors: string[] = [];
