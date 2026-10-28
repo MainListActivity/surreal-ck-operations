@@ -62,6 +62,9 @@ const BASE_TOOLS = [
   "implementer_takeover",
   "qa_observation_grant", "qa_observation_revoke", "qa_observation_status", "qa_observation_session",
   "qa_observation_read", "qa_observation_timeline", "qa_observation_text",
+  // SYS-INT 评审协同的持久事件唤醒：GM 订阅登记/关闭/只读，QA 结构化 scope 请求与撤销（core 判定角色、fence 与活租约）。
+  "review_watch_register", "review_watch_close", "review_watch_status",
+  "qa_review_scope_signal", "review_scope_signals",
   // Manage capability (gm/product) only in core: writes a task's independence policy under a compare-and-set; audited.
   "independence_set",
   // Manage capability only in core: registers an identity principal (the only cross-employee identity link); audited.
@@ -1118,6 +1121,21 @@ export class SidecarPool {
         if (!core.qaObservationTimeline) throw Object.assign(new Error("core does not expose qa_observation_timeline"), { code: "temporarily_unavailable" });
         return withQaRelease(await core.qaObservationTimeline({ credential: cred }, args as never));
       });
+      case "review_watch_register": return core.reviewWatchRegister
+        ? core.reviewWatchRegister(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose review_watch_register"), { code: "temporarily_unavailable" }));
+      case "review_watch_close": return core.reviewWatchClose
+        ? core.reviewWatchClose(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose review_watch_close"), { code: "temporarily_unavailable" }));
+      case "review_watch_status": return core.reviewWatchStatus
+        ? core.reviewWatchStatus(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose review_watch_status"), { code: "temporarily_unavailable" }));
+      case "qa_review_scope_signal": return core.qaReviewScopeSignal
+        ? core.qaReviewScopeSignal(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose qa_review_scope_signal"), { code: "temporarily_unavailable" }));
+      case "review_scope_signals": return core.reviewScopeSignals
+        ? core.reviewScopeSignals(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose review_scope_signals"), { code: "temporarily_unavailable" }));
       case "qa_observation_text": return withinReplyCeiling(async () => {
         if (!core.qaObservationText) throw Object.assign(new Error("core does not expose qa_observation_text"), { code: "temporarily_unavailable" });
         return withQaRelease(await core.qaObservationText({ credential: cred }, args as never));
