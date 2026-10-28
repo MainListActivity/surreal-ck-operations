@@ -54,11 +54,11 @@
 
 `sources[]`：catalog（`/v1/models`）、quotas（`/v1/magpie/quotas`）、usage（`/v1/magpie/usage/requests?period=7d&…`）与 providers（本地配置）。每个来源记录状态、本机 UTC 抓取时刻、HTTP Date、精确偏差（±5 分钟内，且 `clockSkewMs = capturedAt − httpDate`）、Age、缓存头、body SHA256、字节数与来源 `readAt`；**正文不进入文档/回执**。
 
-`subscription` 与 `balance`：网关只提供 0–100 的百分比窗口与 `resetsAt`，因此 `windows[].remainingPct` 是百分比，`balance.absoluteAmount=null`、`unit=null`，并在 `balance.disclosure` 明示“百分比不是绝对余额”。`readAt` 缺失或早于快照 TTL 即 `staleBalance`；本机抓取时间不能刷新来源余额。窗口已重置 → `quotaExpired`；任一非 `unlimited` 窗口剩余为 0 → `quotaInsufficient`（健康的长窗口不能抵消已耗尽的短窗口）。
+`subscription` 与 `balance`：网关只提供 0–100 的百分比窗口与 `resetsAt`，因此 `windows[].remainingPct` 是百分比，`balance.absoluteAmount=null`、`unit=null`，并在 `balance.disclosure` 明示“百分比不是绝对余额”。`readAt` 缺失或早于快照 TTL 即 `staleBalance`；本机抓取时间不能刷新来源余额。窗口已重置 → `quotaExpired`；任一非 `unlimited` 窗口剩余为 0 → `quotaInsufficient`（健康的长窗口不能抵消已耗尽的短窗口）。**每个窗口行都必须可确证**：非对象行、`remaining` 缺失/非数/负数/>100、`resetsAt` 存在但不可解析，均产出 `quota` gap 并拒绝生成文档；畸形窗口不会被 `flatMap` 静默丢弃，健康兄弟窗口也不能掩盖它。`unlimited=true` 的窗口同样要在 v4 里带数值百分比，缺失即 gap 闭锁——不允许为凑字段而编造余量。
 
-`usage`：从网关历史请求行中选取**同账号 provider、已完成、served model 在批准可路由集合内**的最新一条，记录 `requestId`（响应 id，缺失时用行 id）、`runId`（`route_id`）、`provider`、`servedModel`、`at`、`providerKeyIdHash`（网关未给则为 null，不臆造）、input/output/cache/reasoning/total。`cost` 只有在 `priced=true` 且成本为有限数时才写数值；否则 **null 且 `costUnknown=true`，绝不以 0 填充**。
+`usage`：从网关历史请求行中选取**同账号 provider、已完成、served model 在批准可路由集合内**的最新一条，记录 `requestId`（响应 id，缺失时用行 id）、`runId`（`route_id`）、`provider`、`servedModel`、`at`、`providerKeyIdHash`（网关未给则为 null，不臆造）、input/output/cache/reasoning/total。完成态必须**显式** `done === true`：`done` 缺失、为 `false` 或非布尔（如字符串/数字）都视为未知，一律不作为已完成 usage 关联；当存在其他字段都匹配但完成态未知的行时，`usage` gap 会写明 `done=true` 缺失，而不是笼统地说没有请求。`cost` 只有在 `priced=true` 且成本为有限数时才写数值；否则 **null 且 `costUnknown=true`，绝不以 0 填充**。
 
-`pricing`：从网关 catalog 观测（`source=magpie-catalog`），记录 `priceRevision`、`reviewed`、`free`、`freeEvidence`、input/output 单价、币种、`subscriptionCost.disclosed=false`、`marginalCost`。`free=true` 只允许由 catalog 零价真实证据支撑；订阅分摊成本与边际成本分开披露，订阅成本当前不披露。观测价目默认 `reviewed=false`，不能自证受审。
+`pricing`：从网关 catalog 观测（`source=magpie-catalog`），记录 `priceRevision`、`reviewed`、`free`、`freeEvidence`、input/output 单价、币种、`subscriptionCost.disclosed=false`、`marginalCost`。零价证据只认源**明确给出数值** `input=0` 且 `output=0`；catalog `free=true` 但价格缺失/非 0 视为价目不明 → `price` gap、不生成文档，`freeEvidence` 永远不会因此写成 `magpie-catalog-zero`。订阅分摊成本与边际成本分开披露，订阅成本当前不披露。观测价目默认 `reviewed=false`，不能自证受审。
 
 `approvalReadiness`：`ready` 与 `blockedReasons`（`account-ownership` / `price-not-reviewed`）必须一致。当前生产状态通常是 `price-not-reviewed`：文档是有效证据，但**不能**用于 enable 证明或执行窗口，直到出现新的受审价目决定。
 
@@ -82,6 +82,7 @@
 `ops_magpie_window_prepare {env?, manifestPath, documentPath, approvalTask}`：
 
 - 只读，不写候选、不启用、不续跑、不重试；
+- 证据根跟随 `approvalTask`（与 `ops_internal_ai_prove`/`ops_internal_ai_deliver` 一致），因此经理可以在自己的任务租约上为另一个审批任务准备窗口；若未来允许省略 `approvalTask`，才回落到调用者自己的任务根。指向其他任务根或证据根之外的路径一律拒绝；
 - 校验文件路径安全、manifest 为 v2、documentHash/configurationDigest/service 绑定一致；
 - 返回 `{eligible, blockedReasons, headroomSeconds, evidenceExpiresAt, window?, manifestHash, documentHash}`；
 - `window = {approvalTask, configurationDigest, evidenceExpiresAt, minRemainingSeconds:5400, notAfter: evidenceExpiresAt − 5400s}`；

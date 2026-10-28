@@ -561,6 +561,13 @@ check('a v2 Magpie manifest and v4 route evidence prepare, are independently app
   world.clock=clock; // the fake gateway and the broker share the same capture clock
   const approval=await core.createTask(gm,{title:'Synthetic Magpie v4 approval',context:'Only isolated fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
   const claim=await core.claim(author,approval.id);
+  // A fresh consumer employee and task keep this regression independent of the earlier
+  // deliberate-failure tests: the SYS04 fault budget is scoped to each task id, and one employee
+  // can only hold one lease.
+  const prover=await new LocalEnrollmentAdmin(database).enroll('test-magpie-consumer','engineering',['execute','review']);
+  const proofTask=await core.createTask(gm,{title:'Synthetic Magpie v4 consumer',context:'Only isolated fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
+  await core.claim(prover,proofTask.id);
+  const proofRoot=join(dir,'evidence',proofTask.id);
   // The real sampler reads the fake loopback gateway and the sealed supplier identity; it writes
   // the v4 document under the approval task's evidence root.
   const sampled=await ops.call(author,approval.id,'ops_magpie_route_sample',{alias:'SNV_FORK',purpose:'synthetic fork route evidence'}) as {status:string;document:Record<string,any>;documentSha256:string;receipt:Record<string,any>};
@@ -585,43 +592,44 @@ check('a v2 Magpie manifest and v4 route evidence prepare, are independently app
   const prepared=await ops.call(author,approval.id,'ops_internal_ai_prepare',{manifestPath,documentPath}) as {digest:string;documentHash:string;approvalMarker:string};
   expect(prepared.digest).toBe(manifest.configurationDigest);
   expect(prepared.documentHash).toBe(sha256(documentBytes));
-  const disabled=await ops.call(author,approval.id,'ops_internal_ai_prove',{mode:'register-disabled',manifestPath,documentPath,activityId:'ui01-internal',nonce:'magpie-disabled-nonce-0001',idempotencyKey:'magpie-disabled'}) as Record<string,unknown>;
-  expect(disabled).toMatchObject({type:'development-disabled',scope:'register-disabled',paidCallsAllowed:0,documentHash:manifest.documentHash});
-  await core.submit(author,{taskId:approval.id,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version},{text:'Synthetic Magpie v4 files',idempotencyKey:randomUUID()});
-  const review=await core.claim(reviewer,approval.id);
-  await core.accept(reviewer,{taskId:approval.id,deliveryId:review.deliveryId,fence:review.fence,expectedVersion:review.task.version},{text:prepared.approvalMarker,idempotencyKey:randomUUID()});
-  const proven=await request('ops_internal_ai_prove',{mode:'enable',approvalTask:approval.id,manifestPath,documentPath,activityId:'ui01-internal',nonce:'magpie-enable-nonce-0001',idempotencyKey:'magpie-enable'}) as Record<string,unknown>;
-  expect(proven).toMatchObject({type:'approved-service',paidCallsAllowed:1,documentHash:manifest.documentHash});
-  // The window proxy reads the approval task's root from the caller's separate task lease and
-  // binds exactly this manifest digest and evidence expiry.
-  const window=await ops.call(consumer,consumerTask,'ops_magpie_window_prepare',{approvalTask:approval.id,manifestPath,documentPath}) as Record<string,any>;
-  expect(window.eligible).toBe(true);
-  expect(window.window).toMatchObject({approvalTask:approval.id,configurationDigest:manifest.configurationDigest,evidenceExpiresAt:reviewed.expiresAt});
-  expect(window.manifestHash).toBe(sha256(Buffer.from(JSON.stringify(manifest))));
-  expect(window.documentHash).toBe(sha256(documentBytes));
-  // Frozen old v3 evidence cannot be bound to a v2 Magpie manifest.
-  const v3=await files(consumerTask,'reviewed-token-plan-v3');
-  const v3Bytes=await readFile(v3.documentPath);
-  const v3Body:ProofManifestBody={...body,documentHash:sha256(v3Bytes)};
-  const v3ManifestPath=join(dir,'evidence',consumerTask,'magpie-v2-over-v3.json');
-  await writeFile(v3ManifestPath,JSON.stringify({...v3Body,configurationDigest:configurationDigest(v3Body)}));
-  await expect(request('ops_internal_ai_prepare',{manifestPath:v3ManifestPath,documentPath:v3.documentPath})).rejects.toMatchObject({code:'invalid'});
-  // A v1 manifest cannot carry v4 Magpie evidence, and v2 Magpie evidence cannot ride a v1 body.
-  const v1=await files(consumerTask,'reviewed-service');
-  await rewrite(v1,reviewed);
-  await expect(request('ops_internal_ai_prepare',{manifestPath:v1.manifestPath,documentPath:v1.documentPath})).rejects.toMatchObject({code:'invalid'});
-  const v1Bytes=await readFile((await files(consumerTask,'reviewed-service')).documentPath);
-  const crossBody:ProofManifestBody={...body,documentHash:sha256(v1Bytes)};
-  const crossPath=join(dir,'evidence',consumerTask,'magpie-v2-over-v1.json');
-  await writeFile(crossPath,JSON.stringify({...crossBody,configurationDigest:configurationDigest(crossBody)}));
-  await expect(request('ops_internal_ai_prepare',{manifestPath:crossPath,documentPath:join(dir,'evidence',consumerTask,'internal-ai-evidence.json')})).rejects.toMatchObject({code:'invalid'});
-  // Tampered bytes or digests never reach the approval store.
+  // Tampered bytes or digests never reach the approval store (checks run while the author still
+  // holds the approval task's lease).
   const badHashPath=join(dir,'evidence',approval.id,'magpie-v2-bad-hash.json');
   await writeFile(badHashPath,JSON.stringify({...manifest,documentHash:'a'.repeat(64)}));
   await expect(ops.call(author,approval.id,'ops_internal_ai_prepare',{manifestPath:badHashPath,documentPath})).rejects.toMatchObject({code:'invalid'});
   const badDigestPath=join(dir,'evidence',approval.id,'magpie-v2-bad-digest.json');
   await writeFile(badDigestPath,JSON.stringify({...manifest,configurationDigest:'b'.repeat(64)}));
   await expect(ops.call(author,approval.id,'ops_internal_ai_prepare',{manifestPath:badDigestPath,documentPath})).rejects.toMatchObject({code:'invalid'});
+  const disabled=await ops.call(author,approval.id,'ops_internal_ai_prove',{mode:'register-disabled',manifestPath,documentPath,activityId:'ui01-internal',nonce:'magpie-disabled-nonce-0001',idempotencyKey:'magpie-disabled'}) as Record<string,unknown>;
+  expect(disabled).toMatchObject({type:'development-disabled',scope:'register-disabled',paidCallsAllowed:0,documentHash:manifest.documentHash});
+  await core.submit(author,{taskId:approval.id,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version},{text:'Synthetic Magpie v4 files',idempotencyKey:randomUUID()});
+  const review=await core.claim(reviewer,approval.id);
+  await core.accept(reviewer,{taskId:approval.id,deliveryId:review.deliveryId,fence:review.fence,expectedVersion:review.task.version},{text:prepared.approvalMarker,idempotencyKey:randomUUID()});
+  const proven=await ops.call(prover,proofTask.id,'ops_internal_ai_prove',{mode:'enable',approvalTask:approval.id,manifestPath,documentPath,activityId:'ui01-internal',nonce:'magpie-enable-nonce-0001',idempotencyKey:'magpie-enable'}) as Record<string,unknown>;
+  expect(proven).toMatchObject({type:'approved-service',paidCallsAllowed:1,documentHash:manifest.documentHash});
+  // The window proxy reads the approval task's root from the caller's separate task lease and
+  // binds exactly this manifest digest and evidence expiry.
+  const window=await ops.call(prover,proofTask.id,'ops_magpie_window_prepare',{approvalTask:approval.id,manifestPath,documentPath}) as Record<string,any>;
+  expect(window.eligible).toBe(true);
+  expect(window.window).toMatchObject({approvalTask:approval.id,configurationDigest:manifest.configurationDigest,evidenceExpiresAt:reviewed.expiresAt});
+  expect(window.manifestHash).toBe(sha256(Buffer.from(JSON.stringify(manifest))));
+  expect(window.documentHash).toBe(sha256(documentBytes));
+  // Frozen old v3 evidence cannot be bound to a v2 Magpie manifest.
+  const v3=await files(proofTask.id,'reviewed-token-plan-v3');
+  const v3Bytes=await readFile(v3.documentPath);
+  const v3Body:ProofManifestBody={...body,documentHash:sha256(v3Bytes)};
+  const v3ManifestPath=join(proofRoot,'magpie-v2-over-v3.json');
+  await writeFile(v3ManifestPath,JSON.stringify({...v3Body,configurationDigest:configurationDigest(v3Body)}));
+  await expect(ops.call(prover,proofTask.id,'ops_internal_ai_prepare',{manifestPath:v3ManifestPath,documentPath:v3.documentPath})).rejects.toMatchObject({code:'invalid'});
+  // A v1 manifest cannot carry v4 Magpie evidence, and v2 Magpie evidence cannot ride a v1 body.
+  const v1=await files(proofTask.id,'reviewed-service');
+  await rewrite(v1,reviewed);
+  await expect(ops.call(prover,proofTask.id,'ops_internal_ai_prepare',{manifestPath:v1.manifestPath,documentPath:v1.documentPath})).rejects.toMatchObject({code:'invalid'});
+  const v1Bytes=await readFile((await files(proofTask.id,'reviewed-service')).documentPath);
+  const crossBody:ProofManifestBody={...body,documentHash:sha256(v1Bytes)};
+  const crossPath=join(proofRoot,'magpie-v2-over-v1.json');
+  await writeFile(crossPath,JSON.stringify({...crossBody,configurationDigest:configurationDigest(crossBody)}));
+  await expect(ops.call(prover,proofTask.id,'ops_internal_ai_prepare',{manifestPath:crossPath,documentPath:join(proofRoot,'internal-ai-evidence.json')})).rejects.toMatchObject({code:'invalid'});
 });
 check('missing approval, wrong manifest/hash/activity/scope and idempotency conflicts reject',async()=>{
   await expect(request('ops_internal_ai_prove',{...proofArgs('none'),approvalTask:consumerTask})).rejects.toBeDefined();
