@@ -9,7 +9,7 @@
 // current module resolution, so this stays honest about what the service actually loads.
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -98,4 +98,31 @@ describe.if(NODE_PRESENT)('drill under the real Node host', () => {
 
 test('the Node host probe is skipped only when no Node binary exists', () => {
   if (!NODE_PRESENT) expect(NODE).toBeTruthy();
+});
+
+// AC03: the worker entry comes from the running release, never from the ops checkout. Production's
+// checkout was still on an older commit without this file, so the detached child died on module-not-found
+// and the drill never started — the exact "depends on the production working directory" AC03 forbids.
+test('AC03: startDrill launches the worker from the active release, not the ops checkout', () => {
+  const home = mkdtempSync(join(tmpdir(), 'drill-start-home-'));
+  try {
+    // A checkout on an old commit: it has no worker entry at all.
+    const checkout = join(home, 'ops-checkout');
+    mkdirSync(join(checkout, 'src'), { recursive: true });
+    // The release the service is actually running.
+    const release = join(home, 'active');
+    mkdirSync(join(release, 'src'), { recursive: true });
+    writeFileSync(join(release, 'src', 'deploy-drill-run.ts'), '// worker\n');
+    const source = readFileSync(SERVICE_MODULE, 'utf8');
+    // The spawn target is built from serviceHome/active, and a missing entry is a named refusal rather
+    // than a silent detached death.
+    expect(source).toContain("join(serviceHome, 'active', 'src', 'deploy-drill-run.ts')");
+    expect(source).not.toContain("join(repo, 'src', 'deploy-drill-run.ts')");
+    expect(source).toContain('drill worker entry not found in the active release');
+    // And the path the code builds really does resolve to the release copy.
+    expect(existsSync(join(release, 'src', 'deploy-drill-run.ts'))).toBe(true);
+    expect(existsSync(join(checkout, 'src', 'deploy-drill-run.ts'))).toBe(false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
