@@ -51,6 +51,8 @@ import {
   type FaultDiagnostic, type FaultInput, type FaultPhase, type FaultRecord, type FaultTargetKind, type FlowStage,
 } from './faults.ts';
 import { WaitStore, waitRecordOf, type WaitRow } from './wait-store.ts';
+import { ReviewEventStore, watchOfRef } from './review-event-store.ts';
+import type { QaScopeSignalInput, QaScopeSignalView, ReviewSignalView, ReviewWatchCloseInput, ReviewWatchInput, ReviewWatchStatusInput, ReviewWatchView } from './review-events.ts';
 import { GoalGovernanceStore } from './goal-store.ts';
 import type { GoalFinalGateRepairResult, GoalOutcomeView, GoalPageView, GoalScanQuery, GoalScanView, GoalFinalGatePreview } from './goal-store.ts';
 import type { GoalCard, GoalEvidenceFact } from './goal-governance.ts';
@@ -660,6 +662,8 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     this.waitWebhookSecret = options?.waits?.webhookSecret ?? process.env.SCK_WAIT_WEBHOOK_SECRET;
     // SYS07: goal outcome contract, final-gate invariants and read-only business metrics.
     this.goals = new GoalGovernanceStore(database.db);
+    // SYS-INT: QA review wake subscriptions ride the SYS05 wait ledger; no agent or timer of their own.
+    this.reviewEvents = new ReviewEventStore(database.db, this.waits, this.waitClock);
   }
   readonly worktrees?: WorktreeRegistry;
   private readonly owner: OwnerDesk;
@@ -679,6 +683,8 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
   private readonly waitClock: () => number;
   /** SYS05: the HMAC secret a webhook must sign with; absent means webhook events are refused, never trusted by default. */
   private readonly waitWebhookSecret?: string;
+  /** SYS-INT: QA review wake subscriptions and structured scope signals. */
+  private readonly reviewEvents: ReviewEventStore;
   private readonly goals: GoalGovernanceStore;
   private readonly projects: ProjectStore;
   /** Stored listings behind the paged reads (C4). */
@@ -1462,6 +1468,11 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       policy_version: policyContract.version, policy_hash: policyContract.hash, expected_policy_epoch: policyEpochAtClaim,
     }));
     const taskView = view(row);
+    // SYS-INT: an independent QA review claim of a watched source task wakes its registered collaboration task once
+    // per review fence. The claim itself already committed; a wake that cannot be written must not undo it.
+    if (row.state === 'review' && row.reviewer_role === 'qa' && row.current_employee === actor.employeeId) {
+      await this.reviewEvents.onReviewClaimed(taskId, actor.employeeId, row.fence).catch(() => undefined);
+    }
     const project = await this.taskProject(taskId);
     const handover = await this.handoverHistory(taskId);
     if (row.state === 'blocked') throw new CompanyError('invalid', 'Execution window expired; manager recovery required');
@@ -2960,10 +2971,18 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (task.state === 'done' && this.worktrees) {
       await this.worktrees.reclaimAfterTerminal(task, 'accept').catch(() => undefined);
     }
+    if (task.reviewerRole === 'qa') {
+      await this.reviewEvents.invalidateSource(task.id, 'the review was accepted before the event was delivered').catch(() => undefined);
+    }
     return task;
   }
   async returnTask(credential: Credential, proof: LeaseProof, evidence: Evidence) {
     const task = await this.transition(credential, proof, 'return', evidence);
+    // SYS-INT: an event produced by the lease that just ended must not wake anyone later. Only this source task's
+    // undelivered events are touched; the collaboration task is never changed by a return.
+    if (task.reviewerRole === 'qa') {
+      await this.reviewEvents.invalidateSource(task.id, 'the review was returned before the event was delivered').catch(() => undefined);
+    }
     // Same event point as accept: a return that leaves the scene with zero effective refs
     // reclaims it in place; a recovery ref keeps the scene for the next holder.
     if (task.worktree && this.worktrees) {
@@ -2978,7 +2997,13 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * reviewer return; handover markers from earlier holders are left untouched.
    */
   async release(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView> {
-    return echoTask(await this.releaseRecord(credential, proof, evidence));
+    const task = await this.releaseRecord(credential, proof, evidence);
+    // SYS-INT: a dropped review lease ends the event window just like a return. Undelivered wakes of that fence are
+    // invalidated now; a later claim raises the fence and produces a fresh event of its own.
+    if (task.state === 'review' && task.reviewerRole === 'qa') {
+      await this.reviewEvents.invalidateSource(task.id, 'the review lease was released before the event was delivered').catch(() => undefined);
+    }
+    return echoTask(task);
   }
 
   private async releaseRecord(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView> {
@@ -3081,6 +3106,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const normalized = normalizeWait({ ...input, ownerRole: input.ownerRole ?? defaultOwner } as WaitInput, {
       now, ownerRole: defaultOwner,
     });
+    // SYS-INT: a feedback wait may name a review watch, but only an active watch of *this* task. A collaboration
+    // task cannot park on another team's subscription, and a closed watch cannot keep it out of the queue.
+    await this.assertReviewWaitReference(proof.taskId, normalized.kind, normalized.reference);
     let releaseGraph: (() => Promise<void>) | undefined;
     try {
       if (normalized.referenceTaskId) {
@@ -3136,6 +3164,16 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
           auditId: randomUUID(), outboxId: randomUUID(),
         });
         if (!updated) throw new CompanyError('temporarily_unavailable', '等待未落地，请重试', true);
+        // SYS-INT: entering a review-watch feedback wait drains what the source state already warrants. An event that
+        // arrived before this wait existed was kept pending; it is delivered now instead of being lost. The task may
+        // already be released again by that delivery, so the answer is the row as it stands now.
+        const watchId = watchOfRef(normalized.reference);
+        if (watchId !== undefined) {
+          await this.syncReviewWatch(watchId);
+          await this.reviewEvents.deliverPendingFor(proof.taskId).catch(() => undefined);
+          const after = await this.db.select<TaskRow>(id('task', proof.taskId));
+          if (after) return view(after);
+        }
         return view(updated);
       } catch (error) {
         const prior = await this.replay(idem, digest);
@@ -6331,6 +6369,87 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const meta: QaObservationMeta = { checkedAt: new Date().toISOString(), dataSource: 'live', instanceAt: await this.dbNow(),
       scope: qaScopeView(scope), completeness: { complete: segment.next === null } };
     return { meta, ...textSegmentAnswer(head, segment), field: input.field };
+  }
+
+  // ---- SYS-INT 评审协同的持久事件唤醒 ----
+  // 只做协调：GM 登记同 goal（源任务, 协同任务）订阅，QA 的真实复核租约与结构化请求触发一次唤醒，正向取证完成并
+  // 撤销请求触发第二次。唤醒只解除协同任务自己的 SYS05 feedback 等待（dispatcher 随后重新派 GM），不生成
+  // qa_observation_scope、不写验收证据、不改源任务租约，也不认识 checkpoint 里的自由文本。
+
+  /** GM (manage): register the one watch of an ordered same-goal task pair; the current source state is delivered at once. */
+  async reviewWatchRegister(credential: Credential, input: ReviewWatchInput): Promise<ReviewWatchView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may register a review watch');
+    requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
+    return this.reviewEvents.register({ ...input, actor: actor.employeeId });
+  }
+
+  /** GM (manage): close a watch with compare-and-set; undelivered events are invalidated, never replayed later. */
+  async reviewWatchClose(credential: Credential, input: ReviewWatchCloseInput): Promise<ReviewWatchView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may close a review watch');
+    requireText(input.watchId, 'watchId', 1, 200);
+    requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
+    return this.reviewEvents.close({ ...input, actor: actor.employeeId });
+  }
+
+  /** Read-only: gm sees every watch, a qa employee only the watches of tasks it reviews. Never returns task text. */
+  async reviewWatchStatus(credential: Credential, input: ReviewWatchStatusInput = {}): Promise<ReviewWatchView[]> {
+    const actor = await this.authorized(credential);
+    if (actor.role !== 'gm' && actor.role !== 'qa') throw new CompanyError('forbidden', 'Review watch status is read by gm or qa');
+    const views = await this.reviewEvents.status({
+      ...(input.watchId ? { watchId: input.watchId } : {}),
+      ...(input.sourceTaskId ? { sourceTaskId: input.sourceTaskId } : {}),
+      ...(input.collaborationTaskId ? { collaborationTaskId: input.collaborationTaskId } : {}),
+    });
+    if (actor.role === 'gm') return views;
+    // A QA sees only the subscriptions it is currently entitled to act on: the source task is held by it, or the
+    // latest structured signal on that source task is its own. Another team's coordination is not its business.
+    return views.filter(view => view.source.holder === actor.employeeId || view.signal?.actor === actor.employeeId);
+  }
+
+  /** QA (own credential, live review lease): a structured scope request, then its positive retract. Audited, task ids only. */
+  async qaReviewScopeSignal(credential: Credential, input: QaScopeSignalInput): Promise<QaScopeSignalView> {
+    const actor = await this.authorized(credential);
+    if (actor.role !== 'qa') throw new CompanyError('forbidden', 'Only a qa reviewer may signal a review scope');
+    requireText(input.taskId, 'taskId', 1, 200);
+    requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
+    return this.reviewEvents.signal({ ...input, actor: actor.employeeId });
+  }
+
+  /** Read-only signal history: gm sees every signal, a qa employee sees the ones it raised. */
+  async reviewScopeSignals(credential: Credential, input: { taskId?: string; limit?: number } = {}): Promise<ReviewSignalView[]> {
+    const actor = await this.authorized(credential);
+    if (actor.role !== 'gm' && actor.role !== 'qa') throw new CompanyError('forbidden', 'Review signals are read by gm or qa');
+    const signals = await this.reviewEvents.signals(input);
+    return actor.role === 'gm' ? signals : signals.filter(signal => signal.actor === actor.employeeId);
+  }
+
+  /**
+   * A feedback wait that names a watch must name *this* task's watch and an active one: a task cannot park itself on
+   * another team's subscription, and a closed watch cannot be the reason a collaboration task stops working.
+   */
+  private async assertReviewWaitReference(taskId: string, kind: string, reference: string | undefined): Promise<void> {
+    const watchId = watchOfRef(reference);
+    if (watchId === undefined) {
+      if (kind === 'feedback' && reference?.startsWith('review-watch:')) {
+        throw new CompanyError('invalid', 'review-watch reference must be review-watch:<32 hex>');
+      }
+      return;
+    }
+    const [watch] = await this.db.query<[{ state?: string; collaboration_task?: unknown } | undefined]>(
+      'SELECT state, collaboration_task FROM ONLY $watch;', { watch: id('qa_review_watch', watchId) });
+    if (!watch) throw new CompanyError('not_found', 'review watch not found');
+    if (watch.state !== 'active') throw new CompanyError('conflict', 'the review watch is closed; it cannot wake this task');
+    if (asId(watch.collaboration_task) !== taskId) {
+      throw new CompanyError('forbidden', 'this task is not the collaboration task of the named review watch');
+    }
+  }
+
+  /** Ask the store to emit whatever the current source state warrants for one watch (used after a wait is entered). */
+  private async syncReviewWatch(watchId: string): Promise<void> {
+    await this.reviewEvents.syncWatch(watchId).catch(() => undefined);
   }
 
 }
