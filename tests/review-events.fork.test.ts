@@ -17,11 +17,10 @@
  */
 import { afterAll, beforeAll, beforeEach, expect, setDefaultTimeout, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
 import { RecordId } from 'surrealdb';
-import { loadDatabaseConfig } from '../src/config.ts';
 import { CompanyDatabase } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { CompanyError } from '../src/core-errors.ts';
@@ -33,16 +32,21 @@ import type { ClaimResult, Evidence, LeaseProof } from '../src/contracts.ts';
 
 setDefaultTimeout(600_000);
 // Same opt-in as the other isolated-namespace fork suites: it needs a local company fork, not a mock.
-const fork = process.env.RUN_SCK_REVIEW_EVENT_FORK_TESTS === '1' ? test : test.skip;
+// Without a fork run nothing is built at import time — reading loadDatabaseConfig() here once pointed
+// the gate's plain `bun test` at the product .env and died on the non-local guard.
+const forkEnv = process.env.RUN_SCK_REVIEW_EVENT_FORK_TESTS === '1' || process.env.RUN_SCK_WORKTREE_FORK_TESTS === '1';
+const fork = forkEnv ? test : test.skip;
 const NS = 'sck_review_events_test';
-const database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
-const credDir = mkdtempSync(join(tmpdir(), 'sck-review-events-'));
-const enrollment = new LocalEnrollmentAdmin(database);
-const owner = new OwnerDesk(database);
+let database: CompanyDatabase;
+let enrollment: LocalEnrollmentAdmin;
+let owner: OwnerDesk;
+let core: SurrealCompanyCore;
+let credDir = '';
+const dir = mkdtempSync(join(tmpdir(), 'sck-review-events-db-'));
+let dbServer: ReturnType<typeof Bun.spawn> | undefined;
 const tokens: Record<string, string> = {};
 const key = () => `re-${crypto.randomUUID()}`;
 let clock = Date.now();
-const core = new SurrealCompanyCore(database, { waits: { clock: () => clock } });
 
 const proofOf = (claimed: ClaimResult): LeaseProof =>
   ({ taskId: claimed.task.id, deliveryId: claimed.deliveryId, fence: claimed.fence, expectedVersion: claimed.task.version });
@@ -113,6 +117,27 @@ const waitFor = async (fn: () => Promise<boolean> | boolean, timeoutMs = 8_000):
 };
 
 beforeAll(async () => {
+  if (!forkEnv) return;
+  // Self-hosting like tests/effective-policy.fork.test.ts: the gate runs this file with the fork env
+  // but without test-worktrees.ts, so the suite spawns its own isolated company-fork database on a
+  // random loopback port instead of falling back to the product .env URL.
+  const reservation = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('fixture') });
+  const port = reservation.port!; reservation.stop(true);
+  const rootPassword = 'review-events-fork-fixture';
+  dbServer = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`,
+    '--user', 'root', '--pass', rootPassword, '--log', 'error', `rocksdb:${dir}/db`],
+    { stdout: 'ignore', stderr: 'ignore' });
+  let ready = false;
+  for (let n = 0; n < 160; n++) {
+    try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) { ready = true; break; } } catch {}
+    await Bun.sleep(25);
+  }
+  if (!ready) throw new Error('the review-events fork fixture did not become healthy');
+  database = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword, namespace: NS, database: 'control_plane' });
+  credDir = mkdtempSync(join(tmpdir(), 'sck-review-events-'));
+  enrollment = new LocalEnrollmentAdmin(database);
+  owner = new OwnerDesk(database);
+  core = new SurrealCompanyCore(database, { waits: { clock: () => clock } });
   await database.connect();
   await database.db.query(`DEFINE NAMESPACE IF NOT EXISTS ${NS};`);
   await database.db.use({ namespace: NS });
@@ -128,7 +153,13 @@ beforeAll(async () => {
   ] as const) tokens[name] = await enrollment.enroll(`re-${name}`, role, caps);
 }, 180_000);
 
-afterAll(async () => { await database.close(); rmSync(credDir, { recursive: true, force: true }); });
+afterAll(async () => {
+  if (!forkEnv) return;
+  await database.close();
+  dbServer?.kill();
+  rmSync(dir, { recursive: true, force: true });
+  if (credDir) rmSync(credDir, { recursive: true, force: true });
+});
 
 /**
  * Fixture reset between cases: each case asserts the wake rules, not the previous case's leftover lease. The lease
@@ -136,6 +167,7 @@ afterAll(async () => { await database.close(); rmSync(credDir, { recursive: true
  * unbound; the wake tables are left alone so a case that inspects them reads its own rows.
  */
 beforeEach(async () => {
+  if (!forkEnv) return;
   clock = Date.now();
   await database.db.query(`UPDATE task SET current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
       state = IF state IN ['doing'] THEN 'ready' ELSE state END,
