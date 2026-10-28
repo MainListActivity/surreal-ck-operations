@@ -1,6 +1,6 @@
 import {DEFAULT_POLICY} from '../src/model-routing/weights.ts';
 import {afterEach,expect,test} from 'bun:test';
-import {mkdtempSync,rmSync,writeFileSync} from 'node:fs';
+import {mkdtempSync,rmSync,writeFileSync,mkdirSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import bundled from '../src/model-routing/benchmarks.json';
@@ -22,7 +22,7 @@ test('AA flight parser preserves prices, escapes and estimates, ignores deprecat
 });
 test('AA refresh is daily, atomic and retains last good snapshot on bad response',async()=>{
  const file=join(scratch(),'aa.json');let calls=0;
- const rows=[{slug:'deepseek-v4-1-flash-1017',intelligenceIndex:45},{slug:'claude-sonnet-5-5',intelligenceIndex:56},...Array.from({length:55},(_,i)=>({slug:`m-${i}`,intelligenceIndex:i}))];
+ const rows=[{slug:'gpt-6-luna',name:'GPT-6 Luna (Max)',intelligenceIndex:38},{slug:'claude-sonnet-5-5',intelligenceIndex:56},...Array.from({length:55},(_,i)=>({slug:`m-${i}`,intelligenceIndex:i}))];
  const fetcher=(async()=>{calls++;return new Response(flight(rows));}) as unknown as typeof fetch;
  const now=Date.now();const a=await refreshAa(file,fetcher,now);expect(a?.models).toHaveLength(57);
  await refreshAa(file,fetcher,now+1000);expect(calls).toBe(1);
@@ -30,8 +30,8 @@ test('AA refresh is daily, atomic and retains last good snapshot on bad response
  expect(loadAa(file)).toEqual(a);
 });
 test('daily benchmark supplies rank, future models and anchor classification',()=>{
- useBenchmarks([{slug:'deepseek-v4-1-flash-1017',score:45},{slug:'claude-sonnet-5-5',score:56},{slug:'future',score:49},{slug:'weak',score:37}]);
- expect(aaRankOf('future')).toBe(2);expect(classify([{id:'p/future'},{id:'p/weak'}]).map(x=>[x.id,x.tier])).toEqual([['p/future','opus']]);
+ useBenchmarks([{slug:'gpt-6-luna',name:'GPT-6 Luna (Max)',score:38},{slug:'claude-sonnet-5-5',score:56},{slug:'future',score:49,priceInput:1.5},{slug:'weak',score:37,priceInput:0.5}]);
+ expect(aaRankOf('future')).toBe(2);expect(classify([{id:'p/future'},{id:'p/weak'}]).map(x=>[x.id,x.tier])).toEqual([['p/future','sonnet']]);
 });
 const nativeUsage=(models:unknown[])=>({period:'7d',since:'2026-10-18T00:00:00Z',models});
 const channel=(provider:string,model:string,decode_out:number,decode_ms:number)=>({provider,model,calls:10,errors:1,input:10,cache_read:80,cache_write:10,timed:8,ttft_ms:4000,decode_n:6,decode_out,decode_ms,output:999999,reasoning:888888});
@@ -63,7 +63,7 @@ test('every rankingFacts collection fetches live native Magpie statistics and fa
   fetch:(async(url:any,options:any)=>{
    expect(String(url)).toBe('http://127.0.0.1:3425/v1/magpie/usage?period=7d');expect(options.cache).toBe('no-store');calls++;
    return down?new Response('unavailable',{status:503}):Response.json(nativeUsage([channel('p','m',100*calls,1000)]));
-  }) as typeof fetch,
+  }) as unknown as typeof fetch,
  });
  expect((await controller.rankingFacts(['p/m']))[0]?.usage?.tokensPerSecond).toBe(100);
  expect((await controller.rankingFacts(['p/m']))[0]?.usage?.tokensPerSecond).toBe(200);
@@ -347,4 +347,77 @@ test('explicit numeric TTFT tail constraints beat probabilistic scores without r
  expect(order).toEqual(['p/unknown','p/boundary','p/slow']);expect(snapshot.rows.at(-1).score).toBe(4);
  const t=rankingTables({'sck-haiku':order},{'sck-haiku':snapshot})[0]!;
  expect(t.rows.at(-1)?.tailReason).toContain('11.643 秒 > 10 秒');expect(t.rows[0]?.tailReason).toBeUndefined();expect(t.rows[1]?.tailReason).toBeUndefined();
+});
+
+
+test('channel-scoped performance and task trends never leak to a new channel with the same model',async()=>{
+ const at=new Date().toISOString();
+ const results=[{model:'remote-magpie/old/m:max',domain:'general',overall:4.8,weight:1,at,task:'t1'}];
+ const db={query:async()=>[results]};
+ const controller=new ModelRoutingController(db as any,scratch(),'unused',{
+  output:async()=> '[]',fetch:(async()=>Response.json(nativeUsage([]))) as unknown as typeof fetch,
+ });
+ const facts=await controller.rankingFacts(['remote-magpie/old/m:max','remote-magpie/new/m:max']);
+ expect(facts[0]?.performance).toEqual({score:4.8,samples:1});
+ expect(facts[1]?.performance).toBeUndefined();
+ expect(facts[0]?.trends?.performanceScore).toMatchObject({samples:1,current:4.8});
+ expect(facts[1]?.trends?.performanceScore).toMatchObject({samples:0,current:undefined});
+});
+
+
+test('admission tracks the newest Luna Max version and moving scores, with inclusive AA input price bands',async()=>{
+ const {admissionAnchor}=await import('../src/model-routing/policy.ts');
+ const rows=[{slug:'gpt-6-luna',name:'GPT-6 Luna (Max)',score:38,priceInput:0.1},
+ {slug:'gpt-6-1-luna',name:'GPT-6.1 Luna (Max)',score:28,priceInput:0.1},
+ ...[0,1,1.0001,2,2.0001,null,-1].map((priceInput,i)=>({slug:`new-${i}`,score:60,priceInput})),
+ {slug:'below',score:27.99,priceInput:0.1},{slug:'equal',score:28,priceInput:0.1},
+ {slug:'unpriced',score:100}];
+ useBenchmarks(rows);expect(admissionAnchor().slug).toBe('gpt-6-1-luna');
+ const selected=classify(rows.map(r=>({id:`vendor/${r.slug}`})));
+ expect(Object.fromEntries(selected.map(r=>[r.model,r.tier]))).toMatchObject({'new-0':'haiku','new-1':'haiku','new-2':'sonnet','new-3':'sonnet','new-4':'opus','new-5':'opus','new-6':'opus',unpriced:'opus',equal:'haiku'});
+ expect(selected.some(r=>r.model==='below')).toBe(false);
+ useBenchmarks(rows.map(r=>r.slug==='gpt-6-1-luna'?{...r,score:26}:r));
+ expect(classify([{id:'vendor/below'}])[0]?.tier).toBe('haiku');
+ useBenchmarks([...rows,{slug:'gpt-7-luna-high',name:'GPT-7 Luna (High)',score:50}]);
+ expect(()=>classify([{id:'vendor/below'}])).toThrow('latest Luna Max');
+});
+
+
+test('new admissions use price bands only, never populate manual groups or borrow when a band is empty',async()=>{
+ const home=scratch(),dir=join(home,'model-routing');mkdirSync(dir,{recursive:true});
+ const rows=[{slug:'gpt-6-luna',name:'GPT-6 Luna (Max)',score:28,priceInput:0.1},
+ {slug:'cheap',score:80,priceInput:1},{slug:'mid',score:29,priceInput:2},
+ {slug:'costly',score:99,priceInput:2.01},{slug:'unpriced',score:99},{slug:'below',score:27,priceInput:0.1}];
+ writeFileSync(join(dir,'aa.json'),JSON.stringify({source:'fixture',retrievedAt:new Date().toISOString(),models:rows}));
+ let catalog=rows.slice(1).map(r=>({id:`p/${r.slug}`}));
+ const groups:Record<string,string[]>={'sck-opus':['owner/high'],'sck-fable':['owner/manual']};
+ const db={query:async(sql:string)=>sql.includes('SELECT enabled')?[{enabled:true}]:[[]]};
+ const controller=new ModelRoutingController(db as any,home,'unused',{
+  fetch:(async()=>Response.json({data:catalog})) as unknown as typeof fetch,groups:()=>groups,
+  command:async(args:string[])=>{if(args[1]==='add')groups[args[2]!]=args[3]!.slice(7).split(',');},
+ });
+ await controller.refresh(true);
+ expect(groups).toEqual({'sck-opus':['owner/high'],'sck-fable':['owner/manual'],'sck-haiku':['p/cheap'],'sck-sonnet':['p/mid']});
+ // Existing members and a manual removal survive another run; neither band borrows.
+ groups['sck-haiku']=[];groups['sck-sonnet']!.push('owner/keep');
+ catalog=[...catalog,{id:'q/cheap'}];await controller.refresh(true);
+ expect(groups['sck-haiku']).toEqual(['q/cheap']);
+ expect(groups['sck-sonnet']).toContain('owner/keep');expect(groups['sck-sonnet']).not.toContain('q/cheap');
+ expect(groups['sck-opus']).toEqual(['owner/high']);expect(groups['sck-fable']).toEqual(['owner/manual']);
+});
+
+
+test('unexpired legacy AA cache refreshes once; missing latest Max blocks admission across reads until recovery',async()=>{
+ const file=join(scratch(),'aa.json'),now=Date.now();
+ const old={source:'fixture',retrievedAt:new Date(now).toISOString(),models:[{slug:'gpt-6-luna',name:'GPT-6 Luna (Max)',score:38,priceInput:0.1}]};
+ writeFileSync(file,JSON.stringify(old));let calls=0;
+ const base=[{slug:'gpt-6-luna',name:'GPT-6 Luna (Max)',intelligenceIndex:28},...Array.from({length:50},(_,i)=>({slug:`r-${i}`,intelligenceIndex:40}))];
+ const fetcher=(async()=>{calls++;return new Response(flight(base));}) as unknown as typeof fetch;
+ const fresh=await refreshAa(file,fetcher,now);expect(calls).toBe(1);expect(fresh?.version).toBe(2);expect(fresh?.models[0]?.score).toBe(28);
+ const broken=[...base,{slug:'gpt-7-luna-high',name:'GPT-7 Luna (High)',intelligenceIndex:40}];
+ const blocked=await refreshAa(file,(async()=>new Response(flight(broken))) as unknown as typeof fetch,now+86400001);
+ expect(blocked?.admissionBlocked).toBe(true);expect(blocked?.models).toEqual(fresh?.models);
+ expect((await refreshAa(file,fetcher,now+86400002))?.admissionBlocked).toBe(true);
+ expect(loadAa(file)?.admissionBlocked).toBe(true);
+ const recovered=await refreshAa(file,fetcher,now+2*86400000+2);expect(recovered?.admissionBlocked).toBeUndefined();
 });

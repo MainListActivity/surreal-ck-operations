@@ -1,5 +1,9 @@
 /** v1 core/adapter boundary. The MCP adapter supplies an opaque credential on every call. */
 import type { WaitHandoffCard, WaitMigrationCandidate } from './waits.ts';
+import type {
+  QaScopeSignalInput, QaScopeSignalView, ReviewSignalView, ReviewWatchCloseInput, ReviewWatchInput, ReviewWatchStatusInput,
+  ReviewWatchView,
+} from './review-events.ts';
 import type { GoalCard, GoalEvidenceFact, GoalEvidenceInput, GoalOutcomeFact, RequiredEvidenceKind } from './goal-governance.ts';
 import type { GoalMetricsAnswer, GoalMetricsSection, GoalMetricsView } from './goal-metrics.ts';
 import type { GoalFinalGatePreview, GoalFinalGateRepairResult, GoalOutcomeView, GoalPageView, GoalScanQuery, GoalScanView } from './goal-store.ts';
@@ -1158,6 +1162,11 @@ export interface QaObservationTextSegment {
 }
 export interface QaObservationSessionView { scope: QaObservationScopeView; code: string; expiresAt: string; /** The restricted read-only page path; the QA opens the preview LAN /q/ page. */ pagePath?: string; }
 export interface QaObservationLoginView { scope: QaObservationScopeView; token: string; expiresAt: string; }
+/** SYS-INT 评审协同唤醒的线形状：声明在 src/review-events.ts（纯规则），这里只做转出，避免三份漂移的副本。 */
+export type {
+  QaScopeSignalInput, QaScopeSignalView, ReviewDeliveryView, ReviewEventKind, ReviewSignalKind, ReviewSignalView,
+  ReviewWakeView, ReviewWatchCloseInput, ReviewWatchInput, ReviewWatchStatusInput, ReviewWatchView,
+} from './review-events.ts';
 
 /**
  * SYS03: the manager-disposition ledger's wire shapes. They are declared once in src/disposition.ts (the module that
@@ -1449,6 +1458,18 @@ export interface CompanyCore {
   qaObservationRead?(auth: QaObservationAuth, input: QaObservationReadInput): Promise<QaObservationReadView>;
   qaObservationTimeline?(auth: QaObservationAuth, input: QaObservationReadInput & { pageSize?: number; cursor?: string }): Promise<QaObservationTimelineView>;
   qaObservationText?(auth: QaObservationAuth, input: { scopeId?: string; taskId: string; field: 'context' | 'evidence'; auditId?: string; offset?: number; limit?: number; expectSha256?: string }): Promise<QaObservationTextSegment>;
+  /**
+   * SYS-INT 评审协同持久事件唤醒：GM 登记一条同 goal（源任务, 协同任务）订阅；独立 QA 领到源任务 review 租约或
+   * 当前 QA 持有人发出结构化 scope 请求时唤醒协同任务一次，正向取证完成并撤销请求时再唤醒一次。事件只解除协同
+   * 任务自己的 SYS05 feedback 等待，不生成 scope、不写验收、不改源任务租约。
+   */
+  reviewWatchRegister?(credential: Credential, input: ReviewWatchInput): Promise<ReviewWatchView>;
+  reviewWatchClose?(credential: Credential, input: ReviewWatchCloseInput): Promise<ReviewWatchView>;
+  reviewWatchStatus?(credential: Credential, input?: ReviewWatchStatusInput): Promise<ReviewWatchView[]>;
+  /** QA（本人 review 租约持有人）：请求/撤销一次 scope 授权，并触发对应阶段的唤醒。 */
+  qaReviewScopeSignal?(credential: Credential, input: QaScopeSignalInput): Promise<QaScopeSignalView>;
+  /** 只读：结构化信号历史（GM 看全部，QA 看自己的）。 */
+  reviewScopeSignals?(credential: Credential, input?: { taskId?: string; limit?: number }): Promise<ReviewSignalView[]>;
   /**
    * SYS03 AC01: claim one blocking episode's disposition. The episode is task+phase+start, keyed by a deterministic id, so
    * two managers claiming concurrently produce exactly one winner; the loser reads `already_handled` (with the decision) or

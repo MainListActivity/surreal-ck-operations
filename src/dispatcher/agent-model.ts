@@ -54,6 +54,7 @@ export function parseMcpReply(raw: string): { ok: boolean; detail: string } {
 }
 
 export interface SetAgentModelOptions {
+  thinkingOptionId?: string;
   base?: string;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
@@ -74,7 +75,7 @@ export async function setAgentModel(agentId: string, model: string, options: Set
       headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
       body: JSON.stringify({
         jsonrpc: '2.0', id: requestId, method: 'tools/call',
-        params: { name: 'update_agent', arguments: { agentId, settings: { model } } },
+        params: { name: 'update_agent', arguments: { agentId, settings: { model, ...(options.thinkingOptionId ? {thinkingOptionId:options.thinkingOptionId} : {}) } } },
       }),
       signal: AbortSignal.timeout(options.timeoutMs ?? 5_000),
     });

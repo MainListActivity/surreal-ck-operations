@@ -1,13 +1,15 @@
 import { readFileSync } from "node:fs";
 import { mkdir, writeFile, rename } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { BenchmarkRow } from "./policy.ts";
+import {admissionAnchor, type BenchmarkRow } from "./policy.ts";
 
 export const AA_SOURCE = "https://artificialanalysis.ai/leaderboards/models";
 const DAY = 86400000;
 const attempts = new Map<string, number>();
 
 export interface AaSnapshot {
+  version?: 2;
+  admissionBlocked?: boolean;
   source: string;
   retrievedAt: string;
   models: BenchmarkRow[];
@@ -67,15 +69,21 @@ export function loadAa(file: string): AaSnapshot | undefined {
 export async function refreshAa(file: string, fetchImpl: typeof fetch = fetch, now = Date.now()): Promise<AaSnapshot | undefined> {
   const old = loadAa(file);
   // Snapshots from before names were kept cannot tell which reasoning level a score belongs to.
-  if (old && now - Date.parse(old.retrievedAt) < DAY && old.models.some((m) => m.name)) return old;
+  if (old?.version === 2 && !old.admissionBlocked && now - Date.parse(old.retrievedAt) < DAY && old.models.some((m) => m.name)) return old;
   if (attempts.has(file) && now - attempts.get(file)! < DAY) return old;
   attempts.set(file, now);
   try {
     const reply = await fetchImpl(AA_SOURCE, { headers: { "user-agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(30000) });
     if (!reply.ok) return old;
     const models = parseAaLeaderboard(await reply.text());
-    if (models.length < 50 || !models.some(m => /deepseek-v4-1-flash/.test(m.slug)) || !models.some(m => /claude-sonnet-5-5/.test(m.slug))) return old;
-    const snapshot = { source: AA_SOURCE, retrievedAt: new Date(now).toISOString(), models };
+    if (models.length < 50) return old;
+    let admissionBlocked=false;
+    try {admissionAnchor(models);} catch {admissionBlocked=true;}
+    // A real leaderboard with no usable latest anchor is different from a transient fetch failure.
+    // Keep the good data, persist the admission stop across retries/restarts, and clear it on recovery.
+    const snapshot: AaSnapshot = admissionBlocked
+      ? {...(old ?? {source:AA_SOURCE,retrievedAt:new Date(now).toISOString(),models}),admissionBlocked:true}
+      : {version:2,source:AA_SOURCE,retrievedAt:new Date(now).toISOString(),models};
     await mkdir(dirname(file), {recursive:true,mode:0o700});
     await writeFile(`${file}.tmp`, JSON.stringify(snapshot), { mode: 0o600 });
     await rename(`${file}.tmp`, file);

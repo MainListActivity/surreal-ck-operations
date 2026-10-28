@@ -1,15 +1,16 @@
 {
-  "version": "0.3.20",
-  "title": "演练 oracle 输出完整记录",
+  "version": "0.3.26",
+  "title": "修复 sidecar-review 门禁：评审事件套件改用隔离公司 fork 库",
   "changes": [
-    "修复 AC04 证据记录缺陷（v0.3.19 生产实测发现）：runner 把 oracle 的 DRILL_ORACLE_OK 摘要截断到 500 字符，阳性对照的 deliveryId 被切断，记录的 oracle 证据无法解析回 JSON；现完整写入该阶段日志",
-    "新增回归：用超过 500 字符的 oracle 摘要断言日志中的摘要能被 JSON.parse 回读并含 leftoverDigestUnchanged 与阳性对照；把切片的旧写法恢复回去该用例立即失败（已实测）",
-    "保留 v0.3.19 的 worker 入口修复（从 serviceHome/active 启动、缺失时点名报错）与 v0.3.18 全部内容：node:net 端口探测、显式 Bun 运行时、frozen lockfile 双依赖、演练库常驻、通道与命名空间隔离、repoint 注入改正、prepare 日志按 release 命名、演练与权限回归接入 sidecar-review 门禁"
+    "tests/review-events.fork.test.ts 不再在模块顶层读产品 .env：与 effective-policy.fork.test.ts 同形态，自备随机回环端口的隔离公司 fork 库，无 fork 环境时整组 skip 且 import 零副作用",
+    "修复 v0.3.24/v0.3.25 升级作业在「检查代码与本机发布门禁」阶段失败：sidecar-review 门禁直跑 bun test 时被非本地库保护拦下（wss://data.maplayer.top/rpc）",
+    "门禁文件表、被测行为与产品代码零改动；仅修正测试的数据库装配方式"
   ],
   "impact": [
-    "v0.3.19 上生产后真实 deploy_drill_run 已跑通（runId d501cea0，9/9 阶段 ok，两面 health/ready、sck 往返、repoint 拒绝与恢复、oracle 零误派零写入、清理均达成）；本次只补齐 oracle 摘要的完整可读记录，使 AC04 证据可被独立复核",
-    "演练仍不触生产 active/插件登记/MCP 端口/真实库与凭证；不绕过员工沙箱与验收，不新增付费资源"
+    "company_upgrade 作业可越过此前失败的 sidecar-review 阶段；v0.3.24/v0.3.25 升级卡在新版本安装后按旧版本待办自动收口",
+    "SYS-INT 九类评审事件场景仍受门禁保护（9 cases / 88 expect），仅在 fork 环境变量下执行",
+    "不改数据库 schema、派工规则或排序逻辑；回滚到部署前现役安全"
   ],
-  "migration": "无数据库迁移、无历史改写；仅改演练 runner 与测试，数据仍用演练根内独立库。",
-  "rollback": "保留健康 active；用当前受审 release 的 installer 回滚至升级前现役（执行时以 active 实际 SHA 为准），active 与插件面同时切回并过 RW06/SYS02/IR06/SYS06 守卫；演练根互不读取，无数据回滚。"
+  "migration": "无数据库迁移；沿用 schema_version 44。",
+  "rollback": "通过标准安装器恢复上一固定发布。"
 }

@@ -9,6 +9,15 @@ if [ "${SCK_SANDBOX:-}" = employee ] || [ -n "${SCK_COMM_DIR:-}" ]; then
   profile="$here/employee.sb"
   if [ ! -r "$profile" ]; then echo "sck sandbox: $profile missing; refusing to start a company session unsandboxed" >&2; exit 78; fi
   export SCK_SANDBOX=employee
+  # Goal workspaces start in the project root. Load the private employee settings explicitly,
+  # after the user's settings, rather than writing company routing into a shared project.
+  if [ -n "${SCK_CLAUDE_SETTINGS:-}" ] && [ "${1##*/}" = claude ]; then
+    if [ ! -r "$SCK_CLAUDE_SETTINGS" ]; then
+      echo "sck sandbox: employee Claude settings missing; refusing an untracked launch" >&2
+      exit 78
+    fi
+    set -- "$@" --settings "$SCK_CLAUDE_SETTINGS"
+  fi
   # Installed as <service home>/sandbox/launch.sh; the paths come from the install, not the session env.
   exec /usr/bin/sandbox-exec -f "$profile" -D HOME="$(cd ~ && pwd -P)" -D SERVICE="$(cd "$here/.." && pwd -P)" "$@"
 fi

@@ -162,8 +162,13 @@ type Handler = (input: { request: Record<string, unknown> }, ctx: { paseo: unkno
 function hook(labels: Record<string, string> | 'fails' | 'hangs' = {}, options: Parameters<typeof registerScrub>[2] = {}, inherited: Record<string, string> = daemonEnv) {
   let handler!: Handler;
   const server = { before: (_name: string, fn: Handler) => { handler = fn; return () => {}; } };
-  registerScrub(server as never, inherited, options);
   let lookups = 0;
+  registerScrub(server as never, inherited, { employee: async () => {
+    lookups++;
+    if (labels === 'fails') throw Error('registry unavailable');
+    if (labels === 'hangs') return new Promise<boolean>(() => {});
+    return labels.company === 'surreal-ck';
+  }, ...options });
   const paseo = {
     agents: {
       ref: () => ({
@@ -196,7 +201,7 @@ describe('agent.session_open hook', () => {
     expect(h.lookups()).toBe(0);
   });
 
-  test('a resumed company agent has lost its marker but is recognised by its labels, once', async () => {
+  test('a resumed company agent has lost its marker but is recognised by its durable registry, once', async () => {
     const h = hook({ company: 'surreal-ck' });
     const first = await h.open({ ...base, reason: 'resume', env: {} });
     expect(first?.env.CLOUDFLARE_API_TOKEN).toBe('');
@@ -214,14 +219,14 @@ describe('agent.session_open hook', () => {
     expect(h.lookups()).toBe(0);
   });
 
-  test('a resumed agent that is not a company agent, or cannot be looked up, is left alone', async () => {
+  test('an authoritative non-employee is left alone; a registry failure is refused', async () => {
     expect(await hook({}).open({ ...base, reason: 'resume', env: {} })).toBeUndefined();
-    expect(await hook('fails').open({ ...base, reason: 'resume', env: {} })).toBeUndefined();
+    await expect(hook('fails').open({ ...base, reason: 'resume', env: {} })).rejects.toThrow('身份登记');
   });
 
-  test('a lookup that never answers does not hold the agent open', async () => {
+  test('an unavailable registry is bounded and never silently bypasses routing', async () => {
     const started = Date.now();
-    expect(await hook('hangs').open({ ...base, reason: 'import', env: {} })).toBeUndefined();
+    await expect(hook('hangs').open({ ...base, reason: 'import', env: {} })).rejects.toThrow('身份登记');
     expect(Date.now() - started).toBeLessThan(4_000);
   }, 6_000);
 });

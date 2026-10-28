@@ -747,7 +747,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('goal_console', {
-    description: 'gm only, read-only: one paged goal console. Each goal carries deadline (exact or unknown, never computed), outcome contract and required evidence, stages (implementation/release/production QA/customer activation/adoption/owner final), every open blocker with responsible role/holder/wait duration/next trigger/dependency path, effective final gate and its evidence, and the source task ids plus a taskTotal. Blocker and source-id lists are capped with omitted counts; use get_context with goalId for the full paged task list. Continue with page.nextCursor while page.hasMore. Pages are deterministic and never write.',
+    description: 'gm only, read-only: one paged goal console. Each goal carries deadline (exact or unknown, never computed), outcome contract and required evidence, stages (implementation/release/production QA/customer activation/adoption/owner final), every open blocker with responsible role/holder/wait duration/next trigger/dependency path, effective final gate and its evidence, and the source task ids plus a taskTotal. Dependency edges that leave the goal are resolved against the whole task table: one that exists in another goal is crossGoal (with that goal and the task state), one that exists in no goal is unscoped external work, and only a row found nowhere is dangling. Blocker, source-id and graph lists are capped with omitted counts; use get_context with goalId for the full paged task list. Continue with page.nextCursor while page.hasMore. Pages are deterministic and never write.',
     inputSchema: z.object({
       goalId: z.string().min(1).max(100).nullish(),
       includeClosed: z.boolean().nullish(),
@@ -759,7 +759,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('goal_governance_scan', {
-    description: 'gm only, read-only dry-run: scan active, needs_repair and done goals for a missing/void/superseded final gate, dependency cycles or dangling edges, missing outcome contracts and missing evidence. It writes nothing, never closes/voids/approves a goal and never rewrites a historical owner decision. The scan is deterministically paged: each page fits the 48 KiB response budget and carries page.nextCursor/hasMore/total/snapshotAt plus global counts; follow nextCursor until hasMore is false to cover every goal. Cards omitted from a page are counted in truncated (and a reduced card is marked detailsOmitted); nothing is silently dropped.',
+    description: 'gm only, read-only dry-run: scan active, needs_repair and done goals for a missing/void/superseded final gate, dependency cycles, graph edges (cross-goal and unscoped external references are classified with their real state; only a dependency that exists nowhere is dangling), missing outcome contracts and missing evidence. It writes nothing, never closes/voids/approves a goal and never rewrites a historical owner decision. The scan is deterministically paged: each page fits the 48 KiB response budget and carries page.nextCursor/hasMore/total/snapshotAt plus global counts; follow nextCursor until hasMore is false to cover every goal. Cards omitted from a page are counted in truncated (and a reduced card is marked detailsOmitted, with capped graph lists counted in graphOmitted); nothing is silently dropped.',
     inputSchema: z.object({ ...pageArgs }),
   }, async (input, ctx) => run(token(ctx), () => core.goalGovernanceScan
     ? core.goalGovernanceScan(token(ctx), withoutNull(input))
@@ -1057,6 +1057,47 @@ function registerTools(server: McpServer, core: CompanyCore) {
       reason: z.string().min(8).max(2000), idempotencyKey: z.string().min(8).max(200) }),
   }, async (input, ctx) => run(token(ctx), () => core.qaObservationRevoke
     ? core.qaObservationRevoke(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  // ---- SYS-INT 评审协同的持久事件唤醒 ----
+  // 只做调度协调：订阅登记与结构化信号都只解除协同任务自己的 SYS05 feedback 等待，不生成 scope、不写验收。
+  server.registerTool('review_watch_register', {
+    description: 'gm only (manage): register the one persistent watch of an ordered same-goal pair (source task reviewed by qa, collaboration task). Registration reads the current source state immediately, so a QA review lease or a structured request that already happened is delivered instead of lost. eventKinds defaults to authorization+positive. Re-registering the same pair re-opens the same watch; a different eventKinds set is refused. Idempotent by key.',
+    inputSchema: z.object({
+      sourceTaskId: z.string().min(1).max(200), collaborationTaskId: z.string().min(1).max(200),
+      eventKinds: z.array(z.enum(['authorization', 'positive'])).min(1).max(2).optional(),
+      reason: z.string().min(8).max(2000), idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.reviewWatchRegister
+    ? core.reviewWatchRegister(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('review_watch_close', {
+    description: 'gm only (manage): close a watch under its version. Undelivered events are invalidated and never replayed. Closing grants nothing and changes no task.',
+    inputSchema: z.object({
+      watchId: z.string().min(1).max(200), expectedVersion: z.number().int().positive(),
+      reason: z.string().min(8).max(2000), idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.reviewWatchClose
+    ? core.reviewWatchClose(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('review_watch_status', {
+    description: 'gm sees every review watch, a qa employee the watches of tasks it reviews. Read-only: current source lease facts, the latest structured signal, and the event deliveries with their codes. Never returns task text.',
+    inputSchema: z.object({ watchId: z.string().max(200).optional(), sourceTaskId: z.string().max(200).optional(),
+      collaborationTaskId: z.string().max(200).optional() }),
+  }, async (input, ctx) => run(token(ctx), () => core.reviewWatchStatus
+    ? core.reviewWatchStatus(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('qa_review_scope_signal', {
+    description: 'qa only, from the live review lease holder (phase=review, reviewerRole=qa, currentEmployee/fence/live lease checked, never the author): a structured scope request (kind=request, wakes the collaboration task once) or its withdrawal after positive evidence (kind=retract with positiveReady=true, wakes once more). Subjects are exact same-goal task ids the qa did not author; no task text, no credentials. It grants no scope and signs no acceptance — checkpoint text alone cannot do this.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200), fence: z.number().int().positive(),
+      kind: z.enum(['request', 'retract']),
+      subjects: z.array(z.string().min(1).max(200)).min(1).max(50),
+      positiveReady: z.boolean().optional(),
+      reason: z.string().min(8).max(2000), idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.qaReviewScopeSignal
+    ? core.qaReviewScopeSignal(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('review_scope_signals', {
+    description: 'Read-only structured scope signals: gm sees all, a qa employee sees its own. Task ids and reasons only, never task text.',
+    inputSchema: z.object({ taskId: z.string().max(200).optional(), limit: z.number().int().min(1).max(50).optional() }),
+  }, async (input, ctx) => run(token(ctx), () => core.reviewScopeSignals
+    ? core.reviewScopeSignals(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('fault_status', {
     description: 'Read-only diagnosis of a task\'s recovery budget: scopes (attempts/deadline/nextAllowedAt/lastErrno), episodes, and any open repair chain. Readable by the task holder, its reviewer, or gm. Secret-free: never returns credentials, upstream bodies, or aliases beyond what the ledger already stored. Use this when ops_login (or another ops tool) is refused with recovery budget spent / deadline passed, so the next attempt is planned against real counters instead of guessed.',
     inputSchema: z.object({ taskId: z.string().min(1).max(200) }),

@@ -1,1342 +1,2400 @@
 {
   "source": "https://artificialanalysis.ai/leaderboards/models",
-  "retrievedAt": "2026-10-23T01:22:47.003966+00:00",
-  "index": "Artificial Analysis Intelligence Index",
+  "retrievedAt": "2026-10-28T02:11:31.284Z",
   "models": [
     {
       "slug": "jt-35b-flash",
       "score": 18.6626376411117,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "JT-35B-Flash"
     },
     {
       "slug": "qwen3-5-omni-plus",
       "score": 20.3839890713777,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.4,
+      "priceOutput": 4.8,
+      "priceCacheHit": null,
+      "name": "Qwen3.5 Omni Plus"
     },
     {
       "slug": "nova-2-0-omni-reasoning-medium",
       "score": 13.6465213725579,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Nova 2.0 Omni (Medium)"
     },
     {
       "slug": "qwen3-5-122b-a10b-non-reasoning",
       "score": 17.7480154665397,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.4,
+      "priceOutput": 3.2,
+      "priceCacheHit": null,
+      "name": "Qwen3.5 122B A10B (Non-reasoning)"
     },
     {
       "slug": "gemma-4-12b-non-reasoning",
       "score": 9.37989472421056,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.1,
+      "priceOutput": 0.3,
+      "priceCacheHit": null,
+      "name": "Gemma 4 12B (Non-reasoning)"
     },
     {
       "slug": "claude-sonnet-5-5-medium",
       "score": 40.838652287929,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 10,
+      "priceCacheHit": 0.1,
+      "name": "Claude Sonnet 5.5 (Medium, Default Fallback)"
     },
     {
       "slug": "gemma-3-270m",
       "score": 5.11705960692171,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Gemma 3 270M"
     },
     {
       "slug": "claude-fable-5-1-low",
       "score": 46.8163422014862,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 10,
+      "priceOutput": 50,
+      "priceCacheHit": 0.25,
+      "name": "Claude Fable 5.1 (Low, Default Fallback)"
     },
     {
       "slug": "apodex-1-1",
       "score": 26.4103686249117,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.3,
+      "priceOutput": 3,
+      "priceCacheHit": 0.03,
+      "name": "Apodex 1.1"
     },
     {
       "slug": "gpt-6-1-sol-xhigh",
       "score": 51.0377679093761,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 10,
+      "priceCacheHit": 0.1,
+      "name": "GPT-6.1 Sol (Xhigh)"
     },
     {
       "slug": "gemini-3-5-flash-lite",
       "score": 22.1685424839812,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.3,
+      "priceOutput": 2.5,
+      "priceCacheHit": 0.03,
+      "name": "Gemini 3.5 Flash-Lite"
     },
     {
       "slug": "step-5",
       "score": 43.7343049141614,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 1,
+      "priceOutput": 2.7,
+      "priceCacheHit": 0.1,
+      "name": "Step 5 Preview"
     },
     {
       "slug": "qwen3-5-2b-non-reasoning",
       "score": 6.18559190112645,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Qwen3.5 2B (Non-reasoning)"
     },
     {
       "slug": "qwen3-omni-30b-a3b-instruct",
       "score": 6.00611816793457,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.25,
+      "priceOutput": 0.97,
+      "priceCacheHit": null,
+      "name": "Qwen3 Omni 30B A3B Instruct"
     },
     {
       "slug": "granite-4-2-3b",
       "score": 9.05588232376756,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.03,
+      "priceOutput": 0.12,
+      "priceCacheHit": 0.0075,
+      "name": "Granite 4.2 3B"
+    },
+    {
+      "slug": "gpt-6-1-terra-non-reasoning",
+      "score": 33.4885115837089,
+      "estimated": false,
+      "priceInput": 1,
+      "priceOutput": 5,
+      "priceCacheHit": 0.05,
+      "name": "GPT-6.1 Terra (Non-reasoning)"
     },
     {
       "slug": "nova-2-0-pro-reasoning-medium",
       "score": 14.1554948903666,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 1.25,
+      "priceOutput": 10,
+      "priceCacheHit": 0.312,
+      "name": "Nova 2.0 Pro Preview (Medium)"
     },
     {
       "slug": "inkling",
       "score": 24.9847810999384,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 1,
+      "priceOutput": 4.05,
+      "priceCacheHit": 0.17,
+      "name": "Inkling (Xhigh)"
     },
     {
       "slug": "qwen3-5-397b-a17b",
       "score": 18.4204249294815,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.6,
+      "priceOutput": 3.6,
+      "priceCacheHit": null,
+      "name": "Qwen3.5 397B A17B (Reasoning)"
     },
     {
       "slug": "granite-4-2-30b",
       "score": 12.68315341158,
-      "estimated": false
+      "estimated": false,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Granite 4.2 30B"
     },
     {
       "slug": "k2-horizon-7b",
       "score": 20.5958819421354,
-      "estimated": false
+      "estimated": false,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "K2 Horizon 7B"
     },
     {
       "slug": "mimo-v2-6-flash",
       "score": 37.8843590141754,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.14,
+      "priceOutput": 0.28,
+      "priceCacheHit": 0.0028,
+      "name": "MiMo-V2.6-Flash"
     },
     {
       "slug": "mistral-small-4-non-reasoning",
       "score": 8.99008610259603,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.15,
+      "priceOutput": 0.6,
+      "priceCacheHit": 0.015,
+      "name": "Mistral Small 4 (Non-reasoning)"
     },
     {
       "slug": "solar-pro4",
       "score": 26.5600314812231,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.3,
+      "priceOutput": 1.2,
+      "priceCacheHit": 0.06,
+      "name": "Solar Pro 4"
     },
     {
       "slug": "gpt-oss-20b-low",
       "score": 9.95295342568922,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.07,
+      "priceOutput": 0.3,
+      "priceCacheHit": null,
+      "name": "gpt-oss-20b (Low)"
     },
     {
       "slug": "o3",
       "score": 20.200754789201,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 2,
+      "priceOutput": 8,
+      "priceCacheHit": 0.5,
+      "name": "o3"
     },
     {
       "slug": "k-exaone-2-0-0803",
       "score": 19.6904943371003,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "K-EXAONE 2.0 0803"
     },
     {
       "slug": "glm-5-3-flash",
       "score": 41.807466113455,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.15,
+      "priceOutput": 0.5,
+      "priceCacheHit": 0.03,
+      "name": "GLM-5.3-Flash"
     },
     {
       "slug": "gpt-6-luna-xhigh",
       "score": 34.5587320217785,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.1,
+      "priceOutput": 0.5,
+      "priceCacheHit": 0.01,
+      "name": "GPT-6 Luna (Xhigh)"
     },
     {
       "slug": "north-mini-code",
       "score": 9.91462776590372,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0,
+      "priceOutput": 0,
+      "priceCacheHit": null,
+      "name": "North Mini Code"
     },
     {
       "slug": "gpt-6-astra-xhigh",
       "score": 52.3863277108782,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 10,
+      "priceOutput": 50,
+      "priceCacheHit": 1,
+      "name": "GPT-6 Astra (Xhigh)"
     },
     {
       "slug": "nova-2-0-omni",
       "score": 8.15087501101863,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Nova 2.0 Omni (Non-reasoning)"
     },
     {
       "slug": "granite-4-0-micro",
       "score": 5.10657830942846,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Granite 4.0 Micro"
     },
     {
       "slug": "claude-haiku-5-5-high",
       "score": 37.8240211671094,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.1,
+      "priceOutput": 0.5,
+      "priceCacheHit": 0.01,
+      "name": "Claude Haiku 5.5 (High)"
     },
     {
       "slug": "grok-4-7-low",
       "score": 42.2166560223448,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 6,
+      "priceCacheHit": 0.5,
+      "name": "Grok 4.7 (Low)"
     },
     {
       "slug": "qwen3-5-9b-non-reasoning",
       "score": 13.2659955355465,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.17,
+      "priceOutput": 0.25,
+      "priceCacheHit": null,
+      "name": "Qwen3.5 9B (Non-reasoning)"
     },
     {
       "slug": "qwen3-5-122b-a10b",
       "score": 15.5694009312969,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.4,
+      "priceOutput": 3.2,
+      "priceCacheHit": null,
+      "name": "Qwen3.5 122B A10B (Reasoning)"
     },
     {
       "slug": "hermes-4-llama-3-1-70b",
       "score": 6.65822068462287,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Hermes 4 - Llama-3.1 70B (Non-reasoning)"
     },
     {
       "slug": "nvidia-nemotron-3-nano-30b-a3b",
       "score": 6.8478519055181,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.05,
+      "priceOutput": 0.2,
+      "priceCacheHit": 0.05,
+      "name": "NVIDIA Nemotron 3 Nano 30B A3B (Non-reasoning)"
     },
     {
       "slug": "mimo-v2-6-pro",
       "score": 46.3242065310383,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.435,
+      "priceOutput": 0.87,
+      "priceCacheHit": 0.0036,
+      "name": "MiMo-V2.6-Pro"
     },
     {
       "slug": "claude-sonnet-5-5-high",
       "score": 46.7533528066958,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 10,
+      "priceCacheHit": 0.1,
+      "name": "Claude Sonnet 5.5 (High, Default Fallback)"
     },
     {
       "slug": "qwen3-next-80b-a3b-instruct",
       "score": 9.64335007559183,
-      "estimated": true
-    },
-    {
-      "slug": "gpt-5-6-terra-medium",
-      "score": 30.0938023419377,
-      "estimated": false
+      "estimated": true,
+      "priceInput": 0.1,
+      "priceOutput": 1.1,
+      "priceCacheHit": 0.09,
+      "name": "Qwen3 Next 80B A3B Instruct"
     },
     {
       "slug": "grok-4-7-high",
       "score": 46.3321770885625,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 6,
+      "priceCacheHit": 0.5,
+      "name": "Grok 4.7 (High)"
     },
     {
       "slug": "minimax-m3",
       "score": 29.2202932236316,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.3,
+      "priceOutput": 1.2,
+      "priceCacheHit": 0.06,
+      "name": "MiniMax-M3"
     },
     {
       "slug": "nemotron-3-5-lightning",
       "score": 12.8572306217144,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.06,
+      "priceOutput": 0.2,
+      "priceCacheHit": 0.035,
+      "name": "Nemotron 3.5 Lightning"
     },
     {
       "slug": "phi-4-multimodal",
       "score": 5.80520041934726,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.08,
+      "priceOutput": 0.32,
+      "priceCacheHit": null,
+      "name": "Phi-4 Multimodal Instruct"
     },
     {
       "slug": "qwen3-5-9b",
       "score": 11.1961650827156,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.135,
+      "priceOutput": 0.2,
+      "priceCacheHit": null,
+      "name": "Qwen3.5 9B (Reasoning)"
     },
     {
       "slug": "nvidia-nemotron-nano-9b-v2",
       "score": 6.84412514839364,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.05,
+      "priceOutput": 0.195,
+      "priceCacheHit": null,
+      "name": "NVIDIA Nemotron Nano 9B V2 (Non-reasoning)"
     },
     {
       "slug": "command-a-plus",
       "score": 13.1335002685349,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0,
+      "priceOutput": 0,
+      "priceCacheHit": null,
+      "name": "Command A+"
     },
     {
       "slug": "gpt-6-astra",
       "score": 52.673669395513,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 10,
+      "priceOutput": 50,
+      "priceCacheHit": 1,
+      "name": "GPT-6 Astra (Max)"
     },
     {
       "slug": "claude-opus-5-5",
       "score": 57.6223698102963,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 4,
+      "priceOutput": 20,
+      "priceCacheHit": 0.2,
+      "name": "Claude Opus 5.5 (Max, Default Fallback)"
     },
     {
       "slug": "exaone-4-0-32b",
       "score": 6.32621718534092,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "EXAONE 4.0 32B (Non-reasoning)"
     },
     {
       "slug": "g9v3-3b",
       "score": 10.841600440564,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "G9v3-3B"
     },
     {
       "slug": "qwen3-5-4b-non-reasoning",
       "score": 10.812307683746,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.03,
+      "priceOutput": 0.15,
+      "priceCacheHit": null,
+      "name": "Qwen3.5 4B (Non-reasoning)"
     },
     {
       "slug": "qwen3-5-397b-a17b-non-reasoning",
       "score": 21.4366547759392,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.6,
+      "priceOutput": 3.6,
+      "priceCacheHit": null,
+      "name": "Qwen3.5 397B A17B (Non-reasoning)"
     },
     {
       "slug": "k2-horizon-3-7b",
       "score": 15.6103951330976,
-      "estimated": false
+      "estimated": false,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "K2 Horizon 3.7B"
     },
     {
       "slug": "olmo-3-7b-think",
       "score": 5.61691854830355,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Olmo 3 7B Think"
     },
     {
       "slug": "hyperclova-x-seed-think-32b",
       "score": 11.3648115832519,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "HyperCLOVA X SEED Think (32B)"
     },
     {
       "slug": "hypernova-60b",
       "score": 11.7380211033452,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "HyperNova 60B 2605 (High, Based on gpt-oss-120b)"
     },
     {
       "slug": "nova-micro",
       "score": 5.8765232381273,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.035,
+      "priceOutput": 0.14,
+      "priceCacheHit": 0.00875,
+      "name": "Nova Micro"
     },
     {
       "slug": "mistral-large-4",
       "score": 38.3770408917494,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 1.36,
+      "priceOutput": 4.18,
+      "priceCacheHit": 0.14,
+      "name": "Mistral Large 4 Preview"
     },
     {
       "slug": "qwen3-8-27b-non-reasoning",
       "score": 20.1502427055595,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.5,
+      "priceOutput": 3,
+      "priceCacheHit": 0.1,
+      "name": "Qwen3.8 27B (Non-reasoning)"
     },
     {
       "slug": "muse-spark-open",
       "score": 38.8666662997805,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 1.25,
+      "priceOutput": 4.25,
+      "priceCacheHit": 0.15,
+      "name": "Muse Spark Open (Xhigh)"
     },
     {
       "slug": "gpt-6-luna-medium",
       "score": 29.9251773515762,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.1,
+      "priceOutput": 0.5,
+      "priceCacheHit": 0.01,
+      "name": "GPT-6 Luna (Medium)"
     },
     {
       "slug": "intellect-3",
       "score": 10.6061102858178,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "INTELLECT-3 (Based on GLM-4.5-Air)"
     },
     {
       "slug": "gpt-oss-20b",
       "score": 8.9675171856126,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.05,
+      "priceOutput": 0.22,
+      "priceCacheHit": null,
+      "name": "gpt-oss-20b (High)"
     },
     {
       "slug": "olmo-3-1-32b-think",
       "score": 7.12364412279906,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Olmo 3.1 32B Think"
     },
     {
       "slug": "nex-n2-pro",
       "score": 28.1990972887912,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Nex-N2-Pro (Based on Qwen3.5-397B-A17B)"
     },
     {
       "slug": "claude-fable-5-1-medium",
       "score": 48.9206162609523,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 10,
+      "priceOutput": 50,
+      "priceCacheHit": 0.25,
+      "name": "Claude Fable 5.1 (Medium, Default Fallback)"
     },
     {
       "slug": "gpt-6-1-sol-high",
       "score": 50.2377777519769,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 10,
+      "priceCacheHit": 0.1,
+      "name": "GPT-6.1 Sol (High)"
     },
     {
       "slug": "command-a",
       "score": 6.9581988704518,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 2.5,
+      "priceOutput": 10,
+      "priceCacheHit": null,
+      "name": "Command A"
     },
     {
       "slug": "lfm2-5-vl-1-6b",
       "score": 4.83423948,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "LFM2.5-VL-1.6B"
     },
     {
       "slug": "jt-mini",
       "score": 12.2117782837313,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "JT-MINI"
     },
     {
       "slug": "claude-fable-5-1",
       "score": 53.3549259623252,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 10,
+      "priceOutput": 50,
+      "priceCacheHit": 0.25,
+      "name": "Claude Fable 5.1 (Max, Default Fallback)"
     },
     {
       "slug": "molmo2-8b",
       "score": 5.00251209304105,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Molmo2-8B"
     },
     {
       "slug": "mistral-small-4",
       "score": 11.2675794141469,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.15,
+      "priceOutput": 0.6,
+      "priceCacheHit": 0.015,
+      "name": "Mistral Small 4 (Reasoning)"
     },
     {
       "slug": "qwen3-5-0-8b-non-reasoning",
       "score": 5.40008099703412,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Qwen3.5 0.8B (Non-reasoning)"
     },
     {
       "slug": "claude-haiku-5-5-xhigh",
       "score": 41.2489304677024,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.1,
+      "priceOutput": 0.5,
+      "priceCacheHit": 0.01,
+      "name": "Claude Haiku 5.5 (Xhigh)"
     },
     {
       "slug": "claude-haiku-5-5-low",
       "score": 29.4523685891139,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.1,
+      "priceOutput": 0.5,
+      "priceCacheHit": 0.01,
+      "name": "Claude Haiku 5.5 (Low)"
     },
     {
       "slug": "ling-3-0-flash-vl",
       "score": 24.5693054077875,
-      "estimated": false
+      "estimated": false,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Ling-3.0-flash-VL"
     },
     {
       "slug": "minicpm-v4-6-1-3b",
       "score": 5.69026588282761,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "MiniCPM-V 4.6 1.3B"
     },
     {
       "slug": "claude-opus-5-5-low",
       "score": 42.3077781466168,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 4,
+      "priceOutput": 20,
+      "priceCacheHit": 0.2,
+      "name": "Claude Opus 5.5 (Low, Default Fallback)"
     },
     {
       "slug": "exaone-4-0-32b-reasoning",
       "score": 8.17836973273723,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "EXAONE 4.0 32B (Reasoning)"
     },
     {
       "slug": "sarvam-105b",
       "score": 8.7905508357489,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.042,
+      "priceOutput": 0.17,
+      "priceCacheHit": 0.026,
+      "name": "Sarvam 105B (High)"
     },
     {
       "slug": "llama-3-1-instruct-405b",
       "score": 7.2893092121128,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Llama 3.1 Instruct 405B"
     },
     {
       "slug": "jt-4-1-flash-236b-a21b",
       "score": 33.9172581709394,
-      "estimated": false
+      "estimated": false,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "JT-4.1 Flash 236B A21B (Reasoning)"
     },
     {
       "slug": "ring-flash-2-0",
       "score": 7.15340447175535,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Ring-flash-2.0"
     },
     {
       "slug": "lfm2-5-1-2b-instruct",
       "score": 5.20951181661378,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "LFM2.5-1.2B-Instruct"
     },
     {
       "slug": "apertus-70b-instruct",
       "score": 5.11462775284761,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Apertus 70B Instruct"
     },
     {
       "slug": "doubao-seed-code",
       "score": 16.9467715940932,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Doubao Seed Code"
     },
     {
       "slug": "exaone-4-5-33b",
       "score": 13.2058394009382,
-      "estimated": true
-    },
-    {
-      "slug": "kimi-k3-low",
-      "score": 30.0666987529068,
-      "estimated": false
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "EXAONE 4.5 33B (Reasoning)"
     },
     {
       "slug": "gemma-4-e4b-non-reasoning",
       "score": 7.45765296912625,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.02,
+      "priceOutput": 0.1,
+      "priceCacheHit": null,
+      "name": "Gemma 4 E4B (Non-reasoning)"
     },
     {
       "slug": "ling-3-1-flash-1019",
       "score": 43.8973584978265,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.3,
+      "priceOutput": 0.9,
+      "priceCacheHit": 0.06,
+      "name": "Ling 3.1 Flash 1019"
     },
     {
       "slug": "k2-horizon-mova-36b-a4b",
       "score": 25.3037790731435,
-      "estimated": false
+      "estimated": false,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "K2 Horizon MoVA 36B A4B"
     },
     {
       "slug": "granite-4-0-350m",
       "score": 4.83423948,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Granite 4.0 350M"
     },
     {
       "slug": "muse-glimmer",
       "score": 17.4754176089465,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.3,
+      "priceOutput": 1.2,
+      "priceCacheHit": 0.04,
+      "name": "Muse Glimmer (High)"
     },
     {
       "slug": "grok-4-7",
       "score": 46.4465506302286,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 6,
+      "priceCacheHit": 0.5,
+      "name": "Grok 4.7 (Xhigh)"
     },
     {
       "slug": "kimi-linear-48b-a3b-instruct",
       "score": 7.30037362771236,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Kimi Linear 48B A3B Instruct"
     },
     {
       "slug": "solar-open-100b-reasoning",
       "score": 10.3644352600556,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Solar Open 100B (Reasoning)"
     },
     {
       "slug": "gpt-5-3-codex",
       "score": 32.5028174368983,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 1.75,
+      "priceOutput": 14,
+      "priceCacheHit": 0.175,
+      "name": "GPT-5.3 Codex (Xhigh)"
     },
     {
       "slug": "lfm2-5-1-2b-thinking",
       "score": 5.22188553175398,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "LFM2.5-1.2B-Thinking"
     },
     {
       "slug": "k2-think-v2",
       "score": 11.4956908518183,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "K2 Think V2"
     },
     {
       "slug": "nvidia-nemotron-3-ultra-550b-a55b",
       "score": 22.9279123422858,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.6,
+      "priceOutput": 2.7,
+      "priceCacheHit": 0.12,
+      "name": "Nemotron 3 Ultra 550B A55B (Reasoning)"
     },
     {
       "slug": "longcat-2-0",
       "score": 19.1123256610623,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.75,
+      "priceOutput": 2.95,
+      "priceCacheHit": 0.015,
+      "name": "LongCat 2.0"
     },
     {
       "slug": "qwen3-5-2b",
       "score": 6.94413664133259,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Qwen3.5 2B (Reasoning)"
     },
     {
       "slug": "tri-21b-think-v0-5",
       "score": 8.98704047108094,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Tri-21B-Think"
     },
     {
       "slug": "granite-4-0-h-small",
       "score": 6.04930220974964,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Granite 4.0 H Small"
     },
     {
       "slug": "llama-3-2-instruct-11b-vision",
       "score": 5.40802026647316,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.345,
+      "priceOutput": 0.345,
+      "priceCacheHit": null,
+      "name": "Llama 3.2 Instruct 11B (Vision)"
     },
     {
       "slug": "longcat-flash-lite",
       "score": 11.4709079965186,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "LongCat Flash Lite"
     },
     {
       "slug": "nova-2-0-lite-reasoning",
       "score": 13.3740793005281,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.3,
+      "priceOutput": 2.5,
+      "priceCacheHit": null,
+      "name": "Nova 2.0 Lite (High)"
     },
     {
       "slug": "solar-mini4",
       "score": 24.0522018844171,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.1,
+      "priceOutput": 0.4,
+      "priceCacheHit": 0.01,
+      "name": "Solar Mini 4"
     },
     {
       "slug": "gpt-6-luna-non-reasoning",
       "score": 18.4678465935701,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.1,
+      "priceOutput": 0.5,
+      "priceCacheHit": 0.01,
+      "name": "GPT-6 Luna (Non-reasoning)"
     },
     {
       "slug": "minicpm5-2b",
       "score": 12.463354831996,
-      "estimated": false
+      "estimated": false,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "MiniCPM5-2B"
     },
     {
       "slug": "qwen3-5-4b",
       "score": 13.1248174602542,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.03,
+      "priceOutput": 0.15,
+      "priceCacheHit": null,
+      "name": "Qwen3.5 4B (Reasoning)"
     },
     {
       "slug": "qwen3-8-27b-medium",
       "score": 27.5508228231586,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.5,
+      "priceOutput": 3,
+      "priceCacheHit": 0.1,
+      "name": "Qwen3.8 27B (Medium)"
+    },
+    {
+      "slug": "kimi-k3-1-pro",
+      "score": 55.0869210959395,
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 10,
+      "priceCacheHit": 0.2,
+      "name": "Kimi K3.1 Pro"
     },
     {
       "slug": "motif-2-12-7b",
       "score": 9.18748556817538,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Motif-2-12.7B-Reasoning"
     },
     {
       "slug": "qwen3-6-35b-a3b-non-reasoning",
       "score": 15.2320772647744,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.375,
+      "priceOutput": 2.25,
+      "priceCacheHit": null,
+      "name": "Qwen3.6 35B A3B (Non-reasoning)"
     },
     {
       "slug": "ministral-3-3b",
       "score": 4.83760020546443,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.1,
+      "priceOutput": 0.1,
+      "priceCacheHit": 0.01,
+      "name": "Ministral 3 3B"
     },
     {
       "slug": "reflection-beam",
       "score": 30.3334426348039,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.4,
+      "priceOutput": 1.2,
+      "priceCacheHit": 0.04,
+      "name": "Beam 1.0"
     },
     {
       "slug": "hermes-4-llama-3-1-70b-reasoning",
       "score": 7.90579275030455,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Hermes 4 - Llama-3.1 70B (Reasoning)"
     },
     {
       "slug": "ling-3-0-flash-fin",
       "score": 22.5965828940594,
-      "estimated": false
+      "estimated": false,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Ling-3.0-flash-Fin"
     },
     {
       "slug": "gemma-4-26b-a4b",
       "score": 16.671930040086,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.1,
+      "priceOutput": 0.34,
+      "priceCacheHit": 0.05,
+      "name": "Gemma 4 26B A4B (Reasoning)"
     },
     {
       "slug": "nvidia-nemotron-nano-12b-v2-vl-reasoning",
       "score": 7.47796854824097,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "NVIDIA Nemotron Nano 12B v2 VL (Reasoning)"
     },
     {
       "slug": "qwen3-5-omni-flash",
       "score": 12.4740069826994,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.1,
+      "priceOutput": 0.8,
+      "priceCacheHit": null,
+      "name": "Qwen3.5 Omni Flash"
     },
     {
       "slug": "gpt-6-luna",
       "score": 38.1245186869738,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.1,
+      "priceOutput": 0.5,
+      "priceCacheHit": 0.01,
+      "name": "GPT-6 Luna (Max)"
     },
     {
       "slug": "nova-2-0-lite-reasoning-low",
       "score": 11.8041280807831,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.3,
+      "priceOutput": 2.5,
+      "priceCacheHit": null,
+      "name": "Nova 2.0 Lite (Low)"
     },
     {
       "slug": "magistral-small-2509",
       "score": 8.59366235978288,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.5,
+      "priceOutput": 1.5,
+      "priceCacheHit": null,
+      "name": "Magistral Small 1.2"
     },
     {
       "slug": "gemma-4-26b-a4b-non-reasoning",
       "score": 13.1303772801787,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.115,
+      "priceOutput": 0.4,
+      "priceCacheHit": 0.060000000000000005,
+      "name": "Gemma 4 26B A4B (Non-reasoning)"
     },
     {
       "slug": "ministral-3-14b",
       "score": 6.04436817215002,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.2,
+      "priceOutput": 0.2,
+      "priceCacheHit": 0.02,
+      "name": "Ministral 3 14B"
     },
     {
       "slug": "inkling-small",
       "score": 25.6582584411942,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.3,
+      "priceOutput": 1.2,
+      "priceCacheHit": 0.06,
+      "name": "Inkling Small"
     },
     {
       "slug": "gemini-3-8-flash-medium",
       "score": 39.7740187061926,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.75,
+      "priceOutput": 3.75,
+      "priceCacheHit": 0.075,
+      "name": "Gemini 3.8 Flash (Medium)"
     },
     {
       "slug": "gemma-4-e2b-non-reasoning",
       "score": 6.47543520107148,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Gemma 4 E2B (Non-reasoning)"
     },
     {
       "slug": "sarvam-30b",
       "score": 6.55971145066503,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Sarvam 30B (High)"
     },
     {
       "slug": "mercury-2-5",
       "score": 12.3408453757638,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.25,
+      "priceOutput": 0.75,
+      "priceCacheHit": 0.025,
+      "name": "Mercury 2.5"
     },
     {
       "slug": "nova-2-0-lite",
       "score": 8.73661367769335,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.3,
+      "priceOutput": 2.5,
+      "priceCacheHit": null,
+      "name": "Nova 2.0 Lite (Non-reasoning)"
     },
     {
       "slug": "nvidia-nemotron-3-nano-30b-a3b-reasoning",
       "score": 8.8961440122188,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.05,
+      "priceOutput": 0.2,
+      "priceCacheHit": 0.05,
+      "name": "NVIDIA Nemotron 3 Nano 30B A3B (Reasoning)"
     },
     {
       "slug": "deepseek-v4-flash-vision",
       "score": 34.8390628035969,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.44,
+      "priceOutput": 1.32,
+      "priceCacheHit": 0.014,
+      "name": "DeepSeek V4 Flash Vision (Max)"
     },
     {
       "slug": "minicpm5-1b",
       "score": 8.79664321370212,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "MiniCPM5-1B (Reasoning)"
     },
     {
       "slug": "jamba-1-7-large",
       "score": 6.0710365237197,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Jamba 1.7 Large"
     },
     {
       "slug": "claude-haiku-5-5",
       "score": 43.3950199670746,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.1,
+      "priceOutput": 0.5,
+      "priceCacheHit": 0.01,
+      "name": "Claude Haiku 5.5 (Max)"
     },
     {
       "slug": "gpt-6-luna-high",
       "score": 32.9282054150837,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.1,
+      "priceOutput": 0.5,
+      "priceCacheHit": 0.01,
+      "name": "GPT-6 Luna (High)"
     },
     {
       "slug": "nemotron-3-5-bolt-74b-a9b",
       "score": 21.4072054842003,
-      "estimated": false
+      "estimated": false,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Nemotron 3.5 Bolt 74B-A9B"
     },
     {
       "slug": "nanbeige4-1-3b",
       "score": 8.4012282586083,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Nanbeige4.1-3B"
     },
     {
       "slug": "qwen3-8-27b-low",
       "score": 26.2047978189896,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.5,
+      "priceOutput": 3,
+      "priceCacheHit": 0.1,
+      "name": "Qwen3.8 27B (Low)"
     },
     {
       "slug": "solar-open2-250b",
       "score": 24.7365297627523,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Solar Open2 250B"
     },
     {
       "slug": "ling-3-0-tiny",
       "score": 11.0636233769305,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0,
+      "priceOutput": 0,
+      "priceCacheHit": null,
+      "name": "Ling 3.0 Tiny"
     },
     {
       "slug": "celeris-1",
       "score": 6.3469533538601,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.2,
+      "priceOutput": 0.7,
+      "priceCacheHit": null,
+      "name": "Celeris-1"
     },
     {
       "slug": "tiny-aya-global",
       "score": 4.83423948,
-      "estimated": true
-    },
-    {
-      "slug": "gpt-5-6-terra-high",
-      "score": 34.2376558067555,
-      "estimated": false
+      "estimated": true,
+      "priceInput": 0,
+      "priceOutput": 0,
+      "priceCacheHit": null,
+      "name": "Tiny Aya Global"
     },
     {
       "slug": "a-x-k2",
       "score": 21.4612645385074,
-      "estimated": false
+      "estimated": false,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "A.X-K2"
     },
     {
       "slug": "exaone-4-0-1-2b",
       "score": 5.22938457197929,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Exaone 4.0 1.2B (Non-reasoning)"
     },
     {
       "slug": "hermes-4-llama-3-1-405b-reasoning",
       "score": 7.49497809925135,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 1,
+      "priceOutput": 3,
+      "priceCacheHit": null,
+      "name": "Hermes 4 - Llama-3.1 405B (Reasoning)"
     },
     {
       "slug": "deepseek-v4-pro",
       "score": 35.9967791278402,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 1.32,
+      "priceOutput": 3.96,
+      "priceCacheHit": 0.044,
+      "name": "DeepSeek V4 Pro 0813 (Max)"
     },
     {
       "slug": "magistral-medium-2509",
       "score": 11.8254509953707,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Magistral Medium 1.2"
     },
     {
       "slug": "qwen3-6-35b-a3b",
       "score": 18.2289900189843,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.375,
+      "priceOutput": 2.25,
+      "priceCacheHit": null,
+      "name": "Qwen3.6 35B A3B (Reasoning)"
     },
     {
       "slug": "apertus-8b-instruct",
       "score": 4.83423948,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.1,
+      "priceOutput": 0.2,
+      "priceCacheHit": null,
+      "name": "Apertus 8B Instruct"
     },
     {
       "slug": "gemini-3-8-flash",
       "score": 40.9262321765904,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.75,
+      "priceOutput": 3.75,
+      "priceCacheHit": 0.075,
+      "name": "Gemini 3.8 Flash (High)"
     },
     {
       "slug": "nemotron-3-nano-omni-30b-a3b",
       "score": 10.2506761710987,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.4,
+      "priceOutput": 1.365,
+      "priceCacheHit": 0.2,
+      "name": "Nemotron 3 Nano Omni 30B A3B Reasoning"
     },
     {
       "slug": "kimi-k2-7-code",
       "score": 25.8121062401836,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.95,
+      "priceOutput": 4,
+      "priceCacheHit": 0.19,
+      "name": "Kimi K2.7 Code"
     },
     {
       "slug": "qwen3-8-2-4t-a95b",
       "score": 39.9461723105325,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 6,
+      "priceCacheHit": 0.25,
+      "name": "Qwen3.8 2.4T A95B"
     },
     {
       "slug": "olmo-3-7b-instruct",
       "score": 5.24099718758815,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Olmo 3 7B Instruct"
     },
     {
       "slug": "jt-4-1-flash-236b-a21b-non-reasoning",
       "score": 27.2926268381758,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "JT-4.1 Flash 236B A21B (Non-reasoning)"
     },
     {
       "slug": "llama-4-maverick",
       "score": 9.29902687437199,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.25,
+      "priceOutput": 0.9199999999999999,
+      "priceCacheHit": 0.22,
+      "name": "Llama 4 Maverick"
     },
     {
       "slug": "olmo-3-1-32b-instruct",
       "score": 6.49671923993574,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Olmo 3.1 32B Instruct"
     },
     {
       "slug": "ministral-3-8b",
       "score": 5.47767370454416,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.15,
+      "priceOutput": 0.15,
+      "priceCacheHit": 0.015,
+      "name": "Ministral 3 8B"
     },
     {
       "slug": "claude-sonnet-5-5-xhigh",
       "score": 51.8955544183089,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 10,
+      "priceCacheHit": 0.1,
+      "name": "Claude Sonnet 5.5 (Xhigh, Default Fallback)"
     },
     {
       "slug": "llama-3-3-instruct-70b",
       "score": 7.66380859299009,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.6,
+      "priceOutput": 0.71,
+      "priceCacheHit": 0.6,
+      "name": "Llama 3.3 Instruct 70B"
     },
     {
       "slug": "nemotron-cascade-2-30b-a3b",
       "score": 11.6708359406601,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Nemotron Cascade 2 30B A3B"
     },
     {
       "slug": "r1-1776",
       "score": 6.43857605749744,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "R1 1776"
     },
     {
       "slug": "qwen3-8-flash-next",
       "score": 39.8223021864741,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.15,
+      "priceOutput": 0.47,
+      "priceCacheHit": 0.016,
+      "name": "Qwen3.8-Flash-Next"
     },
     {
       "slug": "claude-fable-5-1-xhigh",
       "score": 53.2032587538944,
-      "estimated": false
-    },
-    {
-      "slug": "gpt-5-6-terra-non-reasoning",
-      "score": 20.7797013584503,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 10,
+      "priceOutput": 50,
+      "priceCacheHit": 0.25,
+      "name": "Claude Fable 5.1 (Xhigh, Default Fallback)"
     },
     {
       "slug": "llama-3-2-instruct-90b-vision",
       "score": 6.4088295766243,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Llama 3.2 Instruct 90B (Vision)"
     },
     {
       "slug": "claude-fable-5-1-high",
       "score": 51.1515708852237,
-      "estimated": false
-    },
-    {
-      "slug": "gpt-5-6-terra-xhigh",
-      "score": 37.9513370742927,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 10,
+      "priceOutput": 50,
+      "priceCacheHit": 0.25,
+      "name": "Claude Fable 5.1 (High, Default Fallback)"
     },
     {
       "slug": "k2-horizon-0-9b",
       "score": 3.04760621054014,
-      "estimated": false
+      "estimated": false,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "K2 Horizon 0.9B"
     },
     {
       "slug": "nvidia-nemotron-3-nano-4b",
       "score": 4.76910061591993,
-      "estimated": false
+      "estimated": false,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "NVIDIA Nemotron 3 Nano 4B"
     },
     {
       "slug": "phi-4-mini",
       "score": 6.32860508899613,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.075,
+      "priceOutput": 0.3,
+      "priceCacheHit": null,
+      "name": "Phi-4 Mini Instruct"
     },
     {
       "slug": "nova-2-0-pro",
       "score": 9.95904965562327,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 1.25,
+      "priceOutput": 10,
+      "priceCacheHit": null,
+      "name": "Nova 2.0 Pro Preview (Non-reasoning)"
     },
     {
       "slug": "gpt-6-1-sol-medium",
       "score": 47.7833271274065,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 10,
+      "priceCacheHit": 0.1,
+      "name": "GPT-6.1 Sol (Medium)"
     },
     {
       "slug": "k2-v2",
       "score": 9.87390600007694,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "K2-V2 (High)"
     },
     {
       "slug": "gpt-6-astra-low",
       "score": 45.7819243120341,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 10,
+      "priceOutput": 50,
+      "priceCacheHit": 1,
+      "name": "GPT-6 Astra (Low)"
     },
     {
       "slug": "ernie-5-0-thinking-preview",
       "score": 14.2551784975475,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "ERNIE 5.0 Thinking Preview"
     },
     {
       "slug": "ling-3-1-flash",
       "score": 41.0906200397391,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.3,
+      "priceOutput": 0.9,
+      "priceCacheHit": 0.06,
+      "name": "Ling 3.1 Flash"
     },
     {
       "slug": "granite-4-0-h-350m",
       "score": 4.83423948,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Granite 4.0 H 350M"
     },
     {
       "slug": "qwen3-5-0-8b",
       "score": 6.12847840160203,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Qwen3.5 0.8B (Reasoning)"
     },
     {
       "slug": "apriel-v1-6-15b-thinker",
       "score": 13.401396407375,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Apriel-v1.6-15B-Thinker"
     },
     {
       "slug": "qwen3-7-plus",
       "score": 25.1622215821984,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.4,
+      "priceOutput": 1.6,
+      "priceCacheHit": 0.08,
+      "name": "Qwen3.7 Plus"
     },
     {
       "slug": "deephermes-3-mistral-24b-preview",
       "score": 6.07426212371414,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "DeepHermes 3 - Mistral 24B Preview (Non-reasoning)"
     },
     {
       "slug": "nvidia-nemotron-nano-12b-v2-vl",
       "score": 5.82045753777258,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.2,
+      "priceOutput": 0.6,
+      "priceCacheHit": null,
+      "name": "NVIDIA Nemotron Nano 12B v2 VL (Non-reasoning)"
     },
     {
       "slug": "step-3-vl-10b",
       "score": 7.69391371030502,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Step3 VL 10B"
     },
     {
       "slug": "llama-4-scout",
       "score": 6.45126865234633,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.18,
+      "priceOutput": 0.66,
+      "priceCacheHit": null,
+      "name": "Llama 4 Scout"
     },
     {
       "slug": "granite-4-2-8b",
       "score": 11.0812712267815,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.06,
+      "priceOutput": 0.25,
+      "priceCacheHit": 0.015,
+      "name": "Granite 4.2 8B"
     },
     {
       "slug": "ernie-4-5-300b-a47b",
       "score": 7.50448042633837,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "ERNIE 4.5 300B A47B"
     },
     {
       "slug": "claude-haiku-5-5-medium",
       "score": 34.4646519474657,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.1,
+      "priceOutput": 0.5,
+      "priceCacheHit": 0.01,
+      "name": "Claude Haiku 5.5 (Medium)"
     },
     {
       "slug": "molmo-7b-d",
       "score": 5.56262049746202,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Molmo 7B-D"
     },
     {
       "slug": "qwen3-8-27b",
       "score": 33.6762858057476,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.5,
+      "priceOutput": 3,
+      "priceCacheHit": 0.1,
+      "name": "Qwen3.8 27B (Xhigh)"
     },
     {
       "slug": "motif-3",
       "score": 33.566562209723,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Motif 3"
     },
     {
       "slug": "gemma-4-e2b",
       "score": 7.77445525187484,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Gemma 4 E2B (Reasoning)"
+    },
+    {
+      "slug": "gpt-6-1-terra",
+      "score": 48.1061836463044,
+      "estimated": false,
+      "priceInput": 1,
+      "priceOutput": 5,
+      "priceCacheHit": 0.05,
+      "name": "GPT-6.1 Terra (Max)"
     },
     {
       "slug": "qwen3-8-max",
       "score": 45.4152084980521,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 6,
+      "priceCacheHit": 0.25,
+      "name": "Qwen3.8 Max (0902)"
     },
     {
       "slug": "claude-sonnet-5-5",
       "score": 56.0001286580794,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 10,
+      "priceCacheHit": 0.1,
+      "name": "Claude Sonnet 5.5 (Max, Default Fallback)"
     },
     {
       "slug": "hy3",
       "score": 25.2972775731571,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.136,
+      "priceOutput": 0.5549999999999999,
+      "priceCacheHit": 0.034,
+      "name": "Hy3"
     },
     {
       "slug": "gpt-6-1-sol",
       "score": 51.8332597011541,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 10,
+      "priceCacheHit": 0.1,
+      "name": "GPT-6.1 Sol (Max)"
     },
     {
       "slug": "nova-2-0-omni-reasoning-low",
       "score": 11.1140626232787,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Nova 2.0 Omni (Low)"
     },
     {
       "slug": "jamba-1-7-mini",
       "score": 5.21767706986744,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Jamba 1.7 Mini"
     },
     {
       "slug": "trinity-large-thinking",
       "score": 10.8242425924218,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.25,
+      "priceOutput": 0.8,
+      "priceCacheHit": 0.06,
+      "name": "Trinity Large Thinking"
     },
     {
       "slug": "deephermes-3-llama-3-1-8b-preview",
       "score": 5.08032603461277,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "DeepHermes 3 - Llama-3.1 8B Preview (Non-reasoning)"
     },
     {
       "slug": "qwen3-omni-30b-a3b-reasoning",
       "score": 7.76082961984319,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.25,
+      "priceOutput": 0.97,
+      "priceCacheHit": null,
+      "name": "Qwen3 Omni 30B A3B (Reasoning)"
     },
     {
       "slug": "k2-horizon-375b-a23b",
       "score": 30.5015302696723,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0,
+      "priceOutput": 0,
+      "priceCacheHit": null,
+      "name": "K2 Horizon 375B A23B"
     },
     {
       "slug": "claude-sonnet-5-5-low",
       "score": 35.8681594577587,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 10,
+      "priceCacheHit": 0.1,
+      "name": "Claude Sonnet 5.5 (Low, Default Fallback)"
     },
     {
       "slug": "gemini-3-1-pro-preview",
       "score": 29.7185656132261,
-      "estimated": false
-    },
-    {
-      "slug": "gpt-5-6-terra",
-      "score": 42.0829248239494,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 12,
+      "priceCacheHit": 0.2,
+      "name": "Gemini 3.1 Pro Preview"
     },
     {
       "slug": "gpt-6-luna-low",
       "score": 21.5261980080866,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.1,
+      "priceOutput": 0.5,
+      "priceCacheHit": 0.01,
+      "name": "GPT-6 Luna (Low)"
     },
     {
       "slug": "g9v3-39a5b",
       "score": 21.8316172646825,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "G9v3-39A5B"
     },
     {
       "slug": "diffusiongemma-26b-a4b",
       "score": 9.51014305662543,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "DiffusionGemma 26B A4B"
     },
     {
       "slug": "gpt-5-5-instant-06-26",
       "score": 26.0135173401368,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 5,
+      "priceOutput": 30,
+      "priceCacheHit": 0.5,
+      "name": "GPT-5.5 Instant (June 2026)"
+    },
+    {
+      "slug": "gpt-6-1-terra-medium",
+      "score": 41.318827405477,
+      "estimated": false,
+      "priceInput": 1,
+      "priceOutput": 5,
+      "priceCacheHit": 0.05,
+      "name": "GPT-6.1 Terra (Medium)"
     },
     {
       "slug": "falcon-h1r-7b",
       "score": 7.82776928077145,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Falcon-H1R-7B"
     },
     {
       "slug": "qwen3-next-80b-a3b-reasoning",
       "score": 11.1973684395653,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Qwen3 Next 80B A3B (Reasoning)"
+    },
+    {
+      "slug": "gpt-6-1-terra-low",
+      "score": 36.2133370409149,
+      "estimated": false,
+      "priceInput": 1,
+      "priceOutput": 5,
+      "priceCacheHit": 0.05,
+      "name": "GPT-6.1 Terra (Low)"
     },
     {
       "slug": "gpt-oss-120b-low",
       "score": 10.2105650347196,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.125,
+      "priceOutput": 0.595,
+      "priceCacheHit": 0.125,
+      "name": "gpt-oss-120b (Low)"
     },
     {
       "slug": "glm-5-3-low",
       "score": 34.2990078159643,
-      "estimated": false
-    },
-    {
-      "slug": "gpt-5-6-terra-low",
-      "score": 27.496203401716,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 1.4,
+      "priceOutput": 4.4,
+      "priceCacheHit": 0.26,
+      "name": "GLM-5.3 (Low)"
     },
     {
       "slug": "gemma-4-31b",
       "score": 14.6689500745828,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0,
+      "priceOutput": 0,
+      "priceCacheHit": null,
+      "name": "Gemma 4 31B (Reasoning)"
     },
     {
       "slug": "glm-5-3",
       "score": 44.777392385614,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 1.4,
+      "priceOutput": 4.4,
+      "priceCacheHit": 0.26,
+      "name": "GLM-5.3 (Max)"
     },
     {
       "slug": "llama-3-1-nemotron-ultra-253b-v1-reasoning",
       "score": 7.52746905624501,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Llama 3.1 Nemotron Ultra 253B v1 (Reasoning)"
     },
     {
       "slug": "gemma-4-31b-non-reasoning",
       "score": 13.9198819005287,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.16499999999999998,
+      "priceOutput": 0.4,
+      "priceCacheHit": 0.14,
+      "name": "Gemma 4 31B (Non-reasoning)"
     },
     {
       "slug": "minicpm5-1b-non-reasoning",
       "score": 8.69473818567247,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "MiniCPM5-1B (Non-reasoning)"
     },
     {
       "slug": "gemini-4-argon",
       "score": 52.5605655745982,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 10,
+      "priceCacheHit": 0.1,
+      "name": "Gemini 4 Argon (High)"
     },
     {
       "slug": "hermes-4-llama-3-1-405b",
       "score": 7.41221110231024,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 1,
+      "priceOutput": 3,
+      "priceCacheHit": null,
+      "name": "Hermes 4 - Llama-3.1 405B (Non-reasoning)"
     },
     {
       "slug": "minimax-m3-1-flash",
       "score": 42.7057475126235,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.15,
+      "priceOutput": 0.6,
+      "priceCacheHit": 0.015,
+      "name": "MiniMax-M3.1-Flash"
     },
     {
       "slug": "deepseek-v4-pro-non-reasoning",
       "score": 20.3605101726847,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 1.32,
+      "priceOutput": 3.96,
+      "priceCacheHit": 0.044,
+      "name": "DeepSeek V4 Pro 0813 (Non-reasoning)"
     },
     {
       "slug": "exaone-4-0-1-2b-reasoning",
       "score": 5.27138994054015,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Exaone 4.0 1.2B (Reasoning)"
     },
     {
       "slug": "gemma-4-e4b",
       "score": 8.90908441839731,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.02,
+      "priceOutput": 0.1,
+      "priceCacheHit": null,
+      "name": "Gemma 4 E4B (Reasoning)"
     },
     {
       "slug": "k2-v2-low",
       "score": 7.31130007284626,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "K2-V2 (Low)"
     },
     {
       "slug": "granite-4-0-h-nano-1b",
       "score": 5.1945517329943,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Granite 4.0 H 1B"
     },
     {
       "slug": "reka-flash-3",
       "score": 5.64602230491152,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.2,
+      "priceOutput": 0.8,
+      "priceCacheHit": null,
+      "name": "Reka Flash 3"
     },
     {
       "slug": "mistral-medium-3-5",
       "score": 14.1889227802691,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 1.5,
+      "priceOutput": 7.5,
+      "priceCacheHit": 0.15,
+      "name": "Mistral Medium 3.5"
     },
     {
       "slug": "k2-v2-medium",
       "score": 9.01595166538807,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "K2-V2 (Medium)"
     },
     {
       "slug": "mi-dm-k-2-5-pro-dec28",
       "score": 11.0361387091137,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Mi:dm K 2.5 Pro"
     },
     {
       "slug": "claude-opus-5-5-xhigh",
       "score": 55.9873505840139,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 4,
+      "priceOutput": 20,
+      "priceCacheHit": 0.2,
+      "name": "Claude Opus 5.5 (Xhigh, Default Fallback)"
     },
     {
       "slug": "gpt-6-astra-high",
       "score": 50.9191471636152,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 10,
+      "priceOutput": 50,
+      "priceCacheHit": 1,
+      "name": "GPT-6 Astra (High)"
     },
     {
       "slug": "lfm2-5-2-6b",
       "score": 8.38708534765242,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "LFM2.5-2.6B"
     },
     {
       "slug": "lfm2-5-8b-a1b",
       "score": 7.21643567343487,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "LFM2.5-8B-A1B"
     },
     {
       "slug": "nemotron-3-5-super-vl",
       "score": 26.4910658661689,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.225,
+      "priceOutput": 0.575,
+      "priceCacheHit": 0.05,
+      "name": "Nemotron 3.5 Super VL"
     },
     {
       "slug": "nova-premier",
       "score": 9.15908119897819,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Nova Premier"
     },
     {
       "slug": "gpt-6-1-sol-low",
       "score": 42.0835618555848,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 2,
+      "priceOutput": 10,
+      "priceCacheHit": 0.1,
+      "name": "GPT-6.1 Sol (Low)"
+    },
+    {
+      "slug": "gpt-6-1-terra-xhigh",
+      "score": 45.3640518262171,
+      "estimated": false,
+      "priceInput": 1,
+      "priceOutput": 5,
+      "priceCacheHit": 0.05,
+      "name": "GPT-6.1 Terra (Xhigh)"
     },
     {
       "slug": "gpt-6-astra-medium",
       "score": 49.5704363034369,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 10,
+      "priceOutput": 50,
+      "priceCacheHit": 1,
+      "name": "GPT-6 Astra (Medium)"
     },
     {
       "slug": "muse-wonder-full",
       "score": 55.8021199855616,
-      "estimated": false
+      "estimated": false,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Muse Wonder Full (Max)"
+    },
+    {
+      "slug": "gpt-6-1-terra-high",
+      "score": 43.8688591051329,
+      "estimated": false,
+      "priceInput": 1,
+      "priceOutput": 5,
+      "priceCacheHit": 0.05,
+      "name": "GPT-6.1 Terra (High)"
     },
     {
       "slug": "claude-opus-5-5-medium",
       "score": 51.2434931792768,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 4,
+      "priceOutput": 20,
+      "priceCacheHit": 0.2,
+      "name": "Claude Opus 5.5 (Medium, Default Fallback)"
     },
     {
       "slug": "ring-2-6-1t",
       "score": 16.6172363768618,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.3,
+      "priceOutput": 2.5,
+      "priceCacheHit": null,
+      "name": "Ring-2.6-1T"
     },
     {
       "slug": "phi-4",
       "score": 5.92257028113751,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.125,
+      "priceOutput": 0.5,
+      "priceCacheHit": null,
+      "name": "Phi-4"
     },
     {
       "slug": "gpt-oss-120b",
       "score": 11.6028431512592,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.15,
+      "priceOutput": 0.6,
+      "priceCacheHit": 0.1,
+      "name": "gpt-oss-120b (High)"
     },
     {
       "slug": "deepseek-v4-1-flash-1017",
       "score": 45.0965048681912,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.3,
+      "priceOutput": 1.2,
+      "priceCacheHit": 0.006,
+      "name": "DeepSeek V4.1 Flash 1017 (Max)"
     },
     {
       "slug": "nvidia-nemotron-nano-9b-v2-reasoning",
       "score": 7.42882284148722,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.04,
+      "priceOutput": 0.16,
+      "priceCacheHit": null,
+      "name": "NVIDIA Nemotron Nano 9B V2 (Reasoning)"
     },
     {
       "slug": "claude-opus-5-5-high",
       "score": 53.5831959822067,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 4,
+      "priceOutput": 20,
+      "priceCacheHit": 0.2,
+      "name": "Claude Opus 5.5 (High, Default Fallback)"
     },
     {
       "slug": "agnes-2-5-pro-beta",
       "score": 35.2413300369053,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.1,
+      "priceOutput": 0.3,
+      "priceCacheHit": 0.01,
+      "name": "Agnes 2.5 Pro Beta"
     },
     {
       "slug": "nova-2-0-pro-reasoning-low",
       "score": 12.7754507441167,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 1.25,
+      "priceOutput": 10,
+      "priceCacheHit": null,
+      "name": "Nova 2.0 Pro Preview (Low)"
     },
     {
       "slug": "gemini-3-8-flash-low",
       "score": 33.4548106699132,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.75,
+      "priceOutput": 3.75,
+      "priceCacheHit": 0.075,
+      "name": "Gemini 3.8 Flash (Low)"
     },
     {
       "slug": "jamba-reasoning-3b",
       "score": 5.66829948484426,
-      "estimated": true
-    },
-    {
-      "slug": "kimi-k3",
-      "score": 43.5938229518782,
-      "estimated": false
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "Jamba Reasoning 3B"
     },
     {
       "slug": "quasar-438b",
       "score": 26.7372536607816,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.11,
+      "priceOutput": 0.33,
+      "priceCacheHit": 0.0099,
+      "name": "Quasar 438B (Max, Based on GLM-5.2)"
     },
     {
       "slug": "lfm2-24b-a2b",
       "score": 5.94753271655266,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "LFM2 24B A2B"
     },
     {
       "slug": "nova-2-0-lite-reasoning-medium",
       "score": 12.4823794919822,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.3,
+      "priceOutput": 2.5,
+      "priceCacheHit": null,
+      "name": "Nova 2.0 Lite (Medium)"
     },
     {
       "slug": "kat-coder-pro-v2",
       "score": 21.7045082420985,
-      "estimated": true
+      "estimated": true,
+      "priceInput": null,
+      "priceOutput": null,
+      "priceCacheHit": null,
+      "name": "KAT Coder Pro V2"
     },
     {
       "slug": "qwen3-coder-next",
       "score": 9.23682203219174,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 0.31,
+      "priceOutput": 1,
+      "priceCacheHit": 0.28500000000000003,
+      "name": "Qwen3 Coder Next"
     },
     {
       "slug": "gemma-4-12b",
       "score": 14.1847516647736,
-      "estimated": true
+      "estimated": true,
+      "priceInput": 0.1,
+      "priceOutput": 0.3,
+      "priceCacheHit": null,
+      "name": "Gemma 4 12B (Reasoning)"
     },
     {
       "slug": "muse-wonder",
       "score": 52.393894697293,
-      "estimated": false
+      "estimated": false,
+      "priceInput": 4,
+      "priceOutput": 20,
+      "priceCacheHit": 0.2,
+      "name": "Muse Wonder (Max)"
     }
   ]
 }
