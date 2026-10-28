@@ -75,6 +75,8 @@ let quotaRefreshedAt = 0;
 /** Lifecycle GC (dead comm channels + cold archive) runs on its own slow clock. */
 let gcRefreshedAt = 0;
 const GC_MS = 30 * 60_000;
+/** Closing the version cards an install already answered is cheap but not per-tick work. */
+let upgradeClosureAt = 0;
 // Model family matchers: an `auto:<family>` def resolves to the newest id of that family
 // among the provider's selectable models. Families are deliberately narrow so a provider
 // publishing an unrelated line (e.g. gpt-7, or a renamed workhorse) never silently switches.
@@ -380,6 +382,16 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
         void ctx.modelRouting.refresh().catch(error => console.warn(`model routing refresh failed: ${(error as Error).message}`));
         await timing.measure("model-journal",()=>ctx.modelJournal.drain(ctx.db.db));
         const report = await timing.measure("tick", () => ctx.dispatcher.tick());
+        // An installed version answers every older pending version card, however it got installed: through the upgrade
+        // job, by hand, or before this process started. The job closes its own batch right after verifying; this pass
+        // catches everything else, and a card it cannot close stays put for the next tick.
+        if (Date.now() - upgradeClosureAt > 600_000) {
+          upgradeClosureAt = Date.now();
+          await timing.measure("upgrade-closure", async () => {
+            const now = await ctx.upgrades.installed();
+            if (now) await ctx.upgrades.closeSuperseded(now, "system:dispatcher");
+          }).catch((error) => console.warn(`superseded upgrade cards left open: ${(error as Error).message}`));
+        }
         await timing.measure("observation", () => persistDispatchObservation(ctx)).catch((error) => console.warn(`dispatch observation write failed: ${(error as Error).message}`));
         failures = 0;
         const changed = report.commands || report.revoked.length || report.woke.length || report.retired.length ||
