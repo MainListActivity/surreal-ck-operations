@@ -1478,6 +1478,10 @@ export interface CompanyCore {
   acceptanceMappingPreview?(credential: Credential, input: { taskId: TaskId }): Promise<AcceptanceMappingPreviewView>;
   /** SYS-INT: gm-only authorized import of a versioned acceptance-mapping bundle under digest + version CAS. */
   acceptanceMappingImport?(credential: Credential, input: AcceptanceMappingImportInput): Promise<TaskView>;
+  /** SYS-INT: start one controlled non-production deploy drill (task holder or gm; audited, host-executed). */
+  deployDrillRun?(credential: Credential, input: { taskId: TaskId; runId: string; baseSha: string; candidateSha: string; idempotencyKey: string }): Promise<{ runId: string; pid: number; root: string }>;
+  /** SYS-INT: read one deploy drill's state and structured stage records. */
+  deployDrillStatus?(credential: Credential, input: { runId: string }): Promise<{ state?: { runId: string; status: string; phase?: string; error?: string }; stages?: string[] }>;
   /** SYS02: gm read of the versioned gate record. */
   acceptanceGate?(credential: Credential): Promise<AcceptanceGateView>;
   /** SYS02: gm versioned change of the gate; the reason and before/after are audited. */

@@ -1,9 +1,12 @@
 import { readCompanyRelease, type CompanyRelease } from './company-release.ts';
+import { drillHost, startDrill, readDrillStatus, type DrillState } from './deploy-drill-service.ts';
+import { validateDrillPlan } from './deploy-drill.ts';
 import { parseExecutionWindow, windowExpired, recoveryReasonSchema } from './task-recovery.ts';
 import { workspaceScopeFor } from './goal-workspace-capability.ts';
 import { authenticationLookup } from './diagnostics.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
@@ -2481,6 +2484,36 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       if (replayed) return replayed;
       throw error;
     }
+  }
+
+  /**
+   * SYS-INT: start one controlled non-production two-face switch & rollback drill. The caller names
+   * only business facts (task, runId, base/candidate SHA); every path and port is constructed by the
+   * validator, the drill runs in a detached host child, and the employee never needs launchctl or
+   * paseo. Only the task holder (engineering) or gm may start a drill; every call is audited.
+   */
+  async deployDrillRun(credential: Credential, input: { taskId: string; runId: string; baseSha: string; candidateSha: string; idempotencyKey: string }): Promise<{ runId: string; pid: number; root: string }> {
+    const actor = await this.authenticate(credential);
+    if (actor.role !== 'engineering' && actor.role !== 'gm') throw new CompanyError('forbidden', 'Only engineering or gm may run a deploy drill');
+    const row = await this.db.select<{ current_employee?: string; state: string }>(id('task', input.taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    if (row.current_employee !== actor.employeeId && actor.role !== 'gm') throw new CompanyError('forbidden', 'Only the task holder may run a drill for this task');
+    const home = process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library', 'Application Support', 'SurrealCKCompany');
+    const repo = this.companyReleaseRepo ?? this.worktrees?.options.opsRepo ?? process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
+    const host = drillHost(home, repo);
+    const plan = await validateDrillPlan(input, host.ctx);
+    await this.db.query('CREATE audit CONTENT {task:$task,actor:$actor,action:"deploy_drill_run",evidence:$evidence,at:time::now()};',
+      { task: input.taskId, actor: actor.employeeId, evidence: `runId ${input.runId} base ${input.baseSha} candidate ${input.candidateSha} root ${plan.root}` });
+    const pid = startDrill(home, repo, plan);
+    return { runId: input.runId, pid, root: plan.root };
+  }
+
+  /** SYS-INT: read one drill's state and stage records; the task holder, gm, qa or product may read. */
+  async deployDrillStatus(credential: Credential, input: { runId: string }): Promise<{ state?: DrillState; stages?: string[] }> {
+    const actor = await this.authenticate(credential);
+    if (!['engineering', 'gm', 'qa', 'product'].includes(actor.role ?? '')) throw new CompanyError('forbidden', 'Not allowed to read drill status');
+    const home = process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library', 'Application Support', 'SurrealCKCompany');
+    return readDrillStatus(home, input.runId);
   }
 
   /** SYS02: gm read of the versioned gate record. */

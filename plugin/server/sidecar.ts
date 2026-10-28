@@ -56,6 +56,8 @@ const BASE_TOOLS = [
   "get_admin_summary", "read_task_text", "read_worktree_refs", "record_acceptance_evidence", "acceptance_status", "acceptance_gate", "set_acceptance_gate",
   // SYS-INT mapping preview (read-only) and gm-only authorized import; core enforces both.
   "acceptance_mapping_preview", "acceptance_mapping_import",
+  // SYS-INT controlled non-production deploy drill: host-executed (the service child), never the sandbox.
+  "deploy_drill_run", "deploy_drill_status",
   // gm only in core (record a task's code implementer when the bound one cannot continue; compare-and-set, audited).
   "implementer_takeover",
   "qa_observation_grant", "qa_observation_revoke", "qa_observation_status", "qa_observation_session",
@@ -1207,6 +1209,18 @@ export class SidecarPool {
             idempotencyKey: String(args.idempotencyKey ?? ""),
           })
         : Promise.reject(Object.assign(new Error("core does not expose fault_lift"), { code: "temporarily_unavailable" }));
+      case "deploy_drill_run": return core.deployDrillRun
+        ? core.deployDrillRun(cred, {
+            taskId: String(args.taskId ?? live().taskId),
+            runId: String(args.runId ?? ""),
+            baseSha: String(args.baseSha ?? ""),
+            candidateSha: String(args.candidateSha ?? ""),
+            idempotencyKey: String(args.idempotencyKey ?? ""),
+          })
+        : Promise.reject(Object.assign(new Error("core does not expose deploy_drill_run"), { code: "temporarily_unavailable" }));
+      case "deploy_drill_status": return core.deployDrillStatus
+        ? core.deployDrillStatus(cred, { runId: String(args.runId ?? "") })
+        : Promise.reject(Object.assign(new Error("core does not expose deploy_drill_status"), { code: "temporarily_unavailable" }));
       default: throw Object.assign(new Error(RETIRED_TOOLS.has(tool)
         ? `${tool} 已下线：凭证不再交给员工，需要账号、workspace、登录请用运维工具（sck call ops_info '{}' 查看）`
         : `unknown tool: ${tool}`), { code: "unknown_tool" });

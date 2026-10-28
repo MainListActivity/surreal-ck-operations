@@ -1,17 +1,19 @@
 {
-  "version": "0.3.16",
-  "title": "临期额度优先与五条大请求观测退出",
+  "version": "0.3.17",
+  "title": "受控非生产双面切换与回滚演练能力",
   "changes": [
-    "手动置顶之后新增独立临期优先层：24小时内失效的赠送额度、明确不续订的订阅及固定周期额度，层内仅比较综合分",
-    "累计5条输入超过50,000 token的成功请求（含缓存输入）后，临期额度新读数不变则退出紧急层；同一额度池共享结果，重启和刷新不重新入层",
-    "保留额度截止时间、真实读取时间与临期数量；远端临期卡片后台刷新，模型专属试用窗口单独匹配",
-    "Paseo和网页同时展示临期原因、截止时间、有效大请求数及退出说明"
+    "新增 deploy_drill_run/deploy_drill_status 工具：在受权宿主运行面（launchd 服务/插件进程）启动严格限定非生产的双面切换与回滚演练，员工不需要也不接触 launchctl/paseo",
+    "演练根固定为 <serviceHome>/drills/<runId>：独立公司 fork 隔离库（rocksdb 在根内）、专用端口段 39200-39299 空闲探测、独立 active 链接；路径全部由 runId 构造，调用方无法命名生产目标",
+    "MCP 面真实进程：以 SCK_SERVICE_HOME 指向演练根运行该 release 的 run-service.sh mcp（health/ready 实测）；插件面真实通道：release 内固定驱动起真实 SidecarPool，独立 client-cli 进程走真实 sck call get_context 往返",
+    "切换前以目标自身脚本执行内容绑定与 RW06/SYS02/IR06/SYS06 四守卫；含 repoint 失败注入：损坏候选的 vendor 必须被内容绑定拒绝、恢复后才能继续",
+    "oracle 阶段在演练库播种 blocked+blocked_to=gm 遗留样本并断言零误派零写入、ready 阳性对照可领取；旧版已含 RB01 语义的 oracle 假设在演练报告中披露，逐包 RB01 套件仍留在发布门禁",
+    "每阶段写结构化记录（runId/阶段/SHA/环境/UTC/结果/日志 SHA-256），成功后仅清理本次演练的重产物（releases/库），阶段记录保留；不影响任何生产状态"
   ],
   "impact": [
-    "持续报错、额度耗尽、首token超过20秒仍置后，手动置顶保持最高优先级",
-    "只调整Haiku/Sonnet组内顺序；Opus/Fable、排序权重和刷新间隔不变，不调用JEV",
-    "观测状态保存在本机私有model-routing/urgency.json，不存提示词、响应正文或原始账号名"
+    "为 INT01 真实双面切换回滚补证提供受控工具（任务 c3736677 可在部署后复跑候选与回滚实测）；不绕过员工沙箱、不豁免验收、不新增付费资源",
+    "演练全程不触生产 active/插件登记/MCP 端口/真实库与凭证路径；子进程环境显式构造，生产 SURREAL_*/SCK_* 变量不继承，杜绝演练误连生产库",
+    "runId 单次有效：重放已有状态的 runId 一律冲突拒绝；发起限在办任务持有人（engineering）或 gm 并写审计"
   ],
-  "migration": "无数据库迁移；发布后按最新pins及真实额度生成quality-pace-v4排序。现有历史请求不倒灌到新临期批次的计数。",
-  "rollback": "通过标准安装器恢复上一固定发布并重新计算排序；观测文件保留，旧版不读取。"
+  "migration": "无数据库迁移、无历史改写；新增模块、固定驱动脚本与工具注册，仅用现有表。",
+  "rollback": "保留健康 active release；用当前受审 release 的 installer 回滚至部署前现役（执行时以 active 实际 SHA 为准）：active 与插件面同时切回，RW06/SYS02/IR06/SYS06 守卫校验兼容后再切；演练根目录与旧版互不读取，无数据回滚。"
 }
