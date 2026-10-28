@@ -1,18 +1,18 @@
 {
-  "version": "0.3.13",
-  "title": "SYS-INT 源业务验收映射契约与受众绑定修正",
+  "version": "0.3.14",
+  "title": "老板交接型升级卡可达与旧版本待办自动收口",
   "changes": [
-    "纠正映射注册表混淆：工具自身机制项改为 AC-MAP-1..8 并保留独立 bundle；另建 sys-int-source-qa 源业务 bundle，不再把工具 AC 冒充源 e7d08f27 的 INT01–08",
-    "源业务 bundle 以 QA 独立签核承载真实 INT01–08 业务原义（双面部署/同源评估/故障/等待/策略/终验分页/双入口探针/可复算指标）+ 逐 SYS01–07 + 受审逐包 RB01，全部 required 可追溯",
-    "SYS_REQUIRED_MAPPING 补 SYS03（处置通道重演）并修正 SYS06 rb01=true（rollback-isolation-policy），逐 SYS01–07 完整",
-    "bundle 增加受众绑定（腿/执行岗/目标）：预览按受众给出唯一 proposal，错配 bundle 导入被拒并显式冲突；digest 覆盖受众，注册表更新即失效旧预览",
-    "源 QA bundle 不携带任何别腿机器基线：业务项为对真实生产证据的人工独立签核，承载任务自身服务器基线照常生效但不充当业务覆盖"
+    "SYS05 交接等待（owner_handoff）中的任务不再丢失升级卡：待办由收件箱交接卡生成，不再只认 blocked_to=owner 的关口与提问",
+    "升级授权、装前重校验接受该状态：老板在交接卡上点升级即视为对这条等待的正式决定，安装成功后解除等待并把任务交回派工",
+    "上线成功后自动收口所有更老版本的待办：旧卡按已上线回复/解除并经审计登记，不再长期挂在收件箱等待一个已经发生过的安装",
+    "已被现役版本取代的旧卡标注「已被 vX 替代」且不再提供升级动作，避免再点一次无效安装",
+    "补齐 sidecar-review 门禁的单测清单（v0.3.12 起门禁已含 effective-policy.fork，回归用例未同步）"
   ],
   "impact": [
-    "旧 sys-int-implement digest 全部失效（版本 1→2）；部署后 ce3906b5 需按新预览 digest 重新 dry-run 并导入",
-    "源 QA 行预览可见 16 项 required 业务契约与逐项 SYS 覆盖；工程行只见工具自身 bundle，两个受众互不可串",
-    "无 schema 变更、无历史改写；回滚到部署前现役安全，旧版忽略新增预览字段"
+    "老板收件箱不再出现「点了没反应」或「旧版本还在等升级」两类待办；新版本一上线，旧待办自动离开",
+    "只在升级作业成功验证后触发收口；更老版本卡片若状态已变化则保留原状，由下一轮重试，不强制改状态",
+    "无 schema 变更、无历史改写；回滚到部署前现役安全"
   ],
-  "migration": "无数据库迁移、无历史改写；仅映射注册表/预览/导入守卫与测试改动，复用 043 已有标记字段。",
-  "rollback": "保留健康 active release；用当前受审 release 的 installer 回滚至部署前现役（现为 v0.3.12 bd45733b2c74ebda12efc71858e9c3080693afc2，以 active 实际 SHA 为准）：active 与插件面同时切回，插件 SOURCE/DIRECTORY 必须等于回滚目标 release/plugin；install 报 plugin repoint failed 时按运维文档 R3 先 remove 再 install 同一被守卫放行的目标。RW06/SYS02/IR06/SYS06 守卫校验兼容后再切；无数据回滚。"
+  "migration": "无数据库迁移、无历史改写；仅升级卡片来源、状态门、完成收尾与门禁单测改动。",
+  "rollback": "保留健康 active release；用当前受审 release 的 installer 回滚至部署前现役（现为 v0.3.13 eca29c50ddcf72539148b30474d9b430caf50bd1，以 active 实际 SHA 为准）：active 与插件面同时切回，插件 SOURCE/DIRECTORY 必须等于回滚目标 release/plugin；install 报 plugin repoint failed 时按运维文档 R3 先 remove 再 install 同一被守卫放行的目标。RW06/SYS02/IR06/SYS06 守卫校验兼容后再切；无数据回滚。"
 }

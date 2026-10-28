@@ -326,14 +326,14 @@ async function upgrade(tid,version,digest){
  try{await api('upgrade',{taskId:tid,taskVersion:version,digest});await load()}catch(e){alert(e.message);if(el){el.disabled=false;el.textContent='重新升级'}}
 }
 function upgradeCard(x){
- const p=x.plan,busy=['queued','preparing','checking','installing','verifying'].includes(x.status),done=x.status==='succeeded';
+ const p=x.plan,busy=['queued','preparing','checking','installing','verifying'].includes(x.status),done=x.status==='succeeded',stale=x.retired===true;
  const list=a=>'<ul>'+a.map(t=>'<li>'+esc(t)+'</li>').join('')+'</ul>';
- return '<article class="decision-card upgrade-card"><div class="card-top"><span class="type-label">公司系统升级 · '+esc(x.phase)+'</span>'+badge(done?'已完成':busy?'进行中':'待执行',done?'success':busy?'blue':'warning')+'</div>'
+ return '<article class="decision-card upgrade-card"><div class="card-top"><span class="type-label">公司系统升级 · '+esc(x.phase)+'</span>'+badge(done?'已完成':stale?'已替代':busy?'进行中':'待执行',done?'success':stale?'blue':busy?'blue':'warning')+'</div>'
  +'<h3>v'+esc(p.version)+' · '+esc(p.title)+'</h3>'
  +'<div class="upgrade-cols"><div><h4>上线内容</h4>'+list(p.changes)+'<h4>影响范围</h4>'+list(p.impact)+'</div>'
  +'<div><h4>数据变化</h4><p class="upgrade-p">'+esc(p.migration)+'</p><h4>回退方式</h4><p class="upgrade-p">'+esc(p.rollback)+'</p></div></div>'
  +'<details class="sha"><summary>提交详情</summary><code>'+esc(p.sha)+'</code></details>'+(x.error?'<p class="err" role="alert">'+esc(x.error)+'</p>':'')
- +(done?'<p class="okm">升级完成，已自动回复通过</p>':'<div class="decision-actions"><button id="upgrade-'+esc(x.taskId)+'" class="approve" '+(busy?'disabled':'')+' onclick="upgrade(\\''+x.taskId+'\\','+x.taskVersion+',\\''+p.digest+'\\')">'+(busy?esc(x.phase):'升级至 v'+esc(p.version))+'</button></div>')+'</article>';
+ +(done?'<p class="okm">升级完成，已自动回复通过</p>':stale?'<p class="okm">该版本已被现役版本取代，无需再安装；这张旧待办会自动收口。</p>':'<div class="decision-actions"><button id="upgrade-'+esc(x.taskId)+'" class="approve" '+(busy?'disabled':'')+' onclick="upgrade(\\''+x.taskId+'\\','+x.taskVersion+',\\''+p.digest+'\\')">'+(busy?esc(x.phase):'升级至 v'+esc(p.version))+'</button></div>')+'</article>';
 }
 async function notice(key){try{await api('notice',{key});await load()}catch(e){alert(e.message)}}
 async function voidTask(tid,gid){
