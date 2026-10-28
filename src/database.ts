@@ -175,6 +175,11 @@ export class CompanyDatabase {
     // SYS-INT：版本化验收映射的导入标记。只新增 task 可选字段；旧版读不到即按 legacy 处理，不误派不误关（RB01）。
     await this.db.query(loadSchema('043-acceptance-mapping.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 43 WHERE schema_version < 43;');
+    // SYS-INT：QA 评审协同的持久事件唤醒（编号 044）。只新增 qa_review_watch / qa_review_signal / qa_review_wake
+    // 三张表与索引；协同任务仍用 040 的 task_wait，事件只解除等待并把任务放回 ready。旧版读不到新表即忽略，
+    // 行为退回固定时间等待（RB01：不误派、不误关）。
+    await this.db.query(loadSchema('044-review-events.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 44 WHERE schema_version < 44;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {
