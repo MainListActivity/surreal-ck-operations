@@ -176,6 +176,12 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
         const body = readDoc(opsRepo, url.searchParams.get("name") ?? "");
         return body === undefined ? json({ error: "not found" }, 404) : json({ name: url.searchParams.get("name"), text: body });
       }
+      if(req.method==='POST'&&sub==='/api/upgrade/automatic'){
+        if(req.headers.get('origin')&&req.headers.get('origin')!==url.origin)return json({error:'origin mismatch'},403);
+        const b=await req.json() as {enabled?:unknown};if(typeof b.enabled!=='boolean')return json({error:'enabled must be boolean'},400);
+        const c=await opts.company();if(!c.upgrades)return json({error:'升级服务尚未就绪'},409);
+        return json(await c.upgrades.setAuto(b.enabled,SOURCE));
+      }
       if (req.method === "POST" && sub === "/api/upgrade") {
         if(req.headers.get("origin") && req.headers.get("origin")!==url.origin)return json({error:"origin mismatch"},403);
         const b=await req.json() as {taskId:string;taskVersion:number;digest:string};
@@ -325,6 +331,9 @@ async function upgrade(tid,version,digest){
  const el=$('upgrade-'+tid);if(el){el.disabled=true;el.textContent='正在启动升级…'}
  try{await api('upgrade',{taskId:tid,taskVersion:version,digest});await load()}catch(e){alert(e.message);if(el){el.disabled=false;el.textContent='重新升级'}}
 }
+async function autoUpgrade(){
+ try{await api('upgrade/automatic',{enabled:!INBOX?.upgrades?.automatic?.enabled});await load();}catch(e){alert(e.message||'设置失败，请重试')}
+}
 function upgradeCard(x){
  const p=x.plan,busy=['queued','preparing','checking','installing','verifying'].includes(x.status),done=x.status==='succeeded',stale=x.retired===true;
  const list=a=>'<ul>'+a.map(t=>'<li>'+esc(t)+'</li>').join('')+'</ul>';
@@ -419,7 +428,7 @@ function render(){
     const v=INBOX?.upgrades?.current;
     const stats=[['待审批',gates.length,'验收提交等待你的决定','violet'],['待回复',asks.length,'来自执行员工的问题','amber'],['升级流程',items.filter(x=>x.status!=='succeeded').length,'公司系统版本升级','blue'],['系统通知',notices.length,'运行提醒与简报','green']];
     const statHtml='<section class="stat-grid">'+stats.map(s=>'<article class="metric-card '+s[3]+'"><span>'+s[0]+'</span><strong>'+s[1]+'</strong><small>'+s[2]+'</small><i></i></article>').join('')+'</section>';
-    const head=v?'<section class="panel version-panel"><span class="type-label">当前生产版本</span><div class="version-row"><strong>v'+esc(v.version)+'</strong><code>'+esc(v.sha)+'</code></div></section>':'';
+    const head=v?'<section class="panel version-panel"><span class="type-label">当前生产版本</span><div class="version-row"><strong>v'+esc(v.version)+'</strong><code>'+esc(v.sha)+'</code></div><p>自动安装已合 main 的公司版本；全部门禁和验证通过后才回复。失败退避24小时，每个版本累计失败2次后停止自动尝试。</p><button onclick="autoUpgrade()">'+(INBOX?.upgrades?.automatic?.enabled?'自动升级已开启 · 点击关闭':'自动升级已关闭 · 点击开启')+'</button></section>':'';
     const g=gates.map(x=>'<article class="decision-card"><div class="card-top"><span class="type-label">'+esc(KIND[x.task.kind]||x.task.kind)+'</span>'+badge('待验收','violet')+'</div>'
       +'<h3>'+esc(x.task.title)+'</h3><p class="byline">执行 '+esc(x.task.executor_role)+' · 提交人 '+esc(x.task.current_employee||'—')+'</p>'
       +'<div class="submission">'+linkify(x.submission||'（无提交说明）')+'</div>'

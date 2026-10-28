@@ -56,6 +56,7 @@ export async function runCompanyUpgrade(service:CompanyUpgrades,id:string,option
  let phase='校验版本',previous:string|undefined=job.previous,targetPath:string|undefined,pausedVersion:number|undefined=job.pause_version,pausedBefore=job.paused_before??false,healthy=false,switched=false;
  const update=async(status:UpgradeStatus,next:string)=>{phase=next;await service.update(id,status,next);};
  try{
+  await service.assertAutomatic(job);
   await update('preparing','校验版本');
   await git(repo,['fetch','origin','main']);
   const plan=await readCompanyRelease(repo,job.plan.sha);
@@ -100,22 +101,31 @@ export async function runCompanyUpgrade(service:CompanyUpgrades,id:string,option
    if(!t||t.version!==job.task_version||!((t.state==='blocked'&&t.blocked_to==='owner')||(t.state==='review'&&t.reviewer_role==='owner')
      ||(t.state==='blocked'&&t.wait_kind==='owner_handoff'&&t.wait_owner_role==='owner')))throw Error('owner task moved');
    if((await installedRelease(home)).sha!==current.sha)throw Error('another release replaced the current version');
+   targetPath=await realpath(target);
+   await service.assertAutomatic(job);
    // Pause ownership and the recovery snapshot are one atomic write. A retry
    // retains the original state only while its pause revision is still current.
    const pauseResults=await db.query(`BEGIN;
     LET $c=SELECT * FROM ONLY company_meta:config;
+    IF $automatic AND ($c.company_auto_upgrade!=true OR $c.company_auto_upgrade_revision!=$policyRevision) {THROW '自动升级授权已改变';};
+    LET $t=SELECT * FROM ONLY $task;
+    IF $automatic {
+     IF $c.paused=true {THROW '老板已暂停派工，自动升级停止';};
+     IF $t.version!=$taskVersion OR $t.company_upgrade.digest!=$digest {THROW '升级任务已经变化';};
+     LET $done=SELECT id FROM task WHERE id IN ($t.dependencies??[]) AND state='done';
+     IF array::len($done)!=array::len($t.dependencies??[]) {THROW '升级前置验收已经变化';};
+    };
     LET $j=SELECT * FROM ONLY $job;
     LET $before=IF $j.pause_version!=NONE AND $j.pause_version=$c.pause_version THEN $j.paused_before ELSE $c.paused??false END;
     LET $revision=($c.pause_version??0)+1;
     UPSERT ONLY company_meta:config SET paused=true,pause_version=$revision;
-    UPDATE $job SET previous=$previous,paused_before=$before,pause_version=$revision;
+    UPDATE $job SET previous=$previous,paused_before=$before,pause_version=$revision,status='installing',phase='安装版本并切换公司插件',updated_at=time::now();
     RETURN {before:$before,revision:$revision};
-    COMMIT;`,{job:job.id,previous});
+    COMMIT;`,{job:job.id,previous,automatic:job.authorization==='automatic',policyRevision:job.policy_revision,task:job.task,taskVersion:job.task_version,digest:job.plan.digest});
    const pause=pauseResults.find(x=>x&&typeof x==='object'&&'revision' in x) as {before:boolean;revision:number}|undefined;
    if(!pause)throw Error('pause ownership unavailable');
    pausedBefore=pause.before;pausedVersion=pause.revision;
-   await update('installing','安装版本并切换公司插件');
-   targetPath=await realpath(target);
+   phase='安装版本并切换公司插件';
    switched=true;
    await run('sh',[join(target,'scripts/company-service.sh'),'install',target],home);
   }
