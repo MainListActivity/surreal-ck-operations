@@ -14,7 +14,9 @@
 release_matches_commit() {
   release=$1; sha=$2; repo=$3
   [ -d "$release" ] || return 1
-  [ -d "$repo/.git" ] || return 1
+  # A linked worktree has `.git` as a FILE (gitdir pointer), not a directory: `-e` accepts both, so the
+  # release gate keeps working when it is run from a task worktree instead of the main checkout.
+  [ -e "$repo/.git" ] || return 1
   work=$(mktemp -d) || return 1
   status=1
   if git -C "$repo" cat-file -e "$sha^{commit}" 2>/dev/null \

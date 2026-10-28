@@ -16,7 +16,13 @@ import { runDrill, type DrillExec, type DrillHost } from './deploy-drill-runner.
 export interface DrillState { runId: string; status: 'running' | 'passed' | 'failed'; phase?: string; error?: string }
 
 const CHILD_ENV = (): Record<string, string> => ({
-  PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${homedir()}/.bun/bin`,
+  // pnpm installs the release dependencies in prepare. It ships with the machine's Node install, not the
+  // system PATH the service runs under, so search the ordinary user locations explicitly rather than
+  // letting the drill fail with "Executable not found in $PATH: pnpm".
+  PATH: [
+    '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin',
+    `${homedir()}/.bun/bin`, `${homedir()}/node/bin`, `${homedir()}/Library/pnpm`,
+  ].join(':'),
   HOME: homedir(), TMPDIR: tmpdir(),
 });
 
@@ -42,7 +48,18 @@ const exec: DrillExec = {
     child.once('close', () => resolve());
     child.once('error', reject);
   }),
-  healthy: async url => { try { return (await fetch(url, { signal: AbortSignal.timeout(1500) })).ok; } catch { return false; } },
+  // Each probe opens its own connection. A pooled keep-alive socket speaks to whichever process held
+  // the port when it was opened — after a face swap that is the previous release, which keeps answering
+  // 503/nothing while the new one is up — so a cached connection would poll the dead server forever.
+  probe: async url => {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(1500), headers: { connection: 'close' } });
+      const body = (await response.text()).slice(0, 200);
+      return { ok: response.ok, detail: `HTTP ${response.status} ${body}`.trim() };
+    } catch (error) {
+      return { ok: false, detail: String((error as Error)?.message ?? error).slice(0, 200) };
+    }
+  },
   nowIso: () => new Date().toISOString(),
 };
 
@@ -94,6 +111,9 @@ export function drillHost(serviceHome: string, repo: string): DrillHost & { ctx:
 
 /** Launches the drill in a detached child (the service process must not block on a minutes-long drill). */
 export function startDrill(serviceHome: string, repo: string, plan: DrillPlan): number {
+  // The drill root does not exist yet on a first run: validateDrillPlan only constructs paths. Create it
+  // before writing the plan, or the detached child has nothing to read.
+  mkdirSync(plan.root, { recursive: true, mode: 0o700 });
   writeFileSync(join(plan.root, 'plan.json'), JSON.stringify(plan, null, 2) + '\n', { mode: 0o600 });
   const child = spawn(resolveDrillBun(serviceHome), [join(repo, 'src', 'deploy-drill-run.ts'), plan.runId],
     { cwd: repo, env: { ...CHILD_ENV(), SCK_DRILL_HOME: serviceHome, SCK_DRILL_REPO: repo }, detached: true, stdio: 'ignore' });

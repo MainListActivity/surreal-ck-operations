@@ -1,19 +1,19 @@
 {
-  "version": "0.3.17",
-  "title": "受控非生产双面切换与回滚演练能力",
+  "version": "0.3.18",
+  "title": "演练工具 Node 宿主兼容与完整运行依赖修复",
   "changes": [
-    "新增 deploy_drill_run/deploy_drill_status 工具：在受权宿主运行面（launchd 服务/插件进程）启动严格限定非生产的双面切换与回滚演练，员工不需要也不接触 launchctl/paseo",
-    "演练根固定为 <serviceHome>/drills/<runId>：独立公司 fork 隔离库（rocksdb 在根内）、专用端口段 39200-39299 空闲探测、独立 active 链接；路径全部由 runId 构造，调用方无法命名生产目标",
-    "MCP 面真实进程：以 SCK_SERVICE_HOME 指向演练根运行该 release 的 run-service.sh mcp（health/ready 实测）；插件面真实通道：release 内固定驱动起真实 SidecarPool，独立 client-cli 进程走真实 sck call get_context 往返",
-    "切换前以目标自身脚本执行内容绑定与 RW06/SYS02/IR06/SYS06 四守卫；含 repoint 失败注入：损坏候选的 vendor 必须被内容绑定拒绝、恢复后才能继续",
-    "oracle 阶段在演练库播种 blocked+blocked_to=gm 遗留样本并断言零误派零写入、ready 阳性对照可领取；旧版已含 RB01 语义的 oracle 假设在演练报告中披露，逐包 RB01 套件仍留在发布门禁",
-    "每阶段写结构化记录（runId/阶段/SHA/环境/UTC/结果/日志 SHA-256），成功后仅清理本次演练的重产物（releases/库），阶段记录保留；不影响任何生产状态"
+    "端口探测改用 node:net：插件面把服务代码跑在 Node 下（Bun.serve 是抛错桩），旧探测在 Node 上把 39200-39299 全判忙、演练无法启动；现按主机真实空闲/占用判定，异常不再伪装成全忙",
+    "演练子进程显式解析可信 Bun（服务固定 runtime-bun→~/.bun），Node 的 process.execPath 不再用于 TS worker/face/client-cli/oracle；根 node_modules 与 plugin node_modules 改由 release 自带 frozen lockfile 安装，不再复制可变生产依赖",
+    "prepare 先建演练根再落 plan.json 并预检运行时确为 Bun；pnpm/Node 用户目录补入子进程 PATH；失败信息带步骤名与双向输出，不再只有一句『drill command failed』",
+    "演练库跨面切换常驻（不再随旧面被杀），面通道文件每阶段重建并写入演练命名空间，固定 fixture 员工每阶段先清再建；健康探测按截止时间等待且每探针独立连接",
+    "repoint 失败注入改为篡改受内容绑定覆盖的源文件（vendor 本就不在清单内），并要求恢复后绑定重新通过；报告新增实际 Bun 路径与版本",
+    "新增 Node 宿主与回归门禁：AC01 端口探测、AC02 运行时解析、AC03 依赖安装来源、AC05 端口冲突/运行时缺失/依赖缺失/重放/越权拒绝均可执行"
   ],
   "impact": [
-    "为 INT01 真实双面切换回滚补证提供受控工具（任务 c3736677 可在部署后复跑候选与回滚实测）；不绕过员工沙箱、不豁免验收、不新增付费资源",
-    "演练全程不触生产 active/插件登记/MCP 端口/真实库与凭证路径；子进程环境显式构造，生产 SURREAL_*/SCK_* 变量不继承，杜绝演练误连生产库",
-    "runId 单次有效：重放已有状态的 runId 一律冲突拒绝；发起限在办任务持有人（engineering）或 gm 并写审计"
+    "修复 v0.3.17 在生产插件 Node 宿主上的真实失败（源 22594855 v9 实测）：演练此前只能在 Bun 下成立，现可在实际发布宿主跑完整候选切换与回滚",
+    "演练仍不触生产 active/插件登记/MCP 端口/真实库与凭证；不绕过员工沙箱与验收，不新增付费资源",
+    "版本 0.3.17→0.3.18，须在现役 dc2c85e 之后受控升级；不预设后续版本号"
   ],
-  "migration": "无数据库迁移、无历史改写；新增模块、固定驱动脚本与工具注册，仅用现有表。",
-  "rollback": "保留健康 active release；用当前受审 release 的 installer 回滚至部署前现役（执行时以 active 实际 SHA 为准）：active 与插件面同时切回，RW06/SYS02/IR06/SYS06 守卫校验兼容后再切；演练根目录与旧版互不读取，无数据回滚。"
+  "migration": "无数据库迁移、无历史改写；仅改演练模块、驱动与测试，数据仍用演练根内独立库。",
+  "rollback": "保留健康 active；用当前受审 release 的 installer 回滚至升级前现役（执行时以 active 实际 SHA 为准），active 与插件面同时切回并过 RW06/SYS02/IR06/SYS06 守卫；演练根互不读取，无数据回滚。"
 }
