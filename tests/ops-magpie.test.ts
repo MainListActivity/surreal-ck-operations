@@ -193,6 +193,7 @@ describe('magpie execution-window proxy', () => {
     const reviewed = { ...out.document, pricing: { ...out.document.pricing, reviewed: true }, approvalReadiness: { ready: true, blockedReasons: [] } };
     expect(evidenceSchema.safeParse(reviewed).success).toBe(true);
     const paths = writeProof(r, v2Manifest(reviewed), reviewed);
+    const before = readdirSync(join(r.home, 'evidence', 'task-1')).sort();
     const first = await prepare(r, paths);
     const second = await prepare(r, paths);
     expect(first.eligible).toBe(true);
@@ -202,6 +203,8 @@ describe('magpie execution-window proxy', () => {
     expect(first.window.notAfter).toBe(new Date(Date.parse(reviewed.expiresAt) - MAGPIE_EXECUTION_HEADROOM_SECONDS * 1000).toISOString());
     expect(second).toEqual(first);
     expect(first.documentHash).toBe(sha256(readFileSync(paths.documentPath)));
+    // Duplicate calls are read-only: no second candidate, manifest or document is created.
+    expect(readdirSync(join(r.home, 'evidence', 'task-1')).sort()).toEqual(before);
   });
 
   test('a schema-valid but ineligible route snapshot cannot obtain a window', async () => {
