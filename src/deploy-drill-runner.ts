@@ -23,6 +23,8 @@ export interface DrillExec {
 export interface DrillHost {
   repo: string;
   forkBinary: string;
+  /** The parent service home: the pinned runtime-bun is copied from here into the drill root. */
+  serviceHome: string;
   exec: DrillExec;
   state: (plan: DrillPlan) => { status: string } | undefined;
   writeState: (plan: DrillPlan, state: { status: string; phase?: string; error?: string; runId: string }) => void;
@@ -40,11 +42,23 @@ export async function runDrill(plan: DrillPlan, host: DrillHost): Promise<{ repo
   mkdirSync(join(plan.root, 'private'), { recursive: true });
   mkdirSync(join(plan.root, 'database'), { recursive: true });
   const pids: number[] = [];
+  const stages: StageRecord[] = [];
   let phase: DrillPhase = 'prepare';
+  const writeReport = (status: 'passed' | 'failed', error?: string): string => {
+    const report = {
+      runId: plan.runId, baseSha: plan.baseSha, candidateSha: plan.candidateSha, environment: 'drill',
+      startedAt: stages[0]?.at ?? exec.nowIso(), finishedAt: exec.nowIso(), status, ...(error ? { error } : {}),
+      phases: stages.map(({ runId: _r, environment: _e, ...rest }) => rest),
+      oracleAssumption: 'older releases already contain the RB01 semantics; the oracle proves drill isolation and the faces did not misdispatch, not that the candidate introduced the behavior',
+    };
+    const path = join(plan.root, 'report.json');
+    writeFileSync(path, JSON.stringify(report, null, 2) + '\n');
+    return path;
+  };
   try {
     // prepare: archive both releases, vendor, plugin deps, content binding, target guards.
     for (const sha of [plan.baseSha, plan.candidateSha]) {
-      await drillPhase(plan, host, 'prepare', sha, async log => {
+      await drillPhase(plan, host, stages, 'prepare', sha, async log => {
         const release = join(plan.releasesRoot, sha);
         const archive = join(plan.root, `${sha}.tar`);
         await exec.run('git', ['-C', host.repo, 'archive', '--format=tar', `--output=${archive}`, sha], {}).then(assertOk);
@@ -55,6 +69,13 @@ export async function runDrill(plan: DrillPlan, host: DrillHost): Promise<{ repo
         if (existsSync(pluginDeps)) {
           mkdirSync(join(release, 'plugin', 'node_modules'), { recursive: true });
           await exec.run('cp', ['-RL', pluginDeps, join(release, 'plugin', 'node_modules')], {}).then(assertOk);
+        }
+        // The pinned service runtime rides into the drill root, so the faces run the same Bun production
+        // runs (bun-runtime.sh resolves runtime-bun under the service home before ~/.bun).
+        const pinnedRuntime = join(host.serviceHome, 'runtime-bun');
+        if (existsSync(pinnedRuntime)) {
+          await exec.run('cp', ['-RL', pinnedRuntime, join(plan.root, 'runtime-bun')], {}).then(assertOk);
+          log('pinned runtime-bun copied into the drill root');
         }
         await exec.run('sh', [join(release, 'plugin', 'scripts', 'vendor.sh')], { cwd: release }).then(assertOk);
         // Content binding + all four target guards, from the target's own scripts: the drill must prove
@@ -70,7 +91,7 @@ export async function runDrill(plan: DrillPlan, host: DrillHost): Promise<{ repo
       });
     }
     // db-up: the company fork on the drill port; rocksdb lives only under the drill root.
-    await drillPhase(plan, host, 'db-up', plan.candidateSha, async () => {
+    await drillPhase(plan, host, stages, 'db-up', plan.candidateSha, async () => {
       const env = drillDbEnv(plan);
       const pid = await exec.spawnDetached(host.forkBinary, ['start', '--bind', `127.0.0.1:${plan.dbPort}`, '--user', 'root', '--pass', env.SURREAL_ROOT_PASS, '--log', 'error', `rocksdb:${plan.dbPath}`],
         { env: {}, logFile: join(plan.logsRoot, 'fork-db.log') });
@@ -80,7 +101,7 @@ export async function runDrill(plan: DrillPlan, host: DrillHost): Promise<{ repo
     });
     // base-up / switch / rollback share one face lifecycle helper.
     const facesUp = async (sha: string, phaseName: DrillPhase) => {
-      await drillPhase(plan, host, phaseName, sha, async log => {
+      await drillPhase(plan, host, stages, phaseName, sha, async log => {
         const release = join(plan.releasesRoot, sha);
         const serviceEnv = [
           `SCK_MCP_PORT=${plan.mcpPort}`, `SCK_COMPANY_NS=${plan.namespace}`, 'SCK_COMPANY_DB=control_plane',
@@ -116,7 +137,7 @@ export async function runDrill(plan: DrillPlan, host: DrillHost): Promise<{ repo
     };
     await facesUp(plan.baseSha, 'base-up');
     // repoint-failure: the plugin face switch to a corrupted candidate source must fail and recover.
-    await drillPhase(plan, host, 'repoint-failure', plan.candidateSha, async log => {
+    await drillPhase(plan, host, stages, 'repoint-failure', plan.candidateSha, async log => {
       const release = join(plan.releasesRoot, plan.candidateSha);
       const vendor = join(release, 'plugin', 'server', 'vendor');
       const hidden = join(plan.root, 'vendor.hidden');
@@ -131,23 +152,29 @@ export async function runDrill(plan: DrillPlan, host: DrillHost): Promise<{ repo
     });
     await facesUp(plan.candidateSha, 'switch');
     // oracle: seed leftovers on the drill DB, then prove zero misdispatch / zero write with the candidate's own code.
-    await drillPhase(plan, host, 'oracle', plan.candidateSha, async log => {
+    await drillPhase(plan, host, stages, 'oracle', plan.candidateSha, async log => {
       const r = await exec.run(process.execPath, [join(plan.releasesRoot, plan.candidateSha, 'scripts', 'deploy-drill-oracle.ts'), plan.root], {}).then(assertOk);
       log(r.stdout.trim().slice(0, 500));
     });
     await facesUp(plan.baseSha, 'rollback');
-    await drillPhase(plan, host, 'cleanup', plan.baseSha, async log => {
+    await drillPhase(plan, host, stages, 'cleanup', plan.baseSha, async log => {
       for (const pid of pids) await exec.killTree(pid).catch(() => undefined);
       pids.length = 0;
       rmSync(join(plan.root, 'database'), { recursive: true, force: true });
       rmSync(plan.releasesRoot, { recursive: true, force: true });
-      log('processes stopped; releases and drill database removed; stage records kept');
+      rmSync(join(plan.root, 'runtime-bun'), { recursive: true, force: true });
+      log('processes stopped; releases, runtime and drill database removed; stage records kept');
     });
+    const reportPath = writeReport('passed');
     host.writeState(plan, { runId: plan.runId, status: 'passed' });
-    return { reportPath: join(plan.root, 'report.json') };
+    return { reportPath };
   } catch (error) {
     for (const pid of pids) await host.exec.killTree(pid).catch(() => undefined);
-    host.writeState(plan, { runId: plan.runId, status: 'failed', phase, error: String((error as Error).message ?? error).slice(0, 500) });
+    const message = String((error as Error).message ?? error).slice(0, 500);
+    // The failure report is the machine-readable handoff to the audit and the rerunning task; write it
+    // before rethrowing so a failed drill is never a bare running state without evidence.
+    writeReport('failed', message).toString();
+    host.writeState(plan, { runId: plan.runId, status: 'failed', phase, error: message });
     throw error;
   }
 }
@@ -172,7 +199,7 @@ function assertOk(r: { code: number; stderr: string }): { code: number; stdout: 
 }
 
 /** One phase = one structured stage record + one raw log, both under the drill root. */
-async function drillPhase(plan: DrillPlan, host: DrillHost, phase: DrillPhase, sha: string, body: (log: (line: string) => void) => Promise<void>): Promise<void> {
+async function drillPhase(plan: DrillPlan, host: DrillHost, stages: StageRecord[], phase: DrillPhase, sha: string, body: (log: (line: string) => void) => Promise<void>): Promise<void> {
   const started = host.exec.nowIso();
   const logFile = join(plan.logsRoot, `${phase}.log`);
   const lines: string[] = [`phase ${phase} started ${started} sha ${sha}`];
@@ -180,11 +207,11 @@ async function drillPhase(plan: DrillPlan, host: DrillHost, phase: DrillPhase, s
     await body(line => lines.push(`${new Date().toISOString()} ${line}`));
     lines.push(`phase ${phase} ok ${host.exec.nowIso()}`);
     writeFileSync(logFile, lines.join('\n') + '\n');
-    writeStage(plan, { runId: plan.runId, phase, sha, environment: 'drill', at: started, finishedAt: host.exec.nowIso(), result: 'ok', logSha256: sha256File(logFile) });
+    collectStage(plan, stages, { runId: plan.runId, phase, sha, environment: 'drill', at: started, finishedAt: host.exec.nowIso(), result: 'ok', logSha256: sha256File(logFile) });
   } catch (error) {
     lines.push(`phase ${phase} FAILED ${host.exec.nowIso()}: ${String((error as Error).message ?? error)}`);
     writeFileSync(logFile, lines.join('\n') + '\n');
-    writeStage(plan, { runId: plan.runId, phase, sha, environment: 'drill', at: started, finishedAt: host.exec.nowIso(), result: 'failed', logSha256: sha256File(logFile), error: String((error as Error).message ?? error).slice(0, 500) });
+    collectStage(plan, stages, { runId: plan.runId, phase, sha, environment: 'drill', at: started, finishedAt: host.exec.nowIso(), result: 'failed', logSha256: sha256File(logFile), error: String((error as Error).message ?? error).slice(0, 500) });
     throw error;
   }
 }
@@ -194,7 +221,8 @@ interface StageRecord {
   at: string; finishedAt: string; result: 'ok' | 'failed'; logSha256: string; error?: string;
 }
 
-function writeStage(plan: DrillPlan, record: StageRecord): void {
-  const n = readdirSync(plan.stagesRoot).length + 1;
+function collectStage(plan: DrillPlan, stages: StageRecord[], record: StageRecord): void {
+  stages.push(record);
+  const n = readdirSync(plan.stagesRoot).length;
   writeFileSync(join(plan.stagesRoot, `${String(n).padStart(2, '0')}-${record.phase}.json`), JSON.stringify(record, null, 2) + '\n');
 }

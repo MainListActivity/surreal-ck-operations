@@ -65,6 +65,7 @@ export function drillHost(serviceHome: string, repo: string): DrillHost & { ctx:
   return {
     ctx, exec, repo,
     forkBinary: join(homedir(), '.surrealdb', 'surreal'),
+    serviceHome,
     state: plan => readState(plan.root),
     writeState: (plan, state) => writeFileSync(join(plan.root, 'state.json'), JSON.stringify(state, null, 2) + '\n', { mode: 0o600 }),
   };
@@ -94,11 +95,3 @@ export const readDrillStatus = (serviceHome: string, runId: string): { state?: D
   try { stages = readdirSync(join(root, 'stages')).sort(); } catch {}
   return { state, stages };
 };
-
-if (import.meta.main) {
-  const repo = process.env.SCK_DRILL_REPO ?? '/Users/y/IdeaProjects/surreal-ck-operations';
-  const serviceHome = process.env.SCK_DRILL_HOME ?? join(homedir(), 'Library', 'Application Support', 'SurrealCKCompany');
-  const runId = process.argv[2];
-  if (!runId) { console.error('usage: deploy-drill-run.ts <runId>'); process.exit(2); }
-  await runDrillDetached(serviceHome, repo, runId);
-}
