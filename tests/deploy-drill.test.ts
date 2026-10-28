@@ -55,3 +55,24 @@ test('drill plan rejects when the whole dedicated port range is busy', async () 
   const ctx = baseCtx({ portFree: async () => false });
   await expect(validateDrillPlan({ runId: UUID, baseSha: BASE, candidateSha: CANDIDATE }, ctx)).rejects.toMatchObject({ code: 'temporarily_unavailable' });
 });
+
+/** AC05: no caller input can name a production path, port or namespace — every target comes from the runId. */
+test('drill plan cannot express a production target', async () => {
+  const plan = await validateDrillPlan({ runId: UUID, baseSha: BASE, candidateSha: CANDIDATE }, baseCtx());
+  // Every path is constructed under the drill root and nothing else; the caller supplied only the runId.
+  for (const path of [plan.root, plan.releasesRoot, plan.logsRoot, plan.stagesRoot, plan.dbPath]) {
+    expect(path.startsWith(`${'/fixture/service-home'}/drills/${UUID}`)).toBe(true);
+  }
+  // Ports are inside the drill range and distinct from the production MCP/DB ports.
+  for (const port of [Number(plan.mcpPort), Number(plan.dbPort)]) {
+    expect(port).toBeGreaterThanOrEqual(DRILL_PORT_MIN);
+    expect(port).toBeLessThanOrEqual(DRILL_PORT_MAX);
+  }
+  // The namespace is derived and prefixed, so a drill cannot land in the production company namespace.
+  expect(plan.namespace.startsWith('sck_drill_')).toBe(true);
+  expect(plan.namespace).not.toBe('sck_agent_company');
+  // A runId shaped like a path or an absolute target is refused before any path is built.
+  for (const bad of ['/Users/y/IdeaProjects/surreal-ck-operations', '../../releases', `${UUID}/../../x`]) {
+    await expect(validateDrillPlan({ runId: bad, baseSha: BASE, candidateSha: CANDIDATE }, baseCtx())).rejects.toMatchObject({ code: 'invalid' });
+  }
+});

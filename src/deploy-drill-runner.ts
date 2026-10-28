@@ -272,7 +272,9 @@ function assertOk(r: { code: number; stdout: string; stderr: string }, what = 'c
 /** One phase = one structured stage record + one raw log, both under the drill root. */
 async function drillPhase(plan: DrillPlan, host: DrillHost, stages: StageRecord[], phase: DrillPhase, sha: string, body: (log: (line: string) => void) => Promise<void>): Promise<void> {
   const started = host.exec.nowIso();
-  const logFile = join(plan.logsRoot, `${phase}.log`);
+  // prepare runs once per release: one log per phase would overwrite the base run with the candidate
+  // one and leave the first stage record pointing at a file it no longer hashes to.
+  const logFile = join(plan.logsRoot, `${phase}${phase === 'prepare' ? `-${sha.slice(0, 8)}` : ''}.log`);
   const lines: string[] = [`phase ${phase} started ${started} sha ${sha}`];
   try {
     await body(line => lines.push(`${new Date().toISOString()} ${line}`));

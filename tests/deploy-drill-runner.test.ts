@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readFileSync as rf, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runDrill, type DrillExec, type DrillHost } from '../src/deploy-drill-runner.ts';
@@ -207,6 +208,28 @@ test('drill stops at prepare when a release dependency install fails', async () 
     expect(report.status).toBe('failed');
     expect(report.phases.at(-1)?.phase).toBe('prepare');
     expect(calls.some(c => c.startsWith('spawn '))).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/** AC04: every stage record must hash to the log file it names — two prepare runs share a phase name. */
+test('drill stage records keep a distinct, verifiable log hash per prepare run', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'drill-runner-logs-'));
+  try {
+    writeFileSync(join(root, 'face-channel.json'), JSON.stringify({ SCK_COMM_DIR: join(root, 'comm'), SCK_COMM_KEY: 'k' }));
+    const { exec } = stubExec();
+    const states: unknown[] = [];
+    const { reportPath } = await runDrill(plan(root), host(exec, join(root, 'service-home'), states));
+    const report = JSON.parse(readFileSync(reportPath, 'utf8'));
+    const prepare = report.phases.filter((p: { phase: string }) => p.phase === 'prepare');
+    expect(prepare.length).toBe(2);
+    // Distinct SHAs → distinct log files → distinct hashes; the same file overwritten fails this.
+    expect(prepare[0].logSha256).not.toBe(prepare[1].logSha256);
+    for (const phase of report.phases) {
+      const file = readFileSync(join(root, 'logs', `${phase.phase}${phase.phase === 'prepare' ? `-${phase.sha.slice(0, 8)}` : ''}.log`));
+      expect(createHash('sha256').update(file).digest('hex')).toBe(phase.logSha256);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
