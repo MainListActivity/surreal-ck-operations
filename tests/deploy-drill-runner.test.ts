@@ -62,7 +62,8 @@ const stubExec = (failOn?: string): { exec: DrillExec; calls: string[]; killed: 
         }
         const stdout = line.includes('client-cli.ts')
           ? JSON.stringify({ principal: 'drill-fixture-eng', tasks: [] })
-          : `DRILL_ORACLE_OK ${JSON.stringify({ leftoverDigestUnchanged: true })}`;
+          // Long enough to exceed the old 500-character slice, like the real summary plus its auth-timing lines.
+          : `DRILL_ORACLE_OK ${JSON.stringify({ leftoverTask: '90bc6a0d-dc28-498d-bc42-e26123737c8b', leftoverRefusal: 'conflict', leftoverDigestUnchanged: true, positiveControl: { taskId: 'e272a58b-bcea-44c4-80a4-07b725a3aaaa', claimed: true, deliveryId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' }, policyEpochPresent: true, authTiming: 'query=1ms digest=0ms total=1ms concurrentAtStart=1 queryOk=true '.repeat(6) })}`;
         return { code: 0, stdout, stderr: '' };
       },
       // The real face driver writes the channel file after it starts; the runner deletes the previous
@@ -233,6 +234,25 @@ test('drill stage records keep a distinct, verifiable log hash per prepare run',
       const file = readFileSync(join(root, 'logs', `${phase.phase}${phase.phase === 'prepare' ? `-${phase.sha.slice(0, 8)}` : ''}.log`));
       expect(createHash('sha256').update(file).digest('hex')).toBe(phase.logSha256);
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/** AC04: the oracle summary must be recorded whole — truncation cut the positive control's deliveryId off. */
+test('drill runner records the complete oracle summary', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'drill-runner-oracle-'));
+  try {
+    writeFileSync(join(root, 'face-channel.json'), JSON.stringify({ SCK_COMM_DIR: join(root, 'comm'), SCK_COMM_KEY: 'k' }));
+    const { exec } = stubExec();
+    const states: unknown[] = [];
+    await runDrill(plan(root), host(exec, join(root, 'service-home'), states));
+    const oracle = readFileSync(join(root, 'logs', 'oracle.log'), 'utf8');
+    const line = oracle.split('\n').find(l => l.includes('DRILL_ORACLE_OK'));
+    expect(line).toBeDefined();
+    // The recorded summary parses back as JSON: a truncated slice would throw here.
+    const summary = JSON.parse(line!.slice(line!.indexOf('{')));
+    expect(summary.leftoverDigestUnchanged).toBe(true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

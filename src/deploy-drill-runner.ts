@@ -207,7 +207,9 @@ export async function runDrill(plan: DrillPlan, host: DrillHost): Promise<{ repo
     // oracle: seed leftovers on the drill DB, then prove zero misdispatch / zero write with the candidate's own code.
     await drillPhase(plan, host, stages, 'oracle', plan.candidateSha, async log => {
       const r = await exec.run(host.bun, [join(plan.releasesRoot, plan.candidateSha, 'scripts', 'deploy-drill-oracle.ts'), plan.root], {}).then(assertOk);
-      log(r.stdout.trim().slice(0, 500));
+      // Keep the whole summary: truncating it cut the positive control's deliveryId off mid-string, so the
+      // recorded evidence could not be parsed back — and the positive control is the point of the oracle.
+      log(r.stdout.trim());
     });
     await facesUp(plan.baseSha, 'rollback');
     await drillPhase(plan, host, stages, 'cleanup', plan.baseSha, async log => {
