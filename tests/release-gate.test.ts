@@ -22,12 +22,17 @@ function fakeBun(path: string, version: string, label: string) {
 }
 
 // The files the sidecar-review gate runs (scripts/release-gate.sh): the sidecar regression, the deployment-source
-// association, and the SYS06 effective-policy contract that needs the company fork database.
+// association, the SYS06 effective-policy contract that needs the company fork database, and the deploy-drill
+// suite (SYS-INT AC05: the Node-host drill probes and the drill's authorization guards run nowhere in hosted CI).
 const SIDECAR_REVIEW_FILES = [
   'tests/dispatcher-sidecar.fork.test.ts',
   'tests/deployment-source.test.ts',
   'tests/deployment-source.fork.test.ts',
   'tests/effective-policy.fork.test.ts',
+  'tests/deploy-drill.test.ts',
+  'tests/deploy-drill-runner.test.ts',
+  'tests/deploy-drill-node-host.test.ts',
+  'tests/deploy-drill-access.fork.test.ts',
 ];
 
 // A stand-in Bun that writes the arguments it was handed, one per line, so the shape of the call is visible: a quoted
@@ -245,14 +250,19 @@ test.skipIf(!existsSync('/usr/bin/python3'))('a sidecar-review gate run records 
     writeFileSync(join(release, 'tests', 'deployment-source.fork.test.ts'), '');
     // SYS06: the effective-policy contract regression rides the same gate; it needs the company fork database.
     writeFileSync(join(release, 'tests', 'effective-policy.fork.test.ts'), '');
+    // SYS-INT: the deploy-drill suite rides the gate too (Node-host probes + drill authorization guards).
+    for (const drillTest of SIDECAR_REVIEW_FILES.filter(f => f.includes('deploy-drill'))) {
+      writeFileSync(join(release, drillTest), '');
+    }
     const pinned = join(home, 'runtime-bun', 'bin', 'bun');
-    writeFileSync(pinned, '#!/bin/sh\n[ "$1" = --version ] && { echo 1.4.2; exit 0; }\necho "sidecar stand-in, fork=${RUN_SCK_CHANNEL_FORK_TESTS:-0}"\nexit "${FAKE_TEST_RC:-0}"\n');
+    writeFileSync(pinned, '#!/bin/sh\n[ "$1" = --version ] && { echo 1.4.2; exit 0; }\necho "sidecar stand-in, fork=${RUN_SCK_CHANNEL_FORK_TESTS:-0} drill=${RUN_SCK_DRILL_ACCESS_TESTS:-0}"\nexit "${FAKE_TEST_RC:-0}"\n');
     chmodSync(pinned, 0o755);
     const run = sh(GATE, ['sidecar-review', release], home);
     expect(run.code).toBe(0);
     const record = JSON.parse(readFileSync(join(home, 'gates', 'sidecar-review', `${SHA}.json`), 'utf8'));
     expect(record).toMatchObject({ gate: 'sidecar-review', sha: SHA, bun: PINNED, platform: 'darwin', result: 'pass', exitCode: 0 });
-    expect(readFileSync(join(home, 'gates', 'sidecar-review', `${SHA}.log`), 'utf8')).toContain('fork=1');
+    // Both opt-ins reach the real test process: the fork suite and the drill access half.
+    expect(readFileSync(join(home, 'gates', 'sidecar-review', `${SHA}.log`), 'utf8')).toContain('fork=1 drill=1');
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -417,6 +427,50 @@ test.skipIf(!existsSync('/usr/bin/python3'))('the sidecar-review gate hands bun 
     expect(argv).toEqual(['test', ...SIDECAR_REVIEW_FILES]);
     // The defect's signature: one argument carrying the whole list instead of three paths.
     expect(argv.filter(arg => arg.includes(' '))).toEqual([]);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// The drill suite has to be *run*, not just named: a gate that lists the files but hands bun nothing would record a
+// pass for tests that never executed. This asserts the real drill files reach bun's argv and that the drill's own
+// opt-in reaches the process environment.
+test.skipIf(!existsSync('/usr/bin/python3'))('the sidecar-review gate executes the drill suite with its opt-ins', () => {
+  const home = serviceHome();
+  try {
+    const release = join(home, 'releases', SHA);
+    mkdirSync(join(release, 'tests'), { recursive: true });
+    for (const file of SIDECAR_REVIEW_FILES) writeFileSync(join(release, file), '');
+    const argvFile = join(home, 'argv.txt');
+    recordingBun(join(home, 'runtime-bun', 'bin', 'bun'), argvFile);
+    expect(sh(GATE, ['sidecar-review', release], home).code).toBe(0);
+    const argv = readFileSync(argvFile, 'utf8').split('\n').filter(Boolean);
+    // Every drill test this task added is one of bun's filters...
+    for (const drillTest of ['tests/deploy-drill.test.ts', 'tests/deploy-drill-runner.test.ts', 'tests/deploy-drill-node-host.test.ts', 'tests/deploy-drill-access.fork.test.ts']) {
+      expect(argv).toContain(drillTest);
+    }
+    // ...and the gate stopped with a pass only because bun ran them.
+    expect(readFileSync(join(home, 'gates', 'sidecar-review', `${SHA}.json`), 'utf8')).toContain('"result": "pass"');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// A listed file that is not in the release must refuse the gate. Bun exits 0 when a filter matches no file, so without
+// this check a release that dropped a drill test would silently "pass" a gate that never ran it.
+test.skipIf(!existsSync('/usr/bin/python3'))('the sidecar-review gate refuses a release missing any drill test it names', () => {
+  const home = serviceHome();
+  try {
+    const release = join(home, 'releases', SHA);
+    mkdirSync(join(release, 'tests'), { recursive: true });
+    for (const file of SIDECAR_REVIEW_FILES) writeFileSync(join(release, file), '');
+    for (const drillTest of ['tests/deploy-drill.test.ts', 'tests/deploy-drill-runner.test.ts', 'tests/deploy-drill-node-host.test.ts']) {
+      rmSync(join(release, drillTest), { force: true });
+      const run = sh(GATE, ['sidecar-review', release], home);
+      expect(run.code).toBe(2);
+      expect(run.err).toContain(`the release has no ${drillTest}`);
+      writeFileSync(join(release, drillTest), '');
+    }
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

@@ -622,10 +622,14 @@ export class SurrealCompanyCore implements CompanyCore {
   private readonly contributionReadHook?: (taskId: string) => Promise<void>;
 private readonly independenceReadHook?: (taskId: string) => Promise<void>;
   private readonly companyReleaseRepo?:string;
+  private readonly drillLaunch?: (home: string, repo: string, plan: { runId: string; root: string }) => number;
   constructor(readonly database: CompanyDatabase, options?: { companyReleaseRepo?:string; leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter };
     externalActions?: { gateway?: ExternalActionGateway }; faults?: { limits?: FaultBudgetLimits; clock?: () => number };
-    waits?: { clock?: () => number; webhookSecret?: string } }) {
+    waits?: { clock?: () => number; webhookSecret?: string };
+    /** Test seam only: replaces the detached drill launch so a gate can assert the guards without a real run. */
+    drillLaunch?: (home: string, repo: string, plan: { runId: string; root: string }) => number }) {
     this.companyReleaseRepo=options?.companyReleaseRepo;
+    this.drillLaunch = options?.drillLaunch;
     this.submitCheck = options?.submitCheck;
     this.acceptanceAdapter = options?.acceptance?.adapter ?? createGithubActionsAdapter();
     // Same seam as the acceptance adapter: the controlled external exit is injectable so a test drives an isolated fake
@@ -2504,7 +2508,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const plan = await validateDrillPlan(input, host.ctx);
     await this.db.query('CREATE audit CONTENT {task:$task,actor:$actor,action:"deploy_drill_run",evidence:$evidence,at:time::now()};',
       { task: input.taskId, actor: actor.employeeId, evidence: `runId ${input.runId} base ${input.baseSha} candidate ${input.candidateSha} root ${plan.root}` });
-    const pid = startDrill(home, repo, plan);
+    const pid = (this.drillLaunch ?? startDrill)(home, repo, plan);
     return { runId: input.runId, pid, root: plan.root };
   }
 
