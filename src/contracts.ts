@@ -143,7 +143,13 @@ export interface AcceptanceMappingPreviewView {
   /** The criteria the task carries today (empty for a legacy row). */
   currentCriteria: AcceptanceCriterion[];
   /** The registry bundle that would apply, with the digest an import must echo; undefined when the leg is unsupported. */
-  proposal?: { key: string; leg: AcceptanceLeg; version: number; digest: string; description: string; criteria: AcceptanceCriterion[] };
+  proposal?: {
+    key: string; leg: AcceptanceLeg; version: number; digest: string; description: string; criteria: AcceptanceCriterion[];
+    /** Who this bundle may attach to; a target outside it is refused instead of silently fitted. */
+    appliesTo?: { leg?: string; executorRole?: string; goalId?: string };
+    /** Traceability: every required item, the SYS packages it covers and the evidence class behind it. */
+    coverage?: Array<{ criteriaId: string; item: string; sys: string[]; machineSource: string; humanSignoff: string }>;
+  };
   /** Per-SYS required mapping: machine source, human sign-off, RB01 coverage. */
   sysRequired: SysRequiredMappingView[];
   /** Empty when an import would be accepted right now; otherwise machine-readable refusal reasons. */

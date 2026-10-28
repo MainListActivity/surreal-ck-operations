@@ -16,7 +16,8 @@ import { CompanyDatabase } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import {
-  ACCEPTANCE_MAPPING_BUNDLES, ACCEPTANCE_MAPPING_KEY, INT_CRITERIA, mappingBundle, mappingDigest,
+  ACCEPTANCE_MAPPING_BUNDLES, ACCEPTANCE_MAPPING_KEY, ACCEPTANCE_MAPPING_SOURCE_KEY, SOURCE_CRITERIA, SYS_INT_GOAL_ID,
+  SYS_REQUIRED_MAPPING, TOOL_CRITERIA, mappingBundle, mappingDigest,
 } from '../src/acceptance-mapping.ts';
 import { validateAcceptanceCriteria } from '../src/acceptance.ts';
 import type { TaskView } from '../src/contracts.ts';
@@ -46,6 +47,16 @@ const releaseKindTask = async (title: string): Promise<string> => {
     created_at: time::now() };`, { task: new RecordId('task', id), title });
   return id;
 };
+const freshLegacyRow = async (title: string, version = 2, over: { executorRole?: string; goalId?: string } = {}): Promise<string> => {
+  const id = randomUUID();
+  await database.db.query(`CREATE ONLY $task CONTENT { title: $title, context: 'SYS-INT 夹具', state: 'ready',
+    kind: 'task', executor_role: $executor_role, reviewer_role: 'engineering', dependencies: [], version: $version,
+    fence: 0, acceptance_legacy: true, acceptance_attempt: 0, created_at: time::now()
+    ${over.goalId ? ', goal: $goal' : ''} };`,
+    { task: new RecordId('task', id), title, version, executor_role: over.executorRole ?? 'engineering',
+      ...(over.goalId ? { goal: new RecordId('goal', over.goalId) } : {}) });
+  return id;
+};
 
 beforeAll(async () => {
   await database.connect();
@@ -62,17 +73,19 @@ afterAll(async () => { await database.close(); rmSync(credDir, { recursive: true
 beforeEach(async () => { await database.db.query('UPDATE employee SET active_task = NONE;'); });
 
 fork('SYS-INT registry: honest classification and stable digests', () => {
-  test('every bundle validates and carries the real CI baseline verbatim', () => {
-    for (const candidate of ACCEPTANCE_MAPPING_BUNDLES) {
-      expect(validateAcceptanceCriteria(candidate.criteria).length).toBe(candidate.criteria.length);
-      const baseline = validateAcceptanceCriteria([{ id: 'AC-BASE-IMPL-1', kind: 'machine', required: true, layer: 'ci', evidence: 'ci-run', verify: 'ci', risk: 'code' }]);
-      expect(candidate.criteria.some(item => item.id === baseline[0]!.id && item.kind === 'machine' && item.evidence === 'ci-run')).toBe(true);
-    }
+  test('the tool bundle carries the real CI baseline verbatim; the source bundle borrows no other leg', () => {
+    const tool = mappingBundle(ACCEPTANCE_MAPPING_KEY)!;
+    expect(validateAcceptanceCriteria(tool.criteria).length).toBe(tool.criteria.length);
+    const baseline = validateAcceptanceCriteria([{ id: 'AC-BASE-IMPL-1', kind: 'machine', required: true, layer: 'ci', evidence: 'ci-run', verify: 'ci', risk: 'code' }]);
+    expect(tool.criteria.some(item => item.id === baseline[0]!.id && item.kind === 'machine' && item.evidence === 'ci-run')).toBe(true);
+    const source = mappingBundle(ACCEPTANCE_MAPPING_SOURCE_KEY)!;
+    expect(source.criteria.some(item => item.id.startsWith('AC-BASE-'))).toBe(false);
+    expect(source.criteria.every(item => item.kind === 'human')).toBe(true);
   });
 
   test('the INT supplement is human sign-off only; prose never pretends to be machine-verified', () => {
-    expect(INT_CRITERIA.length).toBe(8);
-    for (const criterion of INT_CRITERIA) {
+    expect(TOOL_CRITERIA.length).toBe(8);
+    for (const criterion of TOOL_CRITERIA) {
       expect(criterion.kind).toBe('human');
       expect(criterion.evidence).toBe('review-signoff');
       expect(criterion.verify).toBe('independent-review');
@@ -82,11 +95,37 @@ fork('SYS-INT registry: honest classification and stable digests', () => {
     expect(bundle.criteria.filter(item => item.kind === 'machine').every(item => item.id.startsWith('AC-BASE-'))).toBe(true);
   });
 
-  test('the digest binds key, version and criteria; a registry change invalidates previews', () => {
+  test('the source bundle states the business INT01–08 plus per-SYS01–07 and the audited RB01 contract, all required', () => {
+    expect(SOURCE_CRITERIA.length).toBe(16);
+    for (const criterion of SOURCE_CRITERIA) {
+      expect(criterion.kind).toBe('human');
+      expect(criterion.required).toBe(true);
+      expect(criterion.verify).toBe('qa-production');
+    }
+    const ids = SOURCE_CRITERIA.map(item => item.id);
+    for (let n = 1; n <= 8; n++) expect(ids).toContain(`AC-SRC-INT-${n}`);
+    for (const sys of ['SYS01', 'SYS02', 'SYS03', 'SYS04', 'SYS05', 'SYS06', 'SYS07', 'RB01']) expect(ids).toContain(`AC-SRC-${sys}`);
+    const source = mappingBundle(ACCEPTANCE_MAPPING_SOURCE_KEY)!;
+    expect(source.appliesTo).toMatchObject({ goalId: SYS_INT_GOAL_ID, executorRole: 'qa' });
+    expect(source.coverage!.length).toBe(16);
+    expect(source.coverage!.find(entry => entry.criteriaId === 'AC-SRC-INT-1')!.sys).toContain('DEPLOY');
+    expect(source.coverage!.find(entry => entry.criteriaId === 'AC-SRC-RB01')!.sys).toHaveLength(7);
+  });
+
+  test('the per-SYS required mapping is complete over SYS01–07, has SYS03 and keeps the SYS06 RB01 coverage', () => {
+    const systems = SYS_REQUIRED_MAPPING.map(item => item.sys);
+    for (const sys of ['SYS01', 'SYS02', 'SYS03', 'SYS04', 'SYS05', 'SYS06', 'SYS07']) expect(systems).toContain(sys);
+    expect(SYS_REQUIRED_MAPPING.find(item => item.sys === 'SYS06')!.rb01).toBe(true);
+    expect(SYS_REQUIRED_MAPPING.find(item => item.sys === 'SYS03')!.rb01).toBe(true);
+  });
+
+  test('the digest binds key, version, audience and criteria; a registry change invalidates previews', () => {
     const bundle = mappingBundle(ACCEPTANCE_MAPPING_KEY)!;
     expect(mappingDigest(bundle)).toMatch(/^[0-9a-f]{64}$/);
     expect(mappingDigest(bundle)).toBe(mappingDigest(mappingBundle(ACCEPTANCE_MAPPING_KEY)!));
     expect(mappingDigest({ ...bundle, version: bundle.version + 1 })).not.toBe(mappingDigest(bundle));
+    expect(mappingDigest({ ...bundle, appliesTo: { ...bundle.appliesTo!, executorRole: 'qa' } })).not.toBe(mappingDigest(bundle));
+    expect(mappingDigest(mappingBundle(ACCEPTANCE_MAPPING_SOURCE_KEY)!)).not.toBe(mappingDigest(bundle));
   });
 });
 
@@ -99,14 +138,6 @@ fork('SYS-INT import: preview is a zero-write dry-run and the import is gm-only,
     expectedVersion: over.expectedVersion ?? versionAtPreview,
     reason: over.reason ?? 'SYS-INT：legacy 行按受审映射升级到版本化 criteria', idempotencyKey: over.idempotencyKey ?? key(),
   });
-  const freshLegacyRow = async (title: string, version = 2): Promise<string> => {
-    const id = randomUUID();
-    await database.db.query(`CREATE ONLY $task CONTENT { title: $title, context: 'SYS-INT 夹具', state: 'ready',
-      kind: 'task', executor_role: 'engineering', reviewer_role: 'engineering', dependencies: [], version: $version,
-      fence: 0, acceptance_legacy: true, acceptance_attempt: 0, created_at: time::now() };`,
-      { task: new RecordId('task', id), title, version });
-    return id;
-  };
 
   beforeAll(async () => {
     const gate = await core.acceptanceGate(tokens.gm);
@@ -144,7 +175,7 @@ fork('SYS-INT import: preview is a zero-write dry-run and the import is gm-only,
     const imported: TaskView = await core.acceptanceMappingImport(tokens.gm, importInput({ idempotencyKey: 'sys-int-import-e7d08f27' }));
     const row = await taskRow(taskId);
     expect(row!.acceptance_legacy).toBe(false);
-    expect((row!.acceptance_criteria as Array<{ id: string }>).map(item => item.id)).toContain('AC-INT-8');
+    expect((row!.acceptance_criteria as Array<{ id: string }>).map(item => item.id)).toContain('AC-MAP-8');
     expect(row!.version).toBe(versionAtPreview + 1);
     expect(imported.version).toBe(versionAtPreview + 1);
     expect((await auditRows(taskId)).some(entry => entry.action === 'acceptance_mapping_imported')).toBe(true);
@@ -154,12 +185,12 @@ fork('SYS-INT import: preview is a zero-write dry-run and the import is gm-only,
       .rejects.toMatchObject({ code: 'invalid' });
     const status = await core.acceptanceStatus(tokens.eng, { taskId });
     expect(status.verdict.legacy).toBe(false);
-    expect(status.verdict.criteria.map(item => item.id)).toContain('AC-INT-1');
+    expect(status.verdict.criteria.map(item => item.id)).toContain('AC-MAP-1');
     expect(status.verdict.ok).toBe(false);
     const unmet = new Set(status.verdict.unmet.map(item => item.acId));
     // Submit phase judges the machine criteria; the human sign-offs become unmet at the independent review.
     expect(unmet.has('AC-BASE-IMPL-1')).toBe(true);
-    const intCriterion = status.verdict.criteria.find(item => item.id === 'AC-INT-1');
+    const intCriterion = status.verdict.criteria.find(item => item.id === 'AC-MAP-1');
     expect(intCriterion).toMatchObject({ kind: 'human', required: true, verify: 'independent-review' });
   });
 
@@ -213,5 +244,70 @@ fork('SYS-INT import: preview is a zero-write dry-run and the import is gm-only,
     await expect(core.acceptanceMappingImport(tokens.gm, importInput({ taskId: downId, expectedVersion: 2, reason: '删除 required 项的导入必须被拒绝' })))
       .rejects.toMatchObject({ code: 'invalid' });
     expect(((await taskRow(downId))!.version as number)).toBe(2);
+  });
+});
+
+fork('SYS-INT source bundle: audience-bound business QA contract for the SYS-INT goal', () => {
+  let qaTaskId = '';
+  let sourceDigest = '';
+  let qaVersionAtPreview = 0;
+  const sourceInput = (over: Partial<{ taskId: string; expectedVersion: number; digest: string; idempotencyKey: string; mappingKey: string; reason: string }> = {}) => ({
+    taskId: over.taskId ?? qaTaskId, mappingKey: over.mappingKey ?? ACCEPTANCE_MAPPING_SOURCE_KEY,
+    digest: over.digest ?? sourceDigest, expectedVersion: over.expectedVersion ?? qaVersionAtPreview,
+    reason: over.reason ?? 'SYS-INT：源 QA 行按受审业务契约升级到版本化 criteria', idempotencyKey: over.idempotencyKey ?? key(),
+  });
+
+  beforeAll(async () => {
+    qaTaskId = await freshLegacyRow('SYS-INT 源 QA 行', 2, { executorRole: 'qa', goalId: SYS_INT_GOAL_ID });
+    const preview = await core.acceptanceMappingPreview(tokens.gm, { taskId: qaTaskId });
+    expect(preview.proposal!.key).toBe(ACCEPTANCE_MAPPING_SOURCE_KEY);
+    expect(preview.conflicts).toEqual([]);
+    sourceDigest = preview.proposal!.digest;
+    qaVersionAtPreview = (await taskRow(qaTaskId))!.version as number;
+  });
+
+  test('the preview shows the business contract with traceable coverage and no borrowed machine baseline', async () => {
+    const preview = await core.acceptanceMappingPreview(tokens.qa, { taskId: qaTaskId });
+    expect(preview.proposal!.criteria.every(item => item.kind === 'human' && item.required)).toBe(true);
+    expect(preview.proposal!.coverage!.length).toBe(16);
+    expect(preview.proposal!.coverage!.find(entry => entry.criteriaId === 'AC-SRC-INT-7')!.sys).toEqual(['SYS02', 'SYS03']);
+    expect(preview.sysRequired.map(item => item.sys)).toContain('SYS03');
+    expect(preview.proposal!.appliesTo).toMatchObject({ goalId: SYS_INT_GOAL_ID, executorRole: 'qa' });
+  });
+
+  test('a wrong bundle for a mismatched source task is refused before anything else', async () => {
+    await expect(core.acceptanceMappingImport(tokens.gm, sourceInput({ mappingKey: ACCEPTANCE_MAPPING_KEY })))
+      .rejects.toMatchObject({ code: 'invalid' });
+    const engRow = await freshLegacyRow('工程行误用源 bundle', 2);
+    await expect(core.acceptanceMappingImport(tokens.gm, sourceInput({ taskId: engRow })))
+      .rejects.toMatchObject({ code: 'invalid' });
+    const otherGoal = await freshLegacyRow('别的目标的 QA 行', 2, { executorRole: 'qa', goalId: 'not-the-sys-int-goal' });
+    const foreign = await core.acceptanceMappingPreview(tokens.gm, { taskId: otherGoal });
+    expect(foreign.conflicts).toContain('unsupported-leg');
+    await expect(core.acceptanceMappingImport(tokens.gm, sourceInput({ taskId: otherGoal })))
+      .rejects.toMatchObject({ code: 'invalid' });
+  });
+
+  test('executor and qa cannot self-import; gm imports once under CAS, audited and idempotent', async () => {
+    await expect(core.acceptanceMappingImport(tokens.eng, sourceInput())).rejects.toMatchObject({ code: 'forbidden' });
+    await expect(core.acceptanceMappingImport(tokens.qa, sourceInput())).rejects.toMatchObject({ code: 'forbidden' });
+    await expect(core.acceptanceMappingImport(tokens.judge, sourceInput())).rejects.toMatchObject({ code: 'forbidden' });
+    const imported: TaskView = await core.acceptanceMappingImport(tokens.gm, sourceInput({ idempotencyKey: 'sys-int-source-import' }));
+    const row = await taskRow(qaTaskId);
+    expect(row!.acceptance_legacy).toBe(false);
+    const ids = (row!.acceptance_criteria as Array<{ id: string }>).map(item => item.id);
+    expect(ids).toContain('AC-SRC-INT-1');
+    expect(ids).toContain('AC-SRC-SYS03');
+    expect(ids).toContain('AC-SRC-RB01');
+    expect(row!.version).toBe(qaVersionAtPreview + 1);
+    expect(imported.version).toBe(qaVersionAtPreview + 1);
+    expect((await auditRows(qaTaskId)).some(entry => entry.action === 'acceptance_mapping_imported')).toBe(true);
+    const replay = await core.acceptanceMappingImport(tokens.gm, sourceInput({ idempotencyKey: 'sys-int-source-import' }));
+    expect(replay.version).toBe(qaVersionAtPreview + 1);
+    await expect(core.acceptanceMappingImport(tokens.gm, sourceInput({ expectedVersion: qaVersionAtPreview + 1, reason: '业务契约不得二次覆盖' })))
+      .rejects.toMatchObject({ code: 'invalid' });
+    const status = await core.acceptanceStatus(tokens.qa, { taskId: qaTaskId });
+    expect(status.verdict.legacy).toBe(false);
+    expect(status.verdict.criteria.map(item => item.id)).toContain('AC-SRC-INT-8');
   });
 });
