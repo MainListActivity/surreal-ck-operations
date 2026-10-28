@@ -1,3 +1,4 @@
+import {UrgencyTracker} from './urgency.ts';
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync } from "node:fs";
@@ -92,6 +93,7 @@ export class ModelRoutingController {
   private catalog: CatalogModel[] = [];
   private updated = 0;
   private sessionsChecked = 0;
+  private readonly urgencyTracker: UrgencyTracker;
   private readonly gaugeHistory: GaugeHistory;
   private pending?: Promise<void>;
   constructor(
@@ -112,6 +114,7 @@ export class ModelRoutingController {
       now?: () => number;
     } = {},
   ) {
+    this.urgencyTracker=new UrgencyTracker(join(home,"model-routing","urgency.json"));
     this.gaugeHistory = new GaugeHistory(join(home,"model-routing","trend-gauges.json"));
     try {
       this.enabled =
@@ -212,11 +215,28 @@ export class ModelRoutingController {
     return {synchronized};
   }
 
+  /** Refresh only expiring remote cards; normal remote quota reads may be old cache entries. */
+  private async rankingQuota(now:number){
+    const rows=JSON.parse(await this.output(["quota","--json"])) as Parameters<typeof quotaAccounts>[0];
+    const near=(t?:string)=>!!t&&Date.parse(t)>now&&Date.parse(t)<=now+24*3600_000;
+    const providers=[...new Set(rows.filter(q=>q.provider.startsWith('remote-magpie/')&&(!q.readAt||Date.parse(q.readAt)<now-30_000)&&
+      (q.renew==='off'&&near(q.until)||(q.windows??[]).some(w=>near(w.runsOutAt)||(/^(weekly|monthly|month|daily|7 days|30 days|1 day)$/i.test(w.name??'')||/trial|试用/i.test(w.name??''))&&near(w.resetsAt)))).map(q=>q.provider))];
+    for(let i=0;i<providers.length;i+=3)await Promise.all(providers.slice(i,i+3).map(async provider=>{
+      try{
+        const fresh=JSON.parse(await this.output(['quota','refresh',provider,'--json'])) as typeof rows;
+        if(!Array.isArray(fresh))return;
+        const own=fresh.filter(q=>q.provider===provider);if(!own.length)return;
+        for(let n=rows.length-1;n>=0;n--)if(rows[n]!.provider===provider)rows.splice(n,1);
+        rows.push(...own);
+      }catch{/* Old readings retain their timestamp; stale cards never qualify for urgency. */}
+    }));
+    return quotaAccounts(rows,now);
+  }
   /** Jev's input for one group: accounts and quota, AA rank and price, 7-day usage, task performance. */
   async rankingFacts(ids: string[]): Promise<ModelFacts[]> {
     const now = this.io.now?.() ?? Date.now();
     const [quota, usage, results, observations, health] = await Promise.all([
-      this.output(["quota", "--json"]).then((t) => quotaAccounts(JSON.parse(t))).catch(() => new Map()),
+      this.rankingQuota(now).catch(() => new Map()),
       (async () => {
         const response = await (this.io.fetch ?? fetch)("http://127.0.0.1:3425/v1/magpie/usage?period=7d", {
           cache: "no-store", headers: { "cache-control": "no-cache" }, signal: AbortSignal.timeout(15000),
@@ -263,7 +283,10 @@ export class ModelRoutingController {
       if(h)f.health=h;
       f.trendSource={source:"magpie-usage.jsonl",available:!!observations,invalidLines:observations?.invalid??0,collectedAt:new Date(now).toISOString()};
     }
-    return facts;
+    if(!observations)return facts; // No usage evidence: never start an unbounded urgent experiment.
+    return this.urgencyTracker.update(facts,observations.largeRequests??[],this.io.now?.()??Date.now()).catch(()=>{
+      console.warn('临期额度观测不可读，保留普通排序');return facts;
+    });
   }
   async applyOrders(orders: Record<string, string[]>, isCurrent: () => boolean = () => true): Promise<void> {
     // Serialize behind any periodic sync, then re-read the owner's current membership.

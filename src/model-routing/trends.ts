@@ -1,3 +1,4 @@
+import {createHash} from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
@@ -82,10 +83,11 @@ export function nativeDecode(r: Record<string, unknown>): number | undefined {
   if(think>0&&finite(first)&&first>0&&out*(first-Number(r.ttft_ms))>20*think*window) return;
   return out*1000/window;
 }
-export interface UsageSamples { rows: Map<string, Record<string,Sample[]>>; invalid: number }
+export interface LargeRequest {id:string;model:string;at:number}
+export interface UsageSamples { largeRequests?:LargeRequest[]; rows: Map<string, Record<string,Sample[]>>; invalid: number }
 /** Stream only numeric observations into memory. Accounts, request bodies and session IDs never enter the trend store. */
 export async function readUsageSamples(now: number, file = join(homedir(),'.config/magpie/usage.jsonl')): Promise<UsageSamples> {
-  const rows = new Map<string,Record<string,Sample[]>>(); let invalid=0;
+  const rows = new Map<string,Record<string,Sample[]>>(); let invalid=0;const largeRequests:LargeRequest[]=[];
   const records:Array<{key:string;at:number;metrics:Record<string,number>;failed:boolean;rejected:boolean;handedOn:boolean}>=[];
   const routes=new Map<string,number>();
   const stream=createReadStream(file,{encoding:'utf8'});
@@ -109,6 +111,10 @@ export async function readUsageSamples(now: number, file = join(homedir(),'.conf
           if(prompt>0)put('cacheHitRate',Number(r.cache_read??0)/prompt);
         }
       }
+      const prompt=[r.in,r.cache_read??0,r.cache_write??0];
+      const endedAt=at+(finite(r.ms)&&r.ms>=0?r.ms:0);
+      if(!failed&&r.status>=200&&r.status<300&&r.rejected!==true&&r.handed_on!==true&&finite(r.ms)&&r.ms>=0&&endedAt<=now&&prompt.every(v=>finite(v)&&v>=0)&&prompt.reduce<number>((s,v)=>s+Number(v),0)>50_000)
+        largeRequests.push({id:createHash('sha256').update(line).digest('hex'),model:`${r.provider}/${r.model}`,at:endedAt});
       // Older Magpie logs infer handed-on attempts from a later row of the same route.
       // Keep the integer text: route IDs can exceed JavaScript's safe integer range.
       const route=finite(r.route_id)&&r.route_id!==0?line.match(/"route_id"\s*:\s*(\d+)/)?.[1]:undefined;
@@ -124,7 +130,7 @@ export async function readUsageSamples(now: number, file = join(homedir(),'.conf
     for(const [name,value] of Object.entries(r.metrics))(metrics[name]??=[]).push({at:r.at,value});
     rows.set(r.key,metrics);
   }
-  return {rows,invalid};
+  return {rows,invalid,largeRequests};
 }
 
 /** Sparse gauges are recorded only when their value/source version changes, never once per Jev read. */

@@ -1252,6 +1252,7 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy,on
         {label:"AA 智能分",value:number(row.aaScore),detail:(row.aaRank===undefined?"暂无排名":`全榜第 ${row.aaRank} 名`)+" · "+rankingTrendDetail(row.trends?.aaScore)},
         {label:"生成速度",value:row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,detail:rankingTrendDetail(row.trends?.tokensPerSecond)},
         {label:"首 token 延迟",value:row.ttftMs===undefined?"未知":`${number(row.ttftMs/1000,2)} 秒`,detail:(row.tailReason?row.tailReason+" · ":"")+rankingTrendDetail(row.trends?.ttftMs)},
+        {label:"临期额度",value:row.urgency?`${row.urgency.amount}${row.urgency.unit} · ${row.urgency.requests}/5条`:"无有效临期额度",detail:row.urgency?`${row.urgency.reason}；截止 ${row.urgency.expiresAt}`:"仅使用明确期限与新鲜额度读数"},
         {label:"剩余额度",value:quota,detail:rankingTrendDetail(row.trends?.remainingPct)},
         {label:"请求稳定性",value:row.stabilityPct===undefined?"未知":`${number(row.stabilityPct)}%`,detail:"错误率趋势："+rankingTrendDetail(row.trends?.errorRate)},
         {label:"路由尝试",...rankingHealthMetric(row.health,row.pinned)},
@@ -1272,7 +1273,7 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy,on
           {wide&&stat("智能分",number(row.aaScore),72)}
           {!mobile&&stat("速度",row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,96)}
           {wide&&stat("额度",quota,64)}
-          <View style={{width:mobile?66:76,alignItems:"flex-end"}}><Text style={[s.muted,{fontSize:9}]}>{row.pinned?"置顶":row.decision?.tail?"置后":row.decision?.coldStart?"试用":"层内分"}</Text>
+          <View style={{width:mobile?66:76,alignItems:"flex-end"}}><Text style={[s.muted,{fontSize:9}]}>{row.pinned?"置顶":row.decision?.tail?"置后":row.decision?.urgent?"临期优先":row.decision?.coldStart?"试用":"层内分"}</Text>
             <Text accessibilityLabel={row.decision?.reason??"等待规则排序"} style={{color:c.score,fontSize:mobile?13:17,lineHeight:mobile?18:23,fontWeight:"700"}}>{row.decision?.score===undefined?rankingRuleLabel(row):row.decision.score.toFixed(1)}</Text>
           </View><Text style={[s.muted,{width:mobile?18:22,textAlign:"center",fontSize:17}]}>{open?"−":"+"}</Text>
         </Pressable><Pressable accessibilityRole="button" accessibilityLabel={`${row.pinned?"取消置顶":"置顶"} ${row.model}`} disabled={pinBusy||!onPin}

@@ -1,11 +1,11 @@
 import type { ModelFacts } from './ranking.ts';
 import {DEFAULT_POLICY,rankingPolicy,BILLING_LABELS,type RankingPolicy,type BillingClass} from './weights.ts';
-export const RULE_ENGINE='quality-pace-v3';
+export const RULE_ENGINE='quality-pace-v4';
 export const TTFT_LIMIT_MS=20_000;
 export const AA_BAND_WIDTH=2;
-export const RULE_DESCRIPTION='手动置顶独立第一层，按置顶先后排列；其余模型持续报错、额度耗尽、首 token 超过20秒置后；无请求记录的新模型优先试用；按AA能力分档，再按免费、套餐/积分覆盖、未知、额外付费分层；层内使用可配置权重评分，不调用JEV。';
+export const RULE_DESCRIPTION='手动置顶独立第一层，按置顶先后排列；临期可用额度独立第二优先层，层内只按综合分排序；5条输入超过50,000 token的成功请求后临期额度不变则退出；其余模型持续报错、额度耗尽、首 token 超过20秒置后；无请求记录的新模型优先试用；按AA能力分档，再按免费、套餐/积分覆盖、未知、额外付费分层；层内使用可配置权重评分，不调用JEV。';
 export interface RuleDecision {
- band?:number; ttftMs?:number; latencySource:'recent-ewma'|'recent-last'|'historical-average'|'unknown';
+ urgent?:boolean; band?:number; ttftMs?:number; latencySource:'recent-ewma'|'recent-last'|'historical-average'|'unknown';
  billing:'subscription'|'metered'|'unknown'; quota:'available'|'low'|'exhausted'|'unknown';
  remainingPct?:number; pace?:number; tail?:string; reason:string; costClass?:BillingClass; coldStart?:boolean; score?:number; contributions?:Record<string,{value?:number;weight:number;points:number}>;
 }
@@ -51,21 +51,23 @@ export function ruleOrder(facts:ModelFacts[],pins:string[]=[],now=Date.now(),inp
   const price=costClass==='free'||costClass==='included'?0:finite(facts.price.input)&&finite(facts.price.output)&&finite(hit)&&finite(facts.price.cacheHit)?facts.price.input*(1-clamp(hit))+facts.price.cacheHit*clamp(hit)+facts.price.output:undefined;
   const values={pace:account.pace===undefined?undefined:account.pace/(account.pace+1),latency:latency.value===undefined?undefined:clamp(1-latency.value/TTFT_LIMIT_MS),intelligence:facts.aa?clamp(facts.aa.score/100):undefined,speed:speed===undefined?undefined:speed/(speed+50),performance:facts.performance?clamp(facts.performance.score/5):undefined,price:price===undefined?undefined:1/(1+price)};
   const contributions=Object.fromEntries(Object.entries(policy.weights).map(([key,weight])=>{const value=values[key as keyof typeof values];return [key,{value,weight,points:100*weight*(value??0)/total}];}));
-  const decision:RuleDecision={...account,ttftMs:latency.value,latencySource:latency.source,tail,costClass,coldStart,contributions,score:Object.values(contributions).reduce((s,c)=>s+c.points,0),reason:''};
+  const urgent=!tail&&facts.urgency?.active===true&&Date.parse(facts.urgency.expiresAt)>now;
+  const decision:RuleDecision={...account,urgent,ttftMs:latency.value,latencySource:latency.source,tail,costClass,coldStart,contributions,score:Object.values(contributions).reduce((s,c)=>s+c.points,0),reason:''};
   return {facts,i,decision,gate:facts.health?.excluded?3:tail==='供应商已知账号额度耗尽'?2:tail?1:0,pin:pins.includes(facts.id)?pins.indexOf(facts.id):Infinity};
  });
  const partitions=new Map<number,typeof rows>();
- for(const row of rows.filter(r=>r.pin===Infinity))(partitions.get(row.gate)??partitions.set(row.gate,[]).get(row.gate)!).push(row);
+ for(const row of rows.filter(r=>r.pin===Infinity&&!r.decision.urgent))(partitions.get(row.gate)??partitions.set(row.gate,[]).get(row.gate)!).push(row);
  for(const group of partitions.values()){
   const measured=group.filter(r=>finite(r.facts.aa?.score)).sort((a,b)=>b.facts.aa!.score-a.facts.aa!.score);
   let top=Infinity,band=-1;
   for(const r of measured){if(top-r.facts.aa!.score>policy.bandWidth){top=r.facts.aa!.score;band++;}r.decision.band=band;}
  }
  const costs:Record<BillingClass,number>={free:0,included:1,unknown:2,paid:3};
- rows.sort((a,b)=>a.pin-b.pin||a.gate-b.gate||Number(!!b.decision.coldStart)-Number(!!a.decision.coldStart)||
+ rows.sort((a,b)=>a.pin-b.pin||a.gate-b.gate||Number(!!b.decision.urgent)-Number(!!a.decision.urgent)||(a.decision.urgent&&b.decision.urgent?b.decision.score!-a.decision.score!:0)||Number(!!b.decision.coldStart)-Number(!!a.decision.coldStart)||
   (a.decision.band??Infinity)-(b.decision.band??Infinity)||costs[a.decision.costClass!]-costs[b.decision.costClass!]||
   b.decision.score!-a.decision.score!||a.i-b.i);
- return rows.map(({facts,decision,pin})=>({facts,decision:{...decision,reason:pin!==Infinity?`手动置顶第${pin+1}位；独立第一层；${decision.tail?'自动排序风险：'+decision.tail:'不按能力档、计费层或分数重排'}`:decision.tail??[
+ return rows.map(({facts,decision,pin})=>({facts,decision:{...decision,reason:pin!==Infinity?`手动置顶第${pin+1}位；独立第一层；${decision.tail?'自动排序风险：'+decision.tail:'不按能力档、计费层或分数重排'}`:decision.urgent?`临期额度优先；${facts.urgency!.reason}；综合分 ${decision.score!.toFixed(2)}`:decision.tail??[
+  facts.urgency&&!facts.urgency.active?facts.urgency.reason:undefined,
   decision.coldStart?'新模型优先试用':undefined,BILLING_LABELS[decision.costClass!],
   decision.band===undefined?'AA未知':`能力档${decision.band+1}（AA ${facts.aa!.score}）`,
   `综合分 ${decision.score!.toFixed(2)}`,decision.ttftMs===undefined?'首 token 未测得':`首 token ${(decision.ttftMs/1000).toFixed(2)}秒`,
