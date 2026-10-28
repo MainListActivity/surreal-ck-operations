@@ -15,9 +15,14 @@ export function magpieEnvironment(): NodeJS.ProcessEnv {
  * behind a few seats) does not hold every long-lived lease forever. magpie stores it as no field.
  */
 export const GROUP_STAYS = "auto";
+/** Unfixed members follow the client; fixed member efforts remain authoritative in Magpie. */
+export const GROUP_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+
 export interface ManagedGroup {
   id: string;
   models: string[];
+  /** Owner maintenance: retain every existing setting while changing membership only. */
+  existing?: {id:string; [key:string]:unknown};
 }
 /** Use magpie's own SaveGroup API in one short-lived loopback management process.
  * Repeated CLI invocations each boot provider plugins; an exclusively owned provider DB can make
@@ -30,7 +35,7 @@ export async function saveMagpieGroups(
 ): Promise<void> {
   if (!groups.length) return;
   for (const group of groups)
-    if (!/^sck-[a-z0-9.-]+$/.test(group.id) || !group.models.length)
+    if (!/^sck-[a-z0-9.-]+$/.test(group.id) || (!group.models.length && !group.existing) || (group.existing && group.existing.id !== group.id))
       throw Error("invalid managed group");
   const probe = createServer();
   await new Promise<void>((r) => probe.listen(0, "127.0.0.1", r));
@@ -95,12 +100,13 @@ export async function saveMagpieGroups(
       const r = await fetch(base + "/api/groups/save", {
         method: "POST",
         headers,
-        body: JSON.stringify({
+        body: JSON.stringify(group.existing ? { ...group.existing, members: group.models } : {
           id: group.id,
           name: group.id,
           members: group.models,
           routing: "order",
           affinity: GROUP_STAYS,
+          levels: GROUP_LEVELS,
         }),
         signal: AbortSignal.timeout(45000),
       });

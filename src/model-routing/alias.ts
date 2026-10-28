@@ -1,6 +1,6 @@
 import { readFile, writeFile, rename } from "node:fs/promises";
 import type { JevClient } from "../dispatcher/jev.ts";
-import { benchmarkRows, canonicalModel, type BenchmarkRow } from "./policy.ts";
+import { benchmarkRows, canonicalModel, generatedModel, type BenchmarkRow } from "./policy.ts";
 
 /** A vendor name no rule matches, decided once: by Jev for a new model, or by the owner. */
 export interface AliasEntry {
@@ -28,7 +28,7 @@ export async function saveAliases(file: string, aliases: AliasFile): Promise<voi
   await rename(`${file}.tmp`, file);
 }
 export const aliasMap = (aliases: AliasFile) =>
-  Object.fromEntries(Object.entries(aliases).map(([id, a]) => [id, a.slug]));
+  Object.fromEntries(Object.entries(aliases).filter(([id]) => !generatedModel(id)).map(([id, a]) => [id, a.slug]));
 
 const bigrams = (s: string) => {
   const out = new Set<string>();
@@ -37,6 +37,7 @@ const bigrams = (s: string) => {
 };
 /** Closest AA models by name (one row per model, its best variant), for Jev to choose from. */
 export function aliasCandidates(id: string, rows: readonly BenchmarkRow[] = benchmarkRows()): BenchmarkRow[] {
+  if (generatedModel(id)) return [];
   const target = bigrams(canonicalModel(id));
   const best = new Map<string, BenchmarkRow>();
   for (const r of rows) {
@@ -62,6 +63,7 @@ export async function askAlias(
   model: { id: string; display_name?: string; owned_by?: string },
   now = new Date(),
 ): Promise<AliasEntry> {
+  if (generatedModel(model.id)) throw Error("Magpie generated groups are not eligible for model identity judgement");
   const candidates = aliasCandidates(model.id);
   const options: Record<string, string | null> = Object.fromEntries(
     candidates.map((r, i) => [`a${i}`, `${r.name ?? r.slug}（slug ${r.slug}）`]),
