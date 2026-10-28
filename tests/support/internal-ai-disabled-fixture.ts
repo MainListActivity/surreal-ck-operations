@@ -1,4 +1,4 @@
-import { configurationDigest, PROOF_GOAL, sha256, type ProofManifest } from '../../src/ops/proof-contract.ts';
+import { configurationDigest, PROOF_GOAL, sha256, type ProofManifestBody } from '../../src/ops/proof-contract.ts';
 
 /** 合成开发资料：零余额、未批准、没有价格证书；不得用于启用或真实模型调用。 */
 export function disabledSenseNovaFixture() {
@@ -10,7 +10,7 @@ export function disabledSenseNovaFixture() {
     autoTopupDisabled: true as const, serviceApproved: false,
   };
   const documentBytes = JSON.stringify(evidence);
-  const rest: Omit<ProofManifest, 'configurationDigest'> = {
+  const rest: ProofManifestBody = {
     schemaVersion: 1 as const, goalId: PROOF_GOAL, project: 'surreal_ck' as const, env: 'production' as const,
     activityId: 'synthetic-disabled-sensenova', workspaceSlug: 'sck-ui01', documentHash: sha256(documentBytes),
     service: { accountRef: evidence.accountRef, endpoint: evidence.endpoint, model: evidence.model, priceRevision: evidence.priceRevision },

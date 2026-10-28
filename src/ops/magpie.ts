@@ -351,20 +351,40 @@ export async function sampleMagpieRoute(input: MagpieSampleInput): Promise<Magpi
     } else if (sampledMs - Date.parse(quotaReadAt) > MAGPIE_SNAPSHOT_MAX_AGE_SECONDS * 1000) {
       fail('staleBalance', 'quotas', `quota snapshot readAt is older than the snapshot maxAge; the local capture time does not refresh it`);
     }
-    const windows = (Array.isArray(accountRow.windows) ? accountRow.windows : []).flatMap((value): MagpieEvidenceV4['subscription']['windows'] => {
-      if (!value || typeof value !== 'object') return [];
+    // Every reported window is accounted for: a row that cannot be represented in the v4 document
+    // is a structured gap, never a silent drop. A dropped row could hide an exhausted or unknown
+    // window behind a healthy sibling.
+    const windows: MagpieEvidenceV4['subscription']['windows'] = [];
+    const windowRows = Array.isArray(accountRow.windows) ? accountRow.windows : [];
+    windowRows.forEach((value, index) => {
+      if (!value || typeof value !== 'object') {
+        fail('quota', 'quotas', `quota window #${index + 1} is not an object; its remaining quota cannot be established`);
+        return;
+      }
       const w = value as Record<string, unknown>;
-      const remainingPct = rawNumber(w.remaining);
-      if (remainingPct === null || remainingPct > 100) return [];
+      const name = textOrNull(w.name, 80) ?? `额度窗口 #${index + 1}`;
+      const unlimited = w.unlimited === true;
       const resetsAt = dateOrNull(w.resetsAt);
-      if (w.resetsAt !== undefined && w.resetsAt !== null && resetsAt === null) return [];
-      return [{
-        name: textOrNull(w.name, 80) ?? '额度窗口', remainingPct, resetsAt,
+      if (resetsAt === null && w.resetsAt !== undefined && w.resetsAt !== null) {
+        fail('quota', 'quotas', `quota window ${name} has an unreadable resetsAt; its reset time cannot be established`);
+        return;
+      }
+      const remainingPct = rawNumber(w.remaining);
+      if (remainingPct === null || remainingPct > 100) {
+        // An unlimited window has no quota to prove, but the v4 document still carries a numeric
+        // percentage; inventing one would fabricate a balance, so the snapshot stays closed instead.
+        fail('quota', 'quotas', unlimited
+          ? `quota window ${name} is unlimited but has no readable remaining percentage; the v4 snapshot cannot represent it without inventing a number`
+          : `quota window ${name} has no readable remaining percentage (0-100); an exhausted or unknown window is never dropped`);
+        return;
+      }
+      windows.push({
+        name, remainingPct, resetsAt,
         limit: rawNumber(w.limit), amount: rawNumber(w.amount), unit: textOrNull(w.unit, 40),
-        unlimited: w.unlimited === true,
-      }];
+        unlimited,
+      });
     });
-    if (!windows.length) fail('quota', 'quotas', 'no usable quota window (remaining 0-100) for the bound account');
+    if (!windows.length && !windowRows.length) fail('quota', 'quotas', 'the bound account reports no quota window; usable remaining quota cannot be established');
     else {
       if (windows.some(w => !w.unlimited && w.remainingPct <= 0)) fail('quotaInsufficient', 'quotas', 'a quota window is exhausted; the snapshot cannot establish usable remaining quota');
       if (windows.some(w => w.resetsAt !== null && Date.parse(w.resetsAt) <= sampledMs)) fail('quotaExpired', 'quotas', 'a quota window already reset at capture time');
@@ -384,6 +404,7 @@ export async function sampleMagpieRoute(input: MagpieSampleInput): Promise<Magpi
   let servedModel: string | null = null;
   let pricingEntry: Record<string, unknown> | null = null;
   if (accountRow && accountProvider) {
+    let unknownCompletion = 0;
     const candidates = parseUsageRows(usageBody).flatMap((row): Array<{ row: Record<string, unknown>; at: number }> => {
       const at = dateOrNull(row.t);
       // A row that claims to have completed after this capture (beyond the source-skew bound) is not evidence
@@ -391,15 +412,20 @@ export async function sampleMagpieRoute(input: MagpieSampleInput): Promise<Magpi
       if (at !== null && Date.parse(at) > sampledMs + MAGPIE_SOURCE_CLOCK_SKEW_MS) return [];
       const provider = textOrNull(row.provider, 128);
       const model = textOrNull(row.model, 160);
-      if (!at || provider !== accountProvider || !model || row.done === false) return [];
+      if (!at || provider !== accountProvider || !model) return [];
       if (!routable.some(entry => entry.model === baseId(model))) return [];
       if (textOrNull(row.response_id) === null && textOrNull(row.id) === null) return [];
       if (row.route_id === undefined || row.route_id === null) return [];
+      // Completion must be explicit: a missing, false or non-boolean done is an unknown state and
+      // can never be associated as a completed usage row.
+      if (row.done !== true) { unknownCompletion += 1; return []; }
       return [{ row, at: Date.parse(at) }];
     }).sort((a, b) => b.at - a.at);
     const hit = candidates[0];
     if (!hit) {
-      fail('usage', 'usage', 'no completed Magpie request associates a served model in group/work with the bound account');
+      fail('usage', 'usage', unknownCompletion
+        ? `a matching Magpie request has no explicit done=true (${unknownCompletion} row(s)); an unknown completion state is not a completed usage association`
+        : 'no completed Magpie request associates a served model in group/work with the bound account');
     } else {
       const row = hit.row;
       const inputTokens = intOrNull(row.in), outputTokens = intOrNull(row.out);
@@ -437,16 +463,19 @@ export async function sampleMagpieRoute(input: MagpieSampleInput): Promise<Magpi
     const rawPricing = (pricingEntry.pricing && typeof pricingEntry.pricing === 'object') ? pricingEntry.pricing as Record<string, unknown> : null;
     const input = rawPricing ? rawNumber(rawPricing.input) : null;
     const output = rawPricing ? rawNumber(rawPricing.output) : null;
-    const free = (pricingEntry.free === true && (input === null || input === 0) && (output === null || output === 0))
-      || (input === 0 && output === 0);
-    if (input === null && output === null && !free) {
+    // Zero-price evidence requires the source to state numeric zero input AND output. A `free`
+    // flag with missing or non-zero prices is an unclear price, never a zero-price certificate.
+    const zeroPrices = input === 0 && output === 0;
+    if (pricingEntry.free === true && !zeroPrices) {
+      fail('price', 'catalog', `served model ${servedModel} is marked free but does not state numeric zero input and output prices; a free claim without zero prices is not zero-price evidence`);
+    } else if (input === null && output === null) {
       fail('price', 'catalog', `served model ${servedModel} has no catalog pricing and is not marked free`);
     } else {
       const currency = textOrNull(rawPricing?.currency, 8) ?? textOrNull(pricingEntry.currency, 8);
-      const revision = `magpie-catalog-${sha256(canonical({ model: servedModel, pricing: rawPricing, free })).slice(0, 12)}`;
+      const revision = `magpie-catalog-${sha256(canonical({ model: servedModel, pricing: rawPricing, free: zeroPrices })).slice(0, 12)}`;
       pricing = {
-        priceRevision: revision, source: 'magpie-catalog', reviewed: false, free,
-        freeEvidence: free ? 'magpie-catalog-zero' : 'none',
+        priceRevision: revision, source: 'magpie-catalog', reviewed: false, free: zeroPrices,
+        freeEvidence: zeroPrices ? 'magpie-catalog-zero' : 'none',
         inputPerToken: input, outputPerToken: output, currency,
         subscriptionCost: { disclosed: false },
         marginalCost: { unitInput: input, unitOutput: output },

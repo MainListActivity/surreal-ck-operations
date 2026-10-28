@@ -2,13 +2,13 @@
 // the execution-window proxy. The fake gateway serves only the loopback public surfaces
 // (catalog, quota windows, historical usage) plus a providers.json whose unrelated secret field
 // must never leave the sampler. No model is called and no provider credential is read as a value.
-import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, test } from 'bun:test';
 import {
   PROOF_GOAL, MAGPIE_EXECUTION_HEADROOM_SECONDS, MAGPIE_SNAPSHOT_MAX_AGE_SECONDS,
-  configurationDigest, evidenceSchema, magpieRouteDigest, manifestV1Schema, manifestV2Schema, sha256,
+  configurationDigest, evidenceSchema, magpieRouteDigest, manifestV1Schema, manifestV2Schema, sha256, type ProofManifestBody,
 } from '../src/ops/proof-contract.ts';
 import { loadProofFiles } from '../src/ops/proof-files.ts';
 import { OpsBroker } from '../src/ops/broker.ts';
@@ -20,6 +20,9 @@ const homes: string[] = [];
 afterAll(() => { for (const home of homes) rmSync(home, { recursive: true, force: true }); });
 const ALIAS = 'SNV_PROD';
 const PURPOSE = 'internal-ai route evidence';
+// The approval task a manager prepares a window for; the caller's own lease stays on task-1, so
+// every window test also exercises the cross-task evidence root.
+const APPROVAL_TASK = 'approval-1';
 
 function rig(): Rig {
   const world = new FakeWorld();
@@ -46,7 +49,7 @@ const sample = (r: Rig, args: Record<string, unknown> = {}) =>
   call(r, 'ops_magpie_route_sample', { alias: ALIAS, purpose: PURPOSE, ...args });
 
 function v2Manifest(document: Record<string, any>, overrides: Partial<Record<string, unknown>> = {}) {
-  const rest = {
+  const rest: ProofManifestBody = {
     schemaVersion: 2 as const,
     goalId: PROOF_GOAL,
     project: 'surreal_ck' as const,
@@ -62,17 +65,19 @@ function v2Manifest(document: Record<string, any>, overrides: Partial<Record<str
     identities: [{ alias: 'LCA04_REMOVABLE' as const, workspaceRole: 'admin' as const, billingRole: 'owner' as const }, { alias: 'LCA04_MEMBER' as const, workspaceRole: 'participant' as const, billingRole: 'member' as const }],
     ...overrides,
   };
-  return { ...rest, configurationDigest: configurationDigest(rest as never) };
+  return { ...rest, configurationDigest: configurationDigest(rest) };
 }
-function writeProof(r: Rig, manifest: Record<string, unknown>, document: Record<string, unknown>) {
-  const dir = join(r.home, 'evidence', 'task-1');
+function writeProof(r: Rig, manifest: ProofManifestBody & { configurationDigest: string }, document: Record<string, unknown>, task = APPROVAL_TASK) {
+  const dir = join(r.home, 'evidence', task);
+  mkdirSync(dir, { recursive: true });
   const docBytes = Buffer.from(JSON.stringify(document, null, 2) + '\n');
   const { configurationDigest: _digest, ...rest } = manifest;
   const bound = { ...rest, documentHash: sha256(docBytes) };
-  const bytes = Buffer.from(JSON.stringify({ ...bound, configurationDigest: configurationDigest(bound as never) }, null, 2) + '\n');
+  const digest = configurationDigest(bound);
+  const bytes = Buffer.from(JSON.stringify({ ...bound, configurationDigest: digest }, null, 2) + '\n');
   writeFileSync(join(dir, 'manifest.json'), bytes);
   writeFileSync(join(dir, 'evidence.json'), docBytes);
-  return { manifestPath: join(dir, 'manifest.json'), documentPath: join(dir, 'evidence.json') };
+  return { manifestPath: join(dir, 'manifest.json'), documentPath: join(dir, 'evidence.json'), configurationDigest: digest };
 }
 
 describe('magpie controlled route snapshot', () => {
@@ -182,11 +187,84 @@ describe('magpie controlled route snapshot', () => {
     expect(shortOut.gaps.map((g: any) => g.field)).toContain('headroom');
     expect(shortOut.document).toBeUndefined();
   });
+
+  test('every unprovable quota window is a gap, never silently dropped beside a healthy window', async () => {
+    const healthy = { name: '7d', remaining: 50, resetsInMs: 5 * 86_400_000 };
+    const cases: Array<[string, unknown]> = [
+      ['missing-remaining', { name: '5h', resetsInMs: 3_600_000 }],
+      ['string-remaining', { name: '5h', remaining: '42', resetsInMs: 3_600_000 }],
+      ['over-100', { name: '5h', remaining: 101, resetsInMs: 3_600_000 }],
+      ['negative', { name: '5h', remaining: -1, resetsInMs: 3_600_000 }],
+      ['bad-reset', { name: '5h', remaining: 42, resetsAt: 'not-a-date' }],
+      ['not-an-object', '5h'],
+    ];
+    for (const [label, bad] of cases) {
+      const r = rig();
+      r.world.magpie.windows = [bad as never, healthy];
+      const out = await sample(r);
+      expect(out.status, label).toBe('blocked');
+      expect(out.document, label).toBeUndefined();
+      expect(out.gaps.map((g: any) => g.field), label).toContain('quota');
+      // The healthy sibling was read and kept, so the gap is about the unprovable row itself.
+      expect(out.receipt.subscription.windowCount, label).toBe(1);
+    }
+    // An unlimited window still cannot be represented without a numeric percentage; inventing one
+    // would fabricate a balance, so the snapshot closes instead.
+    const unlimited = rig();
+    unlimited.world.magpie.windows = [{ name: '5h', unlimited: true }, healthy];
+    const unlimitedOut = await sample(unlimited);
+    expect(unlimitedOut.status).toBe('blocked');
+    expect(unlimitedOut.gaps.map((g: any) => g.field)).toContain('quota');
+    expect(unlimitedOut.document).toBeUndefined();
+  });
+
+  test('usage completion must be explicit done=true; missing, false or non-boolean rows never associate', async () => {
+    expect((await sample(rig())).status).toBe('sampled');
+    const cases: Array<[string, unknown]> = [['missing', undefined], ['false', false], ['string', 'true'], ['number', 1]];
+    for (const [label, done] of cases) {
+      const r = rig();
+      r.world.magpie.usageDone = done;
+      const out = await sample(r);
+      expect(out.status, label).toBe('blocked');
+      expect(out.document, label).toBeUndefined();
+      const usageGap = out.gaps.find((g: any) => g.field === 'usage');
+      expect(usageGap, label).toBeDefined();
+      expect(usageGap.detail, label).toContain('done=true');
+    }
+  });
+
+  test('a free catalog claim without numeric zero prices is unclear pricing, not zero-price evidence', async () => {
+    const missing = rig();
+    missing.world.magpie.catalogFree = true;
+    missing.world.magpie.pricing = null;
+    const missingOut = await sample(missing);
+    expect(missingOut.status).toBe('blocked');
+    expect(missingOut.gaps.map((g: any) => g.field)).toContain('price');
+    expect(missingOut.document).toBeUndefined();
+    expect(missingOut.receipt.pricing).toBeNull();
+
+    const asymmetric = rig();
+    asymmetric.world.magpie.catalogFree = true;
+    asymmetric.world.magpie.pricing = { input: 0, output: undefined, currency: 'USD' };
+    const asymOut = await sample(asymmetric);
+    expect(asymOut.status).toBe('blocked');
+    expect(asymOut.gaps.map((g: any) => g.field)).toContain('price');
+    expect(asymOut.receipt.pricing).toBeNull();
+
+    // Only an explicit numeric zero/zero wins the zero-price evidence.
+    const zero = rig();
+    zero.world.magpie.catalogFree = true;
+    zero.world.magpie.pricing = { input: 0, output: 0, currency: 'USD' };
+    const zeroOut = await sample(zero);
+    expect(zeroOut.status).toBe('sampled');
+    expect(zeroOut.document.pricing.free).toBe(true);
+    expect(zeroOut.document.pricing.freeEvidence).toBe('magpie-catalog-zero');
+  });
 });
 
 describe('magpie execution-window proxy', () => {
-  const prepare = (r: Rig, paths: Record<string, string>) =>
-    call(r, 'ops_magpie_window_prepare', { ...paths, approvalTask: 'approval-1' });
+  const prepare = (r: Rig, paths: { manifestPath: string; documentPath: string }) =>
+    call(r, 'ops_magpie_window_prepare', { manifestPath: paths.manifestPath, documentPath: paths.documentPath, approvalTask: APPROVAL_TASK });
 
   test('unreviewed pricing keeps the window closed with the specific field', async () => {
     const r = rig();
@@ -209,7 +287,7 @@ describe('magpie execution-window proxy', () => {
     const second = await prepare(r, paths);
     expect(first.eligible).toBe(true);
     expect(first.window.minRemainingSeconds).toBe(MAGPIE_EXECUTION_HEADROOM_SECONDS);
-    expect(first.window.approvalTask).toBe('approval-1');
+    expect(first.window.approvalTask).toBe(APPROVAL_TASK);
     expect(first.window.configurationDigest).toMatch(/^[a-f0-9]{64}$/);
     expect(first.window.notAfter).toBe(new Date(Date.parse(reviewed.expiresAt) - MAGPIE_EXECUTION_HEADROOM_SECONDS * 1000).toISOString());
     expect(second).toEqual(first);
@@ -294,24 +372,46 @@ describe('magpie execution-window proxy', () => {
   test('a v1 manifest cannot carry a Magpie document or ask for a window', async () => {
     const r = rig();
     const out = await sample(r);
-    const v1 = {
-      schemaVersion: 1, goalId: PROOF_GOAL, project: 'surreal_ck', env: 'production', activityId: 'activity1',
+    const v1: ProofManifestBody = {
+      schemaVersion: 1 as const, goalId: PROOF_GOAL, project: 'surreal_ck' as const, env: 'production' as const, activityId: 'activity1',
       workspaceSlug: 'demo', documentHash: '0'.repeat(64), service: { accountRef: 'a', endpoint: 'https://api.test/v1', model: 'm', priceRevision: 'p' },
       budget: { currency: 'USD', totalNanoUsd: 1_000_000_000, perAttemptNanoUsd: 100_000_000, maxAttempts: 30, autoTopupDisabled: true },
       identities: [{ alias: 'LCA04_REMOVABLE', workspaceRole: 'admin', billingRole: 'owner' }, { alias: 'LCA04_MEMBER', workspaceRole: 'participant', billingRole: 'member' }],
     };
-    expect(manifestV1Schema.safeParse({ ...v1, configurationDigest: configurationDigest(v1 as never) }).success).toBe(true);
-    const paths = writeProof(r, { ...v1, configurationDigest: configurationDigest(v1 as never) }, out.document);
+    expect(manifestV1Schema.safeParse({ ...v1, configurationDigest: configurationDigest(v1) }).success).toBe(true);
+    const paths = writeProof(r, { ...v1, configurationDigest: configurationDigest(v1) }, out.document);
     const error = await prepare(r, paths).catch(e => e as Error & { code?: string });
     expect(error.code).toBe('invalid');
+  });
+
+  test('the evidence root follows the approval task, not the caller task', async () => {
+    const r = rig();
+    const out = await sample(r);
+    const reviewed = { ...out.document, pricing: { ...out.document.pricing, reviewed: true }, approvalReadiness: { ready: true, blockedReasons: [] } };
+    // Files written under the caller's own task cannot stand in for another task's approval.
+    const ownTask = writeProof(r, v2Manifest(reviewed), reviewed, 'task-1');
+    const crossed = await prepare(r, ownTask).catch(e => e as Error & { code?: string });
+    expect(crossed.code).toBe('forbidden');
+    // A path outside every evidence root is refused even with a valid approval task id.
+    const outside = join(r.home, 'stray-manifest.json');
+    writeFileSync(outside, '{}');
+    const escaped = await call(r, 'ops_magpie_window_prepare', { approvalTask: APPROVAL_TASK, manifestPath: outside, documentPath: outside }).catch(e => e as Error & { code?: string });
+    expect(escaped.code).toBe('forbidden');
+    // The approval task's own root is accepted from the caller's separate task lease, and the
+    // returned window binds exactly that approval task and manifest digest.
+    const paths = writeProof(r, v2Manifest(reviewed), reviewed);
+    const window = await prepare(r, paths);
+    expect(window.eligible).toBe(true);
+    expect(window.window.approvalTask).toBe(APPROVAL_TASK);
+    expect(window.window.configurationDigest).toBe(paths.configurationDigest);
   });
 });
 
 function expectNoMagpieLeaks(r: Rig) {
-  const dir = join(r.home, 'evidence', 'task-1');
+  const dirs = [join(r.home, 'evidence', 'task-1'), join(r.home, 'evidence', APPROVAL_TASK)];
   const haystack = JSON.stringify([
     r.outputs, r.company.audits,
-    ...(existsSync(dir) ? readdirSync(dir).map(f => readFileSync(join(dir, f), 'utf8')) : []),
+    ...dirs.flatMap(dir => existsSync(dir) ? readdirSync(dir).map(f => readFileSync(join(dir, f), 'utf8')) : []),
   ]);
   expect(haystack).not.toContain(r.world.magpie.accountUser);
   expect(haystack).not.toContain('{{SECRET_magpie_password}}');

@@ -179,7 +179,7 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
     quotaKind: 'subscription',
     quotaReadAtSkewMs: 0,
     quotaUntilInMs: 30 * 86_400_000,
-    windows: [{ name: '5h', remaining: 42, resetsInMs: 3 * 3_600_000 }] as Array<{ name: string; remaining: number; resetsInMs: number }>,
+    windows: [{ name: '5h', remaining: 42, resetsInMs: 3 * 3_600_000 }] as Array<{ name?: string; remaining?: unknown; resetsInMs?: number; resetsAt?: unknown; unlimited?: boolean }>,
     quotasStatus: 200,
     modelsStatus: 200,
     usageStatus: 200,
@@ -189,7 +189,7 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
     catalogFree: false,
     usagePriced: true,
     usageCost: 0.000_012 as number | null,
-    usageDone: true,
+    usageDone: true as unknown,
     usageIn: 50,
     usageOut: 8,
     usageRouteId: 'run-magpie-1',
@@ -577,8 +577,10 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
         readAt: new Date(this.clock - m.quotaReadAtSkewMs).toISOString(),
         until: new Date(this.clock + m.quotaUntilInMs).toISOString(), renew: 'monthly',
         windows: m.windows.map(w => ({
-          name: w.name, remaining: w.remaining, resetsAt: new Date(this.clock + w.resetsInMs).toISOString(),
-          limit: 100, amount: 100, unit: 'percent', unlimited: false,
+          name: w.name ?? 'window',
+          ...(w.remaining !== undefined ? { remaining: w.remaining } : {}),
+          ...(w.resetsAt !== undefined ? { resetsAt: w.resetsAt } : w.resetsInMs !== undefined ? { resetsAt: new Date(this.clock + w.resetsInMs).toISOString() } : {}),
+          limit: 100, amount: 100, unit: 'percent', unlimited: w.unlimited === true,
         })),
       }]), { status: 200, headers });
     }

@@ -465,7 +465,10 @@ export function canonical(value: unknown): string {
   if (value && typeof value === 'object') return '{' + Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([k, v]) => JSON.stringify(k) + ':' + canonical(v)).join(',') + '}';
   return JSON.stringify(value);
 }
-export function configurationDigest(manifest: Omit<ProofManifest, 'configurationDigest'>): string { return sha256(canonical(manifest)); }
+/** A plain `Omit` over the v1|v2 union collapses it to common keys; distribute so each body stays a versioned shape. */
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+export type ProofManifestBody = DistributiveOmit<ProofManifest, 'configurationDigest'>;
+export function configurationDigest(manifest: ProofManifestBody): string { return sha256(canonical(manifest)); }
 const base = { env: z.literal('production').optional() };
 const files = { manifestPath: z.string().max(1024), documentPath: z.string().max(1024) };
 export const proofToolSchemas = {

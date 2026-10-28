@@ -96,7 +96,9 @@ test('real disabled SenseNova JSON bytes load; model mismatch and document/hash/
   try {
     await restore();
     const files = await loadProofFiles(home, task, manifestPath, documentPath);
+    if (files.manifest.schemaVersion !== 1) throw new Error(`expected the v1 manifest, got v${files.manifest.schemaVersion}`);
     expect(files.manifest.service.model).toBe('sensenova-6.8-flash-lite');
+    if (!('model' in files.evidence)) throw new Error('expected a reviewed evidence document with a model field');
     expect(files.evidence.model).toBe('sensenova-6.8-flash-lite');
     expect(files.evidence).toMatchObject({ type: 'development-disabled', balanceNanoUsd: 0, serviceApproved: false });
     expect(files.documentHash).toBe(createHash('sha256').update(fixture.documentBytes).digest('hex'));

@@ -1674,7 +1674,11 @@ export class OpsBroker {
     if (extra.length) throw invalid(`ops_magpie_window_prepare accepts only manifestPath, documentPath and approvalTask (rejected: ${extra.join(', ')})`);
     const approvalTask = text(args, 'approvalTask', 128);
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(approvalTask)) throw invalid('approvalTask must be a task id');
-    const files = await loadProofFiles(this.serviceHome(), ctx.scope.taskId, text(args, 'manifestPath', 1024), text(args, 'documentPath', 1024));
+    // The evidence root follows the approval task, exactly like ops_internal_ai_prove/deliver, so a
+    // manager can prepare a window for another task's approval; the caller's own task is only the
+    // root when no approval task is named.
+    const proofRoot = approvalTask || ctx.scope.taskId;
+    const files = await loadProofFiles(this.serviceHome(), proofRoot, text(args, 'manifestPath', 1024), text(args, 'documentPath', 1024));
     if (files.manifest.schemaVersion !== 2) throw new CompanyError('invalid', 'the execution-window proxy only accepts a v2 Magpie manifest');
     const result = magpieWindowFromEvidence(files, approvalTask, this.now());
     return {
