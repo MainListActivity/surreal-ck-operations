@@ -1,17 +1,16 @@
 {
-  "version": "0.3.21",
-  "title": "员工身份与原生 Claude 客户端路由",
+  "version": "0.3.22",
+  "title": "目标治理图外部依赖的真实分类",
   "changes": [
-    "按持久员工 agent ID 识别公司会话；插件重载保留本地身份记录，登记查询失败不再当作手动会话放行。",
-    "员工客户端使用原生 Opus/Sonnet/Haiku 模型名，Haiku 默认 Max；公司网关仍按任务档位选组，Factory 和故事作者维持原客户端。",
-    "从工程根目录启动的员工 Claude 显式加载私有路由设置，避免工程目录与 comm 目录分离导致配置未读；手动会话不注入。",
-    "托管分组开放 low 至 max 的请求等级，保留已固定成员等级与手动 Opus 组；请求等级与上游明确报告的等级分开记录，缺失保持未知。",
-    "空闲会话在租约结束后迁移到新版私有设置；不强制重载在途员工。"
+    "目标治理卡对离开本目标的依赖按全库真实事实分类：属于其他 goal 的记 crossGoal 并带 goalId 与引用任务真实状态；存在但无任何 goal 的记 unscoped（external/unscoped）；只有全库查不到的行才记 dangling。",
+    "修复 GoalGovernanceStore.card 把「全库存在但无 goal 的引用」以及同页其他 goal 的依赖误判为 dangling 的问题，不再把真实存在的任务说成「不存在」。",
+    "外部依赖一次性批量查询存在性、归属与终态（无 N+1）；graph 三个列表各封顶并在超出时以 graphOmitted 计数披露，扫描页继续受 48 KiB 预算与分页不截断规则约束。",
+    "unscoped 仍作修复原因披露，避免「消除 dangling 即宣称治理全部修复」；不删除 done/void 历史引用，不改业务依赖、审计或 owner 关口，不自动完成目标。"
   ],
   "impact": [
-    "涉及员工启动、路由身份、派工识别与等级声明；实际模型继续由原分组及排名决定。",
-    "老板手动会话不纳入公司网关；不改变上下文压缩窗口、不放宽跨组回退、不新增 Jev 调用。"
+    "只影响目标治理看板/扫描/日报里的依赖分类与披露字段（graph 新增 unscoped，crossGoal 增加 goalId/state，卡片新增 graphOmitted），不改变任务、依赖、审计与终验数据。",
+    "需要 owner_final 的目标仍按原关口判断；本次是治理显示修复，不是业务指标达成。"
   ],
-  "migration": "发布后短暂停止新派工，执行 model-routing-admin.ts clients 更新 Claude 默认模型及 Haiku Max，再恢复原派工状态；在途租约保留，空闲会话逐批应用 v3 私有设置。无历史任务或证据改写。",
-  "rollback": "保留上一健康 release；active、插件来源和启动器一并恢复；使用发布前保存的员工定义备份恢复客户端默认值。托管组 levels 与原配置的发布前快照一并保留以便恢复。"
+  "migration": "无数据库迁移、无历史改写；改动只在治理卡片的只读评估与响应字段。",
+  "rollback": "保留上一健康 release，用当前受审 release 的 installer 回滚至升级前现役（执行时以 active 实际 SHA 为准），active 与插件面同时切回；无数据回滚。"
 }
