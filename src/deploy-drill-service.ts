@@ -115,8 +115,15 @@ export function startDrill(serviceHome: string, repo: string, plan: DrillPlan): 
   // before writing the plan, or the detached child has nothing to read.
   mkdirSync(plan.root, { recursive: true, mode: 0o700 });
   writeFileSync(join(plan.root, 'plan.json'), JSON.stringify(plan, null, 2) + '\n', { mode: 0o600 });
-  const child = spawn(resolveDrillBun(serviceHome), [join(repo, 'src', 'deploy-drill-run.ts'), plan.runId],
-    { cwd: repo, env: { ...CHILD_ENV(), SCK_DRILL_HOME: serviceHome, SCK_DRILL_REPO: repo }, detached: true, stdio: 'ignore' });
+  // The worker entry comes from the running release, not the ops checkout. The checkout is a working tree
+  // that may sit on any commit — in production it was still on an older one without this file — so
+  // reading it would tie the drill to a mutable production directory (AC03) and, worse, silently fail
+  // to start at all. `active` is the release actually serving right now: its content is the commit the
+  // service was installed from, so the worker runs the same code as the caller.
+  const worker = join(serviceHome, 'active', 'src', 'deploy-drill-run.ts');
+  if (!existsSync(worker)) throw new Error(`drill worker entry not found in the active release: ${worker}`);
+  const child = spawn(resolveDrillBun(serviceHome), [worker, plan.runId],
+    { cwd: join(serviceHome, 'active'), env: { ...CHILD_ENV(), SCK_DRILL_HOME: serviceHome, SCK_DRILL_REPO: repo }, detached: true, stdio: 'ignore' });
   child.unref();
   return child.pid!;
 }
