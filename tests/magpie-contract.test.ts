@@ -4,6 +4,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   PROOF_GOAL, MAGPIE_EXECUTION_HEADROOM_SECONDS, configurationDigest, evidenceSchema,
   magpieEvidenceEligible, magpieRouteDigest, manifestV2Schema, sha256, tokenPlanEvidenceV3Schema,
+  type ProofManifestBody,
 } from '../src/ops/proof-contract.ts';
 
 const sampled = Date.parse('2026-10-28T10:00:00.000Z');
@@ -52,7 +53,7 @@ function document(overrides: Record<string, unknown> = {}) {
   };
 }
 function manifest(overrides: Record<string, unknown> = {}) {
-  const rest = {
+  const rest: ProofManifestBody = {
     schemaVersion: 2 as const, goalId: PROOF_GOAL, project: 'surreal_ck' as const, env: 'production' as const,
     activityId: 'activity1', workspaceSlug: 'demo', documentHash: hash('doc'),
     service: { kind: 'magpie-route' as const, accountRef: 'mgp' + 'a'.repeat(24), endpoint: 'http://127.0.0.1:3425/v1', routeId: 'group/work' as const, routeDigest: magpieRouteDigest(routable), priceRevision: 'magpie-catalog-abc123456789' },
@@ -60,7 +61,7 @@ function manifest(overrides: Record<string, unknown> = {}) {
     identities: [{ alias: 'LCA04_REMOVABLE' as const, workspaceRole: 'admin' as const, billingRole: 'owner' as const }, { alias: 'LCA04_MEMBER' as const, workspaceRole: 'participant' as const, billingRole: 'member' as const }],
     ...overrides,
   };
-  return { ...rest, configurationDigest: configurationDigest(rest as never) };
+  return { ...rest, configurationDigest: configurationDigest(rest) };
 }
 
 describe('magpie manifest v2', () => {
