@@ -176,10 +176,13 @@ export function tierOf(score: number): Tier {
 /** Exact version matches only. A preview/opaque vendor alias never inherits another model's benchmark.
  * Models without a public score, or below AA_FLOOR, are left out of every tier. */
 /** A concrete chat model; groups, auto routers and embeddings are never members. */
+/** Magpie-generated routers are not concrete models, including remote-magpie/auto/... wrappers. */
+export function generatedModel(id: string): boolean {
+  return /(?:^|\/)(?:group|auto)(?:\/|$)/.test(splitMember(id).id);
+}
 export const routable = (m: CatalogModel) =>
   m.type !== "embedding" &&
-  !/^(group|auto)\//.test(m.id) &&
-  !/\/group\//.test(m.id) &&
+  !generatedModel(m.id) &&
   !/\/(auto|combo:.*)$/.test(m.id) &&
   (!m.native_endpoints || m.native_endpoints.some((p) => /messages|responses|chat/.test(p)));
 export function classify(catalog: CatalogModel[]): ModelCandidate[] {
@@ -249,8 +252,7 @@ export function modelIdentity(
   if (
     !provider ||
     !model ||
-    /^(group|auto)\//.test(model) ||
-    /\/group\//.test(model)
+    generatedModel(model) || generatedModel(`${provider}/${model}`)
   )
     return undefined;
   return model.startsWith(`${provider}/`) ? model : `${provider}/${model}`;
