@@ -51,8 +51,12 @@ export function taskTier(task: {model_tier?: string; kind?: string; executor_rol
 export function employeeTier(role?: string): Tier {
   return role === "gm" ? "opus" : role === "product" ? "sonnet" : "haiku";
 }
+/** A client's native name exposes Paseo controls; only the gateway selects the actual task tier. */
+export function employeeClientModel(role?: string): string {
+  return `claude-${employeeTier(role)}-5-5`;
+}
 export function managedModel(def: {provider?: string; model?: string; role?: string} | undefined): boolean {
-  return def?.role !== "story-author" && def?.provider === "claude" && !!def?.model?.startsWith("group/sck-") && !!selectedTier(def.model?.replace(/^group\/sck-(engineering|writing|general)-/, ""));
+  return !!def && def.role !== "story-author" && def.provider === "claude";
 }
 /** Owner rule: no tier may hold a model scoring below this on the AA Intelligence Index. Unscored is not admitted. */
 export const AA_FLOOR = 38;
