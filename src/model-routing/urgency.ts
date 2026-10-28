@@ -19,25 +19,28 @@ const digest=(s:string)=>createHash('sha256').update(s).digest('hex');
 /** Per real quota pool and deadline, shared across models and groups. No prompts or account names retained. */
 export function assessUrgency(facts:ModelFacts[],requests:LargeRequest[],previous:UrgencyState,now:number){
  const state:UrgencyState=structuredClone(Object.fromEntries(Object.entries(previous).filter(([,b])=>finite(b.expires)&&b.expires>now)));
- const pools=new Map<string,{members:Set<string>;kind:UrgencyObservation['kind'];expires:number;amount:number;unit:string;readAt:number}>();
+ const pools=new Map<string,{members:Set<string>;kind:UrgencyObservation['kind'];expires:number;amount:number;unit:string;readAt:number;provider?:string;accountKey?:string;wholeAccount:boolean;singleAccount?:boolean}>();
  for(const f of facts)for(const a of f.accounts){
   const readAt=Date.parse(a.readAt??'');
   if(!finite(readAt)||readAt>now||now-readAt>QUOTA_FRESH_MS||a.remainingPct===0)continue;
-  const add=(kind:UrgencyObservation['kind'],deadline:string|undefined,amount:number|undefined,unit:string,scope="")=>{
+  const add=(kind:UrgencyObservation['kind'],deadline:string|undefined,amount:number|undefined,unit:string,scope="",wholeAccount=false)=>{
    const expires=Date.parse(deadline??'');if(!finite(expires)||expires<=now||expires-now>URGENT_WINDOW_MS||!finite(amount)||amount<=0)return;
    const key=digest(`${a.poolKey??a.account}|${kind}|${expires}|${unit}|${scope}`);
    const old=pools.get(key);if(old){old.members.add(f.id);return;}
-   pools.set(key,{members:new Set([f.id]),kind,expires,amount,unit,readAt});
+   pools.set(key,{members:new Set([f.id]),kind,expires,amount,unit,readAt,provider:a.provider,accountKey:a.poolKey,singleAccount:a.singleAccount,wholeAccount});
   };
   for(const w of a.windows??[]){
-   add('gift',w.runsOutAt,w.runsOut,w.unit??'额度',w.model);
+   const poolAmbiguous=!w.model&&new Set((a.windows??[]).flatMap(x=>x.pool?[x.pool]:[])).size>1;
+   if(poolAmbiguous)continue; // No model-to-pool contract: do not guess a pool's debit.
+   const scope=w.pool?'pool:'+w.pool:w.model?'model:'+w.model:'';
+   add('gift',w.runsOutAt,w.runsOut,w.unit??'额度',scope,!scope);
    // A model-specific, one-off trial is a grant that disappears at its deadline.
-   if(w.model&&/trial|试用/i.test(w.name??w.model))add('gift',w.resetsAt,w.remainingPct,'%',w.model);
+   if(w.model&&/trial|试用/i.test(w.name??w.model))add('gift',w.resetsAt,w.remainingPct,'%',scope);
    // Rolling 5-hour rate caps are not a grant that expires. Only known non-carryover cycles qualify.
-   if((a.kind==='subscription'||a.kind==='plan')&&/^(weekly|monthly|month|daily|7 days|30 days|1 day)$/i.test(w.name??''))
-    add('reset',w.resetsAt,w.remainingPct,'%');
+   if(w.nonCarryOver===true)
+    add('reset',w.resetsAt,w.remainingPct,'%',scope,!scope);
   }
-  if(a.renew==='off')add('subscription',a.until,a.remainingPct,'%');
+  if(a.renew==='off')add('subscription',a.until,a.remainingPct,'%', '',true);
  }
  const observations=new Map<string,UrgencyObservation[]>();
  for(const [key,p] of pools){
@@ -46,7 +49,9 @@ export function assessUrgency(facts:ModelFacts[],requests:LargeRequest[],previou
   if(p.readAt>=b.readAt){
    const members=new Set([...p.members].map(id=>id.replace(/:(?:max|high|medium|low|none|xhigh)$/,'')));
    for(const r of requests){
-    if(r.at<=b.since||r.at>=p.readAt||!members.has(r.model)||b.seen.includes(r.id))continue;
+    const accountMatches=p.singleAccount===true||!!r.accountKey&&r.accountKey===p.accountKey;
+    const memberMatches=members.has(r.model)||(p.wholeAccount&&!!p.provider&&r.model.slice(0,r.model.lastIndexOf('/'))===p.provider&&accountMatches);
+    if(r.at<=b.since||r.at>=p.readAt||!memberMatches||p.singleAccount===false&&!accountMatches||b.seen.includes(r.id))continue;
     if(b.seen.length<URGENT_REQUEST_LIMIT)b.seen.push(r.id);
    }
    if(b.seen.length>=URGENT_REQUEST_LIMIT&&p.amount===b.amount)b.blocked=true;

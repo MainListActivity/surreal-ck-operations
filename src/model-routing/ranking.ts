@@ -45,8 +45,8 @@ export interface UsageStat {
   tokensPerSecond?: number;
   ttftMs?: number;
 }
-export interface QuotaAccount {account:string;poolKey?:string;kind?:'subscription'|'plan'|'api'|'unknown';readAt?:string;until?:string;renew?:string;remainingPct?:number;windows?:QuotaWindow[]}
-export interface QuotaWindow {name?:string;model?:string;remainingPct:number;resetsAt?:string;runsOutAt?:string;runsOut?:number;unit?:string;limit?:number;amount?:number}
+export interface QuotaAccount {account:string;provider?:string;singleAccount?:boolean;poolKey?:string;kind?:'subscription'|'plan'|'api'|'unknown';readAt?:string;until?:string;renew?:string;remainingPct?:number;windows?:QuotaWindow[]}
+export interface QuotaWindow {pool?:string;nonCarryOver?:boolean;name?:string;model?:string;remainingPct:number;resetsAt?:string;runsOutAt?:string;runsOut?:number;unit?:string;limit?:number;amount?:number}
 export interface ModelFacts {
   trends?: ModelTrends;
   trendSource?: { source: string; available: boolean; invalidLines: number; collectedAt: string };
@@ -101,18 +101,19 @@ export function usageStats(snapshot: unknown, collectedAt = new Date().toISOStri
 }
 
 /** `magpie quota --json`: per provider, each account's tightest window. */
-export function quotaAccounts(rows: Array<{ provider:string;name?:string;user?:string;kind?:string;error?:string;readAt?:string;until?:string;renew?:string;windows?:Array<{name?:string;model?:string;remaining?:number;resetsAt?:string;runsOutAt?:string;runsOut?:number;unit?:string;limit?:number;amount?:number;unlimited?:boolean;text?:boolean}> }>,now=Date.now()):Map<string,QuotaAccount[]> {
+export function quotaAccounts(rows: Array<{ provider:string;name?:string;user?:string;kind?:string;error?:string;readAt?:string;until?:string;renew?:string;windows?:Array<{pool?:string;nonCarryOver?:boolean;name?:string;model?:string;remaining?:number;resetsAt?:string;runsOutAt?:string;runsOut?:number;unit?:string;limit?:number;amount?:number;unlimited?:boolean;text?:boolean}> }>,now=Date.now()):Map<string,QuotaAccount[]> {
  const out=new Map<string,QuotaAccount[]>();
  for(const q of rows){
   const list=out.get(q.provider)??[];
   const windows:QuotaWindow[]=(q.error?[]:q.windows??[]).flatMap(w=>{
    if(w.unlimited||w.text||w.resetsAt&&Date.parse(w.resetsAt)<=now||typeof w.remaining!=='number'||!Number.isFinite(w.remaining)||w.remaining<0||w.remaining>100)return [];
-   return [{name:w.name,model:w.model,remainingPct:w.remaining,resetsAt:w.resetsAt,runsOutAt:w.runsOutAt,runsOut:w.runsOut,unit:w.unit,limit:w.limit,amount:w.amount}];
+   return [{pool:w.pool,nonCarryOver:w.nonCarryOver??(/(?:^|\/)(claude|codex)$/.test(q.provider)&&/^(weekly|7 days)$/i.test(w.name??'')),name:w.name,model:w.model,remainingPct:w.remaining,resetsAt:w.resetsAt,runsOutAt:w.runsOutAt,runsOut:w.runsOut,unit:w.unit,limit:w.limit,amount:w.amount}];
   });
-  list.push({account:`${q.provider} #${list.length+1}`,poolKey:createHash('sha256').update(q.provider+'|'+(q.user??q.name??String(list.length))).digest('hex'),
+  list.push({provider:q.provider,account:`${q.provider} #${list.length+1}`,poolKey:createHash('sha256').update(q.provider+'|'+(q.user??q.name??String(list.length))).digest('hex'),
    kind:q.kind==='subscription'||q.kind==='plan'||q.kind==='api'?q.kind:'unknown',readAt:q.error?undefined:q.readAt,until:q.until,renew:q.renew,windows,
    remainingPct:windows.length?Math.min(...windows.map(w=>w.remainingPct)):undefined});out.set(q.provider,list);
  }
+ for(const accounts of out.values())for(const a of accounts)a.singleAccount=accounts.length===1;
  return out;
 }
 
@@ -139,7 +140,10 @@ export function modelFacts(
       accounts: (sources.quota.get(providerOf(base))??[]).map(a=>{
         const model=base.slice(base.lastIndexOf('/')+1),scoped=(a.windows??[]).filter(w=>w.model===model||w.name===model);
         const knownModels=new Set(sources.catalog.map(m=>m.id.slice(m.id.lastIndexOf('/')+1)));
-        const windows=scoped.length?scoped.map(w=>({...w,model})):(a.windows??[]).filter(w=>!w.model&&!knownModels.has(w.name??''));
+        const global=(a.windows??[]).filter(w=>!w.model&&!knownModels.has(w.name??''));
+        const scopedWindows=scoped.map(w=>({...w,model}));
+        const independentTrial=scopedWindows.some(w=>/trial|试用/i.test(w.name??w.model));
+        const windows=independentTrial?scopedWindows:[...global,...scopedWindows];
         return {...a,windows,remainingPct:windows.length?Math.min(...windows.map(w=>w.remainingPct)):a.windows?.length?undefined:a.remainingPct};
       }),
       aa: b ? { rank: aaRankOfScore(b.score), score: Math.round(b.score * 10) / 10, effort: resolved.effort } : undefined,

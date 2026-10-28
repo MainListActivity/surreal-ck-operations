@@ -72,7 +72,7 @@ test('expired, distant, zero, text/unlimited pools and auto-renew subscriptions 
 test('known grant reset qualifies; rolling short caps do not; a new deadline re-admits a new batch',()=>{
  const f=facts();f.accounts[0]!.windows=[{name:'5 hours',remainingPct:80,resetsAt:iso(now+3600000)}];
  expect(assessUrgency([f],[],{},now).facts[0]!.urgency).toBeUndefined();
- f.accounts[0]!.windows[0]!.name='Weekly';expect(assessUrgency([f],[],{},now).facts[0]!.urgency?.kind).toBe('reset');
+ f.accounts[0]!.windows[0]!.name='Weekly';f.accounts[0]!.windows[0]!.nonCarryOver=true;expect(assessUrgency([f],[],{},now).facts[0]!.urgency?.kind).toBe('reset');
  const started=assessUrgency([facts()],[],{},now);const end=assessUrgency([facts('p/a',100,now+6000)],requests(5),started.state,now+7000);
  const next=facts('p/a',100,now+8000);next.accounts[0]!.windows![0]!.runsOutAt=iso(now+7200000);
  expect(assessUrgency([next],[],end.state,now+9000).facts[0]!.urgency).toMatchObject({active:true,requests:0});
@@ -128,4 +128,33 @@ test('controller refreshes the expiring remote card and suppresses an unchanged 
  expect(result[0]!.urgency).toMatchObject({active:false,requests:5});
  expect((await controller().rankingFacts([model]))[0]!.urgency?.active).toBe(false);
  }finally{await rm(dir,{recursive:true,force:true});}
+});
+
+test('ordinary scoped rate cap keeps the exhausted global cap; only an independent trial can override',()=>{
+ const q=quotaAccounts([{provider:'p',kind:'subscription',readAt:iso(now),windows:[{name:'Weekly',remaining:0},{name:'a',model:'a',remaining:80}]}],now);
+ const f=modelFacts(['p/a'],{catalog:[{id:'p/a'}],quota:q,usage:new Map(),performance:new Map()});
+ expect(f[0]!.accounts[0]!.remainingPct).toBe(0);expect(ruleOrder(f,[],now)[0]!.decision.quota).toBe('exhausted');
+});
+
+test('unknown named cycles do not claim non-carryover; only explicit semantics or native Claude/Codex rate budgets qualify',()=>{
+ const make=(provider:string,nonCarryOver?:boolean)=>quotaAccounts([{provider,kind:'subscription',readAt:iso(now),windows:[{name:'Weekly',remaining:80,resetsAt:iso(now+3600000),nonCarryOver}]}],now).get(provider)!;
+ expect(assessUrgency([{...facts(),accounts:make('p')}],[],{},now).facts[0]!.urgency).toBeUndefined();
+ expect(assessUrgency([{...facts(),accounts:make('p',true)}],[],{},now).facts[0]!.urgency?.active).toBe(true);
+ expect(assessUrgency([{...facts(),accounts:make('remote-magpie/codex')}],[],{},now).facts[0]!.urgency?.kind).toBe('reset');
+});
+
+test('ordinary account pool includes manual Opus/Fable calls outside the ranked list, while different accounts and pools remain isolated',()=>{
+ const a=facts('p/a');Object.assign(a.accounts[0]!,{provider:'p',singleAccount:true});
+ const start=assessUrgency([a],[],{},now);
+ a.accounts[0]!.readAt=iso(now+10000);
+ expect(assessUrgency([a],requests(5,'p/manual-opus'),start.state,now+11000).facts[0]!.urgency?.active).toBe(false);
+ const one=facts('p/a'),two=facts('p/b');one.accounts[0]!.windows![0]!.pool='pool-A';two.accounts[0]!.windows![0]!.pool='pool-B';
+ const began=assessUrgency([one,two],[],{},now);
+ for(const f of [one,two])f.accounts[0]!.readAt=iso(now+10000);
+ const result=assessUrgency([one,two],requests(5,'p/a'),began.state,now+11000);
+ expect(result.facts.map(f=>f.urgency?.active)).toEqual([false,true]);
+ const multi=facts('p/a');Object.assign(multi.accounts[0]!,{provider:'p',singleAccount:false,poolKey:'account-1'});
+ const prior=assessUrgency([multi],[],{},now);multi.accounts[0]!.readAt=iso(now+10000);
+ expect(assessUrgency([multi],requests(5).map(r=>({...r,accountKey:'account-2'})),prior.state,now+11000).facts[0]!.urgency?.active).toBe(true);
+ expect(assessUrgency([multi],requests(5).map(r=>({...r,accountKey:'account-1'})),prior.state,now+11000).facts[0]!.urgency?.active).toBe(false);
 });
