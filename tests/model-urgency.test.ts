@@ -52,7 +52,7 @@ test('actual decrease starts a fresh observation; missing/old/backdated reads ne
 });
 
 test('requests on the same real pool are shared across models and effort variants, never across accounts',()=>{
- const a=facts('p/a:max'),b=facts('p/b'),other=facts('q/c');other.accounts[0]!.poolKey='other';
+ const a=facts('p/a:ultra:fast'),b=facts('p/b'),other=facts('q/c');other.accounts[0]!.poolKey='other';
  const start=assessUrgency([a,b,other],[],{},now);
  const newer=[a,b,other].map(f=>({...f,accounts:f.accounts.map(a=>({...a,readAt:iso(now+10000)}))}));
  const r=assessUrgency(newer,[...requests(3),...requests(2,'p/b').map(r=>({...r,id:'b'+r.id}))],start.state,now+11000);

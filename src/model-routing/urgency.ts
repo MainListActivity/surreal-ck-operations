@@ -1,3 +1,4 @@
+import {splitMember} from './policy.ts';
 import {createHash} from 'node:crypto';
 import {mkdir,readFile,writeFile,rename} from 'node:fs/promises';
 import {dirname} from 'node:path';
@@ -47,10 +48,10 @@ export function assessUrgency(facts:ModelFacts[],requests:LargeRequest[],previou
   let b=state[key];
   if(!b||p.readAt>b.readAt&&p.amount!==b.amount)b=state[key]={since:now,readAt:p.readAt,amount:p.amount,seen:[],blocked:false,expires:p.expires};
   if(p.readAt>=b.readAt){
-   const members=new Set([...p.members].map(id=>id.replace(/:(?:max|high|medium|low|none|xhigh)$/,'')));
+   const members=new Set([...p.members].map(id=>splitMember(id).id));
    for(const r of requests){
     const accountMatches=p.singleAccount===true||!!r.accountKey&&r.accountKey===p.accountKey;
-    const memberMatches=members.has(r.model)||(p.wholeAccount&&!!p.provider&&r.model.slice(0,r.model.lastIndexOf('/'))===p.provider&&accountMatches);
+    const memberMatches=members.has(splitMember(r.model).id)||(p.wholeAccount&&!!p.provider&&r.model.slice(0,r.model.lastIndexOf('/'))===p.provider&&accountMatches);
     if(r.at<=b.since||r.at>=p.readAt||!memberMatches||p.singleAccount===false&&!accountMatches||b.seen.includes(r.id))continue;
     if(b.seen.length<URGENT_REQUEST_LIMIT)b.seen.push(r.id);
    }
