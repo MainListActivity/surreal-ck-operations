@@ -1,21 +1,18 @@
 {
-  "version": "0.3.28",
-  "title": "受控追加依赖前置与经理续接、远端渠道目录自动刷新",
+  "version": "0.3.29",
+  "title": "Magpie 受控路由契约修复与 v2/v4 真实回归",
   "changes": [
-    "新增 gm/manage 受控工具 append_dependency_prerequisites：仅对 blocked、无活动租约、正式 dependency 等待且 execute 相位的非 owner 任务追加真实前置，设置 continuation=manager，不自动 resume。",
-    "CAS expectedVersion、业务键幂等、同 goal、闭包环检测与 company_meta:defer_epoch 串行；只追加并保留原等待引用与既有依赖，不覆盖、不清故障/预算/权限。",
-    "WaitStore 在全部前置完成后把 continuation=manager 的等待释放到 GM 关口而非 ready；普通依赖与复核等待行为不变。void 前置仍不授权过期执行窗口。",
-    "MCP 与员工 sidecar 通道同时注册该工具；新增 11 个公司 fork 回归与 sidecar 通道回归，文档补充行为契约。",
-    "组内成员不在 magpie catalog 时强制刷新 remote-magpie 渠道模型清单：不再等每日一次，独立 5 分钟节流，不新增定时器",
-    "适配临时额度窗口：渠道模型随窗口关闭从目录消失、窗口重开时自动被重新看见并按现有排序规则参与路由",
-    "仅 sck-* 组参与判定；owner 自建组、手动移除的成员和已配置的组顺序均不改写"
+    "配额窗口不再静默丢弃：任一非 unlimited 窗口的 remaining 缺失、非数、负数或大于 100，或 resetsAt 存在但不可解析，都产出结构化 gap 并拒绝生成文档；畸形窗口不会被健康兄弟掩盖。",
+    "usage 完成态改为显式 done === true：done 缺失、false 或非布尔一律不作为已完成 usage 关联，未知状态在 usage gap 中说明。",
+    "catalog free=true 但价格缺失或非零按价目不明闭锁；零价证据只认源明确给出数值 input=0 且 output=0，freeEvidence 不再可能写成 magpie-catalog-zero。",
+    "ops_magpie_window_prepare 的证据根改为 approvalTask，与 ops_internal_ai_prove/deliver 一致：经理可在自己任务为另一审批任务准备窗口，其他任务根或证据根外路径仍拒绝。",
+    "manifest v1|v2 联合类型上 configurationDigest 改为分配式 Omit；测试按 schemaVersion 与 'model' in service 收窄，并补真实公司 fork 的 v2/v4 prepare→不同员工独立批准→prove/窗口回归及旧 v3、跨契约、摘要篡改拒绝。"
   ],
   "impact": [
-    "zcode 等临时额度渠道恢复供应后，无需人工操作即可在数分钟内进入 sck-haiku/sck-sonnet 路由",
-    "目录刷新增加时最多每 5 分钟一次，仅在有组内成员缺失时发生",
-    "不改数据库 schema、派工规则、模型评分与排序算法；回滚安全",
-    "新增工具只影响 blocked 且带正式 dependency 等待的 execute 相位任务；普通待办、复核等待、owner 关口与授权/计数不变。"
+    "纯控制面证据与门禁修复：不触产品库、生产数据、active、凭证或模型；采样仍是只读 loopback 快照，未新增依赖或环境变量。",
+    "发布后 v4 采样对畸形配额、未知完成态和不明价目更严格，原本被静默放行的快照会转为 blocked；v1/v3 证据形状不变。",
+    "窗口代理读取根从调用任务改为 approvalTask；旧调用若 approvalTask 指向自身任务，行为不变。"
   ],
-  "migration": "无数据库迁移；新增 model-routing/catalog-refresh-missing.json 节流戳。 受控依赖追加本身不改 schema；company_meta:defer_epoch 沿用既有行。",
-  "rollback": "通过标准安装器恢复上一固定发布。 依赖追加产生的等待引用随任务数据保留，回滚后旧代码按普通 dependency 等待处理，无数据回滚。"
+  "migration": "无数据库迁移、无历史改写；复用既有 evidence/receipt 与 proof candidate 存储，未改 schema、任务或派工数据。",
+  "rollback": "revert 合入提交并按受控 release/vendor 重发；代码回滚不会撤销已生成的只读 Magpie 证据文档与回执，也不改写已批准的 v2/v4 候选，处置以既有审计为准。"
 }

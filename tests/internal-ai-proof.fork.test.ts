@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
-import { mkdtemp, mkdir, writeFile, rm, symlink, realpath } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, realpath } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:net';
@@ -14,7 +14,7 @@ import { OpsBroker } from '../src/ops/broker.ts';
 import { InternalAiProofBridge } from '../src/ops/proof-bridge.ts';
 import { diagnosticFailureByCheck, type ApprovalDiagnosis } from '../src/ops/approval-diagnosis.ts';
 import { CompanyProofStore } from '../src/ops/proof-store.ts';
-import { TOKEN_PLAN_PLAN_TYPE_FREE, PROOF_GOAL, configurationDigest, sha256, APPROVAL_MARKER, type ProofManifest } from '../src/ops/proof-contract.ts';
+import { TOKEN_PLAN_PLAN_TYPE_FREE, PROOF_GOAL, configurationDigest, evidenceSchema, sha256, APPROVAL_MARKER, type ProofManifest, type ProofManifestBody } from '../src/ops/proof-contract.ts';
 import { ProofSigner, verifyCompanyProof } from '../src/ops/proof-signer.ts';
 import { loadProofFiles } from '../src/ops/proof-files.ts';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
@@ -49,6 +49,7 @@ async function start() {
 async function stop() { await database.close(); child.kill(); await child.exited; }
 function broker() {
   ops = new OpsBroker({ core, projects, secretKey: () => key, proofStore: new CompanyProofStore(database.db, now), serviceHome:dir, now,
+    magpie: { base: world.magpie.base, endpointSource: 'injected', readProviders: async () => JSON.stringify(world.magpie.providers) },
     fetch: async (input, init) => {
       const u = new URL(typeof input === 'string' ? input : input instanceof URL ? input : input.url);
       if (u.pathname === '/api/login/ck/password' && loginBarrier) await loginBarrier(new URLSearchParams(String(init?.body)).get('username') ?? '');
@@ -131,6 +132,10 @@ beforeAll(async () => {
     const password='synthetic-'+alias; await world.addAccount('sck-'+alias.toLowerCase().replaceAll('_','-'),password);
     await projects.setSecret({project:'surreal_ck',env:'production',name:alias+'_PASSWORD',value:password},key);
   }
+  // The Magpie sampler binds the sealed supplier identity to the gateway account; the fake gateway
+  // serves that account on its loopback surfaces.
+  await projects.setSecret({project:'surreal_ck',env:'production',name:'SUPPLIER_SNV_FORK_USERNAME',value:world.magpie.accountUser},key);
+  await projects.setSecret({project:'surreal_ck',env:'production',name:'SUPPLIER_SNV_FORK_PASSWORD',value:'synthetic-magpie-password'},key);
   const owner=world.user('sck-lca04-removable')!, member=world.user('sck-lca04-member')!;
   world.workspaces.set('sck-ui01',{slug:'sck-ui01',name:'synthetic',dbName:'ws_ui01',members:[{id:'owner',email:owner.email,displayName:'owner',subject:owner.id,isAdmin:true,disabled:false},{id:'member',email:member.email,displayName:'member',subject:member.id,isAdmin:false,disabled:false}]});
   broker();
@@ -551,6 +556,80 @@ check('reviewed-token-plan v3 promotional/account-bound evidence signs approved-
   ];
   for(const [id,bad] of violations){await rewrite(own,bad);await expect(request('ops_internal_ai_prepare',{manifestPath:own.manifestPath,documentPath:own.documentPath})).rejects.toMatchObject({code:'invalid'});}
   await files(task.id,'reviewed-token-plan-v3');
+});
+check('a v2 Magpie manifest and v4 route evidence prepare, are independently approved, prove and open a window; old v3 and cross-contract pairs reject',async()=>{
+  world.clock=clock; // the fake gateway and the broker share the same capture clock
+  const approval=await core.createTask(gm,{title:'Synthetic Magpie v4 approval',context:'Only isolated fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
+  const claim=await core.claim(author,approval.id);
+  // A fresh consumer employee and task keep this regression independent of the earlier
+  // deliberate-failure tests: the SYS04 fault budget is scoped to each task id, and one employee
+  // can only hold one lease.
+  const prover=await new LocalEnrollmentAdmin(database).enroll('test-magpie-consumer','engineering',['execute','review']);
+  const proofTask=await core.createTask(gm,{title:'Synthetic Magpie v4 consumer',context:'Only isolated fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
+  await core.claim(prover,proofTask.id);
+  const proofRoot=join(dir,'evidence',proofTask.id);
+  // The real sampler reads the fake loopback gateway and the sealed supplier identity; it writes
+  // the v4 document under the approval task's evidence root.
+  const sampled=await ops.call(author,approval.id,'ops_magpie_route_sample',{alias:'SNV_FORK',purpose:'synthetic fork route evidence'}) as {status:string;document:Record<string,any>;documentSha256:string;receipt:Record<string,any>};
+  expect(sampled.status).toBe('sampled');
+  expect(sampled.document.schemaVersion).toBe(4);
+  expect(sampled.document.account.binding).toBe('company-sealed-account');
+  // A reviewed price decision turns the sampler's unreviewed snapshot into an eligible one.
+  const reviewed:Record<string,any>={...sampled.document,pricing:{...sampled.document.pricing,reviewed:true},approvalReadiness:{ready:true,blockedReasons:[]}};
+  expect(evidenceSchema.safeParse(reviewed).success).toBe(true);
+  const root=join(dir,'evidence',approval.id); await mkdir(root,{recursive:true});
+  const documentPath=join(root,'magpie-v4-reviewed.json'), manifestPath=join(root,'magpie-v2-manifest.json');
+  const documentBytes=Buffer.from(JSON.stringify(reviewed));
+  const body:ProofManifestBody={
+    schemaVersion:2 as const,goalId:PROOF_GOAL,project:'surreal_ck' as const,env:'production' as const,activityId:'ui01-internal',workspaceSlug:'sck-ui01',
+    documentHash:sha256(documentBytes),
+    service:{kind:'magpie-route' as const,accountRef:reviewed.accountRef,endpoint:reviewed.endpoint,routeId:'group/work' as const,routeDigest:reviewed.route.digest,priceRevision:reviewed.priceRevision},
+    budget:{currency:'USD' as const,totalNanoUsd:1_000_000_000,perAttemptNanoUsd:100_000_000,maxAttempts:30,autoTopupDisabled:true as const},
+    identities:[{alias:'LCA04_REMOVABLE' as const,workspaceRole:'admin' as const,billingRole:'owner' as const},{alias:'LCA04_MEMBER' as const,workspaceRole:'participant' as const,billingRole:'member' as const}],
+  };
+  const manifest={...body,configurationDigest:configurationDigest(body)};
+  await writeFile(documentPath,documentBytes); await writeFile(manifestPath,JSON.stringify(manifest));
+  const prepared=await ops.call(author,approval.id,'ops_internal_ai_prepare',{manifestPath,documentPath}) as {digest:string;documentHash:string;approvalMarker:string};
+  expect(prepared.digest).toBe(manifest.configurationDigest);
+  expect(prepared.documentHash).toBe(sha256(documentBytes));
+  // Tampered bytes or digests never reach the approval store (checks run while the author still
+  // holds the approval task's lease).
+  const badHashPath=join(dir,'evidence',approval.id,'magpie-v2-bad-hash.json');
+  await writeFile(badHashPath,JSON.stringify({...manifest,documentHash:'a'.repeat(64)}));
+  await expect(ops.call(author,approval.id,'ops_internal_ai_prepare',{manifestPath:badHashPath,documentPath})).rejects.toMatchObject({code:'invalid'});
+  const badDigestPath=join(dir,'evidence',approval.id,'magpie-v2-bad-digest.json');
+  await writeFile(badDigestPath,JSON.stringify({...manifest,configurationDigest:'b'.repeat(64)}));
+  await expect(ops.call(author,approval.id,'ops_internal_ai_prepare',{manifestPath:badDigestPath,documentPath})).rejects.toMatchObject({code:'invalid'});
+  const disabled=await ops.call(author,approval.id,'ops_internal_ai_prove',{mode:'register-disabled',manifestPath,documentPath,activityId:'ui01-internal',nonce:'magpie-disabled-nonce-0001',idempotencyKey:'magpie-disabled'}) as Record<string,unknown>;
+  expect(disabled).toMatchObject({type:'development-disabled',scope:'register-disabled',paidCallsAllowed:0,documentHash:manifest.documentHash});
+  await core.submit(author,{taskId:approval.id,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version},{text:'Synthetic Magpie v4 files',idempotencyKey:randomUUID()});
+  const review=await core.claim(reviewer,approval.id);
+  await core.accept(reviewer,{taskId:approval.id,deliveryId:review.deliveryId,fence:review.fence,expectedVersion:review.task.version},{text:prepared.approvalMarker,idempotencyKey:randomUUID()});
+  const proven=await ops.call(prover,proofTask.id,'ops_internal_ai_prove',{mode:'enable',approvalTask:approval.id,manifestPath,documentPath,activityId:'ui01-internal',nonce:'magpie-enable-nonce-0001',idempotencyKey:'magpie-enable'}) as Record<string,unknown>;
+  expect(proven).toMatchObject({type:'approved-service',paidCallsAllowed:1,documentHash:manifest.documentHash});
+  // The window proxy reads the approval task's root from the caller's separate task lease and
+  // binds exactly this manifest digest and evidence expiry.
+  const window=await ops.call(prover,proofTask.id,'ops_magpie_window_prepare',{approvalTask:approval.id,manifestPath,documentPath}) as Record<string,any>;
+  expect(window.eligible).toBe(true);
+  expect(window.window).toMatchObject({approvalTask:approval.id,configurationDigest:manifest.configurationDigest,evidenceExpiresAt:reviewed.expiresAt});
+  expect(window.manifestHash).toBe(sha256(Buffer.from(JSON.stringify(manifest))));
+  expect(window.documentHash).toBe(sha256(documentBytes));
+  // Frozen old v3 evidence cannot be bound to a v2 Magpie manifest.
+  const v3=await files(proofTask.id,'reviewed-token-plan-v3');
+  const v3Bytes=await readFile(v3.documentPath);
+  const v3Body:ProofManifestBody={...body,documentHash:sha256(v3Bytes)};
+  const v3ManifestPath=join(proofRoot,'magpie-v2-over-v3.json');
+  await writeFile(v3ManifestPath,JSON.stringify({...v3Body,configurationDigest:configurationDigest(v3Body)}));
+  await expect(ops.call(prover,proofTask.id,'ops_internal_ai_prepare',{manifestPath:v3ManifestPath,documentPath:v3.documentPath})).rejects.toMatchObject({code:'invalid'});
+  // A v1 manifest cannot carry v4 Magpie evidence, and v2 Magpie evidence cannot ride a v1 body.
+  const v1=await files(proofTask.id,'reviewed-service');
+  await rewrite(v1,reviewed);
+  await expect(ops.call(prover,proofTask.id,'ops_internal_ai_prepare',{manifestPath:v1.manifestPath,documentPath:v1.documentPath})).rejects.toMatchObject({code:'invalid'});
+  const v1Bytes=await readFile((await files(proofTask.id,'reviewed-service')).documentPath);
+  const crossBody:ProofManifestBody={...body,documentHash:sha256(v1Bytes)};
+  const crossPath=join(proofRoot,'magpie-v2-over-v1.json');
+  await writeFile(crossPath,JSON.stringify({...crossBody,configurationDigest:configurationDigest(crossBody)}));
+  await expect(ops.call(prover,proofTask.id,'ops_internal_ai_prepare',{manifestPath:crossPath,documentPath:join(proofRoot,'internal-ai-evidence.json')})).rejects.toMatchObject({code:'invalid'});
 });
 check('missing approval, wrong manifest/hash/activity/scope and idempotency conflicts reject',async()=>{
   await expect(request('ops_internal_ai_prove',{...proofArgs('none'),approvalTask:consumerTask})).rejects.toBeDefined();

@@ -167,6 +167,42 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
     planHtml: '<html><body>SenseNova Token Plan 订阅方案 公测期完全免费开放，付费档位即将上线 Free · 公测 限时放量 ¥ 0 /月</body></html>',
   };
 
+  /**
+   * Local Magpie gateway fixture for ops_magpie_route_sample. Only the loopback public surfaces
+   * are served; the routing config carries an unrelated secret-looking field so the receipt can
+   * prove it never leaves the sampler.
+   */
+  magpie = {
+    base: 'http://127.0.0.1:3425',
+    accountUser: 'snv-magpie-account',
+    accountProvider: 'sensenova',
+    quotaKind: 'subscription',
+    quotaReadAtSkewMs: 0,
+    quotaUntilInMs: 30 * 86_400_000,
+    windows: [{ name: '5h', remaining: 42, resetsInMs: 3 * 3_600_000 }] as Array<{ name?: string; remaining?: unknown; resetsInMs?: number; resetsAt?: unknown; unlimited?: boolean }>,
+    quotasStatus: 200,
+    modelsStatus: 200,
+    usageStatus: 200,
+    servedModel: 'sn-sensenova-6-8-flash',
+    groupMembers: ['sensenova/sn-sensenova-6-8-flash'] as string[],
+    pricing: { input: 0.000_000_5, output: 0.000_001_5, currency: 'USD' } as { input?: number; output?: number; currency?: string } | null,
+    catalogFree: false,
+    usagePriced: true,
+    usageCost: 0.000_012 as number | null,
+    usageDone: true as unknown,
+    usageIn: 50,
+    usageOut: 8,
+    usageRouteId: 'run-magpie-1',
+    usageResponseId: 'resp-magpie-1',
+    usageProviderKeyId: 'key-abc' as string | null,
+    usageModel: null as string | null,
+    providers: {
+      groups: [{ id: 'group/work', members: ['sensenova/sn-sensenova-6-8-flash'], affinity: 'smart' }],
+      providers: [{ id: 'sensenova', routing: 'smart', api_key: '{{SECRET_magpie_config}}' }],
+      revision: 'internal-value-that-must-not-leave',
+    },
+  };
+
   constructor() {
     this.sqlite.run(`CREATE TABLE users (
       id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, email TEXT, email_verified INTEGER NOT NULL DEFAULT 0, username TEXT,
@@ -285,6 +321,7 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
     if (url.origin === 'https://idp.test') return this.idpAuthorize(url);
     if (url.origin === 'https://auth.test') return this.loginHost(url, method, init);
     if (url.origin === 'https://app.test') return this.product(url, method, init);
+    if (url.origin === this.magpie.base) return this.magpieHost(url, method, init);
     if (['token.sensenova.cn', 'platform.sensenova.cn', 'www.sensenova.cn', 'iam.sensecoreapi.cn'].includes(url.host)) return this.supplierHost(url, method, init);
     return new Response('unreachable host', { status: 502 });
   }
@@ -518,6 +555,47 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
       return json(400, { error: 'invalid_grant' });
     }
     return json(200, { access_token: this.mint(code.userId, undefined, true), token_type: 'Bearer', expires_in: 900 });
+  }
+
+  /** The loopback gateway surfaces the Magpie sampler reads. No model call is ever served. */
+  private magpieHost(url: URL, method: string, _init?: RequestInit): Response {
+    if (method !== 'GET') return json(405, { error: 'method_not_allowed' });
+    const m = this.magpie;
+    const headers: Record<string, string> = { 'content-type': 'application/json', date: new Date(this.clock).toUTCString() };
+    if (url.pathname === '/v1/models') {
+      if (m.modelsStatus !== 200) return new Response('', { status: m.modelsStatus, headers });
+      const data = m.groupMembers.map(member => ({
+        id: member, object: 'model', owned_by: member.includes('/') ? member.slice(0, member.lastIndexOf('/')) : m.accountProvider,
+        ...(m.pricing ? { pricing: m.pricing } : {}), ...(m.catalogFree ? { free: true } : {}),
+      }));
+      return new Response(JSON.stringify({ object: 'list', data }), { status: 200, headers });
+    }
+    if (url.pathname === '/v1/magpie/quotas') {
+      if (m.quotasStatus !== 200) return new Response('', { status: m.quotasStatus, headers });
+      return new Response(JSON.stringify([{
+        provider: m.accountProvider, user: m.accountUser, kind: m.quotaKind,
+        readAt: new Date(this.clock - m.quotaReadAtSkewMs).toISOString(),
+        until: new Date(this.clock + m.quotaUntilInMs).toISOString(), renew: 'monthly',
+        windows: m.windows.map(w => ({
+          name: w.name ?? 'window',
+          ...(w.remaining !== undefined ? { remaining: w.remaining } : {}),
+          ...(w.resetsAt !== undefined ? { resetsAt: w.resetsAt } : w.resetsInMs !== undefined ? { resetsAt: new Date(this.clock + w.resetsInMs).toISOString() } : {}),
+          limit: 100, amount: 100, unit: 'percent', unlimited: w.unlimited === true,
+        })),
+      }]), { status: 200, headers });
+    }
+    if (url.pathname === '/v1/magpie/usage/requests') {
+      if (m.usageStatus !== 200) return new Response('', { status: m.usageStatus, headers });
+      const row = {
+        t: new Date(this.clock - 60_000).toISOString(), agent: 'sck', provider: m.accountProvider,
+        model: m.usageModel ?? m.servedModel, status: 200, ms: 120, in: m.usageIn, out: m.usageOut,
+        cache_read: 0, cache_write: 0, route_id: m.usageRouteId, id: 'req-magpie-1',
+        response_id: m.usageResponseId, providerKeyId: m.usageProviderKeyId,
+        cost: m.usagePriced ? m.usageCost : null, priced: m.usagePriced, done: m.usageDone,
+      };
+      return new Response(JSON.stringify({ rows: [row], total: 1 }), { status: 200, headers });
+    }
+    return new Response('404 Not Found', { status: 404, headers });
   }
 
   /**

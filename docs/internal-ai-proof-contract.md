@@ -75,3 +75,12 @@ v3 文档（`schemaVersion=3`，`type=reviewed-token-plan`，`evidenceClass=prom
 `revalidateBeforeUse=true` 是文档的持续义务声明，不是“已核实”的证明：每次模型调用前由源业务（33dc）重新采样官方 FREE/限时状态与池剩余，文档到期即作废、不续旧件；公司证明链只在签发时校验该文档。
 
 评审人生命周期（FV06）：批准以审计行的 accept 评审人为准，其撤权状态按结构化字段判定，诊断、授权与密钥轮换共用同一规则。调度器正常轮换或归档（员工退役类型 `rotation` / `archive`）只使凭证失效，不撤销已形成的独立批准；显式安全撤权（管理员 revoke，写入不可回退的 `security_revoked`）、失败或人工退役、改动前写入的无类型退役（旧记录）一律拒绝。旧记录不自动追认，需要新的独立批准。
+
+### FV06 Magpie：manifest v2 与受控路由快照 v4
+
+`manifestSchema` 现为 v1/v2 判别联合：v1 仍是直连供应商的 `schemaVersion=1`（`service.accountRef/endpoint/model/priceRevision`）；v2 是 `schemaVersion=2` 的 `service.kind=magpie-route`，绑定 loopback endpoint、`accountRef`（`mgp…`）、`routeId=group/work`、`routeDigest` 与 `priceRevision`。两版共用同一 USD/30 次预算包络和两名固定身份，`configurationDigest` 覆盖各自全部字段。v1 字段不得改写为 Magpie；旧 v3 文档也不能配 v2 manifest。
+
+v4 文档 `type=magpie-controlled-route` 由只读采样器 `ops_magpie_route_sample` 生成：账号绑定用密封用户名与 Magpie quota `user` 精确比对（只出哈希）、记录路由组与 digest、从 usage 历史取 servedModel/requestId/run、记录百分比窗口与 `resetsAt`（不冒充绝对余额）、价目为 catalog 观测且默认未受审、未知成本为 null。本机快照 TTL 7200s，执行余量 5400s；`expiresAt` 取 TTL、订阅 until 与窗口 resetsAt 的最早者，余量不足即关闭。`magpieEvidenceEligible` 重新推导绑定、路由 digest、servedModel 集合归属、窗口新鲜度、价格受审与余量，未受审价目保持 `price-not-reviewed`，不能用于 enable 或窗口。
+
+缺失的窗口适配由 `ops_magpie_window_prepare` 在链路内代理：只读 manifest v2 与 v4 文档，返回可绑定的 `executionWindow`（`minRemainingSeconds=5400`、`notAfter=evidenceExpiresAt−5400s`）或具体 blocked 字段；不写候选、不启用、不重试。字段、失败项、只读边界与非目标详见 [Magpie 受控路由快照契约](./magpie-controlled-route-contract.md)。
+
