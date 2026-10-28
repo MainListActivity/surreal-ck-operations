@@ -478,6 +478,21 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.recordAcceptanceEvidence
     ? core.recordAcceptanceEvidence(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('deploy_drill_run', {
+    description: 'SYS-INT: start one controlled non-production two-face switch & rollback drill under the service drills root (isolated fork DB, dedicated ports; never production). Only the task holder (engineering) or gm; audited.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200), runId: z.string().min(36).max(36),
+      baseSha: z.string().length(40), candidateSha: z.string().length(40), idempotencyKey: z.string().min(1),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.deployDrillRun
+    ? core.deployDrillRun(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('deploy_drill_status', {
+    description: 'SYS-INT: read one deploy drill run state and its structured stage records.',
+    inputSchema: z.object({ runId: z.string().min(36).max(36) }),
+  }, async (input, ctx) => run(token(ctx), () => core.deployDrillStatus
+    ? core.deployDrillStatus(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('acceptance_status', {
     description: 'SYS02: read the versioned gate record and the current acceptance verdict for one task: every criterion, the verified evidence, and the unmet list. The task holder, its reviewer, or gm may read it.',
     inputSchema: z.object({ taskId: z.string().min(1).max(200) }),
