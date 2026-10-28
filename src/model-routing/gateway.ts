@@ -64,7 +64,8 @@ function claudeMetadataSession(metadata: unknown): string | undefined {
   return typeof session === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(session)
     ? session : undefined;
 }
-/** Project-local settings override a user's global settings.env without changing their personal sessions. */
+export const ROUTING_SETTINGS_VERSION = "v3";
+/** Private employee settings override a user's global settings.env without changing their personal sessions. */
 export function installRoutingSettings(
   comm: string,
   env: Record<string, string>,
@@ -96,7 +97,15 @@ export function installRoutingSettings(
     "\n";
   writeFileSync(file + ".sck-tmp", next, { mode: 0o600 });
   renameSync(file + ".sck-tmp", file);
-  writeFileSync(join(comm, ".sck-model-router"), "v2", { mode: 0o600 });
+  writeFileSync(join(comm, ".sck-model-router"), ROUTING_SETTINGS_VERSION, { mode: 0o600 });
+}
+/** Rollback follows employee identity, not the physical project workspace. */
+export function restoreEmployeeRoutingSettings(home: string, employee: string, legacyCwd?: string): boolean {
+  const comm = join(home, "comm", employee);
+  let restored = restoreRoutingSettings(comm);
+  if (legacyCwd && legacyCwd !== comm && legacyCwd.startsWith(join(home, "comm") + "/"))
+    restored = restoreRoutingSettings(legacyCwd) || restored;
+  return restored;
 }
 export function restoreRoutingSettings(comm: string): boolean {
   const file = join(comm, ".claude", "settings.local.json"),
@@ -123,6 +132,9 @@ export function restoreRoutingSettings(comm: string): boolean {
   unlinkSync(backup);
   try {
     unlinkSync(join(comm, ".sck-model-router"));
+  } catch {}
+  try {
+    unlinkSync(join(comm, ".sck-native-client"));
   } catch {}
   return true;
 }
@@ -270,7 +282,8 @@ export async function startModelGateway(
         turn_key:lease.turn_key,
         harness: "claude",
         effort_requested:
-          body.output_config?.effort ?? body.thinking?.type ?? "unspecified",
+          body.output_config?.effort ?? body.reasoning?.effort ?? body.reasoning_effort ?? "unspecified",
+        reported_effort: null, // No echo or model suffix is proof of what the upstream actually used.
         task: lease.task,
         employee: lease.employee,
         fence: lease.fence,

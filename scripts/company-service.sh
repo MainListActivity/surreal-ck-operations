@@ -130,6 +130,10 @@ case "$action" in
     mkdir -p "$service_home/bin" "$service_home/logs" "$HOME/Library/LaunchAgents"
     chmod 700 "$service_home" "$service_home/bin" "$service_home/logs" "$service_home/private"
     cp "$(dirname "$0")/run-service.sh" "$service_home/bin/run.sh"
+    # Keep the already-installed provider wrapper current without changing daemon configuration.
+    if [ -d "$service_home/sandbox" ]; then
+      install -m 0755 "$release/scripts/sandbox/launch.sh" "$service_home/sandbox/launch.sh"
+    fi
     cp "$(dirname "$0")/sck.sh" "$service_home/bin/sck"
     cp "$(dirname "$0")/bun-runtime.sh" "$service_home/bin/bun-runtime.sh"
     chmod 700 "$service_home/bin/run.sh" "$service_home/bin/sck" "$service_home/bin/bun-runtime.sh"

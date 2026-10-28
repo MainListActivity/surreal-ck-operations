@@ -25,10 +25,11 @@ import {
   type Domain,
   type Tier,
 } from "./policy.ts";
+import { ROUTING_SETTINGS_VERSION } from "./gateway.ts";
 import { setAgentModel } from "../dispatcher/agent-model.ts";
-import { employeeTier } from "./policy.ts";
+import { employeeTier, employeeClientModel } from "./policy.ts";
 import { createPaseoCli } from "../dispatcher/paseo.ts";
-import { GROUP_STAYS, saveMagpieGroups, magpieEnvironment } from "./magpie-admin.ts";
+import { GROUP_STAYS, GROUP_LEVELS, saveMagpieGroups, magpieEnvironment } from "./magpie-admin.ts";
 import { readModelResults } from "./store.ts";
 import { readModelHealth } from "./health.ts";
 import { GaugeHistory, metricTrend, readUsageSamples, type ModelTrends, type Sample } from "./trends.ts";
@@ -65,6 +66,10 @@ export function readMagpieGroups(file = join(homedir(), ".config", "magpie", "pr
     return {};
   }
 }
+export function readMagpieLevels(file = join(homedir(), ".config/magpie/providers.json")): Record<string, string[]> {
+  const groups = JSON.parse(readFileSync(file, "utf8"))?.groups ?? [];
+  return Object.fromEntries(groups.map((g: {id:string; levels?:string[]}) => [g.id, g.levels ?? []]));
+}
 /** Each group's stickiness as magpie stored it; the default (`auto`) is stored as no field. */
 export function readMagpieAffinity(file = join(homedir(), ".config", "magpie", "providers.json")): Record<string, string> {
   try {
@@ -84,6 +89,14 @@ export interface RoutingConfig {
 }
 export function readMagpieProviderRouting(file=join(homedir(),'.config/magpie/providers.json')):Record<string,string>{
  try{const data=JSON.parse(readFileSync(file,'utf8'));return Object.fromEntries((data.providers??[]).map((p:{id:string;routing?:string})=>[p.id,p.routing??'smart']));}catch{return {};}
+}
+const nativeClientSignature = (role: string) => JSON.stringify({model:employeeClientModel(role),thinking:employeeTier(role)==='haiku'?'max':null});
+/** Installing transport settings is not proof that the native client model/effort was migrated. */
+export function needsEmployeeActivation(comm: string, role: string): boolean {
+  try {
+    return readFileSync(join(comm,".sck-model-router"),"utf8") !== ROUTING_SETTINGS_VERSION ||
+      readFileSync(join(comm,".sck-native-client"),"utf8") !== nativeClientSignature(role);
+  } catch {return true;}
 }
 export class ModelRoutingController {
   enabled = false;
@@ -106,6 +119,7 @@ export class ModelRoutingController {
       output?: (args: string[]) => Promise<string>;
       groups?: () => Record<string, string[]>;
       affinity?: () => Record<string, string>;
+      levels?: () => Record<string, string[]>;
       providerRouting?: () => Record<string,string>;
       jev?: JevClient;
       usageLog?: string;
@@ -345,16 +359,16 @@ export class ModelRoutingController {
     if (!this.enabled || Date.now() - this.sessionsChecked < 30000) return;
     this.sessionsChecked = Date.now();
     const [rows] = await this.db.query<
-      [Array<{ paseo_agent_id: string; workspace_cwd?: string; role:string }>]
+      [Array<{ id: {id:unknown}; paseo_agent_id: string; workspace_cwd?: string; role:string }>]
     >(
-      "SELECT paseo_agent_id,workspace_cwd,role FROM employee WHERE provider='claude' AND role!='story-author' AND retired!=true AND revoked!=true AND paseo_agent_id!=NONE AND active_task=NONE LIMIT 100;",
+      "SELECT id,paseo_agent_id,workspace_cwd,role FROM employee WHERE provider='claude' AND role!='story-author' AND retired!=true AND revoked!=true AND paseo_agent_id!=NONE AND active_task=NONE LIMIT 100;",
     );
     const paseo = createPaseoCli(undefined, { timeoutMs: 5000 });
     const pending = rows
       .filter(
         (row) =>
           row.workspace_cwd &&
-          ( !existsSync(join(row.workspace_cwd, ".sck-model-router")) || readFileSync(join(row.workspace_cwd, ".sck-model-router"),"utf8") !== "v2" ),
+          needsEmployeeActivation(join(this.home,"comm",String(row.id.id)),row.role),
       )
       .slice(0, 3);
     for (const row of pending) {
@@ -362,8 +376,9 @@ export class ModelRoutingController {
         .status(row.paseo_agent_id)
         .catch(() => undefined);
       if (status?.status === "idle" && status.pendingPermissions === 0) {
-        if (!await setAgentModel(row.paseo_agent_id,`group/sck-${employeeTier(row.role)}`)) continue;
+        if (!await setAgentModel(row.paseo_agent_id,employeeClientModel(row.role), {thinkingOptionId:employeeTier(row.role)==='haiku'?'max':undefined})) continue;
         await paseo.reload(row.paseo_agent_id);
+        await writeFile(join(this.home,"comm",String(row.id.id),".sck-native-client"),nativeClientSignature(row.role),{mode:0o600});
       }
     }
   }
@@ -436,6 +451,7 @@ export class ModelRoutingController {
     } catch {}
     const groups: Record<string, string> = {};
     const routes: Record<string, Array<{ model: string; score: number; samples: number }>> = {};
+    const groupLevels = this.io.levels?.() ?? (this.io.command ? {} : readMagpieLevels());
     const groupsToSet: Array<{ id: string; models: string[]; signature: string }> = [];
     // Membership is the owner's. Automatic grouping runs once per GROUPING_VERSION and afterwards
     // only places models this controller has never seen; manual adds and removals in magpie stay.
@@ -500,7 +516,7 @@ export class ModelRoutingController {
       const signature = digest(JSON.stringify(members));
       groups[`sck-${tier}`] = signature;
       // A group whose stickiness differs is rewritten too: membership alone would leave it as it was.
-      if (JSON.stringify(current) !== JSON.stringify(members) || (stays[`sck-${tier}`] ?? GROUP_STAYS) !== GROUP_STAYS)
+      if (JSON.stringify(current) !== JSON.stringify(members) || (stays[`sck-${tier}`] ?? GROUP_STAYS) !== GROUP_STAYS || JSON.stringify(groupLevels[`sck-${tier}`] ?? []) !== JSON.stringify(GROUP_LEVELS))
         groupsToSet.push({ id: `sck-${tier}`, models: members, signature });
       routes[`group/sck-${tier}`] = ordered.map((m) => ({ model: m.id, score: m.score, samples: m.samples }));
     }
@@ -517,6 +533,7 @@ export class ModelRoutingController {
           `models=${g.models.join(",")}`,
           "routing=order",
           `stays=${GROUP_STAYS}`,
+          `levels=${GROUP_LEVELS.join(",")}`,
         ]);
       }
     } else await saveMagpieGroups(this.cli, groupsToSet, isCurrent);

@@ -376,6 +376,7 @@ test("controller writes only the automatic magpie tier groups, removes the retir
   writeFileSync(join(home, "model-routing", "groups.json"), JSON.stringify({ "sck-route-haiku-best": "x", __selector: "y", __options: "z" }));
   const store: Record<string, string[]> = {};
   const affinity: Record<string, string> = {};
+  const levels: Record<string, string[]> = {};
   const controller = new ModelRoutingController(db as any, home, "unused", {
     fetch: (async () =>
       Response.json({
@@ -387,16 +388,17 @@ test("controller writes only the automatic magpie tier groups, removes the retir
       })) as unknown as typeof fetch,
     command: async (args) => {
       calls.push(args);
-      if (args[0] === "group" && args[1] === "add") { store[args[2]!] = args[3]!.slice(7).split(","); affinity[args[2]!] = args.find((x) => x.startsWith("stays="))!.slice(6); }
+      if (args[0] === "group" && args[1] === "add") { store[args[2]!] = args[3]!.slice(7).split(","); affinity[args[2]!] = args.find((x) => x.startsWith("stays="))!.slice(6); levels[args[2]!] = args.find(x=>x.startsWith("levels="))!.slice(7).split(","); }
     },
     groups: () => store,
     affinity: () => affinity,
+    levels: () => levels,
   });
   await controller.refresh(true);
   expect(status.models.map((m: any) => m.id)).toEqual(["claude/claude-opus-5-5", "claude/claude-haiku-5-5"]);
   const groups = calls.filter((c) => c[0] === "group" && c[1] === "add");
   expect(groups.map((c) => c[2])).toEqual(["sck-fable", "sck-sonnet", "sck-haiku"]);
-  expect(groups.every((c) => c.includes("routing=order") && c.includes("stays=auto"))).toBe(true);
+  expect(groups.every((c) => c.includes("routing=order") && c.includes("stays=auto") && c.includes("levels=low,medium,high,xhigh,max"))).toBe(true);
   expect(groups.every((c) => !c.join(" ").includes("mystery"))).toBe(true);
   expect(calls).toContainEqual(["plugin", "rm", join(home, "model-routing", "sck-performance.gateway.js")]);
   expect(calls).toContainEqual(["group", "rm", "sck-route-haiku-best"]);
@@ -408,7 +410,7 @@ test("controller writes only the automatic magpie tier groups, removes the retir
   // Groups written by the release that pinned every lease (stays=session) are rewritten though their members match.
   affinity["sck-haiku"] = "session";
   await controller.refresh(true);
-  expect(calls.slice(n).filter((c) => c[1] === "add").map((c) => [c[2], c.at(-1)])).toEqual([["sck-haiku", "stays=auto"]]);
+  expect(calls.slice(n).filter((c) => c[1] === "add").map((c) => [c[2], c.find(x=>x.startsWith("stays="))])).toEqual([["sck-haiku", "stays=auto"]]);
 });
 
 test("removing a route group that is already gone does not fail the sync", async () => {
@@ -598,9 +600,9 @@ test("roster simplification preserves story authors, role tracks and review seat
   const changes=planRoutingRoster(defs);
   expect(changes.some(d=>d.role==='story-author')).toBe(false);
   expect(changes.find(d=>d.id==='qa-codex')?.enabled).toBe(false);
-  expect(changes.find(d=>d.id==='qa-claude')).toMatchObject({model:'group/sck-haiku',maxInstances:2,tracks:['web','mobile']});
-  expect(changes.find(d=>d.role==='gm' && d.enabled)).toMatchObject({provider:'claude',model:'group/sck-opus'});
-  expect(changes.find(d=>d.role==='product' && d.enabled)?.model).toBe('group/sck-sonnet');
+  expect(changes.find(d=>d.id==='qa-claude')).toMatchObject({model:'claude-haiku-5-5',thinking:'max',maxInstances:2,tracks:['web','mobile']});
+  expect(changes.find(d=>d.role==='gm' && d.enabled)).toMatchObject({provider:'claude',model:'claude-opus-5-5'});
+  expect(changes.find(d=>d.role==='product' && d.enabled)?.model).toBe('claude-sonnet-5-5');
   expect(changes.filter(d=>d.enabled).every(d=>!d.model.includes('fable'))).toBe(true);
 });
 

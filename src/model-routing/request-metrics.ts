@@ -3,6 +3,8 @@ export interface RequestMetrics {
   total_ms:number; ttft_ms?:number; first_text_ms?:number;
   output_tokens?:number; input_tokens?:number; cache_read_tokens?:number;
   reported_model?:string;
+  /** Explicit upstream response declaration only; missing stays unknown. */
+  reported_effort?:string;
 }
 const count=(x:unknown):x is number=>typeof x==='number'&&Number.isFinite(x)&&x>=0;
 export class StreamMetrics {
@@ -20,6 +22,9 @@ export class StreamMetrics {
     if(event.error||event.type==='error'||event.type==='response.failed'||event.type==='response.incomplete')this.failed=true;
     if(event.type==='message_stop'||event.type==='response.completed')this.terminal=true;
     this.model(event.model??event.message?.model??event.response?.model);
+    const envelope=event.message??event.response??event;
+    const effort=envelope.output_config?.effort??envelope.reasoning?.effort??envelope.reasoning_effort;
+    if (typeof effort === "string" && ["none","minimal","low","medium","high","xhigh","max","ultra"].includes(effort)) this.usage.reported_effort=effort;
     this.tokens(event.usage??event.message?.usage??event.response?.usage);
     const delta=event.delta;
     if(event.type==='content_block_start'){

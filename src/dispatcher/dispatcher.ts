@@ -1,7 +1,7 @@
 import { faultBelongsToWait, faultNeedsNotice } from '../task-recovery.ts';
 import { workspaceScopeFor } from '../goal-workspace-capability.ts';
 import { FACTORY_PROVIDER, factoryFirst } from './provider-order.ts';
-import { managedModel } from "../model-routing/policy.ts";
+import { managedModel, employeeClientModel } from "../model-routing/policy.ts";
 import type { OwnerDesk } from '../owner.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ManagerActionRow, ManagerWakeClaim, ManagerWakeRow, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, MANAGER_WAKE_PENDING_GRACE_SECONDS, MANAGER_WAKE_TURN_GRACE_SECONDS, managerWakeKey, weightedOrder } from '../workforce.ts';
@@ -1146,7 +1146,7 @@ export class Dispatcher {
         // all stay valid. Realign it in place, and when that is not possible leave it for the next
         // pass rather than throwing the session away.
         const def = defs.find(d => d.id === inst.def);
-        const target = def?.model?.startsWith('group/sck-') ? undefined : def ? resolveModel(def) : undefined;
+        const target = def ? resolveModel(def) : undefined;
         const served = runtimeModels.get(inst.id) ?? inst.model;
         // Realign only once the subscription has recovered. A provider that switched models because
         // its standard allowance ran out switches back on its own at reset; asking every pass during
@@ -2237,6 +2237,7 @@ export class Dispatcher {
 
   /** `auto:<family>` resolves through the plugin-maintained slot map; literal model ids pin. */
   private resolveModel(def: EmployeeDef, slots: Map<string, string>): string | undefined {
+    if (managedModel(def)) return employeeClientModel(def.role);
     const model = def.model ?? '';
     return model.startsWith('auto:') ? slots.get(`${def.provider}:${model.slice(5)}`) : model || undefined;
   }
