@@ -161,6 +161,17 @@ describe('magpie controlled route snapshot', () => {
     empty.world.magpie.windows = [{ name: '5h', remaining: 0, resetsInMs: 3_600_000 }];
     expect((await sample(empty)).gaps.map((g: any) => g.field)).toContain('quotaInsufficient');
 
+    // A healthy 7d window does not rescue an exhausted 5h window: every non-unlimited window must remain.
+    const partly = rig();
+    partly.world.magpie.windows = [
+      { name: '5h', remaining: 0, resetsInMs: 3 * 3_600_000 },
+      { name: '7d', remaining: 50, resetsInMs: 5 * 86_400_000 },
+    ];
+    const partlyOut = await sample(partly);
+    expect(partlyOut.status).toBe('blocked');
+    expect(partlyOut.gaps.map((g: any) => g.field)).toContain('quotaInsufficient');
+    expect(partlyOut.document).toBeUndefined();
+
     const stale = rig();
     stale.world.magpie.quotaReadAtSkewMs = (MAGPIE_SNAPSHOT_MAX_AGE_SECONDS + 1) * 1000;
     expect((await sample(stale)).gaps.map((g: any) => g.field)).toContain('staleBalance');
@@ -205,6 +216,38 @@ describe('magpie execution-window proxy', () => {
     expect(first.documentHash).toBe(sha256(readFileSync(paths.documentPath)));
     // Duplicate calls are read-only: no second candidate, manifest or document is created.
     expect(readdirSync(join(r.home, 'evidence', 'task-1')).sort()).toEqual(before);
+  });
+
+  test('a snapshot captured in the future cannot obtain a window', async () => {
+    const r = rig();
+    const out = await sample(r);
+    const reviewed = { ...out.document, pricing: { ...out.document.pricing, reviewed: true }, approvalReadiness: { ready: true, blockedReasons: [] } };
+    const delta = 3_600_000;
+    const sampled = Date.parse(reviewed.sampledAt);
+    const future = {
+      ...reviewed,
+      sampledAt: new Date(sampled + delta).toISOString(),
+      expiresAt: new Date(Date.parse(reviewed.expiresAt) + delta).toISOString(),
+      snapshot: { ...reviewed.snapshot, capturedAt: new Date(sampled + delta).toISOString() },
+      sources: reviewed.sources.map((source: any) => ({
+        ...source,
+        capturedAt: new Date(Date.parse(source.capturedAt) + delta).toISOString(),
+        ...(source.httpDate ? { httpDate: new Date(Date.parse(source.httpDate) + delta).toISOString() } : {}),
+      })),
+      subscription: {
+        ...reviewed.subscription,
+        readAt: new Date(sampled + delta).toISOString(),
+        until: new Date(Date.parse(reviewed.subscription.until) + delta).toISOString(),
+        windows: reviewed.subscription.windows.map((window: any) => ({
+          ...window, resetsAt: window.resetsAt ? new Date(Date.parse(window.resetsAt) + delta).toISOString() : null,
+        })),
+      },
+    };
+    expect(evidenceSchema.safeParse(future).success).toBe(true);
+    const paths = writeProof(r, v2Manifest(future), future);
+    const window = await prepare(r, paths);
+    expect(window.eligible).toBe(false);
+    expect(window.blockedReasons).toContain('sample-in-future');
   });
 
   test('a schema-valid but ineligible route snapshot cannot obtain a window', async () => {

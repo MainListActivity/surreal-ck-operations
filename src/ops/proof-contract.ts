@@ -249,6 +249,8 @@ export const MAGPIE_SNAPSHOT_ID = 'magpie-controlled-snapshot/1';
 export const MAGPIE_SNAPSHOT_MAX_AGE_SECONDS = 7_200;
 /** Minimum execution headroom before an approved window may use this evidence (90 minutes). */
 export const MAGPIE_EXECUTION_HEADROOM_SECONDS = 5_400;
+/** Source timestamp tolerance for a usage row relative to the local capture instant. */
+export const MAGPIE_SOURCE_CLOCK_SKEW_MS = 300_000;
 export const MAGPIE_EVIDENCE_CLASS = 'controlled-route-snapshot';
 /** Canonical digest over the approved routable set; a route change alters it, invalidating the candidate. */
 export function magpieRouteDigest(routable: Array<{ model: string; provider: string }>): string {
@@ -396,6 +398,9 @@ export const magpieEvidenceV4Schema = z.object({
   if (v.route.digest !== magpieRouteDigest(v.route.routable)) fail('route.digest', 'route digest must cover the approved routable set');
   if (!v.route.routable.some(row => row.model === v.route.servedModel)) fail('route.servedModel', 'served model is outside the approved routable set');
   if (v.usage.servedModel !== v.route.servedModel) fail('usage.servedModel', 'usage served model must equal the route observation');
+  if (v.route.observedAt !== v.usage.at) fail('route.observedAt', 'route observation must be the same usage event');
+  const usageAt = Date.parse(v.usage.at);
+  if (!Number.isFinite(usageAt) || usageAt > sampled + MAGPIE_SOURCE_CLOCK_SKEW_MS) fail('usage.at', 'a usage event cannot postdate the local capture');
   if (v.usage.provider !== v.account.provider) fail('usage.provider', 'usage provider must equal the bound account provider');
   if (v.subscription.provider !== v.account.provider) fail('subscription.provider', 'subscription provider must equal the bound account provider');
   if (v.priceRevision !== v.pricing.priceRevision) fail('priceRevision', 'top-level priceRevision must equal the pricing revision');
@@ -426,9 +431,13 @@ export function magpieEvidenceEligible(e: MagpieEvidenceV4, now: number): boolea
   if (!e.pricing.reviewed) return false;
   const sampled = Date.parse(e.sampledAt), expires = Date.parse(e.expiresAt), usageAt = Date.parse(e.usage.at);
   if (![sampled, expires, usageAt].every(Number.isFinite)) return false;
+  // The capture instant itself must already have happened; a hand-written future snapshot cannot open a window.
+  if (sampled > now) return false;
   if (expires <= now || now - sampled > e.snapshot.maxAgeSeconds * 1000 || expires > sampled + e.snapshot.maxAgeSeconds * 1000) return false;
   // 90 minutes of execution headroom, measured against the evidence's own expiry.
   if (expires - now < MAGPIE_EXECUTION_HEADROOM_SECONDS * 1000) return false;
+  if (usageAt > sampled + MAGPIE_SOURCE_CLOCK_SKEW_MS) return false;
+  if (e.route.observedAt !== e.usage.at) return false;
   if (sampled - usageAt > e.snapshot.maxAgeSeconds * 1000) return false;
   if (e.route.group !== 'group/work' || e.route.digest !== magpieRouteDigest(e.route.routable)) return false;
   if (e.route.routable.some(row => row.provider !== e.account.provider)) return false;
@@ -438,7 +447,10 @@ export function magpieEvidenceEligible(e: MagpieEvidenceV4, now: number): boolea
   if (e.subscription.readAt === null) return false;
   const readAt = Date.parse(e.subscription.readAt);
   if (!Number.isFinite(readAt) || sampled - readAt > e.snapshot.maxAgeSeconds * 1000 || readAt > sampled + 1_000) return false;
-  if (!e.subscription.windows.some(window => window.remainingPct > 0)) return false;
+  // Match the v3 minimum-remaining rule: every non-unlimited window must still have quota. One exhausted
+  // window is enough to make the route unusable even when a longer window is healthy.
+  if (!e.subscription.windows.some(window => window.unlimited || window.remainingPct > 0)) return false;
+  if (e.subscription.windows.some(window => !window.unlimited && window.remainingPct <= 0)) return false;
   if (e.subscription.windows.some(window => window.resetsAt !== null && Date.parse(window.resetsAt) <= now)) return false;
   if (e.subscription.until !== null && (Date.parse(e.subscription.until) <= now || expires > Date.parse(e.subscription.until))) return false;
   if (e.subscription.windows.some(window => window.resetsAt !== null && expires > Date.parse(window.resetsAt))) return false;

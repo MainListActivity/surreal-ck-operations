@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { describeTransportFailure, opsFetch, type Fetcher } from './fetcher.ts';
 import {
   evidenceSchema, sha256, canonical, magpieRouteDigest, magpieEvidenceEligible, MAGPIE_SNAPSHOT_ID, MAGPIE_SNAPSHOT_MAX_AGE_SECONDS,
-  MAGPIE_EXECUTION_HEADROOM_SECONDS, type MagpieEvidenceV4,
+  MAGPIE_EXECUTION_HEADROOM_SECONDS, MAGPIE_SOURCE_CLOCK_SKEW_MS, type MagpieEvidenceV4,
 } from './proof-contract.ts';
 import type { ProofFiles } from './proof-files.ts';
 import { redactJson } from './redact.ts';
@@ -366,7 +366,7 @@ export async function sampleMagpieRoute(input: MagpieSampleInput): Promise<Magpi
     });
     if (!windows.length) fail('quota', 'quotas', 'no usable quota window (remaining 0-100) for the bound account');
     else {
-      if (windows.every(w => w.remainingPct === 0 && !w.unlimited)) fail('quotaInsufficient', 'quotas', 'every quota window is exhausted');
+      if (windows.some(w => !w.unlimited && w.remainingPct <= 0)) fail('quotaInsufficient', 'quotas', 'a quota window is exhausted; the snapshot cannot establish usable remaining quota');
       if (windows.some(w => w.resetsAt !== null && Date.parse(w.resetsAt) <= sampledMs)) fail('quotaExpired', 'quotas', 'a quota window already reset at capture time');
       const until = dateOrNull(accountRow.until);
       if (until !== null && Date.parse(until) <= sampledMs) fail('subscription', 'quotas', 'the subscription already expired at capture time');
@@ -386,6 +386,9 @@ export async function sampleMagpieRoute(input: MagpieSampleInput): Promise<Magpi
   if (accountRow && accountProvider) {
     const candidates = parseUsageRows(usageBody).flatMap((row): Array<{ row: Record<string, unknown>; at: number }> => {
       const at = dateOrNull(row.t);
+      // A row that claims to have completed after this capture (beyond the source-skew bound) is not evidence
+      // of a served model; it must not be chosen just because its timestamp sorts first.
+      if (at !== null && Date.parse(at) > sampledMs + MAGPIE_SOURCE_CLOCK_SKEW_MS) return [];
       const provider = textOrNull(row.provider, 128);
       const model = textOrNull(row.model, 160);
       if (!at || provider !== accountProvider || !model || row.done === false) return [];
@@ -582,10 +585,14 @@ export function magpieWindowFromEvidence(files: ProofFiles, approvalTask: string
   const evidence = files.evidence;
   const evidenceExpiresAt = evidence.expiresAt;
   const headroomSeconds = Math.floor((Date.parse(evidenceExpiresAt) - now) / 1000);
+  const sampleInFuture = Date.parse(evidence.sampledAt) > now;
   if (evidence.type !== 'magpie-controlled-route') {
+    if (sampleInFuture) return { eligible: false, blockedReasons: ['sample-in-future'], headroomSeconds, evidenceExpiresAt };
     return { eligible: false, blockedReasons: ['not-magpie-evidence'], headroomSeconds, evidenceExpiresAt };
   }
   const reasons = new Set<string>(evidence.approvalReadiness.blockedReasons);
+  if (sampleInFuture) reasons.add('sample-in-future');
+  if (Date.parse(evidence.usage.at) > now) reasons.add('usage-in-future');
   if (!evidence.approvalReadiness.ready || !evidence.pricing.reviewed) reasons.add('price-not-reviewed');
   if (headroomSeconds < MAGPIE_EXECUTION_HEADROOM_SECONDS) reasons.add('insufficient-headroom');
   const notAfterMs = Date.parse(evidenceExpiresAt) - MAGPIE_EXECUTION_HEADROOM_SECONDS * 1000;

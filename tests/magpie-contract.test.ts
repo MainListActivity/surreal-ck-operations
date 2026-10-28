@@ -142,13 +142,54 @@ describe('magpie evidence v4', () => {
     expect(short.success).toBe(true);
     if (short.success) expect(magpieEvidenceEligible(short.data as never, sampled + 1_000)).toBe(false);
 
-    const stale = evidenceSchema.safeParse(document({ usage: { ...document().usage, at: iso(sampled - 7_201_000) } }));
+    const stale = evidenceSchema.safeParse(document({
+      usage: { ...document().usage, at: iso(sampled - 7_201_000) },
+      route: { ...document().route, observedAt: iso(sampled - 7_201_000) },
+    }));
     expect(stale.success).toBe(true);
     if (stale.success) expect(magpieEvidenceEligible(stale.data as never, sampled + 1_000)).toBe(false);
+
+    // One exhausted window is enough: a healthy longer window cannot make the route usable.
+    const exhausted = document({ subscription: { ...document().subscription, windows: [
+      { ...document().subscription.windows[0], name: '5h', remainingPct: 0, resetsAt: iso(sampled + 10_800_000) },
+      { ...document().subscription.windows[0], name: '7d', remainingPct: 50, resetsAt: iso(sampled + 5 * 86_400_000) },
+    ] } });
+    const drained = evidenceSchema.safeParse(exhausted);
+    expect(drained.success).toBe(true);
+    if (drained.success) expect(magpieEvidenceEligible(drained.data as never, sampled + 1_000)).toBe(false);
 
     // Evidence may not outlive a known quota reset or the subscription until.
     const outlives = document({ subscription: { ...document().subscription, windows: [{ ...document().subscription.windows[0], resetsAt: iso(sampled + 1_500_000) }] } });
     expect(evidenceSchema.safeParse(outlives).success).toBe(false);
+  });
+
+  test('usage and observedAt cannot postdate the capture; a future sample is not eligible', () => {
+    const futureUsage = { at: iso(sampled + 3_600_000) };
+    expect(evidenceSchema.safeParse(document({
+      usage: { ...document().usage, ...futureUsage },
+      route: { ...document().route, observedAt: futureUsage.at },
+    })).success).toBe(false);
+    expect(evidenceSchema.safeParse(document({ route: { ...document().route, observedAt: iso(sampled + 3_600_000) } })).success).toBe(false);
+
+    const shifted = document();
+    const delta = 3_600_000;
+    shifted.sampledAt = iso(sampled + delta);
+    shifted.expiresAt = iso(sampled + 6_000_000 + delta);
+    shifted.snapshot.capturedAt = shifted.sampledAt;
+    shifted.sources = shifted.sources.map(source => ({
+      ...source,
+      capturedAt: iso(Date.parse(source.capturedAt) + delta),
+      ...(source.httpDate ? { httpDate: iso(Date.parse(source.httpDate) + delta) } : {}),
+    }));
+    shifted.subscription = {
+      ...shifted.subscription,
+      readAt: iso(sampled + delta),
+      until: iso(sampled + 30 * 86_400_000 + delta),
+      windows: shifted.subscription.windows.map(window => ({ ...window, resetsAt: iso(Date.parse(window.resetsAt) + delta) })),
+    };
+    const future = evidenceSchema.safeParse(shifted);
+    expect(future.success).toBe(true);
+    if (future.success) expect(magpieEvidenceEligible(future.data as never, sampled + 1_000)).toBe(false);
   });
 
   test('v4 and v3 are distinct contract versions; a v3 document cannot pose as a route snapshot', () => {

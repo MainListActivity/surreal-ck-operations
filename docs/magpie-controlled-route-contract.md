@@ -54,7 +54,7 @@
 
 `sources[]`：catalog（`/v1/models`）、quotas（`/v1/magpie/quotas`）、usage（`/v1/magpie/usage/requests?period=7d&…`）与 providers（本地配置）。每个来源记录状态、本机 UTC 抓取时刻、HTTP Date、精确偏差（±5 分钟内，且 `clockSkewMs = capturedAt − httpDate`）、Age、缓存头、body SHA256、字节数与来源 `readAt`；**正文不进入文档/回执**。
 
-`subscription` 与 `balance`：网关只提供 0–100 的百分比窗口与 `resetsAt`，因此 `windows[].remainingPct` 是百分比，`balance.absoluteAmount=null`、`unit=null`，并在 `balance.disclosure` 明示“百分比不是绝对余额”。`readAt` 缺失或早于快照 TTL 即 `staleBalance`；本机抓取时间不能刷新来源余额。窗口已重置 → `quotaExpired`；全部为 0 → `quotaInsufficient`。
+`subscription` 与 `balance`：网关只提供 0–100 的百分比窗口与 `resetsAt`，因此 `windows[].remainingPct` 是百分比，`balance.absoluteAmount=null`、`unit=null`，并在 `balance.disclosure` 明示“百分比不是绝对余额”。`readAt` 缺失或早于快照 TTL 即 `staleBalance`；本机抓取时间不能刷新来源余额。窗口已重置 → `quotaExpired`；任一非 `unlimited` 窗口剩余为 0 → `quotaInsufficient`（健康的长窗口不能抵消已耗尽的短窗口）。
 
 `usage`：从网关历史请求行中选取**同账号 provider、已完成、served model 在批准可路由集合内**的最新一条，记录 `requestId`（响应 id，缺失时用行 id）、`runId`（`route_id`）、`provider`、`servedModel`、`at`、`providerKeyIdHash`（网关未给则为 null，不臆造）、input/output/cache/reasoning/total。`cost` 只有在 `priced=true` 且成本为有限数时才写数值；否则 **null 且 `costUnknown=true`，绝不以 0 填充**。
 
@@ -71,7 +71,7 @@
 
 ## 5. 校验与动态路由
 
-`magpieEvidenceEligible` 在 prepare/prove/deliver/diagnose 共用检查中重新推导：类型/evidenceClass/serviceApproved、readiness 为空、账号绑定与归属、价格已受审、采样/过期/使用时刻、TTL 与 90 分钟余量、route digest 重算、routable 的 provider 必须等于绑定账号、servedModel 在同一集合且 usage 一致、usage provider 与账号一致、订阅 readAt 新鲜且至少一个窗口剩余 >0、窗口/订阅未到期、`priceRevision` 顶层与 pricing 一致。手写或篡改文档不能靠自报字段通过。
+`magpieEvidenceEligible` 在 prepare/prove/deliver/diagnose 共用检查中重新推导：类型/evidenceClass/serviceApproved、readiness 为空、账号绑定与归属、价格已受审、采样/过期/使用时刻、TTL 与 90 分钟余量、route digest 重算、routable 的 provider 必须等于绑定账号、servedModel 在同一集合且 usage 一致、usage provider 与账号一致、`route.observedAt` 必须是同一 usage 事件且不晚于本机采集（允许 ≤5 分钟来源偏差）、`sampledAt` 不晚于当前时刻、订阅 readAt 新鲜且所有非 `unlimited` 窗口剩余 >0（至少一个可用窗口）、窗口/订阅未到期、`priceRevision` 顶层与 pricing 一致。窗口代理额外返回 `sample-in-future`/`usage-in-future`，未来时刻的文档不能取得窗口。手写或篡改文档不能靠自报字段通过。
 
 `serviceFieldsMatch` 按 manifest 版本判别：v2 必须配 v4 文档，且 accountRef/endpoint/route.group/routeDigest/priceRevision 全部一致；v1 只能配非 Magpie 文档。跨契约（v1 manifest + v4 文档、v2 manifest + v3 文档）在读取阶段即拒绝。
 
