@@ -15,6 +15,9 @@ export function magpieEnvironment(): NodeJS.ProcessEnv {
  * behind a few seats) does not hold every long-lived lease forever. magpie stores it as no field.
  */
 export const GROUP_STAYS = "auto";
+/** Unfixed members follow the client; fixed member efforts remain authoritative in Magpie. */
+export const GROUP_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+
 export interface ManagedGroup {
   id: string;
   models: string[];
@@ -101,6 +104,7 @@ export async function saveMagpieGroups(
           members: group.models,
           routing: "order",
           affinity: GROUP_STAYS,
+          levels: GROUP_LEVELS,
         }),
         signal: AbortSignal.timeout(45000),
       });

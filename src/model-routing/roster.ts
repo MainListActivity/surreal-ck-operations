@@ -1,7 +1,7 @@
 import { REQUIRED_TRACKS } from '../core.ts';
 import type { Role } from '../contracts.ts';
 import { FACTORY_PROVIDER } from '../dispatcher/provider-order.ts';
-import { employeeTier } from './policy.ts';
+import { employeeTier, employeeClientModel } from './policy.ts';
 export interface RoutingDef {
   id:string; role:string; provider:string; model:string; enabled:boolean;
   tracks?:string[]; maxInstances?:number; quotaLimited?:boolean; thinking?:string; priority?:number; weight?:number;
@@ -17,7 +17,7 @@ export function planRoutingRoster(defs: RoutingDef[]): Array<RoutingDef> {
       if (def.provider === FACTORY_PROVIDER) changes.push({...def,enabled:true,quotaLimited:true});
       else if (def.id!==id && def.enabled) changes.push({...def,enabled:false});
     }
-    changes.push({...selected,id,role,provider:'claude',model:`group/sck-${employeeTier(role)}`,enabled:true,quotaLimited:false,
+    changes.push({...selected,id,role,provider:'claude',model:employeeClientModel(role),thinking:employeeTier(role)==='haiku'?'max':selected?.thinking,enabled:true,quotaLimited:false,
       tracks:!REQUIRED_TRACKS[role as Role] && roleDefs.some(d=>(d.enabled || d.provider===FACTORY_PROVIDER) && !d.tracks?.length) ? [] : [...new Set(roleDefs.filter(d=>d.enabled || d.provider===FACTORY_PROVIDER).flatMap(d=>d.tracks ?? []))],
       maxInstances:Math.max(2,...roleDefs.filter(d=>d.enabled || d.provider===FACTORY_PROVIDER).map(d=>d.maxInstances ?? 1))});
   }

@@ -1,3 +1,4 @@
+import { employeeSessionLookup } from "./server/employee-session";
 import {registerUsage} from './server/usage';
 import {registerAgentMetrics} from "./server/agent-metrics";
 import { homedir } from "node:os";
@@ -31,7 +32,14 @@ export default function contribute(server: PluginServerContext) {
   const stopMetrics=registerAgentMetrics(server);
   const stopUsage=registerUsage(server);
   const paseoConfig = join(process.env.PASEO_HOME ?? join(homedir(), ".paseo"), "config.json");
+  const identifyEmployee = employeeSessionLookup(async agentId => {
+      const ctx = await company();
+      const [rows] = await ctx.db.db.query<[Array<{ id: unknown }>]>(
+        "SELECT id FROM employee WHERE paseo_agent_id=$agent LIMIT 1;", { agent: agentId });
+      return rows.length > 0;
+    }, join(serviceHome(), "private", "employee-agents.json"));
   const stopScrub = registerScrub(server, process.env, { zdotdir: join(serviceHome(), "zdot"),
+    employee: identifyEmployee, rememberEmployee: identifyEmployee.remember,
     sandbox: provider => sandboxGap(provider, paseoConfig, join(serviceHome(), "sandbox", "bin")), modelEnv: async request => {
     if(request.provider !== "claude") return {};
     const ctx=await company();
@@ -42,7 +50,7 @@ export default function contribute(server: PluginServerContext) {
     if(!session)throw new Error("公司模型路由尚未恢复员工会话登记");
     const env=routingEnv(`employee:${session.employee}`);
     installRoutingSettings(session.comm,env);
-    return env;
+    return { ...env, SCK_CLAUDE_SETTINGS: join(session.comm, ".claude", "settings.local.json") };
   } });
   const stopDispatch = startDispatch(server);
   let preview!: PreviewHandle;

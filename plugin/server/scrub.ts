@@ -7,7 +7,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { isCompanyAgent } from "./company-agent";
+
 
 /**
  * Infrastructure credentials no company agent may inherit, by exact name or prefix. Provider login
@@ -101,17 +101,22 @@ interface SessionOpen { agentId: string; reason: string; env: Record<string, str
 const launchedByCompany = (env: Record<string, string>) =>
   env.SCK_COMM_DIR !== undefined || env.SCK_EMPLOYEE_CREDENTIAL_FILE !== undefined;
 
-/** Resolves false instead of waiting: a hook that stalls would stall every agent the user opens. */
-function withinLookup<T>(work: Promise<T>, fallback: T, signal: AbortSignal): Promise<T> {
-  return new Promise<T>(resolve => {
-    const timer = setTimeout(() => resolve(fallback), LOOKUP_MS);
-    const done = (value: T) => { clearTimeout(timer); resolve(value); };
-    signal.addEventListener("abort", () => done(fallback), { once: true });
-    work.then(done, () => done(fallback));
+/** Bound startup waits, but never turn a registry outage into permission to bypass employee routing. */
+function withinLookup<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const fail = () => reject(new Error("公司员工身份登记暂不可核实，请稍后重试"));
+    const timer = setTimeout(() => finish(fail), LOOKUP_MS);
+    const finish = (action: () => void) => { clearTimeout(timer); signal.removeEventListener("abort", abort); action(); };
+    const abort = () => finish(fail);
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) { abort(); return; }
+    work.then(value => finish(() => resolve(value)), () => finish(fail));
   });
 }
 
 export interface ScrubOptions {
+  employee?: (agentId: string) => Promise<boolean>;
+  rememberEmployee?: (agentId: string) => void;
   /** Directory for the zsh startup shim; without it company shells keep whatever the user's startup files export. */
   zdotdir?: string;
   modelEnv?: (request: {agentId:string;env:Record<string,string>;provider?:string}) => Promise<Record<string,string>>;
@@ -120,8 +125,8 @@ export interface ScrubOptions {
 }
 
 /**
- * Environment overrides are not persisted with an agent, so a resumed company session no longer
- * carries its launch marker: remember agent ids seen with one, and fall back to the agent's labels.
+ * Environment overrides are not persisted with an agent: resumed sessions use the durable employee
+ * registry. Marked company launches are remembered locally before their agent binding is persisted.
  */
 export function registerScrub(server: PluginServerContext, inherited: Env = process.env, options: ScrubOptions = {}): () => void {
   let zdotdir = options.zdotdir;
@@ -135,10 +140,11 @@ export function registerScrub(server: PluginServerContext, inherited: Env = proc
   }
   const known = new Set<string>();
   const isCompany = async (request: SessionOpen, paseo: PaseoApi, signal: AbortSignal): Promise<boolean> => {
-    if (launchedByCompany(request.env ?? {})) { known.add(request.agentId); return true; }
+    if (launchedByCompany(request.env ?? {})) { options.rememberEmployee?.(request.agentId); known.add(request.agentId); return true; }
     if (known.has(request.agentId)) return true;
     if (request.reason === "create") return false; // company launches are marked; this is somebody else's agent
-    const found = await withinLookup(isCompanyAgent(paseo, { id: request.agentId }), false, signal);
+    if (!options.employee) throw new Error("公司员工身份登记查询未配置");
+    const found = await withinLookup(options.employee(request.agentId), signal);
     if (found) known.add(request.agentId);
     return found;
   };
