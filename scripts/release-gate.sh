@@ -23,7 +23,15 @@ case "$gate" in
     # part of the same local-fork gate, so a regression of the source association blocks the release too.
     # SYS06: the effective-policy contract regression rides this gate as well — it needs the company fork
     # SurrealDB (official upstream is not compatible), so it can never run on hosted CI.
-    gate_test="tests/dispatcher-sidecar.fork.test.ts tests/deployment-source.test.ts tests/deployment-source.fork.test.ts tests/effective-policy.fork.test.ts"
+    # SYS-INT: the deploy-drill suite rides here for the same reason. It must prove the drill works from the
+    # plugin face's Node host (AC01/AC02/AC03) and that the drill's authorization guards still refuse — none
+    # of which hosted CI can exercise, since the Node probe needs a real Node binary and the drill needs the
+    # company fork plus a real macOS process tree. The drill is the rollback-isolation tool, so a regression
+    # here has to block the release exactly like the sidecar regression does. The access test is the same
+    # gate's security half: it drives deployDrillRun against the fork with its own database, so it needs its
+    # own opt-in (deploy-drill-access.fork.test.ts is otherwise skipped).
+    gate_env="RUN_SCK_CHANNEL_FORK_TESTS=1 RUN_SCK_DRILL_ACCESS_TESTS=1"
+    gate_test="tests/dispatcher-sidecar.fork.test.ts tests/deployment-source.test.ts tests/deployment-source.fork.test.ts tests/effective-policy.fork.test.ts tests/deploy-drill.test.ts tests/deploy-drill-runner.test.ts tests/deploy-drill-node-host.test.ts tests/deploy-drill-access.fork.test.ts"
     gate_why='the sidecar-review gate runs on macOS only; it uses the local company fork'
     ;;
   *) echo "unknown gate: $gate (known: slow-pipe, sidecar-review)" >&2; exit 2;;
@@ -62,8 +70,10 @@ if [ "$gate" = slow-pipe ]; then
   # The red control runs too: the pre-SYS01 client must still lose bytes through the same pipe, or the harness is not trusted.
   (cd "$release" && SCK_COMM_CONTROL=1 "$BUN" test $gate_test) > "$log" 2>&1
 else
-  # Exercise the real client-cli -> sidecar -> company-fork path, including plugin reload recovery.
-  (cd "$release" && RUN_SCK_CHANNEL_FORK_TESTS=1 "$BUN" test $gate_test) > "$log" 2>&1
+  # Exercise the real client-cli -> sidecar -> company-fork path, including plugin reload recovery, and the
+  # deploy-drill suite (its opt-ins are named in gate_env).
+  # shellcheck disable=SC2086 # gate_env is a deliberate space-separated assignment list.
+  (cd "$release" && env $gate_env "$BUN" test $gate_test) > "$log" 2>&1
 fi
 rc=$?
 set -e

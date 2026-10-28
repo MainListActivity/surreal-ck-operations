@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { createServer } from 'node:net';
 import { existsSync, mkdirSync, openSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
@@ -15,7 +16,13 @@ import { runDrill, type DrillExec, type DrillHost } from './deploy-drill-runner.
 export interface DrillState { runId: string; status: 'running' | 'passed' | 'failed'; phase?: string; error?: string }
 
 const CHILD_ENV = (): Record<string, string> => ({
-  PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${homedir()}/.bun/bin`,
+  // pnpm installs the release dependencies in prepare. It ships with the machine's Node install, not the
+  // system PATH the service runs under, so search the ordinary user locations explicitly rather than
+  // letting the drill fail with "Executable not found in $PATH: pnpm".
+  PATH: [
+    '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin',
+    `${homedir()}/.bun/bin`, `${homedir()}/node/bin`, `${homedir()}/Library/pnpm`,
+  ].join(':'),
   HOME: homedir(), TMPDIR: tmpdir(),
 });
 
@@ -41,13 +48,39 @@ const exec: DrillExec = {
     child.once('close', () => resolve());
     child.once('error', reject);
   }),
-  healthy: async url => { try { return (await fetch(url, { signal: AbortSignal.timeout(1500) })).ok; } catch { return false; } },
+  // Each probe opens its own connection. A pooled keep-alive socket speaks to whichever process held
+  // the port when it was opened — after a face swap that is the previous release, which keeps answering
+  // 503/nothing while the new one is up — so a cached connection would poll the dead server forever.
+  probe: async url => {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(1500), headers: { connection: 'close' } });
+      const body = (await response.text()).slice(0, 200);
+      return { ok: response.ok, detail: `HTTP ${response.status} ${body}`.trim() };
+    } catch (error) {
+      return { ok: false, detail: String((error as Error)?.message ?? error).slice(0, 200) };
+    }
+  },
   nowIso: () => new Date().toISOString(),
 };
 
 const readState = (root: string): DrillState | undefined => {
   try { return JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')) as DrillState; } catch { return undefined; }
 };
+
+/**
+ * The Bun the drill children must run under. The MCP face hosts this code in Bun, but the plugin face
+ * hosts it in Node (plugin/server/bun-shim.ts), where process.execPath is Node and cannot run the
+ * TypeScript drivers. Order mirrors scripts/bun-runtime.sh: the service-pinned runtime first, then the
+ * generic install, so drills run the same Bun the service runs.
+ */
+export function resolveDrillBun(serviceHome: string): string {
+  const runningBun = (process.versions as Record<string, string | undefined>).bun;
+  if (runningBun) return process.execPath;
+  for (const candidate of [join(serviceHome, 'runtime-bun', 'bin', 'bun'), join(homedir(), '.bun', 'bin', 'bun')]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return 'bun';
+}
 
 export function drillHost(serviceHome: string, repo: string): DrillHost & { ctx: DrillHostContext } {
   const ctx: DrillHostContext = {
@@ -58,13 +91,18 @@ export function drillHost(serviceHome: string, repo: string): DrillHost & { ctx:
     },
     commitExists: async sha => (await exec.run('git', ['-C', repo, 'cat-file', '-e', `${sha}^{commit}`], {})).code === 0,
     isAncestor: async (ancestor, descendant) => (await exec.run('git', ['-C', repo, 'merge-base', '--is-ancestor', ancestor, descendant], {})).code === 0,
-    portFree: async port => {
-      try { const server = Bun.serve({ hostname: '127.0.0.1', port, fetch: () => new Response('') }); server.stop(true); return true; } catch { return false; }
-    },
+    portFree: port => new Promise<boolean>(resolve => {
+      // The MCP face runs under Bun but the plugin face runs under Node (see plugin/server/bun-shim.ts):
+      // a Bun.serve probe reports every port busy there. A plain net listen works in both.
+      const server = createServer();
+      server.once('error', () => resolve(false));
+      server.listen({ host: '127.0.0.1', port, exclusive: true }, () => server.close(() => resolve(true)));
+    }),
   };
   return {
     ctx, exec, repo,
     forkBinary: join(homedir(), '.surrealdb', 'surreal'),
+    bun: resolveDrillBun(serviceHome),
     serviceHome,
     state: plan => readState(plan.root),
     writeState: (plan, state) => writeFileSync(join(plan.root, 'state.json'), JSON.stringify(state, null, 2) + '\n', { mode: 0o600 }),
@@ -73,8 +111,11 @@ export function drillHost(serviceHome: string, repo: string): DrillHost & { ctx:
 
 /** Launches the drill in a detached child (the service process must not block on a minutes-long drill). */
 export function startDrill(serviceHome: string, repo: string, plan: DrillPlan): number {
+  // The drill root does not exist yet on a first run: validateDrillPlan only constructs paths. Create it
+  // before writing the plan, or the detached child has nothing to read.
+  mkdirSync(plan.root, { recursive: true, mode: 0o700 });
   writeFileSync(join(plan.root, 'plan.json'), JSON.stringify(plan, null, 2) + '\n', { mode: 0o600 });
-  const child = spawn(process.execPath, [join(repo, 'src', 'deploy-drill-run.ts'), plan.runId],
+  const child = spawn(resolveDrillBun(serviceHome), [join(repo, 'src', 'deploy-drill-run.ts'), plan.runId],
     { cwd: repo, env: { ...CHILD_ENV(), SCK_DRILL_HOME: serviceHome, SCK_DRILL_REPO: repo }, detached: true, stdio: 'ignore' });
   child.unref();
   return child.pid!;
