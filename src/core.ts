@@ -25,7 +25,7 @@ import {
 } from './acceptance.ts';
 import type { AcceptanceCriterion, AcceptanceEvidenceInput, AcceptanceEvidenceRecord, AcceptanceGateInput, AcceptanceGateView, AcceptanceLeg, AcceptanceMappingImportInput, AcceptanceMappingPreviewView, AcceptancePhase, AcceptanceStatusView } from './contracts.ts';
 import {
-  ACCEPTANCE_MAPPING_KEY, SYS_REQUIRED_MAPPING, mappingBundle, mappingDigest,
+  ACCEPTANCE_MAPPING_BUNDLES, SYS_REQUIRED_MAPPING, bundleAppliesTo, mappingBundle, mappingDigest,
 } from './acceptance-mapping.ts';
 import { companyBlock, companyParts } from './company-context.ts';
 import type { PolicyEffectiveInput, PolicyEffectiveView, PolicyEnforceInput, PolicyEnforceView, PolicyListInput, PolicyPlanInput, PolicyPlanPage, PolicyPlanView, PolicyRevoke, PolicySet, PolicyView, ReviewerRole as PolicyReviewerRole } from './contracts.ts';
@@ -2363,11 +2363,16 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const row = await this.db.select<TaskRow>(id('task', input.taskId));
     if (!row) throw new CompanyError('not_found', 'Task not found');
     const leg = acceptanceLegForSubject({ kind: row.kind, workIntent: row.work_intent });
-    const bundle = leg === 'implement' ? mappingBundle(ACCEPTANCE_MAPPING_KEY) : undefined;
+    // One bundle per audience: the mapping tool's own items for engineering implement rows, the source business
+    // QA contract for the SYS-INT goal's QA rows. A row matching none (or several) is a conflict, never a fit.
+    const matches = ACCEPTANCE_MAPPING_BUNDLES.filter(candidate => bundleAppliesTo(candidate, {
+      leg, executorRole: row.executor_role, goalId: row.goal ? asId(row.goal) : undefined }));
+    const bundle = matches.length === 1 ? matches[0] : undefined;
     let current: AcceptanceCriterion[] = [];
     try { current = validateAcceptanceCriteria(row.acceptance_criteria); } catch { current = []; }
     const conflicts: string[] = [];
-    if (!bundle) conflicts.push('unsupported-leg');
+    if (matches.length === 0) conflicts.push('unsupported-leg');
+    if (matches.length > 1) conflicts.push('ambiguous-bundle');
     if (row.current_employee) conflicts.push('occupied');
     if (row.state === 'done' || row.state === 'void') conflicts.push('terminal-state');
     if (current.length > 0 && !row.acceptance_legacy) conflicts.push('criteria-present');
@@ -2387,11 +2392,17 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         proposal: {
           key: bundle.key, leg: bundle.leg, version: bundle.version, digest: mappingDigest(bundle),
           description: bundle.description, criteria: bundle.criteria,
+          ...(bundle.appliesTo ? { appliesTo: {
+            ...(bundle.appliesTo.leg !== undefined ? { leg: bundle.appliesTo.leg } : {}),
+            ...(bundle.appliesTo.executorRole !== undefined ? { executorRole: bundle.appliesTo.executorRole } : {}),
+            ...(bundle.appliesTo.goalId !== undefined ? { goalId: bundle.appliesTo.goalId } : {}),
+          } } : {}),
+          ...(bundle.coverage ? { coverage: bundle.coverage.map(item => ({ ...item, sys: [...item.sys] })) } : {}),
         },
       } : {}),
       sysRequired: SYS_REQUIRED_MAPPING.map(item => ({ ...item })),
       conflicts,
-      guidance: '只读预览：不写任何数据。导入需 gm 携带本预览的 digest 与目标任务 expectedVersion 走 acceptance_mapping_import；冲突清零前导入会被拒绝，机器源仅为真实 CI 基线，其余为人工独立复核。',
+      guidance: '只读预览：不写任何数据。导入需 gm 携带本预览的 digest 与目标任务 expectedVersion 走 acceptance_mapping_import；冲突清零前导入会被拒绝。bundle 按受众绑定：工程实现行取工具自身项（sys-int-implement），SYS-INT 源 QA 行取源业务契约（sys-int-source-qa，业务项均为对真实生产证据的人工独立签核，不携带别腿机器基线）；错配 bundle 会被拒绝。',
     };
   }
 
@@ -2417,6 +2428,11 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (replayed) return replayed;
     const before = await this.db.select<TaskRow>(id('task', input.taskId));
     if (!before) throw new CompanyError('not_found', 'Task not found');
+    if (!bundleAppliesTo(bundle, {
+      leg: acceptanceLegForSubject({ kind: before.kind, workIntent: before.work_intent }),
+      executorRole: before.executor_role, goalId: before.goal ? asId(before.goal) : undefined })) {
+      throw new CompanyError('invalid', 'refused: this mapping bundle does not apply to the target task (audience mismatch); re-run the preview for the matching bundle');
+    }
     if (before.state === 'done' || before.state === 'void') {
       throw new CompanyError('invalid', 'refused: done/void tasks are historical; a mapping import never rewrites a finished acceptance');
     }

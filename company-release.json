@@ -1,15 +1,18 @@
 {
-  "version": "0.3.12",
-  "title": "发布门禁 fork 套件自备隔离库修复",
+  "version": "0.3.13",
+  "title": "SYS-INT 源业务验收映射契约与受众绑定修正",
   "changes": [
-    "effective-policy.fork 套件改为自备隔离公司 fork 库（随机回环端口），门禁直跑 bun test 不再读产品 .env，v0.3.10 起阻塞每次 sidecar-review 门禁的雷排除",
-    "套件按 deployment-source.fork 同形态门控：无 fork 环境时全部用例 skip，import 零副作用",
-    "功能代码零改动；本版本包含 v0.3.10（SYS06 门禁）与 v0.3.11（版本化验收映射）全部已合入内容"
+    "纠正映射注册表混淆：工具自身机制项改为 AC-MAP-1..8 并保留独立 bundle；另建 sys-int-source-qa 源业务 bundle，不再把工具 AC 冒充源 e7d08f27 的 INT01–08",
+    "源业务 bundle 以 QA 独立签核承载真实 INT01–08 业务原义（双面部署/同源评估/故障/等待/策略/终验分页/双入口探针/可复算指标）+ 逐 SYS01–07 + 受审逐包 RB01，全部 required 可追溯",
+    "SYS_REQUIRED_MAPPING 补 SYS03（处置通道重演）并修正 SYS06 rb01=true（rollback-isolation-policy），逐 SYS01–07 完整",
+    "bundle 增加受众绑定（腿/执行岗/目标）：预览按受众给出唯一 proposal，错配 bundle 导入被拒并显式冲突；digest 覆盖受众，注册表更新即失效旧预览",
+    "源 QA bundle 不携带任何别腿机器基线：业务项为对真实生产证据的人工独立签核，承载任务自身服务器基线照常生效但不充当业务覆盖"
   ],
   "impact": [
-    "升级作业可越过此前失败的\"检查代码与本机发布门禁\"阶段；此后 sidecar-review 门禁稳定包含策略回归",
-    "无数据库迁移、无历史改写；回滚到部署前现役安全"
+    "旧 sys-int-implement digest 全部失效（版本 1→2）；部署后 ce3906b5 需按新预览 digest 重新 dry-run 并导入",
+    "源 QA 行预览可见 16 项 required 业务契约与逐项 SYS 覆盖；工程行只见工具自身 bundle，两个受众互不可串",
+    "无 schema 变更、无历史改写；回滚到部署前现役安全，旧版忽略新增预览字段"
   ],
-  "migration": "无数据库迁移、无历史改写；改动仅测试门控与夹具。",
-  "rollback": "保留健康 active release；用当前受审 release 的 installer 回滚至部署前 active 所指固定 release（执行时以 active 实际 SHA 为准）：active 与插件面同时切回，插件 SOURCE/DIRECTORY 必须等于回滚目标 release/plugin。RW06/SYS02/IR06/SYS06 守卫校验兼容后再切；无数据回滚。"
+  "migration": "无数据库迁移、无历史改写；仅映射注册表/预览/导入守卫与测试改动，复用 043 已有标记字段。",
+  "rollback": "保留健康 active release；用当前受审 release 的 installer 回滚至部署前现役（现为 v0.3.12 bd45733b2c74ebda12efc71858e9c3080693afc2，以 active 实际 SHA 为准）：active 与插件面同时切回，插件 SOURCE/DIRECTORY 必须等于回滚目标 release/plugin；install 报 plugin repoint failed 时按运维文档 R3 先 remove 再 install 同一被守卫放行的目标。RW06/SYS02/IR06/SYS06 守卫校验兼容后再切；无数据回滚。"
 }
