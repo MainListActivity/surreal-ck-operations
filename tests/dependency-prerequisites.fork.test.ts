@@ -182,7 +182,7 @@ describe('append prerequisites to an existing dependency wait', () => {
     expect(releaseAudit).toMatchObject({ continuation: 'manager' });
 
     // No fault/budget was cleared or created; an expired window is still the later resume's problem.
-    expect(gated.recoveryStopped).toBeUndefined();
+    expect((await rowOf(source)).recovery_stopped).toBeUndefined();
     expect(gated.executionWindow).toBeUndefined();
     const [[faultLifts]] = await database.db.query<[[Record<string, unknown>]]>(
       `SELECT count() AS n FROM audit WHERE task = $task AND action = 'fault_lift' GROUP ALL;`,
