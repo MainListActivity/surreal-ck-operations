@@ -40,6 +40,7 @@ export function registerHandlers(server: PluginServerContext): void {
     return handler(input, context);
   });
   ownerHandle(rpc.inbox, async () => (await company()).upgrades.inbox());
+  ownerHandle(rpc.autoUpgrade,async (input:RpcInput<typeof rpc.autoUpgrade>)=>(await company()).upgrades.setAuto(input.enabled,SOURCE));
   ownerHandle(rpc.upgrade, async (input: RpcInput<typeof rpc.upgrade>) => (await company()).upgrades.start(input,SOURCE));
   ownerHandle(rpc.brief, async () => (await company()).owner.brief());
 

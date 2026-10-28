@@ -77,6 +77,8 @@ let gcRefreshedAt = 0;
 const GC_MS = 30 * 60_000;
 /** Closing the version cards an install already answered is cheap but not per-tick work. */
 let upgradeClosureAt = 0;
+let autoUpgradeAt = 0;
+let autoUpgradePending = false;
 // Model family matchers: an `auto:<family>` def resolves to the newest id of that family
 // among the provider's selectable models. Families are deliberately narrow so a provider
 // publishing an unrelated line (e.g. gpt-7, or a renamed workhorse) never silently switches.
@@ -391,6 +393,13 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
             const now = await ctx.upgrades.installed();
             if (now) await ctx.upgrades.closeSuperseded(now, "system:dispatcher");
           }).catch((error) => console.warn(`superseded upgrade cards left open: ${(error as Error).message}`));
+        }
+        if (!autoUpgradePending && Date.now() - autoUpgradeAt > 60_000) {
+          autoUpgradeAt = Date.now();autoUpgradePending = true;
+          // Version validation and DB round trips must not hold up dispatch.
+          void ctx.upgrades.autoStart()
+            .catch(error=>console.warn(`automatic upgrade deferred: ${(error as Error).message}`))
+            .finally(()=>{autoUpgradePending=false;});
         }
         await timing.measure("observation", () => persistDispatchObservation(ctx)).catch((error) => console.warn(`dispatch observation write failed: ${(error as Error).message}`));
         failures = 0;

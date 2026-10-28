@@ -233,3 +233,8 @@ export const upgrade = defineRpc({
   input:z.object({taskId:key,taskVersion:z.number().int().positive(),digest:z.string().regex(/^[a-f0-9]{64}$/)}),
   output:z.object({jobId:z.string(),status:z.string()}),
 });
+
+export const autoUpgrade = defineRpc({
+ name:'company.upgrade.automatic',input:z.object({enabled:z.boolean()}),
+ output:z.object({enabled:z.boolean(),revision:z.number()}),
+});

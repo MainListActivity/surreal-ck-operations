@@ -36,6 +36,7 @@ const SIDECAR_REVIEW_FILES = [
   // SYS-INT 评审协同唤醒：纯规则 + 隔离库集成（事件先于登记、20 并发、重启、旧 fence、两阶段、零轮询）。
   'tests/review-events.test.ts',
   'tests/review-events.fork.test.ts',
+  'tests/company-upgrades.fork.test.ts',
 ];
 
 // A stand-in Bun that writes the arguments it was handed, one per line, so the shape of the call is visible: a quoted
@@ -255,18 +256,18 @@ test.skipIf(!existsSync('/usr/bin/python3'))('a sidecar-review gate run records 
     writeFileSync(join(release, 'tests', 'effective-policy.fork.test.ts'), '');
     // SYS-INT: the deploy-drill suite and the QA review wake regressions ride the gate too. Every file the gate
     // names must exist in the release, so the fixture is built from the same list the gate is asserted against.
-    for (const extra of SIDECAR_REVIEW_FILES.filter(f => f.includes('deploy-drill') || f.includes('review-events'))) {
+    for (const extra of SIDECAR_REVIEW_FILES.filter(f => f.includes('deploy-drill') || f.includes('review-events') || f.includes('company-upgrades'))) {
       writeFileSync(join(release, extra), '');
     }
     const pinned = join(home, 'runtime-bun', 'bin', 'bun');
-    writeFileSync(pinned, '#!/bin/sh\n[ "$1" = --version ] && { echo 1.4.2; exit 0; }\necho "sidecar stand-in, fork=${RUN_SCK_CHANNEL_FORK_TESTS:-0} drill=${RUN_SCK_DRILL_ACCESS_TESTS:-0}"\nexit "${FAKE_TEST_RC:-0}"\n');
+    writeFileSync(pinned, '#!/bin/sh\n[ "$1" = --version ] && { echo 1.4.2; exit 0; }\necho "sidecar stand-in, fork=${RUN_SCK_CHANNEL_FORK_TESTS:-0} drill=${RUN_SCK_DRILL_ACCESS_TESTS:-0} upgrade=${RUN_SCK_UPGRADE_FORK_TESTS:-0}"\nexit "${FAKE_TEST_RC:-0}"\n');
     chmodSync(pinned, 0o755);
     const run = sh(GATE, ['sidecar-review', release], home);
     expect(run.code).toBe(0);
     const record = JSON.parse(readFileSync(join(home, 'gates', 'sidecar-review', `${SHA}.json`), 'utf8'));
     expect(record).toMatchObject({ gate: 'sidecar-review', sha: SHA, bun: PINNED, platform: 'darwin', result: 'pass', exitCode: 0 });
     // Both opt-ins reach the real test process: the fork suite and the drill access half.
-    expect(readFileSync(join(home, 'gates', 'sidecar-review', `${SHA}.log`), 'utf8')).toContain('fork=1 drill=1');
+    expect(readFileSync(join(home, 'gates', 'sidecar-review', `${SHA}.log`), 'utf8')).toContain('fork=1 drill=1 upgrade=1');
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

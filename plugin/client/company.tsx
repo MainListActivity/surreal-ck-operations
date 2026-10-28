@@ -615,6 +615,8 @@ function InboxTab({ ctx }: { ctx: Ctx }) {
   const s = makeStyles(ctx);
   const queryClient = useQueryClient();
   const inboxRpc = useRpc(rpc.inbox);
+  const autoRpc = useRpc(rpc.autoUpgrade);
+  const autoUpgrade=useMutation({mutationFn:(enabled:boolean)=>autoRpc({enabled}),onSuccess:()=>void queryClient.invalidateQueries({queryKey:["inbox"]})});
   const resolve = useRpc(rpc.resolveNotice);
   const consoleRpc = useRpc(rpc.consoleUrl);
   const openRpc = useRpc(rpc.openExternal);
@@ -632,7 +634,11 @@ function InboxTab({ ctx }: { ctx: Ctx }) {
           <Text selectable style={{ color: ctx.theme.colors.accent, fontSize: 13 }}>{consoleQ.data.url}</Text>
         </Pressable>
       ) : null}
-      {box?.upgrades?.current?<View style={s.card}><Text style={s.text}>当前版本 v{box.upgrades.current.version}</Text><Text selectable style={s.muted}>{box.upgrades.current.sha}</Text></View>:null}
+      {box?.upgrades?.current?<View style={s.card}><Text style={s.text}>当前版本 v{box.upgrades.current.version}</Text><Text selectable style={s.muted}>{box.upgrades.current.sha}</Text>
+        <Text style={s.muted}>自动安装已合 main 的公司版本；全部门禁和上线验证通过后才回复。失败退避24小时，同一版本累计失败2次后停止自动尝试。</Text>
+        <Pressable accessibilityRole="button" disabled={autoUpgrade.isPending} style={s.button} onPress={()=>autoUpgrade.mutate(!box.upgrades?.automatic?.enabled)}><Text style={s.buttonText}>{autoUpgrade.isPending?'正在保存':box.upgrades.automatic?.enabled?'自动升级已开启 · 点击关闭':'自动升级已关闭 · 点击开启'}</Text></Pressable>
+        {autoUpgrade.error?<Text style={s.text}>设置失败，请重试</Text>:null}
+      </View>:null}
       {box?.upgrades?.items.map(item=><CompanyUpgradeCard key={`${item.taskId}:${item.jobId??item.plan.sha}`} item={item} ctx={ctx} onDone={refresh}/>)}
       <Section title="待批关口" count={box?.gates.length} ctx={ctx}>
         {box?.gates.filter(g=>!g.task.companyUpgrade).map(g => (
