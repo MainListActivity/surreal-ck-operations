@@ -10,7 +10,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, IndependenceCheckInput, IndependenceCheckView, IndependenceCheckPolicyView, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence, SetIdentityPrincipal, IdentityPrincipalView, FaultStatusView, FaultBudgetView, FaultEpisodeView, FaultRepairView } from './contracts.ts';
+import type { ActiveLease, AppendDependencyPrerequisites, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, IndependenceCheckInput, IndependenceCheckView, IndependenceCheckPolicyView, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence, SetIdentityPrincipal, IdentityPrincipalView, FaultStatusView, FaultBudgetView, FaultEpisodeView, FaultRepairView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
@@ -4155,6 +4155,161 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       submitted_ref: before.submitted_by ? id('employee', before.submitted_by) : undefined,
       submitted_by: before.submitted_by, epoch_seen: epochSeen,
       idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+    });
+    return view(row);
+  }
+
+  /**
+   * gm only: append real prerequisites to an existing execute-phase dependency wait. This is the
+   * narrow repair for a task that is already in a formal dependency wait (not a gm block): the
+   * existing defer path cannot reach it, and a resume/block loop would fake a state change. The
+   * wait row, its reference and every existing dependency stay untouched; only new same-goal task
+   * ids are appended and dependency_continuation becomes 'manager', so a completed wait returns to
+   * GM instead of resuming an employee. Nothing is resumed here: faults, budgets and ordinary
+   * dispatch are not touched, and an expired execution window is still checked by the later resume.
+   */
+  async appendDependencyPrerequisites(credential: Credential, input: AppendDependencyPrerequisites): Promise<TaskView> {
+    return echoTask(await this.appendDependencyPrerequisitesRecord(credential, input));
+  }
+
+  private async appendDependencyPrerequisitesRecord(credential: Credential, input: AppendDependencyPrerequisites): Promise<TaskView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may append dependency prerequisites');
+    requireText(input.taskId, 'task', 1, 200);
+    requireText(input.text, 'text', 20, 8000);
+    requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) {
+      throw new CompanyError('invalid', 'expectedVersion must be a positive integer');
+    }
+    const dependencies = [...new Set(input.dependencies ?? [])];
+    if (!dependencies.length || dependencies.length > 20) throw new CompanyError('invalid', 'append requires 1-20 dependencies');
+    for (const dep of dependencies) requireText(dep, 'dependency', 1, 200);
+    if (dependencies.includes(input.taskId)) throw new CompanyError('invalid', 'A task cannot depend on itself');
+    // Business-keyed idempotency: a manager taking over the same decision must read the same result.
+    const idem = this.businessIdemId('append_dependency_prerequisites', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ taskId: input.taskId, dependencies, text: input.text, expectedVersion: input.expectedVersion }));
+    const replayed = await this.replay(idem, digest);
+    if (replayed) return replayed;
+
+    const taskRef = id('task', input.taskId);
+    type WaitTaskRow = {
+      state: TaskState; blocked_to?: 'gm' | 'owner'; resume_state?: TaskState; reviewer_role: ReviewerRole;
+      current_employee?: string; lease_expires_at?: number; version: number; dependencies?: RecordId[];
+      goal?: RecordId; goal_state?: string; wait_state?: 'waiting' | null; wait_kind?: string | null;
+      wait_episode?: string | null; wait_owner_role?: string | null; execution_window?: unknown;
+    };
+    const [before] = await this.db.query<[WaitTaskRow | undefined]>(
+      `SELECT state, blocked_to, resume_state, reviewer_role, current_employee, lease_expires_at, version,
+        dependencies, goal, goal.state AS goal_state, wait_state, wait_kind, wait_episode, wait_owner_role,
+        execution_window FROM ONLY $task;`, { task: taskRef });
+    if (!before) throw new CompanyError('not_found', 'Task not found');
+    if (before.state !== 'blocked' || before.blocked_to !== undefined ||
+        before.wait_state !== 'waiting' || before.wait_kind !== 'dependency') {
+      throw new CompanyError('invalid', 'append only applies to a blocked formal dependency wait; gm blocks use defer_task_until');
+    }
+    if (before.resume_state !== 'ready') throw new CompanyError('invalid', 'append only applies to execute-phase dependency waits; a review wait keeps its reviewer');
+    if (before.reviewer_role === 'owner' || before.wait_owner_role === 'owner') {
+      throw new CompanyError('invalid', 'Owner-gated tasks cannot receive appended prerequisites');
+    }
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (before.current_employee !== undefined && before.lease_expires_at !== undefined && before.lease_expires_at > nowSec) {
+      throw new CompanyError('conflict', 'The task still holds an active lease');
+    }
+    if (before.version !== input.expectedVersion) throw new CompanyError('conflict', 'Task version moved');
+    if (before.goal && before.goal_state !== 'active') throw new CompanyError('invalid', 'Task goal is not active');
+
+    const [waitRows] = await this.db.query<[Array<{ wait_key: string; kind: string; reference_task?: RecordId }>]>(
+      `SELECT wait_key, kind, reference_task, entered_at FROM task_wait WHERE task = $task AND state IN ['waiting', 'held']
+       ORDER BY entered_at DESC LIMIT 1;`, { task: taskRef });
+    const openWait = waitRows?.[0];
+    if (!openWait || openWait.wait_key !== before.wait_episode || openWait.kind !== 'dependency' || !openWait.reference_task) {
+      throw new CompanyError('invalid', 'The open dependency wait record is missing or no longer matches the task');
+    }
+    if (normalizedId(openWait.reference_task) === input.taskId) throw new CompanyError('invalid', 'A task cannot wait on itself');
+
+    const beforeDeps = (before.dependencies ?? []).map(normalizedId);
+    const newDeps = dependencies.filter(dep => !beforeDeps.includes(dep));
+    if (!newDeps.length) throw new CompanyError('invalid', 'append requires at least one dependency that is not already present');
+
+    const depIds = dependencies.map(dep => id('task', dep));
+    const [depRows] = await this.db.query<[Array<{ id: RecordId; goal?: RecordId }>]>(
+      'SELECT id, goal FROM task WHERE id IN $ids;', { ids: depIds });
+    const depById = new Map((depRows ?? []).map(row => [normalizedId(row.id), row]));
+    for (const dep of dependencies) {
+      const row = depById.get(dep);
+      if (!row) throw new CompanyError('not_found', `Dependency not found: ${dep}`);
+      if (normalizedId(row.goal) !== normalizedId(before.goal)) {
+        throw new CompanyError('invalid', 'Dependencies must live in the same goal as the task');
+      }
+    }
+
+    // Append-only edges still mutate the graph: walk the proposed closure and serialise with the
+    // same durable epoch defer uses, so a concurrent defer/append cannot commit a cycle.
+    const [epochRow] = await this.db.query<[{ value?: number } | undefined]>(
+      'SELECT * FROM ONLY company_meta:defer_epoch;');
+    const epochSeen = epochRow?.value ?? 0;
+    const seen = new Set(dependencies);
+    let frontier = [...dependencies];
+    for (let depth = 0; frontier.length && depth < 32; depth++) {
+      const graph = await this.dependencyGraph(frontier);
+      if (graph.has(input.taskId)) throw new CompanyError('invalid', 'Dependencies would create a cycle after revision resolution');
+      const next = [...new Set([...graph.values()].flat())].filter(dep => !seen.has(dep));
+      if (next.includes(input.taskId)) throw new CompanyError('invalid', 'Dependencies would create a cycle');
+      for (const key of graph.keys()) seen.add(key);
+      for (const dep of next) seen.add(dep);
+      frontier = next;
+    }
+
+    const evidence = `${input.text}\n[append-prerequisites] 操作者=${actor.employeeId} 等待=${openWait.wait_key} 引用=${normalizedId(openWait.reference_task)} 依赖 before=[${beforeDeps.join(', ')}] after=[${[...new Set([...beforeDeps, ...dependencies])].join(', ')}] 续接=manager`;
+    const row = await this.txTask(`BEGIN;
+      LET $who = SELECT * FROM ONLY $actor;
+      LET $t = SELECT * FROM ONLY $task;
+      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'gm' { THROW 'append denied' };
+      IF $t = NONE { THROW 'task not found' };
+      IF $t.state != 'blocked' OR $t.blocked_to != NONE OR $t.wait_state != 'waiting' OR $t.wait_kind != 'dependency' { THROW 'append denied: only a formal dependency wait' };
+      IF $t.resume_state != 'ready' { THROW 'append denied: only execute-phase dependency waits' };
+      IF $t.reviewer_role = 'owner' OR $t.wait_owner_role = 'owner' { THROW 'append denied: owner gate' };
+      IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'append denied: active lease' };
+      IF $t.version != $expected { THROW 'task version moved' };
+      LET $g = SELECT * FROM ONLY $t.goal;
+      IF $g != NONE AND $g.state != 'active' { THROW 'goal is closed' };
+      LET $w = SELECT * FROM task_wait WHERE task = $task AND state IN ['waiting', 'held'] ORDER BY entered_at DESC LIMIT 1;
+      IF array::len($w) != 1 OR $w[0].wait_key != $t.wait_episode OR $w[0].kind != 'dependency' OR $w[0].reference_task = NONE { THROW 'append denied: the open dependency wait is missing' };
+      IF $w[0].reference_task = $task { THROW 'append denied: self reference' };
+      FOR $dep IN $dependencies {
+        LET $d = SELECT * FROM ONLY $dep;
+        IF $d = NONE OR $d.goal != $t.goal { THROW 'append denied: dependency missing or outside the task goal' };
+        IF $d.id = $task { THROW 'append denied: self dependency' };
+      };
+      LET $merged = array::distinct(array::concat($t.dependencies ?? [], $dependencies));
+      IF array::len($merged) = array::len($t.dependencies ?? []) { THROW 'append denied: no new dependency' };
+      LET $epoch = SELECT * FROM ONLY company_meta:defer_epoch;
+      LET $epoch_value = $epoch.value ?? 0;
+      IF $epoch_value != $epoch_seen { THROW 'append graph moved: retry' };
+      IF $epoch = NONE {
+        CREATE ONLY company_meta:defer_epoch CONTENT { value: 1 };
+      } ELSE {
+        UPDATE ONLY company_meta:defer_epoch SET value = $epoch_value + 1;
+      };
+      LET $next = UPDATE ONLY $task SET
+        dependencies = $merged,
+        dependency_continuation = 'manager',
+        version = $t.version + 1 RETURN AFTER;
+      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'dependency_prerequisites_appended', evidence: $evidence,
+        version: $next.version, at: time::now(), source_phase: 'ready', wait_key: $w[0].wait_key,
+        reference_task: $w[0].reference_task, dependencies_before: $before_refs,
+        dependencies_after: $merged, continuation: 'manager', operator: $employee };
+      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+      CREATE ONLY $outbox CONTENT { task: $task, kind: 'dependency_prerequisites_appended', sequence: $sequence.value,
+        payload: { version: $next.version, dependencies_before: $before_refs, dependencies_after: $merged,
+          continuation: 'manager', wait_key: $w[0].wait_key, added: $added }, at: time::now() };
+      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
+      RETURN $next;
+      COMMIT;`, {
+      actor: id('employee', actor.employeeId), employee: actor.employeeId, task: taskRef, expected: input.expectedVersion,
+      dependencies: depIds, evidence, added: newDeps.length,
+      before_refs: (before.dependencies ?? []).map(dep => id('task', normalizedId(dep))),
+      epoch_seen: epochSeen, idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
     });
     return view(row);
   }

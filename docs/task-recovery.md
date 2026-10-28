@@ -5,6 +5,7 @@
 ## 行为契约
 
 - `defer_task_until.continuation=manager`：所有依赖完成后回到经理，保留原 execute/review 相位；即使依赖已经完成也不直接派员工。带 executionWindow 的任务缺省采用 manager，旧任务保持原默认行为。
+- `append_dependency_prerequisites`（gm/manage，窄口）：只作用于**已经在正式 dependency 等待中**的任务（`state=blocked`、`blocked_to=NONE`、`wait_state=waiting`、`wait_kind=dependency`、`resume_state=ready`），用于既有等待需要追加真实前置、又不能靠 resume/block 循环伪造状态变化的场景。要求无活动租约、非 owner 关口、同目标真实任务、至少一项新依赖；`expectedVersion` 必填 CAS，业务键幂等，依赖图 epoch＋闭包环检测，完整审计 `dependency_prerequisites_appended`（before/after、`wait_key`、原引用、continuation=manager）。它保留原等待引用与全部既有依赖，只追加依赖并设 `dependency_continuation=manager`：不改 `state/blocked_to/resume_state`、不自动 resume、不清故障/预算/额度、不扩大普通派工；等待与全部前置完成后，wait release 把任务交回 GM 关口而不是 ready。作废（void）前置只满足依赖等式，不会授权过期执行窗口——经理真正 resume 时仍按 `executionWindow.notAfter` 拒绝。
 - 每项采样、独立批准等前置必须建为真实依赖；不能只写在恢复说明里。系统校验结构化依赖，不解析自然语言猜前置。
 - `resume_task.executionWindow` 包含 approvalTask、configurationDigest、evidenceExpiresAt、minRemainingSeconds、notAfter。批准必须是本任务同目标、已完成的直接依赖，摘要和截止时间须匹配 prepare 登记的候选。notAfter 不得超过证据到期减去最小执行余量。
 - 首次部署前的候选没有可信到期元数据，不能据文字补填；须真实重采样后 prepare 新候选并独立批准。证明工具继续核验不可变文件、身份和独立批准。
@@ -16,6 +17,6 @@
 
 ## 验证与上线
 
-`RUN_SCK_LOOP_BREAKER_TESTS=1 bun test tests/task-recovery.test.ts tests/task-recovery.fork.test.ts tests/loop-breaker.fork.test.ts` 使用公司 fork，覆盖真实提交验收解锁、窗口过期与篡改、旧故障和新阶段、唯一恢复任务及再次停止。
+`RUN_SCK_LOOP_BREAKER_TESTS=1 bun test tests/task-recovery.test.ts tests/task-recovery.fork.test.ts tests/loop-breaker.fork.test.ts` 使用公司 fork，覆盖真实提交验收解锁、窗口过期与篡改、旧故障和新阶段、唯一恢复任务及再次停止。`bun scripts/test-worktrees.ts tests/dependency-prerequisites.fork.test.ts` 覆盖既有依赖等待的受控追加：成功路径与经理续接、并发 CAS、重放、非 GM、owner 关口、复核阶段、活动租约、跨目标、环、终态、重复前置与 void 前置下的过期窗口。
 
 039 为增量元数据，不回填业务数据。双面重新 vendor；既有发布兼容性守卫同时要求接续与窗口检查能力，禁止回滚到会忽略新字段的旧发布。发布后针对已知 FV06 卡点单独核对版本、活租约与老板原授权，再登记经理恢复链；不批量改写旧任务、不伪造采样或验收。

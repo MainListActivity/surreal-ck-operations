@@ -39,6 +39,8 @@ const BASE_TOOLS = [
   "wait_task", "resolve_wait", "cancel_wait", "extend_wait", "list_task_waits", "wait_handoff_cards", "wait_migration_preview", "wait_migration_apply",
   "create_task", "create_goal", "triage_goal", "create_delivery",
   "record_owner_decision", "set_direction", "resume_task", "defer_task_until", "retire_task",
+  // FV06: gm-only append of real prerequisites to an existing dependency wait; sets manager continuation, never resumes.
+  "append_dependency_prerequisites",
   "record_score", "get_model_evidence", "heartbeat", "deliverable_publish",
   // Manage capability (gm/product) only, enforced in core; writes land in audit.
   "def_list", "def_ensure", "project_disciplines_update",
@@ -1022,6 +1024,9 @@ export class SidecarPool {
       case "set_direction": await core.relayDirection(cred, args as never); return { recorded: true };
       case "resume_task": return core.resume(cred, taskIdOf(args.taskId), evidence());
       case "defer_task_until": return core.deferTaskUntil(cred, args as never);
+      case "append_dependency_prerequisites": return core.appendDependencyPrerequisites
+        ? core.appendDependencyPrerequisites(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose append_dependency_prerequisites"), { code: "temporarily_unavailable" }));
       case "retire_task": return core.retireTask(cred, args as never);
       // SYS03 经理处置账本：授权与全部写入都在 core；这里只是同一通道上的入口（sck 与 MCP 同源判定）。
       case "claim_disposition": return core.claimDisposition

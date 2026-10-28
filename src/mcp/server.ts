@@ -560,6 +560,19 @@ function registerTools(server: McpServer, core: CompanyCore) {
     }),
   }, async (input, ctx) => run(token(ctx), () => core.deferTaskUntil(token(ctx), input)));
 
+  server.registerTool('append_dependency_prerequisites', {
+    description: 'gm only: append real prerequisites to an EXISTING execute-phase dependency wait (a task already waiting on a reference task, not a gm block). The wait reference and all existing dependencies stay; new same-goal task ids are appended and the continuation becomes manager, so when the wait and every prerequisite finish the task returns to GM instead of resuming an employee. Owner gates, review-phase waits, live leases, terminal tasks, cross-goal and cyclic dependencies are refused. Version CAS and idempotent; it never resumes the task, clears faults/budgets or widens ordinary dispatch.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200),
+      dependencies: z.array(z.string().min(1).max(200)).min(1).max(20),
+      text: z.string().min(20).max(8000),
+      idempotencyKey: z.string().min(8).max(200),
+      expectedVersion: z.number().int().positive(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.appendDependencyPrerequisites
+    ? core.appendDependencyPrerequisites(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
   server.registerTool('retire_task', {
     description: 'gm/product only: retire a task to the terminal void state. Releases any live lease, and blocked dependents waiting on it re-evaluate (void counts as satisfied) so downstream chains unlock. Repeating on a void task is a no-op; done tasks refuse.',
     inputSchema: z.object({

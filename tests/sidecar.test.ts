@@ -74,6 +74,10 @@ const core = {
   relayGoal: async () => ({}), triageGoal: async () => ({}), createDelivery: async () => [],
   relayOwnerDecision: async () => taskView('x'), relayDirection: async () => {},
   resume: async () => taskView('x'), recordScore: async () => ({ recorded: 1, participants: [] }),
+  appendDependencyPrerequisites: async (_c: string, input: Record<string, unknown>) => {
+    calls.push({ tool: 'append_dependency_prerequisites', text: String(input.text ?? '') });
+    return taskView(String(input.taskId));
+  },
   listOutbox: async () => [],
   qaObservationRead: async (c: string, input: Record<string, unknown>) => ({ meta: { checkedAt: 'x', dataSource: 'live', instanceAt: 'x', scope: {}, completeness: {} }, task: { id: input.taskId }, __cred: c }),
 };
@@ -426,6 +430,21 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
       expect(res.ok).toBe(false);
       expect(res.error).toContain('unknown_tool');
     }
+  });
+
+  test('FV06 append_dependency_prerequisites is listed and dispatched through the employee channel', async () => {
+    const i = inst('e12a');
+    const env = pool.env(i);
+    const listed = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'fa0', '__list__', {});
+    expect((listed.data as { tools: string[] }).tools).toContain('append_dependency_prerequisites');
+    await pool.claim(i, task('task-12a'));
+    const res = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'fa1', 'append_dependency_prerequisites', {
+      taskId: 'task-12a', expectedVersion: 1, dependencies: ['dep-1'],
+      text: 'FV06 通道回归：受控追加依赖前置必须由 sidecar 分发到 core，而不是 unknown_tool。', idempotencyKey: 'fa-1',
+    });
+    expect(res.ok).toBe(true);
+    expect(calls.filter(c => c.tool === 'append_dependency_prerequisites')).toHaveLength(1);
+    expect(calls.find(c => c.tool === 'append_dependency_prerequisites')?.text).toContain('FV06');
   });
 
   test('worktree 工具经 sidecar 路由：员工缺省绑当前任务，gm 缺省取全局，回收/审计透传 core', async () => {
