@@ -210,3 +210,127 @@ run('an obsoleted version card is shown as retired and cannot be installed again
  expect(card?.retired).toBe(true);expect(card?.phase).toContain('替代');
  expect(await service.start({taskId:t.id,taskVersion:t.version,digest:card!.plan.digest},'owner:test').catch((e:{code?:string})=>e.code)).toBe('invalid');
 });
+
+
+async function resetAutomaticFixture(){
+ await db.db.query('DELETE company_upgrade; DELETE task WHERE company_upgrade!=NONE; DELETE company_meta:upgrade_job; UPDATE company_meta:config SET paused=false;');
+ rmSync(join(home,'active'));symlinkSync(join(home,'releases',oldSha),join(home,'active'));
+ await service.setAuto(false,'owner:test');
+}
+run('automatic upgrades are opt-in, pause-aware, single-flight and distinctly audited',async()=>{
+ await resetAutomaticFixture();const t=await task(),before=launches;
+ expect(await service.autoStart()).toBeUndefined();expect(launches).toBe(before);
+ await service.setAuto(true,'owner:test');await owner.setPaused(true);
+ expect(await service.autoStart()).toBeUndefined();await owner.setPaused(false);
+ const job=await service.autoStart();expect(job).toBeDefined();expect(launches).toBe(before+1);
+ expect((await service.job(job!.jobId))?.authorization).toBe('automatic');
+ expect(await service.autoStart()).toBeUndefined();expect(launches).toBe(before+1);
+ const [audits]=await db.db.query<[Array<{action:string;actor:string}>]>("SELECT action,actor FROM audit WHERE task=$task AND action CONTAINS 'company_upgrade_';",{task:new RecordId('task',t.id)});
+ expect(audits.some(a=>a.action==='company_upgrade_auto_authorized'&&a.actor==='system:auto-upgrade')).toBe(true);
+ expect(audits.some(a=>a.action==='company_upgrade_authorized')).toBe(false);
+});
+run('failed automatic versions back off 24h, stop after two attempts, and keep manual retry available',async()=>{
+ await resetAutomaticFixture();const t=await task();await service.setAuto(true,'owner:test');
+ const first=await service.autoStart();await service.update(first!.jobId,'failed','fixture');
+ await expect(service.autoStart()).rejects.toThrow('24小时');
+ await db.db.query('UPDATE $job SET at=time::now()-25h,updated_at=time::now()-25h;',{job:new RecordId('company_upgrade',first!.jobId)});
+ const second=await service.autoStart();expect(second!.jobId).not.toBe(first!.jobId);
+ await service.update(second!.jobId,'failed','fixture');
+ await db.db.query('UPDATE $job SET at=time::now()-25h,updated_at=time::now()-25h;',{job:new RecordId('company_upgrade',second!.jobId)});
+ await expect(service.autoStart()).rejects.toThrow('上限');
+ expect(await service.start({taskId:t.id,taskVersion:t.version,digest:t.companyUpgrade!.digest},'owner:test')).toBeDefined();
+});
+run('disabling automatic authorization during checking prevents install and never replies success',async()=>{
+ await resetAutomaticFixture();const t=await task();await service.setAuto(true,'owner:test');const j=await service.autoStart();let installed=false;
+ await runCompanyUpgrade(service,j!.jobId,{run:async(_exe,args)=>{
+  if(args.includes('sidecar-review'))await service.setAuto(false,'owner:test');
+  if(args[1]==='install')installed=true;
+ },verify:async()=>{}});
+ expect(installed).toBe(false);expect((await service.job(j!.jobId))?.status).toBe('failed');
+ expect((await core.getTask(eng,t.id)).blockedTo).toBe('owner');
+});
+run('automatic task dependencies are rechecked and must be accepted before any job starts',async()=>{
+ await resetAutomaticFixture();const t=await task();await service.setAuto(true,'owner:test');
+ const dep=new RecordId('task',crypto.randomUUID());
+ await db.db.query("CREATE $dep CONTENT {title:'待独立验收',state:'review',version:1}; UPDATE $task SET dependencies=[$dep];",{dep,task:new RecordId('task',t.id)});
+ await expect(service.autoStart()).rejects.toThrow('前置');
+ await db.db.query("UPDATE $dep SET state='done';",{dep});expect(await service.autoStart()).toBeDefined();
+});
+run('automatic upgrade completes real reply without inventing a boss click',async()=>{
+ await resetAutomaticFixture();const t=await task();await service.setAuto(true,'owner:test');const j=await service.autoStart();
+ await runCompanyUpgrade(service,j!.jobId,{run:async(_exe,args)=>{if(args[1]==='install'){rmSync(join(home,'active'));symlinkSync(args[2]!,join(home,'active'));}},verify:async()=>{}});
+ expect((await service.job(j!.jobId))?.status).toBe('succeeded');
+ expect((await core.getTask(eng,t.id)).blockedTo).toBeUndefined();
+ const [cfg]=await db.db.query<[{paused:boolean}]>('SELECT paused FROM ONLY company_meta:config;');expect(cfg.paused).toBe(false);
+});
+run('an automatic exact-version acknowledgement verifies without installing twice',async()=>{
+ await resetAutomaticFixture();const t=await task();await service.setAuto(true,'owner:test');
+ rmSync(join(home,'active'));symlinkSync(join(home,'releases',newSha),join(home,'active'));
+ const j=await service.autoStart();expect(j).toBeDefined();let installs=0;
+ await runCompanyUpgrade(service,j!.jobId,{run:async(_exe,args)=>{if(args[1]==='install')installs++;},verify:async()=>{}});
+ expect(installs).toBe(0);expect((await service.job(j!.jobId))?.status).toBe('succeeded');
+ expect((await core.getTask(eng,t.id)).blockedTo).toBeUndefined();
+});
+run('reopened prerequisites and a replacement automatic grant both block the installation boundary',async()=>{
+ await resetAutomaticFixture();const t=await task();await service.setAuto(true,'owner:test');
+ const dep=new RecordId('task',crypto.randomUUID());
+ await db.db.query("CREATE $dep CONTENT {title:'已验收前置',state:'done',version:1};UPDATE $task SET dependencies=[$dep];",{dep,task:new RecordId('task',t.id)});
+ const j=await service.autoStart();let installs=0;
+ await runCompanyUpgrade(service,j!.jobId,{run:async(_exe,args)=>{
+  if(args.includes('sidecar-review'))await db.db.query("UPDATE $dep SET state='review';",{dep});
+  if(args[1]==='install')installs++;
+ },verify:async()=>{}});
+ expect(installs).toBe(0);expect((await service.job(j!.jobId))?.status).toBe('failed');
+ await resetAutomaticFixture();await task();await service.setAuto(true,'owner:test');const second=await service.autoStart();
+ await runCompanyUpgrade(service,second!.jobId,{run:async(_exe,args)=>{
+  if(args.includes('sidecar-review')){await service.setAuto(false,'owner:test');await service.setAuto(true,'owner:test');}
+  if(args[1]==='install')installs++;
+ },verify:async()=>{}});
+ expect(installs).toBe(0);expect((await service.job(second!.jobId))?.status).toBe('failed');
+});
+run('concurrent automatic scans can launch only one durable worker',async()=>{
+ await resetAutomaticFixture();await task();await service.setAuto(true,'owner:test');const before=launches;
+ await Promise.allSettled([service.autoStart(),service.autoStart(),service.autoStart()]);
+ const [rows]=await db.db.query<[Array<{id:RecordId}>]>('SELECT id FROM company_upgrade;');
+ expect(rows).toHaveLength(1);expect(launches).toBe(before+1);
+});
+run('failed health of an already installed SHA still observes automatic retry backoff and budget',async()=>{
+ await resetAutomaticFixture();await task();await service.setAuto(true,'owner:test');
+ rmSync(join(home,'active'));symlinkSync(join(home,'releases',newSha),join(home,'active'));
+ const first=await service.autoStart();
+ await runCompanyUpgrade(service,first!.jobId,{run:async()=>{},verify:async()=>{throw Error('unhealthy');}});
+ expect((await service.job(first!.jobId))?.status).toBe('failed');
+ await expect(service.autoStart()).rejects.toThrow('24小时');
+ await db.db.query('UPDATE $job SET at=time::now()-25h,updated_at=time::now()-25h;',{job:new RecordId('company_upgrade',first!.jobId)});
+ const second=await service.autoStart();await service.update(second!.jobId,'failed','fixture');
+ await expect(service.autoStart()).rejects.toThrow('上限');
+});
+run('a manual pause during preparation stops installation; entering installing is atomic with its pause revision',async()=>{
+ await resetAutomaticFixture();await task();await service.setAuto(true,'owner:test');const j=await service.autoStart();let installs=0;
+ await runCompanyUpgrade(service,j!.jobId,{run:async(_exe,args)=>{
+  if(args.includes('sidecar-review'))await owner.setPaused(true);
+  if(args[1]==='install')installs++;
+ },verify:async()=>{}});
+ expect(installs).toBe(0);expect((await service.job(j!.jobId))?.status).toBe('failed');
+ const [paused]=await db.db.query<[{paused:boolean}]>('SELECT paused FROM ONLY company_meta:config;');expect(paused.paused).toBe(true);
+ await resetAutomaticFixture();await task();await service.setAuto(true,'owner:test');const second=await service.autoStart();
+ await runCompanyUpgrade(service,second!.jobId,{run:async(_exe,args)=>{
+  if(args[1]==='install'){
+   const state=await service.job(second!.jobId);expect(state?.status).toBe('installing');expect(typeof state?.pause_version).toBe('number');
+   const [config]=await db.db.query<[{paused:boolean;pause_version:number}]>('SELECT paused,pause_version FROM ONLY company_meta:config;');
+   expect(config.paused).toBe(true);expect(state!.pause_version).toBe(config.pause_version);
+   rmSync(join(home,'active'));symlinkSync(args[2]!,join(home,'active'));
+  }
+ },verify:async()=>{}});
+ expect((await service.job(second!.jobId))?.status).toBe('succeeded');
+});
+run('automatic scanning chooses the highest pending version and ignores job-history-only cards',async()=>{
+ await resetAutomaticFixture();const high=await task(),low=await task();await service.setAuto(true,'owner:test');
+ const lowPlan=await readCompanyRelease(repo,git(['rev-parse','HEAD']));expect(lowPlan.version).toBe('0.1.5');
+ await db.db.query('UPDATE $task SET company_upgrade=$plan;',{task:new RecordId('task',low.id),plan:lowPlan});
+ const first=await service.autoStart();expect(String((await service.job(first!.jobId))!.task.id)).toBe(high.id);
+ await service.update(first!.jobId,'failed','fixture');
+ // A completed high-version task can remain in the last three job history cards, but is no longer pending.
+ await db.db.query("UPDATE $task SET state='done',blocked_to=NONE;",{task:new RecordId('task',high.id)});
+ const second=await service.autoStart();expect(String((await service.job(second!.jobId))!.task.id)).toBe(low.id);
+});

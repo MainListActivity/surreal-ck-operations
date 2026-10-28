@@ -1,18 +1,15 @@
 {
-  "version": "0.3.29",
-  "title": "Magpie 受控路由契约修复与 v2/v4 真实回归",
+  "version": "0.3.30",
+  "title": "公司升级全自动执行与可撤销策略",
   "changes": [
-    "配额窗口不再静默丢弃：任一非 unlimited 窗口的 remaining 缺失、非数、负数或大于 100，或 resetsAt 存在但不可解析，都产出结构化 gap 并拒绝生成文档；畸形窗口不会被健康兄弟掩盖。",
-    "usage 完成态改为显式 done === true：done 缺失、false 或非布尔一律不作为已完成 usage 关联，未知状态在 usage gap 中说明。",
-    "catalog free=true 但价格缺失或非零按价目不明闭锁；零价证据只认源明确给出数值 input=0 且 output=0，freeEvidence 不再可能写成 magpie-catalog-zero。",
-    "ops_magpie_window_prepare 的证据根改为 approvalTask，与 ops_internal_ai_prove/deliver 一致：经理可在自己任务为另一审批任务准备窗口，其他任务根或证据根外路径仍拒绝。",
-    "manifest v1|v2 联合类型上 configurationDigest 改为分配式 Omit；测试按 schemaVersion 与 'model' in service 收窄，并补真实公司 fork 的 v2/v4 prepare→不同员工独立批准→prove/窗口回归及旧 v3、跨契约、摘要篡改拒绝。"
+    "新增老板可开关的全自动升级策略，Paseo 收件箱与网页审核台同步显示；默认关闭，本次按老板授权启用。",
+    "后台每分钟非阻塞检查升级卡，最高版本优先；复用固定 main 发布、双类型检查、双门禁、双面安装、验证和回滚。",
+    "自动授权单独审计，失败退避24小时且每个SHA累计失败2次后停止自动尝试；安装前重核策略修订、任务摘要及前置验收，自动回执不冒充老板点击。"
   ],
   "impact": [
-    "纯控制面证据与门禁修复：不触产品库、生产数据、active、凭证或模型；采样仍是只读 loopback 快照，未新增依赖或环境变量。",
-    "发布后 v4 采样对畸形配额、未知完成态和不明价目更严格，原本被静默放行的快照会转为 blocked；v1/v3 证据形状不变。",
-    "窗口代理读取根从调用任务改为 approvalTask；旧调用若 approvalTask 指向自身任务，行为不变。"
+    "仅自动化公司系统安装授权，不取代普通业务审批；不自动发布任意 main 提交，仍需要结构化公司升级任务。",
+    "手动升级与重试保留；安装前可关闭开关取消未进入安装阶段的自动作业。"
   ],
-  "migration": "无数据库迁移、无历史改写；复用既有 evidence/receipt 与 proof candidate 存储，未改 schema、任务或派工数据。",
-  "rollback": "revert 合入提交并按受控 release/vendor 重发；代码回滚不会撤销已生成的只读 Magpie 证据文档与回执，也不改写已批准的 v2/v4 候选，处置以既有审计为准。"
+  "migration": "无schema迁移；新增配置字段和升级作业可选授权字段。发布验证后记录老板授权并开启自动升级。",
+  "rollback": "先关闭自动升级开关，再恢复上一个健康 main release；保留作业和审计历史，不伪造成功回执。"
 }
