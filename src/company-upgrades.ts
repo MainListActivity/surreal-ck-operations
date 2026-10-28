@@ -107,6 +107,8 @@ export class CompanyUpgrades {
  }
  async update(id:string,status:UpgradeStatus,phase:string,error?:string){await this.db.query('UPDATE $job SET status=$status,phase=$phase,error=$error,updated_at=time::now();',{job:new RecordId('company_upgrade',id),status,phase,error});}
  async job(id:string){return this.db.select<UpgradeJob>(new RecordId('company_upgrade',id));}
+ /** The version actually installed, or undefined when the active release cannot be read. */
+ async installed(){return installedRelease(this.options.home).catch(()=>undefined);}
  async finish(job:UpgradeJob){
   const decision=job.decision;
   const note=`通过：公司系统已升级至 v${job.plan.version}（${job.plan.sha}）。\n上线内容：${job.plan.changes.join('；')}\n影响范围：${job.plan.impact.join('；')}\n双面安装、健康检查、版本及门禁验证通过。请员工继续独立业务验收。`;
