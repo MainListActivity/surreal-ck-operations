@@ -182,7 +182,15 @@ export interface GoalAssessment {
   stages: GoalStage[];
   blockers: GoalBlocker[];
   dependencyPath: Array<{ taskId: string; title: string }>;
-  graph: { cycle: boolean; dangling: Array<{ taskId: string; dependency: string }>; crossGoal: Array<{ taskId: string; dependency: string }> };
+  graph: {
+    cycle: boolean;
+    /** Dependencies that exist nowhere in the task table: the only edges that may be called missing. */
+    dangling: Array<{ taskId: string; dependency: string }>;
+    /** Dependencies that exist and belong to another goal, carrying that goal and the task's real state. */
+    crossGoal: Array<{ taskId: string; dependency: string; goalId: string; state?: string }>;
+    /** Dependencies that exist in the fleet but belong to no goal: unscoped external work, never missing. */
+    unscoped: Array<{ taskId: string; dependency: string; state?: string }>;
+  };
   repairReasons: Array<{ code: string; message: string; taskId?: string }>;
   needsRepair: boolean;
   readyToComplete: boolean;
@@ -194,6 +202,8 @@ export interface GoalCard extends GoalAssessment {
   taskTotal: number;
   blockersOmitted?: number;
   sourceTaskIdsTruncated?: boolean;
+  /** Graph edge lists were capped to keep the card inside the response budget; counts disclose the omitted tail. */
+  graphOmitted?: { dangling: number; crossGoal: number; unscoped: number };
   title: string;
   brief: string;
   tier?: string;
@@ -381,8 +391,10 @@ function blockerFor(
 export function assessGoal(input: {
   goal: GoalFact; tasks: GoalTaskFact[]; waits?: GoalWaitFact[]; faults?: GoalFaultFact[];
   outcome?: GoalOutcomeFact; evidence?: GoalEvidenceFact[];
-  /** Dependencies resolved by the store to a task in another goal; the pure rule never invents that fact. */
-  externalDependencies?: Array<{ taskId: string; dependency: string; goalId?: string }>;
+  /** Dependencies resolved by the store against the whole task table. An entry means the row exists: `goalId`
+   * names its goal, `goalId: null` means that goal-less external work, and an absent entry is the only way a
+   * dependency can be reported as missing. The store batches these; the pure rule never invents the fact. */
+  externalDependencies?: Array<{ taskId: string; dependency: string; goalId: string | null; state?: string }>;
   /** Old quick acceptance anchors replaced by goal_acceptance_repair; their void is an authorized replacement. */
   replacedAcceptanceTaskIds?: string[];
   now: number;
@@ -404,16 +416,23 @@ export function assessGoal(input: {
 
   const repairReasons: GoalAssessment['repairReasons'] = [];
   const dangling: Array<{ taskId: string; dependency: string }> = [];
-  const crossGoal: Array<{ taskId: string; dependency: string }> = [];
-  const external = new Map((input.externalDependencies ?? []).map(item => [`${item.taskId}\0${item.dependency}`, item.goalId]));
+  const crossGoal: Array<{ taskId: string; dependency: string; goalId: string; state?: string }> = [];
+  const unscoped: Array<{ taskId: string; dependency: string; state?: string }> = [];
+  const external = new Map((input.externalDependencies ?? []).map(item => [`${item.taskId}\0${item.dependency}`, item]));
   for (const task of tasks) {
     for (const dep of task.dependencies) {
       if (byId.has(dep)) continue;
-      const otherGoal = external.get(`${task.id}\0${dep}`);
-      // Cross-goal edges are invisible in the task list; the store resolves them and passes the facts. A missing
-      // dependency that no goal owns remains dangling, never silently treated as a satisfied edge.
-      if (otherGoal !== undefined && otherGoal !== goal.id) crossGoal.push({ taskId: task.id, dependency: dep });
-      else dangling.push({ taskId: task.id, dependency: dep });
+      const resolved = external.get(`${task.id}\0${dep}`);
+      // The store checked the whole task table. A row in another goal is a cross-goal edge that keeps its real
+      // state; a row with no goal is unscoped external work that exists; only a row found nowhere is dangling.
+      // Reporting an existing row as missing was the bug this distinguishes away.
+      if (!resolved) dangling.push({ taskId: task.id, dependency: dep });
+      else if (resolved.goalId === null) {
+        unscoped.push({ taskId: task.id, dependency: dep, ...(resolved.state ? { state: resolved.state } : {}) });
+      } else if (resolved.goalId !== goal.id) {
+        crossGoal.push({ taskId: task.id, dependency: dep, goalId: resolved.goalId,
+          ...(resolved.state ? { state: resolved.state } : {}) });
+      } else dangling.push({ taskId: task.id, dependency: dep });
     }
   }
   let cycle = false;
@@ -438,7 +457,17 @@ export function assessGoal(input: {
   }
   if (cycle) repairReasons.push({ code: 'dependency_cycle', message: '目标任务依赖存在循环' });
   for (const item of dangling) repairReasons.push({ code: 'dependency_dangling', message: `依赖 ${item.dependency} 不存在`, taskId: item.taskId });
-  for (const item of crossGoal) repairReasons.push({ code: 'dependency_cross_goal', message: `依赖 ${item.dependency} 属于其他目标`, taskId: item.taskId });
+  // An edge to another goal stays a cross-goal fact with the referenced task's real state, so a done edge and a
+  // blocked edge never read the same; it is not downgraded to "missing".
+  for (const item of crossGoal) repairReasons.push({
+    code: 'dependency_cross_goal',
+    message: `依赖 ${item.dependency} 属于其他目标（${item.state ?? '状态未知'}）`, taskId: item.taskId });
+  // A row that exists with no goal is outside every goal's scope: it is disclosed as external/unscoped, never
+  // claimed to be missing. It stays a repair reason so removing dangling cannot be spun as "all governance fixed".
+  for (const item of unscoped) repairReasons.push({
+    code: 'dependency_unscoped',
+    message: `依赖 ${item.dependency} 存在于全库但不属于任何目标（external/unscoped${item.state ? `，状态 ${item.state}` : ''}）`,
+    taskId: item.taskId });
 
   const ownerApproved = final?.state === 'done' && (final.reviewerRole !== 'owner' || final.acceptedBy === 'owner');
   // A required owner_final is only satisfied by an owner-reviewed final gate accepted by the owner himself;
@@ -549,7 +578,7 @@ export function assessGoal(input: {
     },
     stages, blockers,
     dependencyPath: blockers[0]?.dependencyPath ?? [],
-    graph: { cycle, dangling, crossGoal },
+    graph: { cycle, dangling, crossGoal, unscoped },
     repairReasons, needsRepair,
     readyToComplete: (goal.state === 'active' || goal.state === 'needs_repair') && Boolean(input.outcome) &&
       final?.state === 'done' && ownerApproved && missing.length === 0 && repairReasons.length === 0,

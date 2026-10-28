@@ -385,36 +385,49 @@ export class GoalGovernanceStore {
       this.tasksOfGoals(goalIds), this.outcomesOf(goalIds), this.evidenceOf(goalIds),
     ]);
     const taskIds = tasks.map(task => text(task.id));
-    const taskIdSet = new Set(taskIds);
     const [replacementRows] = taskIds.length ? await this.db.query<[Array<{ task: unknown }>]>(
       "SELECT task FROM audit WHERE task IN $tasks AND action IN ['goal_acceptance_replaced', 'goal_final_gate_replaced'];",
       { tasks: taskIds.map(id => new RecordId('task', id)) }) : [[] as Array<{ task: unknown }>];
     const replacedAcceptanceTaskIds = [...new Set((replacementRows ?? []).map(row => text(row.task)))];
-    const missingDeps = [...new Set(tasks.flatMap(task => taskFact(task).dependencies).filter(dep => !taskIdSet.has(dep)))];
-    const [externalRows] = missingDeps.length ? await this.db.query<[Array<{ id: unknown; goal?: unknown }>]>(
-      'SELECT id, goal FROM task WHERE id IN $deps;', { deps: missingDeps.map(dep => new RecordId('task', dep)) }) : [[] as Array<{ id: unknown; goal?: unknown }>];
-    const externalGoalByTask = new Map((externalRows ?? []).map(row => [text(row.id), text(row.goal)]));
-    const [waits, faults] = await Promise.all([this.waitsOfTasks(taskIds), this.faultsOfTasks(taskIds)]);
     const tasksByGoal = new Map<string, GoalTaskFact[]>();
-    const externalByGoal = new Map<string, Array<{ taskId: string; dependency: string; goalId?: string }>>();
-    for (const row of tasks) {
-      const goalId = row.goal ? text(row.goal) : undefined;
-      if (!goalId) continue;
-      const fact = taskFact(row);
-      for (const dep of fact.dependencies) {
-        const otherGoal = externalGoalByTask.get(dep);
-        if (taskIdSet.has(dep) || !otherGoal || otherGoal === goalId) continue;
-        const list = externalByGoal.get(goalId) ?? [];
-        list.push({ taskId: fact.id, dependency: dep, goalId: otherGoal });
-        externalByGoal.set(goalId, list);
-      }
-    }
     for (const row of tasks) {
       const goalId = row.goal ? text(row.goal) : undefined;
       if (!goalId) continue;
       const list = tasksByGoal.get(goalId) ?? [];
       list.push(taskFact(row));
       tasksByGoal.set(goalId, list);
+    }
+    const ownIdsByGoal = new Map([...tasksByGoal].map(([goalId, list]) => [goalId, new Set(list.map(task => task.id))]));
+    // Resolve every dependency that leaves its own goal against the whole task table in one batched read: existence,
+    // owning goal and the referenced task's state. A dep in another goal on this same page is still external to the
+    // holder, so it must be resolved here too; a row that exists with no goal is unscoped, not missing.
+    const unresolvedDeps = new Set<string>();
+    for (const [goalId, list] of tasksByGoal) {
+      const own = ownIdsByGoal.get(goalId)!;
+      for (const task of list) for (const dep of task.dependencies) if (!own.has(dep)) unresolvedDeps.add(dep);
+    }
+    const [externalRows] = unresolvedDeps.size ? await this.db.query<[Array<{ id: unknown; goal?: unknown; state?: unknown }>]>(
+      'SELECT id, goal, state FROM task WHERE id IN $deps;',
+      { deps: [...unresolvedDeps].map(dep => new RecordId('task', dep)) }) : [[] as Array<{ id: unknown; goal?: unknown; state?: unknown }>];
+    const externalGoalByTask = new Map((externalRows ?? []).map(row => [text(row.id), {
+      goalId: row.goal ? text(row.goal) : null,
+      state: row.state === undefined || row.state === null ? undefined : String(row.state),
+    }]));
+    const [waits, faults] = await Promise.all([this.waitsOfTasks(taskIds), this.faultsOfTasks(taskIds)]);
+    const externalByGoal = new Map<string, Array<{ taskId: string; dependency: string; goalId: string | null; state?: string }>>();
+    for (const [goalId, list] of tasksByGoal) {
+      const own = ownIdsByGoal.get(goalId)!;
+      for (const fact of list) {
+        for (const dep of fact.dependencies) {
+          if (own.has(dep)) continue;
+          const resolved = externalGoalByTask.get(dep);
+          if (!resolved) continue;
+          const items = externalByGoal.get(goalId) ?? [];
+          items.push({ taskId: fact.id, dependency: dep, goalId: resolved.goalId,
+            ...(resolved.state ? { state: resolved.state } : {}) });
+          externalByGoal.set(goalId, items);
+        }
+      }
     }
     const waitsByTask = new Map(waits.map(wait => [wait.taskId, wait]));
     const faultsByTask = new Map(faults.map(fault => [fault.taskId, fault]));
@@ -430,7 +443,13 @@ export class GoalGovernanceStore {
         ...(replacedAcceptanceTaskIds.length ? { replacedAcceptanceTaskIds } : {}),
         now,
       });
-      const blockerCap = 8, taskCap = 20, reasonCap = 12;
+      const blockerCap = 8, taskCap = 20, reasonCap = 12, graphCap = 20;
+      const capGraph = <T>(list: T[]): T[] => list.slice(0, graphCap);
+      const graphOmitted = {
+        dangling: Math.max(0, assessment.graph.dangling.length - graphCap),
+        crossGoal: Math.max(0, assessment.graph.crossGoal.length - graphCap),
+        unscoped: Math.max(0, assessment.graph.unscoped.length - graphCap),
+      };
       return {
         ...assessment,
         needsRepair: assessment.needsRepair || goal.state === 'needs_repair',
@@ -442,6 +461,13 @@ export class GoalGovernanceStore {
         repairReasons: assessment.repairReasons.slice(0, reasonCap),
         sourceTaskIds: assessment.sourceTaskIds.slice(0, taskCap),
         ...(assessment.sourceTaskIds.length > taskCap ? { sourceTaskIdsTruncated: true } : {}),
+        graph: {
+          cycle: assessment.graph.cycle,
+          dangling: capGraph(assessment.graph.dangling),
+          crossGoal: capGraph(assessment.graph.crossGoal),
+          unscoped: capGraph(assessment.graph.unscoped),
+        },
+        ...(graphOmitted.dangling || graphOmitted.crossGoal || graphOmitted.unscoped ? { graphOmitted } : {}),
         title: goal.title, brief: goal.brief.slice(0, 800),
         ...(goal.tier ? { tier: goal.tier } : {}), ...(goal.pipeline ? { pipeline: goal.pipeline } : {}),
         ...(goal.project ? { project: goal.project } : {}),
@@ -536,7 +562,8 @@ export class GoalGovernanceStore {
       missingOutcome: cards.filter(card => !card.outcome.registered).length,
       finalGateGap: cards.filter(card => card.repairReasons.some(reason =>
         reason.code === 'final_gate_missing' || reason.code === 'final_gate_void' || reason.code === 'final_gate_superseded')).length,
-      graphIssues: cards.filter(card => card.graph.cycle || card.graph.dangling.length > 0 || card.graph.crossGoal.length > 0).length,
+      graphIssues: cards.filter(card => card.graph.cycle || card.graph.dangling.length > 0 ||
+        card.graph.crossGoal.length > 0 || card.graph.unscoped.length > 0).length,
       unknownDeadline: cards.filter(card => card.deadline.status === 'unknown').length,
     };
     const offset = cursor?.offset ?? 0;
@@ -585,6 +612,20 @@ export class GoalGovernanceStore {
       repairReasons: card.repairReasons.slice(0, 4),
       sourceTaskIds: card.sourceTaskIds.slice(0, 5),
       ...((card.sourceTaskIds.length > 5 || card.sourceTaskIdsTruncated) ? { sourceTaskIdsTruncated: true } : {}),
+      graph: {
+        cycle: card.graph.cycle,
+        dangling: card.graph.dangling.slice(0, 3),
+        crossGoal: card.graph.crossGoal.slice(0, 3),
+        unscoped: card.graph.unscoped.slice(0, 3),
+      },
+      ...((card.graph.dangling.length > 3 || card.graph.crossGoal.length > 3 || card.graph.unscoped.length > 3 ||
+        card.graphOmitted) ? {
+        graphOmitted: {
+          dangling: (card.graphOmitted?.dangling ?? 0) + Math.max(0, card.graph.dangling.length - 3),
+          crossGoal: (card.graphOmitted?.crossGoal ?? 0) + Math.max(0, card.graph.crossGoal.length - 3),
+          unscoped: (card.graphOmitted?.unscoped ?? 0) + Math.max(0, card.graph.unscoped.length - 3),
+        },
+      } : {}),
       brief: card.brief.slice(0, 200),
     };
   }

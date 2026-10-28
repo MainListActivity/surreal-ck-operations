@@ -68,15 +68,29 @@ async function makeTask(goal: string, label: string, over: Record<string, unknow
   return id;
 }
 
+/** A real task row that belongs to no goal: the unscoped external work the governance card must not call missing. */
+async function makeUnscopedTask(label: string, over: Record<string, unknown> = {}): Promise<string> {
+  const id = taskId(label);
+  const row = {
+    title: label, context: 'SYS07 无目标归属的外部依赖夹具', state: 'done', kind: 'task',
+    executor_role: 'engineering', reviewer_role: 'qa', dependencies: [],
+    version: 1, fence: 0, created_at: new Date(Date.now() - 5 * 86_400_000), ...over,
+  };
+  await database.db.query('CREATE ONLY $t CONTENT $row;', { t: new RecordId('task', id), row });
+  return id;
+}
+
 async function seedGoal(input: {
   id: string; tier?: string; state?: string; finalState?: string; acceptedBy?: string; reviewerRole?: string;
   outcomeRequired?: string[]; outcome?: boolean; deadline?: string; doneAt?: string; createdAt?: string;
+  gateDependencies?: string[];
 }): Promise<{ goalId: string; manualId: string; gateId: string }> {
   const goalId = input.id;
   const manualId = await makeTask(goalId, '运营验收', { executor_role: 'product', reviewer_role: 'gm', kind: 'task' });
   const gateId = await makeTask(goalId, 'G3 老板最终验收', {
     executor_role: 'gm', reviewer_role: input.reviewerRole ?? 'owner', kind: 'gate',
     state: input.finalState ?? 'done', ...(input.acceptedBy ? { accepted_by: input.acceptedBy } : {}),
+    ...(input.gateDependencies ? { dependencies: input.gateDependencies } : {}),
   });
   const goalRow = {
     title: `目标 ${goalId}`, brief: 'SYS07 目标夹具', state: input.state ?? 'active', tier: input.tier ?? 'standard',
@@ -327,6 +341,71 @@ describe('SYS07 follow-up: scan paging, owner surfaces and metrics sections', ()
       .toEqual(full.customerEvidence.missingActivation);
     expect(await collect('day_series', segment => (segment.data!.daySeries as Array<{ day: string }>).map(row => row.day)))
       .toEqual(full.daySeries.map(row => row.day));
+  });
+});
+
+describe('whole-database external dependency classification', () => {
+  test('existing rows are unscoped or cross-goal with their real state; only a row found nowhere is dangling', async () => {
+    // Real rows with no goal: one done, one void. They exist, so the card must never call them missing.
+    const unscopedDone = await makeUnscopedTask('orphan-done', { state: 'done' });
+    const unscopedVoid = await makeUnscopedTask('orphan-void', { state: 'void' });
+    // Two goals that land on the same scan page, so their tasks are loaded alongside the scanned goal's.
+    await seedGoal({ id: 'other-done', state: 'done', finalState: 'done', acceptedBy: 'owner' });
+    const otherDoneTask = await makeTask('other-done', '其他目标已完成任务', { state: 'done' });
+    await seedGoal({ id: 'other-blocked' });
+    const otherBlockedTask = await makeTask('other-blocked', '其他目标阻塞任务', { state: 'blocked', blocked_to: 'gm' });
+    // The scanned goal depends on all four real rows plus one dependency that exists nowhere.
+    const gone = `gone-${randomUUID()}`;
+    const scanned = await seedGoal({
+      id: 'scan-external', finalState: 'done', acceptedBy: 'owner',
+      gateDependencies: [unscopedDone, unscopedVoid, otherDoneTask, otherBlockedTask, gone],
+    });
+    // A same-goal cycle must still be detected and not be hidden by the external classification.
+    const cycleA = await makeTask('scan-external', '环 A', { state: 'blocked', dependencies: [] });
+    const cycleB = await makeTask('scan-external', '环 B', { state: 'blocked', dependencies: [cycleA] });
+    await database.db.query('UPDATE ONLY $t SET dependencies = $deps;', { t: new RecordId('task', cycleA), deps: [cycleB] });
+
+    // Walk every page so the assertion also covers paging across multiple goals.
+    const cards: GoalCard[] = [];
+    let cursor: string | undefined;
+    for (let index = 0; index < 20; index++) {
+      const page = await core.goalGovernanceScan(tokens.gm!, { pageSize: 1, ...(cursor ? { cursor } : {}) });
+      expect(answerBytes(page)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+      cards.push(...page.goals);
+      if (!page.page.hasMore) break;
+      cursor = page.page.nextCursor;
+    }
+    const card = cards.find(item => item.goalId === scanned.goalId)!;
+    expect(card).toBeTruthy();
+    expect(card.graph.dangling).toEqual([{ taskId: scanned.gateId, dependency: gone }]);
+    expect(card.graph.unscoped.map(item => [item.dependency, item.state]).sort())
+      .toEqual([[unscopedDone, 'done'], [unscopedVoid, 'void']].sort());
+    expect(card.graph.crossGoal.map(item => [item.dependency, item.goalId, item.state]).sort())
+      .toEqual([[otherDoneTask, 'other-done', 'done'], [otherBlockedTask, 'other-blocked', 'blocked']].sort());
+    expect(card.graph.cycle).toBe(true);
+    const codes = card.repairReasons.map(reason => reason.code);
+    expect(codes).toEqual(expect.arrayContaining(['dependency_unscoped', 'dependency_cross_goal', 'dependency_dangling', 'dependency_cycle']));
+    // None of the four existing rows is described as missing; the unscoped one says external/unscoped, and the
+    // blocked cross-goal one keeps its real state.
+    const messages = card.repairReasons.map(reason => reason.message);
+    for (const id of [unscopedDone, unscopedVoid, otherDoneTask, otherBlockedTask]) {
+      expect(messages.some(message => message.includes(id) && message.includes('不存在'))).toBe(false);
+    }
+    expect(messages.some(message => message.includes(unscopedDone) && message.includes('external/unscoped'))).toBe(true);
+    expect(messages.some(message => message.includes(otherBlockedTask) && message.includes('blocked'))).toBe(true);
+    // Removing dangling does not flatten the goal: it still needs repair and is not ready to complete.
+    expect(card.needsRepair).toBe(true);
+    expect(card.readyToComplete).toBe(false);
+    // The source rows are untouched: no delete, no rewrite of the business dependency edges.
+    const [rows] = await database.db.query<[Array<{ id: unknown; goal?: unknown; dependencies?: unknown[] }>]>(
+      'SELECT id, goal, dependencies FROM task WHERE id IN $ids;',
+      { ids: [unscopedDone, unscopedVoid, otherDoneTask, otherBlockedTask].map(id => new RecordId('task', id)) });
+    expect(rows?.length).toBe(4);
+    const byId = new Map((rows ?? []).map(row => [String(row.id).replace(/^task:/, '').replace(/[⟨⟩]/g, ''), row]));
+    expect(byId.get(unscopedDone)?.goal).toBeUndefined();
+    expect(byId.get(unscopedVoid)?.goal).toBeUndefined();
+    expect(String(byId.get(otherBlockedTask)?.goal)).toContain('other-blocked');
+    expect(String(byId.get(otherDoneTask)?.goal)).toContain('other-done');
   });
 });
 
