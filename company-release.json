@@ -1,18 +1,18 @@
 {
-  "version": "0.3.29",
-  "title": "Magpie 受控路由契约修复与 v2/v4 真实回归",
+  "version": "0.3.30",
+  "title": "受控追加依赖前置兼容 defer 存量执行等待",
   "changes": [
-    "配额窗口不再静默丢弃：任一非 unlimited 窗口的 remaining 缺失、非数、负数或大于 100，或 resetsAt 存在但不可解析，都产出结构化 gap 并拒绝生成文档；畸形窗口不会被健康兄弟掩盖。",
-    "usage 完成态改为显式 done === true：done 缺失、false 或非布尔一律不作为已完成 usage 关联，未知状态在 usage gap 中说明。",
-    "catalog free=true 但价格缺失或非零按价目不明闭锁；零价证据只认源明确给出数值 input=0 且 output=0，freeEvidence 不再可能写成 magpie-catalog-zero。",
-    "ops_magpie_window_prepare 的证据根改为 approvalTask，与 ops_internal_ai_prove/deliver 一致：经理可在自己任务为另一审批任务准备窗口，其他任务根或证据根外路径仍拒绝。",
-    "manifest v1|v2 联合类型上 configurationDigest 改为分配式 Omit；测试按 schemaVersion 与 'model' in service 收窄，并补真实公司 fork 的 v2/v4 prepare→不同员工独立批准→prove/窗口回归及旧 v3、跨契约、摘要篡改拒绝。"
+    "append_dependency_prerequisites 新增存量等待兼容：defer_task_until 留下的执行依赖等待（blocked、blocked_to=NONE、resume_state=ready|doing、无 task_wait 行）在真实 deferred 审计与至少一个未完成依赖同时成立时被接受。",
+    "受控事务在同一原子内补建规范 task_wait 行（kind=dependency、引用=首个未完成依赖、entered_version=任务版本），使普通 wait release 路径从此可见；任务保持 blocked，等待与全部前置完成后交回 GM 关口而不是 ready。",
+    "守卫不变并全部保留：CAS expectedVersion、业务键幂等、同 goal、闭包环、defer_epoch 串行、无活动租约、非 owner、非 review、非 gm-block；审计新增 source_phase 与 legacy_wait 标记，outbox 同步。",
+    "新增公司 fork 回归 8 项：doing/ready 相位正例与释放链、普通 gm 阻塞拒绝、伪造形状（无 deferred 审计）拒绝、依赖已满足自动解锁回 GM、owner 与 review 存量拒绝、租约/跨目标/成环拒绝、并发 CAS 单赢家且只有一条等待行。",
+    "事务后备守卫的错误映射补齐：append 的原子守卫触发时返回与前置检查一致的 invalid 文案，不再落入笼统 forbidden。"
   ],
   "impact": [
-    "纯控制面证据与门禁修复：不触产品库、生产数据、active、凭证或模型；采样仍是只读 loopback 快照，未新增依赖或环境变量。",
-    "发布后 v4 采样对畸形配额、未知完成态和不明价目更严格，原本被静默放行的快照会转为 blocked；v1/v3 证据形状不变。",
-    "窗口代理读取根从调用任务改为 approvalTask；旧调用若 approvalTask 指向自身任务，行为不变。"
+    "纯控制面增量：修复生产 v0.3.28 中 defer 产生的存量依赖等待无法受控追加前置的阻断；不触产品库/生产数据/active/凭证/模型，不改派工、评审与验收路径。",
+    "发布后 GM 可对可审计的存量执行等待受控追加真实前置（如 ee1f0f21 一次性追加四项完整 ID 并保留 33dc）；等待期间任务保持 blocked，不自动 resume。",
+    "无数据库迁移、无历史改写：task_wait 复用既有 schema（040-waits），补建的等待行走既有字段与唯一索引。"
   ],
-  "migration": "无数据库迁移、无历史改写；复用既有 evidence/receipt 与 proof candidate 存储，未改 schema、任务或派工数据。",
-  "rollback": "revert 合入提交并按受控 release/vendor 重发；代码回滚不会撤销已生成的只读 Magpie 证据文档与回执，也不改写已批准的 v2/v4 候选，处置以既有审计为准。"
+  "migration": "无数据库迁移、无历史改写；复用既有 task_wait/audit/outbox/idempotency/company_meta:defer_epoch 结构，未改 schema。",
+  "rollback": "revert 合入提交并按受控 release/vendor 重发，无 schema 回滚；已补建的等待行与已写入的依赖边不因代码回滚自动撤销，回滚前先由经理确认任务状态，不用 DML 绕过。"
 }
