@@ -72,6 +72,18 @@ test("Haiku and Sonnet use separate price pools; manual groups are never auto-po
     "sck-sonnet": "models=a/gpt-6.1-sol", "sck-haiku": "models=a/deepseek-v4.1-flash",
   });
 });
+test("a member missing from the catalog is what forces the relay refresh — effort suffixes and owner groups do not count", async () => {
+  const { missingCatalogMembers } = await import("../src/model-routing/controller.ts");
+  const models = [{ id: "remote-magpie/zcode/GLM-5.3-Flash" }];
+  // Listed, with or without the pinned effort suffix: nothing to refresh.
+  expect(missingCatalogMembers(models, { "sck-haiku": ["remote-magpie/zcode/GLM-5.3-Flash"] })).toBe(false);
+  expect(missingCatalogMembers(models, { "sck-haiku": ["remote-magpie/zcode/GLM-5.3-Flash:max"] })).toBe(false);
+  // A closed vendor window leaves the member in the group but not in the catalog: refresh the relay.
+  expect(missingCatalogMembers(models, { "sck-haiku": ["remote-magpie/zcode/GLM-5.3-Flash:max", "remote-magpie/zcode/GLM-5.3-Trial:max"] })).toBe(true);
+  // Groups the owner owns are never chase targets for the relay catalog.
+  expect(missingCatalogMembers(models, { "owner-group": ["remote-magpie/zcode/gone"] })).toBe(false);
+  expect(missingCatalogMembers(models, {})).toBe(false);
+});
 test("after the one-time grouping, membership is the owner's: manual edits stay, only unseen models are placed", async () => {
   const { ModelRoutingController } = await import("../src/model-routing/controller.ts");
   let catalog = [{ id: "a/gpt-6.1-sol" }, { id: "a/deepseek-v4.1-flash" }, { id: "a/kimi-k3" }];

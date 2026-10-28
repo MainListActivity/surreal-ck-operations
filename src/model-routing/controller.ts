@@ -59,6 +59,18 @@ const exec = promisify(execFile);
 /** Bump to re-run the one-time grouping (owner rule changes). Otherwise membership is the owner's. */
 export const GROUPING_VERSION = "anchors-2026-10-23";
 /** magpie keeps routing groups in providers.json; read-only here, writes go through its save API. */
+/** Group members the catalog no longer lists: the state a closed-then-reopened vendor window leaves.
+ * Only sck-* groups count — other groups belong to the owner and are never sync-owned. */
+export function missingCatalogMembers(
+  models: Array<{ id: string }>,
+  groups: Record<string, string[]>,
+): boolean {
+  const listed = new Set(models.map((m) => m.id));
+  return Object.entries(groups).some(
+    ([id, members]) =>
+      id.startsWith("sck-") && (members ?? []).some((member) => !listed.has(splitMember(member).id)),
+  );
+}
 export function readMagpieGroups(file = join(homedir(), ".config", "magpie", "providers.json")): Record<string, string[]> {
   try {
     const groups = (JSON.parse(readFileSync(file, "utf8")) as { groups?: Array<{ id: string; members?: string[] }> }).groups ?? [];
@@ -163,20 +175,40 @@ export class ModelRoutingController {
     return stdout;
   }
   /** magpie fetches a vendor's model list only when asked; a relay's new models stay invisible
-   * until then. Once a day every remote-magpie provider is fetched again. */
-  private async refreshRemoteCatalogs(now = Date.now()): Promise<void> {
-    const stamp = join(this.home, "model-routing", "catalog-refresh.json");
+   * until then. Once a day every remote-magpie provider is fetched again. A forced run (group members
+   * missing from the catalog) keeps its own shorter stamp so a permanently removed model is checked
+   * every few minutes instead of on every sync, without turning the daily refresh into a poll. */
+  private async refreshRemoteCatalogs(now = Date.now(), force = false): Promise<boolean> {
+    const stamp = join(this.home, "model-routing", force ? "catalog-refresh-missing.json" : "catalog-refresh.json");
     try {
-      if (now - JSON.parse(await readFile(stamp, "utf8")).at < DAY) return;
+      if (now - JSON.parse(await readFile(stamp, "utf8")).at < (force ? 5 * 60_000 : DAY)) return false;
     } catch {}
     let providers: Array<{ id: string; preset?: string }> = [];
     try {
       providers = JSON.parse(await readFile(join(homedir(), ".config", "magpie", "providers.json"), "utf8")).providers ?? [];
     } catch {}
     for (const p of providers.filter((p) => p.preset === "remote-magpie"))
-      await this.output(["provider", "refresh", p.id]).catch((e) => console.warn(`magpie provider refresh ${p.id}: ${(e as Error).message.slice(0, 160)}`));
+      // `provider models <id>` is the CLI's fetch-and-list verb; `provider refresh` is not a
+      // subcommand and failed silently inside the catch, leaving the daily refresh a no-op.
+      await this.output(["provider", "models", p.id]).catch((e) => console.warn(`magpie provider models ${p.id}: ${(e as Error).message.slice(0, 160)}`));
     await mkdir(join(this.home, "model-routing"), { recursive: true, mode: 0o700 });
     await writeFile(stamp, JSON.stringify({ at: now }), { mode: 0o600 });
+    // A forced fetch just refreshed every relay provider, so the daily stamp is current too.
+    if (force) await writeFile(join(this.home, "model-routing", "catalog-refresh.json"), JSON.stringify({ at: now }), { mode: 0o600 });
+    return true;
+  }
+  private async fetchCatalog(): Promise<{ data: CatalogModel[] }> {
+    const reply = await (this.io.fetch ?? fetch)(
+      "http://127.0.0.1:3425/v1/models",
+      { signal: AbortSignal.timeout(10000) },
+    );
+    if (!reply.ok) throw Error(`magpie catalog unavailable: ${reply.status}`);
+    return (await reply.json()) as { data: CatalogModel[] };
+  }
+  /** True when an sck-* group still routes to a member the catalog no longer lists (or never listed):
+   * that is exactly the state a closed-then-reopened vendor window leaves behind. */
+  private async catalogMissesMembers(models: CatalogModel[]): Promise<boolean> {
+    return missingCatalogMembers(models, this.io.groups?.() ?? readMagpieGroups());
   }
   /** For the owner's console: every vendor-name decision, and members breaking the band rule. */
   async identity(): Promise<{
@@ -397,12 +429,14 @@ export class ModelRoutingController {
       return;
     }
     if (!this.io.command) await this.refreshRemoteCatalogs();
-    const reply = await (this.io.fetch ?? fetch)(
-      "http://127.0.0.1:3425/v1/models",
-      { signal: AbortSignal.timeout(10000) },
-    );
-    if (!reply.ok) throw Error(`magpie catalog unavailable: ${reply.status}`);
-    const catalog = (await reply.json()) as { data: CatalogModel[] };
+    let catalog = await this.fetchCatalog();
+    // A relay can drop a vendor's models when a trial window closes and bring them back when a new
+    // window opens. Waiting for the daily remote refresh would leave the group routing to members the
+    // catalog cannot see, so any group member missing from the catalog forces a refresh of the relay
+    // providers — rate-limited so a permanently removed model does not poll them on every sync.
+    if (!this.io.command && await this.catalogMissesMembers(catalog.data)) {
+      if (await this.refreshRemoteCatalogs(Date.now(), true)) catalog = await this.fetchCatalog();
+    }
     this.catalog = catalog.data;
     const dir0 = join(this.home, "model-routing");
     await mkdir(dir0, { recursive: true, mode: 0o700 });
