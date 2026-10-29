@@ -526,6 +526,14 @@ run('a large goal closes in stages: open follow-ups move to a next-phase goal an
   expect(next.tier).toBe('standard');
   const firstAnchor = await C.getTask(gm, asId(next.anchors[0]!));
   expect(firstAnchor.dependencies).toEqual(expect.arrayContaining([followA.id, followB.id]));
+  // The owner's own split runs the same checks and is audited as the owner.
+  const goal2 = await C.relayGoal(gm, { text: '老板分阶段 fixture', ownerQuote: '老板原话 fixture', idempotencyKey: key(), tier: 'standard' });
+  const f2 = await C.createTask(gm, { ...base, goalId: goal2.id, title: `老板移走 ${++count}`, dependencies: [goal2.tasks.plan!], idempotencyKey: key() });
+  await db.db.query("UPDATE $plan SET state = 'done';", { plan: new RecordId('task', goal2.tasks.plan!) });
+  const owned = await C.ownerGoalPhaseSplit('cli', { goalId: goal2.id, taskIds: [f2.id], title: '老板下一阶段', reason: '老板分阶段 fixture', idempotencyKey: key() });
+  expect(owned.unlocked).toEqual([goal2.tasks.manual!]);
+  const [ownerAudit] = await db.db.query<[Array<{ actor: string }>]>("SELECT actor FROM audit WHERE goal = $g AND action = 'goal_phase_split';", { g: new RecordId('goal', goal2.id) });
+  expect(ownerAudit.map(a => String(a.actor))).toEqual(['owner:cli']);
   // A replay returns the same next goal and moves nothing again.
   expect((await C.goalPhaseSplit(gm, { goalId: goal.id, taskIds: [followA.id, followB.id], title: '下一阶段 fixture', reason: '分阶段 fixture', idempotencyKey: idem })).nextGoalId).toBe(split.nextGoalId);
 });

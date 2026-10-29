@@ -2384,6 +2384,16 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   async goalPhaseSplit(credential: Credential, input: { goalId: string; taskIds: TaskId[]; title: string; reason: string; idempotencyKey: string }): Promise<{ goalId: string; nextGoalId: string; moved: TaskId[]; unlocked: TaskId[] }> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may split a goal into phases');
+    return this.phaseSplit({ record: id('employee', actor.employeeId), source: `gm-split:${actor.employeeId}` }, input);
+  }
+
+  /** The owner's own split (owner CLI): same checks and transaction as goalPhaseSplit, audited as the owner. */
+  async ownerGoalPhaseSplit(source: string, input: { goalId: string; taskIds: TaskId[]; title: string; reason: string; idempotencyKey: string }): Promise<{ goalId: string; nextGoalId: string; moved: TaskId[]; unlocked: TaskId[] }> {
+    requireText(source, 'source', 1, 100);
+    return this.phaseSplit({ record: `owner:${source}`, source: `owner-split:${source}` }, input);
+  }
+
+  private async phaseSplit(actor: { record: RecordId | string; source: string }, input: { goalId: string; taskIds: TaskId[]; title: string; reason: string; idempotencyKey: string }): Promise<{ goalId: string; nextGoalId: string; moved: TaskId[]; unlocked: TaskId[] }> {
     requireText(input.goalId, 'goal', 1, 100);
     requireText(input.title, 'title', 4, 60);
     requireText(input.reason, 'reason', 4, 4000);
@@ -2417,7 +2427,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (problems.length) throw new CompanyError('conflict', `分阶段被拒：${problems.slice(0, 10).join('；')}`);
     const next = await this.owner.createGoal({
       text: `${input.title}\n上一阶段：${goal.title}（goal=${input.goalId}）。分阶段原因：${input.reason}\n\n${goal.brief}`.slice(0, 20000),
-      source: `gm-split:${actor.employeeId}`, key: `split:${input.goalId}:${input.idempotencyKey}`,
+      source: actor.source, key: `split:${input.goalId}:${input.idempotencyKey}`,
       note: `从 ${input.goalId} 分出的下一阶段`, tier: goal.tier ?? 'standard',
       ...(goal.project ? { project: asId(goal.project) } : {}),
     });
@@ -2456,7 +2466,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       CREATE outbox CONTENT { kind: 'goal_phase_split', sequence: $sequence.value,
         payload: { goal: $old_key, next: $next_key, moved: $moved_keys }, at: time::now() };
       COMMIT;`, {
-      old: goal.id, next: nextGoal, moved: moved.map(taskId => id('task', taskId)), actor: id('employee', actor.employeeId),
+      old: goal.id, next: nextGoal, moved: moved.map(taskId => id('task', taskId)), actor: actor.record,
       evidence: `分阶段：${input.reason}\n下一阶段目标 ${next.id}：${input.title}\n移入任务：${moved.join('、')}`,
       split_key: HASH(input.idempotencyKey).slice(0, 16), old_key: input.goalId, next_key: next.id, moved_keys: moved,
     });

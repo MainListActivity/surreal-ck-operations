@@ -1,12 +1,12 @@
 {
- "version": "0.3.39",
- "title": "老板成本清单查询修正",
+ "version": "0.3.40",
+ "title": "老板分阶段收口命令",
  "changes": [
-  "pnpm run company cost --days N 的清单查询按 SurrealQL 规则把排序字段一并选出，修正解析错误；单任务查看不变。"
+  "新增 pnpm run company split-goal：老板直接把大目标中长期等待的未完成任务移到下一阶段目标，校验与事务与经理的 goal_phase_split 相同，审计记为老板。"
  ],
  "impact": [
-  "只改老板命令行的只读查询。"
+  "只新增老板命令行入口；经理工具行为不变。"
  ],
  "migration": "无schema和secret变更。",
- "rollback": "恢复上一健康 main 发布。"
+ "rollback": "恢复上一健康 main 发布；已移动任务保持新目标归属。"
 }

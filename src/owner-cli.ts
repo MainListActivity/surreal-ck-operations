@@ -19,6 +19,8 @@ const usage = `老板入口（也可直接在 SurrealDB 写 owner_command 表，
   pnpm run company void <任务ID> <原因>      作废任务（依赖它的任务会解锁；终验关口作废不会关闭目标）
   pnpm run company unlock <任务ID>           补跑已完成/作废任务的依赖解锁（任务依赖都完成了却还是 blocked 时用）
   pnpm run company cancel-goal <目标ID> <原因>  取消目标：作废其全部未完成任务并关闭目标
+  pnpm run company split-goal <目标ID> --tasks <任务ID,任务ID> --title <下一阶段标题> <原因>
+                                             分阶段收口：把未完成任务移到下一阶段目标，本阶段锚点不再等待它们
   pnpm run company pause | resume            暂停/恢复派工
   pnpm run company status                    公司运行概况
   pnpm run company cost [任务ID] [--days N]   任务成本：单个任务的 token/金额/耗时；不给 ID 时列出近 N 天（默认 7）已完成任务`;
@@ -95,6 +97,18 @@ try {
     if (!first) throw new Error('用法：pnpm run company unlock <任务ID>');
     const unlocked = await desk.unlockDependents({ taskId: first, source: 'owner:cli' });
     console.log(unlocked.length ? `已解锁：${unlocked.join('、')}` : '没有需要解锁的任务。');
+  } else if (action === 'split-goal') {
+    const argv = [first ?? '', ...rest].filter(Boolean);
+    const tasks = (flag(argv, 'tasks') ?? '').split(',').map(t => t.trim()).filter(Boolean);
+    const title = flag(argv, 'title');
+    const [goalId, ...why] = argv;
+    if (!goalId || !tasks.length || !title || !why.length) throw new Error('用法：pnpm run company split-goal <目标ID> --tasks <任务ID,任务ID> --title <下一阶段标题> <原因>');
+    const { SurrealCompanyCore } = await import('./core.ts');
+    const core = new SurrealCompanyCore(db);
+    const reason = why.join(' ');
+    const result = await core.ownerGoalPhaseSplit('cli', { goalId, taskIds: tasks, title, reason,
+      idempotencyKey: `owner-cli:${goalId}:${[...tasks].sort().join(',')}` });
+    console.log(`已分阶段：下一阶段目标 ${result.nextGoalId}；移入 ${result.moved.length} 个任务；解锁 ${result.unlocked.join('、') || '无'}`);
   } else if (action === 'cancel-goal') {
     const [goalId, ...note] = [first ?? '', ...rest].filter(Boolean);
     if (!goalId) throw new Error('用法：pnpm run company cancel-goal <目标ID> <原因>');
