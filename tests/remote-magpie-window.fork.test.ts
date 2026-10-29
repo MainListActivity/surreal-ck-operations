@@ -15,6 +15,7 @@ import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { ProjectStore } from '../src/projects.ts';
 import { OpsBroker } from '../src/ops/broker.ts';
 import { CompanyProofStore } from '../src/ops/proof-store.ts';
+import type { OpsScope } from '../src/contracts.ts';
 import { MAGPIE_EXECUTION_HEADROOM_SECONDS, PROOF_GOAL } from '../src/ops/proof-contract.ts';
 import { remoteConfigurationDigest, remoteMagpieEvidenceSchema } from '../src/ops/remote-magpie-evidence.ts';
 import { brokerConfig, FakeWorld } from './support/ops-world.ts';
@@ -31,6 +32,10 @@ let core: SurrealCompanyCore, projects: ProjectStore, ops: OpsBroker, world: Fak
 let clock = Date.parse('2026-10-29T03:00:00Z');
 const now = () => clock;
 let gm: string, author: string, approver: string, windowTask: string, windowCredential: string;
+/** 第二阶段目标：窗口绑定登记对它与 PROOF_GOAL 放行；内部 AI proof 链仍只认 PROOF_GOAL。 */
+const PHASE_TWO_GOAL = 'e159e40ad4e50080';
+const OUTSIDE_GOAL = 'f0f0f0f0f0f0f0f0';
+let phaseTwoTask: string, outsideTask: string, phaseTwoAuthor: string, outsideAuthor: string;
 
 async function start() {
   const binary = join(homedir(), '.surrealdb/surreal');
@@ -77,6 +82,13 @@ async function candidate(args: Record<string, unknown> = {}) {
 async function windowOf(file: string, approvalTask = windowTask) {
   return await ops.call(author, windowTask, 'ops_magpie_window_prepare', { approvalTask, candidatePath: file }) as Record<string, any>;
 }
+/** Candidate and window calls under another task, for the goal-scope regression. */
+async function candidateUnder(credential: string, taskId: string, args: Record<string, unknown> = {}) {
+  return await ops.call(credential, taskId, 'ops_product_magpie_candidate', args) as { candidateFile: string; candidate: any };
+}
+async function windowUnder(credential: string, taskId: string, file: string, approvalTask = taskId) {
+  return await ops.call(credential, taskId, 'ops_magpie_window_prepare', { approvalTask, candidatePath: file }) as Record<string, any>;
+}
 /** Recomputes the digest after an edit. The function is public, so a forger can always do this. */
 function recompute(body: Record<string, unknown>) {
   const { configurationDigest: _old, ...rest } = body;
@@ -98,8 +110,10 @@ async function blockedDependingOn(taskId: string, approvalTask: string, dependen
 /** The binding checks mark the approval task done; each check starts by putting it back so ops calls stay allowed. */
 const approvalDoing = () => database.db.query("UPDATE $dep SET state='doing';", { dep: new RecordId('task', windowTask) });
 const approvalDone = () => database.db.query("UPDATE $dep SET state='done';", { dep: new RecordId('task', windowTask) });
+/** Phase-two fixture task back to doing so later ops calls and the registration lease stay allowed. */
+const phaseTwoDoing = () => database.db.query("UPDATE $t SET state='doing';", { t: new RecordId('task', phaseTwoTask) });
 const newSource = () => core.createTask(gm, { title: 'Window binding source', context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', goalId: PROOF_GOAL, idempotencyKey: randomUUID() });
-const bindWindow = (candidate: { configurationDigest: string; expiry: { expiresAt: string } }) => ({ approvalTask: windowTask, configurationDigest: candidate.configurationDigest, evidenceExpiresAt: candidate.expiry.expiresAt, minRemainingSeconds: MAGPIE_EXECUTION_HEADROOM_SECONDS, notAfter: new Date(Date.parse(candidate.expiry.expiresAt) - MAGPIE_EXECUTION_HEADROOM_SECONDS * 1000).toISOString() });
+const bindWindow = (candidate: { configurationDigest: string; expiry: { expiresAt: string } }, approvalTask = windowTask) => ({ approvalTask, configurationDigest: candidate.configurationDigest, evidenceExpiresAt: candidate.expiry.expiresAt, minRemainingSeconds: MAGPIE_EXECUTION_HEADROOM_SECONDS, notAfter: new Date(Date.parse(candidate.expiry.expiresAt) - MAGPIE_EXECUTION_HEADROOM_SECONDS * 1000).toISOString() });
 
 beforeAll(async () => {
   if (!enabled) return;
@@ -113,6 +127,18 @@ beforeAll(async () => {
   await enroll.enroll(approver, 'qa', ['execute', 'review']);
   await projects.upsert({ id: 'surreal_ck', name: 'synthetic', repoPath: dir, release: 'synthetic', envs: [{ name: 'production', broker: brokerConfig() }] });
   await database.db.query('CREATE $goal CONTENT {state:"active",project:$project,anchors:[],tasks:{}};', { goal: new RecordId('goal', PROOF_GOAL), project: new RecordId('project', 'surreal_ck') });
+  // A phase-two goal and a goal outside the allowlist: both hold a task the author claims, so the ops calls
+  // reach the registration lease instead of failing on claim or project checks.
+  for (const goalId of [PHASE_TWO_GOAL, OUTSIDE_GOAL]) await database.db.query('CREATE $goal CONTENT {state:"active",project:$project,anchors:[],tasks:{}};', { goal: new RecordId('goal', goalId), project: new RecordId('project', 'surreal_ck') });
+  const phaseTwo = await core.createTask(gm, { title: 'Phase-two remote window preparation', context: 'Only test fixtures', executorRole: 'engineering', reviewerRole: 'qa', goalId: PHASE_TWO_GOAL, idempotencyKey: randomUUID() });
+  phaseTwoTask = phaseTwo.id;
+  // An employee can hold one active task at a time, so each fixture goal gets its own holder.
+  phaseTwoAuthor = await enroll.enroll('test-phase-two-author', 'engineering', ['execute', 'review']);
+  await core.claim(phaseTwoAuthor, phaseTwo.id);
+  const outside = await core.createTask(gm, { title: 'Goal outside the allowlist', context: 'Only test fixtures', executorRole: 'engineering', reviewerRole: 'qa', goalId: OUTSIDE_GOAL, idempotencyKey: randomUUID() });
+  outsideTask = outside.id;
+  outsideAuthor = await enroll.enroll('test-outside-author', 'engineering', ['execute', 'review']);
+  await core.claim(outsideAuthor, outside.id);
   world = new FakeWorld(); world.clock = clock;
   await projects.setSecret({ project: 'surreal_ck', env: 'production', name: 'SUPPLIER_SNV_FORK_USERNAME', value: world.magpie.accountUser }, key);
   await projects.setSecret({ project: 'surreal_ck', env: 'production', name: 'SUPPLIER_SNV_FORK_PASSWORD', value: 'synthetic-magpie-password' }, key);
@@ -350,4 +376,61 @@ check('the author approving its own remote candidate stays price-not-reviewed an
   expect(closed.eligible).toBe(false);
   expect(closed.blockedReasons).toEqual(['price-not-reviewed']);
   expect(closed.candidateRegistration).toBeUndefined();
+});
+
+// 目标范围：窗口绑定登记对第二阶段目标放行，其他目标仍拒；内部 AI proof 链仍只认 PROOF_GOAL。
+check('a phase-two goal task registers an eligible remote candidate and a manager binds its window', async () => {
+  clock = Date.now();
+  const out = await candidateUnder(phaseTwoAuthor, phaseTwoTask, { budget: BUDGET });
+  approvals = [approvalFor(out.candidate)];
+  const ready = await windowUnder(phaseTwoAuthor, phaseTwoTask, out.candidateFile);
+  expect(ready.eligible).toBe(true);
+  expect(ready.candidateRegistration).toMatchObject({ digest: out.candidate.configurationDigest });
+  const row = await new CompanyProofStore(database.db, now).candidate(phaseTwoTask);
+  expect(row).toMatchObject({ digest: out.candidate.configurationDigest, evidence_expires_at: out.candidate.expiry.expiresAt, type: 'remote-magpie-evidence/1' });
+  await database.db.query("UPDATE $t SET state='done';", { t: new RecordId('task', phaseTwoTask) });
+  const source = await core.createTask(gm, { title: 'Phase-two binding source', context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', goalId: PHASE_TWO_GOAL, idempotencyKey: randomUUID() });
+  await blockedDependingOn(source.id, phaseTwoTask);
+  const window = bindWindow(out.candidate, phaseTwoTask);
+  await core.resume(gm, source.id, { ...evidence('bind the phase-two remote candidate'), executionWindow: window });
+  expect((await core.getTask(gm, source.id)).executionWindow).toEqual(window);
+  await phaseTwoDoing();
+});
+
+check('a goal outside the allowlist never registers a remote candidate', async () => {
+  clock = Date.now();
+  const out = await candidateUnder(outsideAuthor, outsideTask, { budget: BUDGET });
+  approvals = [approvalFor(out.candidate)];
+  const deniedResult = await windowUnder(outsideAuthor, outsideTask, out.candidateFile).catch((e: { code?: string }) => e);
+  expect(deniedResult.code).toBe('forbidden');
+  expect(await new CompanyProofStore(database.db, now).candidate(outsideTask)).toBeUndefined();
+});
+
+check('a non-holder or an expired lease does not register or replace a remote candidate', async () => {
+  clock = Date.now();
+  await phaseTwoDoing();
+  const store = new CompanyProofStore(database.db, now);
+  const before = await store.candidate(phaseTwoTask);
+  const out = await candidateUnder(phaseTwoAuthor, phaseTwoTask, { budget: BUDGET });
+  approvals = [approvalFor(out.candidate)];
+  // Another employee names the phase-two task: the lease is not theirs, so nothing is written.
+  const notHolder = await windowUnder(outsideAuthor, phaseTwoTask, out.candidateFile).catch((e: { code?: string }) => e);
+  expect(['forbidden', 'unauthorized']).toContain(notHolder.code);
+  expect((await store.candidate(phaseTwoTask))?.digest).toBe(before?.digest);
+  // The holder's lease expired: the candidate is eligible, but the row is not written or replaced.
+  await database.db.query('UPDATE $t SET lease_expires_at=$p;', { t: new RecordId('task', phaseTwoTask), p: Math.floor(clock / 1000) - 1 });
+  const expired = await windowUnder(phaseTwoAuthor, phaseTwoTask, out.candidateFile).catch((e: { code?: string }) => e);
+  expect(['forbidden', 'unauthorized']).toContain(expired.code);
+  await database.db.query('UPDATE $t SET lease_expires_at=$p;', { t: new RecordId('task', phaseTwoTask), p: Math.floor(clock / 1000) + 3600 });
+  expect((await store.candidate(phaseTwoTask))?.digest).toBe(before?.digest);
+});
+
+check('the internal AI proof lease still refuses the phase-two goal while the registration lease accepts it', async () => {
+  await phaseTwoDoing();
+  const store = new CompanyProofStore(database.db, now);
+  const scope: OpsScope = { taskId: phaseTwoTask, project: 'surreal_ck', actor: { employeeId: 'test-phase-two-author', role: 'engineering', capabilities: [] } };
+  const v2 = await store.lease(scope).then(() => undefined, (e: { code?: string }) => e);
+  expect(v2?.code).toBe('forbidden');
+  const remote = await store.remoteLease(scope);
+  expect(remote.goal).toBe(PHASE_TWO_GOAL);
 });
