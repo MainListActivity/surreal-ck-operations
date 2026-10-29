@@ -407,6 +407,19 @@ run('a rejected CI billing block continues through server-verified evidence and 
     const upgrade = await core.block(who,{taskId:upgradeId,deliveryId:next.deliveryId,fence:next.fence,expectedVersion:next.task.version},'owner',
       {...note('GitHub CI 计费已由系统判定。现在申请安装已合入 main 的公司版本。'),companyUpgrade:{sha:newSha}});
     expect(upgrade.companyUpgrade?.sha).toBe(newSha);
+    // A verified CI billing exception must not prevent a later, unrelated dependency/business wait.
+    const waitingId = crypto.randomUUID();
+    await db.db.query("CREATE $task CONTENT {title:'后续依赖等待',context:'https://github.com/fixture/repo/pull/7',kind:'release',executor_role:'engineering',reviewer_role:'product',state:'ready',version:1,fence:0,dependencies:[],acceptance_head:$sha,acceptance_legacy:false,acceptance_version:1,acceptance_criteria:$criteria};",{
+      task:new RecordId('task',waitingId),sha,criteria:baselineAcceptanceCriteria('release'),
+    });
+    const waitingClaim = await ciCore.claim(who,waitingId);
+    await ciCore.recordAcceptanceEvidence(who,{taskId:waitingId,acId:'AC-BASE-RELEASE-1',sha,
+      source:{provider:'github-actions',runUrl:'https://github.com/fixture/repo/actions/runs/42'},idempotencyKey:`ci-proof-${waitingId}`});
+    const waiting = await ciCore.wait(who,{taskId:waitingId,deliveryId:waitingClaim.deliveryId,fence:waitingClaim.fence,expectedVersion:waitingClaim.task.version},
+      note('独立前置任务尚未完成，等待其完成以后继续上线审核。'),{
+        kind:'dependency',referenceTaskId:upgradeId,reason:'等待独立前置任务完成',completed:['GitHub CI 计费已经由系统判定'],
+      });
+    expect(waiting.state).toBe('blocked');expect(waiting.blockedTo).toBeUndefined();
   } finally {
     if (previousGate) await db.db.upsert(gateId).content(previousGate);
     else await db.db.delete(gateId);

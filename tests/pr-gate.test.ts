@@ -27,6 +27,15 @@ test('CI billing control reads PR/run sources even when the blocker omits all bi
   expect(await createCiBillingCheck(github())({text:'PR #7 检查未启动',repo:'o/r'}))
     .toEqual({runUrl:'https://github.com/o/r/actions/runs/9',sha:'head-1'});
   expect(await createCiBillingCheck(github([{name:'tests',conclusion:'failure'}]))({text})).toBeUndefined();
+  const mixed = async (args: string[]) => {
+    if (args[0] === 'pr') return JSON.stringify({state:'OPEN',headRefOid:'head-1',statusCheckRollup:[
+      {detailsUrl:'https://github.com/o/r/actions/runs/9/job/5'},
+      {detailsUrl:'https://github.com/o/r/actions/runs/10/job/6'},
+    ]});
+    if (args[1]?.includes('/runs/10/jobs')) return JSON.stringify({jobs:[{id:6,steps:[{name:'test',conclusion:'failure'}]}]});
+    return github()(args);
+  };
+  expect(await createCiBillingCheck(mixed)({text})).toBeUndefined();
   expect(await createCiBillingCheck(github())({text,head:'other-head'})).toBeUndefined();
   expect(await createCiBillingCheck(async () => {throw Error('offline');})({text})).toBeUndefined();
 });

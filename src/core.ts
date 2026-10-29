@@ -75,7 +75,7 @@ import { PLUGIN_RUNTIME_ROLES } from './contracts.ts';
 import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES, QA_OBSERVATION_WAIT_ROOTS_LIMIT, fitGoalWaitSummary, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
 import { CompanyError } from './core-errors.ts';
-import { assertEmployeeCiBlockAllowed, createCiBillingCheck, refuseEmployeeCiBlock, type CiBillingCheck } from './github-ci-control.ts';
+import { assertEmployeeCiBlockAllowed, createCiBillingCheck, isCiBlockCause, refuseEmployeeCiBlock, type CiBillingCheck } from './github-ci-control.ts';
 import { DispositionLedger, type DispositionApplier, type DispositionClaimInput, type DispositionClaimOutcome, type DispositionClaimView, type DispositionDecideInput, type DispositionDecideOutcome, type DispositionPhase, type DispositionStatusInput, type DispositionStatusView, type ExternalActionRequestInput, type ExternalActionView, type HolderNoticeView, type ExternalActionGateway } from './disposition.ts';
 import { createCompanyGithubGateway, githubRepoSlug } from './external-actions.ts';
 import { validateExternalDependencies } from './input-bounds.ts';
@@ -3087,6 +3087,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   private async assertCiBlockAllowed(proof: LeaseProof, employeeId: string, causes: string[], background: string[] = [], row?: TaskRow): Promise<void> {
     assertEmployeeCiBlockAllowed(...causes);
+    if (!isCiBlockCause(causes)) return;
     const taskId = proof.taskId;
     const task = row ?? await this.db.select<TaskRow>(id('task',taskId));
     // Do not expose source references, or spend GitHub reads, for a foreign/stale lease. The transition owns its error.

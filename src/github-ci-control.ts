@@ -6,6 +6,9 @@ import { githubRepoSlug } from './external-actions.ts';
 
 const CI = /github|git\s*hub|\bCI\b|github-actions|actions\/runs\/|workflow/i;
 const BILLING = /billing|account payments|spending[\s_-]*limit|账单|计费|付款|支付失败|支出上限|消费上限|账户问题/i;
+/** Only a CI-related reason triggers source adjudication; background CI cannot swallow a later business wait. */
+export const isCiBlockCause = (fields: string[]): boolean => fields.some(text => CI.test(text) ||
+  /(?:检查|作业).{0,30}(?:未启动|没有启动|未执行|没有执行|未通过|没有通过)/.test(text));
 
 export interface CiBillingRefusal { runUrl: string; sha: string }
 export type CiBillingCheck = (input: { text: string; head?: string; repo?: string }) => Promise<CiBillingRefusal | undefined>;
@@ -15,16 +18,17 @@ export function createCiBillingCheck(run: GhRunner = ghCli): CiBillingCheck {
   return async ({text, head, repo}) => {
     // Block/wait is an interactive RPC. Bound the entire read, not each of several GitHub calls separately.
     const deadline = Date.now() + 8_000;
-    const boundedRun: GhRunner = async args => {
+    const bounded = async <T>(operation: () => Promise<T>): Promise<T> => {
       const remaining = deadline - Date.now();
       if (remaining <= 0) throw Error('CI source read deadline');
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        return await Promise.race([run(args), new Promise<never>((_,reject) => {
+        return await Promise.race([operation(), new Promise<never>((_,reject) => {
           timer = setTimeout(() => reject(Error('CI source read deadline')),remaining);
         })]);
       } finally { if (timer) clearTimeout(timer); }
     };
+    const boundedRun: GhRunner = args => bounded(() => run(args));
     const adapter = createGithubActionsAdapter(boundedRun);
     const requiredHead = head;
     head ??= /\bhead\s*[:=]?\s+([a-f0-9]{40})\b/i.exec(text)?.[1];
@@ -32,7 +36,7 @@ export function createCiBillingCheck(run: GhRunner = ghCli): CiBillingCheck {
     const shortPrs = [...text.matchAll(/\bPR\s*#(\d+)/gi)].map(match => match[1]!);
     if (repo && shortPrs.length) {
       try {
-        const slug = githubRepoSlug(repo) ?? githubRepoSlug(await git(repo,['config','--get','remote.origin.url']));
+        const slug = githubRepoSlug(repo) ?? githubRepoSlug(await bounded(() => git(repo,['config','--get','remote.origin.url'])));
         if (slug) for (const number of shortPrs) urls.push(`https://github.com/${slug}/pull/${number}`);
       } catch { /* A local path without a verified remote never supplies a guessed repository. */ }
     }
@@ -54,15 +58,13 @@ export function createCiBillingCheck(run: GhRunner = ghCli): CiBillingCheck {
         }
       } catch { /* Unreadable sources never become billing waivers. Acceptance stays closed. */ }
     }
-    const seen = new Set<string>();
-    for (const candidate of candidates) {
-      if (Date.now() >= deadline || seen.size >= 5) break;
-      if (seen.has(candidate.runUrl)) continue;
-      seen.add(candidate.runUrl);
-      const verdict = await adapter.verify({provider:'github-actions',runUrl:candidate.runUrl,sha:candidate.sha});
-      if (verdict.ok && (verdict.source.infrastructure as {reason?: string} | undefined)?.reason === 'billing') return candidate;
-    }
-    return undefined;
+    const unique = [...new Map(candidates.map(candidate => [candidate.runUrl,candidate])).values()].slice(0,5);
+    const verdicts = await Promise.all(unique.map(async candidate => ({candidate,
+      verdict:await adapter.verify({provider:'github-actions',runUrl:candidate.runUrl,sha:candidate.sha})})));
+    // A real/unknown failure alongside billing must still be repairable. Billing is never a blanket CI waiver.
+    if (verdicts.some(({verdict}) => !verdict.ok)) return undefined;
+    return verdicts.find(({verdict}) => verdict.ok &&
+      (verdict.source.infrastructure as {reason?: string} | undefined)?.reason === 'billing')?.candidate;
   };
 }
 
