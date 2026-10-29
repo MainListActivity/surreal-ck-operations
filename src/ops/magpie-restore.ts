@@ -608,7 +608,9 @@ export async function applyMagpieRouteRestore(input: MagpieRestoreApplyInput): P
 
   const journal = readJournal(journalPath);
   const prior = journal.entries[keyHash];
-  if (prior && prior.planDigest !== input.planDigest) return refuse('idempotency-conflict', 'this idempotencyKey was already used with a different plan');
+  if (prior && (prior.planIssuedAt !== input.planIssuedAt || prior.planDigest !== input.planDigest)) {
+    return refuse('idempotency-conflict', 'this idempotencyKey was already used with a different plan');
+  }
   if (prior?.expectedConfigSha256 !== undefined && prior.expectedConfigSha256 !== input.expectedConfigSha256) {
     return refuse('replay-mismatch', 'this idempotencyKey was recorded against a different expected config; the request does not match the recorded apply');
   }

@@ -450,6 +450,15 @@ describe('idempotency and recovery', () => {
     expect(out.refusal.code).toBe('idempotency-conflict');
   });
 
+  test('the same key with a different plan issue time is refused', async () => {
+    const r = rig();
+    const planned = await plan(r);
+    const id = 'replay-issued-at-0001';
+    await apply(r, planned, { idempotencyKey: id });
+    const out = await apply(r, planned, { idempotencyKey: id, planIssuedAt: new Date(Date.parse(planned.issuedAt) + 1).toISOString() });
+    expect(out.refusal.code).toBe('idempotency-conflict');
+  });
+
   test('a failed seal restores the config from the backup', async () => {
     const r = rig();
     const before = readFileSync(r.configPath, 'utf8');
@@ -530,6 +539,27 @@ describe('idempotency and recovery', () => {
     expect(recovered.phases.map((item: any) => item.phase)).toContain('recovery-verified');
     expect(readFileSync(r.configPath, 'utf8')).toBe(written);
     expect(r.company.sealed.get(`demo/production/${SEALED_NAME}`)).toBe('snv-magpie-account');
+  });
+
+  test('a refusal does not rewrite an existing failed journal identity', async () => {
+    const r = rig();
+    const planned = await plan(r);
+    const id = 'failed-record-0001';
+    const keyHash = sha256(`magpie-restore|${id}`);
+    const failed = {
+      keyHash, echo: id.slice(0, 8), planDigest: planned.planDigest, planIssuedAt: planned.issuedAt,
+      phase: 'failed', expectedConfigSha256: planned.config.sha256, accountHash24: planned.accounts[0].accountHash.slice(0, 24),
+      backupFile: 'providers.json.bak-prior-failure', insertedGroup: '{"id":"group/work","members":["prior/member"]}',
+      configShaAfter: 'd'.repeat(64), groupOperation: 'created', bindingOperation: 'sealed', sampledStatus: 'blocked',
+      at: planned.issuedAt, updatedAt: planned.issuedAt,
+    };
+    mkdirSync(join(r.home, 'magpie-restore'), { recursive: true });
+    writeFileSync(r.journalPath, JSON.stringify({ version: 1, entries: { [keyHash]: failed } }, null, 2));
+
+    const out = await apply(r, planned, { idempotencyKey: id, planDigest: 'b'.repeat(64) });
+    expect(out.refusal.code).toBe('idempotency-conflict');
+    const afterRefusal = JSON.parse(readFileSync(r.journalPath, 'utf8'));
+    expect(afterRefusal.entries[keyHash]).toEqual(failed);
   });
 
   test('plan reports an interrupted apply from the journal', async () => {
