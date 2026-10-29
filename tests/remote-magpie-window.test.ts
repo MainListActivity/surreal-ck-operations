@@ -125,6 +125,17 @@ test('a candidate edited after generation is refused, not accepted', async () =>
   expect(result.window).toBeUndefined();
 });
 
+test('without a proof store the eligible window carries no registration, and the result is unchanged', async () => {
+  const seed = rig({ approvals: [] });
+  const first = await candidate(seed, { budget: BUDGET });
+  const approval = { approverEmployee: 'engineering-2', configurationDigest: first.candidate.configurationDigest, priceRevision: first.candidate.pricing.priceRevision, approvedAt: '2026-10-29T02:50:00Z' };
+  const r = rig({ approvals: [approval] });
+  const out = await candidate(r, { budget: BUDGET });
+  const result = await window(r, { candidatePath: out.candidateFile });
+  expect(result.eligible).toBe(true);
+  expect(result.candidateRegistration).toBeUndefined();
+});
+
 test('candidatePath and manifestPath/documentPath are mutually exclusive', async () => {
   const r = rig({ approvals: [] });
   const out = await candidate(r, { budget: BUDGET });

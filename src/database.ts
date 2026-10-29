@@ -183,6 +183,10 @@ export class CompanyDatabase {
     // 任务成本（编号 045）：Magpie 逐请求用量按任务汇总的 task_cost 表。只新增表；旧版忽略（RB01）。
     await this.db.query(loadSchema('045-task-cost.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 45 WHERE schema_version < 45;');
+    // FV06 窗口绑定（编号 046）：internal_ai_candidate 增加 type/source_path 两个可选字段，标明远端候选来源。
+    // 只新增字段，不改既有行；旧版读不到新字段即按 v2 候选处理（RB01）。
+    await this.db.query(loadSchema('046-remote-candidate.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 46 WHERE schema_version < 46;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {
