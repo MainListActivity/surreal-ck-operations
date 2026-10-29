@@ -158,3 +158,8 @@ export async function costBaseline(db: Surreal, complexity: number, exceptTask: 
   if (usd.length < min || elapsed.length < min) return undefined;
   return { usd: median(usd), elapsedSeconds: median(elapsed), samples: Math.min(usd.length, elapsed.length) };
 }
+
+/** The owner's cost list: settled tasks in a window, newest first, with complexity and the mean calibrated score. */
+export const COST_LIST_SQL = `SELECT task, task.title AS title, complexity, cost, at,
+    math::mean((SELECT VALUE overall FROM scorecard WHERE task = $parent.task)) AS score
+  FROM task_cost WHERE at > time::now() - type::duration($span) ORDER BY at DESC LIMIT 200;`;

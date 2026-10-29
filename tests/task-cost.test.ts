@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
 import { CompanyDatabase } from '../src/database.ts';
 import { calibrate, clampComplexity, collectEvalState, writeScorecards } from '../src/scoring.ts';
-import { magpieSessionRows, recordPendingTaskCosts, recordTaskCost, rollUp, sessionOf, type UsageRow } from '../src/task-cost.ts';
+import { COST_LIST_SQL, magpieSessionRows, recordPendingTaskCosts, recordTaskCost, rollUp, sessionOf, type UsageRow } from '../src/task-cost.ts';
 
 test('the gateway session of a lease is recomputed exactly', () => {
   // Same digest as model-routing/gateway.ts: sck-<sha256(task:employee:fence:phase:tier)[0..16]>.
@@ -121,4 +121,7 @@ run('a finished task settles its cost from its lease sessions, and scoring store
   expect(cards[0]!.calibration.complexity).toBe(2);
   const [costRow] = await db.db.query<[Array<{ complexity: number }>]>('SELECT complexity FROM task_cost WHERE task = $t;', { t: new RecordId('task', 't1') });
   expect(costRow[0]!.complexity).toBe(2);
+  // The owner's list reads the settled task with its complexity and calibrated score.
+  const [list] = await db.db.query<[Array<{ title: string; complexity: number; score: number; cost: { usd: number } }>]>(COST_LIST_SQL, { span: '7d' });
+  expect(list.map(r => [r.title, r.complexity, r.score, r.cost.usd])).toEqual([['cost fixture', 2, 4.75, 0.06]]);
 });

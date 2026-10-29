@@ -101,7 +101,7 @@ try {
     const result = await desk.cancelGoal({ goalId, note: note.join(' '), source: 'owner:cli', key: `cli-cancel:${goalId}` });
     console.log(`已作废 ${result.retired} 个任务；${result.remaining ? `仍有 ${result.remaining} 个未能作废，目标保持原状` : '目标已关闭（cancelled）'}`);
   } else if (action === 'cost') {
-    const { readTaskCost, recordTaskCost } = await import('./task-cost.ts');
+    const { COST_LIST_SQL, readTaskCost, recordTaskCost } = await import('./task-cost.ts');
     const argv = [first ?? '', ...rest].filter(Boolean);
     const days = Number(flag(argv, 'days') ?? 7);
     const money = (usd: number) => `$${usd.toFixed(usd < 1 ? 4 : 2)}`;
@@ -119,8 +119,7 @@ try {
       }
     } else {
       const [rows] = await db.db.query<[Array<{ task: RecordId; title?: string; complexity?: number; cost: import('./task-cost.ts').TaskCost; score?: number }>]>(
-        `SELECT task, task.title AS title, complexity, cost, math::mean((SELECT VALUE overall FROM scorecard WHERE task = $parent.task)) AS score
-           FROM task_cost WHERE at > time::now() - type::duration($span) ORDER BY at DESC LIMIT 200;`, { span: `${Number.isFinite(days) && days > 0 ? Math.min(60, days) : 7}d` });
+        `${COST_LIST_SQL}`, { span: `${Number.isFinite(days) && days > 0 ? Math.min(60, days) : 7}d` });
       const total = rows.reduce((a, r) => a + r.cost.usd, 0);
       console.log(`近 ${days} 天已结算 ${rows.length} 个任务，合计 ${money(total)}`);
       for (const r of rows) console.log(`- ${String(r.task.id).slice(0, 8)} ${(r.title ?? '').slice(0, 40)}｜复杂度 ${r.complexity ?? '?'}｜评分 ${r.score?.toFixed(1) ?? '未评'}｜${line(r.cost)}`);
