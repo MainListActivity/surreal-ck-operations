@@ -20,16 +20,20 @@ import { magpieBase } from '../dispatcher/magpie-quota.ts';
 
 export const MAGPIE_ADAPTER = 'magpie-controlled-route/1';
 export const MAGPIE_PROVIDER = 'magpie';
-const GROUP = 'group/work' as const;
+/** The one business route group the controlled adapter serves; shared with magpie-restore. */
+export const MAGPIE_GROUP = 'group/work' as const;
+const GROUP = MAGPIE_GROUP;
 const STEP_TIMEOUT_MS = 12_000;
 const BUDGET_MS = 45_000;
 const MIN_STEP_MS = 1_500;
 const MAX_BODY_BYTES = 512 * 1024;
-const MAX_CONFIG_BYTES = 256 * 1024;
+export const MAX_CONFIG_BYTES = 256 * 1024;
 const USAGE_LIMIT = 50;
-const PROVIDERS_FILE = join(homedir(), '.config', 'magpie', 'providers.json');
+export const PROVIDERS_FILE = join(homedir(), '.config', 'magpie', 'providers.json');
 
 interface Gap { field: string; source: string; detail: string }
+export type { Gap };
+export type { SourceRecord };
 interface SourceRecord {
   name: 'catalog' | 'quotas' | 'usage' | 'providers';
   kind: 'http' | 'local-config';
@@ -107,14 +111,14 @@ const dateOrNull = (value: unknown): string | null => {
   const n = Date.parse(value);
   return Number.isFinite(n) ? new Date(n).toISOString() : null;
 };
-const baseId = (id: string): string => id.slice(id.lastIndexOf('/') + 1);
-const providerOf = (id: string): string | null => {
+export const baseId = (id: string): string => id.slice(id.lastIndexOf('/') + 1);
+export const providerOf = (id: string): string | null => {
   const cut = id.lastIndexOf('/');
   return cut > 0 ? id.slice(0, cut) : null;
 };
-const safeRef = (value: string): boolean => /^[A-Za-z0-9_-]{1,128}$/.test(value);
+export const safeRef = (value: string): boolean => /^[A-Za-z0-9_-]{1,128}$/.test(value);
 
-function resolveEndpoint(input: MagpieSampleInput): { base: string; source: 'env' | 'stash' | 'default' | 'injected'; endpoint: string } | null {
+export function resolveEndpoint(input: Pick<MagpieSampleInput, 'base' | 'endpointSource'>): { base: string; source: 'env' | 'stash' | 'default' | 'injected'; endpoint: string } | null {
   const source = input.base ? (input.endpointSource ?? 'injected')
     : process.env.MAGPIE_ADDR?.trim() ? 'env' : 'default';
   const raw = input.base ?? magpieBase();
@@ -130,7 +134,7 @@ function resolveEndpoint(input: MagpieSampleInput): { base: string; source: 'env
   } catch { return null; }
 }
 
-async function readSource(
+export async function readSource(
   name: SourceRecord['name'], url: string,
   io: { fetcher: Fetcher; left: () => number; now: () => number },
 ): Promise<{ record: SourceRecord; body: unknown; text: string }> {
@@ -208,7 +212,7 @@ function parseProviders(text: string): ProviderConfig | null {
   } catch { return null; }
 }
 
-function parseCatalog(body: unknown): { byId: Map<string, Record<string, unknown>>; byBase: Map<string, Record<string, unknown>> } {
+export function parseCatalog(body: unknown): { byId: Map<string, Record<string, unknown>>; byBase: Map<string, Record<string, unknown>> } {
   const rows = Array.isArray((body as { data?: unknown })?.data) ? (body as { data: unknown[] }).data : [];
   const byId = new Map<string, Record<string, unknown>>(), byBase = new Map<string, Record<string, unknown>>();
   for (const row of rows) {
@@ -221,7 +225,7 @@ function parseCatalog(body: unknown): { byId: Map<string, Record<string, unknown
   return { byId, byBase };
 }
 
-function parseQuotaRows(body: unknown): Array<Record<string, unknown>> {
+export function parseQuotaRows(body: unknown): Array<Record<string, unknown>> {
   const rows = Array.isArray(body) ? body : Array.isArray((body as { data?: unknown })?.data) ? (body as { data: unknown[] }).data : [];
   return rows.filter((row): row is Record<string, unknown> => !!row && typeof row === 'object');
 }
