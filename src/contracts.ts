@@ -514,6 +514,12 @@ export interface CreateTask {
   goalId?: string;
   /** Optional project override: registered project id only; takes precedence over goal.project for this task. */
   project?: string;
+  /**
+   * Optional code repository (ops repo or a registered project repo_path) the task's worktree is allocated in; the business
+   * project is unchanged. Omitted: a code/release/deploy task whose context names the ops repo path, under a project with
+   * another repo, is bound to the ops repo; otherwise the project's repo is used.
+   */
+  codeRepoPath?: string;
   dependencies?: TaskId[];
   /** SYS02: required for new code deliveries when the acceptance gate is enabled. */
   acceptanceCriteria?: AcceptanceCriterion[];
@@ -629,6 +635,8 @@ export interface CreateDelivery {
   discipline?: string;
   /** Optional project override persisted on all three legs so the chain stays on one project. */
   project?: string;
+  /** Optional code repository persisted on all three legs (see CreateTask.codeRepoPath). */
+  codeRepoPath?: string;
   /** Worktree lane shared by the three legs; defaults to one fresh lane per delivery so parallel changes never share a tree. */
   lane?: string;
   dependencies?: TaskId[];
@@ -1545,6 +1553,10 @@ export interface CompanyCore {
    * normal lifecycle (the physical tree itself is never deleted here).
    */
   bindTaskCodeRepo?(credential: Credential, input: { taskId: TaskId; codeRepoPath: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView>;
+  /** gm only: move unfinished tasks of a large goal into a next-phase goal so the current phase can be accepted. */
+  goalPhaseSplit?(credential: Credential, input: { goalId: string; taskIds: TaskId[]; title: string; reason: string; idempotencyKey: string }): Promise<{ goalId: string; nextGoalId: string; moved: TaskId[]; unlocked: TaskId[] }>;
+  /** gm only: turn a blocked read-only engineering task (kind=task) into a code task in place; policy re-judged, audited. */
+  taskIntentUpdate?(credential: Credential, input: { taskId: TaskId; lane?: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView>;
   /** manage (gm/product): list every employee_def row for workforce review. */
   listDefs(credential: Credential): Promise<DefView[]>;
   /** manage (gm/product): create or update an employee_def via the shared workforce writer; audited. */
@@ -1562,7 +1574,9 @@ export interface CompanyCore {
   /** eval role only: score every employee who participated in a finished task. Marks the task evaluated. */
   /** eval/gm only: each participant's actual models (executions, fences, phases, first/last) for modelScores. */
   modelEvidence?(credential: Credential, taskId: TaskId): Promise<Array<{employee:string;models:Array<{model:string;executions:number;fences:number[];phases:string[];first:string;last:string}>}>>;
-  recordScore(credential: Credential, input: { taskId: TaskId; summary: string; scores: EmployeeScore[] }): Promise<{ recorded: number; participants: string[] }>;
+  recordScore(credential: Credential, input: { taskId: TaskId; summary: string; scores: EmployeeScore[]; complexity?: number }): Promise<{ recorded: number; participants: string[] }>;
+  /** eval/gm/product: what a task consumed (tokens, USD, model time, elapsed) from Magpie, computed on first read. */
+  taskCost?(credential: Credential, taskId: TaskId): Promise<import('./task-cost.ts').TaskCost | { taskId: TaskId; available: false; reason: string }>;
 }
 
 /** Employee definition as returned by the manage tools (score internals stay server-side). */

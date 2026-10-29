@@ -30,6 +30,7 @@
    pnpm run company reply <任务ID> <回答>
    pnpm run company direction "先服务律师团队"
    pnpm run company pause | resume | status
+   pnpm run company cost [任务ID] [--days N]
    ```
 
 2. **直接写 SurrealDB**（`sck_agent_company/control_plane`）：
@@ -131,6 +132,25 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME
 - **员工实例**：`employee` 表中带 `def` 的记录，由调度器按需生成；`paseo_agent_id` 登记实际会话，是实例身份的权威绑定。新实例的凭证不落盘——由插件 sidecar 在内存中代持，`spawn` 环境只注入 `SCK_COMM_DIR`/`SCK_COMM_KEY`；`claim`/续租/提交由 sidecar 以该凭证程序化执行，agent 进程拿不到也不认识它。`retired=true` 或凭证撤销后所有调用即 401，实例随会话关闭退役。同一定义连续 3 次异常会自动停用并通知老板。`pnpm run admin inst list` 查看。
   旧的凭证文件会话（`credential_file` 非空的实例）继续按原方式收尾，但不再被通道代领新任务，自然淘汰。
 - 旧员工（gm-01 等）以 `admin bind <员工编号> <agentId> <def>` 挂到定义上，继续保留身份和历史。
+
+## 任务成本与综合评分
+
+每个完成的任务在生命周期轮询（约 30 分钟一轮）或评分时结算成本，存入 `task_cost`：
+
+- **来源**：Magpie 本机 `/v1/magpie/usage/requests` 的逐请求行（`cost`、`priced`、token、`ms`）。网关给每个租约请求带 `x-magpie-session = sck-<digest(task:employee:fence:phase:tier)>`，结算时从该任务的 `model_execution` 重算会话并精确匹配。未定价的请求单独计数（`unpriced`），不按 0 冒充；某个会话在 Magpie 30 天窗口里已无记录时 `complete=false`，金额是下限。
+- **内容**：请求数、失败数、输入/输出/缓存读写 token、USD、模型耗时、建单到最后一次 accept 的总时长，再按员工和模型拆分。原始 `model_execution` 行在结算前不会被保留期清理。
+- **查看**：`pnpm run company cost <任务ID>` 看单个任务；`pnpm run company cost --days 7` 列出近 N 天已结算任务及复杂度与评分。员工侧 eval/gm/product 用 `get_task_cost`。
+- **评分**：评审在 `record_score` 里给 `complexity`（1–5）。评审原分保存为 `scorecard.judge_overall`，进入均分的 `overall` 是校准后的分数，`scorecard.calibration.adjustments` 写明每一步依据：被退回每次 −0.5（最多 −1.5）、租约被收回每次 −0.5（最多 −1）、系统检查退回的提交每次 −0.5（最多 −1）；作者的成本或时长超过同复杂度任务中位数 2 倍 −0.5、4 倍 −1，两者都不到一半且无其他扣分 +0.5（需要至少 5 个同复杂度样本）。结果按 0.5 取整并限在 1–5。
+
+## 提交前系统检查
+
+工程员工在 ops 仓提交 code 任务时，服务先在其工作树上做只读检查，不通过直接退回原员工（租约保留，不派评审），审计记 `submit_check_failed` 并计入评分：
+
+- 改了 `src/`、`plugin/`、`scripts/` 时 `package.json` 版本必须高于 main，`plugin/package.json` 与 `company-release.json` 版本一致；
+- `src/mcp/server.ts` 注册的每个工具都接到 sidecar 分发与工具表；`package.json` 测试脚本里列的文件都存在；
+- `tsc --noEmit` 无类型错误（服务自带编译器，在员工沙箱内运行；工作树缺依赖或编译器无法运行时放行，由评审把关）。
+
+`SCK_SUBMIT_CHECKS=0` 关闭。
 
 ## 管理工具（manage）
 

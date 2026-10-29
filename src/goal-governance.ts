@@ -458,8 +458,10 @@ export function assessGoal(input: {
   if (cycle) repairReasons.push({ code: 'dependency_cycle', message: '目标任务依赖存在循环' });
   for (const item of dangling) repairReasons.push({ code: 'dependency_dangling', message: `依赖 ${item.dependency} 不存在`, taskId: item.taskId });
   // An edge to another goal stays a cross-goal fact with the referenced task's real state, so a done edge and a
-  // blocked edge never read the same; it is not downgraded to "missing".
-  for (const item of crossGoal) repairReasons.push({
+  // blocked edge never read the same; it is not downgraded to "missing". A done edge is satisfied work another goal
+  // already delivered: it stays disclosed in graph.crossGoal but is not a repair reason, or the goal would be parked
+  // in needs_repair forever by dependencies nobody can (or should) change.
+  for (const item of crossGoal.filter(edge => edge.state !== 'done')) repairReasons.push({
     code: 'dependency_cross_goal',
     message: `依赖 ${item.dependency} 属于其他目标（${item.state ?? '状态未知'}）`, taskId: item.taskId });
   // A row that exists with no goal is outside every goal's scope: it is disclosed as external/unscoped, never

@@ -20,7 +20,8 @@ const usage = `老板入口（也可直接在 SurrealDB 写 owner_command 表，
   pnpm run company unlock <任务ID>           补跑已完成/作废任务的依赖解锁（任务依赖都完成了却还是 blocked 时用）
   pnpm run company cancel-goal <目标ID> <原因>  取消目标：作废其全部未完成任务并关闭目标
   pnpm run company pause | resume            暂停/恢复派工
-  pnpm run company status                    公司运行概况`;
+  pnpm run company status                    公司运行概况
+  pnpm run company cost [任务ID] [--days N]   任务成本：单个任务的 token/金额/耗时；不给 ID 时列出近 N 天（默认 7）已完成任务`;
 
 const [action, first, ...rest] = process.argv.slice(2);
 if (!action) { console.log(usage); process.exit(0); }
@@ -99,6 +100,31 @@ try {
     if (!goalId) throw new Error('用法：pnpm run company cancel-goal <目标ID> <原因>');
     const result = await desk.cancelGoal({ goalId, note: note.join(' '), source: 'owner:cli', key: `cli-cancel:${goalId}` });
     console.log(`已作废 ${result.retired} 个任务；${result.remaining ? `仍有 ${result.remaining} 个未能作废，目标保持原状` : '目标已关闭（cancelled）'}`);
+  } else if (action === 'cost') {
+    const { readTaskCost, recordTaskCost } = await import('./task-cost.ts');
+    const argv = [first ?? '', ...rest].filter(Boolean);
+    const days = Number(flag(argv, 'days') ?? 7);
+    const money = (usd: number) => `$${usd.toFixed(usd < 1 ? 4 : 2)}`;
+    const tokens = (n: number) => n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n);
+    const minutes = (s?: number) => s === undefined ? '?' : s >= 3600 ? `${(s / 3600).toFixed(1)}h` : `${Math.round(s / 60)}m`;
+    const line = (c: import('./task-cost.ts').TaskCost) =>
+      `${money(c.usd)}${c.unpriced ? `（另 ${c.unpriced} 次未定价）` : ''} · 请求 ${c.requests}${c.failed ? `（失败 ${c.failed}）` : ''} · 输入 ${tokens(c.inputTokens)} 输出 ${tokens(c.outputTokens)} 缓存读 ${tokens(c.cacheReadTokens)} · 模型 ${minutes(c.modelMs / 1000)} · 总时长 ${minutes(c.elapsedSeconds)}${c.complete ? '' : ' · 部分会话已超出 Magpie 保留期（下限）'}`;
+    if (argv[0]) {
+      const cost = await readTaskCost(db.db, argv[0]) ?? await recordTaskCost(db.db, argv[0]);
+      if (!cost) { console.log('该任务没有可结算的租约模型请求（未完成、无请求或 Magpie 暂不可读）。'); }
+      else {
+        console.log(`任务 ${argv[0]}：${line(cost)}`);
+        for (const [emp, t] of Object.entries(cost.byEmployee)) console.log(`  ${emp}：${money(t.usd)} · 请求 ${t.requests} · 输入 ${tokens(t.inputTokens)} 输出 ${tokens(t.outputTokens)}`);
+        for (const [model, m] of Object.entries(cost.byModel).sort((a, b) => b[1].usd - a[1].usd)) console.log(`  模型 ${model}：${money(m.usd)} / ${m.requests} 次`);
+      }
+    } else {
+      const [rows] = await db.db.query<[Array<{ task: RecordId; title?: string; complexity?: number; cost: import('./task-cost.ts').TaskCost; score?: number }>]>(
+        `SELECT task, task.title AS title, complexity, cost, math::mean((SELECT VALUE overall FROM scorecard WHERE task = $parent.task)) AS score
+           FROM task_cost WHERE at > time::now() - type::duration($span) ORDER BY at DESC LIMIT 200;`, { span: `${Number.isFinite(days) && days > 0 ? Math.min(60, days) : 7}d` });
+      const total = rows.reduce((a, r) => a + r.cost.usd, 0);
+      console.log(`近 ${days} 天已结算 ${rows.length} 个任务，合计 ${money(total)}`);
+      for (const r of rows) console.log(`- ${String(r.task.id).slice(0, 8)} ${(r.title ?? '').slice(0, 40)}｜复杂度 ${r.complexity ?? '?'}｜评分 ${r.score?.toFixed(1) ?? '未评'}｜${line(r.cost)}`);
+    }
   } else if (action === 'status') {
     const workforce = new Workforce(db, '/nonexistent');
     const [brief, tasks, insts, health, config, defs] = await Promise.all([

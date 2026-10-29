@@ -372,13 +372,14 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : core.returnTask(token(ctx), proof(input), evidence(input))));
 
   server.registerTool('create_task', {
-    description: 'Create a managed company task; requires core manage capability. project optionally binds this one task to a registered project (takes precedence over the goal\'s project). revises=<直接上一版任务id> creates the controlled screenplay-revision edge: gm/product only, both drafts must be owner-reviewed screenwriter tasks on the 编剧 track (kind=task) in the same goal and project, and the target must be the unapproved chain tip whose latest submission was really rejected by the owner; the old draft voids with a supersededBy pointer and downstreams resolve to the chain tip.',
+    description: 'Create a managed company task; requires core manage capability. project optionally binds this one task to a registered project (takes precedence over the goal\'s project). codeRepoPath optionally sets the code repository the worktree is allocated in (the ops repo or a registered project repo; the business project is unchanged); without it a code/release/deploy task whose context names the ops repo path under a project with another repo is bound to the ops repo at creation, so it never claims into the business repo. revises=<直接上一版任务id> creates the controlled screenplay-revision edge: gm/product only, both drafts must be owner-reviewed screenwriter tasks on the 编剧 track (kind=task) in the same goal and project, and the target must be the unapproved chain tip whose latest submission was really rejected by the owner; the old draft voids with a supersededBy pointer and downstreams resolve to the chain tip.',
     inputSchema: z.object({
       modelTier: z.enum(['fable','opus','sonnet','haiku','high','medium','low']).optional(),
       title: z.string().min(1), context: z.string().min(1),
       executorRole: z.enum(roles), reviewerRole: z.enum(reviewerRoles),
       discipline: z.string().min(1).max(60).optional(),
       project: z.string().min(1).max(60).optional(),
+      codeRepoPath: z.string().min(1).max(1000).optional(),
       // The 50-dependency and asset-path limits are enforced by core.createTask, the same
       // validator the sidecar reaches. Keeping them out of this schema preserves the structured
       // `invalid` result; a schema failure here would be a plain protocol error instead.
@@ -432,17 +433,26 @@ function registerTools(server: McpServer, core: CompanyCore) {
     inputSchema: z.object({ text: z.string().min(2), tier: z.enum(tiers).optional(), project: z.string().min(1).optional(), pipeline: z.enum(['software', 'video', 'story']).optional(), ...relayShape }),
   }, async (input, ctx) => run(token(ctx), () => core.relayGoal(token(ctx), input)));
 
+  server.registerTool('goal_phase_split', {
+    description: 'gm only: close a large goal in stages. Moves the named unfinished tasks (not anchors, no live lease, not awaited by an open task that stays) into a next-phase goal created once per idempotencyKey with the same tier and project; the moved tasks join the new goal\'s first anchor, and the old goal\'s anchors stop waiting for them and unlock when nothing else is open, so the current phase can go to its acceptance. Returns the next goal id, the moved tasks and the anchors that unlocked. Audited; a refusal writes nothing.',
+    inputSchema: z.object({ goalId: z.string().min(1).max(100), taskIds: z.array(z.string().min(1).max(200)).min(1).max(200),
+      title: z.string().min(4).max(60), reason: z.string().min(4).max(4000), idempotencyKey: z.string().min(1).max(200) }),
+  }, async (input, ctx) => run(token(ctx), () => core.goalPhaseSplit
+    ? core.goalPhaseSplit(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
   server.registerTool('triage_goal', {
     description: 'gm only: choose the flow for a goal waiting in triage. quick = one delivery chain, product acceptance closes it, owner not involved; standard = gm plans deliveries, owner G3; program = product scope proposal first, then plan, owner G3.',
     inputSchema: z.object({ goalId: z.string().min(1), tier: z.enum(tiers), reason: z.string().min(4) }),
   }, async (input, ctx) => run(token(ctx), () => core.triageGoal(token(ctx), input)));
 
   server.registerTool('create_delivery', {
-    description: 'gm/product: create the delivery chain for one code change under a goal: implement (engineering, peer review) -> release request (product or Jev decides go-live) -> merge, deploy and production verification (qa). project optionally binds all three legs to a registered project. The three legs form one worktree lane (one tree, one branch); pass lane to put related deliveries of the same goal into the same lane, otherwise every delivery gets its own lane and runs in parallel with the others. The explicit dependencies are external input: at most 50 raw entries, each a 1-200 character task id, checked before de-duplication by the same core validator create_task uses; a refusal writes no task, audit, outbox or idempotency row.',
+    description: 'gm/product: create the delivery chain for one code change under a goal: implement (engineering, peer review) -> release request (product or Jev decides go-live) -> merge, deploy and production verification (qa). project optionally binds all three legs to a registered project; codeRepoPath (or a spec naming the ops repo path) binds all three legs to that code repository. The three legs form one worktree lane (one tree, one branch); pass lane to put related deliveries of the same goal into the same lane, otherwise every delivery gets its own lane and runs in parallel with the others. The explicit dependencies are external input: at most 50 raw entries, each a 1-200 character task id, checked before de-duplication by the same core validator create_task uses; a refusal writes no task, audit, outbox or idempotency row.',
     inputSchema: z.object({
       goalId: z.string().min(1), title: z.string().min(3), spec: z.string().min(20),
       discipline: z.string().min(1).max(60).optional(),
       project: z.string().min(1).max(60).optional(),
+      codeRepoPath: z.string().min(1).max(1000).optional(),
       lane: z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/).optional(),
       // The 50-dependency limit is enforced by core.createDelivery, the same validator the sidecar
       // reaches. Keeping it out of this schema preserves the structured `invalid` result.
@@ -1008,6 +1018,16 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.bindTaskCodeRepo(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
+  server.registerTool('task_intent_update', {
+    description: 'gm only: turn a blocked read-only engineering task (kind=task, blocked_to=gm or a dependency wait) into a code task in place, optionally naming its lane, instead of retiring it and creating a new code task. Owner gates, review-phase blocks, live leases and release/deploy legs refuse. Write authority is re-judged under the task policy; the implement-leg baseline acceptance criteria are merged while the gate is on; the read worktree assignment is released so the next claim gets an exclusive code tree. Version-guarded, idempotent, audited.',
+    inputSchema: z.object({
+      taskId: z.string().min(1), lane: z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/).optional(),
+      expectedVersion: z.number().int().positive(), ...evidenceShape,
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.taskIntentUpdate
+    ? core.taskIntentUpdate(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
   server.registerTool('get_model_evidence', {
     description:'eval/gm only: actual models and execution fences for final task evaluation. Combine with full submission/return/accept history; request counts are not quality scores.',
     inputSchema:z.object({taskId:z.string().min(1).max(200)}),
@@ -1015,11 +1035,18 @@ function registerTools(server: McpServer, core: CompanyCore) {
     if(!core.modelEvidence) throw new Error('Model evidence unavailable');
     return core.modelEvidence(token(ctx),input.taskId);
   }));
+  server.registerTool('get_task_cost', {
+    description: 'eval/gm/product, read-only: what one task consumed, from Magpie per-request usage matched by the task\'s lease sessions — requests, failed requests, input/output/cache tokens, USD over priced requests, unpriced count, model time, wall time from creation to acceptance, and the same per employee and per model. Settled once when the task is done and kept after raw request rows are pruned; complete=false means some session had no rows left in Magpie\'s window, so the totals are a lower bound.',
+    inputSchema: z.object({ taskId: z.string().min(1).max(200) }),
+  }, async (input, ctx) => run(token(ctx), () => core.taskCost
+    ? core.taskCost(token(ctx), input.taskId)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('record_score', {
-    description: 'eval employees only: record a performance scorecard for every participant of a finished task.',
+    description: 'eval employees only: record a performance scorecard for every participant of a finished task. complexity (1-5) is your rating of how hard the task was; the system keeps your overall as judge_overall and stores a calibrated overall: deductions for returns, revocations and refused submits from the audit trail, and an efficiency step for the authors against the median cost and time of tasks of the same complexity.',
     inputSchema: z.object({
       taskId: z.string().min(1),
       summary: z.string().min(1).max(20000),
+      complexity: z.number().min(1).max(5).optional(),
       scores: z.array(z.object({
         employee: z.string().min(1),
         modelScores: z.array(z.object({model:z.string().min(1).max(200),overall:z.number().min(1).max(5),notes:z.string().max(2000).optional()})).max(50).optional(),

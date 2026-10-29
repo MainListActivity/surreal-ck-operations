@@ -6,7 +6,8 @@ import type { Surreal } from 'surrealdb';
  *  - worktree_audit: read by list_worktree_audits for recent reclaim decisions;
  *  - idempotency: replayed only by a retry of the same write;
  *  - outbox: consumed by sequence; `revoked` rows also name eval participants until the task is scored;
- *  - model_execution: read by eval for tasks not yet scored; a scored task keeps its model_scorecard rollup;
+ *  - model_execution: read by eval for tasks not yet scored, and by the task_cost rollup; a scored task keeps its
+ *    model_scorecard rollup and its task_cost row (a done task is kept until its cost is settled);
  *  - ops_* audit: shown in the history of open tasks only.
  * Each rule deletes in bounded batches so one pass never holds a long transaction.
  */
@@ -16,7 +17,7 @@ export const RETENTION_RULES: RetentionRule[] = [
   { table: 'worktree_audit', days: 14, where: 'at < $cutoff' },
   { table: 'idempotency', days: 14, where: 'at = NONE OR at < $cutoff' },
   { table: 'outbox', days: 14, where: "at < $cutoff AND (kind != 'revoked' OR task.evaluated_at != NONE)" },
-  { table: 'model_execution', days: 7, where: 'at < $cutoff AND (task = NONE OR task.evaluated_at != NONE)' },
+  { table: 'model_execution', days: 7, where: "at < $cutoff AND (task = NONE OR (task.evaluated_at != NONE AND (task.state != 'done' OR task IN (SELECT VALUE task FROM task_cost))))" },
   { table: 'audit', days: 30, where: "string::starts_with(action, 'ops_') AND at < $cutoff AND (task = NONE OR task.state = 'done')" },
 ];
 

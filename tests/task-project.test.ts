@@ -15,7 +15,7 @@ setDefaultTimeout(60000);
 // private RocksDB store plus throwaway git repos. No production data, no credentials, no dispatcher.
 const run = process.env.RUN_SCK_TASK_PROJECT_TESTS === '1' ? test : test.skip;
 let dir: string, port: number, server: ReturnType<typeof Bun.spawn>, db: CompanyDatabase;
-let gm: string, eng: string, eng2: string, eng3: string, eng4: string, eng5: string, product: string, count = 0;
+let gm: string, eng: string, eng2: string, eng3: string, eng4: string, eng5: string, eng6: string, eng7: string, eng8: string, product: string, count = 0;
 let repoOps: string, repoMlc: string, repoAnime: string;
 
 const config = () => ({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: 'fixture-only', namespace: 'task_project_fixture', database: 'control_plane' });
@@ -55,6 +55,9 @@ beforeAll(async () => {
   eng3 = await enrollment.enroll('tp-eng3', 'engineering', ['execute', 'review']);
   eng4 = await enrollment.enroll('tp-eng4', 'engineering', ['execute', 'review']);
   eng5 = await enrollment.enroll('tp-eng5', 'engineering', ['execute', 'review']);
+  eng6 = await enrollment.enroll('tp-eng6', 'engineering', ['execute', 'review']);
+  eng7 = await enrollment.enroll('tp-eng7', 'engineering', ['execute', 'review']);
+  eng8 = await enrollment.enroll('tp-eng8', 'engineering', ['execute', 'review']);
   product = await enrollment.enroll('tp-product', 'product', ['execute', 'review', 'manage']);
 
   const projects = new ProjectStore(db.db);
@@ -427,4 +430,102 @@ run('bind rejects non-gm, unregistered and escaped paths, owner/review blocks, l
   expect(replayed.version).toBe(first.version);
   expect(await auditRows(t.id, 'bind_task_code_repo')).toHaveLength(1);
   await expect(C.bindTaskCodeRepo(gm, { taskId: t.id, codeRepoPath: repoAnime, expectedVersion: v, text: '幂等重放探测', idempotencyKey: idem })).rejects.toMatchObject({ code: 'conflict' });
+});
+
+run('creation binds the code repo up front: explicit, inferred from the ops repo path, or left to the project', async () => {
+  const C = core();
+  const [grows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: '创建即绑定代码仓', brief: 'fixture', state: 'active', source: 'fixture', note: '', project: project:`maplayer-content`, tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
+  const goalId = asId(grows[0]!.id);
+  const base = { executorRole: 'engineering' as const, reviewerRole: 'engineering' as const, goalId };
+  // Code intent naming the ops repo path: bound to the ops repo at creation, the business project stays.
+  const inferred = await C.createTask(gm, { ...base, title: `推断绑定 ${++count}`, context: `代码仓 ${repoOps}，业务项目保持 maplayer-content`, workIntent: { kind: 'code' }, idempotencyKey: key() });
+  expect(inferred.codeRepoPath).toBe(realpathSync(repoOps));
+  const claim = await C.claim(eng6, inferred.id);
+  expect(claim.worktree!.repo).toBe(realpathSync(repoOps));
+  expect(claim.project?.id).toBe('maplayer-content');
+  // A longer sibling path is not the ops repo; a read task naming it is not bound either.
+  const sibling = await C.createTask(gm, { ...base, title: `近似路径 ${++count}`, context: `参考 ${repoOps}-four-tier 的发布脚本`, workIntent: { kind: 'code' }, idempotencyKey: key() });
+  expect(sibling.codeRepoPath).toBeUndefined();
+  const read = await C.createTask(gm, { ...base, title: `只读不绑定 ${++count}`, context: `只读核对 ${repoOps}`, workIntent: { kind: 'read' }, idempotencyKey: key() });
+  expect(read.codeRepoPath).toBeUndefined();
+  // Explicit binding to a registered repo wins; an unregistered one refuses before any write.
+  const explicit = await C.createTask(gm, { ...base, title: `显式绑定 ${++count}`, context: 'fixture', workIntent: { kind: 'code' }, codeRepoPath: repoAnime, idempotencyKey: key() });
+  expect(explicit.codeRepoPath).toBe(realpathSync(repoAnime));
+  await expect(C.createTask(gm, { ...base, title: `未登记仓 ${++count}`, context: 'fixture', codeRepoPath: join(dir, 'not-registered'), idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'forbidden' });
+  // A delivery whose spec names the ops repo binds all three legs, including the read-intent release leg.
+  const legs = await C.createDelivery(gm, { goalId, title: `交付链绑定 ${++count}`, spec: `改动在 ${repoOps} 的 src/ops，业务项目保持 maplayer-content`, idempotencyKey: key() });
+  expect(legs.map(leg => leg.codeRepoPath)).toEqual([0, 1, 2].map(() => realpathSync(repoOps)));
+});
+
+run('a blocked read-only engineering task becomes a code task in place', async () => {
+  const C = core();
+  const t = await C.createTask(gm, { title: `只读改代码 ${++count}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'read' }, idempotencyKey: key() });
+  const v0 = await versionOf(C, t.id);
+  // Only a blocked task changes intent; ready/doing refuse before any write.
+  await expect(C.taskIntentUpdate(gm, { taskId: t.id, expectedVersion: v0, text: '未阻塞必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+  const claim = await C.claim(eng7, t.id);
+  await C.block(eng7, proof(claim), 'gm', { text: 'fixture: 只读任务查明需要改代码，请经理改为 code 写权', idempotencyKey: key() });
+  const v = await versionOf(C, t.id);
+  await expect(C.taskIntentUpdate(eng7, { taskId: t.id, expectedVersion: v, text: '工程师不能改写权', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+  const idem = key();
+  const changed = await C.taskIntentUpdate(gm, { taskId: t.id, lane: 'intent-fix', expectedVersion: v, text: '经理裁定：同任务改为 code', idempotencyKey: idem });
+  expect(changed.workIntent).toEqual({ kind: 'code', lane: 'intent-fix' });
+  expect(changed.version).toBe(v + 1);
+  expect(changed.worktree).toBeUndefined();
+  const replayed = await C.taskIntentUpdate(gm, { taskId: t.id, lane: 'intent-fix', expectedVersion: v, text: '经理裁定：同任务改为 code', idempotencyKey: idem });
+  expect(replayed.version).toBe(changed.version);
+  expect(await auditRows(t.id, 'task_intent_update')).toHaveLength(1);
+  await expect(C.taskIntentUpdate(gm, { taskId: t.id, expectedVersion: changed.version, text: '已是 code 必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'conflict' });
+});
+
+run('a failed system check refuses an ops-repo code submit before review and is audited against the author', async () => {
+  let problems = ['tsc 报 1 个类型错误：src/a.ts(1,1): error TS2322'];
+  const seen: string[] = [];
+  const C = new SurrealCompanyCore(db, { worktrees: { opsRepo: repoOps }, systemCheck: async ({ worktreePath }) => { seen.push(worktreePath); return problems; } });
+  const t = await C.createTask(gm, { title: `系统检查 ${++count}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, idempotencyKey: key() });
+  const claim = await C.claim(eng8, t.id);
+  expect(claim.worktree!.repo).toBe(realpathSync(repoOps));
+  await expect(C.submit(eng8, proof(claim), { text: 'fixture submit that fails the system check', idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('系统检查未通过') });
+  expect(seen).toEqual([claim.worktree!.worktreePath]);
+  const after = await C.getTask(eng8, t.id);
+  expect(after.state).toBe('doing'); // no reviewer is spent; the author still holds the lease
+  expect(after.currentEmployee).toBe('tp-eng8');
+  expect(await auditRows(t.id, 'submit_check_failed')).toHaveLength(1);
+  problems = [];
+  const submitted = await C.submit(eng8, proof(claim), { text: 'fixture submit after fixing the system check', idempotencyKey: key() });
+  expect(submitted.state).toBe('review');
+});
+
+run('a large goal closes in stages: open follow-ups move to a next-phase goal and the anchor unlocks', async () => {
+  const C = core();
+  const goal = await C.relayGoal(gm, { text: '分阶段目标 fixture', ownerQuote: '老板原话 fixture', idempotencyKey: key(), tier: 'standard' });
+  const anchor = goal.tasks.manual!;
+  const base = { executorRole: 'engineering' as const, reviewerRole: 'engineering' as const, goalId: goal.id, context: 'fixture' };
+  const followA = await C.createTask(gm, { ...base, title: `后续补测 A ${++count}`, dependencies: [goal.tasks.plan!], idempotencyKey: key() });
+  const followB = await C.createTask(gm, { ...base, title: `后续补测 B ${++count}`, dependencies: [followA.id], idempotencyKey: key() });
+  await db.db.query("UPDATE $plan SET state = 'done';", { plan: new RecordId('task', goal.tasks.plan!) });
+  // Moving A alone would strand B, which waits on it; anchors cannot be moved.
+  await expect(C.goalPhaseSplit(gm, { goalId: goal.id, taskIds: [followA.id], title: '下一阶段', reason: '分阶段 fixture', idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining(followB.id) });
+  await expect(C.goalPhaseSplit(gm, { goalId: goal.id, taskIds: [anchor], title: '下一阶段', reason: '分阶段 fixture', idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining('锚点') });
+  await expect(C.goalPhaseSplit(eng, { goalId: goal.id, taskIds: [followA.id, followB.id], title: '下一阶段', reason: '分阶段 fixture', idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'forbidden' });
+  const idem = key();
+  const split = await C.goalPhaseSplit(gm, { goalId: goal.id, taskIds: [followA.id, followB.id], title: '下一阶段 fixture', reason: '分阶段 fixture', idempotencyKey: idem });
+  expect(split.moved.sort()).toEqual([followA.id, followB.id].sort());
+  expect(split.unlocked).toEqual([anchor]);
+  const anchorAfter = await C.getTask(gm, anchor);
+  expect(anchorAfter.state).toBe('ready');
+  expect(anchorAfter.dependencies).not.toContain(followA.id);
+  const [movedRows] = await db.db.query<[Array<{ goal: RecordId }>]>('SELECT goal FROM $ids;', { ids: [followA.id, followB.id].map(t => new RecordId('task', t)) });
+  expect(movedRows.map(r => asId(r.goal))).toEqual([split.nextGoalId, split.nextGoalId]);
+  const [next] = await db.db.query<[{ anchors: RecordId[]; tier: string } ]>('SELECT anchors, tier FROM ONLY $g;', { g: new RecordId('goal', split.nextGoalId) });
+  expect(next.tier).toBe('standard');
+  const firstAnchor = await C.getTask(gm, asId(next.anchors[0]!));
+  expect(firstAnchor.dependencies).toEqual(expect.arrayContaining([followA.id, followB.id]));
+  // A replay returns the same next goal and moves nothing again.
+  expect((await C.goalPhaseSplit(gm, { goalId: goal.id, taskIds: [followA.id, followB.id], title: '下一阶段 fixture', reason: '分阶段 fixture', idempotencyKey: idem })).nextGoalId).toBe(split.nextGoalId);
 });

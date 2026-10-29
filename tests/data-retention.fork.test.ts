@@ -24,6 +24,8 @@ run('retention drops operational exhaust and keeps what open work and pending sc
   const q = (sql: string) => db.db.query(sql);
   await q(`CREATE task:scored SET title = 'scored', state = 'done', evaluated_at = time::now();
     CREATE task:pending SET title = 'pending', state = 'done';
+    CREATE task:uncosted SET title = 'scored, cost not settled', state = 'done', evaluated_at = time::now();
+    CREATE task_cost:scored CONTENT { task: task:scored, cost: {} };
     CREATE task:open SET title = 'open', state = 'doing';`);
   await q(`LET $old = time::now() - 40d; LET $new = time::now() - 1h;
     CREATE worktree_audit:old CONTENT { repo: '/r', path: '/p', event: 'skip', trigger: 'sweep', decision: 'skip', result: 'skipped', reason: 'x', at: $old };
@@ -36,6 +38,7 @@ run('retention drops operational exhaust and keeps what open work and pending sc
     CREATE outbox:revoked_scored CONTENT { kind: 'revoked', task: task:scored, at: $old, sequence: 3 };
     CREATE model_execution:scored CONTENT { task: task:scored, employee: 'e', at: $old };
     CREATE model_execution:pending CONTENT { task: task:pending, employee: 'e', at: $old };
+    CREATE model_execution:uncosted CONTENT { task: task:uncosted, employee: 'e', at: $old };
     CREATE model_execution:idle CONTENT { employee: 'e', at: $old };
     CREATE audit:ops_open CONTENT { action: 'ops_call', task: task:open, at: $old };
     CREATE audit:ops_done CONTENT { action: 'ops_error', task: task:scored, at: $old };
@@ -45,7 +48,8 @@ run('retention drops operational exhaust and keeps what open work and pending sc
   expect(await left('worktree_audit')).toEqual(['new']);
   expect(await left('idempotency')).toEqual(['stamped']);
   expect(await left('outbox')).toEqual(['revoked_pending']);
-  expect(await left('model_execution')).toEqual(['pending']);
+  // A scored task keeps its request rows until its cost is settled into task_cost.
+  expect(await left('model_execution')).toEqual(['pending', 'uncosted']);
   expect(await left('audit')).toEqual(expect.arrayContaining(['ops_open', 'submit_done']));
   expect(await left('audit')).not.toContain('ops_done');
   expect(removed).toMatchObject({ worktree_audit: 1, idempotency: 2, outbox: 2, model_execution: 2, audit: 1 });
