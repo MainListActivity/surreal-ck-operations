@@ -36,7 +36,7 @@ import {
 import { productRequest, ProductUnreachable, type ProductResult } from './product.ts';
 import { SUPPLIER_ADAPTER, SUPPLIER_PROVIDER, SUPPLIER_SERVICE, sampleSupplierPlan, supplierAliasFromSecretName } from './supplier.ts';
 import { MAGPIE_ADAPTER, MAGPIE_PROVIDER, magpieWindowFromEvidence, sampleMagpieRoute } from './magpie.ts';
-import { MAGPIE_RESTORE_ALIAS, applyMagpieRouteRestore, planMagpieRouteRestore } from './magpie-restore.ts';
+import { MAGPIE_RESTORE_ALIAS, planMagpieRouteRestore } from './magpie-restore.ts';
 import { loadProofFiles } from './proof-files.ts';
 import { MAGPIE_EXECUTION_HEADROOM_SECONDS, MAGPIE_SNAPSHOT_MAX_AGE_SECONDS } from './proof-contract.ts';
 import { clip, redactJson, redactText } from './redact.ts';
@@ -192,8 +192,9 @@ const opsIdempotentOf = (tool: string, args: Args = {}): boolean => {
       const method = typeof args.method === 'string' ? args.method.toUpperCase() : 'GET';
       return method === 'GET' || method === 'HEAD';
     }
-    // The route restore writes the gateway config and seals a credential; a failed attempt with an
-    // unknown outcome is never repeated blindly — the plan/apply idempotency key handles replays.
+    // The route restore only publishes the read-only plan; apply refuses in every role before any
+    // write. Keeping the conservative non-idempotent classification means an apply refusal is not
+    // retried automatically.
     case 'ops_magpie_route_restore':
       return args.mode !== 'apply';
     default:
@@ -662,6 +663,14 @@ export class OpsBroker {
             'quota windows are percentages plus resetsAt, never an absolute balance',
             'pricing is observed from the gateway catalog and stays unreviewed until a price decision exists',
             'unknown cost stays null; the document is local evidence, not a provider commitment',
+          ],
+        },
+        magpieRouteRestore: {
+          provider: MAGPIE_PROVIDER, adapter: MAGPIE_ADAPTER, group: 'group/work',
+          modes: ['plan'], writeAvailable: false, gatewayReload: 'unknown', recovery: 'unavailable',
+          disclosures: [
+            'only the read-only plan is published; apply is refused in every role with zero writes',
+            'the write channel, real group schema and gateway reload semantics are unproven; the account/route recovery is not complete',
           ],
         },
         // Public client identifiers only (never secrets), so employees can align the channels
@@ -1678,16 +1687,18 @@ export class OpsBroker {
 
   /**
    * `ops_magpie_route_restore {mode: plan|apply, alias: MAGPIE, purpose, …}`: the controlled
-   * repair for the two 2026-10-28 FV06 gaps — a missing `group/work` and an unsealed supplier
-   * username. `plan` is read-only and answers safe ids, hashes and a bounded plan digest; `apply`
-   * accepts only an exact plan (digest + issuedAt + expected config sha) plus an explicit account
-   * and minimal members, and performs at most one CAS-guarded append and one seal. It never edits
-   * an existing group, provider, credential or default route, never restarts the gateway, never
-   * returns a username or secret, and never falls back to a local model call.
+   * read-only inspection for the two 2026-10-28 FV06 gaps — a missing `group/work` and an unsealed
+   * supplier username. Only `plan` is published: it answers safe ids, hashes and a bounded plan
+   * digest, and marks `writeAvailable:false` with `gatewayReload:"unknown"`. `apply` is refused for
+   * every role before any config, seal or journal access (the write channel, real group schema and
+   * gateway reload semantics are unproven). Nothing here restarts the gateway, returns a username or
+   * secret, or falls back to a local model call.
    */
   private async magpieRouteRestore(ctx: Ctx, args: Args): Promise<Outcome> {
     const mode = text(args, 'mode', 10);
     const planOnly = new Set(['mode', 'env', 'alias', 'purpose']);
+    // The apply parameters stay allowlisted so a malformed apply request is still answered with a
+    // precise invalid error, even though apply itself is refused below.
     const applyKeys = ['mode', 'env', 'alias', 'purpose', 'planDigest', 'planIssuedAt', 'expectedConfigSha256', 'accountHash', 'members', 'idempotencyKey'];
     const allowed = new Set(mode === 'apply' ? applyKeys : planOnly);
     if (mode !== 'plan' && mode !== 'apply') throw invalid('mode must be plan or apply');
@@ -1699,6 +1710,13 @@ export class OpsBroker {
     if (/[:\\/@]|\b(?:bearer|token|cookie|secret|password|api[-_ ]?key)\b|[A-Za-z0-9_-]{32,}/i.test(purpose)) {
       throw invalid('purpose must be a short plain-text evidence purpose, not a URL, path or credential');
     }
+    if (mode === 'apply') {
+      // Refused before any config read, seal or journal access, for qa, engineering, product and gm
+      // alike. The underlying entry refuses the same way, so a direct import cannot bypass this.
+      throw new CompanyError('not_configured',
+        'the Magpie route restore write capability is unavailable in this release: ops_magpie_route_restore publishes the read-only plan only (writeAvailable=false, gatewayReload=unknown) and the account/route recovery is not complete',
+        false, { capability: 'magpie_route_restore_apply', writeAvailable: false, gatewayReload: 'unknown' });
+    }
     const io = {
       project: ctx.scope.project, env: ctx.env, taskId: ctx.scope.taskId, purpose,
       readSealed: (name: string) => this.deps.projects.readSealed(ctx.scope.project, ctx.env, name, this.deps.secretKey()),
@@ -1709,34 +1727,12 @@ export class OpsBroker {
       ...(this.deps.magpie?.readProviders ? { readProviders: this.deps.magpie.readProviders } : {}),
       ...(this.deps.magpie?.configPath ? { configPath: this.deps.magpie.configPath } : {}),
     };
-    if (mode === 'plan') {
-      const result = await planMagpieRouteRestore(io);
-      return {
-        value: result,
-        audit: {
-          action: 'ops_magpie_restore',
-          evidence: `ops_magpie_route_restore plan（${purpose}）→ group=${result.config.groupPresent ? 'present' : 'missing'} binding=${result.binding.status} accounts=${result.accounts.length} plan=${result.planDigest.slice(0, 12)} config=${result.config.sha256.slice(0, 12)}`,
-        },
-      };
-    }
-    const members = Array.isArray(args.members) ? args.members : [];
-    const result = await applyMagpieRouteRestore({
-      ...io,
-      planDigest: text(args, 'planDigest', 64),
-      planIssuedAt: text(args, 'planIssuedAt', 40),
-      expectedConfigSha256: text(args, 'expectedConfigSha256', 64),
-      accountHash: text(args, 'accountHash', 64),
-      members: members as string[],
-      idempotencyKey: text(args, 'idempotencyKey', 200),
-      sealUsername: (name, value) => this.deps.projects.setSecret(
-        { project: ctx.scope.project, env: ctx.env, name, value, purpose: 'magpie controlled route restore' },
-        this.deps.secretKey(true)),
-    });
+    const result = await planMagpieRouteRestore(io);
     return {
       value: result,
       audit: {
         action: 'ops_magpie_restore',
-        evidence: `ops_magpie_route_restore apply（${purpose}）→ ${result.status}${result.refusal ? `/${result.refusal.code}` : ''} group=${result.groupOperation ?? 'none'} binding=${result.bindingOperation ?? 'none'} config=${result.config?.sha256After.slice(0, 12) ?? 'none'} account=${result.account?.accountRef.slice(0, 12) ?? 'none'} backup=${result.backupFile ?? 'none'} replay=${result.replayed} phases=${result.phases.map(item => item.phase).join(',')}`,
+        evidence: `ops_magpie_route_restore plan（${purpose}）→ group=${result.config.groupPresent ? 'present' : 'missing'} binding=${result.binding.status} accounts=${result.accounts.length} plan=${result.planDigest.slice(0, 12)} config=${result.config.sha256.slice(0, 12)} writeAvailable=false`,
       },
     };
   }

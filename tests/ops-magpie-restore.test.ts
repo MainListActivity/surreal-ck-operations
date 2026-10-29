@@ -1,13 +1,14 @@
 // ops_magpie_route_restore: the controlled plan/apply repair for a missing `group/work` and an
 // unsealed supplier username. Every test runs against an isolated providers.json and the fake
 // loopback gateway; no model is called and no provider credential is read as a value.
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { afterAll, describe, expect, test } from 'bun:test';
 import { OpsBroker } from '../src/ops/broker.ts';
 import { sha256 } from '../src/ops/proof-contract.ts';
-import { spliceGroup } from '../src/ops/magpie-restore.ts';
+import { applyMagpieRouteRestore, applyMagpieRouteRestoreRetained, spliceGroup } from '../src/ops/magpie-restore.ts';
 import { FakeCompany, FakeWorld, brokerConfig } from './support/ops-world.ts';
 
 const ALIAS = 'MAGPIE';
@@ -33,6 +34,8 @@ interface Rig {
   configPath: string;
   journalPath: string;
   qa: string;
+  fetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+  seal: (name: string, value: string) => Promise<void>;
   setSealFailure: (fail: boolean) => void;
   audits: () => string;
 }
@@ -42,6 +45,7 @@ interface RigOptions {
   sealed?: string;
   extraAccounts?: string[];
   mode?: number;
+  roles?: string[];
   /** Point the broker at a symlink to the real config. */
   linkConfig?: boolean;
   /** Point the broker at a directory instead of a file. */
@@ -65,14 +69,15 @@ function rig(options: RigOptions = {}): Rig {
   }
   if (options.directoryConfig) configPath = configDir;
   if (options.sealed) company.sealed.set(`demo/production/${SEALED_NAME}`, options.sealed);
-  company.env('demo', 'production', brokerConfig(), { healthUrl: 'https://app.test/health' });
+  company.env('demo', 'production', brokerConfig(options.roles ? { roles: options.roles } : {}), { healthUrl: 'https://app.test/health' });
   let sealFailure = false;
+  const seal = async (name: string, value: string) => {
+    if (sealFailure) throw new Error('seal unavailable');
+    company.sealed.set(`demo/production/${name}`, value);
+  };
   const projects = {
     ...company.projects,
-    setSecret: async (input: { project: string; env: string; name: string; value: string }) => {
-      if (sealFailure) throw new Error('seal unavailable');
-      company.sealed.set(`${input.project}/${input.env}/${input.name}`, input.value);
-    },
+    setSecret: async (input: { project: string; env: string; name: string; value: string }) => seal(input.name, input.value),
   };
   const fetch = options.extraAccounts?.length
     ? async (input: string | URL | Request, init?: RequestInit) => {
@@ -94,7 +99,7 @@ function rig(options: RigOptions = {}): Rig {
     magpie: { base: world.magpie.base, endpointSource: 'injected', readProviders: async () => readFileSync(configPath, 'utf8'), configPath, journalPath },
   });
   return {
-    world, company, broker, home, configPath, journalPath,
+    world, company, broker, home, configPath, journalPath, fetch, seal,
     qa: company.lease('qa-1', 'qa', 'task-1'),
     setSealFailure: (fail: boolean) => { sealFailure = fail; },
     audits: () => JSON.stringify(company.audits),
@@ -105,16 +110,32 @@ const call = (r: Rig, args: Record<string, unknown>) => r.broker.call(r.qa, 'tas
 const plan = (r: Rig) => call(r, { mode: 'plan', alias: ALIAS, purpose: PURPOSE });
 const key = (label: string) => `${label}-${Math.random().toString(36).slice(2, 12)}`;
 
+/** The io the broker would build for the retained (unreleased) implementation. */
+const retainedIo = (r: Rig) => ({
+  project: 'demo', env: 'production', taskId: 'task-1', alias: ALIAS, purpose: PURPOSE,
+  readSealed: async (name: string) => r.company.sealed.get(`demo/production/${name}`),
+  fetch: r.fetch, now: r.world.now,
+  evidenceDir: join(r.home, 'evidence'),
+  journalPath: r.journalPath, configPath: r.configPath,
+  readProviders: async () => readFileSync(r.configPath, 'utf8'),
+  base: r.world.magpie.base, endpointSource: 'injected' as const,
+  sealUsername: (name: string, value: string) => r.seal(name, value),
+});
+
+/**
+ * Apply tests exercise the retained implementation directly: the broker and the published entry
+ * refuse apply in this release (covered by the `apply is closed` suite).
+ */
 async function apply(r: Rig, planned: Record<string, any>, overrides: Record<string, unknown> = {}) {
-  return call(r, {
-    mode: 'apply', alias: ALIAS, purpose: PURPOSE,
+  return applyMagpieRouteRestoreRetained({
+    ...retainedIo(r),
     planDigest: planned.planDigest, planIssuedAt: planned.issuedAt,
     expectedConfigSha256: planned.config.sha256,
     accountHash: planned.proposedAccount?.accountHash ?? planned.accounts[0]?.accountHash,
     members: [MEMBER],
     idempotencyKey: key('restore'),
     ...overrides,
-  });
+  }) as Promise<Record<string, any>>;
 }
 
 async function failure(promise: Promise<unknown>): Promise<{ code?: string; message: string }> {
@@ -144,6 +165,8 @@ describe('plan', () => {
     expect(out.planDigest).toMatch(/^[0-9a-f]{64}$/);
     expect(Date.parse(out.expiresAt) - Date.parse(out.issuedAt)).toBe(15 * 60_000);
     expect(out.gatewayReload).toBe('unknown');
+    expect(out.writeAvailable).toBe(false);
+    expect(out.notes.join(' ')).toContain('read-only plan');
     expect(leaks(JSON.stringify(out))).toEqual([]);
     expect(r.company.audits.at(-1)?.action).toBe('ops_magpie_restore');
     expect(leaks(r.audits())).toEqual([]);
@@ -307,14 +330,8 @@ describe('plan bounds and drift', () => {
     const stale = readFileSync(r.configPath, 'utf8');
     const thirdParty = baseConfig({ revision: 'third-party-edit' });
     writeFileSync(r.configPath, thirdParty);
-    const broker = new OpsBroker({
-      core: r.company.core, projects: r.company.projects as never, secretKey: () => Buffer.alloc(32),
-      fetch: r.world.fetch, now: r.world.now, d1: () => r.world.d1, queryAsUser: r.world.queryAsUser, browser: r.world.browser,
-      serviceHome: r.home, sleep: async (ms) => { r.world.clock += ms; },
-      magpie: { base: r.world.magpie.base, endpointSource: 'injected', readProviders: async () => stale, configPath: r.configPath, journalPath: r.journalPath },
-    });
-    const error = await failure(broker.call(r.qa, 'task-1', 'ops_magpie_route_restore', {
-      mode: 'apply', alias: ALIAS, purpose: PURPOSE,
+    const error = await failure(applyMagpieRouteRestoreRetained({
+      ...retainedIo(r), readProviders: async () => stale,
       planDigest: planned.planDigest, planIssuedAt: planned.issuedAt, expectedConfigSha256: planned.config.sha256,
       accountHash: planned.accounts[0].accountHash, members: [MEMBER], idempotencyKey: 'seam-mismatch-1',
     }));
@@ -480,7 +497,7 @@ describe('idempotency and recovery', () => {
     const r = rig();
     const planned = await plan(r);
     const before = readFileSync(r.configPath, 'utf8');
-    const groupJson = JSON.stringify({ affinity: 'smart', id: 'group/work', members: [MEMBER] });
+    const groupJson = JSON.stringify({ id: 'group/work', members: [MEMBER] });
     const written = spliceGroup(before, groupJson)!;
     expect(written).not.toBe(before);
     writeFileSync(r.configPath, written);
@@ -502,11 +519,39 @@ describe('idempotency and recovery', () => {
 
     const out = await apply(r, planned, { idempotencyKey: id });
     expect(out.status).toBe('applied');
-    expect(out.groupOperation).toBe('unchanged');
-    expect(out.phases.map((item: any) => item.phase)).toContain('recovery-verified');
+    // The group exists because this key wrote it before the interruption: never presented as a no-write unchanged.
+    expect(out.groupOperation).toBe('created');
+    expect(out.recovered).toBe(true);
+    expect(out.backupFile).toBe(backupName);
+    expect(out.phases.map((item: any) => item.phase)).toEqual(expect.arrayContaining(['recovery-verified', 'recovery-completed']));
     expect(readFileSync(r.configPath, 'utf8')).toBe(written);
     expect(JSON.parse(readFileSync(r.configPath, 'utf8')).groups.filter((row: any) => row.id === 'group/work')).toHaveLength(1);
     expect(r.company.sealed.get(`demo/production/${SEALED_NAME}`)).toBe('snv-magpie-account');
+    // The completed record keeps the backup pointer instead of overwriting it with null.
+    const journal = JSON.parse(readFileSync(r.journalPath, 'utf8'));
+    expect(journal.entries[keyHash]).toMatchObject({
+      phase: 'done', backupFile: backupName, groupOperation: 'created', recoveredFromInterruptedWrite: true,
+    });
+
+    // A later replay of the same key reports the recorded backup and neither rewrites nor re-seals.
+    const replay = await apply(r, planned, { idempotencyKey: id });
+    expect(replay.status).toBe('unchanged');
+    expect(replay.replayed).toBe(true);
+    expect(replay.backupFile).toBe(backupName);
+    expect(readFileSync(r.configPath, 'utf8')).toBe(written);
+  });
+
+  test('a different key cannot adopt an interrupted write as its own', async () => {
+    const r = rig();
+    const planned = await plan(r);
+    const before = readFileSync(r.configPath, 'utf8');
+    const groupJson = JSON.stringify({ id: 'group/work', members: [MEMBER] });
+    writeFileSync(r.configPath, spliceGroup(before, groupJson)!);
+
+    const out = await apply(r, planned, { idempotencyKey: 'other-key-0001' });
+    expect(out.status).toBe('refused');
+    expect(out.refusal.code).toBe('plan-drifted');
+    expect(r.company.sealed.size).toBe(0);
   });
 
   test('a refusal with the same started key preserves identity and crash recovery metadata', async () => {
@@ -595,8 +640,56 @@ describe('input allowlist', () => {
     expect((await failure(call(r, { mode: 'plan', alias: 'SNV_PROD', purpose: PURPOSE }))).code).toBe('invalid');
   });
 
-  test('an apply without the plan material is rejected', async () => {
+  test('an apply without the plan material is refused as unavailable, not invalid', async () => {
     const r = rig();
-    expect((await failure(call(r, { mode: 'apply', alias: ALIAS, purpose: PURPOSE }))).code).toBe('invalid');
+    expect((await failure(call(r, { mode: 'apply', alias: ALIAS, purpose: PURPOSE }))).code).toBe('not_configured');
+  });
+});
+
+describe('apply is closed', () => {
+  const applyArgs = (planned: Record<string, any>) => ({
+    mode: 'apply', alias: ALIAS, purpose: PURPOSE,
+    planDigest: planned.planDigest, planIssuedAt: planned.issuedAt,
+    expectedConfigSha256: planned.config.sha256,
+    accountHash: planned.accounts[0]?.accountHash, members: [MEMBER], idempotencyKey: 'closed-apply-0001',
+  });
+
+  test('the broker refuses apply for every role with zero writes', async () => {
+    for (const role of ['qa', 'engineering', 'product', 'gm']) {
+      const r = rig({ roles: ['qa', 'engineering', 'product', 'gm'] });
+      const planned = await plan(r);
+      const before = readFileSync(r.configPath, 'utf8');
+      const backups = listBackups(r).length;
+      const lease = r.company.lease(`role-${role}`, role as never, 'task-1');
+      const error = await failure(r.broker.call(lease, 'task-1', 'ops_magpie_route_restore', applyArgs(planned)));
+      expect(error.code).toBe('not_configured');
+      expect(error.message).toContain('write capability is unavailable');
+      expect(readFileSync(r.configPath, 'utf8')).toBe(before);
+      expect(listBackups(r)).toHaveLength(backups);
+      expect(r.company.sealed.size).toBe(0);
+      expect(existsSync(r.journalPath)).toBe(false);
+    }
+  });
+
+  test('the published underlying entry refuses a direct call before any read or write', async () => {
+    const r = rig();
+    const planned = await plan(r);
+    const before = readFileSync(r.configPath, 'utf8');
+    const error = await failure(applyMagpieRouteRestore({
+      ...retainedIo(r),
+      planDigest: planned.planDigest, planIssuedAt: planned.issuedAt, expectedConfigSha256: planned.config.sha256,
+      accountHash: planned.accounts[0].accountHash, members: [MEMBER], idempotencyKey: 'direct-apply-0001',
+    }));
+    expect(error.code).toBe('not_configured');
+    expect((error as { details?: unknown }).details).toMatchObject({ capability: 'magpie_route_restore_apply', writeAvailable: false, gatewayReload: 'unknown' });
+    expect(readFileSync(r.configPath, 'utf8')).toBe(before);
+    expect(r.company.sealed.size).toBe(0);
+    expect(existsSync(r.journalPath)).toBe(false);
+  });
+
+  test('the retained write implementation is not reachable from production code', () => {
+    const hits = execFileSync('git', ['grep', '-l', 'applyMagpieRouteRestoreRetained', '--', 'src'], { encoding: 'utf8' })
+      .trim().split('\n').filter(Boolean);
+    expect(hits).toEqual(['src/ops/magpie-restore.ts']);
   });
 });

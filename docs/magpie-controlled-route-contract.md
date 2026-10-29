@@ -103,37 +103,32 @@
 
 负向：错误账号、路由漂移、缺失 usage、价目不明、窗口过期、余额不足、来源陈旧、余量不足、旧契约拒绝、已登记候选与文档/路由不一致拒绝、重复 prepare 不产生第二份候选。
 
-## 9. 受控恢复工具 `ops_magpie_route_restore`
+## 9. 受控恢复工具 `ops_magpie_route_restore`（只读 plan）
 
-2026-10-28 的 FV06 路由采样无法出证：本机网关 `providers.json` 缺 `group/work`，且公司未密封 `SUPPLIER_MAGPIE_USERNAME`。本工具补上这两项的**受控**修复能力，不是采样通过的保证。
+2026-10-28 的 FV06 路由采样无法出证：本机网关 `providers.json` 缺 `group/work`，且公司未密封 `SUPPLIER_MAGPIE_USERNAME`。本发布**只提供只读 plan**：真实写入通道（直接替换 `providers.json` 与 Magpie 自身 `SaveGroup` API 的取舍）、真实组 schema 与网关加载/刷新语义均未证实，因此 `apply` 关闭，实际账号/路由恢复**未完成**。
 
-### 9.1 plan（只读）
+### 9.1 plan（只读，已发布）
 
 `ops_magpie_route_restore {mode:"plan", alias:"MAGPIE", purpose}`
 
 - 只读 `providers.json`（`~/.config/magpie/providers.json`，lstat 拒绝符号链接/非普通文件，1..256 KiB）与网关 `/v1/models`、`/v1/magpie/quotas`；**零模型调用、零写入**。
-- 返回：`group`、`config{sha256,bytes,groupPresent,existingMembers}`、`groups[{id,memberCount}]`、`unsafeGroupIds`、`providers[{id,routing}]`、`accounts[{accountHash,accountRef,provider}]`、`binding{status:missing|matched|mismatch}`、可选 `proposedAccount`（仅网关恰好一个账号时）、可选 `candidates{provider,models,modelCount,omitted}`、`snapshots{catalogSha256,quotasSha256}`、`sources[]`、`planDigest`、`issuedAt/expiresAt`（15 分钟）、`gatewayReload:"unknown"`、`recovery.interrupted[]`、`notes[]`。
+- 返回：`group`、`config{sha256,bytes,groupPresent,existingMembers}`、`groups[{id,memberCount}]`、`unsafeGroupIds`、`providers[{id,routing}]`、`accounts[{accountHash,accountRef,provider}]`、`binding{status:missing|matched|mismatch}`、可选 `proposedAccount`（仅网关恰好一个账号时）、可选 `candidates{provider,models,modelCount,omitted}`、`snapshots{catalogSha256,quotasSha256}`、`sources[]`、`planDigest`、`issuedAt/expiresAt`（15 分钟）、`gatewayReload:"unknown"`、**`writeAvailable:false`**、`recovery.interrupted[]`、`notes[]`。
 - **不输出**用户名、token、secret、`api_key` 或 `providers.json` 正文；组/供应商 id 只出安全字符集，账号只出 `sha256("magpie|provider|user")` 与 `mgp…` 引用。
 - `candidates` 只含绑定账号同 provider 的 catalog 模型，纯建议；**不自动授权整个 catalog**；无绑定且多账号时不给候选、不给 `proposedAccount`，也不猜默认账号/模型。
-- `recovery.interrupted` 列出 journal 中未完成的 apply（备份文件名、计划摘要前缀、配置是否已变），提示经理先确认网关状态。
+- `recovery.interrupted` 只从既有 journal 读出未完成写入的备份文件名、计划摘要前缀与配置是否已变，供经理核实；本工具不据此恢复、不清理旧 journal/备份原件。
+- plan 沿用环境既有的 `cfg.roles` 授权；本发布不改生产 roles，也不新增 GM 权限。
+- **plan 通过不等于恢复成功**：它只陈述当前缺口与候选，不证明网关会加载任何写入。
 
-### 9.2 apply（严格 allowlist）
+### 9.2 apply（已关闭）
 
-`ops_magpie_route_restore {mode:"apply", alias:"MAGPIE", purpose, planDigest, planIssuedAt, expectedConfigSha256, accountHash, members[], idempotencyKey}`
+`ops_magpie_route_restore {mode:"apply", …}` 在 broker 入口与底层导出入口都以结构化 `not_configured`（`details.capability="magpie_route_restore_apply"`、`writeAvailable:false`、`gatewayReload:"unknown"`）拒绝，**发生在任何配置读取、密封或 journal 访问之前**；qa、engineering、product、gm 一样拒绝，直接 import 底层入口也无法写。apply 参数仍走严格 allowlist，未知参数先按 `invalid` 拒绝。
 
-- 未知参数一律拒绝；alias 固定 `MAGPIE`（密封键 `SUPPLIER_MAGPIE_USERNAME` 由别名派生，不接受任意密封键或路径）。
-- 服务端以**同一份不可变 plan 材料**（config/catalog/quotas 快照哈希、账号集合、绑定状态、既有 `group/work` 成员、`issuedAt`）重算摘要；计划过期（>15 分钟）、配置/目录/配额/绑定漂移、`expectedConfigSha256` 不符、账号哈希匹配 0 个或多个、成员不属于所选账号 provider、成员在同一 base id 下多义、既有 `group/work` 成员不同 → **拒绝**。既有不匹配的密封绑定 → 在任何写入前拒绝，不静默覆盖。
-- `members` 必须由经理显式给出（1..20），工具只把它们规范化为精确 catalog id；不因候选而自动选择账号或成员。
-- **唯一允许的变更**：向顶层 `groups` 追加一个缺失的 `{"id":"group/work","members":[…]}`。既不存在的组才会创建；其余字节按原文保留（在 `groups` 数组闭合处字节级插入），并在写前做语义回环校验（除新组外与原文 `canonical` 相等）。既有组、`providers`、凭证、默认路由、`revision` 均不修改。新组只包含 `id` 与 `members`，不从兄弟组复制字段或猜测 schema。
-- 真实配置 schema 与网关刷新语义未在本链确证：工具把 `gatewayReload` 明写为 `unknown`，**不重启 daemon**，也不声称磁盘写成功等于运行网关已生效。缺刷新能力时由经理/老板另行处理，不绕过代理。
-- 文件安全：同目录锁文件（`O_EXCL`，60 秒后视为陈旧）；同目录 0600 备份 `providers.json.bak-<时间戳>-<随机>`；同目录临时文件 + `rename` 原子替换；保留原 owner/mode；写前重新读取做 CAS，`rename` 前再校验一次，失败绝不覆盖第三方更新的配置；写后校验字节摘要。CAS 检查与 `rename` 之间仍有很短的竞态窗口；锁只协调遵守本工具锁约定的写入者，不能阻止不协作的外部进程在检查后、替换前写文件。
-- 密封绑定：仅从 `/v1/magpie/quotas` 的**内存行**取 `user`，经既有 `setSecret` 写入 `SUPPLIER_MAGPIE_USERNAME`；员工不可见，返回体与审计只出现 `accountRef`（哈希前缀）。
-- 补偿：若配置已写而密封失败，按同一 CAS 从备份恢复配置；恢复被第三方更新阻止时保留备份并如实返回 `refused/binding-failed` 与残留摘要，**不声称完全回滚**。本工具没有通用 secret 删除接口，已密封的值不能被它撤销——这是已知设计缺口。
-- 幂等：`idempotencyKey` 的哈希写入 0600 journal；同一 key + 同一 plan 的重放不再写文件、不再选账号、不再密封，返回 `replayed:true`；同一 key 换 plan、预期配置摘要或账号身份拒绝。已完成记录在计划过期或配额读取时间变化后仍可重放，但会验证密封仍匹配原账号、`group/work` 仍含相同成员且配置摘要与完成记录一致；状态漂移时拒绝并要求重新 plan。
-- 崩溃恢复：journal 记录 `backupFile` 与本次追加的 `insertedGroup`。重试同 key 时，只有「当前文件 == 备份 + 该组 JSON 的字节拼接」才认定为自己未完成的写入，跳过 plan 摘要校验继续完成密封/采样；否则按漂移拒绝，绝不覆盖。
-- 审计：`action=ops_magpie_restore`，只含 mode/status/refusal code、计划与配置摘要前缀、`accountRef` 前缀、备份文件名、阶段名序列；不含任何凭证。
-- 本链**不执行生产 apply**，不 prepare/prove/deliver/enable，不读原配置正文给员工；真实账号与成员选择留给经理/老板，无法确证时保持 blocked，部署验收不等于配置恢复成功。
+未发布的写入实现（`applyMagpieRouteRestoreRetained`）仅作为后续发布的可恢复证据保留：
+
+- 生产不可达：broker 只引用拒绝入口，`src/` 内无其他引用，测试守卫该约束；已知非目标残留是 journal 在取锁前读取、锁内整体写回（只假设单写者）。
+- 崩溃恢复元数据已修正：完成记录不再以 `null` 覆盖 `started.backupFile`；由本键中断写入的组标为 `created`（附 `recovered:true` 与 `recovery-completed` 阶段），不再冒充「未写」的 `unchanged`；重放保留备份指针。
+- 旧 journal 与 `providers.json.bak-*` 原件保留、不清理；在写入通道被另链证实并经经理/运营批准前，**恢复功能不可用**，也不提供人工 DML 或手工替换 `providers.json` 的替代做法。
 
 ### 9.3 测试覆盖
 
-`tests/ops-magpie-restore.test.ts` 使用隔离临时配置 + 受控本机 mock：plan 脱敏与候选边界、成功 apply 的字节保留/权限/备份/密封、幂等重放、既有组相同 no-op / 不同拒绝、跨 provider 成员、多账号不猜账号、无匹配账号、plan 过期与漂移、seam 与磁盘不一致、锁与陈旧锁、symlink/目录/超限、密封半失败回滚、崩溃后 journal 恢复、未知参数与别名限制、秘密零泄漏。
+`tests/ops-magpie-restore.test.ts` 使用隔离临时配置 + 受控本机 mock：plan 脱敏/候选边界/`writeAvailable:false`；apply 在 broker 与底层入口对全部角色结构化拒绝且零写入（配置、密封、journal、备份均不变）；保留实现的 A–D 契约（绑定冲突、完成态重放、拒绝不改写身份、组只写 `id`+`members`）、崩溃恢复保留备份指针与中断写入如实标注、跨 key 身份拒绝；以及未知参数与别名限制、秘密零泄漏、生产不可达守卫。

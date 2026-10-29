@@ -87,6 +87,8 @@ export interface MagpieRestorePlanResult {
   issuedAt: string;
   expiresAt: string;
   gatewayReload: 'unknown';
+  /** This release publishes the read-only plan only; apply is refused before any write. */
+  writeAvailable: false;
   recovery: { interrupted: Array<{ at: string; planDigestPrefix: string; backupFile: string | null; wroteConfig: boolean }> };
   notes: string[];
 }
@@ -100,6 +102,8 @@ export interface MagpieRestoreApplyResult {
   group: typeof MAGPIE_GROUP;
   status: 'applied' | 'unchanged' | 'refused';
   replayed: boolean;
+  /** True when this call finished a write that the same key had already made before an interruption. */
+  recovered?: boolean;
   refusal?: { code: string; detail: string };
   groupOperation?: 'created' | 'unchanged';
   bindingOperation?: 'sealed' | 'already-bound';
@@ -330,6 +334,8 @@ interface JournalEntry {
   insertedGroup?: string;
   groupOperation?: 'created' | 'unchanged';
   bindingOperation?: 'sealed' | 'already-bound';
+  /** The group in the file was written by this key before the interruption, not by this retry. */
+  recoveredFromInterruptedWrite?: boolean;
   sampledStatus?: string;
   at: string;
   updatedAt: string;
@@ -503,14 +509,15 @@ export async function planMagpieRouteRestore(input: MagpieRestorePlanInput): Pro
   const notes: string[] = [];
   if (facts.parsed.unsafeGroupIds) notes.push(`${facts.parsed.unsafeGroupIds} routing group id(s) are not safe identifiers and are not listed`);
   if (!facts.groupWork.present) notes.push(`${MAGPIE_GROUP} is missing from the gateway routing groups`);
-  else notes.push(`${MAGPIE_GROUP} is already present; apply is a no-op when its members are exactly the selected ones and refuses any other members`);
-  if (facts.binding.status === 'mismatch') notes.push('a sealed SUPPLIER_MAGPIE_USERNAME exists but matches no gateway account; apply will refuse rather than overwrite it');
-  if (facts.binding.status === 'missing') notes.push('no sealed SUPPLIER_MAGPIE_USERNAME; apply can seal the selected gateway account');
-  if (!candidatesProvider) notes.push('the gateway reports more than one account and none is bound; apply must name the selected accountHash explicitly');
-  if (candidates) notes.push('candidate members are same-provider catalog suggestions only; apply requires an explicit minimal member list and never auto-authorizes the catalog');
+  else notes.push(`${MAGPIE_GROUP} is already present with the listed members`);
+  if (facts.binding.status === 'mismatch') notes.push('a sealed SUPPLIER_MAGPIE_USERNAME exists but matches no gateway account');
+  if (facts.binding.status === 'missing') notes.push('no sealed SUPPLIER_MAGPIE_USERNAME; the gateway account cannot be bound');
+  if (!candidatesProvider) notes.push('the gateway reports more than one account and none is bound');
+  if (candidates) notes.push('candidate members are same-provider catalog suggestions only; the catalog is never auto-authorized');
   notes.push('a successful disk write is not proof the running gateway reloaded the config; this tool does not restart any daemon');
   notes.push('if sealing the username fails after the config write, the config is restored from the backup under CAS, but a previously sealed value cannot be removed through this tool (no generic secret management interface)');
   if (interrupted.length) notes.push('an earlier apply was interrupted; confirm the gateway state before re-applying');
+  notes.push('this release publishes the read-only plan only: apply is refused with zero writes (writeAvailable=false), the write channel, real group schema and gateway reload semantics are unproven, and the account/route recovery is not complete');
   const value: MagpieRestorePlanResult = {
     mode: 'plan',
     adapter: MAGPIE_ADAPTER,
@@ -537,6 +544,7 @@ export async function planMagpieRouteRestore(input: MagpieRestorePlanInput): Pro
     issuedAt,
     expiresAt: new Date(at + MAGPIE_RESTORE_PLAN_TTL_MS).toISOString(),
     gatewayReload: 'unknown',
+    writeAvailable: false,
     recovery: { interrupted },
     notes,
   };
@@ -563,7 +571,28 @@ function resolveMembers(facts: RestoreFacts, provider: string, raw: string[]): {
   return { ids: ids.sort() };
 }
 
-export async function applyMagpieRouteRestore(input: MagpieRestoreApplyInput): Promise<MagpieRestoreApplyResult> {
+/**
+ * The published apply entry. This release ships the read-only plan only: the write channel (a direct
+ * `providers.json` replace versus Magpie's own SaveGroup API), the real group schema and the gateway
+ * reload semantics are unproven, so every caller — the broker and any direct import — is refused
+ * before any config, seal or journal access. Keeping the refusal here means a caller that bypasses
+ * the broker still cannot write.
+ */
+export async function applyMagpieRouteRestore(_input: MagpieRestoreApplyInput): Promise<MagpieRestoreApplyResult> {
+  throw new CompanyError('not_configured',
+    'the Magpie route restore write capability is unavailable in this release: ops_magpie_route_restore publishes the read-only plan only (writeAvailable=false, gatewayReload=unknown) and the account/route recovery is not complete',
+    false, { capability: 'magpie_route_restore_apply', writeAvailable: false, gatewayReload: 'unknown' });
+}
+
+/**
+ * The unreleased apply implementation, retained with its journal and recovery evidence so a later
+ * release can resume from a verified write channel. It is NOT a production entry: the broker imports
+ * only the refusing entry above and no other `src/` module references this name (a regression test
+ * guards that). Known residual, unchanged and out of this task's scope: the journal is read before
+ * the lock is taken and written back as a whole inside it, so only a single cooperating writer is
+ * assumed.
+ */
+export async function applyMagpieRouteRestoreRetained(input: MagpieRestoreApplyInput): Promise<MagpieRestoreApplyResult> {
   const now = input.now ?? Date.now;
   const at = now();
   const phases: Array<{ phase: string; at: string; detail?: string }> = [];
@@ -672,6 +701,9 @@ export async function applyMagpieRouteRestore(input: MagpieRestoreApplyInput): P
   const wantedMembers = resolved.ids;
 
   let groupOperation: 'created' | 'unchanged';
+  // True when the current file is this key's own interrupted write: the group exists because this
+  // key created it, so the retry must not report "no write" and must keep the original backup.
+  let recoveredWrite = false;
   if (ownWrite && prior?.phase === 'done') {
     // A completed retry only replays when the whole recorded state is still in place.
     if (!facts.groupWork.present || facts.binding.status !== 'matched') {
@@ -691,6 +723,10 @@ export async function applyMagpieRouteRestore(input: MagpieRestoreApplyInput): P
       if (!entry) return refuse('group-conflict', `${MAGPIE_GROUP} contains ${String(member).slice(0, 160)}, which the catalog does not serve; refusing to treat it as identical`);
     }
     groupOperation = 'unchanged';
+    if (ownWrite && prior?.phase !== 'done') {
+      groupOperation = 'created';
+      recoveredWrite = true;
+    }
   }
   phase('group-decided', groupOperation);
   const bindingOperation: 'sealed' | 'already-bound' = facts.binding.status === 'matched' ? 'already-bound' : 'sealed';
@@ -718,7 +754,7 @@ export async function applyMagpieRouteRestore(input: MagpieRestoreApplyInput): P
     let configAfter = facts.config.sha256;
     let backupFile: string | null = null;
 
-    if (groupOperation === 'created') {
+    if (groupOperation === 'created' && !recoveredWrite) {
       const fresh = readConfig(configPathOf(input)); // re-read under the lock
       if (fresh.sha256 !== input.expectedConfigSha256) return refuse('config-drifted', 'Magpie providers.json changed before the write; run plan again');
       if (sha256(await configTextOf(input)) !== fresh.sha256) return refuse('config-drifted', 'the gateway config seam disagrees with the file on disk; refusing to write');
@@ -749,6 +785,10 @@ export async function applyMagpieRouteRestore(input: MagpieRestoreApplyInput): P
       phase('write-started', `backup=${backupName}`);
       configAfter = writeConfigAtomically(fresh, nextText, input.expectedConfigSha256);
       phase('written', `config=${configAfter.slice(0, 12)}`);
+    } else if (recoveredWrite) {
+      backupFile = prior?.backupFile ?? null;
+      phase('recovery-completed', `${MAGPIE_GROUP} was written by this key before the interruption; the retry kept it and its backup`);
+      notes.push('the route group exists because this idempotencyKey wrote it before the interruption; the retry did not rewrite it and kept the original 0600 backup pointer');
     } else {
       phase('unchanged', 'the route group already has exactly the planned members');
     }
@@ -794,7 +834,7 @@ export async function applyMagpieRouteRestore(input: MagpieRestoreApplyInput): P
     journal.entries[keyHash] = {
       ...startedEntry(keyHash, input, account, at, now()), phase: 'done', configShaAfter: configAfter, backupFile,
       insertedGroup: journal.entries[keyHash]?.insertedGroup,
-      groupOperation, bindingOperation, sampledStatus: sampled?.status,
+      groupOperation, bindingOperation, recoveredFromInterruptedWrite: recoveredWrite, sampledStatus: sampled?.status,
     };
     writeJournal(journalPath, journal);
     phase('done', `sampled=${sampled?.status ?? 'n/a'}`);
@@ -804,6 +844,7 @@ export async function applyMagpieRouteRestore(input: MagpieRestoreApplyInput): P
       ...baseResult,
       status: groupOperation === 'created' || bindingOperation === 'sealed' ? 'applied' : 'unchanged',
       replayed: false,
+      ...(recoveredWrite ? { recovered: true } : {}),
       groupOperation, bindingOperation,
       config: { sha256Before: facts.config.sha256, sha256After: configAfter },
       backupFile,
