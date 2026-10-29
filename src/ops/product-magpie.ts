@@ -6,7 +6,7 @@ import {join} from 'node:path';
 import {CompanyError} from '../core-errors.ts';
 import {redactJson} from './redact.ts';
 import {parseMagpieJson} from '../usage/magpie.ts';
-import {sha256} from './proof-contract.ts';
+import {sha256,MAGPIE_SNAPSHOT_MAX_AGE_SECONDS} from './proof-contract.ts';
 import {opsFetch,type Fetcher} from './fetcher.ts';
 
 export const PRODUCT_MAGPIE_MODEL='remote-magpie/group/work';
@@ -70,7 +70,7 @@ export async function observeProductMagpie(input:{readProvider?:()=>unknown;fetc
   if(pages>=USAGE_MAX_PAGES){stop='page-cap';break;}
   if(rowsRead>=USAGE_MAX_ROWS){stop='row-cap';break;}
   if(now()-scanStarted>USAGE_BUDGET_MS){stop='time-cap';break;}
-  const page=await read('usage',`/magpie/usage/requests?period=${USAGE_PERIOD}&offset=${offset}&limit=${USAGE_PAGE_LIMIT}`);
+  const page=await read('usage',`/magpie/usage/requests?period=${USAGE_PERIOD}&q=${encodeURIComponent('group/work')}&offset=${offset}&limit=${USAGE_PAGE_LIMIT}`);
   usageBytes+=page.bytes;
   if(usageBytes>USAGE_MAX_BYTES)throw new CompanyError('response_too_large','remote-magpie usage 分页累计超过 4MiB');
   const body=page.value;
@@ -126,12 +126,15 @@ export async function observeProductMagpie(input:{readProvider?:()=>unknown;fetc
  if(routeMaxOutputTokens===null)gap('maxOutputTokens','远端只读目录未提供该路由的 max_output_tokens');
  if(routeSampledAt===null)gap('sampledAt','无上游采样时刻；不使用本机时钟补造');
  if(routeExpiresAt===null)gap('expiresAt','远端只读接口未提供该路由的到期时刻');
+ const windowContractMaxOutputTokens=65536;
  const result={version:'product-magpie-observation/1',status:'observed',source,capturedAt,
   route:{present:models.has('group/work'),configurationModified:false,revision:routeRevision,digest:routeDigest,servedModel:routeServedModel,maxOutputTokens:routeMaxOutputTokens,sampledAt:routeSampledAt,expiresAt:routeExpiresAt,gaps:routeGaps},
   usage,accounts,receipts,
-  coverage:{period:USAGE_PERIOD,rowsRead,matchingRows:matched,rowsReturned:usage.length,truncated:!complete,rowsTruncated:matched>usage.length,total,complete,pages,stoppedReason:stop,scannedOffset:[0,offset] as [number,number],requestCount:calls,
+  executionBounds:{modelMaxOutputTokens:routeMaxOutputTokens,windowContractMaxOutputTokens,proposedRequestMaxOutputTokens:routeMaxOutputTokens!==null&&routeMaxOutputTokens>0?Math.min(routeMaxOutputTokens,windowContractMaxOutputTokens):null,requiresApprovedWindow:true,enforcement:'product InternalBudgetModel caps each actual request at the approved window limit'},
+  observationSnapshot:{capturedAt,digest:sha256(JSON.stringify({source,receipts})),maxAgeSeconds:MAGPIE_SNAPSHOT_MAX_AGE_SECONDS,freshnessExpiresAt:new Date(Date.parse(capturedAt)+MAGPIE_SNAPSHOT_MAX_AGE_SECONDS*1000).toISOString(),expiryBasis:'local-observation-freshness-policy',routingConfigurationVerified:false},
+  coverage:{period:USAGE_PERIOD,filter:{field:'q',value:'group/work',exactRequestedModel:'group/work'},rowsRead,matchingRows:matched,rowsReturned:usage.length,truncated:!complete,rowsTruncated:matched>usage.length,total,complete,pages,stoppedReason:stop,scannedOffset:[0,offset] as [number,number],requestCount:calls,
    bounds:{pageSize:USAGE_PAGE_LIMIT,maxPages:USAGE_MAX_PAGES,maxRows:USAGE_MAX_ROWS,maxBytes:USAGE_MAX_BYTES,budgetMs:USAGE_BUDGET_MS},routeFieldsComplete:routeGaps.length===0},
   authorization:{executable:false,newBudgetGranted:false,configurationChangeRequired:false},
-  nextAction:'核对产品 ops_request GET /api/ops/internal-ai/runtime 和实际 run/requestId；本次只说明以上有界扫描范围内的结果，扫描未完成或为空都不代表缺组或缺数据。旧 v4 本机账号契约不适用于此源；观测不能作为 prepare/prove/enable 授权。'};
+  nextAction:'模型支持的最大输出不是请求必须使用的上限；请求应由获批窗口及产品调用层限制。observationSnapshot仅是本次读取的新鲜度策略，不是远端路由revision或供应商到期证明。核对产品 ops_request GET /api/ops/internal-ai/runtime 和实际 run/requestId；本次只说明以上有界扫描范围内的结果，扫描未完成或为空都不代表缺组或缺数据。旧 v4 本机账号契约不适用于此源；观测不能作为 prepare/prove/enable 授权。'};
  return redactJson(result,[provider.key,...list(quotasBody.data).flatMap(r=>typeof r.user==='string'?[r.user]:[])]) as typeof result;
 }

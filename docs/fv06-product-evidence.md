@@ -25,3 +25,16 @@ VPS 上的 `http://127.0.0.1:3425/v1` 与 Mac 上同样的 URL 是两个不同�
 责任归因：任务描述的来源主机歧义、适配器对真实API的错误假设、验收只验证闭锁而未覆盖现役正向来源，以及经理继续沿用已知过时契约共同导致；不能归因于老板未提供账号或未决定改模型。
 
 详细原始审计和维护验证保存在本机维护目录，不在仓库提交原始账号、凭证或客户数据。目标、G3、历史失败和未完成状态均保留；纠正来源不等于四指标已完成。
+
+
+## 原生筛选和输出上限的后续更正
+
+v0.3.37 使用远端 Magpie 原生 q=group/work 先筛选再分页，仍逐行核对 req===group/work。固定版本源码依据：yetone/magpie v0.1.1970 的 internal/usageapi/usageapi.go FilterOf 接受 q，internal/usage/ledger.go Filter.keepsRecord 会匹配 Requested 等字段。不能用 model=group/work 替代：model 是实际模型过滤。筛选来自固定工具逻辑，员工不能注入查询或连接覆盖；分页与字节/时间上限不扩大。coverage.filter 披露请求的服务端筛选及本地精确核对。
+
+实测原生筛选得到2条请求（total=2/complete=true），均为2026-10-28、实际模型sn-sensenova-6-8-flash、provider=raccoon。它们是历史维护请求，不能当成管理员/成员UI成功样本；完成态与端到端结果仍分别核对，旧证据不因此变新。
+
+route.maxOutputTokens 是远端目录的模型能力，保留兼容读取，不是窗口必须放行的请求值。executionBounds 分别披露该能力、magpie-window/v1的65536上限及候选请求上限（两者取小）。产品现有 InternalBudgetModel 在真正发请求前将 maxOutputTokens 限制为窗口批准值；声明窗口65536不等于伪造模型能力为65536。该候选值不是预算或授权。
+
+observationSnapshot 单独记录本次读取的哈希、采集时刻和本地2小时新鲜度策略，expiryBasis 明示 local-observation-freshness-policy。它不填入远端route.revision/digest/expiresAt，routingConfigurationVerified=false；不能把本地快照期限冒充供应商到期或实际路由配置验证。过期历史请求、未知完成态、价格未受审、剩余模型预算及产品窗口绑定仍独立处理。
+
+产品受保护runtime接口另行修复HTTP loopback观测：运行时配置披露与直接供应商HTTPS价目认证分离。endpointHost=null的旧返回来自价目函数限制，不能证明产品未配置。此更正不放宽tariffFor、不改模型/连接配置。
