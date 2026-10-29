@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import type { AuditEntry, ModelRankingAttempt, ModelRankingTable, Brief, Inbox, PermissionRequest, ProviderOptionsResult, Pulse, Roster, TaskAttachment, TaskView } from "./types";
+import type { ModelCatalogPage, AuditEntry, ModelRankingAttempt, ModelRankingTable, Brief, Inbox, PermissionRequest, ProviderOptionsResult, Pulse, Roster, TaskAttachment, TaskView } from "./types";
 
 const record = <T>() => z.custom<T>(value => typeof value === "object" && value !== null);
 const key = z.string().min(1);
@@ -167,6 +167,10 @@ export const pinModelRanking = defineRpc({
   input: z.object({group:z.enum(["sck-haiku","sck-sonnet","sck-opus"]),model:z.string().min(1).max(300),pinned:z.boolean()}),
   output: z.object({ok:z.boolean()}),
 });
+
+export const modelCatalog=defineRpc({name:'company.model-catalog.get',input:z.object({query:z.string().max(200).default(''),offset:z.number().int().min(0).default(0),limit:z.number().int().min(1).max(100).default(40)}),output:record<ModelCatalogPage>()});
+export const modelMembershipInput=z.object({group:z.enum(['sck-haiku','sck-sonnet','sck-opus','sck-fable']),model:z.string().min(1).max(300),present:z.boolean(),expectedMembers:z.array(z.string().max(300)).max(100)}).strict();
+export const setModelMembership=defineRpc({name:'company.model-membership.set',input:modelMembershipInput,output:z.object({ok:z.boolean()})});
 
 export const modelIdentity = defineRpc({
   name: "company.model-identity.get",

@@ -6,26 +6,23 @@ import {assessUrgency,UrgencyTracker} from '../src/model-routing/urgency.ts';
 import {modelFacts,quotaAccounts,rankingTables,type ModelFacts} from '../src/model-routing/ranking.ts';
 import {readUsageSamples,type LargeRequest} from '../src/model-routing/trends.ts';
 import {ruleOrder} from '../src/model-routing/rules.ts';
-import {rankingLayers} from '../plugin/shared/ranking-layers.ts';
 const now=Date.parse('2026-10-28T02:00:00Z'),iso=(t:number)=>new Date(t).toISOString();
 const facts=(id='p/a',amount=100,readAt=now):ModelFacts=>({id,price:{free:false},accounts:[{account:'p #1',poolKey:'pool',kind:'subscription',remainingPct:80,readAt:iso(readAt),windows:[{name:'Credits',remainingPct:80,runsOutAt:iso(now+3600000),runsOut:amount,unit:'credits'}]}]});
 const requests=(n:number,model='p/a'):LargeRequest[]=>Array.from({length:n},(_,i)=>({id:String(i),model,at:now+(i+1)*1000}));
 
-test('pins, usable urgent models, ordinary layers, then hard tails; urgency ignores AA/cost/cold divisions',()=>{
+test('pins remain explicit overrides while urgency competes through the same nonlinear score',()=>{
  const weak=facts('p/weak');weak.aa={score:20,rank:100};weak.price.free=true;
- const strong=facts('p/strong');strong.aa={score:80,rank:1};strong.accounts[0]!.kind='api';
+ const strong=facts('p/strong');strong.aa={score:80,rank:1};
  const ordinary={...facts('p/ordinary'),accounts:[]};ordinary.aa={score:99,rank:1};
  const bad={...facts('p/bad'),health:{source:'magpie-routing' as const,excluded:true,attempts:4,errors:4,consecutiveErrors:4}};
  const pin={...bad,id:'p/pin'};
- const slow=facts('p/slow');slow.usage={source:'magpie',period:'7d',scope:'provider-model',collectedAt:iso(now),requests:1,errors:0,speedSamples:0,ttftSamples:1,ttftMs:21000};
- const f=assessUrgency([ordinary,weak,strong,bad,pin,slow],[],{},now).facts;
+ const f=assessUrgency([ordinary,weak,strong,bad,pin],[],{},now).facts;
  const rows=ruleOrder(f,['p/pin'],now);
- expect(rows[0]!.facts.id).toBe('p/pin');expect(rows.slice(1,3).every(r=>r.decision.urgent)).toBe(true);
- expect(rows[1]!.decision.score!).toBeGreaterThanOrEqual(rows[2]!.decision.score!);expect(rows[3]!.facts.id).toBe('p/ordinary');
- expect(rows.at(-1)!.decision.tail).toBeTruthy();expect(rows.find(r=>r.facts.id==='p/slow')!.decision.urgent).toBe(false);
- const table=rankingTables({'sck-haiku':rows.map(r=>r.facts.id)},{'sck-haiku':{engine:'quality-pace-v4',tier:'haiku',at:iso(now),model:'rules',rules:'',rows,answers:{}}},[],{'sck-haiku':['p/pin']})[0]!;
- const layers=rankingLayers(table);expect(layers[1]!.title).toContain('第2层 · 临期额度优先');expect(layers[1]!.count).toBe(2);expect(layers[1]!.comparison).toContain('5条');
- const embed=new Function('return ('+rankingLayers.toString()+')')();expect(embed(table)).toEqual(layers);
+ expect(rows[0]!.facts.id).toBe('p/pin');
+ expect(rows.slice(1).map(r=>r.decision.score)).toEqual(rows.slice(1).map(r=>r.decision.score!).sort((a,b)=>b-a));
+ expect(rows.filter(r=>r.decision.urgent).every(r=>r.decision.factors!.urgency>1)).toBe(true);
+ expect(rows.find(r=>r.facts.id==='p/bad')!.decision.score).toBe(0);
+ expect(rows.every(r=>r.decision.band===undefined)).toBe(true);
 });
 
 test('five qualifying requests require a new quota read after completion; the same batch stays excluded',()=>{

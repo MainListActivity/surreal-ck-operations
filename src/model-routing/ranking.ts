@@ -261,9 +261,9 @@ export interface RankingTable {
 }
 /** Current Magpie membership/order wins; a changed effort is a new member and must not inherit an old score. */
 export function rankingTables(groups: Record<string,string[]>, results: Record<string,RankingResultSnapshot> = {}, requests: RankingRequestSnapshot[] = [], pins: RankingPins = {}, gates:RankingGates = {}): RankingTable[] {
-  return RANKED_TIERS.map(tier => {
+  return (["haiku","sonnet","opus","fable"] as Tier[]).map(tier => {
     const group = `sck-${tier}`, result = results[group], gate=gates[group];
-    const bandWidth=result?.policy?.bandWidth??(result?.engine==='quality-pace-v1'?2:undefined);
+    const bandWidth=result?.engine===RULE_ENGINE?undefined:result?.policy?.bandWidth??(result?.engine==='quality-pace-v1'?2:undefined);
     const bandRanges:Record<string,{top:number;bottom:number}>={};
     if(bandWidth!==undefined)for(const r of result?.rows??[]){
       if(r.decision?.band===undefined||typeof r.facts.aa?.score!=='number'||!Number.isFinite(r.facts.aa.score))continue;

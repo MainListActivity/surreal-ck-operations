@@ -1,7 +1,8 @@
 /** Fixed reference scales: adding a candidate cannot change another candidate's score. */
-export const WEIGHT_LABELS={pace:'额度消耗紧迫度',latency:'首 token 延迟',intelligence:'AA 能力',speed:'输出速度',performance:'验收绩效',price:'预计费用'};
+export const WEIGHT_LABELS={pace:'额度消耗意愿',latency:'首 token 延迟',intelligence:'AA 能力',speed:'输出速度',performance:'验收绩效',price:'预计费用'};
 export const BILLING_LABELS={free:'免费',included:'套餐/积分覆盖',unknown:'计费未知',paid:'额外付费'};
 export type BillingClass=keyof typeof BILLING_LABELS;
+/** bandWidth is retained only to read old saved policies; v5 never partitions by it. */
 export interface RankingPolicy {bandWidth:number;weights:Record<keyof typeof WEIGHT_LABELS,number>;billingOverrides:Record<string,BillingClass>}
 export const DEFAULT_POLICY:RankingPolicy={bandWidth:2,weights:{pace:35,latency:30,intelligence:15,speed:10,performance:5,price:5},billingOverrides:{}};
 export function rankingPolicy(input:unknown=DEFAULT_POLICY):RankingPolicy {

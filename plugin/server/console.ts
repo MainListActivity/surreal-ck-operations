@@ -26,6 +26,7 @@ type CompanyApi = {
     revokeTaskLease(taskId: string, reason: string, handover: string, actor: string): Promise<{ ok: boolean; employee?: string }>;
   };
   db: { db: import("surrealdb").Surreal };
+  modelRouting: import("./vendor/src/model-routing/controller.ts").ModelRoutingController;
   modelRanking: import("./vendor/src/model-routing/ranking.ts").RankingRefresher;
   opsRepo: string;
 };
@@ -105,6 +106,24 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
       if (req.method === "GET" && sub === "/ranking") {
         const { rankingPage }=await import("./ranking-page.ts");
         return text(rankingPage,200,"text/html; charset=utf-8");
+      }
+      if(req.method==='GET'&&sub==='/api/model-catalog'){
+        try{return json(await (await opts.company()).modelRouting.catalogPage(url.searchParams.get('query')??'',Number(url.searchParams.get('offset')??0),40));}
+        catch{return json({error:'模型目录读取失败'},400);}
+      }
+      if(req.method==='POST'&&['/api/model-membership','/api/model-alias'].includes(sub)){
+        if(req.headers.get('origin')&&req.headers.get('origin')!==url.origin)return json({error:'origin mismatch'},403);
+        try{
+          const b=await req.json(),ctx=await opts.company();
+          if(sub==='/api/model-membership'){
+            const {modelMembershipInput}=await import('../shared/rpc.ts');
+            const {updateModelMembership}=await import('./model-ranking.ts');
+            return json(await updateModelMembership(ctx,modelMembershipInput.parse(b)));
+          }
+          if(typeof b.model!=='string'||!b.model||b.model.length>300||!(b.slug===null||typeof b.slug==='string'&&b.slug.length>0&&b.slug.length<=200))throw Error('参数无效');
+          const {updateModelAlias}=await import('./model-ranking.ts');
+          return json(await updateModelAlias(ctx,{model:b.model,slug:b.slug}));
+        }catch(error){return json({error:(error as Error).message.slice(0,300)},409);}
       }
       if (req.method === "GET" && sub === "/api/model-ranking") {
         const { modelRankingView }=await import("./model-ranking.ts");
