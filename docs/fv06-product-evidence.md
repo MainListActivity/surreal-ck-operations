@@ -55,3 +55,12 @@ observationSnapshot 单独记录本次读取的哈希、采集时刻和本地2�
 - 旧 v4 本机契约（`magpie-controlled-route/1`）与 `manifestPath/documentPath` 调用方式保留，用于历史兼容。
 
 此契约只说明远端观测与有效期，不是新供应商授权证书，也不授予任何预算。
+
+## 价目人工批准 marker（remote-price-approval/1）
+
+- `ops_product_magpie_price_approve {candidatePath}` 由另一位员工调用：候选作者不能批准自己的候选（`self_review`）；候选 digest 被改动、候选无 catalog 价目（`price-missing`，保持 null，不写 0）时拒绝写入。
+- marker 写入批准员工自己的任务证据目录 `evidence/<任务>/price-approval-<员工哈希>-<digest前16位>.json`，并带 `markerDigest`。`approvalTask` 必须等于调用者自己的任务，不能写进别的任务证据根。
+- marker 绑定 `configurationDigest`、`priceRevision`、批准时刻与候选有效期（`expiresAt`），不写账号名、token 或任何凭证。
+- `ops_magpie_window_prepare {candidatePath, approvalTask}` 在没有注入 `remotePriceApprovals` 时，从 `approvalTask` 证据根读取 marker。以下情形会跳过该 marker，窗口保持 `price-not-reviewed` 或报 `evidence-expired`：文件不符合 schema、`markerDigest` 不符（被篡改）、`configurationDigest` 或 `priceRevision` 不符、批准时刻在未来、已过期。
+- 生产中只要存在一条独立、未篡改、未过期且 digest 相符的 marker，窗口才不再报 `price-not-reviewed`。这份 marker 只代表价目审核，不授予预算，不启用、不执行。
+- 注入的 `remotePriceApprovals` 仍保留为测试接缝，并优先于磁盘 marker。
