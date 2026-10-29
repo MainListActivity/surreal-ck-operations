@@ -45,3 +45,5 @@ test('catalog provides scored AA choices and exact CAS membership changes from t
  await h.button('添加到 Haiku').props.onPress();await new Promise(r=>setTimeout(r,0));
  expect(h.writes).toContainEqual(['membership',{group:'sck-haiku',model:'v/new:max',present:true,expectedMembers:[]}]);
 });
+
+test('Paseo removes the interval selector and saves only the policy',async()=>{const h=harness();h.render();expect(h.text()).not.toContain('刷新间隔');expect(h.button('10 分钟')).toBeUndefined();h.elements.find(n=>n.type==='TextInput'&&n.props.accessibilityLabel==='首 token 延迟权重').props.onChangeText('90');h.render();await h.button('保存设置').props.onPress();await new Promise(r=>setTimeout(r,0));const saved=h.writes.find(w=>w[0]==='save');expect(saved[1].refreshMinutes).toBeUndefined();expect(saved[1].policy.weights.latency).toBe(90);});

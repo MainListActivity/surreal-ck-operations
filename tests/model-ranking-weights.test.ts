@@ -47,13 +47,13 @@ test('preview uses frozen observations, matches the live engine and never applie
  expect((await r.preview(policy('pace'))).tables[0]!.rows[0]!.model).toBe('p/b');expect(reads).toBe(0);expect(applied).toBe(0);
  await r.preview(p,true);expect(reads).toBe(1);expect(applied).toBe(0);
 });
-test('exploration requests recheck after 30 seconds, then restore the configured interval once measured',async()=>{
+test('observation requests keep the 30 second cadence after exploration acquires samples',async()=>{
  let calls=0,sampled=false;const fresh=fact('p/new');delete fresh.usage;
  const db={query:async(sql:string)=>sql.includes('SELECT ranking_rules')?[{ranking_refresh_minutes:10}]:[{}]};
  const r=new RankingRefresher({db:db as any,groups:()=>({'sck-haiku':['p/new']}),facts:async()=>{calls++;return [sampled?fact('p/new'):fresh];},apply:async()=>{}});
  r.trigger(0);await r.settled();r.trigger(29999);await r.settled();expect(calls).toBe(1);
  sampled=true;r.trigger(30000);await r.settled();expect(calls).toBe(2);
- r.trigger(60000);await r.settled();expect(calls).toBe(2);r.trigger(630000);await r.settled();expect(calls).toBe(3);
+ r.trigger(60000);await r.settled();expect(calls).toBe(3);r.trigger(630000);await r.settled();expect(calls).toBe(4);
 });
 test('a depleted short-window account cannot inflate the model pace using its positive long window',()=>{
  const f=fact('p/model');f.accounts=[
