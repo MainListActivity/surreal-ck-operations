@@ -8,7 +8,7 @@ VPS 上的 `http://127.0.0.1:3425/v1` 与 Mac 上同样的 URL 是两个不同�
 
 `ops_product_magpie_observe {}` 复用老板已有 remote-magpie HTTPS 连接。员工不能覆盖地址、模型、账号或凭证。仅 GET models / quotas / usage，受现有任务、角色、策略和故障预算控制，不调用推理、不改配置。
 
-回执 `product-magpie-observation/1` 明示 source、远端 endpoint、模型引用、来源 SHA256、抓取时刻与覆盖范围。只读取最近200条，最多返回10条匹配 work 的记录；不足不能推断不存在。使用 Magpie 实际字段 req/served/in/out/t/status/ms/stop；无 done 字段不机械判为失败。完成态需成功状态、正耗时和结束标志，仍不代表端到端UI成功。账号仅出哈希，不能把同供应商的其他账号余额冒充本次请求余额；关联信息缺失保持unknown。价目读取 prompt/completion 字符串；缺失保持null，已核零价与未受审授权区分。
+回执 `product-magpie-observation/1` 明示 source、远端 endpoint、模型引用、来源 SHA256、抓取时刻与覆盖范围。usage 采用**有界分页**：每页 200 行、最多 5 页（1000 行）、累计 4MiB、12s 预算，逐页仍受 1MiB/15s 限制；`coverage` 如实给出 rowsRead、pages、matchingRows、rowsReturned、total、complete、truncated、stoppedReason 与 scannedOffset，分页不推进（仍声明有行却返回空页）按 fail-closed 报错。**不足或为空都不能推断不存在或缺组**：最近一页无匹配只代表该有界范围未找到。使用 Magpie 实际字段 req/served/in/out/t/status/ms/stop；无 done 字段不机械判为失败。完成态需成功状态、正耗时和结束标志，仍不代表端到端UI成功。`accountRef` 由行的 provider + providerAccount/providerKeyId 派生为 `mgp…` 哈希；可派生时 `accountBinding` **等于同一 accountRef**，无法派生时保持 `unknown`，绝不借用同供应商其他账号。route 除 present/configurationModified 外，若远端只读 `models` 条目提供 revision/digest/max_output_tokens/expires_at 则如实透出；servedModel 取扫描范围内首个 group/work 匹配行，sampledAt 取该行的上游 `t`；取不到的字段返回结构化 null 并在 `route.gaps` 说明，`coverage.routeFieldsComplete` 标明是否齐全——**不用本机时钟或本地配置补造**。价目读取 catalog prompt/completion 字符串；缺失保持 null（不写 0），已核零价与未受审授权区分，reviewed 恒 false。
 
 此回执只是观测，不是新供应商授权证书。不得把它改字段伪装为 v4 文档，或用来自动 prepare/prove/deliver/enable；不授予任何预算。产品实际配置需与 `ops_request GET /api/ops/internal-ai/runtime`、产品 run/requestId 对应核验。剩余30次预算用尽是独立事实，不能通过更换任务、组、身份或周期重领；只读观测不消耗模型次数。
 
