@@ -1,4 +1,5 @@
 import type { Surreal } from 'surrealdb';
+import { RULE_ENGINE } from './vendor/src/model-routing/rules.ts';
 import { rankingSettings, rankingRequests, rankingTables, type RankingGates, type RankingAttempt, type RankingResultSnapshot } from './vendor/src/model-routing/ranking.ts';
 import { readMagpieGroups } from './vendor/src/model-routing/controller.ts';
 
@@ -9,7 +10,7 @@ export async function modelRankingView(db: Surreal) {
   const [status]=await db.query<[{at?:Date;error?:string;results?:Record<string,RankingResultSnapshot>;orders?:Record<string,string[]>;pins?:Record<string,string[]>;gates?:RankingGates;attempts?:Record<string,RankingAttempt>}|undefined]>(
     'SELECT at,error,orders,results,pins,gates,attempts FROM ONLY company_meta:model_ranking;');
   const requests=await rankingRequests(db);
-  return {...settings,requests,attempts:{},tables:rankingTables(readMagpieGroups(),status?.results,requests,status?.pins,status?.gates),configured:true,engine:'quality-pace-v5',
+  return {...settings,requests,attempts:{},tables:rankingTables(readMagpieGroups(),status?.results,requests,status?.pins,status?.gates),configured:true,engine:RULE_ENGINE,
     at:status?.at?String(status.at):undefined,error:status?.error,orders:status?.orders??{}};
 }
 

@@ -1,5 +1,5 @@
 import {routingDesignCss} from '../shared/model-routing-design.ts';
-import {ROUTING_DEFAULTS,ROUTING_WEIGHTS,ROUTING_FORMULA,ROUTING_COST_HELP,routingNumber,routingMetrics,routingTrends} from '../shared/model-routing-view.ts';
+import {ROUTING_DEFAULTS,ROUTING_WEIGHTS,ROUTING_FORMULA,ROUTING_COST_HELP,routingNumber,routingMetrics,routingTrends,routingCalculation} from '../shared/model-routing-view.ts';
 import {rankingTrendDetail} from '../shared/ranking-trends.ts';
 import {relayShellCss,relayIcon} from '../shared/relay-shell.ts';
 /** Review-console counterpart of the same owner model management surface. */
@@ -31,7 +31,7 @@ const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;
 const copy=value=>JSON.parse(JSON.stringify(value));
 const defaults=${JSON.stringify(ROUTING_DEFAULTS)},weightLabels=${JSON.stringify(ROUTING_WEIGHTS)};
 const formula=${JSON.stringify(ROUTING_FORMULA)},costHelp=${JSON.stringify(ROUTING_COST_HELP)};
-const routingNumber=${routingNumber.toString()},routingMetrics=${routingMetrics.toString()},routingTrends=${routingTrends.toString()};
+const routingNumber=${routingNumber.toString()},routingMetrics=${routingMetrics.toString()},routingTrends=${routingTrends.toString()},routingCalculation=${routingCalculation.toString()};
 const trendDetail=${rankingTrendDetail.toString()};
 const groups=['sck-haiku','sck-sonnet','sck-opus','sck-fable'],groupLabel=g=>g.replace('sck-','').replace(/^./,x=>x.toUpperCase());
 let state,policy,preview,dirty=false,previewReady=false,previewTimer,previewSeq=0,mode='ranking',group='sck-haiku',search='',expanded='',shown=12,busy=false,catalog,catalogOffset=0,catalogExpanded='',catalogSeq=0,searchTimer;
@@ -56,7 +56,7 @@ function rowHtml(row,index){
  const actualRank=(currentTable()?.rows.findIndex(r=>r.model===row.model)??index)+1;
  const parts=row.model.replace(/^remote-magpie\\//,'').split('/'),name=parts.pop(),open=expanded===row.model,f=row.decision?.factors;
  const detail=open?'<div class="score-details"><code>'+esc(row.model)+'</code><p class="model-note">'+esc(row.decision?.reason??'本组手动维护，尚无自动评分')+'</p><div class="metric-grid">'+routingMetrics(row).map(([title,value,note])=>'<div><small>'+esc(title)+'</small><strong>'+esc(value)+'</strong><small>'+esc(note)+'</small></div>').join('')+'</div>'+
- (f?'<p class="factor-line">计算：'+[f.base,f.latency,f.availability,f.reliability,f.urgency].map(v=>routingNumber(v,3)).join(' × ')+' + '+routingNumber(f.exploration,2)+' = '+routingNumber(row.decision.score,2)+(row.decision.tail?'（不可用模型记0）':'')+'</p>':'')+
+ (f?'<p class="factor-line">'+esc(routingCalculation(row))+'</p>':'')+
  Object.entries(row.decision?.contributions??{}).map(([key,v])=>'<div class="factor-line">'+esc(weightLabels[key])+'：原始分 '+routingNumber(v.value===undefined?undefined:v.value*100)+' / 100 · 权重 '+v.weight+' · 乘数 '+routingNumber(v.factor,3)+'</div>').join('')+
  routingTrends(row).map(([title,trend])=>'<p class="factor-line">'+esc(title)+'：'+esc(trendDetail(trend))+'</p>').join('')+'<div class="row-actions">'+(['sck-haiku','sck-sonnet'].includes(group)?'<button class="small-button" data-pin="'+index+'" '+(dirty||busy?'disabled':'')+'>'+(row.pinned?'取消置顶':'置顶模型')+'</button>':'')+'<button class="small-button" data-manage="'+index+'">管理此模型</button></div><div class="row-actions">'+Object.entries({auto:'自动计费',free:'免费',included:'订阅/积分',unknown:'未知',paid:'额外付费'}).map(([key,title])=>'<button class="small-button" data-billing="'+key+'" data-billing-row="'+index+'">'+((policy.billingOverrides[row.model]??'auto')===key?'✓ ':'')+title+'</button>').join('')+'</div></div>':'';
  return '<article class="model-row '+(open?'open':'')+'"><button class="model-main" aria-expanded="'+open+'" data-expand="'+index+'"><b class="rank">#'+actualRank+'</b><span class="model-id"><strong>'+esc(name)+'</strong><small>'+esc(parts.join('/'))+(row.pinned?' · 手动置顶':'')+'</small></span><span class="model-stat"><small>智能分</small><strong>'+routingNumber(row.aaScore)+'</strong></span><span class="model-stat speed"><small>速度</small><strong>'+routingNumber(row.tokensPerSecond,0)+' tok/s</strong></span><span class="model-stat quota"><small>首 token</small><strong>'+routingNumber(row.ttftMs===undefined?undefined:row.ttftMs/1000)+'s</strong></span><span class="jev"><small>总分</small><strong>'+routingNumber(row.decision?.score)+'</strong></span><span class="expand">'+(open?'−':'+')+'</span></button>'+detail+'</article>';
