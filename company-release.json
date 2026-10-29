@@ -1,17 +1,17 @@
 {
- "version": "0.3.47",
- "title": "FV06 远端候选窗口绑定上线（approval candidate 登记）",
- "changes": [
-  "安装载体：为已获上线批准的 FV06 窗口绑定（0.3.46，007b7b3）提供 0.3.47 安装卡，无源码改动。",
-  "ops_magpie_window_prepare 在远端候选判定 eligible 时，把该候选登记为 approvalTask 的 approval candidate：digest=configurationDigest、evidence_expires_at=expiry.expiresAt、author 取 broker 受信作者，type 标为 remote-magpie-evidence/1 并记录 source_path。",
-  "同一任务只有一行当前候选；重新观测产生新 digest 后重做准备会在事务内删除旧行并写入新行，ops 审计记录被替换的 digest，旧 digest 无法再绑定。",
-  "core 的 validateExecutionWindow 与 resume 事务对远端行沿用与 v2 行完全相同的判定，未放宽；附带新增 internal_ai_candidate 的 type/source_path 两个可选字段。"
- ],
- "impact": [
-  "公司控制面改动：只在候选 eligible 时写一行 approval candidate，并新增两个可选字段；不调模型、不改供应商或连接、不扩大观测上限、不授予预算。",
-  "闭锁属性不变：未 eligible 不登记；作者自批、篡改 digest/author、缺价目仍闭锁；resume 仍要求 approvalTask done、同一 goal、是依赖、digest 与 expiry 完全相等、窗口未过期。",
-  "进程重启后已登记的行仍可绑定到其有效期；broker 内观测与批准丢失，需重新观测生成新候选。"
- ],
- "migration": "只新增结构：schema 046 为 internal_ai_candidate 增加 type 与 source_path 两个 option<string> 字段；不改写或删除已有数据，既有 v2 候选行不受影响。代码内容与 main 的 0.3.46（007b7b3）完全一致，本版本仅提升版本号以取得本次上线安装卡。",
- "rollback": "恢复上一健康 main 发布；新字段与新登记行可保留（旧版本忽略），如需清理只删除 type=remote-magpie-evidence/1 的行。"
+  "version": "0.3.48",
+  "title": "FV06 窗口登记租约放行第二阶段目标",
+  "changes": [
+    "ops_magpie_window_prepare 的远端候选登记改用 remoteLease：沿用 v2 租约的全部检查（持有人、doing/review、租约未过期、员工未撤销、角色 engineering/product/qa、项目 surreal_ck 且与 scope 同），目标改为允许名单。",
+    "允许名单 REMOTE_CANDIDATE_GOALS 只含阶段一目标 2e2a6e41c1193595 与第二阶段目标 e159e40ad4e50080，是常量，不放开成任意目标。",
+    "内部 AI proof 链（ops_internal_ai_prepare/prove/deliver、v2 manifest 路径）保持 lease() 只认阶段一目标，未改动。",
+    "registerRemoteCandidate 的登记后重核改为 remoteLeaseValid；resume 的 validateExecutionWindow 仍只要求 approvalTask 与被恢复任务同属一个目标。"
+  ],
+  "impact": [
+    "修复第二阶段目标下 eligible 远端候选一律 forbidden: company approval or live lease unavailable、无法登记也无法绑定 502ed504 窗口的缺陷。",
+    "安全边界不变：非持有人、过期租约、未 eligible 仍不登记；其他目标仍被拒；作者自批、篡改 digest/author、缺价目仍闭锁。",
+    "公司控制面改动；不调模型、不改供应商或连接、不扩大观测上限、不授予预算、无 schema 或 secret 变更。"
+  ],
+  "migration": "无 schema 和 secret 变更。",
+  "rollback": "恢复上一健康 main 发布（0.3.47）；本次只改租约校验与常量，登记行结构不变，回退无需清理数据。"
 }

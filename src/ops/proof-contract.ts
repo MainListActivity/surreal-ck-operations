@@ -3,6 +3,10 @@ import { z } from 'zod';
 export const PROOF_ISSUER = 'urn:surreal-ck:company:internal-ai:v1';
 export const PROOF_AUDIENCE = 'urn:surreal-ck:surreal_ck:production:internal-ai:v1';
 export const PROOF_GOAL = '2e2a6e41c1193595';
+/** 第二阶段目标：远端候选窗口绑定只对这两个目标放行；内部 AI proof 链仍只认 PROOF_GOAL。 */
+export const REMOTE_CANDIDATE_GOALS = [PROOF_GOAL, 'e159e40ad4e50080'] as const;
+export const isRemoteCandidateGoal = (goalId: unknown): boolean =>
+  typeof goalId === 'string' && (REMOTE_CANDIDATE_GOALS as readonly string[]).includes(goalId);
 export const APPROVAL_MARKER = 'company-internal-ai-approve:v1:';
 /** 供应商账户计划类型读回常量：reviewed-token-plan 文档只接受 FREE，非 FREE 值不过校验。 */
 export const TOKEN_PLAN_PLAN_TYPE_FREE = "TOKEN_PLAN_PLAN_TYPE_FREE";

@@ -1863,7 +1863,8 @@ export class OpsBroker {
       // the broker itself verified (digest, expiry, trusted author); this tool never decides the resume.
       let registration: { status: 'registered' | 'unchanged' | 'replaced'; digest: string; replacedDigest?: string } | undefined;
       if (result.eligible && this.deps.proofStore) {
-        const lease = await this.deps.proofStore.lease(ctx.scope);
+        // The registration lease allows the phase-1 and phase-2 goals; the internal AI proof chain still uses lease().
+        const lease = await this.deps.proofStore.remoteLease(ctx.scope);
         const stored = await this.deps.proofStore.registerRemoteCandidate(lease, {
           taskId: approvalTask, digest: parsed.data.configurationDigest, evidenceExpiresAt: parsed.data.expiry.expiresAt,
           author: parsed.data.author, env: ctx.env, sourcePath: resolve(text(args, 'candidatePath', 1024)), candidateHash,

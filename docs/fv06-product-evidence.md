@@ -72,5 +72,6 @@ observationSnapshot 单独记录本次读取的哈希、采集时刻和本地2�
 - **替换语义**：`internal_ai_candidate` 对 `task` 唯一，一个任务只有一行当前候选。重新观测产生新 digest 后再次 prepare，会在一笔事务里删除旧行并写入新行（`digest`/`evidence_expires_at` 是 READONLY 字段，不能原地改写，故用删除+插入）。ops 审计条目记录 `candidate=replaced:<新 digest 前 16 位> replaced=<旧 digest 前 16 位>`。旧 digest 不会被续期：仍用旧 digest 组窗口会被 resume 的 digest 校验拒绝。
 - **resume 校验不变**：`validateExecutionWindow` 与 resume 事务对远端行的判定与 v2 行完全一致——approvalTask 为 `done`、与被恢复任务同一 goal、是被恢复任务的依赖、候选 digest 与 `evidenceExpiresAt` 完全相等、窗口未过期。未放宽任何一项，也没有为远端行加特例。
 - 登记只发生在 eligible 时，来源是 broker 自己核对过的观测、受信作者与独立批准；`ops_magpie_window_prepare` 不决定窗口，也不启用执行。
+- **目标范围**：登记用的租约校验沿用 v2 链的全部条件（当前持有人、doing/review、租约未过期、员工未撤销、角色 engineering/product/qa、项目 surreal_ck 且与调用方 scope 同），但目标只对允许名单放行——阶段一目标 `2e2a6e41c1193595` 与第二阶段目标 `e159e40ad4e50080`（`REMOTE_CANDIDATE_GOALS`，常量，不放开成任意目标）。内部 AI proof 链（`ops_internal_ai_prepare`/`prove`/`deliver`、v2 manifest 路径）仍只认阶段一目标；resume 的 `validateExecutionWindow` 只要求 approvalTask 与被恢复任务同属一个目标（不写死目标），因此第二阶段目标可用。
 - 进程重启后，已登记的行仍在数据库里，可继续被 resume 绑定到其 `evidence_expires_at`；但 broker 内保存的观测与批准会丢失，重新 prepare 前不能产生新的 eligible 候选。被替换或过期的旧行不能再绑定。
 

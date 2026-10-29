@@ -2,7 +2,7 @@ import { windowExpired, type ExecutionWindow } from '../task-recovery.ts';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { OpsScope, Role } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
-import { PROOF_GOAL, APPROVAL_MARKER } from './proof-contract.ts';
+import { PROOF_GOAL, APPROVAL_MARKER, isRemoteCandidateGoal } from './proof-contract.ts';
 import { emptyChecks, mark, normalRetirement, type DiagnosticCheck, type CheckResult, type ReviewerLifecycle } from './approval-diagnosis.ts';
 import type { ProofFiles } from './proof-files.ts';
 export type LeaseStamp = { taskId: string; employee: string; delivery: string; fence: number; goal: string; project: string; role: Role };
@@ -18,11 +18,23 @@ const denied = () => new CompanyError('forbidden', 'company approval or live lea
 export class CompanyProofStore {
   constructor(private readonly db: Surreal, private readonly now: () => number = Date.now) {}
   async lease(scope: OpsScope): Promise<LeaseStamp> {
+    return this.leaseFor(scope, goal => goal === PROOF_GOAL);
+  }
+  /**
+   * 远端候选窗口绑定登记的租约：沿用 lease() 的全部检查（当前持有人、doing/review、租约未过期、员工未撤销、
+   * 角色 engineering/product/qa、项目 surreal_ck 且与 scope 同），目标改为允许名单（PROOF_GOAL 与第二阶段目标）。
+   * 内部 AI proof 链（prepare/prove/deliver、v2 manifest）仍只走 lease()，目标唯一为 PROOF_GOAL。
+   */
+  async remoteLease(scope: OpsScope): Promise<LeaseStamp> {
+    return this.leaseFor(scope, isRemoteCandidateGoal);
+  }
+  private async leaseFor(scope: OpsScope, goalAllowed: (goalId: string | undefined) => boolean): Promise<LeaseStamp> {
     const [rows] = await this.db.query<[Array<{ current_employee: string; delivery_id: string; fence: number; lease_expires_at: number; state: string; goal: RecordId; project: RecordId; revoked: boolean; retired: boolean; role: string }>]>(
       'SELECT current_employee, delivery_id, fence, lease_expires_at, state, goal, goal.project AS project, type::record("employee", current_employee).revoked AS revoked, type::record("employee", current_employee).retired AS retired, type::record("employee", current_employee).role AS role FROM $task;', { task: new RecordId('task', scope.taskId) });
     const r = rows[0];
-    if (!r || r.current_employee !== scope.actor.employeeId || !['doing', 'review'].includes(r.state) || r.lease_expires_at <= this.now() / 1000 || r.revoked || r.retired || !['engineering', 'product', 'qa'].includes(r.role) || String(r.goal?.id) !== PROOF_GOAL || String(r.project?.id) !== scope.project || scope.project !== 'surreal_ck') throw denied();
-    return { taskId: scope.taskId, employee: r.current_employee, delivery: r.delivery_id, fence: r.fence, goal: PROOF_GOAL, project: scope.project, role: r.role as Role };
+    const goalId = r && r.goal ? String(r.goal.id) : undefined;
+    if (!r || r.current_employee !== scope.actor.employeeId || !['doing', 'review'].includes(r.state) || r.lease_expires_at <= this.now() / 1000 || r.revoked || r.retired || !['engineering', 'product', 'qa'].includes(r.role) || !goalAllowed(goalId) || String(r.project?.id) !== scope.project || scope.project !== 'surreal_ck') throw denied();
+    return { taskId: scope.taskId, employee: r.current_employee, delivery: r.delivery_id, fence: r.fence, goal: goalId!, project: scope.project, role: r.role as Role };
   }
   async assertExecutionWindow(taskId: string, approvalTask?: string, files?: ProofFiles): Promise<void> {
     const [row] = await this.db.query<[{ execution_window?: ExecutionWindow } | undefined]>(
@@ -39,6 +51,16 @@ export class CompanyProofStore {
       return current.delivery === stamp.delivery && current.fence === stamp.fence && current.role === stamp.role;
     } catch { return false; }
   }
+  /**
+   * 与 leaseValid 相同的重核，但走远端候选允许名单：登记行之后仍要确认持有人、围栏与角色未变，
+   * 且任务目标仍在允许名单内。v2 链的 leaseValid 不受影响。
+   */
+  async remoteLeaseValid(stamp: LeaseStamp): Promise<boolean> {
+    try {
+      const current = await this.remoteLease({ taskId: stamp.taskId, project: stamp.project, actor: { employeeId: stamp.employee, role: stamp.role, capabilities: [] } });
+      return current.delivery === stamp.delivery && current.fence === stamp.fence && current.role === stamp.role;
+    } catch { return false; }
+  }
   async prepare(lease: LeaseStamp, env: string, files: ProofFiles): Promise<void> {
     const row: Candidate = { evidence_expires_at: files.evidence.expiresAt, task: new RecordId('task', lease.taskId), digest: files.manifest.configurationDigest, manifest_hash: files.manifestHash, document_hash: files.documentHash, manifest_path: files.manifestPath, document_path: files.documentPath, author: lease.employee, env };
     await this.db.query('INSERT INTO internal_ai_candidate $row ON DUPLICATE KEY UPDATE digest = $input.digest;', { row });
@@ -52,7 +74,7 @@ export class CompanyProofStore {
    * place and never extends its expiry; the caller audits the replaced digest. Nothing here decides a window.
    */
   async registerRemoteCandidate(lease: LeaseStamp, input: RemoteCandidateInput): Promise<{ created: boolean; replacedDigest?: string }> {
-    if (!await this.leaseValid(lease)) throw denied();
+    if (!await this.remoteLeaseValid(lease)) throw denied();
     const task = new RecordId('task', input.taskId);
     if (!await this.db.select(task)) throw new CompanyError('not_found', 'approval task not found');
     const row: Candidate = {
