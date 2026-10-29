@@ -34,7 +34,8 @@ function remoteFetch(now: number) {
 
 // The broker keeps the observation it read in process memory, and the window trusts only that copy. Every
 // actor in one test therefore shares a single broker and home, and only the leased employee changes.
-function rig(opts: { employee?: string; approvals?: unknown; home?: string; now?: () => number; shared?: ReturnType<typeof rig> } = {}) {
+interface Rig { world: FakeWorld; company: FakeCompany; broker: OpsBroker; home: string; token: string }
+function rig(opts: { employee?: string; approvals?: unknown; home?: string; now?: () => number; shared?: Rig } = {}): Rig {
   if (opts.shared) {
     const token = opts.shared.company.lease(opts.employee ?? 'qa-1', 'qa', TASK, 'surreal_ck');
     return { ...opts.shared, token };
