@@ -1,4 +1,6 @@
-# FV06 Magpie 受控路由快照契约 v4（实现冻结）
+# FV06 Magpie 受控路由快照契约 v4（历史本机契约）
+
+> 2026-10-29更正：此契约采样源为Mac本机订阅网关，不能用于证明VPS上已经配置的产品remote-magpie路由。生产surreal_ck入口现拒绝误用，并提供只读产品观测；不要求创建本机work组或绑定个人Claude。参见 [产品证据来源](./fv06-product-evidence.md)。以下v4字段保留历史语义，不能将新观测伪装成v4授权。
 
 本链代码范围仍是公司运维程序（operations），业务 opsScope=`surreal_ck`；制度只读，实现不合入、不部署、不启用。旧的直连 SenseNova v3 证据契约（`sensenova-token-plan/3`、`reviewed-token-plan` schemaVersion 2/3）逐字保留，**不得**通过改 manifest 字段把 Magpie 路径伪装成旧供应商路径：Magpie 的 host、servedModel、账号归属与本机网关都不同，因此新增独立版本，而不是复用 v1/v3 字段。
 

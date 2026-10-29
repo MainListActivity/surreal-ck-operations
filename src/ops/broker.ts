@@ -1,3 +1,4 @@
+import {assertLocalMagpieScope,observeProductMagpie,PRODUCT_MAGPIE_MODEL,ProductGatewaySourceMismatch} from './product-magpie.ts';
 // Ops capability broker. Employees never hold credentials: they ask for an operation by name,
 // this trusted code (running inside the Paseo plugin, next to the sealed secrets and the
 // Cloudflare token) performs it, and only a secret-free result goes back. Every call is gated
@@ -68,7 +69,7 @@ export const OPS_TOOLS = [
   'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_principal_list', 'ops_idp_admin_request',
   'ops_idp_provision_rotate', 'ops_invitation_issue',
   'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_approval_diagnose', 'ops_internal_ai_deliver', 'ops_internal_ai_revoke', 'ops_internal_ai_trust', 'ops_internal_ai_rotate_key',
-  'ops_supplier_plan_sample', 'ops_magpie_route_sample', 'ops_magpie_route_restore', 'ops_magpie_window_prepare', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs',
+  'ops_supplier_plan_sample', 'ops_product_magpie_observe', 'ops_magpie_route_sample', 'ops_magpie_route_restore', 'ops_magpie_window_prepare', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
 
@@ -97,6 +98,7 @@ export interface OpsDeps {
    * loopback gateway (MAGPIE_ADDR / stash / default); tests inject the fake gateway and config.
    */
   magpie?: {
+    readProductProvider?: () => unknown;
     base?: string;
     endpointSource?: 'env' | 'stash' | 'default' | 'injected';
     readProviders?: () => Promise<string>;
@@ -372,6 +374,7 @@ export class OpsBroker {
       ops_idp_provision_rotate: (ctx, args) => this.idpProvisionRotate(ctx, args),
       ops_invitation_issue: (ctx, args) => this.invitationIssue(ctx, args),
       ops_supplier_plan_sample: (ctx, args) => this.supplierPlanSample(ctx, args),
+      ops_product_magpie_observe: (ctx,args) => this.productMagpieObserve(ctx,args),
       ops_magpie_route_sample: (ctx, args) => this.magpieRouteSample(ctx, args),
       ops_magpie_route_restore: (ctx, args) => this.magpieRouteRestore(ctx, args),
       ops_magpie_window_prepare: (ctx, args) => this.magpieWindowPrepare(ctx, args),
@@ -537,7 +540,7 @@ export class OpsBroker {
     const known = this.sessions.secrets(ctx.scope.actor.employeeId);
     const base = error instanceof CompanyError ? error
       : new CompanyError('upstream_error', `${(error as Error)?.name ?? 'Error'}: ${String((error as Error)?.message ?? error).slice(0, 200)}`);
-    const safe = new CompanyError(base.code, redactText(base.message, known), base.retryable);
+    const safe = new CompanyError(base.code, redactText(base.message, known), base.retryable, base instanceof ProductGatewaySourceMismatch?base.details:undefined);
     // A call the budget refused never ran: it is the budget's answer, not a new failure of the upstream, and it
     // costs no budget.
     if (error instanceof BudgetRefusal) return safe;
@@ -653,7 +656,9 @@ export class OpsBroker {
           provider: SUPPLIER_PROVIDER, adapter: SUPPLIER_ADAPTER, service: SUPPLIER_SERVICE,
           aliases: [...supplierKinds.entries()].map(([alias, kinds]) => ({ alias, credentials: [...kinds].sort() })),
         },
+        productMagpieObservation:{tool:'ops_product_magpie_observe',model:PRODUCT_MAGPIE_MODEL,source:'configured-remote-magpie',readOnly:true,executable:false,configurationChangeRequired:false,disclosure:'产品在VPS的loopback与Mac的loopback不同；禁止将个人订阅或本机组作为产品恢复前置。'},
         magpieRouteSampling: {
+          applicable:ctx.scope.project!=='surreal_ck'||ctx.env!=='production',source:'mac-local-subscription',
           provider: MAGPIE_PROVIDER, adapter: MAGPIE_ADAPTER, group: 'group/work',
           snapshotMaxAgeSeconds: MAGPIE_SNAPSHOT_MAX_AGE_SECONDS, executionHeadroomSeconds: MAGPIE_EXECUTION_HEADROOM_SECONDS,
           aliases: [...supplierKinds.entries()]
@@ -667,6 +672,7 @@ export class OpsBroker {
         },
         magpieRouteRestore: {
           provider: MAGPIE_PROVIDER, adapter: MAGPIE_ADAPTER, group: 'group/work',
+          applicable:ctx.scope.project!=='surreal_ck'||ctx.env!=='production',source:'mac-local-subscription',
           modes: ['plan'], writeAvailable: false, gatewayReload: 'unknown', recovery: 'unavailable',
           disclosures: [
             'only the read-only plan is published; apply is refused in every role with zero writes',
@@ -1659,7 +1665,15 @@ export class OpsBroker {
    * receipt. It never calls a model, never reads a credential value out of this process, never
    * writes to Magpie, and answers `blocked` with structured gaps for every missing fact.
    */
+  private async productMagpieObserve(ctx:Ctx,args:Args):Promise<Outcome>{
+    if(ctx.scope.project!=='surreal_ck'||ctx.env!=='production')throw new CompanyError('forbidden','此入口只观测 surreal_ck 现役产品的 remote-magpie 连接');
+    if(Object.keys(args).some(key=>key!=='env'))throw invalid('ops_product_magpie_observe 只接受 env，不接受地址、账号、模型或凭证覆盖');
+    const value=await observeProductMagpie({readProvider:this.deps.magpie?.readProductProvider,fetch:this.deps.fetch,now:this.now});
+    return {value,audit:{action:'ops_call',evidence:`ops_product_magpie_observe source=configured-remote-magpie model=${PRODUCT_MAGPIE_MODEL} routePresent=${value.route.present} rows=${value.coverage.matchingRows} executable=false`}};
+  }
+
   private async magpieRouteSample(ctx: Ctx, args: Args): Promise<Outcome> {
+    assertLocalMagpieScope(ctx.scope.project,ctx.env);
     const allowed = new Set(['env', 'alias', 'purpose']);
     const extra = Object.keys(args).filter(key => !allowed.has(key));
     if (extra.length) throw invalid(`ops_magpie_route_sample accepts only alias and purpose (rejected: ${extra.join(', ')})`);
@@ -1695,6 +1709,7 @@ export class OpsBroker {
    * secret, or falls back to a local model call.
    */
   private async magpieRouteRestore(ctx: Ctx, args: Args): Promise<Outcome> {
+    assertLocalMagpieScope(ctx.scope.project,ctx.env);
     const mode = text(args, 'mode', 10);
     const planOnly = new Set(['mode', 'env', 'alias', 'purpose']);
     // The apply parameters stay allowlisted so a malformed apply request is still answered with a
