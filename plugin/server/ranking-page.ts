@@ -1,5 +1,5 @@
 import {routingDesignCss} from '../shared/model-routing-design.ts';
-import {ROUTING_DEFAULTS,ROUTING_WEIGHTS,ROUTING_FORMULA,ROUTING_COST_HELP,routingNumber,routingMetrics} from '../shared/model-routing-view.ts';
+import {ROUTING_DEFAULTS,ROUTING_WEIGHTS,ROUTING_FORMULA,ROUTING_COST_HELP,routingNumber,routingMetrics,routingTrends} from '../shared/model-routing-view.ts';
 import {rankingTrendDetail} from '../shared/ranking-trends.ts';
 import {relayShellCss,relayIcon} from '../shared/relay-shell.ts';
 /** Review-console counterpart of the same owner model management surface. */
@@ -31,10 +31,10 @@ const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;
 const copy=value=>JSON.parse(JSON.stringify(value));
 const defaults=${JSON.stringify(ROUTING_DEFAULTS)},weightLabels=${JSON.stringify(ROUTING_WEIGHTS)};
 const formula=${JSON.stringify(ROUTING_FORMULA)},costHelp=${JSON.stringify(ROUTING_COST_HELP)};
-const routingNumber=${routingNumber.toString()},routingMetrics=${routingMetrics.toString()};
+const routingNumber=${routingNumber.toString()},routingMetrics=${routingMetrics.toString()},routingTrends=${routingTrends.toString()};
 const trendDetail=${rankingTrendDetail.toString()};
 const groups=['sck-haiku','sck-sonnet','sck-opus','sck-fable'],groupLabel=g=>g.replace('sck-','').replace(/^./,x=>x.toUpperCase());
-let state,policy,preview,dirty=false,previewReady=false,previewTimer,previewSeq=0,mode='ranking',group='sck-haiku',search='',expanded='',shown=12,busy=false,catalog,catalogOffset=0,catalogExpanded='',catalogSeq=0,searchTimer;
+let state,policy,preview,dirty=false,previewReady=false,previewTimer,previewSeq=0,mode='ranking',group='sck-haiku',search='',expanded='',shown=12,busy=false,catalog,catalogOffset=0,catalogExpanded='',catalogSeq=0,searchTimer,refreshDirty=false;
 const api=async(path,body)=>{const r=await fetch('api/'+path,body===undefined?{cache:'no-store'}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();if(!r.ok)throw Error(j.error||'请求失败');return j;};
 function setTheme(theme){document.documentElement.dataset.theme=theme;try{localStorage.setItem('relay-theme',theme)}catch{}}
 try{const theme=localStorage.getItem('relay-theme');if(theme)setTheme(theme)}catch{}
@@ -58,7 +58,7 @@ function rowHtml(row,index){
  const detail=open?'<div class="score-details"><code>'+esc(row.model)+'</code><p class="model-note">'+esc(row.decision?.reason??'本组手动维护，尚无自动评分')+'</p><div class="metric-grid">'+routingMetrics(row).map(([title,value,note])=>'<div><small>'+esc(title)+'</small><strong>'+esc(value)+'</strong><small>'+esc(note)+'</small></div>').join('')+'</div>'+
  (f?'<p class="factor-line">计算：'+[f.base,f.latency,f.availability,f.reliability,f.urgency].map(v=>routingNumber(v,3)).join(' × ')+' + '+routingNumber(f.exploration,2)+' = '+routingNumber(row.decision.score,2)+(row.decision.tail?'（不可用模型记0）':'')+'</p>':'')+
  Object.entries(row.decision?.contributions??{}).map(([key,v])=>'<div class="factor-line">'+esc(weightLabels[key])+'：原始分 '+routingNumber(v.value===undefined?undefined:v.value*100)+' / 100 · 权重 '+v.weight+' · 乘数 '+routingNumber(v.factor,3)+'</div>').join('')+
- '<p class="factor-line">首 token 趋势：'+esc(trendDetail(row.trends?.ttftMs))+'</p><div class="row-actions">'+(['sck-haiku','sck-sonnet'].includes(group)?'<button class="small-button" data-pin="'+index+'" '+(dirty||busy?'disabled':'')+'>'+(row.pinned?'取消置顶':'置顶模型')+'</button>':'')+'<button class="small-button" data-manage="'+index+'">管理此模型</button></div><div class="row-actions">'+Object.entries({auto:'自动计费',free:'免费',included:'订阅/积分',unknown:'未知',paid:'额外付费'}).map(([key,title])=>'<button class="small-button" data-billing="'+key+'" data-billing-row="'+index+'">'+((policy.billingOverrides[row.model]??'auto')===key?'✓ ':'')+title+'</button>').join('')+'</div></div>':'';
+ routingTrends(row).map(([title,trend])=>'<p class="factor-line">'+esc(title)+'：'+esc(trendDetail(trend))+'</p>').join('')+'<div class="row-actions">'+(['sck-haiku','sck-sonnet'].includes(group)?'<button class="small-button" data-pin="'+index+'" '+(dirty||busy?'disabled':'')+'>'+(row.pinned?'取消置顶':'置顶模型')+'</button>':'')+'<button class="small-button" data-manage="'+index+'">管理此模型</button></div><div class="row-actions">'+Object.entries({auto:'自动计费',free:'免费',included:'订阅/积分',unknown:'未知',paid:'额外付费'}).map(([key,title])=>'<button class="small-button" data-billing="'+key+'" data-billing-row="'+index+'">'+((policy.billingOverrides[row.model]??'auto')===key?'✓ ':'')+title+'</button>').join('')+'</div></div>':'';
  return '<article class="model-row '+(open?'open':'')+'"><button class="model-main" aria-expanded="'+open+'" data-expand="'+index+'"><b class="rank">#'+actualRank+'</b><span class="model-id"><strong>'+esc(name)+'</strong><small>'+esc(parts.join('/'))+(row.pinned?' · 手动置顶':'')+'</small></span><span class="model-stat"><small>智能分</small><strong>'+routingNumber(row.aaScore)+'</strong></span><span class="model-stat speed"><small>速度</small><strong>'+routingNumber(row.tokensPerSecond,0)+' tok/s</strong></span><span class="model-stat quota"><small>首 token</small><strong>'+routingNumber(row.ttftMs===undefined?undefined:row.ttftMs/1000)+'s</strong></span><span class="jev"><small>总分</small><strong>'+routingNumber(row.decision?.score)+'</strong></span><span class="expand">'+(open?'−':'+')+'</span></button>'+detail+'</article>';
 }
 function draw(){
@@ -79,7 +79,7 @@ function draw(){
  if(table?.at)$('last-refresh').textContent=new Date(table.at).toLocaleString();
 }
 async function action(write,message){if(busy)return;busy=true;draw();$('message').textContent='保存中…';try{await write();$('message').textContent=message;await read();if(mode==='catalog')await loadCatalog();}catch(e){$('message').textContent=e.message;await read();if(mode==='catalog')await loadCatalog();}finally{busy=false;draw();}}
-async function read(){try{state=await api('model-ranking');if(!dirty){policy=copy(state.policy??defaults);editor();$('refresh').value=String(state.refreshMinutes??5);}$('updated').textContent=state.at?'最近更新 '+new Date(state.at).toLocaleTimeString():'等待首次刷新';$('error').textContent=state.error??'';if(mode==='ranking')draw();}catch(e){$('error').textContent=e.message;}}
+async function read(){try{state=await api('model-ranking');if(!dirty){policy=copy(state.policy??defaults);editor();if(!refreshDirty)$('refresh').value=String(state.refreshMinutes??5);}$('updated').textContent=state.at?'最近更新 '+new Date(state.at).toLocaleTimeString():'等待首次刷新';$('error').textContent=state.error??'';if(mode==='ranking')draw();}catch(e){$('error').textContent=e.message;}}
 async function loadCatalog(){const seq=++catalogSeq;$('summary').textContent='正在读取实时目录…';try{const result=await api('model-catalog?query='+encodeURIComponent(search)+'&offset='+catalogOffset);if(seq!==catalogSeq)return;catalog=result;draw();}catch(e){$('summary').textContent=e.message;}}
 function aaOptions(model,query=''){
  return '<option value="">选择对应的 AA 模型</option><option value="__none">不对应 AA</option>'+(catalog?.benchmarks??[]).filter(b=>(b.name+' '+b.slug).toLowerCase().includes(query.toLowerCase())).slice(0,100).map(b=>'<option value="'+esc(b.slug)+'" '+(model.slug===b.slug?'selected':'')+'>'+esc(b.name)+' · '+routingNumber(b.score)+'</option>').join('');
@@ -103,7 +103,7 @@ $('search').oninput=e=>{search=e.target.value;shown=12;clearTimeout(searchTimer)
 $('show-ranking').onclick=()=>{mode='ranking';draw();};$('show-catalog').onclick=()=>{mode='catalog';catalogOffset=0;loadCatalog();};
 $('default-weights').onclick=()=>{policy={...copy(defaults),billingOverrides:policy.billingOverrides};editor();changePolicy();};
 $('refresh-observations').onclick=()=>runPreview(true);
-$('refresh').onchange=()=>{$('save-rule').disabled=false;};
-$('save-rule').onclick=()=>action(async()=>{await api('model-ranking',{rules:state.rules,refreshMinutes:Number($('refresh').value),policy});dirty=false;previewReady=false;preview=undefined;$('save-rule').disabled=true;$('preview-status').textContent='已保存，下次请求到达时刷新排序。';},'排序设置已保存。');
+$('refresh').onchange=()=>{refreshDirty=true;$('save-rule').disabled=false;};
+$('save-rule').onclick=()=>action(async()=>{await api('model-ranking',{rules:state.rules,refreshMinutes:Number($('refresh').value),policy});dirty=false;refreshDirty=false;previewReady=false;preview=undefined;$('save-rule').disabled=true;$('preview-status').textContent='已保存，下次请求到达时刷新排序。';},'排序设置已保存。');
 read();setInterval(read,15000);
 </script></body></html>`;

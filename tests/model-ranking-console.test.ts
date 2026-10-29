@@ -84,3 +84,14 @@ test('model management shares owner token/origin protections and validates exact
  expect((await f.request('api/model-alias',{model:'p/a',slug:'aa-id'})).status).toBe(200);expect(f.aliases).toEqual([['p/a','aa-id']]);
  expect((await f.request('api/model-catalog?query=a&offset=40')).status).toBe(200);
 });
+
+test('polling preserves an unsaved refresh interval and saves the selected value',async()=>{
+ const nodes=new Map<string,any>();const node=(id:string)=>{if(!nodes.has(id))nodes.set(id,{value:'',dataset:{},classList:{toggle(){}},querySelectorAll:()=>[],disabled:true});return nodes.get(id);};
+ const writes:any[]=[];
+ const fetch=async(_url:string,options:any)=>{if(options?.body)writes.push(JSON.parse(options.body));return {ok:true,json:async()=>({tables:[],refreshMinutes:5})};};
+ const script=rankingPage.match(/<script>([\s\S]*?)<\/script>/)![1]!;
+ const page=new Function('document','localStorage','matchMedia','fetch','setInterval',script+';return {read};')({getElementById:node,documentElement:{dataset:{}}},{getItem:()=>null},()=>({matches:false}),fetch,()=>{});
+ await page.read();node('refresh').value='10';node('refresh').onchange();await page.read();
+ expect(node('refresh').value).toBe('10');expect(node('save-rule').disabled).toBe(false);
+ await node('save-rule').onclick();expect(writes[0].refreshMinutes).toBe(10);
+});

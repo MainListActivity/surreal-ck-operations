@@ -271,14 +271,18 @@ export class ModelRoutingController {
       if(live[input.group]&&!existing)throw Error('当前分组配置不可读，未覆盖设置');
       const changes=[{id:input.group,models:members,existing:existing??{id:input.group,name:input.group,routing:'order',affinity:GROUP_STAYS,levels:GROUP_LEVELS}}];
       const dir=join(this.home,'model-routing');await mkdir(dir,{recursive:true,mode:0o700});
-      const file=join(dir,'membership.json');let state:{version?:string;known?:string[]}={};
+      const file=join(dir,'membership.json');let state:{version?:string;known?:string[];manualRemovals?:Record<string,string[]>}={};
       try{state=JSON.parse(await readFile(file,'utf8'));}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
 
       if(!state||typeof state!=='object'||Array.isArray(state)||state.known!==undefined&&(!Array.isArray(state.known)||state.known.some(id=>typeof id!=='string'))||state.version!==undefined&&typeof state.version!=='string')throw Error('已知模型清单不可读，未修改分组');
+      if(state.manualRemovals!==undefined&&(!state.manualRemovals||typeof state.manualRemovals!=='object'||Array.isArray(state.manualRemovals)||Object.values(state.manualRemovals).some(v=>!Array.isArray(v)||v.some(g=>typeof g!=='string'))))throw Error('人工移除清单不可读，未修改分组');
+      const manualRemovals={...state.manualRemovals};
+      if(input.present){manualRemovals[base.id]=(manualRemovals[base.id]??[]).filter(g=>g!==input.group);if(!manualRemovals[base.id]!.length)delete manualRemovals[base.id];}
+      else if(!members.some(member=>splitMember(member).id===base.id))manualRemovals[base.id]=[...new Set([...(manualRemovals[base.id]??[]),input.group])];
       const inventory=await loadInventory(join(dir,'inventory.json'));
       const aliases=inventoryAliases(inventory,await loadAliases(join(dir,'aliases.json')));
       await (this.io.saveGroups??((groups:ManagedGroup[])=>saveMagpieGroups(this.cli,groups)))(changes);
-      await writeFile(file+'.tmp',JSON.stringify({...state,version:state.version??GROUPING_VERSION,known:[...new Set([...(state.known??[]),base.id])]}),{mode:0o600});await rename(file+'.tmp',file);
+      await writeFile(file+'.tmp',JSON.stringify({...state,manualRemovals,version:state.version??GROUPING_VERSION,known:[...new Set([...(state.known??[]),base.id])]}),{mode:0o600});await rename(file+'.tmp',file);
       const finalGroups={...live,[input.group]:members};
       reconcileInventory(inventory,catalog,finalGroups,aliases);
       await saveInventory(join(dir,'inventory.json'),inventory);
@@ -306,7 +310,7 @@ export class ModelRoutingController {
         try {
           const file = join(dir, "membership.json");
           const state = JSON.parse(await readFile(file, "utf8"));
-          state.known = (state.known ?? []).filter((id: string) => id !== model);
+          if (!state.manualRemovals?.[model]?.length) state.known = (state.known ?? []).filter((id: string) => id !== model);
           await writeFile(`${file}.tmp`, JSON.stringify(state), { mode: 0o600 });
           await rename(`${file}.tmp`, file);
         } catch {}
@@ -500,7 +504,7 @@ export class ModelRoutingController {
     const aa = this.io.command ? loadAa(join(dir0, "aa.json")) : await refreshAa(join(dir0, "aa.json"));
     if (aa?.admissionBlocked) throw Error("AA 最新 Luna Max 锚点缺失，暂停新增分组，保留现有配置");
     if (aa) useBenchmarks(aa.models);
-    let state: { version?: string; known?: string[] } = {};
+    let state: { version?: string; known?: string[]; manualRemovals?:Record<string,string[]> } = {};
     try {
       state = JSON.parse(await readFile(join(dir0, "membership.json"), "utf8"));
     } catch {}
@@ -548,7 +552,7 @@ export class ModelRoutingController {
     // Membership is the owner's. Automatic grouping runs once per GROUPING_VERSION and afterwards
     // only places models this controller has never seen; manual adds and removals in magpie stay.
     // The controller only reorders members by ranking.
-    const fresh = models.filter((m) => !known.has(m.id));
+    const fresh = models.filter((m) => !known.has(m.id)&&!state.manualRemovals?.[m.id]?.length);
     const byId = new Map(models.map((m) => [m.id, m]));
     const levelsOf = (member: string) => catalog.data.find((m) => m.id === splitMember(member).id)?.reasoning_levels;
     const holds = (list: string[], id: string) => list.some((x) => splitMember(x).id === id);
@@ -568,7 +572,7 @@ export class ModelRoutingController {
       const bucket = models.filter(m=>m.tier===tier);
       const current = live[`sck-${tier}`];
       const ids = initializing || !current
-        ? bucket.map((m) => m.member ?? m.id)
+        ? bucket.filter(m=>!state.manualRemovals?.[m.id]?.length).map((m) => m.member ?? m.id)
         : [...current.filter(member=>!generatedModel(member)).map(pinned), ...fresh.filter((m) => m.tier === tier && !holds(current, m.id)).map((m) => m.member ?? m.id)];
       if (!ids.length) {
         groups[`sck-${tier}`] = digest("[]");
@@ -642,7 +646,7 @@ export class ModelRoutingController {
       // (or a concurrent one) must not fail every later sync.
       else await this.command(['group','rm',id]).catch((e: Error) => { if (!/no group/.test(e.message)) throw e; });
     }
-    await writeFile(join(dir, "membership.json.tmp"), JSON.stringify({ version: GROUPING_VERSION, known: nextKnown }), { mode: 0o600 });
+    await writeFile(join(dir, "membership.json.tmp"), JSON.stringify({ ...state, version: GROUPING_VERSION, known: nextKnown }), { mode: 0o600 });
     await rename(join(dir, "membership.json.tmp"), join(dir, "membership.json"));
     await writeFile(join(dir, "groups.json.tmp"), JSON.stringify(groups), {
       mode: 0o600,

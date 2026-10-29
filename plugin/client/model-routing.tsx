@@ -5,7 +5,7 @@ import {useEffect,useState} from 'react';
 import {Pressable,Text,TextInput,View} from 'react-native';
 import * as rpc from '../shared/rpc';
 import type {ModelCatalogPage,ModelRankingPolicy,ModelRankingTable} from '../shared/types';
-import {ROUTING_WEIGHTS,ROUTING_DEFAULTS,ROUTING_FORMULA,ROUTING_COST_HELP,routingMetrics,routingNumber} from '../shared/model-routing-view';
+import {ROUTING_WEIGHTS,ROUTING_DEFAULTS,ROUTING_FORMULA,ROUTING_COST_HELP,routingMetrics,routingNumber,routingTrends} from '../shared/model-routing-view';
 import {rankingTrendDetail} from '../shared/ranking-trends';
 import {relayPalette} from './relay-theme';
 type Props={ctx:{theme:PluginSurfaceProps['theme'];compact:boolean}};
@@ -70,7 +70,7 @@ export function ModelRoutingPanel({ctx}:Props){
        <View style={{flexDirection:'row',flexWrap:'wrap',gap:10}}>{routingMetrics(row).map(([title,value,detail])=><View key={title} style={{width:mobile?'46%':'30%',gap:2}}><Text style={muted}>{title}</Text><Text selectable style={{...text,fontWeight:'600'}}>{value}</Text><Text style={muted}>{detail}</Text></View>)}</View>
        {f&&<Text selectable style={muted}>计算：{routingNumber(f.base,2)} × {routingNumber(f.latency,3)} × {routingNumber(f.availability,3)} × {routingNumber(f.reliability,3)} × {routingNumber(f.urgency,3)} + {routingNumber(f.exploration,2)} = {routingNumber(row.decision?.score,2)}{row.decision?.tail?'（不可用模型记0）':''}</Text>}
        <View style={{gap:3}}>{Object.entries(row.decision?.contributions??{}).map(([key,value])=><Text key={key} style={muted}>{ROUTING_WEIGHTS[key as keyof typeof ROUTING_WEIGHTS]}：原始分 {routingNumber(value.value===undefined?undefined:value.value*100)} / 100 · 权重 {value.weight} · 乘数 {routingNumber(value.factor,3)}</Text>)}</View>
-       <Text style={muted}>首 token 趋势：{rankingTrendDetail(row.trends?.ttftMs)}</Text>
+       {routingTrends(row).map(([title,trend])=><Text key={title} style={muted}>{title}：{rankingTrendDetail(trend)}</Text>)}
        <View style={{flexDirection:'row',flexWrap:'wrap',gap:7}}>{['sck-haiku','sck-sonnet'].includes(group)&&button(row.pinned?'取消置顶':'置顶模型',()=>void action(()=>pin({group:group as 'sck-haiku',model:row.model,pinned:!row.pinned}),'置顶已更新。'),!!row.pinned,dirty)}{button('管理此模型',()=>{setSearch(row.model.replace(/:(low|medium|high|xhigh|max)$/,''));setMode('catalog');})}</View>
        <View style={{flexDirection:'row',gap:5,flexWrap:'wrap'}}>{Object.entries({auto:'自动计费',free:'免费',included:'订阅/积分',unknown:'未知',paid:'额外付费'}).map(([kind,title])=><View key={kind}>{button(title,()=>{const overrides={...effective.billingOverrides};if(kind==='auto')delete overrides[row.model];else overrides[row.model]=kind as 'free';setPolicy({...effective,billingOverrides:overrides});},(effective.billingOverrides[row.model]??'auto')===kind)}</View>)}</View>
       </View>}

@@ -1,7 +1,7 @@
 import {expect,test} from 'bun:test';
 import {relayPalette} from '../plugin/client/relay-theme.ts';
 import {rankingTrendDetail} from '../plugin/shared/ranking-trends.ts';
-import {ROUTING_WEIGHTS,ROUTING_DEFAULTS,ROUTING_FORMULA,ROUTING_COST_HELP,routingMetrics,routingNumber} from '../plugin/shared/model-routing-view.ts';
+import {ROUTING_WEIGHTS,ROUTING_DEFAULTS,ROUTING_FORMULA,ROUTING_COST_HELP,routingMetrics,routingNumber,routingTrends} from '../plugin/shared/model-routing-view.ts';
 const page=await Bun.file(new URL('../plugin/client/model-routing.tsx',import.meta.url)).text();
 const source=page.slice(page.indexOf('const GROUPS')).replace('export function ModelRoutingPanel','function ModelRoutingPanel');
 const compiled=new Bun.Transpiler({loader:'tsx',tsconfig:{compilerOptions:{jsx:'react',jsxFactory:'React.createElement'}}}).transformSync(source+'\nreturn ModelRoutingPanel;');
@@ -10,7 +10,7 @@ function harness(ranking:any={tables:[],policy:ROUTING_DEFAULTS},catalog:any={mo
  const React={createElement:(type:any,props:any,...children:any[]):any=>typeof type==='function'?type({...props,children}):({type,props:props??{},children})};
  const useState=(initial:any)=>{const key=cursor++;if(!(key in states))states[key]=initial;return [states[key],(next:any)=>{states[key]=typeof next==='function'?next(states[key]):next;}];};
  const rpc={modelRanking:'get',previewModelRanking:'preview',saveModelRanking:'save',pinModelRanking:'pin',modelCatalog:'catalog',setModelMembership:'membership',setModelAlias:'alias'};
- const component=new Function('React','useState','useEffect','useRpc','useQuery','useQueryClient','rpc','relayPalette','ROUTING_WEIGHTS','ROUTING_DEFAULTS','ROUTING_FORMULA','ROUTING_COST_HELP','routingMetrics','routingNumber','rankingTrendDetail','View','Text','TextInput','Pressable',compiled)(React,useState,()=>{},(tool:string)=>async(input:unknown)=>{writes.push([tool,input]);return {};},(options:any)=>({data:options.queryKey[0]==='model-catalog'?catalog:ranking,isError:false,refetch:async()=>{}}),()=>({invalidateQueries:async()=>{}}),rpc,relayPalette,ROUTING_WEIGHTS,ROUTING_DEFAULTS,ROUTING_FORMULA,ROUTING_COST_HELP,routingMetrics,routingNumber,rankingTrendDetail,'View','Text','TextInput','Pressable');
+ const component=new Function('React','useState','useEffect','useRpc','useQuery','useQueryClient','rpc','relayPalette','ROUTING_WEIGHTS','ROUTING_DEFAULTS','ROUTING_FORMULA','ROUTING_COST_HELP','routingMetrics','routingNumber','routingTrends','rankingTrendDetail','View','Text','TextInput','Pressable',compiled)(React,useState,()=>{},(tool:string)=>async(input:unknown)=>{writes.push([tool,input]);return {};},(options:any)=>({data:options.queryKey[0]==='model-catalog'?catalog:ranking,isError:false,refetch:async()=>{}}),()=>({invalidateQueries:async()=>{}}),rpc,relayPalette,ROUTING_WEIGHTS,ROUTING_DEFAULTS,ROUTING_FORMULA,ROUTING_COST_HELP,routingMetrics,routingNumber,routingTrends,rankingTrendDetail,'View','Text','TextInput','Pressable');
  const render=(compact=false)=>{cursor=0;elements.length=0;const root=component({ctx:{theme:{colors:{surface0:'#ffffff'}},compact}});const walk=(node:any)=>{if(!node||typeof node!=='object')return;if(Array.isArray(node)){node.forEach(walk);return;}elements.push(node);node.children?.forEach(walk);};walk(root);return elements;};
  const texts=(node:any):string=>Array.isArray(node)?node.map(texts).join(''):typeof node==='string'||typeof node==='number'?String(node):node?.children?texts(node.children):'';
  return {render,writes,text:()=>elements.filter(n=>n.type==='Text').map(texts).join('\n'),button:(title:string)=>elements.find(n=>n.type==='Pressable'&&texts(n)===title),elements};
@@ -28,6 +28,7 @@ test('compact rows expand to real score factors, free quota immunity, prices and
  nodes.find(n=>n.type==='Pressable'&&n.props.accessibilityState?.expanded===false).props.onPress();h.render(true);
  expect(h.text()).toContain('费用原始分');expect(h.text()).toContain('免费，不扣分');expect(h.text()).toContain('原始分 100.0 / 100');
  expect(h.text()).toContain('乘数 1.000');expect(h.text()).toContain('首 token 趋势');expect(h.text()).toContain('42.36');
+ for(const name of ['输出速度趋势','错误率趋势','缓存命中趋势','额度趋势','绩效趋势','AA 能力趋势','缓存命中率','请求成功率'])expect(h.text()).toContain(name);
  expect(h.button('置顶模型')).toBeDefined();
 });
 test('manual groups remain navigable without fabricated scores or pin actions',()=>{

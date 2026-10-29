@@ -41,3 +41,14 @@ test('adding an existing member preserves manual order and other effort variants
  const {c,groups}=fixture();groups['sck-opus']=['v/b:max','v/a:max'];
  await c.setMembership({group:'sck-opus',model:'v/b:max',present:true,expectedMembers:['v/b:max']});expect(groups['sck-opus']).toEqual(['v/b:max','v/a:max']);
 });
+
+test('manual removal survives AA correction and explicit re-add clears the removal marker',async()=>{
+ const {c,groups,home}=fixture();
+ await c.setMembership({group:'sck-haiku',model:'v/a:max',present:false,expectedMembers:['v/a:max']});
+ // Synchronization failure must not erase the saved owner decision.
+ await c.setAlias('v/a',null);
+ const state=()=>JSON.parse(readFileSync(join(home,'model-routing/membership.json'),'utf8'));
+ expect(state().known).toContain('v/a');expect(state().manualRemovals['v/a']).toEqual(['sck-haiku']);expect(groups['sck-haiku']).toEqual([]);
+ await c.setMembership({group:'sck-haiku',model:'v/a:max',present:true,expectedMembers:[]});
+ expect(state().manualRemovals['v/a']).toBeUndefined();expect(groups['sck-haiku']).toEqual(['v/a:max']);
+});

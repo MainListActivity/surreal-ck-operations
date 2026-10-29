@@ -296,7 +296,7 @@ export interface ModelRankingTable {
   group: string; at?: string; rules?: string; bandWidth?:number; bandRanges?:Record<string,{top:number;bottom:number}>; scored: boolean;
   rows: Array<{
     model: string; previousRank?:number; price?:{free:boolean;input?:number|null;output?:number|null;cacheHit?:number|null}; pinned?: boolean; tailReason?:string; urgency?:{active:boolean;kind:'gift'|'subscription'|'reset';expiresAt:string;amount:number;unit:string;requests:number;reason:string}; decision?:{factors?:{base:number;latency:number;availability:number;reliability:number;urgency:number;exploration:number;estimatedCost?:number};urgent?:boolean;score?:number;coldStart?:boolean;costClass?:string;contributions?:Record<string,{value?:number;weight:number;points:number;factor?:number}>;band?:number;ttftMs?:number;latencySource:string;billing:string;quota:string;remainingPct?:number;pace?:number;tail?:string;reason:string}; trends?: import("./model-trends.ts").ModelTrends; trendSource?: {available:boolean;collectedAt:string}; aaScore?: number; aaRank?: number; effort?: string;
-    tokensPerSecond?: number; ttftMs?: number; stabilityPct?: number; stabilitySamples?: number;
+    cacheHitRate?: number; tokensPerSecond?: number; ttftMs?: number; stabilityPct?: number; stabilitySamples?: number;
     accounts: Array<{account: string; remainingPct?: number}>;
     performanceScore?: number; performanceSamples?: number;
     jevScore?: number; jevConfidence?: number;
