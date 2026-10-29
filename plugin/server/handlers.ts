@@ -199,10 +199,14 @@ export function registerHandlers(server: PluginServerContext): void {
     return {ok:true};
   });
 
+  ownerHandle(rpc.modelCatalog,async(input:RpcInput<typeof rpc.modelCatalog>)=>(await company()).modelRouting.catalogPage(input.query,input.offset,input.limit));
+  ownerHandle(rpc.setModelMembership,async(input:RpcInput<typeof rpc.setModelMembership>)=>{
+    const {updateModelMembership}=await import('./model-ranking.ts');return updateModelMembership(await company(),input);
+  });
   ownerHandle(rpc.modelIdentity, async () => (await company()).modelRouting.identity());
   ownerHandle(rpc.setModelAlias, async (input: RpcInput<typeof rpc.setModelAlias>) => {
-    const result=await (await company()).modelRouting.setAlias(input.model, input.slug);
-    return {ok:true,...result};
+    const {updateModelAlias}=await import("./model-ranking.ts");
+    return updateModelAlias(await company(),input);
   });
 
   ownerHandle(rpc.roster, async (_input: unknown, { paseo }: { paseo: any }) => {

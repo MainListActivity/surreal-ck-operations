@@ -5,20 +5,17 @@ import {RankingRefresher,type ModelFacts} from '../src/model-routing/ranking.ts'
 const now=Date.parse('2026-10-27T12:00:00Z');
 function fact(id:string,ttft=1000):ModelFacts{return {id,aa:{rank:1,score:60},accounts:[{account:'anon',kind:'plan',remainingPct:80,windows:[{remainingPct:80,resetsAt:new Date(now+7*86400000).toISOString()}]}],price:{free:false},usage:{source:'magpie',scope:'provider-model',period:'7d',collectedAt:new Date(now).toISOString(),requests:5,errors:0,speedSamples:2,ttftSamples:5,ttftMs:ttft,tokensPerSecond:50}};}
 const policy=(key:keyof typeof DEFAULT_POLICY.weights)=>({...structuredClone(DEFAULT_POLICY),weights:Object.fromEntries(Object.keys(DEFAULT_POLICY.weights).map(k=>[k,k===key?100:0])) as typeof DEFAULT_POLICY.weights});
-test('weights change the within-layer winner and each component sums exactly to the total',()=>{
+test('weights change the global winner and multiplicative factors reproduce the total',()=>{
  const fast=fact('p/fast',100),urgent=fact('p/urgent',19000);urgent.accounts[0]!.windows=[{remainingPct:60,resetsAt:new Date(now+3600000).toISOString()}];
  const latency=ruleOrder([urgent,fast],[],now,policy('latency')),pace=ruleOrder([fast,urgent],[],now,policy('pace'));
  expect(latency[0]!.facts.id).toBe('p/fast');expect(pace[0]!.facts.id).toBe('p/urgent');
- for(const r of [...pace,...latency])expect(r.decision.score).toBeCloseTo(Object.values(r.decision.contributions!).reduce((s,v)=>s+v.points,0),10);
+ for(const r of [...pace,...latency]){const f=r.decision.factors!;expect(r.decision.score).toBeCloseTo(Math.min(100,f.base*f.latency*f.availability*f.reliability*f.urgency+f.exploration),10);}
 });
-test('automatic ability and cost layers hold; explicit manual pins take precedence',()=>{
- const free=fact('p/free',19000),included=fact('p/included',100),paid=fact('p/paid',1),strong=fact('p/strong',19000);
- free.price.free=true;paid.accounts[0]!.kind='api';strong.aa!.score=65;strong.accounts[0]!.kind='api';
- const rows=ruleOrder([paid,included,free,strong],['p/paid'],now,policy('latency'));
- expect(rows.map(r=>r.facts.id)).toEqual(['p/paid','p/strong','p/free','p/included']);
- expect(ruleOrder([paid,included,free,strong],[],now,policy('latency')).map(r=>r.facts.id)).toEqual(['p/strong','p/free','p/included','p/paid']);
- const p=policy('latency');p.billingOverrides['p/included']='paid';
- expect(ruleOrder([paid,included],[],now,p)[0]!.facts.id).toBe('p/paid');
+test('automatic ordering has no ability/cost layers and explicit manual pins still take precedence',()=>{
+ const free=fact('free',19000),fast=fact('fast',100);free.price.free=true;free.aa!.score=100;
+ const rows=ruleOrder([free,fast],[],now,policy('latency'));expect(rows[0]!.facts.id).toBe('fast');
+ expect(rows.every(r=>r.decision.band===undefined)).toBe(true);
+ expect(ruleOrder([free,fast],['free'],now)[0]!.facts.id).toBe('free');
 });
 test('truly untried models get exploration priority; any error attempt prevents infinite new-model promotion',()=>{
  const known=fact('p/known'),fresh=fact('p/new');delete fresh.usage;fresh.aa!.score=30;
@@ -34,7 +31,7 @@ test('failing one model never demotes a healthy sibling on the same provider',()
 test('unknown metrics get no fabricated values; invalid policies fail closed',()=>{
  const missing=fact('p/missing');delete missing.usage;missing.health={source:'magpie-routing',attempts:1,errors:0,consecutiveErrors:0,excluded:false};
  const d=ruleOrder([missing],[],now,policy('latency'))[0]!.decision;
- expect(d.contributions!.latency!.value).toBeUndefined();expect(d.score).toBe(0);
+ expect(d.contributions!.latency!.value).toBeUndefined();expect(d.ttftMs).toBeUndefined();expect(d.score).toBeGreaterThan(0);
  for(const invalid of [{...DEFAULT_POLICY,weights:{}},{...DEFAULT_POLICY,bandWidth:NaN},{...DEFAULT_POLICY,weights:{...DEFAULT_POLICY.weights,pace:-1}}])expect(()=>rankingPolicy(invalid)).toThrow();
  expect(rankingPolicy(policy('latency'))).toEqual(policy('latency'));
  expect(()=>rankingPolicy({...policy('latency'),weights:Object.fromEntries(Object.keys(DEFAULT_POLICY.weights).map(k=>[k,0]))})).toThrow();
@@ -64,7 +61,7 @@ test('a depleted short-window account cannot inflate the model pace using its po
   {account:'usable',kind:'plan',remainingPct:10,windows:[{remainingPct:10,resetsAt:new Date(now+7*86400000).toISOString()}]},
  ];
  const d=ruleOrder([f],[],now)[0]!.decision;expect(d.pace).toBeCloseTo(10/168,10);
- expect(d.contributions!.pace!.value).toBeCloseTo((10/168)/(1+10/168),10);
+ expect(d.contributions!.pace!.value).toBeCloseTo(0.6+0.4*(10/168)/(1+10/168),10);
 });
 test('real routing-log aggregation isolates two sibling models before ranking',async()=>{
  const {mkdtempSync,writeFileSync,rmSync}=await import('node:fs');const {tmpdir}=await import('node:os');const {join}=await import('node:path');

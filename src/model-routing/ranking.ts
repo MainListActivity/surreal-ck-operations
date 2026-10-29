@@ -261,9 +261,9 @@ export interface RankingTable {
 }
 /** Current Magpie membership/order wins; a changed effort is a new member and must not inherit an old score. */
 export function rankingTables(groups: Record<string,string[]>, results: Record<string,RankingResultSnapshot> = {}, requests: RankingRequestSnapshot[] = [], pins: RankingPins = {}, gates:RankingGates = {}): RankingTable[] {
-  return RANKED_TIERS.map(tier => {
+  return (["haiku","sonnet","opus","fable"] as Tier[]).map(tier => {
     const group = `sck-${tier}`, result = results[group], gate=gates[group];
-    const bandWidth=result?.policy?.bandWidth??(result?.engine==='quality-pace-v1'?2:undefined);
+    const bandWidth=result?.engine===RULE_ENGINE?undefined:result?.policy?.bandWidth??(result?.engine==='quality-pace-v1'?2:undefined);
     const bandRanges:Record<string,{top:number;bottom:number}>={};
     if(bandWidth!==undefined)for(const r of result?.rows??[]){
       if(r.decision?.band===undefined||typeof r.facts.aa?.score!=='number'||!Number.isFinite(r.facts.aa.score))continue;
@@ -282,7 +282,7 @@ export function rankingTables(groups: Record<string,string[]>, results: Record<s
       const pinned = (pins[group] ?? []).includes(model);
       const decision=judged?.decision;
       return { model, price:facts?.price, urgency:facts?.urgency, decision, tailReason:pinned?undefined:decision?.tail??(!pinned&&!excluded&&overTtftLimit(facts,tailLimit)?`老板规则要求末尾：原生平均首token ${facts!.usage!.ttftMs!/1000} 秒 > ${tailLimit!/1000} 秒`:undefined), trends: facts?.trends, trendSource:facts?.trendSource, pinned, health: gate ? current?.health : facts?.health, aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
-        tokensPerSecond: facts?.usage?.tokensPerSecond, ttftMs: decision?decision.ttftMs:facts?.usage?.ttftMs,
+        cacheHitRate:facts?.usage?.cacheHitRate, tokensPerSecond: facts?.usage?.tokensPerSecond, ttftMs: decision?decision.ttftMs:facts?.usage?.ttftMs,
         stabilityPct: facts?.usage?.requests ? Math.max(0,100*(1-facts.usage.errors/facts.usage.requests)) : undefined,
         stabilitySamples: facts?.usage?.requests,
         accounts: facts?.accounts ?? [], performanceScore: facts?.performance?.score,

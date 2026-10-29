@@ -216,3 +216,15 @@ test('inherited property names are not valid Jev answer choices',async()=>{
   await expect(askAlias({model:'f',ask:async()=>({model:'f',answers:{same:{type:'choice',choice,confidence:1}}})},{id:'vendor/opaque'})).rejects.toThrow();
  }
 });
+
+test('manual removal remains absent after AA association, full sync and controller restart',async()=>{
+ useBenchmarks(ROWS);
+ const home=scratch(),id='p/deepseek-v4.1-flash',catalog=[{id,reasoning_levels:ALL}],store={'sck-haiku':[id+':max']};
+ const first=controller(home,catalog,store);
+ Object.assign(first.io,{groupSettings:()=>({'sck-haiku':{id:'sck-haiku',routing:'order'}}),saveGroups:async(changes:any[])=>{for(const g of changes)store[g.id as 'sck-haiku']=g.models;}});
+ await first.c.setMembership({group:'sck-haiku',model:id+':max',present:false,expectedMembers:[id+':max']});
+ await first.c.setAlias(id,'deepseek-v4-1-flash-1017');expect(store['sck-haiku']).toEqual([]);
+ const next=controller(home,catalog,store);await next.c.refresh(true);expect(store['sck-haiku']).toEqual([]);
+ const state=JSON.parse(readFileSync(join(home,'model-routing/membership.json'),'utf8'));
+ expect(state.manualRemovals[id]).toEqual(['sck-haiku']);
+});

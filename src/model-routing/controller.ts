@@ -29,7 +29,7 @@ import { ROUTING_SETTINGS_VERSION } from "./gateway.ts";
 import { setAgentModel } from "../dispatcher/agent-model.ts";
 import { employeeTier, employeeClientModel } from "./policy.ts";
 import { createPaseoCli } from "../dispatcher/paseo.ts";
-import { GROUP_STAYS, GROUP_LEVELS, saveMagpieGroups, magpieEnvironment } from "./magpie-admin.ts";
+import { GROUP_STAYS, GROUP_LEVELS, saveMagpieGroups, magpieEnvironment, type ManagedGroup } from "./magpie-admin.ts";
 import { readModelResults } from "./store.ts";
 import { readModelHealth } from "./health.ts";
 import { GaugeHistory, metricTrend, readUsageSamples, type ModelTrends, type Sample } from "./trends.ts";
@@ -131,6 +131,8 @@ export class ModelRoutingController {
       command?: (args: string[]) => Promise<void>;
       output?: (args: string[]) => Promise<string>;
       groups?: () => Record<string, string[]>;
+      groupSettings?: () => Record<string, {id:string;[key:string]:unknown}>;
+      saveGroups?: (groups: ManagedGroup[]) => Promise<void>;
       affinity?: () => Record<string, string>;
       levels?: () => Record<string, string[]>;
       providerRouting?: () => Record<string,string>;
@@ -231,8 +233,66 @@ export class ModelRoutingController {
       inventory: inventoryView(inventory),
     };
   }
+  /** Paginated live catalog for both owner surfaces. Never calls Jev. */
+  async catalogPage(query='',offset=0,limit=40) {
+    if (!Number.isSafeInteger(offset)||offset<0||!Number.isSafeInteger(limit)||limit<1||limit>100||query.length>200) throw Error('模型查询参数无效');
+    const catalog=(await this.fetchCatalog()).data.filter(m=>!generatedModel(m.id));
+    const groups=this.io.groups?.()??readMagpieGroups();
+    const inventory=await loadInventory(join(this.home,'model-routing','inventory.json'));
+    const aliases=inventoryAliases(inventory,await loadAliases(join(this.home,'model-routing','aliases.json')));
+    const matches=catalog.filter(m=>(m.id+' '+(m.display_name??'')).toLowerCase().includes(query.trim().toLowerCase()));
+    const models=matches.slice(offset,offset+limit).map(m=>{
+      const resolved=resolveBenchmark(m.id,m.reasoning_levels),alias=aliases[m.id];
+      return {id:m.id,name:m.display_name??m.id,levels:m.reasoning_levels??[],
+        groups:Object.entries(groups).filter(([,members])=>members.some(member=>splitMember(member).id===m.id)).map(([group])=>group),
+        members:Object.fromEntries(Object.entries(groups).filter(([group])=>group.startsWith('sck-')).map(([group,members])=>[group,members.filter(member=>splitMember(member).id===m.id)])),
+        slug:alias?.slug===null?null:alias?.slug??resolved?.row.slug??null,
+        aa:resolved?{score:resolved.row.score,name:resolved.row.name??resolved.row.slug}:undefined,
+        status:inventory.grouped[m.id]?'grouped':inventory.decisions[m.id]?'decided':'pending'};
+    });
+    return {models,total:matches.length,offset,nextOffset:offset+limit<matches.length?offset+limit:null,
+      benchmarks:[...benchmarkRows()].filter(b=>Number.isFinite(b.score)).map(b=>({slug:b.slug,name:b.name??b.slug,score:b.score})),
+      groups:Object.keys(groups).filter(group=>['sck-haiku','sck-sonnet','sck-opus','sck-fable'].includes(group))};
+  }
+
+  /** Change only membership, serialized with sync/ranking; preserve all owner group settings. */
+  async setMembership(input:{group:string;model:string;present:boolean;expectedMembers:string[]}) {
+    if(!['sck-haiku','sck-sonnet','sck-opus','sck-fable'].includes(input.group)||generatedModel(input.model)||typeof input.present!=='boolean')throw Error('分组参数无效');
+    while(this.pending)await this.pending.catch(()=>undefined);
+    const operation=async()=>{
+      const catalog=(await this.fetchCatalog()).data,base=splitMember(input.model),entry=catalog.find(m=>m.id===base.id);
+      if(input.present&&(!entry||base.effort&&!(entry.reasoning_levels??[]).includes(base.effort)))throw Error('模型或思考等级不在当前 Magpie 目录中');
+      const live=this.io.groups?.()??readMagpieGroups(),current=live[input.group]??[];
+      const currentMembers=current.filter(member=>splitMember(member).id===base.id);
+      if(JSON.stringify(currentMembers)!==JSON.stringify(input.expectedMembers))throw Error('分组成员已变化，请刷新后重试');
+      const members=input.present?(current.includes(input.model)?current:[...current,input.model]):current.filter(member=>member!==input.model);
+      const settings=this.io.groupSettings?.()??Object.fromEntries((JSON.parse(await readFile(join(homedir(),'.config/magpie/providers.json'),'utf8')).groups??[]).map((g:{id:string})=>[g.id,g]));
+      const existing=settings[input.group];
+      if(live[input.group]&&!existing)throw Error('当前分组配置不可读，未覆盖设置');
+      const changes=[{id:input.group,models:members,existing:existing??{id:input.group,name:input.group,routing:'order',affinity:GROUP_STAYS,levels:GROUP_LEVELS}}];
+      const dir=join(this.home,'model-routing');await mkdir(dir,{recursive:true,mode:0o700});
+      const file=join(dir,'membership.json');let state:{version?:string;known?:string[];manualRemovals?:Record<string,string[]>}={};
+      try{state=JSON.parse(await readFile(file,'utf8'));}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+
+      if(!state||typeof state!=='object'||Array.isArray(state)||state.known!==undefined&&(!Array.isArray(state.known)||state.known.some(id=>typeof id!=='string'))||state.version!==undefined&&typeof state.version!=='string')throw Error('已知模型清单不可读，未修改分组');
+      if(state.manualRemovals!==undefined&&(!state.manualRemovals||typeof state.manualRemovals!=='object'||Array.isArray(state.manualRemovals)||Object.values(state.manualRemovals).some(v=>!Array.isArray(v)||v.some(g=>typeof g!=='string'))))throw Error('人工移除清单不可读，未修改分组');
+      const manualRemovals={...state.manualRemovals};
+      if(input.present){manualRemovals[base.id]=(manualRemovals[base.id]??[]).filter(g=>g!==input.group);if(!manualRemovals[base.id]!.length)delete manualRemovals[base.id];}
+      else if(!members.some(member=>splitMember(member).id===base.id))manualRemovals[base.id]=[...new Set([...(manualRemovals[base.id]??[]),input.group])];
+      const inventory=await loadInventory(join(dir,'inventory.json'));
+      const aliases=inventoryAliases(inventory,await loadAliases(join(dir,'aliases.json')));
+      await (this.io.saveGroups??((groups:ManagedGroup[])=>saveMagpieGroups(this.cli,groups)))(changes);
+      await writeFile(file+'.tmp',JSON.stringify({...state,manualRemovals,version:state.version??GROUPING_VERSION,known:[...new Set([...(state.known??[]),base.id])]}),{mode:0o600});await rename(file+'.tmp',file);
+      const finalGroups={...live,[input.group]:members};
+      reconcileInventory(inventory,catalog,finalGroups,aliases);
+      await saveInventory(join(dir,'inventory.json'),inventory);
+    };
+    this.pending=operation().finally(()=>{this.pending=undefined;});await this.pending;
+  }
+
   /** Owner's decision on a vendor name; a model not yet in any group is placed by it on the next sync. */
   async setAlias(model: string, slug: string | null): Promise<{synchronized:boolean}> {
+    if(generatedModel(model))throw Error('生成分组不能关联 AA');
     while(this.pending) await this.pending.catch(()=>undefined);
     let synchronized=true;
     const operation=async()=>{
@@ -250,7 +310,7 @@ export class ModelRoutingController {
         try {
           const file = join(dir, "membership.json");
           const state = JSON.parse(await readFile(file, "utf8"));
-          state.known = (state.known ?? []).filter((id: string) => id !== model);
+          if (!state.manualRemovals?.[model]?.length) state.known = (state.known ?? []).filter((id: string) => id !== model);
           await writeFile(`${file}.tmp`, JSON.stringify(state), { mode: 0o600 });
           await rename(`${file}.tmp`, file);
         } catch {}
@@ -444,7 +504,7 @@ export class ModelRoutingController {
     const aa = this.io.command ? loadAa(join(dir0, "aa.json")) : await refreshAa(join(dir0, "aa.json"));
     if (aa?.admissionBlocked) throw Error("AA 最新 Luna Max 锚点缺失，暂停新增分组，保留现有配置");
     if (aa) useBenchmarks(aa.models);
-    let state: { version?: string; known?: string[] } = {};
+    let state: { version?: string; known?: string[]; manualRemovals?:Record<string,string[]> } = {};
     try {
       state = JSON.parse(await readFile(join(dir0, "membership.json"), "utf8"));
     } catch {}
@@ -492,7 +552,7 @@ export class ModelRoutingController {
     // Membership is the owner's. Automatic grouping runs once per GROUPING_VERSION and afterwards
     // only places models this controller has never seen; manual adds and removals in magpie stay.
     // The controller only reorders members by ranking.
-    const fresh = models.filter((m) => !known.has(m.id));
+    const fresh = models.filter((m) => !known.has(m.id)&&!state.manualRemovals?.[m.id]?.length);
     const byId = new Map(models.map((m) => [m.id, m]));
     const levelsOf = (member: string) => catalog.data.find((m) => m.id === splitMember(member).id)?.reasoning_levels;
     const holds = (list: string[], id: string) => list.some((x) => splitMember(x).id === id);
@@ -512,7 +572,7 @@ export class ModelRoutingController {
       const bucket = models.filter(m=>m.tier===tier);
       const current = live[`sck-${tier}`];
       const ids = initializing || !current
-        ? bucket.map((m) => m.member ?? m.id)
+        ? bucket.filter(m=>!state.manualRemovals?.[m.id]?.length).map((m) => m.member ?? m.id)
         : [...current.filter(member=>!generatedModel(member)).map(pinned), ...fresh.filter((m) => m.tier === tier && !holds(current, m.id)).map((m) => m.member ?? m.id)];
       if (!ids.length) {
         groups[`sck-${tier}`] = digest("[]");
@@ -586,7 +646,7 @@ export class ModelRoutingController {
       // (or a concurrent one) must not fail every later sync.
       else await this.command(['group','rm',id]).catch((e: Error) => { if (!/no group/.test(e.message)) throw e; });
     }
-    await writeFile(join(dir, "membership.json.tmp"), JSON.stringify({ version: GROUPING_VERSION, known: nextKnown }), { mode: 0o600 });
+    await writeFile(join(dir, "membership.json.tmp"), JSON.stringify({ ...state, version: GROUPING_VERSION, known: nextKnown }), { mode: 0o600 });
     await rename(join(dir, "membership.json.tmp"), join(dir, "membership.json"));
     await writeFile(join(dir, "groups.json.tmp"), JSON.stringify(groups), {
       mode: 0o600,

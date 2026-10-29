@@ -30,7 +30,7 @@ run(
       for(const d of planRoutingRoster(before)) await wf.upsertDef(d.id,{role:d.role as any,provider:d.provider,model:d.model,enabled:d.enabled,tracks:d.tracks,maxInstances:d.maxInstances,quotaLimited:d.quotaLimited});
       const migrated=await wf.defs();
       expect(migrated.find(d=>d.id==='gm-grok')?.enabled).toBe(false);
-      expect(migrated.find(d=>d.id==='gm-claude')).toMatchObject({model:'group/sck-opus',provider:'claude',quotaLimited:false});
+      expect(migrated.find(d=>d.id==='gm-claude')).toMatchObject({model:'claude-opus-5-5',provider:'claude',quotaLimited:false});
       expect(migrated.find(d=>d.id==='story-claude')?.model).toBe('keep-story');
       await db.db
         .query(`CREATE task:fixture CONTENT {title:'fixture',context:'fixture',state:'doing',executor_role:'engineering',reviewer_role:'qa',model_tier:'medium',current_employee:'fixture-worker',lease_expires_at:time::unix(time::now())+120,fence:3};
@@ -181,7 +181,7 @@ run('fork: Factory roster physically removes other native defs, preserves author
   expect(after.some(d=>['engineering-codex','qa-grok'].includes(d.id))).toBe(false);
   expect(after.find(d=>d.id==='engineering-factory')).toMatchObject({provider:'factory-droid',model:'native-model',thinking:'high',enabled:true,maxInstances:3});
   expect(after.find(d=>d.id==='engineering-factory')?.quotaLimited).not.toBe(false);
-  expect(after.find(d=>d.id==='engineering-claude')).toMatchObject({model:'group/sck-haiku',thinking:'medium'});
+  expect(after.find(d=>d.id==='engineering-claude')).toMatchObject({model:'claude-haiku-5-5',thinking:'max'});
   expect(after.find(d=>d.id==='engineering-claude')?.tracks?.slice().sort()).toEqual(['mobile','web']);
   expect(after.find(d=>d.id==='story-native')).toEqual(before);
   const [history]=await db.db.query<[any]>('SELECT * FROM ONLY employee:historical;');expect(String(history.def)).toContain('engineering-codex');

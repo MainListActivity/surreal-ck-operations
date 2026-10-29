@@ -6,6 +6,7 @@ export type TierInput = Tier | "high" | "medium" | "low";
 export type Domain = "engineering" | "writing" | "general";
 export interface CatalogModel {
   id: string;
+  display_name?: string;
   context_window?: number;
   context_length?: number;
   native_endpoints?: string[];

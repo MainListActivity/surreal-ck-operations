@@ -1,5 +1,4 @@
-import {rankingLayers} from "../shared/ranking-layers.ts";
-import { rankingHealthMetric, rankingTrendDetail, rankingRuleLabel } from "../shared/ranking-trends.ts";
+import {ModelRoutingPanel} from "./model-routing";
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -1181,248 +1180,6 @@ function RegisterDefCard({ ctx, editing, onDone, onCancel }: {
   );
 }
 
-/** Preserve JSON keys while giving the request a readable, collapsible structure on any width. */
-function RankingJson({ctx,label,value,depth=0}: {ctx:Ctx;label:string;value:unknown;depth?:number}) {
-  const s=makeStyles(ctx);
-  const [open,setOpen]=useState(depth<1);
-  if(value===null||typeof value!=="object") return <Text selectable style={s.text}>{label}：{JSON.stringify(value)}</Text>;
-  const entries=Object.entries(value);
-  return <View style={{gap:6}}>
-    <Pressable accessibilityRole="button" accessibilityState={{expanded:open}} onPress={()=>setOpen(!open)}>
-      <Text style={s.text}>{open?"▾":"▸"} {label}（{entries.length} 项）</Text>
-    </Pressable>
-    {open&&<View style={{paddingLeft:12,gap:6}}>{entries.map(([key,item])=><RankingJson key={key} ctx={ctx} label={key} value={item} depth={depth+1}/>)}</View>}
-  </View>;
-}
-
-/** Resolve appearance from Paseo's surface; preserve the reference design's purple brand in both modes. */
-function relayColors(ctx:Ctx) {
-  const match=ctx.theme.colors.surface0?.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
-  const hex=match?.[1];const rgb=hex?.length===3?hex.split("").map(x=>x+x).join(""):hex;
-  const cssRgb=ctx.theme.colors.surface0?.match(/^rgba?\(\s*([\d.]+)[, ]+([\d.]+)[, ]+([\d.]+)/i);
-  const channels=rgb?[parseInt(rgb.slice(0,2),16),parseInt(rgb.slice(2,4),16),parseInt(rgb.slice(4,6),16)]:cssRgb?.slice(1,4).map(Number);
-  const hsl=ctx.theme.colors.surface0?.startsWith("hsl")?ctx.theme.colors.surface0.match(/[\d.]+%/g):null;
-  const light=channels ? (channels[0]!*299+channels[1]!*587+channels[2]!*114)/1000>128 : hsl?.[1]?parseFloat(hsl[1])>50:true;
-  return {...ctx.theme.colors,
-    surface0:light?"#f4f5f7":"#0e0f12",surface1:light?"#ffffff":"#17181d",surface2:light?"#ececef":"#23252b",
-    foreground:light?"#202127":"#f0f0f2",foregroundMuted:light?"#71747e":"#9a9da7",border:light?"#e5e6ea":"#2a2c33",
-    accent:light?"#6d5bd0":"#9581ff",accentForeground:light?"#ffffff":"#1c1830",score:light?"#6957cc":"#ad9eff",
-    tab:light?"#ffffff":"#1b1d22",input:light?"#f5f5f7":"#111216",row:light?"#ffffff":"#1b1d22",path:light?"#f5f5f7":"#111216",
-    statusSuccess:light?"#218663":"#58c99b",statusWarning:light?"#a7671d":"#e1a456",
-  };
-}
-
-/** Layout and spacing follow redesign/src/App.tsx; colors follow the selected Paseo theme. */
-function relayStyles(ctx:Ctx) {
-  const c=relayColors(ctx);
-  return {
-    text:{color:c.foreground,fontSize:13,lineHeight:20},
-    muted:{color:c.foregroundMuted,fontSize:11,lineHeight:17},
-    panel:{backgroundColor:c.surface1,borderColor:c.border,borderWidth:1,borderRadius:14,padding:ctx.compact?16:22,gap:0},
-    row:{flexDirection:"row" as const,alignItems:"center" as const,gap:12},
-    accent:{color:c.accent},
-    step:{width:34,height:34,borderRadius:10,backgroundColor:c.surface2,alignItems:"center" as const,justifyContent:"center" as const},
-    input:{backgroundColor:c.input,color:c.foreground,borderColor:c.border,borderWidth:1,borderRadius:13,padding:14,fontSize:13,lineHeight:22},
-  };
-}
-
-function RelayHeading({ctx,step,title,subtitle}: {ctx:Ctx;step:string;title:string;subtitle:string}) {
-  const s=relayStyles(ctx);
-  return <View style={[s.row,{marginBottom:22}]}><View style={s.step}><Text style={[s.muted,s.accent,{fontWeight:"700"}]}>{step}</Text></View>
-    <View style={{flex:1}}><Text style={[s.text,{fontSize:15,fontWeight:"700"}]}>{title}</Text><Text style={s.muted}>{subtitle}</Text></View>
-  </View>;
-}
-
-function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy,onBilling,billingOverrides}: {ctx:Ctx;table:import("../shared/types").ModelRankingTable;width?:number;onPin?:(model:string,pinned:boolean)=>Promise<void>;pinBusy?:boolean;onBilling?:(model:string,kind:string)=>void;billingOverrides?:Record<string,string>}) {
-  const s=relayStyles(ctx),c=relayColors(ctx);
-  const [expanded,setExpanded]=useState<string|null>(null);
-  const mobile=width<=600,wide=width>900;
-  const layers=rankingLayers(table),starts=new Map(layers.map(layer=>[layer.start,layer]));
-  const number=(value:number|undefined,digits=1)=>value===undefined?"未知":value.toFixed(digits);
-  return <View style={{gap:mobile?5:8}}>
-    <View style={[s.row,{alignItems:"flex-start",justifyContent:"space-between",marginBottom:mobile?7:10}]}>
-      <View style={{flex:1}}><Text style={[s.text,{fontSize:mobile?15:17,fontWeight:"700"}]}>{table.group.replace("sck-","").replace(/^./,x=>x.toUpperCase())} 模型</Text>
-        {!mobile&&<Text style={[s.muted,{marginTop:6}]}>手动置顶之后优先消耗临期可用额度；其余模型中，新模型优先试用，再按能力档和计费层分组，再比较综合分。未置顶模型继续执行故障、额度和20秒置后规则。</Text>}
-      </View>
-      <View style={{backgroundColor:c.surface2,borderColor:c.border,borderWidth:1,borderRadius:999,paddingHorizontal:9,paddingVertical:6}}><Text style={[s.muted,s.accent,{fontSize:10,fontWeight:"700"}]}>{table.rows.length} 个成员</Text></View>
-    </View>
-    <View style={{backgroundColor:c.surface2,borderRadius:10,padding:12,gap:5,marginBottom:8}}><Text style={[s.text,{fontWeight:"700"}]}>先比较分层，再比较层内分</Text><Text style={s.muted}>①手动置顶 → ②临期可用额度（综合分降序）→ ③其余模型按安全状态 → 新模型试用 → AA能力档 → 计费类型 → 层内分降序</Text><Text style={s.muted}>手动置顶按先后排列；临期层不再按能力或计费拆分，直接比较综合分，异常模型仍置后。其余模型的安全状态、试用状态、能力档、计费类型都相同，才是同一层。AA档在同一安全状态内，从最高分开始逐档划分。每层下方列出实际范围和依据。</Text><Text style={s.muted}>{table.rows.some(r=>r.previousRank!==undefined)?"以下分层来自当前预览；保存前不影响线上。":"以下分层来自最近成功排序快照；跨层即使分数更高，也不会提前。"}</Text></View>
-    {!table.scored&&<Text style={[s.muted,{marginBottom:8}]}>等待下一次请求触发规则排序。</Text>}
-    {table.rows.map((row,index)=>{
-      const short=row.model.replace(/^remote-magpie\//,"");const slash=short.lastIndexOf("/");
-      const open=expanded===row.model,layer=starts.get(index);
-      const quota=row.accounts.length?row.accounts.map((a,i)=>`${row.accounts.length>1?`#${i+1} `:""}${a.remainingPct===undefined?"未知":`${number(a.remainingPct)}%`}`).join(" · "):"未知";
-      const metrics=[
-        {label:"层内分",value:row.decision?.score?.toFixed(2)??"未知",detail:row.pinned?"手动置顶按先后排列，分数仅供参考":row.previousRank?`线上第 ${row.previousRank} 名 → 预览第 ${index+1} 名`:"固定分层内比较，不跨能力档或计费层"},
-        {label:"排序依据",value:row.decision?.reason??"等待规则排序",detail:"不调用 JEV；首 token 置后阈值为20秒"},
-        {label:"AA 智能分",value:number(row.aaScore),detail:(row.aaRank===undefined?"暂无排名":`全榜第 ${row.aaRank} 名`)+" · "+rankingTrendDetail(row.trends?.aaScore)},
-        {label:"生成速度",value:row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,detail:rankingTrendDetail(row.trends?.tokensPerSecond)},
-        {label:"首 token 延迟",value:row.ttftMs===undefined?"未知":`${number(row.ttftMs/1000,2)} 秒`,detail:(row.tailReason?row.tailReason+" · ":"")+rankingTrendDetail(row.trends?.ttftMs)},
-        {label:"临期额度",value:row.urgency?`${row.urgency.amount}${row.urgency.unit} · ${row.urgency.requests}/5条`:"无有效临期额度",detail:row.urgency?`${row.urgency.reason}；截止 ${row.urgency.expiresAt}`:"仅使用明确期限与新鲜额度读数"},
-        {label:"剩余额度",value:quota,detail:rankingTrendDetail(row.trends?.remainingPct)},
-        {label:"请求稳定性",value:row.stabilityPct===undefined?"未知":`${number(row.stabilityPct)}%`,detail:"错误率趋势："+rankingTrendDetail(row.trends?.errorRate)},
-        {label:"路由尝试",...rankingHealthMetric(row.health,row.pinned)},
-        {label:"缓存命中率",value:row.trends?.cacheHitRate?.current===undefined?"未知":`${number(row.trends.cacheHitRate.current*100)}%`,detail:rankingTrendDetail(row.trends?.cacheHitRate)},
-        {label:"样本权重",value:number(row.performanceSamples,2),detail:rankingTrendDetail(row.trends?.performanceScore)},
-      ];
-      const stat=(label:string,value:string,width:number)=><View style={{width,gap:2}}><Text style={[s.muted,{fontSize:9}]}>{label}</Text><Text style={[s.text,{fontSize:11,fontWeight:"600"}]}>{value}</Text></View>;
-      return <View key={row.model} style={{gap:mobile?5:8}}>
-        {layer&&<View accessibilityLabel={layer.title} style={{borderTopWidth:2,borderColor:c.accent,backgroundColor:c.surface2,borderRadius:8,padding:12,marginTop:index?16:4,gap:5}}><Text style={[s.text,{fontWeight:"700",fontSize:12}]}>{layer.title}</Text><Text style={[s.muted,{color:c.accent}]}>第{layer.start+1}–{layer.end+1}名 · 本段{layer.count}个模型{layer.total!==layer.count?` / 本层共${layer.total}个`:""}</Text><Text style={s.muted}>{layer.abilitySummary}</Text><Collapsible title="这一层如何形成" ctx={ctx}><Text style={s.muted}>{layer.ability}</Text><Text style={s.muted}>{layer.explanation}</Text><Text style={[s.muted,{fontWeight:"600"}]}>{layer.comparison}</Text></Collapsible></View>}
-        <View style={{borderWidth:1,borderColor:open?c.accent:c.border,borderRadius:mobile?10:12,backgroundColor:c.row,overflow:"hidden"}}>
-        <View style={{flexDirection:"row",alignItems:"center"}}><Pressable accessibilityRole="button" accessibilityLabel={`第 ${index+1} 名 ${row.model}`} accessibilityState={{expanded:open}}
-          onPress={()=>setExpanded(open?null:row.model)} style={[s.row,{flex:1,minWidth:0,minHeight:mobile?52:62,paddingVertical:mobile?7:10,paddingHorizontal:mobile?8:12,gap:mobile?7:12}]}>
-          <View style={{width:mobile?28:34,height:mobile?28:34,borderRadius:mobile?8:12,backgroundColor:c.surface2,alignItems:"center",justifyContent:"center"}}><Text style={[s.muted,{fontSize:mobile?9:11,fontWeight:"700"}]}>#{index+1}</Text></View>
-          <View style={{flex:1,minWidth:0}}><View style={[s.row,{gap:8}]}>
-            <Text numberOfLines={1} style={[s.text,{flexShrink:1,fontSize:mobile?12:13,fontWeight:"700"}]}>{short.slice(slash+1)}</Text>
-            {!mobile&&index===0&&!!row.decision&&!row.decision.tail&&<View style={{backgroundColor:c.surface2,paddingHorizontal:6,paddingVertical:3,borderRadius:5}}><Text style={{color:c.statusSuccess,fontSize:9}}>推荐</Text></View>}
-          </View><Text style={[s.muted,{fontSize:mobile?9:10}]}>{short.slice(0,slash)} · {row.ttftMs===undefined?"TTFT ?":`${number(row.ttftMs/1000,2)}s`}</Text></View>
-          {wide&&stat("智能分",number(row.aaScore),72)}
-          {!mobile&&stat("速度",row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,96)}
-          {wide&&stat("额度",quota,64)}
-          <View style={{width:mobile?66:76,alignItems:"flex-end"}}><Text style={[s.muted,{fontSize:9}]}>{row.pinned?"置顶":row.decision?.tail?"置后":row.decision?.urgent?"临期优先":row.decision?.coldStart?"试用":"层内分"}</Text>
-            <Text accessibilityLabel={row.decision?.reason??"等待规则排序"} style={{color:c.score,fontSize:mobile?13:17,lineHeight:mobile?18:23,fontWeight:"700"}}>{row.decision?.score===undefined?rankingRuleLabel(row):row.decision.score.toFixed(1)}</Text>
-          </View><Text style={[s.muted,{width:mobile?18:22,textAlign:"center",fontSize:17}]}>{open?"−":"+"}</Text>
-        </Pressable><Pressable accessibilityRole="button" accessibilityLabel={`${row.pinned?"取消置顶":"置顶"} ${row.model}`} disabled={pinBusy||!onPin}
-          onPress={()=>void onPin?.(row.model,!row.pinned)} style={{paddingHorizontal:mobile?7:10,minHeight:44,justifyContent:"center",opacity:pinBusy?0.5:1}}>
-          <Text style={{fontSize:mobile?10:11,color:row.pinned?c.accent:c.foregroundMuted}}>{row.pinned?"取消置顶":"置顶"}</Text>
-        </Pressable></View>
-        {open&&<View style={{paddingLeft:mobile?43:58,paddingRight:mobile?9:14,paddingBottom:mobile?10:14}}>
-          <Text selectable numberOfLines={1} style={{color:c.foregroundMuted,fontSize:mobile?8:9,lineHeight:14,fontFamily:"Menlo",backgroundColor:c.path,borderRadius:8,paddingHorizontal:mobile?7:9,paddingVertical:mobile?5:7,marginVertical:mobile?9:12}}>{row.model}</Text>
-          <View style={{flexDirection:"row",flexWrap:"wrap",gap:mobile?7:8}}>{metrics.map(metric=><View key={metric.label} style={{flexBasis:wide?"14%":"28%",flexGrow:1,minWidth:0,gap:2,borderLeftWidth:1,borderColor:c.border,paddingLeft:mobile?8:10}}>
-            <Text style={[s.muted,{fontSize:mobile?8:9}]}>{metric.label}</Text><Text selectable style={[s.text,{fontSize:mobile?11:12,fontWeight:"700"}]}>{metric.value}</Text>
-            <Text style={[s.muted,{fontSize:mobile?8:9}]}>{metric.detail}</Text>
-          </View>)}</View>
-          {!!row.decision?.contributions&&<View style={{marginTop:10,gap:4}}>{Object.entries(row.decision.contributions).map(([key,v])=><Text key={key} style={s.muted}>{({pace:"额度紧迫度",latency:"首 token",intelligence:"AA",speed:"速度",performance:"绩效",price:"费用"} as Record<string,string>)[key]}：{v.value===undefined?"未知（不加分）":`${(v.value*100).toFixed(1)}%`} × 权重 {v.weight} → +{v.points.toFixed(2)}</Text>)}</View>}
-          {!!onBilling&&<View style={{marginTop:12,gap:6}}><Text style={s.muted}>计费分类（新数据仍由 Magpie 提供；此处仅修正分类）</Text><View style={[s.row,{flexWrap:"wrap"}]}>{Object.entries({auto:"自动",free:"免费",included:"套餐/积分",unknown:"未知",paid:"额外付费"}).map(([kind,label])=><Pressable accessibilityRole="button" accessibilityState={{selected:(billingOverrides?.[row.model]??"auto")===kind}} key={kind} onPress={()=>onBilling(row.model,kind)} style={{padding:8,borderWidth:1,borderColor:(billingOverrides?.[row.model]??"auto")===kind?c.accent:c.border,borderRadius:8}}><Text style={s.text}>{label}</Text></Pressable>)}</View></View>}
-          {mobile&&row.performanceScore!==undefined&&<Text style={[s.muted,{fontSize:9,marginTop:7}]}>历史绩效 {number(row.performanceScore,2)} / 5</Text>}
-        </View>}
-      </View></View>;
-    })}
-  </View>;
-}
-
-function ModelRankingCard({ctx}: {ctx:Ctx}) {
-  const c=relayColors(ctx);
-  const get=useRpc(rpc.modelRanking),preview=useRpc(rpc.previewModelRanking),save=useRpc(rpc.saveModelRanking),pin=useRpc(rpc.pinModelRanking);
-  const [pinBusy,setPinBusy]=useState(false),[pinMessage,setPinMessage]=useState("");
-  const query=useQuery({queryKey:["model-ranking"],queryFn:()=>get({}),refetchInterval:15000});
-  const [draft,setDraft]=useState<{rules:string;refreshMinutes:2|5|10;policy?:import("../shared/types").ModelRankingPolicy}>();
-  const [group,setGroup]=useState("sck-haiku"),[width,setWidth]=useState(ctx.compact?390:1100);
-  const s=relayStyles({...ctx,compact:width<=600});
-  const [savedAt,setSavedAt]=useState<number>();
-  const [busy,setBusy]=useState(false),[message,setMessage]=useState(""),[selectOpen,setSelectOpen]=useState(false);
-  const current=draft??{rules:query.data?.rules??"智能程度和速度综合优先",refreshMinutes:(query.data?.refreshMinutes??5) as 2|5|10};
-  const defaults:import("../shared/types").ModelRankingPolicy={bandWidth:2,weights:{pace:35,latency:30,intelligence:15,speed:10,performance:5,price:5},billingOverrides:{}};
-  const policy=current.policy??query.data?.policy??defaults;
-  const [previewPolicy,setPreviewPolicy]=useState<typeof policy>();
-  const [previewVersion,setPreviewVersion]=useState(0);
-  const changed=!!draft&&JSON.stringify(policy)!==JSON.stringify(query.data?.policy??defaults);
-  const policyKey=JSON.stringify(policy);
-  useEffect(()=>{if(!changed){setPreviewPolicy(undefined);return;}setPreviewPolicy(undefined);const timer=setTimeout(()=>setPreviewPolicy(policy),500);return()=>clearTimeout(timer);},[policyKey,changed]);
-  const previewQuery=useQuery({queryKey:["ranking-preview",previewPolicy,previewVersion],queryFn:()=>preview({policy:previewPolicy!,refresh:false}),enabled:!!previewPolicy,retry:false});
-  const previewReady=changed&&JSON.stringify(previewPolicy)===policyKey&&!!previewQuery.data&&!previewQuery.isError;
-  const tables=changed?(previewReady?previewQuery.data!.tables:[]):query.data?.tables??[],selected=tables.find(t=>t.group===group)??tables[0];
-  const editPolicy=(next:typeof policy)=>setDraft({...current,policy:next});
-  const mobile=width<=600,wide=width>900;
-  const failed=query.isError||!!query.data?.error,unconfigured=query.data&&!query.data.configured;
-  return <View onLayout={e=>setWidth(e.nativeEvent.layout.width)} style={{width:"100%",maxWidth:1240,alignSelf:"center",backgroundColor:c.surface0}}>
-    <View style={[s.row,{height:mobile?60:68,borderBottomWidth:1,borderColor:c.border,justifyContent:"space-between",paddingHorizontal:mobile?6:12}]}>
-      <View style={[s.row,{gap:11}]}><View style={{width:30,height:30,borderRadius:9,backgroundColor:"#6650c4",alignItems:"center",justifyContent:"center",flexDirection:"row",gap:3}}><View style={{width:4,height:10,borderRadius:4,backgroundColor:"#ffffff"}}/><View style={{width:4,height:16,borderRadius:4,backgroundColor:"#ffffff"}}/></View><Text style={[s.text,{fontSize:14,fontWeight:"700"}]}>Model Relay</Text></View>
-      <View style={[s.row,{gap:8,paddingHorizontal:12,paddingVertical:7,borderWidth:1,borderColor:c.border,borderRadius:999}]}><View style={{width:7,height:7,borderRadius:4,backgroundColor:failed?c.statusWarning:c.statusSuccess}}/><Text style={s.muted}>实时数据</Text></View>
-    </View>
-    <View style={{paddingTop:mobile?30:64,paddingBottom:mobile?25:36}}>
-      <View style={[s.row,{justifyContent:"space-between",alignItems:"flex-end"}]}><View style={{flex:1,maxWidth:600}}>
-        <Text style={{color:c.accent,fontSize:11,fontWeight:"800",letterSpacing:1.8,marginBottom:12}}>ROUTING CONSOLE</Text>
-        <Text style={{color:c.foreground,fontSize:mobile?38:58,lineHeight:mobile?42:62,fontWeight:"700",letterSpacing:-1.8,marginBottom:16}}>模型排序</Text>
-        <Text style={[s.muted,{fontSize:mobile?12:14,lineHeight:24}]}>Haiku、Sonnet 按规则自动排序；Opus 的成员、顺序和组内配置由你在 Magpie 手动维护。</Text>
-      </View>{!mobile&&<View style={[s.row,{borderWidth:1,borderColor:c.border,borderRadius:14,paddingVertical:12,paddingHorizontal:15}]}><View style={{width:7,height:7,borderRadius:4,backgroundColor:failed?c.statusWarning:c.statusSuccess}}/><View><Text style={[s.text,{fontSize:12,fontWeight:"700"}]}>{failed?"同步异常":unconfigured?"尚未配置":query.data?"运行正常":"正在加载"}</Text><Text style={s.muted}>{query.data?.at?new Date(query.data.at).toLocaleString():"等待同步"}</Text></View></View>}</View>
-    </View>
-    <View style={{flexDirection:wide?"row":"column",gap:18,alignItems:"flex-start"}}>
-      <View style={[s.panel,{width:wide?340:"100%"}]}>
-        <RelayHeading ctx={ctx} step="01" title="排序规则" subtitle="固定规则，无模型调用费用"/>
-        <Text style={[s.text,{fontSize:12,fontWeight:"600",marginBottom:9}]}>当前生效规则</Text>
-        <Text selectable style={[s.text,{fontSize:12,lineHeight:21}]}>{query.data?.rules??current.rules}</Text>
-        <Text style={[s.muted,{marginTop:8,fontSize:11}]}>固定分层内使用加权分；修改后自动预览，保存前不影响线上。</Text>
-        <Text style={[s.text,{fontWeight:"600",marginTop:18}]}>综合评分权重</Text>
-        <Text style={s.muted}>先按能力档、免费/套餐积分/未知/额外付费分层。层内总分 = 各项加权分之和 ÷ 权重之和；未知数据不加分。</Text>
-        {Object.entries({pace:"额度消耗紧迫度",latency:"首 token 延迟",intelligence:"AA 能力",speed:"输出速度",performance:"验收绩效",price:"预计费用"}).map(([key,label])=><View key={key} style={[s.row,{justifyContent:"space-between",marginTop:8}]}><Text style={s.text}>{label}</Text><TextInput accessibilityLabel={`${label}权重`} keyboardType="numeric" style={[s.input,{width:72}]} value={String(policy.weights[key as keyof typeof policy.weights])} onChangeText={v=>editPolicy({...policy,weights:{...policy.weights,[key]:Number(v)}})}/></View>)}
-        <View style={[s.row,{justifyContent:"space-between",marginTop:10}]}><Text style={s.text}>AA 能力档宽度（0–10）</Text><TextInput accessibilityLabel="AA 能力档宽度" keyboardType="numeric" style={[s.input,{width:72}]} value={String(policy.bandWidth)} onChangeText={v=>editPolicy({...policy,bandWidth:Number(v)})}/></View>
-        <View style={[s.row,{flexWrap:"wrap",marginTop:10}]}><Pressable accessibilityRole="button" onPress={()=>editPolicy({...policy,bandWidth:defaults.bandWidth,weights:defaults.weights})}><Text style={{color:c.accent}}>恢复默认权重</Text></Pressable><Pressable accessibilityRole="button" disabled={!changed} onPress={async()=>{try{await preview({policy,refresh:true});setPreviewVersion(v=>v+1);setPreviewPolicy(policy);}catch{setMessage("更新观测失败，请稍后重试。");}}}><Text style={{color:c.accent}}>更新观测</Text></Pressable></View>
-        {changed&&<Text accessibilityRole="alert" style={[s.muted,{marginTop:8}]}>{previewQuery.isError?"预览失败，请检查权重或更新观测；未保存。":previewReady?`预览（未保存），观测 ${new Date(previewQuery.data!.at).toLocaleString()}`:"正在计算预览，未保存…"}</Text>}
-        <Text style={[s.muted,{marginTop:8}]}>展开模型可修正计费分类。新模型试用期间每30秒检查观测，已有报错记录不会重复当作新模型。</Text>
-        <Text style={[s.text,{fontSize:12,fontWeight:"600",marginTop:20,marginBottom:9}]}>刷新间隔</Text>
-        <Pressable accessibilityRole="button" accessibilityLabel="选择模型排序刷新间隔" accessibilityState={{expanded:selectOpen}} style={[s.input,s.row,{height:45,justifyContent:"space-between",paddingVertical:0}]} onPress={()=>setSelectOpen(!selectOpen)}><Text style={s.text}>{current.refreshMinutes} 分钟{current.refreshMinutes===5?"（默认）":""}</Text><Text style={s.muted}>⌄</Text></Pressable>
-        {selectOpen&&<View style={[s.input,{marginTop:6,gap:12}]}>{([2,5,10] as const).map(minutes=><Pressable key={minutes} accessibilityRole="button" accessibilityState={{selected:current.refreshMinutes===minutes}} onPress={()=>{setDraft({...current,refreshMinutes:minutes});setSelectOpen(false);}}><Text style={s.text}>{minutes} 分钟{minutes===5?"（默认）":""}</Text></Pressable>)}</View>}
-        <Pressable accessibilityRole="button" disabled={busy||!query.data} style={[s.row,{height:47,borderRadius:13,backgroundColor:savedAt?"#2ea77e":c.accent,paddingHorizontal:16,justifyContent:"space-between",marginTop:22,opacity:busy?0.6:1}]} onPress={async()=>{setBusy(true);setSavedAt(undefined);setMessage("");try{await save({...current,policy});await query.refetch();setDraft(previous=>previous&&(previous.rules!==current.rules||previous.refreshMinutes!==current.refreshMinutes||JSON.stringify(previous.policy)!==JSON.stringify(current.policy))?previous:undefined);setMessage("已保存，下次员工请求到达时刷新排序。");const at=Date.now();setSavedAt(at);setTimeout(()=>setSavedAt(previous=>previous===at?undefined:previous),2200);}catch{setMessage("保存失败，请重试。");}finally{setBusy(false);}}}><Text style={{color:c.accentForeground,fontSize:13,fontWeight:"700"}}>{busy?"保存中…":savedAt?"已保存设置":"保存排序设置"}</Text><Text style={{color:c.accentForeground,fontSize:18}}>{savedAt?"✓":"→"}</Text></Pressable>
-        {!!message&&<Text style={[s.muted,{marginTop:8}]}>{message}</Text>}
-        <View style={{borderTopWidth:1,borderColor:c.border,marginTop:24,paddingTop:19,gap:5}}><Text style={[s.muted,{fontSize:10}]}>最近刷新</Text><Text style={[s.text,{fontSize:11,fontFamily:"Menlo"}]}>{query.data?.at?new Date(query.data.at).toLocaleString():"尚未刷新"}</Text><Text style={[s.muted,{fontSize:10}]}>到期后由下一次员工请求触发后台刷新。</Text></View>
-        {unconfigured&&<Text style={[s.muted,{marginTop:8}]}>规则排序尚未初始化。</Text>}{failed&&<Text style={{color:c.statusWarning,fontSize:12,marginTop:8}}>{query.data?.error??"设置读取失败，请稍后重试。"}</Text>}
-      </View>
-      <View style={[s.panel,{flex:wide?1:undefined,width:wide?undefined:"100%",minWidth:0}]}>
-        <RelayHeading ctx={ctx} step="02" title="模型优先级" subtitle={changed?"配置预览 · 尚未应用线上":"依据当前规则生成的实时排序"}/>
-        <View style={{flexDirection:"row",gap:7,padding:5,borderRadius:13,backgroundColor:c.input,marginBottom:mobile?16:25}}>{[...tables].sort((a,b)=>['sck-haiku','sck-sonnet','sck-opus'].indexOf(a.group)-['sck-haiku','sck-sonnet','sck-opus'].indexOf(b.group)).map(table=><Pressable key={table.group} accessibilityRole="tab" accessibilityLabel={`查看 ${table.group} 模型排序`} accessibilityState={{selected:selected?.group===table.group}} onPress={()=>setGroup(table.group)} style={{flex:1,minHeight:39,borderRadius:9,backgroundColor:selected?.group===table.group?c.tab:"transparent",alignItems:"center",justifyContent:"center"}}><Text style={{color:selected?.group===table.group?c.foreground:c.foregroundMuted,fontSize:12,fontWeight:"600"}}>{table.group.replace('sck-','').replace(/^./,x=>x.toUpperCase())} <Text style={{color:selected?.group===table.group?c.accent:c.foregroundMuted,fontSize:10}}> {table.rows.length}</Text></Text></Pressable>)}</View>
-        {!!selected&&!!query.data?.attempts?.[selected.group]&&<Text style={[s.muted,{marginBottom:10,fontSize:10}]}>{(()=>{const a=query.data!.attempts[selected.group]!;return `最近刷新尝试：${new Date(a.at).toLocaleString()} · ${a.status} · ${a.modelCount} 个评分模型 · ${a.encoding} · 共享 ${a.stateBytes}/${a.limits.stateBytes} 字节 · 请求 ${a.requestBytes}/${a.limits.requestBytes} 字节`;})()}</Text>}
-        {selected?<ModelRankingList key={selected.group} ctx={ctx} table={selected} width={width} pinBusy={pinBusy||changed} billingOverrides={policy.billingOverrides} onBilling={(model,kind)=>{const next={...policy.billingOverrides};if(kind==="auto")delete next[model];else next[model]=kind as "free"|"included"|"unknown"|"paid";editPolicy({...policy,billingOverrides:next});}} onPin={async(model,pinned)=>{setPinBusy(true);setPinMessage("");try{await pin({group:selected.group as "sck-haiku"|"sck-sonnet"|"sck-opus",model,pinned});await query.refetch();setPinMessage(pinned?"已置顶到独立第一层，状态异常仍保留提示。":"已取消置顶，恢复自动分层。");}catch{await query.refetch();setPinMessage("置顶更新未完成，请刷新后重试。");}finally{setPinBusy(false);}}}/>:<Text style={s.muted}>尚无分组成员。</Text>}
-        {!!pinMessage&&<Text accessibilityRole="alert" style={[s.muted,{marginTop:10}]}>{pinMessage}</Text> }
-        {!!selected?.at&&<Text style={[s.muted,{marginTop:14,fontSize:10}]}>{selected.scored?"最近成功排序":"历史请求数据"}：{new Date(selected.at).toLocaleString()} · 本轮规则：{selected.rules??"未记录"}</Text>}
-      </View>
-    </View>
-    <View style={{marginTop:18}}><Collapsible title="历史 JEV 请求（已停用）" ctx={ctx}>
-      <Text style={s.muted}>仅保留切换前的历史快照；现在按固定规则排序，不再调用 JEV。</Text>
-      {!query.data?.requests.length&&<Text style={s.muted}>没有历史请求。</Text>}
-      {query.data?.requests.map(request=><View key={request.tier} style={{gap:8,marginTop:12}}><Text style={s.text}>{request.tier.toUpperCase()} · 调用开始：{new Date(request.at).toLocaleString()}</Text><RankingJson ctx={ctx} label="请求内容" value={request.payload}/><ExpandableText ctx={ctx} text={JSON.stringify(request.payload,null,2)} lines={3} style={{color:c.foregroundMuted,fontSize:11,fontFamily:"Menlo"}}/></View>)}
-    </Collapsible></View>
-  </View>;
-}
-
-/** Vendor names no rule matches: Jev's one-time call, and the owner's correction of it. */
-function ModelIdentityCard({ctx}: {ctx:Ctx}) {
-  const s=makeStyles(ctx);
-  const get=useRpc(rpc.modelIdentity), set=useRpc(rpc.setModelAlias);
-  const query=useQuery({queryKey:["model-identity"],queryFn:()=>get({}),refetchInterval:30000});
-  const [drafts,setDrafts]=useState<Record<string,string>>({});
-  const [all,setAll]=useState(false), [message,setMessage]=useState("");
-  const aliases=query.data?.aliases??[];
-  const inventory=query.data?.inventory;
-  const entries=[...aliases.map(a=>({...a,pending:false})),...(inventory?.pending??[]).filter(model=>!aliases.some(a=>a.model===model)).map(model=>({model,slug:null,by:"jev" as const,pending:true,suggested:undefined,confidence:undefined,aa:undefined}))];
-  const groupedIds=new Set(inventory?.grouped.map(m=>m.model)??[]);
-  const needsDecision=(a:typeof entries[number])=>!groupedIds.has(a.model)&&(a.pending||(!a.slug&&!!a.suggested));
-  const shown=all?entries:entries.filter(needsDecision);
-  const apply=async(model:string,slug:string|null)=>{
-    setMessage("");try{const result=await set({model,slug});await query.refetch();setDrafts(d=>({...d,[model]:""}));setMessage(result.synchronized===false?"裁决已保存；分组同步暂未完成，后台会重试。":"裁决已保存。已入组与已裁决未入组的记录已更新；现有分组成员不会因名称确认而移动。");}
-    catch(e){setMessage(`保存失败：${(e as Error).message}`);}
-  };
-  return <Section title="模型与 AA 榜单对应" ctx={ctx}><View style={s.card}>
-    <Text style={s.muted}>分档按 AA 分数，且分数对应测得时的思考等级；组内成员会固定在该等级。名称对不上的新模型由 Jev 判断一次，你可以改。</Text>
-    {query.isError&&<Text style={s.muted}>读取失败，请稍后重试。</Text>}
-    {!!query.data?.issues.length&&<Text style={s.text}>分档检查（不属于待裁决；现有成员不会自动移除）</Text>}
-    {query.data?.issues.map(i=><Text key={i.group+i.member} style={s.muted}>{i.group}：{i.member} — {i.reason}</Text>)}
-    <Text style={s.h2}>本地模型记录</Text>
-    <Text style={s.muted}>首次部署处理全量，之后仅处理未裁决的模型 ID。历史裁决与分组版本无关，重启后保留。</Text>
-    <Collapsible ctx={ctx} title={`已入组（${inventory?.grouped.length??0}）`}>
-      {inventory?.grouped.map(m=><Text key={m.model} style={s.muted}>{m.model} → {m.groups.join("、")}</Text>)}
-    </Collapsible>
-    <Collapsible ctx={ctx} title={`已裁决但未入组（${inventory?.decidedUngrouped.length??0}）`}>
-      {inventory?.decidedUngrouped.map(m=><Text key={m.model} style={s.muted}>{m.model} · {m.by==="owner"?"人工":m.by==="jev"?"Jev":m.by==="group"?"曾入组":"规则匹配"} · {m.reason}{m.present?"":" · 当前目录已无此模型"}</Text>)}
-    </Collapsible>
-    <Text style={s.text}>待裁决 / 待人工确认（{entries.filter(needsDecision).length}）</Text>
-    {!shown.length&&<Text style={s.muted}>没有待裁决的映射。已处理的记录可在历史中查看。</Text>}
-    {shown.map(a=><View key={a.model} style={s.card}>
-      <Text style={s.text}>{a.model}</Text>
-      <Text style={s.muted}>{a.pending?"尚未裁决，等待 Jev 或人工处理":a.slug?`= ${a.aa?.name??a.slug}（${a.aa?.score??"?"}）`:a.suggested?`Jev 倾向 ${a.aa?.name??a.suggested}（${a.aa?.score??"?"}），但不够确定，未采用`:"不对应任何 AA 模型"}
-        {a.by==="owner"?" · 你设定":a.confidence!==undefined?` · Jev 置信 ${a.confidence.toFixed(2)}`:""}</Text>
-      <TextInput accessibilityLabel={`${a.model} 对应的 AA slug`} style={s.input} placeholder={a.suggested??"AA slug，例如 qwen3-8-flash-next"}
-        value={drafts[a.model]??""} onChangeText={v=>setDrafts(d=>({...d,[a.model]:v}))}/>
-      <View style={{flexDirection:"row",gap:8}}>
-        <Pressable accessibilityRole="button" style={s.buttonSecondary} disabled={!(drafts[a.model]||a.suggested)} onPress={()=>void apply(a.model,(drafts[a.model]||a.suggested)!.trim())}><Text style={s.text}>采用</Text></Pressable>
-        <Pressable accessibilityRole="button" style={s.buttonSecondary} onPress={()=>void apply(a.model,null)}><Text style={s.text}>设为不对应</Text></Pressable>
-      </View>
-    </View>)}
-    {entries.length>shown.length||all?<Pressable accessibilityRole="button" style={s.buttonSecondary} onPress={()=>setAll(!all)}><Text style={s.text}>{all?"只看待裁决的":`查看历史裁决（${aliases.length}）`}</Text></Pressable>:null}
-    {!!message&&<Text style={s.muted}>{message}</Text>}
-  </View></Section>;
-}
-
 function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   const s = makeStyles(ctx);
   const queryClient = useQueryClient();
@@ -1439,8 +1196,6 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   const refreshAll = () => void queryClient.invalidateQueries();
   return (
     <View style={{ gap: 12 }}>
-      <ModelRankingCard ctx={ctx}/>
-      <ModelIdentityCard ctx={ctx}/>
       <Section title="派工开关" ctx={ctx}>
         <View style={[s.card, s.row]}>
           <Text style={[s.text, { flex: 1 }]}>{r?.paused ? "派工已暂停" : "派工运行中"}</Text>
@@ -1628,13 +1383,14 @@ export function CompanySurface(props: PluginSurfaceProps) {
   const s = makeStyles(ctx);
   const briefRpc = useRpc(rpc.brief);
   const brief = useQuery({ queryKey: ["brief"], queryFn: () => briefRpc({}), refetchInterval: 15_000 });
-  const [tab, setTab] = useState<"pulse" | "inbox" | "new" | "goals" | "roster">("pulse");
+  const [tab, setTab] = useState<"pulse" | "inbox" | "new" | "goals" | "roster" | "models">("pulse");
   const tabs = [
     { id: "pulse" as const, title: "动态" },
     { id: "inbox" as const, title: "收件箱" },
     { id: "new" as const, title: "发目标" },
     { id: "goals" as const, title: "目标进展" },
     { id: "roster" as const, title: "编制" },
+    { id: "models" as const, title: "模型排序" },
   ];
   return (
     <View style={s.screen}>
@@ -1655,6 +1411,7 @@ export function CompanySurface(props: PluginSurfaceProps) {
         {tab === "new" && <NewGoalTab ctx={ctx} brief={brief.data} />}
         {tab === "goals" && <GoalsTab ctx={ctx} brief={brief.data} />}
         {tab === "roster" && <RosterTab ctx={ctx} brief={brief.data} />}
+        {tab === "models" && <ModelRoutingPanel ctx={ctx}/>}
       </ScrollView>
     </View>
   );

@@ -215,7 +215,7 @@ test('refresh records immutable rule decisions, requires no Jev client and skips
  const publication=f.writes.find(w=>w?.results);
  expect(Object.keys(publication.results)).toEqual(['sck-haiku']);expect(f.calls).toEqual([]);
  expect(publication.orders['sck-haiku']).toEqual(['p/b']);
- expect(publication.results['sck-haiku']).toMatchObject({engine:'quality-pace-v4',answers:{},rows:[{facts:{id:'p/b'},decision:{latencySource:'unknown'}}]});
+ expect(publication.results['sck-haiku']).toMatchObject({engine:'quality-pace-v5',answers:{},rows:[{facts:{id:'p/b'},decision:{latencySource:'unknown'}}]});
 });
 
 test('ranking list joins current members to one successful snapshot, never a newer failed attempt or another effort',async()=>{
@@ -304,7 +304,7 @@ test('automatic ranking neither reads facts nor sends Jev questions or applies o
  expect(f.calls).toEqual([]);
  expect(f.applied[0]['sck-opus']).toBeUndefined();
  await expect(r.setPin('sck-opus','owner/manual:high',true)).rejects.toThrow();
- expect(rankingTables({'sck-opus':['owner/manual:high']},{},[],{'sck-opus':['owner/manual:high']})).toEqual([]);
+ expect(rankingTables({'sck-opus':['owner/manual:high']},{},[],{'sck-opus':['owner/manual:high']})).toMatchObject([{group:'sck-opus',rows:[{model:'owner/manual:high',decision:undefined}]}]);
 });
 
 test('Jev failure preserves successful scores while independent safety observations demote and recover members',async()=>{
@@ -319,7 +319,7 @@ test('Jev failure preserves successful scores while independent safety observati
   apply:async o=>{members=o['sck-haiku']!;},jev:{model:'fixture',ask:async(_s,q)=>{if(fail)throw Error('upstream');return response(q);}}});
  r.trigger(0);await r.settled();const success=structuredClone(results['sck-haiku']);
  fail=true;bad=true;r.trigger(300000);await r.settled();
- expect(results['sck-haiku'].engine).toBe('quality-pace-v4');expect(members.at(-1)).toBe('p/a');
+ expect(results['sck-haiku'].engine).toBe('quality-pace-v5');expect(members.at(-1)).toBe('p/a');
  let t=rankingTables({'sck-haiku':members},results,[],{},gates)[0]!;
  expect(t.scored).toBe(true);expect(t.at).toBe(results['sck-haiku'].at);expect(t.rows.find(r=>r.model==='p/b')?.decision).toBeDefined();
  expect(t.rows.find(r=>r.model==='p/a')?.jevScore).toBeUndefined();expect(t.rows.find(r=>r.model==='p/a')?.health?.excluded).toBe(true);

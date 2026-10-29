@@ -1,16 +1,16 @@
 {
-  "version": "0.3.33",
-  "title": "Magpie 受控路由恢复工具收口为只读 plan",
+  "version": "0.3.34",
+  "title": "非线性模型评分与统一模型管理",
   "changes": [
-    "ops_magpie_route_restore 只发布只读 plan：plan 返回 writeAvailable=false、gatewayReload=unknown，并明确真实账号/路由恢复未完成；plan 通过不等于恢复成功。",
-    "apply 在 broker 入口与底层导出入口都以结构化 not_configured（capability=magpie_route_restore_apply）拒绝，发生在任何配置读取、密封或 journal 访问之前；qa、engineering、product、gm 一致拒绝，直接 import 底层入口也无法写入。",
-    "未发布的 apply 实现保留为后续发布的可恢复证据：修复崩溃恢复元数据（done 不再以 null 覆盖 started.backupFile；本键中断写入的组标为 created 并附 recovered 标记，不再冒充 unchanged），旧 journal 与备份原件保留不清理。保留实现生产不可达（broker 只引用拒绝入口、src 无其他引用，测试守卫），恢复功能标注为不可用。",
-    "plan 沿用环境既有 cfg.roles 授权；本发布不改生产 roles、不新增 GM 权限、不放宽 sck-* 组名、不直接写 group/work、不启动管理进程或重启 daemon。将来 apply 必须 GM 代码门加受控 roles 配置并经另一条上线链。"
+    "取消自动能力、计费、临期与20秒分层，统一按非线性总分降序；保留人工置顶，Opus/Fable手动维护。",
+    "免费模型不受供应商额度影响；延迟、可靠性、费用、绩效与额度互相约束；首次实测后探索奖励也受延迟约束。",
+    "新增独立模型排序页与实时模型目录，可搜索分页、直接添加或移出分组、选择已评分AA模型关联。",
+    "插件与网页审核台按redesign2参考重做明暗色布局，显示实际费用、乘法因子与总分，移除过时JEV和分层组件。"
   ],
   "impact": [
-    "只读能力增量：员工可对 Magpie 路由组与账号绑定现状做脱敏核对；不写配置、不密封、不落 journal、不调用模型、不动订阅/额度/预算。",
-    "真实写入通道、组 schema 与网关加载语义仍未证实，实际账号/路由恢复需要另立任务；本发布不声称业务恢复完成。"
+    "仅影响Haiku/Sonnet后续模型优先顺序与老板模型管理，不改变运行中任务租约或模型绩效历史。",
+    "账号选择继续交给Magpie原生PACE；管理操作保留其他分组与组内配置，手动移除不再自动加入。"
   ],
-  "migration": "无数据库迁移、无新环境变量、无主机准备变更；复用既有 journal/备份原件，不做清理或改写。",
-  "rollback": "revert 合入提交并按受控 release/vendor 重发；保留的 journal 与 0600 备份原件不随回滚删除，回滚后同样不提供 apply，也不以 DML 或手工替换 providers.json 代替。"
+  "migration": "无schema变更。旧bandWidth仅保留读取兼容，不参与评分。升级后用最新实测刷新自动排序；不把缺失免费信息猜成免费。",
+  "rollback": "用受控安装器恢复上一健康main发布；保留手动分组、AA关联、绩效和任务历史，重新按旧版本配置刷新排序。"
 }

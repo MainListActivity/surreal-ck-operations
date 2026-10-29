@@ -10,7 +10,7 @@ import {relayDesignCss} from '../plugin/shared/relay-design.ts';
 const homes:string[]=[];
 afterEach(()=>{for(const home of homes.splice(0))rmSync(home,{recursive:true,force:true});});
 function fixture(){
- const home=mkdtempSync(join(tmpdir(),'sck-ranking-console-'));homes.push(home);let settings={ranking_rules:'原规则',ranking_refresh_minutes:5};const resets:number[]=[];const pins:unknown[]=[];
+ const home=mkdtempSync(join(tmpdir(),'sck-ranking-console-'));homes.push(home);let settings={ranking_rules:'原规则',ranking_refresh_minutes:5};const resets:number[]=[];const pins:unknown[]=[];const membership:unknown[]=[];const aliases:unknown[]=[];
  const db={query:async(sql:string,vars?:any)=>{
   if(sql.startsWith('SELECT ranking_rules'))return [settings];
   if(sql.startsWith('SELECT at,error,orders,results,pins'))return [{at:new Date('2026-10-24T08:00:00Z'),orders:{},results:{}}];
@@ -18,22 +18,22 @@ function fixture(){
   if(sql.startsWith('UPSERT company_meta:model_routing')){settings={ranking_rules:vars.rules,ranking_refresh_minutes:vars.minutes};return [undefined];}
   throw Error('Unexpected query');
  }};
- const fetch=createConsoleFetch({home,lanBase:()=> 'http://localhost',company:async()=>({db:{db},modelRanking:{setPin:async(...args:unknown[])=>{pins.push(args);},reset:(minutes:number)=>resets.push(minutes)}} as any)});
+ const fetch=createConsoleFetch({home,lanBase:()=> 'http://localhost',company:async()=>({db:{db},modelRouting:{catalogPage:async(query:string,offset:number)=>({models:[],query,offset}),setMembership:async(input:unknown)=>{membership.push(input);},setAlias:async(...args:unknown[])=>{aliases.push(args);return {synchronized:true};}},modelRanking:{configure:async(write:()=>Promise<void>,minutes:number)=>{await write();resets.push(minutes);},trigger:()=>{},setPin:async(...args:unknown[])=>{pins.push(args);},reset:(minutes:number)=>resets.push(minutes)}} as any)});
  const base=consoleUrl(home,()=> 'http://localhost')+'/';
  const request=(path:string,body?:unknown,origin?:string)=>fetch(new Request(base+path,body===undefined?undefined:{method:'POST',headers:{'content-type':'application/json',...(origin?{origin}:{})},body:JSON.stringify(body)}));
- return {fetch,request,resets,pins,home,base};
+ return {fetch,request,resets,pins,membership,aliases,home,base};
 }
 test('owner ranking page uses supplied Figma layout, real API, light/dark tokens and a review-console return link',async()=>{
  const f=fixture();expect((await f.fetch(new Request('http://localhost/o/wrong/ranking'))).status).toBe(404);
  const response=await f.request('ranking');expect(response.status).toBe(200);const html=await response.text();
- for(const part of ['ranking-layer-guide','这一层如何形成','先比较分层，再比较层内分','id="policy-editor"','api/model-ranking/preview','class="workspace"','class="settings-panel"','class="results-panel"','class="model-list"','model-row-main','role="tablist"','href="./"','api/model-ranking','aria-expanded'])expect(html).toContain(part);
- expect(html).toContain('prefers-color-scheme:light');expect(html).toContain('<title>模型排序');expect(html).toContain('Opus 的成员、顺序和组内配置由你在 Magpie 手动维护');expect(html).not.toContain('seedModels');expect(html).not.toContain('makeModels');
+ for(const part of ['几何效用','管理模型','id="policy-editor"','model-ranking/preview','class="ranking-layout"','class="rule-card"','class="ranking-card"','class="model-list"','model-main','role="tablist"','href="./"','model-membership','aria-expanded'])expect(html).toContain(part);
+ expect(html).toContain('prefers-color-scheme:light');expect(html).toContain('<title>模型排序');expect(html).toContain('Opus / Fable 保持手动');expect(html).not.toContain('seedModels');expect(html).not.toContain('makeModels');
  const script=rankingPage.match(/<script>([\s\S]*?)<\/script>/)![1]!;
  expect(()=>new Function(script)).not.toThrow();
  expect(html).not.toMatch(/\.metrics small\s*\{\s*display:\s*none/);
  expect(script).toContain('EWMA');
  expect(html).not.toContain('<textarea');
- expect(script).toContain("$('rule').textContent=state.rules");
+ expect(html).not.toContain('历史 JEV 请求');
  expect(script).not.toContain("$('rule').value");
  expect(script).toContain('rules:state.rules,refreshMinutes:Number');
  expect((await (await f.request('')).text())).toContain("location.href='ranking'");
@@ -70,4 +70,28 @@ test('owner preview rejects foreign origins and invalid configuration without ch
  expect((await f.request('api/model-ranking/preview',{policy:{}},'https://other.example')).status).toBe(403);
  expect((await f.request('api/model-ranking',{rules:'',refreshMinutes:10,policy:{bandWidth:100}},'http://localhost')).status).toBe(400);
  expect(f.resets).toEqual([]);expect(await (await f.request('api/model-ranking')).json()).toMatchObject({refreshMinutes:5});
+});
+
+test('model management shares owner token/origin protections and validates exact membership inputs',async()=>{
+ const f=fixture();const body={group:'sck-haiku',model:'p/a:max',present:true,expectedMembers:[]};
+ expect((await f.request('api/model-membership',body,'https://foreign.example')).status).toBe(403);
+ expect((await f.request('api/model-membership',{...body,group:'other-group'})).status).toBe(409);
+ expect((await f.request('api/model-membership',{...body,expectedMembers:'untrusted'})).status).toBe(409);
+ expect(f.membership).toEqual([]);
+ expect((await f.request('api/model-membership',body,'http://localhost')).status).toBe(200);expect(f.membership).toEqual([body]);
+ expect((await f.request('api/model-alias',{model:'p/a',slug:'aa-id'},'https://foreign.example')).status).toBe(403);
+ expect((await f.request('api/model-alias',{model:'p/a',slug:42})).status).toBe(409);
+ expect((await f.request('api/model-alias',{model:'p/a',slug:'aa-id'})).status).toBe(200);expect(f.aliases).toEqual([['p/a','aa-id']]);
+ expect((await f.request('api/model-catalog?query=a&offset=40')).status).toBe(200);
+});
+
+test('polling preserves an unsaved refresh interval and saves the selected value',async()=>{
+ const nodes=new Map<string,any>();const node=(id:string)=>{if(!nodes.has(id))nodes.set(id,{value:'',dataset:{},classList:{toggle(){}},querySelectorAll:()=>[],disabled:true});return nodes.get(id);};
+ const writes:any[]=[];
+ const fetch=async(_url:string,options:any)=>{if(options?.body)writes.push(JSON.parse(options.body));return {ok:true,json:async()=>({tables:[],refreshMinutes:5})};};
+ const script=rankingPage.match(/<script>([\s\S]*?)<\/script>/)![1]!;
+ const page=new Function('document','localStorage','matchMedia','fetch','setInterval',script+';return {read};')({getElementById:node,documentElement:{dataset:{}}},{getItem:()=>null},()=>({matches:false}),fetch,()=>{});
+ await page.read();node('refresh').value='10';node('refresh').onchange();await page.read();
+ expect(node('refresh').value).toBe('10');expect(node('save-rule').disabled).toBe(false);
+ await node('save-rule').onclick();expect(writes[0].refreshMinutes).toBe(10);
 });

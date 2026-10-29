@@ -1,10 +1,9 @@
-import {rankingLayers} from "../shared/ranking-layers.ts";
-import {DEFAULT_POLICY,WEIGHT_LABELS,BILLING_LABELS} from './vendor/src/model-routing/weights.ts';
-import { rankingHealthMetric, rankingTrendDetail, rankingRuleLabel } from "../shared/ranking-trends.ts";
-import { relayShellCss, relayIcon } from "../shared/relay-shell.ts";
-
-/** Browser counterpart of the owner's Figma layout; data is supplied by the shared ranking API. */
-export const rankingPage = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>模型排序 · 公司审核台</title><style>${relayShellCss}</style></head><body><div class="shell">
+import {routingDesignCss} from '../shared/model-routing-design.ts';
+import {ROUTING_DEFAULTS,ROUTING_WEIGHTS,ROUTING_FORMULA,ROUTING_COST_HELP,routingNumber,routingMetrics,routingTrends} from '../shared/model-routing-view.ts';
+import {rankingTrendDetail} from '../shared/ranking-trends.ts';
+import {relayShellCss,relayIcon} from '../shared/relay-shell.ts';
+/** Review-console counterpart of the same owner model management surface. */
+export const rankingPage = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>模型排序 · 公司审核台</title><style>${relayShellCss}${routingDesignCss}</style></head><body><div class="shell">
 <aside class="sidebar">
 <a class="brand" href="./" title="返回公司审核台"><span class="brand-mark"><i></i><i></i></span><span><strong>Relay</strong><small>Operations</small></span></a>
 <p class="nav-label">管理工作区</p>
@@ -23,109 +22,88 @@ export const rankingPage = `<!doctype html><html lang="zh-CN"><head><meta charse
 <div class="top-actions"><button class="icon-button" id="theme-btn" onclick="toggleTheme()" aria-label="切换主题"></button></div>
 </header>
 <main class="content">
-<header class="page-title"><div><p class="kicker">ROUTING CONSOLE</p><h1>模型排序</h1><p class="page-copy">Haiku、Sonnet 按规则自动排序；Opus 的成员、顺序和组内配置由你在 Magpie 手动维护。</p></div><div class="sync-state"><span class="sync-dot"></span><div><strong id="sync-title">正在加载</strong><span id="sync-time">等待同步</span></div></div></header>
-<div class="workspace"><aside class="settings-panel"><div class="section-heading"><span class="step">01</span><div><h2>排序规则</h2><p>固定规则，无模型调用费用</p></div></div><div class="field-label">当前生效规则</div><p id="rule" style="font-size:12px;line-height:1.8;white-space:pre-wrap;margin:0"></p><p class="field-help">固定分层内使用加权分；修改后自动预览，保存前不影响线上。</p><div id="policy-editor"></div><button id="default-weights" class="pin-button">恢复默认权重</button><button id="refresh-observations" class="pin-button">更新观测</button><p id="preview-status" class="field-help" role="status"></p><label class="field-label" for="refresh">刷新间隔</label><div class="select-wrap"><select id="refresh"><option value="2">2 分钟</option><option value="5" selected>5 分钟（默认）</option><option value="10">10 分钟</option></select></div><button id="save-rule" class="save-button" disabled><span id="save-label" style="font-size:13px">保存排序设置</span><span id="save-arrow">→</span></button><p id="save-message" class="field-help" role="status"></p><div class="last-refresh"><span>最近刷新</span><time id="last-refresh">尚未刷新</time><p>到期后由下一次员工请求触发后台刷新。</p></div><p id="error" class="error-message" role="alert"></p></aside>
-<section class="results-panel"><div class="section-heading results-heading"><span class="step">02</span><div><h2>模型优先级</h2><p id="ranking-mode">依据当前规则生成的实时排序</p></div><span id="updated" class="updated"></span></div><div class="tabs" id="group-tabs" role="tablist" aria-label="模型组"></div><div class="group-summary"><div><h2 id="models-heading">Haiku 模型</h2><p>手动置顶之后优先消耗临期可用额度；其余模型中，新模型优先试用，再按能力档、免费/套餐积分/未知/额外付费分层，再比较综合分。</p></div><span id="model-count" class="model-count">加载中</span></div><div class="ranking-layer-guide"><strong>先比较分层，再比较层内分</strong><p>①手动置顶 → ②临期可用额度（综合分降序）→ ③其余模型按安全状态 → 新模型试用 → AA能力档 → 计费类型 → 层内分降序</p><p>手动置顶按先后排列；临期层不再按能力或计费拆分，直接比较综合分，异常模型仍置后。其余模型的安全状态、试用状态、能力档、计费类型都相同，才是同一层。AA档在同一安全状态内从最高分开始逐档划分；每层下方列出实际范围和依据。</p><p id="layer-source">以下分层来自最近成功排序快照；跨层即使分数更高，也不会提前。</p></div><p id="legacy" class="field-help"></p><p id="pin-message" class="field-help" role="status"></p><div id="model-list" class="model-list"></div><p id="attempt-budget" class="field-help"></p><p id="snapshot" class="field-help"></p><details class="request-details"><summary>历史 JEV 请求（已停用）</summary><pre id="request-json"></pre></details></section></div>
+<header class="page-title"><div><p class="kicker">MODEL ROUTING</p><h1>模型排序</h1><p class="page-copy">评分、真实实测与模型管理。Haiku / Sonnet 自动排序，Opus / Fable 保持手动。</p></div><div class="sync-state"><span class="sync-dot"></span><span id="updated">正在读取…</span></div></header>
+<div class="ranking-layout"><aside class="rule-card"><div class="number-title"><span>01</span><div><h2>评分规则</h2><p>非线性计算 · 无模型调用费用</p></div></div><p id="formula"></p><div id="policy-editor"></div><p>延迟以20秒为衰减参考，连续扣分；未知指标使用保守先验，新模型获得有限探索。</p><label for="refresh">刷新间隔</label><select id="refresh"><option value="2">2 分钟</option><option value="5">5 分钟（默认）</option><option value="10">10 分钟</option></select><button id="save-rule" class="save-rule" disabled>保存设置</button><div class="row-actions"><button id="default-weights" class="small-button">恢复默认</button><button id="refresh-observations" class="small-button">更新观测</button></div><p id="preview-status" class="status-line" role="status"></p><p id="cost-help"></p><div class="rule-meta"><span>最近成功排序</span><strong id="last-refresh">尚未刷新</strong><p>每次请求读取内存排序；到期后下一次请求触发异步刷新。</p></div><p id="error" class="routing-error" role="alert"></p></aside>
+<section class="ranking-card"><div class="number-title"><span>02</span><div><h2>模型优先级与管理</h2><p id="ranking-mode">实时成员 · 按总分排序</p></div></div><div class="model-tabs" id="group-tabs" role="tablist" aria-label="模型分组"></div><div class="routing-tools"><button id="show-ranking" class="active">当前排序</button><button id="show-catalog">管理模型</button><input id="search" class="routing-input" placeholder="搜索模型或供应商" aria-label="搜索模型或供应商"></div><p id="summary" class="model-note"></p><p id="message" class="status-line" role="status"></p><div id="model-list" class="model-list"></div><div id="pagination" class="pagination"></div></section></div>
 </main></div></div><script>
-const store={get:k=>{try{return localStorage.getItem(k)}catch(e){return null}},set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}}};
-function prefTheme(){try{return matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}catch(e){return 'light'}}
-function renderThemeBtn(){const b=document.getElementById('theme-btn');if(b)b.innerHTML='<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">'+((store.get('relay-theme')||prefTheme())==='light'?'<path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/>':'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/>')+'</svg>'}
-function toggleTheme(){const next=(store.get('relay-theme')||prefTheme())==='light'?'dark':'light';store.set('relay-theme',next);document.documentElement.dataset.theme=next;renderThemeBtn()}
-{const st=store.get('relay-theme');if(st)document.documentElement.dataset.theme=st}
-renderThemeBtn();
 const $=id=>document.getElementById(id);
-const defaults=${JSON.stringify(DEFAULT_POLICY)},weightLabels=${JSON.stringify(WEIGHT_LABELS)},billingLabels=${JSON.stringify(BILLING_LABELS)};
-let policy=null,preview=null,previewPending=false,previewTimer,previewSequence=0,policyDirty=false;
-const copy=v=>JSON.parse(JSON.stringify(v));
-function editor(){if(!policy)return;
- $('policy-editor').innerHTML='<p class="field-help">总分 = 各项加权得分之和 ÷ 权重之和。未知指标不加分；展开模型可修正计费分类。</p>'+Object.entries(weightLabels).map(([key,label])=>'<label style="display:flex;align-items:center;justify-content:space-between;margin:8px 0">'+label+'<input data-weight="'+key+'" type="number" min="0" max="100" value="'+policy.weights[key]+'" style="width:70px;padding:8px;background:transparent;color:inherit;border:1px solid var(--border);border-radius:8px"></label>').join('')+'<label style="display:flex;justify-content:space-between">AA 能力档宽度<input id="band-width" type="number" min="0" max="10" step="0.1" value="'+policy.bandWidth+'" style="width:70px;background:transparent;color:inherit"></label>';
- $('policy-editor').querySelectorAll('[data-weight]').forEach(e=>e.oninput=()=>{policy.weights[e.dataset.weight]=Number(e.value);changePolicy();});
- $('band-width').oninput=e=>{policy.bandWidth=Number(e.target.value);changePolicy();};
-}
-function changePolicy(){dirty=true;policyDirty=true;preview=null;previewPending=true;++previewSequence;clearTimeout(previewTimer);$('preview-status').textContent='正在计算预览，未保存…';draw();previewTimer=setTimeout(()=>runPreview(false),500);}
-async function runPreview(refresh){
- const sequence=++previewSequence,body={policy:copy(policy),refresh};previewPending=true;
- try{const r=await fetch('api/model-ranking/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();if(sequence!==previewSequence)return;if(!r.ok)throw Error(j.error||'预览失败');preview=j;$('preview-status').textContent='预览（未保存），观测 '+new Date(j.at).toLocaleString();}
- catch(e){if(sequence===previewSequence){preview=null;$('preview-status').textContent=e.message+'；线上未变更';}}
- finally{if(sequence===previewSequence){previewPending=false;draw();}}
-}
-$('default-weights').onclick=()=>{policy={...policy,bandWidth:defaults.bandWidth,weights:{...defaults.weights}};editor();changePolicy();};
-$('refresh-observations').onclick=()=>{if(!policy)return;dirty=true;policyDirty=true;clearTimeout(previewTimer);preview=null;draw();runPreview(true);};
-const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const num=(v,n=1)=>typeof v==='number'&&Number.isFinite(v)?v.toFixed(n):'未知';
-let state=null,group='sck-haiku',expanded=null,dirty=false,saving=false,pinning=false,readSequence=0,saveTimer;
-const api=async(body)=>{const r=await fetch('api/model-ranking',body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{cache:'no-store'});const j=await r.json();if(!r.ok)throw Error(j.error||'读取失败');return j;};
+const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const copy=value=>JSON.parse(JSON.stringify(value));
+const defaults=${JSON.stringify(ROUTING_DEFAULTS)},weightLabels=${JSON.stringify(ROUTING_WEIGHTS)};
+const formula=${JSON.stringify(ROUTING_FORMULA)},costHelp=${JSON.stringify(ROUTING_COST_HELP)};
+const routingNumber=${routingNumber.toString()},routingMetrics=${routingMetrics.toString()},routingTrends=${routingTrends.toString()};
 const trendDetail=${rankingTrendDetail.toString()};
-const layerSections=${rankingLayers.toString()};
-const ruleLabel=${rankingRuleLabel.toString()};
-const healthMetric=${rankingHealthMetric.toString()};
-function metrics(row){return [
- ['层内分',num(row.decision?.score,2),row.pinned?'手动置顶按先后排列，分数仅供参考':row.previousRank?'线上第 '+row.previousRank+' 名':'仅在固定层内比较'],
- ['排序依据',row.decision?.reason??'等待规则排序','不调用 JEV；首 token 置后阈值20秒'],
- ['AA 智能分',num(row.aaScore),(row.aaRank===undefined?'暂无排名':'全榜第 '+row.aaRank+' 名')+' · '+trendDetail(row.trends?.aaScore)],
- ['生成速度',row.tokensPerSecond===undefined?'未知':num(row.tokensPerSecond,0)+' tok/s',trendDetail(row.trends?.tokensPerSecond)],
- ['首 token 延迟',row.ttftMs===undefined?'未知':num(row.ttftMs/1000,2)+' 秒',(row.tailReason?row.tailReason+' · ':'')+trendDetail(row.trends?.ttftMs)],
- ['临期额度',row.urgency?row.urgency.amount+row.urgency.unit+' · '+row.urgency.requests+'/5条':'无有效临期额度',row.urgency?row.urgency.reason+'；截止 '+row.urgency.expiresAt:'仅使用明确期限与新鲜额度读数'],
- ['剩余额度',quota(row),trendDetail(row.trends?.remainingPct)],
- ['请求稳定性',row.stabilityPct===undefined?'未知':num(row.stabilityPct)+'%','错误率趋势：'+trendDetail(row.trends?.errorRate)],
- ['路由尝试',healthMetric(row.health,row.pinned).value,healthMetric(row.health,row.pinned).detail],
- ['缓存命中率',row.trends?.cacheHitRate?.current===undefined?'未知':num(row.trends.cacheHitRate.current*100)+'%',trendDetail(row.trends?.cacheHitRate)],
- ['样本权重',num(row.performanceSamples,2),trendDetail(row.trends?.performanceScore)]
- ];}
-function quota(row){return row.accounts?.length?row.accounts.map((a,i)=>(row.accounts.length>1?'#'+(i+1)+' ':'')+(a.remainingPct===undefined?'未知':num(a.remainingPct)+'%')).join(' · '):'未知';}
-function selected(){const tables=policyDirty?(preview?.tables||[]):state?.tables||[];return tables.find(t=>t.group===group)||tables[0];}
+const groups=['sck-haiku','sck-sonnet','sck-opus','sck-fable'],groupLabel=g=>g.replace('sck-','').replace(/^./,x=>x.toUpperCase());
+let state,policy,preview,dirty=false,previewReady=false,previewTimer,previewSeq=0,mode='ranking',group='sck-haiku',search='',expanded='',shown=12,busy=false,catalog,catalogOffset=0,catalogExpanded='',catalogSeq=0,searchTimer,refreshDirty=false;
+const api=async(path,body)=>{const r=await fetch('api/'+path,body===undefined?{cache:'no-store'}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();if(!r.ok)throw Error(j.error||'请求失败');return j;};
+function setTheme(theme){document.documentElement.dataset.theme=theme;try{localStorage.setItem('relay-theme',theme)}catch{}}
+try{const theme=localStorage.getItem('relay-theme');if(theme)setTheme(theme)}catch{}
+$('theme-btn').onclick=()=>setTheme((document.documentElement.dataset.theme||((matchMedia('(prefers-color-scheme:dark)').matches)?'dark':'light'))==='dark'?'light':'dark');
+$('theme-btn').innerHTML='${relayIcon("sun")}';
+$('formula').textContent=formula;$('cost-help').textContent=costHelp;
+function editor(){
+ $('policy-editor').innerHTML=Object.entries(weightLabels).map(([key,title])=>'<label class="weights-row">'+esc(title)+'<input class="routing-input" aria-label="'+esc(title)+'权重" data-weight="'+key+'" type="number" min="0" max="100" value="'+policy.weights[key]+'"></label>').join('');
+ $('policy-editor').querySelectorAll('[data-weight]').forEach(input=>input.oninput=()=>{policy.weights[input.dataset.weight]=Number(input.value);changePolicy();});
+}
+function changePolicy(){dirty=true;previewReady=false;preview=undefined;const seq=++previewSeq;clearTimeout(previewTimer);$('preview-status').textContent='正在计算预览，未保存…';$('save-rule').disabled=false;draw();previewTimer=setTimeout(()=>runPreview(false,seq),450);}
+async function runPreview(refresh,seq=++previewSeq){
+ try{const result=await api('model-ranking/preview',{policy:copy(policy),refresh});if(seq!==previewSeq)return;preview=result;previewReady=true;$('preview-status').textContent=dirty?'预览中，保存前不影响线上。':'观测已更新。';draw();}
+ catch(e){if(seq===previewSeq){previewReady=false;$('preview-status').textContent=e.message+'；线上未变更。';}}
+}
+function currentTable(){return (dirty?(previewReady?preview?.tables:[]):state?.tables)?.find(t=>t.group===group);}
+function rankingRows(){return (currentTable()?.rows??[]).filter(row=>row.model.toLowerCase().includes(search.toLowerCase()));}
+function rowHtml(row,index){
+ const actualRank=(currentTable()?.rows.findIndex(r=>r.model===row.model)??index)+1;
+ const parts=row.model.replace(/^remote-magpie\\//,'').split('/'),name=parts.pop(),open=expanded===row.model,f=row.decision?.factors;
+ const detail=open?'<div class="score-details"><code>'+esc(row.model)+'</code><p class="model-note">'+esc(row.decision?.reason??'本组手动维护，尚无自动评分')+'</p><div class="metric-grid">'+routingMetrics(row).map(([title,value,note])=>'<div><small>'+esc(title)+'</small><strong>'+esc(value)+'</strong><small>'+esc(note)+'</small></div>').join('')+'</div>'+
+ (f?'<p class="factor-line">计算：'+[f.base,f.latency,f.availability,f.reliability,f.urgency].map(v=>routingNumber(v,3)).join(' × ')+' + '+routingNumber(f.exploration,2)+' = '+routingNumber(row.decision.score,2)+(row.decision.tail?'（不可用模型记0）':'')+'</p>':'')+
+ Object.entries(row.decision?.contributions??{}).map(([key,v])=>'<div class="factor-line">'+esc(weightLabels[key])+'：原始分 '+routingNumber(v.value===undefined?undefined:v.value*100)+' / 100 · 权重 '+v.weight+' · 乘数 '+routingNumber(v.factor,3)+'</div>').join('')+
+ routingTrends(row).map(([title,trend])=>'<p class="factor-line">'+esc(title)+'：'+esc(trendDetail(trend))+'</p>').join('')+'<div class="row-actions">'+(['sck-haiku','sck-sonnet'].includes(group)?'<button class="small-button" data-pin="'+index+'" '+(dirty||busy?'disabled':'')+'>'+(row.pinned?'取消置顶':'置顶模型')+'</button>':'')+'<button class="small-button" data-manage="'+index+'">管理此模型</button></div><div class="row-actions">'+Object.entries({auto:'自动计费',free:'免费',included:'订阅/积分',unknown:'未知',paid:'额外付费'}).map(([key,title])=>'<button class="small-button" data-billing="'+key+'" data-billing-row="'+index+'">'+((policy.billingOverrides[row.model]??'auto')===key?'✓ ':'')+title+'</button>').join('')+'</div></div>':'';
+ return '<article class="model-row '+(open?'open':'')+'"><button class="model-main" aria-expanded="'+open+'" data-expand="'+index+'"><b class="rank">#'+actualRank+'</b><span class="model-id"><strong>'+esc(name)+'</strong><small>'+esc(parts.join('/'))+(row.pinned?' · 手动置顶':'')+'</small></span><span class="model-stat"><small>智能分</small><strong>'+routingNumber(row.aaScore)+'</strong></span><span class="model-stat speed"><small>速度</small><strong>'+routingNumber(row.tokensPerSecond,0)+' tok/s</strong></span><span class="model-stat quota"><small>首 token</small><strong>'+routingNumber(row.ttftMs===undefined?undefined:row.ttftMs/1000)+'s</strong></span><span class="jev"><small>总分</small><strong>'+routingNumber(row.decision?.score)+'</strong></span><span class="expand">'+(open?'−':'+')+'</span></button>'+detail+'</article>';
+}
 function draw(){
- $('layer-source').textContent=policyDirty?'以下分层来自当前预览；保存前不影响线上。':'以下分层来自最近成功排序快照；跨层即使分数更高，也不会提前。';
- $('ranking-mode').textContent=policyDirty?'配置预览 · 尚未应用线上':'依据当前规则生成的实时排序';
- const tables=policyDirty?(preview?.tables||[]):state?.tables||[],table=selected();
- $('group-tabs').innerHTML=['sck-haiku','sck-sonnet','sck-opus'].flatMap(id=>{const t=tables.find(t=>t.group===id);if(!t)return [];return '<button role="tab" data-group="'+id+'" aria-selected="'+(table?.group===id)+'" class="tab '+(table?.group===id?'active':'')+'">'+id.slice(4).replace(/^./,x=>x.toUpperCase())+'<span>'+t.rows.length+'</span></button>';}).join('');
- $('group-tabs').querySelectorAll('button').forEach(b=>b.onclick=()=>{group=b.dataset.group;expanded=null;draw();});
- $('models-heading').textContent=table?table.group.slice(4).replace(/^./,x=>x.toUpperCase())+' 模型':'模型';
- $('model-count').textContent=(table?.rows.length||0)+' 个成员';
- $('updated').textContent=table?.at?'更新于 '+new Date(table.at).toLocaleTimeString():'';
- const attempt=state?.attempts?.[table?.group];
- $('attempt-budget').textContent=attempt?'最近刷新尝试：'+new Date(attempt.at).toLocaleString()+' · '+attempt.status+' · '+attempt.modelCount+' 个评分模型 · '+attempt.encoding+' · 共享 '+attempt.stateBytes+'/'+attempt.limits.stateBytes+' 字节 · 请求 '+attempt.requestBytes+'/'+attempt.limits.requestBytes+' 字节':'';
- $('snapshot').textContent=table?.at?(table.scored?'最近成功排序：':'历史请求数据：')+new Date(table.at).toLocaleString()+' · 本轮规则：'+(table.rules||'未记录'):'';
- $('legacy').textContent=table&&!table.scored?'等待下一次请求触发规则排序。':'';
- const starts=new Map(table?layerSections(table).map(layer=>[layer.start,layer]):[]);
- $('model-list').innerHTML=table?.rows.map((r,i)=>{
-  const short=r.model.replace(/^remote-magpie\\//,''),slash=short.lastIndexOf('/'),open=expanded===r.model;
-  const layer=starts.get(i);
-  const header=layer?'<section class="ranking-layer" aria-label="'+esc(layer.title)+'"><h3>'+esc(layer.title)+'</h3><p class="layer-range">第'+(layer.start+1)+'–'+(layer.end+1)+'名 · 本段'+layer.count+'个模型'+(layer.total!==layer.count?' / 本层共'+layer.total+'个':'')+'</p><p>'+esc(layer.abilitySummary)+'</p><details><summary>这一层如何形成</summary><p>'+esc(layer.ability)+'</p><p>'+esc(layer.explanation)+'</p><p><strong>'+esc(layer.comparison)+'</strong></p></details></section>':'';
-  const score=r.decision?.score===undefined?ruleLabel(r):num(r.decision.score,1);
-  const stat=(cls,label,value)=>'<div class="row-stat '+cls+'"><span>'+label+'</span><strong>'+esc(value)+'</strong></div>';
-  return header+'<article class="model-row '+(open?'expanded':'')+'"><div class="model-row-header"><button class="model-row-main" data-index="'+i+'" aria-expanded="'+open+'" aria-label="'+esc('第 '+(i+1)+' 名 '+r.model)+'"><span class="rank">#'+(i+1)+'</span><div class="model-primary"><div class="model-name-row"><h3 title="'+esc(r.model)+'">'+esc(short.slice(slash+1))+'</h3>'+(i===0&&r.decision&&!r.decision.tail?'<span class="tag">推荐</span>':'')+'</div><p>'+esc(short.slice(0,slash))+' · '+(r.ttftMs===undefined?'TTFT ?':num(r.ttftMs/1000,2)+'s')+'</p></div>'+stat('intelligence','智能分',num(r.aaScore))+stat('speed','速度',r.tokensPerSecond===undefined?'未知':num(r.tokensPerSecond,0)+' tok/s')+stat('quota','额度',quota(r))+'<div class="score"><span>'+(r.pinned?'置顶':r.decision?.tail?'置后':r.decision?.urgent?'临期优先':r.decision?.coldStart?'试用':'层内分')+'</span><strong title="'+esc(r.decision?.reason??'等待规则排序')+'">'+score+'</strong></div><span class="chevron">'+(open?'−':'+')+'</span></button><button class="pin-button" data-pin="'+i+'" '+(pinning||policyDirty?'disabled':'')+' aria-pressed="'+!!r.pinned+'" aria-label="'+esc((r.pinned?'取消置顶 ':'置顶 ')+r.model)+'">'+(r.pinned?'取消置顶':'置顶')+'</button></div>'+(open?'<div class="row-details"><div class="model-path" title="'+esc(r.model)+'">'+esc(r.model)+'</div><div class="metrics">'+metrics(r).map(([label,value,detail])=>'<div><span>'+label+'</span><strong>'+esc(value)+'</strong><small>'+esc(detail)+'</small></div>').join('')+'</div>'+Object.entries(r.decision?.contributions||{}).map(([key,v])=>'<p class="field-help">'+esc(weightLabels[key])+': '+(v.value===undefined?'未知（不加分）':num(v.value*100,1)+'%')+' × '+v.weight+' → +'+num(v.points,2)+'</p>').join('')+'<label class="field-label">计费分类<select data-billing="'+i+'">'+Object.entries({auto:'自动',...billingLabels}).map(([kind,label])=>'<option value="'+kind+'" '+((policy?.billingOverrides[r.model]||'auto')===kind?'selected':'')+'>'+label+'</option>').join('')+'</select></label>'+(r.previousRank?'<p class="field-help">线上第 '+r.previousRank+' 名 → 预览第 '+(i+1)+' 名</p>':'')+(r.performanceScore===undefined?'':'<p class="mobile-performance">历史绩效 '+num(r.performanceScore,2)+' / 5</p>')+'</div>':'')+'</article>';
- }).join('')||'<p class="empty-state">尚无分组成员。</p>';
- $('model-list').querySelectorAll('.model-row-main').forEach(b=>b.onclick=()=>{const id=table.rows[Number(b.dataset.index)].model;expanded=expanded===id?null:id;draw();});
- $('model-list').querySelectorAll('[data-billing]').forEach(e=>e.onchange=()=>{const id=table.rows[Number(e.dataset.billing)].model;if(e.value==='auto')delete policy.billingOverrides[id];else policy.billingOverrides[id]=e.value;changePolicy();});
- $('model-list').querySelectorAll('[data-pin]').forEach(b=>b.onclick=async()=>{
-  if(pinning)return;const row=table.rows[Number(b.dataset.pin)],targetGroup=table.group;
-  pinning=true;$('pin-message').textContent='';draw();
-  try{const response=await fetch('api/model-ranking/pin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({group:targetGroup,model:row.model,pinned:!row.pinned})});const result=await response.json();if(!response.ok)throw Error(result.error||'保存失败');$('pin-message').textContent=row.pinned?'已取消置顶，恢复自动分层。':'已置顶到独立第一层，状态异常仍保留提示。';}
-  catch(e){$('pin-message').textContent='置顶更新未完成：'+e.message;}
-  finally{pinning=false;await load();draw();}
- });
+ $('group-tabs').innerHTML=groups.map(g=>'<button role="tab" aria-selected="'+(g===group)+'" data-group="'+g+'" class="'+(g===group?'active':'')+'">'+groupLabel(g)+' <span>'+(state?.tables?.find(t=>t.group===g)?.rows.length??0)+'</span></button>').join('');
+ $('group-tabs').querySelectorAll('[data-group]').forEach(b=>b.onclick=()=>{group=b.dataset.group;shown=12;draw();});
+ $('show-ranking').classList.toggle('active',mode==='ranking');$('show-catalog').classList.toggle('active',mode==='catalog');
+ $('ranking-mode').textContent=dirty?'配置预览 · 未应用线上':'实时成员 · 按总分排序';
+ if(mode==='catalog'){drawCatalog();return;}
+ const rows=rankingRows(),table=currentTable();
+ $('summary').textContent=['sck-opus','sck-fable'].includes(group)?'本组由你维护成员与顺序，自动公式不修改此分组。':'手动置顶之后全部模型仅按总分降序；展开可查看计算因子。';
+ $('model-list').innerHTML=rows.slice(0,shown).map(rowHtml).join('')||'<p class="model-note">'+(dirty&&!previewReady?'正在等待有效预览…':'本组暂无匹配成员，可在管理模型中添加。')+'</p>';
+ $('pagination').innerHTML=shown<rows.length?'<button class="small-button" id="more-models">显示其余 '+(rows.length-shown)+' 个模型</button>':'';
+ if($('more-models'))$('more-models').onclick=()=>{shown+=20;draw();};
+ $('model-list').querySelectorAll('[data-expand]').forEach(b=>b.onclick=()=>{const row=rows[Number(b.dataset.expand)];expanded=expanded===row.model?'':row.model;draw();});
+ $('model-list').querySelectorAll('[data-pin]').forEach(b=>b.onclick=()=>{const row=rows[Number(b.dataset.pin)];action(()=>api('model-ranking/pin',{group,model:row.model,pinned:!row.pinned}),'置顶已更新。');});
+ $('model-list').querySelectorAll('[data-manage]').forEach(b=>b.onclick=()=>{const row=rows[Number(b.dataset.manage)];search=row.model.replace(/:(low|medium|high|xhigh|max)$/,'');$('search').value=search;mode='catalog';catalogOffset=0;loadCatalog();});
+ $('model-list').querySelectorAll('[data-billing]').forEach(b=>b.onclick=()=>{const row=rows[Number(b.dataset.billingRow)],kind=b.dataset.billing;if(kind==='auto')delete policy.billingOverrides[row.model];else policy.billingOverrides[row.model]=kind;changePolicy();});
+ if(table?.at)$('last-refresh').textContent=new Date(table.at).toLocaleString();
 }
-async function load(){
- const sequence=++readSequence;
- try{const next=await api();if(sequence!==readSequence)return;state=next;$('rule').textContent=state.rules;if(!dirty){policy=copy(state.policy||defaults);editor();$('refresh').value=state.refreshMinutes;}
-  $('last-refresh').textContent=state.at?new Date(state.at).toLocaleString():'尚未刷新';
-  $('sync-title').textContent=state.error?'同步异常':!state.configured?'尚未配置':'运行正常';
-  $('sync-time').textContent=state.at?new Date(state.at).toLocaleString():'等待首次刷新';
-  $('error').textContent=state.error||(!state.configured?'规则排序尚未初始化。':'');
-  $('request-json').textContent=JSON.stringify(state.requests||[],null,2);$('save-rule').disabled=saving;draw();
- }catch(e){if(sequence===readSequence){$('sync-title').textContent='读取失败';$('error').textContent=e.message;}}
+async function action(write,message){if(busy)return;busy=true;draw();$('message').textContent='保存中…';try{await write();$('message').textContent=message;await read();if(mode==='catalog')await loadCatalog();}catch(e){$('message').textContent=e.message;await read();if(mode==='catalog')await loadCatalog();}finally{busy=false;draw();}}
+async function read(){try{state=await api('model-ranking');if(!dirty){policy=copy(state.policy??defaults);editor();if(!refreshDirty)$('refresh').value=String(state.refreshMinutes??5);}$('updated').textContent=state.at?'最近更新 '+new Date(state.at).toLocaleTimeString():'等待首次刷新';$('error').textContent=state.error??'';if(mode==='ranking')draw();}catch(e){$('error').textContent=e.message;}}
+async function loadCatalog(){const seq=++catalogSeq;$('summary').textContent='正在读取实时目录…';try{const result=await api('model-catalog?query='+encodeURIComponent(search)+'&offset='+catalogOffset);if(seq!==catalogSeq)return;catalog=result;draw();}catch(e){$('summary').textContent=e.message;}}
+function aaOptions(model,query=''){
+ return '<option value="">选择对应的 AA 模型</option><option value="__none">不对应 AA</option>'+(catalog?.benchmarks??[]).filter(b=>(b.name+' '+b.slug).toLowerCase().includes(query.toLowerCase())).slice(0,100).map(b=>'<option value="'+esc(b.slug)+'" '+(model.slug===b.slug?'selected':'')+'>'+esc(b.name)+' · '+routingNumber(b.score)+'</option>').join('');
 }
-$('refresh').onchange=()=>{dirty=true;};
-$('save-rule').onclick=async()=>{
- if(saving)return;saving=true;++readSequence;
- const body={rules:state.rules,refreshMinutes:Number($('refresh').value),policy:copy(policy)};const policyKey=JSON.stringify(policy);
- clearTimeout(saveTimer);$('save-rule').classList.remove('saved');$('save-arrow').textContent='→';
- $('save-rule').disabled=true;$('save-label').textContent='保存中…';$('save-message').textContent='';
- try{await api(body);if(Number($('refresh').value)===body.refreshMinutes&&JSON.stringify(policy)===policyKey){dirty=false;policyDirty=false;preview=null;++previewSequence;clearTimeout(previewTimer);$('preview-status').textContent='';}
-  $('save-message').textContent='已保存，下次员工请求到达时刷新排序。';$('save-rule').classList.add('saved');$('save-label').textContent='已保存设置';$('save-arrow').textContent='✓';saveTimer=setTimeout(()=>{$('save-rule').classList.remove('saved');$('save-label').textContent='保存排序设置';$('save-arrow').textContent='→';},2200);await load();
- }catch(e){$('save-message').textContent='保存失败：'+e.message;}
- finally{saving=false;$('save-rule').disabled=false;if(!$('save-rule').classList.contains('saved'))$('save-label').textContent='保存排序设置';}
-};
-load();setInterval(load,15000);
+function drawCatalog(){
+ $('summary').textContent='从实时 Magpie 目录入组/移出，关联有评分的 AA 模型。已排除 group/ 和 auto/ 生成分组。';
+ const models=catalog?.models??[];
+ $('model-list').innerHTML=models.map((model,index)=>{
+ const open=catalogExpanded===model.id,members=model.members[group]??[];
+ return '<article class="catalog-row"><button class="catalog-toggle" data-catalog-expand="'+index+'" aria-expanded="'+open+'"><strong>'+esc(model.name)+'</strong><small>'+esc(model.id)+'</small><small>'+(model.aa?'AA '+routingNumber(model.aa.score)+' · '+esc(model.aa.name):'尚未关联 AA')+' · '+esc(model.groups.map(groupLabel).join(' / ')||'未入组')+' '+(open?'−':'+')+'</small></button>'+(open?'<div class="catalog-editor"><label>思考等级<select class="routing-input" id="effort-'+index+'"><option value="">默认</option>'+model.levels.map(level=>'<option '+(level==='max'?'selected':'')+'>'+esc(level)+'</option>').join('')+'</select></label><button class="small-button" data-add="'+index+'" '+(busy?'disabled':'')+'>添加到 '+groupLabel(group)+'</button>'+members.map((member,j)=>'<button class="small-button" data-remove="'+index+'" data-member="'+j+'" '+(busy?'disabled':'')+'>移出 '+groupLabel(group)+' · '+esc(member.split('/').pop())+'</button>').join('')+'<label>关联 AA（只展示有评分条目）<input class="routing-input" data-aa-search="'+index+'" placeholder="搜索 AA 名称或 slug"><select class="routing-input" id="aa-'+index+'">'+aaOptions(model)+'</select></label><button class="small-button" data-aa-save="'+index+'" '+(busy?'disabled':'')+'>保存 AA 关联</button></div>':'')+'</article>';
+ }).join('')||'<p class="model-note">暂无匹配模型。</p>';
+ $('pagination').innerHTML='<button id="catalog-prev" class="small-button" '+(catalogOffset===0?'disabled':'')+'>上一页</button><span>'+(models.length?catalogOffset+1:0)+'–'+(catalogOffset+models.length)+' / '+(catalog?.total??0)+'</span><button id="catalog-next" class="small-button" '+(catalog?.nextOffset==null?'disabled':'')+'>下一页</button>';
+ $('catalog-prev').onclick=()=>{catalogOffset=Math.max(0,catalogOffset-40);loadCatalog();};$('catalog-next').onclick=()=>{catalogOffset=catalog.nextOffset;loadCatalog();};
+ $('model-list').querySelectorAll('[data-catalog-expand]').forEach(b=>b.onclick=()=>{const model=models[Number(b.dataset.catalogExpand)];catalogExpanded=catalogExpanded===model.id?'':model.id;drawCatalog();});
+ $('model-list').querySelectorAll('[data-add]').forEach(b=>b.onclick=()=>{const i=Number(b.dataset.add),model=models[i],effort=$('effort-'+i).value;action(()=>api('model-membership',{group,model:model.id+(effort?':'+effort:''),present:true,expectedMembers:model.members[group]??[]}),'分组已保存，正在刷新排序。');});
+ $('model-list').querySelectorAll('[data-remove]').forEach(b=>b.onclick=()=>{const model=models[Number(b.dataset.remove)],members=model.members[group]??[];action(()=>api('model-membership',{group,model:members[Number(b.dataset.member)],present:false,expectedMembers:members}),'成员已移出。');});
+ $('model-list').querySelectorAll('[data-aa-search]').forEach(input=>input.oninput=()=>{const i=Number(input.dataset.aaSearch);$('aa-'+i).innerHTML=aaOptions(models[i],input.value);});
+ $('model-list').querySelectorAll('[data-aa-save]').forEach(b=>b.onclick=()=>{const i=Number(b.dataset.aaSave),model=models[i],slug=$('aa-'+i).value;if(!slug){$('message').textContent='请先选择 AA 模型。';return;}action(()=>api('model-alias',{model:model.id,slug:slug==='__none'?null:slug}),'AA 关联已保存。');});
+}
+$('search').oninput=e=>{search=e.target.value;shown=12;clearTimeout(searchTimer);if(mode==='catalog'){catalogOffset=0;searchTimer=setTimeout(loadCatalog,300);}else draw();};
+$('show-ranking').onclick=()=>{mode='ranking';draw();};$('show-catalog').onclick=()=>{mode='catalog';catalogOffset=0;loadCatalog();};
+$('default-weights').onclick=()=>{policy={...copy(defaults),billingOverrides:policy.billingOverrides};editor();changePolicy();};
+$('refresh-observations').onclick=()=>runPreview(true);
+$('refresh').onchange=()=>{refreshDirty=true;$('save-rule').disabled=false;};
+$('save-rule').onclick=()=>action(async()=>{await api('model-ranking',{rules:state.rules,refreshMinutes:Number($('refresh').value),policy});dirty=false;refreshDirty=false;previewReady=false;preview=undefined;$('save-rule').disabled=true;$('preview-status').textContent='已保存，下次请求到达时刷新排序。';},'排序设置已保存。');
+read();setInterval(read,15000);
 </script></body></html>`;
