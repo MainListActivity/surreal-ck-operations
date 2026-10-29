@@ -1,5 +1,6 @@
 import {assertLocalMagpieScope,observeProductMagpie,PRODUCT_MAGPIE_MODEL,ProductGatewaySourceMismatch,type ProductMagpieObservation} from './product-magpie.ts';
 import {buildRemoteMagpieCandidate,remoteMagpieEvidenceSchema,remoteMagpieWindow,samplingBudgetSchema,type PriceApproval,type TrustedRecord} from './remote-magpie-evidence.ts';
+import {priceApprovalFileName,priceApprovalFor} from './price-approval.ts';
 // Ops capability broker. Employees never hold credentials: they ask for an operation by name,
 // this trusted code (running inside the Paseo plugin, next to the sealed secrets and the
 // Cloudflare token) performs it, and only a secret-free result goes back. Every call is gated
@@ -70,7 +71,7 @@ export const OPS_TOOLS = [
   'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_principal_list', 'ops_idp_admin_request',
   'ops_idp_provision_rotate', 'ops_invitation_issue',
   'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_approval_diagnose', 'ops_internal_ai_deliver', 'ops_internal_ai_revoke', 'ops_internal_ai_trust', 'ops_internal_ai_rotate_key',
-  'ops_supplier_plan_sample', 'ops_product_magpie_observe', 'ops_product_magpie_candidate', 'ops_magpie_route_sample', 'ops_magpie_route_restore', 'ops_magpie_window_prepare', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs',
+  'ops_supplier_plan_sample', 'ops_product_magpie_observe', 'ops_product_magpie_candidate', 'ops_magpie_route_sample', 'ops_magpie_route_restore', 'ops_magpie_window_prepare', 'ops_product_magpie_price_approve', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
 
@@ -332,6 +333,8 @@ export class OpsBroker {
   private readonly lastScope = new Map<string, OpsScope>();
   // Observations this process read from the remote, keyed by their snapshot digest. Window checks trust these copies only.
   private readonly remoteObservations = new Map<string, TrustedRecord>();
+  /** Price approvals this broker process recorded. The window trusts only these, never the evidence files. */
+  private readonly remotePriceApprovalRecords: PriceApproval[] = [];
 
   constructor(private readonly deps: OpsDeps) {
     this.now = deps.now ?? Date.now;
@@ -390,6 +393,7 @@ export class OpsBroker {
       ops_magpie_route_sample: (ctx, args) => this.magpieRouteSample(ctx, args),
       ops_magpie_route_restore: (ctx, args) => this.magpieRouteRestore(ctx, args),
       ops_magpie_window_prepare: (ctx, args) => this.magpieWindowPrepare(ctx, args),
+      ops_product_magpie_price_approve: (ctx, args) => this.productMagpiePriceApprove(ctx, args),
       ops_origin_status: (ctx) => this.origin(ctx, { op: 'status' }),
       ops_origin_health: (ctx) => this.origin(ctx, { op: 'health' }),
       ops_origin_logs: (ctx, args) => this.origin(ctx, originLogsRequest(args)),
@@ -1706,6 +1710,33 @@ export class OpsBroker {
   }
 
   /**
+   * `ops_product_magpie_price_approve {candidatePath, approvalTask?}`: an independent employee records a
+   * price review for one remote-magpie candidate. The caller approves; the author cannot. The marker goes
+   * into the caller's own task evidence root with the candidate digest, the catalog price revision and the
+   * candidate expiry, and it is read back only from the approval task root by the window. Nothing is
+   * executed, bound or released by this tool.
+   */
+  private async productMagpiePriceApprove(ctx:Ctx,args:Args):Promise<Outcome>{
+    if(ctx.scope.project!=='surreal_ck'||ctx.env!=='production')throw new CompanyError('forbidden','此入口只记录 surreal_ck 现役产品的 remote-magpie 价目审核');
+    const allowed=new Set(['env','candidatePath','approvalTask']);
+    const extra=Object.keys(args).filter(key=>!allowed.has(key));
+    if(extra.length)throw invalid(`ops_product_magpie_price_approve 只接受 candidatePath 与 approvalTask（rejected: ${extra.join(', ')})`);
+    const approvalTask=args.approvalTask===undefined?ctx.scope.taskId:text(args,'approvalTask',128);
+    if(!/^[A-Za-z0-9_-]{1,128}$/.test(approvalTask))throw invalid('approvalTask must be a task id');
+    if(approvalTask!==ctx.scope.taskId)throw new CompanyError('forbidden','approval marker must be written into the approver\'s own task evidence root');
+    const raw=await readProofFile(this.serviceHome(),approvalTask,text(args,'candidatePath',1024));
+    const parsed=remoteMagpieEvidenceSchema.safeParse(JSON.parse(raw.toString('utf8')));
+    if(!parsed.success)throw new CompanyError('invalid','remote-magpie candidate is malformed or was edited after it was generated');
+    const marker=priceApprovalFor({candidate:parsed.data,approverEmployee:ctx.scope.actor.employeeId,approvalTask,now:this.now()});
+    const evidenceDir=join(this.serviceHome(),'evidence',approvalTask);
+    mkdirSync(evidenceDir,{recursive:true,mode:0o700});
+    const file=join(evidenceDir,priceApprovalFileName(marker));
+    writeFileSync(file,JSON.stringify(marker,null,2)+'\n',{mode:0o600});
+    this.remotePriceApprovalRecords.push({approverEmployee:marker.approverEmployee,configurationDigest:marker.configurationDigest,priceRevision:marker.priceRevision,approvedAt:marker.approvedAt,approvalTask,expiresAt:marker.expiresAt});
+    return {value:{markerFile:file,marker},audit:{action:'ops_call',evidence:`ops_product_magpie_price_approve ${marker.configurationDigest.slice(0,16)} priceRevision=${marker.priceRevision} approver=${ctx.scope.actor.employeeId}`}};
+  }
+
+  /**
    * `ops_product_magpie_observe {env?}`: read-only observation of the configured remote-magpie
    * connection. It fetches models, quotas and bounded usage, never calls a model, and accepts no
    * address, model, account or credential override.
@@ -1825,7 +1856,8 @@ export class OpsBroker {
       const raw = await readProofFile(this.serviceHome(), proofRoot, text(args, 'candidatePath', 1024));
       const parsed = remoteMagpieEvidenceSchema.safeParse(JSON.parse(raw.toString('utf8')));
       if (!parsed.success) throw new CompanyError('invalid', 'remote-magpie candidate is malformed or was edited after it was generated');
-      const result = remoteMagpieWindow(parsed.data, {approvalTask, now: this.now(), approvals: this.deps.magpie?.remotePriceApprovals?.() ?? [], trusted: this.remoteObservations.get(parsed.data.observation.digest)});
+      const approvals = this.deps.magpie?.remotePriceApprovals?.() ?? this.remotePriceApprovalRecords.filter(a => a.approvalTask === approvalTask);
+      const result = remoteMagpieWindow(parsed.data, {approvalTask, now: this.now(), approvals, trusted: this.remoteObservations.get(parsed.data.observation.digest)});
       return {
         value: { ...result, candidateHash: sha256(raw), evidenceExpiresAt: parsed.data.expiry.expiresAt },
         audit: {
