@@ -41,7 +41,7 @@ import {loadInventory,saveInventory,inventoryAliases,recordDecision,reconcileInv
 import type { JevClient } from "../dispatcher/jev.ts";
 /** New vendor names Jev is asked about per sync; models are added rarely, so this only bounds a burst. */
 const ALIAS_ASKS_PER_SYNC = 6;
-const DAY = 86400000;
+const REMOTE_DISCOVERY_MS = 60_000;
 export interface MemberIssue { group: string; member: string; reason: string }
 /** Report a member below the dynamic Luna Max floor or outside its AA input-price band; never remove owner members. */
 export function memberIssue(tier: Tier, member: string, levels: string[] | undefined): string | undefined {
@@ -177,13 +177,13 @@ export class ModelRoutingController {
     return stdout;
   }
   /** magpie fetches a vendor's model list only when asked; a relay's new models stay invisible
-   * until then. Once a day every remote-magpie provider is fetched again. A forced run (group members
+   * until then. Once a minute every remote-magpie provider is fetched again. A forced run (group members
    * missing from the catalog) keeps its own shorter stamp so a permanently removed model is checked
-   * every few minutes instead of on every sync, without turning the daily refresh into a poll. */
+   * every few minutes rather than repeatedly within one sync. */
   private async refreshRemoteCatalogs(now = Date.now(), force = false): Promise<boolean> {
     const stamp = join(this.home, "model-routing", force ? "catalog-refresh-missing.json" : "catalog-refresh.json");
     try {
-      if (now - JSON.parse(await readFile(stamp, "utf8")).at < (force ? 5 * 60_000 : DAY)) return false;
+      if (now - JSON.parse(await readFile(stamp, "utf8")).at < (force ? 5 * 60_000 : REMOTE_DISCOVERY_MS)) return false;
     } catch {}
     let providers: Array<{ id: string; preset?: string }> = [];
     try {
@@ -191,11 +191,11 @@ export class ModelRoutingController {
     } catch {}
     for (const p of providers.filter((p) => p.preset === "remote-magpie"))
       // `provider models <id>` is the CLI's fetch-and-list verb; `provider refresh` is not a
-      // subcommand and failed silently inside the catch, leaving the daily refresh a no-op.
+      // subcommand and failed silently inside the catch, leaving catalog discovery a no-op.
       await this.output(["provider", "models", p.id]).catch((e) => console.warn(`magpie provider models ${p.id}: ${(e as Error).message.slice(0, 160)}`));
     await mkdir(join(this.home, "model-routing"), { recursive: true, mode: 0o700 });
     await writeFile(stamp, JSON.stringify({ at: now }), { mode: 0o600 });
-    // A forced fetch just refreshed every relay provider, so the daily stamp is current too.
+    // A forced fetch refreshed every relay provider, so the normal discovery stamp is current too.
     if (force) await writeFile(join(this.home, "model-routing", "catalog-refresh.json"), JSON.stringify({ at: now }), { mode: 0o600 });
     return true;
   }
@@ -322,12 +322,16 @@ export class ModelRoutingController {
     return {synchronized};
   }
 
-  /** Refresh only expiring remote cards; normal remote quota reads may be old cache entries. */
-  private async rankingQuota(now:number){
+  /** Discover new grants as well as old ones; a cached card cannot announce a new activity. */
+  private async rankingQuota(now:number,ids:string[]){
     const rows=JSON.parse(await this.output(["quota","--json"])) as Parameters<typeof quotaAccounts>[0];
-    const near=(t?:string)=>!!t&&Date.parse(t)>now&&Date.parse(t)<=now+24*3600_000;
-    const providers=[...new Set(rows.filter(q=>q.provider.startsWith('remote-magpie/')&&(!q.readAt||Date.parse(q.readAt)<now-30_000)&&
-      (q.renew==='off'&&near(q.until)||(q.windows??[]).some(w=>near(w.runsOutAt)||(/^(weekly|monthly|month|daily|7 days|30 days|1 day)$/i.test(w.name??'')||/trial|试用/i.test(w.name??''))&&near(w.resetsAt)))).map(q=>q.provider))];
+    const providersInUse=new Set(ids.map(id=>{const base=splitMember(id).id;return base.slice(0,base.lastIndexOf('/'));}));
+    const near=(at?:string)=>!!at&&Date.parse(at)>now&&Date.parse(at)<=now+24*3600_000;
+    const providers=[...new Set(rows.filter(q=>{
+      if(!q.provider.startsWith('remote-magpie/')||!providersInUse.has(q.provider))return false;
+      const pending=q.renew==='off'&&near(q.until)||(q.windows??[]).some(w=>near(w.runsOutAt)||near(w.resetsAt));
+      return !q.readAt||Date.parse(q.readAt)<now-(pending?30_000:REMOTE_DISCOVERY_MS);
+    }).map(q=>q.provider))];
     for(let i=0;i<providers.length;i+=3)await Promise.all(providers.slice(i,i+3).map(async provider=>{
       try{
         const fresh=JSON.parse(await this.output(['quota','refresh',provider,'--json'])) as typeof rows;
@@ -344,7 +348,7 @@ export class ModelRoutingController {
     ids = ids.filter(id=>!generatedModel(id));
     const now = this.io.now?.() ?? Date.now();
     const [quota, usage, results, observations, health] = await Promise.all([
-      this.rankingQuota(now).catch(() => new Map()),
+      this.rankingQuota(now,ids).catch(() => new Map()),
       (async () => {
         const response = await (this.io.fetch ?? fetch)("http://127.0.0.1:3425/v1/magpie/usage?period=7d", {
           cache: "no-store", headers: { "cache-control": "no-cache" }, signal: AbortSignal.timeout(15000),
@@ -442,7 +446,7 @@ export class ModelRoutingController {
   }
   refresh(force = false): Promise<void> {
     if (this.pending) return this.pending;
-    if (!force && Date.now() - this.updated < 300000) return Promise.resolve();
+    if (!force && Date.now() - this.updated < REMOTE_DISCOVERY_MS) return Promise.resolve();
     this.pending = this.sync().finally(() => {
       this.pending = undefined;
     });
@@ -491,7 +495,7 @@ export class ModelRoutingController {
     if (!this.io.command) await this.refreshRemoteCatalogs();
     let catalog = await this.fetchCatalog();
     // A relay can drop a vendor's models when a trial window closes and bring them back when a new
-    // window opens. Waiting for the daily remote refresh would leave the group routing to members the
+    // window opens. A cached remote list could leave the group routing to members the
     // catalog cannot see, so any group member missing from the catalog forces a refresh of the relay
     // providers — rate-limited so a permanently removed model does not poll them on every sync.
     if (!this.io.command && await this.catalogMissesMembers(catalog.data)) {

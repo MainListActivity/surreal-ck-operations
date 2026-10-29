@@ -21,7 +21,7 @@ run('fork: deterministic ranking persists across reconnect without Jev or overwr
   applied.length=0;refresher.trigger(0);await refresher.settled();expect(calls).toBe(0);expect(applied).toEqual([{'sck-sonnet':['a/fast','a/slow'],'sck-haiku':['a/slow','a/fast']}]);
   expect(await rankingRequests(db.db)).toEqual([]);
   const [status]=await db.db.query<[any]>('SELECT * FROM ONLY company_meta:model_ranking;');
-  expect(status.orders.kept).toEqual(['old/model']);expect(status.results['sck-haiku']).toMatchObject({engine:'quality-pace-v5',answers:{}});
+  expect(status.orders.kept).toEqual(['old/model']);expect(status.results['sck-haiku']).toMatchObject({engine:'quality-pace-v6',answers:{}});
   expect(status.results['sck-haiku'].rows[0].score).toBeUndefined();expect(status.results['sck-haiku'].rows[0].decision.tail).toBeUndefined();expect(status.results['sck-haiku'].rows[0].decision.factors.latency).toBeLessThan(0.5);
   const reconnected=new CompanyDatabase(config);try{
    await reconnected.connect();await reconnected.useDatabase();
@@ -77,9 +77,9 @@ run('fork: urgent snapshots publish below pins, preview without re-entry, and fi
   const initial=groups['sck-haiku'].map(id=>({id,price:{free:false},aa:{score:id==='p/ordinary'?99:10,rank:1},accounts:[{account:id,poolKey:id,kind:'subscription' as const,remainingPct:80,readAt:at(now),windows:id==='p/urgent'?[{name:'Credits',remainingPct:80,runsOut:100,runsOutAt:at(now+3600000),unit:'credits'}]:[]}]}));
   let evaluated=assessUrgency(initial,[],{},now);
   const r=new RankingRefresher({db:db.db,groups:()=>groups,facts:async()=>evaluated.facts,apply:async orders=>{groups={'sck-haiku':orders['sck-haiku']!};}});
-  await r.setPin('sck-haiku','p/pin',true);expect(groups['sck-haiku']).toEqual(['p/pin','p/ordinary','p/urgent']);
+  await r.setPin('sck-haiku','p/pin',true);expect(groups['sck-haiku']).toEqual(['p/pin','p/urgent','p/ordinary']);
   const [stored]=await db.db.query<[any]>('SELECT results FROM ONLY company_meta:model_ranking;');
-  const preview=await r.preview(DEFAULT_POLICY);expect(preview.tables[0]!.rows[2]!.urgency?.active).toBe(true);expect(stored.results['sck-haiku'].rows[2].decision.urgent).toBe(true);
+  const preview=await r.preview(DEFAULT_POLICY);expect(preview.tables[0]!.rows[1]!.urgency?.active).toBe(true);expect(stored.results['sck-haiku'].rows[1].decision.urgent).toBe(true);
   const newer=initial.map(f=>({...f,accounts:f.accounts.map(a=>({...a,readAt:at(now+1000)}))}));
   evaluated=assessUrgency(newer,Array.from({length:5},(_,i)=>({id:String(i),model:'p/urgent',at:now+100+i})),evaluated.state,now+1100);
   r.reset();r.trigger();await r.settled();expect(groups['sck-haiku']).toEqual(['p/pin','p/ordinary','p/urgent']);
