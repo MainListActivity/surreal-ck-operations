@@ -215,5 +215,28 @@ check('a candidate that this broker process never observed is refused as observa
   const restarted = new OpsBroker({ core, projects, secretKey: () => key, serviceHome: dir, now, fetch: (input, init) => world.fetch(input, init) as never, magpie: { readProductProvider: () => provider, remotePriceApprovals: () => [approvalFor(out.candidate)] } });
   const result = await restarted.call(author, windowTask, 'ops_magpie_window_prepare', { approvalTask: windowTask, candidatePath: out.candidateFile }) as Record<string, any>;
   expect(result.eligible).toBe(false);
-  expect(result.blockedReasons).toEqual(['observation-untrusted']);
+  // Without a trusted author no approval can count as independent, so the price gate is also closed.
+  expect(result.blockedReasons).toContain('observation-untrusted');
+  expect(result.blockedReasons).toContain('price-not-reviewed');
+});
+
+check('an author edited to the approver and re-digested is refused on candidate-author-mismatch', async () => {
+  const out = await candidate({ budget: BUDGET });
+  approvals = [approvalFor(out.candidate)];
+  // The file now names the approver as author. Its digest is recomputed, so only the trusted author check can refuse it.
+  const edited = recompute({ ...out.candidate, author: approver });
+  const result = await windowOf(await writeCopy(out.candidateFile, edited));
+  expect(result.eligible).toBe(false);
+  expect(result.blockedReasons).toContain('candidate-author-mismatch');
+  expect(result.blockedReasons).not.toContain('candidate-digest-mismatch');
+  expect(result.window).toBeUndefined();
+});
+
+check('the original author cannot self-approve an unedited candidate, and it stays price-not-reviewed', async () => {
+  const out = await candidate({ budget: BUDGET });
+  // Only the author's own approval is on the table.
+  approvals = [{ ...approvalFor(out.candidate, out.candidate.author) }];
+  const result = await windowOf(out.candidateFile);
+  expect(result.eligible).toBe(false);
+  expect(result.blockedReasons).toEqual(['price-not-reviewed']);
 });

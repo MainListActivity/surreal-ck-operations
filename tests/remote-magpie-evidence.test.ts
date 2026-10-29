@@ -3,7 +3,7 @@
 // price needs an independent approval for the same configuration digest, the evidence keeps 5400s of
 // headroom, and an expired candidate can only be replaced by a new observation.
 import { expect, test } from 'bun:test';
-import { buildRemoteMagpieCandidate, remoteMagpieEvidenceSchema, remoteMagpieWindow, remoteConfigurationDigest, type PriceApproval, type RemoteMagpieEvidence } from '../src/ops/remote-magpie-evidence.ts';
+import { buildRemoteMagpieCandidate, remoteMagpieEvidenceSchema, remoteMagpieWindow, remoteConfigurationDigest, type PriceApproval, type RemoteMagpieEvidence, type TrustedRecord } from '../src/ops/remote-magpie-evidence.ts';
 import type { ProductMagpieObservation } from '../src/ops/product-magpie.ts';
 import { MAGPIE_EXECUTION_HEADROOM_SECONDS } from '../src/ops/proof-contract.ts';
 
@@ -43,17 +43,18 @@ function observation(patch: Partial<ProductMagpieObservation> = {}, usagePatch: 
 // Each candidate is built from one observation; window checks receive that same observation as the trusted copy.
 // Keyed by the observation snapshot digest, as the broker stores it. An edited candidate keeps that field,
 // so it still resolves to the trusted observation and must be refused on the field that changed.
-const trusted = new Map<string, ProductMagpieObservation>();
+const trusted = new Map<string, TrustedRecord>();
 const candidate = (patch: Partial<ProductMagpieObservation> = {}, budget: typeof BUDGET | null = BUDGET, usagePatch: Record<string, unknown> = {}, author = 'engineering-1') => {
   const o = observation(patch, usagePatch);
   const c = buildRemoteMagpieCandidate({ observation: o, author, budget });
-  trusted.set(o.observationSnapshot.digest, o);
+  // The record stands for the broker's own copy: the observation and the employee who generated the candidate.
+  trusted.set(o.observationSnapshot.digest, { observation: o, author });
   return c;
 };
 // The trusted observation is found through the digest an edited copy still carries. An edit that changes
 // the body fails on candidate-digest-mismatch or on the rebuilt-from-observation check.
 const windowOf = (c: RemoteMagpieEvidence, input: { approvalTask: string; now: number; approvals: PriceApproval[] }) =>
-  remoteMagpieWindow(c, { ...input, observation: trusted.get(c.observation.digest) });
+  remoteMagpieWindow(c, { ...input, trusted: trusted.get(c.observation.digest) });
 
 const approvalFor = (c: { configurationDigest: string; pricing: { priceRevision: string | null } }, approver = 'qa-1'): PriceApproval =>
   ({ approverEmployee: approver, configurationDigest: c.configurationDigest, priceRevision: c.pricing.priceRevision!, approvedAt: '2026-10-29T02:50:00Z' });
@@ -195,9 +196,11 @@ test('a null route with a forged revision, digest and expiry, recomputed, and a 
 
 test('a candidate with no trusted observation behind it is refused, even when its digest is valid', () => {
   const c = candidate();
-  const result = remoteMagpieWindow(c, { approvalTask: 't', now: NOW, approvals: [approvalFor(c)], observation: undefined });
+  const result = remoteMagpieWindow(c, { approvalTask: 't', now: NOW, approvals: [approvalFor(c)], trusted: undefined });
   expect(result.eligible).toBe(false);
-  expect(result.blockedReasons).toEqual(['observation-untrusted']);
+  // Without a trusted author no approval can count as independent, so the price gate also stays closed.
+  expect(result.blockedReasons).toContain('observation-untrusted');
+  expect(result.blockedReasons).toContain('price-not-reviewed');
 });
 
 test('price approval never authorises a changed observation field', () => {
@@ -211,5 +214,32 @@ test('price approval never authorises a changed observation field', () => {
 test('a legitimate null+gap candidate with a real observation still passes', () => {
   const c = candidate();
   const result = windowOf(c, { approvalTask: 'approval-1', now: NOW, approvals: [approvalFor(c)] });
+  expect(result.eligible).toBe(true);
+});
+
+// The author is part of the trusted record, not of the candidate file. Editing it and recomputing the public
+// digest must not let the original author approve their own price under another name.
+test('an author edited to another employee and re-digested is refused, and the original author cannot self-approve it', () => {
+  const c = candidate({}, BUDGET, {}, 'engineering-1');
+  const edited = recomputed({ ...c, author: 'engineering-2' });
+  // An approval from the edited author would look independent of the file, but the trusted author is engineering-1.
+  const forgedApproval = approvalFor(edited, 'engineering-1');
+  const result = windowOf(edited, { approvalTask: 't', now: NOW, approvals: [forgedApproval] });
+  expect(result.eligible).toBe(false);
+  expect(result.blockedReasons).toContain('candidate-author-mismatch');
+  expect(result.blockedReasons).not.toContain('candidate-digest-mismatch');
+  expect(result.window).toBeUndefined();
+});
+
+test('the original author cannot approve their own unedited candidate, and the window stays price-not-reviewed', () => {
+  const c = candidate({}, BUDGET, {}, 'engineering-1');
+  const result = windowOf(c, { approvalTask: 't', now: NOW, approvals: [approvalFor(c, 'engineering-1')] });
+  expect(result.eligible).toBe(false);
+  expect(result.blockedReasons).toEqual(['price-not-reviewed']);
+});
+
+test('a second employee approval still opens the window for an unedited candidate', () => {
+  const c = candidate({}, BUDGET, {}, 'engineering-1');
+  const result = windowOf(c, { approvalTask: 't', now: NOW, approvals: [approvalFor(c, 'qa-1')] });
   expect(result.eligible).toBe(true);
 });

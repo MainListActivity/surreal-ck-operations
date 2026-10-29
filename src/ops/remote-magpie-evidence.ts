@@ -195,6 +195,12 @@ export function buildRemoteMagpieCandidate(input: {
   return { ...body, configurationDigest: remoteConfigurationDigest(body) };
 }
 
+/** What the broker itself recorded when it read the remote: the observation and the employee who generated the candidate. */
+export interface TrustedRecord {
+  observation: ProductMagpieObservation;
+  author: string;
+}
+
 export interface RemoteWindowResult {
   eligible: boolean;
   blockedReasons: string[];
@@ -207,9 +213,11 @@ export interface RemoteWindowResult {
  * anyone, so the rebuilt values are the reference. Expiry and route are named separately because they
  * are the fields a candidate would extend or invent.
  */
-function observationReasons(c: RemoteMagpieEvidence, observation: ProductMagpieObservation | undefined): string[] {
-  if (!observation || observation.observationSnapshot.digest !== c.observation.digest) return ['observation-untrusted'];
-  const { configurationDigest: _digest, ...rebuilt } = buildRemoteMagpieCandidate({ observation, author: c.author, budget: c.budget });
+function observationReasons(c: RemoteMagpieEvidence, trusted: TrustedRecord | undefined): string[] {
+  if (!trusted || trusted.observation.observationSnapshot.digest !== c.observation.digest) return ['observation-untrusted'];
+  // The author comes from the broker's own record of who generated the candidate, never from the file.
+  if (c.author !== trusted.author) return ['candidate-author-mismatch'];
+  const { configurationDigest: _digest, ...rebuilt } = buildRemoteMagpieCandidate({ observation: trusted.observation, author: trusted.author, budget: c.budget });
   const { configurationDigest: _claimed, ...claimed } = c;
   const reasons: string[] = [];
   for (const key of Object.keys(rebuilt) as Array<keyof typeof rebuilt>) {
@@ -225,17 +233,19 @@ function observationReasons(c: RemoteMagpieEvidence, observation: ProductMagpieO
  * revision, the owner's budget envelope, and the execution headroom. Expired evidence is refused, never
  * extended. Approvals only decide the price gate: they never make a changed field acceptable.
  */
-export function remoteMagpieWindow(c: RemoteMagpieEvidence, input: { approvalTask: string; now: number; approvals: PriceApproval[]; observation: ProductMagpieObservation | undefined }): RemoteWindowResult {
+export function remoteMagpieWindow(c: RemoteMagpieEvidence, input: { approvalTask: string; now: number; approvals: PriceApproval[]; trusted: TrustedRecord | undefined }): RemoteWindowResult {
   const reasons = new Set<string>();
   const { configurationDigest, ...body } = c;
   if (remoteConfigurationDigest(body) !== configurationDigest) reasons.add('candidate-digest-mismatch');
-  for (const reason of observationReasons(c, input.observation)) reasons.add(reason);
+  for (const reason of observationReasons(c, input.trusted)) reasons.add(reason);
+  // Self-approval is judged against the trusted author. A file that names another author cannot change who may approve.
+  const trustedAuthor = input.trusted?.author;
   if (Date.parse(c.observation.capturedAt) > input.now) reasons.add('sample-in-future');
   if (c.accountRef === null) reasons.add('account-unbound');
   if (!c.route.present) reasons.add('route-absent');
   if (c.route.servedModel === null) reasons.add('served-model-missing');
   if (c.pricing.priceRevision === null) reasons.add('price-missing');
-  else if (!input.approvals.some(a => a.approverEmployee !== c.author && a.configurationDigest === configurationDigest && a.priceRevision === c.pricing.priceRevision)) reasons.add('price-not-reviewed');
+  else if (!input.approvals.some(a => trustedAuthor !== undefined && a.approverEmployee !== trustedAuthor && a.configurationDigest === configurationDigest && a.priceRevision === c.pricing.priceRevision)) reasons.add('price-not-reviewed');
   if (!c.budget) reasons.add('budget-missing');
   if (c.coverage.complete !== true) reasons.add('coverage-incomplete');
   const expiresMs = Date.parse(c.expiry.expiresAt);

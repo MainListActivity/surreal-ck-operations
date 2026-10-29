@@ -1,5 +1,5 @@
 import {assertLocalMagpieScope,observeProductMagpie,PRODUCT_MAGPIE_MODEL,ProductGatewaySourceMismatch,type ProductMagpieObservation} from './product-magpie.ts';
-import {buildRemoteMagpieCandidate,remoteMagpieEvidenceSchema,remoteMagpieWindow,samplingBudgetSchema,type PriceApproval} from './remote-magpie-evidence.ts';
+import {buildRemoteMagpieCandidate,remoteMagpieEvidenceSchema,remoteMagpieWindow,samplingBudgetSchema,type PriceApproval,type TrustedRecord} from './remote-magpie-evidence.ts';
 // Ops capability broker. Employees never hold credentials: they ask for an operation by name,
 // this trusted code (running inside the Paseo plugin, next to the sealed secrets and the
 // Cloudflare token) performs it, and only a secret-free result goes back. Every call is gated
@@ -316,6 +316,9 @@ class BudgetRefusal extends CompanyError {
   }
 }
 
+/** Remote observations the broker keeps for window checks. A candidate older than this many reads is refused as observation-untrusted. */
+export const REMOTE_OBSERVATION_LIMIT = 64;
+
 export class OpsBroker {
   readonly tools: readonly string[] = OPS_TOOLS;
   private readonly sessions: SessionStore;
@@ -328,7 +331,7 @@ export class OpsBroker {
   /** SYS05: the last scope a cleanup audit can name; it never contains a token. */
   private readonly lastScope = new Map<string, OpsScope>();
   // Observations this process read from the remote, keyed by their snapshot digest. Window checks trust these copies only.
-  private readonly remoteObservations = new Map<string, ProductMagpieObservation>();
+  private readonly remoteObservations = new Map<string, TrustedRecord>();
 
   constructor(private readonly deps: OpsDeps) {
     this.now = deps.now ?? Date.now;
@@ -1673,6 +1676,17 @@ export class OpsBroker {
    * with gaps. The budget envelope is only recorded when the caller supplies it; without it the window
    * stays closed. Nothing is authorized or executed by this tool.
    */
+  /** Keeps the broker's own record of a generated observation. Bounded: the oldest record is evicted first. */
+  private rememberRemoteObservation(digest:string,record:TrustedRecord):void{
+    this.remoteObservations.delete(digest);
+    this.remoteObservations.set(digest,record);
+    while(this.remoteObservations.size>REMOTE_OBSERVATION_LIMIT){
+      const oldest=this.remoteObservations.keys().next().value;
+      if(oldest===undefined)break;
+      this.remoteObservations.delete(oldest);
+    }
+  }
+
   private async productMagpieCandidate(ctx:Ctx,args:Args):Promise<Outcome>{
     if(ctx.scope.project!=='surreal_ck'||ctx.env!=='production')throw new CompanyError('forbidden','此入口只观测 surreal_ck 现役产品的 remote-magpie 连接');
     const extra=Object.keys(args).filter(key=>key!=='env'&&key!=='budget');
@@ -1681,8 +1695,9 @@ export class OpsBroker {
     if(budget&&!budget.success)throw invalid('budget 必须是 {currency:"USD",totalNanoUsd,perAttemptNanoUsd,maxAttempts}，不接受其他字段');
     const observation=await observeProductMagpie({readProvider:this.deps.magpie?.readProductProvider,fetch:this.deps.fetch,now:this.now});
     // The window check rebuilds the candidate from this broker-held copy, never from the candidate file.
-    this.remoteObservations.set(observation.observationSnapshot.digest,observation);
-    const candidate=buildRemoteMagpieCandidate({observation,author:ctx.scope.actor.employeeId,budget:budget?budget.data:null});
+    const author=ctx.scope.actor.employeeId;
+    this.rememberRemoteObservation(observation.observationSnapshot.digest,{observation,author});
+    const candidate=buildRemoteMagpieCandidate({observation,author,budget:budget?budget.data:null});
     const evidenceDir=join(this.serviceHome(),'evidence',ctx.scope.taskId);
     mkdirSync(evidenceDir,{recursive:true,mode:0o700});
     const file=join(evidenceDir,`remote-magpie-candidate-${this.now()}.json`);
@@ -1810,7 +1825,7 @@ export class OpsBroker {
       const raw = await readProofFile(this.serviceHome(), proofRoot, text(args, 'candidatePath', 1024));
       const parsed = remoteMagpieEvidenceSchema.safeParse(JSON.parse(raw.toString('utf8')));
       if (!parsed.success) throw new CompanyError('invalid', 'remote-magpie candidate is malformed or was edited after it was generated');
-      const result = remoteMagpieWindow(parsed.data, {approvalTask, now: this.now(), approvals: this.deps.magpie?.remotePriceApprovals?.() ?? [], observation: this.remoteObservations.get(parsed.data.observation.digest)});
+      const result = remoteMagpieWindow(parsed.data, {approvalTask, now: this.now(), approvals: this.deps.magpie?.remotePriceApprovals?.() ?? [], trusted: this.remoteObservations.get(parsed.data.observation.digest)});
       return {
         value: { ...result, candidateHash: sha256(raw), evidenceExpiresAt: parsed.data.expiry.expiresAt },
         audit: {

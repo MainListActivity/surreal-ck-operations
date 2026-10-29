@@ -47,6 +47,9 @@ observationSnapshot 单独记录本次读取的哈希、采集时刻和本地2�
 - 有效期取本地观测新鲜度策略（7200s，`expiry.basis=local-observation-freshness-policy`）与远端已给出的源到期、额度 reset 中的较小值。这不是供应商承诺。
 - 价目审核是显式批准步：候选列出 catalog 价目原文与 priceRevision。只有不同员工的批准记录读回同一 `configurationDigest` 与 priceRevision 时，窗口才不再报 `price-not-reviewed`。缺价目保持 null，不写 0；已核零价记为 `remote-catalog-zero`，与未审区分。当前生产没有批准读取器，因此远端窗口在批准读取器建成前一律闭锁。`price-not-reviewed` 是有意的安全闭锁，不是缺陷：窗口只检查注入的 `remotePriceApprovals`，生产中该注入点未接线，任何远端候选都会报此原因。批准 marker 的写入与读回拆出为后续任务 `b943c060`（依赖本任务合入），在该任务完成前不得放行远端窗口。
 - 预算包络（`totalNanoUsd`、`perAttemptNanoUsd`、`maxAttempts`）由调用方给出并原样记录；未给出则 `budget-missing`，窗口闭锁。不读取或复用旧 30 次周期、旧批准或旧容量。
+- **未披露限制（预算）：** 预算由候选生成的调用方提供，窗口只核对它存在（`budget-missing`），不核对数值是否为老板批准的包络。执行前必须另行绑定受信的老板批准包络，本契约不实现这一步。
+- **作者绑定：** broker 生成候选时把 `ctx.scope.actor.employeeId` 与观测一起记为受信记录。窗口以受信作者参与重建比对与自批准判断；候选文件里的 `author` 与受信记录不符时拒绝（`candidate-author-mismatch`），且不能借改作者重算摘要绕过自批准。受信记录缺失时（例如进程重启后）窗口闭锁为 `observation-untrusted`。
+- **受信记录上限：** broker 进程内最多保留 64 条观测记录，超出时淘汰最旧的一条。被淘汰的候选需要重新观测，否则窗口闭锁为 `observation-untrusted`。
 - `ops_magpie_window_prepare {candidatePath, approvalTask}` 读取候选文件，校验 digest 未被改动，按上面的规则输出 `eligible`、`blockedReasons` 与 `window{approvalTask, configurationDigest, evidenceExpiresAt, minRemainingSeconds=5400, notAfter=expiresAt−5400s}`。它不绑定、不 resume、不调用模型、不改配置或预算。
 - 证据余量不足 5400s 或已过期的候选闭锁；过期候选只能通过新观测生成新候选，不能续期。
 - 旧 v4 本机契约（`magpie-controlled-route/1`）与 `manifestPath/documentPath` 调用方式保留，用于历史兼容。
