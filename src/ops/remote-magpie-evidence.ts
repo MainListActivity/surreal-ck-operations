@@ -151,6 +151,8 @@ export function buildRemoteMagpieCandidate(input: {
   for (const routeGap of o.route.gaps) note(`route.${routeGap.field}`, routeGap.reason);
   if (!o.route.present) note('route', '远端目录中没有 group/work 路由');
   if (!input.budget) note('budget', '未提供采样包络（次数/USD 上限/证据期），窗口闭锁');
+  // A truncated scan may have missed another served model, so the first matching price is not the route's price.
+  if (!o.coverage.complete) note('coverage', `扫描未完成（${o.coverage.stoppedReason}），匹配范围之外的 served model 与价目未知，窗口闭锁`);
 
   const body: CandidateBody = {
     version: REMOTE_MAGPIE_EVIDENCE,
@@ -215,6 +217,7 @@ export function remoteMagpieWindow(c: RemoteMagpieEvidence, input: { approvalTas
   if (c.pricing.priceRevision === null) reasons.add('price-missing');
   else if (!input.approvals.some(a => a.approverEmployee !== c.author && a.configurationDigest === configurationDigest && a.priceRevision === c.pricing.priceRevision)) reasons.add('price-not-reviewed');
   if (!c.budget) reasons.add('budget-missing');
+  if (c.coverage.complete !== true) reasons.add('coverage-incomplete');
   const expiresMs = Date.parse(c.expiry.expiresAt);
   if (input.now >= expiresMs) reasons.add('evidence-expired');
   else if (expiresMs - input.now < MAGPIE_EXECUTION_HEADROOM_SECONDS * 1000) reasons.add('insufficient-headroom');

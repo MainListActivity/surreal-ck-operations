@@ -1666,13 +1666,6 @@ export class OpsBroker {
   }
 
   /**
-   * `ops_magpie_route_sample {env?, alias, purpose}`: the controlled, read-only Magpie route
-   * snapshot. It reads only the loopback gateway's public surfaces plus providers.json, binds the
-   * sealed supplier identity to the serving gateway account, and writes a v4 evidence document and
-   * receipt. It never calls a model, never reads a credential value out of this process, never
-   * writes to Magpie, and answers `blocked` with structured gaps for every missing fact.
-   */
-  /**
    * `ops_product_magpie_candidate {env?, budget?}`: runs the same read-only observation, then writes a
    * remote-magpie-evidence/1 candidate to the task evidence directory. Unstated remote facts stay null
    * with gaps. The budget envelope is only recorded when the caller supplies it; without it the window
@@ -1693,6 +1686,11 @@ export class OpsBroker {
     return {value:{candidateFile:file,candidate},audit:{action:'ops_call',evidence:`ops_product_magpie_candidate ${candidate.configurationDigest.slice(0,16)} routePresent=${candidate.route.present} gaps=${candidate.gaps.length} budget=${budget?'provided':'absent'}`}};
   }
 
+  /**
+   * `ops_product_magpie_observe {env?}`: read-only observation of the configured remote-magpie
+   * connection. It fetches models, quotas and bounded usage, never calls a model, and accepts no
+   * address, model, account or credential override.
+   */
   private async productMagpieObserve(ctx:Ctx,args:Args):Promise<Outcome>{
     if(ctx.scope.project!=='surreal_ck'||ctx.env!=='production')throw new CompanyError('forbidden','此入口只观测 surreal_ck 现役产品的 remote-magpie 连接');
     if(Object.keys(args).some(key=>key!=='env'))throw invalid('ops_product_magpie_observe 只接受 env，不接受地址、账号、模型或凭证覆盖');
@@ -1700,6 +1698,13 @@ export class OpsBroker {
     return {value,audit:{action:'ops_call',evidence:`ops_product_magpie_observe source=configured-remote-magpie model=${PRODUCT_MAGPIE_MODEL} routePresent=${value.route.present} rows=${value.coverage.matchingRows} executable=false`}};
   }
 
+  /**
+   * `ops_magpie_route_sample {env?, alias, purpose}`: the controlled, read-only Magpie route
+   * snapshot. It reads only the loopback gateway's public surfaces plus providers.json, binds the
+   * sealed supplier identity to the serving gateway account, and writes a v4 evidence document and
+   * receipt. It never calls a model, never reads a credential value out of this process, never
+   * writes to Magpie, and answers `blocked` with structured gaps for every missing fact.
+   */
   private async magpieRouteSample(ctx: Ctx, args: Args): Promise<Outcome> {
     assertLocalMagpieScope(ctx.scope.project,ctx.env);
     const allowed = new Set(['env', 'alias', 'purpose']);
