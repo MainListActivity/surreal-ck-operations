@@ -6,9 +6,16 @@ import { githubRepoSlug } from './external-actions.ts';
 
 const CI = /github|git\s*hub|\bCI\b|github-actions|actions\/runs\/|workflow/i;
 const BILLING = /billing|account payments|spending[\s_-]*limit|账单|计费|付款|支付失败|支出上限|消费上限|账户问题/i;
-/** Only a CI-related reason triggers source adjudication; background CI cannot swallow a later business wait. */
-export const isCiBlockCause = (fields: string[]): boolean => fields.some(text => CI.test(text) ||
-  /(?:检查|作业).{0,30}(?:未启动|没有启动|未执行|没有执行|未通过|没有通过)/.test(text));
+function ciCauseClauses(fields: Array<string | undefined>): string[] {
+  return fields.filter(field => typeof field === 'string').flatMap(field => field!.split(/[\n;；。]/)).filter(text => {
+    const unstarted = /(?:检查|作业).{0,30}(?:未启动|没有启动|未执行|没有执行|未通过|没有通过)/.test(text);
+    if (!CI.test(text) && !unstarted) return false;
+    const completed = /已(?:由系统)?(?:完成|通过|豁免|记录|判定)|already (?:passed|completed|waived)/i.test(text);
+    return !completed || unstarted || /仍.{0,10}(?:失败|阻塞)|(?:未|没有)(?:通过|启动|执行)|\b(?:blocked|pending)\b/i.test(text);
+  });
+}
+/** Only the current CI cause triggers adjudication, not a completed CI item beside an unrelated business wait. */
+export const isCiBlockCause = (fields: string[]): boolean => ciCauseClauses(fields).length > 0;
 
 export interface CiBillingRefusal { runUrl: string; sha: string }
 export type CiBillingCheck = (input: { text: string; head?: string; repo?: string }) => Promise<CiBillingRefusal | undefined>;
@@ -83,6 +90,5 @@ export function refuseEmployeeCiBlock(source?: CiBillingRefusal): never {
  */
 export function assertEmployeeCiBlockAllowed(...fields: Array<string | undefined>): void {
   // Background and unrelated clauses must not turn an ordinary customer invoice into a CI blocker.
-  const clauses = fields.filter(field => typeof field === 'string').flatMap(field => field!.split(/[\n;；。]/));
-  if (clauses.some(text => CI.test(text) && BILLING.test(text))) refuseEmployeeCiBlock();
+  if (ciCauseClauses(fields).some(text => BILLING.test(text))) refuseEmployeeCiBlock();
 }

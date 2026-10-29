@@ -420,6 +420,15 @@ run('a rejected CI billing block continues through server-verified evidence and 
         kind:'dependency',referenceTaskId:upgradeId,reason:'等待独立前置任务完成',completed:['GitHub CI 计费已经由系统判定'],
       });
     expect(waiting.state).toBe('blocked');expect(waiting.blockedTo).toBeUndefined();
+    // The same distinction must hold for block's free-text summary, not just wait's structured fields.
+    const businessId = crypto.randomUUID();
+    await db.db.query("CREATE $task CONTENT {title:'客户付款审批',context:'https://github.com/fixture/repo/pull/7',kind:'release',executor_role:'engineering',reviewer_role:'product',state:'ready',version:1,fence:0,dependencies:[],acceptance_head:$sha,acceptance_legacy:false,acceptance_version:1,acceptance_criteria:$criteria};",{
+      task:new RecordId('task',businessId),sha,criteria:baselineAcceptanceCriteria('release'),
+    });
+    const businessClaim = await ciCore.claim(who,businessId);
+    const business = await ciCore.block(who,{taskId:businessId,deliveryId:businessClaim.deliveryId,fence:businessClaim.fence,expectedVersion:businessClaim.task.version},
+      'owner',note('GitHub PR 已完成；等待老板批准客户账单，该付款属于业务审批。'));
+    expect(business.blockedTo).toBe('owner');
   } finally {
     if (previousGate) await db.db.upsert(gateId).content(previousGate);
     else await db.db.delete(gateId);
