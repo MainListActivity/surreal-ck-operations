@@ -141,3 +141,37 @@ test('an empty scan reports sampledAt as a gap rather than the local capture tim
  expect(out.route.sampledAt).toBeNull();expect(out.route.gaps.some(g=>g.field==='sampledAt')).toBe(true);
  expect(out.route.sampledAt).not.toBe(out.capturedAt);
 });
+test('the wall-time budget stops the scan and reports it as incomplete',async()=>{
+ let clock=Date.parse('2026-10-29T03:00:00Z');
+ const fetcher=async(url:string|URL|Request)=>{
+  const text=String(url);
+  if(text.endsWith('/models'))return Response.json({data:[{id:'group/work'}]});
+  if(text.endsWith('/quotas'))return Response.json({data:[]});
+  clock+=13_000;
+  return Response.json({total:5000,rows:other(200)});
+ };
+ const out=await observeProductMagpie({readProvider:()=>provider,fetch:fetcher,now:()=>clock});
+ expect(out.coverage).toMatchObject({pages:1,complete:false,truncated:true,stoppedReason:'time-cap'});
+});
+test('the cumulative byte budget fails closed across pages',async()=>{
+ const padding='x'.repeat(5_000);
+ const page=Array.from({length:200},(_,i)=>({req:'group/other',route_id:i,padding}));
+ const fetcher=async(url:string|URL|Request)=>{
+  const text=String(url);
+  if(text.endsWith('/models'))return Response.json({data:[{id:'group/work'}]});
+  if(text.endsWith('/quotas'))return Response.json({data:[]});
+  return Response.json({total:5000,rows:page});
+ };
+ await expect(observeProductMagpie({readProvider:()=>provider,fetch:fetcher,now:()=>Date.parse('2026-10-29T03:00:00Z')})).rejects.toMatchObject({code:'response_too_large'});
+});
+test('more matching rows than the receipt bound keeps the first ten and says so',async()=>{
+ const page=Array.from({length:200},(_,i)=>row({route_id:i}));
+ const fetcher=async(url:string|URL|Request)=>{
+  const text=String(url);
+  if(text.endsWith('/models'))return Response.json({data:[{id:'group/work'},{id:'sn/deepseek'}]});
+  if(text.endsWith('/quotas'))return Response.json({data:[]});
+  return Response.json({total:200,rows:page});
+ };
+ const out=await observeProductMagpie({readProvider:()=>provider,fetch:fetcher,now:()=>Date.parse('2026-10-29T03:00:00Z')});
+ expect(out.usage).toHaveLength(10);expect(out.coverage).toMatchObject({matchingRows:200,rowsReturned:10,rowsTruncated:true,complete:true});
+});

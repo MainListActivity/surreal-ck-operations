@@ -64,7 +64,7 @@ export async function observeProductMagpie(input:{readProvider?:()=>unknown;fetc
  if(!object(catalogBody)||!Array.isArray(catalogBody.data)||!object(quotasBody)||!Array.isArray(quotasBody.data))throw new CompanyError('upstream_error','remote-magpie 观测结构不兼容，不能按空数据处理');
  // Bounded usage scan: collect the first matching rows while reading every row the bounds allow, so the
  // receipt can say exactly how much of the window was inspected.
- const scanStarted=now();let offset=0,pages=0,rowsRead=0,usageBytes=0,total:number|null=null,stop:StopReason='end-of-window';
+ const scanStarted=now();let offset=0,pages=0,rowsRead=0,usageBytes=0,total:number|null=null,stop:StopReason='end-of-window',matched=0;
  const matchingRows:ObjectRow[]=[];
  for(;;){
   if(pages>=USAGE_MAX_PAGES){stop='page-cap';break;}
@@ -78,7 +78,7 @@ export async function observeProductMagpie(input:{readProvider?:()=>unknown;fetc
   const rows=list(body.rows),pageTotal=number(body.total);
   if(pageTotal!==null)total=pageTotal;
   pages++;
-  for(const row of rows)if(row.req==='group/work'&&matchingRows.length<MAX_RETURNED_ROWS)matchingRows.push(row);
+  for(const row of rows)if(row.req==='group/work'){matched++;if(matchingRows.length<MAX_RETURNED_ROWS)matchingRows.push(row);}
   rowsRead+=rows.length;offset+=rows.length;
   if(rows.length===0){
    if(total!==null&&offset<total)throw new CompanyError('upstream_error','remote-magpie usage 分页未推进（仍声明有行但返回空页）');
@@ -129,7 +129,7 @@ export async function observeProductMagpie(input:{readProvider?:()=>unknown;fetc
  const result={version:'product-magpie-observation/1',status:'observed',source,capturedAt,
   route:{present:models.has('group/work'),configurationModified:false,revision:routeRevision,digest:routeDigest,servedModel:routeServedModel,maxOutputTokens:routeMaxOutputTokens,sampledAt:routeSampledAt,expiresAt:routeExpiresAt,gaps:routeGaps},
   usage,accounts,receipts,
-  coverage:{period:USAGE_PERIOD,rowsRead,matchingRows:matchingRows.length,rowsReturned:usage.length,truncated:!complete,rowsTruncated:matchingRows.length>usage.length,total,complete,pages,stoppedReason:stop,scannedOffset:[0,offset] as [number,number],requestCount:calls,
+  coverage:{period:USAGE_PERIOD,rowsRead,matchingRows:matched,rowsReturned:usage.length,truncated:!complete,rowsTruncated:matched>usage.length,total,complete,pages,stoppedReason:stop,scannedOffset:[0,offset] as [number,number],requestCount:calls,
    bounds:{pageSize:USAGE_PAGE_LIMIT,maxPages:USAGE_MAX_PAGES,maxRows:USAGE_MAX_ROWS,maxBytes:USAGE_MAX_BYTES,budgetMs:USAGE_BUDGET_MS},routeFieldsComplete:routeGaps.length===0},
   authorization:{executable:false,newBudgetGranted:false,configurationChangeRequired:false},
   nextAction:'核对产品 ops_request GET /api/ops/internal-ai/runtime 和实际 run/requestId；本次只说明以上有界扫描范围内的结果，扫描未完成或为空都不代表缺组或缺数据。旧 v4 本机账号契约不适用于此源；观测不能作为 prepare/prove/enable 授权。'};
