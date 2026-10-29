@@ -1,5 +1,5 @@
 {
-  "version": "0.3.31",
+  "version": "0.3.32",
   "title": "受控追加依赖前置兼容 defer 存量执行等待",
   "changes": [
     "append_dependency_prerequisites 新增存量等待兼容：defer_task_until 留下的执行依赖等待（blocked、blocked_to=NONE、resume_state=ready|doing、无 task_wait 行）在真实 deferred 审计与至少一个未完成依赖同时成立时被接受。",
