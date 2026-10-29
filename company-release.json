@@ -1,5 +1,5 @@
 {
-  "version": "0.3.32",
+  "version": "0.3.33",
   "title": "Magpie 受控路由恢复工具收口为只读 plan",
   "changes": [
     "ops_magpie_route_restore 只发布只读 plan：plan 返回 writeAvailable=false、gatewayReload=unknown，并明确真实账号/路由恢复未完成；plan 通过不等于恢复成功。",
