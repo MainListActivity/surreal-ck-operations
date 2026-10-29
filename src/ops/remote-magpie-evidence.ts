@@ -202,14 +202,34 @@ export interface RemoteWindowResult {
 }
 
 /**
- * The window check for a remote candidate. It writes nothing and binds nothing. A window needs an
- * independent price approval for this digest and price revision, the owner's budget envelope, and
- * the execution headroom. Expired evidence is refused, never extended.
+ * Rebuilds the candidate from the trusted observation the broker stored when it read the remote, then
+ * compares every body field. The candidate file is only a copy: its own digest can be recomputed by
+ * anyone, so the rebuilt values are the reference. Expiry and route are named separately because they
+ * are the fields a candidate would extend or invent.
  */
-export function remoteMagpieWindow(c: RemoteMagpieEvidence, input: { approvalTask: string; now: number; approvals: PriceApproval[] }): RemoteWindowResult {
+function observationReasons(c: RemoteMagpieEvidence, observation: ProductMagpieObservation | undefined): string[] {
+  if (!observation || observation.observationSnapshot.digest !== c.observation.digest) return ['observation-untrusted'];
+  const { configurationDigest: _digest, ...rebuilt } = buildRemoteMagpieCandidate({ observation, author: c.author, budget: c.budget });
+  const { configurationDigest: _claimed, ...claimed } = c;
+  const reasons: string[] = [];
+  for (const key of Object.keys(rebuilt) as Array<keyof typeof rebuilt>) {
+    if (canonical(rebuilt[key]) === canonical(claimed[key])) continue;
+    reasons.push(key === 'route' ? 'route-not-from-observation' : key === 'expiry' ? 'expiry-not-from-observation' : 'candidate-not-from-observation');
+  }
+  return reasons;
+}
+
+/**
+ * The window check for a remote candidate. It writes nothing and binds nothing. A window needs the
+ * candidate to match the trusted observation, an independent price approval for this digest and price
+ * revision, the owner's budget envelope, and the execution headroom. Expired evidence is refused, never
+ * extended. Approvals only decide the price gate: they never make a changed field acceptable.
+ */
+export function remoteMagpieWindow(c: RemoteMagpieEvidence, input: { approvalTask: string; now: number; approvals: PriceApproval[]; observation: ProductMagpieObservation | undefined }): RemoteWindowResult {
   const reasons = new Set<string>();
   const { configurationDigest, ...body } = c;
   if (remoteConfigurationDigest(body) !== configurationDigest) reasons.add('candidate-digest-mismatch');
+  for (const reason of observationReasons(c, input.observation)) reasons.add(reason);
   if (Date.parse(c.observation.capturedAt) > input.now) reasons.add('sample-in-future');
   if (c.accountRef === null) reasons.add('account-unbound');
   if (!c.route.present) reasons.add('route-absent');

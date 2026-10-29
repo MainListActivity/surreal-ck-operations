@@ -147,13 +147,13 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
       if (req.method === "POST" && sub === "/api/model-ranking") {
         if(req.headers.get("origin")&&req.headers.get("origin")!==url.origin)return json({error:"origin mismatch"},403);
         const b=await req.json() as {rules?:unknown;refreshMinutes?:unknown;policy?:unknown};
-        if(typeof b.rules!=="string"||b.rules.length>8000||![2,5,10].includes(b.refreshMinutes as number))return json({error:"排序规则或刷新间隔无效"},400);
+        if(typeof b.rules!=="string"||b.rules.length>8000||![2,5,10].includes((b.refreshMinutes??5) as number))return json({error:"排序规则或刷新间隔无效"},400);
         const { saveRankingSettings }=await import("./vendor/src/model-routing/ranking.ts");
         const ctx=await opts.company();
         try{
           const {rankingPolicy}=await import('./vendor/src/model-routing/weights.ts');
           const policy=b.policy===undefined?undefined:rankingPolicy(b.policy);
-          await saveRankingSettings(ctx.db.db,{rules:b.rules,refreshMinutes:b.refreshMinutes as number,policy},ctx.modelRanking);
+          await saveRankingSettings(ctx.db.db,{rules:b.rules,refreshMinutes:(b.refreshMinutes??5) as number,policy},ctx.modelRanking);
         }catch{return json({error:'排序设置无效或保存失败'},400);}
         return json({ok:true});
       }
