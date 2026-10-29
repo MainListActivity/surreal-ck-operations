@@ -189,3 +189,10 @@ test('model capacity is separate from the proposed per-request ceiling and local
  expect(out.route.expiresAt).toBeNull();expect(out.observationSnapshot.expiryBasis).toBe('local-observation-freshness-policy');expect(out.observationSnapshot.routingConfigurationVerified).toBe(false);
  expect(Date.parse(out.observationSnapshot.freshnessExpiresAt)-Date.parse(out.observationSnapshot.capturedAt)).toBe(7200000);expect(out.authorization.executable).toBe(false);
 });
+
+test('the remote candidate tool accepts only a budget and refuses endpoint or credential overrides before any read',async()=>{
+ const r=rig();
+ await expect(r.broker.call(r.token,'task-1','ops_product_magpie_candidate',{url:'http://127.0.0.1:3425'})).rejects.toMatchObject({code:'invalid'});
+ await expect(r.broker.call(r.token,'task-1','ops_product_magpie_candidate',{budget:{currency:'USD',totalNanoUsd:1,perAttemptNanoUsd:1,maxAttempts:1,extra:true}})).rejects.toMatchObject({code:'invalid'});
+ expect(r.world.requests).toHaveLength(0);
+});

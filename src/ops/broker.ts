@@ -1,4 +1,5 @@
-import {assertLocalMagpieScope,observeProductMagpie,PRODUCT_MAGPIE_MODEL,ProductGatewaySourceMismatch} from './product-magpie.ts';
+import {assertLocalMagpieScope,observeProductMagpie,PRODUCT_MAGPIE_MODEL,ProductGatewaySourceMismatch,type ProductMagpieObservation} from './product-magpie.ts';
+import {buildRemoteMagpieCandidate,remoteMagpieEvidenceSchema,remoteMagpieWindow,samplingBudgetSchema,type PriceApproval,type TrustedRecord} from './remote-magpie-evidence.ts';
 // Ops capability broker. Employees never hold credentials: they ask for an operation by name,
 // this trusted code (running inside the Paseo plugin, next to the sealed secrets and the
 // Cloudflare token) performs it, and only a secret-free result goes back. Every call is gated
@@ -38,7 +39,7 @@ import { productRequest, ProductUnreachable, type ProductResult } from './produc
 import { SUPPLIER_ADAPTER, SUPPLIER_PROVIDER, SUPPLIER_SERVICE, sampleSupplierPlan, supplierAliasFromSecretName } from './supplier.ts';
 import { MAGPIE_ADAPTER, MAGPIE_PROVIDER, magpieWindowFromEvidence, sampleMagpieRoute } from './magpie.ts';
 import { MAGPIE_RESTORE_ALIAS, planMagpieRouteRestore } from './magpie-restore.ts';
-import { loadProofFiles } from './proof-files.ts';
+import { loadProofFiles, readProofFile } from './proof-files.ts';
 import { MAGPIE_EXECUTION_HEADROOM_SECONDS, MAGPIE_SNAPSHOT_MAX_AGE_SECONDS } from './proof-contract.ts';
 import { clip, redactJson, redactText } from './redact.ts';
 import { SessionStore, type OpsSession } from './sessions.ts';
@@ -69,7 +70,7 @@ export const OPS_TOOLS = [
   'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_principal_list', 'ops_idp_admin_request',
   'ops_idp_provision_rotate', 'ops_invitation_issue',
   'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_approval_diagnose', 'ops_internal_ai_deliver', 'ops_internal_ai_revoke', 'ops_internal_ai_trust', 'ops_internal_ai_rotate_key',
-  'ops_supplier_plan_sample', 'ops_product_magpie_observe', 'ops_magpie_route_sample', 'ops_magpie_route_restore', 'ops_magpie_window_prepare', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs',
+  'ops_supplier_plan_sample', 'ops_product_magpie_observe', 'ops_product_magpie_candidate', 'ops_magpie_route_sample', 'ops_magpie_route_restore', 'ops_magpie_window_prepare', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
 
@@ -102,6 +103,11 @@ export interface OpsDeps {
     base?: string;
     endpointSource?: 'env' | 'stash' | 'default' | 'injected';
     readProviders?: () => Promise<string>;
+    /**
+     * Trusted price approvals for remote-magpie candidates, from a source other than the caller. Production
+     * has none, so every remote window stays closed on price-not-reviewed until the approval reader exists.
+     */
+    remotePriceApprovals?: () => PriceApproval[];
     /** Test seam: the gateway config the restore tool may append one group to. */
     configPath?: string;
     /** Test seam: where plan/idempotency state is kept. */
@@ -310,6 +316,9 @@ class BudgetRefusal extends CompanyError {
   }
 }
 
+/** Remote observations the broker keeps for window checks. A candidate older than this many reads is refused as observation-untrusted. */
+export const REMOTE_OBSERVATION_LIMIT = 64;
+
 export class OpsBroker {
   readonly tools: readonly string[] = OPS_TOOLS;
   private readonly sessions: SessionStore;
@@ -321,6 +330,8 @@ export class OpsBroker {
   private readonly browserSpaces = new Map<string, Set<number>>();
   /** SYS05: the last scope a cleanup audit can name; it never contains a token. */
   private readonly lastScope = new Map<string, OpsScope>();
+  // Observations this process read from the remote, keyed by their snapshot digest. Window checks trust these copies only.
+  private readonly remoteObservations = new Map<string, TrustedRecord>();
 
   constructor(private readonly deps: OpsDeps) {
     this.now = deps.now ?? Date.now;
@@ -375,6 +386,7 @@ export class OpsBroker {
       ops_invitation_issue: (ctx, args) => this.invitationIssue(ctx, args),
       ops_supplier_plan_sample: (ctx, args) => this.supplierPlanSample(ctx, args),
       ops_product_magpie_observe: (ctx,args) => this.productMagpieObserve(ctx,args),
+      ops_product_magpie_candidate: (ctx,args) => this.productMagpieCandidate(ctx,args),
       ops_magpie_route_sample: (ctx, args) => this.magpieRouteSample(ctx, args),
       ops_magpie_route_restore: (ctx, args) => this.magpieRouteRestore(ctx, args),
       ops_magpie_window_prepare: (ctx, args) => this.magpieWindowPrepare(ctx, args),
@@ -1659,11 +1671,44 @@ export class OpsBroker {
   }
 
   /**
-   * `ops_magpie_route_sample {env?, alias, purpose}`: the controlled, read-only Magpie route
-   * snapshot. It reads only the loopback gateway's public surfaces plus providers.json, binds the
-   * sealed supplier identity to the serving gateway account, and writes a v4 evidence document and
-   * receipt. It never calls a model, never reads a credential value out of this process, never
-   * writes to Magpie, and answers `blocked` with structured gaps for every missing fact.
+   * `ops_product_magpie_candidate {env?, budget?}`: runs the same read-only observation, then writes a
+   * remote-magpie-evidence/1 candidate to the task evidence directory. Unstated remote facts stay null
+   * with gaps. The budget envelope is only recorded when the caller supplies it; without it the window
+   * stays closed. Nothing is authorized or executed by this tool.
+   */
+  /** Keeps the broker's own record of a generated observation. Bounded: the oldest record is evicted first. */
+  private rememberRemoteObservation(digest:string,record:TrustedRecord):void{
+    this.remoteObservations.delete(digest);
+    this.remoteObservations.set(digest,record);
+    while(this.remoteObservations.size>REMOTE_OBSERVATION_LIMIT){
+      const oldest=this.remoteObservations.keys().next().value;
+      if(oldest===undefined)break;
+      this.remoteObservations.delete(oldest);
+    }
+  }
+
+  private async productMagpieCandidate(ctx:Ctx,args:Args):Promise<Outcome>{
+    if(ctx.scope.project!=='surreal_ck'||ctx.env!=='production')throw new CompanyError('forbidden','此入口只观测 surreal_ck 现役产品的 remote-magpie 连接');
+    const extra=Object.keys(args).filter(key=>key!=='env'&&key!=='budget');
+    if(extra.length)throw invalid(`ops_product_magpie_candidate 只接受 budget，不接受地址、账号、模型或凭证覆盖（rejected: ${extra.join(', ')}）`);
+    const budget=args.budget===undefined?null:samplingBudgetSchema.safeParse(args.budget);
+    if(budget&&!budget.success)throw invalid('budget 必须是 {currency:"USD",totalNanoUsd,perAttemptNanoUsd,maxAttempts}，不接受其他字段');
+    const observation=await observeProductMagpie({readProvider:this.deps.magpie?.readProductProvider,fetch:this.deps.fetch,now:this.now});
+    // The window check rebuilds the candidate from this broker-held copy, never from the candidate file.
+    const author=ctx.scope.actor.employeeId;
+    this.rememberRemoteObservation(observation.observationSnapshot.digest,{observation,author});
+    const candidate=buildRemoteMagpieCandidate({observation,author,budget:budget?budget.data:null});
+    const evidenceDir=join(this.serviceHome(),'evidence',ctx.scope.taskId);
+    mkdirSync(evidenceDir,{recursive:true,mode:0o700});
+    const file=join(evidenceDir,`remote-magpie-candidate-${this.now()}.json`);
+    writeFileSync(file,JSON.stringify(candidate,null,2)+'\n',{mode:0o600});
+    return {value:{candidateFile:file,candidate},audit:{action:'ops_call',evidence:`ops_product_magpie_candidate ${candidate.configurationDigest.slice(0,16)} routePresent=${candidate.route.present} gaps=${candidate.gaps.length} budget=${budget?'provided':'absent'}`}};
+  }
+
+  /**
+   * `ops_product_magpie_observe {env?}`: read-only observation of the configured remote-magpie
+   * connection. It fetches models, quotas and bounded usage, never calls a model, and accepts no
+   * address, model, account or credential override.
    */
   private async productMagpieObserve(ctx:Ctx,args:Args):Promise<Outcome>{
     if(ctx.scope.project!=='surreal_ck'||ctx.env!=='production')throw new CompanyError('forbidden','此入口只观测 surreal_ck 现役产品的 remote-magpie 连接');
@@ -1672,6 +1717,13 @@ export class OpsBroker {
     return {value,audit:{action:'ops_call',evidence:`ops_product_magpie_observe source=configured-remote-magpie model=${PRODUCT_MAGPIE_MODEL} routePresent=${value.route.present} rows=${value.coverage.matchingRows} executable=false`}};
   }
 
+  /**
+   * `ops_magpie_route_sample {env?, alias, purpose}`: the controlled, read-only Magpie route
+   * snapshot. It reads only the loopback gateway's public surfaces plus providers.json, binds the
+   * sealed supplier identity to the serving gateway account, and writes a v4 evidence document and
+   * receipt. It never calls a model, never reads a credential value out of this process, never
+   * writes to Magpie, and answers `blocked` with structured gaps for every missing fact.
+   */
   private async magpieRouteSample(ctx: Ctx, args: Args): Promise<Outcome> {
     assertLocalMagpieScope(ctx.scope.project,ctx.env);
     const allowed = new Set(['env', 'alias', 'purpose']);
@@ -1759,15 +1811,29 @@ export class OpsBroker {
    * — or the specific blocked fields. It binds nothing itself and never resumes or retries.
    */
   private async magpieWindowPrepare(ctx: Ctx, args: Args): Promise<Outcome> {
-    const allowed = new Set(['env', 'manifestPath', 'documentPath', 'approvalTask']);
+    const allowed = new Set(['env', 'manifestPath', 'documentPath', 'approvalTask', 'candidatePath']);
     const extra = Object.keys(args).filter(key => !allowed.has(key));
-    if (extra.length) throw invalid(`ops_magpie_window_prepare accepts only manifestPath, documentPath and approvalTask (rejected: ${extra.join(', ')})`);
+    if (extra.length) throw invalid(`ops_magpie_window_prepare accepts only manifestPath, documentPath, candidatePath and approvalTask (rejected: ${extra.join(', ')})`);
     const approvalTask = text(args, 'approvalTask', 128);
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(approvalTask)) throw invalid('approvalTask must be a task id');
     // The evidence root follows the approval task, exactly like ops_internal_ai_prove/deliver, so a
     // manager can prepare a window for another task's approval; the caller's own task is only the
     // root when no approval task is named.
     const proofRoot = approvalTask || ctx.scope.taskId;
+    if (args.candidatePath !== undefined) {
+      if (args.manifestPath !== undefined || args.documentPath !== undefined) throw invalid('candidatePath 与 manifestPath/documentPath 只能二选一');
+      const raw = await readProofFile(this.serviceHome(), proofRoot, text(args, 'candidatePath', 1024));
+      const parsed = remoteMagpieEvidenceSchema.safeParse(JSON.parse(raw.toString('utf8')));
+      if (!parsed.success) throw new CompanyError('invalid', 'remote-magpie candidate is malformed or was edited after it was generated');
+      const result = remoteMagpieWindow(parsed.data, {approvalTask, now: this.now(), approvals: this.deps.magpie?.remotePriceApprovals?.() ?? [], trusted: this.remoteObservations.get(parsed.data.observation.digest)});
+      return {
+        value: { ...result, candidateHash: sha256(raw), evidenceExpiresAt: parsed.data.expiry.expiresAt },
+        audit: {
+          action: 'ops_magpie_window',
+          evidence: `ops_magpie_window_prepare(remote) → ${result.eligible ? 'window-ready' : `blocked(${result.blockedReasons.join(',')})`}`,
+        },
+      };
+    }
     const files = await loadProofFiles(this.serviceHome(), proofRoot, text(args, 'manifestPath', 1024), text(args, 'documentPath', 1024));
     if (files.manifest.schemaVersion !== 2) throw new CompanyError('invalid', 'the execution-window proxy only accepts a v2 Magpie manifest');
     const result = magpieWindowFromEvidence(files, approvalTask, this.now());

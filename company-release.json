@@ -1,15 +1,18 @@
 {
-  "version": "0.3.42",
-  "title": "临期额度优先消耗与独立额度识别修复",
-  "changes": [
-    "临期额度通过非线性总分获得较高优先级，保留统一分数降序；页面同步显示计算过程。",
-    "识别包含完整模型名的活动窗口，独立试用与模型专属到期赠送额度不受普通周额度耗尽误判。",
-    "每分钟发现远端目录与新增额度，已知近期截止时每30秒更新；保留五条有效请求后额度不变撤销临期资格。"
-  ],
-  "impact": [
-    "影响Haiku/Sonnet自动排序；保留老板权重、计费标记、置顶及分组成员，Opus/Fable继续手动维护。",
-    "不调用JEV，不新增模型推理请求；远端额度刷新最多三个并发。"
-  ],
-  "migration": "无需schema或凭证迁移；临期观测记录保留，旧评分快照仍按旧公式展示。",
-  "rollback": "恢复上一健康main发布；保留现有配置、分组成员与额度观测记录。"
+ "version": "0.3.43",
+ "title": "FV06 远端证据候选契约（remote-magpie-evidence/1）",
+ "changes": [
+  "新增 ops_product_magpie_candidate：只读观测远端 remote-magpie，写 remote-magpie-evidence/1 候选，远端未给出的字段保持 null 并记入 gaps。",
+  "ops_magpie_window_prepare 新增 candidatePath 模式：价目需不同员工批准同一 digest，缺预算、余量不足或过期即闭锁。",
+  "远端候选消费时以 broker 保存的受信观测重建候选并逐字段比对：expiry、route、价目或其他字段与观测不一致即闭锁；价目批准不能授权改写观测或续期。",
+  "候选 author 改由 broker 受信记录决定（生成候选的员工）：窗口以受信作者参与重建与自批准判断，文件内改写 author 并重算摘要的候选被 candidate-author-mismatch 拒绝。"
+ ],
+ "impact": [
+  "只新增员工侧只读工具与窗口计算；不调用模型，不改任何供应商或产品配置，不授予预算。",
+  "生产尚无价目批准读取器，远端窗口在批准读取器建成前一律闭锁。",
+  "窗口检查只读取 broker 进程内保存的观测，进程重启后需重新观测生成候选，旧候选闭锁为 observation-untrusted。",
+  "broker 进程内观测与作者记录最多保留 64 条，超出淘汰最旧；被淘汰或进程重启后的候选闭锁为 observation-untrusted，需重新观测。预算数值仍由调用方提供，窗口只核对存在性，未绑定老板批准包络。"
+ ],
+ "migration": "无schema和secret变更。",
+ "rollback": "恢复上一健康 main 发布；新工具不写数据，回退无需清理。"
 }
