@@ -21,13 +21,11 @@ interface ModelManagementContext {
 /** One mutation path shared by both owner surfaces; invalidate stale ranking writes first. */
 export async function updateModelMembership(ctx:ModelManagementContext,input:Parameters<ModelManagementContext['modelRouting']['setMembership']>[0]) {
  const settings=await rankingSettings(ctx.db.db);
- await ctx.modelRanking.configure(()=>ctx.modelRouting.setMembership(input),settings.refreshMinutes);
- ctx.modelRanking.trigger();
+ await ctx.modelRanking.configure(()=>ctx.modelRouting.setMembership(input),settings.refreshMinutes,true);
  return {ok:true};
 }
 export async function updateModelAlias(ctx:ModelManagementContext,input:{model:string;slug:string|null}) {
  const settings=await rankingSettings(ctx.db.db);let result={synchronized:false};
- await ctx.modelRanking.configure(async()=>{result=await ctx.modelRouting.setAlias(input.model,input.slug);},settings.refreshMinutes);
- ctx.modelRanking.trigger();
+ await ctx.modelRanking.configure(async()=>{result=await ctx.modelRouting.setAlias(input.model,input.slug);},settings.refreshMinutes,true);
  return {ok:true,...result};
 }

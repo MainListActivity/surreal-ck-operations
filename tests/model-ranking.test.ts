@@ -98,7 +98,7 @@ function fixture(){
  const deps={db:db as any,jev,groups:()=>groups,facts:async(ids:string[])=>{factsCalls++;return ids.map(fact);},apply:async(x:any)=>{applied.push(x);}};
  return {db,deps,writes,calls,applied,factsCalls:()=>factsCalls};
 }
-test('request refresh is asynchronous, single-flight, interval-controlled and excludes Fable and Opus',async()=>{
+test('observation refresh is asynchronous, single-flight and fixed at 30 seconds; saves apply immediately',async()=>{
  const f=fixture();const r=new RankingRefresher(f.deps);
  r.trigger(0);r.trigger(0);expect(f.calls).toEqual([]);await r.settled();
  expect(f.calls).toEqual([]);expect(f.factsCalls()).toBe(1);expect(f.applied).toHaveLength(1);
@@ -106,17 +106,19 @@ test('request refresh is asynchronous, single-flight, interval-controlled and ex
  r.trigger(30000);await r.settled();expect(f.applied).toHaveLength(2);
  await saveRankingSettings(f.db as any,{rules:'质量优先',refreshMinutes:2},r);
  expect(await rankingSettings(f.db as any)).toEqual({rules:DEFAULT_RANKING_RULES,refreshMinutes:2,policy:DEFAULT_POLICY});
- r.trigger(300001);await r.settled();expect(f.applied).toHaveLength(3);
- r.trigger(330000);await r.settled();expect(f.applied).toHaveLength(3);
- r.trigger(330001);await r.settled();expect(f.applied).toHaveLength(4);
+ expect(f.applied).toHaveLength(3);expect(f.factsCalls()).toBe(2);
+ r.reset();r.trigger(300001);await r.settled();expect(f.applied).toHaveLength(4);
+ r.trigger(330000);await r.settled();expect(f.applied).toHaveLength(4);
+ r.trigger(330001);await r.settled();expect(f.applied).toHaveLength(5);
 });
 test('saving during a refresh invalidates old rules, stopped refresher cannot publish',async()=>{
- const f=fixture();let release!:()=>void;const wait=new Promise<void>(resolve=>release=resolve);
+ const f=fixture();const r=new RankingRefresher(f.deps);r.trigger(0);await r.settled();
+ let release!:()=>void;const wait=new Promise<void>(resolve=>release=resolve);
  f.deps.facts=async(ids:string[])=>{await wait;return ids.map(fact);};
- const r=new RankingRefresher(f.deps);r.trigger();await Promise.resolve();
- await saveRankingSettings(f.db as any,{rules:'新规则',refreshMinutes:10},r);release();await r.settled();expect(f.applied).toHaveLength(0);
- r.trigger();await r.settled();expect(f.applied).toHaveLength(1);
- r.stop();r.reset();r.trigger();await r.settled();expect(f.applied).toHaveLength(1);
+ r.trigger(30000);await Promise.resolve();
+ await saveRankingSettings(f.db as any,{rules:'新规则',refreshMinutes:10},r);expect(f.applied).toHaveLength(2);
+ release();await r.settled();expect(f.applied).toHaveLength(2);
+ r.stop();r.reset();r.trigger();await r.settled();expect(f.applied).toHaveLength(2);
  await expect(saveRankingSettings(f.db as any,{rules:'',refreshMinutes:3},r)).rejects.toThrow();
 });
 test('facts failure retains group order and records a safe error without invoking Jev',async()=>{
@@ -149,8 +151,11 @@ test('save/stop while apply is waiting prevents stale publication at the write b
   const published:unknown[]=[];
   const r=new RankingRefresher({...f.deps,apply:async(orders,isCurrent)=>{entered();await wait;if(isCurrent())published.push(orders);}});
   r.trigger();await started;
-  if(action==='save')await saveRankingSettings(f.db as any,{rules:'new rules',refreshMinutes:5},r);else r.stop();
-  release();await r.settled();expect(published).toHaveLength(0);
+  let saved!:()=>void;const written=new Promise<void>(resolve=>saved=resolve),query=f.db.query;
+  f.db.query=async(sql:string,v?:any)=>{const result=await query(sql,v);if(sql.includes('UPSERT company_meta:model_routing MERGE'))saved();return result;};
+  const saving=action==='save'?saveRankingSettings(f.db as any,{rules:'new rules',refreshMinutes:5},r):undefined;
+  if(action==='stop')r.stop();else await written;
+  release();await saving;await r.settled();expect(published).toHaveLength(action==='save'?1:0);
  }
 });
 test('controller rechecks invalidation after waiting for an existing sync',async()=>{

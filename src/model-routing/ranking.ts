@@ -13,6 +13,8 @@ import { aaRankOfScore, generatedModel, resolveBenchmark, splitMember, type Effo
 export const RANKED_TIERS: Tier[] = ["sonnet", "haiku"];
 export const REFRESH_MINUTES = [2, 5, 10] as const;
 export const DEFAULT_REFRESH_MINUTES = 5;
+/** Observation I/O stays off the request path; owner edits never wait for this cadence. */
+export const OBSERVATION_REFRESH_MS = 30_000;
 export const DEFAULT_RANKING_RULES = RULE_DESCRIPTION;
 
 export interface RankingSettings {
@@ -310,49 +312,66 @@ export interface RefresherDeps {
   log?(message: string): void;
 }
 
-/** Owner's design: no timer of its own. The first request after the interval starts one refresh
- * in the background; saving new rules clears the clock so the next request refreshes at once. */
+/** Requests refresh observations in the background. Owner edits recompute and apply before returning. */
 export class RankingRefresher {
   private last?: number;
-  private minutes = DEFAULT_REFRESH_MINUTES;
   private running?: Promise<void>;
   private revision = 0;
   private stopped = false;
   private pinning?: Promise<void>;
-  private warming=false;
   private urgencyDeadline=Infinity;
   private configuring?:Promise<void>;
+  private observations=new Map<string,ModelFacts>();
+  private observationsLoaded=false;
   private previewSnapshot?:{at:string;groups:Record<string,string[]>;facts:ModelFacts[]};
   constructor(private readonly deps: RefresherDeps) {}
-  reset(minutes = DEFAULT_REFRESH_MINUTES): void {
+  reset(_minutes = DEFAULT_REFRESH_MINUTES): void {
     this.last = undefined;
-    this.minutes = minutes;
     this.revision++;
   }
   stop(): void { this.stopped = true; this.revision++; }
   settled(): Promise<void> { return this.running ?? Promise.resolve(); }
   trigger(now = Date.now()): void {
-    if (this.stopped || this.running || this.pinning || this.configuring || (now<this.urgencyDeadline && this.last !== undefined && now - this.last < (this.warming?30000:this.minutes * 60000))) return;
+    if (this.stopped || this.running || this.pinning || this.configuring || (now<this.urgencyDeadline && this.last !== undefined && now - this.last < OBSERVATION_REFRESH_MS)) return;
     this.last = now;
     const revision = this.revision;
     this.running = Promise.resolve().then(() => this.run(revision)).catch(() => this.deps.log?.("模型排序刷新失败，保留现有顺序"))
       .finally(() => { this.running = undefined; });
   }
-  async configure(write:()=>Promise<void>,minutes:number):Promise<void>{
+  async configure(write:()=>Promise<void>,_minutes=DEFAULT_REFRESH_MINUTES,refreshFacts=false):Promise<void>{
     const previous=this.configuring;
-    const job=(async()=>{await previous?.catch(()=>undefined);this.reset(minutes);await this.pinning;await write();this.reset(minutes);})();
+    const job=(async()=>{await previous?.catch(()=>undefined);this.reset();await this.pinning;
+      if(this.stopped)throw Error('排序服务已停止');
+      await write();this.reset();this.previewSnapshot=undefined;
+      await this.run(this.revision,!refreshFacts,true);
+    })();
     this.configuring=job;
     try{await job;}finally{if(this.configuring===job)this.configuring=undefined;}
   }
+  private async cachedFacts(ids:string[]):Promise<ModelFacts[]>{
+    if(!this.observationsLoaded){
+      const [status]=await this.deps.db.query<[{results?:Record<string,RankingResultSnapshot>;gates?:RankingGates}|undefined]>('SELECT results,gates FROM ONLY company_meta:model_ranking;');
+      const persisted=[...Object.values(status?.results??{}).flatMap(r=>[...r.rows.map(row=>row.facts),...(r.pinnedFacts??[]),...(r.excludedFacts??[])]),...Object.values(status?.gates??{}).flatMap(g=>g.facts)];
+      for(const fact of new Map(persisted.map(f=>[f.id,f])).values())if(!this.observations.has(fact.id))this.observations.set(fact.id,fact);
+      this.observationsLoaded=true;
+    }
+    const missing=ids.filter(id=>!this.observations.has(id));
+    if(missing.length)for(const fact of await this.deps.facts(missing))this.observations.set(fact.id,fact);
+    return ids.flatMap(id=>this.observations.has(id)?[this.observations.get(id)!]:[]);
+  }
   /** Read/collect only: never writes settings, orders or Magpie configuration. Frozen observations across slider edits. */
   async preview(input:unknown,refresh=false){
+    const revision=this.revision;
+    const current=()=>{if(revision!==this.revision||this.stopped)throw Error('排序配置已变化，请重新预览');};
     const policy=rankingPolicy(input),groups=this.deps.groups(),ids=[...new Set(RANKED_TIERS.flatMap(t=>groups[`sck-${t}`]??[]))];
-    if(refresh){const facts=await this.deps.facts(ids);this.previewSnapshot={at:new Date().toISOString(),groups,facts};}
+    if(refresh){const facts=await this.deps.facts(ids);current();for(const fact of facts)this.observations.set(fact.id,fact);this.previewSnapshot={at:new Date().toISOString(),groups,facts};}
     if(!this.previewSnapshot){
       const [status]=await this.deps.db.query<[{at?:string;results?:Record<string,RankingResultSnapshot>}|undefined]>('SELECT at,results FROM ONLY company_meta:model_ranking;');
+      current();
       this.previewSnapshot={at:status?.at?String(status.at):new Date().toISOString(),groups,facts:Object.values(status?.results??{}).flatMap(r=>r.rows.map(row=>row.facts))};
     }
     const snapshot=this.previewSnapshot,pins=await rankingPins(this.deps.db),orders:Record<string,string[]>={},results:Record<string,RankingResultSnapshot>={};
+    current();
     for(const tier of RANKED_TIERS){const group=`sck-${tier}`,members=groups[group]??[];
       const facts=members.map(id=>snapshot.facts.find(f=>f.id===id));
       if(facts.some(f=>!f))throw Error('预览观测不完整，请点击更新观测');
@@ -362,16 +381,15 @@ export class RankingRefresher {
     const tables=rankingTables(orders,results,[],pins).map(t=>({...t,rows:t.rows.map(r=>({...r,previousRank:(groups[t.group]??[]).indexOf(r.model)+1}))}));
     return {tables,at:snapshot.at,policy};
   }
-  /** Invalidate in-flight Jev results before waiting; serialize edits from both owner surfaces. */
+  /** Invalidate background writes and serialize owner pins from both surfaces. */
   setPin(group: string, model: string, pinned: boolean): Promise<void> {
     if (this.configuring)return Promise.reject(Error('配置保存中，请稍后重试'));
     if (!RANKED_TIERS.some(t => group === `sck-${t}`) || !model || model.length > 300 || typeof pinned !== 'boolean')
       return Promise.reject(Error('置顶参数无效'));
-    this.reset(this.minutes);
+    this.reset();
     const previous = this.pinning;
     const operation = (async () => {
       await previous?.catch(() => undefined);
-      await this.settled();
       if (this.stopped) throw Error('排序服务已停止');
       const members = this.deps.groups()[group] ?? [];
       if (!members.includes(model)) throw Error('模型已不在当前分组，请刷新列表');
@@ -382,7 +400,7 @@ export class RankingRefresher {
         if (pins[group]?.includes(model)) next.splice(pins[group].indexOf(model), 0, model);
         else next.push(model);
       }
-      const facts=await this.deps.facts(members);
+      const facts=await this.cachedFacts(members);
       if(members.some(id=>!facts.some(f=>f.id===id)))throw Error('排序观测缺失，置顶尚未生效');
       const settings=await rankingSettings(this.deps.db);
       const rows=ruleOrder(members.map(id=>facts.find(f=>f.id===id)!),next,Date.now(),settings.policy);
@@ -397,14 +415,15 @@ export class RankingRefresher {
     this.pinning = tracked;
     return tracked;
   }
-  private async run(revision: number): Promise<void> {
+  private async run(revision: number,cached=false,strict=false): Promise<void> {
     try {
       const settings = await rankingSettings(this.deps.db);
-      this.minutes = settings.refreshMinutes;
       const live = this.deps.groups();
       const pins = await rankingPins(this.deps.db);
       const ids = [...new Set(RANKED_TIERS.flatMap(t => live[`sck-${t}`] ?? []))];
-      const allFacts = await this.deps.facts(ids);
+      const allFacts = cached?await this.cachedFacts(ids):await this.deps.facts(ids);
+      if(revision!==this.revision||this.stopped)return;
+      for(const fact of allFacts)this.observations.set(fact.id,fact);
       this.urgencyDeadline=Math.min(Infinity,...allFacts.flatMap(f=>f.urgency?.active?[Date.parse(f.urgency.expiresAt)]:[]));
       const byId = new Map(allFacts.map(f => [f.id, f]));
       const orders: Record<string, string[]> = {};
@@ -430,16 +449,17 @@ export class RankingRefresher {
         }
       }
       if (revision !== this.revision || this.stopped) return;
-      this.warming=Object.values(results).some(r=>r.rows.some(row=>row.decision?.coldStart));
+      if(strict&&errors.length)throw Error(errors.join("；"));
       if (Object.keys(orders).length) await this.deps.apply(orders, () => revision === this.revision && !this.stopped);
       if (revision !== this.revision || this.stopped) return;
       await this.deps.db.query(
         "UPSERT company_meta:model_ranking SET at=time::now(),orders=object::extend(orders ?? {},$orders),results=object::extend(results ?? {},$results),gates=object::extend(gates ?? {},$gates),error=$error,refresh_minutes=$minutes;",
-        { orders, results, gates, error: errors.length ? errors.join("；") : undefined, minutes: this.minutes });
+        { orders, results, gates, error: errors.length ? errors.join("；") : undefined, minutes: DEFAULT_REFRESH_MINUTES });
     } catch (e) {
       this.deps.log?.(`模型排序刷新失败：${(e as Error).message.slice(0, 200)}`);
       if (revision === this.revision && !this.stopped) await this.deps.db.query(
         "UPSERT company_meta:model_ranking MERGE {at:time::now(),error:'刷新失败，保留现有顺序'};").catch(() => undefined);
+      if(strict)throw Error('设置已保存，但排序应用未确认，请重试');
     }
   }
 }

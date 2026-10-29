@@ -158,7 +158,7 @@ export const modelRanking = defineRpc({
 });
 export const saveModelRanking = defineRpc({
   name: "company.model-ranking.save",
-  input: z.object({policy:rankingPolicySchema.optional(),rules:z.string().max(8000),refreshMinutes:z.union([z.literal(2),z.literal(5),z.literal(10)])}),
+  input: z.object({policy:rankingPolicySchema.optional(),rules:z.string().max(8000),refreshMinutes:z.union([z.literal(2),z.literal(5),z.literal(10)]).default(5)}),
   output: z.object({ok:z.boolean()}),
 });
 

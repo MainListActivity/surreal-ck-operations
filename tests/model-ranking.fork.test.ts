@@ -18,7 +18,7 @@ run('fork: deterministic ranking persists across reconnect without Jev or overwr
   expect(await rankingSettings(db.db)).toEqual({rules:DEFAULT_RANKING_RULES,refreshMinutes:2,policy:DEFAULT_POLICY});
   const [c]=await db.db.query<[any]>('SELECT * FROM ONLY company_meta:model_routing;');expect(c).toMatchObject({enabled:true,disabledModels:['keep/excluded'],ranking_rules:DEFAULT_RANKING_RULES});
   await db.db.query("UPSERT company_meta:model_ranking CONTENT {orders:{kept:['old/model']},pins:{'sck-haiku':['a/slow']}};");
-  refresher.trigger(0);await refresher.settled();expect(calls).toBe(0);expect(applied).toEqual([{'sck-sonnet':['a/fast','a/slow'],'sck-haiku':['a/slow','a/fast']}]);
+  applied.length=0;refresher.trigger(0);await refresher.settled();expect(calls).toBe(0);expect(applied).toEqual([{'sck-sonnet':['a/fast','a/slow'],'sck-haiku':['a/slow','a/fast']}]);
   expect(await rankingRequests(db.db)).toEqual([]);
   const [status]=await db.db.query<[any]>('SELECT * FROM ONLY company_meta:model_ranking;');
   expect(status.orders.kept).toEqual(['old/model']);expect(status.results['sck-haiku']).toMatchObject({engine:'quality-pace-v5',answers:{}});
@@ -40,7 +40,7 @@ run('fork: edited weights persist, preview matches next publication and interval
   await db.connect();await db.bootstrap();let groups={'sck-haiku':['p/fast','p/urgent']};
   const now=Date.now();const facts=async()=>groups['sck-haiku'].map(id=>({id,aa:{score:60,rank:1},price:{free:false},accounts:[{account:'anon',kind:'plan' as const,remainingPct:80,windows:[{remainingPct:80,resetsAt:new Date(now+(id==='p/urgent'?3600000:7*86400000)).toISOString()}]}],usage:{source:'magpie' as const,period:'7d' as const,scope:'provider-model' as const,collectedAt:new Date(now).toISOString(),requests:10,errors:0,speedSamples:0,ttftSamples:10,ttftMs:id==='p/fast'?100:19000}}));
   let applyCalls=0;const r=new RankingRefresher({db:db.db,groups:()=>groups,facts,apply:async orders=>{applyCalls++;groups={'sck-haiku':orders['sck-haiku']!};}});
-  await saveRankingSettings(db.db,{rules:'',refreshMinutes:10},r);r.trigger(0);await r.settled();expect(groups['sck-haiku'][0]).toBe('p/fast');
+  await saveRankingSettings(db.db,{rules:'',refreshMinutes:10},r);expect(groups['sck-haiku'][0]).toBe('p/fast');
   const policy=structuredClone(DEFAULT_POLICY);for(const key of Object.keys(policy.weights))policy.weights[key as keyof typeof policy.weights]=key==='pace'?100:0;
   const preview=await r.preview(policy);expect(preview.tables[0]!.rows[0]!.model).toBe('p/urgent');expect(applyCalls).toBe(1);
   expect((await rankingSettings(db.db)).policy).toEqual(DEFAULT_POLICY);

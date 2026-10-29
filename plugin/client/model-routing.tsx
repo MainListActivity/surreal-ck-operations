@@ -18,7 +18,7 @@ export function ModelRoutingPanel({ctx}:Props){
  const catalogRpc=useRpc(rpc.modelCatalog),membership=useRpc(rpc.setModelMembership),alias=useRpc(rpc.setModelAlias);
  const data=useQuery({queryKey:['model-ranking'],queryFn:()=>get({}),refetchInterval:15000});
  const [width,setWidth]=useState(ctx.compact?390:1100),[group,setGroup]=useState<string>('sck-haiku'),[mode,setMode]=useState<'ranking'|'catalog'>('ranking');
- const [policy,setPolicy]=useState<ModelRankingPolicy>(),[minutes,setMinutes]=useState<2|5|10>(),[previewPolicy,setPreviewPolicy]=useState<ModelRankingPolicy>();
+ const [policy,setPolicy]=useState<ModelRankingPolicy>(),[previewPolicy,setPreviewPolicy]=useState<ModelRankingPolicy>();
  const [search,setSearch]=useState(''),[catalogSearch,setCatalogSearch]=useState(''),[offset,setOffset]=useState(0),[shown,setShown]=useState(12);
  const [expanded,setExpanded]=useState(''),[message,setMessage]=useState(''),[busy,setBusy]=useState(false);
  const effective:ModelRankingPolicy=policy??data.data?.policy??ROUTING_DEFAULTS;
@@ -45,10 +45,9 @@ export function ModelRoutingPanel({ctx}:Props){
     <Text style={muted}>{ROUTING_FORMULA}</Text>
     {Object.entries(ROUTING_WEIGHTS).map(([key,title])=><View key={key} style={{flexDirection:'row',alignItems:'center',justifyContent:'space-between',marginTop:12}}><Text style={text}>{title}</Text><TextInput accessibilityLabel={`${title}权重`} keyboardType='numeric' style={{...input,width:65}} value={String(effective.weights[key as keyof typeof effective.weights])} onChangeText={v=>setPolicy({...effective,weights:{...effective.weights,[key]:Number(v)}})}/></View>)}
     <Text style={{...muted,marginTop:12}}>延迟以20秒为衰减参考，连续扣分；未知指标使用保守先验，未测延迟通过有限探索获得样本。</Text>
-    <Text style={{...text,marginTop:15,marginBottom:8}}>刷新间隔</Text><View style={{flexDirection:'row',gap:6}}>{([2,5,10] as const).map(m=><View key={m}>{button(`${m} 分钟`,()=>setMinutes(m),(minutes??data.data?.refreshMinutes??5)===m)}</View>)}</View>
-    <View style={{marginTop:14}}>{button('保存设置',()=>void action(async()=>{await save({rules:data.data?.rules??'',refreshMinutes:(minutes??data.data?.refreshMinutes??5) as 2|5|10,policy:effective});setPolicy(undefined);setMinutes(undefined);},'已保存，下次请求到达时刷新排序。'),true,!data.data||(!dirty&&minutes===undefined))}</View>
+    <View style={{marginTop:14}}>{button('保存设置',()=>void action(async()=>{await save({rules:data.data?.rules??'',policy:effective});setPolicy(undefined);},'已保存，排序已立即生效。'),true,!data.data||!dirty&&!data.data?.error)}</View>
     <View style={{flexDirection:'row',gap:6,flexWrap:'wrap',marginTop:8}}>{button('恢复默认',()=>setPolicy({...ROUTING_DEFAULTS,billingOverrides:effective.billingOverrides}))}{button('更新观测',()=>void action(async()=>{await preview({policy:effective,refresh:true});await client.invalidateQueries({queryKey:['routing-preview']});},'已更新实测，未修改线上排序。'))}</View>
-    <Text style={{...muted,marginTop:12}}>{dirty?(previewData.isError?'预览失败，请更新观测；线上未变更。':previewData.data?'预览中，保存前不影响线上。':'正在计算预览…'):'每次请求读取内存排序；到期后下一次请求触发异步刷新。'}</Text>
+    <Text style={{...muted,marginTop:12}}>{dirty?(previewData.isError?'预览失败，请更新观测；线上未变更。':previewData.data?'预览中，保存前不影响线上。':'正在计算预览…'):'保存后立即重算并应用；请求读取已生效顺序，实测数据最多每30秒后台更新。'}</Text>
     <Text style={{...muted,marginTop:10}}>{ROUTING_COST_HELP}</Text>
    </View>
    <View style={{...panel,flex:1,minWidth:0}}>
@@ -81,7 +80,7 @@ export function ModelRoutingPanel({ctx}:Props){
     </View>:<View style={{gap:8}}>
      <Text style={muted}>从实时 Magpie 目录添加成员，或选择有分数的 AA 对应模型。修改分组不改变其他分组；目录已排除 group/ 和 auto/。</Text>
      {catalog.isError&&<Text accessibilityRole='alert' style={{...text,color:palette.danger}}>目录读取失败，请重试。</Text>}
-     {catalog.data?.models.map(model=><CatalogModel key={model.id} model={model} benchmarks={catalog.data!.benchmarks} group={group} ctx={ctx} busy={busy} onMembership={input=>action(()=>membership(input),'分组已保存，正在刷新排序。')} onAlias={slug=>action(()=>alias({model:model.id,slug}),'AA 关联已保存。')}/>)}
+     {catalog.data?.models.map(model=><CatalogModel key={model.id} model={model} benchmarks={catalog.data!.benchmarks} group={group} ctx={ctx} busy={busy} onMembership={input=>action(()=>membership(input),'分组与排序已生效。')} onAlias={slug=>action(()=>alias({model:model.id,slug}),'AA 关联已保存。')}/>)}
      {!catalog.data?.models.length&&<Text style={muted}>{catalog.isLoading?'正在读取目录…':'没有匹配模型。'}</Text>}
      <View style={{flexDirection:'row',gap:8,alignItems:'center'}}>{button('上一页',()=>setOffset(Math.max(0,offset-40)),false,offset===0)}<Text style={muted}>{catalog.data?.models.length?offset+1:0}–{offset+(catalog.data?.models.length??0)} / {catalog.data?.total??0}</Text>{button('下一页',()=>setOffset(catalog.data?.nextOffset??offset),false,catalog.data?.nextOffset==null)}</View>
     </View>}
