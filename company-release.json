@@ -1,5 +1,5 @@
 {
- "version": "0.3.42",
+ "version": "0.3.43",
  "title": "FV06 远端证据候选契约（remote-magpie-evidence/1）",
  "changes": [
   "新增 ops_product_magpie_candidate：只读观测远端 remote-magpie，写 remote-magpie-evidence/1 候选，远端未给出的字段保持 null 并记入 gaps。",

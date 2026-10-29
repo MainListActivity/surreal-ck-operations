@@ -108,7 +108,7 @@ export function quotaAccounts(rows: Array<{ provider:string;name?:string;user?:s
  for(const q of rows){
   const list=out.get(q.provider)??[];
   const windows:QuotaWindow[]=(q.error?[]:q.windows??[]).flatMap(w=>{
-   if(w.unlimited||w.text||w.resetsAt&&Date.parse(w.resetsAt)<=now||typeof w.remaining!=='number'||!Number.isFinite(w.remaining)||w.remaining<0||w.remaining>100)return [];
+   if(w.unlimited||w.text||w.resetsAt&&Date.parse(w.resetsAt)<=now||w.runsOutAt&&!(Date.parse(w.runsOutAt)>now)||typeof w.remaining!=='number'||!Number.isFinite(w.remaining)||w.remaining<0||w.remaining>100)return [];
    return [{pool:w.pool,nonCarryOver:w.nonCarryOver??(/(?:^|\/)(claude|codex)$/.test(q.provider)&&/^(weekly|7 days)$/i.test(w.name??'')),name:w.name,model:w.model,remainingPct:w.remaining,resetsAt:w.resetsAt,runsOutAt:w.runsOutAt,runsOut:w.runsOut,unit:w.unit,limit:w.limit,amount:w.amount}];
   });
   list.push({provider:q.provider,account:`${q.provider} #${list.length+1}`,poolKey:createHash('sha256').update(q.provider+'|'+(q.user??q.name??String(list.length))).digest('hex'),
@@ -122,6 +122,14 @@ export function quotaAccounts(rows: Array<{ provider:string;name?:string;user?:s
 const providerOf = (id: string) => id.slice(0, id.lastIndexOf("/"));
 const FREE = /(^|[^a-z])free([^a-z]|$)|免费/i;
 
+/** Match complete model labels, including activity decorations; ambiguity never grants a model quota. */
+function quotaWindowScope(window:QuotaWindow,models:Set<string>):{scoped:boolean;model?:string}{
+ if(window.model)return {scoped:true,model:models.has(window.model)?window.model:undefined};
+ const name=window.name?.trim()??'';
+ if(models.has(name))return {scoped:true,model:name};
+ const hits=[...new Set(name.split(/\s+[·|:：–—-]\s+|[·|：]\s*/).map(s=>s.trim()).filter(s=>models.has(s)))];
+ return {scoped:hits.length>0,model:hits.length===1?hits[0]:undefined};
+}
 export function modelFacts(
   ids: string[],
   sources: {
@@ -140,12 +148,14 @@ export function modelFacts(
     return {
       id,
       accounts: (sources.quota.get(providerOf(base))??[]).map(a=>{
-        const model=base.slice(base.lastIndexOf('/')+1),scoped=(a.windows??[]).filter(w=>w.model===model||w.name===model);
-        const knownModels=new Set(sources.catalog.map(m=>m.id.slice(m.id.lastIndexOf('/')+1)));
-        const global=(a.windows??[]).filter(w=>!w.model&&!knownModels.has(w.name??''));
+        const model=base.slice(base.lastIndexOf('/')+1);
+        const knownModels=new Set([...sources.catalog.map(m=>m.id),...ids.map(id=>splitMember(id).id)].filter(id=>providerOf(id)===providerOf(base)).map(id=>id.slice(id.lastIndexOf('/')+1)));
+        const windowsWithScope=(a.windows??[]).map(window=>({window,scope:quotaWindowScope(window,knownModels)}));
+        const scoped=windowsWithScope.filter(w=>w.scope.model===model).map(w=>w.window);
+        const global=windowsWithScope.filter(w=>!w.scope.scoped).map(w=>w.window);
         const scopedWindows=scoped.map(w=>({...w,model}));
-        const independentTrial=scopedWindows.some(w=>/trial|试用/i.test(w.name??w.model));
-        const windows=independentTrial?scopedWindows:[...global,...scopedWindows];
+        const independentGrant=scopedWindows.some(w=>/trial|试用/i.test(w.name??w.model)||!!w.runsOutAt&&typeof w.runsOut==='number'&&w.runsOut>0);
+        const windows=independentGrant?scopedWindows:[...global,...scopedWindows];
         return {...a,windows,remainingPct:windows.length?Math.min(...windows.map(w=>w.remainingPct)):a.windows?.length?undefined:a.remainingPct};
       }),
       aa: b ? { rank: aaRankOfScore(b.score), score: Math.round(b.score * 10) / 10, effort: resolved.effort } : undefined,
@@ -265,7 +275,7 @@ export interface RankingTable {
 export function rankingTables(groups: Record<string,string[]>, results: Record<string,RankingResultSnapshot> = {}, requests: RankingRequestSnapshot[] = [], pins: RankingPins = {}, gates:RankingGates = {}): RankingTable[] {
   return (["haiku","sonnet","opus","fable"] as Tier[]).map(tier => {
     const group = `sck-${tier}`, result = results[group], gate=gates[group];
-    const bandWidth=result?.engine===RULE_ENGINE?undefined:result?.policy?.bandWidth??(result?.engine==='quality-pace-v1'?2:undefined);
+    const bandWidth=[RULE_ENGINE,'quality-pace-v5'].includes(result?.engine??'')?undefined:result?.policy?.bandWidth??(result?.engine==='quality-pace-v1'?2:undefined);
     const bandRanges:Record<string,{top:number;bottom:number}>={};
     if(bandWidth!==undefined)for(const r of result?.rows??[]){
       if(r.decision?.band===undefined||typeof r.facts.aa?.score!=='number'||!Number.isFinite(r.facts.aa.score))continue;

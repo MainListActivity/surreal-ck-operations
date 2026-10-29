@@ -1,13 +1,13 @@
 import type { ModelFacts } from './ranking.ts';
 import {DEFAULT_POLICY,rankingPolicy,BILLING_LABELS,type RankingPolicy,type BillingClass} from './weights.ts';
-export const RULE_ENGINE='quality-pace-v5';
+export const RULE_ENGINE='quality-pace-v6';
 export const TTFT_LIMIT_MS=20_000;
 export const AA_BAND_WIDTH=2;
-export const RULE_DESCRIPTION='手动置顶保留人工顺序；其余按非线性总分降序，不再分层。能力、速度、绩效、费用和额度消耗意愿形成几何效用，乘以首 token 延迟、可用额度与可靠性因子；临期额度加成和有限新模型探索也计入同一总分。免费模型不受供应商额度影响；持续报错或已知付费额度耗尽记0分。';
+export const RULE_DESCRIPTION='手动置顶保留人工顺序；其余按非线性总分降序，不再分层。能力、速度、绩效、费用和额度消耗意愿形成几何效用，乘以首 token 延迟、可用额度与可靠性因子；临期额度以连续的剩余分数空间加成优先消耗，有限新模型探索也计入同一总分。免费模型不受供应商额度影响；持续报错或已知付费额度耗尽记0分。';
 export interface RuleDecision {
  urgent?:boolean; band?:number; ttftMs?:number; latencySource:'recent-ewma'|'recent-last'|'historical-average'|'unknown';
  billing:'subscription'|'metered'|'unknown'; quota:'available'|'low'|'exhausted'|'unknown';
- remainingPct?:number; pace?:number; tail?:string; reason:string; costClass?:BillingClass; coldStart?:boolean; score?:number; factors?:{base:number;latency:number;availability:number;reliability:number;urgency:number;exploration:number;estimatedCost?:number}; contributions?:Record<string,{value?:number;weight:number;points:number;factor?:number}>;
+ remainingPct?:number; pace?:number; tail?:string; reason:string; costClass?:BillingClass; coldStart?:boolean; score?:number; factors?:{base:number;latency:number;availability:number;reliability:number;urgency:number;exploration:number;utility?:number;estimatedCost?:number}; contributions?:Record<string,{value?:number;weight:number;points:number;factor?:number}>;
 }
 const finite=(v:unknown):v is number=>typeof v==='number'&&Number.isFinite(v);
 export function recentMetric(f:ModelFacts,key:string,now:number):{value?:number;source:RuleDecision['latencySource']} {
@@ -80,13 +80,16 @@ export function ruleOrder(facts:ModelFacts[],pins:string[]=[],now=Date.now(),inp
   const reliability=success**2;
   const urgent=!tail&&facts.urgency?.active===true&&Date.parse(facts.urgency.expiresAt)>now;
   const hours=urgent?(Date.parse(facts.urgency!.expiresAt)-now)/3600000:Infinity;
-  const urgency=urgent?1+0.25*(policy.weights.pace/35)/(1+hours/24):1;
-  const ordinary=clamp(base*latencyFactor*availability*reliability*urgency/100)*100;
+  const urgency=urgent?1+8*(policy.weights.pace/35)/(1+hours/24):1;
+  const utility=clamp(base*latencyFactor*availability*reliability/100)*100;
+  // Spend expiring grants first by consuming score headroom smoothly, without a hidden partition
+  // or clamping all urgent models to the same 100 points. Very low utility remains low.
+  const ordinary=100*(1-(1-utility/100)**urgency);
   // A bounded exploration uplift decays over five actual attempts. Errors immediately lose the uplift.
   const exploration=!tail&&!(observed?.errors)&&requests<5?0.9*(1-requests/5)*(100-ordinary)*(coldStart?1:latencyFactor*availability*reliability):0;
   const score=tail?0:Math.min(100,ordinary+exploration);
   const decision:RuleDecision={...account,quota,remainingPct:free?undefined:account.remainingPct,urgent,ttftMs:latency.value,latencySource:latency.source,
-   tail,costClass,coldStart,contributions,score,factors:{base,latency:latencyFactor,availability,reliability,urgency,exploration,estimatedCost:expectedCost},reason:''};
+   tail,costClass,coldStart,contributions,score,factors:{base,utility,latency:latencyFactor,availability,reliability,urgency,exploration,estimatedCost:expectedCost},reason:''};
   const pin=pins.indexOf(facts.id);
   decision.reason=[pin>=0?`手动置顶第${pin+1}位（人工覆盖）`:undefined,tail,
    free?'免费：供应商额度不扣分':BILLING_LABELS[costClass],urgent?'临期消耗加成':facts.urgency?.reason,
