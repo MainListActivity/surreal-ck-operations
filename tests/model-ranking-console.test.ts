@@ -35,7 +35,7 @@ test('owner ranking page uses supplied Figma layout, real API, light/dark tokens
  expect(html).not.toContain('<textarea');
  expect(html).not.toContain('历史 JEV 请求');
  expect(script).not.toContain("$('rule').value");
- expect(script).toContain('rules:state.rules,refreshMinutes:Number');
+ expect(script).toContain('rules:state.rules,policy');expect(html).not.toContain('id="refresh"');expect(html).toContain('保存后立即重算并应用');
  expect((await (await f.request('')).text())).toContain("location.href='ranking'");
  expect(relayDesignCss).toContain('grid-template-columns: 340px minmax(0, 1fr)');
 });
@@ -85,13 +85,14 @@ test('model management shares owner token/origin protections and validates exact
  expect((await f.request('api/model-catalog?query=a&offset=40')).status).toBe(200);
 });
 
-test('polling preserves an unsaved refresh interval and saves the selected value',async()=>{
+test('browser saves without a refresh interval and confirms immediate application',async()=>{
  const nodes=new Map<string,any>();const node=(id:string)=>{if(!nodes.has(id))nodes.set(id,{value:'',dataset:{},classList:{toggle(){}},querySelectorAll:()=>[],disabled:true});return nodes.get(id);};
  const writes:any[]=[];
  const fetch=async(_url:string,options:any)=>{if(options?.body)writes.push(JSON.parse(options.body));return {ok:true,json:async()=>({tables:[],refreshMinutes:5})};};
  const script=rankingPage.match(/<script>([\s\S]*?)<\/script>/)![1]!;
  const page=new Function('document','localStorage','matchMedia','fetch','setInterval',script+';return {read};')({getElementById:node,documentElement:{dataset:{}}},{getItem:()=>null},()=>({matches:false}),fetch,()=>{});
- await page.read();node('refresh').value='10';node('refresh').onchange();await page.read();
- expect(node('refresh').value).toBe('10');expect(node('save-rule').disabled).toBe(false);
- await node('save-rule').onclick();expect(writes[0].refreshMinutes).toBe(10);
+ await page.read();await node('save-rule').onclick();expect(writes[0].refreshMinutes).toBeUndefined();
+ expect(node('preview-status').textContent).toContain('立即生效');
 });
+
+test('owner save accepts interval-free settings from the new clients',async()=>{const f=fixture();expect((await f.request('api/model-ranking',{rules:''})).status).toBe(200);expect(f.resets).toEqual([5]);});
