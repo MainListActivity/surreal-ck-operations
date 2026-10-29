@@ -1,18 +1,12 @@
 {
- "version": "0.3.38",
- "title": "任务成本与综合评分、目标分阶段收口、建单即定代码仓与提交前系统检查",
+ "version": "0.3.39",
+ "title": "老板成本清单查询修正",
  "changes": [
-  "每个完成的任务从 Magpie 逐请求用量按租约会话结算 token、金额（USD）、模型耗时和建单到验收的总时长，按员工、按模型拆分，存入 task_cost，原始请求行清理前先结算；老板用 pnpm run company cost 查看，员工与评审用 get_task_cost。",
-  "评分校准：评审给出任务复杂度，系统保留评审原分为 judge_overall，按退回、租约收回、系统检查退回的提交扣分，并按同复杂度任务的成本与时长中位数给作者加减效率分，校准后的分数进入均分。",
-  "跨目标依赖已完成不再让目标进入 needs_repair。",
-  "create_task/create_delivery 可传 codeRepoPath；写明 ops 仓绝对路径的 code/上线/部署任务在建单时自动绑定 ops 仓，首次领取即落在正确仓；新增 task_intent_update 让经理把阻塞的只读工程任务原地改为 code 任务。",
-  "ops 仓代码任务 submit 前由系统检查 tsc、版本号与 company-release、MCP 工具接线和测试清单；不通过直接退回原员工，不占用评审，并记入评分。",
-  "新增 goal_phase_split：把大目标中长期等待的后续任务移到下一阶段目标，本阶段锚点不再等待并自动解锁验收。"
+  "pnpm run company cost --days N 的清单查询按 SurrealQL 规则把排序字段一并选出，修正解析错误；单任务查看不变。"
  ],
  "impact": [
-  "新增 task_cost 表与 task/scorecard 可选字段；读 Magpie 本机用量接口，不新增推理调用。",
-  "系统检查只读文件与 git 对象，tsc 用服务自带编译器在员工沙箱内运行；检查本身无法运行时放行由评审把关。"
+  "只改老板命令行的只读查询。"
  ],
- "migration": "schema 045 新增 task_cost 表；无 secret 变更。存量已完成任务在生命周期轮询中逐批补算 30 天内的成本。",
- "rollback": "恢复上一健康 main 发布；旧版忽略 task_cost 与新增字段，已移动到下一阶段目标的任务保持新归属。"
+ "migration": "无schema和secret变更。",
+ "rollback": "恢复上一健康 main 发布。"
 }
