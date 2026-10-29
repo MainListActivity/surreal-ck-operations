@@ -18,6 +18,14 @@
 - 机器证据只由服务端适配器写入：`record_acceptance_evidence` 让适配器只读调用 `gh run view`、`gh api .../artifacts/<id>`、`gh api .../deployments` 与 target run/job/status API，要求 run 的 `headSha` 等于提交 SHA、`conclusion=success`。**基础设施拒绝**：GitHub 因账户付款失败或触及支出上限而拒绝启动作业时，run 的 `conclusion` 是 `failure` 而它一个步骤都没跑——这样的 run 没有评判过任何代码，不构成交付失败。适配器读该 run 的作业列表与 check run 注解，只有**全部**作业 `steps` 为空、且至少一条注解确为 GitHub 的拒绝文案（account payments / spending limit / Billing & plans）时才认；跑过步骤的作业、读不到作业列表、读不到注解、无 job 链接的检查一律照旧按失败拒绝。豁免只覆盖**未声明 environment**的通用 CI criteria：声明了环境的 criteria 是部署事实，从未启动的 run 证明不了任何部署，仍按失败拒绝；豁免事实写入证据 `source.infrastructure{reason,message,jobs}` 供复核追溯。probe 必须是受信版本 `acceptance-probe/2` 的 CI artifact 记录：运行中通道由 target 作业开始即创建的 commit status 承载，适配器核验 producer run、target run/job 的 in-progress 窗口（`started_at <= readAt <= completed_at`）与 status 创建时刻/哈希；Node 打包模板由 Node 实际执行构建 bundle 的 default 请求路径并记录 Node 版本/bundle hash；`criterion.verify`（如 `probe:running-channel`/`probe:node-packed`）与 `risk` 绑定 probe kind/target。任意 2xx URL、Fake adapter、自传 `RUN_ID`、作业完成后读取或记录不符一律拒绝；artifact 类证据要求未过期且属于同一 head。模型文本或自写 `passed` 不会进入 `verified=true`。
 - 人工证据由获授权的独立签署写入：实现腿由另一位工程师在 `accept` 时签署，上线申请由运营，部署由 QA，老板关口由 `owner.decide`。Jev 是机器 actor，永远不能签署人工 AC。
 
+### 员工阻塞入口
+
+GitHub CI 计费判定属于系统能力。普通 `report_blocker`（到老板或 GM）以及 `wait` 不能把 CI 账单问题变成任务等待；核心在写入状态、租约、故障预算之前拒绝，返回 `invalid` / `github_ci_system_owned`。对含必需 CI 项的任务，核心从本次证据、任务上下文及最近五条进展/提交/阻塞记录提取 PR/run 来源，读取当前 PR head，再复用 GitHub 适配器读取零步骤与原始计费注释；不依赖员工在这次请求里写出“账单”二字。短写 `PR #编号` 只在仓库 remote 已验证时补全；缺少可核来源不会被猜成豁免。交互式来源读取总预算 8 秒，来源判定与后续状态写入分别重核租约。
+
+直接以 CI 计费为理由的请求，即使未提供来源也会被拒绝；这只是限制员工阻塞能力，不能签发豁免。真实来源检查只处理本次与 CI/检查未执行有关的理由；历史“已完成”或其他分句提到 GitHub，不会单凭关键词与客户账单审批混为一谈，也不禁止后续真实依赖等待。多个 run 中有真实或未知失败时，不凭另一个 run 的 billing 禁止员工报修。员工应调用 `record_acceptance_evidence`，提供 `taskId`、机器 `acId`、当前 `sha` 和 `source{provider:"github-actions",runUrl}`，再正常提交；缺少来源、读取失败、错误 SHA 和真实测试失败都不会获得豁免。
+
+已合入 main 的结构化 `companyUpgrade` 是安装申请，仍由当前工程租约、任务仓库和 main 版本核验，不属于要求老板修复 CI 账单的普通阻塞。独立上线签核和部署事实不能由此替代。
+
 ## 3. 统一评估器（AC03）
 
 `src/acceptance.ts` 的 `evaluateAcceptance` 是唯一判定；以下入口都调用它：
