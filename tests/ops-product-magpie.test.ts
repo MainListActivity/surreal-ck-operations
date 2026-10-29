@@ -175,3 +175,17 @@ test('more matching rows than the receipt bound keeps the first ten and says so'
  const out=await observeProductMagpie({readProvider:()=>provider,fetch:fetcher,now:()=>Date.parse('2026-10-29T03:00:00Z')});
  expect(out.usage).toHaveLength(10);expect(out.coverage).toMatchObject({matchingRows:200,rowsReturned:10,rowsTruncated:true,complete:true});
 });
+
+test('native query filters the entire remote ledger before pagination instead of scanning unrelated recent requests',async()=>{
+ const r=remote();const fetcher=async(url:string|URL|Request,init?:RequestInit)=>{
+  const u=new URL(String(url));if(u.pathname.includes('/usage/')){if(u.searchParams.get('q')!=='group/work')return Response.json({total:45000,rows:[]});return Response.json(r.usage);}return r.fetcher(url,init);
+ };
+ const out=await observeProductMagpie({readProvider:()=>provider,fetch:fetcher,now:()=>r.now});expect(out.usage).toHaveLength(1);expect(out.coverage.complete).toBe(true);expect(out.coverage.filter).toEqual({field:'q',value:'group/work',exactRequestedModel:'group/work'});
+});
+test('model capacity is separate from the proposed per-request ceiling and local freshness is not upstream route expiry',async()=>{
+ const r=remote();Object.assign(r.catalog.data[0]!,{max_output_tokens:384000});
+ const out=await observeProductMagpie({readProvider:()=>provider,fetch:r.fetcher,now:()=>r.now});
+ expect(out.executionBounds).toMatchObject({modelMaxOutputTokens:384000,windowContractMaxOutputTokens:65536,proposedRequestMaxOutputTokens:65536,requiresApprovedWindow:true});
+ expect(out.route.expiresAt).toBeNull();expect(out.observationSnapshot.expiryBasis).toBe('local-observation-freshness-policy');expect(out.observationSnapshot.routingConfigurationVerified).toBe(false);
+ expect(Date.parse(out.observationSnapshot.freshnessExpiresAt)-Date.parse(out.observationSnapshot.capturedAt)).toBe(7200000);expect(out.authorization.executable).toBe(false);
+});

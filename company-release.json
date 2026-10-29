@@ -1,8 +1,8 @@
 {
-  "version":"0.3.36",
-  "title":"扩展FV06远端只读观测：usage分页、绑定与路由字段",
-  "changes":["ops_product_magpie_observe 的 usage 改为有界分页：每页200行、最多5页/1000行、累计4MiB与12s预算，逐页仍受1MiB/15s限制；coverage 如实报告 complete/truncated/stoppedReason/扫描范围与 total，分页不推进时 fail-closed，最近200条无匹配不再等同无数据或缺组。","匹配行的 accountBinding 在可由上游身份派生时等于同一 accountRef（mgp 哈希），无法派生保持 unknown；不借用同供应商其他账号。","route 补齐 revision/digest/servedModel/maxOutputTokens/sampledAt/expiresAt：仅在远端只读表面实际提供时透出，否则返回结构化 null 并在 route.gaps 说明，不用本机时钟或本地配置补造。","价目继续按匹配行 catalog prompt/completion 读取，reviewed 恒 false；缺失保持 null，不写 0、不把 points 当 USD。"],
-  "impact":["只读工具增量：仅读取已配置的 remote-magpie 的 models/quotas/usage；不创建组、不改模型/账号/配置、不调用推理、不改预算/容量/周期、不碰凭证。","观测不是授权证明：不能据此 prepare/prove/deliver/enable 或新增预算；不新增可写端点、不绕过 assertLocalMagpieScope、不读取本机 providers.json 作为回退。","FV06 业务完成与新增调用授权仍须真实证据；本次不声称路由或账号恢复完成。"],
-  "migration":"无schema、无产品配置、secret或环境变量变更。",
-  "rollback":"恢复上一健康main发布；观测回执只读且字段只增不改，不回写任何远端或本机状态，回滚无需数据修复。"
+ "version":"0.3.37",
+ "title":"FV06原生用量筛选与请求限额语义纠正",
+ "changes":["远端用量改为Magpie原生q=group/work服务端筛选后有界分页，本地仍精确核对请求模型；不再让大量无关近期请求遮住历史产品记录。","区分模型支持的输出上限、窗口契约上限和候选请求上限；384000模型能力不再被当作65536执行窗口的必然冲突。","观测快照的本地新鲜度期限与远端路由revision/到期分开披露；不伪造上游字段或授权。"],
+ "impact":["仅只读观测与字段解释，维持既有页数/行数/字节/时间上界；产品remote-magpie连接和模型不变。","历史请求不冒充UI样本或新证据，模型预算、证明和窗口门禁保持；不新增推理调用。"],
+ "migration":"无schema和secret变更；产品runtime观测修复通过产品仓独立发布。",
+ "rollback":"恢复上一健康main发布；保留历史请求、审计与任务更正。"
 }
