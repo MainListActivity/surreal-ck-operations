@@ -102,3 +102,33 @@
 正向：完整快照生成、账号绑定、路由 digest、servedModel、requestId/run、百分比窗口与余额披露、未知成本 null、免费真实证据、窗口代理输出精确 `notAfter`、重复调用确定性。
 
 负向：错误账号、路由漂移、缺失 usage、价目不明、窗口过期、余额不足、来源陈旧、余量不足、旧契约拒绝、已登记候选与文档/路由不一致拒绝、重复 prepare 不产生第二份候选。
+
+## 9. 受控恢复工具 `ops_magpie_route_restore`（只读 plan）
+
+2026-10-28 的 FV06 路由采样无法出证：本机网关 `providers.json` 缺 `group/work`，且公司未密封 `SUPPLIER_MAGPIE_USERNAME`。本发布**只提供只读 plan**：真实写入通道（直接替换 `providers.json` 与 Magpie 自身 `SaveGroup` API 的取舍）、真实组 schema 与网关加载/刷新语义均未证实，因此 `apply` 关闭，实际账号/路由恢复**未完成**。
+
+### 9.1 plan（只读，已发布）
+
+`ops_magpie_route_restore {mode:"plan", alias:"MAGPIE", purpose}`
+
+- 只读 `providers.json`（`~/.config/magpie/providers.json`，lstat 拒绝符号链接/非普通文件，1..256 KiB）与网关 `/v1/models`、`/v1/magpie/quotas`；**零模型调用、零写入**。
+- 返回：`group`、`config{sha256,bytes,groupPresent,existingMembers}`、`groups[{id,memberCount}]`、`unsafeGroupIds`、`providers[{id,routing}]`、`accounts[{accountHash,accountRef,provider}]`、`binding{status:missing|matched|mismatch}`、可选 `proposedAccount`（仅网关恰好一个账号时）、可选 `candidates{provider,models,modelCount,omitted}`、`snapshots{catalogSha256,quotasSha256}`、`sources[]`、`planDigest`、`issuedAt/expiresAt`（15 分钟）、`gatewayReload:"unknown"`、**`writeAvailable:false`**、`recovery.interrupted[]`、`notes[]`。
+- **不输出**用户名、token、secret、`api_key` 或 `providers.json` 正文；组/供应商 id 只出安全字符集，账号只出 `sha256("magpie|provider|user")` 与 `mgp…` 引用。
+- `candidates` 只含绑定账号同 provider 的 catalog 模型，纯建议；**不自动授权整个 catalog**；无绑定且多账号时不给候选、不给 `proposedAccount`，也不猜默认账号/模型。
+- `recovery.interrupted` 只从既有 journal 读出未完成写入的备份文件名、计划摘要前缀与配置是否已变，供经理核实；本工具不据此恢复、不清理旧 journal/备份原件。
+- plan 沿用环境既有的 `cfg.roles` 授权；本发布不改生产 roles，也不新增 GM 权限。
+- **plan 通过不等于恢复成功**：它只陈述当前缺口与候选，不证明网关会加载任何写入。
+
+### 9.2 apply（已关闭）
+
+`ops_magpie_route_restore {mode:"apply", …}` 在 broker 入口与底层导出入口都以结构化 `not_configured`（`details.capability="magpie_route_restore_apply"`、`writeAvailable:false`、`gatewayReload:"unknown"`）拒绝，**发生在任何配置读取、密封或 journal 访问之前**；qa、engineering、product、gm 一样拒绝，直接 import 底层入口也无法写。apply 参数仍走严格 allowlist，未知参数先按 `invalid` 拒绝。
+
+未发布的写入实现（`applyMagpieRouteRestoreRetained`）仅作为后续发布的可恢复证据保留：
+
+- 生产不可达：broker 只引用拒绝入口，`src/` 内无其他引用，测试守卫该约束；已知非目标残留是 journal 在取锁前读取、锁内整体写回（只假设单写者）。
+- 崩溃恢复元数据已修正：完成记录不再以 `null` 覆盖 `started.backupFile`；由本键中断写入的组标为 `created`（附 `recovered:true` 与 `recovery-completed` 阶段），不再冒充「未写」的 `unchanged`；重放保留备份指针。
+- 旧 journal 与 `providers.json.bak-*` 原件保留、不清理；在写入通道被另链证实并经经理/运营批准前，**恢复功能不可用**，也不提供人工 DML 或手工替换 `providers.json` 的替代做法。
+
+### 9.3 测试覆盖
+
+`tests/ops-magpie-restore.test.ts` 使用隔离临时配置 + 受控本机 mock：plan 脱敏/候选边界/`writeAvailable:false`；apply 在 broker 与底层入口对全部角色结构化拒绝且零写入（配置、密封、journal、备份均不变）；保留实现的 A–D 契约（绑定冲突、完成态重放、拒绝不改写身份、组只写 `id`+`members`）、崩溃恢复保留备份指针与中断写入如实标注、跨 key 身份拒绝；以及未知参数与别名限制、秘密零泄漏、生产不可达守卫。

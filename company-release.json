@@ -1,18 +1,16 @@
 {
-  "version": "0.3.32",
-  "title": "受控追加依赖前置兼容 defer 存量执行等待",
+  "version": "0.3.33",
+  "title": "Magpie 受控路由恢复工具收口为只读 plan",
   "changes": [
-    "append_dependency_prerequisites 新增存量等待兼容：defer_task_until 留下的执行依赖等待（blocked、blocked_to=NONE、resume_state=ready|doing、无 task_wait 行）在真实 deferred 审计与至少一个未完成依赖同时成立时被接受。",
-    "受控事务在同一原子内补建规范 task_wait 行（kind=dependency、引用=首个未完成依赖、entered_version=任务版本），使普通 wait release 路径从此可见；任务保持 blocked，等待与全部前置完成后交回 GM 关口而不是 ready。",
-    "守卫不变并全部保留：CAS expectedVersion、业务键幂等、同 goal、闭包环、defer_epoch 串行、无活动租约、非 owner、非 review、非 gm-block；审计新增 source_phase 与 legacy_wait 标记，outbox 同步。",
-    "新增公司 fork 回归 8 项：doing/ready 相位正例与释放链、普通 gm 阻塞拒绝、伪造形状（无 deferred 审计）拒绝、依赖已满足自动解锁回 GM、owner 与 review 存量拒绝、租约/跨目标/成环拒绝、并发 CAS 单赢家且只有一条等待行。",
-    "事务后备守卫的错误映射补齐：append 的原子守卫触发时返回与前置检查一致的 invalid 文案，不再落入笼统 forbidden。"
+    "ops_magpie_route_restore 只发布只读 plan：plan 返回 writeAvailable=false、gatewayReload=unknown，并明确真实账号/路由恢复未完成；plan 通过不等于恢复成功。",
+    "apply 在 broker 入口与底层导出入口都以结构化 not_configured（capability=magpie_route_restore_apply）拒绝，发生在任何配置读取、密封或 journal 访问之前；qa、engineering、product、gm 一致拒绝，直接 import 底层入口也无法写入。",
+    "未发布的 apply 实现保留为后续发布的可恢复证据：修复崩溃恢复元数据（done 不再以 null 覆盖 started.backupFile；本键中断写入的组标为 created 并附 recovered 标记，不再冒充 unchanged），旧 journal 与备份原件保留不清理。保留实现生产不可达（broker 只引用拒绝入口、src 无其他引用，测试守卫），恢复功能标注为不可用。",
+    "plan 沿用环境既有 cfg.roles 授权；本发布不改生产 roles、不新增 GM 权限、不放宽 sck-* 组名、不直接写 group/work、不启动管理进程或重启 daemon。将来 apply 必须 GM 代码门加受控 roles 配置并经另一条上线链。"
   ],
   "impact": [
-    "纯控制面增量：修复生产 v0.3.28 中 defer 产生的存量依赖等待无法受控追加前置的阻断；不触产品库/生产数据/active/凭证/模型，不改派工、评审与验收路径。",
-    "发布后 GM 可对可审计的存量执行等待受控追加真实前置（如 ee1f0f21 一次性追加四项完整 ID 并保留 33dc）；等待期间任务保持 blocked，不自动 resume。",
-    "无数据库迁移、无历史改写：task_wait 复用既有 schema（040-waits），补建的等待行走既有字段与唯一索引。"
+    "只读能力增量：员工可对 Magpie 路由组与账号绑定现状做脱敏核对；不写配置、不密封、不落 journal、不调用模型、不动订阅/额度/预算。",
+    "真实写入通道、组 schema 与网关加载语义仍未证实，实际账号/路由恢复需要另立任务；本发布不声称业务恢复完成。"
   ],
-  "migration": "无数据库迁移、无历史改写；复用既有 task_wait/audit/outbox/idempotency/company_meta:defer_epoch 结构，未改 schema。",
-  "rollback": "revert 合入提交并按受控 release/vendor 重发，无 schema 回滚；已补建的等待行与已写入的依赖边不因代码回滚自动撤销，回滚前先由经理确认任务状态，不用 DML 绕过。"
+  "migration": "无数据库迁移、无新环境变量、无主机准备变更；复用既有 journal/备份原件，不做清理或改写。",
+  "rollback": "revert 合入提交并按受控 release/vendor 重发；保留的 journal 与 0600 备份原件不随回滚删除，回滚后同样不提供 apply，也不以 DML 或手工替换 providers.json 代替。"
 }
