@@ -192,7 +192,7 @@ describe('apply', () => {
     const withoutWork = afterData.groups.filter((row: any) => row.id !== 'group/work');
     expect(withoutWork).toEqual(beforeData.groups);
     expect({ ...afterData, groups: withoutWork }).toEqual(beforeData);
-    expect(afterData.groups.find((row: any) => row.id === 'group/work')).toEqual({ affinity: 'smart', id: 'group/work', members: [MEMBER] });
+    expect(afterData.groups.find((row: any) => row.id === 'group/work')).toEqual({ id: 'group/work', members: [MEMBER] });
     expect(statSync(r.configPath).mode & 0o777).toBe(0o640);
 
     const backups = listBackups(r);
@@ -245,6 +245,21 @@ describe('apply', () => {
     expect(out.refusal.code).toBe('binding-mismatch');
     expect(readFileSync(r.configPath, 'utf8')).toBe(before);
     expect(r.company.sealed.get(`demo/production/${SEALED_NAME}`)).toBe('someone-else');
+  });
+
+  test('a matched sealed binding refuses an explicitly selected different account before any write', async () => {
+    const r = rig({ sealed: 'snv-magpie-account', extraAccounts: ['second-account'] });
+    const planned = await plan(r);
+    expect(planned.binding.status).toBe('matched');
+    expect(planned.accounts).toHaveLength(2);
+    const before = readFileSync(r.configPath, 'utf8');
+    const other = planned.accounts.find((account: { accountHash: string }) => account.accountHash !== planned.binding.accountHash)!;
+    const out = await apply(r, planned, { accountHash: other.accountHash });
+    expect(out.status).toBe('refused');
+    expect(out.refusal.code).toBe('binding-mismatch');
+    expect(readFileSync(r.configPath, 'utf8')).toBe(before);
+    expect(r.company.sealed.get(`demo/production/${SEALED_NAME}`)).toBe('snv-magpie-account');
+    expect(listBackups(r)).toHaveLength(0);
   });
 
   test('members from another provider are refused', async () => {
@@ -357,6 +372,75 @@ describe('idempotency and recovery', () => {
     expect(r.company.sealed.get(`demo/production/${SEALED_NAME}`)).toBe(sealedAfterFirst);
   });
 
+  test('the same key replays an unchanged done entry after plan expiry', async () => {
+    const config = baseConfig({ groups: [{ id: 'group/work', members: [MEMBER], affinity: 'smart' }] });
+    const r = rig({ config, sealed: 'snv-magpie-account' });
+    const planned = await plan(r);
+    const id = 'replay-expired-0001';
+    const first = await apply(r, planned, { idempotencyKey: id });
+    expect(first.status).toBe('unchanged');
+    expect(listBackups(r)).toHaveLength(0);
+
+    r.world.advance(16 * 60_000);
+    const replay = await apply(r, planned, { idempotencyKey: id });
+    expect(replay.status).toBe('unchanged');
+    expect(replay.replayed).toBe(true);
+    expect(replay.backupFile).toBeNull();
+    expect(listBackups(r)).toHaveLength(0);
+  });
+
+  test('the same key replays an unchanged done entry after quota readAt drift', async () => {
+    const config = baseConfig({ groups: [{ id: 'group/work', members: [MEMBER], affinity: 'smart' }] });
+    const r = rig({ config, sealed: 'snv-magpie-account' });
+    const planned = await plan(r);
+    const id = 'replay-quota-drift-0001';
+    const first = await apply(r, planned, { idempotencyKey: id });
+    expect(first.status).toBe('unchanged');
+    r.world.magpie.quotaReadAtSkewMs = 1_000;
+
+    const replay = await apply(r, planned, { idempotencyKey: id });
+    expect(replay.status).toBe('unchanged');
+    expect(replay.replayed).toBe(true);
+    expect(replay.backupFile).toBeNull();
+    expect(listBackups(r)).toHaveLength(0);
+  });
+
+  test('a completed replay refuses a config that differs from the recorded result', async () => {
+    const config = baseConfig({ groups: [{ id: 'group/work', members: [MEMBER], affinity: 'smart' }] });
+    const r = rig({ config, sealed: 'snv-magpie-account' });
+    const planned = await plan(r);
+    const id = 'replay-config-drift-0001';
+    const first = await apply(r, planned, { idempotencyKey: id });
+    expect(first.status).toBe('unchanged');
+    const thirdParty = baseConfig({ revision: 'third-party-edit', groups: [{ id: 'group/work', members: [MEMBER], affinity: 'smart' }] });
+    writeFileSync(r.configPath, thirdParty);
+
+    const replay = await apply(r, planned, { idempotencyKey: id });
+    expect(replay.status).toBe('refused');
+    expect(replay.refusal.code).toBe('state-drifted');
+    expect(readFileSync(r.configPath, 'utf8')).toBe(thirdParty);
+    expect(listBackups(r)).toHaveLength(0);
+  });
+
+  test('an unchanged done key cannot replay with different members', async () => {
+    const alternate = 'sensenova/sensenova-6-8-flash-lite';
+    const config = baseConfig({ groups: [{ id: 'group/work', members: [MEMBER], affinity: 'smart' }] });
+    const r = rig({ config, sealed: 'snv-magpie-account' });
+    r.world.magpie.groupMembers = [MEMBER, alternate];
+    const planned = await plan(r);
+    const id = 'replay-args-0001';
+    const first = await apply(r, planned, { idempotencyKey: id });
+    const before = readFileSync(r.configPath, 'utf8');
+    const replay = await apply(r, planned, { idempotencyKey: id, members: [alternate] });
+
+    expect(first.status).toBe('unchanged');
+    expect(replay.status).toBe('refused');
+    expect(replay.refusal.code).toBe('group-conflict');
+    expect(readFileSync(r.configPath, 'utf8')).toBe(before);
+    expect(r.company.sealed.get(`demo/production/${SEALED_NAME}`)).toBe('snv-magpie-account');
+    expect(listBackups(r)).toHaveLength(0);
+  });
+
   test('the same key with a different plan is refused', async () => {
     const r = rig();
     const planned = await plan(r);
@@ -413,6 +497,38 @@ describe('idempotency and recovery', () => {
     expect(out.phases.map((item: any) => item.phase)).toContain('recovery-verified');
     expect(readFileSync(r.configPath, 'utf8')).toBe(written);
     expect(JSON.parse(readFileSync(r.configPath, 'utf8')).groups.filter((row: any) => row.id === 'group/work')).toHaveLength(1);
+    expect(r.company.sealed.get(`demo/production/${SEALED_NAME}`)).toBe('snv-magpie-account');
+  });
+
+  test('a refusal with the same started key preserves identity and crash recovery metadata', async () => {
+    const r = rig();
+    const planned = await plan(r);
+    const before = readFileSync(r.configPath, 'utf8');
+    const groupJson = JSON.stringify({ id: 'group/work', members: [MEMBER] });
+    const written = spliceGroup(before, groupJson)!;
+    writeFileSync(r.configPath, written);
+    const backupName = 'providers.json.bak-refused-retry-1';
+    writeFileSync(join(r.home, 'config', backupName), before, { mode: 0o600 });
+    const id = 'recovery-refuse-0001';
+    const keyHash = sha256(`magpie-restore|${id}`);
+    const started = {
+      keyHash, echo: id.slice(0, 8), planDigest: planned.planDigest, planIssuedAt: planned.issuedAt,
+      phase: 'started', expectedConfigSha256: planned.config.sha256, accountHash24: planned.accounts[0].accountHash.slice(0, 24),
+      backupFile: backupName, insertedGroup: groupJson, groupOperation: 'created', bindingOperation: 'sealed',
+      at: planned.issuedAt, updatedAt: planned.issuedAt,
+    };
+    mkdirSync(join(r.home, 'magpie-restore'), { recursive: true });
+    writeFileSync(r.journalPath, JSON.stringify({ version: 1, entries: { [keyHash]: started } }, null, 2));
+
+    const refused = await apply(r, planned, { idempotencyKey: id, planDigest: 'b'.repeat(64) });
+    expect(refused.refusal.code).toBe('idempotency-conflict');
+    const afterRefusal = JSON.parse(readFileSync(r.journalPath, 'utf8'));
+    expect(afterRefusal.entries[keyHash]).toEqual(started);
+
+    const recovered = await apply(r, planned, { idempotencyKey: id });
+    expect(recovered.status).toBe('applied');
+    expect(recovered.phases.map((item: any) => item.phase)).toContain('recovery-verified');
+    expect(readFileSync(r.configPath, 'utf8')).toBe(written);
     expect(r.company.sealed.get(`demo/production/${SEALED_NAME}`)).toBe('snv-magpie-account');
   });
 

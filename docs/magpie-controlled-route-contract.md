@@ -124,12 +124,12 @@
 - 未知参数一律拒绝；alias 固定 `MAGPIE`（密封键 `SUPPLIER_MAGPIE_USERNAME` 由别名派生，不接受任意密封键或路径）。
 - 服务端以**同一份不可变 plan 材料**（config/catalog/quotas 快照哈希、账号集合、绑定状态、既有 `group/work` 成员、`issuedAt`）重算摘要；计划过期（>15 分钟）、配置/目录/配额/绑定漂移、`expectedConfigSha256` 不符、账号哈希匹配 0 个或多个、成员不属于所选账号 provider、成员在同一 base id 下多义、既有 `group/work` 成员不同 → **拒绝**。既有不匹配的密封绑定 → 在任何写入前拒绝，不静默覆盖。
 - `members` 必须由经理显式给出（1..20），工具只把它们规范化为精确 catalog id；不因候选而自动选择账号或成员。
-- **唯一允许的变更**：向顶层 `groups` 追加一个缺失的 `{"id":"group/work","members":[…]}`。既不存在的组才会创建；其余字节按原文保留（在 `groups` 数组闭合处字节级插入），并在写前做语义回环校验（除新组外与原文 `canonical` 相等）。既有组、`providers`、凭证、默认路由、`revision` 均不修改。新组沿用既有兄弟组的标量非身份字段（如 `affinity`）以符合该配置自身惯例；**不臆造 schema**。
+- **唯一允许的变更**：向顶层 `groups` 追加一个缺失的 `{"id":"group/work","members":[…]}`。既不存在的组才会创建；其余字节按原文保留（在 `groups` 数组闭合处字节级插入），并在写前做语义回环校验（除新组外与原文 `canonical` 相等）。既有组、`providers`、凭证、默认路由、`revision` 均不修改。新组只包含 `id` 与 `members`，不从兄弟组复制字段或猜测 schema。
 - 真实配置 schema 与网关刷新语义未在本链确证：工具把 `gatewayReload` 明写为 `unknown`，**不重启 daemon**，也不声称磁盘写成功等于运行网关已生效。缺刷新能力时由经理/老板另行处理，不绕过代理。
-- 文件安全：同目录锁文件（`O_EXCL`，60 秒后视为陈旧）；同目录 0600 备份 `providers.json.bak-<时间戳>-<随机>`；同目录临时文件 + `rename` 原子替换；保留原 owner/mode；写前重新读取做 CAS，`rename` 前再校验一次，失败绝不覆盖第三方更新的配置；写后校验字节摘要。
+- 文件安全：同目录锁文件（`O_EXCL`，60 秒后视为陈旧）；同目录 0600 备份 `providers.json.bak-<时间戳>-<随机>`；同目录临时文件 + `rename` 原子替换；保留原 owner/mode；写前重新读取做 CAS，`rename` 前再校验一次，失败绝不覆盖第三方更新的配置；写后校验字节摘要。CAS 检查与 `rename` 之间仍有很短的竞态窗口；锁只协调遵守本工具锁约定的写入者，不能阻止不协作的外部进程在检查后、替换前写文件。
 - 密封绑定：仅从 `/v1/magpie/quotas` 的**内存行**取 `user`，经既有 `setSecret` 写入 `SUPPLIER_MAGPIE_USERNAME`；员工不可见，返回体与审计只出现 `accountRef`（哈希前缀）。
 - 补偿：若配置已写而密封失败，按同一 CAS 从备份恢复配置；恢复被第三方更新阻止时保留备份并如实返回 `refused/binding-failed` 与残留摘要，**不声称完全回滚**。本工具没有通用 secret 删除接口，已密封的值不能被它撤销——这是已知设计缺口。
-- 幂等：`idempotencyKey` 的哈希写入 0600 journal；同一 key + 同一 plan 的重放不再写文件、不再选账号、不再密封，返回 `replayed:true`；同一 key 换 plan 拒绝；完成记录只在最终状态仍在位时重放，否则要求重新 plan。
+- 幂等：`idempotencyKey` 的哈希写入 0600 journal；同一 key + 同一 plan 的重放不再写文件、不再选账号、不再密封，返回 `replayed:true`；同一 key 换 plan、预期配置摘要或账号身份拒绝。已完成记录在计划过期或配额读取时间变化后仍可重放，但会验证密封仍匹配原账号、`group/work` 仍含相同成员且配置摘要与完成记录一致；状态漂移时拒绝并要求重新 plan。
 - 崩溃恢复：journal 记录 `backupFile` 与本次追加的 `insertedGroup`。重试同 key 时，只有「当前文件 == 备份 + 该组 JSON 的字节拼接」才认定为自己未完成的写入，跳过 plan 摘要校验继续完成密封/采样；否则按漂移拒绝，绝不覆盖。
 - 审计：`action=ops_magpie_restore`，只含 mode/status/refusal code、计划与配置摘要前缀、`accountRef` 前缀、备份文件名、阶段名序列；不含任何凭证。
 - 本链**不执行生产 apply**，不 prepare/prove/deliver/enable，不读原配置正文给员工；真实账号与成员选择留给经理/老板，无法确证时保持 blocked，部署验收不等于配置恢复成功。

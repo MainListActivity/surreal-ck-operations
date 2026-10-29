@@ -475,11 +475,10 @@ function writeConfigAtomically(config: ConfigFile, nextText: string, expectedSha
   }
 }
 
-function buildGroup(parsed: ParsedConfig, members: string[]): Record<string, unknown> {
-  // Follow the config's own conventions (for example an affinity) by inheriting the non-identity
-  // scalar fields an existing sibling group carries; the schema itself is never invented.
-  const sibling = parsed.groupRows[0]?.extra ?? {};
-  return { ...sibling, id: MAGPIE_GROUP, members: [...members] };
+function buildGroup(members: string[]): Record<string, unknown> {
+  // Only the identity fields: inheriting a sibling group's scalar extras would guess the gateway
+  // schema and silently import default semantics the company never chose.
+  return { id: MAGPIE_GROUP, members: [...members] };
 }
 
 // ---- plan ----
@@ -593,13 +592,14 @@ export async function applyMagpieRouteRestore(input: MagpieRestoreApplyInput): P
     phase('refused', code);
     const journal = readJournal(journalPath);
     const prior = journal.entries[keyHash];
-    // Never clobber a completed or in-flight record of the same key.
-    if (!prior || prior.phase === 'failed') {
+    // A fresh key records its failed attempt. An existing record — started, done or failed — keeps
+    // its own plan identity and recovery facts (backup, inserted group, expected config): this
+    // call's input must never corrupt the crash-recovery state a retry relies on.
+    if (!prior) {
       journal.entries[keyHash] = {
-        ...(prior ?? { at: new Date(at).toISOString() }),
         keyHash, echo: input.idempotencyKey.slice(0, 8), planDigest: input.planDigest, planIssuedAt: input.planIssuedAt,
         phase: 'failed', expectedConfigSha256: input.expectedConfigSha256, accountHash24: input.accountHash.replace(/^mgp/, '').slice(0, 24),
-        updatedAt: new Date(now()).toISOString(),
+        at: new Date(at).toISOString(), updatedAt: new Date(now()).toISOString(),
       };
       writeJournal(journalPath, journal);
     }
@@ -609,6 +609,9 @@ export async function applyMagpieRouteRestore(input: MagpieRestoreApplyInput): P
   const journal = readJournal(journalPath);
   const prior = journal.entries[keyHash];
   if (prior && prior.planDigest !== input.planDigest) return refuse('idempotency-conflict', 'this idempotencyKey was already used with a different plan');
+  if (prior?.expectedConfigSha256 !== undefined && prior.expectedConfigSha256 !== input.expectedConfigSha256) {
+    return refuse('replay-mismatch', 'this idempotencyKey was recorded against a different expected config; the request does not match the recorded apply');
+  }
 
   // Recompute the facts under the live gateway.
   const facts = await factsOf(input, now);
@@ -618,7 +621,19 @@ export async function applyMagpieRouteRestore(input: MagpieRestoreApplyInput): P
   // backup and the exact group JSON recorded in the journal, so a crash after the rename can be
   // finished without re-planning and without ever touching a third party's newer config.
   const ownWrite = prior ? ownWriteMatches(configPathOf(input), prior, facts.config.text) : false;
-  if (!ownWrite) {
+  // A completed apply replays from its recorded state: the plan digest (checked above) and the
+  // recorded account pin the business identity, so a gateway quotas/catalog refresh or the plan
+  // TTL elapsing must not break idempotency for work that is already in place.
+  const completedReplay = prior?.phase === 'done';
+  if (ownWrite) {
+    phase('recovery-verified', `config=${facts.config.sha256.slice(0, 12)}`);
+    notes.push('an earlier attempt with this idempotencyKey wrote this exact group; the retry only finishes the remaining phase');
+  } else if (completedReplay) {
+    if (prior?.configShaAfter !== facts.config.sha256) {
+      return refuse('state-drifted', 'this idempotencyKey already completed but the config no longer matches its recorded result');
+    }
+    phase('replay-recognised', 'a completed apply with this idempotencyKey is replayed from the recorded state');
+  } else {
     if (issuedMs > at + PLAN_CLOCK_SKEW_MS) return refuse('plan-invalid', 'planIssuedAt is in the future; run plan again');
     if (at - issuedMs > MAGPIE_RESTORE_PLAN_TTL_MS) return refuse('plan-expired', 'the plan window has expired; run plan again');
     if (planMaterial(facts, input.planIssuedAt, suggestedProvider(facts)) !== input.planDigest) {
@@ -627,9 +642,6 @@ export async function applyMagpieRouteRestore(input: MagpieRestoreApplyInput): P
     if (facts.config.sha256 !== input.expectedConfigSha256) {
       return refuse('config-drifted', 'Magpie providers.json does not match the planned sha256; run plan again');
     }
-  } else {
-    phase('recovery-verified', `config=${facts.config.sha256.slice(0, 12)}`);
-    notes.push('an earlier attempt with this idempotencyKey wrote this exact group; the retry only finishes the remaining phase');
   }
 
   // The selected account must be exactly one gateway account.
@@ -647,6 +659,9 @@ export async function applyMagpieRouteRestore(input: MagpieRestoreApplyInput): P
   phase('account-selected', `account=${account.accountRef.slice(0, 12)} provider=${account.provider}`);
   if (facts.binding.status === 'mismatch') {
     return refuse('binding-mismatch', 'a sealed SUPPLIER_MAGPIE_USERNAME exists and matches no gateway account; refusing to overwrite an existing binding');
+  }
+  if (facts.binding.status === 'matched' && facts.binding.accountHash !== account.accountHash) {
+    return refuse('binding-mismatch', 'a sealed SUPPLIER_MAGPIE_USERNAME is already bound to a different gateway account; refusing to write a route for another account or to overwrite the binding');
   }
 
   // Minimal explicit members, each an unambiguous catalog identity of the selected provider.
@@ -707,7 +722,7 @@ export async function applyMagpieRouteRestore(input: MagpieRestoreApplyInput): P
       if (sha256(await configTextOf(input)) !== fresh.sha256) return refuse('config-drifted', 'the gateway config seam disagrees with the file on disk; refusing to write');
       const parsed = parseConfig(fresh.text);
       if (parsed.groupRows.some(row => row.id === MAGPIE_GROUP)) return refuse('group-conflict', `${MAGPIE_GROUP} appeared after the plan; run plan again`);
-      const groupJson = JSON.stringify(buildGroup(parsed, wantedMembers));
+      const groupJson = JSON.stringify(buildGroup(wantedMembers));
       const nextText = spliceGroup(fresh.text, groupJson);
       if (nextText === null) return refuse('config-schema-unknown', 'the providers.json group layout could not be located safely; refusing to rewrite the file');
       if (Buffer.byteLength(nextText, 'utf8') > MAX_CONFIG_BYTES) return refuse('config-too-large', 'the restored config would exceed the size bound');
