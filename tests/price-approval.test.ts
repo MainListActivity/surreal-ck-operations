@@ -32,8 +32,13 @@ function remoteFetch(now: number) {
   };
 }
 
-// One shared service home per rig, so a marker written by one employee is read by the window of another.
-function rig(opts: { employee?: string; approvals?: unknown; home?: string; now?: () => number } = {}) {
+// The broker keeps the observation it read in process memory, and the window trusts only that copy. Every
+// actor in one test therefore shares a single broker and home, and only the leased employee changes.
+function rig(opts: { employee?: string; approvals?: unknown; home?: string; now?: () => number; shared?: ReturnType<typeof rig> } = {}) {
+  if (opts.shared) {
+    const token = opts.shared.company.lease(opts.employee ?? 'qa-1', 'qa', TASK, 'surreal_ck');
+    return { ...opts.shared, token };
+  }
   const world = new FakeWorld();
   const company = new FakeCompany();
   const home = opts.home ?? realpathSync(mkdtempSync(join(tmpdir(), 'price-approval-')));
@@ -68,7 +73,7 @@ test('an independent approval read back from the evidence root opens the window 
   homes.push(home);
   const author = rig({ employee: 'qa-author', home });
   const cand = await candidate(author);
-  const reviewer = rig({ employee: 'engineering-reviewer', home });
+  const reviewer = rig({ employee: 'engineering-reviewer', shared: author });
   const marked = await approve(reviewer, cand.candidateFile);
   expect(marked.marker.configurationDigest).toBe(cand.candidate.configurationDigest);
   expect(marked.marker.approverEmployee).toBe('engineering-reviewer');
@@ -106,14 +111,14 @@ test('a marker for a different configuration digest does not open the window', a
   homes.push(home);
   const author = rig({ employee: 'qa-author', home });
   const cand = await candidate(author);
-  const reviewer = rig({ employee: 'engineering-reviewer', home });
+  const reviewer = rig({ employee: 'engineering-reviewer', shared: author });
   await approve(reviewer, cand.candidateFile);
   // Another candidate from the same route but a different sample produces a different digest.
   const laterNow = () => Date.parse(cand.candidate.observation.capturedAt) + 60_000;
   const later = rig({ employee: 'qa-author', home, now: laterNow });
   const second = await candidate(later);
   expect(second.candidate.configurationDigest).not.toBe(cand.candidate.configurationDigest);
-  const result = await window(rig({ employee: 'engineering-reviewer', home, now: laterNow }), second.candidateFile);
+  const result = await window(rig({ employee: 'engineering-reviewer', shared: later }), second.candidateFile);
   expect(result.eligible).toBe(false);
   expect(result.blockedReasons).toEqual(['price-not-reviewed']);
 });
@@ -123,7 +128,7 @@ test('a tampered marker is skipped and the window stays on price-not-reviewed', 
   homes.push(home);
   const author = rig({ employee: 'qa-author', home });
   const cand = await candidate(author);
-  const reviewer = rig({ employee: 'engineering-reviewer', home });
+  const reviewer = rig({ employee: 'engineering-reviewer', shared: author });
   const marked = await approve(reviewer, cand.candidateFile);
   const tampered = JSON.parse(readFileSync(marked.markerFile, 'utf8'));
   tampered.approverEmployee = 'someone-else';
@@ -138,7 +143,7 @@ test('an expired marker does not open the window', async () => {
   homes.push(home);
   const author = rig({ employee: 'qa-author', home });
   const cand = await candidate(author);
-  const reviewer = rig({ employee: 'engineering-reviewer', home });
+  const reviewer = rig({ employee: 'engineering-reviewer', shared: author });
   await approve(reviewer, cand.candidateFile);
   const far = rig({ employee: 'engineering-reviewer', home, now: () => Date.parse(cand.candidate.expiry.expiresAt) + 1 });
   const result = await window(far, cand.candidateFile);
@@ -179,10 +184,12 @@ test('an approval cannot be written into another task evidence root', async () =
 });
 
 test('an injected remotePriceApprovals seam still takes precedence over markers on disk', async () => {
-  const seed = rig({ employee: 'qa-author' });
-  const cand = await candidate(seed);
-  const approval = { approverEmployee: 'engineering-reviewer', configurationDigest: cand.candidate.configurationDigest, priceRevision: cand.candidate.pricing.priceRevision, approvedAt: '2026-10-29T02:50:00Z' };
-  const r = rig({ employee: 'qa-author', approvals: [approval], home: seed.home });
+  // The seam is wired at broker construction, so this broker is built with it and makes the candidate itself.
+  const approval = { approverEmployee: 'engineering-reviewer', configurationDigest: '', priceRevision: '', approvedAt: '2026-10-29T02:50:00Z' };
+  const r = rig({ employee: 'qa-author', approvals: [approval] });
+  const cand = await candidate(r);
+  approval.configurationDigest = cand.candidate.configurationDigest;
+  approval.priceRevision = cand.candidate.pricing.priceRevision;
   const result = await window(r, cand.candidateFile);
   expect(result.eligible).toBe(true);
 });
