@@ -75,7 +75,7 @@ import { PLUGIN_RUNTIME_ROLES } from './contracts.ts';
 import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES, QA_OBSERVATION_WAIT_ROOTS_LIMIT, fitGoalWaitSummary, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
 import { CompanyError } from './core-errors.ts';
-import { assertEmployeeCiBlockAllowed } from './github-ci-control.ts';
+import { assertEmployeeCiBlockAllowed, createCiBillingCheck, refuseEmployeeCiBlock, type CiBillingCheck } from './github-ci-control.ts';
 import { DispositionLedger, type DispositionApplier, type DispositionClaimInput, type DispositionClaimOutcome, type DispositionClaimView, type DispositionDecideInput, type DispositionDecideOutcome, type DispositionPhase, type DispositionStatusInput, type DispositionStatusView, type ExternalActionRequestInput, type ExternalActionView, type HolderNoticeView, type ExternalActionGateway } from './disposition.ts';
 import { createCompanyGithubGateway, githubRepoSlug } from './external-actions.ts';
 import { validateExternalDependencies } from './input-bounds.ts';
@@ -621,12 +621,13 @@ export class SurrealCompanyCore implements CompanyCore {
   private readonly submitCheck?: SubmitCheck;
   /** SYS02: read-only source adapter that verifies CI runs, artifacts and probes; tests inject a deterministic one. */
   private readonly acceptanceAdapter: AcceptanceSourceAdapter;
+  private readonly ciBillingCheck: CiBillingCheck;
   /** Test seam (SYS-DISP AC06): runs after a contribution view is read and before the lease transaction that checks it. */
   private readonly contributionReadHook?: (taskId: string) => Promise<void>;
 private readonly independenceReadHook?: (taskId: string) => Promise<void>;
   private readonly companyReleaseRepo?:string;
   private readonly drillLaunch?: (home: string, repo: string, plan: { runId: string; root: string }) => number;
-  constructor(readonly database: CompanyDatabase, options?: { companyReleaseRepo?:string; leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter };
+  constructor(readonly database: CompanyDatabase, options?: { companyReleaseRepo?:string; leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; ciBillingCheck?: CiBillingCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter };
     externalActions?: { gateway?: ExternalActionGateway }; faults?: { limits?: FaultBudgetLimits; clock?: () => number };
     waits?: { clock?: () => number; webhookSecret?: string };
     /** Test seam only: replaces the detached drill launch so a gate can assert the guards without a real run. */
@@ -635,6 +636,7 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     this.drillLaunch = options?.drillLaunch;
     this.submitCheck = options?.submitCheck;
     this.acceptanceAdapter = options?.acceptance?.adapter ?? createGithubActionsAdapter();
+    this.ciBillingCheck = options?.ciBillingCheck ?? createCiBillingCheck();
     // Same seam as the acceptance adapter: the controlled external exit is injectable so a test drives an isolated fake
     // endpoint instead of the network, while production always gets the company's authenticated gh CLI.
     this.externalActionsGateway = options?.externalActions?.gateway;
@@ -3072,7 +3074,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const actor = await this.authenticate(credential);
     // A structured upgrade is an install request, validated against main and the current lease by transition.
     // Every ordinary block is checked before recording faults, quota gates, audit or changing the task/lease.
-    if (evidence.companyUpgrade === undefined) assertEmployeeCiBlockAllowed(evidence.text);
+    if (evidence.companyUpgrade === undefined) await this.assertCiBlockAllowed(proof, actor.employeeId, [evidence.text]);
     // The fault is recorded before the state change, so a crash between the two leaves the attempt charged (the
     // attempt really happened) rather than a block that no budget accounts for.
     if (fault !== undefined) await this.reportTaskFault(actor.employeeId, proof.taskId, fault);
@@ -3082,6 +3084,25 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   // ---------------------------------------------------------------- SYS05: typed waits
+
+  private async assertCiBlockAllowed(proof: LeaseProof, employeeId: string, causes: string[], background: string[] = [], row?: TaskRow): Promise<void> {
+    assertEmployeeCiBlockAllowed(...causes);
+    const taskId = proof.taskId;
+    const task = row ?? await this.db.select<TaskRow>(id('task',taskId));
+    // Do not expose source references, or spend GitHub reads, for a foreign/stale lease. The transition owns its error.
+    if (!task || task.current_employee !== employeeId || task.delivery_id !== proof.deliveryId ||
+        task.fence !== proof.fence || task.version !== proof.expectedVersion || (task.lease_expires_at ?? 0) <= Date.now()/1000) return;
+    if (!task?.acceptance_criteria?.some(ac => ac.required && ac.kind === 'machine' && ac.evidence === 'ci-run')) return;
+    // Read the task's own sources, not just the employee's latest wording. The CI adapter decides from GitHub.
+    const [history] = await this.db.query<[Array<{evidence?: string}>]>(
+      "SELECT at,string::slice(evidence ?? '',0,10000) AS evidence FROM audit WHERE task=$task AND action IN ['checkpoint','submit','block','acceptance_evidence'] ORDER BY at DESC LIMIT 5;",
+      {task:id('task',taskId)});
+    const opsRepo = this.companyReleaseRepo ?? this.worktrees?.options.opsRepo ?? process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
+    const repo = task.code_repo_path ?? (task.context?.includes(opsRepo) ? opsRepo : task.worktree?.repo);
+    const source = await this.ciBillingCheck({head:task.acceptance_head,repo,
+      text:[...causes,...background,...(history ?? []).map(item => item.evidence ?? ''),task.context ?? ''].join('\n')});
+    if (source) refuseEmployeeCiBlock(source);
+  }
 
   /**
    * Enter a typed wait. The lease is released and the progress snapshot is stored in the same transaction; the task
@@ -3096,8 +3117,6 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     requireText(evidence.text, 'evidence', 20, 30000);
     // SYS05 AC04: invitation material and credentials stay in the controlled handoff file, never in task evidence.
     assertNonSensitive(evidence.text, 'evidence');
-    assertEmployeeCiBlockAllowed(evidence.text, input.reason, input.pendingAction, input.reference, input.summary,
-      ...(input.completed ?? []));
     const row = await this.db.select<TaskRow>(id('task', proof.taskId));
     if (!row) throw new CompanyError('not_found', 'Task not found');
     if (row.state === 'void') throw new CompanyError('conflict', 'Task retired');
@@ -3106,6 +3125,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const digest = HASH(JSON.stringify({ proof, evidence, input }));
     const replay = await this.replay(idem, digest);
     if (replay) return replay;
+    await this.assertCiBlockAllowed(proof, actor.employeeId, [input.reason, input.pendingAction ?? '', evidence.text],
+      [input.reference ?? '', input.summary ?? '', ...(input.completed ?? [])], row);
     const now = this.waitClock();
     const defaultOwner = input.kind === 'owner_handoff' ? 'owner'
       : (input.kind === 'dependency' || input.kind === 'upstream_repair') ? row.executor_role : 'gm';

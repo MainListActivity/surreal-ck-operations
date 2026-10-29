@@ -20,7 +20,9 @@
 
 ### 员工阻塞入口
 
-GitHub CI 计费判定属于系统能力。普通 `report_blocker`（到老板或 GM）以及 `wait` 的理由、待办、引用、摘要、已完成内容和证据都不能用来把 CI 账单问题变成任务等待；核心在写入状态、租约、故障预算之前拒绝，返回 `invalid` / `github_ci_system_owned`。员工应调用 `record_acceptance_evidence`，提供 `taskId`、机器 `acId`、当前 `sha` 和 `source{provider:"github-actions",runUrl}`，再正常提交；缺少来源、读取失败、错误 SHA 和真实测试失败都不会获得豁免。
+GitHub CI 计费判定属于系统能力。普通 `report_blocker`（到老板或 GM）以及 `wait` 不能把 CI 账单问题变成任务等待；核心在写入状态、租约、故障预算之前拒绝，返回 `invalid` / `github_ci_system_owned`。对含必需 CI 项的任务，核心从本次证据、任务上下文及最近五条进展/提交/阻塞记录提取 PR/run 来源，读取当前 PR head，再复用 GitHub 适配器读取零步骤与原始计费注释；不依赖员工在这次请求里写出“账单”二字。短写 `PR #编号` 只在仓库 remote 已验证时补全；缺少可核来源不会被猜成豁免。交互式来源读取总预算 8 秒，来源判定与后续状态写入分别重核租约。
+
+直接以 CI 计费为理由的请求，即使未提供来源也会被拒绝；这只是限制员工阻塞能力，不能签发豁免。历史“已完成”或其他分句提到 GitHub，不会单凭关键词与客户账单审批混为一谈。员工应调用 `record_acceptance_evidence`，提供 `taskId`、机器 `acId`、当前 `sha` 和 `source{provider:"github-actions",runUrl}`，再正常提交；缺少来源、读取失败、错误 SHA 和真实测试失败都不会获得豁免。
 
 已合入 main 的结构化 `companyUpgrade` 是安装申请，仍由当前工程租约、任务仓库和 main 版本核验，不属于要求老板修复 CI 账单的普通阻塞。独立上线签核和部署事实不能由此替代。
 

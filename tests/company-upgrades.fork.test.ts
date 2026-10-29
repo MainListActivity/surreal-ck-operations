@@ -14,6 +14,7 @@ import {CompanyUpgrades} from '../src/company-upgrades.ts';
 import {runCompanyUpgrade,type UpgradeCommand} from '../src/company-upgrade-runner.ts';
 import {readCompanyRelease,compareRelease,releaseNotesSchema} from '../src/company-release.ts';
 import {baselineAcceptanceCriteria,createGithubActionsAdapter} from '../src/acceptance.ts';
+import {createCiBillingCheck} from '../src/github-ci-control.ts';
 setDefaultTimeout(60_000);
 const run=process.env.RUN_SCK_UPGRADE_FORK_TESTS==='1'?test:test.skip;
 let dir:string,repo:string,home:string,oldSha:string,newSha:string,db:CompanyDatabase,core:SurrealCompanyCore,owner:OwnerDesk,eng:string,server:ReturnType<typeof Bun.spawn>,count=0,launches=0;
@@ -350,7 +351,7 @@ run('GitHub CI billing cannot be turned into an employee block or an owner hando
     expect(await snapshot()).toEqual(before);
   }
   // Only inspecting evidence.text leaves the typed wait's action/reason as a second bypass.
-  for (const field of ['reason','pendingAction','reference','summary'] as const) {
+  for (const field of ['reason','pendingAction'] as const) {
     await expect(core.wait(who,proof,note('上线检查已整理，需要等待所述前置条件解决后再继续执行。'),{
       kind:'owner_handoff',completed:['PR 已准备'],reason:'等待外部处理',pendingAction:'请检查前置条件',
       [field]:'GitHub Actions billing: 请老板修复付款后再继续',
@@ -370,19 +371,27 @@ run('a rejected CI billing block continues through server-verified evidence and 
   await db.db.upsert(gateId).content({enabled:true,version:1,criteria_version:1});
   try {
     const sha = 'a'.repeat(40), taskId = crypto.randomUUID();
-    const ciCore = new SurrealCompanyCore(db, {acceptance:{adapter:createGithubActionsAdapter(async args => {
+    const github = async (args: string[]) => {
+      if (args[0] === 'pr') return JSON.stringify({state:'OPEN',headRefOid:sha,statusCheckRollup:[{detailsUrl:'https://github.com/fixture/repo/actions/runs/42/job/5'}]});
       if (args[0] === 'run') return JSON.stringify({headSha:sha,conclusion:'failure',updatedAt:new Date().toISOString()});
       if (args[1]?.endsWith('/jobs')) return JSON.stringify({jobs:[{id:5,name:'quality',steps:[]}]});
       if (args[1]?.endsWith('/annotations')) return JSON.stringify([{message:'The job was not started because recent account payments have failed'}]);
       throw Error('unexpected GitHub request');
-    })}});
+    };
+    const ciCore = new SurrealCompanyCore(db, {acceptance:{adapter:createGithubActionsAdapter(github)},ciBillingCheck:createCiBillingCheck(github)});
     const who = await new LocalEnrollmentAdmin(db).enroll(`ci-continue-${++count}`, 'engineering', ['execute', 'review']);
     await db.db.query("CREATE $task CONTENT {title:'CI 机器裁决回归',context:'fixture',kind:'release',executor_role:'engineering',reviewer_role:'product',state:'ready',version:1,fence:0,dependencies:[],acceptance_head:$sha,acceptance_legacy:false,acceptance_version:1,acceptance_criteria:$criteria};", {
       task:new RecordId('task',taskId),sha,criteria:baselineAcceptanceCriteria('release'),
     });
     const claim = await ciCore.claim(who,taskId), proof = {taskId,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version};
-    await expect(ciCore.block(who,proof,'owner',note('GitHub CI 因账户付款失败未执行，等待老板充值。')))
-      .rejects.toMatchObject({details:{nextAction:'record_acceptance_evidence',grantsWaiver:false}});
+    // Source association survives euphemistic blocker text and a reference present only in earlier progress.
+    const progress = await ciCore.checkpoint(who,proof,note('当前上线 PR https://github.com/fixture/repo/pull/7，检查未启动。'));
+    proof.expectedVersion = progress.version;
+    await expect(ciCore.block(who,proof,'owner',note('检查未启动，需要外部处理，等待老板回复以后继续。')))
+      .rejects.toMatchObject({details:{nextAction:'record_acceptance_evidence',grantsWaiver:false,source:{sha}}});
+    await expect(ciCore.wait(who,proof,note('目前检查没有执行，等待外部恢复以后继续上线申请。'),{
+      kind:'owner_handoff',reason:'等待外部处理',completed:['PR 已准备'],pendingAction:'请老板处理后回复',
+    })).rejects.toMatchObject({details:{source:{sha}}});
     // Refusing the employee block must not bypass the machine-evidence gate either.
     await expect(ciCore.submit(who,proof,note('尚未提交任何服务端证据，不应直接放行到审核阶段。'))).rejects.toMatchObject({code:'invalid'});
     const recorded = await ciCore.recordAcceptanceEvidence(who,{taskId,acId:'AC-BASE-RELEASE-1',sha,

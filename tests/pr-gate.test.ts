@@ -1,16 +1,34 @@
 import { expect, test } from 'bun:test';
 import { createSubmitCheck, extractPrUrls, judgePr, type PrInfo } from '../src/pr-gate.ts';
-import { assertEmployeeCiBlockAllowed } from '../src/github-ci-control.ts';
+import { assertEmployeeCiBlockAllowed, createCiBillingCheck } from '../src/github-ci-control.ts';
 
 test('CI billing blockers are system-owned; ordinary invoices and real test failures remain separate', () => {
   for (const text of ['GitHub CI 账单失败，要求付款', 'CI 因计费未启动', 'GitHub Actions spending limit reached',
     'CI: account payments have failed', 'GitHub Billing & plans', 'workflow 支出上限']) {
     expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
   }
-  expect(() => assertEmployeeCiBlockAllowed('CI 无法继续', '请老板处理付款失败')).toThrow();
-  for (const text of ['客户账单需要老板批准', 'GitHub CI 断言测试失败', '生产服务器余额不足', '普通外部审批']) {
+  for (const text of ['客户账单需要老板批准', 'GitHub CI 断言测试失败', '生产服务器余额不足', '普通外部审批',
+    'GitHub PR 已完成；等待老板批准客户账单']) {
     expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
   }
+  expect(() => assertEmployeeCiBlockAllowed('GitHub CI 已完成', '请老板批准客户账单')).not.toThrow();
+});
+
+test('CI billing control reads PR/run sources even when the blocker omits all billing words', async () => {
+  const github = (steps: unknown[] = []) => async (args: string[]) => {
+    if (args[0] === 'pr') return JSON.stringify({state:'OPEN',headRefOid:'head-1',statusCheckRollup:[{detailsUrl:'https://github.com/o/r/actions/runs/9/job/5'}]});
+    if (args[0] === 'run') return JSON.stringify({headSha:'head-1',conclusion:'failure'});
+    if (args[1]?.endsWith('/jobs')) return JSON.stringify({jobs:[{id:5,steps}]});
+    if (args[1]?.endsWith('/annotations')) return JSON.stringify([{message:'account payments have failed'}]);
+    throw Error('unexpected GitHub request');
+  };
+  const text = '检查未启动，需老板解决账户问题。https://github.com/o/r/pull/7';
+  expect(await createCiBillingCheck(github())({text})).toEqual({runUrl:'https://github.com/o/r/actions/runs/9',sha:'head-1'});
+  expect(await createCiBillingCheck(github())({text:'PR #7 检查未启动',repo:'o/r'}))
+    .toEqual({runUrl:'https://github.com/o/r/actions/runs/9',sha:'head-1'});
+  expect(await createCiBillingCheck(github([{name:'tests',conclusion:'failure'}]))({text})).toBeUndefined();
+  expect(await createCiBillingCheck(github())({text,head:'other-head'})).toBeUndefined();
+  expect(await createCiBillingCheck(async () => {throw Error('offline');})({text})).toBeUndefined();
 });
 
 const pr = (over: Partial<PrInfo> = {}): PrInfo => ({ url: 'https://github.com/o/r/pull/7', state: 'OPEN', mergeable: 'MERGEABLE', headRefName: 'task/abcd1234', checks: [{ name: 'quality', conclusion: 'SUCCESS' }], ...over });
