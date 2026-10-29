@@ -850,6 +850,10 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
           if (/discipline track denied/i.test(cause)) throw new CompanyError('forbidden', 'Employee definition does not cover the task discipline');
           if (/leased by another|already has active task/i.test(cause)) throw new CompanyError('already_claimed', 'Task or employee already leased');
           if (/lease expired/i.test(cause)) throw new CompanyError('lease_expired', 'Lease expired');
+          // FV06 append backstops: the readable pre-checks answer first; these in-transaction guards are
+          // the atomic backstop and carry the same invalid meaning as their pre-check twins.
+          const appendBackstop = /append denied: (only a formal dependency wait|only execute-phase dependency waits(?:; a review wait keeps its reviewer)?|the open dependency wait(?: is missing)?|a legacy wait needs [^']+)/i.exec(cause);
+          if (appendBackstop) throw new CompanyError('invalid', `Append refused: ${appendBackstop[1]!.trim()}`);
           if (/denied|forbidden|revoked/i.test(cause)) throw new CompanyError('forbidden', 'Action forbidden');
           if (/checkpoint limit/i.test(cause)) throw new CompanyError('checkpoint_limit', 'Checkpoint limit reached');
           if (/task retired/i.test(cause)) throw new CompanyError('conflict', 'Task has been retired');
@@ -4188,13 +4192,17 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * gm only: append real prerequisites to an existing execute-phase dependency wait. This is the
-   * narrow repair for a task that is already in a formal dependency wait (not a gm block): the
-   * existing defer path cannot reach it, and a resume/block loop would fake a state change. The
-   * wait row, its reference and every existing dependency stay untouched; only new same-goal task
-   * ids are appended and dependency_continuation becomes 'manager', so a completed wait returns to
-   * GM instead of resuming an employee. Nothing is resumed here: faults, budgets and ordinary
-   * dispatch are not touched, and an expired execution window is still checked by the later resume.
+   * gm only: append real prerequisites to an existing execute-phase dependency wait. Two wait shapes
+   * qualify. A formal wait carries the SYS05 markers and a matching open task_wait row (resume phase
+   * ready). A legacy wait is what defer_task_until leaves behind: the same blocked shape with no
+   * wait row at all, resume phase ready or doing, a real deferred audit and at least one unmet
+   * dependency — the transaction then atomically builds the canonical wait row so the ordinary
+   * release path can return the task to GM. Neither shape may be a review/owner/gm block, and a
+   * live lease refuses. The existing wait reference and every existing dependency stay untouched;
+   * only new same-goal task ids are appended and dependency_continuation becomes 'manager', so a
+   * completed wait returns to GM instead of resuming an employee. Nothing is resumed here: faults,
+   * budgets and ordinary dispatch are not touched, and an expired execution window is still checked
+   * by the later resume.
    */
   async appendDependencyPrerequisites(credential: Credential, input: AppendDependencyPrerequisites): Promise<TaskView> {
     return echoTask(await this.appendDependencyPrerequisitesRecord(credential, input));
@@ -4231,11 +4239,34 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         dependencies, goal, goal.state AS goal_state, wait_state, wait_kind, wait_episode, wait_owner_role,
         execution_window FROM ONLY $task;`, { task: taskRef });
     if (!before) throw new CompanyError('not_found', 'Task not found');
-    if (before.state !== 'blocked' || before.blocked_to !== undefined ||
-        before.wait_state !== 'waiting' || before.wait_kind !== 'dependency') {
+    if (before.state !== 'blocked' || before.blocked_to !== undefined) {
       throw new CompanyError('invalid', 'append only applies to a blocked formal dependency wait; gm blocks use defer_task_until');
     }
-    if (before.resume_state !== 'ready') throw new CompanyError('invalid', 'append only applies to execute-phase dependency waits; a review wait keeps its reviewer');
+    if (before.resume_state === 'review') {
+      throw new CompanyError('invalid', 'append only applies to execute-phase dependency waits; a review wait keeps its reviewer');
+    }
+    const [waitRows] = await this.db.query<[Array<{ wait_key: string; kind: string; reference_task?: RecordId }>]>(
+      `SELECT wait_key, kind, reference_task, entered_at FROM task_wait WHERE task = $task AND state IN ['waiting', 'held']
+       ORDER BY entered_at DESC LIMIT 1;`, { task: taskRef });
+    const openWait = waitRows?.[0];
+    // A formal wait carries the SYS05 markers and a matching open task_wait row. A legacy wait is
+    // what defer_task_until leaves behind: the same blocked shape with no open wait row at all and
+    // an execute resume phase; its deferred audit and unmet dependencies are verified in the
+    // transaction, which then builds the canonical wait row.
+    const formalWait = before.wait_state === 'waiting' && before.wait_kind === 'dependency' && !!openWait &&
+      openWait.wait_key === before.wait_episode && openWait.kind === 'dependency' && !!openWait.reference_task;
+    if (!formalWait) {
+      if (openWait) throw new CompanyError('invalid', 'append only applies to a blocked formal dependency wait; gm blocks use defer_task_until');
+      if (before.wait_state === 'waiting' && before.wait_kind === 'dependency') {
+        throw new CompanyError('invalid', 'The open dependency wait record is missing or no longer matches the task');
+      }
+      if (!['ready', 'doing'].includes(before.resume_state ?? '')) {
+        throw new CompanyError('invalid', 'append only applies to a blocked formal dependency wait; gm blocks use defer_task_until');
+      }
+    }
+    if (formalWait && before.resume_state !== 'ready') {
+      throw new CompanyError('invalid', 'append only applies to execute-phase dependency waits; a review wait keeps its reviewer');
+    }
     if (before.reviewer_role === 'owner' || before.wait_owner_role === 'owner') {
       throw new CompanyError('invalid', 'Owner-gated tasks cannot receive appended prerequisites');
     }
@@ -4245,15 +4276,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     }
     if (before.version !== input.expectedVersion) throw new CompanyError('conflict', 'Task version moved');
     if (before.goal && before.goal_state !== 'active') throw new CompanyError('invalid', 'Task goal is not active');
-
-    const [waitRows] = await this.db.query<[Array<{ wait_key: string; kind: string; reference_task?: RecordId }>]>(
-      `SELECT wait_key, kind, reference_task, entered_at FROM task_wait WHERE task = $task AND state IN ['waiting', 'held']
-       ORDER BY entered_at DESC LIMIT 1;`, { task: taskRef });
-    const openWait = waitRows?.[0];
-    if (!openWait || openWait.wait_key !== before.wait_episode || openWait.kind !== 'dependency' || !openWait.reference_task) {
-      throw new CompanyError('invalid', 'The open dependency wait record is missing or no longer matches the task');
-    }
-    if (normalizedId(openWait.reference_task) === input.taskId) throw new CompanyError('invalid', 'A task cannot wait on itself');
+    if (formalWait && normalizedId(openWait!.reference_task) === input.taskId) throw new CompanyError('invalid', 'A task cannot wait on itself');
 
     const beforeDeps = (before.dependencies ?? []).map(normalizedId);
     const newDeps = dependencies.filter(dep => !beforeDeps.includes(dep));
@@ -4288,22 +4311,48 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       frontier = next;
     }
 
-    const evidence = `${input.text}\n[append-prerequisites] 操作者=${actor.employeeId} 等待=${openWait.wait_key} 引用=${normalizedId(openWait.reference_task)} 依赖 before=[${beforeDeps.join(', ')}] after=[${[...new Set([...beforeDeps, ...dependencies])].join(', ')}] 续接=manager`;
+    const legacyKey = waitKeyOf(input.taskId, randomUUID());
+    const evidence = `${input.text}\n[append-prerequisites] 操作者=${actor.employeeId} 等待=${formalWait ? openWait!.wait_key : legacyKey} 等待来源=${formalWait ? '正式依赖等待' : 'defer 存量执行等待（受控补建规范等待行）'} 引用=${formalWait ? normalizedId(openWait!.reference_task) : '首个未完成依赖'} 依赖 before=[${beforeDeps.join(', ')}] after=[${[...new Set([...beforeDeps, ...dependencies])].join(', ')}] 续接=manager`;
     const row = await this.txTask(`BEGIN;
       LET $who = SELECT * FROM ONLY $actor;
       LET $t = SELECT * FROM ONLY $task;
       IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'gm' { THROW 'append denied' };
       IF $t = NONE { THROW 'task not found' };
-      IF $t.state != 'blocked' OR $t.blocked_to != NONE OR $t.wait_state != 'waiting' OR $t.wait_kind != 'dependency' { THROW 'append denied: only a formal dependency wait' };
-      IF $t.resume_state != 'ready' { THROW 'append denied: only execute-phase dependency waits' };
+      IF $t.state != 'blocked' OR $t.blocked_to != NONE { THROW 'append denied: only a formal dependency wait' };
+      IF $t.resume_state = 'review' { THROW 'append denied: only execute-phase dependency waits; a review wait keeps its reviewer' };
       IF $t.reviewer_role = 'owner' OR $t.wait_owner_role = 'owner' { THROW 'append denied: owner gate' };
       IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'append denied: active lease' };
       IF $t.version != $expected { THROW 'task version moved' };
       LET $g = SELECT * FROM ONLY $t.goal;
       IF $g != NONE AND $g.state != 'active' { THROW 'goal is closed' };
       LET $w = SELECT * FROM task_wait WHERE task = $task AND state IN ['waiting', 'held'] ORDER BY entered_at DESC LIMIT 1;
-      IF array::len($w) != 1 OR $w[0].wait_key != $t.wait_episode OR $w[0].kind != 'dependency' OR $w[0].reference_task = NONE { THROW 'append denied: the open dependency wait is missing' };
-      IF $w[0].reference_task = $task { THROW 'append denied: self reference' };
+      LET $formal = $t.wait_state = 'waiting' AND $t.wait_kind = 'dependency' AND array::len($w) = 1
+        AND $w[0].wait_key = $t.wait_episode AND $w[0].kind = 'dependency' AND $w[0].reference_task != NONE;
+      IF $formal AND $t.resume_state != 'ready' { THROW 'append denied: only execute-phase dependency waits' };
+      IF !$formal AND $t.wait_state = 'waiting' AND $t.wait_kind = 'dependency' { THROW 'append denied: the open dependency wait is missing' };
+      LET $deferred = SELECT * FROM audit WHERE task = $task AND action = 'deferred' ORDER BY at DESC LIMIT 1;
+      LET $legacy_deps = $t.dependencies ?? [];
+      ${RESOLVE_DEP_SQL('$legacy_deps', '$legacy')}
+      LET $legacy_unmet = SELECT VALUE id FROM task WHERE id IN $legacy_resolved AND ${depUnsatisfiedFor('$t')};
+      LET $legacy_ref = $legacy_unmet[0];
+      LET $wait_key = IF $formal THEN $w[0].wait_key ELSE $legacy_key END;
+      LET $wait_ref = IF $formal THEN $w[0].reference_task ELSE $legacy_ref END;
+      LET $source_phase = IF $formal THEN 'ready' ELSE $t.resume_state END;
+      IF !$formal {
+        IF array::len($w) > 0 { THROW 'append denied: only a formal dependency wait' };
+        IF $t.resume_state NOT IN ['ready', 'doing'] { THROW 'append denied: only execute-phase dependency waits' };
+        IF array::len($deferred) = 0 { THROW 'append denied: a legacy wait needs a real deferred audit' };
+        IF array::len($legacy_unmet) = 0 { THROW 'append denied: a legacy wait needs an unmet dependency' };
+        IF $legacy_ref = $task { THROW 'append denied: self reference' };
+        CREATE ONLY $legacy_wait CONTENT {
+          wait_key: $legacy_key, task: $task, kind: 'dependency', state: 'waiting', source: $legacy_source,
+          owner_role: $t.executor_role, reference_task: $legacy_ref, not_before: NONE, expires_at: NONE,
+          expires_source: 'unknown', next_check_at: NONE, timezone: NONE, progress: {}, completed: [],
+          pending_action: NONE, handoff_file: NONE, reason: $legacy_reason,
+          version: 1, entered_by: $employee, entered_version: $t.version, entered_at: time::now(), updated_at: time::now()
+        };
+      };
+      IF $wait_ref = $task { THROW 'append denied: self reference' };
       FOR $dep IN $dependencies {
         LET $d = SELECT * FROM ONLY $dep;
         IF $d = NONE OR $d.goal != $t.goal { THROW 'append denied: dependency missing or outside the task goal' };
@@ -4322,15 +4371,25 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       LET $next = UPDATE ONLY $task SET
         dependencies = $merged,
         dependency_continuation = 'manager',
+        wait_state = 'waiting',
+        wait_kind = 'dependency',
+        wait_episode = $wait_key,
+        wait_not_before = IF $formal THEN $t.wait_not_before ELSE NONE END,
+        wait_expires_at = IF $formal THEN $t.wait_expires_at ELSE NONE END,
+        wait_next_check_at = IF $formal THEN $t.wait_next_check_at ELSE NONE END,
+        wait_owner_role = IF $formal THEN $t.wait_owner_role ELSE NONE END,
+        wait_source = IF $formal THEN $t.wait_source ELSE 'dependency' END,
+        wait_version = IF $formal THEN $t.wait_version ELSE 1 END,
+        wait_entered_at = IF $formal THEN $t.wait_entered_at ELSE time::now() END,
         version = $t.version + 1 RETURN AFTER;
       CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'dependency_prerequisites_appended', evidence: $evidence,
-        version: $next.version, at: time::now(), source_phase: 'ready', wait_key: $w[0].wait_key,
-        reference_task: $w[0].reference_task, dependencies_before: $before_refs,
-        dependencies_after: $merged, continuation: 'manager', operator: $employee };
+        version: $next.version, at: time::now(), source_phase: $source_phase, wait_key: $wait_key,
+        reference_task: $wait_ref, dependencies_before: $before_refs,
+        dependencies_after: $merged, continuation: 'manager', operator: $employee, legacy_wait: !$formal };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE ONLY $outbox CONTENT { task: $task, kind: 'dependency_prerequisites_appended', sequence: $sequence.value,
         payload: { version: $next.version, dependencies_before: $before_refs, dependencies_after: $merged,
-          continuation: 'manager', wait_key: $w[0].wait_key, added: $added }, at: time::now() };
+          continuation: 'manager', wait_key: $wait_key, added: $added, legacy_wait: !$formal }, at: time::now() };
       CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`, {
@@ -4338,6 +4397,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       dependencies: depIds, evidence, added: newDeps.length,
       before_refs: (before.dependencies ?? []).map(dep => id('task', normalizedId(dep))),
       epoch_seen: epochSeen, idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+      legacy_key: legacyKey, legacy_wait: id('task_wait', legacyKey),
+      legacy_source: { kind: 'dependency' },
+      legacy_reason: '受控追加兼容：任务处于 defer_task_until 产生的存量执行依赖等待（无等待实体）；本工具在同一受控事务中补建规范 dependency 等待并设置经理续接，完成前任务保持 blocked。',
     });
     return view(row);
   }
