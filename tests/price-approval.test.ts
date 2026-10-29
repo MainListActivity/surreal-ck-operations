@@ -2,7 +2,7 @@
 // candidate is written by a different employee and read back from the approval task root with no test
 // seam. Each case below is a closure from the brief: self-approval, a digest mismatch, expiry, tampering,
 // and a missing price all keep the window closed on price-not-reviewed or refuse the marker outright.
-import { mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, expect, test } from 'bun:test';
@@ -124,7 +124,9 @@ test('a marker for a different configuration digest does not open the window', a
   expect(result.blockedReasons).toEqual(['price-not-reviewed']);
 });
 
-test('a tampered marker is skipped and the window stays on price-not-reviewed', async () => {
+test('an edited audit copy of a marker does not change the window, which reads the broker record', async () => {
+  // The evidence file is only an audit copy. Editing it cannot widen or narrow the decision: the window reads
+  // the approval this broker recorded, so the edited file is ignored and the window still opens on that record.
   const home = realpathSync(mkdtempSync(join(tmpdir(), 'price-approval-')));
   homes.push(home);
   const author = rig({ employee: 'qa-author', home });
@@ -135,8 +137,7 @@ test('a tampered marker is skipped and the window stays on price-not-reviewed', 
   tampered.approverEmployee = 'someone-else';
   writeFileSync(marked.markerFile, JSON.stringify(tampered));
   const result = await window(reviewer, cand.candidateFile);
-  expect(result.eligible).toBe(false);
-  expect(result.blockedReasons).toEqual(['price-not-reviewed']);
+  expect(result.eligible).toBe(true);
 });
 
 test('an expired marker does not open the window', async () => {
@@ -193,4 +194,29 @@ test('an injected remotePriceApprovals seam still takes precedence over markers 
   approval.priceRevision = cand.candidate.pricing.priceRevision;
   const result = await window(r, cand.candidateFile);
   expect(result.eligible).toBe(true);
+});
+
+test('a forged marker with a recomputed markerDigest does not open the window', async () => {
+  // markerDigest is an unkeyed hash, so anyone who can write the evidence file can recompute it. The window
+  // trusts only approvals this broker process recorded, so a forged file in a fresh process must stay closed.
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'price-approval-')));
+  homes.push(home);
+  const author = rig({ employee: 'qa-author', home });
+  const cand = await candidate(author);
+  const { canonical, sha256 } = await import('../src/ops/proof-contract.ts');
+  const forgedBody = {
+    version: 'remote-price-approval/1', approverEmployee: 'someone-independent-2', approvalTask: TASK,
+    configurationDigest: cand.candidate.configurationDigest, priceRevision: cand.candidate.pricing.priceRevision,
+    pricing: { free: cand.candidate.pricing.free, freeEvidence: cand.candidate.pricing.freeEvidence },
+    approvedAt: new Date(Date.parse(cand.candidate.observation.capturedAt)).toISOString(),
+    expiresAt: cand.candidate.expiry.expiresAt,
+  };
+  mkdirSync(join(home, 'evidence', TASK), { recursive: true });
+  writeFileSync(join(home, 'evidence', TASK, 'price-approval-forged.json'), JSON.stringify({ ...forgedBody, markerDigest: sha256(canonical(forgedBody)) }));
+  // A fresh process (no recorded approval) reads the same evidence root: the forged file must not open the window.
+  const fresh = rig({ employee: 'qa-author', home, shared: undefined });
+  const second = await candidate(fresh);
+  const result = await window(fresh, second.candidateFile);
+  expect(result.eligible).toBe(false);
+  expect(result.blockedReasons).toContain('price-not-reviewed');
 });

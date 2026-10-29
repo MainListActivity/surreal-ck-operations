@@ -1,6 +1,6 @@
 import {assertLocalMagpieScope,observeProductMagpie,PRODUCT_MAGPIE_MODEL,ProductGatewaySourceMismatch,type ProductMagpieObservation} from './product-magpie.ts';
 import {buildRemoteMagpieCandidate,remoteMagpieEvidenceSchema,remoteMagpieWindow,samplingBudgetSchema,type PriceApproval} from './remote-magpie-evidence.ts';
-import {priceApprovalFileName,priceApprovalFor,readPriceApprovals} from './price-approval.ts';
+import {priceApprovalFileName,priceApprovalFor} from './price-approval.ts';
 // Ops capability broker. Employees never hold credentials: they ask for an operation by name,
 // this trusted code (running inside the Paseo plugin, next to the sealed secrets and the
 // Cloudflare token) performs it, and only a secret-free result goes back. Every call is gated
@@ -330,6 +330,8 @@ export class OpsBroker {
   private readonly lastScope = new Map<string, OpsScope>();
   // Observations this process read from the remote, keyed by their snapshot digest. Window checks trust these copies only.
   private readonly remoteObservations = new Map<string, ProductMagpieObservation>();
+  /** Price approvals this broker process recorded. The window trusts only these, never the evidence files. */
+  private readonly remotePriceApprovalRecords: PriceApproval[] = [];
 
   constructor(private readonly deps: OpsDeps) {
     this.now = deps.now ?? Date.now;
@@ -1715,6 +1717,7 @@ export class OpsBroker {
     mkdirSync(evidenceDir,{recursive:true,mode:0o700});
     const file=join(evidenceDir,priceApprovalFileName(marker));
     writeFileSync(file,JSON.stringify(marker,null,2)+'\n',{mode:0o600});
+    this.remotePriceApprovalRecords.push({approverEmployee:marker.approverEmployee,configurationDigest:marker.configurationDigest,priceRevision:marker.priceRevision,approvedAt:marker.approvedAt,approvalTask,expiresAt:marker.expiresAt});
     return {value:{markerFile:file,marker},audit:{action:'ops_call',evidence:`ops_product_magpie_price_approve ${marker.configurationDigest.slice(0,16)} priceRevision=${marker.priceRevision} approver=${ctx.scope.actor.employeeId}`}};
   }
 
@@ -1838,7 +1841,7 @@ export class OpsBroker {
       const raw = await readProofFile(this.serviceHome(), proofRoot, text(args, 'candidatePath', 1024));
       const parsed = remoteMagpieEvidenceSchema.safeParse(JSON.parse(raw.toString('utf8')));
       if (!parsed.success) throw new CompanyError('invalid', 'remote-magpie candidate is malformed or was edited after it was generated');
-      const approvals = this.deps.magpie?.remotePriceApprovals?.() ?? await readPriceApprovals(this.serviceHome(), approvalTask, this.now());
+      const approvals = this.deps.magpie?.remotePriceApprovals?.() ?? this.remotePriceApprovalRecords.filter(a => a.approvalTask === approvalTask);
       const result = remoteMagpieWindow(parsed.data, {approvalTask, now: this.now(), approvals, observation: this.remoteObservations.get(parsed.data.observation.digest)});
       return {
         value: { ...result, candidateHash: sha256(raw), evidenceExpiresAt: parsed.data.expiry.expiresAt },

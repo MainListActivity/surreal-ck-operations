@@ -30,6 +30,9 @@ export interface PriceApproval {
   configurationDigest: string;
   priceRevision: string;
   approvedAt: string;
+  /** Set on approvals the broker recorded. An approval past this instant no longer counts. */
+  approvalTask?: string;
+  expiresAt?: string;
 }
 
 const usageRow = z.object({
@@ -235,7 +238,7 @@ export function remoteMagpieWindow(c: RemoteMagpieEvidence, input: { approvalTas
   if (!c.route.present) reasons.add('route-absent');
   if (c.route.servedModel === null) reasons.add('served-model-missing');
   if (c.pricing.priceRevision === null) reasons.add('price-missing');
-  else if (!input.approvals.some(a => a.approverEmployee !== c.author && a.configurationDigest === configurationDigest && a.priceRevision === c.pricing.priceRevision)) reasons.add('price-not-reviewed');
+  else if (!input.approvals.some(a => a.approverEmployee !== c.author && a.configurationDigest === configurationDigest && a.priceRevision === c.pricing.priceRevision && (a.expiresAt === undefined || Date.parse(a.expiresAt) > input.now))) reasons.add('price-not-reviewed');
   if (!c.budget) reasons.add('budget-missing');
   if (c.coverage.complete !== true) reasons.add('coverage-incomplete');
   const expiresMs = Date.parse(c.expiry.expiresAt);

@@ -140,6 +140,17 @@ check('a null+gap candidate with no price approval stays closed on price-not-rev
   expect(open.window.minRemainingSeconds).toBe(MAGPIE_EXECUTION_HEADROOM_SECONDS);
 });
 
+check('the real price-approval writer refuses self-approval and keeps the window on the broker record, with no injected approvals', async () => {
+  // No injected approvals: only a recorded writer approval could open the window, and the author cannot write one.
+  approvals = [];
+  const out = await candidate({ budget: BUDGET });
+  const self = await ops.call(author, windowTask, 'ops_product_magpie_price_approve', { candidatePath: out.candidateFile }).catch((e: { code?: string }) => e);
+  expect((self as { code?: string }).code).toBe('self_review');
+  const closed = await windowOf(out.candidateFile);
+  expect(closed.eligible).toBe(false);
+  expect(closed.blockedReasons).toEqual(['price-not-reviewed']);
+});
+
 check('an expiry moved to the next day, with a recomputed digest and a second employee approval, is refused', async () => {
   const out = await candidate({ budget: BUDGET });
   approvals = [approvalFor(out.candidate)];

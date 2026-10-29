@@ -1,20 +1,15 @@
 // remote-price-approval/1: the human price review marker for one remote-magpie candidate. The writer
-// is ops_product_magpie_price_approve. It seals the marker into the approver's own task evidence root,
-// after it has checked the candidate digest and that the approver is not the candidate author. The
-// window reads markers back from the approval task root and drops any marker that is edited, expired,
-// future-dated, or bound to another configuration digest. A dropped marker is never an approval, so the
-// window stays on price-not-reviewed.
-import { readdirSync } from 'node:fs';
-import { join } from 'node:path';
+// is ops_product_magpie_price_approve. It writes the marker into the approver's own task evidence root as
+// an audit copy, and records the approval in the broker process. The window trusts only that in-process
+// record. The evidence file is never read back, because markerDigest is an unkeyed hash that anyone who
+// can write the file could recompute.
 import { z } from 'zod';
 import { CompanyError } from '../core-errors.ts';
 import { canonical, sha256 } from './proof-contract.ts';
-import { readProofFile } from './proof-files.ts';
-import { remoteConfigurationDigest, type PriceApproval, type RemoteMagpieEvidence } from './remote-magpie-evidence.ts';
+import { remoteConfigurationDigest, type RemoteMagpieEvidence } from './remote-magpie-evidence.ts';
 
 export const PRICE_APPROVAL = 'remote-price-approval/1';
 export const PRICE_APPROVAL_PREFIX = 'price-approval-';
-const MAX_MARKERS = 64;
 const taskId = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
 
@@ -69,37 +64,4 @@ export function priceApprovalFor(input: {
     expiresAt: input.candidate.expiry.expiresAt,
   } as const;
   return { ...unsealed, markerDigest: markerDigestOf(unsealed) };
-}
-
-/**
- * Reads the approvals for one approval task. Any file that fails the schema, the marker digest, or the
- * time bounds is skipped. Skipping leaves the window closed, which is the fail-closed direction.
- */
-export async function readPriceApprovals(home: string, task: string, now: number): Promise<PriceApproval[]> {
-  let names: string[];
-  try {
-    names = readdirSync(join(home, 'evidence', task))
-      .filter(name => name.startsWith(PRICE_APPROVAL_PREFIX) && name.endsWith('.json'))
-      .sort()
-      .slice(0, MAX_MARKERS);
-  } catch {
-    return [];
-  }
-  const approvals: PriceApproval[] = [];
-  for (const name of names) {
-    let marker: PriceApprovalMarker;
-    try {
-      const raw = await readProofFile(home, task, join(home, 'evidence', task, name));
-      const parsed = priceApprovalSchema.safeParse(JSON.parse(raw.toString('utf8')));
-      if (!parsed.success) continue;
-      const { markerDigest, ...body } = parsed.data;
-      if (markerDigestOf(body) !== markerDigest) continue;
-      marker = parsed.data;
-    } catch {
-      continue;
-    }
-    if (Date.parse(marker.approvedAt) > now || Date.parse(marker.expiresAt) <= now) continue;
-    approvals.push({ approverEmployee: marker.approverEmployee, configurationDigest: marker.configurationDigest, priceRevision: marker.priceRevision, approvedAt: marker.approvedAt });
-  }
-  return approvals;
 }
