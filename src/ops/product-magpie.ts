@@ -9,6 +9,7 @@ import {parseMagpieJson} from '../usage/magpie.ts';
 import {sha256,MAGPIE_SNAPSHOT_MAX_AGE_SECONDS} from './proof-contract.ts';
 import {opsFetch,type Fetcher} from './fetcher.ts';
 
+export type ProductMagpieObservation=Awaited<ReturnType<typeof observeProductMagpie>>;
 export const PRODUCT_MAGPIE_MODEL='remote-magpie/group/work';
 export class ProductGatewaySourceMismatch extends CompanyError{
  constructor(){super('invalid',
@@ -24,6 +25,7 @@ const list=(v:unknown):ObjectRow[]=>Array.isArray(v)?v.filter(object):[];
 const text=(v:unknown)=>typeof v==='string'&&v.length<=240?v:null;
 const number=(v:unknown)=>typeof v==='number'&&Number.isFinite(v)&&v>=0?v:null;
 const price=(v:unknown)=>typeof v==='string'&&/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(v)?number(Number(v)):number(v);
+const rawText=(v:unknown)=>typeof v==='string'&&v.length<=64?v:null;
 const safeId=(v:unknown)=>typeof v==='string'&&/^[\w.:-]+(?:\/[\w.:-]+)*$/.test(v)&&v.length<=200?v:null;
 
 // Usage windows grow without bound in production (total was 45852 when the first 200 rows carried no
@@ -103,7 +105,7 @@ export async function observeProductMagpie(input:{readProvider?:()=>unknown;fetc
    accountRef,accountBinding:accountRef??'unknown',completed,status,stop:stopFlag,durationMs,
    usage:{input:number(r.in),output:number(r.out),cacheRead:number(r.cache_read),cacheWrite:number(r.cache_write),reasoning:number(r.reasoning)},
    cost:priced?number(r.cost):null,costUnknown:!priced,
-   pricing:{inputPerToken:inputPrice,outputPerToken:outputPrice,free:inputPrice===0&&outputPrice===0,reviewed:false},
+   pricing:{rawPrompt:rawText(pricing?.prompt),rawCompletion:rawText(pricing?.completion),inputPerToken:inputPrice,outputPerToken:outputPrice,free:inputPrice===0&&outputPrice===0,reviewed:false},
   };
  });
  const accounts=list(quotasBody.data).flatMap(row=>{
