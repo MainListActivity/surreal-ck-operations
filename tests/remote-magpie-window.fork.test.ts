@@ -14,6 +14,7 @@ import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { ProjectStore } from '../src/projects.ts';
 import { OpsBroker } from '../src/ops/broker.ts';
+import { CompanyProofStore } from '../src/ops/proof-store.ts';
 import { MAGPIE_EXECUTION_HEADROOM_SECONDS, PROOF_GOAL } from '../src/ops/proof-contract.ts';
 import { remoteConfigurationDigest, remoteMagpieEvidenceSchema } from '../src/ops/remote-magpie-evidence.ts';
 import { brokerConfig, FakeWorld } from './support/ops-world.ts';
@@ -61,6 +62,7 @@ function broker() {
   const remote = remoteFetch();
   ops = new OpsBroker({
     core, projects, secretKey: () => key, serviceHome: dir, now,
+    proofStore: new CompanyProofStore(database.db, now),
     fetch: (input, init) => (String(input).startsWith(provider.chat) ? remote(input) : world.fetch(input, init)) as never,
     magpie: {
       readProductProvider: () => provider,
@@ -87,6 +89,17 @@ async function writeCopy(file: string, edited: unknown) {
 }
 const approvalFor = (c: { configurationDigest: string; pricing: { priceRevision: string | null } }, who = approver) =>
   ({ approverEmployee: who, configurationDigest: c.configurationDigest, priceRevision: c.pricing.priceRevision!, approvedAt: '2026-10-29T02:50:00Z' });
+const evidence = (what: string) => ({ text: `${what} — long enough to satisfy the evidence validation`, idempotencyKey: randomUUID() });
+/** Puts a fixture task into the blocked-to-gm state a manager resumes, with the approval task as its dependency. */
+async function blockedDependingOn(taskId: string, approvalTask: string, dependent = true) {
+  await database.db.query("UPDATE $task SET state='blocked', blocked_to='gm', resume_state='doing', dependencies=[$dep];", { task: new RecordId('task', taskId), dep: new RecordId('task', approvalTask) });
+  if (!dependent) await database.db.query("UPDATE $task SET dependencies=[];", { task: new RecordId('task', taskId) });
+}
+/** The binding checks mark the approval task done; each check starts by putting it back so ops calls stay allowed. */
+const approvalDoing = () => database.db.query("UPDATE $dep SET state='doing';", { dep: new RecordId('task', windowTask) });
+const approvalDone = () => database.db.query("UPDATE $dep SET state='done';", { dep: new RecordId('task', windowTask) });
+const newSource = () => core.createTask(gm, { title: 'Window binding source', context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', goalId: PROOF_GOAL, idempotencyKey: randomUUID() });
+const bindWindow = (candidate: { configurationDigest: string; expiry: { expiresAt: string } }) => ({ approvalTask: windowTask, configurationDigest: candidate.configurationDigest, evidenceExpiresAt: candidate.expiry.expiresAt, minRemainingSeconds: MAGPIE_EXECUTION_HEADROOM_SECONDS, notAfter: new Date(Date.parse(candidate.expiry.expiresAt) - MAGPIE_EXECUTION_HEADROOM_SECONDS * 1000).toISOString() });
 
 beforeAll(async () => {
   if (!enabled) return;
@@ -250,4 +263,91 @@ check('the original author cannot self-approve an unedited candidate, and it sta
   const result = await windowOf(out.candidateFile);
   expect(result.eligible).toBe(false);
   expect(result.blockedReasons).toEqual(['price-not-reviewed']);
+});
+
+// ---- window binding: an eligible remote candidate becomes the approval candidate resume can bind ----
+// The resume checks use the wall clock, so these checks sample at real time instead of the fixed fixture clock.
+
+check('an eligible remote candidate is registered as the approval candidate and a manager binds its window', async () => {
+  clock = Date.now();
+  await approvalDoing();
+  const out = await candidate({ budget: BUDGET });
+  approvals = [approvalFor(out.candidate)];
+  const ready = await windowOf(out.candidateFile);
+  expect(ready.eligible).toBe(true);
+  expect(ready.candidateRegistration).toMatchObject({ digest: out.candidate.configurationDigest });
+  expect(['registered', 'replaced']).toContain(ready.candidateRegistration.status);
+  const row = await new CompanyProofStore(database.db, now).candidate(windowTask);
+  expect(row).toMatchObject({
+    digest: out.candidate.configurationDigest, evidence_expires_at: out.candidate.expiry.expiresAt,
+    type: 'remote-magpie-evidence/1', author: out.candidate.author,
+  });
+  await database.db.query("UPDATE $dep SET state='done';", { dep: new RecordId('task', windowTask) });
+  const source = await newSource();
+  await blockedDependingOn(source.id, windowTask);
+  const window = bindWindow(out.candidate);
+  await core.resume(gm, source.id, { ...evidence('bind the registered remote candidate'), executionWindow: window });
+  expect((await core.getTask(gm, source.id)).executionWindow).toEqual(window);
+  await approvalDoing();
+});
+
+check('a window that differs from the registered remote candidate is refused, and the correct one still binds', async () => {
+  clock = Date.now();
+  await approvalDoing();
+  const out = await candidate({ budget: BUDGET });
+  approvals = [approvalFor(out.candidate)];
+  await windowOf(out.candidateFile);
+  await database.db.query("UPDATE $dep SET state='done';", { dep: new RecordId('task', windowTask) });
+  const source = await newSource();
+  await blockedDependingOn(source.id, windowTask);
+  const base = bindWindow(out.candidate);
+  const refused = async (window: ReturnType<typeof bindWindow>) => expect(await core.resume(gm, source.id, { ...evidence('reject a window that does not match'), executionWindow: window }).catch((e: { code?: string }) => e.code)).toBe('invalid');
+  await refused({ ...base, configurationDigest: 'f'.repeat(64) });
+  await refused({ ...base, evidenceExpiresAt: new Date(Date.parse(base.evidenceExpiresAt) + 3600_000).toISOString() });
+  await refused({ ...base, notAfter: new Date(Date.now() - 1000).toISOString() });
+  // The approval task is no longer done.
+  await database.db.query("UPDATE $dep SET state='review';", { dep: new RecordId('task', windowTask) });
+  await refused(base);
+  await database.db.query("UPDATE $dep SET state='done';", { dep: new RecordId('task', windowTask) });
+  // A task that does not depend on the approval task cannot bind it.
+  const orphan = await newSource();
+  await blockedDependingOn(orphan.id, windowTask, false);
+  expect(await core.resume(gm, orphan.id, { ...evidence('no dependency on the approval'), executionWindow: base }).catch((e: { code?: string }) => e.code)).toBe('invalid');
+  await core.resume(gm, source.id, { ...evidence('the matching registered window binds'), executionWindow: base });
+  expect((await core.getTask(gm, source.id)).executionWindow).toEqual(base);
+  await approvalDoing();
+});
+
+check('a fresh observation replaces the registered candidate and the replaced digest can no longer bind', async () => {
+  clock = Date.now();
+  await approvalDoing();
+  const first = await candidate({ budget: BUDGET });
+  approvals = [approvalFor(first.candidate)];
+  const firstReady = await windowOf(first.candidateFile);
+  expect(firstReady.eligible).toBe(true);
+  clock += 60_000;
+  const second = await candidate({ budget: BUDGET });
+  expect(second.candidate.configurationDigest).not.toBe(first.candidate.configurationDigest);
+  approvals = [approvalFor(second.candidate)];
+  const secondReady = await windowOf(second.candidateFile);
+  expect(secondReady.candidateRegistration).toMatchObject({ status: 'replaced', digest: second.candidate.configurationDigest, replacedDigest: first.candidate.configurationDigest });
+  const row = await new CompanyProofStore(database.db, now).candidate(windowTask);
+  expect(row?.digest).toBe(second.candidate.configurationDigest);
+  await database.db.query("UPDATE $dep SET state='done';", { dep: new RecordId('task', windowTask) });
+  const source = await newSource();
+  await blockedDependingOn(source.id, windowTask);
+  expect(await core.resume(gm, source.id, { ...evidence('the replaced digest is not renewed'), executionWindow: bindWindow(first.candidate) }).catch((e: { code?: string }) => e.code)).toBe('invalid');
+  await core.resume(gm, source.id, { ...evidence('the current candidate binds'), executionWindow: bindWindow(second.candidate) });
+  await approvalDoing();
+});
+
+check('the author approving its own remote candidate stays price-not-reviewed and registers nothing', async () => {
+  clock = Date.now();
+  await approvalDoing();
+  const out = await candidate({ budget: BUDGET });
+  approvals = [{ ...approvalFor(out.candidate, out.candidate.author) }];
+  const closed = await windowOf(out.candidateFile);
+  expect(closed.eligible).toBe(false);
+  expect(closed.blockedReasons).toEqual(['price-not-reviewed']);
+  expect(closed.candidateRegistration).toBeUndefined();
 });

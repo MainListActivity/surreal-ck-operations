@@ -8,7 +8,7 @@ import {priceApprovalFileName,priceApprovalFor} from './price-approval.ts';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { CompanyCore, OpsScope } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
 import { faultFactsOf, type FaultPhase, type FaultTargetKind } from '../faults.ts';
@@ -1858,11 +1858,24 @@ export class OpsBroker {
       if (!parsed.success) throw new CompanyError('invalid', 'remote-magpie candidate is malformed or was edited after it was generated');
       const approvals = this.deps.magpie?.remotePriceApprovals?.() ?? this.remotePriceApprovalRecords.filter(a => a.approvalTask === approvalTask);
       const result = remoteMagpieWindow(parsed.data, {approvalTask, now: this.now(), approvals, trusted: this.remoteObservations.get(parsed.data.observation.digest)});
+      const candidateHash = sha256(raw);
+      // Only an eligible candidate becomes the approval candidate the manager can bind. The row mirrors what
+      // the broker itself verified (digest, expiry, trusted author); this tool never decides the resume.
+      let registration: { status: 'registered' | 'unchanged' | 'replaced'; digest: string; replacedDigest?: string } | undefined;
+      if (result.eligible && this.deps.proofStore) {
+        const lease = await this.deps.proofStore.lease(ctx.scope);
+        const stored = await this.deps.proofStore.registerRemoteCandidate(lease, {
+          taskId: approvalTask, digest: parsed.data.configurationDigest, evidenceExpiresAt: parsed.data.expiry.expiresAt,
+          author: parsed.data.author, env: ctx.env, sourcePath: resolve(text(args, 'candidatePath', 1024)), candidateHash,
+        });
+        registration = { status: stored.replacedDigest ? 'replaced' : stored.created ? 'registered' : 'unchanged', digest: parsed.data.configurationDigest, ...(stored.replacedDigest ? { replacedDigest: stored.replacedDigest } : {}) };
+      }
+      const registeredNote = registration ? ` candidate=${registration.status}:${registration.digest.slice(0, 16)}${registration.replacedDigest ? ` replaced=${registration.replacedDigest.slice(0, 16)}` : ''}` : '';
       return {
-        value: { ...result, candidateHash: sha256(raw), evidenceExpiresAt: parsed.data.expiry.expiresAt },
+        value: { ...result, candidateHash, evidenceExpiresAt: parsed.data.expiry.expiresAt, ...(registration ? { candidateRegistration: registration } : {}) },
         audit: {
           action: 'ops_magpie_window',
-          evidence: `ops_magpie_window_prepare(remote) → ${result.eligible ? 'window-ready' : `blocked(${result.blockedReasons.join(',')})`}`,
+          evidence: `ops_magpie_window_prepare(remote) → ${result.eligible ? 'window-ready' : `blocked(${result.blockedReasons.join(',')})`}${registeredNote}`,
         },
       };
     }

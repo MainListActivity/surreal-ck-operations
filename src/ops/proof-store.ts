@@ -7,7 +7,9 @@ import { emptyChecks, mark, normalRetirement, type DiagnosticCheck, type CheckRe
 import type { ProofFiles } from './proof-files.ts';
 export type LeaseStamp = { taskId: string; employee: string; delivery: string; fence: number; goal: string; project: string; role: Role };
 export type ApprovalReceipt = { taskId: string; version: number; action: 'accept' | 'owner_approve'; auditId: string; reviewer: string; digest: string };
-export type Candidate = { evidence_expires_at?: string; task: RecordId; digest: string; manifest_hash: string; document_hash: string; manifest_path: string; document_path: string; author: string; env: string };
+export type Candidate = { evidence_expires_at?: string; task: RecordId; digest: string; manifest_hash: string; document_hash: string; manifest_path: string; document_path: string; author: string; env: string; type?: string; source_path?: string };
+/** A broker-verified remote candidate registered as the approval candidate for one task. */
+export type RemoteCandidateInput = { taskId: string; digest: string; evidenceExpiresAt: string; author: string; env: string; sourcePath: string; candidateHash: string };
 export type ProofRow = { id: RecordId; task: RecordId; delivery: string; fence: number; request_key: string; request_digest: string; lease: LeaseStamp; approval: ApprovalReceipt | null; files: ProofFiles; identities_digest: string; status_hash: string; expires_at: number; revoked: boolean; version: number; sealed: { ciphertext: string; iv: string; tag: string }; kid: string };
 type ApprovalTaskRow = { state: string; kind: string; version: number; submitted_by: string; accepted_by: string; reviewer_role: string; goal: RecordId; project: RecordId };
 type ApprovalAuditRow = { id: RecordId; actor: RecordId | string; action: 'accept' | 'owner_approve'; evidence: string; version: number; at: unknown };
@@ -43,6 +45,31 @@ export class CompanyProofStore {
     const found = await this.candidate(lease.taskId);
     if (!found || found.manifest_hash !== row.manifest_hash || found.document_hash !== row.document_hash || found.author !== row.author || found.env !== env || found.manifest_path !== row.manifest_path || found.document_path !== row.document_path) throw new CompanyError('conflict', 'immutable approval candidate differs');
   }
+  /**
+   * Registers a broker-verified remote-magpie-evidence/1 candidate as the approval candidate for one task.
+   * It writes the same row shape the v2 prepare chain writes, so the existing resume checks apply unchanged.
+   * One row per task (the schema index is unique on task): a fresh observation replaces the previous row in
+   * place and never extends its expiry; the caller audits the replaced digest. Nothing here decides a window.
+   */
+  async registerRemoteCandidate(lease: LeaseStamp, input: RemoteCandidateInput): Promise<{ created: boolean; replacedDigest?: string }> {
+    if (!await this.leaseValid(lease)) throw denied();
+    const task = new RecordId('task', input.taskId);
+    if (!await this.db.select(task)) throw new CompanyError('not_found', 'approval task not found');
+    const row: Candidate = {
+      task, digest: input.digest, evidence_expires_at: input.evidenceExpiresAt, author: input.author, env: input.env,
+      type: 'remote-magpie-evidence/1', source_path: input.sourcePath,
+      manifest_hash: input.candidateHash, document_hash: input.candidateHash,
+      manifest_path: input.sourcePath, document_path: input.sourcePath,
+    };
+    const before = await this.candidate(input.taskId);
+    // digest and evidence_expires_at are READONLY, so a replacement deletes and re-inserts in one transaction
+    // rather than updating them in place. The unique index keeps one row per task throughout.
+    await this.db.query('BEGIN; DELETE internal_ai_candidate WHERE task = $task; INSERT INTO internal_ai_candidate $row; COMMIT;', { task, row });
+    const found = await this.candidate(input.taskId);
+    if (!found || found.digest !== row.digest || found.evidence_expires_at !== row.evidence_expires_at || found.author !== row.author || found.env !== row.env || found.type !== row.type || found.source_path !== row.source_path) throw new CompanyError('conflict', 'remote candidate registration did not persist');
+    return { created: before === undefined, ...(before && before.digest !== row.digest ? { replacedDigest: before.digest } : {}) };
+  }
+
   async candidate(taskId: string): Promise<Candidate | undefined> {
     const [rows] = await this.db.query<[Candidate[]]>('SELECT * FROM internal_ai_candidate WHERE task = $task LIMIT 1;', { task: new RecordId('task', taskId) }); return rows[0];
   }

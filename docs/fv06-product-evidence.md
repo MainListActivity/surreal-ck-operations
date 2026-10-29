@@ -64,3 +64,13 @@ observationSnapshot 单独记录本次读取的哈希、采集时刻和本地2�
 - `ops_magpie_window_prepare {candidatePath, approvalTask}` 在没有注入 `remotePriceApprovals` 时，从 `approvalTask` 证据根读取 marker。以下情形会跳过该 marker，窗口保持 `price-not-reviewed` 或报 `evidence-expired`：文件不符合 schema、`markerDigest` 不符（被篡改）、`configurationDigest` 或 `priceRevision` 不符、批准时刻在未来、已过期。
 - 生产中只要存在一条独立、未篡改、未过期且 digest 相符的 marker，窗口才不再报 `price-not-reviewed`。这份 marker 只代表价目审核，不授予预算，不启用、不执行。
 - 注入的 `remotePriceApprovals` 仍保留为测试接缝，并优先于磁盘 marker。
+
+## 窗口绑定：远端候选登记为 approval candidate
+
+- `ops_magpie_window_prepare {candidatePath, approvalTask}` 在远端候选判定 `eligible=true` 时，把该候选登记为 `approvalTask` 的 approval candidate（`internal_ai_candidate` 表中该任务的一行）。判定为闭锁时不写任何行。
+- 行内容与 v2 manifest 链同形：`digest = configurationDigest`、`evidence_expires_at = expiry.expiresAt`、`author` 取 broker 受信 author、`env` 为当前环境。远端专有字段：`type = remote-magpie-evidence/1`、`source_path` 为候选文件路径；`manifest_hash`/`document_hash` 记候选文件 sha256，`manifest_path`/`document_path` 同 `source_path`。
+- **替换语义**：`internal_ai_candidate` 对 `task` 唯一，一个任务只有一行当前候选。重新观测产生新 digest 后再次 prepare，会在一笔事务里删除旧行并写入新行（`digest`/`evidence_expires_at` 是 READONLY 字段，不能原地改写，故用删除+插入）。ops 审计条目记录 `candidate=replaced:<新 digest 前 16 位> replaced=<旧 digest 前 16 位>`。旧 digest 不会被续期：仍用旧 digest 组窗口会被 resume 的 digest 校验拒绝。
+- **resume 校验不变**：`validateExecutionWindow` 与 resume 事务对远端行的判定与 v2 行完全一致——approvalTask 为 `done`、与被恢复任务同一 goal、是被恢复任务的依赖、候选 digest 与 `evidenceExpiresAt` 完全相等、窗口未过期。未放宽任何一项，也没有为远端行加特例。
+- 登记只发生在 eligible 时，来源是 broker 自己核对过的观测、受信作者与独立批准；`ops_magpie_window_prepare` 不决定窗口，也不启用执行。
+- 进程重启后，已登记的行仍在数据库里，可继续被 resume 绑定到其 `evidence_expires_at`；但 broker 内保存的观测与批准会丢失，重新 prepare 前不能产生新的 eligible 候选。被替换或过期的旧行不能再绑定。
+
