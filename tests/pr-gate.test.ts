@@ -1,5 +1,17 @@
 import { expect, test } from 'bun:test';
 import { createSubmitCheck, extractPrUrls, judgePr, type PrInfo } from '../src/pr-gate.ts';
+import { assertEmployeeCiBlockAllowed } from '../src/github-ci-control.ts';
+
+test('CI billing blockers are system-owned; ordinary invoices and real test failures remain separate', () => {
+  for (const text of ['GitHub CI 账单失败，要求付款', 'CI 因计费未启动', 'GitHub Actions spending limit reached',
+    'CI: account payments have failed', 'GitHub Billing & plans', 'workflow 支出上限']) {
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+  expect(() => assertEmployeeCiBlockAllowed('CI 无法继续', '请老板处理付款失败')).toThrow();
+  for (const text of ['客户账单需要老板批准', 'GitHub CI 断言测试失败', '生产服务器余额不足', '普通外部审批']) {
+    expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
+  }
+});
 
 const pr = (over: Partial<PrInfo> = {}): PrInfo => ({ url: 'https://github.com/o/r/pull/7', state: 'OPEN', mergeable: 'MERGEABLE', headRefName: 'task/abcd1234', checks: [{ name: 'quality', conclusion: 'SUCCESS' }], ...over });
 

@@ -13,6 +13,7 @@ import {Dispatcher} from '../src/dispatcher/dispatcher.ts';
 import {CompanyUpgrades} from '../src/company-upgrades.ts';
 import {runCompanyUpgrade,type UpgradeCommand} from '../src/company-upgrade-runner.ts';
 import {readCompanyRelease,compareRelease,releaseNotesSchema} from '../src/company-release.ts';
+import {baselineAcceptanceCriteria,createGithubActionsAdapter} from '../src/acceptance.ts';
 setDefaultTimeout(60_000);
 const run=process.env.RUN_SCK_UPGRADE_FORK_TESTS==='1'?test:test.skip;
 let dir:string,repo:string,home:string,oldSha:string,newSha:string,db:CompanyDatabase,core:SurrealCompanyCore,owner:OwnerDesk,eng:string,server:ReturnType<typeof Bun.spawn>,count=0,launches=0;
@@ -333,4 +334,72 @@ run('automatic scanning chooses the highest pending version and ignores job-hist
  // A completed high-version task can remain in the last three job history cards, but is no longer pending.
  await db.db.query("UPDATE $task SET state='done',blocked_to=NONE;",{task:new RecordId('task',high.id)});
  const second=await service.autoStart();expect(String((await service.job(second!.jobId))!.task.id)).toBe(low.id);
+});
+
+run('GitHub CI billing cannot be turned into an employee block or an owner handoff', async () => {
+  const who = await new LocalEnrollmentAdmin(db).enroll(`ci-policy-${++count}`, 'engineering', ['execute', 'review']);
+  const taskId = crypto.randomUUID();
+  await db.db.query("CREATE $task CONTENT {title:'CI 控制回归',context:'fixture',kind:'release',executor_role:'engineering',reviewer_role:'product',state:'ready',version:1,fence:0,dependencies:[]};", {task:new RecordId('task',taskId)});
+  const claim = await core.claim(who,taskId);
+  const proof = {taskId,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version};
+  const snapshot = async () => (await db.db.query('SELECT * FROM ONLY $task;', {task:new RecordId('task',taskId)}))[0];
+  const before = await snapshot();
+  for (const to of ['owner','gm'] as const) {
+    await expect(core.block(who,proof,to,note('GitHub CI 作业没有启动，账单失败，请老板提高 spending limit 后再继续。')))
+      .rejects.toMatchObject({code:'invalid',details:{reason:'github_ci_system_owned'}});
+    expect(await snapshot()).toEqual(before);
+  }
+  // Only inspecting evidence.text leaves the typed wait's action/reason as a second bypass.
+  for (const field of ['reason','pendingAction','reference','summary'] as const) {
+    await expect(core.wait(who,proof,note('上线检查已整理，需要等待所述前置条件解决后再继续执行。'),{
+      kind:'owner_handoff',completed:['PR 已准备'],reason:'等待外部处理',pendingAction:'请检查前置条件',
+      [field]:'GitHub Actions billing: 请老板修复付款后再继续',
+    })).rejects.toMatchObject({code:'invalid',details:{reason:'github_ci_system_owned'}});
+    expect(await snapshot()).toEqual(before);
+  }
+  const [waits] = await db.db.query<[unknown[]]>('SELECT * FROM task_wait WHERE task=$task;',{task:new RecordId('task',taskId)});
+  expect(waits).toHaveLength(0);
+  // A genuine test failure is still a technical blocker. There is no employee-issued billing waiver.
+  const blocked = await core.block(who,proof,'gm',note('GitHub CI 已实际执行测试，断言失败，需要工程修复后重新验证。'));
+  expect(blocked.blockedTo).toBe('gm');
+});
+
+run('a rejected CI billing block continues through server-verified evidence and submit without owner intervention', async () => {
+  const gateId = new RecordId('company_meta','acceptance_gate');
+  const previousGate = await db.db.select(gateId);
+  await db.db.upsert(gateId).content({enabled:true,version:1,criteria_version:1});
+  try {
+    const sha = 'a'.repeat(40), taskId = crypto.randomUUID();
+    const ciCore = new SurrealCompanyCore(db, {acceptance:{adapter:createGithubActionsAdapter(async args => {
+      if (args[0] === 'run') return JSON.stringify({headSha:sha,conclusion:'failure',updatedAt:new Date().toISOString()});
+      if (args[1]?.endsWith('/jobs')) return JSON.stringify({jobs:[{id:5,name:'quality',steps:[]}]});
+      if (args[1]?.endsWith('/annotations')) return JSON.stringify([{message:'The job was not started because recent account payments have failed'}]);
+      throw Error('unexpected GitHub request');
+    })}});
+    const who = await new LocalEnrollmentAdmin(db).enroll(`ci-continue-${++count}`, 'engineering', ['execute', 'review']);
+    await db.db.query("CREATE $task CONTENT {title:'CI 机器裁决回归',context:'fixture',kind:'release',executor_role:'engineering',reviewer_role:'product',state:'ready',version:1,fence:0,dependencies:[],acceptance_head:$sha,acceptance_legacy:false,acceptance_version:1,acceptance_criteria:$criteria};", {
+      task:new RecordId('task',taskId),sha,criteria:baselineAcceptanceCriteria('release'),
+    });
+    const claim = await ciCore.claim(who,taskId), proof = {taskId,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version};
+    await expect(ciCore.block(who,proof,'owner',note('GitHub CI 因账户付款失败未执行，等待老板充值。')))
+      .rejects.toMatchObject({details:{nextAction:'record_acceptance_evidence',grantsWaiver:false}});
+    // Refusing the employee block must not bypass the machine-evidence gate either.
+    await expect(ciCore.submit(who,proof,note('尚未提交任何服务端证据，不应直接放行到审核阶段。'))).rejects.toMatchObject({code:'invalid'});
+    const recorded = await ciCore.recordAcceptanceEvidence(who,{taskId,acId:'AC-BASE-RELEASE-1',sha,
+      source:{provider:'github-actions',runUrl:'https://github.com/fixture/repo/actions/runs/42'},idempotencyKey:`ci-proof-${taskId}`});
+    expect(recorded.verified).toBe(true);
+    expect(recorded.source).toMatchObject({conclusion:'failure',infrastructure:{reason:'billing'}});
+    const submitted = await ciCore.submit(who,proof,note('服务器已记录当前提交的 CI 基础设施判定，继续独立产品上线审核。'));
+    expect(submitted.state).toBe('review');expect(submitted.blockedTo).toBeUndefined();
+    // A main-bound structured installation request is not a demand to repair GitHub billing.
+    const upgradeId = crypto.randomUUID();
+    await db.db.query("CREATE $task CONTENT {title:'公司安装',context:'fixture',kind:'release',executor_role:'engineering',reviewer_role:'qa',state:'ready',version:1,fence:0,dependencies:[],code_repo_path:$repo};",{task:new RecordId('task',upgradeId),repo});
+    const next = await core.claim(who,upgradeId);
+    const upgrade = await core.block(who,{taskId:upgradeId,deliveryId:next.deliveryId,fence:next.fence,expectedVersion:next.task.version},'owner',
+      {...note('GitHub CI 计费已由系统判定。现在申请安装已合入 main 的公司版本。'),companyUpgrade:{sha:newSha}});
+    expect(upgrade.companyUpgrade?.sha).toBe(newSha);
+  } finally {
+    if (previousGate) await db.db.upsert(gateId).content(previousGate);
+    else await db.db.delete(gateId);
+  }
 });

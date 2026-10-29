@@ -452,7 +452,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     }),
   }, async (input, ctx) => run(token(ctx), () => core.createDelivery(token(ctx), input)));
   server.registerTool('record_acceptance_evidence', {
-    description: 'SYS02: record verified machine evidence for one acceptance criterion. The server reads the GitHub Actions run (or its artifact/probe) and refuses a run from another head, a non-successful run, an expired artifact, an out-of-window probe, or a source the caller may not read. Model text never becomes a pass fact.',
+    description: 'SYS02: record verified machine evidence for one acceptance criterion. The server reads the GitHub Actions run (or its artifact/probe) and refuses another head, real test failures, expired artifacts, out-of-window probes and unreadable sources. For generic CI only, GitHub account billing refusals with every job at zero steps are adjudicated and recorded by the server, never by an employee blocker. Model text never becomes a pass fact.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200), acId: z.string().min(1).max(50), sha: z.string().min(1).max(200),
       environment: z.string().min(1).max(100).optional(),

@@ -75,6 +75,7 @@ import { PLUGIN_RUNTIME_ROLES } from './contracts.ts';
 import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES, QA_OBSERVATION_WAIT_ROOTS_LIMIT, fitGoalWaitSummary, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
 import { CompanyError } from './core-errors.ts';
+import { assertEmployeeCiBlockAllowed } from './github-ci-control.ts';
 import { DispositionLedger, type DispositionApplier, type DispositionClaimInput, type DispositionClaimOutcome, type DispositionClaimView, type DispositionDecideInput, type DispositionDecideOutcome, type DispositionPhase, type DispositionStatusInput, type DispositionStatusView, type ExternalActionRequestInput, type ExternalActionView, type HolderNoticeView, type ExternalActionGateway } from './disposition.ts';
 import { createCompanyGithubGateway, githubRepoSlug } from './external-actions.ts';
 import { validateExternalDependencies } from './input-bounds.ts';
@@ -3069,6 +3070,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   async block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence, quotaResetsAt?: string, fault?: FaultInput): Promise<TaskView> {
     const until = quotaResetsAt === undefined ? undefined : parseQuotaResetsAt(quotaResetsAt, Date.now());
     const actor = await this.authenticate(credential);
+    // A structured upgrade is an install request, validated against main and the current lease by transition.
+    // Every ordinary block is checked before recording faults, quota gates, audit or changing the task/lease.
+    if (evidence.companyUpgrade === undefined) assertEmployeeCiBlockAllowed(evidence.text);
     // The fault is recorded before the state change, so a crash between the two leaves the attempt charged (the
     // attempt really happened) rather than a block that no budget accounts for.
     if (fault !== undefined) await this.reportTaskFault(actor.employeeId, proof.taskId, fault);
@@ -3092,6 +3096,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     requireText(evidence.text, 'evidence', 20, 30000);
     // SYS05 AC04: invitation material and credentials stay in the controlled handoff file, never in task evidence.
     assertNonSensitive(evidence.text, 'evidence');
+    assertEmployeeCiBlockAllowed(evidence.text, input.reason, input.pendingAction, input.reference, input.summary,
+      ...(input.completed ?? []));
     const row = await this.db.select<TaskRow>(id('task', proof.taskId));
     if (!row) throw new CompanyError('not_found', 'Task not found');
     if (row.state === 'void') throw new CompanyError('conflict', 'Task retired');
