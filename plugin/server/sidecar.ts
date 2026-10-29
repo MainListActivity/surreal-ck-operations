@@ -37,17 +37,19 @@ const BASE_TOOLS = [
   "get_context", "get_task_history", "list_worktrees", "reclaim_worktrees", "list_worktree_audits", "checkpoint", "submit", "review", "report_blocker",
   // SYS05 typed waits: enter (consumes the lease), trusted-event resolve, manager cancel/extend, read-only audit/cards.
   "wait_task", "resolve_wait", "cancel_wait", "extend_wait", "list_task_waits", "wait_handoff_cards", "wait_migration_preview", "wait_migration_apply",
-  "create_task", "create_goal", "triage_goal", "create_delivery",
+  "create_task", "create_goal", "triage_goal", "create_delivery", "goal_phase_split",
   "record_owner_decision", "set_direction", "resume_task", "defer_task_until", "retire_task",
   // FV06: gm-only append of real prerequisites to an existing dependency wait; sets manager continuation, never resumes.
   "append_dependency_prerequisites",
-  "record_score", "get_model_evidence", "heartbeat", "deliverable_publish",
+  "record_score", "get_model_evidence", "get_task_cost", "heartbeat", "deliverable_publish",
   // Manage capability (gm/product) only, enforced in core; writes land in audit.
   "def_list", "def_ensure", "project_disciplines_update",
   // gm only in core (rebind a blocked task to a registered project; audited, version-guarded).
   "task_project_update",
   // gm only in core (bind a blocked execute-phase task's code repo; audited, version-guarded).
   "bind_task_code_repo",
+  // gm only in core (turn a blocked read-only engineering task into a code task in place; audited, version-guarded).
+  "task_intent_update",
   // gm only in core (read-only acceptance-reference preview; compare-and-set repair of a quick goal's voided gate).
   "goal_acceptance_preview", "goal_acceptance_repair",
   // SYS07 goal governance: paged read-only console/scan/metrics, structured outcome and evidence, final-gate
@@ -1020,6 +1022,9 @@ export class SidecarPool {
       case "create_goal": return core.relayGoal(cred, args as never);
       case "triage_goal": return core.triageGoal(cred, args as never);
       case "create_delivery": return core.createDelivery(cred, args as never);
+      case "goal_phase_split": return core.goalPhaseSplit
+        ? core.goalPhaseSplit(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose goal_phase_split"), { code: "temporarily_unavailable" }));
       case "record_owner_decision": return core.relayOwnerDecision(cred, args as never);
       case "set_direction": await core.relayDirection(cred, args as never); return { recorded: true };
       case "resume_task": return core.resume(cred, taskIdOf(args.taskId), evidence());
@@ -1070,6 +1075,9 @@ export class SidecarPool {
       case "task_project_update": return core.taskProjectUpdate
         ? core.taskProjectUpdate(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose task_project_update"), { code: "temporarily_unavailable" }));
+      case "task_intent_update": return core.taskIntentUpdate
+        ? core.taskIntentUpdate(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose task_intent_update"), { code: "temporarily_unavailable" }));
       case "bind_task_code_repo": return core.bindTaskCodeRepo
         ? core.bindTaskCodeRepo(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose bind_task_code_repo"), { code: "temporarily_unavailable" }));
@@ -1180,6 +1188,9 @@ export class SidecarPool {
         return core.modelEvidence(cred,taskIdOf(args.taskId));
       });
       case "record_score": return core.recordScore(cred, args as never);
+      case "get_task_cost": return core.taskCost
+        ? core.taskCost(cred, (args as { taskId: string }).taskId)
+        : Promise.reject(Object.assign(new Error("core does not expose get_task_cost"), { code: "temporarily_unavailable" }));
       case "def_list": return core.listDefs(cred);
       case "def_ensure": return core.ensureDef(cred, args as never);
       case "project_disciplines_update": return core.updateProjectDisciplines(cred, args as never);

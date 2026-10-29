@@ -5,6 +5,7 @@ import { installBunShim } from "./bun-shim";
 import { loadServiceEnv, serviceHome } from "./env";
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 import { readProviderQuotas } from "./dispatch";
 import { setAgentModel } from "./vendor/src/dispatcher/agent-model.ts";
 
@@ -102,10 +103,12 @@ export function company(): Promise<Company> {
           ? true : undefined,
     };
     const { createSubmitCheck } = await import("./vendor/src/pr-gate.ts");
+    const { createSystemCheck } = await import("./vendor/src/submit-checks.ts");
     // Same build-cost line as the MCP process: the plugin's sidecar serves the same paged reads, so both surfaces must be diagnosable.
     const snapshotObserve = (stats: { outcome: string; kind: string; rows: number; bytes: number; batches: number; loadMs: number; reserveMs: number; writeMs: number; commitMs: number; totalMs: number; serverMs: number; loadAttempts: number; release: string; releaseMs: number }) =>
       console.log(`snapshot build ${stats.kind} ${stats.outcome} rows=${stats.rows} bytes=${stats.bytes} batches=${stats.batches} load=${Math.round(stats.loadMs)} reserve=${Math.round(stats.reserveMs)} write=${Math.round(stats.writeMs)} commit=${Math.round(stats.commitMs)} server=${Math.round(stats.serverMs)} total=${Math.round(stats.totalMs)} reads=${stats.loadAttempts} release=${stats.release} releaseMs=${Math.round(stats.releaseMs)}`);
-    const core = new SurrealCompanyCore(db, { workforce, snapshotObserve, worktrees: worktreeOpts, submitCheck: process.env.SCK_PR_GATE === "0" ? undefined : createSubmitCheck() });
+    const core = new SurrealCompanyCore(db, { workforce, snapshotObserve, worktrees: worktreeOpts, submitCheck: process.env.SCK_PR_GATE === "0" ? undefined : createSubmitCheck(),
+      systemCheck: process.env.SCK_SUBMIT_CHECKS === "0" ? undefined : createSystemCheck({ serviceHome: serviceHome(), home: homedir() }) });
     // Sealed credentials, login tokens and the Cloudflare token live only in this process; agents
     // reach them through the sidecar relay as named, audited, lease-gated operations.
     const ops = new OpsBroker({

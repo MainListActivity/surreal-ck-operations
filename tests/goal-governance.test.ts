@@ -108,9 +108,28 @@ describe('goal final-gate invariants (AC01)', () => {
       externalDependencies: [{ taskId: 'gate', dependency: 'ext-1', goalId: 'g2', state: 'done' }] });
     expect(result.graph.crossGoal).toEqual([{ taskId: 'gate', dependency: 'ext-1', goalId: 'g2', state: 'done' }]);
     expect(result.graph.dangling).toEqual([]);
-    expect(result.repairReasons.map(reason => reason.code)).toContain('dependency_cross_goal');
-    expect(result.repairReasons.find(reason => reason.code === 'dependency_cross_goal')?.message).toContain('done');
-    expect(result.readyToComplete).toBe(false);
+    // A done edge in another goal is delivered work: disclosed in the graph, never a reason to park the goal.
+    expect(result.repairReasons.map(reason => reason.code)).not.toContain('dependency_cross_goal');
+    expect(result.readyToComplete).toBe(true);
+  });
+
+  test('a cross-goal dependency that is not done still needs repair and keeps its real state', () => {
+    const gate = ownerGate({ dependencies: ['ext-1', 'ext-2'] });
+    const result = assessGoal({ goal: goal(), tasks: [task('manual'), gate], outcome: outcome(), now: NOW,
+      externalDependencies: [
+        { taskId: 'gate', dependency: 'ext-1', goalId: 'g2', state: 'done' },
+        { taskId: 'gate', dependency: 'ext-2', goalId: 'g2', state: 'blocked' },
+      ] });
+    const reasons = result.repairReasons.filter(reason => reason.code === 'dependency_cross_goal');
+    expect(reasons.map(reason => reason.message)).toEqual(['依赖 ext-2 属于其他目标（blocked）']);
+    expect(result.needsRepair).toBe(true);
+  });
+
+  test('a goal parked only by done cross-goal dependencies no longer needs repair', () => {
+    const gate = ownerGate({ dependencies: ['ext-1'] });
+    const result = assessGoal({ goal: goal({ state: 'needs_repair' }), tasks: [task('manual'), gate], outcome: outcome(), now: NOW,
+      externalDependencies: [{ taskId: 'gate', dependency: 'ext-1', goalId: 'g2', state: 'done' }] });
+    expect(result.repairReasons.filter(reason => reason.code.startsWith('dependency_'))).toEqual([]);
   });
 
   test('a dependency that exists in the whole database with no goal is unscoped, never called missing', () => {

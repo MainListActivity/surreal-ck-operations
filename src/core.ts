@@ -15,8 +15,10 @@ import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
 import type { SubmitCheck } from './pr-gate.ts';
+import type { SystemCheck } from './submit-checks.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, summarizeModelEvidence, validateScores, writeScorecards, type ModelEvidence } from './scoring.ts';
+import { readTaskCost, recordTaskCost, type TaskCost } from './task-cost.ts';
 import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, SEGMENT_DEFAULT_BYTES, SEGMENT_MAX_BYTES, answerBytes, dualBytes, echoTask, fitCount, longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Bytes, worktreeRefsSegment, worktreeRefsSegmentAnswer, type TaskTextHead } from './response-budget.ts';
 import { DEFAULT_PAGE_SIZE, TASK_STATES, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput, parseWorktreeRefsInput, queryDigest, type ContextParams } from './query-input.ts';
 import {
@@ -443,6 +445,14 @@ export function view(row: TaskRow): TaskView {
 /** Ops repo (agent home); mirrors the plugin/MCP wiring fallback for SCK_AGENT_CWD. */
 const opsRepoPath = () => process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
 
+/** Whether `text` names `repo` as a whole path (…/surreal-ck-operations, not …/surreal-ck-operations-four-tier). */
+export function namesRepo(text: string, repo: string): boolean {
+  for (let at = text.indexOf(repo); at >= 0; at = text.indexOf(repo, at + 1)) {
+    if (!/[\w-]/.test(text[at + repo.length] ?? '')) return true;
+  }
+  return false;
+}
+
 /**
  * Canonical form for repo allowlisting and routing comparisons: resolve() first, then
  * realpath the nearest existing ancestor and re-append the remaining tail — a symlinked
@@ -619,6 +629,7 @@ export class SurrealCompanyCore implements CompanyCore {
   readonly checkpointLimit: number;
   /** Optional pre-submit check of implementation deliveries; returns why the submission cannot go to review. */
   private readonly submitCheck?: SubmitCheck;
+  private readonly systemCheck?: SystemCheck;
   /** SYS02: read-only source adapter that verifies CI runs, artifacts and probes; tests inject a deterministic one. */
   private readonly acceptanceAdapter: AcceptanceSourceAdapter;
   private readonly ciBillingCheck: CiBillingCheck;
@@ -627,7 +638,7 @@ export class SurrealCompanyCore implements CompanyCore {
 private readonly independenceReadHook?: (taskId: string) => Promise<void>;
   private readonly companyReleaseRepo?:string;
   private readonly drillLaunch?: (home: string, repo: string, plan: { runId: string; root: string }) => number;
-  constructor(readonly database: CompanyDatabase, options?: { companyReleaseRepo?:string; leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; ciBillingCheck?: CiBillingCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter };
+  constructor(readonly database: CompanyDatabase, options?: { companyReleaseRepo?:string; leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; systemCheck?: SystemCheck; ciBillingCheck?: CiBillingCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter };
     externalActions?: { gateway?: ExternalActionGateway }; faults?: { limits?: FaultBudgetLimits; clock?: () => number };
     waits?: { clock?: () => number; webhookSecret?: string };
     /** Test seam only: replaces the detached drill launch so a gate can assert the guards without a real run. */
@@ -635,6 +646,7 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     this.companyReleaseRepo=options?.companyReleaseRepo;
     this.drillLaunch = options?.drillLaunch;
     this.submitCheck = options?.submitCheck;
+    this.systemCheck = options?.systemCheck;
     this.acceptanceAdapter = options?.acceptance?.adapter ?? createGithubActionsAdapter();
     this.ciBillingCheck = options?.ciBillingCheck ?? createCiBillingCheck();
     // Same seam as the acceptance adapter: the controlled external exit is injectable so a test drives an isolated fake
@@ -970,6 +982,7 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     if (input.goalId !== undefined) requireText(input.goalId, 'goal', 1, 100);
     const dependencies = [...new Set(input.dependencies ?? [])];
     if (input.revises !== undefined) return this.createRevision(actor, input, dependencies);
+    const codeRepoPath = await this.creationCodeRepo(input, kind);
     const idem = options.repairKey === undefined
       ? this.idemId(actor.employeeId, 'create', input.idempotencyKey)
       : this.businessIdemId('create', options.repairKey);
@@ -993,7 +1006,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       // A task created while the gate is off is legacy: enabling later never retroactively gates it (SYS02 AC06).
       acceptance_legacy: !acceptanceGate.enabled,
       policy_version: policyContract.version, policy_hash: policyContract.hash, policy_contract: policyContract,
-      policy_evidence: policyEvidence, expected_policy_epoch: policyEpoch,
+      policy_evidence: policyEvidence + (codeRepoPath ? ` code_repo=${codeRepoPath}` : ''), expected_policy_epoch: policyEpoch,
+      code_repo_path: codeRepoPath,
     };
     try {
       const row = await this.txTask(`BEGIN;
@@ -1013,7 +1027,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
           dependencies: $dependencies, state: IF array::len($unfinished) = 0 THEN 'ready' ELSE 'blocked' END,
           version: 1, fence: 0, submitted_by: NONE, current_employee: NONE,
           delivery_id: NONE, lease_expires_at: NONE, resume_role: NONE, resume_state: 'ready', blocked_to: NONE,
-          kind: $kind, goal: $goal, created_at: time::now(),
+          kind: $kind, goal: $goal, created_at: time::now(), code_repo_path: $code_repo_path,
           policy_version: $policy_version, policy_hash: $policy_hash, policy_contract: $policy_contract,
           ${acceptanceCriteria.length > 0 ? 'acceptance_criteria: $acceptance_criteria, acceptance_version: $acceptance_version,' : ''}
           acceptance_legacy: $acceptance_legacy, acceptance_head: NONE, acceptance_environment: $acceptance_environment,
@@ -1560,6 +1574,65 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       try { allowed.add(canonicalRepoPath(p)); } catch { /* an unreadable path can never be a bind target */ }
     }
     return allowed;
+  }
+
+  /**
+   * Submit-time system checks (type errors, version metadata, tool wiring) on an engineering code submit to the ops repo.
+   * A failure refuses the submit before review: the author keeps the lease and fixes it, no reviewer is dispatched. Each
+   * refusal is audited as submit_check_failed, which scoring counts against the author. A check that cannot run lets
+   * the submit through; the reviewer still checks.
+   */
+  private async refuseFailedSystemChecks(proof: LeaseProof, employeeId: string): Promise<void> {
+    const row = await this.db.select<TaskRow>(id('task', proof.taskId));
+    if (!row || row.executor_role !== 'engineering' || (row.kind ?? 'task') !== 'task' || row.work_intent?.kind !== 'code') return;
+    if (row.current_employee !== employeeId || row.fence !== proof.fence) return;
+    const tree = row.worktree;
+    if (!tree?.worktreePath) return;
+    try {
+      if (canonicalRepoPath(tree.repo) !== canonicalRepoPath(this.worktrees?.options.opsRepo ?? opsRepoPath())) return;
+    } catch { return; }
+    const problems = await this.systemCheck!({ worktreePath: tree.worktreePath, ...(tree.branch ? { branch: tree.branch } : {}) }).catch(() => []);
+    if (!problems.length) return;
+    const text = problems.join('\n');
+    await this.db.query("CREATE audit CONTENT { task: $task, actor: $actor, action: 'submit_check_failed', version: $version, evidence: $text, at: time::now() };",
+      { task: id('task', proof.taskId), actor: id('employee', employeeId), version: row.version, text }).catch(() => {});
+    throw new CompanyError('invalid', `提交被退回（未进入验收，系统检查未通过）：\n${text}\n修复后重新 submit；租约仍在你手上。`);
+  }
+
+  /**
+   * The code repository a new task is bound to at creation, so its first claim already lands in the right tree instead of
+   * the business project's repo (the wrong-repo block → bind_task_code_repo → re-dispatch loop). An explicit codeRepoPath
+   * must be on the bind allowlist. Without one, a task that writes code (code intent, release or deploy leg) whose
+   * project repo is not the ops repo, and whose context names the ops repo's absolute path, is bound to the ops repo:
+   * that is how managers already state "the code is in operations, the business project stays". Anything else keeps
+   * project routing (undefined).
+   */
+  private async creationCodeRepo(input: Pick<CreateTask, 'codeRepoPath' | 'context' | 'project' | 'goalId' | 'workIntent'>, kind: TaskKind): Promise<string | undefined> {
+    if (input.codeRepoPath !== undefined) {
+      requireText(input.codeRepoPath, 'codeRepoPath', 1, 1000);
+      if (!isAbsolute(input.codeRepoPath) || input.codeRepoPath.includes('\0') || input.codeRepoPath.split('/').includes('..')) {
+        throw new CompanyError('invalid', 'codeRepoPath must be an absolute path without traversal');
+      }
+      const bound = canonicalRepoPath(input.codeRepoPath);
+      if (!(await this.allowedCodeRepos()).has(bound)) throw new CompanyError('forbidden', 'codeRepoPath is not a registered project repo or the ops repo');
+      return bound;
+    }
+    const writes = kind === 'release' || kind === 'deploy' || input.workIntent?.kind === 'code';
+    if (!writes) return undefined;
+    const ops = this.worktrees?.options.opsRepo ?? opsRepoPath();
+    if (!namesRepo(input.context, ops)) return undefined;
+    const project = input.project ? await this.projects.get(input.project)
+      : input.goalId ? await this.goalProject(input.goalId) : undefined;
+    if (!project?.repoPath) return undefined;
+    let opsCanon: string, projectCanon: string;
+    try { opsCanon = canonicalRepoPath(ops); projectCanon = canonicalRepoPath(project.repoPath); } catch { return undefined; }
+    return opsCanon === projectCanon ? undefined : opsCanon;
+  }
+
+  private async goalProject(goalId: string): Promise<ProjectView | undefined> {
+    const [rows] = await this.db.query<[Array<{ project?: RecordId }>]>('SELECT project FROM $goal;', { goal: id('goal', goalId) });
+    const project = rows?.[0]?.project;
+    return project ? this.projects.get(String(project.id)) : undefined;
   }
 
   /**
@@ -2302,6 +2375,97 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       note: `老板原话：${input.ownerQuote}`, tier: input.tier, project: input.project, pipeline: input.pipeline });
   }
 
+  /**
+   * gm only: close a large goal in stages. The named unfinished tasks move to a next-phase goal (created once per
+   * idempotency key, same tier and project); the old goal's anchors stop waiting for them and unlock when nothing else is
+   * open, so the current phase can be accepted. The moved tasks join the new goal's first anchor. Refused, writing
+   * nothing, when a task is an anchor, finished, leased, outside the goal, or still awaited by an open task that stays.
+   */
+  async goalPhaseSplit(credential: Credential, input: { goalId: string; taskIds: TaskId[]; title: string; reason: string; idempotencyKey: string }): Promise<{ goalId: string; nextGoalId: string; moved: TaskId[]; unlocked: TaskId[] }> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may split a goal into phases');
+    requireText(input.goalId, 'goal', 1, 100);
+    requireText(input.title, 'title', 4, 60);
+    requireText(input.reason, 'reason', 4, 4000);
+    requireText(input.idempotencyKey, 'idempotencyKey', 1, 200);
+    const moved = [...new Set(input.taskIds ?? [])];
+    if (!moved.length || moved.length > 200) throw new CompanyError('invalid', 'taskIds must name 1-200 tasks');
+    const goal = await this.db.select<{ id: RecordId; title: string; brief: string; state: string; tier?: GoalTier; project?: RecordId; anchors?: RecordId[]; split_into?: Record<string, RecordId> }>(id('goal', input.goalId));
+    if (!goal) throw new CompanyError('not_found', 'goal not found');
+    const prior = goal.split_into?.[HASH(input.idempotencyKey).slice(0, 16)];
+    if (prior) return { goalId: input.goalId, nextGoalId: asId(prior), moved, unlocked: [] };
+    if (!['active', 'needs_repair'].includes(goal.state)) throw new CompanyError('conflict', 'only an active goal can be split');
+    const anchors = (goal.anchors ?? []).map(asId);
+    const [rows, [now]] = await Promise.all([
+      this.db.query<[TaskRow[]]>('SELECT * FROM task WHERE goal = $goal AND state NOT IN [\'done\', \'void\'];', { goal: goal.id }).then(r => r[0] ?? []),
+      this.db.query<[number]>('RETURN time::unix(time::now());'),
+    ]);
+    const open = new Map(rows.map(row => [asId(row.id), row]));
+    const problems: string[] = [];
+    for (const taskId of moved) {
+      const row = open.get(taskId);
+      if (anchors.includes(taskId)) problems.push(`${taskId} 是目标锚点`);
+      else if (!row) problems.push(`${taskId} 不是本目标的未完成任务`);
+      else if (row.current_employee && (row.lease_expires_at ?? 0) > now) problems.push(`${taskId} 有活动租约`);
+    }
+    const movedSet = new Set(moved);
+    for (const [taskId, row] of open) {
+      if (movedSet.has(taskId) || anchors.includes(taskId)) continue;
+      const waits = (row.dependencies ?? []).map(asId).filter(dep => movedSet.has(dep));
+      if (waits.length) problems.push(`留在本阶段的 ${taskId} 依赖 ${waits.join('、')}，需一起移走或先改依赖`);
+    }
+    if (problems.length) throw new CompanyError('conflict', `分阶段被拒：${problems.slice(0, 10).join('；')}`);
+    const next = await this.owner.createGoal({
+      text: `${input.title}\n上一阶段：${goal.title}（goal=${input.goalId}）。分阶段原因：${input.reason}\n\n${goal.brief}`.slice(0, 20000),
+      source: `gm-split:${actor.employeeId}`, key: `split:${input.goalId}:${input.idempotencyKey}`,
+      note: `从 ${input.goalId} 分出的下一阶段`, tier: goal.tier ?? 'standard',
+      ...(goal.project ? { project: asId(goal.project) } : {}),
+    });
+    const nextGoal = id('goal', next.id);
+    const blockedBefore = new Set(anchors.filter(a => open.get(a)?.state === 'blocked'));
+    await this.db.query(`BEGIN;
+      LET $g = SELECT * FROM ONLY $old;
+      IF $g.state NOT IN ['active', 'needs_repair'] { THROW 'goal moved: no longer active' };
+      LET $n = SELECT * FROM ONLY $next;
+      LET $first = (SELECT VALUE id FROM task WHERE id IN ($n.anchors ?? []) AND state NOT IN ['done', 'void'] LIMIT 1)[0];
+      FOR $t IN $moved {
+        LET $row = SELECT * FROM ONLY $t;
+        IF $row.goal != $old OR $row.state IN ['done', 'void'] { THROW 'task moved: no longer an open task of the goal' };
+        IF $row.current_employee != NONE AND $row.lease_expires_at > time::unix(time::now()) { THROW 'task moved: leased' };
+        UPDATE ONLY $t SET goal = $next, worktree = NONE, version += 1;
+        CREATE audit CONTENT { task: $t, actor: $actor, action: 'goal_phase_split', evidence: $evidence, at: time::now() };
+      };
+      IF $first != NONE {
+        UPDATE ONLY $first SET dependencies = array::union(dependencies ?? [], $moved), state = 'blocked', blocked_to = NONE, version += 1;
+      };
+      FOR $a IN ($g.anchors ?? []) {
+        LET $anchor = SELECT * FROM ONLY $a;
+        IF $anchor.state = 'blocked' AND array::len(array::intersect($anchor.dependencies ?? [], $moved)) > 0 {
+          LET $deps = array::complement($anchor.dependencies ?? [], $moved);
+          ${RESOLVE_DEP_SQL('$deps', '$a_dep')}
+          LET $remaining = SELECT VALUE id FROM task WHERE id IN $a_dep_resolved AND ${depUnsatisfiedFor('$anchor')};
+          LET $free = array::len($remaining) = 0 AND $anchor.blocked_to = NONE AND $anchor.wait_state != 'waiting';
+          UPDATE ONLY $a SET dependencies = $deps, state = IF $free THEN 'ready' ELSE 'blocked' END, version += 1;
+          CREATE audit CONTENT { task: $a, actor: $actor, action: IF $free THEN 'dependency_unlocked' ELSE 'goal_phase_split' END,
+            evidence: $evidence, at: time::now() };
+        };
+      };
+      UPDATE ONLY $old SET split_into[$split_key] = $next, version = (version ?? 0) + 1;
+      CREATE audit CONTENT { goal: $old, actor: $actor, action: 'goal_phase_split', evidence: $evidence, at: time::now() };
+      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+      CREATE outbox CONTENT { kind: 'goal_phase_split', sequence: $sequence.value,
+        payload: { goal: $old_key, next: $next_key, moved: $moved_keys }, at: time::now() };
+      COMMIT;`, {
+      old: goal.id, next: nextGoal, moved: moved.map(taskId => id('task', taskId)), actor: id('employee', actor.employeeId),
+      evidence: `分阶段：${input.reason}\n下一阶段目标 ${next.id}：${input.title}\n移入任务：${moved.join('、')}`,
+      split_key: HASH(input.idempotencyKey).slice(0, 16), old_key: input.goalId, next_key: next.id, moved_keys: moved,
+    });
+    const [after] = await this.db.query<[Array<{ id: RecordId; state: string }>]>('SELECT id, state FROM $ids;',
+      { ids: [...blockedBefore].map(a => id('task', a)) });
+    const unlocked = (after ?? []).filter(row => row.state === 'ready').map(row => asId(row.id));
+    return { goalId: input.goalId, nextGoalId: next.id, moved, unlocked };
+  }
+
   async triageGoal(credential: Credential, input: { goalId: string; tier: GoalTier; reason: string }): Promise<GoalView> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may triage goals');
@@ -2349,6 +2513,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         ...spec, goalId: input.goalId, dependencies, idempotencyKey: `${input.idempotencyKey}:delivery:${index}`,
         // Every leg persists the same project override so the chain stays on one project.
         project: input.project,
+        // ...and the same code repo, explicit or inferred from the spec, so no leg lands in the business repo.
+        ...(input.codeRepoPath !== undefined ? { codeRepoPath: input.codeRepoPath } : {}),
         // One delivery is one lane: every leg works in the same tree and branch, whoever claims it.
         workIntent: { kind: spec.kind === 'release' ? 'read' : 'code', lane },
         // Only the implementation leg carries the discipline track; release/deploy legs stay generic.
@@ -2795,6 +2961,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         prHead = checked?.head;
       }
     }
+    if (action === 'submit' && evidence && this.systemCheck) await this.refuseFailedSystemChecks(proof, actor.employeeId);
     // SYS02 AC03: submit and independent accept call the same evaluator. submit binds the new head; accept signs the human
     // criteria in the transaction that moves the task to done. Missing/untrusted/old-head evidence is refused here.
     let acceptance: { head?: string; environment?: string; human: HumanSignoff[] } | undefined;
@@ -6068,6 +6235,75 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
+   * gm only: turn a blocked read-only engineering task into a code task in place (read → code, optional lane), instead of
+   * retiring it and creating a sibling code task. Allowed on the same execute-phase blocks bind_task_code_repo accepts
+   * (owner gates, review-phase blocks and live leases refuse); kind=task only, so the release leg stays a read leg.
+   * Write authority is re-judged under the task's own policy chain, the implement-leg baseline criteria are merged when
+   * the acceptance gate is on, and the read assignment is cleared so the next claim allocates an exclusive code tree.
+   */
+  async taskIntentUpdate(credential: Credential, input: { taskId: TaskId; lane?: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may change a task work intent');
+    requireText(input.taskId, 'task', 1, 200);
+    requireText(input.text, 'evidence', 4, 4000);
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
+    // A replay of the same call returns its first answer, even though the task already carries code intent by then.
+    const idem = this.idemId(actor.employeeId, 'task_intent_update', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ taskId: input.taskId, lane: input.lane ?? null, expectedVersion: input.expectedVersion, text: input.text }));
+    const replay = await this.replay(idem, digest);
+    if (replay) return replay;
+    const row = await this.taskRowWithProject(input.taskId);
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    if ((row.kind ?? 'task') !== 'task' || row.executor_role !== 'engineering') {
+      throw new CompanyError('forbidden', 'Only engineering tasks of kind=task can become code tasks');
+    }
+    if (row.work_intent?.kind === 'code') throw new CompanyError('conflict', 'Task already has code intent');
+    if (row.work_intent?.kind === 'assets') throw new CompanyError('forbidden', 'Asset tasks keep their directory scope');
+    const intent: WorkIntent = { kind: 'code', ...(input.lane ?? row.work_intent?.lane ? { lane: input.lane ?? row.work_intent!.lane } : {}) };
+    validateIntent(intent);
+    const goalId = row.goal ? asId(row.goal) : undefined;
+    const { contract } = await this.effectiveContractFor(this.chainOfRow(row));
+    const verdict = checkWriteAuthority(contract, { role: 'engineering', kind: 'task', ...(goalId ? { goalId } : {}), intent });
+    if (!verdict.ok) throw new CompanyError(verdict.code, `策略拒绝改为 code：${verdict.reason}（policy v${contract.version}）`);
+    let criteria: AcceptanceCriterion[];
+    try { criteria = validateAcceptanceCriteria(row.acceptance_criteria); } catch { criteria = []; }
+    if ((await loadAcceptanceGate(this.db)).enabled) criteria = mergeAcceptanceCriteria('implement', criteria);
+    const evidence = `${input.text}\n[intent] ${row.work_intent?.kind ?? 'none'} -> code${intent.lane ? ` lane=${intent.lane}` : ''}`;
+    try {
+      const next = await this.txTask(`BEGIN;
+        LET $t = SELECT * FROM ONLY $task;
+        IF $t = NONE { THROW 'task not found' };
+        IF $t.version != $expected { THROW 'task version moved' };
+        IF $t.state != 'blocked' { THROW 'intent change denied: only blocked tasks can change intent' };
+        IF $t.blocked_to = 'owner' { THROW 'intent change denied: owner blocked task' };
+        IF $t.resume_state = 'review' { THROW 'intent change denied: review-phase task' };
+        IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'intent change denied: active lease' };
+        LET $next = UPDATE ONLY $task SET
+          work_intent = $intent, acceptance_criteria = $criteria, acceptance_version = $criteria_version,
+          worktree = NONE, current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE, handover = NONE,
+          version = $t.version + 1 RETURN AFTER;
+        UPDATE employee SET active_task = NONE WHERE active_task = $task;
+        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'task_intent_update', evidence: $evidence, version: $next.version, at: time::now() };
+        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+        CREATE ONLY $outbox CONTENT { task: $task, kind: 'task_intent_updated', sequence: $sequence.value,
+          payload: { intent: $intent, version: $next.version }, at: time::now() };
+        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
+        RETURN $next;
+        COMMIT;`, {
+        actor: id('employee', actor.employeeId), task: id('task', input.taskId), intent,
+        criteria: criteria.length ? criteria : undefined, criteria_version: criteria.length ? ACCEPTANCE_CRITERIA_VERSION : undefined,
+        expected: input.expectedVersion, evidence, idem, digest,
+        audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+      });
+      return echoTask(view(next));
+    } catch (error) {
+      const replayed = await this.replay(idem, digest);
+      if (replayed) return replayed;
+      throw error;
+    }
+  }
+
+  /**
    * gm only: bind an explicit code repository (code_repo_path) to a blocked execute-phase task.
    * Only workspace allocation, worktree registration and dispatch repoHome/cwd follow the
    * binding — the business project (taskProject → claim.json.project, opsScope, broker
@@ -6159,7 +6395,17 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return summarizeModelEvidence(rows ?? []);
   }
 
-  async recordScore(credential: Credential, input: { taskId: TaskId; summary: string; scores: EmployeeScore[] }): Promise<{ recorded: number; participants: string[] }> {
+  async taskCost(credential: Credential, taskId: TaskId): Promise<TaskCost | { taskId: TaskId; available: false; reason: string }> {
+    const actor = await this.authorized(credential);
+    if (!['eval', 'gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Only eval, gm or product may read task cost');
+    requireText(taskId, 'task', 1, 200);
+    const row = await this.db.select<TaskRow>(id('task', taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    const cost = await readTaskCost(this.db, taskId) ?? (row.state === 'done' ? await recordTaskCost(this.db, taskId) : undefined);
+    return cost ?? { taskId, available: false, reason: row.state === 'done' ? '没有该任务的租约模型请求记录，或 Magpie 用量暂不可读' : '任务未完成，完成后结算成本' };
+  }
+
+  async recordScore(credential: Credential, input: { taskId: TaskId; summary: string; scores: EmployeeScore[]; complexity?: number }): Promise<{ recorded: number; participants: string[] }> {
     const actor = await this.authorized(credential);
     if (actor.role !== 'eval') throw new CompanyError('forbidden', 'Only eval employees may record scores');
     requireText(input.summary, 'summary', 1, 20000);
@@ -6176,9 +6422,12 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (invalid) throw new CompanyError('invalid', invalid);
     for (const s of input.scores) if (s.notes !== undefined) requireText(s.notes, 'notes', 0, 4000);
 
+    if (input.complexity !== undefined && (!Number.isFinite(input.complexity) || input.complexity < 1 || input.complexity > 5)) {
+      throw new CompanyError('invalid', 'complexity must be 1-5');
+    }
     return writeScorecards(this.db, {
       taskId: input.taskId, summary: input.summary, judge: actor.employeeId, judgeKind: 'llm',
-      scores: input.scores, state,
+      scores: input.scores, state, ...(input.complexity !== undefined ? { complexity: input.complexity } : {}),
     });
   }
 

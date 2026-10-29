@@ -107,6 +107,7 @@ test('real SDK initialize/list/call and authenticated core identity', async () =
     expect(tools).toContain('project_disciplines_update');
     expect(tools).toContain('defer_task_until');
     expect(tools).toContain('bind_task_code_repo');
+    expect(tools).toContain('task_intent_update');
     expect(tools).toContain('goal_acceptance_preview');
     expect(tools).toContain('goal_acceptance_repair');
     expect(tools).toContain('implementer_takeover');

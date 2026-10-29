@@ -97,11 +97,14 @@ export function evalPrompt(inst: EmployeeInst, task: SupervisedTask, env: Prompt
    get_context 带 taskId 只读该任务，答复不含公司块（companyIncluded 为 false）；若返回 response_too_large，任务正文用 read_task_text 分段读取。需要公司方向、目标与项目时，按答复中的 companyRead 字段，用 {"scope":"company","pageSize":25} 分页读取，逐页用 page.nextCursor 作为 cursor 续读，直到 page.hasMore 为 false；不要为此改用 includeCompany。
    history 里出现的员工编号（claim/checkpoint/submit/review/revoked 的 actor 或 payload）即参与者；dispatcher、owner、gm-relay 不是员工，不评分。
    ${call.replace('<工具名>', 'get_model_evidence').replace('<JSON参数>', JSON.stringify({ taskId: task.id }))}
-   返回每位参与者实际用过的模型集合（每个模型的调用次数、fence、阶段与首末时间），按 fence/phase 关联完整提交与退回历史；modelScores 须恰好覆盖该员工的集合。record_score 报错会直接写明缺哪些模型、哪个模型不属于该员工，照着改一次即可；禁止用 record_score 反复试探模型名，证据读不到就 report_blocker。任务最终验收后结算，返工中不结算。为每个实际参与模型提供 modelScores:[{model,overall,notes}]，区分返工责任和修复贡献；基础设施故障不扣模型质量，不按请求次数分配质量。同一模型整轮只记一次。
-2. 对每位参与者按 1–5 分打分（可以取 0.5 步进）：quality 交付质量、evidence 证据是否真实完整、discipline 流程纪律（是否及时 checkpoint、按协议操作、是否中断导致交接）、timeliness 推进效率，再加 overall 总分与 notes 评语。
-   被中断收回租约的员工 discipline/timeliness 应偏低；接手交接并完成好的员工可给高分。评审的是这一轮的行为，不看资历。你的评分会进入该员工定义的 avg_score，直接影响同类员工以后接到任务的概率，请客观。
+   ${call.replace('<工具名>', 'get_task_cost').replace('<JSON参数>', JSON.stringify({ taskId: task.id }))}
+   返回本任务的 token、金额（USD）、模型耗时与从建单到验收的总时长，按员工拆分。
+   get_model_evidence 返回每位参与者实际用过的模型集合（每个模型的调用次数、fence、阶段与首末时间），按 fence/phase 关联完整提交与退回历史；modelScores 须恰好覆盖该员工的集合。record_score 报错会直接写明缺哪些模型、哪个模型不属于该员工，照着改一次即可；禁止用 record_score 反复试探模型名，证据读不到就 report_blocker。任务最终验收后结算，返工中不结算。为每个实际参与模型提供 modelScores:[{model,overall,notes}]，区分返工责任和修复贡献；基础设施故障不扣模型质量，不按请求次数分配质量。同一模型整轮只记一次。
+2. 先给任务本身的 complexity（1–5：1 是改一行、查一个事实；3 是一个模块内的完整改动；5 是跨模块、需要设计与多轮验证），按任务正文与实际改动判断，不按耗时或成本反推。
+   再对每位参与者按 1–5 分打分（可以取 0.5 步进）：quality 交付质量、evidence 证据是否真实完整、discipline 流程纪律（是否及时 checkpoint、按协议操作、是否中断导致交接）、timeliness 推进效率，再加 overall 总分与 notes 评语。
+   系统会在你的 overall 之上按规则校准：退回、租约收回、系统检查退回的提交各有扣分，作者还会按同复杂度任务的成本与时长中位数加减分；你看到的成本只用来评价效率，不要重复扣同一件事。被中断收回租约的员工 discipline/timeliness 应偏低；接手交接并完成好的员工可给高分。评审的是这一轮的行为，不看资历。你的评分会进入该员工定义的 avg_score，直接影响同类员工以后接到任务的概率，请客观。
 3. 上报（scores 覆盖全部参与者，缺一不可；若确实没有参与者就传空数组）：
-   ${call.replace('<工具名>', 'record_score').replace('<JSON参数>', `{"taskId":"${task.id}","summary":"<本轮一句话总结>","scores":[{"employee":"<员工编号>","quality":4,"evidence":4,"discipline":4,"timeliness":4,"overall":4,"notes":"<评语>"}]}`)}
+   ${call.replace('<工具名>', 'record_score').replace('<JSON参数>', `{"taskId":"${task.id}","summary":"<本轮一句话总结>","complexity":3,"scores":[{"employee":"<员工编号>","quality":4,"evidence":4,"discipline":4,"timeliness":4,"overall":4,"notes":"<评语>"}]}`)}
    调用成功（返回 recorded 数）即完成本轮，不要空转等待。`;
   return firstContact ? `${onboarding(inst, env, ctx?.comm ?? false, ctx?.commDir)}\n\n${body}` : body;
 }

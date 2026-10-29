@@ -180,6 +180,9 @@ export class CompanyDatabase {
     // 行为退回固定时间等待（RB01：不误派、不误关）。
     await this.db.query(loadSchema('044-review-events.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 44 WHERE schema_version < 44;');
+    // 任务成本（编号 045）：Magpie 逐请求用量按任务汇总的 task_cost 表。只新增表；旧版忽略（RB01）。
+    await this.db.query(loadSchema('045-task-cost.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 45 WHERE schema_version < 45;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

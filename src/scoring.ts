@@ -4,6 +4,7 @@ import { RecordId, type Surreal } from 'surrealdb';
 import { scoreModels } from './model-routing/store.ts';
 import { QUOTA_RELEASE } from './dispatcher/quota-failure.ts';
 import type { EmployeeScore, Role, TaskId } from './contracts.ts';
+import { costBaseline, readTaskCost, recordTaskCost, type TaskCost, type UsageFetch } from './task-cost.ts';
 
 const HASH = (value: string) => createHash('sha256').update(value).digest('hex');
 const asId = (record: RecordId | string): string => record instanceof RecordId ? String(record.id) : record;
@@ -11,6 +12,8 @@ const id = (table: string, key: string): RecordId => new RecordId(table, key);
 
 export interface EvalMetrics {
   claims: number; checkpoints: number; submits: number; reviews: number; returnsReceived: number; revocations: number;
+  /** Submits the system checks refused before review (submit_check_failed). */
+  checkFailures?: number;
 }
 
 export interface EvalTimelineEntry { at: string; action: string; actor: string; evidence?: string }
@@ -29,6 +32,8 @@ export interface EvalState {
   timeline: EvalTimelineEntry[];
   timelineTruncated?: boolean;
   modelExecutions?: Array<{employee:string;model?:string;fence:number;phase:string;at:string;ended_at?:string}>;
+  /** What the task consumed (tokens, USD, model time, elapsed), when Magpie usage was readable. */
+  cost?: TaskCost;
 }
 
 const TIMELINE_LIMIT = 40;
@@ -90,6 +95,7 @@ export async function collectEvalState(db: Surreal, taskId: TaskId, excludeEmplo
     if (r.action === 'claim') m.claims++;
     else if (r.action === 'checkpoint') m.checkpoints++;
     else if (r.action === 'submit') { m.submits++; lastSubmitter = emp; }
+    else if (r.action === 'submit_check_failed') m.checkFailures = (m.checkFailures ?? 0) + 1;
     else if (r.action === 'accept' || r.action === 'return') {
       m.reviews++;
       if (r.action === 'return' && lastSubmitter && lastSubmitter !== emp) metric(lastSubmitter).returnsReceived++;
@@ -105,7 +111,9 @@ export async function collectEvalState(db: Surreal, taskId: TaskId, excludeEmplo
   const [modelExecutions] = await db.query<[NonNullable<EvalState['modelExecutions']>]>(
     "SELECT employee,model,fence,phase,<string>at AS at,<string>ended_at AS ended_at FROM model_execution WHERE task=$task AND completed=true AND status>=200 AND status<300 AND phase!='auxiliary' ORDER BY at ASC LIMIT 2001;", {task});
   if (modelExecutions.length>2000) throw new Error("Model evidence exceeds 2000 executions; final evaluation requires a complete timeline");
+  const cost = await readTaskCost(db, taskId).catch(() => undefined);
   return {
+    ...(cost ? { cost } : {}),
     modelExecutions:modelExecutions.filter(r=>!r.model||!generatedModel(r.model)),
     timelineTruncated:auditRows.length>TIMELINE_LIMIT,
     taskId, goalId: row.goal ? asId(row.goal) : undefined,
@@ -142,6 +150,55 @@ export function summarizeModelEvidence(rows: NonNullable<EvalState['modelExecuti
   return [...by].sort(([a], [b]) => a.localeCompare(b)).map(([employee, models]) => ({
     employee, models: [...models.values()].sort((a, b) => a.model.localeCompare(b.model)).map(m => ({ ...m, fences: m.fences.sort((a, b) => a - b) })),
   }));
+}
+
+/**
+ * Rule-based calibration the judge cannot override: the LLM's overall is kept as judge_overall, and the overall that
+ * feeds every average is the judge's score minus deductions for facts in the audit trail, plus an efficiency step
+ * against the median cost and elapsed time of other tasks of the same complexity (authors only: reviewers do not drive
+ * a task's cost). Every step names its basis so an employee can see why a score moved.
+ */
+export interface Calibration {
+  judgeOverall: number;
+  overall: number;
+  complexity: number;
+  adjustments: Array<{ code: string; points: number; basis: string }>;
+  usd?: number; elapsedSeconds?: number;
+  baseline?: { usd: number; elapsedSeconds: number; samples: number };
+}
+
+const clampScore = (x: number) => Math.min(5, Math.max(1, Math.round(x * 100) / 100));
+
+export function calibrate(input: {
+  judgeOverall: number; metrics?: EvalMetrics; complexity: number; author: boolean;
+  cost?: Pick<TaskCost, 'usd' | 'elapsedSeconds'>; baseline?: Calibration['baseline'];
+}): Calibration {
+  const m = input.metrics;
+  const adjustments: Calibration['adjustments'] = [];
+  const deduct = (code: string, count: number, each: number, cap: number, basis: string) => {
+    if (count > 0) adjustments.push({ code, points: -Math.min(cap, count * each), basis });
+  };
+  deduct('returns', m?.returnsReceived ?? 0, 0.5, 1.5, `被退回 ${m?.returnsReceived ?? 0} 次`);
+  deduct('revocations', m?.revocations ?? 0, 0.5, 1, `租约被收回 ${m?.revocations ?? 0} 次`);
+  deduct('check_failures', m?.checkFailures ?? 0, 0.5, 1, `系统检查退回提交 ${m?.checkFailures ?? 0} 次`);
+  const { cost, baseline } = input;
+  if (input.author && cost && baseline && cost.usd > 0 && cost.elapsedSeconds) {
+    const ratio = Math.max(cost.usd / baseline.usd, cost.elapsedSeconds / baseline.elapsedSeconds);
+    const basis = `成本 $${cost.usd.toFixed(4)}/中位 $${baseline.usd.toFixed(4)}，耗时 ${Math.round(cost.elapsedSeconds / 60)}/${Math.round(baseline.elapsedSeconds / 60)} 分钟（复杂度 ${input.complexity}，${baseline.samples} 个样本）`;
+    if (ratio > 4) adjustments.push({ code: 'efficiency', points: -1, basis });
+    else if (ratio > 2) adjustments.push({ code: 'efficiency', points: -0.5, basis });
+    else if (ratio < 0.5 && !adjustments.length) adjustments.push({ code: 'efficiency', points: 0.5, basis });
+  }
+  const total = adjustments.reduce((a, x) => a + x.points, 0);
+  // No rule fired: the judge's score stands exactly as given.
+  return { judgeOverall: input.judgeOverall, overall: adjustments.length ? clampScore(input.judgeOverall + total) : input.judgeOverall, complexity: input.complexity, adjustments,
+    ...(cost ? { usd: cost.usd, ...(cost.elapsedSeconds !== undefined ? { elapsedSeconds: cost.elapsedSeconds } : {}) } : {}),
+    ...(baseline ? { baseline } : {}) };
+}
+
+/** Task complexity 1-5 as the judge rated it; 3 when not given. */
+export function clampComplexity(x: unknown): number {
+  return typeof x === 'number' && Number.isFinite(x) ? Math.min(5, Math.max(1, Math.round(x))) : 3;
 }
 
 export interface ScoredEmployee extends EmployeeScore {
@@ -182,13 +239,22 @@ export function validateScores(state: EvalState, scores: EmployeeScore[]): strin
  */
 export async function writeScorecards(
   db: Surreal,
-  input: { taskId: TaskId; summary: string; judge: string; judgeKind: 'llm' | 'jev'; scores: ScoredEmployee[]; state: EvalState; topPerformer?: string },
+  input: { taskId: TaskId; summary: string; judge: string; judgeKind: 'llm' | 'jev'; scores: ScoredEmployee[]; state: EvalState; topPerformer?: string;
+    complexity?: number; fetchUsage?: UsageFetch },
 ): Promise<{ recorded: number; participants: string[] }> {
   const invalid = validateScores(input.state,input.scores);
   if(invalid) throw new Error(invalid);
   const task = id('task', input.taskId);
   const written = new Set<string>();
-  for (const s of input.scores) {
+  // The cost is settled before the raw model_execution rows become prunable (they are kept until evaluated_at).
+  const cost = input.state.cost ?? await recordTaskCost(db, input.taskId, input.fetchUsage).catch(() => undefined);
+  const complexity = clampComplexity(input.complexity);
+  if (cost) await db.query('UPDATE $c SET complexity = $complexity RETURN NONE;', { c: id('task_cost', input.taskId), complexity });
+  const baseline = cost ? await costBaseline(db, complexity, input.taskId).catch(() => undefined) : undefined;
+  for (const judged of input.scores) {
+    const calibration = calibrate({ judgeOverall: judged.overall, metrics: input.state.metrics[judged.employee], complexity,
+      author: (input.state.metrics[judged.employee]?.submits ?? 0) > 0, ...(cost ? { cost } : {}), ...(baseline ? { baseline } : {}) });
+    const s = { ...judged, overall: calibration.overall };
     const emp = await db.select<{ role?: Role; def?: RecordId; provider?: string; model?: string }>(id('employee', s.employee));
     await db.query(`UPSERT $card CONTENT { task: $task, goal: $goal, employee: $emp, role: $role, def: $def,
       provider: $provider, model: $model, quality: $quality, evidence: $evidence, discipline: $discipline,
@@ -202,6 +268,8 @@ export async function writeScorecards(
       overall: s.overall, notes: s.notes, metrics: input.state.metrics[s.employee], by: input.judge,
       judgeKind: input.judgeKind, confidence: s.confidence, probabilities: s.probabilities, flagged: s.flagged === true,
     });
+    await db.query('UPDATE $card SET judge_overall = $judge, calibration = $calibration RETURN NONE;',
+      { card: id('scorecard', HASH(`${input.taskId}${s.employee}`).slice(0, 24)), judge: judged.overall, calibration });
     const actualModels = await scoreModels(db, input.taskId, s.employee, s.overall, s.modelScores);
     await db.query('UPDATE $card SET model_scores=$assessments,configured_model=$configured,model=$model,actual_models=$models, model_attribution=$basis RETURN NONE;', {card: id('scorecard', HASH(`${input.taskId}${s.employee}`).slice(0,24)), assessments:s.modelScores,models:actualModels, configured:emp?.model,model:actualModels.length===1?actualModels[0]:actualModels.length?'mixed':'unknown', basis:actualModels.length ? 'gateway-completed-requests' : 'unknown'});
     written.add(s.employee);
