@@ -52,6 +52,7 @@ interface GoalRow {
   title: string;
   brief: string;
   state: GoalView['state'];
+  version?: number;
   tier?: GoalTier;
   project?: RecordId;
   pipeline?: string;
@@ -372,7 +373,14 @@ export class OwnerDesk {
       if (!progressed) break;
     }
     const [left] = await this.db.query<[Array<{ id: RecordId }>]>("SELECT id FROM task WHERE goal = $goal AND state NOT IN ['done', 'void'];", { goal });
-    if (!left.length && row.state !== 'cancelled') await this.db.query("UPDATE $goal SET state = 'cancelled', cancelled_at = time::now(), note = $note;", { goal, note: `${input.source} 取消：${input.note}` });
+    if (!left.length && row.state !== 'cancelled') await this.run(`BEGIN;
+      LET $g = SELECT * FROM ONLY $goal;
+      IF $g = NONE OR ($g.version ?? 0) != $version OR $g.state != $state { THROW 'goal version moved' };
+      IF array::len(SELECT id FROM task WHERE goal=$goal AND state NOT IN ['done','void']) > 0 { THROW 'goal still has unfinished work' };
+      UPDATE ONLY $goal SET state='cancelled', cancelled_at=time::now(), note=$note,
+        version=($g.version??0)+1, needs_repair=false, needs_repair_reason=NONE, needs_repair_at=NONE;
+      CREATE audit CONTENT {goal:$goal, actor:$actor, action:'goal_cancelled', evidence:$note, at:time::now()};
+      COMMIT;`, {goal, version:row.version??0, state:row.state, actor:input.source, note:`${input.source} 取消：${input.note}`});
     return { retired, remaining: left.length };
   }
 

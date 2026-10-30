@@ -798,3 +798,32 @@ test('explicit scope exclusion requires an already approved owner final gate, ne
   if(approved)expect((await request).state).toBe('done');else{await expect(request).rejects.toThrow();expect((await database.db.select<any>(new RecordId('task',f.gateId)))!.state).toBe('blocked');}
  }
 });
+
+test('a recursive story has no software gate fallback; book confirmation must be explicitly bound', async () => {
+  const {GoalGovernanceStore}=await import('../src/goal-store.ts');const store=new GoalGovernanceStore(database.db);
+  const {goalId,manualId}=await seedGoal({id:'recursive-story',outcomeRequired:['owner_final']});
+  await database.db.query("UPDATE ONLY $g SET pipeline='story',tasks.acceptance=NONE,anchors=[];",{g:new RecordId('goal',goalId)});
+  const chapter=await makeTask(goalId,'章概要',{state:'review',reviewer_role:'owner'});
+  let card=(await store.card(goalId))!;
+  expect(card.finalGate.taskId).toBeUndefined();expect(card.needsRepair).toBe(false);expect(card.readyToComplete).toBe(false);
+  const gate=await makeTask(goalId,'全书完成确认',{kind:'gate',state:'blocked',reviewer_role:'owner',dependencies:[new RecordId('task',chapter)]});
+  const preview=await store.finalGatePreview({goalId,candidateTaskId:gate});expect(preview.ready).toBe(true);
+  await store.finalGateRepair({goalId,candidateTaskId:gate,expectedGoalVersion:preview.goalVersion,snapshotHash:preview.snapshot.hash,actor:'owner:test',reason:'绑定故事产线全书完成确认',idempotencyKey:randomUUID()});
+  card=(await store.card(goalId))!;expect(card.finalGate.taskId).toBe(gate);expect(card.readyToComplete).toBe(false);
+  const [g]=await database.db.query<any>('SELECT tasks.manual,anchors FROM ONLY $g;',{g:new RecordId('goal',goalId)});
+  expect(String(g.tasks.manual)).toBe(String(new RecordId('task',manualId)));
+  expect(g.anchors.map(String)).toContain(String(new RecordId('task',gate)));
+});
+
+
+test('the real plan-only story template first binding preserves its plan anchor and does not create manual acceptance', async () => {
+  const {GoalGovernanceStore}=await import('../src/goal-store.ts');const store=new GoalGovernanceStore(database.db);
+  const {goalId,manualId}=await seedGoal({id:'plan-only-story',outcomeRequired:['owner_final']});
+  await database.db.query("UPDATE ONLY $g SET pipeline='story',tasks={plan:$plan},anchors=[$plan];",{g:new RecordId('goal',goalId),plan:new RecordId('task',manualId)});
+  const gate=await makeTask(goalId,'全书完成确认',{kind:'gate',state:'ready',reviewer_role:'owner'});
+  const preview=await store.finalGatePreview({goalId,candidateTaskId:gate});expect(preview.ready).toBe(true);
+  await store.finalGateRepair({goalId,candidateTaskId:gate,expectedGoalVersion:preview.goalVersion,snapshotHash:preview.snapshot.hash,actor:'owner:test',reason:'首绑真实故事模板全书终验',idempotencyKey:randomUUID()});
+  const [g]=await database.db.query<any>('SELECT tasks,anchors FROM ONLY $g;',{g:new RecordId('goal',goalId)});
+  expect(g.tasks.manual).toBeUndefined();expect(String(g.tasks.plan)).toBe(String(new RecordId('task',manualId)));
+  expect(g.anchors.map(String)).toEqual([String(new RecordId('task',manualId)),String(new RecordId('task',gate))]);
+});
