@@ -537,3 +537,32 @@ run('a large goal closes in stages: open follow-ups move to a next-phase goal an
   // A replay returns the same next goal and moves nothing again.
   expect((await C.goalPhaseSplit(gm, { goalId: goal.id, taskIds: [followA.id, followB.id], title: '下一阶段 fixture', reason: '分阶段 fixture', idempotencyKey: idem })).nextGoalId).toBe(split.nextGoalId);
 });
+
+run('phase split re-evaluates an owner-approved retained stage without reopening its historical edges',async()=>{
+ const C=new SurrealCompanyCore(db);
+ const g=await C.relayGoal(gm,{text:'阶段收口回归：已验收第一阶段与延后交付分开',ownerQuote:'老板授权将后续交付拆到第二阶段，第一阶段按真实验收关闭',tier:'standard',idempotencyKey:key()});
+ const follow=await C.createTask(gm,{goalId:g.id,title:'第二阶段独立后续工作',context:'下一阶段交付，不能被第一阶段完成冒充',executorRole:'engineering',reviewerRole:'qa',idempotencyKey:key()});
+ const historical=await C.createTask(gm,{goalId:g.id,title:'第一阶段已验收历史工作',context:'已验收历史引用保持原样',executorRole:'engineering',reviewerRole:'qa',dependencies:[follow.id],idempotencyKey:key()});
+ await db.db.query('UPDATE task SET state="done",accepted_by="owner",current_employee=NONE WHERE goal=$goal AND id!=$follow;', {goal:new RecordId('goal',g.id),follow:new RecordId('task',follow.id)});
+ const split=await C.ownerGoalPhaseSplit('test',{goalId:g.id,taskIds:[follow.id],title:'第二阶段独立交付回归',reason:'老板已验收本阶段，将尚未完成的后续工作完整迁入下一阶段，不复用本阶段批准',idempotencyKey:key()});
+ const old=await db.db.select<any>(new RecordId('goal',g.id)),next=await db.db.select<any>(new RecordId('goal',split.nextGoalId));
+ expect(old!.state).toBe('done');expect(next!.state).not.toBe('done');
+ const retained=await db.db.select<any>(new RecordId('task',historical.id));expect(retained!.dependencies.map(asId)).toContain(follow.id);
+ const moved=await db.db.select<any>(new RecordId('task',follow.id));expect(asId(moved!.goal)).toBe(split.nextGoalId);expect(moved!.state).not.toBe('done');
+});
+
+run('phase-split retry preserves completed next anchors and refuses leased anchors',async()=>{
+ for(const scenario of ['done','leased']){
+  const C=core();const g=await C.relayGoal(gm,{text:`分阶段恢复边界 ${scenario}`,ownerQuote:'老板授权分阶段并保留既有执行状态',tier:'standard',idempotencyKey:key()});
+  const work=await C.createTask(gm,{goalId:g.id,title:'待移动真实后续任务',context:'需要下一阶段继续完成',executorRole:'engineering',reviewerRole:'qa',idempotencyKey:key()});
+  // Fault injection between durable next-goal creation and the phase-split transaction.
+  const owner=(C as unknown as {owner:import('../src/owner.ts').OwnerDesk}).owner;
+  const create=owner.createGoal.bind(owner);let first:string|undefined;
+  owner.createGoal=async input=>{const next=await create(input);const row=await db.db.select<any>(new RecordId('goal',next.id));first=asId(row!.anchors[0]);
+   await db.db.query(scenario==='done'?'UPDATE ONLY $task SET state="done";':'UPDATE ONLY $task SET current_employee=$holder,lease_expires_at=time::unix(time::now())+3600;', {task:new RecordId('task',first),holder:new RecordId('employee','fixture-holder')});return next;};
+  const split=C.ownerGoalPhaseSplit('test',{goalId:g.id,taskIds:[work.id],title:'下一阶段恢复边界回归',reason:'回归模拟创建下一阶段后首锚点先行完成或被认领，不能改写既有状态',idempotencyKey:key()});
+  if(scenario==='leased'){
+   await expect(split).rejects.toThrow();expect(asId((await db.db.select<any>(new RecordId('task',work.id)))!.goal)).toBe(g.id);
+  }else{await split;expect((await db.db.select<any>(new RecordId('task',first!)))!.state).toBe('done');}
+ }
+});

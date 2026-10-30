@@ -391,7 +391,8 @@ describe('whole-database external dependency classification', () => {
     for (const id of [unscopedDone, unscopedVoid, otherDoneTask, otherBlockedTask]) {
       expect(messages.some(message => message.includes(id) && message.includes('不存在'))).toBe(false);
     }
-    expect(messages.some(message => message.includes(unscopedDone) && message.includes('external/unscoped'))).toBe(true);
+    expect(messages.some(message => message.includes(unscopedDone))).toBe(false);
+    expect(messages.some(message => message.includes(unscopedVoid) && message.includes('external/unscoped'))).toBe(true);
     expect(messages.some(message => message.includes(otherBlockedTask) && message.includes('blocked'))).toBe(true);
     // Removing dangling does not flatten the goal: it still needs repair and is not ready to complete.
     expect(card.needsRepair).toBe(true);
@@ -734,4 +735,66 @@ describe('business metrics (AC04/AC05)', () => {
     await expectRefused(core.goalMetrics(tokens.gm!, { timezone: 'Mars/Base' }), 'invalid', /IANA/);
     await expectRefused(core.goalMetrics(tokens.eng!, {}), 'forbidden', /经理|Capability denied/);
   });
+});
+
+describe('audited historical retired work resolution',()=>{
+ test('an owner can classify a retired fixture and bind real completed replacement work without changing task history',async()=>{
+  const {GoalGovernanceStore}=await import('../src/goal-store.ts');const store=new GoalGovernanceStore(database.db);
+  const f=await seedGoal({id:'phase-retired',acceptedBy:'owner',outcomeRequired:['implementation','owner_final']});
+  const fixture=await makeTask(f.goalId,'历史QA夹具',{state:'void'}),old=await makeTask(f.goalId,'误建后重建工作',{state:'void'}),replacement=await makeUnscopedTask('真实已交付重建任务');
+  const original=await database.db.select(new RecordId('task',old));
+  const resolve=async(taskId:string,replacements:string[])=>{const g=await database.db.select<any>(new RecordId('goal',f.goalId));const t=await database.db.select<any>(new RecordId('task',taskId));return store.resolveRetiredWork({goalId:f.goalId,taskId,goalVersion:g!.version,taskVersion:t!.version,replacementTaskIds:replacements,disposition:replacements.length?'replaced':'fixture',reason:'老板核查历史审计与交付记录后修正分类，不放宽实际实现要求',actor:'owner:test',key:taskId});};
+  expect((await store.card(f.goalId))!.readyToComplete).toBe(false);
+  await resolve(fixture,[]);await resolve(old,[replacement]);
+  const afterResolution=await database.db.select<any>(new RecordId('task',old));delete afterResolution!.goal_completion_guard;expect(afterResolution).toEqual(original);
+  const result=await store.finalize(f.goalId,'owner:test');expect(result.state).toBe('done');expect(result.card.goalComplete).toBe(true);
+  const [audit]=await database.db.query<any>('SELECT action FROM audit WHERE task=$task AND action="goal_retired_work_resolved";',{task:new RecordId('task',old)});expect(audit).toHaveLength(1);
+  // A reopened replacement invalidates the previous disposition on every read; no cached success.
+  await database.db.query('UPDATE ONLY $task SET state="ready";',{task:new RecordId('task',replacement)});
+  expect((await store.card(f.goalId))!.repairReasons.some(r=>r.code==='implementation_void')).toBe(true);
+ });
+ test('resolution refuses non-owner, stale versions, live tasks, final gates and uncompleted replacements',async()=>{
+  const {GoalGovernanceStore}=await import('../src/goal-store.ts');const store=new GoalGovernanceStore(database.db);
+  const f=await seedGoal({id:'phase-resolution-guards',acceptedBy:'owner',outcomeRequired:['implementation','owner_final']});
+  const old=await makeTask(f.goalId,'历史作废工作',{state:'void'}),replacement=await makeUnscopedTask('未完成重建',{state:'blocked'});
+  const t=await database.db.select<any>(new RecordId('task',old));
+  const input={goalId:f.goalId,taskId:old,goalVersion:0,taskVersion:t!.version,disposition:'fixture' as const,replacementTaskIds:[],reason:'老板核对该任务仅为受控QA测试夹具不代表产品实现',actor:'owner:test',key:'guard'};
+  for(const over of [{actor:'employee:gm'},{goalVersion:99},{taskVersion:99},{taskId:f.manualId},{taskId:f.gateId},{disposition:'replaced' as const,replacementTaskIds:[replacement]}])await expect(store.resolveRetiredWork({...input,...over})).rejects.toThrow();
+ });
+});
+
+test('a committed disposition replay retries finalization after a transient failure',async()=>{
+ const {GoalGovernanceStore}=await import('../src/goal-store.ts');const store=new GoalGovernanceStore(database.db);
+ const f=await seedGoal({id:'phase-finalize-retry',acceptedBy:'owner',outcomeRequired:['implementation','owner_final']});
+ const old=await makeTask(f.goalId,'历史测试夹具',{state:'void'});const t=await database.db.select<any>(new RecordId('task',old));
+ const input={goalId:f.goalId,taskId:old,goalVersion:0,taskVersion:t!.version,disposition:'fixture' as const,replacementTaskIds:[],reason:'老板核查该记录只属于历史QA夹具，不代表尚未交付功能',actor:'owner:test',key:'retry-finalize'};
+ const finalize=store.finalize.bind(store);store.finalize=async()=>{throw Error('transient finalize failure');};
+ await expect(store.resolveRetiredWork(input)).rejects.toThrow('transient');store.finalize=finalize;
+ expect((await store.resolveRetiredWork(input)).state).toBe('done');
+ const [audit]=await database.db.query<any>('SELECT id FROM audit WHERE task=$task AND action="goal_retired_work_resolved";',{task:new RecordId('task',old)});expect(audit).toHaveLength(1);
+});
+
+test('a replacement reopened between assessment and completion cannot certify the goal',async()=>{
+ const {GoalGovernanceStore}=await import('../src/goal-store.ts');
+ const f=await seedGoal({id:'phase-completion-race',acceptedBy:'owner',outcomeRequired:['implementation','owner_final']});
+ const old=await makeTask(f.goalId,'历史重建工作',{state:'void'}),replacement=await makeUnscopedTask('跨goal真实替代');const t=await database.db.select<any>(new RecordId('task',old));
+ let injected=false;
+ const wrapped={select:database.db.select.bind(database.db),query:async<T extends unknown[]>(sql:string,vars?:Record<string,unknown>):Promise<T>=>{
+  if(sql.includes('FOR $guard IN $completion_guards')&&!injected){injected=true;await database.db.query('UPDATE ONLY $task SET state="ready",version+=1;',{task:new RecordId('task',replacement)});}
+  return (await database.db.query(sql,vars)) as T;
+ }};
+ const store=new GoalGovernanceStore(wrapped);
+ await expect(store.resolveRetiredWork({goalId:f.goalId,taskId:old,goalVersion:0,taskVersion:t!.version,disposition:'replaced',replacementTaskIds:[replacement],reason:'老板核验旧记录与已验收的真实重建任务对应后登记替代',actor:'owner:test',key:'race'})).rejects.toThrow();
+ expect(injected).toBe(true);expect((await database.db.select<any>(new RecordId('goal',f.goalId)))!.state).not.toBe('done');
+ const [audit]=await database.db.query<any>('SELECT action FROM audit WHERE goal=$goal AND action="goal_completed";',{goal:new RecordId('goal',f.goalId)});expect(audit).toHaveLength(0);
+});
+
+test('explicit scope exclusion requires an already approved owner final gate, never invents an approval',async()=>{
+ const {GoalGovernanceStore}=await import('../src/goal-store.ts');const store=new GoalGovernanceStore(database.db);
+ for(const approved of [false,true]){
+  const f=await seedGoal({id:`excluded-${approved}`,acceptedBy:approved?'owner':undefined,finalState:approved?'done':'blocked',outcomeRequired:['implementation','owner_final']});
+  const old=await makeTask(f.goalId,'已取消的替代方案不代表上线',{state:'void'});const t=await database.db.select<any>(new RecordId('task',old));
+  const request=store.resolveRetiredWork({goalId:f.goalId,taskId:old,goalVersion:0,taskVersion:t!.version,disposition:'excluded',replacementTaskIds:[],reason:'老板确认本阶段终验范围不包含已经取消的替代方案，原业务在下一阶段继续',actor:'owner:test',key:'excluded'});
+  if(approved)expect((await request).state).toBe('done');else{await expect(request).rejects.toThrow();expect((await database.db.select<any>(new RecordId('task',f.gateId)))!.state).toBe('blocked');}
+ }
 });

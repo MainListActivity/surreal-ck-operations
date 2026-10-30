@@ -250,6 +250,7 @@ function activityCardSort(a: GoalCard, b: GoalCard): number {
 }
 
 export class GoalGovernanceStore {
+  private readonly completionGuards=new WeakMap<GoalCard,Array<{task:RecordId;version:number;state:string}>>();
   constructor(private readonly db: GoalDb, private readonly clock: () => number = Date.now) {}
 
   private async now(): Promise<number> {
@@ -388,6 +389,21 @@ export class GoalGovernanceStore {
     const [replacementRows] = taskIds.length ? await this.db.query<[Array<{ task: unknown }>]>(
       "SELECT task FROM audit WHERE task IN $tasks AND action IN ['goal_acceptance_replaced', 'goal_final_gate_replaced'];",
       { tasks: taskIds.map(id => new RecordId('task', id)) }) : [[] as Array<{ task: unknown }>];
+    const [retiredRows]=taskIds.length?await this.db.query<[Array<{task:unknown;actor:string;evidence:string}>]>(
+      "SELECT task,actor,evidence FROM audit WHERE task IN $tasks AND action='goal_retired_work_resolved';",
+      {tasks:taskIds.map(id=>new RecordId('task',id))}):[[]];
+    const dispositions=retiredRows.flatMap(row=>{
+      try{const data=JSON.parse(row.evidence);const task=tasks.find(t=>text(t.id)===text(row.task));
+        if(!row.actor.startsWith('owner:')||!task||task.state!=='void'||task.version!==data.taskVersion||!['fixture','replaced','excluded'].includes(data.disposition)||!Array.isArray(data.replacementTaskIds)||data.replacementTaskIds.some((id:unknown)=>typeof id!=='string'||!id))return [];
+        return [{taskId:text(row.task),disposition:data.disposition as string,replacements:data.replacementTaskIds as string[]}];
+      }catch{return [];}
+    });
+    const replacementIds=[...new Set(dispositions.flatMap(d=>d.replacements))];
+    const [replacementFacts]=replacementIds.length?await this.db.query<[Array<{id:unknown;state:string;version?:number}>]>(
+      'SELECT id,state,version FROM task WHERE id IN $tasks;',{tasks:replacementIds.map(id=>new RecordId('task',id))}):[[]];
+    const completedReplacementIds=new Set(replacementFacts.filter(r=>r.state==='done').map(r=>text(r.id)));
+    const ownerApprovedGoals=new Set(goalRows.filter(g=>{const final=tasks.find(t=>text(t.id)===finalGateId(goalFact(g)));return final?.state==='done'&&final.reviewer_role==='owner'&&final.accepted_by==='owner';}).map(g=>text(g.id)));
+    const resolvedRetiredTaskIds=dispositions.filter(d=>(d.disposition==='fixture'||d.disposition==='excluded'&&ownerApprovedGoals.has(text(tasks.find(t=>text(t.id)===d.taskId)?.goal)))&&d.replacements.length===0||d.disposition==='replaced'&&d.replacements.length>0&&d.replacements.every(id=>completedReplacementIds.has(id))).map(d=>d.taskId);
     const replacedAcceptanceTaskIds = [...new Set((replacementRows ?? []).map(row => text(row.task)))];
     const tasksByGoal = new Map<string, GoalTaskFact[]>();
     for (const row of tasks) {
@@ -437,7 +453,7 @@ export class GoalGovernanceStore {
       const goalWaits = goalTasks.map(task => waitsByTask.get(task.id)).filter((wait): wait is GoalWaitFact => Boolean(wait));
       const goalFaults = goalTasks.map(task => faultsByTask.get(task.id)).filter((fault): fault is GoalFaultFact => Boolean(fault));
       const assessment = assessGoal({
-        goal, tasks: goalTasks, waits: goalWaits, faults: goalFaults,
+        goal, tasks: goalTasks, waits: goalWaits, faults: goalFaults, resolvedRetiredTaskIds,
         ...(outcomes.get(goal.id) ? { outcome: outcomes.get(goal.id)! } : {}),
         evidence: evidence.get(goal.id) ?? [], ...(externalByGoal.get(goal.id) ? { externalDependencies: externalByGoal.get(goal.id)! } : {}),
         ...(replacedAcceptanceTaskIds.length ? { replacedAcceptanceTaskIds } : {}),
@@ -450,7 +466,7 @@ export class GoalGovernanceStore {
         crossGoal: Math.max(0, assessment.graph.crossGoal.length - graphCap),
         unscoped: Math.max(0, assessment.graph.unscoped.length - graphCap),
       };
-      return {
+      const card:GoalCard = {
         ...assessment,
         needsRepair: assessment.needsRepair || goal.state === 'needs_repair',
         blockers: assessment.blockers.slice(0, blockerCap).map(blocker => ({
@@ -475,6 +491,11 @@ export class GoalGovernanceStore {
         ...(goal.needsRepair !== undefined ? { needsRepairStored: goal.needsRepair } : {}),
         taskTotal: goalTasks.length,
       } satisfies GoalCard;
+      const resolved=new Set(resolvedRetiredTaskIds.filter(id=>goalTasks.some(t=>t.id===id)));
+      const replacementSet=new Set(dispositions.filter(d=>resolved.has(d.taskId)).flatMap(d=>d.replacements));
+      this.completionGuards.set(card,[...goalTasks.filter(t=>resolved.has(t.id)||resolved.size>0&&t.id===assessment.finalGate.taskId).map(t=>({task:new RecordId('task',t.id),version:t.version??0,state:t.state})),
+        ...replacementFacts.filter(r=>replacementSet.has(text(r.id))).map(r=>({task:new RecordId('task',text(r.id)),version:r.version??0,state:r.state}))]);
+      return card;
     });
   }
 
@@ -744,6 +765,46 @@ export class GoalGovernanceStore {
     };
   }
 
+  /** Owner-only, audited classification of historical retired work. Never turns a void task into a success. */
+  async resolveRetiredWork(input:{goalId:string;taskId:string;goalVersion:number;taskVersion:number;
+    disposition:'fixture'|'replaced'|'excluded';replacementTaskIds:string[];reason:string;actor:string;key:string}):Promise<GoalCard>{
+    if(!input.actor.startsWith('owner:'))throw Error('only owner may resolve retired work');
+    if(!input.goalId||!input.taskId||!Number.isInteger(input.goalVersion)||!Number.isInteger(input.taskVersion)||
+      !['fixture','replaced','excluded'].includes(input.disposition)||!Array.isArray(input.replacementTaskIds)||input.replacementTaskIds.length>20||
+      input.replacementTaskIds.some(id=>typeof id!=='string'||!id||id===input.taskId)||
+      (input.disposition==='replaced'?input.replacementTaskIds.length===0:input.replacementTaskIds.length!==0)||
+      typeof input.reason!=='string'||input.reason.trim().length<10||input.reason.length>4000||!input.key||input.key.length>200)throw Error('invalid retired work resolution');
+    const replacements=[...new Set(input.replacementTaskIds)];
+    const digest=HASH(JSON.stringify(input)),auditId=new RecordId('audit',`retired-resolution-${HASH(input.goalId+'|'+input.actor+'|'+input.key)}`);
+    const prior=await this.db.select<{payload_digest:string}>(auditId);
+    if(prior){if(prior.payload_digest!==digest)throw Error('resolution key reused');return (await this.finalize(input.goalId,input.actor)).card;}
+    await this.run(`BEGIN;
+      LET $g=SELECT * FROM ONLY $goal;
+      LET $t=SELECT * FROM ONLY $task;
+      IF $g=NONE OR $g.state NOT IN ['active','needs_repair'] OR ($g.version??0)!=$goal_version {THROW 'goal version moved or not active'};
+      IF $t=NONE OR $t.goal!=$goal OR $t.state!='void' OR $t.version!=$task_version {THROW 'task version moved or not retired'};
+      IF $task IN ($g.anchors??[]) OR $task=$g.tasks.acceptance OR $task=$g.tasks.manual OR $task=$g.tasks.plan {THROW 'cannot resolve a goal anchor'};
+      IF $disposition='excluded' {
+        LET $final=SELECT * FROM ONLY ($g.tasks.acceptance??$g.tasks.manual);
+        IF $final=NONE OR $final.state!='done' OR $final.reviewer_role!='owner' OR $final.accepted_by!='owner' {THROW 'scope exclusion requires an approved owner final gate'};
+      };
+      FOR $replacement IN $replacements {
+        LET $r=SELECT * FROM ONLY $replacement;
+        IF $r=NONE OR $r.state!='done' {THROW 'replacement must be completed'};
+      };
+      CREATE ONLY $audit CONTENT {goal:$goal,task:$task,actor:$actor,action:'goal_retired_work_resolved',
+        evidence:$evidence,payload_digest:$digest,at:time::now()};
+      UPDATE ONLY $goal SET version=($g.version??0)+1;
+      LET $sequence=UPDATE ONLY company_meta:outbox_counter SET value+=1 RETURN AFTER;
+      CREATE outbox CONTENT {task:$task,kind:'goal_retired_work_resolved',sequence:$sequence.value,
+        payload:{goal:$goal_key},at:time::now()};
+      COMMIT;`,{goal:new RecordId('goal',input.goalId),task:new RecordId('task',input.taskId),
+      goal_version:input.goalVersion,task_version:input.taskVersion,replacements:replacements.map(id=>new RecordId('task',id)),
+      audit:auditId,actor:input.actor,disposition:input.disposition,digest,goal_key:input.goalId,evidence:JSON.stringify({taskVersion:input.taskVersion,
+        disposition:input.disposition,replacementTaskIds:replacements,reason:input.reason})});
+    return (await this.finalize(input.goalId,input.actor)).card;
+  }
+
   /** Re-evaluate one goal and persist the verdict. Never rewrites a task or an owner decision. */
   async finalize(goalId: string, actor: string, acceptedTaskId?: string): Promise<{ card: GoalCard; changed: boolean; state: string }> {
     const card = await this.card(goalId);
@@ -761,6 +822,11 @@ export class GoalGovernanceStore {
       await this.run(`BEGIN;
         LET $g = SELECT * FROM ONLY $goal;
         IF $g = NONE OR $g.state NOT IN ['active', 'needs_repair'] OR ($g.version ?? 0) != $version { THROW 'goal version moved' };
+        FOR $guard IN $completion_guards {
+          LET $source=SELECT * FROM ONLY $guard.task;
+          IF $source=NONE OR $source.state!=$guard.state OR ($source.version??0)!=$guard.version {THROW 'retired resolution source moved'};
+          UPDATE ONLY $guard.task SET goal_completion_guard=$completion_stamp;
+        };
         LET $next = UPDATE ONLY $goal SET state = 'done', done_at = time::now(), needs_repair = false,
           needs_repair_reason = NONE, outcome_complete = true, outcome_updated_at = time::now(),
           version = ($g.version ?? 0) + 1 RETURN AFTER;
@@ -770,7 +836,7 @@ export class GoalGovernanceStore {
         CREATE outbox CONTENT { task: $final_gate, kind: 'goal_completed', sequence: $sequence.value,
           payload: { goal: $goal_key, version: $next.version }, at: time::now() };
         COMMIT;`, { goal: new RecordId('goal', goalId), final_gate: card.finalGate.taskId ? new RecordId('task', card.finalGate.taskId) : null,
-        version, actor, goal_key: goalId, evidence: JSON.stringify({ finalGate: card.finalGate, stages: card.stages }) });
+        version, actor, goal_key: goalId, completion_guards:this.completionGuards.get(card)??[],completion_stamp:randomUUID(), evidence: JSON.stringify({ finalGate: card.finalGate, stages: card.stages }) });
       return { card: (await this.card(goalId))!, changed: true, state: 'done' };
     }
     if (reasons.length) {

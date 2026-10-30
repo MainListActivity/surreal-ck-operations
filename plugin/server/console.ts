@@ -207,6 +207,15 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
         const c=await opts.company();if(!c.upgrades)return json({error:"升级服务尚未就绪"},409);
         return json(await c.upgrades.start(b,SOURCE));
       }
+      if(req.method==='POST'&&sub==='/api/goal-retired-resolution'){
+        if(req.headers.get('origin')&&req.headers.get('origin')!==url.origin)return json({error:'origin mismatch'},403);
+        try{
+          const input=await req.json() as Parameters<import('./vendor/src/goal-store.ts').GoalGovernanceStore['resolveRetiredWork']>[0];
+          const {GoalGovernanceStore}=await import('./vendor/src/goal-store.ts');
+          const card=await new GoalGovernanceStore((await opts.company()).db.db).resolveRetiredWork({...input,actor:SOURCE});
+          return json({ok:true,goalId:card.goalId,state:card.state,readyToComplete:card.readyToComplete});
+        }catch{return json({error:'历史任务处置失败：请核对版本、作废状态及替代交付'},409);}
+      }
       if (req.method === "POST" && sub === "/api/decide") {
         const b = await req.json() as { taskId?: string; decision?: string; note?: string; key?: string };
         if (!b.taskId || !["approve", "reject", "reply"].includes(b.decision ?? "")) return json({ error: "bad input" }, 400);
