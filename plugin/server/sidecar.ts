@@ -666,6 +666,13 @@ export class SidecarPool {
     this.ensureSweeper();
   }
 
+  /** FV06 P0 standby wake: a resume assigned this instance a lease server-side (no sidecar claim ran),
+   *  so rebuild the local claim (channel proof + claim.json) from the authoritative server lease. */
+  async adoptLease(inst: EmployeeInst): Promise<void> {
+    if (!this.launched.has(inst.id)) throw new Error("unhealthy session channel cannot adopt a lease");
+    await this.rebuildClaim(inst);
+  }
+
   /**
    * Re-establish the local claim for a lease that survived the restart, then run the
    * turn-end ingest for artifacts the agent may have written while we were down.

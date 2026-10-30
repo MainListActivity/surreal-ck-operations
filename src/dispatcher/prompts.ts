@@ -64,7 +64,9 @@ export function wake(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, f
     // Absolute path, not $SCK_SCRATCH_DIR: Paseo drops spawn env on resume, so the variable
     // is absent for every follow-up turn while the directory itself still exists.
     const scratchDir = ctx.scratchDir ?? '$SCK_SCRATCH_DIR';
-    const allocation = ctx.claim?.worktree;
+    // FV06 standby wakes pass the registered worktree directly (the lease was assigned server-side and
+    // adopted, so there is no fresh claim result here) — same usage line as a normal dispatch.
+    const allocation = ctx.claim?.worktree ?? ctx.worktree;
     const usage = allocation ? `\n登记工作区：${allocation.worktreePath}；mode=${allocation.mode}；branch=${allocation.branch ?? 'detached'}；授权=${JSON.stringify(allocation.intent)}。${allocation.discipline}旧任务 context 若仍要求手动新建独立树，以本次登记路径与写权为准。` : '';
     const body = `【派工】任务 ${task.id}「${task.title}」已领取给你，本轮${mode}。${usage}
 先读 ${commDir}/claim.json —— 里面是本任务的完整上下文：任务详情、交接历史、前任会话（可用 '${env.paseoBin}' logs <agentId> 看完整时间线）、项目环境（project）。你的交付目录是 ${commDir}（report.md、blocker.md、sck 的 req/res 都在那里）；它也是你的会话宿主目录，不是任务现场——文件操作一律用登记工作区/comm 目录的绝对路径，不要在宿主目录写任务产物。临时文件（克隆、构建、转码、抽帧、下载）一律放 ${scratchDir}，不要写到 /tmp 或宿主目录；该目录按保留期自动清理。你不持有任何凭证；要账号、workspace、成员或生产登录，用运维工具 ops_*：先 sck call ops_info '{}' 看当前项目能做什么。

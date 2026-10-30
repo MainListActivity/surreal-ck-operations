@@ -7,7 +7,7 @@ import { emptyChecks, mark, normalRetirement, type DiagnosticCheck, type CheckRe
 import type { ProofFiles } from './proof-files.ts';
 export type LeaseStamp = { taskId: string; employee: string; delivery: string; fence: number; goal: string; project: string; role: Role };
 export type ApprovalReceipt = { taskId: string; version: number; action: 'accept' | 'owner_approve'; auditId: string; reviewer: string; digest: string };
-export type Candidate = { evidence_expires_at?: string; task: RecordId; digest: string; manifest_hash: string; document_hash: string; manifest_path: string; document_path: string; author: string; env: string; type?: string; source_path?: string };
+export type Candidate = { evidence_expires_at?: string; task: RecordId; digest: string; manifest_hash: string; document_hash: string; manifest_path: string; document_path: string; author: string; env: string; type?: string; source_path?: string; /** G1 (FV06 P1): the sampler's employee id, recorded by prepare() when the caller passed it. */ sampler?: string };
 /** A broker-verified remote candidate registered as the approval candidate for one task. */
 export type RemoteCandidateInput = { taskId: string; digest: string; evidenceExpiresAt: string; author: string; env: string; sourcePath: string; candidateHash: string };
 export type ProofRow = { id: RecordId; task: RecordId; delivery: string; fence: number; request_key: string; request_digest: string; lease: LeaseStamp; approval: ApprovalReceipt | null; files: ProofFiles; identities_digest: string; status_hash: string; expires_at: number; revoked: boolean; version: number; sealed: { ciphertext: string; iv: string; tag: string }; kid: string };
@@ -61,11 +61,18 @@ export class CompanyProofStore {
       return current.delivery === stamp.delivery && current.fence === stamp.fence && current.role === stamp.role;
     } catch { return false; }
   }
-  async prepare(lease: LeaseStamp, env: string, files: ProofFiles): Promise<void> {
-    const row: Candidate = { evidence_expires_at: files.evidence.expiresAt, task: new RecordId('task', lease.taskId), digest: files.manifest.configurationDigest, manifest_hash: files.manifestHash, document_hash: files.documentHash, manifest_path: files.manifestPath, document_path: files.documentPath, author: lease.employee, env };
+  /**
+   * 写 internal_ai_candidate（G1/FV06 P1：可选携带采样者身份）。samplerEmployee 与登记持有人同一人时
+   * 直接拒绝——采样 QA 与批准任务登记人必须是两台机器上的两个员工。同文件重放幂等（digest 只刷新、
+   * 其余字段回读比对，含 sampler），换文件冲突。
+   */
+  async prepare(lease: LeaseStamp, env: string, files: ProofFiles, samplerEmployee?: string): Promise<void> {
+    if (samplerEmployee !== undefined && samplerEmployee === lease.employee)
+      throw new CompanyError('invalid', 'sampler must differ from the registering holder (G1: sampler identity is machine-checked)');
+    const row: Candidate = { evidence_expires_at: files.evidence.expiresAt, task: new RecordId('task', lease.taskId), digest: files.manifest.configurationDigest, manifest_hash: files.manifestHash, document_hash: files.documentHash, manifest_path: files.manifestPath, document_path: files.documentPath, author: lease.employee, env, ...(samplerEmployee !== undefined ? { sampler: samplerEmployee } : {}) };
     await this.db.query('INSERT INTO internal_ai_candidate $row ON DUPLICATE KEY UPDATE digest = $input.digest;', { row });
     const found = await this.candidate(lease.taskId);
-    if (!found || found.manifest_hash !== row.manifest_hash || found.document_hash !== row.document_hash || found.author !== row.author || found.env !== env || found.manifest_path !== row.manifest_path || found.document_path !== row.document_path) throw new CompanyError('conflict', 'immutable approval candidate differs');
+    if (!found || found.manifest_hash !== row.manifest_hash || found.document_hash !== row.document_hash || found.author !== row.author || found.env !== env || found.manifest_path !== row.manifest_path || found.document_path !== row.document_path || found.sampler !== row.sampler) throw new CompanyError('conflict', 'immutable approval candidate differs');
   }
   /**
    * Registers a broker-verified remote-magpie-evidence/1 candidate as the approval candidate for one task.
@@ -106,7 +113,7 @@ export class CompanyProofStore {
   }
   private async approvalSnapshot(taskId: string, diagnostic = false): Promise<ApprovalSnapshot> {
     const [candidates, tasks, audits] = await this.db.query<[Candidate[], ApprovalTaskRow[], ApprovalAuditRow[]]>(
-      `SELECT task, digest, manifest_hash, document_hash, manifest_path, document_path, author, env FROM internal_ai_candidate WHERE task = $task LIMIT 1;
+      `SELECT task, digest, manifest_hash, document_hash, manifest_path, document_path, author, env, sampler FROM internal_ai_candidate WHERE task = $task LIMIT 1;
        SELECT state, kind, version, submitted_by, accepted_by, reviewer_role, goal, goal.project AS project FROM $task;
        SELECT id, actor, action, evidence, version, at FROM audit WHERE task = $task AND action IN ['accept', 'owner_approve'] ORDER BY at DESC LIMIT 2;`,
       { task: new RecordId('task', taskId) });
@@ -140,6 +147,11 @@ export class CompanyProofStore {
     set('approvalTaskGoalMatches', String(t?.goal?.id) === PROOF_GOAL);
     set('approvalTaskProjectMatches', String(t?.project?.id) === 'surreal_ck');
     set('candidateAuthorMatchesSubmitter', !!c && !!t && c.author === t.submitted_by);
+    // G1 (FV06 P1): once a candidate carries a sampler identity, 采样 QA ≠ 批准者 is a machine check.
+    // Candidates registered before G1 (no sampler) stay unevaluated here — the legacy approval
+    // contract keeps working, and new registrations should always pass samplerEmployee.
+    if (c && c.sampler !== undefined && a && t)
+      set('samplerApproverIndependent', a.action === 'owner_approve' ? c.sampler !== 'owner' : a.action === 'accept' && c.sampler !== t.accepted_by);
     set('approvalAuditExists', !!a);
     set('auditVersionMatchesTask', !!a && !!t && a.version === t.version);
     if (files) set('auditMarkerExactLine', !!a && !!c && a.evidence.split(/\r?\n/).some(line => line.trim() === APPROVAL_MARKER + c.digest));

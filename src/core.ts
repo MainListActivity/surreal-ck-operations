@@ -82,6 +82,9 @@ import { DispositionLedger, type DispositionApplier, type DispositionClaimInput,
 import { createCompanyGithubGateway, githubRepoSlug } from './external-actions.ts';
 import { validateExternalDependencies } from './input-bounds.ts';
 import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
+import { readProviderQuotas } from './dispatcher/quota-store.ts';
+import { providerAdmission } from './provider-admission.ts';
+import { STANDBY_BUDGET_SECONDS_DEFAULT, STANDBY_RELAY_PROTOCOL } from './standby-relay-capability.ts';
 import { goalRootBlockers, type DispatchVerdict, type GoalRootFacts, type GoalRootPeople, type GoalWorkflowWaitSummary } from './dispatcher/dispatch-blocked.ts';
 import { readGoalWorkflowWaitSnapshot } from './dispatcher/goal-roots.ts';
 import type { WorkIntent, WorktreeAssignment, WorktreeView, WriteScopeHolder } from './contracts.ts';
@@ -282,6 +285,8 @@ export interface TaskRow {
   progress_at?: number;
   /** Unix seconds: a quota-caused block may not be re-announced to gm before this instant. */
   quota_resets_at?: number | null;
+  /** FV06 P0 (schemaless): unix seconds. The standby direct assignment's deadline, cleared on timeout/normal reclaim. */
+  standby_until?: number | null;
   /** SYS05: the open typed wait (schemaless task fields, written only by WaitStore.enter). */
   wait_state?: 'waiting' | null;
   wait_kind?: string | null;
@@ -398,6 +403,7 @@ export function view(row: TaskRow): TaskView {
     submittedBy: row.submitted_by, currentEmployee: row.current_employee,
     deliveryId: row.delivery_id,
     leaseExpiresAt: row.lease_expires_at ? new Date(row.lease_expires_at * 1000).toISOString() : undefined,
+    standbyUntil: row.standby_until ? new Date(row.standby_until * 1000).toISOString() : undefined,
     fence: row.fence,
     blockedTo: row.blocked_to,
     companyUpgrade: row.company_upgrade ?? undefined,
@@ -4021,8 +4027,109 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return echoTask(await this.resumeRecord(credential, taskId, evidence));
   }
 
+  async resumeStandby(credential: Credential, taskId: TaskId, evidence: Evidence, standbyEmployee: string): Promise<TaskView> {
+    return echoTask(await this.resumeRecord(credential, taskId, evidence, { standbyEmployee }));
+  }
+
+  /**
+   * FV06 P1：受控只读预检 verify_standby。对每对（任务，员工）在一个只读判定里复用 standby 直派的
+   * 全部前置（resume 与本预检共用 standbyAdmission，二者不会漂移），逐项返回 {ok, code}。
+   * 不写任务状态、不耗预算；每个条目写一条 audit action='verify_standby' 留痕。
+   * 预检通过只证明「此刻各项判定成立」，不构成派工承诺；真实接力以 resume 的 standby 事务写入为准。
+   */
+  async verifyStandby(credential: Credential, input: { items: Array<{ taskId: string; employeeId: string }>; idempotencyKey: string }):
+  Promise<{ items: Array<{ taskId: string; employeeId: string; ok: boolean; code?: string; message?: string }>; note: string; protocol: string }> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'verify_standby requires gm');
+    if (!Array.isArray(input.items) || input.items.length === 0 || input.items.length > 20)
+      throw new CompanyError('invalid', 'items must list 1..20 {taskId, employeeId} pairs');
+    for (const item of input.items) {
+      if (!item || typeof item.taskId !== 'string' || !item.taskId || typeof item.employeeId !== 'string' || !item.employeeId)
+        throw new CompanyError('invalid', 'each item needs taskId and employeeId');
+    }
+    if (typeof input.idempotencyKey !== 'string' || input.idempotencyKey.length < 4 || input.idempotencyKey.length > 200)
+      throw new CompanyError('invalid', 'Invalid idempotencyKey');
+    const items = [];
+    for (const item of input.items) {
+      const verdict = await this.standbyAdmission(item.taskId, item.employeeId);
+      items.push({ taskId: item.taskId, employeeId: item.employeeId, ok: verdict.ok,
+        ...(verdict.ok ? {} : { code: verdict.code, message: verdict.message }) });
+      await this.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: 'verify_standby', evidence: $evidence, at: time::now() };`, {
+        task: id('task', item.taskId), actor: id('employee', actor.employeeId),
+        evidence: JSON.stringify({ taskId: item.taskId, employeeId: item.employeeId, ok: verdict.ok,
+          ...(verdict.ok ? {} : { code: verdict.code }), protocol: STANDBY_RELAY_PROTOCOL }).slice(0, 2000),
+      });
+    }
+    return { items, note: '只读预检：仅证明此刻各项判定通过，不构成派工承诺，不保证待命期内额度与在岗；真实接力以 resume 的 standby 事务写入为准。', protocol: STANDBY_RELAY_PROTOCOL };
+  }
+
+  /**
+   * FV06 P0：standby 直派的前置判定。resume 与 verify_standby 同源共用；逐项只读评估，返回第一项
+   * 不满足的检查（code + 说明），全过返回 ok。这里不写任何任务状态；事务内的 CAS 守卫仍会复核
+   * 员工/角色/活动任务/策略 epoch，读后变化拒绝写入。额度与健康判定走 provider-admission，与调度器
+   * 的 per-def 闸门（roleCapacity）同一份逻辑与同一份数据。
+   */
+  private async standbyAdmission(taskId: TaskId, employeeId: string): Promise<{ ok: true } | { ok: false; code: string; message: string }> {
+    const deny = (code: string, message: string): { ok: false; code: string; message: string } => ({ ok: false, code, message });
+    const [empRows] = await this.db.query<[Array<{ role: Role; provider?: string; revoked?: boolean; retired?: boolean; workspace_scope?: string; active_task?: RecordId; def_tracks?: string[]; quota_limited?: boolean }>]>(
+      'SELECT role, provider, revoked, retired, workspace_scope, active_task, def.tracks AS def_tracks, def.quota_limited AS quota_limited FROM ONLY $employee;', { employee: id('employee', employeeId) });
+    const emp = empRows?.[0];
+    if (!emp || emp.revoked === true || emp.retired === true) return deny('standby_employee_unavailable', '待命员工不存在或已撤销/退役');
+    const task = await this.taskRowWithProject(taskId);
+    if (!task) return deny('task_not_found', '任务不存在');
+    if (task.executor_role !== emp.role) return deny('standby_role_denied', `待命员工岗位 ${emp.role} 与任务执行岗 ${task.executor_role} 不符`);
+    const goalScope = task.goal ? String((task.goal as RecordId).id) : 'maintenance';
+    if (emp.workspace_scope && emp.workspace_scope !== goalScope) return deny('standby_workspace_denied', '待命员工会话属于另一个目标的会话域');
+    if (emp.active_task && String(emp.active_task.id) !== taskId) {
+      const [activeRows] = await this.db.query<[Array<{ current_employee?: string; lease_expires_at?: number }>]>('SELECT current_employee, lease_expires_at FROM ONLY $active;', { active: emp.active_task });
+      const active = activeRows?.[0];
+      if (active?.current_employee === employeeId && (active.lease_expires_at ?? 0) > Date.now() / 1000)
+        return deny('standby_employee_busy', '待命员工仍持有另一任务的活动租约');
+    }
+    const defTracks = emp.def_tracks ?? [];
+    if (task.discipline) {
+      const required = REQUIRED_TRACKS[emp.role];
+      if (required !== undefined) {
+        if (task.discipline !== required || !defTracks.includes(required)) return deny('discipline_track_denied', '必配轨岗位与任务轨不符');
+      } else if (defTracks.length > 0 && !defTracks.includes(task.discipline)) return deny('discipline_track_denied', '编制轨不覆盖任务轨');
+    }
+    const contrib = await readContributionView(this.db, taskId);
+    if (contrib.facts.excluded.includes(employeeId)) return deny('standby_excluded', '待命员工在本任务的贡献者回避名单内');
+    if (task.executor_role === 'engineering') {
+      if (contrib.facts.ambiguous) return deny('implementer_unresolved', '实现人未定，需经理接管');
+      if (contrib.facts.implementer && contrib.facts.implementer !== employeeId) return deny('bound_to_another_implementer', '任务已绑定其他实现人');
+    }
+    const policyChain = this.chainOfRow(task);
+    const { contract: policyContract, epoch: policyEpochAtClaim } = await this.effectiveContractFor(policyChain);
+    const currentView = view(task);
+    const verdict = dispatchVerdict({ state: task.state, executorRole: currentView.executorRole, kind: currentView.kind,
+      ...(currentView.goalId ? { goalId: currentView.goalId } : {}),
+      ...(currentView.workIntent ? { workIntent: currentView.workIntent } : {}),
+      ...(task.policy_hash ? { policyHash: task.policy_hash } : {}),
+      ...(task.policy_block_reason ? { policyBlockReason: task.policy_block_reason } : {}),
+      registeredDomains: registeredDomainsOf(task) }, policyContract);
+    if (verdict.verdict === 'blocked') return deny('policy_blocked', `策略拒绝派工：${verdict.reason}（policy v${policyContract.version} hash=${policyContract.hash.slice(0, 16)}）`);
+    try {
+      await this.refuseIndependent(await this.independenceGate(taskId, currentView.independence, 'execute'), employeeId);
+    } catch (error) {
+      return deny('independence_denied', error instanceof CompanyError ? error.message : '独立性闸门拒绝');
+    }
+    const window = task.execution_window;
+    if (!window || windowExpired(window)) return deny('execution_window_invalid', '任务没有有效执行窗口；standby 直派必须绑定未过期的独立批准窗口');
+    const [healthRows] = await this.db.query<[Array<{ id: RecordId; state: 'healthy' | 'exhausted'; until?: number; last_error?: string }>]>('SELECT id, state, until, last_error FROM provider_health;');
+    const health = new Map((healthRows ?? []).map(r => [String(r.id.id), { state: r.state, until: r.until, lastError: r.last_error }]));
+    const quotaRows = await readProviderQuotas(this.db);
+    const [cfgRows] = await this.db.query<[Array<{ quota_floor_pct?: number; quota_weekly_floor_pct?: number }>]>('SELECT quota_floor_pct, quota_weekly_floor_pct FROM ONLY company_meta:config;');
+    const floors = { quotaFloorPct: typeof cfgRows?.[0]?.quota_floor_pct === 'number' ? cfgRows[0]!.quota_floor_pct! : 8,
+      quotaWeeklyFloorPct: typeof cfgRows?.[0]?.quota_weekly_floor_pct === 'number' ? cfgRows[0]!.quota_weekly_floor_pct! : 6 };
+    const admission = providerAdmission({ provider: emp.provider, quotaLimited: emp.quota_limited === false ? false : undefined },
+      { health, quotaRows, floors, now: Date.now() });
+    if (!admission.ok) return deny('standby_provider_blocked', `待命员工的订阅不可用：${admission.reason ?? 'unknown'}`);
+    return { ok: true };
+  }
+
   private async resumeRecord(credential: Credential, taskId: TaskId, evidence: Evidence,
-    options: { businessScope?: boolean } = {}): Promise<TaskView> {
+    options: { businessScope?: boolean; standbyEmployee?: string } = {}): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm can resume');
     requireText(evidence.text, 'evidence', 20, 30000);
@@ -4031,7 +4138,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const idem = options.businessScope
       ? this.businessIdemId('resume', evidence.idempotencyKey)
       : this.idemId(actor.employeeId, 'resume', evidence.idempotencyKey);
-    const digest = HASH(JSON.stringify({ taskId, evidence }));
+    const standbyEmployee = options.standbyEmployee;
+    const digest = HASH(JSON.stringify({ taskId, evidence, ...(standbyEmployee ? { standbyEmployee } : {}) }));
     const replay = await this.replay(idem, digest);
     if (replay) return replay;
     const before = await this.db.select<TaskRow>(id('task', taskId));
@@ -4069,14 +4177,57 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       }, { businessScope: true });
       return deferred;
     }
+    // FV06 P0：standby 直派——恢复相位直接 doing 并原子指派待命持有人。窗口必填（standby 预算以
+    // notAfter 封顶）；全部前置在事务外逐项判定，任一不满足直接 invalid，任务留在 blocked 不做部分写入。
+    let standbyAssignment: WorktreeAssignment | undefined;
+    let standbyPolicy: { version: number; hash: string; epoch: number } | undefined;
+    if (standbyEmployee) {
+      if (!evidence.executionWindow) throw new CompanyError('invalid', 'standby resume requires an execution window');
+      const admission = await this.standbyAdmission(taskId, standbyEmployee);
+      if (!admission.ok) throw new CompanyError('invalid', `standby denied (${admission.code}): ${admission.message}`);
+      // workIntent 工作区语义：直派与 claimLease 同一登记——同一把 repo 锁内走 registry.allocate，
+      // 事务内写入 worktree + worktree_ref；不新建未授权现场，也不绕过登记。
+      if (this.worktrees) {
+        const project = await this.taskProject(taskId);
+        const fresh = await this.db.select<TaskRow>(id('task', taskId));
+        if (!fresh) throw new CompanyError('not_found', 'Task not found');
+        const standbyPrincipal = { employeeId: standbyEmployee, role: view(fresh).executorRole, capabilities: [] } as Principal;
+        standbyAssignment = await this.worktrees.locked(fresh.code_repo_path ?? project?.repoPath ?? this.worktrees.options.opsRepo, async (repo, list) => {
+          const reloaded = await this.db.select<TaskRow>(id('task', taskId));
+          if (!reloaded) throw new CompanyError('not_found', 'Task not found');
+          const allocProject = reloaded.code_repo_path ? await this.projectForRepo(repo) : project;
+          return this.worktrees!.allocate(repo, list, view(reloaded), standbyPrincipal, allocProject);
+        });
+      }
+      const policyRow = await this.taskRowWithProject(taskId);
+      if (!policyRow) throw new CompanyError('not_found', 'Task not found');
+      const { contract, epoch } = await this.effectiveContractFor(this.chainOfRow(policyRow));
+      standbyPolicy = { version: contract.version, hash: contract.hash, epoch };
+    }
     try {
+      const standbyBudgetSeconds = standbyEmployee
+        ? await this.db.query<[Array<{ standby_budget_seconds?: number }>]>('SELECT standby_budget_seconds FROM ONLY company_meta:config;')
+            .then(([rows]) => (typeof rows?.[0]?.standby_budget_seconds === 'number' && rows[0]!.standby_budget_seconds! > 0
+              ? rows[0]!.standby_budget_seconds! : STANDBY_BUDGET_SECONDS_DEFAULT))
+        : STANDBY_BUDGET_SECONDS_DEFAULT;
       const row = await this.txTask(`BEGIN;
         LET $who = SELECT * FROM ONLY $actor;
         LET $t = SELECT * FROM ONLY $task;
+        LET $now = time::unix(time::now());
         IF $who.revoked = true OR $who.role != 'gm' OR $t = NONE OR $t.state != 'blocked' { THROW 'resume denied' };
         IF $t.version != $expected_version { THROW 'task version moved' };
         IF $t.recovery_stopped = true AND !$new_window { THROW 'automatic recovery stopped' };
         IF $t.wait_state = 'waiting' { THROW 'task is waiting: cancel or resolve the wait first' };
+        IF $standby != NONE {
+          IF $standby_record = NONE OR $standby_record.revoked = true OR $standby_record.retired = true { THROW 'standby employee unavailable' };
+          IF $standby_record.role != $t.executor_role { THROW 'standby role denied' };
+          IF $standby_record.active_task != NONE AND $standby_record.active_task != $task {
+            LET $active = SELECT * FROM ONLY $standby_record.active_task;
+            IF $active != NONE AND $active.lease_expires_at > $now AND $active.current_employee = $standby { THROW 'standby employee already has active task' };
+          };
+          LET $policy_epoch_now = (SELECT VALUE value FROM ONLY company_meta:policy_epoch) ?? 0;
+          IF $policy_epoch_now != $expected_policy_epoch { THROW 'policy moved: the effective contract moved since the resume was read' };
+        };
         IF $execution_window != NONE {
           IF <datetime>$execution_window.notAfter <= time::now() { THROW 'execution window expired' };
           LET $approval = type::record('task', $execution_window.approvalTask);
@@ -4089,28 +4240,71 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         };
         ${RESOLVE_DEP_SQL('$t.dependencies', '$r_dep')}
         LET $remaining = SELECT * FROM task WHERE id IN $r_dep_resolved AND ${depUnsatisfiedFor('$t')};
+        IF $standby != NONE AND array::len($remaining) > 0 { THROW 'standby denied: unmet dependencies remain' };
+        LET $assigned = $standby != NONE;
         LET $source_phase = $t.resume_state ?? 'ready';
-        LET $restore_phase = IF $source_phase = 'doing' THEN 'ready' ELSE $source_phase END;
+        LET $restore_phase = IF $standby != NONE THEN 'doing' ELSE IF $source_phase = 'doing' THEN 'ready' ELSE $source_phase END END;
+        // FV06 P0：standby_until = min(窗口 notAfter, now + standbyBudgetSeconds)；progress_at 同步写 now，
+        // 消除 stall 分支把刚待命的任务误判为停滞。
+        LET $standby_until = IF $assigned THEN math::min([$standby_not_after, $now + $standby_budget]) ELSE NONE END;
         LET $next = UPDATE ONLY $task SET
           state = IF array::len($remaining) = 0 THEN $restore_phase ELSE 'blocked' END,
           resume_role = IF array::len($remaining) = 0 THEN NONE ELSE $t.resume_role END,
           resume_state = IF array::len($remaining) = 0 THEN NONE ELSE $t.resume_state END,
           blocked_to = NONE, dependency_continuation = NONE, execution_window = $execution_window,
           recovery_stopped = IF $new_window THEN NONE ELSE $t.recovery_stopped END,
-          current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
+          current_employee = IF $assigned THEN $standby ELSE NONE END,
+          delivery_id = IF $assigned THEN $standby_delivery ELSE NONE END,
+          lease_expires_at = IF $assigned THEN $now + $standby_lease_seconds ELSE NONE END,
+          progress_at = IF $assigned THEN $now ELSE $t.progress_at END,
+          standby_until = IF $assigned THEN $standby_until ELSE NONE END,
+          implementer = IF $assigned AND $t.executor_role = 'engineering' AND $t.implementer = NONE THEN $standby ELSE $t.implementer END,
+          worktree = IF $assignment != NONE THEN $assignment ELSE $t.worktree END,
+          lease_policy_version = IF $assigned THEN $policy_version ELSE $t.lease_policy_version END,
+          lease_policy_hash = IF $assigned THEN $policy_hash ELSE $t.lease_policy_hash END,
           version = $t.version + 1 RETURN AFTER;
+        IF $assigned {
+          UPDATE ONLY $standby_record SET active_task = $task;
+          IF $assignment != NONE {
+            UPDATE ONLY $tree SET last_used_at = time::now();
+            UPSERT ONLY $reference CONTENT { task: $task, tree: $tree, employee: $standby,
+              delivery: $standby_delivery, fence: $next.fence, intent: $assignment.intent, at: time::now() };
+          };
+          IF $t.executor_role = 'engineering' AND $t.implementer = NONE {
+            CREATE ONLY $standby_bound_audit CONTENT { task: $task, actor: $standby_record, action: 'implementer_bound', phase: 'execute', version: $next.version, at: time::now() };
+          };
+        };
         IF $new_window {
           CREATE audit CONTENT { task: $task, actor: $actor, action: 'recovery_progress', evidence: '绑定新独立批准及有效执行窗口', at: time::now() };
         };
-        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'resume', evidence: $evidence, version: $next.version, at: time::now(),
-          source_phase: $source_phase, restore_phase: $restore_phase, result: $next.state };
+        IF $assigned {
+          CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'resume', evidence: $evidence, version: $next.version, at: time::now(),
+            source_phase: $source_phase, restore_phase: $restore_phase, result: $next.state,
+            standby: $standby, standby_until: $next.standby_until, lease_expires_at: $next.lease_expires_at };
+        } ELSE {
+          CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'resume', evidence: $evidence, version: $next.version, at: time::now(),
+            source_phase: $source_phase, restore_phase: $restore_phase, result: $next.state };
+        };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        CREATE ONLY $outbox CONTENT { task: $task, kind: 'resumed', sequence: $sequence.value,
-          payload: { state: $next.state, source_phase: $source_phase, restore_phase: $restore_phase }, at: time::now() };
+        IF $assigned {
+          CREATE ONLY $outbox CONTENT { task: $task, kind: 'resumed', sequence: $sequence.value,
+            payload: { state: $next.state, source_phase: $source_phase, restore_phase: $restore_phase,
+              employee: $standby, standbyUntil: $next.standby_until }, at: time::now() };
+        } ELSE {
+          CREATE ONLY $outbox CONTENT { task: $task, kind: 'resumed', sequence: $sequence.value,
+            payload: { state: $next.state, source_phase: $source_phase, restore_phase: $restore_phase }, at: time::now() };
+        };
         CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
         RETURN $next;
         COMMIT;`, {
         actor: id('employee', actor.employeeId), task: id('task', taskId), evidence: evidence.text, execution_window: executionWindow, expected_version: before.version, new_window: evidence.executionWindow !== undefined && before.execution_window?.approvalTask !== executionWindow?.approvalTask,
+        standby: standbyEmployee ?? null, standby_record: standbyEmployee ? id('employee', standbyEmployee) : undefined,
+        standby_delivery: standbyEmployee ? randomUUID() : undefined, standby_lease_seconds: this.leaseSeconds,
+        standby_not_after: standbyEmployee ? Math.floor(Date.parse(executionWindow!.notAfter) / 1000) : 0,
+        standby_budget: standbyBudgetSeconds,
+        assignment: standbyAssignment, tree: standbyAssignment ? id('worktree', standbyAssignment.id) : undefined,
+        reference: id('worktree_ref', taskId), standby_bound_audit: id('audit', randomUUID()),
+        policy_version: standbyPolicy?.version, policy_hash: standbyPolicy?.hash, expected_policy_epoch: standbyPolicy?.epoch,
         idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
       });
       return view(row);

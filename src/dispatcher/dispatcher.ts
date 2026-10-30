@@ -1,4 +1,5 @@
 import { faultBelongsToWait, faultNeedsNotice } from '../task-recovery.ts';
+import { STANDBY_WAKE_RETRY_SECONDS } from '../standby-relay-capability.ts';
 import { workspaceScopeFor } from '../goal-workspace-capability.ts';
 import { FACTORY_PROVIDER, factoryFirst } from './provider-order.ts';
 import { managedModel, employeeClientModel } from "../model-routing/policy.ts";
@@ -81,26 +82,10 @@ const holderNoticeText = (notice: { taskId: string; episode: string; kind: strin
 /** `unknown`: the roster or pool has no observation for the session. It is never shown or treated as busy. */
 export type InstState = 'busy' | 'idle' | 'down' | 'exhausted' | 'unknown';
 
-/** 'ok' healthy / 'probe' single trial session allowed / 'down' cooling off. */
-const availabilityOf = (h: ProviderHealth | undefined, now: number): 'ok' | 'probe' | 'down' =>
-  !h || h.state === 'healthy' ? 'ok' : now >= (h.until ?? 0) ? 'probe' : 'down';
-
-/** Quota circuit breaker, shared by the tick and the roster staffing preview. */
-export function quotaBlockedProviders(rows: ProviderQuota[], cfg: Pick<CompanyConfig, 'quotaFloorPct' | 'quotaWeeklyFloorPct'>, now: number): Map<string, string> {
-  const blocked = new Map<string, string>();
-  if (cfg.quotaFloorPct <= 0 && cfg.quotaWeeklyFloorPct <= 0) return blocked;
-  for (const q of rows) {
-    const age = q.fetchedAt ? now - Date.parse(q.fetchedAt) : 0;
-    if (age >= 15 * 60_000) continue;
-    const hasSplit = q.sessionPct !== undefined || q.weeklyPct !== undefined;
-    const session = hasSplit ? q.sessionPct : q.lowestPct;
-    const hits: string[] = [];
-    if (session !== undefined && session < cfg.quotaFloorPct) hits.push(`短窗口/余额 ${Math.round(session)}%<${cfg.quotaFloorPct}%`);
-    if (q.weeklyPct !== undefined && q.weeklyPct < cfg.quotaWeeklyFloorPct) hits.push(`周/月额度 ${Math.round(q.weeklyPct)}%<${cfg.quotaWeeklyFloorPct}%`);
-    if (hits.length) blocked.set(q.provider, `额度不足（${hits.join('，')}）`);
-  }
-  return blocked;
-}
+// Provider admission (quota floors + health window) lives in src/provider-admission.ts so the FV06
+// standby guard and this pool read the exact same gate — the two faces cannot drift.
+import { availabilityOf, quotaBlockedProviders } from '../provider-admission.ts';
+export { availabilityOf, quotaBlockedProviders };
 
 /** Per role: how many enabled seats can take work right now (provider quota and health), and why the rest cannot. */
 export function roleCapacity(defs: ReadonlyArray<Pick<EmployeeDef, 'role' | 'provider' | 'enabled' | 'quotaLimited'>>, quotaBlocked: ReadonlyMap<string, string>, health: ReadonlyMap<string, ProviderHealth>, now: number): RoleCapacity[] {
@@ -550,6 +535,12 @@ export interface SidecarBridge {
   releaseClaim(instId: string, taskId: string, reason: string): Promise<void>;
   /** Server-side lease was revoked: drop the local claim remnant so the instance can pick again. */
   dropLease?(instId: string, taskId?: string): void;
+  /**
+   * FV06 P0 standby wake: re-establish the local claim (claim.json + channel proof) for a lease the
+   * server already holds for this instance — the resume standby transaction assigned it directly, so
+   * no sidecar claim ran. Missing or failing = the wake still goes out but the channel may be cold.
+   */
+  adoptLease?(inst: EmployeeInst): Promise<void>;
 }
 
 /** Jev-chosen override for one dispatch: force an existing instance, or skip reuse and spawn a chosen def. */
@@ -673,6 +664,8 @@ export class Dispatcher {
   private readonly reloadAt = new Map<string, number>();
   /** agentId → when a closed session holding work was first seen; bounds how long it reads as unknown. */
   private readonly closedSince = new Map<string, number>();
+  /** FV06 P0: agentId → when the last standby wake was sent; retried at the same 60s cadence as resumeClosed's reload. */
+  private readonly standbyWakeAt = new Map<string, number>();
   /** agentId → last timeline tail of a stalled busy holder, when it last changed, and the task it was holding. */
   private readonly activity = new Map<string, { tail: string; at: number; task: string }>();
   /** agentId → the served model already reported as waiting for its provider: one line per episode, not per tick. */
@@ -1081,6 +1074,58 @@ export class Dispatcher {
           report.extended.push(task.id);
         }
         continue;
+      }
+      // FV06 P0: bounded standby. A standby holder (standby_until set) is exempt from the stall/expire
+      // reclaim until the deadline; an idle/unknown holder is woken in place (claim.json re-adopted from
+      // the server lease first), throttled at the same 60s cadence as resumeClosed's reload. Past the
+      // deadline the task returns to the gm gate — never the ready pool. down/exhausted holders keep the
+      // ordinary immediate revoke below, and a busy holder keeps the ordinary renewal/stall branch above.
+      if (task.standbyUntil !== undefined) {
+        if (task.standbyUntil > now) {
+          if (state === 'idle' || state === 'unknown' || !inst) {
+            const agentKey = inst?.paseoAgentId ?? task.currentEmployee!;
+            if (now - (this.standbyWakeAt.get(agentKey) ?? 0) >= STANDBY_WAKE_RETRY_SECONDS) {
+              this.standbyWakeAt.set(agentKey, now);
+              if (inst) {
+                // The standby assignment happened server-side (resume transaction): adopt the lease into
+                // the channel so claim.json and the sck proof exist before the prompt lands.
+                await this.deps.sidecar?.adoptLease?.(inst).catch(error =>
+                  this.log(`standby adopt ${inst.id} failed: ${(error as Error).message}`));
+                const first = !this.onboarded.has(inst.id) && !inst.onboarded;
+                try {
+                  await paseo.send(inst.paseoAgentId!, wake(inst, task, this.deps.env, first,
+                    { comm: !!this.deps.sidecar, worktree: task.row.worktree,
+                      commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }));
+                  this.onboarded.add(inst.id);
+                  this.lastStatus.set(inst.paseoAgentId!, 'running');
+                  await wf.touchWake(inst.id);
+                  (report.recovered ??= []).push(inst.id);
+                  this.log(`standby wake ${inst.id} for ${task.id} (until ${new Date(task.standbyUntil * 1000).toISOString()})`);
+                } catch (error) {
+                  this.log(`standby wake ${inst.id} failed: ${(error as Error).message}`);
+                }
+              }
+            }
+            continue;
+          }
+          // down/exhausted/closed fall through to the ordinary branches below.
+        } else {
+          const reason = `员工 ${task.currentEmployee} 的待命期（standby_until）已过仍未开工，按窗口纪律回经理关口重新安排，不进入 ready 派工池`;
+          const log = inst?.paseoAgentId ? await this.deps.paseo.logsTail(inst.paseoAgentId, LOG_TAIL_ENTRIES) : '';
+          const handover = [
+            '【交接包】standby 待命超时。任务窗口未放宽；经理可换人重新 standby（resume_task 带 standbyEmployee）或放弃该窗口。',
+            `前任会话：${inst?.id ?? task.currentEmployee}${inst?.paseoAgentId ? `（Paseo agentId ${inst.paseoAgentId}；完整时间线：paseo logs ${inst.paseoAgentId}）` : ''}`,
+            log ? `\n---\n${log.slice(-cfg.handoverChars)}` : '（无可用会话日志）',
+          ].join('\n');
+          if (await wf.standbyTimeout(task.id, task.currentEmployee, reason, handover)) {
+            report.revoked.push(task.id);
+            this.deps.sidecar?.dropLease?.(task.currentEmployee, task.id);
+            const scene = task.row.worktree;
+            if (scene) await this.deps.reclaimWorktrees?.({ trigger: 'revoke', treeId: scene.id, repo: scene.repo }).catch(() => undefined);
+            this.log(`standby timeout ${task.id}: returned to gm gate`);
+          }
+          continue;
+        }
       }
       if (state === 'down' || state === 'exhausted') {
         await this.revoke(task, `员工 ${inst!.id} 的会话${state === 'exhausted' ? '所在订阅额度耗尽/限流' : '已中断'}`, inst, report);
