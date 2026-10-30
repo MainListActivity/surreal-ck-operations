@@ -397,6 +397,8 @@ export function assessGoal(input: {
   externalDependencies?: Array<{ taskId: string; dependency: string; goalId: string | null; state?: string }>;
   /** Old quick acceptance anchors replaced by goal_acceptance_repair; their void is an authorized replacement. */
   replacedAcceptanceTaskIds?: string[];
+  /** Owner-audited fixture/replacement dispositions, revalidated by the store on every read. */
+  resolvedRetiredTaskIds?: string[];
   now: number;
 }): GoalAssessment {
   const { goal, now } = input;
@@ -405,7 +407,7 @@ export function assessGoal(input: {
   const faults = input.faults ?? [];
   const evidence = input.evidence ?? [];
   const byId = new Map(tasks.map(task => [task.id, task]));
-  const replacedAcceptance = new Set(input.replacedAcceptanceTaskIds ?? []);
+  const replacedAcceptance = new Set([...(input.replacedAcceptanceTaskIds ?? []),...(input.resolvedRetiredTaskIds ?? [])]);
   const finalId = finalGateId(goal);
   const final = finalId ? byId.get(finalId) : undefined;
   // A final gate is effective only when it is the lineage tip: a superseded_by pointer or a newer revision in
@@ -455,18 +457,21 @@ export function assessGoal(input: {
       repairReasons.push({ code: 'owner_approval_missing', message: '终验关口已完成但不是老板本人批准', taskId: final.id });
     }
   }
+  // Terminal non-final tasks describe historical execution; retain their edges in the graph,
+  // but do not reopen accepted work when a later phase moves or reopens its prerequisites.
+  const currentEdge=(taskId:string)=>taskId===finalId||!TERMINAL.has(byId.get(taskId)?.state??'');
   if (cycle) repairReasons.push({ code: 'dependency_cycle', message: '目标任务依赖存在循环' });
-  for (const item of dangling) repairReasons.push({ code: 'dependency_dangling', message: `依赖 ${item.dependency} 不存在`, taskId: item.taskId });
+  for (const item of dangling.filter(edge=>currentEdge(edge.taskId))) repairReasons.push({ code: 'dependency_dangling', message: `依赖 ${item.dependency} 不存在`, taskId: item.taskId });
   // An edge to another goal stays a cross-goal fact with the referenced task's real state, so a done edge and a
   // blocked edge never read the same; it is not downgraded to "missing". A done edge is satisfied work another goal
   // already delivered: it stays disclosed in graph.crossGoal but is not a repair reason, or the goal would be parked
   // in needs_repair forever by dependencies nobody can (or should) change.
-  for (const item of crossGoal.filter(edge => edge.state !== 'done')) repairReasons.push({
+  for (const item of crossGoal.filter(edge => edge.state !== 'done'&&currentEdge(edge.taskId))) repairReasons.push({
     code: 'dependency_cross_goal',
     message: `依赖 ${item.dependency} 属于其他目标（${item.state ?? '状态未知'}）`, taskId: item.taskId });
   // A row that exists with no goal is outside every goal's scope: it is disclosed as external/unscoped, never
-  // claimed to be missing. It stays a repair reason so removing dangling cannot be spun as "all governance fixed".
-  for (const item of unscoped) repairReasons.push({
+  // claimed to be missing. Completed external work satisfies a dependency regardless of goal ownership.
+  for (const item of unscoped.filter(edge=>edge.state!=='done'&&currentEdge(edge.taskId))) repairReasons.push({
     code: 'dependency_unscoped',
     message: `依赖 ${item.dependency} 存在于全库但不属于任何目标（external/unscoped${item.state ? `，状态 ${item.state}` : ''}）`,
     taskId: item.taskId });

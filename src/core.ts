@@ -2432,12 +2432,21 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       ...(goal.project ? { project: asId(goal.project) } : {}),
     });
     const nextGoal = id('goal', next.id);
+    const nextRow=await this.db.select<{anchors?:RecordId[]}>(nextGoal);
+    const [nextTasks]=await this.db.query<[Array<{id:RecordId;state:string;version:number}>]>(
+      'SELECT id,state,version FROM task WHERE id IN $anchors;',{anchors:nextRow?.anchors??[]});
+    const nextById=new Map(nextTasks.map(t=>[asId(t.id),t]));
+    const firstAnchor=(nextRow?.anchors??[]).map(id=>nextById.get(asId(id))).find(t=>t&&!['done','void'].includes(t.state));
+    if(!firstAnchor)throw new CompanyError('conflict','next stage has no open anchor');
     const blockedBefore = new Set(anchors.filter(a => open.get(a)?.state === 'blocked'));
     await this.db.query(`BEGIN;
       LET $g = SELECT * FROM ONLY $old;
       IF $g.state NOT IN ['active', 'needs_repair'] { THROW 'goal moved: no longer active' };
       LET $n = SELECT * FROM ONLY $next;
-      LET $first = (SELECT VALUE id FROM task WHERE id IN ($n.anchors ?? []) AND state NOT IN ['done', 'void'] LIMIT 1)[0];
+      LET $first=$next_anchor;
+      LET $first_row=SELECT * FROM ONLY $first;
+      IF $first NOT IN ($n.anchors??[]) OR $first_row=NONE OR $first_row.version!=$next_anchor_version OR $first_row.state IN ['done','void'] {THROW 'next stage anchor moved'};
+      IF $first_row.current_employee!=NONE AND $first_row.lease_expires_at>time::unix(time::now()) {THROW 'next stage anchor is leased'};
       FOR $t IN $moved {
         LET $row = SELECT * FROM ONLY $t;
         IF $row.goal != $old OR $row.state IN ['done', 'void'] { THROW 'task moved: no longer an open task of the goal' };
@@ -2466,13 +2475,15 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       CREATE outbox CONTENT { kind: 'goal_phase_split', sequence: $sequence.value,
         payload: { goal: $old_key, next: $next_key, moved: $moved_keys }, at: time::now() };
       COMMIT;`, {
-      old: goal.id, next: nextGoal, moved: moved.map(taskId => id('task', taskId)), actor: actor.record,
+      old: goal.id, next: nextGoal,next_anchor:firstAnchor.id,next_anchor_version:firstAnchor.version, moved: moved.map(taskId => id('task', taskId)), actor: actor.record,
       evidence: `分阶段：${input.reason}\n下一阶段目标 ${next.id}：${input.title}\n移入任务：${moved.join('、')}`,
       split_key: HASH(input.idempotencyKey).slice(0, 16), old_key: input.goalId, next_key: next.id, moved_keys: moved,
     });
     const [after] = await this.db.query<[Array<{ id: RecordId; state: string }>]>('SELECT id, state FROM $ids;',
       { ids: [...blockedBefore].map(a => id('task', a)) });
     const unlocked = (after ?? []).filter(row => row.state === 'ready').map(row => asId(row.id));
+    // Reassess the retained stage after moving its open work; this never approves its final gate.
+    await this.goalFinalizeSafe(input.goalId,actor.source);
     return { goalId: input.goalId, nextGoalId: next.id, moved, unlocked };
   }
 
