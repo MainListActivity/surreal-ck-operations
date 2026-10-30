@@ -390,3 +390,11 @@ test('Factory queue admission preserves recusal and allows overflow and exhauste
  expect(staffingPool({...input,quotaBlocked:new Map([['factory-droid','exhausted']])}).find(e=>e.key==='c')?.eligible).toBe(true);
  expect(staffingPool({...input,recusal:{authors:new Set(['c']),hands:new Set()}}).find(e=>e.key==='c')?.code).toBe('author_recusal');
 });
+
+test('an unresolved Factory definition cannot reserve a task over qualified Claude',()=>{
+ const factory=def('factory',{provider:'factory-droid',model:'auto:missing',maxInstances:1});
+ const claude=def('claude',{provider:'claude',model:'group/sck-haiku',quotaLimited:false});
+ const f=inst('f',{def:'factory',provider:'factory-droid'}),c=inst('c',{def:'claude',provider:'claude',model:'group/sck-haiku'});
+ const entries=staffingPool(base({defs:[factory,claude],insts:[c],states:new Map([['c','idle']]),providerMax:{'factory-droid':1,claude:4}}));
+ expect(entries.find(e=>e.key==='c')?.eligible).toBe(true);
+});

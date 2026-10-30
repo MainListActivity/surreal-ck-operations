@@ -819,3 +819,26 @@ test('Factory max thinking is passed independently of auto-high permission mode'
  const spawn=f.paseo.spawn.bind(f.paseo);f.paseo.spawn=async input=>{seen=input;return spawn(input);};
  await f.tick();expect(seen).toMatchObject({provider:'factory-droid',thinking:'max',mode:'auto-high'});
 });
+
+test('a live Claude implementer is not parked behind Factory that cannot legally take its code',async()=>{
+ const f=factoryWorld();f.setImplementer('factory-task','eng-1');
+ const r=await f.tick();expect(r.woke.find(w=>w.task==='factory-task')?.employee).toBe('eng-1');
+});
+
+test('an older executable Factory task precedes a newer Factory review sharing one provider slot',async()=>{
+ const f=factoryWorld();f.rows[0]!.row.created_at=new Date(1000) as never;
+ f.defs.push({...f.factory,id:'qa-factory',role:'qa'});
+ const review=f.addTask({id:'new-review',state:'review',repoPath:OPS,facts:{authors:[],reviewers:[],excluded:[],unknown:[],ambiguous:false}});review.row.created_at=new Date(2000) as never;
+ const cfg=f.wf.config.bind(f.wf);f.wf.config=async()=>({...await cfg(),providerMax:{'factory-droid':1,claude:8,codex:8}});
+ const r=await f.tick();expect(r.woke.map(w=>w.task)).toEqual(['factory-task']);
+ expect(f.instances.find(i=>i.id===r.woke[0]!.employee)?.provider).toBe('factory-droid');
+});
+
+test('an older runnable Factory manager wake precedes a newer execute task with a shared slot',async()=>{
+ const f=factoryWorld();f.rows[0]!.row.created_at=new Date(2000) as never;
+ f.defs.push({...f.factory,id:'gm-factory',role:'gm'});
+ const gm=f.addTask({id:'old-manager',state:'blocked',blockedTo:'gm',repoPath:OPS});gm.row.created_at=new Date(1000) as never;
+ const cfg=f.wf.config.bind(f.wf);f.wf.config=async()=>({...await cfg(),providerMax:{'factory-droid':1,claude:8,codex:8}});
+ const r=await f.tick();expect(r.woke.map(w=>w.task)).toEqual(['old-manager']);
+ expect(f.instances.find(i=>i.id===r.woke[0]!.employee)?.provider).toBe('factory-droid');
+});

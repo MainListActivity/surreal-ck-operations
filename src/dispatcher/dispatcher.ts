@@ -180,6 +180,8 @@ export interface StaffingEntry {
 }
 
 export interface StaffingInput {
+  /** Internal planning pass: preserve static admission and quota, ignore temporary occupancy and provider preference. */
+  qualificationOnly?: boolean;
   /** Global FIFO of work waiting for Factory; positions after three may use other providers. */
   factoryQueue?: ReadonlyMap<string, number>;
   role: string;
@@ -303,10 +305,12 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     if (!exempt) {
       const quota = quotaOf(provider);
       if (quota) return quota;
+      if (p.qualificationOnly) return undefined;
       if (availabilityOf(p.health.get(provider), p.now) === 'probe') {
         return (p.busyBy.get(provider) ?? 0) === 0 ? undefined : ['probe_busy', BLOCK_TEXT.probe_busy];
       }
     }
+    if (p.qualificationOnly) return undefined;
     return cap(provider, exempt) ? undefined : ['provider_capacity', BLOCK_TEXT.provider_capacity];
   };
   /**
@@ -364,11 +368,11 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       independenceBlock(inst.id, inst.principal) ??
       (p.recusal?.authors.has(inst.id) ? ['author_recusal', BLOCK_TEXT.author_recusal] : undefined) ??
       (p.excludeSubmitter && inst.id === p.task?.submittedBy ? ['author_recusal', BLOCK_TEXT.author_recusal] : undefined) ??
-      (p.reserved?.has(inst.id) ? ['review_capacity', BLOCK_TEXT.review_capacity] : undefined) ??
+      (!p.qualificationOnly && p.reserved?.has(inst.id) ? ['review_capacity', BLOCK_TEXT.review_capacity] : undefined) ??
       ((inst.def && !def) || (def && !def.enabled) ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
-      (!ready(inst) ? notReady(p.states.get(inst.id), inst.provider ?? '') : undefined) ??
-      (p.assigned?.has(inst.id) ? ['assigned', BLOCK_TEXT.assigned] : undefined) ??
-      (p.holding.has(inst.id) ? ['held', BLOCK_TEXT.held] : undefined) ??
+      (!p.qualificationOnly && !ready(inst) ? notReady(p.states.get(inst.id), inst.provider ?? '') : undefined) ??
+      (!p.qualificationOnly && p.assigned?.has(inst.id) ? ['assigned', BLOCK_TEXT.assigned] : undefined) ??
+      (!p.qualificationOnly && p.holding.has(inst.id) ? ['held', BLOCK_TEXT.held] : undefined) ??
       (p.sidecar && inst.credentialFile ? ['credential_file', BLOCK_TEXT.credential_file] : undefined) ??
       (!trackOk(p.task, def?.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (!currentModel(inst) ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
@@ -391,24 +395,30 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       policyBlock ??
       gate(undefined) ??
       independenceBlock(undefined, undefined) ??
-      (p.reserved?.has(`spawn:${def.id}`) ? ['review_capacity', BLOCK_TEXT.review_capacity] : undefined) ??
+      (!p.qualificationOnly && p.reserved?.has(`spawn:${def.id}`) ? ['review_capacity', BLOCK_TEXT.review_capacity] : undefined) ??
       (!def.enabled ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
       (!trackOk(p.task, def.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (resolved === undefined ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
-      (seats >= def.maxInstances ? ['seat_full', `编制席位已满（${seats}/${def.maxInstances} 个实例，仓库 ${repoName(p.home)}）`] : undefined) ??
+      (!p.qualificationOnly && seats >= def.maxInstances ? ['seat_full', `编制席位已满（${seats}/${def.maxInstances} 个实例，仓库 ${repoName(p.home)}）`] : undefined) ??
       capHit(def.provider, def.quotaLimited === false, managedModel(def));
     entries.push({ kind: 'spawn', key: `spawn:${def.id}`, ref: def.id, role: p.role,
       provider: def.provider, model: resolved ?? def.model, def,
       weight: managedModel(def) ? 1 : effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2] });
   }
   const position = p.task ? p.factoryQueue?.get(factoryWorkKey(p.role,p.task,!!p.excludeSubmitter)) : undefined;
-  const factoryOnly = !quotaOf(FACTORY_PROVIDER) && factoryConfigured(p.defs,p.role,p.task) &&
-    (!p.task || !p.factoryQueue || (position !== undefined && position <= FACTORY_WAIT_LIMIT));
+  const factoryOnly = !p.qualificationOnly &&
+    (!p.task || !p.factoryQueue || (position !== undefined && position <= FACTORY_WAIT_LIMIT)) &&
+    factoryConfigured(p.defs,p.role,p.task) && staffingPool({...p,qualificationOnly:true}).some(entry=>entry.provider===FACTORY_PROVIDER && entry.eligible);
   if(factoryOnly) for(const entry of entries) {
     if(entry.provider === FACTORY_PROVIDER || !entry.eligible) continue;
     entry.eligible=false;
     entry.code='factory_wait';
     entry.reason=position === undefined ? BLOCK_TEXT.factory_wait : `${BLOCK_TEXT.factory_wait}（第 ${position}/${FACTORY_WAIT_LIMIT} 个保留等待名额）`;
+  }
+  if(!p.qualificationOnly && position!==undefined && position>FACTORY_WAIT_LIMIT && !quotaOf(FACTORY_PROVIDER)) {
+    for(const entry of entries) if(entry.provider!==FACTORY_PROVIDER && entry.eligible) {
+      entry.note=[entry.note,`Factory 已保留 ${FACTORY_WAIT_LIMIT} 个等待项，本任务第 ${position} 项允许分流`].filter(Boolean).join('；');
+    }
   }
   const total = entries.filter(e => e.eligible).reduce((s, e) => s + Math.max(0, e.weight), 0);
   for (const e of entries) e.share = e.eligible && total > 0 ? Math.max(0, e.weight) / total : 0;
@@ -1351,15 +1361,26 @@ export class Dispatcher {
       for(const wake of await wf.openManagerWakes().catch(()=>[])) activeManagerTasks.add(wake.taskId);
     }
     const factoryCanRoute = availabilityOf(health.get(FACTORY_PROVIDER),now) !== 'down' && !quotaBlocked.has(FACTORY_PROVIDER);
+    const poolBase = { factoryQueue:undefined as Map<string,number>|undefined, defs, states, holding, health, quotaBlocked, busyBy, policyBlocks,
+      providerMax: cfg.providerMax, slots: slotMap, runtimeModels, opsRepo: this.deps.env.opsRepo,
+      sidecar: !!this.deps.sidecar, now };
+    const queueRecusals = new Map<string,ReviewRecusal|undefined>();
+    for(const item of work.filter(item=>item.purpose==='review')) queueRecusals.set(item.task.id,await readReviewRecusal(wf,item.task,message=>this.log(message)));
     const factoryWaiting = factoryQueue([
       ...work.map(item=>({task:item.task,role:item.role,review:item.purpose==='review'})),
       ...gmBlocked.filter(task=>!task.waitState && !activeManagerTasks.has(task.id)).map(task=>({task,role:'gm',review:false})),
-    ].filter(item=>factoryCanRoute && !policyBlocks.has(item.task.id) && factoryConfigured(defs,item.role,item.task))
+    ].filter(item=>factoryCanRoute && !policyBlocks.has(item.task.id) && factoryConfigured(defs,item.role,item.task) &&
+      (!item.review || queueRecusals.get(item.task.id)!==undefined) &&
+      staffingPool({...poolBase,qualificationOnly:true,insts,role:item.role,home:item.task.repoPath??this.deps.env.opsRepo,task:item.task,
+        excludeSubmitter:item.review,recusal:item.review?queueRecusals.get(item.task.id):undefined,
+        implementer:executeGateFor(executeGates,item.role,item.task,item.review),
+        independence:independence.get(`${item.review?'review':'execute'}:${item.task.id}`)})
+        .some(entry=>entry.provider===FACTORY_PROVIDER && entry.eligible))
       .map(item=>({key:factoryWorkKey(item.role,item.task,item.review),createdAt:Date.parse(String(item.task.row.created_at??''))||undefined})));
     this.passInputs.factoryQueue=factoryWaiting;
-    const poolBase = { factoryQueue:factoryWaiting, defs, states, holding, health, quotaBlocked, busyBy, policyBlocks,
-      providerMax: cfg.providerMax, slots: slotMap, runtimeModels, opsRepo: this.deps.env.opsRepo,
-      sidecar: !!this.deps.sidecar, now };
+    poolBase.factoryQueue=factoryWaiting;
+    // Reservation order takes precedence over the ordinary review-first order for queued Factory work.
+    work.sort((a,b)=>(factoryWaiting.get(factoryWorkKey(a.role,a.task,a.purpose==='review'))??Infinity)-(factoryWaiting.get(factoryWorkKey(b.role,b.task,b.purpose==='review'))??Infinity));
     const freshTakeovers = new Map<string, { implementer: string; unavailable: string }>();
     const poolFor = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false, recusal?: ReviewRecusal,
       reserved?: ReadonlySet<string>) =>
@@ -1519,125 +1540,134 @@ export class Dispatcher {
     // and never guessed at, while the rest of the queue keeps moving. Items beyond the concurrency cap are recorded
     // after the loop as blocked by max_running.
     const unplaced: typeof work = [];
-    for (const item of work) {
-      if (running >= cfg.maxRunning) { unplaced.push(item); continue; }
-      const home = item.task.repoPath ?? this.deps.env.opsRepo;
-      // The binding outlives the employee: a struck implementer settles here, by automatic successor or by the block that says so.
-      if (item.purpose === 'execute' && item.task.executorRole === 'engineering') {
-        if (await replaceStruckImplementer(item.task, home)) continue;
-        const quota = persistentQuotaImplementer(item.task);
-        if (quota) {
-          await this.settleBlocked(item.task, 'execute', home,
-            [{ key: quota.employee, eligible: false, code: 'implementer_quota', until: quota.until,
-              reason: `已连续 ${quota.failures} 次额度失败` }], now, report);
-          continue;
+    const dispatchWorkItems = async (items: typeof work) => {
+      for (const item of items) {
+        if (running >= cfg.maxRunning) { unplaced.push(item); continue; }
+        const home = item.task.repoPath ?? this.deps.env.opsRepo;
+        // The binding outlives the employee: a struck implementer settles here, by automatic successor or by the block that says so.
+        if (item.purpose === 'execute' && item.task.executorRole === 'engineering') {
+          if (await replaceStruckImplementer(item.task, home)) continue;
+          const quota = persistentQuotaImplementer(item.task);
+          if (quota) {
+            await this.settleBlocked(item.task, 'execute', home,
+              [{ key: quota.employee, eligible: false, code: 'implementer_quota', until: quota.until,
+                reason: `已连续 ${quota.failures} 次额度失败` }], now, report);
+            continue;
+          }
         }
-      }
-      if (item.purpose === 'execute' && item.task.executorRole === 'engineering' && !executeGates.has(item.task.id)) {
-        await this.settleBlocked(item.task, 'execute', home, undefined, now, report);
-        continue;
-      }
-      const last = await wf.lastDispatch(item.task.id, item.task.version, item.purpose);
-      if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
-      // SYS-DISP R1: a same-lane or overlapping write scope held by another writer is a reason of its own. The claim would be
-      // refused, so nothing is spawned or claimed; the verdict names the holders and clears once they finish.
-      if (item.purpose === 'execute') {
-        const scope = await this.writeScopeBlock(item.task);
-        if (scope) {
-          await this.settleBlocked(item.task, 'execute', home, undefined, now, report, [scope]);
-          continue;
-        }
-      }
-      // SYS-DISP AC05 (R1): an engineering execute claim must leave the review that follows a legal path: a legal reuse
-      // reviewer who is not the implementer, or a compliant spare seat. Otherwise nothing is claimed and the block goes to the
-      // manager. The reserved reviewer is logical only: no review lease, and this task's execute pool may not pick it.
-      let reserved: ReadonlySet<string> | undefined;
-      if (item.purpose === 'execute' && item.task.executorRole === 'engineering' && item.task.reviewerRole !== 'owner') {
-        const authors = await readReviewRecusal(wf, item.task, message => this.log(message));
-        if (authors === undefined) {
+        if (item.purpose === 'execute' && item.task.executorRole === 'engineering' && !executeGates.has(item.task.id)) {
           await this.settleBlocked(item.task, 'execute', home, undefined, now, report);
           continue;
         }
-        // The future review of this task is judged with its review-stage independence too, so capacity is never reserved for a reviewer the policy excludes.
-        const reviewScope = item.task.independence ? await this.deps.workforce.independenceScope(item.task.independence, 'review') : undefined;
-        const reviewPlan = (recusal: ReviewRecusal, pool: EmployeeInst[] = insts) => reviewPlanOf(staffingPool({ ...poolBase,
-          insts: pool, role: item.task.reviewerRole, home, task: item.task, excludeSubmitter: true, recusal, independence: reviewScope }));
-        const plan = reviewPlan(authors);
-        if (!plan.feasible) {
-          const blocked = poolFor(item.role, home, item.task).map(entry => entry.eligible
-            ? { ...entry, eligible: false, code: 'review_capacity' as const }
+        const last = await wf.lastDispatch(item.task.id, item.task.version, item.purpose);
+        if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
+        // SYS-DISP R1: a same-lane or overlapping write scope held by another writer is a reason of its own. The claim would be
+        // refused, so nothing is spawned or claimed; the verdict names the holders and clears once they finish.
+        if (item.purpose === 'execute') {
+          const scope = await this.writeScopeBlock(item.task);
+          if (scope) {
+            await this.settleBlocked(item.task, 'execute', home, undefined, now, report, [scope]);
+            continue;
+          }
+        }
+        // SYS-DISP AC05 (R1): an engineering execute claim must leave the review that follows a legal path: a legal reuse
+        // reviewer who is not the implementer, or a compliant spare seat. Otherwise nothing is claimed and the block goes to the
+        // manager. The reserved reviewer is logical only: no review lease, and this task's execute pool may not pick it.
+        let reserved: ReadonlySet<string> | undefined;
+        if (item.purpose === 'execute' && item.task.executorRole === 'engineering' && item.task.reviewerRole !== 'owner') {
+          const authors = await readReviewRecusal(wf, item.task, message => this.log(message));
+          if (authors === undefined) {
+            await this.settleBlocked(item.task, 'execute', home, undefined, now, report);
+            continue;
+          }
+          // The future review of this task is judged with its review-stage independence too, so capacity is never reserved for a reviewer the policy excludes.
+          const reviewScope = item.task.independence ? await this.deps.workforce.independenceScope(item.task.independence, 'review') : undefined;
+          const reviewPlan = (recusal: ReviewRecusal, pool: EmployeeInst[] = insts) => reviewPlanOf(staffingPool({ ...poolBase,
+            insts: pool, role: item.task.reviewerRole, home, task: item.task, excludeSubmitter: true, recusal, independence: reviewScope }));
+          const plan = reviewPlan(authors);
+          if (!plan.feasible) {
+            const blocked = poolFor(item.role, home, item.task).map(entry => entry.eligible
+              ? { ...entry, eligible: false, code: 'review_capacity' as const }
+              : entry);
+            await this.settleBlocked(item.task, 'execute', home,
+              [...blocked, { key: '*', eligible: false, code: 'review_capacity' as const }], now, report, [],
+              otherRepoCount(insts, item.role, home, this.deps.env.opsRepo));
+            continue;
+          }
+          // An execute spawn takes a new seat of its def. That seat is not spare: the review must still have a reviewer
+          // once it is counted, otherwise the spawn is held for this task.
+          const held = new Set<string>(plan.reserve ? [plan.reserve] : []);
+          for (const entry of poolFor(item.role, home, item.task)) {
+            if (entry.kind !== 'spawn' || !entry.eligible) continue;
+            const seat = { id: `pending:${entry.key}`, def: entry.ref, role: item.role, provider: entry.provider,
+              model: entry.model, repoHome: home, cwd: home, workspaceScope: this.deps.sidecar ? workspaceScopeFor(item.task.goalId) : undefined } as EmployeeInst;
+            if (!reviewPlan({ authors: new Set([...authors.authors, seat.id]), hands: new Set() }, [...insts, seat]).feasible) held.add(entry.key);
+          }
+          if (held.size) {
+            reserved = held;
+            for (const key of held) report.decisions.push(`reserve:${item.task.id}=${key}`);
+          }
+        }
+        // 验收独立性：review 派工先取本任务回避名单——提交过本任务的作者硬回避
+        // （验收自己的交付等于没验收），仅 claim 过未提交的经手人降权兜底、不硬阻断。
+        // 历史读失败时名单未知：记为 unknown 并留在队列，不派复核；读取恢复后自动继续。
+        const recusal = item.purpose === 'review' ? queueRecusals.get(item.task.id) : undefined;
+        if (item.purpose === 'review' && recusal === undefined) {
+          await this.settleBlocked(item.task, 'review', home, undefined, now, report);
+          continue;
+        }
+        const pickItem = (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter = false,
+          pickRecusal?: ReviewRecusal, anchorHome?: string) => pick(role, task, avoid, excludeSubmitter, pickRecusal, anchorHome, reserved);
+        const spawnItem = (role: string, home: string, task?: SupervisedTask, forReview = false) =>
+          spawnable(role, home, task, forReview, reserved);
+        this.scopeDenied.delete(item.task.id);
+        const result = await this.assign(item.role, item.task, last?.employee, pickItem, spawnItem,
+          (inst, first, claim) => wake(inst, item.task, this.deps.env, first,
+            { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, item.purpose === 'review', slotMap, recusal, undefined, freshTakeovers.has(item.task.id) ? {
+            beforeClaim: async inst => {
+              const previous = freshTakeovers.get(item.task.id)!;
+              const moved = await this.deps.autoTakeover!({ taskId: item.task.id, toEmployee: inst.id,
+                expectedVersion: item.task.version,
+                reason: `自动接替：原实现人 ${previous.implementer} 已不可用（${previous.unavailable}），创建同仓新工程实例接续` });
+              if (!moved) throw new Error('fresh successor takeover lost its task version');
+              item.task.implementer = inst.id;
+              item.task.version++;
+              executeGates.set(item.task.id, { implementer: inst.id, unresolved: false });
+              report.decisions.push(`auto-takeover:${item.task.id}=${inst.id}`);
+            },
+          } : undefined);
+        if (!result) {
+          if (this.scopeDenied.delete(item.task.id)) {
+            // The claim lost the write scope: the same reason the preflight gives, never a wake failure.
+            const scope = (await this.writeScopeBlock(item.task)) ?? { code: 'write_scope' as const, text: BLOCK_TEXT.write_scope };
+            await this.settleBlocked(item.task, item.purpose, home, undefined, now, report, [scope]);
+            continue;
+          }
+          // Eligible candidates that still failed to wake or spawn are a runtime failure, not an empty pool. Entries held for
+          // review capacity stay review_capacity here: they were never candidates, so they are not a wake failure.
+          const entries = poolFor(item.role, home, item.task, item.purpose === 'review', recusal, reserved).map(entry => entry.eligible
+            ? { ...entry, eligible: false, code: 'wake_failed' as const, reason: '唤醒或创建失败，下一轮重试' }
             : entry);
-          await this.settleBlocked(item.task, 'execute', home,
-            [...blocked, { key: '*', eligible: false, code: 'review_capacity' as const }], now, report, [],
+          await this.settleBlocked(item.task, item.purpose, home, entries, now, report, [],
             otherRepoCount(insts, item.role, home, this.deps.env.opsRepo));
           continue;
         }
-        // An execute spawn takes a new seat of its def. That seat is not spare: the review must still have a reviewer
-        // once it is counted, otherwise the spawn is held for this task.
-        const held = new Set<string>(plan.reserve ? [plan.reserve] : []);
-        for (const entry of poolFor(item.role, home, item.task)) {
-          if (entry.kind !== 'spawn' || !entry.eligible) continue;
-          const seat = { id: `pending:${entry.key}`, def: entry.ref, role: item.role, provider: entry.provider,
-            model: entry.model, repoHome: home, cwd: home, workspaceScope: this.deps.sidecar ? workspaceScopeFor(item.task.goalId) : undefined } as EmployeeInst;
-          if (!reviewPlan({ authors: new Set([...authors.authors, seat.id]), hands: new Set() }, [...insts, seat]).feasible) held.add(entry.key);
-        }
-        if (held.size) {
-          reserved = held;
-          for (const key of held) report.decisions.push(`reserve:${item.task.id}=${key}`);
-        }
+        await this.clearBlocked(item.task, item.purpose);
+        await wf.recordDispatch(item.task.id, item.task.version, item.purpose, result.id);
+        running++;
+        busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);
+        assigned.add(result.id);
+        leaveFactoryQueue(factoryWaiting,factoryWorkKey(item.role,item.task,item.purpose==='review'));
+        report.woke.push({ task: item.task.id, employee: result.id, spawned: result.spawned });
       }
-      // 验收独立性：review 派工先取本任务回避名单——提交过本任务的作者硬回避
-      // （验收自己的交付等于没验收），仅 claim 过未提交的经手人降权兜底、不硬阻断。
-      // 历史读失败时名单未知：记为 unknown 并留在队列，不派复核；读取恢复后自动继续。
-      const recusal = item.purpose === 'review' ? await readReviewRecusal(wf, item.task, message => this.log(message)) : undefined;
-      if (item.purpose === 'review' && recusal === undefined) {
-        await this.settleBlocked(item.task, 'review', home, undefined, now, report);
-        continue;
-      }
-      const pickItem = (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter = false,
-        pickRecusal?: ReviewRecusal, anchorHome?: string) => pick(role, task, avoid, excludeSubmitter, pickRecusal, anchorHome, reserved);
-      const spawnItem = (role: string, home: string, task?: SupervisedTask, forReview = false) =>
-        spawnable(role, home, task, forReview, reserved);
-      this.scopeDenied.delete(item.task.id);
-      const result = await this.assign(item.role, item.task, last?.employee, pickItem, spawnItem,
-        (inst, first, claim) => wake(inst, item.task, this.deps.env, first,
-          { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, item.purpose === 'review', slotMap, recusal, undefined, freshTakeovers.has(item.task.id) ? {
-          beforeClaim: async inst => {
-            const previous = freshTakeovers.get(item.task.id)!;
-            const moved = await this.deps.autoTakeover!({ taskId: item.task.id, toEmployee: inst.id,
-              expectedVersion: item.task.version,
-              reason: `自动接替：原实现人 ${previous.implementer} 已不可用（${previous.unavailable}），创建同仓新工程实例接续` });
-            if (!moved) throw new Error('fresh successor takeover lost its task version');
-            item.task.implementer = inst.id;
-            item.task.version++;
-            executeGates.set(item.task.id, { implementer: inst.id, unresolved: false });
-            report.decisions.push(`auto-takeover:${item.task.id}=${inst.id}`);
-          },
-        } : undefined);
-      if (!result) {
-        if (this.scopeDenied.delete(item.task.id)) {
-          // The claim lost the write scope: the same reason the preflight gives, never a wake failure.
-          const scope = (await this.writeScopeBlock(item.task)) ?? { code: 'write_scope' as const, text: BLOCK_TEXT.write_scope };
-          await this.settleBlocked(item.task, item.purpose, home, undefined, now, report, [scope]);
-          continue;
-        }
-        // Eligible candidates that still failed to wake or spawn are a runtime failure, not an empty pool. Entries held for
-        // review capacity stay review_capacity here: they were never candidates, so they are not a wake failure.
-        const entries = poolFor(item.role, home, item.task, item.purpose === 'review', recusal, reserved).map(entry => entry.eligible
-          ? { ...entry, eligible: false, code: 'wake_failed' as const, reason: '唤醒或创建失败，下一轮重试' }
-          : entry);
-        await this.settleBlocked(item.task, item.purpose, home, entries, now, report, [],
-          otherRepoCount(insts, item.role, home, this.deps.env.opsRepo));
-        continue;
-      }
-      await this.clearBlocked(item.task, item.purpose);
-      await wf.recordDispatch(item.task.id, item.task.version, item.purpose, result.id);
-      running++;
-      busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);
-      assigned.add(result.id);
-      leaveFactoryQueue(factoryWaiting,factoryWorkKey(item.role,item.task,item.purpose==='review'));
-      report.woke.push({ task: item.task.id, employee: result.id, spawned: result.spawned });
-    }
+    };
+    // Older manager work must get its chance before newer jobs borrow Factory capacity.
+    const lateWork = work.filter(item => {
+      const position=factoryWaiting.get(factoryWorkKey(item.role,item.task,item.purpose==='review'));
+      return position!==undefined && [...factoryWaiting].some(([key,n])=>key.endsWith(':manager') && n<position);
+    });
+    const lateKeys=new Set(lateWork.map(item=>item.task.id));
+    await dispatchWorkItems(work.filter(item=>!lateKeys.has(item.task.id)));
     if (unplaced.length) await this.markGlobal(unplaced, globalBlock('max_running'), now, report, true);
 
     // Manager actions: a ready/doing engineering task whose execute verdict needs a manager decision (unresolved
@@ -1876,6 +1906,16 @@ export class Dispatcher {
       pendingGm.length = 0;
     }
 
+    // Only manager episodes still awaiting a real wake consume waiting slots.
+    const pendingManagerKeys=new Set(pendingGm.map(todo=>factoryWorkKey('gm',todo.task)));
+    for(const key of [...factoryWaiting.keys()]) if(key.endsWith(':manager') && !pendingManagerKeys.has(key)) leaveFactoryQueue(factoryWaiting,key);
+    const dispatchLateBefore = async (position = Infinity) => {
+      const ready=lateWork.filter(item=>(factoryWaiting.get(factoryWorkKey(item.role,item.task,item.purpose==='review'))??Infinity)<position || position===Infinity);
+      for(const item of ready) lateWork.splice(lateWork.indexOf(item),1);
+      const before=unplaced.length;
+      await dispatchWorkItems(ready);
+      if(unplaced.length>before) await this.markGlobal(unplaced.slice(before),globalBlock('max_running'),now,report,true);
+    };
     const granted: Array<{ todo: PendingGm; claim: ManagerWakeClaim }> = [];
     for (const todo of pendingGm) {
       const home = todo.task.repoPath ?? this.deps.env.opsRepo;
@@ -1918,7 +1958,11 @@ export class Dispatcher {
       const group = gmGroups.get(key);
       if (group) group.push(item); else gmGroups.set(key, [item]);
     }
-    for (const group of gmGroups.values()) {
+    const orderedGmGroups=[...gmGroups.values()].sort((a,b)=>
+      Math.min(...a.map(item=>factoryWaiting.get(factoryWorkKey('gm',item.todo.task))??Infinity))-
+      Math.min(...b.map(item=>factoryWaiting.get(factoryWorkKey('gm',item.todo.task))??Infinity)));
+    for (const group of orderedGmGroups) {
+      await dispatchLateBefore(Math.min(...group.map(item=>factoryWaiting.get(factoryWorkKey('gm',item.todo.task))??Infinity)));
       if (running >= cfg.maxRunning) {
         for (const item of group) {
           await wf.finishManagerWake(item.claim, 'finished', 'max_running gate held the wake').catch(error =>
@@ -1988,6 +2032,8 @@ export class Dispatcher {
       assigned.add(result.id);
       report.woke.push(...group.map(item => ({ task: item.todo.task.id, employee: result!.id, spawned: result!.spawned })));
     }
+
+    await dispatchLateBefore();
 
     // SYS03 AC04：持久 outbox 的持有人通知。取消/依赖等待/恢复/撤租/接手/结果未知都已经和审计在同一个事务里落库，
     // 这里只负责把还没投递的通知送进仍在线、仍空闲的持有人会话——通道重连或插件重启后的补发走的是同一条路径。
