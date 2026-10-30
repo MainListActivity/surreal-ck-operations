@@ -50,6 +50,8 @@ export interface UsageStat {
 export interface QuotaAccount {account:string;provider?:string;singleAccount?:boolean;poolKey?:string;kind?:'subscription'|'plan'|'api'|'unknown';readAt?:string;until?:string;renew?:string;remainingPct?:number;windows?:QuotaWindow[]}
 export interface QuotaWindow {pool?:string;nonCarryOver?:boolean;name?:string;model?:string;remainingPct:number;resetsAt?:string;runsOutAt?:string;runsOut?:number;unit?:string;limit?:number;amount?:number}
 export interface ModelFacts {
+  /** Latest actual Magpie request, never the observation refresh timestamp. */
+  lastRequestAt?:string;
   trends?: ModelTrends;
   trendSource?: { source: string; available: boolean; invalidLines: number; collectedAt: string };
   id: string;
@@ -275,7 +277,7 @@ export interface RankingTable {
 export function rankingTables(groups: Record<string,string[]>, results: Record<string,RankingResultSnapshot> = {}, requests: RankingRequestSnapshot[] = [], pins: RankingPins = {}, gates:RankingGates = {}): RankingTable[] {
   return (["haiku","sonnet","opus","fable"] as Tier[]).map(tier => {
     const group = `sck-${tier}`, result = results[group], gate=gates[group];
-    const bandWidth=[RULE_ENGINE,'quality-pace-v5'].includes(result?.engine??'')?undefined:result?.policy?.bandWidth??(result?.engine==='quality-pace-v1'?2:undefined);
+    const bandWidth=[RULE_ENGINE,'quality-pace-v6','quality-pace-v5'].includes(result?.engine??'')?undefined:result?.policy?.bandWidth??(result?.engine==='quality-pace-v1'?2:undefined);
     const bandRanges:Record<string,{top:number;bottom:number}>={};
     if(bandWidth!==undefined)for(const r of result?.rows??[]){
       if(r.decision?.band===undefined||typeof r.facts.aa?.score!=='number'||!Number.isFinite(r.facts.aa.score))continue;

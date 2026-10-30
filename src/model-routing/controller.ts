@@ -375,6 +375,7 @@ export class ModelRoutingController {
       inputPrice:f.price.input??undefined, outputPrice:f.price.output??undefined, cacheHitPrice:f.price.cacheHit??undefined,
     }])),now);
     for (const f of facts) {
+      f.lastRequestAt=observations?.lastRequestAt?.get(splitMember(f.id).id);
       const trends: ModelTrends = {};
       const raw=observations?.rows.get(splitMember(f.id).id)??{};
       for(const [name,unit] of Object.entries({ttftMs:"ms",tokensPerSecond:"tokens/s",errorRate:"ratio",cacheHitRate:"ratio",ttftOver10sRate:"ratio",ttftOver20sRate:"ratio"}))

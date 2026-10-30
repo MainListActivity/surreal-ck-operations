@@ -84,10 +84,10 @@ export function nativeDecode(r: Record<string, unknown>): number | undefined {
   return out*1000/window;
 }
 export interface LargeRequest {id:string;model:string;at:number;accountKey?:string}
-export interface UsageSamples { largeRequests?:LargeRequest[]; rows: Map<string, Record<string,Sample[]>>; invalid: number }
+export interface UsageSamples { lastRequestAt?:Map<string,string>; largeRequests?:LargeRequest[]; rows: Map<string, Record<string,Sample[]>>; invalid: number }
 /** Stream only numeric observations into memory. Accounts, request bodies and session IDs never enter the trend store. */
 export async function readUsageSamples(now: number, file = join(homedir(),'.config/magpie/usage.jsonl')): Promise<UsageSamples> {
-  const rows = new Map<string,Record<string,Sample[]>>(); let invalid=0;const largeRequests:LargeRequest[]=[];
+  const rows = new Map<string,Record<string,Sample[]>>(); let invalid=0;const latestRequests=new Map<string,number>();const largeRequests:LargeRequest[]=[];
   const records:Array<{key:string;at:number;metrics:Record<string,number>;failed:boolean;rejected:boolean;handedOn:boolean}>=[];
   const routes=new Map<string,number>();
   const stream=createReadStream(file,{encoding:'utf8'});
@@ -97,8 +97,11 @@ export async function readUsageSamples(now: number, file = join(homedir(),'.conf
       let r:Record<string,unknown>;try{r=JSON.parse(line);}catch{invalid++;continue;}
       if(!r||typeof r!=='object'||Array.isArray(r)){invalid++;continue;}
       const at=typeof r.t==='string'?Date.parse(r.t):NaN;
-      if(!finite(at)||at>now||at<now-7*DAY||typeof r.provider!=='string'||typeof r.model!=='string')continue;
+      if(!finite(at)||at>now||typeof r.provider!=='string'||typeof r.model!=='string')continue;
       if(!finite(r.status)||r.status<0){invalid++;continue;}
+      const modelKey=`${r.provider}/${r.model}`;
+      if(at>(latestRequests.get(modelKey)??-Infinity))latestRequests.set(modelKey,at);
+      if(at<now-7*DAY)continue;
       const metrics:Record<string,number>={};
       const put=(name:string,value:unknown)=>{if(finite(value))metrics[name]=value;};
       const failed=(typeof r.err==='string'&&r.err.length>0)||r.status>=400;
@@ -130,7 +133,7 @@ export async function readUsageSamples(now: number, file = join(homedir(),'.conf
     for(const [name,value] of Object.entries(r.metrics))(metrics[name]??=[]).push({at:r.at,value});
     rows.set(r.key,metrics);
   }
-  return {rows,invalid,largeRequests};
+  return {rows,invalid,largeRequests,lastRequestAt:new Map([...latestRequests].map(([key,at])=>[key,new Date(at).toISOString()]))};
 }
 
 /** Sparse gauges are recorded only when their value/source version changes, never once per Jev read. */

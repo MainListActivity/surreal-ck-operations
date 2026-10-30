@@ -21,7 +21,7 @@ run('fork: deterministic ranking persists across reconnect without Jev or overwr
   applied.length=0;refresher.trigger(0);await refresher.settled();expect(calls).toBe(0);expect(applied).toEqual([{'sck-sonnet':['a/fast','a/slow'],'sck-haiku':['a/slow','a/fast']}]);
   expect(await rankingRequests(db.db)).toEqual([]);
   const [status]=await db.db.query<[any]>('SELECT * FROM ONLY company_meta:model_ranking;');
-  expect(status.orders.kept).toEqual(['old/model']);expect(status.results['sck-haiku']).toMatchObject({engine:'quality-pace-v6',answers:{}});
+  expect(status.orders.kept).toEqual(['old/model']);expect(status.results['sck-haiku']).toMatchObject({engine:'quality-pace-v7',answers:{}});
   expect(status.results['sck-haiku'].rows[0].score).toBeUndefined();expect(status.results['sck-haiku'].rows[0].decision.tail).toBeUndefined();expect(status.results['sck-haiku'].rows[0].decision.factors.latency).toBeLessThan(0.5);
   const reconnected=new CompanyDatabase(config);try{
    await reconnected.connect();await reconnected.useDatabase();
