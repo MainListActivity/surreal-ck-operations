@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  magpieBase, missingFrom, readMagpieQuotas, toUsageEntry, usageEntriesFrom, windowId,
+  magpieBase, missingFrom, poolRoom, readMagpieQuotas, toUsageEntry, usageEntriesFrom, windowId,
   type MagpieProvider,
 } from '../src/dispatcher/magpie-quota.ts';
 
@@ -123,5 +123,20 @@ describe('reading the snapshot', () => {
   test('a bare array body is accepted as well as { data }', async () => {
     const entries = await readMagpieQuotas({ base: 'http://x', fetchImpl: ok([provider({ provider: 'claude' })]) });
     expect(entries!.map(e => e.providerId)).toEqual(['claude']);
+  });
+});
+
+describe('pool room', () => {
+  test('windows of one pool all bind, pools are alternatives', () => {
+    // Factory: standard 5h/7d/30d have room, Droid Core 30d is spent -> the provider can still work.
+    expect(poolRoom([
+      { id: 'five_hour', pct: 99 }, { id: 'weekly', pct: 99 }, { id: 'monthly', pct: 99 },
+      { id: 'core_five_hour', pct: 100 }, { id: 'core_weekly', pct: 100 }, { id: 'core_monthly', pct: 0 },
+    ])).toBe(99);
+    // One spent window inside a pool blocks that pool.
+    expect(poolRoom([{ id: 'five_hour', pct: 90 }, { id: 'monthly', pct: 0 }])).toBe(0);
+    // Both pools spent -> blocked; no windows -> unknown.
+    expect(poolRoom([{ id: 'monthly', pct: 0 }, { id: 'core_monthly', pct: 0 }])).toBe(0);
+    expect(poolRoom([])).toBeUndefined();
   });
 });

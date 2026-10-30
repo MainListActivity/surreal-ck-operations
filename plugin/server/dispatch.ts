@@ -12,7 +12,7 @@ import { isCompanyAgent } from "./company-agent";
 import { dirname, join } from "node:path";
 import { serviceHome } from "./env";
 import { sweepArchiveBatches, sweepInstanceDirs } from "./vendor/src/dispatcher/lifecycle-gc.ts";
-import { missingFrom, readMagpieQuotas, type MagpieUsageEntry } from "./vendor/src/dispatcher/magpie-quota.ts";
+import { missingFrom, poolRoom, readMagpieQuotas, type MagpieUsageEntry } from "./vendor/src/dispatcher/magpie-quota.ts";
 import { readProviderQuotas, readQuotaEntries } from "./vendor/src/dispatcher/quota-store.ts";
 export { readProviderQuotas };
 
@@ -41,30 +41,28 @@ function providerQuotaSummary(entry: ProviderUsageEntry): string {
 
 /** Lowest remaining percentage across windows and balances; undefined when the provider reports no numbers. */
 function lowestRemainingPct(entry: ProviderUsageEntry): number | undefined {
-  const pcts = windowPcts(entry, "all");
-  return pcts.length ? Math.min(...pcts) : undefined;
+  return poolRoom(windowPcts(entry, "all"));
 }
 
 /** Long billing windows get a much lower circuit-breaker floor than the 5h/session window. */
 const isLongWindow = (id: string) => /week|month|billing|cycle/i.test(id);
 
-function windowPcts(entry: ProviderUsageEntry, scope: "short" | "long" | "all"): number[] {
-  const pcts: number[] = [];
+function windowPcts(entry: ProviderUsageEntry, scope: "short" | "long" | "all"): Array<{ id: string; pct: number }> {
+  const pcts: Array<{ id: string; pct: number }> = [];
   for (const w of entry.windows ?? []) {
     if (w.remainingPct == null) continue;
-    if (scope === "all" || isLongWindow(w.id) === (scope === "long")) pcts.push(w.remainingPct);
+    if (scope === "all" || isLongWindow(w.id) === (scope === "long")) pcts.push({ id: w.id, pct: w.remainingPct });
   }
   if (scope !== "long") {
     for (const b of entry.balances ?? []) {
-      if (b.remaining != null && b.limit != null && b.limit > 0) pcts.push((b.remaining / b.limit) * 100);
+      if (b.remaining != null && b.limit != null && b.limit > 0) pcts.push({ id: b.id, pct: (b.remaining / b.limit) * 100 });
     }
   }
   return pcts;
 }
 
 function splitLowestPct(entry: ProviderUsageEntry): { session: number | undefined; weekly: number | undefined } {
-  const s = windowPcts(entry, "short"), w = windowPcts(entry, "long");
-  return { session: s.length ? Math.min(...s) : undefined, weekly: w.length ? Math.min(...w) : undefined };
+  return { session: poolRoom(windowPcts(entry, "short")), weekly: poolRoom(windowPcts(entry, "long")) };
 }
 
 function formatProviderUsage(entry: ProviderUsageEntry): string {
