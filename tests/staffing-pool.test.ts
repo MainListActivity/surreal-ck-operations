@@ -378,3 +378,23 @@ test('managed recency order: least recently woken first, a prior hand last, and 
   // No recorded wake is never a claim to be the stalest session.
   expect(managedRecencyOrder([at('never'), at('woken', 50)]).map(i => i.id)).toEqual(['woken', 'never']);
 });
+
+test('Factory queue admission preserves recusal and allows overflow and exhausted-quota fallback',()=>{
+ const factory=def('factory',{provider:'factory-droid',maxInstances:1});
+ const claude=def('claude',{provider:'claude',model:'group/sck-haiku',quotaLimited:false});
+ const f=inst('f',{def:'factory',provider:'factory-droid'}),c=inst('c',{def:'claude',provider:'claude',model:'group/sck-haiku'});
+ const t={id:'queued',state:'review',executorRole:'engineering',reviewerRole:'engineering',row:{}} as unknown as SupervisedTask;
+ const input=base({defs:[factory,claude],insts:[f,c],task:t,excludeSubmitter:true,states:new Map([['f','busy'],['c','idle']]),providerMax:{'factory-droid':1,claude:4},factoryQueue:new Map([['queued:engineering:review',3]])});
+ expect(staffingPool(input).find(e=>e.key==='c')).toMatchObject({eligible:false,code:'factory_wait',share:0});
+ expect(staffingPool({...input,factoryQueue:new Map([['queued:engineering:review',4]])}).find(e=>e.key==='c')?.eligible).toBe(true);
+ expect(staffingPool({...input,quotaBlocked:new Map([['factory-droid','exhausted']])}).find(e=>e.key==='c')?.eligible).toBe(true);
+ expect(staffingPool({...input,recusal:{authors:new Set(['c']),hands:new Set()}}).find(e=>e.key==='c')?.code).toBe('author_recusal');
+});
+
+test('an unresolved Factory definition cannot reserve a task over qualified Claude',()=>{
+ const factory=def('factory',{provider:'factory-droid',model:'auto:missing',maxInstances:1});
+ const claude=def('claude',{provider:'claude',model:'group/sck-haiku',quotaLimited:false});
+ const f=inst('f',{def:'factory',provider:'factory-droid'}),c=inst('c',{def:'claude',provider:'claude',model:'group/sck-haiku'});
+ const entries=staffingPool(base({defs:[factory,claude],insts:[c],states:new Map([['c','idle']]),providerMax:{'factory-droid':1,claude:4}}));
+ expect(entries.find(e=>e.key==='c')?.eligible).toBe(true);
+});

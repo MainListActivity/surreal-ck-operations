@@ -28,7 +28,7 @@ export type BlockCode =
   | 'paused' | 'budget' | 'resources' | 'max_running'
   | 'implementer_mismatch' | 'implementer_unresolved' | 'implementer_unavailable' | 'implementer_quota' | 'author_recusal' | 'independence_conflict' | 'no_candidate'  | 'session_busy' | 'held' | 'assigned' | 'credential_file' | 'track_mismatch' | 'model_slot'
   | 'quota' | 'probe_busy' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'wake_failed' | 'unknown' | 'review_capacity'
-  | 'write_scope' | 'policy_blocked';
+  | 'write_scope' | 'policy_blocked' | 'factory_wait';
 
 /** One staffing entry, reduced to what the evaluator reads. `key` is the employee id or `spawn:<def>`. */
 export interface EvaluatedEntry {
@@ -133,6 +133,7 @@ const PERMANENT: ReadonlySet<BlockCode> = new Set<BlockCode>([
 
 /** Owner-facing text per code. The staffing pool and the evaluator both read this table. */
 export const BLOCK_TEXT: Record<BlockCode, string> = {
+  factory_wait: 'Factory 仍有额度，本任务保留等待 Factory；已有 3 个等待任务后新任务可分流',
   paused: '全局暂停派工',
   budget: '订阅额度耗尽或限流',
   resources: '宿主机资源低于水位',
@@ -163,6 +164,7 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
 };
 
 const OWNER: Record<BlockCode, RecoveryAuthority> = {
+  factory_wait: 'system',
   paused: 'gm', budget: 'owner', resources: 'gm', max_running: 'gm',
   implementer_mismatch: 'gm', implementer_unresolved: 'gm', implementer_unavailable: 'system', implementer_quota: 'gm', author_recusal: 'gm', independence_conflict: 'gm', no_candidate: 'gm',  session_busy: 'gm', held: 'gm', assigned: 'gm', credential_file: 'gm', track_mismatch: 'gm', model_slot: 'gm',
   quota: 'owner', provider_capacity: 'gm', seat_full: 'gm', def_disabled: 'gm', wake_failed: 'gm', unknown: 'gm',
@@ -171,6 +173,7 @@ const OWNER: Record<BlockCode, RecoveryAuthority> = {
 };
 
 const RECOVERY: Record<BlockCode, string> = {
+  factory_wait: '等待 Factory 空闲后自动派工；额度耗尽后回退其他合格员工',
   paused: '经理解除全局暂停',
   budget: '老板充值，或等待额度恢复',
   resources: '清理宿主机磁盘或等待水位恢复',
@@ -201,6 +204,7 @@ const RECOVERY: Record<BlockCode, string> = {
 };
 
 const NEXT: Record<BlockCode, string> = {
+  factory_wait: 'Factory 空闲或额度状态变化',
   paused: '全局暂停解除',
   budget: '额度恢复或老板充值',
   resources: '宿主机水位恢复',
@@ -232,6 +236,7 @@ const NEXT: Record<BlockCode, string> = {
 
 /** The source each code is read from. Stable strings: the roster, the cards and the brief show them as they are. */
 const BASIS: Record<BlockCode, string> = {
+  factory_wait: 'tick:factory-queue',
   paused: 'tick:global-gate', budget: 'tick:global-gate', resources: 'tick:global-gate', max_running: 'tick:global-gate',
   implementer_mismatch: 'contribution-audit', implementer_unresolved: 'contribution-audit', implementer_unavailable: 'tick:session-status', implementer_quota: 'tick:provider-health', author_recusal: 'contribution-audit',
   independence_conflict: 'contribution-audit',  no_candidate: 'tick:staffing-pool', session_busy: 'paseo:session-status', held: 'tick:staffing-pool', assigned: 'tick:staffing-pool',
@@ -245,6 +250,7 @@ const BASIS: Record<BlockCode, string> = {
 
 /** Recovery actions per code. Only the ones with a tool are executable; the rest name who must act outside the system. */
 const ACTIONS: Record<BlockCode, RecoveryAction[]> = {
+  factory_wait: [{authority:'system',label:'等待 Factory 空闲后自动重试；队列之外的任务可分流',executable:false}],
   paused: [{ authority: 'gm', label: '经理解除全局暂停', executable: false }],
   budget: [{ authority: 'owner', label: '老板充值，或等待额度恢复', executable: false }],
   resources: [{ authority: 'gm', label: '清理宿主机磁盘或等待水位恢复', executable: false }],
