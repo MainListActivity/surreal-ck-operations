@@ -347,3 +347,100 @@ run('G1: approval machine-rejects sampler == accepted_by; sampler-less legacy ca
   const legacy = await approvalWorld({ candidate: { digest }, acceptedBy: approver.id });
   expect((await proof.approval(legacy.taskId, 'production', files)).reviewer).toBe(approver.id);
 });
+
+// ---- 复验修复面（R1–R4）：标记生命周期、admission 补口、sampler 校验、幂等与 clamp ----
+
+run('R1: standby→submit→reviewer claim never triggers wake/timeout; the stale marker cannot destroy later leases', async () => {
+  const gm = await actor('gm');
+  const { taskId, window } = await windowedBlockedTask('标记生命周期', 'qa');
+  const standby = await actor('qa');
+  await core.resumeStandby(gm.cred, taskId, { ...text('待命后提交'), executionWindow: window }, standby.id);
+  expect((await rowOf(taskId))!.standby_until).toBeTruthy();
+  // 待命持有人提交：任务进复核相位——旧 deadline 不得再管辖这条租约
+  const holderRow = await rowOf(taskId);
+  const submitProof = { taskId, deliveryId: String(holderRow!.delivery_id), fence: holderRow!.fence as number, expectedVersion: holderRow!.version as number };
+  await core.submit(standby.cred, submitProof, text('待命接力工作完成，交独立复核'));
+  expect((await rowOf(taskId))!.state).toBe('review');
+  // state=doing 门：复核相位上 standbyTimeout 必须拒绝，租约原样
+  expect(await wf.standbyTimeout(taskId, standby.id, '超时（应被拒）', 'x')).toBe(false);
+  // 复核者领取：新领清除旧标记
+  const reviewer = await actor('qa');
+  const reviewClaim = await core.claim(reviewer.cred, taskId);
+  expect(reviewClaim.task.state).toBe('review');
+  expect((await rowOf(taskId))!.standby_until ?? null).toBeNull();
+  expect(await wf.standbyTimeout(taskId, reviewer.id, '超时（应被拒）', 'x')).toBe(false);
+  const after = await rowOf(taskId);
+  expect(after!.state).toBe('review');
+  expect(after!.current_employee).toBe(reviewer.id);
+  expect(after!.lease_expires_at).toBeTruthy();
+});
+
+run('R1: revoke→reclaim clears the marker; the next holder is never timeout-reclaimed (路径 B)', async () => {
+  const gm = await actor('gm');
+  const { taskId, window } = await windowedBlockedTask('收回再领取', 'qa');
+  const standby = await actor('qa');
+  await core.resumeStandby(gm.cred, taskId, { ...text('待命后会被收回'), executionWindow: window }, standby.id);
+  expect(await wf.revokeLease(taskId, standby.id, '会话中断', '【交接包】fixture')).toBe(true);
+  const revoked = await rowOf(taskId);
+  expect(revoked!.state).toBe('ready');
+  expect(revoked!.standby_until ?? null).toBeNull();
+  const next = await actor('qa');
+  await core.claim(next.cred, taskId);
+  expect((await rowOf(taskId))!.standby_until ?? null).toBeNull();
+  expect(await wf.standbyTimeout(taskId, next.id, '超时（应被拒）', 'x')).toBe(false);
+});
+
+run('R2: admission checks execute capability and unmet dependencies; verify_standby codes them', async () => {
+  const gm = await actor('gm');
+  const { taskId, window } = await windowedBlockedTask('能力与依赖预检', 'qa');
+  const reviewOnlyId = `sb-qa-ro-${++count}`;
+  await admin.enroll(reviewOnlyId, 'qa', ['review']);
+  const noCap = await core.verifyStandby(gm.cred, { items: [{ taskId, employeeId: reviewOnlyId, executionWindow: window }], idempotencyKey: `verify-cap-${count}` });
+  expect(noCap.items[0]).toMatchObject({ ok: false, code: 'standby_capability_denied' });
+  // 依赖未满足：额外挂一个未完成前置
+  const unfinished = await gmTask('product', 'product');
+  await db.db.query('UPDATE $task SET dependencies = array::append(dependencies, $extra);', { task: new RecordId('task', taskId), extra: new RecordId('task', unfinished.id) });
+  const standby = await actor('qa');
+  const unmet = await core.verifyStandby(gm.cred, { items: [{ taskId, employeeId: standby.id, executionWindow: window }], idempotencyKey: `verify-dep-${count}` });
+  expect(unmet.items[0]).toMatchObject({ ok: false, code: 'dependencies_unmet' });
+  // 前置完成后预检放行
+  await db.db.query("UPDATE $extra SET state='done';", { extra: new RecordId('task', unfinished.id) });
+  const okNow = await core.verifyStandby(gm.cred, { items: [{ taskId, employeeId: standby.id, executionWindow: window }], idempotencyKey: `verify-dep2-${count}` });
+  expect(okNow.items[0]).toMatchObject({ ok: true });
+});
+
+run('R3: prepare validates the sampler is a registered active employee', async () => {
+  const { taskId, holder } = await approvalWorld({});
+  const lease = proofLease(taskId, holder);
+  expect(await proof.prepare(lease, 'production', fakeFiles('c'.repeat(64)), 'sb-ghost').catch(e => e.code)).toBe('invalid');
+  const sampler = await actor('engineering');
+  await proof.prepare(lease, 'production', fakeFiles('c'.repeat(64)), sampler.id);
+  await db.db.query('UPDATE $e SET revoked = true;', { e: new RecordId('employee', sampler.id) });
+  const second = await approvalWorld({});
+  expect(await proof.prepare(proofLease(second.taskId, second.holder), 'production', fakeFiles('c'.repeat(64)), sampler.id).catch(e => e.code)).toBe('invalid');
+});
+
+run('R4: verify_standby replays idempotently (no duplicate audits) and the budget clamps to the lease', async () => {
+  const gm = await actor('gm');
+  const { taskId, window } = await windowedBlockedTask('幂等预检', 'qa');
+  const standby = await actor('qa');
+  const key = `verify-idem-${count}-${crypto.randomUUID()}`;
+  const first = await core.verifyStandby(gm.cred, { items: [{ taskId, employeeId: standby.id, executionWindow: window }], idempotencyKey: key });
+  const replay = await core.verifyStandby(gm.cred, { items: [{ taskId, employeeId: standby.id, executionWindow: window }], idempotencyKey: key });
+  expect(replay.items).toEqual(first.items);
+  const [audits] = await db.db.query<[Array<{ count: number }>]>('SELECT count() AS count FROM audit WHERE task = $task AND action = \'verify_standby\' GROUP ALL;', { task: new RecordId('task', taskId) });
+  expect(audits[0]!.count).toBe(1);
+  // 同键不同输入 → conflict
+  const other = await actor('qa');
+  expect(await core.verifyStandby(gm.cred, { items: [{ taskId, employeeId: other.id, executionWindow: window }], idempotencyKey: key }).catch(e => e.code)).toBe('conflict');
+  // 预算 clamp：配置 900s > 租约 600s → standby_until 不晚于租约到期
+  await db.db.query('UPSERT company_meta:config MERGE { standby_budget_seconds: 900 };');
+  const clampedTask = (await windowedBlockedTask('预算收敛', 'qa'));
+  const holder = await actor('qa');
+  const resumed = await core.resumeStandby(gm.cred, clampedTask.taskId, { ...text('配置超预算时收敛到租约长度'), executionWindow: clampedTask.window }, holder.id);
+  const standbySec = Math.floor(Date.parse(resumed.standbyUntil!) / 1000);
+  const leaseSec = Math.floor(Date.parse(resumed.leaseExpiresAt!) / 1000);
+  expect(standbySec).toBeLessThanOrEqual(leaseSec);
+  expect(leaseSec - standbySec).toBeLessThanOrEqual(2);
+  await db.db.query('UPSERT company_meta:config MERGE { standby_budget_seconds: 600 };');
+});

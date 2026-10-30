@@ -163,3 +163,34 @@ test('⑦ a doing standby task with a holder never re-enters the dispatch pool (
   // 唯一动作是 standby 唤醒
   expect(f.sends.filter(s => s.prompt.includes('sb-atomic'))).toHaveLength(1);
 });
+
+test('⑧ state gate: a review-state task with a stale marker gets no wake and no standbyTimeout（复核租约不受旧 deadline 管辖）', async () => {
+  const f = fixture([{ id: 'sb-review', state: 'ready', repoPath: '/fixture/ops' }]);
+  doingHeld(f, 'sb-review', { standbyUntil: NOW - 10, status: 'idle', worktree: false });
+  // submit 之后：state=review，持有人未变（租约未清的间隙）
+  const row = f.rows.find(r => r.id === 'sb-review')!;
+  row.state = 'review';
+  const sc = sidecarSpy();
+  const { calls, wf } = spies(f);
+  await f.tick({ workforce: wf as never, sidecar: { ...sc.bridge } as unknown as SidecarBridge });
+  expect(sc.calls.adoptLease).toHaveLength(0);
+  expect(calls.standbyTimeout).toHaveLength(0);
+  expect(calls.revokeLease).toHaveLength(0);
+  expect(f.sends.filter(s => s.prompt.includes('sb-review'))).toHaveLength(0);
+});
+
+test('⑨ state gate: a ready-state task with a residual marker follows the ordinary rules（收回后的残留标记不再触发超时回关口）', async () => {
+  const f = fixture([{ id: 'sb-residual', state: 'ready', repoPath: '/fixture/ops' }]);
+  doingHeld(f, 'sb-residual', { standbyUntil: NOW - 10, status: 'idle', worktree: false });
+  // revokeLease 之后：state=ready 无主——残留标记由普通派工接管
+  const row = f.rows.find(r => r.id === 'sb-residual')!;
+  row.state = 'ready';
+  row.currentEmployee = undefined;
+  const raw = row.row as unknown as Record<string, unknown>;
+  delete raw.current_employee;
+  const { calls, wf } = spies(f);
+  const result = await f.tick({ workforce: wf as never });
+  expect(calls.standbyTimeout).toHaveLength(0);
+  // 无主 ready 任务走普通规则：实现人未定 → 经理接管待办（绝不是 standbyTimeout）
+  expect(result.woke.find(w => w.task === 'sb-residual')?.employee.startsWith('gm-')).toBe(true);
+});

@@ -1080,7 +1080,9 @@ export class Dispatcher {
       // the server lease first), throttled at the same 60s cadence as resumeClosed's reload. Past the
       // deadline the task returns to the gm gate — never the ready pool. down/exhausted holders keep the
       // ordinary immediate revoke below, and a busy holder keeps the ordinary renewal/stall branch above.
-      if (task.standbyUntil !== undefined) {
+      // state='doing' 门：标记只在直派租约存续期有效——submit 后的复核相位、收回后的 ready 或任何残留
+      // 标记都不再触发唤醒/超时（复核与普通派工租约不受旧 deadline 管辖）。
+      if (task.standbyUntil !== undefined && task.state === 'doing') {
         if (task.standbyUntil > now) {
           if (state === 'idle' || state === 'unknown' || !inst) {
             const agentKey = inst?.paseoAgentId ?? task.currentEmployee!;

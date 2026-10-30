@@ -893,6 +893,8 @@ export class Workforce {
       LET $next = UPDATE ONLY $task SET
         state = IF $t.state = 'doing' THEN 'ready' ELSE $t.state END,
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
+        // FV06：收回即待命阶段结束，旧标记不得管辖下一位持有人的租约。
+        standby_until = NONE,
         handover = true, previous_employee = $employee, version = $t.version + 1 RETURN AFTER;
       UPDATE employee SET active_task = NONE WHERE active_task = $task;
       CREATE audit CONTENT { task: $task, actor: $actor, action: 'revoked', evidence: $evidence, version: $next.version, at: time::now() };
@@ -923,7 +925,9 @@ export class Workforce {
     const evidence = `原因：${reason}\n\n${handover}`.slice(0, 30000);
     const responses = await this.db.query<unknown[]>(`BEGIN;
       LET $t = SELECT * FROM ONLY $task;
-      IF $t = NONE OR $t.current_employee != $employee { THROW 'lease changed' };
+      // state='doing' 门（FV06 复验）：待命超时只对「仍有待命标记的直派租约」成立。submit 后的复核相位、
+      // 收回后的 ready、标记已清除的普通租约，都不得被写成 blocked + resume_state=doing。
+      IF $t = NONE OR $t.current_employee != $employee OR $t.state != 'doing' OR $t.standby_until = NONE { THROW 'lease changed' };
       LET $next = UPDATE ONLY $task SET
         state = 'blocked', blocked_to = 'gm', resume_state = 'doing',
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE, standby_until = NONE,

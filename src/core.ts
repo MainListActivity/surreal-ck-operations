@@ -1457,6 +1457,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         progress_at = IF $same THEN $t.progress_at ELSE $now END,
         fence = IF $same THEN $t.fence ELSE $t.fence + 1 END,
         version = IF $same THEN $t.version ELSE $t.version + 1 END,
+        // FV06：standby 标记只属于那一次直派租约。同一持有人原地续领（$same）保留其待命窗口；
+        // 任何新持有人（复核、收回后的下一位、下一位实现人）领取即清除，旧标记不得管辖新租约。
+        standby_until = IF $same THEN $t.standby_until ELSE NONE END,
         lease_policy_version = $policy_version,
         lease_policy_hash = $policy_hash,
         policy_block_reason = IF $t.policy_block_reason != NONE THEN $t.policy_block_reason ELSE NONE END,
@@ -4049,6 +4052,15 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     }
     if (typeof input.idempotencyKey !== 'string' || input.idempotencyKey.length < 4 || input.idempotencyKey.length > 200)
       throw new CompanyError('invalid', 'Invalid idempotencyKey');
+    // R4（复验）：幂等键真参与幂等——同一（经理，键）重放返回已记录结果且不再写重复审计；
+    // 同键不同 items 视为键复用冲突（与任务写路径的 replay 语义一致）。
+    const marker = id('company_meta', `verify_standby_${HASH(`${actor.employeeId}\0verify_standby\0${input.idempotencyKey}`).slice(0, 24)}`);
+    const payloadDigest = HASH(JSON.stringify({ items: input.items }));
+    const prior = await this.db.select<{ payload_digest?: string; result?: { items: Array<{ taskId: string; employeeId: string; ok: boolean; code?: string; message?: string }>; note: string; protocol: string } }>(marker);
+    if (prior?.result) {
+      if (prior.payload_digest !== payloadDigest) throw new CompanyError('conflict', 'Idempotency key reused with different input');
+      return prior.result;
+    }
     const items = [];
     for (const item of input.items) {
       const verdict = await this.standbyAdmission(item.taskId, item.employeeId, item.executionWindow);
@@ -4060,7 +4072,10 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
           ...(verdict.ok ? {} : { code: verdict.code }), protocol: STANDBY_RELAY_PROTOCOL }).slice(0, 2000),
       });
     }
-    return { items, note: '只读预检：仅证明此刻各项判定通过，不构成派工承诺，不保证待命期内额度与在岗；真实接力以 resume 的 standby 事务写入为准。', protocol: STANDBY_RELAY_PROTOCOL };
+    const response = { items, note: '只读预检：仅证明此刻各项判定通过，不构成派工承诺，不保证待命期内额度与在岗；真实接力以 resume 的 standby 事务写入为准。', protocol: STANDBY_RELAY_PROTOCOL };
+    await this.db.query('UPSERT ONLY $marker CONTENT { payload_digest: $digest, result: $result, at: time::now() };',
+      { marker, digest: payloadDigest, result: response });
+    return response;
   }
 
   /**
@@ -4071,9 +4086,11 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    */
   private async standbyAdmission(taskId: TaskId, employeeId: string, window?: import('./task-recovery.ts').ExecutionWindow): Promise<{ ok: true } | { ok: false; code: string; message: string }> {
     const deny = (code: string, message: string): { ok: false; code: string; message: string } => ({ ok: false, code, message });
-    const [empRows] = await this.db.query<[Array<{ role: Role; provider?: string; revoked?: boolean; retired?: boolean; workspace_scope?: string; active_task?: RecordId; def?: RecordId }>]>('SELECT role, provider, revoked, retired, workspace_scope, active_task, def FROM $employee;', { employee: id('employee', employeeId) });
+    const [empRows] = await this.db.query<[Array<{ role: Role; provider?: string; revoked?: boolean; retired?: boolean; workspace_scope?: string; active_task?: RecordId; def?: RecordId; capabilities?: string[] }>]>('SELECT role, provider, revoked, retired, workspace_scope, active_task, def, capabilities FROM $employee;', { employee: id('employee', employeeId) });
     const emp = empRows?.[0];
     if (!emp || emp.revoked === true || emp.retired === true) return deny('standby_employee_unavailable', '待命员工不存在或已撤销/退役');
+    // claimLease 的执行相位要求 execute 能力（R2）：缺能力的直派只会成为死租约。
+    if (!(emp.capabilities ?? []).includes('execute')) return deny('standby_capability_denied', '待命员工没有 execute 能力');
     let defTracks: string[] = [];
     let quotaLimited: boolean | undefined;
     if (emp.def) {
@@ -4103,6 +4120,18 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (task.executor_role === 'engineering') {
       if (contrib.facts.ambiguous) return deny('implementer_unresolved', '实现人未定，需经理接管');
       if (contrib.facts.implementer && contrib.facts.implementer !== employeeId) return deny('bound_to_another_implementer', '任务已绑定其他实现人');
+    }
+    // 依赖预检（R2，复验）：与 resume 事务同一解析与未满足判定，verify_standby 不再对依赖未满足返回 ok。
+    if ((task.dependencies ?? []).length > 0) {
+      const responses = await this.db.query(`
+        LET $parent = SELECT * FROM ONLY $task;
+        ${RESOLVE_DEP_SQL('$parent.dependencies', '$rd')}
+        SELECT VALUE id FROM task WHERE id IN $rd_resolved AND ${depUnsatisfiedFor('$parent')};`,
+        { task: id('task', taskId) }).responses();
+      const last = responses?.at(-1);
+      if (!last?.success) return deny('dependencies_unreadable', '依赖解析读取失败，按失败关闭拒绝直派');
+      const unmet = (last.result as unknown[] | undefined) ?? [];
+      if (unmet.length > 0) return deny('dependencies_unmet', `仍有 ${unmet.length} 项依赖未完成；直派必须等待依赖全部完成`);
     }
     const policyChain = this.chainOfRow(task);
     const { contract: policyContract, epoch: policyEpochAtClaim } = await this.effectiveContractFor(policyChain);
@@ -4213,8 +4242,13 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     try {
       const standbyBudgetSeconds = standbyEmployee
         ? await this.db.query<[Array<{ standby_budget_seconds?: number }>]>('SELECT standby_budget_seconds FROM company_meta:config;')
-            .then(([rows]) => (typeof rows?.[0]?.standby_budget_seconds === 'number' && rows[0]!.standby_budget_seconds! > 0
-              ? rows[0]!.standby_budget_seconds! : STANDBY_BUDGET_SECONDS_DEFAULT))
+            .then(([rows]) => {
+              // R4（复验）：预算 clamp 到租约长度——配置大于 leaseSeconds 时租约会先死、唤醒循环
+              // 反复 adoptLease 失败并孤儿化交付物；deadline 永不晚于租约到期。
+              const configured = typeof rows?.[0]?.standby_budget_seconds === 'number' && rows[0]!.standby_budget_seconds! > 0
+                ? rows[0]!.standby_budget_seconds! : STANDBY_BUDGET_SECONDS_DEFAULT;
+              return Math.min(configured, this.leaseSeconds);
+            })
         : STANDBY_BUDGET_SECONDS_DEFAULT;
       const row = await this.txTask(`BEGIN;
         LET $who = SELECT * FROM ONLY $actor;

@@ -69,6 +69,13 @@ export class CompanyProofStore {
   async prepare(lease: LeaseStamp, env: string, files: ProofFiles, samplerEmployee?: string): Promise<void> {
     if (samplerEmployee !== undefined && samplerEmployee === lease.employee)
       throw new CompanyError('invalid', 'sampler must differ from the registering holder (G1: sampler identity is machine-checked)');
+    if (samplerEmployee !== undefined) {
+      // G1（复验 R3）：采样者身份是机器绑定事实，不能是自报字符串——必须是在册未撤销/退役的员工。
+      const [samplerRows] = await this.db.query<[Array<{ revoked?: boolean; retired?: boolean }>]>('SELECT revoked, retired FROM $employee;', { employee: new RecordId('employee', samplerEmployee) });
+      const sampler = samplerRows?.[0];
+      if (!sampler || sampler.revoked === true || sampler.retired === true)
+        throw new CompanyError('invalid', 'sampler must be a registered active employee');
+    }
     const row: Candidate = { evidence_expires_at: files.evidence.expiresAt, task: new RecordId('task', lease.taskId), digest: files.manifest.configurationDigest, manifest_hash: files.manifestHash, document_hash: files.documentHash, manifest_path: files.manifestPath, document_path: files.documentPath, author: lease.employee, env, ...(samplerEmployee !== undefined ? { sampler: samplerEmployee } : {}) };
     await this.db.query('INSERT INTO internal_ai_candidate $row ON DUPLICATE KEY UPDATE digest = $input.digest;', { row });
     const found = await this.candidate(lease.taskId);
