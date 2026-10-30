@@ -442,7 +442,11 @@ describe('recursive story final gate lifecycle', () => {
   test('an ongoing story waits for its eventual book confirmation instead of a software G3', () => {
     const g = goal({ pipeline: 'story', tasks: { plan: 'plan', manual: 'legacy-manual' }, anchors: [] });
     const result = assessGoal({ goal: g, tasks: [task('plan'), task('legacy-manual', { state: 'void', kind: 'gate' }),
-      task('chapter-outline', { state: 'review', reviewerRole: 'owner' })], outcome: outcome(['owner_final']), now: NOW });
+      task('chapter-outline', { state: 'review', reviewerRole: 'owner' }),
+      task('legacy-release', {kind:'release'}), task('legacy-deploy', {kind:'deploy'})], outcome: outcome(['owner_final']), now: NOW });
+    expect(result.stages.find(s => s.key === 'implementation')).toMatchObject({label:'创作交付',status:'active'});
+    expect(result.stages.find(s => s.key === 'release')?.status).toBe('not_required');
+    expect(result.stages.find(s => s.key === 'deploy_qa')?.status).toBe('not_required');
     expect(result.finalGate.taskId).toBeUndefined();
     expect(result.repairReasons).toEqual([]);
     expect(result.stages.find(s => s.key === 'owner_final')).toMatchObject({ status: 'waiting' });
