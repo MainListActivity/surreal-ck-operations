@@ -1,3 +1,4 @@
+import {SessionHistoryPanel,SessionHistorySurface} from "./client/session-history";
 import { ModelSwitchTimeline } from './client/model-switch';
 import { modelSwitchSchema } from './shared/model-switch';
 import { MagpieUsageSurface, AgentUsagePanel } from "./client/usage";
@@ -7,6 +8,11 @@ import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { CompanySurface } from "./client/company";
 
 export default function contribute(client: PluginClientContext) {
+  client.addSurface("employee-history",SessionHistorySurface);
+  client.addCommandCenterItem({id:"employee-history-global",title:"只读审阅员工历史（输入会话 ID）",icon:"BookOpen",context:"global",onSelect({openSurface}){openSurface("employee-history");}});
+  client.addSidebarItem({id:"employee-history",title:"会话审阅",icon:"BookOpen",surface:"employee-history"});
+  client.addWorkspacePanel({id:"employee-history",title:"只读审阅历史",icon:"BookOpen",context:"agent",locations:["workspace","explorer"],Component:SessionHistoryPanel});
+  client.addCommandCenterItem({id:"employee-history",title:"只读审阅员工历史",icon:"BookOpen",context:"agent",onSelect({openPanel}){openPanel("employee-history",{location:"explorer"});}});
   client.addWorkspacePanel({
     id: "agent-model-metrics",
     title: "会话用量",

@@ -302,3 +302,12 @@ describe('employee sandbox gate', () => {
     expect(await h.open({ ...base, agentId: 'other', provider: 'codex', reason: 'create', env: {} })).toBeUndefined();
   });
 });
+
+test('archived history never requires a live model route, while an interactive resume still does',async()=>{
+ let open:any,calls=0;const server={before:(_name:string,fn:any)=>{open=fn;return ()=>{};}};
+ const stop=registerScrub(server as never,daemonEnv,{employee:async()=>true,modelEnv:async()=>{calls++;throw Error('route unavailable');}});
+ try{const request={agentId:'history-only',provider:'claude',reason:'resume',purpose:'history',env:{}};
+ const result=await open({request},{paseo:{},signal:new AbortController().signal});expect(result.env.SURREAL_ROOT_PASS).toBe('');expect(calls).toBe(0);
+ await expect(open({request:{...request,purpose:'interactive'}},{paseo:{},signal:new AbortController().signal})).rejects.toThrow('route unavailable');expect(calls).toBe(1);
+ }finally{stop();}
+});
