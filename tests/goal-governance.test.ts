@@ -472,3 +472,11 @@ describe('recursive story final gate lifecycle', () => {
     expect(invalid.repairReasons.map(r => r.code)).toContain('final_gate_void');
   });
 });
+
+
+test('story display keeps explicit implementation gaps visible even after owner confirmation', () => {
+  const result = assessGoal({goal:goal({pipeline:'story'}),tasks:[task('manual'),task('void-chapter',{state:'void'}),ownerGate()],outcome:outcome(['implementation','owner_final']),now:NOW});
+  expect(result.stages.find(s=>s.key==='implementation')).toMatchObject({label:'创作交付',status:'missing'});
+  expect(result.repairReasons.map(r=>r.code)).toContain('implementation_void');
+  expect(result.readyToComplete).toBe(false);
+});

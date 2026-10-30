@@ -524,10 +524,11 @@ export function assessGoal(input: {
   const deployTask = tasks.find(task => task.kind === 'deploy');
   const evidenceIds = (kind: GoalEvidenceKind) => evidence.filter(item => item.kind === kind).map(item => item.id).sort();
   const implementationStage = stage('implementation',
-    story ? nonFinal.some(task => !TERMINAL.has(task.state)) ? 'active' : ownerFinalApproved ? 'done' : 'waiting' :
-    retiredImplementation.length ? 'missing' : !implementationRequired && nonFinal.some(task => task.state === 'void') ? 'not_required' :
+    retiredImplementation.length ? 'missing' :
+    story ? nonFinal.some(task => !TERMINAL.has(task.state)) ? 'active' : ownerFinalApproved ? 'done' : 'waiting' : !implementationRequired && nonFinal.some(task => task.state === 'void') ? 'not_required' :
       implementationDone ? 'done' : nonFinal.length ? 'active' : 'unknown',
-    [], story ? '按概要审批与正文 QA 递归交付，以全书完成确认收口' : retiredImplementation.length ? '实现任务已作废且没有已完成的继任修订；需授权变更成果契约或取消目标' :
+    [], retiredImplementation.length ? '实现任务已作废且没有已完成的继任修订；需授权变更成果契约或取消目标' :
+      story ? '按概要审批与正文 QA 递归交付，以全书完成确认收口' :
       !implementationRequired && nonFinal.some(task => task.state === 'void') ? '实现已完成但任务被作废；当前成果契约不要求 implementation' : undefined);
   if (story) implementationStage.label = '创作交付';
   stages.push(implementationStage);
