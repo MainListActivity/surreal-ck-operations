@@ -842,3 +842,24 @@ test('an older runnable Factory manager wake precedes a newer execute task with 
  const r=await f.tick();expect(r.woke.map(w=>w.task)).toEqual(['old-manager']);
  expect(f.instances.find(i=>i.id===r.woke[0]!.employee)?.provider).toBe('factory-droid');
 });
+
+test('goal employee closed by idle cleanup sleeps across ticks and reuses its identity for later work',async()=>{
+ const f=fixture([]);f.setStatus('agent-eng-1','closed');let reloads=0;f.paseo.reload=async()=>{reloads++;};
+ const first=await f.tick();expect(first.retired).not.toContain('eng-1');expect(reloads).toBe(0);
+ expect(f.last!.sessionSnapshot().sessions.get('eng-1')).toMatchObject({status:'closed',state:'sleeping'});
+ const second=await f.tick();expect(second.retired).not.toContain('eng-1');expect(reloads).toBe(0);
+ f.addTask({id:'later',state:'ready',facts:{authors:[],reviewers:[],excluded:[],unknown:[],ambiguous:false}});
+ const report=await f.tick();expect(report.woke.find(w=>w.task==='later')).toMatchObject({employee:'eng-1',spawned:false});
+ expect(f.sends.some(s=>s.agentId==='agent-eng-1')).toBe(true);expect(f.spawnCwds).toHaveLength(0);
+});
+test('sleeping Claude seats do not displace a new Factory seat in the same workspace',async()=>{
+ const f=factoryWorld();f.setStatus('agent-eng-1','closed');
+ for(let n=0;n<6;n++){const base=f.instances.find(i=>i.id==='eng-1')!;const id=`claude-extra-${n}`;f.instances.push({...base,id,paseoAgentId:'agent-'+id});f.agents.set('agent-'+id,{id:'agent-'+id,status:'closed'});}
+ const r=await f.tick();const assigned=r.woke.find(w=>w.task==='factory-task')!;expect(assigned.spawned).toBe(true);expect(f.instances.find(i=>i.id===assigned.employee)?.provider).toBe('factory-droid');expect(r.retired).not.toContain('eng-1');
+});
+
+test('an old holder notice cannot wake a sleeping employee without a legal assignment',async()=>{
+ const f=fixture([]);f.setStatus('agent-eng-1','closed');let delivered=0;
+ Object.assign(f.wf,{pendingHolderNotices:async()=>[{noticeKey:'old-notice',taskId:'old-task',holder:'eng-1',kind:'revoked',text:'已撤租'}],markHolderNotices:async()=>{delivered++;return 1;}});
+ const r=await f.tick();expect(f.sends).toHaveLength(0);expect(delivered).toBe(0);expect(r.decisions).toContain('holder-notice-wait:old-task');expect(r.retired).not.toContain('eng-1');
+});

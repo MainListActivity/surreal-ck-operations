@@ -10,6 +10,8 @@
 
 `checkpoint`、`submit`、`review`、`report_blocker` 的租约证明由通道自动补齐，参数里只写业务字段；`claim_next` 不存在于你这一侧——任务在你被叫醒前已领好。
 
+目标员工会话可被 Paseo 空闲回收进程而进入休眠；身份、目标与上下文保留，下次合法派工复用原会话。进程 closed 不等于员工退役，租约结束不授权继续任务写入。老板审阅无租约历史走插件「会话审阅」，不恢复执行权限。
+
 ## 每次被唤醒
 
 1. **读上下文**：先读 `$SCK_COMM_DIR/claim.json`——里面是代领结果：任务详情、`project`（任务所属目标的项目环境：仓库路径、发布方式、生产地址、回滚方式、红线、已登记的凭证名——只有名字，值你拿不到）、`history`（前任 checkpoint、交接包 `revoked`、验收退回 `return`、老板决定 `owner_*`）、`predecessors`（前任会话 ID，可用 `paseo logs <agentId>` 看完整时间线）。`task.handover=true` 表示前任会话中断，你在接手续做：先核对任务分支/工作目录里的实际改动与最后一次 checkpoint，从断点继续。`orphanedArtifacts` 列出本任务此前因租约中断而未入账的 report.md/blocker.md 副本（在 `evidenceDir` 下）：先读，核对仍然成立的部分可直接沿用，不必重做。需要公司方向或在办目标时调用 `get_context`；需要更早记录时调用 `get_task_history`。

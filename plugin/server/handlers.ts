@@ -1,3 +1,6 @@
+import {homedir} from "node:os";
+import {sessionHistory} from "../shared/session-history";
+import {readSessionHistory} from "./session-history";
 import { factoryFirst } from './vendor/src/dispatcher/provider-order.ts';
 import { basename, join } from "node:path";
 import { realpathSync } from "node:fs";
@@ -39,6 +42,12 @@ export function registerHandlers(server: PluginServerContext): void {
     if (isQaContext(context)) throw new Error('owner RPC is not available to a QA session; use the /q/ read-only console');
     return handler(input, context);
   });
+  ownerHandle(sessionHistory,async (input: {agentId:string;cursor:number;textOffset:number})=>{
+    const {db}=await company();const [rows]=await db.db.query<[unknown[]]>('SELECT id FROM employee WHERE paseo_agent_id=$agent LIMIT 1;',{agent:input.agentId});
+    if(!rows.length)throw Error('该会话没有公司员工登记');
+    return readSessionHistory({...input,home:homedir(),paseoHome:process.env.PASEO_HOME??join(homedir(),'.paseo')});
+  });
+
   ownerHandle(rpc.inbox, async () => (await company()).upgrades.inbox());
   ownerHandle(rpc.autoUpgrade,async (input:RpcInput<typeof rpc.autoUpgrade>)=>(await company()).upgrades.setAuto(input.enabled,SOURCE));
   ownerHandle(rpc.upgrade, async (input: RpcInput<typeof rpc.upgrade>) => (await company()).upgrades.start(input,SOURCE));
