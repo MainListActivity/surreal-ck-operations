@@ -42,7 +42,7 @@ export function registerHandlers(server: PluginServerContext): void {
     if (isQaContext(context)) throw new Error('owner RPC is not available to a QA session; use the /q/ read-only console');
     return handler(input, context);
   });
-  ownerHandle(sessionHistory,async (input: {agentId:string;cursor:number})=>{
+  ownerHandle(sessionHistory,async (input: {agentId:string;cursor:number;textOffset:number})=>{
     const {db}=await company();const [rows]=await db.db.query<[unknown[]]>('SELECT id FROM employee WHERE paseo_agent_id=$agent LIMIT 1;',{agent:input.agentId});
     if(!rows.length)throw Error('该会话没有公司员工登记');
     return readSessionHistory({...input,home:homedir(),paseoHome:process.env.PASEO_HOME??join(homedir(),'.paseo')});

@@ -10,7 +10,7 @@ function fixture(provider='claude'){
  const registryFile=join(registry,agentId+'.json');writeFileSync(registryFile,JSON.stringify(record));
  const root=join(home,provider==='claude'?'.claude':'.factory',provider==='claude'?'projects':'sessions','repo');mkdirSync(root,{recursive:true});
  const file=join(root,sessionId+'.jsonl');
- const read=(cursor=0)=>readSessionHistory({home,paseoHome,agentId,cursor});
+ const read=(cursor=0,textOffset=0)=>readSessionHistory({home,paseoHome,agentId,cursor,textOffset});
  return {home,record,registryFile,file,read,close:()=>rmSync(home,{recursive:true,force:true})};
 }
 test('closed unarchived and archived histories read without a runtime, credential or lease',async()=>{
@@ -40,4 +40,13 @@ test('foreign agents, malformed IDs and transcript symlinks outside native stora
  writeFileSync(f.registryFile,JSON.stringify(f.record));const outside=join(f.home,'outside');writeFileSync(outside,'{}');symlinkSync(outside,f.file);await expect(f.read()).rejects.toThrow('未找到本地历史');
  await expect(readSessionHistory({home:f.home,paseoHome:f.home,agentId:'../private',cursor:0})).rejects.toThrow('无效');
  }finally{f.close();}
+});
+
+test('ordinary long reports remain completely reachable through text continuation pages',async()=>{
+ const f=fixture();try{const text='完整报告'.repeat(5000);writeFileSync(f.file,JSON.stringify({type:'assistant',message:{content:text}})+'\n');let cursor=0,offset=0,all='';for(let i=0;i<30;i++){const p=await f.read(cursor,offset);all+=p.entries.map(e=>e.text).join('');if(p.next===undefined)break;cursor=p.next;offset=p.nextTextOffset??0;}expect(all).toBe(text);}finally{f.close();}
+});
+test('tool outputs never expose tokens, and visible messages redact env secrets and JWTs',()=>{
+ const secrets='{"refresh_token":"fixture-refresh","token":"fixture-token"} GITHUB_TOKEN=fixture-github eyJabcdefghij.abcdefghij.abcdef';
+ const tool=historyEntry({type:'user',message:{content:[{type:'tool_result',content:secrets}]}})!;expect(tool.text).not.toContain('fixture');
+ const visible=historyEntry({type:'assistant',message:{content:secrets}})!;expect(visible.text).not.toContain('fixture');expect(visible.text).not.toContain('eyJ');
 });

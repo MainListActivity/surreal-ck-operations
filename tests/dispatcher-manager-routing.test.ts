@@ -857,3 +857,9 @@ test('sleeping Claude seats do not displace a new Factory seat in the same works
  for(let n=0;n<6;n++){const base=f.instances.find(i=>i.id==='eng-1')!;const id=`claude-extra-${n}`;f.instances.push({...base,id,paseoAgentId:'agent-'+id});f.agents.set('agent-'+id,{id:'agent-'+id,status:'closed'});}
  const r=await f.tick();const assigned=r.woke.find(w=>w.task==='factory-task')!;expect(assigned.spawned).toBe(true);expect(f.instances.find(i=>i.id===assigned.employee)?.provider).toBe('factory-droid');expect(r.retired).not.toContain('eng-1');
 });
+
+test('an old holder notice cannot wake a sleeping employee without a legal assignment',async()=>{
+ const f=fixture([]);f.setStatus('agent-eng-1','closed');let delivered=0;
+ Object.assign(f.wf,{pendingHolderNotices:async()=>[{noticeKey:'old-notice',taskId:'old-task',holder:'eng-1',kind:'revoked',text:'已撤租'}],markHolderNotices:async()=>{delivered++;return 1;}});
+ const r=await f.tick();expect(f.sends).toHaveLength(0);expect(delivered).toBe(0);expect(r.decisions).toContain('holder-notice-wait:old-task');expect(r.retired).not.toContain('eng-1');
+});

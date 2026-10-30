@@ -2054,7 +2054,7 @@ export class Dispatcher {
         if (running >= cfg.maxRunning) break;
         // 持有人是员工 ID，会话只是它的一个实例：只投给这一轮还在线、空闲、且没被本轮派工的实例。
         const holder = insts.find(candidate => candidate.id === notice.holder && candidate.paseoAgentId
-          && !assigned.has(candidate.id) && ['idle','sleeping'].includes(states.get(candidate.id) ?? ''));
+          && !assigned.has(candidate.id) && states.get(candidate.id) === 'idle');
         if (!holder) {
           // 会话不在线或正在别的活上：通知留着，下一轮再试，持有人也可以自己读 holder_notices。
           report.decisions.push(`holder-notice-wait:${notice.taskId}`);
