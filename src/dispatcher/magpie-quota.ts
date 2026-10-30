@@ -73,6 +73,21 @@ export function windowId(name: string): string {
   return core ? `core_${id}` : id;
 }
 
+/**
+ * Windows of one provider fall into pools. Within a pool every window must have room (5h, 7d and 30d are all
+ * limits on the same spend), so a pool's room is its lowest window. Pools are alternatives: Factory's Droid Core
+ * allowance and its standard one are separate, and work can run while either has room, so the provider's room is
+ * its best pool. Only the `core_` prefix marks a second pool; everything else shares one.
+ */
+export function poolRoom(items: ReadonlyArray<{ id: string; pct: number }>): number | undefined {
+  const pools = new Map<string, number>();
+  for (const { id, pct } of items) {
+    const pool = id.startsWith('core_') ? 'core' : 'standard';
+    pools.set(pool, Math.min(pools.get(pool) ?? Infinity, pct));
+  }
+  return pools.size ? Math.max(...pools.values()) : undefined;
+}
+
 /** One magpie provider → the entry the quota pipeline stores; undefined when it reports nothing usable. */
 export function toUsageEntry(provider: MagpieProvider): MagpieUsageEntry | undefined {
   const id = String(provider.provider ?? '').trim();
