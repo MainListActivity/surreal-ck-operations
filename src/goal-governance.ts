@@ -505,6 +505,7 @@ export function assessGoal(input: {
       ...(final ? { taskId: final.id } : {}) });
   }
 
+  const story = goal.pipeline === 'story';
   const implementationRequired = required.includes('implementation');
   const retiredImplementation = implementationRequired ? nonFinal.filter(task => task.state === 'void' && task.kind !== 'gate' &&
     !implementationSettled(task, byId, replacedAcceptance)) : [];
@@ -522,16 +523,22 @@ export function assessGoal(input: {
   const releaseTask = tasks.find(task => task.kind === 'release');
   const deployTask = tasks.find(task => task.kind === 'deploy');
   const evidenceIds = (kind: GoalEvidenceKind) => evidence.filter(item => item.kind === kind).map(item => item.id).sort();
-  stages.push(stage('implementation',
-    retiredImplementation.length ? 'missing' : !implementationRequired && nonFinal.some(task => task.state === 'void') ? 'not_required' :
+  const implementationStage = stage('implementation',
+    retiredImplementation.length ? 'missing' :
+    story ? nonFinal.some(task => !TERMINAL.has(task.state)) ? 'active' : ownerFinalApproved ? 'done' : 'waiting' : !implementationRequired && nonFinal.some(task => task.state === 'void') ? 'not_required' :
       implementationDone ? 'done' : nonFinal.length ? 'active' : 'unknown',
     [], retiredImplementation.length ? '实现任务已作废且没有已完成的继任修订；需授权变更成果契约或取消目标' :
-      !implementationRequired && nonFinal.some(task => task.state === 'void') ? '实现已完成但任务被作废；当前成果契约不要求 implementation' : undefined));
+      story ? '按概要审批与正文 QA 递归交付，以全书完成确认收口' :
+      !implementationRequired && nonFinal.some(task => task.state === 'void') ? '实现已完成但任务被作废；当前成果契约不要求 implementation' : undefined);
+  if (story) implementationStage.label = '创作交付';
+  stages.push(implementationStage);
   stages.push(stage('release',
+    story && !required.includes('release') && !evidenceIds('release').length ? 'not_required' :
     evidenceIds('release').length || releaseTask?.state === 'done' ? 'done' :
       releaseTask ? 'waiting' : required.includes('release') ? 'missing' : 'unknown',
     evidenceIds('release')));
   stages.push(stage('deploy_qa',
+    story && !required.includes('deploy_qa') && !evidenceIds('deploy_qa').length ? 'not_required' :
     evidenceIds('deploy_qa').length || deployTask?.state === 'done' ? 'done' :
       deployTask ? 'waiting' : required.includes('deploy_qa') ? 'missing' : 'unknown',
     evidenceIds('deploy_qa')));
