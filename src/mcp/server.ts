@@ -562,9 +562,10 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : core.resume(token(ctx), input.taskId, evidence(input))));
 
   server.registerTool('verify_standby', {
-    description: 'gm only (FV06 P1): read-only standby precheck. For each {taskId, employeeId} pair re-evaluates every standby assignment precondition (claim-grade role/workspace/discipline/active-task/implementer-binding/avoidance checks, the effective policy verdict, the independence gate, a live unexpired execution window, and provider quota/health with the same source as the dispatcher) and returns per-item {ok, code}. Writes no task state and consumes no budget; each item is audited. Passing proves only this instant — never a dispatch promise: the real relay is the resume standby transaction, and in-window quota/liveness of the holder is still not guaranteed.',
+    description: 'gm only (FV06 P1): read-only standby precheck. For each {taskId, employeeId, executionWindow?} pair re-evaluates every standby assignment precondition (claim-grade role/workspace/discipline/active-task/implementer-binding checks, the effective policy verdict, the independence gate, an unexpired execution window — the one you pass or the one already bound — and provider quota/health with the same source as the dispatcher) and returns per-item {ok, code}. Writes no task state and consumes no budget; each item is audited. Passing proves only this instant — never a dispatch promise: the real relay is the resume standby transaction, and in-window quota/liveness of the holder is still not guaranteed.',
     inputSchema: z.object({
-      items: z.array(z.object({ taskId: z.string().min(1), employeeId: z.string().min(1) })).min(1).max(20),
+      items: z.array(z.object({ taskId: z.string().min(1), employeeId: z.string().min(1),
+        executionWindow: executionWindowSchema.optional() })).min(1).max(20),
       idempotencyKey: z.string().min(4).max(200),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.verifyStandby

@@ -1337,8 +1337,9 @@ export interface CompanyCore {
   resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView>;
   /** FV06 P0: gm only — windowed resume with a bounded standby direct assignment (progress_at/standby_until written in the resume transaction). */
   resumeStandby?(credential: Credential, taskId: TaskId, evidence: Evidence, standbyEmployee: string): Promise<TaskView>;
-  /** FV06 P1: gm only — read-only standby precheck; per-item {ok, code}; audited, never writes task state or budget. */
-  verifyStandby?(credential: Credential, input: { items: Array<{ taskId: string; employeeId: string }>; idempotencyKey: string }): Promise<{
+  /** FV06 P1: gm only — read-only standby precheck; per-item {ok, code}; audited, never writes task state or budget.
+   *  An item may carry the executionWindow the gm is about to bind (the task row only has one after a windowed resume). */
+  verifyStandby?(credential: Credential, input: { items: Array<{ taskId: string; employeeId: string; executionWindow?: import('./task-recovery.ts').ExecutionWindow }>; idempotencyKey: string }): Promise<{
     items: Array<{ taskId: string; employeeId: string; ok: boolean; code?: string; message?: string }>;
     note: string; protocol: string;
   }>;

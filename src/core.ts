@@ -4037,7 +4037,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * 不写任务状态、不耗预算；每个条目写一条 audit action='verify_standby' 留痕。
    * 预检通过只证明「此刻各项判定成立」，不构成派工承诺；真实接力以 resume 的 standby 事务写入为准。
    */
-  async verifyStandby(credential: Credential, input: { items: Array<{ taskId: string; employeeId: string }>; idempotencyKey: string }):
+  async verifyStandby(credential: Credential, input: { items: Array<{ taskId: string; employeeId: string; executionWindow?: import('./task-recovery.ts').ExecutionWindow }>; idempotencyKey: string }):
   Promise<{ items: Array<{ taskId: string; employeeId: string; ok: boolean; code?: string; message?: string }>; note: string; protocol: string }> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'verify_standby requires gm');
@@ -4051,7 +4051,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       throw new CompanyError('invalid', 'Invalid idempotencyKey');
     const items = [];
     for (const item of input.items) {
-      const verdict = await this.standbyAdmission(item.taskId, item.employeeId);
+      const verdict = await this.standbyAdmission(item.taskId, item.employeeId, item.executionWindow);
       items.push({ taskId: item.taskId, employeeId: item.employeeId, ok: verdict.ok,
         ...(verdict.ok ? {} : { code: verdict.code, message: verdict.message }) });
       await this.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: 'verify_standby', evidence: $evidence, at: time::now() };`, {
@@ -4069,24 +4069,29 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * 员工/角色/活动任务/策略 epoch，读后变化拒绝写入。额度与健康判定走 provider-admission，与调度器
    * 的 per-def 闸门（roleCapacity）同一份逻辑与同一份数据。
    */
-  private async standbyAdmission(taskId: TaskId, employeeId: string): Promise<{ ok: true } | { ok: false; code: string; message: string }> {
+  private async standbyAdmission(taskId: TaskId, employeeId: string, window?: import('./task-recovery.ts').ExecutionWindow): Promise<{ ok: true } | { ok: false; code: string; message: string }> {
     const deny = (code: string, message: string): { ok: false; code: string; message: string } => ({ ok: false, code, message });
-    const [empRows] = await this.db.query<[Array<{ role: Role; provider?: string; revoked?: boolean; retired?: boolean; workspace_scope?: string; active_task?: RecordId; def_tracks?: string[]; quota_limited?: boolean }>]>(
-      'SELECT role, provider, revoked, retired, workspace_scope, active_task, def.tracks AS def_tracks, def.quota_limited AS quota_limited FROM ONLY $employee;', { employee: id('employee', employeeId) });
+    const [empRows] = await this.db.query<[Array<{ role: Role; provider?: string; revoked?: boolean; retired?: boolean; workspace_scope?: string; active_task?: RecordId; def?: RecordId }>]>('SELECT role, provider, revoked, retired, workspace_scope, active_task, def FROM $employee;', { employee: id('employee', employeeId) });
     const emp = empRows?.[0];
     if (!emp || emp.revoked === true || emp.retired === true) return deny('standby_employee_unavailable', '待命员工不存在或已撤销/退役');
+    let defTracks: string[] = [];
+    let quotaLimited: boolean | undefined;
+    if (emp.def) {
+      const [defRows] = await this.db.query<[Array<{ tracks?: string[]; quota_limited?: boolean }>]>('SELECT tracks, quota_limited FROM $def;', { def: emp.def });
+      defTracks = defRows?.[0]?.tracks ?? [];
+      quotaLimited = defRows?.[0]?.quota_limited;
+    }
     const task = await this.taskRowWithProject(taskId);
     if (!task) return deny('task_not_found', '任务不存在');
     if (task.executor_role !== emp.role) return deny('standby_role_denied', `待命员工岗位 ${emp.role} 与任务执行岗 ${task.executor_role} 不符`);
     const goalScope = task.goal ? String((task.goal as RecordId).id) : 'maintenance';
     if (emp.workspace_scope && emp.workspace_scope !== goalScope) return deny('standby_workspace_denied', '待命员工会话属于另一个目标的会话域');
     if (emp.active_task && String(emp.active_task.id) !== taskId) {
-      const [activeRows] = await this.db.query<[Array<{ current_employee?: string; lease_expires_at?: number }>]>('SELECT current_employee, lease_expires_at FROM ONLY $active;', { active: emp.active_task });
+      const [activeRows] = await this.db.query<[Array<{ current_employee?: string; lease_expires_at?: number }>]>('SELECT current_employee, lease_expires_at FROM $active;', { active: emp.active_task });
       const active = activeRows?.[0];
       if (active?.current_employee === employeeId && (active.lease_expires_at ?? 0) > Date.now() / 1000)
         return deny('standby_employee_busy', '待命员工仍持有另一任务的活动租约');
     }
-    const defTracks = emp.def_tracks ?? [];
     if (task.discipline) {
       const required = REQUIRED_TRACKS[emp.role];
       if (required !== undefined) {
@@ -4094,7 +4099,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       } else if (defTracks.length > 0 && !defTracks.includes(task.discipline)) return deny('discipline_track_denied', '编制轨不覆盖任务轨');
     }
     const contrib = await readContributionView(this.db, taskId);
-    if (contrib.facts.excluded.includes(employeeId)) return deny('standby_excluded', '待命员工在本任务的贡献者回避名单内');
+    // 执行相位的回避与 claimLease 同源：作者级 excluded 只挡复核相位；执行相位靠实现人绑定与独立性闸门。
     if (task.executor_role === 'engineering') {
       if (contrib.facts.ambiguous) return deny('implementer_unresolved', '实现人未定，需经理接管');
       if (contrib.facts.implementer && contrib.facts.implementer !== employeeId) return deny('bound_to_another_implementer', '任务已绑定其他实现人');
@@ -4114,16 +4119,17 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     } catch (error) {
       return deny('independence_denied', error instanceof CompanyError ? error.message : '独立性闸门拒绝');
     }
-    const window = task.execution_window;
-    if (!window || windowExpired(window)) return deny('execution_window_invalid', '任务没有有效执行窗口；standby 直派必须绑定未过期的独立批准窗口');
+    // resume 路径传的是本次要绑定的窗口（事务提交前任务行还没有）；verify_standby 用任务行上已登记的窗口。
+    const bound = window ?? task.execution_window;
+    if (!bound || windowExpired(bound)) return deny('execution_window_invalid', '任务没有有效执行窗口；standby 直派必须绑定未过期的独立批准窗口');
     const [healthRows] = await this.db.query<[Array<{ id: RecordId; state: 'healthy' | 'exhausted'; until?: number; last_error?: string }>]>('SELECT id, state, until, last_error FROM provider_health;');
-    const health = new Map((healthRows ?? []).map(r => [String(r.id.id), { state: r.state, until: r.until, lastError: r.last_error }]));
+    const health = new Map((healthRows ?? []).map(r => [asId(r.id), { state: r.state, until: r.until, lastError: r.last_error }]));
     const quotaRows = await readProviderQuotas(this.db);
-    const [cfgRows] = await this.db.query<[Array<{ quota_floor_pct?: number; quota_weekly_floor_pct?: number }>]>('SELECT quota_floor_pct, quota_weekly_floor_pct FROM ONLY company_meta:config;');
+    const [cfgRows] = await this.db.query<[Array<{ quota_floor_pct?: number; quota_weekly_floor_pct?: number }>]>('SELECT quota_floor_pct, quota_weekly_floor_pct FROM company_meta:config;');
     const floors = { quotaFloorPct: typeof cfgRows?.[0]?.quota_floor_pct === 'number' ? cfgRows[0]!.quota_floor_pct! : 8,
       quotaWeeklyFloorPct: typeof cfgRows?.[0]?.quota_weekly_floor_pct === 'number' ? cfgRows[0]!.quota_weekly_floor_pct! : 6 };
-    const admission = providerAdmission({ provider: emp.provider, quotaLimited: emp.quota_limited === false ? false : undefined },
-      { health, quotaRows, floors, now: Date.now() });
+    const admission = providerAdmission({ provider: emp.provider, quotaLimited: quotaLimited === false ? false : undefined },
+      { health, quotaRows, floors, now: Math.floor(Date.now() / 1000) });
     if (!admission.ok) return deny('standby_provider_blocked', `待命员工的订阅不可用：${admission.reason ?? 'unknown'}`);
     return { ok: true };
   }
@@ -4183,7 +4189,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     let standbyPolicy: { version: number; hash: string; epoch: number } | undefined;
     if (standbyEmployee) {
       if (!evidence.executionWindow) throw new CompanyError('invalid', 'standby resume requires an execution window');
-      const admission = await this.standbyAdmission(taskId, standbyEmployee);
+      const admission = await this.standbyAdmission(taskId, standbyEmployee, evidence.executionWindow);
       if (!admission.ok) throw new CompanyError('invalid', `standby denied (${admission.code}): ${admission.message}`);
       // workIntent 工作区语义：直派与 claimLease 同一登记——同一把 repo 锁内走 registry.allocate，
       // 事务内写入 worktree + worktree_ref；不新建未授权现场，也不绕过登记。
@@ -4206,7 +4212,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     }
     try {
       const standbyBudgetSeconds = standbyEmployee
-        ? await this.db.query<[Array<{ standby_budget_seconds?: number }>]>('SELECT standby_budget_seconds FROM ONLY company_meta:config;')
+        ? await this.db.query<[Array<{ standby_budget_seconds?: number }>]>('SELECT standby_budget_seconds FROM company_meta:config;')
             .then(([rows]) => (typeof rows?.[0]?.standby_budget_seconds === 'number' && rows[0]!.standby_budget_seconds! > 0
               ? rows[0]!.standby_budget_seconds! : STANDBY_BUDGET_SECONDS_DEFAULT))
         : STANDBY_BUDGET_SECONDS_DEFAULT;
@@ -4243,12 +4249,13 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         IF $standby != NONE AND array::len($remaining) > 0 { THROW 'standby denied: unmet dependencies remain' };
         LET $assigned = $standby != NONE;
         LET $source_phase = $t.resume_state ?? 'ready';
-        LET $restore_phase = IF $standby != NONE THEN 'doing' ELSE IF $source_phase = 'doing' THEN 'ready' ELSE $source_phase END END;
+        LET $restore_phase = IF $source_phase = 'doing' THEN 'ready' ELSE $source_phase END;
+        LET $restore_phase_final = IF $assigned THEN 'doing' ELSE $restore_phase END;
         // FV06 P0：standby_until = min(窗口 notAfter, now + standbyBudgetSeconds)；progress_at 同步写 now，
         // 消除 stall 分支把刚待命的任务误判为停滞。
         LET $standby_until = IF $assigned THEN math::min([$standby_not_after, $now + $standby_budget]) ELSE NONE END;
         LET $next = UPDATE ONLY $task SET
-          state = IF array::len($remaining) = 0 THEN $restore_phase ELSE 'blocked' END,
+          state = IF array::len($remaining) = 0 THEN $restore_phase_final ELSE 'blocked' END,
           resume_role = IF array::len($remaining) = 0 THEN NONE ELSE $t.resume_role END,
           resume_state = IF array::len($remaining) = 0 THEN NONE ELSE $t.resume_state END,
           blocked_to = NONE, dependency_continuation = NONE, execution_window = $execution_window,
@@ -4256,6 +4263,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
           current_employee = IF $assigned THEN $standby ELSE NONE END,
           delivery_id = IF $assigned THEN $standby_delivery ELSE NONE END,
           lease_expires_at = IF $assigned THEN $now + $standby_lease_seconds ELSE NONE END,
+          fence = IF $assigned THEN $t.fence + 1 ELSE $t.fence END,
           progress_at = IF $assigned THEN $now ELSE $t.progress_at END,
           standby_until = IF $assigned THEN $standby_until ELSE NONE END,
           implementer = IF $assigned AND $t.executor_role = 'engineering' AND $t.implementer = NONE THEN $standby ELSE $t.implementer END,
@@ -4279,7 +4287,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         };
         IF $assigned {
           CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'resume', evidence: $evidence, version: $next.version, at: time::now(),
-            source_phase: $source_phase, restore_phase: $restore_phase, result: $next.state,
+            source_phase: $source_phase, restore_phase: $restore_phase_final, result: $next.state,
             standby: $standby, standby_until: $next.standby_until, lease_expires_at: $next.lease_expires_at };
         } ELSE {
           CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'resume', evidence: $evidence, version: $next.version, at: time::now(),
@@ -4288,7 +4296,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         IF $assigned {
           CREATE ONLY $outbox CONTENT { task: $task, kind: 'resumed', sequence: $sequence.value,
-            payload: { state: $next.state, source_phase: $source_phase, restore_phase: $restore_phase,
+            payload: { state: $next.state, source_phase: $source_phase, restore_phase: $restore_phase_final,
               employee: $standby, standbyUntil: $next.standby_until }, at: time::now() };
         } ELSE {
           CREATE ONLY $outbox CONTENT { task: $task, kind: 'resumed', sequence: $sequence.value,
@@ -4298,7 +4306,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         RETURN $next;
         COMMIT;`, {
         actor: id('employee', actor.employeeId), task: id('task', taskId), evidence: evidence.text, execution_window: executionWindow, expected_version: before.version, new_window: evidence.executionWindow !== undefined && before.execution_window?.approvalTask !== executionWindow?.approvalTask,
-        standby: standbyEmployee ?? null, standby_record: standbyEmployee ? id('employee', standbyEmployee) : undefined,
+        standby: standbyEmployee, standby_record: standbyEmployee ? id('employee', standbyEmployee) : undefined,
         standby_delivery: standbyEmployee ? randomUUID() : undefined, standby_lease_seconds: this.leaseSeconds,
         standby_not_after: standbyEmployee ? Math.floor(Date.parse(executionWindow!.notAfter) / 1000) : 0,
         standby_budget: standbyBudgetSeconds,

@@ -69,6 +69,19 @@ const POLICY_SHARED = {
   'src/database.ts': "// loadSchema('035-effective-policy.surql')\n",
 };
 
+// FV06 P0/P1: the standby relay contract the switch guard requires (capability marker, the resume
+// write in core, the view field, the supervision branch, the config field) — in src and in the
+// plugin vendor alike; a fixture target without it is the incompatible case the guard refuses.
+const STANDBY_FILES = {
+  'src/standby-relay-capability.ts': "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/1';\n",
+  'src/dispatcher/dispatcher.ts': "export const STANDBY_WAKE_RETRY_SECONDS = 60;\n// standby timeout: return to the gm gate\n",
+};
+const STANDBY_APPENDS: Array<[string, string]> = [
+  ['src/core.ts', "standby_until = IF $assigned THEN math::min([$standby_not_after, $now + $standby_budget]) ELSE NONE END\nstandby employee unavailable\nstandby denied: unmet dependencies remain\n"],
+  ['src/contracts.ts', 'export interface StandbyView {\n  standbyUntil?: string;\n}\n'],
+  ['src/workforce.ts', "standby_budget_seconds: 600,\naction: 'standby_timeout',\n"],
+];
+
 function makeRelease(releases: string, sha: string, withGit = false, capable = true, policy = capable) {
   const dir = join(releases, sha);
   mkdirSync(join(dir, 'src', 'mcp'), { recursive: true });
@@ -77,9 +90,9 @@ function makeRelease(releases: string, sha: string, withGit = false, capable = t
   writeFileSync(join(dir, 'src', 'mcp', 'run.ts'), 'export {};\n');
   writeFileSync(join(dir, 'src', 'dispatcher', 'run.ts'), 'export {};\n');
   if (capable) {
-const files = { 'src/task-recovery.ts': 'export {};', 'src/ops/proof-store.ts': 'export const assertExecutionWindow = true;', ...CAPABILITY_FILES, ...ACCEPTANCE_FILES, ...(policy ? POLICY_FILES : {}),
+const files = { 'src/task-recovery.ts': 'export {};', 'src/ops/proof-store.ts': 'export const assertExecutionWindow = true;', ...CAPABILITY_FILES, ...ACCEPTANCE_FILES, ...(policy ? POLICY_FILES : {}), ...STANDBY_FILES,
   'src/goal-workspace-capability.ts': "export const GOAL_WORKSPACE_CONTRACT = 'sck-goal-workspace/v1';\n" };
-    const appends: Array<[string, string]> = [['src/core.ts', "// workspace goal denied dependency_continuation\n"], ['src/workforce.ts', "// workspace_scope\n"], ['src/core.ts', "export const ACCEPTANCE_CORE = 'mergeAcceptanceCriteria(leg, criteria); isTrustedCodeDeliverable(subject);';\n"]];
+    const appends: Array<[string, string]> = [['src/core.ts', "// workspace goal denied dependency_continuation\n"], ['src/workforce.ts', "// workspace_scope\n"], ['src/core.ts', "export const ACCEPTANCE_CORE = 'mergeAcceptanceCriteria(leg, criteria); isTrustedCodeDeliverable(subject);';\n"], ...STANDBY_APPENDS];
     if (policy) appends.push(...Object.entries(POLICY_SHARED));
     mkdirSync(join(dir, 'schema'), { recursive: true });
     mkdirSync(join(dir, 'src', 'ops'), { recursive: true });
@@ -87,6 +100,7 @@ const files = { 'src/task-recovery.ts': 'export {};', 'src/ops/proof-store.ts': 
     for (const [path, body] of appends) appendFileSync(join(dir, path), body);
     // The plugin surface runs the same core; its generated vendor must carry both contracts too.
     mkdirSync(join(dir, 'plugin', 'server', 'vendor', 'src', 'ops'), { recursive: true });
+    mkdirSync(join(dir, 'plugin', 'server', 'vendor', 'src', 'dispatcher'), { recursive: true });
     mkdirSync(join(dir, 'plugin', 'server', 'vendor', 'schema'), { recursive: true });
     for (const [path, body] of Object.entries(files)) {
       writeFileSync(join(dir, 'plugin', 'server', 'vendor', path), body);
