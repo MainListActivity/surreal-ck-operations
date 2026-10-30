@@ -1,13 +1,13 @@
 import type { ModelFacts } from './ranking.ts';
 import {DEFAULT_POLICY,rankingPolicy,BILLING_LABELS,type RankingPolicy,type BillingClass} from './weights.ts';
-export const RULE_ENGINE='quality-pace-v6';
+export const RULE_ENGINE='quality-pace-v7';
 export const TTFT_LIMIT_MS=20_000;
 export const AA_BAND_WIDTH=2;
-export const RULE_DESCRIPTION='手动置顶保留人工顺序；其余按非线性总分降序，不再分层。能力、速度、绩效、费用和额度消耗意愿形成几何效用，乘以首 token 延迟、可用额度与可靠性因子；临期额度以连续的剩余分数空间加成优先消耗，有限新模型探索也计入同一总分。免费模型不受供应商额度影响；持续报错或已知付费额度耗尽记0分。';
+export const RULE_DESCRIPTION='手动置顶保留人工顺序；其余按非线性总分降序，不再分层。能力、速度、绩效、费用和额度消耗意愿形成几何效用，乘以首 token 延迟、可用额度与可靠性因子；临期额度以连续的剩余分数空间加成优先消耗，有限新模型探索与随请求陈旧度增长的探索加分计入同一总分。免费模型不受供应商额度影响；持续报错或已知付费额度耗尽记0分。';
 export interface RuleDecision {
- urgent?:boolean; band?:number; ttftMs?:number; latencySource:'recent-ewma'|'recent-last'|'historical-average'|'unknown';
+ sampleAgeMs?:number; urgent?:boolean; band?:number; ttftMs?:number; latencySource:'recent-ewma'|'recent-last'|'historical-average'|'unknown';
  billing:'subscription'|'metered'|'unknown'; quota:'available'|'low'|'exhausted'|'unknown';
- remainingPct?:number; pace?:number; tail?:string; reason:string; costClass?:BillingClass; coldStart?:boolean; score?:number; factors?:{base:number;latency:number;availability:number;reliability:number;urgency:number;exploration:number;utility?:number;estimatedCost?:number}; contributions?:Record<string,{value?:number;weight:number;points:number;factor?:number}>;
+ remainingPct?:number; pace?:number; tail?:string; reason:string; costClass?:BillingClass; coldStart?:boolean; score?:number; factors?:{base:number;latency:number;availability:number;reliability:number;urgency:number;exploration:number;utility?:number;staleness?:number;estimatedCost?:number}; contributions?:Record<string,{value?:number;weight:number;points:number;factor?:number}>;
 }
 const finite=(v:unknown):v is number=>typeof v==='number'&&Number.isFinite(v);
 export function recentMetric(f:ModelFacts,key:string,now:number):{value?:number;source:RuleDecision['latencySource']} {
@@ -40,14 +40,14 @@ const clamp=(n:number)=>Math.max(0,Math.min(1,n));
 export function ruleOrder(facts:ModelFacts[],pins:string[]=[],now=Date.now(),input:RankingPolicy=DEFAULT_POLICY):Array<{facts:ModelFacts;decision:RuleDecision}> {
  pins=[...new Set(pins)].filter(id=>facts.some(f=>f.id===id));
  const policy=rankingPolicy(input);
- const baseWeight=Object.entries(policy.weights).filter(([key])=>key!=='latency').reduce((sum,[,weight])=>sum+weight,0);
+ const baseWeight=Object.entries(policy.weights).filter(([key])=>key!=='latency'&&key!=='staleness').reduce((sum,[,weight])=>sum+weight,0);
  const rows=facts.map((facts,i)=>{
   const latency=recentMetric(facts,'ttftMs',now),account=accountFacts(facts,now);
   const costClass=policy.billingOverrides[facts.id]??(facts.price.free?'free':account.billing==='subscription'?'included':account.billing==='metered'?'paid':'unknown');
   const free=costClass==='free';
   const quota=free?'available':account.quota;
   const tail=facts.health?.excluded?'该模型持续报错':quota==='exhausted'?'供应商已知账号额度耗尽':undefined;
-  const requests=Math.max(facts.usage?.requests??0,facts.health?.attempts??0);
+  const requests=Math.max(facts.usage?.requests??0,facts.health?.attempts??0,!facts.usage&&facts.lastRequestAt?5:0);
   const coldStart=requests===0&&!tail;
   const speed=recentMetric(facts,'tokensPerSecond',now).value;
   const hit=clamp(facts.usage?.cacheHitRate??0);
@@ -63,7 +63,7 @@ export function ruleOrder(facts:ModelFacts[],pins:string[]=[],now=Date.now(),inp
    price:expectedCost===undefined?0.5:1/(1+expectedCost),
    latency:latency.value===undefined?0.5:1/(1+(latency.value/TTFT_LIMIT_MS)**1.3),
   };
-  const contributions=Object.fromEntries(Object.entries(policy.weights).map(([key,weight])=>{
+  const contributions=Object.fromEntries(Object.entries(policy.weights).filter(([key])=>key!=='staleness').map(([key,weight])=>{
    const value=clamp(values[key as keyof typeof values]);
    const exponent=key==='latency'?weight/30:baseWeight?weight/baseWeight:0;
    const factor=exponent===0?1:Math.max(value,0.001)**exponent;
@@ -87,12 +87,22 @@ export function ruleOrder(facts:ModelFacts[],pins:string[]=[],now=Date.now(),inp
   const ordinary=100*(1-(1-utility/100)**urgency);
   // A bounded exploration uplift decays over five actual attempts. Errors immediately lose the uplift.
   const exploration=!tail&&!(observed?.errors)&&requests<5?0.9*(1-requests/5)*(100-ordinary)*(coldStart?1:latencyFactor*availability*reliability):0;
-  const score=tail?0:Math.min(100,ordinary+exploration);
-  const decision:RuleDecision={...account,quota,remainingPct:free?undefined:account.remainingPct,urgent,ttftMs:latency.value,latencySource:latency.source,
-   tail,costClass,coldStart,contributions,score,factors:{base,utility,latency:latencyFactor,availability,reliability,urgency,exploration,estimatedCost:expectedCost},reason:''};
+  // Refreshing quota/AA does not make request observations fresh. Any new attempt resets exploration age.
+  const requestTimes=[facts.lastRequestAt,facts.health?.lastAttemptAt,...['errorRate','ttftMs','tokensPerSecond'].map(k=>facts.trends?.[k]?.lastSampleAt)]
+   .map(at=>Date.parse(at??'')).filter(at=>finite(at)&&at<=now);
+  const sampleAgeMs=requestTimes.length?now-Math.max(...requestTimes):undefined;
+  const staleHours=sampleAgeMs===undefined?0:Math.max(0,sampleAgeMs/3600000-1);
+  const staleDegree=staleHours/(staleHours+24);
+  const beforeStale=Math.min(100,ordinary+exploration);
+  const staleness=tail?0:(100-beforeStale)*(policy.weights.staleness/100)*staleDegree*availability*reliability;
+  contributions.staleness={value:sampleAgeMs===undefined?undefined:staleDegree,weight:policy.weights.staleness,factor:1,points:staleness};
+  const score=tail?0:Math.min(100,beforeStale+staleness);
+  const decision:RuleDecision={sampleAgeMs,...account,quota,remainingPct:free?undefined:account.remainingPct,urgent,ttftMs:latency.value,latencySource:latency.source,
+   tail,costClass,coldStart,contributions,score,factors:{base,utility,latency:latencyFactor,availability,reliability,urgency,exploration,staleness,estimatedCost:expectedCost},reason:''};
   const pin=pins.indexOf(facts.id);
   decision.reason=[pin>=0?`手动置顶第${pin+1}位（人工覆盖）`:undefined,tail,
    free?'免费：供应商额度不扣分':BILLING_LABELS[costClass],urgent?'临期消耗加成':facts.urgency?.reason,
+   staleness>0?`陈旧数据探索 +${staleness.toFixed(2)}（距上次请求 ${(sampleAgeMs!/3600000).toFixed(1)} 小时）`:undefined,
    exploration>0?`新模型探索 +${exploration.toFixed(2)}`:undefined,
    `非线性总分 ${score.toFixed(2)}`,latency.value===undefined?'首 token 未测得':`首 token ${(latency.value/1000).toFixed(2)}秒`].filter(Boolean).join('；');
   return {facts,decision,i,pin:pin<0?Infinity:pin};

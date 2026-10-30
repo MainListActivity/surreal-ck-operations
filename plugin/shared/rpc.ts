@@ -149,7 +149,7 @@ export const roster = defineRpc({
   output: record<Roster>(),
 });
 
-export const rankingPolicySchema=z.object({bandWidth:z.number().finite().min(0).max(10),weights:z.object({pace:z.number().min(0).max(100),latency:z.number().min(0).max(100),intelligence:z.number().min(0).max(100),speed:z.number().min(0).max(100),performance:z.number().min(0).max(100),price:z.number().min(0).max(100)}).strict().refine(w=>Object.values(w).some(n=>n>0)),billingOverrides:z.record(z.string().min(1).max(300),z.enum(['free','included','unknown','paid'])).refine(v=>Object.keys(v).length<=1000)}).strict();
+export const rankingPolicySchema=z.object({bandWidth:z.number().finite().min(0).max(10),weights:z.object({pace:z.number().min(0).max(100),latency:z.number().min(0).max(100),intelligence:z.number().min(0).max(100),speed:z.number().min(0).max(100),performance:z.number().min(0).max(100),price:z.number().min(0).max(100),staleness:z.number().finite().min(0).max(100).default(20)}).strict().refine(w=>Object.entries(w).some(([key,n])=>key!=='staleness'&&n>0)),billingOverrides:z.record(z.string().min(1).max(300),z.enum(['free','included','unknown','paid'])).refine(v=>Object.keys(v).length<=1000)}).strict();
 export const previewModelRanking=defineRpc({name:'company.model-ranking.preview',input:z.object({policy:rankingPolicySchema,refresh:z.boolean().default(false)}),output:z.object({tables:record<ModelRankingTable[]>(),at:z.string(),policy:rankingPolicySchema})});
 export const modelRanking = defineRpc({
   name: "company.model-ranking.get",

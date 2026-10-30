@@ -59,6 +59,7 @@ test('every rankingFacts collection fetches live native Magpie statistics and fa
  let calls=0;let down=false;
  const db={query:async()=>[[]]};
  const controller=new ModelRoutingController(db as any,scratch(),'unused',{
+  usageLog:join(scratch(),'missing-usage.jsonl'),routingLogDir:join(scratch(),'missing-routing'),
   output:async(args:string[])=>{expect(args).toEqual(['quota','--json']);return '[]';},
   fetch:(async(url:any,options:any)=>{
    expect(String(url)).toBe('http://127.0.0.1:3425/v1/magpie/usage?period=7d');expect(options.cache).toBe('no-store');calls++;
@@ -220,7 +221,7 @@ test('refresh records immutable rule decisions, requires no Jev client and skips
  const publication=f.writes.find(w=>w?.results);
  expect(Object.keys(publication.results)).toEqual(['sck-haiku']);expect(f.calls).toEqual([]);
  expect(publication.orders['sck-haiku']).toEqual(['p/b']);
- expect(publication.results['sck-haiku']).toMatchObject({engine:'quality-pace-v6',answers:{},rows:[{facts:{id:'p/b'},decision:{latencySource:'unknown'}}]});
+ expect(publication.results['sck-haiku']).toMatchObject({engine:'quality-pace-v7',answers:{},rows:[{facts:{id:'p/b'},decision:{latencySource:'unknown'}}]});
 });
 
 test('ranking list joins current members to one successful snapshot, never a newer failed attempt or another effort',async()=>{
@@ -324,7 +325,7 @@ test('Jev failure preserves successful scores while independent safety observati
   apply:async o=>{members=o['sck-haiku']!;},jev:{model:'fixture',ask:async(_s,q)=>{if(fail)throw Error('upstream');return response(q);}}});
  r.trigger(0);await r.settled();const success=structuredClone(results['sck-haiku']);
  fail=true;bad=true;r.trigger(300000);await r.settled();
- expect(results['sck-haiku'].engine).toBe('quality-pace-v6');expect(members.at(-1)).toBe('p/a');
+ expect(results['sck-haiku'].engine).toBe('quality-pace-v7');expect(members.at(-1)).toBe('p/a');
  let t=rankingTables({'sck-haiku':members},results,[],{},gates)[0]!;
  expect(t.scored).toBe(true);expect(t.at).toBe(results['sck-haiku'].at);expect(t.rows.find(r=>r.model==='p/b')?.decision).toBeDefined();
  expect(t.rows.find(r=>r.model==='p/a')?.jevScore).toBeUndefined();expect(t.rows.find(r=>r.model==='p/a')?.health?.excluded).toBe(true);
@@ -360,6 +361,7 @@ test('channel-scoped performance and task trends never leak to a new channel wit
  const results=[{model:'remote-magpie/old/m:max',domain:'general',overall:4.8,weight:1,at,task:'t1'}];
  const db={query:async()=>[results]};
  const controller=new ModelRoutingController(db as any,scratch(),'unused',{
+  usageLog:join(scratch(),'missing-usage.jsonl'),routingLogDir:join(scratch(),'missing-routing'),
   output:async()=> '[]',fetch:(async()=>Response.json(nativeUsage([]))) as unknown as typeof fetch,
  });
  const facts=await controller.rankingFacts(['remote-magpie/old/m:max','remote-magpie/new/m:max']);

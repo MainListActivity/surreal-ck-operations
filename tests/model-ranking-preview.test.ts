@@ -16,8 +16,8 @@ function harness(ranking:any={tables:[],policy:ROUTING_DEFAULTS},catalog:any={mo
  return {render,writes,text:()=>elements.filter(n=>n.type==='Text').map(texts).join('\n'),button:(title:string)=>elements.find(n=>n.type==='Pressable'&&texts(n)===title),elements};
 }
 const row={model:'vendor/model:max',aaScore:50,accounts:[{account:'masked',remainingPct:0}],ttftMs:30000,decision:{score:42.36,reason:'非线性总分 42.36',latencySource:'historical-average',billing:'subscription',quota:'low',costClass:'free',contributions:{price:{value:1,weight:5,factor:1,points:0}},factors:{base:80,latency:0.5,availability:1,reliability:1,urgency:1,exploration:2.36,estimatedCost:0}}};
-test('ranking surface replaces old layers/Jev widgets with six weights, global score and catalog actions',()=>{
- const h=harness();const nodes=h.render();expect(nodes.filter(n=>n.type==='TextInput')).toHaveLength(7);
+test('ranking surface replaces old layers/Jev widgets with seven weights, global score and catalog actions',()=>{
+ const h=harness();const nodes=h.render();expect(nodes.filter(n=>n.type==='TextInput')).toHaveLength(8);
  expect(h.text()).toContain('几何效用');expect(h.text()).toContain('本组暂无匹配成员');
  expect(h.text()).not.toContain('历史 JEV');expect(h.text()).not.toContain('AA 能力档宽度');
  expect(h.button('管理模型')).toBeDefined();expect(h.button('保存设置')).toBeDefined();

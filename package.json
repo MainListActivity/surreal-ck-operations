@@ -1,6 +1,6 @@
 {
   "name": "@surreal-ck/company-control-plane",
-  "version": "0.3.49",
+  "version": "0.3.50",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@10.32.1",

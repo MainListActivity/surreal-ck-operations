@@ -46,7 +46,7 @@ test('billing overrides immediately reverse the actual applied order using the s
  const f=fixture(),r=new RankingRefresher(f.deps);
  await saveRankingSettings(f.db as any,{rules:'',refreshMinutes:10},r);
  expect(f.published.at(-1)['sck-haiku']).toEqual(['p/a','p/b']);
- const policy={...DEFAULT_POLICY,weights:{pace:0,latency:0,intelligence:0,speed:0,performance:0,price:100},billingOverrides:{'p/b':'free' as const,'p/a':'paid' as const}};
+ const policy={...DEFAULT_POLICY,weights:{staleness:20,pace:0,latency:0,intelligence:0,speed:0,performance:0,price:100},billingOverrides:{'p/b':'free' as const,'p/a':'paid' as const}};
  await saveRankingSettings(f.db as any,{rules:'',refreshMinutes:10,policy},r);
  expect(f.published.at(-1)['sck-haiku']).toEqual(['p/b','p/a']);expect(f.reads()).toBe(0);
 });

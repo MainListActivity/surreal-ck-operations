@@ -1,7 +1,7 @@
 import type {ModelRankingTable} from './types.ts';
-export const ROUTING_WEIGHTS={pace:'额度消耗意愿',latency:'首 token 延迟',intelligence:'AA 能力',speed:'输出速度',performance:'验收绩效',price:'预计费用'};
-export const ROUTING_DEFAULTS={bandWidth:2,weights:{pace:35,latency:30,intelligence:15,speed:10,performance:5,price:5},billingOverrides:{}};
-export const ROUTING_FORMULA='基础效用 U = 几何效用 × 延迟因子 × 额度可用性 × 可靠性²；总分 = 100 × [1 − (1 − U/100)^E] + 探索加分。临期指数 E 随真实到期临近而增强，无临期时为1。手动置顶保留人工顺序；其余只按总分降序（0–100）。';
+export const ROUTING_WEIGHTS={pace:'额度消耗意愿',latency:'首 token 延迟',intelligence:'AA 能力',speed:'输出速度',performance:'验收绩效',price:'预计费用',staleness:'陈旧数据探索'};
+export const ROUTING_DEFAULTS={bandWidth:2,weights:{pace:35,latency:30,intelligence:15,speed:10,performance:5,price:5,staleness:20},billingOverrides:{}};
+export const ROUTING_FORMULA='基础效用 U = 几何效用 × 延迟因子 × 额度可用性 × 可靠性²；总分 = 100 × [1 − (1 − U/100)^E] + 新模型探索 + 陈旧数据探索。陈旧探索在1小时无请求后增长，额外24小时达到上限的一半，新的实际请求使其回落；额度耗尽或持续报错不加分。临期指数 E 随真实到期临近而增强，无临期时为1。手动置顶保留人工顺序；其余只按总分降序（0–100）。';
 export const ROUTING_COST_HELP='费用按 100万输入＋25万输出估算并考虑缓存命中。免费及订阅/积分覆盖为零额外费用，费用原始分为100；权重不是模型价格。';
 export function routingNumber(value:number|undefined|null,decimals=1){return typeof value==='number'&&Number.isFinite(value)?value.toFixed(decimals):'未知';}
 export function routingMetrics(row:ModelRankingTable['rows'][number]){
@@ -17,6 +17,7 @@ export function routingMetrics(row:ModelRankingTable['rows'][number]){
   ['供应商额度',d?.costClass==='free'?'免费，不扣分':row.accounts.map(a=>`${n(a.remainingPct,2)}%`).join(' / ')||'未知','免费不受额度耗尽影响'],
   ['可靠性因子',f?`${n(f.reliability*100)}%`:'未知',row.health?`${row.health.errors}/${row.health.attempts} 次路由错误`:'暂无路由样本'],
   ['临期额度',row.urgency?.active?`${row.urgency.amount} ${row.urgency.unit}`:'无有效临期额度',row.urgency?.reason??'只使用新鲜、明确的到期数据'],
+  ['陈旧数据探索',f?`+${n(f.staleness??0,2)} 分`:'未知',d?.sampleAgeMs===undefined?'无可核验请求时间':`距上次请求 ${n(d.sampleAgeMs/60000,0)} 分钟；刷新观测不会清零`],
   ['AA 参考价',`入 $${n(row.price?.input,3)} / 出 $${n(row.price?.output,3)}`,`缓存命中 $${n(row.price?.cacheHit,3)} / M token`],
  ] as const;
 }
@@ -32,5 +33,5 @@ export function routingCalculation(row:ModelRankingTable['rows'][number]){
  const n=routingNumber;
  const expression=f.utility===undefined?[f.base,f.latency,f.availability,f.reliability,f.urgency].map(v=>n(v,3)).join(' × '):
   `100 × [1 − (1 − ${n(f.utility,3)}/100)^${n(f.urgency,3)}]`;
- return `计算：${expression} + ${n(f.exploration,2)} = ${n(row.decision?.score,2)}${row.decision?.tail?'（不可用模型记0）':''}`;
+ return `计算：${expression} + ${n(f.exploration,2)}${f.staleness===undefined?'':` + ${n(f.staleness,2)}`} = ${n(row.decision?.score,2)}${row.decision?.tail?'（不可用模型记0）':''}`;
 }
