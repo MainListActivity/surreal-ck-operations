@@ -156,7 +156,7 @@ export function registerScrub(server: PluginServerContext, inherited: Env = proc
       throw new Error(`公司会话必须在员工沙箱中启动：${gap}`);
     }
     const env: Record<string, string> = { ...scrubEnv(request.env ?? {}, inherited), ...SANDBOX_MARKER };
-    if (options.modelEnv) Object.assign(env, await options.modelEnv(request));
+    if (request.purpose !== "history" && options.modelEnv) Object.assign(env, await options.modelEnv(request));
     const blanked = Object.keys(env).filter(name => env[name] === "" && request.env?.[name] === undefined);
     if (zdotdir && env.ZDOTDIR === undefined) env.ZDOTDIR = zdotdir;
     console.log(`scrub ${request.agentId} (${request.reason}): blanked ${blanked.length} credential variable(s)${blanked.length ? ` [${blanked.join(", ")}]` : ""}${env.ZDOTDIR === zdotdir && zdotdir ? "; zsh startup shimmed" : ""}`);

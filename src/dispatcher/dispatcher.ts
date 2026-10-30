@@ -79,7 +79,7 @@ const holderNoticeText = (notice: { taskId: string; episode: string; kind: strin
   + `按最新决定行事，不要基于旧提醒重复动作。`;
 
 /** `unknown`: the roster or pool has no observation for the session. It is never shown or treated as busy. */
-export type InstState = 'busy' | 'idle' | 'down' | 'exhausted' | 'unknown';
+export type InstState = 'busy' | 'idle' | 'sleeping' | 'down' | 'exhausted' | 'unknown';
 
 /** 'ok' healthy / 'probe' single trial session allowed / 'down' cooling off. */
 const availabilityOf = (h: ProviderHealth | undefined, now: number): 'ok' | 'probe' | 'down' =>
@@ -264,7 +264,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
   const resolveSlot = (def: EmployeeDef): string | undefined =>
     (def.model ?? '').startsWith('auto:') ? p.slots.get(`${def.provider}:${(def.model ?? '').slice(5)}`) : (def.model || undefined);
   const ready = (inst: EmployeeInst) =>
-    p.states.get(inst.id) === 'idle' ||
+    (p.states.get(inst.id) === 'idle' || p.states.get(inst.id) === 'sleeping') ||
     (p.states.get(inst.id) === 'exhausted' && availabilityOf(p.health.get(inst.provider ?? ''), p.now) === 'probe');
   /**
    * A provider in quota or health cooldown: the percent floor (no provable recovery time), or the health cooldown, which
@@ -1078,6 +1078,14 @@ export class Dispatcher {
       }
       if (status === 'closed') {
         openTasks ??= await wf.tasks();
+        // Paseo's idle collector closes only the process. Goal conversations remain durable seats.
+        // Leave unused runtimes asleep; send() restores the same persistence handle after a legal claim.
+        if (inst.workspaceScope && !openTasks.some(t => t.currentEmployee === inst.id) &&
+            (!inst.def || defs.some(d => d.id === inst.def && d.enabled))) {
+          states.set(inst.id, 'sleeping');
+          this.closedSince.delete(inst.paseoAgentId);
+          continue;
+        }
         const resumed = await this.resumeClosed(inst, openTasks, now, report);
         if (resumed) {
           states.set(inst.id, resumed);
@@ -1491,7 +1499,7 @@ export class Dispatcher {
       if (failures < PERSISTENT_QUOTA_FAILURES && h.until !== undefined) return undefined;
       return { employee, failures, until: h.until === undefined ? undefined : new Date(h.until * 1000).toISOString() };
     };
-    const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
+    const ready = (inst: EmployeeInst) => ['idle','sleeping'].includes(states.get(inst.id) ?? '') ||
       (states.get(inst.id) === 'exhausted' && availabilityOf(health.get(inst.provider ?? ''), now) === 'probe');
     // Surfacing: enabled auto defs whose family cannot be resolved right now would silently
     // starve their roles, so escalate once (clears automatically when resolution returns).
@@ -1514,10 +1522,10 @@ export class Dispatcher {
       // Continuity beats weights: the previous holder keeps the task when it is still available.
       // Review work never hits this: an author's former holder is already out; a claim-only
       // hand surviving as previousEmployee is continuity, not a conflict.
-      const previous = candidates.find(i => i.id === task?.previousEmployee && states.get(i.id) === 'idle');
+      const previous = candidates.find(i => i.id === task?.previousEmployee && ['idle','sleeping'].includes(states.get(i.id) ?? ''));
       if (previous) return previous;
       // A dead (exhausted) session cannot prove a provider recovered; probe with a live one when possible.
-      const live = candidates.filter(i => states.get(i.id) === 'idle');
+      const live = candidates.filter(i => ['idle','sleeping'].includes(states.get(i.id) ?? ''));
       const usable = live.length ? live : candidates;
       const pool = usable.filter(i => i.id !== avoid);
       const available = pool.length ? pool : usable;
@@ -2046,7 +2054,7 @@ export class Dispatcher {
         if (running >= cfg.maxRunning) break;
         // 持有人是员工 ID，会话只是它的一个实例：只投给这一轮还在线、空闲、且没被本轮派工的实例。
         const holder = insts.find(candidate => candidate.id === notice.holder && candidate.paseoAgentId
-          && !assigned.has(candidate.id) && states.get(candidate.id) === 'idle');
+          && !assigned.has(candidate.id) && ['idle','sleeping'].includes(states.get(candidate.id) ?? ''));
         if (!holder) {
           // 会话不在线或正在别的活上：通知留着，下一轮再试，持有人也可以自己读 holder_notices。
           report.decisions.push(`holder-notice-wait:${notice.taskId}`);
