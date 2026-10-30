@@ -814,3 +814,16 @@ test('a recursive story has no software gate fallback; book confirmation must be
   expect(String(g.tasks.manual)).toBe(String(new RecordId('task',manualId)));
   expect(g.anchors.map(String)).toContain(String(new RecordId('task',gate)));
 });
+
+
+test('the real plan-only story template first binding preserves its plan anchor and does not create manual acceptance', async () => {
+  const {GoalGovernanceStore}=await import('../src/goal-store.ts');const store=new GoalGovernanceStore(database.db);
+  const {goalId,manualId}=await seedGoal({id:'plan-only-story',outcomeRequired:['owner_final']});
+  await database.db.query("UPDATE ONLY $g SET pipeline='story',tasks={plan:$plan},anchors=[$plan];",{g:new RecordId('goal',goalId),plan:new RecordId('task',manualId)});
+  const gate=await makeTask(goalId,'全书完成确认',{kind:'gate',state:'ready',reviewer_role:'owner'});
+  const preview=await store.finalGatePreview({goalId,candidateTaskId:gate});expect(preview.ready).toBe(true);
+  await store.finalGateRepair({goalId,candidateTaskId:gate,expectedGoalVersion:preview.goalVersion,snapshotHash:preview.snapshot.hash,actor:'owner:test',reason:'首绑真实故事模板全书终验',idempotencyKey:randomUUID()});
+  const [g]=await database.db.query<any>('SELECT tasks,anchors FROM ONLY $g;',{g:new RecordId('goal',goalId)});
+  expect(g.tasks.manual).toBeUndefined();expect(String(g.tasks.plan)).toBe(String(new RecordId('task',manualId)));
+  expect(g.anchors.map(String)).toEqual([String(new RecordId('task',manualId)),String(new RecordId('task',gate))]);
+});

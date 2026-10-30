@@ -942,14 +942,16 @@ export class GoalGovernanceStore {
     const candidate = (await this.tasksOfGoals([input.goalId])).map(taskFact).find(task => task.id === input.candidateTaskId)!;
     const goal = new RecordId('goal', input.goalId);
     const nextVersion = input.expectedGoalVersion + 1;
-    const quickSame = goalFact(row).tasks.manual === currentId && goalFact(row).tasks.acceptance === currentId;
+    const fact = goalFact(row);
+    const quickSame = currentId !== undefined && fact.tier === 'quick' && (fact.pipeline ?? 'software') === 'software' &&
+      fact.tasks.manual === currentId && fact.tasks.acceptance === currentId;
     await this.run(`BEGIN;
       LET $g = SELECT * FROM ONLY $goal;
       IF $g = NONE OR $g.state NOT IN ['active', 'needs_repair'] OR ($g.version ?? 0) != $expected_version { THROW 'goal version moved' };
       LET $c = SELECT * FROM ONLY $candidate;
       IF $c = NONE OR $c.version != $candidate_version OR $c.state IN ['done', 'void'] { THROW 'candidate moved or terminal' };
       IF $g.tasks != $expected_refs OR ($g.pipeline ?? 'software') != $expected_pipeline { THROW 'goal final gate moved' };
-      IF $old != NONE {
+      IF $old != NONE AND $old != NULL {
         CREATE audit CONTENT { task: $old, actor: $actor, action: 'goal_final_gate_replaced',
           evidence: $old_evidence, at: time::now() };
       };
