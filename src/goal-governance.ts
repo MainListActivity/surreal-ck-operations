@@ -241,8 +241,9 @@ function sortedIds(values: readonly string[] | undefined): string[] {
 }
 
 /** The live final gate: standard/program/video use `acceptance`; quick reuses its product acceptance as `manual`. */
-export function finalGateId(goal: Pick<GoalFact, 'tasks'>): string | undefined {
-  return goal.tasks.acceptance ?? goal.tasks.manual;
+export function finalGateId(goal: Pick<GoalFact, 'tasks' | 'pipeline'>): string | undefined {
+  // Story manual is historical product acceptance, never the eventual book confirmation.
+  return goal.tasks.acceptance ?? (goal.pipeline === 'story' ? undefined : goal.tasks.manual);
 }
 
 function evidenceFor(taskId: string | undefined, evidence: GoalEvidenceFact[]): string[] {
@@ -448,9 +449,11 @@ export function assessGoal(input: {
     state.set(id, 2);
   };
   for (const task of tasks) visit(task.id);
-  if (!finalId) repairReasons.push({ code: 'final_gate_missing', message: '目标没有有效的最终交付/验收关口' });
-  else if (!final) repairReasons.push({ code: 'final_gate_missing', message: `终验关口 ${finalId} 不存在` });
-  else {
+  const storyAwaitingFinal = goal.pipeline === 'story' && !finalId &&
+    (goal.state === 'active' || goal.state === 'needs_repair') && tasks.some(task => !TERMINAL.has(task.state));
+  if (!finalId && !storyAwaitingFinal) repairReasons.push({ code: 'final_gate_missing', message: '目标没有有效的最终交付/验收关口' });
+  else if (finalId && !final) repairReasons.push({ code: 'final_gate_missing', message: `终验关口 ${finalId} 不存在` });
+  else if (final) {
     if (superseded) repairReasons.push({ code: 'final_gate_superseded', message: '终验关口已被新版本替代', taskId: final.id });
     if (final.state === 'void') repairReasons.push({ code: 'final_gate_void', message: '终验关口已作废，目标不能自动完成', taskId: final.id });
     if (final.state === 'done' && final.reviewerRole === 'owner' && final.acceptedBy !== 'owner') {
@@ -544,8 +547,9 @@ export function assessGoal(input: {
   const ownerStage = final?.reviewerRole === 'owner'
     ? final.state === 'done' ? (final.acceptedBy === 'owner' ? 'done' : 'missing') :
       final.state === 'void' ? 'missing' : 'waiting'
-    : ownerRequired ? 'missing' : 'not_required';
+    : storyAwaitingFinal ? 'waiting' : ownerRequired ? 'missing' : 'not_required';
   stages.push(stage('owner_final', ownerStage, evidenceFor(final?.id, evidence),
+    storyAwaitingFinal ? '故事按层递归创作中；收尾时登记《全书完成确认》，仍须老板真实批准' :
     final?.reviewerRole !== 'owner' && ownerRequired ? 'required owner_final 需要 owner 终验关口且由老板本人批准' :
       final?.state === 'void' ? '终验关口已作废' : undefined));
 

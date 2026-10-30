@@ -948,13 +948,13 @@ export class GoalGovernanceStore {
       IF $g = NONE OR $g.state NOT IN ['active', 'needs_repair'] OR ($g.version ?? 0) != $expected_version { THROW 'goal version moved' };
       LET $c = SELECT * FROM ONLY $candidate;
       IF $c = NONE OR $c.version != $candidate_version OR $c.state IN ['done', 'void'] { THROW 'candidate moved or terminal' };
-      IF $expected_old != NONE AND $g.tasks.acceptance != $expected_old { THROW 'goal final gate moved' };
+      IF $g.tasks != $expected_refs OR ($g.pipeline ?? 'software') != $expected_pipeline { THROW 'goal final gate moved' };
       IF $old != NONE {
         CREATE audit CONTENT { task: $old, actor: $actor, action: 'goal_final_gate_replaced',
           evidence: $old_evidence, at: time::now() };
       };
       UPDATE ONLY $goal SET tasks.acceptance = $candidate, tasks.manual = IF $quick THEN $candidate ELSE $g.tasks.manual END,
-        anchors = array::map($g.anchors ?? [], |$a| IF $a = $expected_old OR $quick THEN $candidate ELSE $a END),
+        anchors = array::union(array::map($g.anchors ?? [], |$a| IF $a = $expected_old OR $quick THEN $candidate ELSE $a END), [$candidate]),
         state = 'needs_repair', needs_repair = true,
         needs_repair_reason = '终验关口引用已替换；待新关口验收后重算，旧版因此不能自动关闭目标',
         needs_repair_at = time::now(), version = $next_version;
@@ -965,6 +965,7 @@ export class GoalGovernanceStore {
         payload: { goal: $goal_key, old: $expected_old, new: $candidate_key, snapshot: $snapshot }, at: time::now() };
       COMMIT;`, {
       goal, candidate: new RecordId('task', input.candidateTaskId), candidate_version: candidate.version ?? 0,
+      expected_refs: row.tasks ?? {}, expected_pipeline: row.pipeline ?? 'software',
       expected_version: input.expectedGoalVersion, expected_old: currentId ? new RecordId('task', currentId) : null,
       old: currentId ? new RecordId('task', currentId) : null,
       old_evidence: `终验引用由 ${currentId ?? '-'} 替换为 ${input.candidateTaskId}；授权修复，旧关口不再承担实现完成判定`,

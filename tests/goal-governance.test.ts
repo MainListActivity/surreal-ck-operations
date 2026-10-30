@@ -437,3 +437,34 @@ describe('metrics segmentation keeps a large window complete and inside the resp
     expect(segmentGoalMetrics(view, { scope: 'fixture-window' }).section).toBeNull();
   });
 });
+
+describe('recursive story final gate lifecycle', () => {
+  test('an ongoing story waits for its eventual book confirmation instead of a software G3', () => {
+    const g = goal({ pipeline: 'story', tasks: { plan: 'plan', manual: 'legacy-manual' }, anchors: [] });
+    const result = assessGoal({ goal: g, tasks: [task('plan'), task('legacy-manual', { state: 'void', kind: 'gate' }),
+      task('chapter-outline', { state: 'review', reviewerRole: 'owner' })], outcome: outcome(['owner_final']), now: NOW });
+    expect(result.finalGate.taskId).toBeUndefined();
+    expect(result.repairReasons).toEqual([]);
+    expect(result.stages.find(s => s.key === 'owner_final')).toMatchObject({ status: 'waiting' });
+    expect(result.outcome.missing).toContain('owner_final');
+    expect(result.readyToComplete).toBe(false);
+  });
+
+  test('finishing every story task without registering book confirmation remains a repair gap', () => {
+    const result = assessGoal({ goal: goal({ pipeline: 'story', tasks: { plan: 'plan' }, anchors: [] }),
+      tasks: [task('plan')], outcome: outcome(['owner_final']), now: NOW });
+    expect(result.repairReasons.map(r => r.code)).toContain('final_gate_missing');
+    expect(result.readyToComplete).toBe(false);
+  });
+
+  test('an explicitly bound story gate still needs real owner approval and all work complete', () => {
+    for (const acceptedBy of [undefined, 'gm', 'owner']) {
+      const result = assessGoal({ goal: goal({ pipeline: 'story' }), tasks: [task('manual'), ownerGate({ acceptedBy })],
+        outcome: outcome(['owner_final']), now: NOW });
+      expect(result.readyToComplete).toBe(acceptedBy === 'owner');
+    }
+    const invalid = assessGoal({ goal: goal({ pipeline: 'story' }), tasks: [task('manual'), ownerGate({ state: 'void' })],
+      outcome: outcome(['owner_final']), now: NOW });
+    expect(invalid.repairReasons.map(r => r.code)).toContain('final_gate_void');
+  });
+});
