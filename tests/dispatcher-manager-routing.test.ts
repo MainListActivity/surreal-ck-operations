@@ -291,7 +291,7 @@ export function fixture(specs: TaskSpec[]) {
     env: inst => ({ SCK_COMM_DIR: `/tmp/${inst.id}`, SCK_COMM_KEY: 'k' }),
     canReuse: () => true,
     detachAgent: () => {},
-    claim: async (inst, task) => task && inst.role === task.executorRole
+    claim: async (inst, task) => task && inst.role === (task.state==='review'?task.reviewerRole:task.executorRole)
       ? ({ task: taskView(task), deliveryId: `delivery-${task.id}`, fence: 1,
           leaseExpiresAt: new Date((now + 600) * 1000).toISOString(), history: [] } as ClaimResult)
       : undefined,
@@ -318,7 +318,7 @@ export function fixture(specs: TaskSpec[]) {
   return {
     tick,
     get last() { return last; },
-    rows, instances, agents, errors, health, facts, prompts, sends, spawnCwds, readWorkspaceCalls, notices, actions, dispatches,
+    paseo, rows, instances, agents, errors, health, facts, prompts, sends, spawnCwds, readWorkspaceCalls, notices, actions, dispatches,
     setStatus(agentId: string, status: string) { agents.get(agentId)!.status = status; },
     setError(agentId: string, error: string) { errors.set(agentId, error); },
     failReload(value: boolean) { failReload = value; },
@@ -707,7 +707,7 @@ function factoryWorld() {
     const inst:EmployeeInst={id:'factory-1',def:factory.id,provider:factory.provider,model:factory.model,role:factory.role,paseoAgentId:'agent-factory',cwd:OPS,repoHome:OPS,workspaceScope:'maintenance'};
     f.instances.push(inst);f.agents.set('agent-factory',{id:'agent-factory',status});return inst;
   };
-  return {...f,factory,addFactory};
+  return {...f,factory,addFactory,get last(){return f.last;}};
 }
 test('Factory native spawn precedes idle Claude reuse and staffing never asks Jev',async()=>{
   const f=factoryWorld();let calls=0;
@@ -721,9 +721,10 @@ test('Factory idle reuse precedes idle Claude reuse',async()=>{
  const f=factoryWorld();f.addFactory('idle');
  expect((await f.tick()).woke.find(w=>w.task==='factory-task')).toMatchObject({employee:'factory-1',spawned:false});
 });
-test('Factory full seats fall back to idle Claude',async()=>{
+test('Factory full seats wait rather than using idle Claude',async()=>{
  const f=factoryWorld();f.addFactory('running');
- expect((await f.tick()).woke.find(w=>w.task==='factory-task')).toMatchObject({employee:'eng-1',spawned:false});
+ const report=await f.tick();expect(report.woke.find(w=>w.task==='factory-task')).toBeUndefined();
+ expect(f.last!.dispatchVerdicts().find(v=>v.taskId==='factory-task')!.reasons.map(r=>r.code)).toContain('factory_wait');
 });
 test('Factory exhausted health falls back to Claude without reopening Factory',async()=>{
  const f=factoryWorld();f.health.set('factory-droid',{provider:'factory-droid',state:'exhausted',until:2_000_000_000,failures:1});
@@ -734,10 +735,10 @@ test('Factory quota floor falls back to Claude',async()=>{
  const report=await f.tick({quota:async()=>[{provider:'factory-droid',sessionPct:0,weeklyPct:0,fetchedAt:new Date().toISOString(),summary:'fixture exhausted'}]});
  expect(report.woke.find(w=>w.task==='factory-task')).toMatchObject({employee:'eng-1',spawned:false});
 });
-test('Factory provider concurrency cap falls back even with spare definition seats',async()=>{
+test('Factory provider concurrency cap waits even with spare definition seats',async()=>{
  const f=factoryWorld();f.factory.maxInstances=3;f.addFactory('running');const config=f.wf.config.bind(f.wf);
  f.wf.config=async()=>({...await config(),providerMax:{'factory-droid':1,claude:4,codex:8}});
- expect((await f.tick()).woke.find(w=>w.task==='factory-task')).toMatchObject({employee:'eng-1',spawned:false});
+ expect((await f.tick()).woke.find(w=>w.task==='factory-task')).toBeUndefined();
 });
 
 test('a repository difference without an explicit code repo binding never authorizes automatic takeover',async()=>{
@@ -765,4 +766,56 @@ test('same repository manager work is separated by goal, not batched into one co
   await f.tick();
   const managers = f.instances.filter(i => i.role === 'gm');
   expect(managers.map(i => i.workspaceScope).sort()).toEqual(['goal-a', 'goal-b']);
+});
+
+
+test('three Factory waiters are retained and later work spills to Claude',async()=>{
+ const f=factoryWorld();f.addFactory('running');
+ f.rows[0]!.row.created_at=new Date('2026-10-01T00:00:00Z') as never;
+ for(let n=2;n<=5;n++){
+  const t=f.addTask({id:`waiting-${n}`,state:'ready',repoPath:OPS,facts:{authors:[],reviewers:[],excluded:[],unknown:[],ambiguous:false}});
+  t.row.created_at=new Date(`2026-10-0${n}T00:00:00Z`) as never;
+ }
+ const r=await f.tick();
+ expect(r.woke.some(w=>['factory-task','waiting-2','waiting-3'].includes(w.task))).toBe(false);
+ expect(r.woke.some(w=>w.task==='waiting-4')).toBe(true);
+ expect(f.instances.find(i=>i.id===r.woke.find(w=>w.task==='waiting-4')!.employee)?.provider).toBe('claude');
+ const again=await f.tick();expect(again.woke.some(w=>['factory-task','waiting-2','waiting-3'].includes(w.task))).toBe(false);
+});
+
+test('manager wakes share the three-job Factory backlog and allow later independent groups to spill',async()=>{
+ const f=fixture([1,2,3,4].map(n=>({id:`gm-queued-${n}`,state:'blocked' as const,blockedTo:'gm' as const,repoPath:OPS,goalId:`g${n}`})));
+ const fd:EmployeeDef={...f.defs[0]!,id:'gm-factory',provider:'factory-droid',model:'native',maxInstances:4};f.defs.push(fd);
+ f.instances.push({id:'busy-factory-gm',def:fd.id,role:'gm',provider:'factory-droid',model:'native',paseoAgentId:'busy-factory-agent',repoHome:OPS,workspaceScope:'maintenance'});
+ f.agents.set('busy-factory-agent',{id:'busy-factory-agent',status:'running'});
+ const config=f.wf.config.bind(f.wf);f.wf.config=async()=>({...await config(),providerMax:{codex:8,'factory-droid':1}});
+ f.rows.forEach((t,n)=>{t.row.created_at=new Date(1000+n) as never;});
+ const r=await f.tick();expect(r.woke.map(w=>w.task)).toEqual(['gm-queued-4']);
+ expect(f.instances.find(i=>i.id===r.woke[0]!.employee)?.provider).not.toBe('factory-droid');
+});
+
+test('review tasks retain three Factory waiting slots and overflow keeps author recusal',async()=>{
+ const f=factoryWorld();f.rows.length=0;
+ f.factory.role='qa';f.factory.maxInstances=1;
+ const fi=f.addFactory('running');fi.role='qa';
+ const q=f.defs.find(d=>d.id==='qa-codex')!;Object.assign(q,{provider:'claude',model:'group/sck-haiku',quotaLimited:false});
+ Object.assign(f.instances.find(i=>i.id==='qa-1')!,{provider:'claude',model:'group/sck-haiku'});
+ for(let n=1;n<=4;n++){const t=f.addTask({id:`review-${n}`,state:'review',repoPath:OPS,facts:{authors:['author'],reviewers:[],excluded:['author'],unknown:[],ambiguous:false}});t.row.created_at=new Date(n*1000) as never;}
+ const r=await f.tick();expect(r.woke.map(w=>w.task)).toEqual(['review-4']);expect(r.woke[0]?.employee).toBe('qa-1');
+});
+
+test('a Factory assignment leaves three waiting slots for the remaining jobs',async()=>{
+ const f=factoryWorld();f.addFactory('running');f.factory.maxInstances=2;
+ const config=f.wf.config.bind(f.wf);f.wf.config=async()=>({...await config(),providerMax:{'factory-droid':2,claude:8,codex:8}});
+ f.rows[0]!.row.created_at=new Date(1000) as never;
+ for(let n=2;n<=5;n++){const t=f.addTask({id:`promote-${n}`,state:'ready',repoPath:OPS,facts:{authors:[],reviewers:[],excluded:[],unknown:[],ambiguous:false}});t.row.created_at=new Date(n*1000) as never;}
+ const r=await f.tick();expect(r.woke.map(w=>w.task)).toEqual(['factory-task','promote-5']);
+ expect(f.instances.find(i=>i.id===r.woke[0]!.employee)?.provider).toBe('factory-droid');
+ expect(f.instances.find(i=>i.id===r.woke[1]!.employee)?.provider).toBe('claude');
+});
+
+test('Factory max thinking is passed independently of auto-high permission mode',async()=>{
+ const f=factoryWorld();f.factory.thinking='max';let seen:unknown;
+ const spawn=f.paseo.spawn.bind(f.paseo);f.paseo.spawn=async input=>{seen=input;return spawn(input);};
+ await f.tick();expect(seen).toMatchObject({provider:'factory-droid',thinking:'max',mode:'auto-high'});
 });

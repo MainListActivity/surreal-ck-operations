@@ -1,6 +1,6 @@
 import { faultBelongsToWait, faultNeedsNotice } from '../task-recovery.ts';
 import { workspaceScopeFor } from '../goal-workspace-capability.ts';
-import { FACTORY_PROVIDER, factoryFirst } from './provider-order.ts';
+import { FACTORY_PROVIDER, FACTORY_WAIT_LIMIT, factoryFirst, factoryQueue, leaveFactoryQueue } from './provider-order.ts';
 import { managedModel, employeeClientModel } from "../model-routing/policy.ts";
 import type { OwnerDesk } from '../owner.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ManagerActionRow, ManagerWakeClaim, ManagerWakeRow, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
@@ -180,6 +180,8 @@ export interface StaffingEntry {
 }
 
 export interface StaffingInput {
+  /** Global FIFO of work waiting for Factory; positions after three may use other providers. */
+  factoryQueue?: ReadonlyMap<string, number>;
   role: string;
   home: string;
   task?: SupervisedTask;
@@ -239,6 +241,15 @@ function trackOkFor(role: Role, task: SupervisedTask | undefined, tracks: string
   const required = REQUIRED_TRACKS[role];
   if (required !== undefined) return task?.discipline === required && (tracks ?? []).includes(required);
   return !task?.discipline || !tracks?.length || tracks.includes(task.discipline);
+}
+
+export function factoryWorkKey(role: string, task: SupervisedTask, review = false): string {
+  const phase = review ? 'review' : task.state === 'blocked' || role !== task.executorRole ? 'manager' : 'execute';
+  return `${task.id}:${role}:${phase}`;
+}
+
+export function factoryConfigured(defs: readonly EmployeeDef[], role: string, task?: SupervisedTask): boolean {
+  return defs.some(def => def.enabled && def.provider === FACTORY_PROVIDER && def.role === role && trackOkFor(role as Role,task,def.tracks));
 }
 
 /**
@@ -389,6 +400,15 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     entries.push({ kind: 'spawn', key: `spawn:${def.id}`, ref: def.id, role: p.role,
       provider: def.provider, model: resolved ?? def.model, def,
       weight: managedModel(def) ? 1 : effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2] });
+  }
+  const position = p.task ? p.factoryQueue?.get(factoryWorkKey(p.role,p.task,!!p.excludeSubmitter)) : undefined;
+  const factoryOnly = !quotaOf(FACTORY_PROVIDER) && factoryConfigured(p.defs,p.role,p.task) &&
+    (!p.task || !p.factoryQueue || (position !== undefined && position <= FACTORY_WAIT_LIMIT));
+  if(factoryOnly) for(const entry of entries) {
+    if(entry.provider === FACTORY_PROVIDER || !entry.eligible) continue;
+    entry.eligible=false;
+    entry.code='factory_wait';
+    entry.reason=position === undefined ? BLOCK_TEXT.factory_wait : `${BLOCK_TEXT.factory_wait}（第 ${position}/${FACTORY_WAIT_LIMIT} 个保留等待名额）`;
   }
   const total = entries.filter(e => e.eligible).reduce((s, e) => s + Math.max(0, e.weight), 0);
   for (const e of entries) e.share = e.eligible && total > 0 ? Math.max(0, e.weight) / total : 0;
@@ -607,6 +627,7 @@ export interface PassInputs {
   runtimeModels?: Map<string, string>;
   /** taskId → why the effective policy contract no longer authorizes it, read once in this pass (SYS06 AC02/RB01). */
   policyBlocks?: Map<string, string>;
+  factoryQueue?: Map<string, number>;
 }
 
 export interface TickReport {
@@ -645,7 +666,7 @@ export async function snapshotOf(p: PassInputs, opts: { opsRepo: string; sidecar
   }
   const holding = new Set(p.tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
   const poolBase = { defs: p.defs, insts: p.insts, states: p.states, holding, health: p.health, quotaBlocked: p.quotaBlocked,
-    busyBy, providerMax: p.cfg.providerMax, slots: p.slots, runtimeModels: p.runtimeModels, policyBlocks: p.policyBlocks,
+    factoryQueue:p.factoryQueue, busyBy, providerMax: p.cfg.providerMax, slots: p.slots, runtimeModels: p.runtimeModels, policyBlocks: p.policyBlocks,
     opsRepo: opts.opsRepo, sidecar: opts.sidecar, now: p.now };
   const homes = [...new Set([opts.opsRepo, ...p.insts.map(i => i.repoHome ?? i.cwd ?? opts.opsRepo), ...p.tasks.map(t => t.repoPath ?? opts.opsRepo)])];
   const roles = [...new Set([...p.defs.map(d => d.role), ...p.insts.map(i => i.role)])];
@@ -1324,7 +1345,19 @@ export class Dispatcher {
     const rand = this.deps.rand ?? Math.random;
     // The candidate pool is evaluated by staffingPool — the same function the owner
     // page previews — so dispatch gating and the roster can never drift apart.
-    const poolBase = { defs, states, holding, health, quotaBlocked, busyBy, policyBlocks,
+    // Reserve only pending work; active manager turns are not waiting jobs.
+    const activeManagerTasks = new Set<string>();
+    if(factoryConfigured(defs,'gm') && typeof wf.openManagerWakes === 'function') {
+      for(const wake of await wf.openManagerWakes().catch(()=>[])) activeManagerTasks.add(wake.taskId);
+    }
+    const factoryCanRoute = availabilityOf(health.get(FACTORY_PROVIDER),now) !== 'down' && !quotaBlocked.has(FACTORY_PROVIDER);
+    const factoryWaiting = factoryQueue([
+      ...work.map(item=>({task:item.task,role:item.role,review:item.purpose==='review'})),
+      ...gmBlocked.filter(task=>!task.waitState && !activeManagerTasks.has(task.id)).map(task=>({task,role:'gm',review:false})),
+    ].filter(item=>factoryCanRoute && !policyBlocks.has(item.task.id) && factoryConfigured(defs,item.role,item.task))
+      .map(item=>({key:factoryWorkKey(item.role,item.task,item.review),createdAt:Date.parse(String(item.task.row.created_at??''))||undefined})));
+    this.passInputs.factoryQueue=factoryWaiting;
+    const poolBase = { factoryQueue:factoryWaiting, defs, states, holding, health, quotaBlocked, busyBy, policyBlocks,
       providerMax: cfg.providerMax, slots: slotMap, runtimeModels, opsRepo: this.deps.env.opsRepo,
       sidecar: !!this.deps.sidecar, now };
     const freshTakeovers = new Map<string, { implementer: string; unavailable: string }>();
@@ -1602,6 +1635,7 @@ export class Dispatcher {
       running++;
       busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);
       assigned.add(result.id);
+      leaveFactoryQueue(factoryWaiting,factoryWorkKey(item.role,item.task,item.purpose==='review'));
       report.woke.push({ task: item.task.id, employee: result.id, spawned: result.spawned });
     }
     if (unplaced.length) await this.markGlobal(unplaced, globalBlock('max_running'), now, report, true);
@@ -1909,9 +1943,11 @@ export class Dispatcher {
         }
       };
       let result: (EmployeeInst & { spawned: boolean }) | undefined;
+      // A batch containing a reserved waiter must not carry it into a fallback session.
+      const anchorTask = (group.find(item => (factoryWaiting.get(factoryWorkKey('gm', item.todo.task)) ?? Infinity) <= FACTORY_WAIT_LIMIT) ?? group[0])!.todo.task;
       try {
         result = await this.assign('gm', undefined, undefined, pick, spawnable,
-          (inst, first, claim, worktree) => gmAttention(inst, group.map(item => item.todo), this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, slotMap, undefined, { task: group[0]!.todo.task }, { beforeExternal, afterExternal });
+          (inst, first, claim, worktree) => gmAttention(inst, group.map(item => item.todo), this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, slotMap, undefined, { task: anchorTask }, { beforeExternal, afterExternal });
       } catch (error) {
         this.log(`manager wake assign failed: ${(error as Error).message}`);
       }
@@ -1931,6 +1967,7 @@ export class Dispatcher {
         continue;
       }
       for (const item of group) {
+        leaveFactoryQueue(factoryWaiting,factoryWorkKey('gm',item.todo.task));
         const marked = await wf.markManagerWakeRunning(item.claim, result.id, result.paseoAgentId).catch(error => {
           this.log(`manager wake bind failed for ${item.todo.task.id}: ${(error as Error).message}`);
           return false;
