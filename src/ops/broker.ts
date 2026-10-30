@@ -1,6 +1,7 @@
 import {assertLocalMagpieScope,observeProductMagpie,PRODUCT_MAGPIE_MODEL,ProductGatewaySourceMismatch,type ProductMagpieObservation} from './product-magpie.ts';
 import {buildRemoteMagpieCandidate,remoteMagpieEvidenceSchema,remoteMagpieWindow,samplingBudgetSchema,type PriceApproval,type TrustedRecord} from './remote-magpie-evidence.ts';
 import {priceApprovalFileName,priceApprovalFor} from './price-approval.ts';
+import {parsePlatformOperatorsView} from './platform-operators.ts';
 // Ops capability broker. Employees never hold credentials: they ask for an operation by name,
 // this trusted code (running inside the Paseo plugin, next to the sealed secrets and the
 // Cloudflare token) performs it, and only a secret-free result goes back. Every call is gated
@@ -71,7 +72,7 @@ export const OPS_TOOLS = [
   'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_principal_list', 'ops_idp_admin_request',
   'ops_idp_provision_rotate', 'ops_invitation_issue',
   'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_approval_diagnose', 'ops_internal_ai_deliver', 'ops_internal_ai_revoke', 'ops_internal_ai_trust', 'ops_internal_ai_rotate_key',
-  'ops_supplier_plan_sample', 'ops_product_magpie_observe', 'ops_product_magpie_candidate', 'ops_magpie_route_sample', 'ops_magpie_route_restore', 'ops_magpie_window_prepare', 'ops_product_magpie_price_approve', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs',
+  'ops_supplier_plan_sample', 'ops_product_magpie_observe', 'ops_product_magpie_candidate', 'ops_magpie_route_sample', 'ops_magpie_route_restore', 'ops_magpie_window_prepare', 'ops_product_magpie_price_approve', 'ops_platform_operator_list', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
 
@@ -394,6 +395,7 @@ export class OpsBroker {
       ops_magpie_route_restore: (ctx, args) => this.magpieRouteRestore(ctx, args),
       ops_magpie_window_prepare: (ctx, args) => this.magpieWindowPrepare(ctx, args),
       ops_product_magpie_price_approve: (ctx, args) => this.productMagpiePriceApprove(ctx, args),
+      ops_platform_operator_list: (ctx, args) => this.platformOperatorList(ctx, args),
       ops_origin_status: (ctx) => this.origin(ctx, { op: 'status' }),
       ops_origin_health: (ctx) => this.origin(ctx, { op: 'health' }),
       ops_origin_logs: (ctx, args) => this.origin(ctx, originLogsRequest(args)),
@@ -1707,6 +1709,28 @@ export class OpsBroker {
     const file=join(evidenceDir,`remote-magpie-candidate-${this.now()}.json`);
     writeFileSync(file,JSON.stringify(candidate,null,2)+'\n',{mode:0o600});
     return {value:{candidateFile:file,candidate},audit:{action:'ops_call',evidence:`ops_product_magpie_candidate ${candidate.configurationDigest.slice(0,16)} routePresent=${candidate.route.present} gaps=${candidate.gaps.length} budget=${budget?'provided':'absent'}`}};
+  }
+
+  /**
+   * `ops_platform_operator_list {session}`: read-only listing of the platform operators behind the product's
+   * operator channel (GET /api/ops/platform-operators, format_version 1). It needs an operator session carrying
+   * the product's read capability, and the response is validated strictly so only subject hashes — never raw
+   * subjects or emails — reach the employee. It writes nothing, calls no model and grants nothing.
+   */
+  private async platformOperatorList(ctx: Ctx, args: Args): Promise<Outcome> {
+    if (ctx.scope.project !== 'surreal_ck' || ctx.env !== 'production') throw new CompanyError('forbidden', '平台运营主体清单只对 surreal_ck 生产环境开放');
+    if (!['gm', 'engineering', 'product', 'qa'].includes(ctx.scope.actor.role)) throw new CompanyError('forbidden', `role ${ctx.scope.actor.role} may not list platform operators`);
+    const extra = Object.keys(args).filter(key => key !== 'session' && key !== 'env');
+    if (extra.length) throw invalid(`ops_platform_operator_list 只接受 session（rejected: ${extra.join(', ')}）`);
+    const session = this.session(ctx, args);
+    if (session.kind !== 'operator') throw invalid('平台运营主体清单需要运营会话；请先用 ops_operator_login');
+    const res = await this.product(ctx, session, 'GET', '/api/ops/platform-operators');
+    if (!res.ok) throw new CompanyError('upstream_error', `产品运营主体清单返回 HTTP ${res.status}；不据此推断主体状态`, true);
+    const view = parsePlatformOperatorsView(res.body);
+    return {
+      value: view,
+      audit: { action: 'ops_call', evidence: `ops_platform_operator_list → ${res.status} operators=${view.operators.length} current=${view.operators.filter(o => o.isCurrent).length}` },
+    };
   }
 
   /**

@@ -75,3 +75,11 @@ observationSnapshot 单独记录本次读取的哈希、采集时刻和本地2�
 - **目标范围**：登记用的租约校验沿用 v2 链的全部条件（当前持有人、doing/review、租约未过期、员工未撤销、角色 engineering/product/qa、项目 surreal_ck 且与调用方 scope 同），但目标只对允许名单放行——阶段一目标 `2e2a6e41c1193595` 与第二阶段目标 `e159e40ad4e50080`（`REMOTE_CANDIDATE_GOALS`，常量，不放开成任意目标）。内部 AI proof 链（`ops_internal_ai_prepare`/`prove`/`deliver`、v2 manifest 路径）仍只认阶段一目标；resume 的 `validateExecutionWindow` 只要求 approvalTask 与被恢复任务同属一个目标（不写死目标），因此第二阶段目标可用。
 - 进程重启后，已登记的行仍在数据库里，可继续被 resume 绑定到其 `evidence_expires_at`；但 broker 内保存的观测与批准会丢失，重新 prepare 前不能产生新的 eligible 候选。被替换或过期的旧行不能再绑定。
 
+
+## 平台运营主体只读清单（ops_platform_operator_list）
+
+- `ops_platform_operator_list {session}` 用**运营会话**调用产品 `GET /api/ops/platform-operators`（format_version 1），把结果原样交给调用者。产品侧鉴权沿用 `requirePlatformOperator` 与既有只读能力 `quota.read`，不新增能力。
+- 只对 `surreal_ck` / `production` 放行，角色限 `gm`、`engineering`、`product`、`qa`。每次调用落 broker 审计（`ops_platform_operator_list → <status> operators=<n> current=<n>`，不含 PII）。
+- 返回形状：`{ format_version, operators: [{ subject_hash, kind, status, capabilities, isCurrent }] }`。`subject_hash` 是 `sha256:<12位>` 伪名；**不返回**原始 subject、邮箱或 display_name。公司侧用严格 schema 校验，多出任何字段（例如产品回归时带回原始 subject）会直接拒绝为 `upstream_error`，不会透传。
+- 只读：不写 `_system`、不改能力、不授予任何权限。`isCurrent` 标记当前运营会话主体。
+- 用途：判断给某个运营身份追加一项能力会不会连带提权其它主体（CSV 播种会把同一份能力灌给全部 `PLATFORM_OPERATOR_SUBJECTS`）。

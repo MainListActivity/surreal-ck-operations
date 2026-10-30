@@ -791,6 +791,19 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
       if (method === 'GET' && url.pathname === '/api/ops/quota/context') {
         return json(200, { subject: grant.userId, capabilities: caps });
       }
+      // Mirrors GET /api/ops/platform-operators (format_version 1): subject hashes only, isCurrent for the caller.
+      if (method === 'GET' && url.pathname === '/api/ops/platform-operators') {
+        if (!caps.includes('quota.read')) return apiError(403, 'platform-operator-capability-missing');
+        const hash = (subject: string) => `sha256:${createHash('sha256').update(subject).digest('hex').slice(0, 12)}`;
+        const rows = [
+          { subject: grant.userId, kind: 'human', status: 'active', capabilities: ['quota.read'] },
+          { subject: 'synthetic-second-operator', kind: 'human', status: 'active', capabilities: ['quota.read', 'subscription.manage'] },
+          { subject: 'synthetic-disabled-operator', kind: 'agent', status: 'disabled', capabilities: [] },
+        ];
+        return json(200, { format_version: 1, operators: rows.map(r => ({
+          subject_hash: hash(r.subject), kind: r.kind, status: r.status, capabilities: r.capabilities, isCurrent: r.subject === grant.userId,
+        })) });
+      }
       const entitlement = /^\/api\/ops\/product-entitlements\/workspaces\/[^/]+$/.exec(url.pathname);
       if (method === 'GET' && entitlement) {
         if (!caps.includes('quota.read')) return apiError(403, 'platform-operator-capability-missing');

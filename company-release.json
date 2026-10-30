@@ -1,17 +1,17 @@
 {
-  "version": "0.3.48",
-  "title": "FV06 窗口登记租约放行第二阶段目标",
-  "changes": [
-    "ops_magpie_window_prepare 的远端候选登记改用 remoteLease：沿用 v2 租约的全部检查（持有人、doing/review、租约未过期、员工未撤销、角色 engineering/product/qa、项目 surreal_ck 且与 scope 同），目标改为允许名单。",
-    "允许名单 REMOTE_CANDIDATE_GOALS 只含阶段一目标 2e2a6e41c1193595 与第二阶段目标 e159e40ad4e50080，是常量，不放开成任意目标。",
-    "内部 AI proof 链（ops_internal_ai_prepare/prove/deliver、v2 manifest 路径）保持 lease() 只认阶段一目标，未改动。",
-    "registerRemoteCandidate 的登记后重核改为 remoteLeaseValid；resume 的 validateExecutionWindow 仍只要求 approvalTask 与被恢复任务同属一个目标。"
-  ],
-  "impact": [
-    "修复第二阶段目标下 eligible 远端候选一律 forbidden: company approval or live lease unavailable、无法登记也无法绑定 502ed504 窗口的缺陷。",
-    "安全边界不变：非持有人、过期租约、未 eligible 仍不登记；其他目标仍被拒；作者自批、篡改 digest/author、缺价目仍闭锁。",
-    "公司控制面改动；不调模型、不改供应商或连接、不扩大观测上限、不授予预算、无 schema 或 secret 变更。"
-  ],
-  "migration": "无 schema 和 secret 变更。",
-  "rollback": "恢复上一健康 main 发布（0.3.47）；本次只改租约校验与常量，登记行结构不变，回退无需清理数据。"
+ "version": "0.3.49",
+ "title": "FV06 平台运营主体只读清单工具",
+ "changes": [
+  "新增 ops_platform_operator_list：用运营会话调用产品 GET /api/ops/platform-operators（format_version 1），列出运营主体的 subject 哈希前缀、kind、status、能力列表与 isCurrent。",
+  "公司侧对响应做严格 schema 校验，只允许 subject_hash/kind/status/capabilities/isCurrent，任何额外字段（原始 subject、邮箱、display_name）一律拒绝为 upstream_error，不透传。",
+  "仅 surreal_ck/production 且角色为 gm/engineering/product/qa 可用；需要运营会话；每次调用落审计，不含 PII。",
+  "只读：不写 _system、不改能力、不授予权限、不调模型。"
+ ],
+ "impact": [
+  "让经理能判断追加一项运营能力是否会连带提权其它主体；此前产品没有任何只读接口能列出 _system.platform_operator。",
+  "生产实际列出 4 行而非 seed 的 2 个主体：10 项能力行=当前 LCA04_OPS，11 项能力行=另一 CSV 播种主体，另有 2 行历史遗留（disabled 0 项、active 6 项）。CSV 播种的第二个主体会随同一 CSV 一并获得追加能力。",
+  "无 schema 或 secret 变更；不改供应商、连接或观测上限。"
+ ],
+ "migration": "无 schema 和 secret 变更。",
+ "rollback": "恢复上一健康 main 发布；本工具只读，回退无需清理数据。"
 }
