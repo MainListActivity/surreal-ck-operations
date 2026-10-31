@@ -860,6 +860,7 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
           if (/goal acceptance repairer/i.test(cause)) throw new CompanyError('self_review', 'Repairing gm cannot review or accept the repaired goal candidate; another gm must');
           if (/self review/i.test(cause)) throw new CompanyError('self_review', 'Employee cannot review own delivery');
           if (/discipline track denied/i.test(cause)) throw new CompanyError('forbidden', 'Employee definition does not cover the task discipline');
+          if (/employee runtime is suspending/i.test(cause)) throw new CompanyError('conflict', 'Employee runtime is suspending; retry after closure');
           if (/leased by another|already has active task/i.test(cause)) throw new CompanyError('already_claimed', 'Task or employee already leased');
           if (/lease expired/i.test(cause)) throw new CompanyError('lease_expired', 'Lease expired');
           // FV06 append backstops: the readable pre-checks answer first; these in-transaction guards are
@@ -1427,6 +1428,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       LET $def_tracks = $who.def.tracks ?? [];
       IF $t.discipline != NONE AND array::len($def_tracks) > 0 AND $t.discipline NOT IN $def_tracks { THROW 'discipline track denied' };
       IF $has_req AND ($t.discipline != $req OR $req NOT IN $def_tracks) { THROW 'discipline track denied' };
+      IF ($who.runtime_sleep_until ?? 0) > time::unix(time::now()) { THROW 'employee runtime is suspending'; };
       IF $who.active_task != NONE AND $who.active_task != $task {
         LET $active = SELECT * FROM ONLY $who.active_task;
         IF $active != NONE AND $active.lease_expires_at > $now AND $active.current_employee = $employee { THROW 'employee already has active task' };
