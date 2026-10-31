@@ -435,3 +435,55 @@ test('for-heads, block bodies, labels, export default and async functions cannot
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
 });
+
+// R11 (attempt-9 return): the 18 fail-open rows from the reviewer's 93-case TypeScript-oracle
+// probe. Covers export-default-async, statement-start blocks, case/default labels, ??/?. then
+// label, reserved in, type aliases, and catch-without-params — each with a code-marker control.
+test('export-default-async, statement blocks, case labels, in-operator and type aliases cannot smuggle markers', () => {
+  const roots: string[] = [];
+  try {
+    const refused: Array<[string, string]> = [
+      ['a01-export-default-async-anon', lines(SQL, 'export default async function () {}', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['a02-export-default-async-named', lines(SQL, 'export default async function f() {}', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['b01-block-after-semi-same-line', lines(SQL, `x(); { y(); } /'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['b02-block-after-semi-newline', lines(SQL, 'x();', '{ y(); }', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['b03-block-after-if-block', lines(SQL, 'if (a) { b(); }', '{ y(); }', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['c01-case-number', lines(SQL, 'switch (a) { case 1: { x(); }', `/'/.test(s); } // ${UNAVAILABLE}`, DENIED)],
+      ['c02-case-string', lines(SQL, "switch (a) { case 'a': { x(); }", `/'/.test(s); } // ${UNAVAILABLE}`, DENIED)],
+      ['c03-default', lines(SQL, 'switch (a) { default: { x(); }', `/'/.test(s); } // ${UNAVAILABLE}`, DENIED)],
+      ['c06-case-number-same-line', lines(SQL, `switch (a) { case 1: { x(); } /'/.test(s); } // ${UNAVAILABLE}`, DENIED)],
+      ['q01-nullish-then-label', lines(SQL, 'const v = b ?? c;', 'foo: { x(); }', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['q02-optchain-then-label', lines(SQL, 'const v = b?.c;', 'foo: { x(); }', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['q03-optchain-then-case-ident', lines(SQL, 'const v = b?.c;', 'switch (a) { case x: { x(); }', `/'/.test(s); } // ${UNAVAILABLE}`, DENIED)],
+      ['i01-string-in-regex', lines(SQL, `const r = 'a' in /'/.constructor; // ${UNAVAILABLE}`, DENIED)],
+      ['i02-ident-in-regex', lines(SQL, `const r = x in /'/.constructor; // ${UNAVAILABLE}`, DENIED)],
+      ['i03-in-call-args', lines(SQL, `const r = f('a' in /'/.constructor); // ${UNAVAILABLE}`, DENIED)],
+      ['i04-in-inside-for-of-call', lines(SQL, `for (const k of f('a' in /'/.constructor)) {} // ${UNAVAILABLE}`, DENIED)],
+      ['t01-type-object-then-regex', lines(SQL, 'type T = { a: 1 }', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['k07-try-catch-no-param', lines(SQL, 'try { x(); } catch { y(); }', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+    ];
+    for (const [name, core] of refused) {
+      const root = release({ 'src/core.ts': core });
+      roots.push(root);
+      const result = probe(root);
+      expect(result.code, `${name}: ${result.output}`).not.toBe(0);
+    }
+    const accepted: Array<[string, string]> = [
+      ['export-default-async-code', lines(SQL, 'export default async function () {}', `/'/.test(s); const t = '${UNAVAILABLE}';`, DENIED)],
+      ['block-after-semi-code', lines(SQL, 'x();', '{ y(); }', `/'/.test(s); const t = '${UNAVAILABLE}';`, DENIED)],
+      ['case-number-code', lines(SQL, 'switch (a) { case 1: { x(); }', `/'/.test(s); const t = '${UNAVAILABLE}'; }`, DENIED)],
+      ['nullish-then-label-code', lines(SQL, 'const v = b ?? c;', 'foo: { x(); }', `/'/.test(s); const t = '${UNAVAILABLE}';`, DENIED)],
+      ['string-in-regex-code', lines(SQL, `const r = 'a' in /'/.constructor; const t = '${UNAVAILABLE}';`, DENIED)],
+      ['type-object-code', lines(SQL, 'type T = { a: 1 }', `/'/.test(s); const t = '${UNAVAILABLE}';`, DENIED)],
+      ['catch-no-param-code', lines(SQL, 'try { x(); } catch { y(); }', `/'/.test(s); const t = '${UNAVAILABLE}';`, DENIED)],
+    ];
+    for (const [name, core] of accepted) {
+      const root = release({ 'src/core.ts': core });
+      roots.push(root);
+      const result = probe(root);
+      expect(result.code, `${name}: ${result.output}`).toBe(0);
+    }
+  } finally {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  }
+});

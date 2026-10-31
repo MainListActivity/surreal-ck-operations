@@ -26,13 +26,16 @@ STANDBY_RELAY_PROTOCOL_EXPECTED='standby-relay/1'
 #   start/operator/open, after expression-prefix keywords (return/typeof/default/...), after =>,
 #   and after ) that closed an if/while/for/with/switch head. After an identifier, number,
 #   string/template/regex end, ), or ], a slash is division. Member names after . are never
-#   keywords (stats.in / x is division). in/of are keywords only inside a for head
-#   (for (x of /re/)); as bare identifiers they stay ident (of / 2 is division). Postfix !
-#   (TS non-null) keeps an expression end; != / !== stay operators. else/do/try/finally bodies
-#   and labelled statements (foo: {...}) are statement blocks, so a following / may be a regex.
-#   class/function bodies are expression-braced when the keyword appears in expression
-#   position (including async function), so (class {} / 2) and (function () {} / 2) are
-#   division; statements and export default keep } as a statement boundary (regex ok).
+#   keywords (stats.in / x is division). in is always the reserved binary operator (so
+#   'a' in /re/ is a regex after in); of is a keyword only inside a for head
+#   (for (x of /re/)), and as a bare identifier stays ident (of / 2 is division). Postfix !
+#   (TS non-null) keeps an expression end; != / !== stay operators. else/do/try/finally/catch
+#   bodies, labelled statements (foo: / case 1: / default:), statement-start blocks (after ;
+#   or a previous block }), and TypeScript type T = { ... } are statement blocks, so a
+#   following / may be a regex. ?? and ?. do not arm the ternary colon. class/function bodies
+#   are expression-braced when the keyword appears in expression position (including async
+#   function), so (class {} / 2) and (function () {} / 2) are division; statements and
+#   export default (incl. default async) keep } as a statement boundary (regex ok).
 #   Other ambiguous } stay statement-boundary / fail-closed. Non-ASCII UTF-8 identifier bytes
 #   are treated as ident so non-ASCII / 2 is division;
 # - text inside any quote is preserved (SQL/template markers are real code); template text
@@ -72,6 +75,8 @@ standby_relay_has_code() {
       async_stmt = 0
       label_colon = 0
       saw_question = 0
+      pending_case = 0
+      pending_type = 0
       tpl_depth = 0
       in_tpl_text = 0
       brace_depth = 0
@@ -92,25 +97,33 @@ standby_relay_has_code() {
         prev_kind = "ident"; last_kw = ""; after_dot = 0; stmt_boundary = 0; pending_async = 0
         return
       }
-      # in/of are contextual: in/of after an operand is the for-in/of operator; a bare of
-      # ("const of = 4; of / 2") stays ident so the slash is division. In a for head the of
-      # opens an expression, so a regex after it is recognised.
-      if ((w == "in" || w == "of") && in_for_head()) {
-        # for (const x of /re/) and for (k in obj): the contextual operator opens an expression.
+      # in is an ES reserved binary operator everywhere; of is only a keyword in a for head
+      # (a bare of stays ident so "const of = 4; of / 2" is division).
+      if (w == "in") {
         prev_kind = "kw"; last_kw = w; pending_fn_expr = 0; pending_async = 0
-      } else if (w == "return" || w == "typeof" || w == "instanceof" || w == "new" || w == "delete" || w == "void" || w == "throw" || w == "case" || w == "do" || w == "else" || w == "yield" || w == "await" || w == "default") {
+      } else if (w == "of" && in_for_head()) {
         prev_kind = "kw"; last_kw = w; pending_fn_expr = 0; pending_async = 0
+      } else if (w == "return" || w == "typeof" || w == "instanceof" || w == "new" || w == "delete" || w == "void" || w == "throw" || w == "do" || w == "else" || w == "yield" || w == "await") {
+        prev_kind = "kw"; last_kw = w; pending_fn_expr = 0; pending_async = 0
+      } else if (w == "case" || w == "default") {
+        # case/default introduce a labelled clause; the next : is a case label, not a ternary.
+        prev_kind = "kw"; last_kw = w; pending_fn_expr = 0; pending_async = 0; pending_case = 1
+      } else if (w == "type" && (before_stmt || before == "" || before == "ident" || before == "tend" || before == "num")) {
+        # TypeScript type alias: type T = { ... } ends as a statement boundary.
+        # before=ident/tend/num covers ASI after a previous statement without a semicolon.
+        prev_kind = "ident"; last_kw = ""; pending_type = 1; pending_fn_expr = 0; pending_async = 0
       } else if (w == "async") {
         # Remember where async appeared: async function in expression position is an expression.
+        # export default async function is a declaration (same as export default function).
         async_before = before; async_before_kw = before_kw; async_stmt = before_stmt
         pending_async = 1; pending_fn_expr = 0
         prev_kind = "ident"; last_kw = ""
       } else if (w == "function" || w == "class") {
         # Expression position (after = / : / , / ( / => / keyword) → body } ends a primary.
-        # Statement boundary, or after export default, → declaration; body } is a statement
-        # boundary (regex ok). async function takes the position where async appeared.
+        # Statement boundary, or after export default (incl. default async), → declaration.
         if (pending_async) {
-          if (async_stmt == 0 && (async_before == "op" || async_before == "kw" || async_before == "arrow" || async_before == "ifparen")) pending_fn_expr = 1
+          if (async_before_kw == "default") pending_fn_expr = 0
+          else if (async_stmt == 0 && (async_before == "op" || async_before == "kw" || async_before == "arrow" || async_before == "ifparen")) pending_fn_expr = 1
           else pending_fn_expr = 0
           pending_async = 0
         } else if (before_kw == "default") {
@@ -130,6 +143,8 @@ standby_relay_has_code() {
         prev_kind = "num"; last_kw = ""; pending_fn_expr = 0; pending_async = 0
       } else {
         # Keep pending_fn_expr across the optional name (class Foo / function foo).
+        # Keep pending_case across the case value (case 1 / case 'a' / case x).
+        # Keep pending_type across the alias name (type T).
         prev_kind = "ident"; last_kw = ""; pending_async = 0
       }
       stmt_boundary = 0
@@ -336,7 +351,14 @@ standby_relay_has_code() {
         if (char == "?") {
           flush_word()
           code = code "?"
-          saw_question = 1
+          # ?? and ?. are operators, not a ternary lead-in. Only a lone ? sets saw_question.
+          if (next_char == "?" || next_char == ".") {
+            code = code next_char
+            i++
+            saw_question = 0
+          } else {
+            saw_question = 1
+          }
           prev_kind = "op"
           last_kw = ""
           after_dot = 0
@@ -346,8 +368,10 @@ standby_relay_has_code() {
         if (char == ":") {
           flush_word()
           code = code ":"
-          # A label (foo: { ... }) takes a statement body; object properties and ternaries do not.
-          if (saw_question) { saw_question = 0; label_colon = 0 }
+          # A label (foo: / case 1: / default:) takes a statement body; object properties and
+          # ternaries do not. pending_case covers case/default values that are not idents.
+          if (saw_question) { saw_question = 0; label_colon = 0; pending_case = 0 }
+          else if (pending_case) { label_colon = 1; pending_case = 0 }
           else if (prev_kind == "ident" && (length(brace_stack) == 0 || substr(brace_stack, length(brace_stack), 1) != "e")) label_colon = 1
           else label_colon = 0
           prev_kind = "op"
@@ -390,7 +414,7 @@ standby_relay_has_code() {
           }
           # Object/class/function-expr } ends a primary (division); block } is a statement boundary.
           if (kind == "e") { prev_kind = "tend"; stmt_boundary = 0 }
-          else { prev_kind = "op"; stmt_boundary = 1 }
+          else { prev_kind = "op"; stmt_boundary = 1; saw_question = 0 }
           last_kw = ""
           after_dot = 0
           continue
@@ -406,9 +430,16 @@ standby_relay_has_code() {
           } else if (prev_kind == "arrow") {
             # () => {} is a block body; () => ({}) uses a paren so prev is op.
             brace_stack = brace_stack "s"
-          } else if (last_kw == "else" || last_kw == "do" || last_kw == "try" || last_kw == "finally" || label_colon) {
-            # else/do/try/finally bodies and labelled statements are statement blocks.
+          } else if (last_kw == "else" || last_kw == "do" || last_kw == "try" || last_kw == "finally" || last_kw == "catch" || label_colon) {
+            # else/do/try/finally/catch bodies and labelled statements are statement blocks.
             brace_stack = brace_stack "s"
+          } else if (stmt_boundary) {
+            # A block that starts a statement (after ; or a previous block }) is never an object.
+            brace_stack = brace_stack "s"
+          } else if (pending_type) {
+            # type T = { ... } — type literal ends as a statement boundary.
+            brace_stack = brace_stack "s"
+            pending_type = 0
           } else if (prev_kind == "op" || prev_kind == "kw") {
             brace_stack = brace_stack "e"
           } else {
@@ -430,6 +461,9 @@ standby_relay_has_code() {
           stmt_boundary = 1
           pending_fn_expr = 0
           label_colon = 0
+          saw_question = 0
+          pending_case = 0
+          pending_type = 0
           continue
         }
         if (char == "[" || char == "," || char == "~" || char == "^" || char == "%" || char == "*" || char == "+" || char == "-" || char == "<" || char == ">" || char == "|" || char == "&" || char == "=") {
