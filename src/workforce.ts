@@ -65,6 +65,7 @@ export interface EmployeeInst {
   credential?: string;
   lastWakeAt?: number;
   idleSince?: number;
+  runtimeSleepRequestedAt?: number;
   onboarded?: boolean;
   /** Directory of the Paseo workspace this instance runs in (project repo, or the ops repo when undefined). */
   cwd?: string;
@@ -506,13 +507,13 @@ export class Workforce {
   // ---- employee instances ----
   async insts(): Promise<EmployeeInst[]> {
     type Row = { id: RecordId; role: Role; def?: RecordId; principal?: RecordId; provider?: string; model?: string; thinking?: string;
-      paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number; idle_since?: number;
+      paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number; idle_since?: number; runtime_sleep_requested_at?: number;
       v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; workspace_scope?: string; wake_count?: number };
     const [rows] = await this.db.query<[Row[]]>(
       'SELECT * FROM employee WHERE revoked != true AND retired != true AND (def != NONE OR paseo_agent_id != NONE) ORDER BY id;');
     return rows.map(r => ({ id: asId(r.id), role: r.role, def: r.def ? asId(r.def) : undefined, provider: r.provider,
       model: r.model, thinking: r.thinking, paseoAgentId: r.paseo_agent_id ?? undefined,
-      activeTask: r.active_task ? asId(r.active_task) : undefined, credentialFile: r.credential_file, lastWakeAt: r.last_wake_at, idleSince: r.idle_since,
+      activeTask: r.active_task ? asId(r.active_task) : undefined, credentialFile: r.credential_file, lastWakeAt: r.last_wake_at, idleSince: r.idle_since, runtimeSleepRequestedAt: r.runtime_sleep_requested_at,
       onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, repoHome: r.workspace_repo ?? undefined, workspaceScope: r.workspace_scope ?? undefined, wakeCount: r.wake_count ?? 0,
       principal: r.principal ? asId(r.principal) : undefined }));
   }
@@ -592,11 +593,32 @@ export class Workforce {
     await this.db.query('UPDATE employee SET idle_since = NONE WHERE paseo_agent_id = $agent AND retired != true;', { agent: agentId });
   }
 
-  async observeSessionIdle(observations: Array<{ id: string; since?: number; lastWakeAt?: number }>): Promise<void> {
+  async observeSessionIdle(observations: Array<{ id: string; since?: number; lastWakeAt?: number; previousIdleSince?: number }>): Promise<void> {
     if (!observations.length) return;
     await this.db.query(`FOR $o IN $observations {
-      UPDATE employee SET idle_since = $o.since WHERE id = $o.employee AND retired != true AND (last_wake_at ?? NONE) = $o.last_wake;
-    };`, { observations: observations.map(o => ({ employee: id('employee', o.id), since: o.since, last_wake: o.lastWakeAt })) });
+      UPDATE employee SET idle_since = $o.since WHERE id = $o.employee AND retired != true AND (last_wake_at ?? NONE) = $o.last_wake AND ($o.guard != true OR (idle_since ?? NONE) = $o.previous);
+    };`, { observations: observations.map(o => ({ employee: id('employee', o.id), since: o.since, last_wake: o.lastWakeAt, guard: Object.hasOwn(o,"previousIdleSince"), previous: o.previousIdleSince })) });
+  }
+
+  /** A short claim barrier while the native runtime closes; no credential or identity is revoked. */
+  async reserveRuntimeSleep(inst: EmployeeInst, now: number): Promise<boolean> {
+    if (inst.idleSince === undefined || now - inst.idleSince < 3600) return false;
+    const result = await this.runTxResult<boolean>(`BEGIN;
+      LET $e = SELECT * FROM ONLY $employee;
+      LET $held = SELECT VALUE id FROM task WHERE current_employee = $key AND state IN ['ready','doing','review','blocked'];
+      LET $wakes = SELECT VALUE id FROM dispatch WHERE purpose = 'gm-manager-wake' AND state IN ['pending','running','unknown'] AND (employee = $key OR agent = $agent);
+      LET $safe = $e != NONE AND $e.retired != true AND $e.revoked != true AND ($e.active_task ?? NONE) = NONE
+        AND $e.paseo_agent_id = $agent AND $e.idle_since = $since AND ($e.last_wake_at ?? NONE) = $last_wake
+        AND ($e.runtime_sleep_until ?? 0) <= $now AND array::len($held) = 0 AND array::len($wakes) = 0;
+      IF $safe { UPDATE ONLY $employee SET runtime_sleep_until = $now + 120, runtime_sleep_requested_at = $now; };
+      RETURN $safe;
+      COMMIT;`, { employee: id('employee',inst.id), key: inst.id, agent: inst.paseoAgentId, since: inst.idleSince, last_wake: inst.lastWakeAt, now });
+    return result === true;
+  }
+
+  async releaseRuntimeSleep(employeeId: string, now: number): Promise<void> {
+    await this.db.query('UPDATE $e SET runtime_sleep_until = NONE WHERE runtime_sleep_requested_at = $now;',
+      {e: id('employee',employeeId), now});
   }
 
   async retireIdle(inst: EmployeeInst): Promise<void> {
@@ -605,7 +627,7 @@ export class Workforce {
   }
 
   async touchWake(employeeId: string): Promise<void> {
-    await this.db.query('UPDATE $e SET last_wake_at = time::unix(time::now()), idle_since = NONE, v3_onboarded = true, wake_count = (wake_count ?? 0) + 1;',
+    await this.db.query('UPDATE $e SET last_wake_at = time::unix(time::now()), idle_since = NONE, runtime_sleep_requested_at = NONE, v3_onboarded = true, wake_count = (wake_count ?? 0) + 1;',
       { e: id('employee', employeeId) });
   }
 
@@ -1201,11 +1223,12 @@ export class Workforce {
   async markManagerWakeRunning(claim: ManagerWakeClaim, employee: string, agent?: string): Promise<boolean> {
     const d = this.managerWakeId(claim.input.taskId, claim.input.phase, claim.input.episode);
     const updated = await this.runTxResult<WakeDbRow>(`BEGIN;
+      LET $worker = SELECT * FROM ONLY $employee_record;
       LET $old = SELECT * FROM ONLY $d;
       LET $updated = UPDATE ONLY $d SET state = 'running', employee = $employee, agent = $agent,
         external_started_at = IF external_started_at = NONE THEN time::unix(time::now()) ELSE external_started_at END,
         last_checked_at = time::unix(time::now()), updated_at = time::unix(time::now()), at = time::unix(time::now())
-        WHERE token = $wake_token AND attempt = $attempt AND state IN ['pending', 'running', 'unknown'] RETURN AFTER;
+        WHERE ($worker.runtime_sleep_until ?? 0) <= time::unix(time::now()) AND token = $wake_token AND attempt = $attempt AND state IN ['pending', 'running', 'unknown'] RETURN AFTER;
       IF $updated != NONE {
         LET $seat = SELECT * FROM ONLY $employee_record;
         IF $seat != NONE AND ($seat.revoked = true OR $seat.retired = true) { THROW 'manager employee retired' };

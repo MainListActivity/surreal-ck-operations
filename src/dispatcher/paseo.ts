@@ -64,6 +64,8 @@ export interface PaseoGateway {
   spawn(input: SpawnInput): Promise<string>;
   send(agentId: string, prompt: string): Promise<void>;
   stop(agentId: string): Promise<void>;
+  /** Close only the runtime via native MCP; keep agent persistence and archive state. */
+  sleep?(agentId: string): Promise<void>;
   /**
    * Restart the session's underlying process in place, keeping the agent, its conversation and
    * its channel binding. A session parked in `error` never leaves that state on its own — the
@@ -112,7 +114,7 @@ const isAgentNotFound = (error: unknown): boolean => {
 
 export function createPaseoCli(
   bin = process.env.SCK_PASEO_BIN ?? '/Applications/Paseo.app/Contents/Resources/bin/paseo',
-  options: { timeoutMs?: number } = {},
+  options: { timeoutMs?: number; runtimeMcpUrl?: string } = {},
 ): PaseoGateway {
   const defaultTimeoutMs = options.timeoutMs ?? 60_000;
   const run = async (args: string[], timeoutMs = defaultTimeoutMs): Promise<string> => {
@@ -263,6 +265,10 @@ export function createPaseoCli(
       } finally {
         await rm(dir, { recursive: true, force: true });
       }
+    },
+    async sleep(agentId) {
+      const { closePaseoRuntime } = await import('./runtime-sleep.ts');
+      await closePaseoRuntime(agentId, options.runtimeMcpUrl);
     },
     async stop(agentId) {
       await run(['stop', agentId]);

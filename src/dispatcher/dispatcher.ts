@@ -16,6 +16,7 @@ import type { ReclaimTrigger } from './worktree-reclaim.ts';
 import { jevNeedsOwner, jevRelease, jevTriage } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
 import { reclaimIdleSessions } from './idle-sessions.ts';
+import { observeRuntimeIdle, reclaimMemoryLru } from './memory-lru.ts';
 import { memoryBlocked, resourceBlocks, type HostResources } from './host.ts';
 import type { ArtifactTrigger } from './artifact-reclaim.ts';
 import type { ArtifactReclaimResult } from './artifact-sweeper.ts';
@@ -1080,7 +1081,7 @@ export class Dispatcher {
         openTasks ??= await wf.tasks();
         // Paseo's idle collector closes only the process. Goal conversations remain durable seats.
         // Leave unused runtimes asleep; send() restores the same persistence handle after a legal claim.
-        if (inst.workspaceScope && !openTasks.some(t => t.currentEmployee === inst.id) &&
+        if ((inst.workspaceScope || inst.runtimeSleepRequestedAt !== undefined) && !inst.activeTask && !openTasks.some(t => t.currentEmployee === inst.id) &&
             (!inst.def || defs.some(d => d.id === inst.def && d.enabled))) {
           states.set(inst.id, 'sleeping');
           this.closedSince.delete(inst.paseoAgentId);
@@ -1148,6 +1149,8 @@ export class Dispatcher {
     // Execute gates for open engineering work are read before rotation, so a bound implementer's session is kept.
     const gates = await this.readExecuteGates(tasks);
 
+    await observeRuntimeIdle({instances:insts,states,tasks,now,workforce:wf});
+
     // 2c. Session rotation: a session that has run many turns carries an ever-growing context,
     // so every further turn costs more input tokens. Retire idle instances past the configured
     // size/count and let the next task spawn a fresh, cheap session.
@@ -1156,7 +1159,8 @@ export class Dispatcher {
       // A retired session cannot take its open engineering task back (the implementer is bound), so keep bound sessions.
       // An unreadable gate hides which session is bound, so nothing is rotated in that pass (fail-closed).
       const bound = new Set([...gates.values()].flatMap(gate => gate?.implementer ? [gate.implementer] : []));
-      const rotationSafe = ![...gates.values()].includes(null);
+      const rotationHost = this.hostResources();
+      const rotationSafe = ![...gates.values()].includes(null) && !(rotationHost && memoryBlocked(rotationHost,cfg.minFreeMemMb));
       if (rotationSafe) {
         const idleRetired = await reclaimIdleSessions({ instances: insts, states, held: holding, bound, now,
           minutes: cfg.sessionIdleMinutes ?? 120, workforce: wf, paseo,
@@ -1304,7 +1308,18 @@ export class Dispatcher {
     // starve every session already running on this host, so the entire dispatch
     // pass waits. Supervision above already ran — stalled leases still get reclaimed.
     // A probe error fails open (logged) rather than halting dispatch forever.
-    const host = this.hostResources();
+    let host = this.hostResources();
+    if (host && memoryBlocked(host,cfg.minFreeMemMb) && (work.length || gmBlocked.length)) {
+      const slept = await reclaimMemoryLru({instances:insts,states,now,workforce:wf,paseo,log:text=>this.log(text)});
+      if (slept) {
+        states.set(slept.id,'sleeping');
+        insts = insts.map(i=>i.id===slept.id?slept:i);
+        this.passInputs.insts = insts;
+        // One close per pass lets the kernel reclaim pages before sacrificing another warm context.
+        const refreshed = this.hostResources();
+        if (refreshed) host = refreshed;
+      }
+    }
     const headroom = cfg.artifactHeadroomMb ?? 0;
     const pressure = Boolean(host && host.freeDiskMb < cfg.minFreeDiskMb + headroom);
     let reclaimAttempt: ArtifactReclaimResult | undefined;
