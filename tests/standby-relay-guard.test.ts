@@ -5,6 +5,8 @@ import { dirname, join } from 'node:path';
 
 const ROOT = join(import.meta.dir, '..');
 const GUARD = join(ROOT, 'scripts/standby-relay-guard.sh');
+// Path-bearing argv0 so dash (Linux CI, no BASH_SOURCE) can resolve the scanner from dirname($0).
+const GUARD_ARGV0 = join(ROOT, 'scripts/standby-relay-guard-test');
 
 // Every guard call reads the target with the repository's TypeScript parser, so it starts a
 // parser process; the matrix below therefore runs a few hundred of them.
@@ -63,7 +65,7 @@ function release(files: Record<string, string> = {}, withVendor = true): string 
 function probe(root: string): { code: number; output: string } {
   const child = Bun.spawnSync([
     'sh', '-c', '. "$1"; standby_relay_target_supported "$2" full',
-    'standby-relay-guard-test', GUARD, root,
+    GUARD_ARGV0, GUARD, root,
   ], { stdout: 'pipe', stderr: 'pipe' });
   return { code: child.exitCode, output: `${child.stdout.toString()}${child.stderr.toString()}` };
 }
@@ -100,17 +102,17 @@ test('full scope refuses a tree without plugin/, while core scope still accepts 
   try {
     const full = Bun.spawnSync([
       'sh', '-c', '. "$1"; standby_relay_target_supported "$2" full',
-      'standby-relay-guard-test', GUARD, noPlugin,
+      GUARD_ARGV0, GUARD, noPlugin,
     ], { stdout: 'pipe', stderr: 'pipe' });
     expect(full.exitCode, `full: ${full.stderr.toString()}`).not.toBe(0);
     const refused = Bun.spawnSync([
       'sh', '-c', '. "$1"; standby_relay_refuse "$2" full',
-      'standby-relay-guard-test', GUARD, noPlugin,
+      GUARD_ARGV0, GUARD, noPlugin,
     ], { stdout: 'pipe', stderr: 'pipe' });
     expect(`${refused.stdout.toString()}${refused.stderr.toString()}`).toContain('缺少插件树');
     const core = Bun.spawnSync([
       'sh', '-c', '. "$1"; standby_relay_target_supported "$2" core',
-      'standby-relay-guard-test', GUARD, noPlugin,
+      GUARD_ARGV0, GUARD, noPlugin,
     ], { stdout: 'pipe', stderr: 'pipe' });
     expect(core.exitCode, `core: ${core.stderr.toString()}`).toBe(0);
   } finally {
@@ -132,9 +134,13 @@ test('a spaced release path resolves the TypeScript parser regardless of cwd', (
   writeTree(spaced, VALID_FILES);
   const bareCwd = mkdtempSync(join(tmpdir(), 'sck-standby-bare-cwd-'));
   try {
+    // $0 must carry a path under dash (Linux CI): dash has no BASH_SOURCE, and a bare
+    // argv0 is skipped by the scanner resolver. Put the argv0 beside the copied guard so
+    // dirname($0) finds standby-relay-scan.mjs even when cwd has no scripts/.
+    const argv0 = join(scripts, 'standby-relay-guard-spaced-test');
     const result = Bun.spawnSync([
       'sh', '-c', '. "$1"; standby_relay_target_supported "$2" core',
-      'standby-relay-guard-spaced-test', join(scripts, 'standby-relay-guard.sh'), spaced,
+      argv0, join(scripts, 'standby-relay-guard.sh'), spaced,
     ], {
       cwd: bareCwd,
       env: { ...process.env, STANDBY_RELAY_RUNTIME: process.execPath, PATH: '/usr/bin:/bin' },
@@ -646,13 +652,13 @@ test('the class, function, case and type families cannot smuggle a comment marke
       writeFileSync(file, commented);
       const refused = Bun.spawnSync([
         'sh', '-c', '. "$1"; standby_relay_has_code_marker "$2" "$3"',
-        'standby-relay-guard-marker-test', GUARD, file, UNAVAILABLE,
+        GUARD_ARGV0, GUARD, file, UNAVAILABLE,
       ], { stdout: 'pipe', stderr: 'pipe' });
       expect(refused.exitCode, `${name} (comment): ${refused.stderr.toString()}`).not.toBe(0);
       writeFileSync(file, coded);
       const accepted = Bun.spawnSync([
         'sh', '-c', '. "$1"; standby_relay_has_code_marker "$2" "$3"',
-        'standby-relay-guard-marker-test', GUARD, file, UNAVAILABLE,
+        GUARD_ARGV0, GUARD, file, UNAVAILABLE,
       ], { stdout: 'pipe', stderr: 'pipe' });
       expect(accepted.exitCode, `${name} (code): ${accepted.stderr.toString()}`).toBe(0);
     }
