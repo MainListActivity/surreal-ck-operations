@@ -48,7 +48,7 @@ function makeStyles({ theme, compact }: Ctx) {
     chipActive: { backgroundColor: p.accentSoft, borderColor: c.accent },
     chipText: { color: c.foregroundMuted, fontSize: 12, fontWeight: "600" as const },
     chipTextActive: { color: c.accent },
-    tab: { flex: 1, minHeight: 31, borderRadius: 7, alignItems: "center" as const, justifyContent: "center" as const, paddingHorizontal: 8 },
+    tab: { flexGrow: 0, flexShrink: 0, minHeight: 31, borderRadius: 7, alignItems: "center" as const, justifyContent: "center" as const, paddingHorizontal: 8 },
     tabActive: { backgroundColor: c.surface1 },
     tabText: { color: c.foregroundMuted, fontSize: 12, fontWeight: "600" as const },
     tabTextActive: { color: c.foreground, fontWeight: "700" as const },
@@ -1405,7 +1405,7 @@ export function CompanySurface(props: PluginSurfaceProps & { initialTab?: Compan
         <Text style={s.h1}>运营工作台</Text>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ flexGrow: 0 }} contentContainerStyle={{ gap: 4, padding: 3, backgroundColor: relayPalette(ctx.theme).inputBg, borderRadius: 10 }}>
           {tabs.map(t => (
-            <Pressable key={t.id} accessibilityRole="tab" accessibilityLabel={t.title} accessibilityState={{ selected: tab === t.id }} style={[s.tab, { flex: 0, minHeight: 40, paddingHorizontal: 12 }, tab === t.id && s.tabActive]} onPress={() => setTab(t.id)}>
+            <Pressable key={t.id} accessibilityRole="tab" accessibilityLabel={t.title} accessibilityState={{ selected: tab === t.id }} style={[s.tab, { minHeight: 40, paddingHorizontal: 12 }, tab === t.id && s.tabActive]} onPress={() => setTab(t.id)}>
               <Text numberOfLines={1} style={[s.tabText, tab === t.id && s.tabTextActive]}>{t.title}</Text>
             </Pressable>
           ))}
