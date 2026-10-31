@@ -91,6 +91,33 @@ test('the standby switch guard accepts a complete release and refuses missing ca
   }
 }, TIMEOUT);
 
+// R14: under full scope a tree without plugin/ cannot prove the plugin face, so it is refused
+// the same way a tree with plugin/ but without vendor is refused. Scope=core (the remote MCP
+// deploy) still accepts the same tree, because that payload is the service core only.
+test('full scope refuses a tree without plugin/, while core scope still accepts it', () => {
+  const noPlugin = mkdtempSync(join(tmpdir(), 'sck-standby-noplugin-'));
+  writeTree(noPlugin, VALID_FILES);
+  try {
+    const full = Bun.spawnSync([
+      'sh', '-c', '. "$1"; standby_relay_target_supported "$2" full',
+      'standby-relay-guard-test', GUARD, noPlugin,
+    ], { stdout: 'pipe', stderr: 'pipe' });
+    expect(full.exitCode, `full: ${full.stderr.toString()}`).not.toBe(0);
+    const refused = Bun.spawnSync([
+      'sh', '-c', '. "$1"; standby_relay_refuse "$2" full',
+      'standby-relay-guard-test', GUARD, noPlugin,
+    ], { stdout: 'pipe', stderr: 'pipe' });
+    expect(`${refused.stdout.toString()}${refused.stderr.toString()}`).toContain('缺少插件树');
+    const core = Bun.spawnSync([
+      'sh', '-c', '. "$1"; standby_relay_target_supported "$2" core',
+      'standby-relay-guard-test', GUARD, noPlugin,
+    ], { stdout: 'pipe', stderr: 'pipe' });
+    expect(core.exitCode, `core: ${core.stderr.toString()}`).toBe(0);
+  } finally {
+    rmSync(noPlugin, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
 const COMMENT_MARKERS = [
   { path: 'src/standby-relay-capability.ts', line: "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/1';", replacement: "export const OTHER_PROTOCOL = 'standby-relay/0';", marker: "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/1';" },
   { path: 'src/standby-relay-capability.ts', line: "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/1';", replacement: "export const OTHER_PROTOCOL = 'standby-relay/0';", marker: 'STANDBY_RELAY_PROTOCOL[[:space:]]*=' },

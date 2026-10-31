@@ -4,8 +4,11 @@
 # A target release is compatible only when its own code carries the standby protocol on BOTH faces
 # that run it: the core (src/: the capability marker, the standby resume write in core.ts, the view
 # fields in contracts.ts) and the plugin vendor (plugin/server/vendor/src/: the same contract, since
-# the plugin runs the same core). The supervision branch in dispatcher.ts and the relay-capability
-# module are probed too, so a tree that carries the marker but lost the behavior cannot pass.
+# the plugin runs the same core). Under full scope a tree without plugin/ (or with plugin/ but
+# without vendor) is refused the same way — unknown is incompatible; only scope=core (the remote
+# MCP deploy) skips the plugin face. The supervision branch in dispatcher.ts and the relay-
+# capability module are probed too, so a tree that carries the marker but lost the behavior cannot
+# pass.
 #
 # The rule is fail-closed with no zero-row exception: an incompatible or unreadable target is refused
 # even when no task is standing by today — a check that read "nothing stands by" as safe would race a
@@ -13,7 +16,8 @@
 # neither wakes the holder nor returns the timeout to the gm gate.
 #
 # Sourced by scripts/company-service.sh (install/rollback) and scripts/deploy-mcp-remote.sh (remote
-# switch). Read-only: files are read, never executed; no credentials are touched.
+# switch). The target's files are read, never executed; the guard's own scanner (and the runtime that
+# runs it) are the tools that decide the verdict, not part of the target. No credentials are touched.
 STANDBY_RELAY_PROTOCOL_EXPECTED='standby-relay/1'
 
 # Where the marker search runs, and with which runtime. The decision "is this occurrence code or a
@@ -36,9 +40,11 @@ STANDBY_RELAY_PROTOCOL_EXPECTED='standby-relay/1'
 #
 # The parser is the one the release was type-checked with, so the guard and the compiler agree on
 # what the source says. The scanner runs on the runtime the services run with when this shell
-# resolved it (scripts/bun-runtime.sh), otherwise on bun or node from PATH. Its answer is read from
-# what it prints, not from its exit code, so a runtime that cannot run it at all (a stub, a wrong
-# interpreter) refuses the target instead of passing it.
+# resolved it (scripts/bun-runtime.sh: pin, then the service-home runtime-bun, then ~/.bun/bin/bun;
+# PATH is never searched). Its answer is read from what it prints, not from its exit code, so a
+# runtime that cannot run it at all (a stub, a wrong interpreter) refuses the target instead of
+# passing it. A typescript module that loads but does not expose createSourceFile/ScriptTarget is
+# likewise refused.
 standby_relay_scanner=''
 standby_relay_runtime=''
 
@@ -83,7 +89,9 @@ standby_relay_resolve_runtime() {
       return 0
     fi
   done
-  # The runtime the services run with, when this shell can resolve it.
+  # The runtime the services run with, when this shell can resolve it (same order as
+  # scripts/bun-runtime.sh: pin, then the service-home runtime-bun, then ~/.bun/bin/bun).
+  # PATH is never searched: the Bun there is not the runtime the services run.
   if command -v resolve_bun >/dev/null 2>&1; then
     standby_relay_home=${service_home:-${SCK_SERVICE_HOME:-"$HOME/Library/Application Support/SurrealCKCompany"}}
     standby_relay_candidate=$(resolve_bun "$standby_relay_home" >/dev/null 2>&1; printf '%s' "${BUN:-}")
@@ -92,10 +100,12 @@ standby_relay_resolve_runtime() {
       return 0
     fi
   fi
-  for standby_relay_candidate in bun node; do
-    standby_relay_path=$(command -v "$standby_relay_candidate" 2>/dev/null) || continue
-    standby_relay_runtime=$standby_relay_path
-    return 0
+  standby_relay_home=${service_home:-${SCK_SERVICE_HOME:-"$HOME/Library/Application Support/SurrealCKCompany"}}
+  for standby_relay_candidate in "$standby_relay_home/runtime-bun/bin/bun" "$HOME/.bun/bin/bun"; do
+    if [ -x "$standby_relay_candidate" ]; then
+      standby_relay_runtime=$standby_relay_candidate
+      return 0
+    fi
   done
   return 1
 }
@@ -187,14 +197,20 @@ standby_relay_probe_root() {
 }
 
 # 0 when <release> may be switched to. Scope `full` (local install/rollback) also checks the plugin
-# vendor, which runs the same core; scope `core` is the remote MCP deploy (service core only).
+# vendor, which runs the same core: a shipped plugin must carry a generated vendor tree with the
+# contract, and a missing plugin/ or a missing vendor is unknown (refused), never assumed
+# compatible. Scope `core` is the remote MCP deploy, whose payload is the service core only.
 standby_relay_target_supported() {
   standby_relay_release=$1
   standby_relay_scope=${2:-full}
   [ -d "$standby_relay_release" ] || return 1
   standby_relay_root_present "$standby_relay_release" || return 1
   standby_relay_vendor=''
-  if [ "$standby_relay_scope" != core ] && [ -d "$standby_relay_release/plugin" ]; then
+  if [ "$standby_relay_scope" != core ]; then
+    # Full scope: the plugin face must be present and carry the same contract. A tree without
+    # plugin/ cannot prove the plugin face, so it is refused the same way a tree with plugin/ but
+    # without vendor is refused.
+    [ -d "$standby_relay_release/plugin" ] || return 1
     [ -d "$standby_relay_release/plugin/server/vendor" ] || return 1
     standby_relay_root_present "$standby_relay_release/plugin/server/vendor" || return 1
     standby_relay_vendor="$standby_relay_release/plugin/server/vendor"
@@ -225,36 +241,52 @@ standby_relay_refusal_reason() {
   standby_relay_missing=''
   case "$standby_relay_verdict" in
     yes*) ;;
-    no*) standby_relay_missing=${standby_relay_verdict#no} ;;
+    no*)
+      standby_relay_missing=${standby_relay_verdict#no}
+      # An "unreadable <file>" reason means the scanner could not decide (unterminated template /
+      # block comment, or the file itself could not be read) — that is "无法判定", not "不完整".
+      case "$standby_relay_missing" in
+        *unreadable*) standby_relay_unreadable=1 ;;
+      esac
+      ;;
     *) standby_relay_unreadable=1 ;;
   esac
   if [ "$standby_relay_unreadable" -ne 0 ]; then
     echo "目标代码的 standby 接力契约无法判定（代码扫描器不可用或源码不可读）：无法证明它会在待命期内豁免收回、超时回经理关口"
+    if [ -n "$standby_relay_missing" ]; then
+      # One reason per distinct line: the same unreadable file is reported once per check.
+      echo "不可读的证据："
+      printf '%s\n' "$standby_relay_missing" | awk 'NF && !seen[$0]++'
+    fi
     return 0
   fi
   if [ -n "$standby_relay_missing" ]; then
     echo "目标代码的 standby 接力契约不完整（capability/core/contracts/dispatcher/workforce 标记不满足）：无法证明它会在待命期内豁免收回、超时回经理关口"
-    echo "缺少的契约证据：$standby_relay_missing"
+    echo "缺少的契约证据："
+    printf '%s\n' "$standby_relay_missing" | awk 'NF && !seen[$0]++'
     return 0
   fi
   [ "$standby_relay_scope" = core ] && { echo "目标代码不支持 standby 接力契约"; return 0; }
-  if [ -d "$standby_relay_release/plugin" ] && [ ! -d "$standby_relay_release/plugin/server/vendor" ]; then
+  if [ ! -d "$standby_relay_release/plugin" ]; then
+    echo "目标发布缺少插件树：无法证明插件面与核心同样支持 standby 接力（未知按不兼容处理）"
+    return 0
+  fi
+  if [ ! -d "$standby_relay_release/plugin/server/vendor" ]; then
     echo "目标发布缺少插件 vendor 树：无法证明插件面与核心同样支持 standby 接力（未知按不兼容处理）"
     return 0
   fi
-  if [ -d "$standby_relay_release/plugin" ]; then
-    standby_relay_verdict=$(standby_relay_root_checks "$standby_relay_release/plugin/server/vendor" | standby_relay_scan batch) || :
-    standby_relay_missing=''
-    case "$standby_relay_verdict" in
-      yes*) ;;
-      no*) standby_relay_missing=${standby_relay_verdict#no} ;;
-      *) standby_relay_missing='代码扫描器无法判定插件 vendor 树' ;;
-    esac
-    if [ -n "$standby_relay_missing" ]; then
-      echo "目标的插件 vendor 代码不支持 standby 接力契约：双面不同源，切换会让插件面按旧语义对待待命任务"
-      echo "缺少的契约证据：$standby_relay_missing"
-      return 0
-    fi
+  standby_relay_verdict=$(standby_relay_root_checks "$standby_relay_release/plugin/server/vendor" | standby_relay_scan batch) || :
+  standby_relay_missing=''
+  case "$standby_relay_verdict" in
+    yes*) ;;
+    no*) standby_relay_missing=${standby_relay_verdict#no} ;;
+    *) standby_relay_missing='代码扫描器无法判定插件 vendor 树' ;;
+  esac
+  if [ -n "$standby_relay_missing" ]; then
+    echo "目标的插件 vendor 代码不支持 standby 接力契约：双面不同源，切换会让插件面按旧语义对待待命任务"
+    echo "缺少的契约证据："
+    printf '%s\n' "$standby_relay_missing" | awk 'NF && !seen[$0]++'
+    return 0
   fi
   echo "目标代码不支持 standby 接力契约"
 }

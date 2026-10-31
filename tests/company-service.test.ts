@@ -242,8 +242,8 @@ const SWITCH_GUARDS: Array<[string, string]> = [
   ['standby-relay-guard.sh', 'standby_relay_target_supported'],
 ];
 
-function runSwitchGuard(script: string, entry: string, root: string) {
-  return Bun.spawnSync(['sh', '-c', `. "${join(ROOT, 'scripts', script)}"; ${entry} "${root}" full`], {
+function runSwitchGuard(script: string, entry: string, root: string, scope = 'full') {
+  return Bun.spawnSync(['sh', '-c', `. "${join(ROOT, 'scripts', script)}"; ${entry} "${root}" "${scope}"`], {
     // The standby guard reads the target with the repository's TypeScript parser, so it needs a
     // runtime that can load it; the fixture's own runtime is a stub (see fixture()).
     env: { PATH: '/usr/bin:/bin', STANDBY_RELAY_RUNTIME: process.execPath },
@@ -253,13 +253,18 @@ function runSwitchGuard(script: string, entry: string, root: string) {
 }
 
 test('every switch guard accepts the real checkout and its plugin vendor tree', () => {
-  // The tree that ships this version must be installable by its own guards; the vendor face runs the same core.
+  // The tree that ships this version must be installable by its own guards. The vendor face runs
+  // the same core: for guards that require plugin/ under full scope (standby-relay), probe the
+  // vendor face with scope=core; the release itself is still probed with full.
+  const vendor = join(ROOT, 'plugin', 'server', 'vendor');
   for (const [script, entry] of SWITCH_GUARDS) {
-    for (const root of [ROOT, join(ROOT, 'plugin', 'server', 'vendor')]) {
-      const result = runSwitchGuard(script, entry, root);
-      expect(`${script} ${root}: ${result.stderr.toString().trim()}`).toBe(`${script} ${root}: `);
-      expect(result.exitCode).toBe(0);
-    }
+    const releaseResult = runSwitchGuard(script, entry, ROOT, 'full');
+    expect(`${script} ${ROOT} full: ${releaseResult.stderr.toString().trim()}`).toBe(`${script} ${ROOT} full: `);
+    expect(releaseResult.exitCode).toBe(0);
+    const vendorScope = script === 'standby-relay-guard.sh' ? 'core' : 'full';
+    const vendorResult = runSwitchGuard(script, entry, vendor, vendorScope);
+    expect(`${script} ${vendor} ${vendorScope}: ${vendorResult.stderr.toString().trim()}`).toBe(`${script} ${vendor} ${vendorScope}: `);
+    expect(vendorResult.exitCode).toBe(0);
   }
 });
 

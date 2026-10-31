@@ -27,17 +27,29 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 
-// The repository's TypeScript: resolved from this file's directory (scripts/ under the repository
-// root), with the working directory as a second chance for a caller that runs the scanner from
-// elsewhere.
+// The repository's TypeScript: resolved from this file's parent (the repository root), with the
+// working directory as a second chance. A module that loads but does not expose createSourceFile
+// and ScriptTarget (for example a Bun global cache of an incompatible typescript build) is not
+// a parser the guard can use: refuse it instead of crashing mid-decision.
 function loadTypeScript() {
+  const fromUrl = new URL('..', import.meta.url);
+  const repoRoot = fromUrl.pathname;
   const attempts = [
-    () => require('typescript'),
+    () => require(require.resolve('typescript', { paths: [repoRoot] })),
     () => require(require.resolve('typescript', { paths: [process.cwd()] })),
   ];
   for (const attempt of attempts) {
     try {
-      return attempt();
+      const candidate = attempt();
+      if (
+        candidate
+        && typeof candidate.createSourceFile === 'function'
+        && candidate.ScriptTarget != null
+        && typeof candidate.getLeadingCommentRanges === 'function'
+        && typeof candidate.getTrailingCommentRanges === 'function'
+      ) {
+        return candidate;
+      }
     } catch {
       // try the next location
     }
@@ -48,7 +60,7 @@ function loadTypeScript() {
 const ts = loadTypeScript();
 
 if (!ts) {
-  process.stderr.write('standby-relay-scan: the repository TypeScript parser (node_modules/typescript) is not available\n');
+  process.stderr.write('standby-relay-scan: the repository TypeScript parser (node_modules/typescript with createSourceFile/ScriptTarget) is not available\n');
   process.exit(3);
 }
 
