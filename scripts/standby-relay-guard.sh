@@ -18,10 +18,11 @@ STANDBY_RELAY_PROTOCOL_EXPECTED='standby-relay/1'
 
 # Search source outside comments only. Preserve markers inside quoted SQL/template strings, but discard // and
 # /* ... */ comments (including trailing comments), so a comment-only release cannot pass the capability probe.
-standby_relay_has_code_marker() {
+standby_relay_has_code() {
   file=$1
-  marker=$2
-  awk -v marker="$marker" '
+  mode=$2
+  marker=$3
+  awk -v mode="$mode" -v marker="$marker" '
     BEGIN { escape = sprintf("%c", 92) }
     {
       line = $0
@@ -44,11 +45,13 @@ standby_relay_has_code_marker() {
         if (char == "/" && next_char == "*") { in_block_comment = 1; i++; continue }
         code = code char
       }
-      if (index(code, marker)) found = 1
+      if ((mode == "pattern" && code ~ marker) || (mode != "pattern" && index(code, marker))) found = 1
     }
     END { exit(found ? 0 : 1) }
   ' "$file"
 }
+standby_relay_has_code_marker() { standby_relay_has_code "$1" fixed "$2"; }
+standby_relay_has_code_pattern() { standby_relay_has_code "$1" pattern "$2"; }
 
 # 0 when the tree at <root> carries the contract (files read, never executed).
 standby_relay_probe_root() {
@@ -61,7 +64,7 @@ standby_relay_probe_root() {
   workforce="$root/src/workforce.ts"
   [ -f "$cap" ] && [ -f "$core" ] && [ -f "$contracts" ] && [ -f "$dispatcher" ] && [ -f "$workforce" ] || return 1
   # Declarations, not comment text: a comment-only tree cannot pass.
-  grep -Eq '^[[:space:]]*(export[[:space:]]+)?const[[:space:]]+STANDBY_RELAY_PROTOCOL[[:space:]]*=' "$cap" 2>/dev/null || return 1
+  standby_relay_has_code_pattern "$cap" '^[[:space:]]*(export[[:space:]]+)?const[[:space:]]+STANDBY_RELAY_PROTOCOL[[:space:]]*=' || return 1
   standby_relay_has_code_marker "$cap" "$STANDBY_RELAY_PROTOCOL_EXPECTED" || return 1
   # The resume transaction writes progress_at and standby_until (min of the window deadline and the budget).
   standby_relay_has_code_marker "$core" 'standby_until = IF $assigned THEN math::min([$standby_not_after, $now + $standby_budget]) ELSE NONE END' || return 1

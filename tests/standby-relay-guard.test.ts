@@ -89,6 +89,7 @@ test('the standby switch guard accepts a complete release and refuses missing ca
 
 const COMMENT_MARKERS = [
   { path: 'src/standby-relay-capability.ts', line: "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/1';", replacement: "export const OTHER_PROTOCOL = 'standby-relay/0';", marker: "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/1';" },
+  { path: 'src/standby-relay-capability.ts', line: "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/1';", replacement: "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/0';", marker: 'STANDBY_RELAY_PROTOCOL[[:space:]]*=' },
   { path: 'src/standby-relay-capability.ts', line: "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/1';", replacement: "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/0';", marker: 'standby-relay/1' },
   { path: 'src/core.ts', line: 'standby_until = IF $assigned THEN math::min([$standby_not_after, $now + $standby_budget]) ELSE NONE END', replacement: 'LET $standby_until = NONE;', marker: 'standby_until = IF $assigned THEN math::min([$standby_not_after, $now + $standby_budget]) ELSE NONE END' },
   { path: 'src/core.ts', line: 'standby employee unavailable', replacement: 'standby employee is active', marker: 'standby employee unavailable' },
