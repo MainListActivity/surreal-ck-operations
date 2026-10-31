@@ -1,15 +1,22 @@
 {
-  "version": "0.3.60",
-  "title": "内存压力下按 LRU 休眠闲置员工",
+  "version": "0.3.61",
+  "title": "FV06 有界待命接力",
   "changes": [
-    "有待派工作且内存不足时，按连续空闲起点从旧到新关闭员工运行时；空闲不足一小时不回收。",
-    "每轮最多关闭一个再探测内存；压力恢复继续派工，无合格候选时维持阻塞。",
-    "关闭前复查任务、经理唤醒、权限与状态，设置短期领取保护；保留身份、绑定和上下文供下次派工复用。"
+    "resume_task 增可选 standbyEmployee：带执行窗口的恢复可原子指派真实租约持有人（有界待命），事务写 doing、租约、fence+1、progress_at 与 standby_until=min(notAfter, now+standbyBudgetSeconds)，工作区经登记路径写入 worktree 与 worktree_ref。",
+    "调度器对带待命标记的任务就地唤醒空闲持有人（60 秒节流，先从服务端租约重建会话凭证），待命期内豁免停滞与过期收回，待命超时回经理关口而非进入派工池。",
+    "陈旧待命标记生命周期闭环（复验修复）：claimLease 新领即清 standby_until（同人续领保留自己的窗口）、revokeLease 收回即清、调度器唤醒/超时两分支与 standbyTimeout 事务都要求 state=doing 且标记仍在——submit 或收回后的残留标记不再销毁后续复核/派工租约。",
+    "发布切换守卫探针对齐真实声明（复验修复 R5）：standby 守卫此前要求 workforce.ts 行首 snake_case 标记，而真实实现是 CompanyConfig.standbyBudgetSeconds 声明与 company_meta 行键读取，导致本能力自身的发布被守卫判为不兼容而拒绝安装；探针改验真实声明，fixture 同步为真实形态，并新增「全部切换守卫 × 真实检出与插件 vendor 树」冒烟测试。",
+    "待命准入补齐 claim 级检查：execute 能力与依赖未满足预检与 resume 事务同款；verify_standby 幂等键真参与幂等（重放返回已记录结果，同键不同输入冲突），待命预算 clamp 到租约长度。",
+    "新增 verify_standby 只读预检（经理专属，逐项给出判定码，不写状态不耗预算），与恢复路径共用同一套前置判定。",
+    "候选登记链新增采样者身份：登记人与采样者不得为同一人且采样者必须是在册未撤销/退役员工，批准诊断新增机器必检位，采样者与批准者同人时批准被拒。",
+    "发布切换守卫新增待命协议探针：核心与插件 vendor 两侧都携带协议标记才允许切换，任一侧缺失即拒绝。",
+    "复验修复 R6：standby fail-closed 守卫只接受代码区的能力标记，忽略行注释与块注释（保留 SQL/template 字符串中的真实标记）；拒绝路径负例覆盖缺能力/预算/vendor 与注释伪标记。将 dispatcher-standby 单测注册进 test:bridge、standby fork 注册进 test-worktrees 默认目标并使用专用 RUN_SCK_STANDBY_RELAY_TESTS 门控。"
   ],
   "impact": [
-    "仅管理公司登记的闲置员工，不管理 Magpie 代理池或老板普通会话。",
-    "未知空闲起点从首次连续闲置观测开始计时，不放宽内存门禁。"
+    "只新增能力与保护：默认路径逐字段不变（不带 standbyEmployee 的恢复、派工、超时、回收与既有诊断位均保持原语义）。",
+    "provider 与额度判定抽到共享模块，调度器与待命守卫读同一份逻辑与数据，行为不变。",
+    "无采样者身份的既有候选仍按旧契约可验收；新登记链携带采样者后，采样者与批准者必须异人。"
   ],
-  "migration": "SCHEMALESS 员工记录按需新增运行时关闭保护和请求时间字段，无批量迁移。使用本机 Paseo 0.14 MCP 原生运行时关闭功能，不归档或删除会话。",
-  "rollback": "恢复上一健康 main 发布；短期领取保护两分钟自动过期，员工和会话持久记录保留。"
+  "migration": "无数据迁移或 schema、secret 变更；standby_until 为 schemaless 任务字段。",
+  "rollback": "无兼容目标时保持当前健康版本、受控 hold 或前向修复，不回退到不含待命协议的旧版本（守卫拒绝）；细则见 docs/company-service-operations.md §5。待命期任务按普通租约继续且不会伪造或延长执行窗口。"
 }

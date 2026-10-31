@@ -105,7 +105,9 @@ export class InternalAiProofBridge {
     if (tool === 'ops_internal_ai_prepare') {
       const args = proofToolSchemas.ops_internal_ai_prepare.parse(raw);
       const files = await loadProofFiles(this.deps.home, scope.taskId, args.manifestPath, args.documentPath);
-      await this.deps.store.prepare(lease, env, files);
+      // G1 (FV06 P1): pass the sampler identity through so the candidate row carries it and the
+      // approval diagnosis can machine-check 采样 QA ≠ 批准者 instead of a manual file comparison.
+      await this.deps.store.prepare(lease, env, files, args.samplerEmployee);
       return { digest: files.manifest.configurationDigest, documentHash: files.documentHash, approvalMarker: APPROVAL_MARKER + files.manifest.configurationDigest, paidCallsAllowed: 0 };
     }
     if (tool === 'ops_internal_ai_prove') {

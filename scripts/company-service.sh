@@ -12,6 +12,7 @@ components=${SCK_COMPONENTS:-mcp}
 . "$(dirname "$0")/bun-runtime.sh"
 . "$(dirname "$0")/release-content.sh"
 . "$(dirname "$0")/review-wait-guard.sh"
+. "$(dirname "$0")/standby-relay-guard.sh"
 . "$(dirname "$0")/independence-guard.sh"
 . "$(dirname "$0")/policy-guard.sh"
 . "$(dirname "$0")/goal-workspace-guard.sh"
@@ -123,6 +124,10 @@ case "$action" in
     # "no policy today" would race a policy write, and would miss the data that already holds one.
     policy_target_supported "$release" || { policy_refuse "$release"; exit 1; }
     goal_workspace_target_supported "$release" || { goal_workspace_refuse "$release"; exit 1; }
+    # FV06 P0/P1: the same content-bound rule for the bounded standby relay — both the core and the
+    # plugin vendor must carry the standby protocol, or a standby direct assignment would run against
+    # a supervision loop that neither wakes the holder nor returns the timeout to the gm gate.
+    standby_relay_target_supported "$release" || { standby_relay_refuse "$release"; exit 1; }
     check_gate comm-slow-pipe "$sha" || {
       echo "refused: no passing comm-slow-pipe gate for $sha on bun $(runtime_version) — run 'sh $(dirname "$0")/release-gate.sh slow-pipe $release' on this Mac, then install again" >&2; exit 1; }
     check_gate sidecar-review "$sha" || {

@@ -281,6 +281,9 @@ export interface TaskView {
   currentEmployee?: EmployeeId;
   deliveryId?: DeliveryId;
   leaseExpiresAt?: string;
+  /** FV06 P0: a standby direct assignment expires here (ISO 8601); the supervision loop wakes the idle
+   * holder until then and returns the task to the gm gate past it. */
+  standbyUntil?: string;
   fence: number;
   blockedTo?: 'gm' | 'owner';
   /** Blocked rows: the phase to restore when the wait ends (ready/doing -> ready, review -> review). */
@@ -1332,6 +1335,14 @@ export interface CompanyCore {
   /** SYS05: migrate one named legacy task into a wait; owner gates refused, version-locked, audited. */
   waitMigrationApply?(credential: Credential, input: WaitMigrationApplyInput): Promise<TaskView>;
   resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView>;
+  /** FV06 P0: gm only — windowed resume with a bounded standby direct assignment (progress_at/standby_until written in the resume transaction). */
+  resumeStandby?(credential: Credential, taskId: TaskId, evidence: Evidence, standbyEmployee: string): Promise<TaskView>;
+  /** FV06 P1: gm only — read-only standby precheck; per-item {ok, code}; audited, never writes task state or budget.
+   *  An item may carry the executionWindow the gm is about to bind (the task row only has one after a windowed resume). */
+  verifyStandby?(credential: Credential, input: { items: Array<{ taskId: string; employeeId: string; executionWindow?: import('./task-recovery.ts').ExecutionWindow }>; idempotencyKey: string }): Promise<{
+    items: Array<{ taskId: string; employeeId: string; ok: boolean; code?: string; message?: string }>;
+    note: string; protocol: string;
+  }>;
   /** gm only: a gm block becomes a dependency wait — stays blocked for the dispatcher; the last dependency restores ready (execute) or review (provable non-owner review block). */
   deferTaskUntil(credential: Credential, input: DeferTaskUntil): Promise<TaskView>;
   /**

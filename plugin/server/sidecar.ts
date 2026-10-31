@@ -39,6 +39,8 @@ const BASE_TOOLS = [
   "wait_task", "resolve_wait", "cancel_wait", "extend_wait", "list_task_waits", "wait_handoff_cards", "wait_migration_preview", "wait_migration_apply",
   "create_task", "create_goal", "triage_goal", "create_delivery", "goal_phase_split",
   "record_owner_decision", "set_direction", "resume_task", "defer_task_until", "retire_task",
+  // FV06 P1: gm-only read-only standby precheck (per-item {ok, code}); writes nothing, consumes no budget.
+  "verify_standby",
   // FV06: gm-only append of real prerequisites to an existing dependency wait; sets manager continuation, never resumes.
   "append_dependency_prerequisites",
   "record_score", "get_model_evidence", "get_task_cost", "heartbeat", "deliverable_publish",
@@ -666,6 +668,13 @@ export class SidecarPool {
     this.ensureSweeper();
   }
 
+  /** FV06 P0 standby wake: a resume assigned this instance a lease server-side (no sidecar claim ran),
+   *  so rebuild the local claim (channel proof + claim.json) from the authoritative server lease. */
+  async adoptLease(inst: EmployeeInst): Promise<void> {
+    if (!this.launched.has(inst.id)) throw new Error("unhealthy session channel cannot adopt a lease");
+    await this.rebuildClaim(inst);
+  }
+
   /**
    * Re-establish the local claim for a lease that survived the restart, then run the
    * turn-end ingest for artifacts the agent may have written while we were down.
@@ -1027,7 +1036,14 @@ export class SidecarPool {
         : Promise.reject(Object.assign(new Error("core does not expose goal_phase_split"), { code: "temporarily_unavailable" }));
       case "record_owner_decision": return core.relayOwnerDecision(cred, args as never);
       case "set_direction": await core.relayDirection(cred, args as never); return { recorded: true };
-      case "resume_task": return core.resume(cred, taskIdOf(args.taskId), evidence());
+      // FV06 P0: standbyEmployee turns the resume into an atomic bounded standby assignment
+      // (doing + lease + progress_at + standby_until) instead of the ordinary ready hand-off.
+      case "resume_task": return args.standbyEmployee && core.resumeStandby
+        ? core.resumeStandby(cred, taskIdOf(args.taskId), evidence(), String(args.standbyEmployee))
+        : core.resume(cred, taskIdOf(args.taskId), evidence());
+      case "verify_standby": return core.verifyStandby
+        ? core.verifyStandby(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose verify_standby"), { code: "temporarily_unavailable" }));
       case "defer_task_until": return core.deferTaskUntil(cred, args as never);
       case "append_dependency_prerequisites": return core.appendDependencyPrerequisites
         ? core.appendDependencyPrerequisites(cred, args as never)

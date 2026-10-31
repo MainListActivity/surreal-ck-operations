@@ -69,6 +69,23 @@ const POLICY_SHARED = {
   'src/database.ts': "// loadSchema('035-effective-policy.surql')\n",
 };
 
+// FV06 P0/P1: the standby relay contract the switch guard requires (capability marker, the resume
+// write in core, the view field, the supervision branch, the config field) — in src and in the
+// plugin vendor alike; a fixture target without it is the incompatible case the guard refuses.
+// The workforce markers mirror the real declarations (CompanyConfig.standbyBudgetSeconds,
+// DEFAULT_CONFIG's entry and the company_meta row key): a fixture shaped differently from the
+// real tree lets the guard pass while the real tree is refused, which is exactly the gap the
+// real-tree smoke test below closes.
+const STANDBY_FILES = {
+  'src/standby-relay-capability.ts': "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/1';\nexport const STANDBY_BUDGET_SECONDS_DEFAULT = 600;\n",
+  'src/dispatcher/dispatcher.ts': "export const STANDBY_WAKE_RETRY_SECONDS = 60;\nconst STANDBY_TIMEOUT_REASON = 'standby timeout';\n",
+};
+const STANDBY_APPENDS: Array<[string, string]> = [
+  ['src/core.ts', "standby_until = IF $assigned THEN math::min([$standby_not_after, $now + $standby_budget]) ELSE NONE END\nstandby employee unavailable\nstandby denied: unmet dependencies remain\n"],
+  ['src/contracts.ts', 'export interface StandbyView {\n  standbyUntil?: string;\n}\n'],
+  ['src/workforce.ts', "export interface StandbyConfig {\n  standbyBudgetSeconds: number;\n}\nstandbyBudgetSeconds: STANDBY_BUDGET_SECONDS_DEFAULT,\nrow.standby_budget_seconds\naction: 'standby_timeout',\n"],
+];
+
 function makeRelease(releases: string, sha: string, withGit = false, capable = true, policy = capable) {
   const dir = join(releases, sha);
   mkdirSync(join(dir, 'src', 'mcp'), { recursive: true });
@@ -77,9 +94,9 @@ function makeRelease(releases: string, sha: string, withGit = false, capable = t
   writeFileSync(join(dir, 'src', 'mcp', 'run.ts'), 'export {};\n');
   writeFileSync(join(dir, 'src', 'dispatcher', 'run.ts'), 'export {};\n');
   if (capable) {
-const files = { 'src/task-recovery.ts': 'export {};', 'src/ops/proof-store.ts': 'export const assertExecutionWindow = true;', ...CAPABILITY_FILES, ...ACCEPTANCE_FILES, ...(policy ? POLICY_FILES : {}),
+const files = { 'src/task-recovery.ts': 'export {};', 'src/ops/proof-store.ts': 'export const assertExecutionWindow = true;', ...CAPABILITY_FILES, ...ACCEPTANCE_FILES, ...(policy ? POLICY_FILES : {}), ...STANDBY_FILES,
   'src/goal-workspace-capability.ts': "export const GOAL_WORKSPACE_CONTRACT = 'sck-goal-workspace/v1';\n" };
-    const appends: Array<[string, string]> = [['src/core.ts', "// workspace goal denied dependency_continuation\n"], ['src/workforce.ts', "// workspace_scope\n"], ['src/core.ts', "export const ACCEPTANCE_CORE = 'mergeAcceptanceCriteria(leg, criteria); isTrustedCodeDeliverable(subject);';\n"]];
+    const appends: Array<[string, string]> = [['src/core.ts', "// workspace goal denied dependency_continuation\n"], ['src/workforce.ts', "// workspace_scope\n"], ['src/core.ts', "export const ACCEPTANCE_CORE = 'mergeAcceptanceCriteria(leg, criteria); isTrustedCodeDeliverable(subject);';\n"], ...STANDBY_APPENDS];
     if (policy) appends.push(...Object.entries(POLICY_SHARED));
     mkdirSync(join(dir, 'schema'), { recursive: true });
     mkdirSync(join(dir, 'src', 'ops'), { recursive: true });
@@ -87,6 +104,7 @@ const files = { 'src/task-recovery.ts': 'export {};', 'src/ops/proof-store.ts': 
     for (const [path, body] of appends) appendFileSync(join(dir, path), body);
     // The plugin surface runs the same core; its generated vendor must carry both contracts too.
     mkdirSync(join(dir, 'plugin', 'server', 'vendor', 'src', 'ops'), { recursive: true });
+    mkdirSync(join(dir, 'plugin', 'server', 'vendor', 'src', 'dispatcher'), { recursive: true });
     mkdirSync(join(dir, 'plugin', 'server', 'vendor', 'schema'), { recursive: true });
     for (const [path, body] of Object.entries(files)) {
       writeFileSync(join(dir, 'plugin', 'server', 'vendor', path), body);
@@ -192,6 +210,9 @@ function runInstall(f: Fixture, extraEnv: Record<string, string> = {}, target = 
       PASEO: f.fakePaseo,
       SCK_SERVICE_HOME: f.serviceHome,
       SCK_OPS_REPO: f.opsRepo,
+      // The standby guard reads the target with the repository's TypeScript parser, so it needs a
+      // runtime that can load it; the fixture's pinned runtime is a stub (see fixture()).
+      STANDBY_RELAY_RUNTIME: process.execPath,
       FAKE_RELEASES_DIR: f.releases,
       FAKE_PASEO_LOG: f.paseoLog,
       FAKE_PASEO_MODE: 'normal',
@@ -206,6 +227,46 @@ function runInstall(f: Fixture, extraEnv: Record<string, string> = {}, target = 
 function cleanup(f: Fixture) {
   rmSync(f.root, { recursive: true, force: true });
 }
+
+/**
+ * The switch guards against the real checkout, not a fixture: a guard probes declarations, so a fixture shaped
+ * differently from the tree it protects can pass while the real tree is refused — and a release that cannot pass a
+ * guard cannot be installed, which blocks the deploy leg of the very version that introduced the capability.
+ * This runs the shipped guards on the repository root and on the plugin vendor tree.
+ */
+const SWITCH_GUARDS: Array<[string, string]> = [
+  ['review-wait-guard.sh', 'review_wait_target_supported'],
+  ['independence-guard.sh', 'independence_target_supported'],
+  ['policy-guard.sh', 'policy_target_supported'],
+  ['goal-workspace-guard.sh', 'goal_workspace_target_supported'],
+  ['standby-relay-guard.sh', 'standby_relay_target_supported'],
+];
+
+function runSwitchGuard(script: string, entry: string, root: string, scope = 'full') {
+  return Bun.spawnSync(['sh', '-c', `. "${join(ROOT, 'scripts', script)}"; ${entry} "${root}" "${scope}"`], {
+    // The standby guard reads the target with the repository's TypeScript parser, so it needs a
+    // runtime that can load it; the fixture's own runtime is a stub (see fixture()).
+    env: { PATH: '/usr/bin:/bin', STANDBY_RELAY_RUNTIME: process.execPath },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+}
+
+test('every switch guard accepts the real checkout and its plugin vendor tree', () => {
+  // The tree that ships this version must be installable by its own guards. The vendor face runs
+  // the same core: for guards that require plugin/ under full scope (standby-relay), probe the
+  // vendor face with scope=core; the release itself is still probed with full.
+  const vendor = join(ROOT, 'plugin', 'server', 'vendor');
+  for (const [script, entry] of SWITCH_GUARDS) {
+    const releaseResult = runSwitchGuard(script, entry, ROOT, 'full');
+    expect(`${script} ${ROOT} full: ${releaseResult.stderr.toString().trim()}`).toBe(`${script} ${ROOT} full: `);
+    expect(releaseResult.exitCode).toBe(0);
+    const vendorScope = script === 'standby-relay-guard.sh' ? 'core' : 'full';
+    const vendorResult = runSwitchGuard(script, entry, vendor, vendorScope);
+    expect(`${script} ${vendor} ${vendorScope}: ${vendorResult.stderr.toString().trim()}`).toBe(`${script} ${vendor} ${vendorScope}: `);
+    expect(vendorResult.exitCode).toBe(0);
+  }
+});
 
 function activeTarget(f: Fixture) {
   return readlinkSync(join(f.serviceHome, 'active'));
