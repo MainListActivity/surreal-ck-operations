@@ -868,7 +868,7 @@ test('memory pressure sleeps an hour-idle employee and reuses the same identity 
  const f=fixture([{id:'lru-work',state:'ready',facts:{authors:[],reviewers:[],excluded:[],unknown:[],ambiguous:false}}]);
  const target=f.instances.find(i=>i.id==='eng-1')!;target.idleSince=990000;target.lastWakeAt=980000;
  const original=f.wf.config.bind(f.wf);let closed=0;
- Object.assign(f.wf,{config:async()=>({...await original(),minFreeMemMb:2048}),observeSessionIdle:async()=>{},reserveRuntimeSleep:async(i:EmployeeInst,now:number)=>{i.runtimeSleepRequestedAt=now;return true},releaseRuntimeSleep:async()=>{}});
+ Object.assign(f.wf,{config:async()=>({...await original(),minFreeMemMb:2048}),observeSessionIdle:async()=>{},confirmRuntimeSleep:async()=>true,reserveRuntimeSleep:async(i:EmployeeInst,now:number)=>{i.runtimeSleepRequestedAt=now;return true},releaseRuntimeSleep:async()=>{}});
  Object.assign(f.paseo,{sleep:async(id:string)=>{closed++;f.setStatus(id,'closed')}});
  const report=await f.tick({hostResources:()=>({freeMemMb:100,freeDiskMb:99999,memoryPressure:closed?1:2})});
  expect(closed).toBe(1);expect(report.retired).toEqual([]);expect(report.woke.find(w=>w.task==='lru-work')).toMatchObject({employee:'eng-1',spawned:false});expect(f.spawnCwds).toEqual([]);
@@ -876,7 +876,7 @@ test('memory pressure sleeps an hour-idle employee and reuses the same identity 
 test('memory pressure waits when every employee is idle less than an hour',async()=>{
  const f=fixture([{id:'lru-young',state:'ready',facts:{authors:[],reviewers:[],excluded:[],unknown:[],ambiguous:false}}]);
  const original=f.wf.config.bind(f.wf);let closed=0;
- Object.assign(f.wf,{config:async()=>({...await original(),minFreeMemMb:2048}),observeSessionIdle:async()=>{},reserveRuntimeSleep:async()=>true,releaseRuntimeSleep:async()=>{}});
+ Object.assign(f.wf,{config:async()=>({...await original(),minFreeMemMb:2048}),observeSessionIdle:async()=>{},confirmRuntimeSleep:async()=>true,reserveRuntimeSleep:async()=>true,releaseRuntimeSleep:async()=>{}});
  for(const i of f.instances){i.idleSince=999000;i.lastWakeAt=990000}
  Object.assign(f.paseo,{sleep:async()=>{closed++}});
  const r=await f.tick({hostResources:()=>({freeMemMb:100,freeDiskMb:99999,memoryPressure:2})});

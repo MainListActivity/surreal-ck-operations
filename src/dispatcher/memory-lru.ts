@@ -24,10 +24,10 @@ export async function observeRuntimeIdle(input: {
 /** Reclaim at most one runtime per dispatch pass so kernel pressure can settle between closes. */
 export async function reclaimMemoryLru(input:{
   instances:EmployeeInst[]; states:ReadonlyMap<string,string>; now:number;
-  workforce:Pick<Workforce,'insts'|'tasks'|'openManagerWakes'|'reserveRuntimeSleep'|'releaseRuntimeSleep'>;
+  workforce:Pick<Workforce,'insts'|'tasks'|'openManagerWakes'|'reserveRuntimeSleep'|'confirmRuntimeSleep'|'releaseRuntimeSleep'>;
   paseo:Pick<PaseoGateway,'status'|'sleep'>; log:(text:string)=>void;
 }):Promise<EmployeeInst|undefined> {
-  if (!input.paseo.sleep || typeof input.workforce.reserveRuntimeSleep!=='function') return;
+  if (!input.paseo.sleep || (typeof input.workforce.reserveRuntimeSleep!=='function' || typeof input.workforce.confirmRuntimeSleep!=='function')) return;
   const eligible=(i:EmployeeInst)=>!!i.paseoAgentId && !i.activeTask && i.idleSince!==undefined &&
     input.now-i.idleSince>=MIN_IDLE_SECONDS && (i.lastWakeAt??0)<i.idleSince;
   const candidates=input.instances.filter(i=>input.states.get(i.id)==='idle' && eligible(i))
@@ -46,7 +46,7 @@ export async function reclaimMemoryLru(input:{
       }
       // An ambiguous close keeps its short claim barrier until expiry; never close a second process in that pass.
       try {
-        await input.paseo.sleep(fresh.paseoAgentId!);
+        await input.paseo.sleep(fresh.paseoAgentId!,()=>input.workforce.confirmRuntimeSleep(fresh,input.now));
         const after=await input.paseo.status(fresh.paseoAgentId!);
         if (after?.status!=='closed') {input.log(`memory LRU: closure unconfirmed for ${fresh.id}`);return;}
       } catch(error) {input.log(`memory LRU: closure uncertain for ${fresh.id}: ${(error as Error).message}`);return;}

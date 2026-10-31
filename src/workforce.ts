@@ -616,6 +616,16 @@ export class Workforce {
     return result === true;
   }
 
+  /** Rechecked after MCP initialization, immediately before sending a destructive runtime operation. */
+  async confirmRuntimeSleep(inst: EmployeeInst, requestedAt: number): Promise<boolean> {
+    const [safe] = await this.db.query<[boolean]>(`RETURN (SELECT VALUE count() FROM employee WHERE id=$e
+      AND runtime_sleep_requested_at=$requested AND runtime_sleep_until > time::unix(time::now()) + 30
+      AND (active_task ?? NONE)=NONE AND idle_since=$since AND (last_wake_at ?? NONE)=$wake
+      AND paseo_agent_id=$agent AND retired!=true AND revoked!=true GROUP ALL)[0] = 1;`,
+      {e:id('employee',inst.id),requested:requestedAt,since:inst.idleSince,wake:inst.lastWakeAt,agent:inst.paseoAgentId});
+    return safe===true;
+  }
+
   async releaseRuntimeSleep(employeeId: string, now: number): Promise<void> {
     await this.db.query('UPDATE $e SET runtime_sleep_until = NONE WHERE runtime_sleep_requested_at = $now;',
       {e: id('employee',employeeId), now});

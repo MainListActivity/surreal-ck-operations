@@ -7,7 +7,7 @@ const inst=(id:string,since?:number):EmployeeInst=>({id,role:'engineering',paseo
 function world(instances:EmployeeInst[]){
  const states=new Map(instances.map(i=>[i.id,'idle'])),closed:string[]=[],released:string[]=[],reserved:string[]=[];
  const tasks:SupervisedTask[]=[],wakes:any[]=[];let status='idle',permissions=0,unreadable=false,failClose=false;
- const wf={insts:async()=>instances,tasks:async()=>tasks,openManagerWakes:async()=>{if(unreadable)throw Error('unreadable');return wakes},reserveRuntimeSleep:async(i:EmployeeInst)=>{reserved.push(i.id);return true},releaseRuntimeSleep:async(id:string)=>{released.push(id)}} as unknown as Workforce;
+ const wf={insts:async()=>instances,tasks:async()=>tasks,openManagerWakes:async()=>{if(unreadable)throw Error('unreadable');return wakes},confirmRuntimeSleep:async()=>true,reserveRuntimeSleep:async(i:EmployeeInst)=>{reserved.push(i.id);return true},releaseRuntimeSleep:async(id:string)=>{released.push(id)}} as unknown as Workforce;
  const paseo={status:async(id:string)=>({status:closed.includes(id)?'closed':status,pendingPermissions:permissions}),sleep:async(id:string)=>{if(failClose)throw Error('timeout');closed.push(id)}};
  return {instances,states,closed,released,reserved,tasks,wakes,paseo,wf,setStatus:(s:string,p=0)=>{status=s;permissions=p},setUnreadable:()=>{unreadable=true},setFail:()=>{failClose=true},run:()=>reclaimMemoryLru({instances,states,now:10000,workforce:wf,paseo,log:()=>{}})};
 }
@@ -50,5 +50,5 @@ test('native MCP adapter invokes runtime-close only and rejects remote endpoints
   const result=body.method==='initialize'?{protocolVersion:'2025-03-26',capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}}:(calls.push(body.params),{content:[],structuredContent:{success:true}});
   return Response.json({jsonrpc:'2.0',id:body.id,result});
  }});
- try{await closePaseoRuntime('agent-fixture',`http://127.0.0.1:${server.port}/mcp/agents`);expect(calls).toEqual([{name:'kill_agent',arguments:{agentId:'agent-fixture'}}]);await expect(closePaseoRuntime('x','https://example.com/mcp')).rejects.toThrow('local owner');}finally{server.stop(true)}
+ try{await closePaseoRuntime('agent-fixture',`http://127.0.0.1:${server.port}/mcp/agents`);expect(calls).toEqual([{name:'kill_agent',arguments:{agentId:'agent-fixture'}}]);await expect(closePaseoRuntime('other',`http://127.0.0.1:${server.port}/mcp/agents`,async()=>false)).rejects.toThrow('reservation');expect(calls).toHaveLength(1);await expect(closePaseoRuntime('x','https://example.com/mcp')).rejects.toThrow('local owner');}finally{server.stop(true)}
 });

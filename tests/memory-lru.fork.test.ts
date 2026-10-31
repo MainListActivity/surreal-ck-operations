@@ -17,10 +17,12 @@ run('runtime sleep reservation fences claims and manager wakes while preserving 
   const task=await core.createTask(gm,{title:'memory LRU integration',context:'read only fixture',executorRole:'qa',reviewerRole:'gm',idempotencyKey:'lru-task'});
   const before=(await db.db.select<any>(new RecordId('employee','worker')))!;
   expect(await wf.reserveRuntimeSleep(await find(),now)).toBe(true);
+  expect(await wf.confirmRuntimeSleep(await find(),now)).toBe(true);
   await expect(core.claim(worker,task.id)).rejects.toThrow('suspending');
   const wake=await wf.acquireManagerWake({taskId:task.id,phase:'execute',episode:1,version:1,repo:'/tmp',reason:'fixture'});
   expect(wake).toBeDefined();expect(await wf.markManagerWakeRunning(wake!,'worker','agent-worker')).toBe(false);
   await wf.releaseRuntimeSleep('worker',now);
+  expect(await wf.confirmRuntimeSleep(await find(),now)).toBe(false);
   const claim=await core.claim(worker,task.id);expect(claim.task.id).toBe(task.id);
   const after=(await db.db.select<any>(new RecordId('employee','worker')))!;
   expect(after.credential_digest).toBe(before.credential_digest);expect(after.paseo_agent_id).toBe(before.paseo_agent_id);expect(after.revoked).toBe(before.revoked);expect(after.retired).toBe(before.retired);
