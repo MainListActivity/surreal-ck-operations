@@ -349,3 +349,40 @@ test('division after primaries and nested templates cannot smuggle comment marke
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
 });
+
+// R9 (attempt-7 return): template text must honour backslash escapes; class/function
+// expressions and a bare identifier named of must keep a following slash as division.
+test('template escapes, class/function expressions and of-as-ident cannot smuggle markers', () => {
+  const roots: string[] = [];
+  try {
+    const refused: Array<[string, string]> = [
+      ['R9-1-escaped-backtick-then-comment', lines(SQL, 'const s = `a\\`b`; // ' + UNAVAILABLE, DENIED)],
+      ['R9-2-two-escaped-backticks-then-comment', lines(SQL, 'const s = `\\`x\\``; // ' + UNAVAILABLE, DENIED)],
+      ['R9-3-escaped-dollar-brace-then-comment', lines(SQL, 'const s = `\\${`; // ' + UNAVAILABLE, DENIED)],
+      ['R9-4-escaped-backslash-close-then-comment', lines(SQL, 'const s = `a\\\\`; // ' + UNAVAILABLE, DENIED)],
+      ['R9-6-of-identifier-div-then-comment', lines(SQL, 'const of = 4; const r = of / 2; // ' + UNAVAILABLE, DENIED)],
+      ['R9-7-function-expression-div-then-comment', lines(SQL, 'const r = function () {} / 2; // ' + UNAVAILABLE, DENIED)],
+      ['R9-8-escaped-backtick-parity-then-comment', lines(SQL, 'const s = `a\\`b`; const t = `c`; // ' + UNAVAILABLE, 'const u = `\\``;', DENIED)],
+      ['R9-11-class-expression-div-then-comment', lines(SQL, 'const r = class {} / 2; // ' + UNAVAILABLE, DENIED)],
+    ];
+    for (const [name, core] of refused) {
+      const root = release({ 'src/core.ts': core });
+      roots.push(root);
+      const result = probe(root);
+      expect(result.code, `${name}: ${result.output}`).not.toBe(0);
+    }
+    const accepted: Array<[string, string]> = [
+      ['R9-5-escaped-backtick-then-code-marker', lines(SQL, "const s = `a\\`b`; const label = '" + UNAVAILABLE + "';", DENIED)],
+      ['R9-9-escaped-backtick-parity-then-code-marker', lines(SQL, 'const s = `a\\`b`; const t = `c`; const label = "' + UNAVAILABLE + '";', 'const u = `\\``;', DENIED)],
+      ['R9-10-escaped-dollar-brace-then-code-marker', lines(SQL, 'const s = `\\${`; const label = "' + UNAVAILABLE + '";', DENIED)],
+    ];
+    for (const [name, core] of accepted) {
+      const root = release({ 'src/core.ts': core });
+      roots.push(root);
+      const result = probe(root);
+      expect(result.code, `${name}: ${result.output}`).toBe(0);
+    }
+  } finally {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  }
+});

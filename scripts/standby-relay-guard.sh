@@ -26,10 +26,16 @@ STANDBY_RELAY_PROTOCOL_EXPECTED='standby-relay/1'
 #   start/operator/open, after expression-prefix keywords (return/typeof/default/...), after =>,
 #   and after ) that closed an if/while/for/with/switch head. After an identifier, number,
 #   string/template/regex end, ), or ], a slash is division. Member names after . are never
-#   keywords (stats.in / x is division). Postfix ! (TS non-null) keeps an expression end;
-#   != / !== stay operators. Ambiguous } outside ${} is a statement boundary (regex ok /
-#   fail-closed). Non-ASCII UTF-8 identifier bytes are treated as ident so 总数 / 2 is division;
-# - text inside any quote is preserved (SQL/template markers are real code); comment text is
+#   keywords (stats.in / x is division). in/of are never bare keywords (of / 2 is division;
+#   for-of regex after of is not recognised — fail-closed toward division). Postfix !
+#   (TS non-null) keeps an expression end; != / !== stay operators. class/function bodies are
+#   expression-braced when the keyword appears in expression position so (class {} / 2) and
+#   (function () {} / 2) are division; statement declarations keep } as a statement boundary
+#   (regex ok). Other ambiguous } stay statement-boundary / fail-closed. Non-ASCII UTF-8
+#   identifier bytes are treated as ident so non-ASCII / 2 is division;
+# - text inside any quote is preserved (SQL/template markers are real code); template text
+#   honours backslash escapes (so a backslash-backtick does not close and a backslash-${ does
+#   not open a substitution), matching the string-literal escape rule. Comment text is
 #   discarded but lines are kept, so a multi-line /* ... */ block cannot smuggle markers and an
 #   anchored pattern still sees one code line per source line. A comment-only release cannot pass.
 # - a file still inside a template or block comment at EOF is unreadable and refused.
@@ -56,6 +62,8 @@ standby_relay_has_code() {
       paren_stack = ""
       brace_stack = ""
       after_dot = 0
+      stmt_boundary = 1
+      pending_fn_expr = 0
       tpl_depth = 0
       in_tpl_text = 0
       brace_depth = 0
@@ -65,22 +73,33 @@ standby_relay_has_code() {
     function is_digit(c) { return index(digits, c) > 0 }
     function is_id_cont(c) { return index(id_cont, c) > 0 || c > del }
     function is_flag(c) { return index(flags, c) > 0 }
-    function flush_word(   w) {
+    function flush_word(   w, before) {
       w = word; word = ""
       if (w == "") return
+      before = prev_kind
       if (after_dot) {
-        prev_kind = "ident"; last_kw = ""; after_dot = 0
+        prev_kind = "ident"; last_kw = ""; after_dot = 0; stmt_boundary = 0
         return
       }
-      if (w == "return" || w == "typeof" || w == "instanceof" || w == "in" || w == "of" || w == "new" || w == "delete" || w == "void" || w == "throw" || w == "case" || w == "do" || w == "else" || w == "yield" || w == "await" || w == "default") {
+      # in/of are contextual (for-in/of); as bare identifiers they must stay ident so
+      # "const of = 4; of / 2" is division. for-of regex after of is not recognised (fail-closed).
+      if (w == "return" || w == "typeof" || w == "instanceof" || w == "new" || w == "delete" || w == "void" || w == "throw" || w == "case" || w == "do" || w == "else" || w == "yield" || w == "await" || w == "default") {
+        prev_kind = "kw"; last_kw = w; pending_fn_expr = 0
+      } else if (w == "function" || w == "class") {
+        # Expression position (after = / : / , / ( / => / keyword) → body } ends a primary.
+        # Statement boundary → declaration; body } is a statement boundary (regex ok).
+        if (stmt_boundary == 0 && (before == "op" || before == "kw" || before == "arrow" || before == "ifparen")) pending_fn_expr = 1
+        else pending_fn_expr = 0
         prev_kind = "kw"; last_kw = w
       } else if (w == "if" || w == "while" || w == "for" || w == "with" || w == "switch") {
-        prev_kind = "ident"; last_kw = w
+        prev_kind = "ident"; last_kw = w; pending_fn_expr = 0
       } else if (is_digit(substr(w, 1, 1))) {
-        prev_kind = "num"; last_kw = ""
+        prev_kind = "num"; last_kw = ""; pending_fn_expr = 0
       } else {
+        # Keep pending_fn_expr across the optional name (class Foo / function foo).
         prev_kind = "ident"; last_kw = ""
       }
+      stmt_boundary = 0
     }
     function can_regex() {
       return (prev_kind == "" || prev_kind == "op" || prev_kind == "kw" || prev_kind == "arrow" || prev_kind == "ifparen")
@@ -134,9 +153,15 @@ standby_relay_has_code() {
           if (char == "*" && next_char == "/") { in_block_comment = 0; i++ }
           continue
         }
-        # Template text: only ` and ${ are special; everything else (including quotes) is code text.
+        # Template text: backslash escapes, ` and ${ are special; everything else is code text.
         if (in_tpl_text && quote == bt) {
           code = code char
+          if (char == escape && i < length(line)) {
+            # \` does not close; \${ does not open a substitution (same rule as quoted strings).
+            code = code next_char
+            i++
+            continue
+          }
           if (char == "$" && next_char == "{") {
             code = code next_char
             i++
@@ -152,6 +177,7 @@ standby_relay_has_code() {
             leave_template()
             last_kw = ""
             after_dot = 0
+            stmt_boundary = 0
             continue
           }
           continue
@@ -304,9 +330,9 @@ standby_relay_has_code() {
             kind = substr(brace_stack, length(brace_stack), 1)
             brace_stack = substr(brace_stack, 1, length(brace_stack) - 1)
           }
-          # Object-literal } ends a primary (division); block } is a statement boundary (regex ok).
-          if (kind == "e") prev_kind = "tend"
-          else prev_kind = "op"
+          # Object/class/function-expr } ends a primary (division); block } is a statement boundary.
+          if (kind == "e") { prev_kind = "tend"; stmt_boundary = 0 }
+          else { prev_kind = "op"; stmt_boundary = 1 }
           last_kw = ""
           after_dot = 0
           continue
@@ -316,6 +342,9 @@ standby_relay_has_code() {
           code = code "{"
           if (tpl_depth > 0 && in_tpl_text == 0 && brace_depth > 0) {
             brace_depth++
+          } else if (pending_fn_expr) {
+            brace_stack = brace_stack "e"
+            pending_fn_expr = 0
           } else if (prev_kind == "arrow") {
             # () => {} is a block body; () => ({}) uses a paren so prev is op.
             brace_stack = brace_stack "s"
@@ -327,9 +356,20 @@ standby_relay_has_code() {
           prev_kind = "op"
           last_kw = ""
           after_dot = 0
+          stmt_boundary = 0
           continue
         }
-        if (char == "[" || char == ";" || char == "," || char == ":" || char == "?" || char == "~" || char == "^" || char == "%" || char == "*" || char == "+" || char == "-" || char == "<" || char == ">" || char == "|" || char == "&" || char == "=") {
+        if (char == ";") {
+          flush_word()
+          code = code ";"
+          prev_kind = "op"
+          last_kw = ""
+          after_dot = 0
+          stmt_boundary = 1
+          pending_fn_expr = 0
+          continue
+        }
+        if (char == "[" || char == "," || char == ":" || char == "?" || char == "~" || char == "^" || char == "%" || char == "*" || char == "+" || char == "-" || char == "<" || char == ">" || char == "|" || char == "&" || char == "=") {
           flush_word()
           if ((char == "+" || char == "-" || char == "|" || char == "&" || char == "=" || char == "<" || char == ">") && next_char == char) {
             code = code char next_char
@@ -338,11 +378,11 @@ standby_relay_has_code() {
             else prev_kind = "op"
           } else {
             code = code char
-            if (char == "[") prev_kind = "op"
-            else prev_kind = "op"
+            prev_kind = "op"
           }
           last_kw = ""
           after_dot = 0
+          stmt_boundary = 0
           continue
         }
         if (char == " " || char == "\t") {
