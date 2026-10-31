@@ -54,7 +54,7 @@ try {
     'tests/db.integration.test.ts', 'tests/v3.integration.test.ts',
     'tests/implementer-binding.integration.test.ts', 'tests/contributor-cas.integration.test.ts',
     'tests/dispatcher-sidecar.fork.test.ts', 'tests/dispatch-episode.fork.test.ts', 'tests/review-capacity-replay.fork.test.ts', 'tests/standby-relay.fork.test.ts',
-    'tests/idle-sessions.fork.test.ts', 'tests/ops-denial-circuit.fork.test.ts', 'tests/ops-denial-circuit.test.ts', 'tests/company-db-runtime.test.ts', 'tests/host-resources.test.ts', 'tests/scratch-gc.test.ts', 'tests/test-runner-cleanup.test.ts',
+    'tests/memory-lru.fork.test.ts', 'tests/idle-sessions.fork.test.ts', 'tests/ops-denial-circuit.fork.test.ts', 'tests/ops-denial-circuit.test.ts', 'tests/company-db-runtime.test.ts', 'tests/host-resources.test.ts', 'tests/scratch-gc.test.ts', 'tests/test-runner-cleanup.test.ts',
     'tests/quota-turn.test.ts', 'tests/turn-closeout.test.ts', 'tests/quota-scoring.fork.test.ts',
     'tests/session-history.test.ts', 'tests/factory-queue.test.ts', 'tests/dispatcher-sidecar.test.ts', 'tests/dispatcher-manager-routing.test.ts', 'tests/sidecar.test.ts', 'tests/sidecar-quota-gate.fork.test.ts',
     'tests/sidecar-late-lease.test.ts', 'tests/mcp.transport.test.ts', 'tests/worktrees.test.ts',
