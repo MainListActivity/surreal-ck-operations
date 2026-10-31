@@ -24,18 +24,22 @@
 
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 
-// The repository's TypeScript: resolved from this file's parent (the repository root), with the
-// working directory as a second chance. A module that loads but does not expose createSourceFile
-// and ScriptTarget (for example a Bun global cache of an incompatible typescript build) is not
-// a parser the guard can use: refuse it instead of crashing mid-decision.
+// The repository's TypeScript: resolved from this file's parent (the repository root that ships
+// the scanner), with createRequire(import.meta.url) as a second chance from the scanner's own
+// directory, and the working directory as a last resort. fileURLToPath decodes %20 so a release
+// under "$HOME/Library/Application Support/..." still resolves; .pathname alone does not.
+// A module that loads but does not expose createSourceFile and ScriptTarget (for example a Bun
+// global cache of an incompatible typescript build) is not a parser the guard can use: refuse it
+// instead of crashing mid-decision.
 function loadTypeScript() {
-  const fromUrl = new URL('..', import.meta.url);
-  const repoRoot = fromUrl.pathname;
+  const repoRoot = fileURLToPath(new URL('..', import.meta.url));
   const attempts = [
     () => require(require.resolve('typescript', { paths: [repoRoot] })),
+    () => require('typescript'),
     () => require(require.resolve('typescript', { paths: [process.cwd()] })),
   ];
   for (const attempt of attempts) {

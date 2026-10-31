@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -115,6 +115,36 @@ test('full scope refuses a tree without plugin/, while core scope still accepts 
     expect(core.exitCode, `core: ${core.stderr.toString()}`).toBe(0);
   } finally {
     rmSync(noPlugin, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
+// R15: a release under a path that contains spaces (the production layout is
+// $HOME/Library/Application Support/SurrealCKCompany/releases/<sha>) must still resolve the
+// repository TypeScript parser from the scanner's own directory, even when the caller's cwd has
+// no node_modules. fileURLToPath is required: URL.pathname keeps %20 and require.resolve fails.
+test('a spaced release path resolves the TypeScript parser regardless of cwd', () => {
+  const spaced = mkdtempSync(join(tmpdir(), 'sck standby spaced-'));
+  const scripts = join(spaced, 'scripts');
+  mkdirSync(scripts, { recursive: true });
+  writeFileSync(join(scripts, 'standby-relay-guard.sh'), readFileSync(GUARD));
+  writeFileSync(join(scripts, 'standby-relay-scan.mjs'), readFileSync(join(ROOT, 'scripts/standby-relay-scan.mjs')));
+  symlinkSync(join(ROOT, 'node_modules'), join(spaced, 'node_modules'));
+  writeTree(spaced, VALID_FILES);
+  const bareCwd = mkdtempSync(join(tmpdir(), 'sck-standby-bare-cwd-'));
+  try {
+    const result = Bun.spawnSync([
+      'sh', '-c', '. "$1"; standby_relay_target_supported "$2" core',
+      'standby-relay-guard-spaced-test', join(scripts, 'standby-relay-guard.sh'), spaced,
+    ], {
+      cwd: bareCwd,
+      env: { ...process.env, STANDBY_RELAY_RUNTIME: process.execPath, PATH: '/usr/bin:/bin' },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    expect(result.exitCode, `${result.stdout.toString()}${result.stderr.toString()}`).toBe(0);
+  } finally {
+    rmSync(spaced, { recursive: true, force: true });
+    rmSync(bareCwd, { recursive: true, force: true });
   }
 }, TIMEOUT);
 

@@ -38,13 +38,16 @@ STANDBY_RELAY_PROTOCOL_EXPECTED='standby-relay/1'
 # - when the parser cannot be loaded, or a file cannot be read, nothing is decided: the scan fails
 #   and the target is refused. The guard never answers "safe" on an unreadable tree.
 #
-# The parser is the one the release was type-checked with, so the guard and the compiler agree on
-# what the source says. The scanner runs on the runtime the services run with when this shell
-# resolved it (scripts/bun-runtime.sh: pin, then the service-home runtime-bun, then ~/.bun/bin/bun;
-# PATH is never searched). Its answer is read from what it prints, not from its exit code, so a
-# runtime that cannot run it at all (a stub, a wrong interpreter) refuses the target instead of
-# passing it. A typescript module that loads but does not expose createSourceFile/ScriptTarget is
-# likewise refused.
+# The parser is the one the release that runs the guard was type-checked with (install/rollback use
+# the current audited release's installer, not the target's), so the guard and the compiler agree
+# on what the source says. The scanner resolves that parser via fileURLToPath so a release under
+# "$HOME/Library/Application Support/..." still finds its node_modules. The scanner runs on the
+# runtime the services run with when this shell resolved it (scripts/bun-runtime.sh: an explicit
+# pin is never replaced; otherwise the service-home runtime-bun, then ~/.bun/bin/bun; PATH is never
+# searched). Its answer is read from what it prints, not from its exit code, so a runtime that
+# cannot run it at all (a stub, a wrong interpreter, a pin that points nowhere) refuses the target
+# instead of passing it. A typescript module that loads but does not expose
+# createSourceFile/ScriptTarget is likewise refused.
 standby_relay_scanner=''
 standby_relay_runtime=''
 
@@ -83,20 +86,34 @@ standby_relay_resolve_scanner() {
 
 standby_relay_resolve_runtime() {
   [ -n "$standby_relay_runtime" ] && return 0
-  for standby_relay_candidate in "${STANDBY_RELAY_RUNTIME:-}" "${SCK_BUN:-}" "${BUN:-}"; do
-    if [ -n "$standby_relay_candidate" ] && [ -x "$standby_relay_candidate" ]; then
-      standby_relay_runtime=$standby_relay_candidate
-      return 0
-    fi
-  done
+  # Explicit pins (STANDBY_RELAY_RUNTIME, then SCK_BUN): set but missing is the runtime, never
+  # replaced by another Bun — same rule as scripts/bun-runtime.sh. An unusable pin refuses the
+  # target instead of falling through to ~/.bun.
+  if [ -n "${STANDBY_RELAY_RUNTIME:-}" ]; then
+    [ -x "$STANDBY_RELAY_RUNTIME" ] || return 1
+    standby_relay_runtime=$STANDBY_RELAY_RUNTIME
+    return 0
+  fi
+  if [ -n "${SCK_BUN:-}" ]; then
+    [ -x "$SCK_BUN" ] || return 1
+    standby_relay_runtime=$SCK_BUN
+    return 0
+  fi
+  # BUN already set in this shell (for example by a prior resolve_bun): same pin rule.
+  if [ -n "${BUN:-}" ]; then
+    [ -x "$BUN" ] || return 1
+    standby_relay_runtime=$BUN
+    return 0
+  fi
   # The runtime the services run with, when this shell can resolve it (same order as
-  # scripts/bun-runtime.sh: pin, then the service-home runtime-bun, then ~/.bun/bin/bun).
+  # scripts/bun-runtime.sh: the service-home runtime-bun, then ~/.bun/bin/bun).
   # PATH is never searched: the Bun there is not the runtime the services run.
   if command -v resolve_bun >/dev/null 2>&1; then
     standby_relay_home=${service_home:-${SCK_SERVICE_HOME:-"$HOME/Library/Application Support/SurrealCKCompany"}}
-    standby_relay_candidate=$(resolve_bun "$standby_relay_home" >/dev/null 2>&1; printf '%s' "${BUN:-}")
-    if [ -n "$standby_relay_candidate" ] && [ -x "$standby_relay_candidate" ]; then
-      standby_relay_runtime=$standby_relay_candidate
+    resolve_bun "$standby_relay_home" >/dev/null 2>&1 || true
+    if [ -n "${BUN:-}" ]; then
+      [ -x "$BUN" ] || return 1
+      standby_relay_runtime=$BUN
       return 0
     fi
   fi
@@ -277,11 +294,25 @@ standby_relay_refusal_reason() {
   fi
   standby_relay_verdict=$(standby_relay_root_checks "$standby_relay_release/plugin/server/vendor" | standby_relay_scan batch) || :
   standby_relay_missing=''
+  standby_relay_unreadable=0
   case "$standby_relay_verdict" in
     yes*) ;;
-    no*) standby_relay_missing=${standby_relay_verdict#no} ;;
-    *) standby_relay_missing='代码扫描器无法判定插件 vendor 树' ;;
+    no*)
+      standby_relay_missing=${standby_relay_verdict#no}
+      case "$standby_relay_missing" in
+        *unreadable*) standby_relay_unreadable=1 ;;
+      esac
+      ;;
+    *) standby_relay_unreadable=1; standby_relay_missing='代码扫描器无法判定插件 vendor 树' ;;
   esac
+  if [ "$standby_relay_unreadable" -ne 0 ]; then
+    echo "目标的插件 vendor 代码的 standby 接力契约无法判定（代码扫描器不可用或源码不可读）：双面不同源无法证明，切换会让插件面按旧语义对待待命任务"
+    if [ -n "$standby_relay_missing" ]; then
+      echo "不可读的证据："
+      printf '%s\n' "$standby_relay_missing" | awk 'NF && !seen[$0]++'
+    fi
+    return 0
+  fi
   if [ -n "$standby_relay_missing" ]; then
     echo "目标的插件 vendor 代码不支持 standby 接力契约：双面不同源，切换会让插件面按旧语义对待待命任务"
     echo "缺少的契约证据："
