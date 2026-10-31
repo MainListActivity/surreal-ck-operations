@@ -20,3 +20,11 @@ test('valid sysctl skips the slower memory_pressure command; unavailable sysctl 
   expect(fallback.memoryPressure).toBeUndefined();
   expect(fallback.freeMemMb).toBeGreaterThan(0);
 });
+
+test('memory pressure and disk watermarks produce independent reasons, including both at once',async()=>{
+ const {resourceBlocks}=await import('../src/dispatcher/host.ts');
+ expect(resourceBlocks({freeMemMb:249,freeDiskMb:45000,memoryPressure:2},2048,10240).map(b=>b.code)).toEqual(['memory_pressure']);
+ expect(resourceBlocks({freeMemMb:249,freeDiskMb:45000,memoryPressure:1},2048,10240)).toEqual([]);
+ expect(resourceBlocks({freeMemMb:8000,freeDiskMb:100,memoryPressure:1},2048,10240).map(b=>b.code)).toEqual(['disk_space']);
+ expect(resourceBlocks({freeMemMb:249,freeDiskMb:100,memoryPressure:2},2048,10240).map(b=>b.code)).toEqual(['memory_pressure','disk_space']);
+});
