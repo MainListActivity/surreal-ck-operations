@@ -16,14 +16,23 @@
 # switch). Read-only: files are read, never executed; no credentials are touched.
 STANDBY_RELAY_PROTOCOL_EXPECTED='standby-relay/1'
 
-# Search source outside comments only. Preserve markers inside quoted SQL/template strings, but discard // and
-# /* ... */ comments (including trailing comments), so a comment-only release cannot pass the capability probe.
+# Search source outside comments only, with a line-based JS/TS lexer:
+# - single- and double-quoted strings end at the closing quote or, if unterminated, at end of line
+#   (JS/TS strings cannot span lines), so a stray quote cannot swallow later comment lines;
+# - template literals may span lines: the backtick state carries across lines until it closes;
+# - a regex literal /.../[flags] is recognised where JS allows one (after an operator or opener),
+#   so a quote inside a regex does not open a string;
+# - text inside any quote is preserved (SQL/template markers are real code); comment text is
+#   discarded but lines are kept, so a multi-line /* ... */ block cannot smuggle markers and an
+#   anchored pattern still sees one code line per source line. A comment-only release cannot pass.
 standby_relay_has_code() {
   file=$1
   mode=$2
   marker=$3
   awk -v mode="$mode" -v marker="$marker" '
-    BEGIN { escape = sprintf("%c", 92) }
+    BEGIN {
+      escape = sprintf("%c", 92); dq = sprintf("%c", 34); sq = sprintf("%c", 39); bt = sprintf("%c", 96)
+    }
     {
       line = $0
       code = ""
@@ -36,15 +45,37 @@ standby_relay_has_code() {
         }
         if (quote != "") {
           code = code char
-          if (char == escape && i < length(line)) { code = code substr(line, i + 1, 1); i++; continue }
-          if (char == quote) quote = ""
+          if (char == escape && i < length(line)) { code = code next_char; i++; continue }
+          if (char == quote) { quote = ""; template = 0 }
           continue
         }
-        if (char == "\\\"" || char == "'\''" || char == "`") { quote = char; code = code char; continue }
+        if (char == dq || char == sq || char == bt) { quote = char; template = (char == bt) ? 1 : 0; code = code char; continue }
         if (char == "/" && next_char == "/") break
         if (char == "/" && next_char == "*") { in_block_comment = 1; i++; continue }
+        if (char == "/" && next_char != "" && next_char != "/" && next_char != "*" && prev_code_char ~ /[=(,:[!&|?{};+-]$/) {
+          # Regex literal: scan to the closing slash honouring escapes and character classes.
+          j = i + 1; in_class = 0; closed = 0
+          while (j <= length(line)) {
+            rc = substr(line, j, 1)
+            if (rc == escape) { j += 2; continue }
+            if (in_class) { if (rc == "]") in_class = 0 }
+            else if (rc == "[") { in_class = 1 }
+            else if (rc == "/") { closed = 1; break }
+            j++
+          }
+          if (closed) {
+            code = code "re"
+            j++
+            while (j <= length(line) && substr(line, j, 1) ~ /[a-z]/) j++
+            i = j - 1
+            prev_code_char = ""
+            continue
+          }
+        }
+        if (char != " " && char != "\t") prev_code_char = char
         code = code char
       }
+      if (quote != "" && template != 1) quote = ""
       if ((mode == "pattern" && code ~ marker) || (mode != "pattern" && index(code, marker))) found = 1
     }
     END { exit(found ? 0 : 1) }
@@ -72,12 +103,11 @@ standby_relay_probe_root() {
   standby_relay_has_code_marker "$core" 'standby denied: unmet dependencies remain' || return 1
   # The view surfaces the deadline; the config carries the budget. The budget lives in the config
   # interface (CompanyConfig.standbyBudgetSeconds), its default (DEFAULT_CONFIG), and the company_meta
-  # config row key it is read from (standby_budget_seconds). Probe the declarations the tree really
-  # has: a comment-only or fixture-shaped tree cannot pass, and a tree that dropped the budget
-  # declaration while keeping the row key cannot pass either.
-  grep -Eq '^[[:space:]]*standbyUntil\?:' "$contracts" 2>/dev/null || return 1
-  grep -Eq '^[[:space:]]*standbyBudgetSeconds:[[:space:]]*number;' "$workforce" 2>/dev/null || return 1
-  grep -Eq '^[[:space:]]*standbyBudgetSeconds:[[:space:]]*STANDBY_BUDGET_SECONDS_DEFAULT' "$workforce" 2>/dev/null || return 1
+  # config row key it is read from (standby_budget_seconds). The declaration probes run through the
+  # same comment-stripping scanner: a block comment that mentions the declaration cannot stand in for it.
+  standby_relay_has_code_pattern "$contracts" '^[[:space:]]*standbyUntil[?]:' || return 1
+  standby_relay_has_code_pattern "$workforce" '^[[:space:]]*standbyBudgetSeconds:[[:space:]]*number;' || return 1
+  standby_relay_has_code_pattern "$workforce" '^[[:space:]]*standbyBudgetSeconds:[[:space:]]*STANDBY_BUDGET_SECONDS_DEFAULT' || return 1
   standby_relay_has_code_marker "$workforce" 'standby_budget_seconds' || return 1
   standby_relay_has_code_marker "$dispatcher" 'standby timeout' || return 1
   standby_relay_has_code_marker "$workforce" 'standby_timeout' || return 1

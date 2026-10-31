@@ -3232,6 +3232,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       LET $next = UPDATE ONLY $task SET
         state = IF $t.state = 'doing' THEN 'ready' ELSE $t.state END,
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
+        standby_until = NONE,
         version = $t.version + 1 RETURN AFTER;
       UPDATE employee SET active_task = NONE WHERE id = $actor AND active_task = $task;
       CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'released', evidence: $evidence, version: $next.version, at: time::now(), phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END };

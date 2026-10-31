@@ -444,3 +444,18 @@ run('R4: verify_standby replays idempotently (no duplicate audits) and the budge
   expect(leaseSec - standbySec).toBeLessThanOrEqual(2);
   await db.db.query('UPSERT company_meta:config MERGE { standby_budget_seconds: 600 };');
 });
+
+run('R6: releasing a standby lease clears standby_until so the ready view never shows a stale deadline', async () => {
+  const gm = await actor('gm');
+  const { taskId, window, executor } = await windowedBlockedTask('释放待命租约');
+  const resumed = await core.resumeStandby(gm.cred, taskId, { ...text('待命建立后立刻释放，检查标记生命周期'), executionWindow: window }, executor.id);
+  expect(resumed.standbyUntil).toBeDefined();
+  const released = await core.release(executor.cred,
+    { taskId, deliveryId: resumed.deliveryId!, fence: resumed.fence!, expectedVersion: resumed.version },
+    text('释放待命租约：待命窗口随租约一起结束'));
+  expect(released.state).toBe('ready');
+  expect(released.standbyUntil).toBeUndefined();
+  const row = await rowOf(taskId);
+  expect(row!.standby_until ?? null).toBeNull();
+  expect(row!.current_employee ?? null).toBeNull();
+});

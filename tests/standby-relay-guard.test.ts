@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -126,4 +126,128 @@ test('every required marker is refused when it appears only in a comment', () =>
   } finally {
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
+});
+
+// The review probes for attempt 4 (fv06-attempt4-guard-probe*.ts) plus the multi-line block
+// comment and quote-state cases they exposed. Every fixture below keeps a required marker only
+// inside a comment, or verifies that a legitimate marker stays accepted.
+const SQL = 'standby_until = IF $assigned THEN math::min([$standby_not_after, $now + $standby_budget]) ELSE NONE END';
+const UNAVAILABLE = 'standby employee unavailable';
+const DENIED = 'standby denied: unmet dependencies remain';
+const lines = (...xs: string[]) => xs.join('\n') + '\n';
+
+test('a multi-line block comment cannot stand in for declarations or behavior markers', () => {
+  const roots: string[] = [];
+  try {
+    // The protocol declaration lives only inside a block comment; the budget default is real code.
+    const protocolInBlock = release({
+      'src/standby-relay-capability.ts': lines('/*', "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/1';", '*/', 'export const STANDBY_BUDGET_SECONDS_DEFAULT = 600;'),
+    });
+    // Both workforce declarations live only inside a block comment; the row key and audit action are real code.
+    const budgetInBlock = release({
+      'src/workforce.ts': lines('export interface CompanyConfig {', '}', 'const DEFAULT_CONFIG = {', '};', '/*', 'standbyBudgetSeconds: number;', 'standbyBudgetSeconds: STANDBY_BUDGET_SECONDS_DEFAULT,', '*/', 'row.standby_budget_seconds', "action: 'standby_timeout',"),
+    });
+    // The view field lives only inside a block comment.
+    const viewInBlock = release({
+      'src/contracts.ts': lines('export interface TaskView {', '}', '/*', 'standbyUntil?: string;', '*/'),
+    });
+    // All three core markers live only inside one block comment.
+    const coreInBlock = release({
+      'src/core.ts': lines('/*', SQL, UNAVAILABLE, DENIED, '*/'),
+    });
+    roots.push(protocolInBlock, budgetInBlock, viewInBlock, coreInBlock);
+    for (const root of roots) expectRefused(root);
+    // Control: a block comment that contains none of the markers does not affect a complete tree.
+    const commented = release({
+      'src/core.ts': lines('/* note: this file carries the bounded standby relay */', SQL, UNAVAILABLE, DENIED),
+    });
+    roots.push(commented);
+    expect(probe(commented).code).toBe(0);
+  } finally {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('quote state cannot swallow a later comment: apostrophes, backticks and regex literals', () => {
+  const roots: string[] = [];
+  try {
+    const cases: Array<[string, string]> = [
+      // An apostrophe inside a double-quoted string must not open a single-quoted string.
+      ['same-line-dq-apostrophe-then-comment', lines(SQL, `const note = "it's"; // ${UNAVAILABLE}`, DENIED)],
+      ['earlier-line-dq-apostrophe-then-comment', lines(SQL, `const note = "operator's note";`, `// ${UNAVAILABLE}`, DENIED)],
+      // A backtick inside a double-quoted string must not open a template literal.
+      ['dq-odd-backtick-then-comment', lines(SQL, 'const label = "use ` only";', `// ${UNAVAILABLE}`, DENIED)],
+      // A quote inside a regex literal must not open a string: same line and earlier line.
+      ['same-line-regex-quote-then-line-comment', lines(SQL, `const quoteRe = /'/; // ${UNAVAILABLE}`, DENIED)],
+      ['regex-quote-then-comment', lines(SQL, `const quoteRe = /'/;`, `// ${UNAVAILABLE}`, DENIED)],
+      // Block comments after a string carrying a quote are still comments.
+      ['earlier-line-dq-apostrophe-then-block-comment', lines(SQL, `const note = "operator's note";`, `/* ${UNAVAILABLE} */`, DENIED)],
+      ['same-line-dq-apostrophe-then-block-comment', lines(SQL, `const note = "it's"; /* ${UNAVAILABLE} */`, DENIED)],
+      ['same-line-regex-quote-then-block-comment', lines(SQL, `const quoteRe = /'/; /* ${UNAVAILABLE} */`, DENIED)],
+    ];
+    for (const [name, core] of cases) {
+      const root = release({ 'src/core.ts': core });
+      roots.push(root);
+      const result = probe(root);
+      expect(result.code, `${name}: ${result.output}`).not.toBe(0);
+    }
+  } finally {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a core file holding only comments is refused, even after a line with an apostrophe', () => {
+  const roots: string[] = [];
+  try {
+    const plain = release({ 'src/core.ts': lines(`// ${SQL}`, `// ${UNAVAILABLE}`, `// ${DENIED}`) });
+    const afterQuote = release({ 'src/core.ts': lines(`const note = "it's"; // ${SQL}`, `// ${UNAVAILABLE}`, `// ${DENIED}`) });
+    roots.push(plain, afterQuote);
+    for (const root of roots) expectRefused(root);
+  } finally {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('real markers inside strings and a same-line double-quoted URL are still accepted', () => {
+  const roots: string[] = [];
+  try {
+    // A double-quoted URL contains "//"; a real single-quoted marker follows on the same line.
+    const urlSameLine = release({
+      'src/core.ts': lines(`const url = "http://example.test"; const label = '${UNAVAILABLE}';`, SQL, DENIED),
+    });
+    // A marker inside a double-quoted string is real code too.
+    const markerInDq = release({
+      'src/core.ts': lines(SQL, `const msg = "${UNAVAILABLE}";`, DENIED),
+    });
+    // A regex literal with a quote on its own line, then a real code marker.
+    const regexThenMarker = release({
+      'src/core.ts': lines(SQL, `const quoteRe = /'/;`, `const label = "${UNAVAILABLE}";`, DENIED),
+    });
+    // A multi-line block comment with an apostrophe, then a real code marker.
+    const multiBlockThenMarker = release({
+      'src/core.ts': lines(SQL, '/*', "it's a note", '*/', `const label = "${UNAVAILABLE}";`, DENIED),
+    });
+    roots.push(urlSameLine, markerInDq, regexThenMarker, multiBlockThenMarker);
+    for (const root of roots) expect(probe(root).code, root).toBe(0);
+  } finally {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('both switch entry points ask the standby guard before their first side effect', () => {
+  const source = readFileSync(GUARD, 'utf8');
+  // The decision cannot depend on live state: the guard reads files, never a database.
+  expect(source).not.toMatch(/surrealdb|surreal |psql|sqlite|SELECT /i);
+  expect(source).toContain('no authorised read seam');
+  // Install: after the earlier content guards, before the bin copies and the active symlink.
+  const service = readFileSync(join(ROOT, 'scripts/company-service.sh'), 'utf8');
+  const install = service.indexOf('standby_relay_target_supported "$release"');
+  expect(install).toBeGreaterThan(service.indexOf('goal_workspace_target_supported "$release"'));
+  expect(install).toBeLessThan(service.indexOf('mkdir -p "$service_home/bin"'));
+  expect(install).toBeLessThan(service.indexOf('ln -s "$release" "$service_home/active.next"'));
+  // Remote deploy: after the earlier guards and before any ssh/scp step reaches the host.
+  const deploy = readFileSync(join(ROOT, 'scripts/deploy-mcp-remote.sh'), 'utf8');
+  const remote = deploy.indexOf('standby_relay_target_supported "$staging/probe" core');
+  expect(remote).toBeGreaterThan(deploy.indexOf('goal_workspace_target_supported "$staging/probe" core'));
+  expect(remote).toBeLessThan(deploy.indexOf('ssh $ssh_opts'));
 });
