@@ -1,3 +1,5 @@
+import { MagpieUsageSurface } from "./usage";
+import { SessionHistorySurface } from "./session-history";
 import {ModelRoutingPanel} from "./model-routing";
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
@@ -46,7 +48,7 @@ function makeStyles({ theme, compact }: Ctx) {
     chipActive: { backgroundColor: p.accentSoft, borderColor: c.accent },
     chipText: { color: c.foregroundMuted, fontSize: 12, fontWeight: "600" as const },
     chipTextActive: { color: c.accent },
-    tab: { flex: 1, minHeight: 31, borderRadius: 7, alignItems: "center" as const, justifyContent: "center" as const, paddingHorizontal: 8 },
+    tab: { flexGrow: 0, flexShrink: 0, minHeight: 31, borderRadius: 7, alignItems: "center" as const, justifyContent: "center" as const, paddingHorizontal: 8 },
     tabActive: { backgroundColor: c.surface1 },
     tabText: { color: c.foregroundMuted, fontSize: 12, fontWeight: "600" as const },
     tabTextActive: { color: c.foreground, fontWeight: "700" as const },
@@ -1378,12 +1380,14 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
 }
 
 
-export function CompanySurface(props: PluginSurfaceProps) {
+type CompanyTab = "pulse" | "inbox" | "new" | "goals" | "roster" | "models" | "usage" | "history";
+
+export function CompanySurface(props: PluginSurfaceProps & { initialTab?: CompanyTab }) {
   const ctx: Ctx = { theme: props.theme, compact: props.layout.compact, navigation: props.navigation };
   const s = makeStyles(ctx);
   const briefRpc = useRpc(rpc.brief);
   const brief = useQuery({ queryKey: ["brief"], queryFn: () => briefRpc({}), refetchInterval: 15_000 });
-  const [tab, setTab] = useState<"pulse" | "inbox" | "new" | "goals" | "roster" | "models">("pulse");
+  const [tab, setTab] = useState<CompanyTab>(props.initialTab ?? "pulse");
   const tabs = [
     { id: "pulse" as const, title: "动态" },
     { id: "inbox" as const, title: "收件箱" },
@@ -1391,28 +1395,32 @@ export function CompanySurface(props: PluginSurfaceProps) {
     { id: "goals" as const, title: "目标进展" },
     { id: "roster" as const, title: "编制" },
     { id: "models" as const, title: "模型排序" },
+    { id: "usage" as const, title: "Magpie 用量" },
+    { id: "history" as const, title: "只读审阅" },
   ];
   return (
     <View style={s.screen}>
-      <ScrollView contentContainerStyle={s.scroll}>
-        <View style={{ gap: 4, marginBottom: 2 }}>
-          <Text style={s.kicker}>COMPANY OPERATIONS</Text>
-          <Text style={s.h1}>运营工作台</Text>
-        </View>
-        <View style={{ flexDirection: "row", backgroundColor: relayPalette(ctx.theme).inputBg, borderRadius: 10, padding: 3, gap: 2 }}>
+      <View style={{ paddingHorizontal: ctx.compact ? 14 : 20, paddingTop: ctx.compact ? 10 : 16, paddingBottom: 10, gap: 8 }}>
+        {!ctx.compact && <Text style={s.kicker}>COMPANY OPERATIONS</Text>}
+        <Text style={s.h1}>运营工作台</Text>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ flexGrow: 0 }} contentContainerStyle={{ gap: 4, padding: 3, backgroundColor: relayPalette(ctx.theme).inputBg, borderRadius: 10 }}>
           {tabs.map(t => (
-            <Pressable key={t.id} style={[s.tab, tab === t.id && s.tabActive]} onPress={() => setTab(t.id)}>
-              <Text style={[s.tabText, tab === t.id && s.tabTextActive]}>{t.title}</Text>
+            <Pressable key={t.id} accessibilityRole="tab" accessibilityLabel={t.title} accessibilityState={{ selected: tab === t.id }} style={[s.tab, { minHeight: 40, paddingHorizontal: 12 }, tab === t.id && s.tabActive]} onPress={() => setTab(t.id)}>
+              <Text numberOfLines={1} style={[s.tabText, tab === t.id && s.tabTextActive]}>{t.title}</Text>
             </Pressable>
           ))}
-        </View>
-        {tab === "pulse" && <PulseTab ctx={ctx} />}
-        {tab === "inbox" && <InboxTab ctx={ctx} />}
-        {tab === "new" && <NewGoalTab ctx={ctx} brief={brief.data} />}
-        {tab === "goals" && <GoalsTab ctx={ctx} brief={brief.data} />}
-        {tab === "roster" && <RosterTab ctx={ctx} brief={brief.data} />}
-        {tab === "models" && <ModelRoutingPanel ctx={ctx}/>}
-      </ScrollView>
+        </ScrollView>
+      </View>
+      {tab === "usage" ? <MagpieUsageSurface {...props} /> : tab === "history" ? <SessionHistorySurface {...props} /> : (
+        <ScrollView style={{ flex: 1 }} contentContainerStyle={s.scroll}>
+          {tab === "pulse" && <PulseTab ctx={ctx} />}
+          {tab === "inbox" && <InboxTab ctx={ctx} />}
+          {tab === "new" && <NewGoalTab ctx={ctx} brief={brief.data} />}
+          {tab === "goals" && <GoalsTab ctx={ctx} brief={brief.data} />}
+          {tab === "roster" && <RosterTab ctx={ctx} brief={brief.data} />}
+          {tab === "models" && <ModelRoutingPanel ctx={ctx}/>}
+        </ScrollView>
+      )}
     </View>
   );
 }

@@ -19,7 +19,7 @@ const VALID_FILES: Record<string, string> = {
   'src/contracts.ts': 'export interface TaskView {\n  standbyUntil?: string;\n}\n',
   'src/dispatcher/dispatcher.ts': [
     'export const STANDBY_WAKE_RETRY_SECONDS = 60;',
-    "const STANDBY_TIMEOUT = 'standby timeout';",
+    'const STANDBY_TIMEOUT = "standby timeout";',
   ].join('\n') + '\n',
   'src/workforce.ts': [
     'export interface CompanyConfig {',
@@ -100,7 +100,7 @@ const COMMENT_MARKERS = [
   { path: 'src/workforce.ts', line: 'row.standby_budget_seconds', replacement: 'row.resume_budget_seconds', marker: 'standby_budget_seconds' },
   { path: 'src/workforce.ts', line: "action: 'standby_timeout',", replacement: "action: 'ordinary_reclaim',", marker: 'standby_timeout' },
   { path: 'src/dispatcher/dispatcher.ts', line: 'export const STANDBY_WAKE_RETRY_SECONDS = 60;', replacement: 'export const WAKE_RETRY_SECONDS = 60;', marker: 'STANDBY_WAKE_RETRY_SECONDS' },
-  { path: 'src/dispatcher/dispatcher.ts', line: "const STANDBY_TIMEOUT = 'standby timeout';", replacement: "const STANDBY_TIMEOUT = 'ordinary timeout';", marker: 'standby timeout' },
+  { path: 'src/dispatcher/dispatcher.ts', line: 'const STANDBY_TIMEOUT = "standby timeout";', replacement: 'const STANDBY_TIMEOUT = "ordinary timeout";', marker: 'standby timeout' },
 ];
 
 const COMMENT_FORMS = [
