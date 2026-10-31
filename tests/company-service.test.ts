@@ -72,14 +72,18 @@ const POLICY_SHARED = {
 // FV06 P0/P1: the standby relay contract the switch guard requires (capability marker, the resume
 // write in core, the view field, the supervision branch, the config field) — in src and in the
 // plugin vendor alike; a fixture target without it is the incompatible case the guard refuses.
+// The workforce markers mirror the real declarations (CompanyConfig.standbyBudgetSeconds,
+// DEFAULT_CONFIG's entry and the company_meta row key): a fixture shaped differently from the
+// real tree lets the guard pass while the real tree is refused, which is exactly the gap the
+// real-tree smoke test below closes.
 const STANDBY_FILES = {
-  'src/standby-relay-capability.ts': "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/1';\n",
+  'src/standby-relay-capability.ts': "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/1';\nexport const STANDBY_BUDGET_SECONDS_DEFAULT = 600;\n",
   'src/dispatcher/dispatcher.ts': "export const STANDBY_WAKE_RETRY_SECONDS = 60;\n// standby timeout: return to the gm gate\n",
 };
 const STANDBY_APPENDS: Array<[string, string]> = [
   ['src/core.ts', "standby_until = IF $assigned THEN math::min([$standby_not_after, $now + $standby_budget]) ELSE NONE END\nstandby employee unavailable\nstandby denied: unmet dependencies remain\n"],
   ['src/contracts.ts', 'export interface StandbyView {\n  standbyUntil?: string;\n}\n'],
-  ['src/workforce.ts', "standby_budget_seconds: 600,\naction: 'standby_timeout',\n"],
+  ['src/workforce.ts', "export interface StandbyConfig {\n  standbyBudgetSeconds: number;\n}\nstandbyBudgetSeconds: STANDBY_BUDGET_SECONDS_DEFAULT,\nrow.standby_budget_seconds\naction: 'standby_timeout',\n"],
 ];
 
 function makeRelease(releases: string, sha: string, withGit = false, capable = true, policy = capable) {
@@ -220,6 +224,39 @@ function runInstall(f: Fixture, extraEnv: Record<string, string> = {}, target = 
 function cleanup(f: Fixture) {
   rmSync(f.root, { recursive: true, force: true });
 }
+
+/**
+ * The switch guards against the real checkout, not a fixture: a guard probes declarations, so a fixture shaped
+ * differently from the tree it protects can pass while the real tree is refused — and a release that cannot pass a
+ * guard cannot be installed, which blocks the deploy leg of the very version that introduced the capability.
+ * This runs the shipped guards on the repository root and on the plugin vendor tree.
+ */
+const SWITCH_GUARDS: Array<[string, string]> = [
+  ['review-wait-guard.sh', 'review_wait_target_supported'],
+  ['independence-guard.sh', 'independence_target_supported'],
+  ['policy-guard.sh', 'policy_target_supported'],
+  ['goal-workspace-guard.sh', 'goal_workspace_target_supported'],
+  ['standby-relay-guard.sh', 'standby_relay_target_supported'],
+];
+
+function runSwitchGuard(script: string, entry: string, root: string) {
+  return Bun.spawnSync(['sh', '-c', `. "${join(ROOT, 'scripts', script)}"; ${entry} "${root}" full`], {
+    env: { PATH: '/usr/bin:/bin' },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+}
+
+test('every switch guard accepts the real checkout and its plugin vendor tree', () => {
+  // The tree that ships this version must be installable by its own guards; the vendor face runs the same core.
+  for (const [script, entry] of SWITCH_GUARDS) {
+    for (const root of [ROOT, join(ROOT, 'plugin', 'server', 'vendor')]) {
+      const result = runSwitchGuard(script, entry, root);
+      expect(`${script} ${root}: ${result.stderr.toString().trim()}`).toBe(`${script} ${root}: `);
+      expect(result.exitCode).toBe(0);
+    }
+  }
+});
 
 function activeTarget(f: Fixture) {
   return readlinkSync(join(f.serviceHome, 'active'));

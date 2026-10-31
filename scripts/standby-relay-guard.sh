@@ -33,9 +33,15 @@ standby_relay_probe_root() {
   grep -qF 'standby_until = IF $assigned THEN math::min([$standby_not_after, $now + $standby_budget]) ELSE NONE END' "$core" 2>/dev/null || return 1
   grep -qF 'standby employee unavailable' "$core" 2>/dev/null || return 1
   grep -qF 'standby denied: unmet dependencies remain' "$core" 2>/dev/null || return 1
-  # The view surfaces the deadline; the config carries the budget.
+  # The view surfaces the deadline; the config carries the budget. The budget lives in the config
+  # interface (CompanyConfig.standbyBudgetSeconds), its default (DEFAULT_CONFIG), and the company_meta
+  # config row key it is read from (standby_budget_seconds). Probe the declarations the tree really
+  # has: a comment-only or fixture-shaped tree cannot pass, and a tree that dropped the budget
+  # declaration while keeping the row key cannot pass either.
   grep -Eq '^[[:space:]]*standbyUntil\?:' "$contracts" 2>/dev/null || return 1
-  grep -Eq '^[[:space:]]*standby_budget_seconds' "$workforce" 2>/dev/null || return 1
+  grep -Eq '^[[:space:]]*standbyBudgetSeconds:[[:space:]]*number;' "$workforce" 2>/dev/null || return 1
+  grep -Eq '^[[:space:]]*standbyBudgetSeconds:[[:space:]]*STANDBY_BUDGET_SECONDS_DEFAULT' "$workforce" 2>/dev/null || return 1
+  grep -qF 'standby_budget_seconds' "$workforce" 2>/dev/null || return 1
   # The supervision branch wakes standby holders, waives the stall/expire reclaim before the deadline
   # and returns the timeout to the gm gate (standby_timeout), never the ready pool.
   grep -qF 'standby timeout' "$dispatcher" 2>/dev/null || return 1
