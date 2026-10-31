@@ -487,3 +487,57 @@ test('export-default-async, statement blocks, case labels, in-operator and type 
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
 });
+
+// R12 (attempt-10 return): adjacent syntax variants of class/interface bodies, function
+// bodies and ASI, case ternaries, for-await, and type/annotation line endings. Keep these as
+// families because one-token patches leave nearby legal TypeScript fail-open.
+test('class/function/type syntax variants cannot smuggle comment markers', () => {
+  const roots: string[] = [];
+  try {
+    const refused: Array<[string, string]> = [
+      ['e01-export-default-class-anon', lines(SQL, 'export default class {}', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['e02-export-default-abstract-class', lines(SQL, 'export default abstract class {}', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['e03-export-default-class-generic', lines(SQL, 'export default class<T> {}', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['s01-return-asi-block', lines(SQL, 'function f() { return', '{ y(); }', `/'/.test(s); } // ${UNAVAILABLE}`, DENIED)],
+      ['s02-yield-asi-block', lines(SQL, 'function* g() { yield', '{ y(); }', `/'/.test(s); } // ${UNAVAILABLE}`, DENIED)],
+      ['s03-void-return-type-body', lines(SQL, 'function f(): void { x(); }', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['s04-promise-void-return-body', lines(SQL, 'async function f(): Promise<void> { x(); }', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['s05-class-extends-generic-body', lines(SQL, 'class A extends B<C> {}', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['s06-class-generic-decl-body', lines(SQL, 'class A<T> {}', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['s07-interface-generic-body', lines(SQL, 'interface I<T> { a: T }', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['s08-class-implements-generic-body', lines(SQL, 'class A implements B<C> {}', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['c07-case-ternary-label', lines(SQL, 'switch (a) { case b ? 1 : 2: { x(); }', `/'/.test(s); } // ${UNAVAILABLE}`, DENIED)],
+      ['o01-for-await-of-regex', lines(SQL, `async function f() { for await (const x of /'/.x) {} } // ${UNAVAILABLE}`, DENIED)],
+      ['t02-type-alias-ident-then-regex', lines(SQL, 'type T = string', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['t03-type-alias-qualified-then-regex', lines(SQL, 'type T = A.B', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['t04-type-alias-tuple-then-regex', lines(SQL, 'type T = [a, b]', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['t06-declare-const-annotation-then-regex', lines(SQL, 'declare const x: string', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['t07-let-annotation-then-regex', lines(SQL, 'let x: string', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['t08-let-typeof-annotation-then-regex', lines(SQL, 'let x: typeof y', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+    ];
+    for (const [name, core] of refused) {
+      const root = release({ 'src/core.ts': core });
+      roots.push(root);
+      const result = probe(root);
+      expect(result.code, `${name}: ${result.output}`).not.toBe(0);
+    }
+    const accepted: Array<[string, string]> = [
+      ['y01-return-asi-block-code', lines(SQL, 'function f() { return', '{ y(); }', `/'/.test(s); } const t = '${UNAVAILABLE}';`, DENIED)],
+      ['y02-void-return-body-code', lines(SQL, 'function f(): void { x(); }', `/'/.test(s); const t = '${UNAVAILABLE}';`, DENIED)],
+      ['y03-class-extends-generic-code', lines(SQL, 'class A extends B<C> {}', `/'/.test(s); const t = '${UNAVAILABLE}';`, DENIED)],
+      ['y04-type-alias-string-code', lines(SQL, 'type T = string', `/'/.test(s); const t = '${UNAVAILABLE}';`, DENIED)],
+      ['y05-export-default-class-code', lines(SQL, 'export default class {}', `/'/.test(s); const t = '${UNAVAILABLE}';`, DENIED)],
+      ['y06-for-await-of-code', lines(SQL, `async function f() { for await (const x of /'/.x) {} } const t = '${UNAVAILABLE}';`, DENIED)],
+      ['y07-case-ternary-code', lines(SQL, 'switch (a) { case b ? 1 : 2: { x(); }', `/'/.test(s); const t = '${UNAVAILABLE}'; }`, DENIED)],
+      ['y08-let-annotation-code', lines(SQL, 'let x: string', `/'/.test(s); const t = '${UNAVAILABLE}';`, DENIED)],
+    ];
+    for (const [name, core] of accepted) {
+      const root = release({ 'src/core.ts': core });
+      roots.push(root);
+      const result = probe(root);
+      expect(result.code, `${name}: ${result.output}`).toBe(0);
+    }
+  } finally {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  }
+});
