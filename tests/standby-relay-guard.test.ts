@@ -386,3 +386,52 @@ test('template escapes, class/function expressions and of-as-ident cannot smuggl
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
 });
+
+// R10 (attempt-8 return): the reviewer adversarial probe's fail-open rows. A for-of/in head,
+// an else/do/try body, a labelled statement, export default and an async function expression
+// must keep the following slash in its correct role; otherwise a quote inside the regex body
+// opens a string state and a comment-only marker is read as code. Controls put the same marker
+// in real code and must stay accepted.
+test('for-heads, block bodies, labels, export default and async functions cannot smuggle markers', () => {
+  const BT = '`';
+  const BS = '\\';
+  const D = '$';
+  const roots: string[] = [];
+  try {
+    const refused: Array<[string, string]> = [
+      ['forof-regex-quote-comment', lines(SQL, `for (const x of /'/) {} // ${UNAVAILABLE}`, DENIED)],
+      ['forof-regex-backtick-comment', lines(SQL, `for (const x of /${BT}/) {} // ${UNAVAILABLE}`, `// ${BT}`, DENIED)],
+      ['forin-regex-quote-comment', lines(SQL, `for (const k in /'/) {} // ${UNAVAILABLE}`, DENIED)],
+      ['else-block-regex-quote-comment', lines(SQL, 'if (a) { b(); } else { c(); }', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['label-block-regex-quote-comment', lines(SQL, 'foo: { x(); }', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['export-default-function-regex-quote-comment', lines(SQL, 'export default function () {}', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['async-function-expr-div-quote-comment', lines(SQL, `const f = async function () {} / '/'.length; // ${UNAVAILABLE}`, DENIED)],
+      ['try-catch-regex-quote-comment', lines(SQL, 'try { x(); } catch (e) { y(); }', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['try-finally-regex-quote-comment', lines(SQL, 'try { x(); } finally { y(); }', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['do-while-regex-quote-comment', lines(SQL, 'do { x(); } while (y)', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+    ];
+    for (const [name, core] of refused) {
+      const root = release({ 'src/core.ts': core });
+      roots.push(root);
+      const result = probe(root);
+      expect(result.code, `${name}: ${result.output}`).not.toBe(0);
+    }
+    const accepted: Array<[string, string]> = [
+      ['forof-regex-quote-code-marker', lines(SQL, `for (const x of /'/) {} const t = '${UNAVAILABLE}';`, DENIED)],
+      ['else-regex-quote-code-marker', lines(SQL, 'if (a) { b(); } else { c(); }', `/'/.test(s); const t = '${UNAVAILABLE}';`, DENIED)],
+      ['label-regex-quote-code-marker', lines(SQL, 'foo: { x(); }', `/'/.test(s); const t = '${UNAVAILABLE}';`, DENIED)],
+      ['stmt-class-regex-quote-code-marker', lines(SQL, 'class A {}', `/'/.test(s); const t = '${UNAVAILABLE}';`, DENIED)],
+      ['expr-class-div-code-marker', lines(SQL, `const r = class {} / 2; const t = '${UNAVAILABLE}';`, DENIED)],
+      ['tpl-escaped-dollar-code-marker', lines(SQL, 'const s = ' + BT + 'a' + BS + D + '{b}' + BT + "; const t = '" + UNAVAILABLE + "';", DENIED)],
+      ['tpl-nested-escape-code-marker', lines(SQL, 'const h = ' + BT + D + '{' + BT + 'x' + BS + BT + 'y' + BT + '}z' + BT + "; const t = '" + UNAVAILABLE + "';", DENIED)],
+    ];
+    for (const [name, core] of accepted) {
+      const root = release({ 'src/core.ts': core });
+      roots.push(root);
+      const result = probe(root);
+      expect(result.code, `${name}: ${result.output}`).toBe(0);
+    }
+  } finally {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -26,13 +26,15 @@ STANDBY_RELAY_PROTOCOL_EXPECTED='standby-relay/1'
 #   start/operator/open, after expression-prefix keywords (return/typeof/default/...), after =>,
 #   and after ) that closed an if/while/for/with/switch head. After an identifier, number,
 #   string/template/regex end, ), or ], a slash is division. Member names after . are never
-#   keywords (stats.in / x is division). in/of are never bare keywords (of / 2 is division;
-#   for-of regex after of is not recognised — fail-closed toward division). Postfix !
-#   (TS non-null) keeps an expression end; != / !== stay operators. class/function bodies are
-#   expression-braced when the keyword appears in expression position so (class {} / 2) and
-#   (function () {} / 2) are division; statement declarations keep } as a statement boundary
-#   (regex ok). Other ambiguous } stay statement-boundary / fail-closed. Non-ASCII UTF-8
-#   identifier bytes are treated as ident so non-ASCII / 2 is division;
+#   keywords (stats.in / x is division). in/of are keywords only inside a for head
+#   (for (x of /re/)); as bare identifiers they stay ident (of / 2 is division). Postfix !
+#   (TS non-null) keeps an expression end; != / !== stay operators. else/do/try/finally bodies
+#   and labelled statements (foo: {...}) are statement blocks, so a following / may be a regex.
+#   class/function bodies are expression-braced when the keyword appears in expression
+#   position (including async function), so (class {} / 2) and (function () {} / 2) are
+#   division; statements and export default keep } as a statement boundary (regex ok).
+#   Other ambiguous } stay statement-boundary / fail-closed. Non-ASCII UTF-8 identifier bytes
+#   are treated as ident so non-ASCII / 2 is division;
 # - text inside any quote is preserved (SQL/template markers are real code); template text
 #   honours backslash escapes (so a backslash-backtick does not close and a backslash-${ does
 #   not open a substitution), matching the string-literal escape rule. Comment text is
@@ -64,6 +66,12 @@ standby_relay_has_code() {
       after_dot = 0
       stmt_boundary = 1
       pending_fn_expr = 0
+      pending_async = 0
+      async_before = ""
+      async_before_kw = ""
+      async_stmt = 0
+      label_colon = 0
+      saw_question = 0
       tpl_depth = 0
       in_tpl_text = 0
       brace_depth = 0
@@ -73,31 +81,56 @@ standby_relay_has_code() {
     function is_digit(c) { return index(digits, c) > 0 }
     function is_id_cont(c) { return index(id_cont, c) > 0 || c > del }
     function is_flag(c) { return index(flags, c) > 0 }
-    function flush_word(   w, before) {
+    function in_for_head() {
+      return (length(paren_stack) > 0 && substr(paren_stack, length(paren_stack), 1) == "f")
+    }
+    function flush_word(   w, before, before_kw, before_stmt) {
       w = word; word = ""
       if (w == "") return
-      before = prev_kind
+      before = prev_kind; before_kw = last_kw; before_stmt = stmt_boundary
       if (after_dot) {
-        prev_kind = "ident"; last_kw = ""; after_dot = 0; stmt_boundary = 0
+        prev_kind = "ident"; last_kw = ""; after_dot = 0; stmt_boundary = 0; pending_async = 0
         return
       }
-      # in/of are contextual (for-in/of); as bare identifiers they must stay ident so
-      # "const of = 4; of / 2" is division. for-of regex after of is not recognised (fail-closed).
-      if (w == "return" || w == "typeof" || w == "instanceof" || w == "new" || w == "delete" || w == "void" || w == "throw" || w == "case" || w == "do" || w == "else" || w == "yield" || w == "await" || w == "default") {
-        prev_kind = "kw"; last_kw = w; pending_fn_expr = 0
+      # in/of are contextual: in/of after an operand is the for-in/of operator; a bare of
+      # ("const of = 4; of / 2") stays ident so the slash is division. In a for head the of
+      # opens an expression, so a regex after it is recognised.
+      if ((w == "in" || w == "of") && in_for_head()) {
+        # for (const x of /re/) and for (k in obj): the contextual operator opens an expression.
+        prev_kind = "kw"; last_kw = w; pending_fn_expr = 0; pending_async = 0
+      } else if (w == "return" || w == "typeof" || w == "instanceof" || w == "new" || w == "delete" || w == "void" || w == "throw" || w == "case" || w == "do" || w == "else" || w == "yield" || w == "await" || w == "default") {
+        prev_kind = "kw"; last_kw = w; pending_fn_expr = 0; pending_async = 0
+      } else if (w == "async") {
+        # Remember where async appeared: async function in expression position is an expression.
+        async_before = before; async_before_kw = before_kw; async_stmt = before_stmt
+        pending_async = 1; pending_fn_expr = 0
+        prev_kind = "ident"; last_kw = ""
       } else if (w == "function" || w == "class") {
         # Expression position (after = / : / , / ( / => / keyword) → body } ends a primary.
-        # Statement boundary → declaration; body } is a statement boundary (regex ok).
-        if (stmt_boundary == 0 && (before == "op" || before == "kw" || before == "arrow" || before == "ifparen")) pending_fn_expr = 1
-        else pending_fn_expr = 0
+        # Statement boundary, or after export default, → declaration; body } is a statement
+        # boundary (regex ok). async function takes the position where async appeared.
+        if (pending_async) {
+          if (async_stmt == 0 && (async_before == "op" || async_before == "kw" || async_before == "arrow" || async_before == "ifparen")) pending_fn_expr = 1
+          else pending_fn_expr = 0
+          pending_async = 0
+        } else if (before_kw == "default") {
+          pending_fn_expr = 0
+        } else if (before_stmt == 0 && (before == "op" || before == "kw" || before == "arrow" || before == "ifparen")) {
+          pending_fn_expr = 1
+        } else {
+          pending_fn_expr = 0
+        }
         prev_kind = "kw"; last_kw = w
+      } else if (w == "try" || w == "finally" || w == "catch") {
+        # Block keywords: their { ... } body is a statement block, never an object literal.
+        prev_kind = "kw"; last_kw = w; pending_fn_expr = 0; pending_async = 0
       } else if (w == "if" || w == "while" || w == "for" || w == "with" || w == "switch") {
-        prev_kind = "ident"; last_kw = w; pending_fn_expr = 0
+        prev_kind = "ident"; last_kw = w; pending_fn_expr = 0; pending_async = 0
       } else if (is_digit(substr(w, 1, 1))) {
-        prev_kind = "num"; last_kw = ""; pending_fn_expr = 0
+        prev_kind = "num"; last_kw = ""; pending_fn_expr = 0; pending_async = 0
       } else {
         # Keep pending_fn_expr across the optional name (class Foo / function foo).
-        prev_kind = "ident"; last_kw = ""
+        prev_kind = "ident"; last_kw = ""; pending_async = 0
       }
       stmt_boundary = 0
     }
@@ -276,12 +309,14 @@ standby_relay_has_code() {
         }
         if (char == "(") {
           flush_word()
-          if (last_kw == "if" || last_kw == "while" || last_kw == "for" || last_kw == "with" || last_kw == "switch") paren_stack = paren_stack "i"
+          if (last_kw == "for") paren_stack = paren_stack "f"
+          else if (last_kw == "if" || last_kw == "while" || last_kw == "with" || last_kw == "switch") paren_stack = paren_stack "i"
           else paren_stack = paren_stack "n"
           code = code char
           prev_kind = "op"
           last_kw = ""
           after_dot = 0
+          label_colon = 0
           continue
         }
         if (char == ")") {
@@ -292,10 +327,33 @@ standby_relay_has_code() {
             paren_stack = substr(paren_stack, 1, length(paren_stack) - 1)
           }
           code = code char
-          if (head == "i") prev_kind = "ifparen"
+          if (head == "i" || head == "f") prev_kind = "ifparen"
           else prev_kind = "tend"
           last_kw = ""
           after_dot = 0
+          continue
+        }
+        if (char == "?") {
+          flush_word()
+          code = code "?"
+          saw_question = 1
+          prev_kind = "op"
+          last_kw = ""
+          after_dot = 0
+          stmt_boundary = 0
+          continue
+        }
+        if (char == ":") {
+          flush_word()
+          code = code ":"
+          # A label (foo: { ... }) takes a statement body; object properties and ternaries do not.
+          if (saw_question) { saw_question = 0; label_colon = 0 }
+          else if (prev_kind == "ident" && (length(brace_stack) == 0 || substr(brace_stack, length(brace_stack), 1) != "e")) label_colon = 1
+          else label_colon = 0
+          prev_kind = "op"
+          last_kw = ""
+          after_dot = 0
+          stmt_boundary = 0
           continue
         }
         if (char == "]") {
@@ -348,6 +406,9 @@ standby_relay_has_code() {
           } else if (prev_kind == "arrow") {
             # () => {} is a block body; () => ({}) uses a paren so prev is op.
             brace_stack = brace_stack "s"
+          } else if (last_kw == "else" || last_kw == "do" || last_kw == "try" || last_kw == "finally" || label_colon) {
+            # else/do/try/finally bodies and labelled statements are statement blocks.
+            brace_stack = brace_stack "s"
           } else if (prev_kind == "op" || prev_kind == "kw") {
             brace_stack = brace_stack "e"
           } else {
@@ -356,6 +417,7 @@ standby_relay_has_code() {
           prev_kind = "op"
           last_kw = ""
           after_dot = 0
+          label_colon = 0
           stmt_boundary = 0
           continue
         }
@@ -367,9 +429,10 @@ standby_relay_has_code() {
           after_dot = 0
           stmt_boundary = 1
           pending_fn_expr = 0
+          label_colon = 0
           continue
         }
-        if (char == "[" || char == "," || char == ":" || char == "?" || char == "~" || char == "^" || char == "%" || char == "*" || char == "+" || char == "-" || char == "<" || char == ">" || char == "|" || char == "&" || char == "=") {
+        if (char == "[" || char == "," || char == "~" || char == "^" || char == "%" || char == "*" || char == "+" || char == "-" || char == "<" || char == ">" || char == "|" || char == "&" || char == "=") {
           flush_word()
           if ((char == "+" || char == "-" || char == "|" || char == "&" || char == "=" || char == "<" || char == ">") && next_char == char) {
             code = code char next_char
