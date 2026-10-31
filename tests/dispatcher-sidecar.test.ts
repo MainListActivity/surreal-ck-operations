@@ -1053,3 +1053,14 @@ test('idle retirement waits for two hours of actual observations, then archives 
   expect(w.events).toContain('archive:agent-9');
   expect(w.events).not.toContain('performance-failure');
 });
+
+test('memory-only admission never reclaims disk or emits disk recovery instructions; snapshot survives restart',async()=>{
+ const w=world();w.addTask('memory-only');w.setHost({freeMemMb:249,freeDiskMb:45000,memoryPressure:2});let reclaimed=0;
+ w.setReclaim(async()=>{reclaimed++;return {runId:'unused',trigger:'pressure',dryRun:false,mode:'pressure',trimmed:[],skipped:{},removedFiles:0,freedBytes:0,truncated:false,errors:0,disabled:true,disabledReason:'config'};});
+ for(let i=0;i<2;i++){const d=w.dispatcher();expect((await d.tick()).skipped).toBe('resources');const v=d.dispatchVerdicts().find(v=>v.taskId==='memory-only')!;expect(v.reasons.map(r=>r.code)).toEqual(['memory_pressure']);expect(v.reasons[0]!.recovery).not.toContain('清理宿主机磁盘');expect(v.reasons[0]!.text).toContain('内存');}
+ expect(reclaimed).toBe(0);expect(w.notices.has('resources-reclaim-blocked')).toBe(false);
+ w.setHost({freeMemMb:249,freeDiskMb:45000,memoryPressure:1});const r=await w.dispatcher().tick();expect(r.skipped).toBeUndefined();expect(r.woke.length).toBeGreaterThan(0);
+});
+test('a simultaneous memory and disk block preserves both causes in the task verdict',async()=>{
+ const w=world();w.addTask('both-low');w.setHost({freeMemMb:249,freeDiskMb:128,memoryPressure:2});const d=w.dispatcher();await d.tick();expect(d.dispatchVerdicts().find(v=>v.taskId==='both-low')!.reasons.map(r=>r.code).sort()).toEqual(['disk_space','memory_pressure']);
+});
