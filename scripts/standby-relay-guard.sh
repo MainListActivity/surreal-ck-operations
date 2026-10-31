@@ -20,12 +20,15 @@ STANDBY_RELAY_PROTOCOL_EXPECTED='standby-relay/1'
 # - single- and double-quoted strings close on their quote; an odd number of unescaped trailing
 #   backslashes is an ECMAScript LineContinuation and carries the quote onto the next line
 #   (even count / no backslash ends the quote state at EOL, so a stray quote cannot swallow later
-#   comment lines). Template literals always span lines until the closing backtick;
-# - a regex literal /.../[flags] is recognised by ECMAScript lexical context, not a char class of
-#   operators: after a start/operator/open, after expression-prefix keywords (return/typeof/...),
-#   after =>, and after ) that closed an if/while/for/with/switch head. After an identifier,
-#   number, string/template/regex end, ), or ], a slash is division so a quote inside it is a
-#   real quote. Ambiguous } is treated as a statement boundary (regex ok / fail-closed);
+#   comment lines). Template literals span lines and nest through ${}: a backtick inside an
+#   expression opens an inner template; the matching } of ${} returns to template text;
+# - a regex literal /.../[flags] is recognised by ECMAScript lexical context: after a
+#   start/operator/open, after expression-prefix keywords (return/typeof/default/...), after =>,
+#   and after ) that closed an if/while/for/with/switch head. After an identifier, number,
+#   string/template/regex end, ), or ], a slash is division. Member names after . are never
+#   keywords (stats.in / x is division). Postfix ! (TS non-null) keeps an expression end;
+#   != / !== stay operators. Ambiguous } outside ${} is a statement boundary (regex ok /
+#   fail-closed). Non-ASCII UTF-8 identifier bytes are treated as ident so 总数 / 2 is division;
 # - text inside any quote is preserved (SQL/template markers are real code); comment text is
 #   discarded but lines are kept, so a multi-line /* ... */ block cannot smuggle markers and an
 #   anchored pattern still sees one code line per source line. A comment-only release cannot pass.
@@ -34,33 +37,42 @@ standby_relay_has_code() {
   file=$1
   mode=$2
   marker=$3
-  # LC_ALL=C: BSD awk's regex engine calls towc() under UTF-8 locales and aborts on the
-  # Chinese template text in dispatcher.ts; byte mode keeps the scanner ASCII-stable.
+  # LC_ALL=C: BSD awk regex calls towc() under UTF-8 locales and aborts on the Chinese
+  # template text in dispatcher.ts; byte mode keeps the scanner ASCII-stable. Apostrophes are
+  # forbidden inside this single-quoted awk program (they would end the shell string).
   LC_ALL=C awk -v mode="$mode" -v marker="$marker" '
     BEGIN {
       escape = sprintf("%c", 92); dq = sprintf("%c", 34); sq = sprintf("%c", 39); bt = sprintf("%c", 96)
-      # ASCII-only tables: BSD awk ~ /[A-Za-z]/ calls towc() and aborts on UTF-8 source
-      # (dispatcher.ts carries Chinese template text). index() stays byte-safe.
+      del = sprintf("%c", 127)
       letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
       id_start = letters "_$"
       digits = "0123456789"
       id_cont = id_start digits
       flags = "abcdefghijklmnopqrstuvwxyz"
-      # prev_kind: "" (start) | op | kw | arrow | ifparen | ident | num | tend
-      # can_regex when prev_kind is "", op, kw, arrow, or ifparen.
+      # prev_kind: "" | op | kw | arrow | ifparen | ident | num | tend
       prev_kind = ""
       word = ""
       last_kw = ""
       paren_stack = ""
+      brace_stack = ""
+      after_dot = 0
+      tpl_depth = 0
+      in_tpl_text = 0
+      brace_depth = 0
+      bstack_n = 0
     }
-    function is_id_start(c) { return index(id_start, c) > 0 }
+    function is_id_start(c) { return index(id_start, c) > 0 || c > del }
     function is_digit(c) { return index(digits, c) > 0 }
-    function is_id_cont(c) { return index(id_cont, c) > 0 }
+    function is_id_cont(c) { return index(id_cont, c) > 0 || c > del }
     function is_flag(c) { return index(flags, c) > 0 }
     function flush_word(   w) {
       w = word; word = ""
       if (w == "") return
-      if (w == "return" || w == "typeof" || w == "instanceof" || w == "in" || w == "of" || w == "new" || w == "delete" || w == "void" || w == "throw" || w == "case" || w == "do" || w == "else" || w == "yield" || w == "await") {
+      if (after_dot) {
+        prev_kind = "ident"; last_kw = ""; after_dot = 0
+        return
+      }
+      if (w == "return" || w == "typeof" || w == "instanceof" || w == "in" || w == "of" || w == "new" || w == "delete" || w == "void" || w == "throw" || w == "case" || w == "do" || w == "else" || w == "yield" || w == "await" || w == "default") {
         prev_kind = "kw"; last_kw = w
       } else if (w == "if" || w == "while" || w == "for" || w == "with" || w == "switch") {
         prev_kind = "ident"; last_kw = w
@@ -82,6 +94,36 @@ standby_relay_has_code() {
       }
       return (n % 2) == 1
     }
+    function enter_template() {
+      if (tpl_depth > 0 && in_tpl_text == 0 && brace_depth > 0) {
+        bstack[++bstack_n] = brace_depth
+        brace_depth = 0
+      }
+      tpl_depth++
+      in_tpl_text = 1
+      quote = bt
+      template = 1
+    }
+    function leave_template() {
+      tpl_depth--
+      quote = ""
+      if (tpl_depth == 0) {
+        in_tpl_text = 0
+        brace_depth = 0
+        template = 0
+      } else if (bstack_n > 0) {
+        brace_depth = bstack[bstack_n]
+        delete bstack[bstack_n]
+        bstack_n--
+        in_tpl_text = 0
+        template = 1
+      } else {
+        in_tpl_text = 1
+        quote = bt
+        template = 1
+      }
+      prev_kind = "tend"
+    }
     {
       line = $0
       code = ""
@@ -92,15 +134,45 @@ standby_relay_has_code() {
           if (char == "*" && next_char == "/") { in_block_comment = 0; i++ }
           continue
         }
+        # Template text: only ` and ${ are special; everything else (including quotes) is code text.
+        if (in_tpl_text && quote == bt) {
+          code = code char
+          if (char == "$" && next_char == "{") {
+            code = code next_char
+            i++
+            quote = ""
+            in_tpl_text = 0
+            brace_depth = 1
+            prev_kind = "op"
+            last_kw = ""
+            after_dot = 0
+            continue
+          }
+          if (char == bt) {
+            leave_template()
+            last_kw = ""
+            after_dot = 0
+            continue
+          }
+          continue
+        }
         if (quote != "") {
           code = code char
           if (char == escape && i < length(line)) { code = code next_char; i++; continue }
-          if (char == quote) { quote = ""; template = 0; prev_kind = "tend" }
+          if (char == quote) { quote = ""; template = (tpl_depth > 0) ? 1 : 0; prev_kind = "tend" }
           continue
         }
-        if (char == dq || char == sq || char == bt) {
+        if (char == bt) {
           flush_word()
-          quote = char; template = (char == bt) ? 1 : 0; code = code char; continue
+          code = code char
+          enter_template()
+          last_kw = ""
+          after_dot = 0
+          continue
+        }
+        if (char == dq || char == sq) {
+          flush_word()
+          quote = char; code = code char; after_dot = 0; continue
         }
         if (char == "/" && next_char == "/") { flush_word(); break }
         if (char == "/" && next_char == "*") { flush_word(); in_block_comment = 1; i++; continue }
@@ -123,6 +195,7 @@ standby_relay_has_code() {
               i = j - 1
               prev_kind = "tend"
               last_kw = ""
+              after_dot = 0
               continue
             }
           }
@@ -135,13 +208,13 @@ standby_relay_has_code() {
         if (is_digit(char)) {
           if (word != "") { word = word char; code = code char; continue }
           flush_word()
-          # accumulate a number-ish token into word so flush marks num
           word = char
           while (i + 1 <= length(line) && is_id_cont(substr(line, i + 1, 1))) {
             i++; word = word substr(line, i, 1)
           }
           code = code word
           flush_word()
+          after_dot = 0
           continue
         }
         if (char == "=" && next_char == ">") {
@@ -150,6 +223,29 @@ standby_relay_has_code() {
           i++
           prev_kind = "arrow"
           last_kw = ""
+          after_dot = 0
+          continue
+        }
+        if (char == "!") {
+          flush_word()
+          code = code "!"
+          if (next_char == "=") {
+            prev_kind = "op"
+          } else if (prev_kind == "ident" || prev_kind == "num" || prev_kind == "tend") {
+            prev_kind = "tend"
+          } else {
+            prev_kind = "op"
+          }
+          last_kw = ""
+          after_dot = 0
+          continue
+        }
+        if (char == ".") {
+          flush_word()
+          code = code "."
+          prev_kind = "op"
+          last_kw = ""
+          after_dot = 1
           continue
         }
         if (char == "(") {
@@ -159,6 +255,7 @@ standby_relay_has_code() {
           code = code char
           prev_kind = "op"
           last_kw = ""
+          after_dot = 0
           continue
         }
         if (char == ")") {
@@ -172,29 +269,83 @@ standby_relay_has_code() {
           if (head == "i") prev_kind = "ifparen"
           else prev_kind = "tend"
           last_kw = ""
+          after_dot = 0
           continue
         }
-        if (char == "[" || char == "{" || char == ";" || char == "," || char == ":" || char == "!" || char == "?" || char == "~" || char == "^" || char == "%" || char == "*" || char == "+" || char == "-" || char == "<" || char == ">" || char == "|" || char == "&" || char == "=") {
+        if (char == "]") {
           flush_word()
-          # ++ -- << >> etc.: consume a doubled operator as one op
+          code = code "]"
+          prev_kind = "tend"
+          last_kw = ""
+          after_dot = 0
+          continue
+        }
+        if (char == "}") {
+          flush_word()
+          code = code "}"
+          if (tpl_depth > 0 && in_tpl_text == 0 && brace_depth > 0) {
+            brace_depth--
+            if (brace_depth == 0) {
+              quote = bt
+              in_tpl_text = 1
+              template = 1
+              prev_kind = "tend"
+              last_kw = ""
+              after_dot = 0
+              continue
+            }
+            prev_kind = "tend"
+            last_kw = ""
+            after_dot = 0
+            continue
+          }
+          kind = "s"
+          if (length(brace_stack) > 0) {
+            kind = substr(brace_stack, length(brace_stack), 1)
+            brace_stack = substr(brace_stack, 1, length(brace_stack) - 1)
+          }
+          # Object-literal } ends a primary (division); block } is a statement boundary (regex ok).
+          if (kind == "e") prev_kind = "tend"
+          else prev_kind = "op"
+          last_kw = ""
+          after_dot = 0
+          continue
+        }
+        if (char == "{") {
+          flush_word()
+          code = code "{"
+          if (tpl_depth > 0 && in_tpl_text == 0 && brace_depth > 0) {
+            brace_depth++
+          } else if (prev_kind == "arrow") {
+            # () => {} is a block body; () => ({}) uses a paren so prev is op.
+            brace_stack = brace_stack "s"
+          } else if (prev_kind == "op" || prev_kind == "kw") {
+            brace_stack = brace_stack "e"
+          } else {
+            brace_stack = brace_stack "s"
+          }
+          prev_kind = "op"
+          last_kw = ""
+          after_dot = 0
+          continue
+        }
+        if (char == "[" || char == ";" || char == "," || char == ":" || char == "?" || char == "~" || char == "^" || char == "%" || char == "*" || char == "+" || char == "-" || char == "<" || char == ">" || char == "|" || char == "&" || char == "=") {
+          flush_word()
           if ((char == "+" || char == "-" || char == "|" || char == "&" || char == "=" || char == "<" || char == ">") && next_char == char) {
             code = code char next_char
             i++
-            # ++/-- end an expression; << >> | & = are operators that expect a RHS
             if (char == "+" || char == "-") prev_kind = "tend"
             else prev_kind = "op"
           } else {
             code = code char
-            # } is a statement boundary (ASI) → regex ok; ] ends a primary → division
-            if (char == "]") prev_kind = "tend"
-            else if (char == "}") prev_kind = "op"
+            if (char == "[") prev_kind = "op"
             else prev_kind = "op"
           }
           last_kw = ""
+          after_dot = 0
           continue
         }
         if (char == " " || char == "\t") {
-          # whitespace does not change prev_kind; flush word so "return /" sees kw
           flush_word()
           code = code char
           continue
@@ -203,16 +354,16 @@ standby_relay_has_code() {
         code = code char
         prev_kind = "op"
         last_kw = ""
+        after_dot = 0
       }
       flush_word()
-      # LineContinuation: an odd trailing unescaped \ keeps a single/double quote open.
-      if (quote != "" && template != 1) {
+      if (quote != "" && in_tpl_text == 0 && quote != bt) {
         if (!trailing_odd_escapes(line)) quote = ""
       }
       if ((mode == "pattern" && code ~ marker) || (mode != "pattern" && index(code, marker))) found = 1
     }
     END {
-      if (template || in_block_comment) exit 1
+      if (tpl_depth > 0 || in_block_comment) exit 1
       exit(found ? 0 : 1)
     }
   ' "$file"

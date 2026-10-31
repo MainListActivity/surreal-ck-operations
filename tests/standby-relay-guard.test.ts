@@ -296,3 +296,56 @@ test('regex after keywords, arrows and if-heads, plus LineContinuation, cannot s
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
 });
+
+// R8 (attempt-6 return): division after ], }, member names that equal keywords, TS non-null
+// assertions, export default, non-ASCII identifiers, and nested template literals must not
+// flip the lexer into a state that treats a later comment as code.
+test('division after primaries and nested templates cannot smuggle comment markers', () => {
+  const roots: string[] = [];
+  try {
+    const refused: Array<[string, string]> = [
+      ['G1-keyword-named-member-div', lines(SQL, `const r = stats.in / total; // ${UNAVAILABLE}`, DENIED)],
+      ['G2-keyword-named-member-new-div', lines(SQL, `const pct = stats.new / stats.total; // ${UNAVAILABLE}`, DENIED)],
+      ['G3-ts-non-null-then-div', lines(SQL, `const avg = total! / count; // ${UNAVAILABLE}`, DENIED)],
+      ['G4-ts-non-null-member-then-div', lines(SQL, `const avg = this.total! / this.count; // ${UNAVAILABLE}`, DENIED)],
+      ['G5-object-literal-then-div', lines(SQL, `const o = {} / 2; // ${UNAVAILABLE}`, DENIED)],
+      ['G6-default-export-regex-quote', lines(SQL, `export default /'/.test; // ${UNAVAILABLE}`, DENIED)],
+      ['K1-index-div', lines(SQL, `const r = arr[0] / 2; // ${UNAVAILABLE}`, DENIED)],
+      ['K2-paren-div', lines(SQL, `const r = (a + b) / 2; // ${UNAVAILABLE}`, DENIED)],
+      ['K3-member-div', lines(SQL, `const r = a.b / 2; // ${UNAVAILABLE}`, DENIED)],
+      ['K4-postfix-increment-div', lines(SQL, `let n = i++ / 2; // ${UNAVAILABLE}`, DENIED)],
+      ['K5-nullish-regex-quote', lines(SQL, `const v = a ?? /'/.exec(s); // ${UNAVAILABLE}`, DENIED)],
+      ['K6-and-regex-quote', lines(SQL, `const v = ok && /'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['K7-ternary-regex-quote', lines(SQL, `const v = ok ? /'/ : null; // ${UNAVAILABLE}`, DENIED)],
+      ['K8-prefix-not-regex-quote', lines(SQL, `const v = !/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['K9-if-head-not-equal-regex-quote', lines(SQL, `if (a !== b) /'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['K10-regex-statement-after-block', lines(SQL, 'function f() {}', `/'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['N1-nested-template-apostrophe-then-comment', lines(SQL, "const label = `${ok ? `it's fine` : 'no'}`; // " + UNAVAILABLE, DENIED)],
+      ['N3-nested-html-template-then-comment', lines(SQL, "const h = `${xs.map((x) => `<li>${x}</li>`).join('')}`; // " + UNAVAILABLE, DENIED)],
+      ['U1-non-ascii-identifier-div-then-comment', lines(SQL, 'const 总数 = 4; const avg = 总数 / 2; // ' + UNAVAILABLE, DENIED)],
+      ['C1-simple-template-then-comment', lines(SQL, "const t = `${a}`; // " + UNAVAILABLE, DENIED)],
+      ['E1-eof-in-template', lines(SQL, 'const t = `open', UNAVAILABLE)],
+    ];
+    for (const [name, core] of refused) {
+      const root = release({ 'src/core.ts': core });
+      roots.push(root);
+      const result = probe(root);
+      expect(result.code, `${name}: ${result.output}`).not.toBe(0);
+    }
+    const accepted: Array<[string, string]> = [
+      ['C1-arrow-regex-quote-then-code-marker', lines(SQL, `const f = (s: string) => /'/.test(s); const label = "${UNAVAILABLE}";`, DENIED)],
+      ['C2-keyword-named-member-div-then-code-marker', lines(SQL, `const r = stats.in / total; const label = "${UNAVAILABLE}";`, DENIED)],
+      ['C3-nonnull-div-then-code-marker', lines(SQL, `const avg = total! / count; const label = "${UNAVAILABLE}";`, DENIED)],
+      ['C2-simple-template-then-code-marker', lines(SQL, "const t = `${a}`; const label = '" + UNAVAILABLE + "';", DENIED)],
+      ['F1-nested-html-template-then-code-marker', lines(SQL, "const h = `${xs.map((x) => `<li>${x}</li>`).join('')}`; const label = '" + UNAVAILABLE + "';", DENIED)],
+    ];
+    for (const [name, core] of accepted) {
+      const root = release({ 'src/core.ts': core });
+      roots.push(root);
+      const result = probe(root);
+      expect(result.code, `${name}: ${result.output}`).toBe(0);
+    }
+  } finally {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  }
+});
