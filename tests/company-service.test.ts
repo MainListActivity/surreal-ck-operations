@@ -210,6 +210,9 @@ function runInstall(f: Fixture, extraEnv: Record<string, string> = {}, target = 
       PASEO: f.fakePaseo,
       SCK_SERVICE_HOME: f.serviceHome,
       SCK_OPS_REPO: f.opsRepo,
+      // The standby guard reads the target with the repository's TypeScript parser, so it needs a
+      // runtime that can load it; the fixture's pinned runtime is a stub (see fixture()).
+      STANDBY_RELAY_RUNTIME: process.execPath,
       FAKE_RELEASES_DIR: f.releases,
       FAKE_PASEO_LOG: f.paseoLog,
       FAKE_PASEO_MODE: 'normal',
@@ -241,7 +244,9 @@ const SWITCH_GUARDS: Array<[string, string]> = [
 
 function runSwitchGuard(script: string, entry: string, root: string) {
   return Bun.spawnSync(['sh', '-c', `. "${join(ROOT, 'scripts', script)}"; ${entry} "${root}" full`], {
-    env: { PATH: '/usr/bin:/bin' },
+    // The standby guard reads the target with the repository's TypeScript parser, so it needs a
+    // runtime that can load it; the fixture's own runtime is a stub (see fixture()).
+    env: { PATH: '/usr/bin:/bin', STANDBY_RELAY_RUNTIME: process.execPath },
     stdout: 'pipe',
     stderr: 'pipe',
   });

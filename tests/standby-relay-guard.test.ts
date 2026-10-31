@@ -6,6 +6,10 @@ import { dirname, join } from 'node:path';
 const ROOT = join(import.meta.dir, '..');
 const GUARD = join(ROOT, 'scripts/standby-relay-guard.sh');
 
+// Every guard call reads the target with the repository's TypeScript parser, so it starts a
+// parser process; the matrix below therefore runs a few hundred of them.
+const TIMEOUT = 60_000;
+
 const VALID_FILES: Record<string, string> = {
   'src/standby-relay-capability.ts': [
     "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/1';",
@@ -85,7 +89,7 @@ test('the standby switch guard accepts a complete release and refuses missing ca
   } finally {
     for (const root of [complete, noCapability, noBudget, noVendor, vendorWithoutCapability]) rmSync(root, { recursive: true, force: true });
   }
-});
+}, TIMEOUT);
 
 const COMMENT_MARKERS = [
   { path: 'src/standby-relay-capability.ts', line: "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/1';", replacement: "export const OTHER_PROTOCOL = 'standby-relay/0';", marker: "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/1';" },
@@ -126,7 +130,7 @@ test('every required marker is refused when it appears only in a comment', () =>
   } finally {
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
-});
+}, TIMEOUT);
 
 // The review probes for attempt 4 (fv06-attempt4-guard-probe*.ts) plus the multi-line block
 // comment and quote-state cases they exposed. Every fixture below keeps a required marker only
@@ -166,7 +170,7 @@ test('a multi-line block comment cannot stand in for declarations or behavior ma
   } finally {
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
-});
+}, TIMEOUT);
 
 test('quote state cannot swallow a later comment: apostrophes, backticks and regex literals', () => {
   const roots: string[] = [];
@@ -194,7 +198,7 @@ test('quote state cannot swallow a later comment: apostrophes, backticks and reg
   } finally {
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
-});
+}, TIMEOUT);
 
 test('a core file holding only comments is refused, even after a line with an apostrophe', () => {
   const roots: string[] = [];
@@ -206,7 +210,7 @@ test('a core file holding only comments is refused, even after a line with an ap
   } finally {
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
-});
+}, TIMEOUT);
 
 test('real markers inside strings and a same-line double-quoted URL are still accepted', () => {
   const roots: string[] = [];
@@ -232,7 +236,7 @@ test('real markers inside strings and a same-line double-quoted URL are still ac
   } finally {
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
-});
+}, TIMEOUT);
 
 test('both switch entry points ask the standby guard before their first side effect', () => {
   const source = readFileSync(GUARD, 'utf8');
@@ -250,7 +254,7 @@ test('both switch entry points ask the standby guard before their first side eff
   const remote = deploy.indexOf('standby_relay_target_supported "$staging/probe" core');
   expect(remote).toBeGreaterThan(deploy.indexOf('goal_workspace_target_supported "$staging/probe" core'));
   expect(remote).toBeLessThan(deploy.indexOf('ssh $ssh_opts'));
-});
+}, TIMEOUT);
 
 // R7 (attempt-5 return): regex after keywords/=>/) and LineContinuation. The previous
 // regex-start char class only covered operators/openers, so return /'/, typeof /'/, => /'/,
@@ -295,7 +299,7 @@ test('regex after keywords, arrows and if-heads, plus LineContinuation, cannot s
   } finally {
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
-});
+}, TIMEOUT);
 
 // R8 (attempt-6 return): division after ], }, member names that equal keywords, TS non-null
 // assertions, export default, non-ASCII identifiers, and nested template literals must not
@@ -348,7 +352,7 @@ test('division after primaries and nested templates cannot smuggle comment marke
   } finally {
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
-});
+}, TIMEOUT);
 
 // R9 (attempt-7 return): template text must honour backslash escapes; class/function
 // expressions and a bare identifier named of must keep a following slash as division.
@@ -385,7 +389,7 @@ test('template escapes, class/function expressions and of-as-ident cannot smuggl
   } finally {
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
-});
+}, TIMEOUT);
 
 // R10 (attempt-8 return): the reviewer adversarial probe's fail-open rows. A for-of/in head,
 // an else/do/try body, a labelled statement, export default and an async function expression
@@ -434,7 +438,7 @@ test('for-heads, block bodies, labels, export default and async functions cannot
   } finally {
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
-});
+}, TIMEOUT);
 
 // R11 (attempt-9 return): the 18 fail-open rows from the reviewer's 93-case TypeScript-oracle
 // probe. Covers export-default-async, statement-start blocks, case/default labels, ??/?. then
@@ -486,7 +490,7 @@ test('export-default-async, statement blocks, case labels, in-operator and type 
   } finally {
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
-});
+}, TIMEOUT);
 
 // R12 (attempt-10 return): adjacent syntax variants of class/interface bodies, function
 // bodies and ASI, case ternaries, for-await, and type/annotation line endings. Keep these as
@@ -540,4 +544,62 @@ test('class/function/type syntax variants cannot smuggle comment markers', () =>
   } finally {
     for (const root of roots) rmSync(root, { recursive: true, force: true });
   }
-});
+}, TIMEOUT);
+
+// R13 (attempt-11 return): the review's A-E families that the previous implementation read as
+// code. Each base is a legal TypeScript construct whose lexical state a hand-written lexer reads
+// wrongly - a brace inside a class/interface head, a return or yield whose block follows a
+// comment or a blank line, the lone ? of an optional parameter, a case value holding an object
+// literal, a type alias or an annotation that ends at a line break. The marker sits in a trailing
+// comment (the guard must refuse it) or in code (the guard must accept it).
+const REVIEW_SAMPLES: Array<[string, string[]]> = [
+  ['A01-class-default-generic-object', ['class A<T = {}> {}', "/'/.test(s); @M@"]],
+  ['A05-export-default-class-generic-default', ['export default class<T = {}> {}', "/'/.test(s); @M@"]],
+  ['A06-declare-class-generic-default', ['declare class A<T = {}> {}', "/'/.test(s); @M@"]],
+  ['A08-abstract-class-generic-default', ['abstract class A<T = {}> {}', "/'/.test(s); @M@"]],
+  ['B01-function-object-param-return-void', ['function f(x: { a: 1 }): void { x(); }', "/'/.test(s); @M@"]],
+  ['B02-function-generic-default-return-void', ['function f<T = {}>(): void { x(); }', "/'/.test(s); @M@"]],
+  ['B03-function-destructured-param-return-void', ['function f({ a }: B): void { x(); }', "/'/.test(s); @M@"]],
+  ['B06-return-asi-line-comment', ['function f() { return', '// note', '{ y(); }', "/'/.test(s); } @M@"]],
+  ['B07-return-asi-blank-line', ['function f() { return', '', '{ y(); }', "/'/.test(s); } @M@"]],
+  ['B08-return-asi-block-comment-brace', ['function f() { return', '/* note */ {', 'y(); }', "/'/.test(s); } @M@"]],
+  ['B09-yield-asi-blank-line', ['function* g() { yield', '', '{ y(); }', "/'/.test(s); } @M@"]],
+  ['B15-param-array-object-type-return-void', ['function f(a: { b: 1 }[]): void { x(); }', "/'/.test(s); @M@"]],
+  ['C05-case-ternary-object-value', ['switch (a) { case b ? { c: 1 } : 2: { x(); }', "/'/.test(s); } @M@"]],
+  ['C08-optional-param-then-label-block', ['function f(a?) {}', 'foo: { x(); }', "/'/.test(s); } @M@"]],
+  ['C09-optional-method-then-label-block', ['class A { m?() {} }', 'foo: { x(); }', "/'/.test(s); } @M@"]],
+  ['C10-two-optional-params-then-label-block', ['function f(a?, b?) {}', 'foo: { x(); }', "/'/.test(s); } @M@"]],
+  ['E01-type-alias-array-of-object', ['type T = { a: 1 }[]', "/'/.test(s); @M@"]],
+  ['E02-type-alias-union-null-after-object', ['type T = { a: 1 } | null', "/'/.test(s); @M@"]],
+  ['E03-type-alias-generic-object-array', ['type T = Array<{ a: 1 }>[]', "/'/.test(s); @M@"]],
+  ['E05-let-definite-assignment-annotation', ['let x!: string', "/'/.test(s); @M@"]],
+  ['E06-declare-function-return-annotation', ['declare function f(): string', "/'/.test(s); @M@"]],
+  ['E07-export-declare-function-return', ['export declare function f(): string', "/'/.test(s); @M@"]],
+  ['E08-let-object-destructuring-annotation', ['let { a }: Foo', "/'/.test(s); @M@"]],
+  ['E09-let-array-destructuring-annotation', ['let [a]: Foo', "/'/.test(s); @M@"]],
+];
+
+test('the class, function, case and type families cannot smuggle a comment marker', () => {
+  const root = mkdtempSync(join(tmpdir(), 'sck-standby-sample-'));
+  const file = join(root, 'sample.ts');
+  try {
+    for (const [name, base] of REVIEW_SAMPLES) {
+      const commented = base.join('\n').replace('@M@', `// ${UNAVAILABLE}`);
+      const coded = base.join('\n').replace('@M@', `const t = '${UNAVAILABLE}';`);
+      writeFileSync(file, commented);
+      const refused = Bun.spawnSync([
+        'sh', '-c', '. "$1"; standby_relay_has_code_marker "$2" "$3"',
+        'standby-relay-guard-marker-test', GUARD, file, UNAVAILABLE,
+      ], { stdout: 'pipe', stderr: 'pipe' });
+      expect(refused.exitCode, `${name} (comment): ${refused.stderr.toString()}`).not.toBe(0);
+      writeFileSync(file, coded);
+      const accepted = Bun.spawnSync([
+        'sh', '-c', '. "$1"; standby_relay_has_code_marker "$2" "$3"',
+        'standby-relay-guard-marker-test', GUARD, file, UNAVAILABLE,
+      ], { stdout: 'pipe', stderr: 'pipe' });
+      expect(accepted.exitCode, `${name} (code): ${accepted.stderr.toString()}`).toBe(0);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
