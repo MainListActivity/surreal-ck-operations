@@ -251,3 +251,48 @@ test('both switch entry points ask the standby guard before their first side eff
   expect(remote).toBeGreaterThan(deploy.indexOf('goal_workspace_target_supported "$staging/probe" core'));
   expect(remote).toBeLessThan(deploy.indexOf('ssh $ssh_opts'));
 });
+
+// R7 (attempt-5 return): regex after keywords/=>/) and LineContinuation. The previous
+// regex-start char class only covered operators/openers, so return /'/, typeof /'/, => /'/,
+// and if (s) /'/ were treated as division; a quote inside them flipped quote state and a
+// comment-only marker was accepted. ECMAScript also allows LineContinuation (odd trailing
+// unescaped \) to keep a single/double quote open across lines.
+test('regex after keywords, arrows and if-heads, plus LineContinuation, cannot smuggle markers', () => {
+  const roots: string[] = [];
+  try {
+    const refused: Array<[string, string]> = [
+      ['FO1-kw-return-regex-quote-then-line-comment', lines(SQL, `  return /'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['FO2-kw-typeof-regex-quote-then-line-comment', lines(SQL, `const t = typeof /'/; // ${UNAVAILABLE}`, DENIED)],
+      ['FO3-arrow-regex-quote-then-line-comment', lines(SQL, `const f = (s: string) => /'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['FO4-paren-regex-quote-then-line-comment', lines(SQL, `if (s) /'/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['FO5-kw-return-regex-quote-then-block-comment', lines(SQL, `  return /'/.test(s); /* ${UNAVAILABLE} */`, DENIED)],
+      ['FO6-arrow-regex-backtick-flips-state-for-later-comment', lines(SQL, 'const f = (s: string) => /`/.test(s);', `// ${UNAVAILABLE}`, DENIED)],
+      ['FO7-sq-line-continuation-then-line-comment', lines(SQL, "const note = 'operator \\", `def'; // ${UNAVAILABLE}`, DENIED)],
+      ['FO8-dq-line-continuation-then-line-comment', lines(SQL, 'const note = "operator \\', `def"; // ${UNAVAILABLE}`, DENIED)],
+      // Controls that must keep refusing even when the regex itself has no quote.
+      ['C2-arrow-regex-plain-then-line-comment', lines(SQL, `const f = (s: string) => /x/.test(s); // ${UNAVAILABLE}`, DENIED)],
+      ['C3-paren-regex-plain-then-line-comment', lines(SQL, `if (s) /x/.test(s); // ${UNAVAILABLE}`, DENIED)],
+    ];
+    for (const [name, core] of refused) {
+      const root = release({ 'src/core.ts': core });
+      roots.push(root);
+      const result = probe(root);
+      expect(result.code, `${name}: ${result.output}`).not.toBe(0);
+    }
+    const accepted: Array<[string, string]> = [
+      ['C1-kw-regex-quote-then-code-marker-in-dq', lines(SQL, `  return /'/.test(s); const label = "${UNAVAILABLE}";`, DENIED)],
+      ['C4-operator-regex-quote-then-line-comment-still-refused-elsewhere', lines(SQL, `const quoteRe = /'/; const label = "${UNAVAILABLE}";`, DENIED)],
+      ['C5-template-expression-code-marker', lines(SQL, 'const msg = `${"' + UNAVAILABLE + '"}`;', DENIED)],
+      ['C6-sq-line-continuation-then-code-marker', lines(SQL, "const note = 'operator \\", `def'; const label = "${UNAVAILABLE}";`, DENIED)],
+      ['C7-kw-regex-slash-in-class-then-code-marker', lines(SQL, `  return /[/]/.test(s); const label = "${UNAVAILABLE}";`, DENIED)],
+    ];
+    for (const [name, core] of accepted) {
+      const root = release({ 'src/core.ts': core });
+      roots.push(root);
+      const result = probe(root);
+      expect(result.code, `${name}: ${result.output}`).toBe(0);
+    }
+  } finally {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  }
+});
