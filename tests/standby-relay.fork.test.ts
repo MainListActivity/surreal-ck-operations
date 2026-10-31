@@ -15,12 +15,12 @@ import type { LeaseProof, TaskView, WorktreeAssignment } from '../src/contracts.
 setDefaultTimeout(90000);
 // FV06 P0/P1: bounded standby relay on a real company fork — no production data, no credentials, no sampling.
 // 每个测试用全新员工（活动租约不跨测试残留）。
-const run = process.env.RUN_SCK_LOOP_BREAKER_TESTS === '1' ? test : test.skip;
+const run = process.env.RUN_SCK_STANDBY_RELAY_TESTS === '1' ? test : test.skip;
 let dir: string, server: ReturnType<typeof Bun.spawn>, db: CompanyDatabase, core: SurrealCompanyCore, coreWt: SurrealCompanyCore,
   wf: Workforce, proof: CompanyProofStore, admin: LocalEnrollmentAdmin, count = 0;
 
 beforeAll(async () => {
-  if (process.env.RUN_SCK_LOOP_BREAKER_TESTS !== '1') return;
+  if (process.env.RUN_SCK_STANDBY_RELAY_TESTS !== '1') return;
   dir = realpathSync(mkdtempSync(join(tmpdir(), 'sck-standby-')));
   const listener = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('fixture') });
   const port = listener.port!; listener.stop(true);

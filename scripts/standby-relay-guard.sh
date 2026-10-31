@@ -16,6 +16,40 @@
 # switch). Read-only: files are read, never executed; no credentials are touched.
 STANDBY_RELAY_PROTOCOL_EXPECTED='standby-relay/1'
 
+# Search source outside comments only. Preserve markers inside quoted SQL/template strings, but discard // and
+# /* ... */ comments (including trailing comments), so a comment-only release cannot pass the capability probe.
+standby_relay_has_code_marker() {
+  file=$1
+  marker=$2
+  awk -v marker="$marker" '
+    BEGIN { escape = sprintf("%c", 92) }
+    {
+      line = $0
+      code = ""
+      for (i = 1; i <= length(line); i++) {
+        char = substr(line, i, 1)
+        next_char = substr(line, i + 1, 1)
+        if (in_block_comment) {
+          if (char == "*" && next_char == "/") { in_block_comment = 0; i++ }
+          continue
+        }
+        if (quote != "") {
+          code = code char
+          if (char == escape && i < length(line)) { code = code substr(line, i + 1, 1); i++; continue }
+          if (char == quote) quote = ""
+          continue
+        }
+        if (char == "\\\"" || char == "'\''" || char == "`") { quote = char; code = code char; continue }
+        if (char == "/" && next_char == "/") break
+        if (char == "/" && next_char == "*") { in_block_comment = 1; i++; continue }
+        code = code char
+      }
+      if (index(code, marker)) found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$file"
+}
+
 # 0 when the tree at <root> carries the contract (files read, never executed).
 standby_relay_probe_root() {
   root=$1
@@ -28,11 +62,11 @@ standby_relay_probe_root() {
   [ -f "$cap" ] && [ -f "$core" ] && [ -f "$contracts" ] && [ -f "$dispatcher" ] && [ -f "$workforce" ] || return 1
   # Declarations, not comment text: a comment-only tree cannot pass.
   grep -Eq '^[[:space:]]*(export[[:space:]]+)?const[[:space:]]+STANDBY_RELAY_PROTOCOL[[:space:]]*=' "$cap" 2>/dev/null || return 1
-  grep -q "$STANDBY_RELAY_PROTOCOL_EXPECTED" "$cap" 2>/dev/null || return 1
+  standby_relay_has_code_marker "$cap" "$STANDBY_RELAY_PROTOCOL_EXPECTED" || return 1
   # The resume transaction writes progress_at and standby_until (min of the window deadline and the budget).
-  grep -qF 'standby_until = IF $assigned THEN math::min([$standby_not_after, $now + $standby_budget]) ELSE NONE END' "$core" 2>/dev/null || return 1
-  grep -qF 'standby employee unavailable' "$core" 2>/dev/null || return 1
-  grep -qF 'standby denied: unmet dependencies remain' "$core" 2>/dev/null || return 1
+  standby_relay_has_code_marker "$core" 'standby_until = IF $assigned THEN math::min([$standby_not_after, $now + $standby_budget]) ELSE NONE END' || return 1
+  standby_relay_has_code_marker "$core" 'standby employee unavailable' || return 1
+  standby_relay_has_code_marker "$core" 'standby denied: unmet dependencies remain' || return 1
   # The view surfaces the deadline; the config carries the budget. The budget lives in the config
   # interface (CompanyConfig.standbyBudgetSeconds), its default (DEFAULT_CONFIG), and the company_meta
   # config row key it is read from (standby_budget_seconds). Probe the declarations the tree really
@@ -41,12 +75,10 @@ standby_relay_probe_root() {
   grep -Eq '^[[:space:]]*standbyUntil\?:' "$contracts" 2>/dev/null || return 1
   grep -Eq '^[[:space:]]*standbyBudgetSeconds:[[:space:]]*number;' "$workforce" 2>/dev/null || return 1
   grep -Eq '^[[:space:]]*standbyBudgetSeconds:[[:space:]]*STANDBY_BUDGET_SECONDS_DEFAULT' "$workforce" 2>/dev/null || return 1
-  grep -qF 'standby_budget_seconds' "$workforce" 2>/dev/null || return 1
-  # The supervision branch wakes standby holders, waives the stall/expire reclaim before the deadline
-  # and returns the timeout to the gm gate (standby_timeout), never the ready pool.
-  grep -qF 'standby timeout' "$dispatcher" 2>/dev/null || return 1
-  grep -qF 'standby_timeout' "$workforce" 2>/dev/null || return 1
-  grep -qF 'STANDBY_WAKE_RETRY_SECONDS' "$dispatcher" 2>/dev/null || return 1
+  standby_relay_has_code_marker "$workforce" 'standby_budget_seconds' || return 1
+  standby_relay_has_code_marker "$dispatcher" 'standby timeout' || return 1
+  standby_relay_has_code_marker "$workforce" 'standby_timeout' || return 1
+  standby_relay_has_code_marker "$dispatcher" 'STANDBY_WAKE_RETRY_SECONDS' || return 1
   return 0
 }
 

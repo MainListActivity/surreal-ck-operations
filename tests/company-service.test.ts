@@ -78,7 +78,7 @@ const POLICY_SHARED = {
 // real-tree smoke test below closes.
 const STANDBY_FILES = {
   'src/standby-relay-capability.ts': "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/1';\nexport const STANDBY_BUDGET_SECONDS_DEFAULT = 600;\n",
-  'src/dispatcher/dispatcher.ts': "export const STANDBY_WAKE_RETRY_SECONDS = 60;\n// standby timeout: return to the gm gate\n",
+  'src/dispatcher/dispatcher.ts': "export const STANDBY_WAKE_RETRY_SECONDS = 60;\nconst STANDBY_TIMEOUT_REASON = 'standby timeout';\n",
 };
 const STANDBY_APPENDS: Array<[string, string]> = [
   ['src/core.ts', "standby_until = IF $assigned THEN math::min([$standby_not_after, $now + $standby_budget]) ELSE NONE END\nstandby employee unavailable\nstandby denied: unmet dependencies remain\n"],
