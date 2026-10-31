@@ -25,7 +25,7 @@ export type WorkflowState = 'ready' | 'doing' | 'review';
 
 /** Stable machine codes. The text is for owners; codes drive grouping, notices and auto-clear. */
 export type BlockCode =
-  | 'paused' | 'budget' | 'resources' | 'max_running'
+  | 'paused' | 'budget' | 'resources' | 'memory_pressure' | 'disk_space' | 'max_running'
   | 'implementer_mismatch' | 'implementer_unresolved' | 'implementer_unavailable' | 'implementer_quota' | 'author_recusal' | 'independence_conflict' | 'no_candidate'  | 'session_busy' | 'held' | 'assigned' | 'credential_file' | 'track_mismatch' | 'model_slot'
   | 'quota' | 'probe_busy' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'wake_failed' | 'unknown' | 'review_capacity'
   | 'write_scope' | 'policy_blocked' | 'factory_wait';
@@ -137,6 +137,8 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
   paused: '全局暂停派工',
   budget: '订阅额度耗尽或限流',
   resources: '宿主机资源低于水位',
+  memory_pressure: '宿主机内存压力偏高',
+  disk_space: '宿主机空闲磁盘不足',
   max_running: '全局在办会话已达上限，等待空位',
   implementer_mismatch: '任务已绑定实现负责人，其他人不能接手代码',
   implementer_unresolved: '多名经手人且无实现负责人，需经理指定',
@@ -165,7 +167,7 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
 
 const OWNER: Record<BlockCode, RecoveryAuthority> = {
   factory_wait: 'system',
-  paused: 'gm', budget: 'owner', resources: 'gm', max_running: 'gm',
+  paused: 'gm', budget: 'owner', resources: 'gm', memory_pressure: 'system', disk_space: 'gm', max_running: 'gm',
   implementer_mismatch: 'gm', implementer_unresolved: 'gm', implementer_unavailable: 'system', implementer_quota: 'gm', author_recusal: 'gm', independence_conflict: 'gm', no_candidate: 'gm',  session_busy: 'gm', held: 'gm', assigned: 'gm', credential_file: 'gm', track_mismatch: 'gm', model_slot: 'gm',
   quota: 'owner', provider_capacity: 'gm', seat_full: 'gm', def_disabled: 'gm', wake_failed: 'gm', unknown: 'gm',
   review_capacity: 'gm',
@@ -176,7 +178,9 @@ const RECOVERY: Record<BlockCode, string> = {
   factory_wait: '等待 Factory 空闲后自动派工；额度耗尽后回退其他合格员工',
   paused: '经理解除全局暂停',
   budget: '老板充值，或等待额度恢复',
-  resources: '清理宿主机磁盘或等待水位恢复',
+  resources: '检查宿主机内存和磁盘，等待对应水位恢复',
+  memory_pressure: '降低进程与数据库缓存占用，等待内存压力恢复；无需清理磁盘',
+  disk_space: '清理宿主机磁盘，等待空闲磁盘恢复',
   max_running: '等待在办会话结束，或经理调高 max_running',
   implementer_mismatch: '等待绑定的实现负责人可用，或经理用 implementer_takeover 显式接手',
   implementer_unresolved: '经理用 implementer_takeover 记录实现负责人',
@@ -208,6 +212,8 @@ const NEXT: Record<BlockCode, string> = {
   paused: '全局暂停解除',
   budget: '额度恢复或老板充值',
   resources: '宿主机水位恢复',
+  memory_pressure: '宿主机内存压力恢复',
+  disk_space: '宿主机空闲磁盘恢复',
   max_running: '在办会话数低于上限',
   implementer_mismatch: '绑定实现负责人可派工，或经理接手',
   implementer_unresolved: '经理记录实现负责人',
@@ -237,7 +243,7 @@ const NEXT: Record<BlockCode, string> = {
 /** The source each code is read from. Stable strings: the roster, the cards and the brief show them as they are. */
 const BASIS: Record<BlockCode, string> = {
   factory_wait: 'tick:factory-queue',
-  paused: 'tick:global-gate', budget: 'tick:global-gate', resources: 'tick:global-gate', max_running: 'tick:global-gate',
+  paused: 'tick:global-gate', budget: 'tick:global-gate', resources: 'tick:global-gate', memory_pressure: 'host:memory', disk_space: 'host:disk', max_running: 'tick:global-gate',
   implementer_mismatch: 'contribution-audit', implementer_unresolved: 'contribution-audit', implementer_unavailable: 'tick:session-status', implementer_quota: 'tick:provider-health', author_recusal: 'contribution-audit',
   independence_conflict: 'contribution-audit',  no_candidate: 'tick:staffing-pool', session_busy: 'paseo:session-status', held: 'tick:staffing-pool', assigned: 'tick:staffing-pool',
   credential_file: 'tick:staffing-pool', track_mismatch: 'tick:staffing-pool', model_slot: 'tick:model-slots',
@@ -253,7 +259,9 @@ const ACTIONS: Record<BlockCode, RecoveryAction[]> = {
   factory_wait: [{authority:'system',label:'等待 Factory 空闲后自动重试；队列之外的任务可分流',executable:false}],
   paused: [{ authority: 'gm', label: '经理解除全局暂停', executable: false }],
   budget: [{ authority: 'owner', label: '老板充值，或等待额度恢复', executable: false }],
-  resources: [{ authority: 'gm', label: '清理宿主机磁盘或等待水位恢复', executable: false }],
+  resources: [{ authority: 'gm', label: '检查宿主机内存和磁盘，等待对应水位恢复', executable: false }],
+  memory_pressure: [{authority:'system',label:'降低内存占用，压力恢复后自动重试',executable:false}],
+  disk_space: [{authority:'gm',label:'清理磁盘，空闲磁盘恢复后自动重试',executable:false}],
   max_running: [{ authority: 'gm', label: '等待在办会话结束，或经理调高 max_running', executable: false }],
   implementer_mismatch: [{ authority: 'gm', label: '经理用 implementer_takeover 显式接手', tool: 'implementer_takeover', executable: true }],
   implementer_unresolved: [{ authority: 'gm', label: '经理用 implementer_takeover 记录实现负责人', tool: 'implementer_takeover', executable: true }],

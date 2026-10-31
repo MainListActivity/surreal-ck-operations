@@ -29,3 +29,13 @@ export const hostResources = (diskPath: string, deps: {
   const stat = statfsSync(diskPath);
   return { freeMemMb, freeDiskMb: Math.round(stat.bavail * stat.bsize / 1048576), ...(memoryPressure ? { memoryPressure } : {}) };
 };
+
+/** Exact resource dimensions shared by task verdicts and owner-facing recovery text. */
+export function resourceBlocks(host:HostResources,minFreeMemMb:number,minFreeDiskMb:number){
+ const blocks:Array<{code:'memory_pressure'|'disk_space';text:string}>=[];
+ if(memoryBlocked(host,minFreeMemMb))blocks.push({code:'memory_pressure',text:host.memoryPressure!==undefined
+  ? `宿主机内存压力偏高（内核压力等级 ${host.memoryPressure}），暂停新增派工`
+  : `宿主机空闲内存 ${host.freeMemMb} MB，低于 ${minFreeMemMb} MB 下限`});
+ if(host.freeDiskMb<minFreeDiskMb)blocks.push({code:'disk_space',text:`宿主机空闲磁盘 ${(host.freeDiskMb/1024).toFixed(1)} GB，低于 ${(minFreeDiskMb/1024).toFixed(1)} GB 下限`});
+ return blocks;
+}

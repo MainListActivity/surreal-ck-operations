@@ -17,7 +17,7 @@ import type { ReclaimTrigger } from './worktree-reclaim.ts';
 import { jevNeedsOwner, jevRelease, jevTriage } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
 import { reclaimIdleSessions } from './idle-sessions.ts';
-import { memoryBlocked, type HostResources } from './host.ts';
+import { memoryBlocked, resourceBlocks, type HostResources } from './host.ts';
 import type { ArtifactTrigger } from './artifact-reclaim.ts';
 import type { ArtifactReclaimResult } from './artifact-sweeper.ts';
 import { summarizeReclaim } from './artifact-sweeper.ts';
@@ -64,7 +64,7 @@ const STALL_ACTIVITY_CAP = 3;
 /** Two or more consecutive quota failures on a bound implementer, or an unknown reset, is persistent: a manager decision. */
 const PERSISTENT_QUOTA_FAILURES = 2;
 /** Pass-wide capacity gates and unknown state are not evidence that a manager todo is resolved. */
-const GLOBAL_KEEP = new Set<BlockCode>(['paused', 'budget', 'resources', 'max_running', 'unknown']);
+const GLOBAL_KEEP = new Set<BlockCode>(['paused', 'budget', 'resources', 'memory_pressure', 'disk_space', 'max_running', 'unknown']);
 /** SYS03 AC04: holder notices delivered per pass, so a long backlog cannot turn one tick into hundreds of sends. */
 const HOLDER_NOTICE_BATCH = 20;
 
@@ -807,11 +807,11 @@ export class Dispatcher {
    * already raise their own owner notice, so they only record verdicts. The concurrency cap has no notice of its own,
    * so it escalates like any other block once it has lasted five minutes (`notify`).
    */
-  private async markGlobal(work: ReadonlyArray<{ task: SupervisedTask; purpose: DispatchPhase }>, block: GlobalBlock,
+  private async markGlobal(work: ReadonlyArray<{ task: SupervisedTask; purpose: DispatchPhase }>, block: GlobalBlock | readonly GlobalBlock[],
     now: number, report: TickReport, notify = false): Promise<void> {
     for (const item of work) {
       const home = item.task.repoPath ?? this.deps.env.opsRepo;
-      const { verdict, since } = await this.recordVerdict(item.task, item.purpose, home, undefined, now, [block]);
+      const { verdict, since } = await this.recordVerdict(item.task, item.purpose, home, undefined, now, Array.isArray(block)?block:[block as GlobalBlock]);
       if (notify && now - since >= BLOCK_NOTICE_MS / 1000) await this.notice(verdict.noticeKey, dispatchNoticeText(verdict), report);
     }
   }
@@ -1352,11 +1352,10 @@ export class Dispatcher {
     // pass waits. Supervision above already ran — stalled leases still get reclaimed.
     // A probe error fails open (logged) rather than halting dispatch forever.
     const host = this.hostResources();
-    const underFloor = Boolean(host && (memoryBlocked(host, cfg.minFreeMemMb) || host.freeDiskMb < cfg.minFreeDiskMb));
     const headroom = cfg.artifactHeadroomMb ?? 0;
     const pressure = Boolean(host && host.freeDiskMb < cfg.minFreeDiskMb + headroom);
     let reclaimAttempt: ArtifactReclaimResult | undefined;
-    if (underFloor || pressure) {
+    if (pressure) {
       // Try to buy our way back with terminal-task artifacts before bailing out:
       // no new task can run until free space recovers, and reclaim takes real free
       // space away from nothing (clones only) while the probe is what decides.
@@ -1365,7 +1364,7 @@ export class Dispatcher {
         const reclaimed = reclaimAttempt = await this.deps.reclaimArtifacts({
           // Emergency: the config switch must not be able to deadlock dispatch; only the
           // env kill switch (SCK_ARTIFACT_RECLAIM=0) can, and then the notice says so.
-          trigger: underFloor ? 'pressure' : 'sweep', targetFreeMb, dryRun: false, emergency: true,
+          trigger: host && host.freeDiskMb < cfg.minFreeDiskMb ? 'pressure' : 'sweep', targetFreeMb, dryRun: false, emergency: true,
         }).catch(error => { this.log(`artifact reclaim failed: ${(error as Error).message}`); return undefined; });
         if (reclaimed && (reclaimed.trimmed.length || reclaimed.removedFiles)) {
           this.log(`artifact reclaim ${reclaimed.runId}: ${summarizeReclaim(reclaimed)}`);
@@ -1378,18 +1377,19 @@ export class Dispatcher {
       }
     }
     if (host && (memoryBlocked(host, cfg.minFreeMemMb) || host.freeDiskMb < cfg.minFreeDiskMb)) {
-      const why = reclaimAttempt?.disabled
+      const diskBlocked=host.freeDiskMb<cfg.minFreeDiskMb;
+      const why = diskBlocked && reclaimAttempt?.disabled
         ? `；终态产物回收被${reclaimAttempt.disabledReason === 'env' ? '环境硬停（SCK_ARTIFACT_RECLAIM=0）' : '配置关闭（artifact_reclaim_enabled=false）'}，无法自动腾出空间`
         : '';
       await this.notice('resources',
         `宿主机资源不足，本轮暂停派工：内存压力 ${host.memoryPressure ?? '未知（按空闲内存判断）'}，空闲内存 ${host.freeMemMb} MB（下限 ${cfg.minFreeMemMb} MB）、空闲磁盘 ${(host.freeDiskMb / 1024).toFixed(1)} GB（下限 ${(cfg.minFreeDiskMb / 1024).toFixed(0)} GB）。在办任务不受影响，水位恢复后自动继续派工${why}。`, report);
-      if (reclaimAttempt?.disabled) {
+      if (diskBlocked && reclaimAttempt?.disabled) {
         await this.notice('resources-reclaim-blocked',
           `资源闸门正在阻塞全部派工，但终态产物回收不可用（${reclaimAttempt.disabledReason === 'env' ? 'SCK_ARTIFACT_RECLAIM=0 环境硬停' : 'artifact_reclaim_enabled=false'}）。空闲磁盘 ${host.freeDiskMb} MB，低于下限 ${cfg.minFreeDiskMb} MB。请恢复回收配置，或用 admin reclaim-artifacts --execute 手工回收。`, report, { force: true });
       } else {
         await owner.resolveNotice('resources-reclaim-blocked');
       }
-      await this.markGlobal(work, globalBlock('resources'), now, report);
+      await this.markGlobal(work, resourceBlocks(host,cfg.minFreeMemMb,cfg.minFreeDiskMb), now, report);
       report.skipped = 'resources';
       return report;
     }
