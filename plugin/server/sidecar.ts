@@ -99,6 +99,10 @@ const BASE_TOOLS = [
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
 const RETIRED_TOOLS = new Set(["get_secret", "put_secret"]);
 
+/** How many unacked holder notices ride along with a successful reply. A notice text is bounded by the amend
+ *  input (two 4000-char fields), so this keeps the added context small while still surfacing a backlog. */
+const ATTACHED_NOTICE_LIMIT = 3;
+
 const hash = (text: string | undefined) => (text === undefined ? undefined : createHash("sha256").update(text).digest("hex"));
 
 /** A leading blocker.md line that declares the subscription quota reset the way `report_blocker` takes it.
@@ -343,6 +347,21 @@ export class SidecarPool {
     const held = this.creds.get(instId);
     if (held) return held;
     return this.rotateCredential(instId);
+  }
+
+  /** Unacked holder notices ride along with a successful reply, so an in-lease holder sees an acceptance amendment
+   *  on its very next sck call (the dispatcher only redelivers to idle sessions, and a holder never has to poll
+   *  holder_notices). Best effort: a failed notice read must never fail the tool call it is attached to. */
+  private async attachNotices(instId: string): Promise<unknown[] | undefined> {
+    const read = this.deps.core.dispositionNotices?.bind(this.deps.core);
+    if (!read) return undefined;
+    try {
+      const pending = await read(await this.credentialFor(instId));
+      return pending.length ? pending.slice(0, ATTACHED_NOTICE_LIMIT) : undefined;
+    } catch (error) {
+      this.log(`attach notices ${instId} failed: ${(error as Error).message}`);
+      return undefined;
+    }
   }
 
   private async rotateCredential(instId: string): Promise<string> {
@@ -1365,6 +1384,12 @@ export class SidecarPool {
             .then(data => ({ ok: true as const, data }))
             .catch((error: Error & { code?: string }) => ({ ok: false as const, error: `${error.code ?? "error"}: ${error.message}` }));
     // Last-line budget check: an over-budget success becomes a recoverable, JSON-legal error (SYS01).
-    writeFileAtomic(join(resDir(dir), file), JSON.stringify(guardRelayResponse(res)));
+    // A successful call also carries the employee's unacked holder notices (holder_notices and the tool listing
+    // already answer with notices / no employee state, so they are skipped). An in-lease holder sees an acceptance
+    // amendment here without being interrupted, and an acked notice is gone from the next reply.
+    const answer: CommResponse = res.ok && req && req.tool !== "holder_notices" && req.tool !== "__list__"
+      ? { ...res, notices: await this.attachNotices(instId) }
+      : res;
+    writeFileAtomic(join(resDir(dir), file), JSON.stringify(guardRelayResponse(answer)));
   }
 }

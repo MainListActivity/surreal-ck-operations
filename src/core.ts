@@ -6589,9 +6589,10 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * re-reads $t, so the second append builds on the first. The context-size cap is checked in the same transaction
    * for the same reason.
    * The audit row keeps the verbatim owner quote,
-   * and each employee in notify (default: the live lease holder + the implementer + the latest submitter)
-   * gets a persistent holder_notice that holder_notices reads and acks; the dispatcher redelivers it after a
-   * reconnect or restart, and holding a lease never consumes it.
+   * and each employee in notify (default: the live lease holder + the implementer + the latest submitter; an
+   * explicit empty list notifies nobody) gets a persistent holder_notice that holder_notices reads and acks.
+   * A holder inside a live lease is not interrupted: the sidecar attaches the unacked notices to its next tool
+   * response, and the dispatcher redelivers them after a reconnect or restart.
    */
   async taskAcceptanceAmend(credential: Credential, input: { taskId: TaskId; expectedVersion: number; ownerQuote: string; text: string; notify?: string[]; idempotencyKey: string }): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
@@ -6601,13 +6602,17 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     requireText(input.text, 'text', 4, 4000);
     if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
     const MAX_NOTIFY = 20;
-    const MAX_CONTEXT = 100_000;
-    const explicit = input.notify ?? [];
-    if (!Array.isArray(explicit) || explicit.length > MAX_NOTIFY) throw new CompanyError('invalid', `notify holds at most ${MAX_NOTIFY} employee ids`);
-    const notify = [...new Set(explicit.map(employee => { requireText(employee, 'notify employee', 1, 200); return employee; }))];
+    // Same cap as create-time context (see createTask): the amendment is appended to the same field, so a total
+    // beyond it would make claim.json and read_task_text carry a task the create path itself refuses.
+    const MAX_CONTEXT = 20_000;
+    // Omitted notify means the defaults below; an explicit [] means nobody is notified (the audit is still
+    // written). null is treated as omitted for direct callers, matching the MCP schema's nullish input.
+    const explicit = input.notify ?? undefined;
+    if (explicit !== undefined && (!Array.isArray(explicit) || explicit.length > MAX_NOTIFY)) throw new CompanyError('invalid', `notify holds at most ${MAX_NOTIFY} employee ids`);
+    const notify = explicit === undefined ? undefined : [...new Set(explicit.map(employee => { requireText(employee, 'notify employee', 1, 200); return employee; }))];
     // A replay of the same call returns its first answer, even though the task context already carries the block by then.
     const idem = this.idemId(actor.employeeId, 'acceptance_amend', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ taskId: input.taskId, expectedVersion: input.expectedVersion, ownerQuote: input.ownerQuote, text: input.text, notify }));
+    const digest = HASH(JSON.stringify({ taskId: input.taskId, expectedVersion: input.expectedVersion, ownerQuote: input.ownerQuote, text: input.text, notify: notify ?? null }));
     const replay = await this.replay(idem, digest);
     if (replay) return echoTask(replay);
     const row = await this.db.select<TaskRow>(id('task', input.taskId));
@@ -6617,7 +6622,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const leaseLive = row.current_employee !== undefined && (row.lease_expires_at ?? 0) > Math.floor(Date.now() / 1000);
     const defaults = [leaseLive ? row.current_employee : undefined, row.implementer, row.submitted_by]
       .filter((employee): employee is string => typeof employee === 'string' && employee.length > 0);
-    const recipients = notify.length ? notify : [...new Set(defaults)];
+    const recipients = notify ?? [...new Set(defaults)];
     if (recipients.length) {
       const [found] = await this.db.query<[Array<{ id: RecordId }>]>('SELECT id FROM employee WHERE id IN $ids;',
         { ids: recipients.map(employee => id('employee', employee)) });
@@ -6628,14 +6633,17 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const auditId = randomUUID();
     const at = new Date().toISOString();
     const block = `\n\n【验收要求修订 · ${at} · ${actor.employeeId} · audit ${auditId}】\n老板原话（逐字）：${input.ownerQuote}\n修订说明：${input.text}\n`;
-    const evidence = `${input.text}\n[acceptance_amend] ownerQuote（老板原话，逐字）：${input.ownerQuote}\n[acceptance_amend] notify：${recipients.length ? recipients.join(', ') : '（无：任务没有在租持有人、实现人或提交人）'}`;
+    const evidence = JSON.stringify({ ownerQuote: input.ownerQuote, text: input.text, notify: notify ?? null, expectedVersion: input.expectedVersion });
     const noticeText = `验收要求已修订：${input.text}\n老板原话（逐字）：${input.ownerQuote}\n完整修订已追加到任务上下文；用 sck call read_task_text '{"taskId":"${input.taskId}","field":"context"}' 读全文，再按最新要求行事。`;
     const notices = recipients.map(employee => {
-      const noticeKey = `${input.taskId}\0acceptance_amend\0${auditId}\0${employee}`;
+      // Control-character-free id: the dispatcher embeds it in a shell/JSON command line, where a raw U+0000
+      // separator is neither a valid JSON string nor an executable argv value. The audit id and employee make it
+      // unique per recipient.
+      const noticeKey = `${input.taskId}:acceptance_amended:${auditId}:${employee}`;
       return { employee, noticeKey, record: holderNoticeId(noticeKey) };
     });
     const noticeStatements = notices.map((_, index) => `CREATE ONLY $notice_${index} CONTENT {
-          notice_key: $notice_key_${index}, episode: $episode, task: $task, holder: $holder_${index}, kind: 'acceptance_amend',
+          notice_key: $notice_key_${index}, episode: $episode, task: $task, holder: $holder_${index}, kind: 'acceptance_amended',
           text: $notice_text, payload: $notice_payload, created_at: time::now(), delivered_at: NONE, deliveries: 0,
           last_attempt_at: NONE, last_error: NONE };`).join('\n        ');
     const noticeVars = Object.fromEntries(notices.flatMap((notice, index) => [
@@ -6644,7 +6652,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const vars = {
       actor: id('employee', actor.employeeId), task: id('task', input.taskId), expected: input.expectedVersion,
       block, evidence, idem, digest, audit: id('audit', auditId), audit_id: auditId, outbox: id('outbox', randomUUID()),
-      episode: `${input.taskId}:acceptance_amend:${auditId}`, notice_text: noticeText,
+      episode: `${input.taskId}:acceptance_amended:${auditId}`, notice_text: noticeText,
       notice_payload: { auditId, version: row.version, actor: actor.employeeId, notify: recipients },
       notify: recipients, ...noticeVars,
     };

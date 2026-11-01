@@ -15,6 +15,9 @@ export interface CommResponse {
   ok: boolean;
   data?: unknown;
   error?: string;
+  /** Unacked holder notices the sidecar attached to a successful call (SYS-INT acceptance amendments), so an
+   *  in-lease holder sees an amendment on its next sck call instead of waiting for the dispatcher's idle pass. */
+  notices?: unknown[];
 }
 
 export const commDir = (root: string, employeeId: string) => join(root, employeeId);

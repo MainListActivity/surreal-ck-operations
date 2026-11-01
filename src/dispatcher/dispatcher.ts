@@ -76,13 +76,15 @@ const HOLDER_NOTICE_BATCH = 20;
  * reads the newest decision, because the holder's own snapshot may predate it — the reminder itself is never the
  * authority on what happened to the episode.
  */
-const holderNoticeText = (notice: { taskId: string; episode: string; kind: string; text: string; deliveries: number; noticeKey: string }): string =>
+export const holderNoticeText = (notice: { taskId: string; episode: string; kind: string; text: string; deliveries: number; noticeKey: string }): string =>
   // 验收要求修订不是处置决定：持有人要读的是任务上下文里的修订正文，不是 disposition_status（那里不会有这次修订）。
-  notice.kind === 'acceptance_amend'
+  notice.kind === 'acceptance_amended'
     ? `【公司通知·验收要求修订】${notice.text}\n`
       + `任务 ${notice.taskId}，episode ${notice.episode}；这是第 ${notice.deliveries + 1} 次投递。\n`
       + `完整修订已追加到任务上下文：先 sck call read_task_text '{"taskId":"${notice.taskId}","field":"context"}' 读全文，按最新验收要求行事；`
-      + `读后用 sck call holder_notices '{"ids":["${notice.noticeKey}"],"ack":true}' 回执。`
+      // JSON-escape the whole argument: noticeKey is opaque, and the text lands in a shell/JSON command line where a
+      // raw control character would make the command unparsable. JSON.stringify keeps the argument valid JSON.
+      + `读后用 sck call holder_notices '${JSON.stringify({ ids: [notice.noticeKey], ack: true })}' 回执。`
     : `【公司通知·${notice.kind}】${notice.text}\n`
       + `任务 ${notice.taskId}，episode ${notice.episode}；这是第 ${notice.deliveries + 1} 次投递。\n`
       + `你手上的状态可能已经过时：先用 sck call disposition_status '{"taskId":"${notice.taskId}"}' 读这个任务最新的处置与决定，`

@@ -22,6 +22,11 @@ const calls: Call[] = [];
 let employeeForGetTask = 'eng-x';
 let authRole = 'engineering';
 let activeLeaseRows: ActiveLease[] = [];
+/** Unacked holder notices the fake core hands back; a successful relay must attach them (SYS-INT). */
+let pendingNotices: Array<{ noticeKey: string; kind: string; taskId: string; text: string }> = [];
+let noticeReadFails = false;
+const noticeReads: string[] = [];
+const ackedNotices: string[] = [];
 const wtCalls: Array<{ cred: string; taskId?: string }> = [];
 const pageCalls: Array<{ cred: string; taskId?: string; pageSize?: number }> = [];
 const refCalls: Array<{ cred: string; input: Record<string, unknown> }> = [];
@@ -79,6 +84,16 @@ const core = {
     return taskView(String(input.taskId));
   },
   listOutbox: async () => [],
+  dispositionNotices: async (c: string) => {
+    noticeReads.push(c);
+    if (noticeReadFails) throw new Error('notice store unavailable');
+    return pendingNotices;
+  },
+  ackDispositionNotices: async (_c: string, input: { ids: string[] }) => {
+    ackedNotices.push(...input.ids);
+    pendingNotices = pendingNotices.filter(notice => !input.ids.includes(notice.noticeKey));
+    return { delivered: input.ids.length };
+  },
   qaObservationRead: async (c: string, input: Record<string, unknown>) => ({ meta: { checkedAt: 'x', dataSource: 'live', instanceAt: 'x', scope: {}, completeness: {} }, task: { id: input.taskId }, __cred: c }),
 };
 
@@ -118,7 +133,7 @@ const media = {
 const relay = async (envDir: string, key: string, name: string, tool: string, args: Record<string, unknown> | null) => {
   writeFileSync(join(reqDir(envDir), `${name}.json`), JSON.stringify({ key, tool, args }));
   await until(() => existsSync(join(resDir(envDir), `${name}.json`)));
-  return readJsonFile<{ ok: boolean; data?: unknown; error?: string }>(join(resDir(envDir), `${name}.json`))!;
+  return readJsonFile<{ ok: boolean; data?: unknown; error?: string; notices?: unknown[] }>(join(resDir(envDir), `${name}.json`))!;
 };
 
 let runDir: string;
@@ -139,6 +154,10 @@ beforeEach(() => {
   employeeForGetTask = 'eng-x';
   authRole = 'engineering';
   activeLeaseRows = [];
+  pendingNotices = [];
+  noticeReadFails = false;
+  noticeReads.length = 0;
+  ackedNotices.length = 0;
   runDir = mkdtempSync(join(tmpdir(), 'sck-sidecar-'));
   pool = new SidecarPool({ core: core as never, workforce: workforce as never, ops, media, runDir, heartbeatMs: 10_000, sweepMs: 20,
     log: message => { logs.push(message); } });
@@ -197,6 +216,47 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     const bad = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'acc2', 'submit', { text: '交付完成。', acceptance: 'head-1' });
     expect(bad.ok).toBe(false);
     expect(bad.error).toContain('acceptance must be an object');
+  });
+
+  // SYS-INT 复核 round-02（需求 4）：在租持有人不必等调度器空闲，任一 sck 调用就附带未确认的修订通知；
+  // 条数有上限，ack 之后不再附带，且通知读取失败不会拖垮工具调用本身。
+  test('a successful call carries the unacked holder notices, capped, and stops after ack', async () => {
+    const i = inst('e-notice');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-notice'));
+    const notice = (n: number) => ({
+      noticeKey: `task-notice:acceptance_amended:audit-${n}:e-notice`, kind: 'acceptance_amended',
+      taskId: 'task-notice', text: `第 ${n} 条修订`,
+    });
+    pendingNotices = [notice(1), notice(2), notice(3), notice(4)];
+
+    // heartbeat 只回 {ok:true}，通知就挂在这个回包的顶层。
+    const beat = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n1', 'heartbeat', {});
+    expect(beat.ok).toBe(true);
+    expect(beat.notices).toHaveLength(3);
+    expect(noticeReads).toContain('tok-e-notice');
+    expect((beat.notices as Array<{ noticeKey: string }>).map(n => n.noticeKey))
+      .toEqual([notice(1).noticeKey, notice(2).noticeKey, notice(3).noticeKey]);
+
+    // holder_notices 自己就返回通知，不重复附带；ack 后未确认集合里不再有它。
+    const listed = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n2', 'holder_notices', { ids: [notice(1).noticeKey], ack: true });
+    expect(listed.ok).toBe(true);
+    expect(listed.notices).toBeUndefined();
+    expect((listed.data as { receipt: { delivered: number } }).receipt.delivered).toBe(1);
+    expect(ackedNotices).toEqual([notice(1).noticeKey]);
+
+    const after = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n3', 'checkpoint', { text: 'ack 后继续' });
+    expect(after.ok).toBe(true);
+    expect((after.notices as Array<{ noticeKey: string }>).map(n => n.noticeKey))
+      .toEqual([notice(2).noticeKey, notice(3).noticeKey, notice(4).noticeKey]);
+
+    // 读取通知失败只记日志，回包照常成功且不带通知。
+    pendingNotices = [notice(5)];
+    noticeReadFails = true;
+    const degraded = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n4', 'checkpoint', { text: '通知库暂不可用' });
+    expect(degraded.ok).toBe(true);
+    expect(degraded.notices).toBeUndefined();
+    expect(logs.some(line => line.includes('attach notices e-notice failed'))).toBe(true);
   });
 
   test('QA reads carry the actual running release, and never a fabricated one', async () => {

@@ -136,14 +136,18 @@ run('manager acceptance amendment on an in-flight task', () => {
       `SELECT * FROM audit WHERE task = $task AND action = 'acceptance_amend' ORDER BY at DESC LIMIT 1;`,
       { task: new RecordId('task', taskId) });
     expect(audit).toMatchObject({ actor: new RecordId('employee', 'a-gm'), version: before.version });
-    expect(String(audit.evidence)).toContain(OWNER_QUOTE);
-    expect(String(audit.evidence)).toContain(AMEND_TEXT);
+    // 审计 evidence 是 JSON，含老板原话、修订说明、notify 入参与调用方读到的版本（缺省 notify 记为 null）。
+    expect(JSON.parse(String(audit.evidence))).toEqual({
+      ownerQuote: OWNER_QUOTE, text: AMEND_TEXT, notify: null, expectedVersion: before.version,
+    });
 
     // 默认通知对象 = 当前租约持有人 + implementer + 最近 submitter（eng2 + eng）。
     const forReviewer = await core.dispositionNotices(tokens.eng2!, {});
     expect(forReviewer).toHaveLength(1);
-    expect(forReviewer[0]).toMatchObject({ kind: 'acceptance_amend', taskId, holder: 'a-eng2' });
+    expect(forReviewer[0]).toMatchObject({ kind: 'acceptance_amended', taskId, holder: 'a-eng2' });
     expect(forReviewer[0]!.text).toContain(OWNER_QUOTE);
+    // 通知 id 不含控制字符：调度器要把它嵌进命令行回执。
+    expect(/[\u0000-\u001f\u007f]/.test(forReviewer[0]!.noticeKey)).toBe(false);
     const forImplementer = await core.dispositionNotices(tokens.eng!, {});
     expect(forImplementer.map(notice => notice.taskId)).toEqual([taskId]);
     expect(await core.dispositionNotices(tokens.qa!, {})).toHaveLength(0);
@@ -182,7 +186,7 @@ run('manager acceptance amendment on an in-flight task', () => {
     expect(amended.currentEmployee).toBeUndefined();
     expect(amended.version).toBe(blocked.version);
     const notices = await core.dispositionNotices(tokens.eng!, {});
-    expect(notices.map(notice => notice.kind)).toEqual(['acceptance_amend']);
+    expect(notices.map(notice => notice.kind)).toEqual(['acceptance_amended']);
   });
 
   test('done and void tasks refuse the amendment', async () => {
@@ -255,6 +259,22 @@ run('manager acceptance amendment on an in-flight task', () => {
     expect(await core.dispositionNotices(tokens.qa!, {})).toHaveLength(1);
   });
 
+  // 已批准语义：显式传入以传入为准，[] 表示不通知；只有省略 notify 才用缺省集合。
+  test('an explicit empty notify list notifies nobody and still writes the audit', async () => {
+    const taskId = await makeTask('显式空通知任务');
+    await execute(taskId);
+    await claim(taskId, 'eng2');
+    const before = await core.getTask(tokens.gm!, taskId);
+    const amended = await amend(taskId, before.version, { notify: [] });
+    expect(amended.context).toContain(OWNER_QUOTE);
+    // 持有人、实现人、最近提交人都没有收到通知。
+    for (const who of ['eng2', 'eng', 'qa']) expect(await core.dispositionNotices(tokens[who]!, {})).toHaveLength(0);
+    const [[audit]] = await database.db.query<[[Record<string, unknown>]]>(
+      `SELECT * FROM audit WHERE task = $task AND action = 'acceptance_amend' ORDER BY at DESC LIMIT 1;`,
+      { task: new RecordId('task', taskId) });
+    expect(JSON.parse(String(audit.evidence))).toMatchObject({ notify: [], expectedVersion: before.version });
+  });
+
   // 复核退回 round-01（P1）：并发两次 amend 曾各自在事务外读旧 context 再整体覆写，后写者覆盖先写者，
   // 审计说有两条修订而任务可读位置只剩一条。拼接移进事务后，两条都必须落地。
   test('two concurrent amendments both land in the context, with two audits and one notice each', async () => {
@@ -294,6 +314,7 @@ run('manager acceptance amendment on an in-flight task', () => {
   });
 
   // MAX_CONTEXT 的上限检查随拼接一起移进事务：超限的那一次整笔回滚，任务上下文停在上一条修订。
+  // 上限与创建时一致（20000 字符），而不是另一套更大的数。
   test('an amendment that would push the context past the cap is refused and writes nothing', async () => {
     const taskId = await makeTask('上下文上限任务');
     const quote = '老'.repeat(4000);
@@ -323,7 +344,7 @@ run('manager acceptance amendment on an in-flight task', () => {
       `SELECT count() AS n FROM audit WHERE task = $task AND action = 'acceptance_amend' GROUP ALL;`,
       { task: new RecordId('task', taskId) });
     expect(counts?.n).toBe(rounds - 1);
-    expect(context.length).toBeLessThanOrEqual(100_000);
+    expect(context.length).toBeLessThanOrEqual(20_000);
     expect(context.trimEnd().endsWith(text)).toBe(true);
   });
 });

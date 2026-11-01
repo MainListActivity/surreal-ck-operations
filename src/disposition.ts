@@ -34,7 +34,7 @@ export type DispositionClaimStatus = 'claimed' | 'decided';
 export type DispositionNoticeKind = 'disposition_decided' | 'dependency_wait' | 'resumed' | 'claim_revoked'
   | 'claim_taken_over' | 'external_action' | 'external_action_unknown'
   // SYS-INT：经理对在途任务追加验收要求修订后的持有人通知（正文与审计在 core.taskAcceptanceAmend 写）。
-  | 'acceptance_amend';
+  | 'acceptance_amended';
 
 /**
  * episode 身份：任务 + 阶段 + 阶段开始毫秒。与调度器的 managerWakeKey / managerActionKey 同源，
