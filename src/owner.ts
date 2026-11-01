@@ -134,9 +134,11 @@ export class OwnerDesk {
         specVars.acceptance_criteria = t.acceptanceCriteria;
         specVars.acceptance_version = 1;
       }
+      // The quick legs' lane intent: without it the claim falls back to read (release) and lands in the shared read-only tree.
+      if (t.workIntent) specVars.work_intent = t.workIntent;
       vars[`spec${i}`] = specVars;
       return `CREATE ONLY $t${i} CONTENT { title: $spec${i}.title, context: $spec${i}.context, kind: $spec${i}.kind,
-          executor_role: $spec${i}.executor_role, reviewer_role: $spec${i}.reviewer_role, dependencies: $spec${i}.dependencies,
+          executor_role: $spec${i}.executor_role, reviewer_role: $spec${i}.reviewer_role, dependencies: $spec${i}.dependencies, work_intent: $spec${i}.work_intent,
           acceptance_criteria: $spec${i}.acceptance_criteria,
           acceptance_version: IF array::len($spec${i}.acceptance_criteria ?? []) > 0 THEN 1 ELSE NONE END,
           acceptance_legacy: false, acceptance_head: NONE, acceptance_environment: NONE, acceptance_attempt: 0,

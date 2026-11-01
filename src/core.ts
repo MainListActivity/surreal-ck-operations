@@ -1592,13 +1592,15 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   /**
    * Submit-time system checks (type errors, version metadata, tool wiring) on an engineering code submit to the ops repo.
+   * The release task that carries a quick chain's code leg is checked the same way; read-intent legs are not.
    * A failure refuses the submit before review: the author keeps the lease and fixes it, no reviewer is dispatched. Each
    * refusal is audited as submit_check_failed, which scoring counts against the author. A check that cannot run lets
    * the submit through; the reviewer still checks.
    */
   private async refuseFailedSystemChecks(proof: LeaseProof, employeeId: string): Promise<void> {
     const row = await this.db.select<TaskRow>(id('task', proof.taskId));
-    if (!row || row.executor_role !== 'engineering' || (row.kind ?? 'task') !== 'task' || row.work_intent?.kind !== 'code') return;
+    if (!row || row.executor_role !== 'engineering' || row.work_intent?.kind !== 'code') return;
+    if (!['task', 'release'].includes(row.kind ?? 'task')) return;
     if (row.current_employee !== employeeId || row.fence !== proof.fence) return;
     const tree = row.worktree;
     if (!tree?.worktreePath) return;

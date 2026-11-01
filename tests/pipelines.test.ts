@@ -51,3 +51,22 @@ test('pipeline ids', () => {
   expect([...PIPELINES]).toEqual(['software', 'video', 'story']);
   expect(isPipeline('story')).toBe(true); expect(isPipeline('novel')).toBe(false); expect(isPipeline(undefined)).toBe(false);
 });
+
+test('quick goals write one code lane onto both legs of the merged chain', () => {
+  const t = goalTemplate('quick', '修复按钮', '按钮错位', 'g4');
+  const legs = t.tasks.filter(x => x.ref !== 'manual');
+  expect(legs.map(x => [x.ref, x.kind, x.workIntent?.kind, x.deps])).toEqual([['d0', 'release', 'code', []], ['d1', 'deploy', 'code', ['d0']]]);
+  const lane = legs[0]!.workIntent?.lane;
+  expect(lane).toMatch(/^delivery-[0-9a-f]{8}$/);
+  expect(legs[1]!.workIntent).toEqual({ kind: 'code', lane });
+  expect(t.tasks.find(x => x.ref === 'manual')!.workIntent).toBeUndefined();
+  // The lane belongs to the goal: the same goal names the same lane, another goal names a different one.
+  expect(goalTemplate('quick', '修复按钮', '按钮错位', 'g4').tasks[0]!.workIntent?.lane).toBe(lane);
+  expect(goalTemplate('quick', '修复按钮', '按钮错位', 'g5').tasks[0]!.workIntent?.lane).not.toBe(lane);
+});
+
+test('standard and program plans carry no intent: create_delivery sets it per leg', () => {
+  for (const tier of ['standard', 'program'] as const) {
+    expect(goalTemplate(tier, '改个按钮', '按钮错位', 'g6').tasks.some(x => x.workIntent !== undefined)).toBe(false);
+  }
+});

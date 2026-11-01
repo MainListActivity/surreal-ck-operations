@@ -456,6 +456,9 @@ run('creation binds the code repo up front: explicit, inferred from the ops repo
   // A delivery whose spec names the ops repo binds all three legs, including the read-intent release leg.
   const legs = await C.createDelivery(gm, { goalId, title: `交付链绑定 ${++count}`, spec: `改动在 ${repoOps} 的 src/ops，业务项目保持 maplayer-content`, idempotencyKey: key() });
   expect(legs.map(leg => leg.codeRepoPath)).toEqual([0, 1, 2].map(() => realpathSync(repoOps)));
+  // create_delivery keeps its intents: implement and deploy legs write code, the release leg is read, all on one lane.
+  expect(legs.map(leg => leg.workIntent?.kind)).toEqual(['code', 'read', 'code']);
+  expect(new Set(legs.map(leg => leg.workIntent?.lane)).size).toBe(1);
 });
 
 run('a blocked read-only engineering task becomes a code task in place', async () => {
@@ -496,6 +499,30 @@ run('a failed system check refuses an ops-repo code submit before review and is 
   problems = [];
   const submitted = await C.submit(eng8, proof(claim), { text: 'fixture submit after fixing the system check', idempotencyKey: key() });
   expect(submitted.state).toBe('review');
+});
+
+run('a failed system check also refuses the quick chain code leg (release kind); a read-intent release leg is not checked', async () => {
+  const problems = ['tsc 报 1 个类型错误：src/a.ts(1,1): error TS2322'];
+  const seen: string[] = [];
+  const C = new SurrealCompanyCore(db, { worktrees: { opsRepo: repoOps }, systemCheck: async ({ worktreePath }) => { seen.push(worktreePath); return problems; } });
+  const enrollment = new LocalEnrollmentAdmin(db);
+  const codeEng = await enrollment.enroll(`tp-quick-code-${++count}`, 'engineering', ['execute', 'review']);
+  const readEng = await enrollment.enroll(`tp-quick-read-${++count}`, 'engineering', ['execute', 'review']);
+  const leg = await C.createTask(gm, { title: `合并腿系统检查 ${++count}`, context: 'fixture', kind: 'release', executorRole: 'engineering', reviewerRole: 'product',
+    workIntent: { kind: 'code', lane: 'quick-check' }, idempotencyKey: key() });
+  const claim = await C.claim(codeEng, leg.id);
+  expect(claim.worktree!.mode).toBe('exclusive');
+  await expect(C.submit(codeEng, proof(claim), { text: 'quick leg submit that fails the system check', idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('系统检查未通过') });
+  expect(seen).toEqual([claim.worktree!.worktreePath]);
+  expect((await C.getTask(codeEng, leg.id)).state).toBe('doing');
+  expect(await auditRows(leg.id, 'submit_check_failed')).toHaveLength(1);
+  // A read-intent release leg is not checked: its submit goes through as before.
+  const readLeg = await C.createTask(gm, { title: `上线申请只读 ${++count}`, context: 'fixture', kind: 'release', executorRole: 'engineering', reviewerRole: 'product',
+    workIntent: { kind: 'read' }, idempotencyKey: key() });
+  const readClaim = await C.claim(readEng, readLeg.id);
+  expect((await C.submit(readEng, proof(readClaim), { text: 'read release leg submit', idempotencyKey: key() })).state).toBe('review');
+  expect(seen).toHaveLength(1);
 });
 
 run('a large goal closes in stages: open follow-ups move to a next-phase goal and the anchor unlocks', async () => {

@@ -4,7 +4,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
 import { CompanyDatabase } from '../src/database.ts';
-import { SurrealCompanyCore } from '../src/core.ts';
+import { asId, HASH, SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { ProjectStore } from '../src/projects.ts';
 import { Workforce } from '../src/workforce.ts';
@@ -695,6 +695,25 @@ run('LANE: a blocked task keeps its scene but does not lock the lane — a rewor
   // same lane still waits behind the actively-working rework task.
   await expect(core.claim(c, t3.id)).rejects.toMatchObject({ code: 'worktree_busy' });
   await submit(core, b, rework);
+}, 30000);
+run('QUICK: triage writes one code lane onto the merged and deploy legs; the merged leg claims an exclusive tree on that lane branch', async () => {
+  const path = repo(), core = coreFor(path), eng = await employee('engineering'), deployer = await employee('engineering');
+  const goal = await new OwnerDesk(db).createGoal({ text: 'Quick lane fixture goal', source: 'fixture', key: `quick-lane-${++count}` });
+  await core.triageGoal(gm, { goalId: goal.id, tier: 'quick', reason: 'Synthetic fixture triage of a quick goal' });
+  const [rows] = await db.db.query<[Array<{ id: RecordId; kind: string }>]>('SELECT id, kind FROM task WHERE goal = $goal;', { goal: new RecordId('goal', goal.id) });
+  const merged = asId(rows.find(row => row.kind === 'release')!.id), deploy = asId(rows.find(row => row.kind === 'deploy')!.id);
+  const lane = (await core.getTask(gm, merged)).workIntent?.lane;
+  expect(lane).toMatch(/^delivery-[0-9a-f]{8}$/);
+  // Without these intents the merged leg defaulted to read and landed in the shared read-only tree.
+  expect((await core.getTask(gm, merged)).workIntent).toEqual({ kind: 'code', lane });
+  expect((await core.getTask(gm, deploy)).workIntent).toEqual({ kind: 'code', lane });
+  const first = await core.claim(eng, merged);
+  expect(first.worktree!.mode).toBe('exclusive'); expect(first.worktree!.intent.kind).toBe('code');
+  expect(first.worktree!.lane).toBe(`${goal.id}:${lane}`);
+  expect(first.worktree!.branch).toBe(`lane/${HASH(`${goal.id}:${lane}`).slice(0, 8)}-${lane}`);
+  // The deploy leg waits for the merged leg, yet its write scope already names that writer: both legs are one lane.
+  expect(await core.writeScopeOf(deploy, (await core.authenticate(deployer)).employeeId))
+    .toEqual([{ taskId: merged, employee: (await core.authenticate(eng)).employeeId, intent: 'code' }]);
 }, 30000);
 run('LANE: a shared tree stranded on a task branch is moved back, and a stale unworked task branch restarts from the current base', async () => {
   const path = repo(), core = coreFor(path), qa = await employee('qa'), eng = await employee('engineering');
