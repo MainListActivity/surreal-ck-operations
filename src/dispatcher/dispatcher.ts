@@ -25,7 +25,7 @@ import { summarizeReclaim } from './artifact-sweeper.ts';
 import { executeGate } from '../contributors.ts';
 import { isRetireRefused } from '../retirement.ts';
 import { independenceHit, independenceText, type IndependenceScope } from '../independence.ts';
-import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, holderLabel, managerActionKey, repoName, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
+import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, holderLabel, managerActionKey, managerShortage, repoName, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
 export type { BlockCode, DispatchPhase, DispatchVerdict } from './dispatch-blocked.ts';
 
 /**
@@ -50,6 +50,8 @@ export function managedRecencyOrder<T extends { id: string; lastWakeAt?: number 
 /** Provider error text that means the subscription is out of budget or rate limited, not that the session is broken. */
 export const EXHAUSTED_PATTERN = /usage cap reached|out of credits|add credits|credit balance|usage balance|balance exhausted|payment required|quota|usage limit|rate.?limit|too many requests|\b402\b|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)|model_usage_exhausted|usage_exhausted|credits exhausted|out of usage|at capacity/i;
 const LEASE_SECONDS = 600;
+/** A manager gate that only waits for busy managers reaches the owner once it has waited this long. */
+const GM_QUEUE_NOTICE_MINUTES = 60;
 const LOG_TAIL_ENTRIES = 60;
 // Task-level cooldown after a claim denial; a version bump re-arms the task.
 const CLAIM_DENY_COOLDOWN_MS = 5 * 60_000;
@@ -1998,7 +2000,16 @@ export class Dispatcher {
       // Use the exact same pools as assign, without acquiring a wake only to
       // immediately release it. This remains quiet across dispatcher restarts.
       if (!eligibleInsts('gm', home, todo.task, false).length && !eligibleDefs('gm', home, todo.task).length) {
-        await this.notice(noticeKey, `项目 ${repoName(home)} 暂无可用经理；待办保留，检查经理编制、额度和容量。候选恢复后自动唤醒。`, report);
+        const shortage = managerShortage(poolFor('gm', home, todo.task, false), id => states.get(id) === 'busy');
+        const waitedMinutes = todo.episodeUnknown ? 0 : Math.floor((now * 1000 - todo.wakeEpisode) / 60_000);
+        if (shortage.queued && waitedMinutes < GM_QUEUE_NOTICE_MINUTES) {
+          // Every manager of this workspace is busy: the todo waits its turn, and the owner has nothing to fix.
+          report.decisions.push(`gm-queued:${todo.task.id}`);
+          await owner.resolveNotice(noticeKey);
+          continue;
+        }
+        const why = shortage.queued ? `本工作区经理已连续占满超过 ${GM_QUEUE_NOTICE_MINUTES} 分钟` : shortage.reasons.join('；');
+        await this.notice(noticeKey, `项目 ${repoName(home)} 暂无可用经理（${why}）；待办保留，候选恢复后自动唤醒。`, report);
         continue;
       }
       await owner.resolveNotice(noticeKey);
