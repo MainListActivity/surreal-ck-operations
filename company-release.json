@@ -1,7 +1,8 @@
 {
-  "version": "0.3.63",
+  "version": "0.3.64",
   "title": "FV06 有界待命接力",
   "changes": [
+    "经理在途任务验收要求追加工具 task_acceptance_amend（gm + manage）：对 ready/doing/review/blocked 任务追加老板验收要求修订，单事务写 task.context（下次领取的 claim.json 与 read_task_text field=context 可读）、审计 acceptance_amend（含老板原话逐字与修订说明）与持久 holder_notice；不改 state、租约字段（持有人/delivery/fence/到期）、依赖、验收标准、独立性、worktree，不移动任务版本（版本属于持有人租约证明，移动会打断在审租约），expectedVersion 仍做 CAS；缺省通知当前活租约持有人 + implementer + 最近 submitter，可经 holder_notices 读取与 ack。",
     "resume_task 增可选 standbyEmployee：带执行窗口的恢复可原子指派真实租约持有人（有界待命），事务写 doing、租约、fence+1、progress_at 与 standby_until=min(notAfter, now+standbyBudgetSeconds)，工作区经登记路径写入 worktree 与 worktree_ref。",
     "调度器对带待命标记的任务就地唤醒空闲持有人（60 秒节流，先从服务端租约重建会话凭证），待命期内豁免停滞与过期收回，待命超时回经理关口而非进入派工池。",
     "陈旧待命标记生命周期闭环（复验修复）：claimLease 新领即清 standby_until（同人续领保留自己的窗口）、revokeLease 收回即清、调度器唤醒/超时两分支与 standbyTimeout 事务都要求 state=doing 且标记仍在——submit 或收回后的残留标记不再销毁后续复核/派工租约。",
@@ -13,10 +14,11 @@
     "复验修复 R6：standby fail-closed 守卫只接受代码区的能力标记，忽略行注释与块注释（保留 SQL/template 字符串中的真实标记）；拒绝路径负例覆盖缺能力/预算/vendor 与注释伪标记。将 dispatcher-standby 单测注册进 test:bridge、standby fork 注册进 test-worktrees 默认目标并使用专用 RUN_SCK_STANDBY_RELAY_TESTS 门控。"
   ],
   "impact": [
+    "验收修订是纯追加：不改既有任务状态机与任何门禁，holder_notice 只多一种 kind；旧版 release 读到未知 kind 的通知按既有通用文本投递一次，修订正文在既有 task.context 中照常可读。",
     "只新增能力与保护：默认路径逐字段不变（不带 standbyEmployee 的恢复、派工、超时、回收与既有诊断位均保持原语义）。",
     "provider 与额度判定抽到共享模块，调度器与待命守卫读同一份逻辑与数据，行为不变。",
     "无采样者身份的既有候选仍按旧契约可验收；新登记链携带采样者后，采样者与批准者必须异人。"
   ],
-  "migration": "无数据迁移或 schema、secret 变更；standby_until 为 schemaless 任务字段。",
-  "rollback": "无兼容目标时保持当前健康版本、受控 hold 或前向修复，不回退到不含待命协议的旧版本（守卫拒绝）；细则见 docs/company-service-operations.md §5。待命期任务按普通租约继续且不会伪造或延长执行窗口。"
+  "migration": "schema 047 仅以 DEFINE FIELD OVERWRITE 把 holder_notice.kind 白名单加一项（acceptance_amend），无数据迁移、无回填、无 secret 变更；standby_until 为 schemaless 任务字段。",
+  "rollback": "无兼容目标时保持当前健康版本、受控 hold 或前向修复，不回退到不含待命协议的旧版本（守卫拒绝）；细则见 docs/company-service-operations.md §5。待命期任务按普通租约继续且不会伪造或延长执行窗口。验收修订正文写在既有 task.context，回退旧版照常可读。"
 }
