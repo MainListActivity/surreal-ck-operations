@@ -1,15 +1,16 @@
 {
-  "version": "0.3.68",
-  "title": "quick 链合并腿共用 code 车道",
+  "version": "0.3.69",
+  "title": "quick 链建单写入代码仓，写明运营仓路径的公司升级卡不再被拒",
   "changes": [
-    "quick 目标的「实现与上线申请」合并腿与「合入部署与生产实测」部署腿建单时写入同一个 code 车道，工程员工可在该车道 commit 与 push。",
-    "triage 建单路径写入 work_intent；triage_goal、CLI/MCP 建目标与 Jev 分级一致覆盖。",
-    "提交前系统检查扩到 kind=release 且 intent=code 的合并腿；只收紧，read 意图的上线申请腿与其他任务行为不变。"
+    "quick 目标的「实现与上线申请」合并腿与「合入部署与生产实测」部署腿建单时，按 create_delivery 同一规则写入 code_repo_path：spec 写明运营仓绝对路径即绑定运营仓。",
+    "triage_goal、owner CLI 与 Jev 分级都经同一建单路径；spec 写明运营仓路径的公司系统 quick 目标，部署腿提交公司升级卡时不再因未绑定代码仓被拒。",
+    "create_delivery 与 create_task 对无业务项目的目标同样生效：代码类任务的 spec 写明运营仓路径即绑定运营仓；产品仓 quick 目标未写明运营仓路径时行为不变。"
   ],
   "impact": [
-    "只影响新建的 quick 目标；标准 create_delivery 链、standard 与 program 计划的行为不变。存量在途的 quick 合并腿不做数据迁移，已建任务的 work_intent 保持原样。",
-    "quick 合并腿带 code 车道后，提交时执行系统检查；检查失败拒绝提交并写 submit_check_failed 审计。"
+    "只影响此后新建、且 spec 写明运营仓路径的代码类任务；未写明运营仓路径的任务路由与改动前一致，standard 与 program 计划的其它行为不变。",
+    "存量在途的 quick 链任务不做数据迁移：code_repo_path 为空的任务由经理用 bind_task_code_repo 逐个改绑，本版本不改写任何已有数据。",
+    "未写明运营仓路径的公司系统 quick 目标仍不绑定代码仓，其部署腿送公司升级卡仍会被拒：经理需在建单 brief 写明运营仓绝对路径，或用 bind_task_code_repo 改绑。"
   ],
-  "migration": "无：本版本不新增 schema、不改写数据；存量在途 quick 合并腿不迁移",
-  "rollback": "切回上一固定版本 0.3.67（releases/fca1b6a）；回退后新建 quick 链回到合并腿 read 的旧行为，已建任务无需数据回滚"
+  "migration": "无：本版本不新增 schema、不改写数据；存量在途任务不迁移，由经理逐个改绑",
+  "rollback": "切回上一固定版本 0.3.68（releases/1d69642）；回退后新建 quick 链又会缺 code_repo_path，即公司升级卡被拒的旧行为，已建任务无需数据回滚"
 }

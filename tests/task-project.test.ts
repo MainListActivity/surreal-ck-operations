@@ -7,6 +7,7 @@ import { CompanyDatabase } from '../src/database.ts';
 import { asId, SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { ProjectStore } from '../src/projects.ts';
+import { OwnerDesk } from '../src/owner.ts';
 import { Workforce } from '../src/workforce.ts';
 import type { ClaimResult, LeaseProof } from '../src/contracts.ts';
 
@@ -459,6 +460,96 @@ run('creation binds the code repo up front: explicit, inferred from the ops repo
   // create_delivery keeps its intents: implement and deploy legs write code, the release leg is read, all on one lane.
   expect(legs.map(leg => leg.workIntent?.kind)).toEqual(['code', 'read', 'code']);
   expect(new Set(legs.map(leg => leg.workIntent?.lane)).size).toBe(1);
+});
+
+run('create_delivery on a goal without a project binds its legs only when the spec names the ops repo', async () => {
+  const C = core();
+  const [grows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: '无项目交付链', brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
+  const goalId = asId(grows[0]!.id);
+  // The company system has no business project, so naming its repo path is what binds the legs, as it does under a project.
+  const named = await C.createDelivery(gm, { goalId, title: `无项目绑定 ${++count}`, spec: `改动在 ${repoOps} 的 src/ops，目标没有业务项目`, idempotencyKey: key() });
+  expect(named.map(leg => leg.codeRepoPath)).toEqual([0, 1, 2].map(() => realpathSync(repoOps)));
+  const plain = await C.createDelivery(gm, { goalId, title: `无项目普通 ${++count}`, spec: '改动只涉及产品仓库里的按钮文案，不提运营仓路径', idempotencyKey: key() });
+  expect(plain.map(leg => leg.codeRepoPath)).toEqual([undefined, undefined, undefined]);
+});
+
+/** Company-system ops repo fixture: one released main commit whose company-release.json matches its package.json. */
+const companyOpsRepo = (name: string, version: string) => {
+  const path = join(dir, name);
+  const git = (...args: string[]) => {
+    const r = Bun.spawnSync(['git', '-C', path, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', ...args], { stdout: 'pipe', stderr: 'pipe' });
+    if (r.exitCode) throw new Error(r.stderr.toString());
+    return r.stdout.toString().trim();
+  };
+  Bun.spawnSync(['git', 'init', '-q', '-b', 'main', path]);
+  writeFileSync(join(path, 'package.json'), JSON.stringify({ version }));
+  writeFileSync(join(path, 'company-release.json'), JSON.stringify({ version, title: '夹具公司系统', changes: ['夹具：quick 链建单写入代码仓'],
+    impact: ['夹具：只影响测试仓库'], migration: '无：夹具不改数据', rollback: '切回上一固定版本' }));
+  git('add', '.');
+  git('commit', '-qm', 'release');
+  const sha = git('rev-parse', 'HEAD');
+  git('update-ref', 'refs/remotes/origin/main', sha);
+  return { path, sha };
+};
+/** A goal waiting in triage; its brief is the spec the quick legs carry. */
+const triageFixtureGoal = async (brief: string, withProject = false) => {
+  const project = withProject ? 'project: project:`maplayer-content`, ' : '';
+  const [rows] = await db.db.query<[Array<{ id: RecordId }>]>(
+    `CREATE goal CONTENT { title: $title, brief: $brief, state: 'triage', source: 'fixture', note: '', ${project}tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;`,
+    { title: brief.slice(0, 40), brief });
+  return asId(rows[0]!.id);
+};
+/** Every task of a goal, with the fields the code-repo binding decides. */
+const goalTasks = async (goalId: string) => {
+  const [rows] = await db.db.query<[Array<{ id: RecordId; kind: string; code_repo_path?: string; work_intent?: { kind: string; lane?: string } }>]>(
+    'SELECT id, kind, code_repo_path, work_intent FROM task WHERE goal = $goal;', { goal: new RecordId('goal', goalId) });
+  return rows;
+};
+/** The implement-and-release leg, then the deploy leg, of a quick goal. */
+const codeLegs = async (goalId: string) => {
+  const legs = await goalTasks(goalId);
+  const release = legs.find(t => t.kind === 'release'), deploy = legs.find(t => t.kind === 'deploy');
+  if (!release || !deploy) throw new Error('quick goal is missing its release or deploy leg');
+  return [release, deploy] as const;
+};
+
+run('quick triage on a company-system goal pins both legs to the ops repo the spec names; the deploy leg passes the company upgrade check', async () => {
+  // No project: before the fix the quick legs carried no code_repo_path, so the company upgrade card was refused as not ops.
+  const ops = companyOpsRepo('company-ops', '0.9.1');
+  const C = new SurrealCompanyCore(db, { worktrees: { opsRepo: ops.path }, companyReleaseRepo: ops.path });
+  const goalId = await triageFixtureGoal(`公司系统小改动：改动在 ${ops.path} 的 src/ops`);
+  await C.triageGoal(gm, { goalId, tier: 'quick', reason: 'fixture: 公司系统小改动走 quick 链' });
+  const [release, deploy] = await codeLegs(goalId);
+  expect(release!.code_repo_path).toBe(ops.path);
+  expect(deploy!.code_repo_path).toBe(ops.path);
+  expect(deploy!.work_intent).toEqual({ kind: 'code', lane: release!.work_intent!.lane });
+  // The deploy leg reports to the owner with a company upgrade card. Its release leg is not run here, so the fixture unblocks it.
+  await db.db.query("UPDATE ONLY $task SET dependencies = [], state = 'ready';", { task: deploy!.id });
+  const worker = await new LocalEnrollmentAdmin(db).enroll(`tp-quick-deploy-${++count}`, 'engineering', ['execute', 'review']);
+  const claim = await C.claim(worker, asId(deploy!.id));
+  const card = await C.block(worker, proof(claim), 'owner', { text: '夹具：部署腿登记公司系统上线版本，升级卡应通过校验', idempotencyKey: key(), companyUpgrade: { sha: ops.sha } });
+  expect(card).toMatchObject({ blockedTo: 'owner', companyUpgrade: { sha: ops.sha } });
+});
+
+run('quick goals on a product project keep project routing unless the spec names the ops repo', async () => {
+  const C = core();
+  const plain = await triageFixtureGoal('产品仓小改动：按钮文案调整', true);
+  await C.triageGoal(gm, { goalId: plain, tier: 'quick', reason: 'fixture: 产品仓小改动走 quick 链' });
+  expect((await codeLegs(plain)).map(t => t.code_repo_path)).toEqual([undefined, undefined]);
+  // Naming the ops repo binds the legs to it, as create_delivery does for a business project.
+  const named = await triageFixtureGoal(`产品仓小改动：参考 ${repoOps} 的发布脚本`, true);
+  await C.triageGoal(gm, { goalId: named, tier: 'quick', reason: 'fixture: 产品仓小改动走 quick 链' });
+  expect((await codeLegs(named)).map(t => t.code_repo_path)).toEqual([realpathSync(repoOps), realpathSync(repoOps)]);
+});
+
+run('the owner CLI and Jev tiering write the same quick legs as triage_goal', async () => {
+  const desk = new OwnerDesk(db, { opsRepo: repoOps });
+  const cli = await desk.createGoal({ text: `CLI 提出的小改动：改动在 ${repoOps} 的 src/ops`, source: 'cli', key: key(), tier: 'quick' });
+  const jev = await desk.createGoal({ text: `Jev 分级的小改动：改动在 ${repoOps} 的 src/ops`, source: 'cli', key: key() });
+  await desk.triage(jev.id, 'quick', 'jev（fixture）');
+  for (const goalId of [cli.id, jev.id]) {
+    expect((await codeLegs(goalId)).map(t => t.code_repo_path)).toEqual([realpathSync(repoOps), realpathSync(repoOps)]);
+  }
 });
 
 run('a blocked read-only engineering task becomes a code task in place', async () => {

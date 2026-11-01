@@ -5,7 +5,7 @@ import { ROLES, type CompanyBrief, type GoalTier, type GoalView, type OwnerDecis
 import { GOAL_TIERS, goalTemplate, isPipeline } from './flows.ts';
 import { ProjectStore } from './projects.ts';
 import type { BriefData, RoleCapacity, WaitingItem } from './owner-brief.ts';
-import { asId, CompanyError, depUnsatisfiedFor, HASH, id, REQUIRED_TRACKS, requireText, RESOLVE_DEP_SQL, UNLOCK_CHILDREN_SQL, UNLOCK_SQL, view, type IdempotencyRow, type TaskRow } from './core.ts';
+import { asId, CompanyError, depUnsatisfiedFor, HASH, id, opsPinnedRepo, opsRepoPath, REQUIRED_TRACKS, requireText, RESOLVE_DEP_SQL, UNLOCK_CHILDREN_SQL, UNLOCK_SQL, view, type IdempotencyRow, type TaskRow } from './core.ts';
 import { assertRoleContract, loadContract } from './role-contract.ts';
 import type { DispatchVerdict } from './dispatcher/dispatch-blocked.ts';
 import { dispatchBlockedList } from './dispatcher/dispatch-list.ts';
@@ -85,8 +85,11 @@ const briefDispatch = (verdicts: DispatchVerdict[]): BriefData['dispatchBlocked'
 
 export class OwnerDesk {
   private readonly goals: GoalGovernanceStore;
-  constructor(private readonly database: CompanyDatabase) {
+  /** The ops repo a code leg binds to when its brief names it, the same rule create_delivery applies. */
+  private readonly opsRepo: string;
+  constructor(private readonly database: CompanyDatabase, options?: { opsRepo?: string }) {
     this.goals = new GoalGovernanceStore(database.db);
+    this.opsRepo = options?.opsRepo ?? opsRepoPath();
   }
   private get db() { return this.database.db; }
 
@@ -123,6 +126,8 @@ export class OwnerDesk {
     if (!row) throw new CompanyError('not_found', 'goal not found');
     if (row.state !== 'triage') return goalView(row);
     const template = goalTemplate(tier, row.title, row.brief, goalId, isPipeline(row.pipeline) ? row.pipeline : 'software');
+    // Each leg's code repo follows create_delivery's rule, so every entry point (triage_goal, owner CLI, Jev) binds alike.
+    const projectRepo = row.project ? (await this.db.select<{ repo_path?: string }>(row.project))?.repo_path : undefined;
     const ids = Object.fromEntries(template.tasks.map(t => [t.ref, id('task', randomUUID())]));
     const vars: Record<string, unknown> = { goal, tier, via, source: `triage:${via}`.slice(0, 200) };
     const creates = template.tasks.map((t, i) => {
@@ -136,9 +141,13 @@ export class OwnerDesk {
       }
       // The quick legs' lane intent: without it the claim falls back to read (release) and lands in the shared read-only tree.
       if (t.workIntent) specVars.work_intent = t.workIntent;
+      // The company-upgrade check reads the bound repo: without it the quick deploy leg's upgrade card is refused.
+      const codeRepoPath = opsPinnedRepo({ kind: t.kind, workIntent: t.workIntent, context: t.context, opsRepo: this.opsRepo, projectRepo });
+      if (codeRepoPath !== undefined) specVars.code_repo_path = codeRepoPath;
       vars[`spec${i}`] = specVars;
       return `CREATE ONLY $t${i} CONTENT { title: $spec${i}.title, context: $spec${i}.context, kind: $spec${i}.kind,
           executor_role: $spec${i}.executor_role, reviewer_role: $spec${i}.reviewer_role, dependencies: $spec${i}.dependencies, work_intent: $spec${i}.work_intent,
+          code_repo_path: $spec${i}.code_repo_path,
           acceptance_criteria: $spec${i}.acceptance_criteria,
           acceptance_version: IF array::len($spec${i}.acceptance_criteria ?? []) > 0 THEN 1 ELSE NONE END,
           acceptance_legacy: false, acceptance_head: NONE, acceptance_environment: NONE, acceptance_attempt: 0,

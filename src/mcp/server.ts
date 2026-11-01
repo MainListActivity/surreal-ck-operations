@@ -372,7 +372,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : core.returnTask(token(ctx), proof(input), evidence(input))));
 
   server.registerTool('create_task', {
-    description: 'Create a managed company task; requires core manage capability. project optionally binds this one task to a registered project (takes precedence over the goal\'s project). codeRepoPath optionally sets the code repository the worktree is allocated in (the ops repo or a registered project repo; the business project is unchanged); without it a code/release/deploy task whose context names the ops repo path under a project with another repo is bound to the ops repo at creation, so it never claims into the business repo. revises=<直接上一版任务id> creates the controlled screenplay-revision edge: gm/product only, both drafts must be owner-reviewed screenwriter tasks on the 编剧 track (kind=task) in the same goal and project, and the target must be the unapproved chain tip whose latest submission was really rejected by the owner; the old draft voids with a supersededBy pointer and downstreams resolve to the chain tip.',
+    description: 'Create a managed company task; requires core manage capability. project optionally binds this one task to a registered project (takes precedence over the goal\'s project). codeRepoPath optionally sets the code repository the worktree is allocated in (the ops repo or a registered project repo; the business project is unchanged); without it a code/release/deploy task whose context names the ops repo path is bound to the ops repo at creation, with or without a project, so it never claims into the business repo. revises=<直接上一版任务id> creates the controlled screenplay-revision edge: gm/product only, both drafts must be owner-reviewed screenwriter tasks on the 编剧 track (kind=task) in the same goal and project, and the target must be the unapproved chain tip whose latest submission was really rejected by the owner; the old draft voids with a supersededBy pointer and downstreams resolve to the chain tip.',
     inputSchema: z.object({
       modelTier: z.enum(['fable','opus','sonnet','haiku','high','medium','low']).optional(),
       title: z.string().min(1), context: z.string().min(1),
@@ -442,7 +442,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('triage_goal', {
-    description: 'gm only: choose the flow for a goal waiting in triage. quick = one delivery chain, product acceptance closes it, owner not involved; standard = gm plans deliveries, owner G3; program = product scope proposal first, then plan, owner G3.',
+    description: 'gm only: choose the flow for a goal waiting in triage. quick = one delivery chain whose code legs bind the ops repo when the brief names its absolute path (as create_delivery does), product acceptance closes it, owner not involved; standard = gm plans deliveries, owner G3; program = product scope proposal first, then plan, owner G3.',
     inputSchema: z.object({ goalId: z.string().min(1), tier: z.enum(tiers), reason: z.string().min(4) }),
   }, async (input, ctx) => run(token(ctx), () => core.triageGoal(token(ctx), input)));
 

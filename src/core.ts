@@ -449,7 +449,7 @@ export function view(row: TaskRow): TaskView {
 }
 
 /** Ops repo (agent home); mirrors the plugin/MCP wiring fallback for SCK_AGENT_CWD. */
-const opsRepoPath = () => process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
+export const opsRepoPath = () => process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
 
 /** Whether `text` names `repo` as a whole path (…/surreal-ck-operations, not …/surreal-ck-operations-four-tier). */
 export function namesRepo(text: string, repo: string): boolean {
@@ -457,6 +457,26 @@ export function namesRepo(text: string, repo: string): boolean {
     if (!/[\w-]/.test(text[at + repo.length] ?? '')) return true;
   }
   return false;
+}
+
+/** Whether a task writes code: a release or deploy leg, or a code intent. */
+export const writesCode = (kind: TaskKind, workIntent?: WorkIntent): boolean =>
+  kind === 'release' || kind === 'deploy' || workIntent?.kind === 'code';
+
+/**
+ * The ops repo a task binds to at creation: the rule create_task, create_delivery and the quick chain share. A code-writing
+ * task whose context names the ops repo's absolute path is bound to it, so it never claims into the business repo. A target
+ * project that already is the ops repo needs no binding (routing lands there anyway). Undefined keeps project routing.
+ */
+export function opsPinnedRepo(input: { kind: TaskKind; workIntent?: WorkIntent; context: string; opsRepo: string; projectRepo?: string }): string | undefined {
+  if (!writesCode(input.kind, input.workIntent) || !namesRepo(input.context, input.opsRepo)) return undefined;
+  try {
+    const ops = canonicalRepoPath(input.opsRepo);
+    if (input.projectRepo !== undefined && canonicalRepoPath(input.projectRepo) === ops) return undefined;
+    return ops;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -668,7 +688,7 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     this.leaseSeconds = seconds;
     this.checkpointLimit = options?.checkpointLimit ?? DEFAULT_CHECKPOINT_LIMIT;
     this.workforce = options?.workforce;
-    this.owner = new OwnerDesk(database);
+    this.owner = new OwnerDesk(database, { opsRepo: options?.worktrees?.opsRepo ?? opsRepoPath() });
     this.dispositions = new DispositionLedger(database);
     this.projects = new ProjectStore(database.db);
     this.worktrees = options?.worktrees ? new WorktreeRegistry(database.db, options.worktrees) : undefined;
@@ -1616,7 +1636,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * The code repository a new task is bound to at creation, so its first claim already lands in the right tree instead of
    * the business project's repo (the wrong-repo block → bind_task_code_repo → re-dispatch loop). An explicit codeRepoPath
    * must be on the bind allowlist. Without one, a task that writes code (code intent, release or deploy leg) whose
-   * project repo is not the ops repo, and whose context names the ops repo's absolute path, is bound to the ops repo:
+   * context names the ops repo's absolute path is bound to the ops repo, unless its project repo already is the ops repo:
    * that is how managers already state "the code is in operations, the business project stays". Anything else keeps
    * project routing (undefined).
    */
@@ -1630,16 +1650,12 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       if (!(await this.allowedCodeRepos()).has(bound)) throw new CompanyError('forbidden', 'codeRepoPath is not a registered project repo or the ops repo');
       return bound;
     }
-    const writes = kind === 'release' || kind === 'deploy' || input.workIntent?.kind === 'code';
-    if (!writes) return undefined;
     const ops = this.worktrees?.options.opsRepo ?? opsRepoPath();
-    if (!namesRepo(input.context, ops)) return undefined;
+    // The project is read only for a code write that names the ops repo; every other creation keeps its reads.
+    if (!writesCode(kind, input.workIntent) || !namesRepo(input.context, ops)) return undefined;
     const project = input.project ? await this.projects.get(input.project)
       : input.goalId ? await this.goalProject(input.goalId) : undefined;
-    if (!project?.repoPath) return undefined;
-    let opsCanon: string, projectCanon: string;
-    try { opsCanon = canonicalRepoPath(ops); projectCanon = canonicalRepoPath(project.repoPath); } catch { return undefined; }
-    return opsCanon === projectCanon ? undefined : opsCanon;
+    return opsPinnedRepo({ kind, workIntent: input.workIntent, context: input.context, opsRepo: ops, projectRepo: project?.repoPath });
   }
 
   private async goalProject(goalId: string): Promise<ProjectView | undefined> {
