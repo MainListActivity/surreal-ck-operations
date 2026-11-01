@@ -689,9 +689,39 @@ test('no eligible GM never acquires/releases wake claims on repeated ticks; reco
   for (let n = 0; n < 4; n++) await f.tick(); // fixture recreates Dispatcher: includes restart behavior
   expect(f.wakes.size).toBe(0);
   expect(f.prompts).toHaveLength(0);
-  expect([...f.notices.keys()].some(k => k.startsWith('gm-unavailable:'))).toBe(true);
+  const raised = [...f.notices.entries()].find(([k]) => k.startsWith('gm-unavailable:'));
+  expect(raised?.[1].text).toContain('编制已停用');
   f.defs.find(d => d.role === 'gm')!.enabled = true;
   expect((await f.tick()).woke.some(w => w.task === 'fixture-no-gm')).toBe(true);
+});
+
+test('busy managers filling the workspace are a queue, not an outage; a queue past an hour reaches the owner', async () => {
+  const f = fixture([{ id: 'q-busy', blockedTo: 'gm' }]);
+  const gm = f.defs.find(d => d.role === 'gm')!;
+  gm.maxInstances = 1;
+  f.instances.push({ id: 'gm-busy', def: gm.id, role: 'gm', provider: gm.provider, model: gm.model, paseoAgentId: 'agent-gm-busy',
+    cwd: OPS, repoHome: OPS, workspaceScope: 'maintenance', credential: 'cred-gm-busy' });
+  f.agents.set('agent-gm-busy', { id: 'agent-gm-busy', status: 'running' });
+  const open = () => [...f.notices.entries()].filter(([k, n]) => k.startsWith('gm-unavailable:') && !n.resolved);
+  const first = await f.tick();
+  expect(first.decisions).toContain('gm-queued:q-busy');
+  expect(open()).toHaveLength(0);
+  // The same seats held for over an hour since the gate opened: now the owner hears about it.
+  f.rows[0]!.dispatchBlockedSince = 1_000_000 - 61 * 60;
+  await f.tick();
+  expect(open()).toHaveLength(1);
+  expect(open()[0]![1].text).toContain('连续占满');
+});
+
+test('a seat held by a manager that is down is an outage, not a queue', async () => {
+  const f = fixture([{ id: 'q-down', blockedTo: 'gm' }]);
+  const gm = f.defs.find(d => d.role === 'gm')!;
+  gm.maxInstances = 1;
+  f.instances.push({ id: 'gm-down', def: gm.id, role: 'gm', provider: gm.provider, model: gm.model, paseoAgentId: 'agent-gm-down',
+    cwd: OPS, repoHome: OPS, workspaceScope: 'maintenance', credential: 'cred-gm-down' });
+  f.agents.set('agent-gm-down', { id: 'agent-gm-down', status: 'error' });
+  const report = await f.tick();
+  expect(report.decisions).not.toContain('gm-queued:q-down');
 });
 
 test('a gm-unavailable notice closes once its workspace has no manager work left, and stays while it does', async () => {
