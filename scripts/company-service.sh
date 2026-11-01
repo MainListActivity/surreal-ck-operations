@@ -138,6 +138,7 @@ case "$action" in
     # Keep the already-installed provider wrapper current without changing daemon configuration.
     if [ -d "$service_home/sandbox" ]; then
       install -m 0755 "$release/scripts/sandbox/launch.sh" "$service_home/sandbox/launch.sh"
+      sh "$release/scripts/sandbox/build-ps.sh" "$service_home/sandbox" || echo "warning: sandbox ps shim build failed" >&2
     fi
     cp "$(dirname "$0")/sck.sh" "$service_home/bin/sck"
     cp "$(dirname "$0")/bun-runtime.sh" "$service_home/bin/bun-runtime.sh"

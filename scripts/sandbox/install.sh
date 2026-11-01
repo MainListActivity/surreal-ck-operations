@@ -13,6 +13,7 @@ paseo=${SCK_PASEO_BIN:-/Applications/Paseo.app/Contents/Resources/bin/paseo}
 mkdir -p "$dest/bin"
 install -m 0644 "$src/employee.sb" "$dest/employee.sb"
 install -m 0755 "$src/launch.sh" "$dest/launch.sh"
+sh "$src/build-ps.sh" "$dest"
 
 # Paseo's claude provider takes only argv[0] of a replaced command, so each provider gets an executable.
 wrap() { # wrap <name> <real binary>
