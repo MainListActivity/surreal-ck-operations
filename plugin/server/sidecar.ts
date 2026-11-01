@@ -104,7 +104,7 @@ const RETIRED_TOOLS = new Set(["get_secret", "put_secret"]);
 const ATTACHED_NOTICE_LIMIT = 3;
 
 /** What a successful reply carries besides its data: the unacked holder notices that fit its budget, and the cut when
- *  some did not (the cut notices stay unacked and are attached again on the next call). */
+ *  some were left out, by the budget or the per-reply limit (the cut notices stay unacked and are attached again on the next call). */
 export interface AttachedNotices { notices?: unknown[]; noticesTruncated?: NoticeCut }
 
 const hash = (text: string | undefined) => (text === undefined ? undefined : createHash("sha256").update(text).digest("hex"));
@@ -364,8 +364,7 @@ export class SidecarPool {
     try {
       const pending = await read(await this.credentialFor(instId));
       if (!pending.length) return {};
-      const fitted = fitAttachedNotices(data, pending.slice(0, ATTACHED_NOTICE_LIMIT));
-      return fitted ?? { notices: pending.slice(0, ATTACHED_NOTICE_LIMIT) };
+      return fitAttachedNotices(data, pending, ATTACHED_NOTICE_LIMIT) ?? { notices: pending };
     } catch (error) {
       this.log(`attach notices ${instId} failed: ${(error as Error).message}`);
       return {};

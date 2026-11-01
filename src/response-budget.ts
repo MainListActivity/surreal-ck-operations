@@ -222,35 +222,48 @@ export function longestFittingPrefix(text: string, fits: (prefix: string) => boo
 }
 
 /**
- * Bytes one relay reply takes as the sidecar writes it: the single JSON line the caller reads, envelope included. The
- * data-only case keeps the shared MCP-measured value (answerBytes: the answer twice, plus the frame reserve), which is
- * stricter than this line and is what the relay has always admitted or refused — so nothing that fits today is newly
- * refused, and nothing that is refused today becomes admitted. A reply that also carries the unacked holder notices
- * attached to the call (SYS-INT) is measured as the line it becomes: the whole serialized reply, notices included (R3).
- * Measuring only `data` would let a large attachment pass a guard that reads as if it had been checked.
+ * Bytes one relay reply, as the guard measures it. The data is judged as it always was: answerBytes, the answer twice plus the
+ * frame reserve, which is stricter than the single JSON line the caller reads. So a reply without notices is measured exactly as
+ * before, and nothing that fits today is newly refused. A reply that carries unacked holder notices (SYS-INT) must also fit as the
+ * line it becomes, with the notices and noticesTruncated written once (R3). The larger of the two is the measure, so attaching
+ * notices can only make the judgement stricter, and a reply that passes is always within the budget.
  */
-export const relayReplyBytes = (res: { ok: boolean; data?: unknown; error?: string; notices?: unknown[] }): number =>
-  res.notices === undefined
-    ? answerBytes(res.data)
-    : jsonBytes({ ok: true, data: res.data ?? null, notices: res.notices });
+export const relayReplyBytes = (res: { ok: boolean; data?: unknown; error?: string; notices?: unknown[]; noticesTruncated?: unknown }): number => {
+  const answer = answerBytes(res.data);
+  if (res.notices === undefined && res.noticesTruncated === undefined) return answer;
+  const line = jsonBytes({
+    ok: true, data: res.data ?? null,
+    ...(res.notices === undefined ? {} : { notices: res.notices }),
+    ...(res.noticesTruncated === undefined ? {} : { noticesTruncated: res.noticesTruncated }),
+  });
+  return Math.max(answer, line);
+};
 
-/**
- * The notices that fit the remaining budget of one reply, for a data answer that already fits on its own. The cut is a
- * prefix in delivery order: every notice left out stays unacked, so the next call attaches it again — a holder sees a
- * large backlog late, never never. Undefined when every notice fits, so the caller keeps its own list untouched.
- */
+/** The report of the notices one reply left out: how many, their JSON bytes, and the SHA-256 of exactly those notices. */
 export interface NoticeCut extends ListCut { bytes: number }
-export function fitAttachedNotices(data: unknown, notices: unknown[]): { notices: unknown[]; noticesTruncated: NoticeCut } | undefined {
-  const kept: unknown[] = [];
-  for (const notice of notices) {
-    const candidate = [...kept, notice];
-    if (relayReplyBytes({ ok: true, data, notices: candidate }) > RESPONSE_BUDGET_BYTES) break;
-    kept.push(notice);
+const cutReport = (cut: unknown[]): NoticeCut => ({
+  count: cut.length, bytes: jsonBytes(cut), sha256: createHash('sha256').update(JSON.stringify(cut)).digest('hex'),
+});
+/**
+ * The notices one reply can carry beside its data, in delivery order, at most `limit` of them. Undefined when every notice fits, so
+ * the caller keeps its own list. Otherwise the reply keeps the longest prefix whose whole line fits, and noticesTruncated describes
+ * only the notices left out, whether the budget or the limit left them out: their count, their JSON bytes, and the digest of exactly
+ * those. A notice left out stays unacked and is attached on a later call. When the data is over budget on its own, no notice fits:
+ * none is kept, all are reported, and the guard refuses the reply.
+ */
+export function fitAttachedNotices(data: unknown, notices: unknown[], limit: number = notices.length): { notices: unknown[]; noticesTruncated: NoticeCut } | undefined {
+  if (notices.length === 0) return undefined;
+  // The longest prefix of at most `limit` notices whose whole reply fits. Everything after the prefix, including what the limit left out, is cut.
+  for (let keep = Math.min(limit, notices.length); keep >= 0; keep--) {
+    if (keep === notices.length) {
+      if (relayReplyBytes({ ok: true, data, notices }) <= RESPONSE_BUDGET_BYTES) return undefined;
+      continue;
+    }
+    const reply = { ok: true, data, notices: notices.slice(0, keep), noticesTruncated: cutReport(notices.slice(keep)) };
+    if (relayReplyBytes(reply) <= RESPONSE_BUDGET_BYTES) return { notices: reply.notices, noticesTruncated: reply.noticesTruncated };
   }
-  if (kept.length === notices.length) return undefined;
-  return { notices: kept, noticesTruncated: {
-    count: notices.length, bytes: jsonBytes(notices), sha256: createHash('sha256').update(JSON.stringify(notices)).digest('hex'),
-  } };
+  // Nothing fits beside the data, so the data is over budget on its own: the guard refuses the reply and every notice stays unacked.
+  return { notices: [], noticesTruncated: cutReport(notices) };
 }
 
 /**
@@ -258,7 +271,7 @@ export function fitAttachedNotices(data: unknown, notices: unknown[]): { notices
  * (answerBytes of its data, and the whole reply line when attached notices ride along with it), is replaced by a
  * recoverable, JSON-legal error with its code, so an oversize value can never reach the caller as a cut byte stream.
  */
-export function guardRelayResponse<T extends { ok: boolean; data?: unknown; error?: string; notices?: unknown[] }>(res: T):
+export function guardRelayResponse<T extends { ok: boolean; data?: unknown; error?: string; notices?: unknown[]; noticesTruncated?: unknown }>(res: T):
   T | { ok: false; code: 'response_too_large'; retryable: false; error: string } {
   if (!res.ok) return res;
   const bytes = relayReplyBytes(res);

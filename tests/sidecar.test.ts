@@ -297,7 +297,7 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     const attached = (fitted.notices ?? []) as Array<{ noticeKey: string }>;
     expect(attached.length).toBeGreaterThan(0);
     expect(attached.length).toBeLessThan(3);
-    expect(fitted.noticesTruncated).toMatchObject({ count: 3 });
+    expect(fitted.noticesTruncated).toMatchObject({ count: 1 });
     // 被截掉的正是放不进剩余预算的那一条（这里第三条 24 KB 的正文放不下），且它仍未确认、没有被丢。
     expect(new Set(attached.map(n => n.noticeKey))).toEqual(new Set([bigNotice(1).noticeKey, bigNotice(2).noticeKey]));
 
@@ -309,7 +309,7 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     expect(Buffer.byteLength(JSON.stringify(next), 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
     expect(new Set(((next.notices ?? []) as Array<{ noticeKey: string }>).map(n => n.noticeKey)))
       .toEqual(new Set([bigNotice(1).noticeKey, bigNotice(2).noticeKey]));
-    expect(next.noticesTruncated).toMatchObject({ count: 3 });
+    expect(next.noticesTruncated).toMatchObject({ count: 1 });
 
     // 第三条照旧可读：holder_notices 自己读全量，但它的回显同样受同一预算约束，所以用缩小的 ids 逐条读；
     // 被截掉的那条不会因此丢失，ack 之后才彻底消失。

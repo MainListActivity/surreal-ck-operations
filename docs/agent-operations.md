@@ -169,7 +169,7 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 - 范围：只接受 `ready` / `doing` / `review` / `blocked`；`done` / `void` 返回 `conflict`。非 gm（含 product）与无 manage 能力返回 `forbidden`。
 - 只追加：不改 `state`、`blocked_to` / `resume_*`、依赖、`acceptance_criteria` / `acceptance_version`、独立性策略、worktree 与租约字段（持有人、delivery、fence、到期时间），不放宽验收机器项、独立验收、额度或依赖。任务版本也不移动——版本是持有人租约证明的一部分，移动会让持有人在通道心跳重新同步前（最多 60 秒）的 checkpoint/submit 撞上租约失效；`expectedVersion` 仍做 compare-and-set，读到过期任务即 `conflict`。
 - 落库：单事务把修订追加到 `task.context`——拼接在事务内由被锁的行算出（`$t.context + 修订块`），不在事务外读旧值再整体覆写；同一版本并发两次修订两条都落地（输的一方拿到可重试的写冲突后整笔重跑，重跑会读到对手的正文）。追加后总长上限 20000 字符（与创建时一致），超限整笔回滚并返回 `invalid`，检查也在同一事务内。审计 `action=acceptance_amend`（`evidence` 为 JSON：`ownerQuote` 逐字原话、`text`、`notify` 入参、`expectedVersion`）与 outbox 同事务写入。
-- 通知：`notify` 缺省为「当前活租约持有人 + implementer + 最近 submitter」去重；显式传入以传入为准，`[]` 表示不通知（审计照写）。每人一条持久 `holder_notice`（kind `acceptance_amended`），经 `holder_notices` 读取与 `ack`，通道重连或插件重启后由调度补发；租约内持有人不被中断——sidecar 会把未确认通知附在该员工下一次 `sck` 调用的回包顶层（`notices`，最多 3 条，`ack` 后不再附带）。附带的通知与回包数据共用同一个 48 KiB 预算：放不下的通知不附带，回包带 `noticesTruncated`（`count` / `bytes` / `sha256`），未附带的仍未确认，下一次调用再附带，不会丢失。未知员工 ID 返回 `invalid`。
+- 通知：`notify` 缺省为「当前活租约持有人 + implementer + 最近 submitter」去重；显式传入以传入为准，`[]` 表示不通知（审计照写）。每人一条持久 `holder_notice`（kind `acceptance_amended`），经 `holder_notices` 读取与 `ack`，通道重连或插件重启后由调度补发；租约内持有人不被中断——sidecar 会把未确认通知附在该员工下一次 `sck` 调用的回包顶层（`notices`，最多 3 条，`ack` 后不再附带）。附带的通知与回包数据共用同一个 48 KiB 预算：数据的判定始终按 `answerBytes`，带通知时整条写回行也不超过 48 KiB。放不下的通知不附带，回包的 `noticesTruncated` 只描述被截掉的那几条（`count` 为条数，`bytes` 为它们的 JSON 字节数，`sha256` 为它们的摘要），未附带的仍未确认，下一次调用再附带，不会丢失。未知员工 ID 返回 `invalid`。
 - 幂等：同一 `idempotencyKey` 同载荷回放首次结果（不重复追加、不重复通知），异载荷 `conflict`。
 
 ## 任务输入上限
