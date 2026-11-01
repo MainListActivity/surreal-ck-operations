@@ -98,6 +98,8 @@ rtk proxy "$PASEO_CLI" plugin ls sck-company
 **兼容目标是回滚的前提（RW06）**：切换（install 与远端 deploy）在内容绑定之后、任何副作用（bin 复制、`active` 链接、插件重指、MCP 重启、快照清理、远端上传）之前，用 `scripts/review-wait-guard.sh` 读取**目标自身的代码**判定兼容性：目标必须带 `src/review-wait-capability.ts` 的协议标记、`src/core.ts` 中的“按原阶段解锁”语句（`$restore_phase`）与 `src/contracts.ts` 的 resume 视图字段；本地 install 还要求插件 vendor 同源，远端 deploy 只查核心。不兼容、不可读或无法证明的目标一律拒绝，**没有“当前没有等待项所以放行”的例外**（检查之后并发产生的等待会绕过这种检查）；拒绝发生在任何切换副作用之前，并输出目标、原因与 `waiting items=unknown`（切换脚本没有受权的公司数据读取接缝，不能据此声称没有等待项）。
 只有证明兼容的目标才能切换；旧版本（如 9854fe0、475b5c2 及其后的旧快照）不是固定可回退版本。没有可用兼容目标时，保持当前健康版本、受控 hold，或走受审的前向修复，不得把破坏复核阶段的旧版当成可用性恢复，也不得以伪 accept 或改库换取回滚条件。窗口内切换前仍须按第 4 节采样并证明没有活复核租约（或使用已独立部署验收、支持复核 adopt 的版本）。
 
+**有界待命接力契约（FV06）**：切换守卫在 RW06/SYS02/IR06/SYS06 之外再用 `scripts/standby-relay-guard.sh` 读取目标自身代码，确认它带有界待命协议：`src/standby-relay-capability.ts` 的协议常量、`src/core.ts` 的 resume 事务写（`progress_at` / `standby_until`）与两条拒绝文案、`src/contracts.ts` 的 `standbyUntil` 视图字段、`src/workforce.ts` 的预算配置与超时审计、`src/dispatcher/dispatcher.ts` 的节流唤醒与超时回关口。本地 install（scope=`full`）还要求插件树与其 vendor 同源——**没有 `plugin/`、或有 `plugin/` 但没有 `plugin/server/vendor/`，一律按未知即不兼容拒绝**；远端 deploy（scope=`core`）只查核心。标记位置由**运行守卫的那份 release**自带的 TypeScript 解析器（该 release 的 `scripts/standby-relay-scan.mjs` 与其 `node_modules/typescript`）判定——install/回滚用的是当前受审 release 的 installer，不是目标自己的；注释里的伪标记不能顶替声明，解析器读不了的文件也不放行。拒绝同样发生在任何切换副作用之前，并输出 `standby items=unknown`；没有可用兼容目标时，保持当前健康版本、受控 hold，或走受审的前向修复。与其它切换守卫一样，它只证明目标带着这份契约、不能证明其行为，不代替真实派工与待命演练证据。
+
 **已写策略的数据不能切到不执行策略的代码（IR06）**：切换守卫在 RW06 之外再用 `scripts/independence-guard.sh` 读取目标自身代码，确认它带 `src/independence.ts` 的协议常量、`src/core.ts` 的来源版本守卫（`INDEPENDENCE_GUARD_SQL` 与 `independenceGate`）与 `src/contracts.ts` 的策略及身份视图；本地 install 还要求插件 vendor 同源，远端 deploy 只查核心。线上数据可能已带有独立性策略（`independence_set`），把这份数据切到没有该契约的目标上，被排除的来源经手人、其登记 principal 同伴与点名员工会被直接放行认领——这正是 IR06 拒绝回滚旧 release 的原因。拒绝同样发生在任何切换副作用之前，并输出 `excluded tasks=unknown`；没有可用兼容目标时，保持当前健康版本、受控 hold，或走受审的前向修复（换回带该契约的代码即可让同一份数据重新生效，无需改数据）。守卫只读目标树并匹配声明，只能证明目标带有这份契约，不能证明其行为：它与 RW06 同属标记式探针，不执行目标代码，不能替代真实派工与隔离演练证据。
 
 **已写策略的数据不能切到不执行策略的代码（SYS06）**：切换守卫在 RW06/SYS02/IR06 之外再用 `scripts/policy-guard.sh` 读取目标自身代码，确认它带有效策略执行层：`src/policy.ts` 的判定（`resolveEffective` / `checkWriteAuthority` / `dispatchVerdict`）、`src/policy-store.ts` 的读取层、`src/core.ts` 的 `policyPlan` / `policyEnforce` 与 `policy_blocked` 审计、`src/workforce.ts` 的 `policyDispatchVerdict` 派工接缝、`src/contracts.ts` 的试算契约与任务视图事实，以及 `schema/*effective-policy*.surql` 的 `policy` 表与任务/租约登记字段（并要求 `src/database.ts` 真的加载这一版迁移）；本地 install 还要求插件 vendor 同源，远端 deploy 只查核心。线上数据可能已带策略行与任务上的 `policy_*`/`lease_policy_*` 登记，也可能已有 `blocked + blocked_to=gm` 的隔离任务：把这份数据切到不执行策略的目标上，等于把派工判定交回给一个看不见它们的 release——当前契约已不再授权的在办任务会被当普通 ready 任务派出去（新版拒领、旧版照派），隔离过的任务也丢掉说清原因的字段。拒绝同样发生在任何切换副作用之前，并输出 `affected tasks=unknown`；**不设「零行例外」**——「现在还没有策略行」不是安全证明（写策略随时会紧随其后），这样判也会漏掉那批已经写下的数据。没有可用兼容目标时，保持当前健康版本、受控 hold，或走受审的前向修复（换回带该契约的代码即可让同一份数据重新生效，无需改数据）。与 RW06/SYS02/IR06 一样，守卫只读目标树并匹配声明，只能证明目标带着这份契约、不能证明其行为，不代替真实派工与隔离演练证据。
@@ -112,7 +114,7 @@ rtk proxy curl --fail 'http://127.0.0.1:<mcp-port>/ready'
 rtk proxy "$PASEO_CLI" plugin ls sck-company
 ```
 
-**不得调用旧 release 自带的 installer**：旧版本的 `scripts/company-service.sh` 没有 RW06 守卫（也没有 SYS02/IR06/SYS06 守卫），实测对不兼容目标会直接 `rc=0` 切 `active` 并复制 bin（全新 installer 对同一目标则拒绝且零副作用）。回滚命令固定用 `$SCK_RELEASE_DIR/scripts/company-service.sh`（`$SCK_RELEASE_DIR` 为当前受审 release）。若 install 输出 `warning: plugin repoint failed`（插件登记在服务目录之外），按第 3 节 R3 手工 `remove` + `install` 指向**已被守卫放行的同一目标**，顺序不得颠倒。
+**不得调用旧 release 自带的 installer**：旧版本的 `scripts/company-service.sh` 没有 RW06 守卫（也没有 SYS02/IR06/SYS06/FV06 守卫），实测对不兼容目标会直接 `rc=0` 切 `active` 并复制 bin（全新 installer 对同一目标则拒绝且零副作用）。回滚命令固定用 `$SCK_RELEASE_DIR/scripts/company-service.sh`（`$SCK_RELEASE_DIR` 为当前受审 release）。若 install 输出 `warning: plugin repoint failed`（插件登记在服务目录之外），按第 3 节 R3 手工 `remove` + `install` 指向**已被守卫放行的同一目标**，顺序不得颠倒。
 
 回滚恢复的是上一版完整固定 release（含集成过的在途功能、依赖与 vendor），不能只改 `active` 或只 reload。 SYS02 的回滚边界：新增内容只有可选 `acceptance_*` 字段、`acceptance_evidence` 表与 gate 记录，没有新 task 状态；旧 release 会绕过门禁 accept。存在启用 criteria 的在办任务时不得回滚，必须排空或保留新 release；演练须覆盖“新版写入 gated 数据 → 固定旧 release（a925222）dispatcher/core → 拒绝恢复”，且新守卫拒绝旧目标。重做第 4 节的双面验证；仅恢复与回滚版本兼容的编制，其余保持停用并报经理。旧 release 不完整/不兼容或回滚失败时保留现场并报阻塞，不回退到 v3 历史树作为生产源。
 
@@ -488,6 +490,14 @@ Paseo 公司插件「公司 → 只读审阅」允许粘贴员工 agent ID；会
 升级代码不会擅自重启数据库；首次应用须在新增派工暂停期间运行 main 固定发布的 company-db.sh install，验证原数据库健康和查询恢复后再解除同一暂停。凭证与持久数据目录保持原路径。安装将运行脚本复制到服务 bin 目录，数据库启动不依赖 active 发布；代码回退不破坏数据库入口。后续安装沿用该运行脚本，避免手改启动脚本后重装丢失预算。需要覆盖时在 launchd 环境中设置相同 SURREAL_* 整数字段；默认配置适用于当前16GB共享宿主机。
 
 派工任务结论区分 memory_pressure 和 disk_space，两者同时低时分别显示，不复用磁盘清理说明。内存判断仍优先 macOS 内核压力等级，正常压力时不以少量空闲页误拦截。磁盘产物回收只由磁盘回收水位触发，内存不足不触发无关清盘；回收禁用通知仅在磁盘确实阻断派工时出现。旧 resources 代码保留兼容，恢复提示改为检查内存和磁盘，实时结论会在下一 tick 更新。
+
+### 内存压力 LRU 休眠（v0.3.60）
+
+有待派工作且内存门禁阻断时，按连续空闲起点升序关闭一个闲置员工运行时，硬下限 3600 秒。未知起点从观测开始，不用进程年龄或上次领取时间代替。每轮最多关闭一个，再探测内存；仍有压力时等待下一轮，磁盘不足不触发此回收。
+
+持有任务、经理唤醒中、权限待处理、运行中、状态不明或快照变动均跳过。事务登记两分钟领取屏障，任务 claim 与经理唤醒均遵守；关闭确认后解除，结果不明时自然过期。不退役、不撤销凭证、不归档工作空间，绑定的实现人也可休眠，下次合法派工复用原身份和会话。
+
+使用本机 Paseo MCP `/mcp/agents` 的 `kill_agent`。安装版 0.14.0 中它仅调用 `closeAgentCommand → closeAgent`，保留持久记录，与 delete、archive、close-items 不同。默认端点 `http://127.0.0.1:6767/mcp/agents`，可通过 SCK_PASEO_RUNTIME_MCP_URL 指定其他本机端口，仅接受回环 HTTP。Paseo 升级后应复核该关闭契约。
 
 ### 公司插件导航约定（v0.3.58）
 

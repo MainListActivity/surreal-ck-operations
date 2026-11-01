@@ -8,7 +8,8 @@ import type { RoutingLease } from './vendor/src/model-routing/gateway.ts';
 // req/res files, and ingests report.md/blocker.md when a turn ends.
 import { OpsCircuit } from "./ops-circuit";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { latestFindings, taskBrief } from "./vendor/src/dispatcher/brief.ts";
 import { basename, dirname, join } from "node:path";
 import {
   blockerPath, commDir, ensureCommDirs, readJsonFile, readTextFile, reportPath, reqDir, resDir,
@@ -39,6 +40,8 @@ const BASE_TOOLS = [
   "wait_task", "resolve_wait", "cancel_wait", "extend_wait", "list_task_waits", "wait_handoff_cards", "wait_migration_preview", "wait_migration_apply",
   "create_task", "create_goal", "triage_goal", "create_delivery", "goal_phase_split",
   "record_owner_decision", "set_direction", "resume_task", "defer_task_until", "retire_task",
+  // FV06 P1: gm-only read-only standby precheck (per-item {ok, code}); writes nothing, consumes no budget.
+  "verify_standby",
   // FV06: gm-only append of real prerequisites to an existing dependency wait; sets manager continuation, never resumes.
   "append_dependency_prerequisites",
   "record_score", "get_model_evidence", "get_task_cost", "heartbeat", "deliverable_publish",
@@ -189,6 +192,22 @@ export interface SettleResult {
 }
 
 const ORPHAN_PREFIX = "orphaned-";
+/**
+ * task.md and findings/round-NN.md for the lease just taken: what the dispatch message points the employee at. The comm
+ * dir outlives tasks, so an earlier task's findings are removed first.
+ */
+function stageBrief(dir: string, claim: ClaimResult): void {
+  try { writeBrief(dir, claim); } catch (error) { console.warn(`task brief for ${claim.task?.id} not staged: ${(error as Error).message}`); }
+}
+function writeBrief(dir: string, claim: ClaimResult): void {
+  rmSync(join(dir, "findings"), { recursive: true, force: true });
+  writeFileAtomic(join(dir, "task.md"), taskBrief(claim));
+  const findings = latestFindings(claim.history);
+  if (!findings) return;
+  mkdirSync(join(dir, "findings"), { recursive: true, mode: 0o700 });
+  writeFileAtomic(join(dir, findings.file), findings.text);
+}
+
 /** Preserved artifacts of earlier leases on the task; claim.json lists them for the next holder. */
 function orphanedArtifacts(evidenceDir: string): string[] {
   try { return readdirSync(evidenceDir).filter(f => f.startsWith(ORPHAN_PREFIX) && f.endsWith(".md")).sort().map(f => join(evidenceDir, f)); }
@@ -436,6 +455,7 @@ export class SidecarPool {
     const evidenceDir = join(dirname(this.deps.runDir), "evidence", task.id);
     mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
     writeFileAtomic(join(dir, "claim.json"), JSON.stringify({ ...result, evidenceDir, orphanedArtifacts: orphanedArtifacts(evidenceDir) }));
+    stageBrief(dir, result);
     // A new lease must not inherit a previous turn's artifacts: archive them so an
     // identical-looking new report still submits instead of matching a stale hash.
     this.archive(reportPath(dir), "stale");
@@ -668,6 +688,13 @@ export class SidecarPool {
     this.ensureSweeper();
   }
 
+  /** FV06 P0 standby wake: a resume assigned this instance a lease server-side (no sidecar claim ran),
+   *  so rebuild the local claim (channel proof + claim.json) from the authoritative server lease. */
+  async adoptLease(inst: EmployeeInst): Promise<void> {
+    if (!this.launched.has(inst.id)) throw new Error("unhealthy session channel cannot adopt a lease");
+    await this.rebuildClaim(inst);
+  }
+
   /**
    * Re-establish the local claim for a lease that survived the restart, then run the
    * turn-end ingest for artifacts the agent may have written while we were down.
@@ -749,6 +776,7 @@ export class SidecarPool {
     this.log(`sidecar adopted ${lease.state} lease ${task.id} for ${inst.id}`);
     try {
       writeFileAtomic(claimPath, JSON.stringify(snapshot));
+      stageBrief(dir, snapshot);
     } catch (error) {
       // The in-memory proof is enough for sck writes; a failed snapshot refresh must not
       // turn a valid recovered lease into no_lease.
@@ -1029,7 +1057,14 @@ export class SidecarPool {
         : Promise.reject(Object.assign(new Error("core does not expose goal_phase_split"), { code: "temporarily_unavailable" }));
       case "record_owner_decision": return core.relayOwnerDecision(cred, args as never);
       case "set_direction": await core.relayDirection(cred, args as never); return { recorded: true };
-      case "resume_task": return core.resume(cred, taskIdOf(args.taskId), evidence());
+      // FV06 P0: standbyEmployee turns the resume into an atomic bounded standby assignment
+      // (doing + lease + progress_at + standby_until) instead of the ordinary ready hand-off.
+      case "resume_task": return args.standbyEmployee && core.resumeStandby
+        ? core.resumeStandby(cred, taskIdOf(args.taskId), evidence(), String(args.standbyEmployee))
+        : core.resume(cred, taskIdOf(args.taskId), evidence());
+      case "verify_standby": return core.verifyStandby
+        ? core.verifyStandby(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose verify_standby"), { code: "temporarily_unavailable" }));
       case "defer_task_until": return core.deferTaskUntil(cred, args as never);
       case "append_dependency_prerequisites": return core.appendDependencyPrerequisites
         ? core.appendDependencyPrerequisites(cred, args as never)

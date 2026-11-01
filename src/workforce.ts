@@ -17,6 +17,7 @@ import { gateCredentialChange } from './retirement.ts';
 import { acceptanceSubject, evaluateAcceptance, loadAcceptanceEvidence, loadAcceptanceGate, type AcceptanceTaskRow } from './acceptance.ts';
 import { DispositionLedger, dispositionEpisodeKey, type DispositionDecisionView, type DispositionPhase, type HolderNoticeView } from './disposition.ts';
 import { WaitStore, type WaitRow } from './wait-store.ts';
+import { STANDBY_BUDGET_SECONDS_DEFAULT } from './standby-relay-capability.ts';
 import type { WaitHandoffCard } from './waits.ts';
 /**
  * Root-level workforce and lease supervision for the local dispatcher and admin CLI.
@@ -65,6 +66,7 @@ export interface EmployeeInst {
   credential?: string;
   lastWakeAt?: number;
   idleSince?: number;
+  runtimeSleepRequestedAt?: number;
   onboarded?: boolean;
   /** Directory of the Paseo workspace this instance runs in (project repo, or the ops repo when undefined). */
   cwd?: string;
@@ -148,6 +150,8 @@ export interface CompanyConfig {
   commDirGraceHours: number;
   /** 员工临时文件目录 scratch/<实例> 的保留小时数，按目录最后修改时间计时；0 = 不自动清理。 */
   scratchGraceHours: number;
+  /** FV06 P0：standby 直派的待命预算（秒）；standby_until = min(notAfter, now + standbyBudgetSeconds)。缺省 ≤600。 */
+  standbyBudgetSeconds: number;
 }
 
 export const DEFAULT_CONFIG: CompanyConfig = {
@@ -159,6 +163,7 @@ export const DEFAULT_CONFIG: CompanyConfig = {
   minFreeMemMb: 2048, minFreeDiskMb: 10240,
   artifactReclaimEnabled: true, artifactEvidenceGraceDays: 3, artifactDeliverableGraceDays: 7, artifactHeadroomMb: 10240,
   archiveRetentionDays: 7, commDirGraceHours: 48, scratchGraceHours: 24,
+  standbyBudgetSeconds: STANDBY_BUDGET_SECONDS_DEFAULT,
 };
 
 /** 有效派工权重 = 配置的 weight × 绩效系数（无评分记录时系数为 1；5 分约 1.7 倍，1 分约 0.33 倍）。 */
@@ -213,6 +218,9 @@ export interface SupervisedTask {
   resumeRole?: string;
   /** Unix seconds; set by a quota-caused block, gm is not re-announced before it. */
   quotaResetsAt?: number;
+  /** FV06 P0: unix seconds. A standby direct-assignment expires here: before it, the idle holder is woken and
+   * stall/expire reclaim is waived; past it the task returns to the gm gate instead of the ready pool. */
+  standbyUntil?: number;
   /** SYS05: set while a typed wait owns the task. A waiting task takes no employee, lease or provider seat. */
   waitState?: 'waiting';
   waitKind?: string;
@@ -264,7 +272,8 @@ const supervised = (row: TaskRow): SupervisedTask => {
     leaseExpiresAt: row.lease_expires_at ?? undefined,
     progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined,
     resumeState: row.state === 'blocked' ? row.resume_state : undefined, resumeRole: row.state === 'blocked' ? row.resume_role : undefined,
-    quotaResetsAt: row.quota_resets_at ?? undefined, kind: v.kind, title: v.title, goalId: v.goalId,
+    quotaResetsAt: row.quota_resets_at ?? undefined, standbyUntil: row.standby_until ?? undefined,
+    kind: v.kind, title: v.title, goalId: v.goalId,
     ...(row.wait_state === 'waiting' ? {
       waitState: 'waiting' as const,
       ...(row.wait_kind === undefined || row.wait_kind === null ? {} : { waitKind: row.wait_kind }),
@@ -448,6 +457,8 @@ export class Workforce {
       archiveRetentionDays: typeof row?.archive_retention_days === 'number' ? row.archive_retention_days : DEFAULT_CONFIG.archiveRetentionDays,
       commDirGraceHours: typeof row?.comm_dir_grace_hours === 'number' ? row.comm_dir_grace_hours : DEFAULT_CONFIG.commDirGraceHours,
       scratchGraceHours: typeof row?.scratch_grace_hours === 'number' ? row.scratch_grace_hours : DEFAULT_CONFIG.scratchGraceHours,
+      standbyBudgetSeconds: typeof row?.standby_budget_seconds === 'number' && row.standby_budget_seconds > 0
+        ? row.standby_budget_seconds : STANDBY_BUDGET_SECONDS_DEFAULT,
       blockLoopLimit: typeof row?.block_loop_limit === 'number' ? row.block_loop_limit : 5,
     };
   }
@@ -506,13 +517,13 @@ export class Workforce {
   // ---- employee instances ----
   async insts(): Promise<EmployeeInst[]> {
     type Row = { id: RecordId; role: Role; def?: RecordId; principal?: RecordId; provider?: string; model?: string; thinking?: string;
-      paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number; idle_since?: number;
+      paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number; idle_since?: number; runtime_sleep_requested_at?: number;
       v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; workspace_scope?: string; wake_count?: number };
     const [rows] = await this.db.query<[Row[]]>(
       'SELECT * FROM employee WHERE revoked != true AND retired != true AND (def != NONE OR paseo_agent_id != NONE) ORDER BY id;');
     return rows.map(r => ({ id: asId(r.id), role: r.role, def: r.def ? asId(r.def) : undefined, provider: r.provider,
       model: r.model, thinking: r.thinking, paseoAgentId: r.paseo_agent_id ?? undefined,
-      activeTask: r.active_task ? asId(r.active_task) : undefined, credentialFile: r.credential_file, lastWakeAt: r.last_wake_at, idleSince: r.idle_since,
+      activeTask: r.active_task ? asId(r.active_task) : undefined, credentialFile: r.credential_file, lastWakeAt: r.last_wake_at, idleSince: r.idle_since, runtimeSleepRequestedAt: r.runtime_sleep_requested_at,
       onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, repoHome: r.workspace_repo ?? undefined, workspaceScope: r.workspace_scope ?? undefined, wakeCount: r.wake_count ?? 0,
       principal: r.principal ? asId(r.principal) : undefined }));
   }
@@ -592,11 +603,42 @@ export class Workforce {
     await this.db.query('UPDATE employee SET idle_since = NONE WHERE paseo_agent_id = $agent AND retired != true;', { agent: agentId });
   }
 
-  async observeSessionIdle(observations: Array<{ id: string; since?: number; lastWakeAt?: number }>): Promise<void> {
+  async observeSessionIdle(observations: Array<{ id: string; since?: number; lastWakeAt?: number; previousIdleSince?: number }>): Promise<void> {
     if (!observations.length) return;
     await this.db.query(`FOR $o IN $observations {
-      UPDATE employee SET idle_since = $o.since WHERE id = $o.employee AND retired != true AND (last_wake_at ?? NONE) = $o.last_wake;
-    };`, { observations: observations.map(o => ({ employee: id('employee', o.id), since: o.since, last_wake: o.lastWakeAt })) });
+      UPDATE employee SET idle_since = $o.since WHERE id = $o.employee AND retired != true AND (last_wake_at ?? NONE) = $o.last_wake AND ($o.guard != true OR (idle_since ?? NONE) = $o.previous);
+    };`, { observations: observations.map(o => ({ employee: id('employee', o.id), since: o.since, last_wake: o.lastWakeAt, guard: Object.hasOwn(o,"previousIdleSince"), previous: o.previousIdleSince })) });
+  }
+
+  /** A short claim barrier while the native runtime closes; no credential or identity is revoked. */
+  async reserveRuntimeSleep(inst: EmployeeInst, now: number): Promise<boolean> {
+    if (inst.idleSince === undefined || now - inst.idleSince < 3600) return false;
+    const result = await this.runTxResult<boolean>(`BEGIN;
+      LET $e = SELECT * FROM ONLY $employee;
+      LET $held = SELECT VALUE id FROM task WHERE current_employee = $key AND state IN ['ready','doing','review','blocked'];
+      LET $wakes = SELECT VALUE id FROM dispatch WHERE purpose = 'gm-manager-wake' AND state IN ['pending','running','unknown'] AND (employee = $key OR agent = $agent);
+      LET $safe = $e != NONE AND $e.retired != true AND $e.revoked != true AND ($e.active_task ?? NONE) = NONE
+        AND $e.paseo_agent_id = $agent AND $e.idle_since = $since AND ($e.last_wake_at ?? NONE) = $last_wake
+        AND ($e.runtime_sleep_until ?? 0) <= $now AND array::len($held) = 0 AND array::len($wakes) = 0;
+      IF $safe { UPDATE ONLY $employee SET runtime_sleep_until = $now + 120, runtime_sleep_requested_at = $now; };
+      RETURN $safe;
+      COMMIT;`, { employee: id('employee',inst.id), key: inst.id, agent: inst.paseoAgentId, since: inst.idleSince, last_wake: inst.lastWakeAt, now });
+    return result === true;
+  }
+
+  /** Rechecked after MCP initialization, immediately before sending a destructive runtime operation. */
+  async confirmRuntimeSleep(inst: EmployeeInst, requestedAt: number): Promise<boolean> {
+    const [safe] = await this.db.query<[boolean]>(`RETURN (SELECT VALUE count() FROM employee WHERE id=$e
+      AND runtime_sleep_requested_at=$requested AND runtime_sleep_until > time::unix(time::now()) + 30
+      AND (active_task ?? NONE)=NONE AND idle_since=$since AND (last_wake_at ?? NONE)=$wake
+      AND paseo_agent_id=$agent AND retired!=true AND revoked!=true GROUP ALL)[0] = 1;`,
+      {e:id('employee',inst.id),requested:requestedAt,since:inst.idleSince,wake:inst.lastWakeAt,agent:inst.paseoAgentId});
+    return safe===true;
+  }
+
+  async releaseRuntimeSleep(employeeId: string, now: number): Promise<void> {
+    await this.db.query('UPDATE $e SET runtime_sleep_until = NONE WHERE runtime_sleep_requested_at = $now;',
+      {e: id('employee',employeeId), now});
   }
 
   async retireIdle(inst: EmployeeInst): Promise<void> {
@@ -605,7 +647,7 @@ export class Workforce {
   }
 
   async touchWake(employeeId: string): Promise<void> {
-    await this.db.query('UPDATE $e SET last_wake_at = time::unix(time::now()), idle_since = NONE, v3_onboarded = true, wake_count = (wake_count ?? 0) + 1;',
+    await this.db.query('UPDATE $e SET last_wake_at = time::unix(time::now()), idle_since = NONE, runtime_sleep_requested_at = NONE, v3_onboarded = true, wake_count = (wake_count ?? 0) + 1;',
       { e: id('employee', employeeId) });
   }
 
@@ -883,6 +925,8 @@ export class Workforce {
       LET $next = UPDATE ONLY $task SET
         state = IF $t.state = 'doing' THEN 'ready' ELSE $t.state END,
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
+        // FV06：收回即待命阶段结束，旧标记不得管辖下一位持有人的租约。
+        standby_until = NONE,
         handover = true, previous_employee = $employee, version = $t.version + 1 RETURN AFTER;
       UPDATE employee SET active_task = NONE WHERE active_task = $task;
       CREATE audit CONTENT { task: $task, actor: $actor, action: 'revoked', evidence: $evidence, version: $next.version, at: time::now() };
@@ -901,6 +945,31 @@ export class Workforce {
     if (!task?.current_employee) return { ok: false };
     const ok = await this.revokeLease(taskId, task.current_employee, reason, handover, actor);
     return { ok, employee: ok ? task.current_employee : undefined };
+  }
+
+  /**
+   * FV06 P0：standby 待命超时收回。与 revokeLease 的 doing→ready 不同，这里任务回经理关口而不是
+   * ready 池：blocked + blocked_to='gm'、resume_state='doing'（经理可换人重新 standby，普通 resume
+   * 则按既有守卫恢复 ready 派工）、租约与 delivery 清空、standby_until 清除。旧持有人的一切写入随
+   * delivery 清空失效；audit 单独记 standby_timeout，便于与普通收回区分。
+   */
+  async standbyTimeout(taskId: TaskId, employeeId: string, reason: string, handover: string, actor = 'dispatcher'): Promise<boolean> {
+    const evidence = `原因：${reason}\n\n${handover}`.slice(0, 30000);
+    const responses = await this.db.query<unknown[]>(`BEGIN;
+      LET $t = SELECT * FROM ONLY $task;
+      // state='doing' 门（FV06 复验）：待命超时只对「仍有待命标记的直派租约」成立。submit 后的复核相位、
+      // 收回后的 ready、标记已清除的普通租约，都不得被写成 blocked + resume_state=doing。
+      IF $t = NONE OR $t.current_employee != $employee OR $t.state != 'doing' OR $t.standby_until = NONE { THROW 'lease changed' };
+      LET $next = UPDATE ONLY $task SET
+        state = 'blocked', blocked_to = 'gm', resume_state = 'doing',
+        current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE, standby_until = NONE,
+        handover = true, previous_employee = $employee, version = $t.version + 1 RETURN AFTER;
+      UPDATE employee SET active_task = NONE WHERE active_task = $task;
+      CREATE audit CONTENT { task: $task, actor: $actor, action: 'standby_timeout', evidence: $evidence, version: $next.version, at: time::now() };
+      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+      CREATE outbox CONTENT { task: $task, kind: 'revoked', sequence: $sequence.value, payload: { employee: $employee, state: 'blocked', reason: 'standby_timeout' }, at: time::now() };
+      COMMIT;`, { task: id('task', taskId), employee: employeeId, evidence, actor }).responses();
+    return responses.every(r => r.success);
   }
 
   // ---- dispatch bookkeeping ----
@@ -1201,11 +1270,12 @@ export class Workforce {
   async markManagerWakeRunning(claim: ManagerWakeClaim, employee: string, agent?: string): Promise<boolean> {
     const d = this.managerWakeId(claim.input.taskId, claim.input.phase, claim.input.episode);
     const updated = await this.runTxResult<WakeDbRow>(`BEGIN;
+      LET $worker = SELECT * FROM ONLY $employee_record;
       LET $old = SELECT * FROM ONLY $d;
       LET $updated = UPDATE ONLY $d SET state = 'running', employee = $employee, agent = $agent,
         external_started_at = IF external_started_at = NONE THEN time::unix(time::now()) ELSE external_started_at END,
         last_checked_at = time::unix(time::now()), updated_at = time::unix(time::now()), at = time::unix(time::now())
-        WHERE token = $wake_token AND attempt = $attempt AND state IN ['pending', 'running', 'unknown'] RETURN AFTER;
+        WHERE ($worker.runtime_sleep_until ?? 0) <= time::unix(time::now()) AND token = $wake_token AND attempt = $attempt AND state IN ['pending', 'running', 'unknown'] RETURN AFTER;
       IF $updated != NONE {
         LET $seat = SELECT * FROM ONLY $employee_record;
         IF $seat != NONE AND ($seat.revoked = true OR $seat.retired = true) { THROW 'manager employee retired' };

@@ -554,9 +554,23 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), async () => { await core.relayDirection(token(ctx), input); return { recorded: true }; }));
 
   server.registerTool('resume_task', {
-    description: 'gm only: resume a blocked task. For windowed operations pass executionWindow bound to a completed independent approval dependency and its immutable candidate expiry/digest. Expired windows require resampling and new approval; plain resume cannot extend them.',
-    inputSchema: z.object({ taskId: z.string().min(1), ...evidenceShape }),
-  }, async (input, ctx) => run(token(ctx), () => core.resume(token(ctx), input.taskId, evidence(input))));
+    description: 'gm only: resume a blocked task. For windowed operations pass executionWindow bound to a completed independent approval dependency and its immutable candidate expiry/digest. Expired windows require resampling and new approval; plain resume cannot extend them. Optionally pass standbyEmployee to assign a bounded standby holder atomically (FV06): the resume transaction writes doing + the holder lease + progress_at and standby_until = min(window notAfter, now + standby budget), allocates the registered worktree like a claim, and the holder is woken until standby_until — past it the task returns to this gm gate, never the ready pool. Every claim-grade guard (role, quota/provider, policy, independence, avoidance, dependencies, worktree registration) applies; any refusal leaves the task blocked.',
+    inputSchema: z.object({ taskId: z.string().min(1), ...evidenceShape,
+      standbyEmployee: z.string().min(1).max(200).optional() }),
+  }, async (input, ctx) => run(token(ctx), () => input.standbyEmployee && core.resumeStandby
+    ? core.resumeStandby(token(ctx), input.taskId, evidence(input), input.standbyEmployee)
+    : core.resume(token(ctx), input.taskId, evidence(input))));
+
+  server.registerTool('verify_standby', {
+    description: 'gm only (FV06 P1): read-only standby precheck. For each {taskId, employeeId, executionWindow?} pair re-evaluates every standby assignment precondition (claim-grade role/workspace/discipline/active-task/implementer-binding checks, the effective policy verdict, the independence gate, an unexpired execution window — the one you pass or the one already bound — and provider quota/health with the same source as the dispatcher) and returns per-item {ok, code}. Writes no task state and consumes no budget; each item is audited. Passing proves only this instant — never a dispatch promise: the real relay is the resume standby transaction, and in-window quota/liveness of the holder is still not guaranteed.',
+    inputSchema: z.object({
+      items: z.array(z.object({ taskId: z.string().min(1), employeeId: z.string().min(1),
+        executionWindow: executionWindowSchema.optional() })).min(1).max(20),
+      idempotencyKey: z.string().min(4).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.verifyStandby
+    ? core.verifyStandby(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('defer_task_until', {
     description: 'gm only: turn a gm-blocked execute task, or a normal non-owner review block with a provable original submit and reviewer block, into a dependency wait — it stays blocked (the manager is no longer woken for it), the gm flag clears, and it restores ready (execute) or review (review) when every dependency is done; with continuation=manager it returns to GM instead, including when dependencies are already done. Use manager for further sampling, approval or scheduling decisions. Every prerequisite must be a real dependency task. Owner gates and unprovable review history are refused.',
