@@ -12,6 +12,7 @@
 # src/mcp/sync-gate.ts.
 set -eu
 . "$(dirname "$0")/review-wait-guard.sh"
+. "$(dirname "$0")/standby-relay-guard.sh"
 . "$(dirname "$0")/independence-guard.sh"
 . "$(dirname "$0")/policy-guard.sh"
 . "$(dirname "$0")/goal-workspace-guard.sh"
@@ -76,6 +77,8 @@ independence_target_supported "$staging/probe" core || { independence_refuse "$s
 # Refused before any step reaches the host.
 policy_target_supported "$staging/probe" core || { policy_refuse "$staging/probe" core; exit 1; }
 goal_workspace_target_supported "$staging/probe" core || { goal_workspace_refuse "$staging/probe" core; exit 1; }
+# FV06 P0/P1: the remote payload must carry the standby relay contract too; refused before any ssh/scp step.
+standby_relay_target_supported "$staging/probe" core || { standby_relay_refuse "$staging/probe" core; exit 1; }
 
 sed -n \
   -e 's/^SURREAL_ROOT_USER=/SURREAL_ROOT_USER=/p' \

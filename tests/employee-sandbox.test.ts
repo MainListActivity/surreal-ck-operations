@@ -60,4 +60,25 @@ describe('employee sandbox launcher', () => {
     expect(run(root, env, '/usr/bin/touch', join(root, 'evidence', 'ok')).code).toBe(0);
     expect(run(root, { SCK_COMM_DIR: '/c' }, '/bin/sh', '-c', 'echo $SCK_SANDBOX')).toMatchObject({ code: 0, out: 'employee\n' });
   });
+
+  // Factory's Execute supervisor runs `ps -o ppid= -p $$` every two seconds and kills the command when it fails;
+  // /bin/ps is setuid and refused inside the sandbox, so without the shim every foreground command was SIGKILLed.
+  test.skipIf(process.platform !== 'darwin')('company sessions get a working ps first on PATH; the setuid one stays refused', () => {
+    const root = service();
+    const build = Bun.spawnSync(['sh', join(SRC, 'build-ps.sh'), join(root, 'sandbox')], { stdout: 'pipe', stderr: 'pipe' });
+    expect(build.exitCode).toBe(0);
+    const env = { SCK_SANDBOX: 'employee' };
+    expect(run(root, env, '/bin/sh', '-c', '/bin/ps -o ppid= -p $$').code).not.toBe(0);
+    expect(run(root, env, '/bin/sh', '-c', 'command -v ps').out.trim()).toBe(join(root, 'sandbox', 'shim', 'ps'));
+    const ppid = run(root, env, '/bin/sh', '-c', 'ps -o ppid= -p $$; echo "real=$PPID"');
+    expect(ppid.code).toBe(0);
+    const [got, real] = ppid.out.trim().split('\n');
+    expect(`real=${got!.trim()}`).toBe(real!);
+    expect(run(root, env, '/bin/sh', '-c', 'ps -o pid= -p 999999').code).toBe(1);
+    const cols = run(root, env, '/bin/sh', '-c', 'ps -o pid,pgid,command -p $$').out.split('\n');
+    expect(cols[0]).toBe('PID PGID COMMAND');
+    expect(cols[1]).toContain('ps -o pid,pgid,command -p');
+    // The owner's own sessions keep the system ps.
+    expect(run(root, {}, '/bin/sh', '-c', 'command -v ps').out.trim()).toBe('/bin/ps');
+  });
 });

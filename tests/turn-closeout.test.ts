@@ -117,3 +117,13 @@ test('a report written after the lease ended is preserved with its task and list
     expect(claim.orphanedArtifacts).toEqual([join(evidence, kept[0]!)]);
   } finally { w.close(); }
 });
+
+for (const phase of ['doing', 'review'] as const) test(`silent nudge names the ${phase} closeout tool`, async () => {
+  const sent: string[] = [];
+  const ctx = { workforce: {}, sidecar: { settle: async () => ({ status: 'silent', silent: { instId: 'i', taskId: 't', nudges: 1, phase } }) } };
+  const paseo = { agents: { ref: () => ({ send: async (text: string) => { sent.push(text); } }) } };
+  await settleCompanyTurn(ctx as never, paseo as never, { agent: { id: 'a' }, outcome: { kind: 'completed' }, timeline: [] } as never);
+  expect(sent).toHaveLength(1);
+  expect(sent[0]).toContain(`sck call ${phase === 'review' ? 'review' : 'submit'}`);
+  if (phase === 'review') expect(sent[0]).not.toContain('call submit');
+});

@@ -422,6 +422,17 @@ test('a busy bound implementer is not escalated to the manager', async () => {
   expect(codes).not.toContain('implementer_unresolved');
 });
 
+test('an implementer bound across goal workspaces is unavailable, not a busy wait', async () => {
+  const f = fixture([{ id: 'cross-goal', state: 'ready', implementer: 'eng-1', repoPath: OPS }]);
+  (f.rows[0] as { goalId?: string }).goalId = 'goal-b';
+  await f.tick();
+  const verdict = f.last!.dispatchVerdicts().find(v => v.taskId === 'cross-goal')!;
+  expect(verdict.reasons.map(reason => reason.code)).toContain('implementer_unavailable');
+  // Same workspace: the binding stands and the implementer is dispatched.
+  const same = fixture([{ id: 'same-goal', state: 'ready', implementer: 'eng-1', repoPath: OPS }]);
+  expect((await same.tick()).woke.find(w => w.task === 'same-goal')?.employee).toBe('eng-1');
+});
+
 test('a vanished bound implementer enters the manager takeover todo', async () => {
   const f = fixture([{ id: 'gone-task', state: 'ready', implementer: 'gone-employee', repoPath: OPS }]);
   const result = await f.tick();
@@ -678,9 +689,56 @@ test('no eligible GM never acquires/releases wake claims on repeated ticks; reco
   for (let n = 0; n < 4; n++) await f.tick(); // fixture recreates Dispatcher: includes restart behavior
   expect(f.wakes.size).toBe(0);
   expect(f.prompts).toHaveLength(0);
-  expect([...f.notices.keys()].some(k => k.startsWith('gm-unavailable:'))).toBe(true);
+  const raised = [...f.notices.entries()].find(([k]) => k.startsWith('gm-unavailable:'));
+  expect(raised?.[1].text).toContain('编制已停用');
   f.defs.find(d => d.role === 'gm')!.enabled = true;
   expect((await f.tick()).woke.some(w => w.task === 'fixture-no-gm')).toBe(true);
+});
+
+test('busy managers filling the workspace are a queue, not an outage; a queue past an hour reaches the owner', async () => {
+  const f = fixture([{ id: 'q-busy', blockedTo: 'gm' }]);
+  const gm = f.defs.find(d => d.role === 'gm')!;
+  gm.maxInstances = 1;
+  f.instances.push({ id: 'gm-busy', def: gm.id, role: 'gm', provider: gm.provider, model: gm.model, paseoAgentId: 'agent-gm-busy',
+    cwd: OPS, repoHome: OPS, workspaceScope: 'maintenance', credential: 'cred-gm-busy' });
+  f.agents.set('agent-gm-busy', { id: 'agent-gm-busy', status: 'running' });
+  const open = () => [...f.notices.entries()].filter(([k, n]) => k.startsWith('gm-unavailable:') && !n.resolved);
+  const first = await f.tick();
+  expect(first.decisions).toContain('gm-queued:q-busy');
+  expect(open()).toHaveLength(0);
+  // The same seats held for over an hour since the gate opened: now the owner hears about it.
+  f.rows[0]!.dispatchBlockedSince = 1_000_000 - 61 * 60;
+  await f.tick();
+  expect(open()).toHaveLength(1);
+  expect(open()[0]![1].text).toContain('连续占满');
+});
+
+test('a seat held by a manager that is down is an outage, not a queue', async () => {
+  const f = fixture([{ id: 'q-down', blockedTo: 'gm' }]);
+  const gm = f.defs.find(d => d.role === 'gm')!;
+  gm.maxInstances = 1;
+  f.instances.push({ id: 'gm-down', def: gm.id, role: 'gm', provider: gm.provider, model: gm.model, paseoAgentId: 'agent-gm-down',
+    cwd: OPS, repoHome: OPS, workspaceScope: 'maintenance', credential: 'cred-gm-down' });
+  f.agents.set('agent-gm-down', { id: 'agent-gm-down', status: 'error' });
+  const report = await f.tick();
+  expect(report.decisions).not.toContain('gm-queued:q-down');
+});
+
+test('a gm-unavailable notice closes once its workspace has no manager work left, and stays while it does', async () => {
+  const f = fixture([{ id: 'stale-a', blockedTo: 'gm' }, { id: 'stale-b', blockedTo: 'gm' }]);
+  (f.rows[1] as { goalId?: string }).goalId = 'goal-b';
+  f.defs.find(d => d.role === 'gm')!.enabled = false;
+  await f.tick();
+  const open = () => [...f.notices.entries()].filter(([k, n]) => k.startsWith('gm-unavailable:') && !n.resolved).map(([k]) => k);
+  expect(open()).toHaveLength(2);
+  // stale-a was closed by hand: its workspace has no manager-gate task any more.
+  f.rows[0]!.state = 'done';
+  (f.rows[0] as { blockedTo?: string }).blockedTo = undefined;
+  expect((await f.tick()).decisions).toContain('gm-unavailable-cleared:gm-unavailable:/fixture/ops:maintenance');
+  expect(open()).toEqual([expect.stringMatching(/:goal-b$/)]);
+  // The workspace that still waits on a manager keeps its notice across passes.
+  await f.tick();
+  expect(open()).toHaveLength(1);
 });
 
 test('a persisted full-history model evaluation dispatches an eval employee even for quick/jev-only settings',async()=>{
@@ -862,4 +920,23 @@ test('an old holder notice cannot wake a sleeping employee without a legal assig
  const f=fixture([]);f.setStatus('agent-eng-1','closed');let delivered=0;
  Object.assign(f.wf,{pendingHolderNotices:async()=>[{noticeKey:'old-notice',taskId:'old-task',holder:'eng-1',kind:'revoked',text:'已撤租'}],markHolderNotices:async()=>{delivered++;return 1;}});
  const r=await f.tick();expect(f.sends).toHaveLength(0);expect(delivered).toBe(0);expect(r.decisions).toContain('holder-notice-wait:old-task');expect(r.retired).not.toContain('eng-1');
+});
+
+test('memory pressure sleeps an hour-idle employee and reuses the same identity once the probe recovers',async()=>{
+ const f=fixture([{id:'lru-work',state:'ready',facts:{authors:[],reviewers:[],excluded:[],unknown:[],ambiguous:false}}]);
+ const target=f.instances.find(i=>i.id==='eng-1')!;target.idleSince=990000;target.lastWakeAt=980000;
+ const original=f.wf.config.bind(f.wf);let closed=0;
+ Object.assign(f.wf,{config:async()=>({...await original(),minFreeMemMb:2048}),observeSessionIdle:async()=>{},confirmRuntimeSleep:async()=>true,reserveRuntimeSleep:async(i:EmployeeInst,now:number)=>{i.runtimeSleepRequestedAt=now;return true},releaseRuntimeSleep:async()=>{}});
+ Object.assign(f.paseo,{sleep:async(id:string)=>{closed++;f.setStatus(id,'closed')}});
+ const report=await f.tick({hostResources:()=>({freeMemMb:100,freeDiskMb:99999,memoryPressure:closed?1:2})});
+ expect(closed).toBe(1);expect(report.retired).toEqual([]);expect(report.woke.find(w=>w.task==='lru-work')).toMatchObject({employee:'eng-1',spawned:false});expect(f.spawnCwds).toEqual([]);
+});
+test('memory pressure waits when every employee is idle less than an hour',async()=>{
+ const f=fixture([{id:'lru-young',state:'ready',facts:{authors:[],reviewers:[],excluded:[],unknown:[],ambiguous:false}}]);
+ const original=f.wf.config.bind(f.wf);let closed=0;
+ Object.assign(f.wf,{config:async()=>({...await original(),minFreeMemMb:2048}),observeSessionIdle:async()=>{},confirmRuntimeSleep:async()=>true,reserveRuntimeSleep:async()=>true,releaseRuntimeSleep:async()=>{}});
+ for(const i of f.instances){i.idleSince=999000;i.lastWakeAt=990000}
+ Object.assign(f.paseo,{sleep:async()=>{closed++}});
+ const r=await f.tick({hostResources:()=>({freeMemMb:100,freeDiskMb:99999,memoryPressure:2})});
+ expect(r.skipped).toBe('resources');expect(closed).toBe(0);expect(r.woke).toEqual([]);expect(r.retired).toEqual([]);
 });

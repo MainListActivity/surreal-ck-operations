@@ -33,6 +33,7 @@ export const diagnosticFailureByCheck = {
   "approvalTaskGoalMatches": "approval-task-goal-mismatch",
   "approvalTaskProjectMatches": "approval-task-project-mismatch",
   "candidateAuthorMatchesSubmitter": "candidate-author-mismatch",
+  "samplerApproverIndependent": "sampler-approver-mismatch",
   "approvalAuditExists": "approval-audit-missing",
   "auditVersionMatchesTask": "audit-version-mismatch",
   "auditMarkerExactLine": "audit-marker-missing",

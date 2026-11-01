@@ -131,6 +131,33 @@ const PERMANENT: ReadonlySet<BlockCode> = new Set<BlockCode>([
   'author_recusal', 'independence_conflict', 'implementer_mismatch', 'implementer_unresolved', 'implementer_quota', 'track_mismatch',  'credential_file', 'def_disabled', 'no_candidate', 'review_capacity', 'policy_blocked',
 ]);
 
+/** Codes meaning a qualified candidate exists and is only occupied right now; they clear without anyone acting. */
+const OCCUPIED: ReadonlySet<BlockCode> = new Set<BlockCode>(['held', 'assigned', 'provider_capacity', 'probe_busy', 'wake_failed']);
+
+export interface ManagerShortage {
+  /** True while the gate only waits for an occupied manager: a queue, not something the owner must fix. */
+  queued: boolean;
+  /** Owner-facing reasons, deduplicated, when nothing is merely occupied. */
+  reasons: string[];
+}
+
+/**
+ * Why a manager gate has no free manager. Both seats of a workspace busy is ordinary queueing and must not reach the
+ * owner as "no manager available" — that notice then outlives the moment it described. `seat_full` alone is not a
+ * queue: the seats may be held by managers that can never take the work (disabled, model drift), which only a fix
+ * clears. `session_busy` counts only for a session that is really running a turn (`isBusy`), not one that is down.
+ */
+export function managerShortage(
+  entries: readonly { eligible: boolean; code?: BlockCode; reason?: string; inst?: { id: string } }[],
+  isBusy: (instId: string) => boolean,
+): ManagerShortage {
+  const queued = entries.some(e => e.eligible || (e.code !== undefined && OCCUPIED.has(e.code)) ||
+    (e.code === 'session_busy' && !!e.inst && isBusy(e.inst.id)));
+  const reasons = [...new Set(entries.map(e => e.reason ?? (e.code ? BLOCK_TEXT[e.code] : undefined))
+    .filter((r): r is string => !!r))];
+  return { queued, reasons: reasons.length ? reasons : [BLOCK_TEXT.no_candidate] };
+}
+
 /** Owner-facing text per code. The staffing pool and the evaluator both read this table. */
 export const BLOCK_TEXT: Record<BlockCode, string> = {
   factory_wait: 'Factory 仍有额度，本任务保留等待 Factory；已有 3 个等待任务后新任务可分流',

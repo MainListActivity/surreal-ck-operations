@@ -63,7 +63,7 @@ async function settleTurn(ctx: Pick<Company, "sidecar" | "workforce">, paseo: Pa
     if (kind === "completed" && nudges <= MAX_SILENT_NUDGES) {
       try {
         await paseo.agents.ref(event.agent.id).send(
-          `【系统】你上一轮结束时没有提交 report.md 或 blocker.md，任务仍挂在你名下。继续执行当前任务；收尾规则不变：完成写 report.md，受阻写 blocker.md。这是第 ${nudges}/${MAX_SILENT_NUDGES} 次提醒——再次无收尾退出，任务将被收回重派。`
+          `【系统】任务仍挂在你名下，上一轮没有提交。继续完成，用 sck call ${res.silent.phase === "review" ? 'review（decision 为 accept 或 return）' : 'submit'} 写入${res.silent.phase === "review" ? "复核结论" : "结果"}。第 ${nudges}/${MAX_SILENT_NUDGES} 次提醒，再次未提交将收回重派。`
         );
         console.log(`silent-turn nudge ${nudges}/${MAX_SILENT_NUDGES} sent to ${instId} on ${taskId}`);
       } catch (error) {

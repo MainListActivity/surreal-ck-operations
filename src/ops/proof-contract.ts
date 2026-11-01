@@ -476,7 +476,10 @@ export function configurationDigest(manifest: ProofManifestBody): string { retur
 const base = { env: z.literal('production').optional() };
 const files = { manifestPath: z.string().max(1024), documentPath: z.string().max(1024) };
 export const proofToolSchemas = {
-  ops_internal_ai_prepare: z.object({ ...base, ...files }).strict(),
+  // G1 (FV06 P1): the sampler identity rides the registration chain. Optional so pre-G1 callers keep
+  // their contract; when present, prepare() refuses sampler == the registering holder and the approval
+  // diagnosis turns 采样 QA ≠ 批准者 into a machine check instead of a manual comparison.
+  ops_internal_ai_prepare: z.object({ ...base, ...files, samplerEmployee: ref.optional() }).strict(),
   ops_internal_ai_prove: z.object({ ...base, ...files, mode: z.enum(['register-disabled', 'enable']), approvalTask: ref.optional(), activityId: ref, nonce: z.string().regex(/^[A-Za-z0-9_-]{16,64}$/), idempotencyKey: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/) }).strict(),
   ops_internal_ai_approval_diagnose: z.object({ ...base, ...files, approvalTask: ref, activityId: ref }).strict(),
   ops_internal_ai_deliver: z.object({ ...base, proofHandle: z.string().regex(/^p_[a-f0-9]{64}$/), session: z.string().max(128) }).strict(),
