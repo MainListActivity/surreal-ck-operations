@@ -18,6 +18,8 @@
  *   not restart it.
  * - When the budget runs out, one structured diagnostic is generated and one repair task is created or linked.
  *   The original task then waits on that repair as a normal dependency.
+ * - A completed repair lifts the budget of the task it was made for, and each completion lifts once: the spend is
+ *   recorded in the same transaction as the lift, keyed by task, incident and credential (AC04).
  */
 import { RecordId } from 'surrealdb';
 import {
@@ -100,12 +102,21 @@ export interface FaultIncidentRow {
 export interface FaultRepairRow {
   incident: string;
   fingerprint: string;
+  /** The repair task of the current round. */
   taskId?: string;
   sourceTaskId?: string;
+  /** Every repair task of the chain, oldest round first. A chain written before the rounds has its one task here. */
+  rounds: string[];
   state: 'open' | 'done' | 'void';
   diagnostic?: FaultDiagnostic;
   createdAt: string;
   updatedAt: string;
+}
+
+/** A completion that may lift a budget once: the repair round's task and the audit that completed it. */
+export interface FaultCredential {
+  repair: string;
+  credential: string;
 }
 
 /** The outcome of a reservation: may the attempt run, and was a unit of the budget charged for it. */
@@ -192,6 +203,9 @@ const scopeId = (key: string) => new RecordId('fault_budget', key);
 /** The id of the repair row (one per incident). */
 const repairId = (incident: string) => new RecordId('fault_repair', incident);
 
+/** The id of a consumption record (one per task, incident and credential). */
+const consumptionId = (key: string) => new RecordId('fault_repair_consumption', key);
+
 /** The id of the episode row (one per cause and task). */
 const episodeId = (episode: string) => new RecordId('fault_episode', episode);
 
@@ -201,6 +215,11 @@ export class FaultStore {
   /** The episode key of a cause and a task. It is derived, so a retry of the same report lands on the same episode. */
   static episodeKey(fingerprint: string, taskId: string): string {
     return `${fingerprint}#${taskId}`;
+  }
+
+  /** The key of a credential spent on one incident of one task. It is the record id, so a second spend hits the same record. */
+  static consumptionKey(taskId: string, incident: string, credential: string): string {
+    return `${taskId}|${incident}|${credential}`;
   }
 
   // ---------------------------------------------------------------- reads
@@ -336,15 +355,18 @@ export class FaultStore {
   /** The repair chain of an incident. */
   async repair(incident: string): Promise<FaultRepairRow | undefined> {
     const row = await this.db.select<{
-      incident?: string; fingerprint?: string; task?: unknown; source_task?: unknown; state?: string;
+      incident?: string; fingerprint?: string; task?: unknown; source_task?: unknown; rounds?: unknown[]; state?: string;
       diagnostic?: unknown; created_at?: unknown; updated_at?: unknown;
     }>(repairId(incident));
     if (!row) return undefined;
+    const taskId = row.task === undefined || row.task === null ? undefined : asText(row.task);
     return {
       incident: row.incident ?? incident,
       fingerprint: row.fingerprint ?? '',
-      ...(row.task === undefined || row.task === null ? {} : { taskId: asText(row.task) }),
+      ...(taskId === undefined ? {} : { taskId }),
       ...(row.source_task === undefined || row.source_task === null ? {} : { sourceTaskId: asText(row.source_task) }),
+      // A chain written before the rounds existed has its one repair task as its only round.
+      rounds: row.rounds?.length ? row.rounds.map(asText) : taskId === undefined ? [] : [taskId],
       state: (row.state ?? 'open') as FaultRepairRow['state'],
       ...(row.diagnostic === undefined || row.diagnostic === null ? {} : { diagnostic: row.diagnostic as FaultDiagnostic }),
       createdAt: asIso(row.created_at),
@@ -659,12 +681,71 @@ export class FaultStore {
     return (updated?.length ?? 0) > 0;
   }
 
+  /** The credentials already spent on one incident of one task. */
+  async spentCredentials(taskId: string, incident: string): Promise<Set<string>> {
+    const [rows] = await this.db.query<[Array<{ credential?: string }>]>(
+      'SELECT credential FROM fault_repair_consumption WHERE task = $task AND incident = $incident;',
+      { task: new RecordId('task', taskId), incident },
+    );
+    return new Set((rows ?? []).flatMap(row => (row.credential ? [row.credential] : [])));
+  }
+
   /**
-   * Lift the recovery of one incident on one task: its repair is done, so the episodes of that incident close and
-   * the budgets it spent on this task start over (AC04). This is the only way a spent budget comes back — not a new
-   * session, a new holder or a re-claimed lease. Only the task's own budgets are reset; the total stays for the audit.
+   * Spend completion credentials on one incident of one task, and lift that task's recovery of the incident (AC04).
+   *
+   * One consumption record per (task, incident, credential) is written in the same transaction as the lift: the
+   * episodes of the incident close, and the budgets the task spent on it start over. A credential that is recorded
+   * already makes the whole transaction fail, so a replay, a concurrent call or a call after a restart finds it spent
+   * and changes nothing. Returns false when a concurrent call spent one of them first; the caller reads the state again.
    */
-  async liftRepair(input: { taskId: string; incident: string; now: number; limits: FaultBudgetLimits }): Promise<void> {
+  async spendCredentials(input: {
+    taskId: string; incident: string; now: number; limits: FaultBudgetLimits;
+    via: 'repair' | 'gm'; credentials: FaultCredential[];
+  }): Promise<boolean> {
+    if (input.credentials.length === 0) return false;
+    const vars: Record<string, unknown> = {
+      task: new RecordId('task', input.taskId), incident: input.incident, via: input.via,
+      row: repairId(input.incident), now: input.now, deadline: input.now + input.limits.totalDeadlineMs,
+    };
+    const statements = ['BEGIN TRANSACTION;'];
+    input.credentials.forEach((item, index) => {
+      const key = FaultStore.consumptionKey(input.taskId, input.incident, item.credential);
+      vars[`consumption${index}`] = consumptionId(key);
+      vars[`key${index}`] = key;
+      vars[`repair${index}`] = new RecordId('task', item.repair);
+      vars[`credential${index}`] = item.credential;
+      statements.push(`CREATE $consumption${index} CONTENT { key: $key${index}, task: $task, incident: $incident,
+        repair: $repair${index}, credential: $credential${index}, via: $via, consumed_at: time::now() };`);
+      statements.push(`UPDATE $row SET state = 'done', updated_at = time::now() WHERE task = $repair${index};`);
+    });
+    statements.push(`UPDATE fault_episode SET state = 'resolved', resolved_at = time::now(), updated_at = time::now()
+      WHERE task = $task AND incident = $incident AND state != 'resolved';`);
+    statements.push(`UPDATE fault_budget SET attempts = 0, deadline = $deadline, next_allowed_at = $now,
+      stopped = false, stop_reason = NONE, stop_fingerprint = NONE, stop_diagnostic = NONE, failed = false,
+      updated_at = time::now() WHERE task = $task AND last_incident = $incident;`);
+    statements.push('COMMIT TRANSACTION;');
+    const spent = await this.retrying(async () => {
+      try {
+        await this.db.query(statements.join('\n'), vars);
+        return true;
+      } catch (error) {
+        // A failed transaction changed nothing. Which statement reports the duplicate depends on the order of the
+        // statements, so the error text is not matched: the spend is read back instead. A credential that is recorded
+        // by now was spent by an earlier call, and this call is told so; any other failure is the caller's to see.
+        const taken = await this.spentCredentials(input.taskId, input.incident);
+        if (input.credentials.some(item => taken.has(item.credential))) return false;
+        throw error;
+      }
+    });
+    return spent === true;
+  }
+
+  /**
+   * Reset the recovery of one incident on one task by hand, with no credential (AC04): the gm lifts it and the caller
+   * audits the reason. The budgets start over with the default window and the episodes of the incident close. Only
+   * the task's own budgets are reset; the total stays for the audit.
+   */
+  async resetRecovery(input: { taskId: string; incident: string; now: number; limits: FaultBudgetLimits }): Promise<void> {
     const task = new RecordId('task', input.taskId);
     await this.db.query(`UPDATE fault_episode SET state = 'resolved', resolved_at = time::now(), updated_at = time::now()
       WHERE task = $task AND incident = $incident AND state != 'resolved';`, { task, incident: input.incident });
@@ -673,34 +754,78 @@ export class FaultStore {
       updated_at = time::now() WHERE task = $task AND last_incident = $incident;`, {
       task, incident: input.incident, deadline: input.now + input.limits.totalDeadlineMs, now: input.now,
     });
-    await this.db.query(`UPDATE $row SET state = 'done', updated_at = time::now();`, { row: repairId(input.incident) });
   }
 
   /**
-   * Create or link the one repair task of an incident and return its id. The incident key is unique, so a second
-   * exhaustion of the same cause links the existing repair instead of creating a second chain.
+   * Create or link the repair task of an incident and return its id (AC04).
+   *
+   * The chain has rounds. While the current round is open, a second exhaustion of the same cause links that round
+   * instead of creating another one. A round that is done or retired is spent: the chain moves on to a new round,
+   * whose task is keyed by its round number, so a repair that already lifted the budget cannot serve as the green
+   * light for the same incident again.
    */
   async ensureRepair(input: {
     incident: string; fingerprint: string; sourceTaskId: string; diagnostic: FaultDiagnostic; now: number;
-    /** Creates the repair task; the caller owns task creation so the repair follows the normal task rules. */
-    createTask: (input: { incident: string; fingerprint: string; sourceTaskId: string; diagnostic: FaultDiagnostic }) => Promise<string>;
+    /** Creates the repair task of one round; the caller owns task creation so the repair follows the normal task rules. */
+    createTask: (input: {
+      incident: string; fingerprint: string; sourceTaskId: string; diagnostic: FaultDiagnostic; round: number;
+    }) => Promise<string>;
   }): Promise<string> {
-    const existing = await this.repair(input.incident);
-    if (existing?.taskId) return existing.taskId;
-    const taskId = await input.createTask({
-      incident: input.incident, fingerprint: input.fingerprint, sourceTaskId: input.sourceTaskId, diagnostic: input.diagnostic,
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const existing = await this.repair(input.incident);
+      if (existing?.taskId && await this.isOpen(existing.taskId)) return existing.taskId;
+      const taskId = await input.createTask({
+        incident: input.incident, fingerprint: input.fingerprint, sourceTaskId: input.sourceTaskId,
+        diagnostic: input.diagnostic, round: (existing?.rounds.length ?? 0) + 1,
+      });
+      // A concurrent caller may have moved the chain already: then the chain is read again.
+      if (await this.linkRound(input, taskId, existing) && await this.isOpen(taskId)) return taskId;
+    }
+    throw new Error(`the repair chain of ${input.incident} moved during the link; retry the resume`);
+  }
+
+  /**
+   * Link a round to its incident. The first round creates the chain row. A later round moves the row away from the
+   * round that was read (compare-and-set), so a concurrent caller that moved the chain first wins: false is returned.
+   */
+  private async linkRound(input: { incident: string; fingerprint: string; sourceTaskId: string; diagnostic: FaultDiagnostic },
+    taskId: string, existing: FaultRepairRow | undefined): Promise<boolean> {
+    const task = new RecordId('task', taskId);
+    const source = new RecordId('task', input.sourceTaskId);
+    if (!existing?.taskId) {
+      try {
+        await this.db.query(`IF (SELECT * FROM ONLY $row) = NONE {
+            CREATE $row CONTENT { incident: $incident, fingerprint: $fingerprint, task: $task_ref, source_task: $source_ref,
+              rounds: [$task_ref], state: 'open', diagnostic: $diagnostic, created_at: time::now(), updated_at: time::now() };
+          } ELSE {
+            UPDATE $row SET task = $task_ref, source_task = $source_ref, rounds = [$task_ref], state = 'open',
+              diagnostic = $diagnostic, updated_at = time::now();
+          };`, {
+          row: repairId(input.incident), incident: input.incident, fingerprint: input.fingerprint,
+          task_ref: task, source_ref: source, diagnostic: input.diagnostic,
+        });
+        return true;
+      } catch (error) {
+        // Two first links raced and the other one created the row: its round is the chain now, and this one is read again.
+        const row = await this.repair(input.incident);
+        if (row?.taskId !== undefined) return false;
+        throw error;
+      }
+    }
+    const [moved] = await this.db.query<[Array<{ id?: unknown }>]>(`UPDATE $row SET task = $task_ref, source_task = $source_ref,
+        rounds = $rounds, state = 'open', diagnostic = $diagnostic, updated_at = time::now()
+        WHERE task = $expected RETURN AFTER;`, {
+      row: repairId(input.incident), task_ref: task, source_ref: source, diagnostic: input.diagnostic,
+      expected: new RecordId('task', existing.taskId),
+      rounds: [...existing.rounds.filter(round => round !== taskId), taskId].map(round => new RecordId('task', round)),
     });
-    await this.db.query(`IF (SELECT * FROM ONLY $row) = NONE {
-        CREATE $row CONTENT { incident: $incident, fingerprint: $fingerprint, task: $task_ref, source_task: $source_ref,
-          state: 'open', diagnostic: $diagnostic, created_at: time::now(), updated_at: time::now() };
-      } ELSE {
-        UPDATE $row SET task = $task_ref, source_task = $source_ref, diagnostic = $diagnostic, updated_at = time::now();
-      };`, {
-      row: repairId(input.incident), incident: input.incident, fingerprint: input.fingerprint,
-      task_ref: new RecordId('task', taskId), source_ref: new RecordId('task', input.sourceTaskId),
-      diagnostic: input.diagnostic,
-    });
-    return taskId;
+    return (moved?.length ?? 0) > 0;
+  }
+
+  /** A repair task that is done or retired is spent: it no longer serves as the green light of its incident. */
+  private async isOpen(taskId: string): Promise<boolean> {
+    const task = await this.db.select<{ state?: string }>(new RecordId('task', taskId));
+    return task?.state !== 'done' && task?.state !== 'void';
   }
 
   /**

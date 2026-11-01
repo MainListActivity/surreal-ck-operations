@@ -187,6 +187,13 @@ export class CompanyDatabase {
     // 只新增字段，不改既有行；旧版读不到新字段即按 v2 候选处理（RB01）。
     await this.db.query(loadSchema('046-remote-candidate.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 46 WHERE schema_version < 46;');
+    // SYS04 故障修复凭据消耗（编号 047）：一条真实修复完成凭据最多自动解除一次恢复预算。只新增一张表与 fault_repair 的
+    // 两个可选字段；旧版读不到即忽略（RB01）。首次升到 047 时记下凭据起点：之后的 accept / owner_approve 审计才是凭据，
+    // 升级前已完成的修复不是凭据，所以升级本身不解除任何预算。
+    await this.db.query(loadSchema('047-fault-repair-credential.surql'));
+    await this.db.query(`UPDATE company_meta:installation SET fault_credential_since = time::now()
+      WHERE schema_version < 47 AND fault_credential_since = NONE;`);
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 47 WHERE schema_version < 47;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {
