@@ -85,7 +85,9 @@ try {
     // SYS-INT：演练工具的 Node 宿主门禁与 deployDrillRun/Status 权限回归（自建隔离库，不启动生产演练）。
     'tests/deploy-drill.test.ts', 'tests/deploy-drill-runner.test.ts', 'tests/deploy-drill-node-host.test.ts', 'tests/deploy-drill-access.fork.test.ts',
     // SYS-INT：QA 评审协同的持久事件唤醒（自建隔离库；订阅/信号/事件只解除协同任务自己的 feedback 等待）。
-    'tests/review-events.test.ts', 'tests/review-events.fork.test.ts',  ];
+    'tests/review-events.test.ts', 'tests/review-events.fork.test.ts',
+    // 经理在途任务验收要求追加（自建隔离库；验证租约不中断、门禁不动、通知可读可 ack、幂等与版本 CAS）。
+    'tests/task-acceptance-amend.fork.test.ts',  ];
   const test = Bun.spawn([process.execPath, 'test', ...targets], { detached: true, stdout: 'inherit', stderr: 'inherit', env: {
     ...process.env, SCK_PRODUCT_ENV: '/dev/null', SURREAL_URL: `ws://127.0.0.1:${port}/rpc`, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: rootPassword,
     RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_PIPELINE_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_UPGRADE_FORK_TESTS: '1', RUN_SCK_LOOP_BREAKER_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_ROLLBACK_FORK_TESTS: '1', RUN_SCK_DRILL_ACCESS_TESTS: '1', RUN_SCK_REVIEW_EVENT_FORK_TESTS: '1',

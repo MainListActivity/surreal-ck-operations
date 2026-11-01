@@ -1028,6 +1028,20 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.taskIntentUpdate(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
+  server.registerTool('task_acceptance_amend', {
+    description: 'gm only (manage): append the boss\'s acceptance-requirement amendment to an in-flight task (ready/doing/review/blocked; done/void refuse). Append-only — state, blocked_to/resume_*, dependencies, acceptance criteria, independence, worktree and the lease (holder, delivery, fence, expiry) are untouched, and the task version does not move, so a live lease keeps working. The amendment is appended to the task context (visible on the next claim and through read_task_text field=context), the audit row keeps the verbatim ownerQuote, and every employee in notify (default: current lease holder + implementer + latest submitter) gets a persistent holder_notices entry. Version-guarded (expectedVersion), idempotent.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200),
+      expectedVersion: z.number().int().positive(),
+      ownerQuote: z.string().min(1).max(4000),
+      text: z.string().min(4).max(4000),
+      notify: z.array(z.string().min(1).max(200)).max(20).nullish(),
+      idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.taskAcceptanceAmend
+    ? core.taskAcceptanceAmend(token(ctx), { ...input, notify: input.notify ?? undefined })
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
   server.registerTool('get_model_evidence', {
     description:'eval/gm only: actual models and execution fences for final task evaluation. Combine with full submission/return/accept history; request counts are not quality scores.',
     inputSchema:z.object({taskId:z.string().min(1).max(200)}),

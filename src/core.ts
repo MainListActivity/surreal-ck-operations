@@ -78,7 +78,7 @@ import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBS
 
 import { CompanyError } from './core-errors.ts';
 import { assertEmployeeCiBlockAllowed, createCiBillingCheck, isCiBlockCause, refuseEmployeeCiBlock, type CiBillingCheck } from './github-ci-control.ts';
-import { DispositionLedger, type DispositionApplier, type DispositionClaimInput, type DispositionClaimOutcome, type DispositionClaimView, type DispositionDecideInput, type DispositionDecideOutcome, type DispositionPhase, type DispositionStatusInput, type DispositionStatusView, type ExternalActionRequestInput, type ExternalActionView, type HolderNoticeView, type ExternalActionGateway } from './disposition.ts';
+import { DispositionLedger, holderNoticeId, type DispositionApplier, type DispositionClaimInput, type DispositionClaimOutcome, type DispositionClaimView, type DispositionDecideInput, type DispositionDecideOutcome, type DispositionPhase, type DispositionStatusInput, type DispositionStatusView, type ExternalActionRequestInput, type ExternalActionView, type HolderNoticeView, type ExternalActionGateway } from './disposition.ts';
 import { createCompanyGithubGateway, githubRepoSlug } from './external-actions.ts';
 import { validateExternalDependencies } from './input-bounds.ts';
 import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
@@ -866,6 +866,9 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
           // the atomic backstop and carry the same invalid meaning as their pre-check twins.
           const appendBackstop = /append denied: (only a formal dependency wait|only execute-phase dependency waits(?:; a review wait keeps its reviewer)?|the open dependency wait(?: is missing)?|a legacy wait needs [^']+)/i.exec(cause);
           if (appendBackstop) throw new CompanyError('invalid', `Append refused: ${appendBackstop[1]!.trim()}`);
+          // 验收修订：状态不在 ready/doing/review/blocked 之内是 invalid（不是被拒权），其余冲突照常。
+          const amendInvalid = /acceptance amend invalid: ([^'"\n]+)/i.exec(cause);
+          if (amendInvalid) throw new CompanyError('invalid', `Acceptance amendment refused: ${amendInvalid[1]!.trim()}`);
           if (/denied|forbidden|revoked/i.test(cause)) throw new CompanyError('forbidden', 'Action forbidden');
           if (/checkpoint limit/i.test(cause)) throw new CompanyError('checkpoint_limit', 'Checkpoint limit reached');
           if (/task retired/i.test(cause)) throw new CompanyError('conflict', 'Task has been retired');
@@ -6320,6 +6323,107 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     } catch (error) {
       const replayed = await this.replay(idem, digest);
       if (replayed) return replayed;
+      throw error;
+    }
+  }
+
+  /**
+   * gm only (manage): append the boss's acceptance-requirement amendment to an in-flight task.
+   *
+   * The amendment is an append-only annotation on a task that is already moving, so it must not disturb the
+   * task's machine gates or the holder's lease: state, blocked_to/resume_*, dependencies, acceptance_criteria,
+   * acceptance_version, independence, worktree and every lease field (current_employee, delivery_id, fence,
+   * lease_expires_at) are left exactly as they were — nothing here relaxes the machine criteria, independent
+   * review, quota or dependencies. The version is deliberately left alone too: it is part of the holder's
+   * lease proof, and bumping it would make the holder's next checkpoint/submit fail with a stale-proof
+   * conflict until the channel's heartbeat resynced (up to 60 s) — exactly the interruption this tool must
+   * avoid. The compare-and-set on expectedVersion still refuses a caller that read a stale task, and
+   * concurrent appends serialize on the record write (txTask retries the conflict and re-reads).
+   *
+   * The amendment text is appended to task.context — the field claim.json and read_task_text(field=context)
+   * read — so the next claim and every later reader sees it. The audit row keeps the verbatim owner quote,
+   * and each employee in notify (default: the live lease holder + the implementer + the latest submitter)
+   * gets a persistent holder_notice that holder_notices reads and acks; the dispatcher redelivers it after a
+   * reconnect or restart, and holding a lease never consumes it.
+   */
+  async taskAcceptanceAmend(credential: Credential, input: { taskId: TaskId; expectedVersion: number; ownerQuote: string; text: string; notify?: string[]; idempotencyKey: string }): Promise<TaskView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may amend a task acceptance requirement');
+    requireText(input.taskId, 'task', 1, 200);
+    requireText(input.ownerQuote, 'ownerQuote', 1, 4000);
+    requireText(input.text, 'text', 4, 4000);
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
+    const MAX_NOTIFY = 20;
+    const MAX_CONTEXT = 100_000;
+    const explicit = input.notify ?? [];
+    if (!Array.isArray(explicit) || explicit.length > MAX_NOTIFY) throw new CompanyError('invalid', `notify holds at most ${MAX_NOTIFY} employee ids`);
+    const notify = [...new Set(explicit.map(employee => { requireText(employee, 'notify employee', 1, 200); return employee; }))];
+    // A replay of the same call returns its first answer, even though the task context already carries the block by then.
+    const idem = this.idemId(actor.employeeId, 'acceptance_amend', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ taskId: input.taskId, expectedVersion: input.expectedVersion, ownerQuote: input.ownerQuote, text: input.text, notify }));
+    const replay = await this.replay(idem, digest);
+    if (replay) return echoTask(replay);
+    const row = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    if (row.state === 'done' || row.state === 'void') throw new CompanyError('conflict', `Acceptance amendment does not apply to ${row.state} tasks`);
+    if (!['ready', 'doing', 'review', 'blocked'].includes(row.state)) throw new CompanyError('invalid', `Acceptance amendment does not apply to ${row.state} tasks`);
+    const leaseLive = row.current_employee !== undefined && (row.lease_expires_at ?? 0) > Math.floor(Date.now() / 1000);
+    const defaults = [leaseLive ? row.current_employee : undefined, row.implementer, row.submitted_by]
+      .filter((employee): employee is string => typeof employee === 'string' && employee.length > 0);
+    const recipients = notify.length ? notify : [...new Set(defaults)];
+    if (recipients.length) {
+      const [found] = await this.db.query<[Array<{ id: RecordId }>]>('SELECT id FROM employee WHERE id IN $ids;',
+        { ids: recipients.map(employee => id('employee', employee)) });
+      const known = new Set((found ?? []).map(entry => asId(entry.id)));
+      const unknown = recipients.filter(employee => !known.has(employee));
+      if (unknown.length) throw new CompanyError('invalid', `Unknown employee id in notify: ${unknown.join(', ')}`);
+    }
+    const auditId = randomUUID();
+    const at = new Date().toISOString();
+    const block = `\n\n【验收要求修订 · ${at} · ${actor.employeeId} · audit ${auditId}】\n老板原话（逐字）：${input.ownerQuote}\n修订说明：${input.text}\n`;
+    const context = `${row.context ?? ''}${block}`;
+    if (context.length > MAX_CONTEXT) {
+      throw new CompanyError('invalid', `The amended context would exceed ${MAX_CONTEXT} characters; archive the old context before appending another amendment`);
+    }
+    const evidence = `${input.text}\n[acceptance_amend] ownerQuote（老板原话，逐字）：${input.ownerQuote}\n[acceptance_amend] notify：${recipients.length ? recipients.join(', ') : '（无：任务没有在租持有人、实现人或提交人）'}`;
+    const noticeText = `验收要求已修订：${input.text}\n老板原话（逐字）：${input.ownerQuote}\n完整修订已追加到任务上下文；用 sck call read_task_text '{"taskId":"${input.taskId}","field":"context"}' 读全文，再按最新要求行事。`;
+    const notices = recipients.map(employee => {
+      const noticeKey = `${input.taskId}\0acceptance_amend\0${auditId}\0${employee}`;
+      return { employee, noticeKey, record: holderNoticeId(noticeKey) };
+    });
+    const noticeStatements = notices.map((_, index) => `CREATE ONLY $notice_${index} CONTENT {
+          notice_key: $notice_key_${index}, episode: $episode, task: $task, holder: $holder_${index}, kind: 'acceptance_amend',
+          text: $notice_text, payload: $notice_payload, created_at: time::now(), delivered_at: NONE, deliveries: 0,
+          last_attempt_at: NONE, last_error: NONE };`).join('\n        ');
+    const noticeVars = Object.fromEntries(notices.flatMap((notice, index) => [
+      [`notice_${index}`, notice.record], [`notice_key_${index}`, notice.noticeKey], [`holder_${index}`, notice.employee],
+    ]));
+    try {
+      const next = await this.txTask(`BEGIN;
+        LET $t = SELECT * FROM ONLY $task;
+        IF $t = NONE { THROW 'task not found' };
+        IF $t.version != $expected { THROW 'task version moved' };
+        IF $t.state IN ['done', 'void'] { THROW 'task already terminal' };
+        IF $t.state NOT IN ['ready', 'doing', 'review', 'blocked'] { THROW 'acceptance amend invalid: only ready, doing, review or blocked tasks accept an amendment' };
+        LET $next = UPDATE ONLY $task SET context = $context RETURN AFTER;
+        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'acceptance_amend', evidence: $evidence, version: $next.version, at: time::now() };
+        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+        CREATE ONLY $outbox CONTENT { task: $task, kind: 'acceptance_amend', sequence: $sequence.value,
+          payload: { version: $next.version, audit: $audit_id, notify: $notify }, at: time::now() };
+        ${noticeStatements}
+        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
+        RETURN $next;
+        COMMIT;`, {
+        actor: id('employee', actor.employeeId), task: id('task', input.taskId), expected: input.expectedVersion,
+        context, evidence, idem, digest, audit: id('audit', auditId), audit_id: auditId, outbox: id('outbox', randomUUID()),
+        episode: `${input.taskId}:acceptance_amend:${auditId}`, notice_text: noticeText,
+        notice_payload: { auditId, version: row.version, actor: actor.employeeId, notify: recipients },
+        notify: recipients, ...noticeVars,
+      });
+      return echoTask(view(next));
+    } catch (error) {
+      const replayed = await this.replay(idem, digest);
+      if (replayed) return echoTask(replayed);
       throw error;
     }
   }

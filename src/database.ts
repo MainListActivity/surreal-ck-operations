@@ -187,6 +187,10 @@ export class CompanyDatabase {
     // 只新增字段，不改既有行；旧版读不到新字段即按 v2 候选处理（RB01）。
     await this.db.query(loadSchema('046-remote-candidate.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 46 WHERE schema_version < 46;');
+    // 经理验收要求修订（编号 047）：holder_notice.kind 白名单新增 acceptance_amend。修订正文追加在既有
+    // task.context，不新增任务字段、不改任何既有行；旧版 release 读到未知 kind 按既有通用文本投递一次（RB01）。
+    await this.db.query(loadSchema('047-acceptance-amend.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 47 WHERE schema_version < 47;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

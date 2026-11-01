@@ -1557,6 +1557,14 @@ export interface CompanyCore {
   goalPhaseSplit?(credential: Credential, input: { goalId: string; taskIds: TaskId[]; title: string; reason: string; idempotencyKey: string }): Promise<{ goalId: string; nextGoalId: string; moved: TaskId[]; unlocked: TaskId[] }>;
   /** gm only: turn a blocked read-only engineering task (kind=task) into a code task in place; policy re-judged, audited. */
   taskIntentUpdate?(credential: Credential, input: { taskId: TaskId; lane?: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView>;
+  /**
+   * gm only (manage): append the boss's acceptance-requirement amendment to an in-flight task. Append-only —
+   * state, lease/fence/holder, dependencies, acceptance criteria, independence and quota are untouched, and the
+   * task version does not move, so a live lease keeps working. The text lands in task.context (claim.json and
+   * read_task_text), the audit keeps the verbatim ownerQuote, and every employee in notify gets a holder_notices
+   * entry. Version-guarded (expectedVersion) and idempotent.
+   */
+  taskAcceptanceAmend?(credential: Credential, input: { taskId: TaskId; expectedVersion: number; ownerQuote: string; text: string; notify?: string[]; idempotencyKey: string }): Promise<TaskView>;
   /** manage (gm/product): list every employee_def row for workforce review. */
   listDefs(credential: Credential): Promise<DefView[]>;
   /** manage (gm/product): create or update an employee_def via the shared workforce writer; audited. */

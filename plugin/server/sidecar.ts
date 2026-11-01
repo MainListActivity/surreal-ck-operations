@@ -50,6 +50,8 @@ const BASE_TOOLS = [
   "bind_task_code_repo",
   // gm only in core (turn a blocked read-only engineering task into a code task in place; audited, version-guarded).
   "task_intent_update",
+  // gm only in core (append the boss's acceptance-requirement amendment to an in-flight task; never touches its gates or lease).
+  "task_acceptance_amend",
   // gm only in core (read-only acceptance-reference preview; compare-and-set repair of a quick goal's voided gate).
   "goal_acceptance_preview", "goal_acceptance_repair",
   // SYS07 goal governance: paged read-only console/scan/metrics, structured outcome and evidence, final-gate
@@ -1078,6 +1080,9 @@ export class SidecarPool {
       case "task_intent_update": return core.taskIntentUpdate
         ? core.taskIntentUpdate(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose task_intent_update"), { code: "temporarily_unavailable" }));
+      case "task_acceptance_amend": return core.taskAcceptanceAmend
+        ? core.taskAcceptanceAmend(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose task_acceptance_amend"), { code: "temporarily_unavailable" }));
       case "bind_task_code_repo": return core.bindTaskCodeRepo
         ? core.bindTaskCodeRepo(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose bind_task_code_repo"), { code: "temporarily_unavailable" }));

@@ -108,6 +108,8 @@ test('real SDK initialize/list/call and authenticated core identity', async () =
     expect(tools).toContain('defer_task_until');
     expect(tools).toContain('bind_task_code_repo');
     expect(tools).toContain('task_intent_update');
+    // 经理在途任务验收要求追加：与其它 gm 工具同一条 MCP 表面（角色与能力在 core 判定）。
+    expect(tools).toContain('task_acceptance_amend');
     expect(tools).toContain('goal_acceptance_preview');
     expect(tools).toContain('goal_acceptance_repair');
     expect(tools).toContain('implementer_takeover');
