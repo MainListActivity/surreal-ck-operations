@@ -186,7 +186,7 @@ interface LiveClaim {
 /** What settle() found for a finished turn; `silent` carries the still-open round. */
 export interface SettleResult {
   status: "ingested" | "no_claim" | "silent";
-  silent?: { instId: string; taskId: string; nudges: number };
+  silent?: { instId: string; taskId: string; nudges: number; phase: "doing" | "review" };
 }
 
 const ORPHAN_PREFIX = "orphaned-";
@@ -526,7 +526,7 @@ export class SidecarPool {
     // between a wake nudge and a server-side release; the count feeds that decision.
     if (!options.infrastructureFailure) live.nudges = (live.nudges ?? 0) + 1;
     this.log(`turn ended without new report/blocker: ${instId} on ${live.taskId} (silent turn ${live.nudges})`);
-    return { status: "silent", silent: { instId, taskId: live.taskId, nudges: live.nudges ?? 0 } };
+    return { status: "silent", silent: { instId, taskId: live.taskId, nudges: live.nudges ?? 0, phase: live.phase } };
   }
 
   private async finish(
@@ -1016,7 +1016,12 @@ export class SidecarPool {
         : Promise.reject(Object.assign(new Error("core does not expose acceptance_mapping_import"), { code: "temporarily_unavailable" }));
       case "checkpoint": return writeOp(p => core.checkpoint(cred, p, evidence()));
       case "submit": return writeOp(p => core.submit(cred, p, evidence()), true);
-      case "review": return writeOp(p => (args.decision === "accept" ? core.accept(cred, p, evidence()) : core.returnTask(cred, p, evidence())), true);
+      case "review": {
+        if (args.decision !== "accept" && args.decision !== "return") {
+          throw Object.assign(new Error('review decision must be "accept" or "return"'), { code: "invalid" });
+        }
+        return writeOp(p => (args.decision === "accept" ? core.accept(cred, p, evidence()) : core.returnTask(cred, p, evidence())), true);
+      }
       case "report_blocker": return writeOp(p => core.block(cred, p, args.to === "owner" ? "owner" : "gm", evidence(), quotaReset()), true);
       // SYS05: entering a wait consumes the lease in the same turn — the task takes no employee or provider seat
       // while it waits. The ops sessions and browser spaces opened under this lease are dropped by endLease below.

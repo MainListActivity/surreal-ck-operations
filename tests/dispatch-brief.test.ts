@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { latestFindings, requirementOf, taskBrief } from '../src/dispatcher/brief.ts';
-import { wake } from '../src/dispatcher/prompts.ts';
+import { wake, gmAttention } from '../src/dispatcher/prompts.ts';
 import type { ClaimResult, HistoryEntry } from '../src/contracts.ts';
 
 const env = { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' };
@@ -52,4 +52,18 @@ test('the dispatch message is three sentences: what, finish, which tool', () => 
   const review = wake({ id: 'e2', role: 'engineering' } as never, task('review'), env, true, { comm: true, claim: claim('review', []), commDir: '/c' });
   expect(review).toContain('按 /c/task.md 复核交付。');
   expect(review).toContain("call review");
+});
+
+test('manager first contact carries only task actions, reasons and the tool entry', () => {
+  const text = gmAttention({ id: 'gm1', role: 'gm' } as never, [
+    { task: { id: 'blocked-1', title: '导出', executorRole: 'engineering' }, action: 'resume', expectedVersion: 4 },
+    { task: { id: 'ready-1', title: '修复', executorRole: 'engineering' }, action: 'implementer_takeover', expectedVersion: 7 },
+  ] as never, env, true, { comm: true });
+  expect(text).toContain('blocked-1');
+  expect(text).toContain('resume_task');
+  expect(text).toContain('ready-1');
+  expect(text).toContain('implementer_takeover');
+  expect(text).toContain('expectedVersion=7');
+  expect(text).toContain("'/bin/sck' call");
+  for (const word of ['AGENTS.md', 'PROTOCOL', '公司唯一真人', '你有决定权', '只有花钱', 'response_too_large']) expect(text).not.toContain(word);
 });
