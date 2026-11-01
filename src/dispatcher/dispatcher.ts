@@ -1480,6 +1480,11 @@ export class Dispatcher {
       // Do not loosen cross-repo admission or infer a correction from a project change alone.
       if (task.codeRepoPath === home && (inst.repoHome ?? inst.cwd ?? this.deps.env.opsRepo) !== home)
         return `任务代码仓已显式改绑为 ${home}，原实现人会话仍属于 ${inst.repoHome ?? inst.cwd ?? this.deps.env.opsRepo}`;
+      // A goal-scoped session only ever takes work of its own goal (staffing inWorkspace), so an implementer bound across
+      // goals — by a takeover, or a task moved to another goal phase — can never be dispatched the task back.
+      const scope = workspaceScopeFor(task.goalId);
+      if (inst.workspaceScope && inst.workspaceScope !== scope)
+        return `原实现人会话属于目标 ${inst.workspaceScope} 的工作区，本任务属于 ${scope}，调度永远派不到它`;
       return undefined;
     };
     /**

@@ -422,6 +422,17 @@ test('a busy bound implementer is not escalated to the manager', async () => {
   expect(codes).not.toContain('implementer_unresolved');
 });
 
+test('an implementer bound across goal workspaces is unavailable, not a busy wait', async () => {
+  const f = fixture([{ id: 'cross-goal', state: 'ready', implementer: 'eng-1', repoPath: OPS }]);
+  (f.rows[0] as { goalId?: string }).goalId = 'goal-b';
+  await f.tick();
+  const verdict = f.last!.dispatchVerdicts().find(v => v.taskId === 'cross-goal')!;
+  expect(verdict.reasons.map(reason => reason.code)).toContain('implementer_unavailable');
+  // Same workspace: the binding stands and the implementer is dispatched.
+  const same = fixture([{ id: 'same-goal', state: 'ready', implementer: 'eng-1', repoPath: OPS }]);
+  expect((await same.tick()).woke.find(w => w.task === 'same-goal')?.employee).toBe('eng-1');
+});
+
 test('a vanished bound implementer enters the manager takeover todo', async () => {
   const f = fixture([{ id: 'gone-task', state: 'ready', implementer: 'gone-employee', repoPath: OPS }]);
   const result = await f.tick();
