@@ -1,16 +1,15 @@
 {
-  "version": "0.3.67",
-  "title": "故障恢复预算：同一修复完成只解除一次",
+  "version": "0.3.68",
+  "title": "quick 链合并腿共用 code 车道",
   "changes": [
-    "修复完成（accept 或 owner_approve 审计）解除恢复预算时，按（源任务、incident、凭据）写入消费记录，与解除在同一事务中提交；重放、并发与进程重启都不会再次清零。",
-    "同一 incident 再次耗尽后，已消耗的修复不再充当绿灯：修复链推进一轮，由新的修复任务承接，需要该轮的真实完成凭据，或 gm 审计的人工解除。",
-    "升级前的修复完成，以及直接改为 done 的修复任务，都不是凭据；升级本身不解除任何预算。"
+    "quick 目标的「实现与上线申请」合并腿与「合入部署与生产实测」部署腿建单时写入同一个 code 车道，工程员工可在该车道 commit 与 push。",
+    "triage 建单路径写入 work_intent；triage_goal、CLI/MCP 建目标与 Jev 分级一致覆盖。",
+    "提交前系统检查扩到 kind=release 且 intent=code 的合并腿；只收紧，read 意图的上线申请腿与其他任务行为不变。"
   ],
   "impact": [
-    "同一次修复完成只解除同一源任务的一次恢复预算；不同任务与不同 incident 互不影响。",
-    "人工 fault_lift 仍需 gm 权限与原因审计，窗口仍为默认 3 次 / 120 秒，并一并消耗当时未消耗的修复凭据。",
-    "不改变超时、重试与 GET 重试策略，不改变产品或供应商配置；本版本不声称网络问题已修复。"
+    "只影响新建的 quick 目标；标准 create_delivery 链、standard 与 program 计划的行为不变。存量在途的 quick 合并腿不做数据迁移，已建任务的 work_intent 保持原样。",
+    "quick 合并腿带 code 车道后，提交时执行系统检查；检查失败拒绝提交并写 submit_check_failed 审计。"
   ],
-  "migration": "只新增结构：047 fault_repair_consumption 表，fault_repair 增加可选字段 rounds，company_meta:installation 记录 fault_credential_since 起点；不改写、删除既有 task、audit、outbox 或 fault_* 行。",
-  "rollback": "可切回 0.3.66；回退后旧版会重新按 done 修复自动清零，本次修复的缺口重新出现，因此优先前向修复。"
+  "migration": "无：本版本不新增 schema、不改写数据；存量在途 quick 合并腿不迁移",
+  "rollback": "切回上一固定版本 0.3.67（releases/fca1b6a）；回退后新建 quick 链回到合并腿 read 的旧行为，已建任务无需数据回滚"
 }
