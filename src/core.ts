@@ -78,7 +78,7 @@ import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBS
 
 import { CompanyError } from './core-errors.ts';
 import { assertEmployeeCiBlockAllowed, createCiBillingCheck, isCiBlockCause, refuseEmployeeCiBlock, type CiBillingCheck } from './github-ci-control.ts';
-import { DispositionLedger, type DispositionApplier, type DispositionClaimInput, type DispositionClaimOutcome, type DispositionClaimView, type DispositionDecideInput, type DispositionDecideOutcome, type DispositionPhase, type DispositionStatusInput, type DispositionStatusView, type ExternalActionRequestInput, type ExternalActionView, type HolderNoticeView, type ExternalActionGateway } from './disposition.ts';
+import { DispositionLedger, holderNoticeId, type DispositionApplier, type DispositionClaimInput, type DispositionClaimOutcome, type DispositionClaimView, type DispositionDecideInput, type DispositionDecideOutcome, type DispositionPhase, type DispositionStatusInput, type DispositionStatusView, type ExternalActionRequestInput, type ExternalActionView, type HolderNoticeView, type ExternalActionGateway } from './disposition.ts';
 import { createCompanyGithubGateway, githubRepoSlug } from './external-actions.ts';
 import { validateExternalDependencies } from './input-bounds.ts';
 import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
@@ -874,6 +874,9 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
           // the atomic backstop and carry the same invalid meaning as their pre-check twins.
           const appendBackstop = /append denied: (only a formal dependency wait|only execute-phase dependency waits(?:; a review wait keeps its reviewer)?|the open dependency wait(?: is missing)?|a legacy wait needs [^']+)/i.exec(cause);
           if (appendBackstop) throw new CompanyError('invalid', `Append refused: ${appendBackstop[1]!.trim()}`);
+          // 验收修订：状态不在 ready/doing/review/blocked 之内是 invalid（不是被拒权），其余冲突照常。
+          const amendInvalid = /acceptance amend invalid: ([^'"\n]+)/i.exec(cause);
+          if (amendInvalid) throw new CompanyError('invalid', `Acceptance amendment refused: ${amendInvalid[1]!.trim()}`);
           if (/denied|forbidden|revoked/i.test(cause)) throw new CompanyError('forbidden', 'Action forbidden');
           if (/checkpoint limit/i.test(cause)) throw new CompanyError('checkpoint_limit', 'Checkpoint limit reached');
           if (/task retired/i.test(cause)) throw new CompanyError('conflict', 'Task has been retired');
@@ -5074,11 +5077,14 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   async ackDispositionNotices(credential: Credential, input: { ids: string[]; error?: string }): Promise<{ delivered: number }> {
     const actor = await this.authorized(credential);
     if (!Array.isArray(input.ids) || input.ids.length === 0 || input.ids.length > 100) throw new CompanyError('invalid', 'ids must hold 1-100 notice keys');
-    const mine = new Set((await this.dispositions.noticesFor(actor.employeeId, 200)).map(notice => notice.noticeKey));
+    const keys = [...new Set(input.ids)];
     // Only the holder's own notices can be acknowledged: a leaked key must not let another employee mark anyone's notice delivered.
-    const owned = input.ids.filter(key => mine.has(key));
-    if (owned.length !== input.ids.length) throw new CompanyError('forbidden', 'Notices may only be acknowledged by their holder');
-    return { delivered: await this.dispositions.markNotices(owned, { agent: actor.employeeId, error: input.error }) };
+    const mine = await this.dispositions.noticesByKey(actor.employeeId, keys);
+    if (mine.length !== keys.length) throw new CompanyError('forbidden', 'Notices may only be acknowledged by their holder');
+    // A notice the holder already has (attached to an earlier reply, or acknowledged before) is acknowledged again without a
+    // second count, and a failure receipt does not reopen it. One such id must not refuse the rest of the batch.
+    const undelivered = mine.filter(notice => notice.deliveredAt === undefined).map(notice => notice.noticeKey);
+    return { delivered: await this.dispositions.markNotices(undelivered, { agent: actor.employeeId, error: input.error }) };
   }
 
   /**
@@ -6617,6 +6623,137 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     } catch (error) {
       const replayed = await this.replay(idem, digest);
       if (replayed) return replayed;
+      throw error;
+    }
+  }
+
+  /**
+   * gm only (manage): append the boss's acceptance-requirement amendment to an in-flight task.
+   *
+   * The amendment is an append-only annotation on a task that is already moving, so it must not disturb the
+   * task's machine gates or the holder's lease: state, blocked_to/resume_*, dependencies, acceptance_criteria,
+   * acceptance_version, independence, worktree and every lease field (current_employee, delivery_id, fence,
+   * lease_expires_at) are left exactly as they were — nothing here relaxes the machine criteria, independent
+   * review, quota or dependencies. The version is deliberately left alone too: it is part of the holder's
+   * lease proof, and bumping it would make the holder's next checkpoint/submit fail with a stale-proof
+   * conflict until the channel's heartbeat resynced (up to 60 s) — exactly the interruption this tool must
+   * avoid. The compare-and-set on expectedVersion still refuses a caller that read a stale task.
+   *
+   * The amendment text is appended to task.context — the field claim.json and read_task_text(field=context)
+   * read — so the next claim and every later reader sees it. The append is computed INSIDE the transaction from
+   * the row it locks ($t.context + $block), never from a copy read beforehand: two amendments that both pass the
+   * version guard must both land, and an out-of-transaction read is a last-writer-wins that silently drops one
+   * verbatim owner quote while the audit claims both were appended. The loser of the record write gets the fork's
+   * retryable 'Transaction conflict: Resource busy', and taskAcceptanceAmend re-runs the whole statement — which
+   * re-reads $t, so the second append builds on the first. The context-size cap is checked in the same transaction
+   * for the same reason.
+   * The audit row keeps the verbatim owner quote,
+   * and each employee in notify (default: the live lease holder + the implementer + the latest submitter; an
+   * explicit empty list notifies nobody) gets a persistent holder_notice that holder_notices reads and acks.
+   * A holder inside a live lease is not interrupted: the sidecar attaches the unacked notices to its next tool
+   * response, and the dispatcher redelivers them after a reconnect or restart.
+   */
+  async taskAcceptanceAmend(credential: Credential, input: { taskId: TaskId; expectedVersion: number; ownerQuote: string; text: string; notify?: string[]; idempotencyKey: string }): Promise<TaskView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may amend a task acceptance requirement');
+    requireText(input.taskId, 'task', 1, 200);
+    requireText(input.ownerQuote, 'ownerQuote', 1, 4000);
+    requireText(input.text, 'text', 4, 4000);
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
+    const MAX_NOTIFY = 20;
+    // Same cap as create-time context (see createTask): the amendment is appended to the same field, so a total
+    // beyond it would make claim.json and read_task_text carry a task the create path itself refuses.
+    const MAX_CONTEXT = 20_000;
+    // Omitted notify means the defaults below; an explicit [] means nobody is notified (the audit is still
+    // written). null is treated as omitted for direct callers, matching the MCP schema's nullish input.
+    const explicit = input.notify ?? undefined;
+    if (explicit !== undefined && (!Array.isArray(explicit) || explicit.length > MAX_NOTIFY)) throw new CompanyError('invalid', `notify holds at most ${MAX_NOTIFY} employee ids`);
+    const notify = explicit === undefined ? undefined : [...new Set(explicit.map(employee => { requireText(employee, 'notify employee', 1, 200); return employee; }))];
+    // A replay of the same call returns its first answer, even though the task context already carries the block by then.
+    const idem = this.idemId(actor.employeeId, 'acceptance_amend', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ taskId: input.taskId, expectedVersion: input.expectedVersion, ownerQuote: input.ownerQuote, text: input.text, notify: notify ?? null }));
+    const replay = await this.replay(idem, digest);
+    if (replay) return echoTask(replay);
+    const row = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    if (row.state === 'done' || row.state === 'void') throw new CompanyError('conflict', `Acceptance amendment does not apply to ${row.state} tasks`);
+    if (!['ready', 'doing', 'review', 'blocked'].includes(row.state)) throw new CompanyError('invalid', `Acceptance amendment does not apply to ${row.state} tasks`);
+    const leaseLive = row.current_employee !== undefined && (row.lease_expires_at ?? 0) > Math.floor(Date.now() / 1000);
+    const defaults = [leaseLive ? row.current_employee : undefined, row.implementer, row.submitted_by]
+      .filter((employee): employee is string => typeof employee === 'string' && employee.length > 0);
+    const recipients = notify ?? [...new Set(defaults)];
+    if (recipients.length) {
+      const [found] = await this.db.query<[Array<{ id: RecordId }>]>('SELECT id FROM employee WHERE id IN $ids;',
+        { ids: recipients.map(employee => id('employee', employee)) });
+      const known = new Set((found ?? []).map(entry => asId(entry.id)));
+      const unknown = recipients.filter(employee => !known.has(employee));
+      if (unknown.length) throw new CompanyError('invalid', `Unknown employee id in notify: ${unknown.join(', ')}`);
+    }
+    const auditId = randomUUID();
+    const at = new Date().toISOString();
+    const block = `\n\n【验收要求修订 · ${at} · ${actor.employeeId} · audit ${auditId}】\n老板原话（逐字）：${input.ownerQuote}\n修订说明：${input.text}\n`;
+    const evidence = JSON.stringify({ ownerQuote: input.ownerQuote, text: input.text, notify: notify ?? null, expectedVersion: input.expectedVersion });
+    const noticeText = `验收要求已修订：${input.text}\n老板原话（逐字）：${input.ownerQuote}\n完整修订已追加到任务上下文；用 sck call read_task_text '{"taskId":"${input.taskId}","field":"context"}' 读全文，再按最新要求行事。`;
+    const notices = recipients.map(employee => {
+      // Control-character-free id: the dispatcher embeds it in a shell/JSON command line, where a raw U+0000
+      // separator is neither a valid JSON string nor an executable argv value. The audit id and employee make it
+      // unique per recipient.
+      const noticeKey = `${input.taskId}:acceptance_amended:${auditId}:${employee}`;
+      return { employee, noticeKey, record: holderNoticeId(noticeKey) };
+    });
+    const noticeStatements = notices.map((_, index) => `CREATE ONLY $notice_${index} CONTENT {
+          notice_key: $notice_key_${index}, episode: $episode, task: $task, holder: $holder_${index}, kind: 'acceptance_amended',
+          text: $notice_text, payload: $notice_payload, created_at: time::now(), delivered_at: NONE, deliveries: 0,
+          last_attempt_at: NONE, last_error: NONE };`).join('\n        ');
+    const noticeVars = Object.fromEntries(notices.flatMap((notice, index) => [
+      [`notice_${index}`, notice.record], [`notice_key_${index}`, notice.noticeKey], [`holder_${index}`, notice.employee],
+    ]));
+    const vars = {
+      actor: id('employee', actor.employeeId), task: id('task', input.taskId), expected: input.expectedVersion,
+      block, evidence, idem, digest, audit: id('audit', auditId), audit_id: auditId, outbox: id('outbox', randomUUID()),
+      episode: `${input.taskId}:acceptance_amended:${auditId}`, notice_text: noticeText,
+      notice_payload: { auditId, version: row.version, actor: actor.employeeId, notify: recipients },
+      notify: recipients, ...noticeVars,
+    };
+    // txTask filters its own 'Cannot COMMIT' cascade out of the cause it inspects, so the loser of a concurrent
+    // append gets the generic write conflict and is NOT retried there. Re-run the whole statement here instead:
+    // the append is computed from $t inside the transaction, so a re-run reads the winner's context and lands on
+    // top of it rather than overwriting it. Only the transient write conflict is retried — 'task version moved'
+    // is the CAS refusing a genuinely stale read and must stay a refusal.
+    const APPEND_CONFLICT = /Task changed or transaction conflicted/i;
+    try {
+      let next: TaskRow | undefined;
+      for (let attempt = 0; attempt < 5 && next === undefined; attempt++) {
+        try {
+          next = await this.txTask(`BEGIN;
+            LET $t = SELECT * FROM ONLY $task;
+            IF $t = NONE { THROW 'task not found' };
+            IF $t.version != $expected { THROW 'task version moved' };
+            IF $t.state IN ['done', 'void'] { THROW 'task already terminal' };
+            IF $t.state NOT IN ['ready', 'doing', 'review', 'blocked'] { THROW 'acceptance amend invalid: only ready, doing, review or blocked tasks accept an amendment' };
+            LET $appended = ($t.context ?? '') + $block;
+            IF string::len($appended) > ${MAX_CONTEXT} { THROW 'acceptance amend invalid: the amended context would exceed ${MAX_CONTEXT} characters; archive the old context before appending another amendment' };
+            LET $next = UPDATE ONLY $task SET context = $appended RETURN AFTER;
+            CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'acceptance_amend', evidence: $evidence, version: $next.version, at: time::now() };
+            LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+            CREATE ONLY $outbox CONTENT { task: $task, kind: 'acceptance_amend', sequence: $sequence.value,
+              payload: { version: $next.version, audit: $audit_id, notify: $notify }, at: time::now() };
+            ${noticeStatements}
+            CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
+            RETURN $next;
+            COMMIT;`, vars);
+        } catch (error) {
+          if (!(error instanceof CompanyError) || error.code !== 'conflict' || !APPEND_CONFLICT.test(error.message)) throw error;
+          const replayed = await this.replay(idem, digest);
+          if (replayed) return echoTask(replayed);
+          if (attempt === 4) throw error;
+          await Bun.sleep(10 * (attempt + 1));
+        }
+      }
+      return echoTask(view(next!));
+    } catch (error) {
+      const replayed = await this.replay(idem, digest);
+      if (replayed) return echoTask(replayed);
       throw error;
     }
   }

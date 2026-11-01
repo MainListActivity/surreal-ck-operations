@@ -18,7 +18,7 @@ import {
 import { serviceHome } from "./env";
 import type { ActiveLease, ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, WorktreeAssignment, WriteScopeHolder } from "./vendor/src/contracts.ts";
 import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workforce.ts";
-import { guardRelayResponse } from "./vendor/src/response-budget.ts";
+import { fitAttachedNotices, guardRelayResponse, type NoticeCut } from "./vendor/src/response-budget.ts";
 import { isPaged, parseReclaimInput, parseWorktreeInput, taskIdOf } from "./vendor/src/query-input.ts";
 import { arriving, SNAPSHOT_TOOLS, withinReplyCeiling } from "./vendor/src/reply-clock.ts";
 
@@ -53,6 +53,8 @@ const BASE_TOOLS = [
   "bind_task_code_repo",
   // gm only in core (turn a blocked read-only engineering task into a code task in place; audited, version-guarded).
   "task_intent_update",
+  // gm only in core (append the boss's acceptance-requirement amendment to an in-flight task; never touches its gates or lease).
+  "task_acceptance_amend",
   // gm only in core (read-only acceptance-reference preview; compare-and-set repair of a quick goal's voided gate).
   "goal_acceptance_preview", "goal_acceptance_repair",
   // SYS07 goal governance: paged read-only console/scan/metrics, structured outcome and evidence, final-gate
@@ -96,6 +98,14 @@ const BASE_TOOLS = [
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
 const RETIRED_TOOLS = new Set(["get_secret", "put_secret"]);
+
+/** How many unacked holder notices ride along with a successful reply. A notice text is bounded by the amend
+ *  input (two 4000-char fields), so this keeps the added context small while still surfacing a backlog. */
+const ATTACHED_NOTICE_LIMIT = 3;
+
+/** What a successful reply carries besides its data: the unacked holder notices that fit its budget, and the cut when
+ *  some were left out, by the budget or the per-reply limit (the cut notices stay unacked and are attached again on the next call). */
+export interface AttachedNotices { notices?: unknown[]; noticesTruncated?: NoticeCut }
 
 const hash = (text: string | undefined) => (text === undefined ? undefined : createHash("sha256").update(text).digest("hex"));
 
@@ -226,6 +236,8 @@ export class SidecarPool {
   private readonly beats = new Map<string, ReturnType<typeof setInterval>>();
   private readonly active = new Set<string>();
   private readonly processing = new Set<string>();
+  /** instId → the notice step last queued for that employee; each step waits for the one before it (see withNoticeGate). */
+  private readonly noticeGates = new Map<string, Promise<void>>();
   private sweeper?: ReturnType<typeof setInterval>;
 
   /** Last claim denial code per instance: the dispatcher reads it after a lost claim (see claimDenial). */
@@ -341,6 +353,50 @@ export class SidecarPool {
     const held = this.creds.get(instId);
     if (held) return held;
     return this.rotateCredential(instId);
+  }
+
+  /** Undelivered holder notices ride along with a successful reply, so an in-lease holder sees an acceptance amendment
+   *  on its very next sck call (the dispatcher only redelivers to idle sessions, and a holder never has to poll
+   *  holder_notices). Attaching is delivery: markAttached marks what the reply carries before the reply is written.
+   *  The attached notices share the reply's budget: a notice that does not fit is left for the next call (it stays
+   *  undelivered), and the reply records the cut. Best effort: a failed notice read must never fail the tool call it
+   *  is attached to, and a data answer over the budget on its own is left to the guard to refuse. */
+  private async attachNotices(instId: string, data: unknown): Promise<AttachedNotices> {
+    const read = this.deps.core.dispositionNotices?.bind(this.deps.core);
+    if (!read) return {};
+    try {
+      const pending = await read(await this.credentialFor(instId));
+      if (!pending.length) return {};
+      // The note is part of the notice body, so it is measured with the notice: the holder needs no ack for it.
+      const noted = pending.map(notice => ({ ...notice, text: `【已随本次回包送达，无需 ack】${notice.text}` }));
+      return fitAttachedNotices(data, noted, ATTACHED_NOTICE_LIMIT) ?? { notices: noted.slice(0, ATTACHED_NOTICE_LIMIT) };
+    } catch (error) {
+      this.log(`attach notices ${instId} failed: ${(error as Error).message}`);
+      return {};
+    }
+  }
+
+  /** Attaching is delivery (R2): each notice a reply carries is marked delivered with the receipt a holder's ack writes
+   *  (agent = the employee), so neither the next reply nor the dispatcher's idle wake-up sends it again. Best effort: a
+   *  failed mark is logged, and the call it rides on still succeeds. */
+  private async markAttached(instId: string, notices: unknown[]): Promise<void> {
+    const ack = this.deps.core.ackDispositionNotices?.bind(this.deps.core);
+    const ids = notices.map(notice => (notice as { noticeKey?: unknown }).noticeKey).filter((key): key is string => typeof key === "string");
+    if (!ack || ids.length === 0) return;
+    try {
+      await ack(await this.credentialFor(instId), { ids });
+    } catch (error) {
+      this.log(`mark attached notices ${instId} failed: ${(error as Error).message}`);
+    }
+  }
+
+  /** Reading the pending notices, attaching them to a reply and marking them delivered is one step per employee. The sweep
+   *  starts every request file as it arrives, so two calls in flight would otherwise both read the same notice and both carry
+   *  it. Queued this way, the second call reads only what the first left undelivered. A failed step does not break the queue. */
+  private withNoticeGate<T>(instId: string, step: () => Promise<T>): Promise<T> {
+    const run = (this.noticeGates.get(instId) ?? Promise.resolve()).then(step);
+    this.noticeGates.set(instId, run.then(() => undefined, () => undefined));
+    return run;
   }
 
   private async rotateCredential(instId: string): Promise<string> {
@@ -1118,6 +1174,9 @@ export class SidecarPool {
       case "task_intent_update": return core.taskIntentUpdate
         ? core.taskIntentUpdate(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose task_intent_update"), { code: "temporarily_unavailable" }));
+      case "task_acceptance_amend": return core.taskAcceptanceAmend
+        ? core.taskAcceptanceAmend(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose task_acceptance_amend"), { code: "temporarily_unavailable" }));
       case "bind_task_code_repo": return core.bindTaskCodeRepo
         ? core.bindTaskCodeRepo(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose bind_task_code_repo"), { code: "temporarily_unavailable" }));
@@ -1365,6 +1424,22 @@ export class SidecarPool {
             .then(data => ({ ok: true as const, data }))
             .catch((error: Error & { code?: string }) => ({ ok: false as const, error: `${error.code ?? "error"}: ${error.message}` }));
     // Last-line budget check: an over-budget success becomes a recoverable, JSON-legal error (SYS01).
-    writeFileAtomic(join(resDir(dir), file), JSON.stringify(guardRelayResponse(res)));
+    // A successful call also carries the employee's unacked holder notices (holder_notices and the tool listing
+    // already answer with notices / no employee state, so they are skipped). The notices are fitted to the reply's
+    // remaining budget first: an in-lease holder sees an acceptance amendment here without being interrupted, an
+    // attached notice is delivered (marked below), so it is gone from the next reply, and a notice that did not fit
+    // stays undelivered and is attached on the next call.
+    // Calls of one employee that arrive together take turns on the read, the attach and the mark (see withNoticeGate).
+    const guarded = await this.withNoticeGate(instId, async () => {
+      const answer: CommResponse = res.ok && req && req.tool !== "holder_notices" && req.tool !== "__list__"
+        ? { ...res, ...(await this.attachNotices(instId, (res as { data?: unknown }).data)) }
+        : res;
+      const checked = guardRelayResponse(answer);
+      // Attaching is delivery: the notices a reply carries are marked before the reply is written. A reply the guard
+      // refuses carries none of them, so nothing is marked for it.
+      if (checked === answer && answer.notices?.length) await this.markAttached(instId, answer.notices);
+      return checked;
+    });
+    writeFileAtomic(join(resDir(dir), file), JSON.stringify(guarded));
   }
 }

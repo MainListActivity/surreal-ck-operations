@@ -124,6 +124,27 @@ test('a sidecar answer passes through as one JSON line, Chinese and emoji intact
   rmSync(dir, { recursive: true, force: true });
 });
 
+// SYS-INT 复核 round-02（需求 4）：sidecar 把未确认的修订通知挂在回包顶层；客户端要把它带到员工看得见的
+// 那一行 JSON 里——数据是对象时并进对象，否则包成 {data, notices}，始终只有一行。
+test('unacked holder notices ride along with the next answer, still as one JSON line', async () => {
+  const notices = [{ noticeKey: 'task-1:acceptance_amended:audit-1:a-eng', kind: 'acceptance_amended', taskId: 'task-1', text: '验收要求已修订' }];
+  const run = async (data: unknown, name: string) => {
+    const dir = commDir();
+    const child = Bun.spawn([process.execPath, CLIENT, 'call', 'checkpoint', '{"text":"half"}'], {
+      cwd: ROOT, stdout: 'pipe', stderr: 'pipe', env: cleanEnv({ SCK_COMM_DIR: dir, SCK_COMM_KEY: 'comm-client-key' }),
+    });
+    const file = await waitForRequest(dir);
+    writeFileAtomic(join(resDir(dir), file), JSON.stringify({ ok: true, data, notices }));
+    const out = await new Response(child.stdout).text();
+    expect(await child.exited, name).toBe(0);
+    rmSync(dir, { recursive: true, force: true });
+    return oneJsonLine(out);
+  };
+  const task = { id: 'task-1', state: 'review', version: 21 };
+  expect(await run(task, 'object data')).toEqual({ ...task, notices });
+  expect(await run([1, 2], 'array data')).toEqual({ data: [1, 2], notices });
+});
+
 test('a direct call prints one answer: the data within the budget on success; one refusal line and exit 1 on failure (SYS01 AC03, F1)', async () => {
   // The same 60-task page with 200-character contexts fits. The MCP result carries the answer twice (as text and as
   // structuredContent), and the 48 KiB budget counts both copies, so the direct call prints the answer once and it is

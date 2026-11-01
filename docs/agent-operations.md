@@ -162,6 +162,16 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 
 三次写入的审计条目可查：`SELECT * FROM audit WHERE action IN ('def_ensure','project_disciplines_update') ORDER BY at DESC`。owner console 与 admin CLI 继续可用，与 MCP 管理工具并存。
 
+## 在途任务验收要求追加（task_acceptance_amend）
+
+经理（gm 且能力含 `manage`）可把老板对在途任务验收范围的收窄/追加决定写成任务可读的修订，不必作废重建、也不等下一次派工：`{taskId, expectedVersion, ownerQuote, text, notify?, idempotencyKey}`。
+
+- 范围：只接受 `ready` / `doing` / `review` / `blocked`；`done` / `void` 返回 `conflict`。非 gm（含 product）与无 manage 能力返回 `forbidden`。
+- 只追加：不改 `state`、`blocked_to` / `resume_*`、依赖、`acceptance_criteria` / `acceptance_version`、独立性策略、worktree 与租约字段（持有人、delivery、fence、到期时间），不放宽验收机器项、独立验收、额度或依赖。任务版本也不移动——版本是持有人租约证明的一部分，移动会让持有人在通道心跳重新同步前（最多 60 秒）的 checkpoint/submit 撞上租约失效；`expectedVersion` 仍做 compare-and-set，读到过期任务即 `conflict`。
+- 落库：单事务把修订追加到 `task.context`——拼接在事务内由被锁的行算出（`$t.context + 修订块`），不在事务外读旧值再整体覆写；同一版本并发两次修订两条都落地（输的一方拿到可重试的写冲突后整笔重跑，重跑会读到对手的正文）。追加后总长上限 20000 字符（与创建时一致），超限整笔回滚并返回 `invalid`，检查也在同一事务内。审计 `action=acceptance_amend`（`evidence` 为 JSON：`ownerQuote` 逐字原话、`text`、`notify` 入参、`expectedVersion`）与 outbox 同事务写入。
+- 通知：`notify` 缺省为「当前活租约持有人 + implementer + 最近 submitter」去重；显式传入以传入为准，`[]` 表示不通知（审计照写）。每人一条持久 `holder_notice`（kind `acceptance_amended`），经 `holder_notices` 读取与 `ack`，通道重连或插件重启后由调度补发；租约内持有人不被中断——sidecar 会把未送达通知附在该员工下一次 `sck` 调用的回包顶层（`notices`，最多 3 条）。**附带即送达**：回包构造完成、守卫放行后，附带的每条通知先写 `delivered_at` 标记送达（与调度器空闲唤醒后的标记相同），再写回；附带正文注明「已随本次回包送达，无需 ack」。同一条通知只经回包或空闲唤醒送达一次，不会重复：同一员工并发到达的调用按序读取、附带、标记，后到的只读到尚未送达的通知。标记失败只记日志，不影响本次调用。已送达的本人通知再次回执（`ack`，或附带时的标记）仍然成功，计 0、不改送达时间，失败回执也不会把它重新打开；同一批里其余未送达的照常标记。非本人的通知仍整批拒绝（`forbidden`）。附带的通知与回包数据共用同一个 48 KiB 预算：数据的判定始终按 `answerBytes`，带通知时整条写回行也不超过 48 KiB。放不下的通知不附带，回包的 `noticesTruncated` 只描述被截掉的那几条（`count` 为条数，`bytes` 为它们的 JSON 字节数，`sha256` 为它们的摘要），未附带的仍未送达，下一次调用再附带，不会丢失。未知员工 ID 返回 `invalid`。
+- 幂等：同一 `idempotencyKey` 同载荷回放首次结果（不重复追加、不重复通知），异载荷 `conflict`。
+
 ## 任务输入上限
 
 `create_task` 与 `create_delivery` 的显式 `dependencies` 至多 50 条，按去重前原始条数先验（51 条重复 ID 同样拒绝），每项为 1–200 字符的 task id；asset 类 `workIntent.paths` 至多 50 条、每条至多 300 字符，非 assets 不接受 paths。判定在 core 统一完成，MCP、sidecar 与直接调用是同一结论：超限返回结构化 `invalid`，任务/审计/outbox/幂等零写入。链内自动依赖（交付链腿间、goal anchor）不受此上限，保持完整。

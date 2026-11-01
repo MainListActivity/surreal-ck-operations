@@ -6,7 +6,8 @@ import { SurrealCompanyCore } from '../src/core.ts';
 import {
   ANSWER_WRAPPER_BYTES, CLAIM_HISTORY_FLOOR_BYTES, CLAIM_LIST_ECHO_BYTES, DATA_BUDGET_BYTES, ITEM_BUDGET_BYTES, MAX_REQUEST_ID_BYTES,
   PROJECT_ECHO_BYTES, RESPONSE_BUDGET_BYTES, RESPONSE_FRAME_BYTES, SSE_RPC_FRAME_BYTES, answerBytes, answerResult, dualBytes, echoClaim,
-  echoTask, fitCount, guardRelayResponse, jsonBytes, longestFittingPrefix, oversizeRequestId, openCursor, sealCursor, textSegment,
+  echoTask, fitAttachedNotices, fitCount, guardRelayResponse, jsonBytes, longestFittingPrefix, oversizeRequestId, openCursor, relayReplyBytes,
+  sealCursor, textSegment,
   textSegmentAnswer, utf8Prefix, utf8Segment, worktreeRefsSegment, worktreeRefsSegmentAnswer,
 } from '../src/response-budget.ts';
 import {
@@ -35,6 +36,92 @@ describe('byte budget (SYS01)', () => {
     const fits = { ok: true as const, data: { blob: 'a'.repeat(lo) } };
     expect(guardRelayResponse(fits)).toBe(fits);
     expect(guardRelayResponse({ ok: true as const, data: { blob: 'a'.repeat(lo + 1) } })).toMatchObject({ ok: false, code: 'response_too_large' });
+  });
+
+  test('attached holder notices count against the same budget as the data they ride with (SYS-INT, R3)', () => {
+    const data = { id: 'task-x', state: 'review', version: 26 };
+    // A notice is bounded by the amend input: ownerQuote and text are each at most 4000 characters (3 UTF-8 bytes each).
+    const bigNotice = (n: number) => ({ noticeKey: `n${n}`, kind: 'acceptance_amended', ownerQuote: '验'.repeat(4000), text: '验'.repeat(4000) });
+
+    // Fitting notices are kept whole, and the reply line stays within the budget.
+    const small = [bigNotice(1), bigNotice(2)];
+    expect(fitAttachedNotices(data, small)).toBeUndefined();
+    const reply = { ok: true as const, data, notices: small };
+    expect(relayReplyBytes(reply)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    expect(Buffer.byteLength(JSON.stringify(reply), 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    expect(guardRelayResponse(reply)).toBe(reply);
+
+    // Three of them: two fit the remaining budget, the third is cut off and reported. The report describes only the cut
+    // notice: its count, its JSON bytes, and the digest of exactly that notice. The cut notice stays unacked, so the next
+    // call attaches it again — the holder sees a large backlog late, never never.
+    const three = [bigNotice(1), bigNotice(2), bigNotice(3)];
+    const fitted = fitAttachedNotices(data, three)!;
+    expect(fitted).not.toBeUndefined();
+    expect(fitted.notices).toEqual(small);
+    expect(fitted.noticesTruncated).toEqual({
+      count: 1, bytes: jsonBytes([three[2]]), sha256: createHash('sha256').update(JSON.stringify([three[2]])).digest('hex'),
+    });
+    const cut = { ok: true as const, data, ...fitted };
+    expect(guardRelayResponse(cut)).toBe(cut);
+    expect(Buffer.byteLength(JSON.stringify(cut), 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+
+    // The data judgement does not depend on notices (SYS-INT, R4). The same over-budget data is refused with no notices,
+    // with a small notice, with an empty list, and with a notice too large to attach, which the fit cuts to nothing.
+    const huge = { id: 'x', blob: 'x'.repeat(200_000) };
+    const hugeNotice = { noticeKey: 'huge', kind: 'acceptance_amended', text: 'y'.repeat(60_000) };
+    const tiny = { noticeKey: 'tiny', kind: 'acceptance_amended', text: 'short' };
+    const cutAll = fitAttachedNotices(huge, [hugeNotice])!;
+    expect(cutAll.notices).toEqual([]);
+    expect(cutAll.noticesTruncated.count).toBe(1);
+    for (const attached of [{}, { notices: [tiny] }, { notices: [] }, cutAll]) {
+      expect(guardRelayResponse({ ok: true as const, data: huge, ...attached })).toMatchObject({ ok: false, code: 'response_too_large' });
+    }
+
+    // For data that fits on its own, the measure and the written line agree on whether the reply is within the budget, for every list.
+    for (const list of [[], [bigNotice(1)], small, three]) {
+      const line = { ok: true as const, data, notices: list };
+      expect(relayReplyBytes(line) <= RESPONSE_BUDGET_BYTES).toBe(Buffer.byteLength(JSON.stringify(line), 'utf8') <= RESPONSE_BUDGET_BYTES);
+    }
+  });
+
+  test('a kept notice that fills the budget to the byte, with a second notice cut beside it, still writes a line within 48 KiB (SYS-INT, R4)', () => {
+    const data = { x: 1 };
+    const written = (reply: unknown): number => Buffer.byteLength(JSON.stringify(reply), 'utf8');
+    const notice = (size: number) => ({ noticeKey: 'boundary-1', kind: 'acceptance_amended', text: 'c'.repeat(size) });
+    const second = { noticeKey: 'boundary-2', kind: 'acceptance_amended', text: 'd'.repeat(200) };
+    const report = { count: 1, bytes: jsonBytes([second]), sha256: createHash('sha256').update(JSON.stringify([second])).digest('hex') };
+    // The largest kept notice whose whole line still fits beside the report of the cut second notice (bisection on the guard's measure).
+    let lo = 0;
+    let hi = RESPONSE_BUDGET_BYTES;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (relayReplyBytes({ ok: true, data, notices: [notice(mid)], noticesTruncated: report }) <= RESPONSE_BUDGET_BYTES) lo = mid;
+      else hi = mid - 1;
+    }
+    const fitted = fitAttachedNotices(data, [notice(lo), second])!;
+    expect(fitted.notices).toEqual([notice(lo)]);
+    expect(fitted.noticesTruncated).toEqual(report);
+    const line = { ok: true as const, data, ...fitted };
+    expect(guardRelayResponse(line)).toBe(line);
+    expect(written(line)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    // One character more and the kept notice no longer fits beside the report: it is cut too, and the line still fits.
+    const over = fitAttachedNotices(data, [notice(lo + 1), second])!;
+    expect(over.notices).toEqual([]);
+    expect(over.noticesTruncated.count).toBe(2);
+    expect(written({ ok: true, data, ...over })).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+  });
+
+  test('notices past the per-reply limit are cut and reported like notices that do not fit, and the report describes exactly those (SYS-INT, R4)', () => {
+    const data = { id: 'task-x' };
+    const four = [1, 2, 3, 4].map(n => ({ noticeKey: `k${n}`, kind: 'acceptance_amended', text: `t${n}` }));
+    const fitted = fitAttachedNotices(data, four, 3)!;
+    expect(fitted.notices).toEqual(four.slice(0, 3));
+    expect(fitted.noticesTruncated).toEqual({
+      count: 1, bytes: jsonBytes([four[3]]), sha256: createHash('sha256').update(JSON.stringify([four[3]])).digest('hex'),
+    });
+    expect(fitAttachedNotices(data, four.slice(0, 3), 3)).toBeUndefined();
+    expect(fitAttachedNotices(data, four, 0)!.notices).toEqual([]);
+    expect(fitAttachedNotices(data, four, 0)!.noticesTruncated.count).toBe(4);
   });
 
   test('the answer is carried twice, and the budget counts both copies: the text is the answer JSON and structuredContent holds the same data (SYS01, D1)', () => {

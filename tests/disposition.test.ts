@@ -5,6 +5,7 @@
 import { expect, test } from 'bun:test';
 import { createCompanyGithubGateway, githubRepoSlug } from '../src/external-actions.ts';
 import { dispositionBusinessKey, dispositionEpisodeKey, dispositionNoticeKey } from '../src/disposition.ts';
+import { holderNoticeText } from '../src/dispatcher/dispatcher.ts';
 
 test('episode identity is task + phase + episode start, and the same episode keeps one key', () => {
   expect(dispositionEpisodeKey('task-1', 'execute', 1_700_000_000_000)).toBe('task-1:execute:1700000000000');
@@ -32,6 +33,29 @@ test('notice identity includes the episode, the kind and the version, so one eve
   expect(dispositionNoticeKey(episode, 'disposition_decided', 7)).toBe(dispositionNoticeKey(episode, 'disposition_decided', 7));
   expect(dispositionNoticeKey(episode, 'resumed', 7)).not.toBe(dispositionNoticeKey(episode, 'disposition_decided', 7));
   expect(dispositionNoticeKey(episode, 'disposition_decided', 8)).not.toBe(dispositionNoticeKey(episode, 'disposition_decided', 7));
+});
+
+// SYS-INT 复核 round-02：修订通知的 ack 命令要能真的执行——参数整体 JSON 转义，id 即使含控制字符也不能让
+// 命令行出现原始 NUL（shell 参数与 JSON 字面量都会拒收）。
+test('the acceptance amendment notice carries an executable, JSON-parseable ack command', () => {
+  const notice = {
+    taskId: 'task-1', episode: 'task-1:acceptance_amended:audit-1', kind: 'acceptance_amended',
+    text: '验收要求已修订：只按真树放行判定。', deliveries: 0, noticeKey: 'task-1:acceptance_amended:audit-1:a-eng',
+  };
+  const ackArg = (text: string) => /sck call holder_notices '([^']+)' 回执/.exec(text)?.[1];
+  const command = ackArg(holderNoticeText(notice));
+  expect(command).toBeDefined();
+  expect(JSON.parse(command!)).toEqual({ ids: [notice.noticeKey], ack: true });
+  expect(/[\u0000-\u001f\u007f]/.test(command!)).toBe(false);
+  // 即使 id 里带控制字符（历史行或未来格式），正文仍是可解析、可执行的参数。
+  const opaque = 'task-1\u0000acceptance_amended\u0000audit-1\u0000a-eng';
+  const escaped = ackArg(holderNoticeText({ ...notice, noticeKey: opaque }));
+  expect(JSON.parse(escaped!)).toEqual({ ids: [opaque], ack: true });
+  expect(/[\u0000-\u001f\u007f]/.test(escaped!)).toBe(false);
+  // 其他处置通知的文案不变：仍指向 disposition_status。
+  const decided = holderNoticeText({ ...notice, kind: 'disposition_decided' });
+  expect(decided).toContain('disposition_status');
+  expect(decided).not.toContain('验收要求修订');
 });
 
 /** One scripted gh runner: every call is answered from the list, and the calls themselves are recorded. */

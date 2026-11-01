@@ -194,6 +194,10 @@ export class CompanyDatabase {
     await this.db.query(`UPDATE company_meta:installation SET fault_credential_since = time::now()
       WHERE schema_version < 47 AND fault_credential_since = NONE;`);
     await this.db.query('UPDATE company_meta:installation SET schema_version = 47 WHERE schema_version < 47;');
+    // 经理验收要求修订（编号 048；047 已由故障修复凭据占用）：holder_notice.kind 白名单新增 acceptance_amended。修订正文
+    // 追加在既有 task.context，不新增任务字段、不改任何既有行；旧版 release 读到未知 kind 按既有通用文本投递一次（RB01）。
+    await this.db.query(loadSchema('048-acceptance-amend.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 48 WHERE schema_version < 48;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

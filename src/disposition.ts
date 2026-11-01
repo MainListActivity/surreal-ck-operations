@@ -32,7 +32,9 @@ export type DispositionPhase = 'execute' | 'review';
 export type DispositionActionName = 'resume' | 'defer' | 'dependency' | 'retire' | 'repair';
 export type DispositionClaimStatus = 'claimed' | 'decided';
 export type DispositionNoticeKind = 'disposition_decided' | 'dependency_wait' | 'resumed' | 'claim_revoked'
-  | 'claim_taken_over' | 'external_action' | 'external_action_unknown';
+  | 'claim_taken_over' | 'external_action' | 'external_action_unknown'
+  // SYS-INT：经理对在途任务追加验收要求修订后的持有人通知（正文与审计在 core.taskAcceptanceAmend 写）。
+  | 'acceptance_amended';
 
 /**
  * episode 身份：任务 + 阶段 + 阶段开始毫秒。与调度器的 managerWakeKey / managerActionKey 同源，
@@ -51,6 +53,12 @@ export const dispositionBusinessKey = (episode: string, action: DispositionActio
 };
 
 export const dispositionNoticeKey = (episode: string, kind: DispositionNoticeKind, version: number) => `${episode}\0${kind}\0${version}`;
+
+/**
+ * holder_notice 的记录 id 由 notice_key 导出：投递回执（markNotices）只拿到 noticeKey，所以任何写通知的
+ * 路径（处置账本、经理验收修订）都必须用同一个派生，否则通知写进去却 ack 不到。
+ */
+export const holderNoticeId = (noticeKey: string): RecordId => id('holder_notice', HASH(noticeKey).slice(0, 24));
 
 export interface DispositionClaimInput {
   taskId: string;
@@ -298,7 +306,7 @@ export class DispositionLedger {
   }
 
   private noticeId(noticeKey: string): RecordId {
-    return id('holder_notice', HASH(noticeKey).slice(0, 24));
+    return holderNoticeId(noticeKey);
   }
 
   private externalId(actionKey: string): RecordId {
@@ -925,6 +933,13 @@ export class DispositionLedger {
     const [rows] = await this.db.query<[Row[]]>(
       'SELECT * FROM holder_notice WHERE holder = $holder AND delivered_at = NONE ORDER BY created_at, notice_key LIMIT $limit;',
       { holder: employeeId, limit });
+    return (rows ?? []).map(row => this.noticeView(row));
+  }
+
+  /** 一个员工自己的通知（含已送达），只按 noticeKey 取：回执的归属校验用。已送达的通知被再次回执时，仍要能认出是本人的。 */
+  async noticesByKey(employeeId: string, noticeKeys: string[]): Promise<HolderNoticeView[]> {
+    const [rows] = await this.db.query<[Row[]]>(
+      'SELECT * FROM holder_notice WHERE holder = $holder AND notice_key IN $keys;', { holder: employeeId, keys: noticeKeys });
     return (rows ?? []).map(row => this.noticeView(row));
   }
 
