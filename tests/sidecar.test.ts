@@ -676,6 +676,13 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     await fresh.settle('agent-review');
     expect(calls.filter(c => c.tool === 'submit')).toHaveLength(0);
     expect(readdirSync(env.SCK_COMM_DIR).some(f => f.startsWith('report.md.stale-'))).toBe(true);
+    for (const [n, decision] of [undefined, null, '', 'dry-run-probe', 'ACCEPT', false, 1, {}].entries()) {
+      const invalid = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, `bad-review-${n}`, 'review', { decision, text: 'schema probe, not a decision', idempotencyKey: `invalid-${n}` });
+      expect(invalid.ok).toBe(false);
+      expect(JSON.stringify(invalid)).toContain('invalid');
+      expect(calls.filter(c => c.tool === 'return' || c.tool === 'accept')).toHaveLength(0);
+      expect(fresh.holdsLease(i.id, 'task-review')).toBe(true);
+    }
     const review = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'rv2', 'review', { decision: 'return', text: 'formal review after reload' });
     expect(review.ok).toBe(true);
     expect(calls.find(c => c.tool === 'return')!.proof).toEqual({
