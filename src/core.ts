@@ -6578,11 +6578,17 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * review, quota or dependencies. The version is deliberately left alone too: it is part of the holder's
    * lease proof, and bumping it would make the holder's next checkpoint/submit fail with a stale-proof
    * conflict until the channel's heartbeat resynced (up to 60 s) — exactly the interruption this tool must
-   * avoid. The compare-and-set on expectedVersion still refuses a caller that read a stale task, and
-   * concurrent appends serialize on the record write (txTask retries the conflict and re-reads).
+   * avoid. The compare-and-set on expectedVersion still refuses a caller that read a stale task.
    *
    * The amendment text is appended to task.context — the field claim.json and read_task_text(field=context)
-   * read — so the next claim and every later reader sees it. The audit row keeps the verbatim owner quote,
+   * read — so the next claim and every later reader sees it. The append is computed INSIDE the transaction from
+   * the row it locks ($t.context + $block), never from a copy read beforehand: two amendments that both pass the
+   * version guard must both land, and an out-of-transaction read is a last-writer-wins that silently drops one
+   * verbatim owner quote while the audit claims both were appended. The loser of the record write gets the fork's
+   * retryable 'Transaction conflict: Resource busy', and taskAcceptanceAmend re-runs the whole statement — which
+   * re-reads $t, so the second append builds on the first. The context-size cap is checked in the same transaction
+   * for the same reason.
+   * The audit row keeps the verbatim owner quote,
    * and each employee in notify (default: the live lease holder + the implementer + the latest submitter)
    * gets a persistent holder_notice that holder_notices reads and acks; the dispatcher redelivers it after a
    * reconnect or restart, and holding a lease never consumes it.
@@ -6622,10 +6628,6 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const auditId = randomUUID();
     const at = new Date().toISOString();
     const block = `\n\n【验收要求修订 · ${at} · ${actor.employeeId} · audit ${auditId}】\n老板原话（逐字）：${input.ownerQuote}\n修订说明：${input.text}\n`;
-    const context = `${row.context ?? ''}${block}`;
-    if (context.length > MAX_CONTEXT) {
-      throw new CompanyError('invalid', `The amended context would exceed ${MAX_CONTEXT} characters; archive the old context before appending another amendment`);
-    }
     const evidence = `${input.text}\n[acceptance_amend] ownerQuote（老板原话，逐字）：${input.ownerQuote}\n[acceptance_amend] notify：${recipients.length ? recipients.join(', ') : '（无：任务没有在租持有人、实现人或提交人）'}`;
     const noticeText = `验收要求已修订：${input.text}\n老板原话（逐字）：${input.ownerQuote}\n完整修订已追加到任务上下文；用 sck call read_task_text '{"taskId":"${input.taskId}","field":"context"}' 读全文，再按最新要求行事。`;
     const notices = recipients.map(employee => {
@@ -6639,29 +6641,49 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const noticeVars = Object.fromEntries(notices.flatMap((notice, index) => [
       [`notice_${index}`, notice.record], [`notice_key_${index}`, notice.noticeKey], [`holder_${index}`, notice.employee],
     ]));
+    const vars = {
+      actor: id('employee', actor.employeeId), task: id('task', input.taskId), expected: input.expectedVersion,
+      block, evidence, idem, digest, audit: id('audit', auditId), audit_id: auditId, outbox: id('outbox', randomUUID()),
+      episode: `${input.taskId}:acceptance_amend:${auditId}`, notice_text: noticeText,
+      notice_payload: { auditId, version: row.version, actor: actor.employeeId, notify: recipients },
+      notify: recipients, ...noticeVars,
+    };
+    // txTask filters its own 'Cannot COMMIT' cascade out of the cause it inspects, so the loser of a concurrent
+    // append gets the generic write conflict and is NOT retried there. Re-run the whole statement here instead:
+    // the append is computed from $t inside the transaction, so a re-run reads the winner's context and lands on
+    // top of it rather than overwriting it. Only the transient write conflict is retried — 'task version moved'
+    // is the CAS refusing a genuinely stale read and must stay a refusal.
+    const APPEND_CONFLICT = /Task changed or transaction conflicted/i;
     try {
-      const next = await this.txTask(`BEGIN;
-        LET $t = SELECT * FROM ONLY $task;
-        IF $t = NONE { THROW 'task not found' };
-        IF $t.version != $expected { THROW 'task version moved' };
-        IF $t.state IN ['done', 'void'] { THROW 'task already terminal' };
-        IF $t.state NOT IN ['ready', 'doing', 'review', 'blocked'] { THROW 'acceptance amend invalid: only ready, doing, review or blocked tasks accept an amendment' };
-        LET $next = UPDATE ONLY $task SET context = $context RETURN AFTER;
-        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'acceptance_amend', evidence: $evidence, version: $next.version, at: time::now() };
-        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        CREATE ONLY $outbox CONTENT { task: $task, kind: 'acceptance_amend', sequence: $sequence.value,
-          payload: { version: $next.version, audit: $audit_id, notify: $notify }, at: time::now() };
-        ${noticeStatements}
-        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
-        RETURN $next;
-        COMMIT;`, {
-        actor: id('employee', actor.employeeId), task: id('task', input.taskId), expected: input.expectedVersion,
-        context, evidence, idem, digest, audit: id('audit', auditId), audit_id: auditId, outbox: id('outbox', randomUUID()),
-        episode: `${input.taskId}:acceptance_amend:${auditId}`, notice_text: noticeText,
-        notice_payload: { auditId, version: row.version, actor: actor.employeeId, notify: recipients },
-        notify: recipients, ...noticeVars,
-      });
-      return echoTask(view(next));
+      let next: TaskRow | undefined;
+      for (let attempt = 0; attempt < 5 && next === undefined; attempt++) {
+        try {
+          next = await this.txTask(`BEGIN;
+            LET $t = SELECT * FROM ONLY $task;
+            IF $t = NONE { THROW 'task not found' };
+            IF $t.version != $expected { THROW 'task version moved' };
+            IF $t.state IN ['done', 'void'] { THROW 'task already terminal' };
+            IF $t.state NOT IN ['ready', 'doing', 'review', 'blocked'] { THROW 'acceptance amend invalid: only ready, doing, review or blocked tasks accept an amendment' };
+            LET $appended = ($t.context ?? '') + $block;
+            IF string::len($appended) > ${MAX_CONTEXT} { THROW 'acceptance amend invalid: the amended context would exceed ${MAX_CONTEXT} characters; archive the old context before appending another amendment' };
+            LET $next = UPDATE ONLY $task SET context = $appended RETURN AFTER;
+            CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'acceptance_amend', evidence: $evidence, version: $next.version, at: time::now() };
+            LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+            CREATE ONLY $outbox CONTENT { task: $task, kind: 'acceptance_amend', sequence: $sequence.value,
+              payload: { version: $next.version, audit: $audit_id, notify: $notify }, at: time::now() };
+            ${noticeStatements}
+            CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
+            RETURN $next;
+            COMMIT;`, vars);
+        } catch (error) {
+          if (!(error instanceof CompanyError) || error.code !== 'conflict' || !APPEND_CONFLICT.test(error.message)) throw error;
+          const replayed = await this.replay(idem, digest);
+          if (replayed) return echoTask(replayed);
+          if (attempt === 4) throw error;
+          await Bun.sleep(10 * (attempt + 1));
+        }
+      }
+      return echoTask(view(next!));
     } catch (error) {
       const replayed = await this.replay(idem, digest);
       if (replayed) return echoTask(replayed);

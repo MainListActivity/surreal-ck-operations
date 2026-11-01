@@ -168,7 +168,7 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 
 - 范围：只接受 `ready` / `doing` / `review` / `blocked`；`done` / `void` 返回 `conflict`。非 gm（含 product）与无 manage 能力返回 `forbidden`。
 - 只追加：不改 `state`、`blocked_to` / `resume_*`、依赖、`acceptance_criteria` / `acceptance_version`、独立性策略、worktree 与租约字段（持有人、delivery、fence、到期时间），不放宽验收机器项、独立验收、额度或依赖。任务版本也不移动——版本是持有人租约证明的一部分，移动会让持有人在通道心跳重新同步前（最多 60 秒）的 checkpoint/submit 撞上租约失效；`expectedVersion` 仍做 compare-and-set，读到过期任务即 `conflict`。
-- 落库：单事务写 `task.context`（下次领取的 claim.json 与 `read_task_text` 的 `context` 都读得到）、审计 `action=acceptance_amend`（`evidence` 含 `ownerQuote` 逐字原话与修订说明）与 outbox。
+- 落库：单事务把修订追加到 `task.context`——拼接在事务内由被锁的行算出（`$t.context + 修订块`），不在事务外读旧值再整体覆写；同一版本并发两次修订两条都落地（输的一方拿到可重试的写冲突后整笔重跑，重跑会读到对手的正文），超限检查在同一事务内（超限整笔回滚并返回 `invalid`）。审计 `action=acceptance_amend`（`evidence` 含 `ownerQuote` 逐字原话与修订说明）与 outbox 同事务写入。
 - 通知：`notify` 缺省为「当前活租约持有人 + implementer + 最近 submitter」去重；每人一条持久 `holder_notice`（kind `acceptance_amend`），经 `holder_notices` 读取与 `ack`，通道重连或插件重启后由调度补发，租约内持有人不被中断。未知员工 ID 返回 `invalid`。
 - 幂等：同一 `idempotencyKey` 同载荷回放首次结果（不重复追加、不重复通知），异载荷 `conflict`。
 

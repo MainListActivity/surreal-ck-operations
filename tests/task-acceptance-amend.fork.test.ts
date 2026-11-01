@@ -254,4 +254,76 @@ run('manager acceptance amendment on an in-flight task', () => {
     await expectRefused(amend(taskId, amended.version, { notify: ['a-ghost'] }), 'invalid', /Unknown employee id/);
     expect(await core.dispositionNotices(tokens.qa!, {})).toHaveLength(1);
   });
+
+  // 复核退回 round-01（P1）：并发两次 amend 曾各自在事务外读旧 context 再整体覆写，后写者覆盖先写者，
+  // 审计说有两条修订而任务可读位置只剩一条。拼接移进事务后，两条都必须落地。
+  test('two concurrent amendments both land in the context, with two audits and one notice each', async () => {
+    const taskId = await makeTask('并发追加任务');
+    const before = await core.getTask(tokens.gm!, taskId);
+    const quoteA = '老板原话 A：并发修订第一条只看真树放行。';
+    const textA = '并发修订说明 A：第一条收窄判据，必须留在任务上下文里。';
+    const quoteB = '老板原话 B：并发修订第二条不认词法对抗样例。';
+    const textB = '并发修订说明 B：第二条收窄判据，同样必须留在任务上下文里。';
+    const results = await Promise.allSettled([
+      core.taskAcceptanceAmend(tokens.gm!, {
+        taskId, expectedVersion: before.version, ownerQuote: quoteA, text: textA, notify: ['a-eng'], idempotencyKey: key(),
+      }),
+      core.taskAcceptanceAmend(tokens.gm!, {
+        taskId, expectedVersion: before.version, ownerQuote: quoteB, text: textB, notify: ['a-eng2'], idempotencyKey: key(),
+      }),
+    ]);
+    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+    if (rejected.length) console.log(rejected.map(r => `${(r.reason as CompanyError).code}: ${(r.reason as CompanyError).message}`).join(' | '));
+    expect(rejected).toHaveLength(0);
+
+    const after = await core.getTask(tokens.gm!, taskId);
+    expect(after.context).toContain(quoteA);
+    expect(after.context).toContain(textA);
+    expect(after.context).toContain(quoteB);
+    expect(after.context).toContain(textB);
+    // 两条修订互不覆盖，且都完整追加在原 context 之后（谁先落地由竞态决定，只断言原前缀仍在、两条都在）。
+    expect(after.context.startsWith(before.context)).toBe(true);
+    // 版本仍不移动（不中断租约），审计各一条，通知各一条。
+    expect(after.version).toBe(before.version);
+    const [[counts]] = await database.db.query<[[{ n: number }]]>(
+      `SELECT count() AS n FROM audit WHERE task = $task AND action = 'acceptance_amend' GROUP ALL;`,
+      { task: new RecordId('task', taskId) });
+    expect(counts?.n).toBe(2);
+    expect((await core.dispositionNotices(tokens.eng!, {})).filter(notice => notice.taskId === taskId)).toHaveLength(1);
+    expect((await core.dispositionNotices(tokens.eng2!, {})).filter(notice => notice.taskId === taskId)).toHaveLength(1);
+  });
+
+  // MAX_CONTEXT 的上限检查随拼接一起移进事务：超限的那一次整笔回滚，任务上下文停在上一条修订。
+  test('an amendment that would push the context past the cap is refused and writes nothing', async () => {
+    const taskId = await makeTask('上下文上限任务');
+    const quote = '老'.repeat(4000);
+    const text = '修'.repeat(4000);
+    let rounds = 0;
+    let refused: CompanyError | undefined;
+    let last = await core.getTask(tokens.gm!, taskId);
+    while (rounds < 20) {
+      rounds++;
+      try {
+        last = await core.taskAcceptanceAmend(tokens.gm!, {
+          taskId, expectedVersion: last.version, ownerQuote: quote, text, idempotencyKey: key(),
+        });
+      } catch (error) {
+        refused = error as CompanyError;
+        break;
+      }
+    }
+    expect(refused).toBeInstanceOf(CompanyError);
+    expect(refused!.code).toBe('invalid');
+    expect(refused!.message).toMatch(/exceed .* characters/);
+    // 被拒的这次没有留下任何痕迹：审计条数等于成功追加的次数，正文仍是成功那次的末尾。
+    // 注意用库里的行做断言：amend 的回包是 echoTask 的结果，context 会按响应预算截断。
+    const stored = await rowOf(taskId);
+    const context = String(stored.context ?? '');
+    const [[counts]] = await database.db.query<[[{ n: number }]]>(
+      `SELECT count() AS n FROM audit WHERE task = $task AND action = 'acceptance_amend' GROUP ALL;`,
+      { task: new RecordId('task', taskId) });
+    expect(counts?.n).toBe(rounds - 1);
+    expect(context.length).toBeLessThanOrEqual(100_000);
+    expect(context.trimEnd().endsWith(text)).toBe(true);
+  });
 });
