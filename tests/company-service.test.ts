@@ -266,7 +266,7 @@ test('every switch guard accepts the real checkout and its plugin vendor tree', 
     expect(`${script} ${vendor} ${vendorScope}: ${vendorResult.stderr.toString().trim()}`).toBe(`${script} ${vendor} ${vendorScope}: `);
     expect(vendorResult.exitCode).toBe(0);
   }
-});
+}, 30_000); // Ten guard runs take about 4.5s on the CI runner (main: 4.4-4.6s), too close to Bun's 5s default.
 
 function activeTarget(f: Fixture) {
   return readlinkSync(join(f.serviceHome, 'active'));
