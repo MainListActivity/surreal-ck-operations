@@ -694,6 +694,23 @@ test('no eligible GM never acquires/releases wake claims on repeated ticks; reco
   expect((await f.tick()).woke.some(w => w.task === 'fixture-no-gm')).toBe(true);
 });
 
+test('a gm-unavailable notice closes once its workspace has no manager work left, and stays while it does', async () => {
+  const f = fixture([{ id: 'stale-a', blockedTo: 'gm' }, { id: 'stale-b', blockedTo: 'gm' }]);
+  (f.rows[1] as { goalId?: string }).goalId = 'goal-b';
+  f.defs.find(d => d.role === 'gm')!.enabled = false;
+  await f.tick();
+  const open = () => [...f.notices.entries()].filter(([k, n]) => k.startsWith('gm-unavailable:') && !n.resolved).map(([k]) => k);
+  expect(open()).toHaveLength(2);
+  // stale-a was closed by hand: its workspace has no manager-gate task any more.
+  f.rows[0]!.state = 'done';
+  (f.rows[0] as { blockedTo?: string }).blockedTo = undefined;
+  expect((await f.tick()).decisions).toContain('gm-unavailable-cleared:gm-unavailable:/fixture/ops:maintenance');
+  expect(open()).toEqual([expect.stringMatching(/:goal-b$/)]);
+  // The workspace that still waits on a manager keeps its notice across passes.
+  await f.tick();
+  expect(open()).toHaveLength(1);
+});
+
 test('a persisted full-history model evaluation dispatches an eval employee even for quick/jev-only settings',async()=>{
   const f=fixture([]);
   f.defs.push({id:'eval-claude',role:'eval',provider:'claude',model:'group/sck-haiku',enabled:true,maxInstances:2,priority:0,weight:1,scored:0,errorStreak:0});

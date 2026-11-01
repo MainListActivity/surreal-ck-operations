@@ -2019,6 +2019,19 @@ export class Dispatcher {
       }
       granted.push({ todo, claim });
     }
+    // A gm-unavailable notice is only re-checked while its workspace still has manager work, so once that work
+    // is gone (resumed by hand, retired, goal closed) nothing above would ever resolve it. Close the notices whose
+    // project/workspace has no manager-gate task left; throttled work still counts, so they do not flap.
+    if (!managerReadFailed) {
+      const live = new Set([...gmBlocked, ...managerTodos.map(todo => todo.task)].map(task =>
+        `gm-unavailable:${task.repoPath ?? this.deps.env.opsRepo}:${workspaceScopeFor(task.goalId)}`));
+      for (const notice of await owner.openNotices().catch(() => [])) {
+        if (notice.key.startsWith('gm-unavailable:') && !live.has(notice.key)) {
+          await owner.resolveNotice(notice.key);
+          report.decisions.push(`gm-unavailable-cleared:${notice.key}`);
+        }
+      }
+    }
 
     // An instance lives in one Paseo workspace (one project), so gm-attention dispatches
     // per repo: the group's readTask anchors pick home, per-project spawn quota,

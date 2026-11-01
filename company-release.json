@@ -1,5 +1,5 @@
 {
-  "version": "0.3.63",
+  "version": "0.3.64",
   "title": "FV06 有界待命接力",
   "changes": [
     "resume_task 增可选 standbyEmployee：带执行窗口的恢复可原子指派真实租约持有人（有界待命），事务写 doing、租约、fence+1、progress_at 与 standby_until=min(notAfter, now+standbyBudgetSeconds)，工作区经登记路径写入 worktree 与 worktree_ref。",
