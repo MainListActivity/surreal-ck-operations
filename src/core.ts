@@ -6183,6 +6183,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       IF $t.state NOT IN ['ready', 'doing'] AND ($t.state != 'blocked' OR $t.resume_state NOT IN ['ready', 'doing']) { THROW 'implementer takeover moved: task is not in execute phase' };
       LET $to = SELECT * FROM ONLY $target;
       IF $to = NONE OR $to.revoked = true OR 'execute' NOT IN $to.capabilities OR $to.role != $t.executor_role { THROW 'implementer takeover invalid: target employee cannot execute this task' };
+      LET $scope = IF $t.goal != NONE THEN record::id($t.goal) ELSE 'maintenance' END;
+      IF $to.workspace_scope != NONE AND $to.workspace_scope != $scope { THROW 'implementer takeover invalid: target employee works in another goal workspace and can never be dispatched this task' };
       LET $to_tracks = $to.def.tracks ?? [];
       IF $t.discipline != NONE AND array::len($to_tracks) > 0 AND $t.discipline NOT IN $to_tracks { THROW 'implementer takeover invalid: target employee track does not cover the task' };
       IF $replacement != NONE {

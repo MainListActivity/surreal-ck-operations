@@ -172,3 +172,22 @@ test('AC04 (R4): a block raised in review does not open the execute-phase takeov
     reason: 'SYNTHETIC takeover of an execute-phase block, allowed', idempotencyKey: key() });
   expect(taken).toMatchObject({ implementer: 't-eng-b', state: 'blocked' });
 });
+
+test('implementer takeover refuses a target bound to another goal workspace: it could never be dispatched the task', async () => {
+  const t = await newTask('跨目标工作区接手');
+  await deliver(tokens['eng-a'], t.id);
+  await review(tokens['eng-b'], t.id, 'return');
+  const version = (await task(t.id)).version;
+  await database.db.query("UPDATE employee:⟨t-eng-c⟩ SET workspace_scope = 'other-goal';");
+  try {
+    await expect(core.implementerTakeover(tokens.gm, { taskId: t.id, toEmployee: 't-eng-c', expectedVersion: version,
+      reason: '目标工作区不一致的接手', idempotencyKey: key() })).rejects.toMatchObject({ code: 'invalid' });
+    expect(await task(t.id)).toMatchObject({ implementer: 't-eng-a' });
+    // The same employee in the task's own workspace (no goal: maintenance) is accepted.
+    await database.db.query("UPDATE employee:⟨t-eng-c⟩ SET workspace_scope = 'maintenance';");
+    await expect(core.implementerTakeover(tokens.gm, { taskId: t.id, toEmployee: 't-eng-c', expectedVersion: version,
+      reason: '同一工作区的接手', idempotencyKey: key() })).resolves.toMatchObject({ implementer: 't-eng-c' });
+  } finally {
+    await database.db.query('UPDATE employee:⟨t-eng-c⟩ SET workspace_scope = NONE;');
+  }
+});
