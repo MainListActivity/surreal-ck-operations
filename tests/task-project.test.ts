@@ -461,6 +461,52 @@ run('creation binds the code repo up front: explicit, inferred from the ops repo
   expect(new Set(legs.map(leg => leg.workIntent?.lane)).size).toBe(1);
 });
 
+run('triage binds a company-system quick goal legs to the ops repo; a project goal keeps project routing', async () => {
+  const C = core();
+  const owner = (C as unknown as { owner: import('../src/owner.ts').OwnerDesk }).owner;
+  type LegRow = { title: string; code_repo_path?: string };
+  const tasksOf = async (goalId: string) => (await db.db.query<[LegRow[]]>(
+    'SELECT title, code_repo_path FROM task WHERE goal = $goal;', { goal: new RecordId('goal', goalId) }))[0] ?? [];
+  const repoOf = (rows: LegRow[], suffix: string) => rows.find(row => row.title.endsWith(suffix))?.code_repo_path;
+  // No project: the company system's own goal. Its implement+release leg and its deploy leg bind to the ops repo at triage,
+  // so the deploy leg's upgrade card passes the company-release gate. The manual acceptance is not a code leg.
+  const company = await owner.createGoal({ text: `公司系统小改动 ${++count}`, source: 'fixture', key: key() });
+  await C.triageGoal(gm, { goalId: company.id, tier: 'quick', reason: '经理定级：公司系统单仓库小改动' });
+  const companyRows = await tasksOf(company.id);
+  expect(repoOf(companyRows, '· 实现与上线申请')).toBe(realpathSync(repoOps));
+  expect(repoOf(companyRows, '· 合入部署与生产实测')).toBe(realpathSync(repoOps));
+  expect(repoOf(companyRows, '· 运营验收')).toBeUndefined();
+  // A goal with a project keeps the project routing: none of its legs is bound to a code repo at triage.
+  const project = await owner.createGoal({ text: `业务项目小改动 ${++count}`, source: 'fixture', key: key(), project: 'maplayer-content' });
+  await C.triageGoal(gm, { goalId: project.id, tier: 'quick', reason: '经理定级：业务项目单仓库小改动' });
+  const projectRows = await tasksOf(project.id);
+  expect(projectRows).toHaveLength(3);
+  expect(projectRows.every(row => row.code_repo_path === undefined)).toBe(true);
+});
+
+run('owner CLI split: the next phase of a company-system quick goal binds its code legs from a core that only knows the company repo', async () => {
+  const owner = (core() as unknown as { owner: import('../src/owner.ts').OwnerDesk }).owner;
+  const origin = await owner.createGoal({ text: `分阶段绑定原目标 ${++count}`, source: 'fixture', key: key() });
+  await core().triageGoal(gm, { goalId: origin.id, tier: 'quick', reason: '经理定级：公司系统单仓库小改动' });
+  // Only the deploy leg moves: the manual acceptance is the anchor, and nothing that stays waits on the deploy leg.
+  const legs = (await db.db.query<[Array<{ id: RecordId; title: string }>]>(
+    'SELECT id, title FROM task WHERE goal = $goal;', { goal: new RecordId('goal', origin.id) }))[0] ?? [];
+  const deploy = legs.find(row => row.title.endsWith('· 合入部署与生产实测'))!;
+  // The owner CLI builds its core from the company repo alone (no worktree registry); the split triages the next phase there.
+  const title = `分阶段绑定下一阶段 ${++count}`;
+  const split = await new SurrealCompanyCore(db, { companyReleaseRepo: repoOps }).ownerGoalPhaseSplit('cli', {
+    goalId: origin.id, taskIds: [asId(deploy.id)], title, reason: '老板分阶段 fixture', idempotencyKey: key() });
+  type LegRow = { title: string; code_repo_path?: string };
+  const rows = (await db.db.query<[LegRow[]]>('SELECT title, code_repo_path FROM task WHERE goal = $goal;',
+    { goal: new RecordId('goal', split.nextGoalId) }))[0] ?? [];
+  // The moved deploy leg keeps its original binding, so only the next phase's own legs prove the split's triage.
+  const next = rows.filter(row => row.title.startsWith(`[目标] ${title} · `));
+  expect(next).toHaveLength(3);
+  expect(next.find(row => row.title.endsWith('· 实现与上线申请'))?.code_repo_path).toBe(realpathSync(repoOps));
+  expect(next.find(row => row.title.endsWith('· 合入部署与生产实测'))?.code_repo_path).toBe(realpathSync(repoOps));
+  expect(next.find(row => row.title.endsWith('· 运营验收'))?.code_repo_path).toBeUndefined();
+});
+
 run('a blocked read-only engineering task becomes a code task in place', async () => {
   const C = core();
   const t = await C.createTask(gm, { title: `只读改代码 ${++count}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'read' }, idempotencyKey: key() });

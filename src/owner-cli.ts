@@ -28,7 +28,8 @@ const usage = `老板入口（也可直接在 SurrealDB 写 owner_command 表，
 const [action, first, ...rest] = process.argv.slice(2);
 if (!action) { console.log(usage); process.exit(0); }
 const db = new CompanyDatabase(loadDatabaseConfig());
-const desk = new OwnerDesk(db);
+const opsRepo = process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
+const desk = new OwnerDesk(db, opsRepo);
 try {
   await db.connect();
   await db.bootstrap();
@@ -104,7 +105,8 @@ try {
     const [goalId, ...why] = argv;
     if (!goalId || !tasks.length || !title || !why.length) throw new Error('用法：pnpm run company split-goal <目标ID> --tasks <任务ID,任务ID> --title <下一阶段标题> <原因>');
     const { SurrealCompanyCore } = await import('./core.ts');
-    const core = new SurrealCompanyCore(db);
+    // The next phase is triaged in this process: the core needs the ops repo too, or its quick code legs stay unbound.
+    const core = new SurrealCompanyCore(db, { companyReleaseRepo: opsRepo });
     const reason = why.join(' ');
     const result = await core.ownerGoalPhaseSplit('cli', { goalId, taskIds: tasks, title, reason,
       idempotencyKey: `owner-cli:${goalId}:${[...tasks].sort().join(',')}` });

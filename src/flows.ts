@@ -9,7 +9,7 @@ export const PIPELINES = ['software', 'video', 'story'] as const;
 export type PipelineId = typeof PIPELINES[number];
 export const isPipeline = (value: unknown): value is PipelineId => PIPELINES.includes(value as PipelineId);
 
-type Spec = Pick<CreateTask, 'title' | 'context' | 'executorRole' | 'reviewerRole' | 'acceptanceCriteria' | 'workIntent'> & { kind: Exclude<TaskKind, 'goal'> };
+type Spec = Pick<CreateTask, 'title' | 'context' | 'executorRole' | 'reviewerRole' | 'acceptanceCriteria' | 'workIntent' | 'codeRepoPath'> & { kind: Exclude<TaskKind, 'goal'> };
 
 const AUTHORITY = '决策边界：能在公司内决定的事不找老板。技术方案与拆分由经理定，是否上线由运营定，运营定不了交经理；只有花钱/充值、签约、对外联系、公司方向和项目红线才 report_blocker to=owner，并写明已查过哪些来源。';
 
@@ -61,11 +61,13 @@ const laneIntent = (lane: string): WorkIntent => ({ kind: 'code', lane });
  * quick 目标的合并交付链：实现+上线申请合一（工程交活时一并写上线申请，运营/Jev 决定是否上线）
  * → 合入部署与生产实测。比标准链少一轮复核与派工；quick 即小改动，不再走独立的工程互审。
  */
-export function quickChain(title: string, spec: string, lane: string): Spec[] {
+export function quickChain(title: string, spec: string, lane: string, codeRepoPath?: string): Spec[] {
   const head = chainHead(title, spec);
+  // Only a company-system goal (no project) passes a repo; its code legs bind to it, a project goal's legs stay unbound.
+  const bind = codeRepoPath === undefined ? {} : { codeRepoPath };
   return [
     {
-      title: `${title} · 实现与上线申请`, kind: 'release', executorRole: 'engineering', reviewerRole: 'product', workIntent: laneIntent(lane),
+      title: `${title} · 实现与上线申请`, kind: 'release', executorRole: 'engineering', reviewerRole: 'product', workIntent: laneIntent(lane), ...bind,
       // Quick skips the independent engineering review, so the combined leg keeps only the machine CI AC; Jev/product stays
       // the reviewer and Jev may auto-approve when the CI evidence is verified (no human AC to sign).
       acceptanceCriteria: defaultAcceptanceCriteria('release'),
@@ -77,7 +79,7 @@ export function quickChain(title: string, spec: string, lane: string): Spec[] {
 运营：复核证据与 PR、迁移类型与红线；只在触碰 project.redLines 或需要花钱、对外联系时 report_blocker to=gm，其余自己决定。
 ${AUTHORITY}`,
     },
-    { ...deliveryChain(title, spec)[2], workIntent: laneIntent(lane) },
+    { ...deliveryChain(title, spec)[2], workIntent: laneIntent(lane), ...bind },
   ];
 }
 
@@ -171,8 +173,11 @@ export interface GoalTemplate {
   refs: { intake?: string; plan?: string; manual?: string; acceptance?: string };
 }
 
-/** Task graph for a triaged goal. Refs are local names; the caller maps them to record ids. */
-export function goalTemplate(tier: GoalTier, title: string, brief: string, goalId: string, pipeline: PipelineId = 'software'): GoalTemplate {
+/**
+ * Task graph for a triaged goal. Refs are local names; the caller maps them to record ids. codeRepoPath is the company-system
+ * repo of a goal without a project (see OwnerDesk.triage): only the quick code legs carry it, every other task stays unbound.
+ */
+export function goalTemplate(tier: GoalTier, title: string, brief: string, goalId: string, pipeline: PipelineId = 'software', codeRepoPath?: string): GoalTemplate {
   const head = `所属目标：${title}（goal=${goalId}，级别 ${tier}${pipeline === 'software' ? '' : `，产线 ${pipeline}`}）\n老板原始输入：\n${brief}\n`;
   if (pipeline === 'story') {
     return { tasks: [{ ...linePlan(goalId, head, 'story'), ref: 'plan', deps: [] }], anchors: [], refs: { plan: 'plan' } };
@@ -186,7 +191,7 @@ export function goalTemplate(tier: GoalTier, title: string, brief: string, goalI
   if (tier === 'quick') {
     // One goal, one delivery, one lane: named the way create_delivery names its lane (delivery-<sha256 prefix>).
     const lane = `delivery-${createHash('sha256').update(goalId).digest('hex').slice(0, 8)}`;
-    const chain = quickChain(title, brief, lane).map((spec, i) => ({ ...spec, ref: `d${i}`, deps: i ? [`d${i - 1}`] : [] }));
+    const chain = quickChain(title, brief, lane, codeRepoPath).map((spec, i) => ({ ...spec, ref: `d${i}`, deps: i ? [`d${i - 1}`] : [] }));
     return {
       tasks: [...chain, { ...productAcceptance(goalId, head, true), ref: 'manual', deps: [chain.at(-1)!.ref] }],
       anchors: ['manual'], refs: { manual: 'manual', acceptance: 'manual' },
