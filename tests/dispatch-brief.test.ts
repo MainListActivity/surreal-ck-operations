@@ -13,6 +13,16 @@ test('the requirement is cut out of a delivery leg context; other contexts stay 
   expect(requirementOf('写一页调研。')).toBe('写一页调研。');
 });
 
+test('a delivery leg keeps the acceptance amendment in its requirement section', () => {
+  const amendment = '【验收要求修订 · 2026-11-01T09:00:00Z · gm-1 · audit a1】\n老板原话（逐字）：只收窄守卫范围\n修订说明：其余要求不变。\n';
+  expect(requirementOf(`${legacy}\n\n${amendment}`)).toBe(`导出 CSV，列头用字段标签。\n\n${amendment.trim()}`);
+  const md = taskBrief({ task: { title: '导出 · 实现', context: `${legacy}\n\n${amendment}`, state: 'doing' } as never });
+  expect(md).toContain('老板原话（逐字）：只收窄守卫范围');
+  expect(md).toContain('修订说明：其余要求不变。');
+  expect(md.indexOf('老板原话')).toBeLessThan(md.indexOf('## 本环节'));
+  expect(md).not.toContain('项目环境（');
+});
+
 test('findings are the newest return, numbered by the returns so far', () => {
   expect(latestFindings([{ action: 'submit', actor: 'a', at }])).toBeUndefined();
   const f = latestFindings([ret('第一轮'), { action: 'submit', actor: 'a', at }, ret('第二轮'), ret('第三轮：R3-1 空值崩溃')]);

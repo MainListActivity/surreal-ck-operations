@@ -353,21 +353,38 @@ export class SidecarPool {
     return this.rotateCredential(instId);
   }
 
-  /** Unacked holder notices ride along with a successful reply, so an in-lease holder sees an acceptance amendment
+  /** Undelivered holder notices ride along with a successful reply, so an in-lease holder sees an acceptance amendment
    *  on its very next sck call (the dispatcher only redelivers to idle sessions, and a holder never has to poll
-   *  holder_notices). The attached notices share the reply's budget: a notice that does not fit is left for the next
-   *  call (it stays unacked), and the reply records the cut. Best effort: a failed notice read must never fail the
-   *  tool call it is attached to, and a data answer over the budget on its own is left to the guard to refuse. */
+   *  holder_notices). Attaching is delivery: markAttached marks what the reply carries before the reply is written.
+   *  The attached notices share the reply's budget: a notice that does not fit is left for the next call (it stays
+   *  undelivered), and the reply records the cut. Best effort: a failed notice read must never fail the tool call it
+   *  is attached to, and a data answer over the budget on its own is left to the guard to refuse. */
   private async attachNotices(instId: string, data: unknown): Promise<AttachedNotices> {
     const read = this.deps.core.dispositionNotices?.bind(this.deps.core);
     if (!read) return {};
     try {
       const pending = await read(await this.credentialFor(instId));
       if (!pending.length) return {};
-      return fitAttachedNotices(data, pending, ATTACHED_NOTICE_LIMIT) ?? { notices: pending };
+      // The note is part of the notice body, so it is measured with the notice: the holder needs no ack for it.
+      const noted = pending.map(notice => ({ ...notice, text: `【已随本次回包送达，无需 ack】${notice.text}` }));
+      return fitAttachedNotices(data, noted, ATTACHED_NOTICE_LIMIT) ?? { notices: noted.slice(0, ATTACHED_NOTICE_LIMIT) };
     } catch (error) {
       this.log(`attach notices ${instId} failed: ${(error as Error).message}`);
       return {};
+    }
+  }
+
+  /** Attaching is delivery (R2): each notice a reply carries is marked delivered with the receipt a holder's ack writes
+   *  (agent = the employee), so neither the next reply nor the dispatcher's idle wake-up sends it again. Best effort: a
+   *  failed mark is logged, and the call it rides on still succeeds. */
+  private async markAttached(instId: string, notices: unknown[]): Promise<void> {
+    const ack = this.deps.core.ackDispositionNotices?.bind(this.deps.core);
+    const ids = notices.map(notice => (notice as { noticeKey?: unknown }).noticeKey).filter((key): key is string => typeof key === "string");
+    if (!ack || ids.length === 0) return;
+    try {
+      await ack(await this.credentialFor(instId), { ids });
+    } catch (error) {
+      this.log(`mark attached notices ${instId} failed: ${(error as Error).message}`);
     }
   }
 
@@ -1399,10 +1416,15 @@ export class SidecarPool {
     // A successful call also carries the employee's unacked holder notices (holder_notices and the tool listing
     // already answer with notices / no employee state, so they are skipped). The notices are fitted to the reply's
     // remaining budget first: an in-lease holder sees an acceptance amendment here without being interrupted, an
-    // acked notice is gone from the next reply, and a notice that did not fit is attached again on the next call.
+    // attached notice is delivered (marked below), so it is gone from the next reply, and a notice that did not fit
+    // stays undelivered and is attached on the next call.
     const answer: CommResponse = res.ok && req && req.tool !== "holder_notices" && req.tool !== "__list__"
       ? { ...res, ...(await this.attachNotices(instId, (res as { data?: unknown }).data)) }
       : res;
-    writeFileAtomic(join(resDir(dir), file), JSON.stringify(guardRelayResponse(answer)));
+    const guarded = guardRelayResponse(answer);
+    // Attaching is delivery: the notices a reply carries are marked before the reply is written. A reply the guard
+    // refuses carries none of them, so nothing is marked for it.
+    if (guarded === answer && answer.notices?.length) await this.markAttached(instId, answer.notices);
+    writeFileAtomic(join(resDir(dir), file), JSON.stringify(guarded));
   }
 }

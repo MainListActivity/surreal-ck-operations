@@ -224,9 +224,9 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     expect(bad.error).toContain('acceptance must be an object');
   });
 
-  // SYS-INT 复核 round-02（需求 4）：在租持有人不必等调度器空闲，任一 sck 调用就附带未确认的修订通知；
-  // 条数有上限，ack 之后不再附带，且通知读取失败不会拖垮工具调用本身。
-  test('a successful call carries the unacked holder notices, capped, and stops after ack', async () => {
+  // SYS-INT 复核 round-02（需求 4）与 R2：在租持有人不必等调度器空闲，任一 sck 调用就附带未送达的修订通知；
+  // 条数有上限。附带即送达：附带过的不再随回包附带，调度器也不再重发；通知读取失败不会拖垮工具调用本身。
+  test('a successful call carries the undelivered holder notices, capped, and attaching delivers them', async () => {
     const i = inst('e-notice');
     const env = pool.env(i);
     await pool.claim(i, task('task-notice'));
@@ -244,17 +244,18 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     expect((beat.notices as Array<{ noticeKey: string }>).map(n => n.noticeKey))
       .toEqual([notice(1).noticeKey, notice(2).noticeKey, notice(3).noticeKey]);
 
-    // holder_notices 自己就返回通知，不重复附带；ack 后未确认集合里不再有它。
-    const listed = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n2', 'holder_notices', { ids: [notice(1).noticeKey], ack: true });
-    expect(listed.ok).toBe(true);
-    expect(listed.notices).toBeUndefined();
-    expect((listed.data as { receipt: { delivered: number } }).receipt.delivered).toBe(1);
-    expect(ackedNotices).toEqual([notice(1).noticeKey]);
+    // 附带即送达：前三条已随 heartbeat 回包标记送达，正文注明无需 ack；调度器的待发集合里只剩第四条。
+    expect((beat.notices as Array<{ text: string }>).every(n => n.text.startsWith('【已随本次回包送达，无需 ack】'))).toBe(true);
+    expect(ackedNotices).toEqual([notice(1).noticeKey, notice(2).noticeKey, notice(3).noticeKey]);
+    expect(pendingNotices.map(n => n.noticeKey)).toEqual([notice(4).noticeKey]);
 
-    const after = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n3', 'checkpoint', { text: 'ack 后继续' });
+    // 已送达的不再出现，只剩第四条，它在下一次调用附带；之后就没有未送达的通知了。
+    const after = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n3', 'checkpoint', { text: '附带之后继续' });
     expect(after.ok).toBe(true);
-    expect((after.notices as Array<{ noticeKey: string }>).map(n => n.noticeKey))
-      .toEqual([notice(2).noticeKey, notice(3).noticeKey, notice(4).noticeKey]);
+    expect((after.notices as Array<{ noticeKey: string }>).map(n => n.noticeKey)).toEqual([notice(4).noticeKey]);
+    const drained = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n3b', 'checkpoint', { text: '全部送达之后' });
+    expect(drained.ok).toBe(true);
+    expect(drained.notices).toBeUndefined();
 
     // 读取通知失败只记日志，回包照常成功且不带通知。
     pendingNotices = [notice(5)];
@@ -300,23 +301,24 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     expect(fitted.noticesTruncated).toMatchObject({ count: 1 });
     // 被截掉的正是放不进剩余预算的那一条（这里第三条 24 KB 的正文放不下），且它仍未确认、没有被丢。
     expect(new Set(attached.map(n => n.noticeKey))).toEqual(new Set([bigNotice(1).noticeKey, bigNotice(2).noticeKey]));
+    // 附带即送达：这两条已标记送达，被截掉的第三条仍待发。
+    expect(ackedNotices).toEqual([bigNotice(1).noticeKey, bigNotice(2).noticeKey]);
+    expect(pendingNotices.map(n => n.noticeKey)).toEqual([bigNotice(3).noticeKey]);
 
-    // 未确认的通知还在：放不下第三条时它留在原地，data 再小也不会凭空补齐（两条大通知仍占满预算），
-    // 但它始终未被确认，可以用 holder_notices 读全、ack 后消失。
-    coreForCheckpoint = () => ({ id: 'task-budget', state: 'review' });
-    const next = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'b3', 'checkpoint', { text: '继续读剩余通知' });
-    expect(next.ok).toBe(true);
-    expect(Buffer.byteLength(JSON.stringify(next), 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    expect(new Set(((next.notices ?? []) as Array<{ noticeKey: string }>).map(n => n.noticeKey)))
-      .toEqual(new Set([bigNotice(1).noticeKey, bigNotice(2).noticeKey]));
-    expect(next.noticesTruncated).toMatchObject({ count: 1 });
-
-    // 第三条照旧可读：holder_notices 自己读全量，但它的回显同样受同一预算约束，所以用缩小的 ids 逐条读；
-    // 被截掉的那条不会因此丢失，ack 之后才彻底消失。
+    // 被截掉的第三条仍未送达：放不下它时它留在原地，holder_notices 可以按 ids 逐条读出（回显同样受预算约束）。
     const readThird = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'b3c', 'holder_notices', { ids: [bigNotice(3).noticeKey] });
     expect(readThird.ok).toBe(true);
     expect(new Set(((readThird.data as { notices: Array<{ noticeKey: string }> }).notices).map(n => n.noticeKey)))
       .toEqual(new Set([bigNotice(3).noticeKey]));
+
+    // 下一次调用附带它：前两条已随上一次回包送达，不再出现；它单独也放得下，所以没有截断，且已全部送达。
+    coreForCheckpoint = () => ({ id: 'task-budget', state: 'review' });
+    const next = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'b3', 'checkpoint', { text: '继续读剩余通知' });
+    expect(next.ok).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(next), 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    expect(((next.notices ?? []) as Array<{ noticeKey: string }>).map(n => n.noticeKey)).toEqual([bigNotice(3).noticeKey]);
+    expect(next.noticesTruncated).toBeUndefined();
+    expect(pendingNotices).toEqual([]);
 
     // ack 之后这些通知彻底不再出现。
     await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'b4', 'holder_notices',

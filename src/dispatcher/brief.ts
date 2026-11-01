@@ -22,10 +22,16 @@ export function latestFindings(history: readonly HistoryEntry[] | undefined): Fi
   return { round, file: `findings/round-${String(round).padStart(2, '0')}.md`, text: `${last.evidence!.trim()}${cut}\n` };
 }
 
-/** The requirement part of a task context. Delivery legs wrap it in a fixed head; anything else is kept whole. */
+/** Acceptance amendments are appended to the end of a task's context (core.taskAcceptanceAmend). */
+const AMENDMENT_HEAD = '【验收要求修订';
+
+/** The requirement part of a task context. Delivery legs wrap it in a fixed head; anything else is kept whole. The
+ *  amendments appended after that head are part of the requirement, so the tail from the first one is kept verbatim. */
 export function requirementOf(context: string): string {
   const legacy = /需求与验收标准：\n([\s\S]*?)\n\n项目环境（/.exec(context);
-  return (legacy ? legacy[1]! : context).trim();
+  if (!legacy) return context.trim();
+  const amended = context.indexOf(AMENDMENT_HEAD);
+  return [legacy[1]!.trim(), amended < 0 ? '' : context.slice(amended).trim()].filter(Boolean).join('\n\n');
 }
 
 type Leg = 'implement' | 'release' | 'combined' | 'deploy' | undefined;
