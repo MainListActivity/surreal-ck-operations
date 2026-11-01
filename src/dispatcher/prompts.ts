@@ -1,6 +1,7 @@
 import type { ClaimResult, WorktreeAssignment } from '../contracts.ts';
 import type { EmployeeInst, SupervisedTask } from '../workforce.ts';
 import type { BlockCode, DispatchVerdict } from './dispatch-blocked.ts';
+import { latestFindings } from './brief.ts';
 
 export interface PromptEnv { opsRepo: string; sckBin: string; paseoBin: string }
 
@@ -59,23 +60,7 @@ ${channel}`;
 
 export function wake(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, firstContact: boolean, ctx?: PromptCtx): string {
   const mode = task.state === 'review' ? '独立验收' : task.row.handover ? '接手续做（前任会话已中断）' : '执行';
-  if (ctx?.comm) {
-    const commDir = ctx.commDir ?? '$SCK_COMM_DIR';
-    // Absolute path, not $SCK_SCRATCH_DIR: Paseo drops spawn env on resume, so the variable
-    // is absent for every follow-up turn while the directory itself still exists.
-    const scratchDir = ctx.scratchDir ?? '$SCK_SCRATCH_DIR';
-    // FV06 standby wakes pass the registered worktree directly (the lease was assigned server-side and
-    // adopted, so there is no fresh claim result here) — same usage line as a normal dispatch.
-    const allocation = ctx.claim?.worktree ?? ctx.worktree;
-    const usage = allocation ? `\n登记工作区：${allocation.worktreePath}；mode=${allocation.mode}；branch=${allocation.branch ?? 'detached'}；授权=${JSON.stringify(allocation.intent)}。${allocation.discipline}旧任务 context 若仍要求手动新建独立树，以本次登记路径与写权为准。` : '';
-    const body = `【派工】任务 ${task.id}「${task.title}」已领取给你，本轮${mode}。${usage}
-先读 ${commDir}/claim.json —— 里面是本任务的完整上下文：任务详情、交接历史、前任会话（可用 '${env.paseoBin}' logs <agentId> 看完整时间线）、项目环境（project）。你的交付目录是 ${commDir}（report.md、blocker.md、sck 的 req/res 都在那里）；它也是你的会话宿主目录，不是任务现场——文件操作一律用登记工作区/comm 目录的绝对路径，不要在宿主目录写任务产物。临时文件（克隆、构建、转码、抽帧、下载）一律放 ${scratchDir}，不要写到 /tmp 或宿主目录；该目录按保留期自动清理。你不持有任何凭证；要账号、workspace、成员或生产登录，用运维工具 ops_*：先 sck call ops_info '{}' 看当前项目能做什么。
-完成后：把交付说明写入 ${commDir}/report.md（内容即评审证据，写清楚做了什么、怎么验证、遗留什么）；验收任务用 sck call review 报 accept/return。
-中途保活不需要你管（通道自动续租约）；每完成一个有意义阶段用 sck call checkpoint '{"text":"...","idempotencyKey":"..."}' 存进度；自己定不了就 sck call report_blocker '{"to":"gm","text":"...","idempotencyKey":"..."}'（只有花钱、签约、对外、方向、红线才 to=owner）。订阅额度用尽或限流导致的阻塞，另加 "quotaResetsAt"：平台给出的恢复时间，ISO 8601 且带时区偏移（如 "2026-10-18T10:12:00-04:00"），系统到点后才会重新派工。
-要等时间或外部事件（依赖完成、上游修复、客户激活、老板交接、反馈）时，用 sck call wait_task '{"kind":"time","notBefore":"<带时区偏移的绝对时刻>","reason":"...","text":"...","idempotencyKey":"..."}'，不要在会话里 sleep 或定时输出保活：服务端会原子保存进度、释放租约并在条件成立时重新派工。kind=dependency/upstream_repair 要给 referenceTaskId；owner_handoff 要给 completed 与 pendingAction，且只由老板经 record_owner_decision 回复解除——你自称收到反馈不能解锁。
-本轮只做这一项；写完 report.md 或报阻塞后结束本轮，不空转、不建 agent/定时器。`;
-    return firstContact ? `${onboarding(inst, env, true, commDir)}\n\n${body}` : body;
-  }
+  if (ctx?.comm) return briefWake(task, env, ctx);
   const body = `【派工】任务 ${task.id}「${task.title}」需要你${mode}。
 1. 领取：${tool(inst, env, false).replace('<工具名>', 'claim_next').replace('<JSON参数>', JSON.stringify({ taskId: task.id }))}
    返回的 history 包含前任进度、交接包、验收退回意见和老板决定，先完整阅读；如需更早记录用 get_task_history；返回 response_too_large 时加 {"pageSize":10}，再用 page.nextCursor 逐页翻页，超长证据用 read_task_text。凭证不交给员工，旧凭证文件模式也没有运维工具；需要账号或生产登录的工作 report_blocker to=gm 说明。${task.row.handover ? `
@@ -86,6 +71,28 @@ export function wake(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, f
 3. 本轮只做这一项；完成交接后结束本轮，不要空转等待，不创建 agent 或定时器。
 若领取返回 already_claimed、no_available_task 或 forbidden，直接结束本轮。`;
   return firstContact ? `${onboarding(inst, env)}\n\n${body}` : body;
+}
+
+/**
+ * The dispatch message: which file says what to do, how to finish, and the one tool that hands the result in. Nothing
+ * else — the requirement is in task.md (staged by the sidecar), the system enforces leases, worktrees and credentials.
+ */
+function briefWake(task: SupervisedTask, env: PromptEnv, ctx: PromptCtx): string {
+  const dir = ctx.commDir ?? '$SCK_COMM_DIR';
+  const tree = ctx.claim?.worktree ?? ctx.worktree;
+  const sck = (name: string, args: string) => `'${env.sckBin}' call ${name} '${args}'`;
+  const lines = [`【派工】任务 ${task.id}`];
+  if (tree) lines.push(`工作目录：${tree.worktreePath}${tree.branch ? `（分支 ${tree.branch}）` : ''}`);
+  if (task.state === 'review') {
+    lines.push(`按 ${dir}/task.md 复核交付。`,
+      `结论用 ${sck('review', '{"decision":"accept|return","text":"…","idempotencyKey":"…"}')} 写入；return 时逐条写明问题与复现方式。`);
+    return lines.join('\n');
+  }
+  const findings = latestFindings(ctx.claim?.history);
+  lines.push(findings ? `修复 ${dir}/${findings.file} 中记录的问题（需求见 ${dir}/task.md）。` : `完成 ${dir}/task.md 中的需求。`);
+  lines.push(tree?.intent.kind === 'code' ? '完成必要自测，提交并推送。' : '完成必要自查。');
+  lines.push(`将结果与发布材料用 ${sck('submit', '{"text":"…","idempotencyKey":"…"}')} 写入。`);
+  return lines.join('\n');
 }
 
 export function evalPrompt(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, firstContact: boolean, ctx?: PromptCtx): string {

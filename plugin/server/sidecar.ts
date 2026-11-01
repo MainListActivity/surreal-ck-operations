@@ -8,7 +8,8 @@ import type { RoutingLease } from './vendor/src/model-routing/gateway.ts';
 // req/res files, and ingests report.md/blocker.md when a turn ends.
 import { OpsCircuit } from "./ops-circuit";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { latestFindings, taskBrief } from "./vendor/src/dispatcher/brief.ts";
 import { basename, dirname, join } from "node:path";
 import {
   blockerPath, commDir, ensureCommDirs, readJsonFile, readTextFile, reportPath, reqDir, resDir,
@@ -189,6 +190,22 @@ export interface SettleResult {
 }
 
 const ORPHAN_PREFIX = "orphaned-";
+/**
+ * task.md and findings/round-NN.md for the lease just taken: what the dispatch message points the employee at. The comm
+ * dir outlives tasks, so an earlier task's findings are removed first.
+ */
+function stageBrief(dir: string, claim: ClaimResult): void {
+  try { writeBrief(dir, claim); } catch (error) { console.warn(`task brief for ${claim.task?.id} not staged: ${(error as Error).message}`); }
+}
+function writeBrief(dir: string, claim: ClaimResult): void {
+  rmSync(join(dir, "findings"), { recursive: true, force: true });
+  writeFileAtomic(join(dir, "task.md"), taskBrief(claim));
+  const findings = latestFindings(claim.history);
+  if (!findings) return;
+  mkdirSync(join(dir, "findings"), { recursive: true, mode: 0o700 });
+  writeFileAtomic(join(dir, findings.file), findings.text);
+}
+
 /** Preserved artifacts of earlier leases on the task; claim.json lists them for the next holder. */
 function orphanedArtifacts(evidenceDir: string): string[] {
   try { return readdirSync(evidenceDir).filter(f => f.startsWith(ORPHAN_PREFIX) && f.endsWith(".md")).sort().map(f => join(evidenceDir, f)); }
@@ -436,6 +453,7 @@ export class SidecarPool {
     const evidenceDir = join(dirname(this.deps.runDir), "evidence", task.id);
     mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
     writeFileAtomic(join(dir, "claim.json"), JSON.stringify({ ...result, evidenceDir, orphanedArtifacts: orphanedArtifacts(evidenceDir) }));
+    stageBrief(dir, result);
     // A new lease must not inherit a previous turn's artifacts: archive them so an
     // identical-looking new report still submits instead of matching a stale hash.
     this.archive(reportPath(dir), "stale");
@@ -756,6 +774,7 @@ export class SidecarPool {
     this.log(`sidecar adopted ${lease.state} lease ${task.id} for ${inst.id}`);
     try {
       writeFileAtomic(claimPath, JSON.stringify(snapshot));
+      stageBrief(dir, snapshot);
     } catch (error) {
       // The in-memory proof is enough for sck writes; a failed snapshot refresh must not
       // turn a valid recovered lease into no_lease.

@@ -75,8 +75,8 @@ test('① idle standby holder is woken in place (adopt + dispatch prompt), throt
   const wakes = f.sends.filter(s => s.prompt.includes('【派工】任务 sb-idle'));
   expect(wakes).toHaveLength(1);
   expect(sc.calls.adoptLease).toEqual(['eng-1']);
-  expect(wakes[0]!.prompt).toContain('已领取给你，本轮执行');
-  expect(wakes[0]!.prompt).toContain('登记工作区：/fixture/ops-sck-x');
+  expect(wakes[0]!.prompt).toContain('task.md 中的需求');
+  expect(wakes[0]!.prompt).toContain('工作目录：/fixture/ops-sck-x');
   expect(report.revoked).not.toContain('sb-idle');
   // 60s 节流：同一秒内再 tick 不再唤醒
   await f.tick({ sidecar: { ...sc.bridge } as unknown as SidecarBridge });
