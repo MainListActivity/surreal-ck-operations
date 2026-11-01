@@ -9,6 +9,9 @@ if [ "${SCK_SANDBOX:-}" = employee ] || [ -n "${SCK_COMM_DIR:-}" ]; then
   profile="$here/employee.sb"
   if [ ! -r "$profile" ]; then echo "sck sandbox: $profile missing; refusing to start a company session unsandboxed" >&2; exit 78; fi
   export SCK_SANDBOX=employee
+  # /bin/ps is setuid and the sandbox refuses to exec it; Factory's Execute supervisor kills every foreground
+  # command whose `ps -o ppid= -p $$` liveness check fails. shim/ps (built from ps.c) answers it through libproc.
+  if [ -x "$here/shim/ps" ]; then PATH="$here/shim:${PATH:-/usr/bin:/bin}"; export PATH; fi
   # Goal workspaces start in the project root. Load the private employee settings explicitly,
   # after the user's settings, rather than writing company routing into a shared project.
   if [ -n "${SCK_CLAUDE_SETTINGS:-}" ] && [ "${1##*/}" = claude ]; then
