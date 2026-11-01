@@ -70,3 +70,18 @@ test('standard and program plans carry no intent: create_delivery sets it per le
     expect(goalTemplate(tier, '改个按钮', '按钮错位', 'g6').tasks.some(x => x.workIntent !== undefined)).toBe(false);
   }
 });
+
+test('a company-system quick goal binds both code legs to the ops repo; the manual acceptance stays unbound', () => {
+  const t = goalTemplate('quick', '修复按钮', '按钮错位', 'g7', 'software', '/ops/repo');
+  expect(t.tasks.filter(x => x.ref !== 'manual').map(x => [x.ref, x.codeRepoPath])).toEqual([['d0', '/ops/repo'], ['d1', '/ops/repo']]);
+  expect(t.tasks.find(x => x.ref === 'manual')!.codeRepoPath).toBeUndefined();
+});
+
+test('no company repo keeps project routing, and only quick code legs ever take the company repo', () => {
+  expect(goalTemplate('quick', '修复按钮', '按钮错位', 'g8').tasks.some(x => x.codeRepoPath !== undefined)).toBe(false);
+  expect(goalTemplate('quick', '修复按钮', '按钮错位', 'g8', 'software', undefined)).toEqual(goalTemplate('quick', '修复按钮', '按钮错位', 'g8'));
+  for (const tier of ['standard', 'program'] as const) {
+    expect(goalTemplate(tier, '改个按钮', '按钮错位', 'g9', 'software', '/ops/repo').tasks.some(x => x.codeRepoPath !== undefined)).toBe(false);
+  }
+  expect(goalTemplate('standard', '短剧', '做一集', 'g10', 'video', '/ops/repo').tasks.some(x => x.codeRepoPath !== undefined)).toBe(false);
+});

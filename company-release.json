@@ -1,21 +1,21 @@
 {
-  "version": "0.3.69",
+  "version": "0.3.71",
   "title": "经理在途任务验收要求追加与定向通知",
   "changes": [
-    "新增 task_acceptance_amend（gm + manage）：对 ready/doing/review/blocked 任务追加老板的验收要求修订。单事务把修订追加进 task.context（下次领取的 claim.json 与 read_task_text field=context 都可读），同时写审计 acceptance_amend。",
-    "审计 acceptance_amend 的 evidence 为 JSON，含 ownerQuote 逐字原话、text、notify 入参与 expectedVersion，并同时写 outbox 与幂等行。追加后总长上限 20000 字符，超限整笔回滚并返回 invalid。不改 state、blocked_to/resume_*、依赖、验收标准、独立性、worktree 与租约字段，不移动任务版本，expectedVersion 仍做 compare-and-set。",
-    "定向通知：notify 缺省为「当前活租约持有人 + implementer + 最近 submitter」去重，显式传入以传入为准（[] 表示不通知，审计照写）；未知员工 ID 返回 invalid。每位员工一条持久 holder_notice（新 kind acceptance_amended），经 holder_notices 读取与仅本人 ack。通道重连或插件重启后由调度补发，调度提醒直接附修订原话与说明。通知 id 不含控制字符，回执命令参数整体 JSON 转义。",
-    "附带即送达：成功的 sck 调用回包顶层附带该员工未送达的 holder_notice，至多 3 条。附带的通知先写 delivered_at 再写回包，正文注明「已随本次回包送达，无需 ack」，调度器空闲唤醒不再补发。同一员工并发到达的调用按序读取、附带、标记，同一条不会在两次回包里重复出现。标记失败只记日志，不影响原调用。已送达的本人通知再次回执（ack）仍成功、计 0，失败回执不会把它重新打开；非本人的通知仍整批拒绝。",
-    "附带通知计入同一个 48 KiB 回包预算：守卫按 answerBytes 与整条写回行的较大值计。放不下的通知按 fitAttachedNotices 截掉，noticesTruncated（count/bytes/sha256）只记被截掉的那几条，它们仍未送达，下一次调用再附带。守卫拒绝的回包不附带、不标记。",
-    "交付腿的派工需求书保留验收修订：需求段在「项目环境（」之前截取，其后的「【验收要求修订」块原样接在「## 需求」末尾，不改 chainHead 结构。"
+    "新增 gm 专属工具 task_acceptance_amend（manage）：对 ready、doing、review、blocked 任务追加老板的验收要求修订。单事务把修订追加进 task.context，下次领取的 claim.json 与 read_task_text（field=context）都可读，同时写审计 acceptance_amend。",
+    "审计 evidence 为 JSON，含 ownerQuote（老板原话，逐字）、text、notify 与 expectedVersion，同时写 outbox 与幂等行。追加后 context 总长上限 20000 字符，超限整笔回滚并返回 invalid；expectedVersion 做比较并交换。",
+    "不改变 state、blocked_to、resume_*、依赖、验收标准、独立性、worktree 与租约字段，不移动任务版本，不中断在审任务的活租约，不放宽任何门禁。done 与 void 任务拒绝追加。",
+    "定向通知：notify 缺省为当前活租约持有人、implementer 与最近 submitter 去重；显式传入以传入为准，[] 表示不通知但审计照写；未知员工 ID 返回 invalid。每位员工写一条持久 holder_notice（kind 为 acceptance_amended），经 holder_notices 读取，仅本人可 ack。",
+    "成功的 sck 调用回包顶层附带该员工未送达的 holder_notice，每次至多 3 条，附带即送达：先写 delivered_at 再写回包，调度器空闲唤醒不再补发。附带通知计入同一 48 KiB 回包预算，放不下的截掉，留待下一次调用。",
+    "交付腿的派工需求书保留 context 末尾的验收修订块：需求段在「项目环境（」之前截取，修订块原样接在「## 需求」末尾，不改 chainHead 结构。"
   ],
   "impact": [
-    "验收修订是纯追加：不改任务状态机与任何门禁，持有人租约不被中断，修订后用修订前的租约证明仍可 checkpoint、submit 与 accept。",
-    "每次成功的 sck 调用回包（holder_notices 与工具列表除外）都会附带该员工未送达的全部 holder_notice，不只 acceptance_amended；每次至多 3 条，且放得下回包预算。附带即送达，被截掉的仍未送达，下一次回包或空闲唤醒再送。",
+    "验收修订是纯追加：不改任务状态机与任何门禁，持有人租约不被中断，修订前的租约证明仍可 checkpoint、submit 与 accept。",
+    "每次成功的 sck 调用回包（holder_notices 与工具列表除外）都会附带该员工未送达的全部 holder_notice，不只 acceptance_amended；每次至多 3 条，且放得下回包预算。被截掉的仍未送达，下一次回包或空闲唤醒再送。",
     "限制：续租是通道后台动作，不经 sck 回包，因此不附带通知；通知只随员工自己的 sck 调用送达。",
-    "没有通知的应答，预算判定与此前逐字节一致（answerBytes）；只有带通知的应答多测一次整条写回行，放不下的通知被截掉，超预算的回包不会被放行。",
-    "只影响已追加修订的任务：交付腿的需求书此前会丢掉 context 末尾的修订块，本版起保留。"
+    "没有通知的应答，预算判定与此前逐字节一致；只有带通知的应答多测一次整条写回行，超预算的回包不会被放行。",
+    "只影响已追加修订的任务。交付腿的需求书此前会丢掉 context 末尾的修订块，本版起保留。"
   ],
-  "migration": "本版只新增一个迁移 048：仅以 DEFINE FIELD OVERWRITE 放宽 holder_notice.kind 白名单（新增 acceptance_amended），不新增表或字段，不改写、不删除任何既有行，无回填，无 secret 变更。047（故障修复凭据）由 0.3.67 引入，本版不改动。",
-  "rollback": "按 docs/company-service-operations.md §5 双面回滚到上一个固定版本 0.3.68（releases/1d696423ad41c45d251f3df3e36405bbdc803940），由当前受审 release 的 installer 执行。048 只放宽 holder_notice.kind 白名单，回退无数据操作。已写入 task.context 的验收修订块旧版照常可读。回退后，已标记送达的通知不会再由旧版补发（delivered_at 已写入）；未送达的通知由旧版按既有通道投递，未知 kind 按通用文本投递一次。"
+  "migration": "只新增结构：本版只新增迁移 048，仅以 DEFINE FIELD OVERWRITE 放宽 holder_notice.kind 白名单（新增 acceptance_amended），不新增表或字段，不改写、不删除既有行，无回填，无 secret 变更。047（故障修复凭据）由 0.3.67 引入，本版不改动。",
+  "rollback": "切回升级前的现役固定版本，即 0.3.70（releases/809a0f7c330b9a5663da70f22274de0799fd16fc），以老板升级前实际线上版本为准，由当前受审 release 的 installer 执行（见 docs/company-service-operations.md §5）。048 只放宽白名单，回退无数据操作。已写入 task.context 的验收修订块旧版照常可读。已标记送达的通知不会被旧版再次补发；未送达的由旧版按既有通道投递，未知 kind 按通用文本投递一次。"
 }

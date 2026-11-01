@@ -668,7 +668,8 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     this.leaseSeconds = seconds;
     this.checkpointLimit = options?.checkpointLimit ?? DEFAULT_CHECKPOINT_LIMIT;
     this.workforce = options?.workforce;
-    this.owner = new OwnerDesk(database);
+    // The company-system repo the upgrade gate compares against: a quick goal without a project binds its code legs to it at triage.
+    this.owner = new OwnerDesk(database, options?.companyReleaseRepo ?? options?.worktrees?.opsRepo);
     this.dispositions = new DispositionLedger(database);
     this.projects = new ProjectStore(database.db);
     this.worktrees = options?.worktrees ? new WorktreeRegistry(database.db, options.worktrees) : undefined;

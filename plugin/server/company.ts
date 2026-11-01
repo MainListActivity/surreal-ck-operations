@@ -82,7 +82,9 @@ export function company(): Promise<Company> {
     void modelRouting.refresh().catch(error=>console.warn(`model routing startup: ${(error as Error).message}`));
 
     const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/private/credentials`);
-    const owner = new OwnerDesk(db);
+    const opsRepo = process.env.SCK_AGENT_CWD ?? "/Users/y/IdeaProjects/surreal-ck-operations";
+    // The ops repo lets triage bind a company-system quick goal's code legs to it (see OwnerDesk.triage).
+    const owner = new OwnerDesk(db, opsRepo);
     // Workforce also powers the manage-only def_* tools exposed through the sidecar.
     const paseo = createPaseoCli();
     const worktreeOpts = {
@@ -193,7 +195,6 @@ export function company(): Promise<Company> {
       const agent=requestAgents.get(id);requestAgents.delete(id);
       if(agent){try{metricStore.complete(agent,id,done,metrics);}catch{console.warn('agent model metrics: local completion unavailable');}}
     }});
-    const opsRepo = process.env.SCK_AGENT_CWD ?? "/Users/y/IdeaProjects/surreal-ck-operations";
     const dispatcher = new Dispatcher({
       workforce,
       owner,
