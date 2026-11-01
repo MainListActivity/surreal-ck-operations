@@ -20,7 +20,7 @@ import { parseBrokerConfig } from '../src/ops/config.ts';
 import { createOpsFetcher, type Fetcher } from '../src/ops/fetcher.ts';
 import { passwordLogin } from '../src/ops/idp.ts';
 import { loginBrokerConfig, makeTestPki, startLoginIdp, type LoginIdp, type LoginIdpOptions, type TestPki } from './support/ops-login-transport.ts';
-import type { CreateTask } from '../src/contracts.ts';
+import type { ClaimResult, CreateTask, LeaseProof } from '../src/contracts.ts';
 
 const NS = 'sck_agent_company_test_fault_transport';
 const database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
@@ -53,6 +53,8 @@ beforeAll(async () => {
   for (const [name, role, caps] of [
     ['gm', 'gm', ['execute', 'review', 'manage']],
     ['eng', 'engineering', ['execute', 'review']],
+    // The independent reviewer of the repair task (its reviewer role is qa).
+    ['qa', 'qa', ['execute', 'review']],
   ] as const) tokens[name] = await enrollment.enroll(`t-${name}`, role, caps);
   pki = makeTestPki();
   transport = createOpsFetcher({ connectTimeoutMs: CONNECT_TIMEOUT_MS, ca: pki.ca });
@@ -65,7 +67,9 @@ afterAll(async () => {
 
 beforeEach(async () => {
   clock = 1_700_000_000_000;
-  await database.db.query('DELETE fault_budget; DELETE fault_episode; DELETE fault_incident; DELETE fault_repair;');
+  // A repair chain is keyed by its incident, and that key is an idempotency key: the records of the previous test go
+  // too, or a new chain would link to a repair task that the previous test already finished.
+  await database.db.query('DELETE fault_budget; DELETE fault_episode; DELETE fault_incident; DELETE fault_repair; DELETE fault_repair_consumption; DELETE idempotency;');
   await database.db.query(`UPDATE task SET current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE
     WHERE current_employee != NONE; UPDATE employee SET active_task = NONE WHERE active_task != NONE;`);
 });
@@ -90,6 +94,21 @@ const budgetRow = async (taskId: string) => {
   const store = new FaultStore(database.db);
   return store.scope(budgetKey(taskId, TARGET, PHASE));
 };
+
+const proofOf = (result: ClaimResult): LeaseProof =>
+  ({ taskId: result.task.id, deliveryId: result.deliveryId, fence: result.fence, expectedVersion: result.task.version });
+
+/** A repair finishes the way every task does: the engineer submits, and an independent qa reviewer accepts. */
+async function finishRepair(repairTaskId: string): Promise<void> {
+  const built = await core.claim(tokens.eng!, repairTaskId);
+  await core.submit(tokens.eng!, proofOf(built), {
+    text: '修复已完成：按诊断调整了建连与重试配置，并附验证记录。', idempotencyKey: `repair-submit-${repairTaskId}`,
+  });
+  const reviewed = await core.claim(tokens.qa!, repairTaskId);
+  await core.accept(tokens.qa!, proofOf(reviewed), {
+    text: '独立评审通过：修复说明与诊断一致，证据完整。', idempotencyKey: `repair-accept-${repairTaskId}`,
+  });
+}
 
 interface Attempt {
   reserved?: { allowed: boolean; attempt: number; charged: boolean; reason?: string; message: string };
@@ -386,12 +405,14 @@ describe('the real transport', () => {
     const [repairs] = await database.db.query<[Array<{ task?: unknown }>]>('SELECT task FROM fault_repair;');
     const repairId = String(repairs?.[0]?.task ?? '').split(':').slice(1).join(':').replace(/^⟨|⟩$/g, '');
     expect(repairId).not.toBe('');
-    // The repair is finished.
-    await database.db.query('UPDATE $t SET state = "done";', { t: new RecordId('task', repairId) });
+    // The repair is finished for real: the engineer submits and the independent reviewer accepts.
+    await finishRepair(repairId);
     // The source task may recover again, with a fresh budget.
     clock += 10_000;
     const recovered = await attempt(scope, target);
     expect(recovered.reserved?.allowed).toBe(true);
+    const [spent] = await database.db.query<[Array<{ key?: string }>]>('SELECT key FROM fault_repair_consumption;');
+    expect(spent?.length).toBe(1);
     const after = await budgetRow(taskId);
     expect(after?.attempts).toBe(1);
     expect(after?.failed).toBe(true);
