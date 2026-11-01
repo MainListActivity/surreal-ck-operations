@@ -936,6 +936,13 @@ export class DispositionLedger {
     return (rows ?? []).map(row => this.noticeView(row));
   }
 
+  /** 一个员工自己的通知（含已送达），只按 noticeKey 取：回执的归属校验用。已送达的通知被再次回执时，仍要能认出是本人的。 */
+  async noticesByKey(employeeId: string, noticeKeys: string[]): Promise<HolderNoticeView[]> {
+    const [rows] = await this.db.query<[Row[]]>(
+      'SELECT * FROM holder_notice WHERE holder = $holder AND notice_key IN $keys;', { holder: employeeId, keys: noticeKeys });
+    return (rows ?? []).map(row => this.noticeView(row));
+  }
+
   /** 投递回执：失败只记 last_error / attempts，绝不回滚已经确认的审计或决定，也不把通知从待发队列里丢掉。 */
   async markNotices(ids: string[], outcome: { agent?: string; error?: string }): Promise<number> {
     let updated = 0;

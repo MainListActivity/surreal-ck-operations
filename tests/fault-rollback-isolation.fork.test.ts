@@ -65,7 +65,7 @@ const PROTECTED = ['rb01-waiting', 'rb01-sys05-wait', 'rb01-gated-owner', 'rb01-
  * design, and must raise none where SYS04 deferred it. */
 const GATES = ['rb01-gm-episode', 'rb01-fault-exhausted'];
 /** The tables SYS04 adds; the rollback must neither read nor change their contents. */
-const NEW_TABLES = ['fault_incident', 'fault_episode', 'fault_budget', 'fault_repair', 'task_wait'];
+const NEW_TABLES = ['fault_incident', 'fault_episode', 'fault_budget', 'fault_repair', 'fault_repair_consumption', 'task_wait'];
 const run = process.env.RUN_SCK_ROLLBACK_FORK_TESTS === '1' ? describe : describe.skip;
 
 const PHASE: FaultPhase = 'login';
@@ -370,10 +370,14 @@ run('RB01 rollback isolation: SYS04 fault states against the previous release', 
   test('the new states exist where the new version wrote them, and the control namespace has none of them', () => {
     // The two namespaces were seeded identically, and no new table existed before the new version ran.
     for (const table of NEW_TABLES) expect(seedCounts.A[table]).toBe(0);
-    for (const table of NEW_TABLES) {
+    // The drill spends no completion credential: a consumption is written only when a real repair completion lifts a
+    // budget, and that spend path is covered by tests/fault-budget.fork.test.ts. The table stays in the isolation checks.
+    for (const table of NEW_TABLES.filter(table => table !== 'fault_repair_consumption')) {
       expect(newTableCounts.seed[table]).toBe(0);
       expect(newTableCounts.written[table]).toBeGreaterThan(0);
     }
+    expect(newTableCounts.seed.fault_repair_consumption).toBe(0);
+    expect(newTableCounts.written.fault_repair_consumption).toBe(0);
     // The budget ran out, so the episode is exhausted and the repair chain exists.
     expect(budgetBefore.attempts).toBe(limits.maxAttempts);
     // The fourth attempt is refused by name, not merely unallowed.

@@ -26,6 +26,8 @@ let activeLeaseRows: ActiveLease[] = [];
 /** Unacked holder notices the fake core hands back; a successful relay must attach them (SYS-INT). */
 let pendingNotices: Array<{ noticeKey: string; kind: string; taskId: string; text: string }> = [];
 let noticeReadFails = false;
+/** Makes the fake ack fail the way a store outage would: a failed mark must only be logged, never fail the call. */
+let noticeAckFails = false;
 const noticeReads: string[] = [];
 const ackedNotices: string[] = [];
 const wtCalls: Array<{ cred: string; taskId?: string }> = [];
@@ -95,6 +97,7 @@ const core = {
     return input?.ids ? pendingNotices.filter(notice => input.ids!.includes(notice.noticeKey)) : pendingNotices;
   },
   ackDispositionNotices: async (_c: string, input: { ids: string[] }) => {
+    if (noticeAckFails) throw new Error('notice store unavailable');
     ackedNotices.push(...input.ids);
     pendingNotices = pendingNotices.filter(notice => !input.ids.includes(notice.noticeKey));
     return { delivered: input.ids.length };
@@ -161,6 +164,7 @@ beforeEach(() => {
   activeLeaseRows = [];
   pendingNotices = [];
   noticeReadFails = false;
+  noticeAckFails = false;
   noticeReads.length = 0;
   ackedNotices.length = 0;
   coreForCheckpoint = (taskId: string, expectedVersion: number) => ({ ...taskView(taskId), version: expectedVersion + 1 });
@@ -327,6 +331,35 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     const cleared = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'b5', 'checkpoint', { text: '回执之后' });
     expect(cleared.ok).toBe(true);
     expect(cleared.notices).toBeUndefined();
+  });
+
+  // SYS-INT R2 并发：sweep 会同时开始同一员工的两个请求文件。读取、附带、标记是按员工串行的一步，两次同时到达的
+  // 调用只有一次带上这条通知；标记失败只记日志，回包照常成功并带上通知，通知仍未送达。
+  test('calls in flight carry a pending notice once, and a failed mark only logs', async () => {
+    const i = inst('e-race');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-race'));
+    const race = { noticeKey: 'task-race:acceptance_amended:audit-1:e-race', kind: 'acceptance_amended', taskId: 'task-race', text: '并发修订' };
+    pendingNotices = [race];
+    const dir = env.SCK_COMM_DIR;
+    for (const name of ['race1', 'race2']) {
+      writeFileSync(join(reqDir(dir), `${name}.json`), JSON.stringify({ key: env.SCK_COMM_KEY, tool: 'heartbeat', args: {} }));
+    }
+    await until(() => ['race1', 'race2'].every(name => existsSync(join(resDir(dir), `${name}.json`))));
+    const replies = ['race1', 'race2'].map(name => readJsonFile<{ ok: boolean; notices?: unknown[] }>(join(resDir(dir), `${name}.json`))!);
+    expect(replies.every(reply => reply.ok)).toBe(true);
+    expect(replies.reduce((count, reply) => count + (reply.notices?.length ?? 0), 0)).toBe(1);
+    expect(ackedNotices).toEqual([race.noticeKey]);
+
+    const late = { ...race, noticeKey: 'task-race:acceptance_amended:audit-2:e-race', text: '标记失败的修订' };
+    pendingNotices = [late];
+    noticeAckFails = true;
+    const degraded = await relay(dir, env.SCK_COMM_KEY!, 'race3', 'heartbeat', {});
+    noticeAckFails = false;
+    expect(degraded.ok).toBe(true);
+    expect((degraded.notices as Array<{ noticeKey: string }>).map(n => n.noticeKey)).toEqual([late.noticeKey]);
+    expect(logs.some(line => line.includes('mark attached notices e-race failed'))).toBe(true);
+    expect(pendingNotices.map(n => n.noticeKey)).toEqual([late.noticeKey]);
   });
 
   test('QA reads carry the actual running release, and never a fabricated one', async () => {

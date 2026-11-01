@@ -103,6 +103,15 @@ const amend = (taskId: string, expectedVersion: number, extra: Record<string, un
   core.taskAcceptanceAmend(tokens.gm!, { taskId, expectedVersion, ownerQuote: OWNER_QUOTE, text: AMEND_TEXT, idempotencyKey: key(), ...extra });
 
 run('manager acceptance amendment on an in-flight task', () => {
+  // The fresh bootstrap of this file runs schema 047 (fault repair credential) and then 048 (this amendment's kind). The
+  // version marker ends at 48, and 047's credential start is recorded, which only the 047 step itself writes.
+  test('a fresh bootstrap runs 047 then 048: the version marker is 48 and the credential start is recorded', async () => {
+    const [installation] = await database.db.query<[{ schema_version?: number; fault_credential_since?: unknown } | undefined]>(
+      'SELECT schema_version, fault_credential_since FROM ONLY company_meta:installation;');
+    expect(installation?.schema_version).toBe(48);
+    expect(installation?.fault_credential_since).toBeDefined();
+  });
+
   test('review task with a live lease: amend keeps state, lease and every gate, and the holder can still accept', async () => {
     const taskId = await makeTask('在审任务');
     await execute(taskId);
@@ -155,6 +164,14 @@ run('manager acceptance amendment on an in-flight task', () => {
     // ack 只对本人通知生效；回执后不再待发。
     await expectRefused(core.ackDispositionNotices(tokens.eng2!, { ids: [forImplementer[0]!.noticeKey] }), 'forbidden', /holder/);
     expect(await core.ackDispositionNotices(tokens.eng2!, { ids: [forReviewer[0]!.noticeKey] })).toEqual({ delivered: 1 });
+    expect(await core.dispositionNotices(tokens.eng2!, {})).toHaveLength(0);
+    // 已送达的本人通知再回执仍成功、不计数；同一批里另一条本人未送达的通知照常标记，不连累整批。
+    expect(await core.ackDispositionNotices(tokens.eng2!, { ids: [forReviewer[0]!.noticeKey] })).toEqual({ delivered: 0 });
+    await amend(taskId, (await core.getTask(tokens.gm!, taskId)).version);
+    const second = await core.dispositionNotices(tokens.eng2!, {});
+    expect(second).toHaveLength(1);
+    expect(second[0]!.noticeKey).not.toBe(forReviewer[0]!.noticeKey);
+    expect(await core.ackDispositionNotices(tokens.eng2!, { ids: [forReviewer[0]!.noticeKey, second[0]!.noticeKey] })).toEqual({ delivered: 1 });
     expect(await core.dispositionNotices(tokens.eng2!, {})).toHaveLength(0);
 
     // 租约未被打断：持有人用修订前领取时的租约证明直接验收。

@@ -236,6 +236,8 @@ export class SidecarPool {
   private readonly beats = new Map<string, ReturnType<typeof setInterval>>();
   private readonly active = new Set<string>();
   private readonly processing = new Set<string>();
+  /** instId → the notice step last queued for that employee; each step waits for the one before it (see withNoticeGate). */
+  private readonly noticeGates = new Map<string, Promise<void>>();
   private sweeper?: ReturnType<typeof setInterval>;
 
   /** Last claim denial code per instance: the dispatcher reads it after a lost claim (see claimDenial). */
@@ -386,6 +388,15 @@ export class SidecarPool {
     } catch (error) {
       this.log(`mark attached notices ${instId} failed: ${(error as Error).message}`);
     }
+  }
+
+  /** Reading the pending notices, attaching them to a reply and marking them delivered is one step per employee. The sweep
+   *  starts every request file as it arrives, so two calls in flight would otherwise both read the same notice and both carry
+   *  it. Queued this way, the second call reads only what the first left undelivered. A failed step does not break the queue. */
+  private withNoticeGate<T>(instId: string, step: () => Promise<T>): Promise<T> {
+    const run = (this.noticeGates.get(instId) ?? Promise.resolve()).then(step);
+    this.noticeGates.set(instId, run.then(() => undefined, () => undefined));
+    return run;
   }
 
   private async rotateCredential(instId: string): Promise<string> {
@@ -1418,13 +1429,17 @@ export class SidecarPool {
     // remaining budget first: an in-lease holder sees an acceptance amendment here without being interrupted, an
     // attached notice is delivered (marked below), so it is gone from the next reply, and a notice that did not fit
     // stays undelivered and is attached on the next call.
-    const answer: CommResponse = res.ok && req && req.tool !== "holder_notices" && req.tool !== "__list__"
-      ? { ...res, ...(await this.attachNotices(instId, (res as { data?: unknown }).data)) }
-      : res;
-    const guarded = guardRelayResponse(answer);
-    // Attaching is delivery: the notices a reply carries are marked before the reply is written. A reply the guard
-    // refuses carries none of them, so nothing is marked for it.
-    if (guarded === answer && answer.notices?.length) await this.markAttached(instId, answer.notices);
+    // Calls of one employee that arrive together take turns on the read, the attach and the mark (see withNoticeGate).
+    const guarded = await this.withNoticeGate(instId, async () => {
+      const answer: CommResponse = res.ok && req && req.tool !== "holder_notices" && req.tool !== "__list__"
+        ? { ...res, ...(await this.attachNotices(instId, (res as { data?: unknown }).data)) }
+        : res;
+      const checked = guardRelayResponse(answer);
+      // Attaching is delivery: the notices a reply carries are marked before the reply is written. A reply the guard
+      // refuses carries none of them, so nothing is marked for it.
+      if (checked === answer && answer.notices?.length) await this.markAttached(instId, answer.notices);
+      return checked;
+    });
     writeFileAtomic(join(resDir(dir), file), JSON.stringify(guarded));
   }
 }
