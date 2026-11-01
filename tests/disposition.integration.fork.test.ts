@@ -345,6 +345,8 @@ run('SYS03 manager disposition on the company fork', () => {
         .then(v => `delivered:${v.delivered}`, (error: Error) => `error:${(error as { code?: string }).code ?? error.message}`) };
     obs.ackByHolder = await core.ackDispositionNotices(eng, { ids: holderNotices.map(n => n.noticeKey) }).then(v => v.delivered);
     obs.noticeAfterAck = (await core.dispositionNotices(eng)).length;
+    // The dispatcher's pending list drops an acknowledged notice too: an attached notice is marked delivered the same way.
+    obs.pendingAfterAck = (await wf.pendingHolderNotices(500)).filter(notice => notice.holder === 'sys03-eng-a').length;
     obs.statusViews = {
       currentHolder: await core.dispositionStatus(gmC, claimOf(e1, '')),
       otherManager: await core.dispositionStatus(product, claimOf(e1, '')),
@@ -675,6 +677,7 @@ run('SYS03 manager disposition on the company fork', () => {
     expect(notice.ackByOther).toMatch(/^error:/);
     expect(obs.ackByHolder).toBe(notice.count);
     expect(obs.noticeAfterAck).toBe(0);
+    expect(obs.pendingAfterAck).toBe(0);
     const views = obs.statusViews as { currentHolder: { claim?: { holder?: string; token?: string } };
       otherManager: { claim?: { holder?: string; token?: string } }; stranger: string };
     expect(views.currentHolder.claim?.holder).toBe('sys03-gm-c');
