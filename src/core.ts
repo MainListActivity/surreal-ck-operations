@@ -47,7 +47,7 @@ import {
   checkToolScope, policyView as policyApiView, type EffectiveContract, type PolicyDomain, type PolicyRow, type PolicyScope, type PolicyScopeLink, type PolicyStatus, type PolicyVerdict,
 } from './policy.ts';
 import { chainOfTaskRow, policyRowView, policyScopeChain, readEffectiveContract, readPolicyEpoch, readPolicyRows, readTaskPolicyRow, registeredDomainsOf, scanInFlightTasks, type PolicyDbRow } from './policy-store.ts';
-import { FaultStore, type FaultReportResult, type FaultReserveResult } from './fault-store.ts';
+import { FaultStore, type FaultCredential, type FaultReportResult, type FaultReserveResult } from './fault-store.ts';
 import {
   DEFAULT_FAULT_BUDGET, budgetKey, classifyFault, faultEvidence, jitterFactorOf, type FaultBudgetLimits,
   type FaultDiagnostic, type FaultInput, type FaultPhase, type FaultRecord, type FaultTargetKind, type FlowStage,
@@ -3856,7 +3856,18 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const liftable = matching.some(episode => episode.state === 'exhausted' || episode.state === 'stopped' || episode.state === 'opened' || episode.state === 'converged');
     if (!liftable) throw new CompanyError('conflict', `incident ${input.incident} is already resolved on this task`);
     const now = this.faultClock();
-    await this.faults.liftRepair({ taskId: input.taskId, incident: input.incident, now, limits: this.faultLimits });
+    // The lift spends the completions of this incident's repair rounds that are still unspent, so the automatic path
+    // cannot spend the same completion again once the budget runs out (AC04). With none unspent, the budget is reset
+    // by hand, and the audit below records the reason.
+    const unspent = await this.unspentCredentials(input.taskId, input.incident);
+    if (unspent.length > 0) {
+      const spent = await this.faults.spendCredentials({
+        taskId: input.taskId, incident: input.incident, now, limits: this.faultLimits, via: 'gm', credentials: unspent,
+      });
+      if (!spent) throw new CompanyError('conflict', `incident ${input.incident} was lifted by a concurrent call; read the fault status before retrying`);
+    } else {
+      await this.faults.resetRecovery({ taskId: input.taskId, incident: input.incident, now, limits: this.faultLimits });
+    }
     await this.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: 'fault_lift', evidence: $evidence, at: time::now() };`,
       { task: id('task', input.taskId), actor: id('employee', actor.employeeId),
         evidence: JSON.stringify({ incident: input.incident, reason: input.reason, idempotencyKey: input.idempotencyKey }).slice(0, 30000) });
@@ -3900,20 +3911,60 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * A repair that is done lifts the fault it was made for (AC04): the source task may recover again, with a fresh
-   * budget and a new stage. The repair task is the one the manager created for the incident.
+   * A real repair completion lifts the fault it was made for (AC04): the source task may recover again, with a fresh
+   * budget and a new stage. Each completion lifts a task at most once. The spend is recorded in the same transaction
+   * as the lift, so a replay, a concurrent call or a restart finds the completion spent and changes nothing. One lift
+   * spends every completion of the incident that is still unspent, so an older completion cannot lift it again later.
    */
   private async liftRepairedFaults(taskId: TaskId, now: number): Promise<void> {
     const incidents = new Set((await this.faults.episodesOfTask(taskId))
       .filter(episode => episode.state === 'exhausted' || episode.state === 'stopped')
       .map(episode => episode.incident));
     for (const incident of incidents) {
-      const repair = await this.faults.repair(incident);
-      if (!repair?.taskId) continue;
-      const repairTask = await this.db.select<{ state?: string }>(id('task', repair.taskId));
-      if (repairTask?.state !== 'done') continue;
-      await this.faults.liftRepair({ taskId, incident, now, limits: this.faultLimits });
+      // A concurrent call that spent the completions first makes the spend return false: the state is read again.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const credentials = await this.unspentCredentials(taskId, incident);
+        if (credentials.length === 0) break;
+        const spent = await this.faults.spendCredentials({ taskId, incident, now, limits: this.faultLimits, via: 'repair', credentials });
+        if (spent) break;
+      }
     }
+  }
+
+  /**
+   * The completions of one incident's repair rounds that this task has not spent yet, newest round first. A round
+   * gives a completion only when it is done and its completion audit exists: a raw state change gives none.
+   */
+  private async unspentCredentials(taskId: TaskId, incident: string): Promise<FaultCredential[]> {
+    const repair = await this.faults.repair(incident);
+    if (!repair?.rounds.length) return [];
+    const spent = await this.faults.spentCredentials(taskId, incident);
+    const unspent: FaultCredential[] = [];
+    for (const round of [...repair.rounds].reverse()) {
+      const credential = await this.repairCredential(round);
+      if (credential !== undefined && !spent.has(credential)) unspent.push({ repair: round, credential });
+    }
+    return unspent;
+  }
+
+  /**
+   * The credential of one repair round: the newest accept or owner approval of its repair task, written after the
+   * credential marker that the upgrade to schema 047 set. Audits from before the marker are not credentials, so
+   * upgrading lifts nothing.
+   */
+  private async repairCredential(repairTaskId: string): Promise<string | undefined> {
+    const repairTask = await this.db.select<{ state?: string }>(id('task', repairTaskId));
+    if (repairTask?.state !== 'done') return undefined;
+    // The marker is compared inside the query: the SDK hands datetimes out as its own class, not as Date. A marker
+    // that is not set (NONE) matches no audit, so nothing before the upgrade is a credential.
+    const [rows] = await this.db.query<[Array<{ id?: unknown }>]>(
+      `SELECT id, at FROM audit WHERE task = $task AND action IN ['accept', 'owner_approve']
+        AND at >= (SELECT VALUE fault_credential_since FROM ONLY company_meta:installation)
+        ORDER BY at DESC LIMIT 1;`,
+      { task: id('task', repairTaskId) },
+    );
+    const audit = rows?.[0]?.id;
+    return audit === undefined ? undefined : asId(audit);
   }
 
   /**
@@ -3937,20 +3988,22 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * usual review rather than as an owner gate. The create carries a business key, so the chain exists exactly
    * once no matter how often the budget is exhausted.
    */
-  private async createFaultRepairTask(credential: Credential, sourceTaskId: TaskId, incident: string, fingerprint: string, diagnostic: FaultDiagnostic): Promise<TaskId> {
+  private async createFaultRepairTask(credential: Credential, sourceTaskId: TaskId, incident: string, fingerprint: string, diagnostic: FaultDiagnostic, round: number): Promise<TaskId> {
     const source = await this.db.select<TaskRow>(id('task', sourceTaskId));
     const title = `故障修复 ${diagnostic.phase}/${diagnostic.hop} ${diagnostic.errno}`;
     const context = [
-      'SYS04 故障修复任务：一次恢复预算耗尽后的唯一修复链。',
+      'SYS04 故障修复任务：一次恢复预算耗尽后的修复链（同一 incident 的每一轮各一个任务）。',
       `incident=${incident}`,
       `fingerprint=${fingerprint}`,
       `phase=${diagnostic.phase} hop=${diagnostic.hop} errno=${diagnostic.errno} httpClass=${diagnostic.httpClass} status=${diagnostic.status ?? '-'}`,
       `attempts=${diagnostic.attempts}/${diagnostic.maxAttempts} elapsedMs=${diagnostic.elapsedMs} retryability=${diagnostic.retryability}`,
       `diagnosis: ${diagnostic.guidance}`,
       `sourceTask=${sourceTaskId}`,
+      `round=${round}`,
       source?.goal ? `goal=${asId(source.goal)}` : '',
     ].filter(Boolean).join('\n');
-    const repairKey = `fault-repair:${incident}`;
+    // Round one keeps the key its chain was created with; a later round is a new task with its own key.
+    const repairKey = round > 1 ? `fault-repair:${incident}:${round}` : `fault-repair:${incident}`;
     try {
       const view = await this.createTaskRecord(credential, {
         title,
@@ -4204,7 +4257,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       const repairTaskId = await this.faults.ensureRepair({
         incident: stopped.incident, fingerprint: stopped.fingerprint, sourceTaskId: taskId,
         diagnostic: stopped.diagnostic, now: this.faultClock(),
-        createTask: () => this.createFaultRepairTask(credential, taskId, stopped.incident, stopped.fingerprint, stopped.diagnostic),
+        createTask: ({ round }) => this.createFaultRepairTask(credential, taskId, stopped.incident, stopped.fingerprint, stopped.diagnostic, round),
       });
       const deferred = await this.deferTaskUntilRecord(credential, {
         taskId,

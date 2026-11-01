@@ -26,7 +26,7 @@ import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { FaultStore } from '../src/fault-store.ts';
 import { budgetKey, classifyFault, faultFingerprint, incidentKey, type FaultBudgetLimits, type FaultPhase, type FaultTargetKind } from '../src/faults.ts';
-import type { ClaimResult, CreateTask, Evidence } from '../src/contracts.ts';
+import type { ClaimResult, CreateTask, Evidence, LeaseProof } from '../src/contracts.ts';
 
 const NS = 'sck_agent_company_test_fault_budget';
 const database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
@@ -52,6 +52,8 @@ beforeAll(async () => {
     ['gm', 'gm', ['execute', 'review', 'manage']],
     ['eng', 'engineering', ['execute', 'review']],
     ['eng2', 'engineering', ['execute', 'review']],
+    // The independent reviewer of the repair tasks (their reviewer role is qa).
+    ['qa', 'qa', ['execute', 'review']],
   ] as const) tokens[name] = await enrollment.enroll(`t-${name}`, role, caps);
 });
 
@@ -61,7 +63,9 @@ afterAll(async () => {
 
 beforeEach(async () => {
   clock = 1_700_000_000_000;
-  await database.db.query('DELETE fault_budget; DELETE fault_episode; DELETE fault_incident; DELETE fault_repair;');
+  // A repair chain is keyed by its incident, and that key is an idempotency key: the records of the previous test go
+  // too, or a new chain would link to a repair task that the previous test already finished.
+  await database.db.query('DELETE fault_budget; DELETE fault_episode; DELETE fault_incident; DELETE fault_repair; DELETE fault_repair_consumption; DELETE idempotency;');
   // The fixture leases one task per employee at a time: the leases of the previous test are released.
   await database.db.query(`UPDATE task SET current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE
     WHERE current_employee != NONE; UPDATE employee SET active_task = NONE WHERE active_task != NONE;`);
@@ -130,10 +134,64 @@ async function report(scope: { taskId: string; employeeId?: string }, input: Att
   });
 }
 
-const budgetRow = async (taskId: string, target = TARGET, phase = PHASE) => {
+const budgetRow = async (taskId: string, target: FaultTargetKind = TARGET, phase: FaultPhase = PHASE) => {
   const store = new FaultStore(database.db);
   return store.scope(budgetKey(taskId, target, phase));
 };
+
+/** The reservation of the default budget: the input the broker uses before an attempt. */
+const RESERVE = { phase: PHASE, target: TARGET } as const;
+
+/** The incident the core records for a fault of this target and cause (the identity alias is not part of it). */
+const incidentOf = (target: FaultTargetKind = TARGET, errno = 'UND_ERR_CONNECT_TIMEOUT') =>
+  incidentKey(classifyFault({ phase: PHASE, errno, identityAlias: 'LCA04_MEMBER', target, environment: 'production' }));
+
+/** The four attempts that spend a whole budget on one cause: the fourth is refused and the episode is exhausted. */
+async function exhaust(scope: { taskId: string; employeeId?: string }, input: AttemptInput = { errno: 'UND_ERR_CONNECT_TIMEOUT' }) {
+  await attempt(scope, input);
+  for (let n = 0; n < 2; n++) {
+    clock += 10_000;
+    await attempt(scope, input);
+  }
+  clock += 10_000;
+  return attempt(scope, input);
+}
+
+/**
+ * The gm resumes a stopped task, as the manager does. The task waits at the gm gate, and the resume hands it to the
+ * repair chain of its incident. The result is the repair round the chain now waits on.
+ */
+async function resumeToRepair(taskId: string, incident = incidentOf()): Promise<string> {
+  await database.db.query('UPDATE $t SET state = "blocked", blocked_to = "gm", resume_state = "ready";', { t: new RecordId('task', taskId) });
+  await core.resume(tokens.gm!, taskId, {
+    text: '尝试恢复：预算耗尽后应当走修复链而不是直接恢复', idempotencyKey: `resume-${taskId}-${clock}`,
+  });
+  const repair = await new FaultStore(database.db).repair(incident);
+  if (!repair?.taskId) throw new Error(`no repair round for ${incident}`);
+  return repair.taskId;
+}
+
+const proofOf = (result: ClaimResult): LeaseProof =>
+  ({ taskId: result.task.id, deliveryId: result.deliveryId, fence: result.fence, expectedVersion: result.task.version });
+
+/** A repair finishes the way every task does: the engineer submits, and an independent qa reviewer accepts. */
+async function finishRepair(repairTaskId: string): Promise<void> {
+  const built = await claim(repairTaskId, 'eng');
+  await core.submit(tokens.eng!, proofOf(built), {
+    text: '修复已完成：按诊断调整了建连与重试配置，并附验证记录。', idempotencyKey: `repair-submit-${repairTaskId}`,
+  });
+  const reviewed = await claim(repairTaskId, 'qa');
+  await core.accept(tokens.qa!, proofOf(reviewed), {
+    text: '独立评审通过：修复说明与诊断一致，证据完整。', idempotencyKey: `repair-accept-${repairTaskId}`,
+  });
+}
+
+/** The completions spent on lifts for one task, as the ledger records them. */
+async function spentCount(taskId: string): Promise<number> {
+  const [rows] = await database.db.query<[Array<{ key?: string }>]>(
+    'SELECT key FROM fault_repair_consumption WHERE task = $task;', { task: new RecordId('task', taskId) });
+  return rows?.length ?? 0;
+}
 
 describe('the budget is spent before the attempt', () => {
   test('the first attempt is free, the recovery attempts are charged, and the fourth is refused', async () => {
@@ -476,11 +534,14 @@ describe('the exhausted budget', () => {
     const key = budgetKey(taskId, TARGET, PHASE);
     const row = await store.scope(key);
     expect(row?.attempts).toBe(3);
-    // The repair finishes: the budget is reset and the episode may open a new stage.
-    await store.liftRepair({ taskId, incident: row?.lastIncident ?? '', now: clock, limits });
+    // The repair finishes for real: the engineer submits and the independent reviewer accepts. The completion lifts
+    // the budget at the next reservation, and the episode may open a new stage.
+    await finishRepair(await resumeToRepair(taskId, row?.lastIncident ?? ''));
+    expect((await core.reserveFault!(scope, RESERVE))?.allowed).toBe(true);
     const after = await store.scope(key);
     expect(after?.attempts).toBe(0);
     expect(after?.stopped).toBe(false);
+    expect(await spentCount(taskId)).toBe(1);
     clock += 10_000;
     const recovered = await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
     expect(recovered.reserved?.allowed).toBe(true);
@@ -543,21 +604,170 @@ describe('the exhausted budget', () => {
     await core.resume(tokens.gm, taskId, {
       text: '尝试恢复：预算耗尽后应当走修复链而不是直接恢复', idempotencyKey: `resume-lift-${clock}`,
     });
-    const [repairs] = await database.db.query<[Array<{ task?: unknown }>]>('SELECT task FROM fault_repair;');
-    // The fork renders a record id as `task:⟨uuid⟩`: strip the table and the quoting.
-    const repairId = String(repairs?.[0]?.task ?? '').split(':').slice(1).join(':').replace(/^⟨|⟩$/g, '');
+    // The repair is finished for real: the engineer submits and the independent reviewer accepts.
+    const repairId = (await new FaultStore(database.db).repair(incidentOf()))?.taskId ?? '';
     expect(repairId).not.toBe('');
-    // The repair is finished.
-    await database.db.query('UPDATE $t SET state = "done";', { t: new RecordId('task', repairId) });
+    await finishRepair(repairId);
     // The source task may recover again: the budget starts over.
     const recovered = await core.reserveFault!(scope, { phase: PHASE, target: TARGET });
     expect(recovered?.allowed).toBe(true);
     const row = await budgetRow(taskId);
     expect(row?.attempts).toBe(0);
     expect(row?.failed).toBe(false);
+    expect(await spentCount(taskId)).toBe(1);
     // And the episode is closed: a later report opens a new stage.
     const [episodes] = await database.db.query<[Array<{ state?: string }>]>('SELECT state FROM fault_episode;');
     expect(episodes?.[0]?.state).toBe('resolved');
+  });
+});
+
+describe('a repair completion lifts a budget once (AC04)', () => {
+  test('the first real completion lifts; the same completion replayed after a new exhaustion lifts nothing', async () => {
+    const taskId = await makeTask('修复凭据：首次完成解除一次');
+    const scope = { taskId, employeeId: 't-eng' };
+    await exhaust(scope);
+    const repairId = await resumeToRepair(taskId);
+    // The repair is not finished yet: nothing lifts.
+    expect((await core.reserveFault!(scope, RESERVE))?.allowed).toBe(false);
+    await finishRepair(repairId);
+    expect((await core.reserveFault!(scope, RESERVE))?.allowed).toBe(true);
+    expect((await budgetRow(taskId))?.attempts).toBe(0);
+    expect(await spentCount(taskId)).toBe(1);
+    // The budget is spent again on the same cause. The completion is spent already, so replaying it clears nothing.
+    expect((await exhaust(scope)).reserved?.allowed).toBe(false);
+    expect((await core.reserveFault!(scope, RESERVE))?.allowed).toBe(false);
+    expect((await budgetRow(taskId))?.attempts).toBe(3);
+    expect(await spentCount(taskId)).toBe(1);
+  });
+
+  test('a restart replays the completion and changes nothing', async () => {
+    const taskId = await makeTask('修复凭据：重启后重放不清零');
+    const scope = { taskId, employeeId: 't-eng' };
+    await exhaust(scope);
+    await finishRepair(await resumeToRepair(taskId));
+    expect((await core.reserveFault!(scope, RESERVE))?.allowed).toBe(true);
+    await exhaust(scope);
+    // A new process reads the same database, and the completion is recorded as spent there.
+    const restarted = new SurrealCompanyCore(database, { faults: { limits, clock: now } });
+    expect((await restarted.reserveFault!(scope, RESERVE))?.allowed).toBe(false);
+    expect(await spentCount(taskId)).toBe(1);
+  });
+
+  test('concurrent calls on one completion lift it once', async () => {
+    const taskId = await makeTask('修复凭据：并发只解除一次');
+    const scope = { taskId, employeeId: 't-eng' };
+    await exhaust(scope);
+    await finishRepair(await resumeToRepair(taskId));
+    const results = await Promise.all([1, 2, 3].map(() => core.reserveFault!(scope, RESERVE)));
+    expect(results.some(result => result?.allowed)).toBe(true);
+    expect(await spentCount(taskId)).toBe(1);
+  });
+
+  test('a raw done state is not a completion, and the chain moves on to a new round', async () => {
+    const taskId = await makeTask('修复凭据：直接改 done 不是凭据');
+    const scope = { taskId, employeeId: 't-eng' };
+    await exhaust(scope);
+    const first = await resumeToRepair(taskId);
+    await database.db.query('UPDATE $t SET state = "done";', { t: new RecordId('task', first) });
+    expect((await core.reserveFault!(scope, RESERVE))?.allowed).toBe(false);
+    expect(await spentCount(taskId)).toBe(0);
+    // A raw state gives no green light: the next resume opens the next round of the chain.
+    const next = await resumeToRepair(taskId);
+    expect(next).not.toBe(first);
+    expect((await new FaultStore(database.db).repair(incidentOf()))?.rounds).toEqual([first, next]);
+    expect((await core.reserveFault!(scope, RESERVE))?.allowed).toBe(false);
+  });
+
+  test('a completion written before the schema 047 upgrade is not a credential', async () => {
+    const taskId = await makeTask('修复凭据：升级前的完成不解除');
+    const scope = { taskId, employeeId: 't-eng' };
+    await exhaust(scope);
+    await finishRepair(await resumeToRepair(taskId));
+    // The upgrade runs now. Its marker is later than that completion, so the completion is not a credential.
+    await database.db.query('UPDATE company_meta:installation SET schema_version = 46, fault_credential_since = NONE;');
+    await database.bootstrap();
+    expect((await core.reserveFault!(scope, RESERVE))?.allowed).toBe(false);
+    expect(await spentCount(taskId)).toBe(0);
+    // A completion after the upgrade is a credential.
+    await finishRepair(await resumeToRepair(taskId));
+    expect((await core.reserveFault!(scope, RESERVE))?.allowed).toBe(true);
+    expect(await spentCount(taskId)).toBe(1);
+  });
+
+  test('a new round gives one more lift, and a re-exhausted budget needs that new completion', async () => {
+    const taskId = await makeTask('修复凭据：新一轮修复再解除一次');
+    const scope = { taskId, employeeId: 't-eng' };
+    await exhaust(scope);
+    const first = await resumeToRepair(taskId);
+    await finishRepair(first);
+    expect((await core.reserveFault!(scope, RESERVE))?.allowed).toBe(true);
+    // The budget is spent again on the same cause. The first completion is spent, so it cannot lift a second time.
+    expect((await exhaust(scope)).reserved?.allowed).toBe(false);
+    expect((await core.reserveFault!(scope, RESERVE))?.allowed).toBe(false);
+    // The chain moves on to a new round. Only that round's completion lifts once more.
+    const second = await resumeToRepair(taskId);
+    expect(second).not.toBe(first);
+    expect((await core.reserveFault!(scope, RESERVE))?.allowed).toBe(false);
+    await finishRepair(second);
+    expect((await core.reserveFault!(scope, RESERVE))?.allowed).toBe(true);
+    expect(await spentCount(taskId)).toBe(2);
+  });
+
+  test('a completion lifts only the incident it was made for', async () => {
+    const taskId = await makeTask('修复凭据：只解除自己的 incident');
+    const scope = { taskId, employeeId: 't-eng' };
+    // Two incidents on one task. The product API is exhausted first; the identity login is the newest one, so the
+    // chain is made for it. Both causes are connect timeouts: a reset of a non-idempotent write is unknown_outcome,
+    // which is never retried, so it could not run a budget out.
+    await exhaust(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT', target: 'product_api' });
+    await exhaust(scope);
+    await finishRepair(await resumeToRepair(taskId, incidentOf(TARGET)));
+    expect((await core.reserveFault!(scope, RESERVE))?.allowed).toBe(true);
+    const other = await core.reserveFault!(scope, { phase: PHASE, target: 'product_api' });
+    expect(other?.allowed).toBe(false);
+    expect((await budgetRow(taskId, 'product_api'))?.attempts).toBe(3);
+    expect(await spentCount(taskId)).toBe(1);
+  });
+
+  test('a completion lifts each task on the cause once: one task spending it leaves the other its own spend', async () => {
+    const first = await makeTask('修复凭据：同一原因两个任务（甲）');
+    const second = await makeTask('修复凭据：同一原因两个任务（乙）');
+    const firstScope = { taskId: first, employeeId: 't-eng' };
+    const secondScope = { taskId: second, employeeId: 't-eng' };
+    // Both tasks run out on the same cause, so they share one repair chain.
+    await exhaust(firstScope);
+    await exhaust(secondScope);
+    await finishRepair(await resumeToRepair(first));
+    // The completion lifts each task once. Spending it for the first task does not spend it for the second.
+    expect((await core.reserveFault!(firstScope, RESERVE))?.allowed).toBe(true);
+    expect((await core.reserveFault!(secondScope, RESERVE))?.allowed).toBe(true);
+    expect(await spentCount(first)).toBe(1);
+    expect(await spentCount(second)).toBe(1);
+    // The first task runs out again: the completion it spent cannot lift it twice, and the second task is untouched.
+    expect((await exhaust(firstScope)).reserved?.allowed).toBe(false);
+    expect((await core.reserveFault!(firstScope, RESERVE))?.allowed).toBe(false);
+    expect((await core.reserveFault!(secondScope, RESERVE))?.allowed).toBe(true);
+    expect(await spentCount(first)).toBe(1);
+    expect(await spentCount(second)).toBe(1);
+  });
+
+  test('a manual lift spends the unspent completion, and its window stays bounded', async () => {
+    const taskId = await makeTask('修复凭据：人工解除也消耗凭据');
+    const scope = { taskId, employeeId: 't-eng' };
+    await exhaust(scope);
+    await finishRepair(await resumeToRepair(taskId));
+    // gm lifts by hand while the completion is still unspent: the lift spends that completion with it.
+    const lifted = await core.faultLift!(tokens.gm!, {
+      taskId, incident: incidentOf(), reason: '验收期间人工解封，修复已完成', idempotencyKey: `lift-spend-${taskId}`,
+    });
+    expect(lifted.budgets[0]?.attempts).toBe(0);
+    expect(await spentCount(taskId)).toBe(1);
+    // The manual lift opens one window of the usual size, not an unlimited one.
+    expect((await budgetRow(taskId))?.deadline).toBe(clock + limits.totalDeadlineMs);
+    // The spent completion cannot lift the next exhaustion, and the window ends with the usual refusal.
+    expect((await exhaust(scope)).reserved?.allowed).toBe(false);
+    expect((await core.reserveFault!(scope, RESERVE))?.allowed).toBe(false);
+    expect(await spentCount(taskId)).toBe(1);
   });
 });
 
