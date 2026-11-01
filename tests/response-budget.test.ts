@@ -6,7 +6,8 @@ import { SurrealCompanyCore } from '../src/core.ts';
 import {
   ANSWER_WRAPPER_BYTES, CLAIM_HISTORY_FLOOR_BYTES, CLAIM_LIST_ECHO_BYTES, DATA_BUDGET_BYTES, ITEM_BUDGET_BYTES, MAX_REQUEST_ID_BYTES,
   PROJECT_ECHO_BYTES, RESPONSE_BUDGET_BYTES, RESPONSE_FRAME_BYTES, SSE_RPC_FRAME_BYTES, answerBytes, answerResult, dualBytes, echoClaim,
-  echoTask, fitCount, guardRelayResponse, jsonBytes, longestFittingPrefix, oversizeRequestId, openCursor, sealCursor, textSegment,
+  echoTask, fitAttachedNotices, fitCount, guardRelayResponse, jsonBytes, longestFittingPrefix, oversizeRequestId, openCursor, relayReplyBytes,
+  sealCursor, textSegment,
   textSegmentAnswer, utf8Prefix, utf8Segment, worktreeRefsSegment, worktreeRefsSegmentAnswer,
 } from '../src/response-budget.ts';
 import {
@@ -35,6 +36,46 @@ describe('byte budget (SYS01)', () => {
     const fits = { ok: true as const, data: { blob: 'a'.repeat(lo) } };
     expect(guardRelayResponse(fits)).toBe(fits);
     expect(guardRelayResponse({ ok: true as const, data: { blob: 'a'.repeat(lo + 1) } })).toMatchObject({ ok: false, code: 'response_too_large' });
+  });
+
+  test('attached holder notices count against the same budget as the data they ride with (SYS-INT, R3)', () => {
+    const data = { id: 'task-x', state: 'review', version: 26 };
+    // A notice is bounded by the amend input: ownerQuote and text are each at most 4000 characters (3 UTF-8 bytes each).
+    const bigNotice = (n: number) => ({ noticeKey: `n${n}`, kind: 'acceptance_amended', ownerQuote: '验'.repeat(4000), text: '验'.repeat(4000) });
+
+    // Fitting notices are kept whole, and the reply line stays within the budget.
+    const small = [bigNotice(1), bigNotice(2)];
+    expect(fitAttachedNotices(data, small)).toBeUndefined();
+    const reply = { ok: true as const, data, notices: small };
+    expect(relayReplyBytes(reply)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    expect(Buffer.byteLength(JSON.stringify(reply), 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    expect(guardRelayResponse(reply)).toBe(reply);
+
+    // Three of them: two fit the remaining budget, the third is cut off and reported. The cut notice stays unacked,
+    // so the next call attaches it again — the holder sees a large backlog late, never never.
+    const three = [bigNotice(1), bigNotice(2), bigNotice(3)];
+    const fitted = fitAttachedNotices(data, three)!;
+    expect(fitted).not.toBeUndefined();
+    expect(fitted.notices).toHaveLength(2);
+    expect(fitted.noticesTruncated).toMatchObject({ count: 3 });
+    expect(fitted.noticesTruncated.bytes).toBe(jsonBytes(three));
+    expect(fitted.noticesTruncated.sha256).toBe(createHash('sha256').update(JSON.stringify(three)).digest('hex'));
+    const cut = { ok: true as const, data, ...fitted };
+    expect(guardRelayResponse(cut)).toBe(cut);
+    expect(Buffer.byteLength(JSON.stringify(cut), 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+
+    // A data answer over the budget on its own is refused by the guard even with nothing attached: the fit leaves
+    // nothing to add, and the guard still measures the reply line it writes.
+    const huge = { id: 'x', blob: 'x'.repeat(200_000) };
+    expect(fitAttachedNotices(huge, three)!.notices).toHaveLength(0);
+    expect(guardRelayResponse({ ok: true as const, data: huge, notices: [] })).toMatchObject({ ok: false, code: 'response_too_large' });
+
+    // Notices that fit are dropped from the reply exactly as the measure says: the reply line the caller reads is
+    // what was measured, never a value that passed a guard on a narrower envelope.
+    for (const list of [[], [bigNotice(1)], small, three]) {
+      const line = { ok: true as const, data, notices: list };
+      expect(relayReplyBytes(line) <= RESPONSE_BUDGET_BYTES).toBe(Buffer.byteLength(JSON.stringify(line), 'utf8') <= RESPONSE_BUDGET_BYTES);
+    }
   });
 
   test('the answer is carried twice, and the budget counts both copies: the text is the answer JSON and structuredContent holds the same data (SYS01, D1)', () => {

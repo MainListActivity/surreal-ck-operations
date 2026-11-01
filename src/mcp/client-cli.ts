@@ -125,15 +125,21 @@ async function main(): Promise<void> {
       if (res) {
         try { unlinkSync(resFile); } catch { /* consumed race */ }
         if (!res.ok) fail(codeOf(res.error), res.error ?? 'comm request failed');
-        // The sidecar attaches the employee's unacked holder notices to a successful reply. Keep the plain data
-        // shape when there are none (one JSON line, unchanged), and surface them as a top-level `notices` key
-        // otherwise, so an in-lease holder sees an acceptance amendment on its next sck call.
+        // The sidecar attaches the employee's unacked holder notices to a successful reply, fitted to the reply's
+        // budget. Keep the plain data shape when there are none (one JSON line, unchanged), and surface them as a
+        // top-level `notices` key otherwise, with the cut when some did not fit the budget (those stay unacked and
+        // arrive on a later call), so an in-lease holder sees an acceptance amendment on its next sck call.
         const notices = Array.isArray(res.notices) && res.notices.length > 0 ? res.notices : undefined;
-        const answer = notices === undefined
+        // The cut is surfaced even when nothing fitted: the holder is told notices are waiting and reads them with
+        // holder_notices, instead of the reply silently looking like there was nothing to read.
+        const carried = notices === undefined && res.noticesTruncated === undefined
+          ? undefined
+          : { ...(notices === undefined ? {} : { notices }), ...(res.noticesTruncated === undefined ? {} : { noticesTruncated: res.noticesTruncated }) };
+        const answer = carried === undefined
           ? res.data ?? null
           : res.data !== null && typeof res.data === 'object' && !Array.isArray(res.data)
-            ? { ...(res.data as Record<string, unknown>), notices }
-            : { data: res.data ?? null, notices };
+            ? { ...(res.data as Record<string, unknown>), ...carried }
+            : { data: res.data ?? null, ...carried };
         writeStdout(`${JSON.stringify(answer)}\n`);
         process.exit(0);
       }

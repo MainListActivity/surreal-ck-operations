@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SidecarPool, blockerQuotaReset } from '../plugin/server/sidecar.ts';
+import { RESPONSE_BUDGET_BYTES } from '../src/response-budget.ts';
 import { commDir, reqDir, resDir, reportPath, blockerPath, readJsonFile } from '../src/comm.ts';
 import type { ActiveLease, ClaimResult, LeaseProof, TaskView } from '../src/contracts.ts';
 import type { EmployeeInst, SupervisedTask } from '../src/workforce.ts';
@@ -33,11 +34,14 @@ const refCalls: Array<{ cred: string; input: Record<string, unknown> }> = [];
 const reclaimCalls: Array<{ cred: string; input?: { dryRun?: boolean; repos?: string[] } }> = [];
 const auditCalls: Array<{ cred: string; limit?: number }> = [];
 const snap = (proof: LeaseProof): LeaseProof => ({ ...proof }); // record a copy; the pool mutates its proof between calls
+/** The echo a relayed checkpoint answers with; the budget test swaps it for an over-budget one. */
+let coreForCheckpoint: (taskId: string, expectedVersion: number) => unknown =
+  (taskId: string, expectedVersion: number) => ({ ...taskView(taskId), version: expectedVersion + 1 });
 
 const core = {
   claim: async (_cred: string, taskId: string) => claimResult(taskId),
   heartbeat: async (_c: string, proof: LeaseProof) => { calls.push({ tool: 'heartbeat', proof: snap(proof) }); return claimResult(proof.taskId); },
-  checkpoint: async (_c: string, proof: LeaseProof, ev: { text: string }) => { calls.push({ tool: 'checkpoint', proof: snap(proof), text: ev.text }); return { ...taskView(proof.taskId), version: proof.expectedVersion + 1 }; },
+  checkpoint: async (_c: string, proof: LeaseProof, ev: { text: string }) => { calls.push({ tool: 'checkpoint', proof: snap(proof), text: ev.text }); return coreForCheckpoint(proof.taskId, proof.expectedVersion); },
   submit: async (_c: string, proof: LeaseProof, ev: { text: string; acceptance?: { sha?: string; environment?: string } }) => {
     calls.push({ tool: 'submit', proof: snap(proof), text: ev.text, acceptance: ev.acceptance });
     return taskView(proof.taskId);
@@ -47,7 +51,7 @@ const core = {
     return taskView(proof.taskId);
   },
   accept: async (_c: string, proof: LeaseProof, ev: { text: string }) => { calls.push({ tool: 'accept', proof: snap(proof), text: ev.text }); return taskView(proof.taskId); },
-  returnTask: async (_c: string, proof: LeaseProof, ev: { text: string }) => { calls.push({ tool: 'return', proof: snap(proof), text: ev.text }); return taskView(proof.taskId); },
+  returnTask: async (_c: string, proof: LeaseProof, ev: { text: string }) => { calls.push({ tool: 'return', proof: snap(proof), text: ev.text }); return { ...taskView(proof.taskId), version: proof.expectedVersion + 1 }; },
   authenticate: async () => ({ employeeId: 'eng-x', role: authRole, capabilities: ['execute'] as const }),
   companyBrief: async () => ({ ok: true }),
   listTasks: async () => [],
@@ -84,10 +88,11 @@ const core = {
     return taskView(String(input.taskId));
   },
   listOutbox: async () => [],
-  dispositionNotices: async (c: string) => {
+  dispositionNotices: async (c: string, input?: { ids?: string[] }) => {
     noticeReads.push(c);
     if (noticeReadFails) throw new Error('notice store unavailable');
-    return pendingNotices;
+    // Same filter the real core applies (src/core.ts dispositionNotices): the ids narrow the holder's own list.
+    return input?.ids ? pendingNotices.filter(notice => input.ids!.includes(notice.noticeKey)) : pendingNotices;
   },
   ackDispositionNotices: async (_c: string, input: { ids: string[] }) => {
     ackedNotices.push(...input.ids);
@@ -133,7 +138,7 @@ const media = {
 const relay = async (envDir: string, key: string, name: string, tool: string, args: Record<string, unknown> | null) => {
   writeFileSync(join(reqDir(envDir), `${name}.json`), JSON.stringify({ key, tool, args }));
   await until(() => existsSync(join(resDir(envDir), `${name}.json`)));
-  return readJsonFile<{ ok: boolean; data?: unknown; error?: string; notices?: unknown[] }>(join(resDir(envDir), `${name}.json`))!;
+  return readJsonFile<{ ok: boolean; data?: unknown; error?: string; notices?: unknown[]; noticesTruncated?: { count: number; bytes: number; sha256: string } }>(join(resDir(envDir), `${name}.json`))!;
 };
 
 let runDir: string;
@@ -158,6 +163,7 @@ beforeEach(() => {
   noticeReadFails = false;
   noticeReads.length = 0;
   ackedNotices.length = 0;
+  coreForCheckpoint = (taskId: string, expectedVersion: number) => ({ ...taskView(taskId), version: expectedVersion + 1 });
   runDir = mkdtempSync(join(tmpdir(), 'sck-sidecar-'));
   pool = new SidecarPool({ core: core as never, workforce: workforce as never, ops, media, runDir, heartbeatMs: 10_000, sweepMs: 20,
     log: message => { logs.push(message); } });
@@ -257,6 +263,68 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     expect(degraded.ok).toBe(true);
     expect(degraded.notices).toBeUndefined();
     expect(logs.some(line => line.includes('attach notices e-notice failed'))).toBe(true);
+  });
+
+  // SYS-INT 复核 round-03（P1）：附带的通知必须计入同一条 48 KiB 回包预算。守卫原先只量 data，三条最大规模
+  // 通知可以带着 7 万余字节的回复穿过守卫。现在放不下的通知被截掉并如实记在 noticesTruncated 上，写回行不超预算，
+  // 被截掉的通知仍未确认，下一次调用还会来；ack 之后才不再出现。
+  test('attached notices share the reply budget: the written line stays under 48 KiB and a cut notice returns', async () => {
+    const i = inst('e-budget');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-budget'));
+    const big = '验'.repeat(4000);
+    const bigNotice = (n: number) => ({
+      noticeKey: `task-budget:acceptance_amended:audit-${n}:e-budget`, kind: 'acceptance_amended',
+      taskId: 'task-budget', ownerQuote: big, text: big, employee: 'e-budget',
+    });
+    pendingNotices = [bigNotice(1), bigNotice(2), bigNotice(3)];
+
+    // checkpoint 的 data 里有一个 200_000 字符的正文：旧代码会让守卫只看 data 并放行。
+    const oversized = () => ({ id: 'task-budget', version: 26, state: 'review', context: 'x'.repeat(200_000) });
+    coreForCheckpoint = oversized;
+    const line = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'b1', 'checkpoint', { text: '回包超预算的一次修订回显' });
+    // 守卫仍然拦得住，且拒绝码可恢复。
+    expect(line.ok).toBe(false);
+    expect(line.error).toContain('response_too_large');
+    const written = Buffer.byteLength(JSON.stringify(line), 'utf8');
+    expect(written).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+
+    // data 本身在预算内时，通知按剩余空间截取：写回行不超预算，未确认的通知不会丢。
+    coreForCheckpoint = () => ({ id: 'task-budget', version: 26, state: 'review' });
+    const fitted = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'b2', 'checkpoint', { text: '带三条大通知的回显' });
+    expect(fitted.ok).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(fitted), 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    const attached = (fitted.notices ?? []) as Array<{ noticeKey: string }>;
+    expect(attached.length).toBeGreaterThan(0);
+    expect(attached.length).toBeLessThan(3);
+    expect(fitted.noticesTruncated).toMatchObject({ count: 3 });
+    // 被截掉的正是放不进剩余预算的那一条（这里第三条 24 KB 的正文放不下），且它仍未确认、没有被丢。
+    expect(new Set(attached.map(n => n.noticeKey))).toEqual(new Set([bigNotice(1).noticeKey, bigNotice(2).noticeKey]));
+
+    // 未确认的通知还在：放不下第三条时它留在原地，data 再小也不会凭空补齐（两条大通知仍占满预算），
+    // 但它始终未被确认，可以用 holder_notices 读全、ack 后消失。
+    coreForCheckpoint = () => ({ id: 'task-budget', state: 'review' });
+    const next = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'b3', 'checkpoint', { text: '继续读剩余通知' });
+    expect(next.ok).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(next), 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    expect(new Set(((next.notices ?? []) as Array<{ noticeKey: string }>).map(n => n.noticeKey)))
+      .toEqual(new Set([bigNotice(1).noticeKey, bigNotice(2).noticeKey]));
+    expect(next.noticesTruncated).toMatchObject({ count: 3 });
+
+    // 第三条照旧可读：holder_notices 自己读全量，但它的回显同样受同一预算约束，所以用缩小的 ids 逐条读；
+    // 被截掉的那条不会因此丢失，ack 之后才彻底消失。
+    const readThird = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'b3c', 'holder_notices', { ids: [bigNotice(3).noticeKey] });
+    expect(readThird.ok).toBe(true);
+    expect(new Set(((readThird.data as { notices: Array<{ noticeKey: string }> }).notices).map(n => n.noticeKey)))
+      .toEqual(new Set([bigNotice(3).noticeKey]));
+
+    // ack 之后这些通知彻底不再出现。
+    await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'b4', 'holder_notices',
+      { ids: [bigNotice(1).noticeKey, bigNotice(2).noticeKey, bigNotice(3).noticeKey], ack: true });
+    pendingNotices = [];
+    const cleared = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'b5', 'checkpoint', { text: '回执之后' });
+    expect(cleared.ok).toBe(true);
+    expect(cleared.notices).toBeUndefined();
   });
 
   test('QA reads carry the actual running release, and never a fabricated one', async () => {

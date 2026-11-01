@@ -18,7 +18,7 @@ import {
 import { serviceHome } from "./env";
 import type { ActiveLease, ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, WorktreeAssignment, WriteScopeHolder } from "./vendor/src/contracts.ts";
 import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workforce.ts";
-import { guardRelayResponse } from "./vendor/src/response-budget.ts";
+import { fitAttachedNotices, guardRelayResponse, type NoticeCut } from "./vendor/src/response-budget.ts";
 import { isPaged, parseReclaimInput, parseWorktreeInput, taskIdOf } from "./vendor/src/query-input.ts";
 import { arriving, SNAPSHOT_TOOLS, withinReplyCeiling } from "./vendor/src/reply-clock.ts";
 
@@ -102,6 +102,10 @@ const RETIRED_TOOLS = new Set(["get_secret", "put_secret"]);
 /** How many unacked holder notices ride along with a successful reply. A notice text is bounded by the amend
  *  input (two 4000-char fields), so this keeps the added context small while still surfacing a backlog. */
 const ATTACHED_NOTICE_LIMIT = 3;
+
+/** What a successful reply carries besides its data: the unacked holder notices that fit its budget, and the cut when
+ *  some did not (the cut notices stay unacked and are attached again on the next call). */
+export interface AttachedNotices { notices?: unknown[]; noticesTruncated?: NoticeCut }
 
 const hash = (text: string | undefined) => (text === undefined ? undefined : createHash("sha256").update(text).digest("hex"));
 
@@ -351,16 +355,20 @@ export class SidecarPool {
 
   /** Unacked holder notices ride along with a successful reply, so an in-lease holder sees an acceptance amendment
    *  on its very next sck call (the dispatcher only redelivers to idle sessions, and a holder never has to poll
-   *  holder_notices). Best effort: a failed notice read must never fail the tool call it is attached to. */
-  private async attachNotices(instId: string): Promise<unknown[] | undefined> {
+   *  holder_notices). The attached notices share the reply's budget: a notice that does not fit is left for the next
+   *  call (it stays unacked), and the reply records the cut. Best effort: a failed notice read must never fail the
+   *  tool call it is attached to, and a data answer over the budget on its own is left to the guard to refuse. */
+  private async attachNotices(instId: string, data: unknown): Promise<AttachedNotices> {
     const read = this.deps.core.dispositionNotices?.bind(this.deps.core);
-    if (!read) return undefined;
+    if (!read) return {};
     try {
       const pending = await read(await this.credentialFor(instId));
-      return pending.length ? pending.slice(0, ATTACHED_NOTICE_LIMIT) : undefined;
+      if (!pending.length) return {};
+      const fitted = fitAttachedNotices(data, pending.slice(0, ATTACHED_NOTICE_LIMIT));
+      return fitted ?? { notices: pending.slice(0, ATTACHED_NOTICE_LIMIT) };
     } catch (error) {
       this.log(`attach notices ${instId} failed: ${(error as Error).message}`);
-      return undefined;
+      return {};
     }
   }
 
@@ -1390,10 +1398,11 @@ export class SidecarPool {
             .catch((error: Error & { code?: string }) => ({ ok: false as const, error: `${error.code ?? "error"}: ${error.message}` }));
     // Last-line budget check: an over-budget success becomes a recoverable, JSON-legal error (SYS01).
     // A successful call also carries the employee's unacked holder notices (holder_notices and the tool listing
-    // already answer with notices / no employee state, so they are skipped). An in-lease holder sees an acceptance
-    // amendment here without being interrupted, and an acked notice is gone from the next reply.
+    // already answer with notices / no employee state, so they are skipped). The notices are fitted to the reply's
+    // remaining budget first: an in-lease holder sees an acceptance amendment here without being interrupted, an
+    // acked notice is gone from the next reply, and a notice that did not fit is attached again on the next call.
     const answer: CommResponse = res.ok && req && req.tool !== "holder_notices" && req.tool !== "__list__"
-      ? { ...res, notices: await this.attachNotices(instId) }
+      ? { ...res, ...(await this.attachNotices(instId, (res as { data?: unknown }).data)) }
       : res;
     writeFileAtomic(join(resDir(dir), file), JSON.stringify(guardRelayResponse(answer)));
   }
