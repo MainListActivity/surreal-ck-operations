@@ -1,15 +1,15 @@
 {
-  "version": "0.3.68",
-  "title": "quick 链合并腿共用 code 车道",
+  "version": "0.3.70",
+  "title": "quick 公司系统目标的代码腿建单即绑定运营仓",
   "changes": [
-    "quick 目标的「实现与上线申请」合并腿与「合入部署与生产实测」部署腿建单时写入同一个 code 车道，工程员工可在该车道 commit 与 push。",
-    "triage 建单路径写入 work_intent；triage_goal、CLI/MCP 建目标与 Jev 分级一致覆盖。",
-    "提交前系统检查扩到 kind=release 且 intent=code 的合并腿；只收紧，read 意图的上线申请腿与其他任务行为不变。"
+    "公司系统目标（无项目）的 quick 链在 triage 建单时，「实现与上线申请」与「合入部署与生产实测」两条代码腿写入 code_repo_path=运营仓；公司升级卡的上线校验不再因仓库为空被拒。owner CLI 分阶段拆出的下一阶段目标同样绑定。",
+    "判定只看目标有没有挂项目：无项目即公司系统目标，有项目的目标建单行为不变。运营仓由各入口按 SCK_AGENT_CWD 显式传入（MCP 与插件的核心服务、调度器、owner CLI），绑定只用传入的仓，不从目标内容推断。",
+    "standard 与 program 的建单行为不变；quick 的运营验收腿不绑定仓。"
   ],
   "impact": [
-    "只影响新建的 quick 目标；标准 create_delivery 链、standard 与 program 计划的行为不变。存量在途的 quick 合并腿不做数据迁移，已建任务的 work_intent 保持原样。",
-    "quick 合并腿带 code 车道后，提交时执行系统检查；检查失败拒绝提交并写 submit_check_failed 审计。"
+    "只影响之后新建的 quick 公司系统目标。已在途的 quick 腿（如 ed07e3ea）不回填，仍可用 bind_task_code_repo 手动绑定。",
+    "派工路由与工作区分配的结果不变：原先无绑定时即回落到运营仓，现在显式写明。"
   ],
-  "migration": "无：本版本不新增 schema、不改写数据；存量在途 quick 合并腿不迁移",
-  "rollback": "切回上一固定版本 0.3.67（releases/fca1b6a）；回退后新建 quick 链回到合并腿 read 的旧行为，已建任务无需数据回滚"
+  "migration": "无：本版本不新增 schema、不改写数据；code_repo_path 字段早已存在",
+  "rollback": "切回上一固定版本 0.3.68（releases/1d69642）；回退后新建的 quick 公司系统目标回到不绑定仓的旧行为，已建任务无需数据回滚"
 }
