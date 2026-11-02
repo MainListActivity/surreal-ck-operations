@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer as createHttpsServer } from 'node:https';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { egoBrowserInjector, oidcUserEntry } from '../src/ops/browser.ts';
 import { controlPlaneEnv, parseBrokerConfig } from '../src/ops/config.ts';
 import { cloudflareD1 } from '../src/ops/d1.ts';
-import type { Fetcher } from '../src/ops/fetcher.ts';
+import { createOpsFetcher, opsConnectOptions, OPS_CONNECT_TIMEOUT_MS, type Fetcher } from '../src/ops/fetcher.ts';
 import { LoginError, jwtExpiry, passwordLogin } from '../src/ops/idp.ts';
 import { generatePassword, hashPassword, verifyPassword } from '../src/ops/password.ts';
 import { ProductUnreachable, assertProductPath, productRequest, productTimeoutMs } from '../src/ops/product.ts';
@@ -17,6 +18,106 @@ const failure = async (promise: Promise<unknown>) => {
   try { await promise; } catch (error) { return error as Error & { code?: string; reason?: string }; }
   throw new Error('expected failure');
 };
+
+describe('ops transport connect options', () => {
+  /** undici stores the Agent constructor options behind this well-known symbol. */
+  const agentOptions = (agent: object): { connect: { timeout: number; ca?: string; family?: 4 | 6 } } => {
+    const key = Object.getOwnPropertySymbols(agent).find(symbol => String(symbol) === 'Symbol(options)');
+    if (!key) throw new Error('undici Agent is missing Symbol(options)');
+    return (agent as Record<symbol, { connect: { timeout: number; ca?: string; family?: 4 | 6 } }>)[key];
+  };
+
+  const { Agent } = require('undici/index.js') as {
+    Agent: new (options: { connect: object }) => { close(): Promise<void> };
+  };
+
+  test('defaults to IPv4 and keeps the standing timeout and ca for every Agent built from the shared connect', async () => {
+    const ca = '-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n';
+    expect(opsConnectOptions()).toEqual({ timeout: OPS_CONNECT_TIMEOUT_MS, family: 4 });
+    expect(opsConnectOptions({ connectTimeoutMs: 12_345, ca })).toEqual({ timeout: 12_345, family: 4, ca });
+    // createOpsFetcher hands the same connect object to the standing pool and to every freshConnection Agent.
+    const standing = new Agent({ connect: opsConnectOptions({ connectTimeoutMs: 12_345, ca }) });
+    const fresh = new Agent({ connect: opsConnectOptions({ connectTimeoutMs: 12_345, ca }) });
+    expect(agentOptions(standing).connect).toEqual({ timeout: 12_345, family: 4, ca });
+    expect(agentOptions(fresh).connect).toEqual({ timeout: 12_345, family: 4, ca });
+    await standing.close();
+    await fresh.close();
+    const fetcher = createOpsFetcher({ connectTimeoutMs: 12_345, ca });
+    try {
+      expect(typeof fetcher.freshConnection()).toBe('function');
+    } finally {
+      await fetcher.close();
+    }
+  });
+
+  test('an explicit family 6 is passed through on both pools without changing timeout or ca', async () => {
+    const ca = '-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n';
+    expect(opsConnectOptions({ family: 6, connectTimeoutMs: 9_000, ca })).toEqual({ timeout: 9_000, family: 6, ca });
+    const standing = new Agent({ connect: opsConnectOptions({ family: 6, connectTimeoutMs: 9_000, ca }) });
+    const fresh = new Agent({ connect: opsConnectOptions({ family: 6, connectTimeoutMs: 9_000, ca }) });
+    expect(agentOptions(standing).connect).toEqual({ timeout: 9_000, family: 6, ca });
+    expect(agentOptions(fresh).connect).toEqual({ timeout: 9_000, family: 6, ca });
+    await standing.close();
+    await fresh.close();
+    const fetcher = createOpsFetcher({ family: 6, connectTimeoutMs: 9_000, ca });
+    try {
+      expect(typeof fetcher.freshConnection()).toBe('function');
+    } finally {
+      await fetcher.close();
+    }
+  });
+
+  test('family 4 reaches a dual-stack listener over IPv4; family 6 reaches it over IPv6', async () => {
+    // makeTestPki's leaf only covers 127.0.0.1; mint a dual-stack pair so family 6 can finish TLS on ::1.
+    const dir = mkdtempSync(join(tmpdir(), 'sck-ops-fam-'));
+    const { execFileSync } = await import('node:child_process');
+    const openssl = (args: string[]) => execFileSync('openssl', args, { cwd: dir, stdio: 'pipe' });
+    openssl(['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes',
+      '-keyout', 'ca.key', '-out', 'ca.pem', '-days', '1', '-subj', '/CN=sck-ops-fam-ca',
+      '-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign,cRLSign']);
+    openssl(['req', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes',
+      '-keyout', 'leaf.key', '-out', 'leaf.csr', '-subj', '/CN=localhost']);
+    writeFileSync(join(dir, 'leaf.ext'),
+      'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n');
+    openssl(['x509', '-req', '-in', 'leaf.csr', '-CA', 'ca.pem', '-CAkey', 'ca.key', '-CAcreateserial',
+      '-out', 'leaf.pem', '-days', '1', '-extfile', 'leaf.ext']);
+    const ca = readFileSync(join(dir, 'ca.pem'), 'utf8');
+    const cert = readFileSync(join(dir, 'leaf.pem'), 'utf8');
+    const key = readFileSync(join(dir, 'leaf.key'), 'utf8');
+    rmSync(dir, { recursive: true, force: true });
+
+    const seen: string[] = [];
+    const server = createHttpsServer({ cert, key }, (req, res) => {
+      seen.push(req.socket.remoteAddress ?? '');
+      res.end('ok');
+    });
+    await new Promise<void>(resolve => server.listen(0, '::', () => resolve()));
+    const port = (server.address() as { port: number }).port;
+
+    const hit = async (family: 4 | 6, via: 'standing' | 'fresh') => {
+      const transport = createOpsFetcher({ family, ca, connectTimeoutMs: 5_000 });
+      try {
+        const fetch = via === 'fresh' ? transport.freshConnection() : transport;
+        const response = await fetch(`https://localhost:${port}/`);
+        expect(response.status).toBe(200);
+        await response.text();
+      } finally {
+        await transport.close();
+      }
+    };
+
+    await hit(4, 'standing');
+    expect(seen.at(-1)).toMatch(/127\.0\.0\.1/);
+    await hit(4, 'fresh');
+    expect(seen.at(-1)).toMatch(/127\.0\.0\.1/);
+    await hit(6, 'standing');
+    expect(seen.at(-1)).toBe('::1');
+    await hit(6, 'fresh');
+    expect(seen.at(-1)).toBe('::1');
+
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  });
+});
 
 describe('password hashes', () => {
   /** The IdP's own verifier (ma_hono src/domain/users/passwords.ts), WebCrypto based. */
