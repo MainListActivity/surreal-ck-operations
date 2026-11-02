@@ -34,8 +34,10 @@ export interface LoginTokens {
   accessToken: string;
   /** Epoch milliseconds. */
   expiresAt: number;
-  /** How many full authorize→exchange flows ran (transient failures burn one each). */
+  /** How many full authorize→exchange flows ran (transient failures burn one each; a middle attempt that would only get the floor budget is skipped and does not count). */
   attempts: number;
+  /** Monotone wall time of the whole flow, call start to tokens (a clock difference, never a trace sum). */
+  elapsedMs: number;
   /**
    * Sanitized per-hop trace (`a<attempt>:<phase>@<host>:<HTTP status|errno> <ms>`), bounded
    * to the tail of the flow. Hosts and outcomes only — never paths, challenges or tokens —
@@ -61,6 +63,13 @@ export interface LoginOptions {
   /** Time that must remain before a second attempt starts; tests shrink it with the budget. */
   retryMinLeftMs?: number;
   channel?: LoginChannel;
+  /**
+   * Monotone millisecond clock for the flow's own accounting: budget left, attempt deadlines and the
+   * trace wall times. Production leaves it unset (performance.now(), monotone, immune to a wall-clock
+   * step); tests inject a deterministic clock to replay recorded traces without real sockets or real
+   * timers. It is never the epoch clock — token expiry uses `now`.
+   */
+  clock?: () => number;
 }
 
 const MAX_HOPS = 8;
@@ -122,6 +131,8 @@ interface Io {
   step: () => { signal: AbortSignal; ms: number };
   /** Milliseconds left of the whole-login budget, for the retry decision. */
   left: () => number;
+  /** The flow's monotone clock (see LoginOptions.clock); the trace wall times are its differences. */
+  clock: () => number;
   /** 1-based attempt currently in flight, stamped onto each trace row. */
   attempt: number;
   /** Sanitized hop records: phase, origin host, HTTP status or safe errno, wall time. */
@@ -197,7 +208,7 @@ async function request(what: string, io: Io, url: string, init: RequestInit, par
   idempotent = false): Promise<{ response: Response; body?: unknown }> {
   for (let hopAttempt = 1; ; hopAttempt++) {
     const { signal, ms } = io.step();
-    const started = Date.now();
+    const started = io.clock();
     let host = 'unknown';
     try { host = new URL(url).host; } catch { /* unreachable host is still recorded */ }
     try {
@@ -208,11 +219,11 @@ async function request(what: string, io: Io, url: string, init: RequestInit, par
       const body = parseBody
         ? await response.json().catch((error: Error) => { if (error.name === 'TimeoutError') throw error; return undefined; })
         : undefined;
-      io.trace.push({ attempt: io.attempt, phase: phase ?? what, host, ms: Date.now() - started, result: `HTTP ${response.status}` });
+      io.trace.push({ attempt: io.attempt, phase: phase ?? what, host, ms: io.clock() - started, result: `HTTP ${response.status}` });
       return { response, body };
     } catch (error) {
       const { detail } = describeTransportFailure(error, ms);
-      io.trace.push({ attempt: io.attempt, phase: phase ?? what, host, ms: Date.now() - started, result: detail });
+      io.trace.push({ attempt: io.attempt, phase: phase ?? what, host, ms: io.clock() - started, result: detail });
       // An untrusted certificate fails the same way on every attempt, so it is final and never retried.
       if (isTlsTrustFailure(error)) {
         const facts = factsOf(phase ?? what, error);
@@ -367,15 +378,16 @@ export async function passwordLogin(
   config: BrokerConfig, username: string, password: string, options: LoginOptions = {},
 ): Promise<LoginTokens> {
   const channel = channelFor(config, options.channel);
-  const started = Date.now();
+  const clock = options.clock ?? (() => performance.now());
+  const started = clock();
   const budgetMs = options.budgetMs ?? BUDGET_MS;
   const stepMs = options.stepTimeoutMs ?? STEP_TIMEOUT_MS;
   const retryMinLeftMs = options.retryMinLeftMs ?? RETRY_MIN_LEFT_MS;
-  const left = () => budgetMs - (Date.now() - started);
+  const left = () => budgetMs - (clock() - started);
   // Each attempt but the last gets a deadline that leaves one whole-flow envelope for the attempt after it: a connect
   // stall on its last hop then ends that attempt early instead of spending the budget the next fresh flow needs.
   let attemptDeadline = started + budgetMs;
-  const attemptLeft = () => attemptDeadline - Date.now();
+  const attemptLeft = () => attemptDeadline - clock();
   const io: Io = {
     fetcher: options.fetch ?? opsFetch,
     step: () => {
@@ -383,6 +395,7 @@ export async function passwordLogin(
       return { signal: AbortSignal.timeout(ms), ms };
     },
     left,
+    clock,
     attempt: 0,
     trace: [],
     // A same-hop retry only runs while the login still has room for a full connect window AND for a fresh flow
@@ -408,22 +421,40 @@ export async function passwordLogin(
     return new LoginFailure(
       `${failure.message}${suffix}${trace ? `; trace: ${trace}` : ''}${stage ? `; stage=${stage}` : ''}; runtime ${runtimeVersion()}`, failure.facts, true);
   };
-  for (let attempt = 1; ; attempt++) {
-    io.attempt = attempt;
+  // `cycle` counts loop turns including skipped attempts; `flows` counts the authorize→exchange flows that
+  // actually ran — that is what the trace rows, the `attempts` count and the give-up message report.
+  let cycle = 0;
+  let flows = 0;
+  for (;;) {
+    cycle++;
+    // A middle attempt whose own budget cannot fund even one full step (the step limit is the per-request cap)
+    // is skipped, not run: it would be cut at the MIN_STEP floor (2s in production), a budget at which both observed
+    // production failures died — burning a single-use login challenge and the ~2s, and moving the last attempt
+    // against the 30s retry gate. Skipping it keeps the floor-budget flow's whole remainder for the last attempt.
+    // The step limit is only the skip threshold's yardstick (a budget below one step cannot carry a flow), not a
+    // measured healthy-flow minimum, and the skip promises nothing about the last attempt's outcome. The retry gate
+    // itself is untouched: a failure still needs `left >= retryMinLeftMs` to earn another attempt, so a remainder
+    // under the gate gives up instead of slipping into the last attempt.
+    while (cycle < MAX_ATTEMPTS && left() - retryMinLeftMs - RETRY_SLACK_MS < stepMs) cycle++;
+    const isLast = cycle >= MAX_ATTEMPTS;
+    flows++;
+    io.attempt = flows;
     // The last attempt runs on the whole remaining budget; every earlier one is capped at (left - one full envelope -
     // slack), so a connect stall on its last hop ends it with the retry's budget intact. That cap is the fix: the
     // observed fatality was the one remaining attempt stalling on its final hop with nothing left to run a fresh flow.
-    attemptDeadline = attempt < MAX_ATTEMPTS ? Date.now() + Math.max(left() - retryMinLeftMs - RETRY_SLACK_MS, MIN_STEP_MS) : started + budgetMs;
+    attemptDeadline = isLast ? started + budgetMs : clock() + Math.max(left() - retryMinLeftMs - RETRY_SLACK_MS, MIN_STEP_MS);
     try {
-      return await signIn(config, username, password, channel, io, options.now ?? Date.now);
+      const tokens = await signIn(config, username, password, channel, io, options.now ?? Date.now);
+      // The flow's own wall time, from the call's start to the tokens: a clock difference, not a trace sum.
+      return { ...tokens, elapsedMs: Math.round(clock() - started) };
     } catch (error) {
       if (!(error instanceof Unavailable)) throw error;
-      if (attempt >= MAX_ATTEMPTS || left() < retryMinLeftMs) throw giveUp(error, attempt);
+      if (isLast || left() < retryMinLeftMs) throw giveUp(error, flows);
     }
   }
 }
 
-async function signIn(config: BrokerConfig, username: string, password: string, channel: Channel, io: Io, now: () => number): Promise<LoginTokens> {
+async function signIn(config: BrokerConfig, username: string, password: string, channel: Channel, io: Io, now: () => number): Promise<Omit<LoginTokens, 'elapsedMs'>> {
   const verifier = randomBytes(32).toString('base64url');
   const state = randomBytes(12).toString('base64url');
   const authorize = new URL(`${config.idp.issuer}/authorize`);
