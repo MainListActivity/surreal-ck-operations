@@ -1,19 +1,14 @@
 {
-  "version": "0.3.73",
-  "title": "FV06 运营登录：跳过地板预算中间尝试，故障台账记录真实耗时",
+  "version": "0.3.74",
+  "title": "FV06 登录预算回归用例接入 CI 具名清单（test:bridge）",
   "changes": [
-    "passwordLogin 重试循环：中间尝试的信封（left − 30s 闸门 − 1s 松弛）低于单步上限 25s 时跳过，末次尝试按全剩余预算运行——两次生产失败里「2s 地板中间尝试烧掉单用 challenge 并把末次推向闸门」的形态不再出现。",
-    "总预算 75s、实际尝试 ≤3、单步 25s、建连 20s、30s 重试准入与非重试 LoginError 边界全部不变；跳过不产生新准入，剩余不足 30s 照旧放弃；健康首试与早失败路径不触发跳过。",
-    "attempts 计数改为实际执行的流数：被跳过的尝试不占 trace 行号、不消耗 login_challenge、不计入 gave up after N。",
-    "故障台账 ops_fault.elapsedMs 写入调用自身的单调钟差（起点→失败终点），覆盖早期失败与预算耗尽路径，不再恒为 0；不使用 trace 求和。LoginTokens 增 elapsedMs，LoginOptions 增可注入单调钟。",
-    "新增 tests/ops-login-budget.test.ts（13 用例，确定性时钟/传输桩）：两条记录失败复算、阈值两侧、剩余 30s 上下、闸门与 consent 不重试、健康首试、总预算与尝试计数、成功与失败 elapsedMs、消息脱敏。"
+    "tests/ops-login-budget.test.ts（13 用例：两条生产失败 trace 的确定性复算与全部边界）登记进 package.json 的 test:bridge，紧随 ops-login-transport 同一入口；quality-gate 的 pnpm test:bridge 由此真实运行该回归。",
+    "版本 0.3.73 → 0.3.74 三处同步（package.json / plugin/package.json / company-release.json）。"
   ],
   "impact": [
-    "ops_login / ops_operator_login 的重试行为：低预算中间尝试不再消耗 challenge 与时间，末次尝试保留完整剩余预算；不保证末次完成或成功，30s 重试闸门语义不变。",
-    "台账可区分慢与断：elapsedMs 为真实调用耗时（0.3.72 及以前恒为 0）。",
-    "不扩预算、不额外挑战、不隐式外层重试；不改变 IPv4 建连（0.3.72 的 family=4 保持）。",
-    "插件面需按固定 release 同步 vendor 后才生效；只合入源码不算部署完成。"
+    "CI（quality-gate）每次 pull_request/push 都运行登录预算回归与相邻登录传输回归，防止清单与文件再次漂移。",
+    "不改 idp 算法、预算、工具权限或产品配置；测试为纯桩（确定性时钟/传输），不联网、无凭据。"
   ],
   "migration": "无数据迁移，不改写任何已有数据；无新环境变量或主机准备。",
-  "rollback": "切回升级前的现役固定版本，即 0.3.72（releases/4d3328f 合并线上的 a2c355f31114fd074dfde84c8683f487064631b2），以老板升级前实际线上版本为准，由当前受审 release 的 installer 执行（见 docs/company-service-operations.md §5）。回滚后恢复旧的中间尝试行为（2s 地板）与恒 0 的台账耗时。"
+  "rollback": "切回升级前的现役固定版本，即 0.3.73（releases/28d71d6 合并线上的 985d6b8877c184869254da6a0589ddbd3ad91d21），以老板升级前实际线上版本为准，由当前受审 release 的 installer 执行（见 docs/company-service-operations.md §5）。回滚后 CI 清单不再包含登录预算回归（文件仍在仓库，可手工运行）。"
 }
