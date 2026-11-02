@@ -2,7 +2,9 @@
  * into every program, where their globals clash with the plugin's lib set. The subpath keeps Bun on the real
  * package; the bare 'undici' name resolves to Bun's built-in shim, whose Agent has no close() and ignores connect options. */
 interface UndiciModule {
-  Agent: new (options: { connect: { timeout: number; ca?: string } }) => { close(): Promise<void> };
+  Agent: new (options: { connect: { timeout: number; ca?: string; family?: 4 | 6 } }) => {
+    close(): Promise<void>;
+  };
   fetch(input: string | URL | Request, init?: RequestInit & { dispatcher?: unknown }): Promise<Response>;
 }
 const { Agent, fetch: undiciFetch } = require('undici/index.js') as UndiciModule;
@@ -57,16 +59,31 @@ export interface OpsFetchOptions {
   connectTimeoutMs?: number;
   /** Extra trust anchors (PEM). Tests only: production uses the system store and verification stays on. */
   ca?: string;
+  /**
+   * Address family for every connection this fetcher opens. Defaults to 4: the production IdP path has been observed
+   * to time out on the real AAAA route while the A route answers, and undici otherwise prefers IPv6 when both exist.
+   * Pass 6 only for controlled probes; never as a host-wide network change.
+   */
+  family?: 4 | 6;
+}
+
+/** Connect options shared by the standing pool and every `freshConnection()` agent. */
+export function opsConnectOptions(options: OpsFetchOptions = {}): { timeout: number; ca?: string; family: 4 | 6 } {
+  return {
+    timeout: options.connectTimeoutMs ?? OPS_CONNECT_TIMEOUT_MS,
+    family: options.family ?? 4,
+    ...(options.ca ? { ca: options.ca } : {}),
+  };
 }
 
 /** A Fetcher on a private undici dispatcher. `close` releases that dispatcher's sockets. */
 export function createOpsFetcher(options: OpsFetchOptions = {}): ConnectAwareFetcher & { close(): Promise<void> } {
-  const connect = { timeout: options.connectTimeoutMs ?? OPS_CONNECT_TIMEOUT_MS, ...(options.ca ? { ca: options.ca } : {}) };
+  const connect = opsConnectOptions(options);
   const make = () => new Agent({ connect });
   const dispatcher = make();
   // Every `freshConnection()` gets its own dispatcher (and therefore its own connection pool), so a retry really
   // opens a new connection instead of being handed the socket that just failed. All of them share the same connect
-  // limit and trust anchors.
+  // limit, address family and trust anchors.
   const fresh = new Set<ReturnType<typeof make>>();
   const fetcher = (input: string | URL | Request, init?: RequestInit) => undiciFetch(input, { ...init, dispatcher });
   const freshConnection = (): Fetcher => {
