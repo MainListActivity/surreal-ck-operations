@@ -88,6 +88,8 @@ export interface OpsDeps {
   controlEnv?: () => ControlPlaneEnv;
   fetch?: Fetcher;
   now?: () => number;
+  /** Monotone clock for the fault ledger's elapsedMs; tests advance their fake clock instead of real time. */
+  monoNow?: () => number;
   /** Test seam: defaults to real timers; tests advance the fake clock instead of waiting. */
   sleep?: (ms: number) => Promise<void>;
   log?: (message: string) => void;
@@ -325,6 +327,8 @@ export class OpsBroker {
   readonly tools: readonly string[] = OPS_TOOLS;
   private readonly sessions: SessionStore;
   private readonly now: () => number;
+  /** Monotone clock for the fault ledger's elapsedMs (a wall-clock step cannot shrink a measured failure). */
+  private readonly monoNow: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly handlers: Record<OpsTool, Handler>;
   private readonly proofBridge?: InternalAiProofBridge;
@@ -339,6 +343,7 @@ export class OpsBroker {
 
   constructor(private readonly deps: OpsDeps) {
     this.now = deps.now ?? Date.now;
+    this.monoNow = deps.monoNow ?? (() => performance.now());
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.sessions = new SessionStore(this.now);
     if (deps.proofStore) this.proofBridge = new InternalAiProofBridge({
@@ -410,6 +415,9 @@ export class OpsBroker {
     const scope = await this.deps.core.opsScope(credential, taskId);
     this.lastScope.set(scope.actor.employeeId, scope);
     const ctx = await this.context(scope, args.env);
+    // The fault ledger's elapsedMs is the call's own monotone wall time, from here to the failure —
+    // early failures and budget-exhausted logins included, never a trace sum (the trace caps its tail).
+    const startedMs = this.monoNow();
     try {
       // SYS06 AC02 ③：范围内生效的 tool_scope 决定这次调用能不能过。判定在 core（与任务侧同一份 policy.ts），
       // 这里只把工具名与别名递进去；提示词、任务描述写什么都不改变这条结论。
@@ -429,7 +437,7 @@ export class OpsBroker {
       await this.settleAttempt(ctx);
       return value;
     } catch (error) {
-      throw await this.failed(ctx, tool, error, args);
+      throw await this.failed(ctx, tool, error, args, Math.max(0, Math.round(this.monoNow() - startedMs)));
     }
   }
 
@@ -554,7 +562,7 @@ export class OpsBroker {
    * retryable (a 403, a rejected password, a revoked permission, an invalid input) stops the recovery at once and
    * says what to fix; it is never retried for the employee.
    */
-  private async failed(ctx: Ctx, tool: string, error: unknown, args: Args = {}): Promise<CompanyError> {
+  private async failed(ctx: Ctx, tool: string, error: unknown, args: Args = {}, elapsedMs?: number): Promise<CompanyError> {
     const known = this.sessions.secrets(ctx.scope.actor.employeeId);
     const base = error instanceof CompanyError ? error
       : new CompanyError('upstream_error', `${(error as Error)?.name ?? 'Error'}: ${String((error as Error)?.message ?? error).slice(0, 200)}`);
@@ -570,7 +578,7 @@ export class OpsBroker {
     const facts = faultFactsOf(error);
     const upstream = safe.code === 'upstream_error' || safe.code === 'login_failed' || facts.status !== undefined;
     if (upstream) {
-      const charged = await this.chargeFault(ctx, tool, error, safe, args, facts).catch(() => undefined);
+      const charged = await this.chargeFault(ctx, tool, error, safe, args, facts, elapsedMs).catch(() => undefined);
       if (charged) return charged;
     }
     return safe;
@@ -624,7 +632,7 @@ export class OpsBroker {
    * caller as an error that says why the retry is not allowed, so the employee reads the reason instead of looping.
    */
   private async chargeFault(ctx: Ctx, tool: string, error: unknown, safe: CompanyError, args: Args,
-    facts: ReturnType<typeof faultFactsOf> = faultFactsOf(error)): Promise<CompanyError | undefined> {
+    facts: ReturnType<typeof faultFactsOf> = faultFactsOf(error), elapsedMs?: number): Promise<CompanyError | undefined> {
     const report = await this.deps.core.reportFault?.(ctx.scope, {
       tool,
       phase: opsPhaseOf(tool),
@@ -635,6 +643,9 @@ export class OpsBroker {
       alias: typeof args.alias === 'string' ? args.alias : undefined,
       target: opsTargetOf(tool, args),
       environment: ctx.env,
+      // The call's own monotone wall time (call start to this failure): what the ledger records instead of
+      // the constant 0, so slow and broken are distinguishable without summing the trace.
+      ...(elapsedMs === undefined ? {} : { elapsedMs }),
       // A write whose outcome is unknown is never replayed blindly.
       idempotent: opsIdempotentOf(tool, args),
       ...(ctx.fault?.charged === true ? { attempt: ctx.fault.attempt } : {}),
