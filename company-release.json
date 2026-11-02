@@ -1,5 +1,5 @@
 {
-  "version": "0.3.72",
+  "version": "0.3.73",
   "title": "运营客户端默认走 IPv4 建连，缓解 IdP AAAA 路径超时",
   "changes": [
     "ops 私有 undici dispatcher 的 connect 默认 family=4；OpsFetchOptions 增加严格类型 family?:4|6，显式 6 仅供受控探测。",
