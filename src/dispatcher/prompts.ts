@@ -58,6 +58,33 @@ checkpoint/report_blocker/review 的租约证明由通道自动补齐，只需�
 ${channel}`;
 }
 
+/**
+ * FV06 recovery read grant wake. The payload is exactly the grant identity: no credential, no task override,
+ * no token. The channel holds the grant binding; the employee can only run one login, the four fixed GETs in
+ * order and a necessary logout. The source task stays done — this is evidence collection, not execution.
+ */
+export function recoveryWake(inst: EmployeeInst, grant: { id: string; taskId: string; paths: string[]; expiresAt: string },
+  env: PromptEnv, firstContact: boolean, ctx?: PromptCtx): string {
+  const payload = JSON.stringify({ grantId: grant.id, sourceTaskId: grant.taskId, paths: grant.paths, expiresAt: grant.expiresAt });
+  const comm = ctx?.comm ? `\n证据写到通道登记的 evidenceDir（见 claim.json 的 recovery/evidenceDir 段）；不要写 report.md，也不要 submit——源任务已 done，本授权只采证。` : '';
+  const body = `【恢复取证授权】源任务 ${grant.taskId} 已终态，经理签发了一次性的恢复读取授权（grant ${grant.id}，截止 ${grant.expiresAt}）。
+授权载荷：${payload}
+
+只做这件事，按固定顺序：
+1. 登录一次：'${env.sckBin}' call ops_operator_login '{"alias":"LCA04_OPS"}'。失败就停，不再试。
+2. 用上一步返回的 session 依次发四次 GET（每次一条，路径固定，不要跳过、不要重复、不要换顺序）：
+   '${env.sckBin}' call ops_request '{"session":"<session>","method":"GET","path":"${grant.paths[0] ?? ''}"}'
+   '${env.sckBin}' call ops_request '{"session":"<session>","method":"GET","path":"${grant.paths[1] ?? ''}"}'
+   '${env.sckBin}' call ops_request '{"session":"<session>","method":"GET","path":"${grant.paths[2] ?? ''}"}'
+   '${env.sckBin}' call ops_request '{"session":"<session>","method":"GET","path":"${grant.paths[3] ?? ''}"}'
+3. 任一项返回非预期结果（第 1 项应为 503 + endpoint-probe-temporary-grant-not-configured；其余为 200 且严格视图完整）就停止，余项不再调用。
+4. 结束时对本 grant 已取得的 session 做一次本地注销：'${env.sckBin}' call ops_logout '{"session":"<session>"}'（必要时才做；失败不重试）。
+不要把 taskId/sourceTaskId/grantId 或任何租约证明放进参数——通道会拒绝。grant 停止/过期后 logout 仍然允许。
+${comm}
+grant 不是执行租约：不能写任务、不能 checkpoint/submit/review/report_blocker，也不能调用其它 ops 工具。`;
+  return firstContact ? `${onboarding(inst, env, ctx?.comm ?? false, ctx?.commDir)}\n\n${body}` : body;
+}
+
 export function wake(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, firstContact: boolean, ctx?: PromptCtx): string {
   const mode = task.state === 'review' ? '独立验收' : task.row.handover ? '接手续做（前任会话已中断）' : '执行';
   if (ctx?.comm) return briefWake(task, env, ctx);

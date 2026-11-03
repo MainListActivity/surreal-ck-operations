@@ -17,6 +17,8 @@ export interface OpsSession {
   /** Epoch ms. */
   expiresAt: number;
   workspace?: { slug: string; dbName: string };
+  /** FV06: the recovery read grant this session was opened under; scoped drops never touch other sessions. */
+  grantId?: string;
   createdAt: number;
 }
 
@@ -64,6 +66,17 @@ export class SessionStore {
     let dropped = 0;
     for (const session of [...this.sessions.values()]) {
       if (session.employeeId !== employeeId) continue;
+      this.sessions.delete(session.id);
+      dropped++;
+    }
+    return dropped;
+  }
+
+  /** FV06: drop only the handles a recovery read grant opened (local discard; never a remote logout). */
+  dropGrant(grantId: string): number {
+    let dropped = 0;
+    for (const session of [...this.sessions.values()]) {
+      if (session.grantId !== grantId) continue;
       this.sessions.delete(session.id);
       dropped++;
     }

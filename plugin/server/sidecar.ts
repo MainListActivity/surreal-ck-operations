@@ -16,7 +16,8 @@ import {
   writeFileAtomic, type CommRequest, type CommResponse,
 } from "./vendor/src/comm.ts";
 import { serviceHome } from "./env";
-import type { ActiveLease, ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, WorktreeAssignment, WriteScopeHolder } from "./vendor/src/contracts.ts";
+import type { ActiveLease, ClaimResult, CompanyCore, Evidence, LeaseProof, RecoveryReadGrantRowView, TaskView, WorktreeAssignment, WriteScopeHolder } from "./vendor/src/contracts.ts";
+import { RECOVERY_READ_TOOLS, RECOVERY_RESERVED_ARGS } from "./vendor/src/recovery-read.ts";
 import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workforce.ts";
 import { fitAttachedNotices, guardRelayResponse, type NoticeCut } from "./vendor/src/response-budget.ts";
 import { isPaged, parseReclaimInput, parseWorktreeInput, taskIdOf } from "./vendor/src/query-input.ts";
@@ -94,6 +95,8 @@ const BASE_TOOLS = [
   "plugin_runtime_diagnostics",
   // SYS04 故障诊断：任务持有人 / 验收人 / gm 只读预算状态；gm 解封已耗尽的恢复预算（core 判定）。
   "fault_status", "fault_lift",
+  // FV06 终态任务恢复取证：gm+manage 签发/撤销，gm/被授权员工/源任务 reviewer 只读链与调用审计（core 判定）。
+  "recovery_read_grant", "recovery_read_grant_revoke", "recovery_read_status",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -147,9 +150,12 @@ export function blockerQuotaReset(text: string): { quotaResetsAt?: string; mispl
 /** Capability broker behind the `ops_*` tools (OpsBroker). Credentials and login tokens stay on its side. */
 export interface OpsGateway {
   readonly tools: readonly string[];
-  call(credential: string, taskId: string, tool: string, args: Record<string, unknown>): Promise<unknown>;
+  /** `proof` is injected by the channel only (never from user arguments): the recovery read grant binding. */
+  call(credential: string, taskId: string, tool: string, args: Record<string, unknown>, proof?: { grantId: string; grantFence: number }): Promise<unknown>;
   /** The employee instance is done with its lease or gone: drop every session opened for it (and report cleanup). */
   release(employeeId: string): void | { sessions: number; browserSpaces: number; pending: number };
+  /** FV06: drop only the local session handles a recovery read grant opened (no remote logout). */
+  releaseGrant?(grantId: string): number;
 }
 
 export interface SidecarDeps {
@@ -199,6 +205,21 @@ export interface SettleResult {
   silent?: { instId: string; taskId: string; nudges: number; phase: "doing" | "review" };
 }
 
+/**
+ * FV06 recovery read binding: independent of `claims` (never a fake lease proof). It only authorizes the
+ * grant's fixed ops calls; every write tool still requires a normal claim.
+ */
+export interface RecoveryClaim {
+  instId: string;
+  /** The terminal source task whose fault keys every call is charged to. */
+  taskId: string;
+  grantId: string;
+  grantFence: number;
+  alias: string;
+  paths: string[];
+  expiresAt: number;
+}
+
 const ORPHAN_PREFIX = "orphaned-";
 /**
  * task.md and findings/round-NN.md for the lease just taken: what the dispatch message points the employee at. The comm
@@ -230,6 +251,9 @@ export class SidecarPool {
   private readonly routingUnconfirmed = new Set<string>();
   private readonly routingEmployees = new Map<string, {role:string}>();
   private readonly claims = new Map<string, LiveClaim>();
+  /** FV06: recovery read bindings, kept strictly apart from execution claims (never exposed as lease proof). */
+  private readonly recoveryClaims = new Map<string, RecoveryClaim>();
+  private readonly recoveryCheckedAt = new Map<string, number>();
   /** instId → task of the last lease it held; names the task a report written after the lease ended belongs to. */
   private readonly lastTask = new Map<string, string>();
   private readonly instByAgent = new Map<string, string>();
@@ -478,6 +502,8 @@ export class SidecarPool {
       this.log(`claim ${inst.id}: dropped stale lease on ${held.taskId}`);
       this.endLease(inst.id);
     }
+    // 恢复读取与执行租约互斥：一旦要领执行租约，先关闭恢复绑定（grant 本身不撤销）。
+    await this.closeRecovery(inst.id, "execution_claim");
     const cred = await this.credentialFor(inst.id);
     let result: ClaimResult;
     this.denials.delete(inst.id);
@@ -739,6 +765,11 @@ export class SidecarPool {
       try { await this.rebuildClaim(inst); }
       catch (error) { this.log(`adopt lease check ${inst.id} failed: ${(error as Error).message}`); }
     }
+    // FV06: recovery bindings are process state too; rebuild only the grants the server still reports active.
+    for (const inst of insts) {
+      if (!this.launched.has(inst.id)) continue;
+      await this.rebuildRecovery(inst);
+    }
     this.ensureSweeper();
   }
 
@@ -747,6 +778,106 @@ export class SidecarPool {
   async adoptLease(inst: EmployeeInst): Promise<void> {
     if (!this.launched.has(inst.id)) throw new Error("unhealthy session channel cannot adopt a lease");
     await this.rebuildClaim(inst);
+  }
+
+  /**
+   * FV06: bind a recovery read grant to this instance's channel. Never a fake lease: the binding lives in
+   * `recoveryClaims`, authorizes only the grant's ops allowlist, and refuses while any execution claim exists.
+   * The server remains the authority — the grant is re-read and rebound (issued → bound) on every wake/reload.
+   */
+  async adoptRecovery(inst: EmployeeInst, grantId?: string): Promise<RecoveryClaim | undefined> {
+    if (!this.launched.has(inst.id)) throw new Error("unhealthy session channel cannot adopt a recovery grant");
+    if (this.claims.has(inst.id)) throw Object.assign(new Error("execution lease is active; recovery read cannot bind"), { code: "lease_conflict" });
+    const core = this.deps.core;
+    if (!core.recoveryGrantFor || !core.recoveryGrantsFor || !core.recoveryReadBind) {
+      throw Object.assign(new Error("core does not expose recovery read grants"), { code: "no_grant" });
+    }
+    const cred = await this.credentialFor(inst.id);
+    let grant: RecoveryReadGrantRowView | undefined;
+    if (grantId) {
+      grant = await core.recoveryGrantFor(cred, grantId);
+    } else {
+      const grants = await core.recoveryGrantsFor(cred);
+      if (grants.length === 0) return undefined;
+      if (grants.length > 1) {
+        this.log(`recovery adoption ambiguous for ${inst.id}: ${grants.length} active grants (${grants.map(g => g.id).join(", ")})`);
+        return undefined;
+      }
+      grant = grants[0];
+    }
+    if (grant.employeeId !== inst.id) throw Object.assign(new Error("recovery grant belongs to another employee"), { code: "no_grant" });
+    if (grant.state !== "issued" && grant.state !== "bound" && grant.state !== "running") {
+      throw Object.assign(new Error(`recovery grant is ${grant.state}`), { code: "no_grant" });
+    }
+    if (Date.parse(grant.expiresAt) <= Date.now()) throw Object.assign(new Error("recovery grant expired"), { code: "no_grant" });
+    const bound = await core.recoveryReadBind(cred, { grantId: grant.id, fence: grant.fence });
+    const claim: RecoveryClaim = {
+      instId: inst.id, taskId: bound.taskId, grantId: bound.id, grantFence: bound.fence,
+      alias: bound.alias, paths: [...bound.paths], expiresAt: Date.parse(bound.expiresAt),
+    };
+    this.recoveryClaims.set(inst.id, claim);
+    const dir = commDir(this.deps.runDir, inst.id);
+    ensureCommDirs(dir);
+    const evidenceDir = join(dirname(this.deps.runDir), "evidence", claim.taskId);
+    mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+    // claim.json carries a `recovery` section — never a lease proof: submit/review/checkpoint stay impossible.
+    writeFileAtomic(join(dir, "claim.json"), JSON.stringify({
+      recovery: { taskId: claim.taskId, grantId: claim.grantId, grantFence: claim.grantFence,
+        alias: claim.alias, paths: claim.paths, expiresAt: new Date(claim.expiresAt).toISOString() },
+      evidenceDir, orphanedArtifacts: orphanedArtifacts(evidenceDir),
+    }));
+    this.log(`sidecar bound recovery grant ${claim.grantId} for ${inst.id} on source ${claim.taskId}`);
+    return claim;
+  }
+
+  /** FV06: close the local binding (revoked/expired/source changed/execution claim). Drops only this grant's
+   *  local sessions; it never logs in again and never claims a remote logout. */
+  async closeRecovery(instId: string, reason: string): Promise<void> {
+    const claim = this.recoveryClaims.get(instId);
+    if (!claim) return;
+    this.recoveryClaims.delete(instId);
+    this.recoveryCheckedAt.delete(instId);
+    try { this.deps.ops?.releaseGrant?.(claim.grantId); } catch { /* local cleanup only */ }
+    try {
+      const cred = await this.credentialFor(instId);
+      await this.deps.core.recoveryReadClose?.(cred, { grantId: claim.grantId, fence: claim.grantFence, reason });
+    } catch (error) {
+      this.log(`recovery close ${claim.grantId} for ${instId} failed: ${(error as Error).message}`);
+    }
+    const path = join(commDir(this.deps.runDir, instId), "claim.json");
+    const prior = readJsonFile<{ recovery?: { grantId?: string } }>(path);
+    if (prior?.recovery?.grantId === claim.grantId) {
+      try { unlinkSync(path); } catch { /* already gone */ }
+    }
+    this.log(`sidecar closed recovery grant ${claim.grantId} for ${instId}: ${reason}`);
+  }
+
+  /** FV06: the server grant is the authority; a local binding that is no longer active is closed, not renewed. */
+  private async validateRecovery(instId: string): Promise<void> {
+    const claim = this.recoveryClaims.get(instId);
+    if (!claim) return;
+    if (claim.expiresAt <= Date.now()) return this.closeRecovery(instId, "expired");
+    // One server check per minute and instance; local expiry is checked every sweep.
+    const last = this.recoveryCheckedAt.get(instId) ?? 0;
+    if (Date.now() - last < 60_000) return;
+    this.recoveryCheckedAt.set(instId, Date.now());
+    try {
+      const cred = await this.credentialFor(instId);
+      const grant = await this.deps.core.recoveryGrantFor?.(cred, claim.grantId);
+      if (!grant || !["issued", "bound", "running"].includes(grant.state)
+        || Date.parse(grant.expiresAt) <= Date.now() || grant.taskId !== claim.taskId) {
+        await this.closeRecovery(instId, grant?.state ?? "grant_unavailable");
+      }
+    } catch (error) {
+      await this.closeRecovery(instId, `grant_unreadable: ${(error as Error).message.slice(0, 80)}`);
+    }
+  }
+
+  /** FV06 reload: rebuild bindings from the complete credential-scoped server read (active only). */
+  private async rebuildRecovery(inst: EmployeeInst): Promise<void> {
+    if (this.claims.has(inst.id) || this.recoveryClaims.has(inst.id)) return;
+    try { await this.adoptRecovery(inst); }
+    catch (error) { this.log(`recovery adoption ${inst.id} failed: ${(error as Error).message}`); }
   }
 
   /**
@@ -902,7 +1033,7 @@ export class SidecarPool {
   /** Injected-proof write tools plus identity-scoped reads; capability enforcement stays in core. */
   private async dispatch(
     instId: string, tool: string, args: Record<string, unknown>, forceRotate: boolean,
-    request: { lease: LiveClaim | undefined },
+    request: { lease: LiveClaim | undefined; recovery?: RecoveryClaim },
   ): Promise<unknown> {
     const requestLease = request.lease;
     const core = this.deps.core;
@@ -987,6 +1118,28 @@ export class SidecarPool {
     };
     const gateway = [ops, media, browser, sync].find(item => item?.tools.includes(tool));
     if (gateway) {
+      // FV06: a recovery binding authorizes only the ops allowlist, on the source task, with the grant proof
+      // injected here. It is never a lease proof: every write tool below still goes through live().
+      const recovery = request.recovery;
+      if (gateway === ops && recovery) {
+        const bound = this.recoveryClaims.get(instId);
+        if (bound !== recovery) throw Object.assign(new Error("no active recovery read grant for this request"), { code: "no_grant" });
+        if (requestLease) throw Object.assign(new Error("execution and recovery bindings cannot both be active"), { code: "no_grant" });
+        if (bound.expiresAt <= Date.now()) {
+          void this.closeRecovery(instId, "expired");
+          throw Object.assign(new Error("recovery read grant expired"), { code: "no_grant" });
+        }
+        // 员工不能自带或覆盖源任务与 grant 证明：这些键一律拒绝（不是静默丢弃）。
+        for (const key of RECOVERY_RESERVED_ARGS) {
+          if (args[key] !== undefined) {
+            throw Object.assign(new Error(`${key} is injected by the channel and must not be supplied`), { code: "invalid" });
+          }
+        }
+        if (!(RECOVERY_READ_TOOLS as readonly string[]).includes(tool)) {
+          throw Object.assign(new Error(`recovery read allows only ${RECOVERY_READ_TOOLS.join(", ")}`), { code: "forbidden" });
+        }
+        return gateway.call(cred, bound.taskId, tool, { ...args }, { grantId: bound.grantId, grantFence: bound.grantFence });
+      }
       // The lease decides the task: a taskId in the request is dropped so ops tools only ever act for the task in hand.
       const { taskId: _requested, ...rest } = args;
       const claim = live();
@@ -1342,6 +1495,16 @@ export class SidecarPool {
             idempotencyKey: String(args.idempotencyKey ?? ""),
           })
         : Promise.reject(Object.assign(new Error("core does not expose fault_lift"), { code: "temporarily_unavailable" }));
+      // FV06：恢复取证授权不走执行租约——gm 签发/撤销与只读状态都由 core 按凭证判定，参数原样转交。
+      case "recovery_read_grant": return core.recoveryReadGrant
+        ? core.recoveryReadGrant(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose recovery_read_grant"), { code: "temporarily_unavailable" }));
+      case "recovery_read_grant_revoke": return core.recoveryReadGrantRevoke
+        ? core.recoveryReadGrantRevoke(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose recovery_read_grant_revoke"), { code: "temporarily_unavailable" }));
+      case "recovery_read_status": return core.recoveryReadStatus
+        ? core.recoveryReadStatus(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose recovery_read_status"), { code: "temporarily_unavailable" }));
       case "deploy_drill_run": return core.deployDrillRun
         ? core.deployDrillRun(cred, {
             taskId: String(args.taskId ?? live().taskId),
@@ -1390,6 +1553,8 @@ export class SidecarPool {
           .finally(() => this.processing.delete(file));
       }
     }
+    // FV06: expiry is local and immediate; the server state is re-read on a slower cadence.
+    for (const instId of [...this.recoveryClaims.keys()]) void this.validateRecovery(instId);
   }
 
   /** Drains a request written after the instance's lease ended — the caller gets an
@@ -1405,7 +1570,7 @@ export class SidecarPool {
     const dir = commDir(this.deps.runDir, instId);
     const reqPath = join(reqDir(dir), file);
     const req = readJsonFile<CommRequest>(reqPath);
-    const request = { lease: this.claims.get(instId) };
+    const request = { lease: this.claims.get(instId), recovery: this.recoveryClaims.get(instId) };
     const arrival = Date.now();
     try { unlinkSync(reqPath); } catch { /* already consumed */ }
     const res: CommResponse = !req
