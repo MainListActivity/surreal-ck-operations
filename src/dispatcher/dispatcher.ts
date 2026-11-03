@@ -1488,7 +1488,7 @@ export class Dispatcher {
       // repoPath is already the authoritative effective repository (code override, task project, goal project).
       // A live session in another repository is permanently outside staffingPool, too.
       if ((inst.repoHome ?? inst.cwd ?? this.deps.env.opsRepo) !== home)
-        return `任务仓库为 ${home}，原实现人会话仍属于 ${inst.repoHome ?? inst.cwd ?? this.deps.env.opsRepo}`;
+        return `任务代码仓为 ${home}，原实现人会话仍属于 ${inst.repoHome ?? inst.cwd ?? this.deps.env.opsRepo}`;
       // A goal-scoped session only ever takes work of its own goal (staffing inWorkspace), so an implementer bound across
       // goals — by a takeover, or a task moved to another goal phase — can never be dispatched the task back.
       const scope = workspaceScopeFor(task.goalId);
