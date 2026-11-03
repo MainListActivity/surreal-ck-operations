@@ -9,7 +9,7 @@ import { effectiveWeight, MANAGER_WAKE_PENDING_GRACE_SECONDS, MANAGER_WAKE_TURN_
 import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, RetirementKind, Role, WriteScopeHolder } from '../contracts.ts';
 import { REQUIRED_TRACKS } from '../core.ts';
 import { UNATTENDED_MODE, type PaseoGateway, type PaseoWorkspaceInfo } from './paseo.ts';
-import { evalPrompt, gmAttention, gmTriage, wake, type GmTodo, type PromptEnv } from './prompts.ts';
+import { evalPrompt, gmAttention, gmTriage, recoveryWake, wake, type GmTodo, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
 import { agingLevel, agingText, localDate, renderBrief, type RoleCapacity } from '../owner-brief.ts';
 import type { ReclaimResult } from './worktree-registry.ts';
@@ -582,6 +582,11 @@ export interface SidecarBridge {
    * no sidecar claim ran. Missing or failing = the wake still goes out but the channel may be cold.
    */
   adoptLease?(inst: EmployeeInst): Promise<void>;
+  /**
+   * FV06: bind a recovery read grant to the instance channel before a recovery wake. Refuses while an execution
+   * lease is held; the grant stays issued/bound server-side and a later tick can retry.
+   */
+  adoptRecovery?(inst: EmployeeInst, grantId?: string): Promise<unknown>;
 }
 
 /** Jev-chosen override for one dispatch: force an existing instance, or skip reuse and spawn a chosen def. */
@@ -661,6 +666,8 @@ export interface TickReport {
   realigned?: string[];
   /** Sessions restarted in place after their provider's quota window reopened (see PaseoGateway.reload). */
   recovered?: string[];
+  /** FV06 recovery read grants woken this tick (grant ids only). */
+  recovery?: string[];
   skipped?: 'paused' | 'budget' | 'resources';
 }
 
@@ -708,6 +715,8 @@ export class Dispatcher {
   private readonly closedSince = new Map<string, number>();
   /** FV06 P0: agentId → when the last standby wake was sent; retried at the same 60s cadence as resumeClosed's reload. */
   private readonly standbyWakeAt = new Map<string, number>();
+  /** FV06 recovery read grant: grantId → when its wake was last sent (60s cadence, same as standby). */
+  private readonly recoveryWakeAt = new Map<string, number>();
   /** agentId → last timeline tail of a stalled busy holder, when it last changed, and the task it was holding. */
   private readonly activity = new Map<string, { tail: string; at: number; task: string }>();
   /** agentId → the served model already reported as waiting for its provider: one line per episode, not per tick. */
@@ -1199,6 +1208,33 @@ export class Dispatcher {
       }
     }
     insts = insts.filter(i => !report.retired.includes(i.id));
+
+    // 2a. FV06 recovery read grants: wake the named employee with the grant payload only. A busy session is never
+    // interrupted, and an employee holding an execution lease is refused by the channel (the grant stays usable).
+    if (this.deps.sidecar?.adoptRecovery) {
+      const grants = (await wf.activeRecoveryGrants?.(now).catch(() => [])) ?? [];
+      for (const grant of grants) {
+        const inst = byId.get(grant.employeeId);
+        if (!inst || !inst.paseoAgentId) continue;
+        const state = states.get(inst.id);
+        if (state === 'busy' || state === 'down' || state === 'exhausted') continue;
+        if (now - (this.recoveryWakeAt.get(grant.id) ?? 0) < STANDBY_WAKE_RETRY_SECONDS) continue;
+        this.recoveryWakeAt.set(grant.id, now);
+        try {
+          await this.deps.sidecar.adoptRecovery(inst, grant.id);
+          const first = !this.onboarded.has(inst.id) && !inst.onboarded;
+          await paseo.send(inst.paseoAgentId, recoveryWake(inst, grant, this.deps.env, first,
+            { comm: true, commDir: this.deps.sidecar.commDirFor(inst.id), scratchDir: this.deps.sidecar.scratchDirFor(inst.id) }));
+          this.onboarded.add(inst.id);
+          this.lastStatus.set(inst.paseoAgentId, 'running');
+          await wf.touchWake(inst.id);
+          (report.recovery ??= []).push(grant.id);
+          this.log(`recovery wake ${inst.id} for grant ${grant.id} on source ${grant.taskId}`);
+        } catch (error) {
+          this.log(`recovery wake ${inst.id} for grant ${grant.id} failed: ${(error as Error).message}`);
+        }
+      }
+    }
 
     // 2b. Jev decisions: goal triage, release go/no-go, owner-escalation routing. Undecided items stay with gm/product.
     if (this.deps.jev && cfg.jevDecisions) await this.jevDecisions(cfg, report);

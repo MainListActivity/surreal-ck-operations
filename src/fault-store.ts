@@ -24,7 +24,7 @@
 import { RecordId } from 'surrealdb';
 import {
   backoffWaitMs, budgetKey, decideAttempt, decideBudget, diagnosticFor, faultFingerprint, incidentKey,
-  type BudgetDecision, type FaultBudgetLimits, type FaultBudgetState, type FaultDiagnostic, type FaultRecord,
+  type BudgetDecision, type FaultBudgetLimits, type FaultBudgetState, type FaultDiagnostic, type FaultRecord, type FaultRefund,
 } from './faults.ts';
 
 /** The minimal DB surface this store needs. */
@@ -131,6 +131,8 @@ export interface FaultReserveResult {
   waitMs: number;
   budget?: FaultBudgetState;
   diagnostic?: FaultDiagnostic;
+  /** The receipt a caller must pass to `refund` if the reserved call never runs. */
+  refund?: FaultRefund;
 }
 
 /** The outcome of a report: what was recorded and whether the recovery may continue. */
@@ -418,7 +420,23 @@ export class FaultStore {
       const charged = await this.charge(key, row, input, decision.attempt, input.phase,
         row.deadline || input.now + input.limits.totalDeadlineMs).catch(() => undefined);
       if (charged) {
-        return { allowed: true, attempt: decision.attempt, charged: true, waitMs: 0, budget: charged };
+        // The receipt names both sides: the post-state the CAS must still find, and the pre-state the refund
+        // restores. A concurrent failure, settle, stop or lift moves the post-state and makes the refund a no-op.
+        const refund: FaultRefund = {
+          key, taskId: input.taskId, target: input.target, phase: input.phase,
+          chargedAttempts: charged.attempts,
+          chargedTotalAttempts: (row.totalAttempts ?? 0) + 1,
+          chargedDeadline: charged.deadline,
+          chargedNextAllowedAt: charged.nextAllowedAt,
+          chargedLastAttemptAt: charged.lastAttemptAt ?? input.now,
+          priorAttempts: row.attempts,
+          priorTotalAttempts: row.totalAttempts ?? 0,
+          priorDeadline: row.deadline,
+          priorNextAllowedAt: row.nextAllowedAt,
+          ...(row.lastAttemptAt === undefined ? {} : { priorLastAttemptAt: row.lastAttemptAt }),
+          priorFailed: row.failed,
+        };
+        return { allowed: true, attempt: decision.attempt, charged: true, waitMs: 0, budget: charged, refund };
       }
       // The race was lost: read the row again and decide once more.
     }
@@ -546,6 +564,39 @@ export class FaultStore {
   async settle(key: string, now: number): Promise<void> {
     await this.db.query(`UPDATE $row SET failed = false, attempts = 0, next_allowed_at = $now,
       updated_at = time::now() WHERE key = $key AND failed = true;`, { row: scopeId(key), key, now });
+  }
+
+  /**
+   * Refund a reserved attempt whose call never ran. This is not a success settlement: it restores exactly the
+   * pre-reservation counters and keeps every failure fact the row had before the reservation (failed, deadline,
+   * nextAllowedAt, incident, stopped, last error facts).
+   *
+   * The CAS is on the post-state this reservation wrote, never on a cached pre-state:
+   * - a concurrent new failure, a stop, a lift or a real success moves the post-state; the update matches zero
+   *   rows and the newer state wins;
+   * - a second refund with the same receipt also matches zero rows (the post-state is gone), so it is a no-op;
+   * - restoring the pre-state cannot erase `stopped` or any incident field because the query never writes them.
+   */
+  async refund(refund: FaultRefund): Promise<'refunded' | 'superseded'> {
+    const last = refund.priorLastAttemptAt === undefined
+      ? 'last_attempt_at = NONE'
+      : 'last_attempt_at = $prior_last';
+    const [rows] = await this.db.query<[Array<{ attempts?: number }>]>(`UPDATE $row SET
+      attempts = $prior_attempts, total_attempts = $prior_total, deadline = $prior_deadline,
+      next_allowed_at = $prior_next, failed = $prior_failed, ${last}, updated_at = time::now()
+      WHERE key = $key AND failed = true AND attempts = $charged_attempts
+        AND total_attempts = $charged_total AND deadline = $charged_deadline
+        AND next_allowed_at = $charged_next AND last_attempt_at = $charged_last
+      RETURN AFTER;`, {
+      row: scopeId(refund.key), key: refund.key,
+      prior_attempts: refund.priorAttempts, prior_total: refund.priorTotalAttempts,
+      prior_deadline: refund.priorDeadline, prior_next: refund.priorNextAllowedAt,
+      prior_failed: refund.priorFailed, prior_last: refund.priorLastAttemptAt,
+      charged_attempts: refund.chargedAttempts, charged_total: refund.chargedTotalAttempts,
+      charged_deadline: refund.chargedDeadline, charged_next: refund.chargedNextAllowedAt,
+      charged_last: refund.chargedLastAttemptAt,
+    });
+    return rows?.length ? 'refunded' : 'superseded';
   }
 
   /** Record the cause on the scope row: the last fingerprint, the last incident and the machine facts. */

@@ -702,6 +702,30 @@ export class Workforce {
   }
 
   /**
+   * FV06: grants the dispatcher may wake their named employee for. Read-only and bounded: only an unexpired
+   * grant whose source task is still done. The sidecar re-checks every one of these before binding.
+   */
+  async activeRecoveryGrants(nowMs: number): Promise<Array<{
+    id: string; employeeId: string; taskId: string; alias: string; paths: string[]; expiresAt: string; state: string;
+  }>> {
+    const [rows] = await this.db.query<[Array<{ id: RecordId; employee: RecordId; source_task: RecordId; alias: string;
+      paths: string[]; expires_at: unknown; state: string }>]>(
+      `SELECT id, employee, source_task, alias, paths, expires_at, state FROM recovery_read_grant
+        WHERE state IN ['issued', 'bound', 'running'] AND expires_at > time::now()
+        ORDER BY created_at;`);
+    const out = [];
+    for (const row of rows) {
+      const source = await this.db.select<{ state?: string }>(row.source_task);
+      if (source?.state !== 'done') continue;
+      const expiresAt = row.expires_at instanceof Date ? row.expires_at.toISOString() : String(row.expires_at);
+      if (Date.parse(expiresAt) <= nowMs) continue;
+      out.push({ id: asId(row.id), employeeId: asId(row.employee), taskId: asId(row.source_task),
+        alias: row.alias, paths: [...row.paths], expiresAt, state: row.state });
+    }
+    return out;
+  }
+
+  /**
    * SYS05: release the wait conditions that are true now. A time wait releases once (the store's compare-and-set
    * makes twenty ticks one release); a dependency wait releases when its reference task is done or void; nothing
    * is released past an unfinished dependency or an owner gate. Waits whose precise expiry passed first become

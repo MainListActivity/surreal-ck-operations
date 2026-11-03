@@ -198,6 +198,10 @@ export class CompanyDatabase {
     // 追加在既有 task.context，不新增任务字段、不改任何既有行；旧版 release 读到未知 kind 按既有通用文本投递一次（RB01）。
     await this.db.query(loadSchema('048-acceptance-amend.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 48 WHERE schema_version < 48;');
+    // FV06 恢复取证子租约（编号 049）：只新增 recovery_read_grant / recovery_read_call 两张表。grant 不改变源任务、
+    // 不建预算、不 lift；旧 release 读不到这两张表即忽略（RB01）。
+    await this.db.query(loadSchema('049-recovery-read-grant.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 49 WHERE schema_version < 49;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {
