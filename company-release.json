@@ -1,16 +1,17 @@
 {
-  "version": "0.3.74",
-  "title": "独立核查与实现人接手资格闭环，修复错误仓库绑定导致的派工卡死",
+  "version": "0.3.75",
+  "title": "运维登录步长取整，修复小数延迟引发的 RangeError",
   "changes": [
-    "接手与领取事务统一校验有效仓库、目标工作区和退役状态；经理及自动接手均执行独立性门禁并校验来源版本。",
-    "create_task 支持在建单事务内登记独立性约束，首个领取前即生效；无效来源拒绝整笔建单。",
-    "负责人属于错误仓库时自动进入既有接替流程，合格异人优先接替，无可用恢复路径时生成持久经理待办；不再只显示 implementer_mismatch 通知。",
-    "更新经理建单工具说明与故障链回归，保留原贡献历史、租约栅栏和独立验收纪律。"
+    "src/ops/fetcher.ts 新增 wholeMs：把交给 AbortSignal.timeout/setTimeout 的延迟取整（Math.max(1, Math.floor(ms))），常量入参不变，非有限值仍显式失败。",
+    "passwordLogin 的每步时限改用 wholeMs：预算余量来自 performance.now() 差值，剩余小于步长时不再把小数传给计时器（RangeError）。日志/trace 里报告的 ms 与真正传给计时器的值一致。",
+    "同类时钟差超时一并取整：magpie.ts、supplier.ts 的 io.left() 步长，product.ts / d1.ts / idp-principals.ts 的调用方 timeoutMs。",
+    "回归：注入小数时钟、使 left()<stepMs，断言登录不抛 RangeError、捕获到的每个计时器延迟都是整数且不小于 2s 下限；覆盖 customer、operator 与 audience=ops 三个通道。"
   ],
   "impact": [
-    "工程任务接手、直接领取、独立核查建单与后台派工恢复；涉及根服务及 Paseo 插件 vendor。",
-    "正常忙碌、短时额度等待和未知状态继续等待，不以此为由替换员工。"
+    "不改登录预算数值、步长、MIN_STEP_MS、MAX_ATTEMPTS、family4、TLS 或主机网络；不增加重试或改变重试/预算判定。",
+    "故障分类未改动：修复后该本地参数异常不再产生；若把本地参数错误改判为不记预算，会放宽预算语义，故本版不做。unclassified 本就停止恢复，行为不变。",
+    "只影响把时钟差直接当超时用的调用点；常量超时（broker、d1 默认值、browser、mcp 等）字节不变。"
   ],
-  "migration": "无 schema 迁移。历史任务不会从自然语言推断独立性；本次确认的独立核查任务按原业务要求补录结构化隔离并留维护审计。",
-  "rollback": "用当前受审 installer 切回上线前固定 release，保留结构化独立性数据及贡献审计；旧版仍能读取现有 schema。"
+  "migration": "无数据迁移，不改写任何已有数据；无新环境变量或主机准备。",
+  "rollback": "切回升级前的现役固定版本，即 0.3.74（releases/ee1a349e13f746fa4cdddf9005c38d7beace0ff8），以老板升级前实际线上版本为准，由当前受审 release 的 installer 执行（见 docs/company-service-operations.md §5）。无数据迁移，回滚无数据操作。"
 }

@@ -47,6 +47,20 @@ export function transportErrno(error: unknown): string | undefined {
 }
 
 /**
+ * A whole-millisecond delay for `AbortSignal.timeout` / `setTimeout`.
+ *
+ * Timers reject a fractional delay with `RangeError` ("The value of \"delay\" is out of range. It must be an integer").
+ * Budget remainders are clock differences (`performance.now()`, or a test clock), so a remainder smaller than the
+ * step limit carries a fraction and used to reach the timer as-is. Floor is the conservative choice: the wait never
+ * outlives the budget that produced it. Every caller keeps its own floor (`MIN_STEP_MS`), so flooring cannot take a
+ * delay below that floor; 1 ms is the smallest delay the timer accepts. Constants stay unchanged (floor of an
+ * integer is itself). Non-finite input still fails loudly instead of being turned into a hidden 1 ms.
+ */
+export function wholeMs(ms: number): number {
+  return Math.max(1, Math.floor(ms));
+}
+
+/**
  * Node's global fetch keeps undici's default connect limit of 10 s for DNS, TCP and TLS together, so a slow
  * but healthy handshake is cut before any step budget applies (reproduced on Node 24: 10.5 s, while the
  * request signal allowed 25 s). Ops traffic gets an explicit, longer limit on its own dispatcher instead.

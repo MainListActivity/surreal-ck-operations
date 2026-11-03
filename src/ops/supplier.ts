@@ -8,7 +8,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
-import { describeTransportFailure, opsFetch, type Fetcher } from './fetcher.ts';
+import { describeTransportFailure, opsFetch, wholeMs, type Fetcher } from './fetcher.ts';
 import {
   evidenceSchema, sha256, PLAN_HTML_FLAT_ALGORITHM, REVIEWED_QUOTA_AMOUNT, REVIEWED_QUOTA_WINDOW_SECONDS,
   TOKEN_PLAN_PLAN_TYPE_FREE, type TokenPlanEvidenceV3,
@@ -272,7 +272,7 @@ async function probe(
   record.rawSha256 = null;
   record.bodyBytes = null;
   record.requestId = null;
-  const ms = Math.min(STEP_TIMEOUT_MS, Math.max(io.left(), MIN_STEP_MS));
+  const ms = wholeMs(Math.min(STEP_TIMEOUT_MS, Math.max(io.left(), MIN_STEP_MS)));
   record.ms = 0;
   try {
     const response = await io.fetcher(url, { ...init, signal: AbortSignal.timeout(ms) });
@@ -1174,7 +1174,7 @@ async function authRequest(
   const host = new URL(url).host;
   if (!AUTH_HOST_ALLOWLIST.has(host))
     return { status: 0, headers: new Headers(), error: `host not allowlisted: ${host}` };
-  const ms = Math.min(STEP_TIMEOUT_MS, Math.max(io.left(), MIN_STEP_MS));
+  const ms = wholeMs(Math.min(STEP_TIMEOUT_MS, Math.max(io.left(), MIN_STEP_MS)));
   const jar = cookies.get(host);
   const headers: Record<string, string> = { ...init.headers };
   if (jar && jar.size) headers.cookie = [...jar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');

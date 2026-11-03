@@ -1,5 +1,5 @@
 import { CompanyError } from '../core-errors.ts';
-import { opsFetch, type Fetcher } from './fetcher.ts';
+import { opsFetch, wholeMs, type Fetcher } from './fetcher.ts';
 
 export interface D1Client {
   /** One parameterised statement; returns result rows (empty for writes). */
@@ -31,7 +31,7 @@ export function cloudflareD1(options: D1Options): D1Client {
           method: 'POST',
           headers: { authorization: `Bearer ${options.token}`, 'content-type': 'application/json' },
           body: JSON.stringify({ sql, params }),
-          signal: AbortSignal.timeout(options.timeoutMs ?? 20_000),
+          signal: AbortSignal.timeout(wholeMs(options.timeoutMs ?? 20_000)),
         });
       } catch (error) {
         throw new CompanyError('upstream_error', `D1 request failed: ${(error as Error).name}`, true);

@@ -8,7 +8,7 @@
 import { lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { describeTransportFailure, opsFetch, type Fetcher } from './fetcher.ts';
+import { describeTransportFailure, opsFetch, wholeMs, type Fetcher } from './fetcher.ts';
 import {
   evidenceSchema, sha256, canonical, magpieRouteDigest, magpieEvidenceEligible, MAGPIE_SNAPSHOT_ID, MAGPIE_SNAPSHOT_MAX_AGE_SECONDS,
   MAGPIE_EXECUTION_HEADROOM_SECONDS, MAGPIE_SOURCE_CLOCK_SKEW_MS, type MagpieEvidenceV4,
@@ -145,7 +145,7 @@ export async function readSource(
     httpDate: null, clockSkewMs: null, ageSeconds: null, cacheControl: null, rawSha256: null,
     bodyBytes: null, readAt: null, monotonicMs: null,
   };
-  const ms = Math.min(STEP_TIMEOUT_MS, Math.max(io.left(), MIN_STEP_MS));
+  const ms = wholeMs(Math.min(STEP_TIMEOUT_MS, Math.max(io.left(), MIN_STEP_MS)));
   try {
     const response = await io.fetcher(url, { method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(ms), headers: { accept: 'application/json' } });
     const at = io.now();

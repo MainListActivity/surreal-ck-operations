@@ -1,6 +1,6 @@
 import { CompanyError } from '../core-errors.ts';
 import type { BrokerConfig } from './config.ts';
-import { describeTransportFailure, opsFetch, transportErrno, type Fetcher } from './fetcher.ts';
+import { describeTransportFailure, opsFetch, transportErrno, wholeMs, type Fetcher } from './fetcher.ts';
 
 export const PRODUCT_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
 export type ProductMethod = typeof PRODUCT_METHODS[number];
@@ -71,7 +71,7 @@ export async function productRequest(
     body = JSON.stringify(request.body);
     if (Buffer.byteLength(body) > MAX_BODY_BYTES) throw new CompanyError('invalid', 'request body too large');
   }
-  const timeoutMs = options.timeoutMs ?? productTimeoutMs(method, path);
+  const timeoutMs = wholeMs(options.timeoutMs ?? productTimeoutMs(method, path));
   let response: Response;
   let raw: string;
   try {
