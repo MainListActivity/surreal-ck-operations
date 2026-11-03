@@ -95,6 +95,8 @@ const BASE_TOOLS = [
   "plugin_runtime_diagnostics",
   // SYS04 故障诊断：任务持有人 / 验收人 / gm 只读预算状态；gm 解封已耗尽的恢复预算（core 判定）。
   "fault_status", "fault_lift",
+  // FV06 终态任务恢复取证：gm+manage 签发/撤销，gm/被授权员工/源任务 reviewer 只读链与调用审计（core 判定）。
+  "recovery_read_grant", "recovery_read_grant_revoke", "recovery_read_status",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -1493,6 +1495,16 @@ export class SidecarPool {
             idempotencyKey: String(args.idempotencyKey ?? ""),
           })
         : Promise.reject(Object.assign(new Error("core does not expose fault_lift"), { code: "temporarily_unavailable" }));
+      // FV06：恢复取证授权不走执行租约——gm 签发/撤销与只读状态都由 core 按凭证判定，参数原样转交。
+      case "recovery_read_grant": return core.recoveryReadGrant
+        ? core.recoveryReadGrant(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose recovery_read_grant"), { code: "temporarily_unavailable" }));
+      case "recovery_read_grant_revoke": return core.recoveryReadGrantRevoke
+        ? core.recoveryReadGrantRevoke(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose recovery_read_grant_revoke"), { code: "temporarily_unavailable" }));
+      case "recovery_read_status": return core.recoveryReadStatus
+        ? core.recoveryReadStatus(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose recovery_read_status"), { code: "temporarily_unavailable" }));
       case "deploy_drill_run": return core.deployDrillRun
         ? core.deployDrillRun(cred, {
             taskId: String(args.taskId ?? live().taskId),

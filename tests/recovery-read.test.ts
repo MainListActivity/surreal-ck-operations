@@ -360,6 +360,8 @@ function sidecarRig() {
     recoveryReadClose: async (_c: string, input: { grantId: string; fence: number; reason: string }) => {
       closes.push({ grantId: input.grantId, reason: input.reason });
     },
+    recoveryReadStatus: async () => [{ grant: { ...row }, calls: [] }],
+    recoveryReadGrant: async (_c: string, input: Record<string, unknown>) => ({ grant: { ...row, id: String(input.idempotencyKey ?? 'g-new') }, calls: [] }),
   };
   const workforce = { rotate: async () => 'tok-rotated' };
   const logs: string[] = [];
@@ -384,6 +386,17 @@ describe('sidecar recovery binding', () => {
   let r: ReturnType<typeof sidecarRig>;
   beforeEach(() => { r = sidecarRig(); });
   afterEach(() => { r.pool.close(); rmSync(r.runDir, { recursive: true, force: true }); });
+
+  test('the grant tools are dispatched without a lease; core owns their authorization', async () => {
+    const env = r.pool.env(r.inst);
+    const status = await r.relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'grant-status', 'recovery_read_status', { taskId: 'task-done' });
+    expect(status.ok).toBe(true);
+    expect(r.calls).toHaveLength(0);
+    const issued = await r.relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'grant-issue', 'recovery_read_grant',
+      { taskId: 'task-done', employeeId: 'eng-x', alias: RECOVERY_READ_ALIAS, paths: [...RECOVERY_READ_PATHS],
+        expiresAt: new Date(Date.now() + 60_000).toISOString(), authorizationTask: 'task-auth', reason: 'fixture', idempotencyKey: 'fixture-1' });
+    expect(issued.ok).toBe(true);
+  });
 
   test('binding writes a recovery section, not a lease proof, and ops calls carry the channel proof', async () => {
     const env = r.pool.env(r.inst);
