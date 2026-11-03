@@ -43,6 +43,14 @@ DEFINE FIELD IF NOT EXISTS version ON recovery_read_grant TYPE int;
 DEFINE INDEX IF NOT EXISTS recovery_read_grant_source ON recovery_read_grant FIELDS source_task;
 DEFINE INDEX IF NOT EXISTS recovery_read_grant_employee ON recovery_read_grant FIELDS employee;
 
+-- 每个源任务一条链头（id = 源任务的确定性哈希）。签发事务通过它串行化：并发的两笔签发只有一笔能建成链，
+-- 另一笔按“已有链”拒绝；rearm 在同一笔事务里推进链头并承接上一 grant 的计数。
+DEFINE TABLE IF NOT EXISTS recovery_read_chain SCHEMAFULL PERMISSIONS NONE;
+DEFINE FIELD IF NOT EXISTS task ON recovery_read_chain TYPE record<task>;
+DEFINE FIELD IF NOT EXISTS latest_grant ON recovery_read_chain TYPE record<recovery_read_grant>;
+DEFINE FIELD IF NOT EXISTS version ON recovery_read_chain TYPE int;
+DEFINE INDEX IF NOT EXISTS recovery_read_chain_task ON recovery_read_chain FIELDS task UNIQUE;
+
 -- 每次 recovery 调用的可读审计行（ops_call 被 historyRowsAt 排除，QA 看不到；这里只存 ID/布尔/受限字段，
 -- 不含 subject、session、token、URL 或原始 body，body 只有摘要）。
 DEFINE TABLE IF NOT EXISTS recovery_read_call SCHEMAFULL PERMISSIONS NONE;

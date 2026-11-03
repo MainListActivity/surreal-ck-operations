@@ -46,9 +46,10 @@ export function exactRecoveryPaths(paths: unknown): string[] {
   return [...RECOVERY_READ_PATHS];
 }
 
-/** TTL 是 [1min, 30min]；契约值不随调用方改变，调用方只能在这个窗口里选。 */
+/** TTL 是 [1min, 30min]；契约值不随调用方改变，调用方只能在这个窗口里选。必须带时区偏移。 */
 export function parseRecoveryExpiry(expiresAt: unknown, now: number): Date {
-  if (typeof expiresAt !== 'string' || !Number.isFinite(Date.parse(expiresAt))) {
+  if (typeof expiresAt !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(expiresAt)
+    || !Number.isFinite(Date.parse(expiresAt))) {
     throw new CompanyError('invalid', 'expiresAt must be an ISO 8601 instant with a timezone offset');
   }
   const at = Date.parse(expiresAt);

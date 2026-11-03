@@ -432,7 +432,7 @@ export class OpsBroker {
       // fail-closed：任何不在 grant 允许面里的工具都在这里被拒，连 reserve 都不进入。
       if (!scope.recovery) throw new CompanyError('forbidden', 'Recovery read scope is incomplete');
       ctx.recovery = scope.recovery;
-      this.enforceRecoveryTool(tool, args, scope.recovery);
+      this.enforceRecoveryTool(ctx, tool, args, scope.recovery);
     }
     // The fault ledger's elapsedMs is the call's own monotone wall time, from here to the failure —
     // early failures and budget-exhausted logins included, never a trace sum (the trace caps its tail).
@@ -448,12 +448,20 @@ export class OpsBroker {
       if (boundary && !boundary.verdict.ok) {
         throw new CompanyError(boundary.verdict.code, `有效策略拒绝：${boundary.verdict.reason}`);
       }
-      // FV06: 链级 reserve 在 fault reserve 之前。被它拒绝的调用没有发生，不消耗预算。
-      if (ctx.recovery) await this.reserveRecoveryChain(ctx, tool, args);
       // SYS04 AC02: the attempt is reserved before it runs. A refused reservation never reaches the tool.
       // 恢复通道的必要 logout 是清理动作，永不被故障预算拦住。
       const recoveryLogout = ctx.recovery !== undefined && tool === 'ops_logout';
       if (!recoveryLogout) await this.reserveAttempt(ctx, tool, args);
+      // FV06: 链级 reserve 在 fault reserve 之后。预算拒绝（例如源任务 login 键已 deadline_passed）时链还没有
+      // 递增任何计数，grant 不会被永久烧死；链级拒绝时把刚预留的故障尝试退回，因为调用没有发生。
+      if (ctx.recovery) {
+        try {
+          await this.reserveRecoveryChain(ctx, tool, args);
+        } catch (error) {
+          await this.settleAttempt(ctx).catch(() => undefined);
+          throw error;
+        }
+      }
       let outcome: Outcome;
       try {
         outcome = await handler(ctx, args);
@@ -592,13 +600,14 @@ export class OpsBroker {
    * FV06 恢复通道的 fail-closed 允许面：只放行一次登录、四条的固定顺序 GET 和必要的本地 logout。
    * 证明（grantId/fence）只来自通道，参数里带这些键一律拒绝。
    */
-  private enforceRecoveryTool(tool: string, args: Args, grant: RecoveryReadScope): void {
+  private enforceRecoveryTool(ctx: Ctx, tool: string, args: Args, grant: RecoveryReadScope): void {
     if (!(RECOVERY_READ_TOOLS as readonly string[]).includes(tool)) {
       throw new CompanyError('forbidden', `Recovery read allows only ${RECOVERY_READ_TOOLS.join(', ')}; ${tool} is refused`);
     }
     for (const key of ['taskId', 'sourceTaskId', 'grantId', 'grantFence', 'fence']) {
       if (args[key] !== undefined) throw new CompanyError('forbidden', `Recovery read proof comes from the channel; ${key} must not be supplied`);
     }
+    // H5：session 绑定在 reserve 之前校验，被拒的调用不消耗链级计数。方法/路径先判，才能给出精确的拒绝原因。
     if (tool === 'ops_operator_login') {
       const alias = typeof args.alias === 'string' ? canonicalAlias(args.alias) : '';
       if (alias !== grant.alias) throw new CompanyError('forbidden', `Recovery read login must use the grant alias ${grant.alias}`);
@@ -611,6 +620,16 @@ export class OpsBroker {
         throw new CompanyError('forbidden', 'Path is not in this recovery read grant');
       }
       if (args.body !== undefined) throw new CompanyError('forbidden', 'Recovery read GET takes no body');
+    }
+    let session: OpsSession | undefined;
+    try {
+      session = this.sessions.get(args.session, ctx.scope.actor.employeeId, ctx.scope.project, ctx.env);
+    } catch (error) {
+      // logout 在进程重启后可能已经没有本地句柄：仍然允许走到本地 not_found（不重登、不声称远端注销）。
+      if (tool === 'ops_request') throw error;
+    }
+    if (session && (session.grantId !== grant.grantId || session.alias !== grant.alias)) {
+      throw new CompanyError('forbidden', 'Recovery read can only use a session opened under this grant and alias');
     }
   }
 
@@ -1611,7 +1630,12 @@ export class OpsBroker {
   }
 
   private session(ctx: Ctx, args: Args): OpsSession {
-    return this.sessions.get(args.session, ctx.scope.actor.employeeId, ctx.scope.project, ctx.env);
+    const session = this.sessions.get(args.session, ctx.scope.actor.employeeId, ctx.scope.project, ctx.env);
+    // H5：恢复通道只认“本 grant 已取得的会话”。同一员工的旧会话、别的 grant 的会话或别的别名都不能借用。
+    if (ctx.recovery && (session.grantId !== ctx.recovery.grantId || session.alias !== ctx.recovery.alias)) {
+      throw new CompanyError('forbidden', 'Recovery read can only use a session opened under this grant and alias');
+    }
+    return session;
   }
 
   /** Every session tool but `ops_request` only makes sense for a customer session. */

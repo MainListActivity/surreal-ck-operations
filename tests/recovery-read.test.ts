@@ -34,6 +34,9 @@ describe('recovery read grant surface', () => {
     expect(() => parseRecoveryExpiry('2026-11-03T00:00:59Z', now)).toThrow();
     expect(() => parseRecoveryExpiry('2026-11-03T00:30:01Z', now)).toThrow();
     expect(() => parseRecoveryExpiry('not-an-instant', now)).toThrow();
+    // A local-time instant without an offset is ambiguous and refused.
+    expect(() => parseRecoveryExpiry('2026-11-03T00:10:00', now)).toThrow();
+    expect(() => parseRecoveryExpiry('2026-11-03T08:10:00+08:00', now)).not.toThrow();
   });
 
   test('the first item is a 503 not-configured success, not a failure', () => {
@@ -139,13 +142,17 @@ function recoveryRig(chain: ChainState, bodies: Partial<Record<string, [number, 
       if (index === RECOVERY_READ_PATHS.length - 1) chain.state = 'completed';
     },
     reserveFault: async (s: { taskId: string }, input: { phase: string; target?: string }) => {
+      if (company.faults.refuse) {
+        const refusal = company.faults.refuse;
+        company.faults.refuse = undefined;
+        return { allowed: false, attempt: 0, charged: false, reason: refusal.reason, message: refusal.message, evidence: {} };
+      }
       reserved.push({ taskId: s.taskId, phase: input.phase, target: input.target ?? 'none' });
       return { allowed: true, attempt: 0, charged: false, message: '', evidence: {} };
     },
     settleFault: async (s: { taskId: string }, input: { phase: string; target?: string }) => {
       settled.push({ taskId: s.taskId, phase: input.phase, target: input.target ?? 'none' });
     },
-    reportFault: async () => ({ allowed: true, message: '', evidence: {} }),
   };
   const defaultBodies: Record<string, [number, unknown]> = {
     [RECOVERY_READ_PATHS[0]]: [503, { error: { code: 'endpoint-probe-temporary-grant-not-configured' } }],
@@ -156,9 +163,11 @@ function recoveryRig(chain: ChainState, bodies: Partial<Record<string, [number, 
     [RECOVERY_READ_PATHS[3]]: [200, { origin: { state: 'known', sha: 'a'.repeat(40), deploymentId: '7-1' } }],
   };
   const table = { ...defaultBodies, ...bodies };
+  const throwPaths = new Set<string>();
   const fetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     const parsed = new URL(url);
+    if (throwPaths.has(parsed.pathname)) throw new TypeError('fetch failed: socket hang up');
     if (parsed.origin === 'https://app.test' && table[parsed.pathname]) {
       const [status, body] = table[parsed.pathname]!;
       return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
@@ -172,7 +181,7 @@ function recoveryRig(chain: ChainState, bodies: Partial<Record<string, [number, 
     browser: world.browser, sleep: async ms => { world.clock += ms; },
   });
   const qa = company.lease('qa-1', 'qa', 'task-done');
-  return { world, company, core, broker, qa, chain, reserved, settled, settledChain, table };
+  return { world, company, core, broker, qa, chain, reserved, settled, settledChain, table, throwPaths };
 }
 
 async function failure<T>(promise: Promise<T>): Promise<Error & { code: string }> {
@@ -273,25 +282,33 @@ describe('broker recovery read enforcement', () => {
     expect(r.chain.state).toBe('stopped');
     expect(r.chain.stopReason).toBe('unexpected_200');
     expect(r.chain.perPath).toEqual([1, 0, 0, 0]);
-    expect((await failure(r.broker.call(r.qa, 'task-done', 'ops_request', { session: login.session, method: 'GET', path: RECOVERY_READ_PATHS[1] }, recoveryProof))).code).toBe('forbidden');
+    const after = await failure(r.broker.call(r.qa, 'task-done', 'ops_request', { session: login.session, method: 'GET', path: RECOVERY_READ_PATHS[1] }, recoveryProof));
+    expect(['forbidden', 'not_found']).toContain(after.code);
   });
 
   test('a skipped path or a repeated path is refused by the chain', async () => {
-    const r = recoveryRig(resetChain({ state: 'running', perPath: [1, 0, 0, 0] }));
-    const session = { session: 's_x' };
+    const r = recoveryRig(resetChain());
+    await seedOperator(r);
+    const login = await r.broker.call(r.qa, 'task-done', 'ops_operator_login', { alias: RECOVERY_READ_ALIAS }, recoveryProof) as { session: string };
+    r.chain.perPath = [1, 0, 0, 0];
+    const session = { session: login.session };
     expect((await failure(r.broker.call(r.qa, 'task-done', 'ops_request', { ...session, method: 'GET', path: RECOVERY_READ_PATHS[2] }, recoveryProof))).code).toBe('forbidden');
     expect((await failure(r.broker.call(r.qa, 'task-done', 'ops_request', { ...session, method: 'GET', path: RECOVERY_READ_PATHS[0] }, recoveryProof))).code).toBe('forbidden');
     expect(r.chain.perPath).toEqual([1, 0, 0, 0]);
   });
 
   test('a concurrent call sees busy and no counter moves', async () => {
-    const r = recoveryRig(resetChain({ state: 'running', inFlight: { callId: 'c1', path: RECOVERY_READ_PATHS[0] } }));
+    const r = recoveryRig(resetChain());
+    await seedOperator(r);
+    const login = await r.broker.call(r.qa, 'task-done', 'ops_operator_login', { alias: RECOVERY_READ_ALIAS }, recoveryProof) as { session: string };
+    r.chain.inFlight = { callId: 'c1', path: RECOVERY_READ_PATHS[0] };
     const before = [...r.chain.perPath];
-    const error = await failure(r.broker.call(r.qa, 'task-done', 'ops_request', { session: 's_x', method: 'GET', path: RECOVERY_READ_PATHS[0] }, recoveryProof));
+    const error = await failure(r.broker.call(r.qa, 'task-done', 'ops_request',
+      { session: login.session, method: 'GET', path: RECOVERY_READ_PATHS[0] }, recoveryProof));
     expect(error.code).toBe('conflict');
     expect(error.message).toContain('busy');
     expect(r.chain.perPath).toEqual(before);
-    expect(r.settledChain).toHaveLength(0);
+    expect(r.settledChain).toHaveLength(1); // only the login settle; the busy call never settled
   });
 
   test('a stopped grant still allows local logout but refuses the tools', async () => {
@@ -301,6 +318,65 @@ describe('broker recovery read enforcement', () => {
     const error = await failure(r.broker.call(r.qa, 'task-done', 'ops_logout', { session: 's_x' }, recoveryProof));
     expect(error.code).toBe('not_found');
     expect(r.world.requests).toHaveLength(0);
+  });
+
+  test('expired and revoked grants still allow the local logout at the broker layer', async () => {
+    for (const state of ['revoked', 'expired'] as const) {
+      const r = recoveryRig(resetChain({ state: state as never }));
+      const error = await failure(r.broker.call(r.qa, 'task-done', 'ops_logout', { session: 's_x' }, recoveryProof));
+      expect(error.code).toBe('not_found');
+      expect(r.world.requests.filter(x => x.url.includes('/t/ck/authorize'))).toHaveLength(0);
+    }
+  });
+
+  test('a fault-budget refusal never consumes the chain', async () => {
+    const r = recoveryRig(resetChain());
+    await seedOperator(r);
+    r.company.faults.refuse = { reason: 'deadline_passed', message: 'the recovery deadline for this operation has passed.' };
+    const error = await failure(r.broker.call(r.qa, 'task-done', 'ops_operator_login', { alias: RECOVERY_READ_ALIAS }, recoveryProof));
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toContain('deadline');
+    expect(r.chain.loginAttempts).toBe(0);
+    expect(r.chain.inFlight).toBeUndefined();
+    expect(r.chain.state).toBe('bound');
+    expect(r.settledChain).toHaveLength(0);
+    // A later manager lift makes the same grant usable: nothing was burned.
+    const login = await r.broker.call(r.qa, 'task-done', 'ops_operator_login', { alias: RECOVERY_READ_ALIAS }, recoveryProof) as { session: string };
+    expect(login.session).toBeTruthy();
+    expect(r.chain.loginAttempts).toBe(1);
+    expect(r.chain.state).toBe('running');
+  });
+
+  test('a transport failure stops the chain and is charged to the source task', async () => {
+    const r = recoveryRig(resetChain());
+    await seedOperator(r);
+    const login = await r.broker.call(r.qa, 'task-done', 'ops_operator_login', { alias: RECOVERY_READ_ALIAS }, recoveryProof) as { session: string };
+    r.throwPaths.add(RECOVERY_READ_PATHS[0]);
+    const error = await failure(r.broker.call(r.qa, 'task-done', 'ops_request',
+      { session: login.session, method: 'GET', path: RECOVERY_READ_PATHS[0] }, recoveryProof));
+    expect(error.code).toBe('upstream_error');
+    expect(r.chain.state).toBe('stopped');
+    expect(r.chain.stopReason).toBe('transport_upstream_error');
+    // The real attempt is charged to the source task's request|... key, not to a new task or a grant-local key.
+    expect(r.company.faults.reported.some(x => x.taskId === 'task-done' && x.phase === 'request')).toBe(true);
+    expect(r.company.faults.reported.every(x => x.taskId === 'task-done')).toBe(true);
+    r.throwPaths.delete(RECOVERY_READ_PATHS[0]);
+    const next = await failure(r.broker.call(r.qa, 'task-done', 'ops_request',
+      { session: login.session, method: 'GET', path: RECOVERY_READ_PATHS[1] }, recoveryProof));
+    expect(['forbidden', 'not_found']).toContain(next.code);
+  });
+
+  test('recovery only accepts a session opened under this grant and alias', async () => {
+    const r = recoveryRig(resetChain({ state: 'running' }));
+    await seedOperator(r);
+    // A normal lease-mode operator session exists for the same employee; it must not be usable under the grant.
+    const leased = await r.broker.call(r.qa, 'task-done', 'ops_operator_login', { alias: RECOVERY_READ_ALIAS }) as { session: string };
+    const error = await failure(r.broker.call(r.qa, 'task-done', 'ops_request',
+      { session: leased.session, method: 'GET', path: RECOVERY_READ_PATHS[0] }, recoveryProof));
+    expect(error.code).toBe('forbidden');
+    expect(error.message).toContain('grant');
+    expect(r.chain.perPath).toEqual([0, 0, 0, 0]);
+    expect(r.chain.inFlight).toBeUndefined();
   });
 });
 

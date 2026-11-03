@@ -307,3 +307,52 @@ check('an expired grant is closed and a source change is projected as stopped', 
   void closed;
   expect((await core.recoveryReadStatus(gm, { grantId: grant.id }))[0]!.grant.state).toBe('expired');
 });
+
+check('an unsettled inFlight past its deadline becomes stopped(unknown_outcome), never busy forever', async () => {
+  const source = await doneTask(GOAL, '超时源任务');
+  await openEpisode(source);
+  const auth = await doneTask(GOAL, '超时批准');
+  const { grant } = await core.recoveryReadGrant(gm, grantInput(source, auth));
+  await core.recoveryReadBind(eng1, { grantId: grant.id, fence: 1 });
+  const login = await core.recoveryReadReserve(eng1, { grantId: grant.id, grantFence: 1, kind: 'login' });
+  expect(login).toMatchObject({ allowed: true, kind: 'login' });
+  // Before the deadline the grant is busy, not stopped.
+  expect(await core.recoveryReadReserve(eng1, { grantId: grant.id, grantFence: 1, kind: 'login' }))
+    .toMatchObject({ allowed: false, reason: 'busy' });
+  // Simulate a crash/plugin reload that lost the settle: the deadline is already in the past.
+  const held = await database.db.select<{ in_flight?: { path: string; call_id: string } }>(
+    new RecordId('recovery_read_grant', grant.id));
+  await database.db.query(`UPDATE $grant SET in_flight = {
+      path: $path, started_at: time::now() - 120s, deadline: time::now() - 1s, call_id: $callId };`, {
+    grant: new RecordId('recovery_read_grant', grant.id),
+    path: held?.in_flight?.path ?? 'login', callId: held?.in_flight?.call_id ?? login.callId,
+  });
+  // The next reserve advances the chain to its terminal stop instead of answering busy forever.
+  expect(await core.recoveryReadReserve(eng1, { grantId: grant.id, grantFence: 1, kind: 'login' }))
+    .toMatchObject({ allowed: false, reason: 'grant_stopped' });
+  const view = (await core.recoveryReadStatus(gm, { grantId: grant.id }))[0]!.grant;
+  expect(view).toMatchObject({ state: 'stopped', stopReason: 'unknown_outcome', loginAttempts: 1 });
+  expect(view.inFlight).toBeUndefined();
+  // A reload/rebuild sees the terminal state and never rebinds it.
+  expect((await core.recoveryGrantFor(eng1, grant.id)).state).toBe('stopped');
+  expect(await core.recoveryGrantsFor(eng1)).toHaveLength(0);
+  // The stop is auditable.
+  const [rows] = await database.db.query<[Array<{ action: string }>]>(
+    "SELECT action FROM audit WHERE task = $task AND action = 'recovery_read_stop';", { task: new RecordId('task', source) });
+  expect(rows).toHaveLength(1);
+});
+
+check('concurrent issuance creates exactly one chain for a source task', async () => {
+  const source = await doneTask(GOAL, '并发签发源任务');
+  await openEpisode(source);
+  const auth = await doneTask(GOAL, '并发签发批准');
+  const results = await Promise.allSettled([
+    core.recoveryReadGrant(gm, grantInput(source, auth)),
+    core.recoveryReadGrant(gm, grantInput(source, auth)),
+  ]);
+  expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
+  const rejected = results.filter(r => r.status === 'rejected') as PromiseRejectedResult[];
+  expect(rejected).toHaveLength(1);
+  expect((rejected[0]!.reason as { code?: string }).code).toBe('conflict');
+  expect(await core.recoveryReadStatus(gm, { taskId: source })).toHaveLength(1);
+});

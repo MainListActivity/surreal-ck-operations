@@ -7,10 +7,14 @@
     "opsScope 增加 proof 绑定的 recovery_read 分支：按 (员工, 源 taskId, grantId, fence) 校验，与执行租约互斥；不写 current_employee/state，写工具永远不成立。",
     "broker fail-closed：recovery 绑定下只允许一次 ops_operator_login（别名固定）、按 1→2→3→4 顺序的四条 GET（每条一次、method 必须 GET、无 body）与必要 ops_logout；其余工具与写操作一律 forbidden。登录失败、顺序跳过/重复、并发 busy、非预期响应都会停链。",
     "链级原子 reserve/settle：登录一次、每路径一次、inFlight 单飞；停止后不再 reserve，但 logout 永远放行；新 grant 默认拒绝，rearm 必须换 authorizationTask 且原样承接 loginAttempts/perPath，不清零。",
+    "inFlight 超过 deadline 仍未 settle（进程崩溃/插件重载/丢失 settle）→ 原子推进为 stopped(unknown_outcome) 并清空 inFlight，该路径不重试；下一次 reserve、状态读取、绑定或重载查询都会看到终态，不再永久 busy。",
+    "故障预算拒绝不烧链：broker 先做 fault reserve，被拒即返回；链级 reserve 拒绝时退回刚预留的故障尝试。源任务 login 键因 deadline_passed 被拒后，经理 lift 仍可使用同一 grant。",
+    "恢复通道的 session 必须属于本 grant 且别名一致：同一员工的旧会话、别的 grant 的会话都不能借用；未知句柄在 reserve 前拒绝（logout 例外，仅本地 not_found，不重登）。",
+    "签发以源任务链头记录串行化：并发 gm 签发只有一笔建成链，另一笔 conflict；rearm 在同一事务里推进链头并承接上一 grant 的计数。expiresAt 必须带时区偏移；签发审计只含 ID/布尔/受限字段。",
     "逐项成功判据：第 1 项 503 + endpoint-probe-temporary-grant-not-configured 是预期成功；第 2 项 format_version=1 + operators 数组；第 3 项固定投影 + loopback endpoint；第 4 项 origin.state=known + 40 位 hex sha + deploymentId \\d+-\\d+。非预期即停链。",
     "审计只存 ID/布尔/受限字段与 body 摘要：recovery_read_call 不含 subject、session、token、URL 或原始 body；recovery_read_grant / recovery_read_bind / recovery_read_close / recovery_read_revoke 均写可读审计。",
     "sidecar 新增独立 recoveryClaims 与受控唤醒/重载重建：用户请求里的 taskId/sourceTaskId/grantId/grantFence/fence 一律拒绝；执行租约在身时拒绝绑定，领执行租约时关闭恢复绑定；过期/撤销/源任务变化由 sweeper 关闭绑定并只丢弃本 grant 的本地会话。dispatcher 按 grant 载荷唤醒被授权员工，不抢占 busy 会话。",
-    "回归：tests/recovery-read.test.ts（22 例，已登记 test:bridge）覆盖四条路径/TTL/分类、broker 允许面与停链、并发 busy、预算键仍为源 taskId、sidecar 绑定/覆盖拒绝/互斥/过期/重载；tests/recovery-read.fork.test.ts（7 例，RUN_COMPANY_PROOF_FORK_TESTS=1）在隔离公司 fork 上覆盖签发校验、计数原子性、rearm 承接、撤销、审计可见性与 opsScope 绑定。"
+    "回归：tests/recovery-read.test.ts（27 例，已登记 test:bridge）覆盖四条路径/TTL（含时区偏移）/分类、broker 允许面与停链、预算拒绝不烧链、传输失败停链并记账、session 绑定、并发 busy、预算键仍为源 taskId、sidecar 绑定/覆盖拒绝/互斥/过期/重载；tests/recovery-read.fork.test.ts（9 例，RUN_COMPANY_PROOF_FORK_TESTS=1）在隔离公司 fork 上覆盖签发校验、计数原子性、rearm 承接、撤销、审计可见性、opsScope 绑定、inFlight 超时终态与并发签发。"
   ],
   "impact": [
     "不改变任何既有任务的字段、状态或租约语义；没有 grant 时 ops 调用行为与 0.3.75 完全一致。",

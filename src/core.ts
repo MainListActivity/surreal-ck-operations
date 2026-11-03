@@ -4040,6 +4040,37 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     })).reverse();
   }
 
+  /**
+   * H6：inFlight 超过 deadline 仍未 settle（进程崩溃、插件重载、丢失 settle）时，链级终态是
+   * stopped(unknown_outcome)，该路径不重试。这里做一次幂等推进；并发 settle 或另一次 stop 赢了就返回 false。
+   */
+  private async recoveryStopIfOverdue(grantId: string): Promise<boolean> {
+    const row = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
+    if (!row || (row.state !== 'bound' && row.state !== 'running') || !row.in_flight) return false;
+    const deadline = this.recoveryMs(row.in_flight.deadline);
+    if (!Number.isFinite(deadline) || deadline > Date.now()) return false;
+    try {
+      await this.txTask(`BEGIN;
+        LET $g = SELECT * FROM ONLY $grant;
+        IF $g = NONE { THROW 'recovery grant not found' };
+        IF $g.in_flight = NONE { THROW 'recovery call moved' };
+        IF $g.in_flight.deadline > time::now() { THROW 'recovery call still in flight' };
+        UPDATE ONLY $grant SET state = 'stopped', stop_reason = 'unknown_outcome', in_flight = NONE,
+          closed_at = time::now(), version = $g.version + 1;
+        CREATE ONLY $audit CONTENT { task: $g.source_task, actor: $g.employee, action: 'recovery_read_stop',
+          evidence: $evidence, at: time::now() };
+        RETURN $g;
+        COMMIT;`, {
+        grant: id('recovery_read_grant', grantId), audit: id('audit', randomUUID()),
+        evidence: JSON.stringify({ grantId, reason: 'unknown_outcome', path: row.in_flight.path ?? 'login' }).slice(0, 4000),
+      });
+      return true;
+    } catch {
+      // 并发 settle / 另一次 stop 已推进；调用方重新读状态即可。
+      return false;
+    }
+  }
+
   private async recoveryStatusOf(credential: Credential, input: { taskId?: TaskId; grantId?: string }): Promise<RecoveryReadStatusView[]> {
     const actor = await this.authenticate(credential);
     let rows: RecoveryReadGrantDbRow[];
@@ -4060,6 +4091,16 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       if (task?.reviewer_role === actor.role) reviewer = true;
     }
     if (actor.role !== 'gm' && !reviewer) rows = rows.filter(row => asId(row.employee) === actor.employeeId);
+    // H6：读状态也把超时的 inFlight 推进为 stopped(unknown_outcome)，QA 看到的是终态而不是永久 busy。
+    const refreshed: RecoveryReadGrantDbRow[] = [];
+    for (const row of rows) {
+      const key = this.recoveryKey(normalizedId(row.id));
+      if (await this.recoveryStopIfOverdue(key)) {
+        const again = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', key));
+        if (again) refreshed.push(again);
+      } else refreshed.push(row);
+    }
+    rows = refreshed;
     const views: RecoveryReadStatusView[] = [];
     for (const row of rows) views.push({ grant: this.recoveryView(row), calls: await this.recoveryCallsOf(asId(row.id)) });
     return views;
@@ -4131,11 +4172,10 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         throw new CompanyError('conflict', 'The existing recovery read chain is still active; revoke it before rearming');
       }
     }
-    // 新 grant/rearm 从上一链原样承接计数：登录失败过一次，就再也不会有第二次登录机会。
-    const loginAttempts = previous?.login_attempts ?? 0;
-    const perPath = previous?.per_path ? [...previous.per_path] : [0, 0, 0, 0];
+    // 新 grant/rearm 的计数由签发事务从链头原样承接：登录失败过一次，就再也不会有第二次登录机会。
     const grantId = randomUUID();
     const grant = id('recovery_read_grant', grantId);
+    const chainId = id('recovery_read_chain', HASH(`recovery_read_chain\0${input.taskId}`));
     try {
       const row = await this.txTask<RecoveryReadGrantDbRow>(`BEGIN;
         LET $src = SELECT * FROM ONLY $source;
@@ -4143,27 +4183,37 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         IF $src.version != $sourceVersion { THROW 'recovery source task moved' };
         LET $approval = SELECT * FROM ONLY $authorization;
         IF $approval = NONE OR $approval.state != 'done' { THROW 'recovery authorization task moved' };
+        LET $chain = SELECT * FROM ONLY $chainId;
+        LET $has = $chain != NONE;
+        LET $latest = IF $has { SELECT * FROM ONLY $chain.latest_grant } ELSE { { login_attempts: 0, per_path: [0, 0, 0, 0], authorization_task: NONE, state: 'none' } };
+        IF $has AND $rearm = false { THROW 'recovery chain already exists' };
+        IF $has AND $latest.authorization_task = $authorization { THROW 'recovery chain rearm needs a new authorization task' };
+        IF $has AND $latest.state IN ['bound', 'running'] { THROW 'recovery chain is still active' };
         CREATE ONLY $grant CONTENT {
           source_task: $source, employee: $employee, alias: $alias, methods: ['GET'], paths: $paths,
           max_login: $maxLogin, max_calls_per_path: $maxCalls, expires_at: <datetime>$expiresAt,
           authorization_task: $authorization, reason: $reason, state: 'issued',
-          login_attempts: $loginAttempts, per_path: $perPath, in_flight: NONE, stop_reason: '', result_digest: '',
+          login_attempts: $latest.login_attempts, per_path: $latest.per_path,
+          in_flight: NONE, stop_reason: '', result_digest: '',
           created_by: $creator, created_at: time::now(), bound_at: NONE, closed_at: NONE, fence: 1, version: 1
         };
         LET $created = SELECT * FROM ONLY $grant;
+        IF $has { UPDATE ONLY $chainId SET latest_grant = $grant, version = $chain.version + 1; }
+        ELSE { CREATE ONLY $chainId CONTENT { task: $source, latest_grant: $grant, version: 1 }; };
         CREATE ONLY $audit CONTENT { task: $source, actor: $actor, action: 'recovery_read_grant',
           evidence: $evidence, at: time::now() };
         CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $created };
         RETURN $created;
         COMMIT;`, {
         source: id('task', input.taskId), sourceVersion: source.version, authorization: id('task', input.authorizationTask),
-        employee: id('employee', input.employeeId), grant, alias: input.alias, paths,
+        employee: id('employee', input.employeeId), grant, chainId, alias: input.alias, paths,
         maxLogin: RECOVERY_READ_MAX_LOGIN, maxCalls: RECOVERY_READ_MAX_CALLS_PER_PATH,
-        expiresAt: expiresAt.toISOString(), reason: input.reason, loginAttempts, perPath,
+        expiresAt: expiresAt.toISOString(), reason: input.reason,
+        rearm: input.rearm === true,
         creator: actor.employeeId, digest, idem, audit: id('audit', randomUUID()),
         actor: id('employee', actor.employeeId),
-        evidence: JSON.stringify({ grantId, taskId: input.taskId, employeeId: input.employeeId, alias: input.alias,
-          paths, expiresAt: expiresAt.toISOString(), authorizationTask: input.authorizationTask, rearm: input.rearm === true }).slice(0, 4000),
+        evidence: JSON.stringify({ grantId, taskId: input.taskId, employeeId: input.employeeId,
+          authorizationTask: input.authorizationTask, rearm: input.rearm === true }).slice(0, 4000),
       });
       return { grant: this.recoveryView(row), calls: [] };
     } catch (error) {
@@ -4208,7 +4258,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   /** 通道只读查询：按员工凭证取其自己的 grant；未过期的 inactive 也返回，由通道决定拒绝。 */
   async recoveryGrantFor(credential: Credential, grantId: string): Promise<RecoveryReadGrantRowView> {
     const actor = await this.authorized(credential);
-    const row = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', this.recoveryKey(grantId)));
+    const key = this.recoveryKey(grantId);
+    await this.recoveryStopIfOverdue(key);
+    const row = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', key));
     if (!row || asId(row.employee) !== actor.employeeId) throw new CompanyError('not_found', 'Recovery read grant not found for this employee');
     const view = this.recoveryView(row);
     // 读时投影：不写行；过期或源任务离开 done 时通道据此关闭绑定。
@@ -4230,6 +4282,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
          ORDER BY created_at DESC;`, { employee: id('employee', actor.employeeId) });
     const active: RecoveryReadGrantRowView[] = [];
     for (const row of rows) {
+      const key = this.recoveryKey(normalizedId(row.id));
+      if (await this.recoveryStopIfOverdue(key)) continue;
       if (this.recoveryMs(row.expires_at) <= Date.now()) continue;
       const source = await this.db.select<{ state?: string }>(id('task', asId(row.source_task)));
       if (source?.state !== 'done') continue;
@@ -4242,6 +4296,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   async recoveryReadBind(credential: Credential, input: { grantId: string; fence: number }): Promise<RecoveryReadGrantRowView> {
     const actor = await this.authorized(credential);
     const grantId = this.recoveryKey(input.grantId);
+    await this.recoveryStopIfOverdue(grantId);
     const grant = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
     if (!grant || asId(grant.employee) !== actor.employeeId) throw new CompanyError('not_found', 'Recovery read grant not found for this employee');
     if (grant.fence !== input.fence) throw new CompanyError('forbidden', 'Recovery read grant proof does not match');
@@ -4282,6 +4337,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const actor = await this.authorized(credential);
     const grantId = this.recoveryKey(input.grantId);
     if (!Number.isSafeInteger(input.grantFence) || input.grantFence < 1) throw new CompanyError('invalid', 'Invalid grant fence');
+    // H6：上一次调用超过 deadline 仍未 settle → 先推进为 stopped(unknown_outcome)，再按终态拒绝。
+    await this.recoveryStopIfOverdue(grantId);
     const grant = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
     if (!grant || asId(grant.employee) !== actor.employeeId || grant.fence !== input.grantFence) {
       throw new CompanyError('forbidden', 'Recovery read grant proof does not match');
