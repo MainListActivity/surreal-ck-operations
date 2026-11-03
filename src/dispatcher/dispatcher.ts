@@ -1478,18 +1478,17 @@ export class Dispatcher {
     /**
      * A bound implementer is struck when its session cannot take the task back: the employee is no longer live, or this
      * pass observed the session as down — archived, quarantined, or parked in a failure that cannot be restarted. Busy,
-     * idle, exhausted and unknown are not struck unless an explicit code-repo rebind has left
+     * idle, exhausted and unknown are not struck unless the effective repository has left
      * that session outside the task's repository: waiting cannot move a repository-bound session.
      */
     const implementerUnavailableReason = (employeeId: string, task: SupervisedTask, home: string): string | undefined => {
       const inst = insts.find(i => i.id === employeeId);
       if (!inst || states.get(inst.id) === 'down' || (!!inst.def && !defs.some(d => d.id === inst.def && d.enabled)))
         return '员工退役/撤凭证，或会话归档、无法就地重启';
-      // A manager's explicit code-repo correction changes the task's dispatch home, not the
-      // existing session's home. That session is permanently outside this task's legal pool.
-      // Do not loosen cross-repo admission or infer a correction from a project change alone.
-      if (task.codeRepoPath === home && (inst.repoHome ?? inst.cwd ?? this.deps.env.opsRepo) !== home)
-        return `任务代码仓已显式改绑为 ${home}，原实现人会话仍属于 ${inst.repoHome ?? inst.cwd ?? this.deps.env.opsRepo}`;
+      // repoPath is already the authoritative effective repository (code override, task project, goal project).
+      // A live session in another repository is permanently outside staffingPool, too.
+      if ((inst.repoHome ?? inst.cwd ?? this.deps.env.opsRepo) !== home)
+        return `任务代码仓为 ${home}，原实现人会话仍属于 ${inst.repoHome ?? inst.cwd ?? this.deps.env.opsRepo}`;
       // A goal-scoped session only ever takes work of its own goal (staffing inWorkspace), so an implementer bound across
       // goals — by a takeover, or a task moved to another goal phase — can never be dispatched the task back.
       const scope = workspaceScopeFor(task.goalId);
