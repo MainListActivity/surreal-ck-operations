@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { egoBrowserInjector, oidcUserEntry } from '../src/ops/browser.ts';
 import { controlPlaneEnv, parseBrokerConfig } from '../src/ops/config.ts';
 import { cloudflareD1 } from '../src/ops/d1.ts';
-import { createOpsFetcher, opsConnectOptions, OPS_CONNECT_TIMEOUT_MS, type Fetcher } from '../src/ops/fetcher.ts';
+import { createOpsFetcher, opsConnectOptions, OPS_CONNECT_TIMEOUT_MS, wholeMs, type Fetcher } from '../src/ops/fetcher.ts';
 import { LoginError, jwtExpiry, passwordLogin } from '../src/ops/idp.ts';
 import { generatePassword, hashPassword, verifyPassword } from '../src/ops/password.ts';
 import { ProductUnreachable, assertProductPath, productRequest, productTimeoutMs } from '../src/ops/product.ts';
@@ -670,5 +670,113 @@ describe('ego-browser injector', () => {
   test('a missing CLI is a configuration problem, not a crash', async () => {
     const error = await failure(egoBrowserInjector({ ...input('/nonexistent/ego-browser') }));
     expect(error.code).toBe('not_configured');
+  });
+});
+
+describe('timer delays from a fractional clock', () => {
+  /** Capture exactly what reaches AbortSignal.timeout: the timer rejects a fractional delay with RangeError. */
+  async function captureTimeouts<T>(run: () => Promise<T>): Promise<{ value?: T; error?: unknown; delays: number[] }> {
+    const original = AbortSignal.timeout;
+    const delays: number[] = [];
+    (AbortSignal as unknown as { timeout: (ms: number) => AbortSignal }).timeout = (ms: number) => {
+      delays.push(ms);
+      return original.call(AbortSignal, ms);
+    };
+    try {
+      return { value: await run(), delays };
+    } catch (error) {
+      return { error, delays };
+    } finally {
+      (AbortSignal as unknown as { timeout: typeof original }).timeout = original;
+    }
+  }
+
+  const json = (status: number, body: unknown) =>
+    new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  const redirect = (location: string) => new Response(null, { status: 302, headers: { location } });
+
+  /**
+   * A scripted IdP/product transport on a fractional clock. The authorize hop costs [authorizeMs] so the next step's
+   * budget remainder is a fraction smaller than the step limit — the production shape (`performance.now()`
+   * differences) that used to reach `AbortSignal.timeout` unrounded.
+   */
+  function scriptedFlow(clock: { now: number }, options: { authorizeMs: number; loginReply: (state: string) => Response }) {
+    let state = '';
+    return async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith('/authorize')) {
+        state = url.searchParams.get('state') ?? state;
+        clock.now += options.authorizeMs;
+        input; // the URL is only read for routing; no request detail is returned
+        return redirect('https://auth.test/login/ck?login_challenge=CH-1');
+      }
+      if (url.pathname.endsWith('/password')) {
+        clock.now += 300;
+        if ((options.loginReply(state).status ?? 0) === 200) clock.now += 200.5; // body time is a fraction too
+        return options.loginReply(state);
+      }
+      // Token exchange: product proxy (customer/operator) or the IdP's own /token (ops).
+      clock.now += 200;
+      return json(200, { access_token: 'at-1', expires_in: 900 });
+    };
+  }
+
+  const broker = {
+    roles: ['qa', 'engineering'],
+    idp: {
+      issuer: 'https://auth.test/t/ck', clientId: 'client-ck-1234', audience: 'https://auth.test',
+      redirectUri: 'https://app.test/auth/callback', scope: 'openid',
+      ops: { clientId: 'ops-idp-client', audience: 'https://app.test/api/ops/mcp', redirectUri: 'https://idp.test/auth/cb' },
+    },
+    ops: { clientId: 'ops-client-1', redirectUri: 'https://app.test/auth/ops/callback', resource: 'https://app.test/api/ops/mcp', scope: 'openid' },
+    product: { url: 'https://app.test' },
+    accounts: { prefix: 'sck-', emailDomain: 'example.test', workspacePrefix: 'sck-' },
+    limits: { workspacesPerDay: 2, accountsPerDay: 3 },
+  } as const;
+
+  const options = (clock: { now: number }, fetcher: Fetcher, channel?: 'operator' | 'ops') => ({
+    fetch: fetcher, clock: () => clock.now, budgetMs: 12_000, stepTimeoutMs: 6_000, retryMinLeftMs: 100,
+    ...(channel ? { channel } : {}),
+  });
+
+  test('a fractional budget remainder still logs in: every timer delay is an integer at or above the 2 s floor', async () => {
+    const clock = { now: 0 };
+    const run = captureTimeouts(() => passwordLogin(broker as never, 'u', 'pw', options(clock,
+      scriptedFlow(clock, {
+        authorizeMs: 7_000.5,
+        loginReply: state => json(200, { redirect_uri: `https://app.test/auth/callback?code=c1&state=${state}` }),
+      }))));
+    const { value, error, delays } = await run;
+    expect(error).toBeUndefined();
+    expect(value?.accessToken).toBe('at-1');
+    // Step 1 at t=0 gets the whole 6 s step limit; steps 2 and 3 see the fractional remainder (3899.5 / 3399.5).
+    expect(delays).toEqual([6_000, 3_899, 3_399]);
+    for (const delay of delays) {
+      expect(Number.isInteger(delay)).toBe(true);
+      expect(delay).toBeGreaterThanOrEqual(2_000); // MIN_STEP_MS
+    }
+  });
+
+  test('the operator and ops channels share the same integer step guard', async () => {
+    for (const channel of ['operator', 'ops'] as const) {
+      const clock = { now: 0 };
+      // A 403 at the login hop ends the flow right after the fractional step; the point is that the step itself ran.
+      const { error, delays } = await captureTimeouts(() => passwordLogin(broker as never, 'u', 'pw', options(clock,
+        scriptedFlow(clock, { authorizeMs: 7_000.5, loginReply: () => json(403, {}) }), channel)));
+      expect(error).toBeInstanceOf(LoginError);
+      expect(String((error as Error).name)).not.toBe('RangeError');
+      expect(delays).toEqual([6_000, 3_899]);
+      for (const delay of delays) expect(Number.isInteger(delay)).toBe(true);
+    }
+  });
+
+  test('wholeMs floors clock-derived delays, keeps integers and holds the 1 ms timer minimum', () => {
+    expect(wholeMs(24_356.63)).toBe(24_356);
+    expect(wholeMs(23_725.19)).toBe(23_725);
+    expect(wholeMs(2_000)).toBe(2_000);
+    expect(wholeMs(0.4)).toBe(1);
+    expect(wholeMs(-5)).toBe(1);
+    // Non-finite input is a broken clock, not a licence for a hidden 1 ms wait.
+    expect(Number.isNaN(wholeMs(Number.NaN))).toBe(true);
   });
 });

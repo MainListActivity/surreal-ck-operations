@@ -5,7 +5,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { CompanyError } from '../core-errors.ts';
 import type { D1Client } from './d1.ts';
-import { describeTransportFailure, opsFetch, type Fetcher } from './fetcher.ts';
+import { describeTransportFailure, opsFetch, wholeMs, type Fetcher } from './fetcher.ts';
 
 const invalid = (message: string) => new CompanyError('invalid', message);
 
@@ -191,7 +191,7 @@ export async function idpAdminRequest(
     body = JSON.stringify(request.body);
     if (Buffer.byteLength(body) > MAX_BODY_BYTES) throw invalid('request body too large');
   }
-  const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  const timeoutMs = wholeMs(options.timeoutMs ?? REQUEST_TIMEOUT_MS);
   let response: Response;
   let raw: string;
   try {

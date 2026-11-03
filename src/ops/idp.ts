@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { CompanyError } from '../core-errors.ts';
 import { isProvablyUnsentFailure, type FlowStage } from '../faults.ts';
 import type { BrokerConfig } from './config.ts';
-import { describeTransportFailure, isTlsTrustFailure, OPS_CONNECT_TIMEOUT_MS, opsFetch, transportErrno, type ConnectAwareFetcher, type Fetcher } from './fetcher.ts';
+import { describeTransportFailure, isTlsTrustFailure, OPS_CONNECT_TIMEOUT_MS, opsFetch, transportErrno, wholeMs, type ConnectAwareFetcher, type Fetcher } from './fetcher.ts';
 
 /**
  * The machine facts of the hop that failed. The fault classifier reads them; no message is ever parsed for them,
@@ -391,7 +391,9 @@ export async function passwordLogin(
   const io: Io = {
     fetcher: options.fetch ?? opsFetch,
     step: () => {
-      const ms = Math.min(stepMs, Math.max(Math.min(left(), attemptLeft()), MIN_STEP_MS));
+      // The remainder is a clock difference and may be fractional; the timer only accepts an integer. Flooring
+      // never goes below MIN_STEP_MS because the floor is applied before it.
+      const ms = wholeMs(Math.min(stepMs, Math.max(Math.min(left(), attemptLeft()), MIN_STEP_MS)));
       return { signal: AbortSignal.timeout(ms), ms };
     },
     left,
