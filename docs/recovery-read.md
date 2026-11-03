@@ -50,3 +50,30 @@ broker 在调用前 `reserveFault` 预留一次故障预算；如果随后**链�
 - 真实上游成功仍走 `settleFault`：`failed=false`、`attempts=0`、`next_allowed_at=now`，累计
   `total_attempts` 保留。**不得**用 `settleFault` 处理未执行的调用。
 - 源任务 id 保持不变；本流程不新建任务、不换预算键、不自动 lift。
+
+## 5. 发布门禁与 schema 回执（0.3.76 起）
+
+- **本机 recovery-fork 门禁**：`scripts/release-gate.sh recovery-fork <release>` 用官方隔离 runner
+  （`scripts/test-worktrees.ts`）在自建公司 fork 上跑 `tests/recovery-read.fork.test.ts` 与
+  `tests/fault-budget.fork.test.ts`，显式设置 `RUN_COMPANY_PROOF_FORK_TESTS=1`。两个文件都必须打印
+  自己的 executed 标记：**被 skip 的文件不算通过**，门禁记录为 fail。回执按 commit、服务 Bun 版本与
+  darwin 平台绑定；`company-service.sh install` 与 `check-gate` 缺同 SHA / 错 Bun / 非 darwin / fail 的
+  回执都拒绝安装。门禁只连自建 fork，不连默认或生产库，也不下载任何上游替代品。
+- **门禁集合按版本走**：0.3.76 起三道门禁（comm-slow-pipe、sidecar-review、recovery-fork）都是必需；
+  0.3.75 及更早的版本不认识 recovery-fork 这道门禁（它的 `release-gate.sh` 里没有这个分支），
+  因此只校验两道历史门禁——否则回滚到旧版本会被自己的回执挡住。阈值只有一处：
+  `scripts/company-service.sh` 的 `RECOVERY_FORK_GATE_VERSION` 与 `src/company-release.ts` 的
+  `RELEASE_GATE_SETS` 必须一致（有测试守着）。版本读不出来时按更严的一组处理。
+- **schema 回执**：升级验证按**目标版本**要求 schema。0.3.76 起要求 `schema_version >= 49` 且
+  `recovery_read_grant` / `recovery_read_chain` / `recovery_read_call` 三张表都在运行库中（只读回读
+  `company_meta:installation` 与 `INFO FOR DB`）。缺任一项 → 保持 paused / failed，不记 verified。
+  旧目标版本沿用旧下限（41），不会被硬套 49。回执只读，不写任何 marker。
+
+## 6. 两个容易误读的事实
+
+- **paused 不阻止 recovery wake**：公司被暂停时，dispatcher 仍在常规派工之前发出恢复读取唤醒
+  （`dispatcher.ts` 的 recovery wake 段早于 `cfg.paused` 的全局闸门）。这是既有事实，不是本版新增的
+  权限；暂停只挡常规派工。本版不放开也不收紧它，只如实记录。
+- **回退版本健康 ≠ grant 全闭锁证据**：回退到旧版本只说明那个版本的服务重新健康，它不证明任何
+  recovery-read grant 链已被完整关闭、审计齐备或预算归零。grant 的闭锁证据只能来自
+  `recovery_read_status` 的状态与 `recovery_read_call` 的调用审计。

@@ -2,6 +2,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
+import { gatesFor, GATE_ARGUMENTS, RELEASE_GATE_SETS } from '../src/company-release.ts';
 
 // Local release gate (SYS01 AC-B). The macOS slow-pipe regression has no hosted runner any more: company-service.sh install must
 // refuse a release unless scripts/release-gate.sh recorded a passing run for that commit on the Bun runtime the services run with
@@ -93,11 +94,52 @@ function writeRecord(home: string, sha: string, fields: Record<string, unknown>,
   writeFileSync(join(dir, `${sha}.json`), JSON.stringify(record));
 }
 
-/** Both release gates are required: a release is not installable with only one passing record. */
+/** Every release gate is required: a release is not installable with only one passing record. */
 function writeBoth(home: string, sha: string, fields: Record<string, unknown> = {}) {
   writeRecord(home, sha, fields, 'comm-slow-pipe');
   writeRecord(home, sha, fields, 'sidecar-review');
+  writeRecord(home, sha, fields, 'recovery-fork');
 }
+
+test('the gate set follows the release version: an older release keeps the two historical gates', () => {
+  const home = serviceHome();
+  try {
+    // A release before the recovery-fork gate existed does not know that gate. Demanding its record would make a
+    // rollback to that release impossible, so such a release is checked against the two historical gates only.
+    mkdirSync(join(home, 'releases', SHA), { recursive: true });
+    writeFileSync(join(home, 'releases', SHA, 'package.json'), JSON.stringify({ version: '0.3.75' }));
+    writeRecord(home, SHA, {}, 'comm-slow-pipe');
+    writeRecord(home, SHA, {}, 'sidecar-review');
+    expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(0);
+    // The current release carries the third gate and needs its record.
+    writeFileSync(join(home, 'releases', SHA, 'package.json'), JSON.stringify({ version: '0.3.76' }));
+    expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(1);
+    writeRecord(home, SHA, {}, 'recovery-fork');
+    expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(0);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+describe('the gate set a version carries', () => {
+  test('0.3.76 and later carry the recovery-fork gate; an older version keeps the two historical gates', () => {
+    expect(gatesFor('0.3.76')).toEqual(['comm-slow-pipe', 'sidecar-review', 'recovery-fork']);
+    expect(gatesFor('0.3.77')).toEqual(['comm-slow-pipe', 'sidecar-review', 'recovery-fork']);
+    expect(gatesFor('0.4.0')).toEqual(['comm-slow-pipe', 'sidecar-review', 'recovery-fork']);
+    expect(gatesFor('0.3.75')).toEqual(['comm-slow-pipe', 'sidecar-review']);
+    expect(gatesFor('0.2.0')).toEqual(['comm-slow-pipe', 'sidecar-review']);
+  });
+
+  test('the shell installer and the core agree on the version that adds the gate', () => {
+    // scripts/company-service.sh keeps its own copy of the threshold (it runs without the core); the two must
+    // not drift, or the installer would demand a gate record the upgrade worker never asks for.
+    const shell = readFileSync(SERVICE, 'utf8');
+    const threshold = shell.match(/RECOVERY_FORK_GATE_VERSION=(\d+\.\d+\.\d+)/)?.[1];
+    expect(threshold).toBe(RELEASE_GATE_SETS[0]!.version);
+    expect(GATE_ARGUMENTS['recovery-fork']).toBe('recovery-fork');
+    expect(GATE_ARGUMENTS['comm-slow-pipe']).toBe('slow-pipe');
+  });
+});
 
 test('a release with no gate record is refused by check-gate, which install runs before it switches', () => {
   const home = serviceHome();
@@ -110,12 +152,15 @@ test('a release with no gate record is refused by check-gate, which install runs
   }
 });
 
-test('check-gate refuses a release with only one of the two required gate records', () => {
+test('check-gate refuses a release with only some of the required gate records', () => {
   const home = serviceHome();
   try {
     writeRecord(home, SHA, {}, 'comm-slow-pipe');
     expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(1);
     writeRecord(home, SHA, {}, 'sidecar-review');
+    // The recovery-fork gate is required as well: two of three records do not install.
+    expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(1);
+    writeRecord(home, SHA, {}, 'recovery-fork');
     expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(0);
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -230,8 +275,9 @@ test.skipIf(!existsSync('/usr/bin/python3'))('a gate run writes the record check
     expect(pass.out).toContain(`comm-slow-pipe pass for ${SHA} on bun ${PINNED}`);
     expect(readFileSync(join(home, 'gates', 'comm-slow-pipe', `${SHA}.log`), 'utf8')).toContain('control=1');
     expect(JSON.parse(readFileSync(recordFile, 'utf8'))).toMatchObject({ gate: 'comm-slow-pipe', sha: SHA, bun: PINNED, platform: 'darwin', result: 'pass', exitCode: 0 });
-    // Both gates are required for install; this test exercises the slow-pipe record itself.
+    // Every gate is required for install; this test exercises the slow-pipe record itself.
     writeRecord(home, SHA, {}, 'sidecar-review');
+    writeRecord(home, SHA, {}, 'recovery-fork');
     expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(0);
 
     const red = sh(GATE, ['slow-pipe', release], home, { FAKE_TEST_RC: '1' });
@@ -273,14 +319,64 @@ test.skipIf(!existsSync('/usr/bin/python3'))('a sidecar-review gate run records 
   }
 });
 
-test('install checks the gate before it points the active release at the new one', () => {
+test('install checks every gate before it points the active release at the new one', () => {
   const script = readFileSync(SERVICE, 'utf8');
-  const slow = script.indexOf('check_gate comm-slow-pipe "$sha"');
-  const review = script.indexOf('check_gate sidecar-review "$sha"');
+  // The gates of the release are checked in a loop that runs before the active symlink is switched, and the loop
+  // covers every gate a current release carries — a missing record must stop the install, not follow the switch.
+  const loop = script.indexOf('for gate in $(required_gates "$release"); do');
+  const check = script.indexOf('check_gate "$gate" "$sha"');
   const switchPoint = script.indexOf('ln -s "$release" "$service_home/active.next"');
-  expect(slow).toBeGreaterThan(0);
-  expect(review).toBeGreaterThan(slow);
-  expect(switchPoint).toBeGreaterThan(review);
+  expect(loop).toBeGreaterThan(0);
+  expect(check).toBeGreaterThan(loop);
+  expect(switchPoint).toBeGreaterThan(check);
+  // Every gate of the current release is named in the gate set the installer reads.
+  for (const gate of gatesFor('0.3.76')) expect(script).toContain(gate);
+});
+
+test.skipIf(!existsSync('/usr/bin/python3'))('the recovery-fork gate runs the isolated runner with its opt-in and only passes when the checks really ran', () => {
+  const home = serviceHome();
+  try {
+    const release = join(home, 'releases', SHA);
+    mkdirSync(join(release, 'tests'), { recursive: true });
+    writeFileSync(join(release, 'tests', 'recovery-read.fork.test.ts'), '');
+    writeFileSync(join(release, 'tests', 'fault-budget.fork.test.ts'), '');
+    mkdirSync(join(release, 'scripts'), { recursive: true });
+    writeFileSync(join(release, 'scripts', 'test-worktrees.ts'), '');
+    const argvFile = join(home, 'argv.txt');
+    const pinned = join(home, 'runtime-bun', 'bin', 'bun');
+    // The stand-in runs the official runner: it records the arguments and the opt-in it was given.
+    writeFileSync(pinned, `#!/bin/sh\n[ "$1" = --version ] && { echo 1.4.2; exit 0; }\nprintf '%s\\n' "$@" > "${argvFile}"\necho "optin=\${RUN_COMPANY_PROOF_FORK_TESTS:-0}"\n\${FAKE_MARKER:-echo done}\nexit "\${FAKE_TEST_RC:-0}"\n`);
+    chmodSync(pinned, 0o755);
+
+    // A run whose checks were skipped prints no executed marker: the gate records a failure, not a pass.
+    const skipped = sh(GATE, ['recovery-fork', release], home);
+    expect(skipped.code).toBe(1);
+    expect(skipped.err).toContain('a skipped check is not a pass');
+    const record = JSON.parse(readFileSync(join(home, 'gates', 'recovery-fork', `${SHA}.json`), 'utf8'));
+    expect(record).toMatchObject({ gate: 'recovery-fork', sha: SHA, bun: PINNED, platform: 'darwin', result: 'fail' });
+    // The gate drove the official isolated runner with the opt-in and both machine checks.
+    const argv = readFileSync(argvFile, 'utf8');
+    expect(argv).toContain('scripts/test-worktrees.ts');
+    expect(argv).toContain('tests/recovery-read.fork.test.ts');
+    expect(argv).toContain('tests/fault-budget.fork.test.ts');
+    expect(readFileSync(join(home, 'gates', 'recovery-fork', `${SHA}.log`), 'utf8')).toContain('optin=1');
+
+    // The checks really ran: the marker is printed and the record opens the gate.
+    const passed = sh(GATE, ['recovery-fork', release], home, { FAKE_MARKER: 'echo "recovery-read.fork executed"; echo "fault-budget.fork executed"' });
+    expect(passed.code).toBe(0);
+    expect(JSON.parse(readFileSync(join(home, 'gates', 'recovery-fork', `${SHA}.json`), 'utf8'))).toMatchObject({ result: 'pass', exitCode: 0 });
+    writeRecord(home, SHA, {}, 'comm-slow-pipe');
+    writeRecord(home, SHA, {}, 'sidecar-review');
+    expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(0);
+
+    // A regression in the checks closes the gate again.
+    const red = sh(GATE, ['recovery-fork', release], home, { FAKE_TEST_RC: '1', FAKE_MARKER: 'echo "recovery-read.fork executed"; echo "fault-budget.fork executed"' });
+    expect(red.code).toBe(1);
+    expect(JSON.parse(readFileSync(join(home, 'gates', 'recovery-fork', `${SHA}.json`), 'utf8'))).toMatchObject({ result: 'fail' });
+    expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(1);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test('the launcher and the gate resolve one runtime: SCK_BUN, then the pinned runtime-bun, then ~/.bun, never PATH', () => {

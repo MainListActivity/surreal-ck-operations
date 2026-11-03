@@ -3,7 +3,8 @@ import { mkdir,realpath,readFile,rm,rename,mkdtemp } from 'node:fs/promises';
 import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
 import { CompanyUpgrades,type UpgradeJob,type UpgradeStatus } from './company-upgrades.ts';
-import { installedRelease,readCompanyRelease,git,compareRelease } from './company-release.ts';
+import { installedRelease,readCompanyRelease,git,compareRelease,gatesFor,GATE_ARGUMENTS } from './company-release.ts';
+import { verifyReleaseSchema } from './release-schema.ts';
 
 export type UpgradeCommand=(exe:string,args:string[],cwd:string)=>Promise<void>;
 export const command:UpgradeCommand=(exe,args,cwd)=>new Promise((resolve,reject)=>{
@@ -36,7 +37,7 @@ export async function verifyCompanyUpgrade(home:string,target:string,run:Upgrade
  if(p?.status!=='running'||p.enabled!==true||await realpath(p.path)!==await realpath(join(target,'plugin')))throw Error('plugin source mismatch');
  await run('diff',['-qr',join(target,'schema'),join(target,'plugin/server/vendor/schema')],home);
  const {stdout:bunVersion}=await promisify(execFile)(join(home,'runtime-bun/bin/bun'),['--version'],{timeout:5000});
- for(const gate of ['comm-slow-pipe','sidecar-review']){
+ for(const gate of gatesFor(active.version)){
   const record=JSON.parse(await readFile(join(home,'gates',gate,`${active.sha}.json`),'utf8'));
   if(record.sha!==active.sha||record.result!=='pass'||record.bun!==bunVersion.trim()||record.platform!=='darwin')throw Error('release gate mismatch');
  }
@@ -94,8 +95,13 @@ export async function runCompanyUpgrade(service:CompanyUpgrades,id:string,option
    await update('checking','检查代码与本机发布门禁');
    await run('pnpm',['--dir',target,'typecheck'],home);
    await run('pnpm',['--dir',join(target,'plugin'),'typecheck'],home);
-   await run('sh',[join(target,'scripts/release-gate.sh'),'slow-pipe',target],home);
-   await run('sh',[join(target,'scripts/release-gate.sh'),'sidecar-review',target],home);
+   // The gates the target version carries. The recovery-fork gate (0.3.76 and later) runs the recovery-read and
+   // fault-budget checks through the official isolated runner with their opt-in flag set; a skipped or unrecorded
+   // run is not a pass and blocks the switch. An older target keeps the two historical gates, so a rollback
+   // stays possible.
+   for(const gate of gatesFor(plan.version)){
+    await run('sh',[join(target,'scripts/release-gate.sh'),GATE_ARGUMENTS[gate]??gate,target],home);
+   }
    // Revalidate the owner's pending task after preparation; a stale click must not switch anything.
    const t=await db.select<{version:number;state:string;blocked_to?:string;reviewer_role:string;wait_kind?:string;wait_owner_role?:string}>(job.task);
    if(!t||t.version!==job.task_version||!((t.state==='blocked'&&t.blocked_to==='owner')||(t.state==='review'&&t.reviewer_role==='owner')
@@ -131,10 +137,12 @@ export async function runCompanyUpgrade(service:CompanyUpgrades,id:string,option
   }
   await update('verifying','验证实际运行版本与服务');
   await verify(home,target);
-  const [installation]=await db.query<[{schema_version?:number}]>('SELECT schema_version FROM ONLY company_meta:installation;');
-  if((installation?.schema_version??0)<41)throw Error('upgrade schema not applied');
+  // R4: the target version decides the schema it must have reached. A newer target has to prove its schema
+  // marker and its tables by a read-back of the running database; a missing table, an old marker or an
+  // unreadable receipt keeps the release unverified (and the company paused).
+  const schema=await verifyReleaseSchema(db,job.plan.version);
   healthy=true;
-  await db.query('CREATE audit CONTENT {task:$task,actor:$source,action:"company_upgrade_verified",evidence:$evidence,at:time::now()};',{task:job.task,source:job.source,evidence:`v${job.plan.version} ${job.plan.sha}；固定快照、双门禁、active、健康/ready、插件来源与schema/vendor核验通过。`});
+  await db.query('CREATE audit CONTENT {task:$task,actor:$source,action:"company_upgrade_verified",evidence:$evidence,at:time::now()};',{task:job.task,source:job.source,evidence:`v${job.plan.version} ${job.plan.sha}；固定快照、三门禁、active、健康/ready、插件来源与schema/vendor核验通过；schema=${schema.schemaVersion}/需${schema.schema}，必需表 ${schema.tables.length} 张齐备。`});
   try{await service.finish(job);}catch{await service.update(id,'awaiting_reply','已升级，自动回复待完成','版本已验证上线，但任务状态已变化或验收条件尚未满足；未替代独立验收。');}
   // An installed version answers every older pending version card by construction. This runs after the job's own task
   // is settled and never rolls the install back: a card that cannot be closed stays in the inbox for the next pass.

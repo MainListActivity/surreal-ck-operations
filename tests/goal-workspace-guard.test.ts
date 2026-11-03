@@ -17,6 +17,6 @@ test('goal workspace rollback guard rejects an old or declaration-only core and 
 test('both switch entry points enforce goal workspace compatibility before the existing release gate or upload', () => {
   const local = readFileSync(join(root, 'scripts/company-service.sh'), 'utf8');
   const remote = readFileSync(join(root, 'scripts/deploy-mcp-remote.sh'), 'utf8');
-  expect(local.indexOf('goal_workspace_target_supported "$release"')).toBeLessThan(local.indexOf('    check_gate comm-slow-pipe'));
+  expect(local.indexOf('goal_workspace_target_supported "$release"')).toBeLessThan(local.indexOf('for gate in $(required_gates "$release"); do'));
   expect(remote).toContain('goal_workspace_target_supported "$staging/probe" core');
 });

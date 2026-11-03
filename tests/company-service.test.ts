@@ -86,13 +86,15 @@ const STANDBY_APPENDS: Array<[string, string]> = [
   ['src/workforce.ts', "export interface StandbyConfig {\n  standbyBudgetSeconds: number;\n}\nstandbyBudgetSeconds: STANDBY_BUDGET_SECONDS_DEFAULT,\nrow.standby_budget_seconds\naction: 'standby_timeout',\n"],
 ];
 
-function makeRelease(releases: string, sha: string, withGit = false, capable = true, policy = capable) {
+function makeRelease(releases: string, sha: string, withGit = false, capable = true, policy = capable, version?: string) {
   const dir = join(releases, sha);
   mkdirSync(join(dir, 'src', 'mcp'), { recursive: true });
   mkdirSync(join(dir, 'src', 'dispatcher'), { recursive: true });
   mkdirSync(join(dir, 'plugin'), { recursive: true });
   writeFileSync(join(dir, 'src', 'mcp', 'run.ts'), 'export {};\n');
   writeFileSync(join(dir, 'src', 'dispatcher', 'run.ts'), 'export {};\n');
+  // The version the release carries: the installer reads it to decide which release gates it must have passed.
+  if (version) writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'fixture-release', version }));
   if (capable) {
 const files = { 'src/task-recovery.ts': 'export {};', 'src/ops/proof-store.ts': 'export const assertExecutionWindow = true;', ...CAPABILITY_FILES, ...ACCEPTANCE_FILES, ...(policy ? POLICY_FILES : {}), ...STANDBY_FILES,
   'src/goal-workspace-capability.ts': "export const GOAL_WORKSPACE_CONTRACT = 'sck-goal-workspace/v1';\n" };
@@ -115,11 +117,11 @@ const files = { 'src/task-recovery.ts': 'export {};', 'src/ops/proof-store.ts': 
   return dir;
 }
 
-// The install requires both release records for the SHA on the runtime the services run with (scripts/bun-runtime.sh: the
+// The install requires all three release records for the SHA on the runtime the services run with (scripts/bun-runtime.sh: the
 // pinned runtime-bun under the service home). The fixture pins that runtime and its version, so it does not depend on the host Bun;
 // the gate runner itself is covered by tests/release-gate.test.ts.
-function writeGateRecord(serviceHome: string, sha: string) {
-  for (const gate of ['comm-slow-pipe', 'sidecar-review']) {
+function writeGateRecord(serviceHome: string, sha: string, gates: string[] = ['comm-slow-pipe', 'sidecar-review', 'recovery-fork']) {
+  for (const gate of gates) {
     const dir = join(serviceHome, 'gates', gate);
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, `${sha}.json`), JSON.stringify({ gate, sha, bun: '1.4.2', platform: 'darwin', result: 'pass' }));
@@ -362,6 +364,43 @@ test('install refuses a release without a passing comm-slow-pipe gate and leaves
     expect(activeTarget(f)).toBe(join(f.releases, SHAS.previous));
     expect(existsSync(join(f.releases, SHAS.old))).toBe(true);
     expect(existsSync(join(f.home, 'Library', 'LaunchAgents', 'org.surrealck.company-mcp.plist'))).toBe(false);
+  } finally {
+    cleanup(f);
+  }
+});
+
+test('install refuses a release without a passing recovery-fork gate and leaves active unchanged', () => {
+  const f = fixture();
+  try {
+    // The fork gate is what proves the recovery-read proof and fault-budget checks really ran on this SHA. A release
+    // without that record — or with a skipped run — must not be installed, and nothing may be switched.
+    rmSync(join(f.serviceHome, 'gates', 'recovery-fork'), { recursive: true, force: true });
+    const result = runInstall(f, { SCK_RELEASE_KEEP: '1' });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString()).toContain('no passing recovery-fork gate');
+    expect(activeTarget(f)).toBe(join(f.releases, SHAS.previous));
+    expect(existsSync(join(f.home, 'Library', 'LaunchAgents', 'org.surrealck.company-mcp.plist'))).toBe(false);
+  } finally {
+    cleanup(f);
+  }
+});
+
+test('the gate set follows the release version, so a rollback to an older release stays installable', () => {
+  const f = fixture();
+  try {
+    const legacy = join(f.releases, SHAS.old);
+    // A release before the recovery-fork gate existed does not know that gate, so demanding its record would make
+    // a rollback to it impossible. The two historical gates are what such a release must have passed.
+    writeFileSync(join(legacy, 'package.json'), JSON.stringify({ name: 'fixture-release', version: '0.3.75' }));
+    writeGateRecord(f.serviceHome, SHAS.old, ['comm-slow-pipe', 'sidecar-review']);
+    const installed = runInstall(f, { SCK_RELEASE_KEEP: '1' }, legacy);
+    expect(installed.exitCode, installed.stderr.toString()).toBe(0);
+    expect(activeTarget(f)).toBe(legacy);
+    // The same release carrying the current version does carry the third gate and is refused without its record.
+    writeFileSync(join(legacy, 'package.json'), JSON.stringify({ name: 'fixture-release', version: '0.3.76' }));
+    const refused = runInstall(f, { SCK_RELEASE_KEEP: '1' }, legacy);
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stderr.toString()).toContain('no passing recovery-fork gate');
   } finally {
     cleanup(f);
   }

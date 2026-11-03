@@ -7,8 +7,8 @@
 set -eu
 
 service_home=${SCK_SERVICE_HOME:-"$HOME/Library/Application Support/SurrealCKCompany"}
-gate=${1:?usage: release-gate.sh <slow-pipe|sidecar-review> /absolute/release/path}
-release=${2:?usage: release-gate.sh <slow-pipe|sidecar-review> /absolute/release/path}
+gate=${1:?usage: release-gate.sh <slow-pipe|sidecar-review|recovery-fork> /absolute/release/path}
+release=${2:?usage: release-gate.sh <slow-pipe|sidecar-review|recovery-fork> /absolute/release/path}
 . "$(dirname "$0")/bun-runtime.sh"
 
 case "$gate" in
@@ -37,7 +37,19 @@ case "$gate" in
     gate_test="tests/dispatcher-sidecar.fork.test.ts tests/deployment-source.test.ts tests/deployment-source.fork.test.ts tests/effective-policy.fork.test.ts tests/deploy-drill.test.ts tests/deploy-drill-runner.test.ts tests/deploy-drill-node-host.test.ts tests/deploy-drill-access.fork.test.ts tests/review-events.test.ts tests/review-events.fork.test.ts tests/company-upgrades.fork.test.ts"
     gate_why='the sidecar-review gate runs on macOS only; it uses the local company fork'
     ;;
-  *) echo "unknown gate: $gate (known: slow-pipe, sidecar-review)" >&2; exit 2;;
+  recovery-fork)
+    gate_name=recovery-fork
+    # FV06: the recovery-read chain checks and the fault-budget refund checks are machine checks that need the
+    # company fork. They run through the official isolated runner (scripts/test-worktrees.ts), which starts its own
+    # fork on a random port and points the tests at it: no default or production database is touched and nothing
+    # is downloaded. The recovery-read file is opt-in, so the flag is set explicitly and the gate also insists on
+    # the executed marker — a skipped file is not a pass.
+    gate_env="RUN_COMPANY_PROOF_FORK_TESTS=1"
+    gate_test="tests/recovery-read.fork.test.ts tests/fault-budget.fork.test.ts"
+    gate_why='the recovery-fork gate runs on macOS only; it uses the local company fork'
+    gate_markers='recovery-read.fork executed fault-budget.fork executed'
+    ;;
+  *) echo "unknown gate: $gate (known: slow-pipe, sidecar-review, recovery-fork)" >&2; exit 2;;
 esac
 case "$release" in /*) ;; *) echo 'Release path must be absolute' >&2; exit 2;; esac
 [ "$(uname -s)" = Darwin ] || { echo "refused: $gate_why" >&2; exit 2; }
@@ -72,6 +84,9 @@ set +e
 if [ "$gate" = slow-pipe ]; then
   # The red control runs too: the pre-SYS01 client must still lose bytes through the same pipe, or the harness is not trusted.
   (cd "$release" && SCK_COMM_CONTROL=1 "$BUN" test $gate_test) > "$log" 2>&1
+elif [ "$gate" = recovery-fork ]; then
+  # The official isolated runner: it starts its own company fork on a random port and points the tests at it.
+  (cd "$release" && env $gate_env "$BUN" scripts/test-worktrees.ts $gate_test) > "$log" 2>&1
 else
   # Exercise the real client-cli -> sidecar -> company-fork path, including plugin reload recovery, and the
   # deploy-drill suite (its opt-ins are named in gate_env).
@@ -82,6 +97,15 @@ rc=$?
 set -e
 result=fail
 [ "$rc" -eq 0 ] && result=pass
+# A skipped check is not a pass: each machine check has to print its executed marker, so a missing opt-in flag
+# (which skips the file) fails the gate instead of recording an empty green run.
+for marker in ${gate_markers:-}; do
+  if ! grep -q "$marker" "$log" 2>/dev/null; then
+    echo "refused: $gate did not execute '$marker' — a skipped check is not a pass" >&2
+    result=fail
+    rc=1
+  fi
+done
 
 record="$out_dir/$sha.json"
 GATE_NAME="$gate_name" GATE_SHA="$sha" GATE_BUN="$bun_version" GATE_BUN_PATH="$BUN" GATE_RESULT="$result" GATE_RC="$rc" GATE_STARTED="$started" GATE_LOG="$log" GATE_RECORD="$record" \

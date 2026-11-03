@@ -12,7 +12,7 @@ import {Workforce} from '../src/workforce.ts';
 import {Dispatcher} from '../src/dispatcher/dispatcher.ts';
 import {CompanyUpgrades} from '../src/company-upgrades.ts';
 import {runCompanyUpgrade,type UpgradeCommand} from '../src/company-upgrade-runner.ts';
-import {readCompanyRelease,compareRelease,releaseNotesSchema} from '../src/company-release.ts';
+import {readCompanyRelease,compareRelease,releaseNotesSchema,gatesFor,GATE_ARGUMENTS} from '../src/company-release.ts';
 import {baselineAcceptanceCriteria,createGithubActionsAdapter} from '../src/acceptance.ts';
 import {createCiBillingCheck} from '../src/github-ci-control.ts';
 setDefaultTimeout(60_000);
@@ -21,13 +21,13 @@ let dir:string,repo:string,home:string,oldSha:string,newSha:string,db:CompanyDat
 let service:CompanyUpgrades;
 const note=(text='公司系统升级交付说明与验证证据已准备完成，等待老板确认执行')=>({text,idempotencyKey:`upgrade-${++count}-${crypto.randomUUID()}`});
 const git=(args:string[])=>execFileSync('git',['-C',repo,...args],{encoding:'utf8'}).trim();
-const notes={version:'0.2.0',title:'收件箱升级',changes:['更新任务派工与上线入口'],impact:['切换期间短暂停止新派工'],migration:'只新增作业记录',rollback:'恢复旧发布'};
+const notes={version:'0.3.76',title:'收件箱升级',changes:['更新任务派工与上线入口'],impact:['切换期间短暂停止新派工'],migration:'只新增作业记录',rollback:'恢复旧发布'};
 beforeAll(async()=>{
  if(process.env.RUN_SCK_UPGRADE_FORK_TESTS!=='1')return;
  dir=realpathSync(mkdtempSync(join(tmpdir(),'sck-company-upgrade-')));repo=join(dir,'repo');home=join(dir,'service');mkdirSync(repo);mkdirSync(join(home,'releases'),{recursive:true});
- git(['init','-b','main']);writeFileSync(join(repo,'package.json'),'{"version":"0.1.0"}');git(['add','.']);git(['-c','user.name=fixture','-c','user.email=fixture@invalid','commit','-m','old']);oldSha=git(['rev-parse','HEAD']);
- writeFileSync(join(repo,'package.json'),'{"version":"0.2.0"}');writeFileSync(join(repo,'company-release.json'),JSON.stringify(notes));git(['add','.']);git(['-c','user.name=fixture','-c','user.email=fixture@invalid','commit','-m','new']);newSha=git(['rev-parse','HEAD']);git(['remote','add','origin',repo]);git(['fetch','origin','main']);
- for(const [sha,version] of [[oldSha,'0.1.0'],[newSha,'0.2.0']]){mkdirSync(join(home,'releases',sha!),{recursive:true});writeFileSync(join(home,'releases',sha!,'package.json'),JSON.stringify({version}));}
+ git(['init','-b','main']);writeFileSync(join(repo,'package.json'),'{"version":"0.3.74"}');git(['add','.']);git(['-c','user.name=fixture','-c','user.email=fixture@invalid','commit','-m','old']);oldSha=git(['rev-parse','HEAD']);
+ writeFileSync(join(repo,'package.json'),'{"version":"0.3.76"}');writeFileSync(join(repo,'company-release.json'),JSON.stringify(notes));git(['add','.']);git(['-c','user.name=fixture','-c','user.email=fixture@invalid','commit','-m','new']);newSha=git(['rev-parse','HEAD']);git(['remote','add','origin',repo]);git(['fetch','origin','main']);
+ for(const [sha,version] of [[oldSha,'0.3.74'],[newSha,'0.3.76']]){mkdirSync(join(home,'releases',sha!),{recursive:true});writeFileSync(join(home,'releases',sha!,'package.json'),JSON.stringify({version}));}
  symlinkSync(join(home,'releases',oldSha),join(home,'active'));
  const listener=Bun.serve({hostname:'127.0.0.1',port:0,fetch:()=>new Response('fixture')});const port=listener.port!;listener.stop(true);
  server=Bun.spawn([join(homedir(),'.surrealdb/surreal'),'start','--bind',`127.0.0.1:${port}`,'--user','root','--pass','isolated-fixture','--log','error',`rocksdb:${dir}/db`],{stdout:'ignore',stderr:'ignore'});
@@ -40,11 +40,11 @@ async function task(){
  const c=await core.claim(eng,taskId);const t=await core.block(eng,{taskId,deliveryId:c.deliveryId,fence:c.fence,expectedVersion:c.task.version},'owner',{...note(),companyUpgrade:{sha:newSha}});return t;
 }
 run('release metadata and version ordering are stable and human-readable',async()=>{
- const p=await readCompanyRelease(repo,newSha);expect(p.version).toBe('0.2.0');expect(p.digest).toHaveLength(64);expect(p.changes).toEqual(notes.changes);expect(compareRelease('0.10.0','0.2.0')).toBeGreaterThan(0);expect(releaseNotesSchema.safeParse({...notes,changes:[]}).success).toBe(false);
+ const p=await readCompanyRelease(repo,newSha);expect(p.version).toBe('0.3.76');expect(p.digest).toHaveLength(64);expect(p.changes).toEqual(notes.changes);expect(compareRelease('0.10.0','0.3.76')).toBeGreaterThan(0);expect(releaseNotesSchema.safeParse({...notes,changes:[]}).success).toBe(false);
 });
 run('lease-gated structured block renders an upgrade, duplicate clicks start only one job',async()=>{
  const t=await task();expect(t.companyUpgrade?.sha).toBe(newSha);
- const state=await service.state();expect(state.current.version).toBe('0.1.0');expect(state.items.find(i=>i.taskId===t.id)?.plan.changes).toEqual(notes.changes);
+ const state=await service.state();expect(state.current.version).toBe('0.3.74');expect(state.items.find(i=>i.taskId===t.id)?.plan.changes).toEqual(notes.changes);
  const input={taskId:t.id,taskVersion:t.version,digest:t.companyUpgrade!.digest};
  const a=await service.start(input,'owner:test'),b=await service.start(input,'owner:test');expect(a.jobId).toBe(b.jobId);expect(launches).toBe(1);
 });
@@ -55,6 +55,12 @@ run('actual runner validates before replying, keeps owner task on failure and re
  const command:UpgradeCommand=async(exe,args)=>{calls.push([exe,...args].join(' '));if(args[1]==='install'){rmSync(join(home,'active'));symlinkSync(args[2]!,join(home,'active'));}};
  await runCompanyUpgrade(service,id,{run:command,verify:async()=>{const j=await service.job(id);const t=await core.getTask(eng,String(j!.task.id));expect(t.blockedTo).toBe('owner');calls.push('verified');}});
  expect((await service.job(id))!.status).toBe('succeeded');expect(calls.some(x=>x.includes('sidecar-review'))).toBe(true);
+ // FV06: the recovery-fork gate rides the preparation too; without it the release is not registrable.
+ expect(calls.some(x=>x.includes('recovery-fork'))).toBe(true);
+ // The gates the target version carries, in order: a 0.3.76 target needs the third gate; an older target keeps
+ // two, so a rollback does not get blocked by a record its own release cannot produce.
+ expect(calls.filter(x=>x.includes('release-gate.sh')).map(x=>x.split(' ')[2])).toEqual(gatesFor('0.3.76').map(g=>GATE_ARGUMENTS[g]));
+ expect(gatesFor('0.3.75')).toEqual(['comm-slow-pipe','sidecar-review']);
  const [audit]=await db.db.query<[Array<{action:string;at:unknown}>]>("SELECT action,at FROM audit WHERE task=$task AND action IN ['company_upgrade_verified','owner_reply'] ORDER BY at;",{task:(await service.job(id))!.task});expect(audit.map(a=>a.action)).toEqual(['company_upgrade_verified','owner_reply']);
  // A separate click for a new task may acknowledge an already installed exact version, without re-installing it.
  const t=await task();const j=await service.start({taskId:t.id,taskVersion:t.version,digest:t.companyUpgrade!.digest},'owner:test');
@@ -112,7 +118,7 @@ run('an interrupted extraction never exposes a partial release and the next clic
  expect(existsSync(join(home,'releases',newSha))).toBe(false);
  const retry=await service.start(input,'owner:test');
  await runCompanyUpgrade(service,retry.jobId,{run:async(exe,args)=>{if(exe==='git'||exe==='tar')execFileSync(exe,args);if(args[1]==='install'){rmSync(join(home,'active'));symlinkSync(args[2]!,join(home,'active'));}},verify:async()=>{}});
- expect((await service.job(retry.jobId))!.status).toBe('succeeded');expect(JSON.parse(await Bun.file(join(home,'releases',newSha,'company-release.json')).text()).version).toBe('0.2.0');
+ expect((await service.job(retry.jobId))!.status).toBe('succeeded');expect(JSON.parse(await Bun.file(join(home,'releases',newSha,'company-release.json')).text()).version).toBe('0.3.76');
 });
 run('stale reaping cannot overwrite a worker that progressed after the inbox snapshot',async()=>{
  const t=await task(),j=await service.start({taskId:t.id,taskVersion:t.version,digest:t.companyUpgrade!.digest},'owner:test');
@@ -158,9 +164,9 @@ async function handoffTask(){
  // The returned task is ready again; the engineer takes it back before parking it on the owner handoff.
  const again=await core.claim(who,taskId);
  return core.wait(who,{taskId,deliveryId:again.deliveryId,fence:again.fence,expectedVersion:again.task.version},
-  {text:'fixture: 公司 v0.2.0 已合入 main，部署须由老板点升级卡触发独立升级作业。',idempotencyKey:`handoff-${count}-${taskId}`},
+  {text:'fixture: 公司 v0.3.76 已合入 main，部署须由老板点升级卡触发独立升级作业。',idempotencyKey:`handoff-${count}-${taskId}`},
   {kind:'owner_handoff',reason:'公司版本已合入 main，受控双面部署须由老板点击升级卡触发独立升级作业。',
-   completed:['PR 已合入 origin/main'],pendingAction:'老板在收件箱点击「升级至 v0.2.0」',text:'fixture owner handoff'} as never);
+   completed:['PR 已合入 origin/main'],pendingAction:'老板在收件箱点击「升级至 v0.3.76」',text:'fixture owner handoff'} as never);
 }
 
 run('an owner handoff task keeps its upgrade card reachable',async()=>{
@@ -170,7 +176,7 @@ run('an owner handoff task keeps its upgrade card reachable',async()=>{
  expect(only.wait_kind).toBe('owner_handoff');expect(only.wait_owner_role).toBe('owner');
  const state=await service.state();
  const card=state.items.find(i=>i.taskId===t.id);
- expect(card?.plan.version).toBe('0.2.0');
+ expect(card?.plan.version).toBe('0.3.76');
  const j=await service.start({taskId:t.id,taskVersion:t.version,digest:card!.plan.digest},'owner:test');
  await runCompanyUpgrade(service,j.jobId,{run:async(_exe,args)=>{if(args[1]==='install'){rmSync(join(home,'active'));symlinkSync(args[2]!,join(home,'active'));}},verify:async()=>{}});
  expect((await service.job(j.jobId))!.status).toBe('succeeded');
@@ -186,7 +192,7 @@ run('installing a version closes the pending cards of every older version',async
  const current=await handoffTask(),pending=await handoffTask();
  // The second card asks for a version older than the one being installed, so it is an obsoleted TODO.
  await db.db.query('UPDATE $t SET company_upgrade=$plan;',{t:new RecordId('task',pending.id),
-  plan:{...(await readCompanyRelease(repo,newSha)),version:'0.1.5'}});
+  plan:{...(await readCompanyRelease(repo,newSha)),version:'0.3.75'}});
  const j=await service.start({taskId:current.id,taskVersion:current.version,digest:current.companyUpgrade!.digest},'owner:test');
  await runCompanyUpgrade(service,j.jobId,{run:async(_exe,args)=>{if(args[1]==='install'){rmSync(join(home,'active'));symlinkSync(args[2]!,join(home,'active'));}},verify:async()=>{}});
  expect((await service.job(j.jobId))!.status).toBe('succeeded');
@@ -201,8 +207,8 @@ run('an obsoleted version card is shown as retired and cannot be installed again
  rmSync(join(home,'active'));symlinkSync(join(home,'releases',newSha),join(home,'active'));
  // A real older release exists in history, so the plan's version and package.json agree and only the ordering refuses it.
  const old=git(['rev-parse',`${newSha}~1`]);
- writeFileSync(join(repo,'package.json'),'{"version":"0.1.5"}');
- writeFileSync(join(repo,'company-release.json'),JSON.stringify({...notes,version:'0.1.5'}));
+ writeFileSync(join(repo,'package.json'),'{"version":"0.3.75"}');
+ writeFileSync(join(repo,'company-release.json'),JSON.stringify({...notes,version:'0.3.75'}));
  git(['add','.']);git(['-c','user.name=fixture','-c','user.email=fixture@invalid','commit','-m','older']);const olderSha=git(['rev-parse','HEAD']);
  git(['fetch','origin','main']);
  const t=await task();
@@ -328,7 +334,7 @@ run('a manual pause during preparation stops installation; entering installing i
 });
 run('automatic scanning chooses the highest pending version and ignores job-history-only cards',async()=>{
  await resetAutomaticFixture();const high=await task(),low=await task();await service.setAuto(true,'owner:test');
- const lowPlan=await readCompanyRelease(repo,git(['rev-parse','HEAD']));expect(lowPlan.version).toBe('0.1.5');
+ const lowPlan=await readCompanyRelease(repo,git(['rev-parse','HEAD']));expect(lowPlan.version).toBe('0.3.75');
  await db.db.query('UPDATE $task SET company_upgrade=$plan;',{task:new RecordId('task',low.id),plan:lowPlan});
  const first=await service.autoStart();expect(String((await service.job(first!.jobId))!.task.id)).toBe(high.id);
  await service.update(first!.jobId,'failed','fixture');
