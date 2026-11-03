@@ -27,10 +27,59 @@ unload() {
 }
 plist() { echo "$HOME/Library/LaunchAgents/$(label "$1").plist"; }
 
-# Local release gate (SYS01 AC-B, scripts/release-gate.sh): this release SHA needs passing comm-slow-pipe and sidecar-review
-# records, made on darwin with the Bun version installed now. A missing, failed, other-SHA or other-Bun record refuses the
-# switch; nothing is read from a hosted runner.
+# Local release gate (SYS01 AC-B, scripts/release-gate.sh): this release SHA needs passing records for every gate it
+# carries — comm-slow-pipe and sidecar-review always, recovery-fork from 0.3.76 on (see required_gates below) — made on
+# darwin with the Bun version installed now. A missing, failed, other-SHA or other-Bun record refuses the switch;
+# nothing is read from a hosted runner.
 gate_record() { echo "$service_home/gates/$1/$2.json"; }
+# The gates a release must have passed. The two historical gates are always required. The recovery-fork gate belongs to
+# the releases that carry it (0.3.76 and later): a release before that does not know the gate, so demanding its record
+# would make a rollback to an older release impossible — and a rollback has to keep working. The version comes from the
+# release's own package.json, the same file the running version is read from; an unreadable version demands the
+# stricter set. This mirrors gatesFor() in src/company-release.ts.
+RECOVERY_FORK_GATE_VERSION=0.3.76
+version_at_least() {
+  /usr/bin/python3 - "$1" "$2" <<'PY'
+import sys
+def parts(value):
+    head = (value.split('-')[0].split('.') + ['0', '0', '0'])[:3]
+    try:
+        return tuple(int(part) for part in head)
+    except ValueError:
+        return None
+a, b = parts(sys.argv[1]), parts(sys.argv[2])
+if a is None or b is None:
+    sys.exit(1)
+sys.exit(0 if a >= b else 1)
+PY
+}
+required_gates() {
+  gate_release=$1
+  printf '%s\n' comm-slow-pipe sidecar-review
+  gate_version=""
+  if [ -f "$gate_release/package.json" ]; then
+    gate_version=$(/usr/bin/python3 - "$gate_release/package.json" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as handle:
+        print((json.load(handle) or {}).get('version') or '')
+except (OSError, ValueError):
+    print('')
+PY
+)
+  fi
+  if [ -z "$gate_version" ] || version_at_least "$gate_version" "$RECOVERY_FORK_GATE_VERSION"; then
+    printf '%s\n' recovery-fork
+  fi
+}
+gate_argument() {
+  case "$1" in
+    comm-slow-pipe) echo slow-pipe;;
+    sidecar-review) echo sidecar-review;;
+    recovery-fork) echo recovery-fork;;
+    *) echo "$1";;
+  esac
+}
 # The version of the runtime the services run with (scripts/bun-runtime.sh), or "unknown" when it cannot report one. The services run
 # under launchd, which does not inherit this shell's environment, so SCK_BUN is ignored here: the gate checks the runtime they resolve.
 runtime_version() (
@@ -128,10 +177,10 @@ case "$action" in
     # plugin vendor must carry the standby protocol, or a standby direct assignment would run against
     # a supervision loop that neither wakes the holder nor returns the timeout to the gm gate.
     standby_relay_target_supported "$release" || { standby_relay_refuse "$release"; exit 1; }
-    check_gate comm-slow-pipe "$sha" || {
-      echo "refused: no passing comm-slow-pipe gate for $sha on bun $(runtime_version) — run 'sh $(dirname "$0")/release-gate.sh slow-pipe $release' on this Mac, then install again" >&2; exit 1; }
-    check_gate sidecar-review "$sha" || {
-      echo "refused: no passing sidecar-review gate for $sha on bun $(runtime_version) — run 'sh $(dirname "$0")/release-gate.sh sidecar-review $release' on this Mac, then install again" >&2; exit 1; }
+    for gate in $(required_gates "$release"); do
+      check_gate "$gate" "$sha" || {
+        echo "refused: no passing $gate gate for $sha on bun $(runtime_version) — run 'sh $(dirname "$0")/release-gate.sh $(gate_argument "$gate") $release' on this Mac, then install again" >&2; exit 1; }
+    done
     mkdir -p "$service_home/bin" "$service_home/logs" "$HOME/Library/LaunchAgents"
     chmod 700 "$service_home" "$service_home/bin" "$service_home/logs" "$service_home/private"
     cp "$(dirname "$0")/run-service.sh" "$service_home/bin/run.sh"
@@ -320,8 +369,10 @@ PY
     ;;
   check-gate)
     sha=${2:?usage: company-service.sh check-gate <40-character release sha>}
-    check_gate comm-slow-pipe "$sha" || { echo "refused: no passing comm-slow-pipe gate for $sha on bun $(runtime_version)" >&2; exit 1; }
-    check_gate sidecar-review "$sha" || { echo "refused: no passing sidecar-review gate for $sha on bun $(runtime_version)" >&2; exit 1; }
+    release="$service_home/releases/$sha"
+    for gate in $(required_gates "$release"); do
+      check_gate "$gate" "$sha" || { echo "refused: no passing $gate gate for $sha on bun $(runtime_version)" >&2; exit 1; }
+    done
     echo "gate ok: $sha on bun $(runtime_version)"
     ;;
   *)

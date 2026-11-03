@@ -14,6 +14,8 @@ import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { ProjectStore } from '../src/projects.ts';
 import { RECOVERY_READ_ALIAS, RECOVERY_READ_PATHS } from '../src/recovery-read.ts';
+import { LEGACY_SCHEMA_MINIMUM, RECOVERY_READ_TABLES } from '../src/company-release.ts';
+import { readReleaseSchema, verifyReleaseSchema } from '../src/release-schema.ts';
 import { brokerConfig } from './support/ops-world.ts';
 import type { ClaimResult, CreateTask, Evidence } from '../src/contracts.ts';
 
@@ -50,6 +52,8 @@ beforeAll(async () => {
   database = new CompanyDatabase({ url: url + '/rpc', rootUser: 'root', rootPassword: 'root', namespace: 'recovery_read_test', database: 'control_plane' });
   await database.connect();
   await database.bootstrap();
+  // The release gate reads this marker: a skipped file (missing opt-in flag) must not look like a pass.
+  console.log('recovery-read.fork executed');
   core = new SurrealCompanyCore(database);
   projects = new ProjectStore(database.db);
   const enroll = new LocalEnrollmentAdmin(database);
@@ -340,6 +344,48 @@ check('an unsettled inFlight past its deadline becomes stopped(unknown_outcome),
   const [rows] = await database.db.query<[Array<{ action: string }>]>(
     "SELECT action FROM audit WHERE task = $task AND action = 'recovery_read_stop';", { task: new RecordId('task', source) });
   expect(rows).toHaveLength(1);
+});
+
+check('the migrated database proves the schema receipt a 0.3.76 release needs', async () => {
+  // The real fork after bootstrap: the marker is 49 and the three tables exist.
+  const receipt = await readReleaseSchema(database.db);
+  expect(receipt.schemaVersion).toBe(49);
+  for (const table of RECOVERY_READ_TABLES) expect(receipt.tables).toContain(table);
+  const verified = await verifyReleaseSchema(database.db, '0.3.76');
+  expect(verified).toMatchObject({ schema: 49, schemaVersion: 49 });
+  expect(verified.tables).toEqual([...RECOVERY_READ_TABLES]);
+  // An older target keeps the older minimum: 49 is not forced onto a historical version.
+  const legacy = await verifyReleaseSchema(database.db, '0.3.75');
+  expect(legacy).toMatchObject({ schema: LEGACY_SCHEMA_MINIMUM, tables: [] });
+});
+
+check('an isolated database without the three tables or the marker keeps the release unverified', async () => {
+  // The real fork, a second database on the same isolated instance: it is migrated down on purpose, so the
+  // read-back has to refuse it for real — an old marker, a missing table and an unreadable receipt, not a
+  // synthetic stub. Nothing here touches the migrated database the checks above use.
+  const legacy = new CompanyDatabase({ url: url + '/rpc', rootUser: 'root', rootPassword: 'root', namespace: 'recovery_read_legacy', database: 'control_plane' });
+  await legacy.connect();
+  try {
+    await legacy.bootstrap();
+    // An old marker: the release that needs 49 is refused.
+    await legacy.db.query('UPDATE company_meta:installation SET schema_version = 48;');
+    const old = await readReleaseSchema(legacy.db);
+    expect(old.schemaVersion).toBe(48);
+    await expect(verifyReleaseSchema(legacy.db, '0.3.76')).rejects.toThrow(/below the 49/);
+    // The marker is current but a table is missing: still refused, and the missing table is named.
+    await legacy.db.query('UPDATE company_meta:installation SET schema_version = 49; REMOVE TABLE recovery_read_chain;');
+    const receipt = await readReleaseSchema(legacy.db);
+    expect(receipt.schemaVersion).toBe(49);
+    expect(receipt.tables).not.toContain('recovery_read_chain');
+    await expect(verifyReleaseSchema(legacy.db, '0.3.76')).rejects.toThrow(/missing the tables recovery_read_chain/);
+    // An unreadable receipt is a failure, not an empty receipt.
+    await legacy.close();
+    await expect(readReleaseSchema(legacy.db)).rejects.toThrow(/unreadable/);
+    // The migrated database the checks above use is untouched by this probe.
+    expect((await readReleaseSchema(database.db)).schemaVersion).toBe(49);
+  } finally {
+    await legacy.close().catch(() => undefined);
+  }
 });
 
 check('concurrent issuance creates exactly one chain for a source task', async () => {

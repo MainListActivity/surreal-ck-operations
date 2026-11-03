@@ -47,6 +47,8 @@ beforeAll(async () => {
   await database.db.use({ namespace: NS });
   await database.db.query('REMOVE DATABASE IF EXISTS control_plane;');
   await database.bootstrap();
+  // The release gate reads this marker: a skipped file (missing opt-in flag) must not look like a pass.
+  console.log('fault-budget.fork executed');
   const enrollment = new LocalEnrollmentAdmin(database);
   for (const [name, role, caps] of [
     ['gm', 'gm', ['execute', 'review', 'manage']],

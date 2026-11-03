@@ -4,7 +4,7 @@
 -- 不回到可租约状态；grant 不是执行租约，不能写任务，只能让被授权员工在原 taskId 的 fault 键下做一次登录、
 -- 按固定顺序四次 GET 和必要 logout。
 --
--- 旧版 release 读不到这两张表即忽略（RB01）；运行面只有 core 与 broker 使用它们。
+-- 旧版 release 读不到这三张表即忽略（RB01）；运行面只有 core 与 broker 使用它们。
 
 DEFINE TABLE IF NOT EXISTS recovery_read_grant SCHEMAFULL PERMISSIONS NONE;
 -- 源任务：必须终态 done，且已有 fault episode；grant 不改变它的状态、持有人或租约。
