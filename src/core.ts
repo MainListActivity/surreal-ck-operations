@@ -525,7 +525,7 @@ const INDEPENDENCE_GUARD_SQL = `FOR $g IN $indep_guards {
 const EMPLOYEE_WORKSPACE_SQL = (who: string, failure: string) => `
       IF ${who}.retired = true { THROW '${failure}: target employee is retired' };
       LET $scope = IF $t.goal != NONE THEN <string>record::id($t.goal) ELSE 'maintenance' END;
-      IF ${who}.workspace_scope != NONE AND ${who}.workspace_scope != $scope { THROW '${failure}: target employee works in another goal workspace and can never be dispatched this task' };
+      IF ${who}.workspace_scope != NONE AND ${who}.workspace_scope != $scope { THROW '${failure}: workspace goal denied; target employee works in another goal workspace and can never be dispatched this task' };
       LET $home = $t.code_repo_path ?? $t.project.repo_path ?? $t.goal.project.repo_path ?? $ops_repo;
       LET $employee_home = ${who}.workspace_repo ?? ${who}.workspace_cwd ?? $ops_repo;
       IF $home != NONE AND $employee_home != NONE AND $home != $employee_home { THROW '${failure}: target employee works in another repository and can never be dispatched this task' };
