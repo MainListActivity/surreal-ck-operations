@@ -10,7 +10,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ActiveLease, AppendDependencyPrerequisites, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, IndependenceCheckInput, IndependenceCheckView, IndependenceCheckPolicyView, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence, SetIdentityPrincipal, IdentityPrincipalView, FaultStatusView, FaultBudgetView, FaultEpisodeView, FaultRepairView } from './contracts.ts';
+import type { ActiveLease, AppendDependencyPrerequisites, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, IndependenceCheckInput, IndependenceCheckView, IndependenceCheckPolicyView, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence, SetIdentityPrincipal, IdentityPrincipalView, FaultStatusView, FaultBudgetView, FaultEpisodeView, FaultRepairView, RecoveryReadGrantInput, RecoveryReadStatusView, RecoveryReadGrantRowView, RecoveryReadCallView, RecoveryReadState, RecoveryReadReserveInput, RecoveryReadReserveResult, RecoveryReadSettleInput } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
@@ -77,6 +77,11 @@ import { PLUGIN_RUNTIME_ROLES } from './contracts.ts';
 import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES, QA_OBSERVATION_WAIT_ROOTS_LIMIT, fitGoalWaitSummary, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
 import { CompanyError } from './core-errors.ts';
+import {
+  RECOVERY_READ_ALIAS, RECOVERY_READ_CALL_DEADLINE_MS, RECOVERY_READ_MAX_CALLS_PER_PATH, RECOVERY_READ_MAX_LOGIN,
+  RECOVERY_READ_PATHS, exactRecoveryPaths, parseRecoveryExpiry,
+} from './recovery-read.ts';
+import { parseBrokerConfig } from './ops/config.ts';
 import { assertEmployeeCiBlockAllowed, createCiBillingCheck, isCiBlockCause, refuseEmployeeCiBlock, type CiBillingCheck } from './github-ci-control.ts';
 import { DispositionLedger, holderNoticeId, type DispositionApplier, type DispositionClaimInput, type DispositionClaimOutcome, type DispositionClaimView, type DispositionDecideInput, type DispositionDecideOutcome, type DispositionPhase, type DispositionStatusInput, type DispositionStatusView, type ExternalActionRequestInput, type ExternalActionView, type HolderNoticeView, type ExternalActionGateway } from './disposition.ts';
 import { createCompanyGithubGateway, githubRepoSlug } from './external-actions.ts';
@@ -359,6 +364,33 @@ interface ActiveLeaseRow {
   version: number;
 }
 export interface IdempotencyRow { payload_digest: string; result: TaskRow }
+
+/** FV06 recovery read grant row as stored (schema 049). */
+export interface RecoveryReadGrantDbRow {
+  id: RecordId;
+  source_task: RecordId;
+  employee: RecordId;
+  alias: string;
+  methods: string[];
+  paths: string[];
+  max_login: number;
+  max_calls_per_path: number;
+  expires_at: Date | string;
+  authorization_task: RecordId;
+  reason: string;
+  state: RecoveryReadState;
+  login_attempts: number;
+  per_path: number[];
+  in_flight?: { path?: string; started_at?: Date | string; deadline?: Date | string; call_id?: string };
+  stop_reason?: string;
+  result_digest?: string;
+  created_by: string;
+  created_at: Date | string;
+  bound_at?: Date | string;
+  closed_at?: Date | string;
+  fence: number;
+  version: number;
+}
 
 /** The policy as the API states it: `setAt` as an ISO timestamp, whatever the driver returned. */
 function policyView(policy: IndependenceRow): IndependencePolicy {
@@ -2910,20 +2942,38 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return visible.visible(view.id) ? view : withheldEnvs(view);
   }
 
-  async opsScope(credential: Credential, taskId: TaskId): Promise<OpsScope> {
+  async opsScope(credential: Credential, taskId: TaskId, proof?: { grantId: string; grantFence: number }): Promise<OpsScope> {
     const actor = await this.authorized(credential);
     requireText(taskId, 'task', 1, 200);
     const [rows] = await this.db.query<[Array<{ current_employee?: string; state: TaskState; lease_expires_at?: number; project?: RecordId; goal_project?: RecordId }>]>(
       'SELECT current_employee, state, lease_expires_at, project AS project, goal.project AS goal_project FROM $task;', { task: id('task', taskId) });
     const task = rows[0];
     if (!task) throw new CompanyError('not_found', 'Task not found');
+    // Task-level override wins, same resolution as claim/readWorkspace.
+    const project = task.project ?? task.goal_project;
+    if (!project) throw new CompanyError('invalid', 'Task goal has no project environment');
+    if (proof) {
+      // 恢复取证分支：grant 证明只由通道注入，员工参数里没有这个形状。它不写 current_employee / state，
+      // 也不改变源任务；其他身份、撤销、项目与 role 检查仍在 broker 侧原样生效。
+      const grant = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', this.recoveryKey(proof.grantId)));
+      if (!grant || asId(grant.employee) !== actor.employeeId || asId(grant.source_task) !== taskId || grant.fence !== proof.grantFence) {
+        throw new CompanyError('forbidden', 'Recovery read grant does not authorize this employee for this source task');
+      }
+      // 状态/过期/源任务变化不在这一层拒绝：必要的本地 logout 在 stopped/expired/revoked 后仍然必须可用。
+      // 登录与四次 GET 由 broker 的链级 reserve 逐次校验（停链后一律拒绝）。
+      // 与执行租约互斥：同一员工不能一边持有执行租约一边用恢复通道读产品。
+      const [live] = await this.db.query<[Array<{ id: RecordId }>]>(
+        `SELECT id FROM task WHERE current_employee = $employee AND state IN ['doing', 'review']
+           AND lease_expires_at != NONE AND lease_expires_at > time::unix(time::now()) LIMIT 1;`,
+        { employee: actor.employeeId });
+      if (live.length > 0) throw new CompanyError('forbidden', 'Employee holds an execution lease; recovery read is refused');
+      return { actor, taskId, project: String(project.id), kind: 'recovery_read',
+        recovery: { grantId: this.recoveryKey(proof.grantId), grantFence: grant.fence, alias: grant.alias, paths: [...grant.paths] } };
+    }
     if (task.current_employee !== actor.employeeId || !['doing', 'review'].includes(task.state) ||
       (task.lease_expires_at ?? 0) <= Date.now() / 1000) {
       throw new CompanyError('forbidden', 'Ops tools are only available to the current lease holder of the task');
     }
-    // Task-level override wins, same resolution as claim/readWorkspace.
-    const project = task.project ?? task.goal_project;
-    if (!project) throw new CompanyError('invalid', 'Task goal has no project environment');
     return { actor, taskId, project: String(project.id) };
   }
 
@@ -3939,6 +3989,470 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       });
     }
     return { taskId, now, budgets, episodes, repairs };
+  }
+
+  // ---------------- FV06 recovery read grant ----------------
+
+  private recoveryKey(grantId: string): string {
+    return String(grantId).replace(/^recovery_read_grant:/, '').replace(/^⟨/, '').replace(/⟩$/, '');
+  }
+
+  private recoveryMs(value: unknown): number {
+    if (value instanceof Date) return value.getTime();
+    if (typeof value === 'number') return value;
+    if (typeof value === 'string') return Date.parse(value);
+    return Date.parse(String(value ?? ''));
+  }
+
+  private recoveryIso(value: unknown): string {
+    if (value instanceof Date) return value.toISOString();
+    const at = this.recoveryMs(value);
+    return Number.isFinite(at) ? new Date(at).toISOString() : String(value ?? '');
+  }
+
+  private recoveryView(row: RecoveryReadGrantDbRow): RecoveryReadGrantRowView {
+    const flight = row.in_flight && typeof row.in_flight === 'object' ? row.in_flight : undefined;
+    return {
+      id: normalizedId(row.id), taskId: normalizedId(row.source_task), employeeId: normalizedId(row.employee), alias: row.alias,
+      methods: [...(row.methods ?? [])], paths: [...(row.paths ?? [])],
+      expiresAt: this.recoveryIso(row.expires_at), authorizationTask: normalizedId(row.authorization_task), reason: row.reason,
+      state: row.state, loginAttempts: row.login_attempts ?? 0, perPath: [...(row.per_path ?? [])],
+      ...(flight ? { inFlight: { path: String(flight.path), startedAt: this.recoveryIso(flight.started_at),
+        deadline: this.recoveryIso(flight.deadline), callId: String(flight.call_id) } } : {}),
+      ...(row.stop_reason ? { stopReason: row.stop_reason } : {}),
+      ...(row.result_digest ? { resultDigest: row.result_digest } : {}),
+      createdBy: row.created_by, createdAt: this.recoveryIso(row.created_at),
+      ...(row.bound_at === undefined ? {} : { boundAt: this.recoveryIso(row.bound_at) }),
+      ...(row.closed_at === undefined ? {} : { closedAt: this.recoveryIso(row.closed_at) }),
+      fence: row.fence,
+    };
+  }
+
+  private async recoveryCallsOf(grantId: string, limit = 20): Promise<RecoveryReadCallView[]> {
+    const [rows] = await this.db.query<[Array<{ ordinal: number; kind: 'login' | 'get' | 'logout'; path?: string;
+      status?: number; ok: boolean; outcome: string; digest?: string; at: unknown }>]>(
+      'SELECT ordinal, kind, path, status, ok, outcome, digest, at FROM recovery_read_call WHERE grant = $grant ORDER BY ordinal DESC LIMIT $limit;',
+      { grant: id('recovery_read_grant', grantId), limit });
+    return rows.map(row => ({
+      ordinal: row.ordinal, kind: row.kind, ...(row.path ? { path: row.path } : {}),
+      ...(row.status ? { status: row.status } : {}), ok: row.ok === true, outcome: row.outcome,
+      ...(row.digest ? { digest: row.digest } : {}), at: this.recoveryIso(row.at),
+    })).reverse();
+  }
+
+  private async recoveryStatusOf(credential: Credential, input: { taskId?: TaskId; grantId?: string }): Promise<RecoveryReadStatusView[]> {
+    const actor = await this.authenticate(credential);
+    let rows: RecoveryReadGrantDbRow[];
+    if (input.grantId) {
+      const row = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', this.recoveryKey(input.grantId)));
+      rows = row ? [row] : [];
+    } else {
+      requireText(input.taskId ?? '', 'task', 1, 200);
+      const [found] = await this.db.query<[RecoveryReadGrantDbRow[]]>(
+        'SELECT * FROM recovery_read_grant WHERE source_task = $task ORDER BY created_at DESC;',
+        { task: id('task', input.taskId!) });
+      rows = found ?? [];
+    }
+    const sourceIds = new Set(rows.map(row => asId(row.source_task)));
+    let reviewer = false;
+    for (const taskId of sourceIds) {
+      const task = await this.db.select<{ reviewer_role?: string }>(id('task', taskId));
+      if (task?.reviewer_role === actor.role) reviewer = true;
+    }
+    if (actor.role !== 'gm' && !reviewer) rows = rows.filter(row => asId(row.employee) === actor.employeeId);
+    const views: RecoveryReadStatusView[] = [];
+    for (const row of rows) views.push({ grant: this.recoveryView(row), calls: await this.recoveryCallsOf(asId(row.id)) });
+    return views;
+  }
+
+  /** gm + manage；源任务保持 done；issuer ≠ grantee；四条精确路径、固定别名、1–30 分钟 TTL。 */
+  async recoveryReadGrant(credential: Credential, input: RecoveryReadGrantInput): Promise<RecoveryReadStatusView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may issue a recovery read grant');
+    requireText(input.taskId, 'task', 1, 200);
+    requireText(input.employeeId, 'employee', 1, 120);
+    requireText(input.authorizationTask, 'authorizationTask', 1, 200);
+    requireText(input.reason, 'reason', 4, 2000);
+    requireText(input.idempotencyKey, 'idempotencyKey', 1, 200);
+    if (input.employeeId === actor.employeeId) throw new CompanyError('forbidden', 'A recovery read grant cannot be self-issued');
+    if (input.alias !== RECOVERY_READ_ALIAS) throw new CompanyError('invalid', `alias must be ${RECOVERY_READ_ALIAS}`);
+    const paths = exactRecoveryPaths(input.paths);
+    const now = Date.now();
+    const expiresAt = parseRecoveryExpiry(input.expiresAt, now);
+    const idem = this.businessIdemId('recovery_read_grant', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ ...input, paths }));
+    const prior = await this.db.select<{ payload_digest?: string; result?: RecoveryReadGrantDbRow }>(idem);
+    if (prior) {
+      if (prior.payload_digest !== digest) throw new CompanyError('conflict', 'Idempotency key reused with different input');
+      if (!prior.result) throw new CompanyError('conflict', 'Recovery read grant replay has no stored result');
+      return { grant: this.recoveryView(prior.result), calls: await this.recoveryCallsOf(asId(prior.result.id)) };
+    }
+    const source = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!source) throw new CompanyError('not_found', 'Source task not found');
+    if (source.state !== 'done') throw new CompanyError('invalid', 'Recovery read source task must be done');
+    const episodes = await this.faults.episodesOfTask(input.taskId);
+    if (!episodes.some(episode => ['opened', 'exhausted', 'stopped', 'converged'].includes(episode.state))) {
+      throw new CompanyError('invalid', 'Source task has no open, exhausted or stopped fault episode');
+    }
+    const authorization = await this.db.select<TaskRow>(id('task', input.authorizationTask));
+    if (!authorization) throw new CompanyError('not_found', 'Authorization task not found');
+    if (authorization.state !== 'done') throw new CompanyError('invalid', 'Authorization task must be done');
+    const sourceGoal = source.goal ? asId(source.goal) : undefined;
+    const authorizationGoal = authorization.goal ? asId(authorization.goal) : undefined;
+    if (!sourceGoal || sourceGoal !== authorizationGoal) {
+      throw new CompanyError('invalid', 'Authorization task must belong to the source task goal');
+    }
+    const window = authorization.execution_window;
+    if (window && Number.isFinite(Date.parse(window.notAfter)) && expiresAt.getTime() > Date.parse(window.notAfter)) {
+      throw new CompanyError('invalid', 'Grant expiry cannot be later than the authorization task deadline');
+    }
+    const employee = await this.db.select<{ role: Role; revoked?: boolean; retired?: boolean }>(id('employee', input.employeeId));
+    if (!employee || employee.revoked || employee.retired) throw new CompanyError('invalid', 'Grantee employee is not active');
+    const sourceGoalRow = source.goal ? await this.db.select<{ project?: RecordId }>(source.goal) : undefined;
+    const project = source.project ?? sourceGoalRow?.project ?? authorization.project;
+    if (!project) throw new CompanyError('invalid', 'Source task has no project environment');
+    const envRows = (await this.projects.brokerEnvs(String(project.id))).filter(row => row.broker !== undefined && row.broker !== null);
+    if (envRows.length === 0) throw new CompanyError('not_configured', `project ${String(project.id)} has no ops broker environment`);
+    if (!envRows.some(row => parseBrokerConfig(row.broker).roles.includes(employee.role))) {
+      throw new CompanyError('invalid', `employee role ${employee.role} may not use ops tools in ${String(project.id)}`);
+    }
+    const [latest] = await this.db.query<[RecoveryReadGrantDbRow[]]>(
+      'SELECT * FROM recovery_read_grant WHERE source_task = $task ORDER BY created_at DESC LIMIT 1;',
+      { task: id('task', input.taskId) });
+    const previous = latest?.[0];
+    if (previous && input.rearm !== true) {
+      throw new CompanyError('conflict', 'A recovery read chain already exists for this source task; pass rearm with a new authorizationTask');
+    }
+    if (previous && input.rearm === true) {
+      if (asId(previous.authorization_task) === input.authorizationTask) {
+        throw new CompanyError('invalid', 'Rearm needs a new authorization task, not the one that already authorized the chain');
+      }
+      if (previous.state === 'bound' || previous.state === 'running') {
+        throw new CompanyError('conflict', 'The existing recovery read chain is still active; revoke it before rearming');
+      }
+    }
+    // 新 grant/rearm 从上一链原样承接计数：登录失败过一次，就再也不会有第二次登录机会。
+    const loginAttempts = previous?.login_attempts ?? 0;
+    const perPath = previous?.per_path ? [...previous.per_path] : [0, 0, 0, 0];
+    const grantId = randomUUID();
+    const grant = id('recovery_read_grant', grantId);
+    try {
+      const row = await this.txTask<RecoveryReadGrantDbRow>(`BEGIN;
+        LET $src = SELECT * FROM ONLY $source;
+        IF $src = NONE OR $src.state != 'done' { THROW 'recovery source task moved' };
+        IF $src.version != $sourceVersion { THROW 'recovery source task moved' };
+        LET $approval = SELECT * FROM ONLY $authorization;
+        IF $approval = NONE OR $approval.state != 'done' { THROW 'recovery authorization task moved' };
+        CREATE ONLY $grant CONTENT {
+          source_task: $source, employee: $employee, alias: $alias, methods: ['GET'], paths: $paths,
+          max_login: $maxLogin, max_calls_per_path: $maxCalls, expires_at: <datetime>$expiresAt,
+          authorization_task: $authorization, reason: $reason, state: 'issued',
+          login_attempts: $loginAttempts, per_path: $perPath, in_flight: NONE, stop_reason: '', result_digest: '',
+          created_by: $creator, created_at: time::now(), bound_at: NONE, closed_at: NONE, fence: 1, version: 1
+        };
+        LET $created = SELECT * FROM ONLY $grant;
+        CREATE ONLY $audit CONTENT { task: $source, actor: $actor, action: 'recovery_read_grant',
+          evidence: $evidence, at: time::now() };
+        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $created };
+        RETURN $created;
+        COMMIT;`, {
+        source: id('task', input.taskId), sourceVersion: source.version, authorization: id('task', input.authorizationTask),
+        employee: id('employee', input.employeeId), grant, alias: input.alias, paths,
+        maxLogin: RECOVERY_READ_MAX_LOGIN, maxCalls: RECOVERY_READ_MAX_CALLS_PER_PATH,
+        expiresAt: expiresAt.toISOString(), reason: input.reason, loginAttempts, perPath,
+        creator: actor.employeeId, digest, idem, audit: id('audit', randomUUID()),
+        actor: id('employee', actor.employeeId),
+        evidence: JSON.stringify({ grantId, taskId: input.taskId, employeeId: input.employeeId, alias: input.alias,
+          paths, expiresAt: expiresAt.toISOString(), authorizationTask: input.authorizationTask, rearm: input.rearm === true }).slice(0, 4000),
+      });
+      return { grant: this.recoveryView(row), calls: [] };
+    } catch (error) {
+      const replayed = await this.db.select<{ payload_digest?: string; result?: RecoveryReadGrantDbRow }>(idem);
+      if (replayed?.payload_digest === digest && replayed.result) {
+        return { grant: this.recoveryView(replayed.result), calls: await this.recoveryCallsOf(asId(replayed.result.id)) };
+      }
+      throw error;
+    }
+  }
+
+  async recoveryReadGrantRevoke(credential: Credential, input: { grantId: string; reason: string; idempotencyKey: string }): Promise<RecoveryReadStatusView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may revoke a recovery read grant');
+    requireText(input.reason, 'reason', 4, 2000);
+    requireText(input.idempotencyKey, 'idempotencyKey', 1, 200);
+    const grantId = this.recoveryKey(input.grantId);
+    const grant = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
+    if (!grant) throw new CompanyError('not_found', 'Recovery read grant not found');
+    if (grant.state !== 'revoked' && grant.state !== 'completed') {
+      await this.txTask(`BEGIN;
+        LET $g = SELECT * FROM ONLY $grant;
+        IF $g = NONE { THROW 'recovery grant not found' };
+        IF $g.state IN ['revoked', 'completed'] { THROW 'recovery grant already closed' };
+        UPDATE ONLY $grant SET state = 'revoked', stop_reason = $reason, closed_at = time::now(), version = $g.version + 1, in_flight = NONE;
+        LET $updated = SELECT * FROM ONLY $grant;
+        CREATE ONLY $audit CONTENT { task: $g.source_task, actor: $actor, action: 'recovery_read_revoke',
+          evidence: $evidence, at: time::now() };
+        RETURN $updated;
+        COMMIT;`, { grant: id('recovery_read_grant', grantId), actor: id('employee', actor.employeeId),
+        reason: input.reason, audit: id('audit', randomUUID()),
+        evidence: JSON.stringify({ grantId, reason: input.reason, idempotencyKey: input.idempotencyKey }).slice(0, 4000) });
+    }
+    const row = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
+    return { grant: this.recoveryView(row!), calls: await this.recoveryCallsOf(grantId) };
+  }
+
+  async recoveryReadStatus(credential: Credential, input: { taskId?: TaskId; grantId?: string }): Promise<RecoveryReadStatusView[]> {
+    return this.recoveryStatusOf(credential, input);
+  }
+
+  /** 通道只读查询：按员工凭证取其自己的 grant；未过期的 inactive 也返回，由通道决定拒绝。 */
+  async recoveryGrantFor(credential: Credential, grantId: string): Promise<RecoveryReadGrantRowView> {
+    const actor = await this.authorized(credential);
+    const row = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', this.recoveryKey(grantId)));
+    if (!row || asId(row.employee) !== actor.employeeId) throw new CompanyError('not_found', 'Recovery read grant not found for this employee');
+    const view = this.recoveryView(row);
+    // 读时投影：不写行；过期或源任务离开 done 时通道据此关闭绑定。
+    if (view.state === 'issued' || view.state === 'bound' || view.state === 'running') {
+      if (this.recoveryMs(row.expires_at) <= Date.now()) view.state = 'expired';
+      else {
+        const source = await this.db.select<{ state?: string }>(id('task', view.taskId));
+        if (source?.state !== 'done') { view.state = 'stopped'; view.stopReason = 'source_changed'; }
+      }
+    }
+    return view;
+  }
+
+  /** 通道重载/唤醒的完整员工查询：只返回仍可绑定的 grant（issued/bound/running、未过期、源任务仍 done）。 */
+  async recoveryGrantsFor(credential: Credential): Promise<RecoveryReadGrantRowView[]> {
+    const actor = await this.authorized(credential);
+    const [rows] = await this.db.query<[RecoveryReadGrantDbRow[]]>(
+      `SELECT * FROM recovery_read_grant WHERE employee = $employee AND state IN ['issued', 'bound', 'running']
+         ORDER BY created_at DESC;`, { employee: id('employee', actor.employeeId) });
+    const active: RecoveryReadGrantRowView[] = [];
+    for (const row of rows) {
+      if (this.recoveryMs(row.expires_at) <= Date.now()) continue;
+      const source = await this.db.select<{ state?: string }>(id('task', asId(row.source_task)));
+      if (source?.state !== 'done') continue;
+      active.push(this.recoveryView(row));
+    }
+    return active;
+  }
+
+  /** 通道绑定：issued → bound（审计 recovery_read_bind）；执行租约在身时不绑定。 */
+  async recoveryReadBind(credential: Credential, input: { grantId: string; fence: number }): Promise<RecoveryReadGrantRowView> {
+    const actor = await this.authorized(credential);
+    const grantId = this.recoveryKey(input.grantId);
+    const grant = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
+    if (!grant || asId(grant.employee) !== actor.employeeId) throw new CompanyError('not_found', 'Recovery read grant not found for this employee');
+    if (grant.fence !== input.fence) throw new CompanyError('forbidden', 'Recovery read grant proof does not match');
+    if (this.recoveryMs(grant.expires_at) <= Date.now()) {
+      await this.recoveryReadClose(credential, { grantId, fence: input.fence, reason: 'expired' });
+      throw new CompanyError('forbidden', 'Recovery read grant expired');
+    }
+    const source = await this.db.select<{ state?: string }>(id('task', asId(grant.source_task)));
+    if (source?.state !== 'done') throw new CompanyError('forbidden', 'Recovery read source task is no longer done');
+    const [live] = await this.db.query<[Array<{ id: RecordId }>]>(
+      `SELECT id FROM task WHERE current_employee = $employee AND state IN ['doing', 'review']
+         AND lease_expires_at != NONE AND lease_expires_at > time::unix(time::now()) LIMIT 1;`,
+      { employee: actor.employeeId });
+    if (live.length > 0) throw new CompanyError('conflict', 'Employee holds an execution lease; recovery read cannot bind');
+    if (grant.state === 'issued') {
+      const row = await this.txTask<RecoveryReadGrantDbRow>(`BEGIN;
+        LET $g = SELECT * FROM ONLY $grant;
+        IF $g = NONE { THROW 'recovery grant not found' };
+        IF $g.state != 'issued' { THROW 'recovery grant moved' };
+        LET $next = UPDATE ONLY $grant SET state = 'bound', bound_at = time::now(), version = $g.version + 1 RETURN AFTER;
+        CREATE ONLY $audit CONTENT { task: $g.source_task, actor: $actor, action: 'recovery_read_bind',
+          evidence: $evidence, at: time::now() };
+        RETURN $next;
+        COMMIT;`, { grant: id('recovery_read_grant', grantId), actor: id('employee', actor.employeeId),
+        audit: id('audit', randomUUID()),
+        evidence: JSON.stringify({ grantId, employeeId: actor.employeeId, fence: input.fence, taskId: asId(grant.source_task) }).slice(0, 4000) });
+      return this.recoveryView(row);
+    }
+    if (grant.state !== 'bound' && grant.state !== 'running') throw new CompanyError('forbidden', `Recovery read grant is ${grant.state}`);
+    return this.recoveryView(grant);
+  }
+
+  /**
+   * 调用前的链级原子 reserve：登录只允许一次；GET 只允许固定顺序的下一条、每路径一次；任何 inFlight 存在即 busy。
+   * 只递增本 grant 的计数与 inFlight，不碰 fault 账本——预算仍由 broker 按源 taskId 另记。
+   */
+  async recoveryReadReserve(credential: Credential, input: RecoveryReadReserveInput): Promise<RecoveryReadReserveResult> {
+    const actor = await this.authorized(credential);
+    const grantId = this.recoveryKey(input.grantId);
+    if (!Number.isSafeInteger(input.grantFence) || input.grantFence < 1) throw new CompanyError('invalid', 'Invalid grant fence');
+    const grant = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
+    if (!grant || asId(grant.employee) !== actor.employeeId || grant.fence !== input.grantFence) {
+      throw new CompanyError('forbidden', 'Recovery read grant proof does not match');
+    }
+    if (input.kind === 'logout') {
+      // 必要清理永远放行：不递增、不看状态、不要求登录成功。
+      return { allowed: true, kind: 'logout', callId: randomUUID(), message: 'logout allowed' };
+    }
+    const refuse = (reason: string, message: string): RecoveryReadReserveResult => ({ allowed: false, kind: input.kind, ...(input.path ? { path: input.path } : {}), reason, message });
+    if (this.recoveryMs(grant.expires_at) <= Date.now()) return refuse('grant_expired', 'Recovery read grant expired');
+    if (grant.state === 'revoked') return refuse('grant_revoked', 'Recovery read grant was revoked');
+    if (grant.state === 'expired') return refuse('grant_expired', 'Recovery read grant expired');
+    if (grant.state === 'stopped') return refuse('grant_stopped', `Recovery read chain stopped (${grant.stop_reason ?? 'unknown'})`);
+    if (grant.state === 'completed') return refuse('grant_completed', 'Recovery read chain already completed');
+    if (grant.state === 'issued') return refuse('not_bound', 'Recovery read grant is not bound to a channel');
+    if (grant.in_flight) return refuse('busy', 'Recovery read is busy with another call');
+    const source = await this.db.select<{ state?: string }>(id('task', asId(grant.source_task)));
+    if (source?.state !== 'done') return refuse('source_changed', 'Recovery read source task is no longer done');
+    const callId = randomUUID();
+    const deadline = new Date(Date.now() + RECOVERY_READ_CALL_DEADLINE_MS).toISOString();
+    if (input.kind === 'login') {
+      if (grant.state !== 'bound') return refuse('login_unavailable', 'Recovery read login is only available before the first successful login');
+      if ((grant.login_attempts ?? 0) >= (grant.max_login ?? RECOVERY_READ_MAX_LOGIN)) return refuse('login_attempted', 'Recovery read login was already attempted');
+      try {
+        await this.txTask<RecoveryReadGrantDbRow>(`BEGIN;
+          LET $g = SELECT * FROM ONLY $grant;
+          IF $g = NONE { THROW 'recovery grant not found' };
+          IF $g.state != 'bound' { THROW 'recovery login unavailable' };
+          IF $g.login_attempts >= $g.max_login { THROW 'recovery login already attempted' };
+          IF $g.in_flight != NONE { THROW 'recovery read busy' };
+          IF $g.expires_at <= time::now() { THROW 'recovery grant expired' };
+          LET $src = SELECT * FROM ONLY $g.source_task;
+          IF $src = NONE OR $src.state != 'done' { THROW 'recovery source task moved' };
+          LET $next = UPDATE ONLY $grant SET login_attempts = $g.login_attempts + 1,
+            in_flight = { path: 'login', started_at: time::now(), deadline: <datetime>$deadline, call_id: $callId },
+            version = $g.version + 1 RETURN AFTER;
+          RETURN $next;
+          COMMIT;`, { grant: id('recovery_read_grant', grantId), deadline, callId });
+      } catch (error) {
+        return refuse('busy', `Recovery read is busy or the grant moved: ${(error as Error).message.slice(0, 160)}`);
+      }
+      return { allowed: true, kind: 'login', callId, deadline, message: 'login reserved' };
+    }
+    // GET：只允许固定顺序里的下一条。
+    const index = RECOVERY_READ_PATHS.indexOf(input.path as never);
+    if (index < 0 || grant.paths[index] !== input.path) return refuse('path_not_allowlisted', 'Path is not in this grant');
+    if (grant.state !== 'running') return refuse('read_unavailable', 'Recovery read GETs are only available after a successful login');
+    const perPath = grant.per_path ?? [0, 0, 0, 0];
+    if ((perPath[index] ?? 0) >= (grant.max_calls_per_path ?? RECOVERY_READ_MAX_CALLS_PER_PATH)) return refuse('path_attempted', 'This path was already called');
+    if (index > 0 && perPath[index - 1] !== 1) return refuse('path_order', 'Recovery read paths must be called in order');
+    const nextPaths = [...perPath];
+    nextPaths[index] = (nextPaths[index] ?? 0) + 1;
+    try {
+      await this.txTask<RecoveryReadGrantDbRow>(`BEGIN;
+        LET $g = SELECT * FROM ONLY $grant;
+        IF $g = NONE { THROW 'recovery grant not found' };
+        IF $g.version != $expectedVersion { THROW 'recovery grant moved' };
+        IF $g.state != 'running' { THROW 'recovery read unavailable' };
+        IF $g.in_flight != NONE { THROW 'recovery read busy' };
+        IF $g.expires_at <= time::now() { THROW 'recovery grant expired' };
+        LET $src = SELECT * FROM ONLY $g.source_task;
+        IF $src = NONE OR $src.state != 'done' { THROW 'recovery source task moved' };
+        LET $next = UPDATE ONLY $grant SET per_path = $nextPaths,
+          in_flight = { path: $path, started_at: time::now(), deadline: <datetime>$deadline, call_id: $callId },
+          version = $g.version + 1 RETURN AFTER;
+        RETURN $next;
+        COMMIT;`, { grant: id('recovery_read_grant', grantId), expectedVersion: grant.version, nextPaths, path: input.path,
+        deadline, callId });
+    } catch (error) {
+      return refuse('busy', `Recovery read is busy or the grant moved: ${(error as Error).message.slice(0, 160)}`);
+    }
+    return { allowed: true, kind: 'get', callId, path: input.path, deadline, message: 'read reserved' };
+  }
+
+  /** 调用后的原子 settle：记录状态/摘要、清 inFlight、推进或停止；停止是链级终态。 */
+  async recoveryReadSettle(credential: Credential, input: RecoveryReadSettleInput): Promise<void> {
+    const actor = await this.authorized(credential);
+    const grantId = this.recoveryKey(input.grantId);
+    if (input.kind === 'logout') {
+      await this.recoveryCallRow(grantId, input, 0);
+      return;
+    }
+    const grant = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
+    if (!grant || asId(grant.employee) !== actor.employeeId || grant.fence !== input.grantFence) {
+      throw new CompanyError('forbidden', 'Recovery read grant proof does not match');
+    }
+    if (!grant.in_flight || String(grant.in_flight.call_id) !== input.callId) {
+      throw new CompanyError('conflict', 'Recovery read call is not in flight (already settled or unknown)');
+    }
+    const index = input.path ? RECOVERY_READ_PATHS.indexOf(input.path as never) : -1;
+    const state: RecoveryReadState = !input.ok ? 'stopped'
+      : input.kind === 'login' ? 'running'
+        : index === RECOVERY_READ_PATHS.length - 1 ? 'completed' : 'running';
+    const stopReason = !input.ok ? (input.kind === 'login' ? 'login_failed' : input.outcome) : undefined;
+    const digest = input.bodyDigest ?? grant.result_digest ?? '';
+    const closed = state === 'completed' || state === 'stopped';
+    const sets = ['in_flight = NONE', 'state = $state', 'version = $g.version + 1'];
+    if (stopReason) sets.push('stop_reason = $stopReason');
+    if (digest) sets.push('result_digest = $digest');
+    if (closed) sets.push('closed_at = time::now()');
+    const next = await this.txTask<RecoveryReadGrantDbRow>(`BEGIN;
+      LET $g = SELECT * FROM ONLY $grant;
+      IF $g = NONE { THROW 'recovery grant not found' };
+      IF $g.in_flight = NONE OR $g.in_flight.call_id != $callId { THROW 'recovery call moved' };
+      LET $updated = UPDATE ONLY $grant SET ${sets.join(', ')} RETURN AFTER;
+      CREATE ONLY $call CONTENT { grant: $grant, source_task: $g.source_task, employee: $g.employee,
+        ordinal: $ordinal, kind: $kind, path: $path, status: $status, ok: $ok, outcome: $outcome,
+        digest: $digest, at: time::now() };
+      RETURN $updated;
+      COMMIT;`, {
+      grant: id('recovery_read_grant', grantId), callId: input.callId, state,
+      stopReason: stopReason ?? '', digest,
+      call: id('recovery_read_call', randomUUID()), ordinal: await this.recoveryNextOrdinal(grantId),
+      kind: input.kind, path: input.path ?? '', status: input.status ?? 0, ok: input.ok, outcome: input.outcome,
+    });
+    void next;
+  }
+
+  private async recoveryNextOrdinal(grantId: string): Promise<number> {
+    const [rows] = await this.db.query<[Array<{ n: number }>]>(
+      'SELECT count() AS n FROM recovery_read_call WHERE grant = $grant GROUP ALL;', { grant: id('recovery_read_grant', grantId) });
+    return (rows[0]?.n ?? 0) + 1;
+  }
+
+  private async recoveryCallRow(grantId: string, input: RecoveryReadSettleInput, ordinal: number): Promise<void> {
+    const grant = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
+    if (!grant) throw new CompanyError('not_found', 'Recovery read grant not found');
+    await this.db.query(`CREATE $call CONTENT { grant: $grant, source_task: $task, employee: $employee,
+      ordinal: $ordinal, kind: $kind, path: $path, status: $status, ok: $ok, outcome: $outcome,
+      digest: $digest, at: time::now() };`, {
+      call: id('recovery_read_call', randomUUID()), grant: id('recovery_read_grant', grantId),
+      task: grant.source_task, employee: grant.employee, ordinal: ordinal || await this.recoveryNextOrdinal(grantId),
+      kind: input.kind, path: input.path ?? '', status: input.status ?? 0, ok: input.ok, outcome: input.outcome,
+      digest: input.bodyDigest ?? '',
+    });
+  }
+
+  /** 通道关闭：审计 recovery_read_close；过期则 expired，源任务离开 done 则 stopped(source_changed)。 */
+  async recoveryReadClose(credential: Credential, input: { grantId: string; fence: number; reason: string }): Promise<void> {
+    const actor = await this.authorized(credential);
+    const grantId = this.recoveryKey(input.grantId);
+    const grant = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
+    if (!grant || asId(grant.employee) !== actor.employeeId || grant.fence !== input.fence) {
+      throw new CompanyError('forbidden', 'Recovery read grant proof does not match');
+    }
+    const source = await this.db.select<{ state?: string }>(id('task', asId(grant.source_task)));
+    const now = Date.now();
+    const state: RecoveryReadState | undefined = grant.state === 'revoked' || grant.state === 'completed' ? undefined
+      : this.recoveryMs(grant.expires_at) <= now ? 'expired'
+        : source?.state !== 'done' ? 'stopped' : undefined;
+    const stopReason = state === 'stopped' ? 'source_changed' : state === 'expired' ? 'expired' : '';
+    const sets = ['closed_at = time::now()', 'in_flight = NONE'];
+    if (state) sets.push('state = $state');
+    if (stopReason) sets.push('stop_reason = $stopReason');
+    try {
+      await this.txTask(`BEGIN;
+        LET $g = SELECT * FROM ONLY $grant;
+        IF $g = NONE { THROW 'recovery grant not found' };
+        UPDATE ONLY $grant SET ${sets.join(', ')} WHERE state IN ['issued', 'bound', 'running'];
+        CREATE ONLY $audit CONTENT { task: $g.source_task, actor: $actor, action: 'recovery_read_close',
+          evidence: $evidence, at: time::now() };
+        RETURN $g;
+        COMMIT;`, { grant: id('recovery_read_grant', grantId), actor: id('employee', actor.employeeId),
+        ...(state ? { state } : {}), ...(stopReason ? { stopReason } : {}),
+        audit: id('audit', randomUUID()),
+        evidence: JSON.stringify({ grantId, fence: input.fence, reason: input.reason, state: state ?? 'none' }).slice(0, 4000) });
+    } catch (error) {
+      // 关闭是清理动作：grant 已不存在或已被并发关闭时不阻塞通道回收。
+      if (error instanceof CompanyError && (error.code === 'not_found' || error.code === 'conflict')) return;
+      throw error;
+    }
   }
 
   /**

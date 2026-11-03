@@ -1170,6 +1170,35 @@ function registerTools(server: McpServer, core: CompanyCore) {
     }),
   }, async (input, ctx) => run(token(ctx), () => core.faultLift
     ? core.faultLift(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('recovery_read_grant', {
+    description: 'gm + manage only: issue a one-shot recovery read grant for a terminal (done) source task that already has a fault episode. The named employee — never the issuer — may run exactly one LCA04_OPS operator login, the four fixed GETs in order and a necessary logout, all charged to the source task\'s own fault keys. The grant changes no task state, creates no budget and lifts none. Pass the four paths exactly (paths is required); expiresAt is 1–30 minutes. Audited.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200),
+      employeeId: z.string().min(1).max(120),
+      alias: z.literal('LCA04_OPS'),
+      paths: z.array(z.string().min(1).max(2000)).length(4),
+      expiresAt: z.string().min(1).max(100),
+      authorizationTask: z.string().min(1).max(200),
+      reason: z.string().min(4).max(2000),
+      idempotencyKey: z.string().min(1).max(200),
+      rearm: z.boolean().optional(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.recoveryReadGrant
+    ? core.recoveryReadGrant(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('recovery_read_grant_revoke', {
+    description: 'gm + manage only: revoke a recovery read grant. The channel closes the binding on its next check and drops only that grant\'s local session handles; the source task stays done. Audited.',
+    inputSchema: z.object({
+      grantId: z.string().min(1).max(200),
+      reason: z.string().min(4).max(2000),
+      idempotencyKey: z.string().min(1).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.recoveryReadGrantRevoke
+    ? core.recoveryReadGrantRevoke(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('recovery_read_status', {
+    description: 'Read-only recovery read ledger: grants and their calls (IDs, paths, statuses, outcome names, body digests) for a source task or one grant. gm sees all; the grantee and the source task\'s reviewer see their own. Never returns subject, session, token, URL or a response body.',
+    inputSchema: z.object({ taskId: z.string().min(1).max(200).optional(), grantId: z.string().min(1).max(200).optional() }),
+  }, async (input, ctx) => run(token(ctx), () => core.recoveryReadStatus
+    ? core.recoveryReadStatus(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('qa_observation_status', {
     description: 'gm sees every QA observation scope; a qa employee sees its own. Never returns a code, token or session hash. Read-only.',
     inputSchema: z.object({}),

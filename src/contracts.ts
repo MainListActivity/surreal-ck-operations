@@ -592,6 +592,104 @@ export interface OpsScope {
   actor: Principal;
   taskId: TaskId;
   project: string;
+  /**
+   * How this ops call was authorized. Absent means the ordinary live execution lease (every existing caller).
+   * `recovery_read` means a gm-issued recovery read grant bound to a terminal source task: `taskId` is then the
+   * source task, and the broker applies the grant allowlist instead of the execution tool surface.
+   */
+  kind?: 'lease' | 'recovery_read';
+  recovery?: RecoveryReadScope;
+}
+
+/** The restricted authorization a recovery read grant carries into one ops call. */
+export interface RecoveryReadScope {
+  grantId: string;
+  grantFence: number;
+  alias: string;
+  paths: string[];
+}
+
+export type RecoveryReadState = 'issued' | 'bound' | 'running' | 'completed' | 'stopped' | 'revoked' | 'expired';
+
+export interface RecoveryReadGrantInput {
+  taskId: TaskId;
+  employeeId: string;
+  alias: string;
+  paths: string[];
+  expiresAt: string;
+  authorizationTask: TaskId;
+  reason: string;
+  idempotencyKey: string;
+  /** Explicit re-open after a stopped/expired chain: counts are carried over, never cleared. */
+  rearm?: boolean;
+}
+
+export interface RecoveryReadGrantRowView {
+  id: string;
+  taskId: TaskId;
+  employeeId: string;
+  alias: string;
+  methods: string[];
+  paths: string[];
+  expiresAt: string;
+  authorizationTask: TaskId;
+  reason: string;
+  state: RecoveryReadState;
+  loginAttempts: number;
+  perPath: number[];
+  inFlight?: { path: string; startedAt: string; deadline: string; callId: string };
+  stopReason?: string;
+  resultDigest?: string;
+  createdBy: string;
+  createdAt: string;
+  boundAt?: string;
+  closedAt?: string;
+  fence: number;
+}
+
+export interface RecoveryReadCallView {
+  ordinal: number;
+  kind: 'login' | 'get' | 'logout';
+  path?: string;
+  status?: number;
+  ok: boolean;
+  outcome: string;
+  digest?: string;
+  at: string;
+}
+
+export interface RecoveryReadStatusView {
+  grant: RecoveryReadGrantRowView;
+  calls: RecoveryReadCallView[];
+}
+
+export interface RecoveryReadReserveInput {
+  grantId: string;
+  grantFence: number;
+  kind: 'login' | 'get' | 'logout';
+  path?: string;
+}
+
+export interface RecoveryReadReserveResult {
+  allowed: boolean;
+  kind: 'login' | 'get' | 'logout';
+  callId?: string;
+  path?: string;
+  deadline?: string;
+  reason?: string;
+  message: string;
+}
+
+export interface RecoveryReadSettleInput {
+  grantId: string;
+  grantFence: number;
+  callId: string;
+  kind: 'login' | 'get' | 'logout';
+  path?: string;
+  status?: number;
+  ok: boolean;
+  outcome: string;
+  bodyDigest?: string;
 }
 
 export interface SessionRef {
@@ -1455,6 +1553,29 @@ export interface CompanyCore {
    */
   faultLift?(credential: Credential, input: { taskId: TaskId; incident: string; reason: string; idempotencyKey: string }): Promise<FaultStatusView>;
   /**
+   * FV06: gm + manage issues a recovery read grant for one terminal (done) source task. It never changes the
+   * source task, never creates a budget and never lifts one; the grant only lets the named employee run one
+   * operator login, the four fixed GETs in order and a necessary logout, with every call charged to the
+   * source task's own fault keys. The issuer can never be the grantee.
+   */
+  recoveryReadGrant?(credential: Credential, input: RecoveryReadGrantInput): Promise<RecoveryReadStatusView>;
+  /** FV06: gm + manage revokes a grant; the channel closes on its next check and local sessions are dropped. */
+  recoveryReadGrantRevoke?(credential: Credential, input: { grantId: string; reason: string; idempotencyKey: string }): Promise<RecoveryReadStatusView>;
+  /** FV06: read-only grant + call ledger. gm sees all; the grantee and the source task's reviewer see their own. */
+  recoveryReadStatus?(credential: Credential, input: { taskId?: TaskId; grantId?: string }): Promise<RecoveryReadStatusView[]>;
+  /** FV06: channel query — the caller's own grant, active or not; the sidecar binds only active ones. */
+  recoveryGrantFor?(credential: Credential, grantId: string): Promise<RecoveryReadGrantRowView>;
+  /** FV06: channel query — every active grant of the caller, for reload/rebuild (complete credential-scoped read). */
+  recoveryGrantsFor?(credential: Credential): Promise<RecoveryReadGrantRowView[]>;
+  /** FV06: channel bind — issued → bound, audited; refuses when the employee holds an execution lease. */
+  recoveryReadBind?(credential: Credential, input: { grantId: string; fence: number }): Promise<RecoveryReadGrantRowView>;
+  /** FV06: atomic pre-call chain reservation (counts + inFlight), independent of the fault budget reservation. */
+  recoveryReadReserve?(credential: Credential, input: RecoveryReadReserveInput): Promise<RecoveryReadReserveResult>;
+  /** FV06: atomic post-call settle: records the outcome, clears inFlight, advances or stops the chain. */
+  recoveryReadSettle?(credential: Credential, input: RecoveryReadSettleInput): Promise<void>;
+  /** FV06: channel close — audited; expires/stops the grant when the source moved or the TTL passed. */
+  recoveryReadClose?(credential: Credential, input: { grantId: string; fence: number; reason: string }): Promise<void>;
+  /**
    * Dispatcher-only: hand an execute-phase engineering task to a live engineer when the bound implementer's session is
    * gone for good (archived, missing, or a failure that cannot be restarted). Same compare-and-set write as the
    * manager's takeover, audited as `system:dispatcher`. Takes no credential and is never exposed as an agent tool.
@@ -1585,7 +1706,7 @@ export interface CompanyCore {
   /** manage (gm/product): replace only the project's disciplines vocabulary; audited. */
   updateProjectDisciplines(credential: Credential, input: { project: string; disciplines: Array<{ name: string; description?: string; roles?: Role[] }> }): Promise<ProjectView>;
   /** Ops broker gate: the caller must hold the task's current lease and the task's goal must name a project. */
-  opsScope(credential: Credential, taskId: TaskId): Promise<OpsScope>;
+  opsScope(credential: Credential, taskId: TaskId, proof?: { grantId: string; grantFence: number }): Promise<OpsScope>;
   /** Appends a secret-free `ops_*` record to the task's audit trail. Only `ops_call` rows stay out of handover history. */
   auditOps(scope: OpsScope, action: string, evidence: string): Promise<void>;
   /** How many `action` audit rows tasks of this project wrote in the last `windowSeconds`; backs broker quotas. */
