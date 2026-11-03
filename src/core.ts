@@ -6260,6 +6260,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     }
     const gate = await this.independenceGate(input.taskId, contrib.policy, 'execute');
     await this.refuseIndependent(gate, input.toEmployee);
+    await this.contributionReadHook?.(input.taskId);
     const evidence = `${input.reason}\n[implementer_takeover] task=${input.taskId} from=${facts.implementer ?? 'none'} to=${input.toEmployee} replacementReviewer=${input.replacementReviewer ?? 'none'} expectedVersion=${input.expectedVersion}`;
     const query = `BEGIN;
       LET $now = time::unix(time::now());
@@ -6353,6 +6354,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     }
     const gate = await this.independenceGate(input.taskId, contrib.policy, 'execute');
     await this.refuseIndependent(gate, input.toEmployee);
+    await this.contributionReadHook?.(input.taskId);
     const evidence = `${input.reason}\n[implementer_takeover:auto] task=${input.taskId} from=${facts.implementer ?? 'none'} to=${input.toEmployee} expectedVersion=${input.expectedVersion}`;
     const query = `BEGIN;
       LET $now = time::unix(time::now());
@@ -6390,6 +6392,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const vars = {
       task: id('task', input.taskId), expected: input.expectedVersion, target: id('employee', input.toEmployee),
       target_key: input.toEmployee, seen: contrib.version ?? -1, evidence, digest, idem, actor,
+      ops_repo: this.worktrees?.options.opsRepo ?? this.companyReleaseRepo, indep_guards: gate?.guards ?? [],
       audit: id('audit', randomUUID()), bound: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
     };
     try {

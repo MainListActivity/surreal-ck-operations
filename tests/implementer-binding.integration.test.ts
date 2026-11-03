@@ -222,6 +222,10 @@ test('independent cleanup is gated atomically at creation, claim and both takeov
   }
   expect((await task(t.id)).version).toBe(t.version);
   const moved=await core.implementerTakeover(tokens.gm,{taskId:t.id,toEmployee:'t-eng-c',expectedVersion:t.version,reason:'交给未参与源任务的独立工程员工',idempotencyKey:key()});
+  const auto=await core.createTask(tokens.gm,{title:'系统接替也须执行来源栅栏',context:'自动接替事务实测',executorRole:'engineering',reviewerRole:'qa',independence:{stages:['execute'],sources:[source.id],mode:'execute_handlers',reason:'系统接替同样隔离来源作者'},idempotencyKey:key()});
+  await expect(core.systemImplementerTakeover({taskId:auto.id,toEmployee:'t-eng-b',expectedVersion:auto.version,reason:'交给无来源贡献的合法独立员工'})).resolves.toMatchObject({implementer:'t-eng-b'});
+  const [sourceGuard]=await database.db.query<[number]>('RETURN (SELECT VALUE independence_guard FROM ONLY $source);',{source:new RecordId('task',source.id)});
+  expect(sourceGuard).toBe((await task(source.id)).version);
   expect(moved.implementer).toBe('t-eng-c');
   await expect(core.claim(tokens['eng-c'],t.id)).resolves.toMatchObject({task:{state:'doing',implementer:'t-eng-c'}});
 });
@@ -239,4 +243,17 @@ test('direct claim cannot bypass repository routing even with a matching role',a
  try{ await expect(core.claim(tokens['eng-c'],t.id)).rejects.toMatchObject({code:'forbidden'}); }
  finally{ await database.db.query('UPDATE employee:⟨t-eng-c⟩ SET workspace_repo=NONE;'); }
  expect((await task(t.id)).state).toBe('ready');
+});
+
+
+test('source changes after admission refuse both takeover transactions without binding a stale successor',async()=>{
+ const source=await newTask('接手来源版本并发变化');
+ const t=await core.createTask(tokens.gm,{title:'异人接手版本栅栏',context:'source变化拒绝陈旧授权',executorRole:'engineering',reviewerRole:'qa',independence:{stages:['execute'],sources:[source.id],mode:'execute_handlers',reason:'来源贡献必须在提交时仍有效'},idempotencyKey:key()});
+ const racing=new SurrealCompanyCore(database,{workforce,contributionReadHook:async()=>{await database.db.query('UPDATE ONLY $source SET version += 1;',{source:new RecordId('task',source.id)});}});
+ for(const system of [false,true]){
+  const input={taskId:t.id,toEmployee:'t-eng-b',expectedVersion:t.version,reason:'并发来源修改必须拒绝整笔接手',idempotencyKey:key()};
+  await expect(system?racing.systemImplementerTakeover(input):racing.implementerTakeover(tokens.gm,input)).rejects.toMatchObject({code:'conflict'});
+  expect(await task(t.id)).toMatchObject({version:t.version,state:'ready'});
+  expect((await task(t.id)).implementer).toBeUndefined();
+ }
 });
