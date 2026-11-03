@@ -827,3 +827,97 @@ describe('the classification of the block path', () => {
     expect(episodes?.length).toBe(0);
   });
 });
+
+describe('an unexecuted reservation is refunded, never settled healthy', () => {
+  test('refund restores the prior failed facts and the exact counters', async () => {
+    const taskId = await makeTask('退款：恢复原事实');
+    const scope = { taskId, employeeId: 't-eng' };
+    // Seed two real failures, so the refund must restore a count above one rather than zero.
+    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
+    clock += 10_000;
+    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
+    const before = await budgetRow(taskId);
+    expect(before?.failed).toBe(true);
+    expect(before?.attempts).toBe(2);
+    expect(before?.totalAttempts).toBe(2);
+    expect(before?.lastIncident).toBeTruthy();
+    clock += 10_000;
+    const reserved = await core.reserveFault!(scope, RESERVE);
+    expect(reserved?.allowed).toBe(true);
+    expect(reserved?.charged).toBe(true);
+    expect(reserved?.refund).toBeDefined();
+    const charged = await budgetRow(taskId);
+    expect(charged?.attempts).toBe(3);
+    expect(charged?.failed).toBe(true);
+    const result = await core.refundFault!(scope, { ...RESERVE, refund: reserved!.refund! });
+    expect(result.refunded).toBe(true);
+    const after = await budgetRow(taskId);
+    expect(after?.attempts).toBe(before?.attempts);
+    expect(after?.totalAttempts).toBe(before?.totalAttempts);
+    expect(after?.deadline).toBe(before?.deadline);
+    expect(after?.nextAllowedAt).toBe(before?.nextAllowedAt);
+    expect(after?.lastAttemptAt).toBe(before?.lastAttemptAt);
+    expect(after?.failed).toBe(true);
+    expect(after?.stopped).toBe(false);
+    expect(after?.lastIncident).toBe(before?.lastIncident);
+    expect(after?.lastErrno).toBe(before?.lastErrno);
+  });
+
+  test('the refund is a CAS: a second refund and a concurrent new failure are no-ops', async () => {
+    const taskId = await makeTask('退款：并发与重复');
+    const scope = { taskId, employeeId: 't-eng' };
+    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
+    clock += 10_000;
+    const reserved = await core.reserveFault!(scope, RESERVE);
+    expect(reserved?.charged).toBe(true);
+    expect((await core.refundFault!(scope, { ...RESERVE, refund: reserved!.refund! })).refunded).toBe(true);
+    // A second refund with the same receipt finds the post-state gone.
+    expect((await core.refundFault!(scope, { ...RESERVE, refund: reserved!.refund! })).refunded).toBe(false);
+
+    // A concurrent new failure (another holder, next attempt) must win over the older refund.
+    clock += 10_000;
+    const second = await core.reserveFault!(scope, RESERVE);
+    expect(second?.charged).toBe(true);
+    clock += 10_000;
+    const concurrent = await attempt({ taskId, employeeId: 't-eng2' }, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
+    expect(concurrent.reserved?.charged).toBe(true);
+    const rowBeforeRefund = await budgetRow(taskId);
+    expect(rowBeforeRefund?.attempts).toBe(3);
+    const late = await core.refundFault!(scope, { ...RESERVE, refund: second!.refund! });
+    expect(late.refunded).toBe(false);
+    const rowAfterRefund = await budgetRow(taskId);
+    expect(rowAfterRefund?.attempts).toBe(rowBeforeRefund?.attempts);
+    expect(rowAfterRefund?.totalAttempts).toBe(rowBeforeRefund?.totalAttempts);
+    expect(rowAfterRefund?.deadline).toBe(rowBeforeRefund?.deadline);
+    expect(rowAfterRefund?.nextAllowedAt).toBe(rowBeforeRefund?.nextAllowedAt);
+  });
+
+  test('a real upstream success still settles with the original semantics', async () => {
+    const taskId = await makeTask('退款：真实成功仍结算');
+    const scope = { taskId, employeeId: 't-eng' };
+    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
+    clock += 10_000;
+    const reserved = await core.reserveFault!(scope, RESERVE);
+    expect(reserved?.charged).toBe(true);
+    await core.settleFault!(scope, RESERVE);
+    const after = await budgetRow(taskId);
+    expect(after?.failed).toBe(false);
+    expect(after?.attempts).toBe(0);
+    expect(after?.nextAllowedAt).toBe(clock);
+    // The cumulative count stays for the audit, as before.
+    expect(after?.totalAttempts).toBe(2);
+  });
+
+  test('a stopped budget refuses the reservation and issues no refund receipt', async () => {
+    const taskId = await makeTask('退款：停止不发票');
+    const scope = { taskId, employeeId: 't-eng' };
+    await attempt(scope, { status: 403 });
+    const stopped = await budgetRow(taskId);
+    expect(stopped?.stopped).toBe(true);
+    const refused = await core.reserveFault!(scope, RESERVE);
+    expect(refused?.allowed).toBe(false);
+    expect(refused?.charged).toBe(false);
+    expect(refused?.refund).toBeUndefined();
+    expect((await budgetRow(taskId))?.stopped).toBe(true);
+  });
+});

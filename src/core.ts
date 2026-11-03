@@ -50,7 +50,8 @@ import { chainOfTaskRow, policyRowView, policyScopeChain, readEffectiveContract,
 import { FaultStore, type FaultCredential, type FaultReportResult, type FaultReserveResult } from './fault-store.ts';
 import {
   DEFAULT_FAULT_BUDGET, budgetKey, classifyFault, faultEvidence, jitterFactorOf, type FaultBudgetLimits,
-  type FaultDiagnostic, type FaultInput, type FaultPhase, type FaultRecord, type FaultTargetKind, type FlowStage,
+  type FaultDiagnostic, type FaultInput, type FaultPhase, type FaultRecord, type FaultRefund, type FaultTargetKind,
+  type FlowStage,
 } from './faults.ts';
 import { WaitStore, waitRecordOf, type WaitRow } from './wait-store.ts';
 import { ReviewEventStore, watchOfRef } from './review-event-store.ts';
@@ -3791,7 +3792,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    */
   async reserveFault(scope: { taskId: TaskId; employeeId?: string }, input: {
     phase: FaultPhase; target?: FaultTargetKind;
-  }): Promise<{ allowed: boolean; attempt: number; charged: boolean; reason?: string; message: string; evidence: Record<string, unknown> } | undefined> {
+  }): Promise<{ allowed: boolean; attempt: number; charged: boolean; reason?: string; message: string; evidence: Record<string, unknown>; refund?: FaultRefund } | undefined> {
     const controlledTarget = input.target ?? 'none';
     const now = this.faultClock();
     await this.checkExecutionWindow(scope.taskId);
@@ -3812,6 +3813,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       return {
         allowed: true, attempt: result.attempt, charged: result.charged, message: '',
         evidence: { phase: input.phase, target: controlledTarget, attempt: result.attempt, charged: result.charged },
+        ...(result.refund === undefined ? {} : { refund: result.refund }),
       };
     }
     return {
@@ -3847,6 +3849,23 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   async settleFault(scope: { taskId: TaskId; employeeId?: string }, input: { phase: FaultPhase; target?: FaultTargetKind }): Promise<void> {
     const key = budgetKey(scope.taskId, input.target ?? 'none', input.phase);
     await this.faults.settle(key, this.faultClock());
+  }
+
+  /**
+   * Refund a reservation whose call never ran (for example a chain/budget refusal before the upstream call).
+   *
+   * This is deliberately not `settleFault`: a real success clears the recovery, while a refund only undoes the
+   * attempt this reservation charged. The store's CAS keeps the earlier failure facts and refuses to overwrite a
+   * newer failure, stop, lift or success that landed in between.
+   */
+  async refundFault(scope: { taskId: TaskId; employeeId?: string }, input: {
+    phase: FaultPhase; target?: FaultTargetKind; refund: FaultRefund;
+  }): Promise<{ refunded: boolean }> {
+    const key = budgetKey(scope.taskId, input.target ?? 'none', input.phase);
+    if (input.refund.key !== key || input.refund.taskId !== scope.taskId) {
+      throw new CompanyError('invalid', 'refund does not belong to this fault object');
+    }
+    return { refunded: await this.faults.refund(input.refund) === 'refunded' };
   }
 
   /**

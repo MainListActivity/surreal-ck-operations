@@ -300,6 +300,35 @@ export interface FaultBudgetState {
   incident: string;
 }
 
+/**
+ * The exact receipt of one charged reservation. It is the only thing an unexecuted call may give back:
+ * the refund restores the row this reservation moved, and only while the row still matches the values this
+ * reservation wrote. A newer failure, a stop, a lift or a real success makes the refund a no-op.
+ *
+ * A token that names the pre-state lets the store restore it without trusting a cached copy: the CAS is on
+ * the post-state, so a concurrent write wins and the refund never overwrites it.
+ */
+export interface FaultRefund {
+  /** The budget key this reservation belongs to (taskId|target|phase). */
+  key: string;
+  taskId: string;
+  target: string;
+  phase: string;
+  /** The state this reservation wrote; the refund's CAS must find exactly this. */
+  chargedAttempts: number;
+  chargedTotalAttempts: number;
+  chargedDeadline: number;
+  chargedNextAllowedAt: number;
+  chargedLastAttemptAt: number;
+  /** The state before the reservation; the only fields the refund restores. */
+  priorAttempts: number;
+  priorTotalAttempts: number;
+  priorDeadline: number;
+  priorNextAllowedAt: number;
+  priorLastAttemptAt?: number;
+  priorFailed: boolean;
+}
+
 /** The limits a caller applies to a fault object. */
 export interface FaultBudgetLimits {
   /** How many attempts the recovery may spend in total. */

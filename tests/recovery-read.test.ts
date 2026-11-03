@@ -93,12 +93,16 @@ const resetChain = (patch: Partial<ChainState> = {}): ChainState => ({
   state: 'bound', loginAttempts: 0, perPath: [0, 0, 0, 0], ...patch,
 });
 
-function recoveryRig(chain: ChainState, bodies: Partial<Record<string, [number, unknown]>> = {}) {
+function recoveryRig(chain: ChainState, bodies: Partial<Record<string, [number, unknown]>> = {},
+  options: { chargeLogin?: boolean } = {}) {
   const world = new FakeWorld();
   const company = new FakeCompany();
   company.env('demo', 'production', brokerConfig({ ops: { clientId: OPS_CLIENT, redirectUri: OPS_REDIRECT, resource: OPS_RESOURCE } }));
   const reserved: Array<{ taskId: string; phase: string; target: string }> = [];
   const settled: Array<{ taskId: string; phase: string; target: string }> = [];
+  const refunded: Array<{ taskId: string; phase: string; target: string; refund: unknown }> = [];
+  const faultState = { attempts: 2, totalAttempts: 5, deadline: 0, nextAllowedAt: 0, lastAttemptAt: 1, failed: true, stopped: false, incident: 'login|TimeoutError|none|-|product_token|production' };
+  faultState.deadline = Date.now() + 120_000;
   const settledChain: RecoveryReadSettleInput[] = [];
   const scope: OpsScope = {
     actor: { employeeId: 'qa-1', role: 'qa', capabilities: ['execute'] }, taskId: 'task-done', project: 'demo',
@@ -148,10 +152,47 @@ function recoveryRig(chain: ChainState, bodies: Partial<Record<string, [number, 
         return { allowed: false, attempt: 0, charged: false, reason: refusal.reason, message: refusal.message, evidence: {} };
       }
       reserved.push({ taskId: s.taskId, phase: input.phase, target: input.target ?? 'none' });
-      return { allowed: true, attempt: 0, charged: false, message: '', evidence: {} };
+      const target = input.target ?? 'none';
+      if (!options.chargeLogin || input.phase !== 'login') {
+        return { allowed: true, attempt: 0, charged: false, message: '', evidence: {} };
+      }
+      const prior = { attempts: faultState.attempts, totalAttempts: faultState.totalAttempts,
+        deadline: faultState.deadline, nextAllowedAt: faultState.nextAllowedAt,
+        lastAttemptAt: faultState.lastAttemptAt, failed: faultState.failed };
+      faultState.attempts += 1;
+      faultState.totalAttempts += 1;
+      faultState.nextAllowedAt += 1_000;
+      const refund = { key: `${s.taskId}|${target}|${input.phase}`, taskId: s.taskId, target, phase: input.phase,
+        chargedAttempts: faultState.attempts, chargedTotalAttempts: faultState.totalAttempts,
+        chargedDeadline: faultState.deadline, chargedNextAllowedAt: faultState.nextAllowedAt,
+        chargedLastAttemptAt: faultState.lastAttemptAt, priorAttempts: prior.attempts,
+        priorTotalAttempts: prior.totalAttempts, priorDeadline: prior.deadline,
+        priorNextAllowedAt: prior.nextAllowedAt, priorLastAttemptAt: prior.lastAttemptAt, priorFailed: prior.failed };
+      return { allowed: true, attempt: faultState.attempts, charged: true, message: '', evidence: {}, refund };
+    },
+    refundFault: async (s: { taskId: string }, input: { phase: string; target?: string;
+      refund: { chargedAttempts: number; chargedTotalAttempts: number; priorAttempts: number; priorTotalAttempts: number;
+        priorDeadline: number; priorNextAllowedAt: number; priorLastAttemptAt?: number; priorFailed: boolean } }) => {
+      refunded.push({ taskId: s.taskId, phase: input.phase, target: input.target ?? 'none', refund: input.refund });
+      const token = input.refund;
+      if (token.chargedAttempts !== faultState.attempts || token.chargedTotalAttempts !== faultState.totalAttempts) {
+        return { refunded: false };
+      }
+      faultState.attempts = token.priorAttempts;
+      faultState.totalAttempts = token.priorTotalAttempts;
+      faultState.deadline = token.priorDeadline;
+      faultState.nextAllowedAt = token.priorNextAllowedAt;
+      faultState.lastAttemptAt = token.priorLastAttemptAt ?? faultState.lastAttemptAt;
+      faultState.failed = token.priorFailed;
+      return { refunded: true };
     },
     settleFault: async (s: { taskId: string }, input: { phase: string; target?: string }) => {
       settled.push({ taskId: s.taskId, phase: input.phase, target: input.target ?? 'none' });
+      if (options.chargeLogin && input.phase === 'login') {
+        faultState.failed = false;
+        faultState.attempts = 0;
+        faultState.nextAllowedAt = 0;
+      }
     },
   };
   const defaultBodies: Record<string, [number, unknown]> = {
@@ -181,7 +222,7 @@ function recoveryRig(chain: ChainState, bodies: Partial<Record<string, [number, 
     browser: world.browser, sleep: async ms => { world.clock += ms; },
   });
   const qa = company.lease('qa-1', 'qa', 'task-done');
-  return { world, company, core, broker, qa, chain, reserved, settled, settledChain, table, throwPaths };
+  return { world, company, core, broker, qa, chain, reserved, settled, refunded, faultState, settledChain, table, throwPaths };
 }
 
 async function failure<T>(promise: Promise<T>): Promise<Error & { code: string }> {
@@ -295,6 +336,37 @@ describe('broker recovery read enforcement', () => {
     expect((await failure(r.broker.call(r.qa, 'task-done', 'ops_request', { ...session, method: 'GET', path: RECOVERY_READ_PATHS[2] }, recoveryProof))).code).toBe('forbidden');
     expect((await failure(r.broker.call(r.qa, 'task-done', 'ops_request', { ...session, method: 'GET', path: RECOVERY_READ_PATHS[0] }, recoveryProof))).code).toBe('forbidden');
     expect(r.chain.perPath).toEqual([1, 0, 0, 0]);
+  });
+
+  test('a chain refusal refunds the charged attempt and never settles the source fault healthy', async () => {
+    const r = recoveryRig(resetChain(), {}, { chargeLogin: true });
+    await seedOperator(r);
+    const before = { attempts: r.faultState.attempts, totalAttempts: r.faultState.totalAttempts,
+      deadline: r.faultState.deadline, nextAllowedAt: r.faultState.nextAllowedAt };
+    r.chain.inFlight = { callId: 'c1', path: 'login' }; // the chain is busy before the login runs
+    const error = await failure(r.broker.call(r.qa, 'task-done', 'ops_operator_login', { alias: RECOVERY_READ_ALIAS }, recoveryProof));
+    expect(error.code).toBe('conflict');
+    expect(error.message).toContain('busy');
+    expect(r.refunded).toHaveLength(1);
+    expect(r.settled).toHaveLength(0);
+    // The refund restored the pre-reservation counters; the source fault is still failed, never healthy.
+    expect(r.faultState).toMatchObject({ ...before, failed: true });
+  });
+
+  test('a real login success settles the fault, while a free first call settles nothing', async () => {
+    const charged = recoveryRig(resetChain(), {}, { chargeLogin: true });
+    await seedOperator(charged);
+    await charged.broker.call(charged.qa, 'task-done', 'ops_operator_login', { alias: RECOVERY_READ_ALIAS }, recoveryProof);
+    expect(charged.refunded).toHaveLength(0);
+    expect(charged.settled.filter(x => x.phase === 'login')).toHaveLength(1);
+    expect(charged.faultState.failed).toBe(false);
+
+    const free = recoveryRig(resetChain());
+    await seedOperator(free);
+    free.chain.inFlight = { callId: 'c2', path: 'login' };
+    await failure(free.broker.call(free.qa, 'task-done', 'ops_operator_login', { alias: RECOVERY_READ_ALIAS }, recoveryProof));
+    expect(free.refunded).toHaveLength(0);
+    expect(free.settled).toHaveLength(0);
   });
 
   test('a concurrent call sees busy and no counter moves', async () => {

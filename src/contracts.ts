@@ -1534,12 +1534,19 @@ export interface CompanyCore {
    */
   reserveFault?(scope: { taskId: TaskId; employeeId?: string }, input: {
     phase: FaultPhase; target?: FaultTargetKind;
-  }): Promise<{ allowed: boolean; attempt: number; charged: boolean; reason?: string; message: string; evidence: Record<string, unknown> } | undefined>;
+  }): Promise<{ allowed: boolean; attempt: number; charged: boolean; reason?: string; message: string; evidence: Record<string, unknown>; refund?: FaultRefund } | undefined>;
   /**
    * SYS04 AC02: settle a successful attempt of a fault object. A call that works costs no recovery budget: the
    * reserved attempt is refunded and the recovery is over, so the next failure starts a fresh one.
    */
   settleFault?(scope: { taskId: TaskId; employeeId?: string }, input: { phase: FaultPhase; target?: FaultTargetKind }): Promise<void>;
+  /**
+   * Refund a reservation whose call never ran. Unlike `settleFault`, this restores only the reserved attempt and
+   * keeps the earlier failure facts; a newer failure, stop, lift or success makes the refund a no-op.
+   */
+  refundFault?(scope: { taskId: TaskId; employeeId?: string }, input: {
+    phase: FaultPhase; target?: FaultTargetKind; refund: FaultRefund;
+  }): Promise<{ refunded: boolean }>;
   /**
    * Read-only fault diagnosis for one task: budget scopes, episodes, and any open repair chain. Secret-free.
    * Readable by the task holder, its reviewer, or gm — so a QA acceptance that hits a spent budget can see
@@ -1837,7 +1844,7 @@ export interface EnrollmentAdmin {
 // ---- 有效策略层（SYS06 P1）：版本化的机器策略、显式替代关系、当前有效契约 ----
 // 类型定义在 src/policy.ts（受限 schema 与判定逻辑同处一文件，避免判定与字段漂移）；这里只做类型引用。
 import type { EffectiveContract, EffectiveDomain, PolicyAuthorization, PolicyDomain, PolicyPayload, PolicyScope, PolicySource, PolicyStatus, PolicyVerdict } from './policy.ts';
-import type { FaultDiagnostic, FaultPhase, FaultTargetKind, FlowStage } from './faults.ts';
+import type { FaultDiagnostic, FaultPhase, FaultRefund, FaultTargetKind, FlowStage } from './faults.ts';
 export type { EffectiveContract, EffectiveDomain, PolicyAuthorization, PolicyDomain, PolicyPayload, PolicyScope, PolicySource, PolicyStatus, PolicyVerdict };
 
 /** One budget scope of a task, as shown to a holder / reviewer / gm. Secret-free. */

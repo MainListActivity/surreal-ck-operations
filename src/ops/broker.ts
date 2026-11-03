@@ -16,7 +16,7 @@ import {
   RECOVERY_READ_ALIAS, RECOVERY_READ_PATHS, RECOVERY_READ_TOOLS, classifyRecoveryRead, recoveryBodyDigest,
   type RecoveryReadTool,
 } from '../recovery-read.ts';
-import { faultFactsOf, type FaultPhase, type FaultTargetKind } from '../faults.ts';
+import { faultFactsOf, type FaultPhase, type FaultRefund, type FaultTargetKind } from '../faults.ts';
 import { lanIPv4 } from '../preview-core.ts';
 import type { EnvBrokerRow, ProjectStore } from '../projects.ts';
 import {
@@ -83,7 +83,7 @@ export type OpsTool = typeof OPS_TOOLS[number];
 type Args = Record<string, unknown>;
 
 export interface OpsDeps {
-  core: Pick<CompanyCore, 'opsScope' | 'auditOps' | 'opsCount'> & Partial<Pick<CompanyCore, 'policyToolScope' | 'reportFault' | 'reserveFault' | 'settleFault' | 'recoveryReadReserve' | 'recoveryReadSettle'>>;
+  core: Pick<CompanyCore, 'opsScope' | 'auditOps' | 'opsCount'> & Partial<Pick<CompanyCore, 'policyToolScope' | 'reportFault' | 'reserveFault' | 'settleFault' | 'refundFault' | 'recoveryReadReserve' | 'recoveryReadSettle'>>;
   projects: Pick<ProjectStore, 'brokerEnvs' | 'readSealed' | 'setSecret' | 'sealedNames'> & Partial<Pick<ProjectStore, 'ensureSealed' | 'rotateSealed'>>;
   proofStore?: CompanyProofStore;
   serviceHome?: string;
@@ -149,7 +149,7 @@ interface Ctx {
    * what the failure report carries, so an attempt is charged exactly once: by the reservation when there was one,
    * by the report of its failure otherwise.
    */
-  fault?: { attempt: number; charged: boolean; phase: FaultPhase; target: FaultTargetKind };
+  fault?: { attempt: number; charged: boolean; phase: FaultPhase; target: FaultTargetKind; refund?: FaultRefund };
   /**
    * FV06: the grant this call runs under. Set only from the channel-injected proof (never from tool args), so a
    * call in recovery mode cannot escape the grant allowlist or re-login on its own.
@@ -453,12 +453,14 @@ export class OpsBroker {
       const recoveryLogout = ctx.recovery !== undefined && tool === 'ops_logout';
       if (!recoveryLogout) await this.reserveAttempt(ctx, tool, args);
       // FV06: 链级 reserve 在 fault reserve 之后。预算拒绝（例如源任务 login 键已 deadline_passed）时链还没有
-      // 递增任何计数，grant 不会被永久烧死；链级拒绝时把刚预留的故障尝试退回，因为调用没有发生。
+      // 递增任何计数，grant 不会被永久烧死；链级拒绝时把刚预留的故障尝试**退款**，因为调用没有发生。
+      // 退款不是成功结算：它只撤销本次预留，保留此前 failed/attempts/deadline/nextAllowedAt/stopped/incident，
+      // 且用 CAS 防止覆盖并发新失败或重复退款。
       if (ctx.recovery) {
         try {
           await this.reserveRecoveryChain(ctx, tool, args);
         } catch (error) {
-          await this.settleAttempt(ctx).catch(() => undefined);
+          await this.refundAttempt(ctx, tool).catch(() => undefined);
           throw error;
         }
       }
@@ -757,17 +759,40 @@ export class OpsBroker {
       // for; a spent budget or an unrecoverable cause is final.
       throw new BudgetRefusal(result.message, result.reason === 'min_interval');
     }
-    ctx.fault = { attempt: result.attempt, charged: result.charged, phase, target };
+    ctx.fault = { attempt: result.attempt, charged: result.charged, phase, target,
+      ...(result.refund === undefined ? {} : { refund: result.refund }) };
   }
 
   /**
-   * Settle a successful attempt: the fault object works again, so the recovery is over and the reserved attempt is
-   * refunded. A call that works costs no recovery budget.
+   * Settle **a real upstream success**: the fault object works again, so the recovery is over.
+   *
+   * This must never be used for a call that did not run. A chain refusal happens before the handler, and settling
+   * there would clear the source task's earlier failure facts (failed/attempts/deadline/nextAllowedAt/incident) and
+   * could erase a concurrent new failure. The pre-call path uses `refundAttempt` instead.
    */
   private async settleAttempt(ctx: Ctx): Promise<void> {
     if (!ctx.fault?.charged) return;
     await this.deps.core.settleFault?.({ taskId: ctx.scope.taskId, employeeId: ctx.scope.actor.employeeId },
       { phase: ctx.fault.phase, target: ctx.fault.target }).catch(() => undefined);
+  }
+
+  /**
+   * Refund the attempt this call reserved but never ran (a chain/budget refusal before the handler).
+   *
+   * The core restores only the pre-reservation counters through a CAS token; a newer failure, stop, lift or real
+   * success makes the refund a superseded no-op. The audit names the attempt, never an alias or a credential.
+   */
+  private async refundAttempt(ctx: Ctx, tool: string): Promise<void> {
+    if (!ctx.fault?.charged || !ctx.fault.refund) return;
+    const refund = ctx.fault.refund;
+    const result = await this.deps.core.refundFault?.(
+      { taskId: ctx.scope.taskId, employeeId: ctx.scope.actor.employeeId },
+      { phase: ctx.fault.phase, target: ctx.fault.target, refund },
+    ).catch(() => undefined);
+    if (result !== undefined) {
+      await this.audit(ctx, 'ops_fault',
+        `refund ${tool} attempt=${ctx.fault.attempt} ${result.refunded ? 'refunded' : 'superseded'}`).catch(() => undefined);
+    }
   }
 
   /**

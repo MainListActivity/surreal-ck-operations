@@ -5,6 +5,7 @@ import { DEFAULT_CONFIG, managerWakeKey, type EmployeeDef, type EmployeeInst, ty
 import type { OwnerDesk } from '../src/owner.ts';
 import type { ClaimResult, TaskView, WorktreeAssignment } from '../src/contracts.ts';
 import { managerActionKey } from '../src/dispatcher/dispatch-blocked.ts';
+import { RECOVERY_READ_PATHS } from '../src/recovery-read.ts';
 
 const OPS = '/fixture/ops';
 const PROJ_A = '/fixture/proj-a';
@@ -53,6 +54,9 @@ export function fixture(specs: TaskSpec[]) {
   const dispatches = new Map<string, { employee: string; at: number }>();
   const actions = new Map<string, ActionRow>();
   const wakes = new Map<string, ManagerWakeRow>();
+  const recoveryAdopts: Array<{ inst: string; grantId?: string }> = [];
+  let recoveryGrants: Array<{ id: string; employeeId: string; taskId: string; alias: string; paths: string[]; expiresAt: string; state: string }> = [];
+  let failRecoveryAdopt = false;
   const now = 1_000_000;
   let next = 0;
   let keySeq = 0;
@@ -209,6 +213,7 @@ export function fixture(specs: TaskSpec[]) {
     defHealthy: async () => {},
     defFailure: async () => 1,
     pendingEvaluations: async () => [],
+    activeRecoveryGrants: async () => recoveryGrants,
     projectRepos: async () => [],
     doneTaskIds: async () => [],
     readySince: async () => new Map<string, number>(),
@@ -300,6 +305,11 @@ export function fixture(specs: TaskSpec[]) {
     bindAgent: () => {},
     commDirFor: () => '/tmp/comm',
     scratchDirFor: instId => `/tmp/${instId}-scratch`,
+    adoptRecovery: async (inst, grantId) => {
+      recoveryAdopts.push({ inst: inst.id, grantId });
+      if (failRecoveryAdopt) throw new Error('execution lease held');
+      return { bound: grantId };
+    },
     releaseClaim: async () => {},
     releaseWorkspace: async () => {},
     readWorkspace: async (inst, taskId) => {
@@ -329,6 +339,9 @@ export function fixture(specs: TaskSpec[]) {
     failSpawnAfterStart(value: boolean) { failSpawnAfterStart = value; },
     failSendAfterStart(value: boolean) { failSendAfterStart = value; },
     wakes, addTask,
+    recoveryAdopts,
+    setRecoveryGrants(grants: typeof recoveryGrants) { recoveryGrants = grants; },
+    failRecoveryAdopt(value: boolean) { failRecoveryAdopt = value; },
     wakeFor(key: string) { return wakes.get(key); },
     ageWake(key: string, seconds: number) {
       const row = wakes.get(key); if (!row) return;
@@ -693,6 +706,38 @@ test('no eligible GM never acquires/releases wake claims on repeated ticks; reco
   expect(raised?.[1].text).toContain('编制已停用');
   f.defs.find(d => d.role === 'gm')!.enabled = true;
   expect((await f.tick()).woke.some(w => w.task === 'fixture-no-gm')).toBe(true);
+});
+
+test('a recovery read grant wakes only its named idle employee with the grant payload; busy and lease-held sessions stay unwoken', async () => {
+  const f = fixture([]);
+  const expiresAt = new Date((1_000_000 + 600) * 1000).toISOString();
+  f.setRecoveryGrants([{ id: 'g1', employeeId: 'eng-1', taskId: 'task-done', alias: 'LCA04_OPS',
+    paths: [...RECOVERY_READ_PATHS], expiresAt, state: 'issued' }]);
+  const first = await f.tick();
+  expect(first.recovery).toContain('g1');
+  expect(f.recoveryAdopts).toEqual([{ inst: 'eng-1', grantId: 'g1' }]);
+  const prompt = f.sends.at(-1)?.prompt ?? '';
+  expect(prompt).toContain('g1');
+  expect(prompt).toContain('task-done');
+  expect(prompt).toContain('LCA04_OPS');
+  for (const path of RECOVERY_READ_PATHS) expect(prompt).toContain(path);
+  expect(prompt).toContain('不要把 taskId/sourceTaskId/grantId');
+  expect(f.sends.every(s => s.agentId === 'agent-eng-1')).toBe(true);
+
+  // A busy session is never interrupted.
+  f.setStatus('agent-eng-1', 'busy');
+  await f.tick();
+  expect(f.recoveryAdopts).toHaveLength(1);
+
+  // An execution lease held by the employee makes the channel refuse; no prompt goes out and a later tick retries.
+  f.setStatus('agent-eng-1', 'idle');
+  f.failRecoveryAdopt(true);
+  await f.tick();
+  expect(f.recoveryAdopts).toHaveLength(2);
+  expect(f.sends).toHaveLength(1);
+  f.failRecoveryAdopt(false);
+  await f.tick();
+  expect(f.sends).toHaveLength(2);
 });
 
 test('busy managers filling the workspace are a queue, not an outage; a queue past an hour reaches the owner', async () => {

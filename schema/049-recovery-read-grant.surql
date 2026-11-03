@@ -1,6 +1,6 @@
 -- FV06 恢复取证子租约（recovery read grant），本 lane 取号 049。
 --
--- 只新增两张表：不改写 task / audit / fault_* / employee 的任何既有字段或行。终态（done）源任务保持 done，
+-- 只新增三张表（grant、chain、call）：不改写 task / audit / fault_* / employee 的任何既有字段或行。终态（done）源任务保持 done，
 -- 不回到可租约状态；grant 不是执行租约，不能写任务，只能让被授权员工在原 taskId 的 fault 键下做一次登录、
 -- 按固定顺序四次 GET 和必要 logout。
 --
@@ -23,6 +23,9 @@ DEFINE FIELD IF NOT EXISTS authorization_task ON recovery_read_grant TYPE record
 DEFINE FIELD IF NOT EXISTS reason ON recovery_read_grant TYPE string;
 DEFINE FIELD IF NOT EXISTS state ON recovery_read_grant TYPE string
   ASSERT $value IN ['issued', 'bound', 'running', 'completed', 'stopped', 'revoked', 'expired'];
+-- status / reserve / bind / grantFor / grantsFor 读到超期 inFlight 时会**惰性且幂等**地推进到
+-- stopped(unknown_outcome)：只改本次 grant 的状态并留 recovery_read_stop 审计，不重试该调用、不扩权限、
+-- 不授予执行租约，也不改写源任务的 fault 预算。
 -- 单调计数：只增不减；新 grant / rearm 从上一链原样承接，不清零。
 DEFINE FIELD IF NOT EXISTS login_attempts ON recovery_read_grant TYPE int;
 DEFINE FIELD IF NOT EXISTS per_path ON recovery_read_grant TYPE array<int>;
