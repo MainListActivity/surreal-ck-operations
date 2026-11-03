@@ -799,13 +799,21 @@ test('Factory provider concurrency cap waits even with spare definition seats',a
  expect((await f.tick()).woke.find(w=>w.task==='factory-task')).toBeUndefined();
 });
 
-test('a repository difference without an explicit code repo binding never authorizes automatic takeover',async()=>{
+test('a repository mismatch from the project also recovers to an independent same-repo successor',async()=>{
  const f=fixture([{id:'repo-overlay-only',state:'ready',implementer:'eng-1',repoPath:PROJ_A}]);
- const calls:unknown[]=[];
- await f.tick({autoTakeover:async input=>{calls.push(input);return true;}});
- expect(calls).toEqual([]);
- expect(f.rows[0]!.implementer).toBe('eng-1');
- expect(f.last!.dispatchVerdicts().find(v=>v.taskId==='repo-overlay-only')!.dispatchable).toBe(false);
+ const successor={...f.instances.find(i=>i.id==='eng-1')!,id:'eng-independent',paseoAgentId:'agent-independent',repoHome:PROJ_A,cwd:PROJ_A};
+ f.instances.push(successor);f.agents.set('agent-independent',{id:'agent-independent',status:'idle'});
+ const calls:Array<{toEmployee:string}>=[];
+ const result=await f.tick({autoTakeover:async input=>{calls.push(input);return true;}});
+ expect(calls.map(call=>call.toEmployee)).toEqual(['eng-independent']);
+ expect(result.decisions).toContain('auto-takeover:repo-overlay-only=eng-independent');
+});
+
+test('a repository mismatch without an automatic recovery adapter creates a durable manager action',async()=>{
+ const f=fixture([{id:'repo-overlay-only',state:'ready',implementer:'eng-1',repoPath:PROJ_A}]);
+ await f.tick();
+ expect(f.last!.dispatchVerdicts().find(v=>v.taskId==='repo-overlay-only')!.reasons.map(r=>r.code)).toContain('implementer_unavailable');
+ expect([...f.actions.values()].some(a=>a.taskId==='repo-overlay-only' && a.status==='open')).toBe(true);
 });
 
 test('same-repo bound implementer stays assigned after an explicit code repo binding',async()=>{

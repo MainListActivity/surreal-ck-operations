@@ -324,7 +324,7 @@ export interface TaskRow {
   superseded_by?: RecordId;
   lineage?: RecordId;
   revision_no?: number;
-  /** Independence policy (schema 023, SYS-DISP IR01): written only by setIndependence, read with the contribution facts. */
+  /** Independence policy (schema 023, SYS-DISP IR01): written at creation or by setIndependence, read with the contribution facts. */
   independence?: IndependenceRow | null;
   /** Version this task was last checked against as a source of a dependent's gated write (schema 023). */
   independence_guard?: number | null;
@@ -520,6 +520,16 @@ const INDEPENDENCE_GUARD_SQL = `FOR $g IN $indep_guards {
         IF (SELECT VALUE version FROM ONLY $g.task) != $g.version { THROW 'contribution history moved: independence source' };
         UPDATE ONLY $g.task SET independence_guard = $g.version;
       };`;
+
+/** Same repository/goal identity rules as staffingPool; checked inside every lease/takeover transaction. */
+const EMPLOYEE_WORKSPACE_SQL = (who: string, failure: string) => `
+      IF ${who}.retired = true { THROW '${failure}: target employee is retired' };
+      LET $scope = IF $t.goal != NONE THEN <string>record::id($t.goal) ELSE 'maintenance' END;
+      IF ${who}.workspace_scope != NONE AND ${who}.workspace_scope != $scope { THROW '${failure}: target employee works in another goal workspace and can never be dispatched this task' };
+      LET $home = $t.code_repo_path ?? $t.project.repo_path ?? $t.goal.project.repo_path ?? $ops_repo;
+      LET $employee_home = ${who}.workspace_repo ?? ${who}.workspace_cwd ?? $ops_repo;
+      IF $home != NONE AND $employee_home != NONE AND $home != $employee_home { THROW '${failure}: target employee works in another repository and can never be dispatched this task' };
+`;
 
 /** The gate one stage reads: the exclusion index and the source versions the write must be guarded by. */
 interface IndependenceGate {
@@ -992,7 +1002,10 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     const policyEvidence = `policy v${policyContract.version} hash=${policyContract.hash.slice(0, 16)} chain=${policyChain.map(link => `${link.scope}${link.scopeRef ? `:${link.scopeRef}` : ''}`).join('>')}`;
     if (input.goalId !== undefined) requireText(input.goalId, 'goal', 1, 100);
     const dependencies = [...new Set(input.dependencies ?? [])];
-    if (input.revises !== undefined) return this.createRevision(actor, input, dependencies);
+    if (input.revises !== undefined) {
+      if (input.independence) throw new CompanyError('invalid', 'Inline independence is not supported for screenplay revisions');
+      return this.createRevision(actor, input, dependencies);
+    }
     const codeRepoPath = await this.creationCodeRepo(input, kind);
     const idem = options.repairKey === undefined
       ? this.idemId(actor.employeeId, 'create', input.idempotencyKey)
@@ -1002,6 +1015,7 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     if (prior) return prior;
     const taskId = randomUUID();
     const task = id('task', taskId);
+    const independent = input.independence ? normalizeIndependence({ taskId, ...input.independence }) : undefined;
     const vars = {
       actor: id('employee', actor.employeeId), task, idem, digest,
       audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
@@ -1019,6 +1033,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       policy_version: policyContract.version, policy_hash: policyContract.hash, policy_contract: policyContract,
       policy_evidence: policyEvidence + (codeRepoPath ? ` code_repo=${codeRepoPath}` : ''), expected_policy_epoch: policyEpoch,
       code_repo_path: codeRepoPath,
+      independence: independent ? { schema: 1, revision: 1, ...independent, setBy: actor.employeeId } : undefined,
+      independent_sources: (independent?.sources ?? []).map(source => id('task', source)),
+      independent_excluded: (independent?.excluded ?? []).map(employee => id('employee', employee)),
     };
     try {
       const row = await this.txTask(`BEGIN;
@@ -1027,6 +1044,12 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         FOR $dep IN $dependencies {
           LET $d = SELECT * FROM ONLY $dep;
           IF $d = NONE { THROW 'dependency not found' };
+        };
+        FOR $source IN $independent_sources {
+          IF (SELECT VALUE id FROM ONLY $source) = NONE { THROW 'independence invalid: source task not found' };
+        };
+        FOR $excluded IN $independent_excluded {
+          IF (SELECT VALUE id FROM ONLY $excluded) = NONE { THROW 'independence invalid: excluded employee not found' };
         };
         ${RESOLVE_DEP_SQL('$dependencies', '$dep')}
         LET $epoch = (SELECT VALUE value FROM ONLY company_meta:policy_epoch) ?? 0;
@@ -1039,6 +1062,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
           version: 1, fence: 0, submitted_by: NONE, current_employee: NONE,
           delivery_id: NONE, lease_expires_at: NONE, resume_role: NONE, resume_state: 'ready', blocked_to: NONE,
           kind: $kind, goal: $goal, created_at: time::now(), code_repo_path: $code_repo_path,
+          independence: IF $independence != NONE THEN object::extend($independence, {setAt: time::now()}) ELSE NONE END,
           policy_version: $policy_version, policy_hash: $policy_hash, policy_contract: $policy_contract,
           ${acceptanceCriteria.length > 0 ? 'acceptance_criteria: $acceptance_criteria, acceptance_version: $acceptance_version,' : ''}
           acceptance_legacy: $acceptance_legacy, acceptance_head: NONE, acceptance_environment: $acceptance_environment,
@@ -1412,7 +1436,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       LET $who = SELECT * FROM ONLY $actor;
       LET $t = SELECT * FROM ONLY $task;
       IF $who = NONE OR $who.revoked = true OR $t = NONE { THROW 'not found or revoked' };
-      IF $who.workspace_scope != NONE AND $who.workspace_scope != IF $t.goal = NONE THEN 'maintenance' ELSE <string>record::id($t.goal) END { THROW 'workspace goal denied' };
+      ${EMPLOYEE_WORKSPACE_SQL('$who', 'execute denied')}
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.state NOT IN ['ready', 'review', 'doing'] { THROW 'task not claimable' };
       // SYS05：等待中的任务不占租约、不派工；到点前直接 claim 也拒绝（releaseDue 落库后才回到 ready/review）。
@@ -1493,6 +1517,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       RETURN SELECT * FROM ONLY $task;
       COMMIT;`, {
       actor: id('employee', actor.employeeId), employee: actor.employeeId, task,
+      ops_repo: this.worktrees?.options.opsRepo ?? this.companyReleaseRepo,
       delivery: randomUUID(), lease_seconds: this.leaseSeconds,
       assignment: worktree, tree: worktree ? id('worktree', worktree.id) : undefined, reference: id('worktree_ref', taskId),
       audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
@@ -6233,6 +6258,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (input.replacementReviewer && (input.replacementReviewer === input.toEmployee || facts.excluded.includes(input.replacementReviewer))) {
       throw new CompanyError('invalid', 'implementer takeover invalid: replacement reviewer must be independent of every author');
     }
+    const gate = await this.independenceGate(input.taskId, contrib.policy, 'execute');
+    await this.refuseIndependent(gate, input.toEmployee);
     const evidence = `${input.reason}\n[implementer_takeover] task=${input.taskId} from=${facts.implementer ?? 'none'} to=${input.toEmployee} replacementReviewer=${input.replacementReviewer ?? 'none'} expectedVersion=${input.expectedVersion}`;
     const query = `BEGIN;
       LET $now = time::unix(time::now());
@@ -6245,8 +6272,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       IF $t.state NOT IN ['ready', 'doing'] AND ($t.state != 'blocked' OR $t.resume_state NOT IN ['ready', 'doing']) { THROW 'implementer takeover moved: task is not in execute phase' };
       LET $to = SELECT * FROM ONLY $target;
       IF $to = NONE OR $to.revoked = true OR 'execute' NOT IN $to.capabilities OR $to.role != $t.executor_role { THROW 'implementer takeover invalid: target employee cannot execute this task' };
-      LET $scope = IF $t.goal != NONE THEN record::id($t.goal) ELSE 'maintenance' END;
-      IF $to.workspace_scope != NONE AND $to.workspace_scope != $scope { THROW 'implementer takeover invalid: target employee works in another goal workspace and can never be dispatched this task' };
+      ${EMPLOYEE_WORKSPACE_SQL('$to', 'implementer takeover invalid')}
+      ${INDEPENDENCE_GUARD_SQL}
       LET $to_tracks = $to.def.tracks ?? [];
       IF $t.discipline != NONE AND array::len($to_tracks) > 0 AND $t.discipline NOT IN $to_tracks { THROW 'implementer takeover invalid: target employee track does not cover the task' };
       IF $replacement != NONE {
@@ -6279,6 +6306,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const vars = {
       actor: id('employee', actor.employeeId), task: id('task', input.taskId), expected: input.expectedVersion,
       target: id('employee', input.toEmployee), target_key: input.toEmployee,
+      ops_repo: this.worktrees?.options.opsRepo ?? this.companyReleaseRepo, indep_guards: gate?.guards ?? [],
       replacement: input.replacementReviewer ? id('employee', input.replacementReviewer) : undefined,
       excluded_ids: [...new Set([...facts.excluded, input.toEmployee])].map(employee => id('employee', employee)),
       seen: contrib.version ?? -1, evidence, digest, idem, audit: id('audit', randomUUID()),
@@ -6323,6 +6351,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (facts.reviewers.includes(input.toEmployee)) {
       throw new CompanyError('invalid', 'implementer takeover invalid: a current reviewer cannot become the implementer without a named replacement reviewer');
     }
+    const gate = await this.independenceGate(input.taskId, contrib.policy, 'execute');
+    await this.refuseIndependent(gate, input.toEmployee);
     const evidence = `${input.reason}\n[implementer_takeover:auto] task=${input.taskId} from=${facts.implementer ?? 'none'} to=${input.toEmployee} expectedVersion=${input.expectedVersion}`;
     const query = `BEGIN;
       LET $now = time::unix(time::now());
@@ -6333,6 +6363,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       IF $t.state NOT IN ['ready', 'doing'] AND ($t.state != 'blocked' OR $t.resume_state NOT IN ['ready', 'doing']) { THROW 'implementer takeover moved: task is not in execute phase' };
       LET $to = SELECT * FROM ONLY $target;
       IF $to = NONE OR $to.revoked = true OR 'execute' NOT IN $to.capabilities OR $to.role != $t.executor_role { THROW 'implementer takeover invalid: target employee cannot execute this task' };
+      ${EMPLOYEE_WORKSPACE_SQL('$to', 'implementer takeover invalid')}
+      ${INDEPENDENCE_GUARD_SQL}
       LET $to_tracks = $to.def.tracks ?? [];
       IF $t.discipline != NONE AND array::len($to_tracks) > 0 AND $t.discipline NOT IN $to_tracks { THROW 'implementer takeover invalid: target employee track does not cover the task' };
       LET $holder = $t.current_employee;

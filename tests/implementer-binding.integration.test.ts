@@ -2,6 +2,7 @@ import { afterAll, beforeAll, expect, setDefaultTimeout, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { RecordId } from 'surrealdb';
 import { loadDatabaseConfig } from '../src/config.ts';
 import { CompanyDatabase } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
@@ -190,4 +191,52 @@ test('implementer takeover refuses a target bound to another goal workspace: it 
   } finally {
     await database.db.query('UPDATE employee:⟨t-eng-c⟩ SET workspace_scope = NONE;');
   }
+});
+
+
+test('takeover refuses a different repository and a retired successor without changing the task', async () => {
+  const t = await newTask('同目标错误仓库接手回归');
+  await database.db.query("UPDATE employee:⟨t-eng-c⟩ SET workspace_repo = '/wrong-repo'; UPDATE ONLY $task SET code_repo_path = '/right-repo';", {task: new RecordId('task',t.id)});
+  try {
+    for (const system of [false, true]) {
+      const input = {taskId:t.id,toEmployee:'t-eng-c',expectedVersion:t.version,reason:'错误仓库不能成为接手负责人',idempotencyKey:key()};
+      await expect(system ? core.systemImplementerTakeover(input) : core.implementerTakeover(tokens.gm,input)).rejects.toMatchObject({code:'invalid'});
+      expect((await task(t.id)).version).toBe(t.version);
+    }
+    await database.db.query("UPDATE employee:⟨t-eng-c⟩ SET workspace_repo = '/right-repo', retired = true;");
+    await expect(core.implementerTakeover(tokens.gm,{taskId:t.id,toEmployee:'t-eng-c',expectedVersion:t.version,reason:'退役员工不能成为接手负责人',idempotencyKey:key()})).rejects.toMatchObject({code:'invalid'});
+  } finally { await database.db.query('UPDATE employee:⟨t-eng-c⟩ SET workspace_repo = NONE, retired = false;'); }
+});
+
+
+test('independent cleanup is gated atomically at creation, claim and both takeover paths', async () => {
+  const source = await newTask('原执行人的补偿核查来源');
+  await deliver(tokens['eng-a'],source.id);
+  const t = await core.createTask(tokens.gm,{title:'独立核查原任务',context:'结构化隔离，不依赖员工阅读正文',executorRole:'engineering',reviewerRole:'qa',workIntent:{kind:'read'},
+    independence:{stages:['execute'],sources:[source.id],mode:'execute_handlers',reason:'原执行人不得复核自己的操作'},idempotencyKey:key()});
+  expect(t.independence).toMatchObject({revision:1,sources:[source.id],stages:['execute']});
+  await expect(core.claim(tokens['eng-a'],t.id)).rejects.toMatchObject({code:'forbidden'});
+  for(const system of [false,true]) {
+    const input={taskId:t.id,toEmployee:'t-eng-a',expectedVersion:t.version,reason:'禁止通过接手绕过独立性约束',idempotencyKey:key()};
+    await expect(system?core.systemImplementerTakeover(input):core.implementerTakeover(tokens.gm,input)).rejects.toMatchObject({code:'forbidden'});
+  }
+  expect((await task(t.id)).version).toBe(t.version);
+  const moved=await core.implementerTakeover(tokens.gm,{taskId:t.id,toEmployee:'t-eng-c',expectedVersion:t.version,reason:'交给未参与源任务的独立工程员工',idempotencyKey:key()});
+  expect(moved.implementer).toBe('t-eng-c');
+  await expect(core.claim(tokens['eng-c'],t.id)).resolves.toMatchObject({task:{state:'doing',implementer:'t-eng-c'}});
+});
+
+test('invalid independent source refuses creation without leaking a runnable task',async()=>{
+ const title='不存在来源不得创建可抢领的独立任务';
+ await expect(core.createTask(tokens.gm,{title,context:'不存在来源',executorRole:'engineering',reviewerRole:'qa',independence:{stages:['execute'],sources:['missing-source'],mode:'execute_handlers',reason:'必须存在来源'},idempotencyKey:key()})).rejects.toMatchObject({code:'invalid'});
+ const [rows]=await database.db.query<[unknown[]]>('SELECT id FROM task WHERE title=$title;',{title});
+ expect(rows).toEqual([]);
+});
+
+test('direct claim cannot bypass repository routing even with a matching role',async()=>{
+ const t=await newTask('直接领取也遵守仓库资格');
+ await database.db.query("UPDATE employee:⟨t-eng-c⟩ SET workspace_repo='/wrong-repo'; UPDATE ONLY $task SET code_repo_path='/right-repo';",{task:new RecordId('task',t.id)});
+ try{ await expect(core.claim(tokens['eng-c'],t.id)).rejects.toMatchObject({code:'forbidden'}); }
+ finally{ await database.db.query('UPDATE employee:⟨t-eng-c⟩ SET workspace_repo=NONE;'); }
+ expect((await task(t.id)).state).toBe('ready');
 });

@@ -523,6 +523,8 @@ export interface CreateTask {
    * another repo, is bound to the ops repo; otherwise the project's repo is used.
    */
   codeRepoPath?: string;
+  /** Atomic independence policy: enforced before the first claim; prose alone does not exclude anyone. */
+  independence?: Pick<SetIndependence, 'stages' | 'sources' | 'mode' | 'excluded' | 'reason'>;
   dependencies?: TaskId[];
   /** SYS02: required for new code deliveries when the acceptance gate is enabled. */
   acceptanceCriteria?: AcceptanceCriterion[];

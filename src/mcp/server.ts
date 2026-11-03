@@ -372,7 +372,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : core.returnTask(token(ctx), proof(input), evidence(input))));
 
   server.registerTool('create_task', {
-    description: 'Create a managed company task; requires core manage capability. project optionally binds this one task to a registered project (takes precedence over the goal\'s project). codeRepoPath optionally sets the code repository the worktree is allocated in (the ops repo or a registered project repo; the business project is unchanged); without it a code/release/deploy task whose context names the ops repo path under a project with another repo is bound to the ops repo at creation, so it never claims into the business repo. revises=<直接上一版任务id> creates the controlled screenplay-revision edge: gm/product only, both drafts must be owner-reviewed screenwriter tasks on the 编剧 track (kind=task) in the same goal and project, and the target must be the unapproved chain tip whose latest submission was really rejected by the owner; the old draft voids with a supersededBy pointer and downstreams resolve to the chain tip.',
+    description: 'Create a managed company task; requires core manage capability. For independent verification/cleanup, pass independence:{stages:["execute"],sources:["source-task-id"],mode:"execute_handlers",reason:"why independent"} atomically; context prose does not enforce exclusions. project optionally binds this one task to a registered project (takes precedence over the goal\'s project). codeRepoPath optionally sets the code repository the worktree is allocated in (the ops repo or a registered project repo; the business project is unchanged); without it a code/release/deploy task whose context names the ops repo path under a project with another repo is bound to the ops repo at creation, so it never claims into the business repo. revises=<直接上一版任务id> creates the controlled screenplay-revision edge: gm/product only, both drafts must be owner-reviewed screenwriter tasks on the 编剧 track (kind=task) in the same goal and project, and the target must be the unapproved chain tip whose latest submission was really rejected by the owner; the old draft voids with a supersededBy pointer and downstreams resolve to the chain tip.',
     inputSchema: z.object({
       modelTier: z.enum(['fable','opus','sonnet','haiku','high','medium','low']).optional(),
       title: z.string().min(1), context: z.string().min(1),
@@ -385,6 +385,8 @@ function registerTools(server: McpServer, core: CompanyCore) {
       // `invalid` result; a schema failure here would be a plain protocol error instead.
       workIntent: z.object({ kind: z.enum(['read', 'code', 'assets']), paths: z.array(z.string()).optional(), lane: z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/).optional() }).optional(),
       kind: z.enum(['task', 'gate']).optional(), goalId: z.string().min(1).optional(),
+      independence: z.object({stages:z.array(z.enum(['execute','review'])), sources:z.array(z.string()),
+        mode:z.enum(['execute_handlers','all_handlers']),excluded:z.array(z.string()).optional(),reason:z.string()}).optional(),
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
       acceptanceCriteria: acceptanceCriteriaShape.optional(),
       acceptanceEnvironment: z.string().regex(/^[a-z][a-z0-9._-]{0,49}$/).optional(),
