@@ -87,6 +87,16 @@ export const GOAL_TASK_FIELDS = `id, goal, title, state, kind, executor_role, re
   wait_state, wait_kind, wait_not_before, wait_expires_at, wait_next_check_at, wait_owner_role, wait_entered_at,
   dispatch_blocked_phase, dispatch_blocked_since`;
 
+/** A retired task that still needs an owner disposition, with the same-kind completed work that could replace it. */
+export interface GoalRetiredWorkItem {
+  taskId: string; title: string; kind?: string; version?: number;
+  retiredAt?: string; retiredBy?: string; retiredEvidence?: string;
+  candidates: Array<{ taskId: string; title: string; kind?: string }>;
+}
+export interface GoalRetiredWorkView {
+  goalId: string; goalVersion: number; goalState: string; items: GoalRetiredWorkItem[];
+}
+
 function goalFact(row: GoalRecord): GoalFact {
   const refs = row.tasks ?? {};
   const pick = (key: string): string | undefined => refs[key] === undefined || refs[key] === null ? undefined : text(refs[key]);
@@ -803,6 +813,59 @@ export class GoalGovernanceStore {
       audit:auditId,actor:input.actor,disposition:input.disposition,digest,goal_key:input.goalId,evidence:JSON.stringify({taskVersion:input.taskVersion,
         disposition:input.disposition,replacementTaskIds:replacements,reason:input.reason})});
     return (await this.finalize(input.goalId,input.actor)).card;
+  }
+
+  /**
+   * Read-only list of retired, non-anchor work that still needs an owner disposition. This is the console's
+   * discovery surface: a goal can stay needs_repair forever on retired work that a replacement chain already
+   * finished, and nothing else in the system surfaces those items. Tasks settled by a done superseded_by target
+   * or by an existing `goal_retired_work_resolved` audit are not pending and are not listed.
+   */
+  async retiredWorkPending(goalId: string): Promise<GoalRetiredWorkView> {
+    const [row] = await this.goalRows([goalId]) as [GoalRecord | undefined];
+    if (!row) throw new Error('goal not found');
+    const goal = goalFact(row);
+    const excluded = new Set([...goal.anchors, goal.tasks.acceptance, goal.tasks.manual, goal.tasks.plan,
+      goal.tasks.intake].filter(Boolean) as string[]);
+    const [tasks] = await this.db.query<[GoalTaskRecord[]]>(
+      `SELECT ${GOAL_TASK_FIELDS} FROM task WHERE goal = $goal ORDER BY created_at, id;`,
+      { goal: new RecordId('goal', goalId) });
+    const all = tasks ?? [];
+    const supersededDone = new Set(all.filter(task => task.superseded_by &&
+      all.some(other => text(other.id) === text(task.superseded_by) && other.state === 'done')).map(task => text(task.id)));
+    const pending = all.filter(task => task.state === 'void' && task.kind !== 'gate' && !excluded.has(text(task.id)) &&
+      !supersededDone.has(text(task.id)));
+    if (!pending.length) return { goalId, goalVersion: row.version ?? 0, goalState: row.state, items: [] };
+    const ids = pending.map(task => text(task.id));
+    const [resolved] = await this.db.query<[Array<{ task: unknown }>]>(
+      "SELECT task FROM audit WHERE task IN $tasks AND action='goal_retired_work_resolved';",
+      { tasks: ids.map(id => new RecordId('task', id)) });
+    const resolvedIds = new Set((resolved ?? []).map(item => text(item.task)));
+    const [retires] = await this.db.query<[Array<{ task: unknown; actor: unknown; evidence?: string; at: unknown }>]>(
+      "SELECT task, actor, evidence, at FROM audit WHERE task IN $tasks AND action='retire';",
+      { tasks: ids.map(id => new RecordId('task', id)) });
+    const lastRetire = new Map<string, { at: string; actor: string; evidence: string }>();
+    for (const item of retires ?? []) {
+      const id = text(item.task);
+      const at = String(item.at ?? '');
+      const prior = lastRetire.get(id);
+      if (!prior || at >= prior.at) lastRetire.set(id, { at, actor: text(item.actor), evidence: String(item.evidence ?? '') });
+    }
+    const items: GoalRetiredWorkItem[] = [];
+    for (const task of pending) {
+      const id = text(task.id);
+      if (resolvedIds.has(id)) continue;
+      const retire = lastRetire.get(id);
+      items.push({
+        taskId: id, title: task.title, ...(task.kind ? { kind: task.kind } : {}),
+        ...(task.version !== undefined ? { version: task.version } : {}),
+        ...(retire ? { retiredAt: retire.at, retiredBy: retire.actor, retiredEvidence: retire.evidence } : {}),
+        candidates: all.filter(other => other.state === 'done' && other.kind === task.kind && text(other.id) !== id &&
+          !excluded.has(text(other.id)))
+          .map(other => ({ taskId: text(other.id), title: other.title, ...(other.kind ? { kind: other.kind } : {}) })),
+      });
+    }
+    return { goalId, goalVersion: row.version ?? 0, goalState: row.state, items };
   }
 
   /** Re-evaluate one goal and persist the verdict. Never rewrites a task or an owner decision. */

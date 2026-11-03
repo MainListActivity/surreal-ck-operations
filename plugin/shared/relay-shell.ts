@@ -224,6 +224,14 @@ details.sha code,.version-row code,.model-path{font:11px ui-monospace,Menlo,mono
 .text-button{margin-top:10px;padding:0;border:0;background:transparent;color:var(--relay-accent);display:flex;align-items:center;gap:6px;font-size:11px;font-weight:700}
 .text-button .icon{width:12px}
 .text-button.danger{color:var(--relay-danger)}
+.retired-list{margin-top:10px;border-top:1px solid var(--relay-border);padding-top:10px}
+.retired-title{font-size:10px;color:var(--relay-faint);letter-spacing:.04em}
+.retired-item{display:grid;gap:8px;margin-top:8px;padding:10px;border:1px solid var(--relay-border);border-radius:9px;background:var(--relay-panel)}
+.retired-item .retired-name{font-size:11px;font-weight:600}
+.retired-item .retired-meta{font-size:10px;color:var(--relay-muted);line-height:1.5}
+.retired-form{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.retired-form select{font:inherit;font-size:11px;height:27px}
+.retired-form textarea{flex:1 1 100%;font:inherit;font-size:11px;min-height:44px;resize:vertical}
 .tier{font-size:10px;padding:1px 8px;border-radius:10px;border:1px solid var(--relay-border);color:var(--relay-muted)}
 
 /* ---- 手册 ---- */

@@ -167,6 +167,17 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
           "SELECT * FROM task WHERE goal = $goal ORDER BY created_at, id;", { goal: id("goal", goalId) });
         return json({ tasks: rows.map(r => view(r as Parameters<typeof view>[0])) });
       }
+      if (req.method === "GET" && sub === "/api/goal-retired-pending") {
+        const goalId = url.searchParams.get("goalId") ?? "";
+        if (!goalId) return json({ error: "goalId required" }, 400);
+        try {
+          const { GoalGovernanceStore } = await import("./vendor/src/goal-store.ts");
+          const view = await new GoalGovernanceStore((await opts.company()).db.db).retiredWorkPending(goalId);
+          return json(view);
+        } catch (error) {
+          return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+        }
+      }
       if (req.method === "GET" && sub === "/api/task") {
         const taskId = url.searchParams.get("id") ?? "";
         const { db } = await opts.company();
@@ -407,6 +418,37 @@ async function reloadGoalTasks(gid){
     d.innerHTML=(r.tasks||[]).map(t=>'<div class="task-row"><strong>'+esc(t.title)+'</strong><span class="task-people">'+esc(t.executorRole)+' → '+esc(t.reviewerRole)+(t.currentEmployee?' · '+esc(t.currentEmployee):'')+'</span>'+stateBadge(t.state)+'<div class="task-acts">'+taskActions(t,gid)+'</div></div>').join('')||'<div class="task-row"><strong>（无任务）</strong></div>';
   }catch(e){d.textContent=e.message}
 }
+async function loadRetiredWork(gid){
+  const host=document.querySelector('#rw-'+CSS.escape(gid));if(!host)return;
+  try{
+    const r=await api('goal-retired-pending?goalId='+encodeURIComponent(gid));
+    if(!r.items.length){host.innerHTML='<p class="retired-meta">没有待处置的历史任务</p>';return;}
+    host.innerHTML='<p class="retired-title">历史任务处置（作废但未结算，需老板登记）</p>'+r.items.map(function(it){
+      const options=it.candidates.map(function(c){return '<option value="'+c.taskId+'">'+esc(c.title)+'（'+esc(c.kind||'任务')+'）</option>'}).join('');
+      const retired=it.retiredAt?('由 '+esc(it.retiredBy||'未知')+' 于 '+esc(String(it.retiredAt).slice(0,16).replace('T',' '))+' 作废'):'作废时间未知';
+      return '<div class="retired-item"><strong class="retired-name">'+esc(it.title)+'</strong>'
+        +'<span class="retired-meta">'+esc(it.kind||'任务')+' · v'+esc(it.version)+' · '+retired+'</span>'
+        +'<div class="retired-form"><select id="d-'+it.taskId+'">'
+        +'<option value="replaced">由已完成任务替代</option><option value="fixture">QA 夹具（非产品交付）</option><option value="excluded">范围排除（需 owner 终验）</option></select>'
+        +(it.candidates.length?'<select id="r-'+it.taskId+'">'+options+'</select>':'<span class="retired-meta">无同类型已完成替代</span>')
+        +'<button class="no" onclick="resolveRetiredTask(\\''+gid+'\\',\\''+it.taskId+'\\','+r.goalVersion+','+it.version+')">登记处置</button></div>'
+        +'<label class="comment-field"><span>处置原因（必填，至少 10 字）</span><textarea id="w-'+it.taskId+'" placeholder="例如：与替代任务重复，替代任务已完成并验收"></textarea></label>'
+        +(it.retiredEvidence?'<p class="retired-meta">原作废原因：'+esc(String(it.retiredEvidence).slice(0,200))+'</p>':'')
+        +'</div>';
+    }).join('');
+  }catch(e){host.textContent=e.message}
+}
+async function resolveRetiredTask(gid,tid,gv,tv){
+  const d=document.getElementById('d-'+tid),r=document.getElementById('r-'+tid),w=document.getElementById('w-'+tid);
+  const disposition=d?d.value:'fixture';
+  const reason=w?w.value:'';
+  if(reason.trim().length<10){alert('请写明处置原因（至少 10 字）');return}
+  const replacementTaskIds=(disposition==='replaced'&&r)?[r.value]:[];
+  try{
+    await api('goal-retired-resolution',{goalId:gid,taskId:tid,goalVersion:gv,taskVersion:tv,disposition,replacementTaskIds,reason,key:newKey()});
+    toast('已登记历史任务处置');await loadRetiredWork(gid);await load();
+  }catch(e){alert(e.message)}
+}
 async function instruct(){
   const t=$('gm-text');if(!t.value.trim())return;
   try{await api('instruct',{text:t.value,key:newKey()});t.value='';$('gm-ok').textContent='已下达，经理稍后处理';toast('已下达给经理');await load()}catch(e){alert(e.message)}
@@ -427,9 +469,10 @@ async function openGoal(gid){
   if(el.dataset.open){el.dataset.open='';el.querySelector('.task-drawer')?.remove();el.classList.remove('open');return}
   el.dataset.open='1';el.classList.add('open');
   const d=document.createElement('div');d.className='task-drawer';
-  d.innerHTML='<div class="task-head"><span>任务</span><span>执行 → 审核</span><span>状态</span><span></span></div><div class="task-list">加载中…</div><button class="text-button danger" onclick="cancelGoal(\\''+gid+'\\')">取消这个目标</button>';
+  d.innerHTML='<div class="task-head"><span>任务</span><span>执行 → 审核</span><span>状态</span><span></span></div><div class="task-list">加载中…</div><div class="retired-list" id="rw-'+gid+'"></div><button class="text-button danger" onclick="cancelGoal(\\''+gid+'\\')">取消这个目标</button>';
   el.appendChild(d);
   await reloadGoalTasks(gid);
+  await loadRetiredWork(gid);
 }
 function stageChip(x){const tone={done:'done',active:'active',waiting:'waiting',missing:'missing'}[x.status]||'';const label={done:'已',waiting:'等',active:'进行',missing:'缺',not_required:'不需',unknown:'未知'}[x.status]||'未知';return '<span class="stage '+tone+'">'+esc(x.label)+' '+label+'</span>'}
 function goalBlockerHtml(b){
