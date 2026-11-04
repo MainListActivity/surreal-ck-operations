@@ -1,20 +1,22 @@
 {
-  "version": "0.3.77",
-  "title": "恢复唤醒可观测性与静默失败修复",
+  "version": "0.3.78",
+  "title": "恢复取证续跑：状态化唤醒、句柄可达与拒绝入账",
   "changes": [
-    "修复恢复唤醒静默失败：activeRecoveryGrants 按 created_at 排序却未选取该字段，公司 fork 拒绝后被当作「没有 grant」；补选字段，读取失败改为 recovery wake read failed 日志。",
-    "2a 三处静默跳过各记一行结构化日志（grantId、instId、reason=no_instance|no_agent|state=busy|down|exhausted）；60s 节流跳过保持静默。",
-    "adoptRecovery 失败保留 failed 日志并记 last_skip_reason=failed；成功唤醒写入 last_wake_at 并清空跳过原因。",
-    "插件宿主 dispatcher 日志同时追加 <serviceHome>/logs/dispatcher.log（ISO 时间戳、append、best effort，写失败不影响调度）。",
-    "schema 050（增量）：recovery_read_grant 增补可选 last_wake_at / last_skip_reason，recovery_read_status 透出；不改 state 机、限额与路径集合。",
-    "启动自检：缺少 sidecar.adoptRecovery 时只记一次 recovery wake disabled: sidecar hook missing。",
-    "fork 回归新增六项：grant 读取根因、no_instance/busy/失败跳过、健康空闲一 tick 内 issued→bound、自检幂等；该文件在 recovery-fork 门禁内，skip 视为失败。"
+    "唤醒文案按 grant 状态生成：issued|bound 未登录→登录一次并立刻四条 GET；running→不再要求登录，给出 perPath/nextPath 与从该条起的命令；终态不唤醒或明确无事可做。",
+    "dispatcher 读取 grant 时带出 state/login_attempts/per_path/max_login/max_calls_per_path，并把完整计数传给唤醒文案。",
+    "sidecar 登录成功后把 session 句柄存入 RecoveryClaim 并镜像 claim.json（0600），下一次唤醒携带；token 不落盘。",
+    "句柄丢失（进程重启/插件重载）时把 running 链收口为 stopped(session_lost)，不自动重登；新 stop_reason 已登记。",
+    "固定 refusal 枚举（18 项）；reserve 拒绝写 recovery_read_call(ok=false) 但不递增计数，busy 每 grant 每分钟去重。",
+    "broker pre-try 与 sidecar 本地拒绝写 ops_recovery_refuse 审计（只含枚举/工具/路径，不含 session/token）；未知枚举拒绝写入。",
+    "recovery_read_status 增加 refusals、lastRefusal 与 sessionPresent，区分「没发出去」和「被拒绝」。",
+    "fork 回归新增 T1-T13（状态化唤醒、句柄续跑/隔离/丢失、拒绝入账、枚举封闭、门禁标记）；skip 仍视为失败。"
   ],
   "impact": [
-    "成功路径行为不变；新增仅为日志与两个可选字段。唯一的语义修复是让 2a 的 grant 读取真正生效——恢复唤醒本应如此。",
-    "不改 grant 状态机、登录/每路径限额与既有路径集合；不放宽也不新增任何工具。",
-    "迁移 050 纯增量，旧版 release 读不到两个字段即忽略（RB01）。"
+    "成功路径的限额不变：仍是一次登录、每路径一次、1-30 分钟 TTL；rearm 仍承接计数，fault 预算与授权链不变。",
+    "running 链被唤醒时不再要求登录，直接续跑剩余 GET；这是本版修复的核心行为变化。",
+    "进程重启后 running 链明确停止为 session_lost，而不是空转到过期；status 可读。",
+    "无 schema 变更：拒绝行复用 049 的 recovery_read_call，拒绝审计复用既有 audit 表。"
   ],
-  "migration": "新增 schema 050 两个可选字段（IF NOT EXISTS，纯增量、无回填）；在 049 的 recovery_read_grant / recovery_read_chain / recovery_read_call 三表基础上只加字段，bootstrap 把 marker 推至 50。旧版 release 读不到即忽略（RB01）。",
-  "rollback": "切回 0.3.76（releases/6ce60ff6…）。schema 050 纯增量，无需数据回滚；已签发 grant 在旧版按原语义处理。"
+  "migration": "无迁移。schema_version 保持 50；拒绝行复用 049 的 recovery_read_call，拒绝/停止审计复用既有 audit 表（schemaless），不新增列或表；049 的 recovery_read_grant / recovery_read_chain 结构不变。",
+  "rollback": "切回 0.3.77（releases/c25f9a5…）。无数据迁移需要回滚；已签发 grant 在旧版按原语义解析（未知 stop_reason 只是字符串）。"
 }
