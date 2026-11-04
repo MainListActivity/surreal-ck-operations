@@ -58,7 +58,8 @@ export const RECOVERY_READ_STOP_REASONS = ['unknown_outcome', 'login_failed', 's
 export type RecoveryReadStopReason = typeof RECOVERY_READ_STOP_REASONS[number];
 
 /** The next path the chain allows: the first not-yet-called path after a fully called prefix; -1 when none. */
-export function nextRecoveryPath(perPath: readonly number[]): number {
+export function nextRecoveryPath(perPath: readonly number[] | undefined): number {
+  if (!Array.isArray(perPath)) return 0;
   for (let i = 0; i < RECOVERY_READ_PATHS.length; i++) {
     const count = perPath[i] ?? 0;
     if (count === 0) return i;

@@ -74,21 +74,26 @@ export interface RecoveryWakeGrant {
   paths: string[];
   expiresAt: string;
   state: string;
-  loginAttempts: number;
-  perPath: number[];
-  maxLogin: number;
-  maxCallsPerPath: number;
+  /** Absent on an older dispatcher/fixture: treated as 0 / [0,0,0,0] / the built-in maxima. */
+  loginAttempts?: number;
+  perPath?: number[];
+  maxLogin?: number;
+  maxCallsPerPath?: number;
   /** The login handle the sidecar already holds for a running chain; absent when the chain has none. */
   sessionHandle?: string;
 }
 
 export function recoveryWake(inst: EmployeeInst, grant: RecoveryWakeGrant,
   env: PromptEnv, firstContact: boolean, ctx?: PromptCtx): string {
-  const nextIndex = nextRecoveryPath(grant.perPath);
+  const loginAttempts = grant.loginAttempts ?? 0;
+  const maxLogin = grant.maxLogin ?? 1;
+  const maxCallsPerPath = grant.maxCallsPerPath ?? 1;
+  const perPath = Array.isArray(grant.perPath) ? grant.perPath : [];
+  const nextIndex = nextRecoveryPath(perPath);
   const payload = JSON.stringify({
     grantId: grant.id, sourceTaskId: grant.taskId, paths: grant.paths, expiresAt: grant.expiresAt,
-    state: grant.state, loginAttempts: grant.loginAttempts, perPath: grant.perPath, nextPath: nextIndex,
-    maxLogin: grant.maxLogin, maxCallsPerPath: grant.maxCallsPerPath,
+    state: grant.state, loginAttempts, perPath, nextPath: nextIndex,
+    maxLogin, maxCallsPerPath,
     ...(grant.sessionHandle ? { sessionHandle: grant.sessionHandle } : {}),
   });
   const comm = ctx?.comm ? `\n证据写到通道登记的 evidenceDir（见 claim.json 的 recovery/evidenceDir 段）；不要写 report.md，也不要 submit——源任务已 done，本授权只采证。` : '';
@@ -114,15 +119,15 @@ grant 不是执行租约：不能写任务、不能 checkpoint/submit/review/rep
       ? `会话句柄：${grant.sessionHandle}。这就是本 grant 的登录句柄，直接用它发 GET。`
       : `通道当前没有可用的会话句柄。直接尝试下一条 GET；若被拒（session_missing / grant_not_bound），立即停止并在交付里写明——不要重新登录。`;
     return wrap(`${head}\n\n登录已完成，不要再执行登录（本 grant 只有一次登录机会）。
-perPath=${JSON.stringify(grant.perPath)}，nextPath=${nextIndex >= 0 ? nextIndex : 'none'}。${replay}
+perPath=${JSON.stringify(perPath)}，nextPath=${nextIndex >= 0 ? nextIndex : 'none'}。${replay}
 ${handle}
-只做这些 GET，从第 ${Math.min(start + 1, grant.paths.length)} 条开始，按固定顺序，不要跳过、不要重复${grant.maxCallsPerPath === 1 ? '（每路径一次）' : ''}：
+只做这些 GET，从第 ${Math.min(start + 1, grant.paths.length)} 条开始，按固定顺序，不要跳过、不要重复${maxCallsPerPath === 1 ? '（每路径一次）' : ''}：
 ${commands || '   （四条路径都已调用，没有下一步）'}
 任一项返回非预期结果就停止，余项不再调用。
 ${tail}${comm}`);
   }
   if (grant.state === 'issued' || grant.state === 'bound') {
-    if (grant.loginAttempts > 0) {
+    if (loginAttempts > 0) {
       // A login was already reserved but the chain has not advanced: never ask for a second one.
       return wrap(`${head}\n\n登录已尝试，状态尚未推进；不要再次登录，也不要发 GET。等下一次唤醒或让经理读 recovery_read_status。结束本轮。${comm}`);
     }
