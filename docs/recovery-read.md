@@ -27,6 +27,34 @@ internal-ai/runtime → runtime-version），最后按需 `ops_logout`。
 - 必要 `ops_logout` 在 stopped/expired/revoked 下仍然允许：只丢弃本 grant 的本地会话，不重登、
   不声称远端注销；停止/到期/撤销时也会自动清理本地会话。
 
+## 2.1 续跑：唤醒按状态生成，句柄跨轮可达
+
+- dispatcher 读取 grant 时一并取 `state`/`login_attempts`/`per_path`/`max_login`/`max_calls_per_path`，
+  唤醒文案按状态生成：
+  - `issued|bound` 且未登录：只要求登录一次，并明确“登录后立刻按序发四条 GET”；
+  - `running`：**不再要求登录**，给出 `perPath`、`nextPath` 与从该条起的 GET 命令，并禁止重放已完成的路径；
+  - `completed/stopped/expired/revoked`：不唤醒；若陈旧唤醒已送达，明确无事可做、不要调用任何 ops 工具。
+- sidecar 在 recovery 模式的 `ops_operator_login` 成功后，把返回的 session 句柄存入 `RecoveryClaim`
+  并镜像到 `claim.json` 的 `recovery.sessionHandle`（文件 0600）；下一次唤醒把它带进载荷。
+  句柄本身已经通过工具结果交给员工，不新增泄露面；token 从不落盘。
+- **句柄丢失即终态**：进程重启/插件重载后，若 grant 仍为 `running` 而本进程没有该 grant 的句柄，
+  sidecar 调用 `recovery_read_close` 把 grant 收口为 `stopped(session_lost)`（登记在
+  `RECOVERY_READ_STOP_REASONS`），不自动重登、不继续空转到过期。跨进程持久化 token 不在本流程内。
+
+## 2.2 拒绝也必须可见
+
+- 固定的 refusal outcome 枚举（`RECOVERY_READ_REFUSALS`）：`not_allowlisted_tool`、`reserved_arg`、
+  `method_not_get`、`path_not_in_grant`、`session_missing`、`session_foreign`、`grant_not_bound`、
+  `login_unavailable`、`login_attempted`、`path_order`、`path_attempted`、`read_unavailable`、`busy`、
+  `source_changed`、`expired`、`revoked`、`stopped`、`completed`。未知值一律拒绝，不静默通过。
+- 链级 reserve 的每个拒绝写一条 `recovery_read_call(ok=false, status=0, outcome=枚举)`，**不递增**
+  `login_attempts`/`per_path`；`busy` 每 grant 每分钟最多一条。
+- broker 的 pre-try 拒绝（工具不在允许面、参数夹带租约证明、非 GET、路径不在 grant、会话缺失/不属于
+  本 grant）与 sidecar 本地拒绝（stale binding、执行租约冲突、过期、保留参数、工具不在允许面）写
+  `ops_recovery_refuse` 审计行，附着 source task，证据只含 grantId/枚举/工具/路径，不含 session/token。
+- `recovery_read_status` 的 grant 视图增加 `refusals`（按枚举计数）、`lastRefusal` 与 `sessionPresent`，
+  让“没发出去”和“被拒绝”在状态面可区分。
+
 ## 3. status 超期推进（惰性、幂等、不扩权限）
 
 `status`、`reserve`、`bind`、`grantFor`、`grantsFor` 在读到**已超过 deadline 的 inFlight** 时，会把它

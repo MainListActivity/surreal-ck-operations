@@ -33,6 +33,40 @@ export const RECOVERY_READ_MAX_CALLS_PER_PATH = 1;
 
 export type RecoveryReadState = 'issued' | 'bound' | 'running' | 'completed' | 'stopped' | 'revoked' | 'expired';
 
+/**
+ * FV06 refusal outcomes (spec d15cbecb §6.3). A refusal is recorded with exactly one of these names and
+ * never free text, so `recovery_read_status` can separate "the call was never sent" from "the server refused it".
+ * The set is closed: anything else is rejected rather than silently accepted.
+ */
+export const RECOVERY_READ_REFUSALS = [
+  'not_allowlisted_tool', 'reserved_arg', 'method_not_get', 'path_not_in_grant',
+  'session_missing', 'session_foreign', 'grant_not_bound', 'login_unavailable',
+  'login_attempted', 'path_order', 'path_attempted', 'read_unavailable',
+  'busy', 'source_changed', 'expired', 'revoked', 'stopped', 'completed',
+] as const;
+export type RecoveryReadRefusal = typeof RECOVERY_READ_REFUSALS[number];
+const REFUSAL_SET: ReadonlySet<string> = new Set(RECOVERY_READ_REFUSALS);
+export function isRecoveryReadRefusal(value: unknown): value is RecoveryReadRefusal {
+  return typeof value === 'string' && REFUSAL_SET.has(value);
+}
+
+/**
+ * Terminal stop reasons the chain writes itself. A GET that fails records its own outcome string instead;
+ * these name states the channel or clock decided, including the honest closure when the login handle is gone.
+ */
+export const RECOVERY_READ_STOP_REASONS = ['unknown_outcome', 'login_failed', 'session_lost', 'source_changed', 'expired'] as const;
+export type RecoveryReadStopReason = typeof RECOVERY_READ_STOP_REASONS[number];
+
+/** The next path the chain allows: the first not-yet-called path after a fully called prefix; -1 when none. */
+export function nextRecoveryPath(perPath: readonly number[]): number {
+  for (let i = 0; i < RECOVERY_READ_PATHS.length; i++) {
+    const count = perPath[i] ?? 0;
+    if (count === 0) return i;
+    if (count !== 1) return -1; // above the one-call limit: not a resumable prefix
+  }
+  return -1;
+}
+
 /** 必须恰好是四条、顺序一致、无重复：paths 不是可裁剪的允许列表，而是 grant 的全部内容。 */
 export function exactRecoveryPaths(paths: unknown): string[] {
   if (!Array.isArray(paths) || paths.length !== RECOVERY_READ_PATHS.length) {

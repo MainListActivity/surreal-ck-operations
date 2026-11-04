@@ -2,6 +2,7 @@ import type { ClaimResult, WorktreeAssignment } from '../contracts.ts';
 import type { EmployeeInst, SupervisedTask } from '../workforce.ts';
 import type { BlockCode, DispatchVerdict } from './dispatch-blocked.ts';
 import { latestFindings } from './brief.ts';
+import { nextRecoveryPath } from '../recovery-read.ts';
 
 export interface PromptEnv { opsRepo: string; sckBin: string; paseoBin: string }
 
@@ -59,30 +60,84 @@ ${channel}`;
 }
 
 /**
- * FV06 recovery read grant wake. The payload is exactly the grant identity: no credential, no task override,
- * no token. The channel holds the grant binding; the employee can only run one login, the four fixed GETs in
- * order and a necessary logout. The source task stays done — this is evidence collection, not execution.
+ * FV06 recovery read grant wake. The payload is the grant identity plus its state — no credential, no task
+ * override, no token. The channel holds the grant binding; the employee can only run one login, the four fixed
+ * GETs in order and a necessary logout. The source task stays done — this is evidence collection, not execution.
+ *
+ * The prompt is state-driven (d15cbecb §6.1): asking for a login on every wake burned the single login and left
+ * the four GETs unexecuted. A running chain is told exactly which path is next; a terminal chain is not asked to
+ * call anything.
  */
-export function recoveryWake(inst: EmployeeInst, grant: { id: string; taskId: string; paths: string[]; expiresAt: string },
-  env: PromptEnv, firstContact: boolean, ctx?: PromptCtx): string {
-  const payload = JSON.stringify({ grantId: grant.id, sourceTaskId: grant.taskId, paths: grant.paths, expiresAt: grant.expiresAt });
-  const comm = ctx?.comm ? `\n证据写到通道登记的 evidenceDir（见 claim.json 的 recovery/evidenceDir 段）；不要写 report.md，也不要 submit——源任务已 done，本授权只采证。` : '';
-  const body = `【恢复取证授权】源任务 ${grant.taskId} 已终态，经理签发了一次性的恢复读取授权（grant ${grant.id}，截止 ${grant.expiresAt}）。
-授权载荷：${payload}
+export interface RecoveryWakeGrant {
+  id: string;
+  taskId: string;
+  paths: string[];
+  expiresAt: string;
+  state: string;
+  loginAttempts: number;
+  perPath: number[];
+  maxLogin: number;
+  maxCallsPerPath: number;
+  /** The login handle the sidecar already holds for a running chain; absent when the chain has none. */
+  sessionHandle?: string;
+}
 
-只做这件事，按固定顺序：
+export function recoveryWake(inst: EmployeeInst, grant: RecoveryWakeGrant,
+  env: PromptEnv, firstContact: boolean, ctx?: PromptCtx): string {
+  const nextIndex = nextRecoveryPath(grant.perPath);
+  const payload = JSON.stringify({
+    grantId: grant.id, sourceTaskId: grant.taskId, paths: grant.paths, expiresAt: grant.expiresAt,
+    state: grant.state, loginAttempts: grant.loginAttempts, perPath: grant.perPath, nextPath: nextIndex,
+    maxLogin: grant.maxLogin, maxCallsPerPath: grant.maxCallsPerPath,
+    ...(grant.sessionHandle ? { sessionHandle: grant.sessionHandle } : {}),
+  });
+  const comm = ctx?.comm ? `\n证据写到通道登记的 evidenceDir（见 claim.json 的 recovery/evidenceDir 段）；不要写 report.md，也不要 submit——源任务已 done，本授权只采证。` : '';
+  const head = `【恢复取证授权】源任务 ${grant.taskId} 已终态，经理签发了一次性的恢复读取授权（grant ${grant.id}，截止 ${grant.expiresAt}）。
+授权载荷：${payload}`;
+  const tail = `不要把 taskId/sourceTaskId/grantId 或任何租约证明放进参数——通道会拒绝。grant 停止/过期后 logout 仍然允许。
+grant 不是执行租约：不能写任务、不能 checkpoint/submit/review/report_blocker，也不能调用其它 ops 工具。`;
+  const wrap = (body: string) => firstContact ? `${onboarding(inst, env, ctx?.comm ?? false, ctx?.commDir)}\n\n${body}` : body;
+  const terminal = grant.state === 'completed' || grant.state === 'stopped' || grant.state === 'expired' || grant.state === 'revoked';
+  if (terminal) {
+    // activeRecoveryGrants already excludes these states; if a stale grant is delivered anyway, say plainly that
+    // there is nothing to call. A stopped chain must not be retried by the employee.
+    return wrap(`${head}\n\n本 grant 当前状态为 ${grant.state}，无事可做：不要调用任何 ops 工具，不要写任务、不要 submit；结束本轮。${comm}`);
+  }
+  if (grant.state === 'running') {
+    const start = nextIndex >= 0 ? nextIndex : grant.paths.length;
+    const commands = grant.paths.slice(start).map((path, offset) =>
+      `   '${env.sckBin}' call ops_request '{"session":"<session>","method":"GET","path":"${path}"}'`).join('\n');
+    const replay = start > 0
+      ? `已完成的前 ${start} 条路径不要重放（每路径只允许一次）；重复调用会被拒绝并记入拒绝审计。`
+      : '';
+    const handle = grant.sessionHandle
+      ? `会话句柄：${grant.sessionHandle}。这就是本 grant 的登录句柄，直接用它发 GET。`
+      : `通道当前没有可用的会话句柄。直接尝试下一条 GET；若被拒（session_missing / grant_not_bound），立即停止并在交付里写明——不要重新登录。`;
+    return wrap(`${head}\n\n登录已完成，不要再执行登录（本 grant 只有一次登录机会）。
+perPath=${JSON.stringify(grant.perPath)}，nextPath=${nextIndex >= 0 ? nextIndex : 'none'}。${replay}
+${handle}
+只做这些 GET，从第 ${Math.min(start + 1, grant.paths.length)} 条开始，按固定顺序，不要跳过、不要重复${grant.maxCallsPerPath === 1 ? '（每路径一次）' : ''}：
+${commands || '   （四条路径都已调用，没有下一步）'}
+任一项返回非预期结果就停止，余项不再调用。
+${tail}${comm}`);
+  }
+  if (grant.state === 'issued' || grant.state === 'bound') {
+    if (grant.loginAttempts > 0) {
+      // A login was already reserved but the chain has not advanced: never ask for a second one.
+      return wrap(`${head}\n\n登录已尝试，状态尚未推进；不要再次登录，也不要发 GET。等下一次唤醒或让经理读 recovery_read_status。结束本轮。${comm}`);
+    }
+    return wrap(`${head}\n\n只做这件事，按固定顺序：
 1. 登录一次：'${env.sckBin}' call ops_operator_login '{"alias":"LCA04_OPS"}'。失败就停，不再试。
-2. 用上一步返回的 session 依次发四次 GET（每次一条，路径固定，不要跳过、不要重复、不要换顺序）：
+2. 登录成功后**立刻**（不要结束本轮、不要等下一次唤醒）用上一步返回的 session 依次发四次 GET（每次一条，路径固定，不要跳过、不要重复、不要换顺序）：
    '${env.sckBin}' call ops_request '{"session":"<session>","method":"GET","path":"${grant.paths[0] ?? ''}"}'
    '${env.sckBin}' call ops_request '{"session":"<session>","method":"GET","path":"${grant.paths[1] ?? ''}"}'
    '${env.sckBin}' call ops_request '{"session":"<session>","method":"GET","path":"${grant.paths[2] ?? ''}"}'
    '${env.sckBin}' call ops_request '{"session":"<session>","method":"GET","path":"${grant.paths[3] ?? ''}"}'
 3. 任一项返回非预期结果（第 1 项应为 503 + endpoint-probe-temporary-grant-not-configured；其余为 200 且严格视图完整）就停止，余项不再调用。
 4. 结束时对本 grant 已取得的 session 做一次本地注销：'${env.sckBin}' call ops_logout '{"session":"<session>"}'（必要时才做；失败不重试）。
-不要把 taskId/sourceTaskId/grantId 或任何租约证明放进参数——通道会拒绝。grant 停止/过期后 logout 仍然允许。
-${comm}
-grant 不是执行租约：不能写任务、不能 checkpoint/submit/review/report_blocker，也不能调用其它 ops 工具。`;
-  return firstContact ? `${onboarding(inst, env, ctx?.comm ?? false, ctx?.commDir)}\n\n${body}` : body;
+${tail}${comm}`);
+  }
+  return wrap(`${head}\n\n本 grant 当前状态为 ${grant.state}，无事可做：不要调用任何 ops 工具，结束本轮。${comm}`);
 }
 
 export function wake(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, firstContact: boolean, ctx?: PromptCtx): string {

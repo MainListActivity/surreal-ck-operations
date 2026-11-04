@@ -1244,9 +1244,13 @@ export class Dispatcher {
         if (now - (this.recoveryWakeAt.get(grant.id) ?? 0) < STANDBY_WAKE_RETRY_SECONDS) continue;
         this.recoveryWakeAt.set(grant.id, now);
         try {
-          await this.deps.sidecar.adoptRecovery(inst, grant.id);
+          const adopted = await this.deps.sidecar.adoptRecovery(inst, grant.id);
+          // The handle lives in the sidecar; the prompt only carries it when the channel already holds one (d15cbecb §6.2).
+          const sessionHandle = adopted && typeof adopted === 'object' && 'sessionHandle' in adopted
+            && typeof (adopted as { sessionHandle?: unknown }).sessionHandle === 'string'
+            ? (adopted as { sessionHandle: string }).sessionHandle : undefined;
           const first = !this.onboarded.has(inst.id) && !inst.onboarded;
-          await paseo.send(inst.paseoAgentId, recoveryWake(inst, grant, this.deps.env, first,
+          await paseo.send(inst.paseoAgentId, recoveryWake(inst, { ...grant, ...(sessionHandle ? { sessionHandle } : {}) }, this.deps.env, first,
             { comm: true, commDir: this.deps.sidecar.commDirFor(inst.id), scratchDir: this.deps.sidecar.scratchDirFor(inst.id) }));
           this.onboarded.add(inst.id);
           this.lastStatus.set(inst.paseoAgentId, 'running');

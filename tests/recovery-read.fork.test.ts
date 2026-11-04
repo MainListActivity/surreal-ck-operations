@@ -3,6 +3,7 @@
 // Everything is synthetic: no production credential, product call, secret or model is touched.
 import { afterAll, beforeAll, beforeEach, setDefaultTimeout, test } from 'bun:test';
 import { expect } from 'bun:test';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,18 +14,22 @@ import { CompanyDatabase } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { ProjectStore } from '../src/projects.ts';
-import { RECOVERY_READ_ALIAS, RECOVERY_READ_PATHS } from '../src/recovery-read.ts';
+import { RECOVERY_READ_ALIAS, RECOVERY_READ_PATHS, RECOVERY_READ_REFUSALS, nextRecoveryPath } from '../src/recovery-read.ts';
+import { recoveryWake } from '../src/dispatcher/prompts.ts';
 import { LEGACY_SCHEMA_MINIMUM, RECOVERY_READ_TABLES } from '../src/company-release.ts';
 import { readReleaseSchema, verifyReleaseSchema } from '../src/release-schema.ts';
 import { Dispatcher, type SidecarBridge } from '../src/dispatcher/dispatcher.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { DEFAULT_CONFIG, Workforce, type EmployeeInst } from '../src/workforce.ts';
 import type { OwnerDesk } from '../src/owner.ts';
-import { brokerConfig } from './support/ops-world.ts';
-import type { ClaimResult, CreateTask, Evidence } from '../src/contracts.ts';
+import { OpsBroker } from '../src/ops/broker.ts';
+import { SidecarPool } from '../plugin/server/sidecar.ts';
+import { brokerConfig, FakeCompany, FakeWorld, OPS_CLIENT, OPS_REDIRECT, OPS_RESOURCE } from './support/ops-world.ts';
+import type { ClaimResult, CreateTask, Evidence, OpsScope } from '../src/contracts.ts';
 
 const enabled = process.env.RUN_COMPANY_PROOF_FORK_TESTS === '1';
 const check = test.skipIf(!enabled);
+let markerPrinted = false;
 setDefaultTimeout(300_000);
 
 let dir: string, url: string, child: ReturnType<typeof Bun.spawn>, database: CompanyDatabase;
@@ -58,6 +63,7 @@ beforeAll(async () => {
   await database.bootstrap();
   // The release gate reads this marker: a skipped file (missing opt-in flag) must not look like a pass.
   console.log('recovery-read.fork executed');
+  markerPrinted = true;
   core = new SurrealCompanyCore(database);
   projects = new ProjectStore(database.db);
   const enroll = new LocalEnrollmentAdmin(database);
@@ -192,7 +198,7 @@ check('the chain counts are atomic, ordered and monotonic; rearm carries them ov
   const issued = (await core.recoveryReadGrant(gm, grantInput(source, auth))).grant;
   const grantId = issued.id;
   expect(await core.recoveryReadReserve(eng1, { grantId, grantFence: 1, kind: 'login' }))
-    .toMatchObject({ allowed: false, reason: 'not_bound', message: expect.stringContaining('not bound') });
+    .toMatchObject({ allowed: false, reason: 'grant_not_bound', message: expect.stringContaining('not bound') });
   const bound = await core.recoveryReadBind(eng1, { grantId, fence: 1 });
   expect(bound.state).toBe('bound');
   // Logout is always allowed and never counted.
@@ -229,7 +235,7 @@ check('the chain counts are atomic, ordered and monotonic; rearm carries them ov
   expect(view.state).toBe('stopped');
   expect(view.stopReason).toBe('unexpected_200');
   expect(await core.recoveryReadReserve(eng1, { grantId, grantFence: 1, kind: 'get', path: RECOVERY_READ_PATHS[1] }))
-    .toMatchObject({ allowed: false, reason: 'grant_stopped' });
+    .toMatchObject({ allowed: false, reason: 'stopped' });
   // Logout stays possible after the stop.
   expect(await core.recoveryReadReserve(eng1, { grantId, grantFence: 1, kind: 'logout' })).toMatchObject({ allowed: true });
   // A new grant without rearm is refused; rearm needs another authorization task and preserves counts.
@@ -257,7 +263,7 @@ check('status visibility is gm, grantee and source reviewer only; calls carry no
   expect(mine).toHaveLength(1);
   expect(mine[0]!.calls.map(c => `${c.ordinal}:${c.kind}:${c.outcome}`)).toEqual(['1:login:login_ok', '2:get:not_configured_503']);
   expect(mine[0]!.calls[1]).not.toHaveProperty('body');
-  expect(JSON.stringify(mine)).not.toMatch(/session|token|subject|https?:/i);
+  expect(JSON.stringify(mine)).not.toMatch(/token|subject|https?:|s_[0-9a-f]{16}/i);
   // The source reviewer (role engineering) sees it; a role with no review right on the source does not.
   expect(await core.recoveryReadStatus(eng2, { taskId: source })).toHaveLength(1);
   expect(await core.recoveryReadStatus(cs, { taskId: source })).toHaveLength(0);
@@ -294,7 +300,7 @@ check('revoke closes the chain, audit is readable and local logout stays allowed
   const revoked = (await core.recoveryReadStatus(gm, { grantId: grant.id }))[0]!.grant;
   expect(revoked.state).toBe('revoked');
   expect(await core.recoveryReadReserve(eng1, { grantId: grant.id, grantFence: 1, kind: 'login' }))
-    .toMatchObject({ allowed: false, reason: 'grant_revoked' });
+    .toMatchObject({ allowed: false, reason: 'revoked' });
   expect(await core.recoveryReadReserve(eng1, { grantId: grant.id, grantFence: 1, kind: 'logout' })).toMatchObject({ allowed: true });
   const [rows] = await database.db.query<[Array<{ action: string; evidence: string }>]>(
     "SELECT action, evidence FROM audit WHERE task = $task AND action IN ['recovery_read_grant', 'recovery_read_revoke'];",
@@ -337,7 +343,7 @@ check('an unsettled inFlight past its deadline becomes stopped(unknown_outcome),
   });
   // The next reserve advances the chain to its terminal stop instead of answering busy forever.
   expect(await core.recoveryReadReserve(eng1, { grantId: grant.id, grantFence: 1, kind: 'login' }))
-    .toMatchObject({ allowed: false, reason: 'grant_stopped' });
+    .toMatchObject({ allowed: false, reason: 'stopped' });
   const view = (await core.recoveryReadStatus(gm, { grantId: grant.id }))[0]!.grant;
   expect(view).toMatchObject({ state: 'stopped', stopReason: 'unknown_outcome', loginAttempts: 1 });
   expect(view.inFlight).toBeUndefined();
@@ -571,4 +577,376 @@ check('the dispatcher states the missing recovery hook once at startup, not once
   await h.dispatcher.tick();
   await h.dispatcher.tick();
   expect(h.logs.filter(line => line === 'recovery wake disabled: sidecar hook missing')).toHaveLength(1);
+});
+
+// --- FV06 continue-after-login regression (d15cbecb §6, T1–T13) ------------------------------------------------
+// A login that succeeded but whose four GETs were never sent used to look identical to a chain that was never
+// consented: the next wake asked for another login (refused), and the source task lost its only chance at evidence.
+
+const until = async (fn: () => boolean, ms = 5000) => {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) { if (fn()) return; await Bun.sleep(20); }
+  throw new Error('condition not met');
+};
+
+/**
+ * A real SidecarPool over the real core. The ops gateway is a fixture that performs the same reserve/settle the
+ * broker does, so the channel's login-handle capture, claim.json mirror and refusal audit are exercised for real
+ * without any product/IdP call.
+ */
+async function sidecarRig() {
+  const runDir = await mkdtemp(join(tmpdir(), 'sck-recovery-fork-sidecar-'));
+  const opsCalls: Array<{ tool: string; args: Record<string, unknown> }> = [];
+  const ops = {
+    tools: ['ops_info', 'ops_operator_login', 'ops_request', 'ops_logout'],
+    call: async (cred: string, _taskId: string, tool: string, args: Record<string, unknown>, proof: { grantId: string; grantFence: number }) => {
+      opsCalls.push({ tool, args });
+      if (tool === 'ops_operator_login') {
+        const reserved = await core.recoveryReadReserve(cred, { grantId: proof.grantId, grantFence: proof.grantFence, kind: 'login' });
+        if (!reserved.allowed) throw new Error(reserved.message);
+        await core.recoveryReadSettle(cred, { grantId: proof.grantId, grantFence: proof.grantFence, callId: reserved.callId!, kind: 'login', ok: true, outcome: 'login_ok' });
+        return { session: `s_fixture_${randomUUID().slice(0, 8)}`, kind: 'operator', alias: RECOVERY_READ_ALIAS,
+          username: 'fixture', expiresAt: new Date(Date.now() + 600_000).toISOString() };
+      }
+      if (tool === 'ops_request') {
+        const path = String(args.path);
+        const reserved = await core.recoveryReadReserve(cred, { grantId: proof.grantId, grantFence: proof.grantFence, kind: 'get', path });
+        if (!reserved.allowed) throw new Error(reserved.message);
+        await core.recoveryReadSettle(cred, { grantId: proof.grantId, grantFence: proof.grantFence, callId: reserved.callId!, kind: 'get',
+          path, status: 503, ok: true, outcome: 'not_configured_503' });
+        return { status: 503, body: { error: { code: 'endpoint-probe-temporary-grant-not-configured' } } };
+      }
+      return { closed: true };
+    },
+    releaseGrant: () => 0,
+    release: () => ({ sessions: 0, browserSpaces: 0, pending: 0 }),
+  };
+  const logs: string[] = [];
+  const pool = new SidecarPool({ core: core as never, workforce: { rotate: async () => eng1 } as never, ops, runDir,
+    heartbeatMs: 60_000, sweepMs: 20, log: message => logs.push(message) });
+  const inst: EmployeeInst = { id: 'recovery-eng1', role: 'engineering', credential: eng1 } as EmployeeInst;
+  const env = pool.env(inst);
+  const relay = async (dir: string, key: string, name: string, tool: string, args: Record<string, unknown>) => {
+    writeFileSync(join(dir, 'req', `${name}.json`), JSON.stringify({ key, tool, args }));
+    await until(() => existsSync(join(dir, 'res', `${name}.json`)), 5000);
+    return JSON.parse(readFileSync(join(dir, 'res', `${name}.json`), 'utf8')) as { ok: boolean; data?: unknown; error?: string };
+  };
+  return { runDir, pool, inst, env, ops, relay, opsCalls, logs };
+}
+
+/**
+ * The real OpsBroker with a synthetic environment and a real-core audit sink: pre-try refusals are produced by the
+ * broker's own enforcement and persisted where recovery_read_status reads them.
+ */
+async function brokerRig(sourceTaskId: string, grantId: string) {
+  const world = new FakeWorld();
+  const company = new FakeCompany();
+  company.env('demo', 'production', brokerConfig({ ops: { clientId: OPS_CLIENT, redirectUri: OPS_REDIRECT, resource: OPS_RESOURCE } }));
+  const audits: Array<{ action: string; evidence: string }> = [];
+  const chain = { state: 'running' as 'bound' | 'running', loginAttempts: 1, perPath: [0, 0, 0, 0] as number[],
+    inFlight: undefined as { callId: string; path: string } | undefined };
+  const recoveryScope: OpsScope = {
+    actor: { employeeId: 'recovery-eng1', role: 'engineering', capabilities: ['execute'] },
+    taskId: sourceTaskId, project: 'demo', kind: 'recovery_read',
+    recovery: { grantId, grantFence: 1, alias: RECOVERY_READ_ALIAS, paths: [...RECOVERY_READ_PATHS] },
+  };
+  const leaseScope: OpsScope = { actor: recoveryScope.actor, taskId: sourceTaskId, project: 'demo' };
+  const coreAdapter = {
+    opsScope: async (_credential: string, _taskId: string, proof?: { grantId: string; grantFence: number }) => proof ? recoveryScope : leaseScope,
+    auditOps: async (_scope: OpsScope, action: string, evidence: string) => {
+      audits.push({ action, evidence });
+      await database.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: $action, evidence: $evidence, at: time::now() };`,
+        { task: new RecordId('task', sourceTaskId), actor: new RecordId('employee', 'recovery-eng1'), action, evidence });
+    },
+    opsCount: async () => 0,
+    recoveryReadReserve: async (_credential: string, input: { kind: 'login' | 'get' | 'logout'; path?: string }) => {
+      if (input.kind === 'logout') return { allowed: true, kind: 'logout', callId: randomUUID(), message: 'logout allowed' };
+      if (chain.inFlight) return { allowed: false, kind: input.kind, reason: 'busy', message: 'Recovery read is busy with another call' };
+      const callId = randomUUID();
+      if (input.kind === 'login') {
+        if (chain.state !== 'bound') return { allowed: false, kind: 'login', reason: 'login_unavailable', message: 'login unavailable' };
+        chain.loginAttempts += 1;
+        chain.inFlight = { callId, path: 'login' };
+        return { allowed: true, kind: 'login', callId, message: 'login reserved' };
+      }
+      const index = RECOVERY_READ_PATHS.indexOf(input.path as never);
+      if (index < 0) return { allowed: false, kind: 'get', reason: 'path_not_in_grant', message: 'Path is not in this grant' };
+      chain.perPath[index] = (chain.perPath[index] ?? 0) + 1;
+      chain.inFlight = { callId, path: input.path! };
+      return { allowed: true, kind: 'get', callId, path: input.path, message: 'read reserved' };
+    },
+    recoveryReadSettle: async () => {},
+  };
+  const broker = new OpsBroker({
+    core: coreAdapter as never, projects: company.projects as never, secretKey: () => Buffer.alloc(32),
+    controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
+    fetch: (async (input: string | URL | Request, init?: RequestInit) => world.fetch(input as never, init as never)) as never,
+    now: world.now, monoNow: () => world.clock, d1: () => world.d1, queryAsUser: world.queryAsUser, browser: world.browser,
+    sleep: async ms => { world.clock += ms; },
+  });
+  return { broker, world, company, chain, audits, cred: 'fixture-credential', sourceTaskId, grantId };
+}
+
+/** A lease-mode operator session (no grantId): under a recovery proof it must be refused as session_foreign. */
+async function seedForeignSession(r: Awaited<ReturnType<typeof brokerRig>>): Promise<string> {
+  await r.broker.call(r.cred, r.sourceTaskId, 'ops_account_ensure', { alias: RECOVERY_READ_ALIAS });
+  const user = r.world.user('sck-lca04-ops')!;
+  r.world.operatorCaps.set(user.id, ['quota.read', 'subscription.manage']);
+  const login = await r.broker.call(r.cred, r.sourceTaskId, 'ops_operator_login', { alias: RECOVERY_READ_ALIAS }) as { session: string };
+  return login.session;
+}
+
+const wakeEnv = () => ({ opsRepo: dir, sckBin: '/fixture/sck', paseoBin: '/fixture/paseo' });
+const wakeGrant = (patch: Record<string, unknown> = {}) => ({
+  id: 'g-prompt', taskId: 'task-done', paths: [...RECOVERY_READ_PATHS], expiresAt: new Date(Date.now() + 600_000).toISOString(),
+  state: 'bound', loginAttempts: 0, perPath: [0, 0, 0, 0], maxLogin: 1, maxCallsPerPath: 1, ...patch,
+});
+const promptOf = (patch: Record<string, unknown> = {}) => recoveryWake(idleSeat(), wakeGrant(patch), wakeEnv(), false, { comm: true, commDir: '/tmp/comm' });
+const viewGrant = (view: Awaited<ReturnType<typeof grantView>>, patch: Record<string, unknown> = {}) => ({
+  id: view.id, taskId: view.taskId, paths: view.paths, expiresAt: view.expiresAt, state: view.state,
+  loginAttempts: view.loginAttempts, perPath: view.perPath, maxLogin: 1, maxCallsPerPath: 1, ...patch,
+});
+
+check('T1: a bound grant with no login asks for exactly one login and carries state/nextPath', async () => {
+  const prompt = promptOf({ state: 'bound', loginAttempts: 0, perPath: [0, 0, 0, 0] });
+  expect(prompt.match(/ops_operator_login/g) ?? []).toHaveLength(1);
+  expect(prompt).toContain('"state":"bound"');
+  expect(prompt).toContain('"nextPath":0');
+  expect(prompt).toContain('立刻');
+  // The four ordered GETs are spelled out in the same turn: no waiting for another wake.
+  for (const path of RECOVERY_READ_PATHS) expect(prompt).toContain(path);
+});
+
+check('T2: a running grant never asks for a login and points at the next path', async () => {
+  const prompt = promptOf({ state: 'running', loginAttempts: 1, perPath: [1, 0, 0, 0] });
+  expect(prompt).not.toContain('ops_operator_login');
+  expect(prompt).toContain('登录已完成');
+  expect(prompt).toContain('perPath=[1,0,0,0]');
+  expect(prompt).toContain('nextPath=1');
+  expect(prompt).toContain(RECOVERY_READ_PATHS[1]);
+});
+
+check('T3: perPath=[1,0,0,0] gives the second GET only and forbids replaying the first', async () => {
+  const prompt = promptOf({ state: 'running', loginAttempts: 1, perPath: [1, 0, 0, 0] });
+  expect(prompt).toContain(RECOVERY_READ_PATHS[1]);
+  expect(prompt).not.toContain('"path":"' + RECOVERY_READ_PATHS[0] + '"');
+  expect(prompt).toContain('不要重放');
+  expect(nextRecoveryPath([1, 0, 0, 0])).toBe(1);
+  expect(nextRecoveryPath([0, 0, 0, 0])).toBe(0);
+  expect(nextRecoveryPath([1, 1, 1, 1])).toBe(-1);
+});
+
+check('T4: a completed grant is not returned to the wake loop and sends nothing', async () => {
+  const source = await doneTask(GOAL, 'T4 完成源任务');
+  await openEpisode(source);
+  const auth = await doneTask(GOAL, 'T4 批准');
+  const { grant } = await core.recoveryReadGrant(gm, grantInput(source, auth));
+  await core.recoveryReadBind(eng1, { grantId: grant.id, fence: 1 });
+  const login = await core.recoveryReadReserve(eng1, { grantId: grant.id, grantFence: 1, kind: 'login' });
+  await core.recoveryReadSettle(eng1, { grantId: grant.id, grantFence: 1, callId: login.callId!, kind: 'login', ok: true, outcome: 'login_ok' });
+  for (const path of RECOVERY_READ_PATHS) {
+    const get = await core.recoveryReadReserve(eng1, { grantId: grant.id, grantFence: 1, kind: 'get', path });
+    await core.recoveryReadSettle(eng1, { grantId: grant.id, grantFence: 1, callId: get.callId!, kind: 'get', path, status: 200, ok: true, outcome: 'ok' });
+  }
+  const wf = new Workforce(database, join(dir, 'unused-credential-files'));
+  expect(await wf.activeRecoveryGrants(Date.now())).toHaveLength(0);
+  const h = wakeHarness({ instances: [idleSeat()], statuses: { 'agent-eng1': 'idle' },
+    adoptRecovery: async () => { throw new Error('a completed grant must not be adopted'); } });
+  await h.dispatcher.tick();
+  expect(h.sends).toHaveLength(0);
+  expect((await grantView(grant.id)).state).toBe('completed');
+});
+
+check('T5: a failed login burns the single attempt, stops the chain and later wakes never ask again', async () => {
+  const source = await doneTask(GOAL, 'T5 登录失败源任务');
+  await openEpisode(source);
+  const auth = await doneTask(GOAL, 'T5 批准');
+  const { grant } = await core.recoveryReadGrant(gm, grantInput(source, auth));
+  await core.recoveryReadBind(eng1, { grantId: grant.id, fence: 1 });
+  const login = await core.recoveryReadReserve(eng1, { grantId: grant.id, grantFence: 1, kind: 'login' });
+  await core.recoveryReadSettle(eng1, { grantId: grant.id, grantFence: 1, callId: login.callId!, kind: 'login', ok: false, outcome: 'login_failed' });
+  const view = await grantView(grant.id);
+  expect(view).toMatchObject({ state: 'stopped', stopReason: 'login_failed', loginAttempts: 1 });
+  const wf = new Workforce(database, join(dir, 'unused-credential-files'));
+  expect(await wf.activeRecoveryGrants(Date.now())).toHaveLength(0);
+  const prompt = recoveryWake(idleSeat(), viewGrant(view), wakeEnv(), false, { comm: true });
+  expect(prompt).not.toContain('ops_operator_login');
+});
+
+check('T6: the login handle survives the turn, claim.json carries it, and the next wake resumes GET #1', async () => {
+  const rig = await sidecarRig();
+  try {
+    const source = await doneTask(GOAL, 'T6 句柄源任务');
+    await openEpisode(source);
+    const auth = await doneTask(GOAL, 'T6 批准');
+    const { grant } = await core.recoveryReadGrant(gm, grantInput(source, auth));
+    await rig.pool.adoptRecovery(rig.inst, grant.id);
+    const login = await rig.relay(rig.env.SCK_COMM_DIR, rig.env.SCK_COMM_KEY!, 't6-login', 'ops_operator_login', { alias: RECOVERY_READ_ALIAS });
+    expect(login.ok).toBe(true);
+    const staged = JSON.parse(readFileSync(join(rig.env.SCK_COMM_DIR, 'claim.json'), 'utf8')) as { recovery?: { sessionHandle?: string } };
+    const handle = staged.recovery?.sessionHandle;
+    expect(typeof handle).toBe('string');
+    const running = await grantView(grant.id);
+    expect(running.state).toBe('running');
+    const claim = await rig.pool.adoptRecovery(rig.inst, grant.id);
+    expect(claim?.sessionHandle).toBe(handle);
+    const prompt = recoveryWake(idleSeat(), viewGrant(running, { sessionHandle: claim?.sessionHandle }), wakeEnv(), false, { comm: true });
+    expect(prompt).toContain(handle!);
+    expect(prompt).not.toContain('ops_operator_login');
+    const get = await rig.relay(rig.env.SCK_COMM_DIR, rig.env.SCK_COMM_KEY!, 't6-get1', 'ops_request',
+      { session: handle, method: 'GET', path: RECOVERY_READ_PATHS[0] });
+    expect(get.ok).toBe(true);
+    expect((await grantView(grant.id)).perPath).toEqual([1, 0, 0, 0]);
+  } finally {
+    rig.pool.close();
+    await rm(rig.runDir, { recursive: true, force: true });
+  }
+});
+
+check('T7: a handle opened outside this grant is refused as session_foreign and moves no counter', async () => {
+  const source = await doneTask(GOAL, 'T7 句柄隔离源任务');
+  await openEpisode(source);
+  const auth = await doneTask(GOAL, 'T7 批准');
+  const { grant } = await core.recoveryReadGrant(gm, grantInput(source, auth));
+  const r = await brokerRig(source, grant.id);
+  const foreign = await seedForeignSession(r);
+  const before = { ...r.chain, perPath: [...r.chain.perPath] };
+  const error = await refusal(r.broker.call(r.cred, source, 'ops_request',
+    { session: foreign, method: 'GET', path: RECOVERY_READ_PATHS[0] }, { grantId: grant.id, grantFence: 1 }));
+  expect(error.code).toBe('forbidden');
+  expect(error.message).toContain('grant');
+  expect(r.chain.perPath).toEqual(before.perPath);
+  expect(r.chain.loginAttempts).toBe(before.loginAttempts);
+  const view = await grantView(grant.id);
+  expect(view.refusals).toMatchObject({ session_foreign: 1 });
+  expect(view.lastRefusal).toMatchObject({ outcome: 'session_foreign', tool: 'ops_request' });
+});
+
+check('T8: a running grant whose handle died with the process is stopped(session_lost), not retried', async () => {
+  const rig = await sidecarRig();
+  let second: SidecarPool | undefined;
+  try {
+    const source = await doneTask(GOAL, 'T8 句柄丢失源任务');
+    await openEpisode(source);
+    const auth = await doneTask(GOAL, 'T8 批准');
+    const { grant } = await core.recoveryReadGrant(gm, grantInput(source, auth));
+    await rig.pool.adoptRecovery(rig.inst, grant.id);
+    const login = await rig.relay(rig.env.SCK_COMM_DIR, rig.env.SCK_COMM_KEY!, 't8-login', 'ops_operator_login', { alias: RECOVERY_READ_ALIAS });
+    expect(login.ok).toBe(true);
+    expect((await grantView(grant.id)).state).toBe('running');
+    // A new process over the same channel state: the in-memory handle is gone with the old pool.
+    rig.pool.close();
+    second = new SidecarPool({ core: core as never, workforce: { rotate: async () => eng1 } as never, ops: rig.ops, runDir: rig.runDir,
+      heartbeatMs: 60_000, sweepMs: 20, log: () => undefined });
+    second.env(rig.inst);
+    await expect(second.adoptRecovery(rig.inst, grant.id)).rejects.toThrow(/session_lost/);
+    const view = await grantView(grant.id);
+    expect(view).toMatchObject({ state: 'stopped', stopReason: 'session_lost' });
+    expect(view.sessionPresent).toBe(false);
+    const wf = new Workforce(database, join(dir, 'unused-credential-files'));
+    expect(await wf.activeRecoveryGrants(Date.now())).toHaveLength(0);
+  } finally {
+    second?.close();
+    rig.pool.close();
+    await rm(rig.runDir, { recursive: true, force: true });
+  }
+});
+
+check('T9: each reserve refusal writes a closed-enum row and never moves the counters', async () => {
+  const source = await doneTask(GOAL, 'T9 拒绝入账源任务');
+  await openEpisode(source);
+  const auth = await doneTask(GOAL, 'T9 批准');
+  const { grant } = await core.recoveryReadGrant(gm, grantInput(source, auth));
+  await core.recoveryReadBind(eng1, { grantId: grant.id, fence: 1 });
+  // read_unavailable: a GET before the login.
+  expect(await core.recoveryReadReserve(eng1, { grantId: grant.id, grantFence: 1, kind: 'get', path: RECOVERY_READ_PATHS[0] }))
+    .toMatchObject({ allowed: false, reason: 'read_unavailable' });
+  let view = await grantView(grant.id);
+  expect(view).toMatchObject({ loginAttempts: 0, perPath: [0, 0, 0, 0] });
+  // login_unavailable: the login is already settled successfully.
+  const login = await core.recoveryReadReserve(eng1, { grantId: grant.id, grantFence: 1, kind: 'login' });
+  await core.recoveryReadSettle(eng1, { grantId: grant.id, grantFence: 1, callId: login.callId!, kind: 'login', ok: true, outcome: 'login_ok' });
+  expect(await core.recoveryReadReserve(eng1, { grantId: grant.id, grantFence: 1, kind: 'login' }))
+    .toMatchObject({ allowed: false, reason: 'login_unavailable' });
+  // path_order: skipping the first path.
+  expect(await core.recoveryReadReserve(eng1, { grantId: grant.id, grantFence: 1, kind: 'get', path: RECOVERY_READ_PATHS[1] }))
+    .toMatchObject({ allowed: false, reason: 'path_order' });
+  view = await grantView(grant.id);
+  expect(view).toMatchObject({ loginAttempts: 1, perPath: [0, 0, 0, 0] });
+  const get = await core.recoveryReadReserve(eng1, { grantId: grant.id, grantFence: 1, kind: 'get', path: RECOVERY_READ_PATHS[0] });
+  await core.recoveryReadSettle(eng1, { grantId: grant.id, grantFence: 1, callId: get.callId!, kind: 'get', path: RECOVERY_READ_PATHS[0], status: 503, ok: true, outcome: 'not_configured_503' });
+  // path_attempted: the same path twice.
+  expect(await core.recoveryReadReserve(eng1, { grantId: grant.id, grantFence: 1, kind: 'get', path: RECOVERY_READ_PATHS[0] }))
+    .toMatchObject({ allowed: false, reason: 'path_attempted' });
+  const status = await core.recoveryReadStatus(gm, { grantId: grant.id });
+  const refusals = status[0]!.calls.filter(call => !call.ok).map(call => call.outcome);
+  expect(refusals).toEqual(expect.arrayContaining(['read_unavailable', 'login_unavailable', 'path_order', 'path_attempted']));
+  expect(status[0]!.grant).toMatchObject({ loginAttempts: 1, perPath: [1, 0, 0, 0] });
+  expect(status[0]!.grant.refusals).toMatchObject({ read_unavailable: 1, login_unavailable: 1, path_order: 1, path_attempted: 1 });
+});
+
+check('T10: pre-try refusals leave visible enum rows without touching the chain', async () => {
+  const source = await doneTask(GOAL, 'T10 pre-try 源任务');
+  await openEpisode(source);
+  const auth = await doneTask(GOAL, 'T10 批准');
+  const { grant } = await core.recoveryReadGrant(gm, grantInput(source, auth));
+  const r = await brokerRig(source, grant.id);
+  const proof = { grantId: grant.id, grantFence: 1 };
+  const call = (tool: string, args: Record<string, unknown>) => r.broker.call(r.cred, source, tool, args, proof);
+  await refusal(call('ops_info', {}));
+  await refusal(call('ops_request', { session: 's_x', method: 'GET', path: RECOVERY_READ_PATHS[0], taskId: source }));
+  await refusal(call('ops_request', { session: 's_x', method: 'POST', path: RECOVERY_READ_PATHS[0] }));
+  await refusal(call('ops_request', { session: 's_x', method: 'GET', path: '/api/ops/other' }));
+  await refusal(call('ops_request', { session: 's_missing', method: 'GET', path: RECOVERY_READ_PATHS[0] }));
+  const foreign = await seedForeignSession(r);
+  await refusal(call('ops_request', { session: foreign, method: 'GET', path: RECOVERY_READ_PATHS[0] }));
+  expect(r.chain).toMatchObject({ loginAttempts: 1, perPath: [0, 0, 0, 0] });
+  expect(r.audits.filter(a => a.action === 'ops_recovery_refuse')).toHaveLength(6);
+  const view = await grantView(grant.id);
+  expect(view.refusals).toMatchObject({
+    not_allowlisted_tool: 1, reserved_arg: 1, method_not_get: 1, path_not_in_grant: 1,
+    session_missing: 1, session_foreign: 1,
+  });
+  expect(view.lastRefusal?.outcome).toBe('session_foreign');
+});
+
+check('T11: sidecar-local refusals land as the same enum audit on the source task', async () => {
+  const rig = await sidecarRig();
+  try {
+    const source = await doneTask(GOAL, 'T11 本地拒绝源任务');
+    await openEpisode(source);
+    const auth = await doneTask(GOAL, 'T11 批准');
+    const { grant } = await core.recoveryReadGrant(gm, grantInput(source, auth));
+    await rig.pool.adoptRecovery(rig.inst, grant.id);
+    await rig.relay(rig.env.SCK_COMM_DIR, rig.env.SCK_COMM_KEY!, 't11-reserved', 'ops_request',
+      { session: 's_x', method: 'GET', path: RECOVERY_READ_PATHS[0], taskId: source });
+    await rig.relay(rig.env.SCK_COMM_DIR, rig.env.SCK_COMM_KEY!, 't11-tool', 'ops_info', {});
+    const view = await grantView(grant.id);
+    expect(view.refusals).toMatchObject({ reserved_arg: 1, not_allowlisted_tool: 1 });
+    expect(view.loginAttempts).toBe(0);
+    expect(view.perPath).toEqual([0, 0, 0, 0]);
+  } finally {
+    rig.pool.close();
+    await rm(rig.runDir, { recursive: true, force: true });
+  }
+});
+
+check('T12: the refusal vocabulary is closed and unknown outcomes are rejected, not stored', async () => {
+  const source = await doneTask(GOAL, 'T12 枚举源任务');
+  await openEpisode(source);
+  const auth = await doneTask(GOAL, 'T12 批准');
+  const { grant } = await core.recoveryReadGrant(gm, grantInput(source, auth));
+  const error = await refusal(core.recoveryReadRefuse(eng1, { grantId: grant.id, outcome: 'free_text_reason' }));
+  expect(error.code).toBe('invalid');
+  const view = await grantView(grant.id);
+  for (const outcome of Object.keys(view.refusals ?? {})) expect(RECOVERY_READ_REFUSALS).toContain(outcome as never);
+  expect(view.refusals).toBeUndefined();
+});
+
+check('T13: the fork marker is still printed under the gate flag and no added case skips silently', async () => {
+  expect(enabled).toBe(true);
+  expect(markerPrinted).toBe(true);
+  const source = readFileSync(join(import.meta.dir, 'recovery-read.fork.test.ts'), 'utf8');
+  expect((source.match(/test\.skipIf\(!enabled\)/g) ?? [])).toHaveLength(1);
+  expect(source).not.toContain(['test', 'skip'].join('.') + '(');
 });
