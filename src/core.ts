@@ -389,6 +389,9 @@ export interface RecoveryReadGrantDbRow {
   created_at: Date | string;
   bound_at?: Date | string;
   closed_at?: Date | string;
+  /** FV06 observability (schema 050): the dispatcher's latest wake attempt and latest skip reason. */
+  last_wake_at?: Date | string;
+  last_skip_reason?: string;
   fence: number;
   version: number;
 }
@@ -4043,6 +4046,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       createdBy: row.created_by, createdAt: this.recoveryIso(row.created_at),
       ...(row.bound_at === undefined ? {} : { boundAt: this.recoveryIso(row.bound_at) }),
       ...(row.closed_at === undefined ? {} : { closedAt: this.recoveryIso(row.closed_at) }),
+      ...(row.last_wake_at === undefined ? {} : { lastWakeAt: this.recoveryIso(row.last_wake_at) }),
+      ...(row.last_skip_reason ? { lastSkipReason: row.last_skip_reason } : {}),
       fence: row.fence,
     };
   }

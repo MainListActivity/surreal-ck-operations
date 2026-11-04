@@ -16,6 +16,10 @@ import { ProjectStore } from '../src/projects.ts';
 import { RECOVERY_READ_ALIAS, RECOVERY_READ_PATHS } from '../src/recovery-read.ts';
 import { LEGACY_SCHEMA_MINIMUM, RECOVERY_READ_TABLES } from '../src/company-release.ts';
 import { readReleaseSchema, verifyReleaseSchema } from '../src/release-schema.ts';
+import { Dispatcher, type SidecarBridge } from '../src/dispatcher/dispatcher.ts';
+import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
+import { DEFAULT_CONFIG, Workforce, type EmployeeInst } from '../src/workforce.ts';
+import type { OwnerDesk } from '../src/owner.ts';
 import { brokerConfig } from './support/ops-world.ts';
 import type { ClaimResult, CreateTask, Evidence } from '../src/contracts.ts';
 
@@ -136,7 +140,7 @@ async function refusal(promise: Promise<unknown>): Promise<Error & { code?: stri
 check('restart bootstrap runs schema 049 and the source task stays done without a new budget', async () => {
   const [installation] = await database.db.query<[{ schema_version?: number } | undefined]>(
     'SELECT schema_version FROM ONLY company_meta:installation;');
-  expect(installation?.schema_version).toBe(49);
+  expect(installation?.schema_version).toBe(50);
   const source = await doneTask(GOAL, '终态源任务');
   await openEpisode(source);
   const before = await core.faultStatus(gm, { taskId: source });
@@ -349,10 +353,10 @@ check('an unsettled inFlight past its deadline becomes stopped(unknown_outcome),
 check('the migrated database proves the schema receipt a 0.3.76 release needs', async () => {
   // The real fork after bootstrap: the marker is 49 and the three tables exist.
   const receipt = await readReleaseSchema(database.db);
-  expect(receipt.schemaVersion).toBe(49);
+  expect(receipt.schemaVersion).toBe(50);
   for (const table of RECOVERY_READ_TABLES) expect(receipt.tables).toContain(table);
   const verified = await verifyReleaseSchema(database.db, '0.3.76');
-  expect(verified).toMatchObject({ schema: 49, schemaVersion: 49 });
+  expect(verified).toMatchObject({ schema: 49, schemaVersion: 50 });
   expect(verified.tables).toEqual([...RECOVERY_READ_TABLES]);
   // An older target keeps the older minimum: 49 is not forced onto a historical version.
   const legacy = await verifyReleaseSchema(database.db, '0.3.75');
@@ -382,7 +386,7 @@ check('an isolated database without the three tables or the marker keeps the rel
     await legacy.close();
     await expect(readReleaseSchema(legacy.db)).rejects.toThrow(/unreadable/);
     // The migrated database the checks above use is untouched by this probe.
-    expect((await readReleaseSchema(database.db)).schemaVersion).toBe(49);
+    expect((await readReleaseSchema(database.db)).schemaVersion).toBe(50);
   } finally {
     await legacy.close().catch(() => undefined);
   }
@@ -401,4 +405,170 @@ check('concurrent issuance creates exactly one chain for a source task', async (
   expect(rejected).toHaveLength(1);
   expect((rejected[0]!.reason as { code?: string }).code).toBe('conflict');
   expect(await core.recoveryReadStatus(gm, { taskId: source })).toHaveLength(1);
+});
+
+// --- dispatcher 2a observability (schema 050) -------------------------------------------------------------------
+// These run the real Dispatcher over the isolated fork: grant reads/writes go to the database, while the Paseo and
+// sidecar faces are fixtures, so each skip/failure path is exercised for real without touching a live session.
+
+function wakeHarness(options: {
+  instances?: EmployeeInst[];
+  statuses?: Record<string, string>;
+  withSidecar?: boolean;
+  adoptRecovery?: (inst: EmployeeInst, grantId?: string) => Promise<unknown>;
+}) {
+  const instances = options.instances ?? [];
+  const agents = new Map(Object.entries(options.statuses ?? {}).map(([id, status]) => [id, { id, status }]));
+  const logs: string[] = [];
+  const sends: Array<{ agentId: string; text: string }> = [];
+  const base = new Workforce(database, join(dir, 'unused-credential-files'));
+  // The pass reads much more than the 2a block; every face other than the grant store is a fixture.
+  const wf = {
+    config: async () => ({ ...DEFAULT_CONFIG, quotaFloorPct: 0, quotaWeeklyFloorPct: 0, sessionMaxWakes: 0, sessionMaxInputK: 0,
+      evalEnabled: false, jevDecisions: false, maxRunning: 8, providerMax: { codex: 8 } }),
+    defs: async () => [],
+    serverNow: async () => Math.floor(Date.now() / 1000),
+    insts: async () => instances,
+    tasks: async () => [],
+    providerHealth: async () => new Map(),
+    newKey: () => `fixture-${randomUUID()}`,
+    openManagerWakes: async () => [],
+    acquireManagerWake: async (input: unknown, token: string) => ({ key: token, token, attempt: 1, input }),
+    markManagerWakeRunning: async () => true,
+    finishManagerWake: async () => true,
+    lastDispatch: async () => undefined,
+    recordDispatch: async () => {},
+    touchWake: async () => {},
+    defHealthy: async () => {},
+    defFailure: async () => 1,
+    pendingEvaluations: async () => [],
+    projectRepos: async () => [],
+    doneTaskIds: async () => [],
+    markHealthy: async () => {},
+    markExhausted: async () => {},
+    disableDef: async () => {},
+    spawnInst: async () => { throw new Error('fixture does not spawn'); },
+    bind: async () => {},
+    retire: async () => {},
+    rotate: async (id: string) => `rotated-${id}`,
+    revokeLease: async () => false,
+    extendLease: async () => true,
+    writeCredentialFile: () => '/dev/null',
+    // Real grant store: activeRecoveryGrants / the schema-050 wake-stamp writes run against the fork database.
+    activeRecoveryGrants: (nowMs: number) => base.activeRecoveryGrants(nowMs),
+    noteRecoveryWake: (grantId: string) => base.noteRecoveryWake(grantId),
+    noteRecoverySkip: (grantId: string, reason: string) => base.noteRecoverySkip(grantId, reason),
+  } as unknown as Workforce;
+  const owner = { applyPending: async () => [], resolveNotice: async () => {}, openNotices: async () => [],
+    triagePending: async () => [], raiseNotice: async () => false } as unknown as OwnerDesk;
+  const paseo: PaseoGateway = {
+    list: async () => agents,
+    status: async id => agents.get(id) ? { status: agents.get(id)!.status, pendingPermissions: 0 } : undefined,
+    lastError: async () => '', logsTail: async () => '', lastInputTokens: async () => 0,
+    spawn: async () => { throw new Error('fixture does not spawn'); },
+    send: async (id: string, prompt: string) => { sends.push({ agentId: id, text: prompt }); agents.get(id)!.status = 'running'; },
+    stop: async () => {}, reload: async () => {}, archive: async () => {},
+    listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {},
+  };
+  const sidecar: SidecarBridge | undefined = options.withSidecar === false ? undefined : {
+    env: inst => ({ SCK_COMM_DIR: `/tmp/${inst.id}`, SCK_COMM_KEY: 'k' }),
+    canReuse: () => true,
+    detachAgent: () => {},
+    claim: async () => undefined,
+    writeScope: async () => [],
+    claimDenial: () => undefined,
+    bindAgent: () => {},
+    commDirFor: id => `/tmp/comm/${id}`,
+    scratchDirFor: id => `/tmp/${id}-scratch`,
+    releaseClaim: async () => {},
+    releaseWorkspace: async () => {},
+    ...(options.adoptRecovery ? { adoptRecovery: options.adoptRecovery } : {}),
+  } as SidecarBridge;
+  const dispatcher = new Dispatcher({
+    workforce: wf, owner, paseo, ...(sidecar ? { sidecar } : {}),
+    env: { opsRepo: dir, sckBin: '/fixture/sck', paseoBin: '/fixture/paseo' },
+    log: message => logs.push(message),
+  });
+  return { dispatcher, logs, sends };
+}
+
+function idleSeat(): EmployeeInst {
+  return { id: 'recovery-eng1', role: 'engineering', def: 'fixture-eng', provider: 'codex', model: 'fixture',
+    paseoAgentId: 'agent-eng1', credentialFile: '/dev/null' } as EmployeeInst;
+}
+
+/** A fresh issued grant for recovery-eng1 on a done source task with an open fault episode. */
+async function issuedGrant(): Promise<string> {
+  const source = await doneTask(GOAL, '唤醒观测源任务');
+  await openEpisode(source);
+  const auth = await doneTask(GOAL, '唤醒观测批准');
+  return (await core.recoveryReadGrant(gm, grantInput(source, auth))).grant.id;
+}
+
+const grantView = async (grantId: string) => (await core.recoveryReadStatus(gm, { grantId }))[0]!.grant;
+
+check('2a: the grant read returns an issued grant on the real fork (a failed read used to look like "no grants")', async () => {
+  // The company fork rejects ORDER BY on a field missing from the selection; the dispatcher turned that parse
+  // error into an empty grant list every tick, so every issued grant silently never woke. Pin the read itself.
+  const grantId = await issuedGrant();
+  const wf = new Workforce(database, join(dir, 'unused-credential-files'));
+  const grants = await wf.activeRecoveryGrants(Math.floor(Date.now() / 1000));
+  expect(grants.map(grant => grant.id)).toContain(grantId);
+});
+
+check('2a: a grant whose employee has no session logs a no_instance skip and stays issued', async () => {
+  const grantId = await issuedGrant();
+  const h = wakeHarness({ instances: [], adoptRecovery: async () => { throw new Error('must not be called'); } });
+  await h.dispatcher.tick();
+  expect(h.logs.some(line => line.includes(`grant ${grantId}`) && line.includes('reason=no_instance'))).toBe(true);
+  expect(h.sends).toHaveLength(0);
+  const view = await grantView(grantId);
+  expect(view.state).toBe('issued');
+  expect(view.lastSkipReason).toBe('no_instance');
+  expect(view.lastWakeAt).toBeUndefined();
+});
+
+check('2a: a busy session logs state=busy and the grant is neither interrupted nor bound', async () => {
+  const grantId = await issuedGrant();
+  const h = wakeHarness({ instances: [idleSeat()], statuses: { 'agent-eng1': 'busy' },
+    adoptRecovery: async () => { throw new Error('must not be called'); } });
+  await h.dispatcher.tick();
+  expect(h.logs.some(line => line.includes(`grant ${grantId}`) && line.includes('reason=state=busy'))).toBe(true);
+  expect(h.sends).toHaveLength(0);
+  const view = await grantView(grantId);
+  expect(view.state).toBe('issued');
+  expect(view.lastSkipReason).toBe('state=busy');
+});
+
+check('2a: an adoptRecovery failure logs failed and the grant stays issued', async () => {
+  const grantId = await issuedGrant();
+  const h = wakeHarness({ instances: [idleSeat()], statuses: { 'agent-eng1': 'idle' },
+    adoptRecovery: async () => { throw new Error('fixture channel bind failure'); } });
+  await h.dispatcher.tick();
+  expect(h.logs.some(line => line.includes(`grant ${grantId}`) && line.includes('failed: fixture channel bind failure'))).toBe(true);
+  const view = await grantView(grantId);
+  expect(view.state).toBe('issued');
+  expect(view.lastSkipReason).toBe('failed');
+  expect(view.lastWakeAt).toBeUndefined();
+});
+
+check('2a: a healthy idle seat binds the grant within one tick and stamps last_wake_at', async () => {
+  const grantId = await issuedGrant();
+  const h = wakeHarness({ instances: [idleSeat()], statuses: { 'agent-eng1': 'idle' },
+    adoptRecovery: async (_inst, id) => core.recoveryReadBind(eng1, { grantId: id!, fence: 1 }) });
+  await h.dispatcher.tick();
+  expect(h.logs.some(line => line.includes(`recovery wake recovery-eng1 for grant ${grantId}`))).toBe(true);
+  expect(h.sends).toHaveLength(1);
+  expect(h.sends[0]!.agentId).toBe('agent-eng1');
+  const view = await grantView(grantId);
+  expect(view.state).toBe('bound');
+  expect(view.lastWakeAt).toBeDefined();
+  expect(view.lastSkipReason).toBeUndefined();
+});
+
+check('the dispatcher states the missing recovery hook once at startup, not once per tick', async () => {
+  const h = wakeHarness({ withSidecar: false });
+  await h.dispatcher.tick();
+  await h.dispatcher.tick();
+  expect(h.logs.filter(line => line === 'recovery wake disabled: sidecar hook missing')).toHaveLength(1);
 });

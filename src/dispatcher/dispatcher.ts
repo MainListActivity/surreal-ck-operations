@@ -734,7 +734,11 @@ export class Dispatcher {
   private lastArtifactSweep = 0;
   private artifactPressure = false;
 
-  constructor(private readonly deps: DispatcherDeps) {}
+  constructor(private readonly deps: DispatcherDeps) {
+    // FV06 startup self-check: without the channel hook the 2a block is skipped whole, so recovery grants would sit
+    // at issued with no wake and no trace. Say it once at start instead of silently doing nothing every tick.
+    if (!this.deps.sidecar?.adoptRecovery) this.log('recovery wake disabled: sidecar hook missing');
+  }
   private log(message: string) { this.deps.log?.(message); }
 
   /** Dispatch-blocked conclusions from the latest pass, keyed by task and phase. Dispatchable work is absent. */
@@ -1211,13 +1215,32 @@ export class Dispatcher {
 
     // 2a. FV06 recovery read grants: wake the named employee with the grant payload only. A busy session is never
     // interrupted, and an employee holding an execution lease is refused by the channel (the grant stays usable).
+    // Every skip is stated once: without these lines a grant that never bound was indistinguishable from one that
+    // was never seen. The 60s retry throttle below stays silent — it is a cadence, not a decision.
     if (this.deps.sidecar?.adoptRecovery) {
-      const grants = (await wf.activeRecoveryGrants?.(now).catch(() => [])) ?? [];
+      // A failed read is a skip of every grant, not "nothing to do": say so, or a broken query looks like an idle pool.
+      const grants = (await wf.activeRecoveryGrants?.(now).catch((error: Error) => {
+        this.log(`recovery wake read failed: ${error.message}`);
+        return [];
+      })) ?? [];
       for (const grant of grants) {
         const inst = byId.get(grant.employeeId);
-        if (!inst || !inst.paseoAgentId) continue;
+        if (!inst) {
+          this.log(`recovery wake skip grant ${grant.id} employee ${grant.employeeId} reason=no_instance`);
+          await wf.noteRecoverySkip?.(grant.id, 'no_instance').catch(() => undefined);
+          continue;
+        }
+        if (!inst.paseoAgentId) {
+          this.log(`recovery wake skip grant ${grant.id} inst ${inst.id} reason=no_agent`);
+          await wf.noteRecoverySkip?.(grant.id, 'no_agent').catch(() => undefined);
+          continue;
+        }
         const state = states.get(inst.id);
-        if (state === 'busy' || state === 'down' || state === 'exhausted') continue;
+        if (state === 'busy' || state === 'down' || state === 'exhausted') {
+          this.log(`recovery wake skip grant ${grant.id} inst ${inst.id} reason=state=${state}`);
+          await wf.noteRecoverySkip?.(grant.id, `state=${state}`).catch(() => undefined);
+          continue;
+        }
         if (now - (this.recoveryWakeAt.get(grant.id) ?? 0) < STANDBY_WAKE_RETRY_SECONDS) continue;
         this.recoveryWakeAt.set(grant.id, now);
         try {
@@ -1229,9 +1252,11 @@ export class Dispatcher {
           this.lastStatus.set(inst.paseoAgentId, 'running');
           await wf.touchWake(inst.id);
           (report.recovery ??= []).push(grant.id);
+          await wf.noteRecoveryWake?.(grant.id).catch(() => undefined);
           this.log(`recovery wake ${inst.id} for grant ${grant.id} on source ${grant.taskId}`);
         } catch (error) {
           this.log(`recovery wake ${inst.id} for grant ${grant.id} failed: ${(error as Error).message}`);
+          await wf.noteRecoverySkip?.(grant.id, 'failed').catch(() => undefined);
         }
       }
     }

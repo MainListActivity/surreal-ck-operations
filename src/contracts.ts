@@ -644,6 +644,9 @@ export interface RecoveryReadGrantRowView {
   createdAt: string;
   boundAt?: string;
   closedAt?: string;
+  /** FV06 observability: the dispatcher's latest wake attempt (success) or the reason it could not wake (skip). */
+  lastWakeAt?: string;
+  lastSkipReason?: string;
   fence: number;
 }
 
