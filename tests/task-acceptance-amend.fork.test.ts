@@ -104,11 +104,11 @@ const amend = (taskId: string, expectedVersion: number, extra: Record<string, un
 
 run('manager acceptance amendment on an in-flight task', () => {
   // The fresh bootstrap of this file runs schema 047 (fault repair credential) and then 048 (this amendment's kind). The
-  // version marker ends at 48, and 047's credential start is recorded, which only the 047 step itself writes.
-  test('a fresh bootstrap runs 047 then 048: the version marker is 48 and the credential start is recorded', async () => {
+  // version marker has reached at least 48, and 047's credential start is recorded, which only the 047 step itself writes.
+  test('a fresh bootstrap runs 047 then 048: the version marker is at least 48 and the credential start is recorded', async () => {
     const [installation] = await database.db.query<[{ schema_version?: number; fault_credential_since?: unknown } | undefined]>(
       'SELECT schema_version, fault_credential_since FROM ONLY company_meta:installation;');
-    expect(installation?.schema_version).toBe(48);
+    expect(installation?.schema_version).toBeGreaterThanOrEqual(48);
     expect(installation?.fault_credential_since).toBeDefined();
   });
 

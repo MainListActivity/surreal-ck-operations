@@ -710,7 +710,10 @@ export class Workforce {
   }>> {
     const [rows] = await this.db.query<[Array<{ id: RecordId; employee: RecordId; source_task: RecordId; alias: string;
       paths: string[]; expires_at: unknown; state: string }>]>(
-      `SELECT id, employee, source_task, alias, paths, expires_at, state FROM recovery_read_grant
+      // The company fork rejects an ORDER BY field that is not in the selection ("Missing order idiom `created_at`
+      // in statement selection"), and the dispatcher swallows a failed read as "no grants" — a grant that never
+      // woke looked exactly like one that was never seen. created_at is selected so the ordering is legal.
+      `SELECT id, employee, source_task, alias, paths, expires_at, state, created_at FROM recovery_read_grant
         WHERE state IN ['issued', 'bound', 'running'] AND expires_at > time::now()
         ORDER BY created_at;`);
     const out = [];
@@ -723,6 +726,25 @@ export class Workforce {
         alias: row.alias, paths: [...row.paths], expiresAt, state: row.state });
     }
     return out;
+  }
+
+  /**
+   * FV06 observability: record the dispatcher's latest wake attempt on the grant row. A successful wake stamps
+   * `last_wake_at` and clears the previous skip reason; it never touches state, counters, limits or the source task.
+   * Best effort by contract — the caller treats a failure as a missing log line, not a dispatch failure.
+   */
+  async noteRecoveryWake(grantId: string): Promise<void> {
+    await this.db.query(
+      `UPDATE $grant SET last_wake_at = time::now(), last_skip_reason = NONE
+        WHERE state IN ['issued', 'bound', 'running'];`,
+      { grant: new RecordId('recovery_read_grant', String(grantId).replace(/^recovery_read_grant:/, '')) });
+  }
+
+  /** FV06 observability: the latest reason the dispatcher could not wake this grant (no_instance/no_agent/state=/failed). */
+  async noteRecoverySkip(grantId: string, reason: string): Promise<void> {
+    await this.db.query(
+      `UPDATE $grant SET last_skip_reason = $reason WHERE state IN ['issued', 'bound', 'running'];`,
+      { grant: new RecordId('recovery_read_grant', String(grantId).replace(/^recovery_read_grant:/, '')), reason });
   }
 
   /**

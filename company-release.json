@@ -1,24 +1,20 @@
 {
-  "version": "0.3.76",
-  "title": "FV06 终态任务恢复取证子租约与真实升级门禁",
+  "version": "0.3.77",
+  "title": "恢复唤醒可观测性与静默失败修复",
   "changes": [
-    "新增 schema 049 三张表：recovery_read_grant（授权与链级计数）、recovery_read_chain（每源任务链头）、recovery_read_call（可读调用审计）。纯增量，旧 release 读不到即忽略。",
-    "gm+manage 签发恢复取证授权：源任务保持 done、禁自授、固定 LCA04_OPS 与四条精确 GET 路径、TTL 1–30 分钟、绑定 taskId/grantId/fence；不改任务、不建预算、不 lift。",
-    "opsScope 增加 proof 绑定的 recovery_read 分支；broker 只放行一次登录、四条顺序 GET 与必要 logout，其余工具与写操作一律拒绝。",
-    "链级原子 reserve/settle：登录一次、每路径一次、顺序固定、inFlight 单飞；非预期结果即停链；rearm 需新授权任务并原样承接计数。",
-    "inFlight 超过 deadline 仍未 settle → stopped(unknown_outcome)，幂等推进并写 recovery_read_stop 审计；不重试、不扩权限。",
-    "未执行的调用改走退款：refundFault 用 CAS 只撤销本次预留，保留此前 failed/attempts/deadline/stopped/incident；真实成功仍按 settleFault 语义结算。",
-    "sidecar 独立 recoveryClaims：拒用户覆盖 taskId/grantId，与执行租约互斥，重载重建，过期/撤销/源任务变化关闭并只丢本地会话。",
-    "dispatcher 按 grant 载荷唤醒被授权员工，不抢占 busy 会话；通道绑定与授权由服务端判定。",
-    "发布门禁新增 recovery-fork：本机隔离公司 fork 官方 runner + 显式 opt-in，skip 不算通过；0.3.76 起 installer 缺同 SHA/服务 Bun/Darwin 回执即拒绝，旧版本沿用两道历史门禁以保回滚。",
-    "升级验证按目标版本要求 schema：0.3.76 起需 schema>=49 与三张表，回读缺失即保持 paused/failed 不记 verified；旧版本沿用旧下限。"
+    "修复恢复唤醒静默失败：activeRecoveryGrants 按 created_at 排序却未选取该字段，公司 fork 拒绝后被当作「没有 grant」；补选字段，读取失败改为 recovery wake read failed 日志。",
+    "2a 三处静默跳过各记一行结构化日志（grantId、instId、reason=no_instance|no_agent|state=busy|down|exhausted）；60s 节流跳过保持静默。",
+    "adoptRecovery 失败保留 failed 日志并记 last_skip_reason=failed；成功唤醒写入 last_wake_at 并清空跳过原因。",
+    "插件宿主 dispatcher 日志同时追加 <serviceHome>/logs/dispatcher.log（ISO 时间戳、append、best effort，写失败不影响调度）。",
+    "schema 050（增量）：recovery_read_grant 增补可选 last_wake_at / last_skip_reason，recovery_read_status 透出；不改 state 机、限额与路径集合。",
+    "启动自检：缺少 sidecar.adoptRecovery 时只记一次 recovery wake disabled: sidecar hook missing。",
+    "fork 回归新增六项：grant 读取根因、no_instance/busy/失败跳过、健康空闲一 tick 内 issued→bound、自检幂等；该文件在 recovery-fork 门禁内，skip 视为失败。"
   ],
   "impact": [
-    "不改变既有任务字段、状态或租约语义；没有 grant 时 ops 调用行为与 0.3.75 一致。",
-    "不重置、不继承、不新建、不自动 lift 故障预算：恢复读取仍按源 taskId|target|phase 记账。",
-    "不产生业务写入：恢复绑定禁用 ensure、workspace 写入与任何 POST，产品侧只发四条限定 GET。",
-    "TTL 仍为 1–30 分钟；旧的 0830 批准与 00:34 阈值不被引用。"
+    "成功路径行为不变；新增仅为日志与两个可选字段。唯一的语义修复是让 2a 的 grant 读取真正生效——恢复唤醒本应如此。",
+    "不改 grant 状态机、登录/每路径限额与既有路径集合；不放宽也不新增任何工具。",
+    "迁移 050 纯增量，旧版 release 读不到两个字段即忽略（RB01）。"
   ],
-  "migration": "新增 schema 049 三张表，纯增量，无数据迁移；旧 release 读不到即忽略（RB01）。",
-  "rollback": "切回 0.3.75（releases/647ea24f…）。schema 049 纯增量，无需数据回滚；已签发的 grant 在旧版自然失效。"
+  "migration": "新增 schema 050 两个可选字段（IF NOT EXISTS，纯增量、无回填）；在 049 的 recovery_read_grant / recovery_read_chain / recovery_read_call 三表基础上只加字段，bootstrap 把 marker 推至 50。旧版 release 读不到即忽略（RB01）。",
+  "rollback": "切回 0.3.76（releases/6ce60ff6…）。schema 050 纯增量，无需数据回滚；已签发 grant 在旧版按原语义处理。"
 }

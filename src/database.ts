@@ -202,6 +202,10 @@ export class CompanyDatabase {
     // 不建预算、不 lift；旧 release 读不到这三张表即忽略（RB01）。
     await this.db.query(loadSchema('049-recovery-read-grant.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 49 WHERE schema_version < 49;');
+    // FV06 恢复唤醒可观测性（编号 050）：只给 recovery_read_grant 增补两个可选字段 last_wake_at / last_skip_reason，
+    // 记录 dispatcher 最近一次唤醒尝试与最近一次跳过原因；不改 state 机、限额、既有路径或任何既有行（RB01）。
+    await this.db.query(loadSchema('050-recovery-read-wake.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 50 WHERE schema_version < 50;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

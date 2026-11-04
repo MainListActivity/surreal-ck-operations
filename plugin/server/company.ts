@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { readProviderQuotas } from "./dispatch";
 import { setAgentModel } from "./vendor/src/dispatcher/agent-model.ts";
+import { dispatcherLogSink } from "./vendor/src/dispatcher/log-sink.ts";
 
 export interface Company {
   upgrades: import("./vendor/src/company-upgrades.ts").CompanyUpgrades;
@@ -178,6 +179,8 @@ export function company(): Promise<Company> {
     });
     const { ExecutionJournal } = await import("./vendor/src/model-routing/journal.ts");
     const modelJournal=new ExecutionJournal(join(serviceHome(),"model-routing","queue"));
+    // One sink for the dispatcher's lifetime: it opens the logs directory once and appends from then on.
+    const dispatcherLog = dispatcherLogSink(serviceHome());
     let routingReady=false;
     const metricStore=telemetry(),requestAgents=new Map<string,string>();
     const modelGateway = await startModelGateway({ready:()=>routingReady,onRequest:()=>modelRanking.trigger(),lease:async ref=>{
@@ -205,7 +208,9 @@ export function company(): Promise<Company> {
         paseoBin: process.env.SCK_PASEO_BIN ?? "/Applications/Paseo.app/Contents/Resources/bin/paseo",
       },
       notify: process.env.SCK_NOTIFY === "0" ? undefined : notify,
-      log: message => console.log(message),
+      // FV06: the dispatcher log also lands in <serviceHome>/logs/dispatcher.log (ISO timestamp, append), so
+      // recovery wake/skip/fail decisions are auditable from the service home instead of only inside Paseo.
+      log: message => { console.log(message); dispatcherLog(message); },
       jev: jevFromEnv(),
       // Host resource admission: free-memory/disk floors pause dispatch on the owner's
       // machine; supervision still runs so stalled leases keep getting reclaimed.

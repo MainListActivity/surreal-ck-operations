@@ -36,6 +36,7 @@ export const RECOVERY_READ_TABLES = ['recovery_read_grant', 'recovery_read_chain
 export const LEGACY_SCHEMA_MINIMUM = 41;
 export const RELEASE_SCHEMA_REQUIREMENTS: ReleaseSchemaRequirement[] = [
   { version: '0.3.76', schema: 49, tables: [...RECOVERY_READ_TABLES] },
+  { version: '0.3.77', schema: 50, tables: [...RECOVERY_READ_TABLES] },
 ];
 /** The requirement that applies to a target version: the newest one that is not newer than the target. */
 export function schemaRequirementFor(version: string): { schema: number; tables: string[] } {
