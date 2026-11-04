@@ -10,7 +10,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ActiveLease, AppendDependencyPrerequisites, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, IndependenceCheckInput, IndependenceCheckView, IndependenceCheckPolicyView, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence, SetIdentityPrincipal, IdentityPrincipalView, FaultStatusView, FaultBudgetView, FaultEpisodeView, FaultRepairView, RecoveryReadGrantInput, RecoveryReadStatusView, RecoveryReadGrantRowView, RecoveryReadCallView, RecoveryReadState, RecoveryReadReserveInput, RecoveryReadReserveResult, RecoveryReadSettleInput } from './contracts.ts';
+import type { ActiveLease, AppendDependencyPrerequisites, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, IndependenceCheckInput, IndependenceCheckView, IndependenceCheckPolicyView, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence, SetIdentityPrincipal, IdentityPrincipalView, FaultStatusView, FaultBudgetView, FaultEpisodeView, FaultRepairView, RecoveryReadGrantInput, RecoveryReadStatusView, RecoveryReadGrantRowView, RecoveryReadCallView, RecoveryReadState, RecoveryReadReserveInput, RecoveryReadReserveResult, RecoveryReadSettleInput, RecoveryReadRefuseInput, RecoveryReadRefusalView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
@@ -80,7 +80,8 @@ import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBS
 import { CompanyError } from './core-errors.ts';
 import {
   RECOVERY_READ_ALIAS, RECOVERY_READ_CALL_DEADLINE_MS, RECOVERY_READ_MAX_CALLS_PER_PATH, RECOVERY_READ_MAX_LOGIN,
-  RECOVERY_READ_PATHS, exactRecoveryPaths, parseRecoveryExpiry,
+  RECOVERY_READ_PATHS, exactRecoveryPaths, isRecoveryReadRefusal, parseRecoveryExpiry, RECOVERY_READ_STOP_REASONS,
+  type RecoveryReadRefusal,
 } from './recovery-read.ts';
 import { parseBrokerConfig } from './ops/config.ts';
 import { assertEmployeeCiBlockAllowed, createCiBillingCheck, isCiBlockCause, refuseEmployeeCiBlock, type CiBillingCheck } from './github-ci-control.ts';
@@ -4065,6 +4066,50 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
+   * Every refusal for this grant, from both faces: reserve refusals are `recovery_read_call` rows with ok=false,
+   * pre-try/sidecar refusals are `ops_recovery_refuse` audit lines. Non-enum outcomes are ignored rather than
+   * shown, so a status read can never claim a refusal reason the contract does not define.
+   */
+  private async recoveryRefusalsOf(row: RecoveryReadGrantDbRow): Promise<RecoveryReadRefusalView[]> {
+    const grantId = this.recoveryKey(normalizedId(row.id));
+    const out: RecoveryReadRefusalView[] = [];
+    const [calls] = await this.db.query<[Array<{ outcome: string; kind: string; path?: string; at: unknown }>]>(
+      'SELECT outcome, kind, path, at FROM recovery_read_call WHERE grant = $grant AND ok = false ORDER BY at ASC LIMIT 50;',
+      { grant: id('recovery_read_grant', grantId) });
+    for (const call of calls ?? []) {
+      if (!isRecoveryReadRefusal(call.outcome)) continue;
+      const tool = call.kind === 'login' ? 'ops_operator_login' : call.kind === 'get' ? 'ops_request' : 'ops_logout';
+      out.push({ outcome: call.outcome, at: this.recoveryIso(call.at), tool, ...(call.path ? { path: String(call.path) } : {}) });
+    }
+    const [audits] = await this.db.query<[Array<{ evidence: string; at: unknown }>]>(
+      "SELECT evidence, at FROM audit WHERE task = $task AND action = 'ops_recovery_refuse' ORDER BY at ASC LIMIT 50;",
+      { task: row.source_task });
+    for (const audit of audits ?? []) {
+      try {
+        const parsed = JSON.parse(String(audit.evidence ?? '')) as { grantId?: string; outcome?: string; tool?: string; path?: string };
+        if (parsed.grantId && parsed.grantId !== grantId) continue;
+        if (!isRecoveryReadRefusal(parsed.outcome)) continue;
+        out.push({ outcome: parsed.outcome, at: this.recoveryIso(audit.at),
+          ...(parsed.tool ? { tool: parsed.tool } : {}), ...(parsed.path ? { path: parsed.path } : {}) });
+      } catch { /* non-JSON audit evidence is not a refusal */ }
+    }
+    out.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+    return out;
+  }
+
+  /** Status carries the refusal summary and whether the chain has a live login handle (the handle itself stays in the sidecar). */
+  private async recoveryStatusView(row: RecoveryReadGrantDbRow): Promise<RecoveryReadGrantRowView> {
+    const view = this.recoveryView(row);
+    const refusals = await this.recoveryRefusalsOf(row);
+    const counts: Record<string, number> = {};
+    for (const refusal of refusals) counts[refusal.outcome] = (counts[refusal.outcome] ?? 0) + 1;
+    return {
+      ...view, ...(refusals.length > 0 ? { refusals: counts, lastRefusal: refusals[refusals.length - 1]! } : {}),
+      sessionPresent: row.state === 'running',
+    };
+  }
+
+  /**
    * H6：inFlight 超过 deadline 仍未 settle（进程崩溃、插件重载、丢失 settle）时，链级终态是
    * stopped(unknown_outcome)，该路径不重试。这里做一次幂等推进；并发 settle 或另一次 stop 赢了就返回 false。
    */
@@ -4126,7 +4171,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     }
     rows = refreshed;
     const views: RecoveryReadStatusView[] = [];
-    for (const row of rows) views.push({ grant: this.recoveryView(row), calls: await this.recoveryCallsOf(asId(row.id)) });
+    for (const row of rows) views.push({ grant: await this.recoveryStatusView(row), calls: await this.recoveryCallsOf(asId(row.id)) });
     return views;
   }
 
@@ -4371,13 +4416,18 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       // 必要清理永远放行：不递增、不看状态、不要求登录成功。
       return { allowed: true, kind: 'logout', callId: randomUUID(), message: 'logout allowed' };
     }
-    const refuse = (reason: string, message: string): RecoveryReadReserveResult => ({ allowed: false, kind: input.kind, ...(input.path ? { path: input.path } : {}), reason, message });
-    if (this.recoveryMs(grant.expires_at) <= Date.now()) return refuse('grant_expired', 'Recovery read grant expired');
-    if (grant.state === 'revoked') return refuse('grant_revoked', 'Recovery read grant was revoked');
-    if (grant.state === 'expired') return refuse('grant_expired', 'Recovery read grant expired');
-    if (grant.state === 'stopped') return refuse('grant_stopped', `Recovery read chain stopped (${grant.stop_reason ?? 'unknown'})`);
-    if (grant.state === 'completed') return refuse('grant_completed', 'Recovery read chain already completed');
-    if (grant.state === 'issued') return refuse('not_bound', 'Recovery read grant is not bound to a channel');
+    // 拒绝也要入账：写一条 ok=false 的 call 行（枚举 outcome），但绝不递增 login_attempts/per_path——
+    // “被拒”与“调用过”是两件事。busy 每 grant 每分钟最多一条，避免并发重试刷屏。
+    const refuse = async (outcome: RecoveryReadRefusal, message: string): Promise<RecoveryReadReserveResult> => {
+      await this.recoveryRefusalRow(grant, input, outcome).catch(() => undefined);
+      return { allowed: false, kind: input.kind, ...(input.path ? { path: input.path } : {}), reason: outcome, message };
+    };
+    if (this.recoveryMs(grant.expires_at) <= Date.now()) return refuse('expired', 'Recovery read grant expired');
+    if (grant.state === 'revoked') return refuse('revoked', 'Recovery read grant was revoked');
+    if (grant.state === 'expired') return refuse('expired', 'Recovery read grant expired');
+    if (grant.state === 'stopped') return refuse('stopped', `Recovery read chain stopped (${grant.stop_reason ?? 'unknown'})`);
+    if (grant.state === 'completed') return refuse('completed', 'Recovery read chain already completed');
+    if (grant.state === 'issued') return refuse('grant_not_bound', 'Recovery read grant is not bound to a channel');
     if (grant.in_flight) return refuse('busy', 'Recovery read is busy with another call');
     const source = await this.db.select<{ state?: string }>(id('task', asId(grant.source_task)));
     if (source?.state !== 'done') return refuse('source_changed', 'Recovery read source task is no longer done');
@@ -4408,7 +4458,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     }
     // GET：只允许固定顺序里的下一条。
     const index = RECOVERY_READ_PATHS.indexOf(input.path as never);
-    if (index < 0 || grant.paths[index] !== input.path) return refuse('path_not_allowlisted', 'Path is not in this grant');
+    if (index < 0 || grant.paths[index] !== input.path) return refuse('path_not_in_grant', 'Path is not in this grant');
     if (grant.state !== 'running') return refuse('read_unavailable', 'Recovery read GETs are only available after a successful login');
     const perPath = grant.per_path ?? [0, 0, 0, 0];
     if ((perPath[index] ?? 0) >= (grant.max_calls_per_path ?? RECOVERY_READ_MAX_CALLS_PER_PATH)) return refuse('path_attempted', 'This path was already called');
@@ -4500,20 +4550,74 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     });
   }
 
-  /** 通道关闭：审计 recovery_read_close；过期则 expired，源任务离开 done 则 stopped(source_changed)。 */
-  async recoveryReadClose(credential: Credential, input: { grantId: string; fence: number; reason: string }): Promise<void> {
+  /**
+   * A reserve refusal is written as an ok=false call row. It never moves login_attempts/per_path: only a real
+   * reservation does. busy is deduped to one row per grant per minute so concurrent retries cannot flood status.
+   */
+  private async recoveryRefusalRow(grant: RecoveryReadGrantDbRow, input: RecoveryReadReserveInput, outcome: RecoveryReadRefusal): Promise<void> {
+    const grantId = this.recoveryKey(normalizedId(grant.id));
+    if (outcome === 'busy') {
+      const [recent] = await this.db.query<[Array<{ id: RecordId }>]>(
+        `SELECT id FROM recovery_read_call WHERE grant = $grant AND ok = false AND outcome = 'busy'
+           AND at > time::now() - 60s LIMIT 1;`, { grant: id('recovery_read_grant', grantId) });
+      if ((recent ?? []).length > 0) return;
+    }
+    await this.recoveryCallRow(grantId, {
+      grantId, grantFence: grant.fence, callId: '', kind: input.kind,
+      ...(input.path ? { path: input.path } : {}), status: 0, ok: false, outcome,
+    }, 0);
+  }
+
+  /**
+   * A refusal that never reached the chain reserve (broker pre-try or sidecar-local) is audited on the source task
+   * with the same closed outcome enum. It writes no row and moves no counter; it exists so "not sent" is visible.
+   */
+  async recoveryReadRefuse(credential: Credential, input: RecoveryReadRefuseInput): Promise<void> {
+    const actor = await this.authenticate(credential);
+    if (!isRecoveryReadRefusal(input.outcome)) throw new CompanyError('invalid', 'Invalid recovery refusal outcome');
+    let sourceTask: RecordId | undefined;
+    if (input.grantId) {
+      const row = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', this.recoveryKey(input.grantId)));
+      if (!row || asId(row.employee) !== actor.employeeId) throw new CompanyError('not_found', 'Recovery read grant not found for this employee');
+      sourceTask = row.source_task;
+    } else if (input.sourceTaskId) {
+      requireText(input.sourceTaskId, 'sourceTaskId', 1, 200);
+      const task = await this.db.select<{ id: RecordId }>(id('task', input.sourceTaskId));
+      if (!task) throw new CompanyError('not_found', 'Recovery refusal source task not found');
+      sourceTask = task.id;
+    }
+    if (!sourceTask) throw new CompanyError('invalid', 'Recovery refusal needs a grant or source task');
+    const evidence = JSON.stringify({
+      ...(input.grantId ? { grantId: this.recoveryKey(input.grantId) } : {}),
+      outcome: input.outcome, ...(input.tool ? { tool: input.tool } : {}), ...(input.path ? { path: input.path } : {}),
+    }).slice(0, 4000);
+    await this.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: 'ops_recovery_refuse',
+      evidence: $evidence, at: time::now() };`, { task: sourceTask, actor: id('employee', actor.employeeId), evidence });
+  }
+
+  /**
+   * 通道关闭：审计 recovery_read_close；过期则 expired，源任务离开 done 则 stopped(source_changed)。
+   * stopReason（如 session_lost）是通道自己确认的终态：句柄丢失时把 grant 收口，不重登、不空转到过期。
+   */
+  async recoveryReadClose(credential: Credential, input: { grantId: string; fence: number; reason: string; stopReason?: string }): Promise<void> {
     const actor = await this.authorized(credential);
     const grantId = this.recoveryKey(input.grantId);
     const grant = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
     if (!grant || asId(grant.employee) !== actor.employeeId || grant.fence !== input.fence) {
       throw new CompanyError('forbidden', 'Recovery read grant proof does not match');
     }
+    const requested = input.stopReason === undefined ? undefined : input.stopReason;
+    if (requested !== undefined && !(RECOVERY_READ_STOP_REASONS as readonly string[]).includes(requested)) {
+      throw new CompanyError('invalid', 'Invalid recovery stop reason');
+    }
     const source = await this.db.select<{ state?: string }>(id('task', asId(grant.source_task)));
     const now = Date.now();
-    const state: RecoveryReadState | undefined = grant.state === 'revoked' || grant.state === 'completed' ? undefined
-      : this.recoveryMs(grant.expires_at) <= now ? 'expired'
-        : source?.state !== 'done' ? 'stopped' : undefined;
-    const stopReason = state === 'stopped' ? 'source_changed' : state === 'expired' ? 'expired' : '';
+    const active = grant.state === 'issued' || grant.state === 'bound' || grant.state === 'running';
+    const state: RecoveryReadState | undefined = requested !== undefined ? (active ? 'stopped' : undefined)
+      : grant.state === 'revoked' || grant.state === 'completed' ? undefined
+        : this.recoveryMs(grant.expires_at) <= now ? 'expired'
+          : source?.state !== 'done' ? 'stopped' : undefined;
+    const stopReason: string = requested ?? (state === 'stopped' ? 'source_changed' : state === 'expired' ? 'expired' : '');
     const sets = ['closed_at = time::now()', 'in_flight = NONE'];
     if (state) sets.push('state = $state');
     if (stopReason) sets.push('stop_reason = $stopReason');

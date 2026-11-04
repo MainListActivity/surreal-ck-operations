@@ -647,7 +647,19 @@ export interface RecoveryReadGrantRowView {
   /** FV06 observability: the dispatcher's latest wake attempt (success) or the reason it could not wake (skip). */
   lastWakeAt?: string;
   lastSkipReason?: string;
+  /** FV06 refusals (status only): counts by the fixed refusal enum, the latest one, and whether a login handle exists. */
+  refusals?: Record<string, number>;
+  lastRefusal?: RecoveryReadRefusalView;
+  sessionPresent?: boolean;
   fence: number;
+}
+
+/** One recorded refusal, either a reserve refusal (a row) or a pre-try/local refusal (an audit line). */
+export interface RecoveryReadRefusalView {
+  outcome: string;
+  at: string;
+  tool?: string;
+  path?: string;
 }
 
 export interface RecoveryReadCallView {
@@ -693,6 +705,16 @@ export interface RecoveryReadSettleInput {
   ok: boolean;
   outcome: string;
   bodyDigest?: string;
+}
+
+/** A refusal that never reached the chain reserve (broker pre-try or sidecar-local). Audited, never counted. */
+export interface RecoveryReadRefuseInput {
+  grantId?: string;
+  grantFence?: number;
+  sourceTaskId?: TaskId;
+  outcome: string;
+  tool?: string;
+  path?: string;
 }
 
 export interface SessionRef {
@@ -1584,7 +1606,9 @@ export interface CompanyCore {
   /** FV06: atomic post-call settle: records the outcome, clears inFlight, advances or stops the chain. */
   recoveryReadSettle?(credential: Credential, input: RecoveryReadSettleInput): Promise<void>;
   /** FV06: channel close — audited; expires/stops the grant when the source moved or the TTL passed. */
-  recoveryReadClose?(credential: Credential, input: { grantId: string; fence: number; reason: string }): Promise<void>;
+  recoveryReadClose?(credential: Credential, input: { grantId: string; fence: number; reason: string; stopReason?: string }): Promise<void>;
+  /** FV06: record an enum refusal that never reached reserve (pre-try or sidecar-local), attached to the source task. */
+  recoveryReadRefuse?(credential: Credential, input: RecoveryReadRefuseInput): Promise<void>;
   /**
    * Dispatcher-only: hand an execute-phase engineering task to a live engineer when the bound implementer's session is
    * gone for good (archived, missing, or a failure that cannot be restarted). Same compare-and-set write as the

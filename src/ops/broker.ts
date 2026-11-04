@@ -13,8 +13,8 @@ import { join, resolve } from 'node:path';
 import type { CompanyCore, OpsScope, RecoveryReadScope } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
 import {
-  RECOVERY_READ_ALIAS, RECOVERY_READ_PATHS, RECOVERY_READ_TOOLS, classifyRecoveryRead, recoveryBodyDigest,
-  type RecoveryReadTool,
+  RECOVERY_READ_ALIAS, RECOVERY_READ_PATHS, RECOVERY_READ_TOOLS, RECOVERY_RESERVED_ARGS, classifyRecoveryRead, recoveryBodyDigest,
+  type RecoveryReadRefusal, type RecoveryReadTool,
 } from '../recovery-read.ts';
 import { faultFactsOf, type FaultPhase, type FaultRefund, type FaultTargetKind } from '../faults.ts';
 import { lanIPv4 } from '../preview-core.ts';
@@ -251,6 +251,15 @@ const INVITE_WAIT_MS = 480_000;         // total budget per tool call; a same-ke
 
 const invalid = (message: string) => new CompanyError('invalid', message);
 
+/**
+ * A pre-try recovery refusal: the closed outcome rides on the error so `call()` can audit exactly that name.
+ * The code stays the shape the employee already sees (forbidden/not_found/conflict).
+ */
+function recoveryRefusal(outcome: RecoveryReadRefusal, message: string,
+  code: 'forbidden' | 'not_found' | 'conflict' = 'forbidden'): CompanyError {
+  return Object.assign(new CompanyError(code, message), { recoveryOutcome: outcome });
+}
+
 /** Last few sanitized login hops for audit lines: enough to locate a flow, small enough to stay readable. */
 const tailHops = (trace: string, n = 4): string => trace.split(' | ').slice(-n).join(' | ');
 
@@ -432,7 +441,18 @@ export class OpsBroker {
       // fail-closed：任何不在 grant 允许面里的工具都在这里被拒，连 reserve 都不进入。
       if (!scope.recovery) throw new CompanyError('forbidden', 'Recovery read scope is incomplete');
       ctx.recovery = scope.recovery;
-      this.enforceRecoveryTool(ctx, tool, args, scope.recovery);
+      // 拒绝必须可见（d15cbecb §6.3）：pre-try 拒绝先写一条 ops_recovery_refuse 审计再抛，证据只有枚举原因，
+      // 没有 session/token。它不进入下面的 fault reserve，也不消耗链级计数。
+      try {
+        this.enforceRecoveryTool(ctx, tool, args, scope.recovery);
+      } catch (error) {
+        const outcome = (error as { recoveryOutcome?: RecoveryReadRefusal }).recoveryOutcome ?? 'grant_not_bound';
+        await this.audit(ctx, 'ops_recovery_refuse', JSON.stringify({
+          grantId: scope.recovery.grantId, outcome, tool,
+          ...(typeof args.path === 'string' ? { path: args.path } : {}),
+        })).catch(() => undefined);
+        throw error;
+      }
     }
     // The fault ledger's elapsedMs is the call's own monotone wall time, from here to the failure —
     // early failures and budget-exhausted logins included, never a trace sum (the trace caps its tail).
@@ -600,38 +620,39 @@ export class OpsBroker {
 
   /**
    * FV06 恢复通道的 fail-closed 允许面：只放行一次登录、四条的固定顺序 GET 和必要的本地 logout。
-   * 证明（grantId/fence）只来自通道，参数里带这些键一律拒绝。
+   * 证明（grantId/fence）只来自通道，参数里带这些键一律拒绝。每个拒绝都带一个固定的枚举 outcome，
+   * 由 call() 的 pre-try 审计写出——决定“没发出去”和“被拒”必须能在状态面区分。
    */
   private enforceRecoveryTool(ctx: Ctx, tool: string, args: Args, grant: RecoveryReadScope): void {
     if (!(RECOVERY_READ_TOOLS as readonly string[]).includes(tool)) {
-      throw new CompanyError('forbidden', `Recovery read allows only ${RECOVERY_READ_TOOLS.join(', ')}; ${tool} is refused`);
+      throw recoveryRefusal('not_allowlisted_tool', `Recovery read allows only ${RECOVERY_READ_TOOLS.join(', ')}; ${tool} is refused`);
     }
-    for (const key of ['taskId', 'sourceTaskId', 'grantId', 'grantFence', 'fence']) {
-      if (args[key] !== undefined) throw new CompanyError('forbidden', `Recovery read proof comes from the channel; ${key} must not be supplied`);
+    for (const key of RECOVERY_RESERVED_ARGS) {
+      if (args[key] !== undefined) throw recoveryRefusal('reserved_arg', `Recovery read proof comes from the channel; ${key} must not be supplied`);
     }
     // H5：session 绑定在 reserve 之前校验，被拒的调用不消耗链级计数。方法/路径先判，才能给出精确的拒绝原因。
     if (tool === 'ops_operator_login') {
       const alias = typeof args.alias === 'string' ? canonicalAlias(args.alias) : '';
-      if (alias !== grant.alias) throw new CompanyError('forbidden', `Recovery read login must use the grant alias ${grant.alias}`);
+      if (alias !== grant.alias) throw recoveryRefusal('login_unavailable', `Recovery read login must use the grant alias ${grant.alias}`);
       return;
     }
     if (tool === 'ops_request') {
-      if (String(args.method ?? '').toUpperCase() !== 'GET') throw new CompanyError('forbidden', 'Recovery read allows GET only');
+      if (String(args.method ?? '').toUpperCase() !== 'GET') throw recoveryRefusal('method_not_get', 'Recovery read allows GET only');
       const path = args.path;
       if (typeof path !== 'string' || !(RECOVERY_READ_PATHS as readonly string[]).includes(path) || !grant.paths.includes(path)) {
-        throw new CompanyError('forbidden', 'Path is not in this recovery read grant');
+        throw recoveryRefusal('path_not_in_grant', 'Path is not in this recovery read grant');
       }
-      if (args.body !== undefined) throw new CompanyError('forbidden', 'Recovery read GET takes no body');
+      if (args.body !== undefined) throw recoveryRefusal('reserved_arg', 'Recovery read GET takes no body');
     }
     let session: OpsSession | undefined;
     try {
       session = this.sessions.get(args.session, ctx.scope.actor.employeeId, ctx.scope.project, ctx.env);
     } catch (error) {
       // logout 在进程重启后可能已经没有本地句柄：仍然允许走到本地 not_found（不重登、不声称远端注销）。
-      if (tool === 'ops_request') throw error;
+      if (tool === 'ops_request') throw recoveryRefusal('session_missing', (error as Error).message, 'not_found');
     }
     if (session && (session.grantId !== grant.grantId || session.alias !== grant.alias)) {
-      throw new CompanyError('forbidden', 'Recovery read can only use a session opened under this grant and alias');
+      throw recoveryRefusal('session_foreign', 'Recovery read can only use a session opened under this grant and alias');
     }
   }
 

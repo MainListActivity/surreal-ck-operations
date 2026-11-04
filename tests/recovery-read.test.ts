@@ -129,7 +129,7 @@ function recoveryRig(chain: ChainState, bodies: Partial<Record<string, [number, 
       }
       if (chain.state !== 'running') return { allowed: false, kind: 'get', reason: 'read_unavailable', message: 'GETs need a successful login' };
       const index = RECOVERY_READ_PATHS.indexOf(input.path as never);
-      if (index < 0) return { allowed: false, kind: 'get', reason: 'path_not_allowlisted', message: 'Path is not in this grant' };
+      if (index < 0) return { allowed: false, kind: 'get', reason: 'path_not_in_grant', message: 'Path is not in this grant' };
       if (chain.perPath[index] >= 1) return { allowed: false, kind: 'get', reason: 'path_attempted', message: 'This path was already called' };
       if (index > 0 && chain.perPath[index - 1] !== 1) return { allowed: false, kind: 'get', reason: 'path_order', message: 'Paths must be called in order' };
       chain.perPath[index]++;

@@ -17,7 +17,7 @@ import {
 } from "./vendor/src/comm.ts";
 import { serviceHome } from "./env";
 import type { ActiveLease, ClaimResult, CompanyCore, Evidence, LeaseProof, RecoveryReadGrantRowView, TaskView, WorktreeAssignment, WriteScopeHolder } from "./vendor/src/contracts.ts";
-import { RECOVERY_READ_TOOLS, RECOVERY_RESERVED_ARGS } from "./vendor/src/recovery-read.ts";
+import { RECOVERY_READ_TOOLS, RECOVERY_RESERVED_ARGS, type RecoveryReadRefusal, type RecoveryReadStopReason } from "./vendor/src/recovery-read.ts";
 import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workforce.ts";
 import { fitAttachedNotices, guardRelayResponse, type NoticeCut } from "./vendor/src/response-budget.ts";
 import { isPaged, parseReclaimInput, parseWorktreeInput, taskIdOf } from "./vendor/src/query-input.ts";
@@ -218,6 +218,12 @@ export interface RecoveryClaim {
   alias: string;
   paths: string[];
   expiresAt: number;
+  /**
+   * The login handle the broker issued under this grant. It lives in this process only (never persisted as a token)
+   * and is mirrored into claim.json so the next wake can carry it. A restart drops it, which is why a running chain
+   * is closed as stopped(session_lost) rather than silently retried (d15cbecb §6.2).
+   */
+  sessionHandle?: string;
 }
 
 const ORPHAN_PREFIX = "orphaned-";
@@ -809,11 +815,23 @@ export class SidecarPool {
     if (grant.state !== "issued" && grant.state !== "bound" && grant.state !== "running") {
       throw Object.assign(new Error(`recovery grant is ${grant.state}`), { code: "no_grant" });
     }
-    if (Date.parse(grant.expiresAt) <= Date.now()) throw Object.assign(new Error("recovery grant expired"), { code: "no_grant" });
+    if (Date.parse(grant.expiresAt) <= Date.now()) {
+      await this.auditRecoveryRefusal(inst.id, { grantId: grant.id, taskId: grant.taskId, grantFence: grant.fence }, "expired", "channel");
+      throw Object.assign(new Error("recovery grant expired"), { code: "no_grant" });
+    }
+    // A running chain has already spent its single login. If this process holds no handle for it (plugin reload,
+    // restart, dropped session), the honest closure is stopped(session_lost): rebinding would send the employee into
+    // GETs that can never be authorized, and re-login is not allowed. No automatic login ever happens here.
+    const prior = this.recoveryClaims.get(inst.id);
+    if (grant.state === "running" && (!prior || prior.grantId !== grant.id || !prior.sessionHandle)) {
+      await this.stopRecovery(inst.id, grant.id, grant.fence, "session_lost");
+      throw Object.assign(new Error("recovery login handle was lost; grant stopped (session_lost)"), { code: "no_grant" });
+    }
     const bound = await core.recoveryReadBind(cred, { grantId: grant.id, fence: grant.fence });
     const claim: RecoveryClaim = {
       instId: inst.id, taskId: bound.taskId, grantId: bound.id, grantFence: bound.fence,
       alias: bound.alias, paths: [...bound.paths], expiresAt: Date.parse(bound.expiresAt),
+      ...(prior?.grantId === bound.id && prior.sessionHandle ? { sessionHandle: prior.sessionHandle } : {}),
     };
     this.recoveryClaims.set(inst.id, claim);
     const dir = commDir(this.deps.runDir, inst.id);
@@ -823,7 +841,8 @@ export class SidecarPool {
     // claim.json carries a `recovery` section — never a lease proof: submit/review/checkpoint stay impossible.
     writeFileAtomic(join(dir, "claim.json"), JSON.stringify({
       recovery: { taskId: claim.taskId, grantId: claim.grantId, grantFence: claim.grantFence,
-        alias: claim.alias, paths: claim.paths, expiresAt: new Date(claim.expiresAt).toISOString() },
+        alias: claim.alias, paths: claim.paths, expiresAt: new Date(claim.expiresAt).toISOString(),
+        ...(claim.sessionHandle ? { sessionHandle: claim.sessionHandle } : {}) },
       evidenceDir, orphanedArtifacts: orphanedArtifacts(evidenceDir),
     }));
     this.log(`sidecar bound recovery grant ${claim.grantId} for ${inst.id} on source ${claim.taskId}`);
@@ -831,8 +850,9 @@ export class SidecarPool {
   }
 
   /** FV06: close the local binding (revoked/expired/source changed/execution claim). Drops only this grant's
-   *  local sessions; it never logs in again and never claims a remote logout. */
-  async closeRecovery(instId: string, reason: string): Promise<void> {
+   *  local sessions; it never logs in again and never claims a remote logout. A caller-confirmed terminal reason
+   *  (session_lost) is written through to the grant so status shows it. */
+  async closeRecovery(instId: string, reason: string, stopReason?: RecoveryReadStopReason): Promise<void> {
     const claim = this.recoveryClaims.get(instId);
     if (!claim) return;
     this.recoveryClaims.delete(instId);
@@ -840,7 +860,8 @@ export class SidecarPool {
     try { this.deps.ops?.releaseGrant?.(claim.grantId); } catch { /* local cleanup only */ }
     try {
       const cred = await this.credentialFor(instId);
-      await this.deps.core.recoveryReadClose?.(cred, { grantId: claim.grantId, fence: claim.grantFence, reason });
+      await this.deps.core.recoveryReadClose?.(cred, { grantId: claim.grantId, fence: claim.grantFence, reason,
+        ...(stopReason ? { stopReason } : {}) });
     } catch (error) {
       this.log(`recovery close ${claim.grantId} for ${instId} failed: ${(error as Error).message}`);
     }
@@ -852,11 +873,67 @@ export class SidecarPool {
     this.log(`sidecar closed recovery grant ${claim.grantId} for ${instId}: ${reason}`);
   }
 
+  /**
+   * Close a grant the channel never bound in this process (a running chain whose handle died with the previous
+   * process). Writes stopped(session_lost) to the server and removes any stale claim.json for that grant.
+   */
+  private async stopRecovery(instId: string, grantId: string, fence: number, stopReason: RecoveryReadStopReason): Promise<void> {
+    try {
+      const cred = await this.credentialFor(instId);
+      await this.deps.core.recoveryReadClose?.(cred, { grantId, fence, reason: stopReason, stopReason });
+      this.log(`sidecar stopped recovery grant ${grantId} for ${instId}: ${stopReason}`);
+    } catch (error) {
+      this.log(`recovery stop ${grantId} for ${instId} failed: ${(error as Error).message}`);
+    }
+    const path = join(commDir(this.deps.runDir, instId), "claim.json");
+    const prior = readJsonFile<{ recovery?: { grantId?: string } }>(path);
+    if (prior?.recovery?.grantId === grantId) {
+      try { unlinkSync(path); } catch { /* already gone */ }
+    }
+  }
+
+  /** The handle is already handed to the employee in the tool result; mirroring it into claim.json adds no new exposure. */
+  private captureRecoverySession(instId: string, value: unknown): void {
+    const claim = this.recoveryClaims.get(instId);
+    const session = value && typeof value === "object" && "session" in value
+      ? (value as { session?: unknown }).session : undefined;
+    if (!claim || typeof session !== "string" || session.length === 0) return;
+    claim.sessionHandle = session;
+    const dir = commDir(this.deps.runDir, instId);
+    const evidenceDir = join(dirname(this.deps.runDir), "evidence", claim.taskId);
+    writeFileAtomic(join(dir, "claim.json"), JSON.stringify({
+      recovery: { taskId: claim.taskId, grantId: claim.grantId, grantFence: claim.grantFence,
+        alias: claim.alias, paths: claim.paths, expiresAt: new Date(claim.expiresAt).toISOString(),
+        sessionHandle: session },
+      evidenceDir, orphanedArtifacts: orphanedArtifacts(evidenceDir),
+    }));
+    this.log(`sidecar stored recovery session for grant ${claim.grantId} (${instId})`);
+  }
+
+  /** A refusal the sidecar made before the broker saw the call: same closed enum, attached to the source task. */
+  private async auditRecoveryRefusal(instId: string, grant: { grantId?: string; taskId?: string; grantFence?: number } | undefined,
+    outcome: RecoveryReadRefusal, tool: string): Promise<void> {
+    try {
+      if (!this.deps.core.recoveryReadRefuse) return;
+      const cred = await this.credentialFor(instId);
+      await this.deps.core.recoveryReadRefuse(cred, {
+        ...(grant?.grantId ? { grantId: grant.grantId, grantFence: grant.grantFence } : {}),
+        ...(grant?.taskId ? { sourceTaskId: grant.taskId } : {}),
+        outcome, tool,
+      });
+    } catch (error) {
+      this.log(`recovery refusal ${outcome} for ${instId} not recorded: ${(error as Error).message.slice(0, 120)}`);
+    }
+  }
+
   /** FV06: the server grant is the authority; a local binding that is no longer active is closed, not renewed. */
   private async validateRecovery(instId: string): Promise<void> {
     const claim = this.recoveryClaims.get(instId);
     if (!claim) return;
-    if (claim.expiresAt <= Date.now()) return this.closeRecovery(instId, "expired");
+    if (claim.expiresAt <= Date.now()) {
+      await this.auditRecoveryRefusal(instId, claim, "expired", "channel");
+      return this.closeRecovery(instId, "expired");
+    }
     // One server check per minute and instance; local expiry is checked every sweep.
     const last = this.recoveryCheckedAt.get(instId) ?? 0;
     if (Date.now() - last < 60_000) return;
@@ -1123,22 +1200,35 @@ export class SidecarPool {
       const recovery = request.recovery;
       if (gateway === ops && recovery) {
         const bound = this.recoveryClaims.get(instId);
-        if (bound !== recovery) throw Object.assign(new Error("no active recovery read grant for this request"), { code: "no_grant" });
-        if (requestLease) throw Object.assign(new Error("execution and recovery bindings cannot both be active"), { code: "no_grant" });
+        if (bound !== recovery) {
+          await this.auditRecoveryRefusal(instId, recovery, "grant_not_bound", tool);
+          throw Object.assign(new Error("no active recovery read grant for this request"), { code: "no_grant" });
+        }
+        if (requestLease) {
+          await this.auditRecoveryRefusal(instId, bound, "busy", tool);
+          throw Object.assign(new Error("execution and recovery bindings cannot both be active"), { code: "no_grant" });
+        }
         if (bound.expiresAt <= Date.now()) {
+          await this.auditRecoveryRefusal(instId, bound, "expired", tool);
           void this.closeRecovery(instId, "expired");
           throw Object.assign(new Error("recovery read grant expired"), { code: "no_grant" });
         }
         // 员工不能自带或覆盖源任务与 grant 证明：这些键一律拒绝（不是静默丢弃）。
         for (const key of RECOVERY_RESERVED_ARGS) {
           if (args[key] !== undefined) {
+            await this.auditRecoveryRefusal(instId, bound, "reserved_arg", tool);
             throw Object.assign(new Error(`${key} is injected by the channel and must not be supplied`), { code: "invalid" });
           }
         }
         if (!(RECOVERY_READ_TOOLS as readonly string[]).includes(tool)) {
+          await this.auditRecoveryRefusal(instId, bound, "not_allowlisted_tool", tool);
           throw Object.assign(new Error(`recovery read allows only ${RECOVERY_READ_TOOLS.join(", ")}`), { code: "forbidden" });
         }
-        return gateway.call(cred, bound.taskId, tool, { ...args }, { grantId: bound.grantId, grantFence: bound.grantFence });
+        const value = await gateway.call(cred, bound.taskId, tool, { ...args }, { grantId: bound.grantId, grantFence: bound.grantFence });
+        // The single login's handle must survive the turn boundary: keep it in the claim (and claim.json) so the
+        // next wake can send the remaining GETs instead of asking for a login the chain will refuse.
+        if (tool === "ops_operator_login") this.captureRecoverySession(instId, value);
+        return value;
       }
       // The lease decides the task: a taskId in the request is dropped so ops tools only ever act for the task in hand.
       const { taskId: _requested, ...rest } = args;

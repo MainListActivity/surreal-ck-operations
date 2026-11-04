@@ -707,13 +707,18 @@ export class Workforce {
    */
   async activeRecoveryGrants(nowMs: number): Promise<Array<{
     id: string; employeeId: string; taskId: string; alias: string; paths: string[]; expiresAt: string; state: string;
+    loginAttempts: number; perPath: number[]; maxLogin: number; maxCallsPerPath: number;
   }>> {
     const [rows] = await this.db.query<[Array<{ id: RecordId; employee: RecordId; source_task: RecordId; alias: string;
-      paths: string[]; expires_at: unknown; state: string }>]>(
+      paths: string[]; expires_at: unknown; state: string; login_attempts?: number; per_path?: number[];
+      max_login?: number; max_calls_per_path?: number }>]>(
       // The company fork rejects an ORDER BY field that is not in the selection ("Missing order idiom `created_at`
       // in statement selection"), and the dispatcher swallows a failed read as "no grants" — a grant that never
       // woke looked exactly like one that was never seen. created_at is selected so the ordering is legal.
-      `SELECT id, employee, source_task, alias, paths, expires_at, state, created_at FROM recovery_read_grant
+      // The counters travel with the grant so the wake prompt can say what the next step is instead of always asking
+      // for another login (d15cbecb §6.1).
+      `SELECT id, employee, source_task, alias, paths, expires_at, state, login_attempts, per_path,
+         max_login, max_calls_per_path, created_at FROM recovery_read_grant
         WHERE state IN ['issued', 'bound', 'running'] AND expires_at > time::now()
         ORDER BY created_at;`);
     const out = [];
@@ -723,7 +728,9 @@ export class Workforce {
       const expiresAt = row.expires_at instanceof Date ? row.expires_at.toISOString() : String(row.expires_at);
       if (Date.parse(expiresAt) <= nowMs) continue;
       out.push({ id: asId(row.id), employeeId: asId(row.employee), taskId: asId(row.source_task),
-        alias: row.alias, paths: [...row.paths], expiresAt, state: row.state });
+        alias: row.alias, paths: [...row.paths], expiresAt, state: row.state,
+        loginAttempts: row.login_attempts ?? 0, perPath: [...(row.per_path ?? [])],
+        maxLogin: row.max_login ?? 1, maxCallsPerPath: row.max_calls_per_path ?? 1 });
     }
     return out;
   }
