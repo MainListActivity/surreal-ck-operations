@@ -51,7 +51,7 @@ beforeAll(async () => {
   await database.bootstrap();
   const enrollment = new LocalEnrollmentAdmin(database);
   for (const [name, role, caps] of [
-    ['gm', 'gm', ['execute', 'review', 'manage']],
+    ['owner', 'owner', ['execute', 'review', 'manage']],
     ['eng', 'engineering', ['execute', 'review']],
     // The independent reviewer of the repair task (its reviewer role is qa).
     ['qa', 'qa', ['execute', 'review']],
@@ -396,7 +396,7 @@ describe('the real transport', () => {
     expect(before?.maxAttempts).toBe(limits.maxAttempts);
     expect(before?.deadline).toBe(1_700_000_000_000 + limits.totalDeadlineMs);
     // The task waits on the repair chain.
-    await database.db.query('UPDATE $t SET state = "blocked", blocked_to = "gm", resume_state = "ready";', {
+    await database.db.query('UPDATE $t SET state = "blocked", blocked_to = "owner", resume_state = "ready";', {
       t: new RecordId('task', taskId),
     });
     await core.resume(tokens.gm!, taskId, {

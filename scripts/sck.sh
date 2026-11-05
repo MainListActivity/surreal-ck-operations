@@ -10,6 +10,38 @@ if [ "${1:-}" = "sync-gate" ]; then
   cd "$service_home/active"
   exec "$BUN" src/mcp/sync-gate.ts
 fi
+# Owner CLI: bin/sck owner <command> '<JSON>' — reads private/owner-token by path, never prints it.
+if [ "${1:-}" = "owner" ]; then
+  [ -n "${2:-}" ] || { echo 'usage: sck owner <command> <JSON>' >&2; exit 2; }
+  command=$2
+  payload=${3:-"{}"}
+  token_file="$service_home/private/owner-token"
+  [ -r "$token_file" ] || { echo 'owner token missing' >&2; exit 1; }
+  token=$(/usr/bin/sed -n '1p' "$token_file" | /usr/bin/tr -d "\r\n")
+  port=$(/usr/bin/sed -n 's/^SCK_PREVIEW_PORT=//p' "$service_home/private/service.env" 2>/dev/null | /usr/bin/tr -d "\"'")
+  port=${port:-18777}
+  /usr/bin/python3 -I - "$command" "$payload" "$token" "$port" <<'PY'
+import json, sys, urllib.request
+command, payload, token, port = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+try: args = json.loads(payload)
+except ValueError as error:
+    print(json.dumps({"ok": False, "error": "invalid JSON: %s" % error}, ensure_ascii=False)); sys.exit(2)
+if not isinstance(args, dict): args = {}
+args["command"] = command
+request = urllib.request.Request("http://127.0.0.1:%s/api/owner/%s" % (port, command),
+    data=json.dumps(args, ensure_ascii=False).encode("utf-8"),
+    headers={"Content-Type": "application/json", "Authorization": "Bearer " + token,
+             "X-Owner-Agent": __import__("os").environ.get("SCK_OWNER_AGENT", "cli")}, method="POST")
+try:
+    with urllib.request.urlopen(request, timeout=30) as response:
+        print(response.read().decode("utf-8"))
+except urllib.error.HTTPError as error:
+    print(error.read().decode("utf-8")); sys.exit(1)
+except Exception as error:
+    print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False)); sys.exit(1)
+PY
+  exit $?
+fi
 # Spawn env is one-shot: Paseo strips SCK_COMM_* on session resume/refresh, but
 # always re-injects PASEO_AGENT_ID. The sidecar's pointer file also carries the
 # freshest channel key across plugin restarts (adopt() re-keys channels), so it

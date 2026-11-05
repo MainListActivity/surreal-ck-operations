@@ -102,7 +102,7 @@ run('R1 plan coverage: a task built before the policy layer is listed, quarantin
     await oldDb.connect();
     await oldDb.bootstrap();
     const oldEnroll = new OldEnroll(oldDb);
-    gm = await oldEnroll.enroll('r1-gm', 'gm', ['execute', 'review', 'manage']);
+    gm = await oldEnroll.enroll('r1-gm', 'owner', ['execute', 'review', 'manage']);
     eng = await oldEnroll.enroll('r1-eng', 'engineering', ['execute', 'review']);
     oldCore = new OldPolicyCore(oldDb);
 
@@ -215,7 +215,7 @@ run('R1 plan coverage: a task built before the policy layer is listed, quarantin
     const by = new Map(quarantined.map(row => [row.id, row]));
     // 旧版认得的状态字面量 + 责任人；新版专有的解释只写在旧版读不到的字段里。
     expect(by.get(legacyReadyId)?.state).toBe('blocked');
-    expect(by.get(legacyReadyId)?.blocked_to).toBe('gm');
+    expect(by.get(legacyReadyId)?.blocked_to).toBe('owner');
     expect(by.get(legacyReadyId)?.resume_state).toBe('ready');
     expect(by.get(legacyDoingId)?.state).toBe('blocked');
     expect(by.get(legacyDoingId)?.resume_state).toBe('doing');

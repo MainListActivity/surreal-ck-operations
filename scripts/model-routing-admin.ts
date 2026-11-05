@@ -40,7 +40,7 @@ try {
     if(!existsSync(backup))writeFileSync(backup,JSON.stringify(defs,null,2),{mode:0o600});
     for(const def of defs) await workforce.upsertDef(def.id,{...def,model:employeeClientModel(def.role),
       thinking:employeeTier(def.role)==='haiku'?'max':def.thinking});
-    await db.db.query("UPDATE employee SET model = IF role='gm' THEN 'claude-opus-5-5' ELSE IF role='product' THEN 'claude-sonnet-5-5' ELSE 'claude-haiku-5-5' END WHERE provider='claude' AND role!='story-author' AND retired!=true RETURN NONE;");
+    await db.db.query("UPDATE employee SET model = IF role='owner' THEN 'claude-opus-5-5' ELSE IF role='product' THEN 'claude-sonnet-5-5' ELSE 'claude-haiku-5-5' END WHERE provider='claude' AND role!='story-author' AND retired!=true RETURN NONE;");
     console.log(JSON.stringify({updatedDefinitions:defs.length,runningSessions:'unchanged; native model and v3 settings applied only after lease ends'}));
   }
   if (mode === "roster") {
@@ -72,7 +72,7 @@ try {
     const created = changes.filter(d=>!defs.some(old=>old.id===d.id)).map(d=>new RecordId('employee_def',d.id));
     await db.db.query("UPDATE company_meta:model_routing SET created_defs=array::union(created_defs??[],$created);",{created});
     // Persist Claude employees' new defaults; a busy conversation reloads only after its current lease ends.
-    await db.db.query(`UPDATE employee SET model = IF role='gm' THEN 'claude-opus-5-5' ELSE IF role='product' THEN 'claude-sonnet-5-5' ELSE 'claude-haiku-5-5' END
+    await db.db.query(`UPDATE employee SET model = IF role='owner' THEN 'claude-opus-5-5' ELSE IF role='product' THEN 'claude-sonnet-5-5' ELSE 'claude-haiku-5-5' END
       WHERE provider='claude' AND role!='story-author' AND retired!=true RETURN NONE;`);
     console.log(JSON.stringify({rosterChanges:changes.map(d=>({id:d.id,role:d.role,provider:d.provider,model:d.model,enabled:d.enabled})),storyAuthors:'unchanged'}));
 

@@ -136,7 +136,6 @@ run('stale reaping cannot overwrite a worker that progressed after the inbox sna
 
 run('company version actions bypass Jev routing and approval, including stale dispatcher snapshots',async()=>{
  const t=await task(),wf=new Workforce(db,join(dir,'credentials')),before=t.version;
- expect(await wf.rerouteToGm(t.id,before,'Jev proposes GM')).toBe(false);
  expect((await core.getTask(eng,t.id)).blockedTo).toBe('owner');
  await db.db.query("UPDATE $task SET state='review',reviewer_role='owner',acceptance_legacy=true;",{task:new RecordId('task',t.id)});
  expect(await wf.jevAccept(t.id,before,'Jev proposes automatic acceptance')).toBe(false);
@@ -351,7 +350,7 @@ run('GitHub CI billing cannot be turned into an employee block or an owner hando
   const proof = {taskId,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version};
   const snapshot = async () => (await db.db.query('SELECT * FROM ONLY $task;', {task:new RecordId('task',taskId)}))[0];
   const before = await snapshot();
-  for (const to of ['owner','gm'] as const) {
+  for (const to of ['owner','owner'] as const) {
     await expect(core.block(who,proof,to,note('GitHub CI 作业没有启动，账单失败，请老板提高 spending limit 后再继续。')))
       .rejects.toMatchObject({code:'invalid',details:{reason:'github_ci_system_owned'}});
     expect(await snapshot()).toEqual(before);
@@ -367,8 +366,8 @@ run('GitHub CI billing cannot be turned into an employee block or an owner hando
   const [waits] = await db.db.query<[unknown[]]>('SELECT * FROM task_wait WHERE task=$task;',{task:new RecordId('task',taskId)});
   expect(waits).toHaveLength(0);
   // A genuine test failure is still a technical blocker. There is no employee-issued billing waiver.
-  const blocked = await core.block(who,proof,'gm',note('GitHub CI 已实际执行测试，断言失败，需要工程修复后重新验证。'));
-  expect(blocked.blockedTo).toBe('gm');
+  const blocked = await core.block(who,proof,'owner',note('GitHub CI 已实际执行测试，断言失败，需要工程修复后重新验证。'));
+  expect(blocked.blockedTo).toBe('owner');
 });
 
 run('a rejected CI billing block continues through server-verified evidence and submit without owner intervention', async () => {

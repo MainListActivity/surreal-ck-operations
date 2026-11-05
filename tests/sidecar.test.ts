@@ -439,7 +439,7 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     await pool.settle('agent-7');
     const blocks = calls.filter(c => c.tool === 'block');
     expect(blocks).toHaveLength(1);
-    expect(blocks[0]!.to).toBe('gm');
+    expect(blocks[0]!.to).toBe('owner');
     // A later write attempt finds no lease.
     writeFileSync(join(reqDir(env.SCK_COMM_DIR), 'late.json'),
       JSON.stringify({ key: env.SCK_COMM_KEY, tool: 'checkpoint', args: { text: 'x' } }));
@@ -464,25 +464,25 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     const env = pool.env(withQuota);
     await pool.claim(withQuota, task('task-q1'));
     const declared = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'q1', 'report_blocker',
-      { to: 'gm', text: '订阅额度用尽，等恢复', idempotencyKey: 'q1', quotaResetsAt: resetAt });
+      { to: 'owner', text: '订阅额度用尽，等恢复', idempotencyKey: 'q1', quotaResetsAt: resetAt });
     expect(declared.ok).toBe(true);
     // The 5th argument is the only write gate for quota_resets_at (core.block → recordQuotaGate):
     // assert it by identity, so deleting the argument again fails here instead of in production.
     expect(calls.filter(c => c.tool === 'block')).toEqual([{
       tool: 'block', proof: { taskId: 'task-q1', deliveryId: 'd-task-q1', fence: 7, expectedVersion: 1 },
-      to: 'gm', text: '订阅额度用尽，等恢复', quotaResetsAt: resetAt,
+      to: 'owner', text: '订阅额度用尽，等恢复', quotaResetsAt: resetAt,
     }]);
 
     const withoutQuota = inst('e-quota-plain');
     const plainEnv = pool.env(withoutQuota);
     await pool.claim(withoutQuota, task('task-q2'));
     const plain = await relay(plainEnv.SCK_COMM_DIR, plainEnv.SCK_COMM_KEY!, 'q2', 'report_blocker',
-      { to: 'gm', text: '普通阻塞，没有额度恢复时间', idempotencyKey: 'q2' });
+      { to: 'owner', text: '普通阻塞，没有额度恢复时间', idempotencyKey: 'q2' });
     expect(plain.ok).toBe(true);
     const blocks = calls.filter(c => c.tool === 'block');
     expect(blocks).toHaveLength(2);
     expect(blocks[1]!.quotaResetsAt).toBeUndefined();
-    expect(blocks[1]!.to).toBe('gm');
+    expect(blocks[1]!.to).toBe('owner');
   });
 
   test('SYS-QUOTA AC01: a malformed quotaResetsAt is refused, never dropped, and the lease survives it', async () => {
@@ -496,17 +496,17 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
       expect(res.error).toStartWith('invalid:');
       return res.error!;
     };
-    await refused({ to: 'gm', text: '额度用尽', quotaResetsAt: 1_800_000_000 });
-    await refused({ to: 'gm', text: '额度用尽', quotaResetsAt: '' });
-    await refused({ to: 'gm', text: '额度用尽', quotaResetsAt: null });
+    await refused({ to: 'owner', text: '额度用尽', quotaResetsAt: 1_800_000_000 });
+    await refused({ to: 'owner', text: '额度用尽', quotaResetsAt: '' });
+    await refused({ to: 'owner', text: '额度用尽', quotaResetsAt: null });
     // A near-miss key would otherwise be an unknown argument and silently lose the reset.
-    expect(await refused({ to: 'gm', text: '额度用尽', quota_resets_at: new Date(Date.now() + 3600_000).toISOString() }))
+    expect(await refused({ to: 'owner', text: '额度用尽', quota_resets_at: new Date(Date.now() + 3600_000).toISOString() }))
       .toContain('quotaResetsAt');
     // Every refusal happened before core.block and before the lease was consumed.
     expect(calls.filter(c => c.tool === 'block')).toHaveLength(0);
     const resetAt = new Date(Date.now() + 3600_000).toISOString();
     const accepted = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'q3-ok', 'report_blocker',
-      { to: 'gm', text: '额度用尽，改好格式再报', idempotencyKey: 'q3-ok', quotaResetsAt: resetAt });
+      { to: 'owner', text: '额度用尽，改好格式再报', idempotencyKey: 'q3-ok', quotaResetsAt: resetAt });
     expect(accepted.ok).toBe(true);
     expect(calls.filter(c => c.tool === 'block')[0]!.quotaResetsAt).toBe(resetAt);
   });
@@ -521,7 +521,7 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     await pool.settle('agent-q4');
     const blocks = calls.filter(c => c.tool === 'block');
     expect(blocks).toHaveLength(1);
-    expect(blocks[0]!.to).toBe('gm');
+    expect(blocks[0]!.to).toBe('owner');
     expect(blocks[0]!.quotaResetsAt).toBe(resetAt);
     expect(blocks[0]!.text).toContain('订阅额度用尽');
   });
@@ -625,7 +625,7 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     expect(wtCalls[1]).toEqual({ cred: 'tok-e13', taskId: 'task-other' });
 
     // gm 缺省：全局库存（taskId undefined，角色门控在 core）
-    authRole = 'gm';
+    authRole = 'owner';
     await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w3', 'list_worktrees', {});
     expect(wtCalls[2]).toEqual({ cred: 'tok-e13', taskId: undefined });
 
@@ -803,12 +803,12 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     const fresh = new SidecarPool({ core: core as never, workforce: workforce as never, runDir, heartbeatMs: 10_000, sweepMs: 20 });
     await fresh.adopt([i]);
     const env = fresh.env(i);
-    const blocked = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'rb1', 'report_blocker', { text: 'review blocker after reload', to: 'gm' });
+    const blocked = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'rb1', 'report_blocker', { text: 'review blocker after reload', to: 'owner' });
     expect(blocked.ok).toBe(true);
     expect(calls.find(c => c.tool === 'block')!.proof).toEqual({
       taskId: 'task-review-block', deliveryId: 'd-review-block', fence: 2, expectedVersion: 3,
     });
-    expect(calls.find(c => c.tool === 'block')!.to).toBe('gm');
+    expect(calls.find(c => c.tool === 'block')!.to).toBe('owner');
     fresh.close();
   });
 

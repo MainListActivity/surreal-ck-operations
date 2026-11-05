@@ -30,7 +30,7 @@ beforeAll(async () => {
   await db.connect(); await db.bootstrap();
   core = new SurrealCompanyCore(db); owner = new OwnerDesk(db);
   const admin = new LocalEnrollmentAdmin(db);
-  gm = await admin.enroll('loop-gm', 'gm', ['execute', 'review', 'manage']);
+  gm = await admin.enroll('loop-gm', 'owner', ['execute', 'review', 'manage']);
   eng = await admin.enroll('loop-eng', 'engineering', ['execute', 'review']);
 });
 afterAll(async () => { if (!dir) return; await db.close(); server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true }); });
@@ -41,7 +41,7 @@ const newTask = () => core.createTask(gm, { title: `Looping task ${++count}`, co
 /** One round trip: the employee blocks on the manager. The manager resumes it unless this is the last round. */
 async function bounce(taskId: string, round: number, resume: boolean) {
   const claim = await core.claim(eng, taskId);
-  await core.block(eng, proofOf(claim), 'gm', text(`第 ${round} 次阻塞：WS 连接 1006 无事件`));
+  await core.block(eng, proofOf(claim), 'owner', text(`第 ${round} 次阻塞：WS 连接 1006 无事件`));
   if (resume) await core.resume(gm, taskId, text(`经理第 ${round} 次回复`));
 }
 const breaker = () => new Dispatcher({ workforce: {} as never, owner, paseo: {} as never, env: {} as never, log: () => {} }) as unknown as
@@ -60,7 +60,7 @@ run('dependency completion returns a manager continuation without dispatching ex
   const review = await core.claim(qa, dep.id);
   await core.accept(qa, proofOf(review), text('independently verified dependency complete'));
   const resumed = await core.getTask(gm, source.id);
-  expect(resumed).toMatchObject({ state: 'blocked', blockedTo: 'gm', resumeState: 'doing' });
+  expect(resumed).toMatchObject({ state: 'blocked', blockedTo: 'owner', resumeState: 'doing' });
   expect(resumed.dependencyContinuation).toBeUndefined();
   expect(await core.claim(eng, source.id).catch(e => e.code)).toBe('conflict');
   await core.resume(gm, source.id, text('经理已经安排并落实全部所需前置，恢复执行'));
@@ -72,7 +72,7 @@ run('already complete dependencies still require the explicitly requested manage
   await db.db.query("UPDATE $task SET state='done';", { task: new RecordId('task', dep.id) });
   await bounce(source.id, 1, false);
   const result = await core.deferTaskUntil(gm, { taskId: source.id, dependencies: [dep.id], continuation: 'manager', ...text('所有依赖虽完成，但还需要经理补齐新窗口') });
-  expect(result).toMatchObject({ state: 'blocked', blockedTo: 'gm', resumeState: 'doing' });
+  expect(result).toMatchObject({ state: 'blocked', blockedTo: 'owner', resumeState: 'doing' });
 });
 
 run('expired and altered windows are refused; queue expiry becomes one manager wait', async () => {
@@ -90,7 +90,7 @@ run('expired and altered windows are refused; queue expiry becomes one manager w
   await db.db.query('UPDATE $task SET execution_window.notAfter=$past;', { task: new RecordId('task', source.id), past: new Date(Date.now()-1000).toISOString() });
   expect(await core.claim(eng, source.id).catch(e => e.code)).toBe('invalid');
   const blocked = await core.getTask(gm, source.id);
-  expect(blocked).toMatchObject({ state:'blocked', blockedTo:'gm', resumeState:'ready' });
+  expect(blocked).toMatchObject({ state:'blocked', blockedTo:'owner', resumeState:'ready' });
   expect(await core.resume(gm, source.id, text('不能通过普通恢复操作续期旧批准')).catch(e => e.code)).toBe('invalid');
   const [audit] = await db.db.query<[Array<{recovery_reason:string}>]>("SELECT recovery_reason FROM audit WHERE task=$task AND action='block';",{task:new RecordId('task',source.id)});
   expect(audit.filter(a=>a.recovery_reason==='stale_window')).toHaveLength(1);
@@ -127,14 +127,14 @@ run('classified loops get one owned recovery task and a second exhausted cycle s
   const t=await newTask();
   for(let n=0;n<2;n++) {
     const c=await core.claim(eng,t.id);
-    await core.block(eng,proofOf(c),'gm',{...text('缺少新窗口和独立批准，需要经理补齐依赖'),recoveryReason:'missing_prerequisite'});
+    await core.block(eng,proofOf(c),'owner',{...text('缺少新窗口和独立批准，需要经理补齐依赖'),recoveryReason:'missing_prerequisite'});
     if(n===0) await core.resume(gm,t.id,text('经理第一次恢复，不代表业务成功'));
   }
   expect(await breaker().breakLoop(await core.getTask(gm,t.id),{...DEFAULT_CONFIG,blockLoopLimit:2},report())).toBe(true);
   const source=await core.getTask(gm,t.id);
   expect(source.state).toBe('blocked');expect(source.blockedTo).toBeUndefined();
   const [recoveries]=await db.db.query<[Array<{id:RecordId;executor_role:string;reviewer_role:string}>]>('SELECT id,executor_role,reviewer_role FROM task WHERE recovery_source=$task;',{task:new RecordId('task',t.id)});
-  expect(recoveries).toHaveLength(1);expect(recoveries[0]!.executor_role).toBe('gm');expect(recoveries[0]!.reviewer_role).toBe('product');
+  expect(recoveries).toHaveLength(1);expect(recoveries[0]!.executor_role).toBe('owner');expect(recoveries[0]!.reviewer_role).toBe('product');
   expect(source.dependencies).toContain(String(recoveries[0]!.id.id));
   // Real independent review of the recovery handoff still returns the source to the manager.
   const recoveryId=String(recoveries[0]!.id.id);
@@ -143,11 +143,11 @@ run('classified loops get one owned recovery task and a second exhausted cycle s
   const product=await new LocalEnrollmentAdmin(db).enroll('recovery-product','product',['execute','review']);
   const recoveryReview=await core.claim(product,recoveryId);
   await core.accept(product,proofOf(recoveryReview),text('独立复核恢复安排完成，不代表源业务验收通过'));
-  expect((await core.getTask(gm,t.id)).blockedTo).toBe('gm');
+  expect((await core.getTask(gm,t.id)).blockedTo).toBe('owner');
   expect(await owner.escalateLooping(await core.getTask(gm,t.id),2,['仍缺少前置'])).toBe(true);
   const [stopped]=await db.db.query<[Array<{recovery_stopped:boolean}>]>('SELECT recovery_stopped FROM $task;',{task:new RecordId('task',t.id)});
   expect(stopped[0]!.recovery_stopped).toBe(true);
-  expect((await core.getTask(gm,t.id)).blockedTo).toBe('gm');
+  expect((await core.getTask(gm,t.id)).blockedTo).toBe('owner');
   expect(await core.resume(gm,t.id,text('普通恢复不能绕过第二轮自动停止')).catch(e=>e.code)).toBe('invalid');
 });
 
@@ -169,13 +169,13 @@ run('an expired execute window cannot mutate a foreign workspace or block same-r
 
 run('adding completed prerequisites does not reset a stopped recovery while an older dependency waits',async()=>{
   const source=await newTask(),oldDep=await newTask(),finished=await newTask(),newDep=await newTask();
-  await db.db.query("UPDATE $task SET state='blocked',blocked_to='gm',resume_state='doing',dependencies=[$old],recovery_stopped=true; UPDATE $finished SET state='done';",
+  await db.db.query("UPDATE $task SET state='blocked',blocked_to='owner',resume_state='doing',dependencies=[$old],recovery_stopped=true; UPDATE $finished SET state='done';",
     {task:new RecordId('task',source.id),old:new RecordId('task',oldDep.id),finished:new RecordId('task',finished.id)});
   expect(await core.deferTaskUntil(gm,{taskId:source.id,dependencies:[finished.id],continuation:'execute',...text('已完成依赖不能解除停止并直接派工')}).catch(e=>e.code)).toBe('conflict');
   await core.deferTaskUntil(gm,{taskId:source.id,dependencies:[finished.id],continuation:'manager',...text('新增一个已完成依赖不能伪装实际恢复进展')});
   const [still]=await db.db.query<[Array<{recovery_stopped:boolean}>]>('SELECT recovery_stopped FROM $task;',{task:new RecordId('task',source.id)});
   expect(still[0]!.recovery_stopped).toBe(true);
-  await db.db.query("UPDATE $task SET blocked_to='gm';",{task:new RecordId('task',source.id)});
+  await db.db.query("UPDATE $task SET blocked_to='owner';",{task:new RecordId('task',source.id)});
   await core.deferTaskUntil(gm,{taskId:source.id,dependencies:[newDep.id],continuation:'manager',...text('新增真实尚未完成的前置才进入新恢复阶段')});
   const [after]=await db.db.query<[Array<{recovery_stopped?:boolean}>]>('SELECT recovery_stopped FROM $task;',{task:new RecordId('task',source.id)});
   expect(after[0]!.recovery_stopped).not.toBe(true);

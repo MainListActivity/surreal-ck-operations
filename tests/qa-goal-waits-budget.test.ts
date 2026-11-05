@@ -36,8 +36,8 @@ const rootBlocker = {
   factsAvailable: true, impact: 2, dependencyPath: [{ taskId: 'task-root-00', title: maxTitle('根阻点', 0) }],
   people: { implementer: 'engineering-fable-12c5e9', authors: ['engineering-fable-12c5e9'], reviewers: [], submitCommit: 'e0a74a8' },
   reasons: Array.from({ length: 20 }, (_, index) => ({ code: `reason-${index}`, text: `原因 ${index} ` + '生产标题'.repeat(30),
-    candidates: ['candidate'], owner: 'gm', recovery: '经理增补独立复核人选', nextTrigger: '新增编制或员工', basis: 'tick:staffing-pool',
-    actions: [{ authority: 'gm', label: '经理用 def_ensure 增加编制', tool: 'def_ensure', executable: true }] })),
+    candidates: ['candidate'], owner: 'owner', recovery: '经理增补独立复核人选', nextTrigger: '新增编制或员工', basis: 'tick:staffing-pool',
+    actions: [{ authority: 'owner', label: '经理用 def_ensure 增加编制', tool: 'def_ensure', executable: true }] })),
 };
 
 const view = (waits: QaObservationGoalWaitSummary): QaObservationReadView => ({

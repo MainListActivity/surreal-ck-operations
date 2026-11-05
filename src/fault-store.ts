@@ -751,7 +751,7 @@ export class FaultStore {
    */
   async spendCredentials(input: {
     taskId: string; incident: string; now: number; limits: FaultBudgetLimits;
-    via: 'repair' | 'gm'; credentials: FaultCredential[];
+    via: 'repair' | 'owner'; credentials: FaultCredential[];
   }): Promise<boolean> {
     if (input.credentials.length === 0) return false;
     const vars: Record<string, unknown> = {
@@ -792,7 +792,7 @@ export class FaultStore {
   }
 
   /**
-   * Reset the recovery of one incident on one task by hand, with no credential (AC04): the gm lifts it and the caller
+   * Reset the recovery of one incident on one task by hand, with no credential (AC04): the owner lifts it and the caller
    * audits the reason. The budgets start over with the default window and the episodes of the incident close. Only
    * the task's own budgets are reset; the total stays for the audit.
    */

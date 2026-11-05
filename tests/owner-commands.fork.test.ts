@@ -23,7 +23,7 @@ beforeAll(async () => {
   db = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: 'fixture-only', namespace: 'owner_commands_fixture', database: 'control_plane' });
   await db.connect(); await db.bootstrap();
   core = new SurrealCompanyCore(db); owner = new OwnerDesk(db);
-  gm = await new LocalEnrollmentAdmin(db).enroll('commands-gm', 'gm', ['execute', 'review', 'manage']);
+  gm = await new LocalEnrollmentAdmin(db).enroll('commands-gm', 'owner', ['execute', 'review', 'manage']);
 });
 afterAll(async () => { if (!dir) return; await db.close(); server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true }); });
 

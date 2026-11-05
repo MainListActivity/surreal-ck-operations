@@ -91,14 +91,14 @@ async function runPrevious(namespace: string, oldRoot: string): Promise<Outcome>
  * gate is void. Only B gets the SYS07 outcome/evidence/needs_repair writes. */
 async function seedFixture(database: CompanyDatabase, scratch: string): Promise<{ core: SurrealCompanyCore; gm: string; goalId: string; manualId: string; gateId: string }> {
   const core = new SurrealCompanyCore(database);
-  const gm = await new LocalEnrollmentAdmin(database).enroll(`rb01-sys07-gm-${randomUUID().slice(0, 8)}`, 'gm', ['execute', 'review', 'manage']);
+  const gm = await new LocalEnrollmentAdmin(database).enroll(`rb01-sys07-gm-${randomUUID().slice(0, 8)}`, 'owner', ['execute', 'review', 'manage']);
   await database.db.upsert(new RecordId('company_meta', 'config')).content({
     eval_enabled: false, jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0,
   });
   const wf = new Workforce(database, join(scratch, 'unused-credential-files'));
   await wf.upsertDef('rb01-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 2 });
   await wf.upsertDef('rb01-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
-  await wf.upsertDef('rb01-gm', { role: 'gm', provider: 'codex', model: 'fixture', maxInstances: 1 });
+  await wf.upsertDef('rb01-gm', { role: 'owner', provider: 'codex', model: 'fixture', maxInstances: 1 });
   await core.createTask(gm, { title: 'rb01-ready', context: '就绪任务：旧版调度应认领，作为阳性对照。',
     executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `rb01-sys07-ready-${randomUUID()}` });
 
@@ -110,10 +110,10 @@ async function seedFixture(database: CompanyDatabase, scratch: string): Promise<
   const gate = new RecordId('task', gateId);
   await database.db.query(`CREATE ONLY $t CONTENT {
     title: '运营验收', context: 'RB01 SYS07 目标夹具', state: 'done', kind: 'task', executor_role: 'product',
-    reviewer_role: 'gm', dependencies: [], goal: $goal, version: 1, fence: 0, created_at: time::now() - 5d
+    reviewer_role: 'owner', dependencies: [], goal: $goal, version: 1, fence: 0, created_at: time::now() - 5d
   };`, { t: manual, goal });
   await database.db.query(`CREATE ONLY $t CONTENT {
-    title: 'G3 老板最终验收', context: 'RB01 SYS07 终验夹具', state: 'void', kind: 'gate', executor_role: 'gm',
+    title: 'G3 老板最终验收', context: 'RB01 SYS07 终验夹具', state: 'void', kind: 'gate', executor_role: 'owner',
     reviewer_role: 'owner', dependencies: [], goal: $goal, version: 1, fence: 0, created_at: time::now() - 5d
   };`, { t: gate, goal });
   await database.db.query(`CREATE ONLY $g CONTENT {
@@ -168,7 +168,7 @@ run('RB01 rollback isolation: SYS07 goal states against the previous release', (
     const gm = fixture.B.gm;
     await fixture.B.core.goalOutcomeRegister(gm, {
       goalId: fixture.B.goalId, expectedVersion: 0, expected: '交付客户激活并采纳的结果',
-      requiredEvidence: ['customer_activation'], responsibleRole: 'gm',
+      requiredEvidence: ['customer_activation'], responsibleRole: 'owner',
       reason: 'RB01 演练：新版登记目标成果与客户激活证据要求', idempotencyKey: `rb01-sys07-outcome-${suffix}`,
     });
     const card = await fixture.B.core.goalFinalize(gm, { goalId: fixture.B.goalId });

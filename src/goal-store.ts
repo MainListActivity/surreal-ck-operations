@@ -955,7 +955,7 @@ export class GoalGovernanceStore {
       if (['done', 'void'].includes(candidate.state)) violations.push({ code: 'conflict', message: `candidate must be open, found ${candidate.state}` });
       if (candidate.submittedBy) violations.push({ code: 'conflict', message: 'candidate already has a submission' });
       if (candidate.currentEmployee && (candidate.leaseExpiresAt ?? 0) * 1000 > now) violations.push({ code: 'conflict', message: 'candidate holds an active lease' });
-      const expectedReviewer = goal.tier === 'quick' && (goal.pipeline ?? 'software') === 'software' ? 'gm' : 'owner';
+      const expectedReviewer = goal.tier === 'quick' && (goal.pipeline ?? 'software') === 'software' ? 'owner' : 'owner';
       if (candidate.reviewerRole !== expectedReviewer) {
         violations.push({ code: 'invalid', message: `candidate reviewer must be ${expectedReviewer}` });
       }

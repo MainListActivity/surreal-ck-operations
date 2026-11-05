@@ -10,11 +10,11 @@ run('runtime sleep reservation fences claims and manager wakes while preserving 
  const db=new CompanyDatabase({...loadDatabaseConfig(),namespace:'memory_lru_fixture',database:'control_plane'});
  try{
   await db.connect();await db.bootstrap();const wf=new Workforce(db,'/tmp/unused-lru'),core=new SurrealCompanyCore(db),enroll=new LocalEnrollmentAdmin(db);
-  const gm=await enroll.enroll('manager','gm',['manage','execute','review']),worker=await enroll.enroll('worker','qa',['execute','review']);
+  const gm=await enroll.enroll('manager','owner',['manage','execute','review']),worker=await enroll.enroll('worker','qa',['execute','review']);
   const now=await wf.serverNow();
   await db.db.query('UPDATE employee:worker SET paseo_agent_id="agent-worker", idle_since=$since,last_wake_at=$wake;',{since:now-7200,wake:now-7300});
   const find=async()=>(await wf.insts()).find(i=>i.id==='worker')!;
-  const task=await core.createTask(gm,{title:'memory LRU integration',context:'read only fixture',executorRole:'qa',reviewerRole:'gm',idempotencyKey:'lru-task'});
+  const task=await core.createTask(gm,{title:'memory LRU integration',context:'read only fixture',executorRole:'qa',reviewerRole:'owner',idempotencyKey:'lru-task'});
   const before=(await db.db.select<any>(new RecordId('employee','worker')))!;
   expect(await wf.reserveRuntimeSleep(await find(),now)).toBe(true);
   expect(await wf.confirmRuntimeSleep(await find(),now)).toBe(true);

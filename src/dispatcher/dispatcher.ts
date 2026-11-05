@@ -4,17 +4,18 @@ import { workspaceScopeFor } from '../goal-workspace-capability.ts';
 import { FACTORY_PROVIDER, FACTORY_WAIT_LIMIT, factoryFirst, factoryQueue, leaveFactoryQueue } from './provider-order.ts';
 import { managedModel, employeeClientModel } from "../model-routing/policy.ts";
 import type { OwnerDesk } from '../owner.ts';
-import type { CompanyConfig, EmployeeDef, EmployeeInst, ManagerActionRow, ManagerWakeClaim, ManagerWakeRow, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
-import { effectiveWeight, MANAGER_WAKE_PENDING_GRACE_SECONDS, MANAGER_WAKE_TURN_GRACE_SECONDS, managerWakeKey, weightedOrder } from '../workforce.ts';
+import { OutboundMessageStore, type MessageStep } from '../outbound-messages.ts';
+import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
+import { effectiveWeight, weightedOrder } from '../workforce.ts';
 import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, RetirementKind, Role, WriteScopeHolder } from '../contracts.ts';
 import { REQUIRED_TRACKS } from '../core.ts';
 import { UNATTENDED_MODE, type PaseoGateway, type PaseoWorkspaceInfo } from './paseo.ts';
-import { evalPrompt, gmAttention, gmTriage, recoveryWake, wake, type GmTodo, type PromptEnv } from './prompts.ts';
+import { evalPrompt, recoveryWake, wake, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
 import { agingLevel, agingText, localDate, renderBrief, type RoleCapacity } from '../owner-brief.ts';
 import type { ReclaimResult } from './worktree-registry.ts';
 import type { ReclaimTrigger } from './worktree-reclaim.ts';
-import { jevNeedsOwner, jevRelease, jevTriage } from './decisions.ts';
+import { jevRelease, jevTriage } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
 import { reclaimIdleSessions } from './idle-sessions.ts';
 import { observeRuntimeIdle, reclaimMemoryLru } from './memory-lru.ts';
@@ -25,7 +26,7 @@ import { summarizeReclaim } from './artifact-sweeper.ts';
 import { executeGate } from '../contributors.ts';
 import { isRetireRefused } from '../retirement.ts';
 import { independenceHit, independenceText, type IndependenceScope } from '../independence.ts';
-import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, holderLabel, managerActionKey, managerShortage, repoName, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
+import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, holderLabel, repoName, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
 export type { BlockCode, DispatchPhase, DispatchVerdict } from './dispatch-blocked.ts';
 
 /**
@@ -50,8 +51,6 @@ export function managedRecencyOrder<T extends { id: string; lastWakeAt?: number 
 /** Provider error text that means the subscription is out of budget or rate limited, not that the session is broken. */
 export const EXHAUSTED_PATTERN = /usage cap reached|out of credits|add credits|credit balance|usage balance|balance exhausted|payment required|quota|usage limit|rate.?limit|too many requests|\b402\b|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)|model_usage_exhausted|usage_exhausted|credits exhausted|out of usage|at capacity/i;
 const LEASE_SECONDS = 600;
-/** A manager gate that only waits for busy managers reaches the owner once it has waited this long. */
-const GM_QUEUE_NOTICE_MINUTES = 60;
 const LOG_TAIL_ENTRIES = 60;
 // Task-level cooldown after a claim denial; a version bump re-arms the task.
 const CLAIM_DENY_COOLDOWN_MS = 5 * 60_000;
@@ -64,9 +63,9 @@ const CLOSED_GRACE_SECONDS = 600;
 const ACTIVITY_WINDOW_SECONDS = 20 * 60;
 /** Timeline activity extends a stalled busy holder up to this many stallMinutes without a checkpoint. */
 const STALL_ACTIVITY_CAP = 3;
-/** Two or more consecutive quota failures on a bound implementer, or an unknown reset, is persistent: a manager decision. */
+/** Two or more consecutive quota failures on a bound implementer, or an unknown reset, is persistent: a owner decision. */
 const PERSISTENT_QUOTA_FAILURES = 2;
-/** Pass-wide capacity gates and unknown state are not evidence that a manager todo is resolved. */
+/** Pass-wide capacity gates and unknown state are not evidence that an owner todo is resolved. */
 const GLOBAL_KEEP = new Set<BlockCode>(['paused', 'budget', 'resources', 'memory_pressure', 'disk_space', 'max_running', 'unknown']);
 /** SYS03 AC04: holder notices delivered per pass, so a long backlog cannot turn one tick into hundreds of sends. */
 const HOLDER_NOTICE_BATCH = 20;
@@ -138,7 +137,7 @@ const UNKNOWN_EXECUTE_GATE: ExecuteGate = { unresolved: true, unknown: true };
 
 /**
  * The execute gate one pool read carries. Only the task's own executor role, outside review, is gated: a reviewer, or a
- * manager pool anchored on an engineering task, is not an execute pool and never sees the implementer gate.
+ * owner pool anchored on an engineering task, is not an execute pool and never sees the implementer gate.
  */
 export function executeGateFor(gates: ReadonlyMap<string, ExecuteGate>, role: string,
   task?: Pick<SupervisedTask, 'id' | 'executorRole'>, excludeSubmitter = false): ExecuteGate | undefined {
@@ -242,7 +241,7 @@ function trackOkFor(role: Role, task: SupervisedTask | undefined, tracks: string
 }
 
 export function factoryWorkKey(role: string, task: SupervisedTask, review = false): string {
-  const phase = review ? 'review' : task.state === 'blocked' || role !== task.executorRole ? 'manager' : 'execute';
+  const phase = review ? 'review' : task.state === 'blocked' || role !== task.executorRole ? 'owner' : 'execute';
   return `${task.id}:${role}:${phase}`;
 }
 
@@ -495,6 +494,8 @@ export async function reviewStaffingPreviews(
 export interface DispatcherDeps {
   workforce: Workforce;
   owner: OwnerDesk;
+  /** Outbound message store. Injected; defaults to a store over workforce's DB when absent. */
+  messages?: OutboundMessageStore;
   paseo: PaseoGateway;
   env: PromptEnv;
   notify?: (title: string, text: string) => Promise<void>;
@@ -538,7 +539,7 @@ export interface DispatcherDeps {
    * System-initiated implementer replacement: hands an execute-phase engineering task to a live engineer when the bound
    * implementer's session is gone for good (the employee left, or the session is archived, quarantined, or parked in a
    * failure that cannot be restarted, or its repo no longer matches an explicit code-repo rebind). Returns true when the binding moved. Undefined disables the automatic successor:
-   * the block then names the manager's takeover instead.
+   * the block then names the owner's takeover instead.
    */
   autoTakeover?: (input: { taskId: string; toEmployee: string; expectedVersion: number; reason: string }) => Promise<boolean>;
   /**
@@ -592,14 +593,14 @@ export interface SidecarBridge {
 /** Jev-chosen override for one dispatch: force an existing instance, or skip reuse and spawn a chosen def. */
 
 /**
- * Workspace anchor for task-less management dispatches (gm-attention, triage, eval).
+ * Workspace anchor for task-less management dispatches (owner-attention, triage, eval).
  * `task` anchors by task identity: its repoPath picks the candidate home and its id
  * drives readWorkspace project resolution. `home`+`project` anchor a goal directly
  * when no task exists yet (triage): `home` is the resolved repo the candidate pool,
  * spawn cwd and repoHome bind to, `project` is the project id readWorkspace resolves.
  */
 interface DispatchAnchor { task?: SupervisedTask; home?: string; project?: string; goalId?: string; goalTitle?: string }
-/** Optional hooks around the only external Paseo actions (send/spawn), used by the manager-wake CAS. */
+/** Optional hooks around the only external Paseo actions (send/spawn), used by the owner-wake CAS. */
 interface AssignHooks {
   /** Durable successor CAS before allocating its lease. */
   beforeClaim?: (inst: EmployeeInst) => Promise<void>;
@@ -740,6 +741,43 @@ export class Dispatcher {
     if (!this.deps.sidecar?.adoptRecovery) this.log('recovery wake disabled: sidecar hook missing');
   }
   private log(message: string) { this.deps.log?.(message); }
+  private messages?: OutboundMessageStore;
+  private messagesTried = false;
+  /** The store is optional: runtimes without one (tests, legacy) fall back to the built-in template. */
+  private messageStore(): OutboundMessageStore | undefined {
+    if (this.deps.messages) return this.deps.messages;
+    if (this.messages) return this.messages;
+    if (this.messagesTried) return undefined;
+    this.messagesTried = true;
+    try {
+      const database = (this.deps.workforce as unknown as { database?: { db?: unknown } }).database;
+      if (database?.db) this.messages = new OutboundMessageStore(database.db as never);
+    } catch { this.messages = undefined; }
+    return this.messages;
+  }
+  /**
+   * The dispatch message is the latest draft's body (locked, audited, owner-visible), plus the working
+   * directory line. hold=true => no dispatch: the task waits in the owner inbox until released.
+   * A runtime without the store (tests) falls back to the template prompt unchanged.
+   */
+  private async outbound(taskId: string, step: MessageStep, employeeId: string, workdir?: string): Promise<string | null | undefined> {
+    const store = this.messageStore();
+    if (!store) return undefined;
+    try {
+      const prepared = await store.prepareSend(taskId, step, employeeId);
+      if (!prepared) {
+        await this.notice(`message-hold:${taskId}:${step}`,
+          `任务 ${taskId} 的 ${step} 消息被标记「需要我放行」；请在消息流里放行后再派工。`,
+          { commands: 0, revoked: [], extended: [], woke: [], retired: [], exhausted: [], notices: [], evals: [], decisions: [] });
+        return null;
+      }
+      return workdir ? `${prepared.body}\n工作目录：${workdir}` : prepared.body;
+    } catch (error) {
+      this.log(`outbound message read failed for ${taskId}: ${(error as Error).message}`);
+      return undefined;
+    }
+  }
+
 
   /** Dispatch-blocked conclusions from the latest pass, keyed by task and phase. Dispatchable work is absent. */
   private readonly verdicts = new Map<string, DispatchVerdict>();
@@ -1141,7 +1179,7 @@ export class Dispatcher {
       // FV06 P0: bounded standby. A standby holder (standby_until set) is exempt from the stall/expire
       // reclaim until the deadline; an idle/unknown holder is woken in place (claim.json re-adopted from
       // the server lease first), throttled at the same 60s cadence as resumeClosed's reload. Past the
-      // deadline the task returns to the gm gate — never the ready pool. down/exhausted holders keep the
+      // deadline the task returns to the owner gate — never the ready pool. down/exhausted holders keep the
       // ordinary immediate revoke below, and a busy holder keeps the ordinary renewal/stall branch above.
       // state='doing' 门：标记只在直派租约存续期有效——submit 后的复核相位、收回后的 ready 或任何残留
       // 标记都不再触发唤醒/超时（复核与普通派工租约不受旧 deadline 管辖）。
@@ -1158,9 +1196,14 @@ export class Dispatcher {
                   this.log(`standby adopt ${inst.id} failed: ${(error as Error).message}`));
                 const first = !this.onboarded.has(inst.id) && !inst.onboarded;
                 try {
-                  await paseo.send(inst.paseoAgentId!, wake(inst, task, this.deps.env, first,
-                    { comm: !!this.deps.sidecar, worktree: task.row.worktree,
-                      commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }));
+                  const standbyBody = (() => {
+                    const text = wake(inst, task, this.deps.env, first,
+                      { comm: !!this.deps.sidecar, worktree: task.row.worktree,
+                        commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) });
+                    const path = task.row.worktree?.worktreePath;
+                    return path ? `${text}\n工作目录：${path}` : text;
+                  })();
+                  await paseo.send(inst.paseoAgentId!, standbyBody);
                   this.onboarded.add(inst.id);
                   this.lastStatus.set(inst.paseoAgentId!, 'running');
                   await wf.touchWake(inst.id);
@@ -1175,10 +1218,10 @@ export class Dispatcher {
           }
           // down/exhausted/closed fall through to the ordinary branches below.
         } else {
-          const reason = `员工 ${task.currentEmployee} 的待命期（standby_until）已过仍未开工，按窗口纪律回经理关口重新安排，不进入 ready 派工池`;
+          const reason = `员工 ${task.currentEmployee} 的待命期（standby_until）已过仍未开工，按窗口纪律回老板关口重新安排，不进入 ready 派工池`;
           const log = inst?.paseoAgentId ? await this.deps.paseo.logsTail(inst.paseoAgentId, LOG_TAIL_ENTRIES) : '';
           const handover = [
-            '【交接包】standby 待命超时。任务窗口未放宽；经理可换人重新 standby（resume_task 带 standbyEmployee）或放弃该窗口。',
+            '【交接包】standby 待命超时。任务窗口未放宽；老板可换人重新 standby（resume_task 带 standbyEmployee）或放弃该窗口。',
             `前任会话：${inst?.id ?? task.currentEmployee}${inst?.paseoAgentId ? `（Paseo agentId ${inst.paseoAgentId}；完整时间线：paseo logs ${inst.paseoAgentId}）` : ''}`,
             log ? `\n---\n${log.slice(-cfg.handoverChars)}` : '（无可用会话日志）',
           ].join('\n');
@@ -1187,7 +1230,7 @@ export class Dispatcher {
             this.deps.sidecar?.dropLease?.(task.currentEmployee, task.id);
             const scene = task.row.worktree;
             if (scene) await this.deps.reclaimWorktrees?.({ trigger: 'revoke', treeId: scene.id, repo: scene.repo }).catch(() => undefined);
-            this.log(`standby timeout ${task.id}: returned to gm gate`);
+            this.log(`standby timeout ${task.id}: returned to owner gate`);
           }
           continue;
         }
@@ -1261,7 +1304,7 @@ export class Dispatcher {
       }
     }
 
-    // 2b. Jev decisions: goal triage, release go/no-go, owner-escalation routing. Undecided items stay with gm/product.
+    // 2b. Jev decisions: goal triage, release go/no-go, owner-escalation routing. Undecided items stay with owner/product.
     if (this.deps.jev && cfg.jevDecisions) await this.jevDecisions(cfg, report);
     const tasks = await wf.tasks();
     // Execute gates for open engineering work are read before rotation, so a bound implementer's session is kept.
@@ -1401,11 +1444,11 @@ export class Dispatcher {
     this.passInputs.policyBlocks = policyBlocks;
     // Episodes of work that left the queue end here, before any pass-wide gate below returns early.
     await this.endStaleEpisodes(tasks, new Set(work.map(item => `${item.task.id}:${item.purpose}`)));
-    const gmBlocked = tasks.filter(t => t.state === 'blocked' && t.blockedTo === 'gm');
+    const ownerBlocked: SupervisedTask[] = []; // owner retired: blocked-to-owner waits for the boss in the owner inbox
     const usable = [...new Set(defs.filter(d => d.enabled).filter(d =>
       d.quotaLimited === false || (this.available(health.get(d.provider), now) !== 'down' && !quotaBlocked.has(d.provider)),
     ).map(d => d.provider))];
-    if ((work.length || gmBlocked.length) && usable.length === 0) {
+    if ((work.length || ownerBlocked.length) && usable.length === 0) {
       const exhausted = [...health.values()].filter(h => h.state === 'exhausted')
         .map(h => `${h.provider}（预计 ${new Date((h.until ?? now) * 1000).toLocaleString('zh-CN')} 后重试）`);
       const text = `所有订阅都已耗尽或限流，公司暂停派工。请为以下订阅充值或等待额度恢复：${
@@ -1427,7 +1470,7 @@ export class Dispatcher {
     // pass waits. Supervision above already ran — stalled leases still get reclaimed.
     // A probe error fails open (logged) rather than halting dispatch forever.
     let host = this.hostResources();
-    if (host && memoryBlocked(host,cfg.minFreeMemMb) && (work.length || gmBlocked.length)) {
+    if (host && memoryBlocked(host,cfg.minFreeMemMb) && (work.length || ownerBlocked.length)) {
       const slept = await reclaimMemoryLru({instances:insts,states,now,workforce:wf,paseo,log:text=>this.log(text)});
       if (slept) {
         states.set(slept.id,'sleeping');
@@ -1496,11 +1539,9 @@ export class Dispatcher {
     const rand = this.deps.rand ?? Math.random;
     // The candidate pool is evaluated by staffingPool — the same function the owner
     // page previews — so dispatch gating and the roster can never drift apart.
-    // Reserve only pending work; active manager turns are not waiting jobs.
-    const activeManagerTasks = new Set<string>();
-    if(factoryConfigured(defs,'gm') && typeof wf.openManagerWakes === 'function') {
-      for(const wake of await wf.openManagerWakes().catch(()=>[])) activeManagerTasks.add(wake.taskId);
-    }
+    // Reserve only pending work; active owner turns are not waiting jobs.
+    const activeOwnerTasks = new Set<string>();
+    // no owner wake ownership: owner-blocked work stays in the owner inbox
     const factoryCanRoute = availabilityOf(health.get(FACTORY_PROVIDER),now) !== 'down' && !quotaBlocked.has(FACTORY_PROVIDER);
     const poolBase = { factoryQueue:undefined as Map<string,number>|undefined, defs, states, holding, health, quotaBlocked, busyBy, policyBlocks,
       providerMax: cfg.providerMax, slots: slotMap, runtimeModels, opsRepo: this.deps.env.opsRepo,
@@ -1509,7 +1550,7 @@ export class Dispatcher {
     for(const item of work.filter(item=>item.purpose==='review')) queueRecusals.set(item.task.id,await readReviewRecusal(wf,item.task,message=>this.log(message)));
     const factoryWaiting = factoryQueue([
       ...work.map(item=>({task:item.task,role:item.role,review:item.purpose==='review'})),
-      ...gmBlocked.filter(task=>!task.waitState && !activeManagerTasks.has(task.id)).map(task=>({task,role:'gm',review:false})),
+      
     ].filter(item=>factoryCanRoute && !policyBlocks.has(item.task.id) && factoryConfigured(defs,item.role,item.task) &&
       (!item.review || queueRecusals.get(item.task.id)!==undefined) &&
       staffingPool({...poolBase,qualificationOnly:true,insts,role:item.role,home:item.task.repoPath??this.deps.env.opsRepo,task:item.task,
@@ -1560,7 +1601,7 @@ export class Dispatcher {
     /**
      * The binding outlives the employee: a struck implementer can never take its task back, and the execute gate keeps
      * every other engineer out, so the work would wait forever on someone who is gone. The system hands the code to a
-     * live engineer of the same repository on its own — no manager, no owner decision — and the next pass dispatches to
+     * live engineer of the same repository on its own — no owner, no owner decision — and the next pass dispatches to
      * it. With no candidate the verdict says so and the pass retries by itself. Returns true when the item was settled
      * here, so the caller leaves it to the next pass.
      */
@@ -1619,7 +1660,7 @@ export class Dispatcher {
     };
     /**
      * A bound implementer whose provider has failed quota repeatedly, or whose reset time is unknown, cannot be relied
-     * on to come back on its own. This is not a busy/capacity wait: the manager gets a takeover todo. A known short
+     * on to come back on its own. This is not a busy/capacity wait: the owner gets a takeover todo. A known short
      * cooldown stays a wait; one failure is not persistent.
      */
     const persistentQuotaImplementer = (task: SupervisedTask): { employee: string; until?: string; failures: number } | undefined => {
@@ -1717,7 +1758,7 @@ export class Dispatcher {
         }
         // SYS-DISP AC05 (R1): an engineering execute claim must leave the review that follows a legal path: a legal reuse
         // reviewer who is not the implementer, or a compliant spare seat. Otherwise nothing is claimed and the block goes to the
-        // manager. The reserved reviewer is logical only: no review lease, and this task's execute pool may not pick it.
+        // owner. The reserved reviewer is logical only: no review lease, and this task's execute pool may not pick it.
         let reserved: ReadonlySet<string> | undefined;
         if (item.purpose === 'execute' && item.task.executorRole === 'engineering' && item.task.reviewerRole !== 'owner') {
           const authors = await readReviewRecusal(wf, item.task, message => this.log(message));
@@ -1806,254 +1847,17 @@ export class Dispatcher {
         report.woke.push({ task: item.task.id, employee: result.id, spawned: result.spawned });
       }
     };
-    // Older manager work must get its chance before newer jobs borrow Factory capacity.
+    // Older owner work must get its chance before newer jobs borrow Factory capacity.
     const lateWork = work.filter(item => {
       const position=factoryWaiting.get(factoryWorkKey(item.role,item.task,item.purpose==='review'));
-      return position!==undefined && [...factoryWaiting].some(([key,n])=>key.endsWith(':manager') && n<position);
+      return position!==undefined && [...factoryWaiting].some(([key,n])=>key.endsWith(':owner') && n<position);
     });
     const lateKeys=new Set(lateWork.map(item=>item.task.id));
     await dispatchWorkItems(work.filter(item=>!lateKeys.has(item.task.id)));
     if (unplaced.length) await this.markGlobal(unplaced, globalBlock('max_running'), now, report, true);
 
-    // Manager actions: a ready/doing engineering task whose execute verdict needs a manager decision (unresolved
-    // implementer, no automatic successor, or a persistent implementer quota failure) becomes a durable todo. The
-    // same GmTodo feeds the gm prompt and the owner-facing verdict, so reason, action and time basis cannot drift.
-    const tasksById = new Map(tasks.map(task => [task.id, task]));
-    const workExecute = new Map(work.filter(item => item.purpose === 'execute').map(item => [item.task.id, item.task]));
-    const managerActionCode = (verdict: DispatchVerdict): BlockCode | undefined => {
-      const codes = verdict.reasons.map(reason => reason.code);
-      if (codes.includes('implementer_unresolved')) return 'implementer_unresolved';
-      if (codes.includes('implementer_quota')) return 'implementer_quota';
-      if (codes.includes('implementer_unavailable')) return 'implementer_unavailable';
-      return undefined;
-    };
-    type ManagerTodo = GmTodo & { purpose: string; key: string; episode: number; wakeEpisode: number; wakeReason: string; wakeDue: boolean };
-    const managerTodos: ManagerTodo[] = [];
-    for (const verdict of this.verdicts.values()) {
-      if (verdict.phase !== 'execute') continue;
-      const task = workExecute.get(verdict.taskId);
-      if (!task || task.executorRole !== 'engineering') continue;
-      const reasonCode = managerActionCode(verdict);
-      if (!reasonCode) continue;
-      const parsed = Date.parse(verdict.since ?? verdict.checkedAt);
-      const episode = Number.isFinite(parsed) ? parsed : now * 1000;
-      const key = managerActionKey(task.id, 'execute', episode, reasonCode);
-      const purpose = `gm-manager-action:${key}`;
-      let last: { at: number } | undefined;
-      let wakeDue = false;
-      try {
-        last = await wf.lastDispatch(task.id, 0, purpose);
-        wakeDue = !last || now - last.at >= cfg.redispatchMinutes * 60;
-      } catch (error) {
-        // Unknown throttle state is not a licence to wake again: keep the action and retry next pass.
-        this.log(`manager action throttle read failed for ${task.id}: ${(error as Error).message}`);
-      }
-      managerTodos.push({ task, action: 'implementer_takeover', expectedVersion: task.version, reasonCode, verdict, episode, key, purpose,
-        wakeEpisode: episode, wakeReason: reasonCode, wakeDue });
-    }
-
-    // Close todos that no longer describe the task; keep them on read failures and pass-wide gates.
-    let openActions: ManagerActionRow[] | undefined;
-    let managerReadFailed = false;
-    if (typeof wf.openManagerActions === 'function') {
-      try { openActions = await wf.openManagerActions(); }
-      catch (error) { this.log(`manager action read failed: ${(error as Error).message}`); managerReadFailed = true; }
-      if (openActions === undefined) {
-        // Fail closed: without the persisted open set we cannot dedupe a new wake or prove an old todo is resolved.
-        managerTodos.length = 0;
-        managerReadFailed = true;
-      }
-    }
-    if (openActions) {
-      const currentByKey = new Map(managerTodos.map(todo => [todo.key, todo]));
-      for (const action of openActions) {
-        const current = currentByKey.get(action.key);
-        if (current && current.task.implementer === action.implementer) continue;
-        const task = tasksById.get(action.taskId);
-        let resolution: string | undefined;
-        if (!task || task.currentEmployee || !['ready', 'doing'].includes(task.state)) {
-          resolution = 'task left the execute queue';
-        } else if (task.implementer !== action.implementer) {
-          resolution = 'implementer changed';
-        } else {
-          const verdict = this.verdicts.get(`${task.id}:execute`);
-          const codes = verdict?.reasons.map(reason => reason.code) ?? [];
-          // Unknown state and pass-wide gates are not evidence that the implementer problem is handled.
-          if (verdict && codes.length && !codes.some(code => GLOBAL_KEEP.has(code)) && !codes.includes(action.reason as BlockCode)) {
-            resolution = 'reason changed or cleared';
-          }
-        }
-        if (resolution) {
-          await wf.closeManagerAction(action, resolution).catch(error =>
-            this.log(`manager action close failed for ${action.taskId}: ${(error as Error).message}`));
-          if ((resolution === 'task left the execute queue' || resolution === 'implementer changed') && typeof wf.finishManagerWakesForTask === 'function') {
-            await wf.finishManagerWakesForTask(action.taskId, resolution).catch(error =>
-              this.log(`manager wake close failed for ${action.taskId}: ${(error as Error).message}`));
-          }
-        }
-      }
-    }
-
-    // Persist current todos before waking: a wake without a durable todo cannot be deduped after a restart.
-    for (const todo of managerTodos) {
-      if (typeof wf.openManagerAction !== 'function') continue;
-      try {
-        await wf.openManagerAction({ taskId: todo.task.id, phase: 'execute', episode: todo.episode, reason: todo.reasonCode!,
-          action: 'implementer_takeover', version: todo.task.version, repo: todo.task.repoPath ?? this.deps.env.opsRepo,
-          implementer: todo.task.implementer });
-      } catch (error) {
-        this.log(`manager action open failed for ${todo.task.id}: ${(error as Error).message}`);
-        todo.purpose = ''; // skip the wake below: it would have no durable todo
-      }
-    }
-
-    type PendingGm = GmTodo & { purpose?: string; wakeEpisode: number; wakeReason: string;
-      /** True when `wakeEpisode` is only a stand-in (the task version), not an episode start: see the SYS03 guard. */
-      episodeUnknown?: boolean;
-      /** The fault episodes this wake tells the manager about (SYS04: one episode, one notice). */
-      faultEpisodes?: string[]; faultStageStartedAt?: number };
-    const pendingGm: PendingGm[] = [];
-    // Batch audit reads up front: per-task blockLoops() would cost two round trips per
-    // blocked task, and on the ~50KB/s WSS channel hundreds of sequential lookups keep
-    // interactive RPCs queued past the daemon's 30s timeout.
-    const gmLoopStats = gmBlocked.length && typeof owner.blockLoopStats === 'function'
-      ? await owner.blockLoopStats(gmBlocked.map(t => t.id)).catch(() => new Map<string, { loops: number; reasons: string[] }>())
-      : undefined;
-    const gmLastDispatches = gmBlocked.length && typeof wf.lastDispatches === 'function'
-      ? await wf.lastDispatches(gmBlocked.map(t => t.id), 'gm-attention').catch(() => new Map<string, { employee: string; at: number }>())
-      : undefined;
-    for (const task of gmBlocked) {
-      const last = gmLastDispatches ? gmLastDispatches.get(`${task.id}:${task.version}`)
-        : await wf.lastDispatch(task.id, task.version, 'gm-attention');
-      // Quota-gated block: gm hears about it once, stays quiet until the reset instant, then gets one
-      // notice to resume. Inside the gate the 15-minute redispatch does not apply.
-      const quotaUntil = task.quotaResetsAt;
-      const gated = quotaUntil !== undefined && quotaUntil > now;
-      if (gated && last) continue;
-      const afterReset = quotaUntil !== undefined && !gated && (!last || last.at < quotaUntil);
-      if (!gated && last && now - last.at < cfg.redispatchMinutes * 60 && !afterReset) continue;
-      if (await this.breakLoop(task, cfg, report, gmLoopStats?.get(task.id)).catch(() => false)) continue;
-      pendingGm.push({ task, action: 'resume', expectedVersion: task.version,
-        wakeEpisode: task.dispatchBlockedSince ? task.dispatchBlockedSince * 1000 : task.version,
-        episodeUnknown: !task.dispatchBlockedSince,
-        wakeReason: 'blocked_to_gm' });
-    }
-    for (const todo of managerTodos) if (todo.purpose && todo.wakeDue) pendingGm.push(todo);
-
-    // SYS03 AC01：拉起新会话前核验这个 episode 的最新处置状态。上一条待办可能已经被另一个经理处置完了
-    // （resume/defer/依赖/retire/修复），或者正被另一位经理持活租约处理——这两种都不该再启动新会话。
-    // 已被处置的旧待办连同它在飞的 manager wake 在本轮就关掉，所以下一轮它不会再变成"旧提醒"。
-    // 读不到账本就整轮不发经理唤醒：宁可晚一轮，也不能凭一个读不到的 episode 再拉起一位经理。
-    if (pendingGm.length && typeof wf.dispositionFacts === 'function') {
-      const episodeKeys = [...new Set(pendingGm.map(todo => wf.episodeKey(todo.task.id, 'execute', todo.wakeEpisode)))];
-      const taskIds = [...new Set(pendingGm.map(todo => todo.task.id))];
-      let facts: Awaited<ReturnType<typeof wf.dispositionFacts>> | undefined;
-      try { facts = await wf.dispositionFacts({ episodes: episodeKeys, tasks: taskIds }); }
-      catch (error) { this.log(`disposition episode read failed: ${(error as Error).message}`); }
-      if (!facts) {
-        this.log('disposition episode state unavailable; suppressing all gm wake this pass');
-        pendingGm.length = 0;
-      } else {
-        const kept: PendingGm[] = [];
-        for (const todo of pendingGm) {
-          // SYS03 AC01：episode 身份就是（任务, 阶段, 开始时刻）。只有身份相等，才谈得上"这个 episode 已被处置"。
-          const exact = facts.byEpisode.get(wf.episodeKey(todo.task.id, 'execute', todo.wakeEpisode));
-          // byTask 兜底只在"调度器认不出这次提醒的身份"时可用：门禁任务的持久起点会被调度器自己清掉
-          // （见 dispositionFacts），提醒身上只剩任务版本号，按 episode 查必然落空。
-          // 兜底只认**仍在处理中**（claimed）的行——活租约说明现在正有经理在处理这个门禁，不该再拉起第二位；
-          // **decided 的行一律不兜底**：每个处置动作（resume/defer/retire/repair）都把任务带出经理门禁，
-          // 所以"任务此刻还在门禁里 + 有一条已处置的行"只可能意味着那是一条旧 episode，而这个任务已经形成了
-          // 全新的 episode；此时必须照常唤醒经理，否则这条提醒每轮都被旧处置压掉，任务永久饥饿（评审 AC01 缺口）。
-          const fallback = exact ?? (todo.episodeUnknown ? facts.byTask.get(todo.task.id) : undefined);
-          const row = exact ?? (fallback?.status === 'claimed' && fallback.holder && (fallback.leaseExpiresAt ?? 0) > now
-            ? fallback : undefined);
-          // 没有登记行是常态：这个 episode 还没有经理领过，照常唤醒。
-          if (!row) { kept.push(todo); continue; }
-          if (row.status === 'decided') {
-            const resolution = `episode already disposed (${row.decision?.action ?? 'decided'})`;
-            report.decisions.push(`gm-disposition-handled:${todo.task.id}`);
-            await wf.resolveDecidedEpisode({ taskId: todo.task.id, phase: row.phase, episodeMs: row.sinceMs, resolution })
-              .catch(error => this.log(`disposition episode close failed for ${todo.task.id}: ${(error as Error).message}`));
-            continue;
-          }
-          // 活租约：决定还在路上，等同 MR02 的在飞 episode，不再拉起第二位经理。租约失效后这里自然放行。
-          if (row.holder && (row.leaseExpiresAt ?? 0) > now) {
-            report.decisions.push(`gm-disposition-held:${todo.task.id}`);
-            continue;
-          }
-          kept.push(todo);
-        }
-        pendingGm.length = 0;
-        pendingGm.push(...kept);
-      }
-    }
-
-    // SYS04 AC04: the same cause does not wake the manager twice. An episode the manager was already told about
-    // keeps its manager todo quiet: one episode, one notice, whatever the employee reports afterwards. A new stage
-    // (new evidence, a configuration version change, or the repair finishing) opens a new episode, and that one
-    // wakes the manager again. An unreadable ledger fails closed for the pass: waking a manager for a cause that
-    // is already on their desk is exactly the repeated wake this package removes.
-    if (pendingGm.length && typeof wf.faultEpisodes === 'function') {
-      const taskIds = [...new Set(pendingGm.map(todo => todo.task.id))];
-      let facts: Awaited<ReturnType<typeof wf.faultEpisodes>> | undefined;
-      try { facts = await wf.faultEpisodes({ tasks: taskIds }); }
-      catch (error) { this.log(`fault episode read failed: ${(error as Error).message}`); }
-      if (!facts) {
-        report.decisions.push(`gm-fault-ledger-unreadable:${pendingGm.length}`);
-        this.log('fault episode state unavailable; suppressing all gm wake this pass');
-        pendingGm.length = 0;
-      } else {
-        const kept: PendingGm[] = [];
-        for (const todo of pendingGm) {
-          const episodes = facts.byTask.get(todo.task.id) ?? [];
-          const open = episodes.filter(episode => episode.state !== 'resolved' &&
-            faultBelongsToWait(episode.updatedAt, facts.blockedAt?.get(todo.task.id)));
-          const stageStartedAt = facts.blockedAt?.get(todo.task.id);
-          const pending = open.filter(episode => faultNeedsNotice(episode, stageStartedAt));
-          todo.faultStageStartedAt = stageStartedAt;
-          if (open.length && !pending.length) {
-            // The manager already has every open cause of this task on their desk.
-            report.decisions.push(`gm-fault-converged:${todo.task.id}`);
-            continue;
-          }
-          todo.faultEpisodes = pending.map(episode => episode.episode);
-          kept.push(todo);
-        }
-        pendingGm.length = 0;
-        pendingGm.push(...kept);
-      }
-    }
-
-    // Every current episode, not only the ones whose throttle expired, keeps its in-flight
-    // owner alive. Throttle controls a new wake; it must never release an old one.
-    const activeWakeKeys = new Set<string>();
-    for (const todo of managerTodos) activeWakeKeys.add(managerWakeKey(todo.task.id, 'execute', todo.wakeEpisode));
-    for (const task of gmBlocked) activeWakeKeys.add(managerWakeKey(task.id, 'execute',
-      task.dispatchBlockedSince ? task.dispatchBlockedSince * 1000 : task.version));
-    for (const action of openActions ?? []) activeWakeKeys.add(managerWakeKey(action.taskId, 'execute', action.episode));
-
-    // Restore the durable in-flight owner before any new external action. An unreadable
-    // ownership set is not evidence that the previous GM is gone: fail closed for this pass.
-    let wakeReadFailed = typeof wf.openManagerWakes !== 'function' || typeof wf.acquireManagerWake !== 'function';
-    if (!wakeReadFailed) {
-      let openWakes: ManagerWakeRow[] | undefined;
-      try { openWakes = await wf.openManagerWakes!(); }
-      catch (error) {
-        this.log(`manager wake read failed: ${(error as Error).message}`);
-      }
-      if (openWakes === undefined) wakeReadFailed = true;
-      else if (!managerReadFailed) {
-        await this.reconcileManagerWakes(openWakes, activeWakeKeys, now, report);
-      }
-    }
-    if (wakeReadFailed) {
-      this.log('manager wake ownership unavailable; suppressing all gm wake this pass');
-      pendingGm.length = 0;
-    }
-
-    // Only manager episodes still awaiting a real wake consume waiting slots.
-    const pendingManagerKeys=new Set(pendingGm.map(todo=>factoryWorkKey('gm',todo.task)));
-    for(const key of [...factoryWaiting.keys()]) if(key.endsWith(':manager') && !pendingManagerKeys.has(key)) leaveFactoryQueue(factoryWaiting,key);
+    // 老板岗位已撤销：执行窗口、依赖完成、阻塞与故障恢复都由老板在收件箱处理；调度器不再唤醒老板。
+    // Factory 保留项在此按原有次序补派。
     const dispatchLateBefore = async (position = Infinity) => {
       const ready=lateWork.filter(item=>(factoryWaiting.get(factoryWorkKey(item.role,item.task,item.purpose==='review'))??Infinity)<position || position===Infinity);
       for(const item of ready) lateWork.splice(lateWork.indexOf(item),1);
@@ -2061,145 +1865,6 @@ export class Dispatcher {
       await dispatchWorkItems(ready);
       if(unplaced.length>before) await this.markGlobal(unplaced.slice(before),globalBlock('max_running'),now,report,true);
     };
-    const granted: Array<{ todo: PendingGm; claim: ManagerWakeClaim }> = [];
-    for (const todo of pendingGm) {
-      const home = todo.task.repoPath ?? this.deps.env.opsRepo;
-      const noticeKey = `gm-unavailable:${home}:${workspaceScopeFor(todo.task.goalId)}`;
-      // Use the exact same pools as assign, without acquiring a wake only to
-      // immediately release it. This remains quiet across dispatcher restarts.
-      if (!eligibleInsts('gm', home, todo.task, false).length && !eligibleDefs('gm', home, todo.task).length) {
-        const shortage = managerShortage(poolFor('gm', home, todo.task, false), id => states.get(id) === 'busy');
-        const waitedMinutes = todo.episodeUnknown ? 0 : Math.floor((now * 1000 - todo.wakeEpisode) / 60_000);
-        if (shortage.queued && waitedMinutes < GM_QUEUE_NOTICE_MINUTES) {
-          // Every manager of this workspace is busy: the todo waits its turn, and the owner has nothing to fix.
-          report.decisions.push(`gm-queued:${todo.task.id}`);
-          await owner.resolveNotice(noticeKey);
-          continue;
-        }
-        const why = shortage.queued ? `本工作区经理已连续占满超过 ${GM_QUEUE_NOTICE_MINUTES} 分钟` : shortage.reasons.join('；');
-        await this.notice(noticeKey, `项目 ${repoName(home)} 暂无可用经理（${why}）；待办保留，候选恢复后自动唤醒。`, report);
-        continue;
-      }
-      await owner.resolveNotice(noticeKey);
-      if (running >= cfg.maxRunning) continue;
-      let claim: ManagerWakeClaim | undefined;
-      try {
-        claim = await wf.acquireManagerWake!({
-          taskId: todo.task.id, phase: 'execute', episode: todo.wakeEpisode, reason: todo.wakeReason,
-          version: todo.task.version, repo: todo.task.repoPath ?? this.deps.env.opsRepo,
-        }, wf.newKey());
-      } catch (error) {
-        this.log(`manager wake acquire failed for ${todo.task.id}: ${(error as Error).message}`);
-        continue;
-      }
-      if (!claim) {
-        report.decisions.push(`gm-wake-held:${todo.task.id}`);
-        continue;
-      }
-      granted.push({ todo, claim });
-    }
-    // A gm-unavailable notice is only re-checked while its workspace still has manager work, so once that work
-    // is gone (resumed by hand, retired, goal closed) nothing above would ever resolve it. Close the notices whose
-    // project/workspace has no manager-gate task left; throttled work still counts, so they do not flap.
-    if (!managerReadFailed) {
-      const live = new Set([...gmBlocked, ...managerTodos.map(todo => todo.task)].map(task =>
-        `gm-unavailable:${task.repoPath ?? this.deps.env.opsRepo}:${workspaceScopeFor(task.goalId)}`));
-      for (const notice of await owner.openNotices().catch(() => [])) {
-        if (notice.key.startsWith('gm-unavailable:') && !live.has(notice.key)) {
-          await owner.resolveNotice(notice.key);
-          report.decisions.push(`gm-unavailable-cleared:${notice.key}`);
-        }
-      }
-    }
-
-    // An instance lives in one Paseo workspace (one project), so gm-attention dispatches
-    // per repo: the group's readTask anchors pick home, per-project spawn quota,
-    // readWorkspace resolution and the cwd/repoHome fallback on the repo the blocked
-    // tasks actually belong to — a single anchorless assign would pin every project's
-    // gm batch onto the ops repo tree. Only episodes that won the durable wake CAS are
-    // in a group; an in-flight episode is never carried along in another GM's prompt.
-    const gmGroups = new Map<string, Array<{ todo: PendingGm; claim: ManagerWakeClaim }>>();
-    for (const item of granted) {
-      const home = item.todo.task.repoPath ?? this.deps.env.opsRepo;
-      const key = `${home}\0${item.todo.task.goalId ?? ''}`;
-      const group = gmGroups.get(key);
-      if (group) group.push(item); else gmGroups.set(key, [item]);
-    }
-    const orderedGmGroups=[...gmGroups.values()].sort((a,b)=>
-      Math.min(...a.map(item=>factoryWaiting.get(factoryWorkKey('gm',item.todo.task))??Infinity))-
-      Math.min(...b.map(item=>factoryWaiting.get(factoryWorkKey('gm',item.todo.task))??Infinity)));
-    for (const group of orderedGmGroups) {
-      await dispatchLateBefore(Math.min(...group.map(item=>factoryWaiting.get(factoryWorkKey('gm',item.todo.task))??Infinity)));
-      if (running >= cfg.maxRunning) {
-        for (const item of group) {
-          await wf.finishManagerWake(item.claim, 'finished', 'max_running gate held the wake').catch(error =>
-            this.log(`manager wake release failed for ${item.todo.task.id}: ${(error as Error).message}`));
-        }
-        continue;
-      }
-      let externalTouched = false;
-      let externalStarted = false;
-      const beforeExternal = async (inst: EmployeeInst, kind: 'send' | 'spawn') => {
-        externalTouched = true;
-        for (const item of group) {
-          const marked = await wf.markManagerWakeRunning(item.claim, inst.id, kind === 'send' ? inst.paseoAgentId : undefined);
-          if (!marked) throw new Error(`manager wake claim lost for ${item.todo.task.id}`);
-        }
-        externalStarted = true;
-      };
-      const afterExternal = async (inst: EmployeeInst, _kind: 'send' | 'spawn', agentId: string) => {
-        for (const item of group) {
-          const marked = await wf.markManagerWakeRunning(item.claim, inst.id, agentId);
-          if (!marked) throw new Error(`manager wake binding lost for ${item.todo.task.id}`);
-        }
-      };
-      let result: (EmployeeInst & { spawned: boolean }) | undefined;
-      // A batch containing a reserved waiter must not carry it into a fallback session.
-      const anchorTask = (group.find(item => (factoryWaiting.get(factoryWorkKey('gm', item.todo.task)) ?? Infinity) <= FACTORY_WAIT_LIMIT) ?? group[0])!.todo.task;
-      try {
-        result = await this.assign('gm', undefined, undefined, pick, spawnable,
-          (inst, first, claim, worktree) => gmAttention(inst, group.map(item => item.todo), this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, slotMap, undefined, { task: anchorTask }, { beforeExternal, afterExternal });
-      } catch (error) {
-        this.log(`manager wake assign failed: ${(error as Error).message}`);
-      }
-      if (!result) {
-        for (const item of group) {
-          if (externalTouched) {
-            const reason = externalStarted ? 'external action result was not observed' : 'wake start write was uncertain';
-            await wf.finishManagerWake(item.claim, 'unknown', reason, 'unknown').catch(error =>
-              this.log(`manager wake unknown write failed for ${item.todo.task.id}: ${(error as Error).message}`));
-            await this.notice(`manager-wake-unknown:${item.todo.task.id}`,
-              `经理待办 ${item.todo.task.id} 的唤醒尝试已开始但结果未确认（${reason}）。待办与审计保留，本轮不会再次唤醒或 spawn 第二位 GM；恢复路径：等待 Paseo 状态明确，或人工确认会话后清理该 episode。`, report);
-          } else {
-            await wf.finishManagerWake(item.claim, 'finished', 'no external action was started').catch(error =>
-              this.log(`manager wake release failed for ${item.todo.task.id}: ${(error as Error).message}`));
-          }
-        }
-        continue;
-      }
-      for (const item of group) {
-        leaveFactoryQueue(factoryWaiting,factoryWorkKey('gm',item.todo.task));
-        const marked = await wf.markManagerWakeRunning(item.claim, result.id, result.paseoAgentId).catch(error => {
-          this.log(`manager wake bind failed for ${item.todo.task.id}: ${(error as Error).message}`);
-          return false;
-        });
-        if (!marked) {
-          await wf.finishManagerWake(item.claim, 'unknown', 'wake binding update failed', 'unknown').catch(() => false);
-        }
-        if (item.todo.action === 'resume') await wf.recordDispatch(item.todo.task.id, item.todo.task.version, 'gm-attention', result.id);
-        else if (item.todo.purpose) await wf.recordDispatch(item.todo.task.id, 0, item.todo.purpose, result.id);
-        // SYS04: the wake went out, so this cause is on the manager's desk: the episode is notified once.
-        for (const episode of item.todo.faultEpisodes ?? []) {
-          await wf.markFaultEpisodeNotified?.(episode, item.todo.faultStageStartedAt).catch(error =>
-            this.log(`fault episode notify failed for ${episode}: ${(error as Error).message}`));
-        }
-      }
-      running++;
-      busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);
-      assigned.add(result.id);
-      report.woke.push(...group.map(item => ({ task: item.todo.task.id, employee: result!.id, spawned: result!.spawned })));
-    }
-
     await dispatchLateBefore();
 
     // SYS03 AC04：持久 outbox 的持有人通知。取消/依赖等待/恢复/撤租/接手/结果未知都已经和审计在同一个事务里落库，
@@ -2236,38 +1901,7 @@ export class Dispatcher {
       }
     }
 
-    const triage = await owner.triagePending();
-    if (triage.length && running < cfg.maxRunning) {
-      const due: typeof triage = [];
-      for (const goal of triage) {
-        const last = await wf.lastDispatch(`goal:${goal.id}`, 0, 'triage');
-        if (!last || now - last.at >= cfg.redispatchMinutes * 60) due.push(goal);
-      }
-      // Same per-repo anchoring as gm-attention: a due goal's project decides which
-      // shared worktree the gm triage session lands in. The goal has no task yet, so
-      // the anchor carries the resolved repo home plus the project id readWorkspace
-      // resolves; project-less goals stay on the ops repo tree.
-      const triageGroups = new Map<string, typeof due>();
-      for (const goal of due) {
-        const home = goal.repoPath ?? this.deps.env.opsRepo;
-        const key = `${home}\0${goal.id}`;
-        const group = triageGroups.get(key);
-        if (group) group.push(goal); else triageGroups.set(key, [goal]);
-      }
-      for (const group of triageGroups.values()) {
-        const home = group[0].repoPath ?? this.deps.env.opsRepo;
-        if (running >= cfg.maxRunning) break;
-        const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-          (inst, first, claim, worktree) => gmTriage(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, slotMap, undefined, { home, project: group[0].project, goalId: group[0].id, goalTitle: group[0].title });
-        if (!result) continue;
-        for (const goal of group) await wf.recordDispatch(`goal:${goal.id}`, 0, 'triage', result.id);
-        running++;
-        busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);
-        assigned.add(result.id);
-        report.woke.push(...group.map(g => ({ task: `goal:${g.id}`, employee: result.id, spawned: result.spawned })));
-      }
-    }
-
+    // Jev 拿不准的目标留在老板收件箱，由老板通过 owner 接口分级；不再拉起老板分级会话。
     await this.sweep(now);
     // Slow lazy pass over terminal-task artifacts: keeps evidence/deliverables from growing
     // without bound. Skipped when the resource gate already reclaimed above (pressure path).
@@ -2434,12 +2068,12 @@ export class Dispatcher {
       try { await work(); } catch (error) { this.log(`jev ${label} failed: ${(error as Error).message}`); }
     };
     for (const goal of await owner.triagePending()) {
-      // Once Jev was unsure and gm has been asked, gm owns the decision; do not re-ask Jev every tick.
+      // Once Jev was unsure and owner has been asked, owner owns the decision; do not re-ask Jev every tick.
       if (await wf.lastDispatch(`goal:${goal.id}`, 0, 'triage')) continue;
       await attempt(`triage ${goal.id}`, async () => {
         const { tier, confidence } = await jevTriage(jev, goal);
         if (!tier || confidence < cfg.jevMinConfidence) {
-          this.log(`jev unsure about goal ${goal.id} (${tier ?? '?'} @${confidence.toFixed(2)}); leaving it to gm`);
+          this.log(`jev unsure about goal ${goal.id} (${tier ?? '?'} @${confidence.toFixed(2)}); owner inbox`);
           return;
         }
         await owner.triage(goal.id, tier, `jev（${jev.model}，置信度 ${confidence.toFixed(2)}）`);
@@ -2466,22 +2100,7 @@ export class Dispatcher {
           }
         });
       }
-      if (task.state === 'blocked' && task.blockedTo === 'owner' && !task.ownerRerouted && task.jevRouteVersion !== task.version) {
-        await attempt(`route ${task.id}`, async () => {
-          const input = await wf.judgeInput(task.id);
-          const needs = await jevNeedsOwner(jev, input);
-          const verdict = `Jev 升级路由（${jev.model}）：必须老板决定的概率 ${needs.toFixed(2)}，阈值 ${cfg.jevOwnerThreshold}。`;
-          if (needs < cfg.jevOwnerThreshold && await wf.rerouteToGm(task.id, task.version,
-            `${verdict}
-这个问题不属于老板专属事项，改由经理决定。经理确实判断需要老板时，可让员工再次 report_blocker(to=owner)，不会再被改派。`)) {
-            report.decisions.push(`reroute:${task.id}`);
-            this.log(`jev rerouted owner question ${task.id} to gm (${needs.toFixed(2)})`);
-          } else {
-            await wf.jevAdvice(task.id, 'jev_route_version', task.version, `${verdict}
-结论：保留给老板。`);
-          }
-        });
-      }
+      // 老板阻塞不再自动改派：老板在收件箱答复、放行或作废。
     }
   }
 
@@ -2506,84 +2125,6 @@ export class Dispatcher {
     const now = Date.now();
     for (const [id, deny] of this.taskDeny) if (now - deny.at >= CLAIM_DENY_COOLDOWN_MS) this.taskDeny.delete(id);
     this.taskDeny.set(task.id, { at: now, version: task.version });
-  }
-
-  /**
-   * Reconcile persisted wake ownership against the external session state before a new
-   * wake can be considered. running/initializing keeps ownership; idle after the turn
-   * grace, archived, missing or error releases it for a controlled retry; unknown,
-   * unreadable or mismatched evidence stays unknown and is never treated as idle.
-   */
-  private async reconcileManagerWakes(openWakes: ManagerWakeRow[], activeKeys: ReadonlySet<string>, now: number, report: TickReport): Promise<void> {
-    const { workforce: wf, paseo, owner } = this.deps;
-    for (const row of openWakes) {
-      const claim = wf.wakeClaim(row);
-      const noticeKey = `manager-wake-unknown:${row.taskId}`;
-      if (!activeKeys.has(row.key)) {
-        await wf.finishManagerWake(claim, 'finished', 'episode left the execute queue', row.lastStatus).catch(error =>
-          this.log(`manager wake close failed for ${row.taskId}: ${(error as Error).message}`));
-        await owner.resolveNotice(noticeKey).catch(() => undefined);
-        continue;
-      }
-      // Pending with no external-start marker is only a crashed pre-assign attempt after a
-      // conservative grace. A live concurrent dispatcher is inside that grace.
-      if (row.state === 'pending' && !row.externalStartedAt) {
-        if (now - (row.startedAt ?? 0) >= MANAGER_WAKE_PENDING_GRACE_SECONDS) {
-          await wf.finishManagerWake(claim, 'finished', 'pending attempt expired before external action', row.lastStatus).catch(error =>
-            this.log(`manager wake pending release failed for ${row.taskId}: ${(error as Error).message}`));
-        }
-        continue;
-      }
-      if (!row.agent) {
-        const reason = row.externalStartedAt ? 'external action started without a bound agent' : 'agent not recorded';
-        await wf.finishManagerWake(claim, 'unknown', reason, 'unknown').catch(error =>
-          this.log(`manager wake unknown write failed for ${row.taskId}: ${(error as Error).message}`));
-        await this.notice(noticeKey,
-          `经理唤醒 ${row.taskId} 第 ${row.attempt} 次尝试无法核定 Paseo 会话（${reason}）。待办与审计保留，本轮不会再次唤醒；恢复路径：等待会话绑定恢复，或人工确认后清理该 episode。`, report);
-        continue;
-      }
-      let observed: { status: string; pendingPermissions: number } | undefined;
-      try {
-        observed = await paseo.status(row.agent);
-      } catch (error) {
-        await wf.finishManagerWake(claim, 'unknown', `status read failed: ${(error as Error).message.slice(0, 120)}`, 'unknown').catch(() => false);
-        await this.notice(noticeKey,
-          `经理唤醒 ${row.taskId} 第 ${row.attempt} 次尝试状态读取失败。待办与审计保留，本轮不会再次唤醒；恢复路径：等待 Paseo 可读或人工确认。`, report);
-        continue;
-      }
-      const status = observed?.status;
-      if (status === 'running' || status === 'initializing') {
-        await wf.markManagerWakeRunning(claim, row.employee ?? 'unknown', row.agent).catch(error =>
-          this.log(`manager wake running write failed for ${row.taskId}: ${(error as Error).message}`));
-        await owner.resolveNotice(noticeKey).catch(() => undefined);
-        continue;
-      }
-      if (status === 'idle') {
-        const since = row.externalStartedAt ?? row.startedAt ?? 0;
-        if (since && now - since >= MANAGER_WAKE_TURN_GRACE_SECONDS) {
-          await wf.finishManagerWake(claim, 'finished', 'session turn ended without resolving the manager todo', 'idle').catch(error =>
-            this.log(`manager wake idle release failed for ${row.taskId}: ${(error as Error).message}`));
-          await owner.resolveNotice(noticeKey).catch(() => undefined);
-        }
-        continue;
-      }
-      if (status === 'archived' || status === undefined) {
-        await wf.finishManagerWake(claim, 'finished', status === 'archived' ? 'session archived' : 'session not found', status ?? 'missing').catch(error =>
-          this.log(`manager wake invalid release failed for ${row.taskId}: ${(error as Error).message}`));
-        await owner.resolveNotice(noticeKey).catch(() => undefined);
-        continue;
-      }
-      if (status === 'error') {
-        await wf.finishManagerWake(claim, 'finished', 'session error before resolving the manager todo', 'error').catch(error =>
-          this.log(`manager wake error release failed for ${row.taskId}: ${(error as Error).message}`));
-        await owner.resolveNotice(noticeKey).catch(() => undefined);
-        continue;
-      }
-      await wf.finishManagerWake(claim, 'unknown', `unrecognized session state: ${status}`, 'unknown').catch(error =>
-        this.log(`manager wake unknown state write failed for ${row.taskId}: ${(error as Error).message}`));
-      await this.notice(noticeKey,
-        `经理唤醒 ${row.taskId} 第 ${row.attempt} 次尝试处于未知状态（${status}）。待办与审计保留，本轮不会再次唤醒；恢复路径：等待 Paseo 状态明确，或人工确认会话后清理该 episode。`, report);
-    }
   }
 
   private async assign(
@@ -2653,8 +2194,11 @@ export class Dispatcher {
           // instance's claim re-resolves the same registered worktree, so its
           // spawn cwd matches by construction.
         } else {
+          const step: MessageStep = task?.state === 'review' ? 'review' : claim?.history?.some(h => h.action === 'return' || h.action === 'owner_reject') ? 'rework' : 'execute';
+          const body = task ? await this.outbound(task.id, step, existing.id, (claim?.worktree ?? workspace)?.worktreePath) : null;
+          if (task && body === null) { if (claim) await sidecar!.releaseClaim(existing.id, task.id, '消息需要老板放行'); return undefined; }
           await hooks?.beforeExternal?.(existing, 'send');
-          await paseo.send(existing.paseoAgentId!, prompt(existing, first, claim, workspace));
+          await paseo.send(existing.paseoAgentId!, task && body ? body : prompt(existing, first, claim, workspace));
           await hooks?.afterExternal?.(existing, 'send', existing.paseoAgentId!);
           this.onboarded.add(existing.id);
           this.lastStatus.set(existing.paseoAgentId!, 'running');
@@ -2705,6 +2249,9 @@ export class Dispatcher {
         // Legacy instances keep their existing launch directory until normal retirement.
         const instHome = sidecar?.commDirFor(inst.id);
         const spawnCwd = workspaceScope ? repoHome : instHome ?? (claim?.worktree ?? workspace)?.worktreePath ?? repoHome;
+        const step: MessageStep = task?.state === 'review' ? 'review' : claim?.history?.some(h => h.action === 'return' || h.action === 'owner_reject') ? 'rework' : 'execute';
+        const body = task ? await this.outbound(task.id, step, inst.id, spawnCwd) : null;
+        if (task && body === null) { if (claim) await sidecar!.releaseClaim(inst.id, task.id, '消息需要老板放行'); return undefined; }
         await hooks?.beforeExternal?.(inst, 'spawn');
         const agentId = await paseo.spawn({
           title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model, thinking: def.thinking,
@@ -2713,7 +2260,7 @@ export class Dispatcher {
           workspaceScope, repoHome,
           labels: { company: 'surreal-ck', employee_id: inst.id, role: def.role, def: def.id, ...(workspaceScope ? { goal_id: workspaceScope } : {}) },
           env: spawnEnv,
-          prompt: prompt(inst, true, claim, workspace),
+          prompt: task && body ? body : prompt(inst, true, claim, workspace),
         });
         await hooks?.afterExternal?.(inst, 'spawn', agentId);
         const cwd = spawnCwd;
@@ -2962,7 +2509,7 @@ export class Dispatcher {
     }
   }
 
-  /** True when the task kept bouncing between employee and manager and was handed to the owner instead of waking the manager again. */
+  /** True when the task kept bouncing between employee and owner and was handed to the owner instead of waking the owner again. */
   private async breakLoop(task: SupervisedTask, cfg: CompanyConfig, report: TickReport,
       prefetched?: { loops: number; reasons: string[] }): Promise<boolean> {
     if (cfg.blockLoopLimit <= 0) return false;
@@ -2970,7 +2517,7 @@ export class Dispatcher {
     const { loops, reasons } = prefetched ?? await owner.blockLoops(task.id);
     if (loops < cfg.blockLoopLimit || !(await owner.escalateLooping(task, loops, reasons))) return false;
     report.decisions.push(`escalate-loop:${task.id}`);
-    this.log(`task ${task.id} blocked on manager ${loops} times; loop recovery handled`);
+    this.log(`task ${task.id} blocked on owner ${loops} times; loop recovery handled`);
     return true;
   }
 

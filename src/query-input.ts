@@ -236,7 +236,7 @@ function parseSegmentWindow(input: Record<string, unknown>): { offset: number; l
 
 /**
  * Arguments of read_worktree_refs (SYS01 R1): the worktree a paged listing item named, the same includeReleased the listing
- * used, and the byte window a reader continues with. A global read (no taskId) is gm only, as on list_worktrees.
+ * used, and the byte window a reader continues with. A global read (no taskId) is owner only, as on list_worktrees.
  */
 export function parseWorktreeRefsInput(input: Record<string, unknown>): {
   taskId?: string; worktreePath: string; includeReleased: boolean; offset: number; limit: number; expectSha256?: string;

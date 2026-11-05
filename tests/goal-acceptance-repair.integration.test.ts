@@ -24,9 +24,9 @@ let gm: string, gm2: string, gmNoManage: string, productManage: string, productW
 beforeAll(async () => {
   await database.connect();
   await database.bootstrap();
-  gm = await enrollment.enroll(`gar-gm-${suffix}`, 'gm', ['execute', 'review', 'manage']);
-  gm2 = await enrollment.enroll(`gar-gm2-${suffix}`, 'gm', ['execute', 'review', 'manage']);
-  gmNoManage = await enrollment.enroll(`gar-gm3-${suffix}`, 'gm', ['execute', 'review']);
+  gm = await enrollment.enroll(`gar-gm-${suffix}`, 'owner', ['execute', 'review', 'manage']);
+  gm2 = await enrollment.enroll(`gar-gm2-${suffix}`, 'owner', ['execute', 'review', 'manage']);
+  gmNoManage = await enrollment.enroll(`gar-gm3-${suffix}`, 'owner', ['execute', 'review']);
   productManage = await enrollment.enroll(`gar-pm-${suffix}`, 'product', ['execute', 'review', 'manage']);
   productWorker = await enrollment.enroll(`gar-pw-${suffix}`, 'product', ['execute', 'review']);
   eng = await enrollment.enroll(`gar-eng-${suffix}`, 'engineering', ['execute', 'review']);
@@ -93,7 +93,7 @@ async function quickGoal() {
     goalId: goal.id,
     d0: pick(row => row.kind === 'release'),
     d1: pick(row => row.kind === 'deploy'),
-    manual: pick(row => row.executor_role === 'product' && row.reviewer_role === 'gm'),
+    manual: pick(row => row.executor_role === 'product' && row.reviewer_role === 'owner'),
   };
 }
 
@@ -107,7 +107,7 @@ async function voidedGoal() {
 async function createCandidate(goalId: string, dependencies: string[], executorRole: 'product' | 'engineering' = 'product') {
   const task = await core.createTask(gm, {
     title: `[修复] 运营验收候选 ${suffix} ${++seq}`, context: '夹具：quick 目标的运营验收候选，等待全部业务工作完成。',
-    executorRole, reviewerRole: 'gm', kind: 'task', goalId, dependencies, idempotencyKey: key('candidate'),
+    executorRole, reviewerRole: 'owner', kind: 'task', goalId, dependencies, idempotencyKey: key('candidate'),
   });
   return task.id;
 }
@@ -134,7 +134,7 @@ test('repro: a voided quick acceptance keeps the goal on a dead anchor, and new 
   expect((await taskRow(f.manual)).state).toBe('void');
   const followup = await core.createTask(gm, {
     title: `[后续] 修复前新增 ${suffix}`, context: '夹具：作废锚点之后新增的业务工作。',
-    executorRole: 'qa', reviewerRole: 'gm', goalId: f.goalId, idempotencyKey: key('followup'),
+    executorRole: 'qa', reviewerRole: 'owner', goalId: f.goalId, idempotencyKey: key('followup'),
   });
   // The dead anchor never gains the new dependency, so the goal has no open acceptance to wait on it.
   expect(depsOf(await taskRow(f.manual))).toEqual([f.d1].sort());
@@ -180,7 +180,7 @@ test('gm repair repoints references and anchors in one audited step, keeps the v
   const view = await preview(f.goalId, f.candidate);
   const result = await repair(inputFor(f, view.snapshot.hash, 'allow'));
   expect(result).toMatchObject({ goalId: f.goalId, replacedTaskId: f.manual, anchors: [f.candidate], snapshotHash: view.snapshot.hash });
-  expect(result.candidate).toMatchObject({ id: f.candidate, state: 'blocked', executorRole: 'product', reviewerRole: 'gm' });
+  expect(result.candidate).toMatchObject({ id: f.candidate, state: 'blocked', executorRole: 'product', reviewerRole: 'owner' });
   const goal = await goalRow(f.goalId);
   expect(asId(goal.tasks.manual)).toBe(f.candidate);
   expect(asId(goal.tasks.acceptance)).toBe(f.candidate);
@@ -195,7 +195,7 @@ test('gm repair repoints references and anchors in one audited step, keeps the v
   // Work added after the repair waits on the live candidate, not on the void task.
   const followup = await core.createTask(gm, {
     title: `[后续] 修复后新增 ${suffix}`, context: '夹具：修复之后新增的业务工作。',
-    executorRole: 'qa', reviewerRole: 'gm', goalId: f.goalId, idempotencyKey: key('followup'),
+    executorRole: 'qa', reviewerRole: 'owner', goalId: f.goalId, idempotencyKey: key('followup'),
   });
   const candidateNow = await core.getTask(gm, f.candidate);
   expect(candidateNow.dependencies).toEqual(expect.arrayContaining([f.d0, f.d1, followup.id]));
@@ -275,7 +275,7 @@ test('unfinished work must be covered, dependency cycles are refused, and a cand
   const cyclic = await incident();
   const waiter = await core.createTask(gm, {
     title: `[后续] 反向依赖 ${suffix}`, context: '夹具：依赖候选的业务工作，用于验证环检测。',
-    executorRole: 'qa', reviewerRole: 'gm', goalId: cyclic.goalId, dependencies: [cyclic.candidate], idempotencyKey: key('waiter'),
+    executorRole: 'qa', reviewerRole: 'owner', goalId: cyclic.goalId, dependencies: [cyclic.candidate], idempotencyKey: key('waiter'),
   });
   // Force the candidate to also wait on the waiter, which already waits on the candidate.
   await database.db.query('UPDATE ONLY $candidate SET dependencies += $waiter;', { candidate: id('task', cyclic.candidate), waiter: id('task', waiter.id) });
@@ -379,7 +379,7 @@ test('the repaired goal closes only after every dependency is done and the candi
   await repair(inputFor(f, (await preview(f.goalId, f.candidate)).snapshot.hash, 'close'));
   const followup = await core.createTask(gm, {
     title: `[后续] 真实登录补验 ${suffix}`, context: '夹具：修复后仍需完成的业务工作。',
-    executorRole: 'qa', reviewerRole: 'gm', goalId: f.goalId, idempotencyKey: key('followup'),
+    executorRole: 'qa', reviewerRole: 'owner', goalId: f.goalId, idempotencyKey: key('followup'),
   });
   await complete(eng, productWorker, f.d0);
   expect((await taskRow(f.d1)).state).toBe('ready');

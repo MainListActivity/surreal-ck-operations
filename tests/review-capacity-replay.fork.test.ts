@@ -67,7 +67,7 @@ async function openFork(name: string): Promise<Fork> {
   expect(ready).toBe(true);
   await db.connect(); await db.bootstrap();
   const core = new SurrealCompanyCore(db), enrollment = new LocalEnrollmentAdmin(db), owner = new OwnerDesk(db);
-  const gm = await enrollment.enroll('fixture-manager', 'gm', ['execute', 'review', 'manage']);
+  const gm = await enrollment.enroll('fixture-manager', 'owner', ['execute', 'review', 'manage']);
   // Quota floor 20%: the codex rows below are at 0%, which is quota-blocked. provider_max sets the codex concurrency cap.
   await db.db.upsert(new RecordId('company_meta', 'config')).content({ eval_enabled: false, jev_decisions: false, quota_floor_pct: 20,
     quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0, provider_max: { codex: 3, grok: 2 } });
@@ -149,7 +149,7 @@ async function buildThreeAuthorReview(w: Fork) {
     reason: 'synthetic B5: 经理指定 B 续做，A 的席位与额度不可用', idempotencyKey: 'b5-takeover-b' });
   const claimB = await core.claim(B.credential, T1.id);
   expect(claimB.task).toMatchObject({ state: 'doing', implementer: B.id });
-  await core.block(B.credential, proofOf(T1.id, claimB), 'gm', { text: 'synthetic B block to gm for the B5 handoff', idempotencyKey: 'b5-b-block' });
+  await core.block(B.credential, proofOf(T1.id, claimB), 'owner', { text: 'synthetic B block to gm for the B5 handoff', idempotencyKey: 'b5-b-block' });
   expect(await core.getTask(gm, T1.id)).toMatchObject({ state: 'blocked' });
   // The manager resumes the task: it is ready again with B as the recorded implementer. A is refused execute while B is bound.
   await core.resume(gm, T1.id, { text: 'synthetic manager resume after the B5 block', idempotencyKey: 'b5-resume-1' });
@@ -229,7 +229,7 @@ run('B5 three-author review replay: no review candidate qualifies, the roster an
     expect(reviewVerdict.reasons.map(r => r.code)).toEqual(['author_recusal', 'seat_full']);
     expect(reviewVerdict.reasons.find(r => r.code === 'author_recusal')!.candidates).toEqual([A.id, B.id, C.id].sort());
     expect(reviewVerdict.reasons.find(r => r.code === 'seat_full')!.candidates).toEqual([`spawn:${FIXTURE_ENG}`]);
-    expect(reviewVerdict.reasons.find(r => r.code === 'seat_full')!.actions).toEqual([expect.objectContaining({ authority: 'gm', tool: 'def_ensure', executable: true })]);
+    expect(reviewVerdict.reasons.find(r => r.code === 'seat_full')!.actions).toEqual([expect.objectContaining({ authority: 'owner', tool: 'def_ensure', executable: true })]);
     // The execute verdict of T2: the codex seats are quota-blocked, and the reviewer of the work is reserved (R1).
     const executeVerdict = snapshot.verdicts.find(v => v.taskId === T2.id && v.phase === 'execute')!;
     expect(executeVerdict).toMatchObject({ dispatchable: false, eligibleCount: 0, workflowState: 'ready' });

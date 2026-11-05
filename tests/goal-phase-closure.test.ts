@@ -3,7 +3,7 @@ import {assessGoal,type GoalFact,type GoalTaskFact} from '../src/goal-governance
 const goal:GoalFact={id:'g',title:'阶段一',brief:'已交付范围',state:'needs_repair',tasks:{acceptance:'final'},anchors:['final']};
 const done=(id:string,extra:Partial<GoalTaskFact>={}):GoalTaskFact=>({id,title:id,state:'done',kind:'task',executorRole:'engineering',reviewerRole:'qa',dependencies:[],...extra});
 const final=done('final',{kind:'gate',reviewerRole:'owner',acceptedBy:'owner'});
-const outcome={expected:'阶段一已交付范围',requiredEvidence:['implementation','owner_final'] as const,responsibleRole:'gm',version:1,source:'owner'};
+const outcome={expected:'阶段一已交付范围',requiredEvidence:['implementation','owner_final'] as const,responsibleRole:'owner',version:1,source:'owner'};
 const assess=(tasks:GoalTaskFact[],extra:Record<string,unknown>={})=>assessGoal({goal,tasks,outcome:{...outcome,requiredEvidence:[...outcome.requiredEvidence]},now:Date.now(),...extra});
 test('completed historical edges to the next phase stay disclosed without reopening accepted work',()=>{
  const historical=done('old',{dependencies:['next','external']});

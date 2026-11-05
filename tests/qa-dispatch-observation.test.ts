@@ -3,7 +3,7 @@ import { expect, test } from 'bun:test';
 import { persistDispatchObservation, QA_DISPATCH_ITEM_MAX_BYTES } from '../plugin/server/dispatch.ts';
 import { qaDispatchFor } from '../src/qa-observation.ts';
 
-const reason = (i: number) => ({ code: `r${i}`, text: `reason ${i}`, candidates: [], owner: 'gm', recovery: '', nextTrigger: '', basis: '' });
+const reason = (i: number) => ({ code: `r${i}`, text: `reason ${i}`, candidates: [], owner: 'owner', recovery: '', nextTrigger: '', basis: '' });
 const verdict = (taskId: string, reasons: any[]) => ({ taskId, phase: 'review', dispatchable: false, workflowState: 'review', eligibleCount: 0, feasible: false, summary: 's', checkedAt: '2026-10-22T00:00:00Z', waitingMinutes: 1, reasons });
 const ctxFor = (verdicts: any[], onQuery: (q: string, vars: any) => void = () => {}) => ({
   dispatcher: { dispatchSnapshot: () => ({ at: Date.now(), verdicts }) },

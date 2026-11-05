@@ -24,7 +24,7 @@ run(
       const {Workforce}=await import('../src/workforce.ts');
       const {planRoutingRoster}=await import('../src/model-routing/roster.ts');
       const wf=new Workforce(db,'/unused-fixture-credentials');
-      await wf.upsertDef('gm-grok',{role:'gm',provider:'grok',model:'old-gm'});
+      await wf.upsertDef('gm-grok',{role:'owner',provider:'grok',model:'old-gm'});
       await wf.upsertDef('story-claude',{role:'story-author',provider:'claude',model:'keep-story',tracks:['原著']});
       const before=await wf.defs();
       for(const d of planRoutingRoster(before)) await wf.upsertDef(d.id,{role:d.role as any,provider:d.provider,model:d.model,enabled:d.enabled,tracks:d.tracks,maxInstances:d.maxInstances,quotaLimited:d.quotaLimited});

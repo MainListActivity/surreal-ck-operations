@@ -83,12 +83,12 @@ test('workflow wait roots classify active lease and gates, count only in-goal im
       ['lease', task('lease', { state: 'review', reviewerRole: 'qa', currentEmployee: 'qa-1', leaseExpiresAt: Date.parse(collectedAt) / 1000 + 60 })],
       ['wait-1', task('wait-1', { dependencies: ['lease'] })],
       ['wait-2', task('wait-2', { dependencies: ['wait-1'] })],
-      ['manager', task('manager', { blockedTo: 'gm' })],
+      ['owner-blocked', task('owner-blocked', { blockedTo: 'owner' })],
       ['owner', task('owner', { blockedTo: 'owner' })],
     ]) };
   const summary = goalWorkflowWaitRoots(facts);
   expect(summary).toMatchObject({ available: true, checkedAt: collectedAt, totalRoots: 3, shownRoots: 3 });
-  expect(summary.roots.map(root => root.kind)).toEqual(['manager', 'owner', 'active_lease']);
+  expect(summary.roots.map(root => root.kind)).toEqual(['owner', 'owner', 'active_lease']);
   expect(summary.roots[2]).toMatchObject({ taskId: 'lease', workflowState: 'review', impact: 2,
     dependencyPath: [{ taskId: 'lease', title: 'lease' }, { taskId: 'wait-1', title: 'wait-1' }, { taskId: 'wait-2', title: 'wait-2' }] });
 });

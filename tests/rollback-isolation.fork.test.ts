@@ -75,13 +75,13 @@ async function openFork(namespace: string): Promise<CompanyDatabase> {
  */
 async function seedFixture(database: CompanyDatabase, scratch: string): Promise<{ core: SurrealCompanyCore; gm: string }> {
   const core = new SurrealCompanyCore(database);
-  const gm = await new LocalEnrollmentAdmin(database).enroll('rb01-gm', 'gm', ['execute', 'review', 'manage']);
+  const gm = await new LocalEnrollmentAdmin(database).enroll('rb01-gm', 'owner', ['execute', 'review', 'manage']);
   await database.db.upsert(id('company_meta', 'config')).content({
     eval_enabled: false, jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0,
   });
   const wf = new Workforce(database, join(scratch, 'unused-credential-files'));
   await wf.upsertDef('rb01-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 2 });
-  await wf.upsertDef('rb01-gm', { role: 'gm', provider: 'codex', model: 'fixture', maxInstances: 1 });
+  await wf.upsertDef('rb01-gm', { role: 'owner', provider: 'codex', model: 'fixture', maxInstances: 1 });
   const make = (title: string, context: string) =>
     core.createTask(gm, { title, context, executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `rb01-${title}` });
   await make('rb01-ready', '就绪任务：旧版调度应认领，作为阳性对照。');
@@ -102,7 +102,7 @@ async function seedFixture(database: CompanyDatabase, scratch: string): Promise<
   await database.db.query('UPDATE ONLY $t SET state = "blocked", blocked_to = NONE, dependencies = [$dep], version = version + 1;',
     { t: at('rb01-waiting'), dep: at('rb01-ready-long') });
   await database.db.query('UPDATE ONLY $t SET state = "blocked", blocked_to = "owner", version = version + 1;', { t: at('rb01-gated-owner') });
-  await database.db.query('UPDATE ONLY $t SET state = "blocked", blocked_to = "gm", version = version + 1;', { t: at('rb01-gated-gm') });
+  await database.db.query('UPDATE ONLY $t SET state = "blocked", blocked_to = "owner", version = version + 1;', { t: at('rb01-gated-gm') });
   await database.db.query('UPDATE ONLY $t SET state = "doing", current_employee = "rb01-held-employee", lease_expires_at = time::unix(time::now()) + 3600, version = version + 1;',
     { t: at('rb01-held') });
   await database.db.query('UPDATE ONLY $t SET state = "done", version = version + 1;', { t: at('rb01-done') });
@@ -270,7 +270,7 @@ run('RB01 rollback isolation: previous release against new-version data', () => 
     expect(b['rb01-done']).toMatchObject({ state: 'done', occupied: false });
     expect(b['rb01-void']).toMatchObject({ state: 'void', occupied: false });
     // gm-gated work: the previous release's gm-attention notice is its designed behaviour; an executor claim is not.
-    expect(b['rb01-gated-gm']).toMatchObject({ state: 'blocked', blockedTo: 'gm', occupied: false });
+    expect(b['rb01-gated-gm']).toMatchObject({ state: 'blocked', blockedTo: 'owner', occupied: false });
     expect(b['rb01-gated-gm'].dispatch.execute).toBe(false);
     expect(b['rb01-gated-gm'].dispatch['gm-attention']).toBe(true);
   });

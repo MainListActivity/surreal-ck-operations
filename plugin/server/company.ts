@@ -9,6 +9,7 @@ import { homedir } from "node:os";
 import { readProviderQuotas } from "./dispatch";
 import { setAgentModel } from "./vendor/src/dispatcher/agent-model.ts";
 import { dispatcherLogSink } from "./vendor/src/dispatcher/log-sink.ts";
+import { OutboundMessageStore } from "./vendor/src/outbound-messages.ts";
 
 export interface Company {
   upgrades: import("./vendor/src/company-upgrades.ts").CompanyUpgrades;
@@ -25,6 +26,7 @@ export interface Company {
   /** Agent home repo — the default project staffing pools are scoped to. */
   opsRepo: string;
   ops: import("./vendor/src/ops/broker").OpsBroker;
+  messages: OutboundMessageStore;
 }
 
 let boot: Promise<Company> | undefined;
@@ -198,9 +200,11 @@ export function company(): Promise<Company> {
       const agent=requestAgents.get(id);requestAgents.delete(id);
       if(agent){try{metricStore.complete(agent,id,done,metrics);}catch{console.warn('agent model metrics: local completion unavailable');}}
     }});
+    const messages = new OutboundMessageStore(db.db);
     const dispatcher = new Dispatcher({
       workforce,
       owner,
+      messages,
       paseo,
       env: {
         opsRepo,
@@ -249,7 +253,7 @@ export function company(): Promise<Company> {
     routingReady=true;
     const {CompanyUpgrades}=await import("./vendor/src/company-upgrades.ts");
     const upgrades=new CompanyUpgrades(db,owner,{home:serviceHome(),repo:opsRepo});
-    return readyCompany={ upgrades, modelJournal, modelRouting, modelRanking, stopModelGateway:async()=>{modelRanking.stop();await modelGateway.stop();}, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops };
+    return readyCompany={ upgrades, modelJournal, modelRouting, modelRanking, messages, stopModelGateway:async()=>{modelRanking.stop();await modelGateway.stop();}, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops };
   })();
   boot.catch(() => { boot = undefined; }); // a failed boot must not poison later calls
   return boot;

@@ -697,7 +697,7 @@ describe('sync_generate zero-spend gate', () => {
     approval({ project: 'other-project' }, 'wrong-project.json');
     expect((await fail(call(s, 'sync_generate', args))).code).toBe('payment_approval_required');
     rmSync(priv('approvals/wrong-project.json'));
-    approval({ issuer: 'gm' }, 'wrong-issuer.json');
+    approval({ issuer: 'owner' }, 'wrong-issuer.json');
     expect((await fail(call(s, 'sync_generate', args))).code).toBe('payment_approval_required');
     writeFileSync(priv('approvals/broken.json'), '{not json');
     expect((await fail(call(s, 'sync_generate', args))).code).toBe('payment_approval_required');

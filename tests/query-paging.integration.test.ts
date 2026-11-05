@@ -198,7 +198,7 @@ async function relayAndDrop(dir: string, tool: string, args: Record<string, unkn
 beforeAll(async () => {
   await database.connect();
   await database.bootstrap();
-  gm = await enrollment.enroll(ids.gm, 'gm', ['execute', 'review', 'manage']);
+  gm = await enrollment.enroll(ids.gm, 'owner', ['execute', 'review', 'manage']);
   eng = await enrollment.enroll(ids.eng, 'engineering', ['execute', 'review']);
   cs = await enrollment.enroll(ids.cs, 'cs', ['execute']);
   const goal = await owner.createGoal({ text: `分页夹具目标 ${suffix}`, source: 'owner:test', key: key('goal'), tier: 'standard' });
@@ -499,7 +499,7 @@ test('a page item of 18 KiB of text, 36 KiB in both copies of the answer, stays 
 
 test('every page re-checks the caller: an identity revoked mid-traversal is refused on its next page as unauthorized (C4)', async () => {
   const revoked = `qp-revoked-${suffix}`;
-  const credential = await enrollment.enroll(revoked, 'gm', ['execute', 'review', 'manage']);
+  const credential = await enrollment.enroll(revoked, 'owner', ['execute', 'review', 'manage']);
   const first = await core.contextView(credential, { goalId, pageSize: 5 });
   expect(first.page?.nextCursor).toBeDefined();
   await enrollment.revoke(revoked);
@@ -638,7 +638,7 @@ test('a listing taken under one role is refused under another, and resumes once 
   const record = id('query_snapshot', String(cursorBody(token).sid));
   await database.db.query('UPDATE ONLY $record SET role = "engineering";', { record });
   await expectRefused(core.contextView(gm, { goalId, pageSize: 5, cursor: token }), 'forbidden', /another role/);
-  await database.db.query('UPDATE ONLY $record SET role = "gm";', { record });
+  await database.db.query('UPDATE ONLY $record SET role = "owner";', { record });
   const resumed = await core.contextView(gm, { goalId, pageSize: 5, cursor: token });
   expect(resumed.tasks!.length).toBe(5);
 });
@@ -1002,12 +1002,12 @@ test('a store at its listing capacity refuses the new listing as temporarily_una
   const tight = new SnapshotStore(database.db, { maxListings: census.listings + 1, maxPerOwner: 4 });
   const now = new Date().toISOString();
   const body = [JSON.stringify({ n: 1 })];
-  const held = await tight.create({ owner, kind: 'context', digest: 'cap-held', role: 'gm', takenAt: now, bodies: body });
+  const held = await tight.create({ owner, kind: 'context', digest: 'cap-held', role: 'owner', takenAt: now, bodies: body });
   await expectRefused(
-    tight.create({ owner, kind: 'context', digest: 'cap-refused', role: 'gm', takenAt: now, bodies: body }),
+    tight.create({ owner, kind: 'context', digest: 'cap-refused', role: 'owner', takenAt: now, bodies: body }),
     'temporarily_unavailable', /capacity/);
   expect((await tight.census()).listings).toBe(census.listings + 1);
-  const read = await tight.read({ id: held.id, owner, kind: 'context', digest: 'cap-held', role: 'gm', after: 0, limit: 10 });
+  const read = await tight.read({ id: held.id, owner, kind: 'context', digest: 'cap-held', role: 'owner', after: 0, limit: 10 });
   expect(read.rows.length).toBe(1);
   await tight.remove(held.id);
 });
@@ -1016,7 +1016,7 @@ test('a listing abandoned while it was being written is swept with its rows (C4)
   const store = new SnapshotStore(database.db);
   const abandoned = randomUUID();
   await database.db.query(
-    'CREATE ONLY $record CONTENT { owner: "qp-abandoned", kind: "context", digest: "abandoned", role: "gm", state: "building", row_count: 1, byte_count: 2, taken_at: "2026-01-01T00:00:00Z", created_ms: 1, expires_ms: 9999999999999 };',
+    'CREATE ONLY $record CONTENT { owner: "qp-abandoned", kind: "context", digest: "abandoned", role: "owner", state: "building", row_count: 1, byte_count: 2, taken_at: "2026-01-01T00:00:00Z", created_ms: 1, expires_ms: 9999999999999 };',
     { record: id('query_snapshot', abandoned) });
   await database.db.query('CREATE query_snapshot_row CONTENT { snapshot: $snapshot, seq: 1, body: "{}" };', { snapshot: abandoned });
   await store.sweep();

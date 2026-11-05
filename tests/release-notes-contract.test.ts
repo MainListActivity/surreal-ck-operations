@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
-import { releaseNotesSchema, RECOVERY_READ_TABLES } from '../src/company-release.ts';
+import { releaseNotesSchema } from '../src/company-release.ts';
 
 // The release notes are the material the upgrade card is built from: `readCompanyRelease` parses them with
 // `releaseNotesSchema` and refuses anything else. A green CI that ships notes the schema rejects leaves the
@@ -36,10 +36,10 @@ describe('the release notes are registrable', () => {
     expect(notes.version).toBe(pluginPkg.version);
   });
 
-  test('the notes name the three tables schema 049 creates', () => {
+  test('the notes name the schema 051 tables and fields', () => {
     const text = JSON.stringify(notes);
-    for (const table of RECOVERY_READ_TABLES) expect(text).toContain(table);
-    expect(notes.migration).toContain('049');
+    expect(text).toContain('outbound_message');
+    expect(text).toContain('051');
   });
 
   test('the limits are real: an eleventh change or a long one is refused', () => {

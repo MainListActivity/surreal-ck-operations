@@ -24,16 +24,16 @@ function sharedTree(repo: string): WorktreeAssignment {
 /** Light fixture: gm defs + blocked-to-gm tasks, SidecarBridge records readWorkspace/spawn cwd. */
 function fixture(tasks: Array<{ id: string; repoPath?: string }>) {
   const def: EmployeeDef = {
-    id: 'gm-codex', role: 'gm', provider: 'codex', model: 'fixture',
+    id: 'gm-codex', role: 'owner', provider: 'codex', model: 'fixture',
     enabled: true, maxInstances: 4, priority: 0, weight: 1, scored: 0, errorStreak: 0,
   };
   const instances: EmployeeInst[] = [];
   const agents = new Map<string, { id: string; status: string }>();
   const rows: SupervisedTask[] = tasks.map(t => ({
-    id: t.id, title: t.id, state: 'blocked', blockedTo: 'gm',
+    id: t.id, title: t.id, state: 'blocked', blockedTo: 'owner',
     executorRole: 'engineering', reviewerRole: 'engineering', kind: 'task',
     version: 1, evalAttempts: 0, repoPath: t.repoPath,
-    row: { id: t.id, state: 'blocked', blocked_to: 'gm', version: 1 },
+    row: { id: t.id, state: 'blocked', blocked_to: 'owner', version: 1 },
   } as unknown as SupervisedTask));
   const readWorkspaceCalls: Array<{ instId: string; taskId?: string }> = [];
   const spawnCwds: string[] = [];

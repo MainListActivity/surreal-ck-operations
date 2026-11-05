@@ -65,7 +65,7 @@ async function fresh(): Promise<Fixture> {
   await database.connect();
   await database.bootstrap();
   const enrollment = new LocalEnrollmentAdmin(database);
-  const gm = await enrollment.enroll(`cp-gm-${suffix}-${seq}`, 'gm', ['execute', 'review', 'manage']);
+  const gm = await enrollment.enroll(`cp-gm-${suffix}-${seq}`, 'owner', ['execute', 'review', 'manage']);
   const eng = await enrollment.enroll(`cp-eng-${suffix}-${seq}`, 'engineering', ['execute', 'review']);
   return {
     database, core: new SurrealCompanyCore(database), owner: new OwnerDesk(database), projects: new ProjectStore(database.db), enrollment, gm, eng,

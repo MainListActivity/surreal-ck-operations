@@ -45,7 +45,7 @@ beforeAll(async () => {
   await database.db.query('REMOVE DATABASE IF EXISTS control_plane;');
   await database.bootstrap();
   const enrollment = new LocalEnrollmentAdmin(database);
-  gm = await enrollment.enroll(`ev-gm-${suffix}`, 'gm', ['execute', 'review', 'manage']);
+  gm = await enrollment.enroll(`ev-gm-${suffix}`, 'owner', ['execute', 'review', 'manage']);
   holder = await enrollment.enroll(`ev-holder-${suffix}`, 'engineering', ['execute', 'review']);
   other = await enrollment.enroll(`ev-other-${suffix}`, 'engineering', ['execute', 'review']);
   expiring = await enrollment.enroll(`ev-expiring-${suffix}`, 'engineering', ['execute', 'review']);

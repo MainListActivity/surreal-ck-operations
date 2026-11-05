@@ -47,7 +47,7 @@ beforeAll(async () => {
   await database.bootstrap();
   const enrollment = new LocalEnrollmentAdmin(database);
   for (const [name, role, caps] of [
-    ['gm', 'gm', ['execute', 'review', 'manage']],
+    ['owner', 'owner', ['execute', 'review', 'manage']],
     ['eng', 'engineering', ['execute', 'review']],
     ['eng2', 'engineering', ['execute', 'review']],
   ] as const) tokens[name] = await enrollment.enroll(`w-${name}`, role, caps);
@@ -316,7 +316,7 @@ describe('safe release and version locks (AC05)', () => {
     expect(cancelled.ok).toBe(true);
     const row = await rowOf(taskId);
     expect(row.state).toBe('blocked');
-    expect(row.blocked_to).toBe('gm');
+    expect(row.blocked_to).toBe('owner');
     expect(row.wait_state).toBeUndefined();
   });
 
@@ -441,7 +441,7 @@ describe('safe release and version locks (AC05)', () => {
     const legacy = await makeTask('旧时间阻塞');
     const until = Math.floor(Date.now() / 1000) + 3600;
     await database.db.query(
-      'UPDATE ONLY $task SET state = "blocked", blocked_to = "gm", resume_state = "ready", quota_resets_at = $until;',
+      'UPDATE ONLY $task SET state = "blocked", blocked_to = "owner", resume_state = "ready", quota_resets_at = $until;',
       { task: new RecordId('task', legacy), until },
     );
     const before = await rowOf(legacy);
@@ -482,7 +482,7 @@ describe('safe release and version locks (AC05)', () => {
     const legacy = await makeTask('复核期额度阻塞');
     const until = Math.floor(Date.now() / 1000) + 3600;
     await database.db.query(
-      'UPDATE ONLY $task SET state = "blocked", blocked_to = "gm", resume_state = "review", resume_role = "qa", quota_resets_at = $until;',
+      'UPDATE ONLY $task SET state = "blocked", blocked_to = "owner", resume_state = "review", resume_role = "qa", quota_resets_at = $until;',
       { task: new RecordId('task', legacy), until },
     );
     const before = await rowOf(legacy);

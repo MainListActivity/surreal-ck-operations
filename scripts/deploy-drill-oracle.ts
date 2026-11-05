@@ -1,5 +1,5 @@
 // Deploy-drill oracle (SYS-INT). Proves, on the drill database with this release's own code:
-//   1. leftover isolation states are not dispatched — a blocked (blocked_to=gm) task is refused at claim;
+//   1. leftover isolation states are not dispatched — a blocked (blocked_to=owner) task is refused at claim;
 //   2. zero write — the leftover rows are byte-identical after the refused attempts;
 //   3. positive control — a ready task IS claimable, so the zero above is not a dead harness.
 // Older releases already contain these RB01 semantics (the oracle assumption is disclosed in the drill
@@ -28,15 +28,15 @@ await db.connect();
 await db.bootstrap();
 const core = new SurrealCompanyCore(db);
 const enrollment = new LocalEnrollmentAdmin(db);
-const gm = await enrollment.enroll('drill-oracle-manager', 'gm', ['execute', 'review', 'manage']);
+const owner = await enrollment.enroll('drill-oracle-manager', 'owner', ['execute', 'review', 'manage']);
 const eng = await enrollment.enroll('drill-oracle-eng', 'engineering', ['execute']);
 await enrollment.enroll('drill-oracle-qa', 'qa', ['review']);
 
 const runKey = createHash('sha256').update(root).digest('hex').slice(0, 12);
-const leftover = await core.createTask(gm, { title: 'drill leftover isolation sample', context: 'Seeded by the drill oracle; must never be dispatched.',
+const leftover = await core.createTask(owner, { title: 'drill leftover isolation sample', context: 'Seeded by the drill oracle; must never be dispatched.',
   executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `drill-leftover-${runKey}` });
-await db.db.query("UPDATE $t MERGE { state: 'blocked', blocked_to: 'gm' };", { t: id('task', leftover.id) });
-const control = await core.createTask(gm, { title: 'drill positive control sample', context: 'Seeded by the drill oracle; must be claimable.',
+await db.db.query("UPDATE $t MERGE { state: 'blocked', blocked_to: 'owner' };", { t: id('task', leftover.id) });
+const control = await core.createTask(owner, { title: 'drill positive control sample', context: 'Seeded by the drill oracle; must be claimable.',
   executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `drill-control-${runKey}` });
 
 const digest = async (taskId: string): Promise<string> => {

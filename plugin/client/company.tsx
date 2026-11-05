@@ -353,9 +353,9 @@ const workflowOf = (v: unknown): "ready" | "doing" | "review" => (v === "doing" 
 const reasonRows = (v: unknown): DispatchReasonView[] => arr<Record<string, unknown>>(v).map(r => ({
   code: str(r.code), text: str(r.text), candidates: arr<unknown>(r.candidates).map(str),
   candidatesOmitted: num(r.candidatesOmitted) || undefined,
-  owner: r.owner === "owner" ? "owner" : r.owner === "system" ? "system" : "gm", basis: str(r.basis), recovery: str(r.recovery), nextTrigger: str(r.nextTrigger),
+  owner: r.owner === "owner" ? "owner" : r.owner === "system" ? "system" : "owner", basis: str(r.basis), recovery: str(r.recovery), nextTrigger: str(r.nextTrigger),
   actions: arr<Record<string, unknown>>(r.actions).map(a => ({
-    authority: a.authority === "owner" ? "owner" : a.authority === "system" ? "system" : "gm", label: str(a.label), tool: str(a.tool) || undefined, executable: a.executable === true,
+    authority: a.authority === "owner" ? "owner" : a.authority === "system" ? "system" : "owner", label: str(a.label), tool: str(a.tool) || undefined, executable: a.executable === true,
   })),
 }));
 
@@ -444,7 +444,7 @@ export function normalizePulse(raw: unknown): Pulse {
 
 /** The workflow state of a blocked item, in the owner's words. */
 const WORKFLOW_LABEL: Record<"ready" | "doing" | "review", string> = { ready: "就绪", doing: "在办无人持有", review: "待复核" };
-const WAIT_KIND_LABEL = { dependency: "正常依赖等待", manager: "经理关口", owner: "老板关口", active_lease: "活租约等待", unknown: "等待未知" } as const;
+const WAIT_KIND_LABEL = { dependency: "正常依赖等待", manager: "老板关口", owner: "老板关口", active_lease: "活租约等待", unknown: "等待未知" } as const;
 const WAIT_STATE_LABEL = { ready: "就绪", doing: "执行中", review: "待复核", blocked: "依赖阻塞", done: "完成", void: "作废", unknown: "未知" } as const;
 /** A time of day from an ISO instant, in UTC as the server states it; an absent instant reads as unknown. */
 const clockOf = (iso: string): string => (iso ? `${iso.slice(5, 16).replace("T", " ")}（UTC）` : "未知");
@@ -554,7 +554,7 @@ function PulseTab({ ctx }: { ctx: Ctx }) {
             <Text style={{ color: pal.warning, fontSize: 12.5 }}>{v.summary}</Text>
             {v.reasons.map((r, i) => (
               <Text key={i} style={s.muted}>
-                {r.text}（{r.candidates.filter(c => c !== "*").join("、") || "全局"}）· 负责：{r.owner === "gm" ? "经理" : r.owner === "system" ? "系统" : "老板"} · 恢复：{r.recovery}
+                {r.text}（{r.candidates.filter(c => c !== "*").join("、") || "全局"}）· 负责：{r.owner === "system" ? "系统" : "老板"} · 恢复：{r.recovery}
               </Text>
             ))}
             <Text style={s.muted}>结论检查于 {clockOf(v.checkedAt)}</Text>
@@ -629,10 +629,10 @@ function InboxTab({ ctx }: { ctx: Ctx }) {
   return (
     <View style={{ gap: 12 }}>
       {consoleQ.data?.url ? (
-        <Pressable accessibilityRole="button" style={s.card}
+        <Pressable accessibilityRole="button" style={[s.card, { backgroundColor: ctx.theme.colors.accent, borderColor: ctx.theme.colors.accent, paddingVertical: 18 }]}
           onPress={() => void openExternalAnywhere(consoleQ.data!.url, ctx.navigation, openRpc)}>
-          <Text style={s.muted}>网页审核台（手机浏览器打开，可审待办/看手册）</Text>
-          <Text selectable style={{ color: ctx.theme.colors.accent, fontSize: 13 }}>{consoleQ.data.url}</Text>
+          <Text style={{ color: ctx.theme.colors.accentForeground, fontSize: 16, fontWeight: "800" }}>打开「消息流」控制台</Text>
+          <Text style={{ color: ctx.theme.colors.accentForeground, fontSize: 11, marginTop: 5, opacity: .85 }}>看消息沿连线流动 · 编辑待发消息 · 放行 · 审待办</Text>
         </Pressable>
       ) : null}
       {box?.upgrades?.current?<View style={s.card}><Text style={s.text}>当前版本 v{box.upgrades.current.version}</Text><Text selectable style={s.muted}>{box.upgrades.current.sha}</Text>
@@ -707,7 +707,7 @@ function NewGoalTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
         <View style={s.card}>
           <TextInput style={[s.input, { minHeight: 80 }]} placeholder="要公司做什么？越具体越好"
             placeholderTextColor={ctx.theme.colors.foregroundMuted} value={text} onChangeText={setText} multiline />
-          <Text style={s.muted}>级别（不选则 Jev 判断，拿不准交给经理）</Text>
+          <Text style={s.muted}>级别（不选则 Jev 判断，老板分级）</Text>
           <View style={s.row}>
             {([undefined, "quick", "standard", "program"] as (GoalTier | undefined)[]).map(t => (
               <Pressable key={t ?? "auto"} style={[s.chip, tier === t && s.chipActive]} onPress={() => setTier(t)}>
@@ -970,7 +970,7 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
               <ExpandableText text={g.brief} lines={6} style={s.muted} ctx={ctx} />
               {(blockers.find(b => b.goalId === g.id)?.reasons ?? []).map((r, i) => (
                 <Text key={i} style={s.muted}>
-                  {r.text}（{r.candidates.filter(c => c !== "*").join("、") || "全局"}{r.candidatesOmitted ? `；另有 ${r.candidatesOmitted} 个候选未列出` : ""}）· 恢复：{r.recovery} · 处理：{r.owner === "gm" ? "经理" : "老板"}
+                  {r.text}（{r.candidates.filter(c => c !== "*").join("、") || "全局"}{r.candidatesOmitted ? `；另有 ${r.candidatesOmitted} 个候选未列出` : ""}）· 恢复：{r.recovery} · 处理：{"老板"}
                 </Text>
               ))}
               {blockers.find(b => b.goalId === g.id) && (() => {
@@ -1012,7 +1012,7 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   );
 }
 
-const ROLE_LABEL: Record<string, string> = { gm: "总经理", product: "运营/产品", engineering: "工程", "ai-content": "AI 内容", "concept-design": "原型/概念设计", "asset-production": "量产制作", screenwriter: "专职编剧", "story-author": "长篇故事作者", cinematography: "摄影摄像", qa: "测试", cs: "客户成功", eval: "评审" };
+const ROLE_LABEL: Record<string, string> = { product: "运营/产品", engineering: "工程", "ai-content": "AI 内容", "concept-design": "原型/概念设计", "asset-production": "量产制作", screenwriter: "专职编剧", "story-author": "长篇故事作者", cinematography: "摄影摄像", qa: "测试", cs: "客户成功", eval: "评审" };
 const MODEL_PREVIEW = 10;
 
 function RegisterDefCard({ ctx, editing, onDone, onCancel }: {

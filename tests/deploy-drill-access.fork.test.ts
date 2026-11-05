@@ -56,7 +56,7 @@ beforeAll(async () => {
     mkdirSync(plan.root, { recursive: true }); launched += 1; return 4242;
   } });
   const enroll = new LocalEnrollmentAdmin(db);
-  gm = await enroll.enroll('access-gm', 'gm', ['execute', 'review', 'manage']);
+  gm = await enroll.enroll('access-gm', 'owner', ['execute', 'review', 'manage']);
   engineer = await enroll.enroll('access-eng-holder', 'engineering', ['execute', 'review']);
   peerEngineer = await enroll.enroll('access-eng-peer', 'engineering', ['execute', 'review']);
   qa = await enroll.enroll('access-qa', 'qa', ['execute', 'review']);
@@ -140,7 +140,7 @@ run('the real task holder and gm may start a drill; the audit row is written onl
   expect(started.runId).toBe(holderTask.runId);
   expect(started.root).toBe(join(home, 'drills', holderTask.runId));
   expect(await auditCount()).toBe(before + 1);
-  const gmTask = await heldTask('gm');
+  const gmTask = await heldTask('owner');
   const gmStarted = await core.deployDrillRun(gm, input(gmTask));
   expect(gmStarted.runId).toBe(gmTask.runId);
   expect(await auditCount()).toBe(before + 2);

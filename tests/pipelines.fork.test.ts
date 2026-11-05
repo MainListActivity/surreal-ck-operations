@@ -23,7 +23,7 @@ beforeAll(async () => {
   db = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: 'fixture-only', namespace: 'pipelines_fixture', database: 'control_plane' });
   await db.connect(); await db.bootstrap();
   core = new SurrealCompanyCore(db); owner = new OwnerDesk(db);
-  gm = await new LocalEnrollmentAdmin(db).enroll('pipeline-gm', 'gm', ['execute', 'review', 'manage']);
+  gm = await new LocalEnrollmentAdmin(db).enroll('pipeline-gm', 'owner', ['execute', 'review', 'manage']);
   const projects = new ProjectStore(db.db);
   const base = { release: 'local', envs: [] as never[], repoPath: dir };
   await projects.upsert({ ...base, id: 'content', name: '内容项目', pipeline: 'video', disciplines: [
@@ -44,7 +44,7 @@ const task = (goalId: string, extra: Record<string, unknown>) =>
 run('a story goal gets only the story plan: no product intake, acceptance or auto-closing gate', async () => {
   const { goal, tasks } = await goalOn('content', 'story');
   expect(goal.pipeline).toBe('story');
-  expect(tasks.map(t => [t.executor_role, t.reviewer_role, t.kind])).toEqual([['gm', 'qa', 'task']]);
+  expect(tasks.map(t => [t.executor_role, t.reviewer_role, t.kind])).toEqual([['owner', 'qa', 'task']]);
   expect(tasks[0]!.title).toContain('任务拆解与分派');
 });
 
@@ -60,7 +60,7 @@ run('with no explicit line a goal runs its project default; no default means sof
 
 run('a track only accepts the roles the project lists for it, and line roles must name a track', async () => {
   const { goal } = await goalOn('content', 'video');
-  await expect(task(goal.id, { executorRole: 'product', reviewerRole: 'gm', discipline: '原著' })).rejects.toThrow(/only be carried by asset-production/);
+  await expect(task(goal.id, { executorRole: 'product', reviewerRole: 'owner', discipline: '原著' })).rejects.toThrow(/only be carried by asset-production/);
   await expect(task(goal.id, { executorRole: 'engineering', reviewerRole: 'qa', discipline: '角色设计' })).rejects.toThrow(/cannot take it/);
   await expect(task(goal.id, { executorRole: 'concept-design' })).rejects.toThrow(/must set discipline to one of: 角色设计/);
   await expect(task(goal.id, { executorRole: 'concept-design', discipline: '没有这条轨' })).rejects.toThrow(/tracks vocabulary/);
@@ -68,8 +68,8 @@ run('a track only accepts the roles the project lists for it, and line roles mus
   expect((await task(goal.id, { executorRole: 'asset-production', discipline: '原著' })).discipline).toBe('原著');
   expect((await task(goal.id, { executorRole: 'screenwriter', discipline: '编剧' })).executorRole).toBe('screenwriter');
   await expect(task(goal.id, { executorRole: 'screenwriter' })).rejects.toThrow(/must set discipline to one of: 编剧/);
-  expect((await task(goal.id, { executorRole: 'product', reviewerRole: 'gm' })).executorRole).toBe('product');
-  expect((await task(goal.id, { executorRole: 'product', reviewerRole: 'gm', discipline: '审片' })).discipline).toBe('审片');
+  expect((await task(goal.id, { executorRole: 'product', reviewerRole: 'owner' })).executorRole).toBe('product');
+  expect((await task(goal.id, { executorRole: 'product', reviewerRole: 'owner', discipline: '审片' })).discipline).toBe('审片');
 });
 
 run('the contract is data on the project: unknown roles are refused when it is saved', async () => {

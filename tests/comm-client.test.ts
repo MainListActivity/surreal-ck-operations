@@ -149,7 +149,7 @@ test('a direct call prints one answer: the data within the budget on success; on
   // The same 60-task page with 200-character contexts fits. The MCP result carries the answer twice (as text and as
   // structuredContent), and the 48 KiB budget counts both copies, so the direct call prints the answer once and it is
   // within the budget. With 400-character contexts the whole result is over the budget and is refused as one line.
-  const principal = { employeeId: 'gm-01', role: 'gm', capabilities: ['execute', 'review'] };
+  const principal = { employeeId: 'gm-01', role: 'owner', capabilities: ['execute', 'review'] };
   const page = (contextLength: number) => ({
     principal,
     tasks: Array.from({ length: 60 }, (_, i) => ({ id: `task:${i}`, title: `样例 ${i} 中文🙂`, state: 'ready', context: `正文 "${i}" ${'x'.repeat(contextLength)}` })),

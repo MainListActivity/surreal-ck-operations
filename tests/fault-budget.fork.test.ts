@@ -51,7 +51,7 @@ beforeAll(async () => {
   console.log('fault-budget.fork executed');
   const enrollment = new LocalEnrollmentAdmin(database);
   for (const [name, role, caps] of [
-    ['gm', 'gm', ['execute', 'review', 'manage']],
+    ['owner', 'owner', ['execute', 'review', 'manage']],
     ['eng', 'engineering', ['execute', 'review']],
     ['eng2', 'engineering', ['execute', 'review']],
     // The independent reviewer of the repair tasks (their reviewer role is qa).
@@ -164,7 +164,7 @@ async function exhaust(scope: { taskId: string; employeeId?: string }, input: At
  * repair chain of its incident. The result is the repair round the chain now waits on.
  */
 async function resumeToRepair(taskId: string, incident = incidentOf()): Promise<string> {
-  await database.db.query('UPDATE $t SET state = "blocked", blocked_to = "gm", resume_state = "ready";', { t: new RecordId('task', taskId) });
+  await database.db.query('UPDATE $t SET state = "blocked", blocked_to = "owner", resume_state = "ready";', { t: new RecordId('task', taskId) });
   await core.resume(tokens.gm!, taskId, {
     text: '尝试恢复：预算耗尽后应当走修复链而不是直接恢复', idempotencyKey: `resume-${taskId}-${clock}`,
   });
@@ -500,7 +500,7 @@ describe('the exhausted budget', () => {
     clock += 10_000;
     await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
     // The task waits on the gm gate, as a fault report would leave it.
-    await database.db.query('UPDATE $t SET state = "blocked", blocked_to = "gm", resume_state = "ready";', { t: new RecordId('task', taskId) });
+    await database.db.query('UPDATE $t SET state = "blocked", blocked_to = "owner", resume_state = "ready";', { t: new RecordId('task', taskId) });
     const resumed = await core.resume(tokens.gm, taskId, {
       text: '尝试恢复：同一故障再次发生，应当走修复链而不是直接恢复', idempotencyKey: `resume-${clock}`,
     });
@@ -602,7 +602,7 @@ describe('the exhausted budget', () => {
     clock += 10_000;
     await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
     // The task waits on the gm gate, as a fault report would leave it.
-    await database.db.query('UPDATE $t SET state = "blocked", blocked_to = "gm", resume_state = "ready";', { t: new RecordId('task', taskId) });
+    await database.db.query('UPDATE $t SET state = "blocked", blocked_to = "owner", resume_state = "ready";', { t: new RecordId('task', taskId) });
     await core.resume(tokens.gm, taskId, {
       text: '尝试恢复：预算耗尽后应当走修复链而不是直接恢复', idempotencyKey: `resume-lift-${clock}`,
     });
@@ -813,7 +813,7 @@ describe('the classification of the block path', () => {
     const evidence: Evidence = {
       text: '登录建连超时：连接建立阶段停顿 20 秒，未拿到令牌', idempotencyKey: `block-fault-${clock}`,
     };
-    await core.block(tokens.eng!, proof, 'gm', evidence, undefined, {
+    await core.block(tokens.eng!, proof, 'owner', evidence, undefined, {
       phase: 'login', errno: 'UND_ERR_CONNECT_TIMEOUT', identityAlias: 'LCA04_MEMBER', target: 'idp_login', environment: 'production',
     });
     const [episodes] = await database.db.query<[Array<unknown>]>('SELECT episode FROM fault_episode;');
@@ -824,7 +824,7 @@ describe('the classification of the block path', () => {
     const taskId = await makeTask('阻塞：无事实不记账');
     const claimResult = await claim(taskId, 'eng');
     const proof = { taskId, expectedVersion: claimResult.task.version, fence: claimResult.fence, deliveryId: claimResult.deliveryId };
-    await core.block(tokens.eng!, proof, 'gm', { text: '我先停下：请经理确认这一步应该怎么走，以及谁来接手', idempotencyKey: `block-plain-${clock}` });
+    await core.block(tokens.eng!, proof, 'owner', { text: '我先停下：请经理确认这一步应该怎么走，以及谁来接手', idempotencyKey: `block-plain-${clock}` });
     const [episodes] = await database.db.query<[Array<unknown>]>('SELECT episode FROM fault_episode;');
     expect(episodes?.length).toBe(0);
   });

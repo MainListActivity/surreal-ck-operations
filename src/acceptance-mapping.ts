@@ -2,7 +2,7 @@
 //
 // A task created before the gate was enabled (acceptance_legacy=true, criteria empty) never picks up the gate
 // retroactively — that is the AC06 rule that keeps old work unblocked. The controlled way out is not a flag flip:
-// gm previews the versioned criteria that would apply (old vs new, required flags, per-SYS machine source and human
+// owner previews the versioned criteria that would apply (old vs new, required flags, per-SYS machine source and human
 // sign-off, RB01 coverage, the target task version and every conflict), then imports one registry bundle under an
 // explicit digest + expectedVersion CAS with a reason and an audit row.
 //
@@ -56,7 +56,7 @@ const toolCriterion = (n: number, description: string): AcceptanceCriterion =>
 
 export const TOOL_CRITERIA: readonly AcceptanceCriterion[] = [
   toolCriterion(1, '映射预览只读零写：列旧新 criteria、required、RB01 覆盖、目标任务版本与冲突'),
-  toolCriterion(2, '授权导入仅 gm：显式 digest/expectedVersion CAS、幂等键、理由与审计'),
+  toolCriterion(2, '授权导入仅 owner：显式 digest/expectedVersion CAS、幂等键、理由与审计'),
   toolCriterion(3, '拒绝陈旧映射、降级或删除 required 基线、越权、done/void 历史改写与活动租约'),
   toolCriterion(4, '同源覆盖：MCP/sck 与 submit/review/Jev/owner 走同一评估器与同一证据'),
   toolCriterion(5, '机器源与人工签核分类真实：仅真实 CI/探针计 machine，叙述文字不伪装 verified'),

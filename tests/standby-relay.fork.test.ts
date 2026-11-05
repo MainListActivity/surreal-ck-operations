@@ -40,7 +40,7 @@ beforeAll(async () => {
   wf = new Workforce(db, dir);
   proof = new CompanyProofStore(db.db);
   admin = new LocalEnrollmentAdmin(db);
-  gmCred = await admin.enroll('sb-gm', 'gm', ['execute', 'review', 'manage']);
+  gmCred = await admin.enroll('sb-gm', 'owner', ['execute', 'review', 'manage']);
 });
 afterAll(async () => { if (!dir) return; await db.close(); server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true }); });
 
@@ -52,9 +52,9 @@ const newTask = (executorRole: string, reviewerRole = 'qa', cred = gmCred) => co
   reviewerRole: reviewerRole as never, idempotencyKey: `sb-task-${count}-${crypto.randomUUID()}` } as never);
 
 /** 每次调用登记一个全新员工；id 与凭证分开返回（standby 入参要 id，claim 要凭证）。 */
-const actor = async (role: 'gm' | 'engineering' | 'qa' | 'product'): Promise<{ id: string; cred: string }> => {
+const actor = async (role: 'owner' | 'engineering' | 'qa' | 'product'): Promise<{ id: string; cred: string }> => {
   const id = `sb-${role}-${++count}`;
-  return { id, cred: await admin.enroll(id, role, role === 'gm' ? ['execute', 'review', 'manage'] : ['execute', 'review']) };
+  return { id, cred: await admin.enroll(id, role, role === 'owner' ? ['execute', 'review', 'manage'] : ['execute', 'review']) };
 };
 let gmCred = '';
 const gmTask = (executorRole: string, reviewerRole = 'qa') => newTask(executorRole, reviewerRole, gmCred);
@@ -71,7 +71,7 @@ Promise<{ taskId: string; approvalId: string; window: ExecutionWindow; executor:
   await db.db.query("UPDATE $dep SET state='done'; UPDATE $task SET dependencies=[$dep]; CREATE internal_ai_candidate CONTENT {task:$dep, digest:$digest, manifest_hash:$digest, document_hash:$digest, manifest_path:'fixture', document_path:'fixture', author:'fixture', env:'production', evidence_expires_at:$expiry};",
     { task: new RecordId('task', task.id), dep: new RecordId('task', approval.id), digest: window.configurationDigest, expiry });
   const claim = await core.claim(executor.cred, task.id);
-  await core.block(executor.cred, proofOf(claim), 'gm', text(`${label}：等待独立批准接力`));
+  await core.block(executor.cred, proofOf(claim), 'owner', text(`${label}：等待独立批准接力`));
   return { taskId: task.id, approvalId: approval.id, window, executor };
 }
 
@@ -81,7 +81,7 @@ const rowOf = async (taskId: string): Promise<Record<string, unknown> | undefine
 };
 
 run('standby resume assigns a real lease atomically: doing + lease + progress_at + standby_until + window (P0 spec 1)', async () => {
-  const gm = await actor('gm');
+  const gm = await actor('owner');
   const { taskId, window, executor } = await windowedBlockedTask('engineering 同实现人待命');
   const before = await rowOf(taskId);
   const resumed = await core.resumeStandby(gm.cred, taskId, { ...text('窗口与批准件核对无误，原实现人有界待命接力'), executionWindow: window }, executor.id);
@@ -113,7 +113,7 @@ run('standby resume assigns a real lease atomically: doing + lease + progress_at
 });
 
 run('standby resume registers the worktree through the claim registry path, never an unauthorised scene (worktree 归属)', async () => {
-  const gm = await actor('gm');
+  const gm = await actor('owner');
   const { taskId, window, executor } = await windowedBlockedTask('engineering 登记工作区');
   const resumed = await coreWt.resumeStandby(gm.cred, taskId, { ...text('窗口有效；原实现人有界待命接力'), executionWindow: window }, executor.id);
   expect(resumed.state).toBe('doing');
@@ -129,7 +129,7 @@ run('standby resume registers the worktree through the claim registry path, neve
 });
 
 run('standby refusals leave the task blocked with no lease (P0 spec 2+3): window, role, binding, active task, revoked, provider, quota', async () => {
-  const gm = await actor('gm');
+  const gm = await actor('owner');
   const { taskId, window, executor } = await windowedBlockedTask('工程拒绝矩阵');
   const other = await actor('engineering');
   const before = await rowOf(taskId);
@@ -165,14 +165,14 @@ run('standby refusals leave the task blocked with no lease (P0 spec 2+3): window
   // 全部拒绝后任务保持 blocked、无租约、无 standby、版本未动
   const after = await rowOf(taskId);
   expect(after!.state).toBe('blocked');
-  expect(after!.blocked_to).toBe('gm');
+  expect(after!.blocked_to).toBe('owner');
   expect(after!.current_employee ?? null).toBeNull();
   expect(after!.standby_until ?? null).toBeNull();
   expect(after!.version).toBe(before!.version);
 });
 
 run('standby resume replays the same idempotency key once and refuses the same key with different input (重放/漂移)', async () => {
-  const gm = await actor('gm');
+  const gm = await actor('owner');
   const { taskId, window } = await windowedBlockedTask('重放与键漂移', 'qa');
   const standby = await actor('qa');
   const evidence = { ...text('同一幂等键重放'), executionWindow: window };
@@ -189,7 +189,7 @@ run('standby resume replays the same idempotency key once and refuses the same k
 });
 
 run('two concurrent standby resumes produce exactly one winner and no ready intermediate (并发)', async () => {
-  const gm = await actor('gm');
+  const gm = await actor('owner');
   const { taskId, window } = await windowedBlockedTask('并发抢派', 'qa');
   const a = await actor('qa');
   const b = await actor('qa');
@@ -212,7 +212,7 @@ run('two concurrent standby resumes produce exactly one winner and no ready inte
 });
 
 run('plain resume keeps the old contract byte for byte: ready, no holder, no standby fields (旧行为对照)', async () => {
-  const gm = await actor('gm');
+  const gm = await actor('owner');
   const { taskId, window } = await windowedBlockedTask('普通恢复对照');
   const before = await rowOf(taskId);
   const progressBefore = before!.progress_at as number | null;
@@ -228,7 +228,7 @@ run('plain resume keeps the old contract byte for byte: ready, no holder, no sta
 });
 
 run('standby timeout returns the task to the gm gate, never the ready pool (待命超时)', async () => {
-  const gm = await actor('gm');
+  const gm = await actor('owner');
   const { taskId, window } = await windowedBlockedTask('超时回关口', 'qa');
   const standby = await actor('qa');
   await core.resumeStandby(gm.cred, taskId, { ...text('待命后超时'), executionWindow: window }, standby.id);
@@ -237,7 +237,7 @@ run('standby timeout returns the task to the gm gate, never the ready pool (待�
   expect(handed).toBe(true);
   const row = await rowOf(taskId);
   expect(row!.state).toBe('blocked');
-  expect(row!.blocked_to).toBe('gm');
+  expect(row!.blocked_to).toBe('owner');
   expect(row!.resume_state).toBe('doing');
   expect(row!.current_employee ?? null).toBeNull();
   expect(row!.delivery_id ?? null).toBeNull();
@@ -256,7 +256,7 @@ run('standby timeout returns the task to the gm gate, never the ready pool (待�
 });
 
 run('verify_standby is read-only, per-item coded, and audited (P1 spec 7)', async () => {
-  const gm = await actor('gm');
+  const gm = await actor('owner');
   const { taskId, window, executor } = await windowedBlockedTask('只读预检', 'qa');
   const standby = await actor('qa');
   const engForeign = await actor('engineering');
@@ -279,7 +279,7 @@ run('verify_standby is read-only, per-item coded, and audited (P1 spec 7)', asyn
   const claimer = await actor('qa');
   const plain = await gmTask('qa');
   const blocked = await core.claim(claimer.cred, plain.id);
-  await core.block(claimer.cred, proofOf(blocked), 'gm', text('无窗口阻塞'));
+  await core.block(claimer.cred, proofOf(blocked), 'owner', text('无窗口阻塞'));
   const noWindow = await core.verifyStandby(gm.cred, { items: [{ taskId: plain.id, employeeId: standby.id }], idempotencyKey: `verify-nw-${count}` });
   expect(noWindow.items[0]).toMatchObject({ ok: false, code: 'execution_window_invalid' });
   // 非 gm 拒绝
@@ -351,7 +351,7 @@ run('G1: approval machine-rejects sampler == accepted_by; sampler-less legacy ca
 // ---- 复验修复面（R1–R4）：标记生命周期、admission 补口、sampler 校验、幂等与 clamp ----
 
 run('R1: standby→submit→reviewer claim never triggers wake/timeout; the stale marker cannot destroy later leases', async () => {
-  const gm = await actor('gm');
+  const gm = await actor('owner');
   const { taskId, window } = await windowedBlockedTask('标记生命周期', 'qa');
   const standby = await actor('qa');
   await core.resumeStandby(gm.cred, taskId, { ...text('待命后提交'), executionWindow: window }, standby.id);
@@ -376,7 +376,7 @@ run('R1: standby→submit→reviewer claim never triggers wake/timeout; the stal
 });
 
 run('R1: revoke→reclaim clears the marker; the next holder is never timeout-reclaimed (路径 B)', async () => {
-  const gm = await actor('gm');
+  const gm = await actor('owner');
   const { taskId, window } = await windowedBlockedTask('收回再领取', 'qa');
   const standby = await actor('qa');
   await core.resumeStandby(gm.cred, taskId, { ...text('待命后会被收回'), executionWindow: window }, standby.id);
@@ -391,7 +391,7 @@ run('R1: revoke→reclaim clears the marker; the next holder is never timeout-re
 });
 
 run('R2: admission checks execute capability and unmet dependencies; verify_standby codes them', async () => {
-  const gm = await actor('gm');
+  const gm = await actor('owner');
   const { taskId, window } = await windowedBlockedTask('能力与依赖预检', 'qa');
   const reviewOnlyId = `sb-qa-ro-${++count}`;
   await admin.enroll(reviewOnlyId, 'qa', ['review']);
@@ -421,7 +421,7 @@ run('R3: prepare validates the sampler is a registered active employee', async (
 });
 
 run('R4: verify_standby replays idempotently (no duplicate audits) and the budget clamps to the lease', async () => {
-  const gm = await actor('gm');
+  const gm = await actor('owner');
   const { taskId, window } = await windowedBlockedTask('幂等预检', 'qa');
   const standby = await actor('qa');
   const key = `verify-idem-${count}-${crypto.randomUUID()}`;
@@ -446,7 +446,7 @@ run('R4: verify_standby replays idempotently (no duplicate audits) and the budge
 });
 
 run('R6: releasing a standby lease clears standby_until so the ready view never shows a stale deadline', async () => {
-  const gm = await actor('gm');
+  const gm = await actor('owner');
   const { taskId, window, executor } = await windowedBlockedTask('释放待命租约');
   const resumed = await core.resumeStandby(gm.cred, taskId, { ...text('待命建立后立刻释放，检查标记生命周期'), executionWindow: window }, executor.id);
   expect(resumed.standbyUntil).toBeDefined();

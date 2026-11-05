@@ -518,7 +518,7 @@ export class WaitStore {
         LET $restore_state = IF $t.resume_state = 'review' THEN 'review' ELSE 'ready' END;
         LET $next = UPDATE ONLY $t.id SET
           state = IF $manager THEN 'blocked' ELSE $restore_state END,
-          blocked_to = IF $manager THEN 'gm' ELSE NONE END,
+          blocked_to = IF $manager THEN 'owner' ELSE NONE END,
           resume_state = IF $manager THEN $t.resume_state ELSE NONE END,
           resume_role = IF $manager THEN $t.resume_role ELSE NONE END,
           dependency_continuation = NONE,
@@ -654,7 +654,7 @@ export class WaitStore {
         LET $blocked = ($unsat[0] ?? 0) > 0 OR $t.blocked_to = 'owner' OR !$resume;
         LET $next = UPDATE ONLY $t.id SET
           state = IF $blocked THEN 'blocked' ELSE ($t.resume_state ?? 'ready') END,
-          blocked_to = IF $blocked THEN (IF $t.blocked_to = 'owner' THEN 'owner' ELSE 'gm' END) ELSE NONE END,
+          blocked_to = IF $blocked THEN 'owner' ELSE NONE END,
           resume_state = IF $blocked THEN ($t.resume_state ?? 'ready') ELSE NONE END,
           resume_role = IF $blocked THEN $t.resume_role ELSE NONE END,
           wait_state = NONE, wait_kind = NONE, wait_episode = NONE, wait_not_before = NONE,

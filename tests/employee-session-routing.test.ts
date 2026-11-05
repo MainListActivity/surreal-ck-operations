@@ -19,7 +19,7 @@ test('registry identity is stable across model names; outages are never a negati
 });
 
 test('native Claude clients stay managed, Factory and authors remain exceptions', () => {
-  for(const [role,tier] of [['gm','opus'],['product','sonnet'],['qa','haiku']] as const) {
+  for(const [role,tier] of [['owner','opus'],['product','sonnet'],['qa','haiku']] as const) {
     const model=employeeClientModel(role);
     expect(selectedTier(model)).toBe(tier);
     expect(managedModel({provider:'claude',role,model})).toBe(true);

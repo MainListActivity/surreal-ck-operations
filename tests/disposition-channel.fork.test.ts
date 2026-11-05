@@ -78,7 +78,7 @@ run('SYS03 manager disposition over the real employee channels (MCP and sidecar)
     const task = await core.createTask(gm, { title, context: 'SYS03 synthetic channel regression only',
       executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `chan-${title}` });
     const since = Math.floor(Date.now() / 1000);
-    await rawQuery(`UPDATE ONLY $t SET state = 'blocked', blocked_to = 'gm', resume_state = 'doing',
+    await rawQuery(`UPDATE ONLY $t SET state = 'blocked', blocked_to = 'owner', resume_state = 'doing',
       current_employee = $holder, lease_expires_at = $lease, dispatch_blocked_phase = 'execute',
       dispatch_blocked_since = $since, version = version + 1;`,
     { t: id('task', task.id), holder: holderId ?? null, lease: since - 600, since });
@@ -98,15 +98,15 @@ run('SYS03 manager disposition over the real employee channels (MCP and sidecar)
     await db.connect();
     await db.bootstrap();
     const enrollment = new LocalEnrollmentAdmin(db);
-    gm = await enrollment.enroll('sys03-chan-gm-a', 'gm', ['execute', 'review', 'manage']);
-    gmB = await enrollment.enroll('sys03-chan-gm-b', 'gm', ['execute', 'review', 'manage']);
+    gm = await enrollment.enroll('sys03-chan-gm-a', 'owner', ['execute', 'review', 'manage']);
+    gmB = await enrollment.enroll('sys03-chan-gm-b', 'owner', ['execute', 'review', 'manage']);
     holder = await enrollment.enroll('sys03-chan-eng', 'engineering', ['execute', 'review']);
     core = new SurrealCompanyCore(db, { worktrees: { opsRepo: join(scratch, 'repo') } });
     pool = new SidecarPool({ core: core as never,
       // 这个文件只走通道转发，不碰员工会话：workforce 桩只需要在池子认为该轮换时明确报错。
       workforce: { rotate: async () => { throw new Error('fixture never rotates a credential'); } } as never,
       runDir: join(scratch, 'run'), heartbeatMs: 600_000, sweepMs: 20 });
-    for (const [employeeId, role, credential] of [['sys03-chan-gm-a', 'gm', gm], ['sys03-chan-gm-b', 'gm', gmB],
+    for (const [employeeId, role, credential] of [['sys03-chan-gm-a', 'owner', gm], ['sys03-chan-gm-b', 'owner', gmB],
       ['sys03-chan-eng', 'engineering', holder]] as const) {
       const opened = pool.env({ id: employeeId, role, credential } as never);
       channels.set(employeeId, { SCK_COMM_DIR: opened.SCK_COMM_DIR!, SCK_COMM_KEY: opened.SCK_COMM_KEY! });

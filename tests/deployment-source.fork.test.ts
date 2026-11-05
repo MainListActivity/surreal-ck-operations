@@ -82,7 +82,7 @@ beforeAll(async () => {
   const enrollment = new LocalEnrollmentAdmin(database);
   owner = new OwnerDesk(database);
   core = new SurrealCompanyCore(database, { acceptance: { adapter: createGithubActionsAdapter(gh) } });
-  for (const [n, r, c] of [['gm','gm',['execute','review','manage']], ['eng-a','engineering',['execute','review']], ['qa','qa',['execute','review']]] as const)
+  for (const [n, r, c] of [['owner','owner',['execute','review','manage']], ['eng-a','engineering',['execute','review']], ['qa','qa',['execute','review']]] as const)
     tokens[n] = await enrollment.enroll(`t-${n}`, r, c);
   const gate = await core.acceptanceGate(tokens.gm);
   await core.setAcceptanceGate(tokens.gm, { enabled: true, reason: 'N1-R core positive', expectedVersion: gate.version, idempotencyKey: key() });

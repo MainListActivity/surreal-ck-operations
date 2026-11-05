@@ -2,7 +2,7 @@
 
 export type GoalTier = "quick" | "standard" | "program";
 export type TaskState = "blocked" | "ready" | "doing" | "review" | "done" | "void";
-export type Role = "gm" | "product" | "engineering" | "ai-content" | "concept-design" | "asset-production" | "screenwriter" | "story-author" | "cinematography" | "qa" | "cs" | "eval";
+export type Role = "owner" | "product" | "engineering" | "ai-content" | "concept-design" | "asset-production" | "screenwriter" | "story-author" | "cinematography" | "qa" | "cs" | "eval";
 export type TaskKind = "goal" | "task" | "gate" | "release" | "deploy";
 
 export interface TaskView {
@@ -22,7 +22,7 @@ export interface TaskView {
   currentEmployee?: string;
   deliveryId?: string;
   leaseExpiresAt?: string;
-  blockedTo?: "gm" | "owner";
+  blockedTo?: "owner" | "owner";
   /** Blocked rows: the phase restored when the dependency wait ends. */
   resumeState?: TaskState;
   /** Blocked rows: the role recorded by the original block. */
@@ -228,12 +228,12 @@ export interface DispatchReasonView {
   text: string;
   candidates: string[];
   candidatesOmitted?: number;
-  owner: "gm" | "owner" | "system";
+  owner: "owner" | "owner" | "system";
   /** The source the code was read from, for example "contribution-audit". */
   basis: string;
   recovery: string;
   /** Structured recovery actions; `executable` is false when no operations tool performs the action. */
-  actions: Array<{ authority: "gm" | "owner" | "system"; label: string; tool?: string; executable: boolean }>;
+  actions: Array<{ authority: "owner" | "owner" | "system"; label: string; tool?: string; executable: boolean }>;
   nextTrigger: string;
 }
 

@@ -206,6 +206,10 @@ export class CompanyDatabase {
     // 记录 dispatcher 最近一次唤醒尝试与最近一次跳过原因；不改 state 机、限额、既有路径或任何既有行（RB01）。
     await this.db.query(loadSchema('050-recovery-read-wake.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 50 WHERE schema_version < 50;');
+    // 051：派工体系重构（待发消息表、任务需求/验收标准字段、owner 岗位撤销迁移）。只新增表与字段，
+    // 迁移是幂等 UPDATE：旧版 release 读不到新表即忽略（RB01）。
+    await this.db.query(loadSchema('051-role-message-flow.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 51 WHERE schema_version < 51;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

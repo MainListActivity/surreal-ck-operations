@@ -127,7 +127,7 @@ run('IR06 rollback isolation: a policy written by the new code, then the deploye
     await oldDb.bootstrap();
     const oldEnroll = new OldEnroll(oldDb);
     const enroll = async (employeeId: string) => { tokens[employeeId] = await oldEnroll.enroll(employeeId, 'engineering', ['execute', 'review']); };
-    gm = await oldEnroll.enroll('ir-gm', 'gm', ['execute', 'review', 'manage']);
+    gm = await oldEnroll.enroll('ir-gm', 'owner', ['execute', 'review', 'manage']);
     await enroll('ir-src');
     await enroll('ir-alias');
     await enroll('ir-named');

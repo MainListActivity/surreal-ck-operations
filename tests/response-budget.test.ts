@@ -799,7 +799,7 @@ describe('reclaim_worktrees arguments (SYS01, D3): one strict rule on every laye
     const runs: unknown[] = [];
     // The real method runs. Only authorization and the registry are stubbed, so no database or worktree is needed.
     const core = Object.assign(Object.create(SurrealCompanyCore.prototype), {
-      authorized: async (credential: string) => ({ employeeId: 'gm-01', role: credential === 'gm-token' ? 'gm' : 'engineering', capabilities: ['manage'] }),
+      authorized: async (credential: string) => ({ employeeId: 'gm-01', role: credential === 'gm-token' ? 'owner' : 'engineering', capabilities: ['manage'] }),
       worktrees: {
         reclaimAll: async (input: unknown) => {
           runs.push(input);

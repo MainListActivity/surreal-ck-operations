@@ -67,7 +67,7 @@ const WORKFLOW_NAME = { ready: '就绪', doing: '在办无人持有', review: '�
 export function dispatchLine(row: DispatchBlockedRow): string {
   const reasons = row.reasons.map(reason => reason.text).join('；') || row.summary;
   const owner = row.reasons.some(reason => reason.owner === 'owner') ? '老板'
-    : row.reasons.some(reason => reason.owner === 'system') ? '系统' : 'gm';
+    : row.reasons.some(reason => reason.owner === 'system') ? '系统' : 'owner';
   const next = [...new Set(row.reasons.map(reason => reason.nextTrigger))].join('；');
   return `《${short(row.title, 40)}》（${PHASE_NAME[row.phase]}·${WORKFLOW_NAME[row.workflowState]}）：${reasons}；已等 ${row.waitingMinutes} 分钟；负责：${owner}；下一触发：${next || '待定'}`;
 }

@@ -253,7 +253,7 @@ async function main() {
     await seeder.bootstrap();
     const seedCore = new SurrealCompanyCore(seeder);
     const enrollment = new LocalEnrollmentAdmin(seeder);
-    const gm = await enrollment.enroll('measure-gm', 'gm', ['execute', 'review', 'manage']);
+    const owner = await enrollment.enroll('measure-owner', 'owner', ['execute', 'review', 'manage']);
     // Two engineers, one per control worker: an employee holds one lease at a time, so one credential cannot claim in parallel.
     const engs = [await enrollment.enroll('measure-eng-a', 'engineering', ['execute', 'review']), await enrollment.enroll('measure-eng-b', 'engineering', ['execute', 'review'])];
 
@@ -273,13 +273,13 @@ async function main() {
     };
     const seedStart = performance.now();
     for (let index = 0; index < TASKS; index++) {
-      await retried(() => seedCore.createTask(gm, { title: `测量样例 ${index} ${unit}`, context: textOf(CONTEXT_BYTES, `样例 ${index} `),
+      await retried(() => seedCore.createTask(owner, { title: `测量样例 ${index} ${unit}`, context: textOf(CONTEXT_BYTES, `样例 ${index} `),
         executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `measure-${label}-${index}-${randomUUID()}` }));
     }
     // Two control tasks per sample and per phase, so no control request reuses a task another phase has released.
     const controls: string[] = [];
     for (let index = 0; index < 2 * SAMPLES * RATES.length; index++) {
-      const task = await retried(() => seedCore.createTask(gm, { title: `控制样例 ${index}`, context: '控制样例正文',
+      const task = await retried(() => seedCore.createTask(owner, { title: `控制样例 ${index}`, context: '控制样例正文',
         executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `control-${label}-${index}-${randomUUID()}` }));
       controls.push(task.id);
     }
@@ -318,7 +318,7 @@ async function main() {
           timings.claim.push(performance.now() - t0);
           ops.push({ task: taskId, kind: 'claim', start: Date.now() - (performance.now() - t0), end: Date.now() });
           const t1 = performance.now();
-          try { await core.getTask(gm, taskId); timings.read.push(performance.now() - t1); } catch (error) { fail('read', error); }
+          try { await core.getTask(owner, taskId); timings.read.push(performance.now() - t1); } catch (error) { fail('read', error); }
           const proof = { taskId, deliveryId: claimed.deliveryId, fence: claimed.fence, expectedVersion: claimed.task.version };
           const t2 = performance.now();
           try { await core.heartbeat(eng, proof); timings.heartbeat.push(performance.now() - t2); } catch (error) { fail('heartbeat', error); }
@@ -338,7 +338,7 @@ async function main() {
       // Listings are built back to back until the control requests finish, so every control sample overlaps a build.
       const builds = withBuild ? (async () => {
         while (!finished) {
-          const key = await core.contextView(gm, { pageSize: 25 }).then(() => 'ok', error => codeOf(error));
+          const key = await core.contextView(owner, { pageSize: 25 }).then(() => 'ok', error => codeOf(error));
           buildOutcomes[key] = (buildOutcomes[key] ?? 0) + 1;
         }
       })() : Promise.resolve();
@@ -404,7 +404,7 @@ async function main() {
         let answer = 0;
         let rows = 0;
         try {
-          const page = await core.contextView(gm, { pageSize: 25 });
+          const page = await core.contextView(owner, { pageSize: 25 });
           answer = answerBytes(page);
           rows = page.tasks?.length ?? 0;
         } catch (error) {

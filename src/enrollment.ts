@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
+import { ensureOwnerToken } from './owner-token.ts';
 import type { Credential, EmployeeId, EnrollmentAdmin, Principal, Role } from './contracts.ts';
 import { CompanyError, ROLES } from './core.ts';
 import { gateCredentialChange } from './retirement.ts';
@@ -13,9 +14,11 @@ export class LocalEnrollmentAdmin implements EnrollmentAdmin {
   /** `afterDecision` is a test seam (see gateCredentialChange); production passes nothing. */
   constructor(private readonly database: CompanyDatabase, private readonly afterDecision?: (employeeId: EmployeeId) => Promise<void>) {}
 
-  async enroll(employeeId: EmployeeId, role: Role, capabilities: Principal['capabilities']): Promise<Credential> {
+  async enroll(employeeId: EmployeeId, requestedRole: Role, capabilities: Principal['capabilities']): Promise<Credential> {
     if (!/^[a-z0-9][a-z0-9-]{2,79}$/.test(employeeId)) throw new CompanyError('invalid', 'Invalid employee ID');
-    if (!ROLES.includes(role)) throw new CompanyError('invalid', 'Invalid role');
+    // The gm post is retired. Legacy callers still pass 'gm'; it enrols the owner control-plane principal.
+    const role: Role = requestedRole === 'gm' ? 'owner' : requestedRole;
+    if (!ROLES.includes(role) && role !== 'owner') throw new CompanyError('invalid', 'Invalid role');
     if (capabilities.some(value => !['execute', 'review', 'manage'].includes(value))) {
       throw new CompanyError('invalid', 'Invalid capability');
     }
@@ -32,6 +35,24 @@ export class LocalEnrollmentAdmin implements EnrollmentAdmin {
       },
     });
     return token;
+  }
+
+  /** Bootstraps the owner control-plane principal from the private token file. Idempotent; token never leaves this host. */
+  async ensureOwner(serviceHome: string): Promise<void> {
+    const token = ensureOwnerToken(serviceHome);
+    const employee = new RecordId('employee', 'owner');
+    const digest = createHash('sha256').update(token).digest('hex');
+    const existing = await this.database.db.select<{ credential_digest?: string }>(employee);
+    if (existing?.credential_digest === digest) return;
+    await this.database.db.query('UPSERT $employee CONTENT $row;', {
+      employee,
+      row: {
+        role: 'owner', capabilities: ['execute', 'review', 'manage'],
+        credential_digest: digest,
+        credential_hash: await Bun.password.hash(token, { algorithm: 'argon2id' }),
+        revoked: false, retired: false, active_task: null,
+      },
+    });
   }
 
   /**

@@ -30,7 +30,7 @@ const run = process.env.RUN_SCK_CHANNEL_FORK_TESTS === '1' ? describe : describe
 const CLIENT_CLI = join(import.meta.dir, '..', 'src', 'mcp', 'client-cli.ts');
 const TEXT = 'QA 独立重演：这段说明只用于读回断言，不驱动任何真实动作。';
 const REPAIR = { title: 'QA repair chain', context: 'QA synthetic repair body', executorRole: 'engineering', reviewerRole: 'qa' };
-const ROLES: Record<string, string> = { 'qa-gm-a': 'gm', 'qa-gm-b': 'gm', 'qa-eng-a': 'engineering', 'qa-eng-b': 'engineering' };
+const ROLES: Record<string, string> = { 'qa-gm-a': 'owner', 'qa-gm-b': 'owner', 'qa-eng-a': 'engineering', 'qa-eng-b': 'engineering' };
 
 type Channel = { SCK_COMM_DIR: string; SCK_COMM_KEY: string };
 type Answer = { ok: boolean; data?: any; code?: string; error?: string };
@@ -144,7 +144,7 @@ run('QA rehearsal: SYS03 over real sck processes, the real sidecar and the compa
     const task = await core.createTask(creds['qa-gm-a']!, { title, context: 'QA rehearsal: synthetic manager gate',
       executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `qa-task-${title}-${randomUUID().slice(0, 8)}` });
     const since = Math.floor(Date.now() / 1000);
-    await q(`UPDATE ONLY $t SET state = 'blocked', blocked_to = 'gm', resume_state = 'doing', current_employee = $holder,
+    await q(`UPDATE ONLY $t SET state = 'blocked', blocked_to = 'owner', resume_state = 'doing', current_employee = $holder,
       lease_expires_at = $lease, dispatch_blocked_phase = 'execute', dispatch_blocked_since = $since, version = version + 1;`,
     { t: id('task', task.id), holder, lease: since - 600, since });
     const [row] = await q('SELECT version FROM ONLY $t;', { t: id('task', task.id) });
@@ -179,8 +179,8 @@ run('QA rehearsal: SYS03 over real sck processes, the real sidecar and the compa
     await db.connect();
     await db.bootstrap();
     const enrollment = new LocalEnrollmentAdmin(db);
-    creds['qa-gm-a'] = await enrollment.enroll('qa-gm-a', 'gm', ['execute', 'review', 'manage']);
-    creds['qa-gm-b'] = await enrollment.enroll('qa-gm-b', 'gm', ['execute', 'review', 'manage']);
+    creds['qa-gm-a'] = await enrollment.enroll('qa-gm-a', 'owner', ['execute', 'review', 'manage']);
+    creds['qa-gm-b'] = await enrollment.enroll('qa-gm-b', 'owner', ['execute', 'review', 'manage']);
     creds['qa-eng-a'] = await enrollment.enroll('qa-eng-a', 'engineering', ['execute', 'review']);
     creds['qa-eng-b'] = await enrollment.enroll('qa-eng-b', 'engineering', ['execute', 'review']);
     await db.db.upsert(new RecordId('company_meta', 'config')).content({ eval_enabled: false, jev_decisions: false,

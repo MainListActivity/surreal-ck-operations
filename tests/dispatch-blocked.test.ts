@@ -16,7 +16,7 @@ test('every candidate recused: not dispatchable and infeasible, reasons name the
   const v = verdict([{ key: 'author', eligible: false, code: 'author_recusal' }, { key: 'rework', eligible: false, code: 'author_recusal' }],
     { phase: 'review' });
   expect(v).toMatchObject({ dispatchable: false, feasible: false, noticeKey: 'dispatch-blocked:t1:review' });
-  expect(v.reasons).toEqual([expect.objectContaining({ code: 'author_recusal', candidates: ['author', 'rework'], owner: 'gm' })]);
+  expect(v.reasons).toEqual([expect.objectContaining({ code: 'author_recusal', candidates: ['author', 'rework'], owner: 'owner' })]);
 });
 
 test('a coarse early reason cannot hide author recusal: every effective code is reported with its candidates', () => {
@@ -34,7 +34,7 @@ test('pass-wide gates are reported alone: candidates are not read while they app
   const v = evaluateDispatch({ taskId: 't1', title: '实现任务', phase: 'execute', role: 'engineering', home: '/ops',
     entries: [{ key: 'a', eligible: true }], globalBlocks: [globalBlock('paused')], checkedAt: at });
   expect(v.dispatchable).toBe(false);
-  expect(v.reasons).toEqual([expect.objectContaining({ code: 'paused', candidates: ['*'], owner: 'gm', text: BLOCK_TEXT.paused })]);
+  expect(v.reasons).toEqual([expect.objectContaining({ code: 'paused', candidates: ['*'], owner: 'owner', text: BLOCK_TEXT.paused })]);
   expect(v.feasible).toBe(true);
 });
 
@@ -65,7 +65,7 @@ test('independence reasons name the source task and each excluded candidate in t
 test('no candidate at all is a manager decision: infeasible until staff is added', () => {
   const v = verdict([]);
   expect(v).toMatchObject({ dispatchable: false, feasible: false });
-  expect(v.reasons[0]).toMatchObject({ code: 'no_candidate', owner: 'gm' });
+  expect(v.reasons[0]).toMatchObject({ code: 'no_candidate', owner: 'owner' });
 });
 
 test('owner-decision codes alone are infeasible; a busy candidate that can recover stays feasible', () => {
@@ -90,7 +90,7 @@ test('the notice lists reasons with their candidates and the owner-facing recove
     { phase: 'review' });
   const text = dispatchNoticeText(v);
   expect(text).toContain(`原因：${BLOCK_TEXT.author_recusal}（author、rework）`);
-  expect(text).toContain('gm：经理增补独立复核人选');
+  expect(text).toContain('处理：老板：老板增补独立复核人选（编制扩容或新员工），不能由作者自验');
 });
 
 test('the notice key is per task and phase, so a repeated tick keeps one episode', () => {

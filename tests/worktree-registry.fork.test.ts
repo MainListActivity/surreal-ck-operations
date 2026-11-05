@@ -35,7 +35,7 @@ beforeAll(async () => {
   if (process.env.RUN_SCK_WORKTREE_FORK_TESTS !== '1') return;
   dir = realpathSync(mkdtempSync(join(tmpdir(), 'sck-worktree-fork-')));
   const listener = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('fixture') }); port = listener.port!; listener.stop(true);
-  await start(); gm = await new LocalEnrollmentAdmin(db).enroll('worktree-manager', 'gm', ['execute', 'review', 'manage']);
+  await start(); gm = await new LocalEnrollmentAdmin(db).enroll('worktree-manager', 'owner', ['execute', 'review', 'manage']);
 }, 20000);
 afterAll(async () => { if (!dir) return;
   if (process.env.SCK_WORKTREE_EVIDENCE) {
@@ -93,8 +93,8 @@ run('serial QA and GM reuse one physical tree, with authenticated references and
   const path = repo(), core = coreFor(path), qa = await employee('qa');
   const first = await core.claim(qa, (await task(core, 'qa')).id); await submit(core, qa, first);
   const second = await core.claim(qa, (await task(core, 'qa')).id); expect(second.worktree!.worktreePath).toBe(first.worktree!.worktreePath); await submit(core, qa, second);
-  const manager1 = await core.claim(gm, (await task(core, 'gm')).id); await submit(core, gm, manager1);
-  const manager2 = await core.claim(gm, (await task(core, 'gm')).id); expect(manager2.worktree!.worktreePath).toBe(first.worktree!.worktreePath);
+  const manager1 = await core.claim(gm, (await task(core, 'owner')).id); await submit(core, gm, manager1);
+  const manager2 = await core.claim(gm, (await task(core, 'owner')).id); expect(manager2.worktree!.worktreePath).toBe(first.worktree!.worktreePath);
   const inventory = await core.listWorktrees(gm);
   const shared = inventory.find(w => w.id === first.worktree!.id)!;
   expect(shared.references.filter(r => r.state === 'active').map(r => r.taskId)).toEqual([manager2.task.id]);

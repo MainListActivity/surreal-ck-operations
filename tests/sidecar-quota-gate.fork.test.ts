@@ -53,7 +53,7 @@ run('SYS-QUOTA fork: a real sck quota block writes the task row and the provider
     for (let n = 0; n < 100; n++) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) { ready = true; break; } } catch {} await Bun.sleep(25); }
     expect(ready).toBe(true); await db.connect(); await db.bootstrap();
     const core = new SurrealCompanyCore(db), enrollment = new LocalEnrollmentAdmin(db), owner = new OwnerDesk(db);
-    const gm = await enrollment.enroll('fixture-manager', 'gm', ['execute', 'review', 'manage']);
+    const gm = await enrollment.enroll('fixture-manager', 'owner', ['execute', 'review', 'manage']);
     // 额度下限熔断关掉（quota_floor_pct 0）：本用例证明的是 provider_health 这一条门禁，不是 magpie 的剩余额度熔断。
     // provider_max 每个订阅一个席位：一席在手时新任务只能去另一个订阅，本用例的派工落点是确定的。
     await db.db.upsert(new RecordId('company_meta', 'config')).content({ eval_enabled: false, jev_decisions: false,
@@ -116,7 +116,7 @@ run('SYS-QUOTA fork: a real sck quota block writes the task row and the provider
 
     // ---- AC03③：非法值由 core 拒绝、原样回给员工，任务状态不变、一个 provider 行都不写，且租约没被吃掉
     const bad = await relay(codexChannel, 'report_blocker',
-      { to: 'gm', text: '订阅额度用尽，但恢复时间写错了，需要按格式重报一次。', idempotencyKey: 'quota-block-bad', quotaResetsAt: '2026-10-24T04:40:00' });
+      { to: 'owner', text: '订阅额度用尽，但恢复时间写错了，需要按格式重报一次。', idempotencyKey: 'quota-block-bad', quotaResetsAt: '2026-10-24T04:40:00' });
     expect(bad.ok).toBe(false);
     expect(bad.error).toStartWith('invalid:');
     expect(bad.error).toContain('explicit timezone offset');
@@ -126,9 +126,9 @@ run('SYS-QUOTA fork: a real sck quota block writes the task row and the provider
 
     // ---- AC01/AC03①/AC04：同一租约上改好格式重报，任务行与 provider 健康都要落到员工声明的时刻
     const blocked = await relay(codexChannel, 'report_blocker',
-      { to: 'gm', text: '订阅额度用尽：平台说本窗口到点才恢复，先阻塞等恢复。', idempotencyKey: 'quota-block-1', quotaResetsAt: resetAt });
+      { to: 'owner', text: '订阅额度用尽：平台说本窗口到点才恢复，先阻塞等恢复。', idempotencyKey: 'quota-block-1', quotaResetsAt: resetAt });
     expect(blocked.ok).toBe(true);
-    expect(await taskRow(task1.id)).toMatchObject({ state: 'blocked', blocked_to: 'gm', quota_resets_at: resetSec });
+    expect(await taskRow(task1.id)).toMatchObject({ state: 'blocked', blocked_to: 'owner', quota_resets_at: resetSec });
     expect(await healthRow('codex')).toMatchObject({ state: 'exhausted', until: resetSec, last_error: 'quota reset reported by employee' });
 
     // ---- AC04：恢复点前该 provider 不派工。此时唯一的订阅都耗尽，公司压住队列而不是把活派下去。
@@ -156,9 +156,9 @@ run('SYS-QUOTA fork: a real sck quota block writes the task row and the provider
     const { inst: other, channel: otherChannel } = await holderOf(task3.id);
     expect(other.provider).toBe('anthropic');
     const plain = await relay(otherChannel, 'report_blocker',
-      { to: 'gm', text: '范围不确定，需要经理定夺，与订阅额度无关，请给个方向。', idempotencyKey: 'quota-block-2' });
+      { to: 'owner', text: '范围不确定，需要经理定夺，与订阅额度无关，请给个方向。', idempotencyKey: 'quota-block-2' });
     expect(plain.ok).toBe(true);
-    expect(await taskRow(task3.id)).toMatchObject({ state: 'blocked', blocked_to: 'gm' });
+    expect(await taskRow(task3.id)).toMatchObject({ state: 'blocked', blocked_to: 'owner' });
     expect(await quotaOf(task3.id)).toBeNull();
     expect(await healthRow('anthropic')).toBeUndefined();
 
@@ -170,7 +170,7 @@ run('SYS-QUOTA fork: a real sck quota block writes the task row and the provider
     const fileReset = new Date(Date.now() + 2 * 3600_000).toISOString();
     writeFileSync(blockerPath(fileChannel.SCK_COMM_DIR!), `quotaResetsAt: ${fileReset}\n\n订阅额度用尽，等这个点之后再继续。`);
     await pool.settle(fileInst.paseoAgentId!);
-    expect(await taskRow(task5.id)).toMatchObject({ state: 'blocked', blocked_to: 'gm', quota_resets_at: Math.floor(Date.parse(fileReset) / 1000) });
+    expect(await taskRow(task5.id)).toMatchObject({ state: 'blocked', blocked_to: 'owner', quota_resets_at: Math.floor(Date.parse(fileReset) / 1000) });
     expect(await healthRow('anthropic')).toMatchObject({ state: 'exhausted', until: Math.floor(Date.parse(fileReset) / 1000) });
 
     // ---- AC02：文件入口的非法值同样走拒绝路径（不是静默丢字段）：阻塞不落库、额度列空、该 provider 一个 health 行都没写

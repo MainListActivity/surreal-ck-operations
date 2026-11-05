@@ -45,7 +45,7 @@ beforeAll(async () => {
   await database.db.query('REMOVE DATABASE IF EXISTS control_plane;');
   await database.bootstrap();
   for (const [name, role, caps] of [
-    ['gm', 'gm', ['execute', 'review', 'manage']],
+    ['owner', 'owner', ['execute', 'review', 'manage']],
     ['eng', 'engineering', ['execute', 'review']],
     ['qa', 'qa', ['execute', 'review']],
     ['qa2', 'qa', ['execute', 'review']],
@@ -67,7 +67,7 @@ beforeAll(async () => {
     at: new Date().toISOString(),
     verdicts: [{ taskId: subjectId, phase: 'execute', dispatchable: false, workflowState: 'ready', eligibleCount: 0, feasible: false,
       summary: '无独立复核人选', checkedAt: new Date().toISOString(), waitingMinutes: 5,
-      reasons: [{ code: 'author_recusal', text: '本任务作者不能复核', candidates: ['eng-other'], owner: 'gm',
+      reasons: [{ code: 'author_recusal', text: '本任务作者不能复核', candidates: ['eng-other'], owner: 'owner',
         recovery: '经理增补独立复核人选', nextTrigger: '出现独立候选人选', basis: 'contribution-audit' }] }],
   });
   await database.db.query(`UPSERT company_meta:dispatch_observation_status CONTENT { at: $at, ok: true, error: '' };`, { at: new Date().toISOString() });
@@ -253,9 +253,9 @@ fork('F2: goal summary carries the root blocker, impact, dependency path and sub
     verdicts: [{ noticeKey: `${subjectId}:execute:1:no_candidate`, taskId: subjectId, goalId, title: '被核验主体任务', phase: 'execute',
       dispatchable: false, workflowState: 'ready', eligibleCount: 0, feasible: false, summary: '无独立复核人选',
       checkedAt: at, waitingMinutes: 5,
-      reasons: [{ code: 'no_candidate', text: '该岗位与仓库下没有任何编制或员工', candidates: [], owner: 'gm',
+      reasons: [{ code: 'no_candidate', text: '该岗位与仓库下没有任何编制或员工', candidates: [], owner: 'owner',
         recovery: '经理增补编制', nextTrigger: '新增编制或员工', basis: 'tick:staffing-pool',
-        actions: [{ authority: 'gm', label: '经理用 def_ensure 增加编制', tool: 'def_ensure', executable: true }] }] }],
+        actions: [{ authority: 'owner', label: '经理用 def_ensure 增加编制', tool: 'def_ensure', executable: true }] }] }],
   });
   await database.db.query("UPSERT company_meta:dispatch_observation_status CONTENT { at: $at, ok: true, error: '' };", { at });
   const read = await factsCore.qaObservationRead({ credential: tokens.qa }, { scopeId: scope.id, goalId });

@@ -113,7 +113,7 @@ run('RB01 rollback isolation: the policy layer writes, then the deployed release
     await oldDb.connect();
     await oldDb.bootstrap();
     const oldEnroll = new OldEnroll(oldDb);
-    gm = await oldEnroll.enroll('rb-gm', 'gm', ['execute', 'review', 'manage']);
+    gm = await oldEnroll.enroll('rb-gm', 'owner', ['execute', 'review', 'manage']);
     eng = await oldEnroll.enroll('rb-eng', 'engineering', ['execute', 'review']);
     // 第二个工程岗：一个员工同时只能持有一个在办租约，"doing 相位有持有人"与"另一条链上还能领取"需要两个人。
     eng2 = await oldEnroll.enroll('rb-eng2', 'engineering', ['execute', 'review']);
@@ -151,7 +151,7 @@ run('RB01 rollback isolation: the policy layer writes, then the deployed release
     const submitted = await core.submit(eng, proofOf(reviewClaim), evidence('review 相位的提交'));
     if (submitted.state !== 'review') throw new Error(`fixture: submit did not reach review (${submitted.state})`);
     const gmWaitClaim = await core.claim(eng, (await create('RB01 等待 GM')).id);
-    const tGmWait = await core.block(eng, proofOf(gmWaitClaim), 'gm', evidence('等 GM 决定'));
+    const tGmWait = await core.block(eng, proofOf(gmWaitClaim), 'owner', evidence('等 GM 决定'));
     const ownerClaim = await core.claim(eng, (await create('RB01 老板关口')).id);
     const tOwner = await core.block(eng, proofOf(ownerClaim), 'owner', evidence('请老板定关口'));
 
@@ -188,10 +188,10 @@ run('RB01 rollback isolation: the policy layer writes, then the deployed release
       executorRole: 'engineering', reviewerRole: 'qa', workIntent: { kind: 'read' }, idempotencyKey: key() });
     controlId = control.id;
     protectedTasks = [
-      { label: '收权隔离（ready）', id: tReady.id, expectState: 'blocked', expectBlockedTo: 'gm', expectResume: 'ready' },
-      { label: '收权隔离（doing）', id: tDoing.id, expectState: 'blocked', expectBlockedTo: 'gm', expectResume: 'doing' },
-      { label: '收权隔离（review）', id: tReview.id, expectState: 'blocked', expectBlockedTo: 'gm', expectResume: 'review' },
-      { label: '等待 GM', id: tGmWait.id, expectState: 'blocked', expectBlockedTo: 'gm' },
+      { label: '收权隔离（ready）', id: tReady.id, expectState: 'blocked', expectBlockedTo: 'owner', expectResume: 'ready' },
+      { label: '收权隔离（doing）', id: tDoing.id, expectState: 'blocked', expectBlockedTo: 'owner', expectResume: 'doing' },
+      { label: '收权隔离（review）', id: tReview.id, expectState: 'blocked', expectBlockedTo: 'owner', expectResume: 'review' },
+      { label: '等待 GM', id: tGmWait.id, expectState: 'blocked', expectBlockedTo: 'owner' },
       { label: '老板关口', id: tOwner.id, expectState: 'blocked', expectBlockedTo: 'owner' },
       { label: '等依赖', id: tDep.id, expectState: 'blocked' },
     ];

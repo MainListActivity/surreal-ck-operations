@@ -425,7 +425,7 @@ export type MagpieEvidenceV4 = z.infer<typeof magpieEvidenceV4Schema>;
 /**
  * The v4 eligibility gate. It re-derives the route digest, the approved set membership, the
  * account binding and the snapshot/headroom bounds from the document itself. A snapshot with
- * unreviewed pricing (the normal production state until GM decides) is valid evidence but is
+ * unreviewed pricing (the normal production state until the owner decides) is valid evidence but is
  * not eligible for an enable proof or an execution window.
  */
 export function magpieEvidenceEligible(e: MagpieEvidenceV4, now: number): boolean {

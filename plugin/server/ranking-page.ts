@@ -12,7 +12,6 @@ export const rankingPage = `<!doctype html><html lang="zh-CN"><head><meta charse
 <button onclick="location.href='./#goals'">${relayIcon("target")}<span>目标</span></button>
 <button onclick="location.href='./#docs'">${relayIcon("book")}<span>手册</span></button>
 <button class="active">${relayIcon("layers")}<span>模型排序</span></button>
-<button onclick="location.href='./#gm'">${relayIcon("send")}<span>给经理留言</span></button>
 </nav>
 <div class="sidebar-footer"><div class="operator"><span class="avatar">ML</span><span><strong>老板</strong><small>公司审核台</small></span></div></div>
 </aside>

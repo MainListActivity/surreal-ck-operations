@@ -37,7 +37,7 @@ beforeAll(async () => {
   await database.db.query('REMOVE DATABASE IF EXISTS control_plane;');
   await database.bootstrap();
   for (const [name, role, caps] of [
-    ['gm', 'gm', ['execute', 'review', 'manage']], ['product', 'product', ['execute', 'review', 'manage']],
+    ['owner', 'owner', ['execute', 'review', 'manage']], ['product', 'product', ['execute', 'review', 'manage']],
     ['eng-a', 'engineering', ['execute', 'review']], ['eng-b', 'engineering', ['execute', 'review']],
     ['qa', 'qa', ['execute', 'review']], ['eval', 'eval', []],
   ] as const) tokens[name] = await enrollment.enroll(`t-${name}`, role, caps);
@@ -76,7 +76,7 @@ test('program goal from a direct DB owner_command: scope, plan with deliveries, 
   const tasks = goal.tasks as Required<typeof goal.tasks>;
 
   // Scope: product proposes, gm reviews; the owner is not involved.
-  expect((await task(tasks.intake)).reviewerRole).toBe('gm');
+  expect((await task(tasks.intake)).reviewerRole).toBe('owner');
   expect((await task(tasks.plan)).state).toBe('blocked');
   await execute(tokens.product, tasks.intake, '范围提案：目标用户、MVP 清单、明确不做、依赖与风险。');
   await review(tokens.gm, tasks.intake);
@@ -236,7 +236,7 @@ test('instruct owner_command lands as a ready gm task carrying the owner text, i
   expect(instruct!.result).toMatch(/^task=/);
   const taskId = instruct!.result!.slice(5);
   const t = await core.getTask(tokens.gm, taskId);
-  expect(t).toMatchObject({ state: 'ready', executorRole: 'gm', reviewerRole: 'product' });
+  expect(t).toMatchObject({ state: 'ready', executorRole: 'owner', reviewerRole: 'product' });
   expect(t.context).toContain('盘一下上周的交付质量');
   // Re-apply of the same command id must not duplicate the task.
   await database.db.query("UPDATE owner_command SET status = 'pending' WHERE kind = 'instruct';");
@@ -597,7 +597,7 @@ test('dispatcher: jev triages goals, approves safe releases and reroutes owner q
   await database.db.query("UPDATE goal SET state = 'cancelled' WHERE state = 'triage';");
   await database.db.query('DELETE provider_health;');
   await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 } };");
-  await workforce.upsertDef('gm-codex', { role: 'gm', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'high', maxInstances: 2 });
+  await workforce.upsertDef('gm-codex', { role: 'owner', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'high', maxInstances: 2 });
   await workforce.upsertDef('product-codex', { role: 'product', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 2 });
   const answers = { tier: 'quick', tierConfidence: 0.92, go: 0.9, redLine: 0.05, needsOwner: 0.1 };
   const asked: string[] = [];
@@ -661,12 +661,12 @@ test('dispatcher: jev triages goals, approves safe releases and reroutes owner q
 
   // Owner escalation: a question that is not owner-only is moved to gm once; raised again it stays with the owner.
   const ask = await core.createTask(tokens.gm, { title: '选择图表库', context: '选一个图表库', executorRole: 'product',
-    reviewerRole: 'gm', idempotencyKey: key() });
+    reviewerRole: 'owner', idempotencyKey: key() });
   const held = await core.claim(tokens.product, ask.id);
   await core.block(tokens.product, proofOf(held), 'owner', { text: '请老板决定用 ECharts 还是 Chart.js。', idempotencyKey: key() });
   report = await dispatcher.tick();
   expect(report.decisions).toContain(`reroute:${ask.id}`);
-  expect(await task(ask.id)).toMatchObject({ state: 'blocked', blockedTo: 'gm' });
+  expect(await task(ask.id)).toMatchObject({ state: 'blocked', blockedTo: 'owner' });
   await core.resume(tokens.gm, ask.id, { text: '经理：先按原计划继续，确实需要老板时再升级。', idempotencyKey: key() });
   const again = await core.claim(tokens.product, ask.id);
   await core.block(tokens.product, proofOf(again), 'owner', { text: '经理确认需要老板决定：Chart.js 商业版需要购买授权，属于花钱事项。', idempotencyKey: key() });
@@ -679,7 +679,7 @@ test('a task blocked while doing resumes to its bound implementer; a colleague c
   const t = await core.createTask(tokens.gm, { title: '阻塞后恢复', context: '验证恢复后由绑定实现者重新领取', executorRole: 'engineering',
     reviewerRole: 'engineering', idempotencyKey: key() });
   const held = await core.claim(tokens['eng-a'], t.id);
-  await core.block(tokens['eng-a'], proofOf(held), 'gm', { text: '缺少一个前置信息，需要经理协调补充后再恢复本任务继续执行。', idempotencyKey: key() });
+  await core.block(tokens['eng-a'], proofOf(held), 'owner', { text: '缺少一个前置信息，需要经理协调补充后再恢复本任务继续执行。', idempotencyKey: key() });
   const resumed = await core.resume(tokens.gm, t.id, { text: '经理决定：按原方案继续执行，缺少的前置信息已经补充完整。', idempotencyKey: key() });
   expect(resumed.state).toBe('ready');
   // AC04: the first execute claim bound eng-a as implementer, so the resumed code work stays with eng-a; AC06: a colleague is refused.
@@ -711,9 +711,9 @@ test('gm defers a gm-blocked execute task onto dependencies: manager wake stops,
   const qaTask = await core.createTask(tokens.gm, { title: '原QA生产实测', context: '被gm阻塞的执行任务，等待恢复门槛', executorRole: 'qa',
     reviewerRole: 'qa', goalId: goal.id, idempotencyKey: key() });
   const held = await core.claim(tokens.qa, qaTask.id);
-  await core.block(tokens.qa, proofOf(held), 'gm', { text: '上游三链仍在进行中，本任务暂不能重复测试，请经理安排依赖等待。', idempotencyKey: key() });
+  await core.block(tokens.qa, proofOf(held), 'owner', { text: '上游三链仍在进行中，本任务暂不能重复测试，请经理安排依赖等待。', idempotencyKey: key() });
   const beforeVersion = (await task(qaTask.id)).version;
-  expect(await task(qaTask.id)).toMatchObject({ state: 'blocked', blockedTo: 'gm' });
+  expect(await task(qaTask.id)).toMatchObject({ state: 'blocked', blockedTo: 'owner' });
 
   // defer merges the dependency, clears the gm flag and keeps the task out of the work queues.
   const input = { taskId: qaTask.id, dependencies: [gate.id],
@@ -764,10 +764,10 @@ test('review-phase gm block becomes a formal dependency wait and restores review
   const submitted = await core.claim(tokens['eng-a'], qaTask.id);
   await core.submit(tokens['eng-a'], proofOf(submitted), { text: '工程提交复核：生产实测记录、边界结果与原始断言均已写入证据。', idempotencyKey: key() });
   const blockedBy = await core.claim(qaB, qaTask.id);
-  await core.block(qaB, proofOf(blockedBy), 'gm', { text: '新 head 尚无独立工程复核和运营新批准，QA 不能重复实测；请经理挂正式依赖。', idempotencyKey: key() });
+  await core.block(qaB, proofOf(blockedBy), 'owner', { text: '新 head 尚无独立工程复核和运营新批准，QA 不能重复实测；请经理挂正式依赖。', idempotencyKey: key() });
   const before = await task(qaTask.id);
   const beforeHistory = await core.history(tokens.gm, qaTask.id);
-  expect(before).toMatchObject({ state: 'blocked', blockedTo: 'gm', submittedBy: 't-eng-a', implementer: 't-eng-a' });
+  expect(before).toMatchObject({ state: 'blocked', blockedTo: 'owner', submittedBy: 't-eng-a', implementer: 't-eng-a' });
   const beforeVersion = before.version;
   const input = { taskId: qaTask.id, dependencies: [gate.id], text: '把 QA 的真实复核阻塞转为正式依赖等待：前置完成前不派 QA、不派实现、不重复叫醒经理。', idempotencyKey: key(), expectedVersion: beforeVersion };
   await expect(core.deferTaskUntil(tokens.gm, { ...input, idempotencyKey: key(), expectedVersion: beforeVersion - 1 }))
@@ -847,7 +847,7 @@ test('review-phase gm block becomes a formal dependency wait and restores review
   const selfSubmit = await core.claim(tokens.qa, selfTask.id);
   await core.submit(tokens.qa, proofOf(selfSubmit), { text: 'QA 自审用例提交：此处只验证服务端拒绝自验，不声称内容通过。', idempotencyKey: key() });
   const selfBlock = await core.claim(qaB, selfTask.id);
-  await core.block(qaB, proofOf(selfBlock), 'gm', { text: 'QA 自审用例阻塞：等待已完成前置后恢复 review。', idempotencyKey: key() });
+  await core.block(qaB, proofOf(selfBlock), 'owner', { text: 'QA 自审用例阻塞：等待已完成前置后恢复 review。', idempotencyKey: key() });
   const selfDeferred = await core.deferTaskUntil(tokens.gm, { taskId: selfTask.id, dependencies: [gate.id], text: 'QA 自审用例转为正式依赖等待，前置已完成所以应立即恢复 review。', idempotencyKey: key() });
   expect(selfDeferred).toMatchObject({ state: 'review', blockedTo: undefined, submittedBy: 't-qa' });
   await expect(core.claim(tokens.qa, selfTask.id)).rejects.toMatchObject({ code: 'self_review' });
@@ -871,10 +871,10 @@ test('RW06 cross-version: the pre-RW06 unlock misdispatches a review wait (old-r
     const submitted = await core.claim(tokens['eng-a'], t.id);
     await core.submit(tokens['eng-a'], proofOf(submitted), { text: '工程提交复核：旧红与新绿对照用例的原始交付。', idempotencyKey: key() });
     const blocked = await core.claim(qaB, t.id);
-    await core.block(qaB, proofOf(blocked), 'gm', { text: '前置未完成，先挂正式依赖等待，避免误派工程。', idempotencyKey: key() });
+    await core.block(qaB, proofOf(blocked), 'owner', { text: '前置未完成，先挂正式依赖等待，避免误派工程。', idempotencyKey: key() });
     // C3: the manager-blocked view is distinguishable before the wait is formalised.
     // A manager gate on a review-phase task is a manager wait that still names the review phase and reviewer role.
-    expect((await task(t.id)).waiting).toMatchObject({ kind: 'manager', resumeState: 'review', role: 'qa' });
+    expect((await task(t.id)).waiting).toMatchObject({ kind: 'owner', resumeState: 'review', role: 'qa' });
     await core.deferTaskUntil(tokens.gm, { taskId: t.id, dependencies: [gate.id], text: '转为正式依赖等待：前置完成前不派复核、不派实现。', idempotencyKey: key() });
     // C3: the dependency wait names the review phase and the reviewing role, not the execute phase.
     expect((await task(t.id)).waiting).toEqual({ kind: 'dependency', resumeState: 'review', role: 'qa', dependenciesCount: 1 });
@@ -942,7 +942,7 @@ test.skipIf(!old475Available)('RW06 real old code: the 475 unlock statement writ
   await core.submit(tokens['eng-a'], proofOf(submitted), { text: '工程提交复核：真实旧代码对照的原始交付与证据。', idempotencyKey: key() });
   const qaC = await enrollment.enroll('t-qa-oldcode', 'qa', ['execute', 'review']);
   const blocked = await core.claim(qaC, waiting.id);
-  await core.block(qaC, proofOf(blocked), 'gm', { text: '前置未完成，先转正式依赖等待，再用旧代码完成前置。', idempotencyKey: key() });
+  await core.block(qaC, proofOf(blocked), 'owner', { text: '前置未完成，先转正式依赖等待，再用旧代码完成前置。', idempotencyKey: key() });
   await core.deferTaskUntil(tokens.gm, { taskId: waiting.id, dependencies: [gate.id], text: '转为正式依赖等待：前置完成前不派复核与实现。', idempotencyKey: key() });
   // Finish the prerequisite out of band (a status flip, no core transition), so the only unlock statement that runs is the old
   // one under test — the new code's unlock would restore review before the old statement could see the wait.
@@ -974,7 +974,7 @@ test('review wait concurrency, void dependencies and cycle attempts stay fail cl
     const c = await core.claim(tokens['eng-a'], t.id);
     await core.submit(tokens['eng-a'], proofOf(c), { text: `${title} 提交证据：合成用例包含完整提交与测试断言。`, idempotencyKey: key() });
     const r = await core.claim(tokens.qa, t.id);
-    await core.block(tokens.qa, proofOf(r), 'gm', { text: `${title} 复核阻塞：等待经理转为正式依赖。`, idempotencyKey: key() });
+    await core.block(tokens.qa, proofOf(r), 'owner', { text: `${title} 复核阻塞：等待经理转为正式依赖。`, idempotencyKey: key() });
     return t;
   };
   const gate1 = await mkGate('并发前置甲');
@@ -1012,7 +1012,7 @@ test('review wait concurrency, void dependencies and cycle attempts stay fail cl
   await database.db.query("UPDATE $task SET submitted_by = 't-eng-b';", { task: new RecordId('task', snapshot.id) });
   await expect(core.deferTaskUntil(tokens.gm, { taskId: snapshot.id, dependencies: [gate1.id], text: '提交快照与历史不一致时必须失败关闭，不能猜测原提交。', idempotencyKey: key() }))
     .rejects.toMatchObject({ code: 'invalid' });
-  expect(await task(snapshot.id)).toMatchObject({ state: 'blocked', blockedTo: 'gm' });
+  expect(await task(snapshot.id)).toMatchObject({ state: 'blocked', blockedTo: 'owner' });
 
   // A review-phase task can wait on another gm-blocked review task, but the reverse edge is a cycle.
   const cycleA = await mkReview('复核环A');
@@ -1020,7 +1020,7 @@ test('review wait concurrency, void dependencies and cycle attempts stay fail cl
   await core.deferTaskUntil(tokens.gm, { taskId: cycleA.id, dependencies: [cycleB.id], text: '复核环A先等待复核环B，用于验证反向依赖成环被拒绝。', idempotencyKey: key() });
   await expect(core.deferTaskUntil(tokens.gm, { taskId: cycleB.id, dependencies: [cycleA.id], text: '复核环B反向等待复核环A，必须被依赖环检测拒绝。', idempotencyKey: key() }))
     .rejects.toMatchObject({ code: 'invalid' });
-  expect(await task(cycleB.id)).toMatchObject({ state: 'blocked', blockedTo: 'gm' });
+  expect(await task(cycleB.id)).toMatchObject({ state: 'blocked', blockedTo: 'owner' });
 
   // A raw dependency that resolves to a superseded lineage tip must still be checked for a back-edge.
   const resolvedCycle = await mkReview('解析后环任务');
@@ -1029,7 +1029,7 @@ test('review wait concurrency, void dependencies and cycle attempts stay fail cl
   await database.db.query("UPDATE $raw SET superseded_by = $tip, lineage = $raw; UPDATE $tip SET lineage = $raw;", { raw: new RecordId('task', rawDep.id), tip: new RecordId('task', tipDep.id) });
   await expect(core.deferTaskUntil(tokens.gm, { taskId: resolvedCycle.id, dependencies: [rawDep.id], text: '原始依赖解析到新 tip 后若回指本任务，必须按解析后环拒绝。', idempotencyKey: key() }))
     .rejects.toMatchObject({ code: 'invalid' });
-  expect(await task(resolvedCycle.id)).toMatchObject({ state: 'blocked', blockedTo: 'gm' });
+  expect(await task(resolvedCycle.id)).toMatchObject({ state: 'blocked', blockedTo: 'owner' });
 
   // Concurrent reverse defers must not create a cycle even when both pre-reads see a clean graph.
   const concurrentA = await mkReview('并发环A');
@@ -1072,19 +1072,19 @@ test('defer_task_until refuses non-gm, owner gates, live leases, unprovable/cros
   const reviewDoing = await core.claim(tokens['eng-a'], reviewTask.id);
   await core.submit(tokens['eng-a'], proofOf(reviewDoing), { text: '实现完成，提交评审：交付证据、测试结果与遗留事项都已写明。', idempotencyKey: key() });
   const reviewer = await core.claim(tokens['eng-b'], reviewTask.id);
-  await core.block(tokens['eng-b'], proofOf(reviewer), 'gm', { text: '评审发现方向问题，需要经理先做产品决定。', idempotencyKey: key() });
+  await core.block(tokens['eng-b'], proofOf(reviewer), 'owner', { text: '评审发现方向问题，需要经理先做产品决定。', idempotencyKey: key() });
   const reviewVersion = (await task(reviewTask.id)).version;
   await database.db.query("DELETE audit WHERE task = $task AND action = 'submit';", { task: new RecordId('task', reviewTask.id) });
   await expect(core.deferTaskUntil(tokens.gm, { taskId: reviewTask.id, dependencies: [depReady.id], text: reason, idempotencyKey: key() }))
     .rejects.toMatchObject({ code: 'invalid' });
-  expect(await task(reviewTask.id)).toMatchObject({ state: 'blocked', blockedTo: 'gm', version: reviewVersion });
+  expect(await task(reviewTask.id)).toMatchObject({ state: 'blocked', blockedTo: 'owner', version: reviewVersion });
 
   // A review block whose recorded role disagrees with reviewer_role is cross-role and refused.
   const crossTask = await mk('跨角色复核阻塞');
   const crossDoing = await core.claim(tokens['eng-a'], crossTask.id);
   await core.submit(tokens['eng-a'], proofOf(crossDoing), { text: '实现完成，提交评审：用于跨角色拒绝用例。', idempotencyKey: key() });
   const crossReviewer = await core.claim(tokens['eng-b'], crossTask.id);
-  await core.block(tokens['eng-b'], proofOf(crossReviewer), 'gm', { text: '评审阻塞：该合成任务用于验证跨角色复核阻塞会被拒绝。', idempotencyKey: key() });
+  await core.block(tokens['eng-b'], proofOf(crossReviewer), 'owner', { text: '评审阻塞：该合成任务用于验证跨角色复核阻塞会被拒绝。', idempotencyKey: key() });
   await database.db.query("UPDATE $task SET resume_role = 'qa';", { task: new RecordId('task', crossTask.id) });
   await expect(core.deferTaskUntil(tokens.gm, { taskId: crossTask.id, dependencies: [depReady.id], text: reason, idempotencyKey: key() }))
     .rejects.toMatchObject({ code: 'invalid' });
@@ -1093,14 +1093,14 @@ test('defer_task_until refuses non-gm, owner gates, live leases, unprovable/cros
   const ownerReview = await core.createTask(tokens.gm, { title: 'owner复核阻塞', context: 'owner review gate must stay outside defer', executorRole: 'engineering', reviewerRole: 'owner', idempotencyKey: key() });
   const ownerDoing = await core.claim(tokens['eng-a'], ownerReview.id);
   await core.submit(tokens['eng-a'], proofOf(ownerDoing), { text: '实现完成，提交老板复核：用于 owner gate 拒绝用例。', idempotencyKey: key() });
-  await database.db.query("UPDATE $task SET state = 'blocked', blocked_to = 'gm', resume_state = 'review', resume_role = 'owner';", { task: new RecordId('task', ownerReview.id) });
+  await database.db.query("UPDATE $task SET state = 'blocked', blocked_to = 'owner', resume_state = 'review', resume_role = 'owner';", { task: new RecordId('task', ownerReview.id) });
   await expect(core.deferTaskUntil(tokens.gm, { taskId: ownerReview.id, dependencies: [depReady.id], text: reason, idempotencyKey: key() }))
     .rejects.toMatchObject({ code: 'invalid' });
 
   // A gm-blocked task: self, missing, cycle, cross-goal and stale versions are all refused.
   const blocked = await mk('gm阻塞任务');
   const blockedHold = await core.claim(tokens['eng-b'], blocked.id);
-  await core.block(tokens['eng-b'], proofOf(blockedHold), 'gm', { text: '等待外部条件，请经理把本任务转为依赖等待。', idempotencyKey: key() });
+  await core.block(tokens['eng-b'], proofOf(blockedHold), 'owner', { text: '等待外部条件，请经理把本任务转为依赖等待。', idempotencyKey: key() });
   await expect(core.deferTaskUntil(tokens.gm, { taskId: blocked.id, dependencies: [blocked.id], text: reason, idempotencyKey: key() }))
     .rejects.toMatchObject({ code: 'invalid' });
   await expect(core.deferTaskUntil(tokens.gm, { taskId: blocked.id, dependencies: ['00000000-0000-4000-8000-000000000000'], text: reason, idempotencyKey: key() }))
@@ -1114,10 +1114,10 @@ test('defer_task_until refuses non-gm, owner gates, live leases, unprovable/cros
   const a = await mk('环检测A');
   const b = await mk('环检测B');
   const aHold = await core.claim(tokens['eng-b'], a.id);
-  await core.block(tokens['eng-b'], proofOf(aHold), 'gm', { text: '环检测用例：a 先转为依赖等待，稍后尝试 b 反向等待制造环。', idempotencyKey: key() });
+  await core.block(tokens['eng-b'], proofOf(aHold), 'owner', { text: '环检测用例：a 先转为依赖等待，稍后尝试 b 反向等待制造环。', idempotencyKey: key() });
   await core.deferTaskUntil(tokens.gm, { taskId: a.id, dependencies: [b.id], text: reason, idempotencyKey: key() });
   const bHold = await core.claim(tokens['eng-b'], b.id);
-  await core.block(tokens['eng-b'], proofOf(bHold), 'gm', { text: '环检测用例：b 再转为依赖等待，应当被环检测直接拒绝。', idempotencyKey: key() });
+  await core.block(tokens['eng-b'], proofOf(bHold), 'owner', { text: '环检测用例：b 再转为依赖等待，应当被环检测直接拒绝。', idempotencyKey: key() });
   await expect(core.deferTaskUntil(tokens.gm, { taskId: b.id, dependencies: [a.id], text: reason, idempotencyKey: key() }))
     .rejects.toMatchObject({ code: 'invalid' });
 
@@ -1590,7 +1590,7 @@ test('content line roles: concept-design / asset-production tasks only reach the
   const tokenOf = (employee: string) => readFileSync(join(credDir, `${employee}.token`), 'utf8');
 
   const proto = await core.createTask(tokens.gm, { title: '概念原型 demo', context: 'synthetic',
-    executorRole: 'concept-design', reviewerRole: 'gm', idempotencyKey: key() });
+    executorRole: 'concept-design', reviewerRole: 'owner', idempotencyKey: key() });
   const mass = await core.createTask(tokens.gm, { title: '量产素材批次', context: 'synthetic',
     executorRole: 'asset-production', reviewerRole: 'qa', idempotencyKey: key() });
   // eval is still not a taskable role.
@@ -1638,7 +1638,7 @@ test('discipline tracks: project vocabulary, dispatch filter, cross-track claim 
 
   // Non-vocabulary discipline is rejected only when the project defines a vocabulary.
   await expect(core.createTask(tokens.gm, { title: '错轨任务', context: 'synthetic', executorRole: 'ai-content',
-    reviewerRole: 'gm', discipline: '配音', goalId: goal.id, idempotencyKey: key() }))
+    reviewerRole: 'owner', discipline: '配音', goalId: goal.id, idempotencyKey: key() }))
     .rejects.toMatchObject({ code: 'invalid' });
   // No goal/project: free-form value is allowed.
   const free = await core.createTask(tokens.gm, { title: '自由轨任务', context: 'synthetic', executorRole: 'engineering',
@@ -1656,7 +1656,7 @@ test('discipline tracks: project vocabulary, dispatch filter, cross-track claim 
   await workforce.upsertDef('content-any', { role: 'ai-content', provider: 'devin', model: 'swe-2', priority: 30 });
 
   const mk = (title: string, discipline?: string) => core.createTask(tokens.gm, { title, context: 'synthetic',
-    executorRole: 'ai-content', reviewerRole: 'gm', discipline, goalId: goal.id, idempotencyKey: key() });
+    executorRole: 'ai-content', reviewerRole: 'owner', discipline, goalId: goal.id, idempotencyKey: key() });
   const writerTask = await mk('写剧本', '编剧');
   const storyboardTask = await mk('画分镜', '分镜');
   const designTask = await mk('角色设定', '角色设计');
@@ -1688,13 +1688,13 @@ test('discipline tracks: project vocabulary, dispatch filter, cross-track claim 
 test('screenwriter: required-track create_task, claim gating with and without a covering def', async () => {
   // create_task 端：必配轨岗位（REQUIRED_TRACKS）缺轨/错轨显式 invalid，编剧轨任务正常接受。
   await expect(core.createTask(tokens.gm, { title: '剧本 v1（缺轨）', context: 'synthetic',
-    executorRole: 'screenwriter', reviewerRole: 'gm', idempotencyKey: key() }))
+    executorRole: 'screenwriter', reviewerRole: 'owner', idempotencyKey: key() }))
     .rejects.toMatchObject({ code: 'invalid', message: 'executorRole screenwriter requires discipline=编剧' });
   await expect(core.createTask(tokens.gm, { title: '剧本 v1（错轨）', context: 'synthetic',
-    executorRole: 'screenwriter', reviewerRole: 'gm', discipline: '分镜', idempotencyKey: key() }))
+    executorRole: 'screenwriter', reviewerRole: 'owner', discipline: '分镜', idempotencyKey: key() }))
     .rejects.toMatchObject({ code: 'invalid' });
   const scripted = await core.createTask(tokens.gm, { title: '剧本 v1', context: 'synthetic',
-    executorRole: 'screenwriter', reviewerRole: 'gm', discipline: '编剧', idempotencyKey: key() });
+    executorRole: 'screenwriter', reviewerRole: 'owner', discipline: '编剧', idempotencyKey: key() });
   expect(scripted.discipline).toBe('编剧');
 
   await workforce.upsertDef('screenwriter-agy', { role: 'screenwriter', provider: 'antigravity', model: 'gemini-3.7-flash-medium', tracks: ['编剧'] });
@@ -1716,7 +1716,7 @@ test('screenwriter: required-track create_task, claim gating with and without a 
   const bareDef = (await workforce.defs()).find(d => d.id === 'screenwriter-notrack')!;
   const bare = await workforce.spawnInst(bareDef);
   const next = await core.createTask(tokens.gm, { title: '剧本 v2', context: 'synthetic',
-    executorRole: 'screenwriter', reviewerRole: 'gm', discipline: '编剧', idempotencyKey: key() });
+    executorRole: 'screenwriter', reviewerRole: 'owner', discipline: '编剧', idempotencyKey: key() });
   await expect(core.claim(bare.credential!, next.id)).rejects.toMatchObject({ code: 'forbidden' });
 
   // 固定身份（无 def）的 screenwriter 同样 forbidden：必配轨要求编制显式覆盖。
@@ -1773,7 +1773,7 @@ test('manage tools: def_list/def_ensure/project_disciplines_update are manage-on
 test('quota gate: bad reset times are refused; a valid one keeps gm quiet until the reset, then one notice', async () => {
   await database.db.query("UPDATE task SET state = 'done' WHERE state != 'done';");
   await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 4 };");
-  await workforce.upsertDef('gm-codex', { role: 'gm', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', priority: 10 });
+  await workforce.upsertDef('gm-codex', { role: 'owner', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', priority: 10 });
   const paseo = new FakePaseo();
   const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
     rand: () => 0, notify: async () => {} });
@@ -1791,13 +1791,13 @@ test('quota gate: bad reset times are refused; a valid one keeps gm quiet until 
   const idleAll = () => { for (const agent of paseo.agents.keys()) paseo.set(agent, 'idle'); };
 
   // A bare clock time is refused before the transition: the task stays with its holder.
-  await expect(core.block(holder, proofOf(claim), 'gm', evidence(), '2026-10-18T10:12:00'))
+  await expect(core.block(holder, proofOf(claim), 'owner', evidence(), '2026-10-18T10:12:00'))
     .rejects.toThrow('explicit timezone offset');
   expect(await taskRow()).toMatchObject({ state: 'doing' });
 
   const resetAt = new Date(Date.now() + 3600_000).toISOString();
-  await core.block(holder, proofOf(claim), 'gm', evidence(), resetAt);
-  expect(await taskRow()).toMatchObject({ state: 'blocked', blocked_to: 'gm', quota_resets_at: Math.floor(Date.parse(resetAt) / 1000) });
+  await core.block(holder, proofOf(claim), 'owner', evidence(), resetAt);
+  expect(await taskRow()).toMatchObject({ state: 'blocked', blocked_to: 'owner', quota_resets_at: Math.floor(Date.parse(resetAt) / 1000) });
 
   // gm hears about the block once.
   let report = await dispatcher.tick();
@@ -1841,7 +1841,7 @@ test('MR02 real fork: two dispatchers can obtain only one in-flight manager wake
     CREATE audit CONTENT { task: $task, actor: $b, action: 'claim', phase: 'execute', version: 1, at: time::now() };`,
     { task: taskRef, a: new RecordId('employee', 't-eng-a'), b: new RecordId('employee', 't-eng-b') });
   await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 1 });
-  await workforce.upsertDef('gm-codex', { role: 'gm', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 2 });
+  await workforce.upsertDef('gm-codex', { role: 'owner', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 2 });
   const paseo = new FakePaseo();
   const makeDispatcher = () => new Dispatcher({ workforce, owner, paseo,
     env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0, notify: async () => {} });

@@ -5,7 +5,7 @@
  * Company rules, role descriptions and protocol text stay out: the system enforces leases, worktrees, quota and
  * credentials, so restating them only buries the requirement. Pure: the sidecar writes the files.
  */
-import type { ClaimResult, HistoryEntry, ProjectView, TaskView } from '../contracts.ts';
+import type { ClaimResult, HistoryEntry } from '../contracts.ts';
 
 /** Returns that send work back to its author: a reviewer's return and an owner's reject. */
 const RETURNS = new Set(['return', 'owner_reject']);
@@ -34,52 +34,12 @@ export function requirementOf(context: string): string {
   return [legacy[1]!.trim(), amended < 0 ? '' : context.slice(amended).trim()].filter(Boolean).join('\n\n');
 }
 
-type Leg = 'implement' | 'release' | 'combined' | 'deploy' | undefined;
-const legOf = ({ title = '' }: Partial<Pick<TaskView, 'title'>>): Leg =>
-  title.endsWith(' · 实现与上线申请') ? 'combined'
-    : title.endsWith(' · 实现') ? 'implement'
-      : title.endsWith(' · 上线申请') ? 'release'
-        : title.endsWith(' · 合入部署与生产实测') ? 'deploy' : undefined;
-
-const RELEASE_ITEMS = 'PR 链接与提交、改动摘要、影响面、数据库迁移类型（无 / 只新增结构 / 改写或删除已有数据）、新环境变量或主机准备、回滚方式、生产验证要点';
-
 /** This leg's own job, for the executor or the reviewer; undefined for tasks outside a delivery chain. */
-function legJob(leg: Leg, review: boolean): string | undefined {
-  if (!leg) return undefined;
-  if (review) {
-    return {
-      implement: '读 diff、跑测试，确认实现满足上面的需求。',
-      release: '决定是否上线：accept 即同意上线，return 写明还要补什么。',
-      combined: '复核 PR 与上线材料，决定是否上线：accept 即同意上线，return 写明还要补什么。',
-      deploy: '在生产环境按上面的需求逐条实测；测试账号、workspace、登录用 ops_* 工具（sck call ops_info \'{}\'）。每条写：入口 → 操作 → 实际结果。',
-    }[leg];
-  }
-  return {
-    implement: '实现上面的需求，推送分支并创建 PR（不要合入）。',
-    release: `提交上线申请：${RELEASE_ITEMS}。`,
-    combined: `实现上面的需求，推送分支并创建 PR（不要合入），并一并提交上线材料：${RELEASE_ITEMS}。`,
-    deploy: '合入 PR，按下面的发布方式发布，核对生产运行的就是该提交；发布失败先回滚再修复。提交合入提交、发布运行链接与生产健康检查结果。',
-  }[leg];
-}
-
-function releaseFacts(project: ProjectView | undefined): string | undefined {
-  if (!project) return undefined;
-  const lines = [`- 发布方式：${project.release}`];
-  if (project.rollback) lines.push(`- 回滚：${project.rollback}`);
-  for (const env of project.envs ?? []) if (env.url) lines.push(`- ${env.name}：${env.url}${env.healthUrl ? `（健康检查 ${env.healthUrl}）` : ''}`);
-  return lines.join('\n');
-}
-
-/** task.md for this claim. */
-export function taskBrief(claim: Pick<ClaimResult, 'task' | 'project'>): string {
-  const review = claim.task.state === 'review';
-  const leg = legOf(claim.task);
-  const parts = [`# ${claim.task.title ?? ''}`, '', '## 需求', '', requirementOf(claim.task.context ?? '')];
-  const job = legJob(leg, review);
-  if (job) parts.push('', review ? '## 复核要点' : '## 本环节', '', job);
-  if (leg === 'deploy') {
-    const facts = releaseFacts(claim.project);
-    if (facts) parts.push('', '## 发布与环境', '', facts);
-  }
+/** task.md for one claim: only the title, requirement and acceptance criteria. */
+export function taskBrief(claim: Pick<ClaimResult, 'task' | 'project'> & { task: { requirement?: string; acceptanceText?: string } }): string {
+  const task = claim.task as typeof claim.task & { requirement?: string; acceptance_text?: string; acceptanceText?: string };
+  const parts = [`# ${task.title ?? ''}`, '', '## 需求', '', task.requirement?.trim() || requirementOf(task.context ?? '')];
+  const acceptance = task.acceptanceText?.trim() || task.acceptance_text?.trim();
+  if (acceptance) parts.push('', '## 验收标准', '', acceptance);
   return `${parts.join('\n')}\n`;
 }

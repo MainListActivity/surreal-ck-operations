@@ -212,7 +212,7 @@ test('roster RPC: dispatch-blocked rows are the tick verdicts, with the notice s
   try {
     const response = await callRoster();
     expect(response.dispatchBlocked).toEqual([expect.objectContaining({ taskId: task.id, phase: 'review', summary: verdict.summary, feasible: false })]);
-    expect(response.dispatchBlocked[0]!.reasons).toEqual([expect.objectContaining({ code: 'author_recusal', text: BLOCK_TEXT.author_recusal, owner: 'gm' })]);
+    expect(response.dispatchBlocked[0]!.reasons).toEqual([expect.objectContaining({ code: 'author_recusal', text: BLOCK_TEXT.author_recusal, owner: 'owner' })]);
     expect(response.dispatchBlocked[0]!.waitingMinutes).toBeGreaterThanOrEqual(5);
   } finally { verdicts = []; }
 });

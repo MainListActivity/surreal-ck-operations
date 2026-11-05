@@ -36,7 +36,7 @@
 | `req/<id>.json` | 员工（经 sck） | `{ key, tool, args }`：`key` 是环境里的 `SCK_COMM_KEY`，`tool` 为工具名，`args` 为 JSON 参数 |
 | `res/<id>.json` | sidecar | `{ ok: true, data }` 或 `{ ok: false, error: "<code>: <message>" }`，文件名与请求同名 |
 | `report.md` | 员工 | 交付说明；回合结束（`agent.turn_ended`）时 sidecar 将其内容作为 submit 证据提交 |
-| `blocker.md` | 员工 | 阻塞说明；同上时机作为 `report_blocker`（固定 to=gm）提交，优先级高于 report.md。订阅额度/限流阻塞时**首行**写 `quotaResetsAt: <ISO 8601 带偏移>`，等价于 `report_blocker` 的 `quotaResetsAt` |
+| `blocker.md` | 员工 | 阻塞说明；同上时机作为 `report_blocker`（固定 to=owner）提交，优先级高于 report.md。订阅额度/限流阻塞时**首行**写 `quotaResetsAt: <ISO 8601 带偏移>`，等价于 `report_blocker` 的 `quotaResetsAt` |
 
 调用路径：员工执行 `sck call <tool> '<json>'`（`bin/sck` → `src/mcp/client-cli.ts`）→ 存在 `SCK_COMM_DIR` 时进入 comm 模式：原子写 `req/<时间戳>-<随机>.json`（`writeFileAtomic`，先写 `.tmp-<pid>` 再 rename），然后每 200ms 轮询 `res/` 同名文件，读到即把 `data` 同步写完整个 stdout 再退出 0；`ok:false`（远端拒绝）与本地错误（参数非法、缺 `SCK_COMM_KEY`、comm 目录不可写、超时）都在 stdout 输出一行 JSON `{"ok":false,"code":…,"error":…,"retryable":…}`，原因写 stderr，退出 1；默认 120 秒无响应报 `comm_timeout`（媒体等长任务按工具放宽）。`sck list` 等价于 `call __list__`，返回基础工具加当前可用的 `ops_*` 清单。
 

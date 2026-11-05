@@ -41,61 +41,61 @@ const BASE_TOOLS = [
   "wait_task", "resolve_wait", "cancel_wait", "extend_wait", "list_task_waits", "wait_handoff_cards", "wait_migration_preview", "wait_migration_apply",
   "create_task", "create_goal", "triage_goal", "create_delivery", "goal_phase_split",
   "record_owner_decision", "set_direction", "resume_task", "defer_task_until", "retire_task",
-  // FV06 P1: gm-only read-only standby precheck (per-item {ok, code}); writes nothing, consumes no budget.
+  // FV06 P1: owner-only read-only standby precheck (per-item {ok, code}); writes nothing, consumes no budget.
   "verify_standby",
-  // FV06: gm-only append of real prerequisites to an existing dependency wait; sets manager continuation, never resumes.
+  // FV06: owner-only append of real prerequisites to an existing dependency wait; sets manager continuation, never resumes.
   "append_dependency_prerequisites",
   "record_score", "get_model_evidence", "get_task_cost", "heartbeat", "deliverable_publish",
-  // Manage capability (gm/product) only, enforced in core; writes land in audit.
+  // Manage capability (owner/product) only, enforced in core; writes land in audit.
   "def_list", "def_ensure", "project_disciplines_update",
-  // gm only in core (rebind a blocked task to a registered project; audited, version-guarded).
+  // owner only in core (rebind a blocked task to a registered project; audited, version-guarded).
   "task_project_update",
-  // gm only in core (bind a blocked execute-phase task's code repo; audited, version-guarded).
+  // owner only in core (bind a blocked execute-phase task's code repo; audited, version-guarded).
   "bind_task_code_repo",
-  // gm only in core (turn a blocked read-only engineering task into a code task in place; audited, version-guarded).
+  // owner only in core (turn a blocked read-only engineering task into a code task in place; audited, version-guarded).
   "task_intent_update",
-  // gm only in core (append the boss's acceptance-requirement amendment to an in-flight task; never touches its gates or lease).
+  // owner only in core (append the boss's acceptance-requirement amendment to an in-flight task; never touches its gates or lease).
   "task_acceptance_amend",
-  // gm only in core (read-only acceptance-reference preview; compare-and-set repair of a quick goal's voided gate).
+  // owner only in core (read-only acceptance-reference preview; compare-and-set repair of a quick goal's voided gate).
   "goal_acceptance_preview", "goal_acceptance_repair",
   // SYS07 goal governance: paged read-only console/scan/metrics, structured outcome and evidence, final-gate
-  // preview/repair and explicit re-evaluation. Core enforces gm+manage; console/scan/metrics never write.
+  // preview/repair and explicit re-evaluation. Core enforces owner+manage; console/scan/metrics never write.
   "goal_console", "goal_governance_scan", "goal_metrics", "goal_outcome_register", "goal_evidence_record",
   "goal_finalize", "goal_final_gate_preview", "goal_final_gate_repair",
-  // SYS01 bounded reads: gm-only company summary and byte-segment reads of long text (core enforces both).
+  // SYS01 bounded reads: owner-only company summary and byte-segment reads of long text (core enforces both).
   "get_admin_summary", "read_task_text", "read_worktree_refs", "record_acceptance_evidence", "acceptance_status", "acceptance_gate", "set_acceptance_gate",
-  // SYS-INT mapping preview (read-only) and gm-only authorized import; core enforces both.
+  // SYS-INT mapping preview (read-only) and owner-only authorized import; core enforces both.
   "acceptance_mapping_preview", "acceptance_mapping_import",
   // SYS-INT controlled non-production deploy drill: host-executed (the service child), never the sandbox.
   "deploy_drill_run", "deploy_drill_status",
-  // gm only in core (record a task's code implementer when the bound one cannot continue; compare-and-set, audited).
+  // owner only in core (record a task's code implementer when the bound one cannot continue; compare-and-set, audited).
   "implementer_takeover",
   "qa_observation_grant", "qa_observation_revoke", "qa_observation_status", "qa_observation_session",
   "qa_observation_read", "qa_observation_timeline", "qa_observation_text",
-  // SYS-INT 评审协同的持久事件唤醒：GM 订阅登记/关闭/只读，QA 结构化 scope 请求与撤销（core 判定角色、fence 与活租约）。
+  // SYS-INT 评审协同的持久事件唤醒：老板 订阅登记/关闭/只读，QA 结构化 scope 请求与撤销（core 判定角色、fence 与活租约）。
   "review_watch_register", "review_watch_close", "review_watch_status",
   "qa_review_scope_signal", "review_scope_signals",
-  // Manage capability (gm/product) only in core: writes a task's independence policy under a compare-and-set; audited.
+  // Manage capability (owner/product) only in core: writes a task's independence policy under a compare-and-set; audited.
   "independence_set",
   // Manage capability only in core: registers an identity principal (the only cross-employee identity link); audited.
   "identity_principal_set",
-  // gm only in core (read-only dry-run of who authored and reviewed each engineering task).
+  // owner only in core (read-only dry-run of who authored and reviewed each engineering task).
   "contributor_dryrun",
-  // gm or qa in core (read-only preflight of one candidate against a task's independence policy; writes nothing).
+  // owner or qa in core (read-only preflight of one candidate against a task's independence policy; writes nothing).
   "independence_check",
-  // SYS06 effective policy layer: gm/product only in core. Set/revoke one version of a typed machine policy, read the
+  // SYS06 effective policy layer: owner/product only in core. Set/revoke one version of a typed machine policy, read the
   // current effective contract, dry-run a change, or isolate the in-flight tasks that lost authorization.
   "policy_set", "policy_revoke", "policy_list", "policy_effective", "policy_plan", "policy_enforce",
-  // SYS03 经理处置账本：episode 认领/决定/释放、只读状态、持有人通知（core 判定角色与能力；产物落审计与通知 outbox）。
+  // SYS03 老板处置账本：episode 认领/决定/释放、只读状态、持有人通知（core 判定角色与能力；产物落审计与通知 outbox）。
   "claim_disposition", "release_disposition", "disposition_status", "decide_disposition", "holder_notices",
-  // SYS03 受控外部动作：取消 CI 运行走这个入口（core 判定经理/任务当事人），只读对账标 unknown_actor，归因只由 gm 带证据做。
+  // SYS03 受控外部动作：取消 CI 运行走这个入口（core 判定老板/任务当事人），只读对账标 unknown_actor，归因只由 owner 带证据做。
   "cancel_ci_run", "reconcile_ci_runs", "attribute_ci_run", "list_external_actions",
   // SYS04: what the plugin process is actually running. Answered in the plugin host's own context, never from
   // the MCP face's tree or the `active` symlink, so it can serve as evidence of the loaded version.
   "plugin_runtime_diagnostics",
-  // SYS04 故障诊断：任务持有人 / 验收人 / gm 只读预算状态；gm 解封已耗尽的恢复预算（core 判定）。
+  // SYS04 故障诊断：任务持有人 / 验收人 / owner 只读预算状态；owner 解封已耗尽的恢复预算（core 判定）。
   "fault_status", "fault_lift",
-  // FV06 终态任务恢复取证：gm+manage 签发/撤销，gm/被授权员工/源任务 reviewer 只读链与调用审计（core 判定）。
+  // FV06 终态任务恢复取证：owner+manage 签发/撤销，owner/被授权员工/源任务 reviewer 只读链与调用审计（core 判定）。
   "recovery_read_grant", "recovery_read_grant_revoke", "recovery_read_status",
 ];
 
@@ -287,7 +287,7 @@ export class SidecarPool {
     // A task lease authorizes task writes, not the employee's ability to speak.
     // submit/review consumes the lease before Claude's next call handles the tool result.
     // Keep authenticated sessions routable without attributing closeout/chat to the finished task.
-    if(role)return {employee:inst,agent,task:'',fence:0,role,tier:taskTier({executor_role:role}),phase:role==='gm'||role==='eval'?'planning':'idle'};
+    if(role)return {employee:inst,agent,task:'',fence:0,role,tier:taskTier({executor_role:role}),phase:role==='eval'?'planning':'idle'};
   }
 
   /** Spawn env for a fresh instance: comm channel only. Minted credential stays in memory. */
@@ -597,7 +597,7 @@ export class SidecarPool {
       this.archive(reportPath(dir), "stale");
     }
     if (blocker !== undefined && hash(blocker) !== live.blockerHash) {
-      await this.finish(instId, live, "gm", blocker, blockerPath(dir));
+      await this.finish(instId, live, "owner", blocker, blockerPath(dir));
       return { status: "ingested" };
     }
     if (live.phase !== "review" && report !== undefined && hash(report) !== live.reportHash) {
@@ -612,7 +612,7 @@ export class SidecarPool {
   }
 
   private async finish(
-    instId: string, live: LiveClaim, to: "gm" | undefined,
+    instId: string, live: LiveClaim, to: "owner" | undefined,
     text: string, path: string,
   ): Promise<void> {
     const upgradeSha = /^\s*companyUpgradeSha:\s*(\S+)\s*$/m.exec(text)?.[1];
@@ -977,12 +977,12 @@ export class SidecarPool {
         this.archive(reportPath(dir), "stale");
       }
       const claim = this.claims.get(inst.id);
-      if (blocker !== undefined && claim) await this.finish(inst.id, claim, "gm", blocker, blockerPath(dir));
+      if (blocker !== undefined && claim) await this.finish(inst.id, claim, "owner", blocker, blockerPath(dir));
       return;
     }
     const claim = this.claims.get(inst.id);
     if (!claim) return;
-    if (blocker !== undefined) await this.finish(inst.id, claim, "gm", blocker, blockerPath(dir));
+    if (blocker !== undefined) await this.finish(inst.id, claim, "owner", blocker, blockerPath(dir));
     else if (report !== undefined) await this.finish(inst.id, claim, undefined, report, reportPath(dir));
   }
 
@@ -1146,14 +1146,14 @@ export class SidecarPool {
       if (gateway !== ops) return gateway.call(cred, claim.taskId, tool, rest);
       return this.opsCircuit.run({ employee: instId, task: claim.taskId, delivery: claim.proof.deliveryId, tool,
         check: () => { live(); }, invoke: () => gateway.call(cred, claim.taskId, tool, rest),
-        block: text => writeOp(proof => core.block(cred, proof, "gm", {
+        block: text => writeOp(proof => core.block(cred, proof, "owner", {
           text, idempotencyKey: `ops-circuit:${claim.proof.deliveryId}:${tool}`,
         }), true),
       });
     }
     switch (tool) {
       case "list_worktrees": return withinReplyCeiling(async () => {
-        // R8：不带 taskId 即全局库存，只有 gm 可读，由 core 判定并拒绝员工；租约任务不再作为回退范围。
+        // R8：不带 taskId 即全局库存，只有 owner 可读，由 core 判定并拒绝员工；租约任务不再作为回退范围。
         // 显式 taskId 走 core 的 getTask 授权。null 与缺省相同（与 MCP、core 同源）：parseWorktreeInput 只接受字符串 taskId。
         const scope = parseWorktreeInput(args).taskId;
         // C1 default: a call that names neither pageSize nor cursor keeps the pre-SYS01 array; a paged call returns { worktrees, page }.
@@ -1231,7 +1231,7 @@ export class SidecarPool {
         }
         return writeOp(p => (args.decision === "accept" ? core.accept(cred, p, evidence()) : core.returnTask(cred, p, evidence())), true);
       }
-      case "report_blocker": return writeOp(p => core.block(cred, p, args.to === "owner" ? "owner" : "gm", evidence(), quotaReset()), true);
+      case "report_blocker": return writeOp(p => core.block(cred, p, args.to === "owner" ? "owner" : "owner", evidence(), quotaReset()), true);
       // SYS05: entering a wait consumes the lease in the same turn — the task takes no employee or provider seat
       // while it waits. The ops sessions and browser spaces opened under this lease are dropped by endLease below.
       case "wait_task": {
@@ -1282,7 +1282,7 @@ export class SidecarPool {
         ? core.appendDependencyPrerequisites(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose append_dependency_prerequisites"), { code: "temporarily_unavailable" }));
       case "retire_task": return core.retireTask(cred, args as never);
-      // SYS03 经理处置账本：授权与全部写入都在 core；这里只是同一通道上的入口（sck 与 MCP 同源判定）。
+      // SYS03 老板处置账本：授权与全部写入都在 core；这里只是同一通道上的入口（sck 与 MCP 同源判定）。
       case "claim_disposition": return core.claimDisposition
         ? core.claimDisposition(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose claim_disposition"), { code: "temporarily_unavailable" }));
@@ -1308,7 +1308,7 @@ export class SidecarPool {
           return { notices, receipt };
         });
       }
-      // SYS03 受控外部动作：core 判定谁可以发起（经理，或该 run 所属任务的当事人），并记录真实内部员工 ID。
+      // SYS03 受控外部动作：core 判定谁可以发起（老板，或该 run 所属任务的当事人），并记录真实内部员工 ID。
       case "cancel_ci_run": return core.cancelCiRun
         ? core.cancelCiRun(cred, { ...(args as Record<string, unknown>), kind: "ci-run-cancel" } as never)
         : Promise.reject(Object.assign(new Error("core does not expose cancel_ci_run"), { code: "temporarily_unavailable" }));
@@ -1447,7 +1447,7 @@ export class SidecarPool {
       case "def_ensure": return core.ensureDef(cred, args as never);
       case "project_disciplines_update": return core.updateProjectDisciplines(cred, args as never);
       case "deliverable_publish": {
-        // 显式 taskId 供经理代发/补发（免租约）；缺省才取当前租约任务。
+        // 显式 taskId 供老板代发/补发（免租约）；缺省才取当前租约任务。
         const taskId = args.taskId !== undefined && args.taskId !== null ? String(args.taskId) : live().taskId;
         const { publishDeliverables } = await import("./vendor/src/deliverables.ts");
         return publishDeliverables({
@@ -1461,7 +1461,7 @@ export class SidecarPool {
       // there would describe a different execution context than the one the employee's `sck call` reaches. The
       // authorization is core's: it decides whether this caller may read the diagnostics at all, and it does so
       // BEFORE the sample is taken, so an unauthorized read produces no diagnostic at all rather than a refused
-      // one that still touched the filesystem. The role set is gm/product/qa — the operators who act on a
+      // one that still touched the filesystem. The role set is owner/product/qa — the operators who act on a
       // deployment; a general employee has no business collecting the service's runtime fingerprint.
       case "plugin_runtime_diagnostics": return withinReplyCeiling(async () => {
         if (!core.pluginRuntimeDiagnostics) {
@@ -1495,7 +1495,7 @@ export class SidecarPool {
             idempotencyKey: String(args.idempotencyKey ?? ""),
           })
         : Promise.reject(Object.assign(new Error("core does not expose fault_lift"), { code: "temporarily_unavailable" }));
-      // FV06：恢复取证授权不走执行租约——gm 签发/撤销与只读状态都由 core 按凭证判定，参数原样转交。
+      // FV06：恢复取证授权不走执行租约——owner 签发/撤销与只读状态都由 core 按凭证判定，参数原样转交。
       case "recovery_read_grant": return core.recoveryReadGrant
         ? core.recoveryReadGrant(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose recovery_read_grant"), { code: "temporarily_unavailable" }));

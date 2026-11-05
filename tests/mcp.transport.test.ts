@@ -108,7 +108,7 @@ test('real SDK initialize/list/call and authenticated core identity', async () =
     expect(tools).toContain('defer_task_until');
     expect(tools).toContain('bind_task_code_repo');
     expect(tools).toContain('task_intent_update');
-    // 经理在途任务验收要求追加：与其它 gm 工具同一条 MCP 表面（角色与能力在 core 判定）。
+    // 老板在途任务验收要求追加：与其它 gm 工具同一条 MCP 表面（角色与能力在 core 判定）。
     expect(tools).toContain('task_acceptance_amend');
     expect(tools).toContain('goal_acceptance_preview');
     expect(tools).toContain('goal_acceptance_repair');
@@ -119,12 +119,12 @@ test('real SDK initialize/list/call and authenticated core identity', async () =
     expect(tools).toContain('independence_set');
     expect(tools).toContain('identity_principal_set');
     expect(tools).toContain('independence_check');
-    const result = await connection.client.callTool({ name: 'get_context', arguments: { employeeId: 'gm-01', role: 'gm' } });
+    const result = await connection.client.callTool({ name: 'get_context', arguments: { role: 'product' } });
     expect(result.structuredContent).toMatchObject({ ok: true, data: { principal: { employeeId: 'ai-01' } } });
     const claim = await connection.client.callTool({ name: 'claim_next', arguments: {} });
     expect(claim.structuredContent).toMatchObject({ ok: true, data: { deliveryId: 'delivery-1', fence: 1 } });
     const denied = await connection.client.callTool({ name: 'create_task', arguments: {
-      title: 'denied', context: 'synthetic', executorRole: 'qa', reviewerRole: 'gm', idempotencyKey: 'one',
+      title: 'denied', context: 'synthetic', executorRole: 'qa', reviewerRole: 'owner', idempotencyKey: 'one',
     } });
     expect(denied.structuredContent).toMatchObject({ ok: false, code: 'forbidden' });
     active = false;
@@ -344,7 +344,7 @@ test('the text copy of every result is the JSON of its data, and a refusal is JS
     const claim = await connection.client.callTool({ name: 'claim_next', arguments: { taskId: task.id } });
     expect(textOf(claim)).toBe(JSON.stringify((claim.structuredContent as { data: unknown }).data));
     const refused = await connection.client.callTool({ name: 'create_task', arguments: {
-      title: 'denied', context: 'synthetic', executorRole: 'qa', reviewerRole: 'gm', idempotencyKey: 'text-copy',
+      title: 'denied', context: 'synthetic', executorRole: 'qa', reviewerRole: 'owner', idempotencyKey: 'text-copy',
     } });
     expect(refused.structuredContent).toMatchObject({ ok: false, code: 'forbidden' });
     expect(JSON.parse(textOf(refused))).toEqual(refused.structuredContent);
@@ -420,7 +420,7 @@ test('reclaim_worktrees over MCP refuses null, every non-boolean dryRun and a ba
   const gm = createMcpHttpService({
     core: {
       ...core,
-      authenticate: async () => ({ ...principal, role: 'gm' as const }),
+      authenticate: async () => ({ ...principal, role: 'owner' as const }),
       reclaimWorktrees: async (_credential: string, input: unknown) => {
         reclaims.push(input);
         return { scanId: 's', removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 };

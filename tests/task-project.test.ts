@@ -49,7 +49,7 @@ beforeAll(async () => {
   repoAnime = repo('anime-repo');
 
   const enrollment = new LocalEnrollmentAdmin(db);
-  gm = await enrollment.enroll('tp-gm', 'gm', ['execute', 'review', 'manage']);
+  gm = await enrollment.enroll('tp-gm', 'owner', ['execute', 'review', 'manage']);
   eng = await enrollment.enroll('tp-eng', 'engineering', ['execute', 'review']);
   eng2 = await enrollment.enroll('tp-eng2', 'engineering', ['execute', 'review']);
   eng3 = await enrollment.enroll('tp-eng3', 'engineering', ['execute', 'review']);
@@ -96,7 +96,7 @@ const blockByGm = async (core: SurrealCompanyCore, taskId: string, worker = eng)
   const claim = await core.claim(worker, taskId);
   const checkpointed = await core.checkpoint(worker, proof(claim), { text: 'fixture progress before blocking for rebind', idempotencyKey: key() });
   const current = { taskId, deliveryId: claim.deliveryId, fence: claim.fence, expectedVersion: checkpointed.version };
-  return core.block(worker, current, 'gm', { text: 'fixture: 工作区错配阻塞，等待经理改绑', idempotencyKey: key() });
+  return core.block(worker, current, 'owner', { text: 'fixture: 工作区错配阻塞，等待经理改绑', idempotencyKey: key() });
 };
 /** 当前任务版本：负例断言 forbidden 的前提是先过版本门禁。 */
 const versionOf = async (core: SurrealCompanyCore, taskId: string) => (await core.getTask(gm, taskId)).version;
@@ -246,7 +246,7 @@ run('permission, state, lease, version-race, unknown-project and idempotency neg
   const sc = await C.claim(eng2, submitted.id);
   await C.submit(eng2, proof(sc), { text: 'fixture submission before reviewer block', idempotencyKey: key() });
   const rv = await C.claim(eng, submitted.id);
-  await C.block(eng, proof(rv), 'gm', { text: 'fixture reviewer block keeps submitted results', idempotencyKey: key() });
+  await C.block(eng, proof(rv), 'owner', { text: 'fixture reviewer block keeps submitted results', idempotencyKey: key() });
   await expect(C.taskProjectUpdate(gm, { taskId: submitted.id, project: 'maplayer-content', expectedVersion: await versionOf(C, submitted.id), text: '已有提交成果的任务必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
 });
 
@@ -257,7 +257,7 @@ run('rebind releases the stale registered reference but never deletes the physic
   const treePath = claim.worktree!.worktreePath;
   const before = await C.listWorktrees(gm);
   expect(before.find(w => w.worktreePath === treePath)!.references.some(r => r.taskId === t.id && r.state === 'active')).toBe(true);
-  await C.block(eng, proof(claim), 'gm', { text: 'fixture: 错配仓库阻塞，等待改绑', idempotencyKey: key() });
+  await C.block(eng, proof(claim), 'owner', { text: 'fixture: 错配仓库阻塞，等待改绑', idempotencyKey: key() });
 
   await C.taskProjectUpdate(gm, { taskId: t.id, project: 'maplayer-content', expectedVersion: await versionOf(C, t.id), text: '改绑后旧登记引用按生命周期释放', idempotencyKey: key() });
   const after = await C.listWorktrees(gm); // 全局清单：旧树挂在旧仓，任务级清单已按新项目解析
@@ -301,7 +301,7 @@ run('bind routes the workspace to the ops repo while the business project stays 
   const claim = await C.claim(eng4, t.id);
   const treePath = claim.worktree!.worktreePath;
   expect(claim.worktree!.repo).toBe(repoMlc); // 绑定前走业务项目仓
-  await C.block(eng4, proof(claim), 'gm', { text: 'fixture: 代码仓错配阻塞，等待经理绑定', idempotencyKey: key() });
+  await C.block(eng4, proof(claim), 'owner', { text: 'fixture: 代码仓错配阻塞，等待经理绑定', idempotencyKey: key() });
 
   const version = await versionOf(C, t.id);
   const bound = await C.bindTaskCodeRepo(gm, { taskId: t.id, codeRepoPath: repoOps, expectedVersion: version, text: '经理裁定：代码在公司运营仓，业务项目保持 maplayer-content', idempotencyKey: key() });
@@ -370,7 +370,7 @@ run('dependency waits and defer_task_until waits stay bindable, then claim in th
   const gate2 = await C.createTask(gm, { title: `推迟门槛 ${++count}`, context: 'gate for defer-wait bind fixture', executorRole: 'engineering', reviewerRole: 'engineering', goalId, idempotencyKey: key() });
   const held = await C.createTask(gm, { title: `推迟等待任务 ${++count}`, context: 'gm-blocked then deferred fixture', executorRole: 'engineering', reviewerRole: 'engineering', goalId, idempotencyKey: key() });
   const hc = await C.claim(eng4, held.id);
-  await C.block(eng4, proof(hc), 'gm', { text: 'fixture gm block before defer', idempotencyKey: key() });
+  await C.block(eng4, proof(hc), 'owner', { text: 'fixture gm block before defer', idempotencyKey: key() });
   const deferred = await C.deferTaskUntil(gm, { taskId: held.id, dependencies: [gate2.id], text: '转为依赖等待：blocked_to 清空', idempotencyKey: key() });
   expect(deferred.state).toBe('blocked');
   expect(deferred.blockedTo).toBeUndefined();
@@ -409,7 +409,7 @@ run('bind rejects non-gm, unregistered and escaped paths, owner/review blocks, l
   const rc = await C.claim(eng2, rev.id);
   await C.submit(eng2, proof(rc), { text: 'fixture submission to reach review', idempotencyKey: key() });
   const rv = await C.claim(eng4, rev.id);
-  await C.block(eng4, proof(rv), 'gm', { text: 'fixture reviewer block keeps submitted results', idempotencyKey: key() });
+  await C.block(eng4, proof(rv), 'owner', { text: 'fixture reviewer block keeps submitted results', idempotencyKey: key() });
   await expect(C.bindTaskCodeRepo(gm, { taskId: rev.id, codeRepoPath: repoOps, expectedVersion: await versionOf(C, rev.id), text: 'review 阶段块必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
 
   // 活租约与可执行态：blocked+活租约、ready、doing 都拒绝。
@@ -514,7 +514,7 @@ run('a blocked read-only engineering task becomes a code task in place', async (
   // Only a blocked task changes intent; ready/doing refuse before any write.
   await expect(C.taskIntentUpdate(gm, { taskId: t.id, expectedVersion: v0, text: '未阻塞必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
   const claim = await C.claim(eng7, t.id);
-  await C.block(eng7, proof(claim), 'gm', { text: 'fixture: 只读任务查明需要改代码，请经理改为 code 写权', idempotencyKey: key() });
+  await C.block(eng7, proof(claim), 'owner', { text: 'fixture: 只读任务查明需要改代码，请经理改为 code 写权', idempotencyKey: key() });
   const v = await versionOf(C, t.id);
   await expect(C.taskIntentUpdate(eng7, { taskId: t.id, expectedVersion: v, text: '工程师不能改写权', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
   const idem = key();

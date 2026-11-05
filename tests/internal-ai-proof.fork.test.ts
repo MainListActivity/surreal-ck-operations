@@ -121,7 +121,7 @@ beforeAll(async () => {
   const port=await new Promise<number>(resolve => {const s=createServer();s.listen(0,'127.0.0.1',()=>{const a=s.address() as {port:number};s.close(()=>resolve(a.port));});});
   url='ws://127.0.0.1:'+port; await start(); await connect();
   const enroll=new LocalEnrollmentAdmin(database);
-  gm=await enroll.enroll('test-gm','gm',['execute','review','manage']);
+  gm=await enroll.enroll('test-gm','owner',['execute','review','manage']);
   author=await enroll.enroll('test-author','engineering',['execute','review']);
   reviewer=await enroll.enroll('test-reviewer','qa',['execute','review']);
   consumer=await enroll.enroll('test-consumer','engineering',['execute','review']);

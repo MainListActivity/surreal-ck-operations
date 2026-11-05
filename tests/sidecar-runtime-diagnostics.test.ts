@@ -24,7 +24,7 @@ const claimResult = (taskId: string): ClaimResult => ({
  * diagnostics) and — the part this file is about — it refuses BEFORE calling the sampler, exactly as the real
  * core does, so an unauthorized read produces no diagnostic at all.
  */
-let actorRole = 'gm';
+let actorRole = 'owner';
 let samplerCalls = 0;
 /**
  * The plugin host's real collector, replaced by a counting stand-in.
@@ -65,7 +65,7 @@ const core = {
   worktreeList: async () => [], worktreePage: async () => ({ worktrees: [], page: {} }),
   contextView: async () => ({ principal: { employeeId: 'eng-x' }, tasks: [] }),
   pluginRuntimeDiagnostics: async (_credential: string, sample: () => unknown) => {
-    if (!['gm', 'product', 'qa'].includes(actorRole)) {
+    if (!['owner', 'product', 'qa'].includes(actorRole)) {
       // Shaped like the real CompanyError: the code is separate from the message, and the relay prefixes it.
       throw Object.assign(new Error('Only gm, product or qa may read the plugin runtime diagnostics'), { code: 'forbidden' });
     }
@@ -96,7 +96,7 @@ let pluginSourceDir: string | null;
 let pluginSourceCalls = 0;
 let pluginSourceThrows = false;
 beforeEach(() => {
-  actorRole = 'gm';
+  actorRole = 'owner';
   samplerCalls = 0;
   collectorCalls = 0;
   pluginSourceDir = '/test/registered/plugin';
@@ -237,7 +237,7 @@ describe('plugin_runtime_diagnostics through the employee channel', () => {
   });
 
   test('gm, product and qa are answered with the plugin execution context', async () => {
-    for (const role of ['gm', 'product', 'qa']) {
+    for (const role of ['owner', 'product', 'qa']) {
       actorRole = role;
       const before = samplerCalls;
       const beforeCollector = collectorCalls;

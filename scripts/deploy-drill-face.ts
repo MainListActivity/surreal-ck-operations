@@ -25,7 +25,7 @@ await db.connect();
 await db.bootstrap();
 const core = new SurrealCompanyCore(db);
 const enrollment = new LocalEnrollmentAdmin(db);
-await enrollment.enroll('drill-fixture-manager', 'gm', ['execute', 'review', 'manage']);
+await enrollment.enroll('drill-fixture-manager', 'owner', ['execute', 'review', 'manage']);
 const wf = new Workforce(db, join(root, 'credentials'));
 const def = { id: 'drill-fixture-eng', role: 'engineering' as const, provider: 'codex', model: 'drill-fixture', enabled: true };
 await wf.upsertDef(def.id, def);

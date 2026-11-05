@@ -32,7 +32,7 @@ beforeAll(async () => {
   await database.db.query('REMOVE DATABASE IF EXISTS control_plane;');
   await database.bootstrap();
   for (const [name, role, caps] of [
-    ['gm', 'gm', ['execute', 'review', 'manage']],
+    ['owner', 'owner', ['execute', 'review', 'manage']],
     ['product', 'product', ['execute', 'review', 'manage']],
     ['eng', 'engineering', ['execute', 'review']],
     ['qa', 'qa', ['execute', 'review']],
@@ -74,7 +74,7 @@ const revise = (token: string, input: Partial<CreateTask> & { revises: string; t
   });
 const mass = (deps: string[], goalId?: string) => core.createTask(tokens.gm, {
   title: '量产分镜', context: '依赖剧本稿的铺量产出任务。', executorRole: 'asset-production',
-  reviewerRole: 'gm', dependencies: deps, goalId, idempotencyKey: key(),
+  reviewerRole: 'owner', dependencies: deps, goalId, idempotencyKey: key(),
 });
 const submitDraft = async (taskId: string, token = swToken) => {
   const claim = await core.claim(token, taskId);
@@ -122,7 +122,7 @@ test('a+b: real owner rejection opens the controlled revision edge; dependents o
   expect(resumed.state).toBe('blocked');
 
   // A revision carrying its own unfinished dependency starts blocked and unlocks through it.
-  const gate = await core.createTask(tokens.gm, { title: '分镜风格确认', context: '工程小任务：确认分镜风格基线后再放行。', executorRole: 'engineering', reviewerRole: 'gm', idempotencyKey: key() });
+  const gate = await core.createTask(tokens.gm, { title: '分镜风格确认', context: '工程小任务：确认分镜风格基线后再放行。', executorRole: 'engineering', reviewerRole: 'owner', idempotencyKey: key() });
   const w1 = await draft('短片剧本 v1');
   await submitDraft(w1.id);
   await reject(w1.id);
@@ -174,11 +174,11 @@ test('d: every illegal revision shape is refused; owner void without a pointer n
   await expect(revise(tokens.eng, { revises: v1.id, title: '正剧剧本 v2' })).rejects.toThrow();
   // input shape: wrong executor / reviewer / track / kind.
   await expect(revise(tokens.gm, { revises: v1.id, title: '正剧剧本 v2', executorRole: 'engineering' as never })).rejects.toThrow();
-  await expect(revise(tokens.gm, { revises: v1.id, title: '正剧剧本 v2', reviewerRole: 'gm' as never })).rejects.toThrow();
+  await expect(revise(tokens.gm, { revises: v1.id, title: '正剧剧本 v2', reviewerRole: 'owner' as never })).rejects.toThrow();
   await expect(revise(tokens.gm, { revises: v1.id, title: '正剧剧本 v2', discipline: '美术' })).rejects.toThrow();
   await expect(revise(tokens.gm, { revises: v1.id, title: '正剧剧本 v2', kind: 'gate' })).rejects.toThrow();
   // target shape: an M-section (gm-reviewed) screenplay draft is not an owner draft.
-  const mDraft = await core.createTask(tokens.gm, { title: '量产剧本 v1', context: '量产剧本文稿：M 段走 GM 验收的铺量剧本。', executorRole: 'screenwriter', reviewerRole: 'gm', discipline: '编剧', idempotencyKey: key() });
+  const mDraft = await core.createTask(tokens.gm, { title: '量产剧本 v1', context: '量产剧本文稿：M 段走 GM 验收的铺量剧本。', executorRole: 'screenwriter', reviewerRole: 'owner', discipline: '编剧', idempotencyKey: key() });
   await expect(revise(tokens.gm, { revises: mDraft.id, title: '量产剧本 v2' })).rejects.toThrow();
   // goal boundary: a revision must stay in the same goal.
   const goal = await owner.createGoal({ text: '独立剧本目标', source: 'owner:test', key: key(), tier: 'quick' });
@@ -302,7 +302,7 @@ test('e: idempotency, concurrency, fences, corrupt chains, anchor rollup and ord
   expect(noLineageDep.state).toBe('blocked');
   // A fresh core on the same DB resolves identically (restart/replay consistency).
   const core2 = new SurrealCompanyCore(database, { workforce });
-  const reDep = await core2.createTask(tokens.gm, { title: '重启视角量产', context: '依赖环上旧稿的量产任务应保持保守阻塞。', executorRole: 'asset-production', reviewerRole: 'gm', dependencies: [cycleA], idempotencyKey: key() });
+  const reDep = await core2.createTask(tokens.gm, { title: '重启视角量产', context: '依赖环上旧稿的量产任务应保持保守阻塞。', executorRole: 'asset-production', reviewerRole: 'owner', dependencies: [cycleA], idempotencyKey: key() });
   expect(reDep.state).toBe('blocked');
   const resumedCyc = await core2.resume(tokens.gm, cycDep.id, { text: '重评环上依赖：损坏谱系按保守规则仍应保持阻塞。', idempotencyKey: key() });
   expect(resumedCyc.state).toBe('blocked');
@@ -311,9 +311,9 @@ test('e: idempotency, concurrency, fences, corrupt chains, anchor rollup and ord
   // while a live non-anchor dependent still blocks retiring the owner gate and its tip.
   const goal = await owner.createGoal({ text: '带锚点目标', source: 'owner:test', key: key(), tier: 'quick' });
   const gate = await core.createTask(tokens.gm, { title: '目标内原型', context: '概念原型：P 段老板 demo 验收素材稿。', executorRole: 'concept-design', reviewerRole: 'owner', goalId: goal.id, idempotencyKey: key() });
-  const live = await core.createTask(tokens.gm, { title: '目标内量产', context: '依赖原型任务，老板批准前不得开工。', executorRole: 'asset-production', reviewerRole: 'gm', goalId: goal.id, dependencies: [gate.id], idempotencyKey: key() });
+  const live = await core.createTask(tokens.gm, { title: '目标内量产', context: '依赖原型任务，老板批准前不得开工。', executorRole: 'asset-production', reviewerRole: 'owner', goalId: goal.id, dependencies: [gate.id], idempotencyKey: key() });
   await expect(core.retireTask(tokens.gm, { taskId: gate.id, text: '尝试作废仍有存活下游的老板关口任务，应被拒绝。', idempotencyKey: key() })).rejects.toThrow();
-  const anchorDep = await core.createTask(tokens.gm, { title: '目标锚点汇总', context: '目标锚点汇总：rollup 簿记任务。', executorRole: 'product', reviewerRole: 'gm', goalId: goal.id, dependencies: [gate.id], idempotencyKey: key() });
+  const anchorDep = await core.createTask(tokens.gm, { title: '目标锚点汇总', context: '目标锚点汇总：rollup 簿记任务。', executorRole: 'product', reviewerRole: 'owner', goalId: goal.id, dependencies: [gate.id], idempotencyKey: key() });
   await database.db.query('UPDATE $g SET anchors = array::union(anchors ?? [], [$t]);', { g: new RecordId('goal', goal.id), t: new RecordId('task', anchorDep.id) });
   await core.retireTask(tokens.gm, { taskId: live.id, text: '先作废存活的下游任务，再放行关口任务作废。', idempotencyKey: key() });
   await core.retireTask(tokens.gm, { taskId: gate.id, text: '作废老板关口：锚点汇总任务按 rollup 规则应放行解锁。', idempotencyKey: key() });
@@ -321,7 +321,7 @@ test('e: idempotency, concurrency, fences, corrupt chains, anchor rollup and ord
   expect((await task(anchorDep.id)).state).toBe('ready');
 
   // Ordinary non-owner void still satisfies dependents (unchanged baseline semantics).
-  const ordinary = await core.createTask(tokens.gm, { title: '普通前置', context: '普通前置任务：非老板验收的依赖前置。', executorRole: 'engineering', reviewerRole: 'gm', idempotencyKey: key() });
+  const ordinary = await core.createTask(tokens.gm, { title: '普通前置', context: '普通前置任务：非老板验收的依赖前置。', executorRole: 'engineering', reviewerRole: 'owner', idempotencyKey: key() });
   const follower = await mass([ordinary.id]);
   expect(follower.state).toBe('blocked');
   await core.retireTask(tokens.gm, { taskId: ordinary.id, text: '作废普通前置任务：下游应按普通 void 规则解锁。', idempotencyKey: key() });

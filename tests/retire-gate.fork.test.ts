@@ -35,7 +35,7 @@ beforeAll(async () => {
   await database.db.use({ namespace: NS });
   await database.db.query('REMOVE DATABASE IF EXISTS control_plane;');
   await database.bootstrap();
-  gmToken = await enrollment.enroll(gm, 'gm', ['execute', 'review', 'manage']);
+  gmToken = await enrollment.enroll(gm, 'owner', ['execute', 'review', 'manage']);
 });
 
 afterAll(async () => {
@@ -135,7 +135,7 @@ test('(d) a blocked task bound to its author refuses retirement', async () => {
   const author = await engineer('blocked-author');
   const t = await newTask('R1 d blocked');
   const claim = await core.claim(tokenOf(author), t.id);
-  await core.block(tokenOf(author), proofOf(claim), 'gm', { text: BLOCK, idempotencyKey: key() });
+  await core.block(tokenOf(author), proofOf(claim), 'owner', { text: BLOCK, idempotencyKey: key() });
   expect(await task(t.id)).toMatchObject({ state: 'blocked', implementer: author });
   const error = await refusal(workforce.retire(author, WHY, 'manual'));
   expect(error.details?.reasons).toEqual([expect.objectContaining({ taskId: t.id, state: 'blocked', phase: 'execute', reason: 'bound_implementer' })]);

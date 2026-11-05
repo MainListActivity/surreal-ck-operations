@@ -430,7 +430,7 @@ export function databaseGateway(db: Surreal): GatewayDeps {
           fence: 0,
           role: e.role,
           tier: taskTier({executor_role:e.role}),
-          phase: e.role==='gm'||e.role==='eval'?"planning":"idle",
+          phase: e.role==='eval'?"planning":"idle",
         };
       const [task] = await db.query<[any]>(
         "SELECT id,state,kind,title,executor_role,reviewer_role,model_tier,current_employee,fence,lease_expires_at FROM ONLY $task;",

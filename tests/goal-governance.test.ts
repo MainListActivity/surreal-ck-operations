@@ -19,11 +19,11 @@ const task = (id: string, over: Partial<GoalTaskFact> = {}): GoalTaskFact => ({
 });
 
 const outcome = (required: Array<'implementation' | 'customer_activation' | 'customer_adoption' | 'owner_final'> = ['implementation']) => ({
-  expected: '交付可用的结果', requiredEvidence: required, responsibleRole: 'gm', version: 1, source: 'test',
+  expected: '交付可用的结果', requiredEvidence: required, responsibleRole: 'owner', version: 1, source: 'test',
 });
 
 const ownerGate = (over: Partial<GoalTaskFact> = {}) =>
-  task('gate', { title: 'G3 终验', kind: 'gate', executorRole: 'gm', reviewerRole: 'owner', acceptedBy: 'owner', ...over });
+  task('gate', { title: 'G3 终验', kind: 'gate', executorRole: 'owner', reviewerRole: 'owner', acceptedBy: 'owner', ...over });
 
 describe('goal final-gate invariants (AC01)', () => {
   test('a void final gate is a needs_repair gap and never a completion', () => {
@@ -52,8 +52,8 @@ describe('goal final-gate invariants (AC01)', () => {
     expect(result.goalComplete).toBe(false);
   });
 
-  test('required owner_final cannot be satisfied by a manager final gate', () => {
-    const gmGate = task('gate', { kind: 'gate', executorRole: 'gm', reviewerRole: 'gm', acceptedBy: 'gm' });
+  test('required owner_final cannot be satisfied by a qa final gate', () => {
+    const gmGate = task('gate', { kind: 'gate', executorRole: 'engineering', reviewerRole: 'qa', acceptedBy: 'qa' });
     const result = assessGoal({ goal: goal(), tasks: [task('manual'), gmGate],
       outcome: outcome(['implementation', 'owner_final']), now: NOW });
     expect(result.outcome.missing).toContain('owner_final');
@@ -95,7 +95,7 @@ describe('goal final-gate invariants (AC01)', () => {
 
   test('a dependency cycle or a dangling edge is reported, not hidden', () => {
     const a = task('manual', { state: 'blocked', dependencies: ['gate'] });
-    const b = task('gate', { state: 'blocked', dependencies: ['manual', 'missing'], reviewerRole: 'gm' });
+    const b = task('gate', { state: 'blocked', dependencies: ['manual', 'missing'], reviewerRole: 'owner' });
     const result = assessGoal({ goal: goal(), tasks: [a, b], outcome: outcome(), now: NOW });
     expect(result.graph.cycle).toBe(true);
     expect(result.graph.dangling).toEqual([{ taskId: 'gate', dependency: 'missing' }]);
@@ -233,7 +233,7 @@ describe('expired waits and cross-window evidence (AC03/AC04)', () => {
 
 describe('outcome validation (AC02)', () => {
   test('absolute times and IANA zones are required; unknown values are never fabricated', () => {
-    const base = { expected: '客户采纳交付', requiredEvidence: ['customer_adoption'] as Array<'customer_adoption'>, responsibleRole: 'gm', reason: '登记目标成果与证据要求' };
+    const base = { expected: '客户采纳交付', requiredEvidence: ['customer_adoption'] as Array<'customer_adoption'>, responsibleRole: 'owner', reason: '登记目标成果与证据要求' };
     expect(() => normalizeOutcome({ ...base, deadline: '2026-10-30T18:00:00', timezone: 'Asia/Shanghai' })).toThrow(/时区偏移/);
     expect(() => normalizeOutcome({ ...base, timezone: 'Mars/Base' })).toThrow(/IANA/);
     expect(normalizeOutcome({ ...base, deadline: '2026-10-30T18:00:00+08:00', timezone: 'Asia/Shanghai' }).deadline)
@@ -462,7 +462,7 @@ describe('recursive story final gate lifecycle', () => {
   });
 
   test('an explicitly bound story gate still needs real owner approval and all work complete', () => {
-    for (const acceptedBy of [undefined, 'gm', 'owner']) {
+    for (const acceptedBy of [undefined, 'owner', 'owner']) {
       const result = assessGoal({ goal: goal({ pipeline: 'story' }), tasks: [task('manual'), ownerGate({ acceptedBy })],
         outcome: outcome(['owner_final']), now: NOW });
       expect(result.readyToComplete).toBe(acceptedBy === 'owner');

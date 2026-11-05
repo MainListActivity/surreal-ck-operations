@@ -27,7 +27,7 @@ beforeAll(async () => {
   if (process.env.RUN_SCK_WORKTREE_FORK_TESTS !== '1') return;
   dir = realpathSync(mkdtempSync(join(tmpdir(), 'sck-mcp-reclaim-')));
   const listener = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('fixture') }); port = listener.port!; listener.stop(true);
-  await start(); gm = await new LocalEnrollmentAdmin(db).enroll('mcp-reclaim-manager', 'gm', ['execute', 'review', 'manage']);
+  await start(); gm = await new LocalEnrollmentAdmin(db).enroll('mcp-reclaim-manager', 'owner', ['execute', 'review', 'manage']);
 }, 20000);
 afterAll(async () => { if (!dir) return; await db.close(); server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true }); });
 const git = (repo: string, ...args: string[]) => {

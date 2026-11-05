@@ -18,9 +18,9 @@ run('real fork: the third ops refusal blocks exactly the held task and drops its
   const workforce=new Workforce(db,join(root,'unused-credentials'));
   const core=new SurrealCompanyCore(db,{workforce});
   const admin=new LocalEnrollmentAdmin(db);
-  const gm=await admin.enroll('fixture-gm','gm',['manage','execute','review']);
+  const gm=await admin.enroll('fixture-gm','owner',['manage','execute','review']);
   const qa=await admin.enroll('fixture-qa','qa',['execute','review']);
-  const task=await core.createTask(gm,{title:'受控熔断验证',context:'合成工具拒绝，不访问任何外部系统。',executorRole:'qa',reviewerRole:'gm',idempotencyKey:'fixture-ops-circuit'});
+  const task=await core.createTask(gm,{title:'受控熔断验证',context:'合成工具拒绝，不访问任何外部系统。',executorRole:'qa',reviewerRole:'owner',idempotencyKey:'fixture-ops-circuit'});
   let calls=0;
   pool=new SidecarPool({core,workforce:workforce as unknown as SidecarDeps['workforce'],runDir:root,sweepMs:2,heartbeatMs:100000,
    ops:{tools:['ops_request'],release:()=>{},call:async()=>{calls++;return {status:403,ok:false};}}});
@@ -35,7 +35,7 @@ run('real fork: the third ops refusal blocks exactly the held task and drops its
   }
   expect(calls).toBe(3);
   const actual=await core.getTask(gm,task.id);
-  expect(actual).toMatchObject({state:'blocked',blockedTo:'gm'});
+  expect(actual).toMatchObject({state:'blocked',blockedTo:'owner'});
   expect(actual.currentEmployee).toBeUndefined();
   expect((await pool.settle('fixture-agent')).status).toBe('no_claim');
  } finally {pool?.close();await db.close();rmSync(root,{recursive:true,force:true});}

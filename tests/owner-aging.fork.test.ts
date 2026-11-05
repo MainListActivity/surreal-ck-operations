@@ -30,7 +30,7 @@ beforeAll(async () => {
   await db.connect(); await db.bootstrap();
   core = new SurrealCompanyCore(db); owner = new OwnerDesk(db);
   const admin = new LocalEnrollmentAdmin(db);
-  gm = await admin.enroll('aging-gm', 'gm', ['execute', 'review', 'manage']);
+  gm = await admin.enroll('aging-gm', 'owner', ['execute', 'review', 'manage']);
   eng = await admin.enroll('aging-eng', 'engineering', ['execute', 'review']);
   const [rows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: '两位律师试用', brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
   goal = rows[0]!.id;

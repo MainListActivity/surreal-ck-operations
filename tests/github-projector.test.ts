@@ -12,7 +12,7 @@ const task: TaskView = {
 };
 const event: OutboxEvent = { id: 'event-1', sequence: 1, taskId: task.id, kind: 'created', payload: {}, createdAt: '2026-09-27T00:00:00Z' };
 const core = {
-  async authenticate() { return { employeeId: 'gm-01', role: 'gm', capabilities: ['manage'] }; },
+  async authenticate() { return { employeeId: 'gm-01', role: 'owner', capabilities: ['manage'] }; },
   async listOutbox() { return [event]; },
   async getTask() { return task; },
 } as unknown as CompanyCore;

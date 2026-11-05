@@ -24,7 +24,7 @@ beforeAll(async () => {
   db = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: 'fixture-only', namespace: 'story_author_fixture', database: 'control_plane' });
   await db.connect(); await db.bootstrap();
   workforce = new Workforce(db, join(dir, 'credentials')); core = new SurrealCompanyCore(db, { workforce });
-  gm = await new LocalEnrollmentAdmin(db).enroll('story-gm', 'gm', ['execute', 'review', 'manage']);
+  gm = await new LocalEnrollmentAdmin(db).enroll('story-gm', 'owner', ['execute', 'review', 'manage']);
 });
 afterAll(async () => { if (!dir) return; await db.close(); server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true }); });
 
@@ -51,6 +51,6 @@ run('the story-author def refuses other tracks and screenwriter work is not stor
   await new ProjectStore(db.db).upsert({ id: 'novel', name: '故事项目', repoPath: dir, release: 'local', envs: [], disciplines: [{ name: '原著', roles: ['story-author'] }] });
   const [rows] = await db.db.query<[Array<{ id: unknown }>]>("CREATE goal CONTENT { title: '长篇', brief: 'fixture', state: 'active', source: 'fixture', note: '', project: project:novel, tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
   const goalId = String((rows[0]!.id as { id: string }).id);
-  await expect(task({ goalId, executorRole: 'product', reviewerRole: 'gm', discipline: '原著' })).rejects.toThrow(/only be carried by story-author/);
+  await expect(task({ goalId, executorRole: 'product', reviewerRole: 'owner', discipline: '原著' })).rejects.toThrow(/only be carried by story-author/);
   expect((await task({ goalId, discipline: '原著' })).executorRole).toBe('story-author');
 });

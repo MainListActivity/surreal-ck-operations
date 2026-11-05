@@ -194,7 +194,7 @@ export const UNLOCK_CHILDREN_SQL = `
       LET $restore_phase = IF $source_phase = 'review' THEN 'review' ELSE 'ready' END;
       LET $unlocked = UPDATE ONLY $child.id SET
         state = IF $manager THEN 'blocked' ELSE $restore_phase END, version += 1,
-        blocked_to = IF $manager THEN 'gm' ELSE NONE END,
+        blocked_to = IF $manager THEN 'owner' ELSE NONE END,
         resume_state = IF $manager THEN $source_phase ELSE NONE END,
         resume_role = IF $manager THEN $child.resume_role ELSE NONE END,
         dependency_continuation = NONE,
@@ -270,7 +270,7 @@ export interface TaskRow {
   delivery_id?: string;
   lease_expires_at?: number;
   fence: number;
-  blocked_to?: 'gm' | 'owner';
+  blocked_to?: 'owner';
   resume_role?: string;
   resume_state?: TaskState;
   kind?: TaskKind;
@@ -283,13 +283,13 @@ export interface TaskRow {
   model_route_until?:number;
   handover?: boolean;
   previous_employee?: string;
-  /** Bound code implementer: set at the first execute claim or by an explicit gm takeover (schemaless). */
+  /** Bound code implementer: set at the first execute claim or by an explicit owner takeover (schemaless). */
   implementer?: string;
   /** Open dispatch-blocked episode (schemaless): the phase it blocks and when it began, unix seconds. */
   dispatch_blocked_phase?: string | null;
   dispatch_blocked_since?: number | null;
   progress_at?: number;
-  /** Unix seconds: a quota-caused block may not be re-announced to gm before this instant. */
+  /** Unix seconds: a quota-caused block may not be re-announced to owner before this instant. */
   quota_resets_at?: number | null;
   /** FV06 P0 (schemaless): unix seconds. The standby direct assignment's deadline, cleared on timeout/normal reclaim. */
   standby_until?: number | null;
@@ -417,12 +417,12 @@ function principalView(principalId: string, employees: readonly string[], reason
 export function waitingOf(row: Pick<TaskRow, 'state' | 'blocked_to' | 'resume_state' | 'resume_role' | 'reviewer_role' | 'executor_role' | 'dependencies'>): TaskWaiting | undefined {
   if (row.state !== 'blocked') return undefined;
   const resumeState = row.resume_state ?? 'unknown';
-  const role: TaskWaiting['role'] = row.blocked_to === 'owner' ? 'owner'
-    : row.resume_role ? (row.resume_role as Role)
+  const role: TaskWaiting['role'] = row.resume_role ? (row.resume_role as Role)
+    : row.blocked_to === 'owner' ? 'owner'
       : resumeState === 'review' ? row.reviewer_role
         : (resumeState === 'ready' || resumeState === 'doing') ? row.executor_role
           : 'unknown';
-  const kind: TaskWaiting['kind'] = row.blocked_to === 'gm' ? 'manager' : row.blocked_to === 'owner' ? 'owner' : 'dependency';
+  const kind: TaskWaiting['kind'] = row.blocked_to === 'owner' ? 'owner' : 'dependency';
   return { kind, resumeState, role, dependenciesCount: (row.dependencies ?? []).length };
 }
 
@@ -792,7 +792,7 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     // The single WSS channel sustains only ~50KB/s, so unbounded SELECT * stalls every
     // other query behind it for tens of seconds. get_context's contract is the
     // claimable/working set — terminal rows stay reachable through an explicit state.
-    const scoped = actor.role !== 'gm';
+    const scoped = actor.role !== 'owner';
     const [rows] = await this.db.query<[TaskRow[]]>(
       `SELECT *, string::slice(context ?? '', 0, $ctx) AS context FROM task
        WHERE ${state ? 'state = $state' : "state IN ['ready', 'doing', 'review', 'blocked']"}
@@ -841,7 +841,7 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     const actor = await this.authorized(credential);
     const row = await this.db.select<TaskRow>(id('task', taskId));
     if (!row) throw new CompanyError('not_found', 'Task not found');
-    if (actor.role !== row.executor_role && actor.role !== row.reviewer_role && actor.role !== 'gm' && actor.role !== 'eval') {
+    if (actor.role !== row.executor_role && actor.role !== row.reviewer_role && actor.role !== 'owner' && actor.role !== 'eval') {
       throw new CompanyError('forbidden', 'Task access denied');
     }
     return view(row);
@@ -909,8 +909,8 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
             const kind = independence[1]!.toLowerCase();
             throw new CompanyError(kind === 'denied' ? 'forbidden' : kind === 'invalid' ? 'invalid' : 'conflict', `Independence ${kind}: ${independence[2]!.trim()}`);
           }
-          // The gm that repaired a goal acceptance reference is the candidate's author for four-eyes purposes: it may not review or accept that candidate.
-          if (/goal acceptance repairer/i.test(cause)) throw new CompanyError('self_review', 'Repairing gm cannot review or accept the repaired goal candidate; another gm must');
+          // The owner that repaired a goal acceptance reference is the candidate's author for four-eyes purposes: it may not review or accept that candidate.
+          if (/goal acceptance repairer/i.test(cause)) throw new CompanyError('self_review', 'Repairing owner cannot review or accept the repaired goal candidate; another owner must');
           if (/self review/i.test(cause)) throw new CompanyError('self_review', 'Employee cannot review own delivery');
           if (/discipline track denied/i.test(cause)) throw new CompanyError('forbidden', 'Employee definition does not cover the task discipline');
           if (/employee runtime is suspending/i.test(cause)) throw new CompanyError('conflict', 'Employee runtime is suspending; retry after closure');
@@ -961,7 +961,7 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
    */
   private async createTaskRecord(credential: Credential, input: CreateTask, options: { external?: boolean; acceptanceChain?: string; repairKey?: string } = {}): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
-    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Task creation denied');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Task creation denied');
     // External create_task only: the raw list is bounded before de-duplication. Internal delivery
     // legs and automatic goal-anchor dependencies are deliberately not capped here; they must
     // retain the complete dependency set.
@@ -1076,7 +1076,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     try {
       const row = await this.txTask(`BEGIN;
         LET $who = SELECT * FROM ONLY $actor;
-        IF $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role NOT IN ['gm', 'product'] { THROW 'actor revoked or forbidden' };
+        IF $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'actor revoked or forbidden' };
         FOR $dep IN $dependencies {
           LET $d = SELECT * FROM ONLY $dep;
           IF $d = NONE { THROW 'dependency not found' };
@@ -1120,7 +1120,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * Controlled screenplay-revision edge (create_task with `revises`): gm/product replaces an
+   * Controlled screenplay-revision edge (create_task with `revises`): owner/product replaces an
    * owner-rejected screenplay draft with its legal next version in one transaction — the old
    * draft voids with a superseded_by pointer, the new draft inherits the lineage and may start
    * once its own normal dependencies are satisfied. The edge is never a general approval
@@ -1226,7 +1226,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     try {
       const row = await this.txTask(`BEGIN;
         LET $who = SELECT * FROM ONLY $actor;
-        IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role NOT IN ['gm', 'product'] { THROW 'actor revoked or forbidden' };
+        IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'actor revoked or forbidden' };
         LET $d = SELECT * FROM ONLY $revises;
         IF $d = NONE { THROW 'dependency not found' };
         IF $d.executor_role != 'screenwriter' OR $d.discipline != $req_track OR $d.reviewer_role != 'owner' OR ($d.kind ?? 'task') != 'task' { THROW 'revises target is not a screenplay draft' };
@@ -1373,7 +1373,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   async readWorkspace(credential: Credential, taskId?: TaskId, project?: string): Promise<WorktreeAssignment | undefined> {
     const actor = await this.authorized(credential);
-    if (!['gm', 'eval'].includes(actor.role)) throw new CompanyError('forbidden', 'Non-lease workspace requires gm/eval');
+    if (!['owner', 'eval'].includes(actor.role)) throw new CompanyError('forbidden', 'Non-lease workspace requires owner/eval');
     if (!this.worktrees) return undefined;
     const bound = taskId ? await this.getTask(credential, taskId) : undefined;
     const resolved = taskId ? await this.taskProject(taskId!) : project ? await this.projects.get(project) : undefined;
@@ -1387,8 +1387,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   async listWorktrees(credential: Credential, taskId?: TaskId): Promise<WorktreeView[]> {
     const actor = await this.authorized(credential);
-    // Checked before the registry is consulted: a caller without a task and without gm is refused even when no registry exists (R8).
-    if (!taskId && actor.role !== 'gm') throw new CompanyError('forbidden', 'Global worktree inventory requires gm');
+    // Checked before the registry is consulted: a caller without a task and without owner is refused even when no registry exists (R8).
+    if (!taskId && actor.role !== 'owner') throw new CompanyError('forbidden', 'Global worktree inventory requires owner');
     if (!this.worktrees) return [];
     if (taskId) {
       const task = await this.getTask(credential, taskId);
@@ -1506,9 +1506,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       LET $expired = $t.state != 'review' AND $t.execution_window != NONE AND <datetime>$t.execution_window.notAfter <= time::now();
       IF $expired {
         IF $t.current_employee != NONE AND $t.lease_expires_at > $now { THROW 'execution window expired under active lease' };
-        LET $n = UPDATE ONLY $task SET state = 'blocked', blocked_to = 'gm', resume_state = $t.state, version += 1 RETURN AFTER;
+        LET $n = UPDATE ONLY $task SET state = 'blocked', blocked_to = 'owner', resume_state = $t.state, version += 1 RETURN AFTER;
         CREATE audit CONTENT { task: $task, actor: 'system:execution-window', action: 'block', version: $n.version,
-          recovery_reason: 'stale_window', evidence: '执行窗口已过期；需经理安排真实重采样和独立批准，禁止延长旧证据', at: time::now() };
+          recovery_reason: 'stale_window', evidence: '执行窗口已过期；需老板安排真实重采样和独立批准，禁止延长旧证据', at: time::now() };
         LET $seq = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE outbox CONTENT { task: $task, kind: 'block', sequence: $seq.value, payload: { version: $n.version }, at: time::now() };
       } ELSE {
@@ -1817,7 +1817,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     ];
     const vars: Record<string, unknown> = { cap, limit, me: actor.employeeId };
     if (params.state) vars.state = params.state;
-    if (actor.role !== 'gm') {
+    if (actor.role !== 'owner') {
       where.push('(executor_role = $myrole OR reviewer_role = $myrole)');
       vars.myrole = actor.role ?? '';
     }
@@ -2152,7 +2152,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   /**
    * read_worktree_refs (SYS01 R1): one byte segment of one worktree's references as JSON, the recovery entry a paged listing
    * item names when its references were cut. The worktree is looked up under the same scope as list_worktrees (a task id
-   * scopes it to that task's repository; a global read is gm only), and includeReleased must be the filter the listing item
+   * scopes it to that task's repository; a global read is owner only), and includeReleased must be the filter the listing item
    * reports, so the digest the item carries covers exactly this text. Segments never split a character and reassemble
    * exactly; sha256 covers the whole text, and a segment past offset 0 pins the digest it started with.
    */
@@ -2176,15 +2176,15 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return worktreeRefsSegmentAnswer(head, worktreeRefsSegment(text, params.offset, params.limit, head));
   }
 
-  /** Re-checks, on every worktree read, what it needs: access to the task, or gm for the global inventory. */
+  /** Re-checks, on every worktree read, what it needs: access to the task, or owner for the global inventory. */
   private async worktreeScope(credential: Credential, actor: Principal, taskId?: string): Promise<void> {
     if (taskId !== undefined) await this.getTask(credential, taskId as TaskId);
-    else if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Global worktree inventory requires gm');
+    else if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Global worktree inventory requires owner');
   }
 
   /**
    * read_task_text (SYS01, R3): one byte segment of one text of a task. context and evidence are read as stored. project is the
-   * task's project environment as JSON, read by its holder and gm only. dependencies, workIntentPaths and worktreePaths are the
+   * task's project environment as JSON, read by its holder and owner only. dependencies, workIntentPaths and worktreePaths are the
    * task's lists as JSON arrays, the form a claim echo cuts them from. Segments never split a character and reassemble exactly;
    * sha256 covers the whole text, so a reader can verify it.
    */
@@ -2207,8 +2207,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       const actor = await this.authenticate(credential);
       // The holder reads it only while the lease is valid, the same rule as the company block (SYS01 M3).
       const holds = task.currentEmployee === actor.employeeId && Date.parse(task.leaseExpiresAt ?? '') > Date.now();
-      if (actor.role !== 'gm' && !holds) {
-        throw new CompanyError('forbidden', 'the project environment is read by gm or the holder of a valid task lease');
+      if (actor.role !== 'owner' && !holds) {
+        throw new CompanyError('forbidden', 'the project environment is read by owner or the holder of a valid task lease');
       }
       const project = await this.taskProject(params.taskId as TaskId);
       if (!project) throw new CompanyError('not_found', 'the task has no project environment');
@@ -2232,13 +2232,13 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * get_admin_summary (SYS01, C5, gm only): counts by state and by audit action in a window, with the cutoff time and the
+   * get_admin_summary (SYS01, C5, owner only): counts by state and by audit action in a window, with the cutoff time and the
    * outbox sequence. The counts are read twice inside one transaction. integrity.complete is true only when the two reads
    * agree and each count matches the rows it grouped. Nothing here carries task text.
    */
   async adminSummary(credential: Credential, input: Record<string, unknown> = {}): Promise<AdminSummary> {
     const actor = await this.authenticate(credential);
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may read the company summary');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may read the company summary');
     const params = parseSummaryInput(input);
     const since = params.since ?? new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const goal = params.goalId ? id('goal', params.goalId) : undefined;
@@ -2309,7 +2309,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * gm/product/qa only, read-only (SYS04): what the plugin process is actually running.
+   * owner/product/qa only, read-only (SYS04): what the plugin process is actually running.
    *
    * The core cannot take the sample itself — only the plugin host can state which release it loaded, and the
    * plugin host is the face every employee channel reaches. So the core owns the authorization and the caller
@@ -2320,19 +2320,19 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   async pluginRuntimeDiagnostics(credential: Credential, sample: () => PluginRuntimeView | Promise<PluginRuntimeView>): Promise<PluginRuntimeView> {
     const actor = await this.authorized(credential);
     if (!PLUGIN_RUNTIME_ROLES.includes(actor.role)) {
-      throw new CompanyError('forbidden', 'Only gm, product or qa may read the plugin runtime diagnostics');
+      throw new CompanyError('forbidden', 'Only owner, product or qa may read the plugin runtime diagnostics');
     }
     return await sample();
   }
 
   /**
-   * gm only, read-only (SYS-DISP AC05): what the audit-derived contributors say about the given tasks, the implementer status
+   * owner only, read-only (SYS-DISP AC05): what the audit-derived contributors say about the given tasks, the implementer status
    * each one would have, and its timeline. Nothing is written: no lease, submitter, owner gate, history or implementer changes
    * here. Recording a suggested implementer is a separate step that needs owner authorization.
    */
   async contributorDryRun(credential: Credential, input: { taskIds: string[] }): Promise<ContributorDryRunView> {
     const actor = await this.authorized(credential);
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may run the contributor dry-run');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may run the contributor dry-run');
     if (!Array.isArray(input.taskIds) || input.taskIds.length === 0 || input.taskIds.length > 20) {
       throw new CompanyError('invalid', 'taskIds must hold 1 to 20 task ids');
     }
@@ -2373,7 +2373,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * gm and qa, read-only (SYS-DISP IR01-IR05): the verdict the independence gate would give for one employee on one task at one
+   * owner and qa, read-only (SYS-DISP IR01-IR05): the verdict the independence gate would give for one employee on one task at one
    * stage — the formal read-only preflight that the source-avoidance registrations prove their criteria with, replacing an exported
    * reply as evidence. The exclusion comes from the gate's own reader and index, so a reading cannot drift from what a claim or a
    * submit actually does, and nothing is written: no lease, version, audit row, outbox event or dispatch observation. A done or void
@@ -2385,7 +2385,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    */
   async independenceCheck(credential: Credential, input: IndependenceCheckInput): Promise<IndependenceCheckView> {
     const actor = await this.authorized(credential);
-    if (actor.role !== 'gm' && actor.role !== 'qa') {
+    if (actor.role !== 'owner' && actor.role !== 'qa') {
       throw new CompanyError('forbidden', 'Only a manager or qa may read the independence preflight');
     }
     requireText(input.taskId, 'taskId', 1, INDEPENDENCE_LIMITS.idChars);
@@ -2410,7 +2410,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   /**
    * The company block as the credential's holder may read it. Projects keep their identity fields for everyone; their environments
-   * (names, URLs and credential aliases with roles) are shown only to gm and to the holder of a valid lease on one of their tasks
+   * (names, URLs and credential aliases with roles) are shown only to owner and to the holder of a valid lease on one of their tasks
    * (SYS01 M3). The owner's console reads the full block through OwnerDesk.brief, which is unchanged.
    */
   async companyBrief(credential: Credential): Promise<CompanyBrief> {
@@ -2427,9 +2427,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return base;
   }
 
-  /** Which project environments a reader may see: all for gm; otherwise those of the projects of tasks it holds under a valid lease. */
+  /** Which project environments a reader may see: all for owner; otherwise those of the projects of tasks it holds under a valid lease. */
   private async envView(actor: Principal): Promise<EnvView> {
-    if (actor.role === 'gm') return { key: 'all', visible: () => true };
+    if (actor.role === 'owner') return { key: 'all', visible: () => true };
     const [rows] = await this.db.query<[Array<{ project?: RecordId; goal_project?: RecordId }>]>(
       'SELECT project AS project, goal.project AS goal_project FROM task WHERE current_employee = $employee AND lease_expires_at > $now;',
       { employee: actor.employeeId, now: Math.floor(Date.now() / 1000) });
@@ -2442,7 +2442,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   private async relayActor(credential: Credential, ownerQuote: string): Promise<string> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may relay owner instructions');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may relay owner instructions');
     requireText(ownerQuote, 'owner quote', 2, 4000);
     return `gm-relay:${actor.employeeId}`;
   }
@@ -2454,14 +2454,14 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * gm only: close a large goal in stages. The named unfinished tasks move to a next-phase goal (created once per
+   * owner only: close a large goal in stages. The named unfinished tasks move to a next-phase goal (created once per
    * idempotency key, same tier and project); the old goal's anchors stop waiting for them and unlock when nothing else is
    * open, so the current phase can be accepted. The moved tasks join the new goal's first anchor. Refused, writing
    * nothing, when a task is an anchor, finished, leased, outside the goal, or still awaited by an open task that stays.
    */
   async goalPhaseSplit(credential: Credential, input: { goalId: string; taskIds: TaskId[]; title: string; reason: string; idempotencyKey: string }): Promise<{ goalId: string; nextGoalId: string; moved: TaskId[]; unlocked: TaskId[] }> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may split a goal into phases');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may split a goal into phases');
     return this.phaseSplit({ record: id('employee', actor.employeeId), source: `gm-split:${actor.employeeId}` }, input);
   }
 
@@ -2567,7 +2567,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   async triageGoal(credential: Credential, input: { goalId: string; tier: GoalTier; reason: string }): Promise<GoalView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may triage goals');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may triage goals');
     requireText(input.reason, 'reason', 4, 4000);
     return this.owner.triage(input.goalId, input.tier, `${actor.employeeId}：${input.reason}`);
   }
@@ -2629,7 +2629,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return created.map(task => echoTask(task, legLimit));
   }
 
-  /** SYS02: read the gate and the current verdict for one task (its holder, reviewer, or gm). */
+  /** SYS02: read the gate and the current verdict for one task (its holder, reviewer, or owner). */
   async acceptanceStatus(credential: Credential, input: { taskId: TaskId }): Promise<AcceptanceStatusView> {
     const actor = await this.authenticate(credential);
     await this.getTask(credential, input.taskId);
@@ -2646,7 +2646,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return { taskId: input.taskId, gate, verdict };
   }
 
-  /** SYS-INT: read-only versioned acceptance-mapping preview for one task. The holder, reviewer or gm may read it; it never writes. */
+  /** SYS-INT: read-only versioned acceptance-mapping preview for one task. The holder, reviewer or owner may read it; it never writes. */
   async acceptanceMappingPreview(credential: Credential, input: { taskId: TaskId }): Promise<AcceptanceMappingPreviewView> {
     const actor = await this.authenticate(credential);
     await this.getTask(credential, input.taskId);
@@ -2692,14 +2692,14 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       } : {}),
       sysRequired: SYS_REQUIRED_MAPPING.map(item => ({ ...item })),
       conflicts,
-      guidance: '只读预览：不写任何数据。导入需 gm 携带本预览的 digest 与目标任务 expectedVersion 走 acceptance_mapping_import；冲突清零前导入会被拒绝。bundle 按受众绑定：工程实现行取工具自身项（sys-int-implement），SYS-INT 源 QA 行取源业务契约（sys-int-source-qa，业务项均为对真实生产证据的人工独立签核，不携带别腿机器基线）；错配 bundle 会被拒绝。',
+      guidance: '只读预览：不写任何数据。导入需 owner 携带本预览的 digest 与目标任务 expectedVersion 走 acceptance_mapping_import；冲突清零前导入会被拒绝。bundle 按受众绑定：工程实现行取工具自身项（sys-int-implement），SYS-INT 源 QA 行取源业务契约（sys-int-source-qa，业务项均为对真实生产证据的人工独立签核，不携带别腿机器基线）；错配 bundle 会被拒绝。',
     };
   }
 
-  /** SYS-INT: gm-only authorized import of a versioned acceptance-mapping bundle. CAS on the task version, digest-bound to the previewed bundle, audited; refuses stale bundles, downgrades, occupied/done/void rows and never rewrites finished acceptance. */
+  /** SYS-INT: owner-only authorized import of a versioned acceptance-mapping bundle. CAS on the task version, digest-bound to the previewed bundle, audited; refuses stale bundles, downgrades, occupied/done/void rows and never rewrites finished acceptance. */
   async acceptanceMappingImport(credential: Credential, input: AcceptanceMappingImportInput): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may import an acceptance mapping');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may import an acceptance mapping');
     requireText(input.taskId, 'task', 1, 200);
     if (!/^[a-z0-9-]{3,60}$/.test(input.mappingKey)) throw new CompanyError('invalid', 'mappingKey must be a registry bundle key');
     const bundle = mappingBundle(input.mappingKey);
@@ -2777,14 +2777,14 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * SYS-INT: start one controlled non-production two-face switch & rollback drill. The caller names
    * only business facts (task, runId, base/candidate SHA); every path and port is constructed by the
    * validator, the drill runs in a detached host child, and the employee never needs launchctl or
-   * paseo. Only the task holder (engineering) or gm may start a drill; every call is audited.
+   * paseo. Only the task holder (engineering) or owner may start a drill; every call is audited.
    */
   async deployDrillRun(credential: Credential, input: { taskId: string; runId: string; baseSha: string; candidateSha: string; idempotencyKey: string }): Promise<{ runId: string; pid: number; root: string }> {
     const actor = await this.authenticate(credential);
-    if (actor.role !== 'engineering' && actor.role !== 'gm') throw new CompanyError('forbidden', 'Only engineering or gm may run a deploy drill');
+    if (actor.role !== 'engineering' && actor.role !== 'owner') throw new CompanyError('forbidden', 'Only engineering or owner may run a deploy drill');
     const row = await this.db.select<{ current_employee?: string; state: string }>(id('task', input.taskId));
     if (!row) throw new CompanyError('not_found', 'Task not found');
-    if (row.current_employee !== actor.employeeId && actor.role !== 'gm') throw new CompanyError('forbidden', 'Only the task holder may run a drill for this task');
+    if (row.current_employee !== actor.employeeId && actor.role !== 'owner') throw new CompanyError('forbidden', 'Only the task holder may run a drill for this task');
     const home = process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library', 'Application Support', 'SurrealCKCompany');
     const repo = this.companyReleaseRepo ?? this.worktrees?.options.opsRepo ?? process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
     const host = drillHost(home, repo);
@@ -2795,25 +2795,25 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return { runId: input.runId, pid, root: plan.root };
   }
 
-  /** SYS-INT: read one drill's state and stage records; the task holder, gm, qa or product may read. */
+  /** SYS-INT: read one drill's state and stage records; the task holder, owner, qa or product may read. */
   async deployDrillStatus(credential: Credential, input: { runId: string }): Promise<{ state?: DrillState; stages?: string[] }> {
     const actor = await this.authenticate(credential);
-    if (!['engineering', 'gm', 'qa', 'product'].includes(actor.role ?? '')) throw new CompanyError('forbidden', 'Not allowed to read drill status');
+    if (!['engineering', 'owner', 'qa'].includes(actor.role ?? '')) throw new CompanyError('forbidden', 'Not allowed to read drill status');
     const home = process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library', 'Application Support', 'SurrealCKCompany');
     return readDrillStatus(home, input.runId);
   }
 
-  /** SYS02: gm read of the versioned gate record. */
+  /** SYS02: owner read of the versioned gate record. */
   async acceptanceGate(credential: Credential): Promise<AcceptanceGateView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may read the acceptance gate record');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may read the acceptance gate record');
     return loadAcceptanceGate(this.db);
   }
 
-  /** SYS02 AC06: gm changes the gate with a version check and a reason audit; an executor can never self-approve it. */
+  /** SYS02 AC06: owner changes the gate with a version check and a reason audit; an executor can never self-approve it. */
   async setAcceptanceGate(credential: Credential, input: AcceptanceGateInput): Promise<AcceptanceGateView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may change the acceptance gate');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may change the acceptance gate');
     requireText(input.reason, 'reason', 4, 2000);
     const current = await loadAcceptanceGate(this.db);
     const next: AcceptanceGateView = {
@@ -2849,7 +2849,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (input.source?.provider !== 'github-actions') throw new CompanyError('invalid', 'acceptance evidence source must be github-actions');
     const holds = row.current_employee === actor.employeeId && ['doing', 'review'].includes(row.state) &&
       (row.lease_expires_at ?? 0) > Date.now() / 1000;
-    if (actor.role !== 'gm' && !holds) throw new CompanyError('forbidden', 'Acceptance evidence is recorded by the task holder or gm');
+    if (actor.role !== 'owner' && !holds) throw new CompanyError('forbidden', 'Acceptance evidence is recorded by the task holder or owner');
     const criteria = validateAcceptanceCriteria(row.acceptance_criteria);
     const criterion = criteria.find(item => item.id === input.acId);
     if (!criterion) throw new CompanyError('not_found', `acceptance criterion ${input.acId} not found on this task`);
@@ -2894,7 +2894,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return evidence;
   }
 
-  // ---- 受控编制管理工具（manage = gm/product） ----
+  // ---- 受控编制管理工具（manage = owner/product） ----
   // 员工侧唯一写编制/词表的入口；owner console 与 admin CLI 继续可用。每次写落一条 audit。
 
   private static defView(d: Pick<EmployeeDef, 'id' | 'role' | 'provider' | 'model' | 'thinking' | 'tracks' | 'enabled' | 'maxInstances' | 'priority' | 'weight' | 'quotaLimited'>): DefView {
@@ -3027,14 +3027,14 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   /** Lease writes answer with their task echoed within the budget (SYS01): the write is already committed, so its echo never fails it. */
   private async transition(
     credential: Credential, proof: LeaseProof, action: 'heartbeat' | 'checkpoint' | 'submit' | 'accept' | 'return' | 'block',
-    evidence?: Evidence, to?: 'gm' | 'owner'
+    evidence?: Evidence, to?: 'owner'
   ): Promise<TaskView> {
     return echoTask(await this.transitionRecord(credential, proof, action, evidence, to));
   }
 
   private async transitionRecord(
     credential: Credential, proof: LeaseProof, action: 'heartbeat' | 'checkpoint' | 'submit' | 'accept' | 'return' | 'block',
-    evidence?: Evidence, to?: 'gm' | 'owner'
+    evidence?: Evidence, to?: 'owner'
   ): Promise<TaskView> {
     const actor = await this.authorized(credential);
     if (!Number.isSafeInteger(proof.expectedVersion) || !Number.isSafeInteger(proof.fence) || proof.fence < 1) {
@@ -3351,14 +3351,14 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
   /**
    * `quotaResetsAt` is set only for a subscription quota or rate-limit block. The task then stays
-   * quiet for gm until that instant, and the employee's provider leaves dispatch until then too.
+   * quiet for owner until that instant, and the employee's provider leaves dispatch until then too.
    *
    * SYS04 AC01/AC02: a block may carry the machine facts of the failure that caused it (`fault`). Those facts are
    * classified and grouped by fingerprint, and the attempt they describe is charged to the recovery budget of the
    * fault object here — not by the employee, and not by a later retry. Without a `fault`, the block is an ordinary
    * block: the employee blocked because it decided to, and no budget is spent.
    */
-  async block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence, quotaResetsAt?: string, fault?: FaultInput): Promise<TaskView> {
+  async block(credential: Credential, proof: LeaseProof, to: 'owner', evidence: Evidence, quotaResetsAt?: string, fault?: FaultInput): Promise<TaskView> {
     const until = quotaResetsAt === undefined ? undefined : parseQuotaResetsAt(quotaResetsAt, Date.now());
     const actor = await this.authenticate(credential);
     // A structured upgrade is an install request, validated against main and the current lease by transition.
@@ -3419,7 +3419,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       [input.reference ?? '', input.summary ?? '', ...(input.completed ?? [])], row);
     const now = this.waitClock();
     const defaultOwner = input.kind === 'owner_handoff' ? 'owner'
-      : (input.kind === 'dependency' || input.kind === 'upstream_repair') ? row.executor_role : 'gm';
+      : (input.kind === 'dependency' || input.kind === 'upstream_repair') ? row.executor_role : 'owner';
     const normalized = normalizeWait({ ...input, ownerRole: input.ownerRole ?? defaultOwner } as WaitInput, {
       now, ownerRole: defaultOwner,
     });
@@ -3520,7 +3520,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const now = this.waitClock();
     const verified = input.source === 'webhook' ? this.verifyWebhook(input, now) : false;
     if (input.source === 'authorized_person' || input.source === 'dependency') {
-      if (actor.role !== 'gm') throw new CompanyError('forbidden', '只有经理（gm）可以以授权人身份确认等待事件');
+      if (actor.role !== 'owner') throw new CompanyError('forbidden', '只有老板可以以授权人身份确认等待事件');
     }
     if (input.source === 'webhook' && !verified) {
       if (!this.waitWebhookSecret) throw new CompanyError('not_configured', 'webhook 签名密钥未配置；未验证的事件不能解除等待');
@@ -3564,7 +3564,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   /** Manager cancel: version-locked. Without `resume` the task stays blocked for a human, never silently schedulable. */
   async cancelWait(credential: Credential, input: WaitActionInput): Promise<WaitActionView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', '只有经理（gm）可以取消等待');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', '只有老板可以取消等待');
     if (!Number.isSafeInteger(input.expectedVersion)) throw new CompanyError('invalid', 'expectedVersion 必须是整数');
     const reason = String(input.reason ?? '').trim();
     if (reason.length < 10 || reason.length > 2000) throw new CompanyError('invalid', '取消理由需为 10-2000 字');
@@ -3580,7 +3580,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   /** Manager extend/re-arm: version-locked and reasoned. A stale version cannot overwrite another manager's change. */
   async extendWait(credential: Credential, input: WaitActionInput): Promise<WaitActionView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', '只有经理（gm）可以延期等待');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', '只有老板可以延期等待');
     if (!Number.isSafeInteger(input.expectedVersion)) throw new CompanyError('invalid', 'expectedVersion 必须是整数');
     const reason = String(input.reason ?? '').trim();
     if (reason.length < 10 || reason.length > 2000) throw new CompanyError('invalid', '延期理由需为 10-2000 字');
@@ -3614,17 +3614,17 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return { waits: waits.map(wait => this.waitViewOf(wait)), total: waits.length };
   }
 
-  /** The owner handoff cards. Owner/gm only; a card never contains the handoff file's content. */
+  /** The owner handoff cards. Owner/owner only; a card never contains the handoff file's content. */
   async waitHandoffCards(credential: Credential): Promise<WaitHandoffCard[]> {
     const actor = await this.authorized(credential);
-    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', '只有经理/运营可以读取老板交接卡');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', '只有老板/运营可以读取老板交接卡');
     return this.waits.handoffCards(this.waitClock());
   }
 
   /** Read-only legacy migration preview. It never releases anything, and an owner gate is never a time wait. */
   async waitMigrationPreview(credential: Credential): Promise<WaitMigrationPreviewView> {
     const actor = await this.authorized(credential, 'manage');
-    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', '只有经理/运营可以做旧任务迁移预演');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', '只有老板/运营可以做旧任务迁移预演');
     const [rows] = await this.db.query<[Array<{ id: unknown; state: string; blocked_to?: string; quota_resets_at?: number; wait_state?: string }>]>(
       `SELECT id, state, blocked_to, quota_resets_at, wait_state, created_at FROM task
        WHERE state IN ['blocked', 'ready', 'doing'] ORDER BY created_at LIMIT 200;`);
@@ -3648,7 +3648,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    */
   async waitMigrationApply(credential: Credential, input: WaitMigrationApplyInput): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', '只有经理（gm）可以迁移旧任务到等待');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', '只有老板可以迁移旧任务到等待');
     if (!Number.isSafeInteger(input.expectedVersion)) throw new CompanyError('invalid', 'expectedVersion 必须是整数');
     const reason = String(input.reason ?? '').trim();
     if (reason.length < 10 || reason.length > 2000) throw new CompanyError('invalid', '迁移理由需为 10-2000 字');
@@ -3923,7 +3923,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * Read-only diagnosis of a task's recovery budget. Readable by the task holder, its reviewer, or gm.
+   * Read-only diagnosis of a task's recovery budget. Readable by the task holder, its reviewer, or owner.
    * Secret-free: no upstream bodies, no credentials, no aliases beyond what the ledger already stored.
    */
   async faultStatus(credential: Credential, input: { taskId: TaskId }): Promise<FaultStatusView> {
@@ -3933,21 +3933,21 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const holds = row.current_employee === actor.employeeId && ['doing', 'review', 'blocked'].includes(row.state ?? '') &&
       (row.lease_expires_at ?? 0) > Date.now() / 1000;
     const reviews = actor.role === row.reviewer_role;
-    if (actor.role !== 'gm' && !holds && !reviews) {
-      throw new CompanyError('forbidden', 'Fault status is read by the task holder, its reviewer, or gm');
+    if (actor.role !== 'owner' && !holds && !reviews) {
+      throw new CompanyError('forbidden', 'Fault status is read by the task holder, its reviewer, or owner');
     }
     return this.faultStatusOf(input.taskId);
   }
 
   /**
-   * gm only: lift a spent (or stopped) recovery budget for one incident of a task. Resets the existing scope so
+   * owner only: lift a spent (or stopped) recovery budget for one incident of a task. Resets the existing scope so
    * the next attempt starts a fresh recovery window. Audited. Creates no new budget and never invents an incident.
    */
   async faultLift(credential: Credential, input: {
     taskId: TaskId; incident: string; reason: string; idempotencyKey: string;
   }): Promise<FaultStatusView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may lift a spent recovery budget');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may lift a spent recovery budget');
     requireText(input.reason, 'reason', 4, 2000);
     requireText(input.incident, 'incident', 1, 500);
     requireText(input.idempotencyKey, 'idempotencyKey', 1, 200);
@@ -3965,7 +3965,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const unspent = await this.unspentCredentials(input.taskId, input.incident);
     if (unspent.length > 0) {
       const spent = await this.faults.spendCredentials({
-        taskId: input.taskId, incident: input.incident, now, limits: this.faultLimits, via: 'gm', credentials: unspent,
+        taskId: input.taskId, incident: input.incident, now, limits: this.faultLimits, via: 'owner', credentials: unspent,
       });
       if (!spent) throw new CompanyError('conflict', `incident ${input.incident} was lifted by a concurrent call; read the fault status before retrying`);
     } else {
@@ -4114,7 +4114,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       const task = await this.db.select<{ reviewer_role?: string }>(id('task', taskId));
       if (task?.reviewer_role === actor.role) reviewer = true;
     }
-    if (actor.role !== 'gm' && !reviewer) rows = rows.filter(row => asId(row.employee) === actor.employeeId);
+    if (actor.role !== 'owner' && !reviewer) rows = rows.filter(row => asId(row.employee) === actor.employeeId);
     // H6：读状态也把超时的 inFlight 推进为 stopped(unknown_outcome)，QA 看到的是终态而不是永久 busy。
     const refreshed: RecoveryReadGrantDbRow[] = [];
     for (const row of rows) {
@@ -4130,10 +4130,10 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return views;
   }
 
-  /** gm + manage；源任务保持 done；issuer ≠ grantee；四条精确路径、固定别名、1–30 分钟 TTL。 */
+  /** owner + manage；源任务保持 done；issuer ≠ grantee；四条精确路径、固定别名、1–30 分钟 TTL。 */
   async recoveryReadGrant(credential: Credential, input: RecoveryReadGrantInput): Promise<RecoveryReadStatusView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may issue a recovery read grant');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may issue a recovery read grant');
     requireText(input.taskId, 'task', 1, 200);
     requireText(input.employeeId, 'employee', 1, 120);
     requireText(input.authorizationTask, 'authorizationTask', 1, 200);
@@ -4251,7 +4251,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   async recoveryReadGrantRevoke(credential: Credential, input: { grantId: string; reason: string; idempotencyKey: string }): Promise<RecoveryReadStatusView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may revoke a recovery read grant');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may revoke a recovery read grant');
     requireText(input.reason, 'reason', 4, 2000);
     requireText(input.idempotencyKey, 'idempotencyKey', 1, 200);
     const grantId = this.recoveryKey(input.grantId);
@@ -4675,22 +4675,22 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * GM: run ownership reclaim (or dry-run) across registered repos. Uses the same lock and audit path as the dispatcher sweep.
-   * Order: the credential, then the arguments (parseReclaimInput, SYS01 D3), then the gm role. The arguments come before the role,
+   * owner: run ownership reclaim (or dry-run) across registered repos. Uses the same lock and audit path as the dispatcher sweep.
+   * Order: the credential, then the arguments (parseReclaimInput, SYS01 D3), then the owner role. The arguments come before the role,
    * as on MCP and the sidecar, so a malformed call gets the same invalid refusal from any caller. A bad argument never reaches
    * reclaimAll, so no tree is touched.
    */
   async reclaimWorktrees(credential: Credential, input?: { dryRun?: boolean; repos?: string[] }) {
     const actor = await this.authorized(credential);
     const params = parseReclaimInput(input);
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Worktree reclaim requires gm');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Worktree reclaim requires owner');
     if (!this.worktrees) return { scanId: '', removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 };
     return this.worktrees.reclaimAll({ trigger: params.dryRun ? 'dry_run' : 'manual', dryRun: params.dryRun, repos: params.repos });
   }
 
   async listWorktreeAudits(credential: Credential, limit = 100) {
     const actor = await this.authorized(credential);
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Worktree audit query requires gm');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Worktree audit query requires owner');
     return this.worktrees?.listAudits(limit) ?? [];
   }
 
@@ -4725,7 +4725,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   async verifyStandby(credential: Credential, input: { items: Array<{ taskId: string; employeeId: string; executionWindow?: import('./task-recovery.ts').ExecutionWindow }>; idempotencyKey: string }):
   Promise<{ items: Array<{ taskId: string; employeeId: string; ok: boolean; code?: string; message?: string }>; note: string; protocol: string }> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'verify_standby requires gm');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'verify_standby requires owner');
     if (!Array.isArray(input.items) || input.items.length === 0 || input.items.length > 20)
       throw new CompanyError('invalid', 'items must list 1..20 {taskId, employeeId} pairs');
     for (const item of input.items) {
@@ -4734,7 +4734,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     }
     if (typeof input.idempotencyKey !== 'string' || input.idempotencyKey.length < 4 || input.idempotencyKey.length > 200)
       throw new CompanyError('invalid', 'Invalid idempotencyKey');
-    // R4（复验）：幂等键真参与幂等——同一（经理，键）重放返回已记录结果且不再写重复审计；
+    // R4（复验）：幂等键真参与幂等——同一（老板，键）重放返回已记录结果且不再写重复审计；
     // 同键不同 items 视为键复用冲突（与任务写路径的 replay 语义一致）。
     const marker = id('company_meta', `verify_standby_${HASH(`${actor.employeeId}\0verify_standby\0${input.idempotencyKey}`).slice(0, 24)}`);
     const payloadDigest = HASH(JSON.stringify({ items: input.items }));
@@ -4800,7 +4800,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const contrib = await readContributionView(this.db, taskId);
     // 执行相位的回避与 claimLease 同源：作者级 excluded 只挡复核相位；执行相位靠实现人绑定与独立性闸门。
     if (task.executor_role === 'engineering') {
-      if (contrib.facts.ambiguous) return deny('implementer_unresolved', '实现人未定，需经理接管');
+      if (contrib.facts.ambiguous) return deny('implementer_unresolved', '实现人未定，需老板接管');
       if (contrib.facts.implementer && contrib.facts.implementer !== employeeId) return deny('bound_to_another_implementer', '任务已绑定其他实现人');
     }
     // 依赖预检（R2，复验）：与 resume 事务同一解析与未满足判定，verify_standby 不再对依赖未满足返回 ok。
@@ -4848,9 +4848,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   private async resumeRecord(credential: Credential, taskId: TaskId, evidence: Evidence,
     options: { businessScope?: boolean; standbyEmployee?: string } = {}): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm can resume');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner can resume');
     requireText(evidence.text, 'evidence', 20, 30000);
-    // SYS03 AC02/AC05（QA V4）：处置驱动的 resume 由业务键标识，而不是由「谁发的」标识。换一位经理接手同
+    // SYS03 AC02/AC05（QA V4）：处置驱动的 resume 由业务键标识，而不是由「谁发的」标识。换一位老板接手同
     // 一个 episode 重放时，幂等身份必须与发起人无关，否则这里查不到记录、又会拿旧版本去撞任务版本 CAS 而卡住。
     const idem = options.businessScope
       ? this.businessIdemId('resume', evidence.idempotencyKey)
@@ -4936,7 +4936,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         LET $who = SELECT * FROM ONLY $actor;
         LET $t = SELECT * FROM ONLY $task;
         LET $now = time::unix(time::now());
-        IF $who.revoked = true OR $who.role != 'gm' OR $t = NONE OR $t.state != 'blocked' { THROW 'resume denied' };
+        IF $who.revoked = true OR $who.role != 'owner' OR $t = NONE OR $t.state != 'blocked' { THROW 'resume denied' };
         IF $t.version != $expected_version { THROW 'task version moved' };
         IF $t.recovery_stopped = true AND !$new_window { THROW 'automatic recovery stopped' };
         IF $t.wait_state = 'waiting' { THROW 'task is waiting: cancel or resolve the wait first' };
@@ -5122,7 +5122,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * gm only: re-point a gm block at the dependency graph. Execute blocks keep their old
+   * owner only: re-point a owner block at the dependency graph. Execute blocks keep their old
    * behaviour (wait blocked, restore ready). A normal non-owner review block — one backed
    * by a real submit and a reviewer block in the audit stream — may also be deferred: the
    * original submission, submitter, implementer and contributor facts stay untouched, and
@@ -5137,7 +5137,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   private async deferTaskUntilRecord(credential: Credential, input: DeferTaskUntil,
     options: { businessScope?: boolean } = {}): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may defer blocked tasks');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may defer blocked tasks');
     requireText(input.taskId, 'task', 1, 200);
     requireText(input.text, 'text', 20, 8000);
     requireText(input.idempotencyKey, 'idempotencyKey', 1, 200);
@@ -5171,7 +5171,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     // Fast-fail with a readable reason plus the audit snapshot; the transaction re-checks
     // every guard atomically, so a stale pre-read can never turn into a wrong write.
     type DeferredRow = {
-      state: TaskState; blocked_to?: 'gm' | 'owner'; resume_state?: TaskState; resume_role?: string;
+      state: TaskState; blocked_to?: 'owner'; resume_state?: TaskState; resume_role?: string;
       submitted_by?: string; reviewer_role: ReviewerRole; current_employee?: string;
       lease_expires_at?: number; version: number; dependencies?: RecordId[]; goal?: RecordId; goal_state?: string; execution_window?: unknown;
     };
@@ -5180,8 +5180,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       'SELECT state, blocked_to, resume_state, resume_role, submitted_by, reviewer_role, current_employee, lease_expires_at, version, dependencies, goal, goal.state AS goal_state, execution_window FROM ONLY $task;',
       { task: taskRef });
     if (!before) throw new CompanyError('not_found', 'Task not found');
-    if (before.state !== 'blocked' || before.blocked_to !== 'gm' || !['doing', 'ready', 'review'].includes(before.resume_state ?? '')) {
-      throw new CompanyError('invalid', 'defer only applies to gm-blocked execute or normal review-phase tasks');
+    if (before.state !== 'blocked' || before.blocked_to !== 'owner' || !['doing', 'ready', 'review'].includes(before.resume_state ?? '')) {
+      throw new CompanyError('invalid', 'defer only applies to owner-blocked execute or normal review-phase tasks');
     }
     const phase = before.resume_state ?? 'ready';
     if (phase === 'review') await this.requireProvableReviewWait(taskRef, before);
@@ -5222,8 +5222,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const row = await this.txTask(`BEGIN;
       LET $who = SELECT * FROM ONLY $actor;
       LET $t = SELECT * FROM ONLY $task;
-      IF $who = NONE OR $who.revoked = true OR $who.role != 'gm' OR $t = NONE { THROW 'defer denied' };
-      IF $t.state != 'blocked' OR $t.blocked_to != 'gm' OR $t.resume_state NOT IN ['doing', 'ready', 'review'] { THROW 'defer denied: only gm-blocked execute or normal review-phase tasks can wait on dependencies' };
+      IF $who = NONE OR $who.revoked = true OR $who.role != 'owner' OR $t = NONE { THROW 'defer denied' };
+      IF $t.state != 'blocked' OR $t.blocked_to != 'owner' OR $t.resume_state NOT IN ['doing', 'ready', 'review'] { THROW 'defer denied: only owner-blocked execute or normal review-phase tasks can wait on dependencies' };
       IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'defer denied: the task still holds an active lease' };
       IF $t.resume_state = 'review' {
         IF $t.reviewer_role = 'owner' OR $t.submitted_by = NONE { THROW 'defer denied: review block is not an ordinary submitted review' };
@@ -5267,7 +5267,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       LET $next = UPDATE ONLY $task SET
         dependencies = $merged,
         state = IF array::len($remaining) = 0 AND !$manager THEN $restore_phase ELSE 'blocked' END,
-        blocked_to = IF array::len($remaining) = 0 AND $manager THEN 'gm' ELSE NONE END,
+        blocked_to = IF array::len($remaining) = 0 AND $manager THEN 'owner' ELSE NONE END,
         dependency_continuation = IF array::len($remaining) > 0 THEN $continuation ELSE NONE END,
         resume_state = $next_resume_state,
         resume_role = NONE,
@@ -5298,15 +5298,15 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * gm only: append real prerequisites to an existing execute-phase dependency wait. Two wait shapes
+   * owner only: append real prerequisites to an existing execute-phase dependency wait. Two wait shapes
    * qualify. A formal wait carries the SYS05 markers and a matching open task_wait row (resume phase
    * ready). A legacy wait is what defer_task_until leaves behind: the same blocked shape with no
    * wait row at all, resume phase ready or doing, a real deferred audit and at least one unmet
    * dependency — the transaction then atomically builds the canonical wait row so the ordinary
-   * release path can return the task to GM. Neither shape may be a review/owner/gm block, and a
+   * release path can return the task to owner. Neither shape may be a review/owner/owner block, and a
    * live lease refuses. The existing wait reference and every existing dependency stay untouched;
    * only new same-goal task ids are appended and dependency_continuation becomes 'manager', so a
-   * completed wait returns to GM instead of resuming an employee. Nothing is resumed here: faults,
+   * completed wait returns to 老板 instead of resuming an employee. Nothing is resumed here: faults,
    * budgets and ordinary dispatch are not touched, and an expired execution window is still checked
    * by the later resume.
    */
@@ -5316,7 +5316,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   private async appendDependencyPrerequisitesRecord(credential: Credential, input: AppendDependencyPrerequisites): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may append dependency prerequisites');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may append dependency prerequisites');
     requireText(input.taskId, 'task', 1, 200);
     requireText(input.text, 'text', 20, 8000);
     requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
@@ -5335,7 +5335,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
     const taskRef = id('task', input.taskId);
     type WaitTaskRow = {
-      state: TaskState; blocked_to?: 'gm' | 'owner'; resume_state?: TaskState; reviewer_role: ReviewerRole;
+      state: TaskState; blocked_to?: 'owner'; resume_state?: TaskState; reviewer_role: ReviewerRole;
       current_employee?: string; lease_expires_at?: number; version: number; dependencies?: RecordId[];
       goal?: RecordId; goal_state?: string; wait_state?: 'waiting' | null; wait_kind?: string | null;
       wait_episode?: string | null; wait_owner_role?: string | null; execution_window?: unknown;
@@ -5346,7 +5346,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         execution_window FROM ONLY $task;`, { task: taskRef });
     if (!before) throw new CompanyError('not_found', 'Task not found');
     if (before.state !== 'blocked' || before.blocked_to !== undefined) {
-      throw new CompanyError('invalid', 'append only applies to a blocked formal dependency wait; gm blocks use defer_task_until');
+      throw new CompanyError('invalid', 'append only applies to a blocked formal dependency wait; owner blocks use defer_task_until');
     }
     if (before.resume_state === 'review') {
       throw new CompanyError('invalid', 'append only applies to execute-phase dependency waits; a review wait keeps its reviewer');
@@ -5362,12 +5362,12 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const formalWait = before.wait_state === 'waiting' && before.wait_kind === 'dependency' && !!openWait &&
       openWait.wait_key === before.wait_episode && openWait.kind === 'dependency' && !!openWait.reference_task;
     if (!formalWait) {
-      if (openWait) throw new CompanyError('invalid', 'append only applies to a blocked formal dependency wait; gm blocks use defer_task_until');
+      if (openWait) throw new CompanyError('invalid', 'append only applies to a blocked formal dependency wait; owner blocks use defer_task_until');
       if (before.wait_state === 'waiting' && before.wait_kind === 'dependency') {
         throw new CompanyError('invalid', 'The open dependency wait record is missing or no longer matches the task');
       }
       if (!['ready', 'doing'].includes(before.resume_state ?? '')) {
-        throw new CompanyError('invalid', 'append only applies to a blocked formal dependency wait; gm blocks use defer_task_until');
+        throw new CompanyError('invalid', 'append only applies to a blocked formal dependency wait; owner blocks use defer_task_until');
       }
     }
     if (formalWait && before.resume_state !== 'ready') {
@@ -5422,7 +5422,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const row = await this.txTask(`BEGIN;
       LET $who = SELECT * FROM ONLY $actor;
       LET $t = SELECT * FROM ONLY $task;
-      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'gm' { THROW 'append denied' };
+      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'append denied' };
       IF $t = NONE { THROW 'task not found' };
       IF $t.state != 'blocked' OR $t.blocked_to != NONE { THROW 'append denied: only a formal dependency wait' };
       IF $t.resume_state = 'review' { THROW 'append denied: only execute-phase dependency waits; a review wait keeps its reviewer' };
@@ -5505,13 +5505,13 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       epoch_seen: epochSeen, idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
       legacy_key: legacyKey, legacy_wait: id('task_wait', legacyKey),
       legacy_source: { kind: 'dependency' },
-      legacy_reason: '受控追加兼容：任务处于 defer_task_until 产生的存量执行依赖等待（无等待实体）；本工具在同一受控事务中补建规范 dependency 等待并设置经理续接，完成前任务保持 blocked。',
+      legacy_reason: '受控追加兼容：任务处于 defer_task_until 产生的存量执行依赖等待（无等待实体）；本工具在同一受控事务中补建规范 dependency 等待并设置老板续接，完成前任务保持 blocked。',
     });
     return view(row);
   }
 
   /**
-   * gm/product only: retire a task to the terminal 'void' state. Duplicate or obsolete work
+   * owner/product only: retire a task to the terminal 'void' state. Duplicate or obsolete work
    * (e.g. two managers decomposing the same goal into parallel chains) stops occupying the
    * graph: any live lease is released, the holder's active_task clears, and blocked
    * dependents re-evaluate with 'void' counted as satisfied, so a chain waiting only on the
@@ -5525,7 +5525,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   private async retireTaskRecord(credential: Credential, input: RetireTask,
     options: { businessScope?: boolean } = {}): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
-    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Only gm or product may retire tasks');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only the owner may retire tasks');
     requireText(input.taskId, 'task', 1, 200);
     requireText(input.text, 'text', 4, 8000);
     requireText(input.idempotencyKey, 'idempotencyKey', 1, 200);
@@ -5572,7 +5572,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       row = await this.txTask(`BEGIN;
       LET $who = SELECT * FROM ONLY $actor;
       LET $t = SELECT * FROM ONLY $task;
-      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role NOT IN ['gm', 'product'] { THROW 'retire denied' };
+      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'retire denied' };
       IF $t = NONE { THROW 'task not found' };
       IF $t.state IN ['done', 'void'] { THROW 'task already terminal' };
       IF $expected != NONE AND $t.version != $expected { THROW 'task version moved' };
@@ -5618,8 +5618,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return task;
   }
 
-  // ------------------------------------------------------------------ SYS03 经理处置账本
-  // 经理对一个 blocking episode 的处置走这一组方法：先认领（episode 唯一、租约、版本），再带 CAS 与全局业务
+  // ------------------------------------------------------------------ SYS03 老板处置账本
+  // 老板对一个 blocking episode 的处置走这一组方法：先认领（episode 唯一、租约、版本），再带 CAS 与全局业务
   // 幂等键决定，最后由持久 outbox 通知当前持有人。授权与既有通道同源：角色与能力仍由本类判定，处置动作本身
   // 复用 resume/defer/retire/create 的既有状态机，不新增任何旁路写权。
 
@@ -5650,7 +5650,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   async claimDisposition(credential: Credential, input: DispositionClaimInput): Promise<DispositionClaimOutcome> {
     const actor = await this.authorized(credential, 'manage');
-    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Manager disposition requires the gm or product role');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Owner disposition requires the owner role');
     await this.requireOpenEpisode(input.taskId, input.phase, input.sinceMs);
     return this.dispositions.claim(actor, input);
   }
@@ -5658,7 +5658,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   async releaseDisposition(credential: Credential,
     input: { taskId: TaskId; phase: DispositionPhase; sinceMs: number; claimToken: string; reason: string }): Promise<DispositionClaimView> {
     const actor = await this.authorized(credential, 'manage');
-    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Manager disposition requires the gm or product role');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Owner disposition requires the owner role');
     return this.dispositions.release(actor, input);
   }
 
@@ -5668,7 +5668,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     // anyone who is a party of the task; only the holder ever receives the claim token.
     const row = await this.db.select<TaskRow>(id('task', input.taskId));
     if (!row) throw new CompanyError('not_found', 'Task not found');
-    const manager = actor.role === 'gm' || actor.role === 'product';
+    const manager = actor.role === 'owner';
     if (!manager && actor.role !== row.executor_role && actor.role !== row.reviewer_role && row.current_employee !== actor.employeeId) {
       throw new CompanyError('forbidden', 'Task access denied');
     }
@@ -5677,14 +5677,14 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   /**
    * A decided episode needs a manager's decision to still be worth a session: the claim's role gate mirrors the action's
-   * own gate (resume/defer/repair are gm work; retire is gm/product work), and the delegated record methods re-check it in
+   * own gate (resume/defer/repair are owner work; retire is owner/product work), and the delegated record methods re-check it in
    * their transactions, so a claim never widens anyone's authority over the task.
    */
   async decideDisposition(credential: Credential, input: DispositionDecideInput): Promise<DispositionDecideOutcome> {
     const actor = await this.authorized(credential, 'manage');
-    const manager = actor.role === 'gm' || actor.role === 'product';
-    if (!manager) throw new CompanyError('forbidden', 'Manager disposition requires the gm or product role');
-    if (input.action !== 'retire' && actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may resume, defer, wait on dependencies or build a repair chain');
+    const manager = actor.role === 'owner';
+    if (!manager) throw new CompanyError('forbidden', 'Owner disposition requires the owner role');
+    if (input.action !== 'retire' && actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may resume, defer, wait on dependencies or build a repair chain');
     return this.dispositions.decide(actor, input, this.dispositionApplier(credential));
   }
 
@@ -5720,18 +5720,18 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       if (!prerequisite) throw new CompanyError('forbidden', 'Cancelling a CI run requires manager capability or the task the run belongs to');
       const task = await this.db.select<TaskRow>(id('task', prerequisite.taskId));
       if (!task) throw new CompanyError('not_found', 'Prerequisite task not found');
-      // 当事人这一关只对非经理生效。
-      if (actor.role !== 'gm' && actor.role !== 'product') {
+      // 当事人这一关只对非老板生效。
+      if (actor.role !== 'owner') {
         // 当事人只认「这个人跟这条任务有关系」：当前持有人、实现者、提交人。**不再**拿岗位与任务的执行岗/评审岗比对——
         // 那等于让任何一个同岗位员工对仓库里任何一条任务都成为当事人，于是任何 engineering 员工都能取消任意 run（QA V2）。
         const mine = task.current_employee === actor.employeeId || task.implementer === actor.employeeId ||
           task.submitted_by === actor.employeeId;
         if (!mine) throw new CompanyError('forbidden', 'Cancelling this CI run requires being a party of the task it belongs to');
       }
-      // 经理（gm/product）按设计不受 run↔任务绑定约束：他们的取消权本来就是仓库级的应急动作，而记录里仍然有前置任务、
-      // 前置版本与真实员工 ID。绑定核对是对**非经理当事人**的约束——防止任何员工把别人的 run 说成自己任务的 run。
+      // 老板（owner/product）按设计不受 run↔任务绑定约束：他们的取消权本来就是仓库级的应急动作，而记录里仍然有前置任务、
+      // 前置版本与真实员工 ID。绑定核对是对**非老板当事人**的约束——防止任何员工把别人的 run 说成自己任务的 run。
       // 依据照实记成 manager_exempt，不假装核过绑定。
-      if (actor.role === 'gm' || actor.role === 'product') return { binding: 'manager_exempt' as const };
+      if (actor.role === 'owner') return { binding: 'manager_exempt' as const };
       // 绑定核对：run 必须绑定到这条前置任务，head 分支要等于任务登记的树分支。任务没有登记分支时失败关闭——
       // 没有可核对的身份就不能声称这条 run 属于它（QA V2）。
       const branch = task.worktree?.branch;
@@ -5762,26 +5762,26 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   async reconcileCiRuns(credential: Credential, input: { runs: Array<{ repo: string; runId: string }> }) {
-    // AC03/QA D6：对账是**写**账本的动作（它为带外变更建 unknown_actor 行），所以它和事后归因一样是经理的判断：
+    // AC03/QA D6：对账是**写**账本的动作（它为带外变更建 unknown_actor 行），所以它和事后归因一样是老板的判断：
     // 普通员工不得用它往账本里写行。只读的那一面是 list_external_actions，不受影响。
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm' && actor.role !== 'product') {
-      throw new CompanyError('forbidden', 'Reconciling external actions requires the gm or product role');
+    if (actor.role !== 'owner') {
+      throw new CompanyError('forbidden', 'Reconciling external actions requires the owner or product role');
     }
     if (!Array.isArray(input.runs) || input.runs.length === 0 || input.runs.length > 50) throw new CompanyError('invalid', 'runs must hold 1-50 entries');
     return this.dispositions.reconcileExternalActions(actor, input, this.externalActionGateway());
   }
 
   async attributeCiRun(credential: Credential, input: { actionKey: string; employeeId: string; evidence: string }): Promise<ExternalActionView> {
-    // Attribution is a manager judgement on a real person's record: gm only, and never a fabricated internal owner.
+    // Attribution is a manager judgement on a real person's record: owner only, and never a fabricated internal owner.
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Attributing an out-of-band external action requires gm');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Attributing an out-of-band external action requires owner');
     return this.dispositions.attributeExternalAction(actor, input);
   }
 
   async listExternalActions(credential: Credential, input?: { actionKey?: string; state?: string; limit?: number }): Promise<ExternalActionView[]> {
     const actor = await this.authorized(credential);
-    if (actor.role !== 'gm' && actor.role !== 'product') {
+    if (actor.role !== 'owner') {
       // A non-manager sees only the actions it requested itself, never other employees' records.
       const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
         'SELECT * FROM external_action WHERE requested_by = $me ORDER BY created_at DESC LIMIT $limit;',
@@ -5837,12 +5837,12 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
           idempotencyKey: `disposition-repair:${repairKey}`,
         }, { repairKey });
         // 原任务在本决定里换一种等待：门禁解除，改为等修复链。这样原 episode 真的结束了——旧版（不认识处置账本）
-        // 读到的也是一个"等待中"的任务，而不是一个还在门禁里的任务，回滚后不会再为它拉起经理（RB01）。
-        // 只有仍挂在 gm 门禁上的原任务能这样改（defer 的既有前置条件）；owner 门禁、review 门禁或已终态的任务保持原样，
+        // 读到的也是一个"等待中"的任务，而不是一个还在门禁里的任务，回滚后不会再为它拉起老板（RB01）。
+        // 只有仍挂在 owner 门禁上的原任务能这样改（defer 的既有前置条件）；owner 门禁、review 门禁或已终态的任务保持原样，
         // 决定结果如实记下它当时的状态，绝不假装改过。
         const [source] = await this.db.query<[{ state?: string; blocked_to?: string; version?: number } | undefined]>(
           'SELECT state, blocked_to, version FROM ONLY $t;', { t: id('task', taskId) });
-        if (source?.state === 'blocked' && source.blocked_to === 'gm') {
+        if (source?.state === 'blocked' && source.blocked_to === 'owner') {
           const deferred = await this.deferTaskUntilRecord(credential, {
             taskId,
             dependencies: [created.id],
@@ -5864,15 +5864,15 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    */
   async goalAcceptancePreview(credential: Credential, input: GoalAcceptancePreview): Promise<GoalAcceptanceView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may review goal acceptance references');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may review goal acceptance references');
     requireText(input.goalId, 'goal', 1, 100);
     if (input.candidateTaskId !== undefined) requireText(input.candidateTaskId, 'candidateTaskId', 1, 200);
     return (await this.goalAcceptanceState(input.goalId, input.candidateTaskId)).view;
   }
 
   /**
-   * gm only (manage): repoints a quick/software goal's manual/acceptance references and anchors from an
-   * erroneously voided acceptance task to a blocked product→gm candidate that waits on all unfinished goal
+   * owner only (manage): repoints a quick/software goal's manual/acceptance references and anchors from an
+   * erroneously voided acceptance task to a blocked product→owner candidate that waits on all unfinished goal
    * work. Every basis the preview checks is re-verified inside one compare-and-set transaction (goal refs and
    * anchors, the void task, the candidate's version and state, the unfinished-work set), and the write lands
    * with audit, outbox and the idempotency row. The voided task keeps its state and history. The repair never
@@ -5880,7 +5880,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    */
   async goalAcceptanceRepair(credential: Credential, input: GoalAcceptanceRepair): Promise<GoalAcceptanceResult> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may repair goal acceptance references');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may repair goal acceptance references');
     requireText(input.goalId, 'goal', 1, 100);
     requireText(input.expectedOldTaskId, 'expectedOldTaskId', 1, 200);
     requireText(input.candidateTaskId, 'candidateTaskId', 1, 200);
@@ -5920,7 +5920,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     try {
       await this.txTask<GoalAcceptanceResult>(`BEGIN;
         LET $who = SELECT * FROM ONLY $actor;
-        IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'gm' { THROW 'actor revoked or forbidden' };
+        IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'actor revoked or forbidden' };
         LET $g = SELECT * FROM ONLY $goal;
         IF $g = NONE { THROW 'goal acceptance moved: goal not found' };
         IF $g.state != 'active' { THROW 'goal acceptance moved: goal is not active' };
@@ -5957,7 +5957,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   private async requireGoalManager(credential: Credential): Promise<{ employeeId: string }> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', '只有经理（gm）可以读写目标终验图与成果证据');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', '只有老板可以读写目标终验图与成果证据');
     return actor;
   }
 
@@ -6213,7 +6213,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * 只读，写任何东西之前先把事实查清楚——迁移现有冲突配置时先列事实与候选，不自动决定优先级。
    */
   private async validatePolicyProposal(actor: Principal, input: PolicyPlanInput): Promise<{ chain: PolicyScopeLink[]; rows: PolicyRow[]; epoch: number; version: number; target?: PolicyRow }> {
-    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Only a manager may write a machine policy');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only the owner may write a machine policy');
     requireText(input.policyId, 'policyId', 3, 60);
     if (!POLICY_ID_PATTERN.test(input.policyId)) throw new CompanyError('invalid', 'policyId must be lowercase letters, digits, hyphen or underscore');
     if (!POLICY_SCOPES.includes(input.scope)) throw new CompanyError('invalid', `unknown policy scope: ${input.scope}`);
@@ -6237,7 +6237,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (domain !== input.domain) throw new CompanyError('invalid', `payload kind ${domain} does not match domain ${input.domain}`);
     if (!POLICY_SOURCES.includes(input.source)) throw new CompanyError('invalid', `unknown authorization source: ${input.source}`);
     if (input.source === 'owner') {
-      if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may transcribe an owner direction into a policy');
+      if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may transcribe an owner direction into a policy');
       requireText(input.ownerQuote ?? '', 'ownerQuote', 2, 4000);
       const [matched] = await this.db.query<[Array<{ id: RecordId }>]>(
         'SELECT id FROM direction WHERE string::contains(text, $quote) LIMIT 1;', { quote: input.ownerQuote });
@@ -6344,7 +6344,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     try {
       const row = await this.txTask<PolicyDbRow>(`BEGIN;
         LET $who = SELECT * FROM ONLY $actor;
-        IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role NOT IN ['gm', 'product'] { THROW 'policy denied: actor revoked or forbidden' };
+        IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'policy denied: actor revoked or forbidden' };
         LET $epoch = (SELECT VALUE value FROM ONLY company_meta:policy_epoch) ?? 0;
         IF $epoch != $expected_epoch { THROW 'policy moved: the effective policy epoch moved since the proposal was read' };${supersedeGuard}
         LET $competing = SELECT VALUE id FROM policy WHERE domain = $domain AND scope = $scope
@@ -6376,7 +6376,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    */
   async policyRevoke(credential: Credential, input: PolicyRevoke): Promise<PolicyView> {
     const actor = await this.authorized(credential, 'manage');
-    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Only a manager may revoke a machine policy');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only the owner may revoke a machine policy');
     requireText(input.policyId, 'policyId', 1, 200);
     requireText(input.reason, 'reason', 2, 4000);
     const idem = this.idemId(actor.employeeId, 'policy_revoke', input.idempotencyKey);
@@ -6390,7 +6390,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     try {
       const row = await this.txTask<PolicyDbRow>(`BEGIN;
         LET $who = SELECT * FROM ONLY $actor;
-        IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role NOT IN ['gm', 'product'] { THROW 'policy denied: actor revoked or forbidden' };
+        IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'policy denied: actor revoked or forbidden' };
         LET $t = SELECT * FROM ONLY $policy;
         IF $t = NONE { THROW 'policy not found' };
         IF $t.status != 'active' OR $t.superseded_by != NONE { THROW 'policy moved: not the active version' };
@@ -6423,7 +6423,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   /** 策略版本列表：默认只给当前有效（含各作用域链上生效的）版本；includeInactive 时连历史一起给。 */
   async policyList(credential: Credential, input: PolicyListInput): Promise<PolicyView[]> {
     const actor = await this.authorized(credential, 'manage');
-    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Only a manager may read machine policies');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only the owner may read machine policies');
     const clauses: string[] = [];
     const vars: Record<string, unknown> = {};
     if (input.scope !== undefined) { clauses.push('scope = $scope'); vars.scope = input.scope; }
@@ -6442,14 +6442,14 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (input.taskId !== undefined) {
       const row = await this.db.select<TaskRow>(id('task', input.taskId));
       if (!row) throw new CompanyError('not_found', 'Task not found');
-      if (actor.role !== row.executor_role && actor.role !== row.reviewer_role && !['gm', 'product', 'qa', 'eval'].includes(actor.role)) {
+      if (actor.role !== row.executor_role && actor.role !== row.reviewer_role && !['owner', 'qa', 'eval'].includes(actor.role)) {
         throw new CompanyError('forbidden', 'Task policy access denied');
       }
       chain = this.chainOfRow(row);
     } else if (input.scopeChain !== undefined) {
       chain = input.scopeChain.map(link => ({ scope: link.scope, ...(link.scopeRef !== undefined ? { scopeRef: link.scopeRef } : {}) }));
     } else {
-      if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Only a manager may read a scope policy view');
+      if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only the owner may read a scope policy view');
       if (input.goal !== undefined && !(await this.db.select(id('goal', input.goal)))) throw new CompanyError('not_found', 'Goal not found');
       if (input.project !== undefined && !(await this.projects.get(input.project))) throw new CompanyError('not_found', 'Project not found');
       chain = this.policyChain({ goalId: input.goal, projectId: input.project, includeTask: false });
@@ -6564,13 +6564,13 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * 执行隔离（RB01）：把已经不再被有效契约授权的在办任务置为可见的 blocked（等待 GM）并释放租约。
-   * 这条路径是刻意选的：blocked+blocked_to=gm 是旧 release 也认得的隔离状态，回滚到旧版时它们不会被误派工，
+   * 执行隔离（RB01）：把已经不再被有效契约授权的在办任务置为可见的 blocked（等待老板）并释放租约。
+   * 这条路径是刻意选的：blocked+blocked_to=owner 是旧 release 也认得的隔离状态，回滚到旧版时它们不会被误派工，
    * 而只写新字段（旧版会忽略）会留下"旧版照派、新版拒领"的窗口。
    */
   async policyEnforce(credential: Credential, input: PolicyEnforceInput): Promise<PolicyEnforceView> {
     const actor = await this.authorized(credential, 'manage');
-    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Only a manager may enforce a policy change');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only the owner may enforce a policy change');
     requireText(input.reason, 'reason', 2, 4000);
     if (!input.taskIds?.length) throw new CompanyError('invalid', 'policyEnforce needs the task ids it should isolate (from policy_plan)');
     if (input.taskIds.length > 200) throw new CompanyError('invalid', 'policyEnforce is limited to 200 tasks per call');
@@ -6602,7 +6602,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
           IF $t = NONE { THROW 'policy invalid: task not found' };
           IF $t.state IN ['done', 'void'] { THROW 'policy invalid: task is closed' };
           LET $next = UPDATE ONLY $task SET
-            state = 'blocked', blocked_to = 'gm', resume_state = IF $t.state IN ['ready','doing','review'] THEN $t.state ELSE $t.resume_state END,
+            state = 'blocked', blocked_to = 'owner', resume_state = IF $t.state IN ['ready','doing','review'] THEN $t.state ELSE $t.resume_state END,
             resume_role = IF $t.state IN ['ready','doing','review'] THEN (IF $t.state = 'review' THEN $t.reviewer_role ELSE $t.executor_role END) ELSE $t.resume_role END,
             policy_block_reason = $reason, current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
             version = $t.version + 1
@@ -6816,7 +6816,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * gm only (manage): records the code implementer of an engineering task whose bound implementer cannot continue
+   * owner only (manage): records the code implementer of an engineering task whose bound implementer cannot continue
    * (withdrawn, departed, durable quota or runtime failure). The task must be in execute phase: ready or doing, or blocked
    * with an execute resume state. A block raised in review resumes in review, so it is refused like any review-phase task. One compare-and-set
    * transaction re-checks every basis: the task version, the new implementer's role, execute capability and track,
@@ -6828,7 +6828,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    */
   async implementerTakeover(credential: Credential, input: ImplementerTakeover): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may take over a task implementer');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may take over a task implementer');
     requireText(input.taskId, 'taskId', 1, 200);
     requireText(input.toEmployee, 'toEmployee', 1, 200);
     requireText(input.reason, 'reason', 8, 2000);
@@ -6860,7 +6860,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const query = `BEGIN;
       LET $now = time::unix(time::now());
       LET $who = SELECT * FROM ONLY $actor;
-      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'gm' { THROW 'actor revoked or forbidden' };
+      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'actor revoked or forbidden' };
       LET $t = SELECT * FROM ONLY $task;
       IF $t = NONE { THROW 'implementer takeover invalid: task not found' };
       IF $t.version != $expected { THROW 'implementer takeover moved: task version changed' };
@@ -7070,11 +7070,11 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       if (!candidate.goal || asId(candidate.goal) !== goalId) deny('invalid', 'candidate belongs to another goal');
       if ((candidate.project ? asId(candidate.project) : undefined) !== project) deny('invalid', 'candidate project must match the goal project');
       if ((candidate.kind ?? 'task') !== 'task') deny('invalid', 'candidate must be kind task');
-      if (candidate.executor_role !== 'product' || candidate.reviewer_role !== 'gm') {
-        deny('invalid', 'candidate must be executed by product and reviewed by gm');
+      if (candidate.executor_role !== 'product' || candidate.reviewer_role !== 'owner') {
+        deny('invalid', 'candidate must be executed by product and reviewed by owner');
       }
       if (candidate.state !== 'blocked') deny('conflict', `candidate must be blocked, found ${candidate.state}`);
-      if (candidate.blocked_to) deny('conflict', 'candidate is blocked to gm or owner');
+      if (candidate.blocked_to) deny('conflict', 'candidate is blocked to owner');
       if (candidate.submitted_by) deny('conflict', 'candidate already has a submission');
       if (isLeased(candidate)) deny('conflict', 'candidate holds an active lease');
       if (candidateDeps.includes(candidateTaskId)) deny('invalid', 'candidate must not depend on itself');
@@ -7131,7 +7131,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * gm only: rebind a blocked task to a registered project (task-level override over goal.project).
+   * owner only: rebind a blocked task to a registered project (task-level override over goal.project).
    * The controlled unblock path for tasks stuck on the wrong repo: version-guarded, idempotent,
    * fully audited. Only stopped, un-leased, never-submitted blocked tasks qualify; owner-blocked
    * tasks are refused so a rebind can never bypass an owner gate. The stale worktree assignment
@@ -7145,7 +7145,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   private async taskProjectUpdateRecord(credential: Credential, input: { taskId: TaskId; project: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may rebind task projects');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may rebind task projects');
     requireText(input.taskId, 'task', 1, 200);
     requireText(input.project, 'project', 1, 60);
     requireText(input.text, 'evidence', 4, 4000);
@@ -7189,7 +7189,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * gm only: turn a blocked read-only engineering task into a code task in place (read → code, optional lane), instead of
+   * owner only: turn a blocked read-only engineering task into a code task in place (read → code, optional lane), instead of
    * retiring it and creating a sibling code task. Allowed on the same execute-phase blocks bind_task_code_repo accepts
    * (owner gates, review-phase blocks and live leases refuse); kind=task only, so the release leg stays a read leg.
    * Write authority is re-judged under the task's own policy chain, the implement-leg baseline criteria are merged when
@@ -7197,7 +7197,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    */
   async taskIntentUpdate(credential: Credential, input: { taskId: TaskId; lane?: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may change a task work intent');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may change a task work intent');
     requireText(input.taskId, 'task', 1, 200);
     requireText(input.text, 'evidence', 4, 4000);
     if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
@@ -7258,7 +7258,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * gm only (manage): append the boss's acceptance-requirement amendment to an in-flight task.
+   * owner only (manage): append the boss's acceptance-requirement amendment to an in-flight task.
    *
    * The amendment is an append-only annotation on a task that is already moving, so it must not disturb the
    * task's machine gates or the holder's lease: state, blocked_to/resume_*, dependencies, acceptance_criteria,
@@ -7285,7 +7285,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    */
   async taskAcceptanceAmend(credential: Credential, input: { taskId: TaskId; expectedVersion: number; ownerQuote: string; text: string; notify?: string[]; idempotencyKey: string }): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may amend a task acceptance requirement');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may amend a task acceptance requirement');
     requireText(input.taskId, 'task', 1, 200);
     requireText(input.ownerQuote, 'ownerQuote', 1, 4000);
     requireText(input.text, 'text', 4, 4000);
@@ -7389,15 +7389,15 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * gm only: bind an explicit code repository (code_repo_path) to a blocked execute-phase task.
+   * owner only: bind an explicit code repository (code_repo_path) to a blocked execute-phase task.
    * Only workspace allocation, worktree registration and dispatch repoHome/cwd follow the
    * binding — the business project (taskProject → claim.json.project, opsScope, broker
    * quotas) is untouched, so a rebind can never smuggle another project's ops access.
    *
    * Allowed targets: the ops repo or a registered project repo_path, canonicalised —
    * symlink escapes, traversal segments and unregistered paths are refused before any write.
-   * Only state=blocked tasks qualify: blocked_to='gm' and the formal dependency wait
-   * (blocked_to=NONE, including defer_task_until's cleared-gm wait) both bind; owner gates
+   * Only state=blocked tasks qualify: blocked_to='owner' and the formal dependency wait
+   * (blocked_to=NONE, including defer_task_until's cleared-owner wait) both bind; owner gates
    * and review-phase blocks are refused, not guessed, as are live leases. The stale worktree
    * assignment clears through the same lifecycle as task_project_update: the ref releases,
    * uncommitted work in the old tree is preserved, and the tree itself is never deleted here.
@@ -7408,7 +7408,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   private async bindTaskCodeRepoRecord(credential: Credential, input: { taskId: TaskId; codeRepoPath: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may bind a task code repo');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may bind a task code repo');
     requireText(input.taskId, 'task', 1, 200);
     requireText(input.codeRepoPath, 'codeRepoPath', 1, 1000);
     requireText(input.text, 'evidence', 4, 4000);
@@ -7471,7 +7471,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    */
   async modelEvidence(credential: Credential, taskId: TaskId): Promise<ModelEvidence[]> {
     const actor = await this.authorized(credential);
-    if (!['eval','gm'].includes(actor.role)) throw new CompanyError('forbidden','Only eval or gm may read model evaluation evidence');
+    if (!['eval','owner'].includes(actor.role)) throw new CompanyError('forbidden','Only eval or owner may read model evaluation evidence');
     if (!await this.db.select(id('task', taskId))) throw new CompanyError('not_found', 'Task not found');
     // The same rows collectEvalState validates against, read alone: the full eval state rebuilt the whole timeline per call.
     const [rows] = await this.db.query<[NonNullable<Parameters<typeof summarizeModelEvidence>[0]>]>(
@@ -7482,7 +7482,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   async taskCost(credential: Credential, taskId: TaskId): Promise<TaskCost | { taskId: TaskId; available: false; reason: string }> {
     const actor = await this.authorized(credential);
-    if (!['eval', 'gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Only eval, gm or product may read task cost');
+    if (!['eval', 'owner'].includes(actor.role)) throw new CompanyError('forbidden', 'Only eval or owner may read task cost');
     requireText(taskId, 'task', 1, 200);
     const row = await this.db.select<TaskRow>(id('task', taskId));
     if (!row) throw new CompanyError('not_found', 'Task not found');
@@ -7518,7 +7518,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   async listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Outbox access denied');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Outbox access denied');
     type Row = { id: RecordId; sequence: number; kind: string; task: RecordId; payload: Record<string, unknown>; at: Date };
     let rows: Row[];
     if (after) {
@@ -7535,8 +7535,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       payload: row.payload, createdAt: String(row.at) }));
   }
   // ---- QA 受限只读取证（SYS-DISP 7454fc89） ----
-  // 一条独立的只读路径：GM 登记 scope，QA 用本人 sck 会话或浏览器受限会话读取 allowlist 内的任务；
-  // 现有 getTask 的 executor/reviewer/gm/eval ACL 不变，scope 的部署任务复核租约一变即失败关闭。
+  // 一条独立的只读路径：老板 登记 scope，QA 用本人 sck 会话或浏览器受限会话读取 allowlist 内的任务；
+  // 现有 getTask 的 executor/reviewer/owner/eval ACL 不变，scope 的部署任务复核租约一变即失败关闭。
 
   /** The named scope, or the QA employee's single active scope. Never another employee's scope. */
   private async qaScopeFor(employeeId: string, scopeId?: string): Promise<QaObservationScopeRow> {
@@ -7603,10 +7603,10 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return { scope, employeeId };
   }
 
-  /** GM (manage): register a time-bounded, task-allowlisted QA read scope on a live QA review lease. */
+  /** 老板 (manage): register a time-bounded, task-allowlisted QA read scope on a live QA review lease. */
   async qaObservationGrant(credential: Credential, input: QaObservationGrant): Promise<QaObservationScopeView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may grant a QA observation scope');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may grant a QA observation scope');
     requireText(input.goalId, 'goalId', 1, 100);
     requireText(input.deploymentTaskId, 'deploymentTaskId', 1, 200);
     requireText(input.qaEmployee, 'qaEmployee', 1, 200);
@@ -7633,7 +7633,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const evidence = `${input.reason}\n[qa_observation_grant] scope=${scopeId} goal=${input.goalId} deployment=${input.deploymentTaskId} qa=${input.qaEmployee} leaseFence=${input.leaseFence} subjects=${subjects.join(',')} expiresAt=${expiresAt}`;
     const query = `BEGIN;
       LET $who = SELECT * FROM ONLY $actor;
-      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'gm' { THROW 'actor revoked or forbidden' };
+      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'actor revoked or forbidden' };
       LET $d = SELECT * FROM ONLY $deploy;
       IF $d = NONE { THROW 'qa observation invalid: deployment task not found' };
       IF $d.state != 'review' OR $d.reviewer_role != 'qa' { THROW 'qa observation invalid: deployment task is not in QA review' };
@@ -7671,10 +7671,10 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     }
   }
 
-  /** GM (manage): revoke a scope with compare-and-set on its version. */
+  /** 老板 (manage): revoke a scope with compare-and-set on its version. */
   async qaObservationRevoke(credential: Credential, input: QaObservationRevoke): Promise<QaObservationScopeView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may revoke a QA observation scope');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may revoke a QA observation scope');
     requireText(input.scopeId, 'scopeId', 1, 200);
     requireText(input.reason, 'reason', 8, 2000);
     requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
@@ -7686,7 +7686,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const evidence = `${input.reason}\n[qa_observation_revoke] scope=${input.scopeId} expectedVersion=${input.expectedVersion}`;
     const query = `BEGIN;
       LET $who = SELECT * FROM ONLY $actor;
-      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'gm' { THROW 'actor revoked or forbidden' };
+      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'actor revoked or forbidden' };
       LET $s = SELECT * FROM ONLY $scope;
       IF $s = NONE { THROW 'qa observation invalid: scope not found' };
       IF $s.version != $expected { THROW 'qa observation moved: scope version changed' };
@@ -7708,14 +7708,14 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     }
   }
 
-  /** GM sees every scope; a QA sees its own. No credentials or session hashes are returned. */
+  /** 老板 sees every scope; a QA sees its own. No credentials or session hashes are returned. */
   async qaObservationStatus(credential: Credential): Promise<QaObservationScopeView[]> {
     const actor = await this.authorized(credential);
-    if (actor.role === 'gm') {
+    if (actor.role === 'owner') {
       const [rows] = await this.db.query<[QaObservationScopeRow[]]>("SELECT * FROM qa_observation_scope ORDER BY created_at DESC LIMIT 50;");
       return (rows ?? []).map(qaScopeView);
     }
-    if (actor.role !== 'qa') throw new CompanyError('forbidden', 'QA observation status is read by gm or qa');
+    if (actor.role !== 'qa') throw new CompanyError('forbidden', 'QA observation status is read by owner or qa');
     const [rows] = await this.db.query<[QaObservationScopeRow[]]>(
       "SELECT * FROM qa_observation_scope WHERE qa_employee = $me ORDER BY created_at DESC LIMIT 20;", { me: actor.employeeId });
     return (rows ?? []).map(qaScopeView);
@@ -7951,38 +7951,38 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   // ---- SYS-INT 评审协同的持久事件唤醒 ----
-  // 只做协调：GM 登记同 goal（源任务, 协同任务）订阅，QA 的真实复核租约与结构化请求触发一次唤醒，正向取证完成并
-  // 撤销请求触发第二次。唤醒只解除协同任务自己的 SYS05 feedback 等待（dispatcher 随后重新派 GM），不生成
+  // 只做协调：老板 登记同 goal（源任务, 协同任务）订阅，QA 的真实复核租约与结构化请求触发一次唤醒，正向取证完成并
+  // 撤销请求触发第二次。唤醒只解除协同任务自己的 SYS05 feedback 等待（dispatcher 随后重新派 owner），不生成
   // qa_observation_scope、不写验收证据、不改源任务租约，也不认识 checkpoint 里的自由文本。
 
-  /** GM (manage): register the one watch of an ordered same-goal task pair; the current source state is delivered at once. */
+  /** 老板 (manage): register the one watch of an ordered same-goal task pair; the current source state is delivered at once. */
   async reviewWatchRegister(credential: Credential, input: ReviewWatchInput): Promise<ReviewWatchView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may register a review watch');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may register a review watch');
     requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
     return this.reviewEvents.register({ ...input, actor: actor.employeeId });
   }
 
-  /** GM (manage): close a watch with compare-and-set; undelivered events are invalidated, never replayed later. */
+  /** 老板 (manage): close a watch with compare-and-set; undelivered events are invalidated, never replayed later. */
   async reviewWatchClose(credential: Credential, input: ReviewWatchCloseInput): Promise<ReviewWatchView> {
     const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may close a review watch');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may close a review watch');
     requireText(input.watchId, 'watchId', 1, 200);
     requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
     if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
     return this.reviewEvents.close({ ...input, actor: actor.employeeId });
   }
 
-  /** Read-only: gm sees every watch, a qa employee only the watches of tasks it reviews. Never returns task text. */
+  /** Read-only: owner sees every watch, a qa employee only the watches of tasks it reviews. Never returns task text. */
   async reviewWatchStatus(credential: Credential, input: ReviewWatchStatusInput = {}): Promise<ReviewWatchView[]> {
     const actor = await this.authorized(credential);
-    if (actor.role !== 'gm' && actor.role !== 'qa') throw new CompanyError('forbidden', 'Review watch status is read by gm or qa');
+    if (actor.role !== 'owner' && actor.role !== 'qa') throw new CompanyError('forbidden', 'Review watch status is read by owner or qa');
     const views = await this.reviewEvents.status({
       ...(input.watchId ? { watchId: input.watchId } : {}),
       ...(input.sourceTaskId ? { sourceTaskId: input.sourceTaskId } : {}),
       ...(input.collaborationTaskId ? { collaborationTaskId: input.collaborationTaskId } : {}),
     });
-    if (actor.role === 'gm') return views;
+    if (actor.role === 'owner') return views;
     // A QA sees only the subscriptions it is currently entitled to act on: the source task is held by it, or the
     // latest structured signal on that source task is its own. Another team's coordination is not its business.
     return views.filter(view => view.source.holder === actor.employeeId || view.signal?.actor === actor.employeeId);
@@ -7997,12 +7997,12 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return this.reviewEvents.signal({ ...input, actor: actor.employeeId });
   }
 
-  /** Read-only signal history: gm sees every signal, a qa employee sees the ones it raised. */
+  /** Read-only signal history: owner sees every signal, a qa employee sees the ones it raised. */
   async reviewScopeSignals(credential: Credential, input: { taskId?: string; limit?: number } = {}): Promise<ReviewSignalView[]> {
     const actor = await this.authorized(credential);
-    if (actor.role !== 'gm' && actor.role !== 'qa') throw new CompanyError('forbidden', 'Review signals are read by gm or qa');
+    if (actor.role !== 'owner' && actor.role !== 'qa') throw new CompanyError('forbidden', 'Review signals are read by owner or qa');
     const signals = await this.reviewEvents.signals(input);
-    return actor.role === 'gm' ? signals : signals.filter(signal => signal.actor === actor.employeeId);
+    return actor.role === 'owner' ? signals : signals.filter(signal => signal.actor === actor.employeeId);
   }
 
   /**

@@ -25,7 +25,7 @@ beforeAll(async () => {
   await db.connect(); await db.bootstrap();
   core = new SurrealCompanyCore(db); owner = new OwnerDesk(db);
   const admin = new LocalEnrollmentAdmin(db);
-  gm = await admin.enroll('reassign-gm', 'gm', ['execute', 'review', 'manage']);
+  gm = await admin.enroll('reassign-gm', 'owner', ['execute', 'review', 'manage']);
   concept = await admin.enroll('reassign-concept', 'concept-design', ['execute', 'review']);
   await new ProjectStore(db.db).upsert({ id: 'novel', name: '故事项目', repoPath: dir, release: 'local', envs: [], disciplines: [{ name: '原著', roles: ['story-author'] }] });
   const [rows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: '长篇', brief: 'fixture', state: 'active', source: 'fixture', note: '', project: project:novel, tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");

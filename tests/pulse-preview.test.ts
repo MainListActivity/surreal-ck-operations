@@ -39,8 +39,8 @@ const full: Pulse = {
   dispatchBlocked: [{ taskId: 't2', title: '就绪任务', summary: '就绪任务：执行无法派工（会话占用中或异常）', phase: 'execute',
     workflowState: 'ready', checkedAt: '2026-10-15T03:59:30Z', eligibleCount: 0,
     feasible: true, since: '2026-10-15T03:30:00Z', waitingMinutes: 30,
-    reasons: [{ code: 'session_busy', text: '会话占用中或异常', candidates: ['inst-1'], owner: 'gm', basis: 'tick-snapshot',
-      recovery: '等待在办任务完成', nextTrigger: '候选会话空闲', actions: [{ authority: 'gm', label: '等待在办任务完成', executable: false }] }] }],
+    reasons: [{ code: 'session_busy', text: '会话占用中或异常', candidates: ['inst-1'], owner: 'owner', basis: 'tick-snapshot',
+      recovery: '等待在办任务完成', nextTrigger: '候选会话空闲', actions: [{ authority: 'owner', label: '等待在办任务完成', executable: false }] }] }],
   bounds: allBounds({ dispatchBlocked: { total: 1, shown: 1, truncated: false } }),
 };
 
@@ -60,12 +60,12 @@ test('normalizePulse: truncation markers, omitted counts and reason actions surv
     bounds: allBounds({ dispatchBlocked: { total: 1500, shown: 40, truncated: true }, goalBlockers: { total: 300, shown: 40, truncated: true } }),
     goalBlockers: [{ goalId: 'goal-1', taskId: 't9', title: '根任务', phase: 'execute', summary: '等待', feasible: true, waitingMinutes: 30,
       others: 0, impact: 2, dependencyPath: [], people: { authors: ['a'], reviewers: [], peopleOmitted: 788 },
-      reasons: [{ code: 'session_busy', text: '忙', candidates: ['x'], candidatesOmitted: 54, owner: 'gm', basis: 'tick-snapshot', recovery: '等待', nextTrigger: '空闲',
+      reasons: [{ code: 'session_busy', text: '忙', candidates: ['x'], candidatesOmitted: 54, owner: 'owner', basis: 'tick-snapshot', recovery: '等待', nextTrigger: '空闲',
         actions: [{ authority: 'owner', label: '老板充值', executable: false }] }] }],
   });
   expect(p.bounds).toEqual(allBounds({ dispatchBlocked: { total: 1500, shown: 40, truncated: true }, goalBlockers: { total: 300, shown: 40, truncated: true } }));
   expect(p.goalBlockers[0]!.people).toMatchObject({ authors: ['a'], peopleOmitted: 788 });
-  expect(p.goalBlockers[0]!.reasons[0]).toMatchObject({ candidatesOmitted: 54, basis: 'tick-snapshot', owner: 'gm',
+  expect(p.goalBlockers[0]!.reasons[0]).toMatchObject({ candidatesOmitted: 54, basis: 'tick-snapshot', owner: 'owner',
     actions: [{ authority: 'owner', label: '老板充值', executable: false }] });
   expect(p.dispatchBlocked[0]!.reasons[0]!.candidatesOmitted).toBeUndefined();
 });

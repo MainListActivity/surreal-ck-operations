@@ -138,7 +138,7 @@ test('pool: the execute gate reaches only the task executor role, never a review
   expect(executeGateFor(gates, 'engineering', task)).toEqual({ implementer: 'eng-impl', unresolved: false });
   // A reviewer, or a gm pool anchored on the same engineering task, is not an execute pool.
   expect(executeGateFor(gates, 'qa', task)).toBeUndefined();
-  expect(executeGateFor(gates, 'gm', task)).toBeUndefined();
+  expect(executeGateFor(gates, 'owner', task)).toBeUndefined();
   // Review of the task never carries the gate, even for the executor role, and no task means no gate.
   expect(executeGateFor(gates, 'engineering', task, true)).toBeUndefined();
   expect(executeGateFor(gates, 'engineering')).toBeUndefined();
@@ -256,7 +256,7 @@ test('pool: scope is per role+home; other homes/roles do not appear', () => {
   const iProd = inst('i2', { cwd: PRODUCT });
   const pool = staffingPool(base({ defs: [dOps], insts: [iOps, iProd], states: new Map([['i1', 'idle'], ['i2', 'idle']]) }));
   expect(pool.filter(e => e.kind === 'reuse').map(e => e.ref)).toEqual(['i1']);
-  const gm = staffingPool(base({ role: 'gm', defs: [dOps], insts: [iOps], states: new Map([['i1', 'idle']]) }));
+  const gm = staffingPool(base({ role: 'owner', defs: [dOps], insts: [iOps], states: new Map([['i1', 'idle']]) }));
   expect(gm).toEqual([]);
 });
 

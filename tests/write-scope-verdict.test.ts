@@ -35,12 +35,12 @@ test('write scope: a same-lane writer is a gm reason that names its holder and w
     globalBlocks: [{ code: 'write_scope', text: BLOCK_TEXT.write_scope, candidates: [holderLabel(holder)] }], checkedAt: NOW * 1000 });
   expect(verdict.dispatchable).toBe(false);
   expect(verdict.feasible).toBe(true);
-  expect(verdict.reasons).toEqual([expect.objectContaining({ code: 'write_scope', owner: 'gm', basis: 'tick:worktree-scope', candidates: ['任务 0f9c1e2a · employee-7'] })]);
+  expect(verdict.reasons).toEqual([expect.objectContaining({ code: 'write_scope', owner: 'owner', basis: 'tick:worktree-scope', candidates: ['任务 0f9c1e2a · employee-7'] })]);
   const [reason] = verdict.reasons;
   expect(reason!.text).toContain('同线或重叠目录');
-  expect(reason!.recovery).toBe('等待同线或重叠目录的在办写者结束，或经理拆线');
-  expect(reason!.nextTrigger).toBe('同线或重叠目录的在办写者结束，或经理拆线');
-  expect(reason!.actions).toEqual([expect.objectContaining({ authority: 'gm', executable: false })]);
+  expect(reason!.recovery).toBe('等待同线或重叠目录的在办写者结束，或老板拆线');
+  expect(reason!.nextTrigger).toBe('同线或重叠目录的在办写者结束，或老板拆线');
+  expect(reason!.actions).toEqual([expect.objectContaining({ authority: 'owner', executable: false })]);
   expect(reason!.text).not.toBe(BLOCK_TEXT.wake_failed);
 });
 

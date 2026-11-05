@@ -1911,7 +1911,7 @@ export class OpsBroker {
    */
   private async platformOperatorList(ctx: Ctx, args: Args): Promise<Outcome> {
     if (ctx.scope.project !== 'surreal_ck' || ctx.env !== 'production') throw new CompanyError('forbidden', '平台运营主体清单只对 surreal_ck 生产环境开放');
-    if (!['gm', 'engineering', 'product', 'qa'].includes(ctx.scope.actor.role)) throw new CompanyError('forbidden', `role ${ctx.scope.actor.role} may not list platform operators`);
+    if (!['engineering', 'product', 'qa'].includes(ctx.scope.actor.role)) throw new CompanyError('forbidden', `role ${ctx.scope.actor.role} may not list platform operators`);
     const extra = Object.keys(args).filter(key => key !== 'session' && key !== 'env');
     if (extra.length) throw invalid(`ops_platform_operator_list 只接受 session（rejected: ${extra.join(', ')}）`);
     const session = this.session(ctx, args);
@@ -2025,7 +2025,7 @@ export class OpsBroker {
       throw invalid('purpose must be a short plain-text evidence purpose, not a URL, path or credential');
     }
     if (mode === 'apply') {
-      // Refused before any config read, seal or journal access, for qa, engineering, product and gm
+      // Refused before any config read, seal or journal access, for qa, engineering, product and owner
       // alike. The underlying entry refuses the same way, so a direct import cannot bypass this.
       throw new CompanyError('not_configured',
         'the Magpie route restore write capability is unavailable in this release: ops_magpie_route_restore publishes the read-only plan only (writeAvailable=false, gatewayReload=unknown) and the account/route recovery is not complete',

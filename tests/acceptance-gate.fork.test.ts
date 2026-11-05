@@ -133,7 +133,7 @@ beforeAll(async () => {
   await database.db.query('REMOVE DATABASE IF EXISTS control_plane;');
   await database.bootstrap();
   for (const [name, role, caps] of [
-    ['gm', 'gm', ['execute', 'review', 'manage']], ['product', 'product', ['execute', 'review', 'manage']],
+    ['owner', 'owner', ['execute', 'review', 'manage']], ['product', 'product', ['execute', 'review', 'manage']],
     ['eng-a', 'engineering', ['execute', 'review']], ['eng-b', 'engineering', ['execute', 'review']],
     ['qa', 'qa', ['execute', 'review']],
   ] as const) tokens[name] = await enrollment.enroll(`t-${name}`, role, caps);
@@ -400,7 +400,7 @@ fork('SYS02 AC03/AC05: the release baseline requires a human sign-off, so Jev ca
 fork('SYS02 AC03/AC06: the owner gate refuses an out-of-band review without machine evidence, then the owner signs', async () => {
   await ensureGate();
   const gateTask = await core.createTask(tokens.gm, { title: 'SYS02 老板关口', context: '老板关心口不能靠一行 review 绕过。', kind: 'gate',
-    executorRole: 'gm', reviewerRole: 'owner', acceptanceCriteria: [machine()], idempotencyKey: key() });
+    executorRole: 'owner', reviewerRole: 'owner', acceptanceCriteria: [machine()], idempotencyKey: key() });
   await database.db.query("UPDATE $task SET state = 'review', submitted_by = $who, acceptance_head = 'gate-head';",
     { task: new RecordId('task', gateTask.id), who: 't-gm' });
   await expect(owner.decide({ taskId: gateTask.id, decision: 'approve', note: '通过', source: 'owner:test', key: key() }))
@@ -410,7 +410,7 @@ fork('SYS02 AC03/AC06: the owner gate refuses an out-of-band review without mach
   expect((await owner.decide({ taskId: gateTask.id, decision: 'approve', note: '通过', source: 'owner:test', key: key() })).state).toBe('done');
   // The owner CLI path writes an owner_command; applyPending calls the same decide gate.
   const second = await core.createTask(tokens.gm, { title: 'SYS02 老板关口 2', context: 'owner CLI 同源。', kind: 'gate',
-    executorRole: 'gm', reviewerRole: 'owner', acceptanceCriteria: [human({ id: 'AC-1' })], idempotencyKey: key() });
+    executorRole: 'owner', reviewerRole: 'owner', acceptanceCriteria: [human({ id: 'AC-1' })], idempotencyKey: key() });
   await database.db.query("UPDATE $task SET state = 'review', submitted_by = $who;", { task: new RecordId('task', second.id), who: 't-gm' });
   await database.db.query("CREATE owner_command CONTENT { kind: 'approve', task: $task, text: '通过', source: 'cli', status: 'pending' };", { task: second.id });
   const applied = await owner.applyPending();

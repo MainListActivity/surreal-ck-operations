@@ -39,7 +39,7 @@ beforeAll(async () => {
   await database.bootstrap();
   const enrollment = new LocalEnrollmentAdmin(database);
   for (const [name, role, caps] of [
-    ['gm', 'gm', ['execute', 'review', 'manage']],
+    ['owner', 'owner', ['execute', 'review', 'manage']],
     ['product', 'product', ['execute', 'review', 'manage']],
     ['eng', 'engineering', ['execute', 'review']],
   ] as const) tokens[name] = await enrollment.enroll(`w-${name}`, role, caps);
@@ -86,9 +86,9 @@ async function seedGoal(input: {
   gateDependencies?: string[];
 }): Promise<{ goalId: string; manualId: string; gateId: string }> {
   const goalId = input.id;
-  const manualId = await makeTask(goalId, '运营验收', { executor_role: 'product', reviewer_role: 'gm', kind: 'task' });
+  const manualId = await makeTask(goalId, '运营验收', { executor_role: 'product', reviewer_role: 'owner', kind: 'task' });
   const gateId = await makeTask(goalId, 'G3 老板最终验收', {
-    executor_role: 'gm', reviewer_role: input.reviewerRole ?? 'owner', kind: 'gate',
+    executor_role: 'owner', reviewer_role: input.reviewerRole ?? 'owner', kind: 'gate',
     state: input.finalState ?? 'done', ...(input.acceptedBy ? { accepted_by: input.acceptedBy } : {}),
     ...(input.gateDependencies ? { dependencies: input.gateDependencies } : {}),
   });
@@ -104,7 +104,7 @@ async function seedGoal(input: {
   await database.db.query('CREATE ONLY $g CONTENT $row;', { g: new RecordId('goal', goalId), row: goalRow });
   if (input.outcome !== false) {
     await database.db.query(`CREATE ONLY $o CONTENT {
-      goal: $goal, expected: '交付并验证预期客户结果', required_evidence: $required, responsible_role: 'gm',
+      goal: $goal, expected: '交付并验证预期客户结果', required_evidence: $required, responsible_role: 'owner',
       version: 1, source: 'test', actor: 'test', reason: 'SYS07 夹具成果契约', created_at: time::now(), updated_at: time::now()
     };`, { o: new RecordId('goal_outcome', goalId), goal: new RecordId('goal', goalId),
       required: input.outcomeRequired ?? [] });
@@ -209,7 +209,7 @@ describe('SYS07 follow-up: scan paging, owner surfaces and metrics sections', ()
     };`, { key: `wait-${waitTask}`, task: new RecordId('task', waitTask), next: Date.now() + 86_400_000,
       entered: new Date(Date.now() - 3_600_000) });
     const managerTask = await makeTask(late.goalId, '经理决策任务', {
-      state: 'blocked', blocked_to: 'gm', executor_role: 'product', reviewer_role: 'gm',
+      state: 'blocked', blocked_to: 'owner', executor_role: 'product', reviewer_role: 'owner',
       dispatch_blocked_since: Math.floor((Date.now() - 7_200_000) / 1000),
       created_at: new Date(Date.now() - 2 * 3_600_000),
     });
@@ -254,8 +254,8 @@ describe('SYS07 follow-up: scan paging, owner surfaces and metrics sections', ()
     expect(wait.dependencyPath.map(item => item.taskId)).toContain(late.finalGate.taskId ?? '');
     expect(wait.handoff?.pendingAction ?? '').toContain('请客户确认');
     const manager = late.blockers.find(blocker => blocker.taskId === managerTask)!;
-    expect(manager.kind).toBe('manager');
-    expect(manager.responsibleRole).toBe('gm');
+    expect(manager.kind).toBe('owner');
+    expect(manager.responsibleRole).toBe('owner');
     expect(manager.waitedMinutes).toBeGreaterThanOrEqual(119);
   });
 
@@ -353,7 +353,7 @@ describe('whole-database external dependency classification', () => {
     await seedGoal({ id: 'other-done', state: 'done', finalState: 'done', acceptedBy: 'owner' });
     const otherDoneTask = await makeTask('other-done', '其他目标已完成任务', { state: 'done' });
     await seedGoal({ id: 'other-blocked' });
-    const otherBlockedTask = await makeTask('other-blocked', '其他目标阻塞任务', { state: 'blocked', blocked_to: 'gm' });
+    const otherBlockedTask = await makeTask('other-blocked', '其他目标阻塞任务', { state: 'blocked', blocked_to: 'owner' });
     // The scanned goal depends on all four real rows plus one dependency that exists nowhere.
     const gone = `gone-${randomUUID()}`;
     const scanned = await seedGoal({
@@ -487,7 +487,7 @@ describe('default outcome contract at triage (AC02)', () => {
     const outcome = await database.db.select<Record<string, unknown>>(new RecordId('goal_outcome', goal.id));
     expect(outcome).toBeTruthy();
     expect(String(outcome?.expected)).toContain('内部小改动');
-    expect(outcome?.responsible_role).toBe('gm');
+    expect(outcome?.responsible_role).toBe('owner');
     expect(outcome?.required_evidence).toEqual(['implementation', 'final_acceptance']);
     expect(outcome?.version).toBe(1);
   });
@@ -540,7 +540,7 @@ describe('final-gate completion and evidence (AC01/AC02/AC05)', () => {
   });
 
   test('a manager final gate cannot satisfy a required owner_final', async () => {
-    const { goalId } = await seedGoal({ id: 'owner-required-gm', reviewerRole: 'gm', acceptedBy: 'gm',
+    const { goalId } = await seedGoal({ id: 'owner-required-gm', reviewerRole: 'owner', acceptedBy: 'owner',
       outcomeRequired: ['implementation', 'owner_final'] });
     const card = await core.goalFinalize(tokens.gm!, { goalId });
     expect(card.state).toBe('needs_repair');
@@ -571,17 +571,17 @@ describe('final-gate completion and evidence (AC01/AC02/AC05)', () => {
     await seedGoal({ id: 'version-1', outcome: false });
     const first = await core.goalOutcomeRegister(tokens.gm!, {
       goalId: 'version-1', expectedVersion: 0, expected: '交付客户可采纳的结果',
-      requiredEvidence: ['customer_activation'], responsibleRole: 'gm', reason: 'SYS07 回归：登记成果契约',
+      requiredEvidence: ['customer_activation'], responsibleRole: 'owner', reason: 'SYS07 回归：登记成果契约',
       idempotencyKey: 'outcome-v1',
     });
     expect(first.version).toBe(1);
     await expectRefused(core.goalOutcomeRegister(tokens.gm!, {
-      goalId: 'version-1', expectedVersion: 0, expected: '重复登记', requiredEvidence: [], responsibleRole: 'gm',
+      goalId: 'version-1', expectedVersion: 0, expected: '重复登记', requiredEvidence: [], responsibleRole: 'owner',
       reason: 'SYS07 回归：旧版本必须被拒绝', idempotencyKey: 'outcome-stale',
     }), 'conflict', /already registered|version moved/);
     const second = await core.goalOutcomeRegister(tokens.gm!, {
       goalId: 'version-1', expectedVersion: 1, expected: '交付客户可采纳并可回访的结果',
-      requiredEvidence: ['customer_activation', 'customer_adoption'], responsibleRole: 'gm',
+      requiredEvidence: ['customer_activation', 'customer_adoption'], responsibleRole: 'owner',
       reason: 'SYS07 回归：授权补充客户采纳证据', idempotencyKey: 'outcome-v2',
     });
     expect(second.version).toBe(2);
@@ -591,19 +591,19 @@ describe('final-gate completion and evidence (AC01/AC02/AC05)', () => {
     await seedGoal({ id: 'concurrent-outcome-1', outcome: false });
     const first = await core.goalOutcomeRegister(tokens.gm!, {
       goalId: 'concurrent-outcome-1', expectedVersion: 0, expected: '先登记一个客户可采纳的结果',
-      requiredEvidence: ['customer_activation'], responsibleRole: 'gm', reason: 'SYS07 回归：并发 CAS 的基线契约',
+      requiredEvidence: ['customer_activation'], responsibleRole: 'owner', reason: 'SYS07 回归：并发 CAS 的基线契约',
       idempotencyKey: 'outcome-concurrent-base',
     });
     expect(first.version).toBe(1);
     const results = await Promise.allSettled([
       core.goalOutcomeRegister(tokens.gm!, {
         goalId: 'concurrent-outcome-1', expectedVersion: 1, expected: '并发方案 A：客户激活后完成',
-        requiredEvidence: ['customer_activation'], responsibleRole: 'gm', reason: 'SYS07 回归：并发方案 A 的授权变更',
+        requiredEvidence: ['customer_activation'], responsibleRole: 'owner', reason: 'SYS07 回归：并发方案 A 的授权变更',
         idempotencyKey: 'outcome-concurrent-a',
       }),
       core.goalOutcomeRegister(tokens.gm!, {
         goalId: 'concurrent-outcome-1', expectedVersion: 1, expected: '并发方案 B：客户采纳后完成',
-        requiredEvidence: ['customer_adoption'], responsibleRole: 'gm', reason: 'SYS07 回归：并发方案 B 的授权变更',
+        requiredEvidence: ['customer_adoption'], responsibleRole: 'owner', reason: 'SYS07 回归：并发方案 B 的授权变更',
         idempotencyKey: 'outcome-concurrent-b',
       }),
     ]);
@@ -620,7 +620,7 @@ describe('final-gate repair (AC01)', () => {
     const { goalId, gateId } = await seedGoal({ id: 'repair-1', finalState: 'void', acceptedBy: undefined });
     const work = await makeTask(goalId, '未完成补证', { state: 'ready', kind: 'task' });
     const candidate = await makeTask(goalId, '新的 G3 终验', {
-      state: 'blocked', kind: 'gate', executor_role: 'gm', reviewer_role: 'owner', dependencies: [new RecordId('task', work)],
+      state: 'blocked', kind: 'gate', executor_role: 'owner', reviewer_role: 'owner', dependencies: [new RecordId('task', work)],
     });
     const preview = await core.goalFinalGatePreview(tokens.gm!, { goalId, candidateTaskId: candidate });
     expect(preview.ready).toBe(true);
@@ -645,12 +645,12 @@ describe('final-gate repair (AC01)', () => {
     expect(audits?.[0]?.n).toBe(1);
     // A quick goal's old acceptance anchor is a kind=task gm gate. Repairing it must record the replaced audit,
     // otherwise the retired old anchor would look like abandoned implementation work forever.
-    const quick = await seedGoal({ id: 'quick-repair', tier: 'quick', finalState: 'void', reviewerRole: 'gm',
+    const quick = await seedGoal({ id: 'quick-repair', tier: 'quick', finalState: 'void', reviewerRole: 'owner',
       acceptedBy: undefined, outcomeRequired: ['implementation', 'final_acceptance'] });
-    await database.db.query("UPDATE ONLY $task SET kind = 'task', executor_role = 'gm';",
+    await database.db.query("UPDATE ONLY $task SET kind = 'task', executor_role = 'owner';",
       { task: new RecordId('task', quick.gateId) });
     const quickCandidate = await makeTask(quick.goalId, 'quick 运营验收候选', {
-      state: 'blocked', kind: 'task', executor_role: 'gm', reviewer_role: 'gm',
+      state: 'blocked', kind: 'task', executor_role: 'owner', reviewer_role: 'owner',
       dependencies: [new RecordId('task', quick.manualId)],
     });
     const quickPreview = await core.goalFinalGatePreview(tokens.gm!, { goalId: quick.goalId, candidateTaskId: quickCandidate });
@@ -664,14 +664,14 @@ describe('final-gate repair (AC01)', () => {
       "SELECT count() AS n FROM audit WHERE task = $task AND action = 'goal_final_gate_replaced' GROUP ALL;",
       { task: new RecordId('task', quick.gateId) });
     expect(replaced?.[0]?.n).toBe(1);
-    await database.db.query("UPDATE ONLY $task SET state = 'done', accepted_by = 'gm', version += 1;",
+    await database.db.query("UPDATE ONLY $task SET state = 'done', accepted_by = 'owner', version += 1;",
       { task: new RecordId('task', quickCandidate) });
     const quickCard = await core.goalFinalize(tokens.gm!, { goalId: quick.goalId });
     expect(quickCard.state).toBe('done');
     expect(quickCard.goalComplete).toBe(true);
 
     const candidate2 = await makeTask(goalId, '另一个 G3 终验', {
-      state: 'blocked', kind: 'gate', executor_role: 'gm', reviewer_role: 'owner', dependencies: [new RecordId('task', work), new RecordId('task', candidate)],
+      state: 'blocked', kind: 'gate', executor_role: 'owner', reviewer_role: 'owner', dependencies: [new RecordId('task', work), new RecordId('task', candidate)],
     });
     const secondPreview = await core.goalFinalGatePreview(tokens.gm!, { goalId, candidateTaskId: candidate2 });
     expect(secondPreview.ready).toBe(true);

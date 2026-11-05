@@ -120,7 +120,9 @@ test('a report written after the lease ended is preserved with its task and list
 
 for (const phase of ['doing', 'review'] as const) test(`silent nudge names the ${phase} closeout tool`, async () => {
   const sent: string[] = [];
-  const ctx = { workforce: {}, sidecar: { settle: async () => ({ status: 'silent', silent: { instId: 'i', taskId: 't', nudges: 1, phase } }) } };
+  const store = { ensureDraft: async (_task: string, step: string) => ({ id: 'm', hold: false, step, body: `task.md ${step} sck call ${phase === 'review' ? 'review' : 'submit'}` }),
+    prepareSend: async (_task: string, step: string) => ({ body: `task.md ${step} sck call ${phase === 'review' ? 'review' : 'submit'}` }) };
+  const ctx = { workforce: {}, sidecar: { settle: async () => ({ status: 'silent', silent: { instId: 'i', taskId: 't', nudges: 1, phase } }) }, messages: store };
   const paseo = { agents: { ref: () => ({ send: async (text: string) => { sent.push(text); } }) } };
   await settleCompanyTurn(ctx as never, paseo as never, { agent: { id: 'a' }, outcome: { kind: 'completed' }, timeline: [] } as never);
   expect(sent).toHaveLength(1);

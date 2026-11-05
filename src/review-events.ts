@@ -3,7 +3,7 @@
 // 真实阻塞 3cf7477d v19：协同任务用固定时间等待 QA 观察窗口，QA 的真实复核租约与结构化请求不唤醒它。
 // 这里把“独立 QA 领到源任务的 review 租约”或“当前 QA 持有人发出结构化 scope 请求”收敛为一个 authorization
 // 事件，把“同一 scope 正向取证完成、结构化请求撤销”收敛为一个 positive 事件。事件只解除协同任务的 SYS05
-// 等待并让调度器重新派 GM；它不生成 grant/revoke、不写业务验收结论、不改源任务租约、不扩大 subjects。
+// 等待并让调度器重新派老板；它不生成 grant/revoke、不写业务验收结论、不改源任务租约、不扩大 subjects。
 //
 // 事件身份 = 源任务 + review fence + 事件类型（在一条订阅内）。同一 fence 的 claim 与结构化请求共享同一个
 // authorization 事件（先到者生效，后到者是重复）；return/换人抬高 fence，旧 fence 的事件不能在事后交付，

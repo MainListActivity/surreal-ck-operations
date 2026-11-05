@@ -14,7 +14,7 @@ import { arrivedAt, arriving, currentTool, noteTool, SNAPSHOT_TOOLS, withinReply
 import { answerBytes, answerResult, echoClaim, MAX_REQUEST_ID_BYTES, oversizeRequestId, RESPONSE_BUDGET_BYTES } from '../response-budget';
 import { REPLY_CEILING_MS, untilAt } from '../snapshot-store';
 
-const roles = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs'] as const;
+const roles = ['product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs'] as const;
 const defRoles = [...roles, 'eval'] as const;
 const reviewerRoles = [...roles, 'owner'] as const;
 const states = ['blocked', 'ready', 'doing', 'review', 'done', 'void'] as const;
@@ -138,7 +138,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   const withoutNull = (value: Record<string, unknown>) =>
     Object.fromEntries(Object.entries(value).filter(([, item]) => item !== null && item !== undefined)) as never;
   server.registerTool('get_context', {
-    description: 'Show the authenticated employee and the working set of company tasks (ready, doing, review, blocked) within a 48 KiB UTF-8 response budget. Without scope, or with scope "tasks": without pageSize or cursor the answer is complete (keys principal, companyIncluded, companyRead, tasks, and company when includeCompany is true) or refused as response_too_large with retry guidance; it is never cut. With pageSize (1 to 100) or cursor it returns one stored page: continue with the same arguments plus cursor set to page.nextCursor, until page.hasMore is false. includeCompany defaults to false; companyRead names the arguments that read the company block. A task too large for one page is echoed with a long dependency list cut and flagged (listsTruncated), and a context still too large cut and flagged (contextTruncated, contextNextOffset); read_task_text returns any cut part whole. A task read by taskId is whole or refused. A blocked task carries `waiting`: kind (manager/owner/dependency), the phase it restores (`resumeState`, unknown when absent), the role that phase belongs to (a review wait names the reviewing role) and the number of dependencies (the ids stay in the task `dependencies` field). With scope "company" the answer is the company block (directions, goals, projects, paused), optionally one section; project environments (envs, credential aliases and roles) are shown only to gm and to the holder of a valid task lease, and to anyone else envs is empty with envsWithheld true; it is complete (key company) or, with pageSize or cursor, one stored page of parts (keys section, key, part, parts, offset, totalBytes, sha256, json): join the json of the parts of one section and key in part order, check the byte length and sha256 against totalBytes and sha256, then parse; continue with the same arguments plus cursor set to page.nextCursor until page.hasMore is false.',
+    description: 'Show the authenticated employee and the working set of company tasks (ready, doing, review, blocked) within a 48 KiB UTF-8 response budget. Without scope, or with scope "tasks": without pageSize or cursor the answer is complete (keys principal, companyIncluded, companyRead, tasks, and company when includeCompany is true) or refused as response_too_large with retry guidance; it is never cut. With pageSize (1 to 100) or cursor it returns one stored page: continue with the same arguments plus cursor set to page.nextCursor, until page.hasMore is false. includeCompany defaults to false; companyRead names the arguments that read the company block. A task too large for one page is echoed with a long dependency list cut and flagged (listsTruncated), and a context still too large cut and flagged (contextTruncated, contextNextOffset); read_task_text returns any cut part whole. A task read by taskId is whole or refused. A blocked task carries `waiting`: kind (manager/owner/dependency), the phase it restores (`resumeState`, unknown when absent), the role that phase belongs to (a review wait names the reviewing role) and the number of dependencies (the ids stay in the task `dependencies` field). With scope "company" the answer is the company block (directions, goals, projects, paused), optionally one section; project environments (envs, credential aliases and roles) are shown only to owner and to the holder of a valid task lease, and to anyone else envs is empty with envsWithheld true; it is complete (key company) or, with pageSize or cursor, one stored page of parts (keys section, key, part, parts, offset, totalBytes, sha256, json): join the json of the parts of one section and key in part order, check the byte length and sha256 against totalBytes and sha256, then parse; continue with the same arguments plus cursor set to page.nextCursor until page.hasMore is false.',
     inputSchema: z.object({
       scope: z.enum(['tasks', 'company']).nullish(),
       section: z.enum(['directions', 'goals', 'projects']).nullish(),
@@ -169,7 +169,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   });
 
   server.registerTool('reclaim_worktrees', {
-    description: 'GM: ownership-based worktree reclaim or dry-run. Uses persistent refs and durable audit; never force-deletes dirty trees. A value other than the documented ones is refused as invalid before any tree is touched.',
+    description: 'owner: ownership-based worktree reclaim or dry-run. Uses persistent refs and durable audit; never force-deletes dirty trees. A value other than the documented ones is refused as invalid before any tree is touched.',
     inputSchema: z.object({
       // The rule is parseReclaimInput, shared with core and the sidecar (SYS01, D3). The schema documents the shape only: a schema
       // error would be a plain-text refusal, while parseReclaimInput gives the same structured `invalid` on every layer.
@@ -184,14 +184,14 @@ function registerTools(server: McpServer, core: CompanyCore) {
       : Promise.resolve({ scanId: '', removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 });
   }));
   server.registerTool('list_worktree_audits', {
-    description: 'GM: query durable worktree reclaim audit rows (delete/skip/fail/branch_retain/orphan_scan).',
+    description: 'owner: query durable worktree reclaim audit rows (delete/skip/fail/branch_retain/orphan_scan).',
     // A null limit is absent, as on the sidecar (read-only audit list; reclaim_worktrees is left as it is).
     inputSchema: z.object({ limit: z.number().int().min(1).max(500).nullish() }),
   }, async ({ limit }, ctx) => run(token(ctx), () => core.listWorktreeAudits
     ? core.listWorktreeAudits(token(ctx), limit ?? undefined)
     : Promise.resolve([])));
   server.registerTool('list_worktrees', {
-    description: 'Authenticated persistent worktree inventory with compact references (released ones are counted, and listed only with includeReleased). Without pageSize or cursor it returns the complete array, or response_too_large when over the 48 KiB budget (retry with pageSize 25, then cursor set to page.nextCursor, or narrow with taskId); with either it pages by path and returns { worktrees, page }. A worktree whose whole entry cannot fit a page has its references cut and flagged (referencesTruncated: count, sha256, includeReleased, tool); read_worktree_refs returns the whole list in byte segments. Task-scoped reads, or gm global reads.',
+    description: 'Authenticated persistent worktree inventory with compact references (released ones are counted, and listed only with includeReleased). Without pageSize or cursor it returns the complete array, or response_too_large when over the 48 KiB budget (retry with pageSize 25, then cursor set to page.nextCursor, or narrow with taskId); with either it pages by path and returns { worktrees, page }. A worktree whose whole entry cannot fit a page has its references cut and flagged (referencesTruncated: count, sha256, includeReleased, tool); read_worktree_refs returns the whole list in byte segments. Task-scoped reads, or owner global reads.',
     inputSchema: z.object({ taskId: z.string().min(1).max(200).nullish(), includeReleased: z.boolean().nullish(), ...pageArgs }),
   }, async (input, ctx) => run(token(ctx), () => {
     // C1 default: a call that names neither pageSize nor cursor (null counts as absent) keeps the pre-SYS01 array shape.
@@ -200,7 +200,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     return core.listWorktrees ? core.listWorktrees(token(ctx), input.taskId ?? undefined) : Promise.resolve([]);
   }));
   server.registerTool('read_worktree_refs', {
-    description: 'Read one byte segment of one worktree\'s references as JSON: the recovery entry a paged list_worktrees item names when its references were cut (referencesTruncated carries the whole count, SHA-256 and includeReleased). Pass the same taskId and includeReleased the listing used. Returns the total size and SHA-256 of the whole text, so a reader can reassemble and verify. Segments never split a character. expectSha256 (from the first segment) is required on every segment past offset 0: a list that changed in between is refused with conflict instead of mixing two versions. Same access as list_worktrees: a task id scopes the read to that task repository, a global read is gm only.',
+    description: 'Read one byte segment of one worktree\'s references as JSON: the recovery entry a paged list_worktrees item names when its references were cut (referencesTruncated carries the whole count, SHA-256 and includeReleased). Pass the same taskId and includeReleased the listing used. Returns the total size and SHA-256 of the whole text, so a reader can reassemble and verify. Segments never split a character. expectSha256 (from the first segment) is required on every segment past offset 0: a list that changed in between is refused with conflict instead of mixing two versions. Same access as list_worktrees: a task id scopes the read to that task repository, a global read is owner only.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200).nullish(),
       worktreePath: z.string().min(1).max(4096),
@@ -213,11 +213,11 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.worktreeRefs(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('get_admin_summary', {
-    description: 'gm only: read-only company summary at one stated cutoffAt. tasks counts each task by the state it holds at cutoffAt (optionally for one goal; since does not apply to tasks). audit counts entries from since (default: the 24 hours before the cutoff) up to cutoffAt, limited to the tasks of the goal when goalId is given. Returns scope, outboxSequence and integrity; integrity.complete is true only for a proven consistent read, and false means retry. Never returns task text.',
+    description: 'owner only: read-only company summary at one stated cutoffAt. tasks counts each task by the state it holds at cutoffAt (optionally for one goal; since does not apply to tasks). audit counts entries from since (default: the 24 hours before the cutoff) up to cutoffAt, limited to the tasks of the goal when goalId is given. Returns scope, outboxSequence and integrity; integrity.complete is true only for a proven consistent read, and false means retry. Never returns task text.',
     inputSchema: z.object({ since: z.string().min(1).max(40).nullish(), goalId: z.string().min(1).max(100).nullish() }),
   }, async (input, ctx) => run(token(ctx), () => core.adminSummary ? core.adminSummary(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('read_task_text', {
-    description: 'Read one byte segment of a task text: context, evidence (one audit entry, auditId from get_task_history), project (the project environment as JSON; the task holder or gm only), or the lists dependencies, workIntentPaths and worktreePaths as JSON arrays. A claim or heartbeat echo that cut one of them names it and its size; this reads the rest. Returns the total size and SHA-256 of the full text, so a reader can reassemble and verify. Segments never split a character. expectSha256 (from the first segment) is required on every segment past offset 0: if the text changed in between, the read is refused with conflict instead of mixing two versions.',
+    description: 'Read one byte segment of a task text: context, evidence (one audit entry, auditId from get_task_history), project (the project environment as JSON; the task holder or owner only), or the lists dependencies, workIntentPaths and worktreePaths as JSON arrays. A claim or heartbeat echo that cut one of them names it and its size; this reads the rest. Returns the total size and SHA-256 of the full text, so a reader can reassemble and verify. Segments never split a character. expectSha256 (from the first segment) is required on every segment past offset 0: if the text changed in between, the read is refused with conflict instead of mixing two versions.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200),
       field: z.enum(['context', 'evidence', 'project', 'dependencies', 'workIntentPaths', 'worktreePaths']),
@@ -282,8 +282,8 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.submit(token(ctx), proof(input), evidence(input))));
 
   server.registerTool('report_blocker', {
-    description: 'Block the current delivery for gm or owner input. For a subscription quota or rate limit, pass quotaResetsAt: the reset time the provider reported, as ISO 8601 with a timezone offset.',
-    inputSchema: z.object({ ...proofShape, ...evidenceShape, to: z.enum(['gm', 'owner']),
+    description: 'Block the current delivery for the owner. For a subscription quota or rate limit, pass quotaResetsAt: the reset time the provider reported, as ISO 8601 with a timezone offset.',
+    inputSchema: z.object({ ...proofShape, ...evidenceShape, to: z.enum(['owner']),
       quotaResetsAt: z.string().min(1).optional() }),
   }, async (input, ctx) => run(token(ctx), () => core.block(token(ctx), proof(input), input.to, evidence(input), input.quotaResetsAt)));
 
@@ -330,36 +330,36 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.resolveWait ? core.resolveWait(token(ctx), input as never) : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('cancel_wait', {
-    description: 'Manager (gm): cancel a wait under its version with a reason. Without resume=true the task stays blocked for a human; cancelling is not the same as resolving the condition.',
+    description: 'Owner: cancel a wait under its version with a reason. Without resume=true the task stays blocked for a human; cancelling is not the same as resolving the condition.',
     inputSchema: z.object({ waitKey: z.string().min(1), expectedVersion: z.number().int().positive(),
       reason: z.string().min(10).max(2000), idempotencyKey: z.string().min(1).max(200),
       resume: z.boolean().optional() }),
   }, async (input, ctx) => run(token(ctx), () => core.cancelWait ? core.cancelWait(token(ctx), input as never) : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('extend_wait', {
-    description: 'Manager (gm): extend or re-arm a wait under its version with a reason. A stale version is refused; a re-armed wait keeps its task parked.',
+    description: 'Owner: extend or re-arm a wait under its version with a reason. A stale version is refused; a re-armed wait keeps its task parked.',
     inputSchema: z.object({ waitKey: z.string().min(1), expectedVersion: z.number().int().positive(),
       reason: z.string().min(10).max(2000), idempotencyKey: z.string().min(1).max(200),
       ...waitInstants }),
   }, async (input, ctx) => run(token(ctx), () => core.extendWait ? core.extendWait(token(ctx), input as never) : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('list_task_waits', {
-    description: 'Read waits (internal facts, no credentials): by task, by state, or the newest open ones. GM/QA use this to audit concurrency and release once-ness.',
+    description: 'Read waits (internal facts, no credentials): by task, by state, or the newest open ones. owner/QA use this to audit concurrency and release once-ness.',
     inputSchema: z.object({ taskId: z.string().optional(), state: z.enum(['waiting', 'released', 'held', 'expired', 'cancelled', 'superseded']).optional(), limit: z.number().int().min(1).max(100).optional() }),
   }, async (input, ctx) => run(token(ctx), () => core.listWaits ? core.listWaits(token(ctx), input as never) : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('wait_handoff_cards', {
-    description: 'Owner/manager: handoff cards for waits owned by the boss. Each names completed items, the pending action, who waits for whom, the exact expiry or unknown, and the allowed next triggers.',
+    description: 'Owner: handoff cards for waits owned by the boss. Each names completed items, the pending action, who waits for whom, the exact expiry or unknown, and the allowed next triggers.',
     inputSchema: z.object({}),
   }, async (_input, ctx) => run(token(ctx), () => core.waitHandoffCards ? core.waitHandoffCards(token(ctx)) : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('wait_migration_preview', {
-    description: 'Manager: read-only dry-run for legacy tasks. It never releases an owner gate and writes nothing; migration is confirmed one task at a time.',
+    description: 'Owner: read-only dry-run for legacy tasks. It never releases an owner gate and writes nothing; migration is confirmed one task at a time.',
     inputSchema: z.object({}),
   }, async (_input, ctx) => run(token(ctx), () => core.waitMigrationPreview ? core.waitMigrationPreview(token(ctx)) : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('wait_migration_apply', {
-    description: 'Manager (gm): migrate exactly one legacy time-bounded task (future quota_resets_at) into a wait, under the version read. Owner gates, leased tasks and tasks without a future time bound are refused; audited.',
+    description: 'Owner: migrate exactly one legacy time-bounded task (future quota_resets_at) into a wait, under the version read. Owner gates, leased tasks and tasks without a future time bound are refused; audited.',
     inputSchema: z.object({ taskId: z.string().min(1), expectedVersion: z.number().int().positive(),
       reason: z.string().min(10).max(2000), idempotencyKey: z.string().min(1).max(200) }),
   }, async (input, ctx) => run(token(ctx), () => core.waitMigrationApply ? core.waitMigrationApply(token(ctx), input as never) : Promise.reject({ code: 'temporarily_unavailable' })));
@@ -372,7 +372,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : core.returnTask(token(ctx), proof(input), evidence(input))));
 
   server.registerTool('create_task', {
-    description: 'Create a managed company task; requires core manage capability. For independent verification/cleanup, pass independence:{stages:["execute"],sources:["source-task-id"],mode:"execute_handlers",reason:"why independent"} atomically; context prose does not enforce exclusions. project optionally binds this one task to a registered project (takes precedence over the goal\'s project). codeRepoPath optionally sets the code repository the worktree is allocated in (the ops repo or a registered project repo; the business project is unchanged); without it a code/release/deploy task whose context names the ops repo path under a project with another repo is bound to the ops repo at creation, so it never claims into the business repo. revises=<直接上一版任务id> creates the controlled screenplay-revision edge: gm/product only, both drafts must be owner-reviewed screenwriter tasks on the 编剧 track (kind=task) in the same goal and project, and the target must be the unapproved chain tip whose latest submission was really rejected by the owner; the old draft voids with a supersededBy pointer and downstreams resolve to the chain tip.',
+    description: 'Create a managed company task; requires core manage capability. For independent verification/cleanup, pass independence:{stages:["execute"],sources:["source-task-id"],mode:"execute_handlers",reason:"why independent"} atomically; context prose does not enforce exclusions. project optionally binds this one task to a registered project (takes precedence over the goal\'s project). codeRepoPath optionally sets the code repository the worktree is allocated in (the ops repo or a registered project repo; the business project is unchanged); without it a code/release/deploy task whose context names the ops repo path under a project with another repo is bound to the ops repo at creation, so it never claims into the business repo. revises=<直接上一版任务id> creates the controlled screenplay-revision edge: product only, both drafts must be owner-reviewed screenwriter tasks on the 编剧 track (kind=task) in the same goal and project, and the target must be the unapproved chain tip whose latest submission was really rejected by the owner; the old draft voids with a supersededBy pointer and downstreams resolve to the chain tip.',
     inputSchema: z.object({
       modelTier: z.enum(['fable','opus','sonnet','haiku','high','medium','low']).optional(),
       title: z.string().min(1), context: z.string().min(1),
@@ -394,14 +394,14 @@ function registerTools(server: McpServer, core: CompanyCore) {
     }),
   }, async (input, ctx) => run(token(ctx), () => core.createTask(token(ctx), input)));
 
-  // Workforce administration tools: manage capability only (gm/product), every write audited.
+  // Workforce administration tools: manage capability only (product; owner via owner API), every write audited.
   server.registerTool('def_list', {
-    description: 'manage only (gm/product): list employee_def rows (id/role/provider/model/thinking/tracks/enabled/max_instances/priority/weight/quota_limited).',
+    description: 'manage only (product; owner via owner API): list employee_def rows (id/role/provider/model/thinking/tracks/enabled/max_instances/priority/weight/quota_limited).',
     inputSchema: z.object({}),
   }, async (_input, ctx) => run(token(ctx), () => core.listDefs(token(ctx))));
 
   server.registerTool('def_ensure', {
-    description: 'manage only (gm/product): create or update an employee_def (audited). tracks [] clears tracks, omitted keeps; enabled=false disables; quotaLimited=false keeps the def dispatchable even at 0% quota (omitted keeps the stored value). Basic fields are required on every call.',
+    description: 'manage only (product; owner via owner API): create or update an employee_def (audited). tracks [] clears tracks, omitted keeps; enabled=false disables; quotaLimited=false keeps the def dispatchable even at 0% quota (omitted keeps the stored value). Basic fields are required on every call.',
     inputSchema: z.object({
       id: z.string().min(1).max(60), role: z.enum(defRoles), provider: z.string().min(1).max(60), model: z.string().min(1).max(120),
       thinking: z.string().min(1).max(40).optional(), tracks: z.array(z.string().min(1).max(60)).max(50).optional(),
@@ -412,7 +412,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.ensureDef(token(ctx), input)));
 
   server.registerTool('project_disciplines_update', {
-    description: 'manage only (gm/product): replace a project disciplines vocabulary (unique non-empty names, audited); no other project field is touched.',
+    description: 'manage only (product; owner via owner API): replace a project disciplines vocabulary (unique non-empty names, audited); no other project field is touched.',
     inputSchema: z.object({
       project: z.string().min(1).max(60),
       disciplines: z.array(z.object({ name: z.string().min(1).max(60), description: z.string().max(500).optional() })).max(50),
@@ -431,12 +431,12 @@ function registerTools(server: McpServer, core: CompanyCore) {
   const relayShape = { ownerQuote: z.string().min(2), idempotencyKey: z.string().min(1) };
   const tiers = ['quick', 'standard', 'program'] as const;
   server.registerTool('create_goal', {
-    description: 'gm only: record a goal the owner gave in direct conversation. Without tier the goal waits in triage (Jev or gm picks quick/standard/program); project links a project environment; pipeline picks the production line template (software, video or story; defaults to the project\'s line).',
+    description: 'owner only: record a goal the owner gave in direct conversation. Without tier the goal waits in triage (Jev picks quick/standard/program); project links a project environment; pipeline picks the production line template (software, video or story; defaults to the project\'s line).',
     inputSchema: z.object({ text: z.string().min(2), tier: z.enum(tiers).optional(), project: z.string().min(1).optional(), pipeline: z.enum(['software', 'video', 'story']).optional(), ...relayShape }),
   }, async (input, ctx) => run(token(ctx), () => core.relayGoal(token(ctx), input)));
 
   server.registerTool('goal_phase_split', {
-    description: 'gm only: close a large goal in stages. Moves the named unfinished tasks (not anchors, no live lease, not awaited by an open task that stays) into a next-phase goal created once per idempotencyKey with the same tier and project; the moved tasks join the new goal\'s first anchor, and the old goal\'s anchors stop waiting for them and unlock when nothing else is open, so the current phase can go to its acceptance. Returns the next goal id, the moved tasks and the anchors that unlocked. Audited; a refusal writes nothing.',
+    description: 'owner only: close a large goal in stages. Moves the named unfinished tasks (not anchors, no live lease, not awaited by an open task that stays) into a next-phase goal created once per idempotencyKey with the same tier and project; the moved tasks join the new goal\'s first anchor, and the old goal\'s anchors stop waiting for them and unlock when nothing else is open, so the current phase can go to its acceptance. Returns the next goal id, the moved tasks and the anchors that unlocked. Audited; a refusal writes nothing.',
     inputSchema: z.object({ goalId: z.string().min(1).max(100), taskIds: z.array(z.string().min(1).max(200)).min(1).max(200),
       title: z.string().min(4).max(60), reason: z.string().min(4).max(4000), idempotencyKey: z.string().min(1).max(200) }),
   }, async (input, ctx) => run(token(ctx), () => core.goalPhaseSplit
@@ -444,12 +444,12 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('triage_goal', {
-    description: 'gm only: choose the flow for a goal waiting in triage. quick = one delivery chain, product acceptance closes it, owner not involved; standard = gm plans deliveries, owner G3; program = product scope proposal first, then plan, owner G3.',
+    description: 'owner only: choose the flow for a goal waiting in triage. quick = one delivery chain, product acceptance closes it, owner not involved; standard = owner plans deliveries, owner G3; program = product scope proposal first, then plan, owner G3.',
     inputSchema: z.object({ goalId: z.string().min(1), tier: z.enum(tiers), reason: z.string().min(4) }),
   }, async (input, ctx) => run(token(ctx), () => core.triageGoal(token(ctx), input)));
 
   server.registerTool('create_delivery', {
-    description: 'gm/product: create the delivery chain for one code change under a goal: implement (engineering, peer review) -> release request (product or Jev decides go-live) -> merge, deploy and production verification (qa). project optionally binds all three legs to a registered project; codeRepoPath (or a spec naming the ops repo path) binds all three legs to that code repository. The three legs form one worktree lane (one tree, one branch); pass lane to put related deliveries of the same goal into the same lane, otherwise every delivery gets its own lane and runs in parallel with the others. The explicit dependencies are external input: at most 50 raw entries, each a 1-200 character task id, checked before de-duplication by the same core validator create_task uses; a refusal writes no task, audit, outbox or idempotency row.',
+    description: 'product: create the delivery chain for one code change under a goal: implement (engineering, peer review) -> release request (product or Jev decides go-live) -> merge, deploy and production verification (qa). project optionally binds all three legs to a registered project; codeRepoPath (or a spec naming the ops repo path) binds all three legs to that code repository. The three legs form one worktree lane (one tree, one branch); pass lane to put related deliveries of the same goal into the same lane, otherwise every delivery gets its own lane and runs in parallel with the others. The explicit dependencies are external input: at most 50 raw entries, each a 1-200 character task id, checked before de-duplication by the same core validator create_task uses; a refusal writes no task, audit, outbox or idempotency row.',
     inputSchema: z.object({
       goalId: z.string().min(1), title: z.string().min(3), spec: z.string().min(20),
       discipline: z.string().min(1).max(60).optional(),
@@ -491,7 +491,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.recordAcceptanceEvidence(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('deploy_drill_run', {
-    description: 'SYS-INT: start one controlled non-production two-face switch & rollback drill under the service drills root (isolated fork DB, dedicated ports; never production). Only the task holder (engineering) or gm; audited.',
+    description: 'SYS-INT: start one controlled non-production two-face switch & rollback drill under the service drills root (isolated fork DB, dedicated ports; never production). Only the task holder (engineering) or owner; audited.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200), runId: z.string().min(36).max(36),
       baseSha: z.string().length(40), candidateSha: z.string().length(40), idempotencyKey: z.string().min(1),
@@ -506,19 +506,19 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.deployDrillStatus(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('acceptance_status', {
-    description: 'SYS02: read the versioned gate record and the current acceptance verdict for one task: every criterion, the verified evidence, and the unmet list. The task holder, its reviewer, or gm may read it.',
+    description: 'SYS02: read the versioned gate record and the current acceptance verdict for one task: every criterion, the verified evidence, and the unmet list. The task holder, its reviewer, or owner may read it.',
     inputSchema: z.object({ taskId: z.string().min(1).max(200) }),
   }, async (input, ctx) => run(token(ctx), () => core.acceptanceStatus
     ? core.acceptanceStatus(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('acceptance_gate', {
-    description: 'gm only: read the versioned acceptance gate record (enabled, enabledAt, scope, criteriaVersion).',
+    description: 'owner only: read the versioned acceptance gate record (enabled, enabledAt, scope, criteriaVersion).',
     inputSchema: z.object({}),
   }, async (_input, ctx) => run(token(ctx), () => core.acceptanceGate
     ? core.acceptanceGate(token(ctx))
     : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('set_acceptance_gate', {
-    description: 'gm only: change the acceptance gate with an expectedVersion and a reason. The before/after and the reason are audited; an executor cannot self-approve an exemption. Enabling records enabledAt, the cutoff that marks older tasks legacy.',
+    description: 'owner only: change the acceptance gate with an expectedVersion and a reason. The before/after and the reason are audited; an executor cannot self-approve an exemption. Enabling records enabledAt, the cutoff that marks older tasks legacy.',
     inputSchema: z.object({ enabled: z.boolean(), reason: z.string().min(4).max(2000),
       expectedVersion: z.number().int().nonnegative(), idempotencyKey: z.string().min(1) }),
   }, async (input, ctx) => run(token(ctx), () => core.setAcceptanceGate
@@ -533,7 +533,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('acceptance_mapping_import', {
-    description: 'SYS-INT, gm only: import one versioned acceptance-mapping bundle onto a legacy gated task. Requires the preview digest, the task expectedVersion (CAS), a reason and an idempotency key; audited. Refuses a stale digest, a downgrade or removal of required baselines, an occupied or done/void row, and a task that already carries versioned criteria. QA and executors cannot self-approve this.',
+    description: 'SYS-INT, owner only: import one versioned acceptance-mapping bundle onto a legacy gated task. Requires the preview digest, the task expectedVersion (CAS), a reason and an idempotency key; audited. Refuses a stale digest, a downgrade or removal of required baselines, an occupied or done/void row, and a task that already carries versioned criteria. QA and executors cannot self-approve this.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200), mappingKey: z.string().min(3).max(60),
       digest: z.string().regex(/^[0-9a-f]{64}$/), expectedVersion: z.number().int().positive(),
@@ -544,19 +544,19 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('record_owner_decision', {
-    description: 'gm only: record an owner decision given in direct conversation (approve/reject a gate, or reply to an owner question). Quote the owner verbatim.',
+    description: 'owner only: record an owner decision given in direct conversation (approve/reject a gate, or reply to an owner question). Quote the owner verbatim.',
     inputSchema: z.object({
       taskId: z.string().min(1), decision: z.enum(['approve', 'reject', 'reply']), note: z.string(), ...relayShape,
     }),
   }, async (input, ctx) => run(token(ctx), () => core.relayOwnerDecision(token(ctx), input)));
 
   server.registerTool('set_direction', {
-    description: 'gm only: record a company direction the owner gave in direct conversation; shown to every employee in get_context.',
+    description: 'owner only: record a company direction the owner gave in direct conversation; shown to every employee in get_context.',
     inputSchema: z.object({ text: z.string().min(2), ...relayShape }),
   }, async (input, ctx) => run(token(ctx), async () => { await core.relayDirection(token(ctx), input); return { recorded: true }; }));
 
   server.registerTool('resume_task', {
-    description: 'gm only: resume a blocked task. For windowed operations pass executionWindow bound to a completed independent approval dependency and its immutable candidate expiry/digest. Expired windows require resampling and new approval; plain resume cannot extend them. Optionally pass standbyEmployee to assign a bounded standby holder atomically (FV06): the resume transaction writes doing + the holder lease + progress_at and standby_until = min(window notAfter, now + standby budget), allocates the registered worktree like a claim, and the holder is woken until standby_until — past it the task returns to this gm gate, never the ready pool. Every claim-grade guard (role, quota/provider, policy, independence, avoidance, dependencies, worktree registration) applies; any refusal leaves the task blocked.',
+    description: 'owner only: resume a blocked task. For windowed operations pass executionWindow bound to a completed independent approval dependency and its immutable candidate expiry/digest. Expired windows require resampling and new approval; plain resume cannot extend them. Optionally pass standbyEmployee to assign a bounded standby holder atomically (FV06): the resume transaction writes doing + the holder lease + progress_at and standby_until = min(window notAfter, now + standby budget), allocates the registered worktree like a claim, and the holder is woken until standby_until — past it the task returns to this owner gate, never the ready pool. Every claim-grade guard (role, quota/provider, policy, independence, avoidance, dependencies, worktree registration) applies; any refusal leaves the task blocked.',
     inputSchema: z.object({ taskId: z.string().min(1), ...evidenceShape,
       standbyEmployee: z.string().min(1).max(200).optional() }),
   }, async (input, ctx) => run(token(ctx), () => input.standbyEmployee && core.resumeStandby
@@ -564,7 +564,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : core.resume(token(ctx), input.taskId, evidence(input))));
 
   server.registerTool('verify_standby', {
-    description: 'gm only (FV06 P1): read-only standby precheck. For each {taskId, employeeId, executionWindow?} pair re-evaluates every standby assignment precondition (claim-grade role/workspace/discipline/active-task/implementer-binding checks, the effective policy verdict, the independence gate, an unexpired execution window — the one you pass or the one already bound — and provider quota/health with the same source as the dispatcher) and returns per-item {ok, code}. Writes no task state and consumes no budget; each item is audited. Passing proves only this instant — never a dispatch promise: the real relay is the resume standby transaction, and in-window quota/liveness of the holder is still not guaranteed.',
+    description: 'owner only (FV06 P1): read-only standby precheck. For each {taskId, employeeId, executionWindow?} pair re-evaluates every standby assignment precondition (claim-grade role/workspace/discipline/active-task/implementer-binding checks, the effective policy verdict, the independence gate, an unexpired execution window — the one you pass or the one already bound — and provider quota/health with the same source as the dispatcher) and returns per-item {ok, code}. Writes no task state and consumes no budget; each item is audited. Passing proves only this instant — never a dispatch promise: the real relay is the resume standby transaction, and in-window quota/liveness of the holder is still not guaranteed.',
     inputSchema: z.object({
       items: z.array(z.object({ taskId: z.string().min(1), employeeId: z.string().min(1),
         executionWindow: executionWindowSchema.optional() })).min(1).max(20),
@@ -575,7 +575,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('defer_task_until', {
-    description: 'gm only: turn a gm-blocked execute task, or a normal non-owner review block with a provable original submit and reviewer block, into a dependency wait — it stays blocked (the manager is no longer woken for it), the gm flag clears, and it restores ready (execute) or review (review) when every dependency is done; with continuation=manager it returns to GM instead, including when dependencies are already done. Use manager for further sampling, approval or scheduling decisions. Every prerequisite must be a real dependency task. Owner gates and unprovable review history are refused.',
+    description: 'owner only: turn a owner-blocked execute task, or a normal non-owner review block with a provable original submit and reviewer block, into a dependency wait — it stays blocked (no wake is sent for it), the owner-blocked flag clears, and it restores ready (execute) or review (review) when every dependency is done; with continuation=manager it returns to the owner gate instead, including when dependencies are already done. Use manager for further sampling, approval or scheduling decisions. Every prerequisite must be a real dependency task. Owner gates and unprovable review history are refused.',
     inputSchema: z.object({
       taskId: z.string().min(1),
       dependencies: z.array(z.string().min(1)).min(1).max(20),
@@ -587,7 +587,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.deferTaskUntil(token(ctx), input)));
 
   server.registerTool('append_dependency_prerequisites', {
-    description: 'gm only: append real prerequisites to an EXISTING execute-phase dependency wait (a task already waiting on a reference task, not a gm block). The wait reference and all existing dependencies stay; new same-goal task ids are appended and the continuation becomes manager, so when the wait and every prerequisite finish the task returns to GM instead of resuming an employee. Owner gates, review-phase waits, live leases, terminal tasks, cross-goal and cyclic dependencies are refused. Version CAS and idempotent; it never resumes the task, clears faults/budgets or widens ordinary dispatch.',
+    description: 'owner only: append real prerequisites to an EXISTING execute-phase dependency wait (a task already waiting on a reference task, not an owner block). The wait reference and all existing dependencies stay; new same-goal task ids are appended and the continuation becomes manager, so when the wait and every prerequisite finish the task returns to the owner gate instead of resuming an employee. Owner gates, review-phase waits, live leases, terminal tasks, cross-goal and cyclic dependencies are refused. Version CAS and idempotent; it never resumes the task, clears faults/budgets or widens ordinary dispatch.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200),
       dependencies: z.array(z.string().min(1).max(200)).min(1).max(20),
@@ -600,7 +600,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('retire_task', {
-    description: 'gm/product only: retire a task to the terminal void state. Releases any live lease, and blocked dependents waiting on it re-evaluate (void counts as satisfied) so downstream chains unlock. Repeating on a void task is a no-op; done tasks refuse.',
+    description: 'product only: retire a task to the terminal void state. Releases any live lease, and blocked dependents waiting on it re-evaluate (void counts as satisfied) so downstream chains unlock. Repeating on a void task is a no-op; done tasks refuse.',
     inputSchema: z.object({
       taskId: z.string().min(1),
       text: z.string().min(4).max(8000),
@@ -610,7 +610,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.retireTask(token(ctx), input)));
 
   server.registerTool('claim_disposition', {
-    description: 'Manager (gm/product, manage) only: take this blocking episode\'s disposition claim. The episode is task + phase + start (sinceMs = the episode start in milliseconds; a gm-blocked task carries it as dispatchBlockedSince seconds in get_context, a manager todo as its episode). Exactly one manager wins: a second claim answers already_handled (with the decision that closed it) or held_by_other (with the holder and lease), never a second disposition. takeover true takes over an EXPIRED lease and requires expectedEpisodeVersion. Nothing is written to the task by claiming.',
+    description: 'manage only (product; owner via owner API): take this blocking episode\'s disposition claim. The episode is task + phase + start (sinceMs = the episode start in milliseconds; a owner-blocked task carries it as dispatchBlockedSince seconds in get_context, a manager todo as its episode). Exactly one manager wins: a second claim answers already_handled (with the decision that closed it) or held_by_other (with the holder and lease), never a second disposition. takeover true takes over an EXPIRED lease and requires expectedEpisodeVersion. Nothing is written to the task by claiming.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200),
       phase: z.enum(['execute', 'review']),
@@ -629,7 +629,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('release_disposition', {
-    description: 'Manager: hand a disposition claim back before its lease expires (the episode becomes claimable again immediately instead of waiting for the lease, and the episode version rises). Needs the claim token from claim_disposition; only the holder may release. Audited.',
+    description: 'Owner: hand a disposition claim back before its lease expires (the episode becomes claimable again immediately instead of waiting for the lease, and the episode version rises). Needs the claim token from claim_disposition; only the holder may release. Audited.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200),
       phase: z.enum(['execute', 'review']),
@@ -653,7 +653,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('decide_disposition', {
-    description: 'Manager: one episode, one decision. Records resume, defer, dependency (adds the dependencies), retire or repair (builds the repair task) behind a compare-and-set on the claim token + episodeVersion + expectedVersion (the task version you read) and an actor-independent business idempotency key, so twenty concurrent requests, a swapped employee, a restart or a replayed response all read ONE disposition and ONE repair chain. Refused for a non-holder, an expired lease, a moved version and an already handled episode; the task change, its audit row and the notification outbox land in one transaction. Requires the claim token from claim_disposition.',
+    description: 'Owner: one episode, one decision. Records resume, defer, dependency (adds the dependencies), retire or repair (builds the repair task) behind a compare-and-set on the claim token + episodeVersion + expectedVersion (the task version you read) and an actor-independent business idempotency key, so twenty concurrent requests, a swapped employee, a restart or a replayed response all read ONE disposition and ONE repair chain. Refused for a non-holder, an expired lease, a moved version and an already handled episode; the task change, its audit row and the notification outbox land in one transaction. Requires the claim token from claim_disposition.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200),
       phase: z.enum(['execute', 'review']),
@@ -730,7 +730,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('attribute_ci_run', {
-    description: 'gm only: attach manager-supplied evidence to an out-of-band external action and name the real internal employee it is attributed to (attribute_ci_run is never called by the person being attributed). Requires an evidence text of at least 20 characters, kept verbatim on the record and in the audit row; until then the record stays unknown_actor. Never converts an unknown actor into an internal one without evidence.',
+    description: 'owner only: attach manager-supplied evidence to an out-of-band external action and name the real internal employee it is attributed to (attribute_ci_run is never called by the person being attributed). Requires an evidence text of at least 20 characters, kept verbatim on the record and in the audit row; until then the record stays unknown_actor. Never converts an unknown actor into an internal one without evidence.',
     inputSchema: z.object({
       actionKey: z.string().min(8).max(200),
       employeeId: z.string().min(1).max(200),
@@ -752,14 +752,14 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('goal_acceptance_preview', {
-    description: 'gm only (manage): read-only dry-run for repointing a quick/software goal whose manual/acceptance reference still points at an erroneously voided acceptance task. Returns the live references, the unfinished goal work, the candidate checks and the snapshot hash that goal_acceptance_repair must echo. Writes nothing.',
+    description: 'owner only (manage): read-only dry-run for repointing a quick/software goal whose manual/acceptance reference still points at an erroneously voided acceptance task. Returns the live references, the unfinished goal work, the candidate checks and the snapshot hash that goal_acceptance_repair must echo. Writes nothing.',
     inputSchema: z.object({ goalId: z.string().min(1).max(100), candidateTaskId: z.string().min(1).max(200).optional() }),
   }, async (input, ctx) => run(token(ctx), () => core.goalAcceptancePreview
     ? core.goalAcceptancePreview(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('goal_acceptance_repair', {
-    description: 'gm only (manage): commit the acceptance reference repair in one audited compare-and-set transaction. Repoints manual/acceptance and anchors from the expected void task to a blocked product→gm candidate that depends on all unfinished goal work. Needs the snapshotHash from goal_acceptance_preview, a reason and an idempotencyKey; the same key with the same payload returns the original result. The repairing gm cannot claim, accept, return or block the repaired candidate; another gm must review it.',
+    description: 'owner only (manage): commit the acceptance reference repair in one audited compare-and-set transaction. Repoints manual/acceptance and anchors from the expected void task to a blocked product→owner candidate that depends on all unfinished goal work. Needs the snapshotHash from goal_acceptance_preview, a reason and an idempotencyKey; the same key with the same payload returns the original result. The repairing owner cannot claim, accept, return or block the repaired candidate; the assigned reviewer of the candidate must review it.',
     inputSchema: z.object({
       goalId: z.string().min(1).max(100),
       expectedOldTaskId: z.string().min(1).max(200),
@@ -773,7 +773,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('goal_console', {
-    description: 'gm only, read-only: one paged goal console. Each goal carries deadline (exact or unknown, never computed), outcome contract and required evidence, stages (implementation/release/production QA/customer activation/adoption/owner final), every open blocker with responsible role/holder/wait duration/next trigger/dependency path, effective final gate and its evidence, and the source task ids plus a taskTotal. Dependency edges that leave the goal are resolved against the whole task table: one that exists in another goal is crossGoal (with that goal and the task state), one that exists in no goal is unscoped external work, and only a row found nowhere is dangling. Blocker, source-id and graph lists are capped with omitted counts; use get_context with goalId for the full paged task list. Continue with page.nextCursor while page.hasMore. Pages are deterministic and never write.',
+    description: 'owner only, read-only: one paged goal console. Each goal carries deadline (exact or unknown, never computed), outcome contract and required evidence, stages (implementation/release/production QA/customer activation/adoption/owner final), every open blocker with responsible role/holder/wait duration/next trigger/dependency path, effective final gate and its evidence, and the source task ids plus a taskTotal. Dependency edges that leave the goal are resolved against the whole task table: one that exists in another goal is crossGoal (with that goal and the task state), one that exists in no goal is unscoped external work, and only a row found nowhere is dangling. Blocker, source-id and graph lists are capped with omitted counts; use get_context with goalId for the full paged task list. Continue with page.nextCursor while page.hasMore. Pages are deterministic and never write.',
     inputSchema: z.object({
       goalId: z.string().min(1).max(100).nullish(),
       includeClosed: z.boolean().nullish(),
@@ -785,14 +785,14 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('goal_governance_scan', {
-    description: 'gm only, read-only dry-run: scan active, needs_repair and done goals for a missing/void/superseded final gate, dependency cycles, graph edges (cross-goal and unscoped external references are classified with their real state; only a dependency that exists nowhere is dangling), missing outcome contracts and missing evidence. It writes nothing, never closes/voids/approves a goal and never rewrites a historical owner decision. The scan is deterministically paged: each page fits the 48 KiB response budget and carries page.nextCursor/hasMore/total/snapshotAt plus global counts; follow nextCursor until hasMore is false to cover every goal. Cards omitted from a page are counted in truncated (and a reduced card is marked detailsOmitted, with capped graph lists counted in graphOmitted); nothing is silently dropped.',
+    description: 'owner only, read-only dry-run: scan active, needs_repair and done goals for a missing/void/superseded final gate, dependency cycles, graph edges (cross-goal and unscoped external references are classified with their real state; only a dependency that exists nowhere is dangling), missing outcome contracts and missing evidence. It writes nothing, never closes/voids/approves a goal and never rewrites a historical owner decision. The scan is deterministically paged: each page fits the 48 KiB response budget and carries page.nextCursor/hasMore/total/snapshotAt plus global counts; follow nextCursor until hasMore is false to cover every goal. Cards omitted from a page are counted in truncated (and a reduced card is marked detailsOmitted, with capped graph lists counted in graphOmitted); nothing is silently dropped.',
     inputSchema: z.object({ ...pageArgs }),
   }, async (input, ctx) => run(token(ctx), () => core.goalGovernanceScan
     ? core.goalGovernanceScan(token(ctx), withoutNull(input))
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('goal_metrics', {
-    description: 'gm only, read-only: business metrics for a window [from,to) with an IANA timezone. Reports goal/task cycle time, first-pass acceptance rate, repeated blocks per task+phase episode, repeated manager wakes without checkpoints/submits, and model token usage per accepted task and per goal. Actual cost is unknown unless every usage row carries a provider-billed cost; token counts are never converted into money. Denominators, exclusions, data cutoff and coverage are explicit. A window whose full answer fits the budget returns it whole; otherwise the answer is a section index (sections, window, denominators, exclusions, cutoff, coverage) and each section is read with section plus pageSize/cursor, where list-shaped sections paginate until page.hasMore is false.',
+    description: 'owner only, read-only: business metrics for a window [from,to) with an IANA timezone. Reports goal/task cycle time, first-pass acceptance rate, repeated blocks per task+phase episode, repeated manager wakes without checkpoints/submits, and model token usage per accepted task and per goal. Actual cost is unknown unless every usage row carries a provider-billed cost; token counts are never converted into money. Denominators, exclusions, data cutoff and coverage are explicit. A window whose full answer fits the budget returns it whole; otherwise the answer is a section index (sections, window, denominators, exclusions, cutoff, coverage) and each section is read with section plus pageSize/cursor, where list-shaped sections paginate until page.hasMore is false.',
     inputSchema: z.object({
       from: z.string().min(1).max(40).nullish(),
       to: z.string().min(1).max(40).nullish(),
@@ -808,7 +808,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('goal_outcome_register', {
-    description: 'gm only (manage): register or replace a goal’s structured expected outcome, required evidence and responsible role. expectedVersion 0 creates the first contract; the current version is required for a scope change. A deadline must be an absolute instant with an offset; omitting it leaves the deadline unknown. Version-locked, audited and idempotent.',
+    description: 'owner only (manage): register or replace a goal’s structured expected outcome, required evidence and responsible role. expectedVersion 0 creates the first contract; the current version is required for a scope change. A deadline must be an absolute instant with an offset; omitting it leaves the deadline unknown. Version-locked, audited and idempotent.',
     inputSchema: z.object({
       goalId: z.string().min(1).max(100),
       expectedVersion: z.number().int().min(0),
@@ -825,7 +825,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('goal_evidence_record', {
-    description: 'gm only (manage): record one immutable outcome receipt (customer activation/adoption, production QA, release or implementation record). Requires a real source and confirmedBy human/external receipt; test accounts, local test URLs and AI/model confirmers are refused. owner_final cannot be typed in: it must come from the real owner relay decision on the final gate. Audited and idempotent.',
+    description: 'owner only (manage): record one immutable outcome receipt (customer activation/adoption, production QA, release or implementation record). Requires a real source and confirmedBy human/external receipt; test accounts, local test URLs and AI/model confirmers are refused. owner_final cannot be typed in: it must come from the real owner relay decision on the final gate. Audited and idempotent.',
     inputSchema: z.object({
       goalId: z.string().min(1).max(100),
       kind: z.enum(['implementation','release','deploy_qa','customer_activation','customer_adoption','feedback']),
@@ -843,21 +843,21 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('goal_finalize', {
-    description: 'gm only: re-evaluate one goal’s final gate and required evidence. Marks the goal done only when the final gate is done, an owner gate carries the real owner relay approval, and every required receipt exists; otherwise records needs_repair with the concrete reasons. It never accepts a task or substitutes for the owner decision.',
+    description: 'owner only: re-evaluate one goal’s final gate and required evidence. Marks the goal done only when the final gate is done, an owner gate carries the real owner relay approval, and every required receipt exists; otherwise records needs_repair with the concrete reasons. It never accepts a task or substitutes for the owner decision.',
     inputSchema: z.object({ goalId: z.string().min(1).max(100) }),
   }, async (input, ctx) => run(token(ctx), () => core.goalFinalize
     ? core.goalFinalize(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('goal_final_gate_preview', {
-    description: 'gm only (manage), read-only: preview replacing a goal final gate that is void, superseded or missing. Shows the current gate, candidate checks (same goal, open/unleased/unsubmitted, correct reviewer role, depends on all unfinished work, no cycle) and the snapshot hash required by goal_final_gate_repair. Writes nothing.',
+    description: 'owner only (manage), read-only: preview replacing a goal final gate that is void, superseded or missing. Shows the current gate, candidate checks (same goal, open/unleased/unsubmitted, correct reviewer role, depends on all unfinished work, no cycle) and the snapshot hash required by goal_final_gate_repair. Writes nothing.',
     inputSchema: z.object({ goalId: z.string().min(1).max(100), candidateTaskId: z.string().min(1).max(200).optional() }),
   }, async (input, ctx) => run(token(ctx), () => core.goalFinalGatePreview
     ? core.goalFinalGatePreview(token(ctx), withoutNull(input) as never)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('goal_final_gate_repair', {
-    description: 'gm only (manage): CAS repair of a goal final-gate reference to a candidate that depends on all unfinished goal work. Needs the preview snapshotHash, expected goal version and reason. Audited; never releases a lease, accepts a gate or marks the goal done. The repairing gm cannot review the candidate.',
+    description: 'owner only (manage): CAS repair of a goal final-gate reference to a candidate that depends on all unfinished goal work. Needs the preview snapshotHash, expected goal version and reason. Audited; never releases a lease, accepts a gate or marks the goal done. The repairing owner cannot review the candidate.',
     inputSchema: z.object({
       goalId: z.string().min(1).max(100),
       candidateTaskId: z.string().min(1).max(200),
@@ -872,14 +872,14 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('contributor_dryrun', {
-    description: 'gm only, read-only: for up to 20 tasks, who authored and reviewed each one from its audit stream, the implementer status with a suggestion that writes nothing, and the audit timeline with each row role. Use it before any implementer repair; it never changes a lease, submitter, gate or history.',
+    description: 'owner only, read-only: for up to 20 tasks, who authored and reviewed each one from its audit stream, the implementer status with a suggestion that writes nothing, and the audit timeline with each row role. Use it before any implementer repair; it never changes a lease, submitter, gate or history.',
     inputSchema: z.object({ taskIds: z.array(z.string().min(1).max(200)).min(1).max(20) }),
   }, async (input, ctx) => run(token(ctx), () => core.contributorDryRun
     ? core.contributorDryRun(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('implementer_takeover', {
-    description: 'gm only (manage): record a new code implementer for an execute-phase engineering task whose bound implementer cannot continue (withdrawn, departed, durable quota or runtime failure). Compare-and-set on expectedVersion. A current reviewer taking over needs a named independent replacementReviewer. Authorship is never removed; a lease held by someone else is revoked in the same write. The same idempotencyKey with the same payload returns the original result.',
+    description: 'owner only (manage): record a new code implementer for an execute-phase engineering task whose bound implementer cannot continue (withdrawn, departed, durable quota or runtime failure). Compare-and-set on expectedVersion. A current reviewer taking over needs a named independent replacementReviewer. Authorship is never removed; a lease held by someone else is revoked in the same write. The same idempotencyKey with the same payload returns the original result.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200),
       toEmployee: z.string().min(1).max(200),
@@ -893,7 +893,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('independence_set', {
-    description: 'Manager (manage capability) only: write a task independence policy. Contributors of the source tasks (every execute-phase handler, including a claim that never submitted; with all_handlers also the reviewers), the named employees, and anyone sharing a registered identity principal with either, may not take the task (execute) or decide it (review). A definition, provider, model, name or directory is never an identity, so its other employees stay independent (SYS-DISP Q3). Compare-and-set on expectedVersion; refused while the task is leased; a second write with the same idempotencyKey and payload returns the original result.',
+    description: 'Owner (manage capability) only: write a task independence policy. Contributors of the source tasks (every execute-phase handler, including a claim that never submitted; with all_handlers also the reviewers), the named employees, and anyone sharing a registered identity principal with either, may not take the task (execute) or decide it (review). A definition, provider, model, name or directory is never an identity, so its other employees stay independent (SYS-DISP Q3). Compare-and-set on expectedVersion; refused while the task is leased; a second write with the same idempotencyKey and payload returns the original result.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200),
       stages: z.array(z.enum(['execute', 'review'])).min(1).max(2),
@@ -909,7 +909,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('independence_check', {
-    description: 'gm or qa, read-only: the formal candidate-level preflight of the independence gate. Answers whether one employee would be refused by one task independence policy at one stage: clear (the gate would admit them), conflict (it would refuse, with the same via/source/matched/role/principal and the contribution auditRef its refusal cites), unverifiable (the exclusion could not be read, so the gate fails closed — never a pass), or not_applicable (the task has no policy). The policy field echoes the registered revision, stages, mode, sources, excluded, setBy and setAt so qa can read the real values back. stage defaults to the task current phase (review while in review, else execute). Writes nothing at all: no lease, no version, no audit, no dispatch — so a done or void task is still readable. gm always, qa always; every other role is refused.',
+    description: 'qa, read-only: the formal candidate-level preflight of the independence gate. Answers whether one employee would be refused by one task independence policy at one stage: clear (the gate would admit them), conflict (it would refuse, with the same via/source/matched/role/principal and the contribution auditRef its refusal cites), unverifiable (the exclusion could not be read, so the gate fails closed — never a pass), or not_applicable (the task has no policy). The policy field echoes the registered revision, stages, mode, sources, excluded, setBy and setAt so qa can read the real values back. stage defaults to the task current phase (review while in review, else execute). Writes nothing at all: no lease, no version, no audit, no dispatch — so a done or void task is still readable. qa always; every other role is refused.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200),
       employeeId: z.string().min(1).max(200),
@@ -920,7 +920,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('identity_principal_set', {
-    description: 'Manager (manage capability) only: register an identity principal, or set its exact employee set, under a compare-and-set. A principal is the ONLY link that makes two employeeIds one person for independence purposes: contributors of a source task, and employees a manager names, may not take (execute) or decide (review) a task, and neither may anyone who shares a registered principal with them. A definition, provider, model, name or directory never implies the link, and an unregistered link is never recognized. Requires a reason (audited); refused while any named employee holds a live lease; a second write with the same idempotencyKey and payload returns the original result.',
+    description: 'Owner (manage capability) only: register an identity principal, or set its exact employee set, under a compare-and-set. A principal is the ONLY link that makes two employeeIds one person for independence purposes: contributors of a source task, and employees a manager names, may not take (execute) or decide (review) a task, and neither may anyone who shares a registered principal with them. A definition, provider, model, name or directory never implies the link, and an unregistered link is never recognized. Requires a reason (audited); refused while any named employee holds a live lease; a second write with the same idempotencyKey and payload returns the original result.',
     inputSchema: z.object({
       principalId: z.string().min(1).max(200).optional(),
       employees: z.array(z.string().min(1).max(200)).min(1).max(20),
@@ -957,7 +957,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   const policyDomainSchema = z.enum(['write_authority', 'tool_scope', 'gate']);
 
   server.registerTool('policy_set', {
-    description: 'gm or product (manage) only: write one version of a machine policy. Three domains, each with a fixed typed payload and no free text: write_authority (codeRoles/intents/lanes), tool_scope (allowedTools/allowedAliases, newSpend must be false), gate (requireOwnerApproval/requireIndependentReviewer/requiredCriteriaLegs). Scopes are the chain task > goal > project > company; the nearest active version of a domain wins. Versions only grow and never change in place: replacing an active version requires the explicit supersedes record id, a second active version in the same scope+domain is refused, cross-scope supersede, cycles, expired targets and a forged ownerQuote are refused. source=owner needs the gm role and a quote that matches a registered owner direction. Compare-and-set on the internal policy epoch; a second call with the same idempotencyKey and payload returns the original version.',
+    description: 'product (manage) or owner only: write one version of a machine policy. Three domains, each with a fixed typed payload and no free text: write_authority (codeRoles/intents/lanes), tool_scope (allowedTools/allowedAliases, newSpend must be false), gate (requireOwnerApproval/requireIndependentReviewer/requiredCriteriaLegs). Scopes are the chain task > goal > project > company; the nearest active version of a domain wins. Versions only grow and never change in place: replacing an active version requires the explicit supersedes record id, a second active version in the same scope+domain is refused, cross-scope supersede, cycles, expired targets and a forged ownerQuote are refused. source=owner needs the owner role and a quote that matches a registered owner direction. Compare-and-set on the internal policy epoch; a second call with the same idempotencyKey and payload returns the original version.',
     inputSchema: z.object({
       policyId: z.string().min(3).max(60), scope: policyScopeSchema, scopeRef: z.string().min(1).max(200).optional(),
       domain: policyDomainSchema, payload: policyPayloadSchema, supersedes: z.string().min(1).max(200).optional(),
@@ -970,14 +970,14 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('policy_revoke', {
-    description: 'gm or product (manage) only: revoke the active version of a machine policy. Emergency revocation is immediate: the policy epoch moves, so the effective contract every in-flight task and lease is checked against no longer contains this authorization. The row stays as history (queryable via policy_list includeInactive); it is only no longer the authorizing version. Idempotent per (key, payload).',
+    description: 'product (manage) or owner only: revoke the active version of a machine policy. Emergency revocation is immediate: the policy epoch moves, so the effective contract every in-flight task and lease is checked against no longer contains this authorization. The row stays as history (queryable via policy_list includeInactive); it is only no longer the authorizing version. Idempotent per (key, payload).',
     inputSchema: z.object({ policyId: z.string().min(1).max(200), reason: z.string().min(2).max(4000), idempotencyKey: z.string().min(8).max(200) }),
   }, async (input, ctx) => run(token(ctx), () => core.policyRevoke
     ? core.policyRevoke(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('policy_list', {
-    description: 'gm or product (manage) only, read-only: list machine policy versions. By default only versions that are currently active (not superseded, not revoked); includeInactive adds the full history, so an active version A that was explicitly superseded by B is still queryable after B takes over. Every row carries the scope, domain, typed payload, authorization source and owner quote, effective/expiry times and content hash.',
+    description: 'product (manage) or owner only, read-only: list machine policy versions. By default only versions that are currently active (not superseded, not revoked); includeInactive adds the full history, so an active version A that was explicitly superseded by B is still queryable after B takes over. Every row carries the scope, domain, typed payload, authorization source and owner quote, effective/expiry times and content hash.',
     inputSchema: z.object({ scope: policyScopeSchema.optional(), scopeRef: z.string().min(1).max(200).optional(),
       domain: policyDomainSchema.optional(), includeInactive: z.boolean().optional() }),
   }, async (input, ctx) => run(token(ctx), () => core.policyList
@@ -985,7 +985,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('policy_effective', {
-    description: 'Read-only: the effective policy contract for a task, a goal/project scope, or an explicit scope chain. Returns the version, the content hash, the chain, the per-domain winning versions, the rendered contract text a prompt is allowed to carry, and human notes about what expired/was superseded. Machine allow/deny never depends on prompt text: the same call answers the same verdict with any prompt. Task access is limited to the task roles plus gm/product/qa/eval; goal/project/chain views are manager-only.',
+    description: 'Read-only: the effective policy contract for a task, a goal/project scope, or an explicit scope chain. Returns the version, the content hash, the chain, the per-domain winning versions, the rendered contract text a prompt is allowed to carry, and human notes about what expired/was superseded. Machine allow/deny never depends on prompt text: the same call answers the same verdict with any prompt. Task access is limited to the task roles plus product/qa/eval; goal/project/chain views are manager-only.',
     inputSchema: z.object({ taskId: z.string().min(1).max(200).optional(), goal: z.string().min(1).max(200).optional(),
       project: z.string().min(1).max(200).optional(),
       scopeChain: z.array(z.object({ scope: policyScopeSchema, scopeRef: z.string().min(1).max(200).optional() })).min(1).max(8).optional() }),
@@ -994,7 +994,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('policy_plan', {
-    description: 'gm or product (manage) only, read-only dry run: exactly the validation policy_set will run, plus what the change would do. Returns the before/after contracts, the per-domain diff, and the in-flight tasks whose registered contract hash would change, each flagged with whether it loses authorization. The candidate set is every in-flight task of the whole company with no policy_hash prefilter (it is not narrowed by the proposal scope), so tasks that predate the policy layer and carry no registration at all are listed too — they are exactly the ones a rollback to a release that does not execute policies would dispatch. affectedTasks is one page: page.total is the whole affected count, page.hasMore says whether more remain, and page.nextCursor continues them (pass it back as cursor with the same proposal); planHash covers the whole list (and the epoch) and is constant across pages; it is for cursor binding and human cross-checking, not a token policy_enforce consumes. Enforcement re-judges every task you name against the policy in force at that moment, so a named task that is still authorized is left alone and one that lost authorization is quarantined — but it only touches the ids you pass, so whatever appeared in flight after this plan was taken is not covered: re-run the plan before enforcing if the in-flight set may have moved. scanned, scanLimit and truncated report the database scan itself: truncated=true means the candidate set itself was cut (the scan reads newest first and pages by (created_at, id), so a concurrent create or completion cannot make it skip or repeat a row, while what a cut leaves out is the oldest in-flight work) and the plan is not complete — no argument narrows the candidate set, so this tool cannot produce the complete list in that case. Writes no policy and no task state; it does create its cursor signing key once, on first use.',
+    description: 'product (manage) or owner only, read-only dry run: exactly the validation policy_set will run, plus what the change would do. Returns the before/after contracts, the per-domain diff, and the in-flight tasks whose registered contract hash would change, each flagged with whether it loses authorization. The candidate set is every in-flight task of the whole company with no policy_hash prefilter (it is not narrowed by the proposal scope), so tasks that predate the policy layer and carry no registration at all are listed too — they are exactly the ones a rollback to a release that does not execute policies would dispatch. affectedTasks is one page: page.total is the whole affected count, page.hasMore says whether more remain, and page.nextCursor continues them (pass it back as cursor with the same proposal); planHash covers the whole list (and the epoch) and is constant across pages; it is for cursor binding and human cross-checking, not a token policy_enforce consumes. Enforcement re-judges every task you name against the policy in force at that moment, so a named task that is still authorized is left alone and one that lost authorization is quarantined — but it only touches the ids you pass, so whatever appeared in flight after this plan was taken is not covered: re-run the plan before enforcing if the in-flight set may have moved. scanned, scanLimit and truncated report the database scan itself: truncated=true means the candidate set itself was cut (the scan reads newest first and pages by (created_at, id), so a concurrent create or completion cannot make it skip or repeat a row, while what a cut leaves out is the oldest in-flight work) and the plan is not complete — no argument narrows the candidate set, so this tool cannot produce the complete list in that case. Writes no policy and no task state; it does create its cursor signing key once, on first use.',
     inputSchema: z.object({
       policyId: z.string().min(3).max(60), scope: policyScopeSchema, scopeRef: z.string().min(1).max(200).optional(),
       domain: policyDomainSchema, payload: policyPayloadSchema, supersedes: z.string().min(1).max(200).optional(),
@@ -1007,7 +1007,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('policy_enforce', {
-    description: 'gm or product (manage) only: isolate the in-flight tasks that policy_plan reported as losing authorization (RB01). Each named task is set to blocked with blocked_to=gm, its lease is released and the reason is recorded on the task, so every release — including an older one that knows nothing about policies — sees a waiting-on-gm task and never dispatches it. Tasks that are already closed or still authorized are reported instead of being touched. Audited per task; refuses an empty list. A call is limited to 200 task ids, while policy_plan pages through the whole list: read every page of the plan, then enforce its ids in batches of at most 200.',
+    description: 'product (manage) or owner only: isolate the in-flight tasks that policy_plan reported as losing authorization (RB01). Each named task is set to blocked with blocked_to=owner, its lease is released and the reason is recorded on the task, so every release — including an older one that knows nothing about policies — sees a waiting-on-owner task and never dispatches it. Tasks that are already closed or still authorized are reported instead of being touched. Audited per task; refuses an empty list. A call is limited to 200 task ids, while policy_plan pages through the whole list: read every page of the plan, then enforce its ids in batches of at most 200.',
     inputSchema: z.object({ taskIds: z.array(z.string().min(1).max(200)).min(1).max(200).optional(),
       reason: z.string().min(2).max(4000), idempotencyKey: z.string().min(8).max(200) }),
   }, async (input, ctx) => run(token(ctx), () => core.policyEnforce
@@ -1015,7 +1015,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('task_project_update', {
-    description: 'gm only: rebind a blocked, un-leased, never-submitted task to a registered project (task-level override over goal.project). Version-guarded, idempotent, audited; releases the stale worktree assignment through the normal lifecycle. Refuses doing/review/done tasks, active leases, submitted results and owner-blocked tasks.',
+    description: 'owner only: rebind a blocked, un-leased, never-submitted task to a registered project (task-level override over goal.project). Version-guarded, idempotent, audited; releases the stale worktree assignment through the normal lifecycle. Refuses doing/review/done tasks, active leases, submitted results and owner-blocked tasks.',
     inputSchema: z.object({
       taskId: z.string().min(1), project: z.string().min(1).max(60),
       expectedVersion: z.number().int().positive(), ...evidenceShape,
@@ -1025,7 +1025,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('bind_task_code_repo', {
-    description: 'gm only: bind an explicit code repository to a blocked execute-phase task (blocked_to=gm or a formal dependency wait; owner gates and review-phase blocks refuse). Only workspace allocation and dispatch repoHome/cwd follow the binding — the business project (opsScope/claim.json.project) is untouched. Targets are limited to the ops repo or a registered project repo_path, canonicalised (symlink/traversal escapes and unregistered paths refuse). Version-guarded, idempotent, audited; releases the stale worktree assignment through the normal lifecycle.',
+    description: 'owner only: bind an explicit code repository to a blocked execute-phase task (blocked_to=owner or a formal dependency wait; owner gates and review-phase blocks refuse). Only workspace allocation and dispatch repoHome/cwd follow the binding — the business project (opsScope/claim.json.project) is untouched. Targets are limited to the ops repo or a registered project repo_path, canonicalised (symlink/traversal escapes and unregistered paths refuse). Version-guarded, idempotent, audited; releases the stale worktree assignment through the normal lifecycle.',
     inputSchema: z.object({
       taskId: z.string().min(1), codeRepoPath: z.string().min(1).max(1000),
       expectedVersion: z.number().int().positive(), ...evidenceShape,
@@ -1035,7 +1035,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('task_intent_update', {
-    description: 'gm only: turn a blocked read-only engineering task (kind=task, blocked_to=gm or a dependency wait) into a code task in place, optionally naming its lane, instead of retiring it and creating a new code task. Owner gates, review-phase blocks, live leases and release/deploy legs refuse. Write authority is re-judged under the task policy; the implement-leg baseline acceptance criteria are merged while the gate is on; the read worktree assignment is released so the next claim gets an exclusive code tree. Version-guarded, idempotent, audited.',
+    description: 'owner only: turn a blocked read-only engineering task (kind=task, blocked_to=owner or a dependency wait) into a code task in place, optionally naming its lane, instead of retiring it and creating a new code task. Owner gates, review-phase blocks, live leases and release/deploy legs refuse. Write authority is re-judged under the task policy; the implement-leg baseline acceptance criteria are merged while the gate is on; the read worktree assignment is released so the next claim gets an exclusive code tree. Version-guarded, idempotent, audited.',
     inputSchema: z.object({
       taskId: z.string().min(1), lane: z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/).optional(),
       expectedVersion: z.number().int().positive(), ...evidenceShape,
@@ -1045,7 +1045,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('task_acceptance_amend', {
-    description: 'gm only (manage): append the boss\'s acceptance-requirement amendment to an in-flight task (ready/doing/review/blocked; done/void refuse). Append-only — state, blocked_to/resume_*, dependencies, acceptance criteria, independence, worktree and the lease (holder, delivery, fence, expiry) are untouched, and the task version does not move, so a live lease keeps working. The amendment is appended to the task context (visible on the next claim and through read_task_text field=context; the amended context is capped at 20000 characters, the same limit as create), the audit row keeps a JSON evidence with the verbatim ownerQuote, and every employee in notify (default: current lease holder + implementer + latest submitter; an explicit [] notifies nobody) gets a persistent holder_notices entry that the sidecar also attaches to its next call. Version-guarded (expectedVersion), idempotent.',
+    description: 'owner only (manage): append the boss\'s acceptance-requirement amendment to an in-flight task (ready/doing/review/blocked; done/void refuse). Append-only — state, blocked_to/resume_*, dependencies, acceptance criteria, independence, worktree and the lease (holder, delivery, fence, expiry) are untouched, and the task version does not move, so a live lease keeps working. The amendment is appended to the task context (visible on the next claim and through read_task_text field=context; the amended context is capped at 20000 characters, the same limit as create), the audit row keeps a JSON evidence with the verbatim ownerQuote, and every employee in notify (default: current lease holder + implementer + latest submitter; an explicit [] notifies nobody) gets a persistent holder_notices entry that the sidecar also attaches to its next call. Version-guarded (expectedVersion), idempotent.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200),
       expectedVersion: z.number().int().positive(),
@@ -1059,14 +1059,14 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('get_model_evidence', {
-    description:'eval/gm only: actual models and execution fences for final task evaluation. Combine with full submission/return/accept history; request counts are not quality scores.',
+    description:'eval/owner only: actual models and execution fences for final task evaluation. Combine with full submission/return/accept history; request counts are not quality scores.',
     inputSchema:z.object({taskId:z.string().min(1).max(200)}),
   },async(input,ctx)=>run(token(ctx),()=> {
     if(!core.modelEvidence) throw new Error('Model evidence unavailable');
     return core.modelEvidence(token(ctx),input.taskId);
   }));
   server.registerTool('get_task_cost', {
-    description: 'eval/gm/product, read-only: what one task consumed, from Magpie per-request usage matched by the task\'s lease sessions — requests, failed requests, input/output/cache tokens, USD over priced requests, unpriced count, model time, wall time from creation to acceptance, and the same per employee and per model. Settled once when the task is done and kept after raw request rows are pruned; complete=false means some session had no rows left in Magpie\'s window, so the totals are a lower bound.',
+    description: 'eval/owner, read-only: what one task consumed, from Magpie per-request usage matched by the task\'s lease sessions — requests, failed requests, input/output/cache tokens, USD over priced requests, unpriced count, model time, wall time from creation to acceptance, and the same per employee and per model. Settled once when the task is done and kept after raw request rows are pruned; complete=false means some session had no rows left in Magpie\'s window, so the totals are a lower bound.',
     inputSchema: z.object({ taskId: z.string().min(1).max(200) }),
   }, async (input, ctx) => run(token(ctx), () => core.taskCost
     ? core.taskCost(token(ctx), input.taskId)
@@ -1098,7 +1098,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     return (release ? { ...value, meta: { ...value.meta, runtimeRelease: release } } : value) as T;
   };
   server.registerTool('qa_observation_grant', {
-    description: 'gm only (manage): register a time-bounded, read-only QA observation scope. It binds one deployment task in QA review, its live review lease holder and fence, the same goal, an allowlist of subject task ids, an expiry (1 minute to 24 hours), a reason and an idempotency key. The scope cannot expand itself, read other goals, or expose SQL/files. The same key with the same payload returns the original scope; a different payload is a conflict.',
+    description: 'owner only (manage): register a time-bounded, read-only QA observation scope. It binds one deployment task in QA review, its live review lease holder and fence, the same goal, an allowlist of subject task ids, an expiry (1 minute to 24 hours), a reason and an idempotency key. The scope cannot expand itself, read other goals, or expose SQL/files. The same key with the same payload returns the original scope; a different payload is a conflict.',
     inputSchema: z.object({
       goalId: z.string().min(1).max(100), deploymentTaskId: z.string().min(1).max(200),
       qaEmployee: z.string().min(1).max(200), leaseFence: z.number().int().positive(),
@@ -1109,7 +1109,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.qaObservationGrant
     ? core.qaObservationGrant(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('qa_observation_revoke', {
-    description: 'gm only (manage): revoke a QA observation scope with compare-and-set on its version. The revoked scope fails closed on the QA side immediately; the same idempotency key with the same payload returns the original result.',
+    description: 'owner only (manage): revoke a QA observation scope with compare-and-set on its version. The revoked scope fails closed on the QA side immediately; the same idempotency key with the same payload returns the original result.',
     inputSchema: z.object({ scopeId: z.string().min(1).max(200), expectedVersion: z.number().int().positive(),
       reason: z.string().min(8).max(2000), idempotencyKey: z.string().min(8).max(200) }),
   }, async (input, ctx) => run(token(ctx), () => core.qaObservationRevoke
@@ -1117,7 +1117,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   // ---- SYS-INT 评审协同的持久事件唤醒 ----
   // 只做调度协调：订阅登记与结构化信号都只解除协同任务自己的 SYS05 feedback 等待，不生成 scope、不写验收。
   server.registerTool('review_watch_register', {
-    description: 'gm only (manage): register the one persistent watch of an ordered same-goal pair (source task reviewed by qa, collaboration task). Registration reads the current source state immediately, so a QA review lease or a structured request that already happened is delivered instead of lost. eventKinds defaults to authorization+positive. Re-registering the same pair re-opens the same watch; a different eventKinds set is refused. Idempotent by key.',
+    description: 'owner only (manage): register the one persistent watch of an ordered same-goal pair (source task reviewed by qa, collaboration task). Registration reads the current source state immediately, so a QA review lease or a structured request that already happened is delivered instead of lost. eventKinds defaults to authorization+positive. Re-registering the same pair re-opens the same watch; a different eventKinds set is refused. Idempotent by key.',
     inputSchema: z.object({
       sourceTaskId: z.string().min(1).max(200), collaborationTaskId: z.string().min(1).max(200),
       eventKinds: z.array(z.enum(['authorization', 'positive'])).min(1).max(2).optional(),
@@ -1126,7 +1126,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.reviewWatchRegister
     ? core.reviewWatchRegister(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('review_watch_close', {
-    description: 'gm only (manage): close a watch under its version. Undelivered events are invalidated and never replayed. Closing grants nothing and changes no task.',
+    description: 'owner only (manage): close a watch under its version. Undelivered events are invalidated and never replayed. Closing grants nothing and changes no task.',
     inputSchema: z.object({
       watchId: z.string().min(1).max(200), expectedVersion: z.number().int().positive(),
       reason: z.string().min(8).max(2000), idempotencyKey: z.string().min(8).max(200),
@@ -1134,7 +1134,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.reviewWatchClose
     ? core.reviewWatchClose(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('review_watch_status', {
-    description: 'gm sees every review watch, a qa employee the watches of tasks it reviews. Read-only: current source lease facts, the latest structured signal, and the event deliveries with their codes. Never returns task text.',
+    description: 'owner sees every review watch, a qa employee the watches of tasks it reviews. Read-only: current source lease facts, the latest structured signal, and the event deliveries with their codes. Never returns task text.',
     inputSchema: z.object({ watchId: z.string().max(200).optional(), sourceTaskId: z.string().max(200).optional(),
       collaborationTaskId: z.string().max(200).optional() }),
   }, async (input, ctx) => run(token(ctx), () => core.reviewWatchStatus
@@ -1151,17 +1151,17 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.qaReviewScopeSignal
     ? core.qaReviewScopeSignal(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('review_scope_signals', {
-    description: 'Read-only structured scope signals: gm sees all, a qa employee sees its own. Task ids and reasons only, never task text.',
+    description: 'Read-only structured scope signals: owner sees all, a qa employee sees its own. Task ids and reasons only, never task text.',
     inputSchema: z.object({ taskId: z.string().max(200).optional(), limit: z.number().int().min(1).max(50).optional() }),
   }, async (input, ctx) => run(token(ctx), () => core.reviewScopeSignals
     ? core.reviewScopeSignals(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('fault_status', {
-    description: 'Read-only diagnosis of a task\'s recovery budget: scopes (attempts/deadline/nextAllowedAt/lastErrno), episodes, and any open repair chain. Readable by the task holder, its reviewer, or gm. Secret-free: never returns credentials, upstream bodies, or aliases beyond what the ledger already stored. Use this when ops_login (or another ops tool) is refused with recovery budget spent / deadline passed, so the next attempt is planned against real counters instead of guessed.',
+    description: 'Read-only diagnosis of a task\'s recovery budget: scopes (attempts/deadline/nextAllowedAt/lastErrno), episodes, and any open repair chain. Readable by the task holder, its reviewer, or owner. Secret-free: never returns credentials, upstream bodies, or aliases beyond what the ledger already stored. Use this when ops_login (or another ops tool) is refused with recovery budget spent / deadline passed, so the next attempt is planned against real counters instead of guessed.',
     inputSchema: z.object({ taskId: z.string().min(1).max(200) }),
   }, async (input, ctx) => run(token(ctx), () => core.faultStatus
     ? core.faultStatus(token(ctx), { taskId: input.taskId }) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('fault_lift', {
-    description: 'gm only: lift a spent (or stopped) recovery budget for one incident of a task after the cause is fixed or a diagnosis has been recorded. Resets the existing scope so the next attempt starts a fresh recovery window. Creates no new budget and never invents an incident. Audited. Pass the incident from fault_status.',
+    description: 'owner only: lift a spent (or stopped) recovery budget for one incident of a task after the cause is fixed or a diagnosis has been recorded. Resets the existing scope so the next attempt starts a fresh recovery window. Creates no new budget and never invents an incident. Audited. Pass the incident from fault_status.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200),
       incident: z.string().min(1).max(500),
@@ -1171,7 +1171,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.faultLift
     ? core.faultLift(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('recovery_read_grant', {
-    description: 'gm + manage only: issue a one-shot recovery read grant for a terminal (done) source task that already has a fault episode. The named employee — never the issuer — may run exactly one LCA04_OPS operator login, the four fixed GETs in order and a necessary logout, all charged to the source task\'s own fault keys. The grant changes no task state, creates no budget and lifts none. Pass the four paths exactly (paths is required); expiresAt is 1–30 minutes. Audited.',
+    description: 'owner only: issue a one-shot recovery read grant for a terminal (done) source task that already has a fault episode. The named employee — never the issuer — may run exactly one LCA04_OPS operator login, the four fixed GETs in order and a necessary logout, all charged to the source task\'s own fault keys. The grant changes no task state, creates no budget and lifts none. Pass the four paths exactly (paths is required); expiresAt is 1–30 minutes. Audited.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200),
       employeeId: z.string().min(1).max(120),
@@ -1186,7 +1186,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.recoveryReadGrant
     ? core.recoveryReadGrant(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('recovery_read_grant_revoke', {
-    description: 'gm + manage only: revoke a recovery read grant. The channel closes the binding on its next check and drops only that grant\'s local session handles; the source task stays done. Audited.',
+    description: 'owner only: revoke a recovery read grant. The channel closes the binding on its next check and drops only that grant\'s local session handles; the source task stays done. Audited.',
     inputSchema: z.object({
       grantId: z.string().min(1).max(200),
       reason: z.string().min(4).max(2000),
@@ -1195,12 +1195,12 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.recoveryReadGrantRevoke
     ? core.recoveryReadGrantRevoke(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('recovery_read_status', {
-    description: 'Read-only recovery read ledger: grants and their calls (IDs, paths, statuses, outcome names, body digests) for a source task or one grant. gm sees all; the grantee and the source task\'s reviewer see their own. Never returns subject, session, token, URL or a response body.',
+    description: 'Read-only recovery read ledger: grants and their calls (IDs, paths, statuses, outcome names, body digests) for a source task or one grant. owner sees all; the grantee and the source task\'s reviewer see their own. Never returns subject, session, token, URL or a response body.',
     inputSchema: z.object({ taskId: z.string().min(1).max(200).optional(), grantId: z.string().min(1).max(200).optional() }),
   }, async (input, ctx) => run(token(ctx), () => core.recoveryReadStatus
     ? core.recoveryReadStatus(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('qa_observation_status', {
-    description: 'gm sees every QA observation scope; a qa employee sees its own. Never returns a code, token or session hash. Read-only.',
+    description: 'owner sees every QA observation scope; a qa employee sees its own. Never returns a code, token or session hash. Read-only.',
     inputSchema: z.object({}),
   }, async (_input, ctx) => run(token(ctx), () => core.qaObservationStatus
     ? core.qaObservationStatus(token(ctx)) : Promise.reject({ code: 'temporarily_unavailable' })));

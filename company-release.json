@@ -1,20 +1,22 @@
 {
-  "version": "0.3.77",
-  "title": "恢复唤醒可观测性与静默失败修复",
+  "version": "0.3.78",
+  "title": "派工体系重构：老板接口、极简消息流与撤销经理岗位",
   "changes": [
-    "修复恢复唤醒静默失败：activeRecoveryGrants 按 created_at 排序却未选取该字段，公司 fork 拒绝后被当作「没有 grant」；补选字段，读取失败改为 recovery wake read failed 日志。",
-    "2a 三处静默跳过各记一行结构化日志（grantId、instId、reason=no_instance|no_agent|state=busy|down|exhausted）；60s 节流跳过保持静默。",
-    "adoptRecovery 失败保留 failed 日志并记 last_skip_reason=failed；成功唤醒写入 last_wake_at 并清空跳过原因。",
-    "插件宿主 dispatcher 日志同时追加 <serviceHome>/logs/dispatcher.log（ISO 时间戳、append、best effort，写失败不影响调度）。",
-    "schema 050（增量）：recovery_read_grant 增补可选 last_wake_at / last_skip_reason，recovery_read_status 透出；不改 state 机、限额与路径集合。",
-    "启动自检：缺少 sidecar.adoptRecovery 时只记一次 recovery wake disabled: sidecar hook missing。",
-    "fork 回归新增六项：grant 读取根因、no_instance/busy/失败跳过、健康空闲一 tick 内 issued→bound、自检幂等；该文件在 recovery-fork 门禁内，skip 视为失败。"
+    "撤销 gm 岗位：seed/模板/调度器不再生成经理任务；report_blocker 一律路由老板；在途 gm 任务迁移到 owner、复核岗改 qa、执行岗作废并写审计。",
+    "新增老板令牌 private/owner-token（0600）与 /api/owner/* Bearer 接口；bin/sck owner <命令> <JSON> 与网页控制台共用，审计 actor=owner 带 via。",
+    "新增 outbound_message 表：建任务生成执行/复核两条 draft，可预览、编辑、设置需要我放行；发出后锁定并留存原文，hold 时不派工并进老板收件箱。",
+    "派工消息改为极简模板，只说做什么、在哪看需求、怎么交付；删除 onboarding 入职说明，首次接触不再追加任何内容。",
+    "task.md 只输出标题、需求（requirement）与验收标准（acceptance_text）；新增 051 schema 与 bootstrap 加载。",
+    "一个目标 = 一个需求 = 一个任务：软件线 engineering→qa，故事线 story-author→qa，视频线 concept-design→owner；多步由老板加任务与依赖串起来。",
+    "网页控制台重做为消息流大图：泳道、节点、连线、已发光点动画、待发虚线、hold 琥珀、阻塞红色，右侧抽屉编辑/放行/审计；10 秒刷新、明暗主题、窄屏横向滚动。",
+    "Paseo 插件「公司」入口加醒目按钮直达消息流页；移除给经理留言与插件 UI 里的经理文案。",
+    "新增测试覆盖：令牌鉴权、report_blocker 路由 owner、建单双草稿、hold 不派工、sent 锁定、正文来自表、task.md 仅需求/验收、迁移与模板去 gm。"
   ],
   "impact": [
-    "成功路径行为不变；新增仅为日志与两个可选字段。唯一的语义修复是让 2a 的 grant 读取真正生效——恢复唤醒本应如此。",
-    "不改 grant 状态机、登录/每路径限额与既有路径集合；不放宽也不新增任何工具。",
-    "迁移 050 纯增量，旧版 release 读不到两个字段即忽略（RB01）。"
+    "所有原本由经理做的判断交给老板；老板可请编制外 agent 持令牌代操作。员工侧不再有 manage 能力。",
+    "消息原文落库；已发消息不可再编辑。hold 的任务停在老板收件箱，直到放行。",
+    "schema 051 纯增量并含幂等迁移；旧版 release 读不到新表即忽略（RB01）。"
   ],
-  "migration": "新增 schema 050 两个可选字段（IF NOT EXISTS，纯增量、无回填）；在 049 的 recovery_read_grant / recovery_read_chain / recovery_read_call 三表基础上只加字段，bootstrap 把 marker 推至 50。旧版 release 读不到即忽略（RB01）。",
-  "rollback": "切回 0.3.76（releases/6ce60ff6…）。schema 050 纯增量，无需数据回滚；已签发 grant 在旧版按原语义处理。"
+  "migration": "bootstrap 加载 schema/051-role-message-flow.surql：新增 outbound_message 表与 task.requirement/acceptance_text 可选字段；幂等停用 gm 编制、把 blocked_to=gm 改为 owner、reviewer_role=gm 改为 qa、executor_role=gm 未完成置 void 并写 gm_role_retired 审计。服务启动/install 生成 private/owner-token（0600）。",
+  "rollback": "切回 0.3.77。schema 051 纯增量，无需数据回滚；已发出的消息与任务字段为新增，旧版忽略。gm 编制如需恢复需在旧版手工重新启用。"
 }
