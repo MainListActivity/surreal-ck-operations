@@ -176,11 +176,12 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
       if (req.method === "GET" && sub === "/api/inbox") return json(await (async()=>{const c=await opts.company();return c.upgrades?c.upgrades.inbox():c.owner.inbox();})());
       if (req.method === "GET" && sub === "/api/brief") return json(await (await opts.company()).owner.brief());
       if (req.method === "GET" && sub === "/api/tasks") {
-        const goalId = url.searchParams.get("goalId") ?? "";
+        const tag = url.searchParams.get("tag") ?? "";
         const { db } = await opts.company();
-        const { view, id } = await import("./vendor/src/core.ts");
+        const { view } = await import("./vendor/src/core.ts");
         const [rows] = await db.db.query<[unknown[]]>(
-          "SELECT * FROM task WHERE goal = $goal ORDER BY created_at, id;", { goal: id("goal", goalId) });
+          tag ? "SELECT * FROM task WHERE tag = $tag ORDER BY created_at, id;" : "SELECT * FROM task ORDER BY created_at, id LIMIT 500;",
+          tag ? { tag } : {});
         return json({ tasks: rows.map(r => view(r as Parameters<typeof view>[0])) });
       }
       if (req.method === "GET" && sub === "/api/task") {
@@ -286,12 +287,12 @@ ${relayShellCss}
 .main-area{display:grid;grid-template-rows:62px minmax(0,1fr)}
 .content{width:100%;max-width:none;margin:0;padding:0;display:grid;grid-template-columns:minmax(0,1fr) 360px;min-height:calc(100vh - 62px)}
 .flow-pane{min-width:0;overflow:auto;padding:18px 20px 40px}
-.goal-rail{display:flex;gap:8px;overflow-x:auto;padding-bottom:12px;margin-bottom:12px}
-.goal-chip{flex:none;min-width:180px;max-width:240px;padding:10px 12px;border:1px solid var(--relay-border);border-radius:10px;background:var(--relay-panel);cursor:pointer;text-align:left;color:var(--relay-text)}
-.goal-chip.active{border-color:var(--relay-accent-border);background:var(--relay-accent-soft)}
-.goal-chip strong{display:block;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.goal-chip small{display:block;color:var(--relay-faint);font-size:10px;margin-top:4px}
-.goal-chip .chip-cancel{height:22px;padding:0 7px;margin-left:6px;border:1px solid var(--relay-warning);border-radius:6px;background:transparent;color:var(--relay-warning);font-size:10px;font-weight:700;cursor:pointer}
+.chain-rail{display:flex;gap:8px;overflow-x:auto;padding-bottom:12px;margin-bottom:12px}
+.chain-chip{flex:none;min-width:180px;max-width:240px;padding:10px 12px;border:1px solid var(--relay-border);border-radius:10px;background:var(--relay-panel);cursor:pointer;text-align:left;color:var(--relay-text)}
+.chain-chip.active{border-color:var(--relay-accent-border);background:var(--relay-accent-soft)}
+.chain-chip strong{display:block;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chain-chip small{display:block;color:var(--relay-faint);font-size:10px;margin-top:4px}
+.chain-chip .chip-cancel{height:22px;padding:0 7px;margin-left:6px;border:1px solid var(--relay-warning);border-radius:6px;background:transparent;color:var(--relay-warning);font-size:10px;font-weight:700;cursor:pointer}
 .flow-head .row{display:flex;gap:7px;flex-wrap:wrap}
 .retired-box{margin-top:16px;padding:12px;border:1px solid var(--relay-border);border-radius:12px;background:var(--relay-panel)}
 .retired-box h3{margin:0 0 8px;font-size:13px}
@@ -335,9 +336,9 @@ ${relayShellCss}
 .inbox-card{padding:10px;border:1px solid var(--relay-border);border-radius:9px;background:var(--relay-panel-soft)}
 .inbox-card h3{margin:0 0 5px;font-size:12px}
 .inbox-card p{margin:0 0 8px;color:var(--relay-muted);font-size:11px;line-height:1.5}
-.goal-form{display:grid;gap:8px}
-.goal-form input,.goal-form select,.goal-form textarea{width:100%;font-size:11px}
-.goal-form textarea{min-height:70px}
+.task-form{display:grid;gap:8px}
+.task-form input,.task-form select,.task-form textarea{width:100%;font-size:11px}
+.task-form textarea{min-height:70px}
 @media(max-width:900px){.content{grid-template-columns:1fr}.drawer{border-left:0;border-top:1px solid var(--relay-border);max-height:none}.shell{display:block}.sidebar{height:auto;position:sticky;top:0}.main-nav{flex-direction:row}.topbar{top:56px}}
 </style></head><body>
 <div class="shell">
@@ -346,9 +347,10 @@ ${relayShellCss}
 <button data-t="flow" class="on" data-cmd="tab:flow">${relayIcon("activity")}<span>消息流</span></button>
 <button data-t="inbox" data-cmd="tab:inbox">${relayIcon("inbox")}<span>收件箱</span><b id="nav-count" hidden></b></button>
 <button data-t="defs" data-cmd="tab:defs">${relayIcon("layers")}<span>编制</span></button>
+<button data-t="routes" data-cmd="tab:routes">${relayIcon("layers")}<span>路由表</span></button>
 <button data-cmd="theme" id="theme-btn" class="icon-button" aria-label="切换主题"></button>
 <button onclick="location.href='ranking'" class="refresh">${relayIcon("layers")}<span>模型排序</span></button>
-</nav><div class="sidebar-footer"><div class="operator"><span class="avatar">B</span><span><strong>老板</strong><small>控制面 · v0.3.78</small></span></div></div></aside>
+</nav><div class="sidebar-footer"><div class="operator"><span class="avatar">B</span><span><strong>老板</strong><small>控制面 · v0.3.79</small></span></div></div></aside>
 <div class="main-area"><header class="topbar"><div class="breadcrumb"><span>公司</span><b>/</b><strong id="crumb">消息流</strong></div>
 <div class="top-actions"><span class="status" id="stat">加载中…</span><button class="refresh" id="pause-btn" data-cmd="toggle-pause">暂停派工</button><button class="refresh" data-cmd="refresh">${relayIcon("refresh")}<span>刷新</span></button></div></header>
 <main class="content"><div class="flow-pane" id="flow-pane"></div><aside class="drawer" id="drawer"></aside>
@@ -371,7 +373,7 @@ const api=async(cmd,o)=>{
   // 页面在 LAN 面与签名面都从自身前缀下发命令：相对地址留在 /o/<token>/ 内，Bearer 仍是同一把老板令牌。
   const r=await fetch('owner/'+cmd,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+OWNER,'X-Owner-Agent':'web'},body:JSON.stringify({command:cmd,...o})});
   const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.statusText);return j;};
-let OWNER='';let GOALS=[],TASKS=[],MESSAGES=[],INBOX=null,DEFS=[],SEL=null,GOAL='',T='flow',PAUSED=false,NOTICES=[],RETIRED=null;
+let OWNER='';let ROUTES=[],TASKS=[],MESSAGES=[],INBOX=null,DEFS=[],SEL=null,CHAIN='',T='flow',PAUSED=false,NOTICES=[];
 async function boot(){
   const x=await fetch('api/exchange',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pageToken:TOKEN})});
   const j=await x.json().catch(()=>({}));if(!x.ok)throw new Error(j.error||'exchange failed');OWNER=j.ownerToken;
@@ -386,7 +388,7 @@ async function onCommand(ev){
   if(cmd==='tab'){T=arg;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.t===arg));$('crumb').textContent={flow:'消息流',inbox:'收件箱',defs:'编制'}[arg]||arg;render();}
   else if(cmd==='theme')toggleTheme();
   else if(cmd==='refresh')load();
-  else if(cmd==='goal'){GOAL=arg;SEL=null;await refreshRetired();render();}
+  else if(cmd==='chain'){CHAIN=arg;SEL=null;render();}
   else if(cmd==='task'){SEL=arg;render();}
   else if(cmd==='msg'){SEL='m:'+arg;render();}
   else if(cmd==='save-msg')saveMsg(arg);
@@ -401,20 +403,20 @@ async function onCommand(ev){
   else if(cmd==='upgrade-start'){await api('upgrade.start',{taskId:arg.split(':')[0],taskVersion:Number(arg.split(':')[1]),digest:arg.split(':')[2]});toast('已启动升级');await load();}
   else if(cmd==='create-task')createTask();
   else if(cmd==='new-task')newTaskForm();
-  else if(cmd==='new-goal')newGoalForm();
-  else if(cmd==='create-goal')createGoal();
-  else if(cmd==='cancel-goal')cancelGoal(arg);
+  else if(cmd==='route-edit')routeEditForm(arg);
+  else if(cmd==='route-save')saveRouteForm(arg);
+  else if(cmd==='route-disable')disableRouteCmd(arg);
+  else if(cmd==='route-enable')enableRouteCmd(arg);
   else if(cmd==='save-task')saveTask(arg);
   else if(cmd==='reassign')reassignForm(arg);
   else if(cmd==='save-reassign')saveReassign(arg);
   else if(cmd==='toggle-pause')togglePause();
   else if(cmd==='resolve-notice')resolveNotice(arg);
-  else if(cmd==='resolve-retired')resolveRetired(arg);
 }
 async function load(){
   try{
-    const [g,t,m,i,d,s,n]=await Promise.all([api('goal.list',{}),api('task.list',{}),api('message.list',{includeSent:true}),api('inbox',{}),api('def.list',{}),api('status',{}),api('notice.list',{})]);
-    GOALS=g.goals||[];TASKS=t.tasks||[];MESSAGES=m.messages||[];INBOX=i;DEFS=d.defs||[];NOTICES=n.notices||[];PAUSED=s.paused===true;
+    const [g,t,m,i,d,s,n]=await Promise.all([api('route.list',{}),api('task.list',{}),api('message.list',{includeSent:true}),api('inbox',{}),api('def.list',{}),api('status',{}),api('notice.list',{})]);
+    ROUTES=g.routes||[];TASKS=t.tasks||[];MESSAGES=m.messages||[];INBOX=i;DEFS=d.defs||[];NOTICES=n.notices||[];PAUSED=s.paused===true;
     await refreshRetired();
     const n2=(INBOX.gates||[]).length+(INBOX.questions||[]).length;const b=$('nav-count');if(b){b.textContent=n2;b.hidden=!n2}
     $('stat').textContent=n2?('待办 '+n2):'运行中';$('stat').className='status'+(n2?' violet':'');
@@ -422,14 +424,13 @@ async function load(){
     render();
   }catch(e){$('stat').textContent='加载失败：'+e.message}
 }
-async function refreshRetired(){
-  RETIRED=null;if(!GOAL)return;
-  try{RETIRED=await api('goal.retired.list',{goalId:GOAL});}
-  catch(e){RETIRED={goalId:GOAL,goalVersion:0,items:[],error:e.message};}
-}
 const laneY=r=>70+r*104;
 function graph(){
-  const visible=GOAL?TASKS.filter(t=>String(t.goal?.id??t.goal??'')===GOAL):TASKS.slice(0,40);
+  const kids=new Map(),byId=new Map();
+  for(const t of TASKS){const tid=String(t.id?.id??t.id);byId.set(tid,t);const p=t.parent?String(t.parent?.id??t.parent):'';if(p){if(!kids.has(p))kids.set(p,[]);kids.get(p).push(tid)}}
+  const chainOf=r=>{const out=[];const walk=id=>{if(!byId.has(id)||out.includes(id))return;out.push(id);(kids.get(id)||[]).forEach(walk)};walk(r);return out};
+  const chainIds=CHAIN?new Set(chainOf(CHAIN)):null;
+  const visible=chainIds?TASKS.filter(t=>chainIds.has(String(t.id?.id??t.id))):TASKS.slice(0,60);
   const lanes=[...new Set(['owner',...visible.flatMap(t=>[t.executor_role,t.reviewer_role].filter(Boolean))])].slice(0,12);
   const W=1180,H=Math.max(320,lanes.length*104+60);
   let svg='<svg class="graph" viewBox="0 0 '+W+' '+H+'" width="'+W+'" height="'+H+'" role="img" aria-label="消息流">';
@@ -441,8 +442,9 @@ function graph(){
     const held=msgs.some(m=>m.hold||m.state==='held'),blocked=t.state==='blocked',sent=msgs.some(m=>m.state==='sent');
     const cls=blocked?'block':held?'hold':t.state==='doing'?'active':'';
     const tid=esc(String(t.id?.id??t.id));
+    const planned=t.state==='planned';
     svg+='<g class="flow-node" data-cmd="task:'+tid+'" style="cursor:pointer">';
-    svg+='<rect class="node-box '+cls+'" x="'+(x-72)+'" y="'+(y-24)+'" width="144" height="48" rx="9"/>';
+    svg+='<rect class="node-box '+(planned?'hold':cls)+'" x="'+(x-72)+'" y="'+(y-24)+'" width="144" height="48" rx="9" '+(planned?'stroke-dasharray="6 4"':'')+'/>';
     svg+='<text class="node-title" x="'+(x-62)+'" y="'+(y-3)+'">'+esc((t.title||'任务').slice(0,15))+'</text>';
     svg+='<text class="node-meta" x="'+(x-62)+'" y="'+(y+14)+'">'+esc(t.state||'')+' · '+esc(t.executor_role||'')+'</text></g>';
     const ex=x+72,ey=ry-24;
@@ -451,6 +453,10 @@ function graph(){
     svg+='<path id="e-'+n+'" class="edge '+edgeCls+'" d="'+path+'"/>';
     svg+='<path class="edge-hit" data-cmd="task:'+tid+'" d="'+path+'"/>';
     if(sent&&!held&&!blocked)svg+='<circle class="dot" r="3.5"><animateMotion dur="3s" repeatCount="indefinite" path="'+path+'"/></circle>';
+    if(t.parent){const pid=String(t.parent?.id??t.parent);const pi=visible.findIndex(o=>String(o.id?.id??o.id)===pid);
+      if(pi>=0){const px=180+(pi%5)*196,py=pos(visible[pi].executor_role);
+        const pp='M'+px+' '+py+' C'+px+' '+(py+60)+','+x+' '+(y-70)+','+x+' '+(y-26);
+        svg+='<path class="edge '+(t.state==='planned'?'hold':'')+'" stroke-dasharray="'+(t.state==='planned'?'6 4':'none')+'" d="'+pp+'"/>'}}
   });
   svg+='</svg>';return svg;
 }
@@ -491,10 +497,10 @@ function drawerTask(id){
     +'<label>验收标准<textarea id="t-ac">'+esc(t.acceptance_text||'')+'</textarea></label>'
     +'<div class="row"><button class="primary" data-cmd="save-task:'+esc(id)+'">保存需求与验收</button></div></section>'
     +'<section><h3>消息</h3>'+msgs.map(m=>'<div class="inbox-card"><h3>'+esc(m.step)+' · '+esc(m.state)+(m.hold?' · 待放行':'')+'</h3><p>'+esc(m.body.slice(0,90))+'</p><button data-cmd="msg:'+esc(String(m.id?.id??m.id))+'">编辑/放行</button></div>').join('')+'</section>'
-    +'<section><h3>操作</h3><div class="row"><button data-cmd="void:'+esc(id)+'">作废</button><button data-cmd="revoke:'+esc(id)+'">撤销租约</button><button data-cmd="unlock:'+esc(id)+'">解锁</button><button data-cmd="reassign:'+esc(id)+'">改派</button></div></section>';
+    +'<section><h3>操作</h3><div class="row"><button data-cmd="void:'+esc(id)+'">作废</button><button data-cmd="revoke:'+esc(id)+'">撤销租约</button><button data-cmd="reassign:'+esc(id)+'">改派</button></div></section>';
 }
 function reassignForm(id){
-  $('drawer').innerHTML='<div class="kicker">REASSIGN</div><h2>改派任务</h2><div class="goal-form">'
+  $('drawer').innerHTML='<div class="kicker">REASSIGN</div><h2>改派任务</h2><div class="task-form">'
     +'<label>执行岗<select id="r-ex">'+['engineering','qa','product','concept-design','asset-production','screenwriter','story-author','cinematography','cs'].map(r=>'<option>'+r+'</option>').join('')+'</select></label>'
     +'<label>复核岗<select id="r-rev">'+['qa','engineering','owner','product'].map(r=>'<option>'+r+'</option>').join('')+'</select></label>'
     +'<label>改派说明<input id="r-note"/></label>'
@@ -511,61 +517,21 @@ async function saveReassign(id){
   await api('task.reassign',{taskId:id,executorRole,reviewerRole,note});toast('已改派');SEL=id;await load();
 }
 function renderFlow(){
-  const rail='<div class="goal-rail"><button class="goal-chip '+(GOAL?'':'active')+'" data-cmd="goal:"><strong>全部目标</strong><small>'+TASKS.length+' 个任务</small></button>'
-    +GOALS.map(g=>{const gid=String(g.id?.id??g.id),active=GOAL===gid;
-      return '<div class="goal-chip '+(active?'active':'')+'" data-cmd="goal:'+esc(gid)+'" role="button" tabindex="0"><strong>'+esc((g.title||'').slice(0,20))+'</strong><small>'+esc(g.state||'')+(active?' <button class="chip-cancel" data-cmd="cancel-goal:'+esc(gid)+'">取消目标</button>':'')+'</small></div>';
+  const roots=TASKS.filter(t=>!t.parent);
+  const countOf=r=>{let n=0;const walk=id=>{TASKS.filter(t=>t.parent&&String(t.parent?.id??t.parent)===id).forEach(t=>{n++;walk(String(t.id?.id??t.id))})};walk(r);return n};
+  const rail='<div class="chain-rail"><button class="chain-chip '+(CHAIN?'':'active')+'" data-cmd="chain:"><strong>全部任务链</strong><small>'+roots.length+' 条链</small></button>'
+    +roots.slice(0,30).map(g=>{const gid=String(g.id?.id??g.id),active=CHAIN===gid;
+      return '<div class="chain-chip '+(active?'active':'')+'" data-cmd="chain:'+esc(gid)+'" role="button" tabindex="0"><strong>'+esc((g.title||'').slice(0,20))+'</strong><small>'+esc(g.state||'')+' · '+(countOf(gid)+1)+' 个任务</small></div>';
     }).join('')+'</div>';
-  $('flow-pane').innerHTML='<div class="flow-head"><h1>消息流</h1><div class="flow-legend"><span><i></i>已发</span><span><i class="dash"></i>待发 draft</span><span><i class="hold"></i>需要我放行</span><span><i class="block"></i>阻塞到老板</span></div><div class="row"><button class="primary small" data-cmd="new-goal">+ 新增目标</button><button class="primary small" data-cmd="new-task">+ 新增任务</button></div></div>'
-    +rail+'<div class="graph-scroll">'+graph()+'</div>'+retiredHtml();
+  $('flow-pane').innerHTML='<div class="flow-head"><h1>消息流</h1><div class="flow-legend"><span><i></i>已发</span><span><i class="dash"></i>待发 draft</span><span><i class="hold"></i>需要我放行</span><span><i class="block"></i>阻塞到老板</span></div><div class="row"><button class="primary small" data-cmd="new-task">+ 新增任务</button><button class="small" data-cmd="tab:routes">路由表</button></div></div>'
+    +rail+'<div class="graph-scroll">'+graph()+'</div>';
   if(SEL)SEL.startsWith('m:')?drawerMsg(SEL.slice(2)):drawerTask(SEL);else drawerDefault();
-}
-function retiredHtml(){
-  if(!GOAL)return '';
-  const items=RETIRED?.items||[];
-  const err=RETIRED?.error?'<p class="meta">读取失败：'+esc(RETIRED.error)+'</p>':'';
-  return '<section class="retired-box"><h3>待处置作废任务 '+(RETIRED?items.length:'…')+'</h3>'+err
-    +items.map(x=>'<div class="inbox-card"><h3>'+esc(x.title||x.taskId)+'</h3><p class="meta">'+esc(String(x.taskId))+' · '+esc(x.retiredBy||'')+'</p><div class="goal-form">'
-      +'<label>处置方式<select id="rr-d-'+esc(String(x.taskId))+'"><option value="fixture">fixture</option><option value="replaced">replaced</option><option value="excluded">excluded</option></select></label>'
-      +'<label>替代任务 ID（replaced 时必填，逗号分隔）<input id="rr-r-'+esc(String(x.taskId))+'"/></label>'
-      +'<label>处置原因（至少 10 个字）<input id="rr-n-'+esc(String(x.taskId))+'"/></label>'
-      +'<div class="row"><button data-cmd="resolve-retired:'+esc(String(x.taskId))+'">提交处置</button></div></div></div>').join('')
-    +(items.length?'':'<p class="meta">无待处置任务</p>')+'</section>';
-}
-async function cancelGoal(goalId){
-  const note=prompt('取消目标的原因（至少 2 个字）')||'';
-  if(note.trim().length<2)return;
-  await api('goal.cancel',{goalId,note});toast('已取消目标');GOAL='';SEL=null;RETIRED=null;await load();
-}
-function newGoalForm(){
-  $('drawer').innerHTML='<div class="kicker">NEW GOAL</div><h2>新建目标</h2><div class="goal-form">'
-    +'<label>目标内容<textarea id="g-text"></textarea></label>'
-    +'<label>产线<select id="g-pipeline"><option value="software">software</option><option value="story">story</option><option value="video">video</option></select></label>'
-    +'<label>档位<select id="g-tier"><option value="quick">quick</option><option value="standard">standard</option><option value="program">program</option></select></label>'
-    +'<div class="row"><button class="primary" data-cmd="create-goal">创建并分级</button></div></div>';
-}
-async function createGoal(){
-  const text=$('g-text').value.trim();if(text.length<2){toast('请填写目标内容');return}
-  const pipeline=$('g-pipeline').value,tier=$('g-tier').value;
-  const g=await api('goal.create',{text,pipeline,tier});
-  const goalId=String(g.id?.id??g.id??'');
-  await api('goal.triage',{goalId,tier});
-  toast('已创建目标');GOAL=goalId;SEL=null;await load();
 }
 async function togglePause(){
   await api(PAUSED?'task.resume':'task.pause',{});PAUSED=!PAUSED;toast(PAUSED?'已暂停派工':'已恢复派工');await load();
 }
 async function resolveNotice(key){
   await api('notice.resolve',{key});toast('已关闭提醒');await load();
-}
-async function resolveRetired(taskId){
-  const item=(RETIRED?.items||[]).find(x=>String(x.taskId)===taskId);
-  if(!item){toast('该任务已不在待处置列表');return}
-  const disposition=$('rr-d-'+taskId).value;
-  const replacementTaskIds=$('rr-r-'+taskId).value.split(',').map(s=>s.trim()).filter(Boolean);
-  const reason=$('rr-n-'+taskId).value.trim();
-  if(reason.length<10){toast('处置原因至少 10 个字');return}
-  await api('goal.retired.resolve',{goalId:GOAL,taskId,goalVersion:RETIRED.goalVersion,taskVersion:item.version??0,disposition,replacementTaskIds,reason});
-  toast('已处置');await refreshRetired();render();
 }
 function renderInbox(){
   const gates=INBOX?.gates||[],asks=INBOX?.questions||[];
@@ -578,9 +544,9 @@ function renderInbox(){
 function renderDefs(){
   $('flow-pane').innerHTML='<div class="flow-pane"><div class="flow-head"><h1>编制</h1></div><div class="decision-grid">'
     +DEFS.map(d=>'<article class="decision-card"><div class="card-top"><span class="type-label">'+esc(d.role)+'</span><span class="status '+(d.enabled?'success':'')+'">'+(d.enabled?'启用':'停用')+'</span></div><h3>'+esc(d.id)+'</h3><p class="byline">'+esc(d.provider)+' · '+esc(d.model||'')+'</p><div class="decision-actions"><button data-cmd="toggle-def:'+esc(d.id)+':'+(d.enabled?0:1)+'">'+(d.enabled?'停用':'启用')+'</button></div></article>').join('')+'</div></div>';
-  $('drawer').innerHTML='<div class="kicker">DEF</div><h2>新建 / 修改编制</h2><div class="goal-form"><label>ID<input id="d-id"/></label><label>岗位<select id="d-role">'+['product','engineering','qa','concept-design','asset-production','screenwriter','story-author','cinematography','cs','eval'].map(r=>'<option>'+r+'</option>').join('')+'</select></label><label>provider<input id="d-provider" value="codex"/></label><label>model<input id="d-model" value="auto:sol"/></label><div class="row"><button class="primary" data-cmd="create-def">保存编制</button></div></div>';
+  $('drawer').innerHTML='<div class="kicker">DEF</div><h2>新建 / 修改编制</h2><div class="task-form"><label>ID<input id="d-id"/></label><label>岗位<select id="d-role">'+['product','engineering','qa','concept-design','asset-production','screenwriter','story-author','cinematography','cs','eval'].map(r=>'<option>'+r+'</option>').join('')+'</select></label><label>provider<input id="d-provider" value="codex"/></label><label>model<input id="d-model" value="auto:sol"/></label><div class="row"><button class="primary" data-cmd="create-def">保存编制</button></div></div>';
 }
-function render(){if(T==='flow')renderFlow();else if(T==='inbox')renderInbox();else renderDefs()}
+function render(){if(T==='flow')renderFlow();else if(T==='inbox')renderInbox();else if(T==='routes')renderRoutes();else renderDefs()}
 async function saveMsg(id){await api('message.edit',{messageId:id,body:$('msg-body').value});toast('已保存');await load()}
 async function holdMsg(id,on){await api(on?'message.hold':'message.release',{messageId:id});toast(on?'已标记需要我放行':'已取消');await load()}
 async function releaseMsg(id){await api('message.release',{messageId:id});toast('已放行，等待派工');await load()}
@@ -591,17 +557,60 @@ async function decide(id,dec,note){
 }
 async function voidTask(id){const note=prompt('作废原因')||'';if(note.trim().length<2)return;await api('task.void',{taskId:id,note});await load()}
 async function revokeTask(id){await api('task.revoke',{taskId:id});await load()}
-async function unlockTask(id){await api('task.unlock',{taskId:id});await load()}
 async function toggleDef(id,on){await api(on?'def.enable':'def.disable',{id});await load()}
 async function createDef(){await api('def.ensure',{id:$('d-id').value,role:$('d-role').value,provider:$('d-provider').value,model:$('d-model').value});toast('已保存编制');await load()}
 function newTaskForm(){
-  $('drawer').innerHTML='<div class="kicker">NEW TASK</div><h2>新增任务</h2><div class="goal-form">'
-    +'<label>标题<input id="n-title"/></label><label>需求<textarea id="n-req"></textarea></label><label>验收标准<textarea id="n-ac"></textarea></label>'
-    +'<label>执行岗<select id="n-ex">'+['engineering','qa','product','concept-design','asset-production','screenwriter','story-author','cinematography','cs'].map(r=>'<option>'+r+'</option>').join('')+'</select></label>'
-    +'<label>复核岗<select id="n-rev">'+['qa','engineering','owner','product'].map(r=>'<option>'+r+'</option>').join('')+'</select></label>'
-    +'<label>依赖任务 ID（逗号分隔）<input id="n-deps"/></label><div class="row"><button class="primary" data-cmd="create-task">创建并生成两条草稿</button></div></div>';
+  const opts=ROUTES.filter(r=>r.enabled!==false).map(r=>'<option value="'+esc(r.type??r.id)+'">'+esc(r.label||r.type)+' ('+esc(r.type??r.id)+')</option>').join('');
+  $('drawer').innerHTML='<div class="kicker">NEW TASK</div><h2>新增任务</h2><div class="task-form">'
+    +'<label>类型<select id="n-type" onchange="previewChain()">'+opts+'</select></label>'
+    +'<label>标题<input id="n-title" oninput="previewChain()"/></label><label>需求<textarea id="n-req"></textarea></label><label>验收标准<textarea id="n-ac"></textarea></label>'
+    +'<label>分组 tag<input id="n-tag"/></label><label><input type="checkbox" id="n-hold"/> 生成后先让我过目（hold）</label>'
+    +'<section id="n-preview"></section><div class="row"><button class="primary" data-cmd="create-task">创建任务链</button></div></div>';
+  previewChain();
 }
-async function createTask(){await api('task.create',{title:$('n-title').value,requirement:$('n-req').value,acceptanceText:$('n-ac').value,executorRole:$('n-ex').value,reviewerRole:$('n-rev').value,dependencies:$('n-deps').value.split(',').map(s=>s.trim()).filter(Boolean),goalId:GOAL||undefined});toast('已创建');SEL=null;await load()}
+function previewChain(){
+  const el=$('n-preview');if(!el)return;const type=$('n-type')?.value,title=($('n-title')?.value||'任务').trim()||'任务';
+  const byType={};ROUTES.forEach(r=>byType[r.type??r.id]=r);
+  let html='<h3>链预览</h3>',cur=type,seen=new Set(),n=0;
+  while(cur&&byType[cur]&&!seen.has(cur)&&n<10){const r=byType[cur];seen.add(cur);n++;
+    html+='<div class="inbox-card"><h3>'+esc(n===1?title:title+' · '+esc(r.label))+'</h3><p class="meta">'+esc(r.executor_role)+' → '+esc(r.reviewer_role)+(n>1?' · planned':'')+'</p><p>'+esc((r.execute_body||'').slice(0,120))+'</p><p>'+esc((r.review_body||'').slice(0,120))+'</p></div>';
+    cur=r.next;}
+  el.innerHTML=html;
+}
+async function createTask(){
+  const type=$('n-type').value,title=$('n-title').value.trim(),requirement=$('n-req').value,acceptanceText=$('n-ac').value;
+  if(title.length<3||requirement.trim().length<1){toast('标题与需求必填');return}
+  const tag=$('n-tag').value.trim();
+  await api('task.create',{type,title,requirement,acceptanceText,...(tag?{tag}:{}) ,...($('n-hold').checked?{hold:true}:{})});
+  toast('已创建任务链');SEL=null;await load();
+}
+function renderRoutes(){
+  $('flow-pane').innerHTML='<div class="flow-pane"><div class="flow-head"><h1>路由表</h1></div><div class="decision-grid">'
+    +ROUTES.map(r=>'<article class="decision-card"><div class="card-top"><span class="type-label">'+esc(r.type)+'</span><span class="status '+(r.enabled?'success':'')+'">'+(r.enabled?'启用':'停用')+'</span></div><h3>'+esc(r.label)+'</h3><p class="byline">'+esc(r.executor_role)+' → '+esc(r.reviewer_role)+(r.next?' · 后续 '+esc(r.next):'')+(r.hold?' · hold':'')+(r.code?' · code':'')+'</p><div class="decision-actions"><button data-cmd="route-edit:'+esc(r.type)+'">编辑</button>'+(r.enabled?'<button class="reject" data-cmd="route-disable:'+esc(r.type)+'">停用</button>':'<button class="approve" data-cmd="route-enable:'+esc(r.type)+'">启用</button>')+'</div></article>').join('')+'</div></div>';
+  $('drawer').innerHTML='<div class="kicker">ROUTES</div><h2>路由表</h2><p class="meta">每条路由决定一个任务类型的执行岗、复核岗与消息模板。</p>';
+}
+function routeEditForm(type){
+  const r=ROUTES.find(x=>(x.type??'')===type);if(!r)return;
+  const roleOpts=cur=>['engineering','qa','product','concept-design','asset-production','screenwriter','story-author','cinematography','cs','owner'].map(o=>'<option '+(o===cur?'selected':'')+'>'+o+'</option>').join('');
+  $('drawer').innerHTML='<div class="kicker">ROUTE '+esc(type)+'</div><h2>'+esc(r.label)+'</h2><div class="task-form">'
+    +'<label>名称<input id="rt-label" value="'+esc(r.label)+'"/></label>'
+    +'<label>执行岗<select id="rt-ex">'+roleOpts(r.executor_role)+'</select></label>'
+    +'<label>复核岗<select id="rt-rev">'+roleOpts(r.reviewer_role)+'</select></label>'
+    +'<label><input type="checkbox" id="rt-code" '+(r.code?'checked':'')+'/> code 任务</label>'
+    +'<label>执行模板<textarea id="rt-eb">'+esc(r.execute_body||'')+'</textarea></label>'
+    +'<label>复核模板<textarea id="rt-rb">'+esc(r.review_body||'')+'</textarea></label>'
+    +'<label>下一类型 next<select id="rt-next"><option value="">（无）</option>'+ROUTES.map(o=>'<option value="'+esc(o.type)+'" '+(o.type===r.next?'selected':'')+'>'+esc(o.label||o.type)+'</option>').join('')+'</select></label>'
+    +'<label><input type="checkbox" id="rt-hold" '+(r.hold?'checked':'')+'/> hold 草稿</label>'
+    +'<div class="row"><button class="primary" data-cmd="route-save:'+esc(type)+'">保存路由</button><button data-cmd="tab:routes">返回</button></div></div>';
+}
+async function saveRouteForm(type){
+  await api('route.save',{type,label:$('rt-label').value,executorRole:$('rt-ex').value,reviewerRole:$('rt-rev').value,
+    code:$('rt-code').checked,executeBody:$('rt-eb').value||undefined,reviewBody:$('rt-rb').value||undefined,
+    next:$('rt-next').value||undefined,hold:$('rt-hold').checked});
+  toast('已保存路由');await load();T='routes';render();
+}
+async function disableRouteCmd(type){await api('route.disable',{type});toast('已停用');await load()}
+async function enableRouteCmd(type){const r=ROUTES.find(x=>x.type===type);if(!r)return;await api('route.save',{type,label:r.label,executorRole:r.executor_role,reviewerRole:r.reviewer_role,code:r.code,executeBody:r.execute_body,reviewBody:r.review_body,next:r.next,hold:r.hold});toast('已启用');await load()}
 boot().catch(e=>{$('stat').textContent='初始化失败：'+e.message});
 </script></body></html>`;
 

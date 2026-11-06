@@ -36,7 +36,7 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
   const addTask = (id: string, opts: { state?: TaskView['state']; submittedBy?: string; worktreePath?: string; discipline?: string; assets?: string[] } = {}) => {
     if (opts.assets) assetPaths.set(id, opts.assets);
     const v: TaskView = { id, title: id, context: '', state: opts.state ?? 'ready', executorRole: 'engineering', reviewerRole: 'engineering',
-      kind: 'task', dependencies: [], version: 1, fence: 0, submittedBy: opts.submittedBy, discipline: opts.discipline };
+      kind: 'task', version: 1, fence: 0, submittedBy: opts.submittedBy, discipline: opts.discipline };
     if (opts.worktreePath) {
       wtPaths.set(id, opts.worktreePath);
       v.worktree = { id: `wt-${id}`, repo: '/repo', worktreePath: opts.worktreePath, mode: 'exclusive', intent: { kind: 'code' }, discipline: '' };
@@ -49,7 +49,7 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
     defs: async () => [def], serverNow: async () => now, insts: async () => instances.filter(i => !retired.has(i.id)), tasks: async () => rows,
     providerHealth: async () => health, lastDispatch: async () => undefined, recordDispatch: async () => {}, observeSessionIdle: async (observations: Array<{ id: string; since?: number }>) => {
       for (const o of observations) { const i = instances.find(i => i.id === o.id); if (i) i.idleSince = o.since; }
-    }, openManagerWakes: async () => [],
+    }, openPendingWakes: async () => [],
     retireIdle: async (inst: EmployeeInst) => { events.push(`retire:${inst.id}:rotation`); retired.add(inst.id); },
     touchWake: async () => {}, defHealthy: async () => {},
     markExhausted: async (provider: string, _error: string, resetsAt?: number) => {
@@ -138,7 +138,19 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
   let realign: RealignFn | undefined;
   /** Quota snapshot the breaker and the pre-warning read; empty unless a test sets one. */
   let quotaRows: ProviderQuota[] = [];
-  const dispatcher = () => new Dispatcher({ workforce: wf as unknown as Workforce, owner: owner as unknown as OwnerDesk, paseo, sidecar: pool,
+  const messages = {
+    prepareSend: async (taskId: string, step: string, employeeId: string) => ({
+      body: `fixture ${step} body for ${taskId}`,
+      message: { id: `m-${taskId}-${step}`, taskId, step, role: 'x', body: `fixture ${step} body`, state: 'draft', hold: false, createdAt: '' },
+    }),
+    isHeld: async () => false,
+    markSent: async (messageId: string) => { events.push(`markSent:${messageId}`); },
+    latestDraft: async () => undefined,
+    machineCriterionId: async () => 'AC-1',
+    list: async () => [],
+    nextStep: async () => 'execute',
+  };
+  const dispatcher = () => new Dispatcher({ workforce: wf as unknown as Workforce, owner: owner as unknown as OwnerDesk, paseo, sidecar: pool, messages: messages as never,
     env: { opsRepo: '/fixture', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0, hostResources: () => host,
     log: (message: string) => { logs.push(message); },
     ...(reclaim ? { reclaimArtifacts: (input?: ReclaimInput) => reclaim!(input) } : {}),
@@ -383,12 +395,12 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     expect(r.revoked).toHaveLength(0);
     expect(w.views.get('interrupted')!.currentEmployee).toBe(inst.id);
   });
-  test('a closed bound implementer that cannot resume stays unknown through the grace, then reads as down', async () => {
+  test('a closed session holding a lease that cannot resume stays unknown through the grace, then reads as down', async () => {
     const w = world(); w.addTask('bound');
     const inst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: 'fixture-9' } as EmployeeInst;
     w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(inst.id, 'agent-9'); inst.paseoAgentId = 'agent-9';
     w.agents.set('agent-9', { id: 'agent-9', status: 'closed' });
-    w.rows[0]!.implementer = inst.id;
+    Object.assign(w.rows[0]!, { state: 'doing', currentEmployee: inst.id, deliveryId: 'd-bound', leaseExpiresAt: 9999 });
     w.paseo.reload = async id => { w.events.push(`reload-failed:${id}`); throw new Error('synthetic resume failure'); };
     const d = w.dispatcher();
     await d.tick();

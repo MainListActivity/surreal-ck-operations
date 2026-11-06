@@ -92,12 +92,12 @@ export function registerHandlers(server: PluginServerContext): void {
     return { ok: true };
   });
 
-  ownerHandle(rpc.goalTasks, async (input: RpcInput<typeof rpc.goalTasks>) => {
+  ownerHandle(rpc.chainTasks, async (input: RpcInput<typeof rpc.chainTasks>) => {
     const { db } = await company();
     const { view } = await import("./vendor/src/core.ts");
     const { id } = await import("./vendor/src/core.ts");
     const [rows] = await db.db.query<[Parameters<typeof view>[0][]]>(
-      "SELECT *, string::slice(context ?? '', 0, 1200) AS context FROM task WHERE goal = $goal ORDER BY created_at, id LIMIT 500;", { goal: id("goal", input.goalId) });
+      "SELECT *, string::slice(context ?? '', 0, 1200) AS context FROM task WHERE tag = $tag ORDER BY created_at, id LIMIT 500;", { tag: input.tag });
     return { tasks: rows.map(view) };
   });
 

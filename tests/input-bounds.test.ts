@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import {
   MAX_ASSET_PATHS, MAX_ASSET_PATH_CHARS, MAX_TASK_DEPENDENCIES, MAX_TASK_ID_CHARS,
-  PROJECT_TEXT_LIMITS, projectTextLengths, validateExternalDependencies, validateProjectTexts,
+  PROJECT_TEXT_LIMITS, projectTextLengths, validateProjectTexts,
 } from '../src/input-bounds.ts';
 import { validateIntent } from '../src/dispatcher/worktree-registry.ts';
 
@@ -11,18 +11,6 @@ const errorOf = (action: () => void): Error & { code?: string } => {
   throw new Error('expected a refusal');
 };
 const noThrow = (action: () => void): void => { expect(action).not.toThrow(); };
-
-test('external dependencies: 50 raw entries pass, the 51st is refused before de-duplication, and ids are bounded', () => {
-  noThrow(() => validateExternalDependencies(Array.from({ length: MAX_TASK_DEPENDENCIES }, () => 'task')));
-  const tooMany = errorOf(() => validateExternalDependencies(Array.from({ length: MAX_TASK_DEPENDENCIES + 1 }, () => 'same-task')));
-  expect(tooMany.code).toBe('invalid');
-  expect(tooMany.message).toContain(`dependencies count ${MAX_TASK_DEPENDENCIES + 1} exceeds limit ${MAX_TASK_DEPENDENCIES}`);
-  // 51 copies of one id are still 51 input entries; de-duplication must not make them legal.
-  expect(() => validateExternalDependencies(Array.from({ length: 51 }, () => 'same-task'))).toThrow(/dependencies count 51/);
-  expect(() => validateExternalDependencies([ascii(MAX_TASK_ID_CHARS + 1)])).toThrow(new RegExp(`dependencies\\[0\\].*${MAX_TASK_ID_CHARS}`));
-  expect(() => validateExternalDependencies([''])).toThrow(/dependencies\[0\]/);
-  expect(() => validateExternalDependencies('not-a-list')).toThrow(/dependencies must be a list/);
-});
 
 test('asset intent keeps the existing 50-entry and 300-character rules, and non-assets never carry paths', () => {
   const paths = (count: number, length = 280): string[] => Array.from({ length: count }, (_, index) => `assets/${index}/${ascii(length)}`);

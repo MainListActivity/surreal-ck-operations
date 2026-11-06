@@ -11,7 +11,7 @@ export type Candidate = { evidence_expires_at?: string; task: RecordId; digest: 
 /** A broker-verified remote candidate registered as the approval candidate for one task. */
 export type RemoteCandidateInput = { taskId: string; digest: string; evidenceExpiresAt: string; author: string; env: string; sourcePath: string; candidateHash: string };
 export type ProofRow = { id: RecordId; task: RecordId; delivery: string; fence: number; request_key: string; request_digest: string; lease: LeaseStamp; approval: ApprovalReceipt | null; files: ProofFiles; identities_digest: string; status_hash: string; expires_at: number; revoked: boolean; version: number; sealed: { ciphertext: string; iv: string; tag: string }; kid: string };
-type ApprovalTaskRow = { state: string; kind: string; version: number; submitted_by: string; accepted_by: string; reviewer_role: string; goal: RecordId; project: RecordId };
+type ApprovalTaskRow = { state: string; kind: string; version: number; submitted_by: string; accepted_by: string; reviewer_role: string; tag?: string; project: RecordId };
 type ApprovalAuditRow = { id: RecordId; actor: RecordId | string; action: 'accept' | 'owner_approve'; evidence: string; version: number; at: unknown };
 type ApprovalSnapshot = { candidate?: Candidate; task?: ApprovalTaskRow; audit?: ApprovalAuditRow; reviewer?: ReviewerLifecycle; ambiguous: boolean };
 const denied = () => new CompanyError('forbidden', 'company approval or live lease unavailable');
@@ -29,10 +29,10 @@ export class CompanyProofStore {
     return this.leaseFor(scope, isRemoteCandidateGoal);
   }
   private async leaseFor(scope: OpsScope, goalAllowed: (goalId: string | undefined) => boolean): Promise<LeaseStamp> {
-    const [rows] = await this.db.query<[Array<{ current_employee: string; delivery_id: string; fence: number; lease_expires_at: number; state: string; goal: RecordId; project: RecordId; revoked: boolean; retired: boolean; role: string }>]>(
-      'SELECT current_employee, delivery_id, fence, lease_expires_at, state, goal, goal.project AS project, type::record("employee", current_employee).revoked AS revoked, type::record("employee", current_employee).retired AS retired, type::record("employee", current_employee).role AS role FROM $task;', { task: new RecordId('task', scope.taskId) });
+    const [rows] = await this.db.query<[Array<{ current_employee: string; delivery_id: string; fence: number; lease_expires_at: number; state: string; tag?: string; project: RecordId; revoked: boolean; retired: boolean; role: string }>]>(
+      'SELECT current_employee, delivery_id, fence, lease_expires_at, state, tag, project, type::record("employee", current_employee).revoked AS revoked, type::record("employee", current_employee).retired AS retired, type::record("employee", current_employee).role AS role FROM $task;', { task: new RecordId('task', scope.taskId) });
     const r = rows[0];
-    const goalId = r && r.goal ? String(r.goal.id) : undefined;
+    const goalId = r && r.tag ? String(r.tag) : undefined;
     if (!r || r.current_employee !== scope.actor.employeeId || !['doing', 'review'].includes(r.state) || r.lease_expires_at <= this.now() / 1000 || r.revoked || r.retired || !['engineering', 'product', 'qa'].includes(r.role) || !goalAllowed(goalId) || String(r.project?.id) !== scope.project || scope.project !== 'surreal_ck') throw denied();
     return { taskId: scope.taskId, employee: r.current_employee, delivery: r.delivery_id, fence: r.fence, goal: goalId!, project: scope.project, role: r.role as Role };
   }
@@ -112,16 +112,27 @@ export class CompanyProofStore {
   /** Authorization runs before file/candidate/audit reads. Only self or a direct server-stored dependency. */
   async authorizeDiagnosis(lease: LeaseStamp, taskId: string): Promise<boolean> {
     if (!['engineering', 'qa'].includes(lease.role) || !await this.leaseValid(lease)) return false;
-    const [callers, targets] = await this.db.query<[Array<{ dependencies: RecordId[] }>, Array<{ goal: RecordId; project: RecordId }>]>(
-      'SELECT dependencies FROM $caller; SELECT goal, goal.project AS project FROM $target;',
-      { caller: new RecordId('task', lease.taskId), target: new RecordId('task', taskId) });
-    return !!targets[0] && String(targets[0].goal?.id) === lease.goal && String(targets[0].project?.id) === lease.project &&
-      (lease.taskId === taskId || !!callers[0]?.dependencies?.some(dep => dep instanceof RecordId && String(dep.table) === 'task' && String(dep.id) === taskId));
+    const [targets] = await this.db.query<[Array<{ tag?: string; project: RecordId }>]>(
+      'SELECT tag, project FROM $target;',
+      { target: new RecordId('task', taskId) });
+    if (!targets[0] || targets[0].tag !== lease.goal || String(targets[0].project?.id) !== lease.project) return false;
+    if (lease.taskId === taskId) return true;
+    // What the caller's chain predecessors are: its ancestors in the parent chain.
+    let cursor: string | undefined = lease.taskId;
+    const seen = new Set<string>();
+    while (cursor && !seen.has(cursor)) {
+      seen.add(cursor);
+      const result: [Array<{ parent?: RecordId }>] = await this.db.query('SELECT parent FROM $t;', { t: new RecordId('task', cursor) });
+      const parent: RecordId | undefined = result[0]?.[0]?.parent;
+      cursor = parent ? String(parent.id) : undefined;
+      if (cursor === taskId) return true;
+    }
+    return false;
   }
   private async approvalSnapshot(taskId: string, diagnostic = false): Promise<ApprovalSnapshot> {
     const [candidates, tasks, audits] = await this.db.query<[Candidate[], ApprovalTaskRow[], ApprovalAuditRow[]]>(
       `SELECT task, digest, manifest_hash, document_hash, manifest_path, document_path, author, env, sampler FROM internal_ai_candidate WHERE task = $task LIMIT 1;
-       SELECT state, kind, version, submitted_by, accepted_by, reviewer_role, goal, goal.project AS project FROM $task;
+       SELECT state, kind, version, submitted_by, accepted_by, reviewer_role, tag, project FROM $task;
        SELECT id, actor, action, evidence, version, at FROM audit WHERE task = $task AND action IN ['accept', 'owner_approve'] ORDER BY at DESC LIMIT 2;`,
       { task: new RecordId('task', taskId) });
     const audit = audits[0];
@@ -151,7 +162,7 @@ export class CompanyProofStore {
     set('approvalTaskExists', !!t);
     set('approvalTaskDone', !!t && t.state === 'done');
     set('approvalTaskKindEligible', !!t && ['task', 'gate'].includes(t.kind));
-    set('approvalTaskGoalMatches', String(t?.goal?.id) === PROOF_GOAL);
+    set('approvalTaskGoalMatches', t?.tag === PROOF_GOAL);
     set('approvalTaskProjectMatches', String(t?.project?.id) === 'surreal_ck');
     set('candidateAuthorMatchesSubmitter', !!c && !!t && c.author === t.submitted_by);
     // G1 (FV06 P1): once a candidate carries a sampler identity, 采样 QA ≠ 批准者 is a machine check.
@@ -190,12 +201,12 @@ export class CompanyProofStore {
     return { taskId, version: task.version, action: audit.action, auditId: String(audit.id), reviewer: task.accepted_by, digest: candidate.digest };
   }
   async rotationApproval(taskId: string, kid: string): Promise<void> {
-    const [tasks, audits] = await this.db.query<[Array<{ state: string; kind: string; version: number; submitted_by: string; accepted_by: string; reviewer_role: string; goal: RecordId; project: RecordId }>, Array<{ actor: RecordId | string; action: string; evidence: string; version: number }>]>(
-      `SELECT state, kind, version, submitted_by, accepted_by, reviewer_role, goal, goal.project AS project FROM $task;
+    const [tasks, audits] = await this.db.query<[Array<{ state: string; kind: string; version: number; submitted_by: string; accepted_by: string; reviewer_role: string; tag?: string; project: RecordId }>, Array<{ actor: RecordId | string; action: string; evidence: string; version: number }>]>(
+      `SELECT state, kind, version, submitted_by, accepted_by, reviewer_role, tag, project FROM $task;
        SELECT actor, action, evidence, version, at FROM audit WHERE task = $task AND action IN ['accept', 'owner_approve'] ORDER BY at DESC LIMIT 1;`, { task: new RecordId('task', taskId) });
     const t = tasks[0], a = audits[0];
     const marker = 'company-internal-ai-key-rotation:v1:surreal_ck:production:' + kid;
-    if (!t || !a || t.state !== 'done' || !['task','gate'].includes(t.kind) || String(t.goal?.id) !== PROOF_GOAL || String(t.project?.id) !== 'surreal_ck' || a.version !== t.version || !a.evidence.split(/\r?\n/).some(l => l.trim() === marker)) throw denied();
+    if (!t || !a || t.state !== 'done' || !['task','gate'].includes(t.kind) || t.tag !== PROOF_GOAL || String(t.project?.id) !== 'surreal_ck' || a.version !== t.version || !a.evidence.split(/\r?\n/).some(l => l.trim() === marker)) throw denied();
     if (a.action === 'accept') {
       if (!(a.actor instanceof RecordId) || String(a.actor.id) !== t.accepted_by || t.accepted_by === t.submitted_by) throw denied();
       const who = await this.db.select<ReviewerLifecycle>(a.actor);

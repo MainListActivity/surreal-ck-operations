@@ -22,9 +22,9 @@ export async function reclaimIdleSessions(input: {
   }
   if (updates.length) await wf.observeSessionIdle(updates.map(u => ({ id: u.inst.id, since: u.since, lastWakeAt: u.inst.lastWakeAt })));
   if (!candidates.length) return [];
-  // An unreadable manager-wake set must never turn into an empty set.
+  // An unreadable pending-wake set must never turn into an empty set.
   let wakes;
-  try { wakes = await wf.openManagerWakes(); } catch { input.log('idle cleanup skipped: manager wake ownership unavailable'); return []; }
+  try { wakes = await wf.openPendingWakes(); } catch { input.log('idle cleanup skipped: pending wake ownership unavailable'); return []; }
   const retired: string[] = [];
   for (const inst of candidates) {
     if (wakes.some(w => w.employee === inst.id || w.agent === inst.paseoAgentId)) continue;

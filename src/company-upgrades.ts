@@ -91,10 +91,8 @@ export class CompanyUpgrades {
    LET $policy=SELECT * FROM ONLY company_meta:config;
    IF $automatic AND ($policy.company_auto_upgrade!=true OR $policy.paused=true) {THROW '自动升级已关闭或派工已暂停';};
    IF $t.version!=$version OR $t.company_upgrade.digest!=$digest OR $t.company_upgrade.sha!=$sha {THROW '升级内容或任务版本已变化，请刷新';};
-   IF $t.kind NOT IN ['release','deploy'] OR $t.executor_role!='engineering' OR NOT (($t.state='blocked' AND $t.blocked_to='owner') OR ($t.state='review' AND $t.reviewer_role='owner') OR ($t.state='blocked' AND $t.wait_kind='owner_handoff' AND $t.wait_owner_role='owner')) {THROW '任务已不在老板收件箱，不能升级';};
+   IF $t.company_upgrade=NONE OR NOT (($t.state='blocked' AND $t.blocked_to='owner') OR ($t.state='review' AND $t.reviewer_role='owner')) {THROW '任务已不在老板收件箱，不能升级';};
    IF $automatic {
-    LET $done=SELECT id FROM task WHERE id IN ($t.dependencies??[]) AND state='done';
-    IF array::len($done)!=array::len($t.dependencies??[]) {THROW '升级前置任务尚未全部验收完成';};
    };
    LET $lock=SELECT * FROM ONLY company_meta:upgrade_job;
    LET $active=SELECT * FROM ONLY $lock.job;

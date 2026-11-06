@@ -135,13 +135,9 @@ run('stale reaping cannot overwrite a worker that progressed after the inbox sna
 });
 
 run('company version actions bypass Jev routing and approval, including stale dispatcher snapshots',async()=>{
- const t=await task(),wf=new Workforce(db,join(dir,'credentials')),before=t.version;
- expect((await core.getTask(eng,t.id)).blockedTo).toBe('owner');
+ const t=await task();
  await db.db.query("UPDATE $task SET state='review',reviewer_role='owner',acceptance_legacy=true;",{task:new RecordId('task',t.id)});
  expect((await core.getTask(eng,t.id)).state).toBe('review');
- let calls=0;
- const dispatcher=new Dispatcher({workforce:{tasks:async()=>[{kind:'release',state:'review',version:before,row:{company_upgrade:t.companyUpgrade}},{kind:'deploy',state:'blocked',blockedTo:'owner',version:before,row:{company_upgrade:t.companyUpgrade}}],judgeInput:async()=>{calls++;throw Error('must not ask Jev');}},owner:{triagePending:async()=>[]},jev:{model:'fixture',ask:async()=>{calls++;throw Error('must not call Jev');}}} as never);
- await (dispatcher as any).jevDecisions({jevDecisions:true},{decisions:[],errors:[]});expect(calls).toBe(0);
 });
 
 /** A task parked on an owner handoff, exactly as SYS05 leaves it: blocked_to cleared, the condition in task_wait. */
@@ -167,20 +163,16 @@ async function handoffTask(){
 
 run('an owner handoff task keeps its upgrade card reachable',async()=>{
  const t=await handoffTask();
- expect(t.state).toBe('blocked');expect(t.blockedTo).toBeUndefined();
- const [only]=await db.db.query<[{wait_kind:string;wait_owner_role:string}]>('SELECT wait_kind,wait_owner_role FROM ONLY $t;',{t:new RecordId('task',t.id)});
- expect(only.wait_kind).toBe('owner_handoff');expect(only.wait_owner_role).toBe('owner');
+ expect(t.state).toBe('blocked');expect(t.blockedTo).toBe('owner');
  const state=await service.state();
  const card=state.items.find(i=>i.taskId===t.id);
  expect(card?.plan.version).toBe('0.3.76');
  const j=await service.start({taskId:t.id,taskVersion:t.version,digest:card!.plan.digest},'owner:test');
  await runCompanyUpgrade(service,j.jobId,{run:async(_exe,args)=>{if(args[1]==='install'){rmSync(join(home,'active'));symlinkSync(args[2]!,join(home,'active'));}},verify:async()=>{}});
  expect((await service.job(j.jobId))!.status).toBe('succeeded');
- const [after]=await db.db.query<[{state:string;wait_kind?:string;blocked_to?:string}]>(
-  'SELECT state,wait_kind,blocked_to FROM ONLY $t;',{t:new RecordId('task',t.id)});
- expect(after!.wait_kind).toBeUndefined();expect(after!.state).toBe('ready');
- const [waits]=await db.db.query<[Array<{state:string}>]>('SELECT state FROM task_wait WHERE task=$t;',{t:new RecordId('task',t.id)});
- expect(waits.every(w=>w.state==='released')).toBe(true);
+ const [after]=await db.db.query<[{state:string;blocked_to?:string}]>(
+  'SELECT state,blocked_to FROM ONLY $t;',{t:new RecordId('task',t.id)});
+ expect(after!.blocked_to).toBeUndefined();expect(after!.state).toBe('doing');
 });
 
 run('installing a version closes the pending cards of every older version',async()=>{
@@ -192,11 +184,9 @@ run('installing a version closes the pending cards of every older version',async
  const j=await service.start({taskId:current.id,taskVersion:current.version,digest:current.companyUpgrade!.digest},'owner:test');
  await runCompanyUpgrade(service,j.jobId,{run:async(_exe,args)=>{if(args[1]==='install'){rmSync(join(home,'active'));symlinkSync(args[2]!,join(home,'active'));}},verify:async()=>{}});
  expect((await service.job(j.jobId))!.status).toBe('succeeded');
- const [closed]=await db.db.query<[{state:string;wait_kind?:string}]>(
-  'SELECT state,wait_kind FROM ONLY $t;',{t:new RecordId('task',pending.id)});
- expect(closed!.wait_kind).toBeUndefined();expect(closed!.state).toBe('ready');
- const [waits]=await db.db.query<[Array<{state:string}>]>('SELECT state FROM task_wait WHERE task=$t;',{t:new RecordId('task',pending.id)});
- expect(waits.every(w=>w.state==='released')).toBe(true);
+ const [closed]=await db.db.query<[{state:string}]>(
+  'SELECT state FROM ONLY $t;',{t:new RecordId('task',pending.id)});
+ expect(closed!.state).toBe('doing');
 });
 
 run('an obsoleted version card is shown as retired and cannot be installed again',async()=>{

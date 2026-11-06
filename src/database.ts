@@ -426,7 +426,7 @@ export class CompanyDatabase {
         const index = this.buildSlotWaiters.indexOf(waiter);
         if (index >= 0) this.buildSlotWaiters.splice(index, 1);
         reject(new CompanyError('temporarily_unavailable',
-          `snapshot builds are busy: ${MAX_BUILD_CONNECTIONS} are running and none finished within ${BUILD_QUEUE_MS / 1000} seconds; narrow the query with state, goalId, role or since, then retry`, true));
+          `snapshot builds are busy: ${MAX_BUILD_CONNECTIONS} are running and none finished within ${BUILD_QUEUE_MS / 1000} seconds; narrow the query with state, tag, role or since, then retry`, true));
       }, BUILD_QUEUE_MS);
       this.buildSlotWaiters.push(waiter);
     });

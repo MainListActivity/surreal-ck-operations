@@ -52,7 +52,7 @@ beforeAll(async () => {
   });
   await database.db.query('CREATE $goal CONTENT {state:"active",project:$project,anchors:[],tasks:{}};', { goal: new RecordId('goal', PROOF_GOAL), project: new RecordId('project', 'surreal_ck') });
   world = new FakeWorld();
-  const task = await core.createTask(gm, { title: 'Synthetic operator listing', context: 'Only test fixtures', executorRole: 'engineering', reviewerRole: 'qa', goalId: PROOF_GOAL, idempotencyKey: randomUUID() });
+  const task = await core.createTask(gm, { title: 'Synthetic operator listing', context: 'Only test fixtures', executorRole: 'engineering', reviewerRole: 'qa', tag: PROOF_GOAL, idempotencyKey: randomUUID() });
   taskId = task.id;
   await core.claim(author, task.id);
   ops = new OpsBroker({

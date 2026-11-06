@@ -101,7 +101,7 @@ test('roster RPC: task author recused, fresh eligible, public execute pool remai
   expect(historyCalls).toBeGreaterThan(0);
   const p = response.reviewPools[0]!;
   expect(p).toMatchObject({ taskId: task.id, title: task.title, purpose: 'review', status: 'ready', home: '/ops' });
-  expect(p.entries.find(e => e.ref === 'author')).toMatchObject({ eligible: false, share: 0, code: 'author_recusal', reason: BLOCK_TEXT.author_recusal });
+  expect(p.entries.find(e => e.ref === 'author')).toMatchObject({ eligible: false, share: 0, code: 'prior_submitter', reason: BLOCK_TEXT.prior_submitter });
   expect(p.entries.find(e => e.ref === 'fresh')?.eligible).toBe(true);
   expect(response.pools[0]!.entries.find(e => e.ref === 'author')?.eligible).toBe(true);
 });
@@ -118,7 +118,7 @@ test('roster RPC: unknown history blocks all candidates at zero share; recovery 
   const recovered = await callRoster();
   expect(recovered.reviewPools[0]?.status).toBe('ready');
   expect(recovered.reviewPools[0]!.entries.find(e => e.ref === 'fresh')?.eligible).toBe(true);
-  expect(recovered.reviewPools[0]!.entries.find(e => e.ref === 'author')?.reason).toBe(BLOCK_TEXT.author_recusal);
+  expect(recovered.reviewPools[0]!.entries.find(e => e.ref === 'author')?.reason).toBe(BLOCK_TEXT.prior_submitter);
 });
 
 // Compile and render the actual roster JSX section with wire responses, without a host UI runtime.
@@ -143,13 +143,13 @@ const renderText = (response: Roster): string => collectText(render(response,
   { createElement: (_type: unknown, _props: unknown, ...children: unknown[]) => ({ children }) },
   'Section', 'View', 'Text', 'Collapsible', {}));
 
-test('roster page JSX displays task, review recusal and unknown history at zero share', async () => {
+test('roster page JSX displays task, review exclusion and unknown history at zero share', async () => {
   historyFails = false;
   const ready = renderText(await callRoster());
   expect(ready).toContain(task.title);
   expect(ready).toContain(task.id);
   expect(ready).toContain('review');
-  expect(ready).toContain(BLOCK_TEXT.author_recusal);
+  expect(ready).toContain(BLOCK_TEXT.prior_submitter);
   expect(ready).toContain('当前候选估算');
   historyFails = true;
   const unknown = renderText(await callRoster());
@@ -164,7 +164,7 @@ test('roster RPC: a true empty audit still excludes submittedBy without blocking
     const result = await callRoster();
     expect(result.reviewPools[0]?.status).toBe('ready');
     expect(result.reviewPools[0]!.entries.find(e => e.ref === 'rework-submitter'))
-      .toMatchObject({ eligible: false, share: 0, reason: BLOCK_TEXT.author_recusal });
+      .toMatchObject({ eligible: false, share: 0, reason: BLOCK_TEXT.prior_submitter });
     expect(result.reviewPools[0]!.entries.find(e => e.ref === 'fresh')?.eligible).toBe(true);
   } finally { emptyHistory = false; }
 });
@@ -209,13 +209,13 @@ test('roster RPC: defs enabled with a live instance sort first, so truncation ke
 
 test('roster RPC: dispatch-blocked rows are the tick verdicts, with the notice summary', async () => {
   const verdict = evaluateDispatch({ taskId: task.id, title: task.title, phase: 'review', role: 'engineering', home: '/ops',
-    entries: [{ key: 'author', eligible: false, code: 'author_recusal' }, { key: 'rework-submitter', eligible: false, code: 'author_recusal' }],
+    entries: [{ key: 'author', eligible: false, code: 'prior_submitter' }, { key: 'rework-submitter', eligible: false, code: 'prior_submitter' }],
     checkedAt: Date.now(), since: Date.now() - 6 * 60_000 });
   verdicts = [verdict];
   try {
     const response = await callRoster();
     expect(response.dispatchBlocked).toEqual([expect.objectContaining({ taskId: task.id, phase: 'review', summary: verdict.summary, feasible: false })]);
-    expect(response.dispatchBlocked[0]!.reasons).toEqual([expect.objectContaining({ code: 'author_recusal', text: BLOCK_TEXT.author_recusal, owner: 'owner' })]);
+    expect(response.dispatchBlocked[0]!.reasons).toEqual([expect.objectContaining({ code: 'prior_submitter', text: BLOCK_TEXT.prior_submitter, owner: 'owner' })]);
     expect(response.dispatchBlocked[0]!.waitingMinutes).toBeGreaterThanOrEqual(5);
   } finally { verdicts = []; }
 });
@@ -241,7 +241,7 @@ const bytesOf = (value: unknown) => Buffer.byteLength(JSON.stringify(value), 'ut
 const blockedSample = (count: number, goalOf?: (i: number) => string): DispatchVerdict[] => {
   const at = Date.now();
   return Array.from({ length: count }, (_, i) => evaluateDispatch({ taskId: `big-${i}`, title: `大样本任务 ${i}`, phase: 'execute',
-    role: 'engineering', home: '/ops', goalId: goalOf?.(i),
+    role: 'engineering', home: '/ops',
     entries: Array.from({ length: 60 }, (_, c) => ({ key: `big-${i}-c${c}`, eligible: false, code: 'session_busy' as const })),
     checkedAt: at, since: at - (i % 90) * 60_000 }));
 };

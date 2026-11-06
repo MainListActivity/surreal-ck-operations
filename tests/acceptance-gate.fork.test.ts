@@ -176,7 +176,6 @@ fork('SYS02 R1: pre-gate delivery legs stay legacy after enabling; post-gate del
   await ensureGate(false);
   const impl = await core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: 'R1 legacy 链', context: '门禁关闭期间创建的交付三腿在启用后保留旧路径。', idempotencyKey: key() });
   expect(impl.acceptanceLegacy).toBe(true);
-  expect(impl.acceptanceCriteria?.length ?? 0).toBeGreaterThan(0);
   await ensureGate(true);
   const runLeg = async (task: TaskView, submitter: string, reviewer: string) => {
     const claim = await core.claim(submitter, task.id);
@@ -196,18 +195,18 @@ fork('SYS02 R1: pre-gate delivery legs stay legacy after enabling; post-gate del
 fork('SYS02 N1: the declared environment binds submit, accept and adapter-verified evidence', async () => {
   await ensureGate();
   // The environment requirement belongs to the deploy leg: that is the leg that runs against a real environment.
-  const task = await core.createTask(tokens.owner, { title: 'N1 环境绑定', context: '受控部署腿声明 production，未知环境不得通配。',
-    kind: 'deploy', executorRole: 'engineering', reviewerRole: 'qa',
+  const task = await core.createTask(tokens.owner, { title: 'N1 环境绑定', context: '代码交付任务声明 production，未知环境不得通配。',
+    executorRole: 'engineering', reviewerRole: 'qa', workIntent: { kind: 'code' },
     acceptanceEnvironment: 'production', idempotencyKey: key() });
   expect(task.acceptanceEnvironment).toBe('production');
-  expect(task.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-BASE-DEPLOY-1', 'AC-BASE-DEPLOY-2']);
+  expect(task.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-BASE-IMPL-1', 'AC-BASE-IMPL-2']);
   const claim = await core.claim(tokens['eng-a'], task.id);
   fake.setRun('9101', 'n1-head');
   // An adapter with no verified environment cannot satisfy the declared production.
   fake.environmentVerified = false;
-  await expect(recordEvidence(tokens['eng-a'], task.id, 'AC-BASE-DEPLOY-1', 'n1-head', '9101')).rejects.toMatchObject({ code: 'invalid' });
+  await expect(recordEvidence(tokens['eng-a'], task.id, 'AC-BASE-IMPL-1', 'n1-head', '9101')).rejects.toMatchObject({ code: 'invalid' });
   fake.environmentVerified = true;
-  const evidence = await recordEvidence(tokens['eng-a'], task.id, 'AC-BASE-DEPLOY-1', 'n1-head', '9101');
+  const evidence = await recordEvidence(tokens['eng-a'], task.id, 'AC-BASE-IMPL-1', 'n1-head', '9101');
   expect(evidence).toMatchObject({ environment: 'production', attempt: 1 });
   // Missing or wrong submit environments are refused; the declared one is accepted.
   await expect(core.submit(tokens['eng-a'], proofOf(claim), { text: '缺少环境声明的提交必须被拒绝，不能默认通关生产。', idempotencyKey: key(), acceptance: { sha: 'n1-head' } }))
@@ -217,22 +216,8 @@ fork('SYS02 N1: the declared environment binds submit, accept and adapter-verifi
   expect((await core.submit(tokens['eng-a'], proofOf(claim), { text: '正确环境与机器证据齐备，提交独立复核，确认门禁接受该声明的 production 环境。', idempotencyKey: key(), acceptance: { sha: 'n1-head', environment: 'production' } })).state).toBe('review');
   // Accept strictness: a row whose environment was changed no longer matches the persisted target.
   const review = await core.claim(tokens.qa, task.id);
-  await database.db.query("UPDATE acceptance_evidence SET environment = 'staging' WHERE task = $task AND ac_id = 'AC-BASE-DEPLOY-1';", { task: new RecordId('task', task.id) });
+  await database.db.query("UPDATE acceptance_evidence SET environment = 'staging' WHERE task = $task AND ac_id = 'AC-BASE-IMPL-1';", { task: new RecordId('task', task.id) });
   await expect(core.accept(tokens.qa, proofOf(review), { text: '环境不匹配的证据不得通过独立复核，机器证据的环境必须与持久化的目标一致。', idempotencyKey: key() })).rejects.toMatchObject({ code: 'invalid' });
-});
-
-fork('SYS02 N1: an environment requirement belongs to the deploy leg only', async () => {
-  await ensureGate();
-  const impl = await core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: 'N1 腿环境', context: '环境要求只落在部署腿：实现腿与上线申请腿不得携带环境要求。', acceptanceEnvironment: 'production', idempotencyKey: key() });
-  expect(impl.acceptanceEnvironment).toBe('production');
-  // A standalone task that is not the deploy leg refuses the requirement.
-  await expect(core.createTask(tokens.owner, { title: 'N1 任务环境', context: '实现腿不能带环境要求。', executorRole: 'engineering',
-    reviewerRole: 'engineering', workIntent: { kind: 'code' }, acceptanceEnvironment: 'production', idempotencyKey: key() }))
-    .rejects.toMatchObject({ code: 'invalid' });
-  // The deploy leg accepts it.
-  const deployTask = await core.createTask(tokens.owner, { title: 'N1 部署任务', context: '部署腿可以声明环境。', kind: 'deploy',
-    executorRole: 'engineering', reviewerRole: 'qa', acceptanceEnvironment: 'production', idempotencyKey: key() });
-  expect(deployTask.acceptanceEnvironment).toBe('production');
 });
 
 fork('SYS02 relay: an executor cannot introduce an environment on a generic task', async () => {
@@ -353,8 +338,7 @@ fork('SYS02 AC05: report.md auto-submit and a missing head cannot bypass the sub
 
 fork('SYS02 AC03/AC06: the owner gate refuses an out-of-band review without machine evidence, then the owner signs', async () => {
   await ensureGate();
-  const gateTask = await core.createTask(tokens.owner, { title: 'SYS02 老板关口', context: '老板关心口不能靠一行 review 绕过。', kind: 'gate',
-    executorRole: 'product', reviewerRole: 'owner', acceptanceCriteria: [machine()], idempotencyKey: key() });
+  const gateTask = await core.createTask(tokens.owner, { title: 'SYS02 老板关口', context: '老板关心口不能靠一行 review 绕过。', executorRole: 'product', reviewerRole: 'owner', acceptanceCriteria: [machine()], idempotencyKey: key() });
   await database.db.query("UPDATE $task SET state = 'review', submitted_by = $who, acceptance_head = 'gate-head';",
     { task: new RecordId('task', gateTask.id), who: 't-gm' });
   await expect(owner.decide({ taskId: gateTask.id, decision: 'approve', note: '通过', source: 'owner:test', key: key() }))
@@ -363,8 +347,7 @@ fork('SYS02 AC03/AC06: the owner gate refuses an out-of-band review without mach
   await recordEvidence(tokens.owner, gateTask.id, 'AC-1', 'gate-head', '4');
   expect((await owner.decide({ taskId: gateTask.id, decision: 'approve', note: '通过', source: 'owner:test', key: key() })).state).toBe('done');
   // The owner CLI path writes an owner_command; applyPending calls the same decide gate.
-  const second = await core.createTask(tokens.owner, { title: 'SYS02 老板关口 2', context: 'owner CLI 同源。', kind: 'gate',
-    executorRole: 'product', reviewerRole: 'owner', acceptanceCriteria: [human({ id: 'AC-1' })], idempotencyKey: key() });
+  const second = await core.createTask(tokens.owner, { title: 'SYS02 老板关口 2', context: 'owner CLI 同源。', executorRole: 'product', reviewerRole: 'owner', acceptanceCriteria: [human({ id: 'AC-1' })], idempotencyKey: key() });
   await database.db.query("UPDATE $task SET state = 'review', submitted_by = $who;", { task: new RecordId('task', second.id), who: 't-gm' });
   await database.db.query("CREATE owner_command CONTENT { kind: 'approve', task: $task, text: '通过', source: 'cli', status: 'pending' };", { task: second.id });
   const applied = await owner.applyPending();

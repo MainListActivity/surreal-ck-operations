@@ -43,12 +43,10 @@ run('an implementation submit that the check refuses never reaches review, and c
   expect(asked.filter(a => a.text.includes('pull/7'))).toHaveLength(2);
 });
 
-run('other roles and other delivery legs are not checked', async () => {
+run('other roles are not checked', async () => {
   const before = asked.length;
   const qaClaim = await core.claim(qa, (await make('qa')).id);
   expect((await core.submit(qa, proofOf(qaClaim), evidence('CONFLICT in prose only'))).state).toBe('review');
-  const release = await core.claim(eng, (await make('engineering', { kind: 'release' })).id);
-  expect((await core.submit(eng, proofOf(release), evidence('release request CONFLICT mention'))).state).toBe('review');
   expect(asked.length).toBe(before);
 });
 

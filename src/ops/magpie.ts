@@ -611,8 +611,8 @@ export interface MagpieWindowResult {
 }
 /**
  * The window proxy adapter: the company's executionWindow interface is unchanged, so this
- * derives the exact object a manager may bind, or explains why no window can be issued. It
- * writes nothing; the manager still performs the controlled resume/window binding.
+ * derives the exact object an owner may bind, or explains why no window can be issued. It
+ * writes nothing; the owner still performs the controlled resume/window binding.
  */
 export function magpieWindowFromEvidence(files: ProofFiles, approvalTask: string, now: number): MagpieWindowResult {
   const evidence = files.evidence;

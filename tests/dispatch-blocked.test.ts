@@ -13,19 +13,19 @@ test('one eligible candidate makes the item dispatchable: no reasons, no waiting
 });
 
 test('every candidate recused: not dispatchable and infeasible, reasons name the recused candidates for the gm', () => {
-  const v = verdict([{ key: 'author', eligible: false, code: 'author_recusal' }, { key: 'rework', eligible: false, code: 'author_recusal' }],
+  const v = verdict([{ key: 'author', eligible: false, code: 'prior_submitter' }, { key: 'rework', eligible: false, code: 'prior_submitter' }],
     { phase: 'review' });
   expect(v).toMatchObject({ dispatchable: false, feasible: false, noticeKey: 'dispatch-blocked:t1:review' });
-  expect(v.reasons).toEqual([expect.objectContaining({ code: 'author_recusal', candidates: ['author', 'rework'], owner: 'owner' })]);
+  expect(v.reasons).toEqual([expect.objectContaining({ code: 'prior_submitter', candidates: ['author', 'rework'], owner: 'owner' })]);
 });
 
-test('a coarse early reason cannot hide author recusal: every effective code is reported with its candidates', () => {
+test('a coarse early reason cannot hide author exclusion: every effective code is reported with its candidates', () => {
   const v = verdict([
     { key: 'quota-inst', eligible: false, code: 'quota' },
-    { key: 'author', eligible: false, code: 'author_recusal' },
+    { key: 'author', eligible: false, code: 'prior_submitter' },
     { key: 'spawn:d1', eligible: false, code: 'seat_full' },
   ], { phase: 'review' });
-  expect(v.reasons.map(r => r.code)).toEqual(['author_recusal', 'quota', 'seat_full']);
+  expect(v.reasons.map(r => r.code)).toEqual(['prior_submitter', 'quota', 'seat_full']);
   expect(v.reasons.find(r => r.code === 'quota')).toMatchObject({ candidates: ['quota-inst'], owner: 'owner' });
   expect(v.feasible).toBe(true);
 });
@@ -51,17 +51,6 @@ test('unknown state is material at once: infeasible, and never reported as busy'
   expect(v.reasons.some(r => r.code === 'session_busy')).toBe(false);
 });
 
-test('independence reasons name the source task and each excluded candidate in the verdict and the notice', () => {
-  const v = verdict([
-    { key: 't-src', eligible: false, code: 'independence_conflict', reason: '来源任务 P1 的经手人 t-src，不能接手或复核本任务' },
-    { key: 'spawn:eng-factory', eligible: false, code: 'independence_conflict', reason: '与来源任务 P1 的经手人 t-src 同源（同一登记编制），不能接手或复核本任务' },
-  ]);
-  expect(v).toMatchObject({ dispatchable: false, feasible: false });
-  expect(v.reasons).toEqual([expect.objectContaining({ code: 'independence_conflict', candidates: ['spawn:eng-factory', 't-src'] })]);
-  expect(v.reasons[0]!.text).toContain('P1');
-  expect(dispatchNoticeText(v)).toContain('（spawn:eng-factory、t-src）');
-});
-
 test('no candidate at all is a manager decision: infeasible until staff is added', () => {
   const v = verdict([]);
   expect(v).toMatchObject({ dispatchable: false, feasible: false });
@@ -70,7 +59,7 @@ test('no candidate at all is a manager decision: infeasible until staff is added
 
 test('owner-decision codes alone are infeasible; a busy candidate that can recover stays feasible', () => {
   expect(verdict([{ key: 'a', eligible: false, code: 'track_mismatch' }]).feasible).toBe(false);
-  expect(verdict([{ key: 'a', eligible: false, code: 'implementer_mismatch' }]).feasible).toBe(false);
+  expect(verdict([{ key: 'a', eligible: false, code: 'prior_submitter' }]).feasible).toBe(false);
   expect(verdict([{ key: 'a', eligible: false, code: 'session_busy' }]).feasible).toBe(true);
 });
 
@@ -86,10 +75,10 @@ test('waiting time counts whole minutes from the episode start, and the summary 
 });
 
 test('the notice lists reasons with their candidates and the owner-facing recovery', () => {
-  const v = verdict([{ key: 'author', eligible: false, code: 'author_recusal' }, { key: 'rework', eligible: false, code: 'author_recusal' }],
+  const v = verdict([{ key: 'author', eligible: false, code: 'prior_submitter' }, { key: 'rework', eligible: false, code: 'prior_submitter' }],
     { phase: 'review' });
   const text = dispatchNoticeText(v);
-  expect(text).toContain(`原因：${BLOCK_TEXT.author_recusal}（author、rework）`);
+  expect(text).toContain(`原因：${BLOCK_TEXT.prior_submitter}（author、rework）`);
   expect(text).toContain('处理：老板：老板增补独立复核人选（编制扩容或新员工），不能由作者自验');
 });
 

@@ -92,7 +92,7 @@ const pagedOf = (data: unknown) => data as { worktrees: Array<{ id: string }>; p
 
 const make = (label: string, executorRole: string, reviewerRole = 'qa'): Promise<TaskView> => core.createTask(gmA, {
   title: `空参数样例 ${label} ${suffix}`, context: `空参数正文 ${label}`,
-  executorRole: executorRole as never, reviewerRole: reviewerRole as never, idempotencyKey: key(label),
+  executorRole: executorRole as never, reviewerRole: reviewerRole as never, workIntent: executorRole === 'engineering' ? { kind: 'code' } : undefined, idempotencyKey: key(label),
 });
 
 function git(args: string[]) {
@@ -183,7 +183,7 @@ test('R8: a non-gm employee without taskId is forbidden on MCP, sidecar and core
     await coreError(plain.listWorktrees(engA as never)),
   ]) {
     expect(error?.code).toBe('forbidden');
-    expect(error?.message).toMatch(/requires gm/);
+    expect(error?.message).toMatch(/requires owner/);
   }
 });
 
@@ -325,7 +325,7 @@ test('gm paging: pages walk every stored row once, the cursor is bound to the gm
 });
 
 test('get_context: null arguments are absent on MCP and on the sidecar, and a null page size keeps the complete answer', async () => {
-  const nulls = { taskId: null, state: null, goalId: null, role: null, since: null, includeCompany: null, fields: null, pageSize: null, cursor: null };
+  const nulls = { taskId: null, state: null, tag: null, role: null, since: null, includeCompany: null, fields: null, pageSize: null, cursor: null };
   const taskIdsOf = (data: unknown) => ((data as { tasks: Array<{ id: string }> }).tasks).map(task => String(task.id)).sort();
   const keysOf = (data: unknown) => Object.keys(data as object).sort();
   // holderB's working set holds this file's queue tasks (asset-production); the answer is the complete one, not a page.

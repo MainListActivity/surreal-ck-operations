@@ -270,7 +270,7 @@ export class WorktreeRegistry {
     async readWorkspace(repoPath: string, actor: Principal, project?: ProjectView): Promise<WorktreeAssignment> {
     return this.locked(repoPath, async (repo, list) => {
       const task: TaskView = { id: `session-${actor.employeeId}`, title: 'Read workspace', context: '', state: 'ready',
-        executorRole: actor.role, reviewerRole: 'qa', kind: 'task', dependencies: [], version: 0, fence: 0, workIntent: { kind: 'read' } };
+        executorRole: actor.role, reviewerRole: 'qa', kind: 'task', version: 0, fence: 0, workIntent: { kind: 'read' } };
       const assignment = await this.allocate(repo, list, task, actor, project);
       await this.db.query(`BEGIN;
         LET $who = SELECT * FROM ONLY $holder;

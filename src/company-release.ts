@@ -30,14 +30,15 @@ export function compareRelease(a:string,b:string):number {
  * Each entry names the schema marker and the tables that must exist in the running database.
  */
 export interface ReleaseSchemaRequirement { version: string; schema: number; tables: string[] }
-/** The three tables schema 049 creates. */
+/** The three tables schema 049 creates (removed again by schema 052). */
 export const RECOVERY_READ_TABLES = ['recovery_read_grant', 'recovery_read_chain', 'recovery_read_call'] as const;
 /** The oldest schema marker any release may be verified against. */
 export const LEGACY_SCHEMA_MINIMUM = 41;
 export const RELEASE_SCHEMA_REQUIREMENTS: ReleaseSchemaRequirement[] = [
-  { version: '0.3.76', schema: 49, tables: [...RECOVERY_READ_TABLES] },
-  { version: '0.3.77', schema: 50, tables: [...RECOVERY_READ_TABLES] },
+  { version: '0.3.76', schema: 49, tables: [] },
+  { version: '0.3.77', schema: 50, tables: [] },
   { version: '0.3.78', schema: 51, tables: ['outbound_message'] },
+  { version: '0.3.79', schema: 52, tables: ['route'] },
 ];
 /** The requirement that applies to a target version: the newest one that is not newer than the target. */
 export function schemaRequirementFor(version: string): { schema: number; tables: string[] } {

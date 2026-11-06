@@ -339,7 +339,7 @@ function boundTaskFields(task: TaskView): TaskView {
 
 /**
  * The echo of a task that a write returns (SYS01 R3). The write is committed before its echo is built, so the echo never turns it
- * into an error, whatever the task holds. Each text field is bounded (boundTaskFields). Each list of the task (dependencies, the
+ * into an error, whatever the task holds. Each text field is bounded (boundTaskFields). Each list of the task (the
  * intent paths of the task and of its worktree) keeps its longest prefix within a share of the limit, and each cut is flagged in
  * listsTruncated with the whole count and digest. The context then takes the room that is left (echoTaskContext). read_task_text
  * returns any cut list or context whole.
@@ -350,7 +350,6 @@ export function echoTask(task: TaskView, limit: number = ITEM_BUDGET_BYTES): Tas
   // An echo of an echo keeps the cuts of the earlier echo, so their counts and digests still describe the whole lists.
   const cuts: Partial<Record<ClaimListName, ListCut>> = { ...task.listsTruncated };
   const echo: TaskView = boundTaskFields(task);
-  if (task.dependencies) echo.dependencies = cutList(task.dependencies, 'dependencies', cuts, share);
   if (task.workIntent?.paths) echo.workIntent = { ...task.workIntent, paths: cutList(task.workIntent.paths, 'workIntentPaths', cuts, share) };
   if (task.worktree?.intent?.paths) {
     echo.worktree = { ...task.worktree, intent: { ...task.worktree.intent, paths: cutList(task.worktree.intent.paths, 'worktreePaths', cuts, share) } };
@@ -377,11 +376,11 @@ export const CLAIM_HISTORY_FLOOR_BYTES = 8 * 1024;
 export const PROJECT_FIELD_ECHO_BYTES = 512;
 /** Most dual bytes of one red line in a partial project echo. */
 export const RED_LINE_ECHO_BYTES = 1024;
-/** The most dual bytes one list of a claim echo keeps: the dependencies, and the intent paths of the task and of its worktree. */
+/** The most dual bytes one list of a claim echo keeps: the intent paths of the task and of its worktree. */
 export const CLAIM_LIST_ECHO_BYTES = 4 * 1024;
 const PROJECT_IDENTITY = ['id', 'name', 'repoPath', 'defaultBranch', 'release', 'rollback', 'pipeline'] as const;
 
-export type ClaimListName = 'dependencies' | 'workIntentPaths' | 'worktreePaths';
+export type ClaimListName = 'workIntentPaths' | 'worktreePaths';
 
 /**
  * A claim as an MCP caller receives it. task.worktree is left out: the worktree is the top-level field. projectTruncated marks a
@@ -461,7 +460,7 @@ function partialProject(project: ProjectView): Partial<ProjectView> {
 /**
  * The echo of a claim (SYS01, return of 04195c93, R3). The claim has committed, so the echo never fails: deliveryId, fence and
  * leaseExpiresAt always come back, and each variable part is bounded and says so. Predecessors are at most six. Each list is cut to
- * CLAIM_LIST_ECHO_BYTES: the dependencies, the task's intent paths and the worktree's intent paths. The project is echoed whole up
+ * CLAIM_LIST_ECHO_BYTES: the task's intent paths and the worktree's intent paths. The project is echoed whole up
  * to PROJECT_ECHO_BYTES, else in part (identity, red lines; projectTruncated). The history fills what the other fields leave: the
  * newest entries that fit are kept whole, the boundary entry keeps its longest prefix, and historyCount says how many entries the
  * task holds. historyComplete is true only when every entry is kept whole and the count agrees. The context takes the room that is
@@ -472,7 +471,7 @@ export function echoClaim(claim: ClaimResult): ClaimEcho & { task: TaskView } {
   const { task: whole, project, history, historyComplete, historyCount, ...fields } = claim;
   const cuts: Partial<Record<ClaimListName, ListCut>> = {};
   // task.worktree is the same assignment as the top-level worktree, so the echo carries it once.
-  const bare: TaskView = { ...whole, dependencies: cutList(whole.dependencies, 'dependencies', cuts) };
+  const bare: TaskView = { ...whole };
   delete bare.worktree;
   if (whole.workIntent?.paths) bare.workIntent = { ...whole.workIntent, paths: cutList(whole.workIntent.paths, 'workIntentPaths', cuts) };
   const task = boundTaskFields(bare);
@@ -502,7 +501,7 @@ export function echoClaim(claim: ClaimResult): ClaimEcho & { task: TaskView } {
   // The history takes what the whole context would leave, but never less than its floor. A long context is cut to what remains.
   const budget = Math.min(room, Math.max(CLAIM_HISTORY_FLOOR_BYTES, room - dualBytes(echoTaskContext(task, Number.POSITIVE_INFINITY))));
   const { kept, cut } = fillHistory(history, budget);
-  // The task's own fields (title, intent, dependencies) are never cut here; only its context is.
+  // The task's own fields (title, intent, parent) are never cut here; only its context is.
   const echoed = echoTaskContext(task, room - dualBytes(kept));
   const count = historyCount ?? history.length;
   const complete = read ? historyComplete === true && !cut && kept.length === count : undefined;

@@ -623,7 +623,7 @@ export class FaultStore {
 
   /**
    * The budget ran out: the episode is marked exhausted and the one diagnostic of the incident is written to the
-   * repair row. The repair task itself is created by the manager who picks the task up, so the repair follows the
+   * repair row. The repair task itself is created by the owner who picks the task up, so the repair follows the
    * normal task rules instead of appearing on its own.
    */
   private async noteExhaustion(row: FaultScopeRow, input: FaultReserveInput): Promise<FaultDiagnostic | undefined> {
@@ -676,7 +676,7 @@ export class FaultStore {
   /**
    * Open or converge the episode of a cause and a task.
    *
-   * The first report opens the episode. A later report of the same evidence converges onto it: the manager has
+   * The first report opens the episode. A later report of the same evidence converges onto it: the owner has
    * one episode to act on, not one per report. Only new evidence (a different fingerprint, and therefore a
    * different episode) or the repair finishing opens a new stage.
    */
@@ -699,7 +699,7 @@ export class FaultStore {
     });
       return { firstReport: true };
     }
-    // The same evidence: it converges. The episode stays 'opened' until the manager has been told about it.
+    // The same evidence: it converges. The episode stays 'opened' until the owner has been told about it.
     const state = existing.notified ? 'converged' : 'opened';
     await this.db.query('UPDATE $row SET state = $state, updated_at = time::now();', { row: episodeId(episodeKey), state });
     return { firstReport: false };
@@ -721,7 +721,7 @@ export class FaultStore {
   }
 
   /**
-   * Record that the episode reached the manager: exactly one notification per episode. A second call is a no-op,
+   * Record that the episode reached the owner: exactly one notification per episode. A second call is a no-op,
    * so ten identical reports still produce one notice.
    */
   async markNotified(episodeKey: string, stageStartedAt?: number): Promise<boolean> {

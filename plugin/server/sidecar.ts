@@ -491,8 +491,7 @@ export class SidecarPool {
     text: string, path: string,
   ): Promise<void> {
     const upgradeSha = /^\s*companyUpgradeSha:\s*(\S+)\s*$/m.exec(text)?.[1];
-    const recovery = /^\s*recoveryReason:\s*(\S+)\s*$/m.exec(text)?.[1];
-    const evidence: Evidence = { ...(upgradeSha ? {companyUpgrade:{sha:upgradeSha}}:{}), ...(to && recovery ? { recoveryReason: recovery as Evidence["recoveryReason"] } : {}), text, idempotencyKey: `sidecar-file:${instId}:${live.proof.deliveryId}:${hash(text)}` };
+    const evidence: Evidence = { ...(upgradeSha ? {companyUpgrade:{sha:upgradeSha}}:{}), text, idempotencyKey: `sidecar-file:${instId}:${live.proof.deliveryId}:${hash(text)}` };
     try {
       const cred = await this.credentialFor(instId);
       if (to) {
@@ -643,7 +642,7 @@ export class SidecarPool {
     this.ensureSweeper();
   }
 
-  /** FV06 P0 standby wake: a resume assigned this instance a lease server-side (no sidecar claim ran),
+  /** A resume assigned this instance a lease server-side (no sidecar claim ran),
    *  so rebuild the local claim (channel proof + claim.json) from the authoritative server lease. */
   async adoptLease(inst: EmployeeInst): Promise<void> {
     if (!this.launched.has(inst.id)) throw new Error("unhealthy session channel cannot adopt a lease");
@@ -847,7 +846,7 @@ export class SidecarPool {
     const declared = acceptance();
     // SYS-QUOTA: the relay forwards the subscription quota reset the caller declared on a block.
     // A declared field is never dropped quietly — a dropped reset leaves the provider dispatchable
-    // and the manager unparked, which is the P0 this seam caused. A value of the wrong shape is
+    // and the owner unparked, which is the P0 this seam caused. A value of the wrong shape is
     // refused here; the instant itself is validated by core.block (parseQuotaResetsAt), the only
     // writer of quota_resets_at, so both the call entry and the file entry below refuse the same
     // texts with the same `invalid` refusal. A near-miss key is refused too, rather than silently
@@ -868,11 +867,11 @@ export class SidecarPool {
     };
     const evidence = (): Evidence => ({
       ...(args.companyUpgrade === undefined ? {} : { companyUpgrade: args.companyUpgrade as Evidence["companyUpgrade"] }),
-      ...(args.executionWindow === undefined ? {} : { executionWindow: args.executionWindow as Evidence["executionWindow"] }),
-      ...(args.recoveryReason === undefined ? {} : { recoveryReason: args.recoveryReason as Evidence["recoveryReason"] }),
       text: String(args.text ?? ""),
       idempotencyKey: String(args.idempotencyKey ?? `sidecar-relay:${instId}:${randomBytes(6).toString("hex")}`),
       ...(declared ? { acceptance: declared } : {}),
+      ...(args.sha === undefined ? {} : { sha: args.sha as string }),
+      ...(args.next === undefined ? {} : { next: args.next as Evidence["next"] }),
     });
     const live = () => {
       const claim = this.claims.get(instId);
@@ -978,13 +977,9 @@ export class SidecarPool {
         return writeOp(p => (args.decision === "accept" ? core.accept(cred, p, evidence()) : core.returnTask(cred, p, evidence())), true);
       }
       case "report_blocker": return writeOp(p => core.block(cred, p, args.to === "owner" ? "owner" : "owner", evidence(), quotaReset()), true);
-      // SYS05: entering a wait consumes the lease in the same turn — the task takes no employee or provider seat
-      // while it waits. The ops sessions and browser spaces opened under this lease are dropped by endLease below.
       case "create_task": return core.createTask(cred, args as never);
       case "record_owner_decision": return core.relayOwnerDecision(cred, args as never);
       case "set_direction": await core.relayDirection(cred, args as never); return { recorded: true };
-      // FV06 P0: standbyEmployee turns the resume into an atomic bounded standby assignment
-      // (doing + lease + progress_at + standby_until) instead of the ordinary ready hand-off.
       case "resume_task": return core.resume(cred, taskIdOf(args.taskId), evidence());
       case "retire_task": return core.retireTask(cred, args as never);
       // SYS03 老板处置账本：授权与全部写入都在 core；这里只是同一通道上的入口（sck 与 MCP 同源判定）。

@@ -35,12 +35,6 @@ export const createGoal = defineRpc({
   output: z.object({ id: z.string(), state: z.string() }),
 });
 
-export const triageGoal = defineRpc({
-  name: "company.goal.triage",
-  input: z.object({ goalId: z.string().min(1), tier: z.enum(["quick", "standard", "program"]) }),
-  output: z.object({ id: z.string(), state: z.string(), tier: z.string().optional() }),
-});
-
 export const addDirection = defineRpc({
   name: "company.direction.add",
   input: z.object({ text: z.string().min(2), key }),
@@ -76,12 +70,6 @@ export const unlockTask = defineRpc({
   output: z.object({ unlocked: z.array(z.string()) }),
 });
 
-export const cancelGoalRpc = defineRpc({
-  name: "company.goal.cancel",
-  input: z.object({ goalId: z.string().min(1), note: z.string().min(2), key }),
-  output: z.object({ retired: z.number(), remaining: z.number() }),
-});
-
 export const resolveNotice = defineRpc({
   name: "company.notice.resolve",
   input: z.object({ key }),
@@ -94,9 +82,9 @@ export const setPaused = defineRpc({
   output: z.object({ ok: z.boolean() }),
 });
 
-export const goalTasks = defineRpc({
-  name: "company.goal.tasks",
-  input: z.object({ goalId: z.string().min(1) }),
+export const chainTasks = defineRpc({
+  name: "company.chain.tasks",
+  input: z.object({ tag: z.string().min(1) }),
   output: z.object({ tasks: z.array(record<TaskView>()) }),
 });
 

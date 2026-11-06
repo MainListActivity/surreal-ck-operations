@@ -24,7 +24,7 @@ export async function observeRuntimeIdle(input: {
 /** Reclaim at most one runtime per dispatch pass so kernel pressure can settle between closes. */
 export async function reclaimMemoryLru(input:{
   instances:EmployeeInst[]; states:ReadonlyMap<string,string>; now:number;
-  workforce:Pick<Workforce,'insts'|'tasks'|'openManagerWakes'|'reserveRuntimeSleep'|'confirmRuntimeSleep'|'releaseRuntimeSleep'>;
+  workforce:Pick<Workforce,'insts'|'tasks'|'openPendingWakes'|'reserveRuntimeSleep'|'confirmRuntimeSleep'|'releaseRuntimeSleep'>;
   paseo:Pick<PaseoGateway,'status'|'sleep'>; log:(text:string)=>void;
 }):Promise<EmployeeInst|undefined> {
   if (!input.paseo.sleep || (typeof input.workforce.reserveRuntimeSleep!=='function' || typeof input.workforce.confirmRuntimeSleep!=='function')) return;
@@ -37,7 +37,7 @@ export async function reclaimMemoryLru(input:{
       const fresh=(await input.workforce.insts()).find(i=>i.id===candidate.id);
       if (!fresh || !eligible(fresh) || fresh.idleSince!==candidate.idleSince || fresh.paseoAgentId!==candidate.paseoAgentId) continue;
       if ((await input.workforce.tasks()).some(t=>t.currentEmployee===fresh.id)) continue;
-      if ((await input.workforce.openManagerWakes()).some(w=>w.employee===fresh.id || w.agent===fresh.paseoAgentId)) continue;
+      if ((await input.workforce.openPendingWakes()).some(w=>w.employee===fresh.id || w.agent===fresh.paseoAgentId)) continue;
       if (!await input.workforce.reserveRuntimeSleep(fresh,input.now)) continue;
       const status=await input.paseo.status(fresh.paseoAgentId!);
       if (status?.status!=='idle' || status.pendingPermissions>0) {

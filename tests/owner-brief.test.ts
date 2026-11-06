@@ -56,7 +56,7 @@ test('brief names every blocked item of the pass row by row, and says how many i
     evaluateDispatch({ taskId: 'exec-busy', title: '就绪实现', phase: 'execute', role: 'engineering', home: '/ops',
       entries: [{ key: 'fresh', eligible: false, code: 'session_busy' }], checkedAt: at, since: at - 30 * 60_000 }),
     evaluateDispatch({ taskId: 'review-recused', title: '独立验收', phase: 'review', role: 'engineering', home: '/ops',
-      entries: [{ key: 'author', eligible: false, code: 'author_recusal' }], checkedAt: at, since: at - 12 * 60_000 }),
+      entries: [{ key: 'author', eligible: false, code: 'prior_submitter' }], checkedAt: at, since: at - 12 * 60_000 }),
     evaluateDispatch({ taskId: 'budget-gate', title: '预算阻塞任务', phase: 'execute', role: 'engineering', home: '/ops',
       globalBlocks: [globalBlock('budget')], checkedAt: at, since: at - 200 * 60_000 }),
     evaluateDispatch({ taskId: 'zero', title: '零候选任务', phase: 'execute', role: 'engineering', home: '/ops',
@@ -79,7 +79,7 @@ test('brief names every blocked item of the pass row by row, and says how many i
     '- 《就绪实现》（执行·就绪）：会话占用中或异常；已等 30 分钟；负责：老板；下一触发：候选会话空闲',
   ]) expect(text).toContain(line);
   expect(text).not.toContain('可派工任务');
-  // Material blocks first (the owner-only recusal), then the longest wait.
+  // Material blocks first (the owner-only exclusion), then the longest wait.
   expect(text.indexOf('独立验收')).toBeLessThan(text.indexOf('零候选任务'));
   expect(text.indexOf('预算阻塞任务')).toBeLessThan(text.indexOf('就绪实现'));
   // A bounded list names its first rows and the marker says how many it left out.

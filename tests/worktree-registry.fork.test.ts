@@ -71,7 +71,8 @@ const coreFor = (path: string) => {
 };
 async function employee(role: Role) { return new LocalEnrollmentAdmin(db).enroll(`fixture-${role}-${++count}`, role, ['execute', 'review']); }
 async function task(core: SurrealCompanyCore, role: Role, intent?: WorkIntent) {
-  return core.createTask(gm, { title: `Worktree fixture ${++count}`, context: 'Isolated local integration fixture, never production', executorRole: role, reviewerRole: 'qa', workIntent: intent, idempotencyKey: `fixture-task-${count}` });
+  const shape = intent ?? (role === 'engineering' ? { kind: 'code' } as WorkIntent : undefined);
+  return core.createTask(gm, { title: `Worktree fixture ${++count}`, context: 'Isolated local integration fixture, never production', executorRole: role, reviewerRole: 'qa', workIntent: shape, idempotencyKey: `fixture-task-${count}` });
 }
 const proof = (claim: ClaimResult): LeaseProof => ({ taskId: claim.task.id, deliveryId: claim.deliveryId, fence: claim.fence, expectedVersion: claim.task.version });
 async function submit(core: SurrealCompanyCore, credential: string, claim: ClaimResult) { return core.submit(credential, proof(claim), { text: 'Synthetic fixture completed with unchanged scene', idempotencyKey: `fixture-submit-${++count}` }); }
@@ -82,23 +83,6 @@ async function acceptDone(core: SurrealCompanyCore, executor: string, claim: Cla
   return core.accept(qa, proof(review), { text: 'Independent fixture accept for reclaim coverage', idempotencyKey: `fixture-accept-${++count}` });
 }
 
-run('serial QA and GM reuse one physical tree, with authenticated references and protected main', async () => {
-  const path = repo(), core = coreFor(path), qa = await employee('qa');
-  const first = await core.claim(qa, (await task(core, 'qa')).id); await submit(core, qa, first);
-  const second = await core.claim(qa, (await task(core, 'qa')).id); expect(second.worktree!.worktreePath).toBe(first.worktree!.worktreePath); await submit(core, qa, second);
-  const manager1 = await core.claim(gm, (await task(core, 'owner')).id); await submit(core, gm, manager1);
-  const manager2 = await core.claim(gm, (await task(core, 'owner')).id); expect(manager2.worktree!.worktreePath).toBe(first.worktree!.worktreePath);
-  const inventory = await core.listWorktrees(gm);
-  const shared = inventory.find(w => w.id === first.worktree!.id)!;
-  expect(shared.references.filter(r => r.state === 'active').map(r => r.taskId)).toEqual([manager2.task.id]);
-  expect(shared.references.filter(r => r.state === 'released')).toHaveLength(3);
-  expect(shared.createdAt).toBeTruthy(); expect(shared.lastUsedAt).toBeTruthy(); expect(shared.reasons).toContain('active-reference');
-  expect(inventory.find(w => w.worktreePath === path)!.reasons).toContain('repository-main');
-  await expect(core.listWorktrees(qa)).rejects.toMatchObject({ code: 'forbidden' });
-  expect((await core.listWorktrees(qa, first.task.id)).some(w => w.id === shared.id)).toBe(true);
-  const history = await core.history(qa, first.task.id); expect(history.find(h => h.action === 'claim')!.evidence).toContain(first.worktree!.worktreePath);
-  await submit(core, gm, manager2);
-});
 run('untagged engineering tasks each get their own task tree and branch; the shared tree never leaves its branch', async () => {
   const path = repo(), core = coreFor(path), eng = await employee('engineering'), qa = await employee('qa');
   const reader = await core.claim(qa, (await task(core, 'qa')).id);
@@ -141,21 +125,6 @@ run('two first claims across independent processes get distinct writers; dirty f
   const inv = await core.listWorktrees(gm); expect(inv.filter(w => w.repo === path && w.references.some(r => r.state === 'active'))).toHaveLength(2);
   await submit(core, a, again); await submit(core, b, second);
 }, 20000);
-run('asset scopes overlap queues, disjoint directories share; readers prevent engineering branch switch', async () => {
-  const path = repo(), core = coreFor(path), a = await employee('asset-production'), b = await employee('concept-design'), eng = await employee('engineering');
-  const first = await core.claim(a, (await task(core, 'asset-production', { kind: 'assets', paths: ['assets/characters'] })).id);
-  const queued = await task(core, 'concept-design', { kind: 'assets', paths: ['assets/characters/sub'] });
-  await expect(core.claim(b, queued.id)).rejects.toMatchObject({ code: 'worktree_busy' });
-  expect((await core.getTask(gm, queued.id)).currentEmployee).toBeUndefined();
-  const disjoint = await core.claim(b, (await task(core, 'concept-design', { kind: 'assets', paths: ['assets/music'] })).id);
-  expect(disjoint.worktree!.worktreePath).toBe(first.worktree!.worktreePath);
-  const writer = await core.claim(eng, (await task(core, 'engineering')).id); expect(writer.worktree!.mode).toBe('exclusive');
-  expect(git(first.worktree!.worktreePath, 'branch', '--show-current')).toBe(first.worktree!.branch!);
-  await submit(core, a, first); await submit(core, b, disjoint); await submit(core, eng, writer);
-  const resumed = await core.claim(b, queued.id); expect(resumed.worktree!.worktreePath).toBe(first.worktree!.worktreePath); await submit(core, b, resumed);
-  await expect(task(core, 'asset-production', { kind: 'assets', paths: ['../escape'] })).rejects.toMatchObject({ code: 'invalid' });
-  await expect(task(core, 'asset-production', { kind: 'assets', paths: ['.env'] })).rejects.toMatchObject({ code: 'invalid' });
-});
 run('restart persistence, revoked handover preserves dirty scene and fencing; legacy trees are adopted without reset', async () => {
   const path = repo(), core = coreFor(path), eng = await employee('engineering'), successor = await employee('engineering');
   const t = await task(core, 'engineering'), legacy = join(dir, `legacy-${++count}`);
@@ -220,19 +189,6 @@ run('actual dispatcher and sidecar stage one registry source in claim.json, prom
   } finally { pool.detachAgent('fixture-agent'); }
 }, 15000);
 
-run('non-lease GM/eval shared sessions protect checkout and release without credentials reaching agents', async () => {
-  const path = repo(), core = coreFor(path), judge = await employee('eval'), eng = await employee('engineering');
-  const manager = await core.readWorkspace(gm), evaluator = await core.readWorkspace(judge);
-  expect(manager!.worktreePath).toBe(evaluator!.worktreePath);
-  const writer = await core.claim(eng, (await task(core, 'engineering')).id);
-  expect(writer.worktree!.mode).toBe('exclusive');
-  const inventory = await core.listWorktrees(gm), shared = inventory.find(w => w.id === manager!.id)!;
-  expect(shared.references.filter(r => r.state === 'active')).toHaveLength(2);
-  await core.releaseWorkspace(gm); await core.releaseWorkspace(judge);
-  expect((await core.listWorktrees(gm)).find(w => w.id === manager!.id)!.references.filter(r => r.state === 'active')).toHaveLength(0);
-  await submit(core, eng, writer);
-});
-
 run('new code stays isolated while read/asset trees share', async () => {
   const path = repo(), core = new SurrealCompanyCore(db, { worktrees: { opsRepo: path } });
   const eng = await employee('engineering'), qa = await employee('qa'), assets = await employee('asset-production');
@@ -294,7 +250,7 @@ run('project-bound non-lease eval uses project repo and carries persistent proje
   git(path, 'add', '.'); git(path, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'project baseline'); git(path, 'checkout', 'main');
   const project = await new ProjectStore(db.db).upsert({ id: `fixture-project-${++count}`, name: 'Isolated worktree project', repoPath: path, defaultBranch: 'project-default', release: 'Fixture only', envs: [] });
 
-  const t = await core.createTask(gm, { title: 'Project-scoped fixture', context: 'Local fixture only', executorRole: 'qa', reviewerRole: 'engineering', idempotencyKey: `project-task-${count}` });
+  const t = await core.createTask(gm, { title: 'Project-scoped fixture', context: 'Local fixture only', executorRole: 'qa', reviewerRole: 'engineering', project: project.id, idempotencyKey: `project-task-${count}` });
   const workspace = await core.readWorkspace(judge, t.id);
   expect(workspace!.repo).toBe(path); expect(workspace!.project).toBe(project.id); expect(workspace!.repo).not.toBe(opsPath);
   expect(readFileSync(join(workspace!.worktreePath, 'source.txt'), 'utf8')).toBe('project baseline');
@@ -610,37 +566,8 @@ async function laneGoal(core: SurrealCompanyCore, name: string) {
   const [rows] = await core.database.db.query<[Array<{ id: RecordId }>]>(`CREATE goal CONTENT { title: $title, brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;`, { title: `Lane fixture ${name}` });
   return String(rows[0]!.id.id);
 }
-const laneTask = (core: SurrealCompanyCore, goalId: string, role: Role, lane: string, kind: WorkIntent['kind']) =>
-  core.createTask(gm, { title: `Lane ${lane} ${++count}`, context: 'Isolated lane fixture', executorRole: role, reviewerRole: 'qa', goalId, workIntent: { kind, lane }, idempotencyKey: `lane-task-${count}` });
-run('LANE: a task waits instead of sharing the lane tree with another active writer; readers never create a lane', async () => {
-  const path = repo(), core = coreFor(path), a = await employee('engineering'), b = await employee('engineering'), qa = await employee('qa');
-  const goal = await laneGoal(core, 'two');
-  const t1 = await laneTask(core, goal, 'engineering', 'api', 'code'), t2 = await laneTask(core, goal, 'engineering', 'api', 'code');
-  const first = await core.claim(a, t1.id);
-  await expect(core.claim(b, t2.id)).rejects.toMatchObject({ code: 'worktree_busy' });
-  const lonely = await core.claim(qa, (await laneTask(core, goal, 'qa', 'docs', 'read')).id);
-  expect(lonely.worktree!.mode).toBe('shared'); expect(lonely.worktree!.lane).toBeUndefined();
-  await submit(core, a, first); await submit(core, qa, lonely);
-}, 30000);
-run('LANE: a shared tree is not moved off its branch while any task lease (legacy writer or reviewer) is still active on it', async () => {
-  const path = repo(), core = coreFor(path), qa = await employee('qa'), eng = await employee('engineering');
-  const read = await core.claim(qa, (await task(core, 'qa')).id); await submit(core, qa, read);
-  const writer = await core.claim(eng, (await task(core, 'engineering')).id);
-  const shared = read.worktree!, sharedKey = new RecordId('worktree', shared.id);
-  git(shared.worktreePath, 'checkout', '-q', '-b', 'legacy-writer');
-  await db.db.query('UPDATE ONLY $tree SET branch = $branch; UPDATE ONLY $ref SET tree = $tree; UPDATE ONLY $task SET worktree.id = $id;',
-    { tree: sharedKey, branch: 'legacy-writer', ref: new RecordId('worktree_ref', writer.task.id), task: new RecordId('task', writer.task.id), id: shared.id });
-  const during = await core.claim(qa, (await task(core, 'qa')).id);
-  expect(git(shared.worktreePath, 'branch', '--show-current')).toBe('legacy-writer'); expect(during.worktree!.worktreePath).toBe(shared.worktreePath);
-  await submit(core, eng, writer);
-  const qa2 = await employee('qa'); const mid = await core.claim(qa2, (await task(core, 'qa')).id);
-  expect(git(shared.worktreePath, 'branch', '--show-current')).toBe('legacy-writer');
-  await submit(core, qa, during); await submit(core, qa2, mid);
-  const after = await core.claim(qa, (await task(core, 'qa')).id);
-  expect(git(shared.worktreePath, 'branch', '--show-current')).toMatch(/^sck\/shared-/);
-  await submit(core, qa, after);
-}, 30000);
-
+const laneTask = (core: SurrealCompanyCore, tag: string, role: Role, lane: string, kind: WorkIntent['kind']) =>
+  core.createTask(gm, { title: `Lane ${lane} ${++count}`, context: 'Isolated lane fixture', executorRole: role, reviewerRole: 'qa', tag, workIntent: { kind, lane }, idempotencyKey: `lane-task-${count}` });
 run('WT02: a tree holding only dependency output is reclaimed, and a row for a vanished tree is dropped', async () => {
   const path = repo(), core = coreFor(path);
   const eng = await employee('engineering');
@@ -700,32 +627,3 @@ run('a routine sweep records a retention once per reason, never the same skip ev
   expect((await audits()).length).toBeGreaterThan(recorded);
 }, 60000);
 
-run('goal workspace metadata survives database reconnect while its task lease and worktree stay unchanged', async () => {
-  const path = repo(), core = coreFor(path), wf = new Workforce(db, join(dir, 'unused-goal-credentials'));
-  const name = `goal-seat-${++count}`;
-  await wf.upsertDef(name, { role: 'engineering', provider: 'claude', model: 'haiku', maxInstances: 2 });
-  const def = (await wf.defs()).find(d => d.id === name)!;
-  const inst = await wf.spawnInst(def, path, 'fixture-goal');
-  const agentId = `goal-agent-${count}`;
-  await wf.bind(inst.id, { agentId, cwd: path, repoHome: path, workspaceScope: 'fixture-goal' });
-  const [grows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: 'Isolated goal workspace fixture', brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
-  const goal = { id: String(grows[0]!.id.id) };
-  // Rebind the fixture before it takes a lease; real dispatch stores this at spawn.
-  await wf.bind(inst.id, { agentId, workspaceScope: goal.id });
-  const ownTask = await core.createTask(gm, { title: name, context: 'Isolated goal claim', executorRole: 'engineering', reviewerRole: 'qa',
-    goalId: goal.id, workIntent: { kind: 'code' }, idempotencyKey: name });
-  const otherTask = await task(core, 'engineering', { kind: 'code' });
-  await expect(core.claim(inst.credential!, otherTask.id)).rejects.toThrow('another goal');
-  await expect(new SurrealCompanyCore(db).claim(inst.credential!, otherTask.id)).rejects.toThrow('forbidden');
-  const allocated = await core.claim(inst.credential!, ownTask.id);
-  const before = await core.getTask(gm, allocated.task.id);
-  await db.close();
-  db = new CompanyDatabase(config()); await db.connect(); await db.useDatabase();
-  const restored = (await new Workforce(db, join(dir, 'unused-goal-credentials')).insts()).find(i => i.id === inst.id)!;
-  expect(restored).toMatchObject({ cwd: path, repoHome: path, workspaceScope: goal.id, paseoAgentId: agentId });
-  const after = await coreFor(path).getTask(gm, allocated.task.id);
-  expect(after.currentEmployee).toBe(before.currentEmployee);
-  expect(after.fence).toBe(before.fence);
-  expect(after.worktree).toEqual(before.worktree);
-  expect(after.version).toBe(before.version);
-});

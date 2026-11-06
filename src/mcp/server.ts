@@ -1,4 +1,3 @@
-import { executionWindowSchema, recoveryReasonSchema } from '../task-recovery.ts';
 import { basename } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { createHash, timingSafeEqual } from 'node:crypto';
@@ -26,8 +25,6 @@ const proofShape = {
 };
 const evidenceShape = {
   companyUpgrade: z.object({ sha:z.string().regex(/^[a-f0-9]{40}$/) }).strict().optional(),
-  executionWindow: executionWindowSchema.optional(),
-  recoveryReason: recoveryReasonSchema.optional(),
   text: z.string().min(1),
   idempotencyKey: z.string().min(1),
   // SYS02: the head a submission is bound to; machine evidence must match it.
@@ -73,7 +70,7 @@ function toolError(error: unknown) {
   const code = /^[a-z][a-z0-9_]{1,63}$/.test(raw) ? raw : 'internal_error';
   const retryable = code === 'temporarily_unavailable' && typeof error === 'object' && error !== null
     && 'retryable' in error && error.retryable === true;
-  // Structured reasons (independence conflicts name the task, source and employee) travel in structuredContent only; never credentials.
+  // Structured reasons travel in structuredContent only; never credentials.
   const details = typeof error === 'object' && error !== null && 'details' in error && typeof error.details === 'object' && error.details !== null
     ? error.details : undefined;
   // The message is written for the caller (CompanyError, budget refusals). Unknown errors are reported by code alone.
@@ -138,13 +135,13 @@ function registerTools(server: McpServer, core: CompanyCore) {
   const withoutNull = (value: Record<string, unknown>) =>
     Object.fromEntries(Object.entries(value).filter(([, item]) => item !== null && item !== undefined)) as never;
   server.registerTool('get_context', {
-    description: 'Show the authenticated employee and the working set of company tasks (ready, doing, review, blocked) within a 48 KiB UTF-8 response budget. Without scope, or with scope "tasks": without pageSize or cursor the answer is complete (keys principal, companyIncluded, companyRead, tasks, and company when includeCompany is true) or refused as response_too_large with retry guidance; it is never cut. With pageSize (1 to 100) or cursor it returns one stored page: continue with the same arguments plus cursor set to page.nextCursor, until page.hasMore is false. includeCompany defaults to false; companyRead names the arguments that read the company block. A task too large for one page is echoed with a long dependency list cut and flagged (listsTruncated), and a context still too large cut and flagged (contextTruncated, contextNextOffset); read_task_text returns any cut part whole. A task read by taskId is whole or refused. A blocked task carries `waiting`: kind (manager/owner/dependency), the phase it restores (`resumeState`, unknown when absent), the role that phase belongs to (a review wait names the reviewing role) and the number of dependencies (the ids stay in the task `dependencies` field). With scope "company" the answer is the company block (directions, goals, projects, paused), optionally one section; project environments (envs, credential aliases and roles) are shown only to owner and to the holder of a valid task lease, and to anyone else envs is empty with envsWithheld true; it is complete (key company) or, with pageSize or cursor, one stored page of parts (keys section, key, part, parts, offset, totalBytes, sha256, json): join the json of the parts of one section and key in part order, check the byte length and sha256 against totalBytes and sha256, then parse; continue with the same arguments plus cursor set to page.nextCursor until page.hasMore is false.',
+    description: 'Show the authenticated employee and the working set of company tasks (ready, doing, review, blocked) within a 48 KiB UTF-8 response budget. Without scope, or with scope "tasks": without pageSize or cursor the answer is complete (keys principal, companyIncluded, companyRead, tasks, and company when includeCompany is true) or refused as response_too_large with retry guidance; it is never cut. With pageSize (1 to 100) or cursor it returns one stored page: continue with the same arguments plus cursor set to page.nextCursor, until page.hasMore is false. includeCompany defaults to false; companyRead names the arguments that read the company block. A task too large for one page is echoed with a long list cut and flagged (listsTruncated), and a context still too large cut and flagged (contextTruncated, contextNextOffset); read_task_text returns any cut part whole. A task read by taskId is whole or refused. A blocked task carries `blockedTo`: the owner gate it waits on, the phase it restores (`resumeState`, unknown when absent), and the role that phase belongs to (a review wait names the reviewing role). Its chain predecessor stays in the task `parent` field. With scope "company" the answer is the company block (directions, projects, paused), optionally one section; project environments (envs, credential aliases and roles) are shown only to owner and to the holder of a valid task lease, and to anyone else envs is empty with envsWithheld true; it is complete (key company) or, with pageSize or cursor, one stored page of parts (keys section, key, part, parts, offset, totalBytes, sha256, json): join the json of the parts of one section and key in part order, check the byte length and sha256 against totalBytes and sha256, then parse; continue with the same arguments plus cursor set to page.nextCursor until page.hasMore is false.',
     inputSchema: z.object({
       scope: z.enum(['tasks', 'company']).nullish(),
-      section: z.enum(['directions', 'goals', 'projects']).nullish(),
+      section: z.enum(['directions', 'projects']).nullish(),
       taskId: z.string().min(1).max(200).nullish(),
       state: z.enum(states).nullish(),
-      goalId: z.string().min(1).max(100).nullish(),
+      tag: z.string().min(1).max(100).nullish(),
       role: z.enum(roles).nullish(),
       since: z.string().min(1).max(40).nullish(),
       includeCompany: z.boolean().nullish(),
@@ -213,14 +210,14 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.worktreeRefs(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('get_admin_summary', {
-    description: 'owner only: read-only company summary at one stated cutoffAt. tasks counts each task by the state it holds at cutoffAt (optionally for one goal; since does not apply to tasks). audit counts entries from since (default: the 24 hours before the cutoff) up to cutoffAt, limited to the tasks of the goal when goalId is given. Returns scope, outboxSequence and integrity; integrity.complete is true only for a proven consistent read, and false means retry. Never returns task text.',
-    inputSchema: z.object({ since: z.string().min(1).max(40).nullish(), goalId: z.string().min(1).max(100).nullish() }),
+    description: 'owner only: read-only company summary at one stated cutoffAt. tasks counts each task by the state it holds at cutoffAt (audit counts entries from since (default: the 24 hours before the cutoff) up to cutoffAt. Returns scope, outboxSequence and integrity; integrity.complete is true only for a proven consistent read, and false means retry. Never returns task text.',
+    inputSchema: z.object({ since: z.string().min(1).max(40).nullish(), tag: z.string().min(1).max(100).nullish() }),
   }, async (input, ctx) => run(token(ctx), () => core.adminSummary ? core.adminSummary(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('read_task_text', {
-    description: 'Read one byte segment of a task text: context, evidence (one audit entry, auditId from get_task_history), project (the project environment as JSON; the task holder or owner only), or the lists dependencies, workIntentPaths and worktreePaths as JSON arrays. A claim or heartbeat echo that cut one of them names it and its size; this reads the rest. Returns the total size and SHA-256 of the full text, so a reader can reassemble and verify. Segments never split a character. expectSha256 (from the first segment) is required on every segment past offset 0: if the text changed in between, the read is refused with conflict instead of mixing two versions.',
+    description: 'Read one byte segment of a task text: context, evidence (one audit entry, auditId from get_task_history), project (the project environment as JSON; the task holder or owner only), or the lists workIntentPaths and worktreePaths as JSON arrays. A claim or heartbeat echo that cut one of them names it and its size; this reads the rest. Returns the total size and SHA-256 of the full text, so a reader can reassemble and verify. Segments never split a character. expectSha256 (from the first segment) is required on every segment past offset 0: if the text changed in between, the read is refused with conflict instead of mixing two versions.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200),
-      field: z.enum(['context', 'evidence', 'project', 'dependencies', 'workIntentPaths', 'worktreePaths']),
+      field: z.enum(['context', 'evidence', 'project', 'workIntentPaths', 'worktreePaths']),
       auditId: z.string().min(1).max(200).nullish(),
       offset: z.number().int().min(0).max(1_000_000_000).nullish(),
       limit: z.number().int().min(4).max(24576).nullish(),
@@ -253,7 +250,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
       );
       const rank = (task: TaskView) => task.state === 'review' ? 0 : task.state === 'doing' ? 1 : 2;
       candidates.sort((a, b) => rank(a) - rank(b) || a.id.localeCompare(b.id));
-      // The core remains the sole authority for concurrent claims and dependencies.
+      // The core remains the sole authority for concurrent claims and the parent chain.
       for (const candidate of candidates) {
         try {
           return echoClaim(await core.claim(credential, candidate.id));
@@ -311,7 +308,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : core.returnTask(token(ctx), proof(input), evidence(input))));
 
   server.registerTool('create_task', {
-    description: 'Create a managed company task; requires core manage capability. For independent verification/cleanup, pass independence:{stages:["execute"],sources:["source-task-id"],mode:"execute_handlers",reason:"why independent"} atomically; context prose does not enforce exclusions. project optionally binds this one task to a registered project (takes precedence over the goal\'s project). codeRepoPath optionally sets the code repository the worktree is allocated in (the ops repo or a registered project repo; the business project is unchanged); without it a code/release/deploy task whose context names the ops repo path under a project with another repo is bound to the ops repo at creation, so it never claims into the business repo. revises=<直接上一版任务id> creates the controlled screenplay-revision edge: product only, both drafts must be owner-reviewed screenwriter tasks on the 编剧 track (kind=task) in the same goal and project, and the target must be the unapproved chain tip whose latest submission was really rejected by the owner; the old draft voids with a supersededBy pointer and downstreams resolve to the chain tip.',
+    description: 'Create a managed company task; requires core manage capability. project optionally binds this one task to a registered project. codeRepoPath optionally sets the code repository the worktree is allocated in (the ops repo or a registered project repo); without it a code task whose context names the ops repo path under a project with another repo is bound to the ops repo at creation, so it never claims into the business repo.',
     inputSchema: z.object({
       modelTier: z.enum(['fable','opus','sonnet','haiku','high','medium','low']).optional(),
       title: z.string().min(1), context: z.string().min(1),
@@ -323,13 +320,10 @@ function registerTools(server: McpServer, core: CompanyCore) {
       // validator the sidecar reaches. Keeping them out of this schema preserves the structured
       // `invalid` result; a schema failure here would be a plain protocol error instead.
       workIntent: z.object({ kind: z.enum(['read', 'code', 'assets']), paths: z.array(z.string()).optional(), lane: z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/).optional() }).optional(),
-      kind: z.enum(['task', 'gate']).optional(), goalId: z.string().min(1).optional(),
-      independence: z.object({stages:z.array(z.enum(['execute','review'])), sources:z.array(z.string()),
-        mode:z.enum(['execute_handlers','all_handlers']),excluded:z.array(z.string()).optional(),reason:z.string()}).optional(),
-      dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
+      kind: z.enum(['task', 'gate']).optional(), tag: z.string().min(1).optional(),
+      idempotencyKey: z.string().min(1),
       acceptanceCriteria: acceptanceCriteriaShape.optional(),
       acceptanceEnvironment: z.string().regex(/^[a-z][a-z0-9._-]{0,49}$/).optional(),
-      revises: z.string().min(1).optional(),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.createTask(token(ctx), input)));
 
@@ -488,37 +482,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   
   
   
-  // SYS06 有效策略层：机器策略只认受限 schema，判定只由 policy 表里的字段决定——提示词内容改不动允许/拒绝。
-  const policyPayloadSchema = z.discriminatedUnion('kind', [
-    z.object({
-      kind: z.literal('write_authority'),
-      codeRoles: z.array(z.enum(ROLES as unknown as [Role, ...Role[]])).min(0).max(64),
-      intents: z.array(z.enum(['read', 'code', 'assets'])).min(1).max(64),
-      lanes: z.array(z.string().min(1).max(80)).min(1).max(64).optional(),
-    }).catchall(z.unknown()),
-    z.object({
-      kind: z.literal('tool_scope'),
-      allowedTools: z.array(z.string().min(1).max(80)).min(1).max(64),
-      allowedAliases: z.array(z.string().min(1).max(80)).min(1).max(64),
-      newSpend: z.literal(false),
-    }).catchall(z.unknown()),
-    z.object({
-      kind: z.literal('gate'),
-      requireOwnerApproval: z.boolean(),
-      requireIndependentReviewer: z.boolean(),
-      requiredCriteriaLegs: z.array(z.enum(['implement', 'release', 'deploy'])).min(1).max(3),
-    }).catchall(z.unknown()),
-  ]);
-  const policyScopeSchema = z.enum(['company', 'project', 'goal', 'task']);
-  const policyDomainSchema = z.enum(['write_authority', 'tool_scope', 'gate']);
-
-  
-  
-  
-  
-  
-  
-  server.registerTool('task_project_update', {
+server.registerTool('task_project_update', {
     description: 'owner only: rebind a blocked, un-leased, never-submitted task to a registered project (task-level override over goal.project). Version-guarded, idempotent, audited; releases the stale worktree assignment through the normal lifecycle. Refuses doing/review/done tasks, active leases, submitted results and owner-blocked tasks.',
     inputSchema: z.object({
       taskId: z.string().min(1), project: z.string().min(1).max(60),

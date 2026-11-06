@@ -4,7 +4,7 @@
 export type Role = 'gm' | 'owner' | 'product' | 'engineering' | 'ai-content' | 'concept-design' | 'asset-production' | 'screenwriter' | 'story-author' | 'cinematography' | 'qa' | 'cs' | 'eval';
 export const ROLES: readonly Role[] = ['product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs', 'eval'];
 /** 'void' is terminal: retired work never re-enters dispatch and counts as satisfied in dependency evaluation. */
-export type TaskState = 'blocked' | 'ready' | 'doing' | 'review' | 'done' | 'void';
+export type TaskState = 'blocked' | 'ready' | 'doing' | 'review' | 'done' | 'void' | 'planned';
 /** Trusted retirement type, set only by server-side callers (session rotation, scene archive, failures),
  * never taken from a free-text reason. rotation and archive end a session normally; failure and manual do not. */
 export type RetirementKind = 'rotation' | 'archive' | 'failure' | 'manual';
@@ -133,7 +133,7 @@ export interface WorkIntent { kind: 'read' | 'code' | 'assets'; paths?: string[]
 export interface WorktreeAssignment {
   id: string; repo: string; project?: string; worktreePath: string;
   mode: 'shared' | 'exclusive' | 'protected'; branch?: string;
-  /** "<goal id>:<lane name>" when the tree belongs to a lane shared by every task of that lane. */
+  /** Legacy row column kept for compatibility; new code tasks always get their own task/<id8> branch. */
   lane?: string;
   intent: WorkIntent; discipline: string;
 }
@@ -161,14 +161,9 @@ export interface Principal {
 }
 
 /**
- * Why a blocked task is waiting, derived from the row's authoritative facts (RW05/RW06). The owner and manager views read this
- * instead of guessing from transient fields: a review-phase wait names the reviewing role, never the execute phase; a fact the
- * row does not carry is `unknown`, not a default.
  */
 export interface TaskView {
   companyUpgrade?: import('./company-release.ts').CompanyRelease;
-  executionWindow?: import('./task-recovery.ts').ExecutionWindow;
-  dependencyContinuation?: 'execute' | 'manager';
   id: TaskId;
   title: string;
   context: string;
@@ -182,13 +177,12 @@ export interface TaskView {
   /** Project-scoped discipline track (e.g. 编剧/分镜): only defs whose `tracks` list covers it may claim. */
   discipline?: string;
   kind: TaskKind;
-  goalId?: string;
-  /** Task-level project override (takes precedence over goal.project); undefined keeps the goal routing. */
+  /** Task-level project override (registered project id); undefined inherits the chain routing. */
   projectOverlay?: string;
   /**
    * Explicit code-repo binding (owner only): overrides the repo used for worktree allocation and
    * dispatch repoHome/cwd. Never affects business project resolution (claim.json.project,
-   * opsScope, broker quotas) — that stays with projectOverlay/goal.project.
+   * opsScope, broker quotas) — that stays with projectOverlay/project.
    */
   codeRepoPath?: string;
   /** SYS02: this task/delivery leg's versioned structured acceptance criteria. */
@@ -200,23 +194,26 @@ export interface TaskView {
   acceptanceHead?: string;
   acceptanceEnvironment?: string;
   acceptanceAttempt?: number;
-  /** Groups the legs of one create_delivery chain. */
   acceptanceChain?: string;
-  dependencies: TaskId[];
   version: number;
   submittedBy?: EmployeeId;
   currentEmployee?: EmployeeId;
   deliveryId?: DeliveryId;
   leaseExpiresAt?: string;
-  /** FV06 P0: a standby direct assignment expires here (ISO 8601); the supervision loop wakes the idle
-   * holder until then and returns the task to the owner gate past it. */
-  standbyUntil?: string;
   fence: number;
   blockedTo?: 'owner';
   /** Blocked rows: the phase to restore when the wait ends (ready/doing -> ready, review -> review). */
   resumeState?: TaskState;
   /** Blocked rows: the role recorded by the original block, kept for cross-role display and validation. */
   resumeRole?: string;
+  /** The route type this task was created under; routes record the executor/reviewer at creation. */
+  type?: string;
+  /** Chain predecessor: the task this one follows. A task with an unfinished parent stays 'planned'. */
+  parent?: TaskId;
+  /** The submit audit id whose `next` proposal created this task. */
+  proposedIn?: string;
+  /** Optional grouping tag (replaces goal grouping). */
+  tag?: string;
   /** Set when the previous holder's lease was revoked; the next holder must read the handover history. */
   handover?: boolean;
   previousEmployee?: EmployeeId;
@@ -233,7 +230,7 @@ export interface TaskView {
   contextNextOffset?: number;
   /**
    * Set on a write's echo (SYS01 R3) and on a claim's task: each list that was cut to its leading part, with the whole count and
-   * the SHA-256 of the whole JSON. read_task_text (field dependencies, workIntentPaths or worktreePaths) returns the whole list.
+   * the SHA-256 of the whole JSON. read_task_text (field workIntentPaths or worktreePaths) returns the whole list.
    */
   listsTruncated?: Partial<Record<'workIntentPaths' | 'worktreePaths', ListCut>>;
   /**
@@ -294,13 +291,13 @@ export interface PageInfo {
 }
 
 /**
- * One part of the company block (get_context with scope company, SYS01 AC-A). The meta part carries `paused`. Each direction, goal
+ * One part of the company block (get_context with scope company, SYS01 AC-A). The meta part carries `paused`. Each direction
  * and project is one item: its JSON text is cut into parts of a page's size, in order. A reader joins the `json` of the parts of one
  * (section, key) item, checks the joined UTF-8 length against `totalBytes` and its SHA-256 against `sha256`, then parses it.
  */
 export interface CompanyPart {
-  section: 'meta' | 'directions' | 'goals' | 'projects';
-  /** Stable within the listing: `company` for the meta part, `direction-<position>` for a direction, the id for a goal or project. */
+  section: 'meta' | 'directions' | 'projects';
+  /** Stable within the listing: `company` for the meta part, `direction-<position>` for a direction, the id for a project. */
   key: string;
   /** 0-based position of this part among the parts of its item. */
   part: number;
@@ -328,7 +325,7 @@ export interface ContextView {
   /** How to read the company block in pages: the get_context arguments that return it, one page at a time. */
   companyRead?: { scope: 'company'; pageSize: number };
   scope?: 'tasks' | 'company';
-  section?: 'directions' | 'goals' | 'projects';
+  section?: 'directions' | 'projects';
   parts?: CompanyPart[];
   tasks?: Array<Record<string, unknown>>;
   page?: PageInfo;
@@ -346,7 +343,7 @@ export interface WorktreePageView {
 
 /**
  * What read_task_text reads. context and evidence are text. project is the project environment as JSON (holder or owner only),
- * and dependencies, workIntentPaths and worktreePaths are the task's lists as JSON arrays, so a claim echo that cut them can be
+ * and workIntentPaths and worktreePaths are the task's lists as JSON arrays, so a claim echo that cut them can be
  * read back whole (SYS01 R3).
  */
 export type TaskTextField = 'context' | 'evidence' | 'project' | 'workIntentPaths' | 'worktreePaths';
@@ -390,7 +387,6 @@ export interface AdminSummary {
   cutoffAt: string;
   /** Start of the audit window, [since, cutoffAt]. Declared even when the task counts ignore it. */
   since: string;
-  goalId?: string;
   /** What each count covers. `since` limits only the audit counts; task counts are the state at cutoffAt. */
   scope: { tasks: string; audit: string };
   tasks: Record<string, number>;
@@ -416,11 +412,22 @@ export interface CreateTask {
   context: string;
   executorRole: Role;
   reviewerRole: ReviewerRole;
-  /** Optional discipline track; when the task's project (override, else the goal's) defines a non-empty `disciplines` vocabulary the value must be in it. */
+  /** Route type: fills executor/reviewer (and optional next-chain expansion) when given. */
+  type?: string;
+  /** Chain predecessor: parent unfinished → the new task is 'planned'. */
+  parent?: string;
+  /** Owner-edited requirement staged as task.md's 需求 section. */
+  requirement?: string;
+  /** Owner-edited acceptance staged as task.md's 验收标准 section. */
+  acceptanceText?: string;
+  /** Hold the generated dispatch drafts for owner review before release. */
+  hold?: boolean;
+  /** The submit audit id a proposal was created under. */
+  proposed_in?: string;
+  /** Optional discipline track; when the task's project defines a non-empty `disciplines` vocabulary the value must be in it. */
   discipline?: string;
   kind?: Exclude<TaskKind, 'goal'>;
-  goalId?: string;
-  /** Optional project override: registered project id only; takes precedence over goal.project for this task. */
+  /** Optional project override: registered project id only. */
   project?: string;
   /**
    * Optional code repository (ops repo or a registered project repo_path) the task's worktree is allocated in; the business
@@ -438,11 +445,11 @@ export interface CreateTask {
   workIntent?: WorkIntent;
   /**
    * Controlled screenplay-revision edge (product only): both drafts must be owner-reviewed
-   * screenwriter tasks on the 编剧 track (kind=task) in the same goal and project; the target
+   * screenwriter tasks on the 编剧 track (kind=task) in the same project; the target
    * must be the unapproved, unsuperseded chain tip whose latest submission drew a real owner
    * rejection. The service atomically voids the target (supersededBy pointer), inherits the
-   * lineage, and lets the new draft start once its own normal dependencies are satisfied —
-   * the edge never exempts other tasks or other dependencies.
+   * lineage, and lets the new draft start once its own parent is satisfied —
+   * the edge never exempts other tasks.
    */
   revises?: TaskId;
 }
@@ -547,12 +554,14 @@ export interface LeaseProof {
 export interface Evidence {
   /** Engineering company-system release/deploy only. Bound to this lease write and a reviewed main commit. */
   companyUpgrade?: { sha: string };
-  executionWindow?: import('./task-recovery.ts').ExecutionWindow;
-  recoveryReason?: import('./task-recovery.ts').RecoveryReason;
   text: string;
   idempotencyKey: string;
   /** SYS02: the head this submission is bound to; machine evidence must match it. */
   acceptance?: { sha?: string; environment?: string };
+  /** Top-level shorthand for acceptance.sha (code deliverables may pass either). */
+  sha?: string;
+  /** Follow-up proposals, max 20: each creates a planned child typed through the route table. */
+  next?: Array<{ type: string; title: string; requirement?: string; acceptance?: string }>;
 }
 
 export interface OutboxEvent {
@@ -608,16 +617,7 @@ export interface PluginRuntimeView {
  */
 export const PLUGIN_RUNTIME_ROLES: readonly Role[] = ['product', 'qa'];
 
-/**
- * owner dry-run of the contributor derivation (SYS-DISP AC05): read-only. `timeline` is the task's audit stream, oldest first,
- * with the role each row plays. `status` and `suggestedImplementer` are advice; nothing here writes an implementer.
- */
 
-/**
- * SYS03: the manager-disposition ledger's wire shapes. They are declared once in src/disposition.ts (the module that
- * owns the episode claim, the business idempotency key and the notice/action records) and re-exported here so the tool
- * layers (MCP, sidecar) and the core interface share one definition instead of three drifting copies.
- */
 
 /**
  * SYS05: typed wait entry. The employee hands over why it stops; the core normalizes, stores the progress and
@@ -660,7 +660,7 @@ export interface CompanyCore {
   release?(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;
   block(credential: Credential, proof: LeaseProof, to: 'owner', evidence: Evidence, quotaResetsAt?: string): Promise<TaskView>;
   resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView>;
-  /** product: mark a task 'void' (terminal), release any lease on it, and unlock dependents that were waiting only on it. */
+  /** product: mark a task 'void' (terminal), release any lease on it, and release any planned children. */
   retireTask(credential: Credential, input: RetireTask): Promise<TaskView>;
   /** SYS01 bounded reads: optional so older adapters still compile; the sidecar and MCP layers check for them. */
   contextView?(credential: Credential, input: Record<string, unknown>): Promise<ContextView>;

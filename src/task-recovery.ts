@@ -23,7 +23,7 @@ export function parseExecutionWindow(raw: unknown): ExecutionWindow {
 export function windowExpired(window: ExecutionWindow | undefined | null, now = Date.now()): boolean {
   return !!window && (!Number.isFinite(Date.parse(window.notAfter)) || !Number.isFinite(Date.parse(window.evidenceExpiresAt)) || now >= Date.parse(window.notAfter) || now + window.minRemainingSeconds * 1000 > Date.parse(window.evidenceExpiresAt));
 }
-/** Only evidence reported in this manager wait may suppress this wait. Old causes keep their budgets. */
+/** Only evidence reported in this wait may suppress it. Old causes keep their budgets. */
 export function faultBelongsToWait(updatedAt: string | undefined, blockedSinceMs: number | undefined): boolean {
   return blockedSinceMs === undefined || (updatedAt !== undefined && Date.parse(updatedAt) >= blockedSinceMs);
 }

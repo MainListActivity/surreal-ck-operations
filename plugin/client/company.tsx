@@ -8,7 +8,6 @@ import { useEffect, useMemo, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View, type StyleProp, type TextStyle } from "react-native";
 import * as RN from "react-native";
 import * as rpc from "../shared/rpc";
-import { waitingLabel } from "../shared/waiting-label";
 import { relayPalette } from "./relay-theme";
 import type { Brief, DispatchBlockedView, DispatchReasonView, GoalTier, GoalView, Inbox, PermissionRequest, Pulse, Roster, TaskAttachment, TaskView } from "../shared/types";
 
@@ -337,9 +336,9 @@ const arr = <T,>(v: unknown): T[] => (Array.isArray(v) ? v : []) as T[];
 const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
 /** A goal root's people; an absent or malformed block reads as nobody bound, never as an invented name. */
-const goalPeople = (v: unknown): { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number } => {
+const goalPeople = (v: unknown): { executor?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number } => {
   const p = (v ?? {}) as Record<string, unknown>;
-  return { implementer: str(p.implementer) || undefined, authors: arr<unknown>(p.authors).map(str), reviewers: arr<unknown>(p.reviewers).map(str),
+  return { executor: str(p.executor) || undefined, authors: arr<unknown>(p.authors).map(str), reviewers: arr<unknown>(p.reviewers).map(str),
     submitter: str(p.submitter) || undefined, submitCommit: str(p.submitCommit) || undefined, peopleOmitted: num(p.peopleOmitted) || undefined };
 };
 /** A bounded list's truncation marker; a missing marker reads as complete, with nothing left out. */
@@ -361,8 +360,8 @@ const reasonRows = (v: unknown): DispatchReasonView[] => arr<Record<string, unkn
 
 const workflowWaitStateOf = (v: unknown): "ready" | "doing" | "review" | "blocked" | "done" | "void" | "unknown" =>
   v === "ready" || v === "doing" || v === "review" || v === "blocked" || v === "done" || v === "void" ? v : "unknown";
-const workflowWaitKindOf = (v: unknown): "dependency" | "manager" | "owner" | "active_lease" | "unknown" =>
-  v === "dependency" || v === "manager" || v === "owner" || v === "active_lease" ? v : "unknown";
+const workflowWaitKindOf = (v: unknown): "owner" | "active_lease" | "unknown" =>
+  v === "owner" || v === "active_lease" ? v : "unknown";
 
 /** 把 wire 上的 pulse 响应收敛成完整视图模型：缺字段/条目畸形时给安全默认，渲染路径不再裸读。 */
 export function normalizePulse(raw: unknown): Pulse {
@@ -395,7 +394,7 @@ export function normalizePulse(raw: unknown): Pulse {
     resources: arr<unknown>(o.resources).map(str),
     churn: { created: num(ch.created), retired: num(ch.retired), claimLost: num(ch.claimLost) },
     dispatchBlocked: arr<Record<string, unknown>>(o.dispatchBlocked).map(v => ({
-      taskId: str(v.taskId), goalId: str(v.goalId) || undefined, title: str(v.title),
+      taskId: str(v.taskId), rootId: str(v.rootId) || undefined, title: str(v.title),
       phase: v.phase === "review" ? "review" : "execute", workflowState: workflowOf(v.workflowState), summary: str(v.summary),
       checkedAt: str(v.checkedAt), eligibleCount: num(v.eligibleCount),
       feasible: v.feasible === true, since: str(v.since) || undefined, waitingMinutes: num(v.waitingMinutes),
@@ -581,7 +580,7 @@ function RegisterDefCard({ ctx, editing, onDone, onCancel }: {
 }
 
 const WORKFLOW_LABEL: Record<"ready" | "doing" | "review", string> = { ready: "就绪", doing: "在办无人持有", review: "待复核" };
-const WAIT_KIND_LABEL = { dependency: "正常依赖等待", manager: "老板关口", owner: "老板关口", active_lease: "活租约等待", unknown: "等待未知" } as const;
+const WAIT_KIND_LABEL = { owner: "老板关口", active_lease: "活租约等待", unknown: "等待未知" } as const;
 const WAIT_STATE_LABEL = { ready: "就绪", doing: "执行中", review: "待复核", blocked: "依赖阻塞", done: "完成", void: "作废", unknown: "未知" } as const;
 /** A time of day from an ISO instant, in UTC as the server states it; an absent instant reads as unknown. */
 const clockOf = (iso: string): string => (iso ? `${iso.slice(5, 16).replace("T", " ")}（UTC）` : "未知");

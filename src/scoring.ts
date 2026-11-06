@@ -21,7 +21,7 @@ export interface EvalTimelineEntry { at: string; action: string; actor: string; 
 /** Everything a judge (Jev or LLM eval employee) needs to score a finished task. */
 export interface EvalState {
   taskId: TaskId;
-  goalId?: string;
+  tag?: string;
   title: string;
   context: string;
   state: string;
@@ -43,7 +43,7 @@ const CONTEXT_CHARS = 3000;
 /** Read audit + revocation events for a finished task and derive per-participant behavior metrics. */
 export async function collectEvalState(db: Surreal, taskId: TaskId, excludeEmployeeId?: string): Promise<EvalState> {
   const task = id('task', taskId);
-  const row = await db.select<{ title: string; context: string; state: string; executor_role: Role; reviewer_role: Role; goal?: RecordId }>(task);
+  const row = await db.select<{ title: string; context: string; state: string; executor_role: Role; reviewer_role: Role; tag?: string }>(task);
   if (!row) throw { code: 'not_found' };
 
   const [auditRows, revokedRows] = await db.query<[
@@ -116,7 +116,7 @@ export async function collectEvalState(db: Surreal, taskId: TaskId, excludeEmplo
     ...(cost ? { cost } : {}),
     modelExecutions:modelExecutions.filter(r=>!r.model||!generatedModel(r.model)),
     timelineTruncated:auditRows.length>TIMELINE_LIMIT,
-    taskId, goalId: row.goal ? asId(row.goal) : undefined,
+    taskId, tag: row.tag ?? undefined,
     title: row.title, context: String(row.context ?? '').slice(0, CONTEXT_CHARS),
     state: row.state, executorRole: row.executor_role, reviewerRole: row.reviewer_role,
     participants: [...participants].sort(), metrics: Object.fromEntries(metrics), timeline,
@@ -256,12 +256,12 @@ export async function writeScorecards(
       author: (input.state.metrics[judged.employee]?.submits ?? 0) > 0, ...(cost ? { cost } : {}), ...(baseline ? { baseline } : {}) });
     const s = { ...judged, overall: calibration.overall };
     const emp = await db.select<{ role?: Role; def?: RecordId; provider?: string; model?: string }>(id('employee', s.employee));
-    await db.query(`UPSERT $card CONTENT { task: $task, goal: $goal, employee: $emp, role: $role, def: $def,
+    await db.query(`UPSERT $card CONTENT { task: $task, tag: $tag, employee: $emp, role: $role, def: $def,
       provider: $provider, model: $model, quality: $quality, evidence: $evidence, discipline: $discipline,
       timeliness: $timeliness, overall: $overall, notes: $notes, metrics: $metrics, eval_by: $by,
       judge: $judgeKind, confidence: $confidence, probabilities: $probabilities, flagged: $flagged, at: time::now() };`, {
       card: id('scorecard', HASH(`${input.taskId}${s.employee}`).slice(0, 24)),
-      task, goal: input.state.goalId ? id('goal', input.state.goalId) : undefined,
+      task, tag: input.state.tag ?? undefined,
       emp: s.employee, role: emp?.role ?? input.state.executorRole,
       def: emp?.def ? asId(emp.def) : undefined, provider: emp?.provider, model: emp?.model,
       quality: s.quality, evidence: s.evidence, discipline: s.discipline, timeliness: s.timeliness,

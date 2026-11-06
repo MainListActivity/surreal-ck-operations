@@ -10,7 +10,7 @@ import type { EmployeeInst, SupervisedTask } from '../src/workforce.ts';
 
 const taskView = (id: string, version = 1): TaskView => ({
   id, title: `t-${id}`, context: '', state: 'doing', executorRole: 'engineering', reviewerRole: 'qa',
-  kind: 'task', dependencies: [], version, fence: 1, deliveryId: `d-${id}`,
+  kind: 'task', version, fence: 1, deliveryId: `d-${id}`,
 });
 
 const claimResult = (taskId: string): ClaimResult => ({

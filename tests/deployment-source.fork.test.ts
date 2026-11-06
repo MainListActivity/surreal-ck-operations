@@ -96,11 +96,9 @@ afterAll(async () => {
 beforeEach(async () => { if (forkEnv) await database.db.query('UPDATE employee SET active_task = NONE;'); });
 
 fork('N1-R positive: a trusted deployment of this run certifies the environment and a non-author accepts', async () => {
-  const [grows] = await database.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: 'N1-R 核心正例目标', brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
-  const goal = { id: String(grows[0]!.id.id) };
   const task = await core.createTask(tokens.owner, {
-    goalId: goal.id, title: 'N1-R 核心正例', context: '受信部署 workflow 的 deployment 与成功状态都指向本次证据 run。',
-    kind: 'deploy', executorRole: 'engineering', reviewerRole: 'qa', acceptanceEnvironment: 'production', idempotencyKey: key(),
+    title: 'N1-R 核心正例', context: '受信部署 workflow 的 deployment 与成功状态都指向本次证据 run。',
+    executorRole: 'engineering', reviewerRole: 'qa', workIntent: { kind: 'code' }, acceptanceEnvironment: 'production', idempotencyKey: key(),
   } as never);
   const acId = (await core.getTask(tokens.owner, task.id)).acceptanceCriteria?.find(c => c.kind === 'machine')!.id;
 
@@ -179,11 +177,9 @@ fork('N1-R refusal then recovery: the core refuses a borrowed deployment and a w
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
   const switchCore = new SurrealCompanyCore(database, { acceptance: { adapter: createGithubActionsAdapter(ghSwitch) } });
-  const [grows2] = await database.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: 'N1-R 拒绝后恢复目标', brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
-  const goal = { id: String(grows2[0]!.id.id) };
   const task = await switchCore.createTask(tokens.owner, {
-    goalId: goal.id, title: 'N1-R 拒绝后恢复', context: '先借别的 run 的失败 deployment 与别的 run 的 job 各被拒一次，再补本 run 的正确证据并在同一 attempt 提交。',
-    kind: 'deploy', executorRole: 'engineering', reviewerRole: 'qa', acceptanceEnvironment: 'production', idempotencyKey: key(),
+    title: 'N1-R 拒绝后恢复', context: '先借别的 run 的失败 deployment 与别的 run 的 job 各被拒一次，再补本 run 的正确证据并在同一 attempt 提交。',
+    executorRole: 'engineering', reviewerRole: 'qa', workIntent: { kind: 'code' }, acceptanceEnvironment: 'production', idempotencyKey: key(),
   } as never);
   const acId = (await switchCore.getTask(tokens.owner, task.id)).acceptanceCriteria?.find(c => c.kind === 'machine')!.id;
   const claim = await switchCore.claim(tokens['eng-a'], task.id);

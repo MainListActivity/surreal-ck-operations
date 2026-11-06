@@ -38,7 +38,7 @@ beforeAll(async () => {
 afterAll(async () => { if (!dir) return; await db.close(); server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true }); });
 
 const proofOf = (c: ClaimResult): LeaseProof => ({ taskId: c.task.id, deliveryId: c.deliveryId, fence: c.fence, expectedVersion: c.task.version });
-const make = (title: string, extra: Record<string, unknown> = {}) => core.createTask(gm, { title, context: 'aging fixture', executorRole: 'engineering', reviewerRole: 'qa', goalId: String(goal.id), idempotencyKey: `aging-task-${++count}`, ...extra } as never);
+const make = (title: string, extra: Record<string, unknown> = {}) => core.createTask(gm, { title, context: 'aging fixture', executorRole: 'engineering', reviewerRole: 'qa', tag: '两位律师试用', idempotencyKey: `aging-task-${++count}`, ...extra } as never);
 const backdate = (task: TaskView, action: string, h: number) =>
   db.db.query('UPDATE audit SET at = $at WHERE task = $task AND action = $action;', { at: hours(h), task: new RecordId('task', task.id), action });
 const evidence = () => ({ text: 'fixture evidence long enough to be accepted by the task service validation', idempotencyKey: `aging-evidence-${++count}` });
@@ -51,11 +51,11 @@ const dispatcher = (notified: string[]) => {
 
 run('waiting items report how long they wait and which downstream tasks they hold up', async () => {
   const gate = await gateTask('最终验收'); await backdate(gate, 'submit', 30);
-  const second = await make('收尾任务', { dependencies: [gate.id] }); await make('上线任务', { dependencies: [second.id] });
+  const second = await make('收尾任务', { parent: gate.id }); await make('上线任务', { parent: second.id });
   const question = await questionTask('客户反馈如何收集'); await backdate(question, 'block', 5);
   const items = await owner.waitingOnOwner();
   const byId = new Map(items.map(i => [i.taskId, i]));
-  expect(byId.get(gate.id)).toMatchObject({ kind: 'gate', goal: '两位律师试用', downstream: 2 });
+  expect(byId.get(gate.id)).toMatchObject({ kind: 'gate', tag: '两位律师试用', downstream: 2 });
   expect(Date.now() - byId.get(gate.id)!.sinceMs).toBeGreaterThan(29.9 * 3_600_000);
   expect(byId.get(question.id)).toMatchObject({ kind: 'question', downstream: 0 });
   expect((Date.now() - byId.get(question.id)!.sinceMs) / 3_600_000).toBeCloseTo(5, 0);
@@ -80,14 +80,14 @@ run('aging raises one reminder per level, forces a popup from 24h, and clears on
 run('the daily brief flags stuck work, is sent once per day and survives a restart', async () => {
   const done = await make('前置任务'); const c = await core.claim(eng, done.id); await core.submit(eng, proofOf(c), evidence());
   await db.db.query("UPDATE $t SET state = 'done';", { t: new RecordId('task', done.id) });
-  const orphan = await make('依赖已完成却仍 blocked', { dependencies: [done.id] });
+  const orphan = await make('依赖已完成却仍 blocked', { parent: done.id });
   await db.db.query("UPDATE $t SET state = 'blocked';", { t: new RecordId('task', orphan.id) });
   const idle = await make('没人领的活'); await backdate(idle, 'create', 3);
   const notified: string[] = []; const report = { notices: [] as string[] };
   const now = Math.floor(Date.now() / 1000), cfg = { ...DEFAULT_CONFIG, ownerBriefHour: 0 };
   await dispatcher(notified).dailyBrief(now, cfg, report);
   const brief = (await owner.openNotices()).find(n => n.key === `brief:${localDate(new Date(now * 1000))}`)!;
-  for (const part of ['每日简报', '【异常卡滞】', '依赖已完成却仍 blocked', '依赖都已完成', '没人领的活', '就绪 1', 'engineering：当前没有任何可用编制（codex 额度不足', '【员工流动】近24小时新建实例']) expect(brief.text).toContain(part);
+  for (const part of ['每日简报', '【异常卡滞】', '依赖已完成却仍 blocked', '父任务已完成', '没人领的活', '就绪 1', 'engineering：当前没有任何可用编制（codex 额度不足', '【员工流动】近24小时新建实例']) expect(brief.text).toContain(part);
   expect(notified).toHaveLength(1); expect(notified[0]).toStartWith('每日简报'); expect(notified[0]).not.toContain('\n');
   await dispatcher(notified).dailyBrief(now + 60, cfg, report);
   expect(notified).toHaveLength(1);

@@ -1,7 +1,8 @@
 import { readCompanyRelease, type CompanyRelease } from './company-release.ts';
+import { getRoute, listRoutes, CHAIN_LIMIT, type RouteRow } from './routes.ts';
+import { OutboundMessageStore } from './outbound-messages.ts';
 import { drillHost, startDrill, readDrillStatus, type DrillState } from './deploy-drill-service.ts';
 import { validateDrillPlan } from './deploy-drill.ts';
-import { parseExecutionWindow, windowExpired, recoveryReasonSchema } from './task-recovery.ts';
 import { authenticationLookup } from './diagnostics.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
@@ -47,11 +48,10 @@ import { PLUGIN_RUNTIME_ROLES } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
 import { parseBrokerConfig } from './ops/config.ts';
 import { assertEmployeeCiBlockAllowed, createCiBillingCheck, isCiBlockCause, refuseEmployeeCiBlock, type CiBillingCheck } from './github-ci-control.ts';
-import { validateExternalDependencies } from './input-bounds.ts';
 import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
 import { readProviderQuotas } from './dispatcher/quota-store.ts';
 import { providerAdmission } from './provider-admission.ts';
-import { goalRootBlockers, type DispatchVerdict, type GoalRootFacts, type GoalRootPeople, type GoalWorkflowWaitSummary } from './dispatcher/dispatch-blocked.ts';
+import type { DispatchVerdict } from './dispatcher/dispatch-blocked.ts';
 import type { WorkIntent, WorktreeAssignment, WorktreeView, WriteScopeHolder } from './contracts.ts';
 import { ROLES } from './contracts.ts';
 export { CompanyError };
@@ -102,101 +102,17 @@ const normalizedId = (value: unknown): string => {
 };
 
 /**
- * A dependency counts as satisfied when it is 'done', or when it is 'void' and not an
- * owner gate. Voiding an owner-reviewed task (prototype demo, acceptance gate) must not
- * stand in for the owner's approval, so dependents on it stay blocked. Exemption: a
- * dependent that is a goal anchor (member of its goal's anchors list) is rollup
- * bookkeeping, not gated work. For anchors every 'void' dependency counts as satisfied,
- * or retiring a gated task could never unblock the goal's acceptance anchor.
+ * Activates planned children of an accepted task: same transaction, state planned → ready,
+ * audit planned_activated per row. Requires $task and $actor in scope.
  */
-const DEP_UNSATISFIED = `state != 'done' AND (state != 'void' OR reviewer_role = 'owner')`;
-export const depUnsatisfiedFor = (holder: string) =>
-  `state != 'done' AND (state != 'void' OR (reviewer_role = 'owner' AND (${holder}.goal = NONE OR ${holder}.id NOT IN (${holder}.goal.anchors ?? []))))`;
-
-/**
- * Resolves a raw dependency id list through superseded_by chains: every superseded draft
- * maps to the tip of its shared `lineage` (superseded_by = NONE) in O(1) — bounded, no
- * traversal. Binds `${p}_resolved` to the resolved id set. Resolution rules:
- *  - un-superseded deps (superseded_by = NONE, including tips) resolve to themselves;
- *  - a superseded dep whose lineage has exactly the visible tip resolves to that tip;
- *  - corrupt data (superseded but missing lineage, or a lineage with no tip) resolves the
- *    dep to itself — the void+owner rule then keeps it conservatively blocked.
- * The unchanged satisfaction rule is applied to the resolved rows by the caller.
- */
-export const RESOLVE_DEP_SQL = (deps: string, p: string) => `
-  LET ${p}_lns = SELECT VALUE lineage FROM task WHERE id IN ${deps} AND superseded_by != NONE AND lineage != NONE;
-  LET ${p}_ok = SELECT VALUE lineage FROM task WHERE lineage != NONE AND lineage IN ${p}_lns AND superseded_by = NONE;
-  LET ${p}_resolved = array::distinct(array::concat(
-    (SELECT VALUE id FROM task WHERE id IN ${deps} AND superseded_by = NONE),
-    (SELECT VALUE id FROM task WHERE lineage != NONE AND lineage IN ${p}_ok AND superseded_by = NONE),
-    (SELECT VALUE id FROM task WHERE id IN ${deps} AND superseded_by != NONE AND (lineage = NONE OR lineage NOT IN ${p}_ok))));
-`;
-
-/**
- * Unlocks blocked children of $task whose dependencies are all finished ('done' or 'void')
- * (retired tasks count as satisfied so downstream chains unblock on retire). Requires
- * $task and $actor in scope. Retire reuses this block without the goal-close below.
- * When the finished task is a screenplay-chain tip, dependents on ANY earlier version of
- * the same lineage are re-evaluated too — their dependency resolves through superseded_by
- * to the finished tip.
- */
-export const UNLOCK_CHILDREN_SQL = `
-  LET $done_row = SELECT * FROM ONLY $task;
-  LET $task_chain = IF ($done_row.lineage ?? NONE) = NONE THEN [$task] ELSE (SELECT VALUE id FROM task WHERE lineage = $done_row.lineage) END;
-  LET $children = SELECT * FROM task WHERE state = 'blocked' AND blocked_to = NONE AND wait_state != 'waiting' AND array::len(array::filter(dependencies ?? [], |$d| $d IN $task_chain)) > 0;
-  FOR $child IN $children {
-    ${RESOLVE_DEP_SQL('$child.dependencies', '$c_dep')}
-    LET $remaining = SELECT * FROM task WHERE id IN $c_dep_resolved AND ${depUnsatisfiedFor('$child')};
-    IF array::len($remaining) = 0 {
-      LET $source_phase = $child.resume_state ?? 'ready';
-      LET $manager = $child.dependency_continuation = 'manager';
-      LET $restore_phase = IF $source_phase = 'review' THEN 'review' ELSE 'ready' END;
-      LET $unlocked = UPDATE ONLY $child.id SET
-        state = IF $manager THEN 'blocked' ELSE $restore_phase END, version += 1,
-        blocked_to = IF $manager THEN 'owner' ELSE NONE END,
-        resume_state = IF $manager THEN $source_phase ELSE NONE END,
-        resume_role = IF $manager THEN $child.resume_role ELSE NONE END,
-        dependency_continuation = NONE,
-        current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE;
-      CREATE audit CONTENT { task: $child.id, actor: $actor, action: 'dependency_unlocked',
-        evidence: '依赖全部完成，按原阻塞阶段恢复', version: $unlocked.version, at: time::now(),
-        source_phase: $source_phase, restore_phase: $restore_phase,
-        dependencies_before: $child.dependencies ?? [], dependencies_after: $child.dependencies ?? [] };
-      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE outbox CONTENT { task: $child.id, kind: 'dependency_unlocked', sequence: $sequence.value,
-        payload: { state: $unlocked.state, source_phase: $source_phase, restore_phase: $restore_phase,
-          dependencies: $child.dependencies ?? [], version: $unlocked.version }, at: time::now() };
-    };
+export const ACTIVATE_PLANNED_SQL = `
+  LET $planned_children = SELECT * FROM task WHERE parent = $task AND state = 'planned';
+  UPDATE task SET state = 'ready', version += 1 WHERE parent = $task AND state = 'planned';
+  FOR $child IN $planned_children {
+    CREATE audit CONTENT { task: $child.id, actor: $actor, action: 'planned_activated',
+      evidence: '父任务验收通过，计划任务转为就绪', version: $child.version + 1, at: time::now() };
   };
 `;
-
-/**
- * Unlocks blocked children of $task whose dependencies are all finished. Goal closure is deliberately NOT a SQL
- * side effect of any accepted task: SYS07 re-evaluates the final gate and the outcome evidence in
- * GoalGovernanceStore.finalize, so a void gate, a superseded revision or a missing customer receipt can never
- * close a goal. Requires $task and $actor in scope.
- */
-export const UNLOCK_SQL = UNLOCK_CHILDREN_SQL;
-
-/**
- * Adds $task as a dependency of the goal's first unfinished anchor (manual, then final
- * acceptance) and re-blocks that anchor, dropping any lease on it. Requires $goal, $task.
- */
-export const GOAL_ANCHOR_SQL = `
-  IF $goal != NONE {
-    LET $g = SELECT * FROM ONLY $goal;
-    IF $g = NONE OR $g.state != 'active' { THROW 'goal not found or closed' };
-    LET $open = array::filter($g.anchors, |$a| $a.state NOT IN ['done', 'void']);
-    IF array::len($open) > 0 {
-      LET $anchor = SELECT * FROM ONLY $open[0];
-      UPDATE employee SET active_task = NONE WHERE active_task = $anchor.id;
-      UPDATE ONLY $anchor.id SET dependencies += $task, state = 'blocked', blocked_to = NONE,
-        resume_state = NONE, current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
-        version += 1;
-    };
-  };
-`;
-
 
 interface EmployeeRow {
   id: RecordId;
@@ -213,8 +129,6 @@ interface EmployeeRow {
 export interface TaskRow {
   company_upgrade?: CompanyRelease;
   recovery_stopped?: boolean;
-  dependency_continuation?: 'execute' | 'manager';
-  execution_window?: import('./task-recovery.ts').ExecutionWindow;
   id: RecordId;
   title: string;
   context: string;
@@ -226,7 +140,6 @@ export interface TaskRow {
   requirement?: string;
   /** The owner-edited acceptance section staged into task.md. */
   acceptance_text?: string;
-  dependencies: RecordId[];
   version: number;
   submitted_by?: string;
   current_employee?: string;
@@ -237,8 +150,7 @@ export interface TaskRow {
   resume_role?: string;
   resume_state?: TaskState;
   kind?: TaskKind;
-  goal?: RecordId;
-  /** Task-level project override (registered project id); NONE falls back to goal.project routing. */
+  /** Task-level project override (registered project id). */
   project?: RecordId;
   /** Explicit code-repo binding (schema 017); workspace/dispatch routing only, never business project resolution. */
   code_repo_path?: string;
@@ -246,33 +158,24 @@ export interface TaskRow {
   model_route_until?:number;
   handover?: boolean;
   previous_employee?: string;
-  /** Bound code implementer: set at the first execute claim or by an explicit owner takeover (schemaless). */
-  implementer?: string;
   /** Open dispatch-blocked episode (schemaless): the phase it blocks and when it began, unix seconds. */
   dispatch_blocked_phase?: string | null;
   dispatch_blocked_since?: number | null;
   progress_at?: number;
+  /** Route type recorded at creation; drives routing, templates and next-chain expansion. */
+  type?: string;
+  /** Chain predecessor record. */
+  parent?: RecordId;
+  /** The submit audit id a proposal was created under. */
+  proposed_in?: string;
+  /** Optional grouping tag. */
+  tag?: string;
   /** Unix seconds: a quota-caused block may not be re-announced to owner before this instant. */
   quota_resets_at?: number | null;
-  /** FV06 P0 (schemaless): unix seconds. The standby direct assignment's deadline, cleared on timeout/normal reclaim. */
-  standby_until?: number | null;
-  /** SYS05: the open typed wait (schemaless task fields, written only by WaitStore.enter). */
-  wait_state?: 'waiting' | null;
-  wait_kind?: string | null;
-  wait_episode?: string | null;
-  wait_not_before?: number | null;
-  wait_expires_at?: number | null;
-  wait_next_check_at?: number | null;
-  wait_owner_role?: string | null;
-  wait_source?: string | null;
-  wait_version?: number | null;
-  wait_entered_at?: unknown;
   evaluated_at?: string;
   model_eval_full_history?: boolean;
   eval_via?: string;
   eval_attempts?: number;
-  jev_release_version?: number;
-  jev_route_version?: number;
   owner_rerouted?: boolean;
   /** SYS02 acceptance fields (schema 026); every one is optional, so rows written before SYS02 stay valid. */
   acceptance_criteria?: AcceptanceCriterion[];
@@ -286,9 +189,7 @@ export interface TaskRow {
   work_intent?: WorkIntent;
   worktree?: WorktreeAssignment;
   repo_path?: string;
-  goal_tier?: string;
-  goal_title?: string;
-  /** Screenplay-revision edge fields (schema 015): see RESOLVE_DEP_SQL. */
+  /** Screenplay-revision edge fields (schema 015). */
   revises?: RecordId;
   superseded_by?: RecordId;
   lineage?: RecordId;
@@ -304,7 +205,6 @@ interface ActiveLeaseRow {
   executor_role: Role;
   reviewer_role: ReviewerRole;
   submitted_by?: string;
-  implementer?: string;
   current_employee?: string;
   delivery_id?: string;
   lease_expires_at?: number;
@@ -318,17 +218,17 @@ export function view(row: TaskRow): TaskView {
   return {
     id: asId(row.id), title: row.title, context: row.context, state: row.state,
     requirement: row.requirement ?? undefined, acceptanceText: row.acceptance_text ?? undefined,
-    executionWindow: row.execution_window ?? undefined, dependencyContinuation: row.dependency_continuation ?? undefined,
     executorRole: row.executor_role, reviewerRole: row.reviewer_role,
     discipline: row.discipline ?? undefined,
-    kind: row.kind ?? 'task', goalId: row.goal ? asId(row.goal) : undefined,
+    kind: row.kind ?? 'task',
+    type: row.type ?? undefined, parent: row.parent ? asId(row.parent) : undefined,
+    proposedIn: row.proposed_in ?? undefined, tag: row.tag ?? undefined,
     projectOverlay: row.project ? asId(row.project) : undefined,
     codeRepoPath: row.code_repo_path ?? undefined,
-    dependencies: (row.dependencies ?? []).map(asId), version: row.version,
+    version: row.version,
     submittedBy: row.submitted_by, currentEmployee: row.current_employee,
     deliveryId: row.delivery_id,
     leaseExpiresAt: row.lease_expires_at ? new Date(row.lease_expires_at * 1000).toISOString() : undefined,
-    standbyUntil: row.standby_until ? new Date(row.standby_until * 1000).toISOString() : undefined,
     fence: row.fence,
     blockedTo: row.blocked_to,
     companyUpgrade: row.company_upgrade ?? undefined,
@@ -386,35 +286,18 @@ function requireReviewer(role: string): asserts role is ReviewerRole {
   if (role !== 'owner') requireRole(role);
 }
 
-/** Fields the acceptance repair reads from task rows; keeps context text out of the preview. */
-const GOAL_ACCEPTANCE_TASK_FIELDS = 'id, title, state, executor_role, reviewer_role, kind, version, dependencies, blocked_to, submitted_by, current_employee, lease_expires_at, goal, project';
-type GoalAcceptanceTaskRow = Pick<TaskRow, 'id' | 'title' | 'state' | 'executor_role' | 'reviewer_role' | 'kind' | 'version' | 'dependencies' | 'blocked_to' | 'submitted_by' | 'current_employee' | 'lease_expires_at' | 'goal' | 'project'>;
-interface GoalAcceptanceGoalRow {
-  id: RecordId; title: string; state: string; tier?: string; pipeline?: string; project?: RecordId;
-  anchors?: RecordId[]; tasks?: { intake?: RecordId; plan?: RecordId; manual?: RecordId; acceptance?: RecordId };
-}
 const isLeased = (row: { current_employee?: string; lease_expires_at?: number }) =>
   Boolean(row.current_employee) && (row.lease_expires_at ?? 0) > Math.floor(Date.now() / 1000);
 /** Which projects' environments one reader may see in a company block (SYS01 M3). `key` names that view, so a stored listing is read only under the same one. */
 interface EnvView { key: string; visible: (project: string) => boolean }
 /** A project as a reader without environment access sees it: the identity fields as they are, the environments withheld. */
 const withheldEnvs = (project: ProjectView): ProjectView => ({ ...project, envs: [], envsWithheld: true });
-/**
- * Source guard of a gated lease write (SYS-DISP IR03). Every source the gate read must still be at the version it was read at, or the
- * write is refused and the caller re-reads. The write also stamps each source: a concurrent authorship change on a source always bumps
- * its version in the same transaction, so the two conflict instead of one landing between the read and the other's commit.
- */
-const INDEPENDENCE_GUARD_SQL = `FOR $g IN $indep_guards {
-        IF (SELECT VALUE version FROM ONLY $g.task) != $g.version { THROW 'contribution history moved: independence source' };
-        UPDATE ONLY $g.task SET independence_guard = $g.version;
-      };`;
-
 /** Same repository/goal identity rules as staffingPool; checked inside every lease/takeover transaction. */
 const EMPLOYEE_WORKSPACE_SQL = (who: string, failure: string) => `
       IF ${who}.retired = true { THROW '${failure}: target employee is retired' };
-      LET $scope = IF $t.goal != NONE THEN <string>record::id($t.goal) ELSE 'maintenance' END;
-      IF ${who}.workspace_scope != NONE AND ${who}.workspace_scope != $scope { THROW '${failure}: workspace goal denied; target employee works in another goal workspace and can never be dispatched this task' };
-      LET $home = $t.code_repo_path ?? $t.project.repo_path ?? $t.goal.project.repo_path ?? $ops_repo;
+      LET $scope = 'maintenance';
+      IF ${who}.workspace_scope != NONE AND ${who}.workspace_scope != $scope { THROW '${failure}: workspace denied; target employee works in another workspace scope and can never be dispatched this task' };
+      LET $home = $t.code_repo_path ?? $t.project.repo_path ?? $ops_repo;
       LET $employee_home = ${who}.workspace_repo ?? ${who}.workspace_cwd ?? $ops_repo;
       IF $home != NONE AND $employee_home != NONE AND $home != $employee_home { THROW '${failure}: target employee works in another repository and can never be dispatched this task' };
 `;
@@ -626,7 +509,7 @@ export class SurrealCompanyCore implements CompanyCore {
   async activeLeases(credential: Credential): Promise<ActiveLease[]> {
     const actor = await this.authorized(credential);
     const [rows] = await this.db.query<[ActiveLeaseRow[]]>(
-      `SELECT id, state, executor_role, reviewer_role, submitted_by, implementer,
+      `SELECT id, state, executor_role, reviewer_role, submitted_by,
               current_employee, delivery_id, lease_expires_at, fence, version
          FROM task
         WHERE current_employee = $employee
@@ -638,10 +521,10 @@ export class SurrealCompanyCore implements CompanyCore {
     return (rows ?? []).flatMap(row => {
       if (row.state !== 'doing' && row.state !== 'review') return [];
       const role = row.state === 'review' ? row.reviewer_role : row.executor_role;
-      // A role change after the claim, or a review lease held by the submitter/implementer,
+      // A role change after the claim, or a review lease held by the submitter,
       // is contradictory state: never rebuild it as a usable local claim.
       if (role !== actor.role) return [];
-      if (row.state === 'review' && (row.submitted_by === actor.employeeId || row.implementer === actor.employeeId)) return [];
+      if (row.state === 'review' && row.submitted_by === actor.employeeId) return [];
       if (!row.delivery_id || !row.lease_expires_at || !Number.isSafeInteger(row.fence) || row.fence < 1 ||
           !Number.isSafeInteger(row.version)) return [];
       return [{
@@ -737,13 +620,18 @@ export class SurrealCompanyCore implements CompanyCore {
 
   /**
    * `repairKey` (SYS03 AC02) switches the create's idempotency identity from the caller's employee to the business key,
-   * so the repair chain a disposition builds exists exactly once no matter which manager, session or replay asked for it.
+   * so the repair chain a disposition builds exists exactly once no matter which actor, session or replay asked for it.
    */
-  private async createTaskRecord(credential: Credential, input: CreateTask, options: { external?: boolean; acceptanceChain?: string; repairKey?: string } = {}): Promise<TaskView> {
+  private async createTaskRecord(credential: Credential, input: CreateTask, options: { external?: boolean; acceptanceChain?: string; repairKey?: string; route?: RouteRow } = {}): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Task creation denied');
+    const route = options.route ?? (input.type ? await getRoute(this.db, input.type) : undefined);
+    if (input.type && !route?.enabled) throw new CompanyError('invalid', `route type ${input.type} is missing or disabled`);
+    if (route) {
+      input = { ...input, executorRole: route.executor_role, reviewerRole: route.reviewer_role };
+    }
     // External create_task only: the raw list is bounded before de-duplication. Internal delivery
-    // legs and automatic goal-anchor dependencies are deliberately not capped here; they must
+    // route-expanded chain children are deliberately not capped here; they must
     // retain the complete dependency set.
     requireText(input.title, 'title', 3, 200);
     requireText(input.context, 'context', 1, 20000);
@@ -781,11 +669,8 @@ export class SurrealCompanyCore implements CompanyCore {
     // environment named by its criteria. An executor cannot introduce or relabel it at submit time.
     const declaresEnvironment = input.acceptanceEnvironment !== undefined ||
       acceptanceCriteria.some(criterion => criterion.environment !== undefined);
-    if (declaresEnvironment && leg !== 'deploy') {
-      // Before the merge there is no deployment to verify, so an implement or release leg cannot carry an environment
-      // requirement: the deploy leg is the one that runs against a real environment.
-      throw new CompanyError('invalid',
-        `acceptance environment requirements apply to the deploy leg only; this task is the ${leg} leg`);
+    if (declaresEnvironment && !trustedCode) {
+      throw new CompanyError('invalid', 'acceptance environment requirements apply to code delivery tasks only');
     }
     const acceptanceEnvironment = effectiveEnvironment(acceptanceCriteria, input.acceptanceEnvironment);
     // 必配轨岗位（如 screenwriter）：任务必须带指定轨，缺轨/错轨显式拒绝，防止无轨任务落到专属编制。
@@ -796,7 +681,7 @@ export class SurrealCompanyCore implements CompanyCore {
     if (input.modelTier !== undefined && !['fable','opus','sonnet','haiku','high','medium','low'].includes(input.modelTier)) throw new CompanyError('invalid', 'Invalid model tier');
     const kind = input.kind ?? 'task';
     if (kind !== 'task') throw new CompanyError('invalid', 'Invalid task kind');
-    if (input.goalId !== undefined) throw new CompanyError('invalid', 'goalId is retired; use tag');
+    if ((input as { goalId?: unknown }).goalId !== undefined) throw new CompanyError('invalid', 'goalId is retired; use tag');
     if ((input as { dependencies?: unknown }).dependencies !== undefined) throw new CompanyError('invalid', 'dependencies are retired; use parent');
     if (input.revises !== undefined) throw new CompanyError('invalid', 'revises is retired');
     const codeRepoPath = await this.creationCodeRepo(input, kind);
@@ -813,6 +698,9 @@ export class SurrealCompanyCore implements CompanyCore {
       audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
       title: input.title, context: input.context, executor: input.executorRole,
       reviewer: input.reviewerRole, tag: input.tag,
+      type: input.type, parent: input.parent ? id('task', input.parent) : undefined,
+      proposed_in: input.proposed_in,
+      requirement: input.requirement, acceptance_text: input.acceptanceText,
       kind, project: input.project ? id('project', input.project) : undefined,
       discipline: input.discipline, work_intent: input.workIntent, model_tier: input.modelTier,
       acceptance_criteria: acceptanceCriteria,
@@ -827,10 +715,13 @@ export class SurrealCompanyCore implements CompanyCore {
       const row = await this.txTask(`BEGIN;
         LET $who = SELECT * FROM ONLY $actor;
         IF $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'actor revoked or forbidden' };
+        LET $parent_state = IF $parent != NONE THEN (SELECT VALUE state FROM ONLY $parent) ELSE NONE END;
         LET $created = CREATE ONLY $task CONTENT {
           title: $title, context: $context, executor_role: $executor, reviewer_role: $reviewer,
           discipline: $discipline, work_intent: $work_intent, project: $project, model_tier: $model_tier,
-          tag: $tag, state: 'ready',
+          tag: $tag, type: $type, parent: $parent, proposed_in: $proposed_in,
+          requirement: $requirement, acceptance_text: $acceptance_text,
+          state: IF $parent != NONE AND $parent_state != 'done' THEN 'planned' ELSE 'ready' END,
           version: 1, fence: 0, submitted_by: NONE, current_employee: NONE,
           delivery_id: NONE, lease_expires_at: NONE, resume_role: NONE, resume_state: 'ready', blocked_to: NONE,
           kind: $kind, created_at: time::now(), code_repo_path: $code_repo_path,
@@ -844,12 +735,92 @@ export class SurrealCompanyCore implements CompanyCore {
         CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $created };
         RETURN $created;
         COMMIT;`, vars);
-      return view(row);
+      const taskView = view(row);
+      if (route || input.type) {
+        const store = new OutboundMessageStore(this.db);
+        const code = route?.code === true;
+        const drafts = await store.createTaskDrafts(taskView.id, taskView.executorRole, taskView.reviewerRole, code);
+        const hold = input.hold ?? route?.hold;
+        if (hold) {
+          for (const draft of drafts) {
+            await this.db.query('UPDATE $m SET hold = true;', { m: new RecordId('outbound_message', draft.id) });
+          }
+        }
+      }
+      if (route?.next) await this.expandRouteChain(credential, taskView, route, input, options);
+      return taskView;
     } catch (error) {
       const replay = await this.replay(idem, digest);
       if (replay) return replay;
       throw error;
     }
+  }
+
+  /**
+   * Route chain expansion: from `route.next`, create up to CHAIN_LIMIT planned successors. Each child
+   * inherits title (`${title} · ${label}`), requirement and acceptance, points parent at the previous
+   * task, and gets its own execute/review drafts. The walk stops on a missing/disabled route or a cycle.
+   */
+  private async expandRouteChain(credential: Credential, root: TaskView, route: RouteRow, input: CreateTask,
+    options: { external?: boolean; acceptanceChain?: string; repairKey?: string } = {}): Promise<void> {
+    let cursor: RouteRow | undefined = route;
+    let parent: TaskView = root;
+    const seen = new Set<string>([root.type ?? input.type ?? '']);
+    for (let step = 0; step < CHAIN_LIMIT && cursor?.next; step++) {
+      const nextType = cursor.next;
+      if (seen.has(nextType)) break;
+      seen.add(nextType);
+      const next = await getRoute(this.db, nextType);
+      if (!next?.enabled) break;
+      const child = await this.createTaskRecord(credential, {
+        title: `${input.title} · ${next.label}`, context: input.context,
+        executorRole: next.executor_role, reviewerRole: next.reviewer_role,
+        type: nextType, parent: parent.id,
+        requirement: input.requirement, acceptanceText: input.acceptanceText,
+        project: input.project, codeRepoPath: input.codeRepoPath, tag: input.tag,
+        workIntent: input.workIntent, discipline: input.discipline, modelTier: input.modelTier,
+        hold: input.hold ?? next.hold,
+        idempotencyKey: `${input.idempotencyKey}:chain:${nextType}`,
+      }, { ...options, route: next });
+      parent = child;
+      cursor = next;
+    }
+  }
+
+  /**
+   * One submit-`next` proposal: a planned child under the submitted task, typed through the route table,
+   * its execute/review drafts created immediately. proposed_in records the submit audit that proposed it,
+   * which is what a later return uses to void exactly this submission's proposals.
+   */
+  private async createProposal(parent: TaskView, proposal: { type: string; title: string; requirement?: string; acceptance?: string }, submitAuditId: string): Promise<TaskView> {
+    const route = await getRoute(this.db, proposal.type);
+    if (!route?.enabled) throw new CompanyError('invalid', `proposal type ${proposal.type} is missing or disabled`);
+    const taskId = randomUUID();
+    const [rows] = await this.db.query<[TaskRow]>(
+      `CREATE ONLY $task CONTENT { title: $title, context: $context, requirement: $requirement, acceptance_text: $acceptance,
+        type: $type, parent: $parent, proposed_in: $proposed_in, executor_role: $ex, reviewer_role: $rev,
+        state: 'planned', kind: 'task', version: 1, fence: 0, created_at: time::now() } RETURN AFTER;`,
+      { task: id('task', taskId), title: proposal.title, context: proposal.requirement ?? '',
+        requirement: proposal.requirement, acceptance: proposal.acceptance,
+        type: proposal.type, parent: id('task', parent.id), proposed_in: submitAuditId,
+        ex: route.executor_role, rev: route.reviewer_role });
+    const child = view(rows!);
+    await new OutboundMessageStore(this.db).createTaskDrafts(child.id, child.executorRole, child.reviewerRole, route.code === true);
+    return child;
+  }
+
+  /** Every planned descendant of a task, breadth-first: voiding a task cascades through the whole planned subtree. */
+  private async plannedDescendants(taskId: string): Promise<string[]> {
+    const out: string[] = [];
+    let frontier = [taskId];
+    while (frontier.length) {
+      const [rows] = await this.db.query<[Array<{ id: RecordId }>]>(
+        'SELECT id FROM task WHERE parent INSIDE $frontier AND state = $state;', { frontier: frontier.map(t => id('task', t)), state: 'planned' });
+      const next = (rows ?? []).map(row => String(row.id.id));
+      out.push(...next);
+      frontier = next;
+    }
+    return out;
   }
 
   async claim(credential: Credential, taskId: TaskId): Promise<ClaimResult> {
@@ -914,11 +885,6 @@ export class SurrealCompanyCore implements CompanyCore {
     return this.worktrees.inventory();
   }
 
-  /**
-   * The independence gate of one stage (SYS-DISP IR03): the exclusion read now, and the source versions the write must be guarded by.
-   * Undefined when the policy does not name this stage, so legacy tasks and ungated stages take no extra read. A policy this build cannot
-   * enforce refuses here whatever its stages; a source that cannot be read or does not exist refuses too. Nothing is written.
-   */
   private async claimLease(actor: Principal, taskId: TaskId, worktree?: WorktreeAssignment): Promise<ClaimResult> {
     const task = id('task', taskId);
     const row = await this.txTask(`BEGIN;
@@ -930,7 +896,8 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.state NOT IN ['ready', 'review', 'doing'] { THROW 'task not claimable' };
       IF $t.state = 'review' {
-        IF $t.submitted_by = $employee { THROW 'self review denied' };
+        LET $prior_submitters = SELECT VALUE <string>record::id(actor) FROM audit WHERE task = $task AND action IN ['submit', 'owner_submit'];
+        IF $t.submitted_by = $employee OR $prior_submitters CONTAINS $employee { THROW 'self review denied' };
         IF 'review' NOT IN $who.capabilities OR $t.reviewer_role != $who.role { THROW 'review denied' };
       } ELSE {
         IF 'execute' NOT IN $who.capabilities OR $t.executor_role != $who.role { THROW 'execute denied' };
@@ -971,6 +938,7 @@ export class SurrealCompanyCore implements CompanyCore {
       actor: id('employee', actor.employeeId), employee: actor.employeeId, task,
       delivery: randomUUID(), lease_seconds: this.leaseSeconds,
       assignment: worktree, tree: worktree ? id('worktree', worktree.id) : undefined, reference: id('worktree_ref', taskId),
+      audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
       // 必配轨岗位（screenwriter）：要求任务轨恰为必配轨且编制 tracks 显式覆盖——
       // 空 tracks、无 def 的员工与缺轨任务一律 forbidden（claim 端，派工端同规则过滤）。
       req: REQUIRED_TRACKS[actor.role] ?? null, has_req: REQUIRED_TRACKS[actor.role] !== undefined,
@@ -1007,7 +975,7 @@ export class SurrealCompanyCore implements CompanyCore {
    * undefined = free-form values allowed).
    */
   private disciplineContract(projectId?: string): Promise<DisciplineContract | undefined> {
-    return loadContract(this.db, undefined, projectId);
+    return loadContract(this.db, projectId);
   }
 
   /**
@@ -1079,7 +1047,7 @@ export class SurrealCompanyCore implements CompanyCore {
    * the business project's repo (the wrong-repo block → bind_task_code_repo → re-dispatch loop). An explicit codeRepoPath
    * must be on the bind allowlist. Without one, a task that writes code (code intent, release or deploy leg) whose
    * project repo is not the ops repo, and whose context names the ops repo's absolute path, is bound to the ops repo:
-   * that is how managers already state "the code is in operations, the business project stays". Anything else keeps
+   * that is how operators already state "the code is in operations, the business project stays". Anything else keeps
    * project routing (undefined).
    */
   private async creationCodeRepo(input: Pick<CreateTask, 'codeRepoPath' | 'context' | 'project' | 'workIntent'>, kind: TaskKind): Promise<string | undefined> {
@@ -1211,9 +1179,9 @@ export class SurrealCompanyCore implements CompanyCore {
       where.push('(executor_role = $qrole OR reviewer_role = $qrole)');
       vars.qrole = params.role;
     }
-    if (params.goalId) {
-      where.push('goal = $goal');
-      vars.goal = id('goal', params.goalId);
+    if (params.tag) {
+      where.push('tag = $tag');
+      vars.tag = params.tag;
     }
     if (params.since) {
       where.push('created_at >= <datetime>$since');
@@ -1256,12 +1224,12 @@ export class SurrealCompanyCore implements CompanyCore {
     const { limits } = this.snapshots;
     const header = await this.snapshots.build({
       owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '', startedAt,
-      guidance: 'narrow with state, goalId, role or since, or leave fields out',
+      guidance: 'narrow with state, tag, role or since, or leave fields out',
       load: async db => {
         const { at, count, textBytes, rows } = await this.taskRowsAt(actor, params, limits.maxRows + 1, limits.maxBytes, db);
-        if (count > limits.maxRows) throw tooLarge(`more than ${limits.maxRows} tasks match; narrow with state, goalId, role or since`);
+        if (count > limits.maxRows) throw tooLarge(`more than ${limits.maxRows} tasks match; narrow with state, tag, role or since`);
         if (textBytes > limits.maxBytes) {
-          throw tooLarge(`the matching tasks hold more than ${limits.maxBytes} bytes of text; narrow with state, goalId, role or since`);
+          throw tooLarge(`the matching tasks hold more than ${limits.maxBytes} bytes of text; narrow with state, tag, role or since`);
         }
         return { takenAt: at, bodies: rows.map(row => JSON.stringify(listItem(row, params.fields, true))) };
       },
@@ -1391,10 +1359,10 @@ export class SurrealCompanyCore implements CompanyCore {
         ...(params.paged ? { page: { pageSize: params.pageSize, returned: 1, hasMore: false, total: 1, budgetBytes: RESPONSE_BUDGET_BYTES } } : {}),
       };
       return completeOrRefuse(view, `task ${task.id}`,
-        `read a long part with read_task_text: the context {"taskId":"${task.id}","field":"context","offset":0}, then offset = nextOffset with the expectSha256 of the first segment, until nextOffset is null (the whole text has sha256 ${HASH(task.context)}); a long dependency list {"taskId":"${task.id}","field":"dependencies","offset":0}; or leave a part out with fields${company ? `; or ${COMPANY_PAGED_HINT}` : ''}`);
+        `read a long part with read_task_text: the context {"taskId":"${task.id}","field":"context","offset":0}, then offset = nextOffset with the expectSha256 of the first segment, until nextOffset is null (the whole text has sha256 ${HASH(task.context)}); or leave a part out with fields${company ? `; or ${COMPANY_PAGED_HINT}` : ''}`);
     }
     if (!params.paged) {
-      const guidance = 'retry with {"pageSize":25} and then {"cursor":"<page.nextCursor>"} until page.hasMore is false, or narrow with state, goalId, role or since';
+      const guidance = 'retry with {"pageSize":25} and then {"cursor":"<page.nextCursor>"} until page.hasMore is false, or narrow with state, tag, role or since';
       const { count, textBytes, rows } = await this.taskRowsAt(actor, params, COMPLETE_TASK_ROWS + 1, RESPONSE_BUDGET_BYTES);
       if (count > COMPLETE_TASK_ROWS) throw tooLarge(`more than ${COMPLETE_TASK_ROWS} tasks match; ${guidance}`);
       if (textBytes > RESPONSE_BUDGET_BYTES) {
@@ -1404,14 +1372,14 @@ export class SurrealCompanyCore implements CompanyCore {
       return completeOrRefuse(view, `the working set (${rows.length} tasks)`, company ? `${guidance}; or ${COMPANY_PAGED_HINT}` : guidance);
     }
     const digest = queryDigest('context', {
-      state: params.state ?? null, goalId: params.goalId ?? null, role: params.role ?? null, since: params.since ?? null, fields: params.fields ?? null, includeCompany: params.includeCompany,
+      state: params.state ?? null, tag: params.tag ?? null, role: params.role ?? null, since: params.since ?? null, fields: params.fields ?? null, includeCompany: params.includeCompany,
     });
     return this.listingPage<Record<string, unknown>, ContextView>({
       actor, kind: 'context', digest, pageSize: params.pageSize, cursor: params.cursor, startedAt,
       create: started => this.contextListing(actor, params, digest, started),
       parse: body => JSON.parse(body) as Record<string, unknown>,
       respond: (tasks, page) => ({ principal: actor, ...withCompany, tasks: [...tasks], page }),
-      envelopeGuidance: company ? `${COMPANY_PAGED_HINT}, which leaves the block out of every page` : 'narrow the query with state, goalId, role or since',
+      envelopeGuidance: company ? `${COMPANY_PAGED_HINT}, which leaves the block out of every page` : 'narrow the query with state, tag, role or since',
       oversizeGuidance: item => `task ${String(item.id)} is larger than a page can hold; read its context with read_task_text ${JSON.stringify({ taskId: String(item.id), field: 'context', offset: 0 })}, or narrow the fields with fields`,
     });
   }
@@ -1570,7 +1538,7 @@ export class SurrealCompanyCore implements CompanyCore {
 
   /**
    * read_task_text (SYS01, R3): one byte segment of one text of a task. context and evidence are read as stored. project is the
-   * task's project environment as JSON, read by its holder and owner only. dependencies, workIntentPaths and worktreePaths are the
+   * task's project environment as JSON, read by its holder and owner only. workIntentPaths and worktreePaths are the
    * task's lists as JSON arrays, the form a claim echo cuts them from. Segments never split a character and reassemble exactly;
    * sha256 covers the whole text, so a reader can verify it.
    */
@@ -1601,7 +1569,6 @@ export class SurrealCompanyCore implements CompanyCore {
       text = JSON.stringify(project);
     } else {
       const lists = {
-        dependencies: task.dependencies,
         workIntentPaths: task.workIntent?.paths ?? [],
         worktreePaths: task.worktree?.intent?.paths ?? [],
       };
@@ -1627,11 +1594,12 @@ export class SurrealCompanyCore implements CompanyCore {
     if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may read the company summary');
     const params = parseSummaryInput(input);
     const since = params.since ?? new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const goal = params.goalId ? id('goal', params.goalId) : undefined;
     // One transaction. The cutoff is the database time at its start. Task counts are each task's state at that cutoff and
-    // ignore since. Audit counts cover [since, cutoff]; with a goal, only the audit entries of that goal's tasks.
-    const taskWhere = goal ? 'WHERE goal = $goal' : '';
-    const auditWhere = goal ? 'task IN $goalTasks AND at >= <datetime>$since AND at <= $cutoff' : 'at >= <datetime>$since AND at <= $cutoff';
+    // ignore since. Audit counts cover [since, cutoff].
+    const taskWhere = params.tag ? 'WHERE tag = $tag' : '';
+    const auditWhere = params.tag
+      ? 'at >= <datetime>$since AND at <= $cutoff AND task IN (SELECT VALUE id FROM task WHERE tag = $tag)'
+      : 'at >= <datetime>$since AND at <= $cutoff';
     const counts = (n: string) => `LET $states${n} = (SELECT state, count() AS n FROM task ${taskWhere} GROUP BY state);
       LET $taskTotal${n} = (SELECT count() AS n FROM task ${taskWhere} GROUP ALL)[0].n;
       LET $actions${n} = (SELECT action, count() AS n FROM audit WHERE ${auditWhere} GROUP BY action);
@@ -1643,14 +1611,13 @@ export class SurrealCompanyCore implements CompanyCore {
     type SummaryRead = Counts & { cutoff: string; outbox?: number | null; again?: Counts };
     const read = await this.consistentRead<SummaryRead>(`LET $cutoff = time::now();
       LET $outbox = (SELECT VALUE value FROM company_meta:outbox_counter)[0];
-      ${goal ? 'LET $goalTasks = (SELECT VALUE id FROM task WHERE goal = $goal);' : ''}
       ${counts('')}
       ${counts('_again')}
       RETURN { read: {
         cutoff: <string>$cutoff, outbox: $outbox,
         states: $states, taskTotal: $taskTotal, actions: $actions, auditTotal: $auditTotal,
         again: { states: $states_again, taskTotal: $taskTotal_again, actions: $actions_again, auditTotal: $auditTotal_again },
-      } };`, { since, ...(goal ? { goal } : {}) });
+      } };`, { since, tag: params.tag ?? null });
     // Both reads are compared in one canonical order, so a difference in row order alone is not reported as a change.
     const canonical = (c: Counts) => JSON.stringify([
       [...(c.states ?? [])].map(row => [String(row.state ?? null), Number(row.n)]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
@@ -1679,11 +1646,10 @@ export class SurrealCompanyCore implements CompanyCore {
       repeatableRead,
     };
     return {
-      cutoffAt: read.cutoff, since, ...(params.goalId ? { goalId: params.goalId } : {}),
+      cutoffAt: read.cutoff, since,
       scope: {
-        tasks: goal ? 'tasks of this goal, each in the state it holds at cutoffAt; since does not apply to them'
-          : 'every task, each in the state it holds at cutoffAt; since does not apply to them',
-        audit: goal ? "audit entries of this goal's tasks with at from since up to cutoffAt" : 'audit entries with at from since up to cutoffAt',
+        tasks: params.tag ? `tag ${params.tag} 的任务，各处于 cutoffAt 时的状态；since does not apply to them` : 'every task, each in the state it holds at cutoffAt; since does not apply to them',
+        audit: params.tag ? 'audit entries of this tag with at from since up to cutoffAt' : 'audit entries with at from since up to cutoffAt',
       },
       tasks, audit, outboxSequence: Number(read.outbox ?? 0),
       integrity: {
@@ -1712,9 +1678,8 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   /**
-   * owner only, read-only (SYS-DISP AC05): what the audit-derived contributors say about the given tasks, the implementer status
-   * each one would have, and its timeline. Nothing is written: no lease, submitter, owner gate, history or implementer changes
-   * here. Recording a suggested implementer is a separate step that needs owner authorization.
+   * owner only, read-only: what the audit-derived contributors say about the given tasks (authors, claim-only
+   * hands, submitters). Nothing is written here.
    */
   async companyBrief(credential: Credential): Promise<CompanyBrief> {
     const actor = await this.authorized(credential);
@@ -1733,11 +1698,11 @@ export class SurrealCompanyCore implements CompanyCore {
   /** Which project environments a reader may see: all for owner; otherwise those of the projects of tasks it holds under a valid lease. */
   private async envView(actor: Principal): Promise<EnvView> {
     if (actor.role === 'owner') return { key: 'all', visible: () => true };
-    const [rows] = await this.db.query<[Array<{ project?: RecordId; goal_project?: RecordId }>]>(
-      'SELECT project AS project, goal.project AS goal_project FROM task WHERE current_employee = $employee AND lease_expires_at > $now;',
+    const [rows] = await this.db.query<[Array<{ project?: RecordId }>]>(
+      'SELECT project AS project FROM task WHERE current_employee = $employee AND lease_expires_at > $now;',
       { employee: actor.employeeId, now: Math.floor(Date.now() / 1000) });
     const held = new Set((rows ?? []).flatMap(row => {
-      const project = row.project ?? row.goal_project;
+      const project = row.project;
       return project ? [String(project.id)] : [];
     }));
     return { key: [...held].sort().join(','), visible: project => held.has(project) };
@@ -1992,7 +1957,6 @@ export class SurrealCompanyCore implements CompanyCore {
       throw new CompanyError('invalid', 'Invalid lease proof');
     }
     if (evidence) requireText(evidence.text, 'evidence', 20, 30000);
-    if (evidence?.recoveryReason !== undefined && !recoveryReasonSchema.safeParse(evidence.recoveryReason).success) throw new CompanyError('invalid', 'Invalid recoveryReason');
     const idem = evidence ? this.idemId(actor.employeeId, action, evidence.idempotencyKey) : undefined;
     const digest = evidence ? HASH(JSON.stringify({ proof, evidence, to })) : undefined;
     if (idem && digest) {
@@ -2012,6 +1976,18 @@ export class SurrealCompanyCore implements CompanyCore {
       companyUpgrade = await readCompanyRelease(repo,evidence.companyUpgrade.sha);
     }
     let prHead: string | undefined;
+    if (action === 'submit' && evidence?.sha && !evidence.acceptance?.sha) {
+      evidence = { ...evidence, acceptance: { ...(evidence.acceptance ?? {}), sha: evidence.sha } };
+    }
+    if (action === 'submit' && evidence?.next !== undefined) {
+      if (!Array.isArray(evidence.next) || evidence.next.length === 0 || evidence.next.length > 20) {
+        throw new CompanyError('invalid', 'next must be a non-empty list of at most 20 proposals');
+      }
+      for (const proposal of evidence.next) {
+        const route = await getRoute(this.db, proposal.type);
+        if (!route?.enabled) throw new CompanyError('invalid', `proposal type ${proposal.type} is missing or disabled`);
+      }
+    }
     if (action === 'submit' && evidence && this.submitCheck) {
       const row = await this.db.select<TaskRow>(id('task', proof.taskId));
       if (row?.executor_role === 'engineering' && row.kind === 'task') {
@@ -2085,22 +2061,9 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.lease_expires_at <= $now { THROW 'lease expired' };
       IF $t.current_employee != $employee OR $t.delivery_id != $delivery OR $t.fence != $fence OR $t.version != $expected { THROW 'stale lease or version' };
-      IF $t != NONE AND $t.version != $seen { THROW 'contribution history moved: retry' };
-      ${INDEPENDENCE_GUARD_SQL}
-      IF !$heartbeat AND $t.lease_policy_hash != NONE AND $t.lease_policy_hash != $policy_hash {
-        THROW 'policy changed: the effective contract moved since this lease was claimed; re-claim to continue'
-      };
-      IF $t.state = 'review' {
-        LET $repairs = SELECT VALUE count() FROM audit WHERE task = $task AND action = 'goal_acceptance_repair' AND actor = $actor GROUP ALL;
-        IF ($repairs[0] ?? 0) > 0 { THROW 'goal acceptance repairer cannot review' };
-      };
-      LET $owner = IF $t.implementer != NONE THEN $t.implementer ELSE $bound END;
+      LET $excluded = SELECT VALUE <string>record::id(actor) FROM audit WHERE task = $task AND action IN ['submit', 'owner_submit'];
       IF $submit OR (($heartbeat OR $checkpoint) AND $t.state != 'review') {
         IF 'execute' NOT IN $who.capabilities OR $t.state != 'doing' OR $t.executor_role != $who.role { THROW 'execute denied' };
-        IF $t.executor_role = 'engineering' {
-          IF $owner = '' AND $ambiguous { THROW 'execute denied: implementer unresolved, manager takeover required' };
-          IF $owner != $employee { THROW 'execute denied: not the bound implementer' };
-        };
       };
       IF ($heartbeat OR $checkpoint) AND $t.state = 'review' {
         IF $t.submitted_by = $employee OR ($excluded CONTAINS $employee) { THROW 'self review denied' };
@@ -2116,10 +2079,6 @@ export class SurrealCompanyCore implements CompanyCore {
           IF 'review' NOT IN $who.capabilities OR $t.reviewer_role != $who.role { THROW 'block denied' };
         } ELSE {
           IF 'execute' NOT IN $who.capabilities OR $t.state != 'doing' OR $t.executor_role != $who.role { THROW 'block denied' };
-          IF $t.executor_role = 'engineering' {
-            IF $owner = '' AND $ambiguous { THROW 'block denied: implementer unresolved, manager takeover required' };
-            IF $owner != $employee { THROW 'block denied: not the bound implementer' };
-          };
         };
       };
       IF $checkpoint AND $checkpoint_limit > 0 {
@@ -2155,7 +2114,16 @@ export class SurrealCompanyCore implements CompanyCore {
             actor: $employee, at: time::now(), criteria_version: $e.criteriaVersion, task_version: $next.version, digest: $e.digest
           };
         };
-        ${UNLOCK_SQL}
+        ${ACTIVATE_PLANNED_SQL}
+      };
+      IF $returning {
+        LET $sid = SELECT VALUE <string>record::id(id) FROM audit WHERE task = $task AND action = 'submit' ORDER BY at DESC LIMIT 1;
+        LET $proposal_rows = SELECT * FROM task WHERE parent = $task AND proposed_in IN ($sid ?? []) AND state = 'planned';
+        UPDATE task SET state = 'void', version += 1 WHERE parent = $task AND proposed_in IN ($sid ?? []) AND state = 'planned';
+        FOR $c IN $proposal_rows {
+          CREATE audit CONTENT { task: $c.id, actor: $actor, action: 'proposal_voided',
+            evidence: '提交被退回，提议任务作废', version: $c.version + 1, at: time::now() };
+        };
       };
       IF !$heartbeat {
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: $action, evidence: $evidence, version: $next.version, at: time::now(), recovery_reason: $recovery_reason, phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END };
@@ -2165,18 +2133,25 @@ export class SurrealCompanyCore implements CompanyCore {
       ${idem ? 'CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };' : ''}
       RETURN $next;
       COMMIT;`;
+    const auditId = id('audit', randomUUID());
     try {
       const row = await this.txTask(query, {
         actor: id('employee', actor.employeeId), employee: actor.employeeId,
         task: id('task', proof.taskId), delivery: proof.deliveryId,
         fence: proof.fence, expected: proof.expectedVersion, lease_seconds: this.leaseSeconds,
-        ...flags, action, has_company_upgrade: companyUpgrade !== undefined, company_upgrade: companyUpgrade, recovery_reason: action === 'block' ? evidence?.recoveryReason : undefined, evidence: evidence?.text ?? '', to: to ?? '', checkpoint_limit: this.checkpointLimit,
+        ...flags, action, has_company_upgrade: companyUpgrade !== undefined, company_upgrade: companyUpgrade, recovery_reason: undefined, evidence: evidence?.text ?? '', to: to ?? '', checkpoint_limit: this.checkpointLimit,
         acceptance_head: acceptance?.head ?? null, acceptance_environment: acceptance?.environment ?? null,
         has_head: acceptance?.head !== undefined, has_environment: acceptance?.environment !== undefined,
         human_evidence: acceptance?.human ?? [],
-        audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()), idem, digest,
+        audit: auditId, outbox: id('outbox', randomUUID()), idem, digest,
       });
-      return view(row);
+      const done = view(row);
+      if (action === 'submit' && evidence?.next?.length) {
+        for (const proposal of evidence.next) {
+          await this.createProposal(done, proposal, String(auditId.id));
+        }
+      }
+      return done;
     } catch (error) {
       if (idem && digest) {
         const prior = await this.replay(idem, digest);
@@ -2243,7 +2218,6 @@ export class SurrealCompanyCore implements CompanyCore {
       LET $next = UPDATE ONLY $task SET
         state = IF $t.state = 'doing' THEN 'ready' ELSE $t.state END,
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
-        standby_until = NONE,
         version = $t.version + 1 RETURN AFTER;
       UPDATE employee SET active_task = NONE WHERE id = $actor AND active_task = $task;
       CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'released', evidence: $evidence, version: $next.version, at: time::now(), phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END };
@@ -2252,6 +2226,7 @@ export class SurrealCompanyCore implements CompanyCore {
       CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`;
+    const auditId = id('audit', randomUUID());
     try {
       const row = await this.txTask(query, {
         actor: id('employee', actor.employeeId), employee: actor.employeeId,
@@ -2521,19 +2496,7 @@ export class SurrealCompanyCore implements CompanyCore {
     return this.worktrees?.listAudits(limit) ?? [];
   }
 
-  private async validateExecutionWindow(taskId: string, raw: unknown) {
-    const window = parseExecutionWindow(raw);
-    if (windowExpired(window)) throw new CompanyError('invalid', 'Execution window expired; resample and independently approve a fresh candidate');
-    const [facts] = await this.db.query<[Array<{ state: string; goal?: RecordId; digest?: string; expiry?: string }>]>(
-      `SELECT state, goal, (SELECT VALUE digest FROM internal_ai_candidate WHERE task = $approval)[0] AS digest, (SELECT VALUE evidence_expires_at FROM internal_ai_candidate WHERE task = $approval)[0] AS expiry FROM $approval;`,
-      { approval: id('task', window.approvalTask) });
-    const task = await this.db.select<TaskRow>(id('task', taskId));
-    const approved = facts?.[0];
-    if (!task || !approved || approved.state !== 'done' || normalizedId(approved.goal) !== normalizedId(task.goal) ||
-        approved.digest !== window.configurationDigest || approved.expiry !== window.evidenceExpiresAt || !(task.dependencies ?? []).some(d => asId(d) === window.approvalTask))
-      throw new CompanyError('invalid', 'Execution window requires a completed independent approval dependency and matching candidate digest');
-    return window;
-  }
+
 
   async resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView> {
     return echoTask(await this.resumeRecord(credential, taskId, evidence));
@@ -2573,6 +2536,7 @@ export class SurrealCompanyCore implements CompanyCore {
         COMMIT;`, {
         actor: id('employee', actor.employeeId), task: id('task', taskId), evidence: evidence.text,
         expected_version: before.version,
+        audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
         idem, digest,
       });
       return view(row);
@@ -2584,7 +2548,7 @@ export class SurrealCompanyCore implements CompanyCore {
   }
   /**
    * owner/product only: retire a task to the terminal 'void' state. Duplicate or obsolete work
-   * (e.g. two managers decomposing the same goal into parallel chains) stops occupying the
+   * (e.g. two owners decomposing the same work into parallel chains) stops occupying the
    * graph: any live lease is released, the holder's active_task clears, and blocked
    * dependents re-evaluate with 'void' counted as satisfied, so a chain waiting only on the
    * retired task unlocks in the same transaction. Retiring an already-void task is a no-op
@@ -2615,26 +2579,13 @@ export class SurrealCompanyCore implements CompanyCore {
     // Pre-read for a readable fast-fail and the audit snapshot; the transaction re-checks
     // every guard atomically, so a stale pre-read can never turn into a wrong write.
     const before = await this.db.select<TaskRow>(id('task', input.taskId));
+    const descendants = await this.plannedDescendants(input.taskId);
     if (!before) throw new CompanyError('not_found', 'Task not found');
     if (before.state === 'done') throw new CompanyError('conflict', 'Cannot retire a finished task');
     if (input.expectedVersion !== undefined && before.version !== input.expectedVersion) {
       throw new CompanyError('conflict', 'Task version moved');
     }
     if (before.state === 'void') return view(before); // already terminal, idempotent no-op
-    if (before.reviewer_role === 'owner') {
-      // Goal anchors are rollup bookkeeping; they never block retiring the gate itself.
-      // Dependents on ANY version of the task's screenplay lineage are live dependents of
-      // the tip too — retiring the tip would strand them blocked with no revision possible.
-      const rows = await this.db.query<[unknown, unknown, RecordId[]]>(`
-        LET $r = SELECT * FROM ONLY $task;
-        LET $chain = IF ($r.lineage ?? NONE) = NONE THEN [$task] ELSE (SELECT VALUE id FROM task WHERE lineage = $r.lineage) END;
-        SELECT VALUE id FROM task WHERE array::len(array::filter(dependencies ?? [], |$d| $d IN $chain)) > 0
-          AND state NOT IN [$done, $void] AND (goal = NONE OR id NOT IN (goal.anchors ?? []));`,
-        { task: id('task', input.taskId), done: 'done', void: 'void' });
-      if (rows[2].length > 0) {
-        throw new CompanyError('conflict', 'Owner-gated task has live dependents; retire them first');
-      }
-    }
 
     const evidence = `${input.text}\n[retire] 作废前 state=${before.state}` +
       ` blocked_to=${before.blocked_to ?? '-'} holder=${before.current_employee ?? '-'} version=${before.version}`;
@@ -2648,22 +2599,16 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $t = NONE { THROW 'task not found' };
       IF $t.state IN ['done', 'void'] { THROW 'task already terminal' };
       IF $expected != NONE AND $t.version != $expected { THROW 'task version moved' };
-      IF $t.reviewer_role = 'owner' {
-        LET $retire_chain = IF ($t.lineage ?? NONE) = NONE THEN [$task] ELSE (SELECT VALUE id FROM task WHERE lineage = $t.lineage) END;
-        LET $live_dependents = SELECT VALUE id FROM task WHERE array::len(array::filter(dependencies ?? [], |$d| $d IN $retire_chain)) > 0 AND state NOT IN ['done', 'void'] AND (goal = NONE OR id NOT IN (goal.anchors ?? []));
-        IF array::len($live_dependents) > 0 { THROW 'retire refused: live owner-gate dependents' };
-      };
       LET $next = UPDATE ONLY $task SET
         state = 'void', blocked_to = NONE, resume_role = NONE, resume_state = NONE,
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
-        wait_state = NONE, wait_kind = NONE, wait_episode = NONE, wait_not_before = NONE,
-        wait_expires_at = NONE, wait_next_check_at = NONE, wait_owner_role = NONE,
-        wait_source = NONE, wait_version = NONE, wait_entered_at = NONE,
         version = $t.version + 1 RETURN AFTER;
-      UPDATE task_wait SET state = 'cancelled', cancelled_reason = 'task retired', updated_at = time::now()
-        WHERE task = $task AND state IN ['waiting', 'held', 'expired'];
+      FOR $cid IN $descendants {
+        UPDATE type::record('task', $cid) SET state = 'void', version += 1;
+        CREATE audit CONTENT { task: type::record('task', $cid), actor: $actor, action: 'planned_voided',
+          evidence: '父任务作废，计划任务级联作废', version: (SELECT VALUE version FROM ONLY type::record('task', $cid)), at: time::now() };
+      };
       UPDATE employee SET active_task = NONE WHERE active_task = $task;
-      ${UNLOCK_CHILDREN_SQL}
       CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'retire', evidence: $evidence, version: $next.version, at: time::now() };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE ONLY $outbox CONTENT { task: $task, kind: 'retired', sequence: $sequence.value, payload: { state: 'void', retired_holder: $holder }, at: time::now() };
@@ -2672,6 +2617,7 @@ export class SurrealCompanyCore implements CompanyCore {
       COMMIT;`, {
         actor: id('employee', actor.employeeId), task: id('task', input.taskId),
         expected: input.expectedVersion, evidence, holder: before.current_employee,
+        descendants,
         idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
       });
     } catch (error) {
@@ -2696,7 +2642,7 @@ export class SurrealCompanyCore implements CompanyCore {
   // 复用 resume/defer/retire/create 的既有状态机，不新增任何旁路写权。
 
   /**
-   * The episode a task is currently blocked in must be the one being claimed: a manager may not claim, and therefore
+   * The episode a task is currently blocked in must be the one being claimed: the owner may not claim, and therefore
    * decide, an episode the task is no longer in. A task carries its open episode as phase + start (unix seconds); a
    * task without one (never blocked, or already resumed) refuses every claim, which is how a late reminder to a
    * decided episode is turned away.

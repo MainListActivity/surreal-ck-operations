@@ -8,6 +8,8 @@ export interface WaitingItem {
   title: string;
   sinceMs: number;
   /** Non-terminal tasks that transitively depend on this one. */
+  downstream?: number;
+  tag?: string;
 }
 
 /** How many of a role's enabled seats can take work right now, and why the others cannot. */
@@ -41,7 +43,8 @@ const short = (text: string, max: number) => text.length > max ? `${text.slice(0
 
 export function agingText(item: WaitingItem, hours: number): string {
   const what = item.kind === 'gate' ? '待你批准的关口' : '待你回答的问题';
-  return `已等你 ${formatAge(hours)}：${what}《${short(item.title, 60)}》。任务 ${item.taskId}。查看：company owner inbox`;
+  const downstream = item.downstream ? `卡住下游 ${item.downstream} 个任务。` : '';
+  return `已等你 ${formatAge(hours)}：${what}《${short(item.title, 60)}》。任务 ${item.taskId}。${downstream}查看：company owner inbox`;
 }
 
 const PHASE_NAME = { execute: '执行', review: '复核' } as const;

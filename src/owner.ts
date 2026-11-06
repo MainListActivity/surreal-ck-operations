@@ -137,10 +137,10 @@ export class OwnerDesk {
       if (prior.payload_digest !== digest) throw new CompanyError('conflict', 'Idempotency key reused with different input');
       return view(prior.result);
     }
-    const before = await this.db.select<TaskRow & { goal?: RecordId; project?: RecordId }>(id('task', input.taskId));
+    const before = await this.db.select<TaskRow & { project?: RecordId }>(id('task', input.taskId));
     if (!before) throw new CompanyError('not_found', 'task not found');
     const executor = input.executorRole ?? before.executor_role, reviewer = input.reviewerRole ?? before.reviewer_role;
-    assertRoleContract(await loadContract(this.db, before.goal ? asId(before.goal) : undefined, before.project ? asId(before.project) : undefined), executor, before.discipline ?? undefined);
+    assertRoleContract(await loadContract(this.db, before.project ? asId(before.project) : undefined), executor, before.discipline ?? undefined);
     const required = REQUIRED_TRACKS[executor];
     if (required !== undefined && before.discipline !== required) throw new CompanyError('invalid', `executorRole ${executor} requires discipline=${required}`);
     const evidence = `来源：${input.source}\n改派：执行 ${before.executor_role}→${executor}；验收 ${before.reviewer_role}→${reviewer}\n${input.note}`;
@@ -163,7 +163,7 @@ export class OwnerDesk {
   /**
    * Owner-level retire (作废): the task becomes void, its holder is released and dependents that were only
    * waiting on it unlock. Closing a goal's final gate this way never closes the goal. Same guards as the
-   * manager's retire: finished tasks and owner gates with live dependents are refused.
+   * Owner retire: finished tasks and owner gates with live dependents are refused.
    */
   async retire(input: { taskId: TaskId; note: string; source: string; key: string }): Promise<TaskView> {
     requireText(input.note, 'note', 4, 4000);
@@ -184,17 +184,34 @@ export class OwnerDesk {
       IF $t.state IN ['done', 'void'] { THROW 'task is not awaiting: already terminal' };
       LET $next = UPDATE ONLY $task SET state = 'void', blocked_to = NONE, resume_role = NONE, resume_state = NONE,
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE, version = $t.version + 1 RETURN AFTER;
+      FOR $cid IN $descendants {
+        UPDATE type::record('task', $cid) SET state = 'void', version += 1;
+        CREATE audit CONTENT { task: type::record('task', $cid), actor: $actor, action: 'planned_voided',
+          evidence: '父任务作废，计划任务级联作废', version: (SELECT VALUE version FROM ONLY type::record('task', $cid)), at: time::now() };
+      };
       UPDATE employee SET active_task = NONE WHERE active_task = $task;
       CREATE audit CONTENT { task: $task, actor: $actor, action: 'retire', evidence: $evidence, version: $next.version, at: time::now() };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE outbox CONTENT { task: $task, kind: 'retired', sequence: $sequence.value, payload: { state: 'void', retired_holder: $holder }, at: time::now() };
       CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
-      COMMIT;`, { task: id('task', input.taskId), actor: input.source, evidence, holder: before.current_employee, idem, digest });
+      COMMIT;`, { task: id('task', input.taskId), actor: input.source, evidence, holder: before.current_employee, idem, digest, descendants: await this.plannedDescendants(input.taskId) });
     return view(rows.at(-2) as TaskRow);
   }
 
-  /** Re-evaluates the dependents of a finished task; the repair for work that stayed blocked after its dependencies completed. */
+  private async plannedDescendants(taskId: string): Promise<string[]> {
+    const out: string[] = [];
+    let frontier = [taskId];
+    while (frontier.length) {
+      const [rows] = await this.db.query<[Array<{ id: RecordId }>]>(
+        'SELECT id FROM task WHERE parent INSIDE $frontier AND state = $state;', { frontier: frontier.map(t => id('task', t)), state: 'planned' });
+      const next = (rows ?? []).map(row => String(row.id.id));
+      out.push(...next);
+      frontier = next;
+    }
+    return out;
+  }
+
   async addDirection(input: { text: string; source: string; key: string }): Promise<void> {
     requireText(input.text, 'direction', 2, 20000);
     const record = id('direction', HASH(`direction\0${input.key}`).slice(0, 16));
@@ -313,7 +330,7 @@ export class OwnerDesk {
     return stats;
   }
 
-  /** Stops a task that keeps bouncing between employee and manager: it becomes an owner question with the recent reasons. */
+  /** Stops a task that keeps bouncing between employee and reviewer: it becomes an owner question with the recent reasons. */
   async escalateLooping(task: { id: TaskId; version: number }, loops: number, reasons: string[]): Promise<boolean> {
     const [lastBlock] = await this.db.query<[Array<{ recovery_reason?: string }>]>(
       "SELECT recovery_reason, at FROM audit WHERE task = $task AND action = 'block' ORDER BY at DESC LIMIT 1;", { task: id('task', task.id) });
@@ -345,12 +362,26 @@ export class OwnerDesk {
       const key = `${asId(a.task)}|${a.action === 'submit' ? 'gate' : 'question'}`;
       if (!latestAt.has(key)) latestAt.set(key, a.at);
     }
-    return rows.map(row => {
+    return Promise.all(rows.map(async row => {
       const gate = row.state === 'review';
       const since = Date.parse(String(latestAt.get(`${asId(row.id)}|${gate ? 'gate' : 'question'}`) ?? (row as { created_at?: unknown }).created_at ?? new Date()));
       return { taskId: asId(row.id), version: row.version, kind: gate ? 'gate' as const : 'question' as const, title: row.title,
-        sinceMs: since };
-    });
+        sinceMs: since, downstream: await this.nonTerminalDescendants(asId(row.id)), tag: row.tag ?? undefined };
+    }));
+  }
+
+  /** Non-terminal tasks transitively under this one in the parent chain. */
+  private async nonTerminalDescendants(taskId: string): Promise<number> {
+    let count = 0;
+    let frontier = [taskId];
+    while (frontier.length) {
+      const [rows] = await this.db.query<[Array<{ id: RecordId }>]>(
+        "SELECT id FROM task WHERE parent INSIDE $frontier AND state NOT IN ['done', 'void'];", { frontier: frontier.map(t => id('task', t)) });
+      const next = (rows ?? []).map(row => String(row.id.id));
+      count += next.length;
+      frontier = next;
+    }
+    return count;
   }
 
   /** Everything the daily brief reports, read straight from the task service (no model involved). */
@@ -385,6 +416,10 @@ export class OwnerDesk {
       const minutes = at ? (nowMs - Date.parse(String(at))) / 60_000 : 0;
       if (minutes >= 60) stuck.push({ taskId: asId(task.id), title: task.title, reason: `就绪 ${Math.round(minutes)} 分钟仍未被领走` });
     }
+    // Blocked work whose parent already finished is orphaned: it can never be activated and waits for the owner.
+    const [orphans] = await this.db.query<[Array<{ id: RecordId; title: string }>]>(
+      "SELECT id, title FROM task WHERE state = 'blocked' AND parent.state = 'done';");
+    for (const task of orphans ?? []) stuck.push({ taskId: asId(task.id), title: task.title, reason: '父任务已完成却仍 blocked' });
     const n = (...actions: string[]) => counts.filter(c => actions.includes(c.action) && !c.mechanical).reduce((sum, c) => sum + c.n, 0);
     const rolledBack = counts.filter(c => c.action === 'return' && c.mechanical).reduce((sum, c) => sum + c.n, 0);
     const resources = [
@@ -396,7 +431,7 @@ export class OwnerDesk {
       churn: { created: opened[0]?.n ?? 0, retired: closed.reduce((sum, c) => sum + c.n, 0), claimLost: closed.filter(c => c.reason === 'claim race lost').reduce((sum, c) => sum + c.n, 0) } };
   }
 
-  /** Free-form owner instruction routed to the manager as a owner task; owner decides how to act on it. */
+  /** Free-form owner instruction routed as an owner task; the owner decides how to act on it. */
   async instruct(input: { text: string; source: string; key: string }): Promise<{ taskId: string }> {
     requireText(input.text, 'instruction text', 2, 10000);
     const taskId = HASH(`instruct\0${input.key}`).slice(0, 16);
@@ -404,7 +439,7 @@ export class OwnerDesk {
     if (await this.db.select(task)) return { taskId };
     const title = `老板指示：${input.text.trim().split(/\r?\n/)[0].slice(0, 60)}`;
     await this.db.query(`CREATE ONLY $task CONTENT { title: $title, context: $context, kind: 'task',
-      executor_role: 'owner', reviewer_role: 'product', dependencies: [], state: 'ready',
+      executor_role: 'owner', reviewer_role: 'product', state: 'ready',
       version: 1, fence: 0, resume_state: 'ready', created_at: time::now() };
       ${EMIT_CREATED('$task')}`, { task, title, context: `老板原话：\n${input.text.trim()}\n\n来源：${input.source}` });
     return { taskId };

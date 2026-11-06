@@ -63,21 +63,13 @@ test('template bodies are the exact minimal sentences', () => {
   expect(templateFor('eval')).toContain('agents/eval.md');
 });
 
-test('renderMessage names the task machine criterion and falls back to the deploy baseline', () => {
+test('the code template instructs a sha submit and resolves absolute paths', () => {
   const opts = { sckBin: '/bin/sck', commDir: '/c', taskId: 't1' };
   const body = templateFor('execute', true);
-  expect(body).toContain('"acId":"{acId}"');
-  const named = renderMessage(body, { ...opts, acId: 'AC-BASE-DEPLOY-1' });
-  expect(named).toContain('"acId":"AC-BASE-DEPLOY-1"');
-  expect(named).not.toContain('{acId}');
-  // A custom criterion id is what the employee is told to record.
-  expect(renderMessage(body, { ...opts, acId: 'AC-9' })).toContain('"acId":"AC-9"');
-  // No criteria on the row: the baseline id stays usable, never a literal placeholder.
-  const fallback = renderMessage(body, opts);
-  expect(fallback).toContain('"acId":"AC-BASE-DEPLOY-1"');
-  expect(fallback).not.toContain('{acId}');
-  // Rework carries the same placeholder.
-  expect(renderMessage(templateFor('rework', true), { ...opts, acId: 'AC-R' })).toContain('"acId":"AC-R"');
+  expect(body).toContain('"sha":"<合入提交>"');
+  expect(renderMessage(body, opts)).toContain("'/bin/sck' call submit");
+  // Rework prefixes the same instruction with the findings repair step.
+  expect(renderMessage(templateFor('rework', true), { ...opts, findingsFile: '/f/round-1.md' })).toContain('round-1.md');
 });
 
 test('machineCriterionId reads the first required machine criterion and falls back when absent', async () => {

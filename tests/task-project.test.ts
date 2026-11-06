@@ -82,15 +82,15 @@ const proof = (claim: ClaimResult): LeaseProof =>
 /** 无 project 目标：任务仅挂 goal，无单任务覆盖。 */
 async function taskOnNoProjectGoal(core: SurrealCompanyCore) {
   const [grows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: '跨仓库交付解堵', brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
-  return core.createTask(gm, { title: `受控改绑 fixture ${++count}`, context: 'Isolated fixture task for project rebinding tests', executorRole: 'engineering', reviewerRole: 'engineering', goalId: asId(grows[0]!.id), idempotencyKey: key() });
+  return core.createTask(gm, { title: `受控改绑 fixture ${++count}`, context: 'Isolated fixture task for project rebinding tests', executorRole: 'engineering', reviewerRole: 'engineering', tag: asId(grows[0]!.id), idempotencyKey: key() });
 }
 /** goal 本身挂 anime 项目：用于「单任务覆盖不影响同目标其它任务」。 */
 async function animeGoal() {
   const [grows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: 'anime 目标', brief: 'fixture', state: 'active', source: 'fixture', note: '', project: project:anime, tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
   return asId(grows[0]!.id);
 }
-async function taskOnGoal(core: SurrealCompanyCore, goalId: string) {
-  return core.createTask(gm, { title: `anime 目标内任务 ${++count}`, context: 'Isolated fixture task under a project-carrying goal', executorRole: 'engineering', reviewerRole: 'engineering', goalId, idempotencyKey: key() });
+async function taskOnGoal(core: SurrealCompanyCore, tag: string) {
+  return core.createTask(gm, { title: `anime 目标内任务 ${++count}`, context: 'Isolated fixture task under a project-carrying goal', executorRole: 'engineering', reviewerRole: 'engineering', tag, idempotencyKey: key() });
 }
 const blockByGm = async (core: SurrealCompanyCore, taskId: string, worker = eng) => {
   const claim = await core.claim(worker, taskId);
@@ -163,10 +163,7 @@ run('a per-task override does not touch sibling tasks of the same goal', async (
   const C = core(), wf = workforce();
   const goalId = await animeGoal();
   const first = await taskOnGoal(C, goalId);
-  const second = await taskOnGoal(C, goalId);
-  expect(first.goalId).toBe(goalId);
-  expect(second.goalId).toBe(goalId);
-  await blockByGm(C, second.id);
+  const second = await taskOnGoal(C, goalId);  await blockByGm(C, second.id);
   const rebound = await C.taskProjectUpdate(gm, { taskId: second.id, project: 'maplayer-content', expectedVersion: 4, text: '仅该任务改绑，同目标其它任务不受影响', idempotencyKey: key() });
   expect(rebound.projectOverlay).toBe('maplayer-content');
   const [sFirst, sSecond] = await Promise.all([
@@ -270,7 +267,7 @@ run('ops project resolution follows the override for broker scope and audit quot
   const C = core();
   // create_task 带覆盖：claim 后 opsScope 解析到 maplayer-content（ops_info/broker 环境随之切换）。
   const [grows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: 'ops 解析', brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
-  const t = await C.createTask(gm, { title: `ops 解析 fixture ${++count}`, context: 'Isolated fixture for ops project resolution', executorRole: 'engineering', reviewerRole: 'engineering', goalId: asId(grows[0]!.id), project: 'maplayer-content', idempotencyKey: key() });
+  const t = await C.createTask(gm, { title: `ops 解析 fixture ${++count}`, context: 'Isolated fixture for ops project resolution', executorRole: 'engineering', reviewerRole: 'engineering', tag: asId(grows[0]!.id), project: 'maplayer-content', idempotencyKey: key() });
   expect(t.projectOverlay).toBe('maplayer-content');
   const claim = await C.claim(eng, t.id);
   const scope = await C.opsScope(eng, t.id);

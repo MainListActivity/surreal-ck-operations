@@ -50,7 +50,6 @@ run('the cinematography def refuses other tracks and concept-design work is not 
   await expect(claimAs('concept-def', other.id)).rejects.toMatchObject({ code: 'forbidden' });
   await new ProjectStore(db.db).upsert({ id: 'anime', name: '动画项目', repoPath: dir, release: 'local', envs: [], disciplines: [{ name: '摄影', roles: ['cinematography'] }] });
   const [rows] = await db.db.query<[Array<{ id: unknown }>]>("CREATE goal CONTENT { title: '短片', brief: 'fixture', state: 'active', source: 'fixture', note: '', project: project:anime, tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
-  const goalId = String((rows[0]!.id as { id: string }).id);
-  await expect(task({ goalId, executorRole: 'concept-design', reviewerRole: 'owner', discipline: '摄影' })).rejects.toThrow(/only be carried by cinematography/);
-  expect((await task({ goalId, discipline: '摄影' })).executorRole).toBe('cinematography');
+  await expect(task({ project: 'anime', executorRole: 'concept-design', reviewerRole: 'owner', discipline: '摄影' })).rejects.toThrow(/only be carried by cinematography/);
+  expect((await task({ project: 'anime', discipline: '摄影' })).executorRole).toBe('cinematography');
 });

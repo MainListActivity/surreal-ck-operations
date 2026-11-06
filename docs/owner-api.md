@@ -8,7 +8,11 @@
 
 | 命令 | 一行示例 |
 |---|---|
-| 建任务 | `sck owner task.create '{"title":"导出","requirement":"导出 CSV","acceptanceText":"列头正确","executorRole":"engineering","reviewerRole":"qa","dependencies":[]}'` |
+| 建任务（路由类型） | `sck owner task.create '{"type":"software","title":"导出","requirement":"导出 CSV","acceptanceText":"列头正确","tag":"发布线","hold":false}'`（返回 `{task, planned}`：route.next 链上的 planned 后续任务各带草稿） |
+| 任务链与消息 | `sck owner task.plan '{"taskId":"t1"}'`（父链回溯 + 下游全链任务与每任务消息） |
+| 路由列表 | `sck owner route.list '{}'` |
+| 保存路由 | `sck owner route.save '{"type":"software","label":"软件需求","executorRole":"engineering","reviewerRole":"qa","code":true,"next":"gate","hold":false}'`（拒绝同岗/未知岗/未启用 next/成环） |
+| 停用路由 | `sck owner route.disable '{"type":"story"}'`（被别的 next 引用时拒绝） |
 | 改任务 | `sck owner task.update '{"taskId":"t1","requirement":"新需求","acceptanceText":"新验收标准"}'` |
 | 删任务（作废） | `sck owner task.delete '{"taskId":"t1","note":"不需要了"}'` |
 | 任务详情/审计/消息记录 | `sck owner task.detail '{"taskId":"t1"}'` |

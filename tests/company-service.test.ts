@@ -36,16 +36,6 @@ function executable(path: string, content: string) {
   chmodSync(path, 0o755);
 }
 
-// Both switch contracts a capable release carries: RW06 (persistent review-wait state) and IR06 (source-contributor dynamic
-// avoidance). A fixture release without them is the "old target" case each guard must refuse. The two contracts share
-// src/core.ts and src/contracts.ts, so their markers live in the same fixture files.
-const CAPABILITY_FILES = {
-  'src/review-wait-capability.ts': "export const REVIEW_WAIT_PROTOCOL = 'review-wait/1';\n",
-  'src/independence.ts': 'export const INDEPENDENCE_LIMITS = { sources: 20, excluded: 100 } as const;\n',
-  'src/core.ts': "export const UNLOCK = `\n  LET $restore_phase = IF $source_phase = 'review' THEN 'review' ELSE 'ready' END;\n  UPDATE $t SET resume_state = NONE;\n`;\nconst INDEPENDENCE_GUARD_SQL = `FOR $g IN $indep_guards`;\nexport class Core {\n  private async independenceGate(taskId: string) { return taskId; }\n}\n",
-  'src/contracts.ts': 'export interface TaskView {\n  resumeState?: string;\n  resumeRole?: string;\n}\nexport interface IndependencePolicy { schema: 1 }\nexport interface IdentityPrincipalView { id: string }\n',
-};
-
 // SYS02 C2: the acceptance baseline contract the target guard requires (baseline declarations, the evaluator merge,
 // the schema/bootstrap link). A fixture target without it is refused before any install side effect.
 const ACCEPTANCE_FILES = {
@@ -54,39 +44,7 @@ const ACCEPTANCE_FILES = {
   'schema/026-acceptance.surql': "DEFINE FIELD IF NOT EXISTS acceptance_criteria ON task TYPE option<array<object>>;\nDEFINE TABLE IF NOT EXISTS acceptance_evidence SCHEMAFULL;\n",
 };
 
-// SYS06 C1: the effective-policy contract the target guard requires (the judgement, the read layer, the plan/isolation
-// seam and the migration). It shares src/core.ts, src/contracts.ts and src/database.ts with the contracts above, so those
-// markers are appended to the same fixture files — in the release and in the plugin vendor alike.
-const POLICY_FILES = {
-  'src/policy.ts': "export function resolveEffective(rows, chain, epoch, now) { return { hash: 'h', domains: [] }; }\nexport function checkWriteAuthority(contract, input) { return { ok: true }; }\nexport function dispatchVerdict(facts, contract) { return { verdict: 'clear' }; }\n",
-  'src/policy-store.ts': "export async function readEffectiveContract(db, chain, now) { return { contract: { hash: 'h' }, rows: [], epoch: 0 }; }\nexport async function readTaskPolicyRow(db, taskId) { return { id: taskId }; }\n",
-  'src/workforce.ts': "export class Workforce {\n  async policyDispatchVerdict(taskId) { return { verdict: 'clear', hash: taskId }; }\n}\n",
-  'schema/035-effective-policy.surql': 'DEFINE TABLE IF NOT EXISTS policy SCHEMALESS PERMISSIONS NONE;\nDEFINE FIELD IF NOT EXISTS policy_hash ON task TYPE option<string>;\nDEFINE FIELD IF NOT EXISTS lease_policy_hash ON task TYPE option<string>;\nDEFINE FIELD IF NOT EXISTS policy_block_reason ON task TYPE option<string>;\n',
-};
-const POLICY_SHARED = {
-  'src/core.ts': "export class PolicyCore {\n  async policyPlan(credential, input) { return input; }\n  async policyEnforce(credential, input) { return `action: 'policy_blocked' ${input} policy_block_reason`; }\n}\n",
-  'src/contracts.ts': 'export interface PolicyPlanInput { policyId: string }\nexport interface PolicyTaskFacts {\n  policyBlockReason?: string;\n}\n',
-  'src/database.ts': "// loadSchema('035-effective-policy.surql')\n",
-};
-
-// FV06 P0/P1: the standby relay contract the switch guard requires (capability marker, the resume
-// write in core, the view field, the supervision branch, the config field) — in src and in the
-// plugin vendor alike; a fixture target without it is the incompatible case the guard refuses.
-// The workforce markers mirror the real declarations (CompanyConfig.standbyBudgetSeconds,
-// DEFAULT_CONFIG's entry and the company_meta row key): a fixture shaped differently from the
-// real tree lets the guard pass while the real tree is refused, which is exactly the gap the
-// real-tree smoke test below closes.
-const STANDBY_FILES = {
-  'src/standby-relay-capability.ts': "export const STANDBY_RELAY_PROTOCOL = 'standby-relay/1';\nexport const STANDBY_BUDGET_SECONDS_DEFAULT = 600;\n",
-  'src/dispatcher/dispatcher.ts': "export const STANDBY_WAKE_RETRY_SECONDS = 60;\nconst STANDBY_TIMEOUT_REASON = 'standby timeout';\n",
-};
-const STANDBY_APPENDS: Array<[string, string]> = [
-  ['src/core.ts', "standby_until = IF $assigned THEN math::min([$standby_not_after, $now + $standby_budget]) ELSE NONE END\nstandby employee unavailable\nstandby denied: unmet dependencies remain\n"],
-  ['src/contracts.ts', 'export interface StandbyView {\n  standbyUntil?: string;\n}\n'],
-  ['src/workforce.ts', "export interface StandbyConfig {\n  standbyBudgetSeconds: number;\n}\nstandbyBudgetSeconds: STANDBY_BUDGET_SECONDS_DEFAULT,\nrow.standby_budget_seconds\naction: 'standby_timeout',\n"],
-];
-
-function makeRelease(releases: string, sha: string, withGit = false, capable = true, policy = capable, version?: string) {
+function makeRelease(releases: string, sha: string, withGit = false, capable = true, version?: string) {
   const dir = join(releases, sha);
   mkdirSync(join(dir, 'src', 'mcp'), { recursive: true });
   mkdirSync(join(dir, 'src', 'dispatcher'), { recursive: true });
@@ -96,10 +54,8 @@ function makeRelease(releases: string, sha: string, withGit = false, capable = t
   // The version the release carries: the installer reads it to decide which release gates it must have passed.
   if (version) writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'fixture-release', version }));
   if (capable) {
-const files = { 'src/task-recovery.ts': 'export {};', 'src/ops/proof-store.ts': 'export const assertExecutionWindow = true;', ...CAPABILITY_FILES, ...ACCEPTANCE_FILES, ...(policy ? POLICY_FILES : {}), ...STANDBY_FILES,
-  'src/goal-workspace-capability.ts': "export const GOAL_WORKSPACE_CONTRACT = 'sck-goal-workspace/v1';\n" };
-    const appends: Array<[string, string]> = [['src/core.ts', "// workspace goal denied dependency_continuation\n"], ['src/workforce.ts', "// workspace_scope\n"], ['src/core.ts', "export const ACCEPTANCE_CORE = 'mergeAcceptanceCriteria(leg, criteria); isTrustedCodeDeliverable(subject);';\n"], ...STANDBY_APPENDS];
-    if (policy) appends.push(...Object.entries(POLICY_SHARED));
+const files = { ...ACCEPTANCE_FILES, 'src/core.ts': '', 'src/contracts.ts': '', 'src/dispatcher/dispatcher.ts': 'export {};\n' };
+    const appends: Array<[string, string]> = [['src/core.ts', "export const ACCEPTANCE_CORE = 'mergeAcceptanceCriteria(leg, criteria); isTrustedCodeDeliverable(subject);';\n"]];
     mkdirSync(join(dir, 'schema'), { recursive: true });
     mkdirSync(join(dir, 'src', 'ops'), { recursive: true });
     for (const [path, body] of Object.entries(files)) writeFileSync(join(dir, path), body);
@@ -212,9 +168,6 @@ function runInstall(f: Fixture, extraEnv: Record<string, string> = {}, target = 
       PASEO: f.fakePaseo,
       SCK_SERVICE_HOME: f.serviceHome,
       SCK_OPS_REPO: f.opsRepo,
-      // The standby guard reads the target with the repository's TypeScript parser, so it needs a
-      // runtime that can load it; the fixture's pinned runtime is a stub (see fixture()).
-      STANDBY_RELAY_RUNTIME: process.execPath,
       FAKE_RELEASES_DIR: f.releases,
       FAKE_PASEO_LOG: f.paseoLog,
       FAKE_PASEO_MODE: 'normal',
@@ -244,7 +197,7 @@ function runSwitchGuard(script: string, entry: string, root: string, scope = 'fu
   return Bun.spawnSync(['sh', '-c', `. "${join(ROOT, 'scripts', script)}"; ${entry} "${root}" "${scope}"`], {
     // The standby guard reads the target with the repository's TypeScript parser, so it needs a
     // runtime that can load it; the fixture's own runtime is a stub (see fixture()).
-    env: { PATH: '/usr/bin:/bin', STANDBY_RELAY_RUNTIME: process.execPath },
+    env: { PATH: '/usr/bin:/bin' },
     stdout: 'pipe',
     stderr: 'pipe',
   });

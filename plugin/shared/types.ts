@@ -15,8 +15,10 @@ export interface TaskView {
   reviewerRole: Role | "owner";
   discipline?: string;
   kind: TaskKind;
-  goalId?: string;
-  dependencies: string[];
+  type?: string;
+  parent?: string;
+  proposedIn?: string;
+  tag?: string;
   version: number;
   submittedBy?: string;
   currentEmployee?: string;
@@ -28,7 +30,6 @@ export interface TaskView {
   /** Blocked rows: the role recorded by the original block. */
   resumeRole?: string;
   /** Blocked rows: why the task waits (see src/contracts.ts TaskWaiting). */
-  waiting?: { kind: "manager" | "owner" | "dependency"; resumeState: TaskState | "unknown"; role: string; dependenciesCount: number };
   previousEmployee?: string;
 }
 
@@ -167,9 +168,9 @@ export interface ReviewStaffingPoolView extends StaffingPoolView {
   status: "ready" | "blocked" | "history_unavailable";
 }
 
-/** The root blocker of one goal card: the verdict it names first, and the other blocked work behind the goal. */
-export interface GoalRootBlockerView {
-  goalId: string;
+/** The root blocker of one chain card: the verdict it names first, and the other blocked work behind the root. */
+export interface ChainRootBlockerView {
+  rootId: string;
   taskId: string;
   title: string;
   phase: "execute" | "review";
@@ -178,7 +179,7 @@ export interface GoalRootBlockerView {
   since?: string;
   waitingMinutes: number;
   others: number;
-  /** Blocked work of this goal, the root included: the 无法派工 count, shown apart from the normal waits (impact). */
+  /** Blocked work of this chain, the root included: the 无法派工 count, shown apart from the normal waits (impact). */
   undispatchable: number;
   /** The root's workflow state (ready, doing or review), its eligible-candidate count, and when its conclusion was checked. */
   workflowState: "ready" | "doing" | "review";
@@ -188,14 +189,14 @@ export interface GoalRootBlockerView {
   impact: number;
   dependencyPath: Array<{ taskId: string; title: string }>;
   /** People behind the root. `peopleOmitted` counts the names the row left out. */
-  people: { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number };
+  people: { executor?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number };
   reasons: DispatchReasonView[];
 }
 
 /** One dispatch-blocked conclusion from the latest tick, owner-facing. Same summary text as the notice for that episode. */
 export interface DispatchBlockedView {
   taskId: string;
-  goalId?: string;
+  tag?: string;
   title: string;
   phase: "execute" | "review";
   /** The task's workflow state (ready, doing or review). The row itself is the dispatch status: it is blocked. */

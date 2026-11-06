@@ -10,7 +10,7 @@ import { countingFetch, lastBody } from './support/mcp-wire.ts';
 const principal: Principal = { employeeId: 'ai-01', role: 'ai-content', capabilities: ['execute', 'review'] };
 const task: TaskView = {
   id: 'task-test', title: 'Adapter smoke', context: 'Synthetic task', state: 'ready',
-  executorRole: 'ai-content', reviewerRole: 'engineering', kind: 'task', dependencies: [], version: 1, fence: 0,
+  executorRole: 'ai-content', reviewerRole: 'engineering', kind: 'task', version: 1, fence: 0,
 };
 let active = true;
 let unavailable = false;
@@ -77,7 +77,6 @@ function worstClaim(): ClaimResult {
   return {
     task: {
       ...task, title: '甲'.repeat(200), context: '甲'.repeat(20_000), state: 'doing', currentEmployee: 'eng-01', deliveryId: 'delivery-claim',
-      dependencies: Array.from({ length: 200 }, (_, index) => `task-${String(index).padStart(4, '0')}-${'d'.repeat(120)}`),
       workIntent: { kind: 'assets', paths }, leaseExpiresAt: '2026-10-19T19:00:00.000Z', version: 4, fence: 3,
     },
     deliveryId: 'delivery-claim', fence: 3, leaseExpiresAt: '2026-10-19T19:00:00.000Z',

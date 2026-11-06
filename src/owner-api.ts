@@ -12,14 +12,13 @@ import { OutboundMessageStore } from './outbound-messages.ts';
 import { CompanyError } from './core-errors.ts';
 import { ROLES, type CreateTask, type Role } from './contracts.ts';
 import { HASH, REQUIRED_TRACKS } from './core.ts';
+import { getRoute, listRoutes, saveRoute, disableRoute } from './routes.ts';
 import { defaultAcceptanceCriteria } from './acceptance.ts';
 import { readTaskCost, recordTaskCost, COST_LIST_SQL } from './task-cost.ts';
 
 export type OwnerVia = string;
 export interface OwnerApiContext { db: CompanyDatabase; core: CompanyCore & {
-  ownerGoalPhaseSplit(via: string, input: { goalId: string; taskIds: string[]; title: string; reason: string; idempotencyKey: string }): Promise<unknown>;
   contributorDryRun(credential: string, input: { taskIds: string[] }): Promise<unknown>;
-  implementerTakeover(credential: string, input: { taskId: string; toEmployee: string; replacementReviewer?: string; expectedVersion: number; reason: string; idempotencyKey: string }): Promise<unknown>;
 }; owner: OwnerDesk; workforce: Workforce; messages: OutboundMessageStore; opsRepo: string; upgrades?: { inbox(): Promise<unknown>; setAuto(enabled: boolean, source: string): Promise<unknown>; start(input: { taskId: string; taskVersion: number; digest: string }, source: string): Promise<unknown> } }
 
 const actor = (via: string) => `owner:${via || 'web'}`;
@@ -45,14 +44,72 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
   };
   switch (command) {
     // ---- 任务 ----
+    case 'route.list': return { routes: await listRoutes(db) };
+    case 'route.save': {
+      const row = await saveRoute(db, {
+        type: text(input.type, 'type'), label: text(input.label, 'label'),
+        executor_role: text(input.executorRole, 'executorRole') as Role,
+        reviewer_role: text(input.reviewerRole, 'reviewerRole') as Role | 'owner',
+        code: input.code === true,
+        execute_body: optionalText(input.executeBody), review_body: optionalText(input.reviewBody),
+        next: optionalText(input.next), hold: input.hold === true, enabled: true,
+      }, 'owner');
+      return row;
+    }
+    case 'route.disable': {
+      await disableRoute(db, text(input.type, 'type'), 'owner');
+      return { disabled: text(input.type, 'type') };
+    }
+    case 'task.plan': {
+      // The whole chain around a task: walk up through parent to the root, then down breadth-first.
+      const taskId = text(input.taskId, 'taskId');
+      const seen = new Set<string>();
+      let cursor: string | undefined = taskId;
+      const chainIds: string[] = [];
+      while (cursor && !seen.has(cursor) && chainIds.length < 50) {
+        seen.add(cursor); chainIds.push(cursor);
+        const parentRows: Array<{ parent?: RecordId }> | undefined = (await db.query<[Array<{ parent?: RecordId }>]>('SELECT parent FROM $t;', { t: new RecordId('task', cursor) }))[0];
+        cursor = parentRows?.[0]?.parent ? String(parentRows[0].parent.id) : undefined;
+      }
+      const frontier = [...chainIds];
+      for (let i = 0; i < frontier.length && frontier.length < 200; i++) {
+        const [children] = await db.query<[Array<{ id: RecordId }>]>(
+          'SELECT id FROM task WHERE parent = $p;', { p: new RecordId('task', frontier[i]!) });
+        for (const c of children ?? []) { const cid = String(c.id.id); if (!seen.has(cid)) { seen.add(cid); frontier.push(cid); } }
+      }
+      const [tasks] = await db.query<[unknown[]]>('SELECT * FROM task WHERE id IN $ids ORDER BY created_at;', { ids: frontier.map(t => new RecordId('task', t)) });
+      const messages: Record<string, unknown> = {};
+      for (const tid of frontier) messages[tid] = await ctx.messages.list(tid);
+      return { tasks, messages };
+    }
     case 'task.create': {
+      const type = optionalText(input.type);
       const requirement = text(input.requirement, 'requirement');
+      const acceptanceText = input.acceptanceText ?? input.acceptance_text;
+      const ownerCred = ownerCredential();
+      if (type) {
+        const route = await getRoute(db, type);
+        if (!route?.enabled) throw new CompanyError('invalid', `route type ${type} is missing or disabled`);
+        const task = await ctx.core.createTask(ownerCred, {
+          title: text(input.title, 'title', 3), context: requirement,
+          executorRole: route.executor_role, reviewerRole: route.reviewer_role,
+          type, parent: optionalText(input.parent),
+          requirement, acceptanceText: acceptanceText === undefined ? undefined : text(acceptanceText, 'acceptanceText'),
+          project: optionalText(input.project), codeRepoPath: optionalText(input.codeRepoPath),
+          tag: optionalText(input.tag), hold: input.hold === true ? true : undefined,
+          kind: 'task',
+          workIntent: route.code ? { kind: 'code' as const } : undefined,
+          idempotencyKey: key(),
+        } as never);
+        const [planned] = await db.query<[unknown[]]>('SELECT * FROM task WHERE parent = $p AND state = $s;', { p: new RecordId('task', task.id), s: 'planned' });
+        return { task, planned: planned ?? [] };
+      }
+      const requirement2 = requirement;
       const acceptance = text(input.acceptanceText ?? input.acceptance_text, 'acceptanceText');
       const executor = text(input.executorRole, 'executorRole') as Role;
       const reviewer = text(input.reviewerRole, 'reviewerRole') as Role | 'owner';
       if (!ROLES.includes(executor)) throw new CompanyError('invalid', 'unknown executorRole');
       if (reviewer !== 'owner' && !ROLES.includes(reviewer)) throw new CompanyError('invalid', 'unknown reviewerRole');
-      const ownerCred = ownerCredential();
       const isEngineering = executor === 'engineering';
       const discipline = optionalText(input.discipline) ?? (isEngineering ? undefined : REQUIRED_TRACKS[executor]);
       const codeRepoPath = optionalText(input.codeRepoPath);
@@ -63,7 +120,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
         ? defaultAcceptanceCriteria('deploy')
         : input.acceptanceCriteria as CreateTask['acceptanceCriteria'] | undefined;
       const task = await ctx.core.createTask(ownerCred, {
-        title: text(input.title, 'title', 3), context: requirement,
+        title: text(input.title, 'title', 3), context: requirement2,
         executorRole: executor, reviewerRole: reviewer,
         project: optionalText(input.project),
         kind: 'task',
@@ -71,7 +128,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
         idempotencyKey: key(),
       } as never);
       await db.query('UPDATE ONLY $task SET requirement = $requirement, acceptance_text = $acceptance;',
-        { task: new RecordId('task', task.id), requirement, acceptance });
+        { task: new RecordId('task', task.id), requirement: requirement2, acceptance: acceptanceText });
       await ctx.messages.createTaskDrafts(task.id, executor, reviewer, isEngineering);
       return task;
     }

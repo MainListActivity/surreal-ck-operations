@@ -5,7 +5,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import type { Principal, RetirementKind, Role, TaskId, TaskKind } from './contracts.ts';
-import { managerActionKey } from './dispatcher/dispatch-blocked.ts';
+import { ownerActionKey } from './dispatcher/dispatch-blocked.ts';
 import { asId, CompanyError, HASH, id, ROLES, view, type TaskRow } from './core.ts';
 import { LocalEnrollmentAdmin, revokedCredentialDigest } from './enrollment.ts';
 import { collectEvalState, writeScorecards, type EvalState, type ScoredEmployee } from './scoring.ts';
@@ -98,13 +98,9 @@ export interface CompanyConfig {
   /** 配置了 Jev 时，用 noul 决定系统提醒是否弹桌面通知（否则只进收件箱）。 */
   jevNotifyTriage: boolean;
   /** 配置了 Jev 时，由 Jev 做目标分级、上线决定和老板升级路由；拿不准交回老板/运营。 */
-  jevDecisions: boolean;
   /** 上线申请：Jev「可以上线」概率达到该值且「触碰红线」概率不高于 1 - 该值时自动批准。 */
-  jevReleaseThreshold: number;
   /** 升级给老板的问题：Jev「必须老板决定」概率低于该值时改派给老板。 */
-  jevOwnerThreshold: number;
   /** 派工选择候选员工时采信 Jev 答案的最低置信度；低于则回退权重随机。 */
-  jevPickConfidence: number;
   /** 订阅剩余额度（任一额度窗口或余额）低于该百分比时视为不可用，停止复用与新开；0 = 不熔断。 */
   quotaFloorPct: number;
   quotaWeeklyFloorPct: number;
@@ -148,7 +144,7 @@ export const DEFAULT_CONFIG: CompanyConfig = {
   paused: false, maxRunning: 4, providerMax: { codex: 3, grok: 2, devin: 2 },
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
-  jevDecisions: true, jevReleaseThreshold: 0.8, jevOwnerThreshold: 0.3, jevPickConfidence: 0.5,
+
   quotaFloorPct: 8, quotaWeeklyFloorPct: 6, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxWakesByRole: {}, sessionMaxInputK: 200, sessionIdleMinutes: 120, evalQuickLlm: false, ownerBriefHour: 9, blockLoopLimit: 5,
   minFreeMemMb: 2048, minFreeDiskMb: 10240,
   artifactReclaimEnabled: true, artifactEvidenceGraceDays: 3, artifactDeliverableGraceDays: 7, artifactHeadroomMb: 10240,
@@ -191,8 +187,6 @@ export interface SupervisedTask {
   currentEmployee?: string;
   submittedBy?: string;
   previousEmployee?: string;
-  /** Recorded code implementer (legacy rows only; no new binding is written). */
-  implementer?: string;
   /** Open dispatch-blocked episode: the phase it blocks and when it began (unix seconds). */
   dispatchBlockedPhase?: string;
   dispatchBlockedSince?: number;
@@ -205,26 +199,9 @@ export interface SupervisedTask {
   resumeRole?: string;
   /** Unix seconds; set by a quota-caused block, owner is not re-announced before it. */
   quotaResetsAt?: number;
-  /** FV06 P0: unix seconds. A standby direct-assignment expires here: before it, the idle holder is woken and
-   * stall/expire reclaim is waived; past it the task returns to the owner gate instead of the ready pool. */
-  standbyUntil?: number;
-  /** SYS05: set while a typed wait owns the task. A waiting task takes no employee, lease or provider seat. */
-  waitState?: 'waiting';
-  waitKind?: string;
-  /** Unix milliseconds: the absolute instant the time condition becomes true. */
-  waitNotBefore?: number;
-  waitExpiresAt?: number;
-  waitNextCheckAt?: number;
-  waitOwnerRole?: string;
-  waitSource?: string;
-  waitKey?: string;
   kind: string;
   title: string;
-  /** Goal this task belongs to; dispatch-blocked conclusions carry it so goal cards can show the root blocker. */
-  goalId?: string;
   evalAttempts: number;
-  jevReleaseVersion?: number;
-  jevRouteVersion?: number;
   ownerRerouted: boolean;
   /**
    * Effective code repo for dispatch (home grouping, spawn cwd/repoHome): the task's explicit
@@ -234,9 +211,6 @@ export interface SupervisedTask {
   repoPath?: string;
   /** Explicit code-repo binding (code_repo_path); informational — repoPath already resolves it. */
   codeRepoPath?: string;
-  /** Tier of the goal this task belongs to (quick/standard/program); undefined for standalone tasks. */
-  goalTier?: string;
-  goalTitle?: string;
 }
 
 /** What Jev reads for a release or escalation decision. */
@@ -254,26 +228,16 @@ const supervised = (row: TaskRow): SupervisedTask => {
   return { row, id: v.id, state: v.state, version: v.version, executorRole: v.executorRole, reviewerRole: v.reviewerRole,
     discipline: v.discipline,
     currentEmployee: row.current_employee ?? undefined, submittedBy: row.submitted_by ?? undefined,
-    previousEmployee: row.previous_employee ?? undefined, implementer: row.implementer ?? undefined,
+    previousEmployee: row.previous_employee ?? undefined,
     dispatchBlockedPhase: row.dispatch_blocked_phase ?? undefined, dispatchBlockedSince: row.dispatch_blocked_since ?? undefined,
     leaseExpiresAt: row.lease_expires_at ?? undefined,
     progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined,
     resumeState: row.state === 'blocked' ? row.resume_state : undefined, resumeRole: row.state === 'blocked' ? row.resume_role : undefined,
     quotaResetsAt: row.quota_resets_at ?? undefined,
-    kind: v.kind, title: v.title, goalId: v.goalId,
-    ...(row.wait_state === 'waiting' ? {
-      waitState: 'waiting' as const,
-      ...(row.wait_kind === undefined || row.wait_kind === null ? {} : { waitKind: row.wait_kind }),
-      ...(row.wait_not_before === undefined || row.wait_not_before === null ? {} : { waitNotBefore: row.wait_not_before }),
-      ...(row.wait_expires_at === undefined || row.wait_expires_at === null ? {} : { waitExpiresAt: row.wait_expires_at }),
-      ...(row.wait_next_check_at === undefined || row.wait_next_check_at === null ? {} : { waitNextCheckAt: row.wait_next_check_at }),
-      ...(row.wait_owner_role === undefined || row.wait_owner_role === null ? {} : { waitOwnerRole: row.wait_owner_role }),
-      ...(row.wait_source === undefined || row.wait_source === null ? {} : { waitSource: row.wait_source }),
-      ...(row.wait_episode === undefined || row.wait_episode === null ? {} : { waitKey: row.wait_episode }),
-    } : {}),
-    evalAttempts: row.eval_attempts ?? 0, jevReleaseVersion: row.jev_release_version ?? undefined,
-    jevRouteVersion: row.jev_route_version ?? undefined, ownerRerouted: row.owner_rerouted === true, repoPath: row.repo_path ?? undefined,
-    codeRepoPath: row.code_repo_path ?? undefined, goalTier: row.goal_tier ?? undefined, goalTitle: row.goal_title ?? undefined };
+    kind: v.kind, title: v.title,
+    evalAttempts: row.eval_attempts ?? 0,
+    ownerRerouted: row.owner_rerouted === true, repoPath: row.repo_path ?? undefined,
+    codeRepoPath: row.code_repo_path ?? undefined };
 };
 
 const COOLDOWN_BASE = 30 * 60;
@@ -281,40 +245,20 @@ const COOLDOWN_MAX = 6 * 60 * 60;
 export const capabilitiesFor = (role: Role): Principal['capabilities'] =>
   role === 'eval' ? [] : role === 'owner' || role === 'gm' || role === 'product' ? ['execute', 'review', 'manage'] : ['execute', 'review'];
 
-/** One manager todo to persist: task + phase + episode + reason identify it; the action is what the manager can do. */
-export interface ManagerActionInput {
-  taskId: string;
-  phase: 'execute' | 'review';
-  episode: number;
-  reason: string;
-  action: 'implementer_takeover';
-  version: number;
-  repo: string;
-  implementer?: string;
-}
-
-export interface ManagerActionRow extends ManagerActionInput {
-  key: string;
-  status: 'open' | 'closed';
-  createdAt?: string;
-  closedAt?: string;
-  resolution?: string;
-}
-
-/** One manager-wake attempt. It lives in the same schemaless dispatch table, keyed by task+phase+episode. */
+/** One pending-wake attempt. It lives in the same schemaless dispatch table, keyed by task+phase+episode. */
 export type ManagerWakeState = 'pending' | 'running' | 'finished' | 'unknown';
 
-export interface ManagerWakeInput {
+export interface PendingWakeInput {
   taskId: string;
   phase: 'execute' | 'review';
-  /** Episode start in milliseconds (the same value managerActionKey carries). */
+  /** Episode start in milliseconds (the same value ownerActionKey carries). */
   episode: number;
   reason: string;
   version: number;
   repo: string;
 }
 
-export interface ManagerWakeRow extends ManagerWakeInput {
+export interface PendingWakeRow extends PendingWakeInput {
   key: string;
   purpose: 'gm-manager-wake';
   state: ManagerWakeState;
@@ -332,11 +276,11 @@ export interface ManagerWakeRow extends ManagerWakeInput {
 }
 
 /** The CAS token a dispatcher must present for every later write to this attempt. */
-export interface ManagerWakeClaim {
+export interface PendingWakeClaim {
   key: string;
   token: string;
   attempt: number;
-  input: ManagerWakeInput;
+  input: PendingWakeInput;
 }
 
 /** Logical in-flight unit: task + phase + episode. Reason/version are fields, not part of the key. */
@@ -395,10 +339,6 @@ export class Workforce {
       jevMinConfidence: typeof row?.jev_min_confidence === 'number' ? row.jev_min_confidence : 0.7,
       jevFlagThreshold: typeof row?.jev_flag_threshold === 'number' ? row.jev_flag_threshold : 0.65,
       jevNotifyTriage: row?.jev_notify_triage !== false,
-      jevDecisions: row?.jev_decisions !== false,
-      jevReleaseThreshold: typeof row?.jev_release_threshold === 'number' ? row.jev_release_threshold : 0.8,
-      jevOwnerThreshold: typeof row?.jev_owner_threshold === 'number' ? row.jev_owner_threshold : 0.3,
-      jevPickConfidence: typeof row?.jev_pick_confidence === 'number' ? row.jev_pick_confidence : 0.5,
       quotaFloorPct: typeof row?.quota_floor_pct === 'number' ? row.quota_floor_pct : 8,
       quotaWeeklyFloorPct: typeof row?.quota_weekly_floor_pct === 'number' ? row.quota_weekly_floor_pct : DEFAULT_CONFIG.quotaWeeklyFloorPct,
       quotaWarnPct: typeof row?.quota_warn_pct === 'number' ? row.quota_warn_pct : DEFAULT_CONFIG.quotaWarnPct,
@@ -549,7 +489,7 @@ export class Workforce {
         LET $observed = SELECT * FROM ONLY $employee;
         IF ($observed.idle_since ?? NONE) != $idle_since OR ($observed.last_wake_at ?? NONE) != $last_wake OR $observed.paseo_agent_id != $agent { THROW 'idle retirement moved' };
         LET $wakes = SELECT VALUE id FROM dispatch WHERE purpose = 'gm-manager-wake' AND state IN ['pending', 'running', 'unknown'] AND (employee = $key OR agent = $agent);
-        IF array::len($wakes) > 0 { THROW 'idle retirement protected by manager wake' };
+        IF array::len($wakes) > 0 { THROW 'idle retirement protected by pending wake' };
       };
       UPDATE $employee SET retired_kind = IF retired = true THEN retired_kind ELSE $kind END,
         retired = true, retired_reason = $reason, retired_at = time::now(), revoked = true, credential_digest = $digest;`,
@@ -691,7 +631,7 @@ export class Workforce {
   }
 
   /**
-   * Author/handler history for review recusal: `excluded` = prior submitters + recorded implementer (hard recused),
+   * Author/handler history for review exclusion: `excluded` = prior submitters (hard rule),
    * `hands` = execute claimants that never submitted (demoted weight, still eligible).
    */
   async contributors(taskId: TaskId): Promise<{ excluded: string[]; hands: string[]; checkedAt?: string }> {
@@ -700,9 +640,6 @@ export class Workforce {
       { task: id('task', taskId) });
     const excluded = new Set<string>();
     const hands = new Set<string>();
-    const [task] = await this.db.query<[{ implementer?: string }?]>(
-      'SELECT implementer FROM ONLY $task;', { task: id('task', taskId) });
-    if (task?.implementer) excluded.add(task.implementer);
     for (const row of rows ?? []) {
       const actor = typeof row.actor === 'string' ? row.actor : row.actor ? String(row.actor.id) : '';
       if (!actor) continue;
@@ -784,8 +721,6 @@ export class Workforce {
       LET $next = UPDATE ONLY $task SET
         state = IF $t.state = 'doing' THEN 'ready' ELSE $t.state END,
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
-        // FV06：收回即待命阶段结束，旧标记不得管辖下一位持有人的租约。
-        standby_until = NONE,
         handover = true, previous_employee = $employee, version = $t.version + 1 RETURN AFTER;
       UPDATE employee SET active_task = NONE WHERE active_task = $task;
       CREATE audit CONTENT { task: $task, actor: $actor, action: 'revoked', evidence: $evidence, version: $next.version, at: time::now() };
@@ -840,7 +775,7 @@ export class Workforce {
   /**
    * SYS04 AC04: the fault episodes of the given tasks, newest first per task.
    *
-   * The dispatcher reads this before it wakes a manager, so a cause that is already on the manager's desk (or
+   * The dispatcher reads this before it wakes anyone, so a cause that is already on the owner's desk (or
    * whose budget is spent) does not produce a second wake. The read is a single query: an unreadable ledger is
    * reported as undefined, and the caller then fails closed for the pass.
    */
@@ -891,15 +826,15 @@ export class Workforce {
 
 
 
-  // ---- manager wake ownership (MR02) ----
-  // The manager action row is the todo. A separate dispatch row is the in-flight attempt, keyed by
+  // ---- pending wake ownership (MR02) ----
+  // The owner-action row is the todo. A separate dispatch row is the in-flight attempt, keyed by
   // task+phase+episode, so a reason/version change never starts a second wake while the first 老板 is
   // still processing. Every transition is CAS'd by token+attempt; old callbacks cannot release a new claim.
   private managerWakeId(taskId: string, phase: string, episode: number) {
     return id('dispatch', HASH(`gm-manager-wake\0${taskId}\0${phase}\0${episode}`).slice(0, 24));
   }
 
-  private wakeRow(row: WakeDbRow): ManagerWakeRow {
+  private wakeRow(row: WakeDbRow): PendingWakeRow {
     const phase = row.phase === 'review' ? 'review' : 'execute';
     const episode = row.episode ?? 0;
     return {
@@ -915,7 +850,7 @@ export class Workforce {
   }
 
   /** The CAS token for a row read from the database. */
-  wakeClaim(row: ManagerWakeRow): ManagerWakeClaim {
+  wakeClaim(row: PendingWakeRow): PendingWakeClaim {
     return { key: row.key, token: row.token, attempt: row.attempt, input: {
       taskId: row.taskId, phase: row.phase, episode: row.episode, reason: row.reason, version: row.version, repo: row.repo,
     } };
@@ -926,7 +861,7 @@ export class Workforce {
    * row starts the next attempt; pending/running/unknown rows refuse. The write is a single CAS
    * transaction, so concurrent dispatchers and restarts can only produce one winner.
    */
-  async acquireManagerWake(input: ManagerWakeInput, token: string = randomUUID()): Promise<ManagerWakeClaim | undefined> {
+  async acquirePendingWake(input: PendingWakeInput, token: string = randomUUID()): Promise<PendingWakeClaim | undefined> {
     const key = managerWakeKey(input.taskId, input.phase, input.episode);
     const d = this.managerWakeId(input.taskId, input.phase, input.episode);
     const evidence = JSON.stringify({ ...input, key, token, attempt: 1 });
@@ -970,7 +905,7 @@ export class Workforce {
   }
 
   /** Mark the attempt as externally started / running and bind the 老板 employee and (when known) Paseo agent. */
-  async markManagerWakeRunning(claim: ManagerWakeClaim, employee: string, agent?: string): Promise<boolean> {
+  async markPendingWakeRunning(claim: PendingWakeClaim, employee: string, agent?: string): Promise<boolean> {
     const d = this.managerWakeId(claim.input.taskId, claim.input.phase, claim.input.episode);
     const updated = await this.runTxResult<WakeDbRow>(`BEGIN;
       LET $worker = SELECT * FROM ONLY $employee_record;
@@ -981,7 +916,7 @@ export class Workforce {
         WHERE ($worker.runtime_sleep_until ?? 0) <= time::unix(time::now()) AND token = $wake_token AND attempt = $attempt AND state IN ['pending', 'running', 'unknown'] RETURN AFTER;
       IF $updated != NONE {
         LET $seat = SELECT * FROM ONLY $employee_record;
-        IF $seat != NONE AND ($seat.revoked = true OR $seat.retired = true) { THROW 'manager employee retired' };
+        IF $seat != NONE AND ($seat.revoked = true OR $seat.retired = true) { THROW 'wake employee retired' };
         IF $seat != NONE { UPDATE $employee_record SET idle_since = NONE; };
       };
       IF $updated != NONE AND ($old.state ?? '') != 'running' {
@@ -996,7 +931,7 @@ export class Workforce {
   }
 
   /** CAS the attempt to finished (retryable) or unknown (fail closed, never re-woken as if idle). */
-  async finishManagerWake(claim: ManagerWakeClaim, state: 'finished' | 'unknown', resolution: string, lastStatus?: string): Promise<boolean> {
+  async finishManagerWake(claim: PendingWakeClaim, state: 'finished' | 'unknown', resolution: string, lastStatus?: string): Promise<boolean> {
     const d = this.managerWakeId(claim.input.taskId, claim.input.phase, claim.input.episode);
     const action = state === 'unknown' ? 'manager_wake_unknown' : 'manager_wake_finished';
     const repeatGuard = state === 'unknown' ? " AND (state != 'unknown' OR last_status != $last_status)" : '';
@@ -1016,7 +951,7 @@ export class Workforce {
   }
 
   /** Active attempts restored after a restart. */
-  async openManagerWakes(): Promise<ManagerWakeRow[]> {
+  async openPendingWakes(): Promise<PendingWakeRow[]> {
     const [rows] = await this.db.query<[WakeDbRow[]]>(
       `SELECT * FROM dispatch WHERE purpose = 'gm-manager-wake' AND state IN ['pending', 'running', 'unknown'] ORDER BY started_at;`);
     return (rows ?? []).map(row => this.wakeRow(row));
@@ -1040,7 +975,7 @@ export class Workforce {
     const failures = responses.filter(response => !response.success);
     if (failures.length) {
       const cause = failures.map(response => response.error.message).find(message =>
-        !message.includes('not executed due to') && !message.startsWith('Cannot COMMIT')) ?? 'manager wake transaction failed';
+        !message.includes('not executed due to') && !message.startsWith('Cannot COMMIT')) ?? 'pending wake transaction failed';
       throw new Error(cause);
     }
     return responses.map(response => response.success ? response.result : undefined).at(-2) as T | undefined;

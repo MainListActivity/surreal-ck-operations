@@ -83,7 +83,7 @@ async function files(task: string, type: 'reviewed-service'|'development-disable
     ? {...base,schemaVersion:2,serviceApproved:true,planName:'SenseNova Token Plan 公测档',planSourceUrl:'https://www.sensenova.cn/token-plan',quotaUnit:'points',quotaAmount:100_000,quotaWindowSeconds:18_000,quotaRemaining:90_000,accountPlanType:TOKEN_PLAN_PLAN_TYPE_FREE}
     : type === 'reviewed-token-plan-v3'
       ? {...base,type:'reviewed-token-plan',schemaVersion:3,evidenceClass:'promotional-account-bound',serviceApproved:true,planName:'SenseNova Token Plan Free · 公测 · 限时账号绑定',planSourceUrl:'https://www.sensenova.cn/token-plan',
-          planSource:{url:'https://www.sensenova.cn/token-plan',fetchedAt:new Date(clock-1000).toISOString(),httpDate:new Date(clock-1000).toISOString(),clockSkewMs:0,status:200,etag:'"fork-v3"',rawSha256:sha256('raw')},
+          planSource:{url:'https://www.sensenova.cn/token-plan',fetchedAt:new Date(clock-1000).toISOString(),httpDate:new Date(clock-1000).toISOString(),clockSkewMs:0,status:200,eetag:'"fork-v3"',rawSha256:sha256('raw')},
           normalization:{algorithm:'html-text-flat/1',flatSha256:sha256('flat'),flatChars:4},
           accountPlanType:TOKEN_PLAN_PLAN_TYPE_FREE,accountBound:true,accountBoundSource:'console-pool-usage-cross-bound-to-sealed-api-key',
           quotaUnit:'points',quotaAmount:60_000,quotaWindowSeconds:18_000,quotaRemaining:90_000,quotaSource:'account-bound-observation',
@@ -139,21 +139,21 @@ beforeAll(async () => {
   const owner=world.user('sck-lca04-removable')!, member=world.user('sck-lca04-member')!;
   world.workspaces.set('sck-ui01',{slug:'sck-ui01',name:'synthetic',dbName:'ws_ui01',members:[{id:'owner',email:owner.email,displayName:'owner',subject:owner.id,isAdmin:true,disabled:false},{id:'member',email:member.email,displayName:'member',subject:member.id,isAdmin:false,disabled:false}]});
   broker();
-  const approval=await core.createTask(gm,{title:'Synthetic service evidence approval',context:'Only test fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
+  const approval=await core.createTask(gm,{title:'Synthetic service evidence approval',context:'Only test fixtures',executorRole:'engineering',reviewerRole:'qa',tag:PROOF_GOAL,idempotencyKey:randomUUID()});
   approvalTask=approval.id; const claim=await core.claim(author,approval.id);
   ({manifestPath,documentPath,manifest}=await files(approval.id));
   const prepared=await ops.call(author,approval.id,'ops_internal_ai_prepare',{manifestPath,documentPath}) as {approvalMarker:string};
   await core.submit(author,{taskId:approval.id,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version},{text:'Synthetic reviewed files',idempotencyKey:randomUUID()});
   const review=await core.claim(reviewer,approval.id);
   await core.accept(reviewer,{taskId:approval.id,deliveryId:review.deliveryId,fence:review.fence,expectedVersion:review.task.version},{text:prepared.approvalMarker,idempotencyKey:randomUUID()});
-  const task=await core.createTask(gm,{title:'Synthetic consuming task',context:'Only test fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
+  const task=await core.createTask(gm,{title:'Synthetic consuming task',context:'Only test fixtures',executorRole:'engineering',reviewerRole:'qa',tag:PROOF_GOAL,idempotencyKey:randomUUID()});
   consumerTask=task.id; await core.claim(consumer,task.id);
   trusted=await request('ops_internal_ai_trust') as ReturnType<ProofSigner['trust']>;
 },20_000);
 afterAll(async()=>{if(enabled){await stop();world.sqlite.close();await rm(dir,{recursive:true,force:true});}});
 check('actual versioned SenseNova disabled files prepare an immutable candidate across fork restart without identity or model calls', async () => {
   const preparer = await new LocalEnrollmentAdmin(database).enroll('test-disabled-preparer', 'engineering', ['execute', 'review']);
-  const task = await core.createTask(gm, { title: 'Synthetic disabled SenseNova preparation', context: 'No supplier evidence or paid calls', executorRole: 'engineering', reviewerRole: 'qa', goalId: PROOF_GOAL, idempotencyKey: randomUUID() });
+  const task = await core.createTask(gm, { title: 'Synthetic disabled SenseNova preparation', context: 'No supplier evidence or paid calls', executorRole: 'engineering', reviewerRole: 'qa', tag: PROOF_GOAL, idempotencyKey: randomUUID() });
   await core.claim(preparer, task.id);
   const fixture = disabledSenseNovaFixture();
   const root = join(dir, 'evidence', task.id); await mkdir(root, { recursive: true });
@@ -207,11 +207,11 @@ check('diagnosis is referenced, scoped, read-only, content-versioned and never s
   // Caller identity/role cannot be supplied by the request.
   await expect(request('ops_internal_ai_approval_diagnose',{...diagnoseArgs(),role:'engineering',sql:'SELECT * FROM employee'})).rejects.toBeDefined();
   const product = await new LocalEnrollmentAdmin(database).enroll('test-diagnosis-product','product',['execute','review']);
-  const task = await core.createTask(gm,{title:'Synthetic product caller',context:'Only test fixtures',executorRole:'product',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
+  const task = await core.createTask(gm,{title:'Synthetic product caller',context:'Only test fixtures',executorRole:'product',reviewerRole:'qa',tag:PROOF_GOAL,idempotencyKey:randomUUID()});
   await core.claim(product,task.id);
   expect(await bridge.call(await core.opsScope(product,task.id),'production','ops_internal_ai_approval_diagnose',diagnoseArgs())).toEqual({outcome:'denied',failure:'scope-denied'});
   expect(await request('ops_internal_ai_approval_diagnose',{...diagnoseArgs(),approvalTask:'missing-task'})).toEqual({outcome:'denied',failure:'scope-denied'});
-  const unreferenced = await core.createTask(gm,{title:'Synthetic unreferenced approval',context:approvalTask,executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
+  const unreferenced = await core.createTask(gm,{title:'Synthetic unreferenced approval',context:approvalTask,executorRole:'engineering',reviewerRole:'qa',tag:PROOF_GOAL,idempotencyKey:randomUUID()});
   expect(await request('ops_internal_ai_approval_diagnose',{...diagnoseArgs(),approvalTask:unreferenced.id})).toEqual({outcome:'denied',failure:'scope-denied'});
 });
 check('cross-goal, cross-project, no lease and unreferenced callers fail closed before diagnosis', async () => {
@@ -469,7 +469,7 @@ check('deliver resolves identities outside the freshness window; a >60s IdP pass
   } finally { identityDelayMs=0; clock=clock0; delivered=delivered0; }
 });
 check('reviewed-token-plan quota evidence signs approved-service; quota, schema and USD-balance violations reject',async()=>{
-  const task=await core.createTask(gm,{title:'Synthetic token-plan approval',context:'Only isolated fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
+  const task=await core.createTask(gm,{title:'Synthetic token-plan approval',context:'Only isolated fixtures',executorRole:'engineering',reviewerRole:'qa',tag:PROOF_GOAL,idempotencyKey:randomUUID()});
   const claim=await core.claim(author,task.id);
   const f=await files(task.id,'reviewed-token-plan');
   const prepared=await ops.call(author,task.id,'ops_internal_ai_prepare',{manifestPath:f.manifestPath,documentPath:f.documentPath}) as {approvalMarker:string};
@@ -524,7 +524,7 @@ check('reviewed-token-plan quota evidence signs approved-service; quota, schema 
   await files(task.id,'reviewed-token-plan');
 });
 check('reviewed-token-plan v3 promotional/account-bound evidence signs approved-service; contract gaps reject at prepare',async()=>{
-  const task=await core.createTask(gm,{title:'Synthetic token-plan v3 approval',context:'Only isolated fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
+  const task=await core.createTask(gm,{title:'Synthetic token-plan v3 approval',context:'Only isolated fixtures',executorRole:'engineering',reviewerRole:'qa',tag:PROOF_GOAL,idempotencyKey:randomUUID()});
   const claim=await core.claim(author,task.id);
   const f=await files(task.id,'reviewed-token-plan-v3');
   const prepared=await ops.call(author,task.id,'ops_internal_ai_prepare',{manifestPath:f.manifestPath,documentPath:f.documentPath}) as {approvalMarker:string;documentHash:string};
@@ -559,13 +559,13 @@ check('reviewed-token-plan v3 promotional/account-bound evidence signs approved-
 });
 check('a v2 Magpie manifest and v4 route evidence prepare, are independently approved, prove and open a window; old v3 and cross-contract pairs reject',async()=>{
   world.clock=clock; // the fake gateway and the broker share the same capture clock
-  const approval=await core.createTask(gm,{title:'Synthetic Magpie v4 approval',context:'Only isolated fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
+  const approval=await core.createTask(gm,{title:'Synthetic Magpie v4 approval',context:'Only isolated fixtures',executorRole:'engineering',reviewerRole:'qa',tag:PROOF_GOAL,idempotencyKey:randomUUID()});
   const claim=await core.claim(author,approval.id);
   // A fresh consumer employee and task keep this regression independent of the earlier
   // deliberate-failure tests: the SYS04 fault budget is scoped to each task id, and one employee
   // can only hold one lease.
   const prover=await new LocalEnrollmentAdmin(database).enroll('test-magpie-consumer','engineering',['execute','review']);
-  const proofTask=await core.createTask(gm,{title:'Synthetic Magpie v4 consumer',context:'Only isolated fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
+  const proofTask=await core.createTask(gm,{title:'Synthetic Magpie v4 consumer',context:'Only isolated fixtures',executorRole:'engineering',reviewerRole:'qa',tag:PROOF_GOAL,idempotencyKey:randomUUID()});
   await core.claim(prover,proofTask.id);
   const proofRoot=join(dir,'evidence',proofTask.id);
   // The real sampler reads the fake loopback gateway and the sealed supplier identity; it writes
@@ -697,7 +697,7 @@ check('restart preserves pinned sealed key, approved proof, revocation and task-
 check('key rotation requires explicit independently accepted scope and invalidates old proofs',async()=>{
   await expect(request('ops_internal_ai_rotate_key',{approvalTask,expectedKid:trusted.kid})).rejects.toBeDefined();
   const oldClaims=verifyCompanyProof(delivered!,trusted,'proof',clock);
-  const task=await core.createTask(gm,{title:'Synthetic key rotation approval',context:'Only isolated fixture',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
+  const task=await core.createTask(gm,{title:'Synthetic key rotation approval',context:'Only isolated fixture',executorRole:'engineering',reviewerRole:'qa',tag:PROOF_GOAL,idempotencyKey:randomUUID()});
   const claim=await core.claim(author,task.id);
   await core.submit(author,{taskId:task.id,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version},{text:'Rotate isolated test key',idempotencyKey:randomUUID()});
   const review=await core.claim(reviewer,task.id);
@@ -724,14 +724,14 @@ async function lifecycleApproval(label: string) {
   const author = await enroll.enroll(authorId, 'engineering', ['execute', 'review']);
   const reviewer = await enroll.enroll(reviewerId, 'qa', ['execute', 'review']);
   const consumer = await enroll.enroll(consumerId, 'engineering', ['execute', 'review']);
-  const approval = await core.createTask(gm, {title:`Synthetic lifecycle ${label}`, context:'Only test fixtures', executorRole:'engineering', reviewerRole:'qa', goalId:PROOF_GOAL, idempotencyKey:randomUUID()});
+  const approval = await core.createTask(gm, {title:`Synthetic lifecycle ${label}`, context:'Only test fixtures', executorRole:'engineering', reviewerRole:'qa', tag:PROOF_GOAL, idempotencyKey:randomUUID()});
   const claim = await core.claim(author, approval.id);
   const f = await files(approval.id);
   const prepared = await ops.call(author, approval.id, 'ops_internal_ai_prepare', {manifestPath:f.manifestPath, documentPath:f.documentPath}) as {approvalMarker:string};
   await core.submit(author, {taskId:approval.id, deliveryId:claim.deliveryId, fence:claim.fence, expectedVersion:claim.task.version}, {text:'Synthetic reviewed files', idempotencyKey:randomUUID()});
   const review = await core.claim(reviewer, approval.id);
   await core.accept(reviewer, {taskId:approval.id, deliveryId:review.deliveryId, fence:review.fence, expectedVersion:review.task.version}, {text:prepared.approvalMarker, idempotencyKey:randomUUID()});
-  const consuming = await core.createTask(gm, {title:`Synthetic lifecycle consumer ${label}`, context:'Only test fixtures', executorRole:'engineering', reviewerRole:'qa', goalId:PROOF_GOAL, idempotencyKey:randomUUID()});
+  const consuming = await core.createTask(gm, {title:`Synthetic lifecycle consumer ${label}`, context:'Only test fixtures', executorRole:'engineering', reviewerRole:'qa', tag:PROOF_GOAL, idempotencyKey:randomUUID()});
   await core.claim(consumer, consuming.id);
   return {approval: approval.id, consuming: consuming.id, authorId, reviewerId, consumerId, consumer, files: f};
 }
@@ -818,7 +818,7 @@ check('FV06 key rotation approval shares the reviewer lifecycle: normal retireme
   const enroll = new LocalEnrollmentAdmin(database);
   const author = await enroll.enroll('lc-keyrot-author', 'engineering', ['execute', 'review']);
   const reviewer = await enroll.enroll('lc-keyrot-reviewer', 'qa', ['execute', 'review']);
-  const task = await core.createTask(gm, {title:'Synthetic lifecycle key rotation', context:'Only isolated fixture', executorRole:'engineering', reviewerRole:'qa', goalId:PROOF_GOAL, idempotencyKey:randomUUID()});
+  const task = await core.createTask(gm, {title:'Synthetic lifecycle key rotation', context:'Only isolated fixture', executorRole:'engineering', reviewerRole:'qa', tag:PROOF_GOAL, idempotencyKey:randomUUID()});
   const claim = await core.claim(author, task.id);
   await core.submit(author, {taskId:task.id, deliveryId:claim.deliveryId, fence:claim.fence, expectedVersion:claim.task.version}, {text:'Rotate isolated test key', idempotencyKey:randomUUID()});
   const review = await core.claim(reviewer, task.id);

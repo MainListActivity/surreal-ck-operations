@@ -5,7 +5,7 @@ export class CompanyError extends Error {
       'not_configured' | 'payment_approval_required' | 'upstream_error' | 'login_failed' | 'limit_reached' | 'response_too_large' | 'snapshot_gone' | 'retire_refused',
     message: string,
     readonly retryable = false,
-    /** Structured facts a caller can act on: the retirement gate's reasons and legal actions, independence conflicts
+    /** Structured facts a caller can act on: the retirement gate's reasons and legal actions
      * (task, source, employee). Never credentials. */
     readonly details?: unknown,
   ) {

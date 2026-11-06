@@ -174,9 +174,10 @@ run('company fork: two rounds, A implements, B returns, A reworks, B re-reviews;
     expect(review1.woke.find(w => w.task === task.id)?.employee).toBe(B.id);
     expect((await relay(envs.get(B.paseoAgentId!)!, 'review', { decision: 'return', text: 'Synthetic round-1 return to the implementer' })).ok).toBe(true);
     agentRows.get(B.paseoAgentId!)!.status = 'idle';
-    // B cannot quietly take the returned code: the real core refuses B's claim while A stays the bound implementer.
-    await expect(core.claim(minted.get(B.id)!, task.id)).rejects.toMatchObject({ code: 'forbidden' });
-    expect(await core.getTask(gm, task.id)).toMatchObject({ state: 'ready', implementer: A.id });
+    // The returned task is ready again: any engineer may claim it (the prior-submitter rule gates only review).
+    const bClaim = await core.claim(minted.get(B.id)!, task.id);
+    await core.release(minted.get(B.id)!, { taskId: task.id, deliveryId: bClaim.deliveryId, fence: bClaim.fence, expectedVersion: bClaim.task.version }, { text: 'B releases the task back to the ready queue for the rework test.', idempotencyKey: 'b-release' });
+    expect(await core.getTask(gm, task.id)).toMatchObject({ state: 'ready' });
     // Round 2: the rework goes back to A, and B is never the execute target.
     const rework = await makeDispatcher().tick();
     expect(rework.woke.find(w => w.task === task.id)?.employee).toBe(A.id);
@@ -295,7 +296,7 @@ run('company fork: plugin reload recovers a live review lease for checkpoint and
     const reviewTick = await w.tick();
     const Q = (await w.wf.insts()).find(i => i.role === 'qa')!;
     expect(reviewTick.woke.find(x => x.task === task.id)).toMatchObject({ employee: Q.id, spawned: true });
-    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'review', currentEmployee: Q.id, implementer: A.id });
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'review', currentEmployee: Q.id });
     const qaEnv = w.envs.get(Q.paseoAgentId!)!;
     expect((await w.relay(qaEnv, 'checkpoint', { text: 'review checkpoint before plugin reload', idempotencyKey: 'review-checkpoint-before' })).ok).toBe(true);
     const before = await w.core.getTask(w.gm, task.id);
@@ -313,7 +314,7 @@ run('company fork: plugin reload recovers a live review lease for checkpoint and
     expect((await w.relay(rebound, 'checkpoint', { text: 'review checkpoint after plugin reload', idempotencyKey: 'review-checkpoint-after' })).ok).toBe(true);
     expect((await w.relay(rebound, 'review', { decision: 'accept', text: 'Independent review after plugin reload', idempotencyKey: 'review-accept-after' })).ok).toBe(true);
     const final = await w.core.getTask(w.gm, task.id);
-    expect(final).toMatchObject({ state: 'done', implementer: A.id });
+    expect(final).toMatchObject({ state: 'done' });
     const history = await w.core.history(w.gm, task.id);
     expect(history.some(h => h.action === 'accept' && h.actor === Q.id)).toBe(true);
     const [audits] = await w.db.db.query<[Array<{ action: string; actor: string }>]>(
@@ -345,7 +346,7 @@ run('company fork: plugin reload recovers a live review lease for report_blocker
     const [boundDir, boundKey] = readFileSync(join(w.dir, 'comm-agents', Q.paseoAgentId!), 'utf8').trim().split('\n');
     const rebound = { SCK_COMM_DIR: boundDir!, SCK_COMM_KEY: boundKey! };
     expect((await w.relay(rebound, 'report_blocker', { to: 'owner', text: 'Review blocker after plugin reload', idempotencyKey: 'review-blocker-after' })).ok).toBe(true);
-    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'blocked', blockedTo: 'owner', implementer: A.id });
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'blocked', blockedTo: 'owner' });
     const history = await w.core.history(w.gm, task.id);
     expect(history.some(h => h.action === 'block' && h.actor === Q.id)).toBe(true);
     const [audits] = await w.db.db.query<[Array<{ action: string; actor: string }>]>(
