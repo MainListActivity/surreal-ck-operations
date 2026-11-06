@@ -3,10 +3,12 @@ import { mkdtempSync, readFileSync, rmSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ensureOwnerToken } from '../src/owner-token.ts';
-import { OutboundMessageStore, templateFor } from '../src/outbound-messages.ts';
+import { OutboundMessageStore, renderMessage, templateFor, type OutboundMessage } from '../src/outbound-messages.ts';
 import { taskBrief } from '../src/dispatcher/brief.ts';
 import { wake } from '../src/dispatcher/prompts.ts';
 import { goalTemplate } from '../src/flows.ts';
+import { scrubEnv } from '../plugin/server/scrub.ts';
+import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 
 const env = { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' };
 const recordId = (id: string) => ({ id, tb: 'task', toString: () => `task:${id}` });
@@ -63,9 +65,77 @@ test('minimal dispatch message: only what, where, how; no onboarding on first co
 test('template bodies are the exact minimal sentences', () => {
   expect(templateFor('execute', true)).toContain('合入并发布到生产');
   expect(templateFor('execute', false)).not.toContain('合入并发布');
-  expect(templateFor('review')).toContain('call review');
+  // 复核按工作种类分模板：软件线要求在生产逐条复验，内容线只说逐条复验。
+  expect(templateFor('review', true)).toContain('在生产逐条复验');
+  expect(templateFor('review', false)).not.toContain('在生产');
+  expect(templateFor('review', true)).toContain('call review');
+  expect(templateFor('review', false)).toContain('call review');
   expect(templateFor('rework')).toContain('findings/round-NN.md');
-  expect(templateFor('eval')).toContain('task.md');
+  expect(templateFor('eval')).toContain('agents/eval.md');
+});
+
+test('renderMessage names the task machine criterion and falls back to the deploy baseline', () => {
+  const opts = { sckBin: '/bin/sck', commDir: '/c', taskId: 't1' };
+  const body = templateFor('execute', true);
+  expect(body).toContain('"acId":"{acId}"');
+  const named = renderMessage(body, { ...opts, acId: 'AC-BASE-DEPLOY-1' });
+  expect(named).toContain('"acId":"AC-BASE-DEPLOY-1"');
+  expect(named).not.toContain('{acId}');
+  // A custom criterion id is what the employee is told to record.
+  expect(renderMessage(body, { ...opts, acId: 'AC-9' })).toContain('"acId":"AC-9"');
+  // No criteria on the row: the baseline id stays usable, never a literal placeholder.
+  const fallback = renderMessage(body, opts);
+  expect(fallback).toContain('"acId":"AC-BASE-DEPLOY-1"');
+  expect(fallback).not.toContain('{acId}');
+  // Rework carries the same placeholder.
+  expect(renderMessage(templateFor('rework', true), { ...opts, acId: 'AC-R' })).toContain('"acId":"AC-R"');
+});
+
+test('machineCriterionId reads the first required machine criterion and falls back when absent', async () => {
+  const rows: Record<string, unknown>[] = [{
+    acceptance_criteria: [
+      { id: 'AC-H', kind: 'human', required: true },
+      { id: 'AC-OPT', kind: 'machine', required: false },
+      { id: 'AC-7', kind: 'machine', required: true },
+      { id: 'AC-8', kind: 'machine', required: true },
+    ],
+  }];
+  const store = new OutboundMessageStore({ query: async () => [rows] } as never);
+  expect(await store.machineCriterionId('t1')).toBe('AC-7');
+  const empty = new OutboundMessageStore({ query: async () => [[]] } as never);
+  expect(await empty.machineCriterionId('t1')).toBe('AC-BASE-DEPLOY-1');
+  const noMachine = new OutboundMessageStore({ query: async () => [[{ acceptance_criteria: [{ id: 'AC-H', kind: 'human', required: true }] }]] } as never);
+  expect(await noMachine.machineCriterionId('t1')).toBe('AC-BASE-DEPLOY-1');
+});
+
+test('review drafts and no-draft review sends use the same code flag as execute', async () => {
+  const created: Array<{ step: string; body: string }> = [];
+  const fake = (task: Record<string, unknown>) => new OutboundMessageStore({
+    query: async (sql: string, vars: Record<string, any>) => {
+      if (sql.includes('CREATE outbound_message')) {
+        created.push({ step: vars.step, body: vars.body });
+        return [[{ id: { id: `m${created.length}` }, task: { id: 't1' }, step: vars.step, role: vars.role,
+          body: vars.body, state: 'draft', hold: false, created_at: 'now' }]];
+      }
+      if (sql.includes('SELECT executor_role')) return [[task]];
+      if (sql.includes('SELECT body, created_at FROM outbound_message')) return [[]];
+      return [[]];
+    },
+  } as never);
+  // 建单草稿：code=true 时执行和复核都按软件线模板。
+  await fake({}).createTaskDrafts('t1', 'engineering', 'qa', true);
+  expect(created.find(c => c.step === 'execute')!.body).toContain('合入并发布到生产');
+  expect(created.find(c => c.step === 'review')!.body).toContain('在生产逐条复验');
+  // 旧任务没有复核草稿：prepareSend 即时生成时也必须按工作种类选模板。
+  created.length = 0;
+  const codeSend = await fake({ executor_role: 'engineering', reviewer_role: 'qa', kind: 'task', work_intent: { kind: 'code' } })
+    .prepareSend('t1', 'review', 'e1');
+  expect(codeSend!.body).toContain('在生产逐条复验');
+  created.length = 0;
+  const storySend = await fake({ executor_role: 'story-author', reviewer_role: 'qa', kind: 'task', work_intent: { kind: 'assets' } })
+    .prepareSend('t1', 'review', 'e1');
+  expect(storySend!.body).not.toContain('在生产');
+  expect(storySend!.body).toContain('逐条复验');
 });
 
 test('outbound_message schema defines the full draft/held/sent lifecycle', () => {
@@ -76,12 +146,14 @@ test('outbound_message schema defines the full draft/held/sent lifecycle', () =>
   expect(schema).toContain("DEFINE TABLE IF NOT EXISTS outbound_message");
 });
 
-test('migration retires gm defs, rebinds gm waits to owner, changes gm reviewer to qa, voids gm executors with audit', () => {
+test('migration retires gm defs, rebinds gm waits to owner, reroutes gm reviewer, converts gm executors to product with manager continuation and audit', () => {
   const schema = readFileSync(join(import.meta.dir, '..', 'schema/051-role-message-flow.surql'), 'utf8');
   expect(schema).toContain("WHERE role = 'gm'");
   expect(schema).toContain("blocked_to = 'owner'");
   expect(schema).toContain("reviewer_role = 'qa'");
-  expect(schema).toContain("state = 'void'");
+  expect(schema).toContain("dependency_continuation");
+  expect(schema).toContain("executor_role = 'product'");
+  expect(schema).not.toContain("state = 'void'");
   expect(schema).toContain("'gm_role_retired'");
 });
 
@@ -99,12 +171,14 @@ test('hold refuses to send; sent locks editing; the sent body is the table body'
         const task = (vars as { task?: { id?: string } }).task?.id;
         return [rows.filter(r => (r.task as { id: string }).id === task && (sql.includes('state !=') ? r.state !== 'sent' : true))];
       }
-      if (sql.includes('UPDATE ONLY $msg SET hold')) {
+      if (sql.includes('SELECT state FROM $msg')) return [rows.filter(r => (r.id as { id: string }).id === (vars.msg as { id: string }).id)];
+      if (sql.includes('UPDATE $msg SET hold')) {
         const row = rows.find(r => (r.id as { id: string }).id === (vars.msg as { id: string }).id)!;
+        if (row.state === 'sent') return [[]];
         row.hold = vars.hold; row.state = vars.hold ? 'held' : 'draft';
         return [[row]];
       }
-      if (sql.includes('UPDATE ONLY $msg SET body')) {
+      if (sql.includes('UPDATE $msg SET body')) {
         const row = rows.find(r => (r.id as { id: string }).id === (vars.msg as { id: string }).id)!;
         if (row.state === 'sent') return [[]];
         row.body = vars.body; row.edited_by = vars.actor;
@@ -112,7 +186,8 @@ test('hold refuses to send; sent locks editing; the sent body is the table body'
       }
       if (sql.includes('state = ') && sql.includes('sent')) {
         const row = rows.find(r => (r.id as { id: string }).id === (vars.msg as { id: string }).id)!;
-        row.state = 'sent'; row.sent_to = vars.employee;
+        if (!row || row.state === 'sent') return [[]];
+        row.state = 'sent'; row.sent_to = vars.employee; row.hold = false;
         return [[row]];
       }
       if (sql.includes('SELECT executor_role')) return [[{ executor_role: 'engineering', reviewer_role: 'qa', kind: 'task', work_intent: { kind: 'code' } }]];
@@ -128,10 +203,129 @@ test('hold refuses to send; sent locks editing; the sent body is the table body'
   await store.setHold(execute!.id, false, 'owner:test');
   const prepared = await store.prepareSend('t1', 'execute', 'e1');
   expect(prepared!.body).toBe('改成这句');
-  await expect(store.edit(execute!.id, '已发后不许改', 'owner:test')).rejects.toThrow();
+  await store.markSent(execute!.id, 'e1', prepared!.body);
+  await expect(store.edit(execute!.id, '已发后不许改', 'owner:test')).rejects.toThrow('locked');
+  await expect(store.setHold(execute!.id, true, 'owner:test')).rejects.toThrow('locked');
+  const locked = (await store.list('t1')).find(m => m.id === execute!.id)!;
+  expect(locked.body).toBe('改成这句');
+  expect(locked.state).toBe('sent');
+  expect(locked.hold).toBe(false);
+});
+
+test('dispatcher markOutbound passes non-empty employee id to markSent (ITEM 2)', async () => {
+  const sentCalls: Array<{ id: string; employeeId: string; body: string }> = [];
+  const fakeStore = {
+    markSent: async (id: string, employeeId: string, body: string) => {
+      sentCalls.push({ id, employeeId, body });
+      return { body, message: { id, taskId: 't1', step: 'execute' } as OutboundMessage };
+    },
+  };
+  const fakeOwner = {
+    resolveNotice: async () => {},
+  };
+  const dispatcher = new Dispatcher({
+    owner: fakeOwner,
+    messages: fakeStore as unknown as OutboundMessageStore,
+  } as never);
+
+  const prepared = {
+    message: { id: 'm1', taskId: 't1', step: 'execute', sentTo: '' } as OutboundMessage,
+    body: '正文',
+  };
+
+  await (dispatcher as any).markOutbound(prepared, 'eng-instance-42');
+
+  expect(sentCalls).toHaveLength(1);
+  expect(sentCalls[0].employeeId).toBe('eng-instance-42');
+  expect(sentCalls[0].employeeId.length).toBeGreaterThan(0);
+});
+
+test('dispatcher markOutbound resolves hold notice after successful send lock (ITEM 3)', async () => {
+  const resolvedNotices: string[] = [];
+  const fakeStore = {
+    markSent: async (_id: string, _emp: string, body: string) => ({ body, message: {} as OutboundMessage }),
+  };
+  const fakeOwner = {
+    resolveNotice: async (key: string) => {
+      resolvedNotices.push(key);
+    },
+  };
+  const dispatcher = new Dispatcher({
+    owner: fakeOwner,
+    messages: fakeStore as unknown as OutboundMessageStore,
+  } as never);
+
+  const prepared = {
+    message: { id: 'm1', taskId: 'task-abc', step: 'execute', sentTo: '' } as OutboundMessage,
+    body: '正文',
+  };
+
+  await (dispatcher as any).markOutbound(prepared, 'e1');
+
+  expect(resolvedNotices).toEqual(['message-hold:task-abc:execute']);
+});
+
+test('dispatcher markOutbound handles eval path and resolves eval hold notice (ITEM 2 & 3)', async () => {
+  const sentCalls: Array<{ id: string; employeeId: string; body: string }> = [];
+  const resolvedNotices: string[] = [];
+  const fakeStore = {
+    markSent: async (id: string, employeeId: string, body: string) => {
+      sentCalls.push({ id, employeeId, body });
+      return { body, message: {} as OutboundMessage };
+    },
+  };
+  const fakeOwner = {
+    resolveNotice: async (key: string) => {
+      resolvedNotices.push(key);
+    },
+  };
+  const dispatcher = new Dispatcher({
+    owner: fakeOwner,
+    messages: fakeStore as unknown as OutboundMessageStore,
+  } as never);
+
+  const preparedEval = {
+    message: { id: 'm-eval', taskId: 'task-eval-99', step: 'eval', sentTo: '' } as OutboundMessage,
+    body: 'eval 评分说明',
+  };
+
+  await (dispatcher as any).markOutbound(preparedEval, 'eval-inst-7');
+
+  expect(sentCalls).toHaveLength(1);
+  expect(sentCalls[0].employeeId).toBe('eval-inst-7');
+  expect(resolvedNotices).toEqual(['message-hold:task-eval-99:eval']);
+});
+
+test('dispatcher markOutbound logs and does not throw when resolveNotice fails (ITEM 3)', async () => {
+  const logs: string[] = [];
+  const fakeStore = {
+    markSent: async (_id: string, _emp: string, body: string) => ({ body, message: {} as OutboundMessage }),
+  };
+  const fakeOwner = {
+    resolveNotice: async () => {
+      throw new Error('rpc disconnect');
+    },
+  };
+  const dispatcher = new Dispatcher({
+    owner: fakeOwner,
+    messages: fakeStore as unknown as OutboundMessageStore,
+    log: (msg: string) => logs.push(msg),
+  } as never);
+
+  const prepared = {
+    message: { id: 'm1', taskId: 't1', step: 'execute' } as OutboundMessage,
+    body: '正文',
+  };
+
+  await expect((dispatcher as any).markOutbound(prepared, 'e1')).resolves.toBeUndefined();
+  expect(logs.some(l => l.includes('failed to resolve message-hold notice'))).toBe(true);
 });
 
 test('employee sandbox still forbids reading private/', () => {
   const sb = readFileSync(join(import.meta.dir, '..', 'scripts/sandbox/employee.sb'), 'utf8');
   expect(sb).toContain('(under service "/private")');
+});
+
+test('the owner token variable is blanked in every company session launch', () => {
+  expect(scrubEnv({}, { SCK_OWNER_TOKEN: 'fixture' }).SCK_OWNER_TOKEN).toBe('');
 });

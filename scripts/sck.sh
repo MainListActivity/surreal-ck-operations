@@ -17,12 +17,13 @@ if [ "${1:-}" = "owner" ]; then
   payload=${3:-"{}"}
   token_file="$service_home/private/owner-token"
   [ -r "$token_file" ] || { echo 'owner token missing' >&2; exit 1; }
-  token=$(/usr/bin/sed -n '1p' "$token_file" | /usr/bin/tr -d "\r\n")
   port=$(/usr/bin/sed -n 's/^SCK_PREVIEW_PORT=//p' "$service_home/private/service.env" 2>/dev/null | /usr/bin/tr -d "\"'")
   port=${port:-18777}
-  /usr/bin/python3 -I - "$command" "$payload" "$token" "$port" <<'PY'
+  /usr/bin/python3 -I - "$command" "$payload" "$token_file" "$port" <<'PY'
 import json, sys, urllib.request
-command, payload, token, port = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+command, payload, token_file, port = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open(token_file, "r", encoding="utf-8") as f:
+    token = f.readline().strip()
 try: args = json.loads(payload)
 except ValueError as error:
     print(json.dumps({"ok": False, "error": "invalid JSON: %s" % error}, ensure_ascii=False)); sys.exit(2)

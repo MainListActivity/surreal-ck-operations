@@ -263,6 +263,10 @@ export interface TaskRow {
   executor_role: Role;
   reviewer_role: ReviewerRole;
   discipline?: string;
+  /** The owner-edited requirement staged into task.md; separate from the legacy context prose. */
+  requirement?: string;
+  /** The owner-edited acceptance section staged into task.md. */
+  acceptance_text?: string;
   dependencies: RecordId[];
   version: number;
   submitted_by?: string;
@@ -429,6 +433,7 @@ export function waitingOf(row: Pick<TaskRow, 'state' | 'blocked_to' | 'resume_st
 export function view(row: TaskRow): TaskView {
   return {
     id: asId(row.id), title: row.title, context: row.context, state: row.state,
+    requirement: row.requirement ?? undefined, acceptanceText: row.acceptance_text ?? undefined,
     executionWindow: row.execution_window ?? undefined, dependencyContinuation: row.dependency_continuation ?? undefined,
     executorRole: row.executor_role, reviewerRole: row.reviewer_role,
     discipline: row.discipline ?? undefined,

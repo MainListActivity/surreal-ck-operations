@@ -41,20 +41,24 @@ const goalOn = async (project: string, pipeline?: string, tier: 'quick' | 'stand
 const task = (goalId: string, extra: Record<string, unknown>) =>
   core.createTask(gm, { title: `Pipeline task ${++count}`, context: 'pipeline fixture', executorRole: 'concept-design', reviewerRole: 'owner', goalId, idempotencyKey: key(), ...extra } as never);
 
-run('a story goal gets only the story plan: no product intake, acceptance or auto-closing gate', async () => {
+run('a story goal is one story-author delivery reviewed by qa: no product intake, acceptance or auto-closing gate', async () => {
   const { goal, tasks } = await goalOn('content', 'story');
   expect(goal.pipeline).toBe('story');
-  expect(tasks.map(t => [t.executor_role, t.reviewer_role, t.kind])).toEqual([['owner', 'qa', 'task']]);
-  expect(tasks[0]!.title).toContain('任务拆解与分派');
+  expect(tasks.map(t => [t.executor_role, t.reviewer_role, t.kind])).toEqual([['story-author', 'qa', 'task']]);
+  expect(tasks[0]!.title).toContain('交付');
 });
 
 run('with no explicit line a goal runs its project default; no default means software', async () => {
   const video = await goalOn('content');
   expect(video.goal.pipeline).toBe('video');
-  expect(video.tasks.map(t => t.kind).sort()).toEqual(['gate', 'task']); expect(video.tasks.some(t => t.executor_role === 'product')).toBe(false);
+  // video: one concept-design task, reviewed by the owner; no gate/product rows.
+  expect(video.tasks.map(t => [t.executor_role, t.reviewer_role, t.kind])).toEqual([['concept-design', 'owner', 'task']]);
+  expect(video.tasks.some(t => t.executor_role === 'product')).toBe(false);
   const software = await goalOn('plain', undefined, 'standard');
   expect(software.goal.pipeline).toBeUndefined();
-  expect(software.tasks.some(t => t.executor_role === 'product')).toBe(true);
+  // software on a plain project: one engineering deploy task reviewed by qa.
+  expect(software.tasks.map(t => [t.executor_role, t.reviewer_role, t.kind])).toEqual([['engineering', 'qa', 'deploy']]);
+  expect(software.tasks.some(t => t.executor_role === 'product')).toBe(false);
   await expect(owner.createGoal({ text: 'bad line', source: 'test', key: key(), pipeline: 'novel' })).rejects.toMatchObject({ code: 'invalid' });
 });
 

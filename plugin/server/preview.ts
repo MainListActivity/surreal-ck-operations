@@ -133,7 +133,7 @@ export function startPreview(opts: StartPreviewOptions = {}): PreviewHandle {
     const server = createServer((req, res) => {
       const path = req.url ?? "/";
       const handler = (L.name === "lan" && qaHandler && (path === "/q" || path.startsWith("/q/"))) ? qaHandler
-        : (consoleHandler && (path.startsWith("/o/") || path.startsWith("/api/owner/"))) ? consoleHandler : handlerFor();
+        : (consoleHandler && (path.startsWith("/o/") || (L.name === "lan" && path.startsWith("/api/owner/")))) ? consoleHandler : handlerFor();
       if (!handler) { res.writeHead(503).end("preview core unavailable"); return; }
       Promise.resolve().then(async () => {
         const request = toRequest(req);

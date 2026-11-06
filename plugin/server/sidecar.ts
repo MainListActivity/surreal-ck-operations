@@ -276,6 +276,11 @@ export class SidecarPool {
     return {employee,comm:commDir(this.deps.runDir,employee),role:this.routingEmployees.get(employee)?.role};
   }
 
+  /** The receiving employee's real role, for nudge drafts that must not be labelled 'owner'. */
+  roleFor(instId: string): string | undefined {
+    return this.routingEmployees.get(instId)?.role;
+  }
+
   /** Read-only projection of the sidecar's authoritative local claim; never queries the remote DB. */
   routingLease(ref:string):RoutingLease|undefined {
     const inst=ref.startsWith('employee:')?ref.slice(9):this.instByAgent.get(ref);

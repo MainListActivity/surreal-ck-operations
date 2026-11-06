@@ -7,7 +7,7 @@ import { settleCompanyTurn, TurnInterruptions } from "./turn-closeout";
 // Paseo lifecycle events, replacing the org.surrealck.company-dispatcher launchd service.
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { PaseoApi } from "@getpaseo/client";
-import { company, type Company } from "./company";
+import { company, currentPaseo, notePaseo, type Company } from "./company";
 import { isCompanyAgent } from "./company-agent";
 import { dirname, join } from "node:path";
 import { serviceHome } from "./env";
@@ -116,7 +116,7 @@ let modelsRefreshedAt = 0;
  * slot so one provider's outage cannot unstaff every role.
  */
 export async function refreshModels(paseo: PaseoApi, ctx: Company): Promise<Record<string, string>> {
-  paseoHandle = paseo;
+  notePaseo(paseo);
   if (Date.now() - modelsRefreshedAt < 45_000) return readModelSlots(ctx);
   modelsRefreshedAt = Date.now();
   const [defRows] = await ctx.db.db.query<[Array<{ provider?: string; model?: string }>]>(
@@ -158,8 +158,7 @@ export async function readModelSlots(ctx: Company): Promise<Record<string, strin
 }
 
 // Lifecycle hooks and RPC handlers are the only places a paseo handle is handed out;
-// remember the latest one so the tick loop can also refresh quota during quiet periods.
-let paseoHandle: PaseoApi | undefined;
+// company.ts remembers the latest one so the tick loop can also refresh quota during quiet periods.
 
 /**
  * Persists the latest quota snapshot to company_meta for the dispatcher. Hooks carry a Paseo
@@ -170,7 +169,7 @@ let paseoHandle: PaseoApi | undefined;
  */
 let quotaEmptyLoggedAt = 0;
 export async function refreshQuota(paseo: PaseoApi | undefined, ctx: Company): Promise<ProviderUsageEntry[]> {
-  if (paseo) paseoHandle = paseo;
+  if (paseo) notePaseo(paseo);
   if (Date.now() - quotaRefreshedAt < 45_000) return readQuotaEntries<ProviderUsageEntry>(ctx.db.db);
   quotaRefreshedAt = Date.now();
   const usage = paseo
@@ -376,10 +375,11 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
         // same dispatch pass instead of lagging one poll behind. Quota runs without a
         // Paseo handle too: magpie is the source for the providers Paseo never lists.
         if (Date.now() - quotaRefreshedAt > 300_000) {
-          await timing.measure("quota", () => refreshQuota(paseoHandle, ctx)).catch((error) => console.warn(`quota refresh failed: ${(error as Error).message}`));
+          await timing.measure("quota", () => refreshQuota(currentPaseo(), ctx)).catch((error) => console.warn(`quota refresh failed: ${(error as Error).message}`));
         }
+        const paseoHandle = currentPaseo();
         if (paseoHandle && Date.now() - modelsRefreshedAt > 300_000) {
-          await timing.measure("models", () => refreshModels(paseoHandle!, ctx)).catch((error) => console.warn(`model refresh failed: ${(error as Error).message}`));
+          await timing.measure("models", () => refreshModels(paseoHandle, ctx)).catch((error) => console.warn(`model refresh failed: ${(error as Error).message}`));
         }
         if (Date.now() - gcRefreshedAt > GC_MS) {
           gcRefreshedAt = Date.now();
@@ -439,7 +439,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
       }).catch((error: unknown) => console.warn(`idle activity update failed: ${(error as Error).message}`));
     }),
     server.on("agent.turn_ended", (event, { paseo }) => {
-      paseoHandle = paseo;
+      notePaseo(paseo);
       void isCompanyAgent(paseo, event.agent).then(async ok => {
         console.log(`turn_ended ${event.agent.title ?? event.agent.id} company=${ok}`);
         if (!ok) return;
@@ -460,7 +460,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
       }).catch((error: unknown) => console.warn(`turn_ended handler failed: ${(error as Error).message}`));
     }),
     server.on("agent.archived", (event, { paseo }) => {
-      paseoHandle = paseo;
+      notePaseo(paseo);
       void isCompanyAgent(paseo, event.agent).then(async ok => {
         if (!ok) return;
         const ctx = await company();
@@ -475,7 +475,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
     // until a human notices, so the plugin answers allow immediately and logs it.
     // Owner-role approvals (spend, external comms) never arrive on this channel.
     server.on("agent.permission_requested", (event, { paseo }) => {
-      paseoHandle = paseo;
+      notePaseo(paseo);
       void isCompanyAgent(paseo, event.agent).then(async ok => {
         if (!ok) return;
         const request = event.request as { id?: string } | undefined;

@@ -97,6 +97,17 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
     const url = new URL(req.url);
     // 编制外 agent 的 /api/owner/* 接口：Bearer 鉴权，路径独立于 /o/<token>/。
     if (url.pathname.startsWith("/api/owner/")) return ownerFetch(req);
+    // 页面自身的写操作：/o/<token>/owner/<cmd> 与 /api/owner/* 走同一个 Bearer 校验与处理器，
+    // 这样签名面（没有 /api/owner/* 路由）上打开的页面也能用完整命令。
+    if (req.method === "POST" && url.pathname.startsWith(prefix + "/owner/")) {
+      if (req.headers.get("origin") && req.headers.get("origin") !== url.origin) return json({ error: "origin mismatch" }, 403);
+      const command = url.pathname.slice((prefix + "/owner/").length);
+      if (!command || command.includes("/")) return json({ error: "not found" }, 404);
+      const body = await req.text();
+      return ownerFetch(new Request(new URL(`/api/owner/${command}`, url.origin).toString(), {
+        method: "POST", headers: req.headers, body,
+      }));
+    }
     // 页面自身换出 Bearer：/o/<token>/ 路径只证明打开了这个页面。
     if (req.method === "POST" && url.pathname === prefix + "/api/exchange") {
       const body = await req.json().catch(() => ({})) as { pageToken?: string };
@@ -119,54 +130,50 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
         return text(rankingPage,200,"text/html; charset=utf-8");
       }
       if(req.method==='GET'&&sub==='/api/model-catalog'){
-        try{return json(await (await opts.company()).modelRouting.catalogPage(url.searchParams.get('query')??'',Number(url.searchParams.get('offset')??0),40));}
+        try{const {ownerModelCatalog}=await import('./owner-actions.ts');return json(await ownerModelCatalog(await opts.company(),{query:url.searchParams.get('query')??'',offset:Number(url.searchParams.get('offset')??0),limit:40}));}
         catch{return json({error:'模型目录读取失败'},400);}
       }
       if(req.method==='POST'&&['/api/model-membership','/api/model-alias'].includes(sub)){
         if(req.headers.get('origin')&&req.headers.get('origin')!==url.origin)return json({error:'origin mismatch'},403);
         try{
-          const b=await req.json(),ctx=await opts.company();
+          const b=await req.json();
           if(sub==='/api/model-membership'){
-            const {modelMembershipInput}=await import('../shared/rpc.ts');
-            const {updateModelMembership}=await import('./model-ranking.ts');
-            return json(await updateModelMembership(ctx,modelMembershipInput.parse(b)));
+            const {ownerModelMembership}=await import('./owner-actions.ts');
+            return json(await ownerModelMembership(await opts.company(),b));
           }
-          if(typeof b.model!=='string'||!b.model||b.model.length>300||!(b.slug===null||typeof b.slug==='string'&&b.slug.length>0&&b.slug.length<=200))throw Error('参数无效');
-          const {updateModelAlias}=await import('./model-ranking.ts');
-          return json(await updateModelAlias(ctx,{model:b.model,slug:b.slug}));
+          const {ownerModelAlias}=await import('./owner-actions.ts');
+          return json(await ownerModelAlias(await opts.company(),b as {model?:unknown;slug?:unknown}));
         }catch(error){return json({error:(error as Error).message.slice(0,300)},409);}
       }
       if (req.method === "GET" && sub === "/api/model-ranking") {
-        const { modelRankingView }=await import("./model-ranking.ts");
-        return json(await modelRankingView((await opts.company()).db.db));
+        const { ownerModelRanking }=await import("./owner-actions.ts");
+        return json(await ownerModelRanking(await opts.company()));
       }
       if(req.method==='POST'&&sub==='/api/model-ranking/preview'){
         if(req.headers.get('origin')&&req.headers.get('origin')!==url.origin)return json({error:'origin mismatch'},403);
-        try{const b=await req.json() as {policy:unknown;refresh?:boolean};if(b.refresh!==undefined&&typeof b.refresh!=='boolean')throw Error('refresh');
-          return json(await (await opts.company()).modelRanking.preview(b.policy,b.refresh));
+        try{const b=await req.json() as {policy:unknown;refresh?:boolean};
+          const {ownerModelRankingPreview}=await import('./owner-actions.ts');
+          return json(await ownerModelRankingPreview(await opts.company(),b.policy,b.refresh));
         }catch{return json({error:'预览失败：请检查权重或点击更新观测'},400);}
       }
       if (req.method === "POST" && sub === "/api/model-ranking/pin") {
         if(req.headers.get("origin")&&req.headers.get("origin")!==url.origin)return json({error:"origin mismatch"},403);
         const b=await req.json() as {group?:unknown;model?:unknown;pinned?:unknown};
-        if(!["sck-haiku","sck-sonnet","sck-opus"].includes(b.group as string)||typeof b.model!=="string"||!b.model||b.model.length>300||typeof b.pinned!=="boolean")return json({error:"置顶参数无效"},400);
         try {
-          await (await opts.company()).modelRanking.setPin(b.group as string,b.model,b.pinned);
-          return json({ok:true});
-        } catch { return json({error:"置顶更新失败，请刷新后重试"},409); }
+          const {ownerModelRankingPin}=await import('./owner-actions.ts');
+          return json(await ownerModelRankingPin(await opts.company(),b));
+        } catch (error) {
+          const invalid = /invalid/.test((error as Error).message);
+          return json({error:invalid?"置顶参数无效":"置顶更新失败，请刷新后重试"},invalid?400:409);
+        }
       }
       if (req.method === "POST" && sub === "/api/model-ranking") {
         if(req.headers.get("origin")&&req.headers.get("origin")!==url.origin)return json({error:"origin mismatch"},403);
-        const b=await req.json() as {rules?:unknown;refreshMinutes?:unknown;policy?:unknown};
-        if(typeof b.rules!=="string"||b.rules.length>8000||![2,5,10].includes((b.refreshMinutes??5) as number))return json({error:"排序规则或刷新间隔无效"},400);
-        const { saveRankingSettings }=await import("./vendor/src/model-routing/ranking.ts");
-        const ctx=await opts.company();
         try{
-          const {rankingPolicy}=await import('./vendor/src/model-routing/weights.ts');
-          const policy=b.policy===undefined?undefined:rankingPolicy(b.policy);
-          await saveRankingSettings(ctx.db.db,{rules:b.rules,refreshMinutes:(b.refreshMinutes??5) as number,policy},ctx.modelRanking);
+          const b=await req.json() as {rules?:unknown;refreshMinutes?:unknown;policy?:unknown};
+          const {ownerModelRankingSave}=await import('./owner-actions.ts');
+          return json(await ownerModelRankingSave(await opts.company(),b));
         }catch{return json({error:'排序设置无效或保存失败'},400);}
-        return json({ok:true});
       }
       if (req.method === "GET" && sub === "/api/inbox") return json(await (async()=>{const c=await opts.company();return c.upgrades?c.upgrades.inbox():c.owner.inbox();})());
       if (req.method === "GET" && sub === "/api/brief") return json(await (await opts.company()).owner.brief());
@@ -319,6 +326,10 @@ ${relayShellCss}
 .goal-chip.active{border-color:var(--relay-accent-border);background:var(--relay-accent-soft)}
 .goal-chip strong{display:block;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .goal-chip small{display:block;color:var(--relay-faint);font-size:10px;margin-top:4px}
+.goal-chip .chip-cancel{height:22px;padding:0 7px;margin-left:6px;border:1px solid var(--relay-warning);border-radius:6px;background:transparent;color:var(--relay-warning);font-size:10px;font-weight:700;cursor:pointer}
+.flow-head .row{display:flex;gap:7px;flex-wrap:wrap}
+.retired-box{margin-top:16px;padding:12px;border:1px solid var(--relay-border);border-radius:12px;background:var(--relay-panel)}
+.retired-box h3{margin:0 0 8px;font-size:13px}
 .flow-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:8px 0 12px;flex-wrap:wrap}
 .flow-head h1{margin:0;font-size:20px;letter-spacing:-.02em}
 .flow-legend{display:flex;gap:12px;flex-wrap:wrap;color:var(--relay-muted);font-size:10px}
@@ -374,7 +385,7 @@ ${relayShellCss}
 <button onclick="location.href='ranking'" class="refresh">${relayIcon("layers")}<span>模型排序</span></button>
 </nav><div class="sidebar-footer"><div class="operator"><span class="avatar">B</span><span><strong>老板</strong><small>控制面 · v0.3.78</small></span></div></div></aside>
 <div class="main-area"><header class="topbar"><div class="breadcrumb"><span>公司</span><b>/</b><strong id="crumb">消息流</strong></div>
-<div class="top-actions"><span class="status" id="stat">加载中…</span><button class="refresh" data-cmd="refresh">${relayIcon("refresh")}<span>刷新</span></button></div></header>
+<div class="top-actions"><span class="status" id="stat">加载中…</span><button class="refresh" id="pause-btn" data-cmd="toggle-pause">暂停派工</button><button class="refresh" data-cmd="refresh">${relayIcon("refresh")}<span>刷新</span></button></div></header>
 <main class="content"><div class="flow-pane" id="flow-pane"></div><aside class="drawer" id="drawer"></aside>
 <template id="upgrade-card">上线内容：<span class="uc"></span> · 影响范围：<span class="ui"></span> · <button class="upgrade-start">升级至 v<span class="uv"></span></button> · <button class="upgrade-automatic">自动升级已开启</button></template>
 </main></div></div>
@@ -392,9 +403,10 @@ document.documentElement.dataset.theme=store.get('relay-theme')||'light';renderT
 function toast(msg){const el=$('toast');el.textContent=msg;el.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.classList.remove('show'),2200)}
 const TOKEN=location.pathname.split('/')[2];
 const api=async(cmd,o)=>{
-  const r=await fetch('/api/owner/'+cmd,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+OWNER,'X-Owner-Agent':'web'},body:JSON.stringify({command:cmd,...o})});
+  // 页面在 LAN 面与签名面都从自身前缀下发命令：相对地址留在 /o/<token>/ 内，Bearer 仍是同一把老板令牌。
+  const r=await fetch('owner/'+cmd,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+OWNER,'X-Owner-Agent':'web'},body:JSON.stringify({command:cmd,...o})});
   const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.statusText);return j;};
-let OWNER='';let GOALS=[],TASKS=[],MESSAGES=[],INBOX=null,DEFS=[],SEL=null,GOAL='',T='flow';
+let OWNER='';let GOALS=[],TASKS=[],MESSAGES=[],INBOX=null,DEFS=[],SEL=null,GOAL='',T='flow',PAUSED=false,NOTICES=[],RETIRED=null;
 async function boot(){
   const x=await fetch('api/exchange',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pageToken:TOKEN})});
   const j=await x.json().catch(()=>({}));if(!x.ok)throw new Error(j.error||'exchange failed');OWNER=j.ownerToken;
@@ -403,11 +415,13 @@ async function boot(){
 }
 async function onCommand(ev){
   const el=ev.target.closest('[data-cmd]');if(!el)return;
-  const [cmd,arg]=String(el.dataset.cmd).split(':');
+  // Only the first colon separates the command: ids and notice keys may themselves contain colons.
+  const raw=String(el.dataset.cmd),cut=raw.indexOf(':');
+  const cmd=cut<0?raw:raw.slice(0,cut),arg=cut<0?'':raw.slice(cut+1);
   if(cmd==='tab'){T=arg;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.t===arg));$('crumb').textContent={flow:'消息流',inbox:'收件箱',defs:'编制'}[arg]||arg;render();}
   else if(cmd==='theme')toggleTheme();
   else if(cmd==='refresh')load();
-  else if(cmd==='goal'){GOAL=arg;render();}
+  else if(cmd==='goal'){GOAL=arg;SEL=null;await refreshRetired();render();}
   else if(cmd==='task'){SEL=arg;render();}
   else if(cmd==='msg'){SEL='m:'+arg;render();}
   else if(cmd==='save-msg')saveMsg(arg);
@@ -416,21 +430,37 @@ async function onCommand(ev){
   else if(cmd==='void')voidTask(arg);
   else if(cmd==='revoke')revokeTask(arg);
   else if(cmd==='unlock')unlockTask(arg);
-  else if(cmd==='decide')decide(arg,el.dataset.arg,el.dataset.note||'');
-  else if(cmd==='toggle-def')toggleDef(arg,el.dataset.arg==='1');
+  else if(cmd==='decide'){const [id,dec]=String(arg).split(':');decide(id,dec,el.dataset.note||'');}
+  else if(cmd==='toggle-def'){const [id,on]=String(arg).split(':');toggleDef(id,on==='1');}
   else if(cmd==='upgrade-automatic'){await api('upgrade.automatic',{enabled:!(INBOX?.upgrades?.automatic?.enabled)});toast('已切换自动升级');await load();}
   else if(cmd==='upgrade-start'){await api('upgrade.start',{taskId:arg.split(':')[0],taskVersion:Number(arg.split(':')[1]),digest:arg.split(':')[2]});toast('已启动升级');await load();}
   else if(cmd==='create-task')createTask();
   else if(cmd==='new-task')newTaskForm();
+  else if(cmd==='new-goal')newGoalForm();
+  else if(cmd==='create-goal')createGoal();
+  else if(cmd==='cancel-goal')cancelGoal(arg);
+  else if(cmd==='save-task')saveTask(arg);
+  else if(cmd==='reassign')reassignForm(arg);
+  else if(cmd==='save-reassign')saveReassign(arg);
+  else if(cmd==='toggle-pause')togglePause();
+  else if(cmd==='resolve-notice')resolveNotice(arg);
+  else if(cmd==='resolve-retired')resolveRetired(arg);
 }
 async function load(){
   try{
-    const [g,t,m,i,d]=await Promise.all([api('goal.list',{}),api('task.list',{}),api('message.list',{includeSent:true}),api('inbox',{}),api('def.list',{})]);
-    GOALS=g.goals||[];TASKS=t.tasks||[];MESSAGES=m.messages||[];INBOX=i;DEFS=d.defs||[];
-    const n=(INBOX.gates||[]).length+(INBOX.questions||[]).length;const b=$('nav-count');if(b){b.textContent=n;b.hidden=!n}
-    $('stat').textContent=n?('待办 '+n):'运行中';$('stat').className='status'+(n?' violet':'');
+    const [g,t,m,i,d,s,n]=await Promise.all([api('goal.list',{}),api('task.list',{}),api('message.list',{includeSent:true}),api('inbox',{}),api('def.list',{}),api('status',{}),api('notice.list',{})]);
+    GOALS=g.goals||[];TASKS=t.tasks||[];MESSAGES=m.messages||[];INBOX=i;DEFS=d.defs||[];NOTICES=n.notices||[];PAUSED=s.paused===true;
+    await refreshRetired();
+    const n2=(INBOX.gates||[]).length+(INBOX.questions||[]).length;const b=$('nav-count');if(b){b.textContent=n2;b.hidden=!n2}
+    $('stat').textContent=n2?('待办 '+n2):'运行中';$('stat').className='status'+(n2?' violet':'');
+    const pb=$('pause-btn');if(pb)pb.textContent=PAUSED?'恢复派工':'暂停派工';
     render();
   }catch(e){$('stat').textContent='加载失败：'+e.message}
+}
+async function refreshRetired(){
+  RETIRED=null;if(!GOAL)return;
+  try{RETIRED=await api('goal.retired.list',{goalId:GOAL});}
+  catch(e){RETIRED={goalId:GOAL,goalVersion:0,items:[],error:e.message};}
 }
 const laneY=r=>70+r*104;
 function graph(){
@@ -464,7 +494,19 @@ function drawerDefault(){
   $('drawer').innerHTML='<div class="kicker">DRAWER</div><h2>消息与任务</h2><p class="meta">点击节点或连线查看正文、放行与审计。</p>'
     +'<section><h3>待发消息 '+drafts.length+'</h3><div class="inbox-list">'+drafts.slice(0,12).map(m=>'<div class="inbox-card"><h3>'+esc(m.step)+' → '+esc(m.role)+'</h3><p>'+esc(m.body.slice(0,80))+'</p><button data-cmd="msg:'+esc(m.id)+'">查看</button></div>').join('')||'<p class="meta">无</p>'+'</div></section>'
     +'<section><h3>收件箱</h3>'+((INBOX?.gates||[]).length+(INBOX?.questions||[]).length)+' 项待你决定</section>'
+    +'<section><h3>提醒 '+(noticeList().length||'')+'</h3><div class="inbox-list">'+noticesHtml()+'</div></section>'
     +'<section><h3>公司系统升级</h3>'+upgradeHtml()+'</section>';
+}
+function upgradeHtml(){
+  const items=INBOX?.upgrades?.items||[];
+  if(!items.length)return '<p class="meta">无待升级版本</p>';
+  return items.map(x=>'<div class="inbox-card"><h3>v'+esc(x.plan?.version||'')+' · '+esc(x.status||'')+'</h3><p>'+esc(x.taskId||'')+'</p><div class="row"><button data-cmd="upgrade-start:'+esc(String(x.taskId))+':'+esc(String(x.taskVersion))+':'+esc(String(x.plan?.digest||''))+'">升级至 v'+esc(x.plan?.version||'')+'</button></div></div>').join('');
+}
+function noticeList(){return (NOTICES&&NOTICES.length)?NOTICES:(INBOX?.notices||[])}
+function noticesHtml(){
+  const items=noticeList();
+  if(!items.length)return '<p class="meta">无未解决提醒</p>';
+  return items.map(n=>'<div class="inbox-card"><p>'+esc(n.text||n.key)+'</p><button data-cmd="resolve-notice:'+esc(String(n.key))+'">已处理</button></div>').join('');
 }
 function drawerMsg(id){
   const m=MESSAGES.find(x=>String(x.id?.id??x.id)===id);
@@ -480,23 +522,93 @@ function drawerTask(id){
   if(!t){$('drawer').innerHTML='<p class="meta">任务不存在</p>';return}
   const msgs=MESSAGES.filter(m=>String(m.task?.id??m.task??'')===id);
   $('drawer').innerHTML='<div class="kicker">TASK '+esc(id.slice(0,8))+'</div><h2>'+esc(t.title||'')+'</h2><p class="meta">'+esc(t.executor_role||'')+' → '+esc(t.reviewer_role||'')+' · '+esc(t.state||'')+'</p>'
-    +'<section><h3>需求</h3><pre>'+esc(t.requirement||t.context||'')+'</pre><h3>验收标准</h3><pre>'+esc(t.acceptance_text||'')+'</pre></section>'
+    +'<section><h3>需求与验收</h3><label>需求<textarea id="t-req">'+esc(t.requirement||t.context||'')+'</textarea></label>'
+    +'<label>验收标准<textarea id="t-ac">'+esc(t.acceptance_text||'')+'</textarea></label>'
+    +'<div class="row"><button class="primary" data-cmd="save-task:'+esc(id)+'">保存需求与验收</button></div></section>'
     +'<section><h3>消息</h3>'+msgs.map(m=>'<div class="inbox-card"><h3>'+esc(m.step)+' · '+esc(m.state)+(m.hold?' · 待放行':'')+'</h3><p>'+esc(m.body.slice(0,90))+'</p><button data-cmd="msg:'+esc(String(m.id?.id??m.id))+'">编辑/放行</button></div>').join('')+'</section>'
-    +'<section><h3>操作</h3><div class="row"><button data-cmd="void:'+esc(id)+'">作废</button><button data-cmd="revoke:'+esc(id)+'">撤销租约</button><button data-cmd="unlock:'+esc(id)+'">解锁</button></div></section>';
+    +'<section><h3>操作</h3><div class="row"><button data-cmd="void:'+esc(id)+'">作废</button><button data-cmd="revoke:'+esc(id)+'">撤销租约</button><button data-cmd="unlock:'+esc(id)+'">解锁</button><button data-cmd="reassign:'+esc(id)+'">改派</button></div></section>';
+}
+function reassignForm(id){
+  $('drawer').innerHTML='<div class="kicker">REASSIGN</div><h2>改派任务</h2><div class="goal-form">'
+    +'<label>执行岗<select id="r-ex">'+['engineering','qa','product','concept-design','asset-production','screenwriter','story-author','cinematography','cs'].map(r=>'<option>'+r+'</option>').join('')+'</select></label>'
+    +'<label>复核岗<select id="r-rev">'+['qa','engineering','owner','product'].map(r=>'<option>'+r+'</option>').join('')+'</select></label>'
+    +'<label>改派说明<input id="r-note"/></label>'
+    +'<div class="row"><button class="primary" data-cmd="save-reassign:'+esc(id)+'">确认改派</button><button data-cmd="task:'+esc(id)+'">返回</button></div></div>';
+}
+async function saveTask(id){
+  const requirement=$('t-req').value,acceptanceText=$('t-ac').value;
+  if(requirement.trim().length<1||acceptanceText.trim().length<1){toast('需求与验收标准都不能为空');return}
+  await api('task.update',{taskId:id,requirement,acceptanceText});toast('已保存');await load();
+}
+async function saveReassign(id){
+  const executorRole=$('r-ex').value,reviewerRole=$('r-rev').value,note=$('r-note').value.trim();
+  if(note.length<1){toast('请填写改派说明');return}
+  await api('task.reassign',{taskId:id,executorRole,reviewerRole,note});toast('已改派');SEL=id;await load();
 }
 function renderFlow(){
   const rail='<div class="goal-rail"><button class="goal-chip '+(GOAL?'':'active')+'" data-cmd="goal:"><strong>全部目标</strong><small>'+TASKS.length+' 个任务</small></button>'
-    +GOALS.map(g=>'<button class="goal-chip '+(GOAL===String(g.id?.id??g.id)?'active':'')+'" data-cmd="goal:'+esc(String(g.id?.id??g.id))+'"><strong>'+esc((g.title||'').slice(0,20))+'</strong><small>'+esc(g.state||'')+'</small></button>').join('')+'</div>';
-  $('flow-pane').innerHTML='<div class="flow-head"><h1>消息流</h1><div class="flow-legend"><span><i></i>已发</span><span><i class="dash"></i>待发 draft</span><span><i class="hold"></i>需要我放行</span><span><i class="block"></i>阻塞到老板</span></div><button class="primary small" data-cmd="new-task">+ 新增任务</button></div>'
-    +rail+'<div class="graph-scroll">'+graph()+'</div>';
+    +GOALS.map(g=>{const gid=String(g.id?.id??g.id),active=GOAL===gid;
+      return '<div class="goal-chip '+(active?'active':'')+'" data-cmd="goal:'+esc(gid)+'" role="button" tabindex="0"><strong>'+esc((g.title||'').slice(0,20))+'</strong><small>'+esc(g.state||'')+(active?' <button class="chip-cancel" data-cmd="cancel-goal:'+esc(gid)+'">取消目标</button>':'')+'</small></div>';
+    }).join('')+'</div>';
+  $('flow-pane').innerHTML='<div class="flow-head"><h1>消息流</h1><div class="flow-legend"><span><i></i>已发</span><span><i class="dash"></i>待发 draft</span><span><i class="hold"></i>需要我放行</span><span><i class="block"></i>阻塞到老板</span></div><div class="row"><button class="primary small" data-cmd="new-goal">+ 新增目标</button><button class="primary small" data-cmd="new-task">+ 新增任务</button></div></div>'
+    +rail+'<div class="graph-scroll">'+graph()+'</div>'+retiredHtml();
   if(SEL)SEL.startsWith('m:')?drawerMsg(SEL.slice(2)):drawerTask(SEL);else drawerDefault();
+}
+function retiredHtml(){
+  if(!GOAL)return '';
+  const items=RETIRED?.items||[];
+  const err=RETIRED?.error?'<p class="meta">读取失败：'+esc(RETIRED.error)+'</p>':'';
+  return '<section class="retired-box"><h3>待处置作废任务 '+(RETIRED?items.length:'…')+'</h3>'+err
+    +items.map(x=>'<div class="inbox-card"><h3>'+esc(x.title||x.taskId)+'</h3><p class="meta">'+esc(String(x.taskId))+' · '+esc(x.retiredBy||'')+'</p><div class="goal-form">'
+      +'<label>处置方式<select id="rr-d-'+esc(String(x.taskId))+'"><option value="fixture">fixture</option><option value="replaced">replaced</option><option value="excluded">excluded</option></select></label>'
+      +'<label>替代任务 ID（replaced 时必填，逗号分隔）<input id="rr-r-'+esc(String(x.taskId))+'"/></label>'
+      +'<label>处置原因（至少 10 个字）<input id="rr-n-'+esc(String(x.taskId))+'"/></label>'
+      +'<div class="row"><button data-cmd="resolve-retired:'+esc(String(x.taskId))+'">提交处置</button></div></div></div>').join('')
+    +(items.length?'':'<p class="meta">无待处置任务</p>')+'</section>';
+}
+async function cancelGoal(goalId){
+  const note=prompt('取消目标的原因（至少 2 个字）')||'';
+  if(note.trim().length<2)return;
+  await api('goal.cancel',{goalId,note});toast('已取消目标');GOAL='';SEL=null;RETIRED=null;await load();
+}
+function newGoalForm(){
+  $('drawer').innerHTML='<div class="kicker">NEW GOAL</div><h2>新建目标</h2><div class="goal-form">'
+    +'<label>目标内容<textarea id="g-text"></textarea></label>'
+    +'<label>产线<select id="g-pipeline"><option value="software">software</option><option value="story">story</option><option value="video">video</option></select></label>'
+    +'<label>档位<select id="g-tier"><option value="quick">quick</option><option value="standard">standard</option><option value="program">program</option></select></label>'
+    +'<div class="row"><button class="primary" data-cmd="create-goal">创建并分级</button></div></div>';
+}
+async function createGoal(){
+  const text=$('g-text').value.trim();if(text.length<2){toast('请填写目标内容');return}
+  const pipeline=$('g-pipeline').value,tier=$('g-tier').value;
+  const g=await api('goal.create',{text,pipeline,tier});
+  const goalId=String(g.id?.id??g.id??'');
+  await api('goal.triage',{goalId,tier});
+  toast('已创建目标');GOAL=goalId;SEL=null;await load();
+}
+async function togglePause(){
+  await api(PAUSED?'task.resume':'task.pause',{});PAUSED=!PAUSED;toast(PAUSED?'已暂停派工':'已恢复派工');await load();
+}
+async function resolveNotice(key){
+  await api('notice.resolve',{key});toast('已关闭提醒');await load();
+}
+async function resolveRetired(taskId){
+  const item=(RETIRED?.items||[]).find(x=>String(x.taskId)===taskId);
+  if(!item){toast('该任务已不在待处置列表');return}
+  const disposition=$('rr-d-'+taskId).value;
+  const replacementTaskIds=$('rr-r-'+taskId).value.split(',').map(s=>s.trim()).filter(Boolean);
+  const reason=$('rr-n-'+taskId).value.trim();
+  if(reason.length<10){toast('处置原因至少 10 个字');return}
+  await api('goal.retired.resolve',{goalId:GOAL,taskId,goalVersion:RETIRED.goalVersion,taskVersion:item.version??0,disposition,replacementTaskIds,reason});
+  toast('已处置');await refreshRetired();render();
 }
 function renderInbox(){
   const gates=INBOX?.gates||[],asks=INBOX?.questions||[];
   $('flow-pane').innerHTML='<div class="flow-pane"><div class="flow-head"><h1>收件箱</h1></div><div class="decision-grid">'
     +gates.map(x=>'<article class="decision-card"><div class="card-top"><span class="type-label">批准 / 退回</span></div><h3>'+esc(x.task.title||'')+'</h3><div class="submission">'+esc(x.submission||'')+'</div><div class="decision-actions"><button class="approve" data-cmd="decide:'+esc(String(x.task.id))+':approve">批准</button><button class="reject" data-cmd="decide:'+esc(String(x.task.id))+':reject">退回</button></div></article>').join('')
     +asks.map(x=>'<article class="decision-card"><div class="card-top"><span class="type-label">回复 / 放行</span></div><h3>'+esc(x.task.title||'')+'</h3><div class="submission">'+esc(x.question||'')+'</div><label class="comment-field"><span>答复</span><textarea data-note="'+esc(String(x.task.id))+'"></textarea></label><div class="decision-actions"><button class="approve" data-cmd="decide:'+esc(String(x.task.id))+':reply">回复并恢复</button></div></article>').join('')
-    +'</div></div>';$('drawer').innerHTML='<div class="kicker">INBOX</div><h2>老板决定</h2><p class="meta">批准、退回、回复员工提问都会解除阻塞并恢复任务。</p>';
+    +'</div></div>';$('drawer').innerHTML='<div class="kicker">INBOX</div><h2>老板决定</h2><p class="meta">批准、退回、回复员工提问都会解除阻塞并恢复任务。</p>'
+    +'<section><h3>提醒</h3><div class="inbox-list">'+noticesHtml()+'</div></section>';
 }
 function renderDefs(){
   $('flow-pane').innerHTML='<div class="flow-pane"><div class="flow-head"><h1>编制</h1></div><div class="decision-grid">'

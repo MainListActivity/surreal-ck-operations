@@ -17,7 +17,7 @@ import type { PluginServerContext } from "@getpaseo/plugin/server";
  */
 const EXTERNAL = ["CLOUDFLARE_", "CF_API_", "SURREAL", "JEV_", "TYPESAFE_", "ELEVENLABS_", "XI_API_KEY"];
 /** Plumbing variables only the company itself sets; a shell startup file never exports these. */
-const INTERNAL = ["SCK_OPS_", "SCK_PRODUCT_ENV", "SCK_MCP_TOKEN", "SCK_SERVICE_GATE", "SCK_EMPLOYEE_CREDENTIAL"];
+const INTERNAL = ["SCK_OPS_", "SCK_PRODUCT_ENV", "SCK_MCP_TOKEN", "SCK_OWNER_TOKEN", "SCK_SERVICE_GATE", "SCK_EMPLOYEE_CREDENTIAL"];
 
 const LOOKUP_MS = 2_000;
 /** Read by scripts/sandbox/launch.sh, which Paseo runs in place of each provider binary. */

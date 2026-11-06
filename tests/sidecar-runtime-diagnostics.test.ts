@@ -7,6 +7,12 @@ import { commDir, reqDir, resDir, readJsonFile } from '../src/comm.ts';
 import type { ActiveLease, ClaimResult, LeaseProof, TaskView } from '../src/contracts.ts';
 import type { EmployeeInst, SupervisedTask } from '../src/workforce.ts';
 
+/** Restore an optional env var without writing the literal string "undefined" (Node turns undefined into that). */
+const restoreServiceHome = (prev: string | undefined): void => {
+  if (prev === undefined) delete process.env.SCK_SERVICE_HOME;
+  else process.env.SCK_SERVICE_HOME = prev;
+};
+
 // SYS04: the plugin runtime diagnostic rides the employee's own `sck call` channel. These cases pin what the
 // acceptance asks for — the answer comes from the plugin execution context, an unauthorized request is
 // refused, and no sensitive content rides along.
@@ -191,7 +197,7 @@ describe('plugin_runtime_diagnostics through the employee channel', () => {
       expect(text).not.toContain('SCK_EMPLOYEE_CREDENTIAL');
       // The boundary is declared in the answer itself, so a reader can check it without the source.
       expect(text).toContain('process environment values');
-    } finally { process.env.SCK_SERVICE_HOME = prev; }
+    } finally { restoreServiceHome(prev); }
   });
 
   test('the reported release binding is the loaded code, not the active symlink', async () => {
@@ -212,7 +218,7 @@ describe('plugin_runtime_diagnostics through the employee channel', () => {
       // The binding names the release the plugin's own code resolves into, never the symlink's target.
       expect(binding.path).not.toBe(elsewhere);
       expect(String(JSON.stringify(answer.data))).not.toContain(elsewhere);
-    } finally { process.env.SCK_SERVICE_HOME = prev; }
+    } finally { restoreServiceHome(prev); }
   });
 
   test('an unauthorized role is refused through the channel and no diagnostic is produced', async () => {

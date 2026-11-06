@@ -4,13 +4,14 @@ import { workspaceScopeFor } from '../goal-workspace-capability.ts';
 import { FACTORY_PROVIDER, FACTORY_WAIT_LIMIT, factoryFirst, factoryQueue, leaveFactoryQueue } from './provider-order.ts';
 import { managedModel, employeeClientModel } from "../model-routing/policy.ts";
 import type { OwnerDesk } from '../owner.ts';
-import { OutboundMessageStore, type MessageStep } from '../outbound-messages.ts';
+import { OutboundMessageStore, renderMessage, type MessageStep, type OutboundMessage } from '../outbound-messages.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
 import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, RetirementKind, Role, WriteScopeHolder } from '../contracts.ts';
 import { REQUIRED_TRACKS } from '../core.ts';
 import { UNATTENDED_MODE, type PaseoGateway, type PaseoWorkspaceInfo } from './paseo.ts';
-import { evalPrompt, recoveryWake, wake, type PromptEnv } from './prompts.ts';
+import { latestFindings } from './brief.ts';
+import { recoveryWake, wake, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
 import { agingLevel, agingText, localDate, renderBrief, type RoleCapacity } from '../owner-brief.ts';
 import type { ReclaimResult } from './worktree-registry.ts';
@@ -600,6 +601,7 @@ export interface SidecarBridge {
  * spawn cwd and repoHome bind to, `project` is the project id readWorkspace resolves.
  */
 interface DispatchAnchor { task?: SupervisedTask; home?: string; project?: string; goalId?: string; goalTitle?: string }
+interface PreparedOutbound { body: string; message: OutboundMessage; workdir?: string }
 /** Optional hooks around the only external Paseo actions (send/spawn), used by the owner-wake CAS. */
 interface AssignHooks {
   /** Durable successor CAS before allocating its lease. */
@@ -756,11 +758,12 @@ export class Dispatcher {
     return this.messages;
   }
   /**
-   * The dispatch message is the latest draft's body (locked, audited, owner-visible), plus the working
-   * directory line. hold=true => no dispatch: the task waits in the owner inbox until released.
-   * A runtime without the store (tests) falls back to the template prompt unchanged.
+   * The dispatch message is the latest draft's body, rendered with the receiving employee's real paths.
+   * A held message raises the owner notice and returns null; no claim should be taken for it.
+   * The store keeps the message in draft until the caller confirms the external send succeeded.
    */
-  private async outbound(taskId: string, step: MessageStep, employeeId: string, workdir?: string): Promise<string | null | undefined> {
+  private async prepareOutbound(taskId: string, step: MessageStep, employeeId: string,
+    workdir?: string, history?: ClaimResult['history'], opsRepo?: string): Promise<PreparedOutbound | null | undefined> {
     const store = this.messageStore();
     if (!store) return undefined;
     try {
@@ -771,10 +774,58 @@ export class Dispatcher {
           { commands: 0, revoked: [], extended: [], woke: [], retired: [], exhausted: [], notices: [], evals: [], decisions: [] });
         return null;
       }
-      return workdir ? `${prepared.body}\n工作目录：${workdir}` : prepared.body;
+      const findings = latestFindings(history);
+      // Code dispatches name the task's own machine criterion id; plain steps carry no {acId} placeholder.
+      const acId = step === 'execute' || step === 'rework' ? await store.machineCriterionId(taskId) : undefined;
+      const body = renderMessage(prepared.body, {
+        sckBin: this.deps.env.sckBin, commDir: this.deps.sidecar?.commDirFor(employeeId) ?? '$SCK_COMM_DIR',
+        ...(findings ? { findingsFile: findings.file } : {}), taskId, ...(opsRepo ? { opsRepo } : {}),
+        ...(acId ? { acId } : {}),
+      });
+      return { ...prepared, body, workdir };
     } catch (error) {
+      // Fail closed: a legacy prompt here would bypass the owner's edit and hold.
       this.log(`outbound message read failed for ${taskId}: ${(error as Error).message}`);
-      return undefined;
+      return null;
+    }
+  }
+
+  /** The pre-claim hold check: the same draft the send path would read, without touching a lease. */
+  private async heldMessage(taskId: string, step: MessageStep, report: TickReport): Promise<boolean> {
+    const store = this.messageStore();
+    if (!store) return false;
+    try {
+      if (!await store.isHeld(taskId, step)) return false;
+      await this.notice(`message-hold:${taskId}:${step}`,
+        `任务 ${taskId} 的 ${step} 消息被标记「需要我放行」；请在消息流里放行后再派工。`, report);
+      return true;
+    } catch (error) {
+      this.log(`outbound hold read failed for ${taskId}: ${(error as Error).message}`);
+      return true; // an unreadable hold gate fails closed: no claim, no version churn
+    }
+  }
+
+  /** Render the table body with the workdir line. No write: the row stays draft until the external send landed. */
+  private outboundBody(prepared: PreparedOutbound | null | undefined): string | null | undefined {
+    if (!prepared) return prepared;
+    return prepared.workdir ? `${prepared.body}\n工作目录：${prepared.workdir}` : prepared.body;
+  }
+
+  /** Lock the drafted message as sent, and close its hold notice, after the external send succeeded. */
+  private async markOutbound(prepared: PreparedOutbound | null | undefined, employeeId: string): Promise<void> {
+    if (!prepared) return;
+    const store = this.messageStore();
+    if (!store) return;
+    try {
+      await store.markSent(prepared.message.id, employeeId, prepared.message.body);
+    } catch (error) {
+      this.log(`outbound message sent-lock failed: ${(error as Error).message}`);
+      return;
+    }
+    try {
+      await this.deps.owner.resolveNotice(`message-hold:${prepared.message.taskId}:${prepared.message.step}`);
+    } catch (error) {
+      this.log(`failed to resolve message-hold notice for ${prepared.message.taskId}:${prepared.message.step}: ${(error as Error).message}`);
     }
   }
 
@@ -1949,8 +2000,23 @@ export class Dispatcher {
           continue;
         }
         if (running >= cfg.maxRunning || dispatched) continue;
+        // The eval message itself is an owner-previewable draft. It carries the task id and the absolute eval.md path;
+        // no task.md is staged for eval, and the row is marked sent only after the dispatch succeeded.
+        const store = this.messageStore();
+        if (!store) continue;
+        const draft = await store.ensureDraft(task.id, 'eval', 'eval');
+        if (draft.hold || draft.state === 'held') {
+          await this.notice(`message-hold:${task.id}:eval`,
+            `任务 ${task.id} 的 eval 消息被标记「需要我放行」；请在消息流里放行后再派工。`, report);
+          continue;
+        }
+        const prepared = await this.prepareOutbound(task.id, 'eval', '', undefined, undefined, this.deps.env.opsRepo)
+          .catch(error => { this.log(`eval message read failed for ${task.id}: ${(error as Error).message}`); return null; });
+        if (!prepared) continue;
+        const body = this.outboundBody(prepared);
+        if (typeof body !== 'string') continue;
         const result = await this.assign('eval', undefined, last?.employee, pick, spawnable,
-          (inst, first, claim, worktree) => evalPrompt(inst, task, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, slotMap, undefined, { task });
+          () => body, report, insts, false, slotMap, undefined, { task }, undefined, prepared);
         if (result) {
           await wf.recordDispatch(task.id, task.version, 'eval', result.id);
           running++;
@@ -2134,9 +2200,19 @@ export class Dispatcher {
     prompt: (inst: EmployeeInst, firstContact: boolean, claim?: ClaimResult, workspace?: WorktreeAssignment) => string,
     report: TickReport, insts: EmployeeInst[], forReview = false,
     slots?: Map<string, string>, recusal?: ReviewRecusal, anchor?: DispatchAnchor,
-    hooks?: AssignHooks,
+    hooks?: AssignHooks, evalMessage?: PreparedOutbound,
   ): Promise<(EmployeeInst & { spawned: boolean }) | undefined> {
     const { workforce: wf, paseo, env, sidecar } = this.deps;
+    const stepFor = (claim?: ClaimResult): MessageStep => task?.state === 'review' ? 'review'
+      : claim?.history?.some(h => h.action === 'return' || h.action === 'owner_reject') ? 'rework' : 'execute';
+    const nextStep = async (claim?: ClaimResult): Promise<MessageStep> => {
+      if (!task) return stepFor(claim);
+      return await this.messageStore()?.nextStep(task.id).catch(() => undefined) ?? stepFor(claim);
+    };
+    // The owner can hold a message before we claim: no lease, no version bump, no audit row this tick.
+    // Both the reuse and spawn paths share this gate; the post-claim read stays as a backstop.
+    const preStep = await nextStep(undefined);
+    if (task && await this.heldMessage(task.id, preStep, report)) return undefined;
     if (task && sidecar) {
       const deny = this.taskDeny.get(task.id);
       if (deny && deny.version === task.version && Date.now() - deny.at < CLAIM_DENY_COOLDOWN_MS) return undefined;
@@ -2194,11 +2270,20 @@ export class Dispatcher {
           // instance's claim re-resolves the same registered worktree, so its
           // spawn cwd matches by construction.
         } else {
-          const step: MessageStep = task?.state === 'review' ? 'review' : claim?.history?.some(h => h.action === 'return' || h.action === 'owner_reject') ? 'rework' : 'execute';
-          const body = task ? await this.outbound(task.id, step, existing.id, (claim?.worktree ?? workspace)?.worktreePath) : null;
-          if (task && body === null) { if (claim) await sidecar!.releaseClaim(existing.id, task.id, '消息需要老板放行'); return undefined; }
+          const prepared = evalMessage ?? (task ? await this.prepareOutbound(task.id, await nextStep(claim), existing.id,
+            (claim?.worktree ?? workspace)?.worktreePath, claim?.history, env.opsRepo) : null);
+          if (task && prepared === null) {
+            if (claim) await sidecar!.releaseClaim(existing.id, task.id, '派工消息需要老板放行，已收回本次预领租约并等待放行');
+            return undefined;
+          }
+          const body = this.outboundBody(prepared);
+          if (task && body === null) {
+            if (claim) await sidecar!.releaseClaim(existing.id, task.id, '派工消息读取失败，已收回本次预领租约等待重试');
+            return undefined;
+          }
           await hooks?.beforeExternal?.(existing, 'send');
           await paseo.send(existing.paseoAgentId!, task && body ? body : prompt(existing, first, claim, workspace));
+          await this.markOutbound(prepared ?? undefined, existing.id);
           await hooks?.afterExternal?.(existing, 'send', existing.paseoAgentId!);
           this.onboarded.add(existing.id);
           this.lastStatus.set(existing.paseoAgentId!, 'running');
@@ -2249,9 +2334,19 @@ export class Dispatcher {
         // Legacy instances keep their existing launch directory until normal retirement.
         const instHome = sidecar?.commDirFor(inst.id);
         const spawnCwd = workspaceScope ? repoHome : instHome ?? (claim?.worktree ?? workspace)?.worktreePath ?? repoHome;
-        const step: MessageStep = task?.state === 'review' ? 'review' : claim?.history?.some(h => h.action === 'return' || h.action === 'owner_reject') ? 'rework' : 'execute';
-        const body = task ? await this.outbound(task.id, step, inst.id, spawnCwd) : null;
-        if (task && body === null) { if (claim) await sidecar!.releaseClaim(inst.id, task.id, '消息需要老板放行'); return undefined; }
+        // A workspace-scoped session keeps its repo-root cwd, but the workdir line must still name the claim's tree.
+        const workdir = (claim?.worktree ?? workspace)?.worktreePath ?? spawnCwd;
+        const prepared = evalMessage ?? (task ? await this.prepareOutbound(task.id, await nextStep(claim), inst.id,
+          workdir, claim?.history, env.opsRepo) : null);
+        if (task && prepared === null) {
+          if (claim) await sidecar!.releaseClaim(inst.id, task.id, '派工消息需要老板放行，已收回本次预领租约并等待放行');
+          return undefined;
+        }
+        const body = this.outboundBody(prepared);
+        if (task && body === null) {
+          if (claim) await sidecar!.releaseClaim(inst.id, task.id, '派工消息读取失败，已收回本次预领租约等待重试');
+          return undefined;
+        }
         await hooks?.beforeExternal?.(inst, 'spawn');
         const agentId = await paseo.spawn({
           title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model, thinking: def.thinking,
@@ -2262,6 +2357,7 @@ export class Dispatcher {
           env: spawnEnv,
           prompt: task && body ? body : prompt(inst, true, claim, workspace),
         });
+        await this.markOutbound(prepared ?? undefined, inst.id);
         await hooks?.afterExternal?.(inst, 'spawn', agentId);
         const cwd = spawnCwd;
         await wf.bind(inst.id, { agentId, cwd, repoHome, model, workspaceScope });

@@ -250,6 +250,10 @@ export interface TaskView {
   id: TaskId;
   title: string;
   context: string;
+  /** Owner-edited requirement, staged verbatim as task.md's 需求 section. */
+  requirement?: string;
+  /** Owner-edited acceptance criteria, staged verbatim as task.md's 验收标准 section. */
+  acceptanceText?: string;
   state: TaskState;
   executorRole: Role;
   reviewerRole: ReviewerRole;

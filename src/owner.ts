@@ -134,11 +134,16 @@ export class OwnerDesk {
       vars[`t${i}`] = ids[t.ref];
       const specVars: Record<string, unknown> = { title: t.title, context: t.context, kind: t.kind,
         executor_role: t.executorRole, reviewer_role: t.reviewerRole, dependencies: t.deps.map(d => ids[d]),
+        discipline: (t as { discipline?: string }).discipline,
+        work_intent: (t as { workIntent?: unknown }).workIntent,
+        code_repo_path: (t as { codeRepoPath?: string }).codeRepoPath,
+        acceptance_criteria: (t as { acceptanceCriteria?: unknown }).acceptanceCriteria,
         requirement: (t as { requirement?: string }).requirement ?? row.brief,
         acceptance_text: (t as { acceptanceText?: string }).acceptanceText ?? '按目标原文在生产逐条验证。' };
       vars[`spec${i}`] = specVars;
       return `CREATE ONLY $t${i} CONTENT { title: $spec${i}.title, context: $spec${i}.context, kind: $spec${i}.kind,
-          executor_role: $spec${i}.executor_role, reviewer_role: $spec${i}.reviewer_role, dependencies: $spec${i}.dependencies, work_intent: $spec${i}.work_intent,
+          executor_role: $spec${i}.executor_role, reviewer_role: $spec${i}.reviewer_role, dependencies: $spec${i}.dependencies,
+          discipline: $spec${i}.discipline, work_intent: $spec${i}.work_intent,
           code_repo_path: $spec${i}.code_repo_path,
           requirement: $spec${i}.requirement, acceptance_text: $spec${i}.acceptance_text,
           acceptance_criteria: $spec${i}.acceptance_criteria,
@@ -167,7 +172,7 @@ export class OwnerDesk {
     for (const [i, t] of template.tasks.entries()) {
       const taskId = String(ids[t.ref]!.id);
       await messages.createTaskDrafts(taskId, t.executorRole, t.reviewerRole,
-        isPipeline(row.pipeline) ? row.pipeline !== 'software' : false).catch(error =>
+        (isPipeline(row.pipeline) ? row.pipeline : 'software') === 'software').catch(error =>
         console.warn(`outbound drafts for ${taskId} failed: ${(error as Error).message}`));
     }
     // SYS07: every new goal starts with a structured outcome contract. It derives implementation/final-gate
@@ -177,9 +182,7 @@ export class OwnerDesk {
       goalId, expectedVersion: 0,
       outcome: {
         expected: `${after.title}：${after.brief}`.slice(0, 4000),
-        requiredEvidence: after.pipeline === 'video' || after.pipeline === 'story'
-          ? ['implementation', 'owner_final']
-          : tier === 'quick' ? ['implementation', 'final_acceptance'] : ['implementation', 'owner_final'],
+        requiredEvidence: [template.tasks.some(t => t.reviewerRole === 'owner') ? 'owner_final' : 'final_acceptance'],
         responsibleRole: 'owner',
         reason: '目标 triage 时登记的默认成果契约；可在版本 CAS 下补充客户激活/采纳证据',
       },

@@ -10,11 +10,15 @@ import type { CompanyCore } from './contracts.ts';
 import { Workforce } from './workforce.ts';
 import { OutboundMessageStore } from './outbound-messages.ts';
 import { CompanyError } from './core-errors.ts';
-import { ROLES, type GoalTier, type Role } from './contracts.ts';
+import { ROLES, type CreateTask, type GoalTier, type Role } from './contracts.ts';
 import { isPipeline } from './flows.ts';
+import { HASH, REQUIRED_TRACKS } from './core.ts';
+import { defaultAcceptanceCriteria } from './acceptance.ts';
+import { GoalGovernanceStore } from './goal-store.ts';
+import { readTaskCost, recordTaskCost, COST_LIST_SQL } from './task-cost.ts';
 
 export type OwnerVia = string;
-export interface OwnerApiContext { db: CompanyDatabase; core: CompanyCore; owner: OwnerDesk; workforce: Workforce; messages: OutboundMessageStore; opsRepo: string; upgrades?: { inbox(): Promise<unknown>; setAuto(enabled: boolean, source: string): Promise<unknown>; start(input: { taskId: string; taskVersion: number; digest: string }, source: string): Promise<unknown> } }
+export interface OwnerApiContext { db: CompanyDatabase; core: CompanyCore & { ownerGoalPhaseSplit(via: string, input: { goalId: string; taskIds: string[]; title: string; reason: string; idempotencyKey: string }): Promise<unknown> }; owner: OwnerDesk; workforce: Workforce; messages: OutboundMessageStore; opsRepo: string; upgrades?: { inbox(): Promise<unknown>; setAuto(enabled: boolean, source: string): Promise<unknown>; start(input: { taskId: string; taskVersion: number; digest: string }, source: string): Promise<unknown> } }
 
 const actor = (via: string) => `owner:${via || 'web'}`;
 const text = (value: unknown, field: string, min = 1, max = 20000): string => {
@@ -28,7 +32,9 @@ const strArray = (value: unknown): string[] => Array.isArray(value) ? value.filt
 export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unknown>, via: OwnerVia): Promise<unknown> {
   const command = String(input.command ?? '');
   const a = actor(via);
-  const key = () => `owner:${via}:${command}:${randomUUID()}`;
+  const idemp = typeof input.idempotencyKey === 'string' && /^[A-Za-z0-9_:.-]{8,120}$/.test(input.idempotencyKey)
+    ? input.idempotencyKey : undefined;
+  const key = () => idemp ? `owner:${via}:${command}:${idemp}` : `owner:${via}:${command}:${randomUUID()}`;
   const db = ctx.db.db;
   switch (command) {
     // ---- 目标 ----
@@ -37,6 +43,40 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     case 'goal.triage': return ctx.owner.triage(text(input.goalId, 'goalId'), text(input.tier, 'tier') as GoalTier, a);
     case 'goal.cancel': return ctx.owner.cancelGoal({ goalId: text(input.goalId, 'goalId'), note: text(input.note, 'note', 2), source: a, key: key() });
     case 'goal.list': { const [rows] = await db.query<[unknown[]]>('SELECT * FROM goal ORDER BY created_at DESC LIMIT 200;'); return { goals: rows }; }
+    case 'goal.split': {
+      const taskIds = Array.isArray(input.taskIds)
+        ? strArray(input.taskIds)
+        : typeof input.taskIds === 'string'
+        ? input.taskIds.split(',').map(s => s.trim()).filter(Boolean)
+        : [];
+      if (!taskIds.length) throw new CompanyError('invalid', 'taskIds invalid');
+      return ctx.core.ownerGoalPhaseSplit(via, {
+        goalId: text(input.goalId, 'goalId'),
+        taskIds,
+        title: text(input.title, 'title', 4, 60),
+        reason: text(input.reason, 'reason', 4, 4000),
+        idempotencyKey: key(),
+      });
+    }
+    case 'goal.retired.list': return new GoalGovernanceStore(db).retiredWorkPending(text(input.goalId, 'goalId'));
+    case 'goal.retired.resolve': {
+      const replacementTaskIds = Array.isArray(input.replacementTaskIds)
+        ? strArray(input.replacementTaskIds)
+        : typeof input.replacementTaskIds === 'string'
+        ? input.replacementTaskIds.split(',').map(s => s.trim()).filter(Boolean)
+        : [];
+      return new GoalGovernanceStore(db).resolveRetiredWork({
+        goalId: text(input.goalId, 'goalId'),
+        taskId: text(input.taskId, 'taskId'),
+        goalVersion: typeof input.goalVersion === 'number' ? input.goalVersion : Number(input.goalVersion),
+        taskVersion: typeof input.taskVersion === 'number' ? input.taskVersion : Number(input.taskVersion),
+        disposition: text(input.disposition, 'disposition') as 'fixture' | 'replaced' | 'excluded',
+        replacementTaskIds,
+        reason: text(input.reason, 'reason', 10, 4000),
+        actor: a,
+        key: key(),
+      });
+    }
 
     // ---- 任务 ----
     case 'task.create': {
@@ -47,16 +87,29 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       if (!ROLES.includes(executor)) throw new CompanyError('invalid', 'unknown executorRole');
       if (reviewer !== 'owner' && !ROLES.includes(reviewer)) throw new CompanyError('invalid', 'unknown reviewerRole');
       const deps = strArray(input.dependencies);
-      // The owner control-plane credential is only available to the HTTP process; use core's internal create path
-      // under the owner principal through a direct employee credential minted at boot.
       const ownerCred = process.env.SCK_OWNER_TOKEN;
       if (!ownerCred) throw new CompanyError('temporarily_unavailable', 'owner token not configured');
-      const task = await ctx.core.createTask(ownerCred, { title: text(input.title, 'title', 3), context: requirement,
-        executorRole: executor, reviewerRole: reviewer, dependencies: deps, goalId: optionalText(input.goalId),
-        project: optionalText(input.project), idempotencyKey: key() } as never);
+      const isEngineering = executor === 'engineering';
+      const kind = optionalText(input.kind) as CreateTask['kind'] | undefined;
+      const discipline = optionalText(input.discipline) ?? (isEngineering ? undefined : REQUIRED_TRACKS[executor]);
+      const codeRepoPath = optionalText(input.codeRepoPath);
+      const workIntent = isEngineering && !input.workIntent
+        ? { kind: 'code' as const, lane: `delivery-${HASH(`task\0${key()}`).slice(0, 8)}` }
+        : input.workIntent as CreateTask['workIntent'] | undefined;
+      const acceptanceCriteria = isEngineering && !input.acceptanceCriteria
+        ? defaultAcceptanceCriteria('deploy')
+        : input.acceptanceCriteria as CreateTask['acceptanceCriteria'] | undefined;
+      const task = await ctx.core.createTask(ownerCred, {
+        title: text(input.title, 'title', 3), context: requirement,
+        executorRole: executor, reviewerRole: reviewer, dependencies: deps,
+        goalId: optionalText(input.goalId), project: optionalText(input.project),
+        kind: kind ?? (isEngineering ? 'deploy' : 'task'),
+        discipline, codeRepoPath, workIntent, acceptanceCriteria,
+        idempotencyKey: key(),
+      } as never);
       await db.query('UPDATE ONLY $task SET requirement = $requirement, acceptance_text = $acceptance;',
         { task: new RecordId('task', task.id), requirement, acceptance });
-      await ctx.messages.createTaskDrafts(task.id, executor, reviewer, executor === 'engineering');
+      await ctx.messages.createTaskDrafts(task.id, executor, reviewer, isEngineering);
       return task;
     }
     case 'task.update': {
@@ -66,8 +119,11 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       if (input.acceptanceText !== undefined || input.acceptance_text !== undefined) patch.acceptance_text = text(input.acceptanceText ?? input.acceptance_text, 'acceptanceText');
       if (input.title !== undefined) patch.title = text(input.title, 'title', 3);
       if (!Object.keys(patch).length) throw new CompanyError('invalid', 'no fields to update');
-      const [rows] = await db.query<[unknown[]]>('UPDATE ONLY $task MERGE $patch RETURN AFTER;', { task: new RecordId('task', taskId), patch });
+      const taskRecord = new RecordId('task', taskId);
+      const [rows] = await db.query<[unknown[]]>('UPDATE $task MERGE $patch RETURN AFTER;', { task: taskRecord, patch });
       if (!rows?.length) throw new CompanyError('not_found', 'task not found');
+      await db.query("CREATE audit CONTENT { task: $task, actor: $actor, action: 'owner_task_update', evidence: $evidence, at: time::now() };",
+        { task: taskRecord, actor: a, evidence: Object.keys(patch).join(', ') });
       return rows[0];
     }
     case 'task.delete': return ctx.owner.retire({ taskId: text(input.taskId, 'taskId'), note: text(input.note, 'note', 2), source: a, key: key() });
@@ -90,6 +146,16 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     case 'task.unlock': return { unlocked: await ctx.owner.unlockDependents({ taskId: text(input.taskId, 'taskId'), source: a }) };
     case 'task.pause': await ctx.owner.setPaused(true); return { paused: true };
     case 'task.resume': await ctx.owner.setPaused(false); return { paused: false };
+    case 'task.cost': {
+      if (input.taskId !== undefined) {
+        const taskId = text(input.taskId, 'taskId');
+        const cost = await readTaskCost(db, taskId) ?? await recordTaskCost(db, taskId);
+        return { cost: cost ?? null };
+      }
+      const days = typeof input.days === 'number' && Number.isFinite(input.days) && input.days > 0 ? Math.min(60, input.days) : 7;
+      const [rows] = await db.query<[unknown[]]>(COST_LIST_SQL, { span: `${days}d` });
+      return { costs: rows };
+    }
     case 'decide': case 'approve': case 'reject': case 'reply': {
       const decision = command === 'decide' ? text(input.decision, 'decision') : command;
       return ctx.owner.decide({ taskId: text(input.taskId, 'taskId'), decision: decision as 'approve' | 'reject' | 'reply',
@@ -104,6 +170,16 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     case 'upgrade.automatic': { const enabled = input.enabled === true; return ctx.upgrades ? await ctx.upgrades.setAuto(enabled, a) : { ok: false }; }
     case 'upgrade.start': return ctx.upgrades ? await ctx.upgrades.start({ taskId: text(input.taskId, 'taskId'), taskVersion: Number(input.taskVersion), digest: text(input.digest, 'digest') }, a) : { ok: false };
     case 'brief': return ctx.owner.brief();
+    case 'direction.add':
+      await ctx.owner.addDirection({ text: text(input.text, 'text', 2), source: a, key: key() });
+      return { ok: true };
+    case 'instruct':
+      return ctx.owner.instruct({ text: text(input.text, 'text', 2), source: a, key: key() });
+    case 'notice.resolve':
+      await ctx.owner.resolveNotice(text(input.key, 'key'));
+      return { ok: true };
+    case 'notice.list':
+      return { notices: await ctx.owner.openNotices() };
 
     // ---- 待发消息 ----
     case 'message.list': return { messages: await ctx.messages.list(optionalText(input.taskId), input.includeSent !== false) };
