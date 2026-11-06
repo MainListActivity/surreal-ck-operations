@@ -246,7 +246,7 @@ run('disabling automatic authorization during checking prevents install and neve
 run('automatic task dependencies are rechecked and must be accepted before any job starts',async()=>{
  await resetAutomaticFixture();const t=await task();await service.setAuto(true,'owner:test');
  const dep=new RecordId('task',crypto.randomUUID());
- await db.db.query("CREATE $dep CONTENT {title:'待独立验收',state:'review',version:1}; UPDATE $task SET dependencies=[$dep];",{dep,task:new RecordId('task',t.id)});
+ await db.db.query("CREATE $dep CONTENT {title:'待独立验收',state:'review',version:1}; UPDATE $task SET parent=$dep;",{dep,task:new RecordId('task',t.id)});
  await expect(service.autoStart()).rejects.toThrow('前置');
  await db.db.query("UPDATE $dep SET state='done';",{dep});expect(await service.autoStart()).toBeDefined();
 });
@@ -268,7 +268,7 @@ run('an automatic exact-version acknowledgement verifies without installing twic
 run('reopened prerequisites and a replacement automatic grant both block the installation boundary',async()=>{
  await resetAutomaticFixture();const t=await task();await service.setAuto(true,'owner:test');
  const dep=new RecordId('task',crypto.randomUUID());
- await db.db.query("CREATE $dep CONTENT {title:'已验收前置',state:'done',version:1};UPDATE $task SET dependencies=[$dep];",{dep,task:new RecordId('task',t.id)});
+ await db.db.query("CREATE $dep CONTENT {title:'已验收前置',state:'done',version:1};UPDATE $task SET parent=$dep;",{dep,task:new RecordId('task',t.id)});
  const j=await service.autoStart();let installs=0;
  await runCompanyUpgrade(service,j!.jobId,{run:async(_exe,args)=>{
   if(args.includes('sidecar-review'))await db.db.query("UPDATE $dep SET state='review';",{dep});

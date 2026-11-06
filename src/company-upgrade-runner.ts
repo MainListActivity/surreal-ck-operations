@@ -117,6 +117,8 @@ export async function runCompanyUpgrade(service:CompanyUpgrades,id:string,option
     IF $automatic {
      IF $c.paused=true {THROW '老板已暂停派工，自动升级停止';};
      IF $t.version!=$taskVersion OR $t.company_upgrade.digest!=$digest {THROW '升级任务已经变化';};
+     LET $undone=SELECT id FROM task WHERE id IN $ancestors AND state NOT IN ['done','void'];
+     IF array::len($undone)>0 {THROW '升级前置任务尚未全部验收完成';};
     };
     LET $j=SELECT * FROM ONLY $job;
     LET $before=IF $j.pause_version!=NONE AND $j.pause_version=$c.pause_version THEN $j.paused_before ELSE $c.paused??false END;
@@ -124,7 +126,7 @@ export async function runCompanyUpgrade(service:CompanyUpgrades,id:string,option
     UPSERT ONLY company_meta:config SET paused=true,pause_version=$revision;
     UPDATE $job SET previous=$previous,paused_before=$before,pause_version=$revision,status='installing',phase='安装版本并切换公司插件',updated_at=time::now();
     RETURN {before:$before,revision:$revision};
-    COMMIT;`,{job:job.id,previous,automatic:job.authorization==='automatic',policyRevision:job.policy_revision,task:job.task,taskVersion:job.task_version,digest:job.plan.digest});
+    COMMIT;`,{job:job.id,previous,automatic:job.authorization==='automatic',policyRevision:job.policy_revision,task:job.task,taskVersion:job.task_version,digest:job.plan.digest,ancestors:await service.taskAncestors(String(job.task.id))});
    const pause=pauseResults.find(x=>x&&typeof x==='object'&&'revision' in x) as {before:boolean;revision:number}|undefined;
    if(!pause)throw Error('pause ownership unavailable');
    pausedBefore=pause.before;pausedVersion=pause.revision;

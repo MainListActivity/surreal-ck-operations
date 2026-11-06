@@ -57,6 +57,14 @@ export class CompanyUpgrades {
   return this.autoPolicy();
  }
  /** Called by the control loop, never on an inference request. The detached runner owns expensive work. */
+ /** The parent chain of a task as record ids — the automatic upgrade's prerequisite set. */
+ async taskAncestors(taskId:string,depth=0):Promise<RecordId[]>{
+  if(depth>32)return[];
+  const [rows]=await this.db.query<[Array<{parent?:RecordId}>]>('SELECT parent FROM $task;',{task:new RecordId('task',taskId)});
+  const parent=rows?.[0]?.parent;
+  if(!parent)return[];
+  return[parent,...(await this.taskAncestors(String(parent.id),depth+1))];
+ }
  async autoStart(){
   if(!(await this.autoPolicy()).enabled)return;
   const [cfg]=await this.db.query<[{paused?:boolean}]>('SELECT paused FROM ONLY company_meta:config;');
@@ -85,6 +93,7 @@ export class CompanyUpgrades {
   const current=await installedRelease(this.options.home);
   if(current.sha!==plan.sha&&compareRelease(plan.version,current.version)<0)throw new CompanyError('invalid','该版本已被现役版本取代，无需再安装；请改为关闭这张旧待办');
   if(current.sha!==plan.sha&&compareRelease(plan.version,current.version)===0)throw new CompanyError('invalid','目标版本不高于当前版本，请工程提交新的版本号');
+  const ancestors=await this.taskAncestors(input.taskId);
   const jobId=randomUUID();
   const results=await this.db.query(`BEGIN;
    LET $t=SELECT * FROM ONLY $task;
@@ -93,6 +102,8 @@ export class CompanyUpgrades {
    IF $t.version!=$version OR $t.company_upgrade.digest!=$digest OR $t.company_upgrade.sha!=$sha {THROW '升级内容或任务版本已变化，请刷新';};
    IF $t.company_upgrade=NONE OR NOT (($t.state='blocked' AND $t.blocked_to='owner') OR ($t.state='review' AND $t.reviewer_role='owner')) {THROW '任务已不在老板收件箱，不能升级';};
    IF $automatic {
+    LET $undone=SELECT id FROM task WHERE id IN $ancestors AND state NOT IN ['done','void'];
+    IF array::len($undone)>0 {THROW '升级前置任务尚未全部验收完成';};
    };
    LET $lock=SELECT * FROM ONLY company_meta:upgrade_job;
    LET $active=SELECT * FROM ONLY $lock.job;
@@ -110,7 +121,7 @@ export class CompanyUpgrades {
     CREATE audit CONTENT {task:$task,actor:$source,action:IF $automatic THEN 'company_upgrade_auto_authorized' ELSE 'company_upgrade_authorized' END,evidence:$evidence,version:$version,at:time::now()};
     RETURN SELECT * FROM ONLY $job;
    };
-   COMMIT;`,{task:new RecordId('task',input.taskId),version:input.taskVersion,digest:input.digest,sha:plan.sha,plan,job:new RecordId('company_upgrade',jobId),source,automatic,evidence:`${automatic?'按老板开启的自动升级策略安装':'老板授权升级至'} v${plan.version}；SHA ${plan.sha}；仅验证成功后自动回复通过。`}).responses();
+   COMMIT;`,{task:new RecordId('task',input.taskId),version:input.taskVersion,digest:input.digest,sha:plan.sha,ancestors,plan,job:new RecordId('company_upgrade',jobId),source,automatic,evidence:`${automatic?'按老板开启的自动升级策略安装':'老板授权升级至'} v${plan.version}；SHA ${plan.sha}；仅验证成功后自动回复通过。`}).responses();
   const error=results.find(r=>!r.success&&!r.error.message.includes('not executed')&&!r.error.message.startsWith('Cannot COMMIT'));
   if(error&&!error.success)throw new CompanyError('conflict',error.error.message);
   const result=results.filter(r=>r.success&&r.result&&typeof r.result==='object'&&!Array.isArray(r.result)).at(-1);
