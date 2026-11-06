@@ -210,7 +210,7 @@ export class CompanyDatabase {
     // 迁移是幂等 UPDATE：旧版 release 读不到新表即忽略（RB01）。
     await this.db.query(loadSchema('051-role-message-flow.surql'));
     await this.db.query(loadSchema('052-task-routes.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 51 WHERE schema_version < 51;');
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 52 WHERE schema_version < 52;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {
