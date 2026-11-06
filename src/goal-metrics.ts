@@ -554,7 +554,7 @@ export function segmentGoalMetrics(view: GoalMetricsView, input: {
     segmented: true, section, window: view.window, definitions: view.definitions,
     denominators: view.denominators, exclusions: view.exclusions, coverage: view.coverage, sections,
     ...(page ? { page } : {}), ...(data ? { data } : {}),
-    guidance: 'gm 只读指标分段：每个分段都带窗口、IANA 时区、分母、排除项、数据截止与 coverage；token 与成本不互算，缺 provider 账单为 unknown。列表分段用 page.nextCursor 翻页直到 page.hasMore=false；全部 section 可从本响应的 sections 索引取得。',
+    guidance: 'owner 只读指标分段：每个分段都带窗口、IANA 时区、分母、排除项、数据截止与 coverage；token 与成本不互算，缺 provider 账单为 unknown。列表分段用 page.nextCursor 翻页直到 page.hasMore=false；全部 section 可从本响应的 sections 索引取得。',
   });
   if (!input.section) return base(null);
   const section = input.section;

@@ -1,0 +1,399 @@
+import { expect, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { RecordId } from 'surrealdb';
+import { ownerApi, type OwnerApiContext } from '../src/owner-api.ts';
+import { GoalGovernanceStore } from '../src/goal-store.ts';
+import { pluginOwnerCommand } from '../plugin/server/owner-api.ts';
+
+function makeFakeCtx(overrides?: Partial<OwnerApiContext>) {
+  const queries: Array<{ sql: string; params?: any }> = [];
+  const fakeDb = {
+    query: async (sql: string, params?: any) => {
+      queries.push({ sql, params });
+      return [[]];
+    },
+    select: async () => undefined,
+  };
+  return {
+    ctx: {
+      db: { db: fakeDb } as any,
+      core: {} as any,
+      owner: {} as any,
+      workforce: {} as any,
+      messages: {} as any,
+      opsRepo: '/fake/ops',
+      ...overrides,
+    } as OwnerApiContext,
+    queries,
+  };
+}
+
+// ---- ITEM 1: Idempotency ----
+test('idempotencyKey produces identical key on retry, random UUID when omitted', async () => {
+  const recordedKeys: string[] = [];
+  const fakeOwner = {
+    createGoal: async (input: { text: string; source: string; key: string }) => {
+      recordedKeys.push(input.key);
+      return { id: 'g1', title: input.text };
+    },
+  };
+  const { ctx } = makeFakeCtx({ owner: fakeOwner as any });
+
+  const idempKey = 'retry-test-key-12345';
+  await ownerApi(ctx, { command: 'goal.create', text: 'goal text', idempotencyKey: idempKey }, 'test-agent');
+  await ownerApi(ctx, { command: 'goal.create', text: 'goal text', idempotencyKey: idempKey }, 'test-agent');
+  expect(recordedKeys[0]).toBe(recordedKeys[1]);
+  expect(recordedKeys[0]).toBe(`owner:test-agent:goal.create:${idempKey}`);
+
+  await ownerApi(ctx, { command: 'goal.create', text: 'goal text' }, 'test-agent');
+  await ownerApi(ctx, { command: 'goal.create', text: 'goal text' }, 'test-agent');
+  expect(recordedKeys[2]).not.toBe(recordedKeys[3]);
+  expect(recordedKeys[2]).toStartWith('owner:test-agent:goal.create:');
+  expect(recordedKeys[3]).toStartWith('owner:test-agent:goal.create:');
+});
+
+// ---- ITEM 2: task.update audit ----
+test('task.update writes an audit row with actor owner:<via> and changed fields', async () => {
+  const queries: Array<{ sql: string; params?: any }> = [];
+  const updatedTask = { id: new RecordId('task', 't1'), requirement: 'new req', title: 'new title' };
+  const fakeDb = {
+    query: async (sql: string, params?: any) => {
+      queries.push({ sql, params });
+      if (sql.includes('UPDATE $task MERGE $patch RETURN AFTER;')) {
+        return [[updatedTask]];
+      }
+      return [[]];
+    },
+  };
+  const { ctx } = makeFakeCtx({ db: { db: fakeDb } as any });
+
+  const result = await ownerApi(ctx, { command: 'task.update', taskId: 't1', requirement: 'new req', title: 'new title' }, 'agent1');
+  expect(result).toEqual(updatedTask);
+
+  expect(queries.length).toBe(2);
+  expect(queries[0].sql).toBe('UPDATE $task MERGE $patch RETURN AFTER;');
+  expect(queries[0].params.patch).toEqual({ requirement: 'new req', title: 'new title' });
+
+  expect(queries[1].sql).toContain('CREATE audit CONTENT');
+  expect(queries[1].params.actor).toBe('owner:agent1');
+  expect(queries[1].params.evidence).toContain('requirement');
+  expect(queries[1].params.evidence).toContain('title');
+  expect(queries[1].params.task.toString()).toBe('task:t1');
+});
+
+// ---- ITEM 3: New commands ----
+test('direction.add calls ctx.owner.addDirection with text, source, key', async () => {
+  let recorded: any;
+  const fakeOwner = {
+    addDirection: async (args: any) => { recorded = args; },
+  };
+  const { ctx } = makeFakeCtx({ owner: fakeOwner as any });
+  const res = await ownerApi(ctx, { command: 'direction.add', text: 'New direction' }, 'cli');
+  expect(res).toEqual({ ok: true });
+  expect(recorded.text).toBe('New direction');
+  expect(recorded.source).toBe('owner:cli');
+  expect(recorded.key).toStartWith('owner:cli:direction.add:');
+});
+
+test('instruct calls ctx.owner.instruct with text, source, key', async () => {
+  let recorded: any;
+  const fakeOwner = {
+    instruct: async (args: any) => { recorded = args; return { taskId: 'task-inst-1' }; },
+  };
+  const { ctx } = makeFakeCtx({ owner: fakeOwner as any });
+  const res = await ownerApi(ctx, { command: 'instruct', text: 'Check blocker' }, 'desk');
+  expect(res).toEqual({ taskId: 'task-inst-1' });
+  expect(recorded.text).toBe('Check blocker');
+  expect(recorded.source).toBe('owner:desk');
+  expect(recorded.key).toStartWith('owner:desk:instruct:');
+});
+
+test('notice.resolve calls ctx.owner.resolveNotice with key', async () => {
+  let recordedKey: string | undefined;
+  const fakeOwner = {
+    resolveNotice: async (key: string) => { recordedKey = key; },
+  };
+  const { ctx } = makeFakeCtx({ owner: fakeOwner as any });
+  const res = await ownerApi(ctx, { command: 'notice.resolve', key: 'notice-abc' }, 'cli');
+  expect(res).toEqual({ ok: true });
+  expect(recordedKey).toBe('notice-abc');
+});
+
+test('notice.list calls ctx.owner.openNotices', async () => {
+  const fakeNotices = [{ key: 'n1', text: 'notice 1', at: '2026-01-01' }];
+  const fakeOwner = {
+    openNotices: async () => fakeNotices,
+  };
+  const { ctx } = makeFakeCtx({ owner: fakeOwner as any });
+  const res = await ownerApi(ctx, { command: 'notice.list' }, 'cli');
+  expect(res).toEqual({ notices: fakeNotices });
+});
+
+test('goal.split calls ctx.core.ownerGoalPhaseSplit with arguments', async () => {
+  let recordedVia: string | undefined;
+  let recordedInput: any;
+  const fakeCore = {
+    ownerGoalPhaseSplit: async (via: string, input: any) => {
+      recordedVia = via;
+      recordedInput = input;
+      return { goalId: input.goalId, nextGoalId: 'g2', moved: input.taskIds, unlocked: [] };
+    },
+  };
+  const { ctx } = makeFakeCtx({ core: fakeCore as any });
+  const res = await ownerApi(ctx, {
+    command: 'goal.split',
+    goalId: 'g1',
+    taskIds: ['t1', 't2'],
+    title: 'Phase 2 Title',
+    reason: 'Splitting remaining tasks',
+  }, 'split-via');
+  expect(recordedVia).toBe('split-via');
+  expect(recordedInput.goalId).toBe('g1');
+  expect(recordedInput.taskIds).toEqual(['t1', 't2']);
+  expect(recordedInput.title).toBe('Phase 2 Title');
+  expect(recordedInput.reason).toBe('Splitting remaining tasks');
+  expect(recordedInput.idempotencyKey).toStartWith('owner:split-via:goal.split:');
+  expect(res).toEqual({ goalId: 'g1', nextGoalId: 'g2', moved: ['t1', 't2'], unlocked: [] });
+});
+
+test('goal.retired.list calls GoalGovernanceStore.retiredWorkPending', async () => {
+  const fakeDb = {
+    query: async (sql: string) => {
+      if (sql.includes('SELECT * FROM goal WHERE id IN $ids;')) {
+        return [[{ id: new RecordId('goal', 'g1'), version: 2, state: 'active', title: 'goal 1', brief: '', anchors: [], tasks: {} }]];
+      }
+      return [[]];
+    },
+  };
+  const { ctx } = makeFakeCtx({ db: { db: fakeDb } as any });
+  const res = await ownerApi(ctx, { command: 'goal.retired.list', goalId: 'g1' }, 'cli') as any;
+  expect(res.goalId).toBe('g1');
+  expect(res.goalVersion).toBe(2);
+  expect(res.items).toEqual([]);
+});
+
+test('goal.retired.resolve calls GoalGovernanceStore.resolveRetiredWork', async () => {
+  let calledArgs: any;
+  const original = GoalGovernanceStore.prototype.resolveRetiredWork;
+  try {
+    GoalGovernanceStore.prototype.resolveRetiredWork = async function(args: any) {
+      calledArgs = args;
+      return { goalId: args.goalId, state: 'active', readyToComplete: false } as any;
+    };
+    const { ctx } = makeFakeCtx();
+    const res = await ownerApi(ctx, {
+      command: 'goal.retired.resolve',
+      goalId: 'g1',
+      taskId: 't1',
+      goalVersion: 1,
+      taskVersion: 2,
+      disposition: 'fixture',
+      replacementTaskIds: [],
+      reason: 'Valid justification for retiring task',
+    }, 'resolver-agent') as any;
+
+    expect(calledArgs.goalId).toBe('g1');
+    expect(calledArgs.taskId).toBe('t1');
+    expect(calledArgs.goalVersion).toBe(1);
+    expect(calledArgs.taskVersion).toBe(2);
+    expect(calledArgs.disposition).toBe('fixture');
+    expect(calledArgs.replacementTaskIds).toEqual([]);
+    expect(calledArgs.reason).toBe('Valid justification for retiring task');
+    expect(calledArgs.actor).toBe('owner:resolver-agent');
+    expect(calledArgs.key).toStartWith('owner:resolver-agent:goal.retired.resolve:');
+    expect(res.goalId).toBe('g1');
+  } finally {
+    GoalGovernanceStore.prototype.resolveRetiredWork = original;
+  }
+});
+
+test('task.cost reads task cost for single task', async () => {
+  const fakeCost = { taskId: 't1', usd: 0.1234, requests: 5, sessions: 1, complete: true, source: 'magpie-requests' };
+  const fakeDb = {
+    select: async (id: RecordId) => {
+      if (String(id) === 'task_cost:t1') {
+        return { cost: fakeCost };
+      }
+      return undefined;
+    },
+    query: async () => [[]],
+  };
+  const { ctx } = makeFakeCtx({ db: { db: fakeDb } as any });
+  const res = await ownerApi(ctx, { command: 'task.cost', taskId: 't1' }, 'cli') as any;
+  expect(res).toEqual({ cost: fakeCost });
+});
+
+// ---- ITEM 4: Docs and code stay in sync ----
+test('docs/owner-api.md and both owner API layers stay in sync with zero duplicates', () => {
+  const docContent = readFileSync(join(import.meta.dir, '../docs/owner-api.md'), 'utf8');
+  const docCmds = [...docContent.matchAll(/`sck owner ([a-zA-Z0-9_.-]+)/g)].map(m => m[1]);
+
+  const srcContent = readFileSync(join(import.meta.dir, '../src/owner-api.ts'), 'utf8');
+  const srcCmds = [...srcContent.matchAll(/case\s+'([^']+)'\s*:/g)].map(m => m[1]);
+
+  // Plugin-only commands live in the plugin wrapper; the docs must cover both layers.
+  const pluginContent = readFileSync(join(import.meta.dir, '../plugin/server/owner-api.ts'), 'utf8');
+  const pluginCmds = [...pluginContent.matchAll(/case\s+'([^']+)'\s*:/g)].map(m => m[1]);
+
+  // No duplicate rows in documentation
+  const docSet = new Set(docCmds);
+  expect(docCmds.length).toBe(docSet.size);
+
+  const codeSet = new Set([...srcCmds, ...pluginCmds]);
+  expect(docSet).toEqual(codeSet);
+  expect([...docSet].sort()).toEqual([...codeSet].sort());
+});
+
+// ---- ITEM 5: Plugin-only owner commands ----
+function fakeCompany(overrides: Record<string, unknown> = {}) {
+  const queries: Array<{ sql: string; params?: any }> = [];
+  return {
+    company: {
+      db: { db: { query: async (sql: string, params?: any) => { queries.push({ sql, params }); return [[]]; }, select: async () => undefined } },
+      modelRanking: {}, modelRouting: {}, paseo: undefined,
+      ...overrides,
+    } as never,
+    queries,
+  };
+}
+const home = () => mkdtempSync(join(tmpdir(), 'owner-plugin-'));
+
+test('plugin model.ranking returns the console ranking view', async () => {
+  const { company } = fakeCompany();
+  const result = await pluginOwnerCommand(company, home(), { command: 'model.ranking' });
+  expect(result.handled).toBe(true);
+  if (result.handled) expect(result.value).toMatchObject({ configured: true, requests: [] });
+});
+
+test('plugin model.ranking.preview passes policy and refresh to the refresher', async () => {
+  const calls: any[] = [];
+  const { company } = fakeCompany({ modelRanking: { preview: async (policy: unknown, refresh: unknown) => { calls.push({ policy, refresh }); return { ok: true }; } } });
+  const result = await pluginOwnerCommand(company, home(), { command: 'model.ranking.preview', policy: { order: ['a'] }, refresh: true });
+  expect(result).toEqual({ handled: true, value: { ok: true } });
+  expect(calls).toEqual([{ policy: { order: ['a'] }, refresh: true }]);
+  await expect(pluginOwnerCommand(company, home(), { command: 'model.ranking.preview', policy: {}, refresh: 'yes' })).rejects.toThrow(/invalid/);
+});
+
+test('plugin model.ranking.save validates rules and hands the policy to the shared save path', async () => {
+  const calls: any[] = [];
+  const { company, queries } = fakeCompany({
+    modelRanking: { configure: async (write: () => Promise<void>, minutes: number) => { calls.push({ minutes }); await write(); } },
+  });
+  const result = await pluginOwnerCommand(company, home(), { command: 'model.ranking.save', rules: 'haiku>sonnet', refreshMinutes: 10 });
+  expect(result).toEqual({ handled: true, value: { ok: true } });
+  expect(calls).toEqual([{ minutes: 10 }]);
+  const upsert = queries.find(q => q.sql.includes('UPSERT company_meta:model_routing'));
+  expect(upsert?.params.minutes).toBe(10);
+  await expect(pluginOwnerCommand(company, home(), { command: 'model.ranking.save', rules: 'x', refreshMinutes: 3 })).rejects.toThrow(/invalid/);
+  await expect(pluginOwnerCommand(company, home(), { command: 'model.ranking.save', rules: 5, refreshMinutes: 5 })).rejects.toThrow(/invalid/);
+});
+
+test('plugin model.ranking.pin validates the group and calls setPin', async () => {
+  const pins: any[] = [];
+  const { company } = fakeCompany({ modelRanking: { setPin: async (group: string, model: string, pinned: boolean) => { pins.push({ group, model, pinned }); } } });
+  const result = await pluginOwnerCommand(company, home(), { command: 'model.ranking.pin', group: 'sck-opus', model: 'm1', pinned: true });
+  expect(result).toEqual({ handled: true, value: { ok: true } });
+  expect(pins).toEqual([{ group: 'sck-opus', model: 'm1', pinned: true }]);
+  await expect(pluginOwnerCommand(company, home(), { command: 'model.ranking.pin', group: 'sck-fable', model: 'm1', pinned: true })).rejects.toThrow(/invalid/);
+  await expect(pluginOwnerCommand(company, home(), { command: 'model.ranking.pin', group: 'sck-opus', model: '', pinned: true })).rejects.toThrow(/invalid/);
+});
+
+test('plugin model.catalog bounds the query and defaults offset/limit', async () => {
+  const calls: any[] = [];
+  const { company } = fakeCompany({ modelRouting: { catalogPage: async (query: string, offset: number, limit: number) => { calls.push({ query, offset, limit }); return { models: [] }; } } });
+  await pluginOwnerCommand(company, home(), { command: 'model.catalog', query: 'opus', offset: 20, limit: 500 });
+  await pluginOwnerCommand(company, home(), { command: 'model.catalog' });
+  expect(calls).toEqual([{ query: 'opus', offset: 20, limit: 100 }, { query: '', offset: 0, limit: 40 }]);
+});
+
+test('plugin model.membership parses the shared input and calls setMembership', async () => {
+  const members: any[] = [];
+  const { company } = fakeCompany({
+    modelRouting: { setMembership: async (input: unknown) => { members.push(input); return { ok: true }; } },
+    modelRanking: { configure: async (write: () => Promise<void>) => { await write(); } },
+  });
+  const input = { group: 'sck-opus', model: 'm1', present: true, expectedMembers: ['m1'] };
+  const result = await pluginOwnerCommand(company, home(), { command: 'model.membership', input });
+  expect(result).toEqual({ handled: true, value: { ok: true } });
+  expect(members).toEqual([input]);
+  await expect(pluginOwnerCommand(company, home(), { command: 'model.membership', input: { group: 'nope' } })).rejects.toThrow();
+});
+
+test('plugin model.alias validates the slug and calls setAlias', async () => {
+  const aliases: any[] = [];
+  const { company } = fakeCompany({
+    modelRouting: { setAlias: async (model: string, slug: string | null) => { aliases.push({ model, slug }); return { synchronized: true }; } },
+    modelRanking: { configure: async (write: () => Promise<void>) => { await write(); } },
+  });
+  const result = await pluginOwnerCommand(company, home(), { command: 'model.alias', model: 'm1', slug: null });
+  expect(result).toEqual({ handled: true, value: { ok: true, synchronized: true } });
+  expect(aliases).toEqual([{ model: 'm1', slug: null }]);
+  await expect(pluginOwnerCommand(company, home(), { command: 'model.alias', model: 'm1', slug: '' })).rejects.toThrow(/invalid/);
+});
+
+test('plugin permission.list reads the fake paseo and filters company agents', async () => {
+  const refreshed: string[] = [];
+  const paseo = {
+    agents: {
+      list: async () => ({ entries: [
+        { id: 'a1', title: 'QA', labels: { company: 'surreal-ck', employee_id: 'e1', role: 'qa' }, pendingPermissions: [{ id: 'r1' }] },
+        { id: 'a2', title: 'Other', labels: { company: 'someone-else' }, pendingPermissions: [{ id: 'r9' }] },
+      ] }),
+      ref: (id: string) => ({ refresh: async () => { refreshed.push(id); return { pendingPermissions: [{ id: 'r2', kind: 'shell', summary: 'run tests', detail: 'x' }] }; } }),
+    },
+  };
+  const { company } = fakeCompany({ paseo });
+  const result = await pluginOwnerCommand(company, home(), { command: 'permission.list' });
+  expect(result.handled).toBe(true);
+  if (result.handled) {
+    expect((result.value as any).items).toEqual([{ agentId: 'a1', title: 'QA', employeeId: 'e1', role: 'qa',
+      request: { id: 'r2', kind: 'shell', summary: 'run tests', detail: 'x' } }]);
+  }
+  expect(refreshed).toEqual(['a1']);
+});
+
+test('plugin permission.answer validates behavior and responds on the fake paseo', async () => {
+  const answers: any[] = [];
+  const paseo = { agents: { ref: (id: string) => ({ respondToPermission: async (input: unknown) => { answers.push({ id, input }); } }) } };
+  const { company } = fakeCompany({ paseo });
+  const result = await pluginOwnerCommand(company, home(), { command: 'permission.answer', agentId: 'a1', requestId: 'r1', behavior: 'allow', message: 'ok' });
+  expect(result).toEqual({ handled: true, value: { ok: true } });
+  expect(answers).toEqual([{ id: 'a1', input: { requestId: 'r1', response: { behavior: 'allow', message: 'ok' } } }]);
+  await expect(pluginOwnerCommand(company, home(), { command: 'permission.answer', agentId: 'a1', requestId: 'r1', behavior: 'maybe' })).rejects.toThrow(/invalid/);
+  await expect(pluginOwnerCommand(fakeCompany().company, home(), { command: 'permission.list' })).rejects.toThrow(/temporarily_unavailable/);
+});
+
+test('plugin task.attachments lists the evidence dir and attachment.url builds the LAN URL', async () => {
+  const serviceHome = home();
+  mkdirSync(join(serviceHome, 'evidence', 't1'), { recursive: true });
+  writeFileSync(join(serviceHome, 'evidence', 't1', 'report.md'), '# report');
+  const listed = await pluginOwnerCommand(fakeCompany().company, serviceHome, { command: 'task.attachments', taskId: 't1' });
+  expect(listed.handled).toBe(true);
+  if (listed.handled) expect((listed.value as any).attachments.map((a: any) => a.relPath)).toEqual(['report.md']);
+  const url = await pluginOwnerCommand(fakeCompany().company, serviceHome, { command: 'attachment.url', taskId: 't1', file: 'report.md' });
+  expect(url.handled).toBe(true);
+  if (url.handled) expect((url.value as any).url).toEndWith('/e/t1/report.md');
+  await expect(pluginOwnerCommand(fakeCompany().company, serviceHome, { command: 'attachment.url', taskId: 't1', file: '../x' })).rejects.toThrow(/附件不存在或越界/);
+});
+
+test('plugin wrapper leaves every src command untouched', async () => {
+  const result = await pluginOwnerCommand(fakeCompany().company, home(), { command: 'goal.list' });
+  expect(result).toEqual({ handled: false });
+});
+
+// ---- ITEM 5: Token not on the process command line ----
+test('scripts/sck.sh passes token file path and does not pass token in argv', () => {
+  const scriptContent = readFileSync(join(import.meta.dir, '../scripts/sck.sh'), 'utf8');
+  const pythonExecMatch = scriptContent.match(/\/usr\/bin\/python3 -I -[^\n]+/);
+  expect(pythonExecMatch).toBeTruthy();
+  const execLine = pythonExecMatch![0];
+  expect(execLine).not.toContain('"$token"');
+  expect(execLine).not.toContain('$token ');
+  expect(execLine).toContain('"$token_file"');
+
+  expect(scriptContent).not.toMatch(/^\s*token=\$\(/m);
+  expect(scriptContent).toContain('with open(token_file, "r"');
+  expect(scriptContent).toContain('token = f.readline().strip()');
+});

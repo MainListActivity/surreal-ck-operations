@@ -196,7 +196,7 @@ describe('三个域的判定', () => {
     expect(impliedIntent('engineering', 'gate')).toEqual({ kind: 'code' });
     expect(impliedIntent('engineering', 'release')).toEqual({ kind: 'read' });
     expect(impliedIntent('qa', 'task')).toEqual({ kind: 'read' });
-    expect(impliedIntent('gm', 'task')).toEqual({ kind: 'read' });
+    expect(impliedIntent('owner', 'task')).toEqual({ kind: 'read' });
   });
 
   test('tool_scope: tools outside this layer are untouched, and aliases compare in their canonical form', () => {
@@ -213,7 +213,7 @@ describe('三个域的判定', () => {
     expect(checkGateCreation(c, { leg: 'deploy', kind: 'deploy', executorRole: 'qa', reviewerRole: 'owner' })).toEqual({ ok: true });
     expect(checkGateCreation(c, { leg: 'deploy', kind: 'gate', executorRole: 'engineering', reviewerRole: 'qa' }).ok).toBe(false);
     expect(checkGateCreation(c, { leg: 'implement', kind: 'task', executorRole: 'qa', reviewerRole: 'qa' }).ok).toBe(false);
-    expect(checkGateCreation(c, { leg: 'implement', kind: 'task', executorRole: 'qa', reviewerRole: 'gm' })).toEqual({ ok: true });
+    expect(checkGateCreation(c, { leg: 'implement', kind: 'task', executorRole: 'qa', reviewerRole: 'owner' })).toEqual({ ok: true });
     // 没有 gate 策略时创建照旧。
     expect(checkGateCreation(contract([]), { leg: 'deploy', kind: 'deploy', executorRole: 'qa', reviewerRole: 'qa' })).toEqual({ ok: true });
   });

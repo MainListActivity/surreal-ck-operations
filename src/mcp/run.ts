@@ -43,7 +43,7 @@ try {
     console.log(`snapshot build ${stats.kind} ${stats.outcome} rows=${stats.rows} bytes=${stats.bytes} batches=${stats.batches} load=${Math.round(stats.loadMs)} reserve=${Math.round(stats.reserveMs)} write=${Math.round(stats.writeMs)} commit=${Math.round(stats.commitMs)} server=${Math.round(stats.serverMs)} total=${Math.round(stats.totalMs)} reads=${stats.loadAttempts} release=${stats.release} releaseMs=${Math.round(stats.releaseMs)}`);
   const core = new SurrealCompanyCore(db, { workforce, snapshotObserve, submitCheck: process.env.SCK_PR_GATE === '0' ? undefined : createSubmitCheck(), systemCheck: process.env.SCK_SUBMIT_CHECKS === '0' ? undefined : createSystemCheck({ serviceHome: process.env.SCK_SERVICE_HOME || join(homedir(), 'Library/Application Support/SurrealCKCompany'), home: homedir() }), worktrees: {
       opsRepo: process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations',
-      // Same wiring as the plugin process (plugin/server/company.ts): a GM manual reclaim_worktrees
+      // Same wiring as the plugin process (plugin/server/company.ts): an owner manual reclaim_worktrees
       // through this MCP process must tear the Paseo side down together with the git tree instead
       // of leaving workspaces/projects behind. createSceneCleaner is idempotent, matching the
       // plugin's semantics. Employees in the scene retire with an honest reason first; the

@@ -67,7 +67,7 @@
 | `policy_list` | `manage` 能力 + `gm`/`product` | 按作用域/域列出；默认只列当前生效版本，`includeInactive` 看历史 |
 | `policy_effective` | `manage` + `gm`/`product`（带 `taskId` 时该任务的执行岗/评审岗与 `qa`/`eval` 也读得到自己那份） | 当前有效契约 + 作用域链 + 人读 `rendered` + `notes`（到期/被替代/被撤销的当前事实） |
 | `policy_plan` | `gm` / `product` | 试算：差异前后版本、受影响任务与它为什么失去授权；**不写库**。候选集与派工/领取判定同源——扫的是**全公司的在办任务**（与提案的作用域无关），不按 `policy_hash` 预筛，所以策略层上线前既存、没有登记的任务也会被列出来。受影响清单**按页返回**（`page`：`total` / `returned` / `hasMore` / `nextCursor` / `budgetBytes`），每页都裁到 48 KiB 响应预算内；用同一提案加 `cursor` 翻下一页；`planHash` 覆盖全量、翻页不变（同一份试算的指纹）。服务端不留快照，每一页都重算当下的全量试算，所以某页看到的永远是当下事实；生效 epoch 或**受影响清单**一变，旧光标即被拒（`conflict`）——与受影响清单无关的在办变化（某条无关任务新建或完成）不会让光标失效。从第一页重跑即可。数据库扫描本身的上限另由 `scanned` / `scanLimit` / `truncated` 报告 |
-| `policy_enforce` | `gm` / `product` | 隔离在办任务：不在有效契约下仍获授权的任务一律置 `blocked` + `blocked_to=gm`，记 `policy_block_reason`、清租约与持有人；本来就被策略拦着的记 `alreadyBlocked`，已结束或判定为 `clear` 的记 `absent`。**单批最多 200 个 taskId**（超过直接 `invalid`）；清单大于一页时按 `policy_plan` 的页收集 id，再分批发来 |
+| `policy_enforce` | `product`（owner 经 owner 接口） | 隔离在办任务：不在有效契约下仍获授权的任务一律置 `blocked` + `blocked_to=owner`，记 `policy_block_reason`、清租约与持有人；本来就被策略拦着的记 `alreadyBlocked`，已结束或判定为 `clear` 的记 `absent`。**单批最多 200 个 taskId**（超过直接 `invalid`）；清单大于一页时按 `policy_plan` 的页收集 id，再分批发来 |
 
 `policy_enforce` 只对 `policy_plan` 列出的受影响任务动手：`resume_state`/`resume_role` 只在 `ready`/`doing`/`review` 三态有值（`review` 记评审岗），其余状态保留它原有的 `resume_state`；每次隔离写一条 `action='policy_blocked'` 的审计，并把 `employee.active_task` 上指向它的关联清掉。隔离的对象来自试算清单，所以清单的覆盖范围就是这条缓解路径的覆盖范围：候选集必须与判定同源，没有登记的在办任务要先被列出来，隔离才有对象。清单的可获得性分两层，都是显式事实：**页**由 `page.total` / `page.hasMore` / `page.nextCursor` 说明——在扫描上限以内，受影响清单再大也能一页页读完，不会整份被响应预算拒掉；**库扫描**由 `scanned` / `scanLimit` / `truncated` 说明。`truncated=true` 表示候选集本身被读上限（200×50 = 10000 条）截断了，这时**翻页也只能翻已扫到的那部分，本工具给不出完整清单**：候选集是全公司在办任务、与提案作用域无关，`policy_plan` 没有任何收窄入参（换作用域、换域都不会改变候选集），所以「收窄一点再试」这条路不存在，也**不得据此认定已隔离全部受影响任务**。扫描按 `created_at DESC` 走、逐页用 `(created_at, id)` 续读（keyset）：并发新建或离开的任务不会让页与页错位，扫描本身既不重复也不漏行；被上限丢掉的是**最早**的在办任务——恰好包含策略层上线前既存、没有登记的那一批。真需要完整清单时的现实做法是经理另定方案（例如低峰人工核对、或另写一段读取），本工具只如实报告它扫到了什么。
 
@@ -87,18 +87,18 @@
 
 隔离**不引入新的状态字面量**：用的是旧版就认得的 `blocked` + `blocked_to`，另加一个旧版读不到的说明字段 `policy_block_reason`，并把 `resume_state` / `resume_role` 一起记下来（旧版读到也不认识，只会继续按 `blocked` 处理）。
 
-这样做的理由：新旧版本共用一个命名空间时，回滚后的旧 release 必须能安全读到新代码写下的行。旧版的派工读法是"state ∈ {ready, doing} 的执行 / review 的评审，且没有持有人"——它的候选集里本来就没有 `blocked`，`current_employee` / `lease_expires_at` 又被隔离清空，所以隔离过的任务**在任何一轮里都不会被旧版误派**；等待（`blocked_to=gm/owner`）、关口、需修的任务同理，不会被领走。
+这样做的理由：新旧版本共用一个命名空间时，回滚后的旧 release 必须能安全读到新代码写下的行。旧版的派工读法是"state ∈ {ready, doing} 的执行 / review 的评审，且没有持有人"——它的候选集里本来就没有 `blocked`，`current_employee` / `lease_expires_at` 又被隔离清空，所以隔离过的任务**在任何一轮里都不会被旧版误派**；等待（`blocked_to=owner`）、关口、需修的任务同理，不会被领走。
 
 `tests/rollback-isolation-policy.fork.test.ts` 在隔离 fork 库上彩排了这条链路：旧 release 先建库，新代码升到 035 并收权 + 隔离，随后连派三轮（旧版直接读 / 旧版 bootstrap 之后 / 旧版逐个试领之后）——受保护的 6 个任务零命中，而冻结之后新建的对照任务一直可派（证明这三轮不是空转）；6 次旧版领取全部被拒且行内容不变。
 
-`tests/effective-policy-plan-coverage.fork.test.ts` 补的是同一条链路上"上线前既存任务"这一段：**旧 release 自己建**的两条在办任务（ready / doing，没有 `policy_hash` 登记）在新代码上收权后，必须被 `policy_plan` 列出、被 `policy_enforce` 隔离为 `blocked + blocked_to=gm`（并保留 `resume_state`），随后旧 release 的候选集里没有它们、试领全部被拒。
+`tests/effective-policy-plan-coverage.fork.test.ts` 补的是同一条链路上"上线前既存任务"这一段：**旧 release 自己建**的两条在办任务（ready / doing，没有 `policy_hash` 登记）在新代码上收权后，必须被 `policy_plan` 列出、被 `policy_enforce` 隔离为 `blocked + blocked_to=owner`（并保留 `resume_state`），随后旧 release 的候选集里没有它们、试领全部被拒。
 
 切换路径上的那条门禁（"已写策略的数据不能切到不执行策略的代码"）由 `scripts/policy-guard.sh` 在 install / 远端 deploy 的副作用之前把关，见 [company-service-operations.md](./company-service-operations.md) 第 5 节。
 
 ## 一处刻意的不对称
 
 - `tool_scope` **到期**时，broker 的边界退回"没有该域 = 不设机器限制"（`policyToolScope` 读不到 payload 就返回 `ok`）。工具白名单是运维便利与支出边界，不是写权，到期松回基线不会让谁获得额外的写权限。
-- `write_authority` 的域**消失**（到期或被撤销）时，已经在办的任务按 `dispatchVerdict` 判 `blocked`：原来被授权、现在没有契约，绝不能读成放行。冻结但还没被隔离的任务，用 `policy_plan` 看差异 + `policy_enforce` 隔离来关闭这个窗口——**包括策略层上线前就已在办、没有任何策略登记（`policy_hash = NONE`）的任务**：`policy_plan` 的候选集与派工/领取判定同源，扫全部在办任务而不按 `policy_hash` 预筛，这类任务既进得来清单（`fromHash` 为空），也会被判 `blocked` 后隔离为 `blocked + blocked_to=gm`。这不是边缘情形：策略层上线那一刻，线上的在办任务全都是这一类，回滚到不执行策略的 release 时它们会被旧候选集当普通任务派工。清单的可获得性也是显式事实：扫描上限以内，受影响清单按 `page` 分页（每页都在 48 KiB 预算内，顺 `nextCursor` 读完）；数据库扫描本身的上限由 `scanned` / `scanLimit` / `truncated` 报告。`truncated=true` 时必须把清单当成**不完整**的：候选集与作用域无关、`policy_plan` 没有收窄入参，翻页只能翻已扫到的部分，因此不得据此认定「失去授权的任务都已隔离」，也不得据此回滚；补救只能由经理另定方案。
+- `write_authority` 的域**消失**（到期或被撤销）时，已经在办的任务按 `dispatchVerdict` 判 `blocked`：原来被授权、现在没有契约，绝不能读成放行。冻结但还没被隔离的任务，用 `policy_plan` 看差异 + `policy_enforce` 隔离来关闭这个窗口——**包括策略层上线前就已在办、没有任何策略登记（`policy_hash = NONE`）的任务**：`policy_plan` 的候选集与派工/领取判定同源，扫全部在办任务而不按 `policy_hash` 预筛，这类任务既进得来清单（`fromHash` 为空），也会被判 `blocked` 后隔离为 `blocked + blocked_to=owner`。这不是边缘情形：策略层上线那一刻，线上的在办任务全都是这一类，回滚到不执行策略的 release 时它们会被旧候选集当普通任务派工。清单的可获得性也是显式事实：扫描上限以内，受影响清单按 `page` 分页（每页都在 48 KiB 预算内，顺 `nextCursor` 读完）；数据库扫描本身的上限由 `scanned` / `scanLimit` / `truncated` 报告。`truncated=true` 时必须把清单当成**不完整**的：候选集与作用域无关、`policy_plan` 没有收窄入参，翻页只能翻已扫到的部分，因此不得据此认定「失去授权的任务都已隔离」，也不得据此回滚；补救只能由老板另定方案。
 
 ## 验证
 

@@ -23,7 +23,7 @@ let gm: string, engA: string, engB: string, engC: string, engD: string, engE: st
 beforeAll(async () => {
   await database.connect();
   await database.bootstrap();
-  gm = await enrollment.enroll(`test-gm-${suffix}`, 'gm', ['execute', 'review', 'manage']);
+  gm = await enrollment.enroll(`test-gm-${suffix}`, 'owner', ['execute', 'review', 'manage']);
   engA = await enrollment.enroll(`test-enga-${suffix}`, 'engineering', ['execute', 'review']);
   engB = await enrollment.enroll(`test-engb-${suffix}`, 'engineering', ['execute', 'review']);
   engC = await enrollment.enroll(`test-engc-${suffix}`, 'engineering', ['execute', 'review']);
@@ -49,7 +49,7 @@ async function allOutbox(): Promise<OutboxEvent[]> {
 }
 
 test('real DB: bootstrap, identity, concurrent claim, fencing, idempotency, independent review', async () => {
-  expect((await core.authenticate(gm)).role).toBe('gm');
+  expect((await core.authenticate(gm)).role).toBe('owner');
   const first = await core.createTask(gm, {
     title: `First integration task ${suffix}`, context: 'Synthetic integration task in isolated company DB.',
     executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `create-first-${suffix}`,
@@ -141,7 +141,7 @@ test('real DB: expired lease fences old writer, dependencies and blocked recover
   })).rejects.toBeInstanceOf(CompanyError);
   const newProof: LeaseProof = { taskId: parent.id, deliveryId: newClaim.deliveryId,
     fence: newClaim.fence, expectedVersion: newClaim.task.version };
-  const blocked = await core.block(engD, newProof, 'gm', {
+  const blocked = await core.block(engD, newProof, 'owner', {
     text: 'Synthetic blocker requiring manager recovery.', idempotencyKey: `block-${suffix}`,
   });
   expect(blocked.state).toBe('blocked');
@@ -173,7 +173,7 @@ test('real DB: expired lease fences old writer, dependencies and blocked recover
 test('real DB: heartbeat, one active task, return and outbox cursor', async () => {
   await expect(core.createTask(engE, {
     title: 'Forbidden task', context: 'A normal worker cannot create tasks.',
-    executorRole: 'gm', reviewerRole: 'qa', idempotencyKey: `forbidden-${suffix}`,
+    executorRole: 'owner', reviewerRole: 'qa', idempotencyKey: `forbidden-${suffix}`,
   })).rejects.toBeInstanceOf(CompanyError);
   const one = await core.createTask(gm, {
     title: `Return task one ${suffix}`, context: 'Synthetic return path test.',
@@ -425,7 +425,7 @@ test('real DB: retire_task voids work, unblocks dependents, idempotent, releases
   });
   const mass = await core.createTask(gm, {
     title: `Retire mass ${suffix}`, context: 'Mass production gated on the owner demo.',
-    executorRole: 'asset-production', reviewerRole: 'gm', dependencies: [proto.id],
+    executorRole: 'asset-production', reviewerRole: 'owner', dependencies: [proto.id],
     idempotencyKey: `retire-mass-${suffix}`,
   });
   expect(mass.state).toBe('blocked');
@@ -446,7 +446,7 @@ test('real DB: retire_task voids work, unblocks dependents, idempotent, releases
   // 新建量产引用 void 原型不得视为 demo 已批准 → 保持 blocked
   const lateMass = await core.createTask(gm, {
     title: `Retire late mass ${suffix}`, context: 'New mass task referencing a voided prototype.',
-    executorRole: 'asset-production', reviewerRole: 'gm', dependencies: [proto.id],
+    executorRole: 'asset-production', reviewerRole: 'owner', dependencies: [proto.id],
     idempotencyKey: `retire-latemass-${suffix}`,
   });
   expect(lateMass.state).toBe('blocked');
@@ -479,7 +479,7 @@ test('real DB: retire_task voids work, unblocks dependents, idempotent, releases
   });
   const massG = await core.createTask(gm, {
     title: `Goal mass ${suffix}`, context: 'Mass production gated on the prototype.',
-    executorRole: 'asset-production', reviewerRole: 'gm', dependencies: [protoG.id], goalId: goal.id,
+    executorRole: 'asset-production', reviewerRole: 'owner', dependencies: [protoG.id], goalId: goal.id,
     idempotencyKey: `retire-massG-${suffix}`,
   });
   const [anchorIds] = await database.db.query<[RecordId[]]>(

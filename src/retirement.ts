@@ -50,7 +50,7 @@ export function retirementRefusals(employeeId: string, candidates: readonly Reti
     const refuse = (reason: RetireRefusalReason): RetireRefusalItem[] => [{ taskId: candidate.taskId, state: candidate.state, phase, reason }];
     if (candidate.holder === employeeId) return refuse('active_lease');
     if (candidate.explicitImplementer !== undefined) return candidate.explicitImplementer === employeeId ? refuse('bound_implementer') : [];
-    // SYS-DISP IR01/Q1: a claim-only handler is demoted, not erased, and the gate must not lose it (GM v71: 实现者和退役
+    // SYS-DISP IR01/Q1: a claim-only handler is demoted, not erased, and the gate must not lose it (owner v71: 实现者和退役
     // 门禁不得因该修复失效). What relates an employee to unfinished code is every execute-phase handler — `strictExcluded`
     // names exactly that set (authors, the derived implementer and `hands`) and never a pure reviewer.
     if (!candidate.facts.strictExcluded.includes(employeeId)) return [];

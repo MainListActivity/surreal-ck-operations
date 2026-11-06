@@ -26,7 +26,7 @@ beforeAll(async () => {
   await db.connect(); await db.bootstrap();
   core = new SurrealCompanyCore(db); owner = new OwnerDesk(db);
   const admin = new LocalEnrollmentAdmin(db);
-  gm = await admin.enroll('loop-gm', 'gm', ['execute', 'review', 'manage']);
+  gm = await admin.enroll('loop-gm', 'owner', ['execute', 'review', 'manage']);
   eng = await admin.enroll('loop-eng', 'engineering', ['execute', 'review']);
 });
 afterAll(async () => { if (!dir) return; await db.close(); server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true }); });
@@ -37,7 +37,7 @@ const newTask = () => core.createTask(gm, { title: `Looping task ${++count}`, co
 /** One round trip: the employee blocks on the manager. The manager resumes it unless this is the last round. */
 async function bounce(taskId: string, round: number, resume: boolean) {
   const claim = await core.claim(eng, taskId);
-  await core.block(eng, proofOf(claim), 'gm', text(`第 ${round} 次阻塞：WS 连接 1006 无事件`));
+  await core.block(eng, proofOf(claim), 'owner', text(`第 ${round} 次阻塞：WS 连接 1006 无事件`));
   if (resume) await core.resume(gm, taskId, text(`经理第 ${round} 次回复`));
 }
 const breaker = () => new Dispatcher({ workforce: {} as never, owner, paseo: {} as never, env: {} as never, log: () => {} }) as unknown as
@@ -49,11 +49,11 @@ run('a task that keeps bouncing between employee and manager goes to the owner w
   await bounce(t.id, 1, true); await bounce(t.id, 2, true); await bounce(t.id, 3, false);
   const loops = await owner.blockLoops(t.id);
   expect(loops.loops).toBe(3); expect(loops.reasons[0]).toContain('第 3 次阻塞');
-  const current = await core.getTask(gm, t.id); expect(current).toMatchObject({ state: 'blocked', blockedTo: 'gm' });
+  const current = await core.getTask(gm, t.id); expect(current).toMatchObject({ state: 'blocked', blockedTo: 'owner' });
   const r = report();
   expect(await breaker().breakLoop(current, { ...DEFAULT_CONFIG, blockLoopLimit: 4 }, r)).toBe(false);
   expect(await breaker().breakLoop(current, { ...DEFAULT_CONFIG, blockLoopLimit: 0 }, r)).toBe(false);
-  expect((await core.getTask(gm, t.id)).blockedTo).toBe('gm');
+  expect((await core.getTask(gm, t.id)).blockedTo).toBe('owner');
   expect(await breaker().breakLoop(current, { ...DEFAULT_CONFIG, blockLoopLimit: 3 }, r)).toBe(true);
   expect(r.decisions).toEqual([`escalate-loop:${t.id}`]);
   expect(await core.getTask(gm, t.id)).toMatchObject({ state: 'blocked', blockedTo: 'owner' });

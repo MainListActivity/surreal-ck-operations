@@ -9,6 +9,8 @@ import { homedir } from "node:os";
 import { readProviderQuotas } from "./dispatch";
 import { setAgentModel } from "./vendor/src/dispatcher/agent-model.ts";
 import { dispatcherLogSink } from "./vendor/src/dispatcher/log-sink.ts";
+import { OutboundMessageStore } from "./vendor/src/outbound-messages.ts";
+import type { PaseoApi } from "@getpaseo/client";
 
 export interface Company {
   upgrades: import("./vendor/src/company-upgrades.ts").CompanyUpgrades;
@@ -25,7 +27,21 @@ export interface Company {
   /** Agent home repo — the default project staffing pools are scoped to. */
   opsRepo: string;
   ops: import("./vendor/src/ops/broker").OpsBroker;
+  messages: OutboundMessageStore;
+  /** Absolute path of the sck CLI, as the dispatcher resolves it. */
+  sckBin: string;
+  /**
+   * The plugin host's Paseo API handle, learned from lifecycle hooks and owner RPC contexts.
+   * It is not created here (the CLI wrapper the dispatcher uses has no `agents` API); the
+   * first event supplies it, so owner commands that need it error honestly before then.
+   */
+  paseo: PaseoApi | undefined;
 }
+
+let paseoApi: PaseoApi | undefined;
+/** Remember the latest host handle; called by dispatch hooks and the owner RPC wrapper. */
+export function notePaseo(api: PaseoApi | undefined): void { if (api) paseoApi = api; }
+export function currentPaseo(): PaseoApi | undefined { return paseoApi; }
 
 let boot: Promise<Company> | undefined;
 let readyCompany:Company|undefined;
@@ -198,13 +214,16 @@ export function company(): Promise<Company> {
       const agent=requestAgents.get(id);requestAgents.delete(id);
       if(agent){try{metricStore.complete(agent,id,done,metrics);}catch{console.warn('agent model metrics: local completion unavailable');}}
     }});
+    const messages = new OutboundMessageStore(db.db);
+    const sckBin = process.env.SCK_TOOL_BIN ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/bin/sck`;
     const dispatcher = new Dispatcher({
       workforce,
       owner,
+      messages,
       paseo,
       env: {
         opsRepo,
-        sckBin: process.env.SCK_TOOL_BIN ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/bin/sck`,
+        sckBin,
         paseoBin: process.env.SCK_PASEO_BIN ?? "/Applications/Paseo.app/Contents/Resources/bin/paseo",
       },
       notify: process.env.SCK_NOTIFY === "0" ? undefined : notify,
@@ -249,7 +268,8 @@ export function company(): Promise<Company> {
     routingReady=true;
     const {CompanyUpgrades}=await import("./vendor/src/company-upgrades.ts");
     const upgrades=new CompanyUpgrades(db,owner,{home:serviceHome(),repo:opsRepo});
-    return readyCompany={ upgrades, modelJournal, modelRouting, modelRanking, stopModelGateway:async()=>{modelRanking.stop();await modelGateway.stop();}, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops };
+    return readyCompany={ upgrades, modelJournal, modelRouting, modelRanking, messages, stopModelGateway:async()=>{modelRanking.stop();await modelGateway.stop();}, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops, sckBin,
+      get paseo(){ return currentPaseo(); } };
   })();
   boot.catch(() => { boot = undefined; }); // a failed boot must not poison later calls
   return boot;

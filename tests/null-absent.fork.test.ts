@@ -103,8 +103,8 @@ function git(args: string[]) {
 beforeAll(async () => {
   await database.connect();
   await database.bootstrap();
-  gmA = await enrollment.enroll(ids.gmA, 'gm', ['execute', 'review', 'manage']);
-  gmB = await enrollment.enroll(ids.gmB, 'gm', ['execute', 'review', 'manage']);
+  gmA = await enrollment.enroll(ids.gmA, 'owner', ['execute', 'review', 'manage']);
+  gmB = await enrollment.enroll(ids.gmB, 'owner', ['execute', 'review', 'manage']);
   engA = await enrollment.enroll(ids.engA, 'engineering', ['execute', 'review']);
   engB = await enrollment.enroll(ids.engB, 'engineering', ['execute', 'review']);
   holderA = await enrollment.enroll(ids.holderA, 'asset-production', ['execute']);
@@ -136,8 +136,8 @@ beforeAll(async () => {
     const opened = pool.env({ id, role, credential } as unknown as EmployeeInst);
     return { SCK_COMM_DIR: opened.SCK_COMM_DIR!, SCK_COMM_KEY: opened.SCK_COMM_KEY! };
   };
-  env.gmA = channel(ids.gmA, 'gm', gmA);
-  env.gmB = channel(ids.gmB, 'gm', gmB);
+  env.gmA = channel(ids.gmA, 'owner', gmA);
+  env.gmB = channel(ids.gmB, 'owner', gmB);
   env.engA = channel(ids.engA, 'engineering', engA);
   env.holderA = channel(ids.holderA, 'asset-production', holderA);
   env.holderB = channel(ids.holderB, 'asset-production', holderB);

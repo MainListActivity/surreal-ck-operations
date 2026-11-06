@@ -33,7 +33,7 @@ test('automatic upgrade policy uses an owner route with strict boolean input and
   expect(await (await request(true)).json()).toEqual({enabled:true,revision:1});
   expect(await (await request(false)).json()).toEqual({enabled:false,revision:2});
   const page=await (await fetcher(new Request(base))).text();
-  expect(page).toContain("api('upgrade/automatic'");
+  expect(page).toContain("api('upgrade.automatic'");
   expect(page).toContain('自动升级已开启');
  }finally{rmSync(home,{recursive:true,force:true});}
 });

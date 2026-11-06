@@ -1276,7 +1276,7 @@ export class SyncStudio {
     const idempotencyKey = `sck-${sha256hex(`v2|${keyFp}|${scope.project}|${scope.taskId}|${MODEL}|${video.sha256}|${audio.sha256}|${optionsJson}`)}`;
     const actionId = `act-${randomUUID()}`;
 
-    // Gate 6 — single critical section (GM ruling): reconcile → dedup re-check → re-validate
+    // Gate 6 — single critical section (owner ruling): reconcile → dedup re-check → re-validate
     // approval → reserve budget → persist reserved → persist sending+sendIntent, all under one
     // flock acquisition. Concurrent identical calls serialize here and converge on one action.
     const action: SyncAction = {

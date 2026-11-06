@@ -21,19 +21,19 @@ function sharedTree(repo: string): WorktreeAssignment {
   };
 }
 
-/** Light fixture: gm defs + blocked-to-gm tasks, SidecarBridge records readWorkspace/spawn cwd. */
+/** Light fixture: owner-aware dispatcher with blocked-to-owner tasks; records owner notices and any dispatch side effects. */
 function fixture(tasks: Array<{ id: string; repoPath?: string }>) {
   const def: EmployeeDef = {
-    id: 'gm-codex', role: 'gm', provider: 'codex', model: 'fixture',
+    id: 'gm-codex', role: 'owner', provider: 'codex', model: 'fixture',
     enabled: true, maxInstances: 4, priority: 0, weight: 1, scored: 0, errorStreak: 0,
   };
   const instances: EmployeeInst[] = [];
   const agents = new Map<string, { id: string; status: string }>();
   const rows: SupervisedTask[] = tasks.map(t => ({
-    id: t.id, title: t.id, state: 'blocked', blockedTo: 'gm',
+    id: t.id, title: t.id, state: 'blocked', blockedTo: 'owner',
     executorRole: 'engineering', reviewerRole: 'engineering', kind: 'task',
     version: 1, evalAttempts: 0, repoPath: t.repoPath,
-    row: { id: t.id, state: 'blocked', blocked_to: 'gm', version: 1 },
+    row: { id: t.id, state: 'blocked', blocked_to: 'owner', version: 1 },
   } as unknown as SupervisedTask));
   const readWorkspaceCalls: Array<{ instId: string; taskId?: string }> = [];
   const spawnCwds: string[] = [];
@@ -88,12 +88,16 @@ function fixture(tasks: Array<{ id: string; repoPath?: string }>) {
     writeCredentialFile: () => '/dev/null',
   };
 
+  const notices: Array<{ key: string; text: string }> = [];
   const owner = {
     applyPending: async () => [],
     resolveNotice: async () => {},
     openNotices: async () => [],
     triagePending: async () => [],
-    raiseNotice: async () => false,
+    raiseNotice: async (key: string, text: string) => {
+      notices.push({ key, text });
+      return true;
+    },
   };
 
   const paseo: PaseoGateway = {
@@ -143,30 +147,27 @@ function fixture(tasks: Array<{ id: string; repoPath?: string }>) {
     rand: () => 0,
   });
 
-  return { dispatcher, readWorkspaceCalls, spawnCwds, instances, rows };
+  return { dispatcher, readWorkspaceCalls, spawnCwds, instances, rows, notices };
 }
 
-describe('gm-attention groups pendingGm by repoPath', () => {
-  test('two different repoPaths → two dispatches, each readWorkspace/spawn cwd on that project', async () => {
+describe('owner-attention routes blocked-to-owner work to the owner inbox', () => {
+  test('two different repoPaths → one owner notice per task, no employee dispatch', async () => {
     const f = fixture([
       { id: 'task-a1', repoPath: PROJ_A },
       { id: 'task-b1', repoPath: PROJ_B },
     ]);
     const report = await f.dispatcher.tick();
 
-    expect(report.woke).toHaveLength(2);
-    expect(f.readWorkspaceCalls).toHaveLength(2);
-    expect(f.readWorkspaceCalls.map(c => c.taskId).sort()).toEqual(['task-a1', 'task-b1']);
-    expect(f.spawnCwds.every(cwd => cwd.startsWith('/tmp/comm/'))).toBe(true);
-    expect(f.instances.map(i => i.repoHome).sort()).toEqual([
-      PROJ_A,
-      PROJ_B,
-    ]);
-    // Each wake is a distinct employee (assigned prevents reuse across groups).
-    expect(new Set(report.woke.map(w => w.employee)).size).toBe(2);
+    // The owner-attention behaviour changed with the role freeze: blocked-to-owner work is never dispatched to a
+    // session, and the repo path no longer groups anything. Each task gets its own owner inbox notice.
+    expect(report.woke).toHaveLength(0);
+    expect(report.notices.sort()).toEqual(['question:task-a1:1', 'question:task-b1:1']);
+    expect(f.readWorkspaceCalls).toHaveLength(0);
+    expect(f.spawnCwds).toHaveLength(0);
+    expect(f.instances).toHaveLength(0);
   });
 
-  test('same repoPath multi-task → one dispatch covering the whole group', async () => {
+  test('same repoPath multi-task → one owner notice each, never a shared dispatch', async () => {
     const f = fixture([
       { id: 'task-a1', repoPath: PROJ_A },
       { id: 'task-a2', repoPath: PROJ_A },
@@ -174,14 +175,13 @@ describe('gm-attention groups pendingGm by repoPath', () => {
     ]);
     const report = await f.dispatcher.tick();
 
-    expect(report.woke).toHaveLength(3);
-    expect(new Set(report.woke.map(w => w.employee)).size).toBe(1);
-    expect(f.readWorkspaceCalls).toHaveLength(1);
-    expect(f.readWorkspaceCalls[0]!.taskId).toBe('task-a1');
-    expect(f.instances.map(i => i.repoHome)).toEqual([PROJ_A]);
+    expect(report.woke).toHaveLength(0);
+    expect(report.notices.sort()).toEqual(['question:task-a1:1', 'question:task-a2:1', 'question:task-a3:1']);
+    expect(f.readWorkspaceCalls).toHaveLength(0);
+    expect(f.instances).toHaveLength(0);
   });
 
-  test('project-only pendingGm is never anchored on opsRepo workspace', async () => {
+  test('project-only owner work is never anchored on the opsRepo workspace', async () => {
     const f = fixture([
       { id: 'task-a1', repoPath: PROJ_A },
       { id: 'task-a2', repoPath: PROJ_A },
@@ -190,27 +190,26 @@ describe('gm-attention groups pendingGm by repoPath', () => {
 
     expect(f.readWorkspaceCalls.every(c => c.taskId !== undefined)).toBe(true);
     expect(f.spawnCwds.every(cwd => cwd !== OPS && !cwd.startsWith(`${OPS}-`))).toBe(true);
-    expect(f.instances.map(i => i.repoHome)).toEqual([PROJ_A]);
-    expect(f.instances.every(i => i.repoHome === PROJ_A || i.cwd === PROJ_A)).toBe(true);
+    expect(f.spawnCwds).toHaveLength(0);
+    expect(f.instances).toHaveLength(0);
+    expect(f.notices.map(n => n.key).sort()).toEqual(['question:task-a1:1', 'question:task-a2:1']);
   });
 
-  test('repoPath=undefined tasks group under opsRepo', async () => {
+  test('repoPath=undefined tasks also go to the owner inbox, not to an opsRepo session', async () => {
     const f = fixture([
       { id: 'ops-1' },
       { id: 'ops-2' },
     ]);
     const report = await f.dispatcher.tick();
 
-    expect(report.woke).toHaveLength(2);
-    expect(new Set(report.woke.map(w => w.employee)).size).toBe(1);
-    expect(f.readWorkspaceCalls).toHaveLength(1);
-    // readTask is the first undefined-repoPath task; readWorkspace still gets its taskId
-    // so core can resolve project=undefined → opsRepo shared tree.
-    expect(f.readWorkspaceCalls[0]!.taskId).toBe('ops-1');
-    expect(f.instances.map(i => i.repoHome)).toEqual([OPS]);
+    expect(report.woke).toHaveLength(0);
+    expect(report.notices.sort()).toEqual(['question:ops-1:1', 'question:ops-2:1']);
+    expect(f.readWorkspaceCalls).toHaveLength(0);
+    expect(f.spawnCwds).toHaveLength(0);
+    expect(f.instances).toHaveLength(0);
   });
 
-  test('mixed: opsRepo group and project group dispatch separately', async () => {
+  test('mixed: every blocked task lands in the owner inbox and nothing is dispatched', async () => {
     const f = fixture([
       { id: 'ops-1' },
       { id: 'task-a1', repoPath: PROJ_A },
@@ -218,12 +217,10 @@ describe('gm-attention groups pendingGm by repoPath', () => {
     ]);
     const report = await f.dispatcher.tick();
 
-    expect(report.woke).toHaveLength(3);
-    expect(new Set(report.woke.map(w => w.employee)).size).toBe(2);
-    expect(f.spawnCwds.every(cwd => cwd.startsWith('/tmp/comm/'))).toBe(true);
-    expect(f.instances.map(i => i.repoHome).sort()).toEqual([
-      OPS,
-      PROJ_A,
-    ].sort());
+    expect(report.woke).toHaveLength(0);
+    expect(report.notices.sort()).toEqual(['question:ops-1:1', 'question:ops-2:1', 'question:task-a1:1']);
+    expect(f.readWorkspaceCalls).toHaveLength(0);
+    expect(f.spawnCwds).toHaveLength(0);
+    expect(f.instances).toHaveLength(0);
   });
 });

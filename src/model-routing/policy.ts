@@ -50,7 +50,7 @@ export function taskTier(task: {model_tier?: string; kind?: string; executor_rol
   return selectedTier(task.model_tier) ?? employeeTier(task.executor_role);
 }
 export function employeeTier(role?: string): Tier {
-  return role === "gm" ? "opus" : role === "product" ? "sonnet" : "haiku";
+  return role === "owner" || role === "gm" ? "opus" : role === "product" ? "sonnet" : "haiku";
 }
 /** A client's native name exposes Paseo controls; only the gateway selects the actual task tier. */
 export function employeeClientModel(role?: string): string {

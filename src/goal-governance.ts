@@ -131,7 +131,7 @@ export interface GoalStage {
 export interface GoalBlocker {
   taskId: string;
   title: string;
-  kind: 'wait' | 'owner' | 'manager' | 'fault' | 'dependency' | 'holder' | 'unassigned' | 'unknown';
+  kind: 'wait' | 'owner' | 'fault' | 'dependency' | 'holder' | 'unassigned' | 'unknown';
   summary: string;
   responsibleRole: string;
   holder?: string;
@@ -366,11 +366,6 @@ function blockerFor(
   }
   if (task.blockedTo === 'owner') {
     return { ...base, kind: 'owner', summary: '等待老板动作', responsibleRole: 'owner',
-      ...(task.dispatchBlockedSince ? { waitedSince: task.dispatchBlockedSince * 1000,
-        waitedMinutes: Math.max(0, Math.floor((now - task.dispatchBlockedSince * 1000) / 60_000)) } : {}) };
-  }
-  if (task.blockedTo === 'gm') {
-    return { ...base, kind: 'manager', summary: '等待经理动作', responsibleRole: 'gm',
       ...(task.dispatchBlockedSince ? { waitedSince: task.dispatchBlockedSince * 1000,
         waitedMinutes: Math.max(0, Math.floor((now - task.dispatchBlockedSince * 1000) / 60_000)) } : {}) };
   }
@@ -609,7 +604,6 @@ export function blockerSeverity(blocker: GoalBlocker): number {
   switch (blocker.kind) {
     case 'fault': return 7;
     case 'owner': return 6;
-    case 'manager': return 5;
     case 'wait': return 4;
     case 'dependency': return 3;
     case 'unassigned': return 2;

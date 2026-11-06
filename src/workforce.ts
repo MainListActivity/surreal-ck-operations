@@ -105,11 +105,11 @@ export interface CompanyConfig {
   jevFlagThreshold: number;
   /** 配置了 Jev 时，用 noul 决定系统提醒是否弹桌面通知（否则只进收件箱）。 */
   jevNotifyTriage: boolean;
-  /** 配置了 Jev 时，由 Jev 做目标分级、上线决定和老板升级路由；拿不准交回经理/运营。 */
+  /** 配置了 Jev 时，由 Jev 做目标分级、上线决定和老板升级路由；拿不准交回老板/运营。 */
   jevDecisions: boolean;
   /** 上线申请：Jev「可以上线」概率达到该值且「触碰红线」概率不高于 1 - 该值时自动批准。 */
   jevReleaseThreshold: number;
-  /** 升级给老板的问题：Jev「必须老板决定」概率低于该值时改派给经理。 */
+  /** 升级给老板的问题：Jev「必须老板决定」概率低于该值时改派给老板。 */
   jevOwnerThreshold: number;
   /** 派工选择候选员工时采信 Jev 答案的最低置信度；低于则回退权重随机。 */
   jevPickConfidence: number;
@@ -130,7 +130,7 @@ export interface CompanyConfig {
   evalQuickLlm: boolean;
   /** 每日简报的本地发送时刻（0-23 点，之后第一个周期发送）；-1 = 关闭。 */
   ownerBriefHour: number;
-  /** 同一任务在员工与经理之间 block→resume 往返达到该次数就不再自动循环，升级给老板；0 = 关闭。 */
+  /** 同一任务在员工与老板之间 block→resume 往返达到该次数就不再自动循环，升级给老板；0 = 关闭。 */
   blockLoopLimit: number;
   /** 宿主机空闲内存低于该 MB 数时暂停一切派工（新开与唤醒）；0 = 关闭。 */
   minFreeMemMb: number;
@@ -211,15 +211,15 @@ export interface SupervisedTask {
   dispatchBlockedSince?: number;
   leaseExpiresAt?: number;
   progressAt?: number;
-  blockedTo?: 'gm' | 'owner';
+  blockedTo?: 'owner';
   /** Blocked rows: phase restored when the dependency wait ends (review stays review; execute returns ready). */
   resumeState?: TaskRow['state'];
   /** Blocked rows: role recorded by the original block. */
   resumeRole?: string;
-  /** Unix seconds; set by a quota-caused block, gm is not re-announced before it. */
+  /** Unix seconds; set by a quota-caused block, owner is not re-announced before it. */
   quotaResetsAt?: number;
   /** FV06 P0: unix seconds. A standby direct-assignment expires here: before it, the idle holder is woken and
-   * stall/expire reclaim is waived; past it the task returns to the gm gate instead of the ready pool. */
+   * stall/expire reclaim is waived; past it the task returns to the owner gate instead of the ready pool. */
   standbyUntil?: number;
   /** SYS05: set while a typed wait owns the task. A waiting task takes no employee, lease or provider seat. */
   waitState?: 'waiting';
@@ -292,7 +292,7 @@ const supervised = (row: TaskRow): SupervisedTask => {
 const COOLDOWN_BASE = 30 * 60;
 const COOLDOWN_MAX = 6 * 60 * 60;
 export const capabilitiesFor = (role: Role): Principal['capabilities'] =>
-  role === 'eval' ? [] : role === 'gm' || role === 'product' ? ['execute', 'review', 'manage'] : ['execute', 'review'];
+  role === 'eval' ? [] : role === 'owner' || role === 'gm' || role === 'product' ? ['execute', 'review', 'manage'] : ['execute', 'review'];
 
 /** One manager todo to persist: task + phase + episode + reason identify it; the action is what the manager can do. */
 export interface ManagerActionInput {
@@ -938,20 +938,6 @@ export class Workforce {
     return responses.every(r => r.success);
   }
 
-  /** Moves an owner question that does not need the owner to the gm queue (once per task). */
-  async rerouteToGm(taskId: TaskId, version: number, evidence: string): Promise<boolean> {
-    const responses = await this.db.query<unknown[]>(`BEGIN;
-      LET $t = SELECT * FROM ONLY $task;
-      IF $t = NONE OR $t.state != 'blocked' OR $t.blocked_to != 'owner' OR $t.version != $version OR $t.company_upgrade != NONE { THROW 'task changed' };
-      LET $next = UPDATE ONLY $task SET blocked_to = 'gm', owner_rerouted = true, jev_route_version = $version,
-        version = $t.version + 1 RETURN AFTER;
-      CREATE audit CONTENT { task: $task, actor: 'jev', action: 'jev_reroute', evidence: $evidence, version: $next.version, at: time::now() };
-      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE outbox CONTENT { task: $task, kind: 'rerouted', sequence: $sequence.value, payload: { to: 'gm' }, at: time::now() };
-      COMMIT;`, { task: id('task', taskId), version, evidence }).responses();
-    return responses.every(r => r.success);
-  }
-
   async extendLease(taskId: TaskId, employeeId: string, seconds: number): Promise<boolean> {
     const [rows] = await this.db.query<[unknown[]]>(`UPDATE $task SET lease_expires_at = time::unix(time::now()) + $seconds
       WHERE current_employee = $employee AND delivery_id != NONE RETURN AFTER;`,
@@ -994,8 +980,8 @@ export class Workforce {
   }
 
   /**
-   * FV06 P0：standby 待命超时收回。与 revokeLease 的 doing→ready 不同，这里任务回经理关口而不是
-   * ready 池：blocked + blocked_to='gm'、resume_state='doing'（经理可换人重新 standby，普通 resume
+   * FV06 P0：standby 待命超时收回。与 revokeLease 的 doing→ready 不同，这里任务回老板关口而不是
+   * ready 池：blocked + blocked_to='owner'、resume_state='doing'（老板可换人重新 standby，普通 resume
    * 则按既有守卫恢复 ready 派工）、租约与 delivery 清空、standby_until 清除。旧持有人的一切写入随
    * delivery 清空失效；audit 单独记 standby_timeout，便于与普通收回区分。
    */
@@ -1007,7 +993,7 @@ export class Workforce {
       // 收回后的 ready、标记已清除的普通租约，都不得被写成 blocked + resume_state=doing。
       IF $t = NONE OR $t.current_employee != $employee OR $t.state != 'doing' OR $t.standby_until = NONE { THROW 'lease changed' };
       LET $next = UPDATE ONLY $task SET
-        state = 'blocked', blocked_to = 'gm', resume_state = 'doing',
+        state = 'blocked', blocked_to = 'owner', resume_state = 'doing',
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE, standby_until = NONE,
         handover = true, previous_employee = $employee, version = $t.version + 1 RETURN AFTER;
       UPDATE employee SET active_task = NONE WHERE active_task = $task;
@@ -1097,7 +1083,7 @@ export class Workforce {
    * trip — the dispatcher runs on a single ~50KB/s channel). Read-only.
    *
    * `byTask` is the fallback for a manager gate whose persisted episode start the dispatcher itself clears every pass:
-   * a blocked-to-gm task is not a work-queue item, so `endStaleEpisodes` drops its `dispatch_blocked_since`. Without
+   * a blocked-to-owner task is not a work-queue item, so `endStaleEpisodes` drops its `dispatch_blocked_since`. Without
    * this fallback the same reminder would present a different episode every tick. It is the newest claim of the task,
    * and the wake loop may only use it for an IN-FLIGHT claim: a decided row belongs to an episode that is already over,
    * so it must never suppress a wake for the episode the task has formed since (see the SYS03 guard in dispatcher.ts).
@@ -1209,7 +1195,7 @@ export class Workforce {
   /**
    * SYS03 AC01/AC04: a decided episode is resolved, so its leftover manager todo and any in-flight manager wake are
    * closed with the decision as the resolution. Called by the wake loop before it would start another session for that
-   * episode, so a handled episode never produces a second GM session — not in this pass, and not after a restart,
+   * episode, so a handled episode never produces a second 老板 session — not in this pass, and not after a restart,
    * because the closed rows are the same durable bookkeeping the next dispatcher reads.
    */
   async resolveDecidedEpisode(input: { taskId: string; phase: DispositionPhase; episodeMs: number; resolution: string }): Promise<number> {
@@ -1236,7 +1222,7 @@ export class Workforce {
 
   // ---- manager wake ownership (MR02) ----
   // The manager action row is the todo. A separate dispatch row is the in-flight attempt, keyed by
-  // task+phase+episode, so a reason/version change never starts a second wake while the first GM is
+  // task+phase+episode, so a reason/version change never starts a second wake while the first 老板 is
   // still processing. Every transition is CAS'd by token+attempt; old callbacks cannot release a new claim.
   private managerWakeId(taskId: string, phase: string, episode: number) {
     return id('dispatch', HASH(`gm-manager-wake\0${taskId}\0${phase}\0${episode}`).slice(0, 24));
@@ -1312,7 +1298,7 @@ export class Workforce {
     return { key, token, attempt, input };
   }
 
-  /** Mark the attempt as externally started / running and bind the GM employee and (when known) Paseo agent. */
+  /** Mark the attempt as externally started / running and bind the 老板 employee and (when known) Paseo agent. */
   async markManagerWakeRunning(claim: ManagerWakeClaim, employee: string, agent?: string): Promise<boolean> {
     const d = this.managerWakeId(claim.input.taskId, claim.input.phase, claim.input.episode);
     const updated = await this.runTxResult<WakeDbRow>(`BEGIN;

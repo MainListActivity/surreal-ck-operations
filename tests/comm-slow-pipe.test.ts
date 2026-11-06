@@ -22,7 +22,7 @@ function fixturePayload() {
     state: ['ready', 'doing', 'review', 'blocked', 'done'][index % 5],
     context: index % 25 === 0 ? `第${index}条长正文 ${unit.repeat(1500)}` : `短正文 ${index} ${unit}`,
   }));
-  return { principal: { employeeId: 'fixture-gm', role: 'gm' }, tasks, page: { returned: TASKS, hasMore: false } };
+  return { principal: { employeeId: 'fixture-gm', role: 'owner' }, tasks, page: { returned: TASKS, hasMore: false } };
 }
 
 function cleanEnv(overrides: Record<string, string>): Record<string, string> {

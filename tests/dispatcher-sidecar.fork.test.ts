@@ -50,7 +50,7 @@ run('company fork: restart quarantine, actual lease fencing, fresh dispatch and 
     for (let n = 0; n < 100; n++) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) { ready = true; break; } } catch {} await Bun.sleep(25); }
     expect(ready).toBe(true); await db.connect(); await db.bootstrap();
     const core = new SurrealCompanyCore(db), enrollment = new LocalEnrollmentAdmin(db), owner = new OwnerDesk(db);
-    const gm = await enrollment.enroll('fixture-manager', 'gm', ['execute', 'review', 'manage']);
+    const gm = await enrollment.enroll('fixture-manager', 'owner', ['execute', 'review', 'manage']);
     await db.db.upsert(new RecordId('company_meta', 'config')).content({ eval_enabled: false, jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
     const wf = new Workforce(db, join(dir, 'unused-credential-files'));
     await wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
@@ -134,7 +134,7 @@ run('company fork: two rounds, A implements, B returns, A reworks, B re-reviews;
     for (let n = 0; n < 100; n++) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) { ready = true; break; } } catch {} await Bun.sleep(25); }
     expect(ready).toBe(true); await db.connect(); await db.bootstrap();
     const core = new SurrealCompanyCore(db), enrollment = new LocalEnrollmentAdmin(db), owner = new OwnerDesk(db);
-    const gm = await enrollment.enroll('fixture-manager', 'gm', ['execute', 'review', 'manage']);
+    const gm = await enrollment.enroll('fixture-manager', 'owner', ['execute', 'review', 'manage']);
     await db.db.upsert(new RecordId('company_meta', 'config')).content({ eval_enabled: false, jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
     const wf = new Workforce(db, join(dir, 'unused-credential-files'));
     // Two seats of one engineering def: the implementer takes one, and the independent reviewer keeps the other (R1).
@@ -215,7 +215,7 @@ async function startCompanyFork(name: string, tempRoot = tmpdir()) {
   expect(ready).toBe(true);
   await db.connect(); await db.bootstrap();
   const core = new SurrealCompanyCore(db), enrollment = new LocalEnrollmentAdmin(db), owner = new OwnerDesk(db);
-  const gm = await enrollment.enroll('fixture-manager', 'gm', ['execute', 'review', 'manage']);
+  const gm = await enrollment.enroll('fixture-manager', 'owner', ['execute', 'review', 'manage']);
   await db.db.upsert(new RecordId('company_meta', 'config')).content({ eval_enabled: false, jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
   const wf = new Workforce(db, join(dir, 'unused-credential-files'));
   const agentRows = new Map<string, { id: string; status: string }>();
@@ -440,7 +440,7 @@ run('company fork: legacy authors without a recorded implementer wake the manage
   try {
     await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 2 });
     await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
-    await w.wf.upsertDef('fixture-gm', { role: 'gm', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('fixture-gm', { role: 'owner', provider: 'codex', model: 'fixture', maxInstances: 1 });
     const task = await w.core.createTask(w.gm, { title: 'legacy authors and no recorded implementer', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-legacy' });
     // Two legacy authors. Their rows carry no phase, and the task never recorded an implementer. Actors are employee records,
     // as production audit rows are written: the derivation reads only employee actors, so plain strings would be dropped.
@@ -688,8 +688,8 @@ run('company fork: plugin reload recovers a live review lease for report_blocker
     await w.reload();
     const [boundDir, boundKey] = readFileSync(join(w.dir, 'comm-agents', Q.paseoAgentId!), 'utf8').trim().split('\n');
     const rebound = { SCK_COMM_DIR: boundDir!, SCK_COMM_KEY: boundKey! };
-    expect((await w.relay(rebound, 'report_blocker', { to: 'gm', text: 'Review blocker after plugin reload', idempotencyKey: 'review-blocker-after' })).ok).toBe(true);
-    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'blocked', blockedTo: 'gm', implementer: A.id });
+    expect((await w.relay(rebound, 'report_blocker', { to: 'owner', text: 'Review blocker after plugin reload', idempotencyKey: 'review-blocker-after' })).ok).toBe(true);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'blocked', blockedTo: 'owner', implementer: A.id });
     const history = await w.core.history(w.gm, task.id);
     expect(history.some(h => h.action === 'block' && h.actor === Q.id)).toBe(true);
     const [audits] = await w.db.db.query<[Array<{ action: string; actor: string }>]>(
@@ -866,7 +866,7 @@ run('company fork: an explicit code repo rebind replaces the old-repo implemente
   const task=await w.core.createTask(w.gm,{title:'Cross-repo code binding must not strand the implementer',context:'Synthetic regression only',executorRole:'engineering',reviewerRole:'qa',idempotencyKey:'repo-rebind-create'});
   expect((await w.tick()).woke.some(r=>r.task===task.id)).toBe(true);
   const A=(await w.wf.insts()).find(i=>i.role==='engineering')!;
-  expect((await w.relay(w.envs.get(A.paseoAgentId!)!,'report_blocker',{to:'gm',text:'Synthetic code repo mismatch before any delivery',idempotencyKey:'repo-rebind-block'})).ok).toBe(true);
+  expect((await w.relay(w.envs.get(A.paseoAgentId!)!,'report_blocker',{to:'owner',text:'Synthetic code repo mismatch before any delivery',idempotencyKey:'repo-rebind-block'})).ok).toBe(true);
   w.agentRows.get(A.paseoAgentId!)!.status='idle';
   const {canonicalRepoPath}=await import('../src/core.ts');
   const nextRepo=canonicalRepoPath(join(w.dir,'new-code-repo'));

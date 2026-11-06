@@ -30,7 +30,7 @@ const BOUND_MODEL = 'sensenova-6.8-flash-lite';
 const BOUND_PRICE_REVISION = 'sensenova-token-plan-2026-10-10';
 const PLAN_NAME = 'SenseNova Token Plan Free · 公测 · 限时账号绑定';
 /**
- * The reviewed cap. GM FV06 ruling: the authenticated account pools observe 120000/5h and
+ * The reviewed cap. owner FV06 ruling: the authenticated account pools observe 120000/5h and
  * 1200000/7d, but those are observations only — the allowed upper bound never rises above this
  * reviewed 60k points / 5h constant.
  */
@@ -534,7 +534,7 @@ function analyzePools(pools: PoolFacts[], consoleNowMs: number | null): PoolAnal
 }
 
 /**
- * The ±5 minute bound every source clock is judged against (GM FV06 ruling: never widened,
+ * The ±5 minute bound every source clock is judged against (owner FV06 ruling: never widened,
  * no off-by-one tolerance). `RESET_MARGIN_MS` is a safety margin subtracted from a
  * same-domain reset distance — it is not a tolerance for any gate.
  */
@@ -572,7 +572,7 @@ interface ClockView {
 /**
  * Classifies one source's clock facts. The provider API domain's skew is passed in as the
  * host-health reference used only to label which side is wrong — it is never a substitute
- * anchor for a web/console clock (GM ruling), so a skewed source stays blocked either way.
+ * anchor for a web/console clock (owner ruling), so a skewed source stays blocked either way.
  */
 function clockView(record: SourceRecord | undefined, referenceSkewMs: number | null): ClockView {
   const base = {
@@ -699,7 +699,7 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   let planSource: TokenPlanEvidenceV3['planSource'] | undefined;
   let normalization: TokenPlanEvidenceV3['normalization'] | undefined;
   // The provider API domain's clock, used only to label which side is skewed — never as a
-  // substitute anchor for the web/console clock (GM ruling: API-domain Date cannot stand
+  // substitute anchor for the web/console clock (owner ruling: API-domain Date cannot stand
   // in for the plan/console surface, and the host clock is never corrected).
   const apiClock = clockView(modelsRecord, null);
   // The API domain is the host-health reference itself: its own skew is host-side by definition.
@@ -837,7 +837,7 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
         gaps.push({ field: 'poolWindow', source: 'poolUsage', detail: `console response has ${consoleClock.class}; reset_at absolute times cannot be placed in a trusted console clock domain` });
       } else if (consoleClock.class === 'source-clock-skew' || consoleClock.class === 'host-clock-skew') {
         // The relative distance would still be usable, but the document's pools[].resetAt is an
-        // absolute console-domain epoch. GM ruling: an untrusted source clock keeps the sample
+        // absolute console-domain epoch. owner ruling: an untrusted source clock keeps the sample
         // blocked instead of publishing a source-domain absolute as if it were trusted time.
         gaps.push({ field: 'poolWindow', source: 'poolUsage', detail: `console clock is beyond the 5 minute bound (${consoleClock.class}: ${consoleClock.skewMs}ms); reset_at absolute times cannot be converted into a trusted domain, so no document is produced` });
       } else if (consoleClock.class === 'stale-cache-date') {

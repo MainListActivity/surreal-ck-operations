@@ -46,8 +46,8 @@ test('an empty brief says so and omits the empty sections', () => {
 test('local date is zero padded', () => { expect(localDate(new Date(2026, 0, 5, 9))).toBe('2026-01-05'); });
 
 test('a role with every seat down says so plainly', () => {
-  const { text } = renderBrief({ ...data, capacity: [{ role: 'gm', total: 3, usable: 0, down: ['codex 额度不足', 'grok 额度耗尽或异常'] }], resources: [], dispatchBlocked: { total: 0, rows: [] } });
-  expect(text).toContain('gm：当前没有任何可用编制（codex 额度不足；grok 额度耗尽或异常）');
+  const { text } = renderBrief({ ...data, capacity: [{ role: 'owner', total: 3, usable: 0, down: ['codex 额度不足', 'grok 额度耗尽或异常'] }], resources: [], dispatchBlocked: { total: 0, rows: [] } });
+  expect(text).toContain('owner：当前没有任何可用编制（codex 额度不足；grok 额度耗尽或异常）');
 });
 
 // SYS-DISP R1 (AC02): the brief names each blocked item of the pass with its own phase, workflow state, reason, owner, wait and
@@ -75,10 +75,10 @@ test('brief names every blocked item of the pass row by row, and says how many i
   const text = briefWith(12);
   expect(text).toContain('【无法派工】共 4 项（同一份结论，见岗位页面）');
   for (const line of [
-    '- 《独立验收》（复核·待复核）：本任务作者（写过或提交过）不能复核；已等 12 分钟；负责：gm；下一触发：出现独立候选人选',
-    '- 《零候选任务》（执行·就绪）：该岗位与仓库下没有任何编制或员工；已等 5 分钟；负责：gm；下一触发：新增编制或员工',
+    '- 《独立验收》（复核·待复核）：本任务作者（写过或提交过）不能复核；已等 12 分钟；负责：老板；下一触发：出现独立候选人选',
+    '- 《零候选任务》（执行·就绪）：该岗位与仓库下没有任何编制或员工；已等 5 分钟；负责：老板；下一触发：新增编制或员工',
     '- 《预算阻塞任务》（执行·就绪）：订阅额度耗尽或限流；已等 200 分钟；负责：老板；下一触发：额度恢复或老板充值',
-    '- 《就绪实现》（执行·就绪）：会话占用中或异常；已等 30 分钟；负责：gm；下一触发：候选会话空闲',
+    '- 《就绪实现》（执行·就绪）：会话占用中或异常；已等 30 分钟；负责：老板；下一触发：候选会话空闲',
   ]) expect(text).toContain(line);
   expect(text).not.toContain('可派工任务');
   // Material blocks first (the owner-only recusal), then the longest wait.
@@ -99,8 +99,8 @@ test('the brief names every blocker with responsibility, holder, path, wait, tri
       holder: 'eng-holder', waitedMinutes: 90, nextTrigger: '2026-10-28T00:00:00.000Z',
       dependencyPath: [{ taskId: 'gate', title: '终验' }, { taskId: 't1', title: '客户激活' }],
       handoff: { kind: 'customer_activation', ownerRole: 'customer', pendingAction: '请客户确认激活', completed: ['内部验收'] } },
-    { taskId: 't2', title: '经理决策', kind: 'manager', summary: '等待经理动作', responsibleRole: 'gm',
-      dependencyPath: [{ taskId: 't2', title: '经理决策' }] },
+    { taskId: 't2', title: '老板决策', kind: 'owner', summary: '等待老板动作', responsibleRole: 'owner',
+      dependencyPath: [{ taskId: 't2', title: '老板决策' }] },
   ];
   const finalGate: GoalFinalGateView = { taskId: 'gate', title: '终验', state: 'review', reviewerRole: 'owner',
     ownerGate: true, effective: true, superseded: false, evidenceTaskIds: ['e1'] };
@@ -110,6 +110,6 @@ test('the brief names every blocker with responsibility, holder, path, wait, tri
   for (const part of [
     'SYS07 目标（已 12 天，待修复）', '责任：engineering', '持有人：eng-holder', '已等 90 分钟',
     '下一触发：2026-10-28T00:00:00.000Z', '依赖路径：终验 → 客户激活', '交接：待办：请客户确认激活',
-    '阻点[manager] 等待经理动作；责任：gm', '终验：《终验》（review，复核 owner，老板关口）；证据任务：e1',
+    '阻点[owner] 等待老板动作；责任：owner', '终验：《终验》（review，复核 owner，老板关口）；证据任务：e1',
   ]) expect(text).toContain(part);
 });

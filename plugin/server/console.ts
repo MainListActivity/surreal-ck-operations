@@ -9,6 +9,7 @@ import { randomBytes, createHash } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { relayShellCss, relayIcon } from "../shared/relay-shell.ts";
+import { createOwnerApiFetch } from "./owner-api.ts";
 
 type CompanyApi = {
   upgrades?: import("./vendor/src/company-upgrades.ts").CompanyUpgrades;
@@ -90,9 +91,30 @@ function readDoc(opsRepo: string, name: string): string | undefined {
 export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Promise<Response> {
   const token = consoleToken(opts.home);
   const prefix = `/o/${token}`;
+  const ownerFetch = createOwnerApiFetch({ home: opts.home, company: opts.company as () => Promise<import("./company.ts").Company> });
 
   return async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
+    // 编制外 agent 的 /api/owner/* 接口：Bearer 鉴权，路径独立于 /o/<token>/。
+    if (url.pathname.startsWith("/api/owner/")) return ownerFetch(req);
+    // 页面自身的写操作：/o/<token>/owner/<cmd> 与 /api/owner/* 走同一个 Bearer 校验与处理器，
+    // 这样签名面（没有 /api/owner/* 路由）上打开的页面也能用完整命令。
+    if (req.method === "POST" && url.pathname.startsWith(prefix + "/owner/")) {
+      if (req.headers.get("origin") && req.headers.get("origin") !== url.origin) return json({ error: "origin mismatch" }, 403);
+      const command = url.pathname.slice((prefix + "/owner/").length);
+      if (!command || command.includes("/")) return json({ error: "not found" }, 404);
+      const body = await req.text();
+      return ownerFetch(new Request(new URL(`/api/owner/${command}`, url.origin).toString(), {
+        method: "POST", headers: req.headers, body,
+      }));
+    }
+    // 页面自身换出 Bearer：/o/<token>/ 路径只证明打开了这个页面。
+    if (req.method === "POST" && url.pathname === prefix + "/api/exchange") {
+      const body = await req.json().catch(() => ({})) as { pageToken?: string };
+      if (body.pageToken !== token) return json({ error: "invalid page token" }, 401);
+      const { ensureOwnerToken } = await import("./vendor/src/owner-token.ts");
+      return json({ ownerToken: ensureOwnerToken(opts.home) });
+    }
     if (url.pathname !== prefix && !url.pathname.startsWith(prefix + "/")) {
       return text("not found", 404);
     }
@@ -108,54 +130,50 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
         return text(rankingPage,200,"text/html; charset=utf-8");
       }
       if(req.method==='GET'&&sub==='/api/model-catalog'){
-        try{return json(await (await opts.company()).modelRouting.catalogPage(url.searchParams.get('query')??'',Number(url.searchParams.get('offset')??0),40));}
+        try{const {ownerModelCatalog}=await import('./owner-actions.ts');return json(await ownerModelCatalog(await opts.company(),{query:url.searchParams.get('query')??'',offset:Number(url.searchParams.get('offset')??0),limit:40}));}
         catch{return json({error:'模型目录读取失败'},400);}
       }
       if(req.method==='POST'&&['/api/model-membership','/api/model-alias'].includes(sub)){
         if(req.headers.get('origin')&&req.headers.get('origin')!==url.origin)return json({error:'origin mismatch'},403);
         try{
-          const b=await req.json(),ctx=await opts.company();
+          const b=await req.json();
           if(sub==='/api/model-membership'){
-            const {modelMembershipInput}=await import('../shared/rpc.ts');
-            const {updateModelMembership}=await import('./model-ranking.ts');
-            return json(await updateModelMembership(ctx,modelMembershipInput.parse(b)));
+            const {ownerModelMembership}=await import('./owner-actions.ts');
+            return json(await ownerModelMembership(await opts.company(),b));
           }
-          if(typeof b.model!=='string'||!b.model||b.model.length>300||!(b.slug===null||typeof b.slug==='string'&&b.slug.length>0&&b.slug.length<=200))throw Error('参数无效');
-          const {updateModelAlias}=await import('./model-ranking.ts');
-          return json(await updateModelAlias(ctx,{model:b.model,slug:b.slug}));
+          const {ownerModelAlias}=await import('./owner-actions.ts');
+          return json(await ownerModelAlias(await opts.company(),b as {model?:unknown;slug?:unknown}));
         }catch(error){return json({error:(error as Error).message.slice(0,300)},409);}
       }
       if (req.method === "GET" && sub === "/api/model-ranking") {
-        const { modelRankingView }=await import("./model-ranking.ts");
-        return json(await modelRankingView((await opts.company()).db.db));
+        const { ownerModelRanking }=await import("./owner-actions.ts");
+        return json(await ownerModelRanking(await opts.company()));
       }
       if(req.method==='POST'&&sub==='/api/model-ranking/preview'){
         if(req.headers.get('origin')&&req.headers.get('origin')!==url.origin)return json({error:'origin mismatch'},403);
-        try{const b=await req.json() as {policy:unknown;refresh?:boolean};if(b.refresh!==undefined&&typeof b.refresh!=='boolean')throw Error('refresh');
-          return json(await (await opts.company()).modelRanking.preview(b.policy,b.refresh));
+        try{const b=await req.json() as {policy:unknown;refresh?:boolean};
+          const {ownerModelRankingPreview}=await import('./owner-actions.ts');
+          return json(await ownerModelRankingPreview(await opts.company(),b.policy,b.refresh));
         }catch{return json({error:'预览失败：请检查权重或点击更新观测'},400);}
       }
       if (req.method === "POST" && sub === "/api/model-ranking/pin") {
         if(req.headers.get("origin")&&req.headers.get("origin")!==url.origin)return json({error:"origin mismatch"},403);
         const b=await req.json() as {group?:unknown;model?:unknown;pinned?:unknown};
-        if(!["sck-haiku","sck-sonnet","sck-opus"].includes(b.group as string)||typeof b.model!=="string"||!b.model||b.model.length>300||typeof b.pinned!=="boolean")return json({error:"置顶参数无效"},400);
         try {
-          await (await opts.company()).modelRanking.setPin(b.group as string,b.model,b.pinned);
-          return json({ok:true});
-        } catch { return json({error:"置顶更新失败，请刷新后重试"},409); }
+          const {ownerModelRankingPin}=await import('./owner-actions.ts');
+          return json(await ownerModelRankingPin(await opts.company(),b));
+        } catch (error) {
+          const invalid = /invalid/.test((error as Error).message);
+          return json({error:invalid?"置顶参数无效":"置顶更新失败，请刷新后重试"},invalid?400:409);
+        }
       }
       if (req.method === "POST" && sub === "/api/model-ranking") {
         if(req.headers.get("origin")&&req.headers.get("origin")!==url.origin)return json({error:"origin mismatch"},403);
-        const b=await req.json() as {rules?:unknown;refreshMinutes?:unknown;policy?:unknown};
-        if(typeof b.rules!=="string"||b.rules.length>8000||![2,5,10].includes((b.refreshMinutes??5) as number))return json({error:"排序规则或刷新间隔无效"},400);
-        const { saveRankingSettings }=await import("./vendor/src/model-routing/ranking.ts");
-        const ctx=await opts.company();
         try{
-          const {rankingPolicy}=await import('./vendor/src/model-routing/weights.ts');
-          const policy=b.policy===undefined?undefined:rankingPolicy(b.policy);
-          await saveRankingSettings(ctx.db.db,{rules:b.rules,refreshMinutes:(b.refreshMinutes??5) as number,policy},ctx.modelRanking);
+          const b=await req.json() as {rules?:unknown;refreshMinutes?:unknown;policy?:unknown};
+          const {ownerModelRankingSave}=await import('./owner-actions.ts');
+          return json(await ownerModelRankingSave(await opts.company(),b));
         }catch{return json({error:'排序设置无效或保存失败'},400);}
-        return json({ok:true});
       }
       if (req.method === "GET" && sub === "/api/inbox") return json(await (async()=>{const c=await opts.company();return c.upgrades?c.upgrades.inbox():c.owner.inbox();})());
       if (req.method === "GET" && sub === "/api/brief") return json(await (await opts.company()).owner.brief());
@@ -295,268 +313,330 @@ export function consoleUrl(home: string, lanBase: () => string): string {
 const PAGE = `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>公司审核台</title>
+<title>公司 · 消息流</title>
 <style>
 ${relayShellCss}
+:root{--flow-w:1180px}
+.shell{grid-template-columns:220px minmax(0,1fr)}
+.main-area{display:grid;grid-template-rows:62px minmax(0,1fr)}
+.content{width:100%;max-width:none;margin:0;padding:0;display:grid;grid-template-columns:minmax(0,1fr) 360px;min-height:calc(100vh - 62px)}
+.flow-pane{min-width:0;overflow:auto;padding:18px 20px 40px}
+.goal-rail{display:flex;gap:8px;overflow-x:auto;padding-bottom:12px;margin-bottom:12px}
+.goal-chip{flex:none;min-width:180px;max-width:240px;padding:10px 12px;border:1px solid var(--relay-border);border-radius:10px;background:var(--relay-panel);cursor:pointer;text-align:left;color:var(--relay-text)}
+.goal-chip.active{border-color:var(--relay-accent-border);background:var(--relay-accent-soft)}
+.goal-chip strong{display:block;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.goal-chip small{display:block;color:var(--relay-faint);font-size:10px;margin-top:4px}
+.goal-chip .chip-cancel{height:22px;padding:0 7px;margin-left:6px;border:1px solid var(--relay-warning);border-radius:6px;background:transparent;color:var(--relay-warning);font-size:10px;font-weight:700;cursor:pointer}
+.flow-head .row{display:flex;gap:7px;flex-wrap:wrap}
+.retired-box{margin-top:16px;padding:12px;border:1px solid var(--relay-border);border-radius:12px;background:var(--relay-panel)}
+.retired-box h3{margin:0 0 8px;font-size:13px}
+.flow-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:8px 0 12px;flex-wrap:wrap}
+.flow-head h1{margin:0;font-size:20px;letter-spacing:-.02em}
+.flow-legend{display:flex;gap:12px;flex-wrap:wrap;color:var(--relay-muted);font-size:10px}
+.flow-legend span{display:inline-flex;align-items:center;gap:5px}
+.flow-legend i{width:18px;height:2px;display:inline-block;background:var(--relay-accent)}
+.flow-legend i.dash{background:repeating-linear-gradient(90deg,var(--relay-border-strong) 0 4px,transparent 4px 7px)}
+.flow-legend i.hold{background:var(--relay-warning)}
+.flow-legend i.block{background:var(--relay-danger)}
+.graph-scroll{overflow-x:auto;border:1px solid var(--relay-border);border-radius:14px;background:var(--relay-panel)}
+.graph{min-width:var(--flow-w);display:block}
+.lane-label{font:700 10px ui-monospace,Menlo,monospace;fill:var(--relay-faint);letter-spacing:.08em}
+.lane-line{stroke:var(--relay-border);stroke-width:1}
+.node-box{fill:var(--relay-panel-soft);stroke:var(--relay-border-strong);stroke-width:1.2;rx:9}
+.node-box.active{stroke:var(--relay-accent);fill:var(--relay-accent-soft)}
+.node-box.block{stroke:var(--relay-danger);fill:var(--relay-danger-soft)}
+.node-box.hold{stroke:var(--relay-warning);fill:var(--relay-warning-soft)}
+.node-title{font:650 11px "PingFang SC",system-ui,sans-serif;fill:var(--relay-text)}
+.node-meta{font:10px ui-monospace,Menlo,monospace;fill:var(--relay-faint)}
+.edge{fill:none;stroke:var(--relay-accent);stroke-width:1.6;opacity:.75}
+.edge.draft{stroke:var(--relay-border-strong);stroke-dasharray:5 5;animation:dashmove 2.5s linear infinite}
+.edge.hold{stroke:var(--relay-warning);stroke-dasharray:7 4}
+.edge.block{stroke:var(--relay-danger)}
+.edge-hit{fill:none;stroke:transparent;stroke-width:14;cursor:pointer}
+@keyframes dashmove{to{stroke-dashoffset:-40}}
+.dot{fill:var(--relay-accent)}
+.drawer{border-left:1px solid var(--relay-border);background:var(--relay-panel);padding:18px;overflow:auto;max-height:calc(100vh - 62px)}
+.drawer h2{margin:0 0 4px;font-size:15px}
+.drawer .kicker{margin-bottom:14px;color:var(--relay-accent);font:800 10px ui-monospace,Menlo,monospace;letter-spacing:.12em}
+.drawer section{margin:0 0 16px;padding-bottom:14px;border-bottom:1px solid var(--relay-border)}
+.drawer label{display:grid;gap:6px;margin:8px 0;font-size:11px;color:var(--relay-muted);font-weight:700}
+.drawer textarea{min-height:100px;font-size:12px}
+.drawer .row{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}
+.drawer button{height:32px;padding:0 11px;border:1px solid var(--relay-border);border-radius:8px;background:var(--relay-panel-soft);color:var(--relay-text);font-size:11px;font-weight:700;cursor:pointer}
+.drawer button.primary{background:var(--relay-accent);border:0;color:#fff}
+.drawer button.warn{color:var(--relay-warning);border-color:var(--relay-warning)}
+.drawer pre{white-space:pre-wrap;word-break:break-word;font:11px/1.7 ui-monospace,Menlo,monospace;color:var(--relay-muted);max-height:220px;overflow:auto;background:var(--relay-input);padding:9px;border-radius:8px}
+.inbox-list{display:grid;gap:8px}
+.inbox-card{padding:10px;border:1px solid var(--relay-border);border-radius:9px;background:var(--relay-panel-soft)}
+.inbox-card h3{margin:0 0 5px;font-size:12px}
+.inbox-card p{margin:0 0 8px;color:var(--relay-muted);font-size:11px;line-height:1.5}
+.goal-form{display:grid;gap:8px}
+.goal-form input,.goal-form select,.goal-form textarea{width:100%;font-size:11px}
+.goal-form textarea{min-height:70px}
+@media(max-width:900px){.content{grid-template-columns:1fr}.drawer{border-left:0;border-top:1px solid var(--relay-border);max-height:none}.shell{display:block}.sidebar{height:auto;position:sticky;top:0}.main-nav{flex-direction:row}.topbar{top:56px}}
 </style></head><body>
 <div class="shell">
-<aside class="sidebar">
-<div class="brand"><span class="brand-mark"><i></i><i></i></span><span><strong>Relay</strong><small>Operations</small></span></div>
-<p class="nav-label">管理工作区</p>
-<nav class="main-nav">
-<button data-t="todo" class="on" onclick="tab('todo')">${relayIcon("inbox")}<span>待办</span><b id="nav-count" hidden></b></button>
-<button data-t="goals" onclick="tab('goals')">${relayIcon("target")}<span>目标</span></button>
-<button data-t="docs" onclick="tab('docs')">${relayIcon("book")}<span>手册</span></button>
-<button onclick="location.href='ranking'">${relayIcon("layers")}<span>模型排序</span></button>
-<button data-t="gm" onclick="tab('gm')">${relayIcon("send")}<span>给经理留言</span></button>
-</nav>
-<div class="sidebar-footer"><div class="operator"><span class="avatar">ML</span><span><strong>老板</strong><small>公司审核台</small></span></div></div>
-</aside>
-<div class="main-area">
-<header class="topbar">
-<div class="breadcrumb"><span>公司审核台</span><b>/</b><strong id="crumb">待办</strong></div>
-<div class="top-actions"><span class="status" id="stat">加载中…</span><button class="icon-button" id="theme-btn" onclick="toggleTheme()" aria-label="切换主题"></button><button class="refresh" onclick="load()">${relayIcon("refresh")}<span>刷新</span></button></div>
-</header>
-<main class="content" id="m"></main>
-</div>
-</div>
-<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<aside class="sidebar"><div class="brand"><span class="brand-mark"><i></i><i></i></span><span><strong>公司</strong><small>Message Flow</small></span></div>
+<p class="nav-label">工作区</p><nav class="main-nav">
+<button data-t="flow" class="on" data-cmd="tab:flow">${relayIcon("activity")}<span>消息流</span></button>
+<button data-t="inbox" data-cmd="tab:inbox">${relayIcon("inbox")}<span>收件箱</span><b id="nav-count" hidden></b></button>
+<button data-t="defs" data-cmd="tab:defs">${relayIcon("layers")}<span>编制</span></button>
+<button data-cmd="theme" id="theme-btn" class="icon-button" aria-label="切换主题"></button>
+<button onclick="location.href='ranking'" class="refresh">${relayIcon("layers")}<span>模型排序</span></button>
+</nav><div class="sidebar-footer"><div class="operator"><span class="avatar">B</span><span><strong>老板</strong><small>控制面 · v0.3.78</small></span></div></div></aside>
+<div class="main-area"><header class="topbar"><div class="breadcrumb"><span>公司</span><b>/</b><strong id="crumb">消息流</strong></div>
+<div class="top-actions"><span class="status" id="stat">加载中…</span><button class="refresh" id="pause-btn" data-cmd="toggle-pause">暂停派工</button><button class="refresh" data-cmd="refresh">${relayIcon("refresh")}<span>刷新</span></button></div></header>
+<main class="content"><div class="flow-pane" id="flow-pane"></div><aside class="drawer" id="drawer"></aside>
+<template id="upgrade-card">上线内容：<span class="uc"></span> · 影响范围：<span class="ui"></span> · <button class="upgrade-start">升级至 v<span class="uv"></span></button> · <button class="upgrade-automatic">自动升级已开启</button></template>
+</main></div></div>
+<div id="toast" class="toast" role="status"></div>
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const linkify=s=>esc(s).replace(/https?:\\/\\/[^\\s"'<>）)】\\]，。；、]+/g,u=>'<a href="'+u+'" target="_blank" rel="noopener">'+u+'</a>');
-const KIND={goal:'范围',task:'任务',gate:'关口',release:'上线申请',deploy:'部署实测'};
-const CRUMB={todo:'待办',goals:'目标',docs:'手册',gm:'给经理留言'};
-const STATE_TONE={doing:['进行中','blue'],ready:['待领取',''],blocked:['被阻塞','danger'],review:['待验收','violet'],done:['已完成','success'],void:['已作废','']};
-const ICONS={check:'<path d="M5 12l4 4L19 6"/>',x:'<path d="M6 6l12 12M18 6L6 18"/>',send:'<path d="M21 3L9 15M21 3l-7 18-5-6-6-5 18-7z"/>',file:'<path d="M6 2h8l4 4v16H6z"/><path d="M14 2v5h5M9 12h6M9 16h6"/>',activity:'<path d="M3 12h4l2-7 4 14 2-7h6"/>',moon:'<path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/>',sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/>'};
 const icon=n=>'<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">'+(ICONS[n]||'')+'</svg>';
-const badge=(text,tone)=>'<span class="status '+(tone||'')+'"><i></i>'+esc(text)+'</span>';
-function toast(msg){const el=$('toast');el.textContent=msg;el.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(function(){el.classList.remove('show')},2200)}
+const ICONS={activity:'<path d="M3 12h4l2-7 4 14 2-7h6"/>',inbox:'<path d="M4 5h16v12H4z"/>',layers:'<path d="M12 3L3 8l9 5 9-5-9-5z"/>',refresh:'<path d="M20 7v5h-5M4 17v-5h5"/>'};
 const store={get:k=>{try{return localStorage.getItem(k)}catch(e){return null}},set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}}};
 function prefTheme(){try{return matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}catch(e){return 'light'}}
-function renderThemeBtn(){$('theme-btn').innerHTML=icon((store.get('relay-theme')||prefTheme())==='light'?'moon':'sun')}
+function renderThemeBtn(){const b=$('theme-btn');if(b)b.innerHTML=icon((store.get('relay-theme')||prefTheme())==='light'?'activity':'layers')}
 function toggleTheme(){const next=(store.get('relay-theme')||prefTheme())==='light'?'dark':'light';store.set('relay-theme',next);document.documentElement.dataset.theme=next;renderThemeBtn()}
-const savedTheme=store.get('relay-theme');if(savedTheme)document.documentElement.dataset.theme=savedTheme;
-const api=async(p,o)=>{const r=await fetch('api/'+p,o?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)}:undefined);const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.statusText);return j};
-let INBOX=null,BRIEF=null,DOCS=null,T='todo';
-function tab(t){T=t;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.t===t));$('crumb').textContent=CRUMB[t]||t;render()}
+document.documentElement.dataset.theme=store.get('relay-theme')||'light';renderThemeBtn();
+function toast(msg){const el=$('toast');el.textContent=msg;el.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.classList.remove('show'),2200)}
+const TOKEN=location.pathname.split('/')[2];
+const api=async(cmd,o)=>{
+  // 页面在 LAN 面与签名面都从自身前缀下发命令：相对地址留在 /o/<token>/ 内，Bearer 仍是同一把老板令牌。
+  const r=await fetch('owner/'+cmd,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+OWNER,'X-Owner-Agent':'web'},body:JSON.stringify({command:cmd,...o})});
+  const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.statusText);return j;};
+let OWNER='';let GOALS=[],TASKS=[],MESSAGES=[],INBOX=null,DEFS=[],SEL=null,GOAL='',T='flow',PAUSED=false,NOTICES=[],RETIRED=null;
+async function boot(){
+  const x=await fetch('api/exchange',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pageToken:TOKEN})});
+  const j=await x.json().catch(()=>({}));if(!x.ok)throw new Error(j.error||'exchange failed');OWNER=j.ownerToken;
+  document.addEventListener('click',onCommand);
+  await load();setInterval(load,10000);
+}
+async function onCommand(ev){
+  const el=ev.target.closest('[data-cmd]');if(!el)return;
+  // Only the first colon separates the command: ids and notice keys may themselves contain colons.
+  const raw=String(el.dataset.cmd),cut=raw.indexOf(':');
+  const cmd=cut<0?raw:raw.slice(0,cut),arg=cut<0?'':raw.slice(cut+1);
+  if(cmd==='tab'){T=arg;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.t===arg));$('crumb').textContent={flow:'消息流',inbox:'收件箱',defs:'编制'}[arg]||arg;render();}
+  else if(cmd==='theme')toggleTheme();
+  else if(cmd==='refresh')load();
+  else if(cmd==='goal'){GOAL=arg;SEL=null;await refreshRetired();render();}
+  else if(cmd==='task'){SEL=arg;render();}
+  else if(cmd==='msg'){SEL='m:'+arg;render();}
+  else if(cmd==='save-msg')saveMsg(arg);
+  else if(cmd==='hold-msg')holdMsg(arg,!MESSAGES.find(m=>String(m.id?.id??m.id)===arg)?.hold);
+  else if(cmd==='release-msg')releaseMsg(arg);
+  else if(cmd==='void')voidTask(arg);
+  else if(cmd==='revoke')revokeTask(arg);
+  else if(cmd==='unlock')unlockTask(arg);
+  else if(cmd==='decide'){const [id,dec]=String(arg).split(':');decide(id,dec,el.dataset.note||'');}
+  else if(cmd==='toggle-def'){const [id,on]=String(arg).split(':');toggleDef(id,on==='1');}
+  else if(cmd==='upgrade-automatic'){await api('upgrade.automatic',{enabled:!(INBOX?.upgrades?.automatic?.enabled)});toast('已切换自动升级');await load();}
+  else if(cmd==='upgrade-start'){await api('upgrade.start',{taskId:arg.split(':')[0],taskVersion:Number(arg.split(':')[1]),digest:arg.split(':')[2]});toast('已启动升级');await load();}
+  else if(cmd==='create-task')createTask();
+  else if(cmd==='new-task')newTaskForm();
+  else if(cmd==='new-goal')newGoalForm();
+  else if(cmd==='create-goal')createGoal();
+  else if(cmd==='cancel-goal')cancelGoal(arg);
+  else if(cmd==='save-task')saveTask(arg);
+  else if(cmd==='reassign')reassignForm(arg);
+  else if(cmd==='save-reassign')saveReassign(arg);
+  else if(cmd==='toggle-pause')togglePause();
+  else if(cmd==='resolve-notice')resolveNotice(arg);
+  else if(cmd==='resolve-retired')resolveRetired(arg);
+}
 async function load(){
-  $('stat').textContent='加载中…';
-  // brief is only rendered on the goals tab; polling it every 20s on todo used to
-  // run the heaviest aggregate query in a loop and starve the shared DB channel.
   try{
-    INBOX=await api('inbox');
-    if(T!=='todo'||!BRIEF)BRIEF=await api('brief');
-    const g=(INBOX.gates||[]).filter(x=>!x.task.companyUpgrade).length,q=(INBOX.questions||[]).filter(x=>!x.task.companyUpgrade).length,n=g+q;
-    const navBadge=$('nav-count');navBadge.textContent=n;navBadge.hidden=!n;
-    const stat=$('stat');stat.textContent=n?('待办 '+n):'无待办';stat.className='status'+(n?' violet':'');
-    render();}catch(e){$('stat').textContent='加载失败';}
+    const [g,t,m,i,d,s,n]=await Promise.all([api('goal.list',{}),api('task.list',{}),api('message.list',{includeSent:true}),api('inbox',{}),api('def.list',{}),api('status',{}),api('notice.list',{})]);
+    GOALS=g.goals||[];TASKS=t.tasks||[];MESSAGES=m.messages||[];INBOX=i;DEFS=d.defs||[];NOTICES=n.notices||[];PAUSED=s.paused===true;
+    await refreshRetired();
+    const n2=(INBOX.gates||[]).length+(INBOX.questions||[]).length;const b=$('nav-count');if(b){b.textContent=n2;b.hidden=!n2}
+    $('stat').textContent=n2?('待办 '+n2):'运行中';$('stat').className='status'+(n2?' violet':'');
+    const pb=$('pause-btn');if(pb)pb.textContent=PAUSED?'恢复派工':'暂停派工';
+    render();
+  }catch(e){$('stat').textContent='加载失败：'+e.message}
 }
-async function atts(el,tid){
-  try{const r=await api('attachments?taskId='+encodeURIComponent(tid));
-    el.innerHTML=(r.attachments||[]).map(a=>'<a class="attachment" target="_blank" href="'+a.url+'">'+icon('file')+'<span><strong>'+esc(a.name)+'</strong><small>'+((a.sizeBytes/1024).toFixed(1))+'KB · '+esc(a.kind)+'</small></span></a>').join('')||'';
-  }catch(e){}
+async function refreshRetired(){
+  RETIRED=null;if(!GOAL)return;
+  try{RETIRED=await api('goal.retired.list',{goalId:GOAL});}
+  catch(e){RETIRED={goalId:GOAL,goalVersion:0,items:[],error:e.message};}
 }
-const newKey=()=>'k'+Date.now().toString(36)+Math.random().toString(36).slice(2,14);
-async function decide(tid,dec){
-  try{
-    const noteEl=$('n-'+tid),note=noteEl?noteEl.value:'';
-    if(dec!=='approve'&&note.trim().length<2){alert('退回/回复需要写明说明');return}
-    await api('decide',{taskId:tid,decision:dec,note,key:newKey()});
-    toast(dec==='approve'?'已批准，任务继续推进':dec==='reject'?'已退回并通知提交人':'回复已发送');await load();
-  }catch(e){alert(e.message)}
+const laneY=r=>70+r*104;
+function graph(){
+  const visible=GOAL?TASKS.filter(t=>String(t.goal?.id??t.goal??'')===GOAL):TASKS.slice(0,40);
+  const lanes=[...new Set(['owner',...visible.flatMap(t=>[t.executor_role,t.reviewer_role].filter(Boolean))])].slice(0,12);
+  const W=1180,H=Math.max(320,lanes.length*104+60);
+  let svg='<svg class="graph" viewBox="0 0 '+W+' '+H+'" width="'+W+'" height="'+H+'" role="img" aria-label="消息流">';
+  lanes.forEach((l,r)=>{const y=laneY(r);svg+='<line class="lane-line" x1="16" y1="'+y+'" x2="'+(W-16)+'" y2="'+y+'"/><text class="lane-label" x="20" y="'+(y-12)+'">'+esc(l)+'</text>'});
+  const pos=r=>laneY(Math.max(0,lanes.indexOf(r)));
+  visible.forEach((t,n)=>{
+    const x=180+(n%5)*196,y=pos(t.executor_role),ry=pos(t.reviewer_role);
+    const msgs=MESSAGES.filter(m=>String(m.task?.id??m.task??'')===String(t.id?.id??t.id));
+    const held=msgs.some(m=>m.hold||m.state==='held'),blocked=t.state==='blocked',sent=msgs.some(m=>m.state==='sent');
+    const cls=blocked?'block':held?'hold':t.state==='doing'?'active':'';
+    const tid=esc(String(t.id?.id??t.id));
+    svg+='<g class="flow-node" data-cmd="task:'+tid+'" style="cursor:pointer">';
+    svg+='<rect class="node-box '+cls+'" x="'+(x-72)+'" y="'+(y-24)+'" width="144" height="48" rx="9"/>';
+    svg+='<text class="node-title" x="'+(x-62)+'" y="'+(y-3)+'">'+esc((t.title||'任务').slice(0,15))+'</text>';
+    svg+='<text class="node-meta" x="'+(x-62)+'" y="'+(y+14)+'">'+esc(t.state||'')+' · '+esc(t.executor_role||'')+'</text></g>';
+    const ex=x+72,ey=ry-24;
+    const path='M'+ex+' '+y+' C'+(ex+48)+' '+y+','+(x+120)+' '+ey+','+(x+170)+' '+ey;
+    const edgeCls=sent?(blocked?'block':''):held?'hold':'draft';
+    svg+='<path id="e-'+n+'" class="edge '+edgeCls+'" d="'+path+'"/>';
+    svg+='<path class="edge-hit" data-cmd="task:'+tid+'" d="'+path+'"/>';
+    if(sent&&!held&&!blocked)svg+='<circle class="dot" r="3.5"><animateMotion dur="3s" repeatCount="indefinite" path="'+path+'"/></circle>';
+  });
+  svg+='</svg>';return svg;
 }
-async function upgrade(tid,version,digest){
- const el=$('upgrade-'+tid);if(el){el.disabled=true;el.textContent='正在启动升级…'}
- try{await api('upgrade',{taskId:tid,taskVersion:version,digest});await load()}catch(e){alert(e.message);if(el){el.disabled=false;el.textContent='重新升级'}}
+function drawerDefault(){
+  const drafts=MESSAGES.filter(m=>m.state!=='sent');
+  $('drawer').innerHTML='<div class="kicker">DRAWER</div><h2>消息与任务</h2><p class="meta">点击节点或连线查看正文、放行与审计。</p>'
+    +'<section><h3>待发消息 '+drafts.length+'</h3><div class="inbox-list">'+drafts.slice(0,12).map(m=>'<div class="inbox-card"><h3>'+esc(m.step)+' → '+esc(m.role)+'</h3><p>'+esc(m.body.slice(0,80))+'</p><button data-cmd="msg:'+esc(m.id)+'">查看</button></div>').join('')||'<p class="meta">无</p>'+'</div></section>'
+    +'<section><h3>收件箱</h3>'+((INBOX?.gates||[]).length+(INBOX?.questions||[]).length)+' 项待你决定</section>'
+    +'<section><h3>提醒 '+(noticeList().length||'')+'</h3><div class="inbox-list">'+noticesHtml()+'</div></section>'
+    +'<section><h3>公司系统升级</h3>'+upgradeHtml()+'</section>';
 }
-async function autoUpgrade(){
- try{await api('upgrade/automatic',{enabled:!INBOX?.upgrades?.automatic?.enabled});await load();}catch(e){alert(e.message||'设置失败，请重试')}
+function upgradeHtml(){
+  const items=INBOX?.upgrades?.items||[];
+  if(!items.length)return '<p class="meta">无待升级版本</p>';
+  return items.map(x=>'<div class="inbox-card"><h3>v'+esc(x.plan?.version||'')+' · '+esc(x.status||'')+'</h3><p>'+esc(x.taskId||'')+'</p><div class="row"><button data-cmd="upgrade-start:'+esc(String(x.taskId))+':'+esc(String(x.taskVersion))+':'+esc(String(x.plan?.digest||''))+'">升级至 v'+esc(x.plan?.version||'')+'</button></div></div>').join('');
 }
-function upgradeCard(x){
- const p=x.plan,busy=['queued','preparing','checking','installing','verifying'].includes(x.status),done=x.status==='succeeded',stale=x.retired===true;
- const list=a=>'<ul>'+a.map(t=>'<li>'+esc(t)+'</li>').join('')+'</ul>';
- return '<article class="decision-card upgrade-card"><div class="card-top"><span class="type-label">公司系统升级 · '+esc(x.phase)+'</span>'+badge(done?'已完成':stale?'已替代':busy?'进行中':'待执行',done?'success':stale?'blue':busy?'blue':'warning')+'</div>'
- +'<h3>v'+esc(p.version)+' · '+esc(p.title)+'</h3>'
- +'<div class="upgrade-cols"><div><h4>上线内容</h4>'+list(p.changes)+'<h4>影响范围</h4>'+list(p.impact)+'</div>'
- +'<div><h4>数据变化</h4><p class="upgrade-p">'+esc(p.migration)+'</p><h4>回退方式</h4><p class="upgrade-p">'+esc(p.rollback)+'</p></div></div>'
- +'<details class="sha"><summary>提交详情</summary><code>'+esc(p.sha)+'</code></details>'+(x.error?'<p class="err" role="alert">'+esc(x.error)+'</p>':'')
- +(done?'<p class="okm">升级完成，已自动回复通过</p>':stale?'<p class="okm">该版本已被现役版本取代，无需再安装；这张旧待办会自动收口。</p>':'<div class="decision-actions"><button id="upgrade-'+esc(x.taskId)+'" class="approve" '+(busy?'disabled':'')+' onclick="upgrade(\\''+x.taskId+'\\','+x.taskVersion+',\\''+p.digest+'\\')">'+(busy?esc(x.phase):'升级至 v'+esc(p.version))+'</button></div>')+'</article>';
+function noticeList(){return (NOTICES&&NOTICES.length)?NOTICES:(INBOX?.notices||[])}
+function noticesHtml(){
+  const items=noticeList();
+  if(!items.length)return '<p class="meta">无未解决提醒</p>';
+  return items.map(n=>'<div class="inbox-card"><p>'+esc(n.text||n.key)+'</p><button data-cmd="resolve-notice:'+esc(String(n.key))+'">已处理</button></div>').join('');
 }
-async function notice(key){try{await api('notice',{key});await load()}catch(e){alert(e.message)}}
-async function voidTask(tid,gid){
-  const note=prompt('作废原因（必填，会进任务审计）')||'';
+function drawerMsg(id){
+  const m=MESSAGES.find(x=>String(x.id?.id??x.id)===id);
+  if(!m){$('drawer').innerHTML='<p class="meta">消息不存在</p>';return}
+  const locked=m.state==='sent';
+  $('drawer').innerHTML='<div class="kicker">MESSAGE</div><h2>'+esc(m.step)+' · '+esc(m.role)+'</h2>'
+    +'<section><label>消息正文<textarea id="msg-body" '+(locked?'disabled':'')+'>'+esc(m.body)+'</textarea></label>'
+    +(locked?'<p class="meta">已发出并锁定 · '+esc(m.sentAt||'')+'</p>':'<div class="row"><button class="primary" data-cmd="save-msg:'+esc(id)+'">保存</button><button class="warn" data-cmd="hold-msg:'+esc(id)+'">'+(m.hold?'取消放行标记':'需要我放行')+'</button><button data-cmd="release-msg:'+esc(id)+'">放行</button></div>')+'</section>'
+    +'<section><h3>原文留存</h3><pre>'+esc(m.body)+'</pre></section>';
+}
+function drawerTask(id){
+  const t=TASKS.find(x=>String(x.id?.id??x.id)===id);
+  if(!t){$('drawer').innerHTML='<p class="meta">任务不存在</p>';return}
+  const msgs=MESSAGES.filter(m=>String(m.task?.id??m.task??'')===id);
+  $('drawer').innerHTML='<div class="kicker">TASK '+esc(id.slice(0,8))+'</div><h2>'+esc(t.title||'')+'</h2><p class="meta">'+esc(t.executor_role||'')+' → '+esc(t.reviewer_role||'')+' · '+esc(t.state||'')+'</p>'
+    +'<section><h3>需求与验收</h3><label>需求<textarea id="t-req">'+esc(t.requirement||t.context||'')+'</textarea></label>'
+    +'<label>验收标准<textarea id="t-ac">'+esc(t.acceptance_text||'')+'</textarea></label>'
+    +'<div class="row"><button class="primary" data-cmd="save-task:'+esc(id)+'">保存需求与验收</button></div></section>'
+    +'<section><h3>消息</h3>'+msgs.map(m=>'<div class="inbox-card"><h3>'+esc(m.step)+' · '+esc(m.state)+(m.hold?' · 待放行':'')+'</h3><p>'+esc(m.body.slice(0,90))+'</p><button data-cmd="msg:'+esc(String(m.id?.id??m.id))+'">编辑/放行</button></div>').join('')+'</section>'
+    +'<section><h3>操作</h3><div class="row"><button data-cmd="void:'+esc(id)+'">作废</button><button data-cmd="revoke:'+esc(id)+'">撤销租约</button><button data-cmd="unlock:'+esc(id)+'">解锁</button><button data-cmd="reassign:'+esc(id)+'">改派</button></div></section>';
+}
+function reassignForm(id){
+  $('drawer').innerHTML='<div class="kicker">REASSIGN</div><h2>改派任务</h2><div class="goal-form">'
+    +'<label>执行岗<select id="r-ex">'+['engineering','qa','product','concept-design','asset-production','screenwriter','story-author','cinematography','cs'].map(r=>'<option>'+r+'</option>').join('')+'</select></label>'
+    +'<label>复核岗<select id="r-rev">'+['qa','engineering','owner','product'].map(r=>'<option>'+r+'</option>').join('')+'</select></label>'
+    +'<label>改派说明<input id="r-note"/></label>'
+    +'<div class="row"><button class="primary" data-cmd="save-reassign:'+esc(id)+'">确认改派</button><button data-cmd="task:'+esc(id)+'">返回</button></div></div>';
+}
+async function saveTask(id){
+  const requirement=$('t-req').value,acceptanceText=$('t-ac').value;
+  if(requirement.trim().length<1||acceptanceText.trim().length<1){toast('需求与验收标准都不能为空');return}
+  await api('task.update',{taskId:id,requirement,acceptanceText});toast('已保存');await load();
+}
+async function saveReassign(id){
+  const executorRole=$('r-ex').value,reviewerRole=$('r-rev').value,note=$('r-note').value.trim();
+  if(note.length<1){toast('请填写改派说明');return}
+  await api('task.reassign',{taskId:id,executorRole,reviewerRole,note});toast('已改派');SEL=id;await load();
+}
+function renderFlow(){
+  const rail='<div class="goal-rail"><button class="goal-chip '+(GOAL?'':'active')+'" data-cmd="goal:"><strong>全部目标</strong><small>'+TASKS.length+' 个任务</small></button>'
+    +GOALS.map(g=>{const gid=String(g.id?.id??g.id),active=GOAL===gid;
+      return '<div class="goal-chip '+(active?'active':'')+'" data-cmd="goal:'+esc(gid)+'" role="button" tabindex="0"><strong>'+esc((g.title||'').slice(0,20))+'</strong><small>'+esc(g.state||'')+(active?' <button class="chip-cancel" data-cmd="cancel-goal:'+esc(gid)+'">取消目标</button>':'')+'</small></div>';
+    }).join('')+'</div>';
+  $('flow-pane').innerHTML='<div class="flow-head"><h1>消息流</h1><div class="flow-legend"><span><i></i>已发</span><span><i class="dash"></i>待发 draft</span><span><i class="hold"></i>需要我放行</span><span><i class="block"></i>阻塞到老板</span></div><div class="row"><button class="primary small" data-cmd="new-goal">+ 新增目标</button><button class="primary small" data-cmd="new-task">+ 新增任务</button></div></div>'
+    +rail+'<div class="graph-scroll">'+graph()+'</div>'+retiredHtml();
+  if(SEL)SEL.startsWith('m:')?drawerMsg(SEL.slice(2)):drawerTask(SEL);else drawerDefault();
+}
+function retiredHtml(){
+  if(!GOAL)return '';
+  const items=RETIRED?.items||[];
+  const err=RETIRED?.error?'<p class="meta">读取失败：'+esc(RETIRED.error)+'</p>':'';
+  return '<section class="retired-box"><h3>待处置作废任务 '+(RETIRED?items.length:'…')+'</h3>'+err
+    +items.map(x=>'<div class="inbox-card"><h3>'+esc(x.title||x.taskId)+'</h3><p class="meta">'+esc(String(x.taskId))+' · '+esc(x.retiredBy||'')+'</p><div class="goal-form">'
+      +'<label>处置方式<select id="rr-d-'+esc(String(x.taskId))+'"><option value="fixture">fixture</option><option value="replaced">replaced</option><option value="excluded">excluded</option></select></label>'
+      +'<label>替代任务 ID（replaced 时必填，逗号分隔）<input id="rr-r-'+esc(String(x.taskId))+'"/></label>'
+      +'<label>处置原因（至少 10 个字）<input id="rr-n-'+esc(String(x.taskId))+'"/></label>'
+      +'<div class="row"><button data-cmd="resolve-retired:'+esc(String(x.taskId))+'">提交处置</button></div></div></div>').join('')
+    +(items.length?'':'<p class="meta">无待处置任务</p>')+'</section>';
+}
+async function cancelGoal(goalId){
+  const note=prompt('取消目标的原因（至少 2 个字）')||'';
   if(note.trim().length<2)return;
-  try{await api('void',{taskId:tid,note,key:newKey()});toast('任务已作废');if(gid)reloadGoalTasks(gid);else await load()}catch(e){alert(e.message)}
+  await api('goal.cancel',{goalId,note});toast('已取消目标');GOAL='';SEL=null;RETIRED=null;await load();
 }
-async function revokeTask(tid,gid){
-  const note=prompt('终止原因（可留空），只撤当前在途执行，任务回 ready 等下一位员工','');
-  if(note===null)return;
-  try{const r=await api('revoke',{taskId:tid,note});toast(r.ok?('已撤销 '+(r.employee||'')+' 的租约'):'该任务没有在途租约');if(gid)reloadGoalTasks(gid);else await load()}catch(e){alert(e.message)}
+function newGoalForm(){
+  $('drawer').innerHTML='<div class="kicker">NEW GOAL</div><h2>新建目标</h2><div class="goal-form">'
+    +'<label>目标内容<textarea id="g-text"></textarea></label>'
+    +'<label>产线<select id="g-pipeline"><option value="software">software</option><option value="story">story</option><option value="video">video</option></select></label>'
+    +'<label>档位<select id="g-tier"><option value="quick">quick</option><option value="standard">standard</option><option value="program">program</option></select></label>'
+    +'<div class="row"><button class="primary" data-cmd="create-goal">创建并分级</button></div></div>';
 }
-async function unlockTask(tid,gid){
-  try{const r=await api('unlock',{taskId:tid});toast(r.unlocked&&r.unlocked.length?('已解锁：'+r.unlocked.join('、')):'没有需要解锁的任务');if(gid)reloadGoalTasks(gid);else await load()}catch(e){alert(e.message)}
+async function createGoal(){
+  const text=$('g-text').value.trim();if(text.length<2){toast('请填写目标内容');return}
+  const pipeline=$('g-pipeline').value,tier=$('g-tier').value;
+  const g=await api('goal.create',{text,pipeline,tier});
+  const goalId=String(g.id?.id??g.id??'');
+  await api('goal.triage',{goalId,tier});
+  toast('已创建目标');GOAL=goalId;SEL=null;await load();
 }
-async function cancelGoal(gid){
-  const note=prompt('取消目标原因（必填），会作废其全部未完成任务并关闭目标')||'';
-  if(note.trim().length<2)return;
-  if(!confirm('确认取消这个目标？未完成任务将全部作废。'))return;
-  try{const r=await api('cancel-goal',{goalId:gid,note,key:newKey()});toast('已作废 '+r.retired+' 个任务'+(r.remaining?('；仍有 '+r.remaining+' 个未能作废'):''));await load()}catch(e){alert(e.message)}
+async function togglePause(){
+  await api(PAUSED?'task.resume':'task.pause',{});PAUSED=!PAUSED;toast(PAUSED?'已暂停派工':'已恢复派工');await load();
 }
-const TERMINAL=['done','void'];
-function stateBadge(s){const d=STATE_TONE[s]||[s,''];return badge(d[0],d[1])}
-function taskActions(t,gid){
-  let h='';
-  if(t.state==='doing'&&t.currentEmployee)h+='<button class="mid" onclick="revokeTask(\\''+t.id+'\\',\\''+gid+'\\')">终止在途</button>';
-  if(t.state==='blocked')h+='<button class="mid" onclick="unlockTask(\\''+t.id+'\\',\\''+gid+'\\')">解锁</button>';
-  if(!TERMINAL.includes(t.state))h+='<button class="no" onclick="voidTask(\\''+t.id+'\\',\\''+gid+'\\')">作废</button>';
-  return h;
+async function resolveNotice(key){
+  await api('notice.resolve',{key});toast('已关闭提醒');await load();
 }
-async function reloadGoalTasks(gid){
-  const d=document.querySelector('#gt-'+CSS.escape(gid)+' .task-list');if(!d)return;
-  try{const r=await api('tasks?goalId='+encodeURIComponent(gid));
-    d.innerHTML=(r.tasks||[]).map(t=>'<div class="task-row"><strong>'+esc(t.title)+'</strong><span class="task-people">'+esc(t.executorRole)+' → '+esc(t.reviewerRole)+(t.currentEmployee?' · '+esc(t.currentEmployee):'')+'</span>'+stateBadge(t.state)+'<div class="task-acts">'+taskActions(t,gid)+'</div></div>').join('')||'<div class="task-row"><strong>（无任务）</strong></div>';
-  }catch(e){d.textContent=e.message}
+async function resolveRetired(taskId){
+  const item=(RETIRED?.items||[]).find(x=>String(x.taskId)===taskId);
+  if(!item){toast('该任务已不在待处置列表');return}
+  const disposition=$('rr-d-'+taskId).value;
+  const replacementTaskIds=$('rr-r-'+taskId).value.split(',').map(s=>s.trim()).filter(Boolean);
+  const reason=$('rr-n-'+taskId).value.trim();
+  if(reason.length<10){toast('处置原因至少 10 个字');return}
+  await api('goal.retired.resolve',{goalId:GOAL,taskId,goalVersion:RETIRED.goalVersion,taskVersion:item.version??0,disposition,replacementTaskIds,reason});
+  toast('已处置');await refreshRetired();render();
 }
-async function loadRetiredWork(gid){
-  const host=document.querySelector('#rw-'+CSS.escape(gid));if(!host)return;
-  try{
-    const r=await api('goal-retired-pending?goalId='+encodeURIComponent(gid));
-    if(!r.items.length){host.innerHTML='<p class="retired-meta">没有待处置的历史任务</p>';return;}
-    host.innerHTML='<p class="retired-title">历史任务处置（作废但未结算，需老板登记）</p>'+r.items.map(function(it){
-      const options=it.candidates.map(function(c){return '<option value="'+c.taskId+'">'+esc(c.title)+'（'+esc(c.kind||'任务')+'）</option>'}).join('');
-      const retired=it.retiredAt?('由 '+esc(it.retiredBy||'未知')+' 于 '+esc(String(it.retiredAt).slice(0,16).replace('T',' '))+' 作废'):'作废时间未知';
-      return '<div class="retired-item"><strong class="retired-name">'+esc(it.title)+'</strong>'
-        +'<span class="retired-meta">'+esc(it.kind||'任务')+' · v'+esc(it.version)+' · '+retired+'</span>'
-        +'<div class="retired-form"><select id="d-'+it.taskId+'">'
-        +'<option value="replaced">由已完成任务替代</option><option value="fixture">QA 夹具（非产品交付）</option><option value="excluded">范围排除（需 owner 终验）</option></select>'
-        +(it.candidates.length?'<select id="r-'+it.taskId+'">'+options+'</select>':'<span class="retired-meta">无同类型已完成替代</span>')
-        +'<button class="no" onclick="resolveRetiredTask(\\''+gid+'\\',\\''+it.taskId+'\\','+r.goalVersion+','+it.version+')">登记处置</button></div>'
-        +'<label class="comment-field"><span>处置原因（必填，至少 10 字）</span><textarea id="w-'+it.taskId+'" placeholder="例如：与替代任务重复，替代任务已完成并验收"></textarea></label>'
-        +(it.retiredEvidence?'<p class="retired-meta">原作废原因：'+esc(String(it.retiredEvidence).slice(0,200))+'</p>':'')
-        +'</div>';
-    }).join('');
-  }catch(e){host.textContent=e.message}
+function renderInbox(){
+  const gates=INBOX?.gates||[],asks=INBOX?.questions||[];
+  $('flow-pane').innerHTML='<div class="flow-pane"><div class="flow-head"><h1>收件箱</h1></div><div class="decision-grid">'
+    +gates.map(x=>'<article class="decision-card"><div class="card-top"><span class="type-label">批准 / 退回</span></div><h3>'+esc(x.task.title||'')+'</h3><div class="submission">'+esc(x.submission||'')+'</div><div class="decision-actions"><button class="approve" data-cmd="decide:'+esc(String(x.task.id))+':approve">批准</button><button class="reject" data-cmd="decide:'+esc(String(x.task.id))+':reject">退回</button></div></article>').join('')
+    +asks.map(x=>'<article class="decision-card"><div class="card-top"><span class="type-label">回复 / 放行</span></div><h3>'+esc(x.task.title||'')+'</h3><div class="submission">'+esc(x.question||'')+'</div><label class="comment-field"><span>答复</span><textarea data-note="'+esc(String(x.task.id))+'"></textarea></label><div class="decision-actions"><button class="approve" data-cmd="decide:'+esc(String(x.task.id))+':reply">回复并恢复</button></div></article>').join('')
+    +'</div></div>';$('drawer').innerHTML='<div class="kicker">INBOX</div><h2>老板决定</h2><p class="meta">批准、退回、回复员工提问都会解除阻塞并恢复任务。</p>'
+    +'<section><h3>提醒</h3><div class="inbox-list">'+noticesHtml()+'</div></section>';
 }
-async function resolveRetiredTask(gid,tid,gv,tv){
-  const d=document.getElementById('d-'+tid),r=document.getElementById('r-'+tid),w=document.getElementById('w-'+tid);
-  const disposition=d?d.value:'fixture';
-  const reason=w?w.value:'';
-  if(reason.trim().length<10){alert('请写明处置原因（至少 10 字）');return}
-  const replacementTaskIds=(disposition==='replaced'&&r)?[r.value]:[];
-  try{
-    await api('goal-retired-resolution',{goalId:gid,taskId:tid,goalVersion:gv,taskVersion:tv,disposition,replacementTaskIds,reason,key:newKey()});
-    toast('已登记历史任务处置');await loadRetiredWork(gid);await load();
-  }catch(e){alert(e.message)}
+function renderDefs(){
+  $('flow-pane').innerHTML='<div class="flow-pane"><div class="flow-head"><h1>编制</h1></div><div class="decision-grid">'
+    +DEFS.map(d=>'<article class="decision-card"><div class="card-top"><span class="type-label">'+esc(d.role)+'</span><span class="status '+(d.enabled?'success':'')+'">'+(d.enabled?'启用':'停用')+'</span></div><h3>'+esc(d.id)+'</h3><p class="byline">'+esc(d.provider)+' · '+esc(d.model||'')+'</p><div class="decision-actions"><button data-cmd="toggle-def:'+esc(d.id)+':'+(d.enabled?0:1)+'">'+(d.enabled?'停用':'启用')+'</button></div></article>').join('')+'</div></div>';
+  $('drawer').innerHTML='<div class="kicker">DEF</div><h2>新建 / 修改编制</h2><div class="goal-form"><label>ID<input id="d-id"/></label><label>岗位<select id="d-role">'+['product','engineering','qa','concept-design','asset-production','screenwriter','story-author','cinematography','cs','eval'].map(r=>'<option>'+r+'</option>').join('')+'</select></label><label>provider<input id="d-provider" value="codex"/></label><label>model<input id="d-model" value="auto:sol"/></label><div class="row"><button class="primary" data-cmd="create-def">保存编制</button></div></div>';
 }
-async function instruct(){
-  const t=$('gm-text');if(!t.value.trim())return;
-  try{await api('instruct',{text:t.value,key:newKey()});t.value='';$('gm-ok').textContent='已下达，经理稍后处理';toast('已下达给经理');await load()}catch(e){alert(e.message)}
+function render(){if(T==='flow')renderFlow();else if(T==='inbox')renderInbox();else renderDefs()}
+async function saveMsg(id){await api('message.edit',{messageId:id,body:$('msg-body').value});toast('已保存');await load()}
+async function holdMsg(id,on){await api(on?'message.hold':'message.release',{messageId:id});toast(on?'已标记需要我放行':'已取消');await load()}
+async function releaseMsg(id){await api('message.release',{messageId:id});toast('已放行，等待派工');await load()}
+async function decide(id,dec,note){
+  if(dec==='reject'){note=prompt('退回说明')||'';if(note.trim().length<2)return}
+  if(dec==='reply'){const el=document.querySelector('[data-note="'+CSS.escape(id)+'"]');note=el?el.value:''}
+  await api(dec,{taskId:id,note,decision:dec});toast('已处理');await load();
 }
-async function openDoc(name,el){
-  document.querySelectorAll('.docs-nav button').forEach(b=>b.classList.toggle('active',b===el));
-  const view=$('doc-view');
-  const slash=name.lastIndexOf('/'),base=name.slice(slash+1);
-  view.innerHTML='<div class="doc-meta"><span class="doc-icon">'+icon('file')+'</span><div><p>'+esc(name)+'</p><h2>'+esc(base)+'</h2></div></div><div class="doc-info"><span>岗位手册与运行文档 · ops 仓库只读</span></div><div class="docbody">加载中…</div>';
-  try{const r=await api('doc?name='+encodeURIComponent(name));view.querySelector('.docbody').textContent=r.text}catch(e){view.querySelector('.docbody').textContent=e.message}
+async function voidTask(id){const note=prompt('作废原因')||'';if(note.trim().length<2)return;await api('task.void',{taskId:id,note});await load()}
+async function revokeTask(id){await api('task.revoke',{taskId:id});await load()}
+async function unlockTask(id){await api('task.unlock',{taskId:id});await load()}
+async function toggleDef(id,on){await api(on?'def.enable':'def.disable',{id});await load()}
+async function createDef(){await api('def.ensure',{id:$('d-id').value,role:$('d-role').value,provider:$('d-provider').value,model:$('d-model').value});toast('已保存编制');await load()}
+function newTaskForm(){
+  $('drawer').innerHTML='<div class="kicker">NEW TASK</div><h2>新增任务</h2><div class="goal-form">'
+    +'<label>标题<input id="n-title"/></label><label>需求<textarea id="n-req"></textarea></label><label>验收标准<textarea id="n-ac"></textarea></label>'
+    +'<label>执行岗<select id="n-ex">'+['engineering','qa','product','concept-design','asset-production','screenwriter','story-author','cinematography','cs'].map(r=>'<option>'+r+'</option>').join('')+'</select></label>'
+    +'<label>复核岗<select id="n-rev">'+['qa','engineering','owner','product'].map(r=>'<option>'+r+'</option>').join('')+'</select></label>'
+    +'<label>依赖任务 ID（逗号分隔）<input id="n-deps"/></label><div class="row"><button class="primary" data-cmd="create-task">创建并生成两条草稿</button></div></div>';
 }
-function filterDocs(){
-  const q=($('doc-q').value||'').toLowerCase();
-  document.querySelectorAll('.docs-nav button').forEach(b=>{b.style.display=b.dataset.doc.toLowerCase().includes(q)?'':'none'});
-}
-async function openGoal(gid){
-  const el=document.querySelector('#gt-'+CSS.escape(gid));
-  if(el.dataset.open){el.dataset.open='';el.querySelector('.task-drawer')?.remove();el.classList.remove('open');return}
-  el.dataset.open='1';el.classList.add('open');
-  const d=document.createElement('div');d.className='task-drawer';
-  d.innerHTML='<div class="task-head"><span>任务</span><span>执行 → 审核</span><span>状态</span><span></span></div><div class="task-list">加载中…</div><div class="retired-list" id="rw-'+gid+'"></div><button class="text-button danger" onclick="cancelGoal(\\''+gid+'\\')">取消这个目标</button>';
-  el.appendChild(d);
-  await reloadGoalTasks(gid);
-  await loadRetiredWork(gid);
-}
-function stageChip(x){const tone={done:'done',active:'active',waiting:'waiting',missing:'missing'}[x.status]||'';const label={done:'已',waiting:'等',active:'进行',missing:'缺',not_required:'不需',unknown:'未知'}[x.status]||'未知';return '<span class="stage '+tone+'">'+esc(x.label)+' '+label+'</span>'}
-function goalBlockerHtml(b){
-  var parts=['<b>'+esc(b.kind)+'</b> · '+esc(b.summary)];
-  if(b.responsibleRole)parts.push('责任：'+esc(b.responsibleRole));
-  if(b.holder)parts.push('持有人：'+esc(b.holder));
-  if(b.waitedMinutes!==undefined)parts.push('已等 '+b.waitedMinutes+' 分钟');
-  if(b.nextTrigger)parts.push('下一触发：'+esc(b.nextTrigger));
-  if(b.dependencyPath&&b.dependencyPath.length)parts.push('依赖路径：'+b.dependencyPath.map(function(p){return esc(p.title)}).join(' → ')+(b.dependencyPathTruncated?' …':''));
-  if(b.handoff){var h=b.handoff.pendingAction?('待办：'+esc(b.handoff.pendingAction)):((b.handoff.completed&&b.handoff.completed.length)?('已完成 '+b.handoff.completed.length+' 项'):esc(b.handoff.kind));parts.push('交接：'+h)}
-  return parts.join('；');
-}
-function goalFinalGateHtml(fg){
-  if(!fg||!fg.taskId)return '终验：缺失';
-  return '终验：《'+esc(fg.title||fg.taskId)+'》（'+esc(fg.state||'未知')+(fg.reviewerRole?'，复核 '+esc(fg.reviewerRole):'')+(fg.ownerGate?'，老板关口':'')+(fg.effective?'':'，已被替代')+'）；证据任务：'+esc((fg.evidenceTaskIds||[]).join(', ')||'无');
-}
-function render(){
-  const m=$('m');
-  if(T==='todo'){
-    const gates=(INBOX?.gates||[]).filter(x=>!x.task.companyUpgrade);
-    const asks=(INBOX?.questions||[]).filter(x=>!x.task.companyUpgrade);
-    const notices=INBOX?.notices||[];
-    const items=INBOX?.upgrades?.items||[];
-    const v=INBOX?.upgrades?.current;
-    const stats=[['待审批',gates.length,'验收提交等待你的决定','violet'],['待回复',asks.length,'来自执行员工的问题','amber'],['升级流程',items.filter(x=>x.status!=='succeeded').length,'公司系统版本升级','blue'],['系统通知',notices.length,'运行提醒与简报','green']];
-    const statHtml='<section class="stat-grid">'+stats.map(s=>'<article class="metric-card '+s[3]+'"><span>'+s[0]+'</span><strong>'+s[1]+'</strong><small>'+s[2]+'</small><i></i></article>').join('')+'</section>';
-    const head=v?'<section class="panel version-panel"><span class="type-label">当前生产版本</span><div class="version-row"><strong>v'+esc(v.version)+'</strong><code>'+esc(v.sha)+'</code></div><p>自动安装已合 main 的公司版本；全部门禁和验证通过后才回复。失败退避24小时，每个版本累计失败2次后停止自动尝试。</p><button onclick="autoUpgrade()">'+(INBOX?.upgrades?.automatic?.enabled?'自动升级已开启 · 点击关闭':'自动升级已关闭 · 点击开启')+'</button></section>':'';
-    const g=gates.map(x=>'<article class="decision-card"><div class="card-top"><span class="type-label">'+esc(KIND[x.task.kind]||x.task.kind)+'</span>'+badge('待验收','violet')+'</div>'
-      +'<h3>'+esc(x.task.title)+'</h3><p class="byline">执行 '+esc(x.task.executor_role)+' · 提交人 '+esc(x.task.current_employee||'—')+'</p>'
-      +'<div class="submission">'+linkify(x.submission||'（无提交说明）')+'</div>'
-      +'<div class="atts" id="at-'+x.task.id+'"></div>'
-      +'<label class="comment-field"><span>决策说明（批准可留空，退回必填）</span><textarea id="n-'+x.task.id+'" placeholder="补充约束、提醒或后续要求…"></textarea></label>'
-      +'<div class="decision-actions"><button class="approve" onclick="decide(\\''+x.task.id+'\\',\\'approve\\')">'+icon('check')+'批准</button>'
-      +'<button class="reject" onclick="decide(\\''+x.task.id+'\\',\\'reject\\')">'+icon('x')+'退回</button>'
-      +'<button class="quiet" onclick="voidTask(\\''+x.task.id+'\\')">作废</button></div></article>').join('');
-    const q=asks.map(x=>'<article class="decision-card"><div class="card-top"><span class="type-label">提问</span>'+badge('待回复','warning')+'</div>'
-      +'<h3>'+esc(x.task.title)+'</h3><p class="byline">来自 '+esc(x.task.executor_role)+' 的问题</p>'
-      +'<div class="submission">'+linkify(x.question||'（无问题文本）')+'</div>'
-      +'<div class="atts" id="at-'+x.task.id+'"></div>'
-      +'<label class="comment-field"><span>答复</span><textarea id="n-'+x.task.id+'" placeholder="写下清晰的口径和下一步…"></textarea></label>'
-      +'<div class="decision-actions"><button class="approve" onclick="decide(\\''+x.task.id+'\\',\\'reply\\')">'+icon('send')+'回复</button></div></article>').join('');
-    const n=notices.map(x=>'<div class="notice"><span>'+icon('activity')+'</span><div>'+linkify(x.text)+'</div><button onclick="notice(\\''+x.key+'\\')">已阅</button></div>').join('');
-    const u=items.map(upgradeCard).join('');
-    m.innerHTML=head+statHtml+((u||g||q||n)?(u+'<section class="section-bar"><div><h2>需要你的决定</h2><p>按到达时间排序，处理完会自动离开列表</p></div></section><div class="decision-grid">'+g+q+'</div>'+n):'<div class="empty">没有待办事项</div>');
-    [...(INBOX?.gates||[]),...(INBOX?.questions||[])].forEach(x=>{const e=$('at-'+x.task.id);if(e)atts(e,x.task.id)});
-  }else if(T==='goals'){
-    var cards={};((BRIEF&&BRIEF.goalCards)||[]).forEach(function(c){cards[c.goalId]=c});
-    var coverage=BRIEF&&BRIEF.goalCardCoverage;
-    var rows=((BRIEF&&BRIEF.goals)||[]);
-    var cover=(coverage&&coverage.omitted>0)?('<p class="meta">目标详情已展示 '+coverage.shown+'/'+coverage.total+'（按活动阻点优先；未展开的目标只显示标题）</p>'):'';
-    m.innerHTML=cover+(rows.map(function(g,i){
-      var c=cards[g.id];
-      if(!c){return '<article class="goal-card" id="gt-'+g.id+'"><div class="goal-main"><span class="goal-index">'+(i+1)+'</span>'
-        +'<div class="goal-name"><h3>'+esc(g.title)+'</h3><p class="meta">详情未展开（已展示 '+(coverage?coverage.shown:0)+'/'+(coverage?coverage.total:rows.length)+'）</p></div></div></article>'}
-      var deadline=(c.deadline&&c.deadline.status==='exact'&&c.deadline.at)?('截止 '+new Date(c.deadline.at).toISOString().slice(0,10)):'截止未知';
-      var stages=(c.stages||[]).map(stageChip).join('')||'<span class="stage">阶段未知</span>';
-      var missing=(c.outcome&&c.outcome.missing&&c.outcome.missing.length)?('<p class="meta">缺证据：'+esc(c.outcome.missing.join(' / '))+'</p>'):'';
-      var repair=c.needsRepair?('<p class="meta bad">需修复：'+esc((c.repairReasons||[]).map(function(r){return r.message}).join('；'))+'</p>'):'';
-      var blockers=(c.blockers&&c.blockers.length)?('<p class="meta">当前阻点：</p>'+c.blockers.map(function(b){return '<p class="meta">'+goalBlockerHtml(b)+'</p>'}).join('')+(c.blockersOmitted?('<p class="meta">另有 '+c.blockersOmitted+' 个阻点未展示（卡片上限）</p>'):'')):'';
-      var finalLine='<p class="meta">'+goalFinalGateHtml(c.finalGate)+'</p>';
-      var total='<p class="meta">任务 '+(c.taskTotal||0)+' 个</p>';
-      return '<article class="goal-card" id="gt-'+g.id+'"><button class="goal-main" onclick="openGoal(\\''+g.id+'\\')">'
-        +'<span class="goal-index">'+(i+1)+'</span>'
-        +'<div class="goal-name"><span><span class="tier">'+esc(g.tier)+'</span> '+esc(g.state)+(g.project?' · '+esc(g.project):'')+' · '+esc(deadline)+'</span>'
-        +'<h3>'+esc(g.title)+'</h3><p>'+esc((g.brief||'').slice(0,140))+'</p></div>'
-        +'<div class="goal-stages">'+stages+'</div>'+icon('chevron','goal-arrow')+'</button>'
-        +'<div class="goal-extra">'+missing+repair+finalLine+total+blockers+'</div></article>';
-    }).join('')||'<div class="empty">无在办目标</div>');
-  }else if(T==='docs'){
-    if(!DOCS)api('docs').then(r=>{DOCS=r.docs;render()}).catch(()=>{});
-    const groups={};(DOCS||[]).forEach(d=>(groups[d.group]=groups[d.group]||[]).push(d));
-    m.innerHTML='<div class="docs-shell"><aside class="docs-nav"><label class="docs-search">'+icon('file')+'<input id="doc-q" placeholder="搜索文档" oninput="filterDocs()"></label>'
-      +Object.keys(groups).map(g=>'<p>'+esc(g)+'</p>'+groups[g].map(d=>'<button data-doc="'+esc(d.name)+'" onclick="openDoc(\\''+d.name+'\\',this)">'+icon('file')+'<span>'+esc(d.name)+'</span></button>').join('')).join('')
-      +(DOCS?'':'<p>加载中…</p>')+'</aside><article class="doc-view" id="doc-view"><p class="empty">从左侧选择一篇手册查看</p></article></div>';
-  }else{
-    m.innerHTML='<div class="message-layout"><section class="compose-card"><div class="compose-head"><span class="avatar large">经</span><div><h2>发给值班经理</h2><p>写成任务派给经理，回复会出现在待办里</p></div>'+badge('在线','success')+'</div>'
-      +'<label class="compose"><span>你希望经理做什么？</span><textarea id="gm-text" style="min-height:150px" placeholder="比如：盘一下 G1 的进度给我个简报"></textarea><small>写清“为什么”和“结果长什么样”，经理会自行拆解执行步骤。</small></label>'
-      +'<div class="send-row"><button class="primary" onclick="instruct()">'+icon('send')+'下达给经理</button></div><p class="okm" id="gm-ok"></p></section></div>';
-  }
-}
-const startTab=location.hash.slice(1);
-if(CRUMB[startTab])T=startTab;
-document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.t===T));
-$('crumb').textContent=CRUMB[T]||T;
-renderThemeBtn();render();
-load();setInterval(()=>{if(T==='todo')load()},20000);
+async function createTask(){await api('task.create',{title:$('n-title').value,requirement:$('n-req').value,acceptanceText:$('n-ac').value,executorRole:$('n-ex').value,reviewerRole:$('n-rev').value,dependencies:$('n-deps').value.split(',').map(s=>s.trim()).filter(Boolean),goalId:GOAL||undefined});toast('已创建');SEL=null;await load()}
+boot().catch(e=>{$('stat').textContent='初始化失败：'+e.message});
 </script></body></html>`;
+

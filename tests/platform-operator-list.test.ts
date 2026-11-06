@@ -72,7 +72,7 @@ test('a customer session is refused: the list needs an operator session', async 
 });
 
 test('a role outside gm/engineering/product/qa is refused', async () => {
-  const r = rig({ patch: { roles: ['qa', 'engineering', 'gm', 'product', 'ai-content'] } });
+  const r = rig({ patch: { roles: ['qa', 'engineering', 'owner', 'product', 'ai-content'] } });
   const login = await operatorSession(r, 'ai-ops');
   const credential = r.company.lease('ai-1', 'ai-content', 'task-1', 'surreal_ck');
   const error = await failure(r.call('ops_platform_operator_list', { session: login.session }, { cred: credential }));

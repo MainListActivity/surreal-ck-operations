@@ -34,7 +34,7 @@ beforeAll(async () => {
   await database.db.use({ namespace: NS });
   await database.db.query('REMOVE DATABASE IF EXISTS control_plane;');
   await database.bootstrap();
-  gmToken = await enrollment.enroll(gm, 'gm', ['execute', 'review', 'manage']);
+  gmToken = await enrollment.enroll(gm, 'owner', ['execute', 'review', 'manage']);
 });
 
 afterAll(async () => {

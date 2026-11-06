@@ -4,6 +4,7 @@ import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import { ROLES, type CompanyBrief, type GoalTier, type GoalView, type OwnerDecision, type Role, type TaskId, type TaskView } from './contracts.ts';
 import { GOAL_TIERS, goalTemplate, isPipeline } from './flows.ts';
+import { OutboundMessageStore } from './outbound-messages.ts';
 import { ProjectStore } from './projects.ts';
 import type { BriefData, RoleCapacity, WaitingItem } from './owner-brief.ts';
 import { asId, canonicalRepoPath, CompanyError, depUnsatisfiedFor, HASH, id, REQUIRED_TRACKS, requireText, RESOLVE_DEP_SQL, UNLOCK_CHILDREN_SQL, UNLOCK_SQL, view, type IdempotencyRow, type TaskRow } from './core.ts';
@@ -75,7 +76,7 @@ const EMIT_CREATED = (task: string) => `
   LET $seq = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
   CREATE outbox CONTENT { task: ${task}, kind: 'created', sequence: $seq.value, payload: { state: ${task}.state }, at: time::now() };`;
 
-/** Owner-side operations. Used by the owner CLI, the dispatcher (owner_command table) and gm relay. */
+/** Owner-side operations. Used by the owner CLI, the dispatcher (owner_command table) and owner relay. */
 /** The brief names this many blocked items; the rest are counted in `total` and said so, never dropped silently. */
 const BRIEF_DISPATCH_ROWS = 12;
 
@@ -131,21 +132,20 @@ export class OwnerDesk {
     const vars: Record<string, unknown> = { goal, tier, via, source: `triage:${via}`.slice(0, 200) };
     const creates = template.tasks.map((t, i) => {
       vars[`t${i}`] = ids[t.ref];
-      const specVars: Record<string, unknown> = { title: `[目标] ${row.title} · ${t.title}`, context: t.context, kind: t.kind,
-        executor_role: t.executorRole, reviewer_role: t.reviewerRole, dependencies: t.deps.map(d => ids[d]) };
-      // SYS02: the quick chain is a real code delivery; carry its versioned criteria. Absent on plan/manual/acceptance rows.
-      if (t.acceptanceCriteria && t.acceptanceCriteria.length > 0) {
-        specVars.acceptance_criteria = t.acceptanceCriteria;
-        specVars.acceptance_version = 1;
-      }
-      // The quick legs' lane intent: without it the claim falls back to read (release) and lands in the shared read-only tree.
-      if (t.workIntent) specVars.work_intent = t.workIntent;
-      // The company-system quick legs carry the ops repo, as create_delivery binds it; a project goal's legs carry none.
-      if (t.codeRepoPath) specVars.code_repo_path = t.codeRepoPath;
+      const specVars: Record<string, unknown> = { title: t.title, context: t.context, kind: t.kind,
+        executor_role: t.executorRole, reviewer_role: t.reviewerRole, dependencies: t.deps.map(d => ids[d]),
+        discipline: (t as { discipline?: string }).discipline,
+        work_intent: (t as { workIntent?: unknown }).workIntent,
+        code_repo_path: (t as { codeRepoPath?: string }).codeRepoPath,
+        acceptance_criteria: (t as { acceptanceCriteria?: unknown }).acceptanceCriteria,
+        requirement: (t as { requirement?: string }).requirement ?? row.brief,
+        acceptance_text: (t as { acceptanceText?: string }).acceptanceText ?? '按目标原文在生产逐条验证。' };
       vars[`spec${i}`] = specVars;
       return `CREATE ONLY $t${i} CONTENT { title: $spec${i}.title, context: $spec${i}.context, kind: $spec${i}.kind,
-          executor_role: $spec${i}.executor_role, reviewer_role: $spec${i}.reviewer_role, dependencies: $spec${i}.dependencies, work_intent: $spec${i}.work_intent,
+          executor_role: $spec${i}.executor_role, reviewer_role: $spec${i}.reviewer_role, dependencies: $spec${i}.dependencies,
+          discipline: $spec${i}.discipline, work_intent: $spec${i}.work_intent,
           code_repo_path: $spec${i}.code_repo_path,
+          requirement: $spec${i}.requirement, acceptance_text: $spec${i}.acceptance_text,
           acceptance_criteria: $spec${i}.acceptance_criteria,
           acceptance_version: IF array::len($spec${i}.acceptance_criteria ?? []) > 0 THEN 1 ELSE NONE END,
           acceptance_legacy: false, acceptance_head: NONE, acceptance_environment: NONE, acceptance_attempt: 0,
@@ -167,6 +167,14 @@ export class OwnerDesk {
       throw error;
     });
     const after = (await this.db.select<GoalRow>(goal))!;
+    // 建任务即生成两条待发消息 draft（执行岗 + 复核岗），老板可预览/编辑/放行。
+    const messages = new OutboundMessageStore(this.db);
+    for (const [i, t] of template.tasks.entries()) {
+      const taskId = String(ids[t.ref]!.id);
+      await messages.createTaskDrafts(taskId, t.executorRole, t.reviewerRole,
+        (isPipeline(row.pipeline) ? row.pipeline : 'software') === 'software').catch(error =>
+        console.warn(`outbound drafts for ${taskId} failed: ${(error as Error).message}`));
+    }
     // SYS07: every new goal starts with a structured outcome contract. It derives implementation/final-gate
     // evidence from the task graph; an operator can add customer activation/adoption requirements under a version
     // CAS. Existing goals are never rewritten by this default.
@@ -174,10 +182,8 @@ export class OwnerDesk {
       goalId, expectedVersion: 0,
       outcome: {
         expected: `${after.title}：${after.brief}`.slice(0, 4000),
-        requiredEvidence: after.pipeline === 'video' || after.pipeline === 'story'
-          ? ['implementation', 'owner_final']
-          : tier === 'quick' ? ['implementation', 'final_acceptance'] : ['implementation', 'owner_final'],
-        responsibleRole: 'gm',
+        requiredEvidence: [template.tasks.some(t => t.reviewerRole === 'owner') ? 'owner_final' : 'final_acceptance'],
+        responsibleRole: 'owner',
         reason: '目标 triage 时登记的默认成果契约；可在版本 CAS 下补充客户激活/采纳证据',
       },
       actor: 'system:triage', source: `triage:${via}`, reason: '目标 triage 时登记默认成果契约',
@@ -541,7 +547,7 @@ export class OwnerDesk {
     return { loops: blocks.length, reasons: blocks.slice(0, 3).map(b => (b.evidence ?? '').replace(/\s+/g, ' ').slice(0, 300)) };
   }
 
-  /** Batch variant of blockLoops: two queries for the whole gm-blocked set instead of two per task. */
+  /** Batch variant of blockLoops: two queries for the whole owner-blocked set instead of two per task. */
   async blockLoopStats(taskIds: TaskId[]): Promise<Map<string, { loops: number; reasons: string[] }>> {
     const ids = taskIds.map(t => id('task', t));
     const stats = new Map<string, { loops: number; reasons: string[] }>();
@@ -571,11 +577,11 @@ export class OwnerDesk {
     if (['stale_window', 'missing_prerequisite', 'infrastructure'].includes(lastBlock?.[0]?.recovery_reason ?? '')) {
       return this.recoverLooping(task, loops, reasons);
     }
-    const evidence = `这个任务已在员工与经理之间往返 ${loops} 次（阻塞→经理处理→再阻塞）仍没有完成，系统不再自动循环。最近的阻塞原因：\n${reasons.map((r, i) => `${i + 1}. ${r}`).join('\n')}\n请给方向后回复（任务按你的回复继续），或让经理把它拆小/作废。`;
+    const evidence = `这个任务已在员工与老板之间往返 ${loops} 次（阻塞→老板处理→再阻塞）仍没有完成，系统不再自动循环。最近的阻塞原因：\n${reasons.map((r, i) => `${i + 1}. ${r}`).join('\n')}\n请给方向后回复（任务按你的回复继续），或让老板把它拆小/作废。`;
     try {
       await this.run(`BEGIN;
         LET $t = SELECT * FROM ONLY $task;
-        IF $t = NONE OR $t.state != 'blocked' OR $t.blocked_to != 'gm' OR $t.version != $expected { THROW 'task is not blocked on gm' };
+        IF $t = NONE OR $t.state != 'blocked' OR $t.blocked_to != 'owner' OR $t.version != $expected { THROW 'task is not blocked on owner' };
         LET $next = UPDATE ONLY $task SET blocked_to = 'owner', version = $t.version + 1 RETURN AFTER;
         CREATE audit CONTENT { task: $task, actor: 'system:loop-breaker', action: 'escalate', evidence: $evidence, version: $next.version, at: time::now() };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
@@ -591,11 +597,11 @@ export class OwnerDesk {
     try {
       await this.run(`BEGIN;
         LET $t = SELECT * FROM ONLY $task;
-        IF $t.state != 'blocked' OR $t.blocked_to != 'gm' OR $t.version != $expected { THROW 'task moved' };
+        IF $t.state != 'blocked' OR $t.blocked_to != 'owner' OR $t.version != $expected { THROW 'task moved' };
         LET $existing = SELECT * FROM ONLY $recovery;
         IF $existing = NONE {
           CREATE ONLY $recovery CONTENT { title: '恢复任务：' + $t.title,
-            context: $context, executor_role: 'gm', reviewer_role: 'product', kind: 'task',
+            context: $context, executor_role: 'owner', reviewer_role: 'product', kind: 'task',
             goal: $t.goal, project: $t.project, code_repo_path: $t.code_repo_path,
             state: 'ready', version: 1, fence: 0, dependencies: [], work_intent: { kind: 'read' },
             recovery_source: $task, created_at: time::now() };
@@ -603,14 +609,14 @@ export class OwnerDesk {
             blocked_to = NONE, dependency_continuation = 'manager', version += 1;
           CREATE audit CONTENT { task: $recovery, actor: 'system:loop-breaker', action: 'create', evidence: $context, version: 1, at: time::now() };
           CREATE audit CONTENT { task: $task, actor: 'system:loop-breaker', action: 'manager_recovery',
-            evidence: '系统阻塞已交经理恢复任务；完成后先交经理接续，不直接派员工', recovery_task: $recovery, at: time::now() };
+            evidence: '系统阻塞已交老板恢复任务；完成后先交老板接续，不直接派员工', recovery_task: $recovery, at: time::now() };
           LET $seq = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
           CREATE outbox CONTENT { task: $recovery, kind: 'created', sequence: $seq.value, payload: {}, at: time::now() };
         } ELSE {
           IF $t.recovery_stopped != true {
             UPDATE ONLY $task SET recovery_stopped = true, version += 1;
             CREATE audit CONTENT { task: $task, actor: 'system:loop-breaker', action: 'recovery_stopped',
-              evidence: '同一任务的恢复交付后再次达到循环上限；停止自动重派，由经理检查恢复方案；不重建恢复链、不自动升级老板', at: time::now() };
+              evidence: '同一任务的恢复交付后再次达到循环上限；停止自动重派，由老板检查恢复方案；不重建恢复链、不自动升级老板', at: time::now() };
           };
         };
         COMMIT;`, { task: id('task', task.id), recovery, expected: task.version,
@@ -709,7 +715,7 @@ export class OwnerDesk {
       churn: { created: opened[0]?.n ?? 0, retired: closed.reduce((sum, c) => sum + c.n, 0), claimLost: closed.filter(c => c.reason === 'claim race lost').reduce((sum, c) => sum + c.n, 0) } };
   }
 
-  /** Free-form owner instruction routed to the manager as a gm task; gm decides how to act on it. */
+  /** Free-form owner instruction routed to the manager as a owner task; owner decides how to act on it. */
   async instruct(input: { text: string; source: string; key: string }): Promise<{ taskId: string }> {
     requireText(input.text, 'instruction text', 2, 10000);
     const taskId = HASH(`instruct\0${input.key}`).slice(0, 16);
@@ -717,7 +723,7 @@ export class OwnerDesk {
     if (await this.db.select(task)) return { taskId };
     const title = `老板指示：${input.text.trim().split(/\r?\n/)[0].slice(0, 60)}`;
     await this.db.query(`CREATE ONLY $task CONTENT { title: $title, context: $context, kind: 'task',
-      executor_role: 'gm', reviewer_role: 'product', dependencies: [], state: 'ready',
+      executor_role: 'owner', reviewer_role: 'product', dependencies: [], state: 'ready',
       version: 1, fence: 0, resume_state: 'ready', created_at: time::now() };
       ${EMIT_CREATED('$task')}`, { task, title, context: `老板原话：\n${input.text.trim()}\n\n来源：${input.source}` });
     return { taskId };

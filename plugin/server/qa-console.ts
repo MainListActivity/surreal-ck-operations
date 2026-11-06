@@ -271,7 +271,7 @@ ${reasons}${root.reasonsOmitted ? `<div class="meta">另有 ${esc(root.reasonsOm
 <div class="meta">来源 ${esc(waits.source ?? 'workflow-graph')} · 采集于 ${esc(waits.checkedAt ?? '未知')} · dispatcher pass ${esc(g.dispatchCheckedAt ?? '未知')} · 显示 ${esc(waits.shownRoots ?? waits.roots?.length ?? 0)} / ${esc(waits.totalRoots ?? 0)}${waits.truncated ? ' · 已截断' : ''}${waits.budgetLimited ? ' · 为响应字节预算收缩' : ''}</div>
 ${(waits.roots ?? []).length === 0 && (waits.totalRoots ?? 0) > 0 ? '<div class="meta">等待根存在，但本页字节预算未保留任何一条；见上方显示数与截断标记。</div>' : (waits.roots ?? []).length === 0 ? '<div class="meta">当前目标没有已识别的工作流等待根。</div>' : ''}
 ${(waits.roots ?? []).map(r => {
-  const kind = r.kind === 'dependency' ? '正常依赖等待' : r.kind === 'manager' ? '经理关口' : r.kind === 'owner' ? '老板关口' : r.kind === 'active_lease' ? '活租约等待' : '等待未知';
+  const kind = r.kind === 'dependency' ? '正常依赖等待' : r.kind === 'owner' ? '老板关口' : r.kind === 'active_lease' ? '活租约等待' : '等待未知';
   const impact = r.impact === undefined ? '未知' : `${esc(r.impact)} 项`;
   const path = r.dependencyPath?.length ? r.dependencyPath.map(p => `${esc(p.title ?? p.taskId)}（${esc(p.taskId)}）`).join(' → ') : r.kind === 'unknown' ? '未知' : '无后续等待';
   const people = r.people ? `人物 ${esc(r.peopleSource ?? '未知')} · 提交人 ${esc(r.people?.submitter ?? '未记录')}（${esc(r.submitterSource ?? '来源未知')}） · 提交 SHA ${esc(r.people?.submitCommit ?? '未记录')}（${esc(r.submitCommitSource ?? '来源未知')}） · 人物时点 ${esc(r.peopleCheckedAt ?? '未知')} · 提交审计时点 ${esc(r.submitCheckedAt ?? '未知')}` : '人物与提交依据未记录';

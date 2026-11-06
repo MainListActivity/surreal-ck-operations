@@ -96,7 +96,7 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
       events.push(`claim:${i.id}:${id}`); const v = views.get(id)!; Object.assign(v, { state: v.state === 'review' ? 'review' : 'doing', currentEmployee: i.id, version: v.version + 1, fence: v.fence + 1 }); v.deliveryId = `d-${id}-${v.fence}`;
       Object.assign(rows.find(t => t.id === id)!, v, { leaseExpiresAt: 2000 }); i.activeTask = id;
       return { task: { ...v }, deliveryId: v.deliveryId, fence: v.fence, leaseExpiresAt: new Date().toISOString(), history: [], worktree: v.worktree }; },
-    getTask: async (_c: string, id: string) => ({ ...views.get(id)! }), history: async () => [], authenticate: async () => ({ employeeId: 'fixture', role: 'gm' }),
+    getTask: async (_c: string, id: string) => ({ ...views.get(id)! }), history: async () => [], authenticate: async () => ({ employeeId: 'fixture', role: 'owner' }),
     companyBrief: async () => ({}), listTasks: async () => [], relayDirection: async () => { events.push('management'); }, heartbeat: async (_c: string, p: LeaseProof) => ({ task: check(p) }),
     submit: async (_c: string, p: LeaseProof) => { const v = check(p); events.push(`submit:${p.taskId}`); v.state = 'done'; v.currentEmployee = undefined; Object.assign(rows.find(t => t.id === v.id)!, v); return v; },
     block: async (_c: string, p: LeaseProof) => { check(p); events.push(`block:${p.taskId}`); return views.get(p.taskId)!; },
@@ -183,8 +183,8 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     expect((await w.relay(env, 'review', { decision: 'accept', text: 'fixture' })).ok).toBe(true);
   });
   test('healthy management-only GM survives idempotent adoption in the same process', async () => {
-    const w = world('gm');
-    const gm: EmployeeInst = { id: 'gm-fixture', role: 'gm', credential: 'fixture-gm' };
+    const w = world('owner');
+    const gm: EmployeeInst = { id: 'gm-fixture', role: 'owner', credential: 'fixture-gm' };
     const env = w.pool.env(gm); w.pool.bindAgent(gm.id, 'agent-gm'); gm.paseoAgentId = 'agent-gm';
     await w.pool.adopt([gm]);
     expect(w.pool.canReuse(gm)).toBe(true);
@@ -575,7 +575,7 @@ describe('R1: a write scope held by another writer is a verdict, never a spawn c
     expect(w.events.some(e => e.startsWith('claim') || e.startsWith('spawn:') || e.startsWith('send:'))).toBe(false);
     const verdict = d.dispatchVerdicts().find(v => v.taskId === 'scoped')!;
     expect(verdict.dispatchable).toBe(false);
-    expect(verdict.reasons).toEqual([expect.objectContaining({ code: 'write_scope', owner: 'gm', candidates: ['任务 writer-1 · employee-7'] })]);
+    expect(verdict.reasons).toEqual([expect.objectContaining({ code: 'write_scope', owner: 'owner', candidates: ['任务 writer-1 · employee-7'] })]);
     w.setNow(1_300);
     await d.tick();
     const text = w.notices.get('dispatch-blocked:scoped:execute')!;
@@ -638,7 +638,7 @@ describe('R1: a write scope held by another writer is a verdict, never a spawn c
     expect(w.events.some(e => e.startsWith('claim') || e.startsWith('spawn:'))).toBe(false);
     const verdict = d.dispatchVerdicts().find(v => v.taskId === 'assets-overlap')!;
     expect(verdict).toMatchObject({ dispatchable: false, workflowState: 'ready' });
-    expect(verdict.reasons).toEqual([expect.objectContaining({ code: 'write_scope', owner: 'gm', candidates: ['任务 asset-w1 · employee-7'] })]);
+    expect(verdict.reasons).toEqual([expect.objectContaining({ code: 'write_scope', owner: 'owner', candidates: ['任务 asset-w1 · employee-7'] })]);
     expect(verdict.reasons.some(reason => reason.code === 'wake_failed')).toBe(false);
     w.setNow(1_300);
     await d.tick();

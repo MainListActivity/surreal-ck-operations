@@ -52,9 +52,9 @@ async function makeTask(goal: string | undefined, label: string, over: Record<st
 }
 
 async function seedGoal(id: string, over: Record<string, unknown> = {}): Promise<{ goalId: string; gateId: string }> {
-  const manualId = await makeTask(id, '运营验收', { executor_role: 'product', reviewer_role: 'gm' });
+  const manualId = await makeTask(id, '运营验收', { executor_role: 'product', reviewer_role: 'owner' });
   const gateId = await makeTask(id, 'G3 老板最终验收', {
-    executor_role: 'gm', reviewer_role: 'owner', kind: 'gate', state: 'done', accepted_by: 'owner',
+    executor_role: 'owner', reviewer_role: 'owner', kind: 'gate', state: 'done', accepted_by: 'owner',
   });
   await database.db.query('CREATE ONLY $g CONTENT $row;', { g: new RecordId('goal', id), row: {
     title: `目标 ${id}`, brief: '夹具', state: over.state ?? 'active', tier: 'standard', pipeline: 'software',
@@ -63,7 +63,7 @@ async function seedGoal(id: string, over: Record<string, unknown> = {}): Promise
     anchors: [new RecordId('task', manualId), new RecordId('task', gateId)], version: 0,
   } });
   await database.db.query(`CREATE ONLY $o CONTENT {
-    goal: $goal, expected: '交付并验证预期客户结果', required_evidence: $required, responsible_role: 'gm',
+    goal: $goal, expected: '交付并验证预期客户结果', required_evidence: $required, responsible_role: 'owner',
     version: 1, source: 'test', actor: 'test', reason: '夹具成果契约', created_at: time::now(), updated_at: time::now()
   };`, { o: new RecordId('goal_outcome', id), goal: new RecordId('goal', id),
     required: over.required ?? ['implementation', 'owner_final'] });

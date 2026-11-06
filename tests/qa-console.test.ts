@@ -5,7 +5,7 @@ import { createQaConsoleFetch } from '../plugin/server/qa-console.ts';
 
 const scope = { id: 'scope-1', goalId: 'goal-1', deploymentTaskId: 'deploy-1', subjects: ['t1', 't2'],
   expiresAt: '2026-10-22T01:00:00Z', leaseHolder: 'qa-1', leaseFence: 3, version: 1, status: 'active' };
-const reasons = Array.from({ length: 31 }, (_, i) => ({ code: `reason-${i}`, text: `原因 ${i}`, candidates: ['candidate'], owner: 'gm', recovery: '恢复', nextTrigger: '触发', basis: 'contribution-audit' }));
+const reasons = Array.from({ length: 31 }, (_, i) => ({ code: `reason-${i}`, text: `原因 ${i}`, candidates: ['candidate'], owner: 'owner', recovery: '恢复', nextTrigger: '触发', basis: 'contribution-audit' }));
 const readView = {
   meta: { checkedAt: '2026-10-22T00:20:00Z', dataSource: 'live', instanceAt: '2026-10-22T00:20:00Z', scope, completeness: { complete: true, dispatchComplete: true } },
   task: { id: 't1', title: '主体任务', state: 'review', version: 4, executorRole: 'engineering', reviewerRole: 'qa', implementer: 'eng-1', currentEmployee: 'qa-1', goalId: 'goal-1', kind: 'deploy', dependencies: [], waiting: undefined },
@@ -110,9 +110,9 @@ test('F1: next trigger, basis and structured actions render; missing fields show
   const withActions = { ...readView,
     dispatch: { ...readView.dispatch,
       verdicts: [{ ...readView.dispatch.verdicts[0],
-        reasons: [{ code: 'implementer_mismatch', text: '任务已绑定实现负责人', candidates: ['eng-2'], owner: 'gm',
+        reasons: [{ code: 'implementer_mismatch', text: '任务已绑定实现负责人', candidates: ['eng-2'], owner: 'owner',
           recovery: '经理用 implementer_takeover 显式接手', nextTrigger: '绑定实现负责人可派工', basis: 'contribution-audit',
-          actions: [{ authority: 'gm', label: '经理用 implementer_takeover 显式接手', tool: 'implementer_takeover', executable: true },
+          actions: [{ authority: 'owner', label: '经理用 implementer_takeover 显式接手', tool: 'implementer_takeover', executable: true },
             { authority: 'owner', label: '老板线下确认', executable: false }] }] }] } };
   const legacy = { ...readView,
     dispatch: { ...readView.dispatch, verdicts: [{ ...readView.dispatch.verdicts[0],
@@ -136,8 +136,8 @@ test('F2: the goal page renders root blocker, impact, dependency path, notice an
   const rootBase = { taskId: 't9', title: '根任务', phase: 'review', workflowState: 'review', summary: '无独立复核人选',
     feasible: false, waitingMinutes: 30, since: '2026-10-22T00:00:00Z', checkedAt: '2026-10-22T00:19:00Z',
     eligibleCount: 0, undispatchable: 2, others: 1, noticeKey: 't9:review:1:no_candidate' };
-  const reasons = [{ code: 'no_candidate', text: '该岗位与仓库下没有任何编制或员工', candidates: [], owner: 'gm', recovery: '经理增补编制',
-    nextTrigger: '新增编制或员工', basis: 'tick:staffing-pool', actions: [{ authority: 'gm', label: '经理用 def_ensure 增加编制', tool: 'def_ensure', executable: true }] }];
+  const reasons = [{ code: 'no_candidate', text: '该岗位与仓库下没有任何编制或员工', candidates: [], owner: 'owner', recovery: '经理增补编制',
+    nextTrigger: '新增编制或员工', basis: 'tick:staffing-pool', actions: [{ authority: 'owner', label: '经理用 def_ensure 增加编制', tool: 'def_ensure', executable: true }] }];
   const mk = (root: unknown) => createQaConsoleFetch({ home: '/nonexistent', company: async () => ({ core: {
     qaObservationRead: async (_a: any, input: any) => ({ meta: { scope, completeness: { dispatchComplete: true } },
       goal: { id: input.goalId, total: 5, states: { review: 1 }, dispatchComplete: true, undispatchable: 2, dispatchCheckedAt: '2026-10-22T00:19:00Z', root } }),

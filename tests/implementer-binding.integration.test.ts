@@ -29,7 +29,7 @@ beforeAll(async () => {
   await database.db.query('REMOVE DATABASE IF EXISTS control_plane;');
   await database.bootstrap();
   for (const [name, role, caps] of [
-    ['gm', 'gm', ['execute', 'review', 'manage']], ['gm2', 'gm', ['execute', 'review', 'manage']],
+    ['owner', 'owner', ['execute', 'review', 'manage']], ['gm2', 'owner', ['execute', 'review', 'manage']],
     ['eng-a', 'engineering', ['execute', 'review']], ['eng-b', 'engineering', ['execute', 'review']],
     ['eng-c', 'engineering', ['execute', 'review']], ['qa', 'qa', ['execute', 'review']],
   ] as const) tokens[name] = await enrollment.enroll(`t-${name}`, role, caps);
@@ -159,7 +159,7 @@ test('AC04 (R4): a block raised in review does not open the execute-phase takeov
   const inReview = await newTask('AC04 复核阶段阻塞不可接手');
   await deliver(tokens['eng-a'], inReview.id);
   const reviewClaim = await core.claim(tokens['eng-b'], inReview.id);
-  await core.block(tokens['eng-b'], proofOf(reviewClaim), 'gm', { text: 'SYNTHETIC review-phase block for the AC04 takeover refusal.', idempotencyKey: key() });
+  await core.block(tokens['eng-b'], proofOf(reviewClaim), 'owner', { text: 'SYNTHETIC review-phase block for the AC04 takeover refusal.', idempotencyKey: key() });
   const blocked = await task(inReview.id);
   expect(blocked).toMatchObject({ state: 'blocked', implementer: 't-eng-a' });
   await expect(core.implementerTakeover(tokens.gm, { taskId: inReview.id, toEmployee: 't-eng-c', expectedVersion: blocked.version,
@@ -168,7 +168,7 @@ test('AC04 (R4): a block raised in review does not open the execute-phase takeov
   // Blocked in execute: the phase that resumes is execute, so the same takeover is allowed.
   const inExecute = await newTask('AC04 执行阶段阻塞可接手');
   const first = await core.claim(tokens['eng-a'], inExecute.id);
-  await core.block(tokens['eng-a'], proofOf(first), 'gm', { text: 'SYNTHETIC execute-phase block for the AC04 takeover allowance.', idempotencyKey: key() });
+  await core.block(tokens['eng-a'], proofOf(first), 'owner', { text: 'SYNTHETIC execute-phase block for the AC04 takeover allowance.', idempotencyKey: key() });
   const taken = await core.implementerTakeover(tokens.gm, { taskId: inExecute.id, toEmployee: 't-eng-b', expectedVersion: (await task(inExecute.id)).version,
     reason: 'SYNTHETIC takeover of an execute-phase block, allowed', idempotencyKey: key() });
   expect(taken).toMatchObject({ implementer: 't-eng-b', state: 'blocked' });

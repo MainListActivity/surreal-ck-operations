@@ -183,6 +183,12 @@ case "$action" in
     done
     mkdir -p "$service_home/bin" "$service_home/logs" "$HOME/Library/LaunchAgents"
     chmod 700 "$service_home" "$service_home/bin" "$service_home/logs" "$service_home/private"
+    # 老板令牌：不存在时生成（0600），供编制外 agent 通过 owner CLI / HTTP 接口代老板操作。
+    if [ ! -s "$service_home/private/owner-token" ]; then
+      /usr/bin/openssl rand -base64 32 | /usr/bin/tr -d '\n' | /usr/bin/sed 's/^/sck_/' > "$service_home/private/owner-token"
+      printf '\n' >> "$service_home/private/owner-token"
+    fi
+    chmod 600 "$service_home/private/owner-token"
     cp "$(dirname "$0")/run-service.sh" "$service_home/bin/run.sh"
     # Keep the already-installed provider wrapper current without changing daemon configuration.
     if [ -d "$service_home/sandbox" ]; then

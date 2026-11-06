@@ -8,7 +8,8 @@ import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { RpcInput } from "@getpaseo/plugin";
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
-import { company } from "./company";
+import { company, notePaseo } from "./company";
+import { answerPermissionFor, pendingPermissionsFor, taskAttachmentsFor, taskAttachmentUrlFor } from "./owner-actions";
 import { isQaContext } from "./owner-context";
 import { refreshModels, refreshQuota } from "./dispatch";
 import { serviceHome } from "./env";
@@ -40,6 +41,8 @@ const resolveSlot = (entry: any, match: (id: string) => { family: string; versio
 export function registerHandlers(server: PluginServerContext): void {
   const ownerHandle = (contract: any, handler: any) => server.handle(contract, (input: any, context: any) => {
     if (isQaContext(context)) throw new Error('owner RPC is not available to a QA session; use the /q/ read-only console');
+    // Any owner RPC carries the host's Paseo handle; owner CLI/HTTP commands use the remembered one.
+    notePaseo(context?.paseo);
     return handler(input, context);
   });
   ownerHandle(sessionHistory,async (input: {agentId:string;cursor:number;textOffset:number})=>{
@@ -136,22 +139,11 @@ export function registerHandlers(server: PluginServerContext): void {
     };
   });
 
-  ownerHandle(rpc.taskAttachments, async (input: RpcInput<typeof rpc.taskAttachments>) => {
-    const { listTaskAttachments } = await import("./vendor/src/attachments.ts");
-    return { attachments: await listTaskAttachments(serviceHome(), input.taskId) };
-  });
+  ownerHandle(rpc.taskAttachments, async (input: RpcInput<typeof rpc.taskAttachments>) =>
+    taskAttachmentsFor(serviceHome(), input.taskId));
 
-  ownerHandle(rpc.attachmentUrl, async (input: RpcInput<typeof rpc.attachmentUrl>) => {
-    // 老板亲定 LAN 口径：附件打开路径统一为内嵌预览服务 URL（/e/ 路由，无时效）。
-    // 公网签名链路（preview-sign + 签名面 :18778）保留给远程可达链路的部署腿。
-    const { resolveTaskAttachment } = await import("./vendor/src/attachments.ts");
-    const { previewLanBase } = await import("./vendor/src/deliverables.ts");
-    const abs = await resolveTaskAttachment(serviceHome(), input.taskId, input.name);
-    if (!abs) throw new Error("附件不存在或越界");
-    const rel = input.name.split("/").map(encodeURIComponent).join("/");
-    const url = `${previewLanBase(serviceHome())}/e/${encodeURIComponent(input.taskId)}/${rel}`;
-    return { url };
-  });
+  ownerHandle(rpc.attachmentUrl, async (input: RpcInput<typeof rpc.attachmentUrl>) =>
+    taskAttachmentUrlFor(serviceHome(), input.taskId, input.name));
 
   ownerHandle(rpc.openAttachment, async (input: RpcInput<typeof rpc.openAttachment>) => {
     const { isOpenBlocked, resolveTaskAttachment } = await import("./vendor/src/attachments.ts");
@@ -463,37 +455,12 @@ export function registerHandlers(server: PluginServerContext): void {
     return { ok: true };
   });
 
-  ownerHandle(rpc.pendingPermissions, async (_input: unknown, { paseo }: { paseo: any }) => {
-    const { entries } = await paseo.agents.list();
-    const items = [];
-    for (const agent of entries ?? []) {
-      if (agent.labels?.company !== "surreal-ck") continue;
-      const detail = await paseo.agents.ref(agent.id).refresh();
-      const pending = detail?.pendingPermissions ?? agent.pendingPermissions ?? [];
-      for (const request of pending) {
-        items.push({
-          agentId: agent.id,
-          title: agent.title ?? agent.name,
-          employeeId: agent.labels?.employee_id,
-          role: agent.labels?.role,
-          request: {
-            id: request.id,
-            kind: request.kind ?? request.type,
-            summary: request.summary ?? request.title ?? request.description,
-            detail: typeof request.detail === "string" ? request.detail.slice(0, 2000) : undefined,
-          },
-        });
-      }
-    }
-    return { items };
-  });
+  ownerHandle(rpc.pendingPermissions, async (_input: unknown, { paseo }: { paseo: any }) =>
+    pendingPermissionsFor(paseo));
 
-  ownerHandle(rpc.answerPermission, async (input: RpcInput<typeof rpc.answerPermission>, { paseo }: { paseo: any }) => {
-    await paseo.agents.ref(input.agentId).respondToPermission({
-      requestId: input.requestId,
-      response: { behavior: input.behavior, message: input.message },
-    });
-    return { ok: true };
-  });
+  ownerHandle(rpc.answerPermission, async (input: RpcInput<typeof rpc.answerPermission>, { paseo }: { paseo: any }) =>
+    answerPermissionFor(paseo, input));
 
 }
+
+

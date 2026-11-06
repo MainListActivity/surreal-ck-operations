@@ -2,6 +2,10 @@ import type { PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import type { PaseoApi } from "@getpaseo/client";
 import type { Company } from "./company";
 import { quotaFailure, QUOTA_RELEASE } from "./vendor/src/dispatcher/quota-failure.ts";
+import { renderMessage } from "./vendor/src/outbound-messages.ts";
+import { latestFindings } from "./vendor/src/dispatcher/brief.ts";
+import { readJsonFile } from "./vendor/src/comm.ts";
+import { join } from "node:path";
 const MAX_SILENT_NUDGES = 2;
 /** A canceled/failed silent turn waits this long before its lease is surrendered. */
 export const INTERRUPT_GRACE_MS = 45_000;
@@ -35,7 +39,7 @@ export class TurnInterruptions {
   }
 }
 
-async function settleTurn(ctx: Pick<Company, "sidecar" | "workforce">, paseo: PaseoApi,
+async function settleTurn(ctx: Pick<Company, "sidecar" | "workforce" | "messages" | "sckBin">, paseo: PaseoApi,
   event: PluginLifecycleEvents["agent.turn_ended"], interruptions?: TurnInterruptions): Promise<void> {
   const failure = quotaFailure(event.outcome, event.timeline);
   const inst = failure ? (await ctx.workforce.insts()).find(i => i.paseoAgentId === event.agent.id) : undefined;
@@ -62,9 +66,21 @@ async function settleTurn(ctx: Pick<Company, "sidecar" | "workforce">, paseo: Pa
     const kind = event.outcome?.kind ?? "completed";
     if (kind === "completed" && nudges <= MAX_SILENT_NUDGES) {
       try {
-        await paseo.agents.ref(event.agent.id).send(
-          `【系统】任务仍挂在你名下，上一轮没有提交。继续完成，用 sck call ${res.silent.phase === "review" ? 'review（decision 为 accept 或 return）' : 'submit'} 写入${res.silent.phase === "review" ? "复核结论" : "结果"}。第 ${nudges}/${MAX_SILENT_NUDGES} 次提醒，再次未提交将收回重派。`
-        );
+        // 催办也走 outbound_message 表：draft 在触发时生成，hold 则不催办（老板留着放行）。
+        const messages = ctx.messages;
+        const role = ctx.sidecar.roleFor(instId) ?? (await ctx.workforce.insts()).find(i => i.id === instId)?.role ?? "engineering";
+        const draft = await messages.ensureDraft(taskId, "nudge", role, false, res.silent.phase);
+        const prepared = draft.hold ? null : await messages.prepareSend(taskId, "nudge", instId);
+        if (prepared) {
+          const commDir = ctx.sidecar.commDirFor(instId);
+          const claim = readJsonFile<{ history?: Parameters<typeof latestFindings>[0] }>(join(commDir, "claim.json"));
+          const findings = latestFindings(claim?.history);
+          const body = renderMessage(prepared.body, {
+            sckBin: ctx.sckBin, commDir, taskId, ...(findings ? { findingsFile: findings.file } : {}),
+          });
+          await paseo.agents.ref(event.agent.id).send(body);
+          await messages.markSent(prepared.message.id, instId, prepared.message.body);
+        }
         console.log(`silent-turn nudge ${nudges}/${MAX_SILENT_NUDGES} sent to ${instId} on ${taskId}`);
       } catch (error) {
         console.warn(`silent-turn nudge failed for ${instId} on ${taskId}: ${(error as Error).message}`);
@@ -96,7 +112,7 @@ async function settleTurn(ctx: Pick<Company, "sidecar" | "workforce">, paseo: Pa
 // Lifecycle delivery can be repeated; a turn must not double its cooldown or settle
 // the next lease that this agent acquired. Failed writes remain retryable.
 const turns = new WeakMap<object, Map<string, Promise<void>>>();
-export function settleCompanyTurn(ctx: Pick<Company, "sidecar" | "workforce">, paseo: PaseoApi,
+export function settleCompanyTurn(ctx: Pick<Company, "sidecar" | "workforce" | "messages" | "sckBin">, paseo: PaseoApi,
   event: PluginLifecycleEvents["agent.turn_ended"], interruptions?: TurnInterruptions): Promise<void> {
   if (!event.turnId) return settleTurn(ctx, paseo, event, interruptions);
   let seen = turns.get(ctx.sidecar);

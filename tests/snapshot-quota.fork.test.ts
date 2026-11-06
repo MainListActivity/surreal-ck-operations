@@ -46,7 +46,7 @@ async function fresh(limits: Partial<SnapshotLimits> = {}, options: SnapshotStor
 }
 
 const at = (owner: string, extra: Partial<BeginInput> = {}): BeginInput => ({
-  owner, kind: 'context', digest: `dig-${owner}`, role: 'gm', takenAt: TAKEN_AT, rows: 1, bytes: KB, ...extra,
+  owner, kind: 'context', digest: `dig-${owner}`, role: 'owner', takenAt: TAKEN_AT, rows: 1, bytes: KB, ...extra,
 });
 
 const within = <T>(work: Promise<T>, ms: number, what: string): Promise<T> => {
@@ -241,7 +241,7 @@ test('(b) 20 concurrent reservations of 1 KiB across processes admit exactly the
 test('(c) per-owner cap holds under concurrent creates from three processes: at most 4 listings, evicted ones read snapshot_gone, a listing being written is never evicted', async () => {
   const { namespace, db, store } = await fresh({ maxPerOwner: 4, maxListings: 100, maxTotalBytes: 1024 * KB });
   const owner = 'c-owner';
-  const shape = { owner, kind: 'context' as const, digest: 'dig-c', role: 'gm', takenAt: TAKEN_AT };
+  const shape = { owner, kind: 'context' as const, digest: 'dig-c', role: 'owner', takenAt: TAKEN_AT };
   // One listing of this owner is still being written (reserved, not committed) while the creates run.
   // The listing's rows are written in one call below; a second call on the same listing is covered by test (h).
   const writing = await store.begin({ ...shape, rows: 2, bytes: 6 });
@@ -262,7 +262,7 @@ test('(c) per-owner cap holds under concurrent creates from three processes: at 
   let gone = 0;
   for (const id of ids) {
     try {
-      await store.read({ id, owner, kind: 'context', digest: shape.digest, role: 'gm', after: 0, limit: 10 });
+      await store.read({ id, owner, kind: 'context', digest: shape.digest, role: 'owner', after: 0, limit: 10 });
       survivors++;
     } catch (error) {
       expect((error as CompanyError).code).toBe('snapshot_gone');
@@ -275,7 +275,7 @@ test('(c) per-owner cap holds under concurrent creates from three processes: at 
   // The writing listing was never evicted: its rows are intact and it commits once its last row is written.
   await store.writeRows(writing, ['abc', 'def']);
   await store.commit(writing);
-  const back = await store.read({ id: writing.id, owner, kind: 'context', digest: shape.digest, role: 'gm', after: 0, limit: 10 });
+  const back = await store.read({ id: writing.id, owner, kind: 'context', digest: shape.digest, role: 'owner', after: 0, limit: 10 });
   expect(back.rows.map(row => row.body)).toEqual(['abc', 'def']);
   expect(await ownerCount(db, owner)).toBe(4);
   expect(await quotaOf(store)).toEqual({
@@ -291,7 +291,7 @@ test('(d) rows above maxRows and bytes above maxBytes are refused as response_to
     { op: 'begin-all', limits: store.limits, inputs: [at('d-rows', { rows: 4, bytes: 4 }), at('d-bytes', { rows: 1, bytes: 9 })] },
     {
       op: 'create-all', limits: store.limits,
-      inputs: [{ owner: 'd-create', kind: 'context', digest: 'dig-d', role: 'gm', takenAt: TAKEN_AT, bodies: ['a', 'b', 'c', 'd'] }],
+      inputs: [{ owner: 'd-create', kind: 'context', digest: 'dig-d', role: 'owner', takenAt: TAKEN_AT, bodies: ['a', 'b', 'c', 'd'] }],
     },
   ]);
   const [beginBatch, createBatch] = values as Array<Batch<SnapshotReservation>>;
@@ -362,7 +362,7 @@ test('(f) a writer SIGKILLed before commit keeps its room until sweep removes th
 
 test('(g) two processes releasing the same listing at the same time free it exactly once', async () => {
   const { namespace, store } = await fresh();
-  const header = await store.create({ owner: 'g-owner', kind: 'context', digest: 'dig-g', role: 'gm', takenAt: TAKEN_AT, bodies: ['abcdefg'] });
+  const header = await store.create({ owner: 'g-owner', kind: 'context', digest: 'dig-g', role: 'owner', takenAt: TAKEN_AT, bodies: ['abcdefg'] });
   expect(await quotaOf(store)).toEqual({ listings: 1, bytes: 7, rows: 1, quotaListings: 1, quotaBytes: 7 });
 
   const { values } = await runChildren<Batch<'released' | 'absent'>>(namespace, [0, 1].map(() => ({
@@ -385,7 +385,7 @@ test('(h) writeRows numbers rows across calls and batches, and a write past the 
   // Two 300 KiB bodies do not fit one 512 KiB batch, so this second call runs in two transactions.
   await store.writeRows(first, ['def', big, big]);
   await store.commit(first);
-  const back = await store.read({ id: first.id, owner: 'h-owner', kind: 'context', digest: 'dig-h-owner', role: 'gm', after: 0, limit: 10 });
+  const back = await store.read({ id: first.id, owner: 'h-owner', kind: 'context', digest: 'dig-h-owner', role: 'owner', after: 0, limit: 10 });
   expect(back.rows.map(row => row.seq)).toEqual([1, 2, 3, 4]);
   expect(back.rows.map(row => row.body)).toEqual(['abc', 'def', big, big]);
 
@@ -402,12 +402,12 @@ test('(h) writeRows numbers rows across calls and batches, and a write past the 
 test('(i) an expired listing is released by the sweep that finds it, exactly once, and its cursors then read snapshot_gone', async () => {
   const { store } = await fresh({ ttlMs: 1_000 });
   const now = Date.now();
-  const header = await store.create({ owner: 'i-owner', kind: 'context', digest: 'dig-i', role: 'gm', takenAt: TAKEN_AT, bodies: ['abc'] }, now);
+  const header = await store.create({ owner: 'i-owner', kind: 'context', digest: 'dig-i', role: 'owner', takenAt: TAKEN_AT, bodies: ['abc'] }, now);
   expect(await store.sweep(now + 999)).toBe(0);
   expect(await store.sweep(now + 1_000)).toBe(1);
   expect(await store.sweep(now + 1_000)).toBe(0);
   expect(await quotaOf(store)).toEqual({ listings: 0, bytes: 0, rows: 0, quotaListings: 0, quotaBytes: 0 });
-  await expect(store.read({ id: header.id, owner: 'i-owner', kind: 'context', digest: 'dig-i', role: 'gm', after: 0, limit: 10 }, now + 1_000))
+  await expect(store.read({ id: header.id, owner: 'i-owner', kind: 'context', digest: 'dig-i', role: 'owner', after: 0, limit: 10 }, now + 1_000))
     .rejects.toMatchObject({ code: 'snapshot_gone' });
 });
 
@@ -438,7 +438,7 @@ test('(j) a build past its deadline is cancelled: no statement starts after it, 
   const bodies = Array.from({ length: 80 }, (_, index) => `${index}`.padEnd(KB, 'x'));
   const started = performance.now();
   const error = await store.build({
-    owner: 'j-owner', kind: 'context', digest: 'dig-j', role: 'gm', guidance: 'narrow the query', load: async () => ({ takenAt: TAKEN_AT, bodies }),
+    owner: 'j-owner', kind: 'context', digest: 'dig-j', role: 'owner', guidance: 'narrow the query', load: async () => ({ takenAt: TAKEN_AT, bodies }),
   }).then(() => undefined, (reason: unknown) => reason);
   const elapsed = performance.now() - started;
   expect(error).toBeInstanceOf(CompanyError);
@@ -461,7 +461,7 @@ test('(j) a build past its deadline is cancelled: no statement starts after it, 
   expect(await quotaOf(store)).toEqual(baseline);
 
   slow = false;
-  const header = await store.create({ owner: 'j-owner', kind: 'context', digest: 'dig-j-again', role: 'gm', takenAt: TAKEN_AT, bodies: ['again'] });
+  const header = await store.create({ owner: 'j-owner', kind: 'context', digest: 'dig-j-again', role: 'owner', takenAt: TAKEN_AT, bodies: ['again'] });
   expect(header.rows).toBe(1);
   expect(await store.release(header.id)).toBe('released');
   expect(await quotaOf(store)).toEqual(baseline);
@@ -492,7 +492,7 @@ test('(k) a reserved write still in flight at the deadline is abandoned: its con
   holder.db = db.db;
   const baseline = await quotaOf(store);
   const started = performance.now();
-  const error = await store.create({ owner: 'k-owner', kind: 'context', digest: 'dig-k', role: 'gm', takenAt: TAKEN_AT, bodies: ['abc', 'def'] })
+  const error = await store.create({ owner: 'k-owner', kind: 'context', digest: 'dig-k', role: 'owner', takenAt: TAKEN_AT, bodies: ['abc', 'def'] })
     .then(() => undefined, (reason: unknown) => reason);
   const elapsed = performance.now() - started;
   expect(error).toBeInstanceOf(CompanyError);
@@ -511,7 +511,7 @@ test('(k) a reserved write still in flight at the deadline is abandoned: its con
   expect(await quotaOf(store)).toEqual(baseline);
 
   hold = false;
-  const header = await store.create({ owner: 'k-owner', kind: 'context', digest: 'dig-k-again', role: 'gm', takenAt: TAKEN_AT, bodies: ['again'] });
+  const header = await store.create({ owner: 'k-owner', kind: 'context', digest: 'dig-k-again', role: 'owner', takenAt: TAKEN_AT, bodies: ['again'] });
   expect(await store.release(header.id)).toBe('released');
   expect(await quotaOf(store)).toEqual(baseline);
 });
@@ -528,7 +528,7 @@ test('(l) a read still unanswered after loadHedgeMs is abandoned, its connection
   });
   holder.db = db.db;
   const header = await store.build({
-    owner: 'l-owner', kind: 'context', digest: 'dig-l', role: 'gm', guidance: 'narrow the query',
+    owner: 'l-owner', kind: 'context', digest: 'dig-l', role: 'owner', guidance: 'narrow the query',
     load: async () => {
       reads++;
       // The first read never answers; the second one does.
@@ -559,7 +559,7 @@ test('(m) a read that stalls again after the hedge ends the build as temporarily
   holder.db = db.db;
   const started = performance.now();
   const error = await store.build({
-    owner: 'm-owner', kind: 'context', digest: 'dig-m', role: 'gm', guidance: 'narrow the query',
+    owner: 'm-owner', kind: 'context', digest: 'dig-m', role: 'owner', guidance: 'narrow the query',
     load: async () => { reads++; return new Promise<never>(() => undefined); },
   }).then(() => undefined, (reason: unknown) => reason);
   const elapsed = performance.now() - started;
@@ -581,7 +581,7 @@ test('(n) a build whose read is abandoned closes only its own connection: a conc
   let attempts = 0;
   // The first build's first read never answers, so it is abandoned at the hedge and read once more on a new connection.
   const stalled = store.build({
-    owner: 'n-stalled', kind: 'context', digest: 'dig-n-stalled', role: 'gm', guidance: 'narrow the query',
+    owner: 'n-stalled', kind: 'context', digest: 'dig-n-stalled', role: 'owner', guidance: 'narrow the query',
     load: async () => {
       attempts++;
       if (attempts === 1) return new Promise<never>(() => undefined);
@@ -590,7 +590,7 @@ test('(n) a build whose read is abandoned closes only its own connection: a conc
   });
   // The other build reads on its own connection while the first is abandoned, and must still store.
   const other = store.build({
-    owner: 'n-other', kind: 'context', digest: 'dig-n-other', role: 'gm', guidance: 'narrow the query',
+    owner: 'n-other', kind: 'context', digest: 'dig-n-other', role: 'owner', guidance: 'narrow the query',
     load: async conn => {
       await Bun.sleep(600);
       await conn.query('RETURN 1;');
@@ -623,7 +623,7 @@ test('(o) a release that cannot finish within its deadline is left for the sweep
   });
   holder.db = db.db;
   const baseline = await quotaOf(store);
-  const header = await store.create({ owner: 'o-owner', kind: 'context', digest: 'dig-o', role: 'gm', takenAt: TAKEN_AT, bodies: ['kept'] });
+  const header = await store.create({ owner: 'o-owner', kind: 'context', digest: 'dig-o', role: 'owner', takenAt: TAKEN_AT, bodies: ['kept'] });
   hang = true;
   const started = performance.now();
   const error = await store.release(header.id).then(() => undefined, (reason: unknown) => reason);
@@ -645,7 +645,7 @@ test('(o) a release that cannot finish within its deadline is left for the sweep
 test('(p) a build and a sweep run on their own connections: a main connection that refuses every statement does not stop them', async () => {
   const { db, store } = await fresh({ ttlMs: 1 });
   // A listing that has expired by the time the next build starts, so the build's sweep has work to do on its own connection.
-  await store.create({ owner: 'p-owner', kind: 'context', digest: 'dig-p-old', role: 'gm', takenAt: TAKEN_AT, bodies: ['expired'] });
+  await store.create({ owner: 'p-owner', kind: 'context', digest: 'dig-p-old', role: 'owner', takenAt: TAKEN_AT, bodies: ['expired'] });
   await Bun.sleep(5);
   const refused: string[] = [];
   const main = new Proxy({}, {
@@ -655,7 +655,7 @@ test('(p) a build and a sweep run on their own connections: a main connection th
     },
   }) as unknown as Surreal;
   const isolated = new SnapshotStore(main, { reserveWaitMs: 10_000 }, { channel: db.buildChannel });
-  const header = await isolated.create({ owner: 'p-owner', kind: 'context', digest: 'dig-p', role: 'gm', takenAt: TAKEN_AT, bodies: ['fresh'] });
+  const header = await isolated.create({ owner: 'p-owner', kind: 'context', digest: 'dig-p', role: 'owner', takenAt: TAKEN_AT, bodies: ['fresh'] });
   expect(header.rows).toBe(1);
   expect(await isolated.sweep()).toBe(0);
   expect(await isolated.release(header.id)).toBe('released');
@@ -677,7 +677,7 @@ test('(q) at most MAX_BUILD_CONNECTIONS builds hold a connection at once: a buil
     },
   };
   const store = new SnapshotStore(db.db, { reserveWaitMs: 10_000, buildDeadlineMs: 30_000 }, { channel: slow });
-  const make = (owner: string) => store.create({ owner, kind: 'context', digest: `dig-${owner}`, role: 'gm', takenAt: TAKEN_AT, bodies: ['x'] });
+  const make = (owner: string) => store.create({ owner, kind: 'context', digest: `dig-${owner}`, role: 'owner', takenAt: TAKEN_AT, bodies: ['x'] });
   const holding = Array.from({ length: MAX_BUILD_CONNECTIONS }, (_, index) => make(`q-${index}`));
   await Bun.sleep(300);
   expect(db.buildConnectionStats()).toEqual({ open: MAX_BUILD_CONNECTIONS, slotsInUse: MAX_BUILD_CONNECTIONS, idle: 0, queued: 0 });
@@ -703,7 +703,7 @@ test('(q) at most MAX_BUILD_CONNECTIONS builds hold a connection at once: a buil
 test('(r) a release is not held back by saturated build slots: with every slot taken, a release frees its listing at once', async () => {
   const { db } = await fresh();
   const plain = new SnapshotStore(db.db, { reserveWaitMs: 10_000 }, { channel: db.buildChannel, releaseChannel: db.releaseChannel });
-  const kept = await plain.create({ owner: 'r-owner', kind: 'context', digest: 'dig-r', role: 'gm', takenAt: TAKEN_AT, bodies: ['kept'] });
+  const kept = await plain.create({ owner: 'r-owner', kind: 'context', digest: 'dig-r', role: 'owner', takenAt: TAKEN_AT, bodies: ['kept'] });
   // As in (q), the row write of each build takes 4 seconds, so the builds holding slots still hold them during the release.
   const slow = {
     open: async () => {
@@ -716,7 +716,7 @@ test('(r) a release is not held back by saturated build slots: with every slot t
   };
   const store = new SnapshotStore(db.db, { reserveWaitMs: 10_000, buildDeadlineMs: 30_000 }, { channel: slow, releaseChannel: db.releaseChannel });
   const holding = Array.from({ length: MAX_BUILD_CONNECTIONS }, (_, index) =>
-    store.create({ owner: `r-${index}`, kind: 'context', digest: `dig-r-${index}`, role: 'gm', takenAt: TAKEN_AT, bodies: ['x'] }));
+    store.create({ owner: `r-${index}`, kind: 'context', digest: `dig-r-${index}`, role: 'owner', takenAt: TAKEN_AT, bodies: ['x'] }));
   await Bun.sleep(300);
   expect(db.buildConnectionStats()).toEqual({ open: MAX_BUILD_CONNECTIONS, slotsInUse: MAX_BUILD_CONNECTIONS, idle: 0, queued: 0 });
   const started = performance.now();
@@ -729,7 +729,7 @@ test('(r) a release is not held back by saturated build slots: with every slot t
 test('(s) a release whose connection opens only after its deadline still marks the listing, and the next sweep frees it', async () => {
   const { db } = await fresh();
   const plain = new SnapshotStore(db.db, { reserveWaitMs: 10_000 }, { channel: db.buildChannel, releaseChannel: db.releaseChannel });
-  const header = await plain.create({ owner: 's-owner', kind: 'context', digest: 'dig-s', role: 'gm', takenAt: TAKEN_AT, bodies: ['kept'] });
+  const header = await plain.create({ owner: 's-owner', kind: 'context', digest: 'dig-s', role: 'owner', takenAt: TAKEN_AT, bodies: ['kept'] });
   // The release connection opens 3.5 seconds in, after the 3-second release deadline.
   const late = new SnapshotStore(db.db, { reserveWaitMs: 10_000 }, {
     channel: db.buildChannel,
@@ -761,14 +761,14 @@ test('(y) a finished build keeps its socket warm and the next build reuses it, s
   const { db } = await fresh();
   const store = new SnapshotStore(db.db, { reserveWaitMs: 10_000 }, { channel: db.buildChannel, releaseChannel: db.releaseChannel });
   const baseline = await quotaOf(store);
-  const first = await store.create({ owner: 'y-owner', kind: 'context', digest: 'dig-y1', role: 'gm', takenAt: TAKEN_AT, bodies: ['one'] });
+  const first = await store.create({ owner: 'y-owner', kind: 'context', digest: 'dig-y1', role: 'owner', takenAt: TAKEN_AT, bodies: ['one'] });
   // The build returned its socket to the pool instead of closing it; its slot is already free for the next build.
   await settled(() => db.buildConnectionStats().idle === 1, 3_000);
   expect(db.buildConnectionStats()).toEqual({ open: 1, slotsInUse: 0, idle: 1, queued: 0 });
-  const second = await store.create({ owner: 'y-owner', kind: 'context', digest: 'dig-y2', role: 'gm', takenAt: TAKEN_AT, bodies: ['two'] });
+  const second = await store.create({ owner: 'y-owner', kind: 'context', digest: 'dig-y2', role: 'owner', takenAt: TAKEN_AT, bodies: ['two'] });
   // A reused socket leaves the open count at one; a fresh connection would have made it two.
   expect(db.buildConnectionStats()).toEqual({ open: 1, slotsInUse: 0, idle: 1, queued: 0 });
-  expect(await store.read({ id: second.id, owner: 'y-owner', kind: 'context', digest: 'dig-y2', role: 'gm', after: 0, limit: 10 }))
+  expect(await store.read({ id: second.id, owner: 'y-owner', kind: 'context', digest: 'dig-y2', role: 'owner', after: 0, limit: 10 }))
     .toMatchObject({ header: { rows: 1 }, rows: [{ seq: 1, body: 'two' }] });
   expect(await store.release(first.id)).toBe('released');
   expect(await store.release(second.id)).toBe('released');
@@ -800,7 +800,7 @@ test('(u) a reserved listing whose commit stalls is cut at the deadline: its roo
   holder.db = db.db;
   const baseline = await quotaOf(store);
   const started = performance.now();
-  const error = await store.create({ owner: 'u-owner', kind: 'context', digest: 'dig-u', role: 'gm', takenAt: TAKEN_AT, bodies: ['abc', 'def'] })
+  const error = await store.create({ owner: 'u-owner', kind: 'context', digest: 'dig-u', role: 'owner', takenAt: TAKEN_AT, bodies: ['abc', 'def'] })
     .then(() => undefined, (reason: unknown) => reason);
   const elapsed = performance.now() - started;
   expect(error).toBeInstanceOf(CompanyError);
@@ -816,7 +816,7 @@ test('(u) a reserved listing whose commit stalls is cut at the deadline: its roo
   expect(await quotaOf(store)).toEqual(baseline);
 
   hold = false;
-  const header = await store.create({ owner: 'u-owner', kind: 'context', digest: 'dig-u-again', role: 'gm', takenAt: TAKEN_AT, bodies: ['again'] });
+  const header = await store.create({ owner: 'u-owner', kind: 'context', digest: 'dig-u-again', role: 'owner', takenAt: TAKEN_AT, bodies: ['again'] });
   expect(await store.release(header.id)).toBe('released');
   expect(await quotaOf(store)).toEqual(baseline);
 });
@@ -840,7 +840,7 @@ test('(v) a reserved write that stalls, with its release stuck as well, is answe
   holder.db = db.db;
   const baseline = await quotaOf(store);
   const started = performance.now();
-  const error = await store.create({ owner: 'v-owner', kind: 'context', digest: 'dig-v', role: 'gm', takenAt: TAKEN_AT, bodies: ['abc', 'def'] })
+  const error = await store.create({ owner: 'v-owner', kind: 'context', digest: 'dig-v', role: 'owner', takenAt: TAKEN_AT, bodies: ['abc', 'def'] })
     .then(() => undefined, (reason: unknown) => reason);
   const elapsed = performance.now() - started;
   expect(error).toBeInstanceOf(CompanyError);
@@ -883,7 +883,7 @@ test('(w) a build connection that opens after the build deadline is closed witho
   holder.db = db.db;
   const baseline = await quotaOf(store);
   const started = performance.now();
-  const error = await store.create({ owner: 'w-owner', kind: 'context', digest: 'dig-w', role: 'gm', takenAt: TAKEN_AT, bodies: ['late'] })
+  const error = await store.create({ owner: 'w-owner', kind: 'context', digest: 'dig-w', role: 'owner', takenAt: TAKEN_AT, bodies: ['late'] })
     .then(() => undefined, (reason: unknown) => reason);
   const elapsed = performance.now() - started;
   expect(error).toBeInstanceOf(CompanyError);
@@ -914,13 +914,13 @@ test('(x) a build queued behind saturated build slots is cut at its own deadline
   };
   const holdingStore = new SnapshotStore(db.db, { reserveWaitMs: 10_000, buildDeadlineMs: 30_000 }, { channel: slow });
   const holding = Array.from({ length: MAX_BUILD_CONNECTIONS }, (_, index) =>
-    holdingStore.create({ owner: `x-${index}`, kind: 'context', digest: `dig-x-${index}`, role: 'gm', takenAt: TAKEN_AT, bodies: ['x'] }));
+    holdingStore.create({ owner: `x-${index}`, kind: 'context', digest: `dig-x-${index}`, role: 'owner', takenAt: TAKEN_AT, bodies: ['x'] }));
   await Bun.sleep(300);
   expect(db.buildConnectionStats()).toEqual({ open: MAX_BUILD_CONNECTIONS, slotsInUse: MAX_BUILD_CONNECTIONS, idle: 0, queued: 0 });
   // A build with a 1-second deadline waits in the queue for a slot, which the queue would grant only after 2 seconds.
   const queued = new SnapshotStore(db.db, { reserveWaitMs: 10_000, buildDeadlineMs: 1_000 }, { channel: db.buildChannel });
   const started = performance.now();
-  const error = await queued.create({ owner: 'x-queued', kind: 'context', digest: 'dig-x-queued', role: 'gm', takenAt: TAKEN_AT, bodies: ['x'] })
+  const error = await queued.create({ owner: 'x-queued', kind: 'context', digest: 'dig-x-queued', role: 'owner', takenAt: TAKEN_AT, bodies: ['x'] })
     .then(() => undefined, (reason: unknown) => reason);
   const elapsed = performance.now() - started;
   expect(error).toBeInstanceOf(CompanyError);

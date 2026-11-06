@@ -40,8 +40,8 @@ beforeAll(async () => {
   await database.bootstrap();
   const enrollment = new LocalEnrollmentAdmin(database);
   for (const [name, role, caps] of [
-    ['gm', 'gm', ['execute', 'review', 'manage']],
-    ['gm2', 'gm', ['execute', 'review', 'manage']],
+    ['owner', 'owner', ['execute', 'review', 'manage']],
+    ['gm2', 'owner', ['execute', 'review', 'manage']],
     ['eng', 'engineering', ['execute', 'review']],
     ['eng2', 'engineering', ['execute', 'review']],
     ['qa', 'qa', ['execute', 'review']],
@@ -174,9 +174,9 @@ describe('append prerequisites to an existing dependency wait', () => {
     const released = await new WaitStore(database.db).releaseDue(Date.now());
     expect(released.released.map(r => r.taskId)).toContain(source);
     const gated = await core.getTask(tokens.gm!, source);
-    expect(gated).toMatchObject({ state: 'blocked', blockedTo: 'gm', resumeState: 'ready' });
+    expect(gated).toMatchObject({ state: 'blocked', blockedTo: 'owner', resumeState: 'ready' });
     expect(gated.dependencyContinuation).toBeUndefined();
-    expect(gated.waiting).toMatchObject({ kind: 'manager' });
+    expect(gated.waiting).toMatchObject({ kind: 'owner' });
     const [[releaseAudit]] = await database.db.query<[[Record<string, unknown>]]>(
       `SELECT * FROM audit WHERE task = $task AND action = 'wait_released' ORDER BY at DESC LIMIT 1;`,
       { task: new RecordId('task', source) });
@@ -357,7 +357,7 @@ describe('refusals', () => {
     });
     await new WaitStore(database.db).releaseDue(Date.now());
     const gated = await core.getTask(tokens.gm!, source);
-    expect(gated).toMatchObject({ state: 'blocked', blockedTo: 'gm' });
+    expect(gated).toMatchObject({ state: 'blocked', blockedTo: 'owner' });
     await expectRefused(core.resume(tokens.gm!, source, evidence('expired-window-resume')), 'invalid', /window expired/i);
   });
 
@@ -402,7 +402,7 @@ describe('append prerequisites to a legacy defer wait (defer_task_until compat)'
   /** eng 领取（doing）→ 交回 gm → gm 以经理续接 defer：生产 ee1f0f21 的真实存量形状。 */
   async function legacyDoing(taskId: string, referenceTaskId: string): Promise<TaskView> {
     const held = await claim(taskId, 'eng');
-    await core.block(tokens.eng!, proofOf(held), 'gm', evidence(`gm-block-${taskId}`));
+    await core.block(tokens.eng!, proofOf(held), 'owner', evidence(`gm-block-${taskId}`));
     return await core.deferTaskUntil(tokens.gm!, {
       taskId, dependencies: [referenceTaskId], continuation: 'manager',
       text: 'FV06 回归：经理以 defer 产生存量执行依赖等待（无等待实体），验证受控追加能兼容。',
@@ -467,7 +467,7 @@ describe('append prerequisites to a legacy defer wait (defer_task_until compat)'
     const released = await new WaitStore(database.db).releaseDue(Date.now());
     expect(released.released.map(r => r.taskId)).toContain(source);
     const gated = await core.getTask(tokens.gm!, source);
-    expect(gated).toMatchObject({ state: 'blocked', blockedTo: 'gm', resumeState: 'doing' });
+    expect(gated).toMatchObject({ state: 'blocked', blockedTo: 'owner', resumeState: 'doing' });
     expect(gated.dependencyContinuation).toBeUndefined();
     // resume 把 doing 相位恢复为 ready 重新派工（core.resume 的固定语义）。
     expect((await core.resume(tokens.gm!, source, evidence('manager-resume-legacy'))).state).toBe('ready');
@@ -486,7 +486,7 @@ describe('append prerequisites to a legacy defer wait (defer_task_until compat)'
     await execute(first); await review(first); await execute(dep1); await review(dep1);
     const released = await new WaitStore(database.db).releaseDue(Date.now());
     expect(released.released.map(r => r.taskId)).toContain(source);
-    expect(await core.getTask(tokens.gm!, source)).toMatchObject({ state: 'blocked', blockedTo: 'gm', resumeState: 'ready' });
+    expect(await core.getTask(tokens.gm!, source)).toMatchObject({ state: 'blocked', blockedTo: 'owner', resumeState: 'ready' });
 
     // 经理再次 defer（新的未完成前置、经理续接）：得到 legacy-ready 形状（无等待行）。
     const second = await makeTask('第二轮引用');
@@ -510,13 +510,13 @@ describe('append prerequisites to a legacy defer wait (defer_task_until compat)'
     await execute(second); await review(second); await execute(dep2); await review(dep2);
     const released2 = await new WaitStore(database.db).releaseDue(Date.now());
     expect(released2.released.map(r => r.taskId)).toContain(source);
-    expect(await core.getTask(tokens.gm!, source)).toMatchObject({ state: 'blocked', blockedTo: 'gm', resumeState: 'ready' });
+    expect(await core.getTask(tokens.gm!, source)).toMatchObject({ state: 'blocked', blockedTo: 'owner', resumeState: 'ready' });
   });
 
   test('a plain gm block without a defer audit is refused', async () => {
     const source = await makeTask('普通gm阻塞来源');
     const held = await claim(source, 'eng');
-    await core.block(tokens.eng!, proofOf(held), 'gm', evidence('block-only'));
+    await core.block(tokens.eng!, proofOf(held), 'owner', evidence('block-only'));
     await expectRefused(core.appendDependencyPrerequisites(tokens.gm!, {
       taskId: source, dependencies: [await makeTask('普通阻塞前置')], expectedVersion: (await core.getTask(tokens.gm!, source)).version,
       text: '普通 gm 阻塞既无 deferred 审计也无未完成依赖，不是存量依赖等待。', idempotencyKey: key(),
@@ -527,7 +527,7 @@ describe('append prerequisites to a legacy defer wait (defer_task_until compat)'
     const ref = await makeTask('伪造引用');
     const forged = await makeTask('伪造存量来源');
     const held = await claim(forged, 'eng');
-    await core.block(tokens.eng!, proofOf(held), 'gm', evidence('forge-block'));
+    await core.block(tokens.eng!, proofOf(held), 'owner', evidence('forge-block'));
     // 手工把任务摆成 legacy 形状（blocked、blocked_to=NONE、resume_state=doing、带未完成依赖），但没有 deferred 审计。
     await database.db.query(`UPDATE $task SET state = 'blocked', blocked_to = NONE, resume_state = 'doing',
       dependency_continuation = 'manager', dependencies = [$ref];`,
@@ -542,7 +542,7 @@ describe('append prerequisites to a legacy defer wait (defer_task_until compat)'
     const done1 = await makeTask('会完成的引用');
     const source = await makeTask('已满足来源');
     const held = await claim(source, 'eng');
-    await core.block(tokens.eng!, proofOf(held), 'gm', evidence('satisfied-block'));
+    await core.block(tokens.eng!, proofOf(held), 'owner', evidence('satisfied-block'));
     await core.deferTaskUntil(tokens.gm!, {
       taskId: source, dependencies: [done1], continuation: 'manager',
       text: 'defer 后把引用完成，制造依赖已满足的存量形状。', idempotencyKey: key(),
@@ -551,7 +551,7 @@ describe('append prerequisites to a legacy defer wait (defer_task_until compat)'
     await execute(done1); await review(done1);
     // 无等待实体时由依赖完成解锁：回到 GM 关口，而不是停在 blocked 等待追加。
     const unlocked = await core.getTask(tokens.gm!, source);
-    expect(unlocked).toMatchObject({ state: 'blocked', blockedTo: 'gm', resumeState: 'doing' });
+    expect(unlocked).toMatchObject({ state: 'blocked', blockedTo: 'owner', resumeState: 'doing' });
     expect(unlocked.dependencyContinuation).toBeUndefined();
     await expectRefused(core.appendDependencyPrerequisites(tokens.gm!, {
       taskId: source, dependencies: [await makeTask('已满足前置')], expectedVersion: unlocked.version,
@@ -572,7 +572,7 @@ describe('append prerequisites to a legacy defer wait (defer_task_until compat)'
     const reviewTask = await makeTask('复核存量来源', { reviewerRole: 'qa' });
     await execute(reviewTask);
     const reviewClaim = await claim(reviewTask, 'qa');
-    await core.block(tokens.qa!, proofOf(reviewClaim), 'gm', evidence('review-block-legacy'));
+    await core.block(tokens.qa!, proofOf(reviewClaim), 'owner', evidence('review-block-legacy'));
     const deferred = await core.deferTaskUntil(tokens.gm!, {
       taskId: reviewTask, dependencies: [reviewRef], continuation: 'manager',
       text: '复核相位被 defer 成存量等待：受控追加不得触碰复核岗位。', idempotencyKey: key(),

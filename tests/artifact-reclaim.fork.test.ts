@@ -33,7 +33,7 @@ beforeAll(async () => {
   await db.connect(); await db.bootstrap();
   core = new SurrealCompanyCore(db);
   const admin = new LocalEnrollmentAdmin(db);
-  gm = await admin.enroll('artifact-gm', 'gm', ['execute', 'review', 'manage']);
+  gm = await admin.enroll('artifact-gm', 'owner', ['execute', 'review', 'manage']);
   eng = await admin.enroll('artifact-eng', 'engineering', ['execute', 'review']);
   qa = await admin.enroll('artifact-qa', 'qa', ['execute', 'review']);
 });

@@ -117,7 +117,7 @@ describe('time releases time only (AC01/AC05)', () => {
 
 describe('external events (AC02)', () => {
   const activation = (over: Partial<WaitRecord> = {}) => wait({
-    kind: 'customer_activation', source: { kind: 'webhook' }, ownerRole: 'gm',
+    kind: 'customer_activation', source: { kind: 'webhook' }, ownerRole: 'owner',
     expiresAt: NOW + 24 * HOUR, expiresSource: 'exact', ...over,
   });
   const event = (over: Partial<WaitEvent> = {}): WaitEvent => ({

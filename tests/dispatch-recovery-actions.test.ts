@@ -11,21 +11,21 @@ const verdictOf = (entries: EvaluatedEntry[] | undefined, phase: 'execute' | 're
 test('a manager-fixable candidate block names def_ensure as an executable gm action, with its basis', () => {
   const verdict = verdictOf([{ key: 'emp-1', eligible: false, code: 'seat_full' }]);
   const [reason] = verdict.reasons;
-  expect(reason).toMatchObject({ code: 'seat_full', owner: 'gm', basis: 'tick:staffing-pool' });
-  expect(reason!.actions).toEqual([expect.objectContaining({ authority: 'gm', tool: 'def_ensure', executable: true })]);
+  expect(reason).toMatchObject({ code: 'seat_full', owner: 'owner', basis: 'tick:staffing-pool' });
+  expect(reason!.actions).toEqual([expect.objectContaining({ authority: 'owner', tool: 'def_ensure', executable: true })]);
 });
 
 test('a recusal names the manager tool that adds an independent reviewer, sourced from the contribution audit', () => {
   const verdict = verdictOf([{ key: 'emp-author', eligible: false, code: 'author_recusal' }], 'review');
   const [reason] = verdict.reasons;
   expect(reason).toMatchObject({ code: 'author_recusal', basis: 'contribution-audit' });
-  expect(reason!.actions[0]).toMatchObject({ authority: 'gm', executable: true });
+  expect(reason!.actions[0]).toMatchObject({ authority: 'owner', executable: true });
   expect(reason!.actions[0]!.tool).toBe('def_ensure');
 });
 
 test('a takeover block is executable through implementer_takeover', () => {
   const verdict = verdictOf([{ key: 'emp-1', eligible: false, code: 'implementer_mismatch' }]);
-  expect(verdict.reasons[0]!.actions[0]).toMatchObject({ authority: 'gm', tool: 'implementer_takeover', executable: true });
+  expect(verdict.reasons[0]!.actions[0]).toMatchObject({ authority: 'owner', tool: 'implementer_takeover', executable: true });
 });
 
 test('owner-only and outside-system recoveries are not executable and say who acts', () => {
@@ -33,14 +33,14 @@ test('owner-only and outside-system recoveries are not executable and say who ac
   expect(quota.reasons[0]!.actions).toEqual([expect.objectContaining({ authority: 'owner', executable: false })]);
   expect(quota.reasons[0]!.basis).toBe('tick:quota-rows');
   const busy = verdictOf([{ key: 'emp-1', eligible: false, code: 'session_busy' }]);
-  expect(busy.reasons[0]!.actions[0]).toMatchObject({ authority: 'gm', executable: false });
+  expect(busy.reasons[0]!.actions[0]).toMatchObject({ authority: 'owner', executable: false });
   expect(busy.reasons[0]!.actions[0]!.tool).toBeUndefined();
 });
 
 test('a pass-wide gate names its source and an outside-system action', () => {
   const verdict = verdictOf(undefined, 'execute', [globalBlock('paused')]);
   expect(verdict.reasons[0]).toMatchObject({ code: 'paused', basis: 'tick:global-gate' });
-  expect(verdict.reasons[0]!.actions[0]).toMatchObject({ authority: 'gm', executable: false });
+  expect(verdict.reasons[0]!.actions[0]).toMatchObject({ authority: 'owner', executable: false });
 });
 
 test('an unknown state is never shown as busy: its basis is the read that failed', () => {
@@ -57,7 +57,7 @@ test('an unavailable implementer keeps the system retry and also offers the mana
   expect(reason!.actions).toHaveLength(2);
   expect(reason!.actions[0]).toMatchObject({ authority: 'system', executable: false });
   expect(reason!.actions[0]!.tool).toBeUndefined();
-  expect(reason!.actions[1]).toMatchObject({ authority: 'gm', tool: 'implementer_takeover', executable: true });
+  expect(reason!.actions[1]).toMatchObject({ authority: 'owner', tool: 'implementer_takeover', executable: true });
   expect(reason!.recovery).toContain('系统自动改派');
   expect(reason!.nextTrigger).toContain('系统自动改派');
 });
@@ -66,7 +66,7 @@ test('a persistent implementer quota failure is a manager takeover with its real
   const until = '2026-10-21T10:00:00.000Z';
   const verdict = verdictOf([{ key: 'eng-1', eligible: false, code: 'implementer_quota', until }]);
   const [reason] = verdict.reasons;
-  expect(reason).toMatchObject({ code: 'implementer_quota', owner: 'gm', basis: 'tick:provider-health', until });
+  expect(reason).toMatchObject({ code: 'implementer_quota', owner: 'owner', basis: 'tick:provider-health', until });
   expect(reason!.text).toContain(`恢复时间 ${until}`);
-  expect(reason!.actions[0]).toMatchObject({ authority: 'gm', tool: 'implementer_takeover', executable: true });
+  expect(reason!.actions[0]).toMatchObject({ authority: 'owner', tool: 'implementer_takeover', executable: true });
 });

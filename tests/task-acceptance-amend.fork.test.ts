@@ -39,8 +39,8 @@ beforeAll(async () => {
   await database.bootstrap();
   const enrollment = new LocalEnrollmentAdmin(database);
   for (const [name, role, caps] of [
-    ['gm', 'gm', ['execute', 'review', 'manage']],
-    ['gm2', 'gm', ['execute', 'review', 'manage']],
+    ['owner', 'owner', ['execute', 'review', 'manage']],
+    ['gm2', 'owner', ['execute', 'review', 'manage']],
     ['eng', 'engineering', ['execute', 'review']],
     ['eng2', 'engineering', ['execute', 'review']],
     ['qa', 'qa', ['execute', 'review']],
@@ -196,10 +196,10 @@ run('manager acceptance amendment on an in-flight task', () => {
   test('a blocked task accepts the amendment and keeps its block, resume state and holder', async () => {
     const taskId = await makeTask('阻塞任务');
     const held = await claim(taskId, 'eng');
-    const blocked = await core.block(tokens.eng!, proofOf(held), 'gm', evidence('block-before-amend'));
+    const blocked = await core.block(tokens.eng!, proofOf(held), 'owner', evidence('block-before-amend'));
     expect(blocked.state).toBe('blocked');
     const amended = await amend(taskId, blocked.version);
-    expect(amended).toMatchObject({ state: 'blocked', blockedTo: 'gm', resumeState: 'doing' });
+    expect(amended).toMatchObject({ state: 'blocked', blockedTo: 'owner', resumeState: 'doing' });
     expect(amended.currentEmployee).toBeUndefined();
     expect(amended.version).toBe(blocked.version);
     const notices = await core.dispositionNotices(tokens.eng!, {});

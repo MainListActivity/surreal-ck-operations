@@ -86,9 +86,9 @@ run('SYS03 manager disposition on the company fork', () => {
     };
     const core = new SurrealCompanyCore(db, { externalActions: { gateway } });
     const enrollment = new LocalEnrollmentAdmin(db);
-    const gmA = await enrollment.enroll('sys03-gm-a', 'gm', ['execute', 'review', 'manage']);
-    const gmB = await enrollment.enroll('sys03-gm-b', 'gm', ['execute', 'review', 'manage']);
-    const gmC = await enrollment.enroll('sys03-gm-c', 'gm', ['execute', 'review', 'manage']);
+    const gmA = await enrollment.enroll('sys03-gm-a', 'owner', ['execute', 'review', 'manage']);
+    const gmB = await enrollment.enroll('sys03-gm-b', 'owner', ['execute', 'review', 'manage']);
+    const gmC = await enrollment.enroll('sys03-gm-c', 'owner', ['execute', 'review', 'manage']);
     const product = await enrollment.enroll('sys03-product', 'product', ['execute', 'review', 'manage']);
     const eng = await enrollment.enroll('sys03-eng-a', 'engineering', ['execute', 'review']);
     // QA V2 负例：与前置任务执行岗**同岗位**、但不是这条任务当事人的工程员工。
@@ -108,13 +108,13 @@ run('SYS03 manager disposition on the company fork', () => {
     };
 
     /** A task blocked in an execute episode, the way the state machine leaves a manager gate. */
-    const blocked = async (title: string, opts: { to?: 'gm' | 'owner'; resume?: string; holder?: string } = {}) => {
+    const blocked = async (title: string, opts: { to?: 'owner' | 'owner'; resume?: string; holder?: string } = {}) => {
       const task = await core.createTask(gmA, { title, context: 'SYS03 synthetic regression only',
         executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `sys03-${title}` });
       const since = Math.floor(Date.now() / 1000);
       await rawQuery(`UPDATE ONLY $t SET state = 'blocked', blocked_to = $to, resume_state = $resume, current_employee = $holder,
         lease_expires_at = $lease, dispatch_blocked_phase = 'execute', dispatch_blocked_since = $since, version = version + 1;`, {
-        t: id('task', task.id), to: opts.to ?? 'gm', resume: opts.resume ?? 'doing', holder: opts.holder ?? null,
+        t: id('task', task.id), to: opts.to ?? 'owner', resume: opts.resume ?? 'doing', holder: opts.holder ?? null,
         lease: since - 600, since });
       const row = await rowOf(task.id);
       return { id: task.id, sinceMs: (row.dispatch_blocked_since ?? 0) * 1000, version: row.version };
@@ -249,10 +249,10 @@ run('SYS03 manager disposition on the company fork', () => {
     const crashInput = { taskId: crashTask.id, phase: 'execute' as const, sinceMs: crashTask.sinceMs, claimToken: crashToken,
       episodeVersion: 1, action: 'defer' as const, expectedVersion: crashTask.version, dependencies: [e1.id], text: TEXT,
       idempotencyKey: 'sys03-crash-decide' };
-    const crashOutcome = await ledger.decide({ employeeId: 'sys03-gm-a', role: 'gm' }, crashInput, crashApplier())
+    const crashOutcome = await ledger.decide({ employeeId: 'sys03-gm-a', role: 'owner' }, crashInput, crashApplier())
       .then(v => `outcome:${v.outcome}`, (error: Error) => `error:${error.message}`);
     const whileInterrupted = await core.dispositionStatus(gmA, claimOf(crashTask, ''));
-    const replayed = await ledger.decide({ employeeId: 'sys03-gm-a', role: 'gm' }, crashInput, crashApplier());
+    const replayed = await ledger.decide({ employeeId: 'sys03-gm-a', role: 'owner' }, crashInput, crashApplier());
     obs.crashReplay = { crashOutcome, statusWhilePending: whileInterrupted.claim?.status, replayOutcome: replayed.outcome,
       appliedKeys, confirmations: await countRows("SELECT count() AS n FROM audit WHERE task = $t AND action = 'disposition_decided' GROUP ALL;", { t: id('task', crashTask.id) }) };
 
@@ -278,13 +278,13 @@ run('SYS03 manager disposition on the company fork', () => {
       episodeVersion: 1, action: 'repair' as const, expectedVersion: takenTask.version, text: TEXT,
       repair: { title: 'sys03 交接修复链', context: 'SYS03 synthetic takeover chain', executorRole: 'engineering', reviewerRole: 'qa' },
       idempotencyKey: 'sys03-takeover-decide' };
-    const beforeTakeover = await ledger.decide({ employeeId: 'sys03-gm-a', role: 'gm' }, takenInput, chainApplier(true))
+    const beforeTakeover = await ledger.decide({ employeeId: 'sys03-gm-a', role: 'owner' }, takenInput, chainApplier(true))
       .then(v => `outcome:${v.outcome}`, (error: Error) => `error:${error.message}`);
     await expireLease(takenTask);
     const takenOver = await core.claimDisposition(gmB,
       { ...claimOf(takenTask, '受控接手：继续同一条业务操作'), takeover: true, expectedEpisodeVersion: 1 });
     obs.takeoverContinue = { crashed: beforeTakeover,
-      outcome: await ledger.decide({ employeeId: 'sys03-gm-b', role: 'gm' },
+      outcome: await ledger.decide({ employeeId: 'sys03-gm-b', role: 'owner' },
         { ...takenInput, claimToken: takenOver.claim.token! }, chainApplier(false))
         .then(v => ({ outcome: v.outcome, repairTaskId: v.repairTaskId }), (error: Error) => ({ outcome: `error:${error.message}` })),
       chains: [...chains] };
@@ -435,12 +435,12 @@ run('SYS03 manager disposition on the company fork', () => {
     // ---------------------------------------------------------------- namespace 2: real dispatcher ticks
     const dCore = new SurrealCompanyCore(dispatchDb);
     const dEnrollment = new LocalEnrollmentAdmin(dispatchDb);
-    const dGm = await dEnrollment.enroll('sys03-d-gm', 'gm', ['execute', 'review', 'manage']);
+    const dGm = await dEnrollment.enroll('sys03-d-gm', 'owner', ['execute', 'review', 'manage']);
     await dispatchDb.db.upsert(new RecordId('company_meta', 'config')).content({ eval_enabled: false, jev_decisions: false,
       quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
     const dWf = new Workforce(dispatchDb, join(scratch, 'dispatch-credentials'));
     const owner = new OwnerDesk(dispatchDb);
-    await dWf.upsertDef('sys03-d-gm', { role: 'gm', provider: 'codex', model: 'fixture', maxInstances: 2 });
+    await dWf.upsertDef('sys03-d-gm', { role: 'owner', provider: 'codex', model: 'fixture', maxInstances: 2 });
     await dWf.upsertDef('sys03-d-product', { role: 'product', provider: 'codex', model: 'fixture', maxInstances: 1 });
     const agentRows = new Map<string, string>();
     const sends: Array<{ agent: string; text: string }> = [];
@@ -453,7 +453,7 @@ run('SYS03 manager disposition on the company fork', () => {
       const task = await dCore.createTask(dGm, { title, context: 'SYS03 synthetic dispatch regression only',
         executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `sys03-d-${title}` });
       const since = Math.floor(Date.now() / 1000);
-      await rawDispatch(`UPDATE ONLY $t SET state = 'blocked', blocked_to = 'gm', resume_state = 'doing', current_employee = $holder,
+      await rawDispatch(`UPDATE ONLY $t SET state = 'blocked', blocked_to = 'owner', resume_state = 'doing', current_employee = $holder,
         lease_expires_at = $lease, dispatch_blocked_phase = 'execute', dispatch_blocked_since = $since, version = version + 1;`,
         { t: id('task', task.id), holder: holder ?? null, lease: since - 600, since });
       const row = await dRowOf(task.id);
@@ -485,7 +485,7 @@ run('SYS03 manager disposition on the company fork', () => {
       dependencies: [d1.id], text: TEXT, idempotencyKey: 'sys03-d-decide-d5' });
     // The task leaves that gate… and later blocks to gm again: a brand-new episode E2 with its own start.
     const d5E2Since = Math.floor(Date.now() / 1000) + 60;
-    await rawDispatch(`UPDATE ONLY $t SET state = 'blocked', blocked_to = 'gm', resume_state = 'doing',
+    await rawDispatch(`UPDATE ONLY $t SET state = 'blocked', blocked_to = 'owner', resume_state = 'doing',
       current_employee = NONE, lease_expires_at = NONE, dispatch_blocked_phase = 'execute',
       dispatch_blocked_since = $since, dependencies = [], version = version + 1;`,
       { t: id('task', d5.id), since: d5E2Since });
@@ -525,7 +525,7 @@ run('SYS03 manager disposition on the company fork', () => {
     await dCore.decideDisposition(dGm, { taskId: d7.id, phase: 'execute', sinceMs: d7.sinceMs,
       claimToken: d7Claim.claim!.token!, episodeVersion: 1, action: 'defer', expectedVersion: d7.version,
       dependencies: [d1.id], text: TEXT, idempotencyKey: 'sys03-d-decide-d7' });
-    await rawDispatch(`UPDATE ONLY $t SET state = 'blocked', blocked_to = 'gm', resume_state = 'doing',
+    await rawDispatch(`UPDATE ONLY $t SET state = 'blocked', blocked_to = 'owner', resume_state = 'doing',
       current_employee = NONE, lease_expires_at = NONE, dispatch_blocked_phase = NONE,
       dispatch_blocked_since = NONE, dependencies = [], version = version + 1;`, { t: id('task', d7.id) });
     const d7Cleared = await dRowOf(d7.id);
@@ -743,7 +743,7 @@ run('SYS03 manager disposition on the company fork', () => {
     expect(dispatch.tick1.handled).toContain(`gm-disposition-handled:${dispatch.ids.race}`);
     // Zero duplicate dispatch: the held episode is untouched, and the disposed one left the gate.
     expect(dispatch.held.after.version).toBe(dispatch.held.before.version);
-    expect(dispatch.held.after).toMatchObject({ state: 'blocked', blocked_to: 'gm' });
+    expect(dispatch.held.after).toMatchObject({ state: 'blocked', blocked_to: 'owner' });
     expect(dispatch.race.state).toBe('blocked');
     expect(dispatch.race.blocked_to ?? null).toBeNull();
   });

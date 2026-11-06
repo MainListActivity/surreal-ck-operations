@@ -111,7 +111,7 @@ test("after the one-time grouping, membership is the owner's: manual edits stay,
 test("four explicit tiers and owner-approved role defaults never depend on task titles", () => {
   expect(taskTier({ model_tier: "haiku", executor_role: "engineering" })).toBe("haiku");
   expect(taskTier({ executor_role: "engineering",title:"发布高风险功能" })).toBe("haiku");
-  expect(employeeTier("gm")).toBe("opus");
+  expect(employeeTier("owner")).toBe("opus");
   expect(employeeTier("product")).toBe("sonnet");
   expect(employeeTier("qa")).toBe("haiku");
   expect(selectedTier("claude-fable-5-1")).toBe("fable");
@@ -606,14 +606,14 @@ test("roster simplification preserves story authors, role tracks and review seat
   const {planRoutingRoster}=await import('../src/model-routing/roster.ts');
   const defs=[{id:'qa-codex',role:'qa',provider:'codex',model:'native',enabled:true,tracks:['web']},
     {id:'qa-claude',role:'qa',provider:'claude',model:'old',enabled:true,tracks:['mobile']},
-    {id:'gm-old',role:'gm',provider:'grok',model:'native',enabled:true},
+    {id:'gm-old',role:'owner',provider:'grok',model:'native',enabled:true},
     {id:'story',role:'story-author',provider:'codex',model:'keep-me',enabled:true},
     {id:'product-claude',role:'product',provider:'claude',model:'old',enabled:true}];
   const changes=planRoutingRoster(defs);
   expect(changes.some(d=>d.role==='story-author')).toBe(false);
   expect(changes.find(d=>d.id==='qa-codex')?.enabled).toBe(false);
   expect(changes.find(d=>d.id==='qa-claude')).toMatchObject({model:'claude-haiku-5-5',thinking:'max',maxInstances:2,tracks:['web','mobile']});
-  expect(changes.find(d=>d.role==='gm' && d.enabled)).toMatchObject({provider:'claude',model:'claude-opus-5-5'});
+  expect(changes.some(d=>d.role==='owner' && d.enabled)).toBe(false); // owner is a control-plane principal, not an employee def
   expect(changes.find(d=>d.role==='product' && d.enabled)?.model).toBe('claude-sonnet-5-5');
   expect(changes.filter(d=>d.enabled).every(d=>!d.model.includes('fable'))).toBe(true);
 });

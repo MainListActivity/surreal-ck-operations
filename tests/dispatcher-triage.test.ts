@@ -25,7 +25,7 @@ function sharedTree(repo: string): WorktreeAssignment {
 /** Light fixture: gm defs + triage-pending goals, SidecarBridge records readWorkspace/spawn cwd. */
 function fixture(goals: Array<{ id: string; project?: string }>) {
   const def: EmployeeDef = {
-    id: 'gm-codex', role: 'gm', provider: 'codex', model: 'fixture',
+    id: 'gm-codex', role: 'owner', provider: 'codex', model: 'fixture',
     enabled: true, maxInstances: 4, priority: 0, weight: 1, scored: 0, errorStreak: 0,
   };
   const instances: EmployeeInst[] = [];

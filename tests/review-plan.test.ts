@@ -74,6 +74,6 @@ test('review_capacity is a manager decision that waiting never clears, and the c
     since: NOW - 60 * 60_000, checkedAt: NOW });
   expect(verdict).toMatchObject({ dispatchable: false, feasible: false, eligibleCount: 0 });
   expect(verdict.reasons).toHaveLength(1);
-  expect(verdict.reasons[0]).toMatchObject({ code: 'review_capacity', owner: 'gm', candidates: ['*', 'emp-impl'], basis: 'tick:review-capacity' });
-  expect(verdict.reasons[0]!.actions[0]).toMatchObject({ authority: 'gm', tool: 'def_ensure', executable: true });
+  expect(verdict.reasons[0]).toMatchObject({ code: 'review_capacity', owner: 'owner', candidates: ['*', 'emp-impl'], basis: 'tick:review-capacity' });
+  expect(verdict.reasons[0]!.actions[0]).toMatchObject({ authority: 'owner', tool: 'def_ensure', executable: true });
 });

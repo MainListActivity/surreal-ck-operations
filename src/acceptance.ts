@@ -267,7 +267,7 @@ export function acceptanceTargetAttempt(row: { state?: string; acceptance_attemp
 export function isLegacyAcceptance(subject: AcceptanceSubject, gate: AcceptanceGateView): boolean {
   if (!gate.enabled) return true;
   if (subject.acceptanceLegacy === true) return true;
-  // SYS-INT: an authorized mapping import (gm, digest + CAS + audit) is the one controlled way a pre-gate row
+  // SYS-INT: an authorized mapping import (owner, digest + CAS + audit) is the one controlled way a pre-gate row
   // picks up the gate. The createdAt cutoff below keeps enabling the gate from retroactively gating old rows;
   // an explicit import is not that accident, so the marker overrides it.
   if (subject.acceptanceMappingAt !== undefined) return false;
@@ -356,7 +356,7 @@ export function evaluateAcceptance(input: AcceptanceInput): AcceptanceVerdict {
     if (input.phase === 'deploy' && input.actor.role !== 'qa' && input.actor.owner !== true) {
       unmet.push({ acId: criterion.id, reason: 'qa-signoff-required' }); continue;
     }
-    if (input.phase === 'release' && !['product', 'gm'].includes(input.actor.role) && input.actor.owner !== true) {
+    if (input.phase === 'release' && input.actor.role !== 'product' && input.actor.owner !== true) {
       unmet.push({ acId: criterion.id, reason: 'release-signoff-role-mismatch' }); continue;
     }
   }

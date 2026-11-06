@@ -97,14 +97,14 @@ async function taskShape(database: CompanyDatabase, taskId: string): Promise<Cha
 /** The identical fixture in each namespace: ordinary dispatch states plus the manager gates SYS03 disposes of. */
 async function seedFixture(database: CompanyDatabase, scratch: string): Promise<{ core: SurrealCompanyCore; gm: string; wf: Workforce }> {
   const core = new SurrealCompanyCore(database);
-  const gm = await new LocalEnrollmentAdmin(database).enroll('rb01-sys03-gm', 'gm', ['execute', 'review', 'manage']);
+  const gm = await new LocalEnrollmentAdmin(database).enroll('rb01-sys03-gm', 'owner', ['execute', 'review', 'manage']);
   await database.db.upsert(id('company_meta', 'config')).content({
     eval_enabled: false, jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0,
   });
   const wf = new Workforce(database, join(scratch, 'unused-credential-files'));
   await wf.upsertDef('rb01-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 2 });
   await wf.upsertDef('rb01-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
-  await wf.upsertDef('rb01-gm', { role: 'gm', provider: 'codex', model: 'fixture', maxInstances: 1 });
+  await wf.upsertDef('rb01-gm', { role: 'owner', provider: 'codex', model: 'fixture', maxInstances: 1 });
   const make = (title: string, context: string) =>
     core.createTask(gm, { title, context, executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `rb01-sys03-${title}` });
   await make('rb01-ready', '就绪任务：旧版调度应认领，作为阳性对照。');
@@ -138,7 +138,7 @@ async function seedFixture(database: CompanyDatabase, scratch: string): Promise<
   // A manager gate with a persisted episode start, an implementer, and the durable manager todo the old release reads.
   for (const title of ['rb01-gm-episode', 'rb01-repair-source']) {
     const taskId = norm(at(title));
-    await database.db.query(`UPDATE ONLY $t SET state = "blocked", blocked_to = "gm", resume_state = "doing", current_employee = NONE,
+    await database.db.query(`UPDATE ONLY $t SET state = "blocked", blocked_to = "owner", resume_state = "doing", current_employee = NONE,
       lease_expires_at = NONE, dispatch_blocked_phase = "execute", dispatch_blocked_since = $since, version = version + 2;`,
       { t: at(title), since: now });
     await wf.openManagerAction({ taskId, phase: 'execute', episode: now * 1000, reason: 'implementer_unavailable',

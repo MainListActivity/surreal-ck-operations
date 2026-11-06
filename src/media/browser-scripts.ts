@@ -794,7 +794,7 @@ ${MODEL_PICKER}
       if (st.err !== 'no_picker') break;
       await p.waitForTimeout(2500);
     }
-    if (st.err === 'no_picker') { fail('model_unavailable', '找不到 Gemini 模型选择器，拒绝在未确认模型的情况下写作。禁止降级写作：稍后重试，持续不可用则 report_blocker(to=gm) 上报缺口'); }
+    if (st.err === 'no_picker') { fail('model_unavailable', '找不到 Gemini 模型选择器，拒绝在未确认模型的情况下写作。禁止降级写作：稍后重试，持续不可用则 report_blocker(to=owner) 上报缺口'); }
     if (st.already) { pickedModel = st.selected; }
     else {
       let opt = { err: 'no_menu' };
@@ -807,8 +807,8 @@ ${MODEL_PICKER}
         if (opt.err !== 'no_menu') break;
         await p.waitForTimeout(800);
       }
-      if (opt.err === 'no_match') { fail('model_unavailable', '模型 "' + want + '" 在选择器里不可用，当前可选：' + (opt.options || []).join('、') + '。多为配额耗尽自动降档，禁止用低档模型写作：稍后重试，持续不可用则 report_blocker(to=gm) 上报缺口'); }
-      if (opt.err === 'no_menu') { fail('model_unavailable', '模型选择器菜单未能打开，拒绝在未确认模型的情况下写作。禁止降级写作：稍后重试，持续不可用则 report_blocker(to=gm) 上报缺口'); }
+      if (opt.err === 'no_match') { fail('model_unavailable', '模型 "' + want + '" 在选择器里不可用，当前可选：' + (opt.options || []).join('、') + '。多为配额耗尽自动降档，禁止用低档模型写作：稍后重试，持续不可用则 report_blocker(to=owner) 上报缺口'); }
+      if (opt.err === 'no_menu') { fail('model_unavailable', '模型选择器菜单未能打开，拒绝在未确认模型的情况下写作。禁止降级写作：稍后重试，持续不可用则 report_blocker(to=owner) 上报缺口'); }
       await p.waitForTimeout(800);
       pickedModel = await p.evaluate(() => {
 ${MODEL_PICKER}
@@ -820,7 +820,7 @@ ${MODEL_PICKER}
         return modelPillMatches(want);
       }, { want });
       if (!okModel) {
-        fail('model_unavailable', '模型切换未生效：选择器显示 "' + pickedModel + '"，期望 "' + want + '"（或其可用别名，如 Gemini 4 → Argon）。多为配额耗尽自动降档，禁止用低档模型写作：稍后重试，持续不可用则 report_blocker(to=gm) 上报缺口');
+        fail('model_unavailable', '模型切换未生效：选择器显示 "' + pickedModel + '"，期望 "' + want + '"（或其可用别名，如 Gemini 4 → Argon）。多为配额耗尽自动降档，禁止用低档模型写作：稍后重试，持续不可用则 report_blocker(to=owner) 上报缺口');
       }
     }
   }

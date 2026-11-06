@@ -9,7 +9,7 @@ export interface RoutingDef {
 /** One Claude definition per role plus existing native Factory definitions. Story-author definitions and their subscriptions remain untouched. */
 export function planRoutingRoster(defs: RoutingDef[]): Array<RoutingDef> {
   const changes: RoutingDef[] = [];
-  for (const role of [...new Set([...defs.filter(d=>(d.enabled || d.provider===FACTORY_PROVIDER) && d.role!=='story-author').map(d=>d.role),'eval'])]) {
+  for (const role of [...new Set([...defs.filter(d=>(d.enabled || d.provider===FACTORY_PROVIDER) && d.role!=='story-author' && d.role!=='owner' && d.role!=='gm').map(d=>d.role),'eval'])]) {
     const roleDefs = defs.filter(d=>d.role===role);
     const selected = roleDefs.filter(d=>d.provider==='claude').sort((a,b)=>Number(b.enabled)-Number(a.enabled)||a.id.localeCompare(b.id))[0];
     const id = selected?.id ?? `${role}-claude`;

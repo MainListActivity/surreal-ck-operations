@@ -57,7 +57,8 @@ const dbQuery = (sql: string) => sql.includes('BEGIN TRANSACTION;')
     ? { read: { at: new Date().toISOString(), rows: [] } }
     : { read: { at: new Date().toISOString(), submits: [] } } }] }
   : Promise.resolve(queryRows(sql));
-mock.module('../plugin/server/company.ts', () => ({ company: async () => ({
+mock.module('../plugin/server/company.ts', () => ({
+  company: async () => ({
   opsRepo: '/ops', db: { db: { query: dbQuery } },
   owner: { briefData: async () => briefOverride ?? ({ stuck: [], waiting: [], resources: [], goals: [],
     last24h: { done: 0, returned: 0, rolledBack: 0, rejected: 0, retired: 0 }, churn: { created: 0, retired: 0, claimLost: 0 } }) },
@@ -70,7 +71,9 @@ mock.module('../plugin/server/company.ts', () => ({ company: async () => ({
     dispatchVerdicts: () => verdicts,
     dispatchSnapshot: () => snapshot,
   },
-}) }));
+  }),
+  notePaseo: () => {}, currentPaseo: () => undefined,
+}));
 const realDispatch = await import('../plugin/server/dispatch.ts');
 mock.module('../plugin/server/dispatch.ts', () => ({
   ...realDispatch,
@@ -212,7 +215,7 @@ test('roster RPC: dispatch-blocked rows are the tick verdicts, with the notice s
   try {
     const response = await callRoster();
     expect(response.dispatchBlocked).toEqual([expect.objectContaining({ taskId: task.id, phase: 'review', summary: verdict.summary, feasible: false })]);
-    expect(response.dispatchBlocked[0]!.reasons).toEqual([expect.objectContaining({ code: 'author_recusal', text: BLOCK_TEXT.author_recusal, owner: 'gm' })]);
+    expect(response.dispatchBlocked[0]!.reasons).toEqual([expect.objectContaining({ code: 'author_recusal', text: BLOCK_TEXT.author_recusal, owner: 'owner' })]);
     expect(response.dispatchBlocked[0]!.waitingMinutes).toBeGreaterThanOrEqual(5);
   } finally { verdicts = []; }
 });

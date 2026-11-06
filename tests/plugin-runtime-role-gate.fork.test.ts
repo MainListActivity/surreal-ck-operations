@@ -46,7 +46,7 @@ beforeAll(async () => {
   await database.db.query('REMOVE DATABASE IF EXISTS control_plane;');
   await database.bootstrap();
   for (const [name, role, caps] of [
-    ['gm', 'gm', ['execute', 'review', 'manage']],
+    ['owner', 'owner', ['execute', 'review', 'manage']],
     ['product', 'product', ['execute', 'review', 'manage']],
     ['qa', 'qa', ['review']],
     ['eng', 'engineering', ['execute', 'review']],
@@ -66,7 +66,7 @@ const failureOf = async (run: Promise<unknown>): Promise<CompanyError> => {
 };
 
 test('gm, product and qa may read the plugin runtime diagnostics, and the sampler runs', async () => {
-  for (const who of ['gm', 'product', 'qa']) {
+  for (const who of ['owner', 'product', 'qa']) {
     const calls: string[] = [];
     const view = await core.pluginRuntimeDiagnostics(tokens[who]!, sampler(calls));
     expect([who, view.context]).toEqual([who, 'plugin-host']);
@@ -77,7 +77,7 @@ test('gm, product and qa may read the plugin runtime diagnostics, and the sample
 
 test('the allowed roles are exactly gm, product and qa', async () => {
   // The set is the contract, not a side effect of who happened to be tested.
-  expect([...PLUGIN_RUNTIME_ROLES].sort()).toEqual(['gm', 'product', 'qa']);
+  expect([...PLUGIN_RUNTIME_ROLES].sort()).toEqual(['owner', 'product', 'qa']);
 });
 
 test('an unauthorized role is refused and NO diagnostic is produced', async () => {

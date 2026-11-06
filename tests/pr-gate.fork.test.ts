@@ -24,7 +24,7 @@ beforeAll(async () => {
   await db.connect(); await db.bootstrap();
   core = new SurrealCompanyCore(db, { submitCheck: async input => { asked.push(input); return input.text.includes('CONFLICT') ? { reason: 'PR 与主干有冲突：先解决冲突再提交。' } : undefined; } });
   const admin = new LocalEnrollmentAdmin(db);
-  gm = await admin.enroll('gate-gm', 'gm', ['execute', 'review', 'manage']);
+  gm = await admin.enroll('gate-gm', 'owner', ['execute', 'review', 'manage']);
   eng = await admin.enroll('gate-eng', 'engineering', ['execute', 'review']);
   qa = await admin.enroll('gate-qa', 'qa', ['execute', 'review']);
 });

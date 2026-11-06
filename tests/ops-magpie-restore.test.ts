@@ -655,8 +655,8 @@ describe('apply is closed', () => {
   });
 
   test('the broker refuses apply for every role with zero writes', async () => {
-    for (const role of ['qa', 'engineering', 'product', 'gm']) {
-      const r = rig({ roles: ['qa', 'engineering', 'product', 'gm'] });
+    for (const role of ['qa', 'engineering', 'product', 'owner']) {
+      const r = rig({ roles: ['qa', 'engineering', 'product', 'owner'] });
       const planned = await plan(r);
       const before = readFileSync(r.configPath, 'utf8');
       const backups = listBackups(r).length;

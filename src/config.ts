@@ -82,3 +82,6 @@ export function loadDatabaseConfig(): DatabaseConfig {
     database,
   };
 }
+
+/** Service home; the same resolution the plugin and sck use. */
+export const serviceHome = (): string => process.env.SCK_SERVICE_HOME || join(homedir(), 'Library/Application Support/SurrealCKCompany');

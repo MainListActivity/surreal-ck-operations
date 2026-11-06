@@ -198,7 +198,7 @@ export class ReviewEventStore {
     const id = reviewWatchId(pair.sourceTaskId, pair.collaborationTaskId);
     const query = `BEGIN;
       LET $who = SELECT * FROM ONLY $actor;
-      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'gm' { THROW 'review events invalid: only gm may register a review watch' };
+      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'review events invalid: only owner may register a review watch' };
       LET $s = SELECT * FROM ONLY $source;
       LET $c = SELECT * FROM ONLY $collab;
       IF $s = NONE { THROW 'review events invalid: source task not found' };
@@ -501,7 +501,7 @@ export class ReviewEventStore {
     const reason = assertNonSensitive(requireReason(input.reason), 'reason');
     const query = `BEGIN;
       LET $who = SELECT * FROM ONLY $actor;
-      IF $who = NONE OR $who.revoked = true OR $who.role != 'gm' OR 'manage' NOT IN $who.capabilities { THROW 'review events invalid: only gm may close a review watch' };
+      IF $who = NONE OR $who.revoked = true OR $who.role != 'owner' OR 'manage' NOT IN $who.capabilities { THROW 'review events invalid: only owner may close a review watch' };
       LET $w = SELECT * FROM ONLY $watch;
       IF $w = NONE { THROW 'review events invalid: watch not found' };
       IF $w.version != $expected { THROW 'review events moved: watch version changed' };

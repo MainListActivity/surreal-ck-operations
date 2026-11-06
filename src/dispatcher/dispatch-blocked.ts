@@ -51,8 +51,8 @@ export interface GlobalBlock {
   candidates?: readonly string[];
 }
 
-/** Who may take a recovery action: the manager (gm, with the manage capability) or the owner. */
-export type RecoveryAuthority = 'gm' | 'owner' | 'system';
+/** Who may take a recovery action: the manager (owner, with the manage capability) or the owner. */
+export type RecoveryAuthority = 'owner' | 'system';
 
 /**
  * One way out of a block. `tool` names the operations tool that performs it (sck call <tool>). `executable` is false when no
@@ -168,11 +168,11 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
   disk_space: '宿主机空闲磁盘不足',
   max_running: '全局在办会话已达上限，等待空位',
   implementer_mismatch: '任务已绑定实现负责人，其他人不能接手代码',
-  implementer_unresolved: '多名经手人且无实现负责人，需经理指定',
+  implementer_unresolved: '多名经手人且无实现负责人，需老板指定',
   implementer_unavailable: '原实现人无法在当前任务仓库接续，系统自动改派在岗工程员工',
-  implementer_quota: '实现人订阅额度持续不可用，需等待恢复或经理接手',
+  implementer_quota: '实现人订阅额度持续不可用，需等待恢复或老板接手',
   author_recusal: '本任务作者（写过或提交过）不能复核',
-  independence_conflict: '来源任务的经手人或经理指定回避的员工不能接手或复核，且暂无其它合格候选',
+  independence_conflict: '来源任务的经手人或老板指定回避的员工不能接手或复核，且暂无其它合格候选',
   no_candidate: '该岗位与仓库下没有任何编制或员工',
   session_busy: '会话占用中或异常',
   held: '持有在办任务',
@@ -194,44 +194,44 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
 
 const OWNER: Record<BlockCode, RecoveryAuthority> = {
   factory_wait: 'system',
-  paused: 'gm', budget: 'owner', resources: 'gm', memory_pressure: 'system', disk_space: 'gm', max_running: 'gm',
-  implementer_mismatch: 'gm', implementer_unresolved: 'gm', implementer_unavailable: 'system', implementer_quota: 'gm', author_recusal: 'gm', independence_conflict: 'gm', no_candidate: 'gm',  session_busy: 'gm', held: 'gm', assigned: 'gm', credential_file: 'gm', track_mismatch: 'gm', model_slot: 'gm',
-  quota: 'owner', provider_capacity: 'gm', seat_full: 'gm', def_disabled: 'gm', wake_failed: 'gm', unknown: 'gm',
-  review_capacity: 'gm',
-  write_scope: 'gm', probe_busy: 'gm', policy_blocked: 'gm',
+  paused: 'owner', budget: 'owner', resources: 'owner', memory_pressure: 'system', disk_space: 'owner', max_running: 'owner',
+  implementer_mismatch: 'owner', implementer_unresolved: 'owner', implementer_unavailable: 'system', implementer_quota: 'owner', author_recusal: 'owner', independence_conflict: 'owner', no_candidate: 'owner',  session_busy: 'owner', held: 'owner', assigned: 'owner', credential_file: 'owner', track_mismatch: 'owner', model_slot: 'owner',
+  quota: 'owner', provider_capacity: 'owner', seat_full: 'owner', def_disabled: 'owner', wake_failed: 'owner', unknown: 'owner',
+  review_capacity: 'owner',
+  write_scope: 'owner', probe_busy: 'owner', policy_blocked: 'owner',
 };
 
 const RECOVERY: Record<BlockCode, string> = {
   factory_wait: '等待 Factory 空闲后自动派工；额度耗尽后回退其他合格员工',
-  paused: '经理解除全局暂停',
+  paused: '老板解除全局暂停',
   budget: '老板充值，或等待额度恢复',
   resources: '检查宿主机内存和磁盘，等待对应水位恢复',
   memory_pressure: '降低进程与数据库缓存占用，等待内存压力恢复；无需清理磁盘',
   disk_space: '清理宿主机磁盘，等待空闲磁盘恢复',
-  max_running: '等待在办会话结束，或经理调高 max_running',
-  implementer_mismatch: '等待绑定的实现负责人可用，或经理用 implementer_takeover 显式接手',
-  implementer_unresolved: '经理用 implementer_takeover 记录实现负责人',
-  implementer_unavailable: '系统自动改派，无需经理；暂无候选时等候选人空闲后自动重试',
-  implementer_quota: '等待额度恢复，或经理用 implementer_takeover 接手',
-  author_recusal: '经理增补独立复核人选（编制扩容或新员工），不能由作者自验',
-  independence_conflict: '经理增补独立候选人选（编制扩容或新员工），来源经手人不能接手或复核',
-  no_candidate: '经理为该岗位或仓库增加编制或员工',
+  max_running: '等待在办会话结束，或老板调高 max_running',
+  implementer_mismatch: '等待绑定的实现负责人可用，或老板用 implementer_takeover 显式接手',
+  implementer_unresolved: '老板用 implementer_takeover 记录实现负责人',
+  implementer_unavailable: '系统自动改派，无需老板；暂无候选时等候选人空闲后自动重试',
+  implementer_quota: '等待额度恢复，或老板用 implementer_takeover 接手',
+  author_recusal: '老板增补独立复核人选（编制扩容或新员工），不能由作者自验',
+  independence_conflict: '老板增补独立候选人选（编制扩容或新员工），来源经手人不能接手或复核',
+  no_candidate: '老板为该岗位或仓库增加编制或员工',
   session_busy: '等待在办任务完成或租约到期',
   held: '等待在办任务完成或租约到期',
   assigned: '下一轮派工自动处理',
   credential_file: '等待该实例退役，新实例接任务',
-  track_mismatch: '经理调整编制轨或任务轨',
-  model_slot: '等待模型槽位刷新，或经理检查订阅',
+  track_mismatch: '老板调整编制轨或任务轨',
+  model_slot: '等待模型槽位刷新，或老板检查订阅',
   quota: '等待订阅额度或健康恢复；老板可充值',
   provider_capacity: '等待在办任务释放该订阅并发',
-  seat_full: '经理扩编（maxInstances）或等待席位释放',
-  def_disabled: '经理重新启用编制或更换编制',
+  seat_full: '老板扩编（maxInstances）或等待席位释放',
+  def_disabled: '老板重新启用编制或更换编制',
   wake_failed: '检查 Paseo 会话与插件日志，下一轮自动重试',
   unknown: '检查 Paseo 插件、运行时日志与审计读取，恢复后自动重判',
-  review_capacity: '经理为复核岗位增补编制或员工；不能由作者自验，也不能让实现人兼任本任务复核',
-  write_scope: '等待同线或重叠目录的在办写者结束，或经理拆线',
+  review_capacity: '老板为复核岗位增补编制或员工；不能由作者自验，也不能让实现人兼任本任务复核',
+  write_scope: '等待同线或重叠目录的在办写者结束，或老板拆线',
   probe_busy: '等待单次探测会话结束，探测结果决定恢复或再次冷却',
-  policy_blocked: '经理用 policy_plan 看差异，并按新契约重派或恢复授权',
+  policy_blocked: '老板用 policy_plan 看差异，并按新契约重派或恢复授权',
 };
 
 const NEXT: Record<BlockCode, string> = {
@@ -242,10 +242,10 @@ const NEXT: Record<BlockCode, string> = {
   memory_pressure: '宿主机内存压力恢复',
   disk_space: '宿主机空闲磁盘恢复',
   max_running: '在办会话数低于上限',
-  implementer_mismatch: '绑定实现负责人可派工，或经理接手',
-  implementer_unresolved: '经理记录实现负责人',
+  implementer_mismatch: '绑定实现负责人可派工，或老板接手',
+  implementer_unresolved: '老板记录实现负责人',
   implementer_unavailable: '出现可派候选，系统自动改派',
-  implementer_quota: '额度恢复或经理接手',
+  implementer_quota: '额度恢复或老板接手',
   author_recusal: '出现独立候选人选',
   independence_conflict: '出现独立于来源任务的合格候选人选',
   no_candidate: '新增编制或员工',
@@ -262,7 +262,7 @@ const NEXT: Record<BlockCode, string> = {
   wake_failed: '下一轮唤醒成功',
   unknown: '状态与审计读取恢复',
   review_capacity: '出现不同于实现人的合格复核人选，或复核岗位有合规空余席位',
-  write_scope: '同线或重叠目录的在办写者结束，或经理拆线',
+  write_scope: '同线或重叠目录的在办写者结束，或老板拆线',
   probe_busy: '探测会话结束',
   policy_blocked: '有效策略契约重新授权或任务被隔离/重派',
 };
@@ -284,38 +284,38 @@ const BASIS: Record<BlockCode, string> = {
 /** Recovery actions per code. Only the ones with a tool are executable; the rest name who must act outside the system. */
 const ACTIONS: Record<BlockCode, RecoveryAction[]> = {
   factory_wait: [{authority:'system',label:'等待 Factory 空闲后自动重试；队列之外的任务可分流',executable:false}],
-  paused: [{ authority: 'gm', label: '经理解除全局暂停', executable: false }],
+  paused: [{ authority: 'owner', label: '老板解除全局暂停', executable: false }],
   budget: [{ authority: 'owner', label: '老板充值，或等待额度恢复', executable: false }],
-  resources: [{ authority: 'gm', label: '检查宿主机内存和磁盘，等待对应水位恢复', executable: false }],
+  resources: [{ authority: 'owner', label: '检查宿主机内存和磁盘，等待对应水位恢复', executable: false }],
   memory_pressure: [{authority:'system',label:'降低内存占用，压力恢复后自动重试',executable:false}],
-  disk_space: [{authority:'gm',label:'清理磁盘，空闲磁盘恢复后自动重试',executable:false}],
-  max_running: [{ authority: 'gm', label: '等待在办会话结束，或经理调高 max_running', executable: false }],
-  implementer_mismatch: [{ authority: 'gm', label: '经理用 implementer_takeover 显式接手', tool: 'implementer_takeover', executable: true }],
-  implementer_unresolved: [{ authority: 'gm', label: '经理用 implementer_takeover 记录实现负责人', tool: 'implementer_takeover', executable: true }],
+  disk_space: [{authority:'owner',label:'清理磁盘，空闲磁盘恢复后自动重试',executable:false}],
+  max_running: [{ authority: 'owner', label: '等待在办会话结束，或老板调高 max_running', executable: false }],
+  implementer_mismatch: [{ authority: 'owner', label: '老板用 implementer_takeover 显式接手', tool: 'implementer_takeover', executable: true }],
+  implementer_unresolved: [{ authority: 'owner', label: '老板用 implementer_takeover 记录实现负责人', tool: 'implementer_takeover', executable: true }],
   implementer_unavailable: [
     { authority: 'system', label: '系统自动改派在岗工程员工', executable: false },
-    { authority: 'gm', label: '经理也可先核对贡献者再指定负责人（系统同步重试）', tool: 'implementer_takeover', executable: true },
+    { authority: 'owner', label: '老板也可先核对贡献者再指定负责人（系统同步重试）', tool: 'implementer_takeover', executable: true },
   ],
-  implementer_quota: [{ authority: 'gm', label: '经理用 implementer_takeover 接手，或等待额度恢复', tool: 'implementer_takeover', executable: true }],
-  author_recusal: [{ authority: 'gm', label: '经理用 def_ensure 增补独立复核编制，或新增员工', tool: 'def_ensure', executable: true }],
-  independence_conflict: [{ authority: 'gm', label: '经理用 def_ensure 增补独立编制，或新增员工（来源经手人不能接手）', tool: 'def_ensure', executable: true }],
-  no_candidate: [{ authority: 'gm', label: '经理用 def_ensure 为该岗位与仓库增加编制', tool: 'def_ensure', executable: true }],
-  session_busy: [{ authority: 'gm', label: '等待在办任务完成或租约到期', executable: false }],
-  held: [{ authority: 'gm', label: '等待在办任务完成或租约到期', executable: false }],
-  assigned: [{ authority: 'gm', label: '下一轮派工自动处理', executable: false }],
-  credential_file: [{ authority: 'gm', label: '等待该实例退役，新实例接任务', executable: false }],
-  track_mismatch: [{ authority: 'gm', label: '经理用 def_ensure 调整编制轨', tool: 'def_ensure', executable: true }],
-  model_slot: [{ authority: 'gm', label: '等待模型槽位刷新，或经理检查订阅', executable: false }],
+  implementer_quota: [{ authority: 'owner', label: '老板用 implementer_takeover 接手，或等待额度恢复', tool: 'implementer_takeover', executable: true }],
+  author_recusal: [{ authority: 'owner', label: '老板用 def_ensure 增补独立复核编制，或新增员工', tool: 'def_ensure', executable: true }],
+  independence_conflict: [{ authority: 'owner', label: '老板用 def_ensure 增补独立编制，或新增员工（来源经手人不能接手）', tool: 'def_ensure', executable: true }],
+  no_candidate: [{ authority: 'owner', label: '老板用 def_ensure 为该岗位与仓库增加编制', tool: 'def_ensure', executable: true }],
+  session_busy: [{ authority: 'owner', label: '等待在办任务完成或租约到期', executable: false }],
+  held: [{ authority: 'owner', label: '等待在办任务完成或租约到期', executable: false }],
+  assigned: [{ authority: 'owner', label: '下一轮派工自动处理', executable: false }],
+  credential_file: [{ authority: 'owner', label: '等待该实例退役，新实例接任务', executable: false }],
+  track_mismatch: [{ authority: 'owner', label: '老板用 def_ensure 调整编制轨', tool: 'def_ensure', executable: true }],
+  model_slot: [{ authority: 'owner', label: '等待模型槽位刷新，或老板检查订阅', executable: false }],
   quota: [{ authority: 'owner', label: '老板充值，或等待额度与健康恢复', executable: false }],
-  provider_capacity: [{ authority: 'gm', label: '等待在办任务释放该订阅并发', executable: false }],
-  seat_full: [{ authority: 'gm', label: '经理用 def_ensure 调高 maxInstances 扩编', tool: 'def_ensure', executable: true }],
-  def_disabled: [{ authority: 'gm', label: '经理用 def_ensure 重新启用编制', tool: 'def_ensure', executable: true }],
-  wake_failed: [{ authority: 'gm', label: '检查 Paseo 会话与插件日志，下一轮自动重试', executable: false }],
-  unknown: [{ authority: 'gm', label: '检查 Paseo 插件、运行时日志与审计读取，恢复后自动重判', executable: false }],
-  review_capacity: [{ authority: 'gm', label: '经理用 def_ensure 为复核岗位与仓库增加编制（不新增订阅）', tool: 'def_ensure', executable: true }],
-  write_scope: [{ authority: 'gm', label: '等待同线或重叠目录的在办写者结束，或经理拆线', executable: false }],
-  probe_busy: [{ authority: 'gm', label: '等待单次探测会话结束', executable: false }],
-  policy_blocked: [{ authority: 'gm', label: '经理用 policy_plan 看差异并按新契约重派或隔离受影响任务', tool: 'policy_plan', executable: true }],
+  provider_capacity: [{ authority: 'owner', label: '等待在办任务释放该订阅并发', executable: false }],
+  seat_full: [{ authority: 'owner', label: '老板用 def_ensure 调高 maxInstances 扩编', tool: 'def_ensure', executable: true }],
+  def_disabled: [{ authority: 'owner', label: '老板用 def_ensure 重新启用编制', tool: 'def_ensure', executable: true }],
+  wake_failed: [{ authority: 'owner', label: '检查 Paseo 会话与插件日志，下一轮自动重试', executable: false }],
+  unknown: [{ authority: 'owner', label: '检查 Paseo 插件、运行时日志与审计读取，恢复后自动重判', executable: false }],
+  review_capacity: [{ authority: 'owner', label: '老板用 def_ensure 为复核岗位与仓库增加编制（不新增订阅）', tool: 'def_ensure', executable: true }],
+  write_scope: [{ authority: 'owner', label: '等待同线或重叠目录的在办写者结束，或老板拆线', executable: false }],
+  probe_busy: [{ authority: 'owner', label: '等待单次探测会话结束', executable: false }],
+  policy_blocked: [{ authority: 'owner', label: '老板用 policy_plan 看差异并按新契约重派或隔离受影响任务', tool: 'policy_plan', executable: true }],
 };
 
 const PHASE_LABEL: Record<DispatchPhase, string> = { execute: '执行', review: '复核' };
@@ -468,7 +468,7 @@ export function dispatchNoticeText(verdict: DispatchVerdict): string {
   const reasons = verdict.reasons.map(reason =>
     `${reason.text}（${reason.candidates.filter(c => c !== '*').join('、') || '全局'}）`).join('；');
   const next = verdict.reasons.map(reason => reason.nextTrigger).filter((v, i, all) => all.indexOf(v) === i).join('；');
-  const recovery = verdict.reasons.map(reason => `${reason.owner === 'gm' ? 'gm' : reason.owner === 'system' ? '系统' : '老板'}：${reason.recovery}`).join('；');
+  const recovery = verdict.reasons.map(reason => `${reason.owner === 'system' ? '系统' : '老板'}：${reason.recovery}`).join('；');
   return `${verdict.summary}。自 ${verdict.since ?? verdict.checkedAt} 起等待。原因：${reasons}。下一触发：${next || '待定'}。处理：${recovery}。`;
 }
 
@@ -510,7 +510,7 @@ export interface GoalRootFacts {
   collectedAt?: string;
 }
 
-export type GoalWorkflowWaitKind = 'dependency' | 'manager' | 'owner' | 'active_lease' | 'unknown';
+export type GoalWorkflowWaitKind = 'dependency' | 'owner' | 'active_lease' | 'unknown';
 export type GoalWorkflowState = 'ready' | 'doing' | 'review' | 'blocked' | 'done' | 'void' | 'unknown';
 export interface GoalWorkflowWaitRoot {
   goalId?: string;
@@ -610,7 +610,7 @@ function waitingBehind(root: string, facts?: GoalRootFacts): { count: number; pa
 
 const KNOWN_WORKFLOW_STATES = new Set(['ready', 'doing', 'review', 'blocked', 'done', 'void']);
 const TERMINAL_STATES = new Set(['done', 'void']);
-const rootWaitRank: Record<GoalWorkflowWaitKind, number> = { manager: 0, owner: 1, active_lease: 2, dependency: 3, unknown: 4 };
+const rootWaitRank: Record<GoalWorkflowWaitKind, number> = { owner: 0, active_lease: 1, dependency: 2, unknown: 3 };
 
 /**
  * Derives normal workflow waits from one goal graph. Dependency edges are followed only inside `facts.tasks`; absent targets,
@@ -662,7 +662,6 @@ export function goalWorkflowWaitRoots(facts: GoalRootFacts, limit = 20): GoalWor
     if (!KNOWN_WORKFLOW_STATES.has(task.state)) return [unknown(taskId, '工作流状态未知')];
     if (cycles.has(taskId)) return [unknown(cycleRoot.get(taskId) ?? taskId, '依赖关系存在循环')];
     if (task.state === 'blocked') {
-      if (task.blockedTo === 'gm') return [{ id: taskId, kind: 'manager' }];
       if (task.blockedTo === 'owner') return [{ id: taskId, kind: 'owner' }];
       if (task.blockedTo !== undefined && task.blockedTo !== '') return [unknown(taskId, '阻塞处理岗位未知')];
       if ((task.hiddenDependencies ?? 0) > 0) return [unknown(taskId, '存在当前目标不可见范围的依赖')];
@@ -714,18 +713,17 @@ export function goalWorkflowWaitRoots(facts: GoalRootFacts, limit = 20): GoalWor
       title: task?.title ?? candidate.id,
       workflowState: task && KNOWN_WORKFLOW_STATES.has(task.state) ? task.state as GoalWorkflowState : 'unknown',
       kind: candidate.kind,
-      basis: candidate.kind === 'manager' ? 'task.blocked_to=gm' : candidate.kind === 'owner' ? 'task.blocked_to=owner or reviewer_role=owner'
+      basis: candidate.kind === 'owner' ? 'task.blocked_to=owner or reviewer_role=owner'
         : candidate.kind === 'active_lease' ? 'task.current_employee + task.lease_expires_at'
           : candidate.kind === 'dependency' ? 'task.dependencies' : 'workflow-graph',
-      waitingForRole: candidate.kind === 'manager' ? 'gm' : candidate.kind === 'owner' ? 'owner'
+      waitingForRole: candidate.kind === 'owner' ? 'owner'
         : candidate.kind === 'unknown' ? 'unknown'
           : (task?.state === 'review' || (task?.state === 'blocked' && task.resumeState === 'review')
             ? task.reviewerRole ?? 'unknown' : task?.executorRole ?? 'unknown'),
-      nextTrigger: candidate.kind === 'manager' ? '经理解除阻塞后恢复'
-        : candidate.kind === 'owner' ? '老板处理关口后恢复'
-          : candidate.kind === 'active_lease' ? '持有人完成当前任务或租约到期后重新判定'
-            : candidate.kind === 'dependency' ? '依赖任务完成、撤销或恢复后重新判定'
-              : '工作流依赖图恢复一致后重新判定',
+      nextTrigger: candidate.kind === 'owner' ? '老板处理关口后恢复'
+        : candidate.kind === 'active_lease' ? '持有人完成当前任务或租约到期后重新判定'
+          : candidate.kind === 'dependency' ? '依赖任务完成、撤销或恢复后重新判定'
+            : '工作流依赖图恢复一致后重新判定',
       goalRootCount: 0,
       ...(candidate.reason ? { unknownReason: candidate.reason } : {}),
     };

@@ -1,8 +1,8 @@
-// SYS03：经理处置的原子认领、业务幂等与变更通知（blocking episode 的处置账本）。
+// SYS03：老板处置的原子认领、业务幂等与变更通知（blocking episode 的处置账本）。
 //
 // 设计要点（对应 AC01-AC04）：
 //   * 每个 blocking episode（任务 + 阶段 + 阶段开始毫秒）最多一条 disposition_claim，id 由 episode 导出，
-//     领取是一次 CAS：并发两个经理只有一个成功，另一个拿到 held_by_other / already_handled 与可读的结果；
+//     领取是一次 CAS：并发两个老板只有一个成功，另一个拿到 held_by_other / already_handled 与可读的结果；
 //     租约失效只能经显式 takeover 按 episode_version 受控接手（AC01）。
 //   * 决定写入（resume / defer / dependency / retire / repair）先按业务幂等键占位（与员工身份无关），
 //     再走既有 core 状态机落库，最后 CAS 回执；幂等键唯一索引让 20 个并发请求只产生一项处置与一条修复链，
@@ -23,7 +23,7 @@ const HASH = (value: string) => createHash('sha256').update(value).digest('hex')
 const id = (table: string, value: string) => new RecordId(table, value);
 const asId = (value: unknown): string => value instanceof RecordId ? String(value.id) : String(value).split(':').slice(1).join(':');
 
-/** 处置的默认租约：足够一个经理读完 episode 并写入决定，超时可被受控接手。 */
+/** 处置的默认租约：足够一个老板读完 episode 并写入决定，超时可被受控接手。 */
 export const DEFAULT_DISPOSITION_LEASE_SECONDS = 900;
 /** 一个决定最多带来的通知条数（决定本身 + 撤租 + 接手）。 */
 const MAX_NOTICES_PER_DECISION = 3;
@@ -33,7 +33,7 @@ export type DispositionActionName = 'resume' | 'defer' | 'dependency' | 'retire'
 export type DispositionClaimStatus = 'claimed' | 'decided';
 export type DispositionNoticeKind = 'disposition_decided' | 'dependency_wait' | 'resumed' | 'claim_revoked'
   | 'claim_taken_over' | 'external_action' | 'external_action_unknown'
-  // SYS-INT：经理对在途任务追加验收要求修订后的持有人通知（正文与审计在 core.taskAcceptanceAmend 写）。
+  // SYS-INT：老板对在途任务追加验收要求修订后的持有人通知（正文与审计在 core.taskAcceptanceAmend 写）。
   | 'acceptance_amended';
 
 /**
@@ -56,7 +56,7 @@ export const dispositionNoticeKey = (episode: string, kind: DispositionNoticeKin
 
 /**
  * holder_notice 的记录 id 由 notice_key 导出：投递回执（markNotices）只拿到 noticeKey，所以任何写通知的
- * 路径（处置账本、经理验收修订）都必须用同一个派生，否则通知写进去却 ack 不到。
+ * 路径（处置账本、老板验收修订）都必须用同一个派生，否则通知写进去却 ack 不到。
  */
 export const holderNoticeId = (noticeKey: string): RecordId => id('holder_notice', HASH(noticeKey).slice(0, 24));
 
@@ -156,7 +156,7 @@ export interface DispositionStatusInput {
 
 export interface DispositionStatusView {
   taskId: string;
-  /** 该任务有处置记录的最新 episode 快照；没有则为 undefined（提醒尚未被任何经理领取）。 */
+  /** 该任务有处置记录的最新 episode 快照；没有则为 undefined（提醒尚未被任何老板领取）。 */
   claim?: DispositionClaimView;
   /** 最新 episode 的处置历史（按 episode_since 倒序）。 */
   episodes: DispositionClaimView[];
@@ -202,7 +202,7 @@ export interface ExternalActionTarget { provider: 'github'; repo: string; runId:
 /**
  * QA D5：这条受控外部动作实际拿什么把 run 绑到前置任务上。`repo+branch` = 前置任务登记的仓库（GitHub slug 或能
  * 解析成 slug 的 remote）与 run 的仓库相同，并且分支名也相同；`branch_only` = 任务没有可比的仓库标识，只核对了
- * 分支名；`manager_exempt` = 调用者是经理（gm/product），按设计不做 run↔任务绑定核对。依据照实记进审计证据，
+ * 分支名；`manager_exempt` = 调用者是老板（owner/product），按设计不做 run↔任务绑定核对。依据照实记进审计证据，
  * 绝不把只核对了分支（或根本没核对）说成核对了仓库。
  */
 export type ExternalActionBinding = 'repo+branch' | 'branch_only' | 'manager_exempt';
@@ -287,7 +287,7 @@ function requireAction(value: unknown): DispositionActionName {
   return value as DispositionActionName;
 }
 
-/** 经理处置账本。core（工具入口）与 workforce（调度器只读守卫 / 通知投递）各持一个实例，共用同一数据库。 */
+/** 老板处置账本。core（工具入口）与 workforce（调度器只读守卫 / 通知投递）各持一个实例，共用同一数据库。 */
 export class DispositionLedger {
   constructor(private readonly database: CompanyDatabase) {}
   private get db() { return this.database.db; }
@@ -351,7 +351,7 @@ export class DispositionLedger {
     const leaseSeconds = input.leaseSeconds ?? DEFAULT_DISPOSITION_LEASE_SECONDS;
     if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 30 || leaseSeconds > 86_400) throw new CompanyError('invalid', 'Invalid leaseSeconds');
     if (input.takeover === true && !Number.isSafeInteger(input.expectedEpisodeVersion)) {
-      // 接手是破坏性操作（把另一个经理的租约换掉）：必须明示读到的 episode 版本，否则一律拒绝。
+      // 接手是破坏性操作（把另一个老板的租约换掉）：必须明示读到的 episode 版本，否则一律拒绝。
       throw new CompanyError('invalid', 'takeover requires expectedEpisodeVersion');
     }
     const episode = dispositionEpisodeKey(input.taskId, phase, input.sinceMs);
@@ -434,7 +434,7 @@ export class DispositionLedger {
         now: await this.now(), seen: input.expectedEpisodeVersion,
         // 通知的收件人用 undefined（绑定成 NONE）而不是 null：`holder` 字段是 TYPE string，NULL 会被拒。
         notice_holder: holder, notice_id: this.noticeId(takeoverNoticeKey), notice_key: takeoverNoticeKey,
-        notice_text: `经理处置租约已被 ${actor.employeeId} 受控接手（原因：${input.reason}）`,
+        notice_text: `老板处置租约已被 ${actor.employeeId} 受控接手（原因：${input.reason}）`,
         notice_payload: { takenOverBy: actor.employeeId, episodeVersion: takenOverVersion + 1 } });
       if (taken) {
         return { outcome: 'taken_over', claim: this.claimView(taken, actor.employeeId, true), previousHolder: holder };
@@ -828,7 +828,7 @@ export class DispositionLedger {
     requireText(input.taskId, 'taskId', 1, 200);
     const [rows] = await this.db.query<[Row[]]>(
       'SELECT * FROM disposition_claim WHERE task = $task ORDER BY episode_since DESC LIMIT 50;', { task: id('task', input.taskId) });
-    const own = actor.role === 'gm';
+    const own = actor.role === 'owner';
     const episodes = (rows ?? [])
       .filter(row => input.phase === undefined || text(row.phase) === input.phase)
       .filter(row => input.sinceMs === undefined || num(row.episode_since) === input.sinceMs)
@@ -847,7 +847,7 @@ export class DispositionLedger {
     };
   }
 
-  /** 调度器守卫：这个 episode 还该不该拉起新经理会话。只读。 */
+  /** 调度器守卫：这个 episode 还该不该拉起新老板会话。只读。 */
   private claimView(row: Row, viewer: string, includeToken: boolean): DispositionClaimView {
     const holder = text(row.holder) || undefined;
     return {
@@ -1024,7 +1024,7 @@ export class DispositionLedger {
       if (text(existing.state) === 'confirmed') return this.externalViewOf(existing);
       if (text(existing.state) === 'refused') return this.externalViewOf(existing);
     }
-    // 授权关口与任务本身同源（不扩大 GM 权限）：由注入的 authorize 判定调用者是否是该前置任务的当事人，
+    // 授权关口与任务本身同源（不扩大 老板 权限）：由注入的 authorize 判定调用者是否是该前置任务的当事人，
     // 并且把目标 run 交给它去核对绑定关系（run 必须属于这个前置任务的登记分支与仓库）。target 与是否已有记录
     // 都要在判定之前算好：重放时网关需要知道「这次不是第一次请求」才能把终态读回判成 confirmed 而不是 refused。
     const binding = await authorize(input.prerequisiteTaskId === undefined ? undefined : { taskId: input.prerequisiteTaskId, version: prerequisiteVersion! },
@@ -1180,7 +1180,7 @@ export class DispositionLedger {
     return { checked: input.runs.length, unknownActor, confirmed, unreadable };
   }
 
-  /** 事后归因：只把经理提供的证据挂上去，并为带外行写入真实的内部员工 ID。 */
+  /** 事后归因：只把老板提供的证据挂上去，并为带外行写入真实的内部员工 ID。 */
   async attributeExternalAction(actor: { employeeId: string }, input: { actionKey: string; employeeId: string; evidence: string }): Promise<ExternalActionView> {
     requireText(input.actionKey, 'actionKey', 8, 200);
     requireText(input.employeeId, 'employeeId', 1, 200);
@@ -1191,7 +1191,7 @@ export class DispositionLedger {
       LET $current = SELECT * FROM ONLY $d;
       IF $current = NONE { THROW 'external action not found' };
       -- QA D7：事后归因只针对**带外**记录（unknown_actor）。内部请求的 requested_by 是我们自己那次发起留下的
-      -- 真实员工，让别人（哪怕 gm）改写它等于重写「谁要求取消了这条 run」——那是审计事实，不是可以改判的字段。
+      -- 真实员工，让别人（哪怕 owner）改写它等于重写「谁要求取消了这条 run」——那是审计事实，不是可以改判的字段。
       IF $current.attribution != 'unknown_actor' { THROW 'external action already attributed' };
       LET $updated = UPDATE ONLY $d SET attribution = 'internal_employee', requested_by = $employee,
         attribution_evidence = $evidence, updated_at = time::now() RETURN AFTER;

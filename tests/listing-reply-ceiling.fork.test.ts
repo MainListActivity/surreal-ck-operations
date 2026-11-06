@@ -25,7 +25,7 @@ beforeAll(async () => {
   await database.db.query('REMOVE DATABASE IF EXISTS control_plane;');
   await database.bootstrap();
   const enrollment = new LocalEnrollmentAdmin(database);
-  gm = await enrollment.enroll(`rc-gm-${suffix}`, 'gm', ['execute', 'review', 'manage']);
+  gm = await enrollment.enroll(`rc-gm-${suffix}`, 'owner', ['execute', 'review', 'manage']);
   reader = await enrollment.enroll(`rc-reader-${suffix}`, 'engineering', ['execute', 'review']);
   await core.createTask(gm, {
     title: 'reply ceiling fixture', context: 'Synthetic fixture for the reply ceiling test',

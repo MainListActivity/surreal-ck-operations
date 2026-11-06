@@ -189,7 +189,7 @@ export function deriveContributors(events: readonly ContributionEvent[], explici
   const sortedAuthors = [...authors].sort();
   const explicit = explicitImplementer || undefined;
   // The implementer is the recorded one, else the single author. A prior hand is never inferred as the implementer: only
-  // recorded authorship (a submit) or an explicit gm takeover binds a task to one engineer.
+  // recorded authorship (a submit) or an explicit owner takeover binds a task to one engineer.
   const implementer = explicit ?? (sortedAuthors.length === 1 ? sortedAuthors[0] : undefined);
   const excluded = [...new Set([...sortedAuthors, ...(explicit ? [explicit] : [])])].sort();
   const handsOnly = [...executeHands].filter(actor => !excluded.includes(actor)).sort();

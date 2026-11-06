@@ -104,7 +104,7 @@ const approvalFor = (c: { configurationDigest: string; pricing: { priceRevision:
 const evidence = (what: string) => ({ text: `${what} — long enough to satisfy the evidence validation`, idempotencyKey: randomUUID() });
 /** Puts a fixture task into the blocked-to-gm state a manager resumes, with the approval task as its dependency. */
 async function blockedDependingOn(taskId: string, approvalTask: string, dependent = true) {
-  await database.db.query("UPDATE $task SET state='blocked', blocked_to='gm', resume_state='doing', dependencies=[$dep];", { task: new RecordId('task', taskId), dep: new RecordId('task', approvalTask) });
+  await database.db.query("UPDATE $task SET state='blocked', blocked_to='owner', resume_state='doing', dependencies=[$dep];", { task: new RecordId('task', taskId), dep: new RecordId('task', approvalTask) });
   if (!dependent) await database.db.query("UPDATE $task SET dependencies=[];", { task: new RecordId('task', taskId) });
 }
 /** The binding checks mark the approval task done; each check starts by putting it back so ops calls stay allowed. */
@@ -121,7 +121,7 @@ beforeAll(async () => {
   const port = await new Promise<number>(resolve => { const s = createServer(); s.listen(0, '127.0.0.1', () => { const a = s.address() as { port: number }; s.close(() => resolve(a.port)); }); });
   url = 'ws://127.0.0.1:' + port; await start(); await connect();
   const enroll = new LocalEnrollmentAdmin(database);
-  gm = await enroll.enroll('test-gm', 'gm', ['execute', 'review', 'manage']);
+  gm = await enroll.enroll('test-gm', 'owner', ['execute', 'review', 'manage']);
   author = await enroll.enroll('test-author', 'engineering', ['execute', 'review']);
   approver = 'test-approver';
   await enroll.enroll(approver, 'qa', ['execute', 'review']);

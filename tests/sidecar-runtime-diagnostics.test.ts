@@ -7,6 +7,12 @@ import { commDir, reqDir, resDir, readJsonFile } from '../src/comm.ts';
 import type { ActiveLease, ClaimResult, LeaseProof, TaskView } from '../src/contracts.ts';
 import type { EmployeeInst, SupervisedTask } from '../src/workforce.ts';
 
+/** Restore an optional env var without writing the literal string "undefined" (Node turns undefined into that). */
+const restoreServiceHome = (prev: string | undefined): void => {
+  if (prev === undefined) delete process.env.SCK_SERVICE_HOME;
+  else process.env.SCK_SERVICE_HOME = prev;
+};
+
 // SYS04: the plugin runtime diagnostic rides the employee's own `sck call` channel. These cases pin what the
 // acceptance asks for — the answer comes from the plugin execution context, an unauthorized request is
 // refused, and no sensitive content rides along.
@@ -24,7 +30,7 @@ const claimResult = (taskId: string): ClaimResult => ({
  * diagnostics) and — the part this file is about — it refuses BEFORE calling the sampler, exactly as the real
  * core does, so an unauthorized read produces no diagnostic at all.
  */
-let actorRole = 'gm';
+let actorRole = 'owner';
 let samplerCalls = 0;
 /**
  * The plugin host's real collector, replaced by a counting stand-in.
@@ -65,7 +71,7 @@ const core = {
   worktreeList: async () => [], worktreePage: async () => ({ worktrees: [], page: {} }),
   contextView: async () => ({ principal: { employeeId: 'eng-x' }, tasks: [] }),
   pluginRuntimeDiagnostics: async (_credential: string, sample: () => unknown) => {
-    if (!['gm', 'product', 'qa'].includes(actorRole)) {
+    if (!['owner', 'product', 'qa'].includes(actorRole)) {
       // Shaped like the real CompanyError: the code is separate from the message, and the relay prefixes it.
       throw Object.assign(new Error('Only gm, product or qa may read the plugin runtime diagnostics'), { code: 'forbidden' });
     }
@@ -96,7 +102,7 @@ let pluginSourceDir: string | null;
 let pluginSourceCalls = 0;
 let pluginSourceThrows = false;
 beforeEach(() => {
-  actorRole = 'gm';
+  actorRole = 'owner';
   samplerCalls = 0;
   collectorCalls = 0;
   pluginSourceDir = '/test/registered/plugin';
@@ -191,7 +197,7 @@ describe('plugin_runtime_diagnostics through the employee channel', () => {
       expect(text).not.toContain('SCK_EMPLOYEE_CREDENTIAL');
       // The boundary is declared in the answer itself, so a reader can check it without the source.
       expect(text).toContain('process environment values');
-    } finally { process.env.SCK_SERVICE_HOME = prev; }
+    } finally { restoreServiceHome(prev); }
   });
 
   test('the reported release binding is the loaded code, not the active symlink', async () => {
@@ -212,7 +218,7 @@ describe('plugin_runtime_diagnostics through the employee channel', () => {
       // The binding names the release the plugin's own code resolves into, never the symlink's target.
       expect(binding.path).not.toBe(elsewhere);
       expect(String(JSON.stringify(answer.data))).not.toContain(elsewhere);
-    } finally { process.env.SCK_SERVICE_HOME = prev; }
+    } finally { restoreServiceHome(prev); }
   });
 
   test('an unauthorized role is refused through the channel and no diagnostic is produced', async () => {
@@ -237,7 +243,7 @@ describe('plugin_runtime_diagnostics through the employee channel', () => {
   });
 
   test('gm, product and qa are answered with the plugin execution context', async () => {
-    for (const role of ['gm', 'product', 'qa']) {
+    for (const role of ['owner', 'product', 'qa']) {
       actorRole = role;
       const before = samplerCalls;
       const beforeCollector = collectorCalls;

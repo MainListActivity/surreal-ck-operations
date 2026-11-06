@@ -42,7 +42,7 @@ beforeAll(async () => {
   await database.db.query('REMOVE DATABASE IF EXISTS control_plane;');
   await database.bootstrap();
   for (const [name, role, caps] of [
-    ['gm', 'gm', ['execute', 'review', 'manage']],
+    ['owner', 'owner', ['execute', 'review', 'manage']],
     ['src', 'engineering', ['execute', 'review']], ['indep', 'engineering', ['execute', 'review']],
     ['alias', 'engineering', ['execute', 'review']], ['explicit', 'engineering', ['execute', 'review']],
     ['exec', 'engineering', ['execute', 'review']],

@@ -7,7 +7,7 @@ export type DisciplineContract = Map<string, readonly string[] | undefined>;
 /**
  * Role/track contract of a project: a track that lists `roles` may only be carried by those roles,
  * and a role listed by any track is a line role that must always say which track it works on.
- * Roles listed nowhere (gm, product, qa…) stay free to create untracked coordination tasks.
+ * Roles listed nowhere (owner, product, qa…) stay free to create untracked coordination tasks.
  */
 export function assertRoleContract(contract: DisciplineContract | undefined, role: string, discipline?: string): void {
   if (!contract) return;

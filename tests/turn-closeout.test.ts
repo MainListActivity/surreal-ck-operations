@@ -120,10 +120,26 @@ test('a report written after the lease ended is preserved with its task and list
 
 for (const phase of ['doing', 'review'] as const) test(`silent nudge names the ${phase} closeout tool`, async () => {
   const sent: string[] = [];
-  const ctx = { workforce: {}, sidecar: { settle: async () => ({ status: 'silent', silent: { instId: 'i', taskId: 't', nudges: 1, phase } }) } };
+  const msgBody = `task.md ${phase} sck call ${phase === 'review' ? 'review' : 'submit'}`;
+  const store = {
+    ensureDraft: async (_task: string, step: string) => ({ id: 'm', hold: false, step, body: msgBody }),
+    prepareSend: async (_task: string, _step: string) => ({ message: { id: 'm', body: msgBody }, body: msgBody }),
+    markSent: async () => {},
+  };
+  const ctx = {
+    sckBin: '/bin/sck',
+    workforce: { insts: async () => [] },
+    sidecar: {
+      roleFor: () => 'engineering',
+      commDirFor: () => '/tmp',
+      settle: async () => ({ status: 'silent', silent: { instId: 'i', taskId: 't', nudges: 1, phase } }),
+      releaseClaim: async () => {},
+    },
+    messages: store,
+  };
   const paseo = { agents: { ref: () => ({ send: async (text: string) => { sent.push(text); } }) } };
   await settleCompanyTurn(ctx as never, paseo as never, { agent: { id: 'a' }, outcome: { kind: 'completed' }, timeline: [] } as never);
   expect(sent).toHaveLength(1);
-  expect(sent[0]).toContain(`sck call ${phase === 'review' ? 'review' : 'submit'}`);
+  expect(sent[0]).toContain(`call ${phase === 'review' ? 'review' : 'submit'}`);
   if (phase === 'review') expect(sent[0]).not.toContain('call submit');
 });

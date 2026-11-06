@@ -1,6 +1,6 @@
 # 员工执行协议 v3.2
 
-公司任务服务是唯一事实来源。调度器（Paseo 插件内的后台进程）从 SurrealDB 读队列，按角色、岗位轨、项目、额度、容量、租约与独立验收规则筛选候选。合格候选中优先使用 Factory 原生 agent。Factory 额度与健康可用且岗位编制启用时，最多保留 3 个待派工作项等 Factory；席位或并发满时这 3 项继续等待，第 4 项起允许分流其他合格员工。Factory 额度不可用或该岗位无启用编制时正常回落 Claude；派工选人不调用 Jev。编制保留 Claude、Factory 与故事作者特例。Claude 员工默认档位为产品 Sonnet、经理 Opus、其余 Haiku，Magpie 负责组内选模与回退；Fable 仅供老板手动使用。Factory 保留原生客户端与模型配置，思考等级显式设置为 max，故事作者保留既有编制，通过 Paseo 叫醒。
+公司任务服务是唯一事实来源。调度器（Paseo 插件内的后台进程）从 SurrealDB 读队列，按角色、岗位轨、项目、额度、容量、租约与独立验收规则筛选候选。合格候选中优先使用 Factory 原生 agent。Factory 额度与健康可用且岗位编制启用时，最多保留 3 个待派工作项等 Factory；席位或并发满时这 3 项继续等待，第 4 项起允许分流其他合格员工。Factory 额度不可用或该岗位无启用编制时正常回落 Claude；派工选人不调用 Jev。编制保留 Claude、Factory 与故事作者特例。Claude 员工默认档位为产品 Sonnet、其余 Haiku，Magpie 负责组内选模与回退；Fable 仅供老板手动使用。Factory 保留原生客户端与模型配置，思考等级显式设置为 max，故事作者保留既有编制，通过 Paseo 叫醒。
 
 你的身份绑定在 Paseo 会话上：插件为你的员工实例登记并代持凭证，任务的领取、续租、提交由插件里的会话通道（sidecar）程序化完成——你没有也不需要任何凭证文件。调用公司任务服务：
 
@@ -21,8 +21,8 @@
    - 证据附件（截图、导出报告、验收手册等文件）写到 `claim.json` 的 `evidenceDir` 目录——这是按任务共享的服务数据目录，不在任何 git 仓库里；禁止往运营仓库写交付物或证据文件。
    - 执行完成 → 把交付说明写入 `$SCK_COMM_DIR/report.md`：成果位置、逐项验收条件对应的证据、实际验证命令与结果、未验证项与限制。文件落盘即视为提交评审（也可以 `sck call submit '{"text":"...","idempotencyKey":"..."}'`，两者等价）。
    - 验收 → `review {"decision": "accept" 或 "return", "text": "...", "idempotencyKey": "..."}`：独立复核，写逐项检查结果；退回写复现方式和期望结果。
-   - 自己定不了（依赖、范围、跨岗位、运营不确定能否上线） → 写 `$SCK_COMM_DIR/blocker.md`，或 `report_blocker {"to": "gm", "text": "...", "idempotencyKey": "..."}`。
-   - 订阅额度用尽或限流：同样用 `report_blocker`，并加 `"quotaResetsAt": "<平台给出的恢复时间，ISO 8601 带时区偏移>"`。到点前该订阅不再派工，经理在恢复后收到一次通知。改用 `blocker.md` 时把同一行**写在文件首行**（`quotaResetsAt: <恢复时间>`，正文从第二段开始）：两种入口等价，首行之后的同名字样只算正文；首行声明了却给不出合法时间（没带时区偏移、已过去、超过 14 天），那次阻塞会被拒收而不是静默丢字段——先改成正确格式再收尾（细则见 `docs/sidecar-channel.md`）。
+   - 自己定不了（依赖、范围、跨岗位、运营不确定能否上线） → 写 `$SCK_COMM_DIR/blocker.md`，或 `report_blocker {"to": "owner", "text": "...", "idempotencyKey": "..."}`。
+   - 订阅额度用尽或限流：同样用 `report_blocker`，并加 `"quotaResetsAt": "<平台给出的恢复时间，ISO 8601 带时区偏移>"`。到点前该订阅不再派工，老板在恢复后收到一次通知。改用 `blocker.md` 时把同一行**写在文件首行**（`quotaResetsAt: <恢复时间>`，正文从第二段开始）：两种入口等价，首行之后的同名字样只算正文；首行声明了却给不出合法时间（没带时区偏移、已过去、超过 14 天），那次阻塞会被拒收而不是静默丢字段——先改成正确格式再收尾（细则见 `docs/sidecar-channel.md`）。
    - 系统阻塞用 `report_blocker` 增加结构化 `recoveryReason`：窗口失效用 `stale_window`、缺前置用 `missing_prerequisite`、基础设施故障用 `infrastructure`；`blocker.md` 可独立一行写 `recoveryReason: missing_prerequisite`。它只决定恢复去向，不清零故障预算，不授权重试或放宽门禁。
    - 只有下面「老板专属事项」才 `report_blocker to=owner`：写清要老板决定什么、可选项与推荐、你已经查过哪些来源、决定后从哪里继续。
    - 附件呈现：任务 `evidenceDir` 下的图片/视频/音频/HTML 等媒体附件会自动呈现在老板收件箱的对应卡片上，局域网内点开即可看图/播视频/走 HTML；进老板审核的交付，证据里预览链接一律用 `sck call deliverable_publish '{"files":["/abs/a.png","/abs/dir"]}'` 返回的 `http://<lanIP>:<port>/d/<任务ID>/…` URL——本地路径与 file:// 不算交付。
@@ -32,23 +32,23 @@
 
 - 证据真实：读代码、本地测试、线上验证、客户确认分开表述；没有验证的写「未验证」。
 - 验收独立：服务端拒绝你验收自己提交的成果；换会话、换订阅也一样。
-- 老板决定只来自老板：关口（`reviewerRole=owner` 的任务）只能由老板批准或驳回。经理只在老板直接对话里明确表态时，用 `record_owner_decision` 转录，并逐字引用老板原话。
+- 老板决定只来自老板：关口（`reviewerRole=owner` 的任务）只能由老板批准或驳回。员工不自称收到老板回执，也不要把猜测说成老板决定。
 - 缺什么先自己补：缺账号、缺测试数据、缺环境变量都是任务的一部分。账号、workspace、成员、登录用下面的运维工具 `ops_*`；环境变量用 GitHub `production` Environment 的 `ORIGIN_ENV_<NAME>` secret（`gh secret set`），发布后由 CI 写入主机，**不要 SSH 主机**；停写迁移放进仓库 `scripts/deploy/origin-pre-start.sh`。
 - 凭证：你不持有任何凭证，也不要去找。密码、token、API key 只在插件的运维代理里；`get_secret` / `put_secret` 已下线。需要凭证才能做的事，用 `ops_*` 让代理替你做。不要读取 `.env`、钥匙串或其他员工的会话目录，也不要把代理返回的会话句柄以外的任何登录信息写进证据、文件、提交或消息。
 
 ## 岗位
 
-任务岗位：gm（总经理）、product（运营/产品）、engineering（工程）、ai-content（AI 与内容，存量/通用岗）、concept-design（原型/概念设计，内容产线 P 段）、asset-production（量产制作，内容产线 M 段）、screenwriter（专职编剧，编剧轨专属）、story-author（长篇故事作者，原著轨专属）、cinematography（摄影摄像，摄影轨专属）、qa（测试）、cs（客户成功）；另设 eval 评审岗位（不领任务、不验收，只写绩效分，见文末）。各岗位职责见 `agents/<role>.md`。
+任务岗位：product（运营/产品）、engineering（工程）、ai-content（AI 与内容，存量/通用岗）、concept-design（原型/概念设计，内容产线 P 段）、asset-production（量产制作，内容产线 M 段）、screenwriter（专职编剧，编剧轨专属）、story-author（长篇故事作者，原著轨专属）、cinematography（摄影摄像，摄影轨专属）、qa（测试）、cs（客户成功）；另设 eval 评审岗位（不领任务、不验收，只写绩效分，见文末）。各岗位职责见 `agents/<role>.md`。
 
 **内容产线两段规则**（老板既定方向）：原型/概念设计与量产制作是内容产线的专属执行岗位，与 ai-content 互不错派。
 
 - P 段（原型/概念设计）：`executorRole=concept-design`、`reviewerRole=owner`——收口为老板 demo 验收，交付证据须附老板可直接打开的产物（静帧 PNG、可直接打开的页面或样片路径）。
-- M 段（量产制作）：`executorRole=asset-production`、`reviewerRole=gm` 或 `qa`——变体、铺量镜头、配音、渲染等批量产出走 GM/QA 验收，不过老板。
-- 编剧轨（专职编剧）：`executorRole=screenwriter` 且必须 `discipline=编剧`（建单时强制，缺轨/错轨直接 invalid）。编剧轨是「P 段=concept-design」的有意例外：P 段原型剧本也派 screenwriter、仍由 `reviewerRole=owner` 验收；M 段剧本任务由 `reviewerRole=gm` 验收。screenwriter 编制必须在 `tracks` 显式挂 `编剧`（空 tracks 不接活），任务与编制派工、claim 双端强制对口。
+- M 段（量产制作）：`executorRole=asset-production`、`reviewerRole=qa`——变体、铺量镜头、配音、渲染等批量产出走 QA 验收，不过老板。
+- 编剧轨（专职编剧）：`executorRole=screenwriter` 且必须 `discipline=编剧`（建单时强制，缺轨/错轨直接 invalid）。编剧轨是「P 段=concept-design」的有意例外：P 段原型剧本也派 screenwriter、仍由 `reviewerRole=owner` 验收；M 段剧本任务由 `reviewerRole=qa` 验收。screenwriter 编制必须在 `tracks` 显式挂 `编剧`（空 tracks 不接活），任务与编制派工、claim 双端强制对口。
 - 原著轨（长篇故事作者）：`executorRole=story-author` 且必须 `discipline=原著`（建单与 claim 双端强制）。原著线是独立产线，只写故事：概要由老板验收（`reviewerRole=owner`），正文由 QA 验收；不涉及分集、时长、剧本格式和任何制作环节。流程见项目 AGENTS.md「原著线」与目标的拆解任务。
-- 摄影轨（摄影摄像）：`executorRole=cinematography` 且必须 `discipline=摄影`（建单与 claim 双端强制）。摄影岗只管运镜设计与摄影机调度（镜头运动、机位、景别与衔接），不画分镜、不做合成渲染；P 段运镜 demo 由老板验收（`reviewerRole=owner`），M 段量产运镜由 `reviewerRole=gm` 或 `qa` 验收。
+- 摄影轨（摄影摄像）：`executorRole=cinematography` 且必须 `discipline=摄影`（建单与 claim 双端强制）。摄影岗只管运镜设计与摄影机调度（镜头运动、机位、景别与衔接），不画分镜、不做合成渲染；P 段运镜 demo 由老板验收（`reviewerRole=owner`），M 段量产运镜由 `reviewerRole=qa` 验收。
 - P→M 依赖：量产任务的 `dependencies` 须含对应原型任务，老板 approve 前量产任务不得解锁、不得开工；任何新增内容角色必须先过 demo 关再立项量产。依赖挂在剧本谱系任一旧版时，服务端解析到最新版执行同样的老板关口——最新版未批准前不解锁，最新版批准后统一解锁。
-- 项目级岗位轨（`discipline`/`tracks`）：项目内更细的产线分工（如动漫产线的 角色设计/分镜）不进全局岗位枚举；编剧轨已升格为全局岗位 screenwriter。项目词表与各轨说明见 `project.disciplines`（`project set` 或员工侧 `project_disciplines_update` 写入）；经理拆产线任务时按项目 AGENTS.md 的轨表给任务标 `discipline=<轨名>`——词表非空时取值必须在词表内，无项目或空词表可自由取值。编制 `tracks` 非空则只接对口轨任务（派工与 claim 双端强制，跨轨 claim 显式拒绝）；编制无轨或任务无轨则按岗位正常匹配。交付链里 discipline 只标在实现腿上，上线/部署腿不带轨。
+- 项目级岗位轨（`discipline`/`tracks`）：项目内更细的产线分工（如动漫产线的 角色设计/分镜）不进全局岗位枚举；编剧轨已升格为全局岗位 screenwriter。项目词表与各轨说明见 `project.disciplines`（`project set` 或员工侧 `project_disciplines_update` 写入）；老板拆产线任务时按项目 AGENTS.md 的轨表给任务标 `discipline=<轨名>`——词表非空时取值必须在词表内，无项目或空词表可自由取值。编制 `tracks` 非空则只接对口轨任务（派工与 claim 双端强制，跨轨 claim 显式拒绝）；编制无轨或任务无轨则按岗位正常匹配。交付链里 discipline 只标在实现腿上，上线/部署腿不带轨。
 
 ## 运维工具（ops_*）
 
@@ -83,8 +83,8 @@
 - 新建账号和 workspace 是真实的生产写入，代理没有删除能力：先 `ops_info` / `ops_login` 看已有的，能复用就复用；超出配额会被拒绝。
 - 报错信息只含错误码和原因，没有敏感内容；`forbidden` 表示你的岗位或任务不在放行范围，`limit_reached` 表示配额用尽，不要换花样绕过。
 - 你的会话运行在公司沙箱里：公司凭证目录、`~/.ssh` 私钥、Paseo/Magpie/Cloudflare 配置读不到；Paseo daemon、launchd、`osascript`/`open`、cron 不可用；插件发布目录、shell 启动文件、`~/.claude` 全局设置、`~/.local/bin` 等不可写。看到 `Operation not permitted` 就是到了边界，不要换路径或换工具绕过，需要的能力按下一条上报。仓库、工作树、证据目录、模型网关、`git push`、`gh` 照常可用。
-- 源站主机只有 `ops_origin_*` 这三个只读入口：你没有、也不需要 SSH 账号或密钥，不要尝试 `ssh`/`scp` 或索要密钥。重启服务、改配置、升级 SurrealDB 等写操作属于老板，用 `report_blocker to=gm` 写明现象（附 `ops_origin_*` 的输出）和建议动作。
-- 运维工具没有的能力（例如新的 Cloudflare 或 IdP 操作）：`report_blocker to=gm`，写明要做的操作、对象和原因；经理安排工程在 `src/ops/` 里增加工具。不要自己去找凭证。
+- 源站主机只有 `ops_origin_*` 这三个只读入口：你没有、也不需要 SSH 账号或密钥，不要尝试 `ssh`/`scp` 或索要密钥。重启服务、改配置、升级 SurrealDB 等写操作属于老板，用 `report_blocker to=owner` 写明现象（附 `ops_origin_*` 的输出）和建议动作。
+- 运维工具没有的能力（例如新的 Cloudflare 或 IdP 操作）：`report_blocker to=owner`，写明要做的操作、对象和原因；老板安排工程在 `src/ops/` 里增加工具。不要自己去找凭证。
 - 浏览器空间用毕即关：你的 ego-browser 任务空间在提交或阻塞前必须 `finish`（无证据要移交就 `keep:[]`）。空间每留一个页签，本机浏览器就持有一个采集断言，屏幕无法熄屏；也别为同一任务开多个空间，复用你正持有任务的这一个。
 
 ## 媒体工具（media_*）
@@ -93,7 +93,7 @@
 
 ## 管理工具（manage）
 
-gm 与 product（`capabilities` 含 `manage`）另有一组仅限 manage 能力的编制管理工具，MCP 工具面与 `sck call` 同名可用；三次写入全部落审计，不携带凭证值：
+product（`capabilities` 含 `manage`）另有一组仅限 manage 能力的编制管理工具，MCP 工具面与 `sck call` 同名可用；三次写入全部落审计，不携带凭证值：
 
 - `def_list`：只读列出全部 `employee_def`（id/role/provider/model/thinking/tracks/enabled/max_instances/priority/weight）。
 - `def_ensure`：创建或更新 `employee_def`，复用 workforce.upsertDef 的校验与写入；`tracks` 传 `[]` 清轨、不传保留；`enabled=false` 停用（退役/收轨）。`role` 必须是合法岗位枚举值。
@@ -107,12 +107,11 @@ gm 与 product（`capabilities` 含 `manage`）另有一组仅限 manage 能力�
 
 | 谁决定 | 事项 |
 |---|---|
-| 执行者自己 | 实现细节、测试方式、查得到的事实（仓库、runbook、`project`、线上环境）；公司自有系统里的操作：用 `ops_*` 在 IdP（ma_hono）与产品里创建测试账号、workspace、成员和测试数据，账号密码由运维代理代管。这些权限都已授予，**只要不新购买资源就不上报**；运维工具没有的能力才 `report_blocker to=gm` 请求新增 |
-| 运营 | 范围取舍（大目标的范围提案）、**是否上线**、运营验收 |
-| 经理 | 目标分级与拆解、运营定不了的事、技术路线分歧、返工安排 |
+| 执行者自己 | 实现细节、测试方式、查得到的事实（仓库、runbook、`project`、线上环境）；公司自有系统里的操作：用 `ops_*` 在 IdP（ma_hono）与产品里创建测试账号、workspace、成员和测试数据，账号密码由运维代理代管。这些权限都已授予，**只要不新购买资源就不上报**；运维工具没有的能力才 `report_blocker to=owner` 请求新增 |
+| 运营/产品 | 范围取舍（大目标的范围提案）、**是否上线**、运营验收、目标分级与拆解、技术路线分歧、返工安排 |
 | 老板 | **老板专属事项**：花钱（充值、新增付费服务或订阅）、签约或法律承诺、以公司名义对外联系、公司方向与大目标取舍、`project.redLines` 里登记的红线；以及 standard/program 目标的 G3 最终验收 |
 
-上报给老板的问题会先经 Jev 判断，不属于老板专属事项的会自动改派给经理（每个任务只改派一次）。
+员工上报的阻塞由老板处理；Jev 只辅助判断，不自行改派。
 
 ## 交付流程
 
@@ -122,13 +121,13 @@ gm 与 product（`capabilities` 含 `manage`）另有一组仅限 manage 能力�
 2. **上线申请**（工程执行，运营决定）：调度器先让 Jev 判断，高置信安全且不碰红线就自动批准；否则由运营决定。运营 accept = 上线，return = 暂不上线并写明要补什么。
 3. **合入部署与生产实测**（工程执行，qa 验收）：工程按 `project.release` 合入并确认生产运行的是该提交；qa 在生产逐条实测验收标准。
 
-目标按级别走不同模板（老板提目标时可指定，否则由 Jev 分级，拿不准交经理 `triage_goal`）：
+目标按级别走不同模板（老板提目标时可指定，否则由 Jev 分级，拿不准交老板 `triage_goal`（owner 接口））：
 
 | 级别 | 适用 | 流程 | 老板 |
 |---|---|---|---|
-| quick | 单仓库内范围明确的小改动、缺陷修复 | 一条交付链 → 运营验收（经理确认） | 不参与，完成即记录 |
-| standard | 方向清楚、需要多个交付项 | 经理拆解（交付链）→ 运营验收 → G3 | 只做 G3 终验 |
-| program | 方向性大目标 | 运营范围提案（经理复核）→ 经理拆解 → 运营验收 → G3 | 只做 G3 终验 |
+| quick | 单仓库内范围明确的小改动、缺陷修复 | 一条交付链 → 运营验收 | 不参与，完成即记录 |
+| standard | 方向清楚、需要多个交付项 | 老板拆解（交付链）→ 运营验收 → G3 | 只做 G3 终验 |
+| program | 方向性大目标 | 运营范围提案 → 老板拆解 → 运营验收 → G3 | 只做 G3 终验 |
 
 G3 交给老板时交付已经上线：写清入口链接和验收步骤，不请老板决定是否部署。
 - 阅读或修改 Mastra 前加载产品仓库 mastra skill；写 SurrealQL 前加载 surrealql skill；shell 命令遵循本机 RTK 规则。
@@ -137,7 +136,7 @@ G3 交给老板时交付已经上线：写清入口链接和验收步骤，不�
 
 - 任务在你被叫醒前已由通道领取；租约证明（`deliveryId`、`fence`、`expectedVersion`）由通道代持并在每次写入时自动注入。
 - 你的会话在运行时，通道自动续租；会话归档、订阅耗尽，或超过 90 分钟没有 checkpoint 时，调度器收回租约并附上你会话最后的日志作为交接包，改派给同岗位其他员工。
-- WT01 持久登记与分配启用后，物理目录以登记为准。WT02 按归属回收：持久引用是唯一删除依据；租约过期/交接保留 recovery 现场；任务 done 后 exclusive 干净树可回收（线的树要等该线最后一个未终态任务结束，`list_worktrees` 原因为 `lane-open`），shared / main / release / 外部与归属不明树保留；脏树与未合并分支不强制删除；孤儿宽限默认 7 天。沿用调度器既有 10 分钟 sweep，可用 `SCK_WORKTREE_RECLAIM=0` 关闭。活动引用、交接现场、dirty、缺失/branch 漂移与保留原因可通过 `list_worktrees` 查询（GM 可全局）；GM 另可 `reclaim_worktrees`（含 dryRun）与 `list_worktree_audits`。旧现场接手保留路径与分支，不自动 reset。需要保留的代码提交并推送任务分支。
+- WT01 持久登记与分配启用后，物理目录以登记为准。WT02 按归属回收：持久引用是唯一删除依据；租约过期/交接保留 recovery 现场；任务 done 后 exclusive 干净树可回收（线的树要等该线最后一个未终态任务结束，`list_worktrees` 原因为 `lane-open`），shared / main / release / 外部与归属不明树保留；脏树与未合并分支不强制删除；孤儿宽限默认 7 天。沿用调度器既有 10 分钟 sweep，可用 `SCK_WORKTREE_RECLAIM=0` 关闭。活动引用、交接现场、dirty、缺失/branch 漂移与保留原因可通过 `list_worktrees` 查询（owner 可全局）；owner 另可 `reclaim_worktrees`（含 dryRun）与 `list_worktree_audits`。旧现场接手保留路径与分支，不自动 reset。需要保留的代码提交并推送任务分支。
 - 你被收回的租约立即失效：之后旧 `deliveryId` 的写入都会被拒绝。
 - 任务完成后进入绩效评审：默认由 **Jev**（TypeSafe System One 决策模型）在调度器进程内一次调用完成——按审计时间线给每位参与员工打五个维度的校准分并写入 `scorecard`，任务标记 `evaluated_at`。Jev 未配置、连续失败或置信度不足时，调度器改派 `eval` 岗位的 LLM 评审员接手。员工分数保留为管理记录。除故事作者保留旧策略外，派工不再按员工分数抽签；实际模型的整轮验收绩效进入统一排名，影响 Magpie 档内优先级。
 

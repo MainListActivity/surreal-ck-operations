@@ -32,7 +32,7 @@ async function fixture(run: (r: { relay: () => Promise<any>; blocks: string[]; u
 
 test('three identical HTTP denials block the actual lease and queued calls never reach upstream', async () => fixture(async r => {
   const out = await Promise.all([r.relay(), r.relay(), r.relay(), r.relay(), r.relay()]);
-  expect(r.blocks).toEqual(['gm']);
+  expect(r.blocks).toEqual(['owner']);
   expect(r.upstream()).toBe(3);
   expect(out.some(o => !o.ok && /熔断/.test(o.error))).toBe(true);
   expect(readFileSync(join(r.root, 'qa-fixture-aaaaaa', 'ops-denials.json'), 'utf8')).not.toContain('synthetic-session');
@@ -47,7 +47,7 @@ test('a successful call resets the streak; transient failures never count as den
 test('repeated thrown contract refusals also block, without persisting raw messages', async () => fixture(async r => {
   r.setReply(Object.assign(new Error('synthetic-secret-private-detail'), { code: 'forbidden' }));
   await r.relay(); await r.relay(); await r.relay();
-  expect(r.blocks).toEqual(['gm']);
+  expect(r.blocks).toEqual(['owner']);
   expect(readFileSync(join(r.root, 'qa-fixture-aaaaaa', 'ops-denials.json'), 'utf8')).not.toContain('synthetic-secret-private-detail');
 }));
 
