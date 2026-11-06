@@ -27,6 +27,8 @@
 | 暂停派工 | `sck owner task.pause '{}'` |
 | 恢复派工 | `sck owner task.resume '{}'` |
 | 任务成本 | `sck owner task.cost '{"taskId":"t1"}'` |
+| 实现人判定预演 | `sck owner contributor.dryRun '{"taskIds":["t1"]}'` |
+| 指定实现人 | `sck owner implementer.takeover '{"taskId":"t1","toEmployee":"eng-1","expectedVersion":3,"reason":"任务有多名经手人，需指定实现负责人"}'` |
 | 关口决定 | `sck owner decide '{"taskId":"t1","decision":"approve"}'` |
 | 批准 | `sck owner approve '{"taskId":"t1"}'` |
 | 退回 | `sck owner reject '{"taskId":"t1","note":"补齐证据"}'` |

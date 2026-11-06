@@ -84,8 +84,8 @@ beforeAll(async () => {
   core = new SurrealCompanyCore(database, { acceptance: { adapter: createGithubActionsAdapter(gh) } });
   for (const [n, r, c] of [['owner','owner',['execute','review','manage']], ['eng-a','engineering',['execute','review']], ['qa','qa',['execute','review']]] as const)
     tokens[n] = await enrollment.enroll(`t-${n}`, r, c);
-  const gate = await core.acceptanceGate(tokens.gm);
-  await core.setAcceptanceGate(tokens.gm, { enabled: true, reason: 'N1-R core positive', expectedVersion: gate.version, idempotencyKey: key() });
+  const gate = await core.acceptanceGate(tokens.owner);
+  await core.setAcceptanceGate(tokens.owner, { enabled: true, reason: 'N1-R core positive', expectedVersion: gate.version, idempotencyKey: key() });
 }, 60_000);
 afterAll(async () => {
   if (database) await database.close();
@@ -96,11 +96,11 @@ beforeEach(async () => { if (forkEnv) await database.db.query('UPDATE employee S
 
 fork('N1-R positive: a trusted deployment of this run certifies the environment and a non-author accepts', async () => {
   const goal = await owner.createGoal({ text: 'N1-R 核心正例目标', source: 'owner:test', key: key(), tier: 'quick' });
-  const task = await core.createTask(tokens.gm, {
+  const task = await core.createTask(tokens.owner, {
     goalId: goal.id, title: 'N1-R 核心正例', context: '受信部署 workflow 的 deployment 与成功状态都指向本次证据 run。',
     kind: 'deploy', executorRole: 'engineering', reviewerRole: 'qa', acceptanceEnvironment: 'production', idempotencyKey: key(),
   } as never);
-  const acId = (await core.getTask(tokens.gm, task.id)).acceptanceCriteria?.find(c => c.kind === 'machine')!.id;
+  const acId = (await core.getTask(tokens.owner, task.id)).acceptanceCriteria?.find(c => c.kind === 'machine')!.id;
 
   const claim = await core.claim(tokens['eng-a'], task.id);
   const recorded = await core.recordAcceptanceEvidence(tokens['eng-a'], {
@@ -178,11 +178,11 @@ fork('N1-R refusal then recovery: the core refuses a borrowed deployment and a w
   };
   const switchCore = new SurrealCompanyCore(database, { acceptance: { adapter: createGithubActionsAdapter(ghSwitch) } });
   const goal = await owner.createGoal({ text: 'N1-R 拒绝后恢复目标', source: 'owner:test', key: key(), tier: 'quick' });
-  const task = await switchCore.createTask(tokens.gm, {
+  const task = await switchCore.createTask(tokens.owner, {
     goalId: goal.id, title: 'N1-R 拒绝后恢复', context: '先借别的 run 的失败 deployment 与别的 run 的 job 各被拒一次，再补本 run 的正确证据并在同一 attempt 提交。',
     kind: 'deploy', executorRole: 'engineering', reviewerRole: 'qa', acceptanceEnvironment: 'production', idempotencyKey: key(),
   } as never);
-  const acId = (await switchCore.getTask(tokens.gm, task.id)).acceptanceCriteria?.find(c => c.kind === 'machine')!.id;
+  const acId = (await switchCore.getTask(tokens.owner, task.id)).acceptanceCriteria?.find(c => c.kind === 'machine')!.id;
   const claim = await switchCore.claim(tokens['eng-a'], task.id);
   const record = async () => switchCore.recordAcceptanceEvidence(tokens['eng-a'], {
     taskId: task.id, acId, sha: SHA, environment: 'production',
@@ -206,7 +206,7 @@ fork('N1-R refusal then recovery: the core refuses a borrowed deployment and a w
   mode = 'correct';
   const recorded = await record();
   expect(recorded.verified).toBe(true);
-  const current = await switchCore.getTask(tokens.gm, task.id);
+  const current = await switchCore.getTask(tokens.owner, task.id);
   expect(current.state).toBe('doing');
   const submitted = await switchCore.submit(tokens['eng-a'], {
     taskId: task.id, deliveryId: claim.deliveryId, fence: claim.fence, expectedVersion: current.version,

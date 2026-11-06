@@ -2803,7 +2803,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   /** SYS-INT: read one drill's state and stage records; the task holder, owner, qa or product may read. */
   async deployDrillStatus(credential: Credential, input: { runId: string }): Promise<{ state?: DrillState; stages?: string[] }> {
     const actor = await this.authenticate(credential);
-    if (!['engineering', 'owner', 'qa'].includes(actor.role ?? '')) throw new CompanyError('forbidden', 'Not allowed to read drill status');
+    if (!['engineering', 'owner', 'qa', 'product'].includes(actor.role ?? '')) throw new CompanyError('forbidden', 'Not allowed to read drill status');
     const home = process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library', 'Application Support', 'SurrealCKCompany');
     return readDrillStatus(home, input.runId);
   }
@@ -7402,8 +7402,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * Allowed targets: the ops repo or a registered project repo_path, canonicalised —
    * symlink escapes, traversal segments and unregistered paths are refused before any write.
    * Only state=blocked tasks qualify: blocked_to='owner' and the formal dependency wait
-   * (blocked_to=NONE, including defer_task_until's cleared-owner wait) both bind; owner gates
-   * and review-phase blocks are refused, not guessed, as are live leases. The stale worktree
+   * (blocked_to=NONE, including defer_task_until's cleared-owner wait) and an owner-blocked
+   * fallback both bind; review-phase and gate blocks are refused, not guessed, as are live leases. The stale worktree
    * assignment clears through the same lifecycle as task_project_update: the ref releases,
    * uncommitted work in the old tree is preserved, and the tree itself is never deleted here.
    */
@@ -7442,7 +7442,6 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         IF $t.version != $expected { THROW 'task version moved' };
         IF $repo NOT IN $allowed { THROW 'bind denied: repo not registered' };
         IF $t.state != 'blocked' { THROW 'bind denied: only blocked tasks can be rebound' };
-        IF $t.blocked_to = 'owner' { THROW 'bind denied: owner blocked task' };
         IF $t.resume_state = 'review' { THROW 'bind denied: review-phase task' };
         IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'bind denied: active lease' };
         LET $next = UPDATE ONLY $task SET

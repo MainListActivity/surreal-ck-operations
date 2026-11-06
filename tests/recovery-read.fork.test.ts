@@ -140,7 +140,7 @@ async function refusal(promise: Promise<unknown>): Promise<Error & { code?: stri
 check('restart bootstrap runs schema 049 and the source task stays done without a new budget', async () => {
   const [installation] = await database.db.query<[{ schema_version?: number } | undefined]>(
     'SELECT schema_version FROM ONLY company_meta:installation;');
-  expect(installation?.schema_version).toBe(50);
+  expect(installation?.schema_version).toBe(51);
   const source = await doneTask(GOAL, '终态源任务');
   await openEpisode(source);
   const before = await core.faultStatus(gm, { taskId: source });
@@ -353,10 +353,10 @@ check('an unsettled inFlight past its deadline becomes stopped(unknown_outcome),
 check('the migrated database proves the schema receipt a 0.3.76 release needs', async () => {
   // The real fork after bootstrap: the marker is 49 and the three tables exist.
   const receipt = await readReleaseSchema(database.db);
-  expect(receipt.schemaVersion).toBe(50);
+  expect(receipt.schemaVersion).toBe(51);
   for (const table of RECOVERY_READ_TABLES) expect(receipt.tables).toContain(table);
   const verified = await verifyReleaseSchema(database.db, '0.3.76');
-  expect(verified).toMatchObject({ schema: 49, schemaVersion: 50 });
+  expect(verified).toMatchObject({ schema: 49, schemaVersion: 51 });
   expect(verified.tables).toEqual([...RECOVERY_READ_TABLES]);
   // An older target keeps the older minimum: 49 is not forced onto a historical version.
   const legacy = await verifyReleaseSchema(database.db, '0.3.75');
@@ -386,7 +386,7 @@ check('an isolated database without the three tables or the marker keeps the rel
     await legacy.close();
     await expect(readReleaseSchema(legacy.db)).rejects.toThrow(/unreadable/);
     // The migrated database the checks above use is untouched by this probe.
-    expect((await readReleaseSchema(database.db)).schemaVersion).toBe(50);
+    expect((await readReleaseSchema(database.db)).schemaVersion).toBe(51);
   } finally {
     await legacy.close().catch(() => undefined);
   }

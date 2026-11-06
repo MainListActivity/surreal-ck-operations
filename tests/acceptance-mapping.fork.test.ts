@@ -140,13 +140,13 @@ fork('SYS-INT import: preview is a zero-write dry-run and the import is gm-only,
   });
 
   beforeAll(async () => {
-    const gate = await core.acceptanceGate(tokens.gm);
-    if (gate.enabled) await core.setAcceptanceGate(tokens.gm, { enabled: false, reason: 'SYS-INT 测试：先建 legacy 行', expectedVersion: gate.version, idempotencyKey: key() });
-    const legacy = await core.createTask(tokens.gm, { title: 'SYS-INT 映射导入目标', context: '门禁启用前创建的 legacy 行',
+    const gate = await core.acceptanceGate(tokens.owner);
+    if (gate.enabled) await core.setAcceptanceGate(tokens.owner, { enabled: false, reason: 'SYS-INT 测试：先建 legacy 行', expectedVersion: gate.version, idempotencyKey: key() });
+    const legacy = await core.createTask(tokens.owner, { title: 'SYS-INT 映射导入目标', context: '门禁启用前创建的 legacy 行',
       executorRole: 'engineering', reviewerRole: 'engineering', idempotencyKey: key() });
     taskId = legacy.id;
-    const enabled = await core.acceptanceGate(tokens.gm);
-    if (!enabled.enabled) await core.setAcceptanceGate(tokens.gm, { enabled: true, reason: 'SYS-INT 测试：启用门禁', expectedVersion: enabled.version, idempotencyKey: key() });
+    const enabled = await core.acceptanceGate(tokens.owner);
+    if (!enabled.enabled) await core.setAcceptanceGate(tokens.owner, { enabled: true, reason: 'SYS-INT 测试：启用门禁', expectedVersion: enabled.version, idempotencyKey: key() });
     const preview = await core.acceptanceMappingPreview(tokens.eng, { taskId });
     expect(preview.legacy).toBe(true);
     expect(preview.conflicts).toEqual([]);
@@ -157,7 +157,7 @@ fork('SYS-INT import: preview is a zero-write dry-run and the import is gm-only,
   test('the preview writes nothing: same task version, same audit rows', async () => {
     const auditsBefore = await auditRows(taskId);
     const before = await taskRow(taskId);
-    const again = await core.acceptanceMappingPreview(tokens.gm, { taskId });
+    const again = await core.acceptanceMappingPreview(tokens.owner, { taskId });
     expect(again.proposal!.digest).toBe(digest);
     expect(again.sysRequired.length).toBeGreaterThanOrEqual(8);
     expect((await taskRow(taskId))!.version).toBe(before!.version);
@@ -172,16 +172,16 @@ fork('SYS-INT import: preview is a zero-write dry-run and the import is gm-only,
   });
 
   test('gm import succeeds once, is audited and idempotent, and the gate now judges the imported criteria', async () => {
-    const imported: TaskView = await core.acceptanceMappingImport(tokens.gm, importInput({ idempotencyKey: 'sys-int-import-e7d08f27' }));
+    const imported: TaskView = await core.acceptanceMappingImport(tokens.owner, importInput({ idempotencyKey: 'sys-int-import-e7d08f27' }));
     const row = await taskRow(taskId);
     expect(row!.acceptance_legacy).toBe(false);
     expect((row!.acceptance_criteria as Array<{ id: string }>).map(item => item.id)).toContain('AC-MAP-8');
     expect(row!.version).toBe(versionAtPreview + 1);
     expect(imported.version).toBe(versionAtPreview + 1);
     expect((await auditRows(taskId)).some(entry => entry.action === 'acceptance_mapping_imported')).toBe(true);
-    const replay = await core.acceptanceMappingImport(tokens.gm, importInput({ idempotencyKey: 'sys-int-import-e7d08f27' }));
+    const replay = await core.acceptanceMappingImport(tokens.owner, importInput({ idempotencyKey: 'sys-int-import-e7d08f27' }));
     expect(replay.version).toBe(versionAtPreview + 1);
-    await expect(core.acceptanceMappingImport(tokens.gm, importInput({ expectedVersion: versionAtPreview + 1, reason: '已有版本化 criteria 不得二次覆盖' })))
+    await expect(core.acceptanceMappingImport(tokens.owner, importInput({ expectedVersion: versionAtPreview + 1, reason: '已有版本化 criteria 不得二次覆盖' })))
       .rejects.toMatchObject({ code: 'invalid' });
     const status = await core.acceptanceStatus(tokens.eng, { taskId });
     expect(status.verdict.legacy).toBe(false);
@@ -195,15 +195,15 @@ fork('SYS-INT import: preview is a zero-write dry-run and the import is gm-only,
   });
 
   test('a stale digest and an unknown bundle are refused before anything else', async () => {
-    await expect(core.acceptanceMappingImport(tokens.gm, importInput({ digest: 'f'.repeat(64), reason: '伪造 digest 必须被拒绝' })))
+    await expect(core.acceptanceMappingImport(tokens.owner, importInput({ digest: 'f'.repeat(64), reason: '伪造 digest 必须被拒绝' })))
       .rejects.toMatchObject({ code: 'invalid' });
-    await expect(core.acceptanceMappingImport(tokens.gm, importInput({ mappingKey: 'no-such-bundle', reason: '未知 bundle 必须被拒绝' })))
+    await expect(core.acceptanceMappingImport(tokens.owner, importInput({ mappingKey: 'no-such-bundle', reason: '未知 bundle 必须被拒绝' })))
       .rejects.toMatchObject({ code: 'invalid' });
   });
 
   test('a moved task version is refused by the CAS', async () => {
     const casId = await freshLegacyRow('CAS 陈旧版本夹具', 5);
-    await expect(core.acceptanceMappingImport(tokens.gm, importInput({ taskId: casId, expectedVersion: 9, reason: '陈旧版本必须被 CAS 拒绝' })))
+    await expect(core.acceptanceMappingImport(tokens.owner, importInput({ taskId: casId, expectedVersion: 9, reason: '陈旧版本必须被 CAS 拒绝' })))
       .rejects.toThrow();
     expect(((await taskRow(casId))!.version as number)).toBe(5);
   });
@@ -217,19 +217,19 @@ fork('SYS-INT import: preview is a zero-write dry-run and the import is gm-only,
       await Bun.sleep(50);
     }
     const leasedVersion = (await taskRow(busyId))!.version as number;
-    await expect(core.acceptanceMappingImport(tokens.gm, importInput({ taskId: busyId, expectedVersion: leasedVersion, reason: '活动租约未结束，导入必须被拒绝' })))
+    await expect(core.acceptanceMappingImport(tokens.owner, importInput({ taskId: busyId, expectedVersion: leasedVersion, reason: '活动租约未结束，导入必须被拒绝' })))
       .rejects.toMatchObject({ code: 'conflict' });
-    const preview = await core.acceptanceMappingPreview(tokens.gm, { taskId: busyId });
+    const preview = await core.acceptanceMappingPreview(tokens.owner, { taskId: busyId });
     expect(preview.conflicts).toContain('occupied');
   });
 
   test('a done row is never rewritten; release legs are unsupported', async () => {
     const doneId = await freshLegacyRow('已完成历史', 3);
     await database.db.query('UPDATE ONLY $task SET state = "done";', { task: new RecordId('task', doneId) });
-    await expect(core.acceptanceMappingImport(tokens.gm, importInput({ taskId: doneId, expectedVersion: 3, reason: 'done/void 历史结论不得改写' })))
+    await expect(core.acceptanceMappingImport(tokens.owner, importInput({ taskId: doneId, expectedVersion: 3, reason: 'done/void 历史结论不得改写' })))
       .rejects.toMatchObject({ code: 'invalid' });
     const releaseId = await releaseKindTask('release 腿任务');
-    const releasePreview = await core.acceptanceMappingPreview(tokens.gm, { taskId: releaseId });
+    const releasePreview = await core.acceptanceMappingPreview(tokens.owner, { taskId: releaseId });
     expect(releasePreview.proposal).toBeUndefined();
     expect(releasePreview.conflicts).toContain('unsupported-leg');
   });
@@ -239,9 +239,9 @@ fork('SYS-INT import: preview is a zero-write dry-run and the import is gm-only,
     await database.db.query(`UPDATE ONLY $task SET acceptance_criteria =
       [{ id: 'AC-9', kind: 'human', required: true, layer: 'manual', evidence: 'review-signoff', verify: 'independent-review', risk: 'runtime' }];`,
       { task: new RecordId('task', downId) });
-    const preview = await core.acceptanceMappingPreview(tokens.gm, { taskId: downId });
+    const preview = await core.acceptanceMappingPreview(tokens.owner, { taskId: downId });
     expect(preview.conflicts).toContain('downgrade:AC-9');
-    await expect(core.acceptanceMappingImport(tokens.gm, importInput({ taskId: downId, expectedVersion: 2, reason: '删除 required 项的导入必须被拒绝' })))
+    await expect(core.acceptanceMappingImport(tokens.owner, importInput({ taskId: downId, expectedVersion: 2, reason: '删除 required 项的导入必须被拒绝' })))
       .rejects.toMatchObject({ code: 'invalid' });
     expect(((await taskRow(downId))!.version as number)).toBe(2);
   });
@@ -259,7 +259,7 @@ fork('SYS-INT source bundle: audience-bound business QA contract for the SYS-INT
 
   beforeAll(async () => {
     qaTaskId = await freshLegacyRow('SYS-INT 源 QA 行', 2, { executorRole: 'qa', goalId: SYS_INT_GOAL_ID });
-    const preview = await core.acceptanceMappingPreview(tokens.gm, { taskId: qaTaskId });
+    const preview = await core.acceptanceMappingPreview(tokens.owner, { taskId: qaTaskId });
     expect(preview.proposal!.key).toBe(ACCEPTANCE_MAPPING_SOURCE_KEY);
     expect(preview.conflicts).toEqual([]);
     sourceDigest = preview.proposal!.digest;
@@ -276,15 +276,15 @@ fork('SYS-INT source bundle: audience-bound business QA contract for the SYS-INT
   });
 
   test('a wrong bundle for a mismatched source task is refused before anything else', async () => {
-    await expect(core.acceptanceMappingImport(tokens.gm, sourceInput({ mappingKey: ACCEPTANCE_MAPPING_KEY })))
+    await expect(core.acceptanceMappingImport(tokens.owner, sourceInput({ mappingKey: ACCEPTANCE_MAPPING_KEY })))
       .rejects.toMatchObject({ code: 'invalid' });
     const engRow = await freshLegacyRow('工程行误用源 bundle', 2);
-    await expect(core.acceptanceMappingImport(tokens.gm, sourceInput({ taskId: engRow })))
+    await expect(core.acceptanceMappingImport(tokens.owner, sourceInput({ taskId: engRow })))
       .rejects.toMatchObject({ code: 'invalid' });
     const otherGoal = await freshLegacyRow('别的目标的 QA 行', 2, { executorRole: 'qa', goalId: 'not-the-sys-int-goal' });
-    const foreign = await core.acceptanceMappingPreview(tokens.gm, { taskId: otherGoal });
+    const foreign = await core.acceptanceMappingPreview(tokens.owner, { taskId: otherGoal });
     expect(foreign.conflicts).toContain('unsupported-leg');
-    await expect(core.acceptanceMappingImport(tokens.gm, sourceInput({ taskId: otherGoal })))
+    await expect(core.acceptanceMappingImport(tokens.owner, sourceInput({ taskId: otherGoal })))
       .rejects.toMatchObject({ code: 'invalid' });
   });
 
@@ -292,7 +292,7 @@ fork('SYS-INT source bundle: audience-bound business QA contract for the SYS-INT
     await expect(core.acceptanceMappingImport(tokens.eng, sourceInput())).rejects.toMatchObject({ code: 'forbidden' });
     await expect(core.acceptanceMappingImport(tokens.qa, sourceInput())).rejects.toMatchObject({ code: 'forbidden' });
     await expect(core.acceptanceMappingImport(tokens.judge, sourceInput())).rejects.toMatchObject({ code: 'forbidden' });
-    const imported: TaskView = await core.acceptanceMappingImport(tokens.gm, sourceInput({ idempotencyKey: 'sys-int-source-import' }));
+    const imported: TaskView = await core.acceptanceMappingImport(tokens.owner, sourceInput({ idempotencyKey: 'sys-int-source-import' }));
     const row = await taskRow(qaTaskId);
     expect(row!.acceptance_legacy).toBe(false);
     const ids = (row!.acceptance_criteria as Array<{ id: string }>).map(item => item.id);
@@ -302,9 +302,9 @@ fork('SYS-INT source bundle: audience-bound business QA contract for the SYS-INT
     expect(row!.version).toBe(qaVersionAtPreview + 1);
     expect(imported.version).toBe(qaVersionAtPreview + 1);
     expect((await auditRows(qaTaskId)).some(entry => entry.action === 'acceptance_mapping_imported')).toBe(true);
-    const replay = await core.acceptanceMappingImport(tokens.gm, sourceInput({ idempotencyKey: 'sys-int-source-import' }));
+    const replay = await core.acceptanceMappingImport(tokens.owner, sourceInput({ idempotencyKey: 'sys-int-source-import' }));
     expect(replay.version).toBe(qaVersionAtPreview + 1);
-    await expect(core.acceptanceMappingImport(tokens.gm, sourceInput({ expectedVersion: qaVersionAtPreview + 1, reason: '业务契约不得二次覆盖' })))
+    await expect(core.acceptanceMappingImport(tokens.owner, sourceInput({ expectedVersion: qaVersionAtPreview + 1, reason: '业务契约不得二次覆盖' })))
       .rejects.toMatchObject({ code: 'invalid' });
     const status = await core.acceptanceStatus(tokens.qa, { taskId: qaTaskId });
     expect(status.verdict.legacy).toBe(false);

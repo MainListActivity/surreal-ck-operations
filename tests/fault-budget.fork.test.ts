@@ -75,7 +75,7 @@ beforeEach(async () => {
 
 /** A task the gm owns, so the tests can claim and block it. */
 async function makeTask(title: string): Promise<string> {
-  const view = await core.createTask(tokens.gm, {
+  const view = await core.createTask(tokens.owner, {
     title, context: 'SYS04 故障预算回归夹具', executorRole: 'engineering', reviewerRole: 'qa',
     workIntent: { kind: 'read' }, idempotencyKey: `fault-task-${title}-${clock}`,
   } as CreateTask);
@@ -165,7 +165,7 @@ async function exhaust(scope: { taskId: string; employeeId?: string }, input: At
  */
 async function resumeToRepair(taskId: string, incident = incidentOf()): Promise<string> {
   await database.db.query('UPDATE $t SET state = "blocked", blocked_to = "owner", resume_state = "ready";', { t: new RecordId('task', taskId) });
-  await core.resume(tokens.gm!, taskId, {
+  await core.resume(tokens.owner!, taskId, {
     text: '尝试恢复：预算耗尽后应当走修复链而不是直接恢复', idempotencyKey: `resume-${taskId}-${clock}`,
   });
   const repair = await new FaultStore(database.db).repair(incident);
@@ -501,7 +501,7 @@ describe('the exhausted budget', () => {
     await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
     // The task waits on the gm gate, as a fault report would leave it.
     await database.db.query('UPDATE $t SET state = "blocked", blocked_to = "owner", resume_state = "ready";', { t: new RecordId('task', taskId) });
-    const resumed = await core.resume(tokens.gm, taskId, {
+    const resumed = await core.resume(tokens.owner, taskId, {
       text: '尝试恢复：同一故障再次发生，应当走修复链而不是直接恢复', idempotencyKey: `resume-${clock}`,
     });
     // The task did not go back to ready: it waits on the repair.
@@ -578,7 +578,7 @@ describe('the exhausted budget', () => {
       taskId, incident: incident!, reason: '验收期间解封', idempotencyKey: `lift-eng-${clock}`,
     })).rejects.toMatchObject({ code: 'forbidden' });
     // gm lifts with a reason: the next attempt starts a fresh recovery window.
-    const after = await core.faultLift!(tokens.gm, {
+    const after = await core.faultLift!(tokens.owner, {
       taskId, incident: incident!, reason: 'TLS 长尾已诊断，验收需要解封继续测', idempotencyKey: `lift-gm-${clock}`,
     });
     expect(after.budgets[0]?.attempts).toBe(0);
@@ -603,7 +603,7 @@ describe('the exhausted budget', () => {
     await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
     // The task waits on the gm gate, as a fault report would leave it.
     await database.db.query('UPDATE $t SET state = "blocked", blocked_to = "owner", resume_state = "ready";', { t: new RecordId('task', taskId) });
-    await core.resume(tokens.gm, taskId, {
+    await core.resume(tokens.owner, taskId, {
       text: '尝试恢复：预算耗尽后应当走修复链而不是直接恢复', idempotencyKey: `resume-lift-${clock}`,
     });
     // The repair is finished for real: the engineer submits and the independent reviewer accepts.
@@ -759,7 +759,7 @@ describe('a repair completion lifts a budget once (AC04)', () => {
     await exhaust(scope);
     await finishRepair(await resumeToRepair(taskId));
     // gm lifts by hand while the completion is still unspent: the lift spends that completion with it.
-    const lifted = await core.faultLift!(tokens.gm!, {
+    const lifted = await core.faultLift!(tokens.owner!, {
       taskId, incident: incidentOf(), reason: '验收期间人工解封，修复已完成', idempotencyKey: `lift-spend-${taskId}`,
     });
     expect(lifted.budgets[0]?.attempts).toBe(0);

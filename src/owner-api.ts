@@ -18,7 +18,11 @@ import { GoalGovernanceStore } from './goal-store.ts';
 import { readTaskCost, recordTaskCost, COST_LIST_SQL } from './task-cost.ts';
 
 export type OwnerVia = string;
-export interface OwnerApiContext { db: CompanyDatabase; core: CompanyCore & { ownerGoalPhaseSplit(via: string, input: { goalId: string; taskIds: string[]; title: string; reason: string; idempotencyKey: string }): Promise<unknown> }; owner: OwnerDesk; workforce: Workforce; messages: OutboundMessageStore; opsRepo: string; upgrades?: { inbox(): Promise<unknown>; setAuto(enabled: boolean, source: string): Promise<unknown>; start(input: { taskId: string; taskVersion: number; digest: string }, source: string): Promise<unknown> } }
+export interface OwnerApiContext { db: CompanyDatabase; core: CompanyCore & {
+  ownerGoalPhaseSplit(via: string, input: { goalId: string; taskIds: string[]; title: string; reason: string; idempotencyKey: string }): Promise<unknown>;
+  contributorDryRun(credential: string, input: { taskIds: string[] }): Promise<unknown>;
+  implementerTakeover(credential: string, input: { taskId: string; toEmployee: string; replacementReviewer?: string; expectedVersion: number; reason: string; idempotencyKey: string }): Promise<unknown>;
+}; owner: OwnerDesk; workforce: Workforce; messages: OutboundMessageStore; opsRepo: string; upgrades?: { inbox(): Promise<unknown>; setAuto(enabled: boolean, source: string): Promise<unknown>; start(input: { taskId: string; taskVersion: number; digest: string }, source: string): Promise<unknown> } }
 
 const actor = (via: string) => `owner:${via || 'web'}`;
 const text = (value: unknown, field: string, min = 1, max = 20000): string => {
@@ -36,6 +40,11 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     ? input.idempotencyKey : undefined;
   const key = () => idemp ? `owner:${via}:${command}:${idemp}` : `owner:${via}:${command}:${randomUUID()}`;
   const db = ctx.db.db;
+  const ownerCredential = (): string => {
+    const token = process.env.SCK_OWNER_TOKEN;
+    if (!token) throw new CompanyError('temporarily_unavailable', 'owner token not configured');
+    return token;
+  };
   switch (command) {
     // ---- 目标 ----
     case 'goal.create': return ctx.owner.createGoal({ text: text(input.text, 'text', 2), source: a, key: key(),
@@ -87,8 +96,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       if (!ROLES.includes(executor)) throw new CompanyError('invalid', 'unknown executorRole');
       if (reviewer !== 'owner' && !ROLES.includes(reviewer)) throw new CompanyError('invalid', 'unknown reviewerRole');
       const deps = strArray(input.dependencies);
-      const ownerCred = process.env.SCK_OWNER_TOKEN;
-      if (!ownerCred) throw new CompanyError('temporarily_unavailable', 'owner token not configured');
+      const ownerCred = ownerCredential();
       const isEngineering = executor === 'engineering';
       const kind = optionalText(input.kind) as CreateTask['kind'] | undefined;
       const discipline = optionalText(input.discipline) ?? (isEngineering ? undefined : REQUIRED_TRACKS[executor]);
@@ -146,6 +154,15 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     case 'task.unlock': return { unlocked: await ctx.owner.unlockDependents({ taskId: text(input.taskId, 'taskId'), source: a }) };
     case 'task.pause': await ctx.owner.setPaused(true); return { paused: true };
     case 'task.resume': await ctx.owner.setPaused(false); return { paused: false };
+    case 'contributor.dryRun':
+      return ctx.core.contributorDryRun(ownerCredential(), { taskIds: strArray(input.taskIds) });
+    case 'implementer.takeover':
+      return ctx.core.implementerTakeover(ownerCredential(), {
+        taskId: text(input.taskId, 'taskId'), toEmployee: text(input.toEmployee, 'toEmployee'),
+        ...(optionalText(input.replacementReviewer) ? { replacementReviewer: optionalText(input.replacementReviewer)! } : {}),
+        expectedVersion: Number(input.expectedVersion),
+        reason: text(input.reason, 'reason', 8, 2000), idempotencyKey: key(),
+      });
     case 'task.cost': {
       if (input.taskId !== undefined) {
         const taskId = text(input.taskId, 'taskId');

@@ -65,7 +65,7 @@ const evidence = (tag: string): Evidence => ({ text: `验收修订回归证据 $
 const proofOf = (c: ClaimResult) => ({ taskId: c.task.id, deliveryId: c.deliveryId, fence: c.fence, expectedVersion: c.task.version });
 
 async function makeTask(title: string): Promise<string> {
-  const task = await core.createTask(tokens.gm!, {
+  const task = await core.createTask(tokens.owner!, {
     title: `${title} ${++seq}`, context: '经理在途任务验收要求追加的回归夹具；原任务上下文。',
     executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'read' },
     idempotencyKey: key(),
@@ -100,7 +100,7 @@ const rowOf = async (taskId: string) => {
   return rows?.[0] ?? {};
 };
 const amend = (taskId: string, expectedVersion: number, extra: Record<string, unknown> = {}) =>
-  core.taskAcceptanceAmend(tokens.gm!, { taskId, expectedVersion, ownerQuote: OWNER_QUOTE, text: AMEND_TEXT, idempotencyKey: key(), ...extra });
+  core.taskAcceptanceAmend(tokens.owner!, { taskId, expectedVersion, ownerQuote: OWNER_QUOTE, text: AMEND_TEXT, idempotencyKey: key(), ...extra });
 
 run('manager acceptance amendment on an in-flight task', () => {
   // The fresh bootstrap of this file runs schema 047 (fault repair credential) and then 048 (this amendment's kind). The
@@ -116,7 +116,7 @@ run('manager acceptance amendment on an in-flight task', () => {
     const taskId = await makeTask('在审任务');
     await execute(taskId);
     const held = await claim(taskId, 'eng2');
-    const before = await core.getTask(tokens.gm!, taskId);
+    const before = await core.getTask(tokens.owner!, taskId);
     expect(before).toMatchObject({ state: 'review', currentEmployee: 'a-eng2' });
     expect(before.leaseExpiresAt).toBe(held.leaseExpiresAt);
     const rowBefore = await rowOf(taskId);
@@ -167,7 +167,7 @@ run('manager acceptance amendment on an in-flight task', () => {
     expect(await core.dispositionNotices(tokens.eng2!, {})).toHaveLength(0);
     // 已送达的本人通知再回执仍成功、不计数；同一批里另一条本人未送达的通知照常标记，不连累整批。
     expect(await core.ackDispositionNotices(tokens.eng2!, { ids: [forReviewer[0]!.noticeKey] })).toEqual({ delivered: 0 });
-    await amend(taskId, (await core.getTask(tokens.gm!, taskId)).version);
+    await amend(taskId, (await core.getTask(tokens.owner!, taskId)).version);
     const second = await core.dispositionNotices(tokens.eng2!, {});
     expect(second).toHaveLength(1);
     expect(second[0]!.noticeKey).not.toBe(forReviewer[0]!.noticeKey);
@@ -176,18 +176,18 @@ run('manager acceptance amendment on an in-flight task', () => {
 
     // 租约未被打断：持有人用修订前领取时的租约证明直接验收。
     await core.accept(tokens.eng2!, proofOf(held), evidence('accept-after-amend'));
-    expect((await core.getTask(tokens.gm!, taskId)).state).toBe('done');
+    expect((await core.getTask(tokens.owner!, taskId)).state).toBe('done');
   });
 
   test('the amendment is readable through read_task_text and on the next claim', async () => {
     const taskId = await makeTask('待领取任务');
-    const before = await core.getTask(tokens.gm!, taskId);
+    const before = await core.getTask(tokens.owner!, taskId);
     await amend(taskId, before.version);
-    const segment = await core.taskText(tokens.gm!, { taskId, field: 'context' });
+    const segment = await core.taskText(tokens.owner!, { taskId, field: 'context' });
     expect(segment.text).toContain(OWNER_QUOTE);
     expect(segment.text).toContain(AMEND_TEXT);
     // 没有在租持有人、实现人或提交人时，默认通知为空，但修订仍然落库。
-    expect(await core.dispositionNotices(tokens.gm!, {})).toHaveLength(0);
+    expect(await core.dispositionNotices(tokens.owner!, {})).toHaveLength(0);
     const held = await claim(taskId, 'eng');
     expect(held.task.context).toContain(OWNER_QUOTE);
     expect(held.task.context).toContain(AMEND_TEXT);
@@ -210,20 +210,20 @@ run('manager acceptance amendment on an in-flight task', () => {
     const doneId = await makeTask('已完成任务');
     await execute(doneId);
     await review(doneId);
-    const doneView = await core.getTask(tokens.gm!, doneId);
+    const doneView = await core.getTask(tokens.owner!, doneId);
     expect(doneView.state).toBe('done');
     await expectRefused(amend(doneId, doneView.version), 'conflict', /does not apply to done/);
 
     const voidId = await makeTask('已作废任务');
-    await core.retireTask(tokens.gm!, { taskId: voidId, text: '作废这个回归夹具任务。', idempotencyKey: key() });
-    const voidView = await core.getTask(tokens.gm!, voidId);
+    await core.retireTask(tokens.owner!, { taskId: voidId, text: '作废这个回归夹具任务。', idempotencyKey: key() });
+    const voidView = await core.getTask(tokens.owner!, voidId);
     expect(voidView.state).toBe('void');
     await expectRefused(amend(voidId, voidView.version), 'conflict', /does not apply to void/);
   });
 
   test('only gm may amend', async () => {
     const taskId = await makeTask('权限任务');
-    const before = await core.getTask(tokens.gm!, taskId);
+    const before = await core.getTask(tokens.owner!, taskId);
     await expectRefused(core.taskAcceptanceAmend(tokens.product!, {
       taskId, expectedVersion: before.version, ownerQuote: OWNER_QUOTE, text: AMEND_TEXT, idempotencyKey: key(),
     }), 'forbidden', /Only gm/);
@@ -233,15 +233,15 @@ run('manager acceptance amendment on an in-flight task', () => {
     await expectRefused(core.taskAcceptanceAmend(tokens.qa!, {
       taskId, expectedVersion: before.version, ownerQuote: OWNER_QUOTE, text: AMEND_TEXT, idempotencyKey: key(),
     }), 'forbidden', /Capability denied/);
-    expect((await core.getTask(tokens.gm!, taskId)).version).toBe(before.version);
+    expect((await core.getTask(tokens.owner!, taskId)).version).toBe(before.version);
   });
 
   test('a replay with the same key returns the first answer and writes once', async () => {
     const taskId = await makeTask('幂等任务');
-    const before = await core.getTask(tokens.gm!, taskId);
+    const before = await core.getTask(tokens.owner!, taskId);
     const input = { taskId, expectedVersion: before.version, ownerQuote: OWNER_QUOTE, text: AMEND_TEXT, notify: ['a-qa'], idempotencyKey: key() };
-    const first = await core.taskAcceptanceAmend(tokens.gm!, input);
-    const second = await core.taskAcceptanceAmend(tokens.gm!, input);
+    const first = await core.taskAcceptanceAmend(tokens.owner!, input);
+    const second = await core.taskAcceptanceAmend(tokens.owner!, input);
     expect(second.context).toBe(first.context);
     expect(second.version).toBe(first.version);
     const [[counts]] = await database.db.query<[[{ n: number }]]>(
@@ -249,24 +249,24 @@ run('manager acceptance amendment on an in-flight task', () => {
       { task: new RecordId('task', taskId) });
     expect(counts?.n).toBe(1);
     expect(await core.dispositionNotices(tokens.qa!, {})).toHaveLength(1);
-    await expectRefused(core.taskAcceptanceAmend(tokens.gm!, { ...input, text: '同一把幂等键但换了正文。' }), 'conflict', /Idempotency key reused/);
+    await expectRefused(core.taskAcceptanceAmend(tokens.owner!, { ...input, text: '同一把幂等键但换了正文。' }), 'conflict', /Idempotency key reused/);
   });
 
   test('a stale expectedVersion is refused, even after the holder wrote once', async () => {
     const taskId = await makeTask('版本冲突任务');
-    const before = await core.getTask(tokens.gm!, taskId);
+    const before = await core.getTask(tokens.owner!, taskId);
     await expectRefused(amend(taskId, before.version + 1), 'conflict', /Task version moved/);
     const held = await claim(taskId, 'eng');
     await core.checkpoint(tokens.eng!, proofOf(held), evidence('checkpoint-before-amend'));
     await expectRefused(amend(taskId, before.version), 'conflict', /Task version moved/);
-    expect((await core.getTask(tokens.gm!, taskId)).context).not.toContain(OWNER_QUOTE);
+    expect((await core.getTask(tokens.owner!, taskId)).context).not.toContain(OWNER_QUOTE);
   });
 
   test('notify names exactly who is told, and unknown employees are refused', async () => {
     const taskId = await makeTask('显式通知任务');
     await execute(taskId);
     await claim(taskId, 'eng2');
-    const before = await core.getTask(tokens.gm!, taskId);
+    const before = await core.getTask(tokens.owner!, taskId);
     const amended = await amend(taskId, before.version, { notify: ['a-qa'] });
     expect(amended.state).toBe('review');
     expect(await core.dispositionNotices(tokens.qa!, {})).toHaveLength(1);
@@ -281,7 +281,7 @@ run('manager acceptance amendment on an in-flight task', () => {
     const taskId = await makeTask('显式空通知任务');
     await execute(taskId);
     await claim(taskId, 'eng2');
-    const before = await core.getTask(tokens.gm!, taskId);
+    const before = await core.getTask(tokens.owner!, taskId);
     const amended = await amend(taskId, before.version, { notify: [] });
     expect(amended.context).toContain(OWNER_QUOTE);
     // 持有人、实现人、最近提交人都没有收到通知。
@@ -296,16 +296,16 @@ run('manager acceptance amendment on an in-flight task', () => {
   // 审计说有两条修订而任务可读位置只剩一条。拼接移进事务后，两条都必须落地。
   test('two concurrent amendments both land in the context, with two audits and one notice each', async () => {
     const taskId = await makeTask('并发追加任务');
-    const before = await core.getTask(tokens.gm!, taskId);
+    const before = await core.getTask(tokens.owner!, taskId);
     const quoteA = '老板原话 A：并发修订第一条只看真树放行。';
     const textA = '并发修订说明 A：第一条收窄判据，必须留在任务上下文里。';
     const quoteB = '老板原话 B：并发修订第二条不认词法对抗样例。';
     const textB = '并发修订说明 B：第二条收窄判据，同样必须留在任务上下文里。';
     const results = await Promise.allSettled([
-      core.taskAcceptanceAmend(tokens.gm!, {
+      core.taskAcceptanceAmend(tokens.owner!, {
         taskId, expectedVersion: before.version, ownerQuote: quoteA, text: textA, notify: ['a-eng'], idempotencyKey: key(),
       }),
-      core.taskAcceptanceAmend(tokens.gm!, {
+      core.taskAcceptanceAmend(tokens.owner!, {
         taskId, expectedVersion: before.version, ownerQuote: quoteB, text: textB, notify: ['a-eng2'], idempotencyKey: key(),
       }),
     ]);
@@ -313,7 +313,7 @@ run('manager acceptance amendment on an in-flight task', () => {
     if (rejected.length) console.log(rejected.map(r => `${(r.reason as CompanyError).code}: ${(r.reason as CompanyError).message}`).join(' | '));
     expect(rejected).toHaveLength(0);
 
-    const after = await core.getTask(tokens.gm!, taskId);
+    const after = await core.getTask(tokens.owner!, taskId);
     expect(after.context).toContain(quoteA);
     expect(after.context).toContain(textA);
     expect(after.context).toContain(quoteB);
@@ -338,11 +338,11 @@ run('manager acceptance amendment on an in-flight task', () => {
     const text = '修'.repeat(4000);
     let rounds = 0;
     let refused: CompanyError | undefined;
-    let last = await core.getTask(tokens.gm!, taskId);
+    let last = await core.getTask(tokens.owner!, taskId);
     while (rounds < 20) {
       rounds++;
       try {
-        last = await core.taskAcceptanceAmend(tokens.gm!, {
+        last = await core.taskAcceptanceAmend(tokens.owner!, {
           taskId, expectedVersion: last.version, ownerQuote: quote, text, idempotencyKey: key(),
         });
       } catch (error) {

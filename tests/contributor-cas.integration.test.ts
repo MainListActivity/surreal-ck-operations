@@ -53,7 +53,7 @@ afterAll(async () => {
 
 const key = () => crypto.randomUUID();
 const proofOf = (c: ClaimResult) => ({ taskId: c.task.id, deliveryId: c.deliveryId, fence: c.fence, expectedVersion: c.task.version });
-const newTask = (title: string) => core.createTask(tokens.gm, { title, context: 'synthetic SYS-DISP CAS case', executorRole: 'engineering',
+const newTask = (title: string) => core.createTask(tokens.owner, { title, context: 'synthetic SYS-DISP CAS case', executorRole: 'engineering',
   reviewerRole: 'engineering', idempotencyKey: key() });
 const auditCount = async (taskId: string) => {
   const [rows] = await database.db.query<[Array<{ n: number }>]>('SELECT count() AS n FROM audit WHERE task = $task GROUP ALL;', { task: new RecordId('task', taskId) });
@@ -70,7 +70,7 @@ test('CAS retry: a claim whose contribution view moved re-reads once and binds t
   const claim = await core.claim(tokens['eng-a'], task.id);
   expect(hook.calls).toBe(2);
   expect(claim.task.currentEmployee).toBeDefined();
-  const after = await core.getTask(tokens.gm, task.id);
+  const after = await core.getTask(tokens.owner, task.id);
   expect(after.implementer).toBeDefined();
   expect(after.currentEmployee).toBe(after.implementer);
   hook.bumpOn = () => false;
@@ -83,10 +83,10 @@ test('CAS refusal: a view that keeps moving on every try is refused after the re
   hook.taskId = task.id;
   hook.calls = 0;
   hook.bumpOn = () => true;
-  const before = await core.getTask(tokens.gm, task.id);
+  const before = await core.getTask(tokens.owner, task.id);
   await expect(core.claim(tokens['eng-b'], task.id)).rejects.toMatchObject({ code: 'conflict' });
   expect(hook.calls).toBe(5);
-  const after = await core.getTask(tokens.gm, task.id);
+  const after = await core.getTask(tokens.owner, task.id);
   expect(after.currentEmployee).toBeUndefined();
   expect(after.implementer).toBeUndefined();
   expect(after.version).toBeGreaterThan(before.version);
@@ -102,9 +102,9 @@ test('dry-run is gm-only and read-only: it names the authors, the open reviewer 
   const reviewerId = review.task.currentEmployee!;
   expect(review.task.state).toBe('review');
 
-  const beforeVersion = (await core.getTask(tokens.gm, task.id)).version;
+  const beforeVersion = (await core.getTask(tokens.owner, task.id)).version;
   const beforeAudit = await auditCount(task.id);
-  const view = await core.contributorDryRun!(tokens.gm, { taskIds: [task.id] });
+  const view = await core.contributorDryRun!(tokens.owner, { taskIds: [task.id] });
   expect(view.readOnly).toBe(true);
   const row = view.tasks[0]!;
   expect(row).toMatchObject({ found: true, status: 'bound', implementer: authorId });
@@ -115,7 +115,7 @@ test('dry-run is gm-only and read-only: it names the authors, the open reviewer 
   // review claim. The binding is its own row so a later takeover never erases who wrote the code.
   expect((row.timeline ?? []).map(entry => entry.role).filter(role => role !== 'none')).toEqual(['author', 'author', 'author', 'reviewer']);
   expect((row.timeline ?? []).map(entry => entry.action)).toContain('implementer_bound');
-  expect((await core.getTask(tokens.gm, task.id)).version).toBe(beforeVersion);
+  expect((await core.getTask(tokens.owner, task.id)).version).toBe(beforeVersion);
   expect(await auditCount(task.id)).toBe(beforeAudit);
 
   await expect(core.contributorDryRun!(tokens['eng-a'], { taskIds: [task.id] })).rejects.toMatchObject({ code: 'forbidden' });
@@ -135,7 +135,7 @@ test('an author never reviews its own work, even while a reviewer holds the leas
   const first = await core.claim(tokens['eng-a'], task.id);
   await core.submit(tokens['eng-a'], proofOf(first), { text: DELIVERY, idempotencyKey: key() });
   await expect(core.claim(tokens['eng-a'], task.id)).rejects.toMatchObject({ code: 'self_review' });
-  expect((await core.getTask(tokens.gm, task.id)).currentEmployee).toBeUndefined();
+  expect((await core.getTask(tokens.owner, task.id)).currentEmployee).toBeUndefined();
 });
 
 test('dry-run answer is bounded (R3): 20 tasks with 200 audit rows each stay within 24 KiB, keep the newest rows, and mark every cut', async () => {
@@ -146,7 +146,7 @@ test('dry-run answer is bounded (R3): 20 tasks with 200 audit rows each stay wit
     await database.db.query(`FOR $i IN 0..200 { CREATE audit CONTENT { task: $task, actor: 'system:fixture', action: 'fixture_note', evidence: $evidence, version: $i, at: time::now() }; };`,
       { task: new RecordId('task', taskId), evidence: 'synthetic timeline row for the dry-run bound' });
   }
-  const view = await core.contributorDryRun!(tokens.gm, { taskIds: ids });
+  const view = await core.contributorDryRun!(tokens.owner, { taskIds: ids });
   const bytes = Buffer.byteLength(JSON.stringify(view), 'utf8');
   expect(view.budgetBytes).toBe(24 * 1024);
   expect(bytes).toBeLessThanOrEqual(24 * 1024);
@@ -160,7 +160,7 @@ test('dry-run answer is bounded (R3): 20 tasks with 200 audit rows each stay wit
   }
   // A task with few rows is answered whole and not marked.
   const small = await newTask('SYS-DISP dry-run small');
-  const whole = await core.contributorDryRun!(tokens.gm, { taskIds: [small.id] });
+  const whole = await core.contributorDryRun!(tokens.owner, { taskIds: [small.id] });
   expect(whole.truncated).toBe(false);
   expect(whole.tasks[0]!.timelineTruncated).toBe(false);
   expect(whole.tasks[0]!.timelineShown).toBe(whole.tasks[0]!.timelineTotal);

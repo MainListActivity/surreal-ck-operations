@@ -43,10 +43,10 @@ afterAll(async () => {
 const key = () => crypto.randomUUID();
 const proofOf = (c: ClaimResult | { task: TaskView; deliveryId: string; fence: number }, version = c.task.version) =>
   ({ taskId: c.task.id, deliveryId: c.deliveryId, fence: c.fence, expectedVersion: version });
-const task = async (id: string) => core.getTask(tokens.gm, id);
+const task = async (id: string) => core.getTask(tokens.owner, id);
 const DELIVERY = 'Synthetic delivery evidence for the AC06 implementer binding test.';
 const REVIEW = 'Independent synthetic review evidence for the AC06 implementer binding test.';
-const newTask = (title: string) => core.createTask(tokens.gm, { title, context: 'synthetic AC06 case', executorRole: 'engineering',
+const newTask = (title: string) => core.createTask(tokens.owner, { title, context: 'synthetic AC06 case', executorRole: 'engineering',
   reviewerRole: 'engineering', idempotencyKey: key() });
 async function deliver(token: string, taskId: string) {
   const claim = await core.claim(token, taskId);
@@ -79,7 +79,7 @@ test('AC06 all authors excluded: A and B both wrote the task, neither may review
   await deliver(tokens['eng-a'], t.id);
   await review(tokens['eng-b'], t.id, 'return');
   // B is a reviewer, so the takeover needs a named replacement reviewer who is independent of every author.
-  const taken = await core.implementerTakeover(tokens.gm, { taskId: t.id, toEmployee: 't-eng-b', replacementReviewer: 't-eng-c',
+  const taken = await core.implementerTakeover(tokens.owner, { taskId: t.id, toEmployee: 't-eng-b', replacementReviewer: 't-eng-c',
     expectedVersion: (await task(t.id)).version, reason: '经理指定 eng-b 接手代码，eng-c 作为独立复核人', idempotencyKey: key() });
   expect(taken).toMatchObject({ implementer: 't-eng-b', state: 'ready' });
   await deliver(tokens['eng-b'], t.id);
@@ -121,8 +121,8 @@ test('AC06 two managers take over at once: one takeover lands on the version, th
   const before = await task(t.id);
   const expectedVersion = before.version;
   const results = await Promise.allSettled([
-    core.implementerTakeover(tokens.gm, { taskId: t.id, toEmployee: 't-eng-b', expectedVersion, reason: 'gm 甲指定 eng-b 接手代码', idempotencyKey: key() }),
-    core.implementerTakeover(tokens.gm2, { taskId: t.id, toEmployee: 't-eng-c', expectedVersion, reason: 'gm 乙指定 eng-c 接手代码', idempotencyKey: key() }),
+    core.implementerTakeover(tokens.owner, { taskId: t.id, toEmployee: 't-eng-b', expectedVersion, reason: 'gm 甲指定 eng-b 接手代码', idempotencyKey: key() }),
+    core.implementerTakeover(tokens.owner2, { taskId: t.id, toEmployee: 't-eng-c', expectedVersion, reason: 'gm 乙指定 eng-c 接手代码', idempotencyKey: key() }),
   ]);
   const won = results.flatMap(r => r.status === 'fulfilled' ? [r.value] : []);
   const lost = results.flatMap(r => r.status === 'rejected' ? [r.reason as { code?: string }] : []);
@@ -136,20 +136,20 @@ test('AC06 implementer takeover refusals: wrong phase, wrong target, same implem
   const t = await newTask('AC06 接手拒绝');
   await deliver(tokens['eng-a'], t.id);
   // In review the task is not in the execute phase, so a takeover is refused as moved.
-  await expect(core.implementerTakeover(tokens.gm, { taskId: t.id, toEmployee: 't-eng-b', expectedVersion: (await task(t.id)).version,
+  await expect(core.implementerTakeover(tokens.owner, { taskId: t.id, toEmployee: 't-eng-b', expectedVersion: (await task(t.id)).version,
     reason: '审验阶段不可接手代码', idempotencyKey: key() })).rejects.toMatchObject({ code: 'conflict' });
   await review(tokens['eng-b'], t.id, 'return');
   const version = (await task(t.id)).version;
-  await expect(core.implementerTakeover(tokens.gm, { taskId: t.id, toEmployee: 't-qa', expectedVersion: version,
+  await expect(core.implementerTakeover(tokens.owner, { taskId: t.id, toEmployee: 't-qa', expectedVersion: version,
     reason: 'qa 不能写工程代码', idempotencyKey: key() })).rejects.toMatchObject({ code: 'invalid' });
-  await expect(core.implementerTakeover(tokens.gm, { taskId: t.id, toEmployee: 't-eng-a', expectedVersion: version,
+  await expect(core.implementerTakeover(tokens.owner, { taskId: t.id, toEmployee: 't-eng-a', expectedVersion: version,
     reason: '实现者本人重复接手', idempotencyKey: key() })).rejects.toMatchObject({ code: 'invalid' });
   // A stale expectedVersion is a CAS miss. The target must pass the static checks first (a current reviewer is refused as invalid before
   // the version is compared), so the stale case uses eng-c, who never reviewed or wrote the task.
-  await expect(core.implementerTakeover(tokens.gm, { taskId: t.id, toEmployee: 't-eng-c', expectedVersion: version - 1,
+  await expect(core.implementerTakeover(tokens.owner, { taskId: t.id, toEmployee: 't-eng-c', expectedVersion: version - 1,
     reason: '版本号过期的接手请求', idempotencyKey: key() })).rejects.toMatchObject({ code: 'conflict' });
   // B is a reviewer, so the replacement must be independent: A is an author and cannot be it.
-  await expect(core.implementerTakeover(tokens.gm, { taskId: t.id, toEmployee: 't-eng-b', replacementReviewer: 't-eng-a',
+  await expect(core.implementerTakeover(tokens.owner, { taskId: t.id, toEmployee: 't-eng-b', replacementReviewer: 't-eng-a',
     expectedVersion: version, reason: '替代复核人不能是作者', idempotencyKey: key() })).rejects.toMatchObject({ code: 'invalid' });
   expect(await task(t.id)).toMatchObject({ state: 'ready', implementer: 't-eng-a' });
 });
@@ -162,14 +162,14 @@ test('AC04 (R4): a block raised in review does not open the execute-phase takeov
   await core.block(tokens['eng-b'], proofOf(reviewClaim), 'owner', { text: 'SYNTHETIC review-phase block for the AC04 takeover refusal.', idempotencyKey: key() });
   const blocked = await task(inReview.id);
   expect(blocked).toMatchObject({ state: 'blocked', implementer: 't-eng-a' });
-  await expect(core.implementerTakeover(tokens.gm, { taskId: inReview.id, toEmployee: 't-eng-c', expectedVersion: blocked.version,
+  await expect(core.implementerTakeover(tokens.owner, { taskId: inReview.id, toEmployee: 't-eng-c', expectedVersion: blocked.version,
     reason: 'SYNTHETIC takeover of a review-phase block, must be refused', idempotencyKey: key() })).rejects.toMatchObject({ code: 'conflict' });
   expect(await task(inReview.id)).toMatchObject({ state: 'blocked', implementer: 't-eng-a', version: blocked.version });
   // Blocked in execute: the phase that resumes is execute, so the same takeover is allowed.
   const inExecute = await newTask('AC04 执行阶段阻塞可接手');
   const first = await core.claim(tokens['eng-a'], inExecute.id);
   await core.block(tokens['eng-a'], proofOf(first), 'owner', { text: 'SYNTHETIC execute-phase block for the AC04 takeover allowance.', idempotencyKey: key() });
-  const taken = await core.implementerTakeover(tokens.gm, { taskId: inExecute.id, toEmployee: 't-eng-b', expectedVersion: (await task(inExecute.id)).version,
+  const taken = await core.implementerTakeover(tokens.owner, { taskId: inExecute.id, toEmployee: 't-eng-b', expectedVersion: (await task(inExecute.id)).version,
     reason: 'SYNTHETIC takeover of an execute-phase block, allowed', idempotencyKey: key() });
   expect(taken).toMatchObject({ implementer: 't-eng-b', state: 'blocked' });
 });
@@ -181,12 +181,12 @@ test('implementer takeover refuses a target bound to another goal workspace: it 
   const version = (await task(t.id)).version;
   await database.db.query("UPDATE employee:⟨t-eng-c⟩ SET workspace_scope = 'other-goal';");
   try {
-    await expect(core.implementerTakeover(tokens.gm, { taskId: t.id, toEmployee: 't-eng-c', expectedVersion: version,
+    await expect(core.implementerTakeover(tokens.owner, { taskId: t.id, toEmployee: 't-eng-c', expectedVersion: version,
       reason: '目标工作区不一致的接手', idempotencyKey: key() })).rejects.toMatchObject({ code: 'invalid' });
     expect(await task(t.id)).toMatchObject({ implementer: 't-eng-a' });
     // The same employee in the task's own workspace (no goal: maintenance) is accepted.
     await database.db.query("UPDATE employee:⟨t-eng-c⟩ SET workspace_scope = 'maintenance';");
-    await expect(core.implementerTakeover(tokens.gm, { taskId: t.id, toEmployee: 't-eng-c', expectedVersion: version,
+    await expect(core.implementerTakeover(tokens.owner, { taskId: t.id, toEmployee: 't-eng-c', expectedVersion: version,
       reason: '同一工作区的接手', idempotencyKey: key() })).resolves.toMatchObject({ implementer: 't-eng-c' });
   } finally {
     await database.db.query('UPDATE employee:⟨t-eng-c⟩ SET workspace_scope = NONE;');
@@ -200,11 +200,11 @@ test('takeover refuses a different repository and a retired successor without ch
   try {
     for (const system of [false, true]) {
       const input = {taskId:t.id,toEmployee:'t-eng-c',expectedVersion:t.version,reason:'错误仓库不能成为接手负责人',idempotencyKey:key()};
-      await expect(system ? core.systemImplementerTakeover(input) : core.implementerTakeover(tokens.gm,input)).rejects.toMatchObject({code:'invalid'});
+      await expect(system ? core.systemImplementerTakeover(input) : core.implementerTakeover(tokens.owner,input)).rejects.toMatchObject({code:'invalid'});
       expect((await task(t.id)).version).toBe(t.version);
     }
     await database.db.query("UPDATE employee:⟨t-eng-c⟩ SET workspace_repo = '/right-repo', retired = true;");
-    await expect(core.implementerTakeover(tokens.gm,{taskId:t.id,toEmployee:'t-eng-c',expectedVersion:t.version,reason:'退役员工不能成为接手负责人',idempotencyKey:key()})).rejects.toMatchObject({code:'invalid'});
+    await expect(core.implementerTakeover(tokens.owner,{taskId:t.id,toEmployee:'t-eng-c',expectedVersion:t.version,reason:'退役员工不能成为接手负责人',idempotencyKey:key()})).rejects.toMatchObject({code:'invalid'});
   } finally { await database.db.query('UPDATE employee:⟨t-eng-c⟩ SET workspace_repo = NONE, retired = false;'); }
 });
 
@@ -212,17 +212,17 @@ test('takeover refuses a different repository and a retired successor without ch
 test('independent cleanup is gated atomically at creation, claim and both takeover paths', async () => {
   const source = await newTask('原执行人的补偿核查来源');
   await deliver(tokens['eng-a'],source.id);
-  const t = await core.createTask(tokens.gm,{title:'独立核查原任务',context:'结构化隔离，不依赖员工阅读正文',executorRole:'engineering',reviewerRole:'qa',workIntent:{kind:'read'},
+  const t = await core.createTask(tokens.owner,{title:'独立核查原任务',context:'结构化隔离，不依赖员工阅读正文',executorRole:'engineering',reviewerRole:'qa',workIntent:{kind:'read'},
     independence:{stages:['execute'],sources:[source.id],mode:'execute_handlers',reason:'原执行人不得复核自己的操作'},idempotencyKey:key()});
   expect(t.independence).toMatchObject({revision:1,sources:[source.id],stages:['execute']});
   await expect(core.claim(tokens['eng-a'],t.id)).rejects.toMatchObject({code:'forbidden'});
   for(const system of [false,true]) {
     const input={taskId:t.id,toEmployee:'t-eng-a',expectedVersion:t.version,reason:'禁止通过接手绕过独立性约束',idempotencyKey:key()};
-    await expect(system?core.systemImplementerTakeover(input):core.implementerTakeover(tokens.gm,input)).rejects.toMatchObject({code:'forbidden'});
+    await expect(system?core.systemImplementerTakeover(input):core.implementerTakeover(tokens.owner,input)).rejects.toMatchObject({code:'forbidden'});
   }
   expect((await task(t.id)).version).toBe(t.version);
-  const moved=await core.implementerTakeover(tokens.gm,{taskId:t.id,toEmployee:'t-eng-c',expectedVersion:t.version,reason:'交给未参与源任务的独立工程员工',idempotencyKey:key()});
-  const auto=await core.createTask(tokens.gm,{title:'系统接替也须执行来源栅栏',context:'自动接替事务实测',executorRole:'engineering',reviewerRole:'qa',independence:{stages:['execute'],sources:[source.id],mode:'execute_handlers',reason:'系统接替同样隔离来源作者'},idempotencyKey:key()});
+  const moved=await core.implementerTakeover(tokens.owner,{taskId:t.id,toEmployee:'t-eng-c',expectedVersion:t.version,reason:'交给未参与源任务的独立工程员工',idempotencyKey:key()});
+  const auto=await core.createTask(tokens.owner,{title:'系统接替也须执行来源栅栏',context:'自动接替事务实测',executorRole:'engineering',reviewerRole:'qa',independence:{stages:['execute'],sources:[source.id],mode:'execute_handlers',reason:'系统接替同样隔离来源作者'},idempotencyKey:key()});
   await expect(core.systemImplementerTakeover({taskId:auto.id,toEmployee:'t-eng-b',expectedVersion:auto.version,reason:'交给无来源贡献的合法独立员工'})).resolves.toMatchObject({implementer:'t-eng-b'});
   const [sourceGuard]=await database.db.query<[number]>('RETURN (SELECT VALUE independence_guard FROM ONLY $source);',{source:new RecordId('task',source.id)});
   expect(sourceGuard).toBe((await task(source.id)).version);
@@ -232,7 +232,7 @@ test('independent cleanup is gated atomically at creation, claim and both takeov
 
 test('invalid independent source refuses creation without leaking a runnable task',async()=>{
  const title='不存在来源不得创建可抢领的独立任务';
- await expect(core.createTask(tokens.gm,{title,context:'不存在来源',executorRole:'engineering',reviewerRole:'qa',independence:{stages:['execute'],sources:['missing-source'],mode:'execute_handlers',reason:'必须存在来源'},idempotencyKey:key()})).rejects.toMatchObject({code:'invalid'});
+ await expect(core.createTask(tokens.owner,{title,context:'不存在来源',executorRole:'engineering',reviewerRole:'qa',independence:{stages:['execute'],sources:['missing-source'],mode:'execute_handlers',reason:'必须存在来源'},idempotencyKey:key()})).rejects.toMatchObject({code:'invalid'});
  const [rows]=await database.db.query<[unknown[]]>('SELECT id FROM task WHERE title=$title;',{title});
  expect(rows).toEqual([]);
 });
@@ -248,11 +248,11 @@ test('direct claim cannot bypass repository routing even with a matching role',a
 
 test('source changes after admission refuse both takeover transactions without binding a stale successor',async()=>{
  const source=await newTask('接手来源版本并发变化');
- const t=await core.createTask(tokens.gm,{title:'异人接手版本栅栏',context:'source变化拒绝陈旧授权',executorRole:'engineering',reviewerRole:'qa',independence:{stages:['execute'],sources:[source.id],mode:'execute_handlers',reason:'来源贡献必须在提交时仍有效'},idempotencyKey:key()});
+ const t=await core.createTask(tokens.owner,{title:'异人接手版本栅栏',context:'source变化拒绝陈旧授权',executorRole:'engineering',reviewerRole:'qa',independence:{stages:['execute'],sources:[source.id],mode:'execute_handlers',reason:'来源贡献必须在提交时仍有效'},idempotencyKey:key()});
  const racing=new SurrealCompanyCore(database,{workforce,contributionReadHook:async()=>{await database.db.query('UPDATE ONLY $source SET version += 1;',{source:new RecordId('task',source.id)});}});
  for(const system of [false,true]){
   const input={taskId:t.id,toEmployee:'t-eng-b',expectedVersion:t.version,reason:'并发来源修改必须拒绝整笔接手',idempotencyKey:key()};
-  await expect(system?racing.systemImplementerTakeover(input):racing.implementerTakeover(tokens.gm,input)).rejects.toMatchObject({code:'conflict'});
+  await expect(system?racing.systemImplementerTakeover(input):racing.implementerTakeover(tokens.owner,input)).rejects.toMatchObject({code:'conflict'});
   expect(await task(t.id)).toMatchObject({version:t.version,state:'ready'});
   expect((await task(t.id)).implementer).toBeUndefined();
  }
