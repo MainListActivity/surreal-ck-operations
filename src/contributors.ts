@@ -395,7 +395,7 @@ export function proposeImplementer(taskId: string, facts: ContributionFacts, exp
   const unknownNote = facts.unknown.length ? `；${facts.unknown.length} 条历史无法判定阶段，按作者处理` : '';
   if (recorded) return { ...base, status: 'bound', implementer: recorded, note: `已绑定实现负责人，不做变更${unknownNote}` };
   if (facts.ambiguous) {
-    return { ...base, status: 'manager_decision', note: `多名经手人且无显式实现负责人，需经理用 implementer_takeover 指定其一${unknownNote}` };
+    return { ...base, status: 'manager_decision', note: `多名经手人且无显式实现负责人，需老板用 sck owner implementer.takeover 指定其一${unknownNote}` };
   }
   if (facts.authors.length === 1) {
     return { ...base, status: 'proposal', suggestedImplementer: facts.authors[0],

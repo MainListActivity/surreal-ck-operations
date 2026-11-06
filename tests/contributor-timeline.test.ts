@@ -59,7 +59,7 @@ describe('04195c93 replayed through the derivation', () => {
     expect(facts.unknown).toEqual([]);
     const proposal = proposeImplementer('04195c93-c792-4012-9f45-7a1fe17950fc', facts);
     expect(proposal.status).toBe('manager_decision');
-    expect(proposal.note).toContain('implementer_takeover');
+    expect(proposal.note).toContain('implementer.takeover');
   });
 });
 

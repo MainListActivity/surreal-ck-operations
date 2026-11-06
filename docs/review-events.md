@@ -6,7 +6,7 @@ scope 请求时都没有任何东西通知它，窗口一过就错过；用 shel
 
 ## 两种角色，两条路径
 
-**GM（`manage`）登记订阅** —— `review_watch_register`
+**老板（owner，`manage`）登记订阅** —— `review_watch_register`
 
 - 只接受同 goal 的一对任务：`sourceTaskId`（必须是 `reviewerRole=qa` 的任务）与 `collaborationTaskId`（未终态）。
   两项都是**精确任务 id**，没有通配符、没有模式、没有跨 goal 的写法。
@@ -39,7 +39,7 @@ reference=review-watch:<watchId>
 订阅上，关闭的订阅也不能继续让任务停在队列外。
 
 事件到达时只做一件事：解除这个任务自己的 feedback 等待（同一个 `releaseOne` 事务），任务回到 `ready`，调度器
-下一轮重新派 GM。**它不创建 `qa_observation_scope`、不写验收证据、不改源任务租约、不把 QA 的等待变成产品 return。**
+下一轮重新提醒老板。**它不创建 `qa_observation_scope`、不写验收证据、不改源任务租约、不把 QA 的等待变成产品 return。**
 
 ## 幂等、失效与零轮询
 
@@ -56,11 +56,11 @@ reference=review-watch:<watchId>
 
 | 工具 | 角色 | 说明 |
 | --- | --- | --- |
-| `review_watch_register` | gm | 登记/重开一条同 goal 订阅，并补交付当前状态 |
-| `review_watch_close` | gm | 按版本关闭；未交付事件作废 |
-| `review_watch_status` | gm / qa | 只读：租约事实、最近信号、事件交付结果 |
+| `review_watch_register` | owner | 登记/重开一条同 goal 订阅，并补交付当前状态 |
+| `review_watch_close` | owner | 按版本关闭；未交付事件作废 |
+| `review_watch_status` | owner / qa | 只读：租约事实、最近信号、事件交付结果 |
 | `qa_review_scope_signal` | qa（活跃复核租约持有人） | request / positive retract |
-| `review_scope_signals` | gm / qa | 只读信号历史（qa 只看自己的） |
+| `review_scope_signals` | owner / qa | 只读信号历史（qa 只看自己的） |
 
 ## 回滚隔离（RB01）
 
@@ -71,6 +71,6 @@ reference=review-watch:<watchId>
 
 - `tests/review-events.test.ts`：纯规则（事件身份、订阅对、事件类型、subject 归一、失效判定）。
 - `tests/review-events.fork.test.ts`：公司 fork 真实事务，覆盖事件先于登记、登记先于事件、20 并发、重启、旧
-  fence、return 重领、重复通知、授权/撤销两阶段、零轮询，以及非 gm / 跨 goal / 假 holder / 假 fence / 跨 goal
+  fence、return 重领、重复通知、授权/撤销两阶段、零轮询，以及非 owner / 跨 goal / 假 holder / 假 fence / 跨 goal
   subject / 给别家订阅等待 / checkpoint 文本自授权的负例。
 - 两个文件都在 `sidecar-review` 发布门禁里（`RUN_SCK_REVIEW_EVENT_FORK_TESTS=1`）。

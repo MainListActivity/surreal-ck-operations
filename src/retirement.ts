@@ -65,14 +65,14 @@ export function retirementRefusals(employeeId: string, candidates: readonly Reti
  */
 function legalActionFor(phase: 'execute' | 'review', reason: RetireRefusalReason, ids: string): string {
   if (phase === 'review') {
-    if (reason === 'active_lease') return `任务 ${ids} 处于复核阶段且该员工持有复核租约：等待复核完成；租约过期后由调度器收回，并重新安排独立复核。复核阶段不能提前接手，也没有受权的提前释放入口，需要提前退役时报经理`;
-    if (reason === 'bound_implementer') return `任务 ${ids} 处于复核阶段且该员工为实现人：等待复核完成（通过则结束，退回则回到执行阶段）；回到执行阶段后，才可由经理按执行阶段规则交接实现人`;
-    return `任务 ${ids} 处于复核阶段且缺少实现人字段：等待复核完成；退回到执行阶段后，经理核对贡献记录，再按执行阶段规则记录唯一实现人`;
+    if (reason === 'active_lease') return `任务 ${ids} 处于复核阶段且该员工持有复核租约：等待复核完成；租约过期后由调度器收回，并重新安排独立复核。复核阶段不能提前接手，也没有受权的提前释放入口，需要提前退役时报老板`;
+    if (reason === 'bound_implementer') return `任务 ${ids} 处于复核阶段且该员工为实现人：等待复核完成（通过则结束，退回则回到执行阶段）；回到执行阶段后，才可由老板按执行阶段规则交接实现人`;
+    return `任务 ${ids} 处于复核阶段且缺少实现人字段：等待复核完成；退回到执行阶段后，老板核对贡献记录，再按执行阶段规则记录唯一实现人`;
   }
-  if (reason === 'active_lease') return `任务 ${ids} 仍有租约：等待任务结束（完成或作废）。租约过期或被收回不会解除该员工与任务的关系（实现人或作者），需要提前退役时，经理用 implementer_takeover 把实现人交接给其他工程员工，原租约随之撤销`;
-  if (reason === 'bound_implementer') return `任务 ${ids} 绑定该员工为实现人且尚未结束（返修或阻塞中）：等待任务结束；需要提前退役时，经理用 implementer_takeover 把实现人交接给其他工程员工`;
-  if (reason === 'legacy_implementer') return `任务 ${ids} 缺少实现人字段，无法在线确认：经理用 contributor_dryrun 核对贡献记录后，用 implementer_takeover 记录唯一实现人，或等待任务结束`;
-  return `任务 ${ids} 有多名经手人且无实现人：经理用 contributor_dryrun 核对后，用 implementer_takeover 记录唯一实现人，或等待任务结束`;
+  if (reason === 'active_lease') return `任务 ${ids} 仍有租约：等待任务结束（完成或作废）。租约过期或被收回不会解除该员工与任务的关系（实现人或作者），需要提前退役时，老板用 sck owner implementer.takeover 把实现人交接给其他工程员工，原租约随之撤销`;
+  if (reason === 'bound_implementer') return `任务 ${ids} 绑定该员工为实现人且尚未结束（返修或阻塞中）：等待任务结束；需要提前退役时，老板用 sck owner implementer.takeover 把实现人交接给其他工程员工`;
+  if (reason === 'legacy_implementer') return `任务 ${ids} 缺少实现人字段，无法在线确认：老板用 sck owner contributor.dryRun 核对贡献记录后，用 sck owner implementer.takeover 记录唯一实现人，或等待任务结束`;
+  return `任务 ${ids} 有多名经手人且无实现人：老板用 sck owner contributor.dryRun 核对后，用 sck owner implementer.takeover 记录唯一实现人，或等待任务结束`;
 }
 
 /** The legal next steps, one per phase and reason, with the task ids of that group. Each one ends the relation; none goes around the gate. */

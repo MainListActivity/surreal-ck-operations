@@ -5,9 +5,9 @@ import type { Role } from './contracts.ts';
 import { OwnerDesk, type OwnerCommandKind } from './owner.ts';
 import { Workforce } from './workforce.ts';
 
-const usage = `老板入口（也可直接在 SurrealDB 写 owner_command 表，或在 Paseo 里对经理说）
+const usage = `老板入口（也可直接在 SurrealDB 写 owner_command 表，或在 Paseo 里说）
   pnpm run company goal [--tier quick|standard|program] [--project <项目>] [--pipeline software|video|story] "<目标>"
-                                             提出新目标；不指定 tier 时由 Jev/经理分级
+                                             提出新目标；不指定 tier 时由 Jev 分级（不确定时报你定级）
   pnpm run company direction "<公司方向>"    记录公司运作方向，所有员工可见
   pnpm run company inbox                     查看待你决定的关口、员工提问和系统提醒
   pnpm run company approve <任务ID> [意见]   批准关口

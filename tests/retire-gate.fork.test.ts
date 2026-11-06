@@ -334,7 +334,7 @@ test('(g6) several claim-only handlers, no author and no implementer: every hand
   for (const who of [one, two]) {
     const error = await refusal(workforce.retire(who, WHY, 'manual'));
     expect(error.details?.reasons).toEqual([expect.objectContaining({ taskId: t.id, state: 'ready', phase: 'execute', reason: 'implementer_unresolved' })]);
-    expect(error.details?.legalActions.join('\n')).toContain('implementer_takeover');
+    expect(error.details?.legalActions.join('\n')).toContain('implementer.takeover');
     expect(await isRetired(who)).toBe(false);
   }
 });

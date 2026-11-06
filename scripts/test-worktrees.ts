@@ -86,7 +86,7 @@ try {
     'tests/deploy-drill.test.ts', 'tests/deploy-drill-runner.test.ts', 'tests/deploy-drill-node-host.test.ts', 'tests/deploy-drill-access.fork.test.ts',
     // SYS-INT：QA 评审协同的持久事件唤醒（自建隔离库；订阅/信号/事件只解除协同任务自己的 feedback 等待）。
     'tests/review-events.test.ts', 'tests/review-events.fork.test.ts',
-    // 经理在途任务验收要求追加（自建隔离库；验证租约不中断、门禁不动、通知可读可 ack、幂等与版本 CAS）。
+    // 老板对在途任务追加验收要求（自建隔离库；验证租约不中断、门禁不动、通知可读可 ack、幂等与版本 CAS）。
     'tests/task-acceptance-amend.fork.test.ts',  ];
   const test = Bun.spawn([process.execPath, 'test', ...targets], { detached: true, stdout: 'inherit', stderr: 'inherit', env: {
     ...process.env, SCK_PRODUCT_ENV: '/dev/null', SURREAL_URL: `ws://127.0.0.1:${port}/rpc`, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: rootPassword,
