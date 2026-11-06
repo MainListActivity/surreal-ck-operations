@@ -5,7 +5,7 @@ grant 不是执行租约，不能写任务、不能 checkpoint/submit/review/rep
 
 ## 1. 授权与通道
 
-- 只有 gm 能签发，必须绑定：源任务（done 且已有 fault episode）、员工、单一别名、四条精确 GET 路径、
+- 只有老板（owner）能签发，必须绑定：源任务（done 且已有 fault episode）、员工、单一别名、四条精确 GET 路径、
   截止时间与一份同目标已完成的 `authorization_task`；签发者不得自授。
 - 每个源任务一条 `recovery_read_chain` 链头；并发的两笔签发只有一笔能建成链，另一笔按已有链拒绝。
   新 grant / rearm 从上一链原样承接 `login_attempts`、`per_path` 等计数，**不清零**。

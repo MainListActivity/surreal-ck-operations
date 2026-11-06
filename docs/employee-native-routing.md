@@ -5,7 +5,7 @@
 ## 验收条件
 
 1. 公司创建的会话由派工标记立即登记；恢复的会话按 `employee.paseo_agent_id` 核实。本地只保存正向 agent ID，不保存凭证。标题、目录、客户端模型名均不作为身份依据。登记查询失败、超时不能转为非员工；已登记员工在插件重载期间继续被识别。
-2. GM 使用 `claude-opus-5-5`，产品使用 `claude-sonnet-5-5`，其余 Claude 员工使用 `claude-haiku-5-5`，Haiku 默认 `thinkingOptionId=max`。Factory 与故事作者保留既有客户端及编制。原生名称不改变托管派工、额度例外或任务档位约束；Fable 仍只供老板手动使用。
+2. owner（老板）使用 `claude-opus-5-5`，产品使用 `claude-sonnet-5-5`，其余 Claude 员工使用 `claude-haiku-5-5`，Haiku 默认 `thinkingOptionId=max`。Factory 与故事作者保留既有客户端及编制。原生名称不改变托管派工、额度例外或任务档位约束；Fable 仍只供老板手动使用。
 3. 员工从工程根目录启动时，启动器通过 `--settings` 显式加载私有 comm 设置，不在工程根写公司路由设置。手动会话不注入该参数。私有设置不存在时员工启动拒绝，不能静默直连。
 4. 网关将原生客户端名称转为被授权的公司档位组，保留请求的 effort；模型只能由组内成员服务。托管组显式声明 low/medium/high/xhigh/max，未固定成员按 Magpie 的能力映射执行；已有固定成员等级保留。Opus 组配置仍由老板维护，不被重写。
 5. 台账区分请求等级和上游明确报告等级。未报告时是未知，不能由模型后缀、客户端选择或 thinking.type 推断已按 Max 执行。上游报告也不等于对底层计算量的独立证明。

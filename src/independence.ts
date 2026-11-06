@@ -164,10 +164,10 @@ export function independenceHit(index: IndependenceIndex, employee: EmployeeId |
 
 /** Owner-facing text for a hit, for the dispatcher's candidate reasons. */
 export function independenceText(hit: IndependenceHit): string {
-  if (hit.via === 'explicit') return '经理指定回避的员工，不能接手或复核本任务';
+  if (hit.via === 'explicit') return '老板指定回避的员工，不能接手或复核本任务';
   if (hit.via === 'same_principal') {
     return hit.source === undefined
-      ? `与经理指定回避的员工 ${hit.matched} 同一登记身份（principal ${hit.principal}），不能接手或复核本任务`
+      ? `与老板指定回避的员工 ${hit.matched} 同一登记身份（principal ${hit.principal}），不能接手或复核本任务`
       : `与来源任务 ${hit.source} 的经手人 ${hit.matched} 同一登记身份（principal ${hit.principal}），不能接手或复核本任务`;
   }
   return `来源任务 ${hit.source} 的经手人 ${hit.matched}，不能接手或复核本任务`;

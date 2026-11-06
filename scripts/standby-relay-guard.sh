@@ -269,7 +269,7 @@ standby_relay_refusal_reason() {
     *) standby_relay_unreadable=1 ;;
   esac
   if [ "$standby_relay_unreadable" -ne 0 ]; then
-    echo "目标代码的 standby 接力契约无法判定（代码扫描器不可用或源码不可读）：无法证明它会在待命期内豁免收回、超时回经理关口"
+    echo "目标代码的 standby 接力契约无法判定（代码扫描器不可用或源码不可读）：无法证明它会在待命期内豁免收回、超时回老板关口"
     if [ -n "$standby_relay_missing" ]; then
       # One reason per distinct line: the same unreadable file is reported once per check.
       echo "不可读的证据："
@@ -278,7 +278,7 @@ standby_relay_refusal_reason() {
     return 0
   fi
   if [ -n "$standby_relay_missing" ]; then
-    echo "目标代码的 standby 接力契约不完整（capability/core/contracts/dispatcher/workforce 标记不满足）：无法证明它会在待命期内豁免收回、超时回经理关口"
+    echo "目标代码的 standby 接力契约不完整（capability/core/contracts/dispatcher/workforce 标记不满足）：无法证明它会在待命期内豁免收回、超时回老板关口"
     echo "缺少的契约证据："
     printf '%s\n' "$standby_relay_missing" | awk 'NF && !seen[$0]++'
     return 0

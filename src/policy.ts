@@ -23,7 +23,7 @@ export const POLICY_DOMAINS = ['write_authority', 'tool_scope', 'gate'] as const
 export type PolicyDomain = typeof POLICY_DOMAINS[number];
 export const POLICY_STATUSES = ['active', 'superseded', 'revoked'] as const;
 export type PolicyStatus = typeof POLICY_STATUSES[number];
-/** 授权来源：owner = 老板方向转录（须能对回一条已登记方向）；manager = 经理/运营按岗位授权。 */
+/** 授权来源：owner = 老板方向转录（须能对回一条已登记方向）；manager = 运营/系统按岗位授权。 */
 export const POLICY_SOURCES = ['owner', 'manager'] as const;
 export type PolicySource = typeof POLICY_SOURCES[number];
 export const WORK_INTENT_KINDS = ['read', 'code', 'assets'] as const;
@@ -386,7 +386,7 @@ export function dispatchVerdict(facts: PolicyTaskFacts, contract: EffectiveContr
     !contract.domains.some(entry => entry.domain === domain));
   if (lostDomain) {
     return { verdict: 'blocked', hash: contract.hash,
-      reason: '原授权版本已到期或被撤销：当前有效契约里没有生效的写权/工具/关口版本，需经理按新契约重新授权或隔离本任务' };
+      reason: '原授权版本已到期或被撤销：当前有效契约里没有生效的写权/工具/关口版本，需老板按新契约重新授权或隔离本任务' };
   }
   const intent = facts.workIntent ? { kind: facts.workIntent.kind, ...(facts.workIntent.lane !== undefined ? { lane: facts.workIntent.lane } : {}) } as WorkIntent : undefined;
   const verdict = checkWriteAuthority(contract, { role: facts.executorRole, kind: facts.kind ?? 'task',

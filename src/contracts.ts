@@ -20,7 +20,7 @@ export type RetirementKind = 'rotation' | 'archive' | 'failure' | 'manual';
 export type ReviewerRole = Role | 'owner';
 /** release：上线申请，由运营（或 Jev）决定是否上线；deploy：合入部署，由 qa 在生产实测验收。 */
 export type TaskKind = 'goal' | 'task' | 'gate' | 'release' | 'deploy';
-/** quick：小开发任务，运营验收即结束；standard：经理拆解，老板终验；program：先做范围提案的大目标。 */
+/** quick：单一需求，一个任务即可完成；standard：方向清楚的一个任务，需要更多步时老板加任务并用依赖串起来；program：方向性目标，老板按需求拆成多个任务并用依赖串起来。 */
 export type GoalTier = 'quick' | 'standard' | 'program';
 export type EmployeeId = string;
 export type TaskId = string;
@@ -1929,7 +1929,7 @@ export interface PolicyView {
 }
 
 /**
- * 写入一版机器策略。授权来源只有老板转录（owner，须能对回一条已登记的老板方向）与经理/运营（manager）两种；
+ * 写入一版机器策略。授权来源只有老板转录（owner，须能对回一条已登记的老板方向）与运营/系统（manager）两种；
  * 同（作用域, 域）已有生效版本时必须显式 supersedes，否则拒绝——不允许"最新一条文本"静默覆盖。
  */
 export interface PolicySet {
