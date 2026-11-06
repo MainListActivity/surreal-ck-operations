@@ -9,7 +9,7 @@
 | review | 已提交，等待独立验收 | 验收岗位中非提交者的员工；`reviewerRole=owner` 的关口由老板决定 |
 | blocked | 等依赖或老板 | 正式依赖等待（`blocked_to` 为空）完成后按原阶段恢复：执行回 ready，复核回 review；`blocked_to=owner` 进老板待办 |
 
-任务视图用 `waiting` 给出同一事实（RW06 C3）：`kind=manager|owner|dependency`、恢复阶段 `resumeState`、岗位 `role` 与依赖数 `dependenciesCount`（依赖 id 在任务自身的 `dependencies` 字段）；复核等待显示原复核岗位（`resumeRole` 为空时取任务 `reviewerRole`，不会误显示成执行等待），缺少的事实显示 `unknown`。切换发布版本前，`scripts/review-wait-guard.sh` 会拒绝不认识该等待状态的旧目标（见 `docs/company-service-operations.md` 第 5 节）。
+任务视图的 blocked 行带 `blockedTo` 事实：等老板关口时 `blockedTo=owner`（`resumeState` 记录恢复阶段，复核等待显示原复核岗位，缺失显示 `unknown`）；父链 predecessor 在任务 `parent` 字段。
 | done | 验收通过（或老板批准） | 自动解锁后续任务 |
 
 ## 目标流程

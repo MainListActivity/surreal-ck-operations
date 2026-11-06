@@ -77,6 +77,8 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
       Object.assign(rows.find(t => t.id === id)!, { dispatchBlockedPhase: phase, dispatchBlockedSince: since });
     },
   };
+  const sentBodies: Array<{ id: string; body: string }> = [];
+  const spawnBodies: string[] = [];
   const notices = new Map<string, string>();
   const owner = { applyPending: async () => [], resolveNotice: async (key: string) => { notices.delete(key); },
     openNotices: async () => [...notices].map(([key, text]) => ({ key, text, at: '' })), triagePending: async () => [],
@@ -118,8 +120,8 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
   const paseo: PaseoGateway = {
     list: async () => agents, status: async id => agents.get(id) ? { status: agents.get(id)!.status, pendingPermissions: 0 } : undefined,
     lastError: async () => lastError, logsTail: async () => 'fixture transcript', lastInputTokens: async () => 0,
-    spawn: async b => { const id = `agent-${b.labels.employee_id}`; agents.set(id, { id, status: 'running' }); envs.set(id, b.env); cwds.set(id, b.cwd); events.push(`spawn:${id}`); return id; },
-    send: async id => { events.push(`send:${id}`); agents.get(id)!.status = 'running'; }, stop: async id => { events.push(`stop:${id}`); agents.get(id)!.status = 'idle'; },
+    spawn: async b => { const id = `agent-${b.labels.employee_id}`; agents.set(id, { id, status: 'running' }); envs.set(id, b.env); cwds.set(id, b.cwd); spawnBodies.push(b.prompt); events.push(`spawn:${id}`); return id; },
+    send: async (id, body) => { events.push(`send:${id}`); sentBodies.push({ id, body }); agents.get(id)!.status = 'running'; }, stop: async id => { events.push(`stop:${id}`); agents.get(id)!.status = 'idle'; },
     reload: async id => { events.push(`reload:${id}`); agents.get(id)!.status = 'idle'; },
     archive: async id => { events.push(`archive:${id}`); agents.get(id)!.status = 'archived'; pool.detachAgent(id); },
     listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {},
@@ -143,6 +145,12 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
       body: `fixture ${step} body for ${taskId}`,
       message: { id: `m-${taskId}-${step}`, taskId, step, role: 'x', body: `fixture ${step} body`, state: 'draft', hold: false, createdAt: '' },
     }),
+    createDraft: async (taskId: string, step: string, role: string, _code?: boolean, _phase?: string, body?: string) => ({
+      id: `d-${taskId}-${step}`, taskId, step, role, body: body ?? `fixture ${step} body`, state: 'draft', hold: false, createdAt: '',
+    }),
+    ensureDraft: async (taskId: string, step: string, role: string) => ({
+      id: `d-${taskId}-${step}`, taskId, step, role, body: `fixture ${step} body`, state: 'draft', hold: false, createdAt: '',
+    }),
     isHeld: async () => false,
     markSent: async (messageId: string) => { events.push(`markSent:${messageId}`); },
     latestDraft: async () => undefined,
@@ -163,7 +171,7 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
     const r = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(dir), name)); if (!r) throw new Error('relay timeout'); return r;
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
-  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, logs, views, relay, denied, held, scopeUnreadable,
+  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, logs, views, relay, denied, held, scopeUnreadable, sentBodies, spawnBodies,
     holdAssets: (paths: string[], holder: WriteScopeHolder) => { assetHolds.push({ paths, holder }); }, freeAssets: () => { assetHolds.splice(0); },
     authorsOf, unreadable, paseo, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
@@ -808,4 +816,24 @@ test('memory-only admission never reclaims disk or emits disk recovery instructi
 });
 test('a simultaneous memory and disk block preserves both causes in the task verdict',async()=>{
  const w=world();w.addTask('both-low');w.setHost({freeMemMb:249,freeDiskMb:128,memoryPressure:2});const d=w.dispatcher();await d.tick();expect(d.dispatchVerdicts().find(v=>v.taskId==='both-low')!.reasons.map(r=>r.code).sort()).toEqual(['disk_space','memory_pressure']);
+});
+
+test('every employee-facing send carries an outbound_message body that is then marked sent', async () => {
+  // Execute dispatch: the wake body is the rendered execute draft, marked sent after paseo.send.
+  const w = world(); w.addTask('dispatch'); const d = w.dispatcher(); await d.tick();
+  const bodies = [...w.sentBodies.map(b => b.body), ...w.spawnBodies];
+  expect(bodies.some(b => b.includes('fixture execute body for dispatch'))).toBe(true);
+  expect(w.events.some(e => e.startsWith('markSent:'))).toBe(true);
+  expect(bodies.every(b => typeof b === 'string' && b.length > 0)).toBe(true);
+});
+
+test('a stall nudge travels as an outbound row marked sent', async () => {
+  const w = world(); w.addTask('stalled'); const d = w.dispatcher(); await d.tick();
+  w.rows[0]!.progressAt = 1000;
+  w.setNow(1000 + 91 * 60);
+  await d.tick();
+  const nudge = w.sentBodies.find(b => b.body.includes('checkpoint'))!;
+  expect(nudge.body).toContain(`任务 stalled 已 `);
+  expect(nudge.body).toContain('分钟没有 checkpoint');
+  expect(w.sentBodies.every(b => typeof b.body === 'string' && b.body.length > 0)).toBe(true);
 });

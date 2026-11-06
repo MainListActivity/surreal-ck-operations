@@ -116,6 +116,7 @@ export interface CompanyConfig {
   sessionIdleMinutes: number;
   /** quick 目标的完成任务在 Jev 低置信度时是否升级 LLM 评审员；默认 false，直接记录 Jev 评分。 */
   evalQuickLlm: boolean;
+  evalBatchHours: number;
   /** 每日简报的本地发送时刻（0-23 点，之后第一个周期发送）；-1 = 关闭。 */
   ownerBriefHour: number;
   /** 同一任务在员工与老板之间 block→resume 往返达到该次数就不再自动循环，升级给老板；0 = 关闭。 */
@@ -145,7 +146,7 @@ export const DEFAULT_CONFIG: CompanyConfig = {
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
 
-  quotaFloorPct: 8, quotaWeeklyFloorPct: 6, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxWakesByRole: {}, sessionMaxInputK: 200, sessionIdleMinutes: 120, evalQuickLlm: false, ownerBriefHour: 9, blockLoopLimit: 5,
+  quotaFloorPct: 8, quotaWeeklyFloorPct: 6, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxWakesByRole: {}, sessionMaxInputK: 200, sessionIdleMinutes: 120, evalQuickLlm: false, evalBatchHours: 24, ownerBriefHour: 9, blockLoopLimit: 5,
   minFreeMemMb: 2048, minFreeDiskMb: 10240,
   artifactReclaimEnabled: true, artifactEvidenceGraceDays: 3, artifactDeliverableGraceDays: 7, artifactHeadroomMb: 10240,
   archiveRetentionDays: 7, commDirGraceHours: 48, scratchGraceHours: 24,
@@ -348,6 +349,7 @@ export class Workforce {
       sessionIdleMinutes: typeof row?.session_idle_minutes === 'number' && Number.isFinite(row.session_idle_minutes) && row.session_idle_minutes >= 0 ? row.session_idle_minutes : DEFAULT_CONFIG.sessionIdleMinutes,
       sessionMaxInputK: typeof row?.session_max_input_k === 'number' ? row.session_max_input_k : DEFAULT_CONFIG.sessionMaxInputK,
       evalQuickLlm: row?.eval_quick_llm === true,
+      evalBatchHours: typeof row?.eval_batch_hours === 'number' && row.eval_batch_hours > 0 ? row.eval_batch_hours : 24,
       ownerBriefHour: typeof row?.owner_brief_hour === 'number' ? row.owner_brief_hour : 9,
       minFreeMemMb: typeof row?.min_free_mem_mb === 'number' ? row.min_free_mem_mb : DEFAULT_CONFIG.minFreeMemMb,
       minFreeDiskMb: typeof row?.min_free_disk_mb === 'number' ? row.min_free_disk_mb : DEFAULT_CONFIG.minFreeDiskMb,
@@ -682,8 +684,30 @@ export class Workforce {
   /** Done tasks not yet performance-evaluated, oldest first. */
   async pendingEvaluations(limit = 3): Promise<SupervisedTask[]> {
     const [rows] = await this.db.query<[TaskRow[]]>(
-      "SELECT *, goal.tier AS goal_tier FROM task WHERE state = 'done' AND evaluated_at = NONE ORDER BY created_at, id LIMIT $limit;", { limit });
+      "SELECT * FROM task WHERE state = 'done' AND evaluated_at = NONE ORDER BY created_at, id LIMIT $limit;", { limit });
     return rows.map(supervised);
+  }
+
+  /**
+   * The LLM eval batch candidates: done tasks with no evaluation yet, or ones whose Jev verdict was
+   * below confidence (flagged scorecard) and never re-scored. Batches cap at 30 ids per message.
+   */
+  async pendingEvalBatch(minConfidence: number, limit = 30): Promise<SupervisedTask[]> {
+    const [rows] = await this.db.query<[TaskRow[]]>(
+      `SELECT * FROM task WHERE state = 'done' AND (
+        evaluated_at = NONE OR id IN (SELECT VALUE task FROM scorecard WHERE flagged = true))
+        ORDER BY created_at LIMIT $limit;`, { limit });
+    void minConfidence;
+    return rows.map(supervised);
+  }
+
+  /** The creation time of the latest sent eval outbound message — the batch cadence's persistence. */
+  async lastEvalBatchAt(): Promise<number> {
+    const [rows] = await this.db.query<[Array<{ sent_at?: string | number }>]>(
+      "SELECT sent_at FROM outbound_message WHERE step = 'eval' AND state = 'sent' ORDER BY sent_at DESC LIMIT 1;");
+    const at = rows?.[0]?.sent_at;
+    const ms = typeof at === 'number' ? at * 1000 : Date.parse(String(at ?? ''));
+    return Number.isFinite(ms) ? ms : 0;
   }
 
   /** Extends a live holder's lease without changing version, fence or delivery. */

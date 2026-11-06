@@ -87,22 +87,16 @@ rtk proxy "$PASEO_CLI" plugin ls sck-company
 - `rtk proxy readlink "$SCK_RELEASE_ROOT/active"` 必须等于本次 release；`rtk proxy sh "$SCK_RELEASE_DIR/scripts/company-service.sh" status` 应显示 MCP running；`/health`、`/ready` 都返回 200。
 - `paseo plugin ls sck-company` 必须为 running、enabled、无 error，**SOURCE 和 DIRECTORY 都必须等于 `$SCK_RELEASE_DIR/plugin`**。只看 running 不足以证明已切版本。
 - 比对 release `schema/` 与 `plugin/server/vendor/schema/`：`rtk proxy diff -qr "$SCK_RELEASE_DIR/schema" "$SCK_RELEASE_DIR/plugin/server/vendor/schema"` 无差异。vendor 的 TypeScript 多一行 `// @ts-nocheck`，核对 core 时去掉该首行再比对源文件，记录基线 SHA 与生成物哈希。
-- 用真实已登记员工通道 `rtk proxy "$SCK_RELEASE_ROOT/bin/sck" call get_context '{}'` 验证 core 可用；恢复维护前的编制状态后，由老板安排一次实际派工，核对 spawn/claim 与任务记录，不能把命令成功当成已验证派工。无分页参数的 `get_context` 默认不含公司块（答复中 `companyIncluded` 为 false），所以公司块再大也不会让它超限。若它返回 `response_too_large`，说明匹配的任务本身超过 48 KiB 整包预算，即旧的全量任务查询过宽，应视为需要分页的查询问题，而不是可忽略的正常结果：改用 `'{"pageSize":25}'`，并把返回的 `page.nextCursor` 作为 `cursor` 逐页读取，直到 `page.hasMore` 为 false；需要收窄时加 `state`、`goalId`、`role` 或 `since`。公司方向、目标与项目用 `'{"scope":"company","pageSize":25}'` 分页读取（`companyRead` 字段给出同样的参数），按段的长度与 SHA-256 重组。`response_too_large` 时核心仍在运行，可用分页调用复验。预览健康与监听进程按下节检查。公司块中的项目环境（`envs`、凭证别名与角色）只对 gm 与持有该项目有效任务租约的员工返回；其它员工看到项目身份，并得到 `envsWithheld: true`。老板控制台仍是完整视图。
+- 用真实已登记员工通道 `rtk proxy "$SCK_RELEASE_ROOT/bin/sck" call get_context '{}'` 验证 core 可用；恢复维护前的编制状态后，由老板安排一次实际派工，核对 spawn/claim 与任务记录，不能把命令成功当成已验证派工。无分页参数的 `get_context` 默认不含公司块（答复中 `companyIncluded` 为 false），所以公司块再大也不会让它超限。若它返回 `response_too_large`，说明匹配的任务本身超过 48 KiB 整包预算，即旧的全量任务查询过宽，应视为需要分页的查询问题，而不是可忽略的正常结果：改用 `'{"pageSize":25}'`，并把返回的 `page.nextCursor` 作为 `cursor` 逐页读取，直到 `page.hasMore` 为 false；需要收窄时加 `state`、`tag`、`role` 或 `since`。公司方向与项目用 `'{"scope":"company","pageSize":25}'` 分页读取（`companyRead` 字段给出同样的参数），按段的长度与 SHA-256 重组。`response_too_large` 时核心仍在运行，可用分页调用复验。预览健康与监听进程按下节检查。公司块中的项目环境（`envs`、凭证别名与角色）只对老板与持有该项目有效任务租约的员工返回；其它员工看到项目身份，并得到 `envsWithheld: true`。老板控制台仍是完整视图。
 
 证据分别记录两面路径、SHA、进程状态、探针与真实派工结果/时间；若真实派工尚未验证须明确标注，不能宣布部署完成。
 
-目标会话布局的切换还执行 `goal-workspace-guard.sh`：核心与插件 vendor 必须同时携带目标绑定领取检查。旧版会忽略员工 `workspace_scope`，因此被拒绝；上线后发生问题保留健康版本并前向修复，不能用旧调度器接管已绑定目标的会话。布局与迁移边界见 [工程、目标与会话](./goal-workspaces.md)。
-
 ### 5. 双面回滚
 
-**兼容目标是回滚的前提（RW06）**：切换（install 与远端 deploy）在内容绑定之后、任何副作用（bin 复制、`active` 链接、插件重指、MCP 重启、快照清理、远端上传）之前，用 `scripts/review-wait-guard.sh` 读取**目标自身的代码**判定兼容性：目标必须带 `src/review-wait-capability.ts` 的协议标记、`src/core.ts` 中的“按原阶段解锁”语句（`$restore_phase`）与 `src/contracts.ts` 的 resume 视图字段；本地 install 还要求插件 vendor 同源，远端 deploy 只查核心。不兼容、不可读或无法证明的目标一律拒绝，**没有“当前没有等待项所以放行”的例外**（检查之后并发产生的等待会绕过这种检查）；拒绝发生在任何切换副作用之前，并输出目标、原因与 `waiting items=unknown`（切换脚本没有受权的公司数据读取接缝，不能据此声称没有等待项）。
-只有证明兼容的目标才能切换；旧版本（如 9854fe0、475b5c2 及其后的旧快照）不是固定可回退版本。没有可用兼容目标时，保持当前健康版本、受控 hold，或走受审的前向修复，不得把破坏复核阶段的旧版当成可用性恢复，也不得以伪 accept 或改库换取回滚条件。窗口内切换前仍须按第 4 节采样并证明没有活复核租约（或使用已独立部署验收、支持复核 adopt 的版本）。
+**兼容目标是回滚的前提（RW06）**：切换（install 与远端 deploy）在内容绑定之后、任何副作用之前，用 `scripts/acceptance-guard.sh` 读取**目标自身的代码**判定兼容性：目标必须带 SYS02 验收基线（`src/acceptance.ts` 的 criterion/verdict 判定与 `record_acceptance_evidence` 记录接缝）。本地 install（scope=`full`）还要求插件树与其 vendor 同源；远端 deploy（scope=`core`）只查核心。不兼容、不可读或无法证明的目标一律拒绝，拒绝发生在任何切换副作用之前。与其它内容探针一样，它只证明目标带着这份契约、不能证明其行为，不代替真实派工证据。
 
-**有界待命接力契约（FV06）**：切换守卫在 RW06/SYS02/IR06/SYS06 之外再用 `scripts/standby-relay-guard.sh` 读取目标自身代码，确认它带有界待命协议：`src/standby-relay-capability.ts` 的协议常量、`src/core.ts` 的 resume 事务写（`progress_at` / `standby_until`）与两条拒绝文案、`src/contracts.ts` 的 `standbyUntil` 视图字段、`src/workforce.ts` 的预算配置与超时审计、`src/dispatcher/dispatcher.ts` 的节流唤醒与超时回关口。本地 install（scope=`full`）还要求插件树与其 vendor 同源——**没有 `plugin/`、或有 `plugin/` 但没有 `plugin/server/vendor/`，一律按未知即不兼容拒绝**；远端 deploy（scope=`core`）只查核心。标记位置由**运行守卫的那份 release**自带的 TypeScript 解析器（该 release 的 `scripts/standby-relay-scan.mjs` 与其 `node_modules/typescript`）判定——install/回滚用的是当前受审 release 的 installer，不是目标自己的；注释里的伪标记不能顶替声明，解析器读不了的文件也不放行。拒绝同样发生在任何切换副作用之前，并输出 `standby items=unknown`；没有可用兼容目标时，保持当前健康版本、受控 hold，或走受审的前向修复。与其它切换守卫一样，它只证明目标带着这份契约、不能证明其行为，不代替真实派工与待命演练证据。
 
-**已写策略的数据不能切到不执行策略的代码（IR06）**：切换守卫在 RW06 之外再用 `scripts/independence-guard.sh` 读取目标自身代码，确认它带 `src/independence.ts` 的协议常量、`src/core.ts` 的来源版本守卫（`INDEPENDENCE_GUARD_SQL` 与 `independenceGate`）与 `src/contracts.ts` 的策略及身份视图；本地 install 还要求插件 vendor 同源，远端 deploy 只查核心。线上数据可能已带有独立性策略（`independence_set`），把这份数据切到没有该契约的目标上，被排除的来源经手人、其登记 principal 同伴与点名员工会被直接放行认领——这正是 IR06 拒绝回滚旧 release 的原因。拒绝同样发生在任何切换副作用之前，并输出 `excluded tasks=unknown`；没有可用兼容目标时，保持当前健康版本、受控 hold，或走受审的前向修复（换回带该契约的代码即可让同一份数据重新生效，无需改数据）。守卫只读目标树并匹配声明，只能证明目标带有这份契约，不能证明其行为：它与 RW06 同属标记式探针，不执行目标代码，不能替代真实派工与隔离演练证据。
 
-**已写策略的数据不能切到不执行策略的代码（SYS06）**：切换守卫在 RW06/SYS02/IR06 之外再用 `scripts/policy-guard.sh` 读取目标自身代码，确认它带有效策略执行层：`src/policy.ts` 的判定（`resolveEffective` / `checkWriteAuthority` / `dispatchVerdict`）、`src/policy-store.ts` 的读取层、`src/core.ts` 的 `policyPlan` / `policyEnforce` 与 `policy_blocked` 审计、`src/workforce.ts` 的 `policyDispatchVerdict` 派工接缝、`src/contracts.ts` 的试算契约与任务视图事实，以及 `schema/*effective-policy*.surql` 的 `policy` 表与任务/租约登记字段（并要求 `src/database.ts` 真的加载这一版迁移）；本地 install 还要求插件 vendor 同源，远端 deploy 只查核心。线上数据可能已带策略行与任务上的 `policy_*`/`lease_policy_*` 登记，也可能已有 `blocked + blocked_to=owner` 的隔离任务：把这份数据切到不执行策略的目标上，等于把派工判定交回给一个看不见它们的 release——当前契约已不再授权的在办任务会被当普通 ready 任务派出去（新版拒领、旧版照派），隔离过的任务也丢掉说清原因的字段。拒绝同样发生在任何切换副作用之前，并输出 `affected tasks=unknown`；**不设「零行例外」**——「现在还没有策略行」不是安全证明（写策略随时会紧随其后），这样判也会漏掉那批已经写下的数据。没有可用兼容目标时，保持当前健康版本、受控 hold，或走受审的前向修复（换回带该契约的代码即可让同一份数据重新生效，无需改数据）。与 RW06/SYS02/IR06 一样，守卫只读目标树并匹配声明，只能证明目标带着这份契约、不能证明其行为，不代替真实派工与隔离演练证据。
 
 **先停用受影响编制再回滚**：由老板通过现有管理通道暂停这些编制，记录原 enabled 状态，防止旧 core 对新岗位/策略继续派工；核对在办任务并保留租约、comm、登记与审计。回滚目标须同时兼容当前岗位与 WT01/WT02 登记，不能任意选更早版本；不删除 schema、历史或任务数据。
 
@@ -157,31 +151,12 @@ handle_path /pv/* { reverse_proxy 127.0.0.1:18778 }
 
 ## SYS05 时间与外部事件等待
 
-员工不再用前台 sleep 等待时间或外部回执：`wait_task` 在**一个事务**里保存进度快照、清除持有人/租约并把任务移出派工队列，调度器在条件成立时只释放条件本身。等待期间任务不占员工、不占 provider 并发名额，也不产生人工「核时验收」链。
-
-- **契约**：`kind` 固定为 `time` / `dependency` / `upstream_repair` / `customer_activation` / `owner_handoff` / `feedback`；`ownerRole`、非敏感 `reference`、`notBefore`、工具返回的精确 `expiresAt`、`nextCheckAt`、显示用 IANA `timezone`。时间必须是带时区偏移的绝对时刻（或毫秒数）；无偏移的本地时间直接拒绝，夏令时只改显示、不改判定。没有工具给出精确到期时 `expiresSource=unknown`，系统不算、不补。
-- **一次释放**：`task_wait` 的 `state` 从 `waiting` 到 `released` 走版本 CAS；20 个并发 tick 只有一个能落地。`time` 到点只解除时间条件：依赖未完成、任务仍在 `blocked_to=owner`、`owner_handoff` 未收到 owner relay 决定时都保持 `held`，不自动放行。`held` 每个调度 tick 会重查：依赖或引用任务完成后自动回到队列，不会变成丢失事项；需要受信事件的外部等待不会被 tick 放行，仍走 `resolve_wait`/`extend_wait`/`cancel_wait`。精确到期已过且没有到期前受信事件的等待标为 `expired`，不自动恢复；过期等待会保留稳定复查提醒，直到有人取消或先延期再补受信事件；过期状态不能直接确认，不会从队列里静默消失。
-- **受信事件**：`resolve_wait` 只接受老板（`authorized_person`）、依赖任务终态，或带 HMAC 签名的 `webhook`（`provider`+`eventId`+`signature`，密钥 `SCK_WAIT_WEBHOOK_SECRET`；未配置即拒绝）。事件必须写明 `objectWaitId`/`objectTaskId`，重复 `event_key`、过期、错误对象一律拒绝；模型自称「收到反馈」不算。签名只证明事件来源可信，不证明所等任务已完成：`dependency` / `upstream_repair` 等待无论是系统依赖事件还是签名 webhook，都必须在同一事务内确认引用任务为 `done|void`；只有显式 `authorized_person` 是人工豁免并留审计。`owner_handoff` 只能由 `record_owner_decision` 的 owner relay 路径解除。
-- **安全解除**：`cancel_wait` / `extend_wait` 需要当前 `expectedVersion` 与理由；过期版本拒绝。`wait_migration_apply` 只按单个任务、带版本和理由迁移遗留 `quota_resets_at` 时间阻塞，owner 关口/仍被租约持有/没有未来时间边界一律拒绝，审计 `wait_migrated`；迁移保留遗留阻塞记录的 `resume_state`/`resume_role`，复核期阻塞到点仍回复核，不会变成可执行任务。`cancel_wait` 不给 `resume=true` 时任务留在老板关口（`blocked_to=owner`），取消不等于条件已解决。`resume` 不能跳过等待；等待引用会做有界环检测，检测与写入在同一数据库咨询锁临界区（`company_meta:wait_enter_lock`，唯一创建获取、带过期回收），并发互相等待时最多一条成功，另一条返回 `conflict`。`wait_migration_preview` 只读，owner 关口永不批量迁移。
-- **老板交接卡**：`wait_handoff_cards` 与收件箱给出已完成技术项、待老板动作、谁等谁、工具返回的精确到期或 `unknown`、下一触发条件；提醒按 wait+风险桶去重。邀请 secret 链接只留在受控 handoff 文件，卡片只给文件名；此功能不向客户发信、不代签客户采纳。
-- **回收**：租约结束由 ops broker 丢弃本地会话句柄并在审计中注明「未调用远端注销」；ego-browser 空间按受控 closer 有界关闭，未配置或关闭失败记为待清理，绝不冒称已注销。
-- **回滚隔离（RB01）**：新表为 `task_wait` / `wait_event`（旧版不读，忽略）；进入等待的任务同时置为 `state=blocked, blocked_to=NONE, resume_state=ready|review`，旧版派工队列不收 blocked，旧版依赖解锁 SQL 也被新版的 `wait_state='waiting'` 条件挡住。`tests/fault-rollback-isolation.fork.test.ts` 的旧 release 演练已包含 `rb01-sys05-wait`（新版写入未到点时间等待 → 旧版调度多轮 → 零认领、零会话）。
-- **回归**：`tests/waits.test.ts`（纯规则）、`tests/wait-store.fork.test.ts`（真实 core/fork：原子进入、20 并发一次释放、重启、重复/错误对象/过期事件、owner relay、版本锁、依赖终态）、`tests/wait-dispatch.test.ts`（等待零派工、到点一次唤醒）、`tests/wait-cleanup.test.ts`（会话/浏览器回收失败待清理）。验收退回修复的回归：交接卡真实标题/等待方、`source=dependency` 与签名 webhook 在引用未终态时均拒绝、`held` 依赖完成后自动恢复、单任务迁移保留复核阶段与 owner 关口拒绝、过期等待保留复查提醒。
+任务等待语义已收敛为两件事：链上前驱未完成时子任务保持 `planned`（accept 同事务激活）；需要老板决定时任务 `blocked` 且 `blocked_to='owner'`（进老板收件箱）。结构化等待、处置账本与 CI 处置工具已随目标层一起删除。
 
 ## SYS07 目标终验图、客户成果与经营指标
 
 目标不再由「最后一个任务被接受」隐式关闭；`accept` 之后的完成判定改为显式重算，写不进证据的目标停在 `needs_repair`。
 
-- **新增状态**：`goal.state='needs_repair'`。终验关口作废/被新版本替代/缺失、终验完成但缺真实 owner relay 批准、required 客户证据未到、依赖成环或悬空、终验关口早于未完成工作、实现任务被 retire 且没有已完成的继任修订时，`goal_finalize` 只写 `needs_repair`、`needs_repair_reason`、`needs_repair_at`，不写 `done`，不改任何历史任务或老板决定。修复后再次 `goal_finalize` 才回到 `active`/`done`；`goal_final_gate_repair` 只允许老板按预览快照 + goal/task 版本 CAS 替换终验引用；替换后目标仍停在 `needs_repair`，等新关口真实验收并由 `goal_finalize` 重算，不释放租约、不代替验收；旧关口同时写 `goal_final_gate_replaced` 审计，不再被当成无继任的作废实现。普通实现/发布任务被 retire 时，只有 required `implementation` 才形成 `implementation_void` 缺口；授权 outcome 变更若确实不再要求 implementation，可清除该缺口，否则只能显式取消目标，不留无出口的 needs_repair。
-- **成果契约**：`goal_outcome` 每个目标一行，字段 `expected`、`required_evidence`、`responsible_role`、截止绝对时刻与 IANA 时区、版本、授权人/来源/理由。证据词表：`implementation` / `release` / `deploy_qa` / `customer_activation` / `customer_adoption` / `feedback`；`final_acceptance`/`owner_final` 只由真实终验关口与 owner relay 推导，不接受手工填一行就当作批准；required `owner_final` 必须由 `reviewer_role=owner` 的终验关口且 `accepted_by=owner` 满足，gm 终验不能替代老板终验。triage 会为每个新目标写入默认契约，后续变更需 gm 以当前 `expectedVersion` 作版本 CAS，审计留 `goal_outcome_registered`。
-- **客户证据**：`goal_evidence` 不可变，一条一回执；`kind`、`summary`、`source`、`confirmed_by`、`evidence_type`（`external_receipt` / `production_record` / `manual_signoff`）、`at`、digest 留档。测试账号、`localhost`/合成来源、模型或 AI 自称确认人一律拒绝；`owner_final` 不能作为证据类型写入。缺客户激活/采纳等 required 证据时，即使终验关口已完成也只能 `needs_repair`。记录动作只代表人已提供回执，不向客户发信、不代签客户采纳。
-- **只读看板**：`goal_console` 按目标分页给出截止（未知则 `unknown`，不猜）、阶段（实现/发布/部署 QA/客户激活/客户采纳/owner 终验）、多个并行阻点、依赖路径、责任岗位/当前持有人、已等时长、下一触发条件、有效终验及其证据、`needs_repair` 缺口和源任务 id；卡片对阻塞与源任务做上限，完整任务用 `get_context(goalId, pageSize, cursor)` 翻页。`goal_governance_scan` 是只读演练，只列缺口，不批量撤销/关闭/批准任何历史目标。老板简报和插件目标页读同一张卡，不另算一套完成口径；SYS05 `expired` 等待显式标为已过期并给出取消/延期后的下一动作，不伪装成正常等待。
-- **指标（`goal_metrics`）**：窗口左闭右开，按 IANA 时区分日，返回目标/任务周期时间、首验通过率、同一 task+phase 段内的重复阻塞、同一 episode 的重复唤醒且无 checkpoint/submit/accept、可归因到验收任务的 token 用法与每目标用量、客户证据覆盖；窗口内完成的目标按 cutoff 前已存在回执计算，回执早于窗口不误报缺失。初始基线只覆盖本窗口内可见的审计/用量行；系统不承诺可观测的成本下降，成本未知时也不编造趋势。分母、排除项、`cutoffAt`、覆盖行数和未知项随结果返回；没有 provider 实际计费时成本一律 `unknown`，绝不按 token 或时长倒推。通道 release/revoke、系统迁移与人工 return 分列，不混算。
-- **工具**：`goal_console`（分页看板）、`goal_governance_scan`（只读缺口扫描）、`goal_metrics`（经营指标）、`goal_outcome_register`/`goal_evidence_record`（成果契约与客户回执）、`goal_finalize`、`goal_final_gate_preview`/`goal_final_gate_repair`（终验重算与 CAS 修复）。
-- **权限**：上述读/写都要求 owner 的 `manage` capability；员工只能读自己的任务上下文。目标治理写操作全部带 idempotency key、审计与 outbox；并发同版本变更只有一个成功，其余返回 `conflict`。
-- **回滚隔离（RB01）**：旧版不认识 `needs_repair`，其目标关闭 SQL 只匹配 `active`，依赖/修复路径也拒绝非 active 目标，因此回滚后不会静默完成停修目标；`goal_outcome`/`goal_evidence` 是旧版从不读取的新表，`deadline`/`version` 等字段是可忽略的可选字段。本版不改任务状态、依赖、租约或老板决定，回滚不新增派工来源。`tests/goal-rollback-isolation.fork.test.ts` 用 `git archive` 提取真实上一版，在 A/B 两个隔离 namespace 做「新版写入 → 旧版 bootstrap + 三轮调度」：A 阳性对照仍派工普通任务，B 目标任务版本/持有人/goal 状态不变、新表摘要不变，旧版源码不出现新表名。
-- **限制**：真实供应商账单未接入时「实际成本」只能是 `unknown`；真实老板渠道同快照对账、客户激活/采纳的线下回执与发布后生产 QA 由上线验证腿完成；跨目标依赖会明确标成 `dependency_cross_goal`（不再是笼统的悬空边），但不做跨目标自动修复或批量改写。
-- **回归**：`tests/goal-governance.test.ts`（纯规则：终验作废/替代、owner 批准、required 证据、依赖环、阻点分类、DST/成本未知）、`tests/goal-governance.fork.test.ts`（真实 core/fork：权限/分页、只读扫描、卡与简报同源、证据 CAS、终验修复 CAS、并发版本、指标对账）、`tests/goal-rollback-isolation.fork.test.ts`（RB01 真实旧版演练）。
 
 ## 员工客户端
 
@@ -211,7 +186,7 @@ WT02 在 WT01 登记之上启用按归属回收：持久引用是唯一删除依
 - `get_context`、`get_task_history`、`list_worktrees` 的每个响应不超过 48 KiB，即 49152 字节（UTF-8）。计量为 MCP 结果的 JSON 字节加 256 字节帧预留（`answerBytes`），答案的文本副本与 `structuredContent` 两份都计入。不带 `pageSize`、`cursor` 的旧调用返回完整结果，超出则报 `response_too_large`，不截尾。
 - 需要统计或遍历全部条目时，带 `pageSize`（1 至 100，缺省 25）逐页读取，直到 `page.hasMore` 为 false，并累加每页的 `returned`。`page.total` 为快照内的总数，可用于核对。每页条数由预算决定，可能少于 `pageSize`。
 - 分页快照由数据库统一计数，MCP 与插件 sidecar 共用上限：每身份 4 个，全库 64 个，合计 64 MiB；单个快照最多 5000 行或 8 MiB，有效期 6 小时。上限在代码中固定，没有运营配置项。
-- 全库快照已满时返回 `temporarily_unavailable`，可重试。同一身份的快照全部仍在写入时，请求最多等待 5 秒，且不超过本次构建的 10 秒截止。构建超过 10 秒截止，或排队超过 2 秒仍拿不到构建连接，都返回可恢复的 `temporarily_unavailable`；答复最迟在 13 秒内返回。已预留的配额在截止后 2 秒内释放，来不及释放的标记为待清扫，下一次清扫释放一次。50 KiB/s 等受限链路上，超过 10 秒可传输量的大工作集会以该错误返回，这是可恢复的拒绝而不是数据损坏，应按答复指引收窄 `state`、`goalId`、`role`、`since` 或投影字段后重试。超过 5 分钟仍未完成的快照视为遗弃并删除。持续出现容量错误时，核对 `query_snapshot` 表的行数与 `query_snapshot_quota:global` 的 `listings`、`bytes` 计数是否一致。
+- 全库快照已满时返回 `temporarily_unavailable`，可重试。同一身份的快照全部仍在写入时，请求最多等待 5 秒，且不超过本次构建的 10 秒截止。构建超过 10 秒截止，或排队超过 2 秒仍拿不到构建连接，都返回可恢复的 `temporarily_unavailable`；答复最迟在 13 秒内返回。已预留的配额在截止后 2 秒内释放，来不及释放的标记为待清扫，下一次清扫释放一次。50 KiB/s 等受限链路上，超过 10 秒可传输量的大工作集会以该错误返回，这是可恢复的拒绝而不是数据损坏，应按答复指引收窄 `state`、`tag`、`role`、`since` 或投影字段后重试。超过 5 分钟仍未完成的快照视为遗弃并删除。持续出现容量错误时，核对 `query_snapshot` 表的行数与 `query_snapshot_quota:global` 的 `listings`、`bytes` 计数是否一致。
 - 长文本用 `read_task_text` 按字节段读取，每段默认 16 KiB、最大 24 KiB。第二段起必须带首段返回的 `expectSha256`，若原文已变，返回 `conflict`，须从 `offset: 0` 重读。
 - 写入先于回显提交。回显先裁切超长列表（依赖、意图路径，标注 `listsTruncated`，完整列表用 `read_task_text` 读取），再裁切正文（标注 `contextTruncated`）；其余顶层文本字段超过 2 KiB 时同样裁切并标注。只有整条应答仍超过 49 152 字节时，调用方才会收到 `response_too_large`。此时写入已经提交，用 `get_context`（带 `taskId`）核对状态，不得重复提交。
 - 全局库存只有老板可读，即不带 `taskId` 的 `list_worktrees`。非老板角色必须带 `taskId`，缺省或 null 一律返回 `forbidden`。
@@ -242,7 +217,7 @@ QA 步骤对应如下。统计工作树数量时，先以老板身份执行 `lis
 
 不同产线流程不同（软件交付、视频、长篇故事），所以目标模板按产线选，不再全公司一套。
 
-- **产线**：`software`（默认，原流程）、`video`（拆解 → 老板最终验收，不含运营验收）、`story`（只有一个拆解任务，不自动收尾——靠 [展开下一层] 任务接力递归）。目标创建时指定：`pnpm run company goal --pipeline story --project <项目> "<目标>"`，或在插件「新目标」里选产线；不指定则取项目默认产线（`project set` 的 `pipeline` 字段），都没有则走软件线。
+- **路由**：任务唯一的编排单位。`route` 表把任务类型（`software` / `story` / `film` / `eval` …）映射到执行岗、复核岗与消息模板，可选 `next` 后继类型在创建时展开为 `planned` 链（accept 同事务激活）。新任务经 `sck owner task.create '{"type":"<类型>","title":"…"}'` 创建，`task.plan` 先预演链；路由由 `route.list`/`route.save`/`route.disable` 管理（`route.save` 拒绝执行岗=复核岗与成环后继）。
 - **岗位契约**：项目岗位轨词表里每条轨可写 `roles: [...]`，限定能承接它的岗位。建单（`create_task` / `create_delivery`）时校验：派给轨不允许的岗位会被拒绝；任何出现在某条轨 `roles` 里的岗位都是产线岗，建单必须挂轨。没有出现在任何 `roles` 里的岗位（gm、product、qa 等）仍可建不挂轨的协调任务。契约写在项目记录里，改项目配置即生效，不需要改代码。
 - `screenwriter` 仍保留原有的"必须挂 编剧 轨"硬规则。
 
@@ -316,7 +291,7 @@ GC 只删目录本身，不碰 `evidence/`、`deliverables/` 与任何已跟踪�
 pnpm run company revoke <任务ID> ["<原因>"]      # 终止在途执行：撤当前持有人租约回 ready，任务保留等下一位
 pnpm run company void <任务ID> "<原因>"          # 作废：只等它的下游自动解锁；终验关口作废不会关闭目标
 pnpm run company unlock <任务ID>                 # 补跑依赖解锁：依赖都完成了任务却还是 blocked 时用
-pnpm run company cancel-goal <目标ID> "<原因>"   # 作废目标下全部未完成任务并关闭目标（cancelled）
+sck owner task.void '{"taskId":"<任务>","reason":"<原因>"}'   # 作废任务并级联作废其 planned 后继
 ```
 
 `revoke` 与 `void` 的区别：revoke 只撤在途租约（员工换人或路线变更时用，任务本身继续），void 是把任务整个作废。两者在插件「目标进展」页（任务详情与目标卡按钮）和网页审核台（/o/<token>/，目标页与待办关口按钮）也能直接操作，不用开终端。

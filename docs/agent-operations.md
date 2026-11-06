@@ -22,8 +22,9 @@
 1. **命令行**（在发布目录 `~/Library/Application Support/SurrealCKCompany/active` 下）：
 
    ```
-   pnpm run company goal "我要一个 B2C 商城"
-   pnpm run company goal --tier quick --project surreal_ck "导出按钮在 Safari 下无效"
+   sck owner task.create '{"type":"software","title":"我要一个 B2C 商城"}'
+   sck owner task.plan '{"type":"software","title":"导出按钮在 Safari 下无效"}'
+   sck owner route.list '{}'
    pnpm run company inbox
    pnpm run company approve <任务ID> [意见]
    pnpm run company reject <任务ID> <意见>
@@ -36,8 +37,7 @@
 2. **直接写 SurrealDB**（`sck_agent_company/control_plane`）：
 
    ```sql
-   CREATE owner_command CONTENT { kind: 'goal', text: '我要一个 B2C 商城' };
-   CREATE owner_command CONTENT { kind: 'goal', tier: 'quick', project: 'surreal_ck', text: '导出按钮在 Safari 下无效' };
+   CREATE owner_command CONTENT { kind: 'task.create', type: 'software', text: '我要一个 B2C 商城' };
    CREATE owner_command CONTENT { kind: 'approve', task: '<任务ID>', text: '同意' };
    CREATE owner_command CONTENT { kind: 'reject', task: '<任务ID>', text: '需要修改：…' };
    CREATE owner_command CONTENT { kind: 'reply', task: '<任务ID>', text: '回答：…' };
@@ -47,9 +47,10 @@
 
    执行结果回写在同一行的 `status`（applied / failed）和 `result`。
 
-3. **在 Paseo 里直接说**：你的指令由老板通道转录为 `create_goal` / `set_direction` / `record_owner_decision` 等动作，并逐字记录你的原话，审计来源沿用 `gm-relay:<员工编号>`（历史命名保留）。
+3. **在 Paseo 里直接说**：你的指令由老板通道转录为 `task.create` / `set_direction` / `record_owner_decision` 等动作，并逐字记录你的原话，审计来源沿用 `gm-relay:<员工编号>`（历史命名保留）。
 
-不指定 `tier` 时目标先处于「待分级」：Jev 高置信时直接选定 quick / standard / program，否则留在老板收件箱由老板 `triage_goal`（`sck owner goal.triage`）。quick 目标完成后只记录结果，不进老板收件箱；standard / program 在需要老板拍板时才进收件箱。
+唯一编排单位是任务：`route` 表把任务类型映射到执行岗、复核岗与消息模板（执行岗≠复核岗，一任务一会话）。`task.create` 按路由 `next` 把后继类型展开为 `planned` 链，在前驱 accept 的同一事务里激活；员工 `submit` 可带 `next` 提议后继。发给员工的每条消息都是 `outbound_message` 行：老板在控制台消息流预览、编辑、扣留或放行，发送成功后才标记 sent。复核回避只有一条规则：在该任务 `submit` 审计行里作为 actor 出现的员工不能复核它；事实读不出时该任务按 `unknown` 等待。
+
 
 ## 项目环境与凭证
 
@@ -169,34 +170,13 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME
 - 范围：只接受 `ready` / `doing` / `review` / `blocked`；`done` / `void` 返回 `conflict`。非 owner 一律返回 `forbidden`。
 - 只追加：不改 `state`、`blocked_to` / `resume_*`、依赖、`acceptance_criteria` / `acceptance_version`、独立性策略、worktree 与租约字段（持有人、delivery、fence、到期时间），不放宽验收机器项、独立验收、额度或依赖。任务版本也不移动——版本是持有人租约证明的一部分，移动会让持有人在通道心跳重新同步前（最多 60 秒）的 checkpoint/submit 撞上租约失效；`expectedVersion` 仍做 compare-and-set，读到过期任务即 `conflict`。
 - 落库：单事务把修订追加到 `task.context`——拼接在事务内由被锁的行算出（`$t.context + 修订块`），不在事务外读旧值再整体覆写；同一版本并发两次修订两条都落地（输的一方拿到可重试的写冲突后整笔重跑，重跑会读到对手的正文）。追加后总长上限 20000 字符（与创建时一致），超限整笔回滚并返回 `invalid`，检查也在同一事务内。审计 `action=acceptance_amend`（`evidence` 为 JSON：`ownerQuote` 逐字原话、`text`、`notify` 入参、`expectedVersion`）与 outbox 同事务写入。
-- 通知：`notify` 缺省为「当前活租约持有人 + implementer + 最近 submitter」去重；显式传入以传入为准，`[]` 表示不通知（审计照写）。每人一条持久 `holder_notice`（kind `acceptance_amended`），经 `holder_notices` 读取与 `ack`，通道重连或插件重启后由调度补发；租约内持有人不被中断——sidecar 会把未送达通知附在该员工下一次 `sck` 调用的回包顶层（`notices`，最多 3 条）。**附带即送达**：回包构造完成、守卫放行后，附带的每条通知先写 `delivered_at` 标记送达（与调度器空闲唤醒后的标记相同），再写回；附带正文注明「已随本次回包送达，无需 ack」。同一条通知只经回包或空闲唤醒送达一次，不会重复：同一员工并发到达的调用按序读取、附带、标记，后到的只读到尚未送达的通知。标记失败只记日志，不影响本次调用。已送达的本人通知再次回执（`ack`，或附带时的标记）仍然成功，计 0、不改送达时间，失败回执也不会把它重新打开；同一批里其余未送达的照常标记。非本人的通知仍整批拒绝（`forbidden`）。附带的通知与回包数据共用同一个 48 KiB 预算：数据的判定始终按 `answerBytes`，带通知时整条写回行也不超过 48 KiB。放不下的通知不附带，回包的 `noticesTruncated` 只描述被截掉的那几条（`count` 为条数，`bytes` 为它们的 JSON 字节数，`sha256` 为它们的摘要），未附带的仍未送达，下一次调用再附带，不会丢失。未知员工 ID 返回 `invalid`。
+- 通知：`notify` 缺省为「当前活租约持有人 + 最近 submitter」去重；显式传入以传入为准，`[]` 表示不通知（审计照写）。每条通知是一行 `outbound_message`（step=notice），老板可在控制台预览/扣留；送达由调度器在下一次唤醒或回包补发，标记 sent 只在外部发送成功之后。
 - 幂等：同一 `idempotencyKey` 同载荷回放首次结果（不重复追加、不重复通知），异载荷 `conflict`。
 
 ## 任务输入上限
 
-`create_task` 与 `create_delivery` 的显式 `dependencies` 至多 50 条，按去重前原始条数先验（51 条重复 ID 同样拒绝），每项为 1–200 字符的 task id；asset 类 `workIntent.paths` 至多 50 条、每条至多 300 字符，非 assets 不接受 paths。判定在 core 统一完成，MCP、sidecar 与直接调用是同一结论：超限返回结构化 `invalid`，任务/审计/outbox/幂等零写入。链内自动依赖（交付链腿间、goal anchor）不受此上限，保持完整。
+任务的编排字段：`type`（路由键）、`parent`（链上前驱；未完成前子任务保持 `planned`）、`proposed_in`（提议来源 submit 审计）、`tag`（自由分组）、`requirement`/`acceptance_text`（task.md 的两节）。显式 `dependencies` 与 `goalId` 已退役：入参带它们返回 `invalid`（`goalId is retired; use tag`）。asset 类 `workIntent.paths` 至多 50 条、每条至多 300 字符，非 assets 不接受 paths。判定在 core 统一完成：超限返回结构化 `invalid`，任务/审计/outbox/幂等零写入。
 
-## 独立性策略（independence_set）
-
-老板（owner，manage 能力）可为任务写入独立性策略（SYS-DISP IR01–IR03）：来源任务的经手人，以及点名的员工（及其同一登记身份 principal 的员工），不能接手（`execute`）或裁决（`review`）该任务。策略与任务版本一起存放，无策略的旧任务行为不变。
-
-- 字段：`stages`（`execute` / `review`，非空）；`sources`（来源任务 ID，原始条数至多 20）；`mode`（`execute_handlers`：来源的全部执行阶段经手人，含只领取未提交者与实现负责人；`all_handlers`：再加上来源的复核人）；`excluded`（点名回避的员工 ID，原始条数至多 100）；`reason`（非空，至多 2048 UTF-8 字节）。序列化后整个策略不超过 8 KiB。
-- 写入：`expectedVersion` 比较并交换；任务有未到期租约时拒绝，不静默改策略；同一 `idempotencyKey` 且载荷相同则回放原结果，载荷不同则冲突。自引用、来源不存在、未知员工、非法参数均拒绝。非 manage 能力的调用返回 `forbidden`。
-- 同源判定只用已登记的员工 ID 与登记的 principal 身份关联（`employee.principal`，见「身份关联 identity_principal_set」）。同一个 employeeId 跨 agent/会话/工作区始终同源；不同 employeeId 只有显式登记同一 principal 才算同源。编制（`employee.def`）、provider、模型、名字、目录都不构成身份，两个同一编制的员工默认相互独立；未登记的关联一律不识别，也不声称能识别。
-- 执行：调度每轮按来源的最新贡献历史过滤候选，包括 `previousEmployee`、Jev 选择与补位，因此被排除者不会因为连续性或优先级重新入选。新 spawn 的实例是全新 employeeId、无 principal 关联，因此同编制的新实例默认独立、可被派工。领取、提交与裁决在事务内带来源版本守卫：来源在读取后有变动即拒绝并重读。来源不可读时失败关闭：不授租约，候选标记为 `unknown`，恢复后自动重判。
-- 与普通 review 的分界（IR01/Q1）：普通任务的复核回避保持原规则——提交过（写过码）的人硬回避；只持有过租约、未写码的经手人 `hands` 降权（`PRIOR_HAND_WEIGHT_FACTOR`）仍可领取与裁决复核。该规则与阶段无关：执行或复核阶段只领取未提交者都是 `hands`。被老板或系统指定为实现负责人（`implementer_takeover`）或首次执行领取绑定为实现负责人的人，写码事实以 `implementer_bound` 审计行留痕，是真实作者，绑定后来转移也不改写该事实。只有策略指定的来源任务，才按 `mode` 硬排除其全部执行经手人（含 claimed-but-never-submitted）。历史行缺阶段且之后无可判定动作的，仍按作者 fail-closed。
-- 多名经手人都未提交且没有记录的实现负责人时，任务视为归属不明（`ambiguous`）：无人可执行，等老板 `implementer_takeover`（`sck owner implementer.takeover`）指定；这与「只领取未写码」的降权不同，不因修复而丢失。
-- 拒绝返回结构化原因：`forbidden`，`details.conflicts` 含任务、来源任务、员工、命中方式（`contributor` / `explicit` / `same_principal`）、角色与审计引用（不含凭证）。
-
-## 候选级只读预检（independence_check）
-
-`independence_check`（SYS-DISP IR01–IR05）是上面策略的只读入口：给一个 `{taskId, employeeId, stage?}`，回答「这个人在这条任务的这个阶段会不会被拒绝」——供老板与 QA 用正式接口独立读回策略与结论，替代「导出回包」这类二次转述证据。
-
-- 判定与 `claim` / `submit` / 裁决的门禁同源：直接复用门禁读的同一份来源贡献索引与同一套登记身份关联，冲突时给出的 `via` / `source` / `matched` / `role` / `principal` / `auditRef` 与拒绝里 `details.conflicts` 的字段一致，不存在第二套判定。
-- 结论：`clear`（门禁会放行）、`conflict`（会被拒绝）、`unverifiable`（来源贡献读不到、身份表读不到、或策略版本不认识——门禁在这几种情况下失败关闭，因此绝不返回 `clear`）、`not_applicable`（该任务没有策略，旧行为不变）。`stage` 缺省按任务当前阶段推断（`review` 态取 review，其余取 execute）；策略没点名该阶段时门禁本就不读，结论为 `clear`。
-- `policy` 字段回显实际登记的 `revision` / `stages` / `mode` / `sources` / `excluded` / `setBy` / `setAt`；无策略时不回显。除策略文本外不回显任何凭证类信息。
-- 授权：owner 恒可读，qa 可读（QA 需独立复核且不持有 manage），其余角色 `forbidden`。不读通道或凭证文件。
-- 纯读：不领租约、不推进任务版本、不写审计 / outbox / 派工观察、不改任务任何字段，因此**已完成（done）或已作废的任务同样可读**——被核验的目标常常已经完成，这是该工具的主要用途。回退该工具不影响门禁的失败关闭。
 ## 身份关联（identity_principal_set）
 
 老板（owner，manage 能力）可登记 principal：把多个 employeeId 显式绑定为同一个人，用于独立性策略的同源判定（SYS-DISP IR02/Q3）。
@@ -219,13 +199,12 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME
 | `redispatch_minutes` | 15 | 派工后多久未领取可改派（评审派工同样受该去重窗口约束） |
 | `paused` | false | 暂停派工（也可用 `company pause`） |
 | `eval_enabled` | true | 任务完成后是否自动评审打绩效分 |
-| `eval_engine` | auto | `auto`=Jev 优先 LLM 兜底；`llm`=只用 eval 员工；`jev`=只用 Jev |
-| `jev_min_confidence` | 0.7 | Jev 单题置信度下限，低于则升级 LLM 评审（auto） |
-| `jev_flag_threshold` | 0.65 | Jev 员工风险标记阈值，达到则提醒老板 |
-| `jev_notify_triage` | true | 系统提醒是否先经 Jev 分诊再决定弹窗（提醒始终进收件箱） |
-| `jev_decisions` | true | Jev 是否参与目标分级、上线决定、老板升级路由（拿不准时交老板） |
-| `jev_release_threshold` | 0.8 | 上线申请「可以上线」概率 ≥ 该值且「触碰红线」≤ 1 − 该值时自动批准 |
-| `jev_owner_threshold` | 0.3 | 升级给老板的问题「必须老板决定」概率低于该值时不升级（每任务一次） |
+| `eval_engine` | auto | `auto`=Jev 逐任务直评 + 批量 LLM 兜底；`llm`=只用 eval 员工批量；`jev`=只用 Jev |
+| `jev_min_confidence` | 0.7 | Jev 单题置信度下限，低于则入下一批量 LLM eval 候选 |
+| `jev_flag_threshold` | 0.65 | Jev 员工风险标记阈值，达到则任务入低置信批量 eval |
+
+| `eval_batch_hours` | 24 | LLM eval 批量节奏：每隔该时长若有未评分或 Jev 低置信 done 任务发一条批量 eval 消息（≤30 id） |
+
 | `quota_floor_pct` | 8 | 订阅短窗口/余额剩余低于该百分比即停止复用与新开；0 = 不熔断 |
 | `quota_weekly_floor_pct` | 2 | 订阅周/月窗口剩余低于该百分比即停止复用与新开；0 = 不熔断 |
 | `quota_warn_pct` | 20 | 订阅剩余低于该百分比但未触底时，给老板发一次「即将用尽」提醒；0 = 不提醒 |
@@ -243,8 +222,10 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME
 - **订阅额度从哪读**：Paseo 的用量列表只覆盖它自己驱动的订阅（本机是 claude/codex/grok）。magpie 网关（`GET /v1/magpie/quotas`，本机回环）覆盖老板配置的全部订阅，调度器只把 Paseo 没报的那几个补进来（`factory` → `factory-droid`），两边都报时以 Paseo 为准。magpie 未运行或超时按“没有答案”处理，绝不当成“额度为 0”。
 - **员工实例什么时候退役**：只有“这个会话不可能再接任何任务”才退役——凭证文件实例在 sidecar 模式下不可复用（通道轮换）、派工轮次或上下文超过 `session_max_wakes` / `session_max_input_k`（会话轮换）、Paseo 报会话已归档（正常结束）、启动绑定失效且会话还活着（通道隔离）、spawn 失败且不是额度类错误、claim 被拒或写权被占且未绑定实现人、任务现场销毁（场景回收），以及老板手工退役。
 - **不因额度耗尽退役**：额度失败只把 provider 记进 `provider_health`（冷却按指数退避：30 分钟起、最长 6 小时），任务留在原实现人名下等待恢复，不再记员工定义的违规次数。长时间耗尽由额度下限熔断挡住派工（magpie 补上 Paseo 不报的订阅），不靠冷却时长兜底。
-- **老板待办路由**：ready/doing 无人的工程任务若 execute verdict 需要老板动作（`implementer_unresolved`、系统自动接替无候选的 `implementer_unavailable`、绑定实现人持续额度失败），调度器把无法派工记成持久待办并升级成老板通知（同一 task+阶段+episode+reason 去重，负责人已记录、任务开工、退役或理由变化时收口并保留审计）。老板对 ready 任务先 `sck owner contributor.dryRun` 再以最新 `expectedVersion` 调 `sck owner implementer.takeover`，不调用 `resume_task`；只有 blocked 任务用 `resume_task`。普通忙碌、在办租约、普通并发满、依赖等待不升级；读取失败保持待办，不当作已处理。**SYS03 之后的处置账本**：每个 blocking episode 只能由老板一方持有（`claim_disposition` 带租约与 episode 版本；另一持有方读到 `held_by_other`/`already_handled`，租约失效才可带 `expectedEpisodeVersion` 受控接手），处置写入（`decide_disposition`：resume/defer/依赖/retire/修复）以 claim 令牌 + episode 版本 + 任务版本比较并交换，业务幂等键不含员工身份，所以并发的 20 次请求、换人接手或重启都只落一项处置和一条修复链。调度器在按 episode 核验时身份精确相等才算已处置（已处置的在当轮收口；有活租约的不再重复提醒）。任务自己带有持久 episode 起点时只认精确匹配；只有当调度器自己清掉了门禁任务的持久起点（提醒身上只剩任务版本号）时才回退到「按任务取处置行」，且只认仍在处理中的活租约行——一条已处置的行属于已经结束的 episode，同一任务之后形成的全新 episode 必须照常提醒（否则该提醒每轮都被旧处置压掉、任务永久饥饿）；处置结果、撤租与接手通过持久 outbox 通知持有人（`holder_notices` 由员工自己确认），通道重连或插件重启后补发。系统支持动作（例如取消 CI 运行）走 `cancel_ci_run` 受控出口，记录真实内部员工 ID、目标 run、理由、前置任务版本与外部结果（已确认/被拒/结果未知），只读对账把带外变更写成 `unknown_actor`。**同一个 actionKey 只发一次真实取消请求**：重放只读 provider 状态——读回终态且结论是取消=已确认（这正是「provider 已经接受、回执却丢了」的那次请求），终态别的结论或运行不存在=被拒，还没落定=结果未知（如实记 unknown，等它真的 cancelled 之后再按同一 key 读一次才变已确认；绝不为了好看伪报成功，也绝不发第二次取消）。绑定要求 run 的 head 分支等于前置任务登记的分支，任务登记了可比仓库标识（GitHub slug 或能解析出 slug 的 remote）时还要求仓库相同，只登记了本地路径这类比不出来的值就只按分支绑定（**本公司生产即此情形**：任务登记的 `worktree.repo` 是文件系统路径而不是 GitHub slug，故生产上「仓库」这一维不触发、核对依据固定为 `branch_only`，只有分支相同才放行；要按仓库核对须让任务登记 `owner/name` 形式的仓库标识，这是已披露的限制，不是「核过仓库」）；核对依据（repo+branch / branch_only / manager_exempt）如实写进审计证据——老板按设计不受 run↔任务绑定核对（取消权本来就是仓库级的），行动记录里仍然有前置任务、版本与真实员工 ID；`reconcile_ci_runs` 是老板动作（它会写 `unknown_actor` 行），事后归因只针对带外记录，已带内部归属的请求不可改写。
-- **实现人失效自动接替**：绑定的实现人（显式绑定，或由贡献记录派生的唯一作者）彻底不可用（员工退役/撤凭证、不在册，或会话归档、隔离、停在无法就地重启的失败里）时，调度器自动把执行权交给同仓库、非作者的在岗工程员工并发下一轮派工，不需要老板；审计 actor 为 `system:dispatcher`，事件标记 `[implementer_takeover:auto]`，写入与老板 `implementer.takeover` 同一笔事务。实现人只是忙、空闲、额度冷却或状态未知时不触发。没有可派候选时按 `implementer_unavailable` 记为无法派工（负责方「系统」），每轮自动重试。
+- **老板待办路由**：基础设施原因（配额、探测忙、席位满、主机资源、唤醒失败、候选为空、先前提交人、未知）导致的无法派工记为持久待办并升级成老板通知（同一 task+阶段+episode+reason 去重，理由变化或派工成功时收口并保留审计）。需要老板决定的问题走 `blocked_to='owner'` 进收件箱，由 `sck owner decide`/`task.reassign`/`task.void` 处置。
+
+- **复核回避**：唯一排除规则是先前提交人——任务 `submit` 审计里的 actor 不能领该任务的复核；读不出按 `unknown` 等待。返工时上一轮提交人优先续做，claim-only 经手人按 `PRIOR_HAND_WEIGHT_FACTOR` 降权。没有自动接替：候选为空按 `no_candidate` 记无法派工。
+
 - **按编制豁免额度限制**：`employee_def.quota_limited`（默认 true）设为 false 时，该编制不受额度下限熔断与额度类健康冷却影响：剩余额度为 0 也继续派工；停在 error 的会话按 5 分钟重试间隔就地重载后继续尝试。并发席位上限（`provider_max`）仍然生效。设置方式：编制页编辑「额度限制：不受限」、老板 `def_ensure` 的 `quotaLimited` 字段（`sck owner def.ensure`），或 `pnpm run admin def quota <id> unlimited`。
 - **额度恢复后会话自动重启**：额度失败会把会话停在 Paseo 的 `error` 状态，而 Paseo 不会自己把它放出来；调度器只往 `idle` 会话派工，所以冷却结束后调度器用 `paseo agent reload` 就地重启该会话（agent、对话与通道绑定都保留），不退役、不重开新员工。重载失败按 5 分钟间隔重试。
 - **不因模型漂移退役**：供应商可能在会话中途换模型（Factory 标准额度用尽后会切到更便宜的模型，恢复后再切回）。调度器读到 Paseo 报的实际模型与编制不符时，通过 Paseo daemon 的 `update_agent` 就地改回；改不动就留到下一轮，会话、上下文与席位都不丢。订阅还在冷却或低于额度下限时不做改回——那期间的改回不可能生效，调度器等订阅恢复后的第一轮再改。

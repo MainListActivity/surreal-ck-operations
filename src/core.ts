@@ -1,4 +1,4 @@
-import { readCompanyRelease, type CompanyRelease } from './company-release.ts';
+import { git, readCompanyRelease, type CompanyRelease } from './company-release.ts';
 import { getRoute, listRoutes, CHAIN_LIMIT, type RouteRow } from './routes.ts';
 import { OutboundMessageStore } from './outbound-messages.ts';
 import { drillHost, startDrill, readDrillStatus, type DrillState } from './deploy-drill-service.ts';
@@ -13,7 +13,8 @@ import type { CompanyDatabase } from './database.ts';
 import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateTask, Credential, DefView, EnsureDef, ProjectView, EmployeeScore, Evidence, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
-import type { SubmitCheck } from './pr-gate.ts';
+import { ghCli, type GhRunner, type SubmitCheck } from './pr-gate.ts';
+import { githubRepoSlug } from './external-actions.ts';
 import type { SystemCheck } from './submit-checks.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, summarizeModelEvidence, validateScores, writeScorecards, type ModelEvidence } from './scoring.ts';
@@ -404,6 +405,15 @@ function historyEntry(row: AuditHistoryRow, limit?: number): HistoryEntry {
   return entry(longestFittingPrefix(full, text => dualBytes(entry(text, true)) <= limit), true);
 }
 
+/** The workflow runs found for one submitted sha: each is verified by the acceptance adapter before evidence lands. */
+export type AcceptanceRunLister = (slug: string, sha: string, run?: GhRunner) => Promise<string[]>;
+const defaultRunLister: AcceptanceRunLister = async (slug, sha, run = ghCli) => {
+  // The same gh invocation family pr-gate/github-ci-control use: read-only `gh api` against the Actions runs API.
+  const out = await run(['api', `repos/${slug}/actions/runs?head_sha=${sha}&status=completed&per_page=10`, '--jq',
+    '.workflow_runs[] | select(.conclusion == "success") | .html_url']);
+  return out.split(/\r?\n/).map(line => line.trim()).filter(line => /^https:\/\/github\.com\//.test(line)).slice(0, 5);
+};
+
 export class SurrealCompanyCore implements CompanyCore {
   readonly leaseSeconds: number;
   readonly checkpointLimit: number;
@@ -412,12 +422,14 @@ export class SurrealCompanyCore implements CompanyCore {
   private readonly systemCheck?: SystemCheck;
   /** SYS02: read-only source adapter that verifies CI runs, artifacts and probes; tests inject a deterministic one. */
   private readonly acceptanceAdapter: AcceptanceSourceAdapter;
+  /** Resolves the GitHub Actions run urls of one head in one repository slug; tests inject a deterministic one. */
+  private readonly acceptanceRuns: AcceptanceRunLister;
   private readonly ciBillingCheck: CiBillingCheck;
   /** Test seam (SYS-DISP AC06): runs after a contribution view is read and before the lease transaction that checks it. */
   private readonly contributionReadHook?: (taskId: string) => Promise<void>;
   private readonly companyReleaseRepo?:string;
   private readonly drillLaunch?: (home: string, repo: string, plan: { runId: string; root: string }) => number;
-  constructor(readonly database: CompanyDatabase, options?: { companyReleaseRepo?:string; leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; systemCheck?: SystemCheck; ciBillingCheck?: CiBillingCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter };
+  constructor(readonly database: CompanyDatabase, options?: { companyReleaseRepo?:string; leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; systemCheck?: SystemCheck; ciBillingCheck?: CiBillingCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter; runs?: AcceptanceRunLister };
     faults?: { limits?: FaultBudgetLimits; clock?: () => number };
     /** Test seam only: replaces the detached drill launch so a gate can assert the guards without a real run. */
     drillLaunch?: (home: string, repo: string, plan: { runId: string; root: string }) => number }) {
@@ -426,6 +438,7 @@ export class SurrealCompanyCore implements CompanyCore {
     this.submitCheck = options?.submitCheck;
     this.systemCheck = options?.systemCheck;
     this.acceptanceAdapter = options?.acceptance?.adapter ?? createGithubActionsAdapter();
+    this.acceptanceRuns = options?.acceptance?.runs ?? defaultRunLister;
     this.ciBillingCheck = options?.ciBillingCheck ?? createCiBillingCheck();
     this.contributionReadHook = options?.contributionReadHook;
     const seconds = options?.leaseSeconds ?? DEFAULT_LEASE_SECONDS;
@@ -1847,6 +1860,21 @@ export class SurrealCompanyCore implements CompanyCore {
     return evidence;
   }
 
+  /** The GitHub slug of the task's code repository: explicit code_repo_path remote first, then the project's repo. */
+  private async acceptanceRepoSlug(row: TaskRow): Promise<string | undefined> {
+    const paths = [row.code_repo_path];
+    if (!paths[0] && row.project) {
+      const project = await this.db.select<{ repo_path?: string }>(row.project as RecordId);
+      paths.push(project?.repo_path);
+    }
+    for (const path of paths) {
+      if (!path) continue;
+      const slug = githubRepoSlug(path) ?? githubRepoSlug(await git(path, ['config', '--get', 'remote.origin.url']).catch(() => ''));
+      if (slug) return slug;
+    }
+    return undefined;
+  }
+
   // ---- 受控编制管理工具（manage = owner/product） ----
   // 员工侧唯一写编制/词表的入口；owner console 与 admin CLI 继续可用。每次写落一条 audit。
 
@@ -2031,6 +2059,52 @@ export class SurrealCompanyCore implements CompanyCore {
       if (action === 'submit' && !legacy && submittedEnvironment !== declaredEnvironment) {
         throw new CompanyError('invalid',
           `the submitted acceptance environment ${submittedEnvironment ?? 'is missing'} is not the declared environment ${declaredEnvironment ?? 'none'}`);
+      }
+      // 软件线：按 sha 自动验收证据 — a submitted sha names one or more GitHub Actions runs in the task's code
+      // repository. A successful completed run verifies every required machine criterion and records the evidence
+      // before the evaluator reads it; no successful run rejects the submit with the reason (retry after CI lands).
+      if (action === 'submit' && head !== undefined && criteria.some(c => c.kind === 'machine' && c.required !== false)) {
+        const needed = criteria.filter(c => c.kind === 'machine' && c.required !== false &&
+          !evidenceRows.some(e => e.acId === c.id && e.sha === head && e.attempt === attempt));
+        if (needed.length) {
+          const slug = await this.acceptanceRepoSlug(row).catch(() => undefined);
+          if (!slug) {
+            throw new CompanyError('invalid', `submit sha ${head}: the task's code repository has no GitHub remote; record the acceptance evidence with record_acceptance_evidence or fix the remote`);
+          }
+          let urls: string[] = [];
+          try { urls = await this.acceptanceRuns(slug, head); } catch (error) {
+            throw new CompanyError('invalid', `submit sha ${head}: GitHub run lookup failed (${(error as Error).message}); retry after the CI run completes`);
+          }
+          if (!urls.length) {
+            throw new CompanyError('invalid', `submit sha ${head}: no successful completed GitHub Actions run found for this sha in ${slug}; retry after CI completes successfully`);
+          }
+          let covered = 0; const reasons: string[] = [];
+          for (const criterion of needed) {
+            let recorded = false;
+            for (const runUrl of urls) {
+              const verified = await this.acceptanceAdapter.verify({
+                provider: 'github-actions', runUrl, sha: head, environment: declaredEnvironment,
+                verify: criterion.verify, risk: criterion.risk });
+              if (!verified.ok) { reasons.push(`${criterion.id}@${runUrl}: ${verified.reason}`); continue; }
+              if (verified.environment !== declaredEnvironment) { reasons.push(`${criterion.id}@${runUrl}: environment ${verified.environment ?? 'unknown'} is not the declared environment ${declaredEnvironment ?? 'none'}`); continue; }
+              const gate2 = await loadAcceptanceGate(this.db);
+              const rec = await recordAcceptanceEvidenceRow(this.db, {
+                taskId: proof.taskId, acId: criterion.id, kind: 'machine', sha: head, environment: verified.environment,
+                evidenceType: criterion.evidence, source: verified.source, verifier: 'github-actions', actor: actor.employeeId,
+                at: verified.at, criteriaVersion: gate2.criteriaVersion, taskVersion: row.version, attempt });
+              await this.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: 'acceptance_evidence', evidence: $evidence, at: time::now() };`,
+                { task: id('task', proof.taskId), actor: id('employee', actor.employeeId),
+                  evidence: JSON.stringify({ acId: criterion.id, sha: head, evidenceType: criterion.evidence, environment: verified.environment, attempt, digest: rec.digest, auto: true }) });
+              recorded = true; covered++; break;
+            }
+            if (!recorded) {
+              throw new CompanyError('invalid',
+                `submit sha ${head}: no successful run verifies machine criterion ${criterion.id} (${reasons[0] ?? 'no successful completed GitHub Actions run'}); retry after the CI run completes`);
+            }
+          }
+          void covered;
+          evidenceRows.splice(0, evidenceRows.length, ...(await loadAcceptanceEvidence(this.db, proof.taskId)));
+        }
       }
       const verdict = evaluateAcceptance({
         subject, evidence: evidenceRows,

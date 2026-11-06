@@ -8,7 +8,7 @@ import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, Retire
 import { REQUIRED_TRACKS } from '../core.ts';
 import { UNATTENDED_MODE, type PaseoGateway, type PaseoWorkspaceInfo } from './paseo.ts';
 import { latestFindings } from './brief.ts';
-import { wake, type PromptEnv } from './prompts.ts';
+import type { PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
 import { agingLevel, agingText, localDate, renderBrief, type RoleCapacity } from '../owner-brief.ts';
 import type { ReclaimResult } from './worktree-registry.ts';
@@ -1341,7 +1341,10 @@ export class Dispatcher {
       // Continuity beats weights: the previous holder keeps the task when it is still available.
       // Review work never hits this: an author's former holder is already out; a claim-only
       // hand surviving as previousEmployee is continuity, not a conflict.
-      const previous = candidates.find(i => i.id === task?.previousEmployee && ['idle','sleeping'].includes(states.get(i.id) ?? ''));
+      // Rework continuity: the last submitter takes its own rework back when it is free; a claim-only
+      // previous holder only counts when the task was never submitted.
+      const continuation = task?.submittedBy ?? task?.previousEmployee;
+      const previous = candidates.find(i => i.id === continuation && ['idle','sleeping'].includes(states.get(i.id) ?? ''));
       if (previous) return previous;
       // A dead (exhausted) session cannot prove a provider recovered; probe with a live one when possible.
       const live = candidates.filter(i => ['idle','sleeping'].includes(states.get(i.id) ?? ''));
@@ -1386,8 +1389,7 @@ export class Dispatcher {
           spawnable(role, home, task, forReview);
         this.scopeDenied.delete(item.task.id);
         const result = await this.assign(item.role, item.task, last?.employee, pickItem, spawnItem,
-          (inst, first, claim) => wake(inst, item.task, this.deps.env, first,
-            { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, item.purpose === 'review', slotMap, exclusion, undefined, undefined);
+          report, insts, item.purpose === 'review', slotMap, exclusion, undefined, undefined);
         if (!result) {
           // Eligible candidates that still failed to wake or spawn are a runtime failure, not an empty pool. Entries held for
           // non-eligible entries keep their own reason: they were never candidates, so they are not a wake failure.
@@ -1456,49 +1458,44 @@ export class Dispatcher {
         // A recent eval dispatch (LLM or Jev in flight) pauses both engines for this task.
         const last = await wf.lastDispatch(task.id, task.version, 'eval');
         const dispatched = last && now - last.at < cfg.redispatchMinutes * 60;
-        let fullHistory = task.row.model_eval_full_history===true;
+        const fullHistory = task.row.model_eval_full_history===true;
         if (!dispatched && !fullHistory && jevReady && task.evalAttempts < 3) {
           const outcome = await this.jevEvaluate(task, cfg, report);
           if (outcome === 'done') { report.evals.push(task.id); continue; }
           if (outcome === 'retry') continue;
-          if (outcome === 'full-history') fullHistory=true;
         }
-        // quick-tier work is small by definition: the Jev verdict (even low-confidence) is good
-        // enough, and a whole LLM judge session costs more than the task did. eval_quick_llm
-        // re-enables escalation for quick tasks.
-        const llmReady = fullHistory ? defs.some(d=>d.role==='eval' && d.enabled) : llmCapable;
-        if (!llmReady) {
-          if (cfg.evalEngine === 'jev' || task.evalAttempts >= 3) {
-            await this.notice(`eval-stuck:${task.id}`,
-              `任务 ${task.id} 的绩效评审无法完成：${cfg.evalEngine === 'jev' ? 'eval_engine=jev 且 Jev 连续失败' : 'Jev 不可用/连续失败且没有启用的 eval 员工定义'}。检查 JEV_API_KEY 或改用 eval_engine=llm。`, report);
+      }
+      // LLM eval is one batched message every eval_batch_hours (company_meta:config, default 24): it lists
+      // at most 30 done task ids that are unscored or whose Jev verdict was low-confidence. No per-task
+      // eval dispatch exists; the row is an owner-previewable outbound_message marked sent after the send.
+      if (llmCapable && running < cfg.maxRunning) {
+        const lastBatch = await wf.lastEvalBatchAt().catch(() => 0);
+        if (Date.now() - lastBatch >= cfg.evalBatchHours * 3_600_000) {
+          const batch = await wf.pendingEvalBatch(cfg.jevMinConfidence, 30).catch(() => []);
+          const store = this.messageStore();
+          if (batch.length && store) {
+            const draft = await store.createDraft(batch[0].id, 'eval', 'eval', false, 'done',
+              `按 agents/eval.md 的评分规则为以下完成任务的本轮参与员工逐个 record_score：${batch.map(task => task.id).join('、')}。`)
+              .catch(() => undefined);
+            if (draft && (draft.hold || draft.state === 'held')) {
+              await this.notice(`message-hold:${batch[0].id}:eval`,
+                `任务 ${batch[0].id} 的 eval 批量消息被标记「需要我放行」；请在消息流里放行后再派工。`, report);
+            } else if (draft) {
+              const body = renderMessage(draft.body, { sckBin: this.deps.env.sckBin, commDir: '$SCK_COMM_DIR',
+                taskId: batch[0].id, opsRepo: this.deps.env.opsRepo });
+              const prepared: PreparedOutbound = { message: draft, body };
+              const result = await this.assign('eval', undefined, undefined, pick, spawnable,
+                report, insts, false, slotMap, undefined, { task: batch[0] }, undefined, prepared);
+              if (result) {
+                await wf.recordDispatch(batch[0].id, batch[0].version, 'eval', result.id);
+                running++;
+                busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);
+                assigned.add(result.id);
+                report.evals.push(...batch.map(task => task.id));
+                report.woke.push({ task: batch[0].id, employee: result.id, spawned: result.spawned });
+              }
+            }
           }
-          continue;
-        }
-        if (running >= cfg.maxRunning || dispatched) continue;
-        // The eval message itself is an owner-previewable draft. It carries the task id and the absolute eval.md path;
-        // no task.md is staged for eval, and the row is marked sent only after the dispatch succeeded.
-        const store = this.messageStore();
-        if (!store) continue;
-        const draft = await store.ensureDraft(task.id, 'eval', 'eval');
-        if (draft.hold || draft.state === 'held') {
-          await this.notice(`message-hold:${task.id}:eval`,
-            `任务 ${task.id} 的 eval 消息被标记「需要我放行」；请在消息流里放行后再派工。`, report);
-          continue;
-        }
-        const prepared = await this.prepareOutbound(task.id, 'eval', '', undefined, undefined, this.deps.env.opsRepo)
-          .catch(error => { this.log(`eval message read failed for ${task.id}: ${(error as Error).message}`); return null; });
-        if (!prepared) continue;
-        const body = this.outboundBody(prepared);
-        if (typeof body !== 'string') continue;
-        const result = await this.assign('eval', undefined, last?.employee, pick, spawnable,
-          () => body, report, insts, false, slotMap, undefined, { task }, undefined, prepared);
-        if (result) {
-          await wf.recordDispatch(task.id, task.version, 'eval', result.id);
-          running++;
-          busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);
-          assigned.add(result.id);
-          report.evals.push(task.id);
-          report.woke.push({ task: task.id, employee: result.id, spawned: result.spawned });
         }
       }
     }
@@ -1629,7 +1626,6 @@ export class Dispatcher {
     role: string, task: SupervisedTask | undefined, avoid: string | undefined,
     pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean, exclusion?: ReviewExclusion, anchorHome?: string) => EmployeeInst | undefined,
     spawnable: (role: string, home: string, task?: SupervisedTask, forReview?: boolean) => EmployeeDef[],
-    prompt: (inst: EmployeeInst, firstContact: boolean, claim?: ClaimResult, workspace?: WorktreeAssignment) => string,
     report: TickReport, insts: EmployeeInst[], forReview = false,
     slots?: Map<string, string>, exclusion?: ReviewExclusion, anchor?: DispatchAnchor,
     hooks?: AssignHooks, evalMessage?: PreparedOutbound,
@@ -1709,13 +1705,13 @@ export class Dispatcher {
             if (claim) await sidecar!.releaseClaim(existing.id, task.id, '派工消息读取失败，已收回本次预领租约等待重试');
             return undefined;
           }
-          if (task && body === undefined) {
-            if (claim) await sidecar!.releaseClaim(existing.id, task.id, '无待发消息行，已收回本次预领租约并等待生成');
-            this.log(`no outbound message for ${task.id}; skip send to ${existing.id}`);
+          if (body === undefined) {
+            if (claim && task) await sidecar!.releaseClaim(existing.id, task.id, '无待发消息行，已收回本次预领租约并等待生成');
+            this.log(`no outbound message for ${task?.id ?? `dispatch:${role}`}; skip send to ${existing.id}`);
             return undefined;
           }
           await hooks?.beforeExternal?.(existing, 'send');
-          await paseo.send(existing.paseoAgentId!, task ? body! : prompt(existing, first, claim, workspace));
+          await paseo.send(existing.paseoAgentId!, body!);
           await this.markOutbound(prepared ?? undefined, existing.id);
           await hooks?.afterExternal?.(existing, 'send', existing.paseoAgentId!);
           this.onboarded.add(existing.id);
@@ -1792,7 +1788,7 @@ export class Dispatcher {
           repoHome,
           labels: { company: 'surreal-ck', employee_id: inst.id, role: def.role, def: def.id },
           env: spawnEnv,
-          prompt: task ? body! : prompt(inst, true, claim, workspace),
+          prompt: body!,
         });
         await this.markOutbound(prepared ?? undefined, inst.id);
         await hooks?.afterExternal?.(inst, 'spawn', agentId);
@@ -1859,10 +1855,11 @@ export class Dispatcher {
         this.log(`recovered ${inst.id}: closed session resumed in place${holding ? ` holding ${holding.id}` : ''}`);
         if (!holding) return 'idle';
         try {
-          await this.deps.paseo.send(agent, `【系统】公司服务重启打断了你上一轮的工作。任务 ${holding.id}「${holding.title}」的租约仍在你名下（见 claim.json），从中断处继续执行；收尾规则不变：完成写 report.md，受阻写 blocker.md。`);
-          return 'busy';
+          const delivered = await this.sendNotice(holding.id, 'notice', agent, inst.id,
+            `公司服务重启打断了上一轮，任务 ${holding.id} 仍在你名下，从中断处继续。`);
+          return delivered ? 'busy' : 'idle';
         } catch (error) {
-          this.log(`resume prompt to ${inst.id} failed: ${(error as Error).message}`);
+          this.log(`resume notice to ${inst.id} failed: ${(error as Error).message}`);
           return 'idle';
         }
       } catch (error) {
@@ -1883,13 +1880,35 @@ export class Dispatcher {
     const seen = this.activity.get(agent);
     if (!seen || seen.task !== task.id) {
       this.activity.set(agent, { tail, at: now, task: task.id });
-      await this.deps.paseo.send(agent, `【系统】任务 ${task.id} 已超过 ${stallMinutes} 分钟没有 checkpoint。到下一个可记录的节点就调用 checkpoint 写明进展；会话持续无动静将被中止并收回任务。`)
-        .catch(error => this.log(`checkpoint reminder to ${agent} failed: ${(error as Error).message}`));
+      await this.sendNotice(task.id, 'nudge', agent, task.currentEmployee ?? '',
+        `任务 ${task.id} 已 ${stallMinutes} 分钟没有 checkpoint，到下一个节点调用 sck call checkpoint 写明进展。`);
       this.log(`stalled ${task.id}: busy holder still observed, checkpoint requested`);
       return true;
     }
     if (seen.tail !== tail) this.activity.set(agent, { tail, at: now, task: task.id });
     return now - this.activity.get(agent)!.at < ACTIVITY_WINDOW_SECONDS;
+  }
+
+  /**
+   * System notices (resume, stall): every send still passes through outbound_message so the owner can
+   * preview and hold it. The row is created, sent verbatim (no template), and marked sent only after
+   * the external send succeeded; a send failure leaves the draft for the next pass.
+   */
+  private async sendNotice(taskId: string, step: MessageStep, agent: string, employeeId: string, text: string): Promise<boolean> {
+    const store = this.messageStore();
+    if (!store) return false;
+    let messageId = '';
+    try {
+      const draft = await store.createDraft(taskId, step, 'system', false, 'doing', text);
+      messageId = draft.id;
+      const body = renderMessage(text, { sckBin: this.deps.env.sckBin, commDir: this.deps.sidecar?.commDirFor(employeeId) ?? '$SCK_COMM_DIR', taskId });
+      await this.deps.paseo.send(agent, body);
+      await store.markSent(messageId, employeeId, text);
+      return true;
+    } catch (error) {
+      this.log(`${step} notice to ${agent} failed: ${(error as Error).message}`);
+      return false;
+    }
   }
 
   private async revoke(task: SupervisedTask, reason: string, inst: EmployeeInst | undefined, report: TickReport, trigger: 'revoke' | 'expire' = 'revoke') {
