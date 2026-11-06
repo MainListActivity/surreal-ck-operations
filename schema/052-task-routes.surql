@@ -59,3 +59,10 @@ INSERT IGNORE INTO route [
   { id: route:qa,        label: '测试',       executor_role: 'qa',               reviewer_role: 'product', code: false, execute_body: NONE, review_body: NONE, next: NONE, hold: false, enabled: true, updated_at: time::now(), updated_by: 'system' },
   { id: route:gate,      label: '老板关口',   executor_role: 'product',          reviewer_role: 'owner',   code: false, execute_body: NONE, review_body: NONE, next: NONE, hold: false, enabled: true, updated_at: time::now(), updated_by: 'system' },
 ];
+
+-- model_evaluation_reopened 事件在 DELETE 时 $after 为 NONE，原定义（033，不改历史文件）会对任意 done 任务的删除抛
+-- UPDATE NONE。这里用 OVERWRITE 收紧触发条件到 UPDATE 事件本身，删除任务不再触发它。
+DEFINE EVENT OVERWRITE model_evaluation_reopened ON TABLE task WHEN $event = 'UPDATE' AND $before.state = 'done' AND $after.state != 'done' THEN {
+  UPDATE $after.id SET evaluated_at = NONE;
+  DELETE model_scorecard WHERE task = $after.id;
+};
