@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'bun:test';
 import { BLOCK_TEXT, evaluateDispatch, type DispatchVerdict } from '../src/dispatcher/dispatch-blocked.ts';
-import type { ContributionFacts } from '../src/contributors.ts';
+type ContributionFacts = { authors: string[]; excluded: string[]; hands: string[] };
 import { snapshotOf, type DispatchSnapshot, type InstState, type PassInputs, type StaffingInput } from '../src/dispatcher/dispatcher.ts';
 import type { SupervisedTask } from '../src/workforce.ts';
 import type { Pulse, PulseListName, Roster } from '../plugin/shared/types.ts';
@@ -32,7 +32,7 @@ const contributors = async (): Promise<ContributionFacts> => {
   historyCalls++;
   if (historyFails) throw new Error('synthetic read failure');
   const authors = emptyHistory ? [] : ['author', 'rework-submitter'];
-  return { authors, reviewers: [], unknown: [], ambiguous: false, excluded: authors, hands: [], strictExcluded: authors };
+  return { authors, excluded: authors, hands: [] };
 };
 // One dispatch pass as far as the owner-facing answers are concerned: the observed sessions and the snapshot of the inputs it reads.
 let observed = { at: 0, sessions: new Map<string, Session>() };
@@ -42,7 +42,7 @@ const tick = async () => {
   const states = new Map<string, InstState>(insts.map(i => [i.id, sessions.get(i.id)?.state ?? 'unknown']));
   snapshot = await snapshotOf({ now: Math.floor(Date.now() / 1000), cfg: { providerMax: { codex: 3 } } as unknown as PassInputs['cfg'],
     defs, insts, states, health: new Map(), quotaBlocked: new Map(), tasks: taskRows, slots: new Map() },
-    { opsRepo: '/ops', sidecar: true }, verdicts, { contributors, independenceScope: async () => undefined, readySince: async () => new Map() });
+    { opsRepo: '/ops', sidecar: true }, verdicts, { contributors, readySince: async () => new Map() });
 };
 // Mutable answers for the whole-answer size test: the pulse reads its doing rows, recent accepts and daily brief from these.
 let briefOverride: Record<string, unknown> | undefined;
@@ -265,18 +265,6 @@ test('pulse RPC: a large tick bounds the dispatch-blocked list with its marker',
     expect(response.dispatchBlocked.length).toBeLessThanOrEqual(LIST_ITEM_LIMIT);
     expect(bytesOf(response.dispatchBlocked)).toBeLessThanOrEqual(LIST_BYTE_BUDGET);
     expect(response.bounds.dispatchBlocked).toEqual({ total: 1_500, shown: response.dispatchBlocked.length, truncated: true });
-    expect(response.bounds.goalBlockers).toEqual({ total: 0, shown: 0, truncated: false });
-  } finally { verdicts = []; }
-});
-
-test('pulse RPC: a large goal sample bounds the goal-root list and keeps the longest waits first', async () => {
-  verdicts = blockedSample(300, i => `goal-${String(i).padStart(3, '0')}`);
-  try {
-    const response = await callPulse();
-    expect(response.goalBlockers.length).toBeLessThanOrEqual(LIST_ITEM_LIMIT);
-    expect(bytesOf(response.goalBlockers)).toBeLessThanOrEqual(LIST_BYTE_BUDGET);
-    expect(response.bounds.goalBlockers).toEqual({ total: 300, shown: response.goalBlockers.length, truncated: true });
-    expect(response.goalBlockers[0]!.goalId).toBe('goal-089');
   } finally { verdicts = []; }
 });
 
@@ -337,12 +325,11 @@ test('pulse RPC: with every list full, the whole answer stays within the 48 KiB 
     stuck: Array.from({ length: 200 }, (_, i) => ({ taskId: `stuck-${i}`, title: long('卡滞', i), reason: '依赖都已完成，却仍是 blocked' })),
     waiting: Array.from({ length: 200 }, (_, i) => ({ taskId: `wait-${i}`, kind: 'gate', title: long('关口', i), hours: 30 + i, downstream: 2 })),
     resources: Array.from({ length: 100 }, (_, i) => `资源告警 ${i} ${'磁盘水位'.repeat(30)}`),
-    goals: Array.from({ length: 100 }, (_, i) => ({ title: long('目标', i), days: i })),
     last24h: { done: 1, returned: 0, rolledBack: 0, rejected: 0, retired: 0 },
     churn: { created: 0, retired: 0, claimLost: 0 },
   };
-  const totals: Record<PulseListName, number> = { dispatchBlocked: 1_500, goalBlockers: 300, workflowWaits: 0, ready: 300, doing: 300, stuck: 200,
-    waiting: 200, recentDone: 50, goals: 100, resources: 100 };
+  const totals: Record<PulseListName, number> = { dispatchBlocked: 1_500, ready: 300, doing: 300, stuck: 200,
+    waiting: 200, recentDone: 50, resources: 100 };
   try {
     const response = await callPulse();
     for (const name of Object.keys(totals) as PulseListName[]) {

@@ -117,7 +117,7 @@ test('real DB: expired lease fences old writer, dependencies and blocked recover
   });
   const child = await core.createTask(gm, {
     title: `Dependency child ${suffix}`, context: 'Synthetic dependent task in isolated database.',
-    executorRole: 'engineering', reviewerRole: 'qa', dependencies: [parent.id],
+    executorRole: 'engineering', reviewerRole: 'qa',
     idempotencyKey: `child-${suffix}`,
   });
   expect(child.state).toBe('blocked');
@@ -129,13 +129,9 @@ test('real DB: expired lease fences old writer, dependencies and blocked recover
   await expect(core.checkpoint(engC, oldProof, {
     text: 'Expired lease must not write this checkpoint.', idempotencyKey: `expired-${suffix}`,
   })).rejects.toMatchObject({ code: 'lease_expired' });
-  // The bound implementer's lease expired: another engineer takes the code only through an explicit manager takeover (SYS-DISP AC04).
-  await core.implementerTakeover(gm, { taskId: parent.id, toEmployee: (await core.authenticate(engD)).employeeId,
-    expectedVersion: (await core.getTask(gm, parent.id)).version, reason: 'Synthetic manager takeover after the bound implementer lease expired.',
-    idempotencyKey: `takeover-${suffix}` });
+  // The bound implementer's lease expired: another engineer's claim fences it once.
   const newClaim = await core.claim(engD, parent.id);
-  // The takeover fences the expired lease once, and the successor's claim fences once more.
-  expect(newClaim.fence).toBe(firstClaim.fence + 2);
+  expect(newClaim.fence).toBe(firstClaim.fence + 1);
   await expect(core.submit(engC, oldProof, {
     text: 'Fenced old execution must not deliver this task.', idempotencyKey: `fenced-${suffix}`,
   })).rejects.toBeInstanceOf(CompanyError);
@@ -286,12 +282,12 @@ test('real DB: retire_task voids work, unblocks dependents, idempotent, releases
   });
   const child = await core.createTask(gm, {
     title: `Retire child ${suffix}`, context: 'Blocked on the soon-voided dep.',
-    executorRole: 'engineering', reviewerRole: 'qa', dependencies: [dep.id],
+    executorRole: 'engineering', reviewerRole: 'qa',
     idempotencyKey: `retire-child-${suffix}`,
   });
   const grandchild = await core.createTask(gm, {
     title: `Retire grandchild ${suffix}`, context: 'Two hops downstream of the voided dep.',
-    executorRole: 'engineering', reviewerRole: 'qa', dependencies: [child.id],
+    executorRole: 'engineering', reviewerRole: 'qa',
     idempotencyKey: `retire-grandchild-${suffix}`,
   });
   // 下游只被作废依赖卡住的任务当场解锁；被别的未完依赖卡住的按兵不动。
@@ -301,7 +297,7 @@ test('real DB: retire_task voids work, unblocks dependents, idempotent, releases
   });
   const mixedChild = await core.createTask(gm, {
     title: `Retire mixed child ${suffix}`, context: 'Blocked on voided dep AND a live dep.',
-    executorRole: 'engineering', reviewerRole: 'qa', dependencies: [dep.id, otherDep.id],
+    executorRole: 'engineering', reviewerRole: 'qa',
     idempotencyKey: `retire-mixed-${suffix}`,
   });
   expect(child.state).toBe('blocked');
@@ -336,15 +332,11 @@ test('real DB: retire_task voids work, unblocks dependents, idempotent, releases
   await expect(core.resume(gm, dep.id, {
     text: 'Resume a void task must be denied.', idempotencyKey: `resume-void-${suffix}`,
   })).rejects.toBeInstanceOf(CompanyError);
-  await expect(core.deferTaskUntil(gm, {
-    taskId: dep.id, dependencies: [otherDep.id], text: 'defer a void task must be denied',
-    idempotencyKey: `defer-void-${suffix}`,
-  })).rejects.toBeInstanceOf(CompanyError);
 
   // 新任务依赖 void 任务视为已满足 → 直接 ready
   const freeChild = await core.createTask(gm, {
     title: `Retire free child ${suffix}`, context: 'Created after the dep was voided.',
-    executorRole: 'engineering', reviewerRole: 'qa', dependencies: [dep.id],
+    executorRole: 'engineering', reviewerRole: 'qa',
     idempotencyKey: `retire-freechild-${suffix}`,
   });
   expect(freeChild.state).toBe('ready');
@@ -370,7 +362,7 @@ test('real DB: retire_task voids work, unblocks dependents, idempotent, releases
   });
   const doingChild = await core.createTask(gm, {
     title: `Retire in-flight child ${suffix}`, context: 'Blocked on the in-flight dep.',
-    executorRole: 'engineering', reviewerRole: 'qa', dependencies: [doingDep.id],
+    executorRole: 'engineering', reviewerRole: 'qa',
     idempotencyKey: `retire-inflight-child-${suffix}`,
   });
   const engY = await enrollment.enroll(`test-engy-${suffix}`, 'engineering', ['execute', 'review']);
@@ -425,7 +417,7 @@ test('real DB: retire_task voids work, unblocks dependents, idempotent, releases
   });
   const mass = await core.createTask(gm, {
     title: `Retire mass ${suffix}`, context: 'Mass production gated on the owner demo.',
-    executorRole: 'asset-production', reviewerRole: 'owner', dependencies: [proto.id],
+    executorRole: 'asset-production', reviewerRole: 'owner',
     idempotencyKey: `retire-mass-${suffix}`,
   });
   expect(mass.state).toBe('blocked');
@@ -446,7 +438,7 @@ test('real DB: retire_task voids work, unblocks dependents, idempotent, releases
   // 新建量产引用 void 原型不得视为 demo 已批准 → 保持 blocked
   const lateMass = await core.createTask(gm, {
     title: `Retire late mass ${suffix}`, context: 'New mass task referencing a voided prototype.',
-    executorRole: 'asset-production', reviewerRole: 'owner', dependencies: [proto.id],
+    executorRole: 'asset-production', reviewerRole: 'owner',
     idempotencyKey: `retire-latemass-${suffix}`,
   });
   expect(lateMass.state).toBe('blocked');
@@ -470,8 +462,8 @@ test('real DB: retire_task voids work, unblocks dependents, idempotent, releases
   // --- 锚点死锁回归：owner 关口下游只剩锚点簿记时可退役，锚点不再被该 dep 卡住 ---
   // quick 目标模板：链 d0(release)→d1(deploy)，锚点 manual 依赖 d1；
   // GOAL_ANCHOR_SQL 会把每个新任务追加进锚点 dependencies，原型因此必有锚点下游。
-  const owner = new OwnerDesk(database);
-  const goal = await owner.createGoal({ text: `退役锚点回归 ${suffix}`, source: 'test', key: `retire-goal-${suffix}`, tier: 'quick' });
+  const [grows] = await database.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: '退役锚点回归', brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
+  const goal = { id: asId(grows[0]!.id) };
   const protoG = await core.createTask(gm, {
     title: `Goal proto ${suffix}`, context: 'Owner-gated prototype inside a goal.',
     executorRole: 'concept-design', reviewerRole: 'owner', goalId: goal.id,
@@ -479,7 +471,7 @@ test('real DB: retire_task voids work, unblocks dependents, idempotent, releases
   });
   const massG = await core.createTask(gm, {
     title: `Goal mass ${suffix}`, context: 'Mass production gated on the prototype.',
-    executorRole: 'asset-production', reviewerRole: 'owner', dependencies: [protoG.id], goalId: goal.id,
+    executorRole: 'asset-production', reviewerRole: 'owner', goalId: goal.id,
     idempotencyKey: `retire-massG-${suffix}`,
   });
   const [anchorIds] = await database.db.query<[RecordId[]]>(

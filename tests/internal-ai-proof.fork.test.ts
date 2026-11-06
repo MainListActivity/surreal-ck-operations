@@ -146,7 +146,7 @@ beforeAll(async () => {
   await core.submit(author,{taskId:approval.id,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version},{text:'Synthetic reviewed files',idempotencyKey:randomUUID()});
   const review=await core.claim(reviewer,approval.id);
   await core.accept(reviewer,{taskId:approval.id,deliveryId:review.deliveryId,fence:review.fence,expectedVersion:review.task.version},{text:prepared.approvalMarker,idempotencyKey:randomUUID()});
-  const task=await core.createTask(gm,{title:'Synthetic consuming task',context:'Only test fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,dependencies:[approvalTask],idempotencyKey:randomUUID()});
+  const task=await core.createTask(gm,{title:'Synthetic consuming task',context:'Only test fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
   consumerTask=task.id; await core.claim(consumer,task.id);
   trusted=await request('ops_internal_ai_trust') as ReturnType<ProofSigner['trust']>;
 },20_000);
@@ -207,7 +207,7 @@ check('diagnosis is referenced, scoped, read-only, content-versioned and never s
   // Caller identity/role cannot be supplied by the request.
   await expect(request('ops_internal_ai_approval_diagnose',{...diagnoseArgs(),role:'engineering',sql:'SELECT * FROM employee'})).rejects.toBeDefined();
   const product = await new LocalEnrollmentAdmin(database).enroll('test-diagnosis-product','product',['execute','review']);
-  const task = await core.createTask(gm,{title:'Synthetic product caller',context:'Only test fixtures',executorRole:'product',reviewerRole:'qa',goalId:PROOF_GOAL,dependencies:[approvalTask],idempotencyKey:randomUUID()});
+  const task = await core.createTask(gm,{title:'Synthetic product caller',context:'Only test fixtures',executorRole:'product',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
   await core.claim(product,task.id);
   expect(await bridge.call(await core.opsScope(product,task.id),'production','ops_internal_ai_approval_diagnose',diagnoseArgs())).toEqual({outcome:'denied',failure:'scope-denied'});
   expect(await request('ops_internal_ai_approval_diagnose',{...diagnoseArgs(),approvalTask:'missing-task'})).toEqual({outcome:'denied',failure:'scope-denied'});
@@ -731,7 +731,7 @@ async function lifecycleApproval(label: string) {
   await core.submit(author, {taskId:approval.id, deliveryId:claim.deliveryId, fence:claim.fence, expectedVersion:claim.task.version}, {text:'Synthetic reviewed files', idempotencyKey:randomUUID()});
   const review = await core.claim(reviewer, approval.id);
   await core.accept(reviewer, {taskId:approval.id, deliveryId:review.deliveryId, fence:review.fence, expectedVersion:review.task.version}, {text:prepared.approvalMarker, idempotencyKey:randomUUID()});
-  const consuming = await core.createTask(gm, {title:`Synthetic lifecycle consumer ${label}`, context:'Only test fixtures', executorRole:'engineering', reviewerRole:'qa', goalId:PROOF_GOAL, dependencies:[approval.id], idempotencyKey:randomUUID()});
+  const consuming = await core.createTask(gm, {title:`Synthetic lifecycle consumer ${label}`, context:'Only test fixtures', executorRole:'engineering', reviewerRole:'qa', goalId:PROOF_GOAL, idempotencyKey:randomUUID()});
   await core.claim(consumer, consuming.id);
   return {approval: approval.id, consuming: consuming.id, authorId, reviewerId, consumerId, consumer, files: f};
 }

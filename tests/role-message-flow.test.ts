@@ -6,7 +6,6 @@ import { ensureOwnerToken } from '../src/owner-token.ts';
 import { OutboundMessageStore, renderMessage, templateFor, type OutboundMessage } from '../src/outbound-messages.ts';
 import { taskBrief } from '../src/dispatcher/brief.ts';
 import { wake } from '../src/dispatcher/prompts.ts';
-import { goalTemplate } from '../src/flows.ts';
 import { scrubEnv } from '../plugin/server/scrub.ts';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 
@@ -30,16 +29,6 @@ test('report_blocker entries route only to owner', () => {
   expect(sidecar).toContain('args.to === "owner" ? "owner" : "owner"');
   const mcp = readFileSync(join(import.meta.dir, '..', 'src/mcp/server.ts'), 'utf8');
   expect(mcp).toContain("to: z.enum(['owner'])");
-});
-
-test('goal template never generates a gm task', () => {
-  for (const pipeline of ['software', 'video', 'story'] as const) {
-    const template = goalTemplate('quick', 't', '需求', 'g', pipeline);
-    expect(template.tasks).toHaveLength(1);
-    expect(JSON.stringify(template.tasks)).not.toContain('"gm"');
-  }
-  const seed = readFileSync(join(import.meta.dir, '..', 'src/seed.ts'), 'utf8');
-  expect(seed).not.toContain("'gm'");
 });
 
 test('task.md contains only title, requirement and acceptance criteria', () => {

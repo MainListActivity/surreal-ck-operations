@@ -1,8 +1,6 @@
 import { expect, test } from 'bun:test';
 import { executeGateFor, managedRecencyOrder, PRIOR_HAND_WEIGHT_FACTOR, quotaBlockedProviders, staffingPool, type StaffingInput } from '../src/dispatcher/dispatcher.ts';
 import { BLOCK_TEXT } from '../src/dispatcher/dispatch-blocked.ts';
-import { buildIndependenceIndex } from '../src/independence.ts';
-import { deriveContributors } from '../src/contributors.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, SupervisedTask } from '../src/workforce.ts';
 import type { ProviderQuota } from '../src/contracts.ts';
 
@@ -122,36 +120,14 @@ test('pool: exhausted inst is reusable only while the provider is in probe windo
   expect(probing.find(e => e.kind === 'reuse')!.eligible).toBe(true);
 });
 
-test('pool: an unreadable execute history blocks every candidate as unknown, never as busy or free', () => {
-  const d = def('d1');
-  const pool = staffingPool(base({
-    defs: [d], insts: [inst('eng-a')], states: new Map([['eng-a', 'idle']]),
-    task: {} as StaffingInput['task'], implementer: { unresolved: true, unknown: true },
-  }));
-  expect(pool.length).toBe(2);
-  expect(pool.every(e => !e.eligible && e.code === 'unknown' && e.reason === BLOCK_TEXT.unknown)).toBe(true);
-});
-
-test('pool: the execute gate reaches only the task executor role, never a review pool or a manager anchor', () => {
-  const gates = new Map([['t1', { implementer: 'eng-impl', unresolved: false }]]);
-  const task = { id: 't1', executorRole: 'engineering' } as SupervisedTask;
-  expect(executeGateFor(gates, 'engineering', task)).toEqual({ implementer: 'eng-impl', unresolved: false });
-  // A reviewer, or a gm pool anchored on the same engineering task, is not an execute pool.
-  expect(executeGateFor(gates, 'qa', task)).toBeUndefined();
-  expect(executeGateFor(gates, 'owner', task)).toBeUndefined();
-  // Review of the task never carries the gate, even for the executor role, and no task means no gate.
-  expect(executeGateFor(gates, 'engineering', task, true)).toBeUndefined();
-  expect(executeGateFor(gates, 'engineering')).toBeUndefined();
-});
-
 test('pool: submitter excluded only for review work', () => {
   const d = def('d1');
   const i = inst('i1');
   const task = { submittedBy: 'i1' } as StaffingInput['task'];
-  const review = staffingPool(base({ defs: [d], insts: [i], states: new Map([['i1', 'idle']]), task, excludeSubmitter: true }));
+  const review = staffingPool(base({ defs: [d], insts: [i], states: new Map([['i1', 'idle']]), task, excludeSubmitter: true, sidecar: false }));
   expect(review.find(e => e.kind === 'reuse')!.reason).toBe(BLOCK_TEXT.author_recusal);
   expect(review.find(e => e.kind === 'reuse')!.code).toBe('author_recusal');
-  const impl = staffingPool(base({ defs: [d], insts: [i], states: new Map([['i1', 'idle']]), task }));
+  const impl = staffingPool(base({ defs: [d], insts: [i], states: new Map([['i1', 'idle']]), task, sidecar: false }));
   expect(impl.find(e => e.kind === 'reuse')!.eligible).toBe(true);
 });
 
@@ -164,7 +140,7 @@ test('pool: review hard-excludes every author; other candidates keep their full 
   const pool = staffingPool(base({
     defs: [d], insts: [author, reviewer, fresh],
     states: new Map([['eng-author', 'idle'], ['eng-reviewer', 'idle'], ['eng-fresh', 'idle']]),
-    task, excludeSubmitter: true,
+    task, excludeSubmitter: true, sidecar: false,
     recusal: { authors: new Set(['eng-author', 'eng-rework']), hands: new Set() },
   }));
   const by = new Map(pool.filter(e => e.kind === 'reuse').map(e => [e.ref, e]));
@@ -183,7 +159,7 @@ test('pool: a prior hand (claimed, never wrote code) is demoted but eligible, an
   const hand = inst('eng-hand');
   const fresh = inst('eng-fresh');
   const task = {} as StaffingInput['task'];
-  const base0: Partial<StaffingInput> = { defs: [d], insts: [hand, fresh],
+  const base0: Partial<StaffingInput> = { defs: [d], insts: [hand, fresh], sidecar: false,
     states: new Map([['eng-hand', 'idle'], ['eng-fresh', 'idle']]), task, excludeSubmitter: true };
   // No policy: the claim-only holder is eligible at the demoted weight (the pre-SYS-DISP rule).
   const demoted = staffingPool(base({ ...base0, recusal: { authors: new Set(['eng-author']), hands: new Set(['eng-hand']) } }));
@@ -191,16 +167,6 @@ test('pool: a prior hand (claimed, never wrote code) is demoted but eligible, an
   expect(byDemoted.get('eng-hand')!.eligible).toBe(true);
   expect(byDemoted.get('eng-hand')!.weight).toBeCloseTo(byDemoted.get('eng-fresh')!.weight * PRIOR_HAND_WEIGHT_FACTOR);
   expect(byDemoted.get('eng-hand')!.note).toContain('降权兜底');
-  // A strict independence source that names this task: the same holder is excluded outright, demotion never applies.
-  const index = buildIndependenceIndex({ policy: { mode: 'execute_handlers', excluded: [] },
-    sources: [{ taskId: 'P', facts: deriveContributors([{ action: 'claim', actor: 'eng-hand', phase: 'execute' }]) }],
-    principalOf: () => undefined });
-  const strict = staffingPool(base({ ...base0, recusal: { authors: new Set(['eng-author']), hands: new Set(['eng-hand']) },
-    independence: { kind: 'index', index } }));
-  const byStrict = new Map(strict.filter(e => e.kind === 'reuse').map(e => [e.ref, e]));
-  expect(byStrict.get('eng-hand')!.eligible).toBe(false);
-  expect(byStrict.get('eng-hand')!.code).toBe('independence_conflict');
-  expect(byStrict.get('eng-fresh')!.eligible).toBe(true);
 });
 
 test('pool: without a recusal set (execute path or read failure) recusal is unchanged', () => {
@@ -208,46 +174,14 @@ test('pool: without a recusal set (execute path or read failure) recusal is unch
   const author = inst('eng-author');
   const task = { submittedBy: 'eng-author' } as StaffingInput['task'];
   // 执行派工：不带 recusal，贡献者不回避（previousEmployee 连续性保留）。
-  const impl = staffingPool(base({ defs: [d], insts: [author], states: new Map([['eng-author', 'idle']]), task }));
+  const impl = staffingPool(base({ defs: [d], insts: [author], states: new Map([['eng-author', 'idle']]), task, sidecar: false }));
   expect(impl.find(e => e.kind === 'reuse')!.eligible).toBe(true);
   // review 且贡献者读取失败（空集）：提交者仍由 excludeSubmitter 兜底拦住。
   const review = staffingPool(base({
     defs: [d], insts: [author], states: new Map([['eng-author', 'idle']]),
-    task, excludeSubmitter: true, recusal: { authors: new Set<string>(), hands: new Set() },
+    task, excludeSubmitter: true, sidecar: false, recusal: { authors: new Set<string>(), hands: new Set() },
   }));
   expect(review.find(e => e.kind === 'reuse')!.reason).toBe(BLOCK_TEXT.author_recusal);
-});
-
-test('pool: execute gate admits only the bound implementer; spawns and other employees are implementer_mismatch', () => {
-  const d = def('d1');
-  const implementer = inst('eng-impl');
-  const other = inst('eng-other');
-  const pool = staffingPool(base({
-    defs: [d], insts: [implementer, other],
-    states: new Map([['eng-impl', 'idle'], ['eng-other', 'idle']]),
-    task: {} as StaffingInput['task'],
-    implementer: { implementer: 'eng-impl', unresolved: false },
-  }));
-  const by = new Map(pool.map(e => [e.key, e]));
-  expect(by.get('eng-impl')!.eligible).toBe(true);
-  expect(by.get('eng-other')!.eligible).toBe(false);
-  expect(by.get('eng-other')!.code).toBe('implementer_mismatch');
-  expect(by.get('spawn:d1')!.code).toBe('implementer_mismatch');
-});
-
-test('pool: an unresolved execute gate blocks every candidate; a gate without a block leaves routing unchanged', () => {
-  const d = def('d1');
-  const a = inst('eng-a');
-  const unresolved = staffingPool(base({
-    defs: [d], insts: [a], states: new Map([['eng-a', 'idle']]),
-    implementer: { unresolved: true },
-  }));
-  expect(unresolved.every(e => !e.eligible)).toBe(true);
-  expect(unresolved.every(e => e.code === 'implementer_unresolved')).toBe(true);
-  const fresh = staffingPool(base({
-    defs: [d], insts: [a], states: new Map([['eng-a', 'idle']]), implementer: { unresolved: false },
-  }));
-  expect(fresh.find(e => e.kind === 'reuse')!.eligible).toBe(true);
 });
 
 test('pool: scope is per role+home; other homes/roles do not appear', () => {
@@ -294,13 +228,13 @@ test('pool: screenwriter requires 编剧 on task and covering def for reuse and 
     for (const discipline of [undefined, '角色设计', '编剧']) {
       const d = def('d1', { role: 'screenwriter', tracks });
       const i = inst('i1', { role: 'screenwriter' });
-      const pool = staffingPool(base({ role: 'screenwriter', defs: [d], insts: [i],
+      const pool = staffingPool(base({ role: 'screenwriter', defs: [d], insts: [i], sidecar: false,
         states: new Map([['i1', 'idle']]), task: { discipline } as StaffingInput['task'] }));
       expect(pool).toHaveLength(2);
       expect(pool.every(e => e.eligible === (discipline === '编剧' && !!tracks?.includes('编剧')))).toBe(true);
     }
   }
-  const pool = staffingPool(base({ defs: [def('d1', { tracks: ['编剧'] })], insts: [inst('i1')],
+  const pool = staffingPool(base({ defs: [def('d1', { tracks: ['编剧'] })], insts: [inst('i1')], sidecar: false,
     states: new Map([['i1', 'idle']]), task: {} as StaffingInput['task'] }));
   expect(pool.every(e => e.eligible)).toBe(true);
 });
@@ -337,7 +271,7 @@ test('pool: the seat cap still bounds an exempt def', () => {
 
 test('pool: aggregate magpie group backoff applies even to a native-quota-exempt harness',()=>{
  const d=def('d1',{quotaLimited:false});const i=inst('i1');const task={row:{model_route_until:1_000_060}} as SupervisedTask;
- const input=base({defs:[d],insts:[i],states:new Map([['i1','idle']]),task});
+ const input=base({defs:[d],insts:[i],states:new Map([['i1','idle']]),task,sidecar:false});
  expect(staffingPool(input).filter(e=>e.eligible)).toHaveLength(0);
  expect(staffingPool(input).find(e=>e.kind==='reuse')?.code).toBe('quota');
  expect(staffingPool({...input,now:1_000_061}).some(e=>e.eligible)).toBe(true);

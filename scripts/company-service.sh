@@ -11,11 +11,7 @@ action=${1:-}
 components=${SCK_COMPONENTS:-mcp}
 . "$(dirname "$0")/bun-runtime.sh"
 . "$(dirname "$0")/release-content.sh"
-. "$(dirname "$0")/review-wait-guard.sh"
-. "$(dirname "$0")/standby-relay-guard.sh"
-. "$(dirname "$0")/independence-guard.sh"
-. "$(dirname "$0")/policy-guard.sh"
-. "$(dirname "$0")/goal-workspace-guard.sh"
+. "$(dirname "$0")/acceptance-guard.sh"
 
 label() { echo "org.surrealck.company-$1"; }
 
@@ -152,31 +148,7 @@ case "$action" in
     # named after a real commit but holding other code is refused here, before anything is switched.
     release_matches_commit "$release" "$sha" "$ops_repo" || {
       echo "refused: $release does not match commit $sha — cut the release from 'git archive $sha' (dependencies and vendor are prepared after), then install again" >&2; exit 1; }
-    # RW06 C1: a target may be switched to only when its own (content-bound) code proves it understands the persistent
-    # review-wait state. Incompatible, unreadable or drifted targets are refused here — before the bin copies, the active
-    # symlink, the plugin repoint, the MCP restart or release pruning. There is no zero-row exception: a check that treated
-    # "nothing waits yet" as safe would race a defer that lands right after it.
-    review_wait_target_supported "$release" || { review_wait_refuse "$release"; exit 1; }
-    # SYS02 C2: the same content-bound guard for the acceptance baseline, before the bin copies, the active symlink,
-    # the plugin repoint, the MCP restart or release pruning (and before the release gates, which are read-only).
     acceptance_target_supported "$release" || { acceptance_refuse "$release"; exit 1; }
-    # IR06 C1: the same rule for the independence contract. Production data may already carry a policy
-    # (independence_set), so a target that does not enforce it would let an excluded contributor, its registered
-    # principal companion or a named employee claim. Refused here, before the bin copies, the active symlink, the
-    # plugin repoint, the MCP restart or release pruning. No zero-row exception either: "no policy today" would race
-    # a policy write, and would miss the data that already holds one.
-    independence_target_supported "$release" || { independence_refuse "$release"; exit 1; }
-    # SYS06 C1: the same rule for the versioned machine policy. Production data may already carry policy rows, task
-    # policy_*/lease_policy_* registrations and tasks quarantined as blocked+blocked_to=gm, so a target that does not
-    # execute the layer would dispatch what the current contract no longer authorises. Refused here, before the bin
-    # copies, the active symlink, the plugin repoint, the MCP restart or release pruning. No zero-row exception either:
-    # "no policy today" would race a policy write, and would miss the data that already holds one.
-    policy_target_supported "$release" || { policy_refuse "$release"; exit 1; }
-    goal_workspace_target_supported "$release" || { goal_workspace_refuse "$release"; exit 1; }
-    # FV06 P0/P1: the same content-bound rule for the bounded standby relay — both the core and the
-    # plugin vendor must carry the standby protocol, or a standby direct assignment would run against
-    # a supervision loop that neither wakes the holder nor returns the timeout to the gm gate.
-    standby_relay_target_supported "$release" || { standby_relay_refuse "$release"; exit 1; }
     for gate in $(required_gates "$release"); do
       check_gate "$gate" "$sha" || {
         echo "refused: no passing $gate gate for $sha on bun $(runtime_version) — run 'sh $(dirname "$0")/release-gate.sh $(gate_argument "$gate") $release' on this Mac, then install again" >&2; exit 1; }

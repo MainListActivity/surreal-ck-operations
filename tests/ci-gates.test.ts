@@ -38,7 +38,7 @@ test('the rollback runbook uses the guarded installer of the current release, ne
   const docs = readFileSync(join(ROOT, 'docs/company-service-operations.md'), 'utf8');
   expect(docs).not.toMatch(/SCK_PREVIOUS_RELEASE\/scripts\/company-service\.sh/);
   expect(docs).toContain('sh "$SCK_RELEASE_DIR/scripts/company-service.sh" install "$SCK_PREVIOUS_RELEASE"');
-  expect(readFileSync(join(ROOT, 'scripts/company-service.sh'), 'utf8')).toContain('review_wait_target_supported "$release"');
+  expect(readFileSync(join(ROOT, 'scripts/company-service.sh'), 'utf8')).toContain('acceptance_target_supported "$release"');
 });
 
 test('no workflow runs on a hosted macOS runner, and the release gate for the slow pipe exists', () => {

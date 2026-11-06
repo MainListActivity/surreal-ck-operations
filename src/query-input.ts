@@ -12,7 +12,7 @@ export const TASK_STATES: readonly TaskState[] = ['blocked', 'ready', 'doing', '
 /** Top-level TaskView keys a caller may project. Anything else is refused. */
 export const TASK_FIELDS: readonly string[] = [
   'id', 'title', 'context', 'state', 'executorRole', 'reviewerRole', 'discipline', 'kind', 'goalId', 'projectOverlay',
-  'codeRepoPath', 'dependencies', 'version', 'submittedBy', 'currentEmployee', 'deliveryId', 'leaseExpiresAt', 'fence',
+  'codeRepoPath', 'version', 'submittedBy', 'currentEmployee', 'deliveryId', 'leaseExpiresAt', 'fence',
   'blockedTo', 'handover', 'previousEmployee', 'workIntent', 'worktree', 'revises', 'supersededBy', 'lineage', 'revisionNo',
 ];
 
@@ -198,7 +198,7 @@ export function parseReclaimInput(input: unknown): { dryRun: boolean; repos?: st
 }
 
 /** Texts read_task_text returns. The list fields are the task's lists that a claim echo may cut (SYS01 R3). */
-export const TEXT_FIELDS = ['context', 'evidence', 'project', 'dependencies', 'workIntentPaths', 'worktreePaths'] as const;
+export const TEXT_FIELDS = ['context', 'evidence', 'project', 'workIntentPaths', 'worktreePaths'] as const;
 export function parseTextInput(input: Record<string, unknown>): {
   taskId: string; field: (typeof TEXT_FIELDS)[number]; auditId?: string; offset: number; limit: number; expectSha256?: string;
 } {

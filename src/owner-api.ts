@@ -10,11 +10,9 @@ import type { CompanyCore } from './contracts.ts';
 import { Workforce } from './workforce.ts';
 import { OutboundMessageStore } from './outbound-messages.ts';
 import { CompanyError } from './core-errors.ts';
-import { ROLES, type CreateTask, type GoalTier, type Role } from './contracts.ts';
-import { isPipeline } from './flows.ts';
+import { ROLES, type CreateTask, type Role } from './contracts.ts';
 import { HASH, REQUIRED_TRACKS } from './core.ts';
 import { defaultAcceptanceCriteria } from './acceptance.ts';
-import { GoalGovernanceStore } from './goal-store.ts';
 import { readTaskCost, recordTaskCost, COST_LIST_SQL } from './task-cost.ts';
 
 export type OwnerVia = string;
@@ -46,47 +44,6 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     return token;
   };
   switch (command) {
-    // ---- 目标 ----
-    case 'goal.create': return ctx.owner.createGoal({ text: text(input.text, 'text', 2), source: a, key: key(),
-      tier: input.tier as GoalTier | undefined, project: optionalText(input.project), pipeline: optionalText(input.pipeline) });
-    case 'goal.triage': return ctx.owner.triage(text(input.goalId, 'goalId'), text(input.tier, 'tier') as GoalTier, a);
-    case 'goal.cancel': return ctx.owner.cancelGoal({ goalId: text(input.goalId, 'goalId'), note: text(input.note, 'note', 2), source: a, key: key() });
-    case 'goal.list': { const [rows] = await db.query<[unknown[]]>('SELECT * FROM goal ORDER BY created_at DESC LIMIT 200;'); return { goals: rows }; }
-    case 'goal.split': {
-      const taskIds = Array.isArray(input.taskIds)
-        ? strArray(input.taskIds)
-        : typeof input.taskIds === 'string'
-        ? input.taskIds.split(',').map(s => s.trim()).filter(Boolean)
-        : [];
-      if (!taskIds.length) throw new CompanyError('invalid', 'taskIds invalid');
-      return ctx.core.ownerGoalPhaseSplit(via, {
-        goalId: text(input.goalId, 'goalId'),
-        taskIds,
-        title: text(input.title, 'title', 4, 60),
-        reason: text(input.reason, 'reason', 4, 4000),
-        idempotencyKey: key(),
-      });
-    }
-    case 'goal.retired.list': return new GoalGovernanceStore(db).retiredWorkPending(text(input.goalId, 'goalId'));
-    case 'goal.retired.resolve': {
-      const replacementTaskIds = Array.isArray(input.replacementTaskIds)
-        ? strArray(input.replacementTaskIds)
-        : typeof input.replacementTaskIds === 'string'
-        ? input.replacementTaskIds.split(',').map(s => s.trim()).filter(Boolean)
-        : [];
-      return new GoalGovernanceStore(db).resolveRetiredWork({
-        goalId: text(input.goalId, 'goalId'),
-        taskId: text(input.taskId, 'taskId'),
-        goalVersion: typeof input.goalVersion === 'number' ? input.goalVersion : Number(input.goalVersion),
-        taskVersion: typeof input.taskVersion === 'number' ? input.taskVersion : Number(input.taskVersion),
-        disposition: text(input.disposition, 'disposition') as 'fixture' | 'replaced' | 'excluded',
-        replacementTaskIds,
-        reason: text(input.reason, 'reason', 10, 4000),
-        actor: a,
-        key: key(),
-      });
-    }
-
     // ---- 任务 ----
     case 'task.create': {
       const requirement = text(input.requirement, 'requirement');
@@ -95,23 +52,21 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       const reviewer = text(input.reviewerRole, 'reviewerRole') as Role | 'owner';
       if (!ROLES.includes(executor)) throw new CompanyError('invalid', 'unknown executorRole');
       if (reviewer !== 'owner' && !ROLES.includes(reviewer)) throw new CompanyError('invalid', 'unknown reviewerRole');
-      const deps = strArray(input.dependencies);
       const ownerCred = ownerCredential();
       const isEngineering = executor === 'engineering';
-      const kind = optionalText(input.kind) as CreateTask['kind'] | undefined;
       const discipline = optionalText(input.discipline) ?? (isEngineering ? undefined : REQUIRED_TRACKS[executor]);
       const codeRepoPath = optionalText(input.codeRepoPath);
       const workIntent = isEngineering && !input.workIntent
-        ? { kind: 'code' as const, lane: `delivery-${HASH(`task\0${key()}`).slice(0, 8)}` }
+        ? { kind: 'code' as const }
         : input.workIntent as CreateTask['workIntent'] | undefined;
       const acceptanceCriteria = isEngineering && !input.acceptanceCriteria
         ? defaultAcceptanceCriteria('deploy')
         : input.acceptanceCriteria as CreateTask['acceptanceCriteria'] | undefined;
       const task = await ctx.core.createTask(ownerCred, {
         title: text(input.title, 'title', 3), context: requirement,
-        executorRole: executor, reviewerRole: reviewer, dependencies: deps,
-        goalId: optionalText(input.goalId), project: optionalText(input.project),
-        kind: kind ?? (isEngineering ? 'deploy' : 'task'),
+        executorRole: executor, reviewerRole: reviewer,
+        project: optionalText(input.project),
+        kind: 'task',
         discipline, codeRepoPath, workIntent, acceptanceCriteria,
         idempotencyKey: key(),
       } as never);
@@ -151,18 +106,8 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     case 'task.void': return ctx.owner.retire({ taskId: text(input.taskId, 'taskId'), note: text(input.note, 'note', 2), source: a, key: key() });
     case 'task.revoke': return ctx.workforce.revokeTaskLease(text(input.taskId, 'taskId'), text(input.note ?? '老板终止在途执行', 'note'),
       '【交接包】老板终止了上一棒的在途执行。', a);
-    case 'task.unlock': return { unlocked: await ctx.owner.unlockDependents({ taskId: text(input.taskId, 'taskId'), source: a }) };
     case 'task.pause': await ctx.owner.setPaused(true); return { paused: true };
     case 'task.resume': await ctx.owner.setPaused(false); return { paused: false };
-    case 'contributor.dryRun':
-      return ctx.core.contributorDryRun(ownerCredential(), { taskIds: strArray(input.taskIds) });
-    case 'implementer.takeover':
-      return ctx.core.implementerTakeover(ownerCredential(), {
-        taskId: text(input.taskId, 'taskId'), toEmployee: text(input.toEmployee, 'toEmployee'),
-        ...(optionalText(input.replacementReviewer) ? { replacementReviewer: optionalText(input.replacementReviewer)! } : {}),
-        expectedVersion: Number(input.expectedVersion),
-        reason: text(input.reason, 'reason', 8, 2000), idempotencyKey: key(),
-      });
     case 'task.cost': {
       if (input.taskId !== undefined) {
         const taskId = text(input.taskId, 'taskId');

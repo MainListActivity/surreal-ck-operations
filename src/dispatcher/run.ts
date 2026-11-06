@@ -38,8 +38,6 @@ try {
     notify: process.env.SCK_NOTIFY === '0' ? undefined : notify,
     log: message => console.log(`${new Date().toISOString()} ${message}`),
     jev: jevFromEnv(),
-    // Same automatic successor as the plugin's dispatcher (see plugin/server/company.ts).
-    autoTakeover: async input => { await core.systemImplementerTakeover(input); return true; },
     // WT01: managed/legacy scenes must survive; no destructive sweeper.
     // `auto:<family>` defs resolve through the slot map the Paseo plugin maintains;
     // without it this fallback dispatcher cannot spawn auto defs at all.

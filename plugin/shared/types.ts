@@ -78,7 +78,7 @@ export interface Inbox {
  * 最近做完了什么、资源有没有异常。全部来自任务服务与调度器同一套判定。
  */
 /** The lists of the pulse answer that carry a truncation marker (see the bounds field). */
-export type PulseListName = "dispatchBlocked" | "goalBlockers" | "workflowWaits" | "ready" | "doing" | "stuck" | "waiting" | "recentDone" | "goals" | "resources";
+export type PulseListName = "dispatchBlocked" | "ready" | "doing" | "stuck" | "waiting" | "recentDone" | "resources";
 
 export interface Pulse {
   /** When this answer was built (request time). Live lists (doing, stuck, waiting, ...) read as of this instant. */
@@ -92,26 +92,16 @@ export interface Pulse {
   ready: Array<{ taskId: string; title: string; role: string; discipline?: string; waitingMin: number; unclaimableReason?: string }>;
   /** 本轮 tick 判定派不出去的工作（execute 与 review 两阶段），与公司通知同源 */
   dispatchBlocked: DispatchBlockedView[];
-  /** 每个目标的派工不可派结论根，沿用既有 dispatcher pass。 */
-  goalBlockers: GoalRootBlockerView[];
-  /** 独立采集的目标工作流等待根；不代表派工失败，时间与 dispatcherAt 分开。 */
-  workflowWaits: Array<{ goalId?: string; taskId: string; title: string; workflowState: "ready" | "doing" | "review" | "blocked" | "done" | "void" | "unknown";
-    kind: "dependency" | "manager" | "owner" | "active_lease" | "unknown"; basis: string;
-    waitingForRole: string; nextTrigger: string; goalRootCount: number; impact?: number; dependencyPath?: Array<{ taskId: string; title: string }>;
-    unknownReason?: string; dependencyPathTruncated?: boolean; people?: { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number };
-    peopleSource?: string; submitterSource?: string; submitCommitSource?: string; peopleCheckedAt?: string; submitCheckedAt?: string }>;
-  workflowWaitSummary: { source: 'workflow-graph'; available: boolean; checkedAt?: string; totalRoots: number; truncated: boolean; reason?: string };
   /** 依赖全部完成却仍 blocked（需解锁）等异常卡滞 */
   stuck: Array<{ taskId: string; title: string; reason: string }>;
   /** 等老板拍板/回答（带已等时长与下游受阻数） */
-  waiting: Array<{ taskId: string; kind: "gate" | "question"; title: string; goal?: string; hours: number; downstream: number }>;
+  waiting: Array<{ taskId: string; kind: "gate" | "question"; title: string; hours: number }>;
   /** 最近完成（accept/owner_approve） */
   recentDone: Array<{ taskId: string; title: string; at: string; actor?: string }>;
   last24h: { done: number; returned: number; rolledBack: number; rejected: number; retired: number };
   /** 订阅健康/低额度异常行（正常时为空） */
   resources: string[];
   churn: { created: number; retired: number; claimLost: number };
-  goals: Array<{ title: string; days: number }>;
   /** Truncation markers for every list above: how many items existed, and whether the answer left some out. */
   bounds: Record<PulseListName, ListBound>;
 }
@@ -133,7 +123,6 @@ export interface TaskAttachment {
 
 export interface Brief {
   directions: Array<{ text: string; source: string; at: string }>;
-  goals: GoalView[];
   projects: ProjectView[];
   paused: boolean;
 }

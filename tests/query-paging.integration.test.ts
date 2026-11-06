@@ -201,7 +201,7 @@ beforeAll(async () => {
   gm = await enrollment.enroll(ids.gm, 'owner', ['execute', 'review', 'manage']);
   eng = await enrollment.enroll(ids.eng, 'engineering', ['execute', 'review']);
   cs = await enrollment.enroll(ids.cs, 'cs', ['execute']);
-  const goal = await owner.createGoal({ text: `分页夹具目标 ${suffix}`, source: 'owner:test', key: key('goal'), tier: 'standard' });
+  const goal = await core.createTask(gm, { title: `分页夹具目标 ${suffix}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('goal') });
   goalId = goal.id;
   // Fixture: 1000 tasks with Chinese and emoji titles; every 25th context is long (about 6000 characters).
   for (let i = 0; i < TOTAL; i++) {
@@ -213,7 +213,7 @@ beforeAll(async () => {
   }
   expectedWorking = await workingIds(goalId);
   // A second goal with three tasks of its own (tiering adds the triage template's tasks): its whole working set fits the budget.
-  const small = await owner.createGoal({ text: `分页小目标 ${suffix}`, source: 'owner:test', key: key('goal-small'), tier: 'standard' });
+  const small = await core.createTask(gm, { title: `分页小目标 ${suffix}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('goal-small') });
   smallGoalId = small.id;
   for (let i = 0; i < 3; i++) {
     await core.createTask(gm, {
@@ -395,7 +395,7 @@ test('a paged traversal yields every working-set task exactly once, each page in
 });
 
 test('a listing item whose dependency list alone exceeds a page keeps the leading dependencies, flags listsTruncated, and reads the whole list back (SYS01 R3)', async () => {
-  const goal = await owner.createGoal({ text: `长依赖目标 ${suffix}`, source: 'owner:test', key: key('goal-deps'), tier: 'standard' });
+  const goal = await core.createTask(gm, { title: `长依赖目标 ${suffix}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('goal-deps') });
   const wide = await core.createTask(gm, {
     title: `长依赖样例 ${suffix}`, context: '短正文', executorRole: 'engineering', reviewerRole: 'qa', goalId: goal.id, idempotencyKey: key('wide-deps'),
   });
@@ -422,13 +422,13 @@ test('a listing item whose dependency list alone exceeds a page keeps the leadin
   expect(item!.contextTruncated).toBe(false);
   expect(item!.context).toBe('短正文');
   // The whole list reads back through read_task_text, verified by its digest.
-  const whole = await reassemble({ taskId: wide.id, field: 'dependencies', limit: 16 * 1024 });
+  const whole = await reassemble({ taskId: wide.id, field: 'context', limit: 16 * 1024 });
   expect(whole.sha256).toBe(sha256(JSON.stringify(deps)));
   expect(JSON.parse(whole.text) as string[]).toEqual(deps);
 });
 
 test('a page item larger than the page budget on its own is cut at a character boundary and flagged; its rest reads by segment and the traversal goes on (C3, AC03)', async () => {
-  const goal = await owner.createGoal({ text: `超大条目目标 ${suffix}`, source: 'owner:test', key: key('goal-oversize'), tier: 'standard' });
+  const goal = await core.createTask(gm, { title: `超大条目目标 ${suffix}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('goal-oversize') });
   const text = '超'.repeat(20_000); // 60,000 bytes: larger than one page item on its own
   const big = await core.createTask(gm, {
     title: `超大条目 ${unit}`, context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId: goal.id, idempotencyKey: key('oversize'),
@@ -469,7 +469,7 @@ test('a page item larger than the page budget on its own is cut at a character b
 });
 
 test('a page item of 18 KiB of text, 36 KiB in both copies of the answer, stays whole for context and for evidence (C3)', async () => {
-  const goal = await owner.createGoal({ text: `中等条目目标 ${suffix}`, source: 'owner:test', key: key('goal-medium'), tier: 'standard' });
+  const goal = await core.createTask(gm, { title: `中等条目目标 ${suffix}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('goal-medium') });
   const text = '超'.repeat(6_000); // 18,000 bytes: 36 KiB in the text and in the JSON copy, still one page item
   const medium = await core.createTask(gm, {
     title: `中等条目 ${unit}`, context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId: goal.id, idempotencyKey: key('medium-item'),
@@ -530,7 +530,7 @@ test('a gm summary read while writers run is one consistent read: every answer p
 });
 
 test('a gm summary read while tasks change state and audit entries arrive is one consistent read: the task total holds, audit counts never fall (C5)', async () => {
-  const busy = await owner.createGoal({ text: `汇总移动目标 ${suffix}`, source: 'owner:test', key: key('goal-summary-moves'), tier: 'standard' });
+  const busy = await core.createTask(gm, { title: `汇总移动目标 ${suffix}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('goal-summary-moves') });
   // The goal needs at least six tasks of its own for the writers to move between states.
   for (let i = 0; i < 6; i++) {
     await core.createTask(gm, {
@@ -899,7 +899,7 @@ test('state moves, goal and role changes, and new tasks mid-traversal change not
   const stateAt = new Map((before ?? []).map(row => [asId(row.id), row.state]));
   const roleAt = new Map((before ?? []).map(row => [asId(row.id), row.executor_role]));
   const first = await core.contextView(gm, { goalId, pageSize: 40 });
-  const other = await owner.createGoal({ text: `分页另一目标 ${suffix}`, source: 'owner:test', key: key('goal-other'), tier: 'standard' });
+  const other = await core.createTask(gm, { title: `分页另一目标 ${suffix}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('goal-other') });
   // Mid-way: 100 tasks finish, 50 move to another goal, 50 change executor role, and three new tasks arrive.
   const finished = members.slice(0, 100).map(member => id('task', member));
   const moved = members.slice(100, 150).map(member => id('task', member));
@@ -1257,7 +1257,7 @@ test('read_worktree_refs over MCP: a cut worktree reassembles in segments, and e
 });
 
 test('concurrent traversals with writers: each listing is delivered exactly once, with no duplicate and no miss, and each row shows its state at the listing (C4)', async () => {
-  const concurrent = await owner.createGoal({ text: `并发目标 ${suffix}`, source: 'owner:test', key: key('goal-conc'), tier: 'standard' });
+  const concurrent = await core.createTask(gm, { title: `并发目标 ${suffix}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('goal-conc') });
   for (let i = 0; i < 120; i++) {
     await core.createTask(gm, {
       title: `并发样例 ${i} ${unit}`, context: `并发正文 ${i}`, executorRole: 'engineering', reviewerRole: 'qa',
@@ -1434,53 +1434,6 @@ test('a write answers with its task inside the budget: a long context is cut and
   const whole = await reassemble({ taskId: task.id, field: 'context', limit: 16 * 1024 }, eng);
   expect(whole.text).toBe(context);
   expect(whole.sha256).toBe(sha256(context));
-});
-
-test('a delivery answers with all three legs inside one budget: each leg is cut to its share and flagged, and its text verifies (SYS01)', async () => {
-  const deliveryGoal = await owner.createGoal({ text: `回显交付目标 ${suffix}`, source: 'owner:test', key: key('goal-echo'), tier: 'standard' });
-  // Every leg carries the whole spec, so each leg is over its share of the budget on its own.
-  const spec = '需求正文字'.repeat(1_500);
-  const relayed = await relay('create_delivery', {
-    goalId: deliveryGoal.id, title: `回显交付 ${suffix}`, spec, idempotencyKey: key('echo-delivery'),
-  }, args => core.createDelivery(gm, args as never));
-  expect(relayed.exit).toBe(0);
-  const legs = JSON.parse(relayed.out) as TaskView[];
-  expect(legs).toHaveLength(3);
-  expect(bytesOf(legs)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-  for (const leg of legs) {
-    const full = (await core.getTask(gm, leg.id)).context;
-    expect(leg.contextTruncated).toBe(true);
-    expect(leg.contextBytes).toBe(utf8(full));
-    expect(leg.contextSha256).toBe(sha256(full));
-    expect(Buffer.from(full, 'utf8').subarray(0, leg.contextNextOffset!).toString('utf8')).toBe(leg.context);
-  }
-});
-
-test('a delivery whose first leg holds a long dependency list echoes the whole count and digest, cut once (SYS01 R3)', async () => {
-  const deliveryGoal = await owner.createGoal({ text: `依赖回显目标 ${suffix}`, source: 'owner:test', key: key('goal-dep-echo'), tier: 'standard' });
-  // The external dependency list is bounded (R67): at most 50 raw entries. 50 task ids of 36 characters are still
-  // over the share of the create answer, so that answer cuts the list; the leg answer then cuts the cut list again.
-  const dependencies: string[] = [];
-  for (let index = 0; index < 50; index += 1) {
-    const dependency = await core.createTask(gm, {
-      title: `依赖回显 ${suffix} ${index}`, context: '依赖正文', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key(`dep-echo-${index}`),
-    });
-    dependencies.push(dependency.id);
-  }
-  const relayed = await relay('create_delivery', {
-    goalId: deliveryGoal.id, title: `依赖回显交付 ${suffix}`, spec: '需求正文字'.repeat(40), dependencies, idempotencyKey: key('dep-echo-delivery'),
-  }, args => core.createDelivery(gm, args as never));
-  expect(relayed.exit).toBe(0);
-  const legs = JSON.parse(relayed.out) as TaskView[];
-  expect(legs).toHaveLength(3);
-  expect(bytesOf(legs)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-  // The first leg stores the whole list. Its echo keeps a prefix, and the count and digest describe the whole list.
-  const first = legs[0]!;
-  expect((await core.getTask(gm, first.id)).dependencies).toEqual(dependencies);
-  expect(first.listsTruncated).toEqual({ dependencies: { count: dependencies.length, sha256: sha256(JSON.stringify(dependencies)) } });
-  expect(first.dependencies.length).toBeGreaterThan(0);
-  expect(first.dependencies.length).toBeLessThan(dependencies.length);
-  expect(dependencies.slice(0, first.dependencies.length)).toEqual(first.dependencies);
 });
 
 test('claim_next over MCP answers a claim whose context is over the budget: the lease comes back, the context is cut and flagged, and the whole text reassembles (SYS01, defect 1)', async () => {
@@ -1660,13 +1613,10 @@ test('a claim with a long project, dependency list and intent paths echoes each 
   const holder = await designerCredential('long');
   const outsider = await designerCredential('outsider');
   const paths = Array.from({ length: 50 }, (_, i) => `资产/第${i}组/${'镜头草图'.repeat(20)}-${i}`);
-  const deps = expectedWorking.slice(0, 120);
   const task = await core.createTask(gm, {
     title: `长列表样例 ${suffix} ` + '题'.repeat(180), context: '短正文', executorRole: 'concept-design', reviewerRole: 'qa',
     project: projectId, workIntent: { kind: 'assets', paths }, idempotencyKey: key('long-lists'),
   });
-  // The dependency list is written on the row: the ids are fixture tasks, and a claim does not check them.
-  await database.db.query('UPDATE $task SET dependencies = $deps;', { task: id('task', task.id), deps: deps.map(dep => id('task', dep)) });
   const wholeProject = (await new ProjectStore(database.db).get(projectId))!;
   const session = await mcpSession(holder);
   const pool = new SidecarPool({ core, workforce: { rotate: async () => holder } as unknown as SidecarDeps['workforce'], runDir: mkdtempSync(join(tmpdir(), 'sys01-r3-sidecar-')), sweepMs: 5 });
@@ -1681,14 +1631,10 @@ test('a claim with a long project, dependency list and intent paths echoes each 
     expect(claim.project).toMatchObject({ id: projectId, name: `长项目 ${suffix}` });
     expect(claim.project!.redLines!.length).toBeGreaterThan(0);
     expect(claim.project!.redLines!.length).toBeLessThan(40);
-    expect(claim.listsTruncated).toMatchObject({ dependencies: { count: 120 }, workIntentPaths: { count: 50 } });
-    expect(claim.listsTruncated!.dependencies!.sha256).toBe(sha256(JSON.stringify(deps)));
+    expect(claim.listsTruncated).toMatchObject({ workIntentPaths: { count: 50 } });
     expect(claim.listsTruncated!.workIntentPaths!.sha256).toBe(sha256(JSON.stringify(paths)));
-    expect(claim.task.dependencies.length).toBeLessThan(120);
-    expect(claim.task.dependencies).toEqual(deps.slice(0, claim.task.dependencies.length));
     // Each cut list reads back whole through read_task_text, verified against the digest the echo carried.
     const readWhole = async (field: TaskTextField, credential: string) => (await reassemble({ taskId: task.id, field, limit: 16 * 1024 }, credential)).text;
-    expect(JSON.parse(await readWhole('dependencies', holder))).toEqual(deps);
     expect(JSON.parse(await readWhole('workIntentPaths', holder))).toEqual(paths);
     const projectText = await readWhole('project', holder);
     expect(JSON.parse(projectText)).toEqual(wholeProject);

@@ -19,8 +19,8 @@ const { WORKFLOW_LABEL, WAIT_KIND_LABEL, WAIT_STATE_LABEL, clockOf } = new Funct
 
 const emptyBound = { total: 0, shown: 0, truncated: false };
 const allBounds = (over: Partial<Pulse['bounds']> = {}): Pulse['bounds'] => ({
-  dispatchBlocked: emptyBound, goalBlockers: emptyBound, workflowWaits: emptyBound, ready: emptyBound, doing: emptyBound, stuck: emptyBound,
-  waiting: emptyBound, recentDone: emptyBound, goals: emptyBound, resources: emptyBound, ...over,
+  dispatchBlocked: emptyBound, ready: emptyBound, doing: emptyBound, stuck: emptyBound,
+  waiting: emptyBound, recentDone: emptyBound, resources: emptyBound, ...over,
 });
 
 const full: Pulse = {
@@ -28,14 +28,11 @@ const full: Pulse = {
   doing: [{ taskId: 't1', title: '在办任务', role: 'engineering', sinceMin: 42 }],
   ready: [{ taskId: 't2', title: '就绪任务', role: 'qa', waitingMin: 90, unclaimableReason: '无可用实例' }],
   stuck: [{ taskId: 't3', title: '卡住任务', reason: '依赖未满足' }],
-  waiting: [{ taskId: 't4', kind: 'gate', title: '概要关口', hours: 19.2, downstream: 7 }],
+  waiting: [{ taskId: 't4', kind: 'gate', title: '概要关口', hours: 19.2 }],
   recentDone: [{ taskId: 't5', title: '已完成任务', at: '2026-10-15T03:00:00Z', actor: 'qa' }],
   last24h: { done: 3, returned: 1, rolledBack: 0, rejected: 0, retired: 2 },
   resources: ['grok 额度不足'],
   churn: { created: 2, retired: 2, claimLost: 5 },
-  goals: [{ title: '梦痕纪元宣传片', days: 4 }],
-  goalBlockers: [],
-  workflowWaits: [], workflowWaitSummary: { source: 'workflow-graph', available: false, totalRoots: 0, truncated: false, reason: '未加载' },
   dispatchBlocked: [{ taskId: 't2', title: '就绪任务', summary: '就绪任务：执行无法派工（会话占用中或异常）', phase: 'execute',
     workflowState: 'ready', checkedAt: '2026-10-15T03:59:30Z', eligibleCount: 0,
     feasible: true, since: '2026-10-15T03:30:00Z', waitingMinutes: 30,
@@ -54,20 +51,18 @@ test('normalizePulse: 完整响应原样通过', () => {
   expect(p.dispatchBlocked[0]).toMatchObject({ workflowState: 'ready', checkedAt: '2026-10-15T03:59:30Z', eligibleCount: 0 });
 });
 
-test('normalizePulse: truncation markers, omitted counts and reason actions survive the wire', () => {
+test('normalizePulse: truncation markers and omitted reason candidates survive the wire', () => {
   const p = normalizePulse({
     ...full,
-    bounds: allBounds({ dispatchBlocked: { total: 1500, shown: 40, truncated: true }, goalBlockers: { total: 300, shown: 40, truncated: true } }),
-    goalBlockers: [{ goalId: 'goal-1', taskId: 't9', title: '根任务', phase: 'execute', summary: '等待', feasible: true, waitingMinutes: 30,
-      others: 0, impact: 2, dependencyPath: [], people: { authors: ['a'], reviewers: [], peopleOmitted: 788 },
+    bounds: allBounds({ dispatchBlocked: { total: 1500, shown: 40, truncated: true } }),
+    dispatchBlocked: [{ taskId: 't9', title: '根任务', phase: 'execute', summary: '等待', feasible: true, waitingMinutes: 30,
+      workflowState: 'ready', checkedAt: '2026-10-15T03:59:30Z', eligibleCount: 0,
       reasons: [{ code: 'session_busy', text: '忙', candidates: ['x'], candidatesOmitted: 54, owner: 'owner', basis: 'tick-snapshot', recovery: '等待', nextTrigger: '空闲',
         actions: [{ authority: 'owner', label: '老板充值', executable: false }] }] }],
   });
-  expect(p.bounds).toEqual(allBounds({ dispatchBlocked: { total: 1500, shown: 40, truncated: true }, goalBlockers: { total: 300, shown: 40, truncated: true } }));
-  expect(p.goalBlockers[0]!.people).toMatchObject({ authors: ['a'], peopleOmitted: 788 });
-  expect(p.goalBlockers[0]!.reasons[0]).toMatchObject({ candidatesOmitted: 54, basis: 'tick-snapshot', owner: 'owner',
+  expect(p.bounds).toEqual(allBounds({ dispatchBlocked: { total: 1500, shown: 40, truncated: true } }));
+  expect(p.dispatchBlocked[0]!.reasons[0]).toMatchObject({ candidatesOmitted: 54, basis: 'tick-snapshot', owner: 'owner',
     actions: [{ authority: 'owner', label: '老板充值', executable: false }] });
-  expect(p.dispatchBlocked[0]!.reasons[0]!.candidatesOmitted).toBeUndefined();
 });
 
 test('normalizePulse: a response without markers reads as complete, with nothing left out', () => {
@@ -83,7 +78,6 @@ test('normalizePulse: 畸形/缺字段输入收敛为安全视图模型，不再
     expect(typeof p.churn.created).toBe('number');
     for (const w of p.waiting) expect(typeof w.hours).toBe('number');
     for (const d of p.recentDone) expect(typeof d.at).toBe('string');
-    for (const g of p.goals) expect(typeof g.title).toBe('string');
   }
   expect(normalizePulse({ waiting: [{}] }).waiting[0]!.kind).toBe('question');
 });
@@ -144,44 +138,6 @@ const renderPulse = (raw: unknown, q: { isLoading?: boolean; isError?: boolean; 
     { data: raw, isLoading: false, isError: false, error: undefined, ...q },
     attentionOf(normalizePulse(raw)), Section, Collapsible, View, Text, fmtAge, ROLE_LABEL, WORKFLOW_LABEL, WAIT_KIND_LABEL, WAIT_STATE_LABEL, clockOf);
 
-test('normalizePulse and owner view preserve workflow waits, provenance, impact path and independent time', () => {
-  const raw = { ...full, workflowWaitSummary: { source: 'workflow-graph', available: true, checkedAt: '2026-10-15T03:58:00Z', totalRoots: 2, truncated: true },
-    workflowWaits: [{ goalId: 'goal-1', taskId: 'root', title: '活租约复核根', workflowState: 'review', kind: 'active_lease', basis: 'task.current_employee + task.lease_expires_at',
-      waitingForRole: 'qa', nextTrigger: '租约到期后重新判定', goalRootCount: 2, impact: 2,
-      dependencyPath: [{ taskId: 'root', title: '活租约复核根' }, { taskId: 'leaf', title: '下游任务' }],
-      people: { implementer: 'eng-1', authors: ['eng-1'], reviewers: ['qa-1'], submitter: 'eng-1', submitCommit: 'abcdef1234567' },
-      peopleSource: 'contributor-audit', submitterSource: 'submit-audit', submitCommitSource: 'submit-audit-evidence',
-      peopleCheckedAt: '2026-10-15T03:57:00Z', submitCheckedAt: '2026-10-15T03:56:00Z' }] };
-  const p = normalizePulse(raw);
-  expect(p.workflowWaits[0]).toMatchObject({ taskId: 'root', kind: 'active_lease', workflowState: 'review', impact: 2,
-    peopleSource: 'contributor-audit', submitCommitSource: 'submit-audit-evidence', peopleCheckedAt: '2026-10-15T03:57:00Z' });
-  expect(p.workflowWaitSummary).toMatchObject({ available: true, totalRoots: 2, truncated: true, checkedAt: '2026-10-15T03:58:00Z' });
-  const text = collectText(renderPulse(raw));
-  expect(text).toContain('活租约等待');
-  expect(text).toContain('下游任务');
-  expect(text).toContain('影响 2 项');
-  expect(text).toContain('submit-audit-evidence');
-  expect(text).toContain(`人物来源采集于 ${clockOf('2026-10-15T03:57:00Z')}`);
-  expect(text).toContain(`提交审计采集于 ${clockOf('2026-10-15T03:56:00Z')}`);
-  expect(text).toContain('可能未纳入最近 dispatcher pass');
-  expect(text).toContain('列表已截断');
-});
-
-test('动态页渲染：等待根被字节份额清空时不再说“没有等待根”，真实空目标仍说', () => {
-  const cut = { ...full, workflowWaitSummary: { source: 'workflow-graph', available: true, checkedAt: '2026-10-15T03:58:00Z', totalRoots: 3, truncated: true },
-    workflowWaits: [], bounds: allBounds({ workflowWaits: { total: 3, shown: 0, truncated: true } }) };
-  const text = collectText(renderPulse(cut));
-  expect(text).toContain('均未纳入本页字节预算');
-  expect(text).toContain('显示 0 / 3');
-  expect(text).toContain('单项超出本页字节份额');
-  expect(text).not.toContain('当前没有已识别的目标等待根');
-  const empty = { ...full, workflowWaitSummary: { source: 'workflow-graph', available: true, checkedAt: '2026-10-15T03:58:00Z', totalRoots: 0, truncated: false },
-    workflowWaits: [], bounds: allBounds() };
-  const emptyText = collectText(renderPulse(empty));
-  expect(emptyText).toContain('当前没有已识别的目标等待根');
-  expect(emptyText).not.toContain('均未纳入本页字节预算');
-});
-
 test('动态页渲染：完整数据呈现全部区块', () => {
   const text = collectText(renderPulse(full));
   expect(text).toContain('派工运行中');
@@ -189,7 +145,6 @@ test('动态页渲染：完整数据呈现全部区块', () => {
   expect(text).toContain('概要关口');
   expect(text).toContain('无人可派：无可用实例');
   expect(text).toContain('grok 额度不足');
-  expect(text).toContain('梦痕纪元宣传片');
 });
 
 test('动态页渲染：畸形/部分数据不抛错，仍给出可见兜底', () => {
@@ -207,16 +162,12 @@ test('动态页渲染：加载中与失败态可见', () => {
   expect(collectText(renderPulse(undefined, { isError: true, error: new Error('rpc timeout') }))).toContain('加载失败');
 });
 
-test('normalizePulse: goal roots carry their own counts and conclusion time; an unknown workflow state reads as ready', () => {
+test('normalizePulse: dispatchBlocked carries its own conclusion time; an unknown workflow state reads as ready', () => {
   const p = normalizePulse({
     ...full,
-    goalBlockers: [{ goalId: 'goal-1', taskId: 't9', title: '根任务', phase: 'review', workflowState: 'review', summary: '等待复核',
-      feasible: false, waitingMinutes: 12, others: 2, undispatchable: 3, impact: 5, eligibleCount: 0, checkedAt: '2026-10-15T03:59:30Z',
-      dependencyPath: [], people: {}, reasons: [] }],
     dispatchBlocked: [{ taskId: 't8', title: '未知状态', phase: 'execute', workflowState: 'weird', summary: 's', feasible: true,
       waitingMinutes: 1, eligibleCount: 0, checkedAt: '2026-10-15T03:59:30Z', reasons: [] }],
   });
-  expect(p.goalBlockers[0]).toMatchObject({ workflowState: 'review', undispatchable: 3, impact: 5, eligibleCount: 0, checkedAt: '2026-10-15T03:59:30Z' });
   expect(p.dispatchBlocked[0]).toMatchObject({ workflowState: 'ready' });
 });
 

@@ -5,9 +5,8 @@ import { rm } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { RecordId } from 'surrealdb';
 import type { Surreal } from 'surrealdb';
-import type { Principal, ProjectView, Role, TaskView, WorkIntent, WorktreeAssignment, WorktreeView, WriteScopeHolder } from '../contracts.ts';
+import type { Principal, ProjectView, Role, TaskView, WorkIntent, WorktreeAssignment, WorktreeView } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
-import { impliedIntent } from '../policy.ts';
 import { MAX_ASSET_PATHS, MAX_ASSET_PATH_CHARS } from '../input-bounds.ts';
 import {
   decideReclaim, parseGraceDays, reclaimEnabledFrom, type ReclaimTrigger,
@@ -123,14 +122,10 @@ const refState = (r: Ref): 'active' | 'recovery' | 'released' => {
 
 /** What a claim asks for: its intent, the lane it joins, and the branch it must be on (undefined: a shared read tree). */
 function claimShape(task: TaskView, role: string) {
-  const intent: WorkIntent = task.state === 'review' ? { kind: 'read' } : task.workIntent ?? impliedIntent(role as Role, task.kind);
-  // A lane is one serial relay chain of a goal: every task tagged with it shares one tree and one branch.
-  const laneName = intent.kind === 'assets' ? undefined : task.workIntent?.lane;
-  const lane = laneName && task.goalId ? `${task.goalId}:${laneName}` : undefined;
-  const lane8 = lane ? hash(lane).slice(0, 8) : undefined;
+  const intent: WorkIntent = task.state === 'review' ? { kind: 'read' } : task.workIntent ?? { kind: 'read' };
   const writes = intent.kind === 'code' || (task.state === 'review' && task.executorRole === 'engineering' && task.kind === 'task' && !['read', 'assets'].includes(task.workIntent?.kind ?? 'code'));
-  const desired = writes ? (lane ? `lane/${lane8}-${laneName}` : `task/${task.id.slice(0, 8)}`) : undefined;
-  return { intent, lane, lane8, desired };
+  const desired = writes ? `task/${task.id.slice(0, 8)}` : undefined;
+  return { intent, desired };
 }
 type ClaimShape = ReturnType<typeof claimShape>;
 
@@ -139,46 +134,20 @@ type ClaimShape = ReturnType<typeof claimShape>;
  * allocate and the read-only preflight choose the same tree.
  */
 function chooseTree(rows: Row[], list: Tree[], task: TaskView, shape: ClaimShape): Row | undefined {
-  const { intent, lane, desired } = shape;
+  const { intent, desired } = shape;
   const shared = rows.find(r => r.mode === 'shared');
   const previous = task.worktree;
   const own = previous && rows.find(r => String(r.id.id) === previous.id);
-  const legacy = lane ? undefined : list.find(t => t.branch === `task/${task.id.slice(0, 8)}` && !t.main);
+  const legacy = list.find(t => t.branch === `task/${task.id.slice(0, 8)}` && !t.main);
   let chosen = own && list.find(t => t.path === own.path && (!desired || t.branch === desired)) ? own : undefined;
   // Existing task trees are adopted in place, keeping protected mode and all uncommitted work.
   if (!chosen && legacy && (intent.kind === 'code' || desired)) chosen = rows.find(r => r.path === legacy.path);
-  // Whoever picks up the next task of a lane lands in the lane's tree; readers only join a lane that already exists.
-  if (!chosen && lane && (desired || intent.kind === 'read')) chosen = rows.find(r => r.lane === lane && list.some(t => t.path === r.path));
   if (chosen && desired && chosen.branch !== desired) chosen = undefined;
   // Code never runs in the shared tree: it is the read/asset baseline and its branch is never switched.
   if (!chosen && !desired && shared && list.some(t => t.path === shared.path)) chosen = shared;
   return chosen;
 }
 
-/** A live write scope another writer holds: the message allocate refuses with, and the refs that hold it. */
-interface WriteScopeClash { message: string; holders: Ref[] }
-
-/**
- * Who holds the write scope a claim needs right now, from the live refs. Allocate refuses with worktree_busy on a clash, and the
- * dispatcher preflight reports the same holders, so the verdict and the claim cannot disagree.
- */
-function writeScopeClash(intent: WorkIntent, task: Pick<TaskView, 'id' | 'currentEmployee'>, actor: string, chosen: Row | undefined, live: Ref[]): WriteScopeClash | undefined {
-  const activeOn = (r: Row) => live.filter(f => String(f.tree.id) === String(r.id.id) && refState(f) === 'active');
-  if (intent.kind === 'assets') {
-    const overlapping = live.filter(r => refState(r) === 'active' && r.intent.kind === 'assets' && r.intent.paths!.some(a => intent.paths!.some(b => overlap(a, b))));
-    if (overlapping.length) return { message: 'Authorized asset directories overlap; wait for current writer', holders: overlapping };
-    const writers = chosen ? activeOn(chosen).filter(r => r.intent.kind === 'code') : [];
-    if (writers.length) return { message: 'Shared repository has an active code writer; asset writes wait', holders: writers };
-  }
-  if (chosen && intent.kind === 'code' && task.currentEmployee !== actor && activeOn(chosen).length) {
-    const held = activeOn(chosen).map(r => `${String(r.task?.id ?? '?').slice(-8)}:${r.intent.kind}:${refState(r)}`).join(',');
-    return { message: `Task scene ${chosen.path} (mode=${chosen.mode} branch=${chosen.branch}) referenced by ${held}`, holders: activeOn(chosen) };
-  }
-  return undefined;
-}
-
-/** The owner-facing holder of one live ref: a writer is named by its task, a read session only by its employee. */
-const holderOf = (r: Ref): WriteScopeHolder => ({ taskId: r.task ? String(r.task.id) : undefined, employee: r.employee, intent: r.intent.kind });
 
 export class WorktreeRegistry {
   /**
@@ -244,19 +213,10 @@ export class WorktreeRegistry {
       shared.branch = expected;
     }
   }
-  /** Non-terminal tasks that still belong to the lane; the lane tree lives until this reaches zero. */
-  private async laneOpen(lane: string | undefined): Promise<number> {
-    if (!lane) return 0;
-    const [goal, name] = lane.split(':');
-    const [rows] = await this.db.query<[Array<{ count: number }>]>(
-      `SELECT count() AS count FROM task WHERE goal = $goal AND work_intent.lane = $name AND state NOT IN ['done', 'void'] GROUP ALL;`,
-      { goal: record('goal', goal!), name });
-    return rows?.[0]?.count ?? 0;
-  }
   async allocate(repo: string, list: Tree[], task: TaskView, actor: Principal, project?: ProjectView): Promise<WorktreeAssignment> {
     await this.reconcile(repo, list, project?.id);
     const shape = claimShape(task, actor.role);
-    const { intent, lane, lane8, desired } = shape;
+    const { intent, desired } = shape;
     validateIntent(intent);
     const refs = await this.refs(repo);
     const live = refs.filter(r => refState(r) !== 'released' && String(r.task?.id) !== task.id);
@@ -272,11 +232,9 @@ export class WorktreeRegistry {
     // refs (live session or still-assigned holder) serialize access; a parked owner's resumption
     // re-enters through this same gate and queues behind whoever is active then.
     let chosen = chooseTree(rows, list, task, shape);
-    const clash = writeScopeClash(intent, task, actor.employeeId, chosen, live);
-    if (clash) throw new CompanyError('worktree_busy', clash.message);
     if (!chosen) {
       const mode = desired ? 'exclusive' : 'shared';
-      const path = join(dirname(repo), `${basename(repo)}-sck-${hash(repo).slice(0, 8)}-${mode === 'shared' ? 'shared' : lane8 ?? task.id.slice(0, 8)}`);
+      const path = join(dirname(repo), `${basename(repo)}-sck-${hash(repo).slice(0, 8)}-${mode === 'shared' ? 'shared' : task.id.slice(0, 8)}`);
       // Do not treat an existing unregistered path as an empty target.
       if (existsSync(path)) throw new CompanyError('conflict', 'Unregistered allocation path exists; preserve it for reconciliation');
       const branch = desired ?? `sck/shared-${hash(repo).slice(0, 12)}`;
@@ -288,11 +246,11 @@ export class WorktreeRegistry {
       }
       await git(repo, ['worktree', 'add', ...(branchExists ? [] : ['-b', branch]), path, branchExists ? branch : base]);
       const canonical = realpathSync(path);
-      chosen = { id: record('worktree', worktreeId(repo, canonical)), repo, project: project?.id, path: canonical, branch, mode, lane: mode === 'exclusive' ? lane : undefined, created_at: new Date(), last_used_at: new Date() };
+      chosen = { id: record('worktree', worktreeId(repo, canonical)), repo, project: project?.id, path: canonical, branch, mode, created_at: new Date(), last_used_at: new Date() };
       // Persist the physical tree before the task claim. On failure it has no effective reference.
       await this.db.query(`UPSERT ONLY $tree CONTENT { repo: $repo, project: $project, path: $path,
-        branch: $branch, mode: $mode, lane: $lane, created_at: time::now(), last_used_at: time::now() };`,
-        { tree: chosen.id, repo, project: project?.id, path: canonical, branch, mode, lane: chosen.lane });
+        branch: $branch, mode: $mode, created_at: time::now(), last_used_at: time::now() };`,
+        { tree: chosen.id, repo, project: project?.id, path: canonical, branch, mode });
     }
     // Refuse branch drift (manual checkout) instead of silently restoring/resetting the tree.
     const actualBranch = await git(chosen.path, ['symbolic-ref', '--short', 'HEAD']).catch(() => undefined);
@@ -304,26 +262,12 @@ export class WorktreeRegistry {
       if (resolved !== candidate || (resolved !== chosen.path && !resolved.startsWith(chosen.path + sep))) throw new CompanyError('invalid', 'Asset directory escapes worktree through symlink');
     }
     return { id: String(chosen.id.id), repo, project: project?.id, worktreePath: chosen.path, branch: chosen.branch,
-      mode: chosen.mode, lane: chosen.lane, intent,
-      discipline: intent.kind === 'code' ? `仅在${chosen.lane ? '本线（lane）' : '本任务'}分支 commit/push；禁止 checkout/reset/pull；禁止凭证读取；附件写 evidenceDir。`
+      mode: chosen.mode, intent,
+      discipline: intent.kind === 'code' ? `仅在本任务分支 commit/push；禁止 checkout/reset/pull；禁止凭证读取；附件写 evidenceDir。`
         : intent.kind === 'assets' ? '仅写授权目录；不得 checkout/reset/pull 或 commit/push；附件写 evidenceDir。'
           : '只读代码；不得 checkout/reset/pull、commit/push 或写资产；附件写 evidenceDir。' };
   }
-  /**
-   * Read-only preflight of allocate for the dispatcher (SYS-DISP R1): the holders that would block this task's write scope now,
-   * empty when none. Same rules as allocate, with no write: no reconcile, no shared-tree restore, no repo lock. The claim stays
-   * the authority, so a clash that appears in between is still refused there.
-   */
-  async writeScope(repo: string, list: Tree[], task: TaskView, actor: { employeeId: string; role: string }): Promise<WriteScopeHolder[]> {
-    const shape = claimShape(task, actor.role);
-    const refs = await this.refs(repo);
-    const live = refs.filter(r => refState(r) !== 'released' && String(r.task?.id) !== task.id);
-    const rows = await this.rows(repo);
-    const clash = writeScopeClash(shape.intent, task, actor.employeeId, chooseTree(rows, list, task, shape), live);
-    return clash ? clash.holders.map(holderOf) : [];
-  }
-
-  async readWorkspace(repoPath: string, actor: Principal, project?: ProjectView): Promise<WorktreeAssignment> {
+    async readWorkspace(repoPath: string, actor: Principal, project?: ProjectView): Promise<WorktreeAssignment> {
     return this.locked(repoPath, async (repo, list) => {
       const task: TaskView = { id: `session-${actor.employeeId}`, title: 'Read workspace', context: '', state: 'ready',
         executorRole: actor.role, reviewerRole: 'qa', kind: 'task', dependencies: [], version: 0, fence: 0, workIntent: { kind: 'read' } };
@@ -456,7 +400,6 @@ export class WorktreeRegistry {
         status, dirty,
         effectiveRefs: references.filter(r => r.state === 'active').length,
         recoveryRefs: references.filter(r => r.state === 'recovery').length,
-        laneOpen: await this.laneOpen(row.lane),
         createdAt: this.asDate(row.created_at), lastUsedAt: this.asDate(row.last_used_at),
         lastReleasedAt: this.asDate(row.last_released_at),
       }, policy);
@@ -557,8 +500,7 @@ export class WorktreeRegistry {
               status, dirty,
               effectiveRefs: freshRefs.filter(r => refState(r) === 'active').length,
               recoveryRefs: freshRefs.filter(r => refState(r) === 'recovery').length,
-              laneOpen: await this.laneOpen(row.lane),
-              createdAt: this.asDate(row.created_at), lastUsedAt: this.asDate(row.last_used_at),
+                    createdAt: this.asDate(row.created_at), lastUsedAt: this.asDate(row.last_used_at),
               lastReleasedAt: this.asDate(row.last_released_at),
             }, policy);
 

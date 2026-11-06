@@ -112,7 +112,7 @@ test('drill runner: success path writes report.json and passes every phase', asy
     // The channel round-trip, the oracle and the cleanup all actually ran through the stub.
     expect(calls.some(c => c.includes('client-cli.ts'))).toBe(true);
     expect(calls.some(c => c.includes('deploy-drill-oracle.ts'))).toBe(true);
-    expect(calls.some(c => c.includes('goal-workspace-guard.sh'))).toBe(true);
+    expect(calls.some(c => c.includes('acceptance-guard.sh'))).toBe(true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -143,12 +143,12 @@ test('drill runner: failure path still writes report.json and marks the state fa
   const root = mkdtempSync(join(tmpdir(), 'drill-runner-fail-'));
   try {
     mkdirSync(join(root, 'plugin', 'node_modules'), { recursive: true });
-    const { exec } = stubExec('policy-guard.sh'); // the candidate guard refuses: drill fails before any switch
+    const { exec } = stubExec('acceptance-guard.sh'); // the candidate guard refuses: drill fails before any switch
     const states: unknown[] = [];
-    await expect(runDrill(plan(root), host(exec, join(root, 'service-home'), states))).rejects.toThrow('policy_target_supported');
+    await expect(runDrill(plan(root), host(exec, join(root, 'service-home'), states))).rejects.toThrow('acceptance_target_supported');
     const report = JSON.parse(readFileSync(join(root, 'report.json'), 'utf8'));
     expect(report.status).toBe('failed');
-    expect(String(report.error)).toContain('policy_target_supported');
+    expect(String(report.error)).toContain('acceptance_target_supported');
     expect(states.at(-1)).toMatchObject({ status: 'failed' });
     // The failure happened in prepare: no face process was ever spawned.
     expect(report.phases.at(-1)?.result).toBe('failed');

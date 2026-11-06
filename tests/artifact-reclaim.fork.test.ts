@@ -102,7 +102,7 @@ run('the terminal clock is the last audit row, so a just-accepted task keeps its
 run('an ancestor of unfinished work stays intact; once the child finishes it is reclaimable', async () => {
   const parentId = await acceptedTask({ title: `parent ${++count}` });
   seedArtifacts(parentId);
-  const child = await newTask({ title: `child ${count}`, dependencies: [parentId] });
+  const child = await newTask({ title: `child ${count}` });
 
   const held = await reclaimer().reclaim({ trigger: 'sweep' });
   expect(held.trimmed.map(t => t.taskId)).not.toContain(parentId);
@@ -121,9 +121,9 @@ run('pressure reclaims an ancestor a grandchild still needs, but never a direct 
   // mid is a direct dependency and root only an indirect one.
   const root = await acceptedTask({ title: `root ${++count}` });
   seedArtifacts(root);
-  const mid = await acceptedTask({ title: `mid ${count}`, dependencies: [root] });
+  const mid = await acceptedTask({ title: `mid ${count}` });
   seedArtifacts(mid);
-  const leaf = await newTask({ title: `leaf ${count}`, dependencies: [mid] });
+  const leaf = await newTask({ title: `leaf ${count}` });
 
   // Normally the unfinished chain protects both ancestors.
   const normal = await reclaimer().reclaim({ trigger: 'sweep' });

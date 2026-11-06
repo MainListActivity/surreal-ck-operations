@@ -138,7 +138,6 @@ run('company version actions bypass Jev routing and approval, including stale di
  const t=await task(),wf=new Workforce(db,join(dir,'credentials')),before=t.version;
  expect((await core.getTask(eng,t.id)).blockedTo).toBe('owner');
  await db.db.query("UPDATE $task SET state='review',reviewer_role='owner',acceptance_legacy=true;",{task:new RecordId('task',t.id)});
- expect(await wf.jevAccept(t.id,before,'Jev proposes automatic acceptance')).toBe(false);
  expect((await core.getTask(eng,t.id)).state).toBe('review');
  let calls=0;
  const dispatcher=new Dispatcher({workforce:{tasks:async()=>[{kind:'release',state:'review',version:before,row:{company_upgrade:t.companyUpgrade}},{kind:'deploy',state:'blocked',blockedTo:'owner',version:before,row:{company_upgrade:t.companyUpgrade}}],judgeInput:async()=>{calls++;throw Error('must not ask Jev');}},owner:{triagePending:async()=>[]},jev:{model:'fixture',ask:async()=>{calls++;throw Error('must not call Jev');}}} as never);
@@ -162,10 +161,8 @@ async function handoffTask(){
   note('交付未完成：部署腿须由老板点升级卡触发，先按交接等待退回实现人继续收口。'));
  // The returned task is ready again; the engineer takes it back before parking it on the owner handoff.
  const again=await core.claim(who,taskId);
- return core.wait(who,{taskId,deliveryId:again.deliveryId,fence:again.fence,expectedVersion:again.task.version},
-  {text:'fixture: 公司 v0.3.76 已合入 main，部署须由老板点升级卡触发独立升级作业。',idempotencyKey:`handoff-${count}-${taskId}`},
-  {kind:'owner_handoff',reason:'公司版本已合入 main，受控双面部署须由老板点击升级卡触发独立升级作业。',
-   completed:['PR 已合入 origin/main'],pendingAction:'老板在收件箱点击「升级至 v0.3.76」',text:'fixture owner handoff'} as never);
+ return core.block(who,{taskId,deliveryId:again.deliveryId,fence:again.fence,expectedVersion:again.task.version},'owner',
+  {text:'fixture: 公司 v0.3.76 已合入 main，部署须由老板点升级卡触发独立升级作业。',idempotencyKey:`handoff-${count}-${taskId}`});
 }
 
 run('an owner handoff task keeps its upgrade card reachable',async()=>{
@@ -355,16 +352,6 @@ run('GitHub CI billing cannot be turned into an employee block or an owner hando
       .rejects.toMatchObject({code:'invalid',details:{reason:'github_ci_system_owned'}});
     expect(await snapshot()).toEqual(before);
   }
-  // Only inspecting evidence.text leaves the typed wait's action/reason as a second bypass.
-  for (const field of ['reason','pendingAction'] as const) {
-    await expect(core.wait(who,proof,note('上线检查已整理，需要等待所述前置条件解决后再继续执行。'),{
-      kind:'owner_handoff',completed:['PR 已准备'],reason:'等待外部处理',pendingAction:'请检查前置条件',
-      [field]:'GitHub Actions billing: 请老板修复付款后再继续',
-    })).rejects.toMatchObject({code:'invalid',details:{reason:'github_ci_system_owned'}});
-    expect(await snapshot()).toEqual(before);
-  }
-  const [waits] = await db.db.query<[unknown[]]>('SELECT * FROM task_wait WHERE task=$task;',{task:new RecordId('task',taskId)});
-  expect(waits).toHaveLength(0);
   // A genuine test failure is still a technical blocker. There is no employee-issued billing waiver.
   const blocked = await core.block(who,proof,'owner',note('GitHub CI 已实际执行测试，断言失败，需要工程修复后重新验证。'));
   expect(blocked.blockedTo).toBe('owner');
@@ -394,9 +381,8 @@ run('a rejected CI billing block continues through server-verified evidence and 
     proof.expectedVersion = progress.version;
     await expect(ciCore.block(who,proof,'owner',note('检查未启动，需要外部处理，等待老板回复以后继续。')))
       .rejects.toMatchObject({details:{nextAction:'record_acceptance_evidence',grantsWaiver:false,source:{sha}}});
-    await expect(ciCore.wait(who,proof,note('目前检查没有执行，等待外部恢复以后继续上线申请。'),{
-      kind:'owner_handoff',reason:'等待外部处理',completed:['PR 已准备'],pendingAction:'请老板处理后回复',
-    })).rejects.toMatchObject({details:{source:{sha}}});
+    await expect(ciCore.block(who,proof,'owner',note('目前检查没有执行，等待外部恢复以后继续上线申请。')))
+      .rejects.toMatchObject({details:{source:{sha}}});
     // Refusing the employee block must not bypass the machine-evidence gate either.
     await expect(ciCore.submit(who,proof,note('尚未提交任何服务端证据，不应直接放行到审核阶段。'))).rejects.toMatchObject({code:'invalid'});
     const recorded = await ciCore.recordAcceptanceEvidence(who,{taskId,acId:'AC-BASE-RELEASE-1',sha,
@@ -420,11 +406,9 @@ run('a rejected CI billing block continues through server-verified evidence and 
     const waitingClaim = await ciCore.claim(who,waitingId);
     await ciCore.recordAcceptanceEvidence(who,{taskId:waitingId,acId:'AC-BASE-RELEASE-1',sha,
       source:{provider:'github-actions',runUrl:'https://github.com/fixture/repo/actions/runs/42'},idempotencyKey:`ci-proof-${waitingId}`});
-    const waiting = await ciCore.wait(who,{taskId:waitingId,deliveryId:waitingClaim.deliveryId,fence:waitingClaim.fence,expectedVersion:waitingClaim.task.version},
-      note('独立前置任务尚未完成，等待其完成以后继续上线审核。'),{
-        kind:'dependency',referenceTaskId:upgradeId,reason:'等待独立前置任务完成',completed:['GitHub CI 计费已经由系统判定'],
-      });
-    expect(waiting.state).toBe('blocked');expect(waiting.blockedTo).toBeUndefined();
+    const waiting = await ciCore.block(who,{taskId:waitingId,deliveryId:waitingClaim.deliveryId,fence:waitingClaim.fence,expectedVersion:waitingClaim.task.version},'owner',
+      note('独立前置任务尚未完成，等待其完成以后继续上线审核。'));
+    expect(waiting.state).toBe('blocked');expect(waiting.blockedTo).toBe('owner');
     // The same distinction must hold for block's free-text summary, not just wait's structured fields.
     const businessId = crypto.randomUUID();
     await db.db.query("CREATE $task CONTENT {title:'客户付款审批',context:'https://github.com/fixture/repo/pull/7',kind:'release',executor_role:'engineering',reviewer_role:'product',state:'ready',version:1,fence:0,dependencies:[],acceptance_head:$sha,acceptance_legacy:false,acceptance_version:1,acceptance_criteria:$criteria};",{

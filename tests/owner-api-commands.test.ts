@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
 import { ownerApi, type OwnerApiContext } from '../src/owner-api.ts';
-import { GoalGovernanceStore } from '../src/goal-store.ts';
 import { pluginOwnerCommand } from '../plugin/server/owner-api.ts';
 
 function makeFakeCtx(overrides?: Partial<OwnerApiContext>) {
@@ -34,24 +33,24 @@ function makeFakeCtx(overrides?: Partial<OwnerApiContext>) {
 test('idempotencyKey produces identical key on retry, random UUID when omitted', async () => {
   const recordedKeys: string[] = [];
   const fakeOwner = {
-    createGoal: async (input: { text: string; source: string; key: string }) => {
+    addDirection: async (input: { text: string; source: string; key: string }) => {
       recordedKeys.push(input.key);
-      return { id: 'g1', title: input.text };
+      return { id: 'd1' };
     },
   };
   const { ctx } = makeFakeCtx({ owner: fakeOwner as any });
 
   const idempKey = 'retry-test-key-12345';
-  await ownerApi(ctx, { command: 'goal.create', text: 'goal text', idempotencyKey: idempKey }, 'test-agent');
-  await ownerApi(ctx, { command: 'goal.create', text: 'goal text', idempotencyKey: idempKey }, 'test-agent');
+  await ownerApi(ctx, { command: 'direction.add', text: 'goal text', idempotencyKey: idempKey }, 'test-agent');
+  await ownerApi(ctx, { command: 'direction.add', text: 'goal text', idempotencyKey: idempKey }, 'test-agent');
   expect(recordedKeys[0]).toBe(recordedKeys[1]);
-  expect(recordedKeys[0]).toBe(`owner:test-agent:goal.create:${idempKey}`);
+  expect(recordedKeys[0]).toBe(`owner:test-agent:direction.add:${idempKey}`);
 
-  await ownerApi(ctx, { command: 'goal.create', text: 'goal text' }, 'test-agent');
-  await ownerApi(ctx, { command: 'goal.create', text: 'goal text' }, 'test-agent');
+  await ownerApi(ctx, { command: 'direction.add', text: 'goal text' }, 'test-agent');
+  await ownerApi(ctx, { command: 'direction.add', text: 'goal text' }, 'test-agent');
   expect(recordedKeys[2]).not.toBe(recordedKeys[3]);
-  expect(recordedKeys[2]).toStartWith('owner:test-agent:goal.create:');
-  expect(recordedKeys[3]).toStartWith('owner:test-agent:goal.create:');
+  expect(recordedKeys[2]).toStartWith('owner:test-agent:direction.add:');
+  expect(recordedKeys[3]).toStartWith('owner:test-agent:direction.add:');
 });
 
 // ---- ITEM 2: task.update audit ----
@@ -129,84 +128,6 @@ test('notice.list calls ctx.owner.openNotices', async () => {
   const { ctx } = makeFakeCtx({ owner: fakeOwner as any });
   const res = await ownerApi(ctx, { command: 'notice.list' }, 'cli');
   expect(res).toEqual({ notices: fakeNotices });
-});
-
-test('goal.split calls ctx.core.ownerGoalPhaseSplit with arguments', async () => {
-  let recordedVia: string | undefined;
-  let recordedInput: any;
-  const fakeCore = {
-    ownerGoalPhaseSplit: async (via: string, input: any) => {
-      recordedVia = via;
-      recordedInput = input;
-      return { goalId: input.goalId, nextGoalId: 'g2', moved: input.taskIds, unlocked: [] };
-    },
-  };
-  const { ctx } = makeFakeCtx({ core: fakeCore as any });
-  const res = await ownerApi(ctx, {
-    command: 'goal.split',
-    goalId: 'g1',
-    taskIds: ['t1', 't2'],
-    title: 'Phase 2 Title',
-    reason: 'Splitting remaining tasks',
-  }, 'split-via');
-  expect(recordedVia).toBe('split-via');
-  expect(recordedInput.goalId).toBe('g1');
-  expect(recordedInput.taskIds).toEqual(['t1', 't2']);
-  expect(recordedInput.title).toBe('Phase 2 Title');
-  expect(recordedInput.reason).toBe('Splitting remaining tasks');
-  expect(recordedInput.idempotencyKey).toStartWith('owner:split-via:goal.split:');
-  expect(res).toEqual({ goalId: 'g1', nextGoalId: 'g2', moved: ['t1', 't2'], unlocked: [] });
-});
-
-test('goal.retired.list calls GoalGovernanceStore.retiredWorkPending', async () => {
-  const fakeDb = {
-    query: async (sql: string) => {
-      if (sql.includes('SELECT * FROM goal WHERE id IN $ids;')) {
-        return [[{ id: new RecordId('goal', 'g1'), version: 2, state: 'active', title: 'goal 1', brief: '', anchors: [], tasks: {} }]];
-      }
-      return [[]];
-    },
-  };
-  const { ctx } = makeFakeCtx({ db: { db: fakeDb } as any });
-  const res = await ownerApi(ctx, { command: 'goal.retired.list', goalId: 'g1' }, 'cli') as any;
-  expect(res.goalId).toBe('g1');
-  expect(res.goalVersion).toBe(2);
-  expect(res.items).toEqual([]);
-});
-
-test('goal.retired.resolve calls GoalGovernanceStore.resolveRetiredWork', async () => {
-  let calledArgs: any;
-  const original = GoalGovernanceStore.prototype.resolveRetiredWork;
-  try {
-    GoalGovernanceStore.prototype.resolveRetiredWork = async function(args: any) {
-      calledArgs = args;
-      return { goalId: args.goalId, state: 'active', readyToComplete: false } as any;
-    };
-    const { ctx } = makeFakeCtx();
-    const res = await ownerApi(ctx, {
-      command: 'goal.retired.resolve',
-      goalId: 'g1',
-      taskId: 't1',
-      goalVersion: 1,
-      taskVersion: 2,
-      disposition: 'fixture',
-      replacementTaskIds: [],
-      reason: 'Valid justification for retiring task',
-    }, 'resolver-agent') as any;
-
-    expect(calledArgs.goalId).toBe('g1');
-    expect(calledArgs.taskId).toBe('t1');
-    expect(calledArgs.goalVersion).toBe(1);
-    expect(calledArgs.taskVersion).toBe(2);
-    expect(calledArgs.disposition).toBe('fixture');
-    expect(calledArgs.replacementTaskIds).toEqual([]);
-    expect(calledArgs.reason).toBe('Valid justification for retiring task');
-    expect(calledArgs.actor).toBe('owner:resolver-agent');
-    expect(calledArgs.key).toStartWith('owner:resolver-agent:goal.retired.resolve:');
-    expect(res.goalId).toBe('g1');
-  } finally {
-    GoalGovernanceStore.prototype.resolveRetiredWork = original;
-  }
 });
 
 test('task.cost reads task cost for single task', async () => {

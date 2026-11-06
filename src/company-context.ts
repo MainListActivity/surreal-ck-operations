@@ -17,7 +17,6 @@ export function companyBlock(brief: CompanyBrief, section?: CompanySection): Par
   return {
     paused: brief.paused,
     ...(section === undefined || section === 'directions' ? { directions: brief.directions } : {}),
-    ...(section === undefined || section === 'goals' ? { goals: brief.goals } : {}),
     ...(section === undefined || section === 'projects' ? { projects: brief.projects } : {}),
   };
 }
@@ -28,7 +27,6 @@ export function companyParts(brief: CompanyBrief, section?: CompanySection): Com
   if (section === undefined || section === 'directions') {
     brief.directions.forEach((direction, position) => items.push({ section: 'directions', key: `direction-${position}`, value: direction }));
   }
-  if (section === undefined || section === 'goals') for (const goal of brief.goals) items.push({ section: 'goals', key: goal.id, value: goal });
   if (section === undefined || section === 'projects') for (const project of brief.projects) items.push({ section: 'projects', key: project.id, value: project });
   return items.flatMap(item => partsOf(item.section, item.key, JSON.stringify(item.value)));
 }

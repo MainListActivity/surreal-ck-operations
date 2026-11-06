@@ -38,12 +38,6 @@ try {
     return at < 0 ? undefined : argv.splice(at, 2)[1];
   };
   const commands: Record<string, (argv: string[]) => { kind: OwnerCommandKind; task?: string; text?: string; tier?: string; project?: string; pipeline?: string }> = {
-    goal: argv => {
-      const tier = flag(argv, 'tier');
-      const project = flag(argv, 'project');
-      const pipeline = flag(argv, 'pipeline');
-      return { kind: 'goal', text: argv.join(' '), tier, project, pipeline };
-    },
     direction: argv => ({ kind: 'direction', text: argv.join(' ') }),
     approve: ([task, ...note]) => ({ kind: 'approve', task, text: note.join(' ') }),
     reject: ([task, ...note]) => ({ kind: 'reject', task, text: note.join(' ') }),
@@ -94,28 +88,6 @@ try {
     if (!taskId) throw new Error('用法：pnpm run company void <任务ID> <原因>');
     const task = await desk.retire({ taskId, note: note.join(' '), source: 'owner:cli', key: `cli-void:${taskId}` });
     console.log(`已作废：${task.title}（${task.state}）`);
-  } else if (action === 'unlock') {
-    if (!first) throw new Error('用法：pnpm run company unlock <任务ID>');
-    const unlocked = await desk.unlockDependents({ taskId: first, source: 'owner:cli' });
-    console.log(unlocked.length ? `已解锁：${unlocked.join('、')}` : '没有需要解锁的任务。');
-  } else if (action === 'split-goal') {
-    const argv = [first ?? '', ...rest].filter(Boolean);
-    const tasks = (flag(argv, 'tasks') ?? '').split(',').map(t => t.trim()).filter(Boolean);
-    const title = flag(argv, 'title');
-    const [goalId, ...why] = argv;
-    if (!goalId || !tasks.length || !title || !why.length) throw new Error('用法：pnpm run company split-goal <目标ID> --tasks <任务ID,任务ID> --title <下一阶段标题> <原因>');
-    const { SurrealCompanyCore } = await import('./core.ts');
-    // The next phase is triaged in this process: the core needs the ops repo too, or its quick code legs stay unbound.
-    const core = new SurrealCompanyCore(db, { companyReleaseRepo: opsRepo });
-    const reason = why.join(' ');
-    const result = await core.ownerGoalPhaseSplit('cli', { goalId, taskIds: tasks, title, reason,
-      idempotencyKey: `owner-cli:${goalId}:${[...tasks].sort().join(',')}` });
-    console.log(`已分阶段：下一阶段目标 ${result.nextGoalId}；移入 ${result.moved.length} 个任务；解锁 ${result.unlocked.join('、') || '无'}`);
-  } else if (action === 'cancel-goal') {
-    const [goalId, ...note] = [first ?? '', ...rest].filter(Boolean);
-    if (!goalId) throw new Error('用法：pnpm run company cancel-goal <目标ID> <原因>');
-    const result = await desk.cancelGoal({ goalId, note: note.join(' '), source: 'owner:cli', key: `cli-cancel:${goalId}` });
-    console.log(`已作废 ${result.retired} 个任务；${result.remaining ? `仍有 ${result.remaining} 个未能作废，目标保持原状` : '目标已关闭（cancelled）'}`);
   } else if (action === 'cost') {
     const { COST_LIST_SQL, readTaskCost, recordTaskCost } = await import('./task-cost.ts');
     const argv = [first ?? '', ...rest].filter(Boolean);
@@ -147,7 +119,6 @@ try {
     const count = (state: string) => tasks.filter(t => t.state === state).length;
     console.log(`派工：${config.paused ? '已暂停' : '运行中'}（最多同时 ${config.maxRunning} 位员工）`);
     console.log(`任务：待办 ${count('ready')} · 进行中 ${count('doing')} · 待验收 ${count('review')} · 阻塞 ${count('blocked')}`);
-    console.log(`在办目标：${brief.goals.map(g => `${g.title}（${g.id}，${g.state === 'triage' ? '待分级' : g.tier ?? '旧流程'}）`).join('、') || '无'}`);
     if (brief.projects.length) console.log(`项目环境：${brief.projects.map(p => `${p.id}（${p.envs.map(e => e.name).join('/')}）`).join('、')}`);
     console.log(`在职员工：${insts.map(i => `${i.id}@${i.provider ?? '?'}`).join('、') || '无'}`);
     console.log(`订阅：${[...health.values()].map(h => `${h.provider}=${h.state}${h.until ? `(至 ${new Date(h.until * 1000).toLocaleString('zh-CN')})` : ''}`).join('、') || '全部正常'}`);

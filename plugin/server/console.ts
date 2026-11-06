@@ -18,8 +18,6 @@ type CompanyApi = {
     brief(): Promise<unknown>;
     decide(input: { taskId: string; decision: "approve" | "reject" | "reply"; note: string; source: string; key: string }): Promise<unknown>;
     retire(input: { taskId: string; note: string; source: string; key: string }): Promise<unknown>;
-    unlockDependents(input: { taskId: string; source: string }): Promise<string[]>;
-    cancelGoal(input: { goalId: string; note: string; source: string; key: string }): Promise<{ retired: number; remaining: number }>;
     resolveNotice(key: string): Promise<void>;
     instruct(input: { text: string; source: string; key: string }): Promise<{ taskId: string }>;
   };
@@ -185,17 +183,6 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
           "SELECT * FROM task WHERE goal = $goal ORDER BY created_at, id;", { goal: id("goal", goalId) });
         return json({ tasks: rows.map(r => view(r as Parameters<typeof view>[0])) });
       }
-      if (req.method === "GET" && sub === "/api/goal-retired-pending") {
-        const goalId = url.searchParams.get("goalId") ?? "";
-        if (!goalId) return json({ error: "goalId required" }, 400);
-        try {
-          const { GoalGovernanceStore } = await import("./vendor/src/goal-store.ts");
-          const view = await new GoalGovernanceStore((await opts.company()).db.db).retiredWorkPending(goalId);
-          return json(view);
-        } catch (error) {
-          return json({ error: error instanceof Error ? error.message : String(error) }, 400);
-        }
-      }
       if (req.method === "GET" && sub === "/api/task") {
         const taskId = url.searchParams.get("id") ?? "";
         const { db } = await opts.company();
@@ -236,15 +223,6 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
         const c=await opts.company();if(!c.upgrades)return json({error:"升级服务尚未就绪"},409);
         return json(await c.upgrades.start(b,SOURCE));
       }
-      if(req.method==='POST'&&sub==='/api/goal-retired-resolution'){
-        if(req.headers.get('origin')&&req.headers.get('origin')!==url.origin)return json({error:'origin mismatch'},403);
-        try{
-          const input=await req.json() as Parameters<import('./vendor/src/goal-store.ts').GoalGovernanceStore['resolveRetiredWork']>[0];
-          const {GoalGovernanceStore}=await import('./vendor/src/goal-store.ts');
-          const card=await new GoalGovernanceStore((await opts.company()).db.db).resolveRetiredWork({...input,actor:SOURCE});
-          return json({ok:true,goalId:card.goalId,state:card.state,readyToComplete:card.readyToComplete});
-        }catch{return json({error:'历史任务处置失败：请核对版本、作废状态及替代交付'},409);}
-      }
       if (req.method === "POST" && sub === "/api/decide") {
         const b = await req.json() as { taskId?: string; decision?: string; note?: string; key?: string };
         if (!b.taskId || !["approve", "reject", "reply"].includes(b.decision ?? "")) return json({ error: "bad input" }, 400);
@@ -271,19 +249,6 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
           "【交接包】老板终止了上一棒的在途执行。先核对任务分支/授权目录中的实际改动与已有 checkpoint，再继续；不要重复已完成且已验证的步骤。",
           SOURCE);
         return json(r);
-      }
-      if (req.method === "POST" && sub === "/api/unlock") {
-        const b = await req.json() as { taskId?: string };
-        if (!b.taskId) return json({ error: "bad input" }, 400);
-        const unlocked = await (await opts.company()).owner.unlockDependents({ taskId: b.taskId, source: SOURCE });
-        return json({ ok: true, unlocked });
-      }
-      if (req.method === "POST" && sub === "/api/cancel-goal") {
-        const b = await req.json() as { goalId?: string; note?: string; key?: string };
-        if (!b.goalId || (b.note ?? "").trim().length < 2) return json({ error: "取消目标需要写明原因" }, 400);
-        const key = typeof b.key === "string" && /^[A-Za-z0-9_-]{8,72}$/.test(b.key) ? b.key : `web-cancel:${b.goalId}:${Date.now()}`;
-        const r = await (await opts.company()).owner.cancelGoal({ goalId: b.goalId, note: b.note!, source: SOURCE, key });
-        return json({ ok: true, ...r });
       }
       if (req.method === "POST" && sub === "/api/notice") {
         const b = await req.json() as { key?: string };

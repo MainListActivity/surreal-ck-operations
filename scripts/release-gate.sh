@@ -34,7 +34,7 @@ case "$gate" in
     # only to the collaboration task's own feedback wait, old-fence invalidation, zero polling) are exactly the
     # regressions that would silently re-break the coordination tasks, and they need the company fork.
     gate_env="RUN_SCK_CHANNEL_FORK_TESTS=1 RUN_SCK_DRILL_ACCESS_TESTS=1 RUN_SCK_REVIEW_EVENT_FORK_TESTS=1 RUN_SCK_UPGRADE_FORK_TESTS=1"
-    gate_test="tests/dispatcher-sidecar.fork.test.ts tests/deployment-source.test.ts tests/deployment-source.fork.test.ts tests/effective-policy.fork.test.ts tests/deploy-drill.test.ts tests/deploy-drill-runner.test.ts tests/deploy-drill-node-host.test.ts tests/deploy-drill-access.fork.test.ts tests/review-events.test.ts tests/review-events.fork.test.ts tests/company-upgrades.fork.test.ts"
+    gate_test="tests/dispatcher-sidecar.fork.test.ts tests/deployment-source.test.ts tests/deployment-source.fork.test.ts tests/deploy-drill.test.ts tests/deploy-drill-runner.test.ts tests/deploy-drill-node-host.test.ts tests/deploy-drill-access.fork.test.ts tests/company-upgrades.fork.test.ts"
     gate_why='the sidecar-review gate runs on macOS only; it uses the local company fork'
     ;;
   recovery-fork)
@@ -45,9 +45,9 @@ case "$gate" in
     # is downloaded. The recovery-read file is opt-in, so the flag is set explicitly and the gate also insists on
     # the executed marker — a skipped file is not a pass.
     gate_env="RUN_COMPANY_PROOF_FORK_TESTS=1"
-    gate_test="tests/recovery-read.fork.test.ts tests/fault-budget.fork.test.ts"
+    gate_test="tests/fault-budget.fork.test.ts"
     gate_why='the recovery-fork gate runs on macOS only; it uses the local company fork'
-    gate_markers='recovery-read.fork executed fault-budget.fork executed'
+    gate_markers='fault-budget.fork executed'
     ;;
   *) echo "unknown gate: $gate (known: slow-pipe, sidecar-review, recovery-fork)" >&2; exit 2;;
 esac

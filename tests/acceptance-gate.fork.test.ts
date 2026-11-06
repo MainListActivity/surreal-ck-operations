@@ -112,7 +112,6 @@ const human = (over: Partial<AcceptanceCriterion> = {}): AcceptanceCriterion =>
   ({ id: 'AC-2', kind: 'human', required: true, layer: 'manual', evidence: 'review-signoff', verify: 'independent-review', risk: 'code', ...over });
 const proofOf = (c: ClaimResult | { task: TaskView; deliveryId: string; fence: number }, version = c.task.version) =>
   ({ taskId: c.task.id, deliveryId: c.deliveryId, fence: c.fence, expectedVersion: version });
-const goalFor = () => owner.createGoal({ text: 'SYS02 验收门测试目标', source: 'owner:test', key: key(), tier: 'quick' });
 const recordEvidence = (token: string, taskId: string, acId: string, sha: string, runId: string, source: Partial<AcceptanceEvidenceInput['source']> = {}) =>
   core.recordAcceptanceEvidence(token, {
     taskId, acId, sha, source: { provider: 'github-actions', runUrl: `https://github.com/o/r/actions/runs/${runId}`, ...source },
@@ -143,7 +142,6 @@ afterAll(async () => { await database.close(); rmSync(credDir, { recursive: true
 beforeEach(async () => { await database.db.query('UPDATE employee SET active_task = NONE;'); });
 
 fork('SYS02 AC01/AC06: criteria are versioned and required for new code deliveries; pre-gate rows are legacy', async () => {
-  const goal = await goalFor();
   const before = await core.acceptanceGate(tokens.owner);
   expect(before.enabled).toBe(false);
   await expect(core.setAcceptanceGate(tokens.product, { enabled: true, reason: '非 gm', expectedVersion: before.version, idempotencyKey: key() }))
@@ -160,15 +158,12 @@ fork('SYS02 AC01/AC06: criteria are versioned and required for new code deliveri
   const baselineTask = await core.createTask(tokens.owner, { title: '缺 criteria', context: '启用后创建的新代码任务', executorRole: 'engineering',
     reviewerRole: 'engineering', workIntent: { kind: 'code' }, idempotencyKey: key() });
   expect(baselineTask.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-BASE-IMPL-1', 'AC-BASE-IMPL-2']);
-  await expect(core.createDelivery(tokens.owner, { goalId: goal.id, title: '重复 id', spec: '重复 AC 必须被拒绝，不能静默去重。',
+  await expect(core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: '重复 id', context: '重复 AC 必须被拒绝，不能静默去重。',
     acceptanceCriteria: [machine({ id: 'AC-1' }), machine({ id: 'AC-1' })], idempotencyKey: key() }))
     .rejects.toMatchObject({ code: 'invalid' });
-  const [impl, release, deploy] = await core.createDelivery(tokens.owner, { goalId: goal.id, title: 'SYS02 链', spec: '三腿共享版本化 criteria，按 legs 分配。',
+  const impl = await core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: 'SYS02 链', context: '三腿共享版本化 criteria，按 legs 分配。',
     acceptanceCriteria: [machine({ id: 'AC-1' }), human({ id: 'AC-2', legs: ['implement'] })], idempotencyKey: key() });
   expect(impl.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-1', 'AC-2']);
-  expect(release.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-1', 'AC-BASE-RELEASE-2']);
-  expect(deploy.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-1', 'AC-BASE-DEPLOY-1', 'AC-BASE-DEPLOY-2']);
-  expect(impl.acceptanceChain).toBe(release.acceptanceChain);
   // The legacy row keeps the old path: submit and accept without criteria after the gate is enabled.
   const claim = await core.claim(tokens['eng-a'], legacy.id);
   await core.submit(tokens['eng-a'], proofOf(claim), { text: '旧任务在门禁启用后提交：legacy 保留旧路径。', idempotencyKey: key() });
@@ -179,11 +174,8 @@ fork('SYS02 AC01/AC06: criteria are versioned and required for new code deliveri
 
 fork('SYS02 R1: pre-gate delivery legs stay legacy after enabling; post-gate deliveries still need evidence', async () => {
   await ensureGate(false);
-  const goal = await goalFor();
-  const [impl, release, deploy] = await core.createDelivery(tokens.owner, { goalId: goal.id, title: 'R1 legacy 链', spec: '门禁关闭期间创建的交付三腿在启用后保留旧路径。', idempotencyKey: key() });
+  const impl = await core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: 'R1 legacy 链', context: '门禁关闭期间创建的交付三腿在启用后保留旧路径。', idempotencyKey: key() });
   expect(impl.acceptanceLegacy).toBe(true);
-  expect(release.acceptanceLegacy).toBe(true);
-  expect(deploy.acceptanceLegacy).toBe(true);
   expect(impl.acceptanceCriteria?.length ?? 0).toBeGreaterThan(0);
   await ensureGate(true);
   const runLeg = async (task: TaskView, submitter: string, reviewer: string) => {
@@ -194,10 +186,8 @@ fork('SYS02 R1: pre-gate delivery legs stay legacy after enabling; post-gate del
     expect((await core.getTask(tokens.owner, task.id)).state).toBe('done');
   };
   await runLeg(impl, tokens['eng-a'], tokens['eng-b']);
-  await runLeg(release, tokens['eng-a'], tokens.product);
-  await runLeg(deploy, tokens['eng-a'], tokens.qa);
   // A delivery created after enabling still needs machine evidence and is refused without it.
-  const [post] = await core.createDelivery(tokens.owner, { goalId: goal.id, title: 'R1 post-gate', spec: '启用后创建的新交付仍必须补机器证据才能提交。', idempotencyKey: key() });
+  const post = await core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: 'R1 post-gate', context: '启用后创建的新交付仍必须补机器证据才能提交。', idempotencyKey: key() });
   const postClaim = await core.claim(tokens['eng-a'], post.id);
   await expect(core.submit(tokens['eng-a'], proofOf(postClaim), { text: '启用后新交付没有机器证据，提交必须被拒绝。', idempotencyKey: key(), acceptance: { sha: 'post-head' } }))
     .rejects.toMatchObject({ code: 'invalid' });
@@ -233,11 +223,8 @@ fork('SYS02 N1: the declared environment binds submit, accept and adapter-verifi
 
 fork('SYS02 N1: an environment requirement belongs to the deploy leg only', async () => {
   await ensureGate();
-  const goal = await goalFor();
-  const [impl, release, deploy] = await core.createDelivery(tokens.owner, { goalId: goal.id, title: 'N1 腿环境', spec: '环境要求只落在部署腿：实现腿与上线申请腿不得携带环境要求。', acceptanceEnvironment: 'production', idempotencyKey: key() });
-  expect(impl.acceptanceEnvironment).toBeUndefined();
-  expect(release.acceptanceEnvironment).toBeUndefined();
-  expect(deploy.acceptanceEnvironment).toBe('production');
+  const impl = await core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: 'N1 腿环境', context: '环境要求只落在部署腿：实现腿与上线申请腿不得携带环境要求。', acceptanceEnvironment: 'production', idempotencyKey: key() });
+  expect(impl.acceptanceEnvironment).toBe('production');
   // A standalone task that is not the deploy leg refuses the requirement.
   await expect(core.createTask(tokens.owner, { title: 'N1 任务环境', context: '实现腿不能带环境要求。', executorRole: 'engineering',
     reviewerRole: 'engineering', workIntent: { kind: 'code' }, acceptanceEnvironment: 'production', idempotencyKey: key() }))
@@ -250,8 +237,7 @@ fork('SYS02 N1: an environment requirement belongs to the deploy leg only', asyn
 
 fork('SYS02 relay: an executor cannot introduce an environment on a generic task', async () => {
   await ensureGate();
-  const goal = await goalFor();
-  const [impl] = await core.createDelivery(tokens.owner, { goalId: goal.id, title: 'N1 通用 CI', spec: '通用 CI 任务不得由提交方自行声明 production 环境要求。', idempotencyKey: key() });
+  const impl = await core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: 'N1 通用 CI', context: '通用 CI 任务不得由提交方自行声明 production 环境要求。', idempotencyKey: key() });
   expect(impl.acceptanceEnvironment).toBeUndefined();
   const claim = await core.claim(tokens['eng-a'], impl.id);
   fake.setRun('9103', 'n1-generic-head');
@@ -262,8 +248,7 @@ fork('SYS02 relay: an executor cannot introduce an environment on a generic task
 
 fork('SYS02 N2: a returned attempt cannot reuse old machine evidence; re-recording binds the new attempt', async () => {
   await ensureGate();
-  const goal = await goalFor();
-  const [impl] = await core.createDelivery(tokens.owner, { goalId: goal.id, title: 'N2 attempt 链', spec: '退回后的新 attempt 不得静默复用旧机器证据。', idempotencyKey: key() });
+  const impl = await core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: 'N2 attempt 链', context: '退回后的新 attempt 不得静默复用旧机器证据。', idempotencyKey: key() });
   const first = await core.claim(tokens['eng-a'], impl.id);
   fake.setRun('9102', 'n2-head');
   const recorded = await recordEvidence(tokens['eng-a'], impl.id, 'AC-BASE-IMPL-1', 'n2-head', '9102');
@@ -286,8 +271,7 @@ fork('SYS02 N2: a returned attempt cannot reuse old machine evidence; re-recordi
 
 fork('SYS02 N2: a checkpoint between evidence and submit does not invalidate the attempt', async () => {
   await ensureGate();
-  const goal = await goalFor();
-  const [impl] = await core.createDelivery(tokens.owner, { goalId: goal.id, title: 'N2 checkpoint', spec: 'heartbeat/checkpoint 的版本变化不等于重新提交。', idempotencyKey: key() });
+  const impl = await core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: 'N2 checkpoint', context: 'heartbeat/checkpoint 的版本变化不等于重新提交。', idempotencyKey: key() });
   const claim = await core.claim(tokens['eng-a'], impl.id);
   fake.setRun('9104', 'n2-checkpoint-head');
   await recordEvidence(tokens['eng-a'], impl.id, 'AC-BASE-IMPL-1', 'n2-checkpoint-head', '9104');
@@ -299,21 +283,20 @@ fork('SYS02 N2: a checkpoint between evidence and submit does not invalidate the
 
 fork('SYS02 C1: custom optional or human-only criteria cannot remove the server baseline; zero evidence cannot reach review', async () => {
   await ensureGate();
-  const goal = await goalFor();
-  const [impl] = await core.createDelivery(tokens.owner, { goalId: goal.id, title: 'C1 基线', spec: '自定义可选机器 AC 不得移除必需基线；零证据不得进入 review。',
+  const impl = await core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: 'C1 基线', context: '自定义可选机器 AC 不得移除必需基线；零证据不得进入 review。',
     acceptanceCriteria: [{ id: 'AC-OPTIONAL', kind: 'machine', required: false, layer: 'ci', evidence: 'ci-run', verify: 'ci' }], idempotencyKey: key() });
   expect(impl.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-OPTIONAL', 'AC-BASE-IMPL-1', 'AC-BASE-IMPL-2']);
   const claim = await core.claim(tokens['eng-a'], impl.id);
   await expect(core.submit(tokens['eng-a'], proofOf(claim), { text: '零可信机器证据的提交必须被服务端基线拒绝，不能进入复核。', idempotencyKey: key(), acceptance: { sha: 'optional-head' } }))
     .rejects.toMatchObject({ code: 'invalid' });
   expect((await core.getTask(tokens.owner, impl.id)).state).toBe('doing');
-  await expect(core.createDelivery(tokens.owner, { goalId: goal.id, title: 'C1 降级', spec: '同 ID 的 required:false 不得覆盖服务端基线。',
+  await expect(core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: 'C1 降级', context: '同 ID 的 required:false 不得覆盖服务端基线。',
     acceptanceCriteria: [{ id: 'AC-BASE-IMPL-1', kind: 'machine', required: false, layer: 'ci', evidence: 'ci-run', verify: 'ci' }], idempotencyKey: key() }))
     .rejects.toMatchObject({ code: 'invalid' });
-  const [humanOnly] = await core.createDelivery(tokens.owner, { goalId: goal.id, title: 'C1 仅人工', spec: '仅人工 AC 的集合仍必须补上必需机器 AC。',
+  const humanOnly = await core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: 'C1 仅人工', context: '仅人工 AC 的集合仍必须补上必需机器 AC。',
     acceptanceCriteria: [human({ id: 'AC-H' })], idempotencyKey: key() });
   expect(humanOnly.acceptanceCriteria?.map(c => c.id)).toContain('AC-BASE-IMPL-1');
-  const [emptyCriteria] = await core.createDelivery(tokens.owner, { goalId: goal.id, title: 'C1 空 criteria', spec: '无自定义 criteria 的新代码交付必须得到服务端基线，不能是空集。', idempotencyKey: key() });
+  const emptyCriteria = await core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: 'C1 空 criteria', context: '无自定义 criteria 的新代码交付必须得到服务端基线，不能是空集。', idempotencyKey: key() });
   expect(emptyCriteria.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-BASE-IMPL-1', 'AC-BASE-IMPL-2']);
   fake.setRun('12', 'optional-head');
   await recordEvidence(tokens['eng-a'], impl.id, 'AC-BASE-IMPL-1', 'optional-head', '12');
@@ -324,8 +307,7 @@ fork('SYS02 C1: custom optional or human-only criteria cannot remove the server 
 
 fork('SYS02 AC02/AC03: evidence is server-verified and head-bound; submit and independent accept call the same evaluator', async () => {
   await ensureGate();
-  const goal = await goalFor();
-  const [impl] = await core.createDelivery(tokens.owner, { goalId: goal.id, title: '证据链', spec: '机器证据必须来自可信 run，人工 AC 由独立复核签署。',
+  const impl = await core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: '证据链', context: '机器证据必须来自可信 run，人工 AC 由独立复核签署。',
     acceptanceCriteria: [machine(), human()], idempotencyKey: key() });
   const claim = await core.claim(tokens['eng-a'], impl.id);
   // A caller that does not hold the task lease and is not gm cannot write evidence.
@@ -359,8 +341,7 @@ fork('SYS02 AC02/AC03: evidence is server-verified and head-bound; submit and in
 
 fork('SYS02 AC05: report.md auto-submit and a missing head cannot bypass the submit gate', async () => {
   await ensureGate();
-  const goal = await goalFor();
-  const [impl] = await core.createDelivery(tokens.owner, { goalId: goal.id, title: 'report.md 链路', spec: 'report.md 只是 evidence.text，不能替代结构化证据。',
+  const impl = await core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: 'report.md 链路', context: 'report.md 只是 evidence.text，不能替代结构化证据。',
     acceptanceCriteria: [machine()], idempotencyKey: key() });
   const claim = await core.claim(tokens['eng-a'], impl.id);
   await expect(core.submit(tokens['eng-a'], proofOf(claim), { text: 'report.md 自动提交时只有文本，没有 acceptance.head 与可信 run。', idempotencyKey: key() }))
@@ -368,33 +349,6 @@ fork('SYS02 AC05: report.md auto-submit and a missing head cannot bypass the sub
   expect((await core.getTask(tokens.owner, impl.id)).state).toBe('doing');
   // Release the kept lease: a refused submit must not leave the employee leased and cascade into later tests.
   await core.release(tokens['eng-a'], proofOf(claim), { text: '测试清理：被拒后释放租约，后续用例从干净状态开始。', idempotencyKey: key() });
-});
-
-fork('SYS02 AC03/AC05: the release baseline requires a human sign-off, so Jev cannot auto-approve a machine-only release', async () => {
-  await ensureGate();
-  // A standalone release task is ready. A create_delivery release leg waits for its implementation leg, which is not this test.
-  const release = await core.createTask(tokens.owner, { title: 'Jev 机器链', context: 'release 只有机器 AC 时 Jev 可自动批准。',
-    kind: 'release', executorRole: 'engineering', reviewerRole: 'product', acceptanceCriteria: [machine({ id: 'AC-1' })], idempotencyKey: key() });
-  const claim = await core.claim(tokens['eng-a'], release.id);
-  fake.setRun('2', 'rel-head');
-  await recordEvidence(tokens['eng-a'], release.id, 'AC-1', 'rel-head', '2');
-  await core.submit(tokens['eng-a'], proofOf(claim), { text: '上线申请：本 release 只有机器 AC，CI 已通过，无人工签署要求。', idempotencyKey: key(), acceptance: { sha: 'rel-head' } });
-  const before = await core.getTask(tokens.owner, release.id);
-  // The server release baseline adds AC-BASE-RELEASE-2 (human independent sign-off): Jev is a machine actor and is blocked.
-  expect(await workforce.jevAccept(release.id, before.version, 'Jev 测试：release 基线含人工签署。')).toBe(false);
-  expect((await core.getTask(tokens.owner, release.id)).state).toBe('review');
-  expect((await core.history(tokens.owner, release.id)).some(h => h.action === 'jev_acceptance_blocked')).toBe(true);
-  const humanRelease = await core.createTask(tokens.owner, { title: 'Jev 人工链', context: 'release 带人工 AC，Jev 必须交运营。',
-    kind: 'release', executorRole: 'engineering', reviewerRole: 'product',
-    acceptanceCriteria: [machine({ id: 'AC-1' }), human({ id: 'AC-9' })], idempotencyKey: key() });
-  const claim2 = await core.claim(tokens['eng-a'], humanRelease.id);
-  fake.setRun('3', 'rel2-head');
-  await recordEvidence(tokens['eng-a'], humanRelease.id, 'AC-1', 'rel2-head', '3');
-  await core.submit(tokens['eng-a'], proofOf(claim2), { text: '上线申请：本 release 含人工验收 AC，必须由运营签署，Jev 不得自动批准。', idempotencyKey: key(), acceptance: { sha: 'rel2-head' } });
-  const before2 = await core.getTask(tokens.owner, humanRelease.id);
-  expect(await workforce.jevAccept(humanRelease.id, before2.version, 'Jev 测试：存在人工 AC。')).toBe(false);
-  expect((await core.getTask(tokens.owner, humanRelease.id)).state).toBe('review');
-  expect((await core.history(tokens.owner, humanRelease.id)).some(h => h.action === 'jev_acceptance_blocked')).toBe(true);
 });
 
 fork('SYS02 AC03/AC06: the owner gate refuses an out-of-band review without machine evidence, then the owner signs', async () => {
@@ -420,8 +374,7 @@ fork('SYS02 AC03/AC06: the owner gate refuses an out-of-band review without mach
 
 fork('SYS02 AC04: a real in-progress probe satisfies a runtime AC; a post-job or mock record does not', async () => {
   await ensureGate();
-  const goal = await goalFor();
-  const [impl] = await core.createDelivery(tokens.owner, { goalId: goal.id, title: '运行中探针', spec: '运行中可读必须由真实 CI 探针在作业进行中取回。',
+  const impl = await core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: '运行中探针', context: '运行中可读必须由真实 CI 探针在作业进行中取回。',
     acceptanceCriteria: [{ id: 'AC-1', kind: 'machine', required: true, layer: 'runtime', evidence: 'probe', verify: 'probe:running-channel' }],
     idempotencyKey: key() });
   const claim = await core.claim(tokens['eng-a'], impl.id);
@@ -476,8 +429,7 @@ fork('SYS02 AC04: a real in-progress probe satisfies a runtime AC; a post-job or
 
 fork('SYS02 AC05: an expired artifact is refused; a live artifact of the same head is accepted', async () => {
   await ensureGate();
-  const goal = await goalFor();
-  const [impl] = await core.createDelivery(tokens.owner, { goalId: goal.id, title: 'artifact 证据', spec: 'artifact 必须未过期且属于同一 head。',
+  const impl = await core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: 'artifact 证据', context: 'artifact 必须未过期且属于同一 head。',
     acceptanceCriteria: [{ id: 'AC-1', kind: 'machine', required: true, layer: 'ci', evidence: 'artifact', verify: 'artifact', risk: 'packaging' }],
     idempotencyKey: key() });
   const claim = await core.claim(tokens['eng-a'], impl.id);
@@ -499,8 +451,7 @@ fork('SYS02 AC05: an expired artifact is refused; a live artifact of the same he
 fork('SYS02 AC02/AC03: the PR gate head is authoritative; an old declared head with old evidence is refused', async () => {
   await ensureGate();
   const gated = new SurrealCompanyCore(database, { acceptance: { adapter: fake }, submitCheck: async () => ({ head: 'pr-head' }) });
-  const goal = await goalFor();
-  const [impl] = await gated.createDelivery(tokens.owner, { goalId: goal.id, title: 'B2 head 链', spec: '提交的 acceptance head 必须等于 PR 门禁核验的实际 head。',
+  const impl = await gated.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: 'B2 head 链', context: '提交的 acceptance head 必须等于 PR 门禁核验的实际 head。',
     acceptanceCriteria: [machine()], idempotencyKey: key() });
   const claim = await gated.claim(tokens['eng-a'], impl.id);
   fake.setRun('8', 'old-head');
@@ -515,8 +466,7 @@ fork('SYS02 AC02/AC03: the PR gate head is authoritative; an old declared head w
 
 fork('RB01: the new state is additive; an old reader sees the old states, and the rollback boundary is explicit', async () => {
   await ensureGate();
-  const goal = await goalFor();
-  const [impl] = await core.createDelivery(tokens.owner, { goalId: goal.id, title: 'RB01 链路', spec: '回滚演练：旧阅读器忽略新字段；旧门禁关闭时可绕过，必须排空。',
+  const impl = await core.createTask(tokens.owner, { executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' }, title: 'RB01 链路', context: '回滚演练：旧阅读器忽略新字段；旧门禁关闭时可绕过，必须排空。',
     acceptanceCriteria: [machine(), human()], idempotencyKey: key() });
   const claim = await core.claim(tokens['eng-a'], impl.id);
   fake.setRun('6', 'rb-head');

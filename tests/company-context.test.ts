@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { COMPANY_PART_BYTES, companyBlock, companyParts, reassembleCompany } from '../src/company-context.ts';
 import { CompanyError } from '../src/core-errors.ts';
-import type { CompanyBrief, CompanyPart, GoalView, ProjectView } from '../src/contracts.ts';
+import type { CompanyBrief, CompanyPart, ProjectView } from '../src/contracts.ts';
 import { parseContextInput } from '../src/query-input.ts';
 import { RESPONSE_BUDGET_BYTES, answerBytes } from '../src/response-budget.ts';
 
@@ -19,9 +19,6 @@ function textOf(bytes: number, prefix = ''): string {
   return text;
 }
 
-const goal = (index: number, brief: string): GoalView => ({
-  id: `goal-${index}`, title: `目标 ${index}`, brief, state: 'active', tier: 'standard', tasks: {},
-});
 
 const project = (index: number, runbook: string): ProjectView => ({
   id: `project-${index}`, name: `项目 ${index}`, repoPath: `/fixture/project-${index}`, defaultBranch: 'main', release: 'local',
@@ -32,7 +29,6 @@ function briefOf(parts: { directions?: string[]; goals?: string[]; projects?: st
   return {
     paused: parts.paused ?? false,
     directions: (parts.directions ?? []).map((text, index) => ({ text, source: `owner:fixture-${index}`, at: '2026-10-20T00:00:00.000Z' })),
-    goals: (parts.goals ?? []).map((brief, index) => goal(index, brief)),
     projects: (parts.projects ?? []).map((runbook, index) => project(index, runbook)),
   };
 }
@@ -54,7 +50,6 @@ test('the company block parts reassemble exactly for the 31 KiB sample of the op
   // The operations sample is a 30683-byte company block: directions, goals and projects with long texts.
   const brief = briefOf({
     directions: [textOf(9000, '方向一 '), textOf(6000, '方向二 🙂 ')],
-    goals: [textOf(7000, '目标简报 '), textOf(3000, '第二目标 ')],
     projects: [textOf(4000, '项目运行手册 "quoted" ')],
     paused: true,
   });
@@ -64,14 +59,13 @@ test('the company block parts reassemble exactly for the 31 KiB sample of the op
   expect(items.get('meta\0company')!.value).toEqual({ paused: true });
   expect(items.get('directions\0direction-0')!.value).toEqual(JSON.parse(JSON.stringify(brief.directions[0])));
   expect(items.get('directions\0direction-1')!.value).toEqual(JSON.parse(JSON.stringify(brief.directions[1])));
-  expect(items.get('goals\0goal-0')!.value).toEqual(JSON.parse(JSON.stringify(brief.goals[0])));
   expect(items.get('projects\0project-0')!.value).toEqual(JSON.parse(JSON.stringify(brief.projects[0])));
-  expect(items.size).toBe(1 + brief.directions.length + brief.goals.length + brief.projects.length);
+  expect(items.size).toBe(1 + brief.directions.length + brief.projects.length);
 });
 
 test('a 128 KiB block of Chinese, emoji and one very long direction reassembles whole, and every part fits a page', () => {
   const huge = textOf(200 * 1024, '单方向超长 🙂 ');
-  const brief = briefOf({ directions: [huge, textOf(128 * 1024, '第二方向 ')], goals: [textOf(40 * 1024, '目标 🙂 ')], projects: [textOf(8 * 1024)] });
+  const brief = briefOf({ directions: [huge, textOf(128 * 1024, '第二方向 ')], projects: [textOf(8 * 1024)] });
   const parts = companyParts(brief);
   expectEveryPartFits(parts);
   const longest = parts.filter(part => part.section === 'directions' && part.key === 'direction-0');
@@ -96,10 +90,9 @@ test('a growing project set (200 projects with long runbooks) pages into parts t
 });
 
 test('a section narrows the parts to that section, and the meta part is always present', () => {
-  const brief = briefOf({ directions: ['方向'], goals: ['目标'], projects: ['项目'], paused: true });
-  expect(companyParts(brief, 'goals').map(part => `${part.section}/${part.key}`)).toEqual(['meta/company', 'goals/goal-0']);
+  const brief = briefOf({ directions: ['方向'], projects: ['项目'], paused: true });
   expect(companyBlock(brief, 'directions')).toEqual({ paused: true, directions: brief.directions });
-  expect(Object.keys(companyBlock(brief))).toEqual(['paused', 'directions', 'goals', 'projects']);
+  expect(Object.keys(companyBlock(brief))).toEqual(['paused', 'directions', 'projects']);
 });
 
 test('the reader refuses a missing part, a repeated part, a gap, an altered text and a wrong length', () => {

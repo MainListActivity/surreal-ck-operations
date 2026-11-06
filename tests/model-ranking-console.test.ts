@@ -97,10 +97,3 @@ test('browser saves without a refresh interval and confirms immediate applicatio
 
 test('owner save accepts interval-free settings from the new clients',async()=>{const f=fixture();expect((await f.request('api/model-ranking',{rules:''})).status).toBe(200);expect(f.resets).toEqual([5]);});
 
-test('historical goal resolution requires the owner console capability and same origin',async()=>{
- const f=fixture();const body={goalId:'g',taskId:'old',goalVersion:0,taskVersion:1,disposition:'fixture',replacementTaskIds:[],reason:'老板核对历史测试夹具后处置',key:'fixture-resolution'};
- expect((await f.fetch(new Request('http://localhost/o/wrong/api/goal-retired-resolution',{method:'POST',body:JSON.stringify(body)}))).status).toBe(404);
- expect((await f.request('api/goal-retired-resolution',body,'https://other.example')).status).toBe(403);
- // A supplied actor cannot turn malformed input into a valid owner mutation.
- expect((await f.request('api/goal-retired-resolution',{actor:'owner:forged'},'http://localhost')).status).toBe(409);
-});

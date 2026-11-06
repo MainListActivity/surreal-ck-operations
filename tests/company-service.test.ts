@@ -237,11 +237,7 @@ function cleanup(f: Fixture) {
  * This runs the shipped guards on the repository root and on the plugin vendor tree.
  */
 const SWITCH_GUARDS: Array<[string, string]> = [
-  ['review-wait-guard.sh', 'review_wait_target_supported'],
-  ['independence-guard.sh', 'independence_target_supported'],
-  ['policy-guard.sh', 'policy_target_supported'],
-  ['goal-workspace-guard.sh', 'goal_workspace_target_supported'],
-  ['standby-relay-guard.sh', 'standby_relay_target_supported'],
+  ['acceptance-guard.sh', 'acceptance_target_supported'],
 ];
 
 function runSwitchGuard(script: string, entry: string, root: string, scope = 'full') {
@@ -263,7 +259,7 @@ test('every switch guard accepts the real checkout and its plugin vendor tree', 
     const releaseResult = runSwitchGuard(script, entry, ROOT, 'full');
     expect(`${script} ${ROOT} full: ${releaseResult.stderr.toString().trim()}`).toBe(`${script} ${ROOT} full: `);
     expect(releaseResult.exitCode).toBe(0);
-    const vendorScope = script === 'standby-relay-guard.sh' ? 'core' : 'full';
+    const vendorScope = 'full';
     const vendorResult = runSwitchGuard(script, entry, vendor, vendorScope);
     expect(`${script} ${vendor} ${vendorScope}: ${vendorResult.stderr.toString().trim()}`).toBe(`${script} ${vendor} ${vendorScope}: `);
     expect(vendorResult.exitCode).toBe(0);
@@ -406,19 +402,19 @@ test('the gate set follows the release version, so a rollback to an older releas
   }
 });
 
-test('install refuses a target whose code lacks the review-wait contract, before any switch side effect', () => {
+test('install refuses a target whose code lacks the acceptance baseline contract, before any switch side effect', () => {
   const f = fixture();
   try {
     // Everything else about this target is valid (sha named release, fake ancestry and content, a passing gate record); only the
-    // RW06 contract is missing, which is exactly the pre-RW06 target the product drill showed unlocks a review wait into ready.
-    const old = makeRelease(f.releases, SHAS.incompatible, false, false);
+    // SYS02 baseline is missing, which is exactly the pre-SYS02 target the guard exists to refuse.
+    const old = makeRelease(f.releases, SHAS.incompatible, false, true);
+    writeFileSync(join(old, 'src', 'acceptance.ts'), 'export {};\n');
     writeGateRecord(f.serviceHome, SHAS.incompatible);
     const result = runInstall(f, { SCK_RELEASE_KEEP: '1' }, old);
     expect(result.exitCode).toBe(1);
     expect(result.stderr.toString()).toContain('refused:');
-    expect(result.stderr.toString()).toContain('复核等待');
+    expect(result.stderr.toString()).toContain('验收基线');
     expect(result.stderr.toString()).toContain(`target=${old}`);
-    expect(result.stderr.toString()).toContain('waiting items=unknown');
     // No side effect: active still points at the previous release, no plist was written, no release pruned, Paseo untouched.
     expect(activeTarget(f)).toBe(join(f.releases, SHAS.previous));
     expect(existsSync(join(f.home, 'Library', 'LaunchAgents', 'org.surrealck.company-mcp.plist'))).toBe(false);
@@ -428,32 +424,6 @@ test('install refuses a target whose code lacks the review-wait contract, before
     cleanup(f);
   }
 });
-
-test('install refuses a target whose code lacks the effective-policy contract, before any switch side effect', () => {
-  const f = fixture();
-  try {
-    // SYS06 C1: this target satisfies every other guard (RW06 / SYS02 / IR06) and its release record is valid; only the
-    // policy execution layer is missing. Production data may already carry policy rows, task policy_*/lease_policy_*
-    // registrations and tasks quarantined as blocked+blocked_to=gm, so this is exactly the target that must be refused
-    // before the bin copies, the active symlink, the plugin repoint, the MCP restart or pruning.
-    const noPolicy = makeRelease(f.releases, SHAS.nopolicy, false, true, false);
-    writeGateRecord(f.serviceHome, SHAS.nopolicy);
-    const result = runInstall(f, { SCK_RELEASE_KEEP: '1' }, noPolicy);
-    expect(result.exitCode).toBe(1);
-    expect(result.stderr.toString()).toContain('refused:');
-    expect(result.stderr.toString()).toContain('有效策略执行层');
-    expect(result.stderr.toString()).toContain(`target=${noPolicy}`);
-    expect(result.stderr.toString()).toContain('affected tasks=unknown');
-    // No side effect: active still points at the previous release, no plist was written, no release pruned, Paseo untouched.
-    expect(activeTarget(f)).toBe(join(f.releases, SHAS.previous));
-    expect(existsSync(join(f.home, 'Library', 'LaunchAgents', 'org.surrealck.company-mcp.plist'))).toBe(false);
-    expect(existsSync(join(f.releases, SHAS.old))).toBe(true);
-    expect(existsSync(f.paseoLog) ? readFileSync(f.paseoLog, 'utf8').trim() : '').toBe('');
-  } finally {
-    cleanup(f);
-  }
-});
-
 test('an open file handle protects a candidate release from pruning', () => {
   const f = fixture();
   try {

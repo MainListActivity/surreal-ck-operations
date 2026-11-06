@@ -51,43 +51,30 @@ try {
     'tests/artifact-reclaim.test.ts', 'tests/artifact-sweeper.test.ts', 'tests/artifact-reclaim.fork.test.ts',
     'tests/magpie-quota.test.ts', 'tests/agent-model.test.ts', 'tests/quota-store.fork.test.ts',
     'tests/mcp-run-reclaim.fork.test.ts', 'tests/paseo-dead-paths.test.ts',
-    'tests/db.integration.test.ts', 'tests/v3.integration.test.ts',
-    'tests/implementer-binding.integration.test.ts', 'tests/contributor-cas.integration.test.ts',
-    'tests/dispatcher-sidecar.fork.test.ts', 'tests/dispatch-episode.fork.test.ts', 'tests/review-capacity-replay.fork.test.ts', 'tests/standby-relay.fork.test.ts',
-    'tests/memory-lru.fork.test.ts', 'tests/idle-sessions.fork.test.ts', 'tests/ops-denial-circuit.fork.test.ts', 'tests/ops-denial-circuit.test.ts', 'tests/company-db-runtime.test.ts', 'tests/host-resources.test.ts', 'tests/scratch-gc.test.ts', 'tests/test-runner-cleanup.test.ts',
+    'tests/db.integration.test.ts', 'tests/dispatcher-sidecar.fork.test.ts', 'tests/dispatch-episode.fork.test.ts', 'tests/memory-lru.fork.test.ts', 'tests/idle-sessions.fork.test.ts', 'tests/ops-denial-circuit.fork.test.ts', 'tests/ops-denial-circuit.test.ts', 'tests/company-db-runtime.test.ts', 'tests/host-resources.test.ts', 'tests/scratch-gc.test.ts', 'tests/test-runner-cleanup.test.ts',
     'tests/quota-turn.test.ts', 'tests/turn-closeout.test.ts', 'tests/quota-scoring.fork.test.ts',
-    'tests/session-history.test.ts', 'tests/factory-queue.test.ts', 'tests/dispatcher-sidecar.test.ts', 'tests/dispatcher-manager-routing.test.ts', 'tests/sidecar.test.ts', 'tests/sidecar-quota-gate.fork.test.ts',
+    'tests/session-history.test.ts', 'tests/factory-queue.test.ts', 'tests/dispatcher-sidecar.test.ts', 'tests/sidecar.test.ts', 'tests/sidecar-quota-gate.fork.test.ts',
     'tests/sidecar-late-lease.test.ts', 'tests/mcp.transport.test.ts', 'tests/worktrees.test.ts',
-    'tests/owner-aging.fork.test.ts', 'tests/pipelines.fork.test.ts', 'tests/story-author.fork.test.ts', 'tests/cinematography.fork.test.ts', 'tests/owner-reassign.fork.test.ts', 'tests/pr-gate.fork.test.ts', 'tests/loop-breaker.fork.test.ts', 'tests/owner-commands.fork.test.ts',
-    'tests/goal-acceptance-repair.integration.test.ts', 'tests/query-paging.integration.test.ts', 'tests/acceptance-gate.fork.test.ts',
+    'tests/owner-aging.fork.test.ts', 'tests/story-author.fork.test.ts', 'tests/cinematography.fork.test.ts', 'tests/owner-reassign.fork.test.ts', 'tests/pr-gate.fork.test.ts', 'tests/owner-commands.fork.test.ts',
+    'tests/query-paging.integration.test.ts', 'tests/acceptance-gate.fork.test.ts',
     'tests/deployment-source.fork.test.ts',
     'tests/input-bounds.integration.test.ts',
-    'tests/rollback-isolation.fork.test.ts', 'tests/rollback-isolation-independence.fork.test.ts', 'tests/rollback-isolation-policy.fork.test.ts', 'tests/null-absent.fork.test.ts',
-    'tests/disposition.integration.fork.test.ts', 'tests/disposition-channel.fork.test.ts', 'tests/disposition-rollback-isolation.fork.test.ts',
+    'tests/rollback-isolation.fork.test.ts', 'tests/null-absent.fork.test.ts',
     // SYS04：新增故障状态（fault_incident / fault_episode / fault_budget / fault_repair）的回滚隔离演练，
     // 与上面的同形态先例共用 tests/fixtures/rb01-old-runner.ts 的旧版运行时驱动器，同样只在
     // RUN_SCK_ROLLBACK_FORK_TESTS=1 时运行。
-    'tests/fault-rollback-isolation.fork.test.ts',
     // SYS04：故障分类与持久预算、真实 TLS 传输的回归。
-    'tests/company-upgrades.fork.test.ts', 'tests/company-upgrade-console.test.ts', 'tests/task-recovery.test.ts', 'tests/task-recovery.fork.test.ts', 'tests/faults.test.ts', 'tests/fault-budget.fork.test.ts', 'tests/fault-transport.fork.test.ts',
-    // SYS05：时间/外部事件等待状态机、调度零派工与租约结束回收；fork 用例在隔离库验证原子进入、一次释放与版本锁。
-    'tests/waits.test.ts', 'tests/wait-dispatch.test.ts', 'tests/wait-cleanup.test.ts', 'tests/wait-store.fork.test.ts',
+    'tests/company-upgrades.fork.test.ts', 'tests/company-upgrade-console.test.ts', 'tests/faults.test.ts', 'tests/fault-budget.fork.test.ts', // SYS05：时间/外部事件等待状态机、调度零派工与租约结束回收；fork 用例在隔离库验证原子进入、一次释放与版本锁。
     // SYS07：目标终验图、成果证据、只读看板/指标与最终验收阻断；隔离库验证 CAS、分页、权限与历史不回写。
-    'tests/goal-governance.test.ts', 'tests/goal-governance.fork.test.ts',
     // SYS07：needs_repair / goal_outcome / goal_evidence 在真实上一版运行时下的回滚隔离演练（RUN_SCK_ROLLBACK_FORK_TESTS）。
-    'tests/goal-rollback-isolation.fork.test.ts',
     // QA 的 SYS03 独立重演（真实 sck → 真实 sidecar → 真实 core → fork 库）；本轮起纳入本 lane 的回归，见该文件头部说明。
-    'tests/disposition-rehearsal.fork.test.ts',
-    'tests/rollback-isolation.fork.test.ts', 'tests/rollback-isolation-independence.fork.test.ts', 'tests/null-absent.fork.test.ts',
+    'tests/rollback-isolation.fork.test.ts', 'tests/null-absent.fork.test.ts',
     'tests/snapshot-quota.fork.test.ts',
-    'tests/effective-policy.test.ts', 'tests/effective-policy.fork.test.ts', 'tests/effective-policy-plan-coverage.fork.test.ts',
-    'tests/independence.test.ts', 'tests/independence-policy.fork.test.ts', 'tests/independence-check.fork.test.ts',
     // SYS-INT：演练工具的 Node 宿主门禁与 deployDrillRun/Status 权限回归（自建隔离库，不启动生产演练）。
     'tests/deploy-drill.test.ts', 'tests/deploy-drill-runner.test.ts', 'tests/deploy-drill-node-host.test.ts', 'tests/deploy-drill-access.fork.test.ts',
     // SYS-INT：QA 评审协同的持久事件唤醒（自建隔离库；订阅/信号/事件只解除协同任务自己的 feedback 等待）。
-    'tests/review-events.test.ts', 'tests/review-events.fork.test.ts',
     // 老板对在途任务追加验收要求（自建隔离库；验证租约不中断、门禁不动、通知可读可 ack、幂等与版本 CAS）。
-    'tests/task-acceptance-amend.fork.test.ts',  ];
+    ];
   const test = Bun.spawn([process.execPath, 'test', ...targets], { detached: true, stdout: 'inherit', stderr: 'inherit', env: {
     ...process.env, SCK_PRODUCT_ENV: '/dev/null', SURREAL_URL: `ws://127.0.0.1:${port}/rpc`, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: rootPassword,
     RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_PIPELINE_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_UPGRADE_FORK_TESTS: '1', RUN_SCK_LOOP_BREAKER_TESTS: '1', RUN_SCK_STANDBY_RELAY_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_ROLLBACK_FORK_TESTS: '1', RUN_SCK_DRILL_ACCESS_TESTS: '1', RUN_SCK_REVIEW_EVENT_FORK_TESTS: '1',

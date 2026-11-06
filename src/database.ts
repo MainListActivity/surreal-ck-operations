@@ -209,6 +209,7 @@ export class CompanyDatabase {
     // 051：派工体系重构（待发消息表、任务需求/验收标准字段、owner 岗位撤销迁移）。只新增表与字段，
     // 迁移是幂等 UPDATE：旧版 release 读不到新表即忽略（RB01）。
     await this.db.query(loadSchema('051-role-message-flow.surql'));
+    await this.db.query(loadSchema('052-task-routes.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 51 WHERE schema_version < 51;');
   }
 

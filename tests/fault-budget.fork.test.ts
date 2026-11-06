@@ -553,78 +553,7 @@ describe('the exhausted budget', () => {
     expect(episodes?.[0]?.evidence_revision).toBe(2);
   });
 
-  test('fault_status is readable by the holder and reports spent budgets; fault_lift resets them for gm', async () => {
-    const taskId = await makeTask('诊断：fault_status 与 fault_lift');
-    const claimResult = await claim(taskId, 'eng');
-    const scope = { taskId, employeeId: 't-eng' };
-    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
-    for (let n = 0; n < 2; n++) {
-      clock += 10_000;
-      await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
-    }
-    clock += 10_000;
-    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
-    // The holder (and the reviewer / gm) can read the diagnosis without guessing.
-    const status = await core.faultStatus!(tokens.eng, { taskId });
-    expect(status.taskId).toBe(taskId);
-    expect(status.budgets.length).toBeGreaterThanOrEqual(1);
-    expect(status.budgets[0]?.attempts).toBe(3);
-    expect(status.budgets[0]?.lastErrno).toBe('UND_ERR_CONNECT_TIMEOUT');
-    expect(status.episodes.some(episode => episode.state === 'exhausted')).toBe(true);
-    const incident = status.budgets[0]?.lastIncident ?? status.episodes[0]?.incident;
-    expect(incident).toBeTruthy();
-    // A non-gm cannot lift.
-    await expect(core.faultLift!(tokens.eng, {
-      taskId, incident: incident!, reason: '验收期间解封', idempotencyKey: `lift-eng-${clock}`,
-    })).rejects.toMatchObject({ code: 'forbidden' });
-    // gm lifts with a reason: the next attempt starts a fresh recovery window.
-    const after = await core.faultLift!(tokens.owner, {
-      taskId, incident: incident!, reason: 'TLS 长尾已诊断，验收需要解封继续测', idempotencyKey: `lift-gm-${clock}`,
-    });
-    expect(after.budgets[0]?.attempts).toBe(0);
-    expect(after.budgets[0]?.stopped).toBe(false);
-    expect(after.episodes.every(episode => episode.state === 'resolved' || episode.incident !== incident)).toBe(true);
-    clock += 10_000;
-    const recovered = await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
-    expect(recovered.reserved?.allowed).toBe(true);
-    // The claim is kept alive so the holder path stays valid for the duration of the test.
-    expect(claimResult.task.id).toBe(taskId);
-  });
-
-  test('a repair that is done lifts the fault: the source task may recover with a fresh budget', async () => {
-    const taskId = await makeTask('耗尽：修复完成后可恢复');
-    const scope = { taskId, employeeId: 't-eng' };
-    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
-    for (let n = 0; n < 2; n++) {
-      clock += 10_000;
-      await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
-    }
-    clock += 10_000;
-    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
-    // The task waits on the gm gate, as a fault report would leave it.
-    await database.db.query('UPDATE $t SET state = "blocked", blocked_to = "owner", resume_state = "ready";', { t: new RecordId('task', taskId) });
-    await core.resume(tokens.owner, taskId, {
-      text: '尝试恢复：预算耗尽后应当走修复链而不是直接恢复', idempotencyKey: `resume-lift-${clock}`,
-    });
-    // The repair is finished for real: the engineer submits and the independent reviewer accepts.
-    const repairId = (await new FaultStore(database.db).repair(incidentOf()))?.taskId ?? '';
-    expect(repairId).not.toBe('');
-    await finishRepair(repairId);
-    // The source task may recover again: the budget starts over.
-    const recovered = await core.reserveFault!(scope, { phase: PHASE, target: TARGET });
-    expect(recovered?.allowed).toBe(true);
-    const row = await budgetRow(taskId);
-    expect(row?.attempts).toBe(0);
-    expect(row?.failed).toBe(false);
-    expect(await spentCount(taskId)).toBe(1);
-    // And the episode is closed: a later report opens a new stage.
-    const [episodes] = await database.db.query<[Array<{ state?: string }>]>('SELECT state FROM fault_episode;');
-    expect(episodes?.[0]?.state).toBe('resolved');
-  });
-});
-
-describe('a repair completion lifts a budget once (AC04)', () => {
-  test('the first real completion lifts; the same completion replayed after a new exhaustion lifts nothing', async () => {
+      test('the first real completion lifts; the same completion replayed after a new exhaustion lifts nothing', async () => {
     const taskId = await makeTask('修复凭据：首次完成解除一次');
     const scope = { taskId, employeeId: 't-eng' };
     await exhaust(scope);
@@ -753,28 +682,7 @@ describe('a repair completion lifts a budget once (AC04)', () => {
     expect(await spentCount(second)).toBe(1);
   });
 
-  test('a manual lift spends the unspent completion, and its window stays bounded', async () => {
-    const taskId = await makeTask('修复凭据：人工解除也消耗凭据');
-    const scope = { taskId, employeeId: 't-eng' };
-    await exhaust(scope);
-    await finishRepair(await resumeToRepair(taskId));
-    // gm lifts by hand while the completion is still unspent: the lift spends that completion with it.
-    const lifted = await core.faultLift!(tokens.owner!, {
-      taskId, incident: incidentOf(), reason: '验收期间人工解封，修复已完成', idempotencyKey: `lift-spend-${taskId}`,
-    });
-    expect(lifted.budgets[0]?.attempts).toBe(0);
-    expect(await spentCount(taskId)).toBe(1);
-    // The manual lift opens one window of the usual size, not an unlimited one.
-    expect((await budgetRow(taskId))?.deadline).toBe(clock + limits.totalDeadlineMs);
-    // The spent completion cannot lift the next exhaustion, and the window ends with the usual refusal.
-    expect((await exhaust(scope)).reserved?.allowed).toBe(false);
-    expect((await core.reserveFault!(scope, RESERVE))?.allowed).toBe(false);
-    expect(await spentCount(taskId)).toBe(1);
-  });
-});
-
-describe('the audit trail', () => {
-  test('the budget of a fault object is recomputable from the stored row', async () => {
+    test('the budget of a fault object is recomputable from the stored row', async () => {
     const taskId = await makeTask('审计：预算可复算');
     const scope = { taskId, employeeId: 't-eng' };
     await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });

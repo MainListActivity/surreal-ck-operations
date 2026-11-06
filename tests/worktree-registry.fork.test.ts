@@ -70,13 +70,6 @@ const coreFor = (path: string) => {
   return core;
 };
 async function employee(role: Role) { return new LocalEnrollmentAdmin(db).enroll(`fixture-${role}-${++count}`, role, ['execute', 'review']); }
-/** SYS-DISP AC04: a successor takes a bound engineering task's code only through the manager's explicit takeover. */
-async function handOver(c: SurrealCompanyCore, taskId: string, successor: string, label: string) {
-  const version = (await c.getTask(gm, taskId)).version;
-  await c.implementerTakeover(gm, { taskId, toEmployee: (await c.authenticate(successor)).employeeId, expectedVersion: version,
-    reason: `Synthetic manager handover for the ${label} fixture, after the bound implementer lost its lease.`, idempotencyKey: `handover-${label}-${++count}` });
-}
-
 async function task(core: SurrealCompanyCore, role: Role, intent?: WorkIntent) {
   return core.createTask(gm, { title: `Worktree fixture ${++count}`, context: 'Isolated local integration fixture, never production', executorRole: role, reviewerRole: 'qa', workIntent: intent, idempotencyKey: `fixture-task-${count}` });
 }
@@ -172,7 +165,7 @@ run('restart persistence, revoked handover preserves dirty scene and fencing; le
   await new Workforce(db, join(dir, 'unused')).revokeLease(t.id, actor, 'fixture handover', 'fixture previous employee stopped');
   expect((await core.listWorktrees(gm)).find(w => w.id === first.worktree!.id)!.reasons).toContain('unfinished-scene');
   await db.close(); server.kill(); await server.exited; await start();
-  const restarted = coreFor(path); await handOver(restarted, t.id, successor, 'restart');
+  const restarted = coreFor(path);
   const second = await restarted.claim(successor, t.id);
   expect(second.worktree!.worktreePath).toBe(legacy); expect(second.fence).toBeGreaterThan(first.fence); expect(readFileSync(join(legacy, 'source.txt'), 'utf8')).toBe('old scene');
   await expect(restarted.checkpoint(eng, proof(first), { text: 'stale fixture proof', idempotencyKey: 'stale-worktree-proof' })).rejects.toBeDefined();
@@ -288,7 +281,7 @@ run('managed allocator keeps expired-lease takeover semantics and preserves scen
   const eng = await employee('engineering'), next = await employee('engineering');
   const t = await task(core, 'engineering'), a = await core.claim(eng, t.id);
   writeFileSync(join(a.worktree!.worktreePath, 'source.txt'), 'expired dirty scene'); await lapseLease(t.id);
-  const recovery = coreFor(path); await handOver(recovery, t.id, next, 'expired-lease');
+  const recovery = coreFor(path);
   const b = await recovery.claim(next, t.id); expect(b.fence).toBeGreaterThan(a.fence); expect(b.worktree!.worktreePath).toBe(a.worktree!.worktreePath);
   expect(readFileSync(join(b.worktree!.worktreePath, 'source.txt'), 'utf8')).toBe('expired dirty scene');
   await expect(core.checkpoint(eng, proof(a), { text: 'stale after takeover', idempotencyKey: 'managed-expired-stale' })).rejects.toBeDefined();
@@ -300,8 +293,8 @@ run('project-bound non-lease eval uses project repo and carries persistent proje
   git(path, 'checkout', '-b', 'project-default'); writeFileSync(join(path, 'source.txt'), 'project baseline');
   git(path, 'add', '.'); git(path, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'project baseline'); git(path, 'checkout', 'main');
   const project = await new ProjectStore(db.db).upsert({ id: `fixture-project-${++count}`, name: 'Isolated worktree project', repoPath: path, defaultBranch: 'project-default', release: 'Fixture only', envs: [] });
-  const goal = await core.relayGoal(gm, { text: 'Synthetic isolated project-scoped worktree verification goal', ownerQuote: 'Synthetic fixture owner instruction', project: project.id, tier: 'quick', idempotencyKey: `project-goal-${count}` });
-  const t = await core.createTask(gm, { title: 'Project-scoped fixture', context: 'Local fixture only', executorRole: 'qa', reviewerRole: 'engineering', goalId: goal.id, idempotencyKey: `project-task-${count}` });
+
+  const t = await core.createTask(gm, { title: 'Project-scoped fixture', context: 'Local fixture only', executorRole: 'qa', reviewerRole: 'engineering', idempotencyKey: `project-task-${count}` });
   const workspace = await core.readWorkspace(judge, t.id);
   expect(workspace!.repo).toBe(path); expect(workspace!.project).toBe(project.id); expect(workspace!.repo).not.toBe(opsPath);
   expect(readFileSync(join(workspace!.worktreePath, 'source.txt'), 'utf8')).toBe('project baseline');
@@ -357,7 +350,6 @@ run('WT02: lease expire keeps recovery scene; orphan past grace reclaims managed
   const invAfterExpire = await core.listWorktrees(gm);
   expect(invAfterExpire.find(w => w.id === a.worktree!.id)!.references.some(r => r.state === 'recovery' || r.state === 'active')).toBe(true);
   expect(existsSync(a.worktree!.worktreePath)).toBe(true);
-  await handOver(core, t.id, next, 'wt02');
   const b = await core.claim(next, t.id);
   expect(b.worktree!.worktreePath).toBe(a.worktree!.worktreePath);
   await acceptDone(core, next, b);
@@ -618,38 +610,8 @@ async function laneGoal(core: SurrealCompanyCore, name: string) {
   const [rows] = await core.database.db.query<[Array<{ id: RecordId }>]>(`CREATE goal CONTENT { title: $title, brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;`, { title: `Lane fixture ${name}` });
   return String(rows[0]!.id.id);
 }
-const laneTask = (core: SurrealCompanyCore, goalId: string, role: Role, lane: string, kind: WorkIntent['kind'], dependencies: string[] = []) =>
-  core.createTask(gm, { title: `Lane ${lane} ${++count}`, context: 'Isolated lane fixture', executorRole: role, reviewerRole: 'qa', goalId, dependencies, workIntent: { kind, lane }, idempotencyKey: `lane-task-${count}` });
-run('LANE: one lane keeps one tree and one branch for every task and employee; another lane runs in parallel in its own tree', async () => {
-  const path = repo(), core = coreFor(path), a = await employee('engineering'), b = await employee('engineering'), c = await employee('engineering'), qa = await employee('qa');
-  const goal = await laneGoal(core, 'one');
-  const t1 = await laneTask(core, goal, 'engineering', 'billing', 'code');
-  const t2 = await laneTask(core, goal, 'engineering', 'billing', 'code', [t1.id]);
-  const review = await laneTask(core, goal, 'qa', 'billing', 'read', [t2.id]);
-  const other = await laneTask(core, goal, 'engineering', 'search', 'code');
-  const first = await core.claim(a, t1.id);
-  expect(first.worktree!.mode).toBe('exclusive'); expect(first.worktree!.lane).toBe(`${goal}:billing`); expect(first.worktree!.branch).toMatch(/^lane\/[0-9a-f]{8}-billing$/);
-  const parallel = await core.claim(c, other.id);
-  expect(parallel.worktree!.worktreePath).not.toBe(first.worktree!.worktreePath); expect(parallel.worktree!.branch).not.toBe(first.worktree!.branch);
-  writeFileSync(join(first.worktree!.worktreePath, 'source.txt'), 'step one');
-  git(first.worktree!.worktreePath, 'add', '.'); git(first.worktree!.worktreePath, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'step one');
-  await acceptDone(core, a, first);
-  expect(existsSync(first.worktree!.worktreePath)).toBe(true);
-  const second = await core.claim(b, t2.id);
-  expect(second.worktree!.worktreePath).toBe(first.worktree!.worktreePath); expect(second.worktree!.branch).toBe(first.worktree!.branch);
-  expect(readFileSync(join(second.worktree!.worktreePath, 'source.txt'), 'utf8')).toBe('step one');
-  await acceptDone(core, b, second);
-  expect(existsSync(first.worktree!.worktreePath)).toBe(true);
-  expect((await core.listWorktrees(gm)).find(w => w.worktreePath === first.worktree!.worktreePath)!.reasons).toContain('lane-open');
-  const reader = await core.claim(qa, review.id);
-  expect(reader.worktree!.worktreePath).toBe(first.worktree!.worktreePath); expect(reader.worktree!.intent.kind).toBe('read');
-  await submit(core, qa, reader);
-  const gate = await employee('qa'); const closing = await core.claim(gate, reader.task.id);
-  await core.accept(gate, proof(closing), { text: 'Lane review accepted', idempotencyKey: `lane-accept-${++count}` });
-  expect(existsSync(first.worktree!.worktreePath)).toBe(false);
-  expect(existsSync(parallel.worktree!.worktreePath)).toBe(true);
-  await submit(core, c, parallel);
-}, 60000);
+const laneTask = (core: SurrealCompanyCore, goalId: string, role: Role, lane: string, kind: WorkIntent['kind']) =>
+  core.createTask(gm, { title: `Lane ${lane} ${++count}`, context: 'Isolated lane fixture', executorRole: role, reviewerRole: 'qa', goalId, workIntent: { kind, lane }, idempotencyKey: `lane-task-${count}` });
 run('LANE: a task waits instead of sharing the lane tree with another active writer; readers never create a lane', async () => {
   const path = repo(), core = coreFor(path), a = await employee('engineering'), b = await employee('engineering'), qa = await employee('qa');
   const goal = await laneGoal(core, 'two');
@@ -659,78 +621,6 @@ run('LANE: a task waits instead of sharing the lane tree with another active wri
   const lonely = await core.claim(qa, (await laneTask(core, goal, 'qa', 'docs', 'read')).id);
   expect(lonely.worktree!.mode).toBe('shared'); expect(lonely.worktree!.lane).toBeUndefined();
   await submit(core, a, first); await submit(core, qa, lonely);
-}, 30000);
-run('LANE: the write-scope preflight names the writer that refuses the claim, changes nothing, and clears once that writer submits', async () => {
-  const path = repo(), core = coreFor(path), a = await employee('engineering'), b = await employee('engineering');
-  const goal = await laneGoal(core, 'preflight');
-  const t1 = await laneTask(core, goal, 'engineering', 'ledger', 'code'), t2 = await laneTask(core, goal, 'engineering', 'ledger', 'code');
-  const first = await core.claim(a, t1.id);
-  const writerId = (await core.authenticate(b)).employeeId;
-  const holders = await core.writeScopeOf(t2.id, writerId);
-  expect(holders).toEqual([{ taskId: t1.id, employee: (await core.authenticate(a)).employeeId, intent: 'code' }]);
-  expect(await core.writeScopeOf(t2.id, writerId)).toEqual(holders);
-  await expect(core.claim(b, t2.id)).rejects.toMatchObject({ code: 'worktree_busy' });
-  expect((await core.getTask(gm, t2.id)).state).toBe('ready');
-  await submit(core, a, first);
-  expect(await core.writeScopeOf(t2.id, writerId)).toEqual([]);
-  const second = await core.claim(b, t2.id);
-  expect(second.worktree!.worktreePath).toBe(first.worktree!.worktreePath);
-  await submit(core, b, second);
-}, 30000);
-run('LANE: a blocked task keeps its scene but does not lock the lane — a rework claim enters the parked tree, and an active writer still serializes', async () => {
-  const path = repo(), core = coreFor(path), a = await employee('engineering'), b = await employee('engineering'), c = await employee('engineering');
-  const goal = await laneGoal(core, 'returned');
-  const t1 = await laneTask(core, goal, 'engineering', 'returned', 'code');
-  const t2 = await laneTask(core, goal, 'engineering', 'returned', 'code');
-  const t3 = await laneTask(core, goal, 'engineering', 'returned', 'code');
-  const first = await core.claim(a, t1.id);
-  const tree = first.worktree!;
-  // Returned/blocked work is non-terminal: the task keeps its scene as a recovery ref so a
-  // resumption lands back on the lane, but the parked bookmark must not occupy the tree.
-  await db.db.query('UPDATE ONLY $task SET state = $state, current_employee = NONE, delivery_id = NONE;', { task: new RecordId('task', t1.id), state: 'blocked' });
-  const rework = await core.claim(b, t2.id);
-  expect(rework.worktree!.worktreePath).toBe(tree.worktreePath);
-  expect(rework.worktree!.branch).toBe(tree.branch);
-  // The parked scene did not open the lane to concurrent writers: a third code claim on the
-  // same lane still waits behind the actively-working rework task.
-  await expect(core.claim(c, t3.id)).rejects.toMatchObject({ code: 'worktree_busy' });
-  await submit(core, b, rework);
-}, 30000);
-run('QUICK: triage writes one code lane onto the merged and deploy legs; the merged leg claims an exclusive tree on that lane branch', async () => {
-  const path = repo(), core = coreFor(path), eng = await employee('engineering'), deployer = await employee('engineering');
-  const goal = await new OwnerDesk(db).createGoal({ text: 'Quick lane fixture goal', source: 'fixture', key: `quick-lane-${++count}` });
-  await core.triageGoal(gm, { goalId: goal.id, tier: 'quick', reason: 'Synthetic fixture triage of a quick goal' });
-  const [rows] = await db.db.query<[Array<{ id: RecordId; kind: string }>]>('SELECT id, kind FROM task WHERE goal = $goal;', { goal: new RecordId('goal', goal.id) });
-  const merged = asId(rows.find(row => row.kind === 'release')!.id), deploy = asId(rows.find(row => row.kind === 'deploy')!.id);
-  const lane = (await core.getTask(gm, merged)).workIntent?.lane;
-  expect(lane).toMatch(/^delivery-[0-9a-f]{8}$/);
-  // Without these intents the merged leg defaulted to read and landed in the shared read-only tree.
-  expect((await core.getTask(gm, merged)).workIntent).toEqual({ kind: 'code', lane });
-  expect((await core.getTask(gm, deploy)).workIntent).toEqual({ kind: 'code', lane });
-  const first = await core.claim(eng, merged);
-  expect(first.worktree!.mode).toBe('exclusive'); expect(first.worktree!.intent.kind).toBe('code');
-  expect(first.worktree!.lane).toBe(`${goal.id}:${lane}`);
-  expect(first.worktree!.branch).toBe(`lane/${HASH(`${goal.id}:${lane}`).slice(0, 8)}-${lane}`);
-  // The deploy leg waits for the merged leg, yet its write scope already names that writer: both legs are one lane.
-  expect(await core.writeScopeOf(deploy, (await core.authenticate(deployer)).employeeId))
-    .toEqual([{ taskId: merged, employee: (await core.authenticate(eng)).employeeId, intent: 'code' }]);
-}, 30000);
-run('LANE: a shared tree stranded on a task branch is moved back, and a stale unworked task branch restarts from the current base', async () => {
-  const path = repo(), core = coreFor(path), qa = await employee('qa'), eng = await employee('engineering');
-  const read = await core.claim(qa, (await task(core, 'qa')).id);
-  const shared = read.worktree!.worktreePath, baseline = git(path, 'rev-parse', 'main');
-  const stuck = await task(core, 'engineering'); const branch = `task/${stuck.id.slice(0, 8)}`;
-  git(shared, 'checkout', '-q', '-b', branch);
-  await db.db.query('UPDATE ONLY $tree SET branch = $branch;', { tree: new RecordId('worktree', read.worktree!.id), branch });
-  writeFileSync(join(path, 'source.txt'), 'moved on'); git(path, 'add', '.'); git(path, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'main moved');
-  const qa2 = await employee('qa'); const holding = await core.claim(qa2, (await task(core, 'qa')).id);
-  expect(git(shared, 'branch', '--show-current')).toBe(branch);
-  await submit(core, qa, read); await submit(core, qa2, holding);
-  const claimed = await core.claim(eng, stuck.id);
-  expect(git(shared, 'branch', '--show-current')).toMatch(/^sck\/shared-/);
-  expect(claimed.worktree!.branch).toBe(branch); expect(claimed.worktree!.worktreePath).not.toBe(shared);
-  expect(git(claimed.worktree!.worktreePath, 'rev-parse', 'HEAD')).toBe(git(path, 'rev-parse', 'main')); expect(baseline).not.toBe(git(path, 'rev-parse', 'main'));
-  await submit(core, eng, claimed);
 }, 30000);
 run('LANE: a shared tree is not moved off its branch while any task lease (legacy writer or reviewer) is still active on it', async () => {
   const path = repo(), core = coreFor(path), qa = await employee('qa'), eng = await employee('engineering');
@@ -818,7 +708,8 @@ run('goal workspace metadata survives database reconnect while its task lease an
   const inst = await wf.spawnInst(def, path, 'fixture-goal');
   const agentId = `goal-agent-${count}`;
   await wf.bind(inst.id, { agentId, cwd: path, repoHome: path, workspaceScope: 'fixture-goal' });
-  const goal = await new OwnerDesk(db).createGoal({ text: 'Isolated goal workspace fixture', source: 'fixture', key: name, tier: 'standard' });
+  const [grows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: 'Isolated goal workspace fixture', brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
+  const goal = { id: String(grows[0]!.id.id) };
   // Rebind the fixture before it takes a lease; real dispatch stores this at spawn.
   await wf.bind(inst.id, { agentId, workspaceScope: goal.id });
   const ownTask = await core.createTask(gm, { title: name, context: 'Isolated goal claim', executorRole: 'engineering', reviewerRole: 'qa',
