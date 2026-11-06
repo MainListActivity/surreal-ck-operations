@@ -8,11 +8,11 @@ export const DEFAULT_PAGE_SIZE = 25;
 export const MAX_PAGE_SIZE = 100;
 export const MAX_CURSOR_CHARS = 2048;
 
-export const TASK_STATES: readonly TaskState[] = ['blocked', 'ready', 'doing', 'review', 'done', 'void'];
+export const TASK_STATES: readonly TaskState[] = ['blocked', 'ready', 'doing', 'review', 'done', 'void', 'planned'];
 /** Top-level TaskView keys a caller may project. Anything else is refused. */
 export const TASK_FIELDS: readonly string[] = [
-  'id', 'title', 'context', 'state', 'executorRole', 'reviewerRole', 'discipline', 'kind', 'goalId', 'projectOverlay',
-  'codeRepoPath', 'dependencies', 'version', 'submittedBy', 'currentEmployee', 'deliveryId', 'leaseExpiresAt', 'fence',
+  'id', 'title', 'context', 'state', 'executorRole', 'reviewerRole', 'discipline', 'kind', 'tag', 'projectOverlay',
+  'codeRepoPath', 'version', 'submittedBy', 'currentEmployee', 'deliveryId', 'leaseExpiresAt', 'fence',
   'blockedTo', 'handover', 'previousEmployee', 'workIntent', 'worktree', 'revises', 'supersededBy', 'lineage', 'revisionNo',
 ];
 
@@ -89,17 +89,17 @@ export const isPaged = (input: Record<string, unknown>): boolean =>
 export const CONTEXT_SCOPES = ['tasks', 'company'] as const;
 export type ContextScope = (typeof CONTEXT_SCOPES)[number];
 /** Sections of the company block that scope company narrows to. The meta part (paused) is always read. */
-export const COMPANY_SECTIONS = ['directions', 'goals', 'projects'] as const;
+export const COMPANY_SECTIONS = ['directions', 'projects'] as const;
 export type CompanySection = (typeof COMPANY_SECTIONS)[number];
 /** Arguments that name a task filter. They are refused with scope company rather than ignored. */
-const TASK_ONLY_CONTEXT_ARGUMENTS = ['taskId', 'state', 'goalId', 'role', 'since', 'fields', 'includeCompany'] as const;
+const TASK_ONLY_CONTEXT_ARGUMENTS = ['taskId', 'state', 'tag', 'role', 'since', 'fields', 'includeCompany'] as const;
 
 export interface ContextParams {
   scope: ContextScope;
   section?: CompanySection;
   taskId?: string;
   state?: TaskState;
-  goalId?: string;
+  tag?: string;
   role?: Role;
   since?: string;
   pageSize: number;
@@ -150,7 +150,7 @@ export function parseContextInput(input: Record<string, unknown>): ContextParams
     scope,
     taskId: optionalText(input.taskId, 'taskId', 200),
     state: state as TaskState | undefined,
-    goalId: optionalText(input.goalId, 'goalId', 100),
+    tag: optionalText(input.tag, 'tag', 100),
     role: role as Role | undefined,
     since: optionalIso(input.since, 'since'),
     pageSize,
@@ -198,7 +198,7 @@ export function parseReclaimInput(input: unknown): { dryRun: boolean; repos?: st
 }
 
 /** Texts read_task_text returns. The list fields are the task's lists that a claim echo may cut (SYS01 R3). */
-export const TEXT_FIELDS = ['context', 'evidence', 'project', 'dependencies', 'workIntentPaths', 'worktreePaths'] as const;
+export const TEXT_FIELDS = ['context', 'evidence', 'project', 'workIntentPaths', 'worktreePaths'] as const;
 export function parseTextInput(input: Record<string, unknown>): {
   taskId: string; field: (typeof TEXT_FIELDS)[number]; auditId?: string; offset: number; limit: number; expectSha256?: string;
 } {
@@ -254,8 +254,9 @@ export function parseWorktreeRefsInput(input: Record<string, unknown>): {
   };
 }
 
-export function parseSummaryInput(input: Record<string, unknown>): { since?: string; goalId?: string } {
-  return { since: optionalIso(input.since, 'since'), goalId: optionalText(input.goalId, 'goalId', 100) };
+export function parseSummaryInput(input: Record<string, unknown>): { since?: string; tag?: string } {
+  const tag = input.tag === undefined ? undefined : String(input.tag);
+  return { since: optionalIso(input.since, 'since'), tag };
 }
 
 /** Digest of the query a cursor is bound to: its filters and its projection (fields). The page size is not part of it. */

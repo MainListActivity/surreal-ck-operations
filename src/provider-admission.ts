@@ -1,8 +1,8 @@
 /**
- * Provider admission, shared verbatim by the dispatcher's staffing pool and the FV06 standby
- * relay guard: a provider the dispatcher would not staff must be a provider a standby resume
- * cannot assign either. Both faces read the same provider_health rows and the same quota
- * snapshot the plugin persists (readProviderQuotas), so they cannot drift.
+ * Provider admission, shared verbatim by the dispatcher's staffing pool and the roster preview:
+ * a provider the dispatcher would not staff must not appear eligible anywhere else. Both faces
+ * read the same provider_health rows and the same quota snapshot the plugin persists
+ * (readProviderQuotas), so they cannot drift.
  */
 
 /** Minimal structural shape of workforce.ts's ProviderHealth (no import cycle). */
@@ -35,7 +35,7 @@ export function quotaBlockedProviders(rows: ReadonlyArray<AdmissionQuotaRow>, cf
 /**
  * The dispatcher's own per-def admission (the same gate roleCapacity applies): a def exempt from
  * quota gating keeps its seat; everyone else needs the quota floors clear and the health window
- * not cooling off. No seat-cap here: standby assigns an existing idle session, it spawns nothing.
+ * not cooling off. No seat-cap here: this gate only assigns an existing idle session, it spawns nothing.
  */
 export function providerAdmission(input: { provider?: string; quotaLimited?: boolean },
   ctx: { health: ReadonlyMap<string, AdmissionHealth>; quotaRows: ReadonlyArray<AdmissionQuotaRow>; floors: AdmissionFloors; now: number }): { ok: boolean; reason?: string } {

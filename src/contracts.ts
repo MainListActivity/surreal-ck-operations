@@ -1,18 +1,10 @@
 /** v1 core/adapter boundary. The MCP adapter supplies an opaque credential on every call. */
-import type { WaitHandoffCard, WaitMigrationCandidate } from './waits.ts';
-import type {
-  QaScopeSignalInput, QaScopeSignalView, ReviewSignalView, ReviewWatchCloseInput, ReviewWatchInput, ReviewWatchStatusInput,
-  ReviewWatchView,
-} from './review-events.ts';
-import type { GoalCard, GoalEvidenceFact, GoalEvidenceInput, GoalOutcomeFact, RequiredEvidenceKind } from './goal-governance.ts';
-import type { GoalMetricsAnswer, GoalMetricsSection, GoalMetricsView } from './goal-metrics.ts';
-import type { GoalFinalGatePreview, GoalFinalGateRepairResult, GoalOutcomeView, GoalPageView, GoalScanQuery, GoalScanView } from './goal-store.ts';
 /** 'eval' is a workforce-only judge role: it reads task history and writes scorecards, never claims tasks. */
 /** 'owner' is the control-plane principal (no employee_def); 'gm' is a retired literal kept only so legacy enrollment fixtures can be mapped to owner. */
 export type Role = 'gm' | 'owner' | 'product' | 'engineering' | 'ai-content' | 'concept-design' | 'asset-production' | 'screenwriter' | 'story-author' | 'cinematography' | 'qa' | 'cs' | 'eval';
 export const ROLES: readonly Role[] = ['product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs', 'eval'];
 /** 'void' is terminal: retired work never re-enters dispatch and counts as satisfied in dependency evaluation. */
-export type TaskState = 'blocked' | 'ready' | 'doing' | 'review' | 'done' | 'void';
+export type TaskState = 'blocked' | 'ready' | 'doing' | 'review' | 'done' | 'void' | 'planned';
 /** Trusted retirement type, set only by server-side callers (session rotation, scene archive, failures),
  * never taken from a free-text reason. rotation and archive end a session normally; failure and manual do not. */
 export type RetirementKind = 'rotation' | 'archive' | 'failure' | 'manual';
@@ -20,7 +12,7 @@ export type RetirementKind = 'rotation' | 'archive' | 'failure' | 'manual';
 export type ReviewerRole = Role | 'owner';
 /** release：上线申请，由运营（或 Jev）决定是否上线；deploy：合入部署，由 qa 在生产实测验收。 */
 export type TaskKind = 'goal' | 'task' | 'gate' | 'release' | 'deploy';
-/** quick：小开发任务，运营验收即结束；standard：经理拆解，老板终验；program：先做范围提案的大目标。 */
+/** quick：单一需求，一个任务即可完成；standard：方向清楚的一个任务，需要更多步时老板加任务并用依赖串起来；program：方向性目标，老板按需求拆成多个任务并用依赖串起来。 */
 export type GoalTier = 'quick' | 'standard' | 'program';
 export type EmployeeId = string;
 export type TaskId = string;
@@ -137,48 +129,11 @@ export interface AcceptanceStatusView { taskId: TaskId; gate: AcceptanceGateView
 export interface AcceptanceGateInput { enabled: boolean; reason: string; expectedVersion: number; idempotencyKey: string }
 
 /** SYS-INT: read-only preview of the versioned acceptance mapping for one legacy gated row. */
-export interface AcceptanceMappingPreviewView {
-  taskId: TaskId;
-  title: string;
-  state: string;
-  kind?: TaskKind;
-  workIntent?: WorkIntent;
-  occupied: boolean;
-  legacy: boolean;
-  /** The criteria the task carries today (empty for a legacy row). */
-  currentCriteria: AcceptanceCriterion[];
-  /** The registry bundle that would apply, with the digest an import must echo; undefined when the leg is unsupported. */
-  proposal?: {
-    key: string; leg: AcceptanceLeg; version: number; digest: string; description: string; criteria: AcceptanceCriterion[];
-    /** Who this bundle may attach to; a target outside it is refused instead of silently fitted. */
-    appliesTo?: { leg?: string; executorRole?: string; goalId?: string };
-    /** Traceability: every required item, the SYS packages it covers and the evidence class behind it. */
-    coverage?: Array<{ criteriaId: string; item: string; sys: string[]; machineSource: string; humanSignoff: string }>;
-  };
-  /** Per-SYS required mapping: machine source, human sign-off, RB01 coverage. */
-  sysRequired: SysRequiredMappingView[];
-  /** Empty when an import would be accepted right now; otherwise machine-readable refusal reasons. */
-  conflicts: string[];
-  guidance: string;
-}
-export interface SysRequiredMappingView { sys: string; machineEvidence: string; machineVerify: string; humanVerify: string; rb01: boolean; note: string }
-export interface AcceptanceMappingImportInput {
-  taskId: TaskId;
-  mappingKey: string;
-  /** The digest shown by the preview; a stale digest is refused. */
-  digest: string;
-  /** CAS against the task row version read at preview time. */
-  expectedVersion: number;
-  reason: string;
-  idempotencyKey: string;
-}
-
-/** Managed authorization; supplied by task creation, never inferred from prose. */
 export interface WorkIntent { kind: 'read' | 'code' | 'assets'; paths?: string[]; lane?: string }
 export interface WorktreeAssignment {
   id: string; repo: string; project?: string; worktreePath: string;
   mode: 'shared' | 'exclusive' | 'protected'; branch?: string;
-  /** "<goal id>:<lane name>" when the tree belongs to a lane shared by every task of that lane. */
+  /** Legacy row column kept for compatibility; new code tasks always get their own task/<id8> branch. */
   lane?: string;
   intent: WorkIntent; discipline: string;
 }
@@ -206,47 +161,9 @@ export interface Principal {
 }
 
 /**
- * Why a blocked task is waiting, derived from the row's authoritative facts (RW05/RW06). The owner and manager views read this
- * instead of guessing from transient fields: a review-phase wait names the reviewing role, never the execute phase; a fact the
- * row does not carry is `unknown`, not a default.
  */
-export interface TaskWaiting {
-  /** owner: a boss gate; dependency: waiting on other tasks (a review wait is one of these). */
-  kind: 'owner' | 'dependency';
-  /** The phase restored when the wait ends (`unknown` when the row carries none). */
-  resumeState: TaskState | 'unknown';
-  /** For dependency waits: the role whose phase is awaited (review wait -> the reviewer role); `unknown` when no fact names it. */
-  role: Role | 'owner' | 'unknown';
-  /** How many prerequisites the row records. The ids themselves stay in the task's own `dependencies` field, which SYS01's
-   *  per-item budget already truncates with an explicit flag; repeating them here would push a wide row past a page. */
-  dependenciesCount: number;
-}
-
-/**
- * SYS05: a task's open typed wait. It is separate from `TaskWaiting` (which describes any blocked row): a wait
- * names its own condition, the role that owns it, the absolute instant it becomes due and the trusted source that
- * may release it. `expiresAt` is present only when a tool named a precise instant; `expiresSource=unknown` is not
- * a placeholder to be filled in by arithmetic.
- */
-export interface TaskWaitView {
-  waitKey: string;
-  kind: 'time' | 'dependency' | 'upstream_repair' | 'customer_activation' | 'owner_handoff' | 'feedback';
-  state: 'waiting' | 'released' | 'held' | 'expired' | 'cancelled' | 'superseded';
-  ownerRole: string;
-  source: 'time' | 'dependency' | 'webhook' | 'authorized_person' | 'owner';
-  notBefore?: string;
-  expiresAt?: string;
-  expiresSource: 'exact' | 'unknown';
-  nextCheckAt?: string;
-  timezone?: string;
-  version: number;
-}
-
-
 export interface TaskView {
   companyUpgrade?: import('./company-release.ts').CompanyRelease;
-  executionWindow?: import('./task-recovery.ts').ExecutionWindow;
-  dependencyContinuation?: 'execute' | 'manager';
   id: TaskId;
   title: string;
   context: string;
@@ -260,13 +177,12 @@ export interface TaskView {
   /** Project-scoped discipline track (e.g. 编剧/分镜): only defs whose `tracks` list covers it may claim. */
   discipline?: string;
   kind: TaskKind;
-  goalId?: string;
-  /** Task-level project override (takes precedence over goal.project); undefined keeps the goal routing. */
+  /** Task-level project override (registered project id); undefined inherits the chain routing. */
   projectOverlay?: string;
   /**
    * Explicit code-repo binding (owner only): overrides the repo used for worktree allocation and
    * dispatch repoHome/cwd. Never affects business project resolution (claim.json.project,
-   * opsScope, broker quotas) — that stays with projectOverlay/goal.project.
+   * opsScope, broker quotas) — that stays with projectOverlay/project.
    */
   codeRepoPath?: string;
   /** SYS02: this task/delivery leg's versioned structured acceptance criteria. */
@@ -278,45 +194,32 @@ export interface TaskView {
   acceptanceHead?: string;
   acceptanceEnvironment?: string;
   acceptanceAttempt?: number;
-  /** Groups the legs of one create_delivery chain. */
   acceptanceChain?: string;
-  dependencies: TaskId[];
   version: number;
   submittedBy?: EmployeeId;
   currentEmployee?: EmployeeId;
   deliveryId?: DeliveryId;
   leaseExpiresAt?: string;
-  /** FV06 P0: a standby direct assignment expires here (ISO 8601); the supervision loop wakes the idle
-   * holder until then and returns the task to the owner gate past it. */
-  standbyUntil?: string;
   fence: number;
   blockedTo?: 'owner';
   /** Blocked rows: the phase to restore when the wait ends (ready/doing -> ready, review -> review). */
   resumeState?: TaskState;
   /** Blocked rows: the role recorded by the original block, kept for cross-role display and validation. */
   resumeRole?: string;
-  /** Blocked rows: why the task waits, in the same authoritative terms for every view (RW06 C3). */
-  waiting?: TaskWaiting;
-  /** SYS05: the open typed wait (time or trusted external event), when the task is waiting on one. */
-  wait?: TaskWaitView;
+  /** The route type this task was created under; routes record the executor/reviewer at creation. */
+  type?: string;
+  /** Chain predecessor: the task this one follows. A task with an unfinished parent stays 'planned'. */
+  parent?: TaskId;
+  /** The submit audit id whose `next` proposal created this task. */
+  proposedIn?: string;
+  /** Optional grouping tag (replaces goal grouping). */
+  tag?: string;
   /** Set when the previous holder's lease was revoked; the next holder must read the handover history. */
   handover?: boolean;
   previousEmployee?: EmployeeId;
-  /** Bound code implementer (execute phase). Set at the first execute claim or by an explicit owner takeover. */
-  implementer?: EmployeeId;
-  /** Independence policy (SYS-DISP IR01): contributors of the source tasks, and named employees, may not take or decide this task. */
-  independence?: IndependencePolicy;
   modelTier?: 'fable' | 'opus' | 'sonnet' | 'haiku' | 'high' | 'medium' | 'low';
   workIntent?: WorkIntent;
   worktree?: WorktreeAssignment;
-  /** Typed screenplay-revision edge: this draft is the legal next version of `revises`. */
-  revises?: TaskId;
-  /** Set on a superseded draft: points at the replacing version (chain tip has none). */
-  supersededBy?: TaskId;
-  /** Version-chain root shared by every draft of the same screenplay lineage. */
-  lineage?: TaskId;
-  /** 1-based version number inside the lineage (v1 has none until superseded). */
-  revisionNo?: number;
   /**
    * Set on a write's echo (SYS01): the size and digest of the whole context, and whether `context` holds only its leading part.
    * A cut context continues at contextNextOffset in read_task_text, which verifies the text against contextSha256.
@@ -327,21 +230,15 @@ export interface TaskView {
   contextNextOffset?: number;
   /**
    * Set on a write's echo (SYS01 R3) and on a claim's task: each list that was cut to its leading part, with the whole count and
-   * the SHA-256 of the whole JSON. read_task_text (field dependencies, workIntentPaths or worktreePaths) returns the whole list.
+   * the SHA-256 of the whole JSON. read_task_text (field workIntentPaths or worktreePaths) returns the whole list.
    */
-  listsTruncated?: Partial<Record<'dependencies' | 'workIntentPaths' | 'worktreePaths', ListCut>>;
+  listsTruncated?: Partial<Record<'workIntentPaths' | 'worktreePaths', ListCut>>;
   /**
    * Set on a task echo (SYS01 R3): each text field other than the context that was cut to its leading part, with the size and the
    * SHA-256 of its whole value. The whole value is not readable through read_task_text.
    */
   fieldsTruncated?: Record<string, FieldCut>;
   /** 创建时的有效契约登记（SYS06 AC03）：策略版本与 hash，以及逐域契约本体。旧行没有它，语义是"无有效契约"。 */
-  policyVersion?: number;
-  policyHash?: string;
-  policyContract?: EffectiveContract;
-  /** 本租约的契约登记：策略变了以后两者不等，旧 claim 的写动作被拒（下一次相关动作前核版本）。 */
-  leasePolicyVersion?: number;
-  leasePolicyHash?: string;
   /** 被策略收权隔离的原因（可见状态：blocked，等待 owner），旧 release 也认得这个状态。 */
   policyBlockReason?: string;
 }
@@ -394,13 +291,13 @@ export interface PageInfo {
 }
 
 /**
- * One part of the company block (get_context with scope company, SYS01 AC-A). The meta part carries `paused`. Each direction, goal
+ * One part of the company block (get_context with scope company, SYS01 AC-A). The meta part carries `paused`. Each direction
  * and project is one item: its JSON text is cut into parts of a page's size, in order. A reader joins the `json` of the parts of one
  * (section, key) item, checks the joined UTF-8 length against `totalBytes` and its SHA-256 against `sha256`, then parses it.
  */
 export interface CompanyPart {
-  section: 'meta' | 'directions' | 'goals' | 'projects';
-  /** Stable within the listing: `company` for the meta part, `direction-<position>` for a direction, the id for a goal or project. */
+  section: 'meta' | 'directions' | 'projects';
+  /** Stable within the listing: `company` for the meta part, `direction-<position>` for a direction, the id for a project. */
   key: string;
   /** 0-based position of this part among the parts of its item. */
   part: number;
@@ -428,7 +325,7 @@ export interface ContextView {
   /** How to read the company block in pages: the get_context arguments that return it, one page at a time. */
   companyRead?: { scope: 'company'; pageSize: number };
   scope?: 'tasks' | 'company';
-  section?: 'directions' | 'goals' | 'projects';
+  section?: 'directions' | 'projects';
   parts?: CompanyPart[];
   tasks?: Array<Record<string, unknown>>;
   page?: PageInfo;
@@ -446,10 +343,10 @@ export interface WorktreePageView {
 
 /**
  * What read_task_text reads. context and evidence are text. project is the project environment as JSON (holder or owner only),
- * and dependencies, workIntentPaths and worktreePaths are the task's lists as JSON arrays, so a claim echo that cut them can be
+ * and workIntentPaths and worktreePaths are the task's lists as JSON arrays, so a claim echo that cut them can be
  * read back whole (SYS01 R3).
  */
-export type TaskTextField = 'context' | 'evidence' | 'project' | 'dependencies' | 'workIntentPaths' | 'worktreePaths';
+export type TaskTextField = 'context' | 'evidence' | 'project' | 'workIntentPaths' | 'worktreePaths';
 
 /** One byte segment of a text read by read_task_text (SYS01). */
 export interface TaskTextSegment {
@@ -490,7 +387,6 @@ export interface AdminSummary {
   cutoffAt: string;
   /** Start of the audit window, [since, cutoffAt]. Declared even when the task counts ignore it. */
   since: string;
-  goalId?: string;
   /** What each count covers. `since` limits only the audit counts; task counts are the state at cutoffAt. */
   scope: { tasks: string; audit: string };
   tasks: Record<string, number>;
@@ -516,11 +412,22 @@ export interface CreateTask {
   context: string;
   executorRole: Role;
   reviewerRole: ReviewerRole;
-  /** Optional discipline track; when the task's project (override, else the goal's) defines a non-empty `disciplines` vocabulary the value must be in it. */
+  /** Route type: fills executor/reviewer (and optional next-chain expansion) when given. */
+  type?: string;
+  /** Chain predecessor: parent unfinished → the new task is 'planned'. */
+  parent?: string;
+  /** Owner-edited requirement staged as task.md's 需求 section. */
+  requirement?: string;
+  /** Owner-edited acceptance staged as task.md's 验收标准 section. */
+  acceptanceText?: string;
+  /** Hold the generated dispatch drafts for owner review before release. */
+  hold?: boolean;
+  /** The submit audit id a proposal was created under. */
+  proposed_in?: string;
+  /** Optional discipline track; when the task's project defines a non-empty `disciplines` vocabulary the value must be in it. */
   discipline?: string;
   kind?: Exclude<TaskKind, 'goal'>;
-  goalId?: string;
-  /** Optional project override: registered project id only; takes precedence over goal.project for this task. */
+  /** Optional project override: registered project id only. */
   project?: string;
   /**
    * Optional code repository (ops repo or a registered project repo_path) the task's worktree is allocated in; the business
@@ -528,9 +435,7 @@ export interface CreateTask {
    * another repo, is bound to the ops repo; otherwise the project's repo is used.
    */
   codeRepoPath?: string;
-  /** Atomic independence policy: enforced before the first claim; prose alone does not exclude anyone. */
-  independence?: Pick<SetIndependence, 'stages' | 'sources' | 'mode' | 'excluded' | 'reason'>;
-  dependencies?: TaskId[];
+  tag?: string;
   /** SYS02: required for new code deliveries when the acceptance gate is enabled. */
   acceptanceCriteria?: AcceptanceCriterion[];
   /** SYS02: controlled environment declaration for this task (e.g. production); evidence must match it exactly. */
@@ -540,11 +445,11 @@ export interface CreateTask {
   workIntent?: WorkIntent;
   /**
    * Controlled screenplay-revision edge (product only): both drafts must be owner-reviewed
-   * screenwriter tasks on the 编剧 track (kind=task) in the same goal and project; the target
+   * screenwriter tasks on the 编剧 track (kind=task) in the same project; the target
    * must be the unapproved, unsuperseded chain tip whose latest submission drew a real owner
    * rejection. The service atomically voids the target (supersededBy pointer), inherits the
-   * lineage, and lets the new draft start once its own normal dependencies are satisfied —
-   * the edge never exempts other tasks or other dependencies.
+   * lineage, and lets the new draft start once its own parent is satisfied —
+   * the edge never exempts other tasks.
    */
   revises?: TaskId;
 }
@@ -589,7 +494,6 @@ export interface ClaimResult {
    * contract; `history` on the policy itself stays queryable. Undeniable: the claim is refused before it is written if a
    * change since the read dropped the authorization.
    */
-  policy?: PolicyEffectiveView;
 }
 
 /** Result of the ops broker gate; `project` is the id of the project the task's goal belongs to. */
@@ -597,109 +501,9 @@ export interface OpsScope {
   actor: Principal;
   taskId: TaskId;
   project: string;
-  /**
-   * How this ops call was authorized. Absent means the ordinary live execution lease (every existing caller).
-   * `recovery_read` means a owner-issued recovery read grant bound to a terminal source task: `taskId` is then the
-   * source task, and the broker applies the grant allowlist instead of the execution tool surface.
-   */
-  kind?: 'lease' | 'recovery_read';
-  recovery?: RecoveryReadScope;
 }
 
 /** The restricted authorization a recovery read grant carries into one ops call. */
-export interface RecoveryReadScope {
-  grantId: string;
-  grantFence: number;
-  alias: string;
-  paths: string[];
-}
-
-export type RecoveryReadState = 'issued' | 'bound' | 'running' | 'completed' | 'stopped' | 'revoked' | 'expired';
-
-export interface RecoveryReadGrantInput {
-  taskId: TaskId;
-  employeeId: string;
-  alias: string;
-  paths: string[];
-  expiresAt: string;
-  authorizationTask: TaskId;
-  reason: string;
-  idempotencyKey: string;
-  /** Explicit re-open after a stopped/expired chain: counts are carried over, never cleared. */
-  rearm?: boolean;
-}
-
-export interface RecoveryReadGrantRowView {
-  id: string;
-  taskId: TaskId;
-  employeeId: string;
-  alias: string;
-  methods: string[];
-  paths: string[];
-  expiresAt: string;
-  authorizationTask: TaskId;
-  reason: string;
-  state: RecoveryReadState;
-  loginAttempts: number;
-  perPath: number[];
-  inFlight?: { path: string; startedAt: string; deadline: string; callId: string };
-  stopReason?: string;
-  resultDigest?: string;
-  createdBy: string;
-  createdAt: string;
-  boundAt?: string;
-  closedAt?: string;
-  /** FV06 observability: the dispatcher's latest wake attempt (success) or the reason it could not wake (skip). */
-  lastWakeAt?: string;
-  lastSkipReason?: string;
-  fence: number;
-}
-
-export interface RecoveryReadCallView {
-  ordinal: number;
-  kind: 'login' | 'get' | 'logout';
-  path?: string;
-  status?: number;
-  ok: boolean;
-  outcome: string;
-  digest?: string;
-  at: string;
-}
-
-export interface RecoveryReadStatusView {
-  grant: RecoveryReadGrantRowView;
-  calls: RecoveryReadCallView[];
-}
-
-export interface RecoveryReadReserveInput {
-  grantId: string;
-  grantFence: number;
-  kind: 'login' | 'get' | 'logout';
-  path?: string;
-}
-
-export interface RecoveryReadReserveResult {
-  allowed: boolean;
-  kind: 'login' | 'get' | 'logout';
-  callId?: string;
-  path?: string;
-  deadline?: string;
-  reason?: string;
-  message: string;
-}
-
-export interface RecoveryReadSettleInput {
-  grantId: string;
-  grantFence: number;
-  callId: string;
-  kind: 'login' | 'get' | 'logout';
-  path?: string;
-  status?: number;
-  ok: boolean;
-  outcome: string;
-  bodyDigest?: string;
-}
-
 export interface SessionRef {
   employee: string;
   agentId?: string;
@@ -730,61 +534,6 @@ export interface ProjectView {
   envsWithheld?: true;
 }
 
-export interface CreateDelivery {
-  goalId: string;
-  title: string;
-  /** What to build and the acceptance criteria qa verifies in production. */
-  spec: string;
-  /**
-   * SYS02: versioned structured acceptance criteria for the delivery. Each criterion may name the legs it applies to;
-   * a leg with no matching criterion gets that leg's default criteria. The gate is enforced only once enabled (AC06).
-   */
-  acceptanceCriteria?: AcceptanceCriterion[];
-  /** SYS02: controlled environment declaration applied to every leg; evidence must match it exactly. */
-  acceptanceEnvironment?: string;
-  /** Optional discipline track; carried by the implementation leg only, release/deploy legs stay untracked. */
-  discipline?: string;
-  /** Optional project override persisted on all three legs so the chain stays on one project. */
-  project?: string;
-  /** Optional code repository persisted on all three legs (see CreateTask.codeRepoPath). */
-  codeRepoPath?: string;
-  /** Worktree lane shared by the three legs; defaults to one fresh lane per delivery so parallel changes never share a tree. */
-  lane?: string;
-  dependencies?: TaskId[];
-  idempotencyKey: string;
-}
-
-/** owner only: re-point a owner block — execute, or a provable normal non-owner review block — at unmet dependencies instead of the manager. */
-export interface DeferTaskUntil {
-  /** manager: dependencies finish into a fresh owner wait; no employee is dispatched automatically. */
-  continuation?: 'execute' | 'manager';
-  taskId: TaskId;
-  /** Dependencies to merge into the task's existing set (union, same goal, acyclic after resolution). */
-  dependencies: TaskId[];
-  /** Business reason for the wait; audited together with the before/after dependency snapshot and the restore phase. */
-  text: string;
-  idempotencyKey: string;
-  /** Optimistic concurrency: refuse when the task version has moved. */
-  expectedVersion?: number;
-}
-
-/**
- * owner only: append real prerequisites to an existing execute-phase dependency wait. The original
- * wait reference and every existing dependency stay in place; the task remains blocked and is
- * never auto-resumed — when the wait and all prerequisites finish it returns to owner instead.
- */
-export interface AppendDependencyPrerequisites {
-  taskId: TaskId;
-  /** Real task ids in the same goal; at least one must not already be a dependency. */
-  dependencies: TaskId[];
-  /** Business reason; audited with the before/after snapshot and the preserved wait reference. */
-  text: string;
-  idempotencyKey: string;
-  /** Required optimistic concurrency: refuse when the task version has moved. */
-  expectedVersion: number;
-}
-
-/** product: retire a task to the terminal 'void' state; dependents stop waiting on it. */
 export interface RetireTask {
   taskId: TaskId;
   /** Business reason for the retirement; audited together with the before-state snapshot. */
@@ -795,269 +544,6 @@ export interface RetireTask {
 }
 
 /** The phase a policy applies to: taking and writing code (execute), or deciding a review. */
-export type IndependenceStage = 'execute' | 'review';
-
-/**
- * Which contributors of a source task count. `execute_handlers`: every execute-phase handler of the source (its authors, including a
- * claim that never submitted, and its implementer). `all_handlers`: those plus every reviewer of the source.
- */
-export type IndependenceMode = 'execute_handlers' | 'all_handlers';
-
-/** Who may not take or decide a task: the contributors of its source tasks and the employees a manager names (SYS-DISP IR01). */
-export interface IndependencePolicy {
-  /** Format version. Only 1 is understood; any other value fails closed. */
-  schema: 1;
-  /** Starts at 1 and rises by one with every accepted change. */
-  revision: number;
-  stages: IndependenceStage[];
-  sources: TaskId[];
-  mode: IndependenceMode;
-  /** Employees named explicitly (for example a code author or QA). Only these employees and anyone sharing a registered identity principal with them are excluded (SYS-DISP Q3): a definition is a capacity template, never an identity, so its other employees stay independent. */
-  excluded: EmployeeId[];
-  reason: string;
-  setBy: EmployeeId;
-  setAt: string;
-}
-
-/**
- * A registered identity principal (SYS-DISP IR02/Q3): the explicit, manage-controlled link that makes several employeeIds one
- * person for independence purposes. This is the ONLY cross-employee identity key: a definition, provider, model, name or
- * directory never implies it, and an unregistered link is never recognized.
- */
-export interface IdentityPrincipalView {
-  id: string;
-  /** Employees registered to this principal. */
-  employees: EmployeeId[];
-  /** Why these are one person (required, audited). */
-  reason: string;
-  setBy: EmployeeId;
-  setAt: string;
-}
-
-/**
- * Candidate-level read-only preflight (SYS-DISP IR01): would this one employee be excluded by this one task's policy at this stage,
- * exactly as the claim/submit gate would refuse them? A read only: it never takes a lease, never advances a version and never writes
- * anything, so an already finished task stays readable — which is the tool's main use.
- */
-export interface IndependenceCheckInput {
-  taskId: TaskId;
-  employeeId: EmployeeId;
-  /** Stage to judge at; omit to infer it from the task's current phase (review while in review, execute otherwise). */
-  stage?: IndependenceStage;
-}
-
-/**
- * The preflight answer. `clear` means the gate would admit the candidate at this stage; `conflict` means it would refuse (with the
- * same `via`/`source`/`matched`/`role`/`principal`/`auditRef` facts the refusal carries); `unverifiable` means the exclusion could not
- * be read and the gate fails closed, so it is NEVER a pass; `not_applicable` means the task has no policy (legacy behaviour).
- */
-export type IndependenceVerdict = 'clear' | 'conflict' | 'unverifiable' | 'not_applicable';
-
-/** The registered policy as the preflight echoes it, so QA can read the actual values back without a second source. */
-export interface IndependenceCheckPolicyView {
-  revision: number;
-  stages: IndependenceStage[];
-  mode: IndependenceMode;
-  sources: TaskId[];
-  excluded: EmployeeId[];
-  setBy: EmployeeId;
-  setAt: string;
-}
-
-/** One preflight reading: the verdict with the facts behind it, and the policy actually registered on the task. */
-export interface IndependenceCheckView {
-  taskId: TaskId;
-  employeeId: EmployeeId;
-  stage: IndependenceStage;
-  verdict: IndependenceVerdict;
-  via?: 'contributor' | 'explicit' | 'same_principal';
-  /** Source task the match came from (a contributor match, or an identifier link to one). */
-  source?: TaskId;
-  matched?: EmployeeId;
-  role?: 'author' | 'implementer' | 'reviewer';
-  /** Registered principal that made the match, when the match came from an identity link. */
-  principal?: string;
-  /** The contribution audit row that proves the match, as the refusal's details.conflicts cites it. */
-  auditRef?: string;
-  reason: string;
-  /** Present whenever the task has a policy; absent when there is none (verdict not_applicable). */
-  policy?: IndependenceCheckPolicyView;
-}
-
-/** Manager write of a task's independence policy: creates the first one, or replaces it under a compare-and-set. */
-export interface SetIndependence {
-  taskId: TaskId;
-  stages: IndependenceStage[];
-  sources: TaskId[];
-  mode: IndependenceMode;
-  excluded?: EmployeeId[];
-  reason: string;
-  /** Compare-and-set: refuse when the task version has moved. */
-  expectedVersion: number;
-  idempotencyKey: string;
-}
-
-/** Manager write of an identity principal: register the link, or set its exact employee set, under a compare-and-set. */
-export interface SetIdentityPrincipal {
-  /** Existing principal to change; omit to register a new one. */
-  principalId?: string;
-  /** The complete employee set of the principal after the write (at least 1, at most 20). */
-  employees: EmployeeId[];
-  /** Why these are one person (required, audited). */
-  reason: string;
-  /** Compare-and-set on the principal row: refuse when it has moved. Omit for a new principal. */
-  expectedVersion?: number;
-  idempotencyKey: string;
-}
-
-/** owner (manage): record a new code implementer for an execute-phase task whose bound implementer cannot continue. */
-export interface ImplementerTakeover {
-  taskId: TaskId;
-  /** Takes over code work; must hold the task's execute role and capability. */
-  toEmployee: EmployeeId;
-  /** Required when toEmployee is a current reviewer: a different, independent engineer that will review. */
-  replacementReviewer?: EmployeeId;
-  /** Compare-and-set: refuse when the task version has moved. */
-  expectedVersion: number;
-  /** Why the bound implementer is replaced; audited. */
-  reason: string;
-  idempotencyKey: string;
-}
-
-/** owner (manage): read-only dry-run of the acceptance reference repair for a quick/software goal. */
-export interface GoalAcceptancePreview {
-  goalId: string;
-  /** Candidate 运营验收 task (kind task, product executor, owner reviewer) that would take over the references. */
-  candidateTaskId?: TaskId;
-}
-
-/** owner (manage): commit the acceptance reference repair; compare-and-set on the preview snapshot. */
-export interface GoalAcceptanceRepair {
-  goalId: string;
-  /** The voided task the goal's manual/acceptance references must still point at. */
-  expectedOldTaskId: TaskId;
-  candidateTaskId: TaskId;
-  /** snapshot.hash from goal_acceptance_preview; any drift in the repair basis refuses the commit. */
-  snapshotHash: string;
-  /** Business reason, audited with the before and after references. */
-  text: string;
-  idempotencyKey: string;
-}
-
-export interface GoalAcceptanceTask {
-  id: TaskId;
-  title: string;
-  state: TaskState;
-  executorRole: Role;
-  reviewerRole: ReviewerRole;
-  kind: TaskKind;
-  version: number;
-  blockedTo?: 'owner';
-  submitted: boolean;
-  leaseHolder?: string;
-  dependencies: TaskId[];
-}
-
-export interface GoalAcceptanceView {
-  goal: {
-    id: string; title: string; state: GoalView['state']; tier?: GoalTier; pipeline: string; project?: string;
-    tasks: Record<string, string>; anchors: TaskId[];
-  };
-  /** The live manual/acceptance task the goal points at (expected to be void before a repair). */
-  replaced?: GoalAcceptanceTask;
-  /** Goal work that is neither done nor void; the candidate must depend on all of it. */
-  unfinished: GoalAcceptanceTask[];
-  candidate?: GoalAcceptanceTask & { missing: TaskId[] };
-  diff: {
-    manual: { from?: TaskId; to?: TaskId }; acceptance: { from?: TaskId; to?: TaskId };
-    anchors: { from: TaskId[]; to: TaskId[] };
-  };
-  /** Every rule the repair would break; empty when the repair is ready. */
-  violations: Array<{ code: string; message: string }>;
-  ready: boolean;
-  snapshot: { version: 1; hash: string };
-}
-
-export interface GoalAcceptanceResult {
-  goalId: string;
-  replacedTaskId: TaskId;
-  candidate: GoalAcceptanceTask;
-  anchors: TaskId[];
-  snapshotHash: string;
-  repairedAt: string;
-}
-
-// ---- SYS07 P2：目标成果契约、终验图、只读看板与经营指标 ----
-
-export interface GoalConsoleQuery {
-  goalId?: string;
-  includeClosed?: boolean;
-  needsRepairOnly?: boolean;
-  pageSize?: number;
-  cursor?: string;
-}
-
-/** SYS07 write: structured outcome and required evidence for one goal; version-locked scope change. */
-export interface GoalOutcomeRegisterInput {
-  goalId: string;
-  /** 0 when the goal has no contract yet; otherwise the version returned by the last read. */
-  expectedVersion: number;
-  expected: string;
-  requiredEvidence: RequiredEvidenceKind[];
-  responsibleRole: string;
-  /** Absolute instant with an offset, or omitted (unknown deadline, never computed from a duration). */
-  deadline?: string;
-  timezone?: string;
-  reason: string;
-  idempotencyKey: string;
-}
-
-export interface GoalEvidenceRecordInput {
-  goalId: string;
-  kind: GoalEvidenceInput['kind'];
-  summary: string;
-  source: string;
-  confirmedBy: string;
-  evidenceType: GoalEvidenceInput['evidenceType'];
-  at?: string;
-  taskId?: TaskId;
-  reason: string;
-  idempotencyKey: string;
-}
-
-export interface GoalFinalizeInput {
-  goalId: string;
-}
-
-export interface GoalFinalGatePreviewInput {
-  goalId: string;
-  candidateTaskId?: TaskId;
-}
-
-export interface GoalFinalGateRepairRequest {
-  goalId: string;
-  candidateTaskId: TaskId;
-  expectedOldTaskId?: TaskId;
-  expectedGoalVersion: number;
-  snapshotHash: string;
-  reason: string;
-  idempotencyKey: string;
-}
-
-export interface GoalMetricsQuery {
-  /** Absolute instant with offset; omitted means the default last-30-days window. */
-  from?: string;
-  to?: string;
-  timezone?: string;
-  goalId?: string;
-  /** A full answer over the response budget is served as sections; ask for one section at a time. */
-  section?: GoalMetricsSection;
-  /** Page size for list-shaped sections (usage_by_goal, missing evidence, day_series, blocks_by_actor). */
-  pageSize?: number;
-  cursor?: string;
-}
-
-/** deliveryId + fence are mandatory for every write after claim. */
 export interface LeaseProof {
   taskId: TaskId;
   deliveryId: DeliveryId;
@@ -1068,12 +554,14 @@ export interface LeaseProof {
 export interface Evidence {
   /** Engineering company-system release/deploy only. Bound to this lease write and a reviewed main commit. */
   companyUpgrade?: { sha: string };
-  executionWindow?: import('./task-recovery.ts').ExecutionWindow;
-  recoveryReason?: import('./task-recovery.ts').RecoveryReason;
   text: string;
   idempotencyKey: string;
   /** SYS02: the head this submission is bound to; machine evidence must match it. */
   acceptance?: { sha?: string; environment?: string };
+  /** Top-level shorthand for acceptance.sha (code deliverables may pass either). */
+  sha?: string;
+  /** Follow-up proposals, max 20: each creates a planned child typed through the route table. */
+  next?: Array<{ type: string; title: string; requirement?: string; acceptance?: string }>;
 }
 
 export interface OutboxEvent {
@@ -1129,266 +617,14 @@ export interface PluginRuntimeView {
  */
 export const PLUGIN_RUNTIME_ROLES: readonly Role[] = ['product', 'qa'];
 
-/**
- * owner dry-run of the contributor derivation (SYS-DISP AC05): read-only. `timeline` is the task's audit stream, oldest first,
- * with the role each row plays. `status` and `suggestedImplementer` are advice; nothing here writes an implementer.
- */
-export interface ContributorDryRunView {
-  readOnly: true;
-  checkedAt: string;
-  /** UTF-8 JSON bytes the whole answer is held to (SYS-DISP, SYS01 budget). */
-  budgetBytes: number;
-  /** True when at least one task's timeline was cut to fit `budgetBytes`; the cut is marked per task. */
-  truncated: boolean;
-  tasks: Array<{
-    taskId: string; found: boolean; title?: string; state?: TaskState; version?: number;
-    executorRole?: string; reviewerRole?: string; currentEmployee?: string; lastSubmitter?: string;
-    status?: 'bound' | 'proposal' | 'manager_decision' | 'fresh'; implementer?: string; suggestedImplementer?: string;
-    authors?: string[]; reviewers?: string[]; excluded?: string[];
-    unknown?: Array<{ actor: string; action: string; at?: string; reason: string }>; note?: string;
-    /** The newest rows that fit, oldest first. `timelineTotal` counts every row of the task; `timelineShown` is how many are here. */
-    timeline?: Array<{ at: string; version?: number; actor?: string; action: string; phase?: string; phaseSource?: string; role: string }>;
-    timelineTotal?: number;
-    timelineShown?: number;
-    timelineTruncated?: boolean;
-  }>;
-}
 
-
-/** QA 受限只读取证（SYS-DISP 7454fc89）：owner 登记的范围视图。不携带任何凭证。 */
-export interface QaObservationScopeView {
-  id: string; goalId: string; deploymentTaskId: string; qaEmployee: string;
-  leaseHolder: string; leaseFence: number; subjects: string[];
-  status: 'active' | 'revoked'; expiresAt: string; version: number;
-  reason: string; createdAt: string; revokedAt?: string; revokedReason?: string;
-}
-/** owner 登记 scope：绑定正在审的部署任务、同 goal、QA 实际复核租约 holder/fence、任务 allowlist、期限与理由。 */
-export interface QaObservationGrant {
-  goalId: string; deploymentTaskId: string; qaEmployee: string; leaseFence: number;
-  subjects: string[]; expiresAt: string; reason: string; idempotencyKey: string;
-}
-export interface QaObservationRevoke { scopeId: string; expectedVersion: number; reason: string; idempotencyKey: string; }
-/** 读接口的两种调用身份：员工本人的 sck 凭证，或浏览器受限会话令牌（都不是 owner token）。 */
-export interface QaObservationAuth { credential?: Credential; token?: string; }
-export interface QaObservationDispatchReason {
-  code: string; text: string; candidates: string[]; owner: string; recovery: string;
-  nextTrigger: string; basis: string; until?: string;
-  /**
-   * Structured recovery actions with their authority and tool (F1). Observations written before this field existed do not
-   * carry it: the page shows the action as unknown rather than inventing one.
-   */
-  actions?: Array<{ authority: string; label: string; tool?: string; executable: boolean }>;
-}
-
-/**
- * The goal-level root blocker for a QA goal summary (F2). Built by the same server-side evaluator the owner pulse uses
- * (goalRootBlockers over the pass's verdicts); the QA channel never re-derives a parallel conclusion.
- * `factsAvailable` is false when the waiting graph / people could not be read: impact, dependencyPath and people are then
- * omitted (unknown), never reported as zero or empty-as-fact.
- */
-export interface QaObservationGoalRoot {
-  taskId: string; title: string; phase: 'execute' | 'review'; workflowState: 'ready' | 'doing' | 'review';
-  summary: string; feasible: boolean; waitingMinutes: number; since?: string; checkedAt: string;
-  eligibleCount: number; undispatchable: number; others: number;
-  /** The notice key of the root verdict, so a QA can name the episode the owner was told about. */
-  noticeKey?: string;
-  factsAvailable: boolean;
-  impact?: number;
-  dependencyPath?: Array<{ taskId: string; title: string }>;
-  people?: { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number };
-  reasons: QaObservationDispatchReason[];
-  reasonsOmitted?: number;
-}
-export interface QaObservationGoalWaitRoot {
-  goalId?: string;
-  taskId: string;
-  title: string;
-  workflowState: 'ready' | 'doing' | 'review' | 'blocked' | 'done' | 'void' | 'unknown';
-  kind: 'dependency' | 'owner' | 'active_lease' | 'unknown';
-  basis: string;
-  waitingForRole: string;
-  nextTrigger: string;
-  goalRootCount: number;
-  impact?: number;
-  dependencyPath?: Array<{ taskId: string; title: string }>;
-  dependencyPathTruncated?: boolean;
-  unknownReason?: string;
-  people?: { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number };
-  peopleSource?: 'contributor-audit';
-  submitterSource?: 'submit-audit';
-  submitCommitSource?: 'submit-audit-evidence';
-  peopleCheckedAt?: string;
-  submitCheckedAt?: string;
-}
-export interface QaObservationGoalWaitSummary {
-  source: 'workflow-graph';
-  available: boolean;
-  checkedAt?: string;
-  totalRoots: number;
-  shownRoots: number;
-  truncated: boolean;
-  /** true when the cut was made for the response byte budget, not only by the root limit: roots or paths were shortened. */
-  budgetLimited?: boolean;
-  reason?: string;
-  roots: QaObservationGoalWaitRoot[];
-}
-
-export interface QaObservationDispatchVerdict {
-  phase: 'execute' | 'review'; dispatchable: boolean; workflowState: string;
-  eligibleCount: number; feasible: boolean; summary: string;
-  reasons: QaObservationDispatchReason[]; checkedAt: string; since?: string; waitingMinutes: number;
-}
-export interface QaObservationDispatch {
-  available: boolean; source: string; checkedAt?: string; reason?: string;
-  /** true only when the stored pass is a complete observation; false means partial/unavailable, never a silent cut. */
-  complete?: boolean;
-  /** Counts of the pass before any storage decision; a reader can compare them with what it received. */
-  originalVerdicts?: number; originalReasons?: number;
-  /** The latest persistence attempt: the stored snapshot is stale when the last write failed. */
-  attemptAt?: string; attemptOk?: boolean;
-  verdicts?: QaObservationDispatchVerdict[];
-}
-export interface QaObservationMeta {
-  checkedAt: string; dataSource: 'live'; instanceAt: string; runtimeRelease?: string;
-  scope: QaObservationScopeView;
-  completeness: { complete: boolean; taskRead?: boolean; contextIncluded?: boolean; timelinePaged?: boolean; dispatchComplete?: boolean };
-}
-export interface QaObservationReadInput { scopeId?: string; taskId?: string; goalId?: string; }
-export interface QaObservationContribution {
-  authors: string[]; reviewers: string[]; excluded: string[];
-  unknown: Array<{ actor: string; action: string; at?: string; reason: string }>;
-  implementer?: string; ambiguous: boolean;
-}
-export interface QaObservationReadView {
-  meta: QaObservationMeta;
-  task?: TaskView;
-  contribution?: QaObservationContribution;
-  dispatch?: QaObservationDispatch;
-  goal?: { id: string; states: Record<string, number>; total: number; undispatchable?: number; checkedAt?: string;
-    dispatchAvailable?: boolean; dispatchComplete?: boolean; dispatchSource?: string; dispatchReason?: string;
-    dispatchCheckedAt?: string; dispatchAttemptAt?: string; dispatchAttemptOk?: boolean;
-    /** Workflow waits are read from a separately timed, goal-scoped graph, not the dispatcher pass. */
-    waits?: QaObservationGoalWaitSummary;
-    /** F2: the goal's root blocker from the same evaluator the owner page reads, with impact and dependency path. */
-    root?: QaObservationGoalRoot };
-  contextOmitted?: boolean; contextBytes?: number; contextSha256?: string;
-  contextRead?: { taskId: string; field: 'context'; offset: number };
-}
-export interface QaObservationTimelineView { meta: QaObservationMeta; history: HistoryEntry[]; page: PageInfo }
-export interface QaObservationTextSegment {
-  meta: QaObservationMeta; taskId: string; field: 'context' | 'evidence'; auditId?: string;
-  totalBytes: number; sha256: string; offset: number; bytes: number; nextOffset: number | null; text: string;
-}
-export interface QaObservationSessionView { scope: QaObservationScopeView; code: string; expiresAt: string; /** The restricted read-only page path; the QA opens the preview LAN /q/ page. */ pagePath?: string; }
-export interface QaObservationLoginView { scope: QaObservationScopeView; token: string; expiresAt: string; }
-/** SYS-INT 评审协同唤醒的线形状：声明在 src/review-events.ts（纯规则），这里只做转出，避免三份漂移的副本。 */
-export type {
-  QaScopeSignalInput, QaScopeSignalView, ReviewDeliveryView, ReviewEventKind, ReviewSignalKind, ReviewSignalView,
-  ReviewWakeView, ReviewWatchCloseInput, ReviewWatchInput, ReviewWatchStatusInput, ReviewWatchView,
-} from './review-events.ts';
-
-/**
- * SYS03: the manager-disposition ledger's wire shapes. They are declared once in src/disposition.ts (the module that
- * owns the episode claim, the business idempotency key and the notice/action records) and re-exported here so the tool
- * layers (MCP, sidecar) and the core interface share one definition instead of three drifting copies.
- */
-export type {
-  DispositionActionName, DispositionClaimInput, DispositionClaimOutcome, DispositionClaimView, DispositionDecideInput,
-  DispositionDecideOutcome, DispositionDecisionView, DispositionNoticeKind, DispositionPhase, DispositionRepairInput,
-  DispositionStatusInput, DispositionStatusView, ExternalActionRequestInput, ExternalActionView,
-  ExternalActionTarget, HolderNoticeView,
-} from './disposition.ts';
-import type {
-  DispositionClaimInput, DispositionClaimOutcome, DispositionClaimView, DispositionDecideInput, DispositionDecideOutcome,
-  DispositionPhase, DispositionStatusInput, DispositionStatusView, ExternalActionRequestInput, ExternalActionView,
-  HolderNoticeView,
-} from './disposition.ts';
 
 /**
  * SYS05: typed wait entry. The employee hands over why it stops; the core normalizes, stores the progress and
  * releases the lease in one transaction. Times must carry an explicit offset.
  */
-export interface WaitEntryInput {
-  kind: string;
-  ownerRole?: string;
-  reference?: string;
-  referenceTaskId?: string;
-  notBefore?: string;
-  expiresAt?: string;
-  nextCheckAt?: string;
-  timezone?: string;
-  completed?: string[];
-  pendingAction?: string;
-  handoffFile?: string;
-  reason: string;
-  summary?: string;
-}
-/** A trusted external event that would release a wait. `signature` is verified only for webhook sources. */
-export interface WaitResolveInput {
-  waitKey?: string;
-  taskId?: string;
-  source: string;
-  provider?: string;
-  account?: string;
-  eventId?: string;
-  at?: string | number;
-  objectWaitId?: string;
-  objectTaskId?: string;
-  ownerQuote?: string;
-  payloadDigest?: string;
-  signature?: string;
-  text: string;
-  idempotencyKey: string;
-}
-export interface WaitResolveView {
-  released: boolean;
-  code: string;
-  message: string;
-  taskId?: string;
-  waitKey?: string;
-  /** The dedupe key the source event landed on, when it had one. */
-  eventKey?: string;
-}
-export interface WaitActionInput {
-  waitKey: string;
-  expectedVersion: number;
-  reason: string;
-  idempotencyKey: string;
-  /** Cancel: true only when the authorized caller states the blocker is gone. */
-  resume?: boolean;
-  /** Extend: the new absolute instants. */
-  notBefore?: string;
-  expiresAt?: string;
-  nextCheckAt?: string;
-}
-export interface WaitActionView {
-  ok: boolean;
-  message: string;
-  waitKey: string;
-  taskId?: string;
-  version?: number;
-}
-export interface WaitListView {
-  waits: TaskWaitView[];
-  total: number;
-}
-export interface WaitMigrationPreviewView {
-  candidates: WaitMigrationCandidate[];
-  /** Owner gates are never migrated automatically; the count says how many were held back. */
-  ownerGatesBlocked: number;
-  generatedAt: string;
-}
-/** SYS05: migrate exactly one legacy time-bounded task, under its version, after the dry-run. */
-export interface WaitMigrationApplyInput {
-  taskId: TaskId;
-  expectedVersion: number;
-  reason: string;
-  idempotencyKey: string;
-}
-
 export interface CompanyCore {
   /** Read-only write-scope preflight for the dispatcher: the holders that would refuse an execute claim now (SYS-DISP R1). */
-  writeScopeOf(taskId: TaskId, employeeId?: string): Promise<WriteScopeHolder[]>;
   authenticate(credential: Credential): Promise<Principal>;
   listTasks(credential: Credential, state?: TaskState): Promise<TaskView[]>;
   /**
@@ -1423,65 +659,9 @@ export interface CompanyCore {
    */
   release?(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;
   block(credential: Credential, proof: LeaseProof, to: 'owner', evidence: Evidence, quotaResetsAt?: string): Promise<TaskView>;
-  /**
-   * SYS05: enter a typed wait. Atomically stores the progress, releases the execution lease and takes the task out
-   * of the dispatch queue until the condition is released. Optional for old adapters.
-   */
-  wait?(credential: Credential, proof: LeaseProof, evidence: Evidence, input: WaitEntryInput): Promise<TaskView>;
-  /** SYS05: resolve a wait from a trust-checked external event (signed webhook, authorized manager, owner relay). */
-  resolveWait?(credential: Credential, input: WaitResolveInput): Promise<WaitResolveView>;
-  /** SYS05: cancel a wait under its version. Without `resume` the task stays blocked for the manager. */
-  cancelWait?(credential: Credential, input: WaitActionInput): Promise<WaitActionView>;
-  /** SYS05: extend/re-arm a wait under its version, with a reason. */
-  extendWait?(credential: Credential, input: WaitActionInput): Promise<WaitActionView>;
-  /** SYS05: read the waits of one task (or the open ones), owner/owner-side. */
-  listWaits?(credential: Credential, input?: { taskId?: string; state?: string; limit?: number }): Promise<WaitListView>;
-  /** SYS05: the owner handoff cards; unknown expiry stays unknown. */
-  waitHandoffCards?(credential: Credential): Promise<WaitHandoffCard[]>;
-  /** SYS05: read-only dry run for legacy tasks; never releases an owner gate. */
-  waitMigrationPreview?(credential: Credential): Promise<WaitMigrationPreviewView>;
-  /** SYS05: migrate one named legacy task into a wait; owner gates refused, version-locked, audited. */
-  waitMigrationApply?(credential: Credential, input: WaitMigrationApplyInput): Promise<TaskView>;
   resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView>;
-  /** FV06 P0: owner only — windowed resume with a bounded standby direct assignment (progress_at/standby_until written in the resume transaction). */
-  resumeStandby?(credential: Credential, taskId: TaskId, evidence: Evidence, standbyEmployee: string): Promise<TaskView>;
-  /** FV06 P1: owner only — read-only standby precheck; per-item {ok, code}; audited, never writes task state or budget.
-   *  An item may carry the executionWindow the owner is about to bind (the task row only has one after a windowed resume). */
-  verifyStandby?(credential: Credential, input: { items: Array<{ taskId: string; employeeId: string; executionWindow?: import('./task-recovery.ts').ExecutionWindow }>; idempotencyKey: string }): Promise<{
-    items: Array<{ taskId: string; employeeId: string; ok: boolean; code?: string; message?: string }>;
-    note: string; protocol: string;
-  }>;
-  /** owner only: a owner block becomes a dependency wait — stays blocked for the dispatcher; the last dependency restores ready (execute) or review (provable non-owner review block). */
-  deferTaskUntil(credential: Credential, input: DeferTaskUntil): Promise<TaskView>;
-  /**
-   * owner only: append real prerequisites to an existing execute-phase dependency wait under manager
-   * continuation. The wait reference and existing dependencies stay; owner gates, review-phase
-   * waits, live leases, cross-goal/cyclic dependencies and terminal tasks are refused. It never
-   * resumes the task, clears faults/budgets or widens ordinary dispatch. Optional for old adapters.
-   */
-  appendDependencyPrerequisites?(credential: Credential, input: AppendDependencyPrerequisites): Promise<TaskView>;
-  /** product: mark a task 'void' (terminal), release any lease on it, and unlock dependents that were waiting only on it. */
+  /** product: mark a task 'void' (terminal), release any lease on it, and release any planned children. */
   retireTask(credential: Credential, input: RetireTask): Promise<TaskView>;
-  /** owner (manage): read-only dry-run of repointing a quick/software goal's acceptance reference; writes nothing. */
-  goalAcceptancePreview?(credential: Credential, input: GoalAcceptancePreview): Promise<GoalAcceptanceView>;
-  /** owner (manage): compare-and-set repair of a quick/software goal's acceptance reference; audited and idempotent. */
-  goalAcceptanceRepair?(credential: Credential, input: GoalAcceptanceRepair): Promise<GoalAcceptanceResult>;
-  /** SYS07: one paged, read-only goal console (deadline, outcome stages, blockers, gate, evidence). */
-  goalConsole?(credential: Credential, input: GoalConsoleQuery): Promise<GoalPageView>;
-  /** SYS07: read-only dry-run over active goals; never closes, voids or approves anything. */
-  goalGovernanceScan?(credential: Credential, input?: GoalScanQuery): Promise<GoalScanView>;
-  /** SYS07: read-only goal governance metrics; a full answer over budget is segmented by section. */
-  goalMetrics?(credential: Credential, input?: GoalMetricsQuery): Promise<GoalMetricsAnswer>;
-  /** SYS07: register/replace a goal's structured outcome under a version CAS. */
-  goalOutcomeRegister?(credential: Credential, input: GoalOutcomeRegisterInput): Promise<GoalOutcomeView>;
-  /** SYS07: record one immutable outcome receipt (customer activation/adoption or QA/release record). */
-  goalEvidenceRecord?(credential: Credential, input: GoalEvidenceRecordInput): Promise<GoalEvidenceFact>;
-  /** SYS07: re-evaluate the final gate and evidence; marks done or needs_repair, never approves a task. */
-  goalFinalize?(credential: Credential, input: GoalFinalizeInput): Promise<GoalCard>;
-  /** SYS07: read-only preview of a final-gate reference repair. */
-  goalFinalGatePreview?(credential: Credential, input: GoalFinalGatePreviewInput): Promise<GoalFinalGatePreview>;
-  /** SYS07: CAS repair of the final-gate reference; audited, no lease release, no goal completion. */
-  goalFinalGateRepair?(credential: Credential, input: GoalFinalGateRepairRequest): Promise<GoalFinalGateRepairResult>;
   /** SYS01 bounded reads: optional so older adapters still compile; the sidecar and MCP layers check for them. */
   contextView?(credential: Credential, input: Record<string, unknown>): Promise<ContextView>;
   historyView?(credential: Credential, taskId: TaskId, input: Record<string, unknown>): Promise<HistoryPageView>;
@@ -1492,35 +672,6 @@ export interface CompanyCore {
   worktreeRefs?(credential: Credential, input: Record<string, unknown>): Promise<WorktreeRefsSegment>;
   taskText?(credential: Credential, input: Record<string, unknown>): Promise<TaskTextSegment>;
   adminSummary?(credential: Credential, input: Record<string, unknown>): Promise<AdminSummary>;
-  /** owner (manage): record the code implementer of an execute-phase task; audited, idempotent, version-checked. */
-  implementerTakeover?(credential: Credential, input: ImplementerTakeover): Promise<TaskView>;
-  /** Manager (manage capability): write a task's independence policy. Optional for old adapters. */
-  setIndependence?(credential: Credential, input: SetIndependence): Promise<TaskView>;
-  /** Manager (manage capability): register an identity principal, or add/remove employees from it. Optional for old adapters. */
-  setIdentityPrincipal?(credential: Credential, input: SetIdentityPrincipal): Promise<IdentityPrincipalView>;
-  /**
-   * owner and qa, read-only (SYS-DISP IR01-IR05): the verdict the independence gate would give for one employee on one task at one
-   * stage. Writes nothing, so a done or void task stays readable. Optional for old adapters.
-   */
-  independenceCheck?(credential: Credential, input: IndependenceCheckInput): Promise<IndependenceCheckView>;
-  /**
-   * 有效策略层（SYS06 P1），manage 能力持有者（product）：
-   * 写入一版机器策略（显式替代、来源可核、同域冲突拒绝）、撤销、历史与当前有效视图查询、
-   * 变更试算（dry-run 差异 + 受影响任务，只读）与执行隔离（把失去授权的在办任务置为可见的 blocked）。
-   */
-  policySet?(credential: Credential, input: PolicySet): Promise<PolicyView>;
-  policyRevoke?(credential: Credential, input: PolicyRevoke): Promise<PolicyView>;
-  policyList?(credential: Credential, input: PolicyListInput): Promise<PolicyView[]>;
-  policyEffective?(credential: Credential, input: PolicyEffectiveInput): Promise<PolicyEffectiveView>;
-  policyPlan?(credential: Credential, input: PolicyPlanInput): Promise<PolicyPlanView>;
-  policyEnforce?(credential: Credential, input: PolicyEnforceInput): Promise<PolicyEnforceView>;
-  /**
-   * Ops broker 侧的受控工具/账号边界（SYS06 AC02 ③）：范围内生效的 tool_scope 决定允许清单与判定结果。
-   * 判定与任务侧同源（policy.ts），别名规范形也与账户层一致；传了 tool 就返回该次调用的允许/拒绝结论。
-   */
-  policyToolScope?(project: string, input?: { tool?: string; alias?: string; toolNames?: readonly string[] }): Promise<{
-    version: number; hash: string; allowedTools?: string[]; allowedAliases?: string[]; verdict: PolicyVerdict;
-  }>;
   /**
    * SYS04 AC01/AC02: report one machine-classified failure and charge it against the recovery budget of the fault
    * object (task + controlled target + phase). The caller is the ops broker, which knows the phase, the identity
@@ -1556,48 +707,6 @@ export interface CompanyCore {
     phase: FaultPhase; target?: FaultTargetKind; refund: FaultRefund;
   }): Promise<{ refunded: boolean }>;
   /**
-   * Read-only fault diagnosis for one task: budget scopes, episodes, and any open repair chain. Secret-free.
-   * Readable by the task holder, its reviewer, or owner — so a QA acceptance that hits a spent budget can see
-   * nextAllowedAt / attempts / repairTaskId without guessing.
-   */
-  faultStatus?(credential: Credential, input: { taskId: TaskId }): Promise<FaultStatusView>;
-  /**
-   * owner only: lift a spent (or stopped) recovery budget for one incident of a task, after the cause is fixed
-   * or a diagnosis has been recorded. Creates no new budget; resets the existing scope so the next attempt
-   * starts a fresh recovery window. Audited.
-   */
-  faultLift?(credential: Credential, input: { taskId: TaskId; incident: string; reason: string; idempotencyKey: string }): Promise<FaultStatusView>;
-  /**
-   * FV06: owner + manage issues a recovery read grant for one terminal (done) source task. It never changes the
-   * source task, never creates a budget and never lifts one; the grant only lets the named employee run one
-   * operator login, the four fixed GETs in order and a necessary logout, with every call charged to the
-   * source task's own fault keys. The issuer can never be the grantee.
-   */
-  recoveryReadGrant?(credential: Credential, input: RecoveryReadGrantInput): Promise<RecoveryReadStatusView>;
-  /** FV06: owner + manage revokes a grant; the channel closes on its next check and local sessions are dropped. */
-  recoveryReadGrantRevoke?(credential: Credential, input: { grantId: string; reason: string; idempotencyKey: string }): Promise<RecoveryReadStatusView>;
-  /** FV06: read-only grant + call ledger. owner sees all; the grantee and the source task's reviewer see their own. */
-  recoveryReadStatus?(credential: Credential, input: { taskId?: TaskId; grantId?: string }): Promise<RecoveryReadStatusView[]>;
-  /** FV06: channel query — the caller's own grant, active or not; the sidecar binds only active ones. */
-  recoveryGrantFor?(credential: Credential, grantId: string): Promise<RecoveryReadGrantRowView>;
-  /** FV06: channel query — every active grant of the caller, for reload/rebuild (complete credential-scoped read). */
-  recoveryGrantsFor?(credential: Credential): Promise<RecoveryReadGrantRowView[]>;
-  /** FV06: channel bind — issued → bound, audited; refuses when the employee holds an execution lease. */
-  recoveryReadBind?(credential: Credential, input: { grantId: string; fence: number }): Promise<RecoveryReadGrantRowView>;
-  /** FV06: atomic pre-call chain reservation (counts + inFlight), independent of the fault budget reservation. */
-  recoveryReadReserve?(credential: Credential, input: RecoveryReadReserveInput): Promise<RecoveryReadReserveResult>;
-  /** FV06: atomic post-call settle: records the outcome, clears inFlight, advances or stops the chain. */
-  recoveryReadSettle?(credential: Credential, input: RecoveryReadSettleInput): Promise<void>;
-  /** FV06: channel close — audited; expires/stops the grant when the source moved or the TTL passed. */
-  recoveryReadClose?(credential: Credential, input: { grantId: string; fence: number; reason: string }): Promise<void>;
-  /**
-   * Dispatcher-only: hand an execute-phase engineering task to a live engineer when the bound implementer's session is
-   * gone for good (archived, missing, or a failure that cannot be restarted). Same compare-and-set write as the
-   * manager's takeover, audited as `system:dispatcher`. Takes no credential and is never exposed as an agent tool.
-   */
-  systemImplementerTakeover?(input: { taskId: TaskId; toEmployee: EmployeeId; expectedVersion: number; reason: string }): Promise<TaskView>;  /** owner dry-run of the contributor derivation for up to 20 tasks; read-only (SYS-DISP AC05). */
-  contributorDryRun?(credential: Credential, input: { taskIds: string[] }): Promise<ContributorDryRunView>;
-  /**
    * SYS04: authorize a read of the plugin runtime diagnostics (product/qa only) and answer it from the
    * caller's own execution context.
    *
@@ -1606,79 +715,14 @@ export interface CompanyCore {
    * sample itself: only the plugin host can state what it loaded.
    */
   pluginRuntimeDiagnostics?(credential: Credential, sample: () => PluginRuntimeView | Promise<PluginRuntimeView>): Promise<PluginRuntimeView>;
-  /** QA 受限只读取证（SYS-DISP 7454fc89）：owner 登记/撤销/查看范围；QA 换取一次性登录码与受限会话；只读读取。 */
-  qaObservationGrant?(credential: Credential, input: QaObservationGrant): Promise<QaObservationScopeView>;
-  qaObservationRevoke?(credential: Credential, input: QaObservationRevoke): Promise<QaObservationScopeView>;
-  qaObservationStatus?(credential: Credential): Promise<QaObservationScopeView[]>;
-  qaObservationSession?(credential: Credential, input: { scopeId?: string }): Promise<QaObservationSessionView>;
-  qaObservationLogin?(code: string): Promise<QaObservationLoginView>;
-  qaObservationRead?(auth: QaObservationAuth, input: QaObservationReadInput): Promise<QaObservationReadView>;
-  qaObservationTimeline?(auth: QaObservationAuth, input: QaObservationReadInput & { pageSize?: number; cursor?: string }): Promise<QaObservationTimelineView>;
-  qaObservationText?(auth: QaObservationAuth, input: { scopeId?: string; taskId: string; field: 'context' | 'evidence'; auditId?: string; offset?: number; limit?: number; expectSha256?: string }): Promise<QaObservationTextSegment>;
-  /**
-   * SYS-INT 评审协同持久事件唤醒：owner 登记一条同 goal（源任务, 协同任务）订阅；独立 QA 领到源任务 review 租约或
-   * 当前 QA 持有人发出结构化 scope 请求时唤醒协同任务一次，正向取证完成并撤销请求时再唤醒一次。事件只解除协同
-   * 任务自己的 SYS05 feedback 等待，不生成 scope、不写验收、不改源任务租约。
-   */
-  reviewWatchRegister?(credential: Credential, input: ReviewWatchInput): Promise<ReviewWatchView>;
-  reviewWatchClose?(credential: Credential, input: ReviewWatchCloseInput): Promise<ReviewWatchView>;
-  reviewWatchStatus?(credential: Credential, input?: ReviewWatchStatusInput): Promise<ReviewWatchView[]>;
-  /** QA（本人 review 租约持有人）：请求/撤销一次 scope 授权，并触发对应阶段的唤醒。 */
-  qaReviewScopeSignal?(credential: Credential, input: QaScopeSignalInput): Promise<QaScopeSignalView>;
-  /** 只读：结构化信号历史（owner 看全部，QA 看自己的）。 */
-  reviewScopeSignals?(credential: Credential, input?: { taskId?: string; limit?: number }): Promise<ReviewSignalView[]>;
-  /**
-   * SYS03 AC01: claim one blocking episode's disposition. The episode is task+phase+start, keyed by a deterministic id, so
-   * two managers claiming concurrently produce exactly one winner; the loser reads `already_handled` (with the decision) or
-   * `held_by_other` (with the holder). An expired lease is taken over only with an explicit `takeover` and the episode
-   * version the caller read. Optional for old adapters.
-   */
-  claimDisposition?(credential: Credential, input: DispositionClaimInput): Promise<DispositionClaimOutcome>;
-  /** SYS03 AC01/AC04: hand a claim back before its lease expires (episode becomes claimable again); audited and notified. */
-  releaseDisposition?(credential: Credential, input: { taskId: TaskId; phase: DispositionPhase; sinceMs: number; claimToken: string; reason: string }): Promise<DispositionClaimView>;
-  /** SYS03 AC01/AC04 read-only: the episode's current claim and decision, plus the task's newest decided episodes. */
-  dispositionStatus?(credential: Credential, input: DispositionStatusInput): Promise<DispositionStatusView>;
-  /**
-   * SYS03 AC02: one episode, one decision. resume/defer/dependency/retire/repair are recorded under an actor-independent
-   * business idempotency key and a CAS on the claim token, the episode version and the task version; the task change, its
-   * audit row and the notification outbox land in one transaction. Refused for a non-holder, an expired lease, a moved
-   * version or an already handled episode.
-   */
-  decideDisposition?(credential: Credential, input: DispositionDecideInput): Promise<DispositionDecideOutcome>;
-  /** SYS03 AC04: the caller's undelivered holder notices (persistent outbox); resend survives reconnect/restart. */
-  dispositionNotices?(credential: Credential, input?: { ids?: string[] }): Promise<HolderNoticeView[]>;
-  /** SYS03 AC04: delivery receipts. A failed delivery keeps the notice pending with its error; nothing is rolled back. */
-  ackDispositionNotices?(credential: Credential, input: { ids: string[]; error?: string }): Promise<{ delivered: number }>;
-  /**
-   * SYS03 AC03: the controlled entry point for a system-side external action (today: cancel a CI run). Records the real
-   * internal employee, the target run, the reason and the prerequisite task version; requested → result_unknown →
-   * confirmed, retried idempotently under one actionKey. The shared provider account is never recorded as the owner.
-   */
-  cancelCiRun?(credential: Credential, input: ExternalActionRequestInput): Promise<ExternalActionView>;
-  /** SYS03 AC03 read-only: reconcile provider-side run state against the action records; out-of-band changes become unknown_actor. */
-  reconcileCiRuns?(credential: Credential, input: { runs: Array<{ repo: string; runId: string }> }): Promise<{ checked: number; unknownActor: ExternalActionView[]; confirmed: ExternalActionView[]; unreadable: string[] }>;
-  /** SYS03 AC03: attach manager-supplied evidence to an unknown_actor record and name the real internal employee. */
-  attributeCiRun?(credential: Credential, input: { actionKey: string; employeeId: string; evidence: string }): Promise<ExternalActionView>;
-  /** SYS03 AC03 read-only: the recorded external actions. */
-  listExternalActions?(credential: Credential, input?: { actionKey?: string; state?: string; limit?: number }): Promise<ExternalActionView[]>;
 
   listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]>;
   history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]>;
   companyBrief(credential: Credential): Promise<CompanyBrief>;
-  /** owner relays an owner instruction received in a direct conversation; audited as owner-relayed. */
-  relayGoal(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string; tier?: GoalTier; project?: string }): Promise<GoalView>;
-  /** owner: pick the flow template for a goal waiting in triage. */
-  triageGoal(credential: Credential, input: { goalId: string; tier: GoalTier; reason: string }): Promise<GoalView>;
-  /** product: one call creates 实现 → 上线申请 → 合入部署与生产实测 for a code change. */
-  createDelivery(credential: Credential, input: CreateDelivery): Promise<TaskView[]>;
   /** SYS02: record server-verified machine evidence for one acceptance criterion. */
   recordAcceptanceEvidence?(credential: Credential, input: AcceptanceEvidenceInput): Promise<AcceptanceEvidenceRecord>;
   /** SYS02: read the gate and the current verdict for one task (its holder, reviewer, or owner). */
   acceptanceStatus?(credential: Credential, input: { taskId: TaskId }): Promise<AcceptanceStatusView>;
-  /** SYS-INT: read-only versioned acceptance-mapping preview for one task (its holder, reviewer, or owner). */
-  acceptanceMappingPreview?(credential: Credential, input: { taskId: TaskId }): Promise<AcceptanceMappingPreviewView>;
-  /** SYS-INT: owner-only authorized import of a versioned acceptance-mapping bundle under digest + version CAS. */
-  acceptanceMappingImport?(credential: Credential, input: AcceptanceMappingImportInput): Promise<TaskView>;
   /** SYS-INT: start one controlled non-production deploy drill (task holder or owner; audited, host-executed). */
   deployDrillRun?(credential: Credential, input: { taskId: TaskId; runId: string; baseSha: string; candidateSha: string; idempotencyKey: string }): Promise<{ runId: string; pid: number; root: string }>;
   /** SYS-INT: read one deploy drill's state and structured stage records. */
@@ -1693,27 +737,6 @@ export interface CompanyCore {
    * normal lifecycle (the physical tree itself is never deleted here).
    */
   taskProjectUpdate?(credential: Credential, input: { taskId: TaskId; project: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView>;
-  /**
-   * owner only: bind an explicit code repository (code_repo_path) to a blocked execute-phase task.
-   * Workspace allocation and dispatch repoHome/cwd follow the binding; the business project
-   * (taskProject → opsScope/claim.json.project) is untouched. Targets are limited to the ops
-   * repo or a registered project repo_path, canonicalised (symlink/traversal escapes refused).
-   * Version-guarded, idempotent, audited; releases the stale worktree assignment through the
-   * normal lifecycle (the physical tree itself is never deleted here).
-   */
-  bindTaskCodeRepo?(credential: Credential, input: { taskId: TaskId; codeRepoPath: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView>;
-  /** owner only: move unfinished tasks of a large goal into a next-phase goal so the current phase can be accepted. */
-  goalPhaseSplit?(credential: Credential, input: { goalId: string; taskIds: TaskId[]; title: string; reason: string; idempotencyKey: string }): Promise<{ goalId: string; nextGoalId: string; moved: TaskId[]; unlocked: TaskId[] }>;
-  /** owner only: turn a blocked read-only engineering task (kind=task) into a code task in place; policy re-judged, audited. */
-  taskIntentUpdate?(credential: Credential, input: { taskId: TaskId; lane?: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView>;
-  /**
-   * owner only (manage): append the boss's acceptance-requirement amendment to an in-flight task. Append-only —
-   * state, lease/fence/holder, dependencies, acceptance criteria, independence and quota are untouched, and the
-   * task version does not move, so a live lease keeps working. The text lands in task.context (claim.json and
-   * read_task_text), the audit keeps the verbatim ownerQuote, and every employee in notify gets a holder_notices
-   * entry. Version-guarded (expectedVersion) and idempotent.
-   */
-  taskAcceptanceAmend?(credential: Credential, input: { taskId: TaskId; expectedVersion: number; ownerQuote: string; text: string; notify?: string[]; idempotencyKey: string }): Promise<TaskView>;
   /** manage (product): list every employee_def row for workforce review. */
   listDefs(credential: Credential): Promise<DefView[]>;
   /** manage (product): create or update an employee_def via the shared workforce writer; audited. */
@@ -1816,29 +839,8 @@ export interface OwnerDecisionInput {
   idempotencyKey: string;
 }
 
-export interface GoalView {
-  id: string;
-  title: string;
-  brief: string;
-  state: 'triage' | 'active' | 'needs_repair' | 'done' | 'cancelled';
-  tier?: GoalTier;
-  project?: string;
-  /** Production line template this goal runs (software / video / story). */
-  pipeline?: string;
-  /** Repo of the linked project, joined by triagePending; anchors the owner triage session's workspace. */
-  repoPath?: string;
-  /** manual is the 运营验收 anchor; acceptance closes the goal (G3 for standard/program, 运营验收 for quick). */
-  tasks: { intake?: TaskId; plan?: TaskId; manual?: TaskId; acceptance?: TaskId };
-}
-
 export interface CompanyBrief {
   directions: { text: string; source: string; at: string }[];
-  goals: GoalView[];
-  /** SYS07: the same goal cards the console/daily brief use; the MCP company block strips them to keep its
-   * bounded response, and callers read them through goal_console instead. The console caps the list for display;
-   * goalCardCoverage says how many of the total were shown and that the order is active-blocker priority. */
-  goalCards?: GoalCard[];
-  goalCardCoverage?: { shown: number; total: number; omitted: number; snapshotAt: string; prioritized: true };
   projects: ProjectView[];
   paused: boolean;
 }
@@ -1849,209 +851,6 @@ export interface EnrollmentAdmin {
   revoke(employeeId: EmployeeId): Promise<void>;
 }
 
-// ---- 有效策略层（SYS06 P1）：版本化的机器策略、显式替代关系、当前有效契约 ----
-// 类型定义在 src/policy.ts（受限 schema 与判定逻辑同处一文件，避免判定与字段漂移）；这里只做类型引用。
-import type { EffectiveContract, EffectiveDomain, PolicyAuthorization, PolicyDomain, PolicyPayload, PolicyScope, PolicySource, PolicyStatus, PolicyVerdict } from './policy.ts';
 import type { FaultDiagnostic, FaultPhase, FaultRefund, FaultTargetKind, FlowStage } from './faults.ts';
-export type { EffectiveContract, EffectiveDomain, PolicyAuthorization, PolicyDomain, PolicyPayload, PolicyScope, PolicySource, PolicyStatus, PolicyVerdict };
 
 /** One budget scope of a task, as shown to a holder / reviewer / owner. Secret-free. */
-export interface FaultBudgetView {
-  key: string;
-  target: string;
-  phase: string;
-  attempts: number;
-  maxAttempts: number;
-  totalAttempts: number;
-  deadline: number;
-  nextAllowedAt: number;
-  failed: boolean;
-  stopped: boolean;
-  lastErrno?: string;
-  lastHop?: string;
-  lastIncident?: string;
-  stopReason?: string;
-  stopDiagnostic?: FaultDiagnostic;
-}
-
-/** One episode of a cause on a task. */
-export interface FaultEpisodeView {
-  episode: string;
-  incident: string;
-  fingerprint: string;
-  phase: string;
-  state: string;
-  openedAt: string;
-  updatedAt: string;
-  resolvedAt?: string;
-}
-
-/** The open repair chain of an incident, when one exists. */
-export interface FaultRepairView {
-  incident: string;
-  fingerprint: string;
-  taskId?: string;
-  sourceTaskId?: string;
-  state: string;
-  diagnostic?: FaultDiagnostic;
-}
-
-/** Read-only diagnosis of a task's recovery budget. Never carries credentials or upstream bodies. */
-export interface FaultStatusView {
-  taskId: TaskId;
-  now: number;
-  budgets: FaultBudgetView[];
-  episodes: FaultEpisodeView[];
-  repairs: FaultRepairView[];
-}
-
-/** 一版机器策略的登记内容（历史不可变：payload/hash 一版写定）。 */
-export interface PolicyView {
-  id: string;
-  policyId: string;
-  version: number;
-  scope: PolicyScope;
-  scopeRef?: string;
-  domain: PolicyDomain;
-  status: PolicyStatus;
-  effectiveAt: string;
-  expiresAt?: string;
-  supersedes?: string;
-  supersededBy?: string;
-  /** 撤销留下的历史事实：谁撤的、为什么（历史不可变，撤销只关掉"当前生效"）。 */
-  revokedBy?: string;
-  revokeReason?: string;
-  authorization: PolicyAuthorization;
-  payload: PolicyPayload;
-  hash: string;
-  createdBy: EmployeeId;
-  createdAt: string;
-}
-
-/**
- * 写入一版机器策略。授权来源只有老板转录（owner，须能对回一条已登记的老板方向）与经理/运营（manager）两种；
- * 同（作用域, 域）已有生效版本时必须显式 supersedes，否则拒绝——不允许"最新一条文本"静默覆盖。
- */
-export interface PolicySet {
-  policyId: string;
-  scope: PolicyScope;
-  scopeRef?: string;
-  domain: PolicyDomain;
-  payload: PolicyPayload;
-  /** 被本版替代的版本（record id）；同域首次登记时省略。 */
-  supersedes?: string;
-  /** ISO 8601；缺省立即生效。 */
-  effectiveAt?: string;
-  /** ISO 8601；临时授权到期即自动退出有效视图，旧 claim 不能靠它继续写。 */
-  expiresAt?: string;
-  source: PolicySource;
-  /** source=owner 时必须给出，且必须与已登记的老板方向一致；伪造的引文被拒绝。 */
-  ownerQuote?: string;
-  reason: string;
-  idempotencyKey: string;
-}
-
-export interface PolicyRevoke {
-  policyId: string;
-  reason: string;
-  idempotencyKey: string;
-}
-
-export interface PolicyListInput {
-  scope?: PolicyScope;
-  scopeRef?: string;
-  domain?: PolicyDomain;
-  /** true 时连被替代/被撤销的版本一起列出（历史查询）。 */
-  includeInactive?: boolean;
-}
-
-export interface PolicyEffectiveInput {
-  taskId?: TaskId;
-  project?: string;
-  goal?: string;
-  /** 直接给作用域链的显式形式（dry-run 预览用）；给了 taskId/project/goal 时忽略。 */
-  scopeChain?: Array<{ scope: PolicyScope; scopeRef?: string }>;
-}
-
-export interface PolicyEffectiveView {
-  version: number;
-  hash: string;
-  chain: Array<{ scope: PolicyScope; scopeRef?: string }>;
-  domains: EffectiveDomain[];
-  /** 逐域渲染的当前有效契约；提示里只渲染这一段，历史文本留在 policy 表。 */
-  rendered: string;
-  /** 人读的必要说明（非机器契约）：到期与被替代的当前事实。 */
-  notes: string[];
-}
-
-export interface PolicyPlanInput {
-  policyId: string;
-  scope: PolicyScope;
-  scopeRef?: string;
-  domain: PolicyDomain;
-  payload: PolicyPayload;
-  supersedes?: string;
-  effectiveAt?: string;
-  expiresAt?: string;
-  source: PolicySource;
-  ownerQuote?: string;
-  /** 受影响清单的分页（SYS06 R1(b)）：不给就一页，装不下就明确提示怎么翻页；给了就只返回一页。 */
-  pageSize?: number;
-  /** 上一页 page.nextCursor。光标绑定同一份试算（同一调用者、同一提案、同一 planHash）。 */
-  cursor?: string;
-}
-
-/**
- * policy_plan 一页的元数据（SYS06 R1(b)）：affectedTasks 只是 total 里的这一页，正文按真实序列化大小裁到 48 KiB 预算内。
- * 单条就超预算时没有可分页的余地（总数 1 也装不下），这时抛 invalid 并给出该条的字节数——不是 response_too_large，
- * 也不是"收窄查询"能解决的：受影响清单没有收窄入参。
- */
-export interface PolicyPlanPage {
-  pageSize: number;
-  returned: number;
-  total: number;
-  hasMore: boolean;
-  nextCursor?: string;
-  budgetBytes: number;
-}
-
-/** 试算（dry-run）：算出契约差异与受影响任务，写任何东西之前先给人看。 */
-export interface PolicyPlanView {
-  scopeChain: Array<{ scope: PolicyScope; scopeRef?: string }>;
-  before: EffectiveContract;
-  after: EffectiveContract;
-  diff: Array<{ domain: PolicyDomain; before: string; after: string; scope?: PolicyScope; scopeRef?: string }>;
-  /** 受影响的任务：登记的契约 hash 与试算结果不同（含已在办的）。一页的内容见 page；planHash 覆盖全量。 */
-  affectedTasks: Array<{ id: TaskId; title: string; state: TaskState; currentEmployee?: EmployeeId; fromHash?: string; toHash: string; losesAuthorization: boolean;
-    /** 会拦下它的原因（与派工/领取的拒绝理由同源）；losesAuthorization=false 时省略。 */
-    reason?: string }>;
-  /** 候选集扫描的事实（SYS06 R1）：扫了多少在办任务、上限是多少。 */
-  scanned: number;
-  scanLimit: number;
-  /** 扫描被上限截断（不止 200*50 条在办任务）；与 page 无关，是候选集本身不完整的显式信号。 */
-  truncated: boolean;
-  /** 受影响清单的分页：受影响总数、这一页与下一页光标。 */
-  page: PolicyPlanPage;
-  /**
-   * 试算结果的指纹：覆盖生效 epoch、after 契约 hash 与全量受影响清单（与分页无关，翻页时不变）。
-   * 它只用于翻页光标的绑定与人工核对——policy_enforce **不读它**：隔离时对每个**点名**任务按当时的有效契约重新判定，
-   * 所以被点名的那批里，该隔离的会隔离、不该隔离的不会被误伤（判定结果变了就如实报 blocked/absent）。
-   * 但 policy_enforce 只处理点名的 taskIds：试算之后**新出现**且失去授权的在办任务不在这一批里，不会被碰，
-   * 执行前若在办清单可能已经变了，应先重跑 `policy_plan` 再按新清单隔离。
-   */
-  planHash: string;
-}
-
-/** 执行试算结果：对已失去授权的在办任务做可见隔离（置为等待 owner 的 blocked），旧 release 也认得这个状态，不会误派工。 */
-export interface PolicyEnforceInput {
-  taskIds?: TaskId[];
-  reason: string;
-  idempotencyKey: string;
-}
-
-export interface PolicyEnforceView {
-  blocked: TaskId[];
-  alreadyBlocked: TaskId[];
-  absent: TaskId[];
-  audited: number;
-}

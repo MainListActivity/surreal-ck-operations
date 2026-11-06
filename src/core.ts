@@ -1,8 +1,8 @@
-import { readCompanyRelease, type CompanyRelease } from './company-release.ts';
+import { git, readCompanyRelease, type CompanyRelease } from './company-release.ts';
+import { getRoute, listRoutes, CHAIN_LIMIT, type RouteRow } from './routes.ts';
+import { OutboundMessageStore } from './outbound-messages.ts';
 import { drillHost, startDrill, readDrillStatus, type DrillState } from './deploy-drill-service.ts';
 import { validateDrillPlan } from './deploy-drill.ts';
-import { parseExecutionWindow, windowExpired, recoveryReasonSchema } from './task-recovery.ts';
-import { workspaceScopeFor } from './goal-workspace-capability.ts';
 import { authenticationLookup } from './diagnostics.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
@@ -10,11 +10,11 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ActiveLease, AppendDependencyPrerequisites, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, IndependenceCheckInput, IndependenceCheckView, IndependenceCheckPolicyView, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence, SetIdentityPrincipal, IdentityPrincipalView, FaultStatusView, FaultBudgetView, FaultEpisodeView, FaultRepairView, RecoveryReadGrantInput, RecoveryReadStatusView, RecoveryReadGrantRowView, RecoveryReadCallView, RecoveryReadState, RecoveryReadReserveInput, RecoveryReadReserveResult, RecoveryReadSettleInput } from './contracts.ts';
+import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateTask, Credential, DefView, EnsureDef, ProjectView, EmployeeScore, Evidence, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
-import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
-import type { SubmitCheck } from './pr-gate.ts';
+import { ghCli, type GhRunner, type SubmitCheck } from './pr-gate.ts';
+import { githubRepoSlug } from './external-actions.ts';
 import type { SystemCheck } from './submit-checks.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, summarizeModelEvidence, validateScores, writeScorecards, type ModelEvidence } from './scoring.ts';
@@ -28,71 +28,31 @@ import {
   loadAcceptanceGate, recordAcceptanceEvidenceRow, validateAcceptanceCriteria,
   type AcceptanceActor, type AcceptanceSourceAdapter, type AcceptanceTaskRow, type HumanSignoff,
 } from './acceptance.ts';
-import type { AcceptanceCriterion, AcceptanceEvidenceInput, AcceptanceEvidenceRecord, AcceptanceGateInput, AcceptanceGateView, AcceptanceLeg, AcceptanceMappingImportInput, AcceptanceMappingPreviewView, AcceptancePhase, AcceptanceStatusView } from './contracts.ts';
-import {
-  ACCEPTANCE_MAPPING_BUNDLES, SYS_REQUIRED_MAPPING, bundleAppliesTo, mappingBundle, mappingDigest,
-} from './acceptance-mapping.ts';
+import type { AcceptanceCriterion, AcceptanceEvidenceInput, AcceptanceEvidenceRecord, AcceptanceGateInput, AcceptanceGateView, AcceptanceLeg, AcceptancePhase, AcceptanceStatusView } from './contracts.ts';
 import { companyBlock, companyParts } from './company-context.ts';
-import type { PolicyEffectiveInput, PolicyEffectiveView, PolicyEnforceInput, PolicyEnforceView, PolicyListInput, PolicyPlanInput, PolicyPlanPage, PolicyPlanView, PolicyRevoke, PolicySet, PolicyView, ReviewerRole as PolicyReviewerRole } from './contracts.ts';
 import type { AdminSummary, CompanyPart, ContextView, HistoryPageView, PageInfo, ReferencesCut, TaskTextSegment, WorktreePageView, WorktreeRefsSegment } from './contracts.ts';
-import type { QaObservationAuth, QaObservationGrant, QaObservationLoginView, QaObservationMeta, QaObservationReadInput, QaObservationReadView, QaObservationRevoke, QaObservationScopeView, QaObservationSessionView, QaObservationTextSegment, QaObservationTimelineView } from './contracts.ts';
 import { CLEANUP_BUDGET_MS, SnapshotStore, type SnapshotBuildStats, type SnapshotHeader, type SnapshotKind, type SnapshotLimits, untilAt } from './snapshot-store.ts';
 import { arrivedAt } from './reply-clock.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
-import { CONTRIBUTION_MOVED, isContributionMoved, openLeaseOf, proposeImplementer, readAuditTimelineWindow, readContributionView, type ContributionView } from './contributors.ts';
-import { checkIndependence, INDEPENDENCE_LIMITS, normalizeIndependence, policyFault, readEmployeePrincipals, readIndependenceSnapshot, refuseIfExcluded, type IndependenceIndex } from './independence.ts';
-import {
-  POLICY_DOMAINS, POLICY_ID_PATTERN, POLICY_SCOPES, POLICY_SOURCES, checkGateCreation, checkWriteAuthority, contractDiff,
-  dispatchVerdict, domainOfPayload, domainPayload, normalizePayload, policyActiveAt, policyHash, renderContract, resolveEffective,
-  checkToolScope, policyView as policyApiView, type EffectiveContract, type PolicyDomain, type PolicyRow, type PolicyScope, type PolicyScopeLink, type PolicyStatus, type PolicyVerdict,
-} from './policy.ts';
-import { chainOfTaskRow, policyRowView, policyScopeChain, readEffectiveContract, readPolicyEpoch, readPolicyRows, readTaskPolicyRow, registeredDomainsOf, scanInFlightTasks, type PolicyDbRow } from './policy-store.ts';
 import { FaultStore, type FaultCredential, type FaultReportResult, type FaultReserveResult } from './fault-store.ts';
 import {
   DEFAULT_FAULT_BUDGET, budgetKey, classifyFault, faultEvidence, jitterFactorOf, type FaultBudgetLimits,
   type FaultDiagnostic, type FaultInput, type FaultPhase, type FaultRecord, type FaultRefund, type FaultTargetKind,
   type FlowStage,
 } from './faults.ts';
-import { WaitStore, waitRecordOf, type WaitRow } from './wait-store.ts';
-import { ReviewEventStore, watchOfRef } from './review-event-store.ts';
-import type { QaScopeSignalInput, QaScopeSignalView, ReviewSignalView, ReviewWatchCloseInput, ReviewWatchInput, ReviewWatchStatusInput, ReviewWatchView } from './review-events.ts';
-import { GoalGovernanceStore } from './goal-store.ts';
-import type { GoalFinalGateRepairResult, GoalOutcomeView, GoalPageView, GoalScanQuery, GoalScanView, GoalFinalGatePreview } from './goal-store.ts';
-import type { GoalCard, GoalEvidenceFact } from './goal-governance.ts';
-import { segmentGoalMetrics, type GoalMetricsAnswer, type GoalMetricsView } from './goal-metrics.ts';
-import {
-  assertNonSensitive, isTimeZone, migrationPreview, normalizeWait, parseInstant, validateEvent, verifyWaitWebhook,
-  waitEventKey, waitKeyOf, webhookPayload, type WaitEvent, type WaitHandoffCard, type WaitInput,
-} from './waits.ts';
-import type {
-  GoalConsoleQuery, GoalEvidenceRecordInput, GoalFinalGatePreviewInput, GoalFinalGateRepairRequest,
-  GoalFinalizeInput, GoalMetricsQuery, GoalOutcomeRegisterInput,
-  TaskWaitView, WaitActionInput, WaitActionView, WaitEntryInput, WaitListView, WaitMigrationApplyInput,
-  WaitMigrationPreviewView, WaitResolveInput, WaitResolveView,
-} from './contracts.ts';
 
 /** The outcome of a fault report, as the core sees it: the classification plus what the budget decided. */
 type FaultReportOutcome = FaultReportResult;
-import type { ContributorDryRunView, PluginRuntimeView } from './contracts.ts';
+import type { PluginRuntimeView } from './contracts.ts';
 import { PLUGIN_RUNTIME_ROLES } from './contracts.ts';
-import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES, QA_OBSERVATION_WAIT_ROOTS_LIMIT, fitGoalWaitSummary, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
 import { CompanyError } from './core-errors.ts';
-import {
-  RECOVERY_READ_ALIAS, RECOVERY_READ_CALL_DEADLINE_MS, RECOVERY_READ_MAX_CALLS_PER_PATH, RECOVERY_READ_MAX_LOGIN,
-  RECOVERY_READ_PATHS, exactRecoveryPaths, parseRecoveryExpiry,
-} from './recovery-read.ts';
 import { parseBrokerConfig } from './ops/config.ts';
 import { assertEmployeeCiBlockAllowed, createCiBillingCheck, isCiBlockCause, refuseEmployeeCiBlock, type CiBillingCheck } from './github-ci-control.ts';
-import { DispositionLedger, holderNoticeId, type DispositionApplier, type DispositionClaimInput, type DispositionClaimOutcome, type DispositionClaimView, type DispositionDecideInput, type DispositionDecideOutcome, type DispositionPhase, type DispositionStatusInput, type DispositionStatusView, type ExternalActionRequestInput, type ExternalActionView, type HolderNoticeView, type ExternalActionGateway } from './disposition.ts';
-import { createCompanyGithubGateway, githubRepoSlug } from './external-actions.ts';
-import { validateExternalDependencies } from './input-bounds.ts';
 import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
 import { readProviderQuotas } from './dispatcher/quota-store.ts';
 import { providerAdmission } from './provider-admission.ts';
-import { STANDBY_BUDGET_SECONDS_DEFAULT, STANDBY_RELAY_PROTOCOL } from './standby-relay-capability.ts';
-import { goalRootBlockers, type DispatchVerdict, type GoalRootFacts, type GoalRootPeople, type GoalWorkflowWaitSummary } from './dispatcher/dispatch-blocked.ts';
-import { readGoalWorkflowWaitSnapshot } from './dispatcher/goal-roots.ts';
+import type { DispatchVerdict } from './dispatcher/dispatch-blocked.ts';
 import type { WorkIntent, WorktreeAssignment, WorktreeView, WriteScopeHolder } from './contracts.ts';
 import { ROLES } from './contracts.ts';
 export { CompanyError };
@@ -143,101 +103,17 @@ const normalizedId = (value: unknown): string => {
 };
 
 /**
- * A dependency counts as satisfied when it is 'done', or when it is 'void' and not an
- * owner gate. Voiding an owner-reviewed task (prototype demo, acceptance gate) must not
- * stand in for the owner's approval, so dependents on it stay blocked. Exemption: a
- * dependent that is a goal anchor (member of its goal's anchors list) is rollup
- * bookkeeping, not gated work. For anchors every 'void' dependency counts as satisfied,
- * or retiring a gated task could never unblock the goal's acceptance anchor.
+ * Activates planned children of an accepted task: same transaction, state planned → ready,
+ * audit planned_activated per row. Requires $task and $actor in scope.
  */
-const DEP_UNSATISFIED = `state != 'done' AND (state != 'void' OR reviewer_role = 'owner')`;
-export const depUnsatisfiedFor = (holder: string) =>
-  `state != 'done' AND (state != 'void' OR (reviewer_role = 'owner' AND (${holder}.goal = NONE OR ${holder}.id NOT IN (${holder}.goal.anchors ?? []))))`;
-
-/**
- * Resolves a raw dependency id list through superseded_by chains: every superseded draft
- * maps to the tip of its shared `lineage` (superseded_by = NONE) in O(1) — bounded, no
- * traversal. Binds `${p}_resolved` to the resolved id set. Resolution rules:
- *  - un-superseded deps (superseded_by = NONE, including tips) resolve to themselves;
- *  - a superseded dep whose lineage has exactly the visible tip resolves to that tip;
- *  - corrupt data (superseded but missing lineage, or a lineage with no tip) resolves the
- *    dep to itself — the void+owner rule then keeps it conservatively blocked.
- * The unchanged satisfaction rule is applied to the resolved rows by the caller.
- */
-export const RESOLVE_DEP_SQL = (deps: string, p: string) => `
-  LET ${p}_lns = SELECT VALUE lineage FROM task WHERE id IN ${deps} AND superseded_by != NONE AND lineage != NONE;
-  LET ${p}_ok = SELECT VALUE lineage FROM task WHERE lineage != NONE AND lineage IN ${p}_lns AND superseded_by = NONE;
-  LET ${p}_resolved = array::distinct(array::concat(
-    (SELECT VALUE id FROM task WHERE id IN ${deps} AND superseded_by = NONE),
-    (SELECT VALUE id FROM task WHERE lineage != NONE AND lineage IN ${p}_ok AND superseded_by = NONE),
-    (SELECT VALUE id FROM task WHERE id IN ${deps} AND superseded_by != NONE AND (lineage = NONE OR lineage NOT IN ${p}_ok))));
-`;
-
-/**
- * Unlocks blocked children of $task whose dependencies are all finished ('done' or 'void')
- * (retired tasks count as satisfied so downstream chains unblock on retire). Requires
- * $task and $actor in scope. Retire reuses this block without the goal-close below.
- * When the finished task is a screenplay-chain tip, dependents on ANY earlier version of
- * the same lineage are re-evaluated too — their dependency resolves through superseded_by
- * to the finished tip.
- */
-export const UNLOCK_CHILDREN_SQL = `
-  LET $done_row = SELECT * FROM ONLY $task;
-  LET $task_chain = IF ($done_row.lineage ?? NONE) = NONE THEN [$task] ELSE (SELECT VALUE id FROM task WHERE lineage = $done_row.lineage) END;
-  LET $children = SELECT * FROM task WHERE state = 'blocked' AND blocked_to = NONE AND wait_state != 'waiting' AND array::len(array::filter(dependencies ?? [], |$d| $d IN $task_chain)) > 0;
-  FOR $child IN $children {
-    ${RESOLVE_DEP_SQL('$child.dependencies', '$c_dep')}
-    LET $remaining = SELECT * FROM task WHERE id IN $c_dep_resolved AND ${depUnsatisfiedFor('$child')};
-    IF array::len($remaining) = 0 {
-      LET $source_phase = $child.resume_state ?? 'ready';
-      LET $manager = $child.dependency_continuation = 'manager';
-      LET $restore_phase = IF $source_phase = 'review' THEN 'review' ELSE 'ready' END;
-      LET $unlocked = UPDATE ONLY $child.id SET
-        state = IF $manager THEN 'blocked' ELSE $restore_phase END, version += 1,
-        blocked_to = IF $manager THEN 'owner' ELSE NONE END,
-        resume_state = IF $manager THEN $source_phase ELSE NONE END,
-        resume_role = IF $manager THEN $child.resume_role ELSE NONE END,
-        dependency_continuation = NONE,
-        current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE;
-      CREATE audit CONTENT { task: $child.id, actor: $actor, action: 'dependency_unlocked',
-        evidence: '依赖全部完成，按原阻塞阶段恢复', version: $unlocked.version, at: time::now(),
-        source_phase: $source_phase, restore_phase: $restore_phase,
-        dependencies_before: $child.dependencies ?? [], dependencies_after: $child.dependencies ?? [] };
-      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE outbox CONTENT { task: $child.id, kind: 'dependency_unlocked', sequence: $sequence.value,
-        payload: { state: $unlocked.state, source_phase: $source_phase, restore_phase: $restore_phase,
-          dependencies: $child.dependencies ?? [], version: $unlocked.version }, at: time::now() };
-    };
+export const ACTIVATE_PLANNED_SQL = `
+  LET $planned_children = SELECT * FROM task WHERE parent = $task AND state = 'planned';
+  UPDATE task SET state = 'ready', version += 1 WHERE parent = $task AND state = 'planned';
+  FOR $child IN $planned_children {
+    CREATE audit CONTENT { task: $child.id, actor: $actor, action: 'planned_activated',
+      evidence: '父任务验收通过，计划任务转为就绪', version: $child.version + 1, at: time::now() };
   };
 `;
-
-/**
- * Unlocks blocked children of $task whose dependencies are all finished. Goal closure is deliberately NOT a SQL
- * side effect of any accepted task: SYS07 re-evaluates the final gate and the outcome evidence in
- * GoalGovernanceStore.finalize, so a void gate, a superseded revision or a missing customer receipt can never
- * close a goal. Requires $task and $actor in scope.
- */
-export const UNLOCK_SQL = UNLOCK_CHILDREN_SQL;
-
-/**
- * Adds $task as a dependency of the goal's first unfinished anchor (manual, then final
- * acceptance) and re-blocks that anchor, dropping any lease on it. Requires $goal, $task.
- */
-export const GOAL_ANCHOR_SQL = `
-  IF $goal != NONE {
-    LET $g = SELECT * FROM ONLY $goal;
-    IF $g = NONE OR $g.state != 'active' { THROW 'goal not found or closed' };
-    LET $open = array::filter($g.anchors, |$a| $a.state NOT IN ['done', 'void']);
-    IF array::len($open) > 0 {
-      LET $anchor = SELECT * FROM ONLY $open[0];
-      UPDATE employee SET active_task = NONE WHERE active_task = $anchor.id;
-      UPDATE ONLY $anchor.id SET dependencies += $task, state = 'blocked', blocked_to = NONE,
-        resume_state = NONE, current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
-        version += 1;
-    };
-  };
-`;
-
 
 interface EmployeeRow {
   id: RecordId;
@@ -254,8 +130,6 @@ interface EmployeeRow {
 export interface TaskRow {
   company_upgrade?: CompanyRelease;
   recovery_stopped?: boolean;
-  dependency_continuation?: 'execute' | 'manager';
-  execution_window?: import('./task-recovery.ts').ExecutionWindow;
   id: RecordId;
   title: string;
   context: string;
@@ -267,7 +141,6 @@ export interface TaskRow {
   requirement?: string;
   /** The owner-edited acceptance section staged into task.md. */
   acceptance_text?: string;
-  dependencies: RecordId[];
   version: number;
   submitted_by?: string;
   current_employee?: string;
@@ -278,8 +151,7 @@ export interface TaskRow {
   resume_role?: string;
   resume_state?: TaskState;
   kind?: TaskKind;
-  goal?: RecordId;
-  /** Task-level project override (registered project id); NONE falls back to goal.project routing. */
+  /** Task-level project override (registered project id). */
   project?: RecordId;
   /** Explicit code-repo binding (schema 017); workspace/dispatch routing only, never business project resolution. */
   code_repo_path?: string;
@@ -287,33 +159,24 @@ export interface TaskRow {
   model_route_until?:number;
   handover?: boolean;
   previous_employee?: string;
-  /** Bound code implementer: set at the first execute claim or by an explicit owner takeover (schemaless). */
-  implementer?: string;
   /** Open dispatch-blocked episode (schemaless): the phase it blocks and when it began, unix seconds. */
   dispatch_blocked_phase?: string | null;
   dispatch_blocked_since?: number | null;
   progress_at?: number;
+  /** Route type recorded at creation; drives routing, templates and next-chain expansion. */
+  type?: string;
+  /** Chain predecessor record. */
+  parent?: RecordId;
+  /** The submit audit id a proposal was created under. */
+  proposed_in?: string;
+  /** Optional grouping tag. */
+  tag?: string;
   /** Unix seconds: a quota-caused block may not be re-announced to owner before this instant. */
   quota_resets_at?: number | null;
-  /** FV06 P0 (schemaless): unix seconds. The standby direct assignment's deadline, cleared on timeout/normal reclaim. */
-  standby_until?: number | null;
-  /** SYS05: the open typed wait (schemaless task fields, written only by WaitStore.enter). */
-  wait_state?: 'waiting' | null;
-  wait_kind?: string | null;
-  wait_episode?: string | null;
-  wait_not_before?: number | null;
-  wait_expires_at?: number | null;
-  wait_next_check_at?: number | null;
-  wait_owner_role?: string | null;
-  wait_source?: string | null;
-  wait_version?: number | null;
-  wait_entered_at?: unknown;
   evaluated_at?: string;
   model_eval_full_history?: boolean;
   eval_via?: string;
   eval_attempts?: number;
-  jev_release_version?: number;
-  jev_route_version?: number;
   owner_rerouted?: boolean;
   /** SYS02 acceptance fields (schema 026); every one is optional, so rows written before SYS02 stay valid. */
   acceptance_criteria?: AcceptanceCriterion[];
@@ -327,32 +190,14 @@ export interface TaskRow {
   work_intent?: WorkIntent;
   worktree?: WorktreeAssignment;
   repo_path?: string;
-  goal_tier?: string;
-  goal_title?: string;
-  /** Screenplay-revision edge fields (schema 015): see RESOLVE_DEP_SQL. */
+  /** Screenplay-revision edge fields (schema 015). */
   revises?: RecordId;
   superseded_by?: RecordId;
   lineage?: RecordId;
   revision_no?: number;
-  /** Independence policy (schema 023, SYS-DISP IR01): written at creation or by setIndependence, read with the contribution facts. */
-  independence?: IndependenceRow | null;
-  /** Version this task was last checked against as a source of a dependent's gated write (schema 023). */
-  independence_guard?: number | null;
-  /** 有效策略层的契约登记（schema 034）：创建时与每次 claim 时写入，策略变了以后两者不等即拒绝继续写。 */
-  policy_version?: number | null;
-  policy_hash?: string | null;
-  policy_contract?: EffectiveContract | null;
-  lease_policy_version?: number | null;
-  lease_policy_hash?: string | null;
-  policy_block_reason?: string | null;
-  /** 连接读法的投影（goal.project），只在带该投影的查询里出现。 */
-  goal_project?: RecordId;
 }
 
 /** policy 表的一行（snake_case），只在 core 内部出现；对外的形状是 PolicyRow。 */
-
-/** A stored policy: the API shape, with `setAt` as the driver returns it (a Date, or a string in tests). */
-type IndependenceRow = Omit<IndependencePolicy, 'setAt'> & { setAt: Date | string };
 
 /** Compact row for the complete active-lease lookup; keeps task context text out of the recovery path. */
 interface ActiveLeaseRow {
@@ -361,7 +206,6 @@ interface ActiveLeaseRow {
   executor_role: Role;
   reviewer_role: ReviewerRole;
   submitted_by?: string;
-  implementer?: string;
   current_employee?: string;
   delivery_id?: string;
   lease_expires_at?: number;
@@ -370,109 +214,31 @@ interface ActiveLeaseRow {
 }
 export interface IdempotencyRow { payload_digest: string; result: TaskRow }
 
-/** FV06 recovery read grant row as stored (schema 049). */
-export interface RecoveryReadGrantDbRow {
-  id: RecordId;
-  source_task: RecordId;
-  employee: RecordId;
-  alias: string;
-  methods: string[];
-  paths: string[];
-  max_login: number;
-  max_calls_per_path: number;
-  expires_at: Date | string;
-  authorization_task: RecordId;
-  reason: string;
-  state: RecoveryReadState;
-  login_attempts: number;
-  per_path: number[];
-  in_flight?: { path?: string; started_at?: Date | string; deadline?: Date | string; call_id?: string };
-  stop_reason?: string;
-  result_digest?: string;
-  created_by: string;
-  created_at: Date | string;
-  bound_at?: Date | string;
-  closed_at?: Date | string;
-  /** FV06 observability (schema 050): the dispatcher's latest wake attempt and latest skip reason. */
-  last_wake_at?: Date | string;
-  last_skip_reason?: string;
-  fence: number;
-  version: number;
-}
-
-/** The policy as the API states it: `setAt` as an ISO timestamp, whatever the driver returned. */
-function policyView(policy: IndependenceRow): IndependencePolicy {
-  return { ...policy, setAt: policy.setAt instanceof Date ? policy.setAt.toISOString() : String(policy.setAt) };
-}
-
-/** A principal as the API states it, whatever the driver returned for `setAt`. */
-function principalView(principalId: string, employees: readonly string[], reason: string, setBy: string,
-  setAt: Date | string | undefined): IdentityPrincipalView {
-  return { id: principalId, employees: [...employees], reason, setBy,
-    setAt: setAt instanceof Date ? setAt.toISOString() : String(setAt ?? '') };
-}
-
-/**
- * Why a blocked row waits, in terms every view can show (RW06 C3 / RW05). The facts are the row's own: `blocked_to` names a
- * manager or owner gate; a dependency wait carries the phase to restore and, for a review wait, the reviewer role. A review-phase
- * wait never falls back to the execute role when `resume_role` is empty — it names the reviewer role, and a row with no phase
- * fact is `unknown` rather than an implied execute wait.
- */
-export function waitingOf(row: Pick<TaskRow, 'state' | 'blocked_to' | 'resume_state' | 'resume_role' | 'reviewer_role' | 'executor_role' | 'dependencies'>): TaskWaiting | undefined {
-  if (row.state !== 'blocked') return undefined;
-  const resumeState = row.resume_state ?? 'unknown';
-  const role: TaskWaiting['role'] = row.resume_role ? (row.resume_role as Role)
-    : row.blocked_to === 'owner' ? 'owner'
-      : resumeState === 'review' ? row.reviewer_role
-        : (resumeState === 'ready' || resumeState === 'doing') ? row.executor_role
-          : 'unknown';
-  const kind: TaskWaiting['kind'] = row.blocked_to === 'owner' ? 'owner' : 'dependency';
-  return { kind, resumeState, role, dependenciesCount: (row.dependencies ?? []).length };
-}
 
 export function view(row: TaskRow): TaskView {
   return {
     id: asId(row.id), title: row.title, context: row.context, state: row.state,
     requirement: row.requirement ?? undefined, acceptanceText: row.acceptance_text ?? undefined,
-    executionWindow: row.execution_window ?? undefined, dependencyContinuation: row.dependency_continuation ?? undefined,
     executorRole: row.executor_role, reviewerRole: row.reviewer_role,
     discipline: row.discipline ?? undefined,
-    kind: row.kind ?? 'task', goalId: row.goal ? asId(row.goal) : undefined,
+    kind: row.kind ?? 'task',
+    type: row.type ?? undefined, parent: row.parent ? asId(row.parent) : undefined,
+    proposedIn: row.proposed_in ?? undefined, tag: row.tag ?? undefined,
     projectOverlay: row.project ? asId(row.project) : undefined,
     codeRepoPath: row.code_repo_path ?? undefined,
-    dependencies: (row.dependencies ?? []).map(asId), version: row.version,
+    version: row.version,
     submittedBy: row.submitted_by, currentEmployee: row.current_employee,
     deliveryId: row.delivery_id,
     leaseExpiresAt: row.lease_expires_at ? new Date(row.lease_expires_at * 1000).toISOString() : undefined,
-    standbyUntil: row.standby_until ? new Date(row.standby_until * 1000).toISOString() : undefined,
     fence: row.fence,
     blockedTo: row.blocked_to,
     companyUpgrade: row.company_upgrade ?? undefined,
     resumeState: row.state === 'blocked' ? row.resume_state : undefined,
     resumeRole: row.state === 'blocked' ? row.resume_role : undefined,
-    waiting: waitingOf(row),
-    wait: row.wait_state === 'waiting' && row.wait_episode ? {
-      waitKey: row.wait_episode,
-      kind: (row.wait_kind ?? 'time') as NonNullable<TaskView['wait']>['kind'],
-      state: 'waiting',
-      ownerRole: row.wait_owner_role ?? 'unknown',
-      source: (row.wait_source ?? 'time') as NonNullable<TaskView['wait']>['source'],
-      ...(row.wait_not_before === undefined || row.wait_not_before === null ? {} : { notBefore: new Date(row.wait_not_before).toISOString() }),
-      ...(row.wait_expires_at === undefined || row.wait_expires_at === null ? {} : { expiresAt: new Date(row.wait_expires_at).toISOString() }),
-      expiresSource: row.wait_expires_at === undefined || row.wait_expires_at === null ? 'unknown' : 'exact',
-      ...(row.wait_next_check_at === undefined || row.wait_next_check_at === null ? {} : { nextCheckAt: new Date(row.wait_next_check_at).toISOString() }),
-      version: row.wait_version ?? 1,
-    } : undefined,
     handover: row.handover || undefined,
     previousEmployee: row.previous_employee,
-    implementer: row.implementer ?? undefined,
-    independence: row.independence ? policyView(row.independence) : undefined,
     modelTier: row.model_tier,
     workIntent: row.work_intent, worktree: row.worktree,
-    revises: row.revises ? asId(row.revises) : undefined,
-    supersededBy: row.superseded_by ? asId(row.superseded_by) : undefined,
-    lineage: row.lineage ? asId(row.lineage) : undefined,
-    revisionNo: row.revision_no ?? undefined,
     acceptanceCriteria: row.acceptance_criteria ?? undefined,
     acceptanceVersion: row.acceptance_version ?? undefined,
     acceptanceLegacy: row.acceptance_legacy ?? undefined,
@@ -480,12 +246,6 @@ export function view(row: TaskRow): TaskView {
     acceptanceEnvironment: row.acceptance_environment ?? undefined,
     acceptanceAttempt: row.acceptance_attempt ?? undefined,
     acceptanceChain: row.acceptance_chain ?? undefined,
-    policyVersion: row.policy_version ?? undefined,
-    policyHash: row.policy_hash ?? undefined,
-    policyContract: row.policy_contract ?? undefined,
-    leasePolicyVersion: row.lease_policy_version ?? undefined,
-    leasePolicyHash: row.lease_policy_hash ?? undefined,
-    policyBlockReason: row.policy_block_reason ?? undefined,
   };
 }
 
@@ -527,57 +287,21 @@ function requireReviewer(role: string): asserts role is ReviewerRole {
   if (role !== 'owner') requireRole(role);
 }
 
-/** Fields the acceptance repair reads from task rows; keeps context text out of the preview. */
-const GOAL_ACCEPTANCE_TASK_FIELDS = 'id, title, state, executor_role, reviewer_role, kind, version, dependencies, blocked_to, submitted_by, current_employee, lease_expires_at, goal, project';
-type GoalAcceptanceTaskRow = Pick<TaskRow, 'id' | 'title' | 'state' | 'executor_role' | 'reviewer_role' | 'kind' | 'version' | 'dependencies' | 'blocked_to' | 'submitted_by' | 'current_employee' | 'lease_expires_at' | 'goal' | 'project'>;
-interface GoalAcceptanceGoalRow {
-  id: RecordId; title: string; state: string; tier?: string; pipeline?: string; project?: RecordId;
-  anchors?: RecordId[]; tasks?: { intake?: RecordId; plan?: RecordId; manual?: RecordId; acceptance?: RecordId };
-}
-interface GoalAcceptanceCheck { code: 'not_found' | 'invalid' | 'conflict' | 'forbidden'; message: string }
-interface GoalAcceptanceState {
-  view: GoalAcceptanceView; checks: GoalAcceptanceCheck[]; hash: string;
-  candidate?: GoalAcceptanceTaskRow; oldId?: string; unfinishedIds: string[];
-}
 const isLeased = (row: { current_employee?: string; lease_expires_at?: number }) =>
   Boolean(row.current_employee) && (row.lease_expires_at ?? 0) > Math.floor(Date.now() / 1000);
 /** Which projects' environments one reader may see in a company block (SYS01 M3). `key` names that view, so a stored listing is read only under the same one. */
 interface EnvView { key: string; visible: (project: string) => boolean }
 /** A project as a reader without environment access sees it: the identity fields as they are, the environments withheld. */
 const withheldEnvs = (project: ProjectView): ProjectView => ({ ...project, envs: [], envsWithheld: true });
-const briefTask = (row: GoalAcceptanceTaskRow): GoalAcceptanceTask => ({
-  id: asId(row.id), title: row.title, state: row.state, executorRole: row.executor_role, reviewerRole: row.reviewer_role,
-  kind: row.kind ?? 'task', version: row.version, blockedTo: row.blocked_to ?? undefined,
-  submitted: Boolean(row.submitted_by), leaseHolder: isLeased(row) ? row.current_employee : undefined,
-  dependencies: (row.dependencies ?? []).map(asId).sort(),
-});
-
-/**
- * Source guard of a gated lease write (SYS-DISP IR03). Every source the gate read must still be at the version it was read at, or the
- * write is refused and the caller re-reads. The write also stamps each source: a concurrent authorship change on a source always bumps
- * its version in the same transaction, so the two conflict instead of one landing between the read and the other's commit.
- */
-const INDEPENDENCE_GUARD_SQL = `FOR $g IN $indep_guards {
-        IF (SELECT VALUE version FROM ONLY $g.task) != $g.version { THROW 'contribution history moved: independence source' };
-        UPDATE ONLY $g.task SET independence_guard = $g.version;
-      };`;
-
 /** Same repository/goal identity rules as staffingPool; checked inside every lease/takeover transaction. */
 const EMPLOYEE_WORKSPACE_SQL = (who: string, failure: string) => `
       IF ${who}.retired = true { THROW '${failure}: target employee is retired' };
-      LET $scope = IF $t.goal != NONE THEN <string>record::id($t.goal) ELSE 'maintenance' END;
-      IF ${who}.workspace_scope != NONE AND ${who}.workspace_scope != $scope { THROW '${failure}: workspace goal denied; target employee works in another goal workspace and can never be dispatched this task' };
-      LET $home = $t.code_repo_path ?? $t.project.repo_path ?? $t.goal.project.repo_path ?? $ops_repo;
+      LET $scope = 'maintenance';
+      IF ${who}.workspace_scope != NONE AND ${who}.workspace_scope != $scope { THROW '${failure}: workspace denied; target employee works in another workspace scope and can never be dispatched this task' };
+      LET $home = $t.code_repo_path ?? $t.project.repo_path ?? $ops_repo;
       LET $employee_home = ${who}.workspace_repo ?? ${who}.workspace_cwd ?? $ops_repo;
       IF $home != NONE AND $employee_home != NONE AND $home != $employee_home { THROW '${failure}: target employee works in another repository and can never be dispatched this task' };
 `;
-
-/** The gate one stage reads: the exclusion index and the source versions the write must be guarded by. */
-interface IndependenceGate {
-  taskId: string;
-  index: IndependenceIndex;
-  guards: Array<{ task: RecordId; version: number }>;
-}
 
 // ---- Bounded reads (SYS01). Every response, complete or paged, fits the 48 KiB budget measured as serialized
 // UTF-8. A complete answer is returned whole or refused (C2, C3); a paged answer reads a stored listing (C4). ----
@@ -681,6 +405,15 @@ function historyEntry(row: AuditHistoryRow, limit?: number): HistoryEntry {
   return entry(longestFittingPrefix(full, text => dualBytes(entry(text, true)) <= limit), true);
 }
 
+/** The workflow runs found for one submitted sha: each is verified by the acceptance adapter before evidence lands. */
+export type AcceptanceRunLister = (slug: string, sha: string, run?: GhRunner) => Promise<string[]>;
+const defaultRunLister: AcceptanceRunLister = async (slug, sha, run = ghCli) => {
+  // The same gh invocation family pr-gate/github-ci-control use: read-only `gh api` against the Actions runs API.
+  const out = await run(['api', `repos/${slug}/actions/runs?head_sha=${sha}&status=completed&per_page=10`, '--jq',
+    '.workflow_runs[] | select(.conclusion == "success") | .html_url']);
+  return out.split(/\r?\n/).map(line => line.trim()).filter(line => /^https:\/\/github\.com\//.test(line)).slice(0, 5);
+};
+
 export class SurrealCompanyCore implements CompanyCore {
   readonly leaseSeconds: number;
   readonly checkpointLimit: number;
@@ -689,15 +422,15 @@ export class SurrealCompanyCore implements CompanyCore {
   private readonly systemCheck?: SystemCheck;
   /** SYS02: read-only source adapter that verifies CI runs, artifacts and probes; tests inject a deterministic one. */
   private readonly acceptanceAdapter: AcceptanceSourceAdapter;
+  /** Resolves the GitHub Actions run urls of one head in one repository slug; tests inject a deterministic one. */
+  private readonly acceptanceRuns: AcceptanceRunLister;
   private readonly ciBillingCheck: CiBillingCheck;
   /** Test seam (SYS-DISP AC06): runs after a contribution view is read and before the lease transaction that checks it. */
   private readonly contributionReadHook?: (taskId: string) => Promise<void>;
-private readonly independenceReadHook?: (taskId: string) => Promise<void>;
   private readonly companyReleaseRepo?:string;
   private readonly drillLaunch?: (home: string, repo: string, plan: { runId: string; root: string }) => number;
-  constructor(readonly database: CompanyDatabase, options?: { companyReleaseRepo?:string; leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; systemCheck?: SystemCheck; ciBillingCheck?: CiBillingCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter };
-    externalActions?: { gateway?: ExternalActionGateway }; faults?: { limits?: FaultBudgetLimits; clock?: () => number };
-    waits?: { clock?: () => number; webhookSecret?: string };
+  constructor(readonly database: CompanyDatabase, options?: { companyReleaseRepo?:string; leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; systemCheck?: SystemCheck; ciBillingCheck?: CiBillingCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter; runs?: AcceptanceRunLister };
+    faults?: { limits?: FaultBudgetLimits; clock?: () => number };
     /** Test seam only: replaces the detached drill launch so a gate can assert the guards without a real run. */
     drillLaunch?: (home: string, repo: string, plan: { runId: string; root: string }) => number }) {
     this.companyReleaseRepo=options?.companyReleaseRepo;
@@ -705,13 +438,9 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     this.submitCheck = options?.submitCheck;
     this.systemCheck = options?.systemCheck;
     this.acceptanceAdapter = options?.acceptance?.adapter ?? createGithubActionsAdapter();
+    this.acceptanceRuns = options?.acceptance?.runs ?? defaultRunLister;
     this.ciBillingCheck = options?.ciBillingCheck ?? createCiBillingCheck();
-    // Same seam as the acceptance adapter: the controlled external exit is injectable so a test drives an isolated fake
-    // endpoint instead of the network, while production always gets the company's authenticated gh CLI.
-    this.externalActionsGateway = options?.externalActions?.gateway;
-
     this.contributionReadHook = options?.contributionReadHook;
-    this.independenceReadHook = options?.independenceReadHook;
     const seconds = options?.leaseSeconds ?? DEFAULT_LEASE_SECONDS;
     if (!Number.isInteger(seconds) || seconds < 1 || seconds > 3600) {
       throw new CompanyError('invalid', 'Invalid lease duration');
@@ -721,7 +450,6 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     this.workforce = options?.workforce;
     // The company-system repo the upgrade gate compares against: a quick goal without a project binds its code legs to it at triage.
     this.owner = new OwnerDesk(database, options?.companyReleaseRepo ?? options?.worktrees?.opsRepo);
-    this.dispositions = new DispositionLedger(database);
     this.projects = new ProjectStore(database.db);
     this.worktrees = options?.worktrees ? new WorktreeRegistry(database.db, options.worktrees) : undefined;
     this.snapshots = new SnapshotStore(database.db, options?.snapshots, { channel: database.buildChannel, releaseChannel: database.releaseChannel, observe: options?.snapshotObserve });
@@ -729,36 +457,15 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     this.faults = new FaultStore(database.db);
     this.faultLimits = options?.faults?.limits ?? DEFAULT_FAULT_BUDGET;
     this.faultClock = options?.faults?.clock ?? Date.now;
-    // SYS05: typed waits on time and trusted external events.
-    this.waits = new WaitStore(database.db);
-    this.waitClock = options?.waits?.clock ?? Date.now;
-    this.waitWebhookSecret = options?.waits?.webhookSecret ?? process.env.SCK_WAIT_WEBHOOK_SECRET;
-    // SYS07: goal outcome contract, final-gate invariants and read-only business metrics.
-    this.goals = new GoalGovernanceStore(database.db);
-    // SYS-INT: QA review wake subscriptions ride the SYS05 wait ledger; no agent or timer of their own.
-    this.reviewEvents = new ReviewEventStore(database.db, this.waits, this.waitClock);
   }
   readonly worktrees?: WorktreeRegistry;
   private readonly owner: OwnerDesk;
-  /** SYS03: the manager-disposition ledger (episode claims, decisions, holder notices, controlled external actions). */
-  private readonly dispositions: DispositionLedger;
-  /** SYS03: the controlled external-action exit, absent in production (the gh CLI is built then). */
-  private readonly externalActionsGateway?: ExternalActionGateway;
   /** SYS04: the fault ledger — structured faults, the persistent recovery budget and the repair chain. */
   private readonly faults: FaultStore;
   /** SYS04: the recovery budget limits applied to a fault object. */
   private readonly faultLimits: FaultBudgetLimits;
   /** SYS04: the clock the budget is measured against (tests inject a controlled one). */
   private readonly faultClock: () => number;
-  /** SYS05: the wait ledger. */
-  private readonly waits: WaitStore;
-  /** SYS05: the clock waits are measured against (tests inject a controlled one). */
-  private readonly waitClock: () => number;
-  /** SYS05: the HMAC secret a webhook must sign with; absent means webhook events are refused, never trusted by default. */
-  private readonly waitWebhookSecret?: string;
-  /** SYS-INT: QA review wake subscriptions and structured scope signals. */
-  private readonly reviewEvents: ReviewEventStore;
-  private readonly goals: GoalGovernanceStore;
   private readonly projects: ProjectStore;
   /** Stored listings behind the paged reads (C4). */
   private readonly snapshots: SnapshotStore;
@@ -815,7 +522,7 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
   async activeLeases(credential: Credential): Promise<ActiveLease[]> {
     const actor = await this.authorized(credential);
     const [rows] = await this.db.query<[ActiveLeaseRow[]]>(
-      `SELECT id, state, executor_role, reviewer_role, submitted_by, implementer,
+      `SELECT id, state, executor_role, reviewer_role, submitted_by,
               current_employee, delivery_id, lease_expires_at, fence, version
          FROM task
         WHERE current_employee = $employee
@@ -827,10 +534,10 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     return (rows ?? []).flatMap(row => {
       if (row.state !== 'doing' && row.state !== 'review') return [];
       const role = row.state === 'review' ? row.reviewer_role : row.executor_role;
-      // A role change after the claim, or a review lease held by the submitter/implementer,
+      // A role change after the claim, or a review lease held by the submitter,
       // is contradictory state: never rebuild it as a usable local claim.
       if (role !== actor.role) return [];
-      if (row.state === 'review' && (row.submitted_by === actor.employeeId || row.implementer === actor.employeeId)) return [];
+      if (row.state === 'review' && row.submitted_by === actor.employeeId) return [];
       if (!row.delivery_id || !row.lease_expires_at || !Number.isSafeInteger(row.fence) || row.fence < 1 ||
           !Number.isSafeInteger(row.version)) return [];
       return [{
@@ -888,50 +595,14 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
             continue;
           }
           if (/conflict/i.test(cause)) throw new CompanyError('temporarily_unavailable', 'Database contention; retry request', true);
-          // Goal acceptance guards THROW 'goal acceptance moved: …' when a preview basis drifted; that is a stale-snapshot conflict, not a generic failure.
-          const moved = /goal acceptance moved: ([^'"\n]+)/i.exec(cause);
-          if (moved) throw new CompanyError('conflict', `Goal acceptance moved: ${moved[1]!.trim()}; run goal_acceptance_preview again`);
-          // Facts read before a lease transaction moved under it: the caller re-reads the contribution view and retries (SYS-DISP AC04).
-          if (new RegExp(CONTRIBUTION_MOVED, 'i').test(cause)) throw new CompanyError('conflict', 'Task contribution history moved; retry the request');
-          // Implementer takeover: 'moved' is a stale basis (CAS), 'invalid' is an ineligible target; both are checked before the generic denied/forbidden match.
-          const qaScope = /qa observation (invalid|moved): ([^'"\n]+)/i.exec(cause);
-          if (qaScope) throw new CompanyError(qaScope[1]!.toLowerCase() === 'moved' ? 'conflict' : 'invalid', `QA observation ${qaScope[1]!.toLowerCase()}: ${qaScope[2]!.trim()}`);
-          const takeover = /implementer takeover (moved|invalid): ([^'"\n]+)/i.exec(cause);
-          if (takeover) {
-            const kind = takeover[1]!.toLowerCase();
-            throw new CompanyError(kind === 'moved' ? 'conflict' : 'invalid', `Implementer takeover ${kind}: ${takeover[2]!.trim()}`);
-          }
-          // 有效策略层（SYS06）：epoch 或替代目标移动是 conflict，作用域/来源越权是 forbidden，其余（同域冲突、成环）按 conflict。
-          const policyMoved = /policy (moved|conflict): ([^'"\n]+)/i.exec(cause);
-          if (policyMoved) throw new CompanyError('conflict', `Policy ${policyMoved[1]!.toLowerCase()}: ${policyMoved[2]!.trim()}`);
-          if (/policy denied/i.test(cause)) throw new CompanyError('forbidden', 'Policy write denied');
-          if (/policy changed/i.test(cause)) {
-            throw new CompanyError('conflict', '策略已变更：本次动作按的契约已过期，重新领取或按新契约办理（旧 claim 与旧提示不能继续授权写）');
-          }
-          // Independence policy writes: a moved version or a live lease is a conflict; a closed task is invalid; the actor is denied.
-          const independence = /independence (moved|refused|invalid|denied): ([^'"\n]+)/i.exec(cause);
-          if (independence) {
-            const kind = independence[1]!.toLowerCase();
-            throw new CompanyError(kind === 'denied' ? 'forbidden' : kind === 'invalid' ? 'invalid' : 'conflict', `Independence ${kind}: ${independence[2]!.trim()}`);
-          }
-          // The owner that repaired a goal acceptance reference is the candidate's author for four-eyes purposes: it may not review or accept that candidate.
-          if (/goal acceptance repairer/i.test(cause)) throw new CompanyError('self_review', 'Repairing owner cannot review or accept the repaired goal candidate; another owner must');
           if (/self review/i.test(cause)) throw new CompanyError('self_review', 'Employee cannot review own delivery');
           if (/discipline track denied/i.test(cause)) throw new CompanyError('forbidden', 'Employee definition does not cover the task discipline');
           if (/employee runtime is suspending/i.test(cause)) throw new CompanyError('conflict', 'Employee runtime is suspending; retry after closure');
           if (/leased by another|already has active task/i.test(cause)) throw new CompanyError('already_claimed', 'Task or employee already leased');
           if (/lease expired/i.test(cause)) throw new CompanyError('lease_expired', 'Lease expired');
-          // FV06 append backstops: the readable pre-checks answer first; these in-transaction guards are
-          // the atomic backstop and carry the same invalid meaning as their pre-check twins.
-          const appendBackstop = /append denied: (only a formal dependency wait|only execute-phase dependency waits(?:; a review wait keeps its reviewer)?|the open dependency wait(?: is missing)?|a legacy wait needs [^']+)/i.exec(cause);
-          if (appendBackstop) throw new CompanyError('invalid', `Append refused: ${appendBackstop[1]!.trim()}`);
-          // 验收修订：状态不在 ready/doing/review/blocked 之内是 invalid（不是被拒权），其余冲突照常。
-          const amendInvalid = /acceptance amend invalid: ([^'"\n]+)/i.exec(cause);
-          if (amendInvalid) throw new CompanyError('invalid', `Acceptance amendment refused: ${amendInvalid[1]!.trim()}`);
           if (/denied|forbidden|revoked/i.test(cause)) throw new CompanyError('forbidden', 'Action forbidden');
           if (/checkpoint limit/i.test(cause)) throw new CompanyError('checkpoint_limit', 'Checkpoint limit reached');
           if (/task retired/i.test(cause)) throw new CompanyError('conflict', 'Task has been retired');
-          if (/live owner-gate dependents/i.test(cause)) throw new CompanyError('conflict', 'Owner-gated task has live dependents; retire them first');
           if (/not a screenplay draft/i.test(cause)) throw new CompanyError('forbidden', 'Revision edge is limited to owner-reviewed screenplay drafts on the 编剧 track');
           if (/revises|superseded|supersede|revision lineage|real owner rejection/i.test(cause)) throw new CompanyError('conflict', 'Revision edge conflicted; refresh and retry');
           if (/already terminal/i.test(cause)) throw new CompanyError('conflict', 'Task already in a terminal state');
@@ -962,15 +633,19 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
 
   /**
    * `repairKey` (SYS03 AC02) switches the create's idempotency identity from the caller's employee to the business key,
-   * so the repair chain a disposition builds exists exactly once no matter which manager, session or replay asked for it.
+   * so the repair chain a disposition builds exists exactly once no matter which actor, session or replay asked for it.
    */
-  private async createTaskRecord(credential: Credential, input: CreateTask, options: { external?: boolean; acceptanceChain?: string; repairKey?: string } = {}): Promise<TaskView> {
+  private async createTaskRecord(credential: Credential, input: CreateTask, options: { external?: boolean; acceptanceChain?: string; repairKey?: string; route?: RouteRow } = {}): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Task creation denied');
+    const route = options.route ?? (input.type ? await getRoute(this.db, input.type) : undefined);
+    if (input.type && !route?.enabled) throw new CompanyError('invalid', `route type ${input.type} is missing or disabled`);
+    if (route) {
+      input = { ...input, executorRole: route.executor_role, reviewerRole: route.reviewer_role };
+    }
     // External create_task only: the raw list is bounded before de-duplication. Internal delivery
-    // legs and automatic goal-anchor dependencies are deliberately not capped here; they must
+    // route-expanded chain children are deliberately not capped here; they must
     // retain the complete dependency set.
-    if (options.external) validateExternalDependencies(input.dependencies);
     requireText(input.title, 'title', 3, 200);
     requireText(input.context, 'context', 1, 20000);
     requireRole(input.executorRole);
@@ -980,7 +655,7 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     if (input.project !== undefined && !(await this.projects.get(input.project))) {
       throw new CompanyError('not_found', `project ${input.project} not found`);
     }
-    const contract = await this.disciplineContract(input.goalId, input.project);
+    const contract = await this.disciplineContract(input.project);
     if (input.discipline !== undefined) {
       requireText(input.discipline, 'discipline', 1, 60);
       if (contract && !contract.has(input.discipline)) {
@@ -1007,11 +682,8 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     // environment named by its criteria. An executor cannot introduce or relabel it at submit time.
     const declaresEnvironment = input.acceptanceEnvironment !== undefined ||
       acceptanceCriteria.some(criterion => criterion.environment !== undefined);
-    if (declaresEnvironment && leg !== 'deploy') {
-      // Before the merge there is no deployment to verify, so an implement or release leg cannot carry an environment
-      // requirement: the deploy leg is the one that runs against a real environment.
-      throw new CompanyError('invalid',
-        `acceptance environment requirements apply to the deploy leg only; this task is the ${leg} leg`);
+    if (declaresEnvironment && !trustedCode) {
+      throw new CompanyError('invalid', 'acceptance environment requirements apply to code delivery tasks only');
     }
     const acceptanceEnvironment = effectiveEnvironment(acceptanceCriteria, input.acceptanceEnvironment);
     // 必配轨岗位（如 screenwriter）：任务必须带指定轨，缺轨/错轨显式拒绝，防止无轨任务落到专属编制。
@@ -1021,102 +693,75 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     }
     if (input.modelTier !== undefined && !['fable','opus','sonnet','haiku','high','medium','low'].includes(input.modelTier)) throw new CompanyError('invalid', 'Invalid model tier');
     const kind = input.kind ?? 'task';
-    if (!['task', 'gate', 'release', 'deploy'].includes(kind)) throw new CompanyError('invalid', 'Invalid task kind');
-    // SYS06 AC02/AC03：机器策略在创建前判定（写权、老板关口），生效契约登记到任务上。判定只读 policy 表。
-    const policyChain = this.policyChain({ goalId: input.goalId, projectId: input.project, includeTask: false });
-    const { contract: policyContract, epoch: policyEpoch } = await this.effectiveContractFor(policyChain);
-    const writeVerdict = checkWriteAuthority(policyContract, { role: input.executorRole, kind,
-      ...(input.goalId ? { goalId: input.goalId } : {}), ...(input.workIntent ? { intent: input.workIntent } : {}) });
-    if (!writeVerdict.ok) {
-      throw new CompanyError(writeVerdict.code,
-        `策略拒绝创建：${writeVerdict.reason}（policy v${policyContract.version} hash=${policyContract.hash.slice(0, 16)}）`);
-    }
-    const gateVerdict = checkGateCreation(policyContract, { leg, kind, executorRole: input.executorRole, reviewerRole: input.reviewerRole });
-    if (!gateVerdict.ok) {
-      throw new CompanyError(gateVerdict.code, `策略拒绝创建：${gateVerdict.reason}（policy v${policyContract.version}）`);
-    }
-    const policyGate = domainPayload(policyContract, 'gate');
-    if (policyGate?.requiredCriteriaLegs.includes(leg) && trustedCode) {
-      // 策略可以在全局验收闸门关闭时仍要求这条腿带基线验收条件：只加强，不放宽。
-      acceptanceCriteria = mergeAcceptanceCriteria(leg, acceptanceCriteria);
-    }
-    const policyEvidence = `policy v${policyContract.version} hash=${policyContract.hash.slice(0, 16)} chain=${policyChain.map(link => `${link.scope}${link.scopeRef ? `:${link.scopeRef}` : ''}`).join('>')}`;
-    if (input.goalId !== undefined) requireText(input.goalId, 'goal', 1, 100);
-    const dependencies = [...new Set(input.dependencies ?? [])];
-    if (input.revises !== undefined) {
-      if (input.independence) throw new CompanyError('invalid', 'Inline independence is not supported for screenplay revisions');
-      return this.createRevision(actor, input, dependencies);
-    }
+    if (kind !== 'task') throw new CompanyError('invalid', 'Invalid task kind');
+    if ((input as { goalId?: unknown }).goalId !== undefined) throw new CompanyError('invalid', 'goalId is retired; use tag');
+    if ((input as { dependencies?: unknown }).dependencies !== undefined) throw new CompanyError('invalid', 'dependencies are retired; use parent');
+    if (input.revises !== undefined) throw new CompanyError('invalid', 'revises is retired');
     const codeRepoPath = await this.creationCodeRepo(input, kind);
     const idem = options.repairKey === undefined
       ? this.idemId(actor.employeeId, 'create', input.idempotencyKey)
       : this.businessIdemId('create', options.repairKey);
-    const digest = HASH(JSON.stringify({ ...input, dependencies }));
+    const digest = HASH(JSON.stringify(input));
     const prior = await this.replay(idem, digest);
     if (prior) return prior;
     const taskId = randomUUID();
     const task = id('task', taskId);
-    const independent = input.independence ? normalizeIndependence({ taskId, ...input.independence }) : undefined;
     const vars = {
       actor: id('employee', actor.employeeId), task, idem, digest,
       audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
       title: input.title, context: input.context, executor: input.executorRole,
-      reviewer: input.reviewerRole, dependencies: dependencies.map(dep => id('task', dep)),
-      kind, goal: input.goalId ? id('goal', input.goalId) : undefined,
-      project: input.project ? id('project', input.project) : undefined,
-discipline: input.discipline, work_intent: input.workIntent, model_tier: input.modelTier,
+      reviewer: input.reviewerRole, tag: input.tag,
+      type: input.type, parent: input.parent ? id('task', input.parent) : undefined,
+      proposed_in: input.proposed_in,
+      requirement: input.requirement, acceptance_text: input.acceptanceText,
+      kind, project: input.project ? id('project', input.project) : undefined,
+      discipline: input.discipline, work_intent: input.workIntent, model_tier: input.modelTier,
       acceptance_criteria: acceptanceCriteria,
       acceptance_version: acceptanceCriteria.length > 0 ? ACCEPTANCE_CRITERIA_VERSION : undefined,
       acceptance_chain: options.acceptanceChain,
       acceptance_environment: acceptanceEnvironment,
       // A task created while the gate is off is legacy: enabling later never retroactively gates it (SYS02 AC06).
       acceptance_legacy: !acceptanceGate.enabled,
-      policy_version: policyContract.version, policy_hash: policyContract.hash, policy_contract: policyContract,
-      policy_evidence: policyEvidence + (codeRepoPath ? ` code_repo=${codeRepoPath}` : ''), expected_policy_epoch: policyEpoch,
       code_repo_path: codeRepoPath,
-      independence: independent ? { schema: 1, revision: 1, ...independent, setBy: actor.employeeId } : undefined,
-      independent_sources: (independent?.sources ?? []).map(source => id('task', source)),
-      independent_excluded: (independent?.excluded ?? []).map(employee => id('employee', employee)),
     };
     try {
       const row = await this.txTask(`BEGIN;
         LET $who = SELECT * FROM ONLY $actor;
         IF $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'actor revoked or forbidden' };
-        FOR $dep IN $dependencies {
-          LET $d = SELECT * FROM ONLY $dep;
-          IF $d = NONE { THROW 'dependency not found' };
-        };
-        FOR $source IN $independent_sources {
-          IF (SELECT VALUE id FROM ONLY $source) = NONE { THROW 'independence invalid: source task not found' };
-        };
-        FOR $excluded IN $independent_excluded {
-          IF (SELECT VALUE id FROM ONLY $excluded) = NONE { THROW 'independence invalid: excluded employee not found' };
-        };
-        ${RESOLVE_DEP_SQL('$dependencies', '$dep')}
-        LET $epoch = (SELECT VALUE value FROM ONLY company_meta:policy_epoch) ?? 0;
-        IF $epoch != $expected_policy_epoch { THROW 'policy moved: the effective contract moved since it was read; re-read policy_effective and retry' };
-        LET $unfinished = SELECT VALUE id FROM task WHERE id IN $dep_resolved AND ${DEP_UNSATISFIED};
+        LET $parent_state = IF $parent != NONE THEN (SELECT VALUE state FROM ONLY $parent) ELSE NONE END;
         LET $created = CREATE ONLY $task CONTENT {
           title: $title, context: $context, executor_role: $executor, reviewer_role: $reviewer,
           discipline: $discipline, work_intent: $work_intent, project: $project, model_tier: $model_tier,
-          dependencies: $dependencies, state: IF array::len($unfinished) = 0 THEN 'ready' ELSE 'blocked' END,
+          tag: $tag, type: $type, parent: $parent, proposed_in: $proposed_in,
+          requirement: $requirement, acceptance_text: $acceptance_text,
+          state: IF $parent != NONE AND $parent_state != 'done' THEN 'planned' ELSE 'ready' END,
           version: 1, fence: 0, submitted_by: NONE, current_employee: NONE,
           delivery_id: NONE, lease_expires_at: NONE, resume_role: NONE, resume_state: 'ready', blocked_to: NONE,
-          kind: $kind, goal: $goal, created_at: time::now(), code_repo_path: $code_repo_path,
-          independence: IF $independence != NONE THEN object::extend($independence, {setAt: time::now()}) ELSE NONE END,
-          policy_version: $policy_version, policy_hash: $policy_hash, policy_contract: $policy_contract,
+          kind: $kind, created_at: time::now(), code_repo_path: $code_repo_path,
           ${acceptanceCriteria.length > 0 ? 'acceptance_criteria: $acceptance_criteria, acceptance_version: $acceptance_version,' : ''}
           acceptance_legacy: $acceptance_legacy, acceptance_head: NONE, acceptance_environment: $acceptance_environment,
           acceptance_attempt: 0${options.acceptanceChain !== undefined ? ', acceptance_chain: $acceptance_chain' : ''}
         };
-        ${GOAL_ANCHOR_SQL}
-        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'create', version: 1, evidence: $policy_evidence, at: time::now() };
+        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'create', version: 1, at: time::now() };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: 'created', sequence: $sequence.value, payload: { state: $created.state }, at: time::now() };
         CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $created };
         RETURN $created;
         COMMIT;`, vars);
-      return view(row);
+      const taskView = view(row);
+      if (route || input.type) {
+        const store = new OutboundMessageStore(this.db);
+        const code = route?.code === true;
+        const drafts = await store.createTaskDrafts(taskView.id, taskView.executorRole, taskView.reviewerRole, code);
+        const hold = input.hold ?? route?.hold;
+        if (hold) {
+          for (const draft of drafts) {
+            await this.db.query('UPDATE $m SET hold = true;', { m: new RecordId('outbound_message', draft.id) });
+          }
+        }
+      }
+      if (route?.next) await this.expandRouteChain(credential, taskView, route, input, options);
+      return taskView;
     } catch (error) {
       const replay = await this.replay(idem, digest);
       if (replay) return replay;
@@ -1125,182 +770,76 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * Controlled screenplay-revision edge (create_task with `revises`): owner/product replaces an
-   * owner-rejected screenplay draft with its legal next version in one transaction — the old
-   * draft voids with a superseded_by pointer, the new draft inherits the lineage and may start
-   * once its own normal dependencies are satisfied. The edge is never a general approval
-   * exemption: it only exists between two owner-reviewed screenwriter 编剧 drafts in the same
-   * goal and project, the target must be the unapproved chain tip whose latest submission drew
-   * a real owner_reject, and normal downstreams keep resolving to the chain tip.
-   *
-   * The checks below run twice: once here for readable fast-fail errors, once inside the
-   * transaction where a concurrent approve/submit/claim/supersede can't slip past.
+   * Route chain expansion: from `route.next`, create up to CHAIN_LIMIT planned successors. Each child
+   * inherits title (`${title} · ${label}`), requirement and acceptance, points parent at the previous
+   * task, and gets its own execute/review drafts. The walk stops on a missing/disabled route or a cycle.
    */
-  private async createRevision(actor: Principal, input: CreateTask, dependencies: string[]): Promise<TaskView> {
-    const taskId = randomUUID();
-    const idem = this.idemId(actor.employeeId, 'create', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ ...input, dependencies }));
-    // Idempotent replay comes first: a retried call must return the same revision even though
-    // the old draft is already void, which the live checks below would reject.
-    const prior = await this.replay(idem, digest);
-    if (prior) return prior;
-    requireText(input.revises!, 'revises', 1, 200);
-    if (input.executorRole !== 'screenwriter' || input.reviewerRole !== 'owner' ||
-        input.discipline !== REQUIRED_TRACKS.screenwriter || (input.kind ?? 'task') !== 'task') {
-      throw new CompanyError('forbidden', 'revises is limited to owner-reviewed screenplay drafts on the 编剧 track');
-    }
-    // The caller writes the itemized revision points; the service stamps the lineage and the
-    // real rejection audit reference itself so context can never fake the gate.
-    requireText(input.context, 'context', 20, 20000);
-    const targetId = input.revises!;
-    if (dependencies.includes(targetId)) {
-      throw new CompanyError('invalid', 'revises target must not also be a normal dependency');
-    }
-    type TargetRow = {
-      id: RecordId; state: TaskState; executor_role: Role; reviewer_role: ReviewerRole;
-      discipline?: string; kind?: TaskKind; goal?: RecordId; project?: RecordId;
-      superseded_by?: RecordId; lineage?: RecordId; revision_no?: number;
-    };
-    const [target] = await this.db.query<[TargetRow | undefined]>(
-      'SELECT id, state, executor_role, reviewer_role, discipline, kind, goal, project, superseded_by, lineage, revision_no FROM ONLY $task;',
-      { task: id('task', targetId) });
-    if (!target) throw new CompanyError('not_found', 'revises target not found');
-    const isDraft = target.executor_role === 'screenwriter' && target.reviewer_role === 'owner'
-      && target.discipline === REQUIRED_TRACKS.screenwriter && (target.kind ?? 'task') === 'task';
-    if (!isDraft) throw new CompanyError('forbidden', 'revises target is not a screenplay draft');
-    if (target.superseded_by) throw new CompanyError('conflict', 'revises target is already superseded');
-    // review = newest submission still awaiting the owner; done = approved (an approved draft
-    // may never be superseded — in-flight mass production keeps its authorized version).
-    if (!['ready', 'doing', 'blocked'].includes(target.state)) {
-      throw new CompanyError('conflict', 'revises target must be an unapproved draft not awaiting review');
-    }
-    if ((target.goal ? asId(target.goal) : undefined) !== input.goalId) {
-      throw new CompanyError('invalid', 'revises target is in another goal');
-    }
-    if ((target.project ? asId(target.project) : undefined) !== input.project) {
-      throw new CompanyError('invalid', 'revises target is in another project');
-    }
-    const lineageId = target.lineage ? asId(target.lineage) : targetId;
-    // Normal dependencies must stay outside the revision lineage: a dep that resolves into
-    // this chain would wait on the draft being created — a self-dependency.
-    const [chainRows] = await this.db.query<[RecordId[]]>(
-      'SELECT VALUE id FROM task WHERE lineage = $lineage OR id = $revises;',
-      { lineage: id('task', lineageId), revises: id('task', targetId) });
-    const chainIds = new Set((chainRows ?? []).map(asId));
-    const lineageDep = dependencies.find(dep => chainIds.has(dep));
-    if (lineageDep) throw new CompanyError('invalid', `dependency ${lineageDep} is inside the revision lineage`);
-    // A real rejection means the draft's LATEST submission drew an owner_reject afterwards:
-    // pre-seeded opinions, employee review returns, and older rejects followed by a new
-    // pending submission do not count.
-    const [lastSubmit] = await this.db.query<[Array<{ at: unknown }>]>(
-      "SELECT at FROM audit WHERE task = $task AND action = 'submit' ORDER BY at DESC LIMIT 1;",
-      { task: id('task', targetId) });
-    const submitAt = lastSubmit?.[0]?.at;
-    if (!submitAt) throw new CompanyError('conflict', 'revises target was never submitted');
-    // Keep the database's nanosecond precision: JavaScript Date truncates two real,
-    // ordered events in the same millisecond and used to reject a valid revision.
-    const [rejectRows] = await this.db.query<[Array<{ id: RecordId; at: unknown }>]>(
-      "SELECT id, at FROM audit WHERE task = $task AND action = 'owner_reject' AND at > $submitted ORDER BY at DESC LIMIT 1;",
-      { task: id('task', targetId), submitted: submitAt });
-    const reject = rejectRows?.[0];
-    if (!reject) {
-      throw new CompanyError('conflict', 'revises target lacks a real owner rejection on its latest submission');
-    }
-    const nextNo = (target.revision_no ?? 1) + 1;
-    const marker = new RegExp(`(?:^|[^0-9A-Za-z])(?:[vVrR]\\s*0*${nextNo}|第\\s*0*${nextNo}\\s*版)(?![0-9])`);
-    if (!marker.test(input.title)) {
-      throw new CompanyError('invalid', `revision title must carry the new version number v${nextNo}`);
-    }
-    const stamp = `\n\n—— 修订谱系（服务端记录）——\n上一版：task:${targetId}（v${nextNo - 1} → v${nextNo}）\n谱系：task:${lineageId}\n驳回审计：audit:${asId(reject.id)} @ ${String(reject.at)}`;
-
-    const vars = {
-      actor: id('employee', actor.employeeId), task: id('task', taskId),
-      revises: id('task', targetId), lineage: id('task', lineageId), revision_no: nextNo,
-      req_track: REQUIRED_TRACKS.screenwriter,
-      idem, digest,
-      audit: id('audit', randomUUID()), audit_sup: id('audit', randomUUID()),
-      outbox: id('outbox', randomUUID()), outbox_sup: id('outbox', randomUUID()),
-      title: input.title, context: input.context + stamp, executor: input.executorRole,
-      reviewer: input.reviewerRole, dependencies: dependencies.map(dep => id('task', dep)),
-      kind: 'task', goal: input.goalId ? id('goal', input.goalId) : undefined,
-      project: input.project ? id('project', input.project) : undefined,
-      discipline: input.discipline, work_intent: input.workIntent, model_tier: input.modelTier,
-      sup_evidence: `被 task:${taskId} 取代（v${nextNo - 1} → v${nextNo}，谱系 task:${lineageId}）；驳回审计 audit:${asId(reject.id)}`,
-      create_evidence: `修订自 task:${targetId}（v${nextNo - 1} → v${nextNo}）；驳回审计 audit:${asId(reject.id)}`,
-    };
-    try {
-      const row = await this.txTask(`BEGIN;
-        LET $who = SELECT * FROM ONLY $actor;
-        IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'actor revoked or forbidden' };
-        LET $d = SELECT * FROM ONLY $revises;
-        IF $d = NONE { THROW 'dependency not found' };
-        IF $d.executor_role != 'screenwriter' OR $d.discipline != $req_track OR $d.reviewer_role != 'owner' OR ($d.kind ?? 'task') != 'task' { THROW 'revises target is not a screenplay draft' };
-        IF $d.superseded_by != NONE { THROW 'revises target already superseded' };
-        IF $d.state NOT IN ['ready', 'doing', 'blocked'] { THROW 'revises target not supersedeable' };
-        IF ($d.goal ?? NONE) != ($goal ?? NONE) { THROW 'revises target in another goal' };
-        IF ($d.project ?? NONE) != ($project ?? NONE) { THROW 'revises target in another project' };
-        LET $last_submit = SELECT VALUE at FROM audit WHERE task = $revises AND action = 'submit' ORDER BY at DESC LIMIT 1;
-        LET $reject = SELECT * FROM audit WHERE task = $revises AND action = 'owner_reject' ORDER BY at DESC LIMIT 1;
-        IF array::len($last_submit) = 0 { THROW 'revises target has no submission' };
-        IF array::len($reject) = 0 OR $reject[0].at <= $last_submit[0] { THROW 'revises target lacks real owner rejection' };
-        LET $chain_ids = SELECT VALUE id FROM task WHERE lineage = $lineage OR id = $revises;
-        IF array::len(array::filter($dependencies, |$x| $x IN $chain_ids)) > 0 { THROW 'dependency inside revision lineage' };
-        FOR $dep IN $dependencies {
-          LET $dd = SELECT * FROM ONLY $dep;
-          IF $dd = NONE { THROW 'dependency not found' };
-        };
-        ${RESOLVE_DEP_SQL('$dependencies', '$dep')}
-        LET $unfinished = SELECT VALUE id FROM task WHERE id IN $dep_resolved AND ${DEP_UNSATISFIED};
-        LET $created = CREATE ONLY $task CONTENT {
-          title: $title, context: $context, executor_role: $executor, reviewer_role: $reviewer,
-          discipline: $discipline, work_intent: $work_intent, project: $project, model_tier: $model_tier,
-          dependencies: $dependencies, state: IF array::len($unfinished) = 0 THEN 'ready' ELSE 'blocked' END,
-          version: 1, fence: 0, submitted_by: NONE, current_employee: NONE,
-          delivery_id: NONE, lease_expires_at: NONE, resume_role: NONE, resume_state: 'ready', blocked_to: NONE,
-          kind: $kind, goal: $goal, created_at: time::now(),
-          revises: $revises, lineage: $lineage, revision_no: $revision_no
-        };
-        LET $old = UPDATE ONLY $revises SET
-          state = 'void', superseded_by = $task, lineage = $lineage,
-          blocked_to = NONE, resume_role = NONE, resume_state = NONE, handover = NONE,
-          current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
-          version = $d.version + 1
-          WHERE superseded_by = NONE AND state NOT IN ['done', 'void', 'review']
-          RETURN AFTER;
-        IF $old = NONE { THROW 'supersede race lost' };
-        UPDATE employee SET active_task = NONE WHERE active_task = $revises;
-        ${GOAL_ANCHOR_SQL}
-        CREATE ONLY $audit_sup CONTENT { task: $revises, actor: $actor, action: 'superseded', evidence: $sup_evidence, version: $old.version, at: time::now() };
-        LET $seq_sup = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        CREATE ONLY $outbox_sup CONTENT { task: $revises, kind: 'superseded', sequence: $seq_sup.value, payload: { state: 'void', superseded_by: $task, lineage: $lineage }, at: time::now() };
-        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'create', version: 1, evidence: $create_evidence, at: time::now() };
-        LET $seq_new = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        CREATE ONLY $outbox CONTENT { task: $task, kind: 'created', sequence: $seq_new.value, payload: { state: $created.state, revises: $revises, lineage: $lineage, revision_no: $revision_no }, at: time::now() };
-        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $created };
-        RETURN $created;
-        COMMIT;`, vars);
-      return view(row);
-    } catch (error) {
-      const replay = await this.replay(idem, digest);
-      if (replay) return replay;
-      throw error;
+  private async expandRouteChain(credential: Credential, root: TaskView, route: RouteRow, input: CreateTask,
+    options: { external?: boolean; acceptanceChain?: string; repairKey?: string } = {}): Promise<void> {
+    let cursor: RouteRow | undefined = route;
+    let parent: TaskView = root;
+    const seen = new Set<string>([root.type ?? input.type ?? '']);
+    for (let step = 0; step < CHAIN_LIMIT && cursor?.next; step++) {
+      const nextType = cursor.next;
+      if (seen.has(nextType)) break;
+      seen.add(nextType);
+      const next = await getRoute(this.db, nextType);
+      if (!next?.enabled) break;
+      const child = await this.createTaskRecord(credential, {
+        title: `${input.title} · ${next.label}`, context: input.context,
+        executorRole: next.executor_role, reviewerRole: next.reviewer_role,
+        type: nextType, parent: parent.id,
+        requirement: input.requirement, acceptanceText: input.acceptanceText,
+        project: input.project, codeRepoPath: input.codeRepoPath, tag: input.tag,
+        workIntent: input.workIntent, discipline: input.discipline, modelTier: input.modelTier,
+        hold: input.hold ?? next.hold,
+        idempotencyKey: `${input.idempotencyKey}:chain:${nextType}`,
+      }, { ...options, route: next });
+      parent = child;
+      cursor = next;
     }
   }
 
-  private async checkExecutionWindow(taskId: string): Promise<void> {
-    const row = await this.db.select<TaskRow>(id('task', taskId));
-    if (row && row.state !== 'review' && windowExpired(row.execution_window))
-      throw new CompanyError('invalid', 'Execution window expired; manager recovery required');
+  /**
+   * One submit-`next` proposal: a planned child under the submitted task, typed through the route table,
+   * its execute/review drafts created immediately. proposed_in records the submit audit that proposed it,
+   * which is what a later return uses to void exactly this submission's proposals.
+   */
+  private async createProposal(parent: TaskView, proposal: { type: string; title: string; requirement?: string; acceptance?: string }, submitAuditId: string): Promise<TaskView> {
+    const route = await getRoute(this.db, proposal.type);
+    if (!route?.enabled) throw new CompanyError('invalid', `proposal type ${proposal.type} is missing or disabled`);
+    const taskId = randomUUID();
+    const [rows] = await this.db.query<[TaskRow]>(
+      `CREATE ONLY $task CONTENT { title: $title, context: $context, requirement: $requirement, acceptance_text: $acceptance,
+        type: $type, parent: $parent, proposed_in: $proposed_in, executor_role: $ex, reviewer_role: $rev,
+        state: 'planned', kind: 'task', version: 1, fence: 0, created_at: time::now() } RETURN AFTER;`,
+      { task: id('task', taskId), title: proposal.title, context: proposal.requirement ?? '',
+        requirement: proposal.requirement, acceptance: proposal.acceptance,
+        type: proposal.type, parent: id('task', parent.id), proposed_in: submitAuditId,
+        ex: route.executor_role, rev: route.reviewer_role });
+    const child = view(rows!);
+    await new OutboundMessageStore(this.db).createTaskDrafts(child.id, child.executorRole, child.reviewerRole, route.code === true);
+    return child;
+  }
+
+  /** Every planned descendant of a task, breadth-first: voiding a task cascades through the whole planned subtree. */
+  private async plannedDescendants(taskId: string): Promise<string[]> {
+    const out: string[] = [];
+    let frontier = [taskId];
+    while (frontier.length) {
+      const [rows] = await this.db.query<[Array<{ id: RecordId }>]>(
+        'SELECT id FROM task WHERE parent INSIDE $frontier AND state = $state;', { frontier: frontier.map(t => id('task', t)), state: 'planned' });
+      const next = (rows ?? []).map(row => String(row.id.id));
+      out.push(...next);
+      frontier = next;
+    }
+    return out;
   }
 
   async claim(credential: Credential, taskId: TaskId): Promise<ClaimResult> {
     const actor = await this.authorized(credential);
     if (!this.worktrees) return this.claimLease(actor, taskId);
     const task = await this.getTask(credential, taskId);
-    const employee = await this.db.select<{ workspace_scope?: string }>(id('employee', actor.employeeId));
-    if (employee?.workspace_scope && employee.workspace_scope !== workspaceScopeFor(task.goalId)) {
-      throw new CompanyError('forbidden', 'Task claim denied: conversation belongs to another goal');
-    }
     const reviewing = task.state === 'review';
     if (!['ready', 'doing', 'review'].includes(task.state) ||
         !actor.capabilities.includes(reviewing ? 'review' : 'execute') ||
@@ -1308,38 +847,6 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         (reviewing && task.submittedBy === actor.employeeId) ||
         (task.discipline && actor.tracks?.length && !actor.tracks.includes(task.discipline))) {
       throw new CompanyError('forbidden', 'Task claim denied');
-    }
-    if (reviewing) {
-      // A contributor of this task (an author, or its implementer) never reviews it: refused before a worktree is allocated.
-      if ((await readContributionView(this.db, taskId)).facts.excluded.includes(actor.employeeId)) {
-        throw new CompanyError('forbidden', 'Task claim denied: a contributor of this task cannot review it');
-      }
-    }
-    if (!reviewing && task.executorRole === 'engineering') {
-      // Engineering execute is bound to one implementer (contributors.ts): refuse before a worktree is allocated.
-      const facts = (await readContributionView(this.db, taskId)).facts;
-      if (facts.ambiguous) throw new CompanyError('forbidden', 'Task claim denied: implementer unresolved, manager takeover required');
-      if (facts.implementer && facts.implementer !== actor.employeeId) throw new CompanyError('forbidden', 'Task claim denied: bound to another implementer');
-    }
-    // Independence (SYS-DISP IR03): refused before a worktree is allocated, exactly as the claim transaction would refuse it.
-    await this.refuseIndependent(await this.independenceGate(taskId, task.independence, reviewing ? 'review' : 'execute'), actor.employeeId);
-    // SYS06 AC02: a task whose effective contract no longer authorizes this work is refused before any worktree is allocated.
-    // 复核相位同样要判：调度器已经按 policyBlocks 拦下 review 队列，员工直连 claim 不能给出相反结论。判定用**任务自身**
-    // 的执行岗与意图（与调度器 policyDispatchVerdict 同源），不是评审岗位——被 blocked 的任务谁也领不走，也就不可能
-    // 从评审缝拿到执行缝拒绝发的独占写树。
-    {
-      const policyRow = await this.taskRowWithProject(taskId);
-      if (!policyRow) throw new CompanyError('not_found', 'Task not found');
-      const { contract } = await this.effectiveContractFor(this.chainOfRow(policyRow));
-      const verdict = dispatchVerdict({ state: policyRow.state, executorRole: task.executorRole, kind: task.kind,
-        ...(task.goalId ? { goalId: task.goalId } : {}),
-        ...(task.workIntent ? { workIntent: task.workIntent } : {}),
-        ...(policyRow.policy_hash ? { policyHash: policyRow.policy_hash } : {}),
-        ...(policyRow.policy_block_reason ? { policyBlockReason: policyRow.policy_block_reason } : {}),
-        registeredDomains: registeredDomainsOf(policyRow) }, contract);
-      if (verdict.verdict === 'blocked') {
-        throw new CompanyError('forbidden', `策略拒绝领取：${verdict.reason}（policy v${contract.version} hash=${contract.hash.slice(0, 16)}）`);
-      }
     }
     const project = await this.taskProject(taskId);
     // Code-repo routing: an explicit binding wins over the business project repo; the
@@ -1362,20 +869,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     });
   }
 
-  /**
-   * Read-only write-scope preflight for the dispatcher (SYS-DISP R1): the holders that would refuse an execute claim of this task
-   * now, under the claim's own rules. Takes no repo lock and writes nothing; the claim stays the authority.
-   */
-  async writeScopeOf(taskId: TaskId, employeeId?: string): Promise<WriteScopeHolder[]> {
-    if (!this.worktrees) return [];
-    const row = await this.db.select<TaskRow>(id('task', taskId));
-    if (!row) throw new CompanyError('not_found', 'Task not found');
-    const task = view(row);
-    const project = await this.taskProject(taskId);
-    const { repo, list } = await this.worktrees.identity(task.codeRepoPath ?? project?.repoPath ?? this.worktrees.options.opsRepo);
-    return this.worktrees.writeScope(repo, list, task, { employeeId: employeeId ?? '', role: task.executorRole });
-  }
-
+  
   async readWorkspace(credential: Credential, taskId?: TaskId, project?: string): Promise<WorktreeAssignment | undefined> {
     const actor = await this.authorized(credential);
     if (!['owner', 'eval'].includes(actor.role)) throw new CompanyError('forbidden', 'Non-lease workspace requires owner/eval');
@@ -1404,75 +898,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return this.worktrees.inventory();
   }
 
-  /**
-   * The independence gate of one stage (SYS-DISP IR03): the exclusion read now, and the source versions the write must be guarded by.
-   * Undefined when the policy does not name this stage, so legacy tasks and ungated stages take no extra read. A policy this build cannot
-   * enforce refuses here whatever its stages; a source that cannot be read or does not exist refuses too. Nothing is written.
-   */
-  private async independenceGate(taskId: string, policy: IndependencePolicy | undefined,
-    stage: IndependenceStage | undefined): Promise<IndependenceGate | undefined> {
-    if (!policy || !stage) return undefined;
-    const fault = policyFault(policy);
-    if (fault !== undefined) throw new CompanyError('forbidden', fault);
-    if (!policy.stages.includes(stage)) return undefined;
-    const snapshot = await readIndependenceSnapshot(this.db, policy, this.independenceReadHook);
-    return { taskId, index: snapshot.index, guards: snapshot.sources.map(source => ({ task: id('task', source.taskId), version: source.version })) };
-  }
-
-  /** Refuses `employee` when the gate excludes them: `forbidden`, with the structured conflict in `details`. Writes nothing. */
-  private async refuseIndependent(gate: IndependenceGate | undefined, employee: string): Promise<void> {
-    if (!gate) return;
-    const principal = (await readEmployeePrincipals(this.db, [employee])).get(employee);
-    await refuseIfExcluded(this.db, gate.taskId, gate.index, employee, principal);
-  }
-
-  /**
-   * Runs one lease transaction against fresh facts (SYS-DISP AC04, AC06). When the facts it was built from moved under it (another
-   * authorship change landed first), the transaction is refused and this re-reads and tries again: a check that used stale facts is
-   * never accepted. A stage the policy names is gated before the write: a contributor of a source is refused with the structured
-   * conflict, and the write carries the source guards, so a source that moved since the read refuses it and the whole check runs
-   * again (CONTRIBUTION_MOVED). Other stages and legacy tasks run exactly as before.
-   */
-  private async withContributionRetry<T>(taskId: string, actor: string, stageOf: (state?: string) => IndependenceStage | undefined,
-    attempt: (contrib: ContributionView, gate?: IndependenceGate) => Promise<T>): Promise<T> {
-    for (let round = 0; ; round++) {
-      const contrib = await readContributionView(this.db, taskId);
-      const gate = await this.independenceGate(taskId, contrib.policy, stageOf(contrib.state));
-      await this.contributionReadHook?.(taskId);
-      try {
-        await this.refuseIndependent(gate, actor);
-        return await attempt(contrib, gate);
-      } catch (error) {
-        if (round < 4 && isContributionMoved(error)) continue;
-        throw error;
-      }
-    }
-  }
-
   private async claimLease(actor: Principal, taskId: TaskId, worktree?: WorktreeAssignment): Promise<ClaimResult> {
     const task = id('task', taskId);
-    // SYS06 AC02/AC03：派工/领取前的机器策略判定，并把本租约的生效契约登记下来（lease_policy_*）。
-    // 复核相位同样要判：问的是"这条任务还在授权范围内吗"，所以用任务自身的执行岗与意图（与调度器同源），不是评审岗位；
-    // 被 blocked 的任务连评审都领不走，评审缝就不会发出执行缝拒绝发的独占写树。
-    const current = await this.taskRowWithProject(taskId);
-    if (!current) throw new CompanyError('not_found', 'Task not found');
-    const policyChain = this.chainOfRow(current);
-    const { contract: policyContract, rows: policyRows, epoch: policyEpochAtClaim } = await this.effectiveContractFor(policyChain);
-    {
-      const currentTask = view(current);
-      const verdict = dispatchVerdict({ state: current.state, executorRole: currentTask.executorRole, kind: currentTask.kind,
-        ...(currentTask.goalId ? { goalId: currentTask.goalId } : {}),
-        ...(currentTask.workIntent ? { workIntent: currentTask.workIntent } : {}),
-        ...(current.policy_hash ? { policyHash: current.policy_hash } : {}),
-        ...(current.policy_block_reason ? { policyBlockReason: current.policy_block_reason } : {}),
-        registeredDomains: registeredDomainsOf(current) }, policyContract);
-      if (verdict.verdict === 'blocked') {
-        throw new CompanyError('forbidden',
-          `策略拒绝领取：${verdict.reason}（policy v${policyContract.version} hash=${policyContract.hash.slice(0, 16)}）`);
-      }
-    }
-    const row = await this.withContributionRetry(taskId, actor.employeeId, state => state === 'review' ? 'review' : 'execute',
-      (contrib, gate) => this.txTask(`BEGIN;
+    const row = await this.txTask(`BEGIN;
       LET $now = time::unix(time::now());
       LET $who = SELECT * FROM ONLY $actor;
       LET $t = SELECT * FROM ONLY $task;
@@ -1480,24 +908,12 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       ${EMPLOYEE_WORKSPACE_SQL('$who', 'execute denied')}
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.state NOT IN ['ready', 'review', 'doing'] { THROW 'task not claimable' };
-      // SYS05：等待中的任务不占租约、不派工；到点前直接 claim 也拒绝（releaseDue 落库后才回到 ready/review）。
-      IF $t.wait_state = 'waiting' { THROW 'task is waiting' };
-      IF $t != NONE AND $t.version != $seen { THROW 'contribution history moved: retry' };
-      LET $epoch = (SELECT VALUE value FROM ONLY company_meta:policy_epoch) ?? 0;
-      IF $epoch != $expected_policy_epoch { THROW 'policy moved: the effective contract moved since the claim was read' };
-      ${INDEPENDENCE_GUARD_SQL}
       IF $t.state = 'review' {
-        IF $t.submitted_by = $employee OR ($excluded CONTAINS $employee) { THROW 'self review denied' };
-        LET $repairs = SELECT VALUE count() FROM audit WHERE task = $task AND action = 'goal_acceptance_repair' AND actor = $actor GROUP ALL;
-        IF ($repairs[0] ?? 0) > 0 { THROW 'goal acceptance repairer cannot review' };
+        LET $prior_submitters = SELECT VALUE <string>record::id(actor) FROM audit WHERE task = $task AND action IN ['submit', 'owner_submit'];
+        IF $t.submitted_by = $employee OR $prior_submitters CONTAINS $employee { THROW 'self review denied' };
         IF 'review' NOT IN $who.capabilities OR $t.reviewer_role != $who.role { THROW 'review denied' };
       } ELSE {
         IF 'execute' NOT IN $who.capabilities OR $t.executor_role != $who.role { THROW 'execute denied' };
-        IF $t.executor_role = 'engineering' {
-          LET $owner = IF $t.implementer != NONE THEN $t.implementer ELSE $bound END;
-          IF $owner = '' AND $ambiguous { THROW 'execute denied: implementer unresolved, manager takeover required' };
-          IF $owner != '' AND $owner != $employee { THROW 'execute denied: bound to another implementer' };
-        };
       };
       IF $t.current_employee != NONE AND $t.lease_expires_at > $now AND $t.current_employee != $employee { THROW 'leased by another employee' };
       LET $def_tracks = $who.def.tracks ?? [];
@@ -1508,32 +924,15 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         LET $active = SELECT * FROM ONLY $who.active_task;
         IF $active != NONE AND $active.lease_expires_at > $now AND $active.current_employee = $employee { THROW 'employee already has active task' };
       };
-      LET $expired = $t.state != 'review' AND $t.execution_window != NONE AND <datetime>$t.execution_window.notAfter <= time::now();
-      IF $expired {
-        IF $t.current_employee != NONE AND $t.lease_expires_at > $now { THROW 'execution window expired under active lease' };
-        LET $n = UPDATE ONLY $task SET state = 'blocked', blocked_to = 'owner', resume_state = $t.state, version += 1 RETURN AFTER;
-        CREATE audit CONTENT { task: $task, actor: 'system:execution-window', action: 'block', version: $n.version,
-          recovery_reason: 'stale_window', evidence: '执行窗口已过期；需老板安排真实重采样和独立批准，禁止延长旧证据', at: time::now() };
-        LET $seq = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        CREATE outbox CONTENT { task: $task, kind: 'block', sequence: $seq.value, payload: { version: $n.version }, at: time::now() };
-      } ELSE {
-      IF $t.state != 'review' AND $t.recovery_stopped = true { THROW 'automatic recovery stopped' };
       LET $same = $t.current_employee = $employee AND $t.lease_expires_at > $now;
       LET $next = UPDATE ONLY $task SET
         state = IF $t.state = 'review' THEN 'review' ELSE 'doing' END,
         current_employee = $employee,
-        implementer = IF $t.state != 'review' AND $t.executor_role = 'engineering' AND $t.implementer = NONE THEN $employee ELSE $t.implementer END,
         delivery_id = IF $same THEN $t.delivery_id ELSE $delivery END,
         lease_expires_at = $now + $lease_seconds,
         progress_at = IF $same THEN $t.progress_at ELSE $now END,
         fence = IF $same THEN $t.fence ELSE $t.fence + 1 END,
         version = IF $same THEN $t.version ELSE $t.version + 1 END,
-        // FV06：standby 标记只属于那一次直派租约。同一持有人原地续领（$same）保留其待命窗口；
-        // 任何新持有人（复核、收回后的下一位、下一位实现人）领取即清除，旧标记不得管辖新租约。
-        standby_until = IF $same THEN $t.standby_until ELSE NONE END,
-        lease_policy_version = $policy_version,
-        lease_policy_hash = $policy_hash,
-        policy_block_reason = IF $t.policy_block_reason != NONE THEN $t.policy_block_reason ELSE NONE END,
         worktree = IF $assignment != NONE THEN $assignment ELSE $t.worktree END
         RETURN AFTER;
       UPDATE ONLY $actor SET active_task = $task, workspace_read_active = false;
@@ -1544,53 +943,28 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       };
       IF !$same {
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'claim', version: $next.version, at: time::now(), phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END, evidence: IF $assignment != NONE THEN type::string($assignment) ELSE NONE END };
-        // The first execute claim of an unbound engineering task makes this employee its implementer. That binding is the
-        // record that they write the task's code, so it is kept as a contribution row: an implementer whose lease was later
-        // revoked, or whose binding moved on to the next engineer, is still a real author and never reviews their own
-        // delivery (SYS-DISP IR01/Q1: a claim-only holder is a demoted hand, but a bound implementer is not one).
-        IF $t.state != 'review' AND $t.executor_role = 'engineering' AND $t.implementer = NONE {
-          CREATE ONLY $bound_audit CONTENT { task: $task, actor: $actor, action: 'implementer_bound', phase: 'execute', version: $next.version, at: time::now() };
-        };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: 'claimed', sequence: $sequence.value, payload: { employee: $employee, fence: $next.fence }, at: time::now() };
-      };
       };
       RETURN SELECT * FROM ONLY $task;
       COMMIT;`, {
       actor: id('employee', actor.employeeId), employee: actor.employeeId, task,
-      ops_repo: this.worktrees?.options.opsRepo ?? this.companyReleaseRepo,
       delivery: randomUUID(), lease_seconds: this.leaseSeconds,
       assignment: worktree, tree: worktree ? id('worktree', worktree.id) : undefined, reference: id('worktree_ref', taskId),
       audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
       // 必配轨岗位（screenwriter）：要求任务轨恰为必配轨且编制 tracks 显式覆盖——
       // 空 tracks、无 def 的员工与缺轨任务一律 forbidden（claim 端，派工端同规则过滤）。
       req: REQUIRED_TRACKS[actor.role] ?? null, has_req: REQUIRED_TRACKS[actor.role] !== undefined,
-      excluded: contrib.facts.excluded, bound: contrib.facts.implementer ?? '', ambiguous: contrib.facts.ambiguous, seen: contrib.version ?? -1,
-      indep_guards: gate?.guards ?? [], bound_audit: id('audit', randomUUID()),
-      policy_version: policyContract.version, policy_hash: policyContract.hash, expected_policy_epoch: policyEpochAtClaim,
-    }));
+    });
     const taskView = view(row);
-    // SYS-INT: an independent QA review claim of a watched source task wakes its registered collaboration task once
-    // per review fence. The claim itself already committed; a wake that cannot be written must not undo it.
-    if (row.state === 'review' && row.reviewer_role === 'qa' && row.current_employee === actor.employeeId) {
-      await this.reviewEvents.onReviewClaimed(taskId, actor.employeeId, row.fence).catch(() => undefined);
-    }
     const project = await this.taskProject(taskId);
     const handover = await this.handoverHistory(taskId);
-    if (row.state === 'blocked') throw new CompanyError('invalid', 'Execution window expired; manager recovery required');
     return { task: taskView, deliveryId: taskView.deliveryId!, fence: taskView.fence,
       leaseExpiresAt: taskView.leaseExpiresAt!, history: handover.history, historyComplete: handover.historyComplete, historyCount: handover.historyCount,
       predecessors: await this.predecessors(taskId, actor.employeeId),
-      project, worktree: taskView.worktree,
-      // 提示里只渲染当前有效契约（SYS06 AC03）：旧文本留在 policy 历史里，claim.json 拿到的是这一份。
-      policy: this.policyEffectiveView(policyChain, policyContract, policyRows) };
+      project, worktree: taskView.worktree };
   }
 
-  /**
-   * Distinct employees that claimed this task before the current holder, in first-claim order.
-   * Their Paseo session IDs let a successor read the full transcript (`paseo logs <agentId>`)
-   * instead of relying on the truncated log tail stored in the handover packet.
-   */
   private async predecessors(taskId: TaskId, exclude: string): Promise<SessionRef[]> {
     const [claims] = await this.db.query<[Array<{ actor?: unknown }>]>(
       `SELECT actor, at FROM audit WHERE task = $task AND action = 'claim' ORDER BY at ASC;`,
@@ -1613,8 +987,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * (a Set of track names when the project defines a non-empty `disciplines` list, else
    * undefined = free-form values allowed).
    */
-  private disciplineContract(goalId?: string, projectId?: string): Promise<DisciplineContract | undefined> {
-    return loadContract(this.db, goalId, projectId);
+  private disciplineContract(projectId?: string): Promise<DisciplineContract | undefined> {
+    return loadContract(this.db, projectId);
   }
 
   /**
@@ -1623,10 +997,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * workspaces, claim.json.project, worktree inventory and ops scoping.
    */
   private async taskProject(taskId: TaskId): Promise<ProjectView | undefined> {
-    const [rows] = await this.db.query<[Array<{ project?: RecordId; goal_project?: RecordId }>]>(
-      'SELECT project AS project, goal.project AS goal_project FROM $task;', { task: id('task', taskId) });
-    const project = rows[0]?.project ?? rows[0]?.goal_project;
-    return project ? this.projects.get(String(project.id)) : undefined;
+    const [rows] = await this.db.query<[Array<{ project?: RecordId }>]>(
+      'SELECT project FROM $task;', { task: id('task', taskId) });
+    return rows[0]?.project ? this.projects.get(String(rows[0].project.id)) : undefined;
   }
 
   /**
@@ -1687,10 +1060,10 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * the business project's repo (the wrong-repo block → bind_task_code_repo → re-dispatch loop). An explicit codeRepoPath
    * must be on the bind allowlist. Without one, a task that writes code (code intent, release or deploy leg) whose
    * project repo is not the ops repo, and whose context names the ops repo's absolute path, is bound to the ops repo:
-   * that is how managers already state "the code is in operations, the business project stays". Anything else keeps
+   * that is how operators already state "the code is in operations, the business project stays". Anything else keeps
    * project routing (undefined).
    */
-  private async creationCodeRepo(input: Pick<CreateTask, 'codeRepoPath' | 'context' | 'project' | 'goalId' | 'workIntent'>, kind: TaskKind): Promise<string | undefined> {
+  private async creationCodeRepo(input: Pick<CreateTask, 'codeRepoPath' | 'context' | 'project' | 'workIntent'>, kind: TaskKind): Promise<string | undefined> {
     if (input.codeRepoPath !== undefined) {
       requireText(input.codeRepoPath, 'codeRepoPath', 1, 1000);
       if (!isAbsolute(input.codeRepoPath) || input.codeRepoPath.includes('\0') || input.codeRepoPath.split('/').includes('..')) {
@@ -1704,24 +1077,13 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (!writes) return undefined;
     const ops = this.worktrees?.options.opsRepo ?? opsRepoPath();
     if (!namesRepo(input.context, ops)) return undefined;
-    const project = input.project ? await this.projects.get(input.project)
-      : input.goalId ? await this.goalProject(input.goalId) : undefined;
+    const project = input.project ? await this.projects.get(input.project) : undefined;
     if (!project?.repoPath) return undefined;
     let opsCanon: string, projectCanon: string;
     try { opsCanon = canonicalRepoPath(ops); projectCanon = canonicalRepoPath(project.repoPath); } catch { return undefined; }
     return opsCanon === projectCanon ? undefined : opsCanon;
   }
 
-  private async goalProject(goalId: string): Promise<ProjectView | undefined> {
-    const [rows] = await this.db.query<[Array<{ project?: RecordId }>]>('SELECT project FROM $goal;', { goal: id('goal', goalId) });
-    const project = rows?.[0]?.project;
-    return project ? this.projects.get(String(project.id)) : undefined;
-  }
-
-  /**
-   * Audit entries of one task, newest first, read in one consistent read with the database time. Routine ops_call
-   * reads are not audit history and are left out of every history answer.
-   */
   private async historyRowsAt(taskId: TaskId, limit: number, db?: Surreal): Promise<{ at: string; rows: AuditHistoryRow[] }> {
     return this.consistentRead<{ at: string; rows: AuditHistoryRow[] }>(`LET $at = <string>time::now();
       LET $rows = (SELECT id, action, actor, evidence, version, at, <string>at AS cat FROM audit
@@ -1830,9 +1192,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       where.push('(executor_role = $qrole OR reviewer_role = $qrole)');
       vars.qrole = params.role;
     }
-    if (params.goalId) {
-      where.push('goal = $goal');
-      vars.goal = id('goal', params.goalId);
+    if (params.tag) {
+      where.push('tag = $tag');
+      vars.tag = params.tag;
     }
     if (params.since) {
       where.push('created_at >= <datetime>$since');
@@ -1875,12 +1237,12 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const { limits } = this.snapshots;
     const header = await this.snapshots.build({
       owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '', startedAt,
-      guidance: 'narrow with state, goalId, role or since, or leave fields out',
+      guidance: 'narrow with state, tag, role or since, or leave fields out',
       load: async db => {
         const { at, count, textBytes, rows } = await this.taskRowsAt(actor, params, limits.maxRows + 1, limits.maxBytes, db);
-        if (count > limits.maxRows) throw tooLarge(`more than ${limits.maxRows} tasks match; narrow with state, goalId, role or since`);
+        if (count > limits.maxRows) throw tooLarge(`more than ${limits.maxRows} tasks match; narrow with state, tag, role or since`);
         if (textBytes > limits.maxBytes) {
-          throw tooLarge(`the matching tasks hold more than ${limits.maxBytes} bytes of text; narrow with state, goalId, role or since`);
+          throw tooLarge(`the matching tasks hold more than ${limits.maxBytes} bytes of text; narrow with state, tag, role or since`);
         }
         return { takenAt: at, bodies: rows.map(row => JSON.stringify(listItem(row, params.fields, true))) };
       },
@@ -2010,10 +1372,10 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         ...(params.paged ? { page: { pageSize: params.pageSize, returned: 1, hasMore: false, total: 1, budgetBytes: RESPONSE_BUDGET_BYTES } } : {}),
       };
       return completeOrRefuse(view, `task ${task.id}`,
-        `read a long part with read_task_text: the context {"taskId":"${task.id}","field":"context","offset":0}, then offset = nextOffset with the expectSha256 of the first segment, until nextOffset is null (the whole text has sha256 ${HASH(task.context)}); a long dependency list {"taskId":"${task.id}","field":"dependencies","offset":0}; or leave a part out with fields${company ? `; or ${COMPANY_PAGED_HINT}` : ''}`);
+        `read a long part with read_task_text: the context {"taskId":"${task.id}","field":"context","offset":0}, then offset = nextOffset with the expectSha256 of the first segment, until nextOffset is null (the whole text has sha256 ${HASH(task.context)}); or leave a part out with fields${company ? `; or ${COMPANY_PAGED_HINT}` : ''}`);
     }
     if (!params.paged) {
-      const guidance = 'retry with {"pageSize":25} and then {"cursor":"<page.nextCursor>"} until page.hasMore is false, or narrow with state, goalId, role or since';
+      const guidance = 'retry with {"pageSize":25} and then {"cursor":"<page.nextCursor>"} until page.hasMore is false, or narrow with state, tag, role or since';
       const { count, textBytes, rows } = await this.taskRowsAt(actor, params, COMPLETE_TASK_ROWS + 1, RESPONSE_BUDGET_BYTES);
       if (count > COMPLETE_TASK_ROWS) throw tooLarge(`more than ${COMPLETE_TASK_ROWS} tasks match; ${guidance}`);
       if (textBytes > RESPONSE_BUDGET_BYTES) {
@@ -2023,14 +1385,14 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       return completeOrRefuse(view, `the working set (${rows.length} tasks)`, company ? `${guidance}; or ${COMPANY_PAGED_HINT}` : guidance);
     }
     const digest = queryDigest('context', {
-      state: params.state ?? null, goalId: params.goalId ?? null, role: params.role ?? null, since: params.since ?? null, fields: params.fields ?? null, includeCompany: params.includeCompany,
+      state: params.state ?? null, tag: params.tag ?? null, role: params.role ?? null, since: params.since ?? null, fields: params.fields ?? null, includeCompany: params.includeCompany,
     });
     return this.listingPage<Record<string, unknown>, ContextView>({
       actor, kind: 'context', digest, pageSize: params.pageSize, cursor: params.cursor, startedAt,
       create: started => this.contextListing(actor, params, digest, started),
       parse: body => JSON.parse(body) as Record<string, unknown>,
       respond: (tasks, page) => ({ principal: actor, ...withCompany, tasks: [...tasks], page }),
-      envelopeGuidance: company ? `${COMPANY_PAGED_HINT}, which leaves the block out of every page` : 'narrow the query with state, goalId, role or since',
+      envelopeGuidance: company ? `${COMPANY_PAGED_HINT}, which leaves the block out of every page` : 'narrow the query with state, tag, role or since',
       oversizeGuidance: item => `task ${String(item.id)} is larger than a page can hold; read its context with read_task_text ${JSON.stringify({ taskId: String(item.id), field: 'context', offset: 0 })}, or narrow the fields with fields`,
     });
   }
@@ -2189,7 +1551,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   /**
    * read_task_text (SYS01, R3): one byte segment of one text of a task. context and evidence are read as stored. project is the
-   * task's project environment as JSON, read by its holder and owner only. dependencies, workIntentPaths and worktreePaths are the
+   * task's project environment as JSON, read by its holder and owner only. workIntentPaths and worktreePaths are the
    * task's lists as JSON arrays, the form a claim echo cuts them from. Segments never split a character and reassemble exactly;
    * sha256 covers the whole text, so a reader can verify it.
    */
@@ -2220,7 +1582,6 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       text = JSON.stringify(project);
     } else {
       const lists = {
-        dependencies: task.dependencies,
         workIntentPaths: task.workIntent?.paths ?? [],
         worktreePaths: task.worktree?.intent?.paths ?? [],
       };
@@ -2246,11 +1607,12 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may read the company summary');
     const params = parseSummaryInput(input);
     const since = params.since ?? new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const goal = params.goalId ? id('goal', params.goalId) : undefined;
     // One transaction. The cutoff is the database time at its start. Task counts are each task's state at that cutoff and
-    // ignore since. Audit counts cover [since, cutoff]; with a goal, only the audit entries of that goal's tasks.
-    const taskWhere = goal ? 'WHERE goal = $goal' : '';
-    const auditWhere = goal ? 'task IN $goalTasks AND at >= <datetime>$since AND at <= $cutoff' : 'at >= <datetime>$since AND at <= $cutoff';
+    // ignore since. Audit counts cover [since, cutoff].
+    const taskWhere = params.tag ? 'WHERE tag = $tag' : '';
+    const auditWhere = params.tag
+      ? 'at >= <datetime>$since AND at <= $cutoff AND task IN (SELECT VALUE id FROM task WHERE tag = $tag)'
+      : 'at >= <datetime>$since AND at <= $cutoff';
     const counts = (n: string) => `LET $states${n} = (SELECT state, count() AS n FROM task ${taskWhere} GROUP BY state);
       LET $taskTotal${n} = (SELECT count() AS n FROM task ${taskWhere} GROUP ALL)[0].n;
       LET $actions${n} = (SELECT action, count() AS n FROM audit WHERE ${auditWhere} GROUP BY action);
@@ -2262,14 +1624,13 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     type SummaryRead = Counts & { cutoff: string; outbox?: number | null; again?: Counts };
     const read = await this.consistentRead<SummaryRead>(`LET $cutoff = time::now();
       LET $outbox = (SELECT VALUE value FROM company_meta:outbox_counter)[0];
-      ${goal ? 'LET $goalTasks = (SELECT VALUE id FROM task WHERE goal = $goal);' : ''}
       ${counts('')}
       ${counts('_again')}
       RETURN { read: {
         cutoff: <string>$cutoff, outbox: $outbox,
         states: $states, taskTotal: $taskTotal, actions: $actions, auditTotal: $auditTotal,
         again: { states: $states_again, taskTotal: $taskTotal_again, actions: $actions_again, auditTotal: $auditTotal_again },
-      } };`, { since, ...(goal ? { goal } : {}) });
+      } };`, { since, tag: params.tag ?? null });
     // Both reads are compared in one canonical order, so a difference in row order alone is not reported as a change.
     const canonical = (c: Counts) => JSON.stringify([
       [...(c.states ?? [])].map(row => [String(row.state ?? null), Number(row.n)]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
@@ -2298,11 +1659,10 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       repeatableRead,
     };
     return {
-      cutoffAt: read.cutoff, since, ...(params.goalId ? { goalId: params.goalId } : {}),
+      cutoffAt: read.cutoff, since,
       scope: {
-        tasks: goal ? 'tasks of this goal, each in the state it holds at cutoffAt; since does not apply to them'
-          : 'every task, each in the state it holds at cutoffAt; since does not apply to them',
-        audit: goal ? "audit entries of this goal's tasks with at from since up to cutoffAt" : 'audit entries with at from since up to cutoffAt',
+        tasks: params.tag ? `tag ${params.tag} 的任务，各处于 cutoffAt 时的状态；since does not apply to them` : 'every task, each in the state it holds at cutoffAt; since does not apply to them',
+        audit: params.tag ? 'audit entries of this tag with at from since up to cutoffAt' : 'audit entries with at from since up to cutoffAt',
       },
       tasks, audit, outboxSequence: Number(read.outbox ?? 0),
       integrity: {
@@ -2331,92 +1691,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
-   * owner only, read-only (SYS-DISP AC05): what the audit-derived contributors say about the given tasks, the implementer status
-   * each one would have, and its timeline. Nothing is written: no lease, submitter, owner gate, history or implementer changes
-   * here. Recording a suggested implementer is a separate step that needs owner authorization.
-   */
-  async contributorDryRun(credential: Credential, input: { taskIds: string[] }): Promise<ContributorDryRunView> {
-    const actor = await this.authorized(credential);
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may run the contributor dry-run');
-    if (!Array.isArray(input.taskIds) || input.taskIds.length === 0 || input.taskIds.length > 20) {
-      throw new CompanyError('invalid', 'taskIds must hold 1 to 20 task ids');
-    }
-    const rows: ContributorDryRunView['tasks'] = [];
-    for (const taskId of input.taskIds) {
-      requireText(taskId, 'taskId', 1, 200);
-      const row = await this.db.select<TaskRow>(id('task', taskId));
-      if (!row) {
-        rows.push({ taskId, found: false });
-        continue;
-      }
-      const { facts, version } = await readContributionView(this.db, taskId);
-      const window = await readAuditTimelineWindow(this.db, taskId, DRY_RUN_TIMELINE_ROWS, openLeaseOf(row.current_employee, row.state));
-      rows.push({
-        found: true, title: row.title, state: row.state, version, executorRole: row.executor_role,
-        reviewerRole: row.reviewer_role, currentEmployee: row.current_employee, lastSubmitter: row.submitted_by,
-        ...proposeImplementer(taskId, facts, row.implementer ?? undefined),
-        timeline: window.entries, timelineTotal: window.total,
-      });
-    }
-    // The whole answer is held to DRY_RUN_BYTE_BUDGET: every task keeps its newest rows, and the number kept halves until the JSON fits.
-    const answer = (keep: number): ContributorDryRunView => {
-      const tasks = rows.map(task => {
-        if (!task.timeline) return { ...task };
-        const shown = Math.min(keep, task.timeline.length);
-        return { ...task, timeline: task.timeline.slice(task.timeline.length - shown), timelineShown: shown,
-          timelineTruncated: shown < (task.timelineTotal ?? shown) };
-      });
-      return { readOnly: true, checkedAt: new Date().toISOString(), budgetBytes: DRY_RUN_BYTE_BUDGET,
-        truncated: tasks.some(task => task.timelineTruncated === true), tasks };
-    };
-    let keep = DRY_RUN_TIMELINE_ROWS;
-    for (;;) {
-      const view = answer(keep);
-      if (keep === 0 || Buffer.byteLength(JSON.stringify(view), 'utf8') <= DRY_RUN_BYTE_BUDGET) return view;
-      keep = Math.floor(keep / 2);
-    }
-  }
-
-  /**
-   * owner and qa, read-only (SYS-DISP IR01-IR05): the verdict the independence gate would give for one employee on one task at one
-   * stage — the formal read-only preflight that the source-avoidance registrations prove their criteria with, replacing an exported
-   * reply as evidence. The exclusion comes from the gate's own reader and index, so a reading cannot drift from what a claim or a
-   * submit actually does, and nothing is written: no lease, version, audit row, outbox event or dispatch observation. A done or void
-   * task stays readable, which is the tool's main use.
-   *
-   * A task without a policy is not_applicable (legacy behaviour unchanged). A source that cannot be read, an unreadable identity
-   * table, or a policy this build cannot enforce is unverifiable — never clear, because the gate fails closed on exactly those. qa may
-   * read it (independent review without manage); every other role is refused.
-   */
-  async independenceCheck(credential: Credential, input: IndependenceCheckInput): Promise<IndependenceCheckView> {
-    const actor = await this.authorized(credential);
-    if (actor.role !== 'owner' && actor.role !== 'qa') {
-      throw new CompanyError('forbidden', 'Only a manager or qa may read the independence preflight');
-    }
-    requireText(input.taskId, 'taskId', 1, INDEPENDENCE_LIMITS.idChars);
-    requireText(input.employeeId, 'employeeId', 1, INDEPENDENCE_LIMITS.idChars);
-    if (input.stage !== undefined && input.stage !== 'execute' && input.stage !== 'review') {
-      throw new CompanyError('invalid', 'stage must be execute or review');
-    }
-    const row = await this.db.select<TaskRow>(id('task', input.taskId));
-    if (!row) throw new CompanyError('not_found', `Task not found: ${input.taskId}`);
-    // The stage is inferred from the phase the task is in now, the way a claim reads it: review while in review, execute otherwise.
-    const stage: IndependenceStage = input.stage ?? (row.state === 'review' ? 'review' : 'execute');
-    const registered = row.independence ? policyView(row.independence) : undefined;
-    if (registered === undefined) {
-      return { taskId: input.taskId, employeeId: input.employeeId, stage, verdict: 'not_applicable',
-        reason: 'the task has no independence policy, so the gate takes no independence read for it' };
-    }
-    // The policy echo is the registered value itself, so qa reads the real fields back instead of trusting a relayed reply.
-    const policy: IndependenceCheckPolicyView = { revision: registered.revision, stages: registered.stages, mode: registered.mode,
-      sources: registered.sources, excluded: registered.excluded, setBy: registered.setBy, setAt: registered.setAt };
-    return { ...await checkIndependence(this.db, input.taskId, registered, stage, input.employeeId, this.independenceReadHook), policy };
-  }
-
-  /**
-   * The company block as the credential's holder may read it. Projects keep their identity fields for everyone; their environments
-   * (names, URLs and credential aliases with roles) are shown only to owner and to the holder of a valid lease on one of their tasks
-   * (SYS01 M3). The owner's console reads the full block through OwnerDesk.brief, which is unchanged.
+   * owner only, read-only: what the audit-derived contributors say about the given tasks (authors, claim-only
+   * hands, submitters). Nothing is written here.
    */
   async companyBrief(credential: Credential): Promise<CompanyBrief> {
     const actor = await this.authorized(credential);
@@ -2435,11 +1711,11 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   /** Which project environments a reader may see: all for owner; otherwise those of the projects of tasks it holds under a valid lease. */
   private async envView(actor: Principal): Promise<EnvView> {
     if (actor.role === 'owner') return { key: 'all', visible: () => true };
-    const [rows] = await this.db.query<[Array<{ project?: RecordId; goal_project?: RecordId }>]>(
-      'SELECT project AS project, goal.project AS goal_project FROM task WHERE current_employee = $employee AND lease_expires_at > $now;',
+    const [rows] = await this.db.query<[Array<{ project?: RecordId }>]>(
+      'SELECT project AS project FROM task WHERE current_employee = $employee AND lease_expires_at > $now;',
       { employee: actor.employeeId, now: Math.floor(Date.now() / 1000) });
     const held = new Set((rows ?? []).flatMap(row => {
-      const project = row.project ?? row.goal_project;
+      const project = row.project;
       return project ? [String(project.id)] : [];
     }));
     return { key: [...held].sort().join(','), visible: project => held.has(project) };
@@ -2452,189 +1728,6 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return `gm-relay:${actor.employeeId}`;
   }
 
-  async relayGoal(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string; tier?: GoalTier; project?: string; pipeline?: string }): Promise<GoalView> {
-    const source = await this.relayActor(credential, input.ownerQuote);
-    return this.owner.createGoal({ text: input.text, source, key: `${source}:${input.idempotencyKey}`,
-      note: `老板原话：${input.ownerQuote}`, tier: input.tier, project: input.project, pipeline: input.pipeline });
-  }
-
-  /**
-   * owner only: close a large goal in stages. The named unfinished tasks move to a next-phase goal (created once per
-   * idempotency key, same tier and project); the old goal's anchors stop waiting for them and unlock when nothing else is
-   * open, so the current phase can be accepted. The moved tasks join the new goal's first anchor. Refused, writing
-   * nothing, when a task is an anchor, finished, leased, outside the goal, or still awaited by an open task that stays.
-   */
-  async goalPhaseSplit(credential: Credential, input: { goalId: string; taskIds: TaskId[]; title: string; reason: string; idempotencyKey: string }): Promise<{ goalId: string; nextGoalId: string; moved: TaskId[]; unlocked: TaskId[] }> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may split a goal into phases');
-    return this.phaseSplit({ record: id('employee', actor.employeeId), source: `gm-split:${actor.employeeId}` }, input);
-  }
-
-  /** The owner's own split (owner CLI): same checks and transaction as goalPhaseSplit, audited as the owner. */
-  async ownerGoalPhaseSplit(source: string, input: { goalId: string; taskIds: TaskId[]; title: string; reason: string; idempotencyKey: string }): Promise<{ goalId: string; nextGoalId: string; moved: TaskId[]; unlocked: TaskId[] }> {
-    requireText(source, 'source', 1, 100);
-    return this.phaseSplit({ record: `owner:${source}`, source: `owner-split:${source}` }, input);
-  }
-
-  private async phaseSplit(actor: { record: RecordId | string; source: string }, input: { goalId: string; taskIds: TaskId[]; title: string; reason: string; idempotencyKey: string }): Promise<{ goalId: string; nextGoalId: string; moved: TaskId[]; unlocked: TaskId[] }> {
-    requireText(input.goalId, 'goal', 1, 100);
-    requireText(input.title, 'title', 4, 60);
-    requireText(input.reason, 'reason', 4, 4000);
-    requireText(input.idempotencyKey, 'idempotencyKey', 1, 200);
-    const moved = [...new Set(input.taskIds ?? [])];
-    if (!moved.length || moved.length > 200) throw new CompanyError('invalid', 'taskIds must name 1-200 tasks');
-    const goal = await this.db.select<{ id: RecordId; title: string; brief: string; state: string; tier?: GoalTier; project?: RecordId; anchors?: RecordId[]; split_into?: Record<string, RecordId> }>(id('goal', input.goalId));
-    if (!goal) throw new CompanyError('not_found', 'goal not found');
-    const prior = goal.split_into?.[HASH(input.idempotencyKey).slice(0, 16)];
-    if (prior) return { goalId: input.goalId, nextGoalId: asId(prior), moved, unlocked: [] };
-    if (!['active', 'needs_repair'].includes(goal.state)) throw new CompanyError('conflict', 'only an active goal can be split');
-    const anchors = (goal.anchors ?? []).map(asId);
-    const [rows, [now]] = await Promise.all([
-      this.db.query<[TaskRow[]]>('SELECT * FROM task WHERE goal = $goal AND state NOT IN [\'done\', \'void\'];', { goal: goal.id }).then(r => r[0] ?? []),
-      this.db.query<[number]>('RETURN time::unix(time::now());'),
-    ]);
-    const open = new Map(rows.map(row => [asId(row.id), row]));
-    const problems: string[] = [];
-    for (const taskId of moved) {
-      const row = open.get(taskId);
-      if (anchors.includes(taskId)) problems.push(`${taskId} 是目标锚点`);
-      else if (!row) problems.push(`${taskId} 不是本目标的未完成任务`);
-      else if (row.current_employee && (row.lease_expires_at ?? 0) > now) problems.push(`${taskId} 有活动租约`);
-    }
-    const movedSet = new Set(moved);
-    for (const [taskId, row] of open) {
-      if (movedSet.has(taskId) || anchors.includes(taskId)) continue;
-      const waits = (row.dependencies ?? []).map(asId).filter(dep => movedSet.has(dep));
-      if (waits.length) problems.push(`留在本阶段的 ${taskId} 依赖 ${waits.join('、')}，需一起移走或先改依赖`);
-    }
-    if (problems.length) throw new CompanyError('conflict', `分阶段被拒：${problems.slice(0, 10).join('；')}`);
-    const next = await this.owner.createGoal({
-      text: `${input.title}\n上一阶段：${goal.title}（goal=${input.goalId}）。分阶段原因：${input.reason}\n\n${goal.brief}`.slice(0, 20000),
-      source: actor.source, key: `split:${input.goalId}:${input.idempotencyKey}`,
-      note: `从 ${input.goalId} 分出的下一阶段`, tier: goal.tier ?? 'standard',
-      ...(goal.project ? { project: asId(goal.project) } : {}),
-    });
-    const nextGoal = id('goal', next.id);
-    const nextRow=await this.db.select<{anchors?:RecordId[]}>(nextGoal);
-    const [nextTasks]=await this.db.query<[Array<{id:RecordId;state:string;version:number}>]>(
-      'SELECT id,state,version FROM task WHERE id IN $anchors;',{anchors:nextRow?.anchors??[]});
-    const nextById=new Map(nextTasks.map(t=>[asId(t.id),t]));
-    const firstAnchor=(nextRow?.anchors??[]).map(id=>nextById.get(asId(id))).find(t=>t&&!['done','void'].includes(t.state));
-    if(!firstAnchor)throw new CompanyError('conflict','next stage has no open anchor');
-    const blockedBefore = new Set(anchors.filter(a => open.get(a)?.state === 'blocked'));
-    await this.db.query(`BEGIN;
-      LET $g = SELECT * FROM ONLY $old;
-      IF $g.state NOT IN ['active', 'needs_repair'] { THROW 'goal moved: no longer active' };
-      LET $n = SELECT * FROM ONLY $next;
-      LET $first=$next_anchor;
-      LET $first_row=SELECT * FROM ONLY $first;
-      IF $first NOT IN ($n.anchors??[]) OR $first_row=NONE OR $first_row.version!=$next_anchor_version OR $first_row.state IN ['done','void'] {THROW 'next stage anchor moved'};
-      IF $first_row.current_employee!=NONE AND $first_row.lease_expires_at>time::unix(time::now()) {THROW 'next stage anchor is leased'};
-      FOR $t IN $moved {
-        LET $row = SELECT * FROM ONLY $t;
-        IF $row.goal != $old OR $row.state IN ['done', 'void'] { THROW 'task moved: no longer an open task of the goal' };
-        IF $row.current_employee != NONE AND $row.lease_expires_at > time::unix(time::now()) { THROW 'task moved: leased' };
-        UPDATE ONLY $t SET goal = $next, worktree = NONE, version += 1;
-        CREATE audit CONTENT { task: $t, actor: $actor, action: 'goal_phase_split', evidence: $evidence, at: time::now() };
-      };
-      IF $first != NONE {
-        UPDATE ONLY $first SET dependencies = array::union(dependencies ?? [], $moved), state = 'blocked', blocked_to = NONE, version += 1;
-      };
-      FOR $a IN ($g.anchors ?? []) {
-        LET $anchor = SELECT * FROM ONLY $a;
-        IF $anchor.state = 'blocked' AND array::len(array::intersect($anchor.dependencies ?? [], $moved)) > 0 {
-          LET $deps = array::complement($anchor.dependencies ?? [], $moved);
-          ${RESOLVE_DEP_SQL('$deps', '$a_dep')}
-          LET $remaining = SELECT VALUE id FROM task WHERE id IN $a_dep_resolved AND ${depUnsatisfiedFor('$anchor')};
-          LET $free = array::len($remaining) = 0 AND $anchor.blocked_to = NONE AND $anchor.wait_state != 'waiting';
-          UPDATE ONLY $a SET dependencies = $deps, state = IF $free THEN 'ready' ELSE 'blocked' END, version += 1;
-          CREATE audit CONTENT { task: $a, actor: $actor, action: IF $free THEN 'dependency_unlocked' ELSE 'goal_phase_split' END,
-            evidence: $evidence, at: time::now() };
-        };
-      };
-      UPDATE ONLY $old SET split_into[$split_key] = $next, version = (version ?? 0) + 1;
-      CREATE audit CONTENT { goal: $old, actor: $actor, action: 'goal_phase_split', evidence: $evidence, at: time::now() };
-      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE outbox CONTENT { kind: 'goal_phase_split', sequence: $sequence.value,
-        payload: { goal: $old_key, next: $next_key, moved: $moved_keys }, at: time::now() };
-      COMMIT;`, {
-      old: goal.id, next: nextGoal,next_anchor:firstAnchor.id,next_anchor_version:firstAnchor.version, moved: moved.map(taskId => id('task', taskId)), actor: actor.record,
-      evidence: `分阶段：${input.reason}\n下一阶段目标 ${next.id}：${input.title}\n移入任务：${moved.join('、')}`,
-      split_key: HASH(input.idempotencyKey).slice(0, 16), old_key: input.goalId, next_key: next.id, moved_keys: moved,
-    });
-    const [after] = await this.db.query<[Array<{ id: RecordId; state: string }>]>('SELECT id, state FROM $ids;',
-      { ids: [...blockedBefore].map(a => id('task', a)) });
-    const unlocked = (after ?? []).filter(row => row.state === 'ready').map(row => asId(row.id));
-    // Reassess the retained stage after moving its open work; this never approves its final gate.
-    await this.goalFinalizeSafe(input.goalId,actor.source);
-    return { goalId: input.goalId, nextGoalId: next.id, moved, unlocked };
-  }
-
-  async triageGoal(credential: Credential, input: { goalId: string; tier: GoalTier; reason: string }): Promise<GoalView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may triage goals');
-    requireText(input.reason, 'reason', 4, 4000);
-    return this.owner.triage(input.goalId, input.tier, `${actor.employeeId}：${input.reason}`);
-  }
-
-  async createDelivery(credential: Credential, input: CreateDelivery): Promise<TaskView[]> {
-    // The caller's own dependency list is external input: bound the raw list before de-duplication,
-    // exactly like create_task (51 duplicates must not collapse into one legal edge). The legs' internal
-    // chain dependencies (leg N waits for leg N-1) are added below and stay complete.
-    validateExternalDependencies(input.dependencies);
-    requireText(input.goalId, 'goal', 1, 100);
-    requireText(input.title, 'title', 3, 160);
-    requireText(input.spec, 'spec', 20, 20000);
-    if (input.project !== undefined) requireText(input.project, 'project', 1, 60);
-    if (input.discipline !== undefined) {
-      requireText(input.discipline, 'discipline', 1, 60);
-      const contract = await this.disciplineContract(input.goalId, input.project);
-      if (contract && !contract.has(input.discipline)) {
-        throw new CompanyError('invalid', `discipline must be in the project's tracks vocabulary: ${[...contract.keys()].join('、')}`);
-      }
-    }
-    const specs = deliveryChain(input.title, input.spec);
-    // SYS02: the delivery carries one versioned criteria set; each leg gets the criteria that name it, or its defaults.
-    const explicitCriteria = validateAcceptanceCriteria(input.acceptanceCriteria);
-    const acceptanceGate = await loadAcceptanceGate(this.db);
-    const acceptanceChain = HASH(`delivery\0${input.idempotencyKey}`).slice(0, 16);
-    const legNames: AcceptanceLeg[] = ['implement', 'release', 'deploy'];
-    // The legs are returned together: each echo gets an equal share of the item budget, so the whole answer fits (SYS01).
-    const legLimit = Math.floor(ITEM_BUDGET_BYTES / specs.length);
-    const lane = input.lane ?? `delivery-${HASH(input.idempotencyKey).slice(0, 8)}`;
-    const created: TaskView[] = [];
-    let dependencies = [...new Set(input.dependencies ?? [])];
-    for (const [index, spec] of specs.entries()) {
-      // The leg is echoed once, below, at its share of the budget: an echo here too would cut its lists twice (SYS01 R3).
-      const legName = legNames[index] ?? 'implement';
-      const matching = explicitCriteria.length > 0 ? criteriaForLeg(explicitCriteria, legName) : [];
-      // Gate on: pass only the caller's matching criteria; createTaskRecord merges the unremovable baseline for this leg.
-      // Gate off: preserve the old default-criteria behaviour.
-      const acceptanceCriteria = acceptanceGate.enabled
-        ? (matching.length > 0 ? matching : undefined)
-        : (matching.length > 0 ? matching : defaultAcceptanceCriteria(legName));
-      const task = await this.createTaskRecord(credential, {
-        ...spec, goalId: input.goalId, dependencies, idempotencyKey: `${input.idempotencyKey}:delivery:${index}`,
-        // Every leg persists the same project override so the chain stays on one project.
-        project: input.project,
-        // ...and the same code repo, explicit or inferred from the spec, so no leg lands in the business repo.
-        ...(input.codeRepoPath !== undefined ? { codeRepoPath: input.codeRepoPath } : {}),
-        // One delivery is one lane: every leg works in the same tree and branch, whoever claims it.
-        workIntent: { kind: spec.kind === 'release' ? 'read' : 'code', lane },
-        // Only the implementation leg carries the discipline track; release/deploy legs stay generic.
-        discipline: index === 0 ? input.discipline : undefined,
-        acceptanceCriteria,
-        // N1: the environment requirement is a deploy-leg fact. The implement and release legs run against the PR head,
-        // where no deployment exists yet, so they stay generic CI.
-        acceptanceEnvironment: spec.kind === 'deploy' ? input.acceptanceEnvironment : undefined,
-      }, { acceptanceChain });
-      created.push(task);
-      dependencies = [task.id];
-    }
-    return created.map(task => echoTask(task, legLimit));
-  }
-
-  /** SYS02: read the gate and the current verdict for one task (its holder, reviewer, or owner). */
   async acceptanceStatus(credential: Credential, input: { taskId: TaskId }): Promise<AcceptanceStatusView> {
     const actor = await this.authenticate(credential);
     await this.getTask(credential, input.taskId);
@@ -2652,138 +1745,6 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /** SYS-INT: read-only versioned acceptance-mapping preview for one task. The holder, reviewer or owner may read it; it never writes. */
-  async acceptanceMappingPreview(credential: Credential, input: { taskId: TaskId }): Promise<AcceptanceMappingPreviewView> {
-    const actor = await this.authenticate(credential);
-    await this.getTask(credential, input.taskId);
-    const row = await this.db.select<TaskRow>(id('task', input.taskId));
-    if (!row) throw new CompanyError('not_found', 'Task not found');
-    const leg = acceptanceLegForSubject({ kind: row.kind, workIntent: row.work_intent });
-    // One bundle per audience: the mapping tool's own items for engineering implement rows, the source business
-    // QA contract for the SYS-INT goal's QA rows. A row matching none (or several) is a conflict, never a fit.
-    const matches = ACCEPTANCE_MAPPING_BUNDLES.filter(candidate => bundleAppliesTo(candidate, {
-      leg, executorRole: row.executor_role, goalId: row.goal ? asId(row.goal) : undefined }));
-    const bundle = matches.length === 1 ? matches[0] : undefined;
-    let current: AcceptanceCriterion[] = [];
-    try { current = validateAcceptanceCriteria(row.acceptance_criteria); } catch { current = []; }
-    const conflicts: string[] = [];
-    if (matches.length === 0) conflicts.push('unsupported-leg');
-    if (matches.length > 1) conflicts.push('ambiguous-bundle');
-    if (row.current_employee) conflicts.push('occupied');
-    if (row.state === 'done' || row.state === 'void') conflicts.push('terminal-state');
-    if (current.length > 0 && !row.acceptance_legacy) conflicts.push('criteria-present');
-    if (bundle) {
-      for (const criterion of current) {
-        if (criterion.required && !bundle.criteria.some(candidate => candidate.id === criterion.id &&
-          candidate.kind === criterion.kind && candidate.evidence === criterion.evidence && candidate.verify === criterion.verify)) {
-          conflicts.push(`downgrade:${criterion.id}`);
-        }
-      }
-    }
-    return {
-      taskId: input.taskId, title: row.title, state: row.state, ...(row.kind ? { kind: row.kind } : {}),
-      ...(row.work_intent ? { workIntent: row.work_intent } : {}),
-      occupied: Boolean(row.current_employee), legacy: Boolean(row.acceptance_legacy), currentCriteria: current,
-      ...(bundle ? {
-        proposal: {
-          key: bundle.key, leg: bundle.leg, version: bundle.version, digest: mappingDigest(bundle),
-          description: bundle.description, criteria: bundle.criteria,
-          ...(bundle.appliesTo ? { appliesTo: {
-            ...(bundle.appliesTo.leg !== undefined ? { leg: bundle.appliesTo.leg } : {}),
-            ...(bundle.appliesTo.executorRole !== undefined ? { executorRole: bundle.appliesTo.executorRole } : {}),
-            ...(bundle.appliesTo.goalId !== undefined ? { goalId: bundle.appliesTo.goalId } : {}),
-          } } : {}),
-          ...(bundle.coverage ? { coverage: bundle.coverage.map(item => ({ ...item, sys: [...item.sys] })) } : {}),
-        },
-      } : {}),
-      sysRequired: SYS_REQUIRED_MAPPING.map(item => ({ ...item })),
-      conflicts,
-      guidance: '只读预览：不写任何数据。导入需 owner 携带本预览的 digest 与目标任务 expectedVersion 走 acceptance_mapping_import；冲突清零前导入会被拒绝。bundle 按受众绑定：工程实现行取工具自身项（sys-int-implement），SYS-INT 源 QA 行取源业务契约（sys-int-source-qa，业务项均为对真实生产证据的人工独立签核，不携带别腿机器基线）；错配 bundle 会被拒绝。',
-    };
-  }
-
-  /** SYS-INT: owner-only authorized import of a versioned acceptance-mapping bundle. CAS on the task version, digest-bound to the previewed bundle, audited; refuses stale bundles, downgrades, occupied/done/void rows and never rewrites finished acceptance. */
-  async acceptanceMappingImport(credential: Credential, input: AcceptanceMappingImportInput): Promise<TaskView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may import an acceptance mapping');
-    requireText(input.taskId, 'task', 1, 200);
-    if (!/^[a-z0-9-]{3,60}$/.test(input.mappingKey)) throw new CompanyError('invalid', 'mappingKey must be a registry bundle key');
-    const bundle = mappingBundle(input.mappingKey);
-    if (!bundle) throw new CompanyError('invalid', `unknown acceptance mapping bundle: ${input.mappingKey}`);
-    if (!/^[0-9a-f]{64}$/.test(input.digest) || input.digest !== mappingDigest(bundle)) {
-      throw new CompanyError('invalid', 'stale acceptance mapping: the digest does not match the current registry bundle; re-run the preview');
-    }
-    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
-    const reason = String(input.reason ?? '').trim();
-    if (reason.length < 10 || reason.length > 2000) throw new CompanyError('invalid', 'reason must be 10..2000 characters');
-    const idemDigest = HASH(JSON.stringify({ taskId: input.taskId, mappingKey: input.mappingKey, bundleDigest: input.digest, expectedVersion: input.expectedVersion, reason }));
-    const idem = this.idemId(actor.employeeId, 'acceptance_mapping_import', input.idempotencyKey);
-    // The replay lookup runs before the row guards: a successful import must replay even though the row now
-    // carries the imported criteria and every guard would refuse a re-run.
-    const replayed = await this.replay(idem, idemDigest);
-    if (replayed) return replayed;
-    const before = await this.db.select<TaskRow>(id('task', input.taskId));
-    if (!before) throw new CompanyError('not_found', 'Task not found');
-    if (!bundleAppliesTo(bundle, {
-      leg: acceptanceLegForSubject({ kind: before.kind, workIntent: before.work_intent }),
-      executorRole: before.executor_role, goalId: before.goal ? asId(before.goal) : undefined })) {
-      throw new CompanyError('invalid', 'refused: this mapping bundle does not apply to the target task (audience mismatch); re-run the preview for the matching bundle');
-    }
-    if (before.state === 'done' || before.state === 'void') {
-      throw new CompanyError('invalid', 'refused: done/void tasks are historical; a mapping import never rewrites a finished acceptance');
-    }
-    if (before.current_employee) {
-      throw new CompanyError('conflict', 'refused: the task holds an active lease; wait for it to end and re-run the preview');
-    }
-    let current: AcceptanceCriterion[] = [];
-    try { current = validateAcceptanceCriteria(before.acceptance_criteria); } catch { current = []; }
-    if (current.length > 0 && !before.acceptance_legacy) {
-      throw new CompanyError('invalid', 'refused: the task already carries gated versioned criteria; a mapping import never replaces them');
-    }
-    for (const criterion of current) {
-      if (criterion.required && !bundle.criteria.some(candidate => candidate.id === criterion.id &&
-        candidate.kind === criterion.kind && candidate.evidence === criterion.evidence && candidate.verify === criterion.verify)) {
-        throw new CompanyError('invalid', `refused downgrade: required criterion ${criterion.id} is not preserved by the bundle`);
-      }
-    }
-    const evidence = `${reason}\n[map] ${input.mappingKey} v${bundle.version} digest=${input.digest} criteria=${bundle.criteria.length}`;
-    try {
-      const row = await this.txTask(`BEGIN;
-        LET $t = SELECT * FROM ONLY $task;
-        IF $t = NONE { THROW 'task not found' };
-        IF $t.version != $expected { THROW 'task version moved' };
-        IF $t.state = 'done' OR $t.state = 'void' { THROW 'refused: done/void tasks are historical' };
-        IF $t.current_employee != NONE { THROW 'refused: active lease' };
-        IF array::len($t.acceptance_criteria ?? []) > 0 AND $t.acceptance_legacy != true { THROW 'refused: versioned criteria already present' };
-        LET $next = UPDATE ONLY $task SET
-          acceptance_criteria = $criteria, acceptance_version = $criteria_version, acceptance_legacy = false,
-          acceptance_mapping_at = time::now(), acceptance_mapping_digest = $bundle_digest,
-          version = $t.version + 1 RETURN AFTER;
-        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'acceptance_mapping_imported', evidence: $evidence, version: $next.version, at: time::now() };
-        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        CREATE ONLY $outbox CONTENT { task: $task, kind: 'acceptance_mapped', sequence: $sequence.value,
-          payload: { mapping: $mapping_key, digest: $bundle_digest, version: $next.version }, at: time::now() };
-        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $idem_digest, result: $next };
-        RETURN $next;
-        COMMIT;`, {
-        actor: id('employee', actor.employeeId), task: id('task', input.taskId), expected: input.expectedVersion,
-        criteria: bundle.criteria, criteria_version: ACCEPTANCE_CRITERIA_VERSION, mapping_key: input.mappingKey,
-        bundle_digest: input.digest, evidence, idem, idem_digest: idemDigest,
-        audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
-      });
-      return view(row);
-    } catch (error) {
-      const replayed = await this.replay(idem, idemDigest);
-      if (replayed) return replayed;
-      throw error;
-    }
-  }
-
-  /**
-   * SYS-INT: start one controlled non-production two-face switch & rollback drill. The caller names
-   * only business facts (task, runId, base/candidate SHA); every path and port is constructed by the
-   * validator, the drill runs in a detached host child, and the employee never needs launchctl or
-   * paseo. Only the task holder (engineering) or owner may start a drill; every call is audited.
-   */
   async deployDrillRun(credential: Credential, input: { taskId: string; runId: string; baseSha: string; candidateSha: string; idempotencyKey: string }): Promise<{ runId: string; pid: number; root: string }> {
     const actor = await this.authenticate(credential);
     if (actor.role !== 'engineering' && actor.role !== 'owner') throw new CompanyError('forbidden', 'Only engineering or owner may run a deploy drill');
@@ -2899,6 +1860,21 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return evidence;
   }
 
+  /** The GitHub slug of the task's code repository: explicit code_repo_path remote first, then the project's repo. */
+  private async acceptanceRepoSlug(row: TaskRow): Promise<string | undefined> {
+    const paths = [row.code_repo_path];
+    if (!paths[0] && row.project) {
+      const project = await this.db.select<{ repo_path?: string }>(row.project as RecordId);
+      paths.push(project?.repo_path);
+    }
+    for (const path of paths) {
+      if (!path) continue;
+      const slug = githubRepoSlug(path) ?? githubRepoSlug(await git(path, ['config', '--get', 'remote.origin.url']).catch(() => ''));
+      if (slug) return slug;
+    }
+    return undefined;
+  }
+
   // ---- 受控编制管理工具（manage = owner/product） ----
   // 员工侧唯一写编制/词表的入口；owner console 与 admin CLI 继续可用。每次写落一条 audit。
 
@@ -2954,31 +1930,12 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   async opsScope(credential: Credential, taskId: TaskId, proof?: { grantId: string; grantFence: number }): Promise<OpsScope> {
     const actor = await this.authorized(credential);
     requireText(taskId, 'task', 1, 200);
-    const [rows] = await this.db.query<[Array<{ current_employee?: string; state: TaskState; lease_expires_at?: number; project?: RecordId; goal_project?: RecordId }>]>(
-      'SELECT current_employee, state, lease_expires_at, project AS project, goal.project AS goal_project FROM $task;', { task: id('task', taskId) });
+    const [rows] = await this.db.query<[Array<{ current_employee?: string; state: TaskState; lease_expires_at?: number; project?: RecordId }>]>(
+      'SELECT current_employee, state, lease_expires_at, project FROM $task;', { task: id('task', taskId) });
     const task = rows[0];
     if (!task) throw new CompanyError('not_found', 'Task not found');
-    // Task-level override wins, same resolution as claim/readWorkspace.
-    const project = task.project ?? task.goal_project;
-    if (!project) throw new CompanyError('invalid', 'Task goal has no project environment');
-    if (proof) {
-      // 恢复取证分支：grant 证明只由通道注入，员工参数里没有这个形状。它不写 current_employee / state，
-      // 也不改变源任务；其他身份、撤销、项目与 role 检查仍在 broker 侧原样生效。
-      const grant = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', this.recoveryKey(proof.grantId)));
-      if (!grant || asId(grant.employee) !== actor.employeeId || asId(grant.source_task) !== taskId || grant.fence !== proof.grantFence) {
-        throw new CompanyError('forbidden', 'Recovery read grant does not authorize this employee for this source task');
-      }
-      // 状态/过期/源任务变化不在这一层拒绝：必要的本地 logout 在 stopped/expired/revoked 后仍然必须可用。
-      // 登录与四次 GET 由 broker 的链级 reserve 逐次校验（停链后一律拒绝）。
-      // 与执行租约互斥：同一员工不能一边持有执行租约一边用恢复通道读产品。
-      const [live] = await this.db.query<[Array<{ id: RecordId }>]>(
-        `SELECT id FROM task WHERE current_employee = $employee AND state IN ['doing', 'review']
-           AND lease_expires_at != NONE AND lease_expires_at > time::unix(time::now()) LIMIT 1;`,
-        { employee: actor.employeeId });
-      if (live.length > 0) throw new CompanyError('forbidden', 'Employee holds an execution lease; recovery read is refused');
-      return { actor, taskId, project: String(project.id), kind: 'recovery_read',
-        recovery: { grantId: this.recoveryKey(proof.grantId), grantFence: grant.fence, alias: grant.alias, paths: [...grant.paths] } };
-    }
+    const project = task.project;
+    if (!project) throw new CompanyError('invalid', 'Task has no project environment');
     if (task.current_employee !== actor.employeeId || !['doing', 'review'].includes(task.state) ||
       (task.lease_expires_at ?? 0) <= Date.now() / 1000) {
       throw new CompanyError('forbidden', 'Ops tools are only available to the current lease holder of the task');
@@ -2994,33 +1951,15 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   async opsCount(project: string, action: string, windowSeconds: number): Promise<number> {
     const [rows] = await this.db.query<[Array<{ n: number }>]>(
-      'SELECT count() AS n FROM audit WHERE action = $action AND at > time::now() - <duration>$window AND (task.project ?? task.goal.project) = $project GROUP ALL;',
+      'SELECT count() AS n FROM audit WHERE action = $action AND at > time::now() - <duration>$window AND task.project = $project GROUP ALL;',
       { action, project: id('project', project), window: `${Math.max(1, Math.floor(windowSeconds))}s` });
     return rows[0]?.n ?? 0;
   }
 
   async relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView> {
     const source = await this.relayActor(credential, input.ownerQuote);
-    // SYS05: an owner handoff wait parks the task outside the owner-gate fields (blocked_to = NONE), so the
-    // ordinary owner.decide path cannot reach it. The boss's reply through this same relay is the typed event
-    // that releases it, carrying the owner's own words; a model saying "the boss agreed" has no quote to pass.
-    if (input.taskId && input.decision === 'reply') {
-      const waiting = await this.waits.openOfTask(input.taskId).catch(() => undefined);
-      if (waiting?.kind === 'owner_handoff') {
-        await this.resolveOwnerWait(input.taskId, input.ownerQuote, input.idempotencyKey);
-        const row = await this.db.select<TaskRow>(id('task', input.taskId));
-        if (!row) throw new CompanyError('not_found', 'Task not found');
-        return echoTask(view(row));
-      }
-    }
     const decided = await this.owner.decide({ ...input, source, key: `${source}:${input.idempotencyKey}`,
       note: `${input.note}\n老板原话：${input.ownerQuote}` });
-    // SYS05: if a task is both an owner gate and an owner handoff, the same decision resolves the wait too.
-    if (input.taskId) {
-      await this.resolveOwnerWait(input.taskId, input.ownerQuote, input.idempotencyKey)
-        .catch(error => { /* the decision itself must not be lost to a wait ledger error; the next tick can retry */
-          void error; });
-    }
     return echoTask(decided);
   }
 
@@ -3046,7 +1985,6 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       throw new CompanyError('invalid', 'Invalid lease proof');
     }
     if (evidence) requireText(evidence.text, 'evidence', 20, 30000);
-    if (evidence?.recoveryReason !== undefined && !recoveryReasonSchema.safeParse(evidence.recoveryReason).success) throw new CompanyError('invalid', 'Invalid recoveryReason');
     const idem = evidence ? this.idemId(actor.employeeId, action, evidence.idempotencyKey) : undefined;
     const digest = evidence ? HASH(JSON.stringify({ proof, evidence, to })) : undefined;
     if (idem && digest) {
@@ -3066,13 +2004,17 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       companyUpgrade = await readCompanyRelease(repo,evidence.companyUpgrade.sha);
     }
     let prHead: string | undefined;
-    // SYS06 AC03: 下一次相关动作前核版本。租约登记的契约 hash 与当前有效契约不一致时，这笔写被拒——
-    // 旧 claim 与旧提示都不能授权继续写（心跳不算写动作，只续租约）。
-    let policyHashNow: string | undefined;
-    if (action !== 'heartbeat') {
-      const policyRow = await this.taskRowWithProject(proof.taskId);
-      if (!policyRow) throw new CompanyError('not_found', 'Task not found');
-      policyHashNow = (await this.effectiveContractFor(this.chainOfRow(policyRow))).contract.hash;
+    if (action === 'submit' && evidence?.sha && !evidence.acceptance?.sha) {
+      evidence = { ...evidence, acceptance: { ...(evidence.acceptance ?? {}), sha: evidence.sha } };
+    }
+    if (action === 'submit' && evidence?.next !== undefined) {
+      if (!Array.isArray(evidence.next) || evidence.next.length === 0 || evidence.next.length > 20) {
+        throw new CompanyError('invalid', 'next must be a non-empty list of at most 20 proposals');
+      }
+      for (const proposal of evidence.next) {
+        const route = await getRoute(this.db, proposal.type);
+        if (!route?.enabled) throw new CompanyError('invalid', `proposal type ${proposal.type} is missing or disabled`);
+      }
     }
     if (action === 'submit' && evidence && this.submitCheck) {
       const row = await this.db.select<TaskRow>(id('task', proof.taskId));
@@ -3118,6 +2060,52 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         throw new CompanyError('invalid',
           `the submitted acceptance environment ${submittedEnvironment ?? 'is missing'} is not the declared environment ${declaredEnvironment ?? 'none'}`);
       }
+      // 软件线：按 sha 自动验收证据 — a submitted sha names one or more GitHub Actions runs in the task's code
+      // repository. A successful completed run verifies every required machine criterion and records the evidence
+      // before the evaluator reads it; no successful run rejects the submit with the reason (retry after CI lands).
+      if (action === 'submit' && head !== undefined && criteria.some(c => c.kind === 'machine' && c.required !== false)) {
+        const needed = criteria.filter(c => c.kind === 'machine' && c.required !== false &&
+          !evidenceRows.some(e => e.acId === c.id && e.sha === head && e.attempt === attempt));
+        if (needed.length) {
+          const slug = await this.acceptanceRepoSlug(row).catch(() => undefined);
+          if (!slug) {
+            throw new CompanyError('invalid', `submit sha ${head}: the task's code repository has no GitHub remote; record the acceptance evidence with record_acceptance_evidence or fix the remote`);
+          }
+          let urls: string[] = [];
+          try { urls = await this.acceptanceRuns(slug, head); } catch (error) {
+            throw new CompanyError('invalid', `submit sha ${head}: GitHub run lookup failed (${(error as Error).message}); retry after the CI run completes`);
+          }
+          if (!urls.length) {
+            throw new CompanyError('invalid', `submit sha ${head}: no successful completed GitHub Actions run found for this sha in ${slug}; retry after CI completes successfully`);
+          }
+          let covered = 0; const reasons: string[] = [];
+          for (const criterion of needed) {
+            let recorded = false;
+            for (const runUrl of urls) {
+              const verified = await this.acceptanceAdapter.verify({
+                provider: 'github-actions', runUrl, sha: head, environment: declaredEnvironment,
+                verify: criterion.verify, risk: criterion.risk });
+              if (!verified.ok) { reasons.push(`${criterion.id}@${runUrl}: ${verified.reason}`); continue; }
+              if (verified.environment !== declaredEnvironment) { reasons.push(`${criterion.id}@${runUrl}: environment ${verified.environment ?? 'unknown'} is not the declared environment ${declaredEnvironment ?? 'none'}`); continue; }
+              const gate2 = await loadAcceptanceGate(this.db);
+              const rec = await recordAcceptanceEvidenceRow(this.db, {
+                taskId: proof.taskId, acId: criterion.id, kind: 'machine', sha: head, environment: verified.environment,
+                evidenceType: criterion.evidence, source: verified.source, verifier: 'github-actions', actor: actor.employeeId,
+                at: verified.at, criteriaVersion: gate2.criteriaVersion, taskVersion: row.version, attempt });
+              await this.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: 'acceptance_evidence', evidence: $evidence, at: time::now() };`,
+                { task: id('task', proof.taskId), actor: id('employee', actor.employeeId),
+                  evidence: JSON.stringify({ acId: criterion.id, sha: head, evidenceType: criterion.evidence, environment: verified.environment, attempt, digest: rec.digest, auto: true }) });
+              recorded = true; covered++; break;
+            }
+            if (!recorded) {
+              throw new CompanyError('invalid',
+                `submit sha ${head}: no successful run verifies machine criterion ${criterion.id} (${reasons[0] ?? 'no successful completed GitHub Actions run'}); retry after the CI run completes`);
+            }
+          }
+          void covered;
+          evidenceRows.splice(0, evidenceRows.length, ...(await loadAcceptanceEvidence(this.db, proof.taskId)));
+        }
+      }
       const verdict = evaluateAcceptance({
         subject, evidence: evidenceRows,
         phase: action === 'submit' ? 'submit' : 'accept',
@@ -3147,22 +2135,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.lease_expires_at <= $now { THROW 'lease expired' };
       IF $t.current_employee != $employee OR $t.delivery_id != $delivery OR $t.fence != $fence OR $t.version != $expected { THROW 'stale lease or version' };
-      IF $t != NONE AND $t.version != $seen { THROW 'contribution history moved: retry' };
-      ${INDEPENDENCE_GUARD_SQL}
-      IF !$heartbeat AND $t.lease_policy_hash != NONE AND $t.lease_policy_hash != $policy_hash {
-        THROW 'policy changed: the effective contract moved since this lease was claimed; re-claim to continue'
-      };
-      IF $t.state = 'review' {
-        LET $repairs = SELECT VALUE count() FROM audit WHERE task = $task AND action = 'goal_acceptance_repair' AND actor = $actor GROUP ALL;
-        IF ($repairs[0] ?? 0) > 0 { THROW 'goal acceptance repairer cannot review' };
-      };
-      LET $owner = IF $t.implementer != NONE THEN $t.implementer ELSE $bound END;
+      LET $excluded = SELECT VALUE <string>record::id(actor) FROM audit WHERE task = $task AND action IN ['submit', 'owner_submit'];
       IF $submit OR (($heartbeat OR $checkpoint) AND $t.state != 'review') {
         IF 'execute' NOT IN $who.capabilities OR $t.state != 'doing' OR $t.executor_role != $who.role { THROW 'execute denied' };
-        IF $t.executor_role = 'engineering' {
-          IF $owner = '' AND $ambiguous { THROW 'execute denied: implementer unresolved, manager takeover required' };
-          IF $owner != $employee { THROW 'execute denied: not the bound implementer' };
-        };
       };
       IF ($heartbeat OR $checkpoint) AND $t.state = 'review' {
         IF $t.submitted_by = $employee OR ($excluded CONTAINS $employee) { THROW 'self review denied' };
@@ -3178,10 +2153,6 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
           IF 'review' NOT IN $who.capabilities OR $t.reviewer_role != $who.role { THROW 'block denied' };
         } ELSE {
           IF 'execute' NOT IN $who.capabilities OR $t.state != 'doing' OR $t.executor_role != $who.role { THROW 'block denied' };
-          IF $t.executor_role = 'engineering' {
-            IF $owner = '' AND $ambiguous { THROW 'block denied: implementer unresolved, manager takeover required' };
-            IF $owner != $employee { THROW 'block denied: not the bound implementer' };
-          };
         };
       };
       IF $checkpoint AND $checkpoint_limit > 0 {
@@ -3217,7 +2188,16 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
             actor: $employee, at: time::now(), criteria_version: $e.criteriaVersion, task_version: $next.version, digest: $e.digest
           };
         };
-        ${UNLOCK_SQL}
+        ${ACTIVATE_PLANNED_SQL}
+      };
+      IF $returning {
+        LET $sid = SELECT VALUE <string>record::id(id) FROM audit WHERE task = $task AND action = 'submit' ORDER BY at DESC LIMIT 1;
+        LET $proposal_rows = SELECT * FROM task WHERE parent = $task AND proposed_in IN ($sid ?? []) AND state = 'planned';
+        UPDATE task SET state = 'void', version += 1 WHERE parent = $task AND proposed_in IN ($sid ?? []) AND state = 'planned';
+        FOR $c IN $proposal_rows {
+          CREATE audit CONTENT { task: $c.id, actor: $actor, action: 'proposal_voided',
+            evidence: '提交被退回，提议任务作废', version: $c.version + 1, at: time::now() };
+        };
       };
       IF !$heartbeat {
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: $action, evidence: $evidence, version: $next.version, at: time::now(), recovery_reason: $recovery_reason, phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END };
@@ -3227,24 +2207,25 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       ${idem ? 'CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };' : ''}
       RETURN $next;
       COMMIT;`;
-    // Gated stages (SYS-DISP IR03): submit is an execute write; accept and return are review decisions. Other actions take no gate.
-    const gatedStage: IndependenceStage | undefined = action === 'submit' ? 'execute' : action === 'accept' || action === 'return' ? 'review' : undefined;
+    const auditId = id('audit', randomUUID());
     try {
-      const row = await this.withContributionRetry(proof.taskId, actor.employeeId, () => gatedStage, (contrib, gate) => this.txTask(query, {
+      const row = await this.txTask(query, {
         actor: id('employee', actor.employeeId), employee: actor.employeeId,
         task: id('task', proof.taskId), delivery: proof.deliveryId,
         fence: proof.fence, expected: proof.expectedVersion, lease_seconds: this.leaseSeconds,
-        ...flags, action, has_company_upgrade: companyUpgrade !== undefined, company_upgrade: companyUpgrade, recovery_reason: action === 'block' ? evidence?.recoveryReason : undefined, evidence: evidence?.text ?? '', to: to ?? '', checkpoint_limit: this.checkpointLimit,
+        ...flags, action, has_company_upgrade: companyUpgrade !== undefined, company_upgrade: companyUpgrade, recovery_reason: undefined, evidence: evidence?.text ?? '', to: to ?? '', checkpoint_limit: this.checkpointLimit,
         acceptance_head: acceptance?.head ?? null, acceptance_environment: acceptance?.environment ?? null,
         has_head: acceptance?.head !== undefined, has_environment: acceptance?.environment !== undefined,
         human_evidence: acceptance?.human ?? [],
-        excluded: contrib.facts.excluded, bound: contrib.facts.implementer ?? '', ambiguous: contrib.facts.ambiguous, seen: contrib.version ?? -1,
-        audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()), idem, digest,
-        indep_guards: gate?.guards ?? [],
-        policy_hash: policyHashNow ?? null,
-      }));
-      if (action === 'accept' && row.goal) await this.goalFinalizeSafe(asId(row.goal), `system:accept:${actor.employeeId}`, asId(row.id));
-      return view(row);
+        audit: auditId, outbox: id('outbox', randomUUID()), idem, digest,
+      });
+      const done = view(row);
+      if (action === 'submit' && evidence?.next?.length) {
+        for (const proposal of evidence.next) {
+          await this.createProposal(done, proposal, String(auditId.id));
+        }
+      }
+      return done;
     } catch (error) {
       if (idem && digest) {
         const prior = await this.replay(idem, digest);
@@ -3267,18 +2248,10 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (task.state === 'done' && this.worktrees) {
       await this.worktrees.reclaimAfterTerminal(task, 'accept').catch(() => undefined);
     }
-    if (task.reviewerRole === 'qa') {
-      await this.reviewEvents.invalidateSource(task.id, 'the review was accepted before the event was delivered').catch(() => undefined);
-    }
     return task;
   }
   async returnTask(credential: Credential, proof: LeaseProof, evidence: Evidence) {
     const task = await this.transition(credential, proof, 'return', evidence);
-    // SYS-INT: an event produced by the lease that just ended must not wake anyone later. Only this source task's
-    // undelivered events are touched; the collaboration task is never changed by a return.
-    if (task.reviewerRole === 'qa') {
-      await this.reviewEvents.invalidateSource(task.id, 'the review was returned before the event was delivered').catch(() => undefined);
-    }
     // Same event point as accept: a return that leaves the scene with zero effective refs
     // reclaims it in place; a recovery ref keeps the scene for the next holder.
     if (task.worktree && this.worktrees) {
@@ -3294,11 +2267,6 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    */
   async release(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView> {
     const task = await this.releaseRecord(credential, proof, evidence);
-    // SYS-INT: a dropped review lease ends the event window just like a return. Undelivered wakes of that fence are
-    // invalidated now; a later claim raises the fence and produces a fresh event of its own.
-    if (task.state === 'review' && task.reviewerRole === 'qa') {
-      await this.reviewEvents.invalidateSource(task.id, 'the review lease was released before the event was delivered').catch(() => undefined);
-    }
     return echoTask(task);
   }
 
@@ -3324,7 +2292,6 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       LET $next = UPDATE ONLY $task SET
         state = IF $t.state = 'doing' THEN 'ready' ELSE $t.state END,
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
-        standby_until = NONE,
         version = $t.version + 1 RETURN AFTER;
       UPDATE employee SET active_task = NONE WHERE id = $actor AND active_task = $task;
       CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'released', evidence: $evidence, version: $next.version, at: time::now(), phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END };
@@ -3333,6 +2300,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`;
+    const auditId = id('audit', randomUUID());
     try {
       const row = await this.txTask(query, {
         actor: id('employee', actor.employeeId), employee: actor.employeeId,
@@ -3404,374 +2372,6 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * leaves the dispatch queue with no employee or provider seat attached. Nothing about the condition is released
    * here, and the time condition replaces neither a dependency nor an owner approval.
    */
-  async wait(credential: Credential, proof: LeaseProof, evidence: Evidence, input: WaitEntryInput): Promise<TaskView> {
-    const actor = await this.authorized(credential);
-    if (!Number.isSafeInteger(proof.expectedVersion) || !Number.isSafeInteger(proof.fence) || proof.fence < 1) {
-      throw new CompanyError('invalid', 'Invalid lease proof');
-    }
-    requireText(evidence.text, 'evidence', 20, 30000);
-    // SYS05 AC04: invitation material and credentials stay in the controlled handoff file, never in task evidence.
-    assertNonSensitive(evidence.text, 'evidence');
-    const row = await this.db.select<TaskRow>(id('task', proof.taskId));
-    if (!row) throw new CompanyError('not_found', 'Task not found');
-    if (row.state === 'void') throw new CompanyError('conflict', 'Task retired');
-    if (!['doing', 'review'].includes(row.state)) throw new CompanyError('forbidden', 'Task not held');
-    const idem = this.idemId(actor.employeeId, 'wait', evidence.idempotencyKey);
-    const digest = HASH(JSON.stringify({ proof, evidence, input }));
-    const replay = await this.replay(idem, digest);
-    if (replay) return replay;
-    await this.assertCiBlockAllowed(proof, actor.employeeId, [input.reason, input.pendingAction ?? '', evidence.text],
-      [input.reference ?? '', input.summary ?? '', ...(input.completed ?? [])], row);
-    const now = this.waitClock();
-    const defaultOwner = input.kind === 'owner_handoff' ? 'owner'
-      : (input.kind === 'dependency' || input.kind === 'upstream_repair') ? row.executor_role : 'owner';
-    const normalized = normalizeWait({ ...input, ownerRole: input.ownerRole ?? defaultOwner } as WaitInput, {
-      now, ownerRole: defaultOwner,
-    });
-    // SYS-INT: a feedback wait may name a review watch, but only an active watch of *this* task. A collaboration
-    // task cannot park on another team's subscription, and a closed watch cannot keep it out of the queue.
-    await this.assertReviewWaitReference(proof.taskId, normalized.kind, normalized.reference);
-    let releaseGraph: (() => Promise<void>) | undefined;
-    try {
-      if (normalized.referenceTaskId) {
-        const reference = await this.db.select<TaskRow>(id('task', normalized.referenceTaskId));
-        if (!reference) throw new CompanyError('not_found', 'referenceTaskId 指向的任务不存在');
-        if (normalized.referenceTaskId === proof.taskId) throw new CompanyError('invalid', '任务不能等待自己');
-        // The cycle check and the wait insert must be one critical section. A pre-check alone is a TOCTOU race:
-        // two holders entering A->B and B->A at the same time each miss the other's uncommitted edge.
-        releaseGraph = await this.waits.lockGraph(`employee:${actor.employeeId}:${randomUUID()}`);
-        if (await this.waitWouldCycle(proof.taskId, normalized.referenceTaskId)) {
-          throw new CompanyError('conflict', '等待引用会形成依赖环，已拒绝');
-        }
-        if (['done', 'void'].includes(reference.state)) {
-          throw new CompanyError('conflict', 'referenceTaskId 指向的任务已经终态；不需要进入等待');
-        }
-      }
-      // The progress snapshot is the last resumable thing the holder did, not a claim about the outside world.
-      let summary = normalized.summary;
-      if (!summary) {
-        const [latest] = await this.db.query<[Array<{ evidence?: string }>]>(
-          `SELECT evidence FROM audit WHERE task = $task AND action IN ['checkpoint', 'submit', 'wait']
-           ORDER BY at DESC LIMIT 1;`, { task: id('task', proof.taskId) }).catch(() => [[]] as [Array<{ evidence?: string }>]);
-        const text = latest?.[0]?.evidence ?? '';
-        summary = text ? assertNonSensitive(text.slice(0, 800), 'progress summary') : undefined;
-      }
-      const waitKey = waitKeyOf(proof.taskId, randomUUID());
-      const createdAt = this.waitClock();
-      try {
-        const updated = await this.waits.enter({
-          taskId: proof.taskId, waitKey, normalized: {
-            kind: normalized.kind, source: normalized.source, ownerRole: normalized.ownerRole,
-            ...(normalized.reference === undefined ? {} : { reference: normalized.reference }),
-            ...(normalized.referenceTaskId === undefined ? {} : { referenceTaskId: normalized.referenceTaskId }),
-            ...(normalized.notBefore === undefined ? {} : { notBefore: normalized.notBefore }),
-            ...(normalized.expiresAt === undefined ? {} : { expiresAt: normalized.expiresAt }),
-            expiresSource: normalized.expiresSource,
-            ...(normalized.nextCheckAt === undefined ? {} : { nextCheckAt: normalized.nextCheckAt }),
-            ...(normalized.timezone === undefined ? {} : { timezone: normalized.timezone }),
-            completed: normalized.completed,
-            ...(normalized.pendingAction === undefined ? {} : { pendingAction: normalized.pendingAction }),
-            ...(normalized.handoffFile === undefined ? {} : { handoffFile: normalized.handoffFile }),
-            reason: normalized.reason,
-          },
-          progress: {
-            employee: actor.employeeId, taskVersion: proof.expectedVersion, at: createdAt,
-            ...(summary === undefined ? {} : { summary }),
-          },
-          resumeState: row.state === 'review' ? 'review' : 'ready',
-          resumeRole: row.state === 'review' ? row.reviewer_role : row.executor_role,
-          actor: actor.employeeId, employee: actor.employeeId,
-          proof: { deliveryId: proof.deliveryId, fence: proof.fence, expectedVersion: proof.expectedVersion },
-          now, evidence: evidence.text, idem: String(idem.id), digest,
-          auditId: randomUUID(), outboxId: randomUUID(),
-        });
-        if (!updated) throw new CompanyError('temporarily_unavailable', '等待未落地，请重试', true);
-        // SYS-INT: entering a review-watch feedback wait drains what the source state already warrants. An event that
-        // arrived before this wait existed was kept pending; it is delivered now instead of being lost. The task may
-        // already be released again by that delivery, so the answer is the row as it stands now.
-        const watchId = watchOfRef(normalized.reference);
-        if (watchId !== undefined) {
-          await this.syncReviewWatch(watchId);
-          await this.reviewEvents.deliverPendingFor(proof.taskId).catch(() => undefined);
-          const after = await this.db.select<TaskRow>(id('task', proof.taskId));
-          if (after) return view(after);
-        }
-        return view(updated);
-      } catch (error) {
-        const prior = await this.replay(idem, digest);
-        if (prior) return prior;
-        throw this.waitError(error);
-      }
-    } finally {
-      await releaseGraph?.();
-    }
-  }
-
-  /**
-   * Resolve a wait from a trusted event. The public entry accepts an authorized manager or a signed webhook; the
-   * owner path is not reachable here (only the owner relay calls `resolveOwnerWait`), so an employee saying it heard
-   * back from the customer cannot release a real-person acknowledgement.
-   */
-  async resolveWait(credential: Credential, input: WaitResolveInput): Promise<WaitResolveView> {
-    const actor = await this.authorized(credential);
-    if (!input || typeof input.source !== 'string') throw new CompanyError('invalid', 'source is required');
-    if (input.source === 'owner') {
-      throw new CompanyError('forbidden', '老板决定只能由 owner relay 记录（record_owner_decision），员工不能自称收到老板回执');
-    }
-    requireText(input.text, 'evidence', 20, 30000);
-    assertNonSensitive(input.text, 'evidence');
-    const wait = await this.waitOfInput(input);
-    if (!wait) throw new CompanyError('not_found', '没有找到这个等待（waitKey 或 taskId）');
-    const now = this.waitClock();
-    const verified = input.source === 'webhook' ? this.verifyWebhook(input, now) : false;
-    if (input.source === 'authorized_person' || input.source === 'dependency') {
-      if (actor.role !== 'owner') throw new CompanyError('forbidden', '只有老板可以以授权人身份确认等待事件');
-    }
-    if (input.source === 'webhook' && !verified) {
-      if (!this.waitWebhookSecret) throw new CompanyError('not_configured', 'webhook 签名密钥未配置；未验证的事件不能解除等待');
-      throw new CompanyError('forbidden', 'webhook 签名无效；事件未被接受');
-    }
-    const event = validateEvent(waitRecordOf(wait), input as never, now, { verified });
-    const outcome = await this.waits.resolve({
-      wait, event: event as WaitEvent, expectedVersion: wait.version, actor: `employee:${actor.employeeId}`,
-      ownerApproved: false, now,
-    });
-    return {
-      released: outcome.released, code: outcome.code, message: outcome.message,
-      taskId: outcome.taskId, waitKey: wait.waitKey,
-      ...(event.eventId ? { eventKey: waitEventKey(wait.waitKey, event) ?? '' } : {}),
-    };
-  }
-
-  /**
-   * The owner relay's resolution. It is deliberately not exposed as a tool: only `record_owner_decision` (which
-   * carries the owner's own words and is audited as a relay) reaches it. It releases every open owner handoff of
-   * that task, and nothing else.
-   */
-  private async resolveOwnerWait(taskId: TaskId, ownerQuote: string, idempotencyKey: string): Promise<void> {
-    const row = await this.db.select<TaskRow>(id('task', taskId));
-    if (!row) return;
-    const waits = await this.waits.waitsOfTask(taskId);
-    for (const wait of waits) {
-      if (wait.kind !== 'owner_handoff' || wait.state !== 'waiting') continue;
-      const now = this.waitClock();
-      const event: WaitEvent = {
-        source: 'owner', at: now, verified: true, objectWaitId: wait.waitKey, objectTaskId: taskId,
-        eventId: `owner:${idempotencyKey}:${wait.waitKey}`,
-        ownerQuote: assertNonSensitive(ownerQuote.slice(0, 2000), 'ownerQuote'),
-      };
-      await this.waits.resolve({
-        wait, event, expectedVersion: wait.version, actor: 'owner-relay', ownerApproved: true, now,
-      });
-    }
-  }
-
-  /** Manager cancel: version-locked. Without `resume` the task stays blocked for a human, never silently schedulable. */
-  async cancelWait(credential: Credential, input: WaitActionInput): Promise<WaitActionView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', '只有老板可以取消等待');
-    if (!Number.isSafeInteger(input.expectedVersion)) throw new CompanyError('invalid', 'expectedVersion 必须是整数');
-    const reason = String(input.reason ?? '').trim();
-    if (reason.length < 10 || reason.length > 2000) throw new CompanyError('invalid', '取消理由需为 10-2000 字');
-    assertNonSensitive(reason, 'reason');
-    const result = await this.waits.cancel({
-      waitKey: String(input.waitKey ?? ''), expectedVersion: input.expectedVersion, reason,
-      actor: `employee:${actor.employeeId}`, resume: input.resume === true, now: this.waitClock(),
-    });
-    return { ok: result.cancelled, message: result.message, waitKey: String(input.waitKey ?? ''),
-      ...(result.taskId === undefined ? {} : { taskId: result.taskId }) };
-  }
-
-  /** Manager extend/re-arm: version-locked and reasoned. A stale version cannot overwrite another manager's change. */
-  async extendWait(credential: Credential, input: WaitActionInput): Promise<WaitActionView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', '只有老板可以延期等待');
-    if (!Number.isSafeInteger(input.expectedVersion)) throw new CompanyError('invalid', 'expectedVersion 必须是整数');
-    const reason = String(input.reason ?? '').trim();
-    if (reason.length < 10 || reason.length > 2000) throw new CompanyError('invalid', '延期理由需为 10-2000 字');
-    assertNonSensitive(reason, 'reason');
-    const now = this.waitClock();
-    const notBefore = input.notBefore === undefined ? undefined : parseInstant(input.notBefore, 'notBefore');
-    const expiresAt = input.expiresAt === undefined ? undefined : parseInstant(input.expiresAt, 'expiresAt');
-    const nextCheckAt = input.nextCheckAt === undefined ? undefined : parseInstant(input.nextCheckAt, 'nextCheckAt');
-    if (notBefore !== undefined && notBefore < now) throw new CompanyError('invalid', '新的 notBefore 不能早于现在；取消请用 cancel_wait');
-    if (expiresAt !== undefined && expiresAt <= now) throw new CompanyError('invalid', '新的 expiresAt 必须晚于现在');
-    if (nextCheckAt !== undefined && nextCheckAt <= now) throw new CompanyError('invalid', '新的 nextCheckAt 必须晚于现在');
-    const result = await this.waits.extend({
-      waitKey: String(input.waitKey ?? ''), expectedVersion: input.expectedVersion, reason,
-      actor: `employee:${actor.employeeId}`, now,
-      ...(notBefore === undefined ? {} : { notBefore }),
-      ...(expiresAt === undefined ? {} : { expiresAt }),
-      ...(nextCheckAt === undefined ? {} : { nextCheckAt }),
-    });
-    return { ok: result.extended, message: result.message, waitKey: String(input.waitKey ?? ''),
-      ...(result.version === undefined ? {} : { version: result.version }) };
-  }
-
-  /** Read waits. Every authenticated employee may read the internal wait facts; they carry no credentials. */
-  async listWaits(credential: Credential, input: { taskId?: string; state?: string; limit?: number } = {}): Promise<WaitListView> {
-    await this.authorized(credential);
-    const waits = await this.waits.list({
-      ...(input.taskId === undefined ? {} : { taskId: input.taskId }),
-      ...(input.state === undefined ? {} : { state: input.state as never }),
-      ...(input.limit === undefined ? {} : { limit: input.limit }),
-    });
-    return { waits: waits.map(wait => this.waitViewOf(wait)), total: waits.length };
-  }
-
-  /** The owner handoff cards. Owner/owner only; a card never contains the handoff file's content. */
-  async waitHandoffCards(credential: Credential): Promise<WaitHandoffCard[]> {
-    const actor = await this.authorized(credential);
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', '只有老板/运营可以读取老板交接卡');
-    return this.waits.handoffCards(this.waitClock());
-  }
-
-  /** Read-only legacy migration preview. It never releases anything, and an owner gate is never a time wait. */
-  async waitMigrationPreview(credential: Credential): Promise<WaitMigrationPreviewView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', '只有老板/运营可以做旧任务迁移预演');
-    const [rows] = await this.db.query<[Array<{ id: unknown; state: string; blocked_to?: string; quota_resets_at?: number; wait_state?: string }>]>(
-      `SELECT id, state, blocked_to, quota_resets_at, wait_state, created_at FROM task
-       WHERE state IN ['blocked', 'ready', 'doing'] ORDER BY created_at LIMIT 200;`);
-    const candidates = migrationPreview((rows ?? []).map(row => ({
-      id: asId(row.id), state: row.state,
-      ...(row.blocked_to === undefined ? {} : { blocked_to: row.blocked_to }),
-      ...(row.quota_resets_at === undefined || row.quota_resets_at === null ? {} : { quota_resets_at: row.quota_resets_at }),
-      ...(row.wait_state === undefined || row.wait_state === null ? {} : { wait_state: row.wait_state }),
-    })), this.waitClock());
-    return {
-      candidates,
-      ownerGatesBlocked: candidates.filter(candidate => candidate.reason === 'owner_gate').length,
-      generatedAt: new Date(this.waitClock()).toISOString(),
-    };
-  }
-
-  /**
-   * Migrate exactly one legacy time-bounded task, after the dry run. The caller must name the task and the version
-   * it read; an owner gate is refused, a task with no future time bound is refused, and the conversion is audited.
-   * There is no batch entry point: a bulk release could walk past a gate whose real blocker is not time.
-   */
-  async waitMigrationApply(credential: Credential, input: WaitMigrationApplyInput): Promise<TaskView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', '只有老板可以迁移旧任务到等待');
-    if (!Number.isSafeInteger(input.expectedVersion)) throw new CompanyError('invalid', 'expectedVersion 必须是整数');
-    const reason = String(input.reason ?? '').trim();
-    if (reason.length < 10 || reason.length > 2000) throw new CompanyError('invalid', '迁移理由需为 10-2000 字');
-    assertNonSensitive(reason, 'reason');
-    const row = await this.db.select<TaskRow>(id('task', input.taskId));
-    if (!row) throw new CompanyError('not_found', 'Task not found');
-    if (row.version !== input.expectedVersion) throw new CompanyError('conflict', 'Task version moved');
-    if (row.reviewer_role === 'owner' || row.blocked_to === 'owner') {
-      throw new CompanyError('forbidden', '老板关口不能批量迁移为时间等待；必须由老板本人决定');
-    }
-    const waitKey = waitKeyOf(input.taskId, randomUUID());
-    try {
-      const updated = await this.waits.migrateLegacy({
-        taskId: input.taskId, waitKey, expectedVersion: input.expectedVersion, reason,
-        actor: `employee:${actor.employeeId}`, now: this.waitClock(),
-        auditId: randomUUID(), outboxId: randomUUID(),
-      });
-      if (!updated) throw new CompanyError('temporarily_unavailable', '迁移未落地，请重试', true);
-      return view(updated);
-    } catch (error) {
-      throw this.waitError(error);
-    }
-  }
-
-  /** The wait a resolve call names, by its waitKey or its task's open wait. */
-  private async waitOfInput(input: WaitResolveInput): Promise<WaitRow | undefined> {
-    // The event's own object id is a valid locator: a webhook that names the wait it is about has already said
-    // which waiting object it addresses, so requiring a second copy of the same key would only cause omissions.
-    const key = typeof input.waitKey === 'string' ? input.waitKey.trim()
-      : typeof input.objectWaitId === 'string' ? input.objectWaitId.trim() : '';
-    if (key) return this.waits.wait(key);
-    const taskId = typeof input.taskId === 'string' ? input.taskId.trim() : '';
-    if (taskId) return this.waits.openOfTask(taskId);
-    return undefined;
-  }
-
-  /** Verify a webhook signature over the canonical typed payload. An absent secret is a refusal, never a pass. */
-  private verifyWebhook(input: WaitResolveInput, now: number): boolean {
-    if (!input.eventId || !input.provider) return false;
-    const at = input.at === undefined ? now : parseInstant(input.at, 'at');
-    const payload = webhookPayload({
-      eventId: String(input.eventId), provider: String(input.provider), at,
-      ...(input.objectWaitId === undefined ? {} : { objectWaitId: String(input.objectWaitId) }),
-      ...(input.objectTaskId === undefined ? {} : { objectTaskId: String(input.objectTaskId) }),
-    });
-    return verifyWaitWebhook(this.waitWebhookSecret, payload, input.signature);
-  }
-
-  /** True when waiting on `reference` would close a cycle: the reference already (transitively) waits on this task. */
-  private async waitWouldCycle(taskId: string, reference: string): Promise<boolean> {
-    if (taskId === reference) return true;
-    const seen = new Set<string>();
-    const queue = [reference];
-    while (queue.length && seen.size < 50) {
-      const current = queue.shift()!;
-      if (seen.has(current)) continue;
-      seen.add(current);
-      const [rows] = await this.db.query<[Array<{ dependencies?: unknown[] }>]>(
-        'SELECT dependencies FROM $task;', { task: id('task', current) });
-      const edges = new Set<string>();
-      for (const dep of rows?.[0]?.dependencies ?? []) edges.add(asId(dep as never));
-      // A task can wait through its own open wait row as well as through task.dependencies. Both are real edges:
-      // otherwise A->B and B->A both look acyclic and neither can ever be released.
-      const [waits] = await this.db.query<[Array<{ reference_task?: unknown }>]>(
-        `SELECT reference_task FROM task_wait
-         WHERE task = $task AND state IN ['waiting', 'held'] AND reference_task != NONE;`,
-        { task: id('task', current) });
-      for (const wait of waits ?? []) {
-        const ref = wait.reference_task === undefined ? undefined : asId(wait.reference_task as never);
-        if (ref) edges.add(ref);
-      }
-      for (const depId of edges) {
-        if (depId === taskId) return true;
-        if (!seen.has(depId)) queue.push(depId);
-      }
-    }
-    return false;
-  }
-
-  private waitViewOf(wait: WaitRow): TaskWaitView {
-    return {
-      waitKey: wait.waitKey, kind: wait.kind, state: wait.state, ownerRole: wait.ownerRole,
-      source: wait.source.kind,
-      ...(wait.notBefore === undefined ? {} : { notBefore: new Date(wait.notBefore).toISOString() }),
-      ...(wait.expiresAt === undefined ? {} : { expiresAt: new Date(wait.expiresAt).toISOString() }),
-      expiresSource: wait.expiresSource,
-      ...(wait.nextCheckAt === undefined ? {} : { nextCheckAt: new Date(wait.nextCheckAt).toISOString() }),
-      ...(wait.timezone === undefined ? {} : { timezone: wait.timezone }),
-      version: wait.version,
-    };
-  }
-
-  /** The raw wait transaction errors, mapped onto the API's stable codes. */
-  private waitError(error: unknown): CompanyError {
-    if (error instanceof CompanyError) return error;
-    const message = ((error as Error)?.message ?? '').trim();
-    if (/wait graph lock busy/i.test(message)) return new CompanyError('conflict', '另一个等待正在写入，等待图锁未取得；请重试');
-    if (/lease expired/i.test(message)) return new CompanyError('lease_expired', '租约已过期；重新领取后再进入等待');
-    if (/stale lease or version/i.test(message)) return new CompanyError('conflict', '租约或任务版本已移动；旧 fence 的写入被拒绝');
-    if (/already waiting/i.test(message)) return new CompanyError('conflict', '该任务已有进行中的等待');
-    if (/owner gate cannot be migrated/i.test(message)) return new CompanyError('forbidden', '老板关口不能迁移为时间等待；必须由老板本人决定');
-    if (/no future time bound/i.test(message)) return new CompanyError('invalid', '任务没有未来的时间边界（quota_resets_at 为空或已过去），不能迁移为时间等待');
-    if (/not blocked for migration/i.test(message)) return new CompanyError('invalid', '任务不在 blocked 阶段；与迁移预演一致，只有 blocked 任务可以迁移');
-    if (/still leased/i.test(message)) return new CompanyError('conflict', '任务仍被有效租约持有，不能迁移；先释放或等到租约结束');
-    if (/version moved/i.test(message)) return new CompanyError('conflict', '任务版本已移动；重新读取后再迁移');
-    if (/task not held/i.test(message)) return new CompanyError('forbidden', '任务不在执行/复核持有阶段，不能进入等待');
-    if (/not found/i.test(message)) return new CompanyError('not_found', 'Task not found');
-    if (/conflict/i.test(message)) return new CompanyError('conflict', message.slice(0, 300));
-    return new CompanyError('temporarily_unavailable', `等待写入失败：${message.slice(0, 200)}`, true);
-  }
-
-  /**
-   * Classify one failure and charge it against the recovery budget of the fault object.
-   *
-   * The fingerprint groups the same cause; the budget key binds the task, the controlled target and the phase, so
-   * changing the holder, rewording the error or writing the alias differently does not reset it. The attempt is
-   * spent before the caller runs it, so a caller that is refused does not run.
-   */
   private async reportTaskFault(holder: string, taskId: TaskId, input: FaultInput): Promise<FaultReportOutcome> {
     const fault: FaultRecord = classifyFault(input);
     const controlledTarget = input.target ?? 'none';
@@ -3803,8 +2403,6 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }): Promise<{ allowed: boolean; attempt: number; charged: boolean; reason?: string; message: string; evidence: Record<string, unknown>; refund?: FaultRefund } | undefined> {
     const controlledTarget = input.target ?? 'none';
     const now = this.faultClock();
-    await this.checkExecutionWindow(scope.taskId);
-    await this.liftRepairedFaults(scope.taskId, now);
     // SYS04 AC02: the attempt runs inside the lease, so it may not outlive the lock. The lease window caps the
     // recovery deadline; the budget itself stays persisted, so a re-claimed lease keeps the same counters.
     const task = await this.db.select<{ lease_expires_at?: number }>(id('task', scope.taskId));
@@ -3931,733 +2529,6 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * Read-only diagnosis of a task's recovery budget. Readable by the task holder, its reviewer, or owner.
    * Secret-free: no upstream bodies, no credentials, no aliases beyond what the ledger already stored.
    */
-  async faultStatus(credential: Credential, input: { taskId: TaskId }): Promise<FaultStatusView> {
-    const actor = await this.authenticate(credential);
-    const row = await this.db.select<TaskRow>(id('task', input.taskId));
-    if (!row) throw new CompanyError('not_found', 'Task not found');
-    const holds = row.current_employee === actor.employeeId && ['doing', 'review', 'blocked'].includes(row.state ?? '') &&
-      (row.lease_expires_at ?? 0) > Date.now() / 1000;
-    const reviews = actor.role === row.reviewer_role;
-    if (actor.role !== 'owner' && !holds && !reviews) {
-      throw new CompanyError('forbidden', 'Fault status is read by the task holder, its reviewer, or owner');
-    }
-    return this.faultStatusOf(input.taskId);
-  }
-
-  /**
-   * owner only: lift a spent (or stopped) recovery budget for one incident of a task. Resets the existing scope so
-   * the next attempt starts a fresh recovery window. Audited. Creates no new budget and never invents an incident.
-   */
-  async faultLift(credential: Credential, input: {
-    taskId: TaskId; incident: string; reason: string; idempotencyKey: string;
-  }): Promise<FaultStatusView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may lift a spent recovery budget');
-    requireText(input.reason, 'reason', 4, 2000);
-    requireText(input.incident, 'incident', 1, 500);
-    requireText(input.idempotencyKey, 'idempotencyKey', 1, 200);
-    const row = await this.db.select<TaskRow>(id('task', input.taskId));
-    if (!row) throw new CompanyError('not_found', 'Task not found');
-    const episodes = await this.faults.episodesOfTask(input.taskId);
-    const matching = episodes.filter(episode => episode.incident === input.incident);
-    if (matching.length === 0) throw new CompanyError('not_found', `no fault episode for incident ${input.incident} on this task`);
-    const liftable = matching.some(episode => episode.state === 'exhausted' || episode.state === 'stopped' || episode.state === 'opened' || episode.state === 'converged');
-    if (!liftable) throw new CompanyError('conflict', `incident ${input.incident} is already resolved on this task`);
-    const now = this.faultClock();
-    // The lift spends the completions of this incident's repair rounds that are still unspent, so the automatic path
-    // cannot spend the same completion again once the budget runs out (AC04). With none unspent, the budget is reset
-    // by hand, and the audit below records the reason.
-    const unspent = await this.unspentCredentials(input.taskId, input.incident);
-    if (unspent.length > 0) {
-      const spent = await this.faults.spendCredentials({
-        taskId: input.taskId, incident: input.incident, now, limits: this.faultLimits, via: 'owner', credentials: unspent,
-      });
-      if (!spent) throw new CompanyError('conflict', `incident ${input.incident} was lifted by a concurrent call; read the fault status before retrying`);
-    } else {
-      await this.faults.resetRecovery({ taskId: input.taskId, incident: input.incident, now, limits: this.faultLimits });
-    }
-    await this.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: 'fault_lift', evidence: $evidence, at: time::now() };`,
-      { task: id('task', input.taskId), actor: id('employee', actor.employeeId),
-        evidence: JSON.stringify({ incident: input.incident, reason: input.reason, idempotencyKey: input.idempotencyKey }).slice(0, 30000) });
-    return this.faultStatusOf(input.taskId);
-  }
-
-  /** Assemble the secret-free diagnosis view of a task. */
-  private async faultStatusOf(taskId: TaskId): Promise<FaultStatusView> {
-    const now = this.faultClock();
-    const budgets: FaultBudgetView[] = (await this.faults.scopesOfTask(taskId)).map(scope => ({
-      key: scope.key, target: scope.target, phase: scope.phase,
-      attempts: scope.attempts, maxAttempts: scope.maxAttempts, totalAttempts: scope.totalAttempts,
-      deadline: scope.deadline, nextAllowedAt: scope.nextAllowedAt,
-      failed: scope.failed, stopped: scope.stopped,
-      ...(scope.lastErrno === undefined ? {} : { lastErrno: scope.lastErrno }),
-      ...(scope.lastHop === undefined ? {} : { lastHop: scope.lastHop }),
-      ...(scope.lastIncident === undefined ? {} : { lastIncident: scope.lastIncident }),
-      ...(scope.stopReason === undefined ? {} : { stopReason: scope.stopReason }),
-      ...(scope.stopDiagnostic === undefined ? {} : { stopDiagnostic: scope.stopDiagnostic }),
-    }));
-    const episodes: FaultEpisodeView[] = (await this.faults.episodesOfTask(taskId)).map(episode => ({
-      episode: episode.episode, incident: episode.incident, fingerprint: episode.fingerprint,
-      phase: episode.phase, state: episode.state, openedAt: episode.openedAt, updatedAt: episode.updatedAt,
-      ...(episode.resolvedAt === undefined ? {} : { resolvedAt: episode.resolvedAt }),
-    }));
-    const seen = new Set<string>();
-    const repairs: FaultRepairView[] = [];
-    for (const episode of episodes) {
-      if (seen.has(episode.incident)) continue;
-      seen.add(episode.incident);
-      const repair = await this.faults.repair(episode.incident);
-      if (!repair) continue;
-      repairs.push({
-        incident: repair.incident, fingerprint: repair.fingerprint, state: repair.state,
-        ...(repair.taskId === undefined ? {} : { taskId: repair.taskId }),
-        ...(repair.sourceTaskId === undefined ? {} : { sourceTaskId: repair.sourceTaskId }),
-        ...(repair.diagnostic === undefined ? {} : { diagnostic: repair.diagnostic }),
-      });
-    }
-    return { taskId, now, budgets, episodes, repairs };
-  }
-
-  // ---------------- FV06 recovery read grant ----------------
-
-  private recoveryKey(grantId: string): string {
-    return String(grantId).replace(/^recovery_read_grant:/, '').replace(/^⟨/, '').replace(/⟩$/, '');
-  }
-
-  private recoveryMs(value: unknown): number {
-    if (value instanceof Date) return value.getTime();
-    if (typeof value === 'number') return value;
-    if (typeof value === 'string') return Date.parse(value);
-    return Date.parse(String(value ?? ''));
-  }
-
-  private recoveryIso(value: unknown): string {
-    if (value instanceof Date) return value.toISOString();
-    const at = this.recoveryMs(value);
-    return Number.isFinite(at) ? new Date(at).toISOString() : String(value ?? '');
-  }
-
-  private recoveryView(row: RecoveryReadGrantDbRow): RecoveryReadGrantRowView {
-    const flight = row.in_flight && typeof row.in_flight === 'object' ? row.in_flight : undefined;
-    return {
-      id: normalizedId(row.id), taskId: normalizedId(row.source_task), employeeId: normalizedId(row.employee), alias: row.alias,
-      methods: [...(row.methods ?? [])], paths: [...(row.paths ?? [])],
-      expiresAt: this.recoveryIso(row.expires_at), authorizationTask: normalizedId(row.authorization_task), reason: row.reason,
-      state: row.state, loginAttempts: row.login_attempts ?? 0, perPath: [...(row.per_path ?? [])],
-      ...(flight ? { inFlight: { path: String(flight.path), startedAt: this.recoveryIso(flight.started_at),
-        deadline: this.recoveryIso(flight.deadline), callId: String(flight.call_id) } } : {}),
-      ...(row.stop_reason ? { stopReason: row.stop_reason } : {}),
-      ...(row.result_digest ? { resultDigest: row.result_digest } : {}),
-      createdBy: row.created_by, createdAt: this.recoveryIso(row.created_at),
-      ...(row.bound_at === undefined ? {} : { boundAt: this.recoveryIso(row.bound_at) }),
-      ...(row.closed_at === undefined ? {} : { closedAt: this.recoveryIso(row.closed_at) }),
-      ...(row.last_wake_at === undefined ? {} : { lastWakeAt: this.recoveryIso(row.last_wake_at) }),
-      ...(row.last_skip_reason ? { lastSkipReason: row.last_skip_reason } : {}),
-      fence: row.fence,
-    };
-  }
-
-  private async recoveryCallsOf(grantId: string, limit = 20): Promise<RecoveryReadCallView[]> {
-    const [rows] = await this.db.query<[Array<{ ordinal: number; kind: 'login' | 'get' | 'logout'; path?: string;
-      status?: number; ok: boolean; outcome: string; digest?: string; at: unknown }>]>(
-      'SELECT ordinal, kind, path, status, ok, outcome, digest, at FROM recovery_read_call WHERE grant = $grant ORDER BY ordinal DESC LIMIT $limit;',
-      { grant: id('recovery_read_grant', grantId), limit });
-    return rows.map(row => ({
-      ordinal: row.ordinal, kind: row.kind, ...(row.path ? { path: row.path } : {}),
-      ...(row.status ? { status: row.status } : {}), ok: row.ok === true, outcome: row.outcome,
-      ...(row.digest ? { digest: row.digest } : {}), at: this.recoveryIso(row.at),
-    })).reverse();
-  }
-
-  /**
-   * H6：inFlight 超过 deadline 仍未 settle（进程崩溃、插件重载、丢失 settle）时，链级终态是
-   * stopped(unknown_outcome)，该路径不重试。这里做一次幂等推进；并发 settle 或另一次 stop 赢了就返回 false。
-   */
-  private async recoveryStopIfOverdue(grantId: string): Promise<boolean> {
-    const row = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
-    if (!row || (row.state !== 'bound' && row.state !== 'running') || !row.in_flight) return false;
-    const deadline = this.recoveryMs(row.in_flight.deadline);
-    if (!Number.isFinite(deadline) || deadline > Date.now()) return false;
-    try {
-      await this.txTask(`BEGIN;
-        LET $g = SELECT * FROM ONLY $grant;
-        IF $g = NONE { THROW 'recovery grant not found' };
-        IF $g.in_flight = NONE { THROW 'recovery call moved' };
-        IF $g.in_flight.deadline > time::now() { THROW 'recovery call still in flight' };
-        UPDATE ONLY $grant SET state = 'stopped', stop_reason = 'unknown_outcome', in_flight = NONE,
-          closed_at = time::now(), version = $g.version + 1;
-        CREATE ONLY $audit CONTENT { task: $g.source_task, actor: $g.employee, action: 'recovery_read_stop',
-          evidence: $evidence, at: time::now() };
-        RETURN $g;
-        COMMIT;`, {
-        grant: id('recovery_read_grant', grantId), audit: id('audit', randomUUID()),
-        evidence: JSON.stringify({ grantId, reason: 'unknown_outcome', path: row.in_flight.path ?? 'login' }).slice(0, 4000),
-      });
-      return true;
-    } catch {
-      // 并发 settle / 另一次 stop 已推进；调用方重新读状态即可。
-      return false;
-    }
-  }
-
-  private async recoveryStatusOf(credential: Credential, input: { taskId?: TaskId; grantId?: string }): Promise<RecoveryReadStatusView[]> {
-    const actor = await this.authenticate(credential);
-    let rows: RecoveryReadGrantDbRow[];
-    if (input.grantId) {
-      const row = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', this.recoveryKey(input.grantId)));
-      rows = row ? [row] : [];
-    } else {
-      requireText(input.taskId ?? '', 'task', 1, 200);
-      const [found] = await this.db.query<[RecoveryReadGrantDbRow[]]>(
-        'SELECT * FROM recovery_read_grant WHERE source_task = $task ORDER BY created_at DESC;',
-        { task: id('task', input.taskId!) });
-      rows = found ?? [];
-    }
-    const sourceIds = new Set(rows.map(row => asId(row.source_task)));
-    let reviewer = false;
-    for (const taskId of sourceIds) {
-      const task = await this.db.select<{ reviewer_role?: string }>(id('task', taskId));
-      if (task?.reviewer_role === actor.role) reviewer = true;
-    }
-    if (actor.role !== 'owner' && !reviewer) rows = rows.filter(row => asId(row.employee) === actor.employeeId);
-    // H6：读状态也把超时的 inFlight 推进为 stopped(unknown_outcome)，QA 看到的是终态而不是永久 busy。
-    const refreshed: RecoveryReadGrantDbRow[] = [];
-    for (const row of rows) {
-      const key = this.recoveryKey(normalizedId(row.id));
-      if (await this.recoveryStopIfOverdue(key)) {
-        const again = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', key));
-        if (again) refreshed.push(again);
-      } else refreshed.push(row);
-    }
-    rows = refreshed;
-    const views: RecoveryReadStatusView[] = [];
-    for (const row of rows) views.push({ grant: this.recoveryView(row), calls: await this.recoveryCallsOf(asId(row.id)) });
-    return views;
-  }
-
-  /** owner + manage；源任务保持 done；issuer ≠ grantee；四条精确路径、固定别名、1–30 分钟 TTL。 */
-  async recoveryReadGrant(credential: Credential, input: RecoveryReadGrantInput): Promise<RecoveryReadStatusView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may issue a recovery read grant');
-    requireText(input.taskId, 'task', 1, 200);
-    requireText(input.employeeId, 'employee', 1, 120);
-    requireText(input.authorizationTask, 'authorizationTask', 1, 200);
-    requireText(input.reason, 'reason', 4, 2000);
-    requireText(input.idempotencyKey, 'idempotencyKey', 1, 200);
-    if (input.employeeId === actor.employeeId) throw new CompanyError('forbidden', 'A recovery read grant cannot be self-issued');
-    if (input.alias !== RECOVERY_READ_ALIAS) throw new CompanyError('invalid', `alias must be ${RECOVERY_READ_ALIAS}`);
-    const paths = exactRecoveryPaths(input.paths);
-    const now = Date.now();
-    const expiresAt = parseRecoveryExpiry(input.expiresAt, now);
-    const idem = this.businessIdemId('recovery_read_grant', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ ...input, paths }));
-    const prior = await this.db.select<{ payload_digest?: string; result?: RecoveryReadGrantDbRow }>(idem);
-    if (prior) {
-      if (prior.payload_digest !== digest) throw new CompanyError('conflict', 'Idempotency key reused with different input');
-      if (!prior.result) throw new CompanyError('conflict', 'Recovery read grant replay has no stored result');
-      return { grant: this.recoveryView(prior.result), calls: await this.recoveryCallsOf(asId(prior.result.id)) };
-    }
-    const source = await this.db.select<TaskRow>(id('task', input.taskId));
-    if (!source) throw new CompanyError('not_found', 'Source task not found');
-    if (source.state !== 'done') throw new CompanyError('invalid', 'Recovery read source task must be done');
-    const episodes = await this.faults.episodesOfTask(input.taskId);
-    if (!episodes.some(episode => ['opened', 'exhausted', 'stopped', 'converged'].includes(episode.state))) {
-      throw new CompanyError('invalid', 'Source task has no open, exhausted or stopped fault episode');
-    }
-    const authorization = await this.db.select<TaskRow>(id('task', input.authorizationTask));
-    if (!authorization) throw new CompanyError('not_found', 'Authorization task not found');
-    if (authorization.state !== 'done') throw new CompanyError('invalid', 'Authorization task must be done');
-    const sourceGoal = source.goal ? asId(source.goal) : undefined;
-    const authorizationGoal = authorization.goal ? asId(authorization.goal) : undefined;
-    if (!sourceGoal || sourceGoal !== authorizationGoal) {
-      throw new CompanyError('invalid', 'Authorization task must belong to the source task goal');
-    }
-    const window = authorization.execution_window;
-    if (window && Number.isFinite(Date.parse(window.notAfter)) && expiresAt.getTime() > Date.parse(window.notAfter)) {
-      throw new CompanyError('invalid', 'Grant expiry cannot be later than the authorization task deadline');
-    }
-    const employee = await this.db.select<{ role: Role; revoked?: boolean; retired?: boolean }>(id('employee', input.employeeId));
-    if (!employee || employee.revoked || employee.retired) throw new CompanyError('invalid', 'Grantee employee is not active');
-    const sourceGoalRow = source.goal ? await this.db.select<{ project?: RecordId }>(source.goal) : undefined;
-    const project = source.project ?? sourceGoalRow?.project ?? authorization.project;
-    if (!project) throw new CompanyError('invalid', 'Source task has no project environment');
-    const envRows = (await this.projects.brokerEnvs(String(project.id))).filter(row => row.broker !== undefined && row.broker !== null);
-    if (envRows.length === 0) throw new CompanyError('not_configured', `project ${String(project.id)} has no ops broker environment`);
-    if (!envRows.some(row => parseBrokerConfig(row.broker).roles.includes(employee.role))) {
-      throw new CompanyError('invalid', `employee role ${employee.role} may not use ops tools in ${String(project.id)}`);
-    }
-    const [latest] = await this.db.query<[RecoveryReadGrantDbRow[]]>(
-      'SELECT * FROM recovery_read_grant WHERE source_task = $task ORDER BY created_at DESC LIMIT 1;',
-      { task: id('task', input.taskId) });
-    const previous = latest?.[0];
-    if (previous && input.rearm !== true) {
-      throw new CompanyError('conflict', 'A recovery read chain already exists for this source task; pass rearm with a new authorizationTask');
-    }
-    if (previous && input.rearm === true) {
-      if (asId(previous.authorization_task) === input.authorizationTask) {
-        throw new CompanyError('invalid', 'Rearm needs a new authorization task, not the one that already authorized the chain');
-      }
-      if (previous.state === 'bound' || previous.state === 'running') {
-        throw new CompanyError('conflict', 'The existing recovery read chain is still active; revoke it before rearming');
-      }
-    }
-    // 新 grant/rearm 的计数由签发事务从链头原样承接：登录失败过一次，就再也不会有第二次登录机会。
-    const grantId = randomUUID();
-    const grant = id('recovery_read_grant', grantId);
-    const chainId = id('recovery_read_chain', HASH(`recovery_read_chain\0${input.taskId}`));
-    try {
-      const row = await this.txTask<RecoveryReadGrantDbRow>(`BEGIN;
-        LET $src = SELECT * FROM ONLY $source;
-        IF $src = NONE OR $src.state != 'done' { THROW 'recovery source task moved' };
-        IF $src.version != $sourceVersion { THROW 'recovery source task moved' };
-        LET $approval = SELECT * FROM ONLY $authorization;
-        IF $approval = NONE OR $approval.state != 'done' { THROW 'recovery authorization task moved' };
-        LET $chain = SELECT * FROM ONLY $chainId;
-        LET $has = $chain != NONE;
-        LET $latest = IF $has { SELECT * FROM ONLY $chain.latest_grant } ELSE { { login_attempts: 0, per_path: [0, 0, 0, 0], authorization_task: NONE, state: 'none' } };
-        IF $has AND $rearm = false { THROW 'recovery chain already exists' };
-        IF $has AND $latest.authorization_task = $authorization { THROW 'recovery chain rearm needs a new authorization task' };
-        IF $has AND $latest.state IN ['bound', 'running'] { THROW 'recovery chain is still active' };
-        CREATE ONLY $grant CONTENT {
-          source_task: $source, employee: $employee, alias: $alias, methods: ['GET'], paths: $paths,
-          max_login: $maxLogin, max_calls_per_path: $maxCalls, expires_at: <datetime>$expiresAt,
-          authorization_task: $authorization, reason: $reason, state: 'issued',
-          login_attempts: $latest.login_attempts, per_path: $latest.per_path,
-          in_flight: NONE, stop_reason: '', result_digest: '',
-          created_by: $creator, created_at: time::now(), bound_at: NONE, closed_at: NONE, fence: 1, version: 1
-        };
-        LET $created = SELECT * FROM ONLY $grant;
-        IF $has { UPDATE ONLY $chainId SET latest_grant = $grant, version = $chain.version + 1; }
-        ELSE { CREATE ONLY $chainId CONTENT { task: $source, latest_grant: $grant, version: 1 }; };
-        CREATE ONLY $audit CONTENT { task: $source, actor: $actor, action: 'recovery_read_grant',
-          evidence: $evidence, at: time::now() };
-        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $created };
-        RETURN $created;
-        COMMIT;`, {
-        source: id('task', input.taskId), sourceVersion: source.version, authorization: id('task', input.authorizationTask),
-        employee: id('employee', input.employeeId), grant, chainId, alias: input.alias, paths,
-        maxLogin: RECOVERY_READ_MAX_LOGIN, maxCalls: RECOVERY_READ_MAX_CALLS_PER_PATH,
-        expiresAt: expiresAt.toISOString(), reason: input.reason,
-        rearm: input.rearm === true,
-        creator: actor.employeeId, digest, idem, audit: id('audit', randomUUID()),
-        actor: id('employee', actor.employeeId),
-        evidence: JSON.stringify({ grantId, taskId: input.taskId, employeeId: input.employeeId,
-          authorizationTask: input.authorizationTask, rearm: input.rearm === true }).slice(0, 4000),
-      });
-      return { grant: this.recoveryView(row), calls: [] };
-    } catch (error) {
-      const replayed = await this.db.select<{ payload_digest?: string; result?: RecoveryReadGrantDbRow }>(idem);
-      if (replayed?.payload_digest === digest && replayed.result) {
-        return { grant: this.recoveryView(replayed.result), calls: await this.recoveryCallsOf(asId(replayed.result.id)) };
-      }
-      throw error;
-    }
-  }
-
-  async recoveryReadGrantRevoke(credential: Credential, input: { grantId: string; reason: string; idempotencyKey: string }): Promise<RecoveryReadStatusView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may revoke a recovery read grant');
-    requireText(input.reason, 'reason', 4, 2000);
-    requireText(input.idempotencyKey, 'idempotencyKey', 1, 200);
-    const grantId = this.recoveryKey(input.grantId);
-    const grant = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
-    if (!grant) throw new CompanyError('not_found', 'Recovery read grant not found');
-    if (grant.state !== 'revoked' && grant.state !== 'completed') {
-      await this.txTask(`BEGIN;
-        LET $g = SELECT * FROM ONLY $grant;
-        IF $g = NONE { THROW 'recovery grant not found' };
-        IF $g.state IN ['revoked', 'completed'] { THROW 'recovery grant already closed' };
-        UPDATE ONLY $grant SET state = 'revoked', stop_reason = $reason, closed_at = time::now(), version = $g.version + 1, in_flight = NONE;
-        LET $updated = SELECT * FROM ONLY $grant;
-        CREATE ONLY $audit CONTENT { task: $g.source_task, actor: $actor, action: 'recovery_read_revoke',
-          evidence: $evidence, at: time::now() };
-        RETURN $updated;
-        COMMIT;`, { grant: id('recovery_read_grant', grantId), actor: id('employee', actor.employeeId),
-        reason: input.reason, audit: id('audit', randomUUID()),
-        evidence: JSON.stringify({ grantId, reason: input.reason, idempotencyKey: input.idempotencyKey }).slice(0, 4000) });
-    }
-    const row = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
-    return { grant: this.recoveryView(row!), calls: await this.recoveryCallsOf(grantId) };
-  }
-
-  async recoveryReadStatus(credential: Credential, input: { taskId?: TaskId; grantId?: string }): Promise<RecoveryReadStatusView[]> {
-    return this.recoveryStatusOf(credential, input);
-  }
-
-  /** 通道只读查询：按员工凭证取其自己的 grant；未过期的 inactive 也返回，由通道决定拒绝。 */
-  async recoveryGrantFor(credential: Credential, grantId: string): Promise<RecoveryReadGrantRowView> {
-    const actor = await this.authorized(credential);
-    const key = this.recoveryKey(grantId);
-    await this.recoveryStopIfOverdue(key);
-    const row = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', key));
-    if (!row || asId(row.employee) !== actor.employeeId) throw new CompanyError('not_found', 'Recovery read grant not found for this employee');
-    const view = this.recoveryView(row);
-    // 读时投影：不写行；过期或源任务离开 done 时通道据此关闭绑定。
-    if (view.state === 'issued' || view.state === 'bound' || view.state === 'running') {
-      if (this.recoveryMs(row.expires_at) <= Date.now()) view.state = 'expired';
-      else {
-        const source = await this.db.select<{ state?: string }>(id('task', view.taskId));
-        if (source?.state !== 'done') { view.state = 'stopped'; view.stopReason = 'source_changed'; }
-      }
-    }
-    return view;
-  }
-
-  /** 通道重载/唤醒的完整员工查询：只返回仍可绑定的 grant（issued/bound/running、未过期、源任务仍 done）。 */
-  async recoveryGrantsFor(credential: Credential): Promise<RecoveryReadGrantRowView[]> {
-    const actor = await this.authorized(credential);
-    const [rows] = await this.db.query<[RecoveryReadGrantDbRow[]]>(
-      `SELECT * FROM recovery_read_grant WHERE employee = $employee AND state IN ['issued', 'bound', 'running']
-         ORDER BY created_at DESC;`, { employee: id('employee', actor.employeeId) });
-    const active: RecoveryReadGrantRowView[] = [];
-    for (const row of rows) {
-      const key = this.recoveryKey(normalizedId(row.id));
-      if (await this.recoveryStopIfOverdue(key)) continue;
-      if (this.recoveryMs(row.expires_at) <= Date.now()) continue;
-      const source = await this.db.select<{ state?: string }>(id('task', asId(row.source_task)));
-      if (source?.state !== 'done') continue;
-      active.push(this.recoveryView(row));
-    }
-    return active;
-  }
-
-  /** 通道绑定：issued → bound（审计 recovery_read_bind）；执行租约在身时不绑定。 */
-  async recoveryReadBind(credential: Credential, input: { grantId: string; fence: number }): Promise<RecoveryReadGrantRowView> {
-    const actor = await this.authorized(credential);
-    const grantId = this.recoveryKey(input.grantId);
-    await this.recoveryStopIfOverdue(grantId);
-    const grant = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
-    if (!grant || asId(grant.employee) !== actor.employeeId) throw new CompanyError('not_found', 'Recovery read grant not found for this employee');
-    if (grant.fence !== input.fence) throw new CompanyError('forbidden', 'Recovery read grant proof does not match');
-    if (this.recoveryMs(grant.expires_at) <= Date.now()) {
-      await this.recoveryReadClose(credential, { grantId, fence: input.fence, reason: 'expired' });
-      throw new CompanyError('forbidden', 'Recovery read grant expired');
-    }
-    const source = await this.db.select<{ state?: string }>(id('task', asId(grant.source_task)));
-    if (source?.state !== 'done') throw new CompanyError('forbidden', 'Recovery read source task is no longer done');
-    const [live] = await this.db.query<[Array<{ id: RecordId }>]>(
-      `SELECT id FROM task WHERE current_employee = $employee AND state IN ['doing', 'review']
-         AND lease_expires_at != NONE AND lease_expires_at > time::unix(time::now()) LIMIT 1;`,
-      { employee: actor.employeeId });
-    if (live.length > 0) throw new CompanyError('conflict', 'Employee holds an execution lease; recovery read cannot bind');
-    if (grant.state === 'issued') {
-      const row = await this.txTask<RecoveryReadGrantDbRow>(`BEGIN;
-        LET $g = SELECT * FROM ONLY $grant;
-        IF $g = NONE { THROW 'recovery grant not found' };
-        IF $g.state != 'issued' { THROW 'recovery grant moved' };
-        LET $next = UPDATE ONLY $grant SET state = 'bound', bound_at = time::now(), version = $g.version + 1 RETURN AFTER;
-        CREATE ONLY $audit CONTENT { task: $g.source_task, actor: $actor, action: 'recovery_read_bind',
-          evidence: $evidence, at: time::now() };
-        RETURN $next;
-        COMMIT;`, { grant: id('recovery_read_grant', grantId), actor: id('employee', actor.employeeId),
-        audit: id('audit', randomUUID()),
-        evidence: JSON.stringify({ grantId, employeeId: actor.employeeId, fence: input.fence, taskId: asId(grant.source_task) }).slice(0, 4000) });
-      return this.recoveryView(row);
-    }
-    if (grant.state !== 'bound' && grant.state !== 'running') throw new CompanyError('forbidden', `Recovery read grant is ${grant.state}`);
-    return this.recoveryView(grant);
-  }
-
-  /**
-   * 调用前的链级原子 reserve：登录只允许一次；GET 只允许固定顺序的下一条、每路径一次；任何 inFlight 存在即 busy。
-   * 只递增本 grant 的计数与 inFlight，不碰 fault 账本——预算仍由 broker 按源 taskId 另记。
-   */
-  async recoveryReadReserve(credential: Credential, input: RecoveryReadReserveInput): Promise<RecoveryReadReserveResult> {
-    const actor = await this.authorized(credential);
-    const grantId = this.recoveryKey(input.grantId);
-    if (!Number.isSafeInteger(input.grantFence) || input.grantFence < 1) throw new CompanyError('invalid', 'Invalid grant fence');
-    // H6：上一次调用超过 deadline 仍未 settle → 先推进为 stopped(unknown_outcome)，再按终态拒绝。
-    await this.recoveryStopIfOverdue(grantId);
-    const grant = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
-    if (!grant || asId(grant.employee) !== actor.employeeId || grant.fence !== input.grantFence) {
-      throw new CompanyError('forbidden', 'Recovery read grant proof does not match');
-    }
-    if (input.kind === 'logout') {
-      // 必要清理永远放行：不递增、不看状态、不要求登录成功。
-      return { allowed: true, kind: 'logout', callId: randomUUID(), message: 'logout allowed' };
-    }
-    const refuse = (reason: string, message: string): RecoveryReadReserveResult => ({ allowed: false, kind: input.kind, ...(input.path ? { path: input.path } : {}), reason, message });
-    if (this.recoveryMs(grant.expires_at) <= Date.now()) return refuse('grant_expired', 'Recovery read grant expired');
-    if (grant.state === 'revoked') return refuse('grant_revoked', 'Recovery read grant was revoked');
-    if (grant.state === 'expired') return refuse('grant_expired', 'Recovery read grant expired');
-    if (grant.state === 'stopped') return refuse('grant_stopped', `Recovery read chain stopped (${grant.stop_reason ?? 'unknown'})`);
-    if (grant.state === 'completed') return refuse('grant_completed', 'Recovery read chain already completed');
-    if (grant.state === 'issued') return refuse('not_bound', 'Recovery read grant is not bound to a channel');
-    if (grant.in_flight) return refuse('busy', 'Recovery read is busy with another call');
-    const source = await this.db.select<{ state?: string }>(id('task', asId(grant.source_task)));
-    if (source?.state !== 'done') return refuse('source_changed', 'Recovery read source task is no longer done');
-    const callId = randomUUID();
-    const deadline = new Date(Date.now() + RECOVERY_READ_CALL_DEADLINE_MS).toISOString();
-    if (input.kind === 'login') {
-      if (grant.state !== 'bound') return refuse('login_unavailable', 'Recovery read login is only available before the first successful login');
-      if ((grant.login_attempts ?? 0) >= (grant.max_login ?? RECOVERY_READ_MAX_LOGIN)) return refuse('login_attempted', 'Recovery read login was already attempted');
-      try {
-        await this.txTask<RecoveryReadGrantDbRow>(`BEGIN;
-          LET $g = SELECT * FROM ONLY $grant;
-          IF $g = NONE { THROW 'recovery grant not found' };
-          IF $g.state != 'bound' { THROW 'recovery login unavailable' };
-          IF $g.login_attempts >= $g.max_login { THROW 'recovery login already attempted' };
-          IF $g.in_flight != NONE { THROW 'recovery read busy' };
-          IF $g.expires_at <= time::now() { THROW 'recovery grant expired' };
-          LET $src = SELECT * FROM ONLY $g.source_task;
-          IF $src = NONE OR $src.state != 'done' { THROW 'recovery source task moved' };
-          LET $next = UPDATE ONLY $grant SET login_attempts = $g.login_attempts + 1,
-            in_flight = { path: 'login', started_at: time::now(), deadline: <datetime>$deadline, call_id: $callId },
-            version = $g.version + 1 RETURN AFTER;
-          RETURN $next;
-          COMMIT;`, { grant: id('recovery_read_grant', grantId), deadline, callId });
-      } catch (error) {
-        return refuse('busy', `Recovery read is busy or the grant moved: ${(error as Error).message.slice(0, 160)}`);
-      }
-      return { allowed: true, kind: 'login', callId, deadline, message: 'login reserved' };
-    }
-    // GET：只允许固定顺序里的下一条。
-    const index = RECOVERY_READ_PATHS.indexOf(input.path as never);
-    if (index < 0 || grant.paths[index] !== input.path) return refuse('path_not_allowlisted', 'Path is not in this grant');
-    if (grant.state !== 'running') return refuse('read_unavailable', 'Recovery read GETs are only available after a successful login');
-    const perPath = grant.per_path ?? [0, 0, 0, 0];
-    if ((perPath[index] ?? 0) >= (grant.max_calls_per_path ?? RECOVERY_READ_MAX_CALLS_PER_PATH)) return refuse('path_attempted', 'This path was already called');
-    if (index > 0 && perPath[index - 1] !== 1) return refuse('path_order', 'Recovery read paths must be called in order');
-    const nextPaths = [...perPath];
-    nextPaths[index] = (nextPaths[index] ?? 0) + 1;
-    try {
-      await this.txTask<RecoveryReadGrantDbRow>(`BEGIN;
-        LET $g = SELECT * FROM ONLY $grant;
-        IF $g = NONE { THROW 'recovery grant not found' };
-        IF $g.version != $expectedVersion { THROW 'recovery grant moved' };
-        IF $g.state != 'running' { THROW 'recovery read unavailable' };
-        IF $g.in_flight != NONE { THROW 'recovery read busy' };
-        IF $g.expires_at <= time::now() { THROW 'recovery grant expired' };
-        LET $src = SELECT * FROM ONLY $g.source_task;
-        IF $src = NONE OR $src.state != 'done' { THROW 'recovery source task moved' };
-        LET $next = UPDATE ONLY $grant SET per_path = $nextPaths,
-          in_flight = { path: $path, started_at: time::now(), deadline: <datetime>$deadline, call_id: $callId },
-          version = $g.version + 1 RETURN AFTER;
-        RETURN $next;
-        COMMIT;`, { grant: id('recovery_read_grant', grantId), expectedVersion: grant.version, nextPaths, path: input.path,
-        deadline, callId });
-    } catch (error) {
-      return refuse('busy', `Recovery read is busy or the grant moved: ${(error as Error).message.slice(0, 160)}`);
-    }
-    return { allowed: true, kind: 'get', callId, path: input.path, deadline, message: 'read reserved' };
-  }
-
-  /** 调用后的原子 settle：记录状态/摘要、清 inFlight、推进或停止；停止是链级终态。 */
-  async recoveryReadSettle(credential: Credential, input: RecoveryReadSettleInput): Promise<void> {
-    const actor = await this.authorized(credential);
-    const grantId = this.recoveryKey(input.grantId);
-    if (input.kind === 'logout') {
-      await this.recoveryCallRow(grantId, input, 0);
-      return;
-    }
-    const grant = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
-    if (!grant || asId(grant.employee) !== actor.employeeId || grant.fence !== input.grantFence) {
-      throw new CompanyError('forbidden', 'Recovery read grant proof does not match');
-    }
-    if (!grant.in_flight || String(grant.in_flight.call_id) !== input.callId) {
-      throw new CompanyError('conflict', 'Recovery read call is not in flight (already settled or unknown)');
-    }
-    const index = input.path ? RECOVERY_READ_PATHS.indexOf(input.path as never) : -1;
-    const state: RecoveryReadState = !input.ok ? 'stopped'
-      : input.kind === 'login' ? 'running'
-        : index === RECOVERY_READ_PATHS.length - 1 ? 'completed' : 'running';
-    const stopReason = !input.ok ? (input.kind === 'login' ? 'login_failed' : input.outcome) : undefined;
-    const digest = input.bodyDigest ?? grant.result_digest ?? '';
-    const closed = state === 'completed' || state === 'stopped';
-    const sets = ['in_flight = NONE', 'state = $state', 'version = $g.version + 1'];
-    if (stopReason) sets.push('stop_reason = $stopReason');
-    if (digest) sets.push('result_digest = $digest');
-    if (closed) sets.push('closed_at = time::now()');
-    const next = await this.txTask<RecoveryReadGrantDbRow>(`BEGIN;
-      LET $g = SELECT * FROM ONLY $grant;
-      IF $g = NONE { THROW 'recovery grant not found' };
-      IF $g.in_flight = NONE OR $g.in_flight.call_id != $callId { THROW 'recovery call moved' };
-      LET $updated = UPDATE ONLY $grant SET ${sets.join(', ')} RETURN AFTER;
-      CREATE ONLY $call CONTENT { grant: $grant, source_task: $g.source_task, employee: $g.employee,
-        ordinal: $ordinal, kind: $kind, path: $path, status: $status, ok: $ok, outcome: $outcome,
-        digest: $digest, at: time::now() };
-      RETURN $updated;
-      COMMIT;`, {
-      grant: id('recovery_read_grant', grantId), callId: input.callId, state,
-      stopReason: stopReason ?? '', digest,
-      call: id('recovery_read_call', randomUUID()), ordinal: await this.recoveryNextOrdinal(grantId),
-      kind: input.kind, path: input.path ?? '', status: input.status ?? 0, ok: input.ok, outcome: input.outcome,
-    });
-    void next;
-  }
-
-  private async recoveryNextOrdinal(grantId: string): Promise<number> {
-    const [rows] = await this.db.query<[Array<{ n: number }>]>(
-      'SELECT count() AS n FROM recovery_read_call WHERE grant = $grant GROUP ALL;', { grant: id('recovery_read_grant', grantId) });
-    return (rows[0]?.n ?? 0) + 1;
-  }
-
-  private async recoveryCallRow(grantId: string, input: RecoveryReadSettleInput, ordinal: number): Promise<void> {
-    const grant = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
-    if (!grant) throw new CompanyError('not_found', 'Recovery read grant not found');
-    await this.db.query(`CREATE $call CONTENT { grant: $grant, source_task: $task, employee: $employee,
-      ordinal: $ordinal, kind: $kind, path: $path, status: $status, ok: $ok, outcome: $outcome,
-      digest: $digest, at: time::now() };`, {
-      call: id('recovery_read_call', randomUUID()), grant: id('recovery_read_grant', grantId),
-      task: grant.source_task, employee: grant.employee, ordinal: ordinal || await this.recoveryNextOrdinal(grantId),
-      kind: input.kind, path: input.path ?? '', status: input.status ?? 0, ok: input.ok, outcome: input.outcome,
-      digest: input.bodyDigest ?? '',
-    });
-  }
-
-  /** 通道关闭：审计 recovery_read_close；过期则 expired，源任务离开 done 则 stopped(source_changed)。 */
-  async recoveryReadClose(credential: Credential, input: { grantId: string; fence: number; reason: string }): Promise<void> {
-    const actor = await this.authorized(credential);
-    const grantId = this.recoveryKey(input.grantId);
-    const grant = await this.db.select<RecoveryReadGrantDbRow>(id('recovery_read_grant', grantId));
-    if (!grant || asId(grant.employee) !== actor.employeeId || grant.fence !== input.fence) {
-      throw new CompanyError('forbidden', 'Recovery read grant proof does not match');
-    }
-    const source = await this.db.select<{ state?: string }>(id('task', asId(grant.source_task)));
-    const now = Date.now();
-    const state: RecoveryReadState | undefined = grant.state === 'revoked' || grant.state === 'completed' ? undefined
-      : this.recoveryMs(grant.expires_at) <= now ? 'expired'
-        : source?.state !== 'done' ? 'stopped' : undefined;
-    const stopReason = state === 'stopped' ? 'source_changed' : state === 'expired' ? 'expired' : '';
-    const sets = ['closed_at = time::now()', 'in_flight = NONE'];
-    if (state) sets.push('state = $state');
-    if (stopReason) sets.push('stop_reason = $stopReason');
-    try {
-      await this.txTask(`BEGIN;
-        LET $g = SELECT * FROM ONLY $grant;
-        IF $g = NONE { THROW 'recovery grant not found' };
-        UPDATE ONLY $grant SET ${sets.join(', ')} WHERE state IN ['issued', 'bound', 'running'];
-        CREATE ONLY $audit CONTENT { task: $g.source_task, actor: $actor, action: 'recovery_read_close',
-          evidence: $evidence, at: time::now() };
-        RETURN $g;
-        COMMIT;`, { grant: id('recovery_read_grant', grantId), actor: id('employee', actor.employeeId),
-        ...(state ? { state } : {}), ...(stopReason ? { stopReason } : {}),
-        audit: id('audit', randomUUID()),
-        evidence: JSON.stringify({ grantId, fence: input.fence, reason: input.reason, state: state ?? 'none' }).slice(0, 4000) });
-    } catch (error) {
-      // 关闭是清理动作：grant 已不存在或已被并发关闭时不阻塞通道回收。
-      if (error instanceof CompanyError && (error.code === 'not_found' || error.code === 'conflict')) return;
-      throw error;
-    }
-  }
-
-  /**
-   * A real repair completion lifts the fault it was made for (AC04): the source task may recover again, with a fresh
-   * budget and a new stage. Each completion lifts a task at most once. The spend is recorded in the same transaction
-   * as the lift, so a replay, a concurrent call or a restart finds the completion spent and changes nothing. One lift
-   * spends every completion of the incident that is still unspent, so an older completion cannot lift it again later.
-   */
-  private async liftRepairedFaults(taskId: TaskId, now: number): Promise<void> {
-    const incidents = new Set((await this.faults.episodesOfTask(taskId))
-      .filter(episode => episode.state === 'exhausted' || episode.state === 'stopped')
-      .map(episode => episode.incident));
-    for (const incident of incidents) {
-      // A concurrent call that spent the completions first makes the spend return false: the state is read again.
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const credentials = await this.unspentCredentials(taskId, incident);
-        if (credentials.length === 0) break;
-        const spent = await this.faults.spendCredentials({ taskId, incident, now, limits: this.faultLimits, via: 'repair', credentials });
-        if (spent) break;
-      }
-    }
-  }
-
-  /**
-   * The completions of one incident's repair rounds that this task has not spent yet, newest round first. A round
-   * gives a completion only when it is done and its completion audit exists: a raw state change gives none.
-   */
-  private async unspentCredentials(taskId: TaskId, incident: string): Promise<FaultCredential[]> {
-    const repair = await this.faults.repair(incident);
-    if (!repair?.rounds.length) return [];
-    const spent = await this.faults.spentCredentials(taskId, incident);
-    const unspent: FaultCredential[] = [];
-    for (const round of [...repair.rounds].reverse()) {
-      const credential = await this.repairCredential(round);
-      if (credential !== undefined && !spent.has(credential)) unspent.push({ repair: round, credential });
-    }
-    return unspent;
-  }
-
-  /**
-   * The credential of one repair round: the newest accept or owner approval of its repair task, written after the
-   * credential marker that the upgrade to schema 047 set. Audits from before the marker are not credentials, so
-   * upgrading lifts nothing.
-   */
-  private async repairCredential(repairTaskId: string): Promise<string | undefined> {
-    const repairTask = await this.db.select<{ state?: string }>(id('task', repairTaskId));
-    if (repairTask?.state !== 'done') return undefined;
-    // The marker is compared inside the query: the SDK hands datetimes out as its own class, not as Date. A marker
-    // that is not set (NONE) matches no audit, so nothing before the upgrade is a credential.
-    const [rows] = await this.db.query<[Array<{ id?: unknown }>]>(
-      `SELECT id, at FROM audit WHERE task = $task AND action IN ['accept', 'owner_approve']
-        AND at >= (SELECT VALUE fault_credential_since FROM ONLY company_meta:installation)
-        ORDER BY at DESC LIMIT 1;`,
-      { task: id('task', repairTaskId) },
-    );
-    const audit = rows?.[0]?.id;
-    return audit === undefined ? undefined : asId(audit);
-  }
-
-  /**
-   * The fault of a task whose recovery must not continue, if there is one: the budget is spent, or the cause
-   * cannot be recovered at all. The task's own episodes are read; the newest one wins, because that is the cause
-   * the manager has to deal with.
-   */
-  private async blockedFaultFor(taskId: TaskId): Promise<{ fingerprint: string; incident: string; diagnostic: FaultDiagnostic } | undefined> {
-    const episodes = await this.faults.episodesOfTask(taskId);
-    const stopped = episodes.find(episode => episode.state === 'exhausted' || episode.state === 'stopped');
-    if (!stopped) return undefined;
-    const repair = await this.faults.repair(stopped.incident);
-    const diagnostic = repair?.diagnostic;
-    if (!diagnostic) return undefined;
-    return { fingerprint: stopped.fingerprint, incident: stopped.incident, diagnostic };
-  }
-
-  /**
-   * The repair task of an exhausted fault. It is an ordinary engineering task with the structured diagnostic as
-   * its context, created by the manager who is handling the source task, so it enters the normal queue with the
-   * usual review rather than as an owner gate. The create carries a business key, so the chain exists exactly
-   * once no matter how often the budget is exhausted.
-   */
-  private async createFaultRepairTask(credential: Credential, sourceTaskId: TaskId, incident: string, fingerprint: string, diagnostic: FaultDiagnostic, round: number): Promise<TaskId> {
-    const source = await this.db.select<TaskRow>(id('task', sourceTaskId));
-    const title = `故障修复 ${diagnostic.phase}/${diagnostic.hop} ${diagnostic.errno}`;
-    const context = [
-      'SYS04 故障修复任务：一次恢复预算耗尽后的修复链（同一 incident 的每一轮各一个任务）。',
-      `incident=${incident}`,
-      `fingerprint=${fingerprint}`,
-      `phase=${diagnostic.phase} hop=${diagnostic.hop} errno=${diagnostic.errno} httpClass=${diagnostic.httpClass} status=${diagnostic.status ?? '-'}`,
-      `attempts=${diagnostic.attempts}/${diagnostic.maxAttempts} elapsedMs=${diagnostic.elapsedMs} retryability=${diagnostic.retryability}`,
-      `diagnosis: ${diagnostic.guidance}`,
-      `sourceTask=${sourceTaskId}`,
-      `round=${round}`,
-      source?.goal ? `goal=${asId(source.goal)}` : '',
-    ].filter(Boolean).join('\n');
-    // Round one keeps the key its chain was created with; a later round is a new task with its own key.
-    const repairKey = round > 1 ? `fault-repair:${incident}:${round}` : `fault-repair:${incident}`;
-    try {
-      const view = await this.createTaskRecord(credential, {
-        title,
-        context,
-        executorRole: 'engineering',
-        reviewerRole: 'qa',
-        ...(source?.goal ? { goalId: asId(source.goal) } : {}),
-        workIntent: { kind: 'read' },
-        idempotencyKey: repairKey,
-      }, { repairKey });
-      return view.id;
-    } catch (error) {
-      // The chain of this incident already exists — another source task exhausted the same cause at the same
-      // time, or the ledger was cleaned up while the task was not. The repair is shared: link to it instead of
-      // failing the resume of the second task.
-      if (!(error instanceof CompanyError) || error.code !== 'conflict') throw error;
-      const prior = await this.db.select<IdempotencyRow>(this.businessIdemId('create', repairKey));
-      const existing = prior?.result?.id === undefined ? undefined : asId(prior.result.id);
-      if (!existing) throw error;
-      return existing;
-    }
-  }
-
   private async recordQuotaGate(credential: Credential, taskId: TaskId, until: number | undefined): Promise<void> {
     if (until === undefined) {
       await this.db.query('UPDATE ONLY $task SET quota_resets_at = NONE;', { task: id('task', taskId) });
@@ -4699,342 +2570,48 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return this.worktrees?.listAudits(limit) ?? [];
   }
 
-  private async validateExecutionWindow(taskId: string, raw: unknown) {
-    const window = parseExecutionWindow(raw);
-    if (windowExpired(window)) throw new CompanyError('invalid', 'Execution window expired; resample and independently approve a fresh candidate');
-    const [facts] = await this.db.query<[Array<{ state: string; goal?: RecordId; digest?: string; expiry?: string }>]>(
-      `SELECT state, goal, (SELECT VALUE digest FROM internal_ai_candidate WHERE task = $approval)[0] AS digest, (SELECT VALUE evidence_expires_at FROM internal_ai_candidate WHERE task = $approval)[0] AS expiry FROM $approval;`,
-      { approval: id('task', window.approvalTask) });
-    const task = await this.db.select<TaskRow>(id('task', taskId));
-    const approved = facts?.[0];
-    if (!task || !approved || approved.state !== 'done' || normalizedId(approved.goal) !== normalizedId(task.goal) ||
-        approved.digest !== window.configurationDigest || approved.expiry !== window.evidenceExpiresAt || !(task.dependencies ?? []).some(d => asId(d) === window.approvalTask))
-      throw new CompanyError('invalid', 'Execution window requires a completed independent approval dependency and matching candidate digest');
-    return window;
-  }
+
 
   async resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView> {
     return echoTask(await this.resumeRecord(credential, taskId, evidence));
   }
 
-  async resumeStandby(credential: Credential, taskId: TaskId, evidence: Evidence, standbyEmployee: string): Promise<TaskView> {
-    return echoTask(await this.resumeRecord(credential, taskId, evidence, { standbyEmployee }));
-  }
-
-  /**
-   * FV06 P1：受控只读预检 verify_standby。对每对（任务，员工）在一个只读判定里复用 standby 直派的
-   * 全部前置（resume 与本预检共用 standbyAdmission，二者不会漂移），逐项返回 {ok, code}。
-   * 不写任务状态、不耗预算；每个条目写一条 audit action='verify_standby' 留痕。
-   * 预检通过只证明「此刻各项判定成立」，不构成派工承诺；真实接力以 resume 的 standby 事务写入为准。
-   */
-  async verifyStandby(credential: Credential, input: { items: Array<{ taskId: string; employeeId: string; executionWindow?: import('./task-recovery.ts').ExecutionWindow }>; idempotencyKey: string }):
-  Promise<{ items: Array<{ taskId: string; employeeId: string; ok: boolean; code?: string; message?: string }>; note: string; protocol: string }> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'verify_standby requires owner');
-    if (!Array.isArray(input.items) || input.items.length === 0 || input.items.length > 20)
-      throw new CompanyError('invalid', 'items must list 1..20 {taskId, employeeId} pairs');
-    for (const item of input.items) {
-      if (!item || typeof item.taskId !== 'string' || !item.taskId || typeof item.employeeId !== 'string' || !item.employeeId)
-        throw new CompanyError('invalid', 'each item needs taskId and employeeId');
-    }
-    if (typeof input.idempotencyKey !== 'string' || input.idempotencyKey.length < 4 || input.idempotencyKey.length > 200)
-      throw new CompanyError('invalid', 'Invalid idempotencyKey');
-    // R4（复验）：幂等键真参与幂等——同一（老板，键）重放返回已记录结果且不再写重复审计；
-    // 同键不同 items 视为键复用冲突（与任务写路径的 replay 语义一致）。
-    const marker = id('company_meta', `verify_standby_${HASH(`${actor.employeeId}\0verify_standby\0${input.idempotencyKey}`).slice(0, 24)}`);
-    const payloadDigest = HASH(JSON.stringify({ items: input.items }));
-    const prior = await this.db.select<{ payload_digest?: string; result?: { items: Array<{ taskId: string; employeeId: string; ok: boolean; code?: string; message?: string }>; note: string; protocol: string } }>(marker);
-    if (prior?.result) {
-      if (prior.payload_digest !== payloadDigest) throw new CompanyError('conflict', 'Idempotency key reused with different input');
-      return prior.result;
-    }
-    const items = [];
-    for (const item of input.items) {
-      const verdict = await this.standbyAdmission(item.taskId, item.employeeId, item.executionWindow);
-      items.push({ taskId: item.taskId, employeeId: item.employeeId, ok: verdict.ok,
-        ...(verdict.ok ? {} : { code: verdict.code, message: verdict.message }) });
-      await this.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: 'verify_standby', evidence: $evidence, at: time::now() };`, {
-        task: id('task', item.taskId), actor: id('employee', actor.employeeId),
-        evidence: JSON.stringify({ taskId: item.taskId, employeeId: item.employeeId, ok: verdict.ok,
-          ...(verdict.ok ? {} : { code: verdict.code }), protocol: STANDBY_RELAY_PROTOCOL }).slice(0, 2000),
-      });
-    }
-    const response = { items, note: '只读预检：仅证明此刻各项判定通过，不构成派工承诺，不保证待命期内额度与在岗；真实接力以 resume 的 standby 事务写入为准。', protocol: STANDBY_RELAY_PROTOCOL };
-    await this.db.query('UPSERT ONLY $marker CONTENT { payload_digest: $digest, result: $result, at: time::now() };',
-      { marker, digest: payloadDigest, result: response });
-    return response;
-  }
-
-  /**
-   * FV06 P0：standby 直派的前置判定。resume 与 verify_standby 同源共用；逐项只读评估，返回第一项
-   * 不满足的检查（code + 说明），全过返回 ok。这里不写任何任务状态；事务内的 CAS 守卫仍会复核
-   * 员工/角色/活动任务/策略 epoch，读后变化拒绝写入。额度与健康判定走 provider-admission，与调度器
-   * 的 per-def 闸门（roleCapacity）同一份逻辑与同一份数据。
-   */
-  private async standbyAdmission(taskId: TaskId, employeeId: string, window?: import('./task-recovery.ts').ExecutionWindow): Promise<{ ok: true } | { ok: false; code: string; message: string }> {
-    const deny = (code: string, message: string): { ok: false; code: string; message: string } => ({ ok: false, code, message });
-    const [empRows] = await this.db.query<[Array<{ role: Role; provider?: string; revoked?: boolean; retired?: boolean; workspace_scope?: string; active_task?: RecordId; def?: RecordId; capabilities?: string[] }>]>('SELECT role, provider, revoked, retired, workspace_scope, active_task, def, capabilities FROM $employee;', { employee: id('employee', employeeId) });
-    const emp = empRows?.[0];
-    if (!emp || emp.revoked === true || emp.retired === true) return deny('standby_employee_unavailable', '待命员工不存在或已撤销/退役');
-    // claimLease 的执行相位要求 execute 能力（R2）：缺能力的直派只会成为死租约。
-    if (!(emp.capabilities ?? []).includes('execute')) return deny('standby_capability_denied', '待命员工没有 execute 能力');
-    let defTracks: string[] = [];
-    let quotaLimited: boolean | undefined;
-    if (emp.def) {
-      const [defRows] = await this.db.query<[Array<{ tracks?: string[]; quota_limited?: boolean }>]>('SELECT tracks, quota_limited FROM $def;', { def: emp.def });
-      defTracks = defRows?.[0]?.tracks ?? [];
-      quotaLimited = defRows?.[0]?.quota_limited;
-    }
-    const task = await this.taskRowWithProject(taskId);
-    if (!task) return deny('task_not_found', '任务不存在');
-    if (task.executor_role !== emp.role) return deny('standby_role_denied', `待命员工岗位 ${emp.role} 与任务执行岗 ${task.executor_role} 不符`);
-    const goalScope = task.goal ? String((task.goal as RecordId).id) : 'maintenance';
-    if (emp.workspace_scope && emp.workspace_scope !== goalScope) return deny('standby_workspace_denied', '待命员工会话属于另一个目标的会话域');
-    if (emp.active_task && String(emp.active_task.id) !== taskId) {
-      const [activeRows] = await this.db.query<[Array<{ current_employee?: string; lease_expires_at?: number }>]>('SELECT current_employee, lease_expires_at FROM $active;', { active: emp.active_task });
-      const active = activeRows?.[0];
-      if (active?.current_employee === employeeId && (active.lease_expires_at ?? 0) > Date.now() / 1000)
-        return deny('standby_employee_busy', '待命员工仍持有另一任务的活动租约');
-    }
-    if (task.discipline) {
-      const required = REQUIRED_TRACKS[emp.role];
-      if (required !== undefined) {
-        if (task.discipline !== required || !defTracks.includes(required)) return deny('discipline_track_denied', '必配轨岗位与任务轨不符');
-      } else if (defTracks.length > 0 && !defTracks.includes(task.discipline)) return deny('discipline_track_denied', '编制轨不覆盖任务轨');
-    }
-    const contrib = await readContributionView(this.db, taskId);
-    // 执行相位的回避与 claimLease 同源：作者级 excluded 只挡复核相位；执行相位靠实现人绑定与独立性闸门。
-    if (task.executor_role === 'engineering') {
-      if (contrib.facts.ambiguous) return deny('implementer_unresolved', '实现人未定，需老板接管');
-      if (contrib.facts.implementer && contrib.facts.implementer !== employeeId) return deny('bound_to_another_implementer', '任务已绑定其他实现人');
-    }
-    // 依赖预检（R2，复验）：与 resume 事务同一解析与未满足判定，verify_standby 不再对依赖未满足返回 ok。
-    if ((task.dependencies ?? []).length > 0) {
-      const responses = await this.db.query(`
-        LET $parent = SELECT * FROM ONLY $task;
-        ${RESOLVE_DEP_SQL('$parent.dependencies', '$rd')}
-        SELECT VALUE id FROM task WHERE id IN $rd_resolved AND ${depUnsatisfiedFor('$parent')};`,
-        { task: id('task', taskId) }).responses();
-      const last = responses?.at(-1);
-      if (!last?.success) return deny('dependencies_unreadable', '依赖解析读取失败，按失败关闭拒绝直派');
-      const unmet = (last.result as unknown[] | undefined) ?? [];
-      if (unmet.length > 0) return deny('dependencies_unmet', `仍有 ${unmet.length} 项依赖未完成；直派必须等待依赖全部完成`);
-    }
-    const policyChain = this.chainOfRow(task);
-    const { contract: policyContract, epoch: policyEpochAtClaim } = await this.effectiveContractFor(policyChain);
-    const currentView = view(task);
-    const verdict = dispatchVerdict({ state: task.state, executorRole: currentView.executorRole, kind: currentView.kind,
-      ...(currentView.goalId ? { goalId: currentView.goalId } : {}),
-      ...(currentView.workIntent ? { workIntent: currentView.workIntent } : {}),
-      ...(task.policy_hash ? { policyHash: task.policy_hash } : {}),
-      ...(task.policy_block_reason ? { policyBlockReason: task.policy_block_reason } : {}),
-      registeredDomains: registeredDomainsOf(task) }, policyContract);
-    if (verdict.verdict === 'blocked') return deny('policy_blocked', `策略拒绝派工：${verdict.reason}（policy v${policyContract.version} hash=${policyContract.hash.slice(0, 16)}）`);
-    try {
-      await this.refuseIndependent(await this.independenceGate(taskId, currentView.independence, 'execute'), employeeId);
-    } catch (error) {
-      return deny('independence_denied', error instanceof CompanyError ? error.message : '独立性闸门拒绝');
-    }
-    // resume 路径传的是本次要绑定的窗口（事务提交前任务行还没有）；verify_standby 用任务行上已登记的窗口。
-    const bound = window ?? task.execution_window;
-    if (!bound || windowExpired(bound)) return deny('execution_window_invalid', '任务没有有效执行窗口；standby 直派必须绑定未过期的独立批准窗口');
-    const [healthRows] = await this.db.query<[Array<{ id: RecordId; state: 'healthy' | 'exhausted'; until?: number; last_error?: string }>]>('SELECT id, state, until, last_error FROM provider_health;');
-    const health = new Map((healthRows ?? []).map(r => [asId(r.id), { state: r.state, until: r.until, lastError: r.last_error }]));
-    const quotaRows = await readProviderQuotas(this.db);
-    const [cfgRows] = await this.db.query<[Array<{ quota_floor_pct?: number; quota_weekly_floor_pct?: number }>]>('SELECT quota_floor_pct, quota_weekly_floor_pct FROM company_meta:config;');
-    const floors = { quotaFloorPct: typeof cfgRows?.[0]?.quota_floor_pct === 'number' ? cfgRows[0]!.quota_floor_pct! : 8,
-      quotaWeeklyFloorPct: typeof cfgRows?.[0]?.quota_weekly_floor_pct === 'number' ? cfgRows[0]!.quota_weekly_floor_pct! : 6 };
-    const admission = providerAdmission({ provider: emp.provider, quotaLimited: quotaLimited === false ? false : undefined },
-      { health, quotaRows, floors, now: Math.floor(Date.now() / 1000) });
-    if (!admission.ok) return deny('standby_provider_blocked', `待命员工的订阅不可用：${admission.reason ?? 'unknown'}`);
-    return { ok: true };
-  }
-
   private async resumeRecord(credential: Credential, taskId: TaskId, evidence: Evidence,
-    options: { businessScope?: boolean; standbyEmployee?: string } = {}): Promise<TaskView> {
+    options: { businessScope?: boolean } = {}): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner can resume');
     requireText(evidence.text, 'evidence', 20, 30000);
-    // SYS03 AC02/AC05（QA V4）：处置驱动的 resume 由业务键标识，而不是由「谁发的」标识。换一位老板接手同
-    // 一个 episode 重放时，幂等身份必须与发起人无关，否则这里查不到记录、又会拿旧版本去撞任务版本 CAS 而卡住。
     const idem = options.businessScope
       ? this.businessIdemId('resume', evidence.idempotencyKey)
       : this.idemId(actor.employeeId, 'resume', evidence.idempotencyKey);
-    const standbyEmployee = options.standbyEmployee;
-    const digest = HASH(JSON.stringify({ taskId, evidence, ...(standbyEmployee ? { standbyEmployee } : {}) }));
+    const digest = HASH(JSON.stringify({ taskId, evidence }));
     const replay = await this.replay(idem, digest);
     if (replay) return replay;
     const before = await this.db.select<TaskRow>(id('task', taskId));
     if (!before) throw new CompanyError('not_found', 'Task not found');
-    if (before.state === 'blocked' && before.wait_state === 'waiting') {
-      throw new CompanyError('conflict', '任务在等待中；请先 cancel_wait（授权取消）或由受信事件解除，不能用 resume 跳过等待条件');
-    }
-    const executionWindow = evidence.executionWindow === undefined ? before.execution_window : await this.validateExecutionWindow(taskId, evidence.executionWindow);
-    if (windowExpired(executionWindow)) throw new CompanyError('invalid', 'Execution window expired; defer for a fresh approval instead of resuming');
-    if (before.state === 'blocked') {
-      const target = before.resume_state ?? 'ready';
-      if (!['ready', 'doing', 'review'].includes(target)) {
-        throw new CompanyError('invalid', `Unknown resume phase: ${target}`);
-      }
-      if (target === 'review') await this.requireProvableReviewWait(id('task', taskId), before);
-    }
-    if (before.recovery_stopped && !(evidence.executionWindow && before.execution_window?.approvalTask !== executionWindow?.approvalTask)) throw new CompanyError('invalid', 'Automatic recovery stopped; add real prerequisites or a new independent approval before resuming');
-    // SYS04 AC04: a resume may not walk past a fault whose recovery stopped — the budget is spent, or the cause
-    // cannot be recovered at all. The task waits for the one repair chain of that incident instead; the manager is
-    // not asked to approve the same failure again.
-    await this.liftRepairedFaults(taskId, this.faultClock());
-    const stopped = await this.blockedFaultFor(taskId);
-    if (stopped) {
-      const repairTaskId = await this.faults.ensureRepair({
-        incident: stopped.incident, fingerprint: stopped.fingerprint, sourceTaskId: taskId,
-        diagnostic: stopped.diagnostic, now: this.faultClock(),
-        createTask: ({ round }) => this.createFaultRepairTask(credential, taskId, stopped.incident, stopped.fingerprint, stopped.diagnostic, round),
-      });
-      const deferred = await this.deferTaskUntilRecord(credential, {
-        taskId,
-        dependencies: [repairTaskId],
-        text: `恢复已停止（${stopped.diagnostic.phase}/${stopped.diagnostic.hop} ${stopped.diagnostic.errno}，${stopped.diagnostic.attempts}/${stopped.diagnostic.maxAttempts} 次）：已建唯一修复链 ${repairTaskId}，原任务等待该修复完成后再继续`,
-        idempotencyKey: `fault-source:${taskId}:${repairTaskId}`,
-        expectedVersion: before.version,
-      }, { businessScope: true });
-      return deferred;
-    }
-    // FV06 P0：standby 直派——恢复相位直接 doing 并原子指派待命持有人。窗口必填（standby 预算以
-    // notAfter 封顶）；全部前置在事务外逐项判定，任一不满足直接 invalid，任务留在 blocked 不做部分写入。
-    let standbyAssignment: WorktreeAssignment | undefined;
-    let standbyPolicy: { version: number; hash: string; epoch: number } | undefined;
-    if (standbyEmployee) {
-      if (!evidence.executionWindow) throw new CompanyError('invalid', 'standby resume requires an execution window');
-      const admission = await this.standbyAdmission(taskId, standbyEmployee, evidence.executionWindow);
-      if (!admission.ok) throw new CompanyError('invalid', `standby denied (${admission.code}): ${admission.message}`);
-      // workIntent 工作区语义：直派与 claimLease 同一登记——同一把 repo 锁内走 registry.allocate，
-      // 事务内写入 worktree + worktree_ref；不新建未授权现场，也不绕过登记。
-      if (this.worktrees) {
-        const project = await this.taskProject(taskId);
-        const fresh = await this.db.select<TaskRow>(id('task', taskId));
-        if (!fresh) throw new CompanyError('not_found', 'Task not found');
-        const standbyPrincipal = { employeeId: standbyEmployee, role: view(fresh).executorRole, capabilities: [] } as Principal;
-        standbyAssignment = await this.worktrees.locked(fresh.code_repo_path ?? project?.repoPath ?? this.worktrees.options.opsRepo, async (repo, list) => {
-          const reloaded = await this.db.select<TaskRow>(id('task', taskId));
-          if (!reloaded) throw new CompanyError('not_found', 'Task not found');
-          const allocProject = reloaded.code_repo_path ? await this.projectForRepo(repo) : project;
-          return this.worktrees!.allocate(repo, list, view(reloaded), standbyPrincipal, allocProject);
-        });
-      }
-      const policyRow = await this.taskRowWithProject(taskId);
-      if (!policyRow) throw new CompanyError('not_found', 'Task not found');
-      const { contract, epoch } = await this.effectiveContractFor(this.chainOfRow(policyRow));
-      standbyPolicy = { version: contract.version, hash: contract.hash, epoch };
-    }
     try {
-      const standbyBudgetSeconds = standbyEmployee
-        ? await this.db.query<[Array<{ standby_budget_seconds?: number }>]>('SELECT standby_budget_seconds FROM company_meta:config;')
-            .then(([rows]) => {
-              // R4（复验）：预算 clamp 到租约长度——配置大于 leaseSeconds 时租约会先死、唤醒循环
-              // 反复 adoptLease 失败并孤儿化交付物；deadline 永不晚于租约到期。
-              const configured = typeof rows?.[0]?.standby_budget_seconds === 'number' && rows[0]!.standby_budget_seconds! > 0
-                ? rows[0]!.standby_budget_seconds! : STANDBY_BUDGET_SECONDS_DEFAULT;
-              return Math.min(configured, this.leaseSeconds);
-            })
-        : STANDBY_BUDGET_SECONDS_DEFAULT;
       const row = await this.txTask(`BEGIN;
         LET $who = SELECT * FROM ONLY $actor;
         LET $t = SELECT * FROM ONLY $task;
-        LET $now = time::unix(time::now());
         IF $who.revoked = true OR $who.role != 'owner' OR $t = NONE OR $t.state != 'blocked' { THROW 'resume denied' };
         IF $t.version != $expected_version { THROW 'task version moved' };
-        IF $t.recovery_stopped = true AND !$new_window { THROW 'automatic recovery stopped' };
-        IF $t.wait_state = 'waiting' { THROW 'task is waiting: cancel or resolve the wait first' };
-        IF $standby != NONE {
-          IF $standby_record = NONE OR $standby_record.revoked = true OR $standby_record.retired = true { THROW 'standby employee unavailable' };
-          IF $standby_record.role != $t.executor_role { THROW 'standby role denied' };
-          IF $standby_record.active_task != NONE AND $standby_record.active_task != $task {
-            LET $active = SELECT * FROM ONLY $standby_record.active_task;
-            IF $active != NONE AND $active.lease_expires_at > $now AND $active.current_employee = $standby { THROW 'standby employee already has active task' };
-          };
-          LET $policy_epoch_now = (SELECT VALUE value FROM ONLY company_meta:policy_epoch) ?? 0;
-          IF $policy_epoch_now != $expected_policy_epoch { THROW 'policy moved: the effective contract moved since the resume was read' };
-        };
-        IF $execution_window != NONE {
-          IF <datetime>$execution_window.notAfter <= time::now() { THROW 'execution window expired' };
-          LET $approval = type::record('task', $execution_window.approvalTask);
-          LET $approved = SELECT * FROM ONLY $approval;
-          LET $candidate = SELECT * FROM internal_ai_candidate WHERE task = $approval;
-          IF $approved.state != 'done' OR $approval NOT IN $t.dependencies OR array::len($candidate) != 1 OR
-            $candidate[0].digest != $execution_window.configurationDigest OR $candidate[0].evidence_expires_at != $execution_window.evidenceExpiresAt {
-            THROW 'execution approval moved';
-          };
-        };
-        ${RESOLVE_DEP_SQL('$t.dependencies', '$r_dep')}
-        LET $remaining = SELECT * FROM task WHERE id IN $r_dep_resolved AND ${depUnsatisfiedFor('$t')};
-        IF $standby != NONE AND array::len($remaining) > 0 { THROW 'standby denied: unmet dependencies remain' };
-        LET $assigned = $standby != NONE;
-        LET $source_phase = $t.resume_state ?? 'ready';
-        LET $restore_phase = IF $source_phase = 'doing' THEN 'ready' ELSE $source_phase END;
-        LET $restore_phase_final = IF $assigned THEN 'doing' ELSE $restore_phase END;
-        // FV06 P0：standby_until = min(窗口 notAfter, now + standbyBudgetSeconds)；progress_at 同步写 now，
-        // 消除 stall 分支把刚待命的任务误判为停滞。
-        LET $standby_until = IF $assigned THEN math::min([$standby_not_after, $now + $standby_budget]) ELSE NONE END;
+        LET $restore_phase = $t.resume_state ?? 'ready';
         LET $next = UPDATE ONLY $task SET
-          state = IF array::len($remaining) = 0 THEN $restore_phase_final ELSE 'blocked' END,
-          resume_role = IF array::len($remaining) = 0 THEN NONE ELSE $t.resume_role END,
-          resume_state = IF array::len($remaining) = 0 THEN NONE ELSE $t.resume_state END,
-          blocked_to = NONE, dependency_continuation = NONE, execution_window = $execution_window,
-          recovery_stopped = IF $new_window THEN NONE ELSE $t.recovery_stopped END,
-          current_employee = IF $assigned THEN $standby ELSE NONE END,
-          delivery_id = IF $assigned THEN $standby_delivery ELSE NONE END,
-          lease_expires_at = IF $assigned THEN $now + $standby_lease_seconds ELSE NONE END,
-          fence = IF $assigned THEN $t.fence + 1 ELSE $t.fence END,
-          progress_at = IF $assigned THEN $now ELSE $t.progress_at END,
-          standby_until = IF $assigned THEN $standby_until ELSE NONE END,
-          implementer = IF $assigned AND $t.executor_role = 'engineering' AND $t.implementer = NONE THEN $standby ELSE $t.implementer END,
-          worktree = IF $assignment != NONE THEN $assignment ELSE $t.worktree END,
-          lease_policy_version = IF $assigned THEN $policy_version ELSE $t.lease_policy_version END,
-          lease_policy_hash = IF $assigned THEN $policy_hash ELSE $t.lease_policy_hash END,
-          version = $t.version + 1 RETURN AFTER;
-        IF $assigned {
-          UPDATE ONLY $standby_record SET active_task = $task;
-          IF $assignment != NONE {
-            UPDATE ONLY $tree SET last_used_at = time::now();
-            UPSERT ONLY $reference CONTENT { task: $task, tree: $tree, employee: $standby,
-              delivery: $standby_delivery, fence: $next.fence, intent: $assignment.intent, at: time::now() };
-          };
-          IF $t.executor_role = 'engineering' AND $t.implementer = NONE {
-            CREATE ONLY $standby_bound_audit CONTENT { task: $task, actor: $standby_record, action: 'implementer_bound', phase: 'execute', version: $next.version, at: time::now() };
-          };
-        };
-        IF $new_window {
-          CREATE audit CONTENT { task: $task, actor: $actor, action: 'recovery_progress', evidence: '绑定新独立批准及有效执行窗口', at: time::now() };
-        };
-        IF $assigned {
-          CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'resume', evidence: $evidence, version: $next.version, at: time::now(),
-            source_phase: $source_phase, restore_phase: $restore_phase_final, result: $next.state,
-            standby: $standby, standby_until: $next.standby_until, lease_expires_at: $next.lease_expires_at };
-        } ELSE {
-          CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'resume', evidence: $evidence, version: $next.version, at: time::now(),
-            source_phase: $source_phase, restore_phase: $restore_phase, result: $next.state };
-        };
+          state = IF $restore_phase = 'doing' THEN 'ready' ELSE $restore_phase END,
+          resume_role = NONE, resume_state = NONE, blocked_to = NONE,
+          version += 1 RETURN AFTER;
+        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'resume', evidence: $evidence, version: $next.version, at: time::now(),
+          result: $next.state };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        IF $assigned {
-          CREATE ONLY $outbox CONTENT { task: $task, kind: 'resumed', sequence: $sequence.value,
-            payload: { state: $next.state, source_phase: $source_phase, restore_phase: $restore_phase_final,
-              employee: $standby, standbyUntil: $next.standby_until }, at: time::now() };
-        } ELSE {
-          CREATE ONLY $outbox CONTENT { task: $task, kind: 'resumed', sequence: $sequence.value,
-            payload: { state: $next.state, source_phase: $source_phase, restore_phase: $restore_phase }, at: time::now() };
-        };
+        CREATE ONLY $outbox CONTENT { task: $task, kind: 'resumed', sequence: $sequence.value,
+          payload: { state: $next.state }, at: time::now() };
         CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
         RETURN $next;
         COMMIT;`, {
-        actor: id('employee', actor.employeeId), task: id('task', taskId), evidence: evidence.text, execution_window: executionWindow, expected_version: before.version, new_window: evidence.executionWindow !== undefined && before.execution_window?.approvalTask !== executionWindow?.approvalTask,
-        standby: standbyEmployee, standby_record: standbyEmployee ? id('employee', standbyEmployee) : undefined,
-        standby_delivery: standbyEmployee ? randomUUID() : undefined, standby_lease_seconds: this.leaseSeconds,
-        standby_not_after: standbyEmployee ? Math.floor(Date.parse(executionWindow!.notAfter) / 1000) : 0,
-        standby_budget: standbyBudgetSeconds,
-        assignment: standbyAssignment, tree: standbyAssignment ? id('worktree', standbyAssignment.id) : undefined,
-        reference: id('worktree_ref', taskId), standby_bound_audit: id('audit', randomUUID()),
-        policy_version: standbyPolicy?.version, policy_hash: standbyPolicy?.hash, expected_policy_epoch: standbyPolicy?.epoch,
-        idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+        actor: id('employee', actor.employeeId), task: id('task', taskId), evidence: evidence.text,
+        expected_version: before.version,
+        audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+        idem, digest,
       });
       return view(row);
     } catch (error) {
@@ -5043,481 +2620,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       throw error;
     }
   }
-
-  /**
-   * A review-phase wait is legal only when the row carries a real submitted review:
-   * the submitter matches the latest submit audit, the submit snapshot is not newer than
-   * the task, and the latest block is a review-phase block by the reviewer role. A
-   * non-owner reviewer is required; owner gates, cross-role rows and unreadable/missing
-   * history fail closed. Read-only.
-   */
-  private async requireProvableReviewWait(taskRef: RecordId, row: {
-    reviewer_role: ReviewerRole; submitted_by?: string; resume_role?: string; version: number;
-  }): Promise<void> {
-    if (row.reviewer_role === 'owner') throw new CompanyError('invalid', 'review wait does not apply to owner review gates');
-    if (!row.submitted_by) throw new CompanyError('invalid', 'review wait has no original submission');
-    if (row.resume_role && row.resume_role !== row.reviewer_role) {
-      throw new CompanyError('invalid', 'review wait role does not match the reviewer role');
-    }
-    const [subRows] = await this.db.query<[Array<{ id: RecordId; actor: unknown; version?: number; at: unknown }>]>(
-      "SELECT id, actor, version, at FROM audit WHERE task = $task AND action = 'submit' ORDER BY at DESC LIMIT 1;", { task: taskRef });
-    const submission = subRows?.[0];
-    if (!submission || normalizedId(submission.actor) !== row.submitted_by) {
-      throw new CompanyError('invalid', 'review wait lacks a matching original submission');
-    }
-    if (submission.version === undefined || submission.version > row.version) {
-      throw new CompanyError('invalid', 'review submission snapshot is newer than the task');
-    }
-    const [blockRows] = await this.db.query<[Array<{ id: RecordId; actor: unknown; version?: number; at: unknown; phase?: string }>]>(
-      "SELECT id, actor, version, at, phase FROM audit WHERE task = $task AND action = 'block' ORDER BY at DESC LIMIT 1;", { task: taskRef });
-    const latestBlock = blockRows?.[0];
-    if (!latestBlock || latestBlock.phase !== 'review') {
-      throw new CompanyError('invalid', 'review block history is not provable');
-    }
-    const submittedAt = Date.parse(String(submission.at));
-    const blockedAt = Date.parse(String(latestBlock.at));
-    if (!Number.isFinite(submittedAt) || !Number.isFinite(blockedAt) || blockedAt <= submittedAt) {
-      throw new CompanyError('invalid', 'review block history predates the original submission');
-    }
-    const blockActor = latestBlock.actor instanceof RecordId ? await this.db.select<EmployeeRow>(latestBlock.actor) : undefined;
-    if (!blockActor || blockActor.role !== row.reviewer_role) {
-      throw new CompanyError('invalid', 'review block actor does not match the reviewer role');
-    }
-  }
-
-  /**
-   * The dependency graph used by defer's cycle guard. Each raw dependency is
-   * resolved through its superseded_by lineage tip before its dependencies are
-   * considered, so a chain that only becomes cyclic after revision resolution is
-   * still refused. Corrupt/missing lineage stays on the raw row (conservative).
-   */
-  private async dependencyGraph(ids: string[]): Promise<Map<string, string[]>> {
-    const graph = new Map<string, string[]>();
-    if (!ids.length) return graph;
-    type Row = { id: RecordId; dependencies?: RecordId[]; superseded_by?: RecordId; lineage?: RecordId };
-    const [rows] = await this.db.query<[Row[]]>(
-      'SELECT id, dependencies, superseded_by, lineage FROM task WHERE id IN $ids;',
-      { ids: ids.map(d => id('task', d)) });
-    const all: Row[] = [...(rows ?? [])];
-    const lineages = [...new Set(all.filter(row => row.superseded_by && row.lineage).map(row => normalizedId(row.lineage)))];
-    const tips = new Map<string, string>();
-    if (lineages.length) {
-      const [tipRows] = await this.db.query<[Array<{ id: RecordId; lineage: RecordId }>]>(
-        'SELECT id, lineage FROM task WHERE lineage IN $lineages AND superseded_by = NONE;',
-        { lineages: lineages.map(lineage => id('task', lineage)) });
-      for (const tip of tipRows ?? []) tips.set(normalizedId(tip.lineage), normalizedId(tip.id));
-    }
-    const present = new Set(all.map(row => normalizedId(row.id)));
-    const missingTips = [...new Set([...tips.values()].filter(tip => !present.has(tip)))];
-    if (missingTips.length) {
-      const [tipRows] = await this.db.query<[Row[]]>(
-        'SELECT id, dependencies, superseded_by, lineage FROM task WHERE id IN $ids;',
-        { ids: missingTips.map(tip => id('task', tip)) });
-      all.push(...(tipRows ?? []));
-    }
-    const byId = new Map(all.map(row => [normalizedId(row.id), row]));
-    for (const row of all) {
-      const rawId = normalizedId(row.id);
-      const lineage = row.lineage ? normalizedId(row.lineage) : '';
-      const tip = row.superseded_by && lineage ? tips.get(lineage) : undefined;
-      const source = tip ? byId.get(tip) ?? row : row;
-      graph.set(tip ?? rawId, (source.dependencies ?? []).map(normalizedId));
-    }
-    return graph;
-  }
-
-  /**
-   * owner only: re-point a owner block at the dependency graph. Execute blocks keep their old
-   * behaviour (wait blocked, restore ready). A normal non-owner review block — one backed
-   * by a real submit and a reviewer block in the audit stream — may also be deferred: the
-   * original submission, submitter, implementer and contributor facts stay untouched, and
-   * the task returns to 'review' under a fresh claim when the last dependency finishes.
-   * Owner gates, unprovable review history, live leases and closed goals are refused, not
-   * guessed; with every dependency already done the target phase is restored immediately.
-   */
-  async deferTaskUntil(credential: Credential, input: DeferTaskUntil): Promise<TaskView> {
-    return echoTask(await this.deferTaskUntilRecord(credential, input));
-  }
-
-  private async deferTaskUntilRecord(credential: Credential, input: DeferTaskUntil,
-    options: { businessScope?: boolean } = {}): Promise<TaskView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may defer blocked tasks');
-    requireText(input.taskId, 'task', 1, 200);
-    requireText(input.text, 'text', 20, 8000);
-    requireText(input.idempotencyKey, 'idempotencyKey', 1, 200);
-    if (input.expectedVersion !== undefined && !Number.isSafeInteger(input.expectedVersion)) {
-      throw new CompanyError('invalid', 'Invalid expectedVersion');
-    }
-    if (input.continuation !== undefined && !['execute', 'manager'].includes(input.continuation)) throw new CompanyError('invalid', 'Invalid dependency continuation');
-    const dependencies = [...new Set(input.dependencies ?? [])];
-    if (!dependencies.length || dependencies.length > 20) {
-      throw new CompanyError('invalid', 'defer requires 1-20 dependencies');
-    }
-    if (dependencies.includes(input.taskId)) throw new CompanyError('invalid', 'A task cannot wait on itself');
-    // SYS03 AC02/AC05（QA V4）：处置驱动的 defer 幂等身份按业务键算，不掺发起人的员工 ID——接管者重放
-    // 同一条决定时必须读到同一份结果，而不是撞上「任务版本已动」。
-    const idem = options.businessScope
-      ? this.businessIdemId('defer', input.idempotencyKey)
-      : this.idemId(actor.employeeId, 'defer', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ taskId: input.taskId, dependencies, text: input.text, expectedVersion: input.expectedVersion, continuation: input.continuation }));
-    const replayed = await this.replay(idem, digest);
-    if (replayed) return replayed;
-
-    const depIds = dependencies.map(dep => id('task', dep));
-    const taskRef = id('task', input.taskId);
-    // Every defer mutates the dependency graph. A durable epoch, checked and advanced
-    // inside the write transaction, serialises those mutations: a request built from an
-    // older graph cannot commit a cycle after a concurrent defer has landed.
-    const [epochRow] = await this.db.query<[{ value?: number } | undefined]>(
-      'SELECT * FROM ONLY company_meta:defer_epoch;');
-    const epochSeen = epochRow?.value ?? 0;
-
-    // Fast-fail with a readable reason plus the audit snapshot; the transaction re-checks
-    // every guard atomically, so a stale pre-read can never turn into a wrong write.
-    type DeferredRow = {
-      state: TaskState; blocked_to?: 'owner'; resume_state?: TaskState; resume_role?: string;
-      submitted_by?: string; reviewer_role: ReviewerRole; current_employee?: string;
-      lease_expires_at?: number; version: number; dependencies?: RecordId[]; goal?: RecordId; goal_state?: string; execution_window?: unknown;
-    };
-    // `FROM ONLY` yields the record itself (or NONE), not a list.
-    const [before] = await this.db.query<[DeferredRow | undefined]>(
-      'SELECT state, blocked_to, resume_state, resume_role, submitted_by, reviewer_role, current_employee, lease_expires_at, version, dependencies, goal, goal.state AS goal_state, execution_window FROM ONLY $task;',
-      { task: taskRef });
-    if (!before) throw new CompanyError('not_found', 'Task not found');
-    if (before.state !== 'blocked' || before.blocked_to !== 'owner' || !['doing', 'ready', 'review'].includes(before.resume_state ?? '')) {
-      throw new CompanyError('invalid', 'defer only applies to owner-blocked execute or normal review-phase tasks');
-    }
-    const phase = before.resume_state ?? 'ready';
-    if (phase === 'review') await this.requireProvableReviewWait(taskRef, before);
-    if (before.goal && before.goal_state !== 'active') throw new CompanyError('invalid', 'Task goal is not active');
-    if (input.expectedVersion !== undefined && before.version !== input.expectedVersion) {
-      throw new CompanyError('conflict', 'Task version moved');
-    }
-    const beforeDeps = (before.dependencies ?? []).map(normalizedId);
-    const after = [...new Set([...beforeDeps, ...dependencies])];
-    const evidence = `${input.text}\n[defer] 操作者=${actor.employeeId} 来源phase=${phase} 依赖 before=[${beforeDeps.join(', ')}] after=[${after.join(', ')}] 恢复阶段=${phase}`;
-
-    const [depRows] = await this.db.query<[Array<{ id: RecordId; goal?: RecordId }>]>(
-      'SELECT id, goal FROM task WHERE id IN $ids;', { ids: depIds });
-    const depById = new Map((depRows ?? []).map(row => [normalizedId(row.id), row]));
-    for (const dep of dependencies) {
-      const row = depById.get(dep);
-      if (!row) throw new CompanyError('not_found', `Dependency not found: ${dep}`);
-      // normalizedId maps a missing goal to '' on both sides, so goal-less tasks pair with goal-less deps.
-      if (normalizedId(row.goal) !== normalizedId(before.goal)) {
-        throw new CompanyError('invalid', 'Dependencies must live in the same goal as the task');
-      }
-    }
-    // The deferred task must not be reachable from its own new dependencies: walk the
-    // resolved dependency closure of the proposed deps (superseded_by -> lineage tip)
-    // and refuse a path back to the task.
-    const seen = new Set(dependencies);
-    let frontier = [...dependencies];
-    for (let depth = 0; frontier.length && depth < 32; depth++) {
-      const graph = await this.dependencyGraph(frontier);
-      if (graph.has(input.taskId)) throw new CompanyError('invalid', 'Dependencies would create a cycle after revision resolution');
-      const next = [...new Set([...graph.values()].flat())].filter(d => !seen.has(d));
-      if (next.includes(input.taskId)) throw new CompanyError('invalid', 'Dependencies would create a cycle');
-      for (const key of graph.keys()) seen.add(key);
-      for (const n of next) seen.add(n);
-      frontier = next;
-    }
-
-    const row = await this.txTask(`BEGIN;
-      LET $who = SELECT * FROM ONLY $actor;
-      LET $t = SELECT * FROM ONLY $task;
-      IF $who = NONE OR $who.revoked = true OR $who.role != 'owner' OR $t = NONE { THROW 'defer denied' };
-      IF $t.state != 'blocked' OR $t.blocked_to != 'owner' OR $t.resume_state NOT IN ['doing', 'ready', 'review'] { THROW 'defer denied: only owner-blocked execute or normal review-phase tasks can wait on dependencies' };
-      IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'defer denied: the task still holds an active lease' };
-      IF $t.resume_state = 'review' {
-        IF $t.reviewer_role = 'owner' OR $t.submitted_by = NONE { THROW 'defer denied: review block is not an ordinary submitted review' };
-        IF $t.resume_role != NONE AND $t.resume_role != $t.reviewer_role { THROW 'defer denied: review block role mismatch' };
-        LET $sub = SELECT * FROM audit WHERE task = $task AND action = 'submit' ORDER BY at DESC LIMIT 1;
-        IF array::len($sub) = 0 { THROW 'defer denied: original submission missing' };
-        IF $sub[0].actor != $submitted_ref OR $t.submitted_by != $submitted_by { THROW 'defer denied: original submission snapshot mismatch' };
-        IF $sub[0].version = NONE OR $sub[0].version > $t.version { THROW 'defer denied: original submission snapshot is newer than the task' };
-        LET $blk = SELECT * FROM audit WHERE task = $task AND action = 'block' ORDER BY at DESC LIMIT 1;
-        IF array::len($blk) = 0 OR $blk[0].phase != 'review' { THROW 'defer denied: original review block is not provable' };
-        IF $blk[0].at <= $sub[0].at { THROW 'defer denied: original review block predates the submission' };
-        LET $blk_actor = SELECT * FROM ONLY $blk[0].actor;
-        IF $blk_actor = NONE OR $blk_actor.role != $t.reviewer_role { THROW 'defer denied: review block actor role mismatch' };
-      };
-      LET $g = SELECT * FROM ONLY $t.goal;
-      IF $g != NONE AND $g.state != 'active' { THROW 'goal is closed' };
-      IF $expected != NONE AND $t.version != $expected { THROW 'task version moved' };
-      FOR $dep IN $dependencies {
-        LET $d = SELECT * FROM ONLY $dep;
-        IF $d = NONE OR $d.goal != $t.goal { THROW 'defer denied: dependency missing or outside the task goal' };
-      };
-      LET $merged = array::distinct(array::concat($t.dependencies ?? [], $dependencies));
-      ${RESOLVE_DEP_SQL('$merged', '$m_dep')}
-      LET $remaining = SELECT VALUE id FROM task WHERE id IN $m_dep_resolved AND ${depUnsatisfiedFor('$t')};
-      LET $epoch = SELECT * FROM ONLY company_meta:defer_epoch;
-      LET $epoch_value = $epoch.value ?? 0;
-      IF $epoch_value != $epoch_seen { THROW 'defer graph moved: retry' };
-      IF $epoch = NONE {
-        CREATE ONLY company_meta:defer_epoch CONTENT { value: 1 };
-      } ELSE {
-        UPDATE ONLY company_meta:defer_epoch SET value = $epoch_value + 1;
-      };
-      LET $new_deps = array::complement($dependencies, $t.dependencies ?? []);
-      ${RESOLVE_DEP_SQL('$new_deps', '$new_dep')}
-      LET $new_unmet = SELECT VALUE id FROM task WHERE id IN $new_dep_resolved AND ${depUnsatisfiedFor('$t')};
-      IF $t.recovery_stopped = true AND array::len($new_unmet) = 0 AND $continuation != 'manager' { THROW 'automatic recovery stopped: no new unmet prerequisite' };
-      LET $m_phase = $t.resume_state ?? 'ready';
-      LET $restore_phase = IF $m_phase = 'review' THEN 'review' ELSE 'ready' END;
-      LET $manager = $continuation = 'manager';
-      LET $next_resume_state = IF $manager OR (array::len($remaining) > 0 AND $m_phase = 'review') THEN $m_phase ELSE NONE END;
-      LET $next = UPDATE ONLY $task SET
-        dependencies = $merged,
-        state = IF array::len($remaining) = 0 AND !$manager THEN $restore_phase ELSE 'blocked' END,
-        blocked_to = IF array::len($remaining) = 0 AND $manager THEN 'owner' ELSE NONE END,
-        dependency_continuation = IF array::len($remaining) > 0 THEN $continuation ELSE NONE END,
-        resume_state = $next_resume_state,
-        resume_role = NONE,
-        current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
-        version = $t.version + 1 RETURN AFTER;
-      IF array::len($new_unmet) > 0 {
-        CREATE audit CONTENT { task: $task, actor: $actor, action: 'recovery_progress', evidence: '新增真实未完成前置，进入新恢复阶段', at: time::now() };
-        UPDATE ONLY $task SET recovery_stopped = NONE;
-      };
-      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'deferred', evidence: $evidence, version: $next.version, at: time::now(),
-        source_phase: $m_phase, restore_phase: $restore_phase, dependencies_before: $before_refs,
-        dependencies_after: $merged, result: $next.state, operator: $employee };
-      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE ONLY $outbox CONTENT { task: $task, kind: 'deferred', sequence: $sequence.value,
-        payload: { state: $next.state, source_phase: $m_phase, restore_phase: $restore_phase,
-          dependencies_before: $before_refs, dependencies_after: $merged, operator: $employee, added: $added }, at: time::now() };
-      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
-      RETURN $next;
-      COMMIT;`, {
-      actor: id('employee', actor.employeeId), employee: actor.employeeId, task: taskRef, expected: input.expectedVersion,
-      continuation: input.continuation ?? (before.execution_window ? 'manager' : 'execute'), dependencies: depIds, evidence, added: dependencies.filter(dep => !beforeDeps.includes(dep)).length,
-      before_refs: (before.dependencies ?? []).map(dep => id('task', normalizedId(dep))),
-      submitted_ref: before.submitted_by ? id('employee', before.submitted_by) : undefined,
-      submitted_by: before.submitted_by, epoch_seen: epochSeen,
-      idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
-    });
-    return view(row);
-  }
-
-  /**
-   * owner only: append real prerequisites to an existing execute-phase dependency wait. Two wait shapes
-   * qualify. A formal wait carries the SYS05 markers and a matching open task_wait row (resume phase
-   * ready). A legacy wait is what defer_task_until leaves behind: the same blocked shape with no
-   * wait row at all, resume phase ready or doing, a real deferred audit and at least one unmet
-   * dependency — the transaction then atomically builds the canonical wait row so the ordinary
-   * release path can return the task to owner. Neither shape may be a review/owner/owner block, and a
-   * live lease refuses. The existing wait reference and every existing dependency stay untouched;
-   * only new same-goal task ids are appended and dependency_continuation becomes 'manager', so a
-   * completed wait returns to 老板 instead of resuming an employee. Nothing is resumed here: faults,
-   * budgets and ordinary dispatch are not touched, and an expired execution window is still checked
-   * by the later resume.
-   */
-  async appendDependencyPrerequisites(credential: Credential, input: AppendDependencyPrerequisites): Promise<TaskView> {
-    return echoTask(await this.appendDependencyPrerequisitesRecord(credential, input));
-  }
-
-  private async appendDependencyPrerequisitesRecord(credential: Credential, input: AppendDependencyPrerequisites): Promise<TaskView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may append dependency prerequisites');
-    requireText(input.taskId, 'task', 1, 200);
-    requireText(input.text, 'text', 20, 8000);
-    requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
-    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) {
-      throw new CompanyError('invalid', 'expectedVersion must be a positive integer');
-    }
-    const dependencies = [...new Set(input.dependencies ?? [])];
-    if (!dependencies.length || dependencies.length > 20) throw new CompanyError('invalid', 'append requires 1-20 dependencies');
-    for (const dep of dependencies) requireText(dep, 'dependency', 1, 200);
-    if (dependencies.includes(input.taskId)) throw new CompanyError('invalid', 'A task cannot depend on itself');
-    // Business-keyed idempotency: a manager taking over the same decision must read the same result.
-    const idem = this.businessIdemId('append_dependency_prerequisites', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ taskId: input.taskId, dependencies, text: input.text, expectedVersion: input.expectedVersion }));
-    const replayed = await this.replay(idem, digest);
-    if (replayed) return replayed;
-
-    const taskRef = id('task', input.taskId);
-    type WaitTaskRow = {
-      state: TaskState; blocked_to?: 'owner'; resume_state?: TaskState; reviewer_role: ReviewerRole;
-      current_employee?: string; lease_expires_at?: number; version: number; dependencies?: RecordId[];
-      goal?: RecordId; goal_state?: string; wait_state?: 'waiting' | null; wait_kind?: string | null;
-      wait_episode?: string | null; wait_owner_role?: string | null; execution_window?: unknown;
-    };
-    const [before] = await this.db.query<[WaitTaskRow | undefined]>(
-      `SELECT state, blocked_to, resume_state, reviewer_role, current_employee, lease_expires_at, version,
-        dependencies, goal, goal.state AS goal_state, wait_state, wait_kind, wait_episode, wait_owner_role,
-        execution_window FROM ONLY $task;`, { task: taskRef });
-    if (!before) throw new CompanyError('not_found', 'Task not found');
-    if (before.state !== 'blocked' || before.blocked_to !== undefined) {
-      throw new CompanyError('invalid', 'append only applies to a blocked formal dependency wait; owner blocks use defer_task_until');
-    }
-    if (before.resume_state === 'review') {
-      throw new CompanyError('invalid', 'append only applies to execute-phase dependency waits; a review wait keeps its reviewer');
-    }
-    const [waitRows] = await this.db.query<[Array<{ wait_key: string; kind: string; reference_task?: RecordId }>]>(
-      `SELECT wait_key, kind, reference_task, entered_at FROM task_wait WHERE task = $task AND state IN ['waiting', 'held']
-       ORDER BY entered_at DESC LIMIT 1;`, { task: taskRef });
-    const openWait = waitRows?.[0];
-    // A formal wait carries the SYS05 markers and a matching open task_wait row. A legacy wait is
-    // what defer_task_until leaves behind: the same blocked shape with no open wait row at all and
-    // an execute resume phase; its deferred audit and unmet dependencies are verified in the
-    // transaction, which then builds the canonical wait row.
-    const formalWait = before.wait_state === 'waiting' && before.wait_kind === 'dependency' && !!openWait &&
-      openWait.wait_key === before.wait_episode && openWait.kind === 'dependency' && !!openWait.reference_task;
-    if (!formalWait) {
-      if (openWait) throw new CompanyError('invalid', 'append only applies to a blocked formal dependency wait; owner blocks use defer_task_until');
-      if (before.wait_state === 'waiting' && before.wait_kind === 'dependency') {
-        throw new CompanyError('invalid', 'The open dependency wait record is missing or no longer matches the task');
-      }
-      if (!['ready', 'doing'].includes(before.resume_state ?? '')) {
-        throw new CompanyError('invalid', 'append only applies to a blocked formal dependency wait; owner blocks use defer_task_until');
-      }
-    }
-    if (formalWait && before.resume_state !== 'ready') {
-      throw new CompanyError('invalid', 'append only applies to execute-phase dependency waits; a review wait keeps its reviewer');
-    }
-    if (before.reviewer_role === 'owner' || before.wait_owner_role === 'owner') {
-      throw new CompanyError('invalid', 'Owner-gated tasks cannot receive appended prerequisites');
-    }
-    const nowSec = Math.floor(Date.now() / 1000);
-    if (before.current_employee !== undefined && before.lease_expires_at !== undefined && before.lease_expires_at > nowSec) {
-      throw new CompanyError('conflict', 'The task still holds an active lease');
-    }
-    if (before.version !== input.expectedVersion) throw new CompanyError('conflict', 'Task version moved');
-    if (before.goal && before.goal_state !== 'active') throw new CompanyError('invalid', 'Task goal is not active');
-    if (formalWait && normalizedId(openWait!.reference_task) === input.taskId) throw new CompanyError('invalid', 'A task cannot wait on itself');
-
-    const beforeDeps = (before.dependencies ?? []).map(normalizedId);
-    const newDeps = dependencies.filter(dep => !beforeDeps.includes(dep));
-    if (!newDeps.length) throw new CompanyError('invalid', 'append requires at least one dependency that is not already present');
-
-    const depIds = dependencies.map(dep => id('task', dep));
-    const [depRows] = await this.db.query<[Array<{ id: RecordId; goal?: RecordId }>]>(
-      'SELECT id, goal FROM task WHERE id IN $ids;', { ids: depIds });
-    const depById = new Map((depRows ?? []).map(row => [normalizedId(row.id), row]));
-    for (const dep of dependencies) {
-      const row = depById.get(dep);
-      if (!row) throw new CompanyError('not_found', `Dependency not found: ${dep}`);
-      if (normalizedId(row.goal) !== normalizedId(before.goal)) {
-        throw new CompanyError('invalid', 'Dependencies must live in the same goal as the task');
-      }
-    }
-
-    // Append-only edges still mutate the graph: walk the proposed closure and serialise with the
-    // same durable epoch defer uses, so a concurrent defer/append cannot commit a cycle.
-    const [epochRow] = await this.db.query<[{ value?: number } | undefined]>(
-      'SELECT * FROM ONLY company_meta:defer_epoch;');
-    const epochSeen = epochRow?.value ?? 0;
-    const seen = new Set(dependencies);
-    let frontier = [...dependencies];
-    for (let depth = 0; frontier.length && depth < 32; depth++) {
-      const graph = await this.dependencyGraph(frontier);
-      if (graph.has(input.taskId)) throw new CompanyError('invalid', 'Dependencies would create a cycle after revision resolution');
-      const next = [...new Set([...graph.values()].flat())].filter(dep => !seen.has(dep));
-      if (next.includes(input.taskId)) throw new CompanyError('invalid', 'Dependencies would create a cycle');
-      for (const key of graph.keys()) seen.add(key);
-      for (const dep of next) seen.add(dep);
-      frontier = next;
-    }
-
-    const legacyKey = waitKeyOf(input.taskId, randomUUID());
-    const evidence = `${input.text}\n[append-prerequisites] 操作者=${actor.employeeId} 等待=${formalWait ? openWait!.wait_key : legacyKey} 等待来源=${formalWait ? '正式依赖等待' : 'defer 存量执行等待（受控补建规范等待行）'} 引用=${formalWait ? normalizedId(openWait!.reference_task) : '首个未完成依赖'} 依赖 before=[${beforeDeps.join(', ')}] after=[${[...new Set([...beforeDeps, ...dependencies])].join(', ')}] 续接=manager`;
-    const row = await this.txTask(`BEGIN;
-      LET $who = SELECT * FROM ONLY $actor;
-      LET $t = SELECT * FROM ONLY $task;
-      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'append denied' };
-      IF $t = NONE { THROW 'task not found' };
-      IF $t.state != 'blocked' OR $t.blocked_to != NONE { THROW 'append denied: only a formal dependency wait' };
-      IF $t.resume_state = 'review' { THROW 'append denied: only execute-phase dependency waits; a review wait keeps its reviewer' };
-      IF $t.reviewer_role = 'owner' OR $t.wait_owner_role = 'owner' { THROW 'append denied: owner gate' };
-      IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'append denied: active lease' };
-      IF $t.version != $expected { THROW 'task version moved' };
-      LET $g = SELECT * FROM ONLY $t.goal;
-      IF $g != NONE AND $g.state != 'active' { THROW 'goal is closed' };
-      LET $w = SELECT * FROM task_wait WHERE task = $task AND state IN ['waiting', 'held'] ORDER BY entered_at DESC LIMIT 1;
-      LET $formal = $t.wait_state = 'waiting' AND $t.wait_kind = 'dependency' AND array::len($w) = 1
-        AND $w[0].wait_key = $t.wait_episode AND $w[0].kind = 'dependency' AND $w[0].reference_task != NONE;
-      IF $formal AND $t.resume_state != 'ready' { THROW 'append denied: only execute-phase dependency waits' };
-      IF !$formal AND $t.wait_state = 'waiting' AND $t.wait_kind = 'dependency' { THROW 'append denied: the open dependency wait is missing' };
-      LET $deferred = SELECT * FROM audit WHERE task = $task AND action = 'deferred' ORDER BY at DESC LIMIT 1;
-      LET $legacy_deps = $t.dependencies ?? [];
-      ${RESOLVE_DEP_SQL('$legacy_deps', '$legacy')}
-      LET $legacy_unmet = SELECT VALUE id FROM task WHERE id IN $legacy_resolved AND ${depUnsatisfiedFor('$t')};
-      LET $legacy_ref = $legacy_unmet[0];
-      LET $wait_key = IF $formal THEN $w[0].wait_key ELSE $legacy_key END;
-      LET $wait_ref = IF $formal THEN $w[0].reference_task ELSE $legacy_ref END;
-      LET $source_phase = IF $formal THEN 'ready' ELSE $t.resume_state END;
-      IF !$formal {
-        IF array::len($w) > 0 { THROW 'append denied: only a formal dependency wait' };
-        IF $t.resume_state NOT IN ['ready', 'doing'] { THROW 'append denied: only execute-phase dependency waits' };
-        IF array::len($deferred) = 0 { THROW 'append denied: a legacy wait needs a real deferred audit' };
-        IF array::len($legacy_unmet) = 0 { THROW 'append denied: a legacy wait needs an unmet dependency' };
-        IF $legacy_ref = $task { THROW 'append denied: self reference' };
-        CREATE ONLY $legacy_wait CONTENT {
-          wait_key: $legacy_key, task: $task, kind: 'dependency', state: 'waiting', source: $legacy_source,
-          owner_role: $t.executor_role, reference_task: $legacy_ref, not_before: NONE, expires_at: NONE,
-          expires_source: 'unknown', next_check_at: NONE, timezone: NONE, progress: {}, completed: [],
-          pending_action: NONE, handoff_file: NONE, reason: $legacy_reason,
-          version: 1, entered_by: $employee, entered_version: $t.version, entered_at: time::now(), updated_at: time::now()
-        };
-      };
-      IF $wait_ref = $task { THROW 'append denied: self reference' };
-      FOR $dep IN $dependencies {
-        LET $d = SELECT * FROM ONLY $dep;
-        IF $d = NONE OR $d.goal != $t.goal { THROW 'append denied: dependency missing or outside the task goal' };
-        IF $d.id = $task { THROW 'append denied: self dependency' };
-      };
-      LET $merged = array::distinct(array::concat($t.dependencies ?? [], $dependencies));
-      IF array::len($merged) = array::len($t.dependencies ?? []) { THROW 'append denied: no new dependency' };
-      LET $epoch = SELECT * FROM ONLY company_meta:defer_epoch;
-      LET $epoch_value = $epoch.value ?? 0;
-      IF $epoch_value != $epoch_seen { THROW 'append graph moved: retry' };
-      IF $epoch = NONE {
-        CREATE ONLY company_meta:defer_epoch CONTENT { value: 1 };
-      } ELSE {
-        UPDATE ONLY company_meta:defer_epoch SET value = $epoch_value + 1;
-      };
-      LET $next = UPDATE ONLY $task SET
-        dependencies = $merged,
-        dependency_continuation = 'manager',
-        wait_state = 'waiting',
-        wait_kind = 'dependency',
-        wait_episode = $wait_key,
-        wait_not_before = IF $formal THEN $t.wait_not_before ELSE NONE END,
-        wait_expires_at = IF $formal THEN $t.wait_expires_at ELSE NONE END,
-        wait_next_check_at = IF $formal THEN $t.wait_next_check_at ELSE NONE END,
-        wait_owner_role = IF $formal THEN $t.wait_owner_role ELSE NONE END,
-        wait_source = IF $formal THEN $t.wait_source ELSE 'dependency' END,
-        wait_version = IF $formal THEN $t.wait_version ELSE 1 END,
-        wait_entered_at = IF $formal THEN $t.wait_entered_at ELSE time::now() END,
-        version = $t.version + 1 RETURN AFTER;
-      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'dependency_prerequisites_appended', evidence: $evidence,
-        version: $next.version, at: time::now(), source_phase: $source_phase, wait_key: $wait_key,
-        reference_task: $wait_ref, dependencies_before: $before_refs,
-        dependencies_after: $merged, continuation: 'manager', operator: $employee, legacy_wait: !$formal };
-      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE ONLY $outbox CONTENT { task: $task, kind: 'dependency_prerequisites_appended', sequence: $sequence.value,
-        payload: { version: $next.version, dependencies_before: $before_refs, dependencies_after: $merged,
-          continuation: 'manager', wait_key: $wait_key, added: $added, legacy_wait: !$formal }, at: time::now() };
-      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
-      RETURN $next;
-      COMMIT;`, {
-      actor: id('employee', actor.employeeId), employee: actor.employeeId, task: taskRef, expected: input.expectedVersion,
-      dependencies: depIds, evidence, added: newDeps.length,
-      before_refs: (before.dependencies ?? []).map(dep => id('task', normalizedId(dep))),
-      epoch_seen: epochSeen, idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
-      legacy_key: legacyKey, legacy_wait: id('task_wait', legacyKey),
-      legacy_source: { kind: 'dependency' },
-      legacy_reason: '受控追加兼容：任务处于 defer_task_until 产生的存量执行依赖等待（无等待实体）；本工具在同一受控事务中补建规范 dependency 等待并设置老板续接，完成前任务保持 blocked。',
-    });
-    return view(row);
-  }
-
   /**
    * owner/product only: retire a task to the terminal 'void' state. Duplicate or obsolete work
-   * (e.g. two managers decomposing the same goal into parallel chains) stops occupying the
+   * (e.g. two owners decomposing the same work into parallel chains) stops occupying the
    * graph: any live lease is released, the holder's active_task clears, and blocked
    * dependents re-evaluate with 'void' counted as satisfied, so a chain waiting only on the
    * retired task unlocks in the same transaction. Retiring an already-void task is a no-op
@@ -5548,26 +2653,13 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     // Pre-read for a readable fast-fail and the audit snapshot; the transaction re-checks
     // every guard atomically, so a stale pre-read can never turn into a wrong write.
     const before = await this.db.select<TaskRow>(id('task', input.taskId));
+    const descendants = await this.plannedDescendants(input.taskId);
     if (!before) throw new CompanyError('not_found', 'Task not found');
     if (before.state === 'done') throw new CompanyError('conflict', 'Cannot retire a finished task');
     if (input.expectedVersion !== undefined && before.version !== input.expectedVersion) {
       throw new CompanyError('conflict', 'Task version moved');
     }
     if (before.state === 'void') return view(before); // already terminal, idempotent no-op
-    if (before.reviewer_role === 'owner') {
-      // Goal anchors are rollup bookkeeping; they never block retiring the gate itself.
-      // Dependents on ANY version of the task's screenplay lineage are live dependents of
-      // the tip too — retiring the tip would strand them blocked with no revision possible.
-      const rows = await this.db.query<[unknown, unknown, RecordId[]]>(`
-        LET $r = SELECT * FROM ONLY $task;
-        LET $chain = IF ($r.lineage ?? NONE) = NONE THEN [$task] ELSE (SELECT VALUE id FROM task WHERE lineage = $r.lineage) END;
-        SELECT VALUE id FROM task WHERE array::len(array::filter(dependencies ?? [], |$d| $d IN $chain)) > 0
-          AND state NOT IN [$done, $void] AND (goal = NONE OR id NOT IN (goal.anchors ?? []));`,
-        { task: id('task', input.taskId), done: 'done', void: 'void' });
-      if (rows[2].length > 0) {
-        throw new CompanyError('conflict', 'Owner-gated task has live dependents; retire them first');
-      }
-    }
 
     const evidence = `${input.text}\n[retire] 作废前 state=${before.state}` +
       ` blocked_to=${before.blocked_to ?? '-'} holder=${before.current_employee ?? '-'} version=${before.version}`;
@@ -5581,22 +2673,16 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       IF $t = NONE { THROW 'task not found' };
       IF $t.state IN ['done', 'void'] { THROW 'task already terminal' };
       IF $expected != NONE AND $t.version != $expected { THROW 'task version moved' };
-      IF $t.reviewer_role = 'owner' {
-        LET $retire_chain = IF ($t.lineage ?? NONE) = NONE THEN [$task] ELSE (SELECT VALUE id FROM task WHERE lineage = $t.lineage) END;
-        LET $live_dependents = SELECT VALUE id FROM task WHERE array::len(array::filter(dependencies ?? [], |$d| $d IN $retire_chain)) > 0 AND state NOT IN ['done', 'void'] AND (goal = NONE OR id NOT IN (goal.anchors ?? []));
-        IF array::len($live_dependents) > 0 { THROW 'retire refused: live owner-gate dependents' };
-      };
       LET $next = UPDATE ONLY $task SET
         state = 'void', blocked_to = NONE, resume_role = NONE, resume_state = NONE,
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
-        wait_state = NONE, wait_kind = NONE, wait_episode = NONE, wait_not_before = NONE,
-        wait_expires_at = NONE, wait_next_check_at = NONE, wait_owner_role = NONE,
-        wait_source = NONE, wait_version = NONE, wait_entered_at = NONE,
         version = $t.version + 1 RETURN AFTER;
-      UPDATE task_wait SET state = 'cancelled', cancelled_reason = 'task retired', updated_at = time::now()
-        WHERE task = $task AND state IN ['waiting', 'held', 'expired'];
+      FOR $cid IN $descendants {
+        UPDATE type::record('task', $cid) SET state = 'void', version += 1;
+        CREATE audit CONTENT { task: type::record('task', $cid), actor: $actor, action: 'planned_voided',
+          evidence: '父任务作废，计划任务级联作废', version: (SELECT VALUE version FROM ONLY type::record('task', $cid)), at: time::now() };
+      };
       UPDATE employee SET active_task = NONE WHERE active_task = $task;
-      ${UNLOCK_CHILDREN_SQL}
       CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'retire', evidence: $evidence, version: $next.version, at: time::now() };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE ONLY $outbox CONTENT { task: $task, kind: 'retired', sequence: $sequence.value, payload: { state: 'void', retired_holder: $holder }, at: time::now() };
@@ -5605,6 +2691,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       COMMIT;`, {
         actor: id('employee', actor.employeeId), task: id('task', input.taskId),
         expected: input.expectedVersion, evidence, holder: before.current_employee,
+        descendants,
         idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
       });
     } catch (error) {
@@ -5629,1520 +2716,10 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   // 复用 resume/defer/retire/create 的既有状态机，不新增任何旁路写权。
 
   /**
-   * The episode a task is currently blocked in must be the one being claimed: a manager may not claim, and therefore
+   * The episode a task is currently blocked in must be the one being claimed: the owner may not claim, and therefore
    * decide, an episode the task is no longer in. A task carries its open episode as phase + start (unix seconds); a
    * task without one (never blocked, or already resumed) refuses every claim, which is how a late reminder to a
    * decided episode is turned away.
-   */
-  private async requireOpenEpisode(taskId: TaskId, phase: DispositionPhase, sinceMs: number): Promise<TaskRow> {
-    const row = await this.db.select<TaskRow>(id('task', taskId));
-    if (!row) throw new CompanyError('not_found', 'Task not found');
-    if (row.state !== 'blocked') throw new CompanyError('conflict', 'The task is not blocked; there is no episode to dispose of');
-    const openPhase = row.dispatch_blocked_phase === 'review' ? 'review' : row.dispatch_blocked_phase === 'execute' ? 'execute' : undefined;
-    if (openPhase !== undefined && openPhase !== phase) {
-      throw new CompanyError('conflict', `The open episode is in the ${openPhase} phase, not ${phase}`);
-    }
-    if (row.dispatch_blocked_since !== undefined && row.dispatch_blocked_since !== null) {
-      const openSince = row.dispatch_blocked_since * 1000;
-      // The task's open episode is newer than the one being claimed: this reminder is stale (the earlier episode is
-      // already over), so the claim is refused instead of handing a manager a disposed episode.
-      if (openSince > sinceMs) {
-        throw new CompanyError('conflict', 'A newer episode has already started on this task; the reminder is stale');
-      }
-    }
-    return row;
-  }
-
-  async claimDisposition(credential: Credential, input: DispositionClaimInput): Promise<DispositionClaimOutcome> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Owner disposition requires the owner role');
-    await this.requireOpenEpisode(input.taskId, input.phase, input.sinceMs);
-    return this.dispositions.claim(actor, input);
-  }
-
-  async releaseDisposition(credential: Credential,
-    input: { taskId: TaskId; phase: DispositionPhase; sinceMs: number; claimToken: string; reason: string }): Promise<DispositionClaimView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Owner disposition requires the owner role');
-    return this.dispositions.release(actor, input);
-  }
-
-  async dispositionStatus(credential: Credential, input: DispositionStatusInput): Promise<DispositionStatusView> {
-    const actor = await this.authorized(credential);
-    // Managers read the episode's outcome (that is the whole point of a stale snapshot being repairable), and so does
-    // anyone who is a party of the task; only the holder ever receives the claim token.
-    const row = await this.db.select<TaskRow>(id('task', input.taskId));
-    if (!row) throw new CompanyError('not_found', 'Task not found');
-    const manager = actor.role === 'owner';
-    if (!manager && actor.role !== row.executor_role && actor.role !== row.reviewer_role && row.current_employee !== actor.employeeId) {
-      throw new CompanyError('forbidden', 'Task access denied');
-    }
-    return this.dispositions.status(actor, input);
-  }
-
-  /**
-   * A decided episode needs a manager's decision to still be worth a session: the claim's role gate mirrors the action's
-   * own gate (resume/defer/repair are owner work; retire is owner/product work), and the delegated record methods re-check it in
-   * their transactions, so a claim never widens anyone's authority over the task.
-   */
-  async decideDisposition(credential: Credential, input: DispositionDecideInput): Promise<DispositionDecideOutcome> {
-    const actor = await this.authorized(credential, 'manage');
-    const manager = actor.role === 'owner';
-    if (!manager) throw new CompanyError('forbidden', 'Owner disposition requires the owner role');
-    if (input.action !== 'retire' && actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may resume, defer, wait on dependencies or build a repair chain');
-    return this.dispositions.decide(actor, input, this.dispositionApplier(credential));
-  }
-
-  async dispositionNotices(credential: Credential, input?: { ids?: string[] }): Promise<HolderNoticeView[]> {
-    const actor = await this.authorized(credential);
-    const pending = await this.dispositions.noticesFor(actor.employeeId);
-    return input?.ids ? pending.filter(notice => input.ids!.includes(notice.noticeKey)) : pending;
-  }
-
-  async ackDispositionNotices(credential: Credential, input: { ids: string[]; error?: string }): Promise<{ delivered: number }> {
-    const actor = await this.authorized(credential);
-    if (!Array.isArray(input.ids) || input.ids.length === 0 || input.ids.length > 100) throw new CompanyError('invalid', 'ids must hold 1-100 notice keys');
-    const keys = [...new Set(input.ids)];
-    // Only the holder's own notices can be acknowledged: a leaked key must not let another employee mark anyone's notice delivered.
-    const mine = await this.dispositions.noticesByKey(actor.employeeId, keys);
-    if (mine.length !== keys.length) throw new CompanyError('forbidden', 'Notices may only be acknowledged by their holder');
-    // A notice the holder already has (attached to an earlier reply, or acknowledged before) is acknowledged again without a
-    // second count, and a failure receipt does not reopen it. One such id must not refuse the rest of the batch.
-    const undelivered = mine.filter(notice => notice.deliveredAt === undefined).map(notice => notice.noticeKey);
-    return { delivered: await this.dispositions.markNotices(undelivered, { agent: actor.employeeId, error: input.error }) };
-  }
-
-  /**
-   * The controlled external-action entry point for employees (AC03): the run may be cancelled by a manager, or by the
-   * employee who holds, implemented or submitted the task the run belongs to — the same people the existing owner
-   * channel already lets report on that task. Anyone outside that set is refused here, and the record keeps the real
-   * internal employee id; the shared provider account is never recorded as a person.
-   */
-  async cancelCiRun(credential: Credential, input: ExternalActionRequestInput): Promise<ExternalActionView> {
-    const actor = await this.authorized(credential);
-    return this.dispositions.requestExternalAction(actor, input, this.externalActionGateway(),
-      async (prerequisite, target) => {
-      if (!prerequisite) throw new CompanyError('forbidden', 'Cancelling a CI run requires manager capability or the task the run belongs to');
-      const task = await this.db.select<TaskRow>(id('task', prerequisite.taskId));
-      if (!task) throw new CompanyError('not_found', 'Prerequisite task not found');
-      // 当事人这一关只对非老板生效。
-      if (actor.role !== 'owner') {
-        // 当事人只认「这个人跟这条任务有关系」：当前持有人、实现者、提交人。**不再**拿岗位与任务的执行岗/评审岗比对——
-        // 那等于让任何一个同岗位员工对仓库里任何一条任务都成为当事人，于是任何 engineering 员工都能取消任意 run（QA V2）。
-        const mine = task.current_employee === actor.employeeId || task.implementer === actor.employeeId ||
-          task.submitted_by === actor.employeeId;
-        if (!mine) throw new CompanyError('forbidden', 'Cancelling this CI run requires being a party of the task it belongs to');
-      }
-      // 老板（owner/product）按设计不受 run↔任务绑定约束：他们的取消权本来就是仓库级的应急动作，而记录里仍然有前置任务、
-      // 前置版本与真实员工 ID。绑定核对是对**非老板当事人**的约束——防止任何员工把别人的 run 说成自己任务的 run。
-      // 依据照实记成 manager_exempt，不假装核过绑定。
-      if (actor.role === 'owner') return { binding: 'manager_exempt' as const };
-      // 绑定核对：run 必须绑定到这条前置任务，head 分支要等于任务登记的树分支。任务没有登记分支时失败关闭——
-      // 没有可核对的身份就不能声称这条 run 属于它（QA V2）。
-      const branch = task.worktree?.branch;
-      if (!branch) {
-        throw new CompanyError('forbidden', 'Cancelling a CI run requires the prerequisite task to have a registered branch to bind the run to');
-      }
-      const observed = await this.externalActionGateway().observeRun(target);
-      // QA D4：读得到、但 provider 说不存在这条 run 是一个**确定的**事实（不是「读不出来」），所以要放它走到网关，
-      // 由网关落成 refused；只有真的读不出来（网络/权限）才是无法核对、必须在这里就拒绝的情形。
-      if (observed.readable !== true) {
-        const why = (observed as { error?: string }).error ?? 'the run is not readable';
-        throw new CompanyError('forbidden', `The run ${target.repo}#${target.runId} could not be bound to task ${prerequisite.taskId}: ${why}`);
-      }
-      if (observed.exists === true && (observed.headBranch ?? '') !== branch) {
-        throw new CompanyError('forbidden',
-          `Run ${target.repo}#${target.runId} is on branch ${observed.headBranch ?? 'unknown'}, not the prerequisite task's registered branch ${branch}`);
-      }
-      // QA D5：仓库绑定。任务登记的仓库标识能比（GitHub slug，或能解析出 slug 的 remote）时必须与 run 的仓库相同；
-      // 登记的是本地路径这类比不出 slug 的值时只按分支绑定，并把「依据是分支」如实写进审计证据，不谎称核过仓库。
-      const declared = task.worktree?.repo ?? '';
-      const declaredSlug = declared ? githubRepoSlug(declared) : undefined;
-      if (declaredSlug && declaredSlug.toLowerCase() !== target.repo.toLowerCase()) {
-        throw new CompanyError('forbidden',
-          `Run ${target.repo}#${target.runId} is in repository ${target.repo}, not the prerequisite task's registered repository ${declaredSlug}`);
-      }
-      return { binding: declaredSlug ? 'repo+branch' as const : 'branch_only' as const };
-    });
-  }
-
-  async reconcileCiRuns(credential: Credential, input: { runs: Array<{ repo: string; runId: string }> }) {
-    // AC03/QA D6：对账是**写**账本的动作（它为带外变更建 unknown_actor 行），所以它和事后归因一样是老板的判断：
-    // 普通员工不得用它往账本里写行。只读的那一面是 list_external_actions，不受影响。
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') {
-      throw new CompanyError('forbidden', 'Reconciling external actions requires the owner or product role');
-    }
-    if (!Array.isArray(input.runs) || input.runs.length === 0 || input.runs.length > 50) throw new CompanyError('invalid', 'runs must hold 1-50 entries');
-    return this.dispositions.reconcileExternalActions(actor, input, this.externalActionGateway());
-  }
-
-  async attributeCiRun(credential: Credential, input: { actionKey: string; employeeId: string; evidence: string }): Promise<ExternalActionView> {
-    // Attribution is a manager judgement on a real person's record: owner only, and never a fabricated internal owner.
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Attributing an out-of-band external action requires owner');
-    return this.dispositions.attributeExternalAction(actor, input);
-  }
-
-  async listExternalActions(credential: Credential, input?: { actionKey?: string; state?: string; limit?: number }): Promise<ExternalActionView[]> {
-    const actor = await this.authorized(credential);
-    if (actor.role !== 'owner') {
-      // A non-manager sees only the actions it requested itself, never other employees' records.
-      const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
-        'SELECT * FROM external_action WHERE requested_by = $me ORDER BY created_at DESC LIMIT $limit;',
-        { me: actor.employeeId, limit: input?.limit ?? 20 });
-      return rows.map(row => this.dispositions.externalViewOf(row));
-    }
-    return this.dispositions.externalActions(input ?? {});
-  }
-
-  /** The controlled external exit. One implementation today: the company's authenticated `gh` CLI, injected for tests. */
-  private externalActionGateway(): ExternalActionGateway {
-    return this.externalActionsGateway ?? createCompanyGithubGateway();
-  }
-
-  /**
-   * The disposition applier: the ledger decides WHO and WHEN, the existing state machine decides HOW. Every call goes
-   * through the same record methods the manager tools use (with the manager's own credential), so leases, fences,
-   * owner gates, independence, audit and outbox behave exactly as they do on the direct tools — and the idempotency key
-   * is derived from the disposition's business key, so a replay or an employee change reads the same row instead of
-   * writing a second one.
-   */
-  private dispositionApplier(credential: Credential): DispositionApplier {
-    const withKey = (text: string, businessKey: string) => `${text}\n[disposition] business_key=${businessKey}`;
-    return {
-      resume: async ({ taskId, text, idempotencyKey }) => {
-        const row = await this.resumeRecord(credential, taskId, { text: withKey(text, idempotencyKey), idempotencyKey },
-          { businessScope: true });
-        return { taskVersion: row.version, state: row.state };
-      },
-      defer: async ({ taskId, text, dependencies, expectedTaskVersion, idempotencyKey }) => {
-        const row = await this.deferTaskUntilRecord(credential, {
-          taskId, dependencies, text: withKey(text, idempotencyKey), idempotencyKey, expectedVersion: expectedTaskVersion,
-        }, { businessScope: true });
-        return { taskVersion: row.version, state: row.state };
-      },
-      retire: async ({ taskId, text, expectedTaskVersion, idempotencyKey }) => {
-        const row = await this.retireTaskRecord(credential, {
-          taskId, text: withKey(text, idempotencyKey), idempotencyKey, expectedVersion: expectedTaskVersion,
-        }, { businessScope: true });
-        return { taskVersion: row.version, state: row.state };
-      },
-      repair: async ({ repairKey, taskId, text, expectedTaskVersion, repair }) => {
-        const created = await this.createTaskRecord(credential, {
-          title: repair.title,
-          context: `${repair.context}\n\n[来源] episode 处置 ${repairKey}；原任务 ${taskId}；处置说明：${text}`,
-          executorRole: repair.executorRole as Role,
-          reviewerRole: repair.reviewerRole as ReviewerRole,
-          dependencies: repair.dependencies,
-          discipline: repair.discipline,
-          goalId: repair.goalId,
-          project: repair.project,
-          workIntent: repair.workIntent,
-          idempotencyKey: `disposition-repair:${repairKey}`,
-        }, { repairKey });
-        // 原任务在本决定里换一种等待：门禁解除，改为等修复链。这样原 episode 真的结束了——旧版（不认识处置账本）
-        // 读到的也是一个"等待中"的任务，而不是一个还在门禁里的任务，回滚后不会再为它拉起老板（RB01）。
-        // 只有仍挂在 owner 门禁上的原任务能这样改（defer 的既有前置条件）；owner 门禁、review 门禁或已终态的任务保持原样，
-        // 决定结果如实记下它当时的状态，绝不假装改过。
-        const [source] = await this.db.query<[{ state?: string; blocked_to?: string; version?: number } | undefined]>(
-          'SELECT state, blocked_to, version FROM ONLY $t;', { t: id('task', taskId) });
-        if (source?.state === 'blocked' && source.blocked_to === 'owner') {
-          const deferred = await this.deferTaskUntilRecord(credential, {
-            taskId,
-            dependencies: [created.id],
-            text: withKey(`已建修复链 ${created.id}，原任务改为等待该修复完成后再继续`, `source:${repairKey}`),
-            idempotencyKey: `disposition-source:${repairKey}`,
-            expectedVersion: expectedTaskVersion,
-          }, { businessScope: true });
-          return { taskId: created.id, sourceTaskVersion: deferred.version, sourceState: deferred.state };
-        }
-        return { taskId: created.id, sourceTaskVersion: source?.version, sourceState: source?.state };
-      },
-    };
-  }
-
-  /**
-   * Read-only dry-run of the acceptance reference repair (goal_acceptance_preview). Shows the live
-   * manual/acceptance/anchors references, the unfinished goal work, the candidate checks and the
-   * snapshot hash that goal_acceptance_repair must echo back. Writes nothing.
-   */
-  async goalAcceptancePreview(credential: Credential, input: GoalAcceptancePreview): Promise<GoalAcceptanceView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may review goal acceptance references');
-    requireText(input.goalId, 'goal', 1, 100);
-    if (input.candidateTaskId !== undefined) requireText(input.candidateTaskId, 'candidateTaskId', 1, 200);
-    return (await this.goalAcceptanceState(input.goalId, input.candidateTaskId)).view;
-  }
-
-  /**
-   * owner only (manage): repoints a quick/software goal's manual/acceptance references and anchors from an
-   * erroneously voided acceptance task to a blocked product→owner candidate that waits on all unfinished goal
-   * work. Every basis the preview checks is re-verified inside one compare-and-set transaction (goal refs and
-   * anchors, the void task, the candidate's version and state, the unfinished-work set), and the write lands
-   * with audit, outbox and the idempotency row. The voided task keeps its state and history. The repair never
-   * releases leases, never marks the goal done, and never treats a void as approval.
-   */
-  async goalAcceptanceRepair(credential: Credential, input: GoalAcceptanceRepair): Promise<GoalAcceptanceResult> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may repair goal acceptance references');
-    requireText(input.goalId, 'goal', 1, 100);
-    requireText(input.expectedOldTaskId, 'expectedOldTaskId', 1, 200);
-    requireText(input.candidateTaskId, 'candidateTaskId', 1, 200);
-    requireText(input.text, 'text', 4, 8000);
-    if (typeof input.snapshotHash !== 'string' || !/^[0-9a-f]{64}$/.test(input.snapshotHash)) {
-      throw new CompanyError('invalid', 'Invalid snapshotHash');
-    }
-    const idem = this.idemId(actor.employeeId, 'goal_acceptance_repair', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ goalId: input.goalId, expectedOldTaskId: input.expectedOldTaskId,
-      candidateTaskId: input.candidateTaskId, snapshotHash: input.snapshotHash, text: input.text }));
-    const replayed = await this.replayStored<GoalAcceptanceResult>(idem, digest);
-    if (replayed) return replayed;
-
-    const state = await this.goalAcceptanceState(input.goalId, input.candidateTaskId, input.expectedOldTaskId);
-    if (state.checks.length) {
-      throw new CompanyError(state.checks[0]!.code, state.checks.map(check => check.message).join('; '));
-    }
-    if (state.hash !== input.snapshotHash) {
-      throw new CompanyError('conflict', 'Goal acceptance snapshot moved; run goal_acceptance_preview again');
-    }
-    const candidate = state.candidate!;
-    const oldId = state.oldId!;
-    const result: GoalAcceptanceResult = {
-      goalId: input.goalId, replacedTaskId: oldId, candidate: briefTask(candidate),
-      anchors: [input.candidateTaskId], snapshotHash: state.hash, repairedAt: new Date().toISOString(),
-    };
-    const vars = {
-      actor: id('employee', actor.employeeId), goal: id('goal', input.goalId), old: id('task', oldId),
-      candidate: id('task', input.candidateTaskId), cand_version: candidate.version,
-      expected_unfinished: state.unfinishedIds.map(taskId => id('task', taskId)),
-      idem, digest, result,
-      evidence: `${input.text}\n[goal_acceptance] goal=${input.goalId} replaced=${oldId} candidate=${input.candidateTaskId} snapshot=${state.hash}`,
-      evidence_old: `替换为运营验收 task:${input.candidateTaskId}；goal=${input.goalId}；snapshot=${state.hash}`,
-      audit: id('audit', randomUUID()), audit_old: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
-      goal_key: input.goalId, old_key: oldId, candidate_key: input.candidateTaskId,
-    };
-    try {
-      await this.txTask<GoalAcceptanceResult>(`BEGIN;
-        LET $who = SELECT * FROM ONLY $actor;
-        IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'actor revoked or forbidden' };
-        LET $g = SELECT * FROM ONLY $goal;
-        IF $g = NONE { THROW 'goal acceptance moved: goal not found' };
-        IF $g.state != 'active' { THROW 'goal acceptance moved: goal is not active' };
-        IF $g.tier != 'quick' OR ($g.pipeline ?? 'software') != 'software' { THROW 'goal acceptance moved: goal is not quick software' };
-        IF $g.tasks.manual != $old OR $g.tasks.acceptance != $old { THROW 'goal acceptance moved: references changed' };
-        IF array::len(array::filter($g.anchors ?? [], |$a| $a != $old)) > 0 { THROW 'goal acceptance moved: anchors changed' };
-        LET $o = SELECT * FROM ONLY $old;
-        IF $o = NONE OR $o.state != 'void' OR $o.reviewer_role = 'owner' { THROW 'goal acceptance moved: replaced task changed' };
-        LET $c = SELECT * FROM ONLY $candidate;
-        IF $c = NONE OR $c.version != $cand_version { THROW 'goal acceptance moved: candidate changed' };
-        IF $c.state != 'blocked' OR $c.blocked_to != NONE OR $c.submitted_by != NONE OR ($c.current_employee != NONE AND $c.lease_expires_at > time::unix(time::now())) { THROW 'goal acceptance moved: candidate is not blocked and unleased' };
-        LET $unfinished = SELECT VALUE id FROM task WHERE goal = $goal AND state NOT IN ['done', 'void'] AND id != $candidate;
-        IF array::len($unfinished) != array::len($expected_unfinished) OR array::len(array::filter($unfinished, |$u| $u NOT IN $expected_unfinished)) > 0 { THROW 'goal acceptance moved: unfinished goal work changed' };
-        IF array::len(array::filter($unfinished, |$u| $u NOT IN ($c.dependencies ?? []))) > 0 { THROW 'goal acceptance moved: candidate misses unfinished goal work' };
-        LET $dependents = SELECT VALUE id FROM task WHERE state NOT IN ['done', 'void'] AND $candidate IN (dependencies ?? []);
-        IF array::len($dependents) > 0 { THROW 'goal acceptance moved: candidate would form a cycle' };
-        UPDATE ONLY $goal SET tasks.manual = $candidate, tasks.acceptance = $candidate, anchors = [$candidate];
-        CREATE ONLY $audit CONTENT { task: $candidate, actor: $actor, action: 'goal_acceptance_repair', evidence: $evidence, version: $c.version, at: time::now() };
-        CREATE ONLY $audit_old CONTENT { task: $old, actor: $actor, action: 'goal_acceptance_replaced', evidence: $evidence_old, version: $o.version, at: time::now() };
-        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        CREATE ONLY $outbox CONTENT { task: $candidate, kind: 'goal_acceptance_repaired', sequence: $sequence.value, payload: { goal: $goal_key, replaced: $old_key, candidate: $candidate_key }, at: time::now() };
-        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $result };
-        RETURN $result;
-        COMMIT;`, vars);
-      return result;
-    } catch (error) {
-      const replayedAfterFailure = await this.replayStored<GoalAcceptanceResult>(idem, digest);
-      if (replayedAfterFailure) return replayedAfterFailure;
-      throw error;
-    }
-  }
-
-  // ---------------------------------------------------------------- SYS07: goal governance / metrics
-
-  private async requireGoalManager(credential: Credential): Promise<{ employeeId: string }> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', '只有老板可以读写目标终验图与成果证据');
-    return actor;
-  }
-
-  private async goalFinalizeSafe(goalId: string | undefined, actor: string, acceptedTaskId?: string): Promise<void> {
-    if (!goalId) return;
-    try {
-      await this.goals.finalize(goalId, actor, acceptedTaskId);
-    } catch (error) {
-      console.warn(`goal finalize failed for ${goalId}: ${(error as Error).message}`);
-    }
-  }
-
-  private async saveGoalIdem(idem: RecordId, digest: string, result: unknown): Promise<void> {
-    await this.db.query('CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $result };',
-      { idem, digest, result }).catch(() => undefined);
-  }
-
-  /** SYS07: one paged read-only goal console. */
-  async goalConsole(credential: Credential, input: GoalConsoleQuery = {}): Promise<GoalPageView> {
-    await this.requireGoalManager(credential);
-    try {
-      return await this.goals.page({
-        ...(input.goalId ? { goalId: input.goalId } : {}),
-        ...(input.includeClosed === undefined ? {} : { includeClosed: input.includeClosed }),
-        ...(input.needsRepairOnly === undefined ? {} : { needsRepairOnly: input.needsRepairOnly }),
-        ...(input.pageSize === undefined ? {} : { pageSize: input.pageSize }),
-        ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
-      });
-    } catch (error) {
-      throw new CompanyError('invalid', (error as Error).message);
-    }
-  }
-
-  /** SYS07: read-only dry-run over active, needs_repair and done goals; never changes a goal, task or owner decision. */
-  async goalGovernanceScan(credential: Credential, input: GoalScanQuery = {}): Promise<GoalScanView> {
-    await this.requireGoalManager(credential);
-    try {
-      return await this.goals.scan(input);
-    } catch (error) {
-      throw new CompanyError('invalid', (error as Error).message);
-    }
-  }
-
-  /** SYS07: windowed metrics with explicit denominators, coverage and unknown cost. */
-  async goalMetrics(credential: Credential, input: GoalMetricsQuery = {}): Promise<GoalMetricsAnswer> {
-    await this.requireGoalManager(credential);
-    const now = Date.now();
-    const to = input.to ?? new Date(now).toISOString();
-    const from = input.from ?? new Date(now - 30 * 86_400_000).toISOString();
-    for (const [name, value] of [['from', from], ['to', to]] as const) {
-      if (!/(Z|[+-]\d{2}:\d{2})$/.test(value) || !Number.isFinite(Date.parse(value))) {
-        throw new CompanyError('invalid', `${name} 必须是带时区偏移的绝对时刻`);
-      }
-    }
-    const timezone = input.timezone ?? 'UTC';
-    if (!isTimeZone(timezone)) throw new CompanyError('invalid', 'timezone 必须是 IANA 时区');
-    try {
-      const view = await this.goals.metrics({ from, to, timezone, explicit: input.from !== undefined || input.to !== undefined,
-        ...(input.goalId ? { goalId: input.goalId } : {}) });
-      // Small windows keep the existing whole view. A full answer over the response budget is never cut: the caller
-      // gets a section index and reads each section (paging its lists) until it has the whole window.
-      if (!input.section && answerBytes(view) <= RESPONSE_BUDGET_BYTES) return view;
-      return segmentGoalMetrics(view, {
-        ...(input.section ? { section: input.section } : {}),
-        ...(input.pageSize !== undefined ? { pageSize: input.pageSize } : {}),
-        ...(input.cursor ? { cursor: input.cursor } : {}),
-        scope: `${from}\0${to}\0${timezone}\0${input.goalId ?? ''}`,
-      });
-    } catch (error) {
-      throw new CompanyError('invalid', (error as Error).message);
-    }
-  }
-
-  /** SYS07: register or replace a goal's outcome contract under a version CAS. */
-  async goalOutcomeRegister(credential: Credential, input: GoalOutcomeRegisterInput): Promise<GoalOutcomeView> {
-    const actor = await this.requireGoalManager(credential);
-    requireText(input.goalId, 'goalId', 1, 100);
-    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 0) {
-      throw new CompanyError('invalid', 'expectedVersion 必须是非负整数');
-    }
-    requireText(input.reason, 'reason', 10, 2000);
-    assertNonSensitive(input.reason, 'reason');
-    const idem = this.idemId(actor.employeeId, 'goal_outcome_register', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ goalId: input.goalId, expectedVersion: input.expectedVersion,
-      expected: input.expected, requiredEvidence: input.requiredEvidence, responsibleRole: input.responsibleRole,
-      deadline: input.deadline, timezone: input.timezone, reason: input.reason }));
-    const prior = await this.replayStored<GoalOutcomeView>(idem, digest);
-    if (prior) return prior;
-    let result: GoalOutcomeView;
-    try {
-      result = await this.goals.registerOutcome({
-        goalId: input.goalId, expectedVersion: input.expectedVersion,
-        outcome: {
-          expected: input.expected, requiredEvidence: input.requiredEvidence, responsibleRole: input.responsibleRole,
-          ...(input.deadline === undefined ? {} : { deadline: input.deadline }),
-          ...(input.timezone === undefined ? {} : { timezone: input.timezone }), reason: input.reason,
-        },
-        actor: `employee:${actor.employeeId}`, source: actor.employeeId, reason: input.reason,
-        auditId: randomUUID(), outboxId: randomUUID(),
-      });
-    } catch (error) {
-      const message = (error as Error).message;
-      if (/already registered|version moved|conflicted with another transaction|transaction conflict/i.test(message)) throw new CompanyError('conflict', message);
-      if (/not available|not found/i.test(message)) throw new CompanyError('not_found', message);
-      throw new CompanyError('invalid', message);
-    }
-    await this.saveGoalIdem(idem, digest, result);
-    return result;
-  }
-
-  /** SYS07: one immutable outcome receipt from an authorized human/external source. */
-  async goalEvidenceRecord(credential: Credential, input: GoalEvidenceRecordInput): Promise<GoalEvidenceFact> {
-    const actor = await this.requireGoalManager(credential);
-    requireText(input.goalId, 'goalId', 1, 100);
-    requireText(input.reason, 'reason', 10, 2000);
-    assertNonSensitive(input.reason, 'reason');
-    const idem = this.idemId(actor.employeeId, 'goal_evidence_record', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ goalId: input.goalId, kind: input.kind, summary: input.summary,
-      source: input.source, confirmedBy: input.confirmedBy, evidenceType: input.evidenceType, at: input.at, taskId: input.taskId, reason: input.reason }));
-    const prior = await this.replayStored<GoalEvidenceFact>(idem, digest);
-    if (prior) return prior;
-    let result: GoalEvidenceFact;
-    try {
-      result = await this.goals.recordEvidence({
-        goalId: input.goalId,
-        evidence: {
-          kind: input.kind, summary: input.summary, source: input.source, confirmedBy: input.confirmedBy,
-          evidenceType: input.evidenceType, ...(input.at === undefined ? {} : { at: input.at }),
-          ...(input.taskId === undefined ? {} : { taskId: input.taskId }), reason: input.reason,
-        },
-        actor: `employee:${actor.employeeId}`, reason: input.reason, auditId: randomUUID(), outboxId: randomUUID(),
-      });
-    } catch (error) {
-      const message = (error as Error).message;
-      if (/already recorded|conflicted with another transaction|transaction conflict/i.test(message)) throw new CompanyError('conflict', message);
-      if (/not found|not in this goal/i.test(message)) throw new CompanyError('not_found', message);
-      throw new CompanyError('invalid', message);
-    }
-    await this.saveGoalIdem(idem, digest, result);
-    return result;
-  }
-
-  /** SYS07: explicit re-evaluation after evidence/approval; marks done or needs_repair. */
-  async goalFinalize(credential: Credential, input: GoalFinalizeInput): Promise<GoalCard> {
-    const actor = await this.requireGoalManager(credential);
-    requireText(input.goalId, 'goalId', 1, 100);
-    try {
-      return (await this.goals.finalize(input.goalId, `employee:${actor.employeeId}`)).card;
-    } catch (error) {
-      const message = (error as Error).message;
-      if (/not found/i.test(message)) throw new CompanyError('not_found', message);
-      throw new CompanyError('conflict', message);
-    }
-  }
-
-  async goalFinalGatePreview(credential: Credential, input: GoalFinalGatePreviewInput): Promise<GoalFinalGatePreview> {
-    await this.requireGoalManager(credential);
-    requireText(input.goalId, 'goalId', 1, 100);
-    try {
-      return await this.goals.finalGatePreview({ goalId: input.goalId,
-        ...(input.candidateTaskId === undefined ? {} : { candidateTaskId: input.candidateTaskId }) });
-    } catch (error) {
-      const message = (error as Error).message;
-      if (/not found/i.test(message)) throw new CompanyError('not_found', message);
-      throw new CompanyError('invalid', message);
-    }
-  }
-
-  async goalFinalGateRepair(credential: Credential, input: GoalFinalGateRepairRequest): Promise<GoalFinalGateRepairResult> {
-    const actor = await this.requireGoalManager(credential);
-    requireText(input.goalId, 'goalId', 1, 100);
-    requireText(input.candidateTaskId, 'candidateTaskId', 1, 200);
-    requireText(input.reason, 'reason', 10, 2000);
-    assertNonSensitive(input.reason, 'reason');
-    if (!Number.isSafeInteger(input.expectedGoalVersion) || input.expectedGoalVersion < 0) {
-      throw new CompanyError('invalid', 'expectedGoalVersion 必须是非负整数');
-    }
-    if (!/^[0-9a-f]{64}$/.test(input.snapshotHash)) throw new CompanyError('invalid', 'snapshotHash 必须来自预览');
-    const idem = this.idemId(actor.employeeId, 'goal_final_gate_repair', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ goalId: input.goalId, candidateTaskId: input.candidateTaskId,
-      expectedOldTaskId: input.expectedOldTaskId, expectedGoalVersion: input.expectedGoalVersion,
-      snapshotHash: input.snapshotHash, reason: input.reason }));
-    const prior = await this.replayStored<GoalFinalGateRepairResult>(idem, digest);
-    if (prior) return prior;
-    let result: GoalFinalGateRepairResult;
-    try {
-      result = await this.goals.finalGateRepair({
-        goalId: input.goalId, candidateTaskId: input.candidateTaskId,
-        ...(input.expectedOldTaskId === undefined ? {} : { expectedOldTaskId: input.expectedOldTaskId }),
-        expectedGoalVersion: input.expectedGoalVersion, snapshotHash: input.snapshotHash,
-        reason: input.reason, actor: `employee:${actor.employeeId}`, idempotencyKey: input.idempotencyKey,
-      });
-    } catch (error) {
-      const message = (error as Error).message;
-      if (/moved|changed/i.test(message)) throw new CompanyError('conflict', message);
-      throw new CompanyError('invalid', message);
-    }
-    await this.saveGoalIdem(idem, digest, result);
-    return result;
-  }
-
-  /**
-   * Manager write of a task's independence policy (SYS-DISP IR01). Manage capability only. Creates the first policy, or replaces the
-   * current one under a compare-and-set on the task version. Refused while the task is leased, so a lease is never changed silently.
-   * An accepted write bumps the revision and the version in one transaction with its audit row; the same key and payload replay.
-   */
-  // ---- 有效策略层（SYS06 P1）----
-  // 判定只用 policy 表里的受限字段：提示词、context、任务标题都不是授权来源，改提示内容不改变允许/拒绝。
-  // 写入只走 manage 能力持有者；老板来源的策略必须能对回一条已登记的老板方向（伪造引文被拒）。
-
-  /** 策略作用域链：任务 → 目标 → 项目 → 公司，越靠前越具体，命中即覆盖更宽的域。 */
-  // 读取与判定都在 policy-store.ts / policy.ts：调度器（workforce）读的是同一批行、同一份判定。
-  private policyChain(input: { taskId?: string; goalId?: string; projectId?: string; includeTask?: boolean }): PolicyScopeLink[] {
-    return policyScopeChain(input);
-  }
-
-  private chainOfRow(row: Pick<TaskRow, 'id' | 'goal' | 'project' | 'goal_project'>): PolicyScopeLink[] {
-    return chainOfTaskRow(row);
-  }
-
-  private readPolicyRows(chain: readonly PolicyScopeLink[]): Promise<PolicyRow[]> {
-    return readPolicyRows(this.db, chain);
-  }
-
-  /** 单行动态读法：带上 goal.project 投影，策略作用域链需要它。 */
-  private async taskRowWithProject(taskId: string): Promise<(TaskRow & { goal_project?: RecordId }) | undefined> {
-    return await readTaskPolicyRow(this.db, taskId) as (TaskRow & { goal_project?: RecordId }) | undefined;
-  }
-
-  private policyEpoch(): Promise<number> {
-    return readPolicyEpoch(this.db);
-  }
-
-  private effectiveContractFor(chain: readonly PolicyScopeLink[]): Promise<{ contract: EffectiveContract; rows: PolicyRow[]; epoch: number }> {
-    return readEffectiveContract(this.db, chain, Math.floor(Date.now() / 1000));
-  }
-
-  /** 契约视图 + 人读说明：到期与被替代的当前事实写在 notes 里，机器判定只看 domains。 */
-  private policyEffectiveView(chain: Array<{ scope: PolicyScope; scopeRef?: string }>, contract: EffectiveContract, rows: PolicyRow[]): PolicyEffectiveView {
-    const now = Math.floor(Date.now() / 1000);
-    const notes: string[] = [];
-    for (const row of rows) {
-      if (row.status === 'revoked') notes.push(`${row.policyId} v${row.version} 已撤销（${row.revokeReason ?? '无原因'}），不再授权`);
-      else if (row.supersededBy) notes.push(`${row.policyId} v${row.version} 已被替代，历史可查，不再授权`);
-      else if (row.expiresAt !== undefined && row.expiresAt <= now) notes.push(`${row.policyId} v${row.version} 临时授权已于 ${new Date(row.expiresAt * 1000).toISOString()} 到期`);
-      else if (row.effectiveAt > now) notes.push(`${row.policyId} v${row.version} 将于 ${new Date(row.effectiveAt * 1000).toISOString()} 生效`);
-    }
-    return { version: contract.version, hash: contract.hash, chain, domains: contract.domains, rendered: renderContract(contract), notes: [...new Set(notes)] };
-  }
-
-  /**
-   * 提案校验（写入与试算共用）：作用域引用存在、来源可核、版本单调、替代关系显式且不越权/不成环、同域冲突必须显式替代。
-   * 只读，写任何东西之前先把事实查清楚——迁移现有冲突配置时先列事实与候选，不自动决定优先级。
-   */
-  private async validatePolicyProposal(actor: Principal, input: PolicyPlanInput): Promise<{ chain: PolicyScopeLink[]; rows: PolicyRow[]; epoch: number; version: number; target?: PolicyRow }> {
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only the owner may write a machine policy');
-    requireText(input.policyId, 'policyId', 3, 60);
-    if (!POLICY_ID_PATTERN.test(input.policyId)) throw new CompanyError('invalid', 'policyId must be lowercase letters, digits, hyphen or underscore');
-    if (!POLICY_SCOPES.includes(input.scope)) throw new CompanyError('invalid', `unknown policy scope: ${input.scope}`);
-    if (!POLICY_DOMAINS.includes(input.domain)) throw new CompanyError('invalid', `unknown policy domain: ${input.domain}`);
-    if (input.scope === 'company') {
-      if (input.scopeRef !== undefined) throw new CompanyError('invalid', 'company scope carries no scopeRef');
-    } else {
-      requireText(input.scopeRef ?? '', 'scopeRef', 1, 200);
-      if (input.scope === 'project' && !(await this.projects.get(input.scopeRef!))) {
-        throw new CompanyError('not_found', `project ${input.scopeRef} not found`);
-      }
-      if (input.scope === 'goal' && !(await this.db.select(id('goal', input.scopeRef!)))) {
-        throw new CompanyError('not_found', `goal ${input.scopeRef} not found`);
-      }
-      if (input.scope === 'task' && !(await this.db.select(id('task', input.scopeRef!)))) {
-        throw new CompanyError('not_found', `task ${input.scopeRef} not found`);
-      }
-    }
-    const payload = normalizePayload(input.payload);
-    const domain = domainOfPayload(payload);
-    if (domain !== input.domain) throw new CompanyError('invalid', `payload kind ${domain} does not match domain ${input.domain}`);
-    if (!POLICY_SOURCES.includes(input.source)) throw new CompanyError('invalid', `unknown authorization source: ${input.source}`);
-    if (input.source === 'owner') {
-      if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may transcribe an owner direction into a policy');
-      requireText(input.ownerQuote ?? '', 'ownerQuote', 2, 4000);
-      const [matched] = await this.db.query<[Array<{ id: RecordId }>]>(
-        'SELECT id FROM direction WHERE string::contains(text, $quote) LIMIT 1;', { quote: input.ownerQuote });
-      if (!matched?.length) throw new CompanyError('forbidden', 'ownerQuote 与任何已登记的老板方向都不匹配：伪造的引文不能作为授权来源');
-    }
-    const now = Math.floor(Date.now() / 1000);
-    const effectiveAt = input.effectiveAt === undefined ? now : Math.floor(Date.parse(input.effectiveAt) / 1000);
-    if (!Number.isFinite(effectiveAt)) throw new CompanyError('invalid', 'effectiveAt is not a valid time');
-    const expiresAt = input.expiresAt === undefined ? undefined : Math.floor(Date.parse(input.expiresAt) / 1000);
-    if (expiresAt !== undefined && !Number.isFinite(expiresAt)) throw new CompanyError('invalid', 'expiresAt is not a valid time');
-    if (expiresAt !== undefined && expiresAt <= effectiveAt) throw new CompanyError('invalid', 'expiresAt must be after effectiveAt');
-    if (input.supersedes === undefined && input.domain === 'write_authority' && payload.kind === 'write_authority' && payload.codeRoles.length === 0) {
-      // 空的 codeRoles 是"冻结代码写权"的合法收紧，但必须显式说明原因，且只能由老板来源授权。
-      if (input.source !== 'owner') throw new CompanyError('forbidden', 'Freezing all code writes requires an owner-sourced policy');
-    }
-    const chain = this.policyChain({ taskId: input.scope === 'task' ? input.scopeRef : undefined,
-      goalId: input.scope === 'goal' ? input.scopeRef : undefined,
-      projectId: input.scope === 'project' ? input.scopeRef : undefined, includeTask: input.scope === 'task' });
-    const rows = await this.readPolicyRows(chain);
-    const epoch = await this.policyEpoch();
-    const versions = rows.filter(row => row.policyId === input.policyId).map(row => row.version);
-    const version = (versions.length ? Math.max(...versions) : 0) + 1;
-    let target: PolicyRow | undefined;
-    if (input.supersedes !== undefined) {
-      requireText(input.supersedes, 'supersedes', 1, 200);
-      // 目标按 id 全局读：读不到才是 not_found；读到了但不在本次新版本的作用域链上，那是越权替代（forbidden），
-      // 不能含糊成"找不到"——跨项目/跨目标的替代必须给出它自己的理由。
-      const rawTarget = await this.db.select<PolicyDbRow>(id('policy', input.supersedes));
-      if (!rawTarget) throw new CompanyError('not_found', 'supersedes target not found');
-      target = policyRowView(rawTarget);
-      if (target.domain !== domain) throw new CompanyError('conflict', `supersedes target governs ${target.domain}, not ${domain}`);
-      const covered = chain.some(link => link.scope === target!.scope &&
-        (link.scopeRef ?? '') === (target!.scopeRef ?? ''));
-      if (!covered) throw new CompanyError('forbidden', 'cross-scope supersede refused: the target is outside this policy scope');
-      if (target.status !== 'active' || target.supersededBy !== undefined) throw new CompanyError('conflict', 'supersedes target is no longer the active version');
-      if (target.expiresAt !== undefined && target.expiresAt <= now) throw new CompanyError('conflict', 'supersedes target is an expired temporary policy');
-      // 成环：目标的替代链上出现同一 policy id 的任何版本，说明谱系已经不是一条直线。
-      const seen = new Set<string>([target.id]);
-      let cursor = target.supersedes;
-      for (let hop = 0; cursor !== undefined && hop < 64; hop++) {
-        if (seen.has(cursor)) throw new CompanyError('conflict', 'policy supersede cycle detected');
-        seen.add(cursor);
-        const parent: PolicyRow | undefined = (await this.readPolicyRows(chain)).find(row => row.id === cursor);
-        if (!parent) break;
-        if (parent.policyId === input.policyId) throw new CompanyError('conflict', `policy supersede cycle: ${input.policyId} is already in the supersede chain`);
-        cursor = parent.supersedes;
-      }
-    }
-    const competing = rows.filter(row => row.domain === domain && row.scope === input.scope &&
-      (row.scopeRef ?? '') === (input.scopeRef ?? '') && policyActiveAt(row, now) && row.id !== target?.id);
-    if (competing.length) {
-      throw new CompanyError('conflict',
-        `an active ${domain} policy already governs ${input.scope}${input.scopeRef ? `:${input.scopeRef}` : ''} (${competing.map(row => `${row.policyId} v${row.version}`).join(', ')}); supersede it explicitly`);
-    }
-    return { chain, rows, epoch, version, target };
-  }
-
-  /** 写入一版机器策略：显式替代 + 同事务 CAS（epoch 与目标仍是活跃版本），历史只增不改。 */
-  async policySet(credential: Credential, input: PolicySet): Promise<PolicyView> {
-    const actor = await this.authorized(credential, 'manage');
-    requireText(input.reason, 'reason', 2, 4000);
-    const proposal: PolicyPlanInput = { policyId: input.policyId, scope: input.scope, scopeRef: input.scopeRef, domain: input.domain,
-      payload: input.payload, supersedes: input.supersedes, effectiveAt: input.effectiveAt, expiresAt: input.expiresAt,
-      source: input.source, ownerQuote: input.ownerQuote };
-    // 幂等重放先于一切校验：同一个请求第二次来时，它引用的替代目标可能已经被它自己替代掉了，
-    // 再走一遍校验就会把"重放"判成 conflict。摘要只覆盖调用方给的输入（版本号是读出来的派生状态，
-    // 算进去会让重放因为版本已前进而失败）。
-    const idem = this.idemId(actor.employeeId, 'policy_set', input.idempotencyKey);
-    const digest = HASH(JSON.stringify(proposal));
-    const prior = await this.replayPolicy(idem, digest);
-    if (prior) return prior;
-    const { epoch, version, target } = await this.validatePolicyProposal(actor, proposal);
-    const payload = normalizePayload(input.payload);
-    const domain = domainOfPayload(payload);
-    const now = Math.floor(Date.now() / 1000);
-    const effectiveAt = input.effectiveAt === undefined ? now : Math.floor(Date.parse(input.effectiveAt) / 1000);
-    const expiresAt = input.expiresAt === undefined ? undefined : Math.floor(Date.parse(input.expiresAt) / 1000);
-    const hash = policyHash({ policyId: input.policyId, version, scope: input.scope, scopeRef: input.scopeRef,
-      domain, effectiveAt, expiresAt, payload });
-    const policyId = randomUUID();
-    const policy = id('policy', policyId);
-    const evidence = `policy_set ${input.policyId} v${version} scope=${input.scope}${input.scopeRef ? `:${input.scopeRef}` : ''} domain=${domain} ` +
-      `source=${input.source} supersedes=${target?.id ?? 'none'} hash=${hash.slice(0, 16)} epoch=${epoch} → ${epoch + 1}\n理由：${input.reason}`;
-    // 可选字段用条件片段注入：SurrealDB 的 option<int> 不接受 NULL，option<record<policy>> 也不接受用 NULL 去
-    // 取 ONLY（"Expected a single result output"）。没有替代目标时这两句根本不出现，语义上更贴近"没有这个字段"。
-    const supersedeGuard = target ? `
-          LET $t = SELECT * FROM ONLY $supersedes_arg;
-          IF $t = NONE { THROW 'policy moved: supersede target not found' };
-          IF $t.status != 'active' OR $t.superseded_by != NONE { THROW 'policy moved: supersede target is no longer the active version' };
-          IF $t.domain != $domain { THROW 'policy conflict: supersede target governs another domain' };` : '';
-    const competitorClause = target ? ' AND id != $supersedes_arg' : '';
-    const supersedesField = target ? 'supersedes: $supersedes_arg,' : 'supersedes: NONE,';
-    const expiresField = expiresAt === undefined ? '' : 'expires_at: $expires_at,';
-    const closeOutTarget = target ? `UPDATE ONLY $supersedes_arg SET superseded_by = $policy, status = 'superseded';` : '';
-    const vars = {
-      actor: id('employee', actor.employeeId), policy, scope: input.scope, scope_ref: input.scopeRef ?? '',
-      domain, effective_at: effectiveAt, version, hash,
-      ...(expiresAt === undefined ? {} : { expires_at: expiresAt }),
-      ...(target ? { supersedes_arg: id('policy', target.id) } : {}),
-      authorization: { source: input.source, employeeId: actor.employeeId, at: now, ...(input.ownerQuote ? { ownerQuote: input.ownerQuote } : {}) },
-      payload, policy_id: input.policyId, expected_epoch: epoch, evidence,
-      idem, digest, audit: id('audit', randomUUID()),
-    };
-    try {
-      const row = await this.txTask<PolicyDbRow>(`BEGIN;
-        LET $who = SELECT * FROM ONLY $actor;
-        IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'policy denied: actor revoked or forbidden' };
-        LET $epoch = (SELECT VALUE value FROM ONLY company_meta:policy_epoch) ?? 0;
-        IF $epoch != $expected_epoch { THROW 'policy moved: the effective policy epoch moved since the proposal was read' };${supersedeGuard}
-        LET $competing = SELECT VALUE id FROM policy WHERE domain = $domain AND scope = $scope
-          AND (scope_ref ?? '') = $scope_ref AND status = 'active' AND superseded_by = NONE${competitorClause};
-        IF array::len($competing) > 0 { THROW 'policy conflict: another active policy already governs this scope and domain' };
-        LET $created = CREATE ONLY $policy CONTENT {
-          policy_id: $policy_id, version: $version, scope: $scope, scope_ref: $scope_ref, domain: $domain,
-          status: 'active', effective_at: $effective_at, ${expiresField}
-          ${supersedesField} superseded_by: NONE, authorization: $authorization, payload: $payload,
-          hash: $hash, created_by: $actor, created_at: time::now()
-        };
-        ${closeOutTarget}
-        UPDATE ONLY company_meta:policy_epoch SET value = $epoch + 1;
-        CREATE audit CONTENT { actor: $actor, action: 'policy_set', evidence: $evidence, at: time::now() };
-        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: { id: $policy, version: $version } };
-        RETURN $created;
-        COMMIT;`, vars);
-      return policyApiView(policyRowView(row));
-    } catch (error) {
-      const replay = await this.replayPolicy(idem, digest);
-      if (replay) return replay;
-      throw error;
-    }
-  }
-
-  /**
-   * 撤销一版当前有效的策略：紧急收权立即生效——epoch +1 后所有按旧契约登记的租约在下一次写动作前核版本时被拒。
-   * 历史行仍在，只是不再是有效版本的授权依据。
-   */
-  async policyRevoke(credential: Credential, input: PolicyRevoke): Promise<PolicyView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only the owner may revoke a machine policy');
-    requireText(input.policyId, 'policyId', 1, 200);
-    requireText(input.reason, 'reason', 2, 4000);
-    const idem = this.idemId(actor.employeeId, 'policy_revoke', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ policyId: input.policyId, reason: input.reason }));
-    const prior = await this.replayPolicy(idem, digest);
-    if (prior) return prior;
-    const current = (await this.db.select(id('policy', input.policyId))) as PolicyDbRow | undefined;
-    if (!current) throw new CompanyError('not_found', 'Policy not found');
-    if (current.status !== 'active') throw new CompanyError('conflict', 'Policy is not the active version');
-    const evidence = `policy_revoke ${current.policy_id} v${current.version} by ${actor.employeeId}\n理由：${input.reason}`;
-    try {
-      const row = await this.txTask<PolicyDbRow>(`BEGIN;
-        LET $who = SELECT * FROM ONLY $actor;
-        IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'policy denied: actor revoked or forbidden' };
-        LET $t = SELECT * FROM ONLY $policy;
-        IF $t = NONE { THROW 'policy not found' };
-        IF $t.status != 'active' OR $t.superseded_by != NONE { THROW 'policy moved: not the active version' };
-        LET $epoch = (SELECT VALUE value FROM ONLY company_meta:policy_epoch) ?? 0;
-        LET $revoked = UPDATE ONLY $policy SET status = 'revoked', revoked_by = $actor, revoke_reason = $reason RETURN AFTER;
-        UPDATE ONLY company_meta:policy_epoch SET value = $epoch + 1;
-        CREATE audit CONTENT { actor: $actor, action: 'policy_revoke', evidence: $evidence, at: time::now() };
-        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: { id: $policy, version: $t.version } };
-        RETURN $revoked;
-        COMMIT;`, {
-        actor: id('employee', actor.employeeId), policy: id('policy', input.policyId), reason: input.reason,
-        evidence, digest, idem,
-      });
-      return policyApiView(policyRowView(row));
-    } catch (error) {
-      const replay = await this.replayPolicy(idem, digest);
-      if (replay) return replay;
-      throw error;
-    }
-  }
-
-  private async replayPolicy(ident: RecordId, digest: string): Promise<PolicyView | undefined> {
-    const prior = await this.db.select<{ payload_digest: string; result: { id: RecordId } }>(ident);
-    if (!prior) return undefined;
-    if (prior.payload_digest !== digest) throw new CompanyError('conflict', 'Idempotency key reused with different input');
-    const row = await this.db.select<PolicyDbRow>(prior.result.id);
-    return row ? policyApiView(policyRowView(row)) : undefined;
-  }
-
-  /** 策略版本列表：默认只给当前有效（含各作用域链上生效的）版本；includeInactive 时连历史一起给。 */
-  async policyList(credential: Credential, input: PolicyListInput): Promise<PolicyView[]> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only the owner may read machine policies');
-    const clauses: string[] = [];
-    const vars: Record<string, unknown> = {};
-    if (input.scope !== undefined) { clauses.push('scope = $scope'); vars.scope = input.scope; }
-    if (input.scopeRef !== undefined) { clauses.push("(scope_ref ?? '') = $scope_ref"); vars.scope_ref = input.scopeRef; }
-    if (input.domain !== undefined) { clauses.push('domain = $domain'); vars.domain = input.domain; }
-    if (!input.includeInactive) clauses.push("status = 'active' AND superseded_by = NONE");
-    const [rows] = await this.db.query<[PolicyDbRow[]]>(
-      `SELECT * FROM policy${clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''} ORDER BY scope, domain, policy_id, version;`, vars);
-    return (rows ?? []).map(row => policyApiView(policyRowView(row)));
-  }
-
-  /** 当前有效视图：给任务/项目/目标算出生效契约（含逐域渲染文本）；写不写策略都不影响它。 */
-  async policyEffective(credential: Credential, input: PolicyEffectiveInput): Promise<PolicyEffectiveView> {
-    const actor = await this.authorized(credential);
-    let chain: Array<{ scope: PolicyScope; scopeRef?: string }>;
-    if (input.taskId !== undefined) {
-      const row = await this.db.select<TaskRow>(id('task', input.taskId));
-      if (!row) throw new CompanyError('not_found', 'Task not found');
-      if (actor.role !== row.executor_role && actor.role !== row.reviewer_role && !['owner', 'qa', 'eval'].includes(actor.role)) {
-        throw new CompanyError('forbidden', 'Task policy access denied');
-      }
-      chain = this.chainOfRow(row);
-    } else if (input.scopeChain !== undefined) {
-      chain = input.scopeChain.map(link => ({ scope: link.scope, ...(link.scopeRef !== undefined ? { scopeRef: link.scopeRef } : {}) }));
-    } else {
-      if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only the owner may read a scope policy view');
-      if (input.goal !== undefined && !(await this.db.select(id('goal', input.goal)))) throw new CompanyError('not_found', 'Goal not found');
-      if (input.project !== undefined && !(await this.projects.get(input.project))) throw new CompanyError('not_found', 'Project not found');
-      chain = this.policyChain({ goalId: input.goal, projectId: input.project, includeTask: false });
-    }
-    const { contract, rows } = await this.effectiveContractFor(chain);
-    return this.policyEffectiveView(chain, contract, rows);
-  }
-
-  /** 变更试算：算出差量与受影响任务，写任何东西之前先给人看（只读）。 */
-  async policyPlan(credential: Credential, input: PolicyPlanInput): Promise<PolicyPlanView> {
-    const actor = await this.authorized(credential, 'manage');
-    const plan = await this.computePolicyPlan(actor, input);
-    return this.pagePolicyPlan(actor, input, plan);
-  }
-
-  /**
-   * 试算的纯计算部分（只读、无分页）：契约 before/after、候选集扫描、全量受影响清单与 planHash。
-   * policy_plan 的分页只是把这份全量清单裁成一页；planHash 始终覆盖全量，供翻页光标绑定与人工核对。
-   * 它不是执行侧的 CAS：policy_enforce 不读 planHash，而是对每个点名任务按当时的有效契约重新判定。
-   */
-  private async computePolicyPlan(actor: Principal, input: PolicyPlanInput): Promise<Omit<PolicyPlanView, 'affectedTasks' | 'page'> & {
-    affectedTasks: PolicyPlanView['affectedTasks']; scopeChain: PolicyPlanView['scopeChain'];
-  }> {
-    const { chain, target } = await this.validatePolicyProposal(actor, input);
-    const payload = normalizePayload(input.payload);
-    const domain = domainOfPayload(payload);
-    const now = Math.floor(Date.now() / 1000);
-    const effectiveAt = input.effectiveAt === undefined ? now : Math.floor(Date.parse(input.effectiveAt) / 1000);
-    const expiresAt = input.expiresAt === undefined ? undefined : Math.floor(Date.parse(input.expiresAt) / 1000);
-    const { contract: before, rows, epoch } = await this.effectiveContractFor(chain);
-    const versions = rows.filter(row => row.policyId === input.policyId).map(row => row.version);
-    const synthetic: PolicyRow = {
-      id: 'policy:dry-run', policyId: input.policyId, version: (versions.length ? Math.max(...versions) : 0) + 1,
-      scope: input.scope, scopeRef: input.scopeRef, domain, status: 'active', effectiveAt, expiresAt,
-      supersedes: target?.id, authorization: { source: input.source, employeeId: actor.employeeId, at: now, ...(input.ownerQuote ? { ownerQuote: input.ownerQuote } : {}) },
-      payload, hash: policyHash({ policyId: input.policyId, version: (versions.length ? Math.max(...versions) : 0) + 1,
-        scope: input.scope, scopeRef: input.scopeRef, domain, effectiveAt, expiresAt, payload }), createdAt: now, createdBy: actor.employeeId,
-    };
-    const projected = rows.map(row => row.id === target?.id ? { ...row, status: 'superseded' as PolicyStatus, supersededBy: synthetic.id } : row);
-    const after = resolveEffective([...projected, synthetic], chain, epoch + 1, now);
-    // 候选集与派工/领取判定同源（R1）：判定侧对所有在办任务跑 dispatchVerdict，这里就不能按 policy_hash 预筛——
-    // 上线前既存、没有策略登记的任务正是最需要被列出来的那批。分页读到底，读满上限时在视图里显式报告截断。
-    const scan = await scanInFlightTasks<TaskRow & { goal_project?: RecordId }>(this.db);
-    const affectedTasks: PolicyPlanView['affectedTasks'] = [];
-    for (const row of scan.rows) {
-      const task = view(row);
-      const taskChain = this.chainOfRow(row);
-      const next = resolveEffective([...projected, synthetic], taskChain, epoch + 1, now);
-      if ((row.policy_hash ?? '') === next.hash) continue;
-      // 与派工/领取同源：试算里的"失去授权"就是那次判定会拦下的情形（含域整体消失的到期/撤销）。
-      const verdict = dispatchVerdict({ state: row.state, executorRole: task.executorRole, kind: task.kind,
-        ...(task.goalId ? { goalId: task.goalId } : {}),
-        ...(task.workIntent ? { workIntent: task.workIntent } : {}),
-        ...(row.policy_hash ? { policyHash: row.policy_hash } : {}),
-        ...(row.policy_block_reason ? { policyBlockReason: row.policy_block_reason } : {}),
-        registeredDomains: registeredDomainsOf(row) }, next);
-      affectedTasks.push({ id: task.id, title: task.title, state: task.state, currentEmployee: task.currentEmployee,
-        fromHash: row.policy_hash ?? undefined, toHash: next.hash, losesAuthorization: verdict.verdict === 'blocked',
-        ...(verdict.verdict === 'blocked' ? { reason: verdict.reason } : {}) });
-    }
-    const diff = contractDiff(before, after);
-    const planHash = HASH(JSON.stringify({ epoch, after: after.hash, affected: affectedTasks.map(t => `${t.id}:${t.toHash}`).sort() }));
-    return { scopeChain: chain, before, after, diff, affectedTasks, scanned: scan.scanned, scanLimit: scan.scanLimit,
-      truncated: scan.truncated, planHash };
-  }
-
-  /**
-   * 把全量试算裁成一页（SYS06 R1(b)）：受影响清单永远在 48 KiB 预算内返回，装不下就分页而不是整份拒绝。
-   * 光标绑定调用者与同一份试算（planHash），所以翻页期间提案或 epoch 一旦变化就拒绝，不会把两版清单拼在一起。
-   * 页面按真实序列化大小（answerBytes）裁，不按条数猜。
-   */
-  private async pagePolicyPlan(actor: Principal, input: Pick<PolicyPlanInput, 'pageSize' | 'cursor'>,
-    plan: Awaited<ReturnType<SurrealCompanyCore['computePolicyPlan']>>): Promise<PolicyPlanView> {
-    const all = plan.affectedTasks;
-    const defaultPage = 40;
-    const pageSize = input.pageSize === undefined ? defaultPage : Math.floor(input.pageSize);
-    if (!Number.isFinite(pageSize) || pageSize < 1 || pageSize > 200) {
-      throw new CompanyError('invalid', 'pageSize must be an integer between 1 and 200');
-    }
-    let offset = 0;
-    const key = await this.cursorKey();
-    if (input.cursor !== undefined) {
-      const body = openCursor(input.cursor, key, Date.now());
-      // 分开报：别人的光标是 forbidden；同一个调用者、但试算已经变了是 conflict（从第一页重跑才对——报 forbidden
-      // 会让人以为是自己权限的问题）。判据是 planHash：它只覆盖 epoch、after 契约 hash 与受影响清单，
-      // 所以与受影响清单无关的在办变化（例如某条无关任务新建或完成）不会让光标失效。
-      if (body.k !== 'policy-plan' || body.c !== actor.employeeId) {
-        throw new CompanyError('forbidden', 'cursor belongs to another caller or another listing; run the plan again');
-      }
-      if (body.q !== plan.planHash) {
-        throw new CompanyError('conflict', 'the plan changed since this cursor was issued (the effective epoch or the affected list differ); run the plan again from its first page');
-      }
-      offset = body.seq;
-    }
-    const build = (kept: typeof all, start: number): PolicyPlanView => {
-      const end = start + kept.length;
-      const page: PolicyPlanPage = {
-        pageSize, returned: kept.length, total: all.length, hasMore: end < all.length, budgetBytes: RESPONSE_BUDGET_BYTES,
-        ...(end < all.length ? { nextCursor: sealCursor({ v: 1, k: 'policy-plan', c: actor.employeeId, q: plan.planHash, sid: 'plan', seq: end, exp: Date.now() + POLICY_PLAN_CURSOR_TTL_MS }, key) } : {}),
-      };
-      return { ...plan, affectedTasks: kept, page };
-    };
-    // pageSize 是上限：真正发送的一页还要按字节裁，保证 answerBytes 永远在预算内。
-    const candidates = all.slice(offset, offset + pageSize);
-    const fit = (kept: typeof all): number => fitCount(kept, subset => answerBytes(build([...subset], offset)), RESPONSE_BUDGET_BYTES);
-    const keptCount = fit(candidates);
-    if (keptCount === 0 && candidates.length > 0) {
-      // 单条超预算：受影响清单没有收窄入参，这一条也补不了页——如实报它的字节数，让人知道是"这一条太大"。
-      throw new CompanyError('invalid', `one affected task entry alone is ${answerBytes(build(candidates.slice(0, 1), offset))} bytes, over the ${RESPONSE_BUDGET_BYTES}-byte budget; a single entry cannot be paged, so no page can carry it`);
-    }
-    return build(candidates.slice(0, keptCount), offset);
-  }
-
-  /**
-   * 执行隔离（RB01）：把已经不再被有效契约授权的在办任务置为可见的 blocked（等待老板）并释放租约。
-   * 这条路径是刻意选的：blocked+blocked_to=owner 是旧 release 也认得的隔离状态，回滚到旧版时它们不会被误派工，
-   * 而只写新字段（旧版会忽略）会留下"旧版照派、新版拒领"的窗口。
-   */
-  async policyEnforce(credential: Credential, input: PolicyEnforceInput): Promise<PolicyEnforceView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only the owner may enforce a policy change');
-    requireText(input.reason, 'reason', 2, 4000);
-    if (!input.taskIds?.length) throw new CompanyError('invalid', 'policyEnforce needs the task ids it should isolate (from policy_plan)');
-    if (input.taskIds.length > 200) throw new CompanyError('invalid', 'policyEnforce is limited to 200 tasks per call');
-    const blocked: string[] = [], alreadyBlocked: string[] = [], absent: string[] = [];
-    let audited = 0;
-    for (const taskId of [...new Set(input.taskIds)]) {
-      const row = await this.db.select<TaskRow>(id('task', taskId));
-      if (!row) { absent.push(taskId); continue; }
-      if (row.state === 'done' || row.state === 'void') { absent.push(taskId); continue; }
-      const chain = this.chainOfRow(row);
-      const { contract } = await this.effectiveContractFor(chain);
-      const task = view(row);
-      const verdict = dispatchVerdict({ state: row.state, executorRole: task.executorRole, kind: task.kind,
-        ...(task.goalId ? { goalId: task.goalId } : {}),
-        ...(task.workIntent ? { workIntent: task.workIntent } : {}),
-        ...(row.policy_hash ? { policyHash: row.policy_hash } : {}),
-        ...(row.policy_block_reason ? { policyBlockReason: row.policy_block_reason } : {}),
-        registeredDomains: registeredDomainsOf(row) }, contract);
-      if (verdict.verdict === 'clear') { absent.push(taskId); continue; }
-      const reason = verdict.verdict === 'stale'
-        ? `策略隔离：${row.policy_block_reason ?? '原授权已换版，需按新契约重新领取'}`
-        : `策略收权隔离：${verdict.reason}`;
-      const evidence = `policy_enforce task=${taskId} from=${row.policy_hash ?? 'none'} to=${contract.hash} 理由：${input.reason}`;
-      try {
-        const next = await this.txTask<TaskRow>(`BEGIN;
-          LET $who = SELECT * FROM ONLY $actor;
-          IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities { THROW 'policy denied: actor revoked or forbidden' };
-          LET $t = SELECT * FROM ONLY $task;
-          IF $t = NONE { THROW 'policy invalid: task not found' };
-          IF $t.state IN ['done', 'void'] { THROW 'policy invalid: task is closed' };
-          LET $next = UPDATE ONLY $task SET
-            state = 'blocked', blocked_to = 'owner', resume_state = IF $t.state IN ['ready','doing','review'] THEN $t.state ELSE $t.resume_state END,
-            resume_role = IF $t.state IN ['ready','doing','review'] THEN (IF $t.state = 'review' THEN $t.reviewer_role ELSE $t.executor_role END) ELSE $t.resume_role END,
-            policy_block_reason = $reason, current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
-            version = $t.version + 1
-            RETURN AFTER;
-          UPDATE employee SET active_task = NONE WHERE active_task = $task;
-          CREATE audit CONTENT { task: $task, actor: $actor, action: 'policy_blocked', evidence: $evidence, version: $next.version, at: time::now() };
-          RETURN $next;
-          COMMIT;`, {
-          actor: id('employee', actor.employeeId), task: id('task', taskId), reason, evidence,
-        });
-        audited++;
-        if (next.state === 'blocked' && row.policy_block_reason) alreadyBlocked.push(taskId); else blocked.push(taskId);
-      } catch (error) {
-        if (error instanceof CompanyError && error.code === 'invalid') { absent.push(taskId); continue; }
-        throw error;
-      }
-    }
-    return { blocked, alreadyBlocked, absent, audited };
-  }
-
-  /**
-   * 给 ops broker 用的工具/别名边界：范围内生效的 tool_scope 决定允许清单，undefined 表示不设机器限制。
-   * 判定本身复用 policy.ts 的 checkToolScope，broker 只负责把工具名与别名递进来——两边不会各判一套。
-   */
-  async policyToolScope(project: string, input?: { tool?: string; alias?: string; toolNames?: readonly string[] }): Promise<{
-    version: number; hash: string; allowedTools?: string[]; allowedAliases?: string[]; verdict: PolicyVerdict;
-  }> {
-    const chain = this.policyChain({ projectId: project, includeTask: false });
-    const { contract } = await this.effectiveContractFor(chain);
-    const payload = domainPayload(contract, 'tool_scope');
-    const verdict: PolicyVerdict = input?.tool === undefined ? { ok: true }
-      : checkToolScope(contract, { tool: input.tool, alias: input.alias, toolNames: input.toolNames ?? [input.tool] });
-    return { version: contract.version, hash: contract.hash,
-      ...(payload ? { allowedTools: payload.allowedTools, allowedAliases: payload.allowedAliases } : {}), verdict };
-  }
-
-  /**
-   * 调度器派工前的只读判定（SYS06 AC02）：任务在当前有效契约下是否仍可被派工。
-   * 返回 blocked 时调度器按 policy_blocked 拦住候选；返回 stale 表示契约已变但仍授权——claim 会重新登记，
-   * 不静默改变已批的艺术要求（本层不改验收条件与 context）。
-   */
-  async policyDispatchVerdict(taskId: TaskId): Promise<{ verdict: 'clear' | 'stale' | 'blocked'; reason?: string; hash?: string }> {
-    const row = await this.db.select<TaskRow>(id('task', taskId));
-    if (!row) throw new CompanyError('not_found', 'Task not found');
-    if (row.state === 'done' || row.state === 'void') return { verdict: 'clear' };
-    const chain = this.chainOfRow(row);
-    const { contract } = await this.effectiveContractFor(chain);
-    const task = view(row);
-    // 判定复用 policy.ts 的 dispatchVerdict：调度器（workforce）走的是同一段，两边结论不会分叉。
-    return dispatchVerdict({ state: row.state, executorRole: task.executorRole, kind: task.kind,
-      ...(task.goalId ? { goalId: task.goalId } : {}),
-      ...(task.workIntent ? { workIntent: task.workIntent } : {}),
-      ...(row.policy_hash ? { policyHash: row.policy_hash } : {}),
-      ...(row.policy_block_reason ? { policyBlockReason: row.policy_block_reason } : {}),
-      registeredDomains: registeredDomainsOf(row) }, contract);
-  }
-
-  async setIndependence(credential: Credential, input: SetIndependence): Promise<TaskView> {
-    const actor = await this.authorized(credential, 'manage');
-    requireText(input.taskId, 'taskId', 1, 200);
-    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
-    const fields = normalizeIndependence({ taskId: input.taskId, stages: input.stages, sources: input.sources, mode: input.mode,
-      excluded: input.excluded, reason: input.reason });
-    const idem = this.idemId(actor.employeeId, 'independence_set', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ taskId: input.taskId, ...fields, expectedVersion: input.expectedVersion }));
-    const prior = await this.replay(idem, digest);
-    if (prior) return prior;
-    const current = await this.db.select<TaskRow>(id('task', input.taskId));
-    if (!current) throw new CompanyError('not_found', 'Task not found');
-    if (current.state === 'done' || current.state === 'void') throw new CompanyError('invalid', 'Independence invalid: task is closed');
-    if (current.version !== input.expectedVersion) throw new CompanyError('conflict', 'Independence moved: task version changed; re-read and retry');
-    if (current.current_employee && (current.lease_expires_at ?? 0) > Math.floor(Date.now() / 1000)) {
-      throw new CompanyError('conflict', 'Independence refused: the task is leased; release it or wait for the lease to end');
-    }
-    for (const source of fields.sources) {
-      if (!(await this.db.select<TaskRow>(id('task', source)))) throw new CompanyError('not_found', `Independence source not found: ${source}`);
-    }
-    for (const employee of fields.excluded) {
-      if (!(await this.db.select<EmployeeRow>(id('employee', employee)))) throw new CompanyError('invalid', `Independence excluded employee not found: ${employee}`);
-    }
-    const revision = (current.independence?.revision ?? 0) + 1;
-    const evidence = `${input.reason}\n[independence_set] task=${input.taskId} revision=${revision} stages=${fields.stages.join(',')} mode=${fields.mode} sources=${fields.sources.join(',') || 'none'} excluded=${fields.excluded.join(',') || 'none'} expectedVersion=${input.expectedVersion}`;
-    const query = `BEGIN;
-      LET $now = time::unix(time::now());
-      LET $who = SELECT * FROM ONLY $actor;
-      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities { THROW 'independence denied: actor revoked or forbidden' };
-      LET $t = SELECT * FROM ONLY $task;
-      IF $t = NONE { THROW 'independence invalid: task not found' };
-      IF $t.version != $expected { THROW 'independence moved: task version changed' };
-      IF $t.state IN ['done', 'void'] { THROW 'independence invalid: task is closed' };
-      IF $t.current_employee != NONE AND $t.lease_expires_at > $now { THROW 'independence refused: task is leased' };
-      LET $next = UPDATE ONLY $task SET
-        independence = { schema: 1, revision: $revision, stages: $stages, sources: $sources, mode: $mode, excluded: $excluded, reason: $reason, setBy: $employee, setAt: time::now() },
-        version = $t.version + 1
-        RETURN AFTER;
-      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'independence_set', evidence: $evidence, version: $next.version, at: time::now() };
-      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
-      RETURN $next;
-      COMMIT;`;
-    const vars = {
-      actor: id('employee', actor.employeeId), employee: actor.employeeId, task: id('task', input.taskId), expected: input.expectedVersion,
-      revision, stages: fields.stages, sources: fields.sources, mode: fields.mode, excluded: fields.excluded, reason: fields.reason,
-      evidence, digest, idem, audit: id('audit', randomUUID()),
-    };
-    try {
-      return view(await this.txTask<TaskRow>(query, vars));
-    } catch (error) {
-      const replayedAfterFailure = await this.replay(idem, digest);
-      if (replayedAfterFailure) return replayedAfterFailure;
-      throw error;
-    }
-  }
-
-  /**
-   * Manager write of an identity principal (SYS-DISP IR02/Q3): the explicit, manage-controlled link that makes several
-   * employeeIds one person for independence purposes. This is the only cross-employee identity key — a definition, provider,
-   * model, name or directory never implies it — so registering one is a deliberate, audited act with a required reason.
-   * The write sets the principal's exact employee set under a compare-and-set on the principal row, is idempotent per
-   * (key, payload), and refuses while any named employee holds a live lease: an identity is never changed under a running
-   * task. Removing an employee leaves its history rows as they are (audit facts are never rewritten).
-   */
-  async setIdentityPrincipal(credential: Credential, input: SetIdentityPrincipal): Promise<IdentityPrincipalView> {
-    const actor = await this.authorized(credential, 'manage');
-    const employees = [...new Set((input.employees ?? []).filter((employee): employee is string => typeof employee === 'string'))];
-    if (employees.length === 0) throw new CompanyError('invalid', 'Invalid principal: name at least one employee');
-    if (employees.length > 20) throw new CompanyError('invalid', 'Invalid principal: at most 20 employees');
-    for (const employee of employees) requireText(employee, 'employee', 1, 200);
-    requireText(input.reason, 'reason', 8, 2000);
-    if (input.principalId !== undefined) requireText(input.principalId, 'principalId', 1, 200);
-    if (input.expectedVersion !== undefined && (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1)) {
-      throw new CompanyError('invalid', 'Invalid expectedVersion');
-    }
-    const idem = this.idemId(actor.employeeId, 'identity_principal_set', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ principalId: input.principalId ?? '', employees, reason: input.reason,
-      expectedVersion: input.expectedVersion ?? 0 }));
-    // A new principal gets its id before the transaction, so the idempotency row and the audit row name the same id.
-    const principalId = input.principalId ?? `p_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
-    const replayed = await this.replayPrincipal(idem, digest);
-    if (replayed) return replayed;
-    const existing = input.principalId === undefined ? undefined : await this.db.select<{ version?: number }>(id('principal', input.principalId));
-    if (input.principalId !== undefined && !existing) throw new CompanyError('not_found', `Principal not found: ${input.principalId}`);
-    const version = (existing?.version ?? 0) + 1;
-    // An identity is never changed under a running task: no named employee may hold a live lease. `task.current_employee`
-    // stores the plain employee id (see the lease readers), so this compares strings and reads the lease's own row.
-    const [leased] = await this.db.query<[Array<{ current_employee?: string }>]>(
-      'SELECT current_employee FROM task WHERE current_employee IN $ids AND lease_expires_at > time::unix(time::now());', { ids: employees });
-    if ((leased ?? []).length > 0) {
-      throw new CompanyError('conflict', `Principal refused: ${leased[0]!.current_employee} holds a live lease; release it or wait for the lease to end`);
-    }
-    for (const employee of employees) {
-      const row = await this.db.select<EmployeeRow>(id('employee', employee));
-      if (!row) throw new CompanyError('not_found', `Employee not found: ${employee}`);
-    }
-    const evidence = `${input.reason}\n[identity_principal_set] principal=${input.principalId ?? '(new)'} employees=${employees.join(',')} expectedVersion=${input.expectedVersion ?? 0}`;
-    const query = `BEGIN;
-      LET $now = time::unix(time::now());
-      LET $who = SELECT * FROM ONLY $actor;
-      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities { THROW 'principal denied: actor revoked or forbidden' };
-      LET $p = SELECT * FROM ONLY $principal;
-      IF $p = NONE AND $existing { THROW 'principal not found' };
-      IF $p != NONE AND $p.version != $expected { THROW 'principal moved: version changed' };
-      FOR $e IN $employees {
-        LET $row = SELECT * FROM ONLY $e;
-        IF $row = NONE OR $row.revoked = true { THROW 'principal invalid: employee missing or revoked' };
-        // The lease lives on the task row (current_employee); re-checked here so a lease granted between the read and this
-        // write conflicts instead of silently re-identifying a running holder.
-        LET $leased = SELECT VALUE current_employee FROM task WHERE current_employee IN $ids AND lease_expires_at > $now;
-        IF array::len($leased) > 0 { THROW 'principal refused: employee is leased' };
-      };
-      LET $next = UPSERT ONLY $principal CONTENT { reason: $reason, employees: $employees, version: $version, created_at: time::now() } RETURN AFTER;
-      FOR $e IN $employees { UPDATE ONLY $e SET principal = $principal; };
-      CREATE ONLY $audit CONTENT { actor: $actor, action: 'identity_principal_set', evidence: $evidence, version: $version, at: time::now() };
-      // The idempotent result stores the very timestamp the write returns, so a replay is byte-identical to the first call.
-      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: { id: $principal, employees: $employees, reason: $reason, set_by: $employee, set_at: $next.created_at } };
-      RETURN { created_at: $next.created_at, set_by: $employee };
-      COMMIT;`;
-    const vars = {
-      actor: id('employee', actor.employeeId), employee: actor.employeeId, principal: id('principal', principalId),
-      employees: employees.map(employee => id('employee', employee)),
-      // task.current_employee stores the plain employee id (see the lease readers), so the guard compares strings.
-      ids: employees,
-      reason: input.reason, version, existing: input.principalId !== undefined, expected: input.expectedVersion ?? 0,
-      evidence, digest, idem, audit: id('audit', randomUUID()),
-    };
-    try {
-      const written = await this.txTask<{ created_at?: Date | string; set_by?: unknown }>(query, vars);
-      return principalView(principalId, employees, input.reason,
-        written.set_by instanceof RecordId ? asId(written.set_by) : String(written.set_by ?? actor.employeeId),
-        written.created_at);
-    } catch (error) {
-      const replayedAfterFailure = await this.replayPrincipal(idem, digest);
-      if (replayedAfterFailure) return replayedAfterFailure;
-      throw error;
-    }
-  }
-
-  /**
-   * Idempotent replay of a principal write: the same key and payload returns the stored result verbatim (same principal id, same
-   * setBy and setAt), and a different payload under that key conflicts. The stored row is the API view the first write returned.
-   */
-  private async replayPrincipal(ident: RecordId, payloadDigest: string): Promise<IdentityPrincipalView | undefined> {
-    const prior = await this.db.select<IdempotencyRow & { result?: unknown }>(ident);
-    if (!prior) return undefined;
-    if (prior.payload_digest !== payloadDigest) throw new CompanyError('conflict', 'Idempotency key reused with different input');
-    const result = prior.result as { id?: unknown; employees?: unknown[]; reason?: string; set_by?: string; set_at?: Date | string } | undefined;
-    if (!result?.id) return undefined;
-    // The driver hands record links back as RecordId values, so the stored view is normalized to the API's plain ids.
-    const id = result.id instanceof RecordId ? asId(result.id) : String(result.id);
-    const employees = (result.employees ?? []).map(value => value instanceof RecordId ? asId(value) : String(value));
-    return principalView(id, employees, result.reason ?? '', result.set_by ?? '', result.set_at);
-  }
-
-  /**
-   * owner only (manage): records the code implementer of an engineering task whose bound implementer cannot continue
-   * (withdrawn, departed, durable quota or runtime failure). The task must be in execute phase: ready or doing, or blocked
-   * with an execute resume state. A block raised in review resumes in review, so it is refused like any review-phase task. One compare-and-set
-   * transaction re-checks every basis: the task version, the new implementer's role, execute capability and track,
-   * and, when the new implementer is a current reviewer, a named replacement reviewer that is neither an author nor
-   * the new implementer. A lease held by someone else is revoked in the same write (the fence moves, so the old
-   * holder's proof is refused). Audit, outbox and the idempotency row land together. Authorship is never removed.
-   * The target's employee record is written in the same transaction, so a concurrent retirement of the target conflicts
-   * with this takeover instead of both succeeding (retirement.ts, Workforce.retire).
-   */
-  async implementerTakeover(credential: Credential, input: ImplementerTakeover): Promise<TaskView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may take over a task implementer');
-    requireText(input.taskId, 'taskId', 1, 200);
-    requireText(input.toEmployee, 'toEmployee', 1, 200);
-    requireText(input.reason, 'reason', 8, 2000);
-    if (input.replacementReviewer !== undefined) requireText(input.replacementReviewer, 'replacementReviewer', 1, 200);
-    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
-    const idem = this.idemId(actor.employeeId, 'implementer_takeover', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ taskId: input.taskId, toEmployee: input.toEmployee,
-      replacementReviewer: input.replacementReviewer ?? '', expectedVersion: input.expectedVersion, reason: input.reason }));
-    const prior = await this.replay(idem, digest);
-    if (prior) return prior;
-    const current = await this.db.select<TaskRow>(id('task', input.taskId));
-    if (!current) throw new CompanyError('not_found', 'Task not found');
-    if (current.executor_role !== 'engineering') {
-      throw new CompanyError('invalid', 'implementer takeover invalid: only engineering tasks have a code implementer');
-    }
-    const contrib = await readContributionView(this.db, input.taskId);
-    const facts = contrib.facts;
-    if (input.toEmployee === facts.implementer) throw new CompanyError('invalid', 'implementer takeover invalid: employee is already the implementer');
-    if (facts.reviewers.includes(input.toEmployee) && !input.replacementReviewer) {
-      throw new CompanyError('invalid', 'implementer takeover invalid: a current reviewer becoming implementer needs a named independent replacement reviewer');
-    }
-    if (input.replacementReviewer && (input.replacementReviewer === input.toEmployee || facts.excluded.includes(input.replacementReviewer))) {
-      throw new CompanyError('invalid', 'implementer takeover invalid: replacement reviewer must be independent of every author');
-    }
-    const gate = await this.independenceGate(input.taskId, contrib.policy, 'execute');
-    await this.refuseIndependent(gate, input.toEmployee);
-    await this.contributionReadHook?.(input.taskId);
-    const evidence = `${input.reason}\n[implementer_takeover] task=${input.taskId} from=${facts.implementer ?? 'none'} to=${input.toEmployee} replacementReviewer=${input.replacementReviewer ?? 'none'} expectedVersion=${input.expectedVersion}`;
-    const query = `BEGIN;
-      LET $now = time::unix(time::now());
-      LET $who = SELECT * FROM ONLY $actor;
-      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'actor revoked or forbidden' };
-      LET $t = SELECT * FROM ONLY $task;
-      IF $t = NONE { THROW 'implementer takeover invalid: task not found' };
-      IF $t.version != $expected { THROW 'implementer takeover moved: task version changed' };
-      IF $t.version != $seen { THROW 'implementer takeover moved: contribution history changed' };
-      IF $t.state NOT IN ['ready', 'doing'] AND ($t.state != 'blocked' OR $t.resume_state NOT IN ['ready', 'doing']) { THROW 'implementer takeover moved: task is not in execute phase' };
-      LET $to = SELECT * FROM ONLY $target;
-      IF $to = NONE OR $to.revoked = true OR 'execute' NOT IN $to.capabilities OR $to.role != $t.executor_role { THROW 'implementer takeover invalid: target employee cannot execute this task' };
-      ${EMPLOYEE_WORKSPACE_SQL('$to', 'implementer takeover invalid')}
-      ${INDEPENDENCE_GUARD_SQL}
-      LET $to_tracks = $to.def.tracks ?? [];
-      IF $t.discipline != NONE AND array::len($to_tracks) > 0 AND $t.discipline NOT IN $to_tracks { THROW 'implementer takeover invalid: target employee track does not cover the task' };
-      IF $replacement != NONE {
-        LET $rep = SELECT * FROM ONLY $replacement;
-        IF $rep = NONE OR $rep.revoked = true OR 'review' NOT IN $rep.capabilities OR $rep.role != $t.reviewer_role { THROW 'implementer takeover invalid: replacement reviewer cannot review this task' };
-        IF $rep.id IN $excluded_ids { THROW 'implementer takeover invalid: replacement reviewer must be independent of every author' };
-      };
-      LET $holder = $t.current_employee;
-      LET $next = UPDATE ONLY $task SET
-        implementer = $target_key,
-        current_employee = NONE,
-        delivery_id = NONE,
-        lease_expires_at = NONE,
-        fence = IF $holder != NONE THEN $t.fence + 1 ELSE $t.fence END,
-        version = $t.version + 1
-        RETURN AFTER;
-      IF $holder != NONE { UPDATE employee SET active_task = NONE WHERE active_task = $task };
-      UPDATE ONLY $target SET implementer_bound_at = time::now();
-      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'implementer_takeover', evidence: $evidence, version: $next.version, at: time::now() };
-      // Being bound as the implementer is the record that this employee writes this task's code (SYS-DISP IR01/Q1: a real
-      // implementer never reviews its own delivery, even after the binding moves on to the next engineer). The row carries the
-      // new implementer as its actor in the execute phase, so the contribution derivation reads it as authorship rather than
-      // treating a claim-only holder and a bound implementer alike.
-      CREATE ONLY $bound CONTENT { task: $task, actor: $target, action: 'implementer_bound', phase: 'execute', evidence: $evidence, version: $next.version, at: time::now() };
-      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE ONLY $outbox CONTENT { task: $task, kind: 'implementer_takeover', sequence: $sequence.value, payload: { version: $next.version, implementer: $target_key }, at: time::now() };
-      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
-      RETURN $next;
-      COMMIT;`;
-    const vars = {
-      actor: id('employee', actor.employeeId), task: id('task', input.taskId), expected: input.expectedVersion,
-      target: id('employee', input.toEmployee), target_key: input.toEmployee,
-      ops_repo: this.worktrees?.options.opsRepo ?? this.companyReleaseRepo, indep_guards: gate?.guards ?? [],
-      replacement: input.replacementReviewer ? id('employee', input.replacementReviewer) : undefined,
-      excluded_ids: [...new Set([...facts.excluded, input.toEmployee])].map(employee => id('employee', employee)),
-      seen: contrib.version ?? -1, evidence, digest, idem, audit: id('audit', randomUUID()),
-      bound: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
-    };
-    try {
-      return view(await this.txTask<TaskRow>(query, vars));
-    } catch (error) {
-      const replayedAfterFailure = await this.replay(idem, digest);
-      if (replayedAfterFailure) return replayedAfterFailure;
-      throw error;
-    }
-  }
-
-  /**
-   * Dispatcher-initiated implementer replacement. Called when the bound implementer's session is gone for good — the
-   * employee left the roster, or its session is archived, quarantined or parked in a failure that cannot be restarted —
-   * so the task can never be handed back, and the binding would keep every other engineer out forever. The write is the
-   * same compare-and-set transaction as the manager's takeover (version, target role/capability/track, a lease held by
-   * someone else is revoked, authorship is never removed); only the actor differs: the dispatcher acts on its own and
-   * the audit row records `system:dispatcher`. No credential is involved, so this is never exposed as an agent tool.
-   */
-  async systemImplementerTakeover(input: { taskId: string; toEmployee: string; expectedVersion: number; reason: string }): Promise<TaskView> {
-    requireText(input.taskId, 'taskId', 1, 200);
-    requireText(input.toEmployee, 'toEmployee', 1, 200);
-    requireText(input.reason, 'reason', 8, 2000);
-    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
-    const actor = 'system:dispatcher';
-    const idem = this.idemId(actor, 'implementer_takeover', `auto:${input.taskId}:${input.expectedVersion}:${input.toEmployee}`);
-    const digest = HASH(JSON.stringify({ taskId: input.taskId, toEmployee: input.toEmployee, expectedVersion: input.expectedVersion, reason: input.reason }));
-    const prior = await this.replay(idem, digest);
-    if (prior) return prior;
-    const current = await this.db.select<TaskRow>(id('task', input.taskId));
-    if (!current) throw new CompanyError('not_found', 'Task not found');
-    if (current.executor_role !== 'engineering') {
-      throw new CompanyError('invalid', 'implementer takeover invalid: only engineering tasks have a code implementer');
-    }
-    const contrib = await readContributionView(this.db, input.taskId);
-    const facts = contrib.facts;
-    if (input.toEmployee === facts.implementer) throw new CompanyError('invalid', 'implementer takeover invalid: employee is already the implementer');
-    if (facts.excluded.includes(input.toEmployee)) throw new CompanyError('invalid', 'implementer takeover invalid: the successor is an author of this task');
-    if (facts.reviewers.includes(input.toEmployee)) {
-      throw new CompanyError('invalid', 'implementer takeover invalid: a current reviewer cannot become the implementer without a named replacement reviewer');
-    }
-    const gate = await this.independenceGate(input.taskId, contrib.policy, 'execute');
-    await this.refuseIndependent(gate, input.toEmployee);
-    await this.contributionReadHook?.(input.taskId);
-    const evidence = `${input.reason}\n[implementer_takeover:auto] task=${input.taskId} from=${facts.implementer ?? 'none'} to=${input.toEmployee} expectedVersion=${input.expectedVersion}`;
-    const query = `BEGIN;
-      LET $now = time::unix(time::now());
-      LET $t = SELECT * FROM ONLY $task;
-      IF $t = NONE { THROW 'implementer takeover invalid: task not found' };
-      IF $t.version != $expected { THROW 'implementer takeover moved: task version changed' };
-      IF $t.version != $seen { THROW 'implementer takeover moved: contribution history changed' };
-      IF $t.state NOT IN ['ready', 'doing'] AND ($t.state != 'blocked' OR $t.resume_state NOT IN ['ready', 'doing']) { THROW 'implementer takeover moved: task is not in execute phase' };
-      LET $to = SELECT * FROM ONLY $target;
-      IF $to = NONE OR $to.revoked = true OR 'execute' NOT IN $to.capabilities OR $to.role != $t.executor_role { THROW 'implementer takeover invalid: target employee cannot execute this task' };
-      ${EMPLOYEE_WORKSPACE_SQL('$to', 'implementer takeover invalid')}
-      ${INDEPENDENCE_GUARD_SQL}
-      LET $to_tracks = $to.def.tracks ?? [];
-      IF $t.discipline != NONE AND array::len($to_tracks) > 0 AND $t.discipline NOT IN $to_tracks { THROW 'implementer takeover invalid: target employee track does not cover the task' };
-      LET $holder = $t.current_employee;
-      LET $next = UPDATE ONLY $task SET
-        implementer = $target_key,
-        current_employee = NONE,
-        delivery_id = NONE,
-        lease_expires_at = NONE,
-        fence = IF $holder != NONE THEN $t.fence + 1 ELSE $t.fence END,
-        version = $t.version + 1
-        RETURN AFTER;
-      IF $holder != NONE { UPDATE employee SET active_task = NONE WHERE active_task = $task };
-      UPDATE ONLY $target SET implementer_bound_at = time::now();
-      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'implementer_takeover', evidence: $evidence, version: $next.version, at: time::now() };
-      // The same authorship record the manager's takeover writes (see implementerTakeover): the new implementer is the
-      // person who writes this task's code and never reviews it.
-      CREATE ONLY $bound CONTENT { task: $task, actor: $target, action: 'implementer_bound', phase: 'execute', evidence: $evidence, version: $next.version, at: time::now() };
-      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE ONLY $outbox CONTENT { task: $task, kind: 'implementer_takeover', sequence: $sequence.value, payload: { version: $next.version, implementer: $target_key, automatic: true }, at: time::now() };
-      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
-      RETURN $next;
-      COMMIT;`;
-    const vars = {
-      task: id('task', input.taskId), expected: input.expectedVersion, target: id('employee', input.toEmployee),
-      target_key: input.toEmployee, seen: contrib.version ?? -1, evidence, digest, idem, actor,
-      ops_repo: this.worktrees?.options.opsRepo ?? this.companyReleaseRepo, indep_guards: gate?.guards ?? [],
-      audit: id('audit', randomUUID()), bound: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
-    };
-    try {
-      return view(await this.txTask<TaskRow>(query, vars));
-    } catch (error) {
-      const replayedAfterFailure = await this.replay(idem, digest);
-      if (replayedAfterFailure) return replayedAfterFailure;
-      throw error;
-    }
-  }
-
-  /**
-   * Shared read path for the preview and the repair gate: loads the goal, its references, the unfinished
-   * goal work and the candidate; evaluates every acceptance rule; and hashes the basis the repair compares
-   * against. Reads only.
-   */
-  private async goalAcceptanceState(goalId: string, candidateTaskId?: string, expectedOldTaskId?: string): Promise<GoalAcceptanceState> {
-    const goalRef = id('goal', goalId);
-    const goal = await this.db.select<GoalAcceptanceGoalRow>(goalRef);
-    if (!goal) throw new CompanyError('not_found', 'goal not found');
-    const refs = goal.tasks ?? {};
-    const manualId = refs.manual ? asId(refs.manual) : undefined;
-    const acceptanceId = refs.acceptance ? asId(refs.acceptance) : undefined;
-    const anchorIds = (goal.anchors ?? []).map(asId);
-    const oldId = manualId ?? acceptanceId;
-    const referenced = [...new Set([manualId, acceptanceId, ...anchorIds])].filter((x): x is string => Boolean(x));
-    const [referencedRows] = await this.db.query<[GoalAcceptanceTaskRow[]]>(
-      `SELECT ${GOAL_ACCEPTANCE_TASK_FIELDS} FROM task WHERE id IN $ids;`, { ids: referenced.map(x => id('task', x)) });
-    const oldRow = oldId ? (referencedRows ?? []).find(row => asId(row.id) === oldId) : undefined;
-    const [unfinishedRows] = await this.db.query<[GoalAcceptanceTaskRow[]]>(
-      `SELECT ${GOAL_ACCEPTANCE_TASK_FIELDS} FROM task WHERE goal = $goal AND state NOT IN ['done', 'void'] ORDER BY id;`, { goal: goalRef });
-    const [ownerRows] = await this.db.query<[Array<{ id: RecordId }>]>(
-      "SELECT id FROM task WHERE goal = $goal AND reviewer_role = 'owner' AND state != 'done';", { goal: goalRef });
-    const candidate = candidateTaskId ? await this.db.select<GoalAcceptanceTaskRow>(id('task', candidateTaskId)) : undefined;
-    const candidateDeps = (candidate?.dependencies ?? []).map(asId);
-    type DepRow = { id: RecordId; goal?: RecordId; state: TaskState; reviewer_role: ReviewerRole };
-    const depRows = candidateDeps.length
-      ? (await this.db.query<[DepRow[]]>('SELECT id, goal, state, reviewer_role FROM task WHERE id IN $deps;',
-          { deps: candidateDeps.map(x => id('task', x)) }))[0] ?? []
-      : [];
-    const depById = new Map(depRows.map(row => [asId(row.id), row] as const));
-    // A dependency path back to the candidate would make it wait on itself.
-    let cycle = false;
-    if (candidate && candidateTaskId && candidateDeps.length) {
-      const seen = new Set<string>(candidateDeps);
-      let frontier = candidateDeps;
-      while (frontier.length && !cycle) {
-        const [rows] = await this.db.query<[Array<{ dependencies?: RecordId[] }>]>(
-          'SELECT dependencies FROM task WHERE id IN $ids;', { ids: frontier.map(x => id('task', x)) });
-        const next = (rows ?? []).flatMap(row => (row.dependencies ?? []).map(asId));
-        if (next.includes(candidateTaskId)) cycle = true;
-        frontier = [...new Set(next)].filter(x => !seen.has(x));
-        for (const x of frontier) seen.add(x);
-      }
-    }
-
-    const unfinishedIds = unfinishedRows.map(row => asId(row.id)).filter(x => x !== candidateTaskId);
-    const missing = candidate ? unfinishedIds.filter(x => !candidateDeps.includes(x)) : [];
-    const checks: GoalAcceptanceCheck[] = [];
-    const deny = (code: GoalAcceptanceCheck['code'], message: string) => { checks.push({ code, message }); };
-    const pipeline = goal.pipeline ?? 'software';
-    const project = goal.project ? asId(goal.project) : undefined;
-    if (goal.state !== 'active') deny('conflict', `goal is ${goal.state}, not active`);
-    if (goal.tier !== 'quick') deny('invalid', 'goal tier must be quick');
-    if (pipeline !== 'software') deny('invalid', 'goal pipeline must be software');
-    if (!oldId) deny('conflict', 'goal has no manual or acceptance reference');
-    if (manualId !== acceptanceId) deny('conflict', 'manual and acceptance must reference the same task');
-    if (expectedOldTaskId !== undefined && expectedOldTaskId !== oldId) deny('conflict', 'goal acceptance reference moved: expected task differs');
-    if (oldId && !oldRow) deny('not_found', 'replaced acceptance task not found');
-    if (oldRow) {
-      if (oldRow.state !== 'void') deny('conflict', `replaced acceptance task must be void, found ${oldRow.state}`);
-      if (oldRow.reviewer_role === 'owner') deny('invalid', 'owner-reviewed acceptance is not repaired by this tool');
-    }
-    if (anchorIds.some(anchor => anchor !== oldId)) deny('conflict', 'goal anchors name tasks other than the replaced acceptance');
-    if (ownerRows.length) deny('invalid', 'goal has an owner acceptance gate; this repair does not apply');
-    if (!candidateTaskId) deny('invalid', 'candidateTaskId is required');
-    else if (!candidate) deny('not_found', 'candidate task not found');
-    else {
-      if (candidateTaskId === oldId) deny('invalid', 'candidate must differ from the replaced task');
-      if (!candidate.goal || asId(candidate.goal) !== goalId) deny('invalid', 'candidate belongs to another goal');
-      if ((candidate.project ? asId(candidate.project) : undefined) !== project) deny('invalid', 'candidate project must match the goal project');
-      if ((candidate.kind ?? 'task') !== 'task') deny('invalid', 'candidate must be kind task');
-      if (candidate.executor_role !== 'product' || candidate.reviewer_role !== 'owner') {
-        deny('invalid', 'candidate must be executed by product and reviewed by owner');
-      }
-      if (candidate.state !== 'blocked') deny('conflict', `candidate must be blocked, found ${candidate.state}`);
-      if (candidate.blocked_to) deny('conflict', 'candidate is blocked to owner');
-      if (candidate.submitted_by) deny('conflict', 'candidate already has a submission');
-      if (isLeased(candidate)) deny('conflict', 'candidate holds an active lease');
-      if (candidateDeps.includes(candidateTaskId)) deny('invalid', 'candidate must not depend on itself');
-      for (const dep of candidateDeps) {
-        const row = depById.get(dep);
-        if (!row) deny('not_found', `candidate dependency ${dep} not found`);
-        else if (!row.goal || asId(row.goal) !== goalId) deny('invalid', `candidate dependency ${dep} is outside the goal`);
-        else if (row.reviewer_role === 'owner' && row.state !== 'done') deny('invalid', `candidate depends on unapproved owner gate ${dep}`);
-      }
-      if (missing.length) deny('invalid', `candidate does not depend on unfinished goal work: ${missing.join(', ')}`);
-      if (cycle) deny('invalid', 'candidate would form a dependency cycle');
-    }
-
-    const hash = HASH(JSON.stringify({
-      v: 1,
-      goal: { id: goalId, state: goal.state, tier: goal.tier ?? null, pipeline, project: project ?? null,
-        manual: manualId ?? null, acceptance: acceptanceId ?? null, anchors: [...anchorIds].sort() },
-      replaced: oldRow ? { id: oldId, state: oldRow.state, executor: oldRow.executor_role, reviewer: oldRow.reviewer_role } : null,
-      candidate: candidate && candidateTaskId ? { id: candidateTaskId, state: candidate.state, version: candidate.version,
-        executor: candidate.executor_role, reviewer: candidate.reviewer_role, kind: candidate.kind ?? 'task',
-        goal: candidate.goal ? asId(candidate.goal) : null, project: candidate.project ? asId(candidate.project) : null,
-        blockedTo: candidate.blocked_to ?? null, submitted: Boolean(candidate.submitted_by), leased: isLeased(candidate),
-        dependencies: [...candidateDeps].sort() } : null,
-      unfinished: [...unfinishedIds].sort(),
-      ownerGates: (ownerRows ?? []).map(row => asId(row.id)).sort(),
-    }));
-    const view: GoalAcceptanceView = {
-      goal: {
-        id: goalId, title: goal.title, state: goal.state as GoalView['state'], tier: goal.tier as GoalTier | undefined,
-        pipeline, project,
-        tasks: Object.fromEntries(Object.entries(refs).filter(([, ref]) => ref).map(([key, ref]) => [key, asId(ref!)])),
-        anchors: anchorIds,
-      },
-      replaced: oldRow ? briefTask(oldRow) : undefined,
-      unfinished: unfinishedRows.filter(row => asId(row.id) !== candidateTaskId).map(briefTask),
-      candidate: candidate && candidateTaskId ? { ...briefTask(candidate), missing } : undefined,
-      diff: {
-        manual: { from: manualId, to: candidateTaskId ?? manualId },
-        acceptance: { from: acceptanceId, to: candidateTaskId ?? acceptanceId },
-        anchors: { from: anchorIds, to: candidateTaskId ? [candidateTaskId] : anchorIds },
-      },
-      violations: checks.map(check => ({ code: check.code, message: check.message })),
-      ready: checks.length === 0,
-      snapshot: { version: 1, hash },
-    };
-    return { view, checks, hash, candidate: candidate && candidateTaskId ? candidate : undefined, oldId, unfinishedIds };
-  }
-
-  private async replayStored<T>(ident: RecordId, payloadDigest: string): Promise<T | undefined> {
-    const prior = await this.db.select<{ payload_digest: string; result: T }>(ident);
-    if (!prior) return undefined;
-    if (prior.payload_digest !== payloadDigest) throw new CompanyError('conflict', 'Idempotency key reused with different input');
-    return prior.result;
-  }
-
-  /**
-   * owner only: rebind a blocked task to a registered project (task-level override over goal.project).
-   * The controlled unblock path for tasks stuck on the wrong repo: version-guarded, idempotent,
-   * fully audited. Only stopped, un-leased, never-submitted blocked tasks qualify; owner-blocked
-   * tasks are refused so a rebind can never bypass an owner gate. The stale worktree assignment
-   * is cleared (worktree_ref turns 'released' through its own ref state logic — the physical
-   * tree is left for the normal reclaim lifecycle, never deleted here), and the next legitimate
-   * claim allocates a fresh task branch in the target repo.
    */
   async taskProjectUpdate(credential: Credential, input: { taskId: TaskId; project: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
     return echoTask(await this.taskProjectUpdateRecord(credential, input));
@@ -7199,279 +2776,6 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * (owner gates, review-phase blocks and live leases refuse); kind=task only, so the release leg stays a read leg.
    * Write authority is re-judged under the task's own policy chain, the implement-leg baseline criteria are merged when
    * the acceptance gate is on, and the read assignment is cleared so the next claim allocates an exclusive code tree.
-   */
-  async taskIntentUpdate(credential: Credential, input: { taskId: TaskId; lane?: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may change a task work intent');
-    requireText(input.taskId, 'task', 1, 200);
-    requireText(input.text, 'evidence', 4, 4000);
-    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
-    // A replay of the same call returns its first answer, even though the task already carries code intent by then.
-    const idem = this.idemId(actor.employeeId, 'task_intent_update', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ taskId: input.taskId, lane: input.lane ?? null, expectedVersion: input.expectedVersion, text: input.text }));
-    const replay = await this.replay(idem, digest);
-    if (replay) return replay;
-    const row = await this.taskRowWithProject(input.taskId);
-    if (!row) throw new CompanyError('not_found', 'Task not found');
-    if ((row.kind ?? 'task') !== 'task' || row.executor_role !== 'engineering') {
-      throw new CompanyError('forbidden', 'Only engineering tasks of kind=task can become code tasks');
-    }
-    if (row.work_intent?.kind === 'code') throw new CompanyError('conflict', 'Task already has code intent');
-    if (row.work_intent?.kind === 'assets') throw new CompanyError('forbidden', 'Asset tasks keep their directory scope');
-    const intent: WorkIntent = { kind: 'code', ...(input.lane ?? row.work_intent?.lane ? { lane: input.lane ?? row.work_intent!.lane } : {}) };
-    validateIntent(intent);
-    const goalId = row.goal ? asId(row.goal) : undefined;
-    const { contract } = await this.effectiveContractFor(this.chainOfRow(row));
-    const verdict = checkWriteAuthority(contract, { role: 'engineering', kind: 'task', ...(goalId ? { goalId } : {}), intent });
-    if (!verdict.ok) throw new CompanyError(verdict.code, `策略拒绝改为 code：${verdict.reason}（policy v${contract.version}）`);
-    let criteria: AcceptanceCriterion[];
-    try { criteria = validateAcceptanceCriteria(row.acceptance_criteria); } catch { criteria = []; }
-    if ((await loadAcceptanceGate(this.db)).enabled) criteria = mergeAcceptanceCriteria('implement', criteria);
-    const evidence = `${input.text}\n[intent] ${row.work_intent?.kind ?? 'none'} -> code${intent.lane ? ` lane=${intent.lane}` : ''}`;
-    try {
-      const next = await this.txTask(`BEGIN;
-        LET $t = SELECT * FROM ONLY $task;
-        IF $t = NONE { THROW 'task not found' };
-        IF $t.version != $expected { THROW 'task version moved' };
-        IF $t.state != 'blocked' { THROW 'intent change denied: only blocked tasks can change intent' };
-        IF $t.blocked_to = 'owner' { THROW 'intent change denied: owner blocked task' };
-        IF $t.resume_state = 'review' { THROW 'intent change denied: review-phase task' };
-        IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'intent change denied: active lease' };
-        LET $next = UPDATE ONLY $task SET
-          work_intent = $intent, acceptance_criteria = $criteria, acceptance_version = $criteria_version,
-          worktree = NONE, current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE, handover = NONE,
-          version = $t.version + 1 RETURN AFTER;
-        UPDATE employee SET active_task = NONE WHERE active_task = $task;
-        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'task_intent_update', evidence: $evidence, version: $next.version, at: time::now() };
-        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        CREATE ONLY $outbox CONTENT { task: $task, kind: 'task_intent_updated', sequence: $sequence.value,
-          payload: { intent: $intent, version: $next.version }, at: time::now() };
-        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
-        RETURN $next;
-        COMMIT;`, {
-        actor: id('employee', actor.employeeId), task: id('task', input.taskId), intent,
-        criteria: criteria.length ? criteria : undefined, criteria_version: criteria.length ? ACCEPTANCE_CRITERIA_VERSION : undefined,
-        expected: input.expectedVersion, evidence, idem, digest,
-        audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
-      });
-      return echoTask(view(next));
-    } catch (error) {
-      const replayed = await this.replay(idem, digest);
-      if (replayed) return replayed;
-      throw error;
-    }
-  }
-
-  /**
-   * owner only (manage): append the boss's acceptance-requirement amendment to an in-flight task.
-   *
-   * The amendment is an append-only annotation on a task that is already moving, so it must not disturb the
-   * task's machine gates or the holder's lease: state, blocked_to/resume_*, dependencies, acceptance_criteria,
-   * acceptance_version, independence, worktree and every lease field (current_employee, delivery_id, fence,
-   * lease_expires_at) are left exactly as they were — nothing here relaxes the machine criteria, independent
-   * review, quota or dependencies. The version is deliberately left alone too: it is part of the holder's
-   * lease proof, and bumping it would make the holder's next checkpoint/submit fail with a stale-proof
-   * conflict until the channel's heartbeat resynced (up to 60 s) — exactly the interruption this tool must
-   * avoid. The compare-and-set on expectedVersion still refuses a caller that read a stale task.
-   *
-   * The amendment text is appended to task.context — the field claim.json and read_task_text(field=context)
-   * read — so the next claim and every later reader sees it. The append is computed INSIDE the transaction from
-   * the row it locks ($t.context + $block), never from a copy read beforehand: two amendments that both pass the
-   * version guard must both land, and an out-of-transaction read is a last-writer-wins that silently drops one
-   * verbatim owner quote while the audit claims both were appended. The loser of the record write gets the fork's
-   * retryable 'Transaction conflict: Resource busy', and taskAcceptanceAmend re-runs the whole statement — which
-   * re-reads $t, so the second append builds on the first. The context-size cap is checked in the same transaction
-   * for the same reason.
-   * The audit row keeps the verbatim owner quote,
-   * and each employee in notify (default: the live lease holder + the implementer + the latest submitter; an
-   * explicit empty list notifies nobody) gets a persistent holder_notice that holder_notices reads and acks.
-   * A holder inside a live lease is not interrupted: the sidecar attaches the unacked notices to its next tool
-   * response, and the dispatcher redelivers them after a reconnect or restart.
-   */
-  async taskAcceptanceAmend(credential: Credential, input: { taskId: TaskId; expectedVersion: number; ownerQuote: string; text: string; notify?: string[]; idempotencyKey: string }): Promise<TaskView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may amend a task acceptance requirement');
-    requireText(input.taskId, 'task', 1, 200);
-    requireText(input.ownerQuote, 'ownerQuote', 1, 4000);
-    requireText(input.text, 'text', 4, 4000);
-    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
-    const MAX_NOTIFY = 20;
-    // Same cap as create-time context (see createTask): the amendment is appended to the same field, so a total
-    // beyond it would make claim.json and read_task_text carry a task the create path itself refuses.
-    const MAX_CONTEXT = 20_000;
-    // Omitted notify means the defaults below; an explicit [] means nobody is notified (the audit is still
-    // written). null is treated as omitted for direct callers, matching the MCP schema's nullish input.
-    const explicit = input.notify ?? undefined;
-    if (explicit !== undefined && (!Array.isArray(explicit) || explicit.length > MAX_NOTIFY)) throw new CompanyError('invalid', `notify holds at most ${MAX_NOTIFY} employee ids`);
-    const notify = explicit === undefined ? undefined : [...new Set(explicit.map(employee => { requireText(employee, 'notify employee', 1, 200); return employee; }))];
-    // A replay of the same call returns its first answer, even though the task context already carries the block by then.
-    const idem = this.idemId(actor.employeeId, 'acceptance_amend', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ taskId: input.taskId, expectedVersion: input.expectedVersion, ownerQuote: input.ownerQuote, text: input.text, notify: notify ?? null }));
-    const replay = await this.replay(idem, digest);
-    if (replay) return echoTask(replay);
-    const row = await this.db.select<TaskRow>(id('task', input.taskId));
-    if (!row) throw new CompanyError('not_found', 'Task not found');
-    if (row.state === 'done' || row.state === 'void') throw new CompanyError('conflict', `Acceptance amendment does not apply to ${row.state} tasks`);
-    if (!['ready', 'doing', 'review', 'blocked'].includes(row.state)) throw new CompanyError('invalid', `Acceptance amendment does not apply to ${row.state} tasks`);
-    const leaseLive = row.current_employee !== undefined && (row.lease_expires_at ?? 0) > Math.floor(Date.now() / 1000);
-    const defaults = [leaseLive ? row.current_employee : undefined, row.implementer, row.submitted_by]
-      .filter((employee): employee is string => typeof employee === 'string' && employee.length > 0);
-    const recipients = notify ?? [...new Set(defaults)];
-    if (recipients.length) {
-      const [found] = await this.db.query<[Array<{ id: RecordId }>]>('SELECT id FROM employee WHERE id IN $ids;',
-        { ids: recipients.map(employee => id('employee', employee)) });
-      const known = new Set((found ?? []).map(entry => asId(entry.id)));
-      const unknown = recipients.filter(employee => !known.has(employee));
-      if (unknown.length) throw new CompanyError('invalid', `Unknown employee id in notify: ${unknown.join(', ')}`);
-    }
-    const auditId = randomUUID();
-    const at = new Date().toISOString();
-    const block = `\n\n【验收要求修订 · ${at} · ${actor.employeeId} · audit ${auditId}】\n老板原话（逐字）：${input.ownerQuote}\n修订说明：${input.text}\n`;
-    const evidence = JSON.stringify({ ownerQuote: input.ownerQuote, text: input.text, notify: notify ?? null, expectedVersion: input.expectedVersion });
-    const noticeText = `验收要求已修订：${input.text}\n老板原话（逐字）：${input.ownerQuote}\n完整修订已追加到任务上下文；用 sck call read_task_text '{"taskId":"${input.taskId}","field":"context"}' 读全文，再按最新要求行事。`;
-    const notices = recipients.map(employee => {
-      // Control-character-free id: the dispatcher embeds it in a shell/JSON command line, where a raw U+0000
-      // separator is neither a valid JSON string nor an executable argv value. The audit id and employee make it
-      // unique per recipient.
-      const noticeKey = `${input.taskId}:acceptance_amended:${auditId}:${employee}`;
-      return { employee, noticeKey, record: holderNoticeId(noticeKey) };
-    });
-    const noticeStatements = notices.map((_, index) => `CREATE ONLY $notice_${index} CONTENT {
-          notice_key: $notice_key_${index}, episode: $episode, task: $task, holder: $holder_${index}, kind: 'acceptance_amended',
-          text: $notice_text, payload: $notice_payload, created_at: time::now(), delivered_at: NONE, deliveries: 0,
-          last_attempt_at: NONE, last_error: NONE };`).join('\n        ');
-    const noticeVars = Object.fromEntries(notices.flatMap((notice, index) => [
-      [`notice_${index}`, notice.record], [`notice_key_${index}`, notice.noticeKey], [`holder_${index}`, notice.employee],
-    ]));
-    const vars = {
-      actor: id('employee', actor.employeeId), task: id('task', input.taskId), expected: input.expectedVersion,
-      block, evidence, idem, digest, audit: id('audit', auditId), audit_id: auditId, outbox: id('outbox', randomUUID()),
-      episode: `${input.taskId}:acceptance_amended:${auditId}`, notice_text: noticeText,
-      notice_payload: { auditId, version: row.version, actor: actor.employeeId, notify: recipients },
-      notify: recipients, ...noticeVars,
-    };
-    // txTask filters its own 'Cannot COMMIT' cascade out of the cause it inspects, so the loser of a concurrent
-    // append gets the generic write conflict and is NOT retried there. Re-run the whole statement here instead:
-    // the append is computed from $t inside the transaction, so a re-run reads the winner's context and lands on
-    // top of it rather than overwriting it. Only the transient write conflict is retried — 'task version moved'
-    // is the CAS refusing a genuinely stale read and must stay a refusal.
-    const APPEND_CONFLICT = /Task changed or transaction conflicted/i;
-    try {
-      let next: TaskRow | undefined;
-      for (let attempt = 0; attempt < 5 && next === undefined; attempt++) {
-        try {
-          next = await this.txTask(`BEGIN;
-            LET $t = SELECT * FROM ONLY $task;
-            IF $t = NONE { THROW 'task not found' };
-            IF $t.version != $expected { THROW 'task version moved' };
-            IF $t.state IN ['done', 'void'] { THROW 'task already terminal' };
-            IF $t.state NOT IN ['ready', 'doing', 'review', 'blocked'] { THROW 'acceptance amend invalid: only ready, doing, review or blocked tasks accept an amendment' };
-            LET $appended = ($t.context ?? '') + $block;
-            IF string::len($appended) > ${MAX_CONTEXT} { THROW 'acceptance amend invalid: the amended context would exceed ${MAX_CONTEXT} characters; archive the old context before appending another amendment' };
-            LET $next = UPDATE ONLY $task SET context = $appended RETURN AFTER;
-            CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'acceptance_amend', evidence: $evidence, version: $next.version, at: time::now() };
-            LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-            CREATE ONLY $outbox CONTENT { task: $task, kind: 'acceptance_amend', sequence: $sequence.value,
-              payload: { version: $next.version, audit: $audit_id, notify: $notify }, at: time::now() };
-            ${noticeStatements}
-            CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
-            RETURN $next;
-            COMMIT;`, vars);
-        } catch (error) {
-          if (!(error instanceof CompanyError) || error.code !== 'conflict' || !APPEND_CONFLICT.test(error.message)) throw error;
-          const replayed = await this.replay(idem, digest);
-          if (replayed) return echoTask(replayed);
-          if (attempt === 4) throw error;
-          await Bun.sleep(10 * (attempt + 1));
-        }
-      }
-      return echoTask(view(next!));
-    } catch (error) {
-      const replayed = await this.replay(idem, digest);
-      if (replayed) return echoTask(replayed);
-      throw error;
-    }
-  }
-
-  /**
-   * owner only: bind an explicit code repository (code_repo_path) to a blocked execute-phase task.
-   * Only workspace allocation, worktree registration and dispatch repoHome/cwd follow the
-   * binding — the business project (taskProject → claim.json.project, opsScope, broker
-   * quotas) is untouched, so a rebind can never smuggle another project's ops access.
-   *
-   * Allowed targets: the ops repo or a registered project repo_path, canonicalised —
-   * symlink escapes, traversal segments and unregistered paths are refused before any write.
-   * Only state=blocked tasks qualify: blocked_to='owner' and the formal dependency wait
-   * (blocked_to=NONE, including defer_task_until's cleared-owner wait) and an owner-blocked
-   * fallback both bind; review-phase and gate blocks are refused, not guessed, as are live leases. The stale worktree
-   * assignment clears through the same lifecycle as task_project_update: the ref releases,
-   * uncommitted work in the old tree is preserved, and the tree itself is never deleted here.
-   */
-  async bindTaskCodeRepo(credential: Credential, input: { taskId: TaskId; codeRepoPath: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
-    return echoTask(await this.bindTaskCodeRepoRecord(credential, input));
-  }
-
-  private async bindTaskCodeRepoRecord(credential: Credential, input: { taskId: TaskId; codeRepoPath: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may bind a task code repo');
-    requireText(input.taskId, 'task', 1, 200);
-    requireText(input.codeRepoPath, 'codeRepoPath', 1, 1000);
-    requireText(input.text, 'evidence', 4, 4000);
-    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) {
-      throw new CompanyError('invalid', 'Invalid expectedVersion');
-    }
-    if (!isAbsolute(input.codeRepoPath) || input.codeRepoPath.includes('\0') || input.codeRepoPath.split('/').includes('..')) {
-      throw new CompanyError('invalid', 'codeRepoPath must be an absolute path without traversal');
-    }
-    const bound = canonicalRepoPath(input.codeRepoPath);
-    const allowed = await this.allowedCodeRepos();
-    if (!allowed.has(bound)) {
-      throw new CompanyError('forbidden', 'codeRepoPath is not a registered project repo or the ops repo');
-    }
-    const before = await this.db.select<TaskRow>(id('task', input.taskId));
-    if (!before) throw new CompanyError('not_found', 'Task not found');
-    const idem = this.idemId(actor.employeeId, 'bind_task_code_repo', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ taskId: input.taskId, codeRepoPath: bound, expectedVersion: input.expectedVersion, text: input.text }));
-    const replay = await this.replay(idem, digest);
-    if (replay) return replay;
-    const evidence = `${input.text}\n[bind] code_repo_path: ${before.code_repo_path ?? '-'} -> ${bound}`;
-    try {
-      const row = await this.txTask(`BEGIN;
-        LET $t = SELECT * FROM ONLY $task;
-        IF $t = NONE { THROW 'task not found' };
-        IF $t.version != $expected { THROW 'task version moved' };
-        IF $repo NOT IN $allowed { THROW 'bind denied: repo not registered' };
-        IF $t.state != 'blocked' { THROW 'bind denied: only blocked tasks can be rebound' };
-        IF $t.resume_state = 'review' { THROW 'bind denied: review-phase task' };
-        IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'bind denied: active lease' };
-        LET $next = UPDATE ONLY $task SET
-          code_repo_path = $repo, worktree = NONE, current_employee = NONE, delivery_id = NONE,
-          lease_expires_at = NONE, handover = NONE, version = $t.version + 1 RETURN AFTER;
-        UPDATE employee SET active_task = NONE WHERE active_task = $task;
-        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'bind_task_code_repo', evidence: $evidence, version: $next.version, at: time::now() };
-        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        CREATE ONLY $outbox CONTENT { task: $task, kind: 'code_repo_bound', sequence: $sequence.value,
-          payload: { old_repo: $old_repo, new_repo: $repo, version: $next.version }, at: time::now() };
-        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
-        RETURN $next;
-        COMMIT;`, {
-        actor: id('employee', actor.employeeId), task: id('task', input.taskId),
-        repo: bound, allowed: [...allowed], old_repo: before.code_repo_path ?? null,
-        expected: input.expectedVersion, evidence,
-        idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
-      });
-      return view(row);
-    } catch (error) {
-      const replayed = await this.replay(idem, digest);
-      if (replayed) return replayed;
-      throw error;
-    }
-  }
-
-  /**
-   * eval role only: scores the employees who participated in a finished task.
-   * Scorecards are idempotent per (task, employee); writing marks task.evaluated_at so the
-   * dispatcher stops dispatching judges, and rolls the average into employee and employee_def.
    */
   async modelEvidence(credential: Credential, taskId: TaskId): Promise<ModelEvidence[]> {
     const actor = await this.authorized(credential);
@@ -7538,501 +2842,4 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return rows.map(row => ({ id: asId(row.id), sequence: row.sequence, kind: row.kind, taskId: asId(row.task),
       payload: row.payload, createdAt: String(row.at) }));
   }
-  // ---- QA 受限只读取证（SYS-DISP 7454fc89） ----
-  // 一条独立的只读路径：老板 登记 scope，QA 用本人 sck 会话或浏览器受限会话读取 allowlist 内的任务；
-  // 现有 getTask 的 executor/reviewer/owner/eval ACL 不变，scope 的部署任务复核租约一变即失败关闭。
-
-  /** The named scope, or the QA employee's single active scope. Never another employee's scope. */
-  private async qaScopeFor(employeeId: string, scopeId?: string): Promise<QaObservationScopeRow> {
-    if (scopeId !== undefined) {
-      requireText(scopeId, 'scopeId', 1, 200);
-      const row = await this.db.select<QaObservationScopeRow>(id('qa_observation_scope', scopeId));
-      if (!row) throw new CompanyError('not_found', 'QA observation scope not found');
-      if (row.qa_employee !== employeeId) throw new CompanyError('forbidden', 'QA observation scope belongs to another employee');
-      return row;
-    }
-    const [rows] = await this.db.query<[QaObservationScopeRow[]]>(
-      "SELECT * FROM qa_observation_scope WHERE qa_employee = $me AND status = 'active' ORDER BY created_at DESC LIMIT 2;",
-      { me: employeeId });
-    const active = rows ?? [];
-    if (active.length === 0) throw new CompanyError('forbidden', 'no active QA observation scope for this employee');
-    if (active.length > 1) throw new CompanyError('invalid', 'more than one active QA observation scope; pass scopeId');
-    return active[0]!;
-  }
-
-  /** A scope is usable only while its deployment task still carries the exact QA review lease it was granted on. */
-  private async qaScopeUsable(scope: QaObservationScopeRow, employeeId: string): Promise<void> {
-    if (scope.status !== 'active') throw new CompanyError('forbidden', 'QA observation scope is revoked');
-    if (!(Date.parse(scope.expires_at) > Date.now())) throw new CompanyError('forbidden', 'QA observation scope expired');
-    if (scope.qa_employee !== employeeId) throw new CompanyError('forbidden', 'QA observation scope belongs to another employee');
-    const task = await this.db.select<TaskRow>(scope.deployment_task);
-    if (!task) throw new CompanyError('forbidden', 'the deployment task of the QA observation scope no longer exists');
-    const now = Math.floor(Date.now() / 1000);
-    if (task.state !== 'review' || task.reviewer_role !== 'qa') throw new CompanyError('forbidden', 'the deployment task is no longer in QA review');
-    if (task.current_employee !== scope.lease_holder || task.fence !== scope.lease_fence ||
-        task.lease_expires_at === undefined || task.lease_expires_at <= now) {
-      throw new CompanyError('forbidden', 'the QA review lease changed; the observation scope fails closed');
-    }
-    if (!task.goal || asId(task.goal) !== asId(scope.goal)) throw new CompanyError('forbidden', 'the deployment task left the scope goal');
-  }
-
-  /** Authenticate a QA read: an employee credential (qa role) or a browser-only restricted session token. */
-  private async qaObservationAuth(auth: QaObservationAuth, scopeId?: string): Promise<{ scope: QaObservationScopeRow; employeeId: string }> {
-    let employeeId: string;
-    let sessionScope: string | undefined;
-    if (auth.token !== undefined) {
-      requireText(auth.token, 'token', 10, 500);
-      const [rows] = await this.db.query<[QaObservationSessionRow[]]>(
-        "SELECT * FROM qa_observation_session WHERE token_hash = $hash AND state = 'active' LIMIT 1;",
-        { hash: qaHash(auth.token) });
-      const session = rows?.[0];
-      if (!session) throw new CompanyError('forbidden', 'QA observation session is invalid or expired');
-      if (!session.expires_at || !(Date.parse(session.expires_at) > Date.now())) {
-        throw new CompanyError('forbidden', 'QA observation session expired');
-      }
-      employeeId = session.qa_employee;
-      sessionScope = qaId(session.scope);
-    } else if (auth.credential !== undefined) {
-      const actor = await this.authenticate(auth.credential);
-      if (actor.role !== 'qa') throw new CompanyError('forbidden', 'QA observation reads require the qa role');
-      employeeId = actor.employeeId;
-    } else {
-      throw new CompanyError('unauthorized', 'QA observation read requires a credential or a session token');
-    }
-    const scope = await this.qaScopeFor(employeeId, scopeId ?? sessionScope);
-    if (sessionScope !== undefined && scopeId !== undefined && scopeId !== sessionScope) {
-      throw new CompanyError('forbidden', 'the session is bound to another QA observation scope');
-    }
-    await this.qaScopeUsable(scope, employeeId);
-    return { scope, employeeId };
-  }
-
-  /** 老板 (manage): register a time-bounded, task-allowlisted QA read scope on a live QA review lease. */
-  async qaObservationGrant(credential: Credential, input: QaObservationGrant): Promise<QaObservationScopeView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may grant a QA observation scope');
-    requireText(input.goalId, 'goalId', 1, 100);
-    requireText(input.deploymentTaskId, 'deploymentTaskId', 1, 200);
-    requireText(input.qaEmployee, 'qaEmployee', 1, 200);
-    if (!Number.isSafeInteger(input.leaseFence) || input.leaseFence < 1) throw new CompanyError('invalid', 'Invalid leaseFence');
-    if (!Array.isArray(input.subjects) || input.subjects.length === 0 || input.subjects.length > QA_OBSERVATION_MAX_SUBJECTS) {
-      throw new CompanyError('invalid', `subjects must be 1-${QA_OBSERVATION_MAX_SUBJECTS} task ids`);
-    }
-    for (const subject of input.subjects) requireText(subject, 'subject', 1, 200);
-    requireText(input.reason, 'reason', 8, 2000);
-    requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
-    const expiresMs = Date.parse(input.expiresAt);
-    if (!Number.isFinite(expiresMs) || expiresMs < Date.now() + QA_OBSERVATION_MIN_TTL_MS || expiresMs > Date.now() + QA_OBSERVATION_MAX_TTL_MS) {
-      throw new CompanyError('invalid', 'expiresAt must be within 1 minute and 24 hours from now');
-    }
-    const expiresAt = new Date(expiresMs).toISOString();
-    const subjects = [...new Set(input.subjects)];
-    const scopeId = randomUUID();
-    const scopeRecord = id('qa_observation_scope', scopeId);
-    const idem = this.idemId(actor.employeeId, 'qa_observation_grant', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ goalId: input.goalId, deploymentTaskId: input.deploymentTaskId, qaEmployee: input.qaEmployee,
-      leaseFence: input.leaseFence, subjects, expiresAt, reason: input.reason }));
-    const prior = await this.replayStored<QaObservationScopeRow>(idem, digest);
-    if (prior) return qaScopeView(prior);
-    const evidence = `${input.reason}\n[qa_observation_grant] scope=${scopeId} goal=${input.goalId} deployment=${input.deploymentTaskId} qa=${input.qaEmployee} leaseFence=${input.leaseFence} subjects=${subjects.join(',')} expiresAt=${expiresAt}`;
-    const query = `BEGIN;
-      LET $who = SELECT * FROM ONLY $actor;
-      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'actor revoked or forbidden' };
-      LET $d = SELECT * FROM ONLY $deploy;
-      IF $d = NONE { THROW 'qa observation invalid: deployment task not found' };
-      IF $d.state != 'review' OR $d.reviewer_role != 'qa' { THROW 'qa observation invalid: deployment task is not in QA review' };
-      IF $d.current_employee != $qa OR $d.fence != $fence { THROW 'qa observation invalid: QA review lease holder or fence does not match' };
-      IF $d.lease_expires_at = NONE OR $d.lease_expires_at <= time::unix(time::now()) { THROW 'qa observation invalid: QA review lease is not live' };
-      IF $d.goal != $goal { THROW 'qa observation invalid: deployment task is not in the scope goal' };
-      IF $d.submitted_by = $qa OR $d.implementer = $qa { THROW 'qa observation invalid: the qa employee authored the deployment task' };
-      LET $q = SELECT * FROM ONLY $qa_emp;
-      IF $q = NONE OR $q.revoked = true OR $q.role != 'qa' OR 'review' NOT IN $q.capabilities { THROW 'qa observation invalid: qa employee is not an active reviewer' };
-      FOR $s IN $subjects {
-        LET $t = SELECT * FROM ONLY type::record('task', $s);
-        IF $t = NONE { THROW 'qa observation invalid: subject task not found' };
-        IF $t.goal != $goal { THROW 'qa observation invalid: subject task is not in the scope goal' };
-        IF $t.submitted_by = $qa OR $t.implementer = $qa { THROW 'qa observation invalid: the qa employee authored a subject task' };
-      };
-      LET $scope = CREATE ONLY $scope_rec CONTENT { goal: $goal, deployment_task: $deploy, qa_employee: $qa, lease_holder: $qa,
-        lease_fence: $fence, subjects: $subjects, status: 'active', expires_at: $expires, version: 1, reason: $reason,
-        created_by: $actor, created_at: time::now() };
-      CREATE ONLY $audit CONTENT { task: $deploy, actor: $actor, action: 'qa_observation_grant', evidence: $evidence, version: 1, at: time::now() };
-      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $scope };
-      RETURN $scope;
-      COMMIT;`;
-    const vars = {
-      actor: id('employee', actor.employeeId), deploy: id('task', input.deploymentTaskId), qa: input.qaEmployee,
-      qa_emp: id('employee', input.qaEmployee), goal: id('goal', input.goalId), fence: input.leaseFence,
-      subjects, expires: expiresAt, reason: input.reason, scope_rec: scopeRecord, evidence, digest, idem,
-      audit: id('audit', randomUUID()),
-    };
-    try {
-      return qaScopeView(await this.txTask<QaObservationScopeRow>(query, vars));
-    } catch (error) {
-      const replayed = await this.replayStored<QaObservationScopeRow>(idem, digest);
-      if (replayed) return qaScopeView(replayed);
-      throw error;
-    }
-  }
-
-  /** 老板 (manage): revoke a scope with compare-and-set on its version. */
-  async qaObservationRevoke(credential: Credential, input: QaObservationRevoke): Promise<QaObservationScopeView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may revoke a QA observation scope');
-    requireText(input.scopeId, 'scopeId', 1, 200);
-    requireText(input.reason, 'reason', 8, 2000);
-    requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
-    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
-    const idem = this.idemId(actor.employeeId, 'qa_observation_revoke', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ scopeId: input.scopeId, expectedVersion: input.expectedVersion, reason: input.reason }));
-    const prior = await this.replayStored<QaObservationScopeRow>(idem, digest);
-    if (prior) return qaScopeView(prior);
-    const evidence = `${input.reason}\n[qa_observation_revoke] scope=${input.scopeId} expectedVersion=${input.expectedVersion}`;
-    const query = `BEGIN;
-      LET $who = SELECT * FROM ONLY $actor;
-      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'actor revoked or forbidden' };
-      LET $s = SELECT * FROM ONLY $scope;
-      IF $s = NONE { THROW 'qa observation invalid: scope not found' };
-      IF $s.version != $expected { THROW 'qa observation moved: scope version changed' };
-      IF $s.status != 'active' { THROW 'qa observation moved: scope is not active' };
-      LET $next = UPDATE ONLY $scope SET status = 'revoked', revoked_at = time::now(), revoked_by = $actor,
-        revoked_reason = $reason, version = $s.version + 1 RETURN AFTER;
-      CREATE ONLY $audit CONTENT { task: $s.deployment_task, actor: $actor, action: 'qa_observation_revoke', evidence: $evidence, version: $next.version, at: time::now() };
-      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
-      RETURN $next;
-      COMMIT;`;
-    const vars = { actor: id('employee', actor.employeeId), scope: id('qa_observation_scope', input.scopeId),
-      expected: input.expectedVersion, reason: input.reason, evidence, digest, idem, audit: id('audit', randomUUID()) };
-    try {
-      return qaScopeView(await this.txTask<QaObservationScopeRow>(query, vars));
-    } catch (error) {
-      const replayed = await this.replayStored<QaObservationScopeRow>(idem, digest);
-      if (replayed) return qaScopeView(replayed);
-      throw error;
-    }
-  }
-
-  /** 老板 sees every scope; a QA sees its own. No credentials or session hashes are returned. */
-  async qaObservationStatus(credential: Credential): Promise<QaObservationScopeView[]> {
-    const actor = await this.authorized(credential);
-    if (actor.role === 'owner') {
-      const [rows] = await this.db.query<[QaObservationScopeRow[]]>("SELECT * FROM qa_observation_scope ORDER BY created_at DESC LIMIT 50;");
-      return (rows ?? []).map(qaScopeView);
-    }
-    if (actor.role !== 'qa') throw new CompanyError('forbidden', 'QA observation status is read by owner or qa');
-    const [rows] = await this.db.query<[QaObservationScopeRow[]]>(
-      "SELECT * FROM qa_observation_scope WHERE qa_employee = $me ORDER BY created_at DESC LIMIT 20;", { me: actor.employeeId });
-    return (rows ?? []).map(qaScopeView);
-  }
-
-  /** QA (own credential): one-time login code for the company page. The code is stored as a hash and expires quickly. */
-  async qaObservationSession(credential: Credential, input: { scopeId?: string }): Promise<QaObservationSessionView> {
-    const actor = await this.authenticate(credential);
-    if (actor.role !== 'qa') throw new CompanyError('forbidden', 'QA observation sessions require the qa role');
-    const scope = await this.qaScopeFor(actor.employeeId, input.scopeId);
-    await this.qaScopeUsable(scope, actor.employeeId);
-    const code = randomBytes(24).toString('base64url');
-    const expiresAt = new Date(Date.now() + QA_OBSERVATION_CODE_TTL_MS).toISOString();
-    await this.db.query("CREATE $sess CONTENT { scope: $scope, qa_employee: $qa, code_hash: $hash, state: 'code', code_expires_at: $expires, created_at: time::now() };",
-      { sess: id('qa_observation_session', randomUUID()), scope: scope.id, qa: actor.employeeId, hash: qaHash(code), expires: expiresAt });
-    return { scope: qaScopeView(scope), code, expiresAt, pagePath: '/q/' };
-  }
-
-  /** The company page exchanges the one-time code for a browser-only restricted token. The code is consumed. */
-  async qaObservationLogin(code: string): Promise<QaObservationLoginView> {
-    requireText(code, 'code', 10, 500);
-    const [rows] = await this.db.query<[QaObservationSessionRow[]]>(
-      "SELECT * FROM qa_observation_session WHERE code_hash = $hash AND state = 'code' LIMIT 1;", { hash: qaHash(code) });
-    const session = rows?.[0];
-    if (!session) throw new CompanyError('forbidden', 'login code is invalid or already used');
-    if (!(Date.parse(session.code_expires_at) > Date.now())) throw new CompanyError('forbidden', 'login code expired');
-    const scope = await this.db.select<QaObservationScopeRow>(session.scope);
-    if (!scope || scope.status !== 'active') throw new CompanyError('forbidden', 'QA observation scope is not active');
-    const token = randomBytes(32).toString('base64url');
-    const expiresAt = new Date(Date.now() + QA_OBSERVATION_TOKEN_TTL_MS).toISOString();
-    await this.db.query("UPDATE ONLY $sess SET state = 'active', token_hash = $token_hash, expires_at = $expires, used_at = time::now();",
-      { sess: session.id, token_hash: qaHash(token), expires: expiresAt });
-    return { scope: qaScopeView(scope), token, expiresAt };
-  }
-
-  /** QA: full task state, contribution facts (unknown fail-closed), and the last dispatcher pass's verdicts. */
-  async qaObservationRead(auth: QaObservationAuth, input: QaObservationReadInput): Promise<QaObservationReadView> {
-    const { scope } = await this.qaObservationAuth(auth, input.scopeId);
-    const [instanceAt, observation, attempt] = await Promise.all([
-      this.dbNow(),
-      this.db.select<Record<string, unknown>>(id('company_meta', 'dispatch_observation')),
-      this.db.select<{ at?: string; ok?: boolean; error?: string }>(id('company_meta', 'dispatch_observation_status')),
-    ]);
-    const checkedAt = new Date().toISOString();
-    const scopeView = qaScopeView(scope);
-    const baseMeta: QaObservationMeta = { checkedAt, dataSource: 'live', instanceAt, scope: scopeView, completeness: { complete: true } };
-    if (input.goalId !== undefined) {
-      if (input.goalId !== asId(scope.goal)) throw new CompanyError('forbidden', 'the goal is outside the QA observation scope');
-      const goalId = input.goalId;
-      const [rows] = await this.db.query<[Array<{ state?: string | null; n: number }>]>(
-        "SELECT state, count() AS n FROM task WHERE goal = $goal GROUP BY state;", { goal: scope.goal });
-      const states: Record<string, number> = {};
-      for (const row of rows ?? []) states[row.state == null ? 'unknown' : String(row.state)] = Number(row.n);
-      const total = Object.values(states).reduce((sum, n) => sum + n, 0);
-      const [goalTasks] = await this.db.query<[Array<{ id: RecordId }>]>("SELECT id FROM task WHERE goal = $goal;", { goal: scope.goal });
-      const goalIds = new Set((goalTasks ?? []).map(row => asId(row.id)));
-      const state = qaDispatchState(observation, attempt);
-      const verdicts = (observation as { verdicts?: Array<{ taskId?: string; dispatchable?: boolean }> } | undefined)?.verdicts ?? [];
-      const undispatchable = state.complete
-        ? new Set(verdicts.filter(v => v.taskId && goalIds.has(v.taskId) && v.dispatchable === false).map(v => v.taskId)).size
-        : undefined;
-      // Workflow waits are a separately sampled, goal-scoped graph. They remain available when a dispatch pass is absent,
-      // partial or stale, and never inherit the pass timestamp.
-      const passVerdicts = (observation as { verdicts?: DispatchVerdict[] } | undefined)?.verdicts ?? [];
-      const goalVerdicts = passVerdicts.filter(verdict => verdict.goalId === goalId && goalIds.has(verdict.taskId));
-      const verdictRoot = goalRootBlockers(goalVerdicts)[0];
-      let workflowSnapshot: Awaited<ReturnType<typeof readGoalWorkflowWaitSnapshot>> | undefined;
-      let waits: GoalWorkflowWaitSummary;
-      try {
-        workflowSnapshot = await readGoalWorkflowWaitSnapshot(this.db, this.workforce, {
-          goalId, roots: verdictRoot ? [verdictRoot.taskId] : [], limit: QA_OBSERVATION_WAIT_ROOTS_LIMIT,
-          log: message => console.warn(message),
-        });
-        waits = workflowSnapshot.summary;
-      } catch (error) {
-        console.warn(`qa goal workflow wait facts failed: ${(error as Error).message}`);
-        waits = { source: 'workflow-graph', available: false, totalRoots: 0, shownRoots: 0, truncated: false,
-          reason: 'workflow graph could not be read', roots: [] };
-      }
-      // The exact same goal-root evaluator and graph facts serve dispatch blockers and workflow waits. Without workforce
-      // contributor access, the legacy F1 root keeps its facts-unavailable semantics; the workflow wait graph remains readable.
-      const facts: GoalRootFacts | undefined = verdictRoot && this.workforce && workflowSnapshot
-        ? workflowSnapshot.facts : undefined;
-      const rootBlocker = goalRootBlockers(goalVerdicts, facts)[0];
-      const rootVerdict = verdictRoot
-        ? goalVerdicts.find(verdict => verdict.taskId === verdictRoot.taskId && verdict.phase === verdictRoot.phase)
-        : undefined;
-      const reasons = rootBlocker?.reasons ?? [];
-      // Revalidate after the graph and provenance reads so expiry, revocation or holder-fence changes during collection fail closed.
-      await this.qaObservationAuth(auth, input.scopeId);
-      const root = rootBlocker ? {
-        taskId: rootBlocker.taskId, title: rootBlocker.title, phase: rootBlocker.phase,
-        workflowState: rootBlocker.workflowState, summary: rootBlocker.summary, feasible: rootBlocker.feasible,
-        waitingMinutes: rootBlocker.waitingMinutes, ...(rootBlocker.since ? { since: rootBlocker.since } : {}),
-        checkedAt: rootBlocker.checkedAt, eligibleCount: rootBlocker.eligibleCount,
-        undispatchable: rootBlocker.undispatchable, others: rootBlocker.others,
-        ...(rootVerdict?.noticeKey ? { noticeKey: rootVerdict.noticeKey } : {}),
-        factsAvailable: facts !== undefined,
-        ...(facts !== undefined ? {
-          impact: rootBlocker.impact, dependencyPath: rootBlocker.dependencyPath,
-          people: { ...rootBlocker.people, authors: [...rootBlocker.people.authors], reviewers: [...rootBlocker.people.reviewers] },
-        } : {}),
-        reasons: reasons.slice(0, 20).map(reason => ({
-          code: reason.code, text: reason.text, candidates: [...reason.candidates], owner: reason.owner,
-          recovery: reason.recovery, nextTrigger: reason.nextTrigger, basis: reason.basis,
-          ...(reason.until ? { until: reason.until } : {}),
-          actions: reason.actions.map(action => ({ ...action })),
-        })),
-        ...(reasons.length > 20 ? { reasonsOmitted: reasons.length - 20 } : {}),
-      } : undefined;
-      // The waits ride on the one goal answer, and qa_observation_read has no paging input, so an over-budget answer would be
-      // replaced whole by response_too_large on the relay and refused on MCP. Shrink waits against the measured answer instead,
-      // leaving the release stamp its reserve, and say in the summary what was left out.
-      const view = (fitted: GoalWorkflowWaitSummary): QaObservationReadView => ({ meta: { ...baseMeta, completeness: { ...baseMeta.completeness, dispatchComplete: state.complete } },
-        goal: { id: goalId, states, total,
-          ...(undispatchable !== undefined ? { undispatchable } : {}),
-          dispatchAvailable: state.available, dispatchComplete: state.complete, dispatchSource: 'dispatcher-pass',
-          ...(state.reason ? { dispatchReason: state.reason } : {}),
-          ...(state.checkedAt ? { dispatchCheckedAt: state.checkedAt } : {}),
-          ...(state.attemptAt ? { dispatchAttemptAt: state.attemptAt } : {}),
-          ...(state.attemptOk !== undefined ? { dispatchAttemptOk: state.attemptOk } : {}),
-          waits: fitted,
-          ...(root ? { root } : {}),
-        } });
-      const trimmed: GoalWorkflowWaitSummary = waits.available ? { ...waits, roots: waits.roots.map(wait => {
-        if (!wait.people) return wait;
-        const authors = wait.people.authors.slice(0, 6);
-        const reviewers = wait.people.reviewers.slice(0, 6);
-        const peopleOmitted = wait.people.authors.length - authors.length + wait.people.reviewers.length - reviewers.length;
-        return { ...wait, people: { ...wait.people, authors, reviewers, ...(peopleOmitted ? { peopleOmitted } : {}) } };
-      }) } : waits;
-      return view(fitGoalWaitSummary(trimmed, candidate => answerBytes(view(candidate)) <= RESPONSE_BUDGET_BYTES - QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES));
-    }
-    if (input.taskId === undefined) throw new CompanyError('invalid', 'taskId or goalId is required');
-    const taskId = input.taskId;
-    if (!scope.subjects.includes(taskId)) throw new CompanyError('forbidden', 'the task is outside the QA observation scope');
-    const row = await this.db.select<TaskRow>(id('task', taskId));
-    if (!row) throw new CompanyError('not_found', 'Task not found');
-    if (!row.goal || asId(row.goal) !== asId(scope.goal)) throw new CompanyError('forbidden', 'the task is not in the scope goal');
-    const taskView = view(row);
-    const facts = (await readContributionView(this.db, taskId)).facts;
-    const dispatch = qaDispatchFor(observation, taskId, attempt);
-    const context = row.context ?? '';
-    const contextBytes = utf8Bytes(context);
-    const inline = contextBytes <= QA_OBSERVATION_CONTEXT_INLINE_BYTES;
-    const meta: QaObservationMeta = { ...baseMeta, completeness: { complete: true, taskRead: true, contextIncluded: inline,
-      dispatchComplete: dispatch.available && dispatch.complete !== false } };
-    return {
-      meta,
-      task: inline ? taskView : { ...taskView, context: '' },
-      contribution: {
-        authors: [...facts.authors], reviewers: [...facts.reviewers], excluded: [...facts.excluded],
-        unknown: facts.unknown.map(entry => ({ actor: entry.actor, action: entry.action, ...(entry.at ? { at: entry.at } : {}), reason: entry.reason })),
-        ...(facts.implementer ? { implementer: facts.implementer } : {}), ambiguous: facts.ambiguous,
-      },
-      dispatch,
-      ...(inline ? {} : { contextOmitted: true, contextBytes, contextSha256: HASH(context), contextRead: { taskId, field: 'context' as const, offset: 0 } }),
-    };
-  }
-
-  /** QA: one stored page of the allowlisted task's audit history (evidence cut per item, read whole with qa_observation_text). */
-  async qaObservationTimeline(auth: QaObservationAuth, input: QaObservationReadInput & { pageSize?: number; cursor?: string }): Promise<QaObservationTimelineView> {
-    const startedAt = arrivedAt();
-    const { scope } = await this.qaObservationAuth(auth, input.scopeId);
-    if (input.taskId === undefined) throw new CompanyError('invalid', 'taskId is required');
-    if (!scope.subjects.includes(input.taskId)) throw new CompanyError('forbidden', 'the task is outside the QA observation scope');
-    const params = parseHistoryInput({ ...input });
-    const digest = queryDigest('qa-history', { scope: asId(scope.id), taskId: input.taskId });
-    const scopeView = qaScopeView(scope);
-    const taskId = input.taskId;
-    return this.listingPage<HistoryEntry, QaObservationTimelineView>({
-      actor: { employeeId: scope.qa_employee, role: 'qa', capabilities: [] }, kind: 'history', digest,
-      pageSize: params.pageSize, cursor: params.cursor, startedAt,
-      create: async started => {
-        const { limits } = this.snapshots;
-        return this.snapshots.build({
-          owner: scope.qa_employee, kind: 'history', digest, role: 'qa', startedAt: started,
-          guidance: 'read large evidence with qa_observation_text', emptyWhenNoRows: true,
-          load: async db => {
-            const { at, rows } = await this.historyRowsAt(taskId as TaskId, limits.maxRows + 1, db);
-            if (rows.length > limits.maxRows) throw tooLarge(`task ${taskId} has more than ${limits.maxRows} audit entries; its history cannot be listed in one stored listing`);
-            return { takenAt: at, bodies: rows.map(row => JSON.stringify(historyEntry(row, ITEM_BUDGET_BYTES))) };
-          },
-        });
-      },
-      parse: body => JSON.parse(body) as HistoryEntry,
-      respond: (history, page) => ({
-        meta: { checkedAt: page.snapshotAt ?? new Date().toISOString(), dataSource: 'live',
-          instanceAt: page.snapshotAt ?? new Date().toISOString(), scope: scopeView,
-          completeness: { complete: !page.hasMore, timelinePaged: true } },
-        history: [...history].reverse(), page,
-      }),
-      envelopeGuidance: 'use a smaller pageSize',
-      oversizeGuidance: entry => entry.auditId
-        ? `history entry ${entry.auditId} is larger than a page can hold; read its evidence with qa_observation_text ${JSON.stringify({ taskId, field: 'evidence', auditId: entry.auditId, offset: 0 })}`
-        : 'a history entry is larger than a page can hold; use a smaller pageSize',
-    });
-  }
-
-  /** QA: one byte segment of the allowlisted task's context or audit evidence, with the digest for reassembly. */
-  async qaObservationText(auth: QaObservationAuth, input: { scopeId?: string; taskId: string; field: 'context' | 'evidence'; auditId?: string; offset?: number; limit?: number; expectSha256?: string }): Promise<QaObservationTextSegment> {
-    const { scope } = await this.qaObservationAuth(auth, input.scopeId);
-    if (!scope.subjects.includes(input.taskId)) throw new CompanyError('forbidden', 'the task is outside the QA observation scope');
-    if (input.field !== 'context' && input.field !== 'evidence') throw new CompanyError('invalid', 'field must be context or evidence');
-    const offset = input.offset ?? 0;
-    const limit = input.limit ?? SEGMENT_DEFAULT_BYTES;
-    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000_000) throw new CompanyError('invalid', 'Invalid offset');
-    if (!Number.isSafeInteger(limit) || limit < 4 || limit > SEGMENT_MAX_BYTES) throw new CompanyError('invalid', `limit must be 4-${SEGMENT_MAX_BYTES}`);
-    if (input.expectSha256 !== undefined && !/^[0-9a-f]{64}$/.test(input.expectSha256)) throw new CompanyError('invalid', 'Invalid expectSha256');
-    const row = await this.db.select<TaskRow>(id('task', input.taskId));
-    if (!row) throw new CompanyError('not_found', 'Task not found');
-    if (!row.goal || asId(row.goal) !== asId(scope.goal)) throw new CompanyError('forbidden', 'the task is not in the scope goal');
-    let text: string;
-    if (input.field === 'context') {
-      text = row.context ?? '';
-    } else {
-      if (!input.auditId) throw new CompanyError('invalid', 'auditId is required to read evidence');
-      const [rows] = await this.db.query<[Array<{ task?: RecordId; evidence?: string | null }>]>(
-        "SELECT task, evidence FROM audit WHERE id = $aid AND action != 'ops_call';", { aid: id('audit', input.auditId) });
-      const audit = rows?.[0];
-      if (!audit || !audit.task || asId(audit.task) !== input.taskId) throw new CompanyError('not_found', 'evidence entry not found for this task');
-      text = audit.evidence ?? '';
-    }
-    const sha256 = HASH(text);
-    if (input.expectSha256 !== undefined && input.expectSha256 !== sha256) {
-      throw new CompanyError('conflict', `the ${input.field} text changed: it is now ${utf8Bytes(text)} bytes with sha256 ${sha256}; read it again from offset 0`);
-    }
-    const head: TaskTextHead = { taskId: input.taskId, field: input.field, ...(input.auditId ? { auditId: input.auditId } : {}), sha256 };
-    const segment = textSegment(text, offset, limit, head);
-    const meta: QaObservationMeta = { checkedAt: new Date().toISOString(), dataSource: 'live', instanceAt: await this.dbNow(),
-      scope: qaScopeView(scope), completeness: { complete: segment.next === null } };
-    return { meta, ...textSegmentAnswer(head, segment), field: input.field };
-  }
-
-  // ---- SYS-INT 评审协同的持久事件唤醒 ----
-  // 只做协调：老板 登记同 goal（源任务, 协同任务）订阅，QA 的真实复核租约与结构化请求触发一次唤醒，正向取证完成并
-  // 撤销请求触发第二次。唤醒只解除协同任务自己的 SYS05 feedback 等待（dispatcher 随后重新派 owner），不生成
-  // qa_observation_scope、不写验收证据、不改源任务租约，也不认识 checkpoint 里的自由文本。
-
-  /** 老板 (manage): register the one watch of an ordered same-goal task pair; the current source state is delivered at once. */
-  async reviewWatchRegister(credential: Credential, input: ReviewWatchInput): Promise<ReviewWatchView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may register a review watch');
-    requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
-    return this.reviewEvents.register({ ...input, actor: actor.employeeId });
-  }
-
-  /** 老板 (manage): close a watch with compare-and-set; undelivered events are invalidated, never replayed later. */
-  async reviewWatchClose(credential: Credential, input: ReviewWatchCloseInput): Promise<ReviewWatchView> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may close a review watch');
-    requireText(input.watchId, 'watchId', 1, 200);
-    requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
-    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
-    return this.reviewEvents.close({ ...input, actor: actor.employeeId });
-  }
-
-  /** Read-only: owner sees every watch, a qa employee only the watches of tasks it reviews. Never returns task text. */
-  async reviewWatchStatus(credential: Credential, input: ReviewWatchStatusInput = {}): Promise<ReviewWatchView[]> {
-    const actor = await this.authorized(credential);
-    if (actor.role !== 'owner' && actor.role !== 'qa') throw new CompanyError('forbidden', 'Review watch status is read by owner or qa');
-    const views = await this.reviewEvents.status({
-      ...(input.watchId ? { watchId: input.watchId } : {}),
-      ...(input.sourceTaskId ? { sourceTaskId: input.sourceTaskId } : {}),
-      ...(input.collaborationTaskId ? { collaborationTaskId: input.collaborationTaskId } : {}),
-    });
-    if (actor.role === 'owner') return views;
-    // A QA sees only the subscriptions it is currently entitled to act on: the source task is held by it, or the
-    // latest structured signal on that source task is its own. Another team's coordination is not its business.
-    return views.filter(view => view.source.holder === actor.employeeId || view.signal?.actor === actor.employeeId);
-  }
-
-  /** QA (own credential, live review lease): a structured scope request, then its positive retract. Audited, task ids only. */
-  async qaReviewScopeSignal(credential: Credential, input: QaScopeSignalInput): Promise<QaScopeSignalView> {
-    const actor = await this.authorized(credential);
-    if (actor.role !== 'qa') throw new CompanyError('forbidden', 'Only a qa reviewer may signal a review scope');
-    requireText(input.taskId, 'taskId', 1, 200);
-    requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
-    return this.reviewEvents.signal({ ...input, actor: actor.employeeId });
-  }
-
-  /** Read-only signal history: owner sees every signal, a qa employee sees the ones it raised. */
-  async reviewScopeSignals(credential: Credential, input: { taskId?: string; limit?: number } = {}): Promise<ReviewSignalView[]> {
-    const actor = await this.authorized(credential);
-    if (actor.role !== 'owner' && actor.role !== 'qa') throw new CompanyError('forbidden', 'Review signals are read by owner or qa');
-    const signals = await this.reviewEvents.signals(input);
-    return actor.role === 'owner' ? signals : signals.filter(signal => signal.actor === actor.employeeId);
-  }
-
-  /**
-   * A feedback wait that names a watch must name *this* task's watch and an active one: a task cannot park itself on
-   * another team's subscription, and a closed watch cannot be the reason a collaboration task stops working.
-   */
-  private async assertReviewWaitReference(taskId: string, kind: string, reference: string | undefined): Promise<void> {
-    const watchId = watchOfRef(reference);
-    if (watchId === undefined) {
-      if (kind === 'feedback' && reference?.startsWith('review-watch:')) {
-        throw new CompanyError('invalid', 'review-watch reference must be review-watch:<32 hex>');
-      }
-      return;
-    }
-    const [watch] = await this.db.query<[{ state?: string; collaboration_task?: unknown } | undefined]>(
-      'SELECT state, collaboration_task FROM ONLY $watch;', { watch: id('qa_review_watch', watchId) });
-    if (!watch) throw new CompanyError('not_found', 'review watch not found');
-    if (watch.state !== 'active') throw new CompanyError('conflict', 'the review watch is closed; it cannot wake this task');
-    if (asId(watch.collaboration_task) !== taskId) {
-      throw new CompanyError('forbidden', 'this task is not the collaboration task of the named review watch');
-    }
-  }
-
-  /** Ask the store to emit whatever the current source state warrants for one watch (used after a wait is entered). */
-  private async syncReviewWatch(watchId: string): Promise<void> {
-    await this.reviewEvents.syncWatch(watchId).catch(() => undefined);
-  }
-
 }

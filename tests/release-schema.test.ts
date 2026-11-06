@@ -17,11 +17,13 @@ function fakeDb(schemaVersion: number | undefined, tables: string[], fail = fals
 }
 
 describe('the schema a target version must have reached', () => {
-  test('0.3.76 and later need schema 49 and the three recovery-read tables; 0.3.77 schema 50; 0.3.78 schema 51 with outbound_message', () => {
-    expect(schemaRequirementFor('0.3.76')).toEqual({ schema: 49, tables: [...RECOVERY_READ_TABLES] });
-    expect(schemaRequirementFor('0.3.77')).toEqual({ schema: 50, tables: [...RECOVERY_READ_TABLES] });
+  test('0.3.76 and later need schema 49; 0.3.77 schema 50; 0.3.78 schema 51 with outbound_message; 0.3.79 schema 52 with route', () => {
+    // Schema 052 removed the recovery-read tables again, so no version may require them anymore.
+    expect(schemaRequirementFor('0.3.76')).toEqual({ schema: 49, tables: [] });
+    expect(schemaRequirementFor('0.3.77')).toEqual({ schema: 50, tables: [] });
     expect(schemaRequirementFor('0.3.78')).toEqual({ schema: 51, tables: ['outbound_message'] });
-    expect(schemaRequirementFor('0.4.0')).toEqual({ schema: 51, tables: ['outbound_message'] });
+    expect(schemaRequirementFor('0.3.79')).toEqual({ schema: 52, tables: ['route'] });
+    expect(schemaRequirementFor('0.4.0')).toEqual({ schema: 52, tables: ['route'] });
   });
 
   test('an older target keeps the older minimum: 49 is not forced onto every historical version', () => {
@@ -35,15 +37,15 @@ describe('the schema a target version must have reached', () => {
     expect(receipt.tables).toEqual([...RECOVERY_READ_TABLES]);
   });
 
-  test('the three tables and the marker let a 0.3.76 release be verified', async () => {
-    const result = await verifyReleaseSchema(fakeDb(49, [...RECOVERY_READ_TABLES]), '0.3.76');
+  test('the marker alone lets a 0.3.76 release be verified on a post-052 database', async () => {
+    const result = await verifyReleaseSchema(fakeDb(49, ['outbound_message', 'route']), '0.3.76');
     expect(result).toMatchObject({ schema: 49, schemaVersion: 49 });
-    expect(result.tables).toEqual([...RECOVERY_READ_TABLES]);
+    expect(result.tables).toEqual([]);
   });
 
   test('a missing table keeps the release unverified', async () => {
-    const db = fakeDb(49, RECOVERY_READ_TABLES.filter(table => table !== 'recovery_read_chain'));
-    await expect(verifyReleaseSchema(db, '0.3.76')).rejects.toThrow(/missing the tables/);
+    const db = fakeDb(52, []);
+    await expect(verifyReleaseSchema(db, '0.3.79')).rejects.toThrow(/missing the tables/);
   });
 
   test('an old marker keeps the release unverified', async () => {

@@ -89,9 +89,8 @@ async function expectRefused(promise: Promise<unknown>, code: CompanyError['code
 function expectBlock(items: ReturnType<typeof reassembleCompany>, brief: CompanyBrief) {
   expect(items.get('meta\0company')!.value).toEqual({ paused: brief.paused });
   brief.directions.forEach((direction, index) => expect(items.get(`directions\0direction-${index}`)!.value).toEqual(jsonOf(direction)));
-  for (const goal of brief.goals) expect(items.get(`goals\0${goal.id}`)!.value).toEqual(jsonOf(goal));
   for (const project of brief.projects) expect(items.get(`projects\0${project.id}`)!.value).toEqual(jsonOf(project));
-  expect(items.size).toBe(1 + brief.directions.length + brief.goals.length + brief.projects.length);
+  expect(items.size).toBe(1 + brief.directions.length + brief.projects.length);
 }
 
 /** Every part once, each at most COMPANY_PART_BYTES, and the parts of one item numbered 0 to parts-1. */
@@ -106,8 +105,6 @@ function expectPartsWellFormed(parts: CompanyPart[]) {
 async function operationsSample(fx: Fixture): Promise<CompanyBrief> {
   await fx.owner.addDirection({ text: textOf(9000, '方向一 '), source: 'owner:test', key: `ops-${suffix}-dir-a` });
   await fx.owner.addDirection({ text: textOf(6000, '方向二 🙂 '), source: 'owner:test', key: `ops-${suffix}-dir-b` });
-  await fx.owner.createGoal({ text: textOf(7000, '目标简报 '), source: 'owner:test', key: `ops-${suffix}-goal-a`, tier: 'standard' });
-  await fx.owner.createGoal({ text: textOf(3000, '第二目标 '), source: 'owner:test', key: `ops-${suffix}-goal-b`, tier: 'standard' });
   await fx.projects.upsert({
     id: `ops-proj-${suffix}`, name: '样本项目', repoPath: '/fixture/ops', release: 'local', envs: [], runbooks: [textOf(2000, '运行手册甲 '), textOf(2000, '运行手册乙 ')],
   });
@@ -128,7 +125,6 @@ async function growthSample(fx: Fixture): Promise<CompanyBrief> {
   await fx.owner.addDirection({ text: unitsOf(19_000, '单方向超长 '), source: 'owner:test', key: `grow-${suffix}-dir-huge` });
   await fx.owner.addDirection({ text: unitsOf(19_000, '第二超长方向 '), source: 'owner:test', key: `grow-${suffix}-dir-big` });
   await fx.owner.addDirection({ text: unitsOf(15_000, '第三方向 '), source: 'owner:test', key: `grow-${suffix}-dir-third` });
-  await fx.owner.createGoal({ text: textOf(40 * 1024, '大目标 🙂 '), source: 'owner:test', key: `grow-${suffix}-goal-big`, tier: 'standard' });
   for (let index = 0; index < 40; index++) {
     await fx.projects.upsert({
       id: `grow-proj-${index}-${suffix}`, name: `增长项目 ${index}`, repoPath: `/fixture/grow-${index}`, release: 'local', envs: [],

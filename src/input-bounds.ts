@@ -27,19 +27,6 @@ const utf8Bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
  * with the same 200-character bound as the task-reading inputs; existence and role checks remain in
  * the task transaction.
  */
-export function validateExternalDependencies(dependencies: unknown): void {
-  if (dependencies === undefined) return;
-  if (!Array.isArray(dependencies)) throw invalid('dependencies must be a list');
-  if (dependencies.length > MAX_TASK_DEPENDENCIES) {
-    throw invalid(`dependencies count ${dependencies.length} exceeds limit ${MAX_TASK_DEPENDENCIES}`);
-  }
-  for (let index = 0; index < dependencies.length; index++) {
-    const dependency: unknown = dependencies[index];
-    if (typeof dependency !== 'string' || dependency.length === 0 || dependency.length > MAX_TASK_ID_CHARS) {
-      throw invalid(`dependencies[${index}] must be a task id of 1-${MAX_TASK_ID_CHARS} characters`);
-    }
-  }
-}
 
 export interface ProjectTextInput {
   release: string;

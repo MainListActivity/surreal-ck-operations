@@ -19,7 +19,7 @@ const restoreServiceHome = (prev: string | undefined): void => {
 
 const taskView = (id: string, version = 1): TaskView => ({
   id, title: `t-${id}`, context: '', state: 'doing', executorRole: 'engineering', reviewerRole: 'qa',
-  kind: 'task', dependencies: [], version, fence: 1, deliveryId: `d-${id}`,
+  kind: 'task', version, fence: 1, deliveryId: `d-${id}`,
 });
 const claimResult = (taskId: string): ClaimResult => ({
   task: taskView(taskId), deliveryId: `d-${taskId}`, fence: 7, leaseExpiresAt: new Date().toISOString(), history: [],

@@ -104,8 +104,7 @@ export async function runDrill(plan: DrillPlan, host: DrillHost): Promise<{ repo
         // Content binding + all four target guards, from the target's own scripts: the drill must prove
         // the candidate passes exactly what a production switch would demand before it is switched to.
         await exec.run('sh', ['-c', '. "$1/scripts/release-content.sh"; release_matches_commit "$1" "$2" "$3"', 'bind', release, sha, host.repo], {}).then(r => assertOk(r, `content binding ${sha.slice(0, 8)}`));
-        for (const guard of ['review-wait-guard.sh:review_wait_target_supported', 'independence-guard.sh:independence_target_supported',
-          'policy-guard.sh:policy_target_supported', 'goal-workspace-guard.sh:goal_workspace_target_supported']) {
+        for (const guard of ['acceptance-guard.sh:acceptance_target_supported']) {
           const [script, fn] = guard.split(':');
           const r = await exec.run('sh', ['-c', `. "$1/scripts/${script}"; ${fn} "$1"`, 'guard', release], {});
           if (r.code !== 0) throw new Error(`target guard ${fn} refused ${sha}: ${r.stderr.slice(0, 300)}`);

@@ -1,5 +1,4 @@
 import type { DispatchBlockedRow } from './dispatcher/dispatch-list.ts';
-import { blockerSeverity, type GoalBlocker, type GoalFinalGateView } from './goal-governance.ts';
 
 /** What is waiting on the owner (a gate to approve or a question to answer) and what it holds up. */
 export interface WaitingItem {
@@ -7,10 +6,10 @@ export interface WaitingItem {
   version: number;
   kind: 'gate' | 'question';
   title: string;
-  goal?: string;
   sinceMs: number;
   /** Non-terminal tasks that transitively depend on this one. */
-  downstream: number;
+  downstream?: number;
+  tag?: string;
 }
 
 /** How many of a role's enabled seats can take work right now, and why the others cannot. */
@@ -21,17 +20,6 @@ export interface BriefData {
   waiting: Array<WaitingItem & { hours: number }>;
   stuck: Array<{ taskId: string; title: string; reason: string }>;
   last24h: { done: number; returned: number; rolledBack: number; rejected: number; retired: number };
-  goals: Array<{
-    title: string; days: number; id?: string; needsRepair?: boolean;
-    deadline?: { status: 'exact' | 'unknown'; at?: number; timezone?: string; source: string };
-    /** Every open blocker on the card (activity-sorted); the card caps at 8 and blockersOmitted counts the rest. */
-    blockers?: GoalBlocker[];
-    blockersOmitted?: number;
-    /** Effective final gate and the evidence task ids, so the brief never drops the terminal decision. */
-    finalGate?: GoalFinalGateView;
-    /** Legacy single-blocker fields kept for older callers. */
-    blocker?: string; nextTrigger?: string; missingEvidence?: string[];
-  }>;
   resources: string[];
   capacity: RoleCapacity[];
   /** Employee instances opened/closed in the last 24h; a high lost-claim count means the scheduler is thrashing. */
@@ -55,9 +43,8 @@ const short = (text: string, max: number) => text.length > max ? `${text.slice(0
 
 export function agingText(item: WaitingItem, hours: number): string {
   const what = item.kind === 'gate' ? '待你批准的关口' : '待你回答的问题';
-  const holds = item.downstream > 0 ? `，卡住下游 ${item.downstream} 个任务` : '';
-  const goal = item.goal ? `（目标：${short(item.goal, 30)}）` : '';
-  return `已等你 ${formatAge(hours)}：${what}《${short(item.title, 60)}》${goal}${holds}。任务 ${item.taskId}。查看：company owner inbox`;
+  const downstream = item.downstream ? `卡住下游 ${item.downstream} 个任务。` : '';
+  return `已等你 ${formatAge(hours)}：${what}《${short(item.title, 60)}》。任务 ${item.taskId}。${downstream}查看：company owner inbox`;
 }
 
 const PHASE_NAME = { execute: '执行', review: '复核' } as const;
@@ -72,77 +59,19 @@ export function dispatchLine(row: DispatchBlockedRow): string {
   return `《${short(row.title, 40)}》（${PHASE_NAME[row.phase]}·${WORKFLOW_NAME[row.workflowState]}）：${reasons}；已等 ${row.waitingMinutes} 分钟；负责：${owner}；下一触发：${next || '待定'}`;
 }
 
-/** Goals per daily brief; goals beyond the cap are counted, never silently dropped. */
-export const GOAL_LINES = 8;
-
-/** One blocker with every fact the console and brief must show, not just its summary. */
-export function blockerLine(blocker: GoalBlocker): string {
-  const parts = [`阻点[${blocker.kind}] ${short(blocker.summary, 60)}`, `责任：${blocker.responsibleRole}`];
-  if (blocker.holder) parts.push(`持有人：${short(blocker.holder, 40)}`);
-  if (blocker.waitedMinutes !== undefined) parts.push(`已等 ${blocker.waitedMinutes} 分钟`);
-  if (blocker.nextTrigger) parts.push(`下一触发：${short(blocker.nextTrigger, 40)}`);
-  if (blocker.dependencyPath.length) {
-    parts.push(`依赖路径：${blocker.dependencyPath.map(item => short(item.title, 30)).join(' → ')}${blocker.dependencyPathTruncated ? ' …' : ''}`);
-  }
-  if (blocker.handoff) {
-    const handoff = blocker.handoff.pendingAction ? `待办：${short(blocker.handoff.pendingAction, 40)}`
-      : blocker.handoff.completed.length ? `已完成 ${blocker.handoff.completed.length} 项` : blocker.handoff.kind;
-    parts.push(`交接：${handoff}`);
-  }
-  return parts.join('；');
-}
-
-/** The effective final gate and its evidence; a missing gate is named, never implied complete. */
-export function finalGateLine(gate: GoalFinalGateView): string {
-  if (!gate.taskId) return '终验：缺失';
-  const state = `${gate.state ?? '未知'}${gate.reviewerRole ? `，复核 ${gate.reviewerRole}` : ''}${gate.ownerGate ? '，老板关口' : ''}${gate.effective ? '' : '，已被替代'}`;
-  return `终验：《${short(gate.title ?? gate.taskId, 40)}》（${state}）；证据任务：${gate.evidenceTaskIds.length ? gate.evidenceTaskIds.map(id => short(id, 8)).join(', ') : '无'}`;
-}
-
 export function renderBrief(data: BriefData): { summary: string; text: string } {
   const oldest = data.waiting.reduce((max, item) => Math.max(max, item.hours), 0);
   const summary = `每日简报 ${data.date}：待你处理 ${data.waiting.length} 项${data.waiting.length ? `（最久 ${formatAge(oldest)}）` : ''}｜异常卡滞 ${data.stuck.length}｜近24小时完成 ${data.last24h.done}`;
   const lines = [summary, ''];
   lines.push(data.waiting.length ? '【等你处理】' : '【等你处理】无');
   for (const item of [...data.waiting].sort((a, b) => b.hours - a.hours)) {
-    lines.push(`- ${item.kind === 'gate' ? '批准' : '回答'}《${short(item.title, 50)}》已等 ${formatAge(item.hours)}${item.downstream ? `，卡住 ${item.downstream} 个下游` : ''}`);
+    lines.push(`- ${item.kind === 'gate' ? '批准' : '回答'}《${short(item.title, 50)}》已等 ${formatAge(item.hours)}`);
   }
   if (data.stuck.length) {
     lines.push('', '【异常卡滞】');
     for (const item of data.stuck.slice(0, 8)) lines.push(`- ${short(item.title, 50)}：${item.reason}（${item.taskId.slice(0, 8)}）`);
   }
   lines.push('', `【近24小时】完成 ${data.last24h.done}｜退回 ${data.last24h.returned}｜老板驳回 ${data.last24h.rejected}｜作废 ${data.last24h.retired}${data.last24h.rolledBack ? `｜通道回滚 ${data.last24h.rolledBack}（系统换会话，不算退回）` : ''}`);
-  if (data.goals.length) {
-    lines.push('', '【在办目标】');
-    // Activity first: a goal with a repair gap or an open blocker is never pushed out by a quiet one.
-    const rank = (goal: BriefData['goals'][number]) =>
-      goal.needsRepair ? 0 : (goal.blockers?.length ?? 0) ? 1 : (goal.missingEvidence?.length ?? 0) ? 2 : 3;
-    const severity = (goal: BriefData['goals'][number]) =>
-      Math.max(0, ...(goal.blockers ?? []).map(blocker => blockerSeverity(blocker)));
-    const shown = [...data.goals]
-      .sort((a, b) => rank(a) - rank(b) || severity(b) - severity(a) ||
-        (b.blockers?.length ?? 0) - (a.blockers?.length ?? 0) || b.days - a.days)
-      .slice(0, GOAL_LINES);
-    for (const goal of shown) {
-      const extras: string[] = [];
-      if (goal.deadline?.status === 'exact' && goal.deadline.at) extras.push(`截止 ${new Date(goal.deadline.at).toISOString()}`);
-      if (goal.needsRepair) extras.push('待修复');
-      if (goal.missingEvidence?.length) extras.push(`缺证据：${goal.missingEvidence.join('/')}`);
-      lines.push(`- ${short(goal.title, 40)}（已 ${goal.days} 天${extras.length ? `，${extras.join('｜')}` : ''}）`);
-      for (const blocker of goal.blockers ?? []) lines.push(`  · ${blockerLine(blocker)}`);
-      if (goal.blockersOmitted) lines.push(`  · 另有 ${goal.blockersOmitted} 个阻点未展示（卡片上限）`);
-      if (goal.finalGate) lines.push(`  · ${finalGateLine(goal.finalGate)}`);
-      // Legacy callers that only carried the first blocker keep their line; the full card path above supersedes it.
-      if (!goal.blockers?.length && goal.blocker) {
-        lines.push(`  · 阻点：${short(goal.blocker, 50)}${goal.nextTrigger ? `；下一触发：${short(goal.nextTrigger, 30)}` : ''}`);
-      } else if (!goal.blockers?.length && goal.nextTrigger) {
-        lines.push(`  · 下一触发：${short(goal.nextTrigger, 30)}`);
-      }
-    }
-    if (data.goals.length > shown.length) {
-      lines.push(`- 已展示 ${shown.length}/${data.goals.length} 个目标（按活动阻点优先；其余见控制台）`);
-    }
-  }
   // Every blocked item of the latest pass is named here, with its own reason and owner. The brief does not count notices.
   if (data.dispatchBlocked.total) {
     lines.push('', `【无法派工】共 ${data.dispatchBlocked.total} 项（同一份结论，见岗位页面）`);

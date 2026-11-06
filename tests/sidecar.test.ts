@@ -10,7 +10,7 @@ import type { EmployeeInst, SupervisedTask } from '../src/workforce.ts';
 
 const taskView = (id: string, version = 1): TaskView => ({
   id, title: `t-${id}`, context: '', state: 'doing', executorRole: 'engineering', reviewerRole: 'qa',
-  kind: 'task', dependencies: [], version, fence: 1, deliveryId: `d-${id}`,
+  kind: 'task', version, fence: 1, deliveryId: `d-${id}`,
 });
 
 const claimResult = (taskId: string): ClaimResult => ({
@@ -230,163 +230,7 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
 
   // SYS-INT 复核 round-02（需求 4）与 R2：在租持有人不必等调度器空闲，任一 sck 调用就附带未送达的修订通知；
   // 条数有上限。附带即送达：附带过的不再随回包附带，调度器也不再重发；通知读取失败不会拖垮工具调用本身。
-  test('a successful call carries the undelivered holder notices, capped, and attaching delivers them', async () => {
-    const i = inst('e-notice');
-    const env = pool.env(i);
-    await pool.claim(i, task('task-notice'));
-    const notice = (n: number) => ({
-      noticeKey: `task-notice:acceptance_amended:audit-${n}:e-notice`, kind: 'acceptance_amended',
-      taskId: 'task-notice', text: `第 ${n} 条修订`,
-    });
-    pendingNotices = [notice(1), notice(2), notice(3), notice(4)];
-
-    // heartbeat 只回 {ok:true}，通知就挂在这个回包的顶层。
-    const beat = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n1', 'heartbeat', {});
-    expect(beat.ok).toBe(true);
-    expect(beat.notices).toHaveLength(3);
-    expect(noticeReads).toContain('tok-e-notice');
-    expect((beat.notices as Array<{ noticeKey: string }>).map(n => n.noticeKey))
-      .toEqual([notice(1).noticeKey, notice(2).noticeKey, notice(3).noticeKey]);
-
-    // 附带即送达：前三条已随 heartbeat 回包标记送达，正文注明无需 ack；调度器的待发集合里只剩第四条。
-    expect((beat.notices as Array<{ text: string }>).every(n => n.text.startsWith('【已随本次回包送达，无需 ack】'))).toBe(true);
-    expect(ackedNotices).toEqual([notice(1).noticeKey, notice(2).noticeKey, notice(3).noticeKey]);
-    expect(pendingNotices.map(n => n.noticeKey)).toEqual([notice(4).noticeKey]);
-
-    // 已送达的不再出现，只剩第四条，它在下一次调用附带；之后就没有未送达的通知了。
-    const after = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n3', 'checkpoint', { text: '附带之后继续' });
-    expect(after.ok).toBe(true);
-    expect((after.notices as Array<{ noticeKey: string }>).map(n => n.noticeKey)).toEqual([notice(4).noticeKey]);
-    const drained = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n3b', 'checkpoint', { text: '全部送达之后' });
-    expect(drained.ok).toBe(true);
-    expect(drained.notices).toBeUndefined();
-
-    // 读取通知失败只记日志，回包照常成功且不带通知。
-    pendingNotices = [notice(5)];
-    noticeReadFails = true;
-    const degraded = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n4', 'checkpoint', { text: '通知库暂不可用' });
-    expect(degraded.ok).toBe(true);
-    expect(degraded.notices).toBeUndefined();
-    expect(logs.some(line => line.includes('attach notices e-notice failed'))).toBe(true);
-  });
-
-  // SYS-INT 复核 round-03（P1）：附带的通知必须计入同一条 48 KiB 回包预算。守卫原先只量 data，三条最大规模
-  // 通知可以带着 7 万余字节的回复穿过守卫。现在放不下的通知被截掉并如实记在 noticesTruncated 上，写回行不超预算，
-  // 被截掉的通知仍未确认，下一次调用还会来；ack 之后才不再出现。
-  test('attached notices share the reply budget: the written line stays under 48 KiB and a cut notice returns', async () => {
-    const i = inst('e-budget');
-    const env = pool.env(i);
-    await pool.claim(i, task('task-budget'));
-    const big = '验'.repeat(4000);
-    const bigNotice = (n: number) => ({
-      noticeKey: `task-budget:acceptance_amended:audit-${n}:e-budget`, kind: 'acceptance_amended',
-      taskId: 'task-budget', ownerQuote: big, text: big, employee: 'e-budget',
-    });
-    pendingNotices = [bigNotice(1), bigNotice(2), bigNotice(3)];
-
-    // checkpoint 的 data 里有一个 200_000 字符的正文：旧代码会让守卫只看 data 并放行。
-    const oversized = () => ({ id: 'task-budget', version: 26, state: 'review', context: 'x'.repeat(200_000) });
-    coreForCheckpoint = oversized;
-    const line = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'b1', 'checkpoint', { text: '回包超预算的一次修订回显' });
-    // 守卫仍然拦得住，且拒绝码可恢复。
-    expect(line.ok).toBe(false);
-    expect(line.error).toContain('response_too_large');
-    const written = Buffer.byteLength(JSON.stringify(line), 'utf8');
-    expect(written).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-
-    // data 本身在预算内时，通知按剩余空间截取：写回行不超预算，未确认的通知不会丢。
-    coreForCheckpoint = () => ({ id: 'task-budget', version: 26, state: 'review' });
-    const fitted = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'b2', 'checkpoint', { text: '带三条大通知的回显' });
-    expect(fitted.ok).toBe(true);
-    expect(Buffer.byteLength(JSON.stringify(fitted), 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    const attached = (fitted.notices ?? []) as Array<{ noticeKey: string }>;
-    expect(attached.length).toBeGreaterThan(0);
-    expect(attached.length).toBeLessThan(3);
-    expect(fitted.noticesTruncated).toMatchObject({ count: 1 });
-    // 被截掉的正是放不进剩余预算的那一条（这里第三条 24 KB 的正文放不下），且它仍未确认、没有被丢。
-    expect(new Set(attached.map(n => n.noticeKey))).toEqual(new Set([bigNotice(1).noticeKey, bigNotice(2).noticeKey]));
-    // 附带即送达：这两条已标记送达，被截掉的第三条仍待发。
-    expect(ackedNotices).toEqual([bigNotice(1).noticeKey, bigNotice(2).noticeKey]);
-    expect(pendingNotices.map(n => n.noticeKey)).toEqual([bigNotice(3).noticeKey]);
-
-    // 被截掉的第三条仍未送达：放不下它时它留在原地，holder_notices 可以按 ids 逐条读出（回显同样受预算约束）。
-    const readThird = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'b3c', 'holder_notices', { ids: [bigNotice(3).noticeKey] });
-    expect(readThird.ok).toBe(true);
-    expect(new Set(((readThird.data as { notices: Array<{ noticeKey: string }> }).notices).map(n => n.noticeKey)))
-      .toEqual(new Set([bigNotice(3).noticeKey]));
-
-    // 下一次调用附带它：前两条已随上一次回包送达，不再出现；它单独也放得下，所以没有截断，且已全部送达。
-    coreForCheckpoint = () => ({ id: 'task-budget', state: 'review' });
-    const next = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'b3', 'checkpoint', { text: '继续读剩余通知' });
-    expect(next.ok).toBe(true);
-    expect(Buffer.byteLength(JSON.stringify(next), 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    expect(((next.notices ?? []) as Array<{ noticeKey: string }>).map(n => n.noticeKey)).toEqual([bigNotice(3).noticeKey]);
-    expect(next.noticesTruncated).toBeUndefined();
-    expect(pendingNotices).toEqual([]);
-
-    // ack 之后这些通知彻底不再出现。
-    await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'b4', 'holder_notices',
-      { ids: [bigNotice(1).noticeKey, bigNotice(2).noticeKey, bigNotice(3).noticeKey], ack: true });
-    pendingNotices = [];
-    const cleared = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'b5', 'checkpoint', { text: '回执之后' });
-    expect(cleared.ok).toBe(true);
-    expect(cleared.notices).toBeUndefined();
-  });
-
-  // SYS-INT R2 并发：sweep 会同时开始同一员工的两个请求文件。读取、附带、标记是按员工串行的一步，两次同时到达的
-  // 调用只有一次带上这条通知；标记失败只记日志，回包照常成功并带上通知，通知仍未送达。
-  test('calls in flight carry a pending notice once, and a failed mark only logs', async () => {
-    const i = inst('e-race');
-    const env = pool.env(i);
-    await pool.claim(i, task('task-race'));
-    const race = { noticeKey: 'task-race:acceptance_amended:audit-1:e-race', kind: 'acceptance_amended', taskId: 'task-race', text: '并发修订' };
-    pendingNotices = [race];
-    const dir = env.SCK_COMM_DIR;
-    for (const name of ['race1', 'race2']) {
-      writeFileSync(join(reqDir(dir), `${name}.json`), JSON.stringify({ key: env.SCK_COMM_KEY, tool: 'heartbeat', args: {} }));
-    }
-    await until(() => ['race1', 'race2'].every(name => existsSync(join(resDir(dir), `${name}.json`))));
-    const replies = ['race1', 'race2'].map(name => readJsonFile<{ ok: boolean; notices?: unknown[] }>(join(resDir(dir), `${name}.json`))!);
-    expect(replies.every(reply => reply.ok)).toBe(true);
-    expect(replies.reduce((count, reply) => count + (reply.notices?.length ?? 0), 0)).toBe(1);
-    expect(ackedNotices).toEqual([race.noticeKey]);
-
-    const late = { ...race, noticeKey: 'task-race:acceptance_amended:audit-2:e-race', text: '标记失败的修订' };
-    pendingNotices = [late];
-    noticeAckFails = true;
-    const degraded = await relay(dir, env.SCK_COMM_KEY!, 'race3', 'heartbeat', {});
-    noticeAckFails = false;
-    expect(degraded.ok).toBe(true);
-    expect((degraded.notices as Array<{ noticeKey: string }>).map(n => n.noticeKey)).toEqual([late.noticeKey]);
-    expect(logs.some(line => line.includes('mark attached notices e-race failed'))).toBe(true);
-    expect(pendingNotices.map(n => n.noticeKey)).toEqual([late.noticeKey]);
-  });
-
-  test('QA reads carry the actual running release, and never a fabricated one', async () => {
-    const home = mkdtempSync(join(tmpdir(), 'sck-sidecar-home-'));
-    const sha = 'c'.repeat(40);
-    mkdirSync(join(home, 'releases', sha), { recursive: true });
-    symlinkSync(join(home, 'releases', sha), join(home, 'active'));
-    const prevHome = process.env.SCK_SERVICE_HOME;
-    process.env.SCK_SERVICE_HOME = home;
-    try {
-      const i = inst('e-qa');
-      const env = pool.env(i);
-      await pool.claim(i, task('task-qa'));
-      const answer = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY, 'qa1', 'qa_observation_read', { taskId: 'task-qa' });
-      expect(answer.ok).toBe(true);
-      expect((answer.data as { meta: { runtimeRelease?: string } }).meta.runtimeRelease).toBe(sha);
-      unlinkSync(join(home, 'active'));
-      const after = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY, 'qa2', 'qa_observation_read', { taskId: 'task-qa' });
-      expect(after.ok).toBe(true);
-      expect((after.data as { meta: { runtimeRelease?: string } }).meta.runtimeRelease).toBeUndefined();
-    } finally {
-      if (prevHome === undefined) delete process.env.SCK_SERVICE_HOME; else process.env.SCK_SERVICE_HOME = prevHome;
-      rmSync(home, { recursive: true, force: true });
-    }
-  });
-
-  test('relay rejects a wrong comm key and claim_next', async () => {
+          test('relay rejects a wrong comm key and claim_next', async () => {
     const i = inst('e4');
     const env = pool.env(i);
     await pool.claim(i, task('task-4'));
@@ -595,22 +439,7 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     }
   });
 
-  test('FV06 append_dependency_prerequisites is listed and dispatched through the employee channel', async () => {
-    const i = inst('e12a');
-    const env = pool.env(i);
-    const listed = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'fa0', '__list__', {});
-    expect((listed.data as { tools: string[] }).tools).toContain('append_dependency_prerequisites');
-    await pool.claim(i, task('task-12a'));
-    const res = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'fa1', 'append_dependency_prerequisites', {
-      taskId: 'task-12a', expectedVersion: 1, dependencies: ['dep-1'],
-      text: 'FV06 通道回归：受控追加依赖前置必须由 sidecar 分发到 core，而不是 unknown_tool。', idempotencyKey: 'fa-1',
-    });
-    expect(res.ok).toBe(true);
-    expect(calls.filter(c => c.tool === 'append_dependency_prerequisites')).toHaveLength(1);
-    expect(calls.find(c => c.tool === 'append_dependency_prerequisites')?.text).toContain('FV06');
-  });
-
-  test('worktree 工具经 sidecar 路由：员工缺省绑当前任务，gm 缺省取全局，回收/审计透传 core', async () => {
+    test('worktree 工具经 sidecar 路由：员工缺省绑当前任务，gm 缺省取全局，回收/审计透传 core', async () => {
     const i = inst('e13');
     const env = pool.env(i);
     await pool.claim(i, task('task-13'));

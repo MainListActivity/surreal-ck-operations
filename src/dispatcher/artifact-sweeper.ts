@@ -132,7 +132,7 @@ export class ArtifactReclaimer {
     //     gate-triggered emergency reclaim both stop. An operator run still answers.
     //   - artifact_reclaim_enabled=false (config) only stops routine sweeps. A gate
     //     emergency still runs — a halted company must be able to free its own disk —
-    //     and pressure mode already spares direct dependencies.
+    //     and pressure mode already spares direct parents.
     const hardStop = artifactReclaimHardStop(this.deps.env ?? process.env);
     const automatic = input.trigger === 'sweep' || input.trigger === 'pressure';
     const enabled = !automatic || (!hardStop && (base.enabled || input.emergency === true));
@@ -289,22 +289,22 @@ export function dbArtifactTasks(db: Surreal): ArtifactTaskSource {
   const clocks = new Map<string, Date>();
   return {
     async tasks() {
-      const [rows] = await db.query<[Array<{ id: unknown; state: string; dependencies?: unknown[]; progress_at?: unknown }>]>(
-        'SELECT id, state, dependencies, progress_at FROM task;');
+      const [rows] = await db.query<[Array<{ id: unknown; state: string; parent?: unknown; progress_at?: unknown }>]>(
+        'SELECT id, state, parent, progress_at FROM task;');
       const all = rows ?? [];
       const terminal = (state: string) => state === 'done' || state === 'void';
-      const deps = new Map<string, string[]>();
-      for (const row of all) deps.set(idOf(row.id), (row.dependencies ?? []).map(idOf));
+      const parents = new Map<string, string>();
+      for (const row of all) if (row.parent != null) parents.set(idOf(row.id), idOf(row.parent));
 
       const direct = new Set<string>();
-      for (const row of all) if (!terminal(row.state)) for (const dep of deps.get(idOf(row.id)) ?? []) direct.add(dep);
+      for (const row of all) if (!terminal(row.state)) { const p = parents.get(idOf(row.id)); if (p) direct.add(p); }
       const indirect = new Set<string>();
-      const stack = [...direct];
-      while (stack.length) {
-        for (const dep of deps.get(stack.pop()!) ?? []) {
-          if (direct.has(dep) || indirect.has(dep)) continue;
-          indirect.add(dep);
-          stack.push(dep);
+      for (const row of all) {
+        if (terminal(row.state)) continue;
+        let cursor = parents.get(parents.get(idOf(row.id)) ?? '');
+        while (cursor) {
+          if (!direct.has(cursor)) indirect.add(cursor);
+          cursor = parents.get(cursor);
         }
       }
 

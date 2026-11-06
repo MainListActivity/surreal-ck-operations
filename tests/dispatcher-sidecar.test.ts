@@ -36,7 +36,7 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
   const addTask = (id: string, opts: { state?: TaskView['state']; submittedBy?: string; worktreePath?: string; discipline?: string; assets?: string[] } = {}) => {
     if (opts.assets) assetPaths.set(id, opts.assets);
     const v: TaskView = { id, title: id, context: '', state: opts.state ?? 'ready', executorRole: 'engineering', reviewerRole: 'engineering',
-      kind: 'task', dependencies: [], version: 1, fence: 0, submittedBy: opts.submittedBy, discipline: opts.discipline };
+      kind: 'task', version: 1, fence: 0, submittedBy: opts.submittedBy, discipline: opts.discipline };
     if (opts.worktreePath) {
       wtPaths.set(id, opts.worktreePath);
       v.worktree = { id: `wt-${id}`, repo: '/repo', worktreePath: opts.worktreePath, mode: 'exclusive', intent: { kind: 'code' }, discipline: '' };
@@ -49,7 +49,7 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
     defs: async () => [def], serverNow: async () => now, insts: async () => instances.filter(i => !retired.has(i.id)), tasks: async () => rows,
     providerHealth: async () => health, lastDispatch: async () => undefined, recordDispatch: async () => {}, observeSessionIdle: async (observations: Array<{ id: string; since?: number }>) => {
       for (const o of observations) { const i = instances.find(i => i.id === o.id); if (i) i.idleSince = o.since; }
-    }, openManagerWakes: async () => [],
+    }, openPendingWakes: async () => [],
     retireIdle: async (inst: EmployeeInst) => { events.push(`retire:${inst.id}:rotation`); retired.add(inst.id); },
     touchWake: async () => {}, defHealthy: async () => {},
     markExhausted: async (provider: string, _error: string, resetsAt?: number) => {
@@ -77,6 +77,8 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
       Object.assign(rows.find(t => t.id === id)!, { dispatchBlockedPhase: phase, dispatchBlockedSince: since });
     },
   };
+  const sentBodies: Array<{ id: string; body: string }> = [];
+  const spawnBodies: string[] = [];
   const notices = new Map<string, string>();
   const owner = { applyPending: async () => [], resolveNotice: async (key: string) => { notices.delete(key); },
     openNotices: async () => [...notices].map(([key, text]) => ({ key, text, at: '' })), triagePending: async () => [],
@@ -118,8 +120,8 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
   const paseo: PaseoGateway = {
     list: async () => agents, status: async id => agents.get(id) ? { status: agents.get(id)!.status, pendingPermissions: 0 } : undefined,
     lastError: async () => lastError, logsTail: async () => 'fixture transcript', lastInputTokens: async () => 0,
-    spawn: async b => { const id = `agent-${b.labels.employee_id}`; agents.set(id, { id, status: 'running' }); envs.set(id, b.env); cwds.set(id, b.cwd); events.push(`spawn:${id}`); return id; },
-    send: async id => { events.push(`send:${id}`); agents.get(id)!.status = 'running'; }, stop: async id => { events.push(`stop:${id}`); agents.get(id)!.status = 'idle'; },
+    spawn: async b => { const id = `agent-${b.labels.employee_id}`; agents.set(id, { id, status: 'running' }); envs.set(id, b.env); cwds.set(id, b.cwd); spawnBodies.push(b.prompt); events.push(`spawn:${id}`); return id; },
+    send: async (id, body) => { events.push(`send:${id}`); sentBodies.push({ id, body }); agents.get(id)!.status = 'running'; }, stop: async id => { events.push(`stop:${id}`); agents.get(id)!.status = 'idle'; },
     reload: async id => { events.push(`reload:${id}`); agents.get(id)!.status = 'idle'; },
     archive: async id => { events.push(`archive:${id}`); agents.get(id)!.status = 'archived'; pool.detachAgent(id); },
     listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {},
@@ -138,7 +140,25 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
   let realign: RealignFn | undefined;
   /** Quota snapshot the breaker and the pre-warning read; empty unless a test sets one. */
   let quotaRows: ProviderQuota[] = [];
-  const dispatcher = () => new Dispatcher({ workforce: wf as unknown as Workforce, owner: owner as unknown as OwnerDesk, paseo, sidecar: pool,
+  const messages = {
+    prepareSend: async (taskId: string, step: string, employeeId: string) => ({
+      body: `fixture ${step} body for ${taskId}`,
+      message: { id: `m-${taskId}-${step}`, taskId, step, role: 'x', body: `fixture ${step} body`, state: 'draft', hold: false, createdAt: '' },
+    }),
+    createDraft: async (taskId: string, step: string, role: string, _code?: boolean, _phase?: string, body?: string) => ({
+      id: `d-${taskId}-${step}`, taskId, step, role, body: body ?? `fixture ${step} body`, state: 'draft', hold: false, createdAt: '',
+    }),
+    ensureDraft: async (taskId: string, step: string, role: string) => ({
+      id: `d-${taskId}-${step}`, taskId, step, role, body: `fixture ${step} body`, state: 'draft', hold: false, createdAt: '',
+    }),
+    isHeld: async () => false,
+    markSent: async (messageId: string) => { events.push(`markSent:${messageId}`); },
+    latestDraft: async () => undefined,
+    machineCriterionId: async () => 'AC-1',
+    list: async () => [],
+    nextStep: async () => 'execute',
+  };
+  const dispatcher = () => new Dispatcher({ workforce: wf as unknown as Workforce, owner: owner as unknown as OwnerDesk, paseo, sidecar: pool, messages: messages as never,
     env: { opsRepo: '/fixture', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0, hostResources: () => host,
     log: (message: string) => { logs.push(message); },
     ...(reclaim ? { reclaimArtifacts: (input?: ReclaimInput) => reclaim!(input) } : {}),
@@ -151,7 +171,7 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
     const r = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(dir), name)); if (!r) throw new Error('relay timeout'); return r;
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
-  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, logs, views, relay, denied, held, scopeUnreadable,
+  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, logs, views, relay, denied, held, scopeUnreadable, sentBodies, spawnBodies,
     holdAssets: (paths: string[], holder: WriteScopeHolder) => { assetHolds.push({ paths, holder }); }, freeAssets: () => { assetHolds.splice(0); },
     authorsOf, unreadable, paseo, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
@@ -383,12 +403,12 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     expect(r.revoked).toHaveLength(0);
     expect(w.views.get('interrupted')!.currentEmployee).toBe(inst.id);
   });
-  test('a closed bound implementer that cannot resume stays unknown through the grace, then reads as down', async () => {
+  test('a closed session holding a lease that cannot resume stays unknown through the grace, then reads as down', async () => {
     const w = world(); w.addTask('bound');
     const inst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: 'fixture-9' } as EmployeeInst;
     w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(inst.id, 'agent-9'); inst.paseoAgentId = 'agent-9';
     w.agents.set('agent-9', { id: 'agent-9', status: 'closed' });
-    w.rows[0]!.implementer = inst.id;
+    Object.assign(w.rows[0]!, { state: 'doing', currentEmployee: inst.id, deliveryId: 'd-bound', leaseExpiresAt: 9999 });
     w.paseo.reload = async id => { w.events.push(`reload-failed:${id}`); throw new Error('synthetic resume failure'); };
     const d = w.dispatcher();
     await d.tick();
@@ -523,273 +543,6 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
   });
 });
 
-describe('R1: review capacity before an engineering execute claim', () => {
-  // Two idle engineers fill both seats of the fixture def.
-  const twoEngineers = (w: ReturnType<typeof world>) => {
-    for (const [id, agent] of [['employee-8', 'agent-8'], ['employee-9', 'agent-9']] as const) {
-      const inst = { id, def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: `fixture-${id}`, workspaceScope: 'maintenance' } as EmployeeInst;
-      w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(id, agent); inst.paseoAgentId = agent;
-      w.agents.set(agent, { id: agent, status: 'idle' });
-    }
-  };
-  test('a single engineering seat holds the claim: no independent reviewer exists after it', async () => {
-    const w = world(); w.def.maxInstances = 1; w.addTask('solo');
-    const r = await w.dispatcher().tick();
-    expect(r.woke).toHaveLength(0);
-    expect(w.instances).toHaveLength(0);
-    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('spawn:'))).toBe(false);
-    expect(r.notices).toContain('dispatch-blocked:solo:execute');
-    expect(w.notices.get('dispatch-blocked:solo:execute')).toContain('后续独立复核缺合格人选');
-  });
-  test('a spare seat keeps the claim: the implementer takes one seat and a second stays free for review', async () => {
-    const w = world(); w.addTask('spare');
-    await w.dispatcher().tick();
-    expect(w.events).toContain('claim:employee-1:spare');
-    expect(w.views.get('spare')!.currentEmployee).toBe('employee-1');
-  });
-  test('a reserved reviewer is never picked to implement the task', async () => {
-    const w = world(); twoEngineers(w); w.addTask('held');
-    const r = await w.dispatcher().tick();
-    const reserved = r.decisions.find(d => d.startsWith('reserve:held='))?.split('=')[1];
-    const claimed = w.events.find(e => e.startsWith('claim:') && e.endsWith(':held'))?.split(':')[1];
-    expect(reserved).toBeDefined();
-    expect(claimed).toBeDefined();
-    expect(claimed).not.toBe(reserved);
-    expect(w.views.get('held')!.currentEmployee).toBe(claimed);
-  });
-  test('an author may implement a rework, and the reserved reviewer is the other engineer', async () => {
-    const w = world(); twoEngineers(w); w.addTask('rework'); w.authorsOf.set('rework', ['employee-8']);
-    const r = await w.dispatcher().tick();
-    expect(w.events).toContain('claim:employee-8:rework');
-    expect(r.decisions).toContain('reserve:rework=employee-9');
-  });
-});
-
-describe('R1: a write scope held by another writer is a verdict, never a spawn churn or a wake failure', () => {
-  test('a scope held by another writer waits as write_scope: no spawn, no claim, the holder is named, and the claim follows once it ends', async () => {
-    const w = world(); w.addTask('scoped'); w.held.add('scoped');
-    const d = w.dispatcher();
-    const held = await d.tick();
-    expect(held.woke).toHaveLength(0);
-    expect(w.instances).toHaveLength(0);
-    expect(w.events.some(e => e.startsWith('claim') || e.startsWith('spawn:') || e.startsWith('send:'))).toBe(false);
-    const verdict = d.dispatchVerdicts().find(v => v.taskId === 'scoped')!;
-    expect(verdict.dispatchable).toBe(false);
-    expect(verdict.reasons).toEqual([expect.objectContaining({ code: 'write_scope', owner: 'owner', candidates: ['任务 writer-1 · employee-7'] })]);
-    w.setNow(1_300);
-    await d.tick();
-    const text = w.notices.get('dispatch-blocked:scoped:execute')!;
-    expect(text).toContain('同线或重叠目录');
-    expect(text).toContain('任务 writer-1 · employee-7');
-    expect(text).not.toContain('派工未能唤醒');
-    w.held.delete('scoped'); w.setNow(1_360);
-    const freed = await d.tick();
-    expect(freed.woke.map(x => x.task)).toContain('scoped');
-    expect(w.notices.has('dispatch-blocked:scoped:execute')).toBe(false);
-  });
-  test('a claim refused for the write scope at claim time is write_scope, not wake_failed, and earns no cooldown', async () => {
-    const w = world(); w.addTask('raced'); w.denied.set('raced', 'worktree_busy');
-    const d = w.dispatcher();
-    const lost = await d.tick();
-    expect(lost.woke).toHaveLength(0);
-    expect(w.events).toContain('claim-denied:employee-1:raced');
-    // The seat spawned for the refused claim is released as write scope held, not as a claim denial.
-    expect(lost.retired).toEqual(['employee-1']);
-    expect(w.events).toContain('retire:employee-1:failure');
-    expect(w.notices.has('dispatch-blocked:raced:execute')).toBe(false);
-    w.setNow(1_300);
-    await d.tick();
-    const text = w.notices.get('dispatch-blocked:raced:execute')!;
-    expect(text).toContain('同线或重叠目录');
-    expect(text).not.toContain('派工未能唤醒');
-    // No cooldown: once the refusal clears, the next pass claims without waiting for a version bump.
-    w.denied.delete('raced'); w.setNow(1_360);
-    const resumed = await d.tick();
-    expect(resumed.woke.map(x => x.task)).toContain('raced');
-  });
-  test('a refused claim on a reused seat keeps the seat: nothing is spawned or retired', async () => {
-    const w = world(); w.addTask('reused'); w.denied.set('reused', 'worktree_busy');
-    const inst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: 'fixture-9' } as EmployeeInst;
-    inst.workspaceScope = 'maintenance';
-    w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(inst.id, 'agent-9'); inst.paseoAgentId = 'agent-9';
-    w.agents.set('agent-9', { id: 'agent-9', status: 'idle' });
-    const r = await w.dispatcher().tick();
-    expect(w.events).toContain('claim-denied:employee-9:reused');
-    expect(w.events.some(e => e.startsWith('spawn:'))).toBe(false);
-    expect(r.retired).toEqual([]);
-    expect(r.woke).toHaveLength(0);
-    expect(w.instances).toHaveLength(1);
-  });
-  test('an unreadable write scope is unknown: never free, never a claim, and the owner reads that the state is undecided', async () => {
-    const w = world(); w.addTask('blind'); w.scopeUnreadable.add('blind');
-    const r = await w.dispatcher().tick();
-    expect(r.woke).toHaveLength(0);
-    expect(w.instances).toHaveLength(0);
-    expect(w.events.some(e => e.startsWith('claim') || e.startsWith('spawn:'))).toBe(false);
-    expect(w.notices.get('dispatch-blocked:blind:execute')).toContain('不能判定');
-  });
-  test('an assets scope overlapping another writer waits as write_scope: the holder is named to gm, no spawn, no claim, never a wake failure', async () => {
-    const w = world(); w.addTask('assets-overlap', { assets: ['docs/brand/logo'] });
-    w.holdAssets(['docs/brand'], { taskId: 'asset-w1', employee: 'employee-7', intent: 'assets' });
-    const d = w.dispatcher();
-    const blocked = await d.tick();
-    expect(blocked.woke).toHaveLength(0);
-    expect(w.instances).toHaveLength(0);
-    expect(w.events.some(e => e.startsWith('claim') || e.startsWith('spawn:'))).toBe(false);
-    const verdict = d.dispatchVerdicts().find(v => v.taskId === 'assets-overlap')!;
-    expect(verdict).toMatchObject({ dispatchable: false, workflowState: 'ready' });
-    expect(verdict.reasons).toEqual([expect.objectContaining({ code: 'write_scope', owner: 'owner', candidates: ['任务 asset-w1 · employee-7'] })]);
-    expect(verdict.reasons.some(reason => reason.code === 'wake_failed')).toBe(false);
-    w.setNow(1_300);
-    await d.tick();
-    const text = w.notices.get('dispatch-blocked:assets-overlap:execute')!;
-    expect(text).toContain('同线或重叠目录');
-    expect(text).toContain('任务 asset-w1 · employee-7');
-    expect(text).not.toContain('派工未能唤醒');
-    w.freeAssets(); w.setNow(1_360);
-    const freed = await d.tick();
-    expect(freed.woke.map(x => x.task)).toContain('assets-overlap');
-    expect(w.notices.has('dispatch-blocked:assets-overlap:execute')).toBe(false);
-  });
-  test('an assets scope on a disjoint directory of the same writer is not blocked: the claim proceeds', async () => {
-    const w = world(); w.addTask('assets-disjoint', { assets: ['docs/press'] });
-    w.holdAssets(['docs/brand'], { taskId: 'asset-w1', employee: 'employee-7', intent: 'assets' });
-    const d = w.dispatcher();
-    const r = await d.tick();
-    expect(r.woke.map(x => x.task)).toContain('assets-disjoint');
-    expect(w.events).toContain('claim:employee-1:assets-disjoint');
-    expect(d.dispatchVerdicts().some(v => v.taskId === 'assets-disjoint')).toBe(false);
-  });
-});
-
-describe('R3: repeated ticks, replay, bound repo and recusal capacity', () => {
-  // Idle engineers in this fixture's home (or another repo's home), each with its own agent and fixed id.
-  const engineers = (w: ReturnType<typeof world>, ids: string[], repoHome?: string) => {
-    for (const id of ids) {
-      const agent = `agent-${id}`;
-      const inst = { id, def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: `fixture-${id}`, repoHome } as EmployeeInst;
-      inst.workspaceScope = 'maintenance';
-      w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(id, agent); inst.paseoAgentId = agent;
-      w.agents.set(agent, { id: agent, status: 'idle' });
-    }
-  };
-  test('ten repeated ticks, with a restart in the middle, keep one blocked episode: no claim, one notice, one persisted start', async () => {
-    const w = world(); w.def.maxInstances = 1; w.addTask('ten');
-    let d = w.dispatcher();
-    const notes = new Set<string>(), starts = new Set<number | undefined>(), texts = new Set<string>();
-    for (let n = 0; n < 10; n++) {
-      if (n === 5) d = w.dispatcher();
-      w.setNow(1_000_000 + n * 60);
-      const r = await d.tick();
-      expect(r.woke).toHaveLength(0);
-      for (const key of r.notices) notes.add(key);
-      starts.add(w.rows.find(t => t.id === 'ten')!.dispatchBlockedSince);
-      texts.add(w.notices.get('dispatch-blocked:ten:execute')!);
-    }
-    expect(w.events.filter(e => e.startsWith('claim:') || e.startsWith('spawn:') || e.startsWith('send:'))).toEqual([]);
-    expect(w.instances).toHaveLength(0);
-    expect([...notes]).toEqual(['dispatch-blocked:ten:execute']);
-    expect([...starts]).toEqual([1_000_000]);
-    expect(texts.size).toBe(1);
-    expect(w.notices.size).toBe(1);
-  });
-  test('an unreadable contributor history holds the claim as unknown, and the episode clears once the history reads again', async () => {
-    const w = world(); w.addTask('replay'); w.unreadable.add('replay');
-    const held = await w.dispatcher().tick();
-    expect(held.woke).toHaveLength(0);
-    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('spawn:'))).toBe(false);
-    expect(w.notices.get('dispatch-blocked:replay:execute')).toContain('状态或贡献者历史读取失败');
-    w.unreadable.delete('replay'); w.setNow(1_000_060);
-    const resumed = await w.dispatcher().tick();
-    expect(resumed.woke.map(x => x.task)).toContain('replay');
-    expect(w.events).toContain('claim:employee-1:replay');
-    expect(w.notices.has('dispatch-blocked:replay:execute')).toBe(false);
-  });
-  test('A, B and C all recused with the seats full: no claim, the review capacity root cause is named, and one more seat clears it', async () => {
-    const w = world(); w.def.maxInstances = 3; w.addTask('abc');
-    const ids = ['employee-8', 'employee-9', 'employee-10'];
-    engineers(w, ids);
-    w.authorsOf.set('abc', ids);
-    const blocked = await w.dispatcher().tick();
-    expect(blocked.woke).toHaveLength(0);
-    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('spawn:'))).toBe(false);
-    // A full seat can still free up, so the block waits; the owner hears about it once the five-minute threshold passes.
-    expect(w.notices.has('dispatch-blocked:abc:execute')).toBe(false);
-    w.setNow(1_300);
-    const waited = await w.dispatcher().tick();
-    expect(waited.notices).toContain('dispatch-blocked:abc:execute');
-    expect(w.notices.get('dispatch-blocked:abc:execute')).toContain('后续独立复核缺合格人选');
-    w.def.maxInstances = 4; w.setNow(1_360);
-    const resumed = await w.dispatcher().tick();
-    expect(resumed.woke.map(x => x.task)).toContain('abc');
-    expect(w.notices.has('dispatch-blocked:abc:execute')).toBe(false);
-  });
-  test('a task with no reviewer role cannot prove an independent review: it is blocked as review capacity and never claimed', async () => {
-    const w = world(); w.addTask('norole');
-    Object.assign(w.rows.find(t => t.id === 'norole')!, { reviewerRole: undefined });
-    const r = await w.dispatcher().tick();
-    expect(r.woke).toHaveLength(0);
-    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('spawn:'))).toBe(false);
-    expect(w.notices.get('dispatch-blocked:norole:execute')).toContain('后续独立复核缺合格人选');
-  });
-  test('an engineer bound to another repo cannot review this task, so the only seat is not spent on its claim', async () => {
-    const w = world(); w.def.maxInstances = 1; w.addTask('bound');
-    engineers(w, ['employee-8'], '/other-repo');
-    const r = await w.dispatcher().tick();
-    expect(r.woke).toHaveLength(0);
-    expect(w.instances).toHaveLength(1);
-    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('spawn:'))).toBe(false);
-    expect(w.notices.get('dispatch-blocked:bound:execute')).toContain('后续独立复核缺合格人选');
-  });
-  test('a failed Paseo spawn releases the claim and retires the seat as a failure, waits as wake_failed, and clears on the next good pass', async () => {
-    const w = world(); w.addTask('spawnfail');
-    const spawn = w.paseo.spawn;
-    w.paseo.spawn = async () => { throw new Error('paseo daemon unreachable'); };
-    const failed = await w.dispatcher().tick();
-    expect(failed.woke).toHaveLength(0);
-    expect(failed.retired).toContain('employee-1');
-    expect(w.events).toContain('retire:employee-1:failure');
-    expect(w.rows.find(t => t.id === 'spawnfail')!.currentEmployee).toBeUndefined();
-    // Spawn failures are not material at once: the owner hears about them after the five-minute threshold.
-    expect(w.notices.has('dispatch-blocked:spawnfail:execute')).toBe(false);
-    w.setNow(1_300);
-    const again = await w.dispatcher().tick();
-    expect(again.notices).toContain('dispatch-blocked:spawnfail:execute');
-    expect(w.notices.get('dispatch-blocked:spawnfail:execute')).toContain('派工未能唤醒或创建会话');
-    w.paseo.spawn = spawn; w.setNow(1_360);
-    const recovered = await w.dispatcher().tick();
-    expect(recovered.woke.map(x => x.task)).toContain('spawnfail');
-    expect(w.notices.has('dispatch-blocked:spawnfail:execute')).toBe(false);
-  });
-  test('a same-role engineer of another repo is never woken: the target repo takes its own legal seat (R3 hard filter)', async () => {
-    const w = world(); w.def.maxInstances = 2; w.addTask('local');
-    engineers(w, ['employee-8'], '/other-repo');
-    const r = await w.dispatcher().tick();
-    expect(r.woke.map(x => x.task)).toContain('local');
-    expect(w.events).toContain('claim:employee-1:local');
-    expect(w.events.some(e => e.includes('employee-8'))).toBe(false);
-  });
-  test('a zero-candidate verdict names the other-repo engineers it left out, while its reasons stay in this repo', async () => {
-    const w = world(); w.def.maxInstances = 1; w.addTask('home-busy');
-    Object.assign(w.rows.find(t => t.id === 'home-busy')!, { reviewerRole: 'owner' });
-    engineers(w, ['employee-9']);
-    w.agents.set('agent-employee-9', { id: 'agent-employee-9', status: 'running' });
-    engineers(w, ['employee-8'], '/other-repo');
-    const d = w.dispatcher();
-    await d.tick();
-    const verdict = d.dispatchVerdicts().find(v => v.taskId === 'home-busy')!;
-    expect(verdict.dispatchable).toBe(false);
-    expect(verdict.reasons.map(r => r.code)).toEqual(['seat_full', 'session_busy']);
-    expect(verdict.reasons.find(r => r.code === 'seat_full')!.text).toContain('仓库 fixture');
-    expect(verdict.summary).toContain('另有 1 名同岗位员工属其他仓库，不参与本仓库派工');
-    expect(w.events.some(e => e.includes('employee-8'))).toBe(false);
-  });
-});
-
-// A provider may switch the model under a running subscription on its own: Factory serves a
-// cheaper model once its standard allowance is spent and switches back when it recovers. The
-// session, its conversation and its seat all stay valid, so the pass realigns the model in place
-// instead of retiring the employee and losing its context.
 describe('R4: provider model drift is realigned in place, never a retirement', () => {
   const driftedSession = (w: ReturnType<typeof world>) => {
     const drifted = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture',
@@ -1063,4 +816,24 @@ test('memory-only admission never reclaims disk or emits disk recovery instructi
 });
 test('a simultaneous memory and disk block preserves both causes in the task verdict',async()=>{
  const w=world();w.addTask('both-low');w.setHost({freeMemMb:249,freeDiskMb:128,memoryPressure:2});const d=w.dispatcher();await d.tick();expect(d.dispatchVerdicts().find(v=>v.taskId==='both-low')!.reasons.map(r=>r.code).sort()).toEqual(['disk_space','memory_pressure']);
+});
+
+test('every employee-facing send carries an outbound_message body that is then marked sent', async () => {
+  // Execute dispatch: the wake body is the rendered execute draft, marked sent after paseo.send.
+  const w = world(); w.addTask('dispatch'); const d = w.dispatcher(); await d.tick();
+  const bodies = [...w.sentBodies.map(b => b.body), ...w.spawnBodies];
+  expect(bodies.some(b => b.includes('fixture execute body for dispatch'))).toBe(true);
+  expect(w.events.some(e => e.startsWith('markSent:'))).toBe(true);
+  expect(bodies.every(b => typeof b === 'string' && b.length > 0)).toBe(true);
+});
+
+test('a stall nudge travels as an outbound row marked sent', async () => {
+  const w = world(); w.addTask('stalled'); const d = w.dispatcher(); await d.tick();
+  w.rows[0]!.progressAt = 1000;
+  w.setNow(1000 + 91 * 60);
+  await d.tick();
+  const nudge = w.sentBodies.find(b => b.body.includes('checkpoint'))!;
+  expect(nudge.body).toContain(`任务 stalled 已 `);
+  expect(nudge.body).toContain('分钟没有 checkpoint');
+  expect(w.sentBodies.every(b => typeof b.body === 'string' && b.body.length > 0)).toBe(true);
 });

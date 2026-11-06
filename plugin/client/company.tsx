@@ -8,7 +8,6 @@ import { useEffect, useMemo, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View, type StyleProp, type TextStyle } from "react-native";
 import * as RN from "react-native";
 import * as rpc from "../shared/rpc";
-import { waitingLabel } from "../shared/waiting-label";
 import { relayPalette } from "./relay-theme";
 import type { Brief, DispatchBlockedView, DispatchReasonView, GoalTier, GoalView, Inbox, PermissionRequest, Pulse, Roster, TaskAttachment, TaskView } from "../shared/types";
 
@@ -337,9 +336,9 @@ const arr = <T,>(v: unknown): T[] => (Array.isArray(v) ? v : []) as T[];
 const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
 /** A goal root's people; an absent or malformed block reads as nobody bound, never as an invented name. */
-const goalPeople = (v: unknown): { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number } => {
+const goalPeople = (v: unknown): { executor?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number } => {
   const p = (v ?? {}) as Record<string, unknown>;
-  return { implementer: str(p.implementer) || undefined, authors: arr<unknown>(p.authors).map(str), reviewers: arr<unknown>(p.reviewers).map(str),
+  return { executor: str(p.executor) || undefined, authors: arr<unknown>(p.authors).map(str), reviewers: arr<unknown>(p.reviewers).map(str),
     submitter: str(p.submitter) || undefined, submitCommit: str(p.submitCommit) || undefined, peopleOmitted: num(p.peopleOmitted) || undefined };
 };
 /** A bounded list's truncation marker; a missing marker reads as complete, with nothing left out. */
@@ -361,8 +360,8 @@ const reasonRows = (v: unknown): DispatchReasonView[] => arr<Record<string, unkn
 
 const workflowWaitStateOf = (v: unknown): "ready" | "doing" | "review" | "blocked" | "done" | "void" | "unknown" =>
   v === "ready" || v === "doing" || v === "review" || v === "blocked" || v === "done" || v === "void" ? v : "unknown";
-const workflowWaitKindOf = (v: unknown): "dependency" | "manager" | "owner" | "active_lease" | "unknown" =>
-  v === "dependency" || v === "manager" || v === "owner" || v === "active_lease" ? v : "unknown";
+const workflowWaitKindOf = (v: unknown): "owner" | "active_lease" | "unknown" =>
+  v === "owner" || v === "active_lease" ? v : "unknown";
 
 /** 把 wire 上的 pulse 响应收敛成完整视图模型：缺字段/条目畸形时给安全默认，渲染路径不再裸读。 */
 export function normalizePulse(raw: unknown): Pulse {
@@ -394,624 +393,22 @@ export function normalizePulse(raw: unknown): Pulse {
     last24h: { done: num(l24.done), returned: num(l24.returned), rolledBack: num(l24.rolledBack), rejected: num(l24.rejected), retired: num(l24.retired) },
     resources: arr<unknown>(o.resources).map(str),
     churn: { created: num(ch.created), retired: num(ch.retired), claimLost: num(ch.claimLost) },
-    goals: arr<Record<string, unknown>>(o.goals).map(g => ({ title: str(g.title), days: num(g.days) })),
-    goalBlockers: arr<Record<string, unknown>>(o.goalBlockers).map(b => ({
-      goalId: str(b.goalId), taskId: str(b.taskId), title: str(b.title), phase: b.phase === "review" ? "review" : "execute",
-      summary: str(b.summary), feasible: b.feasible === true, since: str(b.since) || undefined, waitingMinutes: num(b.waitingMinutes),
-      others: num(b.others), impact: num(b.impact), undispatchable: num(b.undispatchable),
-      workflowState: workflowOf(b.workflowState), eligibleCount: num(b.eligibleCount), checkedAt: str(b.checkedAt),
-      dependencyPath: arr<Record<string, unknown>>(b.dependencyPath).map(p => ({ taskId: str(p.taskId), title: str(p.title) })),
-      people: goalPeople(b.people),
-      reasons: reasonRows(b.reasons),
-    })),
-    workflowWaits: arr<Record<string, unknown>>(o.workflowWaits).map(w => {
-      const people = w.people && typeof w.people === "object" ? w.people as Record<string, unknown> : undefined;
-      return {
-        goalId: str(w.goalId) || undefined, taskId: str(w.taskId), title: str(w.title),
-        workflowState: workflowWaitStateOf(w.workflowState), kind: workflowWaitKindOf(w.kind),
-        basis: str(w.basis), waitingForRole: str(w.waitingForRole), nextTrigger: str(w.nextTrigger), goalRootCount: num(w.goalRootCount),
-        impact: typeof w.impact === "number" && Number.isFinite(w.impact) ? w.impact : undefined,
-        dependencyPath: arr<Record<string, unknown>>(w.dependencyPath).map(p => ({ taskId: str(p.taskId), title: str(p.title) })),
-        unknownReason: str(w.unknownReason) || undefined, dependencyPathTruncated: w.dependencyPathTruncated === true,
-        people: people ? { implementer: str(people.implementer) || undefined, authors: arr<unknown>(people.authors).map(str),
-          reviewers: arr<unknown>(people.reviewers).map(str), submitter: str(people.submitter) || undefined,
-          submitCommit: str(people.submitCommit) || undefined, peopleOmitted: num(people.peopleOmitted) || undefined } : undefined,
-        peopleSource: str(w.peopleSource) || undefined, submitterSource: str(w.submitterSource) || undefined,
-        submitCommitSource: str(w.submitCommitSource) || undefined, peopleCheckedAt: str(w.peopleCheckedAt) || undefined,
-        submitCheckedAt: str(w.submitCheckedAt) || undefined,
-      };
-    }),
-    workflowWaitSummary: (() => {
-      const summary = (o.workflowWaitSummary ?? {}) as Record<string, unknown>;
-      return { source: "workflow-graph" as const, available: summary.available === true,
-        checkedAt: str(summary.checkedAt) || undefined, totalRoots: num(summary.totalRoots), truncated: summary.truncated === true,
-        reason: str(summary.reason) || undefined };
-    })(),
     dispatchBlocked: arr<Record<string, unknown>>(o.dispatchBlocked).map(v => ({
-      taskId: str(v.taskId), goalId: str(v.goalId) || undefined, title: str(v.title),
+      taskId: str(v.taskId), rootId: str(v.rootId) || undefined, title: str(v.title),
       phase: v.phase === "review" ? "review" : "execute", workflowState: workflowOf(v.workflowState), summary: str(v.summary),
       checkedAt: str(v.checkedAt), eligibleCount: num(v.eligibleCount),
       feasible: v.feasible === true, since: str(v.since) || undefined, waitingMinutes: num(v.waitingMinutes),
       reasons: reasonRows(v.reasons),
     })),
     bounds: {
-      dispatchBlocked: bound(marks.dispatchBlocked), goalBlockers: bound(marks.goalBlockers), workflowWaits: bound(marks.workflowWaits), ready: bound(marks.ready),
+      dispatchBlocked: bound(marks.dispatchBlocked), ready: bound(marks.ready),
       doing: bound(marks.doing), stuck: bound(marks.stuck), waiting: bound(marks.waiting), recentDone: bound(marks.recentDone),
-      goals: bound(marks.goals), resources: bound(marks.resources),
+      resources: bound(marks.resources),
     },
   };
 }
 
 /** The workflow state of a blocked item, in the owner's words. */
-const WORKFLOW_LABEL: Record<"ready" | "doing" | "review", string> = { ready: "就绪", doing: "在办无人持有", review: "待复核" };
-const WAIT_KIND_LABEL = { dependency: "正常依赖等待", manager: "老板关口", owner: "老板关口", active_lease: "活租约等待", unknown: "等待未知" } as const;
-const WAIT_STATE_LABEL = { ready: "就绪", doing: "执行中", review: "待复核", blocked: "依赖阻塞", done: "完成", void: "作废", unknown: "未知" } as const;
-/** A time of day from an ISO instant, in UTC as the server states it; an absent instant reads as unknown. */
-const clockOf = (iso: string): string => (iso ? `${iso.slice(5, 16).replace("T", " ")}（UTC）` : "未知");
-
-/** 动态页：一页回答「公司现在在干什么、什么卡住了、为什么」。 */
-function PulseTab({ ctx }: { ctx: Ctx }) {
-  const s = makeStyles(ctx);
-  const pal = relayPalette(ctx.theme);
-  const pulseRpc = useRpc(rpc.pulse);
-  const data = useQuery({ queryKey: ["pulse"], queryFn: () => pulseRpc({}), refetchInterval: 10_000 });
-  const loaded = data.data != null;
-  const p = useMemo(() => normalizePulse(data.data), [data.data]);
-  // Each blocked item is counted once: the dispatch list holds both phases, and the ready queue is not added on top.
-  const attention = p.waiting.length + p.stuck.length + p.resources.length + p.bounds.dispatchBlocked.total;
-  return (
-    <View style={{ gap: 12 }}>
-      <View style={{ gap: 8 }}>
-        <View style={s.row}>
-          <View style={[s.badge, { backgroundColor: loaded && !p.paused ? pal.successSoft : pal.warningSoft }]}>
-            <Text style={[s.badgeText, { color: loaded && !p.paused ? pal.success : pal.warning }]}>
-              {p.paused ? "派工已暂停" : loaded ? "派工运行中" : "加载中…"}
-            </Text>
-          </View>
-          {attention > 0 && <Text style={s.muted}>需要关注 {attention} 项（往下翻）</Text>}
-        </View>
-        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 10 }}>
-          <MetricCard label="正在办" value={p.doing.length} detail="持有租约的员工" palette={pal} ctx={ctx} />
-          <MetricCard label="就绪待领" value={p.ready.length} detail="等待认领的任务" tone="blue" palette={pal} ctx={ctx} />
-          <MetricCard label="无法派工" value={p.bounds.dispatchBlocked.total} detail={p.stuck.length ? `另有卡住 ${p.stuck.length} 项` : "含依赖与关口"} tone={p.bounds.dispatchBlocked.total > 0 ? "amber" : undefined} palette={pal} ctx={ctx} />
-          <MetricCard label="待你处理" value={p.waiting.length} detail="关口与提问" tone={p.waiting.length > 0 ? "amber" : "green"} palette={pal} ctx={ctx} />
-        </View>
-        {loaded && <Text style={s.muted}>派工结论检查于 {clockOf(p.dispatchAt ?? "")}；页面刷新于 {clockOf(p.at)}</Text>}
-      </View>
-      <Section title="正在办" count={p.doing.length} ctx={ctx}>
-        {p.doing.length === 0 && <Text style={s.muted}>现在没有人在干活。</Text>}
-        {p.doing.map(d => (
-          <View key={d.taskId} style={s.card}>
-            <Text style={s.text}>{d.title}</Text>
-            <Text style={s.muted}>
-              {d.employee ?? d.role}{d.discipline ? ` · ${d.discipline}` : ""}{d.goal ? ` · ${d.goal.slice(0, 40)}` : ""}
-              {d.sinceMin !== undefined ? ` · 已进行 ${fmtAge(d.sinceMin)}` : ""}
-            </Text>
-          </View>
-        ))}
-      </Section>
-      <Section title="待你处理" count={p.waiting.length} ctx={ctx}>
-        {p.waiting.map(w => (
-          <View key={w.taskId} style={s.card}>
-            <Text style={s.text}>{w.kind === "gate" ? "批准" : "回答"} · {w.title}</Text>
-            <Text style={s.muted}>已等 {w.hours < 1 ? `${Math.round(w.hours * 60)} 分钟` : `${w.hours.toFixed(1)} 小时`}{w.downstream ? ` · 卡住下游 ${w.downstream} 个任务` : ""}{w.goal ? ` · ${w.goal.slice(0, 40)}` : ""} · 到「收件箱」处理</Text>
-          </View>
-        ))}
-      </Section>
-      <Section title="卡住" count={p.stuck.length} ctx={ctx}>
-        {p.stuck.map(t => (
-          <View key={t.taskId} style={s.card}>
-            <Text style={s.text}>{t.title}</Text>
-            <Text style={s.muted}>{t.reason} · {t.taskId.slice(0, 8)}</Text>
-          </View>
-        ))}
-      </Section>
-      <Section title="目标工作流等待" count={p.workflowWaitSummary.totalRoots} ctx={ctx}>
-        {!p.workflowWaitSummary.available ? (
-          <Text style={s.muted}>等待图不可读：{p.workflowWaitSummary.reason ?? "未知"}</Text>
-        ) : p.workflowWaits.length === 0 && p.workflowWaitSummary.totalRoots > 0 ? (
-          <Text style={s.muted}>等待根 {p.workflowWaitSummary.totalRoots} 个，均未纳入本页字节预算；见下方截断说明。</Text>
-        ) : p.workflowWaits.length === 0 ? (
-          <Text style={s.muted}>当前没有已识别的目标等待根。</Text>
-        ) : p.workflowWaits.map(root => (
-          <View key={`${root.goalId ?? ""}:${root.taskId}`} style={s.card}>
-            <Text style={s.text}>{WAIT_KIND_LABEL[root.kind]} · {root.title}</Text>
-            <Text style={s.muted}>工作流 {WAIT_STATE_LABEL[root.workflowState]} · 处理岗位 {root.waitingForRole || "未知"} · 根数 {root.goalRootCount}{root.impact !== undefined ? ` · 影响 ${root.impact} 项` : " · 影响未知"}</Text>
-            <Text style={s.muted}>依据 {root.basis || "未知"} · 下一触发 {root.nextTrigger || "未知"}{root.unknownReason ? ` · ${root.unknownReason}` : ""}</Text>
-            {root.dependencyPath && root.dependencyPath.length > 0 && <Text style={s.muted}>依赖路径（根在前）：{root.dependencyPath.map(item => item.title).join(" → ")}{root.dependencyPathTruncated ? " · 路径已截断" : ""}</Text>}
-            {root.people && <Text style={s.muted}>人物来源 {root.peopleSource ?? "未知"} · 实现者 {root.people.implementer ?? "未绑定"} · 作者 {root.people.authors.join("、") || "未记录"} · 复核者 {root.people.reviewers.join("、") || "未记录"}{root.people.peopleOmitted ? ` · 另有 ${root.people.peopleOmitted} 人未列出` : ""}</Text>}
-            {(root.people?.submitter || root.people?.submitCommit) && <Text style={s.muted}>提交人 {root.people.submitter ?? "未记录"}（{root.submitterSource ?? "来源未知"}） · 提交 SHA {root.people.submitCommit ?? "未记录"}（{root.submitCommitSource ?? "来源未知"}）</Text>}
-            {root.peopleCheckedAt && <Text style={s.muted}>人物来源采集于 {clockOf(root.peopleCheckedAt)}</Text>}
-            {root.submitCheckedAt && <Text style={s.muted}>提交审计采集于 {clockOf(root.submitCheckedAt)}</Text>}
-          </View>
-        ))}
-        {p.workflowWaitSummary.available && <Text style={s.muted}>来源 workflow-graph · 采集于 {clockOf(p.workflowWaitSummary.checkedAt ?? "")}{p.dispatchAt ? ` · dispatcher pass ${clockOf(p.dispatchAt)}` : " · dispatcher pass 未记录"}</Text>}
-        {p.workflowWaitSummary.truncated || p.bounds.workflowWaits.truncated ? <Text style={s.muted}>等待根列表已截断：显示 {p.bounds.workflowWaits.shown} / {p.workflowWaitSummary.totalRoots}{p.bounds.workflowWaits.shown === 0 ? "（单项超出本页字节份额，见下方说明）" : ""}。</Text> : null}
-        {p.workflowWaits.some(root => root.kind === "active_lease") && <Text style={s.muted}>活租约中的复核任务来自独立工作流图，可能未纳入最近 dispatcher pass；这不表示不可派工。</Text>}
-      </Section>
-      <Section title="就绪待领" count={p.ready.length} ctx={ctx}>
-        {p.ready.length === 0 && <Text style={s.muted}>没有排队等认领的任务。</Text>}
-        {p.ready.map(r => (
-          <View key={r.taskId} style={s.card}>
-            <Text style={s.text}>{r.title}</Text>
-            <Text style={s.muted}>
-              {ROLE_LABEL[r.role] ?? r.role}{r.discipline ? ` · ${r.discipline}` : ""} · 已等 {fmtAge(r.waitingMin)}
-            </Text>
-            {r.unclaimableReason && (
-              <Text style={{ color: pal.warning, fontSize: 12.5 }}>无人可派：{r.unclaimableReason}</Text>
-            )}
-          </View>
-        ))}
-      </Section>
-      <Section title="无法派工" count={p.bounds.dispatchBlocked.total} ctx={ctx}>
-        {p.dispatchBlocked.length === 0 && <Text style={s.muted}>没有无法派工的任务。</Text>}
-        {p.dispatchBlocked.map(v => (
-          <View key={`${v.taskId}:${v.phase}`} style={s.card}>
-            <Text style={s.text}>{v.title}</Text>
-            <Text style={s.muted}>
-              {v.phase === "review" ? "复核" : "执行"} · 工作流：{WORKFLOW_LABEL[v.workflowState]} · 派工：无法派工 · 可选人数 {v.eligibleCount} · 已等 {fmtAge(v.waitingMinutes)}
-            </Text>
-            <Text style={{ color: pal.warning, fontSize: 12.5 }}>{v.summary}</Text>
-            {v.reasons.map((r, i) => (
-              <Text key={i} style={s.muted}>
-                {r.text}（{r.candidates.filter(c => c !== "*").join("、") || "全局"}）· 负责：{r.owner === "system" ? "系统" : "老板"} · 恢复：{r.recovery}
-              </Text>
-            ))}
-            <Text style={s.muted}>结论检查于 {clockOf(v.checkedAt)}</Text>
-          </View>
-        ))}
-        {p.bounds.dispatchBlocked.truncated && (
-          <Text style={s.muted}>只列出 {p.bounds.dispatchBlocked.shown} 项，共 {p.bounds.dispatchBlocked.total} 项。</Text>
-        )}
-      </Section>
-      <Section title="资源异常" count={p.resources.length} ctx={ctx}>
-        {p.resources.length === 0 && <Text style={s.muted}>订阅与编制都正常。</Text>}
-        {p.resources.map((r, i) => <Text key={i} style={s.text}>{r}</Text>)}
-      </Section>
-      <Collapsible title="近 24 小时" ctx={ctx}>
-        <View style={s.card}>
-          <Text style={s.text}>
-            完成 {p.last24h.done} · 退回 {p.last24h.returned} · 驳回 {p.last24h.rejected} · 通道回滚 {p.last24h.rolledBack} · 退役 {p.last24h.retired}
-          </Text>
-          <Text style={s.muted}>员工流动：新建 {p.churn.created} · 退役 {p.churn.retired} · 认领失败 {p.churn.claimLost}</Text>
-        </View>
-      </Collapsible>
-      <Collapsible title="最近完成" count={p.recentDone.length} ctx={ctx}>
-        <View style={s.card}>
-          {p.recentDone.length === 0 && <Text style={s.muted}>暂无。</Text>}
-          {p.recentDone.map(d => (
-            <Text key={d.taskId + d.at} style={s.muted}>{d.at.slice(5, 16).replace("T", " ")} · {d.actor ? `${d.actor} · ` : ""}{d.title.slice(0, 60)}</Text>
-          ))}
-        </View>
-      </Collapsible>
-      <Collapsible title="在办目标" count={p.goals.length} ctx={ctx}>
-        <View style={s.card}>
-          {p.goals.map((g, i) => <Text key={i} style={s.text}>{g.title.slice(0, 70)}{g.days > 0 ? `（已 ${g.days} 天）` : ""}</Text>)}
-        </View>
-      </Collapsible>
-      {data.isLoading && <Text style={s.muted}>加载中…</Text>}
-      {data.isError && <Text style={s.muted}>加载失败：{String((data.error as Error).message).slice(0, 200)}</Text>}
-    </View>
-  );
-}
-
-function CompanyUpgradeCard({item,ctx,onDone}:{item:import("../shared/types").UpgradeCard;ctx:Ctx;onDone:()=>void}) {
- const s=makeStyles(ctx),start=useRpc(rpc.upgrade);
- const [feedback,setFeedback]=useState("");
- const mutation=useMutation({mutationFn:()=>start({taskId:item.taskId,taskVersion:item.taskVersion,digest:item.plan.digest}),onSuccess:()=>{setFeedback("升级已启动，完成后自动回复通过");onDone();},onError:e=>setFeedback((e as Error).message)});
- const busy=mutation.isPending||["queued","preparing","checking","installing","verifying"].includes(item.status),done=item.status==="succeeded",stale=item.retired===true;
- const rows=(title:string,items:string[])=><View style={{gap:4}}><Text style={s.muted}>{title}</Text>{items.map((t,i)=><Text key={i} style={s.text}>• {t}</Text>)}</View>;
- return <View style={[s.card,{gap:12}]}>
-  <Text style={s.muted}>公司系统升级 · {item.phase}</Text>
-  <Text style={[s.text,{fontSize:18,fontWeight:"700"}]}>v{item.plan.version} · {item.plan.title}</Text>
-  {rows("上线内容",item.plan.changes)}{rows("影响范围",item.plan.impact)}
-  {rows("数据变化",[item.plan.migration])}{rows("回退方式",[item.plan.rollback])}
-  <ExpandableText text={`提交 SHA：${item.plan.sha}`} lines={1} style={s.muted} ctx={ctx}/>
-  {(item.error||feedback)?<Text style={s.text}>{item.error||feedback}</Text>:null}
-  {done?<Text style={s.text}>升级完成，已自动回复通过</Text>:stale?<Text style={s.text}>该版本已被现役版本取代，无需再安装；这张旧待办会自动收口。</Text>:<Pressable accessibilityRole="button" accessibilityLabel={`升级至 v${item.plan.version}`} disabled={busy} style={[s.button,{opacity:busy?0.55:1}]} onPress={()=>mutation.mutate()}><Text style={s.buttonText}>{busy?item.phase:`升级至 v${item.plan.version}`}</Text></Pressable>}
- </View>;
-}
-
-function InboxTab({ ctx }: { ctx: Ctx }) {
-  const s = makeStyles(ctx);
-  const queryClient = useQueryClient();
-  const inboxRpc = useRpc(rpc.inbox);
-  const autoRpc = useRpc(rpc.autoUpgrade);
-  const autoUpgrade=useMutation({mutationFn:(enabled:boolean)=>autoRpc({enabled}),onSuccess:()=>void queryClient.invalidateQueries({queryKey:["inbox"]})});
-  const resolve = useRpc(rpc.resolveNotice);
-  const consoleRpc = useRpc(rpc.consoleUrl);
-  const openRpc = useRpc(rpc.openExternal);
-  const consoleQ = useQuery({ queryKey: ["consoleUrl"], queryFn: () => consoleRpc({}), staleTime: 300_000 });
-  const data = useQuery({ queryKey: ["inbox"], queryFn: () => inboxRpc({}), refetchInterval: 10_000 });
-  const refresh = () => void queryClient.invalidateQueries({ queryKey: ["inbox"] });
-  const box: Inbox | undefined = data.data;
-  const empty = box && box.gates.length + box.questions.length + box.notices.length + (box.upgrades?.items.length??0) === 0;
-  return (
-    <View style={{ gap: 12 }}>
-      {consoleQ.data?.url ? (
-        <Pressable accessibilityRole="button" style={[s.card, { backgroundColor: ctx.theme.colors.accent, borderColor: ctx.theme.colors.accent, paddingVertical: 18 }]}
-          onPress={() => void openExternalAnywhere(consoleQ.data!.url, ctx.navigation, openRpc)}>
-          <Text style={{ color: ctx.theme.colors.accentForeground, fontSize: 16, fontWeight: "800" }}>打开「消息流」控制台</Text>
-          <Text style={{ color: ctx.theme.colors.accentForeground, fontSize: 11, marginTop: 5, opacity: .85 }}>看消息沿连线流动 · 编辑待发消息 · 放行 · 审待办</Text>
-        </Pressable>
-      ) : null}
-      {box?.upgrades?.current?<View style={s.card}><Text style={s.text}>当前版本 v{box.upgrades.current.version}</Text><Text selectable style={s.muted}>{box.upgrades.current.sha}</Text>
-        <Text style={s.muted}>自动安装已合 main 的公司版本；全部门禁和上线验证通过后才回复。失败退避24小时，同一版本累计失败2次后停止自动尝试。</Text>
-        <Pressable accessibilityRole="button" disabled={autoUpgrade.isPending} style={s.button} onPress={()=>autoUpgrade.mutate(!box.upgrades?.automatic?.enabled)}><Text style={s.buttonText}>{autoUpgrade.isPending?'正在保存':box.upgrades.automatic?.enabled?'自动升级已开启 · 点击关闭':'自动升级已关闭 · 点击开启'}</Text></Pressable>
-        {autoUpgrade.error?<Text style={s.text}>设置失败，请重试</Text>:null}
-      </View>:null}
-      {box?.upgrades?.items.map(item=><CompanyUpgradeCard key={`${item.taskId}:${item.jobId??item.plan.sha}`} item={item} ctx={ctx} onDone={refresh}/>)}
-      <Section title="待批关口" count={box?.gates.length} ctx={ctx}>
-        {box?.gates.filter(g=>!g.task.companyUpgrade).map(g => (
-          <DecideCard key={g.task.id} taskId={g.task.id} kind="approve" ctx={ctx} onDone={refresh}
-            body={`${g.task.title}\n\n${g.submission ?? "（无提交说明）"}`} />
-        ))}
-      </Section>
-      <Section title="待回问题" count={box?.questions.length} ctx={ctx}>
-        {box?.questions.filter(q=>!q.task.companyUpgrade).map(q => (
-          <DecideCard key={q.task.id} taskId={q.task.id} kind="reply" ctx={ctx} onDone={refresh}
-            body={`${q.task.title}\n\n${q.question ?? ""}`} />
-        ))}
-      </Section>
-      <Section title="提醒" count={box?.notices.length} ctx={ctx}>
-        {box?.notices.map(n => (
-          <View key={n.key} style={s.card}>
-            <ExpandableText text={n.text} lines={8} style={s.text} ctx={ctx} />
-            <Text style={s.muted}>{n.at}</Text>
-            <Pressable accessibilityRole="button" style={[s.buttonSecondary, { alignSelf: "flex-start" }]}
-              onPress={async () => { await resolve({ key: n.key }); refresh(); }}>
-              <Text style={s.buttonSecondaryText}>知道了</Text>
-            </Pressable>
-          </View>
-        ))}
-      </Section>
-      {empty && <Text style={s.muted}>收件箱是空的。</Text>}
-      {data.isLoading && <Text style={s.muted}>加载中…</Text>}
-      {data.isError && <Text style={s.muted}>加载失败：{String((data.error as Error).message).slice(0, 200)}</Text>}
-    </View>
-  );
-}
-
-function NewGoalTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
-  const s = makeStyles(ctx);
-  const queryClient = useQueryClient();
-  const create = useRpc(rpc.createGoal);
-  const addDir = useRpc(rpc.addDirection);
-  const triage = useRpc(rpc.triageGoal);
-  const [text, setText] = useState("");
-  const [tier, setTier] = useState<GoalTier | undefined>();
-  const [project, setProject] = useState<string | undefined>();
-  const [pipeline, setPipeline] = useState<"software" | "video" | "story" | undefined>();
-  const [direction, setDirection] = useState("");
-  const [feedback, setFeedback] = useState("");
-  const submit = useMutation({
-    mutationFn: () => create({ text, tier, project, pipeline, key: newKey() }),
-    onSuccess: goal => {
-      setText(""); setFeedback(`已创建目标 ${goal.id.slice(0, 16)}（${goal.state === "triage" ? "等待分级" : goal.state}）`);
-      void queryClient.invalidateQueries();
-    },
-    onError: e => setFeedback(`失败：${(e as Error).message.slice(0, 200)}`),
-  });
-  const dirMutation = useMutation({
-    mutationFn: () => addDir({ text: direction, key: newKey() }),
-    onSuccess: () => { setDirection(""); void queryClient.invalidateQueries(); },
-  });
-  const triageMutation = useMutation({
-    mutationFn: (v: { goalId: string; tier: GoalTier }) => triage(v),
-    onSuccess: () => void queryClient.invalidateQueries(),
-  });
-  const triaging = brief?.goals.filter(g => g.state === "triage") ?? [];
-  return (
-    <View style={{ gap: 12 }}>
-      <Section title="新目标" ctx={ctx}>
-        <View style={s.card}>
-          <TextInput style={[s.input, { minHeight: 80 }]} placeholder="要公司做什么？越具体越好"
-            placeholderTextColor={ctx.theme.colors.foregroundMuted} value={text} onChangeText={setText} multiline />
-          <Text style={s.muted}>级别（不选则 Jev 判断，老板分级）</Text>
-          <View style={s.row}>
-            {([undefined, "quick", "standard", "program"] as (GoalTier | undefined)[]).map(t => (
-              <Pressable key={t ?? "auto"} style={[s.chip, tier === t && s.chipActive]} onPress={() => setTier(t)}>
-                <Text style={[s.chipText, tier === t && s.chipTextActive]}>{t ? TIER_LABEL[t] : "自动"}</Text>
-              </Pressable>
-            ))}
-          </View>
-          <Text style={s.muted}>项目（不选则按事务性工作处理）</Text>
-          <View style={s.row}>
-            <Pressable style={[s.chip, project === undefined && s.chipActive]} onPress={() => setProject(undefined)}>
-              <Text style={[s.chipText, project === undefined && s.chipTextActive]}>不关联</Text>
-            </Pressable>
-            {brief?.projects.map(p => (
-              <Pressable key={p.id} style={[s.chip, project === p.id && s.chipActive]} onPress={() => setProject(p.id)}>
-                <Text style={[s.chipText, project === p.id && s.chipTextActive]}>{p.name}</Text>
-              </Pressable>
-            ))}
-          </View>
-          <Text style={s.muted}>产线（不选则用项目默认产线，没有则按软件产线）</Text>
-          <View style={s.row}>
-            {([undefined, "software", "video", "story"] as ("software" | "video" | "story" | undefined)[]).map(l => (
-              <Pressable key={l ?? "default"} style={[s.chip, pipeline === l && s.chipActive]} onPress={() => setPipeline(l)}>
-                <Text style={[s.chipText, pipeline === l && s.chipTextActive]}>{l ? PIPELINE_LABEL[l] : "项目默认"}</Text>
-              </Pressable>
-            ))}
-          </View>
-          <Pressable accessibilityRole="button" style={[s.button, { alignSelf: "flex-start" }]}
-            disabled={submit.isPending || text.trim().length < 2} onPress={() => submit.mutate()}>
-            <Text style={s.buttonText}>下达目标</Text>
-          </Pressable>
-          {feedback !== "" && <Text style={s.muted}>{feedback}</Text>}
-        </View>
-      </Section>
-      {triaging.length > 0 && (
-        <Section title="等待分级" count={triaging.length} ctx={ctx}>
-          {triaging.map(g => (
-            <View key={g.id} style={s.card}>
-              <Text style={s.text}>{g.title}</Text>
-              <View style={s.row}>
-                {(["quick", "standard", "program"] as GoalTier[]).map(t => (
-                  <Pressable key={t} style={s.buttonSecondary} disabled={triageMutation.isPending}
-                    onPress={() => triageMutation.mutate({ goalId: g.id, tier: t })}>
-                    <Text style={s.buttonSecondaryText}>{TIER_LABEL[t]}</Text>
-                  </Pressable>
-                ))}
-              </View>
-            </View>
-          ))}
-        </Section>
-      )}
-      <Section title="公司方向" ctx={ctx}>
-        <View style={s.card}>
-          <TextInput style={[s.input, { minHeight: 48 }]} placeholder="记录一条公司运作方向，所有员工可见"
-            placeholderTextColor={ctx.theme.colors.foregroundMuted} value={direction} onChangeText={setDirection} multiline />
-          <Pressable accessibilityRole="button" style={[s.buttonSecondary, { alignSelf: "flex-start" }]}
-            disabled={dirMutation.isPending || direction.trim().length < 2} onPress={() => dirMutation.mutate()}>
-            <Text style={s.buttonSecondaryText}>记录方向</Text>
-          </Pressable>
-          {brief?.directions.slice(0, 5).map((d, i) => (
-            <Text key={i} style={s.muted}>· {d.text}</Text>
-          ))}
-        </View>
-      </Section>
-    </View>
-  );
-}
-
-function TaskRow({ task, ctx, depth, onOpen, verdict }: { task: TaskView; ctx: Ctx; depth: number; onOpen: (id: string) => void; verdict?: DispatchBlockedView }) {
-  const s = makeStyles(ctx);
-  const p = relayPalette(ctx.theme);
-  const stateTone: Record<string, { bg: string; fg: string }> = {
-    ready: { bg: p.inputBg, fg: p.core.foregroundMuted },
-    doing: { bg: p.blueSoft, fg: p.blue },
-    review: { bg: p.accentSoft, fg: p.core.accent },
-    blocked: { bg: p.warningSoft, fg: p.warning },
-    done: { bg: p.successSoft, fg: p.success },
-    void: { bg: p.inputBg, fg: p.core.foregroundMuted },
-  };
-  const tone = stateTone[task.state] ?? { bg: p.inputBg, fg: p.core.foregroundMuted };
-  return (
-    <View>
-      <Pressable style={[s.row, { paddingLeft: depth * 14 }]} onPress={() => onOpen(task.id)}>
-        <View style={[s.badge, { backgroundColor: tone.bg }]}>
-          <Text style={[s.badgeText, { color: tone.fg }]}>{STATE_LABEL[task.state] ?? task.state}</Text>
-        </View>
-        <View style={[s.badge]}><Text style={s.badgeText}>{KIND_LABEL[task.kind] ?? task.kind}</Text></View>
-        <Text style={[s.text, { flex: 1 }]} numberOfLines={2}>{task.title}</Text>
-        <Text style={s.muted}>{task.currentEmployee?.split("⟨").pop()?.replace("⟩", "") ?? task.executorRole}</Text>
-      </Pressable>
-      {task.waiting && (
-        <View style={{ paddingLeft: depth * 14 + 8 }}>
-          <Text style={s.muted}>{waitingLabel(task.waiting)}</Text>
-        </View>
-      )}
-      {verdict && (
-        <View style={{ paddingLeft: depth * 14 + 8, gap: 2 }}>
-          <Text style={{ color: p.warning, fontSize: 12.5 }}>无法派工（{WORKFLOW_LABEL[verdict.workflowState]}）：{verdict.summary}</Text>
-          <Text style={s.muted}>可选人数 {verdict.eligibleCount} · 结论检查于 {clockOf(verdict.checkedAt)}</Text>
-        </View>
-      )}
-    </View>
-  );
-}
-
-/** 老板对单个任务的生命周期操作：终止在途（撤租约）、解锁依赖、作废任务。终态任务不出按钮。 */
-function TaskOwnerActions({ task, ctx, onDone }: { task: TaskView; ctx: Ctx; onDone: () => void }) {
-  const s = makeStyles(ctx);
-  const voidRpc = useRpc(rpc.voidTask);
-  const revokeRpc = useRpc(rpc.revokeTask);
-  const unlockRpc = useRpc(rpc.unlockTask);
-  const [note, setNote] = useState("");
-  const [result, setResult] = useState<string>();
-  const mutation = useMutation({
-    mutationFn: async (action: "revoke" | "void" | "unlock") => {
-      if (action === "revoke") {
-        const r = await revokeRpc({ taskId: task.id, note });
-        if (!r.ok) throw new Error("没有在途租约可撤");
-        return `已撤销 ${r.employee ?? ""} 的租约，任务回就绪等下一位员工`;
-      }
-      if (action === "void") {
-        const t = await voidRpc({ taskId: task.id, note, key: newKey() });
-        return `已作废（${t.state}）`;
-      }
-      const u = await unlockRpc({ taskId: task.id });
-      return u.unlocked.length ? `已解锁：${u.unlocked.join("、")}` : "没有需要解锁的任务";
-    },
-    onSuccess: r => { setNote(""); setResult(r); onDone(); },
-    onError: e => setResult(`失败：${String((e as Error).message).slice(0, 140)}`),
-  });
-  if (task.state === "done" || task.state === "void") return null;
-  return (
-    <View style={{ gap: 6, marginTop: 6 }}>
-      <TextInput
-        style={[s.input, { minHeight: 32 }]}
-        placeholder="说明（作废必填，终止/解锁可留空）"
-        placeholderTextColor={ctx.theme.colors.foregroundMuted}
-        value={note} onChangeText={setNote} multiline
-      />
-      <View style={s.row}>
-        {task.state === "doing" && task.currentEmployee ? (
-          <Pressable accessibilityRole="button" style={s.buttonSecondary} disabled={mutation.isPending}
-            onPress={() => mutation.mutate("revoke")}>
-            <Text style={s.buttonSecondaryText}>终止在途执行</Text>
-          </Pressable>
-        ) : null}
-        {task.state === "blocked" ? (
-          <Pressable accessibilityRole="button" style={s.buttonSecondary} disabled={mutation.isPending}
-            onPress={() => mutation.mutate("unlock")}>
-            <Text style={s.buttonSecondaryText}>解锁依赖</Text>
-          </Pressable>
-        ) : null}
-        <Pressable accessibilityRole="button" style={s.buttonDanger}
-          disabled={mutation.isPending || note.trim().length < 2}
-          onPress={() => mutation.mutate("void")}>
-          <Text style={s.buttonDangerText}>作废任务</Text>
-        </Pressable>
-      </View>
-      {result ? <Text style={s.muted}>{result}</Text> : null}
-    </View>
-  );
-}
-
-/** 目标级操作：取消目标（作废全部未完成任务并关闭目标）。点开两次确认。 */
-function CancelGoalButton({ goalId, ctx, onDone }: { goalId: string; ctx: Ctx; onDone: () => void }) {
-  const s = makeStyles(ctx);
-  const cancelRpc = useRpc(rpc.cancelGoalRpc);
-  const [open, setOpen] = useState(false);
-  const [note, setNote] = useState("");
-  const [result, setResult] = useState<string>();
-  const mutation = useMutation({
-    mutationFn: () => cancelRpc({ goalId, note, key: newKey() }),
-    onSuccess: r => {
-      setOpen(false); setNote("");
-      setResult(`已作废 ${r.retired} 个任务${r.remaining ? `；仍有 ${r.remaining} 个未能作废，目标保持原状` : "，目标已关闭"}`);
-      onDone();
-    },
-    onError: e => setResult(`失败：${String((e as Error).message).slice(0, 140)}`),
-  });
-  return (
-    <View style={{ gap: 6, marginTop: 4 }}>
-      <Pressable accessibilityRole="button" style={[s.buttonDanger, { alignSelf: "flex-start" }]}
-        onPress={() => setOpen(o => !o)}>
-        <Text style={s.buttonDangerText}>{open ? "收起" : "取消目标…"}</Text>
-      </Pressable>
-      {open ? (
-        <>
-          <Text style={s.muted}>将作废该目标全部未完成任务并关闭目标，操作进审计。</Text>
-          <TextInput
-            style={[s.input, { minHeight: 32 }]}
-            placeholder="取消原因（必填）"
-            placeholderTextColor={ctx.theme.colors.foregroundMuted}
-            value={note} onChangeText={setNote} multiline
-          />
-          <Pressable accessibilityRole="button" style={[s.button, { alignSelf: "flex-start" }]}
-            disabled={mutation.isPending || note.trim().length < 2}
-            onPress={() => mutation.mutate()}>
-            <Text style={s.buttonText}>确认取消目标</Text>
-          </Pressable>
-        </>
-      ) : null}
-      {result ? <Text style={s.muted}>{result}</Text> : null}
-    </View>
-  );
-}
-
-function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
-  const s = makeStyles(ctx);
-  const tasksRpc = useRpc(rpc.goalTasks);
-  const detailRpc = useRpc(rpc.taskDetail);
-  const [openGoal, setOpenGoal] = useState<string | undefined>();
-  const [openTask, setOpenTask] = useState<string | undefined>();
-  const tasksQuery = useQuery({
-    queryKey: ["goalTasks", openGoal],
-    queryFn: () => tasksRpc({ goalId: openGoal! }),
-    enabled: openGoal !== undefined,
-    refetchInterval: 15_000,
-  });
-  const detailQuery = useQuery({
-    queryKey: ["taskDetail", openTask],
-    queryFn: () => detailRpc({ taskId: openTask! }),
-    enabled: openTask !== undefined,
-  });
-  const queryClient = useQueryClient();
-  const refreshAll = () => { void tasksQuery.refetch(); void detailQuery.refetch(); void queryClient.invalidateQueries(); };
-  const goals = (brief?.goals ?? []).filter((g: GoalView) => g.state !== "cancelled");
-  // Goal cards read the same pulse as the queue: the root blocker is the server's conclusion, not a second computation.
-  const pulseRpc = useRpc(rpc.pulse);
-  const pulseQuery = useQuery({ queryKey: ["pulse"], queryFn: () => pulseRpc({}), refetchInterval: 10_000 });
-  const pulse = useMemo(() => normalizePulse(pulseQuery.data), [pulseQuery.data]);
-  const blockers = pulse.goalBlockers;
-  const verdictOf = new Map(pulse.dispatchBlocked.map(v => [v.taskId, v] as const));
-  return (
-    <View style={{ gap: 12 }}>
-      {goals.length === 0 && <Text style={s.muted}>没有进行中的目标。</Text>}
-      {pulse.bounds.goalBlockers.truncated && (
-        <Text style={s.muted}>根阻点只列出 {pulse.bounds.goalBlockers.shown} 个目标，共 {pulse.bounds.goalBlockers.total} 个；其余目标的根阻点未在此列出。</Text>
-      )}
-      {goals.map(g => (
-        <View key={g.id} style={s.card}>
-          <Pressable style={s.row} onPress={() => setOpenGoal(openGoal === g.id ? undefined : g.id)}>
-            <Text style={[s.text, { flex: 1 }]}>{g.title}</Text>
-            <View style={s.badge}><Text style={s.badgeText}>{g.tier ?? "?"}</Text></View>
-            <View style={s.badge}><Text style={s.badgeText}>{g.state}</Text></View>
-          </Pressable>
-          {blockers.find(b => b.goalId === g.id) && (() => {
-            const root = blockers.find(b => b.goalId === g.id)!;
-            return (
-              <View style={{ gap: 2 }}>
-                <Text style={s.muted}>
-                  {root.feasible ? "等待派工" : "无法派工"}：{root.title}（{root.phase === "review" ? "复核" : "执行"}，工作流：{WORKFLOW_LABEL[root.workflowState]}）。{root.summary}。已等待 {root.waitingMinutes} 分钟{root.impact > 0 ? `；影响 ${root.impact} 项后续` : ""}
-                </Text>
-                <Text style={s.muted}>
-                  无法派工 {root.undispatchable} 项（含根）；正常等待（依赖）{root.impact} 项{root.others > 0 ? `；同目标另有 ${root.others} 项阻塞` : ""}；结论检查于 {clockOf(root.checkedAt)}
-                </Text>
-              </View>
-            );
-          })()}
-          {openGoal === g.id && (
-            <View style={{ gap: 4 }}>
-              <ExpandableText text={g.brief} lines={6} style={s.muted} ctx={ctx} />
-              {(blockers.find(b => b.goalId === g.id)?.reasons ?? []).map((r, i) => (
-                <Text key={i} style={s.muted}>
-                  {r.text}（{r.candidates.filter(c => c !== "*").join("、") || "全局"}{r.candidatesOmitted ? `；另有 ${r.candidatesOmitted} 个候选未列出` : ""}）· 恢复：{r.recovery} · 处理：{"老板"}
-                </Text>
-              ))}
-              {blockers.find(b => b.goalId === g.id) && (() => {
-                const root = blockers.find(b => b.goalId === g.id)!;
-                return (
-                  <View style={{ gap: 4 }}>
-                    {root.dependencyPath.length > 1 && (
-                      <Text style={s.muted}>依赖路径（根在前）：{root.dependencyPath.map(p => p.title).join(" → ")}</Text>
-                    )}
-                    <Text style={s.muted}>
-                      实现者：{root.people.implementer ?? "未绑定"}；作者：{root.people.authors.join("、") || "无"}；复核者：{root.people.reviewers.join("、") || "无"}；最后提交：{root.people.submitter ?? "无"}{root.people.submitCommit ? `（提交 ${root.people.submitCommit}）` : ""}{root.people.peopleOmitted ? `；另有 ${root.people.peopleOmitted} 人未列出` : ""}
-                    </Text>
-                    <Text style={s.muted}>数据时点（结论检查时刻）：{clockOf(root.checkedAt)}</Text>
-                  </View>
-                );
-              })()}
-              {(tasksQuery.data?.tasks ?? []).map(t => (
-                <View key={t.id}>
-                  <TaskRow task={t} ctx={ctx} depth={0} verdict={verdictOf.get(t.id)} onOpen={id => setOpenTask(openTask === id ? undefined : id)} />
-                  {openTask === t.id && detailQuery.data && (
-                    <View style={[s.card, { marginLeft: 14, backgroundColor: ctx.theme.colors.surface2 }]}>
-                      <ExpandableText text={detailQuery.data.task.context} lines={8} style={s.muted} ctx={ctx} />
-                      <TaskOwnerActions task={detailQuery.data.task} ctx={ctx} onDone={refreshAll} />
-                      {detailQuery.data.audit.map((a, i) => (
-                        <ExpandableText key={i} lines={4} style={s.mono} ctx={ctx}
-                          text={`${a.at.slice(5, 16)} ${a.action} · ${a.actor}${a.evidence ? ` — ${a.evidence}` : ""}`} />
-                      ))}
-                    </View>
-                  )}
-                </View>
-              ))}
-              {tasksQuery.isLoading && <Text style={s.muted}>加载任务…</Text>}
-              <CancelGoalButton goalId={g.id} ctx={ctx} onDone={refreshAll} />
-            </View>
-          )}
-        </View>
-      ))}
-    </View>
-  );
-}
-
 const ROLE_LABEL: Record<string, string> = { product: "运营/产品", engineering: "工程", "ai-content": "AI 内容", "concept-design": "原型/概念设计", "asset-production": "量产制作", screenwriter: "专职编剧", "story-author": "长篇故事作者", cinematography: "摄影摄像", qa: "测试", cs: "客户成功", eval: "评审" };
 const MODEL_PREVIEW = 10;
 
@@ -1178,6 +575,207 @@ function RegisterDefCard({ ctx, editing, onDone, onCancel }: {
         </>
       )}
       {!ready && result && <Text style={result.startsWith("失败") ? s.buttonDangerText : s.muted}>{result}</Text>}
+    </View>
+  );
+}
+
+const WORKFLOW_LABEL: Record<"ready" | "doing" | "review", string> = { ready: "就绪", doing: "在办无人持有", review: "待复核" };
+const WAIT_KIND_LABEL = { owner: "老板关口", active_lease: "活租约等待", unknown: "等待未知" } as const;
+const WAIT_STATE_LABEL = { ready: "就绪", doing: "执行中", review: "待复核", blocked: "依赖阻塞", done: "完成", void: "作废", unknown: "未知" } as const;
+/** A time of day from an ISO instant, in UTC as the server states it; an absent instant reads as unknown. */
+const clockOf = (iso: string): string => (iso ? `${iso.slice(5, 16).replace("T", " ")}（UTC）` : "未知");
+
+/** 动态页：一页回答「公司现在在干什么、什么卡住了、为什么」。 */
+function PulseTab({ ctx }: { ctx: Ctx }) {
+  const s = makeStyles(ctx);
+  const pal = relayPalette(ctx.theme);
+  const pulseRpc = useRpc(rpc.pulse);
+  const data = useQuery({ queryKey: ["pulse"], queryFn: () => pulseRpc({}), refetchInterval: 10_000 });
+  const loaded = data.data != null;
+  const p = useMemo(() => normalizePulse(data.data), [data.data]);
+  // Each blocked item is counted once: the dispatch list holds both phases, and the ready queue is not added on top.
+  const attention = p.waiting.length + p.stuck.length + p.resources.length + p.bounds.dispatchBlocked.total;
+  return (
+    <View style={{ gap: 12 }}>
+      <View style={{ gap: 8 }}>
+        <View style={s.row}>
+          <View style={[s.badge, { backgroundColor: loaded && !p.paused ? pal.successSoft : pal.warningSoft }]}>
+            <Text style={[s.badgeText, { color: loaded && !p.paused ? pal.success : pal.warning }]}>
+              {p.paused ? "派工已暂停" : loaded ? "派工运行中" : "加载中…"}
+            </Text>
+          </View>
+          {attention > 0 && <Text style={s.muted}>需要关注 {attention} 项（往下翻）</Text>}
+        </View>
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 10 }}>
+          <MetricCard label="正在办" value={p.doing.length} detail="持有租约的员工" palette={pal} ctx={ctx} />
+          <MetricCard label="就绪待领" value={p.ready.length} detail="等待认领的任务" tone="blue" palette={pal} ctx={ctx} />
+          <MetricCard label="无法派工" value={p.bounds.dispatchBlocked.total} detail={p.stuck.length ? `另有卡住 ${p.stuck.length} 项` : "含依赖与关口"} tone={p.bounds.dispatchBlocked.total > 0 ? "amber" : undefined} palette={pal} ctx={ctx} />
+          <MetricCard label="待你处理" value={p.waiting.length} detail="关口与提问" tone={p.waiting.length > 0 ? "amber" : "green"} palette={pal} ctx={ctx} />
+        </View>
+        {loaded && <Text style={s.muted}>派工结论检查于 {clockOf(p.dispatchAt ?? "")}；页面刷新于 {clockOf(p.at)}</Text>}
+      </View>
+      <Section title="正在办" count={p.doing.length} ctx={ctx}>
+        {p.doing.length === 0 && <Text style={s.muted}>现在没有人在干活。</Text>}
+        {p.doing.map(d => (
+          <View key={d.taskId} style={s.card}>
+            <Text style={s.text}>{d.title}</Text>
+            <Text style={s.muted}>
+              {d.employee ?? d.role}{d.discipline ? ` · ${d.discipline}` : ""}{d.goal ? ` · ${d.goal.slice(0, 40)}` : ""}
+              {d.sinceMin !== undefined ? ` · 已进行 ${fmtAge(d.sinceMin)}` : ""}
+            </Text>
+          </View>
+        ))}
+      </Section>
+      <Section title="待你处理" count={p.waiting.length} ctx={ctx}>
+        {p.waiting.map(w => (
+          <View key={w.taskId} style={s.card}>
+            <Text style={s.text}>{w.kind === "gate" ? "批准" : "回答"} · {w.title}</Text>
+            <Text style={s.muted}>已等 {w.hours < 1 ? `${Math.round(w.hours * 60)} 分钟` : `${w.hours.toFixed(1)} 小时`} · 到「收件箱」处理</Text>
+          </View>
+        ))}
+      </Section>
+      <Section title="卡住" count={p.stuck.length} ctx={ctx}>
+        {p.stuck.map(t => (
+          <View key={t.taskId} style={s.card}>
+            <Text style={s.text}>{t.title}</Text>
+            <Text style={s.muted}>{t.reason} · {t.taskId.slice(0, 8)}</Text>
+          </View>
+        ))}
+      </Section>
+      <Section title="就绪待领" count={p.ready.length} ctx={ctx}>
+        {p.ready.length === 0 && <Text style={s.muted}>没有排队等认领的任务。</Text>}
+        {p.ready.map(r => (
+          <View key={r.taskId} style={s.card}>
+            <Text style={s.text}>{r.title}</Text>
+            <Text style={s.muted}>
+              {ROLE_LABEL[r.role] ?? r.role}{r.discipline ? ` · ${r.discipline}` : ""} · 已等 {fmtAge(r.waitingMin)}
+            </Text>
+            {r.unclaimableReason && (
+              <Text style={{ color: pal.warning, fontSize: 12.5 }}>无人可派：{r.unclaimableReason}</Text>
+            )}
+          </View>
+        ))}
+      </Section>
+      <Section title="无法派工" count={p.bounds.dispatchBlocked.total} ctx={ctx}>
+        {p.dispatchBlocked.length === 0 && <Text style={s.muted}>没有无法派工的任务。</Text>}
+        {p.dispatchBlocked.map(v => (
+          <View key={`${v.taskId}:${v.phase}`} style={s.card}>
+            <Text style={s.text}>{v.title}</Text>
+            <Text style={s.muted}>
+              {v.phase === "review" ? "复核" : "执行"} · 工作流：{WORKFLOW_LABEL[v.workflowState]} · 派工：无法派工 · 可选人数 {v.eligibleCount} · 已等 {fmtAge(v.waitingMinutes)}
+            </Text>
+            <Text style={{ color: pal.warning, fontSize: 12.5 }}>{v.summary}</Text>
+            {v.reasons.map((r, i) => (
+              <Text key={i} style={s.muted}>
+                {r.text}（{r.candidates.filter(c => c !== "*").join("、") || "全局"}）· 负责：{r.owner === "system" ? "系统" : "老板"} · 恢复：{r.recovery}
+              </Text>
+            ))}
+            <Text style={s.muted}>结论检查于 {clockOf(v.checkedAt)}</Text>
+          </View>
+        ))}
+        {p.bounds.dispatchBlocked.truncated && (
+          <Text style={s.muted}>只列出 {p.bounds.dispatchBlocked.shown} 项，共 {p.bounds.dispatchBlocked.total} 项。</Text>
+        )}
+      </Section>
+      <Section title="资源异常" count={p.resources.length} ctx={ctx}>
+        {p.resources.length === 0 && <Text style={s.muted}>订阅与编制都正常。</Text>}
+        {p.resources.map((r, i) => <Text key={i} style={s.text}>{r}</Text>)}
+      </Section>
+      <Collapsible title="近 24 小时" ctx={ctx}>
+        <View style={s.card}>
+          <Text style={s.text}>
+            完成 {p.last24h.done} · 退回 {p.last24h.returned} · 驳回 {p.last24h.rejected} · 通道回滚 {p.last24h.rolledBack} · 退役 {p.last24h.retired}
+          </Text>
+          <Text style={s.muted}>员工流动：新建 {p.churn.created} · 退役 {p.churn.retired} · 认领失败 {p.churn.claimLost}</Text>
+        </View>
+      </Collapsible>
+      <Collapsible title="最近完成" count={p.recentDone.length} ctx={ctx}>
+        <View style={s.card}>
+          {p.recentDone.length === 0 && <Text style={s.muted}>暂无。</Text>}
+          {p.recentDone.map(d => (
+            <Text key={d.taskId + d.at} style={s.muted}>{d.at.slice(5, 16).replace("T", " ")} · {d.actor ? `${d.actor} · ` : ""}{d.title.slice(0, 60)}</Text>
+          ))}
+        </View>
+      </Collapsible>
+      {data.isLoading && <Text style={s.muted}>加载中…</Text>}
+      {data.isError && <Text style={s.muted}>加载失败：{String((data.error as Error).message).slice(0, 200)}</Text>}
+    </View>
+  );
+}
+
+function CompanyUpgradeCard({item,ctx,onDone}:{item:import("../shared/types").UpgradeCard;ctx:Ctx;onDone:()=>void}) {
+ const s=makeStyles(ctx),start=useRpc(rpc.upgrade);
+ const [feedback,setFeedback]=useState("");
+ const mutation=useMutation({mutationFn:()=>start({taskId:item.taskId,taskVersion:item.taskVersion,digest:item.plan.digest}),onSuccess:()=>{setFeedback("升级已启动，完成后自动回复通过");onDone();},onError:e=>setFeedback((e as Error).message)});
+ const busy=mutation.isPending||["queued","preparing","checking","installing","verifying"].includes(item.status),done=item.status==="succeeded",stale=item.retired===true;
+ const rows=(title:string,items:string[])=><View style={{gap:4}}><Text style={s.muted}>{title}</Text>{items.map((t,i)=><Text key={i} style={s.text}>• {t}</Text>)}</View>;
+ return <View style={[s.card,{gap:12}]}>
+  <Text style={s.muted}>公司系统升级 · {item.phase}</Text>
+  <Text style={[s.text,{fontSize:18,fontWeight:"700"}]}>v{item.plan.version} · {item.plan.title}</Text>
+  {rows("上线内容",item.plan.changes)}{rows("影响范围",item.plan.impact)}
+  {rows("数据变化",[item.plan.migration])}{rows("回退方式",[item.plan.rollback])}
+  <ExpandableText text={`提交 SHA：${item.plan.sha}`} lines={1} style={s.muted} ctx={ctx}/>
+  {(item.error||feedback)?<Text style={s.text}>{item.error||feedback}</Text>:null}
+  {done?<Text style={s.text}>升级完成，已自动回复通过</Text>:stale?<Text style={s.text}>该版本已被现役版本取代，无需再安装；这张旧待办会自动收口。</Text>:<Pressable accessibilityRole="button" accessibilityLabel={`升级至 v${item.plan.version}`} disabled={busy} style={[s.button,{opacity:busy?0.55:1}]} onPress={()=>mutation.mutate()}><Text style={s.buttonText}>{busy?item.phase:`升级至 v${item.plan.version}`}</Text></Pressable>}
+ </View>;
+}
+
+function InboxTab({ ctx }: { ctx: Ctx }) {
+  const s = makeStyles(ctx);
+  const queryClient = useQueryClient();
+  const inboxRpc = useRpc(rpc.inbox);
+  const autoRpc = useRpc(rpc.autoUpgrade);
+  const autoUpgrade=useMutation({mutationFn:(enabled:boolean)=>autoRpc({enabled}),onSuccess:()=>void queryClient.invalidateQueries({queryKey:["inbox"]})});
+  const resolve = useRpc(rpc.resolveNotice);
+  const consoleRpc = useRpc(rpc.consoleUrl);
+  const openRpc = useRpc(rpc.openExternal);
+  const consoleQ = useQuery({ queryKey: ["consoleUrl"], queryFn: () => consoleRpc({}), staleTime: 300_000 });
+  const data = useQuery({ queryKey: ["inbox"], queryFn: () => inboxRpc({}), refetchInterval: 10_000 });
+  const refresh = () => void queryClient.invalidateQueries({ queryKey: ["inbox"] });
+  const box: Inbox | undefined = data.data;
+  const empty = box && box.gates.length + box.questions.length + box.notices.length + (box.upgrades?.items.length??0) === 0;
+  return (
+    <View style={{ gap: 12 }}>
+      {consoleQ.data?.url ? (
+        <Pressable accessibilityRole="button" style={[s.card, { backgroundColor: ctx.theme.colors.accent, borderColor: ctx.theme.colors.accent, paddingVertical: 18 }]}
+          onPress={() => void openExternalAnywhere(consoleQ.data!.url, ctx.navigation, openRpc)}>
+          <Text style={{ color: ctx.theme.colors.accentForeground, fontSize: 16, fontWeight: "800" }}>打开「消息流」控制台</Text>
+          <Text style={{ color: ctx.theme.colors.accentForeground, fontSize: 11, marginTop: 5, opacity: .85 }}>看消息沿连线流动 · 编辑待发消息 · 放行 · 审待办</Text>
+        </Pressable>
+      ) : null}
+      {box?.upgrades?.current?<View style={s.card}><Text style={s.text}>当前版本 v{box.upgrades.current.version}</Text><Text selectable style={s.muted}>{box.upgrades.current.sha}</Text>
+        <Text style={s.muted}>自动安装已合 main 的公司版本；全部门禁和上线验证通过后才回复。失败退避24小时，同一版本累计失败2次后停止自动尝试。</Text>
+        <Pressable accessibilityRole="button" disabled={autoUpgrade.isPending} style={s.button} onPress={()=>autoUpgrade.mutate(!box.upgrades?.automatic?.enabled)}><Text style={s.buttonText}>{autoUpgrade.isPending?'正在保存':box.upgrades.automatic?.enabled?'自动升级已开启 · 点击关闭':'自动升级已关闭 · 点击开启'}</Text></Pressable>
+        {autoUpgrade.error?<Text style={s.text}>设置失败，请重试</Text>:null}
+      </View>:null}
+      {box?.upgrades?.items.map(item=><CompanyUpgradeCard key={`${item.taskId}:${item.jobId??item.plan.sha}`} item={item} ctx={ctx} onDone={refresh}/>)}
+      <Section title="待批关口" count={box?.gates.length} ctx={ctx}>
+        {box?.gates.filter(g=>!g.task.companyUpgrade).map(g => (
+          <DecideCard key={g.task.id} taskId={g.task.id} kind="approve" ctx={ctx} onDone={refresh}
+            body={`${g.task.title}\n\n${g.submission ?? "（无提交说明）"}`} />
+        ))}
+      </Section>
+      <Section title="待回问题" count={box?.questions.length} ctx={ctx}>
+        {box?.questions.filter(q=>!q.task.companyUpgrade).map(q => (
+          <DecideCard key={q.task.id} taskId={q.task.id} kind="reply" ctx={ctx} onDone={refresh}
+            body={`${q.task.title}\n\n${q.question ?? ""}`} />
+        ))}
+      </Section>
+      <Section title="提醒" count={box?.notices.length} ctx={ctx}>
+        {box?.notices.map(n => (
+          <View key={n.key} style={s.card}>
+            <ExpandableText text={n.text} lines={8} style={s.text} ctx={ctx} />
+            <Text style={s.muted}>{n.at}</Text>
+            <Pressable accessibilityRole="button" style={[s.buttonSecondary, { alignSelf: "flex-start" }]}
+              onPress={async () => { await resolve({ key: n.key }); refresh(); }}>
+              <Text style={s.buttonSecondaryText}>知道了</Text>
+            </Pressable>
+          </View>
+        ))}
+      </Section>
+      {empty && <Text style={s.muted}>收件箱是空的。</Text>}
+      {data.isLoading && <Text style={s.muted}>加载中…</Text>}
+      {data.isError && <Text style={s.muted}>加载失败：{String((data.error as Error).message).slice(0, 200)}</Text>}
     </View>
   );
 }
@@ -1380,7 +978,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
 }
 
 
-type CompanyTab = "pulse" | "inbox" | "new" | "goals" | "roster" | "models" | "usage" | "history";
+type CompanyTab = "pulse" | "inbox" | "roster" | "models" | "usage" | "history";
 
 export function CompanySurface(props: PluginSurfaceProps & { initialTab?: CompanyTab }) {
   const ctx: Ctx = { theme: props.theme, compact: props.layout.compact, navigation: props.navigation };
@@ -1391,8 +989,6 @@ export function CompanySurface(props: PluginSurfaceProps & { initialTab?: Compan
   const tabs = [
     { id: "pulse" as const, title: "动态" },
     { id: "inbox" as const, title: "收件箱" },
-    { id: "new" as const, title: "发目标" },
-    { id: "goals" as const, title: "目标进展" },
     { id: "roster" as const, title: "编制" },
     { id: "models" as const, title: "模型排序" },
     { id: "usage" as const, title: "Magpie 用量" },
@@ -1415,8 +1011,6 @@ export function CompanySurface(props: PluginSurfaceProps & { initialTab?: Compan
         <ScrollView style={{ flex: 1 }} contentContainerStyle={s.scroll}>
           {tab === "pulse" && <PulseTab ctx={ctx} />}
           {tab === "inbox" && <InboxTab ctx={ctx} />}
-          {tab === "new" && <NewGoalTab ctx={ctx} brief={brief.data} />}
-          {tab === "goals" && <GoalsTab ctx={ctx} brief={brief.data} />}
           {tab === "roster" && <RosterTab ctx={ctx} brief={brief.data} />}
           {tab === "models" && <ModelRoutingPanel ctx={ctx}/>}
         </ScrollView>

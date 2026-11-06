@@ -7,7 +7,6 @@ import type { CompanyDatabase } from './database.ts';
 import type { OwnerDesk, OwnerInbox } from './owner.ts';
 import { CompanyError } from './core-errors.ts';
 import { compareRelease,installedRelease,readCompanyRelease,type CompanyRelease } from './company-release.ts';
-import { WaitStore } from './wait-store.ts';
 export type UpgradeStatus='queued'|'preparing'|'checking'|'installing'|'verifying'|'succeeded'|'failed'|'awaiting_reply';
 export interface UpgradeJob {id:RecordId;task:RecordId;task_version:number;plan:CompanyRelease;status:UpgradeStatus;phase:string;error?:string;pid?:number;at:unknown;updated_at:unknown;source:string;decision:'approve'|'reply';authorization?:'owner'|'automatic';policy_revision?:number;previous?:string;pause_version?:number;paused_before?:boolean}
 export interface UpgradeCard {taskId:string;taskVersion:number;plan:CompanyRelease;status:UpgradeStatus|'available';phase:string;error?:string;jobId?:string;retired?:boolean}
@@ -41,19 +40,6 @@ export class CompanyUpgrades {
    seen.add(t.id);const job=jobs.find(j=>String(j.task.id)===t.id&&j.plan.digest===plan.digest);
    items.push({taskId:t.id,taskVersion:t.version,plan,status:job?.status??'available',phase:job?.phase??'待升级',error:job?.error,jobId:job?String(job.id.id):undefined});
   }
-  // SYS05 parks an owner handoff outside the owner-gate fields (blocked_to is cleared), so a handoff task that asks the
-  // owner to install a version is neither a gate nor a question. Reading its plan from the task row is what keeps its
-  // upgrade button reachable instead of leaving the owner a待办 they cannot act on.
-  const handoffIds=(inbox.handoffs??[]).map(h=>h.taskId).filter(id=>!seen.has(id));
-  if(handoffIds.length){
-   const [rows]=await this.db.query<[Array<{id:RecordId;version:number;company_upgrade?:CompanyRelease}>]>(
-    'SELECT id,version,company_upgrade FROM task WHERE id IN $ids;',{ids:handoffIds.map(taskId=>new RecordId('task',taskId))});
-   for(const row of rows??[]){
-    const plan=row.company_upgrade,id=String(row.id.id);if(!plan||seen.has(id))continue;
-    seen.add(id);const job=jobs.find(j=>String(j.task.id)===id&&j.plan.digest===plan.digest);
-    items.push({taskId:id,taskVersion:row.version,plan,status:job?.status??'available',phase:job?.phase??'待升级',error:job?.error,jobId:job?String(job.id.id):undefined});
-   }
-  }
   for(const j of jobs.slice(0,3))if(!seen.has(String(j.task.id)))items.push({taskId:String(j.task.id),taskVersion:j.task_version,plan:j.plan,status:j.status,phase:j.phase,error:j.error,jobId:String(j.id.id)});
   return {automatic:await this.autoPolicy(),current:{version:current.version,sha:current.sha},items:items.map(item=>retired(item,current.version)?{...item,phase:'已被 v'+current.version+' 替代',retired:true}:item)};
  }
@@ -71,13 +57,21 @@ export class CompanyUpgrades {
   return this.autoPolicy();
  }
  /** Called by the control loop, never on an inference request. The detached runner owns expensive work. */
+ /** The parent chain of a task as record ids — the automatic upgrade's prerequisite set. */
+ async taskAncestors(taskId:string,depth=0):Promise<RecordId[]>{
+  if(depth>32)return[];
+  const [rows]=await this.db.query<[Array<{parent?:RecordId}>]>('SELECT parent FROM $task;',{task:new RecordId('task',taskId)});
+  const parent=rows?.[0]?.parent;
+  if(!parent)return[];
+  return[parent,...(await this.taskAncestors(String(parent.id),depth+1))];
+ }
  async autoStart(){
   if(!(await this.autoPolicy()).enabled)return;
   const [cfg]=await this.db.query<[{paused?:boolean}]>('SELECT paused FROM ONLY company_meta:config;');
   if(cfg?.paused)return;
   // Reconcile vanished workers before checking the durable single-flight lock.
   const box=await this.owner.inbox();
-  const pendingIds=new Set([...box.gates.map(x=>x.task.id),...box.questions.map(x=>x.task.id),...(box.handoffs??[]).map(x=>x.taskId)]);
+  const pendingIds=new Set([...box.gates.map(x=>x.task.id),...box.questions.map(x=>x.task.id)]);
   const state=await this.state(box);
   if(state.items.some(x=>running(x.status)))return;
   const candidates=state.items.filter(x=>pendingIds.has(x.taskId)&&!x.retired&&!['succeeded','awaiting_reply'].includes(x.status)&&(compareRelease(x.plan.version,state.current.version)>0||x.plan.sha===state.current.sha))
@@ -99,16 +93,17 @@ export class CompanyUpgrades {
   const current=await installedRelease(this.options.home);
   if(current.sha!==plan.sha&&compareRelease(plan.version,current.version)<0)throw new CompanyError('invalid','该版本已被现役版本取代，无需再安装；请改为关闭这张旧待办');
   if(current.sha!==plan.sha&&compareRelease(plan.version,current.version)===0)throw new CompanyError('invalid','目标版本不高于当前版本，请工程提交新的版本号');
+  const ancestors=await this.taskAncestors(input.taskId);
   const jobId=randomUUID();
   const results=await this.db.query(`BEGIN;
    LET $t=SELECT * FROM ONLY $task;
    LET $policy=SELECT * FROM ONLY company_meta:config;
    IF $automatic AND ($policy.company_auto_upgrade!=true OR $policy.paused=true) {THROW '自动升级已关闭或派工已暂停';};
    IF $t.version!=$version OR $t.company_upgrade.digest!=$digest OR $t.company_upgrade.sha!=$sha {THROW '升级内容或任务版本已变化，请刷新';};
-   IF $t.kind NOT IN ['release','deploy'] OR $t.executor_role!='engineering' OR NOT (($t.state='blocked' AND $t.blocked_to='owner') OR ($t.state='review' AND $t.reviewer_role='owner') OR ($t.state='blocked' AND $t.wait_kind='owner_handoff' AND $t.wait_owner_role='owner')) {THROW '任务已不在老板收件箱，不能升级';};
+   IF $t.company_upgrade=NONE OR NOT (($t.state='blocked' AND $t.blocked_to='owner') OR ($t.state='review' AND $t.reviewer_role='owner')) {THROW '任务已不在老板收件箱，不能升级';};
    IF $automatic {
-    LET $done=SELECT id FROM task WHERE id IN ($t.dependencies??[]) AND state='done';
-    IF array::len($done)!=array::len($t.dependencies??[]) {THROW '升级前置任务尚未全部验收完成';};
+    LET $undone=SELECT id FROM task WHERE id IN $ancestors AND state NOT IN ['done','void'];
+    IF array::len($undone)>0 {THROW '升级前置任务尚未全部验收完成';};
    };
    LET $lock=SELECT * FROM ONLY company_meta:upgrade_job;
    LET $active=SELECT * FROM ONLY $lock.job;
@@ -126,7 +121,7 @@ export class CompanyUpgrades {
     CREATE audit CONTENT {task:$task,actor:$source,action:IF $automatic THEN 'company_upgrade_auto_authorized' ELSE 'company_upgrade_authorized' END,evidence:$evidence,version:$version,at:time::now()};
     RETURN SELECT * FROM ONLY $job;
    };
-   COMMIT;`,{task:new RecordId('task',input.taskId),version:input.taskVersion,digest:input.digest,sha:plan.sha,plan,job:new RecordId('company_upgrade',jobId),source,automatic,evidence:`${automatic?'按老板开启的自动升级策略安装':'老板授权升级至'} v${plan.version}；SHA ${plan.sha}；仅验证成功后自动回复通过。`}).responses();
+   COMMIT;`,{task:new RecordId('task',input.taskId),version:input.taskVersion,digest:input.digest,sha:plan.sha,ancestors,plan,job:new RecordId('company_upgrade',jobId),source,automatic,evidence:`${automatic?'按老板开启的自动升级策略安装':'老板授权升级至'} v${plan.version}；SHA ${plan.sha}；仅验证成功后自动回复通过。`}).responses();
   const error=results.find(r=>!r.success&&!r.error.message.includes('not executed')&&!r.error.message.startsWith('Cannot COMMIT'));
   if(error&&!error.success)throw new CompanyError('conflict',error.error.message);
   const result=results.filter(r=>r.success&&r.result&&typeof r.result==='object'&&!Array.isArray(r.result)).at(-1);
@@ -157,25 +152,6 @@ export class CompanyUpgrades {
   const decision=job.decision;
   const note=`通过：公司系统已升级至 v${job.plan.version}（${job.plan.sha}）。\n上线内容：${job.plan.changes.join('；')}\n影响范围：${job.plan.impact.join('；')}\n双面安装、健康检查、版本及门禁验证通过。请员工继续独立业务验收。`;
   const taskId=String(job.task.id);
-  // SYS05 handoff: the task parked its dispatch outside the owner-gate fields, so owner.decide refuses it. The owner's
-  // click on the version card IS the decision that wait was waiting for (the wait says so in its own pendingAction),
-  // so the same completion releases it and hands the task back to its dispatch instead of failing the reply.
-  const wait=await new WaitStore(this.db).openOfTask(taskId).catch(()=>undefined);
-  if(wait?.kind==='owner_handoff'&&wait.ownerRole==='owner'){
-   const quote=job.authorization==='automatic'
-    ? `按老板开启的公司自动升级策略安装 v${job.plan.version}（${job.source}），不是老板点击。${note}`
-    : `老板在收件箱点击「升级至 v${job.plan.version}」（${job.source}）：同意安装 ${job.plan.sha}。${note}`;
-   const result=await new WaitStore(this.db).resolve({
-    wait, expectedVersion:wait.version, actor:job.source, ownerApproved:true, now:Date.now(),
-    event:{source:'owner',at:Date.now(),verified:true,objectWaitId:wait.waitKey,objectTaskId:taskId,
-     eventId:`owner:${String(job.id.id)}:${wait.waitKey}`,ownerQuote:quote.slice(0,2000)},
-   });
-   if(!result.released)throw new CompanyError('conflict',result.message);
-   await this.db.query(`CREATE audit CONTENT {task:$task,actor:$source,action:'company_upgrade_replied',evidence:$evidence,at:time::now()};`,
-    {task:job.task,source:job.source,evidence:note});
-   await this.update(String(job.id.id),'succeeded',`升级成功，已解除交接等待（v${job.plan.version}）`);
-   return;
-  }
   await this.owner.decide({taskId,expectedVersion:job.task_version,decision,note,source:job.source,key:`company-upgrade:${String(job.id.id)}`});
   await this.update(String(job.id.id),'succeeded','升级成功，已自动回复通过');
  }
@@ -199,17 +175,7 @@ export class CompanyUpgrades {
    const note=`你的版本 v${plan.version}（${plan.sha}）已被现役 v${installed.version}（${installed.sha}）取代，不需要再单独安装。`
     +`\n这张待办按已上线处理；请在该任务的验收证据里记录它随 v${installed.version} 一起上线，再继续你自己的业务验收。`;
    try{
-    const wait=await new WaitStore(this.db).openOfTask(taskId);
-    if(wait?.kind==='owner_handoff'&&wait.ownerRole==='owner'){
-     const result=await new WaitStore(this.db).resolve({
-      wait,expectedVersion:wait.version,actor:source,ownerApproved:true,now:Date.now(),
-      event:{source:'owner',at:Date.now(),verified:true,objectWaitId:wait.waitKey,objectTaskId:taskId,
-       eventId:`owner:superseded:${installed.sha}:${wait.waitKey}`,ownerQuote:note.slice(0,2000)},
-     });
-     if(!result.released)throw new CompanyError('conflict',result.message);
-    }else{
-     await this.owner.decide({taskId,decision:'reply',note,source,key:`company-upgrade-superseded:${installed.sha}:${taskId}`});
-    }
+    await this.owner.decide({taskId,decision:'reply',note,source,key:`company-upgrade-superseded:${installed.sha}:${taskId}`});
     closed.push({taskId,version:plan.version,released:true,reason:'superseded'});
    }catch(error){
     // A card that moved on since the read keeps its own path; the next pass retries instead of forcing a state.

@@ -238,10 +238,6 @@ export function company(): Promise<Company> {
       // session (Factory falls back once its standard allowance is spent) and switch back later.
       // The daemon's MCP endpoint applies the change to the running session in place.
       realignAgent: (agentId, model) => setAgentModel(agentId, model),
-      // The implementer binding outlives the employee: when a bound implementer's session is gone for good, the
-      // dispatcher hands the code to a live engineer on its own (audited as system:dispatcher) instead of waiting for
-      // the manager to reassign.
-      autoTakeover: async input => { await core.systemImplementerTakeover!(input); return true; },
       // Terminal-task artifact lifecycle: the free-disk gate reclaims evidence/deliverables
       // before it gives up, so a full disk stops halting dispatch instead of silently wedging it.
       reclaimArtifacts: (input) => reclaimer.reclaim({

@@ -28,15 +28,14 @@ beforeAll(async () => {
   gm = await admin.enroll('reassign-gm', 'owner', ['execute', 'review', 'manage']);
   concept = await admin.enroll('reassign-concept', 'concept-design', ['execute', 'review']);
   await new ProjectStore(db.db).upsert({ id: 'novel', name: '故事项目', repoPath: dir, release: 'local', envs: [], disciplines: [{ name: '原著', roles: ['story-author'] }] });
-  const [rows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: '长篇', brief: 'fixture', state: 'active', source: 'fixture', note: '', project: project:novel, tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
-  goal = String(rows[0]!.id.id);
+  goal = 'novel';
 });
 afterAll(async () => { if (!dir) return; await db.close(); server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true }); });
 
 const key = () => `reassign-${++count}-${crypto.randomUUID()}`;
 /** A task as the old transitional routing left it: concept-design on the 原著 track, owner-reviewed. */
 async function legacyTask(extra: Record<string, unknown> = {}) {
-  const t = await core.createTask(gm, { title: `Legacy story task ${++count}`, context: 'fixture', executorRole: 'story-author', reviewerRole: 'owner', discipline: '原著', goalId: goal, idempotencyKey: key(), ...extra } as never);
+  const t = await core.createTask(gm, { title: `Legacy story task ${++count}`, context: 'fixture', executorRole: 'story-author', reviewerRole: 'owner', discipline: '原著', project: 'novel', idempotencyKey: key(), ...extra } as never);
   await db.db.query("UPDATE $t SET executor_role = 'concept-design';", { t: new RecordId('task', t.id) });
   return t;
 }

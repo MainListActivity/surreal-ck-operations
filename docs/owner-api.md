@@ -8,14 +8,11 @@
 
 | 命令 | 一行示例 |
 |---|---|
-| 发目标 | `sck owner goal.create '{"text":"做报表导出","tier":"quick","pipeline":"software"}'` |
-| 目标分级 | `sck owner goal.triage '{"goalId":"g1","tier":"quick"}'` |
-| 取消目标 | `sck owner goal.cancel '{"goalId":"g1","note":"方向变了"}'` |
-| 列出目标 | `sck owner goal.list '{}'` |
-| 目标分阶段 | `sck owner goal.split '{"goalId":"g1","taskIds":["t1","t2"],"title":"下一阶段","reason":"第一阶段收口"}'` |
-| 待处置作废任务 | `sck owner goal.retired.list '{"goalId":"g1"}'` |
-| 处置作废任务 | `sck owner goal.retired.resolve '{"goalId":"g1","taskId":"t1","goalVersion":1,"taskVersion":1,"disposition":"fixture","replacementTaskIds":[],"reason":"保留为历史基线"}'` |
-| 建任务 | `sck owner task.create '{"title":"导出","requirement":"导出 CSV","acceptanceText":"列头正确","executorRole":"engineering","reviewerRole":"qa","dependencies":[]}'` |
+| 建任务（路由类型） | `sck owner task.create '{"type":"software","title":"导出","requirement":"导出 CSV","acceptanceText":"列头正确","tag":"发布线","hold":false}'`（返回 `{task, planned}`：route.next 链上的 planned 后续任务各带草稿） |
+| 任务链与消息 | `sck owner task.plan '{"taskId":"t1"}'`（父链回溯 + 下游全链任务与每任务消息） |
+| 路由列表 | `sck owner route.list '{}'` |
+| 保存路由 | `sck owner route.save '{"type":"software","label":"软件需求","executorRole":"engineering","reviewerRole":"qa","code":true,"next":"gate","hold":false}'`（拒绝同岗/未知岗/未启用 next/成环） |
+| 停用路由 | `sck owner route.disable '{"type":"story"}'`（被别的 next 引用时拒绝） |
 | 改任务 | `sck owner task.update '{"taskId":"t1","requirement":"新需求","acceptanceText":"新验收标准"}'` |
 | 删任务（作废） | `sck owner task.delete '{"taskId":"t1","note":"不需要了"}'` |
 | 任务详情/审计/消息记录 | `sck owner task.detail '{"taskId":"t1"}'` |
@@ -23,12 +20,9 @@
 | 改派 | `sck owner task.reassign '{"taskId":"t1","executorRole":"engineering","reviewerRole":"qa","note":"换人"}'` |
 | 作废 | `sck owner task.void '{"taskId":"t1","note":"重复"}'` |
 | 撤销租约 | `sck owner task.revoke '{"taskId":"t1","note":"终止在途"}'` |
-| 解锁 | `sck owner task.unlock '{"taskId":"t1"}'` |
 | 暂停派工 | `sck owner task.pause '{}'` |
 | 恢复派工 | `sck owner task.resume '{}'` |
 | 任务成本 | `sck owner task.cost '{"taskId":"t1"}'` |
-| 实现人判定预演 | `sck owner contributor.dryRun '{"taskIds":["t1"]}'` |
-| 指定实现人 | `sck owner implementer.takeover '{"taskId":"t1","toEmployee":"eng-1","expectedVersion":3,"reason":"任务有多名经手人，需指定实现负责人"}'` |
 | 关口决定 | `sck owner decide '{"taskId":"t1","decision":"approve"}'` |
 | 批准 | `sck owner approve '{"taskId":"t1"}'` |
 | 退回 | `sck owner reject '{"taskId":"t1","note":"补齐证据"}'` |

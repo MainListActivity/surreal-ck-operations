@@ -40,7 +40,7 @@ export function arrivedAt(): number {
 export async function withinReplyCeiling<T>(work: () => Promise<T>): Promise<T> {
   const at = arrivedAt() + REPLY_CEILING_MS;
   const refused = (): CompanyError => new CompanyError('temporarily_unavailable',
-    `the answer was not ready within ${Math.round(REPLY_CEILING_MS / 1000)} seconds of the request; narrow the query (state, goalId, role, since or fields) or read it in pages, then retry`, true);
+    `the answer was not ready within ${Math.round(REPLY_CEILING_MS / 1000)} seconds of the request; narrow the query (state, tag, role, since or fields) or read it in pages, then retry`, true);
   if (Date.now() >= at) throw refused();
   const answer = await untilAt(work().then(value => ({ value })), at);
   if (answer === undefined) throw refused();

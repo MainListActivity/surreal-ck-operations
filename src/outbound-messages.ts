@@ -2,7 +2,7 @@
 import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from './core-errors.ts';
 
-export type MessageStep = 'execute' | 'review' | 'rework' | 'nudge' | 'eval';
+export type MessageStep = 'execute' | 'review' | 'rework' | 'nudge' | 'eval' | 'notice';
 export type MessageState = 'draft' | 'held' | 'sent';
 
 export interface OutboundMessage {
@@ -20,22 +20,20 @@ export interface OutboundMessage {
   createdAt: string;
 }
 
-const STEPS: readonly MessageStep[] = ['execute', 'review', 'rework', 'nudge', 'eval'];
+const STEPS: readonly MessageStep[] = ['execute', 'review', 'rework', 'nudge', 'eval', 'notice'];
 
 /** The deploy-leg machine criterion id every code dispatch may name when the task carries no readable criteria. */
 export const DEFAULT_MACHINE_CRITERION = 'AC-BASE-DEPLOY-1';
 
 /** 表里保存短正文；派工时 renderMessage 才补上真实路径、工具绝对路径与任务 ID。 */
-const EXECUTE_CODE = `实现 task.md 中的需求，合入并发布到生产，按验收标准在生产逐条自验。全部通过后先用 CI 运行记录调 sck call record_acceptance_evidence '{"taskId":"{taskId}","acId":"{acId}","sha":"<合入提交>","source":{"provider":"github-actions","runUrl":"…"}}'，再 sck call submit '{"text":"…","acceptance":{"sha":"<合入提交>"},"idempotencyKey":"…"}'`;
-const EXECUTE_PLAIN = `实现 task.md 中的需求，按验收标准逐条自验，全部通过后：sck call submit '{"text":"…","idempotencyKey":"…"}'`;
+const EXECUTE_CODE = `实现 task.md 中的需求，合入并发布到生产，按验收标准在生产逐条自验，全部通过后：sck call submit '{"text":"<结果>","sha":"<合入提交>"}'。需要后续任务时在 submit 里加 next 数组。`;
+const EXECUTE_PLAIN = `完成 task.md 中的需求，按验收标准自验后：sck call submit '{"text":"<结果>"}'。需要后续任务时在 submit 里加 next 数组。`;
 /** 内容线（故事/视频等）的复核不涉及生产发布；软件线的复核才按生产环境逐条复验。 */
-const REVIEW = `按 task.md 的验收标准逐条复验，结论：sck call review '{"decision":"accept|return","text":"…","idempotencyKey":"…"}'`;
-const REVIEW_CODE = `按 task.md 的验收标准在生产逐条复验，结论：sck call review '{"decision":"accept|return","text":"…","idempotencyKey":"…"}'`;
-const REWORK_CODE = `修复 findings/round-NN.md 中的问题，重新合入并发布到生产，按验收标准在生产逐条自验。全部通过后先调 sck call record_acceptance_evidence '{"taskId":"{taskId}","acId":"{acId}","sha":"<合入提交>","source":{"provider":"github-actions","runUrl":"…"}}'，再调 sck call submit '{"text":"…","acceptance":{"sha":"<合入提交>"},"idempotencyKey":"…"}'`;
-const REWORK_PLAIN = `修复 findings/round-NN.md 中的问题，重新自验后：sck call submit '{"text":"…","idempotencyKey":"…"}'`;
-const NUDGE = (phase: string) => phase === 'review'
-  ? `按 task.md 的验收标准复验后：sck call review '{"decision":"accept|return","text":"…","idempotencyKey":"…"}'`
-  : `完成 task.md 中的需求后：sck call submit '{"text":"…","idempotencyKey":"…"}'`;
+const REVIEW = `按 task.md 的验收标准逐条复验：sck call review '{"decision":"accept|return","text":"<结论>"}'`;
+const REVIEW_CODE = `按 task.md 的验收标准在生产逐条复验：sck call review '{"decision":"accept|return","text":"<结论>"}'`;
+const REWORK_CODE = `修复 findings/round-NN.md 中的问题后，` + EXECUTE_CODE;
+const REWORK_PLAIN = `修复 findings/round-NN.md 中的问题后，` + EXECUTE_PLAIN;
+const NUDGE = (phase: string) => phase === 'review' ? REVIEW : EXECUTE_PLAIN;
 /** eval 不读本任务 task.md：评分规则在运营仓的 agents/eval.md，由派工时补成绝对路径。 */
 const EVAL = `任务 {taskId} 已完成，读 sck call get_task_history 和 sck call get_model_evidence，按 agents/eval.md 为全部参与员工打分，用 sck call record_score '{"taskId":"{taskId}","summary":"<本轮一句话总结>","complexity":3,"scores":[{"employee":"<员工编号>","quality":4,"evidence":4,"discipline":4,"timeliness":4,"overall":4,"notes":"<评语>","modelScores":[]}]}' 提交`;
 

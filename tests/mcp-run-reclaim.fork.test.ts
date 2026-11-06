@@ -76,7 +76,7 @@ run('MCP process manual reclaim_worktrees tears git tree, Paseo scene and regist
   const eng = await new LocalEnrollmentAdmin(db).enroll(`fixture-eng-${++count}`, 'engineering', ['execute', 'review']);
   const peer = await new LocalEnrollmentAdmin(db).enroll(`fixture-peer-${++count}`, 'engineering', ['execute', 'review']);
   const holder = await core.claim(eng, (await core.createTask(gm, { title: `MCP holder ${count}`, context: 'Isolated fixture task', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `mcp-holder-${count}` })).id);
-  const task = await core.createTask(gm, { title: `MCP retire target ${count}`, context: 'Isolated fixture task to be retired', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `mcp-task-${count}` });
+  const task = await core.createTask(gm, { title: `MCP retire target ${count}`, context: 'Isolated fixture task to be retired', executorRole: 'engineering', reviewerRole: 'qa', workIntent: { kind: 'code' }, idempotencyKey: `mcp-task-${count}` });
   const claim = await core.claim(peer, task.id);
   expect(claim.worktree!.mode).toBe('exclusive');
   const scene = claim.worktree!.worktreePath;

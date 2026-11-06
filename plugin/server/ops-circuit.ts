@@ -37,8 +37,8 @@ export class OpsCircuit {
     const old = state.tools[input.tool];
     const stop = async (): Promise<never> => {
       input.check();
-      await input.block(`【ops 拒绝熔断】工具 ${input.tool} 在同一任务租约下连续 ${LIMIT} 次收到相同权限/契约拒绝，已停止重试。请经理核对权限、契约或供应商能力后恢复任务。`);
-      throw Object.assign(new Error('ops 拒绝熔断：任务已上报经理，停止重复调用'), { code: 'temporarily_unavailable' });
+      await input.block(`【ops 拒绝熔断】工具 ${input.tool} 在同一任务租约下连续 ${LIMIT} 次收到相同权限/契约拒绝，已停止重试。请老板核对权限、契约或供应商能力后恢复任务。`);
+      throw Object.assign(new Error('ops 拒绝熔断：任务已上报老板，停止重复调用'), { code: 'temporarily_unavailable' });
     };
     if (Number.isSafeInteger(old?.count) && old!.count >= LIMIT) return stop();
     let result: unknown, error: unknown, failed = false;

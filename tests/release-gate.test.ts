@@ -29,14 +29,10 @@ const SIDECAR_REVIEW_FILES = [
   'tests/dispatcher-sidecar.fork.test.ts',
   'tests/deployment-source.test.ts',
   'tests/deployment-source.fork.test.ts',
-  'tests/effective-policy.fork.test.ts',
   'tests/deploy-drill.test.ts',
   'tests/deploy-drill-runner.test.ts',
   'tests/deploy-drill-node-host.test.ts',
   'tests/deploy-drill-access.fork.test.ts',
-  // SYS-INT 评审协同唤醒：纯规则 + 隔离库集成（事件先于登记、20 并发、重启、旧 fence、两阶段、零轮询）。
-  'tests/review-events.test.ts',
-  'tests/review-events.fork.test.ts',
   'tests/company-upgrades.fork.test.ts',
 ];
 
@@ -299,10 +295,9 @@ test.skipIf(!existsSync('/usr/bin/python3'))('a sidecar-review gate run records 
     writeFileSync(join(release, 'tests', 'deployment-source.test.ts'), '');
     writeFileSync(join(release, 'tests', 'deployment-source.fork.test.ts'), '');
     // SYS06: the effective-policy contract regression rides the same gate; it needs the company fork database.
-    writeFileSync(join(release, 'tests', 'effective-policy.fork.test.ts'), '');
     // SYS-INT: the deploy-drill suite and the QA review wake regressions ride the gate too. Every file the gate
     // names must exist in the release, so the fixture is built from the same list the gate is asserted against.
-    for (const extra of SIDECAR_REVIEW_FILES.filter(f => f.includes('deploy-drill') || f.includes('review-events') || f.includes('company-upgrades'))) {
+    for (const extra of SIDECAR_REVIEW_FILES.filter(f => f.includes('deploy-drill') || f.includes('company-upgrades'))) {
       writeFileSync(join(release, extra), '');
     }
     const pinned = join(home, 'runtime-bun', 'bin', 'bun');
@@ -338,7 +333,6 @@ test.skipIf(!existsSync('/usr/bin/python3'))('the recovery-fork gate runs the is
   try {
     const release = join(home, 'releases', SHA);
     mkdirSync(join(release, 'tests'), { recursive: true });
-    writeFileSync(join(release, 'tests', 'recovery-read.fork.test.ts'), '');
     writeFileSync(join(release, 'tests', 'fault-budget.fork.test.ts'), '');
     mkdirSync(join(release, 'scripts'), { recursive: true });
     writeFileSync(join(release, 'scripts', 'test-worktrees.ts'), '');
@@ -357,12 +351,11 @@ test.skipIf(!existsSync('/usr/bin/python3'))('the recovery-fork gate runs the is
     // The gate drove the official isolated runner with the opt-in and both machine checks.
     const argv = readFileSync(argvFile, 'utf8');
     expect(argv).toContain('scripts/test-worktrees.ts');
-    expect(argv).toContain('tests/recovery-read.fork.test.ts');
     expect(argv).toContain('tests/fault-budget.fork.test.ts');
     expect(readFileSync(join(home, 'gates', 'recovery-fork', `${SHA}.log`), 'utf8')).toContain('optin=1');
 
     // The checks really ran: the marker is printed and the record opens the gate.
-    const passed = sh(GATE, ['recovery-fork', release], home, { FAKE_MARKER: 'echo "recovery-read.fork executed"; echo "fault-budget.fork executed"' });
+    const passed = sh(GATE, ['recovery-fork', release], home, { FAKE_MARKER: 'echo "fault-budget.fork executed"' });
     expect(passed.code).toBe(0);
     expect(JSON.parse(readFileSync(join(home, 'gates', 'recovery-fork', `${SHA}.json`), 'utf8'))).toMatchObject({ result: 'pass', exitCode: 0 });
     writeRecord(home, SHA, {}, 'comm-slow-pipe');
@@ -370,7 +363,7 @@ test.skipIf(!existsSync('/usr/bin/python3'))('the recovery-fork gate runs the is
     expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(0);
 
     // A regression in the checks closes the gate again.
-    const red = sh(GATE, ['recovery-fork', release], home, { FAKE_TEST_RC: '1', FAKE_MARKER: 'echo "recovery-read.fork executed"; echo "fault-budget.fork executed"' });
+    const red = sh(GATE, ['recovery-fork', release], home, { FAKE_TEST_RC: '1', FAKE_MARKER: 'echo "fault-budget.fork executed"' });
     expect(red.code).toBe(1);
     expect(JSON.parse(readFileSync(join(home, 'gates', 'recovery-fork', `${SHA}.json`), 'utf8'))).toMatchObject({ result: 'fail' });
     expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(1);

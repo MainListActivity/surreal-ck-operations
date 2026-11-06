@@ -10,7 +10,7 @@ import { countingFetch, lastBody } from './support/mcp-wire.ts';
 const principal: Principal = { employeeId: 'ai-01', role: 'ai-content', capabilities: ['execute', 'review'] };
 const task: TaskView = {
   id: 'task-test', title: 'Adapter smoke', context: 'Synthetic task', state: 'ready',
-  executorRole: 'ai-content', reviewerRole: 'engineering', kind: 'task', dependencies: [], version: 1, fence: 0,
+  executorRole: 'ai-content', reviewerRole: 'engineering', kind: 'task', version: 1, fence: 0,
 };
 let active = true;
 let unavailable = false;
@@ -77,7 +77,6 @@ function worstClaim(): ClaimResult {
   return {
     task: {
       ...task, title: '甲'.repeat(200), context: '甲'.repeat(20_000), state: 'doing', currentEmployee: 'eng-01', deliveryId: 'delivery-claim',
-      dependencies: Array.from({ length: 200 }, (_, index) => `task-${String(index).padStart(4, '0')}-${'d'.repeat(120)}`),
       workIntent: { kind: 'assets', paths }, leaseExpiresAt: '2026-10-19T19:00:00.000Z', version: 4, fence: 3,
     },
     deliveryId: 'delivery-claim', fence: 3, leaseExpiresAt: '2026-10-19T19:00:00.000Z',
@@ -105,20 +104,14 @@ test('real SDK initialize/list/call and authenticated core identity', async () =
     expect(tools).toContain('def_list');
     expect(tools).toContain('def_ensure');
     expect(tools).toContain('project_disciplines_update');
-    expect(tools).toContain('defer_task_until');
-    expect(tools).toContain('bind_task_code_repo');
-    expect(tools).toContain('task_intent_update');
-    // 老板在途任务验收要求追加：与其它 gm 工具同一条 MCP 表面（角色与能力在 core 判定）。
-    expect(tools).toContain('task_acceptance_amend');
-    expect(tools).toContain('goal_acceptance_preview');
-    expect(tools).toContain('goal_acceptance_repair');
-    expect(tools).toContain('implementer_takeover');
+    // Kept owner/manage tools ride the same surface; capability checks live in core.
+    expect(tools).toContain('resume_task');
+    expect(tools).toContain('retire_task');
+    expect(tools).toContain('task_project_update');
+    expect(tools).toContain('acceptance_status');
+    expect(tools).toContain('record_acceptance_evidence');
     // SYS01 R1: the recovery entry for a worktree whose references were cut from a page.
     expect(tools).toContain('read_worktree_refs');
-    // SYS-DISP IR01: the read-only candidate preflight (gm/qa) rides the same surface as the write entry.
-    expect(tools).toContain('independence_set');
-    expect(tools).toContain('identity_principal_set');
-    expect(tools).toContain('independence_check');
     const result = await connection.client.callTool({ name: 'get_context', arguments: { role: 'product' } });
     expect(result.structuredContent).toMatchObject({ ok: true, data: { principal: { employeeId: 'ai-01' } } });
     const claim = await connection.client.callTool({ name: 'claim_next', arguments: {} });

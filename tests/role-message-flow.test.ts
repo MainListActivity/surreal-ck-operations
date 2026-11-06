@@ -6,7 +6,6 @@ import { ensureOwnerToken } from '../src/owner-token.ts';
 import { OutboundMessageStore, renderMessage, templateFor, type OutboundMessage } from '../src/outbound-messages.ts';
 import { taskBrief } from '../src/dispatcher/brief.ts';
 import { wake } from '../src/dispatcher/prompts.ts';
-import { goalTemplate } from '../src/flows.ts';
 import { scrubEnv } from '../plugin/server/scrub.ts';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 
@@ -30,16 +29,6 @@ test('report_blocker entries route only to owner', () => {
   expect(sidecar).toContain('args.to === "owner" ? "owner" : "owner"');
   const mcp = readFileSync(join(import.meta.dir, '..', 'src/mcp/server.ts'), 'utf8');
   expect(mcp).toContain("to: z.enum(['owner'])");
-});
-
-test('goal template never generates a gm task', () => {
-  for (const pipeline of ['software', 'video', 'story'] as const) {
-    const template = goalTemplate('quick', 't', '需求', 'g', pipeline);
-    expect(template.tasks).toHaveLength(1);
-    expect(JSON.stringify(template.tasks)).not.toContain('"gm"');
-  }
-  const seed = readFileSync(join(import.meta.dir, '..', 'src/seed.ts'), 'utf8');
-  expect(seed).not.toContain("'gm'");
 });
 
 test('task.md contains only title, requirement and acceptance criteria', () => {
@@ -74,21 +63,13 @@ test('template bodies are the exact minimal sentences', () => {
   expect(templateFor('eval')).toContain('agents/eval.md');
 });
 
-test('renderMessage names the task machine criterion and falls back to the deploy baseline', () => {
+test('the code template instructs a sha submit and resolves absolute paths', () => {
   const opts = { sckBin: '/bin/sck', commDir: '/c', taskId: 't1' };
   const body = templateFor('execute', true);
-  expect(body).toContain('"acId":"{acId}"');
-  const named = renderMessage(body, { ...opts, acId: 'AC-BASE-DEPLOY-1' });
-  expect(named).toContain('"acId":"AC-BASE-DEPLOY-1"');
-  expect(named).not.toContain('{acId}');
-  // A custom criterion id is what the employee is told to record.
-  expect(renderMessage(body, { ...opts, acId: 'AC-9' })).toContain('"acId":"AC-9"');
-  // No criteria on the row: the baseline id stays usable, never a literal placeholder.
-  const fallback = renderMessage(body, opts);
-  expect(fallback).toContain('"acId":"AC-BASE-DEPLOY-1"');
-  expect(fallback).not.toContain('{acId}');
-  // Rework carries the same placeholder.
-  expect(renderMessage(templateFor('rework', true), { ...opts, acId: 'AC-R' })).toContain('"acId":"AC-R"');
+  expect(body).toContain('"sha":"<合入提交>"');
+  expect(renderMessage(body, opts)).toContain("'/bin/sck' call submit");
+  // Rework prefixes the same instruction with the findings repair step.
+  expect(renderMessage(templateFor('rework', true), { ...opts, findingsFile: '/f/round-1.md' })).toContain('round-1.md');
 });
 
 test('machineCriterionId reads the first required machine criterion and falls back when absent', async () => {

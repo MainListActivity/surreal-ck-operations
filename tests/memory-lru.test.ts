@@ -7,7 +7,7 @@ const inst=(id:string,since?:number):EmployeeInst=>({id,role:'engineering',paseo
 function world(instances:EmployeeInst[]){
  const states=new Map(instances.map(i=>[i.id,'idle'])),closed:string[]=[],released:string[]=[],reserved:string[]=[];
  const tasks:SupervisedTask[]=[],wakes:any[]=[];let status='idle',permissions=0,unreadable=false,failClose=false;
- const wf={insts:async()=>instances,tasks:async()=>tasks,openManagerWakes:async()=>{if(unreadable)throw Error('unreadable');return wakes},confirmRuntimeSleep:async()=>true,reserveRuntimeSleep:async(i:EmployeeInst)=>{reserved.push(i.id);return true},releaseRuntimeSleep:async(id:string)=>{released.push(id)}} as unknown as Workforce;
+ const wf={insts:async()=>instances,tasks:async()=>tasks,openPendingWakes:async()=>{if(unreadable)throw Error('unreadable');return wakes},confirmRuntimeSleep:async()=>true,reserveRuntimeSleep:async(i:EmployeeInst)=>{reserved.push(i.id);return true},releaseRuntimeSleep:async(id:string)=>{released.push(id)}} as unknown as Workforce;
  const paseo={status:async(id:string)=>({status:closed.includes(id)?'closed':status,pendingPermissions:permissions}),sleep:async(id:string)=>{if(failClose)throw Error('timeout');closed.push(id)}};
  return {instances,states,closed,released,reserved,tasks,wakes,paseo,wf,setStatus:(s:string,p=0)=>{status=s;permissions=p},setUnreadable:()=>{unreadable=true},setFail:()=>{failClose=true},run:()=>reclaimMemoryLru({instances,states,now:10000,workforce:wf,paseo,log:()=>{}})};
 }

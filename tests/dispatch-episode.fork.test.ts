@@ -158,71 +158,6 @@ run('B2 (SYS-DISP AC03/AC06): ten real ticks with a restart in the middle keep o
   }
 }, 120000);
 
-run('B3 (SYS-DISP AC06) (b)(c): an unreadable audit history is unknown, never busy and never dispatched; once it reads again the next tick clears the notice with a dispatch_unblocked row', async () => {
-  const w = await startFork('b3-audit');
-  try {
-    await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
-    const task = await w.core.createTask(w.gm, { title: 'B3 unreadable audit history', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'owner', idempotencyKey: 'b3-audit-create' });
-    const key = `dispatch-blocked:${task.id}:execute`;
-    // Injected failure at the database handle: only the contribution-history read of this task fails. Other queries run unchanged.
-    let failing = true;
-    w.db.db.query = ((sql: string, vars?: Record<string, unknown>) => {
-      const target = vars?.task;
-      if (failing && sql.includes('action IN $actions') && target instanceof RecordId && String(target.id) === task.id) {
-        throw new Error('injected audit read failure');
-      }
-      return w.rawQuery(sql as never, vars as never);
-    }) as unknown as typeof w.db.db.query;
-
-    const first = w.newDispatcher();
-    const firstReport = await first.tick();
-    const firstVerdict = w.verdictOf(first, task.id);
-    console.log('B3(b) verdict', JSON.stringify(firstVerdict));
-    expect(firstReport.woke.filter(x => x.task === task.id)).toEqual([]);
-    expect(firstVerdict?.reasons.map(r => r.code)).toEqual(['unknown']);
-    expect(firstVerdict?.dispatchable).toBe(false);
-    expect(firstVerdict?.feasible).toBe(false);
-    expect(firstReport.notices).toContain(key);
-    const open1 = await w.noticeRows(`dispatch-blocked:${task.id}:`);
-    expect(open1.map(r => r.key)).toEqual([key]);
-    expect(open1[0]!.text).toContain(BLOCK_TEXT.unknown);
-    expect(open1[0]!.text).not.toContain(BLOCK_TEXT.session_busy);
-    expect(await w.wf.insts()).toEqual([]);
-    expect(await w.dispatchRows(task.id)).toEqual([]);
-    const row1 = await w.taskRow(task.id);
-    expect(row1.state).toBe('ready');
-    expect(row1.current_employee ?? null).toBeNull();
-    expect(row1.dispatch_blocked_phase).toBe('execute');
-    expect(claimsOf(await w.auditRows(task.id))).toEqual([]);
-
-    // Still unreadable on the next tick: the conclusion stays unknown and nothing is claimed.
-    const second = w.newDispatcher();
-    const secondReport = await second.tick();
-    expect(secondReport.woke.filter(x => x.task === task.id)).toEqual([]);
-    expect(w.verdictOf(second, task.id)?.reasons.map(r => r.code)).toEqual(['unknown']);
-    expect((await w.noticeRows(`dispatch-blocked:${task.id}:`)).map(r => r.key)).toEqual([key]);
-    expect(claimsOf(await w.auditRows(task.id))).toEqual([]);
-
-    // Recovery: the audit reads again, and the next tick dispatches and clears the notice.
-    failing = false;
-    const recovered = w.newDispatcher();
-    const recoveredReport = await recovered.tick();
-    console.log('B3(c) recovered woke', JSON.stringify(recoveredReport.woke));
-    expect(recoveredReport.woke.find(x => x.task === task.id)).toMatchObject({ spawned: true });
-    const open3 = await w.noticeRows(`dispatch-blocked:${task.id}:`);
-    expect(open3.map(r => r.key)).toEqual([key]);
-    expect(open3[0]!.resolved_at).toBeTruthy();
-    expect((await w.owner.openNotices()).some(n => n.key === key)).toBe(false);
-    const unblocked = (await w.auditRows(task.id)).filter(r => r.action === 'dispatch_unblocked');
-    expect(unblocked).toHaveLength(1);
-    expect(unblocked[0]!.evidence).toBe('dispatch-blocked execute episode ended: dispatched');
-    expect((await w.taskRow(task.id)).dispatch_blocked_phase ?? null).toBeNull();
-    expect(claimsOf(await w.auditRows(task.id))).toHaveLength(1);
-  } finally {
-    await w.close();
-  }
-}, 120000);
-
 run('B3 (SYS-DISP AC06) (a): a session the tick cannot observe is unknown, never busy and never dispatched; recovery resumes the bound task and clears the notice', async () => {
   const w = await startFork('b3-observe');
   try {
@@ -249,12 +184,15 @@ run('B3 (SYS-DISP AC06) (a): a session the tick cannot observe is unknown, never
     expect(second.retired).toEqual([]);
     expect((await w.wf.insts()).map(i => i.id)).toEqual([A.id]);
     expect(claimsOf(await w.auditRows(task.id))).toHaveLength(1);
-    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'ready', implementer: A.id });
-    expect(verdict).toMatchObject({ dispatchable: false, feasible: false });
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'ready' });
+    expect(verdict).toMatchObject({ dispatchable: false, feasible: true });
     expect(verdict?.reasons.map(r => r.code)).toContain('unknown');
     expect(verdict?.reasons.map(r => r.code)).not.toContain('session_busy');
-    // Unknown is material at once: the owner notice opens in this pass and names the unknown state.
-    expect(second.notices).toContain(key);
+    // A feasible unknown block becomes an owner notice once the episode ages past the grace; backdate it and re-tick.
+    expect(second.notices).not.toContain(key);
+    await w.wf.setDispatchBlock(task.id, 'execute', Math.floor(Date.now() / 1000) - 600);
+    const third = await w.newDispatcher().tick();
+    expect(third.notices).toContain(key);
     const open = await w.noticeRows(`dispatch-blocked:${task.id}:`);
     expect(open.map(r => r.key)).toEqual([key]);
     expect(open[0]!.resolved_at).toBeFalsy();
@@ -264,7 +202,7 @@ run('B3 (SYS-DISP AC06) (a): a session the tick cannot observe is unknown, never
     w.hidden.delete(A.paseoAgentId!);
     const recovered = await w.newDispatcher().tick();
     expect(recovered.woke.find(x => x.task === task.id)).toMatchObject({ employee: A.id, spawned: false });
-    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'doing', currentEmployee: A.id, implementer: A.id });
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'doing', currentEmployee: A.id });
     expect((await w.owner.openNotices()).some(n => n.key === key)).toBe(false);
     const unblocked = (await w.auditRows(task.id)).filter(r => r.action === 'dispatch_unblocked');
     expect(unblocked).toHaveLength(1);

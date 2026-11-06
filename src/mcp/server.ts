@@ -1,4 +1,3 @@
-import { executionWindowSchema, recoveryReasonSchema } from '../task-recovery.ts';
 import { basename } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { createHash, timingSafeEqual } from 'node:crypto';
@@ -26,8 +25,6 @@ const proofShape = {
 };
 const evidenceShape = {
   companyUpgrade: z.object({ sha:z.string().regex(/^[a-f0-9]{40}$/) }).strict().optional(),
-  executionWindow: executionWindowSchema.optional(),
-  recoveryReason: recoveryReasonSchema.optional(),
   text: z.string().min(1),
   idempotencyKey: z.string().min(1),
   // SYS02: the head a submission is bound to; machine evidence must match it.
@@ -73,7 +70,7 @@ function toolError(error: unknown) {
   const code = /^[a-z][a-z0-9_]{1,63}$/.test(raw) ? raw : 'internal_error';
   const retryable = code === 'temporarily_unavailable' && typeof error === 'object' && error !== null
     && 'retryable' in error && error.retryable === true;
-  // Structured reasons (independence conflicts name the task, source and employee) travel in structuredContent only; never credentials.
+  // Structured reasons travel in structuredContent only; never credentials.
   const details = typeof error === 'object' && error !== null && 'details' in error && typeof error.details === 'object' && error.details !== null
     ? error.details : undefined;
   // The message is written for the caller (CompanyError, budget refusals). Unknown errors are reported by code alone.
@@ -138,13 +135,13 @@ function registerTools(server: McpServer, core: CompanyCore) {
   const withoutNull = (value: Record<string, unknown>) =>
     Object.fromEntries(Object.entries(value).filter(([, item]) => item !== null && item !== undefined)) as never;
   server.registerTool('get_context', {
-    description: 'Show the authenticated employee and the working set of company tasks (ready, doing, review, blocked) within a 48 KiB UTF-8 response budget. Without scope, or with scope "tasks": without pageSize or cursor the answer is complete (keys principal, companyIncluded, companyRead, tasks, and company when includeCompany is true) or refused as response_too_large with retry guidance; it is never cut. With pageSize (1 to 100) or cursor it returns one stored page: continue with the same arguments plus cursor set to page.nextCursor, until page.hasMore is false. includeCompany defaults to false; companyRead names the arguments that read the company block. A task too large for one page is echoed with a long dependency list cut and flagged (listsTruncated), and a context still too large cut and flagged (contextTruncated, contextNextOffset); read_task_text returns any cut part whole. A task read by taskId is whole or refused. A blocked task carries `waiting`: kind (manager/owner/dependency), the phase it restores (`resumeState`, unknown when absent), the role that phase belongs to (a review wait names the reviewing role) and the number of dependencies (the ids stay in the task `dependencies` field). With scope "company" the answer is the company block (directions, goals, projects, paused), optionally one section; project environments (envs, credential aliases and roles) are shown only to owner and to the holder of a valid task lease, and to anyone else envs is empty with envsWithheld true; it is complete (key company) or, with pageSize or cursor, one stored page of parts (keys section, key, part, parts, offset, totalBytes, sha256, json): join the json of the parts of one section and key in part order, check the byte length and sha256 against totalBytes and sha256, then parse; continue with the same arguments plus cursor set to page.nextCursor until page.hasMore is false.',
+    description: 'Show the authenticated employee and the working set of company tasks (ready, doing, review, blocked) within a 48 KiB UTF-8 response budget. Without scope, or with scope "tasks": without pageSize or cursor the answer is complete (keys principal, companyIncluded, companyRead, tasks, and company when includeCompany is true) or refused as response_too_large with retry guidance; it is never cut. With pageSize (1 to 100) or cursor it returns one stored page: continue with the same arguments plus cursor set to page.nextCursor, until page.hasMore is false. includeCompany defaults to false; companyRead names the arguments that read the company block. A task too large for one page is echoed with a long list cut and flagged (listsTruncated), and a context still too large cut and flagged (contextTruncated, contextNextOffset); read_task_text returns any cut part whole. A task read by taskId is whole or refused. A blocked task carries `blockedTo`: the owner gate it waits on, the phase it restores (`resumeState`, unknown when absent), and the role that phase belongs to (a review wait names the reviewing role). Its chain predecessor stays in the task `parent` field. With scope "company" the answer is the company block (directions, projects, paused), optionally one section; project environments (envs, credential aliases and roles) are shown only to owner and to the holder of a valid task lease, and to anyone else envs is empty with envsWithheld true; it is complete (key company) or, with pageSize or cursor, one stored page of parts (keys section, key, part, parts, offset, totalBytes, sha256, json): join the json of the parts of one section and key in part order, check the byte length and sha256 against totalBytes and sha256, then parse; continue with the same arguments plus cursor set to page.nextCursor until page.hasMore is false.',
     inputSchema: z.object({
       scope: z.enum(['tasks', 'company']).nullish(),
-      section: z.enum(['directions', 'goals', 'projects']).nullish(),
+      section: z.enum(['directions', 'projects']).nullish(),
       taskId: z.string().min(1).max(200).nullish(),
       state: z.enum(states).nullish(),
-      goalId: z.string().min(1).max(100).nullish(),
+      tag: z.string().min(1).max(100).nullish(),
       role: z.enum(roles).nullish(),
       since: z.string().min(1).max(40).nullish(),
       includeCompany: z.boolean().nullish(),
@@ -213,14 +210,14 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.worktreeRefs(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('get_admin_summary', {
-    description: 'owner only: read-only company summary at one stated cutoffAt. tasks counts each task by the state it holds at cutoffAt (optionally for one goal; since does not apply to tasks). audit counts entries from since (default: the 24 hours before the cutoff) up to cutoffAt, limited to the tasks of the goal when goalId is given. Returns scope, outboxSequence and integrity; integrity.complete is true only for a proven consistent read, and false means retry. Never returns task text.',
-    inputSchema: z.object({ since: z.string().min(1).max(40).nullish(), goalId: z.string().min(1).max(100).nullish() }),
+    description: 'owner only: read-only company summary at one stated cutoffAt. tasks counts each task by the state it holds at cutoffAt (audit counts entries from since (default: the 24 hours before the cutoff) up to cutoffAt. Returns scope, outboxSequence and integrity; integrity.complete is true only for a proven consistent read, and false means retry. Never returns task text.',
+    inputSchema: z.object({ since: z.string().min(1).max(40).nullish(), tag: z.string().min(1).max(100).nullish() }),
   }, async (input, ctx) => run(token(ctx), () => core.adminSummary ? core.adminSummary(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('read_task_text', {
-    description: 'Read one byte segment of a task text: context, evidence (one audit entry, auditId from get_task_history), project (the project environment as JSON; the task holder or owner only), or the lists dependencies, workIntentPaths and worktreePaths as JSON arrays. A claim or heartbeat echo that cut one of them names it and its size; this reads the rest. Returns the total size and SHA-256 of the full text, so a reader can reassemble and verify. Segments never split a character. expectSha256 (from the first segment) is required on every segment past offset 0: if the text changed in between, the read is refused with conflict instead of mixing two versions.',
+    description: 'Read one byte segment of a task text: context, evidence (one audit entry, auditId from get_task_history), project (the project environment as JSON; the task holder or owner only), or the lists workIntentPaths and worktreePaths as JSON arrays. A claim or heartbeat echo that cut one of them names it and its size; this reads the rest. Returns the total size and SHA-256 of the full text, so a reader can reassemble and verify. Segments never split a character. expectSha256 (from the first segment) is required on every segment past offset 0: if the text changed in between, the read is refused with conflict instead of mixing two versions.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200),
-      field: z.enum(['context', 'evidence', 'project', 'dependencies', 'workIntentPaths', 'worktreePaths']),
+      field: z.enum(['context', 'evidence', 'project', 'workIntentPaths', 'worktreePaths']),
       auditId: z.string().min(1).max(200).nullish(),
       offset: z.number().int().min(0).max(1_000_000_000).nullish(),
       limit: z.number().int().min(4).max(24576).nullish(),
@@ -253,7 +250,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
       );
       const rank = (task: TaskView) => task.state === 'review' ? 0 : task.state === 'doing' ? 1 : 2;
       candidates.sort((a, b) => rank(a) - rank(b) || a.id.localeCompare(b.id));
-      // The core remains the sole authority for concurrent claims and dependencies.
+      // The core remains the sole authority for concurrent claims and the parent chain.
       for (const candidate of candidates) {
         try {
           return echoClaim(await core.claim(credential, candidate.id));
@@ -295,75 +292,14 @@ function registerTools(server: McpServer, core: CompanyCore) {
     nextCheckAt: z.string().min(1).optional(),
     timezone: z.string().min(1).max(80).optional(),
   };
-  server.registerTool('wait_task', {
-    description: 'Enter a typed wait and release the current lease: kind=time needs notBefore (ISO 8601 with an explicit offset); dependency/upstream_repair need referenceTaskId; owner_handoff needs completed and pendingAction. The server stores progress and schedules the release; do not sleep in the foreground.',
-    inputSchema: z.object({ ...proofShape, ...evidenceShape,
-      kind: z.enum(['time', 'dependency', 'upstream_repair', 'customer_activation', 'owner_handoff', 'feedback']),
-      ownerRole: z.string().min(1).max(60).optional(),
-      reference: z.string().max(240).optional(),
-      referenceTaskId: z.string().min(1).max(200).optional(),
-      ...waitInstants,
-      completed: z.array(z.string().min(1).max(240)).max(10).optional(),
-      pendingAction: z.string().max(600).optional(),
-      handoffFile: z.string().max(300).optional(),
-      reason: z.string().min(10).max(2000),
-      summary: z.string().max(1000).optional(),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => {
-    if (!core.wait) return Promise.reject({ code: 'temporarily_unavailable' });
-    const { taskId: _taskId, deliveryId: _deliveryId, fence: _fence, expectedVersion: _expectedVersion, ...spec } = input;
-    return core.wait(token(ctx), proof(input), evidence(input), spec as never);
-  }));
-
-  server.registerTool('resolve_wait', {
-    description: 'Resolve a wait from a trust-checked event: an authorized manager (source=authorized_person) or a signed webhook (source=webhook with provider/eventId/signature). The owner path is not callable here; owner decisions resolve owner handoffs through record_owner_decision only. Duplicate, expired and wrong-object events are refused.',
-    inputSchema: z.object({
-      waitKey: z.string().optional(), taskId: z.string().optional(),
-      source: z.enum(['authorized_person', 'webhook', 'dependency']),
-      provider: z.string().min(1).max(80).optional(), account: z.string().max(120).optional(),
-      eventId: z.string().min(1).max(200).optional(), at: z.union([z.string(), z.number()]).optional(),
-      objectWaitId: z.string().max(300).optional(), objectTaskId: z.string().max(200).optional(),
-      ownerQuote: z.string().max(2000).optional(), payloadDigest: z.string().max(200).optional(),
-      signature: z.string().max(200).optional(), text: z.string().min(20).max(30000),
-      idempotencyKey: z.string().min(1).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.resolveWait ? core.resolveWait(token(ctx), input as never) : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('cancel_wait', {
-    description: 'Owner: cancel a wait under its version with a reason. Without resume=true the task stays blocked for a human; cancelling is not the same as resolving the condition.',
-    inputSchema: z.object({ waitKey: z.string().min(1), expectedVersion: z.number().int().positive(),
-      reason: z.string().min(10).max(2000), idempotencyKey: z.string().min(1).max(200),
-      resume: z.boolean().optional() }),
-  }, async (input, ctx) => run(token(ctx), () => core.cancelWait ? core.cancelWait(token(ctx), input as never) : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('extend_wait', {
-    description: 'Owner: extend or re-arm a wait under its version with a reason. A stale version is refused; a re-armed wait keeps its task parked.',
-    inputSchema: z.object({ waitKey: z.string().min(1), expectedVersion: z.number().int().positive(),
-      reason: z.string().min(10).max(2000), idempotencyKey: z.string().min(1).max(200),
-      ...waitInstants }),
-  }, async (input, ctx) => run(token(ctx), () => core.extendWait ? core.extendWait(token(ctx), input as never) : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('list_task_waits', {
-    description: 'Read waits (internal facts, no credentials): by task, by state, or the newest open ones. owner/QA use this to audit concurrency and release once-ness.',
-    inputSchema: z.object({ taskId: z.string().optional(), state: z.enum(['waiting', 'released', 'held', 'expired', 'cancelled', 'superseded']).optional(), limit: z.number().int().min(1).max(100).optional() }),
-  }, async (input, ctx) => run(token(ctx), () => core.listWaits ? core.listWaits(token(ctx), input as never) : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('wait_handoff_cards', {
-    description: 'Owner: handoff cards for waits owned by the boss. Each names completed items, the pending action, who waits for whom, the exact expiry or unknown, and the allowed next triggers.',
-    inputSchema: z.object({}),
-  }, async (_input, ctx) => run(token(ctx), () => core.waitHandoffCards ? core.waitHandoffCards(token(ctx)) : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('wait_migration_preview', {
-    description: 'Owner: read-only dry-run for legacy tasks. It never releases an owner gate and writes nothing; migration is confirmed one task at a time.',
-    inputSchema: z.object({}),
-  }, async (_input, ctx) => run(token(ctx), () => core.waitMigrationPreview ? core.waitMigrationPreview(token(ctx)) : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('wait_migration_apply', {
-    description: 'Owner: migrate exactly one legacy time-bounded task (future quota_resets_at) into a wait, under the version read. Owner gates, leased tasks and tasks without a future time bound are refused; audited.',
-    inputSchema: z.object({ taskId: z.string().min(1), expectedVersion: z.number().int().positive(),
-      reason: z.string().min(10).max(2000), idempotencyKey: z.string().min(1).max(200) }),
-  }, async (input, ctx) => run(token(ctx), () => core.waitMigrationApply ? core.waitMigrationApply(token(ctx), input as never) : Promise.reject({ code: 'temporarily_unavailable' })));
-
+  
+  
+  
+  
+  
+  
+  
+  
   server.registerTool('review', {
     description: 'Independently accept or return the current review delivery.',
     inputSchema: z.object({ ...proofShape, ...evidenceShape, decision: z.enum(['accept', 'return']) }),
@@ -372,7 +308,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : core.returnTask(token(ctx), proof(input), evidence(input))));
 
   server.registerTool('create_task', {
-    description: 'Create a managed company task; requires core manage capability. For independent verification/cleanup, pass independence:{stages:["execute"],sources:["source-task-id"],mode:"execute_handlers",reason:"why independent"} atomically; context prose does not enforce exclusions. project optionally binds this one task to a registered project (takes precedence over the goal\'s project). codeRepoPath optionally sets the code repository the worktree is allocated in (the ops repo or a registered project repo; the business project is unchanged); without it a code/release/deploy task whose context names the ops repo path under a project with another repo is bound to the ops repo at creation, so it never claims into the business repo. revises=<直接上一版任务id> creates the controlled screenplay-revision edge: product only, both drafts must be owner-reviewed screenwriter tasks on the 编剧 track (kind=task) in the same goal and project, and the target must be the unapproved chain tip whose latest submission was really rejected by the owner; the old draft voids with a supersededBy pointer and downstreams resolve to the chain tip.',
+    description: 'Create a managed company task; requires core manage capability. project optionally binds this one task to a registered project. codeRepoPath optionally sets the code repository the worktree is allocated in (the ops repo or a registered project repo); without it a code task whose context names the ops repo path under a project with another repo is bound to the ops repo at creation, so it never claims into the business repo.',
     inputSchema: z.object({
       modelTier: z.enum(['fable','opus','sonnet','haiku','high','medium','low']).optional(),
       title: z.string().min(1), context: z.string().min(1),
@@ -384,13 +320,10 @@ function registerTools(server: McpServer, core: CompanyCore) {
       // validator the sidecar reaches. Keeping them out of this schema preserves the structured
       // `invalid` result; a schema failure here would be a plain protocol error instead.
       workIntent: z.object({ kind: z.enum(['read', 'code', 'assets']), paths: z.array(z.string()).optional(), lane: z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/).optional() }).optional(),
-      kind: z.enum(['task', 'gate']).optional(), goalId: z.string().min(1).optional(),
-      independence: z.object({stages:z.array(z.enum(['execute','review'])), sources:z.array(z.string()),
-        mode:z.enum(['execute_handlers','all_handlers']),excluded:z.array(z.string()).optional(),reason:z.string()}).optional(),
-      dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
+      kind: z.enum(['task', 'gate']).optional(), tag: z.string().min(1).optional(),
+      idempotencyKey: z.string().min(1),
       acceptanceCriteria: acceptanceCriteriaShape.optional(),
       acceptanceEnvironment: z.string().regex(/^[a-z][a-z0-9._-]{0,49}$/).optional(),
-      revises: z.string().min(1).optional(),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.createTask(token(ctx), input)));
 
@@ -430,40 +363,10 @@ function registerTools(server: McpServer, core: CompanyCore) {
 
   const relayShape = { ownerQuote: z.string().min(2), idempotencyKey: z.string().min(1) };
   const tiers = ['quick', 'standard', 'program'] as const;
-  server.registerTool('create_goal', {
-    description: 'owner only: record a goal the owner gave in direct conversation. Without tier the goal waits in triage (Jev picks quick/standard/program); project links a project environment; pipeline picks the production line template (software, video or story; defaults to the project\'s line).',
-    inputSchema: z.object({ text: z.string().min(2), tier: z.enum(tiers).optional(), project: z.string().min(1).optional(), pipeline: z.enum(['software', 'video', 'story']).optional(), ...relayShape }),
-  }, async (input, ctx) => run(token(ctx), () => core.relayGoal(token(ctx), input)));
-
-  server.registerTool('goal_phase_split', {
-    description: 'owner only: close a large goal in stages. Moves the named unfinished tasks (not anchors, no live lease, not awaited by an open task that stays) into a next-phase goal created once per idempotencyKey with the same tier and project; the moved tasks join the new goal\'s first anchor, and the old goal\'s anchors stop waiting for them and unlock when nothing else is open, so the current phase can go to its acceptance. Returns the next goal id, the moved tasks and the anchors that unlocked. Audited; a refusal writes nothing.',
-    inputSchema: z.object({ goalId: z.string().min(1).max(100), taskIds: z.array(z.string().min(1).max(200)).min(1).max(200),
-      title: z.string().min(4).max(60), reason: z.string().min(4).max(4000), idempotencyKey: z.string().min(1).max(200) }),
-  }, async (input, ctx) => run(token(ctx), () => core.goalPhaseSplit
-    ? core.goalPhaseSplit(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('triage_goal', {
-    description: 'owner only: choose the flow for a goal waiting in triage. quick = one delivery chain, product acceptance closes it, owner not involved; standard = owner plans deliveries, owner G3; program = product scope proposal first, then plan, owner G3.',
-    inputSchema: z.object({ goalId: z.string().min(1), tier: z.enum(tiers), reason: z.string().min(4) }),
-  }, async (input, ctx) => run(token(ctx), () => core.triageGoal(token(ctx), input)));
-
-  server.registerTool('create_delivery', {
-    description: 'product: create the delivery chain for one code change under a goal: implement (engineering, peer review) -> release request (product or Jev decides go-live) -> merge, deploy and production verification (qa). project optionally binds all three legs to a registered project; codeRepoPath (or a spec naming the ops repo path) binds all three legs to that code repository. The three legs form one worktree lane (one tree, one branch); pass lane to put related deliveries of the same goal into the same lane, otherwise every delivery gets its own lane and runs in parallel with the others. The explicit dependencies are external input: at most 50 raw entries, each a 1-200 character task id, checked before de-duplication by the same core validator create_task uses; a refusal writes no task, audit, outbox or idempotency row.',
-    inputSchema: z.object({
-      goalId: z.string().min(1), title: z.string().min(3), spec: z.string().min(20),
-      discipline: z.string().min(1).max(60).optional(),
-      project: z.string().min(1).max(60).optional(),
-      codeRepoPath: z.string().min(1).max(1000).optional(),
-      lane: z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/).optional(),
-      // The 50-dependency limit is enforced by core.createDelivery, the same validator the sidecar
-      // reaches. Keeping it out of this schema preserves the structured `invalid` result.
-      dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
-      acceptanceCriteria: acceptanceCriteriaShape.optional(),
-      acceptanceEnvironment: z.string().regex(/^[a-z][a-z0-9._-]{0,49}$/).optional(),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.createDelivery(token(ctx), input)));
-  server.registerTool('record_acceptance_evidence', {
+  
+  
+  
+    server.registerTool('record_acceptance_evidence', {
     description: 'SYS02: record verified machine evidence for one acceptance criterion. The server reads the GitHub Actions run (or its artifact/probe) and refuses another head, real test failures, expired artifacts, out-of-window probes and unreadable sources. For generic CI only, GitHub account billing refusals with every job at zero steps are adjudicated and recorded by the server, never by an employee blocker. Model text never becomes a pass fact.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200), acId: z.string().min(1).max(50), sha: z.string().min(1).max(200),
@@ -525,24 +428,8 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.setAcceptanceGate(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
-  server.registerTool('acceptance_mapping_preview', {
-    description: 'SYS-INT, read-only: preview the versioned acceptance mapping for one task — the criteria it carries today, the registry bundle that would apply with the digest an import must echo, the per-SYS required mapping (machine source, human sign-off, RB01 coverage), and every conflict (occupied, terminal state, criteria already present, downgrade, unsupported leg). It never writes.',
-    inputSchema: z.object({ taskId: z.string().min(1).max(200) }),
-  }, async (input, ctx) => run(token(ctx), () => core.acceptanceMappingPreview
-    ? core.acceptanceMappingPreview(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('acceptance_mapping_import', {
-    description: 'SYS-INT, owner only: import one versioned acceptance-mapping bundle onto a legacy gated task. Requires the preview digest, the task expectedVersion (CAS), a reason and an idempotency key; audited. Refuses a stale digest, a downgrade or removal of required baselines, an occupied or done/void row, and a task that already carries versioned criteria. QA and executors cannot self-approve this.',
-    inputSchema: z.object({
-      taskId: z.string().min(1).max(200), mappingKey: z.string().min(3).max(60),
-      digest: z.string().regex(/^[0-9a-f]{64}$/), expectedVersion: z.number().int().positive(),
-      reason: z.string().min(10).max(2000), idempotencyKey: z.string().min(8).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.acceptanceMappingImport
-    ? core.acceptanceMappingImport(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
+  
+  
   server.registerTool('record_owner_decision', {
     description: 'owner only: record an owner decision given in direct conversation (approve/reject a gate, or reply to an owner question). Quote the owner verbatim.',
     inputSchema: z.object({
@@ -556,49 +443,11 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), async () => { await core.relayDirection(token(ctx), input); return { recorded: true }; }));
 
   server.registerTool('resume_task', {
-    description: 'owner only: resume a blocked task. For windowed operations pass executionWindow bound to a completed independent approval dependency and its immutable candidate expiry/digest. Expired windows require resampling and new approval; plain resume cannot extend them. Optionally pass standbyEmployee to assign a bounded standby holder atomically (FV06): the resume transaction writes doing + the holder lease + progress_at and standby_until = min(window notAfter, now + standby budget), allocates the registered worktree like a claim, and the holder is woken until standby_until — past it the task returns to this owner gate, never the ready pool. Every claim-grade guard (role, quota/provider, policy, independence, avoidance, dependencies, worktree registration) applies; any refusal leaves the task blocked.',
-    inputSchema: z.object({ taskId: z.string().min(1), ...evidenceShape,
-      standbyEmployee: z.string().min(1).max(200).optional() }),
-  }, async (input, ctx) => run(token(ctx), () => input.standbyEmployee && core.resumeStandby
-    ? core.resumeStandby(token(ctx), input.taskId, evidence(input), input.standbyEmployee)
-    : core.resume(token(ctx), input.taskId, evidence(input))));
+    description: 'owner only: resume a blocked task to its recorded phase (blocked rows only mean waiting on the owner now).',
+    inputSchema: z.object({ taskId: z.string().min(1), ...evidenceShape }),
+  }, async (input, ctx) => run(token(ctx), () => core.resume(token(ctx), input.taskId, evidence(input))));
 
-  server.registerTool('verify_standby', {
-    description: 'owner only (FV06 P1): read-only standby precheck. For each {taskId, employeeId, executionWindow?} pair re-evaluates every standby assignment precondition (claim-grade role/workspace/discipline/active-task/implementer-binding checks, the effective policy verdict, the independence gate, an unexpired execution window — the one you pass or the one already bound — and provider quota/health with the same source as the dispatcher) and returns per-item {ok, code}. Writes no task state and consumes no budget; each item is audited. Passing proves only this instant — never a dispatch promise: the real relay is the resume standby transaction, and in-window quota/liveness of the holder is still not guaranteed.',
-    inputSchema: z.object({
-      items: z.array(z.object({ taskId: z.string().min(1), employeeId: z.string().min(1),
-        executionWindow: executionWindowSchema.optional() })).min(1).max(20),
-      idempotencyKey: z.string().min(4).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.verifyStandby
-    ? core.verifyStandby(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('defer_task_until', {
-    description: 'owner only: turn a owner-blocked execute task, or a normal non-owner review block with a provable original submit and reviewer block, into a dependency wait — it stays blocked (no wake is sent for it), the owner-blocked flag clears, and it restores ready (execute) or review (review) when every dependency is done; with continuation=manager it returns to the owner gate instead, including when dependencies are already done. Use manager for further sampling, approval or scheduling decisions. Every prerequisite must be a real dependency task. Owner gates and unprovable review history are refused.',
-    inputSchema: z.object({
-      taskId: z.string().min(1),
-      dependencies: z.array(z.string().min(1)).min(1).max(20),
-      continuation: z.enum(['execute', 'manager']).optional(),
-      text: z.string().min(20).max(8000),
-      idempotencyKey: z.string().min(1),
-      expectedVersion: z.number().int().positive().optional(),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.deferTaskUntil(token(ctx), input)));
-
-  server.registerTool('append_dependency_prerequisites', {
-    description: 'owner only: append real prerequisites to an EXISTING execute-phase dependency wait (a task already waiting on a reference task, not an owner block). The wait reference and all existing dependencies stay; new same-goal task ids are appended and the continuation becomes manager, so when the wait and every prerequisite finish the task returns to the owner gate instead of resuming an employee. Owner gates, review-phase waits, live leases, terminal tasks, cross-goal and cyclic dependencies are refused. Version CAS and idempotent; it never resumes the task, clears faults/budgets or widens ordinary dispatch.',
-    inputSchema: z.object({
-      taskId: z.string().min(1).max(200),
-      dependencies: z.array(z.string().min(1).max(200)).min(1).max(20),
-      text: z.string().min(20).max(8000),
-      idempotencyKey: z.string().min(8).max(200),
-      expectedVersion: z.number().int().positive(),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.appendDependencyPrerequisites
-    ? core.appendDependencyPrerequisites(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
+  
   server.registerTool('retire_task', {
     description: 'product only: retire a task to the terminal void state. Releases any live lease, and blocked dependents waiting on it re-evaluate (void counts as satisfied) so downstream chains unlock. Repeating on a void task is a no-op; done tasks refuse.',
     inputSchema: z.object({
@@ -609,412 +458,31 @@ function registerTools(server: McpServer, core: CompanyCore) {
     }),
   }, async (input, ctx) => run(token(ctx), () => core.retireTask(token(ctx), input)));
 
-  server.registerTool('claim_disposition', {
-    description: 'manage only (product; owner via owner API): take this blocking episode\'s disposition claim. The episode is task + phase + start (sinceMs = the episode start in milliseconds; a owner-blocked task carries it as dispatchBlockedSince seconds in get_context, a manager todo as its episode). Exactly one manager wins: a second claim answers already_handled (with the decision that closed it) or held_by_other (with the holder and lease), never a second disposition. takeover true takes over an EXPIRED lease and requires expectedEpisodeVersion. Nothing is written to the task by claiming.',
-    inputSchema: z.object({
-      taskId: z.string().min(1).max(200),
-      phase: z.enum(['execute', 'review']),
-      sinceMs: z.number().int().min(0),
-      reason: z.string().min(4).max(2000),
-      leaseSeconds: z.number().int().min(30).max(86400).nullish(),
-      takeover: z.boolean().nullish(),
-      expectedEpisodeVersion: z.number().int().positive().nullish(),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.claimDisposition
-    ? core.claimDisposition(token(ctx), {
-      taskId: input.taskId, phase: input.phase, sinceMs: input.sinceMs, reason: input.reason,
-      leaseSeconds: input.leaseSeconds ?? undefined, takeover: input.takeover ?? undefined,
-      expectedEpisodeVersion: input.expectedEpisodeVersion ?? undefined,
-    })
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('release_disposition', {
-    description: 'Owner: hand a disposition claim back before its lease expires (the episode becomes claimable again immediately instead of waiting for the lease, and the episode version rises). Needs the claim token from claim_disposition; only the holder may release. Audited.',
-    inputSchema: z.object({
-      taskId: z.string().min(1).max(200),
-      phase: z.enum(['execute', 'review']),
-      sinceMs: z.number().int().min(0),
-      claimToken: z.string().min(8).max(200),
-      reason: z.string().min(4).max(2000),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.releaseDisposition
-    ? core.releaseDisposition(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('disposition_status', {
-    description: 'Read-only: what happened to a blocking episode. Returns the newest episode\'s claim (status claimed/decided, holder, lease, episodeVersion), the decision if any (action, businessKey, the actor, the task version it landed on and the repair task it built), the episode history for the task, whether the task still has an open episode, and how many holder notices are undelivered. A manager whose snapshot is stale reads the new decision here instead of acting on the old reminder. The claim token is returned only to the holder.',
-    inputSchema: z.object({
-      taskId: z.string().min(1).max(200),
-      phase: z.enum(['execute', 'review']).nullish(),
-      sinceMs: z.number().int().min(0).nullish(),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.dispositionStatus
-    ? core.dispositionStatus(token(ctx), { taskId: input.taskId, phase: input.phase ?? undefined, sinceMs: input.sinceMs ?? undefined })
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('decide_disposition', {
-    description: 'Owner: one episode, one decision. Records resume, defer, dependency (adds the dependencies), retire or repair (builds the repair task) behind a compare-and-set on the claim token + episodeVersion + expectedVersion (the task version you read) and an actor-independent business idempotency key, so twenty concurrent requests, a swapped employee, a restart or a replayed response all read ONE disposition and ONE repair chain. Refused for a non-holder, an expired lease, a moved version and an already handled episode; the task change, its audit row and the notification outbox land in one transaction. Requires the claim token from claim_disposition.',
-    inputSchema: z.object({
-      taskId: z.string().min(1).max(200),
-      phase: z.enum(['execute', 'review']),
-      sinceMs: z.number().int().min(0),
-      claimToken: z.string().min(8).max(200),
-      episodeVersion: z.number().int().positive(),
-      action: z.enum(['resume', 'defer', 'dependency', 'retire', 'repair']),
-      expectedVersion: z.number().int().positive(),
-      text: z.string().min(4).max(8000),
-      dependencies: z.array(z.string().min(1).max(200)).max(20).nullish(),
-      repair: z.object({
-        title: z.string().min(3).max(200),
-        context: z.string().min(1).max(20_000),
-        executorRole: z.string().min(1).max(60),
-        reviewerRole: z.string().min(1).max(60),
-        dependencies: z.array(z.string().min(1).max(200)).max(20).nullish(),
-        discipline: z.string().min(1).max(60).nullish(),
-        goalId: z.string().min(1).max(100).nullish(),
-        project: z.string().min(1).max(60).nullish(),
-        workIntent: z.object({
-          kind: z.enum(['read', 'code', 'assets']),
-          paths: z.array(z.string().min(1).max(4096)).max(50).nullish(),
-          lane: z.string().min(1).max(200).nullish(),
-        }).nullish(),
-      }).nullish(),
-      businessKey: z.string().min(8).max(200).nullish(),
-      idempotencyKey: z.string().min(8).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.decideDisposition
-    ? core.decideDisposition(token(ctx), input as never)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('holder_notices', {
-    description: 'The authenticated employee\'s own undelivered notices from the persistent outbox: a disposition decided on a task they hold (resumed / dependency wait / decided), a claim taken over or released, an external action whose result is unknown. They survive a channel reconnect or a plugin restart and are deduplicated by episode+kind+version. ack true marks the listed ids delivered (ids are the noticeKey values); a delivery failure is recorded as error on the notice and keeps it pending, and never rolls back a decision. Tools naming the same decision return it again.',
-    inputSchema: z.object({
-      ids: z.array(z.string().min(1).max(200)).max(100).nullish(),
-      ack: z.boolean().nullish(),
-      error: z.string().min(1).max(2000).nullish(),
-    }),
-  }, async (input, ctx) => run(token(ctx), async () => {
-    if (!core.dispositionNotices) throw new CompanyError('temporarily_unavailable', 'core does not expose holder_notices');
-    const pending = await core.dispositionNotices(token(ctx), input.ids ? { ids: input.ids } : undefined);
-    if (input.ack !== true) return { notices: pending };
-    if (!input.ids?.length) throw new CompanyError('invalid', 'ack requires the ids of the notices being acknowledged');
-    if (!core.ackDispositionNotices) throw new CompanyError('temporarily_unavailable', 'core does not expose holder_notices');
-    const receipt = await core.ackDispositionNotices(token(ctx), { ids: input.ids, error: input.error ?? undefined });
-    return { notices: pending, receipt };
-  }));
-
-  server.registerTool('cancel_ci_run', {
-    description: 'The controlled entry point for cancelling a CI run (AC03): a manager, or a party of the task the run belongs to (its executor/reviewer role, holder, implementer or submitter), asks through this proxy instead of calling gh by hand. Records the real internal employee, the target run, the reason and the prerequisite task version it read (prerequisiteTaskId + prerequisiteVersion, compare-and-set), then: state confirmed with the provider\'s answer, refused when the provider definitely will not cancel (no such run, already finished), or result_unknown when the outcome cannot be judged. Retry with the same actionKey is idempotent and never fires a second real cancel. The shared GitHub account is recorded as the external account, never as a person.',
-    inputSchema: z.object({
-      runId: z.string().min(1).max(100),
-      repo: z.string().min(1).max(200),
-      reason: z.string().min(8).max(2000),
-      actionKey: z.string().min(8).max(200),
-      prerequisiteTaskId: z.string().min(1).max(200).nullish(),
-      prerequisiteVersion: z.number().int().positive().nullish(),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.cancelCiRun
-    ? core.cancelCiRun(token(ctx), {
-      kind: 'ci-run-cancel', runId: input.runId, repo: input.repo, reason: input.reason, actionKey: input.actionKey,
-      prerequisiteTaskId: input.prerequisiteTaskId ?? undefined, prerequisiteVersion: input.prerequisiteVersion ?? undefined,
-    })
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('reconcile_ci_runs', {
-    description: 'Read-only reconciliation of provider-side CI run state against the recorded controlled actions (AC03). For each run it reads what the provider says now; a run whose external change none of our records asked for is written as an out-of-band record with attribution unknown_actor and a null requester, never as an internal employee. A run nobody requested cannot be made to look like an internal action by this tool. Unreadable runs are named in `unreadable` instead of guessed at.',
-    inputSchema: z.object({
-      runs: z.array(z.object({ repo: z.string().min(1).max(200), runId: z.string().min(1).max(100) })).min(1).max(50),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.reconcileCiRuns
-    ? core.reconcileCiRuns(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('attribute_ci_run', {
-    description: 'owner only: attach manager-supplied evidence to an out-of-band external action and name the real internal employee it is attributed to (attribute_ci_run is never called by the person being attributed). Requires an evidence text of at least 20 characters, kept verbatim on the record and in the audit row; until then the record stays unknown_actor. Never converts an unknown actor into an internal one without evidence.',
-    inputSchema: z.object({
-      actionKey: z.string().min(8).max(200),
-      employeeId: z.string().min(1).max(200),
-      evidence: z.string().min(20).max(4000),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.attributeCiRun
-    ? core.attributeCiRun(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('list_external_actions', {
-    description: 'Read-only: the recorded controlled external actions with their state (requested / result_unknown / confirmed / refused), the real internal requester, the provider account, the prerequisite task and version, and the attribution (internal_employee or unknown_actor with its evidence). A manager reads every record; anyone else reads only the actions they requested themselves.',
-    inputSchema: z.object({
-      actionKey: z.string().min(1).max(200).nullish(),
-      state: z.enum(['requested', 'result_unknown', 'confirmed', 'refused']).nullish(),
-      limit: z.number().int().min(1).max(200).nullish(),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.listExternalActions
-    ? core.listExternalActions(token(ctx), { actionKey: input.actionKey ?? undefined, state: input.state ?? undefined, limit: input.limit ?? undefined })
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('goal_acceptance_preview', {
-    description: 'owner only (manage): read-only dry-run for repointing a quick/software goal whose manual/acceptance reference still points at an erroneously voided acceptance task. Returns the live references, the unfinished goal work, the candidate checks and the snapshot hash that goal_acceptance_repair must echo. Writes nothing.',
-    inputSchema: z.object({ goalId: z.string().min(1).max(100), candidateTaskId: z.string().min(1).max(200).optional() }),
-  }, async (input, ctx) => run(token(ctx), () => core.goalAcceptancePreview
-    ? core.goalAcceptancePreview(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('goal_acceptance_repair', {
-    description: 'owner only (manage): commit the acceptance reference repair in one audited compare-and-set transaction. Repoints manual/acceptance and anchors from the expected void task to a blocked product→owner candidate that depends on all unfinished goal work. Needs the snapshotHash from goal_acceptance_preview, a reason and an idempotencyKey; the same key with the same payload returns the original result. The repairing owner cannot claim, accept, return or block the repaired candidate; the assigned reviewer of the candidate must review it.',
-    inputSchema: z.object({
-      goalId: z.string().min(1).max(100),
-      expectedOldTaskId: z.string().min(1).max(200),
-      candidateTaskId: z.string().min(1).max(200),
-      snapshotHash: z.string().regex(/^[0-9a-f]{64}$/),
-      text: z.string().min(4).max(8000),
-      idempotencyKey: z.string().min(8).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.goalAcceptanceRepair
-    ? core.goalAcceptanceRepair(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('goal_console', {
-    description: 'owner only, read-only: one paged goal console. Each goal carries deadline (exact or unknown, never computed), outcome contract and required evidence, stages (implementation/release/production QA/customer activation/adoption/owner final), every open blocker with responsible role/holder/wait duration/next trigger/dependency path, effective final gate and its evidence, and the source task ids plus a taskTotal. Dependency edges that leave the goal are resolved against the whole task table: one that exists in another goal is crossGoal (with that goal and the task state), one that exists in no goal is unscoped external work, and only a row found nowhere is dangling. Blocker, source-id and graph lists are capped with omitted counts; use get_context with goalId for the full paged task list. Continue with page.nextCursor while page.hasMore. Pages are deterministic and never write.',
-    inputSchema: z.object({
-      goalId: z.string().min(1).max(100).nullish(),
-      includeClosed: z.boolean().nullish(),
-      needsRepairOnly: z.boolean().nullish(),
-      ...pageArgs,
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.goalConsole
-    ? core.goalConsole(token(ctx), withoutNull(input))
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('goal_governance_scan', {
-    description: 'owner only, read-only dry-run: scan active, needs_repair and done goals for a missing/void/superseded final gate, dependency cycles, graph edges (cross-goal and unscoped external references are classified with their real state; only a dependency that exists nowhere is dangling), missing outcome contracts and missing evidence. It writes nothing, never closes/voids/approves a goal and never rewrites a historical owner decision. The scan is deterministically paged: each page fits the 48 KiB response budget and carries page.nextCursor/hasMore/total/snapshotAt plus global counts; follow nextCursor until hasMore is false to cover every goal. Cards omitted from a page are counted in truncated (and a reduced card is marked detailsOmitted, with capped graph lists counted in graphOmitted); nothing is silently dropped.',
-    inputSchema: z.object({ ...pageArgs }),
-  }, async (input, ctx) => run(token(ctx), () => core.goalGovernanceScan
-    ? core.goalGovernanceScan(token(ctx), withoutNull(input))
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('goal_metrics', {
-    description: 'owner only, read-only: business metrics for a window [from,to) with an IANA timezone. Reports goal/task cycle time, first-pass acceptance rate, repeated blocks per task+phase episode, repeated manager wakes without checkpoints/submits, and model token usage per accepted task and per goal. Actual cost is unknown unless every usage row carries a provider-billed cost; token counts are never converted into money. Denominators, exclusions, data cutoff and coverage are explicit. A window whose full answer fits the budget returns it whole; otherwise the answer is a section index (sections, window, denominators, exclusions, cutoff, coverage) and each section is read with section plus pageSize/cursor, where list-shaped sections paginate until page.hasMore is false.',
-    inputSchema: z.object({
-      from: z.string().min(1).max(40).nullish(),
-      to: z.string().min(1).max(40).nullish(),
-      timezone: z.string().min(1).max(80).nullish(),
-      goalId: z.string().min(1).max(100).nullish(),
-      section: z.enum(['cycle', 'acceptance', 'blocks', 'blocks_by_actor', 'wakes', 'usage', 'usage_by_goal',
-        'events', 'customer_evidence', 'customer_evidence_missing_activation', 'customer_evidence_missing_adoption',
-        'day_series']).nullish(),
-      ...pageArgs,
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.goalMetrics
-    ? core.goalMetrics(token(ctx), withoutNull(input))
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('goal_outcome_register', {
-    description: 'owner only (manage): register or replace a goal’s structured expected outcome, required evidence and responsible role. expectedVersion 0 creates the first contract; the current version is required for a scope change. A deadline must be an absolute instant with an offset; omitting it leaves the deadline unknown. Version-locked, audited and idempotent.',
-    inputSchema: z.object({
-      goalId: z.string().min(1).max(100),
-      expectedVersion: z.number().int().min(0),
-      expected: z.string().min(4).max(4000),
-      requiredEvidence: z.array(z.enum(['implementation','release','deploy_qa','customer_activation','customer_adoption','feedback','final_acceptance','owner_final'])).max(8),
-      responsibleRole: z.string().min(1).max(80),
-      deadline: z.string().min(1).max(40).nullish(),
-      timezone: z.string().min(1).max(80).nullish(),
-      reason: z.string().min(10).max(2000),
-      idempotencyKey: z.string().min(8).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.goalOutcomeRegister
-    ? core.goalOutcomeRegister(token(ctx), withoutNull(input) as never)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('goal_evidence_record', {
-    description: 'owner only (manage): record one immutable outcome receipt (customer activation/adoption, production QA, release or implementation record). Requires a real source and confirmedBy human/external receipt; test accounts, local test URLs and AI/model confirmers are refused. owner_final cannot be typed in: it must come from the real owner relay decision on the final gate. Audited and idempotent.',
-    inputSchema: z.object({
-      goalId: z.string().min(1).max(100),
-      kind: z.enum(['implementation','release','deploy_qa','customer_activation','customer_adoption','feedback']),
-      summary: z.string().min(4).max(2000),
-      source: z.string().min(2).max(1000),
-      confirmedBy: z.string().min(2).max(200),
-      evidenceType: z.enum(['external_receipt','production_record','manual_signoff']),
-      at: z.string().min(1).max(40).nullish(),
-      taskId: z.string().min(1).max(200).nullish(),
-      reason: z.string().min(10).max(2000),
-      idempotencyKey: z.string().min(8).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.goalEvidenceRecord
-    ? core.goalEvidenceRecord(token(ctx), withoutNull(input) as never)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('goal_finalize', {
-    description: 'owner only: re-evaluate one goal’s final gate and required evidence. Marks the goal done only when the final gate is done, an owner gate carries the real owner relay approval, and every required receipt exists; otherwise records needs_repair with the concrete reasons. It never accepts a task or substitutes for the owner decision.',
-    inputSchema: z.object({ goalId: z.string().min(1).max(100) }),
-  }, async (input, ctx) => run(token(ctx), () => core.goalFinalize
-    ? core.goalFinalize(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('goal_final_gate_preview', {
-    description: 'owner only (manage), read-only: preview replacing a goal final gate that is void, superseded or missing. Shows the current gate, candidate checks (same goal, open/unleased/unsubmitted, correct reviewer role, depends on all unfinished work, no cycle) and the snapshot hash required by goal_final_gate_repair. Writes nothing.',
-    inputSchema: z.object({ goalId: z.string().min(1).max(100), candidateTaskId: z.string().min(1).max(200).optional() }),
-  }, async (input, ctx) => run(token(ctx), () => core.goalFinalGatePreview
-    ? core.goalFinalGatePreview(token(ctx), withoutNull(input) as never)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('goal_final_gate_repair', {
-    description: 'owner only (manage): CAS repair of a goal final-gate reference to a candidate that depends on all unfinished goal work. Needs the preview snapshotHash, expected goal version and reason. Audited; never releases a lease, accepts a gate or marks the goal done. The repairing owner cannot review the candidate.',
-    inputSchema: z.object({
-      goalId: z.string().min(1).max(100),
-      candidateTaskId: z.string().min(1).max(200),
-      expectedOldTaskId: z.string().min(1).max(200).nullish(),
-      expectedGoalVersion: z.number().int().min(0),
-      snapshotHash: z.string().regex(/^[0-9a-f]{64}$/),
-      reason: z.string().min(10).max(2000),
-      idempotencyKey: z.string().min(8).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.goalFinalGateRepair
-    ? core.goalFinalGateRepair(token(ctx), withoutNull(input) as never)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('contributor_dryrun', {
-    description: 'owner only, read-only: for up to 20 tasks, who authored and reviewed each one from its audit stream, the implementer status with a suggestion that writes nothing, and the audit timeline with each row role. Use it before any implementer repair; it never changes a lease, submitter, gate or history.',
-    inputSchema: z.object({ taskIds: z.array(z.string().min(1).max(200)).min(1).max(20) }),
-  }, async (input, ctx) => run(token(ctx), () => core.contributorDryRun
-    ? core.contributorDryRun(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('implementer_takeover', {
-    description: 'owner only (manage): record a new code implementer for an execute-phase engineering task whose bound implementer cannot continue (withdrawn, departed, durable quota or runtime failure). Compare-and-set on expectedVersion. A current reviewer taking over needs a named independent replacementReviewer. Authorship is never removed; a lease held by someone else is revoked in the same write. The same idempotencyKey with the same payload returns the original result.',
-    inputSchema: z.object({
-      taskId: z.string().min(1).max(200),
-      toEmployee: z.string().min(1).max(200),
-      replacementReviewer: z.string().min(1).max(200).optional(),
-      expectedVersion: z.number().int().positive(),
-      reason: z.string().min(8).max(2000),
-      idempotencyKey: z.string().min(8).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.implementerTakeover
-    ? core.implementerTakeover(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('independence_set', {
-    description: 'Owner (manage capability) only: write a task independence policy. Contributors of the source tasks (every execute-phase handler, including a claim that never submitted; with all_handlers also the reviewers), the named employees, and anyone sharing a registered identity principal with either, may not take the task (execute) or decide it (review). A definition, provider, model, name or directory is never an identity, so its other employees stay independent (SYS-DISP Q3). Compare-and-set on expectedVersion; refused while the task is leased; a second write with the same idempotencyKey and payload returns the original result.',
-    inputSchema: z.object({
-      taskId: z.string().min(1).max(200),
-      stages: z.array(z.enum(['execute', 'review'])).min(1).max(2),
-      sources: z.array(z.string().min(1).max(200)).max(20),
-      mode: z.enum(['execute_handlers', 'all_handlers']),
-      excluded: z.array(z.string().min(1).max(200)).max(100).optional(),
-      reason: z.string().min(1).max(2048),
-      expectedVersion: z.number().int().positive(),
-      idempotencyKey: z.string().min(8).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.setIndependence
-    ? core.setIndependence(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('independence_check', {
-    description: 'qa, read-only: the formal candidate-level preflight of the independence gate. Answers whether one employee would be refused by one task independence policy at one stage: clear (the gate would admit them), conflict (it would refuse, with the same via/source/matched/role/principal and the contribution auditRef its refusal cites), unverifiable (the exclusion could not be read, so the gate fails closed — never a pass), or not_applicable (the task has no policy). The policy field echoes the registered revision, stages, mode, sources, excluded, setBy and setAt so qa can read the real values back. stage defaults to the task current phase (review while in review, else execute). Writes nothing at all: no lease, no version, no audit, no dispatch — so a done or void task is still readable. qa always; every other role is refused.',
-    inputSchema: z.object({
-      taskId: z.string().min(1).max(200),
-      employeeId: z.string().min(1).max(200),
-      stage: z.enum(['execute', 'review']).optional(),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.independenceCheck
-    ? core.independenceCheck(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('identity_principal_set', {
-    description: 'Owner (manage capability) only: register an identity principal, or set its exact employee set, under a compare-and-set. A principal is the ONLY link that makes two employeeIds one person for independence purposes: contributors of a source task, and employees a manager names, may not take (execute) or decide (review) a task, and neither may anyone who shares a registered principal with them. A definition, provider, model, name or directory never implies the link, and an unregistered link is never recognized. Requires a reason (audited); refused while any named employee holds a live lease; a second write with the same idempotencyKey and payload returns the original result.',
-    inputSchema: z.object({
-      principalId: z.string().min(1).max(200).optional(),
-      employees: z.array(z.string().min(1).max(200)).min(1).max(20),
-      reason: z.string().min(8).max(2000),
-      expectedVersion: z.number().int().positive().optional(),
-      idempotencyKey: z.string().min(8).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.setIdentityPrincipal
-    ? core.setIdentityPrincipal(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  // SYS06 有效策略层：机器策略只认受限 schema，判定只由 policy 表里的字段决定——提示词内容改不动允许/拒绝。
-  const policyPayloadSchema = z.discriminatedUnion('kind', [
-    z.object({
-      kind: z.literal('write_authority'),
-      codeRoles: z.array(z.enum(ROLES as unknown as [Role, ...Role[]])).min(0).max(64),
-      intents: z.array(z.enum(['read', 'code', 'assets'])).min(1).max(64),
-      lanes: z.array(z.string().min(1).max(80)).min(1).max(64).optional(),
-    }).catchall(z.unknown()),
-    z.object({
-      kind: z.literal('tool_scope'),
-      allowedTools: z.array(z.string().min(1).max(80)).min(1).max(64),
-      allowedAliases: z.array(z.string().min(1).max(80)).min(1).max(64),
-      newSpend: z.literal(false),
-    }).catchall(z.unknown()),
-    z.object({
-      kind: z.literal('gate'),
-      requireOwnerApproval: z.boolean(),
-      requireIndependentReviewer: z.boolean(),
-      requiredCriteriaLegs: z.array(z.enum(['implement', 'release', 'deploy'])).min(1).max(3),
-    }).catchall(z.unknown()),
-  ]);
-  const policyScopeSchema = z.enum(['company', 'project', 'goal', 'task']);
-  const policyDomainSchema = z.enum(['write_authority', 'tool_scope', 'gate']);
-
-  server.registerTool('policy_set', {
-    description: 'product (manage) or owner only: write one version of a machine policy. Three domains, each with a fixed typed payload and no free text: write_authority (codeRoles/intents/lanes), tool_scope (allowedTools/allowedAliases, newSpend must be false), gate (requireOwnerApproval/requireIndependentReviewer/requiredCriteriaLegs). Scopes are the chain task > goal > project > company; the nearest active version of a domain wins. Versions only grow and never change in place: replacing an active version requires the explicit supersedes record id, a second active version in the same scope+domain is refused, cross-scope supersede, cycles, expired targets and a forged ownerQuote are refused. source=owner needs the owner role and a quote that matches a registered owner direction. Compare-and-set on the internal policy epoch; a second call with the same idempotencyKey and payload returns the original version.',
-    inputSchema: z.object({
-      policyId: z.string().min(3).max(60), scope: policyScopeSchema, scopeRef: z.string().min(1).max(200).optional(),
-      domain: policyDomainSchema, payload: policyPayloadSchema, supersedes: z.string().min(1).max(200).optional(),
-      effectiveAt: z.string().min(4).max(40).optional(), expiresAt: z.string().min(4).max(40).optional(),
-      source: z.enum(['owner', 'manager']), ownerQuote: z.string().min(2).max(4000).optional(),
-      reason: z.string().min(2).max(4000), idempotencyKey: z.string().min(8).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.policySet
-    ? core.policySet(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('policy_revoke', {
-    description: 'product (manage) or owner only: revoke the active version of a machine policy. Emergency revocation is immediate: the policy epoch moves, so the effective contract every in-flight task and lease is checked against no longer contains this authorization. The row stays as history (queryable via policy_list includeInactive); it is only no longer the authorizing version. Idempotent per (key, payload).',
-    inputSchema: z.object({ policyId: z.string().min(1).max(200), reason: z.string().min(2).max(4000), idempotencyKey: z.string().min(8).max(200) }),
-  }, async (input, ctx) => run(token(ctx), () => core.policyRevoke
-    ? core.policyRevoke(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('policy_list', {
-    description: 'product (manage) or owner only, read-only: list machine policy versions. By default only versions that are currently active (not superseded, not revoked); includeInactive adds the full history, so an active version A that was explicitly superseded by B is still queryable after B takes over. Every row carries the scope, domain, typed payload, authorization source and owner quote, effective/expiry times and content hash.',
-    inputSchema: z.object({ scope: policyScopeSchema.optional(), scopeRef: z.string().min(1).max(200).optional(),
-      domain: policyDomainSchema.optional(), includeInactive: z.boolean().optional() }),
-  }, async (input, ctx) => run(token(ctx), () => core.policyList
-    ? core.policyList(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('policy_effective', {
-    description: 'Read-only: the effective policy contract for a task, a goal/project scope, or an explicit scope chain. Returns the version, the content hash, the chain, the per-domain winning versions, the rendered contract text a prompt is allowed to carry, and human notes about what expired/was superseded. Machine allow/deny never depends on prompt text: the same call answers the same verdict with any prompt. Task access is limited to the task roles plus product/qa/eval; goal/project/chain views are manager-only.',
-    inputSchema: z.object({ taskId: z.string().min(1).max(200).optional(), goal: z.string().min(1).max(200).optional(),
-      project: z.string().min(1).max(200).optional(),
-      scopeChain: z.array(z.object({ scope: policyScopeSchema, scopeRef: z.string().min(1).max(200).optional() })).min(1).max(8).optional() }),
-  }, async (input, ctx) => run(token(ctx), () => core.policyEffective
-    ? core.policyEffective(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('policy_plan', {
-    description: 'product (manage) or owner only, read-only dry run: exactly the validation policy_set will run, plus what the change would do. Returns the before/after contracts, the per-domain diff, and the in-flight tasks whose registered contract hash would change, each flagged with whether it loses authorization. The candidate set is every in-flight task of the whole company with no policy_hash prefilter (it is not narrowed by the proposal scope), so tasks that predate the policy layer and carry no registration at all are listed too — they are exactly the ones a rollback to a release that does not execute policies would dispatch. affectedTasks is one page: page.total is the whole affected count, page.hasMore says whether more remain, and page.nextCursor continues them (pass it back as cursor with the same proposal); planHash covers the whole list (and the epoch) and is constant across pages; it is for cursor binding and human cross-checking, not a token policy_enforce consumes. Enforcement re-judges every task you name against the policy in force at that moment, so a named task that is still authorized is left alone and one that lost authorization is quarantined — but it only touches the ids you pass, so whatever appeared in flight after this plan was taken is not covered: re-run the plan before enforcing if the in-flight set may have moved. scanned, scanLimit and truncated report the database scan itself: truncated=true means the candidate set itself was cut (the scan reads newest first and pages by (created_at, id), so a concurrent create or completion cannot make it skip or repeat a row, while what a cut leaves out is the oldest in-flight work) and the plan is not complete — no argument narrows the candidate set, so this tool cannot produce the complete list in that case. Writes no policy and no task state; it does create its cursor signing key once, on first use.',
-    inputSchema: z.object({
-      policyId: z.string().min(3).max(60), scope: policyScopeSchema, scopeRef: z.string().min(1).max(200).optional(),
-      domain: policyDomainSchema, payload: policyPayloadSchema, supersedes: z.string().min(1).max(200).optional(),
-      effectiveAt: z.string().min(4).max(40).optional(), expiresAt: z.string().min(4).max(40).optional(),
-      source: z.enum(['owner', 'manager']), ownerQuote: z.string().min(2).max(4000).optional(),
-      pageSize: z.number().int().min(1).max(200).optional(), cursor: z.string().min(1).max(2000).optional(),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.policyPlan
-    ? core.policyPlan(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('policy_enforce', {
-    description: 'product (manage) or owner only: isolate the in-flight tasks that policy_plan reported as losing authorization (RB01). Each named task is set to blocked with blocked_to=owner, its lease is released and the reason is recorded on the task, so every release — including an older one that knows nothing about policies — sees a waiting-on-owner task and never dispatches it. Tasks that are already closed or still authorized are reported instead of being touched. Audited per task; refuses an empty list. A call is limited to 200 task ids, while policy_plan pages through the whole list: read every page of the plan, then enforce its ids in batches of at most 200.',
-    inputSchema: z.object({ taskIds: z.array(z.string().min(1).max(200)).min(1).max(200).optional(),
-      reason: z.string().min(2).max(4000), idempotencyKey: z.string().min(8).max(200) }),
-  }, async (input, ctx) => run(token(ctx), () => core.policyEnforce
-    ? core.policyEnforce(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('task_project_update', {
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+server.registerTool('task_project_update', {
     description: 'owner only: rebind a blocked, un-leased, never-submitted task to a registered project (task-level override over goal.project). Version-guarded, idempotent, audited; releases the stale worktree assignment through the normal lifecycle. Refuses doing/review/done tasks, active leases, submitted results and owner-blocked tasks.',
     inputSchema: z.object({
       taskId: z.string().min(1), project: z.string().min(1).max(60),
@@ -1024,40 +492,9 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.taskProjectUpdate(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
-  server.registerTool('bind_task_code_repo', {
-    description: 'owner only: bind an explicit code repository to a blocked execute-phase task (blocked_to=owner or a formal dependency wait; owner gates and review-phase blocks refuse). Only workspace allocation and dispatch repoHome/cwd follow the binding — the business project (opsScope/claim.json.project) is untouched. Targets are limited to the ops repo or a registered project repo_path, canonicalised (symlink/traversal escapes and unregistered paths refuse). Version-guarded, idempotent, audited; releases the stale worktree assignment through the normal lifecycle.',
-    inputSchema: z.object({
-      taskId: z.string().min(1), codeRepoPath: z.string().min(1).max(1000),
-      expectedVersion: z.number().int().positive(), ...evidenceShape,
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.bindTaskCodeRepo
-    ? core.bindTaskCodeRepo(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('task_intent_update', {
-    description: 'owner only: turn a blocked read-only engineering task (kind=task, blocked_to=owner or a dependency wait) into a code task in place, optionally naming its lane, instead of retiring it and creating a new code task. Owner gates, review-phase blocks, live leases and release/deploy legs refuse. Write authority is re-judged under the task policy; the implement-leg baseline acceptance criteria are merged while the gate is on; the read worktree assignment is released so the next claim gets an exclusive code tree. Version-guarded, idempotent, audited.',
-    inputSchema: z.object({
-      taskId: z.string().min(1), lane: z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/).optional(),
-      expectedVersion: z.number().int().positive(), ...evidenceShape,
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.taskIntentUpdate
-    ? core.taskIntentUpdate(token(ctx), input)
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
-  server.registerTool('task_acceptance_amend', {
-    description: 'owner only (manage): append the boss\'s acceptance-requirement amendment to an in-flight task (ready/doing/review/blocked; done/void refuse). Append-only — state, blocked_to/resume_*, dependencies, acceptance criteria, independence, worktree and the lease (holder, delivery, fence, expiry) are untouched, and the task version does not move, so a live lease keeps working. The amendment is appended to the task context (visible on the next claim and through read_task_text field=context; the amended context is capped at 20000 characters, the same limit as create), the audit row keeps a JSON evidence with the verbatim ownerQuote, and every employee in notify (default: current lease holder + implementer + latest submitter; an explicit [] notifies nobody) gets a persistent holder_notices entry that the sidecar also attaches to its next call. Version-guarded (expectedVersion), idempotent.',
-    inputSchema: z.object({
-      taskId: z.string().min(1).max(200),
-      expectedVersion: z.number().int().positive(),
-      ownerQuote: z.string().min(1).max(4000),
-      text: z.string().min(4).max(4000),
-      notify: z.array(z.string().min(1).max(200)).max(20).nullish(),
-      idempotencyKey: z.string().min(8).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.taskAcceptanceAmend
-    ? core.taskAcceptanceAmend(token(ctx), { ...input, notify: input.notify ?? undefined })
-    : Promise.reject({ code: 'temporarily_unavailable' })));
-
+  
+  
+  
   server.registerTool('get_model_evidence', {
     description:'eval/owner only: actual models and execution fences for final task evaluation. Combine with full submission/return/accept history; request counts are not quality scores.',
     inputSchema:z.object({taskId:z.string().min(1).max(200)}),
@@ -1097,156 +534,9 @@ function registerTools(server: McpServer, core: CompanyCore) {
     const release = qaRelease();
     return (release ? { ...value, meta: { ...value.meta, runtimeRelease: release } } : value) as T;
   };
-  server.registerTool('qa_observation_grant', {
-    description: 'owner only (manage): register a time-bounded, read-only QA observation scope. It binds one deployment task in QA review, its live review lease holder and fence, the same goal, an allowlist of subject task ids, an expiry (1 minute to 24 hours), a reason and an idempotency key. The scope cannot expand itself, read other goals, or expose SQL/files. The same key with the same payload returns the original scope; a different payload is a conflict.',
-    inputSchema: z.object({
-      goalId: z.string().min(1).max(100), deploymentTaskId: z.string().min(1).max(200),
-      qaEmployee: z.string().min(1).max(200), leaseFence: z.number().int().positive(),
-      subjects: z.array(z.string().min(1).max(200)).min(1).max(50),
-      expiresAt: z.string().min(10).max(40), reason: z.string().min(8).max(2000),
-      idempotencyKey: z.string().min(8).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.qaObservationGrant
-    ? core.qaObservationGrant(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
-  server.registerTool('qa_observation_revoke', {
-    description: 'owner only (manage): revoke a QA observation scope with compare-and-set on its version. The revoked scope fails closed on the QA side immediately; the same idempotency key with the same payload returns the original result.',
-    inputSchema: z.object({ scopeId: z.string().min(1).max(200), expectedVersion: z.number().int().positive(),
-      reason: z.string().min(8).max(2000), idempotencyKey: z.string().min(8).max(200) }),
-  }, async (input, ctx) => run(token(ctx), () => core.qaObservationRevoke
-    ? core.qaObservationRevoke(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
-  // ---- SYS-INT 评审协同的持久事件唤醒 ----
+      // ---- SYS-INT 评审协同的持久事件唤醒 ----
   // 只做调度协调：订阅登记与结构化信号都只解除协同任务自己的 SYS05 feedback 等待，不生成 scope、不写验收。
-  server.registerTool('review_watch_register', {
-    description: 'owner only (manage): register the one persistent watch of an ordered same-goal pair (source task reviewed by qa, collaboration task). Registration reads the current source state immediately, so a QA review lease or a structured request that already happened is delivered instead of lost. eventKinds defaults to authorization+positive. Re-registering the same pair re-opens the same watch; a different eventKinds set is refused. Idempotent by key.',
-    inputSchema: z.object({
-      sourceTaskId: z.string().min(1).max(200), collaborationTaskId: z.string().min(1).max(200),
-      eventKinds: z.array(z.enum(['authorization', 'positive'])).min(1).max(2).optional(),
-      reason: z.string().min(8).max(2000), idempotencyKey: z.string().min(8).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.reviewWatchRegister
-    ? core.reviewWatchRegister(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
-  server.registerTool('review_watch_close', {
-    description: 'owner only (manage): close a watch under its version. Undelivered events are invalidated and never replayed. Closing grants nothing and changes no task.',
-    inputSchema: z.object({
-      watchId: z.string().min(1).max(200), expectedVersion: z.number().int().positive(),
-      reason: z.string().min(8).max(2000), idempotencyKey: z.string().min(8).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.reviewWatchClose
-    ? core.reviewWatchClose(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
-  server.registerTool('review_watch_status', {
-    description: 'owner sees every review watch, a qa employee the watches of tasks it reviews. Read-only: current source lease facts, the latest structured signal, and the event deliveries with their codes. Never returns task text.',
-    inputSchema: z.object({ watchId: z.string().max(200).optional(), sourceTaskId: z.string().max(200).optional(),
-      collaborationTaskId: z.string().max(200).optional() }),
-  }, async (input, ctx) => run(token(ctx), () => core.reviewWatchStatus
-    ? core.reviewWatchStatus(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
-  server.registerTool('qa_review_scope_signal', {
-    description: 'qa only, from the live review lease holder (phase=review, reviewerRole=qa, currentEmployee/fence/live lease checked, never the author): a structured scope request (kind=request, wakes the collaboration task once) or its withdrawal after positive evidence (kind=retract with positiveReady=true, wakes once more). Subjects are exact same-goal task ids the qa did not author; no task text, no credentials. It grants no scope and signs no acceptance — checkpoint text alone cannot do this.',
-    inputSchema: z.object({
-      taskId: z.string().min(1).max(200), fence: z.number().int().positive(),
-      kind: z.enum(['request', 'retract']),
-      subjects: z.array(z.string().min(1).max(200)).min(1).max(50),
-      positiveReady: z.boolean().optional(),
-      reason: z.string().min(8).max(2000), idempotencyKey: z.string().min(8).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.qaReviewScopeSignal
-    ? core.qaReviewScopeSignal(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
-  server.registerTool('review_scope_signals', {
-    description: 'Read-only structured scope signals: owner sees all, a qa employee sees its own. Task ids and reasons only, never task text.',
-    inputSchema: z.object({ taskId: z.string().max(200).optional(), limit: z.number().int().min(1).max(50).optional() }),
-  }, async (input, ctx) => run(token(ctx), () => core.reviewScopeSignals
-    ? core.reviewScopeSignals(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
-  server.registerTool('fault_status', {
-    description: 'Read-only diagnosis of a task\'s recovery budget: scopes (attempts/deadline/nextAllowedAt/lastErrno), episodes, and any open repair chain. Readable by the task holder, its reviewer, or owner. Secret-free: never returns credentials, upstream bodies, or aliases beyond what the ledger already stored. Use this when ops_login (or another ops tool) is refused with recovery budget spent / deadline passed, so the next attempt is planned against real counters instead of guessed.',
-    inputSchema: z.object({ taskId: z.string().min(1).max(200) }),
-  }, async (input, ctx) => run(token(ctx), () => core.faultStatus
-    ? core.faultStatus(token(ctx), { taskId: input.taskId }) : Promise.reject({ code: 'temporarily_unavailable' })));
-  server.registerTool('fault_lift', {
-    description: 'owner only: lift a spent (or stopped) recovery budget for one incident of a task after the cause is fixed or a diagnosis has been recorded. Resets the existing scope so the next attempt starts a fresh recovery window. Creates no new budget and never invents an incident. Audited. Pass the incident from fault_status.',
-    inputSchema: z.object({
-      taskId: z.string().min(1).max(200),
-      incident: z.string().min(1).max(500),
-      reason: z.string().min(4).max(2000),
-      idempotencyKey: z.string().min(1).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.faultLift
-    ? core.faultLift(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
-  server.registerTool('recovery_read_grant', {
-    description: 'owner only: issue a one-shot recovery read grant for a terminal (done) source task that already has a fault episode. The named employee — never the issuer — may run exactly one LCA04_OPS operator login, the four fixed GETs in order and a necessary logout, all charged to the source task\'s own fault keys. The grant changes no task state, creates no budget and lifts none. Pass the four paths exactly (paths is required); expiresAt is 1–30 minutes. Audited.',
-    inputSchema: z.object({
-      taskId: z.string().min(1).max(200),
-      employeeId: z.string().min(1).max(120),
-      alias: z.literal('LCA04_OPS'),
-      paths: z.array(z.string().min(1).max(2000)).length(4),
-      expiresAt: z.string().min(1).max(100),
-      authorizationTask: z.string().min(1).max(200),
-      reason: z.string().min(4).max(2000),
-      idempotencyKey: z.string().min(1).max(200),
-      rearm: z.boolean().optional(),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.recoveryReadGrant
-    ? core.recoveryReadGrant(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
-  server.registerTool('recovery_read_grant_revoke', {
-    description: 'owner only: revoke a recovery read grant. The channel closes the binding on its next check and drops only that grant\'s local session handles; the source task stays done. Audited.',
-    inputSchema: z.object({
-      grantId: z.string().min(1).max(200),
-      reason: z.string().min(4).max(2000),
-      idempotencyKey: z.string().min(1).max(200),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.recoveryReadGrantRevoke
-    ? core.recoveryReadGrantRevoke(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
-  server.registerTool('recovery_read_status', {
-    description: 'Read-only recovery read ledger: grants and their calls (IDs, paths, statuses, outcome names, body digests) for a source task or one grant. owner sees all; the grantee and the source task\'s reviewer see their own. Never returns subject, session, token, URL or a response body.',
-    inputSchema: z.object({ taskId: z.string().min(1).max(200).optional(), grantId: z.string().min(1).max(200).optional() }),
-  }, async (input, ctx) => run(token(ctx), () => core.recoveryReadStatus
-    ? core.recoveryReadStatus(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
-  server.registerTool('qa_observation_status', {
-    description: 'owner sees every QA observation scope; a qa employee sees its own. Never returns a code, token or session hash. Read-only.',
-    inputSchema: z.object({}),
-  }, async (_input, ctx) => run(token(ctx), () => core.qaObservationStatus
-    ? core.qaObservationStatus(token(ctx)) : Promise.reject({ code: 'temporarily_unavailable' })));
-  server.registerTool('qa_observation_session', {
-    description: 'qa only: exchange the caller\'s live sck session and its active observation scope for a one-time login code for the dedicated read-only QA console (5 minutes). The code is a restricted, single-use login seam, not the employee credential and not the owner token; the console at the preview LAN /q/ page (returned as pagePath) exchanges it for an HttpOnly 30-minute read-only session. The console has no owner RPC and no write route.',
-    inputSchema: z.object({ scopeId: z.string().min(1).max(200).nullish() }),
-  }, async (input, ctx) => run(token(ctx), () => core.qaObservationSession
-    ? core.qaObservationSession(token(ctx), { ...(input.scopeId ? { scopeId: input.scopeId } : {}) }) : Promise.reject({ code: 'temporarily_unavailable' })));
-  server.registerTool('qa_observation_read', {
-    description: 'qa only (the scope must still bind the live QA review lease holder and fence): read one allowlisted subject of the scope. A task subject returns its full state (a long context is omitted and flagged, read it with qa_observation_text), contribution facts with unknown rows fail-closed, the last dispatcher pass\'s verdicts and all reasons for the task, and checkedAt/dataSource/instanceAt/runtimeRelease/scope/completeness. A goal subject returns the controlled goal summary only. Read-only; no task text of unlisted tasks is ever returned.',
-    inputSchema: z.object({ scopeId: z.string().min(1).max(200).nullish(), taskId: z.string().min(1).max(200).nullish(), goalId: z.string().min(1).max(100).nullish() }),
-  }, async (input, ctx) => run(token(ctx), async () => {
-    if (!core.qaObservationRead) return Promise.reject({ code: 'temporarily_unavailable' });
-    return withRelease(await core.qaObservationRead({ credential: token(ctx) }, {
-      ...(input.scopeId ? { scopeId: input.scopeId } : {}), ...(input.taskId ? { taskId: input.taskId } : {}),
-      ...(input.goalId ? { goalId: input.goalId } : {}),
-    }));
-  }));
-  server.registerTool('qa_observation_timeline', {
-    description: 'qa only: one stored page of an allowlisted task\'s audit history (newest-first pages, oldest-first within a page), within the 48 KiB budget. Evidence too large for a page is cut and flagged; read it whole with qa_observation_text. Continue with page.nextCursor until page.hasMore is false; a cursor is bound to the scope, task and caller.',
-    inputSchema: z.object({ scopeId: z.string().min(1).max(200).nullish(), taskId: z.string().min(1).max(200), ...pageArgs }),
-  }, async (input, ctx) => run(token(ctx), async () => {
-    if (!core.qaObservationTimeline) return Promise.reject({ code: 'temporarily_unavailable' });
-    return withRelease(await core.qaObservationTimeline({ credential: token(ctx) }, {
-      ...(input.scopeId ? { scopeId: input.scopeId } : {}), taskId: input.taskId,
-      ...(input.pageSize !== undefined && input.pageSize !== null ? { pageSize: input.pageSize } : {}),
-      ...(input.cursor ? { cursor: input.cursor } : {}),
-    }));
-  }));
-  server.registerTool('qa_observation_text', {
-    description: 'qa only: one byte segment of an allowlisted task\'s context or one audit entry\'s evidence. Returns the whole text\'s size and SHA-256; a segment past offset 0 requires expectSha256 from the first segment, so a changed text is refused instead of mixed. Segments never split a character.',
-    inputSchema: z.object({ scopeId: z.string().min(1).max(200).nullish(), taskId: z.string().min(1).max(200),
-      field: z.enum(['context', 'evidence']), auditId: z.string().min(1).max(200).nullish(),
-      offset: z.number().int().min(0).max(1_000_000_000).nullish(), limit: z.number().int().min(4).max(24576).nullish(),
-      expectSha256: z.string().regex(/^[0-9a-f]{64}$/).nullish() }),
-  }, async (input, ctx) => run(token(ctx), async () => {
-    if (!core.qaObservationText) return Promise.reject({ code: 'temporarily_unavailable' });
-    return withRelease(await core.qaObservationText({ credential: token(ctx) }, {
-      ...(input.scopeId ? { scopeId: input.scopeId } : {}), taskId: input.taskId, field: input.field,
-      ...(input.auditId ? { auditId: input.auditId } : {}),
-      ...(input.offset !== undefined && input.offset !== null ? { offset: input.offset } : {}),
-      ...(input.limit !== undefined && input.limit !== null ? { limit: input.limit } : {}),
-      ...(input.expectSha256 ? { expectSha256: input.expectSha256 } : {}),
-    }));
-  }));
-}
+                              }
 
 export function createMcpHttpService(options: McpServiceOptions) {
   const { core } = options;

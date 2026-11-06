@@ -9,7 +9,7 @@
  * Reclaim is bound to the task lifecycle, never to file mtimes:
  *   - only tasks in a terminal state (done / void) qualify, clocked from their last audit row;
  *   - a grace window keeps fresh results intact (done evidence 3d, deliverables 7d, retired work 1d);
- *   - ancestors of unfinished work stay intact (fully in normal mode, direct dependencies under pressure);
+ *   - ancestors of unfinished work stay intact (fully in normal mode, direct parents under pressure);
  *   - "trim" removes heavy files (media, archives, dependency/VCS trees) and keeps the small text
  *     trail, leaving a `.reclaimed.json` tombstone that records what went away;
  *   - under disk pressure the grace shrinks to 12h and the oldest tasks go first until free space recovers.
@@ -149,7 +149,7 @@ export function decideArtifact(candidate: ArtifactCandidate, policy: ArtifactPol
   if (candidate.state !== 'done' && candidate.state !== 'void') return skip('task-not-terminal');
   if (candidate.tombstoned) return skip('already-trimmed');
   // Unfinished work may still open what its ancestors produced. Under pressure only the direct
-  // dependencies stay protected — the transitive chain is the first thing to give.
+  // parents stay protected — the transitive chain is the first thing to give.
   if (candidate.protection === 'direct' || (candidate.protection === 'indirect' && mode === 'normal')) return skip('needed-by-open-task');
   if (!candidate.terminalAt) return skip('no-authority-clock');
   const ageMs = policy.now.getTime() - candidate.terminalAt.getTime();

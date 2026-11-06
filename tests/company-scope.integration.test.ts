@@ -79,9 +79,8 @@ async function expectRefused(promise: Promise<unknown>, code: CompanyError['code
 function expectBlock(items: ReturnType<typeof reassembleCompany>, brief: CompanyBrief) {
   expect(items.get('meta\0company')!.value).toEqual({ paused: brief.paused });
   brief.directions.forEach((direction, index) => expect(items.get(`directions\0direction-${index}`)!.value).toEqual(jsonOf(direction)));
-  for (const goal of brief.goals) expect(items.get(`goals\0${goal.id}`)!.value).toEqual(jsonOf(goal));
   for (const project of brief.projects) expect(items.get(`projects\0${project.id}`)!.value).toEqual(jsonOf(project));
-  expect(items.size).toBe(1 + brief.directions.length + brief.goals.length + brief.projects.length);
+  expect(items.size).toBe(1 + brief.directions.length + brief.projects.length);
 }
 
 /** Walks every page of one listing, each answer inside the budget, and returns the parts in the order the pages gave them. */
@@ -118,14 +117,12 @@ test('task answers leave the company block out by default, and say whether they 
 });
 
 test('the 31 KiB sample: the block pages back whole, and task answers keep it whole while it fits', async () => {
-  // The operations sample is a 30683-byte company block: long directions, goals and a project with two 2 KiB runbooks.
-  await owner.addDirection({ text: textOf(9000, '方向一 '), source: 'owner:test', key: key('dir-a') });
-  await owner.addDirection({ text: textOf(6000, '方向二 🙂 '), source: 'owner:test', key: key('dir-b') });
-  await owner.createGoal({ text: textOf(7000, '目标简报 '), source: 'owner:test', key: key('goal-a'), tier: 'standard' });
-  await owner.createGoal({ text: textOf(3000, '第二目标 '), source: 'owner:test', key: key('goal-b'), tier: 'standard' });
+  // The operations sample is an over-budget company block: long directions and a project with two 2 KiB runbooks.
+  await owner.addDirection({ text: textOf(30000, '方向一 '), source: 'owner:test', key: key('dir-a') });
+  await owner.addDirection({ text: textOf(20000, '方向二 🙂 '), source: 'owner:test', key: key('dir-b') });
   await new ProjectStore(database.db).upsert({ id: `cs-proj-a-${suffix}`, name: '样本项目', repoPath: '/fixture/cs-a', release: 'local', envs: [], runbooks: [textOf(2000, '运行手册甲 '), textOf(2000, '运行手册乙 ')] });
   const brief = await live();
-  // About 30 KiB of block is about 60 KiB of answer, so neither the task answer nor the complete company answer can carry it whole.
+  // An over-48-KiB block roughly doubles in the answer, so neither the task answer nor the complete company answer can carry it whole.
   await expectRefused(core.contextView(gm, { includeCompany: true, state: 'done' }), 'response_too_large', /pageSize/);
   await expectRefused(core.contextView(gm, { scope: 'company' }), 'response_too_large', /pageSize/);
   expectBlock(reassembleCompany(await coreWalk(4)), brief);
@@ -136,7 +133,6 @@ test('the 128 KiB sample: a block that does not fit is refused with paging guida
   await owner.addDirection({ text: unitsOf(19_000, '单方向超长 '), source: 'owner:test', key: key('dir-huge') });
   await owner.addDirection({ text: unitsOf(19_000, '第二超长方向 '), source: 'owner:test', key: key('dir-big') });
   await owner.addDirection({ text: unitsOf(15_000, '第三方向 '), source: 'owner:test', key: key('dir-third') });
-  await owner.createGoal({ text: textOf(40 * 1024, '大目标 🙂 '), source: 'owner:test', key: key('goal-big'), tier: 'standard' });
   const projects = new ProjectStore(database.db);
   for (let index = 0; index < 40; index++) {
     await projects.upsert({ id: `cs-proj-${index}-${suffix}`, name: `增长项目 ${index}`, repoPath: `/fixture/cs-${index}`, release: 'local', envs: [], runbooks: [textOf(1200, `手册 ${index} `)] });
@@ -151,9 +147,6 @@ test('the 128 KiB sample: a block that does not fit is refused with paging guida
   expect(parts.every(part => Buffer.byteLength(part.json, 'utf8') <= COMPANY_PART_BYTES)).toBe(true);
   expectBlock(reassembleCompany(parts), brief);
   // One section is read on its own; the meta part still comes with it.
-  const goals = reassembleCompany(await coreWalk(5, 'goals'));
-  expect([...goals.keys()].every(name => name.startsWith('meta\0') || name.startsWith('goals\0'))).toBe(true);
-  expect(goals.size).toBe(1 + brief.goals.length);
 });
 
 test('a company cursor is bound to its caller, its section and its scope, and an altered one is refused', async () => {

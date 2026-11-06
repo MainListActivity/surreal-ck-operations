@@ -16,10 +16,9 @@ import {
   writeFileAtomic, type CommRequest, type CommResponse,
 } from "./vendor/src/comm.ts";
 import { serviceHome } from "./env";
-import type { ActiveLease, ClaimResult, CompanyCore, Evidence, LeaseProof, RecoveryReadGrantRowView, TaskView, WorktreeAssignment, WriteScopeHolder } from "./vendor/src/contracts.ts";
-import { RECOVERY_READ_TOOLS, RECOVERY_RESERVED_ARGS } from "./vendor/src/recovery-read.ts";
+import type { ActiveLease, ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, WorktreeAssignment } from "./vendor/src/contracts.ts";
 import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workforce.ts";
-import { fitAttachedNotices, guardRelayResponse, type NoticeCut } from "./vendor/src/response-budget.ts";
+import { guardRelayResponse } from "./vendor/src/response-budget.ts";
 import { isPaged, parseReclaimInput, parseWorktreeInput, taskIdOf } from "./vendor/src/query-input.ts";
 import { arriving, SNAPSHOT_TOOLS, withinReplyCeiling } from "./vendor/src/reply-clock.ts";
 
@@ -37,78 +36,23 @@ const HEARTBEAT_MS = 60_000;
 const SWEEP_MS = 400;
 const BASE_TOOLS = [
   "get_context", "get_task_history", "list_worktrees", "reclaim_worktrees", "list_worktree_audits", "checkpoint", "submit", "review", "report_blocker",
-  // SYS05 typed waits: enter (consumes the lease), trusted-event resolve, manager cancel/extend, read-only audit/cards.
-  "wait_task", "resolve_wait", "cancel_wait", "extend_wait", "list_task_waits", "wait_handoff_cards", "wait_migration_preview", "wait_migration_apply",
-  "create_task", "create_goal", "triage_goal", "create_delivery", "goal_phase_split",
-  "record_owner_decision", "set_direction", "resume_task", "defer_task_until", "retire_task",
-  // FV06 P1: owner-only read-only standby precheck (per-item {ok, code}); writes nothing, consumes no budget.
-  "verify_standby",
-  // FV06: owner-only append of real prerequisites to an existing dependency wait; sets manager continuation, never resumes.
-  "append_dependency_prerequisites",
-  "record_score", "get_model_evidence", "get_task_cost", "heartbeat", "deliverable_publish",
+  "create_task", "resume_task", "retire_task",
+  "record_owner_decision", "set_direction", "record_score", "get_model_evidence", "get_task_cost", "heartbeat", "deliverable_publish",
   // Manage capability (owner/product) only, enforced in core; writes land in audit.
   "def_list", "def_ensure", "project_disciplines_update",
   // owner only in core (rebind a blocked task to a registered project; audited, version-guarded).
   "task_project_update",
-  // owner only in core (bind a blocked execute-phase task's code repo; audited, version-guarded).
-  "bind_task_code_repo",
-  // owner only in core (turn a blocked read-only engineering task into a code task in place; audited, version-guarded).
-  "task_intent_update",
-  // owner only in core (append the boss's acceptance-requirement amendment to an in-flight task; never touches its gates or lease).
-  "task_acceptance_amend",
-  // owner only in core (read-only acceptance-reference preview; compare-and-set repair of a quick goal's voided gate).
-  "goal_acceptance_preview", "goal_acceptance_repair",
-  // SYS07 goal governance: paged read-only console/scan/metrics, structured outcome and evidence, final-gate
-  // preview/repair and explicit re-evaluation. Core enforces owner+manage; console/scan/metrics never write.
-  "goal_console", "goal_governance_scan", "goal_metrics", "goal_outcome_register", "goal_evidence_record",
-  "goal_finalize", "goal_final_gate_preview", "goal_final_gate_repair",
   // SYS01 bounded reads: owner-only company summary and byte-segment reads of long text (core enforces both).
   "get_admin_summary", "read_task_text", "read_worktree_refs", "record_acceptance_evidence", "acceptance_status", "acceptance_gate", "set_acceptance_gate",
-  // SYS-INT mapping preview (read-only) and owner-only authorized import; core enforces both.
-  "acceptance_mapping_preview", "acceptance_mapping_import",
   // SYS-INT controlled non-production deploy drill: host-executed (the service child), never the sandbox.
   "deploy_drill_run", "deploy_drill_status",
-  // owner only in core (record a task's code implementer when the bound one cannot continue; compare-and-set, audited).
-  "implementer_takeover",
-  "qa_observation_grant", "qa_observation_revoke", "qa_observation_status", "qa_observation_session",
-  "qa_observation_read", "qa_observation_timeline", "qa_observation_text",
-  // SYS-INT 评审协同的持久事件唤醒：老板 订阅登记/关闭/只读，QA 结构化 scope 请求与撤销（core 判定角色、fence 与活租约）。
-  "review_watch_register", "review_watch_close", "review_watch_status",
-  "qa_review_scope_signal", "review_scope_signals",
-  // Manage capability (owner/product) only in core: writes a task's independence policy under a compare-and-set; audited.
-  "independence_set",
-  // Manage capability only in core: registers an identity principal (the only cross-employee identity link); audited.
-  "identity_principal_set",
-  // owner only in core (read-only dry-run of who authored and reviewed each engineering task).
-  "contributor_dryrun",
-  // owner or qa in core (read-only preflight of one candidate against a task's independence policy; writes nothing).
-  "independence_check",
-  // SYS06 effective policy layer: owner/product only in core. Set/revoke one version of a typed machine policy, read the
-  // current effective contract, dry-run a change, or isolate the in-flight tasks that lost authorization.
-  "policy_set", "policy_revoke", "policy_list", "policy_effective", "policy_plan", "policy_enforce",
-  // SYS03 老板处置账本：episode 认领/决定/释放、只读状态、持有人通知（core 判定角色与能力；产物落审计与通知 outbox）。
-  "claim_disposition", "release_disposition", "disposition_status", "decide_disposition", "holder_notices",
-  // SYS03 受控外部动作：取消 CI 运行走这个入口（core 判定老板/任务当事人），只读对账标 unknown_actor，归因只由 owner 带证据做。
-  "cancel_ci_run", "reconcile_ci_runs", "attribute_ci_run", "list_external_actions",
   // SYS04: what the plugin process is actually running. Answered in the plugin host's own context, never from
   // the MCP face's tree or the `active` symlink, so it can serve as evidence of the loaded version.
   "plugin_runtime_diagnostics",
-  // SYS04 故障诊断：任务持有人 / 验收人 / owner 只读预算状态；owner 解封已耗尽的恢复预算（core 判定）。
-  "fault_status", "fault_lift",
-  // FV06 终态任务恢复取证：owner+manage 签发/撤销，owner/被授权员工/源任务 reviewer 只读链与调用审计（core 判定）。
-  "recovery_read_grant", "recovery_read_grant_revoke", "recovery_read_status",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
 const RETIRED_TOOLS = new Set(["get_secret", "put_secret"]);
-
-/** How many unacked holder notices ride along with a successful reply. A notice text is bounded by the amend
- *  input (two 4000-char fields), so this keeps the added context small while still surfacing a backlog. */
-const ATTACHED_NOTICE_LIMIT = 3;
-
-/** What a successful reply carries besides its data: the unacked holder notices that fit its budget, and the cut when
- *  some were left out, by the budget or the per-reply limit (the cut notices stay unacked and are attached again on the next call). */
-export interface AttachedNotices { notices?: unknown[]; noticesTruncated?: NoticeCut }
 
 const hash = (text: string | undefined) => (text === undefined ? undefined : createHash("sha256").update(text).digest("hex"));
 
@@ -171,6 +115,7 @@ export interface SidecarDeps {
   sync?: OpsGateway;
   /** Root under which per-instance comm dirs live. */
   runDir: string;
+
   /**
    * The registered source directory of this plugin, from the trusted host's own plugin registry
    * (`paseo plugin ls --json`). The Paseo host evaluates a CJS bundle with no module loader, so the
@@ -205,21 +150,6 @@ export interface SettleResult {
   silent?: { instId: string; taskId: string; nudges: number; phase: "doing" | "review" };
 }
 
-/**
- * FV06 recovery read binding: independent of `claims` (never a fake lease proof). It only authorizes the
- * grant's fixed ops calls; every write tool still requires a normal claim.
- */
-export interface RecoveryClaim {
-  instId: string;
-  /** The terminal source task whose fault keys every call is charged to. */
-  taskId: string;
-  grantId: string;
-  grantFence: number;
-  alias: string;
-  paths: string[];
-  expiresAt: number;
-}
-
 const ORPHAN_PREFIX = "orphaned-";
 /**
  * task.md and findings/round-NN.md for the lease just taken: what the dispatch message points the employee at. The comm
@@ -251,17 +181,12 @@ export class SidecarPool {
   private readonly routingUnconfirmed = new Set<string>();
   private readonly routingEmployees = new Map<string, {role:string}>();
   private readonly claims = new Map<string, LiveClaim>();
-  /** FV06: recovery read bindings, kept strictly apart from execution claims (never exposed as lease proof). */
-  private readonly recoveryClaims = new Map<string, RecoveryClaim>();
-  private readonly recoveryCheckedAt = new Map<string, number>();
   /** instId → task of the last lease it held; names the task a report written after the lease ended belongs to. */
   private readonly lastTask = new Map<string, string>();
   private readonly instByAgent = new Map<string, string>();
   private readonly beats = new Map<string, ReturnType<typeof setInterval>>();
   private readonly active = new Set<string>();
   private readonly processing = new Set<string>();
-  /** instId → the notice step last queued for that employee; each step waits for the one before it (see withNoticeGate). */
-  private readonly noticeGates = new Map<string, Promise<void>>();
   private sweeper?: ReturnType<typeof setInterval>;
 
   /** Last claim denial code per instance: the dispatcher reads it after a lost claim (see claimDenial). */
@@ -384,50 +309,6 @@ export class SidecarPool {
     return this.rotateCredential(instId);
   }
 
-  /** Undelivered holder notices ride along with a successful reply, so an in-lease holder sees an acceptance amendment
-   *  on its very next sck call (the dispatcher only redelivers to idle sessions, and a holder never has to poll
-   *  holder_notices). Attaching is delivery: markAttached marks what the reply carries before the reply is written.
-   *  The attached notices share the reply's budget: a notice that does not fit is left for the next call (it stays
-   *  undelivered), and the reply records the cut. Best effort: a failed notice read must never fail the tool call it
-   *  is attached to, and a data answer over the budget on its own is left to the guard to refuse. */
-  private async attachNotices(instId: string, data: unknown): Promise<AttachedNotices> {
-    const read = this.deps.core.dispositionNotices?.bind(this.deps.core);
-    if (!read) return {};
-    try {
-      const pending = await read(await this.credentialFor(instId));
-      if (!pending.length) return {};
-      // The note is part of the notice body, so it is measured with the notice: the holder needs no ack for it.
-      const noted = pending.map(notice => ({ ...notice, text: `【已随本次回包送达，无需 ack】${notice.text}` }));
-      return fitAttachedNotices(data, noted, ATTACHED_NOTICE_LIMIT) ?? { notices: noted.slice(0, ATTACHED_NOTICE_LIMIT) };
-    } catch (error) {
-      this.log(`attach notices ${instId} failed: ${(error as Error).message}`);
-      return {};
-    }
-  }
-
-  /** Attaching is delivery (R2): each notice a reply carries is marked delivered with the receipt a holder's ack writes
-   *  (agent = the employee), so neither the next reply nor the dispatcher's idle wake-up sends it again. Best effort: a
-   *  failed mark is logged, and the call it rides on still succeeds. */
-  private async markAttached(instId: string, notices: unknown[]): Promise<void> {
-    const ack = this.deps.core.ackDispositionNotices?.bind(this.deps.core);
-    const ids = notices.map(notice => (notice as { noticeKey?: unknown }).noticeKey).filter((key): key is string => typeof key === "string");
-    if (!ack || ids.length === 0) return;
-    try {
-      await ack(await this.credentialFor(instId), { ids });
-    } catch (error) {
-      this.log(`mark attached notices ${instId} failed: ${(error as Error).message}`);
-    }
-  }
-
-  /** Reading the pending notices, attaching them to a reply and marking them delivered is one step per employee. The sweep
-   *  starts every request file as it arrives, so two calls in flight would otherwise both read the same notice and both carry
-   *  it. Queued this way, the second call reads only what the first left undelivered. A failed step does not break the queue. */
-  private withNoticeGate<T>(instId: string, step: () => Promise<T>): Promise<T> {
-    const run = (this.noticeGates.get(instId) ?? Promise.resolve()).then(step);
-    this.noticeGates.set(instId, run.then(() => undefined, () => undefined));
-    return run;
-  }
-
   private async rotateCredential(instId: string): Promise<string> {
     // Plugin restart or adoption: re-issue. Retired instances fail here (revoked + retired row).
     const rotated = await this.deps.workforce.rotate(instId);
@@ -459,12 +340,8 @@ export class SidecarPool {
     }
   }
 
-  /**
-   * Server-side truth for a held claim: the lease is alive only while the task
-   * still names this instance its employee under the same delivery, unexpired.
-   * Anything else (revoked, expired, re-claimed by another worker) is a stale
-   * local remnant — drop it instead of letting it block every future pick.
-   */
+  
+
   private async staleClaim(held: LiveClaim): Promise<boolean> {
     try {
       const cred = await this.credentialFor(held.instId);
@@ -481,11 +358,6 @@ export class SidecarPool {
   /** Why the last claim of this instance was denied (for example worktree_busy), until its next claim. */
   claimDenial(instId: string): string | undefined {
     return this.denials.get(instId);
-  }
-
-  /** Write-scope preflight through the core: read-only, under the same rules as the claim it precedes. */
-  writeScope(task: SupervisedTask, employeeId?: string): Promise<WriteScopeHolder[]> {
-    return this.deps.core.writeScopeOf(task.id, employeeId);
   }
 
   /** Claims the task as the instance and stages claim.json in its comm dir. */
@@ -507,8 +379,6 @@ export class SidecarPool {
       this.log(`claim ${inst.id}: dropped stale lease on ${held.taskId}`);
       this.endLease(inst.id);
     }
-    // 恢复读取与执行租约互斥：一旦要领执行租约，先关闭恢复绑定（grant 本身不撤销）。
-    await this.closeRecovery(inst.id, "execution_claim");
     const cred = await this.credentialFor(inst.id);
     let result: ClaimResult;
     this.denials.delete(inst.id);
@@ -621,8 +491,7 @@ export class SidecarPool {
     text: string, path: string,
   ): Promise<void> {
     const upgradeSha = /^\s*companyUpgradeSha:\s*(\S+)\s*$/m.exec(text)?.[1];
-    const recovery = /^\s*recoveryReason:\s*(\S+)\s*$/m.exec(text)?.[1];
-    const evidence: Evidence = { ...(upgradeSha ? {companyUpgrade:{sha:upgradeSha}}:{}), ...(to && recovery ? { recoveryReason: recovery as Evidence["recoveryReason"] } : {}), text, idempotencyKey: `sidecar-file:${instId}:${live.proof.deliveryId}:${hash(text)}` };
+    const evidence: Evidence = { ...(upgradeSha ? {companyUpgrade:{sha:upgradeSha}}:{}), text, idempotencyKey: `sidecar-file:${instId}:${live.proof.deliveryId}:${hash(text)}` };
     try {
       const cred = await this.credentialFor(instId);
       if (to) {
@@ -770,120 +639,17 @@ export class SidecarPool {
       try { await this.rebuildClaim(inst); }
       catch (error) { this.log(`adopt lease check ${inst.id} failed: ${(error as Error).message}`); }
     }
-    // FV06: recovery bindings are process state too; rebuild only the grants the server still reports active.
-    for (const inst of insts) {
-      if (!this.launched.has(inst.id)) continue;
-      await this.rebuildRecovery(inst);
-    }
     this.ensureSweeper();
   }
 
-  /** FV06 P0 standby wake: a resume assigned this instance a lease server-side (no sidecar claim ran),
+  /** A resume assigned this instance a lease server-side (no sidecar claim ran),
    *  so rebuild the local claim (channel proof + claim.json) from the authoritative server lease. */
   async adoptLease(inst: EmployeeInst): Promise<void> {
     if (!this.launched.has(inst.id)) throw new Error("unhealthy session channel cannot adopt a lease");
     await this.rebuildClaim(inst);
   }
 
-  /**
-   * FV06: bind a recovery read grant to this instance's channel. Never a fake lease: the binding lives in
-   * `recoveryClaims`, authorizes only the grant's ops allowlist, and refuses while any execution claim exists.
-   * The server remains the authority — the grant is re-read and rebound (issued → bound) on every wake/reload.
-   */
-  async adoptRecovery(inst: EmployeeInst, grantId?: string): Promise<RecoveryClaim | undefined> {
-    if (!this.launched.has(inst.id)) throw new Error("unhealthy session channel cannot adopt a recovery grant");
-    if (this.claims.has(inst.id)) throw Object.assign(new Error("execution lease is active; recovery read cannot bind"), { code: "lease_conflict" });
-    const core = this.deps.core;
-    if (!core.recoveryGrantFor || !core.recoveryGrantsFor || !core.recoveryReadBind) {
-      throw Object.assign(new Error("core does not expose recovery read grants"), { code: "no_grant" });
-    }
-    const cred = await this.credentialFor(inst.id);
-    let grant: RecoveryReadGrantRowView | undefined;
-    if (grantId) {
-      grant = await core.recoveryGrantFor(cred, grantId);
-    } else {
-      const grants = await core.recoveryGrantsFor(cred);
-      if (grants.length === 0) return undefined;
-      if (grants.length > 1) {
-        this.log(`recovery adoption ambiguous for ${inst.id}: ${grants.length} active grants (${grants.map(g => g.id).join(", ")})`);
-        return undefined;
-      }
-      grant = grants[0];
-    }
-    if (grant.employeeId !== inst.id) throw Object.assign(new Error("recovery grant belongs to another employee"), { code: "no_grant" });
-    if (grant.state !== "issued" && grant.state !== "bound" && grant.state !== "running") {
-      throw Object.assign(new Error(`recovery grant is ${grant.state}`), { code: "no_grant" });
-    }
-    if (Date.parse(grant.expiresAt) <= Date.now()) throw Object.assign(new Error("recovery grant expired"), { code: "no_grant" });
-    const bound = await core.recoveryReadBind(cred, { grantId: grant.id, fence: grant.fence });
-    const claim: RecoveryClaim = {
-      instId: inst.id, taskId: bound.taskId, grantId: bound.id, grantFence: bound.fence,
-      alias: bound.alias, paths: [...bound.paths], expiresAt: Date.parse(bound.expiresAt),
-    };
-    this.recoveryClaims.set(inst.id, claim);
-    const dir = commDir(this.deps.runDir, inst.id);
-    ensureCommDirs(dir);
-    const evidenceDir = join(dirname(this.deps.runDir), "evidence", claim.taskId);
-    mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
-    // claim.json carries a `recovery` section — never a lease proof: submit/review/checkpoint stay impossible.
-    writeFileAtomic(join(dir, "claim.json"), JSON.stringify({
-      recovery: { taskId: claim.taskId, grantId: claim.grantId, grantFence: claim.grantFence,
-        alias: claim.alias, paths: claim.paths, expiresAt: new Date(claim.expiresAt).toISOString() },
-      evidenceDir, orphanedArtifacts: orphanedArtifacts(evidenceDir),
-    }));
-    this.log(`sidecar bound recovery grant ${claim.grantId} for ${inst.id} on source ${claim.taskId}`);
-    return claim;
-  }
 
-  /** FV06: close the local binding (revoked/expired/source changed/execution claim). Drops only this grant's
-   *  local sessions; it never logs in again and never claims a remote logout. */
-  async closeRecovery(instId: string, reason: string): Promise<void> {
-    const claim = this.recoveryClaims.get(instId);
-    if (!claim) return;
-    this.recoveryClaims.delete(instId);
-    this.recoveryCheckedAt.delete(instId);
-    try { this.deps.ops?.releaseGrant?.(claim.grantId); } catch { /* local cleanup only */ }
-    try {
-      const cred = await this.credentialFor(instId);
-      await this.deps.core.recoveryReadClose?.(cred, { grantId: claim.grantId, fence: claim.grantFence, reason });
-    } catch (error) {
-      this.log(`recovery close ${claim.grantId} for ${instId} failed: ${(error as Error).message}`);
-    }
-    const path = join(commDir(this.deps.runDir, instId), "claim.json");
-    const prior = readJsonFile<{ recovery?: { grantId?: string } }>(path);
-    if (prior?.recovery?.grantId === claim.grantId) {
-      try { unlinkSync(path); } catch { /* already gone */ }
-    }
-    this.log(`sidecar closed recovery grant ${claim.grantId} for ${instId}: ${reason}`);
-  }
-
-  /** FV06: the server grant is the authority; a local binding that is no longer active is closed, not renewed. */
-  private async validateRecovery(instId: string): Promise<void> {
-    const claim = this.recoveryClaims.get(instId);
-    if (!claim) return;
-    if (claim.expiresAt <= Date.now()) return this.closeRecovery(instId, "expired");
-    // One server check per minute and instance; local expiry is checked every sweep.
-    const last = this.recoveryCheckedAt.get(instId) ?? 0;
-    if (Date.now() - last < 60_000) return;
-    this.recoveryCheckedAt.set(instId, Date.now());
-    try {
-      const cred = await this.credentialFor(instId);
-      const grant = await this.deps.core.recoveryGrantFor?.(cred, claim.grantId);
-      if (!grant || !["issued", "bound", "running"].includes(grant.state)
-        || Date.parse(grant.expiresAt) <= Date.now() || grant.taskId !== claim.taskId) {
-        await this.closeRecovery(instId, grant?.state ?? "grant_unavailable");
-      }
-    } catch (error) {
-      await this.closeRecovery(instId, `grant_unreadable: ${(error as Error).message.slice(0, 80)}`);
-    }
-  }
-
-  /** FV06 reload: rebuild bindings from the complete credential-scoped server read (active only). */
-  private async rebuildRecovery(inst: EmployeeInst): Promise<void> {
-    if (this.claims.has(inst.id) || this.recoveryClaims.has(inst.id)) return;
-    try { await this.adoptRecovery(inst); }
-    catch (error) { this.log(`recovery adoption ${inst.id} failed: ${(error as Error).message}`); }
-  }
 
   /**
    * Re-establish the local claim for a lease that survived the restart, then run the
@@ -1038,7 +804,7 @@ export class SidecarPool {
   /** Injected-proof write tools plus identity-scoped reads; capability enforcement stays in core. */
   private async dispatch(
     instId: string, tool: string, args: Record<string, unknown>, forceRotate: boolean,
-    request: { lease: LiveClaim | undefined; recovery?: RecoveryClaim },
+    request: { lease: LiveClaim | undefined },
   ): Promise<unknown> {
     const requestLease = request.lease;
     const core = this.deps.core;
@@ -1080,7 +846,7 @@ export class SidecarPool {
     const declared = acceptance();
     // SYS-QUOTA: the relay forwards the subscription quota reset the caller declared on a block.
     // A declared field is never dropped quietly — a dropped reset leaves the provider dispatchable
-    // and the manager unparked, which is the P0 this seam caused. A value of the wrong shape is
+    // and the owner unparked, which is the P0 this seam caused. A value of the wrong shape is
     // refused here; the instant itself is validated by core.block (parseQuotaResetsAt), the only
     // writer of quota_resets_at, so both the call entry and the file entry below refuse the same
     // texts with the same `invalid` refusal. A near-miss key is refused too, rather than silently
@@ -1101,11 +867,11 @@ export class SidecarPool {
     };
     const evidence = (): Evidence => ({
       ...(args.companyUpgrade === undefined ? {} : { companyUpgrade: args.companyUpgrade as Evidence["companyUpgrade"] }),
-      ...(args.executionWindow === undefined ? {} : { executionWindow: args.executionWindow as Evidence["executionWindow"] }),
-      ...(args.recoveryReason === undefined ? {} : { recoveryReason: args.recoveryReason as Evidence["recoveryReason"] }),
       text: String(args.text ?? ""),
       idempotencyKey: String(args.idempotencyKey ?? `sidecar-relay:${instId}:${randomBytes(6).toString("hex")}`),
       ...(declared ? { acceptance: declared } : {}),
+      ...(args.sha === undefined ? {} : { sha: args.sha as string }),
+      ...(args.next === undefined ? {} : { next: args.next as Evidence["next"] }),
     });
     const live = () => {
       const claim = this.claims.get(instId);
@@ -1125,26 +891,6 @@ export class SidecarPool {
     if (gateway) {
       // FV06: a recovery binding authorizes only the ops allowlist, on the source task, with the grant proof
       // injected here. It is never a lease proof: every write tool below still goes through live().
-      const recovery = request.recovery;
-      if (gateway === ops && recovery) {
-        const bound = this.recoveryClaims.get(instId);
-        if (bound !== recovery) throw Object.assign(new Error("no active recovery read grant for this request"), { code: "no_grant" });
-        if (requestLease) throw Object.assign(new Error("execution and recovery bindings cannot both be active"), { code: "no_grant" });
-        if (bound.expiresAt <= Date.now()) {
-          void this.closeRecovery(instId, "expired");
-          throw Object.assign(new Error("recovery read grant expired"), { code: "no_grant" });
-        }
-        // 员工不能自带或覆盖源任务与 grant 证明：这些键一律拒绝（不是静默丢弃）。
-        for (const key of RECOVERY_RESERVED_ARGS) {
-          if (args[key] !== undefined) {
-            throw Object.assign(new Error(`${key} is injected by the channel and must not be supplied`), { code: "invalid" });
-          }
-        }
-        if (!(RECOVERY_READ_TOOLS as readonly string[]).includes(tool)) {
-          throw Object.assign(new Error(`recovery read allows only ${RECOVERY_READ_TOOLS.join(", ")}`), { code: "forbidden" });
-        }
-        return gateway.call(cred, bound.taskId, tool, { ...args }, { grantId: bound.grantId, grantFence: bound.grantFence });
-      }
       // The lease decides the task: a taskId in the request is dropped so ops tools only ever act for the task in hand.
       const { taskId: _requested, ...rest } = args;
       const claim = live();
@@ -1222,12 +968,6 @@ export class SidecarPool {
       case "set_acceptance_gate": return core.setAcceptanceGate
         ? core.setAcceptanceGate(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose set_acceptance_gate"), { code: "temporarily_unavailable" }));
-      case "acceptance_mapping_preview": return core.acceptanceMappingPreview
-        ? core.acceptanceMappingPreview(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose acceptance_mapping_preview"), { code: "temporarily_unavailable" }));
-      case "acceptance_mapping_import": return core.acceptanceMappingImport
-        ? core.acceptanceMappingImport(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose acceptance_mapping_import"), { code: "temporarily_unavailable" }));
       case "checkpoint": return writeOp(p => core.checkpoint(cred, p, evidence()));
       case "submit": return writeOp(p => core.submit(cred, p, evidence()), true);
       case "review": {
@@ -1237,209 +977,15 @@ export class SidecarPool {
         return writeOp(p => (args.decision === "accept" ? core.accept(cred, p, evidence()) : core.returnTask(cred, p, evidence())), true);
       }
       case "report_blocker": return writeOp(p => core.block(cred, p, args.to === "owner" ? "owner" : "owner", evidence(), quotaReset()), true);
-      // SYS05: entering a wait consumes the lease in the same turn — the task takes no employee or provider seat
-      // while it waits. The ops sessions and browser spaces opened under this lease are dropped by endLease below.
-      case "wait_task": {
-        if (!core.wait) return Promise.reject(Object.assign(new Error("core does not expose wait_task"), { code: "temporarily_unavailable" }));
-        const { taskId: _t, deliveryId: _d, fence: _f, expectedVersion: _e, ...spec } = args;
-        return writeOp(p => core.wait!(cred, p, evidence(), spec as never), true);
-      }
-      case "resolve_wait": return core.resolveWait
-        ? core.resolveWait(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose resolve_wait"), { code: "temporarily_unavailable" }));
-      case "cancel_wait": return core.cancelWait
-        ? core.cancelWait(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose cancel_wait"), { code: "temporarily_unavailable" }));
-      case "extend_wait": return core.extendWait
-        ? core.extendWait(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose extend_wait"), { code: "temporarily_unavailable" }));
-      case "list_task_waits": return core.listWaits
-        ? core.listWaits(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose list_task_waits"), { code: "temporarily_unavailable" }));
-      case "wait_handoff_cards": return core.waitHandoffCards
-        ? core.waitHandoffCards(cred)
-        : Promise.reject(Object.assign(new Error("core does not expose wait_handoff_cards"), { code: "temporarily_unavailable" }));
-      case "wait_migration_preview": return core.waitMigrationPreview
-        ? core.waitMigrationPreview(cred)
-        : Promise.reject(Object.assign(new Error("core does not expose wait_migration_preview"), { code: "temporarily_unavailable" }));
-      case "wait_migration_apply": return core.waitMigrationApply
-        ? core.waitMigrationApply(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose wait_migration_apply"), { code: "temporarily_unavailable" }));
       case "create_task": return core.createTask(cred, args as never);
-      case "create_goal": return core.relayGoal(cred, args as never);
-      case "triage_goal": return core.triageGoal(cred, args as never);
-      case "create_delivery": return core.createDelivery(cred, args as never);
-      case "goal_phase_split": return core.goalPhaseSplit
-        ? core.goalPhaseSplit(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose goal_phase_split"), { code: "temporarily_unavailable" }));
       case "record_owner_decision": return core.relayOwnerDecision(cred, args as never);
       case "set_direction": await core.relayDirection(cred, args as never); return { recorded: true };
-      // FV06 P0: standbyEmployee turns the resume into an atomic bounded standby assignment
-      // (doing + lease + progress_at + standby_until) instead of the ordinary ready hand-off.
-      case "resume_task": return args.standbyEmployee && core.resumeStandby
-        ? core.resumeStandby(cred, taskIdOf(args.taskId), evidence(), String(args.standbyEmployee))
-        : core.resume(cred, taskIdOf(args.taskId), evidence());
-      case "verify_standby": return core.verifyStandby
-        ? core.verifyStandby(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose verify_standby"), { code: "temporarily_unavailable" }));
-      case "defer_task_until": return core.deferTaskUntil(cred, args as never);
-      case "append_dependency_prerequisites": return core.appendDependencyPrerequisites
-        ? core.appendDependencyPrerequisites(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose append_dependency_prerequisites"), { code: "temporarily_unavailable" }));
+      case "resume_task": return core.resume(cred, taskIdOf(args.taskId), evidence());
       case "retire_task": return core.retireTask(cred, args as never);
       // SYS03 老板处置账本：授权与全部写入都在 core；这里只是同一通道上的入口（sck 与 MCP 同源判定）。
-      case "claim_disposition": return core.claimDisposition
-        ? core.claimDisposition(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose claim_disposition"), { code: "temporarily_unavailable" }));
-      case "release_disposition": return core.releaseDisposition
-        ? core.releaseDisposition(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose release_disposition"), { code: "temporarily_unavailable" }));
-      case "disposition_status": return core.dispositionStatus
-        ? core.dispositionStatus(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose disposition_status"), { code: "temporarily_unavailable" }));
-      case "decide_disposition": return core.decideDisposition
-        ? core.decideDisposition(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose decide_disposition"), { code: "temporarily_unavailable" }));
-      case "holder_notices": {
-        if (!core.dispositionNotices || !core.ackDispositionNotices) {
-          return Promise.reject(Object.assign(new Error("core does not expose holder_notices"), { code: "temporarily_unavailable" }));
-        }
-        const ids = Array.isArray(args.ids) ? args.ids as string[] : undefined;
-        return withinReplyCeiling(async () => {
-          const notices = await core.dispositionNotices!(cred, ids ? { ids } : undefined);
-          if (args.ack !== true) return { notices };
-          if (!ids?.length) throw Object.assign(new Error("ack requires the ids of the notices being acknowledged"), { code: "invalid" });
-          const receipt = await core.ackDispositionNotices!(cred, { ids, error: typeof args.error === "string" ? args.error : undefined });
-          return { notices, receipt };
-        });
-      }
-      // SYS03 受控外部动作：core 判定谁可以发起（老板，或该 run 所属任务的当事人），并记录真实内部员工 ID。
-      case "cancel_ci_run": return core.cancelCiRun
-        ? core.cancelCiRun(cred, { ...(args as Record<string, unknown>), kind: "ci-run-cancel" } as never)
-        : Promise.reject(Object.assign(new Error("core does not expose cancel_ci_run"), { code: "temporarily_unavailable" }));
-      case "reconcile_ci_runs": return core.reconcileCiRuns
-        ? core.reconcileCiRuns(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose reconcile_ci_runs"), { code: "temporarily_unavailable" }));
-      case "attribute_ci_run": return core.attributeCiRun
-        ? core.attributeCiRun(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose attribute_ci_run"), { code: "temporarily_unavailable" }));
-      case "list_external_actions": return core.listExternalActions
-        ? core.listExternalActions(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose list_external_actions"), { code: "temporarily_unavailable" }));
       case "task_project_update": return core.taskProjectUpdate
         ? core.taskProjectUpdate(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose task_project_update"), { code: "temporarily_unavailable" }));
-      case "task_intent_update": return core.taskIntentUpdate
-        ? core.taskIntentUpdate(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose task_intent_update"), { code: "temporarily_unavailable" }));
-      case "task_acceptance_amend": return core.taskAcceptanceAmend
-        ? core.taskAcceptanceAmend(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose task_acceptance_amend"), { code: "temporarily_unavailable" }));
-      case "bind_task_code_repo": return core.bindTaskCodeRepo
-        ? core.bindTaskCodeRepo(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose bind_task_code_repo"), { code: "temporarily_unavailable" }));
-      case "goal_acceptance_preview": return core.goalAcceptancePreview
-        ? core.goalAcceptancePreview(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose goal_acceptance_preview"), { code: "temporarily_unavailable" }));
-      case "goal_acceptance_repair": return core.goalAcceptanceRepair
-        ? core.goalAcceptanceRepair(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose goal_acceptance_repair"), { code: "temporarily_unavailable" }));
-      case "goal_console": return core.goalConsole
-        ? core.goalConsole(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose goal_console"), { code: "temporarily_unavailable" }));
-      case "goal_governance_scan": return core.goalGovernanceScan
-        ? core.goalGovernanceScan(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose goal_governance_scan"), { code: "temporarily_unavailable" }));
-      case "goal_metrics": return core.goalMetrics
-        ? core.goalMetrics(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose goal_metrics"), { code: "temporarily_unavailable" }));
-      case "goal_outcome_register": return core.goalOutcomeRegister
-        ? core.goalOutcomeRegister(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose goal_outcome_register"), { code: "temporarily_unavailable" }));
-      case "goal_evidence_record": return core.goalEvidenceRecord
-        ? core.goalEvidenceRecord(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose goal_evidence_record"), { code: "temporarily_unavailable" }));
-      case "goal_finalize": return core.goalFinalize
-        ? core.goalFinalize(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose goal_finalize"), { code: "temporarily_unavailable" }));
-      case "goal_final_gate_preview": return core.goalFinalGatePreview
-        ? core.goalFinalGatePreview(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose goal_final_gate_preview"), { code: "temporarily_unavailable" }));
-      case "goal_final_gate_repair": return core.goalFinalGateRepair
-        ? core.goalFinalGateRepair(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose goal_final_gate_repair"), { code: "temporarily_unavailable" }));
-      case "contributor_dryrun": return core.contributorDryRun
-        ? core.contributorDryRun(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose contributor_dryrun"), { code: "temporarily_unavailable" }));
-      case "qa_observation_grant": return core.qaObservationGrant
-        ? core.qaObservationGrant(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose qa_observation_grant"), { code: "temporarily_unavailable" }));
-      case "qa_observation_revoke": return core.qaObservationRevoke
-        ? core.qaObservationRevoke(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose qa_observation_revoke"), { code: "temporarily_unavailable" }));
-      case "qa_observation_status": return core.qaObservationStatus
-        ? core.qaObservationStatus(cred)
-        : Promise.reject(Object.assign(new Error("core does not expose qa_observation_status"), { code: "temporarily_unavailable" }));
-      case "qa_observation_session": return core.qaObservationSession
-        ? core.qaObservationSession(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose qa_observation_session"), { code: "temporarily_unavailable" }));
-      case "qa_observation_read": return withinReplyCeiling(async () => {
-        if (!core.qaObservationRead) throw Object.assign(new Error("core does not expose qa_observation_read"), { code: "temporarily_unavailable" });
-        return withQaRelease(await core.qaObservationRead({ credential: cred }, args as never));
-      });
-      case "qa_observation_timeline": return withinReplyCeiling(async () => {
-        if (!core.qaObservationTimeline) throw Object.assign(new Error("core does not expose qa_observation_timeline"), { code: "temporarily_unavailable" });
-        return withQaRelease(await core.qaObservationTimeline({ credential: cred }, args as never));
-      });
-      case "review_watch_register": return core.reviewWatchRegister
-        ? core.reviewWatchRegister(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose review_watch_register"), { code: "temporarily_unavailable" }));
-      case "review_watch_close": return core.reviewWatchClose
-        ? core.reviewWatchClose(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose review_watch_close"), { code: "temporarily_unavailable" }));
-      case "review_watch_status": return core.reviewWatchStatus
-        ? core.reviewWatchStatus(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose review_watch_status"), { code: "temporarily_unavailable" }));
-      case "qa_review_scope_signal": return core.qaReviewScopeSignal
-        ? core.qaReviewScopeSignal(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose qa_review_scope_signal"), { code: "temporarily_unavailable" }));
-      case "review_scope_signals": return core.reviewScopeSignals
-        ? core.reviewScopeSignals(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose review_scope_signals"), { code: "temporarily_unavailable" }));
-      case "qa_observation_text": return withinReplyCeiling(async () => {
-        if (!core.qaObservationText) throw Object.assign(new Error("core does not expose qa_observation_text"), { code: "temporarily_unavailable" });
-        return withQaRelease(await core.qaObservationText({ credential: cred }, args as never));
-      });
-      case "implementer_takeover": return core.implementerTakeover
-        ? core.implementerTakeover(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose implementer_takeover"), { code: "temporarily_unavailable" }));
-      case "independence_set": return core.setIndependence
-        ? core.setIndependence(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose independence_set"), { code: "temporarily_unavailable" }));
-      case "identity_principal_set": return core.setIdentityPrincipal
-        ? core.setIdentityPrincipal(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose identity_principal_set"), { code: "temporarily_unavailable" }));
-      case "independence_check": return core.independenceCheck
-        ? core.independenceCheck(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose independence_check"), { code: "temporarily_unavailable" }));
-      case "policy_set": return core.policySet
-        ? core.policySet(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose policy_set"), { code: "temporarily_unavailable" }));
-      case "policy_revoke": return core.policyRevoke
-        ? core.policyRevoke(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose policy_revoke"), { code: "temporarily_unavailable" }));
-      case "policy_list": return core.policyList
-        ? core.policyList(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose policy_list"), { code: "temporarily_unavailable" }));
-      case "policy_effective": return core.policyEffective
-        ? core.policyEffective(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose policy_effective"), { code: "temporarily_unavailable" }));
-      case "policy_plan": return core.policyPlan
-        ? core.policyPlan(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose policy_plan"), { code: "temporarily_unavailable" }));
-      case "policy_enforce": return core.policyEnforce
-        ? core.policyEnforce(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose policy_enforce"), { code: "temporarily_unavailable" }));
       case "get_model_evidence": return withinReplyCeiling(async()=> {
         if(!core.modelEvidence) throw new Error("Model evidence unavailable");
         return core.modelEvidence(cred,taskIdOf(args.taskId));
@@ -1489,27 +1035,6 @@ export class SidecarPool {
           return { ...sample, channel: "plugin-sidecar", instanceId: instId };
         });
       });
-      case "fault_status": return core.faultStatus
-        ? core.faultStatus(cred, { taskId: String(args.taskId ?? live().taskId) })
-        : Promise.reject(Object.assign(new Error("core does not expose fault_status"), { code: "temporarily_unavailable" }));
-      case "fault_lift": return core.faultLift
-        ? core.faultLift(cred, {
-            taskId: String(args.taskId ?? live().taskId),
-            incident: String(args.incident ?? ""),
-            reason: String(args.reason ?? ""),
-            idempotencyKey: String(args.idempotencyKey ?? ""),
-          })
-        : Promise.reject(Object.assign(new Error("core does not expose fault_lift"), { code: "temporarily_unavailable" }));
-      // FV06：恢复取证授权不走执行租约——owner 签发/撤销与只读状态都由 core 按凭证判定，参数原样转交。
-      case "recovery_read_grant": return core.recoveryReadGrant
-        ? core.recoveryReadGrant(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose recovery_read_grant"), { code: "temporarily_unavailable" }));
-      case "recovery_read_grant_revoke": return core.recoveryReadGrantRevoke
-        ? core.recoveryReadGrantRevoke(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose recovery_read_grant_revoke"), { code: "temporarily_unavailable" }));
-      case "recovery_read_status": return core.recoveryReadStatus
-        ? core.recoveryReadStatus(cred, args as never)
-        : Promise.reject(Object.assign(new Error("core does not expose recovery_read_status"), { code: "temporarily_unavailable" }));
       case "deploy_drill_run": return core.deployDrillRun
         ? core.deployDrillRun(cred, {
             taskId: String(args.taskId ?? live().taskId),
@@ -1559,7 +1084,6 @@ export class SidecarPool {
       }
     }
     // FV06: expiry is local and immediate; the server state is re-read on a slower cadence.
-    for (const instId of [...this.recoveryClaims.keys()]) void this.validateRecovery(instId);
   }
 
   /** Drains a request written after the instance's lease ended — the caller gets an
@@ -1575,7 +1099,7 @@ export class SidecarPool {
     const dir = commDir(this.deps.runDir, instId);
     const reqPath = join(reqDir(dir), file);
     const req = readJsonFile<CommRequest>(reqPath);
-    const request = { lease: this.claims.get(instId), recovery: this.recoveryClaims.get(instId) };
+    const request = { lease: this.claims.get(instId) };
     const arrival = Date.now();
     try { unlinkSync(reqPath); } catch { /* already consumed */ }
     const res: CommResponse = !req
@@ -1594,22 +1118,7 @@ export class SidecarPool {
             .then(data => ({ ok: true as const, data }))
             .catch((error: Error & { code?: string }) => ({ ok: false as const, error: `${error.code ?? "error"}: ${error.message}` }));
     // Last-line budget check: an over-budget success becomes a recoverable, JSON-legal error (SYS01).
-    // A successful call also carries the employee's unacked holder notices (holder_notices and the tool listing
-    // already answer with notices / no employee state, so they are skipped). The notices are fitted to the reply's
-    // remaining budget first: an in-lease holder sees an acceptance amendment here without being interrupted, an
-    // attached notice is delivered (marked below), so it is gone from the next reply, and a notice that did not fit
-    // stays undelivered and is attached on the next call.
-    // Calls of one employee that arrive together take turns on the read, the attach and the mark (see withNoticeGate).
-    const guarded = await this.withNoticeGate(instId, async () => {
-      const answer: CommResponse = res.ok && req && req.tool !== "holder_notices" && req.tool !== "__list__"
-        ? { ...res, ...(await this.attachNotices(instId, (res as { data?: unknown }).data)) }
-        : res;
-      const checked = guardRelayResponse(answer);
-      // Attaching is delivery: the notices a reply carries are marked before the reply is written. A reply the guard
-      // refuses carries none of them, so nothing is marked for it.
-      if (checked === answer && answer.notices?.length) await this.markAttached(instId, answer.notices);
-      return checked;
-    });
+    const guarded = guardRelayResponse(res);
     writeFileAtomic(join(resDir(dir), file), JSON.stringify(guarded));
   }
 }

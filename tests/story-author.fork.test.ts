@@ -50,7 +50,6 @@ run('the story-author def refuses other tracks and screenwriter work is not stor
   await expect(claimAs('screen-def', other.id)).rejects.toMatchObject({ code: 'forbidden' });
   await new ProjectStore(db.db).upsert({ id: 'novel', name: '故事项目', repoPath: dir, release: 'local', envs: [], disciplines: [{ name: '原著', roles: ['story-author'] }] });
   const [rows] = await db.db.query<[Array<{ id: unknown }>]>("CREATE goal CONTENT { title: '长篇', brief: 'fixture', state: 'active', source: 'fixture', note: '', project: project:novel, tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
-  const goalId = String((rows[0]!.id as { id: string }).id);
-  await expect(task({ goalId, executorRole: 'product', reviewerRole: 'owner', discipline: '原著' })).rejects.toThrow(/only be carried by story-author/);
-  expect((await task({ goalId, discipline: '原著' })).executorRole).toBe('story-author');
+  await expect(task({ project: 'novel', executorRole: 'product', reviewerRole: 'owner', discipline: '原著' })).rejects.toThrow(/only be carried by story-author/);
+  expect((await task({ project: 'novel', discipline: '原著' })).executorRole).toBe('story-author');
 });

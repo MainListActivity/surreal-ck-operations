@@ -56,18 +56,6 @@ export function registerHandlers(server: PluginServerContext): void {
   ownerHandle(rpc.upgrade, async (input: RpcInput<typeof rpc.upgrade>) => (await company()).upgrades.start(input,SOURCE));
   ownerHandle(rpc.brief, async () => (await company()).owner.brief());
 
-  ownerHandle(rpc.createGoal, async (input: RpcInput<typeof rpc.createGoal>) => {
-    const goal = await (await company()).owner.createGoal({
-      text: input.text, source: SOURCE, key: input.key, tier: input.tier, project: input.project, pipeline: input.pipeline,
-    });
-    return { id: goal.id, state: goal.state };
-  });
-
-  ownerHandle(rpc.triageGoal, async (input: RpcInput<typeof rpc.triageGoal>) => {
-    const goal = await (await company()).owner.triage(input.goalId, input.tier, "owner:paseo-plugin");
-    return { id: goal.id, state: goal.state, tier: goal.tier };
-  });
-
   ownerHandle(rpc.addDirection, async (input: RpcInput<typeof rpc.addDirection>) => {
     await (await company()).owner.addDirection({ text: input.text, source: SOURCE, key: input.key });
     return { ok: true };
@@ -94,17 +82,6 @@ export function registerHandlers(server: PluginServerContext): void {
       SOURCE);
   });
 
-  ownerHandle(rpc.unlockTask, async (input: RpcInput<typeof rpc.unlockTask>) => {
-    const unlocked = await (await company()).owner.unlockDependents({ taskId: input.taskId, source: SOURCE });
-    return { unlocked };
-  });
-
-  ownerHandle(rpc.cancelGoalRpc, async (input: RpcInput<typeof rpc.cancelGoalRpc>) => {
-    return await (await company()).owner.cancelGoal({
-      goalId: input.goalId, note: input.note, source: SOURCE, key: input.key,
-    });
-  });
-
   ownerHandle(rpc.resolveNotice, async (input: RpcInput<typeof rpc.resolveNotice>) => {
     await (await company()).owner.resolveNotice(input.key);
     return { ok: true };
@@ -115,12 +92,12 @@ export function registerHandlers(server: PluginServerContext): void {
     return { ok: true };
   });
 
-  ownerHandle(rpc.goalTasks, async (input: RpcInput<typeof rpc.goalTasks>) => {
+  ownerHandle(rpc.chainTasks, async (input: RpcInput<typeof rpc.chainTasks>) => {
     const { db } = await company();
     const { view } = await import("./vendor/src/core.ts");
     const { id } = await import("./vendor/src/core.ts");
     const [rows] = await db.db.query<[Parameters<typeof view>[0][]]>(
-      "SELECT *, string::slice(context ?? '', 0, 1200) AS context FROM task WHERE goal = $goal ORDER BY created_at, id LIMIT 500;", { goal: id("goal", input.goalId) });
+      "SELECT *, string::slice(context ?? '', 0, 1200) AS context FROM task WHERE tag = $tag ORDER BY created_at, id LIMIT 500;", { tag: input.tag });
     return { tasks: rows.map(view) };
   });
 
@@ -268,9 +245,8 @@ export function registerHandlers(server: PluginServerContext): void {
   ownerHandle(rpc.pulse, async () => {
     const { db, owner, workforce, dispatcher } = await company();
     const { quotaBlockedProviders, roleCapacity } = await import("./vendor/src/dispatcher/dispatcher.ts");
-    const { dispatchBlockedRows, goalBlockerList, goalBlockerRows, goalWorkflowWaitRows } = await import("./vendor/src/dispatcher/dispatch-list.ts");
+    const { dispatchBlockedRows } = await import("./vendor/src/dispatcher/dispatch-list.ts");
     const { pulseAnswer } = await import("./vendor/src/dispatcher/pulse-answer.ts");
-    const { readGoalWorkflowWaitSnapshot } = await import("./vendor/src/dispatcher/goal-roots.ts");
     const { localDate } = await import("./vendor/src/owner-brief.ts");
     const { readProviderQuotas } = await import("./dispatch.ts");
     const { RecordId } = await import("surrealdb");
@@ -326,21 +302,6 @@ export function registerHandlers(server: PluginServerContext): void {
       `SELECT task, task.title AS title, at, actor FROM audit WHERE action IN ['accept','owner_approve'] ORDER BY at DESC LIMIT 8;`);
 
     const readyIds = new Set(ready.map(r => r.taskId));
-    // Goal cards name each root's people and waiting chain, read now for the roots the bounded list shows. A failed read keeps the
-    // verdict-only card rather than failing the whole pulse.
-    const roots = goalBlockerList(verdicts);
-    const workflowSnapshot = await readGoalWorkflowWaitSnapshot(db.db, workforce, {
-      roots: roots.items.map(root => root.taskId), limit: 20,
-      log: message => console.warn(message),
-    }).catch(error => {
-      console.warn(`goal workflow wait facts failed: ${(error as Error).message}`);
-      return undefined;
-    });
-    const goalFacts = workflowSnapshot?.facts;
-    const workflowWaitSummary = workflowSnapshot?.summary ?? {
-      source: 'workflow-graph' as const, available: false, totalRoots: 0, shownRoots: 0, truncated: false,
-      reason: 'workflow graph could not be read', roots: [],
-    };
     // Every row goes to pulseAnswer, which caps the list and reports the whole count (SYS-DISP R6).
     return pulseAnswer({
       at: new Date(now).toISOString(),
@@ -349,15 +310,9 @@ export function registerHandlers(server: PluginServerContext): void {
       doing,
       ready,
       dispatchBlocked: dispatchBlockedRows(verdicts),
-      goalBlockers: goalBlockerRows(verdicts, goalFacts),
-      workflowWaits: goalWorkflowWaitRows(workflowWaitSummary),
-      workflowWaitSummary: { source: workflowWaitSummary.source, available: workflowWaitSummary.available,
-        checkedAt: workflowWaitSummary.checkedAt, totalRoots: workflowWaitSummary.totalRoots,
-        truncated: workflowWaitSummary.truncated, ...(workflowWaitSummary.reason ? { reason: workflowWaitSummary.reason } : {}) },
       stuck: (brief.stuck ?? []).filter(s => !readyIds.has(s.taskId)),
       waiting: brief.waiting ?? [],
       recentDone: (recentDone ?? []).map((r: any) => ({ taskId: asId(r.task), title: String(r.title ?? ""), at: String(r.at), actor: r.actor ? asId(r.actor) : undefined })),
-      goals: brief.goals ?? [],
       resources: brief.resources ?? [],
       last24h: brief.last24h,
       churn: brief.churn,

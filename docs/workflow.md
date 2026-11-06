@@ -9,19 +9,14 @@
 | review | 已提交，等待独立验收 | 验收岗位中非提交者的员工；`reviewerRole=owner` 的关口由老板决定 |
 | blocked | 等依赖或老板 | 正式依赖等待（`blocked_to` 为空）完成后按原阶段恢复：执行回 ready，复核回 review；`blocked_to=owner` 进老板待办 |
 
-任务视图用 `waiting` 给出同一事实（RW06 C3）：`kind=manager|owner|dependency`、恢复阶段 `resumeState`、岗位 `role` 与依赖数 `dependenciesCount`（依赖 id 在任务自身的 `dependencies` 字段）；复核等待显示原复核岗位（`resumeRole` 为空时取任务 `reviewerRole`，不会误显示成执行等待），缺少的事实显示 `unknown`。切换发布版本前，`scripts/review-wait-guard.sh` 会拒绝不认识该等待状态的旧目标（见 `docs/company-service-operations.md` 第 5 节）。
+任务视图的 blocked 行带 `blockedTo` 事实：等老板关口时 `blockedTo=owner`（`resumeState` 记录恢复阶段，复核等待显示原复核岗位，缺失显示 `unknown`）；父链 predecessor 在任务 `parent` 字段。
 | done | 验收通过（或老板批准） | 自动解锁后续任务 |
 
 ## 目标流程
 
-老板提出目标后，系统自动创建四个任务：
+老板提出目标后，系统按产线创建一个交付任务（软件：engineering 实现+合入发布+生产自验 → qa 生产复验；故事：story-author → qa；视频：concept-design → owner）。需要更多步时老板加任务并用依赖串起来。
 
-1. **G1 范围提案**（运营执行 → 老板审批）
-2. **任务拆解与分派**（经理执行 → 运营验收）：经理创建的所有 `goalId` 任务自动成为手册的依赖。
-3. **真人验收操作手册**（运营执行 → 测试按手册实际操作验收）
-4. **G3 老板最终验收**（经理执行 → 老板审批）：驳回后经理创建返工任务，G3 自动等待返工完成。
-
-中途需要老板拍板的节点由经理创建 `kind=gate`、`reviewerRole=owner` 的 G2 关口任务。
+中途需要老板拍板的节点建 `kind=gate`、`reviewerRole=owner` 的关口任务。旧的 `create_delivery` 三链交付（实现 → 上线申请 → 合入部署）只是兼容旧数据的遗留入口，新目标不走它。
 
 ## 故障接续
 

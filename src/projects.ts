@@ -3,7 +3,6 @@ import { execFileSync } from 'node:child_process';
 import { RecordId, type Surreal } from 'surrealdb';
 import { ROLES, type ProjectView, type Role } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
-import { isPipeline } from './flows.ts';
 
 import { parseBrokerConfig } from './ops/config.ts';
 import { projectTextLengths, validateProjectTexts, type ProjectTextExisting, type ProjectTextLengths } from './input-bounds.ts';
@@ -101,7 +100,6 @@ export class ProjectStore {
     const existing = await this.storedTexts(input.id);
     validateProjectTexts(input, existing ?? undefined);
     assertDisciplines(input.disciplines);
-    if (input.pipeline !== undefined && !isPipeline(input.pipeline)) throw new CompanyError('invalid', 'pipeline must be software, video or story');
     const project = new RecordId('project', input.id);
     await this.db.query(`UPSERT $project CONTENT {
         name: $p.name, repo_path: $p.repoPath, default_branch: $p.defaultBranch ?? 'main', release: $p.release,

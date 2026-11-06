@@ -39,8 +39,9 @@ const unit = '中文🙂字符';
 let gm: string;
 let eng: string;
 let cs: string;
-let goalId: string;
+let tag: string;
 let smallGoalId: string;
+let goalId: string;
 let expectedWorking: string[] = [];
 
 /** `count` code points of mixed Chinese and emoji, starting with `prefix` (never splits a surrogate pair). */
@@ -62,7 +63,7 @@ async function expectRefused(promise: Promise<unknown>, code: CompanyError['code
 
 async function workingIds(goal: string): Promise<string[]> {
   const [rows] = await database.db.query<[Array<{ id: RecordId }>]>(
-    "SELECT id FROM task WHERE goal = $goal AND state IN ['ready', 'doing', 'review', 'blocked'];", { goal: id('goal', goal) });
+    "SELECT id FROM task WHERE tag = $goal AND state IN ['ready', 'doing', 'review', 'blocked'];", { goal: goal });
   return (rows ?? []).map(row => asId(row.id));
 }
 
@@ -201,24 +202,24 @@ beforeAll(async () => {
   gm = await enrollment.enroll(ids.gm, 'owner', ['execute', 'review', 'manage']);
   eng = await enrollment.enroll(ids.eng, 'engineering', ['execute', 'review']);
   cs = await enrollment.enroll(ids.cs, 'cs', ['execute']);
-  const goal = await owner.createGoal({ text: `分页夹具目标 ${suffix}`, source: 'owner:test', key: key('goal'), tier: 'standard' });
+  const goal = await core.createTask(gm, { title: `分页夹具目标 ${suffix}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('goal') });
   goalId = goal.id;
   // Fixture: 1000 tasks with Chinese and emoji titles; every 25th context is long (about 6000 characters).
   for (let i = 0; i < TOTAL; i++) {
     await core.createTask(gm, {
       title: `分页样例 ${i} ${unit}`,
       context: i % 25 === 0 ? codePoints(6000, `第${i}条长正文 `) : `短正文 ${i} ${unit}`,
-      executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key(`t${i}`),
+      executorRole: 'engineering', reviewerRole: 'qa', tag: goalId, idempotencyKey: key(`t${i}`),
     });
   }
   expectedWorking = await workingIds(goalId);
   // A second goal with three tasks of its own (tiering adds the triage template's tasks): its whole working set fits the budget.
-  const small = await owner.createGoal({ text: `分页小目标 ${suffix}`, source: 'owner:test', key: key('goal-small'), tier: 'standard' });
+  const small = await core.createTask(gm, { title: `分页小目标 ${suffix}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('goal-small') });
   smallGoalId = small.id;
   for (let i = 0; i < 3; i++) {
     await core.createTask(gm, {
       title: `小目标样例 ${i} ${unit}`, context: i === 0 ? codePoints(1_500, '较长正文 ') : `短正文 ${i}`,
-      executorRole: 'engineering', reviewerRole: 'qa', goalId: smallGoalId, idempotencyKey: key(`small${i}`),
+      executorRole: 'engineering', reviewerRole: 'qa', tag: smallGoalId, idempotencyKey: key(`small${i}`),
     });
   }
 }, 1_200_000);
@@ -231,14 +232,14 @@ test('the budget is 48 KiB of serialized UTF-8 and the working set holds at leas
 });
 
 test('legacy get_context over the whole working set is refused as response_too_large, never a partial list (C2)', async () => {
-  await expectRefused(core.contextView(gm, { goalId }), 'response_too_large', /pageSize/);
+  await expectRefused(core.contextView(gm, { tag: goalId }), 'response_too_large', /pageSize/);
 });
 
 test('legacy get_context answers whole when the set fits: the old keys, every task, and no page (C2)', async () => {
   // The goal's working set is read from the database: a tiered goal also gets its triage template tasks.
   const members = await workingIds(smallGoalId);
   expect(members.length).toBeGreaterThanOrEqual(3);
-  const legacy = await core.contextView(gm, { goalId: smallGoalId });
+  const legacy = await core.contextView(gm, { tag: smallGoalId });
   expect(Object.keys(legacy).sort()).toEqual(['companyIncluded', 'companyRead', 'principal', 'tasks']);
   expect(legacy.companyIncluded).toBe(false);
   expect(legacy.page).toBeUndefined();
@@ -259,22 +260,22 @@ test('the company block is never trimmed: a legacy answer whose brief breaks the
   try {
     core.companyBrief = async () => bulky;
     // AC-A: the block is not in a task answer by default, so the bulky block is only in an answer that asks for it.
-    expect((await core.contextView(gm, { goalId: smallGoalId })).companyIncluded).toBe(false);
-    await expectRefused(core.contextView(gm, { goalId: smallGoalId, includeCompany: true }), 'response_too_large', /budget/);
-    const page = await core.contextView(gm, { goalId: smallGoalId, pageSize: 100 });
+    expect((await core.contextView(gm, { tag: smallGoalId })).companyIncluded).toBe(false);
+    await expectRefused(core.contextView(gm, { tag: smallGoalId, includeCompany: true }), 'response_too_large', /budget/);
+    const page = await core.contextView(gm, { tag: smallGoalId, pageSize: 100 });
     expect(page).not.toHaveProperty('company');
     expect(page.tasks!.length).toBe(await workingIds(smallGoalId).then(ids => ids.length));
-    await expectRefused(core.contextView(gm, { goalId: smallGoalId, pageSize: 5, includeCompany: true }), 'response_too_large', /budget/);
+    await expectRefused(core.contextView(gm, { tag: smallGoalId, pageSize: 5, includeCompany: true }), 'response_too_large', /budget/);
   } finally {
     core.companyBrief = original;
   }
-  const withBrief = await core.contextView(gm, { goalId: smallGoalId, pageSize: 5, includeCompany: true });
+  const withBrief = await core.contextView(gm, { tag: smallGoalId, pageSize: 5, includeCompany: true });
   expect(withBrief).toHaveProperty('company');
 });
 
 test('legacy get_task_history is the complete history with whole evidence when it fits, and refused when it does not (C2, C3)', async () => {
   const small = await core.createTask(gm, {
-    title: '历史小样例', context: '历史小样例正文', executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('hist-small'),
+    title: '历史小样例', context: '历史小样例正文', executorRole: 'engineering', reviewerRole: 'qa', tag: goalId, idempotencyKey: key('hist-small'),
   });
   await addAudit(small.id, codePoints(3_000, '完整证据 '));
   const whole = await core.history(gm, small.id);
@@ -284,7 +285,7 @@ test('legacy get_task_history is the complete history with whole evidence when i
   expect(full?.evidence).toBe(codePoints(3_000, '完整证据 '));
   expect(full?.evidenceTruncated).toBe(false);
   const big = await core.createTask(gm, {
-    title: '历史大样例', context: '历史大样例正文', executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('hist-big'),
+    title: '历史大样例', context: '历史大样例正文', executorRole: 'engineering', reviewerRole: 'qa', tag: goalId, idempotencyKey: key('hist-big'),
   });
   for (let i = 0; i < 30; i++) await addAudit(big.id, codePoints(6_000, `证据第${i}条 `));
   await expectRefused(core.history(gm, big.id), 'response_too_large', /pageSize/);
@@ -293,7 +294,7 @@ test('legacy get_task_history is the complete history with whole evidence when i
 test('get_context by taskId returns the whole context when it fits, with its size and digest (C3)', async () => {
   const text = codePoints(4_000, '中等正文 ');
   const task = await core.createTask(gm, {
-    title: '中等正文样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('medium'),
+    title: '中等正文样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', tag: goalId, idempotencyKey: key('medium'),
   });
   const detail = await core.contextView(gm, { taskId: task.id });
   const view = detail.tasks![0]!;
@@ -307,7 +308,7 @@ test('get_context by taskId returns the whole context when it fits, with its siz
 test('a context over the budget is refused whole with read_task_text guidance; segments verify, a changed text is refused, and each read is permission-checked (C3)', async () => {
   const text = '中'.repeat(19_000); // 57,000 bytes: above the 48 KiB budget
   const task = await core.createTask(gm, {
-    title: '超大正文样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('huge'),
+    title: '超大正文样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', tag: goalId, idempotencyKey: key('huge'),
   });
   await expectRefused(core.contextView(gm, { taskId: task.id }), 'response_too_large', /read_task_text/);
   const first = await core.taskText(gm, { taskId: task.id, field: 'context', offset: 0, limit: 8_192 });
@@ -329,7 +330,7 @@ test('a context over the budget is refused whole with read_task_text guidance; s
 test('a text reassembles exactly from 4-byte segments of mixed Chinese and emoji, with its digest verified (C3)', async () => {
   const text = '中文🙂字符'.repeat(60);
   const task = await core.createTask(gm, {
-    title: '分段样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('tiny'),
+    title: '分段样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', tag: goalId, idempotencyKey: key('tiny'),
   });
   const whole = await reassemble({ taskId: task.id, field: 'context', limit: 4 });
   expect(whole.text).toBe(text);
@@ -343,7 +344,7 @@ test('a control-heavy or quote-dense text reads back whole through read_task_tex
   // push the whole text past 48 KiB (120,000 bytes of control characters, 80,000 of the mix): it must be read in segments.
   for (const text of ['\u0001'.repeat(20_000), '"\u0001'.repeat(10_000)]) {
     const task = await core.createTask(gm, {
-      title: '转义样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('escape'),
+      title: '转义样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', tag: goalId, idempotencyKey: key('escape'),
     });
     const whole = await reassemble({ taskId: task.id, field: 'context', limit: 24 * 1024 });
     expect(whole.text).toBe(text);
@@ -363,7 +364,7 @@ test('a since that SurrealDB would refuse is invalid on every read that takes it
 test('a read past offset 0 must pin the digest of its first segment, so two versions of one text are never mixed (C3)', async () => {
   const text = '中文🙂字符'.repeat(40);
   const task = await core.createTask(gm, {
-    title: '版本样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('version'),
+    title: '版本样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', tag: goalId, idempotencyKey: key('version'),
   });
   await expectRefused(core.taskText(gm, { taskId: task.id, field: 'context', offset: 8, limit: 16 }), 'invalid', /expectSha256/);
   const first = await core.taskText(gm, { taskId: task.id, field: 'context', offset: 0, limit: 16 });
@@ -376,7 +377,7 @@ test('a read past offset 0 must pin the digest of its first segment, so two vers
 test('a paged traversal yields every working-set task exactly once, each page inside the budget', async () => {
   const expected = await workingIds(goalId);
   const seen = await drain(async cursor => {
-    const page = await core.contextView(gm, { goalId, pageSize: 37, ...(cursor ? { cursor } : {}) });
+    const page = await core.contextView(gm, { tag: goalId, pageSize: 37, ...(cursor ? { cursor } : {}) });
     expect(bytesOf(page)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
     // Every item is whole unless it cannot fit a page on its own (C3). A cut item is flagged, and its size describes the full text.
     for (const task of page.tasks!) {
@@ -394,56 +395,23 @@ test('a paged traversal yields every working-set task exactly once, each page in
   expect([...seen].sort()).toEqual([...expected].sort());
 });
 
-test('a listing item whose dependency list alone exceeds a page keeps the leading dependencies, flags listsTruncated, and reads the whole list back (SYS01 R3)', async () => {
-  const goal = await owner.createGoal({ text: `长依赖目标 ${suffix}`, source: 'owner:test', key: key('goal-deps'), tier: 'standard' });
-  const wide = await core.createTask(gm, {
-    title: `长依赖样例 ${suffix}`, context: '短正文', executorRole: 'engineering', reviewerRole: 'qa', goalId: goal.id, idempotencyKey: key('wide-deps'),
-  });
-  // A goal's acceptance task depends on every task of the goal: 900 identifiers are about 36 KiB of JSON, 72 KiB in both copies.
-  const deps = expectedWorking.slice(0, 900);
-  await database.db.query('UPDATE $task SET dependencies = $deps;', { task: id('task', wide.id), deps: deps.map(dep => id('task', dep)) });
-  const delivered: Array<Record<string, unknown>> = [];
-  let cursor: string | undefined;
-  for (let guard = 0; guard < 50; guard++) {
-    const page = await core.contextView(gm, { goalId: goal.id, pageSize: 2, ...(cursor ? { cursor } : {}) });
-    expect(bytesOf(page)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    delivered.push(...(page.tasks as Array<Record<string, unknown>>));
-    cursor = page.page!.nextCursor;
-    if (!page.page!.hasMore) break;
-  }
-  const item = delivered.find(task => task.id === wide.id);
-  expect(item).toBeDefined();
-  const kept = item!.dependencies as string[];
-  expect(kept.length).toBeGreaterThan(0);
-  expect(kept.length).toBeLessThan(deps.length);
-  expect(kept).toEqual(deps.slice(0, kept.length));
-  expect(item!.listsTruncated).toEqual({ dependencies: { count: deps.length, sha256: sha256(JSON.stringify(deps)) } });
-  // The context of this item is whole: the cut list made room for it.
-  expect(item!.contextTruncated).toBe(false);
-  expect(item!.context).toBe('短正文');
-  // The whole list reads back through read_task_text, verified by its digest.
-  const whole = await reassemble({ taskId: wide.id, field: 'dependencies', limit: 16 * 1024 });
-  expect(whole.sha256).toBe(sha256(JSON.stringify(deps)));
-  expect(JSON.parse(whole.text) as string[]).toEqual(deps);
-});
-
 test('a page item larger than the page budget on its own is cut at a character boundary and flagged; its rest reads by segment and the traversal goes on (C3, AC03)', async () => {
-  const goal = await owner.createGoal({ text: `超大条目目标 ${suffix}`, source: 'owner:test', key: key('goal-oversize'), tier: 'standard' });
+  const goal = await core.createTask(gm, { title: `超大条目目标 ${suffix}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('goal-oversize') });
   const text = '超'.repeat(20_000); // 60,000 bytes: larger than one page item on its own
   const big = await core.createTask(gm, {
-    title: `超大条目 ${unit}`, context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId: goal.id, idempotencyKey: key('oversize'),
+    title: `超大条目 ${unit}`, context: text, executorRole: 'engineering', reviewerRole: 'qa', tag: goal.id, idempotencyKey: key('oversize'),
   });
   for (let i = 0; i < 4; i++) {
     await core.createTask(gm, {
-      title: `超大目标样例 ${i} ${unit}`, context: `短正文 ${i}`, executorRole: 'engineering', reviewerRole: 'qa', goalId: goal.id, idempotencyKey: key(`oversize-${i}`),
+      title: `超大目标样例 ${i} ${unit}`, context: `短正文 ${i}`, executorRole: 'engineering', reviewerRole: 'qa', tag: goal.id, idempotencyKey: key(`oversize-${i}`),
     });
   }
   // A complete answer over this goal is refused, since the set does not fit whole (C2).
-  await expectRefused(core.contextView(gm, { goalId: goal.id }), 'response_too_large', /pageSize/);
+  await expectRefused(core.contextView(gm, { tag: goal.id }), 'response_too_large', /pageSize/);
   const expected = await workingIds(goal.id);
   const items: Array<Record<string, unknown>> = [];
   const seen = await drain(async cursor => {
-    const page = await core.contextView(gm, { goalId: goal.id, pageSize: 3, ...(cursor ? { cursor } : {}) });
+    const page = await core.contextView(gm, { tag: goal.id, pageSize: 3, ...(cursor ? { cursor } : {}) });
     expect(bytesOf(page)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
     items.push(...(page.tasks as Array<Record<string, unknown>>));
     return { items: page.tasks!.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
@@ -469,16 +437,16 @@ test('a page item larger than the page budget on its own is cut at a character b
 });
 
 test('a page item of 18 KiB of text, 36 KiB in both copies of the answer, stays whole for context and for evidence (C3)', async () => {
-  const goal = await owner.createGoal({ text: `中等条目目标 ${suffix}`, source: 'owner:test', key: key('goal-medium'), tier: 'standard' });
+  const goal = await core.createTask(gm, { title: `中等条目目标 ${suffix}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('goal-medium') });
   const text = '超'.repeat(6_000); // 18,000 bytes: 36 KiB in the text and in the JSON copy, still one page item
   const medium = await core.createTask(gm, {
-    title: `中等条目 ${unit}`, context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId: goal.id, idempotencyKey: key('medium-item'),
+    title: `中等条目 ${unit}`, context: text, executorRole: 'engineering', reviewerRole: 'qa', tag: goal.id, idempotencyKey: key('medium-item'),
   });
   await addAudit(medium.id, text);
   const expected = await workingIds(goal.id);
   const delivered: Array<Record<string, unknown>> = [];
   const seen = await drain(async cursor => {
-    const page = await core.contextView(gm, { goalId: goal.id, pageSize: 2, ...(cursor ? { cursor } : {}) });
+    const page = await core.contextView(gm, { tag: goal.id, pageSize: 2, ...(cursor ? { cursor } : {}) });
     expect(bytesOf(page)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
     delivered.push(...(page.tasks as Array<Record<string, unknown>>));
     return { items: page.tasks!.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
@@ -500,44 +468,44 @@ test('a page item of 18 KiB of text, 36 KiB in both copies of the answer, stays 
 test('every page re-checks the caller: an identity revoked mid-traversal is refused on its next page as unauthorized (C4)', async () => {
   const revoked = `qp-revoked-${suffix}`;
   const credential = await enrollment.enroll(revoked, 'owner', ['execute', 'review', 'manage']);
-  const first = await core.contextView(credential, { goalId, pageSize: 5 });
+  const first = await core.contextView(credential, { tag: goalId, pageSize: 5 });
   expect(first.page?.nextCursor).toBeDefined();
   await enrollment.revoke(revoked);
-  await expectRefused(core.contextView(credential, { goalId, pageSize: 5, cursor: first.page!.nextCursor }), 'unauthorized', /Invalid credential/);
+  await expectRefused(core.contextView(credential, { tag: goalId, pageSize: 5, cursor: first.page!.nextCursor }), 'unauthorized', /Invalid credential/);
 });
 
 test('a gm summary read while writers run is one consistent read: every answer passes its integrity checks (C5)', async () => {
   const writers = Promise.all(Array.from({ length: 3 }, (_, w) => (async () => {
     for (let i = 0; i < 5; i++) {
       const task = await core.createTask(gm, {
-        title: `汇总并发样例 ${w}-${i} ${unit}`, context: `并发写入 ${w}-${i}`, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key(`sum-${w}-${i}`),
+        title: `汇总并发样例 ${w}-${i} ${unit}`, context: `并发写入 ${w}-${i}`, executorRole: 'engineering', reviewerRole: 'qa', tag: goalId, idempotencyKey: key(`sum-${w}-${i}`),
       });
       await addAudit(task.id, `并发审计 ${w}-${i}`);
     }
   })()));
   const answers: Array<Awaited<ReturnType<typeof core.adminSummary>>> = [];
-  while (answers.length < 8) answers.push(await core.adminSummary(gm, { goalId }));
+  while (answers.length < 8) answers.push(await core.adminSummary(gm, { tag: goalId }));
   await writers;
   for (const summary of answers) {
     expect(summary.integrity.complete).toBe(true);
     expect(summary.integrity.checks).toEqual({ taskCountsMatchRows: true, auditCountsMatchRows: true, statesKnown: true, repeatableRead: true });
   }
   // After the writers finish, the summary counts every task of the goal that the database holds.
-  const [rows] = await database.db.query<[Array<{ n: number }>]>('SELECT count() AS n FROM task WHERE goal = $goal GROUP ALL;', { goal: id('goal', goalId) });
-  const final = await core.adminSummary(gm, { goalId });
+  const [rows] = await database.db.query<[Array<{ n: number }>]>('SELECT count() AS n FROM task WHERE tag = $goal GROUP ALL;', { goal: goalId });
+  const final = await core.adminSummary(gm, { tag: goalId });
   expect(final.integrity.complete).toBe(true);
   expect(final.integrity.taskRows).toBe(rows?.[0]?.n ?? 0);
 });
 
 test('a gm summary read while tasks change state and audit entries arrive is one consistent read: the task total holds, audit counts never fall (C5)', async () => {
-  const busy = await owner.createGoal({ text: `汇总移动目标 ${suffix}`, source: 'owner:test', key: key('goal-summary-moves'), tier: 'standard' });
+  const busy = await core.createTask(gm, { title: `汇总移动目标 ${suffix}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('goal-summary-moves') });
   // The goal needs at least six tasks of its own for the writers to move between states.
   for (let i = 0; i < 6; i++) {
     await core.createTask(gm, {
-      title: `汇总移动样例 ${i} ${unit}`, context: `移动前的正文 ${i}`, executorRole: 'engineering', reviewerRole: 'qa', goalId: busy.id, idempotencyKey: key(`moves-${i}`),
+      title: `汇总移动样例 ${i} ${unit}`, context: `移动前的正文 ${i}`, executorRole: 'engineering', reviewerRole: 'qa', tag: busy.id, idempotencyKey: key(`moves-${i}`),
     });
   }
-  const [rows] = await database.db.query<[Array<{ id: RecordId }>]>('SELECT id FROM task WHERE goal = $goal;', { goal: id('goal', busy.id) });
+  const [rows] = await database.db.query<[Array<{ id: RecordId }>]>('SELECT id FROM task WHERE tag = $goal;', { goal: busy.id });
   const members = (rows ?? []).map(row => asId(row.id));
   const total = members.length;
   expect(total).toBeGreaterThanOrEqual(6);
@@ -550,7 +518,7 @@ test('a gm summary read while tasks change state and audit entries arrive is one
     }
   })();
   const answers: Array<Awaited<ReturnType<typeof core.adminSummary>>> = [];
-  while (answers.length < 10) answers.push(await core.adminSummary(gm, { goalId: busy.id }));
+  while (answers.length < 10) answers.push(await core.adminSummary(gm, { tag: busy.id }));
   await writers;
   let previousAudit = -1;
   let previousCutoff = '';
@@ -564,7 +532,7 @@ test('a gm summary read while tasks change state and audit entries arrive is one
     previousCutoff = summary.cutoffAt;
   }
   // Once the writers have finished, a fresh read counts every audit entry they wrote and agrees with the rows.
-  const final = await core.adminSummary(gm, { goalId: busy.id });
+  const final = await core.adminSummary(gm, { tag: busy.id });
   expect(final.integrity.complete).toBe(true);
   expect(final.integrity.auditRows).toBeGreaterThanOrEqual(previousAudit);
   expect(final.integrity.auditRows).toBeGreaterThanOrEqual(6);
@@ -573,7 +541,7 @@ test('a gm summary read while tasks change state and audit entries arrive is one
 test('UTF-8 survives every page: Chinese titles and emoji parse back intact', async () => {
   const titles: string[] = [];
   await drain(async cursor => {
-    const page = await core.contextView(gm, { goalId, pageSize: 100, ...(cursor ? { cursor } : {}) });
+    const page = await core.contextView(gm, { tag: goalId, pageSize: 100, ...(cursor ? { cursor } : {}) });
     const parsed = JSON.parse(JSON.stringify(page)) as typeof page;
     for (const task of parsed.tasks!) {
       expect(String(task.context)).not.toContain('�');
@@ -586,18 +554,18 @@ test('UTF-8 survives every page: Chinese titles and emoji parse back intact', as
 
 test('a traversal keeps its snapshot: rows created mid-way are excluded and in-place updates neither repeat nor drop rows', async () => {
   const snapshot = await workingIds(goalId);
-  const first = await core.contextView(gm, { goalId, pageSize: 50 });
+  const first = await core.contextView(gm, { tag: goalId, pageSize: 50 });
   const late: string[] = [];
   for (let i = 0; i < 3; i++) {
     const created = await core.createTask(gm, {
-      title: `迟到样例 ${i}`, context: `创建于快照之后 ${i}`, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key(`late${i}`),
+      title: `迟到样例 ${i}`, context: `创建于快照之后 ${i}`, executorRole: 'engineering', reviewerRole: 'qa', tag: goalId, idempotencyKey: key(`late${i}`),
     });
     late.push(created.id);
   }
-  await database.db.query('UPDATE task SET title = title + " · 已更新" WHERE goal = $goal;', { goal: id('goal', goalId) });
+  await database.db.query('UPDATE task SET title = title + " · 已更新" WHERE tag = $goal;', { goal: goalId });
   // Continue from the first page's cursor: the traversal started before the mid-way writes above.
   const rest = await drain(async cursor => {
-    const page = await core.contextView(gm, { goalId, pageSize: 50, ...(cursor ? { cursor } : {}) });
+    const page = await core.contextView(gm, { tag: goalId, pageSize: 50, ...(cursor ? { cursor } : {}) });
     return { items: page.tasks ?? [], nextCursor: page.page!.nextCursor };
   }, first.page!.nextCursor);
   const everything = [...first.tasks!, ...rest];
@@ -611,14 +579,14 @@ test('a traversal keeps its snapshot: rows created mid-way are excluded and in-p
 });
 
 test('cursors are bound to the caller and the query, are sealed, and expire with their listing (C4)', async () => {
-  const first = await core.contextView(gm, { goalId, pageSize: 10 });
+  const first = await core.contextView(gm, { tag: goalId, pageSize: 10 });
   const token = first.page!.nextCursor!;
-  await expectRefused(core.contextView(gm, { goalId, pageSize: 10, cursor: token.replace(/\.[^.]+$/, '.') }), 'invalid', /verification|malformed/);
-  await expectRefused(core.contextView(eng, { goalId, pageSize: 10, cursor: token }), 'forbidden', /another caller/);
-  await expectRefused(core.contextView(gm, { goalId, state: 'ready', pageSize: 10, cursor: token }), 'forbidden', /another query/);
-  await expectRefused(core.contextView(gm, { goalId, pageSize: 10, fields: ['id'], cursor: token }), 'forbidden', /another query/);
+  await expectRefused(core.contextView(gm, { tag: goalId, pageSize: 10, cursor: token.replace(/\.[^.]+$/, '.') }), 'invalid', /verification|malformed/);
+  await expectRefused(core.contextView(eng, { tag: goalId, pageSize: 10, cursor: token }), 'forbidden', /another caller/);
+  await expectRefused(core.contextView(gm, { tag: goalId, state: 'ready', pageSize: 10, cursor: token }), 'forbidden', /another query/);
+  await expectRefused(core.contextView(gm, { tag: goalId, pageSize: 10, fields: ['id'], cursor: token }), 'forbidden', /another query/);
   const flipped = token.slice(0, -2) + (token.endsWith('AA') ? 'BB' : 'AA');
-  await expectRefused(core.contextView(gm, { goalId, pageSize: 10, cursor: flipped }), 'invalid', /verification|malformed/);
+  await expectRefused(core.contextView(gm, { tag: goalId, pageSize: 10, cursor: flipped }), 'invalid', /verification|malformed/);
   // A cursor sealed with the stored key but already past its expiry names a listing that is gone.
   const keyRow = await database.db.select<{ key: string }>(id('company_meta', 'cursor_key'));
   const sealKey = Buffer.from(keyRow!.key, 'base64url');
@@ -626,26 +594,26 @@ test('cursors are bound to the caller and the query, are sealed, and expire with
     v: 1, k: 'context', c: ids.gm, q: queryDigest('context', { state: null, goalId, role: null, since: null, fields: null }),
     sid: randomUUID(), seq: 0, exp: Date.now() - 1_000,
   }, sealKey);
-  await expectRefused(core.contextView(gm, { goalId, pageSize: 10, cursor: expired }), 'snapshot_gone', /expired/);
+  await expectRefused(core.contextView(gm, { tag: goalId, pageSize: 10, cursor: expired }), 'snapshot_gone', /expired/);
   // The unmodified cursor still works for its own caller and query.
-  const again = await core.contextView(gm, { goalId, pageSize: 10, cursor: token });
+  const again = await core.contextView(gm, { tag: goalId, pageSize: 10, cursor: token });
   expect(again.tasks!.length).toBeGreaterThan(0);
 });
 
 test('a listing taken under one role is refused under another, and resumes once the role is back (C4)', async () => {
-  const first = await core.contextView(gm, { goalId, pageSize: 5 });
+  const first = await core.contextView(gm, { tag: goalId, pageSize: 5 });
   const token = first.page!.nextCursor!;
   const record = id('query_snapshot', String(cursorBody(token).sid));
   await database.db.query('UPDATE ONLY $record SET role = "engineering";', { record });
-  await expectRefused(core.contextView(gm, { goalId, pageSize: 5, cursor: token }), 'forbidden', /another role/);
+  await expectRefused(core.contextView(gm, { tag: goalId, pageSize: 5, cursor: token }), 'forbidden', /another role/);
   await database.db.query('UPDATE ONLY $record SET role = "owner";', { record });
-  const resumed = await core.contextView(gm, { goalId, pageSize: 5, cursor: token });
+  const resumed = await core.contextView(gm, { tag: goalId, pageSize: 5, cursor: token });
   expect(resumed.tasks!.length).toBe(5);
 });
 
 test('task history pages stay inside the budget and yield every entry once; evidence over the page budget is cut, flagged and reassembles (C2, C3, C4)', async () => {
   const task = await core.createTask(gm, {
-    title: '历史分页样例', context: '历史分页夹具', executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('hist'),
+    title: '历史分页样例', context: '历史分页夹具', executorRole: 'engineering', reviewerRole: 'qa', tag: goalId, idempotencyKey: key('hist'),
   });
   for (let i = 0; i < 29; i++) await addAudit(task.id, codePoints(6_000, `证据第${i}条 `));
   const oversized = '超'.repeat(20_000); // 60,000 bytes: larger than a page can hold on its own
@@ -672,48 +640,47 @@ test('task history pages stay inside the budget and yield every entry once; evid
 });
 
 test('the gm summary counts the fixture at a cutoff, reads repeatably, and everyone else is refused (C5)', async () => {
-  const [rows] = await database.db.query<[Array<{ id: RecordId }>]>('SELECT id FROM task WHERE goal = $goal;', { goal: id('goal', goalId) });
-  const summary = await core.adminSummary(gm, { goalId });
+  const [rows] = await database.db.query<[Array<{ id: RecordId }>]>('SELECT id FROM task WHERE tag = $goal;', { goal: goalId });
+  const summary = await core.adminSummary(gm, { tag: goalId });
   const counted = Object.values(summary.tasks).reduce((sum, n) => sum + n, 0);
   expect(counted).toBe((rows ?? []).length);
   expect(summary.cutoffAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   expect(summary.since).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-  expect(summary.goalId).toBe(goalId);
   expect(summary.scope.tasks).toContain('since does not apply');
   expect(summary.integrity.complete).toBe(true);
   expect(summary.integrity.checks).toEqual({ taskCountsMatchRows: true, auditCountsMatchRows: true, statesKnown: true, repeatableRead: true });
   expect(summary.integrity.taskRows).toBe(counted);
-  await expectRefused(core.adminSummary(eng, {}), 'forbidden', /Only gm/);
-  await expectRefused(core.adminSummary(cs, {}), 'forbidden', /Only gm/);
+  await expectRefused(core.adminSummary(eng, {}), 'forbidden', /Only owner/);
+  await expectRefused(core.adminSummary(cs, {}), 'forbidden', /Only owner/);
 });
 
 test('audit counts cover [since, cutoffAt] and task counts ignore the window; with goalId the audit counts are that goal\'s (C5, AC04)', async () => {
   const wide = '2000-01-01T00:00:00.000Z';
-  const everything = await core.adminSummary(gm, { goalId, since: wide });
+  const everything = await core.adminSummary(gm, { tag: goalId, since: wide });
   // With goalId the audit counts are that goal's tasks' entries, so they are counted here through those tasks.
   const [audits] = await database.db.query<[Array<{ n: number }>]>(
-    'SELECT count() AS n FROM audit WHERE task IN (SELECT VALUE id FROM task WHERE goal = $goal) AND at >= <datetime>$since AND at <= <datetime>$cutoff GROUP ALL;',
-    { goal: id('goal', goalId), since: wide, cutoff: everything.cutoffAt });
+    'SELECT count() AS n FROM audit WHERE task IN (SELECT VALUE id FROM task WHERE tag = $goal) AND at >= <datetime>$since AND at <= <datetime>$cutoff GROUP ALL;',
+    { goal: goalId, since: wide, cutoff: everything.cutoffAt });
   const [allAudits] = await database.db.query<[Array<{ n: number }>]>(
     'SELECT count() AS n FROM audit WHERE at >= <datetime>$since AND at <= <datetime>$cutoff GROUP ALL;',
     { since: wide, cutoff: everything.cutoffAt });
   expect(everything.since).toBe(wide);
-  expect(everything.scope.audit).toContain('this goal');
+  expect(everything.scope.audit).toContain('this tag');
   expect(everything.integrity.auditRows).toBeGreaterThan(0);
   expect(everything.integrity.auditRows).toBe(audits?.[0]?.n ?? 0);
   expect(everything.integrity.auditRows).toBeLessThan(allAudits?.[0]?.n ?? 0);
   const futureSince = new Date(Date.now() + 3_600_000).toISOString();
-  const future = await core.adminSummary(gm, { goalId, since: futureSince });
+  const future = await core.adminSummary(gm, { tag: goalId, since: futureSince });
   expect(future.since).toBe(futureSince);
   expect(future.integrity.auditRows).toBe(0);
   expect(future.tasks).toEqual(everything.tasks);
 });
 
 test('a role that may see no task gets an empty page, and an empty legacy answer, never the company listing', async () => {
-  const page = await core.contextView(cs, { goalId, pageSize: 5 });
+  const page = await core.contextView(cs, { tag: goalId, pageSize: 5 });
   expect(page.tasks).toEqual([]);
   expect(page.page!.hasMore).toBe(false);
-  const legacy = await core.contextView(cs, { goalId });
+  const legacy = await core.contextView(cs, { tag: goalId });
   expect(legacy.tasks).toEqual([]);
   expect(legacy.page).toBeUndefined();
 });
@@ -739,9 +706,9 @@ test('reads add no task, audit or outbox state; the only new rows are stored lis
   };
   const before = { task: await countRows('task'), audit: await countRows('audit'), outbox: await countRows('outbox') };
   const listingsBefore = await listingIds();
-  await core.contextView(gm, { goalId, pageSize: 10 });
+  await core.contextView(gm, { tag: goalId, pageSize: 10 });
   await core.historyView(gm, expectedWorking[0]!, { pageSize: 5 });
-  await core.adminSummary(gm, { goalId });
+  await core.adminSummary(gm, { tag: goalId });
   const emptyWorktrees = await core.worktreePage(gm, { pageSize: 5 });
   const after = { task: await countRows('task'), audit: await countRows('audit'), outbox: await countRows('outbox') };
   expect(after).toEqual(before);
@@ -757,7 +724,7 @@ test('reads add no task, audit or outbox state; the only new rows are stored lis
 });
 
 test('sck relay round trip: the real comm client returns one complete, budgeted JSON page', async () => {
-  const relayed = await relay('get_context', { goalId, pageSize: 37 }, args => core.contextView(gm, args));
+  const relayed = await relay('get_context', { tag: goalId, pageSize: 37 }, args => core.contextView(gm, args));
   expect(relayed.exit).toBe(0);
   expect(relayed.out.endsWith('\n')).toBe(true);
   expect(Buffer.byteLength(relayed.out, 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
@@ -784,21 +751,21 @@ test('an invalid query comes back as a JSON error with the reason on stderr', as
 
 test('state, role and time filters narrow the listing, and the cursor stays bound to them', async () => {
   const [readyRows] = await database.db.query<[Array<{ id: RecordId }>]>(
-    "SELECT id FROM task WHERE goal = $goal AND state = 'ready';", { goal: id('goal', goalId) });
+    "SELECT id FROM task WHERE tag = $goal AND state = 'ready';", { goal: goalId });
   const readyDb = (readyRows ?? []).map(row => asId(row.id));
   const readySeen = await drain(async cursor => {
-    const page = await core.contextView(gm, { goalId, state: 'ready', pageSize: 100, ...(cursor ? { cursor } : {}) });
+    const page = await core.contextView(gm, { tag: goalId, state: 'ready', pageSize: 100, ...(cursor ? { cursor } : {}) });
     expect(page.tasks!.every(task => task.state === 'ready')).toBe(true);
     return { items: page.tasks!.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
   });
   expect([...readySeen].sort()).toEqual([...readyDb].sort());
-  const engineering = await core.contextView(gm, { goalId, role: 'engineering', pageSize: 100 });
+  const engineering = await core.contextView(gm, { tag: goalId, role: 'engineering', pageSize: 100 });
   expect(engineering.tasks!.every(task => task.executorRole === 'engineering' || task.reviewerRole === 'engineering')).toBe(true);
   expect(engineering.tasks!.length).toBeGreaterThan(0);
-  const future = await core.contextView(gm, { goalId, since: new Date(Date.now() + 3_600_000).toISOString() });
+  const future = await core.contextView(gm, { tag: goalId, since: new Date(Date.now() + 3_600_000).toISOString() });
   expect(future.tasks).toEqual([]);
-  const someCursor = (await core.contextView(gm, { goalId, state: 'ready', pageSize: 5 })).page!.nextCursor!;
-  await expectRefused(core.contextView(gm, { goalId, pageSize: 5, cursor: someCursor }), 'forbidden', /another query/);
+  const someCursor = (await core.contextView(gm, { tag: goalId, state: 'ready', pageSize: 5 })).page!.nextCursor!;
+  await expectRefused(core.contextView(gm, { tag: goalId, pageSize: 5, cursor: someCursor }), 'forbidden', /another query/);
 });
 
 test('list_worktrees is compact and paged: released references are counted, listed only on request, and the cursor is bound (C1, C4)', async () => {
@@ -863,28 +830,28 @@ test('a worktree listing keeps its rows while the registry changes between pages
 test('a caller that drops mid-traversal retries the same cursor on a fresh connection and gets the same page (AC05)', async () => {
   const expected = await workingIds(goalId);
   const pageSize = 37;
-  const first = await core.contextView(gm, { goalId, pageSize });
+  const first = await core.contextView(gm, { tag: goalId, pageSize });
   const cursor = first.page!.nextCursor!;
   // The answer to this page is lost in transit: nothing is kept on the caller side, so it asks again.
-  const lost = await core.contextView(gm, { goalId, pageSize, cursor });
+  const lost = await core.contextView(gm, { tag: goalId, pageSize, cursor });
   // A fresh connection (a new core with no state of its own) retries with the same cursor.
   const fresh = new SurrealCompanyCore(database);
-  const retried = await fresh.contextView(gm, { goalId, pageSize, cursor });
+  const retried = await fresh.contextView(gm, { tag: goalId, pageSize, cursor });
   // The retry is the same page of the same listing: same tasks, same snapshot, same continuation.
   expect(JSON.parse(JSON.stringify(retried.tasks))).toEqual(JSON.parse(JSON.stringify(lost.tasks)));
   expect(retried.page!.snapshotAt).toBe(lost.page!.snapshotAt);
   expect(cursorBody(retried.page!.nextCursor!)).toEqual(cursorBody(lost.page!.nextCursor!));
   // Through real comm client processes: the first caller is killed after its request left, then a new process retries.
   const dir = newCommDir();
-  const dropped = await relayAndDrop(dir, 'get_context', { goalId, pageSize, cursor }, args => core.contextView(gm, args));
-  expect(dropped).toEqual({ goalId, pageSize, cursor });
-  const relayed = await relay('get_context', { goalId, pageSize, cursor }, args => fresh.contextView(gm, args), dir);
+  const dropped = await relayAndDrop(dir, 'get_context', { tag: goalId, pageSize, cursor }, args => core.contextView(gm, args));
+  expect(dropped).toEqual({ tag: goalId, pageSize, cursor });
+  const relayed = await relay('get_context', { tag: goalId, pageSize, cursor }, args => fresh.contextView(gm, args), dir);
   expect(relayed.exit).toBe(0);
   const page = JSON.parse(relayed.out) as { tasks: Array<{ id: unknown }>; page: { nextCursor?: string } };
   expect(page.tasks!.map(task => String(task.id))).toEqual(lost.tasks!.map(task => String(task.id)));
   // Continuing from the retried page reaches every task of the listing exactly once.
   const rest = await drain(async next => {
-    const more = await fresh.contextView(gm, { goalId, pageSize, ...(next ? { cursor: next } : {}) });
+    const more = await fresh.contextView(gm, { tag: goalId, pageSize, ...(next ? { cursor: next } : {}) });
     return { items: more.tasks!.map(task => String(task.id)), nextCursor: more.page!.nextCursor };
   }, page.page.nextCursor);
   const seen = [...first.tasks!.map(task => String(task.id)), ...page.tasks!.map(task => String(task.id)), ...rest];
@@ -895,27 +862,27 @@ test('a caller that drops mid-traversal retries the same cursor on a fresh conne
 test('state moves, goal and role changes, and new tasks mid-traversal change nothing the listing delivers (C4)', async () => {
   const members = await workingIds(goalId);
   const [before] = await database.db.query<[Array<{ id: RecordId; state: string; executor_role: string }>]>(
-    'SELECT id, state, executor_role FROM task WHERE goal = $goal;', { goal: id('goal', goalId) });
+    'SELECT id, state, executor_role FROM task WHERE tag = $goal;', { goal: goalId });
   const stateAt = new Map((before ?? []).map(row => [asId(row.id), row.state]));
   const roleAt = new Map((before ?? []).map(row => [asId(row.id), row.executor_role]));
-  const first = await core.contextView(gm, { goalId, pageSize: 40 });
-  const other = await owner.createGoal({ text: `分页另一目标 ${suffix}`, source: 'owner:test', key: key('goal-other'), tier: 'standard' });
+  const first = await core.contextView(gm, { tag: goalId, pageSize: 40 });
+  const other = await core.createTask(gm, { title: `分页另一目标 ${suffix}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('goal-other') });
   // Mid-way: 100 tasks finish, 50 move to another goal, 50 change executor role, and three new tasks arrive.
   const finished = members.slice(0, 100).map(member => id('task', member));
   const moved = members.slice(100, 150).map(member => id('task', member));
   const rerolled = members.slice(150, 200).map(member => id('task', member));
   await database.db.query('UPDATE task SET state = "done" WHERE id IN $ids;', { ids: finished });
-  await database.db.query('UPDATE task SET goal = $goal WHERE id IN $ids;', { goal: id('goal', other.id), ids: moved });
+  await database.db.query('UPDATE task SET tag = $goal WHERE id IN $ids;', { goal: other.id, ids: moved });
   await database.db.query('UPDATE task SET executor_role = "qa" WHERE id IN $ids;', { ids: rerolled });
   const newcomers: string[] = [];
   for (let i = 0; i < 3; i++) {
     const created = await core.createTask(gm, {
-      title: `中途样例 ${i}`, context: `中途新增 ${i}`, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key(`mid${i}`),
+      title: `中途样例 ${i}`, context: `中途新增 ${i}`, executorRole: 'engineering', reviewerRole: 'qa', tag: goalId, idempotencyKey: key(`mid${i}`),
     });
     newcomers.push(created.id);
   }
   const rest = await drain(async cursor => {
-    const page = await core.contextView(gm, { goalId, pageSize: 40, ...(cursor ? { cursor } : {}) });
+    const page = await core.contextView(gm, { tag: goalId, pageSize: 40, ...(cursor ? { cursor } : {}) });
     return { items: page.tasks ?? [], nextCursor: page.page!.nextCursor };
   }, first.page!.nextCursor);
   const delivered = [...first.tasks!, ...rest];
@@ -927,7 +894,7 @@ test('state moves, goal and role changes, and new tasks mid-traversal change not
   for (const task of delivered) {
     const taskId = String(task.id);
     expect(task.state).toBe(stateAt.get(taskId));
-    expect(task.goalId).toBe(goalId);
+    expect(task.tag).toBe(goalId);
     expect(task.executorRole).toBe(roleAt.get(taskId));
   }
 });
@@ -941,7 +908,7 @@ test('a full traversal keeps every page inside the budget; heap growth is a meas
   const pages: Array<{ bytes: number; rows: number; ms: number }> = [];
   const seen = await drain(async cursor => {
     const started = performance.now();
-    const page = await core.contextView(gm, { goalId, pageSize, ...(cursor ? { cursor } : {}) });
+    const page = await core.contextView(gm, { tag: goalId, pageSize, ...(cursor ? { cursor } : {}) });
     const ms = performance.now() - started;
     pages.push({ bytes: bytesOf(page), rows: page.tasks!.length, ms });
     heapPeak = Math.max(heapPeak, process.memoryUsage().heapUsed);
@@ -969,11 +936,11 @@ test('a full traversal keeps every page inside the budget; heap growth is a meas
 });
 
 test('a listing past its expiry is refused as snapshot_gone, and the sweep removes it with its rows (C4)', async () => {
-  const first = await core.contextView(gm, { goalId, pageSize: 3 });
+  const first = await core.contextView(gm, { tag: goalId, pageSize: 3 });
   const token = first.page!.nextCursor!;
   const sid = String(cursorBody(token).sid);
   await database.db.query('UPDATE ONLY $record SET expires_ms = 0;', { record: id('query_snapshot', sid) });
-  await expectRefused(core.contextView(gm, { goalId, pageSize: 3, cursor: token }), 'snapshot_gone', /start the listing again/);
+  await expectRefused(core.contextView(gm, { tag: goalId, pageSize: 3, cursor: token }), 'snapshot_gone', /start the listing again/);
   const store = new SnapshotStore(database.db);
   expect(await store.sweep()).toBeGreaterThanOrEqual(1);
   const gone = await database.db.select(id('query_snapshot', sid));
@@ -983,13 +950,13 @@ test('a listing past its expiry is refused as snapshot_gone, and the sweep remov
 });
 
 test('an identity past its listing cap loses its oldest listing, which then fails as snapshot_gone (C4)', async () => {
-  const first = await core.contextView(gm, { goalId, state: 'ready', pageSize: 5 });
+  const first = await core.contextView(gm, { tag: goalId, state: 'ready', pageSize: 5 });
   const oldest = first.page!.nextCursor!;
   // Six more listings for the same identity, each under its own query, push the first past the cap of four.
   for (let i = 0; i < 6; i++) {
-    await core.contextView(gm, { goalId, since: new Date(Date.now() - (i + 1) * 60_000).toISOString(), pageSize: 5 });
+    await core.contextView(gm, { tag: goalId, since: new Date(Date.now() - (i + 1) * 60_000).toISOString(), pageSize: 5 });
   }
-  await expectRefused(core.contextView(gm, { goalId, state: 'ready', pageSize: 5, cursor: oldest }), 'snapshot_gone', /start the listing again/);
+  await expectRefused(core.contextView(gm, { tag: goalId, state: 'ready', pageSize: 5, cursor: oldest }), 'snapshot_gone', /start the listing again/);
   const [owned] = await database.db.query<[Array<{ n: number }>]>('SELECT count() AS n FROM query_snapshot WHERE owner = $owner GROUP ALL;', { owner: ids.gm });
   expect(owned?.[0]?.n ?? 0).toBeLessThanOrEqual(4);
 });
@@ -1167,7 +1134,7 @@ test('a worktree whose references alone exceed a page is cut and flagged, pageSi
 });
 
 test('read_worktree_refs keeps the list_worktrees scope: a global read is gm only, and a path outside the scope is not_found (SYS01 R1, R8)', async () => {
-  await expectRefused(core.worktreeRefs(eng, { worktreePath: '/tmp/wt-000' }), 'forbidden', /gm/);
+  await expectRefused(core.worktreeRefs(eng, { worktreePath: '/tmp/wt-000' }), 'forbidden', /owner/);
   await expectRefused(core.worktreeRefs(gm, { worktreePath: '/tmp/not-registered' }), 'not_found', /worktree not found/);
 });
 
@@ -1257,30 +1224,30 @@ test('read_worktree_refs over MCP: a cut worktree reassembles in segments, and e
 });
 
 test('concurrent traversals with writers: each listing is delivered exactly once, with no duplicate and no miss, and each row shows its state at the listing (C4)', async () => {
-  const concurrent = await owner.createGoal({ text: `并发目标 ${suffix}`, source: 'owner:test', key: key('goal-conc'), tier: 'standard' });
+  const concurrent = await core.createTask(gm, { title: `并发目标 ${suffix}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('goal-conc') });
   for (let i = 0; i < 120; i++) {
     await core.createTask(gm, {
       title: `并发样例 ${i} ${unit}`, context: `并发正文 ${i}`, executorRole: 'engineering', reviewerRole: 'qa',
-      goalId: concurrent.id, idempotencyKey: key(`conc${i}`),
+      tag: concurrent.id, idempotencyKey: key(`conc${i}`),
     });
   }
   const sizes = [7, 13, 30];
   // Three first pages at once: their listings are stored together, through the one admission queue.
-  const firsts = await Promise.all(sizes.map(pageSize => core.contextView(gm, { goalId: concurrent.id, pageSize })));
+  const firsts = await Promise.all(sizes.map(pageSize => core.contextView(gm, { tag: concurrent.id, pageSize })));
   // The writers start only now, so the membership and the states the listings hold are those of this instant.
   const members = await workingIds(concurrent.id);
   const [stateRows] = await database.db.query<[Array<{ id: RecordId; state: string }>]>(
-    'SELECT id, state FROM task WHERE goal = $goal;', { goal: id('goal', concurrent.id) });
+    'SELECT id, state FROM task WHERE tag = $goal;', { goal: concurrent.id });
   const stateAt = new Map((stateRows ?? []).map(row => [asId(row.id), row.state]));
   const writers = (async () => {
     for (let round = 0; round < 3; round++) {
-      await database.db.query('UPDATE task SET title = title + " · 并发更新" WHERE goal = $goal;', { goal: id('goal', concurrent.id) });
+      await database.db.query('UPDATE task SET title = title + " · 并发更新" WHERE tag = $goal;', { goal: concurrent.id });
     }
     await database.db.query('UPDATE task SET state = "done" WHERE id IN $ids;', { ids: members.slice(0, 40).map(member => id('task', member)) });
   })();
   // Each traversal continues from its own first page while the writers run.
   const rests = await Promise.all(firsts.map((first, index) => drain(async cursor => {
-    const page = await core.contextView(gm, { goalId: concurrent.id, pageSize: sizes[index]!, ...(cursor ? { cursor } : {}) });
+    const page = await core.contextView(gm, { tag: concurrent.id, pageSize: sizes[index]!, ...(cursor ? { cursor } : {}) });
     return { items: page.tasks ?? [], nextCursor: page.page!.nextCursor };
   }, first.page!.nextCursor)));
   await writers;
@@ -1296,8 +1263,8 @@ test('concurrent traversals with writers: each listing is delivered exactly once
   const fresh = new SurrealCompanyCore(database);
   const cursor = firsts[0]!.page!.nextCursor!;
   const [mine, theirs] = await Promise.all([
-    core.contextView(gm, { goalId: concurrent.id, pageSize: sizes[0], cursor }),
-    fresh.contextView(gm, { goalId: concurrent.id, pageSize: sizes[0], cursor }),
+    core.contextView(gm, { tag: concurrent.id, pageSize: sizes[0], cursor }),
+    fresh.contextView(gm, { tag: concurrent.id, pageSize: sizes[0], cursor }),
   ]);
   expect(JSON.stringify(theirs.tasks)).toBe(JSON.stringify(mine.tasks));
 });
@@ -1322,7 +1289,7 @@ test('the real sidecar and comm client carry a traversal and the legacy answers,
     const pageBytes: number[] = [];
     let cursor: string | undefined;
     for (let page = 0; page < 200; page++) {
-      const reply = await call('get_context', { goalId, pageSize: 100, ...(cursor ? { cursor } : {}) });
+      const reply = await call('get_context', { tag: goalId, pageSize: 100, ...(cursor ? { cursor } : {}) });
       expect(reply.exit).toBe(0);
       expect(Buffer.byteLength(reply.out, 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
       const body = JSON.parse(reply.out) as { tasks: Array<{ id: unknown }>; page: { nextCursor?: string } };
@@ -1334,10 +1301,10 @@ test('the real sidecar and comm client carry a traversal and the legacy answers,
     expect(new Set(seen).size).toBe(seen.length);
     expect([...seen].sort()).toEqual([...expected].sort());
     // Legacy answers through the same channel: whole when they fit, refused as JSON when they do not.
-    const whole = await call('get_context', { goalId: smallGoalId });
+    const whole = await call('get_context', { tag: smallGoalId });
     expect(whole.exit).toBe(0);
     expect(Object.keys(JSON.parse(whole.out) as object).sort()).toEqual(['companyIncluded', 'companyRead', 'principal', 'tasks']);
-    const refused = await call('get_context', { goalId });
+    const refused = await call('get_context', { tag: goalId });
     expect(refused.exit).toBe(1);
     expect(JSON.parse(refused.out)).toMatchObject({ ok: false });
     expect(refused.out).toContain('response_too_large');
@@ -1386,16 +1353,16 @@ test('the real sidecar and comm client carry a traversal and the legacy answers,
 
 test('a burst of first pages for one caller stays within its cap, and a listing the burst evicts is refused, never completed short (C4)', async () => {
   const earliest = new Date(Date.now() - 100 * 3_600_000).toISOString();
-  const first = await core.contextView(gm, { goalId, pageSize: 5, since: earliest });
+  const first = await core.contextView(gm, { tag: goalId, pageSize: 5, since: earliest });
   const token = first.page!.nextCursor!;
   // Eight first pages at once under eight different queries: each is admitted in turn, never past the cap.
   const burst = await Promise.all(Array.from({ length: 8 }, (_, index) =>
-    core.contextView(gm, { goalId, pageSize: 5, since: new Date(Date.now() - (index + 1) * 3_600_000).toISOString() })));
+    core.contextView(gm, { tag: goalId, pageSize: 5, since: new Date(Date.now() - (index + 1) * 3_600_000).toISOString() })));
   expect(burst.every(page => page.tasks!.length === 5 && page.page!.hasMore)).toBe(true);
   const [owned] = await database.db.query<[Array<{ n: number }>]>('SELECT count() AS n FROM query_snapshot WHERE owner = $owner GROUP ALL;', { owner: ids.gm });
   expect(owned?.[0]?.n ?? 0).toBeLessThanOrEqual(4);
   // The burst evicted the first listing: its next page is refused as gone, not answered with a short page.
-  await expectRefused(core.contextView(gm, { goalId, pageSize: 5, since: earliest, cursor: token }), 'snapshot_gone', /start the listing again/);
+  await expectRefused(core.contextView(gm, { tag: goalId, pageSize: 5, since: earliest, cursor: token }), 'snapshot_gone', /start the listing again/);
 });
 
 test('a write answers with its task inside the budget: a long context is cut and flagged, the committed create and checkpoint report it truthfully, and the replay agrees (SYS01)', async () => {
@@ -1434,53 +1401,6 @@ test('a write answers with its task inside the budget: a long context is cut and
   const whole = await reassemble({ taskId: task.id, field: 'context', limit: 16 * 1024 }, eng);
   expect(whole.text).toBe(context);
   expect(whole.sha256).toBe(sha256(context));
-});
-
-test('a delivery answers with all three legs inside one budget: each leg is cut to its share and flagged, and its text verifies (SYS01)', async () => {
-  const deliveryGoal = await owner.createGoal({ text: `回显交付目标 ${suffix}`, source: 'owner:test', key: key('goal-echo'), tier: 'standard' });
-  // Every leg carries the whole spec, so each leg is over its share of the budget on its own.
-  const spec = '需求正文字'.repeat(1_500);
-  const relayed = await relay('create_delivery', {
-    goalId: deliveryGoal.id, title: `回显交付 ${suffix}`, spec, idempotencyKey: key('echo-delivery'),
-  }, args => core.createDelivery(gm, args as never));
-  expect(relayed.exit).toBe(0);
-  const legs = JSON.parse(relayed.out) as TaskView[];
-  expect(legs).toHaveLength(3);
-  expect(bytesOf(legs)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-  for (const leg of legs) {
-    const full = (await core.getTask(gm, leg.id)).context;
-    expect(leg.contextTruncated).toBe(true);
-    expect(leg.contextBytes).toBe(utf8(full));
-    expect(leg.contextSha256).toBe(sha256(full));
-    expect(Buffer.from(full, 'utf8').subarray(0, leg.contextNextOffset!).toString('utf8')).toBe(leg.context);
-  }
-});
-
-test('a delivery whose first leg holds a long dependency list echoes the whole count and digest, cut once (SYS01 R3)', async () => {
-  const deliveryGoal = await owner.createGoal({ text: `依赖回显目标 ${suffix}`, source: 'owner:test', key: key('goal-dep-echo'), tier: 'standard' });
-  // The external dependency list is bounded (R67): at most 50 raw entries. 50 task ids of 36 characters are still
-  // over the share of the create answer, so that answer cuts the list; the leg answer then cuts the cut list again.
-  const dependencies: string[] = [];
-  for (let index = 0; index < 50; index += 1) {
-    const dependency = await core.createTask(gm, {
-      title: `依赖回显 ${suffix} ${index}`, context: '依赖正文', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key(`dep-echo-${index}`),
-    });
-    dependencies.push(dependency.id);
-  }
-  const relayed = await relay('create_delivery', {
-    goalId: deliveryGoal.id, title: `依赖回显交付 ${suffix}`, spec: '需求正文字'.repeat(40), dependencies, idempotencyKey: key('dep-echo-delivery'),
-  }, args => core.createDelivery(gm, args as never));
-  expect(relayed.exit).toBe(0);
-  const legs = JSON.parse(relayed.out) as TaskView[];
-  expect(legs).toHaveLength(3);
-  expect(bytesOf(legs)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-  // The first leg stores the whole list. Its echo keeps a prefix, and the count and digest describe the whole list.
-  const first = legs[0]!;
-  expect((await core.getTask(gm, first.id)).dependencies).toEqual(dependencies);
-  expect(first.listsTruncated).toEqual({ dependencies: { count: dependencies.length, sha256: sha256(JSON.stringify(dependencies)) } });
-  expect(first.dependencies.length).toBeGreaterThan(0);
-  expect(first.dependencies.length).toBeLessThan(dependencies.length);
-  expect(dependencies.slice(0, first.dependencies.length)).toEqual(first.dependencies);
 });
 
 test('claim_next over MCP answers a claim whose context is over the budget: the lease comes back, the context is cut and flagged, and the whole text reassembles (SYS01, defect 1)', async () => {
@@ -1660,13 +1580,10 @@ test('a claim with a long project, dependency list and intent paths echoes each 
   const holder = await designerCredential('long');
   const outsider = await designerCredential('outsider');
   const paths = Array.from({ length: 50 }, (_, i) => `资产/第${i}组/${'镜头草图'.repeat(20)}-${i}`);
-  const deps = expectedWorking.slice(0, 120);
   const task = await core.createTask(gm, {
     title: `长列表样例 ${suffix} ` + '题'.repeat(180), context: '短正文', executorRole: 'concept-design', reviewerRole: 'qa',
     project: projectId, workIntent: { kind: 'assets', paths }, idempotencyKey: key('long-lists'),
   });
-  // The dependency list is written on the row: the ids are fixture tasks, and a claim does not check them.
-  await database.db.query('UPDATE $task SET dependencies = $deps;', { task: id('task', task.id), deps: deps.map(dep => id('task', dep)) });
   const wholeProject = (await new ProjectStore(database.db).get(projectId))!;
   const session = await mcpSession(holder);
   const pool = new SidecarPool({ core, workforce: { rotate: async () => holder } as unknown as SidecarDeps['workforce'], runDir: mkdtempSync(join(tmpdir(), 'sys01-r3-sidecar-')), sweepMs: 5 });
@@ -1681,14 +1598,10 @@ test('a claim with a long project, dependency list and intent paths echoes each 
     expect(claim.project).toMatchObject({ id: projectId, name: `长项目 ${suffix}` });
     expect(claim.project!.redLines!.length).toBeGreaterThan(0);
     expect(claim.project!.redLines!.length).toBeLessThan(40);
-    expect(claim.listsTruncated).toMatchObject({ dependencies: { count: 120 }, workIntentPaths: { count: 50 } });
-    expect(claim.listsTruncated!.dependencies!.sha256).toBe(sha256(JSON.stringify(deps)));
+    expect(claim.listsTruncated).toMatchObject({ workIntentPaths: { count: 50 } });
     expect(claim.listsTruncated!.workIntentPaths!.sha256).toBe(sha256(JSON.stringify(paths)));
-    expect(claim.task.dependencies.length).toBeLessThan(120);
-    expect(claim.task.dependencies).toEqual(deps.slice(0, claim.task.dependencies.length));
     // Each cut list reads back whole through read_task_text, verified against the digest the echo carried.
     const readWhole = async (field: TaskTextField, credential: string) => (await reassemble({ taskId: task.id, field, limit: 16 * 1024 }, credential)).text;
-    expect(JSON.parse(await readWhole('dependencies', holder))).toEqual(deps);
     expect(JSON.parse(await readWhole('workIntentPaths', holder))).toEqual(paths);
     const projectText = await readWhole('project', holder);
     expect(JSON.parse(projectText)).toEqual(wholeProject);
@@ -1702,7 +1615,7 @@ test('a claim with a long project, dependency list and intent paths echoes each 
     expect(JSON.parse(viaSidecar.out)).toMatchObject({ field: 'project', sha256: claim.projectSha256 });
     const refused = await theirs('read_task_text', { taskId: task.id, field: 'project', offset: 0, limit: 16 * 1024 });
     expect(refused.exit).toBe(1);
-    expect(refused.out).toContain('gm or the holder of a valid task lease');
+    expect(refused.out).toContain('owner or the holder of a valid task lease');
     // A page of this task's history through the sidecar stays inside the budget.
     const history = await mine('get_task_history', { taskId: task.id, pageSize: 5 });
     expect(history.exit).toBe(0);

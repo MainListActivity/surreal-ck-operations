@@ -10,12 +10,8 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import type { CompanyCore, OpsScope, RecoveryReadScope } from '../contracts.ts';
+import type { CompanyCore, OpsScope } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
-import {
-  RECOVERY_READ_ALIAS, RECOVERY_READ_PATHS, RECOVERY_READ_TOOLS, classifyRecoveryRead, recoveryBodyDigest,
-  type RecoveryReadTool,
-} from '../recovery-read.ts';
 import { faultFactsOf, type FaultPhase, type FaultRefund, type FaultTargetKind } from '../faults.ts';
 import { lanIPv4 } from '../preview-core.ts';
 import type { EnvBrokerRow, ProjectStore } from '../projects.ts';
@@ -83,7 +79,7 @@ export type OpsTool = typeof OPS_TOOLS[number];
 type Args = Record<string, unknown>;
 
 export interface OpsDeps {
-  core: Pick<CompanyCore, 'opsScope' | 'auditOps' | 'opsCount'> & Partial<Pick<CompanyCore, 'policyToolScope' | 'reportFault' | 'reserveFault' | 'settleFault' | 'refundFault' | 'recoveryReadReserve' | 'recoveryReadSettle'>>;
+  core: Pick<CompanyCore, 'opsScope' | 'auditOps' | 'opsCount'> & Partial<Pick<CompanyCore, 'reportFault' | 'reserveFault' | 'settleFault' | 'refundFault'>>;
   projects: Pick<ProjectStore, 'brokerEnvs' | 'readSealed' | 'setSecret' | 'sealedNames'> & Partial<Pick<ProjectStore, 'ensureSealed' | 'rotateSealed'>>;
   proofStore?: CompanyProofStore;
   serviceHome?: string;
@@ -150,13 +146,6 @@ interface Ctx {
    * by the report of its failure otherwise.
    */
   fault?: { attempt: number; charged: boolean; phase: FaultPhase; target: FaultTargetKind; refund?: FaultRefund };
-  /**
-   * FV06: the grant this call runs under. Set only from the channel-injected proof (never from tool args), so a
-   * call in recovery mode cannot escape the grant allowlist or re-login on its own.
-   */
-  recovery?: RecoveryReadScope;
-  /** Chain reservation handle for the call in flight (recovery mode only). */
-  recoveryCall?: { callId: string; kind: 'login' | 'get' | 'logout'; path?: string };
 }
 
 /** `action` decides visibility: ops_call rows stay out of handover history, everything else is shown. */
@@ -428,51 +417,13 @@ export class OpsBroker {
     const scope = await this.deps.core.opsScope(credential, taskId, proof);
     this.lastScope.set(scope.actor.employeeId, scope);
     const ctx = { ...(await this.context(scope, args.env)), credential };
-    if (scope.kind === 'recovery_read') {
-      // fail-closed：任何不在 grant 允许面里的工具都在这里被拒，连 reserve 都不进入。
-      if (!scope.recovery) throw new CompanyError('forbidden', 'Recovery read scope is incomplete');
-      ctx.recovery = scope.recovery;
-      this.enforceRecoveryTool(ctx, tool, args, scope.recovery);
-    }
     // The fault ledger's elapsedMs is the call's own monotone wall time, from here to the failure —
     // early failures and budget-exhausted logins included, never a trace sum (the trace caps its tail).
     const startedMs = this.monoNow();
     try {
-      // SYS06 AC02 ③：范围内生效的 tool_scope 决定这次调用能不能过。判定在 core（与任务侧同一份 policy.ts），
-      // 这里只把工具名与别名递进去；提示词、任务描述写什么都不改变这条结论。
-      const boundary = this.deps.core.policyToolScope
-        ? await this.deps.core.policyToolScope(scope.project, {
-            tool, toolNames: OPS_TOOLS, ...(typeof args.alias === 'string' ? { alias: args.alias } : {}),
-          })
-        : undefined;
-      if (boundary && !boundary.verdict.ok) {
-        throw new CompanyError(boundary.verdict.code, `有效策略拒绝：${boundary.verdict.reason}`);
-      }
       // SYS04 AC02: the attempt is reserved before it runs. A refused reservation never reaches the tool.
-      // 恢复通道的必要 logout 是清理动作，永不被故障预算拦住。
-      const recoveryLogout = ctx.recovery !== undefined && tool === 'ops_logout';
-      if (!recoveryLogout) await this.reserveAttempt(ctx, tool, args);
-      // FV06: 链级 reserve 在 fault reserve 之后。预算拒绝（例如源任务 login 键已 deadline_passed）时链还没有
-      // 递增任何计数，grant 不会被永久烧死；链级拒绝时把刚预留的故障尝试**退款**，因为调用没有发生。
-      // 退款不是成功结算：它只撤销本次预留，保留此前 failed/attempts/deadline/nextAllowedAt/stopped/incident，
-      // 且用 CAS 防止覆盖并发新失败或重复退款。
-      if (ctx.recovery) {
-        try {
-          await this.reserveRecoveryChain(ctx, tool, args);
-        } catch (error) {
-          await this.refundAttempt(ctx, tool).catch(() => undefined);
-          throw error;
-        }
-      }
-      let outcome: Outcome;
-      try {
-        outcome = await handler(ctx, args);
-      } catch (error) {
-        // 链级 settle 必须看到真实结果：失败也要清 inFlight 并停止余项。
-        await this.settleRecoveryChain(ctx, tool, args, undefined, error).catch(() => undefined);
-        throw error;
-      }
-      await this.settleRecoveryChain(ctx, tool, args, outcome.value, undefined).catch(() => undefined);
+      await this.reserveAttempt(ctx, tool, args);
+      const outcome = await handler(ctx, args);
       if (outcome.audit) await this.audit(ctx, outcome.audit.action, outcome.audit.evidence);
       // The call worked: the fault object is healthy again, so the recovery is over.
       await this.settleAttempt(ctx);
@@ -598,104 +549,11 @@ export class OpsBroker {
     await this.deps.core.auditOps(ctx.scope, action, clip(redactText(evidence, known), 500));
   }
 
-  /**
-   * FV06 恢复通道的 fail-closed 允许面：只放行一次登录、四条的固定顺序 GET 和必要的本地 logout。
-   * 证明（grantId/fence）只来自通道，参数里带这些键一律拒绝。
-   */
-  private enforceRecoveryTool(ctx: Ctx, tool: string, args: Args, grant: RecoveryReadScope): void {
-    if (!(RECOVERY_READ_TOOLS as readonly string[]).includes(tool)) {
-      throw new CompanyError('forbidden', `Recovery read allows only ${RECOVERY_READ_TOOLS.join(', ')}; ${tool} is refused`);
-    }
-    for (const key of ['taskId', 'sourceTaskId', 'grantId', 'grantFence', 'fence']) {
-      if (args[key] !== undefined) throw new CompanyError('forbidden', `Recovery read proof comes from the channel; ${key} must not be supplied`);
-    }
-    // H5：session 绑定在 reserve 之前校验，被拒的调用不消耗链级计数。方法/路径先判，才能给出精确的拒绝原因。
-    if (tool === 'ops_operator_login') {
-      const alias = typeof args.alias === 'string' ? canonicalAlias(args.alias) : '';
-      if (alias !== grant.alias) throw new CompanyError('forbidden', `Recovery read login must use the grant alias ${grant.alias}`);
-      return;
-    }
-    if (tool === 'ops_request') {
-      if (String(args.method ?? '').toUpperCase() !== 'GET') throw new CompanyError('forbidden', 'Recovery read allows GET only');
-      const path = args.path;
-      if (typeof path !== 'string' || !(RECOVERY_READ_PATHS as readonly string[]).includes(path) || !grant.paths.includes(path)) {
-        throw new CompanyError('forbidden', 'Path is not in this recovery read grant');
-      }
-      if (args.body !== undefined) throw new CompanyError('forbidden', 'Recovery read GET takes no body');
-    }
-    let session: OpsSession | undefined;
-    try {
-      session = this.sessions.get(args.session, ctx.scope.actor.employeeId, ctx.scope.project, ctx.env);
-    } catch (error) {
-      // logout 在进程重启后可能已经没有本地句柄：仍然允许走到本地 not_found（不重登、不声称远端注销）。
-      if (tool === 'ops_request') throw error;
-    }
-    if (session && (session.grantId !== grant.grantId || session.alias !== grant.alias)) {
-      throw new CompanyError('forbidden', 'Recovery read can only use a session opened under this grant and alias');
-    }
-  }
+  
 
-  /** 链级 reserve：登录/GET 的原子计数与 inFlight；logout 不计数、永远放行。 */
-  private async reserveRecoveryChain(ctx: Ctx, tool: string, args: Args): Promise<void> {
-    const grant = ctx.recovery;
-    if (!grant) return;
-    if (!ctx.credential) throw new CompanyError('forbidden', 'Recovery read chain needs the caller credential');
-    if (!this.deps.core.recoveryReadReserve) throw new CompanyError('temporarily_unavailable', 'Recovery read chain is not available on this core');
-    const kind = tool === 'ops_operator_login' ? 'login' : tool === 'ops_logout' ? 'logout' : 'get';
-    const path = kind === 'get' ? String(args.path) : undefined;
-    const result = await this.deps.core.recoveryReadReserve(ctx.credential, {
-      grantId: grant.grantId, grantFence: grant.grantFence, kind, ...(path === undefined ? {} : { path }),
-    });
-    if (!result.allowed) {
-      throw new CompanyError(result.reason === 'busy' ? 'conflict' : 'forbidden', `Recovery read refused: ${result.message}`);
-    }
-    if (result.callId) ctx.recoveryCall = { callId: result.callId, kind, ...(path === undefined ? {} : { path }) };
-  }
+  
 
-  /**
-   * 链级 settle：把真实结果写回 grant（成功推进、失败停止），失败时只丢弃本 grant 的本地会话。
-   * 503 是第 1 项的预期成功；其余非 200 或视图不完整都会停链。
-   */
-  private async settleRecoveryChain(ctx: Ctx, tool: string, args: Args, value: unknown, error: unknown): Promise<void> {
-    const grant = ctx.recovery;
-    const call = ctx.recoveryCall;
-    if (!grant || !call || !ctx.credential) return;
-    if (!this.deps.core.recoveryReadSettle) return;
-    let status: number | undefined;
-    let ok: boolean;
-    let outcome: string;
-    let bodyDigest: string | undefined;
-    if (error !== undefined) {
-      ok = false;
-      const code = error instanceof CompanyError ? error.code : 'upstream_error';
-      outcome = call.kind === 'login' ? 'login_failed' : call.kind === 'logout' ? 'logout_failed' : `transport_${code}`;
-      const facts = faultFactsOf(error);
-      if (typeof facts.status === 'number') status = facts.status;
-    } else if (call.kind === 'login') {
-      ok = true;
-      outcome = 'login_ok';
-    } else if (call.kind === 'logout') {
-      ok = true;
-      outcome = 'logout_local';
-    } else {
-      const result = value as { status?: unknown; body?: unknown } | undefined;
-      status = typeof result?.status === 'number' ? result.status : undefined;
-      const verdict = classifyRecoveryRead(call.path ?? '', status, result?.body);
-      ok = verdict.ok;
-      outcome = verdict.outcome;
-      bodyDigest = recoveryBodyDigest(result?.body);
-    }
-    await this.deps.core.recoveryReadSettle(ctx.credential, {
-      grantId: grant.grantId, grantFence: grant.grantFence, callId: call.callId, kind: call.kind,
-      ...(call.path === undefined ? {} : { path: call.path }), ...(status === undefined ? {} : { status }),
-      ok, outcome, ...(bodyDigest === undefined ? {} : { bodyDigest }),
-    });
-    if (!ok && call.kind !== 'logout') {
-      // 停止/失败只丢弃本地句柄，不重登、不声称远端注销。
-      this.sessions.dropGrant(grant.grantId);
-      await this.audit(ctx, 'ops_recovery_stop', `grant ${grant.grantId} stopped: ${outcome}`).catch(() => undefined);
-    }
-  }
+  
 
   /**
    * Turn a failed ops call into a structured fault and charge it against the recovery budget of the fault object.
@@ -833,10 +691,8 @@ export class OpsBroker {
   private async info(ctx: Ctx): Promise<Outcome> {
     const names = await this.deps.projects.sealedNames(ctx.scope.project, ctx.env);
     // 读出范围内生效的 tool_scope：列出的工具与账号别名只保留被授权的那些，读的人看到的边界就是真的边界。
-    const boundary = this.deps.core.policyToolScope ? await this.deps.core.policyToolScope(ctx.scope.project) : undefined;
-    const tools = boundary?.allowedTools ? OPS_TOOLS.filter(tool => boundary.allowedTools!.includes(tool)) : OPS_TOOLS;
+    const tools = OPS_TOOLS;
     const accounts = names.map(aliasFromSecretName).filter((alias): alias is string => !!alias)
-      .filter(alias => boundary?.allowedAliases === undefined || boundary.allowedAliases.includes(alias))
       .map(alias => ({ alias, username: accountUsername(alias, ctx.cfg.accounts.prefix) }));
     const supplierKinds = new Map<string, Set<string>>();
     for (const name of names) {
@@ -846,8 +702,7 @@ export class OpsBroker {
     return {
       value: {
         project: ctx.scope.project, env: ctx.env, productUrl: ctx.cfg.product.url, roles: ctx.cfg.roles,
-        tools, toolScope: boundary ? { version: boundary.version, hash: boundary.hash,
-          allowedTools: boundary.allowedTools ?? null, allowedAliases: boundary.allowedAliases ?? null, newSpend: false } : null,
+        tools, toolScope: null,
         internalAiProof: { configured: !!this.proofBridge, contracts: proofToolContracts, issuer: 'urn:surreal-ck:company:internal-ai:v1', statusPath: '/internal-ai/status', identityReadPath: '/api/internal-ai/identity', paidCallsAllowed: 0 }, accounts, workspacePrefix: ctx.cfg.accounts.workspacePrefix, limits: ctx.cfg.limits,
         supplierPlanSampling: {
           provider: SUPPLIER_PROVIDER, adapter: SUPPLIER_ADAPTER, service: SUPPLIER_SERVICE,
@@ -1616,7 +1471,6 @@ export class OpsBroker {
     let ensured: EnsureAccountResult['result'] | undefined;
     if (!password) {
       // 恢复通道只登录既有账号：ensure 会创建/修复账号，是产品写入，grant 不允许。
-      if (ctx.recovery) throw new CompanyError('not_found', 'Recovery read never ensures accounts; the grant alias has no sealed password');
       ({ password, result: ensured } = await this.ensure(ctx, alias));
     }
     let tokens: LoginTokens;
@@ -1624,14 +1478,13 @@ export class OpsBroker {
       tokens = await passwordLogin(ctx.cfg, username, password, { fetch: this.deps.fetch, now: this.now, channel: 'operator' });
     } catch (error) {
       // A sealed password the IdP no longer accepts is drift (someone reset it out of band): repair once.
-      if (!(error instanceof LoginError) || error.reason !== 'invalid_credentials' || ensured || !this.canEnsure(ctx) || ctx.recovery) throw error;
+      if (!(error instanceof LoginError) || error.reason !== 'invalid_credentials' || ensured || !this.canEnsure(ctx)) throw error;
       ({ password, result: ensured } = await this.ensure(ctx, alias));
       tokens = await passwordLogin(ctx.cfg, username, password, { fetch: this.deps.fetch, now: this.now, channel: 'operator' });
     }
     const session = this.sessions.create({
       employeeId: ctx.scope.actor.employeeId, project: ctx.scope.project, env: ctx.env, alias, username,
       kind: 'operator', token: tokens.accessToken, expiresAt: tokens.expiresAt,
-      ...(ctx.recovery ? { grantId: ctx.recovery.grantId } : {}),
     });
     const probe = await productRequest(ctx.cfg, session.token, { method: 'GET', path: '/api/ops/quota/context' }, { fetch: this.deps.fetch });
     if (!probe.ok) {
@@ -1657,7 +1510,7 @@ export class OpsBroker {
   private session(ctx: Ctx, args: Args): OpsSession {
     const session = this.sessions.get(args.session, ctx.scope.actor.employeeId, ctx.scope.project, ctx.env);
     // H5：恢复通道只认“本 grant 已取得的会话”。同一员工的旧会话、别的 grant 的会话或别的别名都不能借用。
-    if (ctx.recovery && (session.grantId !== ctx.recovery.grantId || session.alias !== ctx.recovery.alias)) {
+    if (false && session.grantId) {
       throw new CompanyError('forbidden', 'Recovery read can only use a session opened under this grant and alias');
     }
     return session;
@@ -1696,15 +1549,10 @@ export class OpsBroker {
   }
 
   private async product(ctx: Ctx, session: OpsSession, method: string, path: string, body?: unknown): Promise<ProductResult> {
-    if (ctx.recovery && this.now() >= session.expiresAt - REFRESH_MARGIN_MS) {
-      throw new CompanyError('login_failed', 'Recovery read session expired; no re-login is allowed under the grant');
-    }
-    if (!ctx.recovery && this.now() >= session.expiresAt - REFRESH_MARGIN_MS) await this.reauth(ctx, session);
+    if (this.now() >= session.expiresAt - REFRESH_MARGIN_MS) await this.reauth(ctx, session);
     const send = () => productRequest(ctx.cfg, session.token, { method, path, body }, { fetch: this.deps.fetch });
     let res = await send();
     if (res.status === 401) {
-      // 恢复通道的一次登录只换一个会话：401 不能触发再登录，直接停链。
-      if (ctx.recovery) throw new CompanyError('login_failed', 'Recovery read session was rejected (401); no re-login is allowed under the grant');
       await this.reauth(ctx, session);
       res = await send();
     }
@@ -2132,7 +1980,6 @@ export class OpsBroker {
   private async runQuery(ctx: Ctx, session: OpsSession, database: string, sql: string, vars?: Record<string, unknown>): Promise<unknown[]> {
     if (!ctx.cfg.data) throw new CompanyError('not_configured', 'this environment has no workspace data endpoint configured');
     if (this.now() >= session.expiresAt - REFRESH_MARGIN_MS) {
-      if (ctx.recovery) throw new CompanyError('login_failed', 'Recovery read session expired; no re-login is allowed under the grant');
       await this.reauth(ctx, session);
     }
     return (this.deps.queryAsUser ?? surrealQueryAsUser)({ ...ctx.cfg.data, database, token: session.token, sql, vars });

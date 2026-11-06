@@ -16,6 +16,6 @@ adapter 负责 MCP initialize、工具 schema、错误映射和本地绑定；co
 
 `CompanyDatabase.connect()` 后先 `bootstrap()`，再创建 `SurrealCompanyCore`。adapter 每次调用 core 方法均传 credential。对于租约相关写入，从 `claim()` 返回的 `deliveryId`、`fence` 和 `task.version` 构造 `LeaseProof`；`checkpoint()` 等成功后用新版本更新 proof。`CompanyError` 的 `code` 和 `retryable` 映射为 MCP 工具错误，不返回数据库底层错误与凭证。代码包括 `unauthorized`、`forbidden`、`not_found`、`conflict`、`invalid`、`already_claimed`、`lease_expired`、`self_review`、`temporarily_unavailable`。只有最后一项表示数据库争用已在内部有限重试后仍失败，`retryable=true`。
 
-`listOutbox()` 仅 gm/管理能力可访问。`after` 是上次事件 ID，内部查对应持久 `sequence`，数据库侧返回序号严格更大的最多 1000 条，按序号递增。consumer 使用最后一条事件 ID 继续取页直到返回空页；不可把少于 1000 条当成服务永久静止。所有业务事件和全局序号在同一事务提交；并发写争用同一序号记录，冲突时事务重试，因此后提交的事件不会落在已经确认的游标之前。bootstrap 把旧事件按原有 `at,id` 一次性补序号，后续重复启动不改已有序号。
+`listOutbox()` 仅 owner（管理能力）可访问。`after` 是上次事件 ID，内部查对应持久 `sequence`，数据库侧返回序号严格更大的最多 1000 条，按序号递增。consumer 使用最后一条事件 ID 继续取页直到返回空页；不可把少于 1000 条当成服务永久静止。所有业务事件和全局序号在同一事务提交；并发写争用同一序号记录，冲突时事务重试，因此后提交的事件不会落在已经确认的游标之前。bootstrap 把旧事件按原有 `at,id` 一次性补序号，后续重复启动不改已有序号。
 
 事件 `kind`：`created`（payload.state）、`claimed`（employee/fence）、`checkpoint`、`submit`、`accept`、`return`、`block`（version/state）、`resumed`（state）、`dependency_unlocked`（state）。heartbeat 不发 outbox 事件。`taskId` 只属于本新库任务；原 GitHub queue.py v2 工单不在此 outbox。#25 的 GitHub 投影应在消费端保存处理标记，并按事件 ID 去重。

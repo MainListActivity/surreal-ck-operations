@@ -81,7 +81,7 @@ async function seedFixture(database: CompanyDatabase, scratch: string): Promise<
   });
   const wf = new Workforce(database, join(scratch, 'unused-credential-files'));
   await wf.upsertDef('rb01-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 2 });
-  await wf.upsertDef('rb01-gm', { role: 'owner', provider: 'codex', model: 'fixture', maxInstances: 1 });
+  await wf.upsertDef('rb01-gm', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
   const make = (title: string, context: string) =>
     core.createTask(gm, { title, context, executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `rb01-${title}` });
   await make('rb01-ready', '就绪任务：旧版调度应认领，作为阳性对照。');
@@ -269,10 +269,9 @@ run('RB01 rollback isolation: previous release against new-version data', () => 
     expect(b['rb01-held']).toMatchObject({ state: 'doing', occupied: true, occupiedBy: 'rb01-held-employee' });
     expect(b['rb01-done']).toMatchObject({ state: 'done', occupied: false });
     expect(b['rb01-void']).toMatchObject({ state: 'void', occupied: false });
-    // gm-gated work: the previous release's gm-attention notice is its designed behaviour; an executor claim is not.
+    // Owner-gated work: a claim must never reach it; the wait notice is the designed behaviour.
     expect(b['rb01-gated-gm']).toMatchObject({ state: 'blocked', blockedTo: 'owner', occupied: false });
     expect(b['rb01-gated-gm'].dispatch.execute).toBe(false);
-    expect(b['rb01-gated-gm'].dispatch['gm-attention']).toBe(true);
   });
 
   test('the previous runtime reads new-version data without the new semantics: paging ignored, new tools refused', () => {

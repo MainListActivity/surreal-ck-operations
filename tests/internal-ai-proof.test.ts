@@ -339,12 +339,13 @@ test('approval diagnostics use production predicates, strict authorization and n
   const loaded=await loadProofFiles(home,taskId,manifestPath,documentPath);
   const scope:OpsScope={taskId,project:'surreal_ck',actor:{employeeId:'synthetic-caller',role:'engineering',capabilities:[]}};
   let role='engineering', authorize=true, revoked=false, retired=false;
-  const task={state:'done',kind:'task',version:10,submitted_by:'synthetic-author',accepted_by:'synthetic-reviewer',reviewer_role:'qa',goal:new RecordId('goal',fixture.manifest.goalId),project:new RecordId('project','surreal_ck')};
+  const task={state:'done',kind:'task',version:10,submitted_by:'synthetic-author',accepted_by:'synthetic-reviewer',reviewer_role:'qa',tag:fixture.manifest.goalId,project:new RecordId('project','surreal_ck')};
   const candidate={task:new RecordId('task',taskId),env:'production',digest:fixture.manifest.configurationDigest,manifest_hash:loaded.manifestHash,document_hash:loaded.documentHash,manifest_path:manifestPath,document_path:documentPath,author:task.submitted_by};
   const audit={id:new RecordId('audit','synthetic'),actor:new RecordId('employee',task.accepted_by) as RecordId|string,action:'accept',version:10,evidence:'notes\r\n '+ 'company-internal-ai-approve:v1:'+candidate.digest+' \r\n',at:new Date()};
   const db={query:async(sql:string)=>{
-    if(sql.startsWith('SELECT current_employee')) return [[{current_employee:scope.actor.employeeId,delivery_id:'synthetic-delivery',fence:1,lease_expires_at:Date.now()/1000+600,state:'doing',goal:task.goal,project:task.project,revoked:false,retired:false,role}]];
-    if(sql.startsWith('SELECT dependencies')) return [[{dependencies:[]}],authorize?[{goal:task.goal,project:task.project}]:[]];
+    if(sql.startsWith('SELECT current_employee')) return [[{current_employee:scope.actor.employeeId,delivery_id:'synthetic-delivery',fence:1,lease_expires_at:Date.now()/1000+600,state:'doing',tag:task.tag,project:task.project,revoked:false,retired:false,role}]];
+    if(sql.startsWith('SELECT tag, project FROM')) return authorize?[[{tag:task.tag,project:task.project}]]:[[]];
+    if(sql.startsWith('SELECT parent FROM')) return [[{}]];
     if(sql.startsWith('SELECT task, digest')) return [[candidate],[task],[audit]];
     if(sql.startsWith('SELECT revoked')) return [[{revoked,retired}]];
     throw new Error('unexpected read');

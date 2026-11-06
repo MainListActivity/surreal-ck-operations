@@ -30,56 +30,15 @@ afterAll(async () => { if (!dir) return; await db.close(); server.kill(); await 
 const key = () => `owner-cmd-${++count}-${crypto.randomUUID()}`;
 const task = (extra: Record<string, unknown> = {}) => core.createTask(gm, { title: `Command task ${++count}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key(), ...extra } as never);
 const state = async (id: string) => (await core.getTask(gm, id)).state;
-const goalWith = async (tasks: Array<{ ref: string; deps?: string[]; reviewer?: string }>, anchors: string[]) => {
-  const [rows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: '目标', brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
-  const goalId = String(rows[0]!.id.id), ids: Record<string, string> = {};
-  for (const t of tasks) ids[t.ref] = (await task({ goalId, dependencies: (t.deps ?? []).map(d => ids[d]!), reviewerRole: t.reviewer ?? 'qa' })).id;
-  await db.db.query('UPDATE $goal SET anchors = $anchors;', { goal: rows[0]!.id, anchors: anchors.map(a => new RecordId('task', ids[a]!)) });
-  return { goalId, ids };
-};
-
-run('void retires a task, unlocks what only waited on it, is idempotent, and refuses finished work', async () => {
-  const a = await task(), b = await task({ dependencies: [a.id] });
-  expect(await state(b.id)).toBe('blocked');
+run('void retires a task, voids its planned descendants, is idempotent, and refuses finished work', async () => {
+  const a = await task(), b = await task({ parent: a.id });
+  expect(await state(b.id)).toBe('planned');
   const k = key();
   const voided = await owner.retire({ taskId: a.id, note: '方向变了，不需要了', source: 'owner:test', key: k });
-  expect(voided.state).toBe('void'); expect(await state(b.id)).toBe('ready');
+  expect(voided.state).toBe('void'); expect(await state(b.id)).toBe('void');
   expect((await owner.retire({ taskId: a.id, note: '方向变了，不需要了', source: 'owner:test', key: k })).version).toBe(voided.version);
-  const [audit] = await db.db.query<[Array<{ action: string }>]>("SELECT action FROM audit WHERE task = $t AND action IN ['retire','dependency_unlocked'];", { t: new RecordId('task', b.id) });
-  expect(audit.map(x => x.action)).toEqual(['dependency_unlocked']);
   await db.db.query("UPDATE $t SET state = 'done';", { t: new RecordId('task', b.id) });
   await expect(owner.retire({ taskId: b.id, note: '已经完成的不能作废', source: 'owner:test', key: key() })).rejects.toMatchObject({ code: 'conflict' });
-});
-
-run('retiring a goal\'s final gate never closes the goal, and a gate with live dependents is refused', async () => {
-  const { goalId, ids } = await goalWith([{ ref: 'work' }, { ref: 'gate', deps: ['work'], reviewer: 'owner' }], ['gate']);
-  await owner.retire({ taskId: ids.gate!, note: '不再需要最终关口', source: 'owner:test', key: key() });
-  expect(await state(ids.gate!)).toBe('void');
-  const [g] = await db.db.query<[Array<{ state: string }>]>('SELECT state FROM goal WHERE id = $g;', { g: new RecordId('goal', goalId) });
-  expect(g[0]!.state).toBe('active');
-  const gate = await task({ reviewerRole: 'owner' }); await task({ dependencies: [gate.id] });
-  await expect(owner.retire({ taskId: gate.id, note: '有依赖者不能作废', source: 'owner:test', key: key() })).rejects.toMatchObject({ code: 'conflict' });
-});
-
-run('unlock re-evaluates dependents that stayed blocked after their dependency finished', async () => {
-  const a = await task(), b = await task({ dependencies: [a.id] });
-  await expect(owner.unlockDependents({ taskId: a.id, source: 'owner:test' })).rejects.toMatchObject({ code: 'conflict' });
-  await db.db.query("UPDATE $t SET state = 'done';", { t: new RecordId('task', a.id) });
-  expect(await state(b.id)).toBe('blocked');
-  expect(await owner.unlockDependents({ taskId: a.id, source: 'owner:test' })).toEqual([b.id]);
-  expect(await state(b.id)).toBe('ready');
-  expect(await owner.unlockDependents({ taskId: a.id, source: 'owner:test' })).toEqual([]);
-});
-
-run('cancel-goal retires every unfinished task, including owner gates, and closes the goal; finished work stays done', async () => {
-  const { goalId, ids } = await goalWith([{ ref: 'a' }, { ref: 'b', deps: ['a'] }, { ref: 'gate', deps: ['b'], reviewer: 'owner' }], ['gate']);
-  await db.db.query("UPDATE $t SET state = 'done';", { t: new RecordId('task', ids.a!) });
-  const result = await owner.cancelGoal({ goalId, note: '被新目标取代', source: 'owner:test', key: key() });
-  expect(result).toEqual({ retired: 2, remaining: 0 });
-  expect(await state(ids.a!)).toBe('done'); expect(await state(ids.b!)).toBe('void'); expect(await state(ids.gate!)).toBe('void');
-  const [g] = await db.db.query<[Array<{ state: string; note: string }>]>('SELECT state, note FROM goal WHERE id = $g;', { g: new RecordId('goal', goalId) });
-  expect(g[0]).toMatchObject({ state: 'cancelled' }); expect(g[0]!.note).toContain('被新目标取代');
-  await expect(owner.cancelGoal({ goalId: 'nope-nope', note: '不存在的目标', source: 'owner:test', key: key() })).rejects.toMatchObject({ code: 'not_found' });
 });
 
 run('revoke releases the live lease back to ready with owner provenance; no-ops without a lease', async () => {
@@ -99,16 +58,3 @@ run('revoke releases the live lease back to ready with owner provenance; no-ops 
   expect(await wf.revokeTaskLease(a.id, '再撤一次', '', 'owner:test')).toEqual({ ok: false });
 });
 
-run('closing an already retired goal writes one cancellation audit and preserves task history', async () => {
-  const {goalId,ids}=await goalWith([{ref:'old'}],[]);
-  await owner.retire({taskId:ids.old!,note:'旧交付链已被替代',source:'owner:test',key:key()});
-  const [before]=await db.db.query<any>('SELECT state,version FROM ONLY $t;', {t:new RecordId('task',ids.old!)});
-  await owner.cancelGoal({goalId,note:'旧目标已被新目标替代，收口历史状态',source:'owner:test',key:key()});
-  await owner.cancelGoal({goalId,note:'旧目标已被新目标替代，收口历史状态',source:'owner:test',key:key()});
-  const [after]=await db.db.query<any>('SELECT state,version FROM ONLY $t;', {t:new RecordId('task',ids.old!)});
-  expect(after).toEqual(before);
-  const [audits]=await db.db.query<any>("SELECT actor,evidence FROM audit WHERE goal=$g AND action='goal_cancelled';",{g:new RecordId('goal',goalId)});
-  expect(audits).toHaveLength(1);expect(audits[0].actor).toBe('owner:test');
-  const [g]=await db.db.query<any>('SELECT state,version,needs_repair FROM ONLY $g;',{g:new RecordId('goal',goalId)});
-  expect(g).toMatchObject({state:'cancelled',version:1,needs_repair:false});
-});

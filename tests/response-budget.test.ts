@@ -431,35 +431,28 @@ describe('write echo (SYS01 R3, return of 04195c93)', () => {
   const cjkPath = (index: number): string => `${String(index).padStart(3, '0')}-${'甲'.repeat(296)}`;
   const dependencyIds = (count: number): string[] => Array.from({ length: count }, (_, i) => `task-${String(i).padStart(4, '0')}-${'d'.repeat(40)}`);
   // A task as a committed write returns it: its lists as stored, its context as written.
-  const taskWith = (context: string, lists: { dependencies?: string[]; paths?: string[]; worktreePaths?: string[] } = {}): TaskView => ({
-    id: 'task-write', title: '写入回显', context, state: 'doing', executorRole: 'engineering', reviewerRole: 'qa', kind: 'task',
-    dependencies: lists.dependencies ?? [], version: 5, fence: 3,
+  const taskWith = (context: string, lists: { paths?: string[]; worktreePaths?: string[] } = {}): TaskView => ({
+    id: 'task-write', title: '写入回显', context, state: 'doing', executorRole: 'engineering', reviewerRole: 'qa', kind: 'task', version: 5, fence: 3,
     ...(lists.paths ? { workIntent: { kind: 'assets', paths: lists.paths } } : {}),
     ...(lists.worktreePaths ? { worktree: { id: 'wt-write', repo: '/repos/proj', worktreePath: '/wt/write', mode: 'exclusive', intent: { kind: 'assets', paths: lists.worktreePaths } } as unknown as WorktreeAssignment } : {}),
   });
 
   test('a write echo over the budget keeps its fields, cuts each long list to a flagged prefix, and fits the envelope', () => {
-    const dependencies = dependencyIds(1_000);
     const paths = Array.from({ length: 50 }, (_, i) => cjkPath(i));
-    const echo = echoTask(taskWith('短正文', { dependencies, paths, worktreePaths: paths }));
+    const echo = echoTask(taskWith('短正文', { paths, worktreePaths: paths }));
     expect(answerBytes(echo)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
     expect(echo).toMatchObject({ id: 'task-write', title: '写入回显', context: '短正文', contextTruncated: false, version: 5, fence: 3 });
     // Each cut list keeps its leading part; the count and the digest describe the whole list, which read_task_text returns.
     expect(echo.listsTruncated).toEqual({
-      dependencies: { count: 1_000, sha256: sha256(JSON.stringify(dependencies)) },
       workIntentPaths: { count: 50, sha256: sha256(JSON.stringify(paths)) },
       worktreePaths: { count: 50, sha256: sha256(JSON.stringify(paths)) },
     });
-    expect(echo.dependencies.length).toBeGreaterThan(0);
-    expect(echo.dependencies.length).toBeLessThan(1_000);
-    expect(echo.dependencies).toEqual(dependencies.slice(0, echo.dependencies.length));
     expect(echo.workIntent!.paths).toEqual(paths.slice(0, echo.workIntent!.paths!.length));
     expect(echo.worktree!.intent.paths).toEqual(paths.slice(0, echo.worktree!.intent.paths!.length));
   });
 
   test('a list within its share is echoed whole and is not flagged', () => {
-    const echo = echoTask(taskWith('短正文', { dependencies: ['task-a', 'task-b'], paths: ['assets/a.md'] }));
-    expect(echo.dependencies).toEqual(['task-a', 'task-b']);
+    const echo = echoTask(taskWith('短正文', { paths: ['assets/a.md'] }));
     expect(echo.workIntent).toEqual({ kind: 'assets', paths: ['assets/a.md'] });
     expect(echo.listsTruncated).toBeUndefined();
     expect(echo.contextTruncated).toBe(false);
@@ -469,9 +462,9 @@ describe('write echo (SYS01 R3, return of 04195c93)', () => {
     // createDelivery gives each leg an equal share of the item budget; the legs are returned together in one answer.
     const legLimit = Math.floor(ITEM_BUDGET_BYTES / 3);
     const context = '甲'.repeat(19_000);
-    const echo = echoTask(taskWith(context, { dependencies: dependencyIds(1_000), paths: Array.from({ length: 50 }, (_, i) => cjkPath(i)) }), legLimit);
+    const echo = echoTask(taskWith(context, { paths: Array.from({ length: 50 }, (_, i) => cjkPath(i)) }), legLimit);
     expect(dualBytes(echo)).toBeLessThanOrEqual(legLimit);
-    expect(echo.listsTruncated?.dependencies?.count).toBe(1_000);
+    expect(echo.listsTruncated?.workIntentPaths?.count).toBe(50);
     expect(echo.contextTruncated).toBe(true);
     expect(context.startsWith(echo.context)).toBe(true);
     expect(echo.contextBytes).toBe(utf8(context));
@@ -481,15 +474,13 @@ describe('write echo (SYS01 R3, return of 04195c93)', () => {
 
   test('an echo of an echo keeps the count and digest of the whole list, not of the list the first echo cut', () => {
     // A write answer cuts a list to its share; a leg answer cuts it again. Both cut lists are prefixes of the whole one.
-    const dependencies = dependencyIds(200);
+    const paths = Array.from({ length: 50 }, (_, i) => cjkPath(i));
     const legLimit = Math.floor(ITEM_BUDGET_BYTES / 3);
-    const first = echoTask(taskWith('短正文', { dependencies }));
+    const first = echoTask(taskWith('短正文', { paths }));
     const second = echoTask(first, legLimit);
     expect(dualBytes(second)).toBeLessThanOrEqual(legLimit);
-    expect(second.listsTruncated).toEqual({ dependencies: { count: 200, sha256: sha256(JSON.stringify(dependencies)) } });
-    expect(second.dependencies.length).toBeGreaterThan(0);
-    expect(second.dependencies.length).toBeLessThan(first.dependencies.length);
-    expect(second.dependencies).toEqual(dependencies.slice(0, second.dependencies.length));
+    expect(second.listsTruncated).toEqual({ workIntentPaths: { count: 50, sha256: sha256(JSON.stringify(paths)) } });
+    expect(second.workIntent!.paths!.length).toBeLessThanOrEqual(paths.length);
   });
 });
 
@@ -531,8 +522,7 @@ describe('claim echo (SYS01, return of 04195c93)', () => {
   });
   const claimWith = (context: string, claim: Partial<ClaimResult> = {}, task: Partial<TaskView> = {}): ClaimResult => ({
     task: {
-      id: 'task-claim', title: '认领回显', context, state: 'doing', executorRole: 'engineering', reviewerRole: 'qa', kind: 'task',
-      dependencies: [], version: 4, fence: 3, currentEmployee: 'eng-01', deliveryId: 'delivery-claim', leaseExpiresAt: '2026-10-19T19:00:00.000Z',
+      id: 'task-claim', title: '认领回显', context, state: 'doing', executorRole: 'engineering', reviewerRole: 'qa', kind: 'task', version: 4, fence: 3, currentEmployee: 'eng-01', deliveryId: 'delivery-claim', leaseExpiresAt: '2026-10-19T19:00:00.000Z',
       ...task,
     },
     deliveryId: 'delivery-claim', fence: 3, leaseExpiresAt: '2026-10-19T19:00:00.000Z', history: [], historyComplete: true,
@@ -589,24 +579,19 @@ describe('claim echo (SYS01, return of 04195c93)', () => {
   });
 
   test('a list over CLAIM_LIST_ECHO_BYTES is cut to its longest prefix, counted and digested; a short list is whole', () => {
-    const dependencies = Array.from({ length: 1_000 }, (_, i) => `task-${String(i).padStart(4, '0')}-${'d'.repeat(40)}`);
-    const paths = Array.from({ length: 50 }, (_, i) => cjkPath(i));
+        const paths = Array.from({ length: 50 }, (_, i) => cjkPath(i));
     const worktree = worktreeOf(paths);
-    const echo = echoClaim(claimWith('短正文', { worktree }, { dependencies, workIntent: { kind: 'assets', paths }, worktree }));
+    const echo = echoClaim(claimWith('短正文', { worktree }, { workIntent: { kind: 'assets', paths }, worktree }));
     expect(envelope(echo)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    expect(echo.task.dependencies.length).toBeGreaterThan(0);
-    expect(echo.task.dependencies).toEqual(dependencies.slice(0, echo.task.dependencies.length));
-    expect(dualBytes(echo.task.dependencies)).toBeLessThanOrEqual(CLAIM_LIST_ECHO_BYTES);
     expect(echo.task.workIntent?.paths).toEqual(paths.slice(0, echo.task.workIntent?.paths?.length));
     expect(echo.worktree?.intent.paths).toEqual(paths.slice(0, echo.worktree?.intent.paths?.length));
     expect(echo.listsTruncated).toEqual({
-      dependencies: { count: 1_000, sha256: sha256(JSON.stringify(dependencies)) },
       workIntentPaths: { count: 50, sha256: sha256(JSON.stringify(paths)) },
       worktreePaths: { count: 50, sha256: sha256(JSON.stringify(paths)) },
     });
-    const short = echoClaim(claimWith('短正文', {}, { dependencies: ['task-a'], workIntent: { kind: 'assets', paths: ['assets/a'] } }));
+    const short = echoClaim(claimWith('短正文', {}, { workIntent: { kind: 'assets', paths: ['assets/a'] } }));
     expect(short.listsTruncated).toBeUndefined();
-    expect(short.task).toMatchObject({ dependencies: ['task-a'], workIntent: { kind: 'assets', paths: ['assets/a'] } });
+    expect(short.task).toMatchObject({ workIntent: { kind: 'assets', paths: ['assets/a'] } });
   });
 
   test('legal maxima together still answer within the budget: title, lists, project, a full handover window, six predecessors, a 20,000-character context', () => {
@@ -620,11 +605,11 @@ describe('claim echo (SYS01, return of 04195c93)', () => {
     const echo = echoClaim(claimWith(context, {
       worktree, predecessors, history: Array.from({ length: 8 }, (_, i) => entry(i)),
       project: project({ release: '甲'.repeat(2_600), runbooks: Array.from({ length: 20 }, () => '甲'.repeat(60)) }),
-    }, { title: '甲'.repeat(200), dependencies, workIntent: { kind: 'assets', paths }, worktree }));
+    }, { title: '甲'.repeat(200), workIntent: { kind: 'assets', paths }, worktree }));
     expect(envelope(echo)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
     expect(echo).toMatchObject({ deliveryId: 'delivery-claim', fence: 3, leaseExpiresAt: '2026-10-19T19:00:00.000Z' });
     expect(echo.task).toMatchObject({ title: '甲'.repeat(200), contextTruncated: true, contextBytes: utf8(context), contextSha256: sha256(context) });
-    expect(Object.keys(echo.listsTruncated ?? {}).sort()).toEqual(['dependencies', 'workIntentPaths', 'worktreePaths']);
+    expect(Object.keys(echo.listsTruncated ?? {}).sort()).toEqual(['workIntentPaths', 'worktreePaths']);
   });
 
   test('history fills the room the other fields leave: the newest entries that fit are kept whole, the boundary entry is cut, and the count says what is missing (SYS01 R3)', () => {
@@ -698,7 +683,7 @@ describe('claim echo (SYS01, return of 04195c93)', () => {
       const echo = echoClaim(claimWith(context, {
         worktree, history, historyCount: history.length + next(100), historyComplete: true,
         predecessors: [], project: project({ release: '版'.repeat(next(9_000)), notes: '注'.repeat(next(20_000)) }),
-      }, { dependencies, workIntent: { kind: 'assets', paths }, worktree }));
+      }, { workIntent: { kind: 'assets', paths }, worktree }));
       expect(envelope(echo)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
       expect(echo).toMatchObject({ deliveryId: 'delivery-claim', fence: 3, leaseExpiresAt: '2026-10-19T19:00:00.000Z' });
     }

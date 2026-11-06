@@ -103,9 +103,8 @@ export async function runCompanyUpgrade(service:CompanyUpgrades,id:string,option
     await run('sh',[join(target,'scripts/release-gate.sh'),GATE_ARGUMENTS[gate]??gate,target],home);
    }
    // Revalidate the owner's pending task after preparation; a stale click must not switch anything.
-   const t=await db.select<{version:number;state:string;blocked_to?:string;reviewer_role:string;wait_kind?:string;wait_owner_role?:string}>(job.task);
-   if(!t||t.version!==job.task_version||!((t.state==='blocked'&&t.blocked_to==='owner')||(t.state==='review'&&t.reviewer_role==='owner')
-     ||(t.state==='blocked'&&t.wait_kind==='owner_handoff'&&t.wait_owner_role==='owner')))throw Error('owner task moved');
+   const t=await db.select<{version:number;state:string;blocked_to?:string;reviewer_role:string}>(job.task);
+   if(!t||t.version!==job.task_version||!((t.state==='blocked'&&t.blocked_to==='owner')||(t.state==='review'&&t.reviewer_role==='owner')))throw Error('owner task moved');
    if((await installedRelease(home)).sha!==current.sha)throw Error('another release replaced the current version');
    targetPath=await realpath(target);
    await service.assertAutomatic(job);
@@ -118,8 +117,8 @@ export async function runCompanyUpgrade(service:CompanyUpgrades,id:string,option
     IF $automatic {
      IF $c.paused=true {THROW '老板已暂停派工，自动升级停止';};
      IF $t.version!=$taskVersion OR $t.company_upgrade.digest!=$digest {THROW '升级任务已经变化';};
-     LET $done=SELECT id FROM task WHERE id IN ($t.dependencies??[]) AND state='done';
-     IF array::len($done)!=array::len($t.dependencies??[]) {THROW '升级前置验收已经变化';};
+     LET $undone=SELECT id FROM task WHERE id IN $ancestors AND state NOT IN ['done','void'];
+     IF array::len($undone)>0 {THROW '升级前置任务尚未全部验收完成';};
     };
     LET $j=SELECT * FROM ONLY $job;
     LET $before=IF $j.pause_version!=NONE AND $j.pause_version=$c.pause_version THEN $j.paused_before ELSE $c.paused??false END;
@@ -127,7 +126,7 @@ export async function runCompanyUpgrade(service:CompanyUpgrades,id:string,option
     UPSERT ONLY company_meta:config SET paused=true,pause_version=$revision;
     UPDATE $job SET previous=$previous,paused_before=$before,pause_version=$revision,status='installing',phase='安装版本并切换公司插件',updated_at=time::now();
     RETURN {before:$before,revision:$revision};
-    COMMIT;`,{job:job.id,previous,automatic:job.authorization==='automatic',policyRevision:job.policy_revision,task:job.task,taskVersion:job.task_version,digest:job.plan.digest});
+    COMMIT;`,{job:job.id,previous,automatic:job.authorization==='automatic',policyRevision:job.policy_revision,task:job.task,taskVersion:job.task_version,digest:job.plan.digest,ancestors:await service.taskAncestors(String(job.task.id))});
    const pause=pauseResults.find(x=>x&&typeof x==='object'&&'revision' in x) as {before:boolean;revision:number}|undefined;
    if(!pause)throw Error('pause ownership unavailable');
    pausedBefore=pause.before;pausedVersion=pause.revision;

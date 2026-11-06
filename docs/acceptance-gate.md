@@ -20,7 +20,7 @@
 
 ### 员工阻塞入口
 
-GitHub CI 计费判定属于系统能力。普通 `report_blocker`（到老板或 GM）以及 `wait` 不能把 CI 账单问题变成任务等待；核心在写入状态、租约、故障预算之前拒绝，返回 `invalid` / `github_ci_system_owned`。对含必需 CI 项的任务，核心从本次证据、任务上下文及最近五条进展/提交/阻塞记录提取 PR/run 来源，读取当前 PR head，再复用 GitHub 适配器读取零步骤与原始计费注释；不依赖员工在这次请求里写出“账单”二字。短写 `PR #编号` 只在仓库 remote 已验证时补全；缺少可核来源不会被猜成豁免。交互式来源读取总预算 8 秒，来源判定与后续状态写入分别重核租约。
+GitHub CI 计费判定属于系统能力。普通 `report_blocker`（到老板）以及 `wait` 不能把 CI 账单问题变成任务等待；核心在写入状态、租约、故障预算之前拒绝，返回 `invalid` / `github_ci_system_owned`。对含必需 CI 项的任务，核心从本次证据、任务上下文及最近五条进展/提交/阻塞记录提取 PR/run 来源，读取当前 PR head，再复用 GitHub 适配器读取零步骤与原始计费注释；不依赖员工在这次请求里写出“账单”二字。短写 `PR #编号` 只在仓库 remote 已验证时补全；缺少可核来源不会被猜成豁免。交互式来源读取总预算 8 秒，来源判定与后续状态写入分别重核租约。
 
 直接以 CI 计费为理由的请求，即使未提供来源也会被拒绝；这只是限制员工阻塞能力，不能签发豁免。真实来源检查只处理本次与 CI/检查未执行有关的理由；历史“已完成”或其他分句提到 GitHub，不会单凭关键词与客户账单审批混为一谈，也不禁止后续真实依赖等待。多个 run 中有真实或未知失败时，不凭另一个 run 的 billing 禁止员工报修。员工应调用 `record_acceptance_evidence`，提供 `taskId`、机器 `acId`、当前 `sha` 和 `source{provider:"github-actions",runUrl}`，再正常提交；缺少来源、读取失败、错误 SHA 和真实测试失败都不会获得豁免。
 
@@ -48,7 +48,7 @@ GitHub CI 计费判定属于系统能力。普通 `report_blocker`（到老板�
 
 ## 5. 存量与治理（AC06）
 
-`company_meta:acceptance_gate` 是版本化记录 `{version, enabled, enabled_at, scope, criteria_version}`，安装时 `enabled=false`。只有 gm 能通过 `set_acceptance_gate` 修改，必须带 `expectedVersion` 与理由，前后值与理由写入审计；执行者不能自批豁免。启用时记录 `enabledAt`，之前创建的任务为 legacy；新强制范围在上线申请列明。老板关口不自动批准，旧历史只读。
+`company_meta:acceptance_gate` 是版本化记录 `{version, enabled, enabled_at, scope, criteria_version}`，安装时 `enabled=false`。只有 owner（老板）能通过 `set_acceptance_gate` 修改，必须带 `expectedVersion` 与理由，前后值与理由写入审计；执行者不能自批豁免。启用时记录 `enabledAt`，之前创建的任务为 legacy；新强制范围在上线申请列明。老板关口不自动批准，旧历史只读。
 
 ## 6. 回滚隔离（RB01）
 
@@ -64,8 +64,8 @@ GitHub CI 计费判定属于系统能力。普通 `report_blocker`（到老板�
 | --- | --- | --- |
 | `record_acceptance_evidence` | `taskId`、`acId`、`sha`、`environment?`（只用于与受控声明比对，不能新增要求）、`source{provider,runUrl,artifactId,probe?}`、`idempotencyKey` | probe 必须带 artifactId；声明的环境由 Deployments API 核验；服务端写入本次 attempt 与 criteria 版本 |
 | `acceptance_status` | `taskId` | 读 gate、criteria、证据与当前未满足清单 |
-| `acceptance_gate` | — | gm 读 gate 记录 |
-| `set_acceptance_gate` | `enabled`、`reason`、`expectedVersion`、`idempotencyKey` | gm 版本化启停，审计理由 |
+| `acceptance_gate` | — | owner 读 gate 记录 |
+| `set_acceptance_gate` | `enabled`、`reason`、`expectedVersion`、`idempotencyKey` | owner 版本化启停，审计理由 |
 
 `create_task`/`create_delivery` 的 MCP schema 携带 `acceptanceCriteria`、`acceptanceEnvironment`；`submit`/`review` 携带 `acceptance{sha,environment}`。`submit` 的声明 head 必须等于 PR 门禁实际 head，声明的环境必须等于受控声明；`accept` 使用提交时持久化的环境与 attempt。
 

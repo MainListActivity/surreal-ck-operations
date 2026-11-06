@@ -21,7 +21,7 @@ import {
 
 /** Only the company's Magpie supplier alias may be repaired; the sealed key is derived from it. */
 export const MAGPIE_RESTORE_ALIAS = 'MAGPIE' as const;
-/** A plan is a bounded snapshot: after this window apply refuses and the manager re-plans. */
+/** A plan is a bounded snapshot: after this window apply refuses and the owner re-plans. */
 export const MAGPIE_RESTORE_PLAN_TTL_MS = 15 * 60_000;
 const PLAN_CLOCK_SKEW_MS = 60_000;
 const MAX_MEMBERS = 20;
@@ -217,7 +217,7 @@ function catalogProvider(id: string, row: Record<string, unknown> | undefined): 
     ?? null;
 }
 
-/** Same-provider catalog suggestions for the manager; never an automatic authorization. */
+/** Same-provider catalog suggestions for the owner; never an automatic authorization. */
 function candidatesOf(catalog: ReturnType<typeof parseCatalog>, provider: string): { models: string[]; modelCount: number } {
   const models: string[] = [];
   for (const [id, row] of catalog.byId) {
@@ -809,7 +809,7 @@ export async function applyMagpieRouteRestoreRetained(input: MagpieRestoreApplyI
               restored = true;
               phase('config-restored', 'sealed binding failed; the config was restored from the backup');
             } else {
-              phase('restore-skipped', 'the config changed after the write; the backup is left in place for the manager');
+              phase('restore-skipped', 'the config changed after the write; the backup is left in place for the owner');
             }
           } catch { phase('restore-failed', 'the backup could not be restored'); }
         }
