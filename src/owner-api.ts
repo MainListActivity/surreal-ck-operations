@@ -85,7 +85,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     case 'task.create': {
       const type = optionalText(input.type);
       const requirement = text(input.requirement, 'requirement');
-      const acceptanceText = input.acceptanceText ?? input.acceptance_text;
+      const acceptanceText = input.acceptanceText ?? input.acceptance_text ?? input.acceptance;
       const ownerCred = ownerCredential();
       if (type) {
         const route = await getRoute(db, type);
@@ -105,7 +105,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
         return { task, planned: planned ?? [] };
       }
       const requirement2 = requirement;
-      const acceptance = text(input.acceptanceText ?? input.acceptance_text, 'acceptanceText');
+      const acceptance = text(input.acceptanceText ?? input.acceptance_text ?? input.acceptance, 'acceptanceText');
       const executor = text(input.executorRole, 'executorRole') as Role;
       const reviewer = text(input.reviewerRole, 'reviewerRole') as Role | 'owner';
       if (!ROLES.includes(executor)) throw new CompanyError('invalid', 'unknown executorRole');
@@ -136,7 +136,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       const taskId = text(input.taskId, 'taskId');
       const patch: Record<string, string> = {};
       if (input.requirement !== undefined) patch.requirement = text(input.requirement, 'requirement');
-      if (input.acceptanceText !== undefined || input.acceptance_text !== undefined) patch.acceptance_text = text(input.acceptanceText ?? input.acceptance_text, 'acceptanceText');
+      if (input.acceptanceText !== undefined || input.acceptance_text !== undefined || input.acceptance !== undefined) patch.acceptance_text = text(input.acceptanceText ?? input.acceptance_text ?? input.acceptance, 'acceptanceText');
       if (input.title !== undefined) patch.title = text(input.title, 'title', 3);
       if (!Object.keys(patch).length) throw new CompanyError('invalid', 'no fields to update');
       const taskRecord = new RecordId('task', taskId);
