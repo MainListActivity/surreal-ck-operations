@@ -52,13 +52,13 @@ beforeAll(async () => {
   ] as const) tokens[name] = await enrollment.enroll(`qa-obs-${name}`, role, caps);
   const goal = await owner.createGoal({ text: 'QA 受限只读取证测试目标', source: 'owner:test', key: key(), tier: 'quick' });
   goalId = goal.id;
-  const deploy = await core.createTask(tokens.gm, { goalId, title: '部署任务（QA 复核）', context: '部署任务上下文。', executorRole: 'engineering', reviewerRole: 'qa', kind: 'deploy', idempotencyKey: key() });
+  const deploy = await core.createTask(tokens.owner, { goalId, title: '部署任务（QA 复核）', context: '部署任务上下文。', executorRole: 'engineering', reviewerRole: 'qa', kind: 'deploy', idempotencyKey: key() });
   deployId = deploy.id;
   const first = await core.claim(tokens.eng, deployId);
   await core.submit(tokens.eng, proofOf(first), { text: '部署任务已实现并通过本地验证，提交独立 QA 复核；本轮不部署、不启用门禁。', idempotencyKey: key() });
   const review = await core.claim(tokens.qa, deployId);
   qaFence = review.fence;
-  const subject = await core.createTask(tokens.gm, { goalId, title: '被核验主体任务', context: '主体任务上下文：' + '中文🙂'.repeat(3000), executorRole: 'engineering', reviewerRole: 'product', kind: 'task', idempotencyKey: key() });
+  const subject = await core.createTask(tokens.owner, { goalId, title: '被核验主体任务', context: '主体任务上下文：' + '中文🙂'.repeat(3000), executorRole: 'engineering', reviewerRole: 'product', kind: 'task', idempotencyKey: key() });
   subjectId = subject.id;
   // Legacy contribution row with no phase and no follow-up: the reader must keep it as unknown, not drop it.
   await database.db.query(`CREATE audit CONTENT { task: type::record('task', $task), action: 'checkpoint', actor: type::record('employee', 'legacy-unknown-author'), evidence: '旧贡献记录，无 phase', version: 1, at: time::now() };`, { task: subjectId });
@@ -79,7 +79,7 @@ beforeEach(async () => {
 
 fork('grant + read: GM scope lets QA read an allowlisted task it cannot read directly', async () => {
   await expectRefused(core.getTask(tokens.qa, subjectId), 'forbidden', /Task access denied/);
-  const scope = await core.qaObservationGrant(tokens.gm, {
+  const scope = await core.qaObservationGrant(tokens.owner, {
     goalId, deploymentTaskId: deployId, qaEmployee: 'qa-obs-qa', leaseFence: qaFence,
     subjects: [deployId, subjectId], expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
     reason: 'QA 独立验收取证', idempotencyKey: key(),
@@ -103,29 +103,29 @@ fork('grant + read: GM scope lets QA read an allowlisted task it cannot read dir
 
 fork('scope negatives: wrong role/fence/goal/allowlist, revoke CAS, expiry and lease change fail closed', async () => {
   await expectRefused(core.qaObservationRead({ credential: tokens.qa2 }, { taskId: subjectId }), 'forbidden', /no active QA observation scope/);
-  await expectRefused(core.qaObservationGrant(tokens.gm, {
+  await expectRefused(core.qaObservationGrant(tokens.owner, {
     goalId, deploymentTaskId: deployId, qaEmployee: 'qa-obs-qa', leaseFence: qaFence + 1,
     subjects: [subjectId], expiresAt: new Date(Date.now() + 3_600_000).toISOString(), reason: '错误 fence', idempotencyKey: key(),
   }), 'invalid', /holder or fence/);
-  const other = await core.createTask(tokens.gm, { goalId, title: '未列入 allowlist 的任务', context: '未列入。', executorRole: 'engineering', reviewerRole: 'product', kind: 'task', idempotencyKey: key() });
+  const other = await core.createTask(tokens.owner, { goalId, title: '未列入 allowlist 的任务', context: '未列入。', executorRole: 'engineering', reviewerRole: 'product', kind: 'task', idempotencyKey: key() });
   await expectRefused(core.qaObservationRead({ credential: tokens.qa }, { scopeId, taskId: other.id }), 'forbidden', /outside the QA observation scope/);
-  const revoked = await core.qaObservationRevoke(tokens.gm, { scopeId, expectedVersion: 1, reason: '验收完成后撤销该只读范围', idempotencyKey: key() });
+  const revoked = await core.qaObservationRevoke(tokens.owner, { scopeId, expectedVersion: 1, reason: '验收完成后撤销该只读范围', idempotencyKey: key() });
   expect(revoked.status).toBe('revoked');
   await expectRefused(core.qaObservationRead({ credential: tokens.qa }, { scopeId, taskId: subjectId }), 'forbidden', /revoked/);
-  await expectRefused(core.qaObservationRevoke(tokens.gm, { scopeId, expectedVersion: 1, reason: '使用过期版本撤销', idempotencyKey: key() }), 'conflict', /version changed/);
-  const expiring = await core.qaObservationGrant(tokens.gm, {
+  await expectRefused(core.qaObservationRevoke(tokens.owner, { scopeId, expectedVersion: 1, reason: '使用过期版本撤销', idempotencyKey: key() }), 'conflict', /version changed/);
+  const expiring = await core.qaObservationGrant(tokens.owner, {
     goalId, deploymentTaskId: deployId, qaEmployee: 'qa-obs-qa', leaseFence: qaFence, subjects: [subjectId],
     expiresAt: new Date(Date.now() + 120_000).toISOString(), reason: '过期测试 scope', idempotencyKey: key(),
   });
   await database.db.query(`UPDATE type::record('qa_observation_scope', $id) SET expires_at = $past;`, { id: expiring.id, past: new Date(Date.now() - 60_000).toISOString() });
   await expectRefused(core.qaObservationRead({ credential: tokens.qa }, { scopeId: expiring.id, taskId: subjectId }), 'forbidden', /expired/);
   const goal2 = await owner.createGoal({ text: '第二个目标', source: 'owner:test', key: key(), tier: 'quick' });
-  const otherGoalTask = await core.createTask(tokens.gm, { goalId: goal2.id, title: '跨目标任务', context: '跨目标。', executorRole: 'engineering', reviewerRole: 'product', kind: 'task', idempotencyKey: key() });
-  await expectRefused(core.qaObservationGrant(tokens.gm, {
+  const otherGoalTask = await core.createTask(tokens.owner, { goalId: goal2.id, title: '跨目标任务', context: '跨目标。', executorRole: 'engineering', reviewerRole: 'product', kind: 'task', idempotencyKey: key() });
+  await expectRefused(core.qaObservationGrant(tokens.owner, {
     goalId, deploymentTaskId: deployId, qaEmployee: 'qa-obs-qa', leaseFence: qaFence, subjects: [otherGoalTask.id],
     expiresAt: new Date(Date.now() + 3_600_000).toISOString(), reason: '跨目标的负例范围检查', idempotencyKey: key(),
   }), 'invalid', /not in the scope goal/);
-  const leaseScope = await core.qaObservationGrant(tokens.gm, {
+  const leaseScope = await core.qaObservationGrant(tokens.owner, {
     goalId, deploymentTaskId: deployId, qaEmployee: 'qa-obs-qa', leaseFence: qaFence, subjects: [subjectId],
     expiresAt: new Date(Date.now() + 3_600_000).toISOString(), reason: '租约变化负例范围', idempotencyKey: key(),
   });
@@ -136,16 +136,16 @@ fork('scope negatives: wrong role/fence/goal/allowlist, revoke CAS, expiry and l
 
 fork('session login, idempotency replay, timeline paging and text segments', async () => {
   const fixed = `fixed-${crypto.randomUUID()}`;
-  const first = await core.qaObservationGrant(tokens.gm, {
+  const first = await core.qaObservationGrant(tokens.owner, {
     goalId, deploymentTaskId: deployId, qaEmployee: 'qa-obs-qa', leaseFence: qaFence, subjects: [subjectId],
     expiresAt: new Date(Date.now() + 3_600_000).toISOString(), reason: '会话与分页测试范围', idempotencyKey: fixed,
   });
-  const replay = await core.qaObservationGrant(tokens.gm, {
+  const replay = await core.qaObservationGrant(tokens.owner, {
     goalId, deploymentTaskId: deployId, qaEmployee: 'qa-obs-qa', leaseFence: qaFence, subjects: [subjectId],
     expiresAt: first.expiresAt, reason: '会话与分页测试范围', idempotencyKey: fixed,
   });
   expect(replay.id).toBe(first.id);
-  await expectRefused(core.qaObservationGrant(tokens.gm, {
+  await expectRefused(core.qaObservationGrant(tokens.owner, {
     goalId, deploymentTaskId: deployId, qaEmployee: 'qa-obs-qa', leaseFence: qaFence, subjects: [subjectId],
     expiresAt: new Date(Date.now() + 7_200_000).toISOString(), reason: '同键但不同载荷负例', idempotencyKey: fixed,
   }), 'conflict', /different input/);
@@ -177,7 +177,7 @@ fork('session login, idempotency replay, timeline paging and text segments', asy
 });
 
 fork('goal summary fails closed when dispatch observation/status is missing, partial or stale', async () => {
-  const scope = await core.qaObservationGrant(tokens.gm, {
+  const scope = await core.qaObservationGrant(tokens.owner, {
     goalId, deploymentTaskId: deployId, qaEmployee: 'qa-obs-qa', leaseFence: qaFence, subjects: [subjectId],
     expiresAt: new Date(Date.now() + 3_600_000).toISOString(), reason: '目标完整性负例范围', idempotencyKey: key(),
   });
@@ -209,7 +209,7 @@ fork('goal summary fails closed when dispatch observation/status is missing, par
 });
 
 fork('scope view uses bare record ids so the goal page and the core goal check agree', async () => {
-  const scope = await core.qaObservationGrant(tokens.gm, {
+  const scope = await core.qaObservationGrant(tokens.owner, {
     goalId, deploymentTaskId: deployId, qaEmployee: 'qa-obs-qa', leaseFence: qaFence, subjects: [subjectId],
     expiresAt: new Date(Date.now() + 3_600_000).toISOString(), reason: '目标页裸ID回归范围', idempotencyKey: key(),
   });
@@ -238,12 +238,12 @@ fork('scope view uses bare record ids so the goal page and the core goal check a
 fork('F2: goal summary carries the root blocker, impact, dependency path and submit commit from the shared evaluator', async () => {
   // A core with a workforce wired (the plugin process wires one; the bare core above does not) so the goal root facts are readable.
   const factsCore = new SurrealCompanyCore(database, { workforce: new Workforce(database, credDir) });
-  const scope = await core.qaObservationGrant(tokens.gm, {
+  const scope = await core.qaObservationGrant(tokens.owner, {
     goalId, deploymentTaskId: deployId, qaEmployee: 'qa-obs-qa', leaseFence: qaFence, subjects: [subjectId],
     expiresAt: new Date(Date.now() + 3_600_000).toISOString(), reason: 'F2 根阻点回归范围', idempotencyKey: key(),
   });
   // A chained dependent so the waiting graph has an edge behind the root.
-  const downstream = await core.createTask(tokens.gm, {
+  const downstream = await core.createTask(tokens.owner, {
     goalId, title: '后续等待任务', context: '依赖根阻点任务。', executorRole: 'engineering', reviewerRole: 'product',
     kind: 'task', dependencies: [subjectId], idempotencyKey: key(),
   });
@@ -278,7 +278,7 @@ fork('F2: goal summary carries the root blocker, impact, dependency path and sub
   // payload nor inflate the impact count.
   const beforeImpact = root?.impact;
   const foreignGoal = await owner.createGoal({ text: '外部目标（QA scope 之外）', source: 'owner:test', key: key(), tier: 'quick' });
-  const foreignTask = await core.createTask(tokens.gm, {
+  const foreignTask = await core.createTask(tokens.owner, {
     goalId: foreignGoal.id, title: 'SECRET_FOREIGN_GOAL_TASK', context: '外部目标任务，依赖本目标根，但不得出现在 QA payload。',
     executorRole: 'engineering', reviewerRole: 'product', kind: 'task',
     dependencies: [subjectId, downstream.id], idempotencyKey: key(),

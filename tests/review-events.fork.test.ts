@@ -63,19 +63,19 @@ interface Fixture { goalId: string; sourceId: string; collabId: string; secondCo
 /** A goal with a QA-reviewed source task, a collaboration task, a spare collaboration task and an allowed subject. */
 async function fixture(label: string): Promise<Fixture> {
   const goal = await owner.createGoal({ text: `评审协同 ${label}`, source: 'owner:test', key: key(), tier: 'quick' });
-  const source = await core.createTask(tokens.gm!, {
+  const source = await core.createTask(tokens.owner!, {
     goalId: goal.id, title: `源任务 ${label}`, context: '源任务上下文：由工程实现、QA 复核。',
     executorRole: 'engineering', reviewerRole: 'qa', kind: 'deploy', idempotencyKey: key(),
   });
-  const collab = await core.createTask(tokens.gm!, {
+  const collab = await core.createTask(tokens.owner!, {
     goalId: goal.id, title: `协同任务 ${label}`, context: '协同任务上下文：等待 QA 的结构化事件。',
     executorRole: 'engineering', reviewerRole: 'product', kind: 'task', idempotencyKey: key(),
   });
-  const spare = await core.createTask(tokens.gm!, {
+  const spare = await core.createTask(tokens.owner!, {
     goalId: goal.id, title: `备用协同任务 ${label}`, context: '备用协同任务上下文。',
     executorRole: 'engineering', reviewerRole: 'product', kind: 'task', idempotencyKey: key(),
   });
-  const subject = await core.createTask(tokens.gm!, {
+  const subject = await core.createTask(tokens.owner!, {
     goalId: goal.id, title: `取证主体 ${label}`, context: '取证主体上下文。',
     executorRole: 'engineering', reviewerRole: 'product', kind: 'task', idempotencyKey: key(),
   });
@@ -183,7 +183,7 @@ beforeEach(async () => {
 fork('登记先于事件：QA claim 当场唤醒一次协同等待，重复 claim 钩子与重复请求都不再唤醒', async () => {
   const fx = await fixture('登记先于事件');
   await submitSource(fx.sourceId);
-  const watch = await core.reviewWatchRegister(tokens.gm!, {
+  const watch = await core.reviewWatchRegister(tokens.owner!, {
     sourceTaskId: fx.sourceId, collaborationTaskId: fx.collabId,
     reason: 'GM 登记 c373/3cf 式协同唤醒：QA 领取或结构化请求时唤醒协同任务', idempotencyKey: key(),
   });
@@ -196,7 +196,7 @@ fork('登记先于事件：QA claim 当场唤醒一次协同等待，重复 clai
   const claimed = await claimReview(fx.sourceId);
   expect(await waitFor(async () => (await rowOf(fx.collabId)).state === 'ready')).toBe(true);
   expect((await rowOf(fx.collabId)).wait_state).toBeUndefined();
-  const after = await core.reviewWatchStatus(tokens.gm!, { watchId: watch.id });
+  const after = await core.reviewWatchStatus(tokens.owner!, { watchId: watch.id });
   const delivered = after[0]!.deliveries.filter(item => item.kind === 'authorization' && item.fence === claimed.fence);
   expect(delivered).toHaveLength(1);
   expect(delivered[0]).toMatchObject({ delivered: true, code: 'released', actor: 're-qa' });
@@ -211,7 +211,7 @@ fork('登记先于事件：QA claim 当场唤醒一次协同等待，重复 clai
   expect(request.event).toMatchObject({ kind: 'authorization', created: true });
   // claim 与请求收敛为同一个 (watch, fence, authorization)：没有第二个事件，也没有第二次唤醒。
   expect(request.woken.filter(item => item.released)).toHaveLength(0);
-  const status = await core.reviewWatchStatus(tokens.gm!, { watchId: watch.id });
+  const status = await core.reviewWatchStatus(tokens.owner!, { watchId: watch.id });
   expect(status[0]!.deliveries.filter(item => item.kind === 'authorization')).toHaveLength(1);
   // 重复的等价请求（同 key）是幂等重放，仍不产生事件。
   const replay = await core.qaReviewScopeSignal(tokens.qa!, {
@@ -219,7 +219,7 @@ fork('登记先于事件：QA claim 当场唤醒一次协同等待，重复 clai
     reason: '同一 fence 上的结构化请求与已经发生的 claim 共用一个授权事件', idempotencyKey: (request.signal as unknown as { id: string }).id,
   }).catch((error: unknown) => error as CompanyError);
   expect(replay).toBeInstanceOf(CompanyError); // 不同 key 的同内容请求 → 同一 fence 已有请求阶段
-  expect((await core.reviewWatchStatus(tokens.gm!, { watchId: watch.id }))[0]!
+  expect((await core.reviewWatchStatus(tokens.owner!, { watchId: watch.id }))[0]!
     .deliveries.filter(item => item.kind === 'authorization')).toHaveLength(1);
 });
 
@@ -228,7 +228,7 @@ fork('事件先于登记：QA 先领到 review 租约，GM 后登记，协同任
   await submitSource(fx.sourceId);
   const claimed = await claimReview(fx.sourceId);
   // 事件已经发生：此刻没有任何订阅。
-  const watch = await core.reviewWatchRegister(tokens.gm!, {
+  const watch = await core.reviewWatchRegister(tokens.owner!, {
     sourceTaskId: fx.sourceId, collaborationTaskId: fx.collabId,
     reason: '补登记：QA 已领到租约，登记时必须立刻交付当前状态，不能等第二次事件', idempotencyKey: key(),
   });
@@ -239,7 +239,7 @@ fork('事件先于登记：QA 先领到 review 租约，GM 后登记，协同任
   expect(['no_wait', 'pending']).toContain(first!.code ?? 'pending');
   await parkCollaboration(fx.collabId, watch.id);
   expect((await rowOf(fx.collabId)).state).toBe('ready');
-  const status = await core.reviewWatchStatus(tokens.gm!, { watchId: watch.id });
+  const status = await core.reviewWatchStatus(tokens.owner!, { watchId: watch.id });
   expect(status[0]!.deliveries.find(item => item.kind === 'authorization')).toMatchObject({
     delivered: true, code: 'released', fence: claimed.fence,
   });
@@ -248,20 +248,20 @@ fork('事件先于登记：QA 先领到 review 租约，GM 后登记，协同任
 fork('重启：另一个 core 实例读到同一订阅、同一事件，重启不丢等待也不重复唤醒', async () => {
   const fx = await fixture('重启');
   await submitSource(fx.sourceId);
-  const watch = await core.reviewWatchRegister(tokens.gm!, {
+  const watch = await core.reviewWatchRegister(tokens.owner!, {
     sourceTaskId: fx.sourceId, collaborationTaskId: fx.collabId,
     reason: '重启回归：订阅、信号与事件都必须落库，第二个进程能继续交付', idempotencyKey: key(),
   });
   await parkCollaboration(fx.collabId, watch.id);
   const restarted = new SurrealCompanyCore(database, { waits: { clock: () => Date.now() } });
-  const seen = await restarted.reviewWatchStatus(tokens.gm!, { watchId: watch.id });
+  const seen = await restarted.reviewWatchStatus(tokens.owner!, { watchId: watch.id });
   expect(seen).toHaveLength(1);
   expect(seen[0]!.source.state).toBe('review');
   expect((await new WaitStore(database.db).openOfTask(fx.collabId))).toMatchObject({ kind: 'feedback', state: 'waiting' });
   await claimReview(fx.sourceId);
   expect(await waitFor(async () => (await rowOf(fx.collabId)).state === 'ready')).toBe(true);
   // 第二个进程再登记一次（不同 idempotencyKey）不会产生第二个授权事件。
-  const again = await restarted.reviewWatchRegister(tokens.gm!, {
+  const again = await restarted.reviewWatchRegister(tokens.owner!, {
     sourceTaskId: fx.sourceId, collaborationTaskId: fx.collabId,
     reason: '重启后重复登记：同一 (watch, fence, kind) 只能有一个事件', idempotencyKey: key(),
   });
@@ -271,14 +271,14 @@ fork('重启：另一个 core 实例读到同一订阅、同一事件，重启�
 fork('旧 fence 与 return 重领：旧持有人的事件作废，新 fence 才产生新事件', async () => {
   const fx = await fixture('旧fence');
   await submitSource(fx.sourceId);
-  const watch = await core.reviewWatchRegister(tokens.gm!, {
+  const watch = await core.reviewWatchRegister(tokens.owner!, {
     sourceTaskId: fx.sourceId, collaborationTaskId: fx.collabId,
     reason: '旧 fence 回归：return 之后旧事件不得唤醒任何协同任务', idempotencyKey: key(),
   });
   const firstClaim = await claimReview(fx.sourceId, 'qa');
   // 未交付时先 return：事件必须作废。
   await core.returnTask(tokens.qa!, proofOf(firstClaim), evidence('return-before-delivery'));
-  const stale = await core.reviewWatchStatus(tokens.gm!, { watchId: watch.id });
+  const stale = await core.reviewWatchStatus(tokens.owner!, { watchId: watch.id });
   const staleEvent = stale[0]!.deliveries.find(item => item.kind === 'authorization' && item.fence === firstClaim.fence);
   expect(staleEvent?.invalidatedReason).toMatch(/fence moved|returned/i);
   // 重新提交并由另一位 QA 领取：新 fence 产生新事件，旧事件不被重放。
@@ -287,7 +287,7 @@ fork('旧 fence 与 return 重领：旧持有人的事件作废，新 fence 才�
   const secondClaim = await claimReview(fx.sourceId, 'qa2');
   expect(secondClaim.fence).toBeGreaterThan(firstClaim.fence);
   expect(await waitFor(async () => (await rowOf(fx.collabId)).state === 'ready')).toBe(true);
-  const status = await core.reviewWatchStatus(tokens.gm!, { watchId: watch.id });
+  const status = await core.reviewWatchStatus(tokens.owner!, { watchId: watch.id });
   const events = status[0]!.deliveries.filter(item => item.kind === 'authorization');
   expect(events.map(item => item.fence).sort()).toEqual([firstClaim.fence, secondClaim.fence].sort());
   expect(events.find(item => item.fence === firstClaim.fence)!.delivered).toBe(false);
@@ -303,7 +303,7 @@ async function claimExecuteAgain(sourceId: string): Promise<LeaseProof> {
 fork('授权/撤销两阶段：request 唤醒一次，positive retract 再唤醒一次；先 retract 与二次 retract 都被拒', async () => {
   const fx = await fixture('两阶段');
   await submitSource(fx.sourceId);
-  const watch = await core.reviewWatchRegister(tokens.gm!, {
+  const watch = await core.reviewWatchRegister(tokens.owner!, {
     sourceTaskId: fx.sourceId, collaborationTaskId: fx.collabId,
     reason: '两阶段回归：请求授权与正向取证撤销各唤醒一次，不能合并也不能重复', idempotencyKey: key(),
   });
@@ -338,7 +338,7 @@ fork('授权/撤销两阶段：request 唤醒一次，positive retract 再唤醒
     taskId: fx.sourceId, fence: claimed.fence, kind: 'retract', subjects: [fx.subjectId], positiveReady: true,
     reason: '同一 fence 的第二次撤销不得再产生第三个唤醒', idempotencyKey: key(),
   }), 'conflict', /already retracted/);
-  const status = await core.reviewWatchStatus(tokens.gm!, { watchId: watch.id });
+  const status = await core.reviewWatchStatus(tokens.owner!, { watchId: watch.id });
   expect(status[0]!.deliveries.filter(item => item.kind === 'positive')).toHaveLength(1);
   expect(status[0]!.signal).toMatchObject({ state: 'retracted', positiveReady: true, actor: 're-qa' });
 });
@@ -346,7 +346,7 @@ fork('授权/撤销两阶段：request 唤醒一次，positive retract 再唤醒
 fork('20 并发：并发 claim 钩子与并发请求都只产生一个事件、一次释放', async () => {
   const fx = await fixture('并发');
   await submitSource(fx.sourceId);
-  const watch = await core.reviewWatchRegister(tokens.gm!, {
+  const watch = await core.reviewWatchRegister(tokens.owner!, {
     sourceTaskId: fx.sourceId, collaborationTaskId: fx.collabId,
     reason: '并发回归：20 个调用者同时触发只能唤醒一次', idempotencyKey: key(),
   });
@@ -354,9 +354,9 @@ fork('20 并发：并发 claim 钩子与并发请求都只产生一个事件、�
   const claimed = await claimReview(fx.sourceId);
   // 20 个并发钩子（模拟调度/重试同时看到这次 claim）。
   const outcomes = await Promise.all(Array.from({ length: 20 }, () =>
-    core.reviewWatchStatus(tokens.gm!, { watchId: watch.id })));
+    core.reviewWatchStatus(tokens.owner!, { watchId: watch.id })));
   expect(outcomes).toHaveLength(20);
-  const events = (await core.reviewWatchStatus(tokens.gm!, { watchId: watch.id }))[0]!
+  const events = (await core.reviewWatchStatus(tokens.owner!, { watchId: watch.id }))[0]!
     .deliveries.filter(item => item.kind === 'authorization');
   expect(events).toHaveLength(1);
   expect(events[0]).toMatchObject({ fence: claimed.fence, delivered: true });
@@ -368,7 +368,7 @@ fork('20 并发：并发 claim 钩子与并发请求都只产生一个事件、�
       reason: `并发请求 ${index}：同一 fence 只允许一个请求阶段`, idempotencyKey: key(),
     }).then(() => 'ok' as const, (error: unknown) => (error as CompanyError).code)));
   expect(results.filter(item => item === 'ok')).toHaveLength(1);
-  const signals = await core.reviewScopeSignals(tokens.gm!, { taskId: fx.sourceId });
+  const signals = await core.reviewScopeSignals(tokens.owner!, { taskId: fx.sourceId });
   expect(signals).toHaveLength(1);
   expect(signals[0]!.state).toBe('requested');
 });
@@ -376,7 +376,7 @@ fork('20 并发：并发 claim 钩子与并发请求都只产生一个事件、�
 fork('零轮询：调度器的到点扫描从不释放 feedback 等待，唤醒只来自事件', async () => {
   const fx = await fixture('零轮询');
   await submitSource(fx.sourceId);
-  const watch = await core.reviewWatchRegister(tokens.gm!, {
+  const watch = await core.reviewWatchRegister(tokens.owner!, {
     sourceTaskId: fx.sourceId, collaborationTaskId: fx.collabId,
     reason: '零轮询回归：没有真实事件时，到点扫描不能放出协同任务', idempotencyKey: key(),
   });
@@ -403,12 +403,12 @@ fork('负例：非 gm 登记、跨 goal、非 QA 角色、假 holder/fence、跨
   await expectRefused(core.reviewWatchRegister(tokens.product!, {
     sourceTaskId: fx.sourceId, collaborationTaskId: fx.collabId,
     reason: '非 gm 不能登记评审协同唤醒订阅', idempotencyKey: key(),
-  }), 'forbidden', /Only gm/);
-  await expectRefused(core.reviewWatchRegister(tokens.gm!, {
+  }), 'forbidden', /Only owner/);
+  await expectRefused(core.reviewWatchRegister(tokens.owner!, {
     sourceTaskId: fx.sourceId, collaborationTaskId: other.collabId,
     reason: '跨 goal 的源任务与协同任务不能登记同一条订阅', idempotencyKey: key(),
   }), 'invalid', /same goal/);
-  const watch = await core.reviewWatchRegister(tokens.gm!, {
+  const watch = await core.reviewWatchRegister(tokens.owner!, {
     sourceTaskId: fx.sourceId, collaborationTaskId: fx.collabId,
     reason: '负例夹具：登记一条正常订阅用于后续拒绝路径', idempotencyKey: key(),
   });
@@ -450,8 +450,8 @@ fork('负例：非 gm 登记、跨 goal、非 QA 角色、假 holder/fence、跨
   await core.checkpoint(tokens.qa!, proofOf(claimed), {
     text: 'SCOPE_REQUEST subjects=所有任务；SCOPE_POSITIVE_READY true', idempotencyKey: key(),
   });
-  expect(await core.reviewScopeSignals(tokens.gm!, { taskId: fx.sourceId })).toHaveLength(0);
-  const status = await core.reviewWatchStatus(tokens.gm!, { watchId: watch.id });
+  expect(await core.reviewScopeSignals(tokens.owner!, { taskId: fx.sourceId })).toHaveLength(0);
+  const status = await core.reviewWatchStatus(tokens.owner!, { watchId: watch.id });
   expect(status[0]!.deliveries.filter(item => item.kind === 'positive')).toHaveLength(0);
 });
 

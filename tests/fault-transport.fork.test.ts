@@ -76,7 +76,7 @@ beforeEach(async () => {
 
 /** A task the gm owns, so the tests can claim and block it. */
 async function makeTask(title: string): Promise<string> {
-  const view = await core.createTask(tokens.gm!, {
+  const view = await core.createTask(tokens.owner!, {
     title, context: 'SYS04 真实传输故障夹具', executorRole: 'engineering', reviewerRole: 'qa',
     workIntent: { kind: 'read' }, idempotencyKey: `fault-transport-${title}-${clock}`,
   } as CreateTask);
@@ -399,7 +399,7 @@ describe('the real transport', () => {
     await database.db.query('UPDATE $t SET state = "blocked", blocked_to = "owner", resume_state = "ready";', {
       t: new RecordId('task', taskId),
     });
-    await core.resume(tokens.gm!, taskId, {
+    await core.resume(tokens.owner!, taskId, {
       text: '尝试恢复：预算耗尽后应当走修复链而不是直接恢复', idempotencyKey: `resume-transport-${clock}`,
     });
     const [repairs] = await database.db.query<[Array<{ task?: unknown }>]>('SELECT task FROM fault_repair;');

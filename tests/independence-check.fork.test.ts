@@ -67,15 +67,15 @@ beforeEach(async () => {
 
 const key = () => crypto.randomUUID();
 const EVIDENCE = '独立预检只读工具测试证据：候选级回避判定与门禁同源，读取不写任何字段。';
-const engineering = (title: string) => core.createTask(tokens.gm, { title, context: 'synthetic independence_check case',
+const engineering = (title: string) => core.createTask(tokens.owner, { title, context: 'synthetic independence_check case',
   executorRole: 'engineering', reviewerRole: 'engineering', idempotencyKey: key() });
-const versionOf = async (taskId: string) => (await core.getTask(tokens.gm, taskId)).version;
+const versionOf = async (taskId: string) => (await core.getTask(tokens.owner, taskId)).version;
 const policyInput = async (taskId: string, sources: string[], over: Partial<SetIndependence> = {}): Promise<SetIndependence> => ({
   taskId, stages: ['execute'], sources, mode: 'execute_handlers', reason: 'G5 独立审查：来源经手人回避（independence_check 测试）',
   expectedVersion: await versionOf(taskId), idempotencyKey: key(), ...over,
 });
 const setPolicy = async (taskId: string, sources: string[], over: Partial<SetIndependence> = {}) =>
-  core.setIndependence(tokens.gm, await policyInput(taskId, sources, over));
+  core.setIndependence(tokens.owner, await policyInput(taskId, sources, over));
 const proofOf = (claimed: ClaimResult) => ({ taskId: claimed.task.id, deliveryId: claimed.deliveryId, fence: claimed.fence, expectedVersion: claimed.task.version });
 const failureOf = async (run: Promise<unknown>): Promise<CompanyError> => {
   try { await run; } catch (error) { if (error instanceof CompanyError) return error; throw error; }
@@ -87,7 +87,7 @@ const authorParent = async (author: 'src' | 'alias', parentId: string) => {
   await core.submit(tokens[author]!, proofOf(claimed), { text: EVIDENCE, idempotencyKey: key() });
 };
 const check = (taskId: string, employeeId: string, stage?: 'execute' | 'review'): Promise<IndependenceCheckView> =>
-  core.independenceCheck(tokens.gm, { taskId, employeeId, ...(stage === undefined ? {} : { stage }) });
+  core.independenceCheck(tokens.owner, { taskId, employeeId, ...(stage === undefined ? {} : { stage }) });
 
 // IR06(a) and IR02: a source author is a conflict, and the conflict carries the same source/role as the claim refusal, plus the audit row.
 test('a source author reads as a conflict with the source, role and audit reference the gate cites', async () => {
@@ -121,7 +121,7 @@ test('mode distinguishes a source reviewer: all_handlers conflicts, execute_hand
   await authorParent('src', parent.id);
   const reviewing = await core.claim(tokens.exec, parent.id);
   await core.accept(tokens.exec, proofOf(reviewing), { text: EVIDENCE, idempotencyKey: key() });
-  expect((await core.getTask(tokens.gm, parent.id)).state).toBe('done');
+  expect((await core.getTask(tokens.owner, parent.id)).state).toBe('done');
 
   const all = await engineering('dependent under all_handlers');
   await setPolicy(all.id, [parent.id], { mode: 'all_handlers' });
@@ -210,7 +210,7 @@ test('a closed (done) target stays readable with the right verdict, and an expli
   await core.submit(tokens.exec, proofOf(executed), { text: EVIDENCE, idempotencyKey: key() });
   const reviewing = await core.claim(tokens.indep, dependent.id);
   await core.accept(tokens.indep, proofOf(reviewing), { text: EVIDENCE, idempotencyKey: key() });
-  expect((await core.getTask(tokens.gm, dependent.id)).state).toBe('done');
+  expect((await core.getTask(tokens.owner, dependent.id)).state).toBe('done');
 
   expect(await check(dependent.id, 't-src')).toMatchObject({ verdict: 'conflict', stage: 'execute', source: parent.id, role: 'author' });
   expect(await check(dependent.id, 't-exec')).toMatchObject({ verdict: 'clear' });
@@ -266,12 +266,12 @@ test('only gm and qa may read, and reading writes nothing: no version, audit, ou
       { id: new RecordId('company_meta', 'dispatch_observation') });
     return { audit: audit?.[0]?.count ?? 0, outbox: outbox?.[0]?.count ?? 0, observations: observations?.[0]?.count ?? 0 };
   };
-  const before = { ...(await counts()), task: await core.getTask(tokens.gm, dependent.id) };
-  await core.independenceCheck(tokens.gm, { taskId: dependent.id, employeeId: 't-src' });
-  await core.independenceCheck(tokens.gm, { taskId: dependent.id, employeeId: 't-indep' });
+  const before = { ...(await counts()), task: await core.getTask(tokens.owner, dependent.id) };
+  await core.independenceCheck(tokens.owner, { taskId: dependent.id, employeeId: 't-src' });
+  await core.independenceCheck(tokens.owner, { taskId: dependent.id, employeeId: 't-indep' });
   await core.independenceCheck(tokens.qa!, { taskId: dependent.id, employeeId: 't-alias' });
-  await core.independenceCheck(tokens.gm, { taskId: dependent.id, employeeId: 't-src', stage: 'review' });
-  const after = { ...(await counts()), task: await core.getTask(tokens.gm, dependent.id) };
+  await core.independenceCheck(tokens.owner, { taskId: dependent.id, employeeId: 't-src', stage: 'review' });
+  const after = { ...(await counts()), task: await core.getTask(tokens.owner, dependent.id) };
 
   expect(after.audit).toBe(before.audit);
   expect(after.outbox).toBe(before.outbox);

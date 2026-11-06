@@ -72,15 +72,15 @@ beforeEach(async () => {
 
 const key = () => crypto.randomUUID();
 const EVIDENCE = '独立审查提交：来源经手人回避的 IR05 测试证据，覆盖领取后冲突拒绝与并发竞争。';
-const engineering = (title: string) => core.createTask(tokens.gm, { title, context: 'synthetic IR05 independence case',
+const engineering = (title: string) => core.createTask(tokens.owner, { title, context: 'synthetic IR05 independence case',
   executorRole: 'engineering', reviewerRole: 'engineering', idempotencyKey: key() });
-const versionOf = async (taskId: string) => (await core.getTask(tokens.gm, taskId)).version;
+const versionOf = async (taskId: string) => (await core.getTask(tokens.owner, taskId)).version;
 const policyInput = async (taskId: string, sources: string[], over: Partial<SetIndependence> = {}): Promise<SetIndependence> => ({
   taskId, stages: ['execute'], sources, mode: 'execute_handlers', reason: 'G5 独立审查：来源经手人回避（测试）',
   expectedVersion: await versionOf(taskId), idempotencyKey: key(), ...over,
 });
 const setPolicy = async (taskId: string, sources: string[], over: Partial<SetIndependence> = {}) =>
-  core.setIndependence(tokens.gm, await policyInput(taskId, sources, over));
+  core.setIndependence(tokens.owner, await policyInput(taskId, sources, over));
 const proofOf = (claimed: ClaimResult) => ({ taskId: claimed.task.id, deliveryId: claimed.deliveryId, fence: claimed.fence, expectedVersion: claimed.task.version });
 const failureOf = async (run: Promise<unknown>): Promise<CompanyError> => {
   try { await run; } catch (error) { if (error instanceof CompanyError) return error; throw error; }
@@ -104,7 +104,7 @@ test('a fresh bootstrap loads the independence migrations: task has both policy 
   const [table] = await database.db.query<[{ fields?: Record<string, string> }]>('INFO FOR TABLE employee;');
   expect(Object.keys(table?.fields ?? {})).toContain('principal');
   const probe = await engineering('bootstrap probe');
-  expect((await core.getTask(tokens.gm, probe.id)).independence).toBeUndefined();
+  expect((await core.getTask(tokens.owner, probe.id)).independence).toBeUndefined();
 });
 
 test('G5 replay: a source authored after the policy is a conflict at claim; the independent engineer still claims', async () => {
@@ -158,7 +158,7 @@ test('the same definition is not the same identity: an independent employee of t
   await authorParent('src', parent.id);
   const dependent = await engineering('dependent a same-def independent employee may take');
   await setPolicy(dependent.id, [parent.id]);
-  const scope = await workforce.independenceScope((await core.getTask(tokens.gm, dependent.id)).independence, 'execute');
+  const scope = await workforce.independenceScope((await core.getTask(tokens.owner, dependent.id)).independence, 'execute');
   if (scope?.kind !== 'index') throw new Error('expected an index scope');
   expect(independenceHit(scope.index, 't-src', undefined)).toMatchObject({ via: 'contributor', source: parent.id });
   expect(independenceHit(scope.index, 't-alias', 'eng-factory')).toBeUndefined();
@@ -185,7 +185,7 @@ test('an unreadable source history refuses the claim fail-closed, leaves no leas
     const refusal = await failureOf(core.claim(tokens.indep, dependent.id));
     expect(refusal.code).toBe('temporarily_unavailable');
     expect(refusal.retryable).toBe(true);
-    expect((await core.getTask(tokens.gm, dependent.id)).currentEmployee).toBeUndefined();
+    expect((await core.getTask(tokens.owner, dependent.id)).currentEmployee).toBeUndefined();
   } finally {
     seam.source = undefined;
   }
@@ -199,14 +199,14 @@ test('a source contribution that lands after the claim is refused at submit, and
   const claimed = await core.claim(tokens.indep, dependent.id);
 
   // The manager makes the claimant the implementer of the source: a new source contribution after the claim.
-  await core.implementerTakeover(tokens.gm, { taskId: parent.id, toEmployee: 't-indep', expectedVersion: await versionOf(parent.id),
+  await core.implementerTakeover(tokens.owner, { taskId: parent.id, toEmployee: 't-indep', expectedVersion: await versionOf(parent.id),
     reason: '经理指定 indep 接手源任务（测试）', idempotencyKey: key() });
 
   const refusal = await failureOf(core.submit(tokens.indep, proofOf(claimed), { text: EVIDENCE, idempotencyKey: key() }));
   expect(refusal.code).toBe('forbidden');
   expect(refusal.message).toContain('independence conflict');
   expect(refusal.details).toMatchObject({ conflicts: [{ task: dependent.id, source: parent.id, employee: 't-indep', via: 'contributor' }] });
-  const held = await core.getTask(tokens.gm, dependent.id);
+  const held = await core.getTask(tokens.owner, dependent.id);
   expect(held.currentEmployee).toBe('t-indep');
   expect(held.state).toBe('doing');
 });
@@ -219,7 +219,7 @@ test('a source change between the independence read and the claim write is caugh
   seam.contribution = async (taskId: string) => {
     if (taskId !== dependent.id || moved) return;
     moved = true;
-    await core.implementerTakeover(tokens.gm, { taskId: parent.id, toEmployee: 't-indep', expectedVersion: await versionOf(parent.id),
+    await core.implementerTakeover(tokens.owner, { taskId: parent.id, toEmployee: 't-indep', expectedVersion: await versionOf(parent.id),
       reason: '经理指定 indep 接手源任务（竞争测试）', idempotencyKey: key() });
   };
   const before = seam.contributionReads;
@@ -231,7 +231,7 @@ test('a source change between the independence read and the claim write is caugh
   }
   // The first round read the source before the takeover and the guard refused its write; the retry read again and refused the claim.
   expect(seam.contributionReads - before).toBe(2);
-  expect((await core.getTask(tokens.gm, dependent.id)).currentEmployee).toBeUndefined();
+  expect((await core.getTask(tokens.owner, dependent.id)).currentEmployee).toBeUndefined();
 });
 
 test('concurrent takeover of the source and claim of the dependent never leave a conflicting submit standing', async () => {
@@ -241,7 +241,7 @@ test('concurrent takeover of the source and claim of the dependent never leave a
     await setPolicy(dependent.id, [parent.id]);
     const [claimed, taken] = await Promise.allSettled([
       core.claim(tokens.indep, dependent.id),
-      core.implementerTakeover(tokens.gm, { taskId: parent.id, toEmployee: 't-indep', expectedVersion: await versionOf(parent.id),
+      core.implementerTakeover(tokens.owner, { taskId: parent.id, toEmployee: 't-indep', expectedVersion: await versionOf(parent.id),
         reason: '经理指定 indep 接手源任务（并发轮次）', idempotencyKey: key() }),
     ]);
     // Both races settle before the submit, so a takeover that landed is already visible to the submit gate. Every round asserts the
@@ -260,22 +260,22 @@ test('a policy change is refused while a lease is active, and nothing about the 
   const dependent = await engineering('dependent under an active lease');
   const first = await setPolicy(dependent.id, [parent.id]);
   await core.claim(tokens.indep, dependent.id);
-  const refusal = await failureOf(core.setIndependence(tokens.gm, await policyInput(dependent.id, [], { excluded: ['t-explicit'] })));
+  const refusal = await failureOf(core.setIndependence(tokens.owner, await policyInput(dependent.id, [], { excluded: ['t-explicit'] })));
   expect(refusal.code).toBe('conflict');
   expect(refusal.message).toContain('lease');
-  expect((await core.getTask(tokens.gm, dependent.id)).independence).toMatchObject({ revision: first.independence!.revision, sources: [parent.id] });
+  expect((await core.getTask(tokens.owner, dependent.id)).independence).toMatchObject({ revision: first.independence!.revision, sources: [parent.id] });
 });
 
 test('setIndependence replays the same key and payload without a second revision, and refuses a different payload under that key', async () => {
   const parent = await engineering('parent for replay');
   const dependent = await engineering('dependent for replay');
   const input = await policyInput(dependent.id, [parent.id]);
-  const first = await core.setIndependence(tokens.gm, input);
-  const again = await core.setIndependence(tokens.gm, input);
+  const first = await core.setIndependence(tokens.owner, input);
+  const again = await core.setIndependence(tokens.owner, input);
   expect(again.independence?.revision).toBe(first.independence?.revision);
   expect(again.version).toBe(first.version);
-  expect((await core.setIndependence(tokens.gm, input).then(view => view.version))).toBe(first.version);
-  const clash = await failureOf(core.setIndependence(tokens.gm, { ...input, reason: '另一个理由同一个幂等键（测试）' }));
+  expect((await core.setIndependence(tokens.owner, input).then(view => view.version))).toBe(first.version);
+  const clash = await failureOf(core.setIndependence(tokens.owner, { ...input, reason: '另一个理由同一个幂等键（测试）' }));
   expect(clash.code).toBe('conflict');
 });
 
@@ -284,12 +284,12 @@ test('policy writes are manager-only and every bad input is refused before anyth
   const dependent = await engineering('dependent for negative inputs');
   const version = await versionOf(dependent.id);
   expect((await failureOf(core.setIndependence(tokens.src, await policyInput(dependent.id, [parent.id])))).code).toBe('forbidden');
-  expect((await failureOf(core.setIndependence(tokens.gm, await policyInput(dependent.id, [dependent.id])))).code).toBe('invalid');
-  expect((await failureOf(core.setIndependence(tokens.gm, await policyInput(dependent.id, ['task-that-does-not-exist'])))).code).toBe('not_found');
-  expect((await failureOf(core.setIndependence(tokens.gm, await policyInput(dependent.id, [parent.id], { excluded: ['t-ghost'] })))).code).toBe('invalid');
-  expect((await failureOf(core.setIndependence(tokens.gm, await policyInput(dependent.id, [parent.id], { expectedVersion: version + 9 })))).code).toBe('conflict');
-  expect((await core.getTask(tokens.gm, dependent.id)).independence).toBeUndefined();
-  expect((await core.getTask(tokens.gm, dependent.id)).version).toBe(version);
+  expect((await failureOf(core.setIndependence(tokens.owner, await policyInput(dependent.id, [dependent.id])))).code).toBe('invalid');
+  expect((await failureOf(core.setIndependence(tokens.owner, await policyInput(dependent.id, ['task-that-does-not-exist'])))).code).toBe('not_found');
+  expect((await failureOf(core.setIndependence(tokens.owner, await policyInput(dependent.id, [parent.id], { excluded: ['t-ghost'] })))).code).toBe('invalid');
+  expect((await failureOf(core.setIndependence(tokens.owner, await policyInput(dependent.id, [parent.id], { expectedVersion: version + 9 })))).code).toBe('conflict');
+  expect((await core.getTask(tokens.owner, dependent.id)).independence).toBeUndefined();
+  expect((await core.getTask(tokens.owner, dependent.id)).version).toBe(version);
 });
 
 // SYS-DISP Q3 negatives: an identity link is a manage-controlled, audited write. Nobody may self-declare a link, and a live lease
@@ -314,10 +314,10 @@ test('principal writes are manager-only, audited, idempotent, and refuse a live 
     // Only manage may register an identity link.
     expect((await failureOf(core.setIdentityPrincipal!(tokens.src, principalInput()))).code).toBe('forbidden');
     // A short reason and an unknown employee are refused before anything is written.
-    expect((await failureOf(core.setIdentityPrincipal!(tokens.gm, principalInput({ reason: '短' })))).code).toBe('invalid');
-    expect((await failureOf(core.setIdentityPrincipal!(tokens.gm, principalInput({ employees: ['t-ghost'] })))).code).toBe('not_found');
+    expect((await failureOf(core.setIdentityPrincipal!(tokens.owner, principalInput({ reason: '短' })))).code).toBe('invalid');
+    expect((await failureOf(core.setIdentityPrincipal!(tokens.owner, principalInput({ employees: ['t-ghost'] })))).code).toBe('not_found');
     // A live lease refuses the write: an identity is never changed under a running task.
-    expect((await failureOf(core.setIdentityPrincipal!(tokens.gm, principalInput({ employees: ['t-indep', 't-alias'] })))).code).toBe('conflict');
+    expect((await failureOf(core.setIdentityPrincipal!(tokens.owner, principalInput({ employees: ['t-indep', 't-alias'] })))).code).toBe('conflict');
     // Nothing was written: only the fixture's own principal row exists, and no employee gained a second link.
     const [rows] = await database.db.query<[{ count: number }[]]>('SELECT count() AS count FROM principal GROUP ALL;');
     expect(rows?.[0]?.count ?? 0).toBe(1);
@@ -325,10 +325,10 @@ test('principal writes are manager-only, audited, idempotent, and refuse a live 
     expect(linked?.[0]?.count ?? 0).toBe(2);
     // The same key and payload replays the original result; a different payload under that key conflicts.
     const input = principalInput();
-    const first = await core.setIdentityPrincipal!(tokens.gm, input);
+    const first = await core.setIdentityPrincipal!(tokens.owner, input);
     expect(first).toMatchObject({ employees: ['t-src', 't-alias'], setBy: 't-gm', reason: input.reason });
-    expect(await core.setIdentityPrincipal!(tokens.gm, input)).toEqual(first);
-    expect((await failureOf(core.setIdentityPrincipal!(tokens.gm, { ...input, reason: '另一个理由，同一把幂等键' }))).code).toBe('conflict');
+    expect(await core.setIdentityPrincipal!(tokens.owner, input)).toEqual(first);
+    expect((await failureOf(core.setIdentityPrincipal!(tokens.owner, { ...input, reason: '另一个理由，同一把幂等键' }))).code).toBe('conflict');
     const [audit] = await database.db.query<[{ count: number }[]]>("SELECT count() AS count FROM audit WHERE action = 'identity_principal_set' GROUP ALL;");
     expect(audit?.[0]?.count ?? 0).toBeGreaterThan(0);
   } finally {
@@ -352,7 +352,7 @@ test('an ordinary task keeps the claim-only review rule: the prior hand may clai
   const parent = await engineering('parent where a hand claimed the review and released it');
   const written = await core.claim(tokens.exec, parent.id);
   await core.submit(tokens.exec, proofOf(written), { text: EVIDENCE, idempotencyKey: key() });
-  expect((await core.getTask(tokens.gm, parent.id)).state).toBe('review');
+  expect((await core.getTask(tokens.owner, parent.id)).state).toBe('review');
   // A second holder claims the review lease and releases it without deciding: they held the task but wrote nothing.
   const claimed = await core.claim(tokens.alias, parent.id);
   await core.release(tokens.alias, proofOf(claimed), { text: '本轮暂停，未裁决（claim-only 经手人，Q1 回归夹具）', idempotencyKey: key() });
@@ -409,7 +409,7 @@ test('the dispatcher reads the same exclusion from the audit stream: the contrib
   await authorParent('src', parent.id);
   const dependent = await engineering('dependent for the candidate pool');
   await setPolicy(dependent.id, [parent.id]);
-  const policy = (await core.getTask(tokens.gm, dependent.id)).independence!;
+  const policy = (await core.getTask(tokens.owner, dependent.id)).independence!;
   const scope = await readIndependenceSnapshot(database.db, policy);
   expect(scope.sources).toEqual([expect.objectContaining({ taskId: parent.id, version: expect.any(Number) })]);
   expect(independenceHit(scope.index, 't-src', undefined)).toMatchObject({ via: 'contributor', source: parent.id });
@@ -425,7 +425,7 @@ test('review stage: a source contributor may not review the dependent, the indep
   await setPolicy(dependent.id, [parent.id], { stages: ['review'] });
   const executed = await core.claim(tokens.exec, dependent.id);
   await core.submit(tokens.exec, proofOf(executed), { text: EVIDENCE, idempotencyKey: key() });
-  expect((await core.getTask(tokens.gm, dependent.id)).state).toBe('review');
+  expect((await core.getTask(tokens.owner, dependent.id)).state).toBe('review');
 
   const refusal = await failureOf(core.claim(tokens.src, dependent.id));
   expect(refusal.message).toContain('independence conflict');
@@ -439,7 +439,7 @@ test('review decisions are gated too: a reviewer who became a source contributor
   const executed = await core.claim(tokens.exec, dependent.id);
   await core.submit(tokens.exec, proofOf(executed), { text: EVIDENCE, idempotencyKey: key() });
   const reviewing = await core.claim(tokens.indep, dependent.id);
-  await core.implementerTakeover(tokens.gm, { taskId: parent.id, toEmployee: 't-indep', expectedVersion: await versionOf(parent.id),
+  await core.implementerTakeover(tokens.owner, { taskId: parent.id, toEmployee: 't-indep', expectedVersion: await versionOf(parent.id),
     reason: '经理指定 indep 接手源任务（复核后新贡献）', idempotencyKey: key() });
 
   const refusals = [
@@ -450,7 +450,7 @@ test('review decisions are gated too: a reviewer who became a source contributor
     expect(refusal.code).toBe('forbidden');
     expect(refusal.details).toMatchObject({ conflicts: [{ task: dependent.id, source: parent.id, employee: 't-indep', via: 'contributor' }] });
   }
-  const held = await core.getTask(tokens.gm, dependent.id);
+  const held = await core.getTask(tokens.owner, dependent.id);
   expect(held.state).toBe('review');
   expect(held.currentEmployee).toBe('t-indep');
 });
@@ -477,7 +477,7 @@ test('the candidate pool built from the stored policy drops a contributor that a
   const dependent = await engineering('dependent whose candidates are read on every pass');
   await setPolicy(dependent.id, [parent.id]);
   const dispatchPass = async () => {
-    const task = await core.getTask(tokens.gm, dependent.id);
+    const task = await core.getTask(tokens.owner, dependent.id);
     return pool({ id: dependent.id } as unknown as SupervisedTask, await workforce.independenceScope(task.independence, 'execute'));
   };
   // Before the source has any contributor, its employee is an ordinary candidate.
@@ -498,7 +498,7 @@ test('an unreadable source history refuses the submit fail-closed: the lease sta
   const dependent = await engineering('dependent submitted while the source history is unreadable');
   await setPolicy(dependent.id, [parent.id]);
   const claimed = await core.claim(tokens.indep, dependent.id);
-  const before = await core.getTask(tokens.gm, dependent.id);
+  const before = await core.getTask(tokens.owner, dependent.id);
 
   seam.source = async (taskId: string) => { if (taskId === parent.id) throw new Error('audit read failed'); };
   try {
@@ -508,7 +508,7 @@ test('an unreadable source history refuses the submit fail-closed: the lease sta
   } finally {
     seam.source = undefined;
   }
-  expect(await core.getTask(tokens.gm, dependent.id)).toMatchObject({ state: 'doing', currentEmployee: 't-indep', version: before.version });
+  expect(await core.getTask(tokens.owner, dependent.id)).toMatchObject({ state: 'doing', currentEmployee: 't-indep', version: before.version });
 
   expect((await core.submit(tokens.indep, proofOf(claimed), { text: EVIDENCE, idempotencyKey: key() })).state).toBe('review');
 });
@@ -522,9 +522,9 @@ test('a policy version this build does not read fails closed: the claim is refus
   const refusal = await failureOf(core.claim(tokens.indep, dependent.id));
   expect(refusal.code).toBe('forbidden');
   expect(refusal.message).toContain('not understood');
-  expect((await core.getTask(tokens.gm, dependent.id)).currentEmployee).toBeUndefined();
+  expect((await core.getTask(tokens.owner, dependent.id)).currentEmployee).toBeUndefined();
 
-  const scope = await workforce.independenceScope((await core.getTask(tokens.gm, dependent.id)).independence, 'execute');
+  const scope = await workforce.independenceScope((await core.getTask(tokens.owner, dependent.id)).independence, 'execute');
   expect(scope).toMatchObject({ kind: 'unverifiable' });
   const entries = pool({ id: dependent.id } as unknown as SupervisedTask, scope);
   expect(entries.length).toBeGreaterThan(0);
@@ -544,10 +544,10 @@ test('an incomplete stored policy fails closed: a missing, empty, unknown or mis
     const refusal = await failureOf(core.claim(tokens.indep, dependent.id));
     expect(refusal.code).toBe('forbidden');
     expect(refusal.message).toContain('incomplete');
-    expect((await core.getTask(tokens.gm, dependent.id)).currentEmployee).toBeUndefined();
+    expect((await core.getTask(tokens.owner, dependent.id)).currentEmployee).toBeUndefined();
 
     // The stage list cannot be trusted, so the policy is unverifiable at every stage, not only at the ones it names.
-    const stored = (await core.getTask(tokens.gm, dependent.id)).independence;
+    const stored = (await core.getTask(tokens.owner, dependent.id)).independence;
     expect(await workforce.independenceScope(stored, 'execute')).toMatchObject({ kind: 'unverifiable' });
     expect(await workforce.independenceScope(stored, 'review')).toMatchObject({ kind: 'unverifiable' });
     const entries = pool({ id: dependent.id } as unknown as SupervisedTask, await workforce.independenceScope(stored, 'execute'));
@@ -566,9 +566,9 @@ test('a source record that no longer exists refuses the claim as not found, and 
   const refusal = await failureOf(core.claim(tokens.indep, dependent.id));
   expect(refusal.code).toBe('not_found');
   expect(refusal.message).toContain(gone);
-  expect((await core.getTask(tokens.gm, dependent.id)).currentEmployee).toBeUndefined();
+  expect((await core.getTask(tokens.owner, dependent.id)).currentEmployee).toBeUndefined();
 
-  const scope = await workforce.independenceScope((await core.getTask(tokens.gm, dependent.id)).independence, 'execute');
+  const scope = await workforce.independenceScope((await core.getTask(tokens.owner, dependent.id)).independence, 'execute');
   expect(scope).toMatchObject({ kind: 'unverifiable', source: gone });
   const verdict = evaluateDispatch({ taskId: dependent.id, title: 'dependent', phase: 'execute', role: 'engineering', home: '/ops/repo',
     entries: pool({ id: dependent.id } as unknown as SupervisedTask, scope), checkedAt: 1_000_000 });
@@ -582,7 +582,7 @@ test('the verdict and its notice name the source task and each excluded candidat
   await authorParent('src', parent.id);
   const dependent = await engineering('dependent whose excluded candidates are the only ones left');
   await setPolicy(dependent.id, [parent.id]);
-  const scope = await workforce.independenceScope((await core.getTask(tokens.gm, dependent.id)).independence, 'execute');
+  const scope = await workforce.independenceScope((await core.getTask(tokens.owner, dependent.id)).independence, 'execute');
   // Only the excluded candidates are left in the pool, so the verdict must say why none of them can take the task.
   const excluded = pool({ id: dependent.id } as unknown as SupervisedTask, scope).filter(entry => !entry.eligible);
   const verdict = evaluateDispatch({ taskId: dependent.id, title: 'dependent', phase: 'execute', role: 'engineering', home: '/ops/repo',

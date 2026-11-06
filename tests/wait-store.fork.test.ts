@@ -68,7 +68,7 @@ beforeEach(async () => {
 
 let seq = 0;
 async function makeTask(title: string, reviewerRole: 'qa' | 'owner' = 'qa'): Promise<string> {
-  const task = await core.createTask(tokens.gm, {
+  const task = await core.createTask(tokens.owner, {
     title: `${title} ${++seq}`, context: 'SYS05 等待状态机回归夹具', executorRole: 'engineering',
     reviewerRole, workIntent: { kind: 'read' }, idempotencyKey: `wait-task-${title}-${seq}-${clock}`,
   } as CreateTask);
@@ -135,7 +135,7 @@ describe('entering a wait releases the lease and capacity (AC01/AC03)', () => {
     const taskId = await makeTask('重启后仍在等');
     await enter(taskId, 'eng', { kind: 'time', notBefore: iso(Date.now() + 10 * 60_000) });
     const restarted = new SurrealCompanyCore(database, { waits: { clock: () => clock, webhookSecret: WEBHOOK_SECRET } });
-    const view = await restarted.getTask(tokens.gm!, taskId);
+    const view = await restarted.getTask(tokens.owner!, taskId);
     expect(view.state).toBe('blocked');
     expect(view.wait?.kind).toBe('time');
     expect(view.wait?.state).toBe('waiting');
@@ -194,16 +194,16 @@ describe('external events (AC02/AC06)', () => {
       text: 'SYS05 回归：受信 webhook 确认客户已激活（测试事件，不对真实客户造事件）',
       idempotencyKey: 'resolve-activate-1',
     };
-    const first = await core.resolveWait(tokens.gm!, signed as never);
+    const first = await core.resolveWait(tokens.owner!, signed as never);
     expect(first.released).toBe(true);
     expect((await rowOf(taskId)).state).toBe('ready');
-    const again = await core.resolveWait(tokens.gm!, signed as never);
+    const again = await core.resolveWait(tokens.owner!, signed as never);
     expect(again.released).toBe(false);
     expect(['not_waiting', 'duplicate_event']).toContain(again.code);
 
     const secondTask = await makeTask('错误对象事件');
     const second = await enter(secondTask, 'eng', { kind: 'feedback', expiresAt: iso(Date.now() + 3_600_000) });
-    await expectRefused(core.resolveWait(tokens.gm!, {
+    await expectRefused(core.resolveWait(tokens.owner!, {
       waitKey: second.wait!.waitKey, source: 'authorized_person', objectWaitId: second.wait!.waitKey,
       objectTaskId: 'someone-else', at: Date.now(),
       text: 'SYS05 回归：错误对象的事件必须被拒绝，不能解除这个等待', idempotencyKey: 'wrong-object',
@@ -215,7 +215,7 @@ describe('external events (AC02/AC06)', () => {
   test('a bad webhook signature is refused; a wait with no configured secret is not trusted', async () => {
     const taskId = await makeTask('坏签名');
     const entered = await enter(taskId, 'eng', { kind: 'customer_activation', expiresAt: iso(Date.now() + 3_600_000) });
-    await expectRefused(core.resolveWait(tokens.gm!, {
+    await expectRefused(core.resolveWait(tokens.owner!, {
       source: 'webhook', provider: 'product', eventId: 'evt-bad', at: Date.now(),
       objectWaitId: entered.wait!.waitKey, signature: '0'.repeat(64),
       text: 'SYS05 回归：签名无效的 webhook 事件不能解除等待，也不能被信任', idempotencyKey: 'bad-signature',
@@ -233,7 +233,7 @@ describe('external events (AC02/AC06)', () => {
     expect(expired.map(item => item.taskId)).toContain(taskId);
     await store.releaseDue(clock);
     expect((await rowOf(taskId)).state).toBe('blocked');
-    const late = await core.resolveWait(tokens.gm!, {
+    const late = await core.resolveWait(tokens.owner!, {
       source: 'authorized_person', objectWaitId: entered.wait!.waitKey, at: expiresAt - 1_000,
       text: 'SYS05 回归：等待过期后即使事件发生在到期前，也必须先延期再确认',
       idempotencyKey: 'late-event',
@@ -253,19 +253,19 @@ describe('owner handoff (AC04/AC06)', () => {
       handoffFile: '/secure/handoff/invite-abc.txt', expiresAt: iso(Date.now() + 86_400_000),
     });
     const waitKey = entered.wait!.waitKey;
-    await expectRefused(core.resolveWait(tokens.gm!, {
+    await expectRefused(core.resolveWait(tokens.owner!, {
       source: 'authorized_person', objectWaitId: waitKey, at: Date.now(),
       text: 'SYS05 回归：模型自称收到老板反馈，不能解锁老板交接等待',
       idempotencyKey: 'model-self-report',
     } as never), 'invalid', /owner relay/);
-    await expectRefused(core.resolveWait(tokens.gm!, {
+    await expectRefused(core.resolveWait(tokens.owner!, {
       source: 'owner', objectWaitId: waitKey, at: Date.now(), ownerQuote: '老板说可以',
       text: 'SYS05 回归：公开工具不能冒充 owner relay 记录老板决定',
       idempotencyKey: 'fake-owner',
     } as never), 'forbidden', /owner relay/);
     expect((await rowOf(taskId)).state).toBe('blocked');
     // The relay path (record_owner_decision with decision=reply) is the only writer that reaches this resolution.
-    const relayed = await core.relayOwnerDecision(tokens.gm!, {
+    const relayed = await core.relayOwnerDecision(tokens.owner!, {
       taskId, decision: 'reply', note: '老板已确认转交客户', ownerQuote: '可以转交客户', idempotencyKey: 'owner-decision-1',
     } as never);
     expect(relayed.state).toBe('ready');
@@ -279,11 +279,11 @@ describe('owner handoff (AC04/AC06)', () => {
     const entered = await enter(taskId, 'eng', {
       kind: 'owner_handoff', completed: ['已生成邀请文件'], pendingAction: '请老板确认是否发给客户',
     });
-    const cards = await core.waitHandoffCards(tokens.gm!);
+    const cards = await core.waitHandoffCards(tokens.owner!);
     const card = cards.find(item => item.waitKey === entered.wait!.waitKey);
     expect(card).toBeDefined();
     expect(card!.expiresAt).toEqual({ source: 'unknown' });
-    expect(card!.taskTitle).toBe((await core.getTask(tokens.gm!, taskId)).title);
+    expect(card!.taskTitle).toBe((await core.getTask(tokens.owner!, taskId)).title);
     expect(card!.waitingOn).toBe('owner');
     expect(card!.waitingBy).toBe('engineering');
     expect(card!.handoffFileName).toBeUndefined();
@@ -296,21 +296,21 @@ describe('safe release and version locks (AC05)', () => {
     const taskId = await makeTask('版本锁');
     const entered = await enter(taskId, 'eng', { kind: 'time', notBefore: iso(Date.now() + 10 * 60_000) });
     const waitKey = entered.wait!.waitKey;
-    await expectRefused(core.resume(tokens.gm!, taskId, evidence('resume-past-wait')), 'conflict', /在等待中/);
-    const stale = await core.extendWait(tokens.gm!, {
+    await expectRefused(core.resume(tokens.owner!, taskId, evidence('resume-past-wait')), 'conflict', /在等待中/);
+    const stale = await core.extendWait(tokens.owner!, {
       waitKey, expectedVersion: 99, reason: 'SYS05 回归：用旧版本延期必须被拒绝，不能覆盖别人刚做的变更', idempotencyKey: 'extend-stale',
     });
     expect(stale.ok).toBe(false);
-    const extended = await core.extendWait(tokens.gm!, {
+    const extended = await core.extendWait(tokens.owner!, {
       waitKey, expectedVersion: 1, reason: 'SYS05 回归：延期十分钟，保留同一个任务与等待身份', idempotencyKey: 'extend-ok',
       notBefore: iso(Date.now() + 20 * 60_000),
     });
     expect(extended).toMatchObject({ ok: true, version: 2 });
-    const cancelStale = await core.cancelWait(tokens.gm!, {
+    const cancelStale = await core.cancelWait(tokens.owner!, {
       waitKey, expectedVersion: 1, reason: 'SYS05 回归：旧版本取消必须被拒绝，避免覆盖延期', idempotencyKey: 'cancel-stale',
     });
     expect(cancelStale.ok).toBe(false);
-    const cancelled = await core.cancelWait(tokens.gm!, {
+    const cancelled = await core.cancelWait(tokens.owner!, {
       waitKey, expectedVersion: 2, reason: 'SYS05 回归：授权取消等待，任务交回经理而不是静默可调度', idempotencyKey: 'cancel-ok',
     });
     expect(cancelled.ok).toBe(true);
@@ -326,7 +326,7 @@ describe('safe release and version locks (AC05)', () => {
     const entered = await enter(taskId, 'eng', { kind: 'upstream_repair', referenceTaskId: dependency });
     const store = new WaitStore(database.db);
     expect((await store.releaseDue(Date.now())).released.map(item => item.taskId)).not.toContain(taskId);
-    await core.retireTask(tokens.gm!, { taskId: dependency, text: 'SYS05 回归：修复任务作废，视为已满足依赖', idempotencyKey: `retire-${dependency}` } as never);
+    await core.retireTask(tokens.owner!, { taskId: dependency, text: 'SYS05 回归：修复任务作废，视为已满足依赖', idempotencyKey: `retire-${dependency}` } as never);
     const sweep = await store.releaseDue(Date.now());
     expect(sweep.released.map(item => item.taskId)).toContain(taskId);
     expect((await rowOf(taskId)).state).toBe('ready');
@@ -337,7 +337,7 @@ describe('safe release and version locks (AC05)', () => {
     const dependency = await makeTask('未完成的上游修复');
     const taskId = await makeTask('等待未完成修复');
     const entered = await enter(taskId, 'eng', { kind: 'upstream_repair', referenceTaskId: dependency });
-    const refused = await core.resolveWait(tokens.gm!, {
+    const refused = await core.resolveWait(tokens.owner!, {
       source: 'dependency', objectWaitId: entered.wait!.waitKey, at: Date.now(),
       text: 'SYS05 回归：引用任务仍为 ready，系统依赖事件不能解除上游修复等待',
       idempotencyKey: 'dependency-not-terminal',
@@ -346,7 +346,7 @@ describe('safe release and version locks (AC05)', () => {
     expect(refused.code).toBe('dependency');
     expect((await rowOf(taskId)).state).toBe('blocked');
     // A named manager may attest explicitly (and is audited as authorized_person) rather than pretending the task finished.
-    const attested = await core.resolveWait(tokens.gm!, {
+    const attested = await core.resolveWait(tokens.owner!, {
       source: 'authorized_person', objectWaitId: entered.wait!.waitKey, at: Date.now(),
       text: 'SYS05 回归：授权人显式确认上游已修复并留审计，属于人工豁免而非系统依赖事件',
       idempotencyKey: 'dependency-human-exemption',
@@ -361,7 +361,7 @@ describe('safe release and version locks (AC05)', () => {
     const entered = await enter(taskId, 'eng', { kind: 'upstream_repair', referenceTaskId: dependency });
     const at = Date.now();
     const payload = webhookPayload({ eventId: 'evt-repair-ready', provider: 'ops-provider', at, objectWaitId: entered.wait!.waitKey });
-    const refused = await core.resolveWait(tokens.gm!, {
+    const refused = await core.resolveWait(tokens.owner!, {
       source: 'webhook', provider: 'ops-provider', eventId: 'evt-repair-ready', at,
       objectWaitId: entered.wait!.waitKey, signature: signWaitWebhook(WEBHOOK_SECRET, payload),
       text: 'SYS05 回归：签名证明事件真实，不证明上游修复完成；引用仍 ready 时必须拒绝',
@@ -430,7 +430,7 @@ describe('safe release and version locks (AC05)', () => {
     expect(first.held.map(item => item.taskId)).toContain(taskId);
     expect((await store.waitsOfTask(taskId))[0]!.state).toBe('held');
     expect((await rowOf(taskId)).state).toBe('blocked');
-    await core.retireTask(tokens.gm!, { taskId: dependency, text: 'SYS05 回归：依赖完成后 held 等待应自动恢复', idempotencyKey: `retire-held-${dependency}` } as never);
+    await core.retireTask(tokens.owner!, { taskId: dependency, text: 'SYS05 回归：依赖完成后 held 等待应自动恢复', idempotencyKey: `retire-held-${dependency}` } as never);
     const recovered = await store.releaseDue(Date.now());
     expect(recovered.released.map(item => item.taskId)).toContain(taskId);
     expect((await rowOf(taskId)).state).toBe('ready');
@@ -445,7 +445,7 @@ describe('safe release and version locks (AC05)', () => {
       { task: new RecordId('task', legacy), until },
     );
     const before = await rowOf(legacy);
-    const migrated = await core.waitMigrationApply(tokens.gm!, {
+    const migrated = await core.waitMigrationApply(tokens.owner!, {
       taskId: legacy, expectedVersion: before.version as number,
       reason: 'SYS05 回归：把一条旧的时间阻塞按任务迁移为时间等待，不批量放行', idempotencyKey: 'migrate-one',
     });
@@ -454,7 +454,7 @@ describe('safe release and version locks (AC05)', () => {
     expect((await rowOf(legacy)).quota_resets_at).toBeUndefined();
     const wait = (await new WaitStore(database.db).waitsOfTask(legacy))[0]!;
     expect(wait.notBefore).toBe(until * 1000);
-    await expectRefused(core.waitMigrationApply(tokens.gm!, {
+    await expectRefused(core.waitMigrationApply(tokens.owner!, {
       taskId: legacy, expectedVersion: before.version as number,
       reason: 'SYS05 回归：旧版本再次迁移必须被拒绝，避免覆盖新状态', idempotencyKey: 'migrate-stale',
     }), 'conflict', /version moved|版本/);
@@ -462,7 +462,7 @@ describe('safe release and version locks (AC05)', () => {
     const ready = await makeTask('ready 残留额度边界');
     await database.db.query('UPDATE ONLY $task SET quota_resets_at = $until;', { task: new RecordId('task', ready), until });
     const readyRow = await rowOf(ready);
-    await expectRefused(core.waitMigrationApply(tokens.gm!, {
+    await expectRefused(core.waitMigrationApply(tokens.owner!, {
       taskId: ready, expectedVersion: readyRow.version as number,
       reason: 'SYS05 回归：ready 任务不在迁移预演的 eligible 条件内，apply 必须拒绝', idempotencyKey: 'migrate-ready',
     }), 'invalid', /blocked/);
@@ -472,7 +472,7 @@ describe('safe release and version locks (AC05)', () => {
       task: new RecordId('task', owned), until,
     });
     const ownedRow = await rowOf(owned);
-    await expectRefused(core.waitMigrationApply(tokens.gm!, {
+    await expectRefused(core.waitMigrationApply(tokens.owner!, {
       taskId: owned, expectedVersion: ownedRow.version as number,
       reason: 'SYS05 回归：老板关口不能被批量迁移为时间等待', idempotencyKey: 'migrate-owner',
     }), 'forbidden', /老板关口/);
@@ -486,7 +486,7 @@ describe('safe release and version locks (AC05)', () => {
       { task: new RecordId('task', legacy), until },
     );
     const before = await rowOf(legacy);
-    const migrated = await core.waitMigrationApply(tokens.gm!, {
+    const migrated = await core.waitMigrationApply(tokens.owner!, {
       taskId: legacy, expectedVersion: before.version as number,
       reason: 'SYS05 回归：复核期旧阻塞迁移后必须回到复核，而不是变成可执行任务', idempotencyKey: 'migrate-review',
     });
@@ -500,7 +500,7 @@ describe('safe release and version locks (AC05)', () => {
   });
 
   test('the migration preview is read-only and never marks an owner gate eligible', async () => {
-    const preview = await core.waitMigrationPreview(tokens.gm!);
+    const preview = await core.waitMigrationPreview(tokens.owner!);
     expect(Array.isArray(preview.candidates)).toBe(true);
     expect(preview.ownerGatesBlocked).toBeGreaterThanOrEqual(0);
     for (const candidate of preview.candidates) {
