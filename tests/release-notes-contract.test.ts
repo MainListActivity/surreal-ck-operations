@@ -36,10 +36,10 @@ describe('the release notes are registrable', () => {
     expect(notes.version).toBe(pluginPkg.version);
   });
 
-  test('the notes name the schema 051 tables and fields', () => {
+  test('the notes name the schema 053 table', () => {
     const text = JSON.stringify(notes);
-    expect(text).toContain('outbound_message');
-    expect(text).toContain('051');
+    expect(text).toContain('lane_note');
+    expect(text).toContain('053');
   });
 
   test('the limits are real: an eleventh change or a long one is refused', () => {

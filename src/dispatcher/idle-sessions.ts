@@ -12,9 +12,8 @@ export async function reclaimIdleSessions(input: {
   const updates: Array<{ inst: EmployeeInst; since?: number }> = [];
   const candidates: EmployeeInst[] = [];
   for (const inst of input.instances) {
-    // Goal agents are durable conversations, independent of transient worktree resources.
-    if (inst.workspaceScope) continue;
-    const eligible = input.states.get(inst.id) === 'idle' && !inst.activeTask && !input.held.has(inst.id) && !input.bound.has(inst.id) && !!inst.paseoAgentId;
+    // A closed runtime reads as sleeping: it still has to end, or it stays on the roster forever.
+    const eligible = ['idle', 'sleeping'].includes(input.states.get(inst.id) ?? '') && !inst.activeTask && !input.held.has(inst.id) && !input.bound.has(inst.id) && !!inst.paseoAgentId;
     const freshWake = inst.idleSince !== undefined && (inst.lastWakeAt ?? 0) >= inst.idleSince;
     const since = eligible ? freshWake ? now : inst.idleSince ?? now : undefined;
     if (since !== inst.idleSince) updates.push({ inst, since });
@@ -29,7 +28,7 @@ export async function reclaimIdleSessions(input: {
   for (const inst of candidates) {
     if (wakes.some(w => w.employee === inst.id || w.agent === inst.paseoAgentId)) continue;
     const status = await input.paseo.status(inst.paseoAgentId!).catch(() => undefined);
-    if (status?.status !== 'idle' || status.pendingPermissions > 0) continue;
+    if ((status?.status !== 'idle' && status?.status !== 'closed') || status.pendingPermissions > 0) continue;
     try { await wf.retireIdle(inst); }
     catch (error) { input.log(`idle cleanup kept ${inst.id}: ${(error as Error).message}`); continue; }
     // The credential gate succeeded before anything is archived.

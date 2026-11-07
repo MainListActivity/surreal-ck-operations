@@ -72,7 +72,7 @@ test('pool: legacy instance does not consume a maxInstances seat in sidecar mode
   const spawn = pool.find(e => e.kind === 'spawn')!;
   expect(spawn.eligible).toBe(true);   // seat free despite the live legacy inst
   // Non-sidecar mode: the same inst would consume the seat.
-  const pool2 = staffingPool(base({ defs: [d], insts: [legacy], states: new Map([['i1', 'idle']]), sidecar: false }));
+  const pool2 = staffingPool(base({ defs: [d], insts: [legacy], states: new Map([['i1', 'busy']]), sidecar: false }));
   expect(pool2.find(e => e.kind === 'spawn')!.reason).toBe('编制席位已满（1/1 个实例，仓库 repo）');
 });
 
@@ -331,4 +331,14 @@ test('an unresolved Factory definition cannot reserve a task over qualified Clau
  const f=inst('f',{def:'factory',provider:'factory-droid'}),c=inst('c',{def:'claude',provider:'claude',model:'group/sck-haiku'});
  const entries=staffingPool(base({defs:[factory,claude],insts:[c],states:new Map([['c','idle']]),providerMax:{'factory-droid':1,claude:4}}));
  expect(entries.find(e=>e.key==='c')?.eligible).toBe(true);
+});
+
+test('pool: a session waiting between turns frees its seat; one that holds a lease or runs does not', () => {
+  const d = def('d1', { maxInstances: 1 });
+  const held = inst('i1');
+  const spawnOf = (input: Parameters<typeof base>[0]) => staffingPool(base({ defs: [d], insts: [held], ...input })).find(e => e.kind === 'spawn')!;
+  expect(spawnOf({ states: new Map([['i1', 'idle']]) }).eligible).toBe(true);
+  expect(spawnOf({ states: new Map([['i1', 'sleeping']]) }).eligible).toBe(true);
+  expect(spawnOf({ states: new Map([['i1', 'busy']]) }).code).toBe('seat_full');
+  expect(spawnOf({ states: new Map([['i1', 'idle']]), holding: new Set(['i1']) }).code).toBe('seat_full');
 });

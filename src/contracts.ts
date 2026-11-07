@@ -486,6 +486,9 @@ export interface ClaimResult {
   historyComplete?: boolean;
   /** Earlier holders of this task with their Paseo session IDs; the successor can pull full transcripts. */
   predecessors?: SessionRef[];
+  /** This claim's lane and the notes.md text for it; read failure leaves both absent. */
+  lane?: string;
+  laneNotes?: string;
   /** Project environment of the task's goal: where it ships, how to verify, red lines. Credentials are never part of it. */
   project?: ProjectView;
   worktree?: WorktreeAssignment;
@@ -562,6 +565,8 @@ export interface Evidence {
   sha?: string;
   /** Follow-up proposals, max 20: each creates a planned child typed through the route table. */
   next?: Array<{ type: string; title: string; requirement?: string; acceptance?: string }>;
+  /** Lessons for this lane's long-term notes, max 5: they take effect only once the task is done. */
+  learned?: string[];
 }
 
 export interface OutboxEvent {

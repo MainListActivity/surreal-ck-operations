@@ -29,6 +29,8 @@ const evidenceShape = {
   idempotencyKey: z.string().min(1),
   // SYS02: the head a submission is bound to; machine evidence must match it.
   acceptance: z.object({ sha: z.string().min(1).max(200).optional(), environment: z.string().min(1).max(100).optional() }).optional(),
+  // Long-term lessons for this lane; core validates length and content.
+  learned: z.array(z.string().min(1)).max(5).optional(),
 };
 // SYS02 structured acceptance criteria. The schema documents the shape; core validates and owns the gate.
 const acceptanceCriterionShape = z.object({

@@ -47,7 +47,7 @@ test('A, B and C all recused, the only reviewer seat full and its provider out o
   const authors = { contributors: async () => ({ excluded: ['emp-a', 'emp-b', 'emp-c'] }) } as unknown as Pick<Workforce, 'contributors'>;
   const engineer = (id: string) => ({ ...reviewer, id }) as EmployeeInst;
   const p = await preview({ defs: [{ ...def, maxInstances: 3 }], insts: ['emp-a', 'emp-b', 'emp-c'].map(engineer),
-    states: new Map([['emp-a', 'idle' as const], ['emp-b', 'idle' as const], ['emp-c', 'idle' as const]]),
+    states: new Map<string, 'busy'>([['emp-a', 'busy'], ['emp-b', 'busy'], ['emp-c', 'busy']]) as never,
     quotaBlocked: new Map([['claude', 'quota reset pending']]) }, authors);
   expect(p.status).toBe('blocked');
   expect(p.entries.filter(entry => entry.code === 'prior_submitter')).toHaveLength(3);

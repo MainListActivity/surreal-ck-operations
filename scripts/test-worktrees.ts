@@ -70,6 +70,8 @@ try {
     // QA 的 SYS03 独立重演（真实 sck → 真实 sidecar → 真实 core → fork 库）；本轮起纳入本 lane 的回归，见该文件头部说明。
     'tests/rollback-isolation.fork.test.ts', 'tests/null-absent.fork.test.ts',
     'tests/snapshot-quota.fork.test.ts',
+    // 线的笔记：提议、生效、作废、上限与线间隔离（自建隔离库）。
+    'tests/lane-notes.fork.test.ts',
     // SYS-INT：演练工具的 Node 宿主门禁与 deployDrillRun/Status 权限回归（自建隔离库，不启动生产演练）。
     'tests/deploy-drill.test.ts', 'tests/deploy-drill-runner.test.ts', 'tests/deploy-drill-node-host.test.ts', 'tests/deploy-drill-access.fork.test.ts',
     // SYS-INT：QA 评审协同的持久事件唤醒（自建隔离库；订阅/信号/事件只解除协同任务自己的 feedback 等待）。

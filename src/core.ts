@@ -1,4 +1,5 @@
 import { git, readCompanyRelease, type CompanyRelease } from './company-release.ts';
+import { checkLearned, LaneNoteStore, laneOf } from './lane-notes.ts';
 import { getRoute, listRoutes, CHAIN_LIMIT, type RouteRow } from './routes.ts';
 import { OutboundMessageStore } from './outbound-messages.ts';
 import { drillHost, startDrill, readDrillStatus, type DrillState } from './deploy-drill-service.ts';
@@ -752,7 +753,8 @@ export class SurrealCompanyCore implements CompanyCore {
       if (route || input.type) {
         const store = new OutboundMessageStore(this.db);
         const code = route?.code === true;
-        const drafts = await store.createTaskDrafts(taskView.id, taskView.executorRole, taskView.reviewerRole, code);
+        const drafts = await store.createTaskDrafts(taskView.id, taskView.executorRole, taskView.reviewerRole, code,
+          { execute: route?.execute_body, review: route?.review_body });
         const hold = input.hold ?? route?.hold;
         if (hold) {
           for (const draft of drafts) {
@@ -818,7 +820,8 @@ export class SurrealCompanyCore implements CompanyCore {
         type: proposal.type, parent: id('task', parent.id), proposed_in: submitAuditId,
         ex: route.executor_role, rev: route.reviewer_role });
     const child = view(rows!);
-    await new OutboundMessageStore(this.db).createTaskDrafts(child.id, child.executorRole, child.reviewerRole, route.code === true);
+    await new OutboundMessageStore(this.db).createTaskDrafts(child.id, child.executorRole, child.reviewerRole, route.code === true,
+      { execute: route.execute_body, review: route.review_body });
     return child;
   }
 
@@ -959,7 +962,9 @@ export class SurrealCompanyCore implements CompanyCore {
     const taskView = view(row);
     const project = await this.taskProject(taskId);
     const handover = await this.handoverHistory(taskId);
-    return { task: taskView, deliveryId: taskView.deliveryId!, fence: taskView.fence,
+    const lane = laneOf(project?.id, actor.role);
+    const laneNotes = await new LaneNoteStore(this.db).render(lane).catch(() => undefined);
+    return { task: taskView, deliveryId: taskView.deliveryId!, fence: taskView.fence, lane, laneNotes,
       leaseExpiresAt: taskView.leaseExpiresAt!, history: handover.history, historyComplete: handover.historyComplete, historyCount: handover.historyCount,
       predecessors: await this.predecessors(taskId, actor.employeeId),
       project, worktree: taskView.worktree };
@@ -2016,6 +2021,8 @@ export class SurrealCompanyCore implements CompanyCore {
         if (!route?.enabled) throw new CompanyError('invalid', `proposal type ${proposal.type} is missing or disabled`);
       }
     }
+    const noteAction = action === 'submit' || action === 'accept' || action === 'return';
+    const learned = noteAction && evidence?.learned !== undefined ? checkLearned(evidence.learned) : undefined;
     if (action === 'submit' && evidence && this.submitCheck) {
       const row = await this.db.select<TaskRow>(id('task', proof.taskId));
       if (row?.executor_role === 'engineering' && row.kind === 'task') {
@@ -2191,6 +2198,7 @@ export class SurrealCompanyCore implements CompanyCore {
         ${ACTIVATE_PLANNED_SQL}
       };
       IF $returning {
+        UPDATE lane_note SET state = 'removed', updated_at = time::now() WHERE source_task = $task AND state = 'proposed' AND phase = 'execute';
         LET $sid = SELECT VALUE <string>record::id(id) FROM audit WHERE task = $task AND action = 'submit' ORDER BY at DESC LIMIT 1;
         LET $proposal_rows = SELECT * FROM task WHERE parent = $task AND proposed_in IN ($sid ?? []) AND state = 'planned';
         UPDATE task SET state = 'void', version += 1 WHERE parent = $task AND proposed_in IN ($sid ?? []) AND state = 'planned';
@@ -2224,6 +2232,12 @@ export class SurrealCompanyCore implements CompanyCore {
         for (const proposal of evidence.next) {
           await this.createProposal(done, proposal, String(auditId.id));
         }
+      }
+      // The transition is already committed: a note that cannot be stored must not fail the delivery it rode on.
+      if (learned) {
+        await new LaneNoteStore(this.db).propose(laneOf((await this.taskProject(proof.taskId))?.id, actor.role), proof.taskId,
+          action === 'submit' ? 'execute' : 'review', learned, actor.employeeId)
+          .catch(error => console.warn(`lane notes for ${proof.taskId} not stored: ${(error as Error).message}`));
       }
       return done;
     } catch (error) {

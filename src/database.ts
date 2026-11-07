@@ -211,6 +211,9 @@ export class CompanyDatabase {
     await this.db.query(loadSchema('051-role-message-flow.surql'));
     await this.db.query(loadSchema('052-task-routes.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 52 WHERE schema_version < 52;');
+    // 053：线的笔记。只新增 lane_note 表，不改既有行；旧 release 读不到新表即忽略（RB01）。
+    await this.db.query(loadSchema('053-lane-notes.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 53 WHERE schema_version < 53;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

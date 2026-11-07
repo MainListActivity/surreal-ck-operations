@@ -1,6 +1,7 @@
 import { FACTORY_PROVIDER, FACTORY_WAIT_LIMIT, factoryFirst, factoryQueue, leaveFactoryQueue } from './provider-order.ts';
 import { managedModel, employeeClientModel } from "../model-routing/policy.ts";
 import type { OwnerDesk } from '../owner.ts';
+import { LaneNoteStore } from '../lane-notes.ts';
 import { OutboundMessageStore, renderMessage, type MessageStep, type OutboundMessage } from '../outbound-messages.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
@@ -304,8 +305,11 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
   for (const def of p.defs) {
     if (def.role !== p.role) continue;
     const resolved = resolveSlot(def);
+    // A session waiting between turns is not using a seat: counting it would stall a role with few seats while its finished
+    // sessions wait for review. maxRunning still bounds what actually runs on the host.
+    const waiting = (i: EmployeeInst) => ['idle', 'sleeping'].includes(p.states.get(i.id) ?? '') && !p.holding.has(i.id) && !p.assigned?.has(i.id);
     const seats = p.insts.filter(i => i.def === def.id && (i.repoHome ?? i.cwd ?? p.opsRepo) === p.home &&
-      inWorkspace(i) && !(p.sidecar && i.credentialFile)).length;
+      inWorkspace(i) && !(p.sidecar && i.credentialFile) && !waiting(i)).length;
     const hit: Block | undefined =
       gate(undefined) ??
       (!def.enabled ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
@@ -651,6 +655,17 @@ export class Dispatcher {
     if (!this.deps.sidecar?.adoptRecovery) this.log('recovery wake disabled: sidecar hook missing');
   }
   private log(message: string) { this.deps.log?.(message); }
+  /** Finished tasks' proposals take effect here, so every way a task can end goes through one path. Never blocks a pass. */
+  private async settleLaneNotes(): Promise<void> {
+    const database = (this.deps.workforce as unknown as { database?: { db?: unknown } }).database;
+    if (!database?.db) return;
+    try {
+      const result = await new LaneNoteStore(database.db as never).settle();
+      for (const lane of result.fullLanes) await this.deps.owner.raiseNotice(`lane_notes_full:${lane}`, `线 ${lane} 的笔记已到上限，新经验暂不生效，请在控制台删减`);
+      for (const lane of result.openLanes) await this.deps.owner.resolveNotice(`lane_notes_full:${lane}`);
+    } catch (error) { this.log(`lane notes settle failed: ${(error as Error).message}`); }
+  }
+
   private messages?: OutboundMessageStore;
   private messagesTried = false;
   /** The store is optional: runtimes without one (tests, legacy) fall back to the built-in template. */
@@ -1022,7 +1037,7 @@ export class Dispatcher {
       }
       if (status === 'closed') {
         openTasks ??= await wf.tasks();
-        // Paseo's idle collector closes only the process. Goal conversations remain durable seats.
+        // Paseo's idle collector closes only the process; idle cleanup ends the session itself once it has waited long enough.
         // Leave unused runtimes asleep; send() restores the same persistence handle after a legal claim.
         if ((inst.workspaceScope || inst.runtimeSleepRequestedAt !== undefined) && !inst.activeTask && !openTasks.some(t => t.currentEmployee === inst.id) &&
             (!inst.def || defs.some(d => d.id === inst.def && d.enabled))) {
@@ -1090,6 +1105,7 @@ export class Dispatcher {
     const tasks = await wf.tasks();
 
     await observeRuntimeIdle({instances:insts,states,tasks,now,workforce:wf});
+    await this.settleLaneNotes();
 
     // 2c. Session rotation: a session that has run many turns carries an ever-growing context,
     // so every further turn costs more input tokens. Retire idle instances past the configured
@@ -1115,9 +1131,9 @@ export class Dispatcher {
         // misleads Jev's staffing picks. Retire it on sight.
         const legacyEol = Boolean(this.deps.sidecar && inst.credentialFile);
         const maxWakes = cfg.sessionMaxWakesByRole?.[inst.role] ?? cfg.sessionMaxWakes;
-        const overWakes = !inst.workspaceScope && maxWakes > 0 && (inst.wakeCount ?? 0) >= maxWakes;
+        const overWakes = maxWakes > 0 && (inst.wakeCount ?? 0) >= maxWakes;
         let inputK = 0;
-        if (!inst.workspaceScope && !legacyEol && !overWakes && cfg.sessionMaxInputK > 0 && (inst.wakeCount ?? 0) >= 3 && inspected < 8) {
+        if (!legacyEol && !overWakes && cfg.sessionMaxInputK > 0 && (inst.wakeCount ?? 0) >= 3 && inspected < 8) {
           inspected++;
           inputK = ((await paseo.lastInputTokens(inst.paseoAgentId!).catch(() => undefined)) ?? 0) / 1000;
         }

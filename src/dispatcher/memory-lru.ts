@@ -3,7 +3,7 @@ import type {PaseoGateway} from './paseo.ts';
 
 const MIN_IDLE_SECONDS = 3600;
 
-/** Persist continuous idle observations, including durable goal conversations. Never infer idle from process age. */
+/** Persist continuous idle observations; a closed runtime is still waiting. Never infer idle from process age. */
 export async function observeRuntimeIdle(input: {
   instances:EmployeeInst[]; states:ReadonlyMap<string,string>; tasks:SupervisedTask[]; now:number;
   workforce:Pick<Workforce,'observeSessionIdle'>;
@@ -12,7 +12,7 @@ export async function observeRuntimeIdle(input: {
   const held=new Set(input.tasks.flatMap(t=>t.currentEmployee?[t.currentEmployee]:[]));
   const updates:Array<{id:string;since?:number;lastWakeAt?:number;previousIdleSince?:number}>=[];
   for (const inst of input.instances) {
-    const idle=input.states.get(inst.id)==='idle' && !inst.activeTask && !held.has(inst.id) && !!inst.paseoAgentId;
+    const idle=['idle','sleeping'].includes(input.states.get(inst.id)??'') && !inst.activeTask && !held.has(inst.id) && !!inst.paseoAgentId;
     const fresh=inst.idleSince!==undefined && (inst.lastWakeAt??0)>=inst.idleSince;
     const since=idle?(fresh?input.now:inst.idleSince??input.now):undefined;
     if (since!==inst.idleSince) updates.push({id:inst.id,since,lastWakeAt:inst.lastWakeAt,previousIdleSince:inst.idleSince});

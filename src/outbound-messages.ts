@@ -26,16 +26,22 @@ const STEPS: readonly MessageStep[] = ['execute', 'review', 'rework', 'nudge', '
 export const DEFAULT_MACHINE_CRITERION = 'AC-BASE-DEPLOY-1';
 
 /** 表里保存短正文；派工时 renderMessage 才补上真实路径、工具绝对路径与任务 ID。 */
-const EXECUTE_CODE = `实现 task.md 中的需求，合入并发布到生产，按验收标准在生产逐条自验，全部通过后：sck call submit '{"text":"<结果>","sha":"<合入提交>"}'。需要后续任务时在 submit 里加 next 数组。`;
-const EXECUTE_PLAIN = `完成 task.md 中的需求，按验收标准自验后：sck call submit '{"text":"<结果>"}'。需要后续任务时在 submit 里加 next 数组。`;
+const NOTES = `先读 notes.md。`;
+const LEARNED = `有长期可复用的要求、方法或坑，就加 learned 数组（最多 5 条，每条一行，不写本次结论）。`;
+const EXECUTE_CODE = `${NOTES}实现 task.md 中的需求，合入并发布到生产，按验收标准在生产逐条自验，全部通过后：sck call submit '{"text":"<结果>","sha":"<合入提交>"}'。需要后续任务时在 submit 里加 next 数组。${LEARNED}`;
+const EXECUTE_PLAIN = `${NOTES}完成 task.md 中的需求，按验收标准自验后：sck call submit '{"text":"<结果>"}'。需要后续任务时在 submit 里加 next 数组。${LEARNED}`;
 /** 内容线（故事/视频等）的复核不涉及生产发布；软件线的复核才按生产环境逐条复验。 */
-const REVIEW = `按 task.md 的验收标准逐条复验：sck call review '{"decision":"accept|return","text":"<结论>"}'`;
-const REVIEW_CODE = `按 task.md 的验收标准在生产逐条复验：sck call review '{"decision":"accept|return","text":"<结论>"}'`;
+const REVIEW = `${NOTES}按 task.md 的验收标准逐条复验：sck call review '{"decision":"accept|return","text":"<结论>"}'。${LEARNED}`;
+const REVIEW_CODE = `${NOTES}按 task.md 的验收标准在生产逐条复验：sck call review '{"decision":"accept|return","text":"<结论>"}'。${LEARNED}`;
 const REWORK_CODE = `修复 findings/round-NN.md 中的问题后，` + EXECUTE_CODE;
 const REWORK_PLAIN = `修复 findings/round-NN.md 中的问题后，` + EXECUTE_PLAIN;
 const NUDGE = (phase: string) => phase === 'review' ? REVIEW : EXECUTE_PLAIN;
 /** eval 不读本任务 task.md：评分规则在运营仓的 agents/eval.md，由派工时补成绝对路径。 */
 const EVAL = `任务 {taskId} 已完成，读 sck call get_task_history 和 sck call get_model_evidence，按 agents/eval.md 为全部参与员工打分，用 sck call record_score '{"taskId":"{taskId}","summary":"<本轮一句话总结>","complexity":3,"scores":[{"employee":"<员工编号>","quality":4,"evidence":4,"discipline":4,"timeliness":4,"overall":4,"notes":"<评语>","modelScores":[]}]}' 提交`;
+
+/** A route's own template still has to point the session at its notes; the stored draft is the full text the owner previews. */
+const routeBody = (body?: string): string | undefined =>
+  body?.trim() ? (body.includes('notes.md') ? body : `${NOTES}${body}`) : undefined;
 
 export const templateFor = (step: MessageStep, code = false, phase = 'doing'): string =>
   step === 'execute' ? (code ? EXECUTE_CODE : EXECUTE_PLAIN)
@@ -59,6 +65,7 @@ export function renderMessage(body: string, opts: {
     .replaceAll('{acId}', acId ?? DEFAULT_MACHINE_CRITERION)
     .replaceAll('sck call', `'${sckBin}' call`)
     .replaceAll('task.md', taskFile)
+    .replaceAll('notes.md', `${commDir.replace(/\/+$/, '')}/notes.md`)
     .replaceAll(/findings\/round-(?:\d+|NN)\.md/g, findings ?? 'findings/round-NN.md')
     .replaceAll('agents/eval.md', opsRepo ? `${opsRepo.replace(/\/+$/, '')}/agents/eval.md` : 'agents/eval.md');
 }
@@ -89,15 +96,16 @@ export class OutboundMessageStore {
   }
 
   /** 建任务时为执行岗与复核岗各生成一条 draft；幂等：已有 draft 不重复生成。 */
-  async createTaskDrafts(taskId: string, executorRole: string, reviewerRole: string, code: boolean): Promise<OutboundMessage[]> {
+  async createTaskDrafts(taskId: string, executorRole: string, reviewerRole: string, code: boolean,
+    bodies: { execute?: string; review?: string } = {}): Promise<OutboundMessage[]> {
     const [existing] = await this.db.query<[Array<Record<string, unknown>>]>(
       `SELECT * FROM outbound_message WHERE task = $task AND step IN ['execute','review'] AND state != 'sent' ORDER BY created_at;`,
       { task: this.task(taskId) });
     const have = new Set((existing ?? []).map(row => String(row.step)));
     const out: OutboundMessage[] = [];
-    if (!have.has('execute')) out.push(await this.createDraft(taskId, 'execute', executorRole, code));
+    if (!have.has('execute')) out.push(await this.createDraft(taskId, 'execute', executorRole, code, 'doing', routeBody(bodies.execute)));
     // 复核草稿与执行草稿用同一个 code 标记：软件线的复核才需要在生产逐条复验。
-    if (!have.has('review')) out.push(await this.createDraft(taskId, 'review', reviewerRole, code, 'review'));
+    if (!have.has('review')) out.push(await this.createDraft(taskId, 'review', reviewerRole, code, 'review', routeBody(bodies.review)));
     return out;
   }
 

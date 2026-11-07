@@ -2,6 +2,7 @@
  * 老板接口：任何持有 owner-token 的 agent 都能调用（网页控制台与 sck owner 共用同一套 JSON 命令）。
  * 所有写操作记 actor=owner 并带 via 标签（请求头 X-Owner-Agent，没有则 web）。
  */
+import { LaneNoteStore } from './lane-notes.ts';
 import { randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
@@ -37,6 +38,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     ? input.idempotencyKey : undefined;
   const key = () => idemp ? `owner:${via}:${command}:${idemp}` : `owner:${via}:${command}:${randomUUID()}`;
   const db = ctx.db.db;
+  const notes = () => new LaneNoteStore(db);
   const ownerCredential = (): string => {
     const token = process.env.SCK_OWNER_TOKEN;
     if (!token) throw new CompanyError('temporarily_unavailable', 'owner token not configured');
@@ -215,6 +217,14 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     }
 
     // ---- 编制 ----
+    // ---- 线的笔记 ----
+    case 'note.list': return { notes: await notes().list(optionalText(input.lane)) };
+    case 'note.preview': { const lane = text(input.lane, 'lane'); return { lane, text: await notes().render(lane) }; }
+    case 'note.add': return notes().add(text(input.lane, 'lane'), text(input.text, 'text', 1, 2000), a, { pinned: input.pinned === true, proposed: input.proposed === true });
+    case 'note.edit': return notes().edit(text(input.noteId, 'noteId'), text(input.text, 'text', 1, 2000));
+    case 'note.pin': return notes().pin(text(input.noteId, 'noteId'), input.pinned === true);
+    case 'note.activate': return notes().activate(text(input.noteId, 'noteId'));
+    case 'note.remove': await notes().remove(text(input.noteId, 'noteId')); return { removed: true };
     case 'def.list': return { defs: await ctx.workforce.defs() };
     case 'def.ensure': {
       const defId = text(input.id, 'id');
