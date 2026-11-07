@@ -33,6 +33,7 @@
 | 文件 | 写者 | 含义 |
 |---|---|---|
 | `claim.json` | sidecar | 代领结果：任务详情、project、`history`、`predecessors`、`deliveryId`/`fence`/`leaseExpiresAt`；每次新领取原子覆盖 |
+| `notes.md` | sidecar | 这条线的长期笔记，每次领取时刷新；线的标识是 `<项目 id 或 company>:<岗位>` |
 | `req/<id>.json` | 员工（经 sck） | `{ key, tool, args }`：`key` 是环境里的 `SCK_COMM_KEY`，`tool` 为工具名，`args` 为 JSON 参数 |
 | `res/<id>.json` | sidecar | `{ ok: true, data }` 或 `{ ok: false, error: "<code>: <message>" }`，文件名与请求同名 |
 | `report.md` | 员工 | 交付说明；回合结束（`agent.turn_ended`）时 sidecar 将其内容作为 submit 证据提交 |

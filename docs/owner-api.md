@@ -9,6 +9,13 @@
 | 命令 | 一行示例 |
 |---|---|
 | 建任务（路由类型） | `sck owner task.create '{"type":"software","title":"导出","requirement":"导出 CSV","acceptanceText":"列头正确","tag":"发布线","hold":false}'`（返回 `{task, planned}`：route.next 链上的 planned 后续任务各带草稿） |
+| 笔记列表 | `sck owner note.list '{"lane":"surreal_ck:qa"}'`（不带 lane 列全部，含待生效） |
+| 笔记全文 | `sck owner note.preview '{"lane":"surreal_ck:qa"}'`（会话将读到的 `notes.md`） |
+| 加笔记 | `sck owner note.add '{"lane":"surreal_ck:qa","text":"…"}'`（`proposed:true` 进待审） |
+| 改笔记 | `sck owner note.edit '{"noteId":"n1","text":"…"}'` |
+| 置顶笔记 | `sck owner note.pin '{"noteId":"n1","pinned":true}'` |
+| 笔记生效 | `sck owner note.activate '{"noteId":"n1"}'` |
+| 删笔记 | `sck owner note.remove '{"noteId":"n1"}'` |
 | 任务链与消息 | `sck owner task.plan '{"taskId":"t1"}'`（父链回溯 + 下游全链任务与每任务消息） |
 | 路由列表 | `sck owner route.list '{}'` |
 | 保存路由 | `sck owner route.save '{"type":"software","label":"软件需求","executorRole":"engineering","reviewerRole":"qa","code":true,"next":"gate","hold":false}'`（拒绝同岗/未知岗/未启用 next/成环） |

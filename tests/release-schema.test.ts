@@ -17,14 +17,15 @@ function fakeDb(schemaVersion: number | undefined, tables: string[], fail = fals
 }
 
 describe('the schema a target version must have reached', () => {
-  test('0.3.76 and later need schema 49; 0.3.77 schema 50; 0.3.78 schema 51 with outbound_message; 0.3.79 schema 52 with route; 0.3.80 schema 52', () => {
+  test('0.3.76 and later need schema 49; 0.3.77 schema 50; 0.3.78 schema 51 with outbound_message; 0.3.79 schema 52 with route; 0.3.80 schema 52; 0.3.81 schema 53 with lane_note', () => {
     // Schema 052 removed the recovery-read tables again, so no version may require them anymore.
     expect(schemaRequirementFor('0.3.76')).toEqual({ schema: 49, tables: [] });
     expect(schemaRequirementFor('0.3.77')).toEqual({ schema: 50, tables: [] });
     expect(schemaRequirementFor('0.3.78')).toEqual({ schema: 51, tables: ['outbound_message'] });
     expect(schemaRequirementFor('0.3.79')).toEqual({ schema: 52, tables: ['route'] });
     expect(schemaRequirementFor('0.3.80')).toEqual({ schema: 52, tables: [] });
-    expect(schemaRequirementFor('0.4.0')).toEqual({ schema: 52, tables: [] });
+    expect(schemaRequirementFor('0.3.81')).toEqual({ schema: 53, tables: ['lane_note'] });
+    expect(schemaRequirementFor('0.4.0')).toEqual({ schema: 53, tables: ['lane_note'] });
   });
 
   test('an older target keeps the older minimum: 49 is not forced onto every historical version', () => {

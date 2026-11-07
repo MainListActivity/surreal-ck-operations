@@ -348,6 +348,7 @@ ${relayShellCss}
 <button data-t="inbox" data-cmd="tab:inbox">${relayIcon("inbox")}<span>收件箱</span><b id="nav-count" hidden></b></button>
 <button data-t="defs" data-cmd="tab:defs">${relayIcon("layers")}<span>编制</span></button>
 <button data-t="routes" data-cmd="tab:routes">${relayIcon("layers")}<span>路由表</span></button>
+<button data-t="notes" data-cmd="tab:notes">${relayIcon("layers")}<span>线的笔记</span></button>
 <button data-cmd="theme" id="theme-btn" class="icon-button" aria-label="切换主题"></button>
 <button onclick="location.href='ranking'" class="refresh">${relayIcon("layers")}<span>模型排序</span></button>
 </nav><div class="sidebar-footer"><div class="operator"><span class="avatar">B</span><span><strong>老板</strong><small>控制面 · v0.3.79</small></span></div></div></aside>
@@ -385,7 +386,7 @@ async function onCommand(ev){
   // Only the first colon separates the command: ids and notice keys may themselves contain colons.
   const raw=String(el.dataset.cmd),cut=raw.indexOf(':');
   const cmd=cut<0?raw:raw.slice(0,cut),arg=cut<0?'':raw.slice(cut+1);
-  if(cmd==='tab'){T=arg;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.t===arg));$('crumb').textContent={flow:'消息流',inbox:'收件箱',defs:'编制'}[arg]||arg;render();}
+  if(cmd==='tab'){T=arg;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.t===arg));$('crumb').textContent={flow:'消息流',inbox:'收件箱',defs:'编制',routes:'路由表',notes:'线的笔记'}[arg]||arg;render();}
   else if(cmd==='theme')toggleTheme();
   else if(cmd==='refresh')load();
   else if(cmd==='chain'){CHAIN=arg;SEL=null;render();}
@@ -412,11 +413,18 @@ async function onCommand(ev){
   else if(cmd==='save-reassign')saveReassign(arg);
   else if(cmd==='toggle-pause')togglePause();
   else if(cmd==='resolve-notice')resolveNotice(arg);
+  else if(cmd==='notes-lane'){NLANE=arg;T='notes';document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.t==='notes'));$('crumb').textContent='线的笔记';render();}
+  else if(cmd==='note-add')addNote();
+  else if(cmd==='note-edit')noteEditForm(arg);
+  else if(cmd==='note-save')saveNote(arg);
+  else if(cmd==='note-pin')pinNote(arg);
+  else if(cmd==='note-activate')activateNote(arg);
+  else if(cmd==='note-remove')removeNote(arg);
 }
 async function load(){
   try{
-    const [g,t,m,i,d,s,n]=await Promise.all([api('route.list',{}),api('task.list',{}),api('message.list',{includeSent:true}),api('inbox',{}),api('def.list',{}),api('status',{}),api('notice.list',{})]);
-    ROUTES=g.routes||[];TASKS=t.tasks||[];MESSAGES=m.messages||[];INBOX=i;DEFS=d.defs||[];NOTICES=n.notices||[];PAUSED=s.paused===true;
+    const [nt,g,t,m,i,d,s,n]=await Promise.all([api('note.list',{}),api('route.list',{}),api('task.list',{}),api('message.list',{includeSent:true}),api('inbox',{}),api('def.list',{}),api('status',{}),api('notice.list',{})]);
+    NOTES=nt.notes||[];ROUTES=g.routes||[];TASKS=t.tasks||[];MESSAGES=m.messages||[];INBOX=i;DEFS=d.defs||[];NOTICES=n.notices||[];PAUSED=s.paused===true;
     await refreshRetired();
     const n2=(INBOX.gates||[]).length+(INBOX.questions||[]).length;const b=$('nav-count');if(b){b.textContent=n2;b.hidden=!n2}
     $('stat').textContent=n2?('待办 '+n2):'运行中';$('stat').className='status'+(n2?' violet':'');
@@ -497,6 +505,7 @@ function drawerTask(id){
     +'<label>验收标准<textarea id="t-ac">'+esc(t.acceptance_text||'')+'</textarea></label>'
     +'<div class="row"><button class="primary" data-cmd="save-task:'+esc(id)+'">保存需求与验收</button></div></section>'
     +'<section><h3>消息</h3>'+msgs.map(m=>'<div class="inbox-card"><h3>'+esc(m.step)+' · '+esc(m.state)+(m.hold?' · 待放行':'')+'</h3><p>'+esc(m.body.slice(0,90))+'</p><button data-cmd="msg:'+esc(String(m.id?.id??m.id))+'">编辑/放行</button></div>').join('')+'</section>'
+    +'<section><h3>会话将读到的笔记</h3><div class="row"><button data-cmd="notes-lane:'+esc(laneOfTask(t,t.executor_role))+'">执行线</button>'+(t.reviewer_role==='owner'?'':'<button data-cmd="notes-lane:'+esc(laneOfTask(t,t.reviewer_role))+'">复核线</button>')+'</div></section>'
     +'<section><h3>操作</h3><div class="row"><button data-cmd="void:'+esc(id)+'">作废</button><button data-cmd="revoke:'+esc(id)+'">撤销租约</button><button data-cmd="reassign:'+esc(id)+'">改派</button></div></section>';
 }
 function reassignForm(id){
@@ -546,7 +555,7 @@ function renderDefs(){
     +DEFS.map(d=>'<article class="decision-card"><div class="card-top"><span class="type-label">'+esc(d.role)+'</span><span class="status '+(d.enabled?'success':'')+'">'+(d.enabled?'启用':'停用')+'</span></div><h3>'+esc(d.id)+'</h3><p class="byline">'+esc(d.provider)+' · '+esc(d.model||'')+'</p><div class="decision-actions"><button data-cmd="toggle-def:'+esc(d.id)+':'+(d.enabled?0:1)+'">'+(d.enabled?'停用':'启用')+'</button></div></article>').join('')+'</div></div>';
   $('drawer').innerHTML='<div class="kicker">DEF</div><h2>新建 / 修改编制</h2><div class="task-form"><label>ID<input id="d-id"/></label><label>岗位<select id="d-role">'+['product','engineering','qa','concept-design','asset-production','screenwriter','story-author','cinematography','cs','eval'].map(r=>'<option>'+r+'</option>').join('')+'</select></label><label>provider<input id="d-provider" value="codex"/></label><label>model<input id="d-model" value="auto:sol"/></label><div class="row"><button class="primary" data-cmd="create-def">保存编制</button></div></div>';
 }
-function render(){if(T==='flow')renderFlow();else if(T==='inbox')renderInbox();else if(T==='routes')renderRoutes();else renderDefs()}
+function render(){if(T==='flow')renderFlow();else if(T==='inbox')renderInbox();else if(T==='routes')renderRoutes();else if(T==='notes')renderLaneNotes();else renderDefs()}
 async function saveMsg(id){await api('message.edit',{messageId:id,body:$('msg-body').value});toast('已保存');await load()}
 async function holdMsg(id,on){await api(on?'message.hold':'message.release',{messageId:id});toast(on?'已标记需要我放行':'已取消');await load()}
 async function releaseMsg(id){await api('message.release',{messageId:id});toast('已放行，等待派工');await load()}
@@ -584,6 +593,35 @@ async function createTask(){
   await api('task.create',{type,title,requirement,acceptanceText,...(tag?{tag}:{}) ,...($('n-hold').checked?{hold:true}:{})});
   toast('已创建任务链');SEL=null;await load();
 }
+let NOTES=[],NLANE='';
+const noteId=n=>String(n.id?.id??n.id);
+function laneOfTask(t,role){const p=String(t.project?.id??t.project??'').replace(/^project:/,'');return (p||'company')+':'+role}
+function renderLaneNotes(){
+  const lanes=[...new Set(NOTES.map(n=>n.lane).concat(NLANE?[NLANE]:[]))].sort();
+  if(!NLANE&&lanes.length)NLANE=lanes[0];
+  const rows=NOTES.filter(n=>n.lane===NLANE);
+  $('flow-pane').innerHTML='<div class="flow-pane"><div class="flow-head"><h1>线的笔记</h1></div><div class="row">'
+    +lanes.map(l=>'<button '+(l===NLANE?'class="primary" ':'')+'data-cmd="notes-lane:'+esc(l)+'">'+esc(l)+' ('+NOTES.filter(n=>n.lane===l&&n.state==='active').length+')</button>').join('')
+    +'</div><div class="decision-grid">'
+    +(rows.length?rows.map(n=>'<article class="decision-card"><div class="card-top"><span class="type-label">'+esc(n.author)+'</span><span class="status '+(n.state==='active'?'success':'')+'">'+(n.state==='active'?'生效':'待生效')+(n.pinned?' · 置顶':'')+'</span></div><p>'+esc(n.text)+'</p><div class="row">'
+      +(n.state==='proposed'?'<button class="primary" data-cmd="note-activate:'+esc(noteId(n))+'">生效</button>':'')
+      +'<button data-cmd="note-edit:'+esc(noteId(n))+'">编辑</button><button data-cmd="note-pin:'+esc(noteId(n))+'">'+(n.pinned?'取消置顶':'置顶')+'</button><button data-cmd="note-remove:'+esc(noteId(n))+'">删除</button></div></article>').join(''):'<p class="meta">这条线还没有笔记</p>')
+    +'</div></div>';
+  $('drawer').innerHTML='<div class="kicker">NOTES</div><h2>添加笔记</h2><p class="meta">一条线 = 项目 × 职能。只记长期有效的要求、方法和坑，不记某次任务的结论。</p><div class="task-form">'
+    +'<label>线<input id="n-lane" value="'+esc(NLANE)+'" placeholder="surreal_ck:qa"/></label>'
+    +'<label>内容<textarea id="n-text"></textarea></label>'
+    +'<div class="row"><button class="primary" data-cmd="note-add">添加</button></div></div>';
+}
+function noteEditForm(id){
+  const n=NOTES.find(x=>noteId(x)===id);if(!n)return;
+  $('drawer').innerHTML='<div class="kicker">NOTE</div><h2>编辑笔记</h2><div class="task-form"><label>内容<textarea id="n-edit">'+esc(n.text)+'</textarea></label>'
+    +'<div class="row"><button class="primary" data-cmd="note-save:'+esc(id)+'">保存</button><button data-cmd="tab:notes">返回</button></div></div>';
+}
+async function addNote(){const lane=$('n-lane').value.trim();await api('note.add',{lane,text:$('n-text').value});NLANE=lane;toast('已添加');await load()}
+async function saveNote(id){await api('note.edit',{noteId:id,text:$('n-edit').value});toast('已保存');await load()}
+async function pinNote(id){const n=NOTES.find(x=>noteId(x)===id);await api('note.pin',{noteId:id,pinned:!n?.pinned});await load()}
+async function activateNote(id){await api('note.activate',{noteId:id});toast('已生效');await load()}
+async function removeNote(id){await api('note.remove',{noteId:id});toast('已删除');await load()}
 function renderRoutes(){
   $('flow-pane').innerHTML='<div class="flow-pane"><div class="flow-head"><h1>路由表</h1></div><div class="decision-grid">'
     +ROUTES.map(r=>'<article class="decision-card"><div class="card-top"><span class="type-label">'+esc(r.type)+'</span><span class="status '+(r.enabled?'success':'')+'">'+(r.enabled?'启用':'停用')+'</span></div><h3>'+esc(r.label)+'</h3><p class="byline">'+esc(r.executor_role)+' → '+esc(r.reviewer_role)+(r.next?' · 后续 '+esc(r.next):'')+(r.hold?' · hold':'')+(r.code?' · code':'')+'</p><div class="decision-actions"><button data-cmd="route-edit:'+esc(r.type)+'">编辑</button>'+(r.enabled?'<button class="reject" data-cmd="route-disable:'+esc(r.type)+'">停用</button>':'<button class="approve" data-cmd="route-enable:'+esc(r.type)+'">启用</button>')+'</div></article>').join('')+'</div></div>';

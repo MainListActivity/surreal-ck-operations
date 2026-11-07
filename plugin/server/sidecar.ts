@@ -161,6 +161,7 @@ function stageBrief(dir: string, claim: ClaimResult): void {
 function writeBrief(dir: string, claim: ClaimResult): void {
   rmSync(join(dir, "findings"), { recursive: true, force: true });
   writeFileAtomic(join(dir, "task.md"), taskBrief(claim));
+  writeFileAtomic(join(dir, "notes.md"), claim.laneNotes ?? "（这条线的笔记暂时读不到，直接按 task.md 干活）\n");
   const findings = latestFindings(claim.history);
   if (!findings) return;
   mkdirSync(join(dir, "findings"), { recursive: true, mode: 0o700 });
@@ -409,7 +410,8 @@ export class SidecarPool {
     // directory — deliberately outside any git repo so audits never bloat it.
     const evidenceDir = join(dirname(this.deps.runDir), "evidence", task.id);
     mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
-    writeFileAtomic(join(dir, "claim.json"), JSON.stringify({ ...result, evidenceDir, orphanedArtifacts: orphanedArtifacts(evidenceDir) }));
+    const { laneNotes: _notes, ...claimView } = result; // notes.md carries the text; claim.json stays small.
+    writeFileAtomic(join(dir, "claim.json"), JSON.stringify({ ...claimView, evidenceDir, orphanedArtifacts: orphanedArtifacts(evidenceDir) }));
     stageBrief(dir, result);
     // A new lease must not inherit a previous turn's artifacts: archive them so an
     // identical-looking new report still submits instead of matching a stale hash.
@@ -872,6 +874,7 @@ export class SidecarPool {
       ...(declared ? { acceptance: declared } : {}),
       ...(args.sha === undefined ? {} : { sha: args.sha as string }),
       ...(args.next === undefined ? {} : { next: args.next as Evidence["next"] }),
+      ...(args.learned === undefined ? {} : { learned: args.learned as Evidence["learned"] }),
     });
     const live = () => {
       const claim = this.claims.get(instId);
