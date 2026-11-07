@@ -8,7 +8,7 @@
 import { randomBytes, createHash } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, chmodSync } from "node:fs";
 import { join } from "node:path";
-import { relayShellCss, relayIcon } from "../shared/relay-shell.ts";
+import { relayShellCss, relayIcon, RELAY_ICON_PATHS } from "../shared/relay-shell.ts";
 import { createOwnerApiFetch } from "./owner-api.ts";
 
 type CompanyApi = {
@@ -370,9 +370,9 @@ ${relayShellCss}
 <button data-t="defs" data-cmd="tab:defs">${relayIcon("layers")}<span>编制</span></button>
 <button data-t="routes" data-cmd="tab:routes">${relayIcon("layers")}<span>路由表</span></button>
 <button data-t="notes" data-cmd="tab:notes">${relayIcon("layers")}<span>线的笔记</span></button>
-<button data-cmd="theme" id="theme-btn" class="icon-button" aria-label="切换主题"></button>
+<button data-cmd="theme" id="theme-btn" class="icon-button theme-toggle" aria-label="切换主题"></button>
 <button onclick="location.href='ranking'" class="refresh">${relayIcon("layers")}<span>模型排序</span></button>
-</nav><div class="sidebar-footer"><div class="operator"><span class="avatar">B</span><span><strong>老板</strong><small>控制面 · v0.3.79</small></span></div></div></aside>
+</nav><div class="sidebar-footer"><div class="operator"><span class="avatar">B</span><span><strong>老板</strong><small id="release-ver">控制面</small></span></div></div></aside>
 <div class="main-area"><header class="topbar"><div class="breadcrumb"><span>公司</span><b>/</b><strong id="crumb">目标进度</strong></div>
 <div class="top-actions"><span class="status" id="stat">加载中…</span><button class="refresh" id="pause-btn" data-cmd="toggle-pause">暂停派工</button><button class="refresh" data-cmd="refresh">${relayIcon("refresh")}<span>刷新</span></button></div></header>
 <main class="content"><div class="flow-pane" id="flow-pane"></div><aside class="drawer" id="drawer"></aside>
@@ -383,10 +383,10 @@ ${relayShellCss}
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const icon=n=>'<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">'+(ICONS[n]||'')+'</svg>';
-const ICONS={activity:'<path d="M3 12h4l2-7 4 14 2-7h6"/>',inbox:'<path d="M4 5h16v12H4z"/>',layers:'<path d="M12 3L3 8l9 5 9-5-9-5z"/>',refresh:'<path d="M20 7v5h-5M4 17v-5h5"/>'};
+const ICONS={activity:'<path d="M3 12h4l2-7 4 14 2-7h6"/>',inbox:'<path d="M4 5h16v12H4z"/>',layers:'<path d="M12 3L3 8l9 5 9-5-9-5z"/>',refresh:'<path d="M20 7v5h-5M4 17v-5h5"/>',sun:'${RELAY_ICON_PATHS.sun}',moon:'${RELAY_ICON_PATHS.moon}'};
 const store={get:k=>{try{return localStorage.getItem(k)}catch(e){return null}},set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}}};
 function prefTheme(){try{return matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}catch(e){return 'light'}}
-function renderThemeBtn(){const b=$('theme-btn');if(b)b.innerHTML=icon((store.get('relay-theme')||prefTheme())==='light'?'activity':'layers')}
+function renderThemeBtn(){const b=$('theme-btn');if(!b)return;const dark=(store.get('relay-theme')||prefTheme())==='dark';b.innerHTML=icon(dark?'sun':'moon')+'<span class="theme-label">'+(dark?'浅色':'深色')+'</span>'}
 function toggleTheme(){const next=(store.get('relay-theme')||prefTheme())==='light'?'dark':'light';store.set('relay-theme',next);document.documentElement.dataset.theme=next;renderThemeBtn()}
 document.documentElement.dataset.theme=store.get('relay-theme')||'light';renderThemeBtn();
 function toast(msg){const el=$('toast');el.textContent=msg;el.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.classList.remove('show'),2200)}
@@ -448,6 +448,7 @@ async function load(){
     const [pr,nt,g,t,m,i,d,s,n]=await Promise.all([api('progress',{}).catch(e=>({error:e.message})),api('note.list',{}),api('route.list',{}),api('task.list',{}),api('message.list',{includeSent:true}),api('inbox',{}),api('def.list',{}),api('status',{}),api('notice.list',{})]);
     PROGRESS=pr;NOTES=nt.notes||[];ROUTES=g.routes||[];TASKS=t.tasks||[];MESSAGES=m.messages||[];INBOX=i;DEFS=d.defs||[];NOTICES=n.notices||[];PAUSED=s.paused===true;
     const n2=(INBOX.gates||[]).length+(INBOX.questions||[]).length;const b=$('nav-count');if(b){b.textContent=n2;b.hidden=!n2}
+    const rv=$('release-ver');if(rv)rv.textContent='控制面'+(INBOX.upgrades&&INBOX.upgrades.current?' · v'+INBOX.upgrades.current.version:'');
     $('stat').textContent=n2?('待办 '+n2):'运行中';$('stat').className='status'+(n2?' violet':'');
     const pb=$('pause-btn');if(pb)pb.textContent=PAUSED?'恢复派工':'暂停派工';
     render();

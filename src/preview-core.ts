@@ -23,6 +23,8 @@ export interface PreviewCoreOptions {
   now?: () => number;
   /** 签名门控：给了则 /e//d/ 请求必须带有效 exp+sig（公网/隧道面用）。 */
   auth?: { secret: string; ttlMs?: number };
+  /** 目录列表页的 CSS：插件宿主从共享设计变量注入，缺省沿用旧内联样式（应急桥接兼容）。 */
+  listPageCss?: string;
 }
 
 const MIME: Record<string, string> = {
@@ -99,7 +101,7 @@ function serveFile(file: string, size: number, req: Request): Response {
 }
 
 /** linkFor：子项名→href。无鉴权用相对链接，鉴权模式签发绝对路径签名 URL。 */
-function listPage(kind: 'e' | 'd', taskId: string, dir: string, subdir: boolean, linkFor: (name: string, isDir: boolean) => string): string | null {
+function listPage(kind: 'e' | 'd', taskId: string, dir: string, subdir: boolean, linkFor: (name: string, isDir: boolean) => string, css: string): string | null {
   let files: string[];
   try { files = readdirSync(dir); } catch { return null; }
   const parent = subdir ? `<li><a href="${esc(linkFor('..', true))}">📁 ../</a></li>` : '';
@@ -111,7 +113,7 @@ function listPage(kind: 'e' | 'd', taskId: string, dir: string, subdir: boolean,
       : `<li><a href="${esc(linkFor(f, false))}">${esc(f)}</a> <span class="sz">${(st.size / 1024 / 1024).toFixed(1)}MB</span></li>`;
   }).join('\n');
   return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${esc(taskId)}</title><style>body{font:16px/1.8 -apple-system,sans-serif;margin:24px;max-width:760px}a{color:#3aa6a0}.sz{color:#888;font-size:13px}h1{font-size:18px}</style>
+<title>${esc(taskId)}</title><style>${css}</style>
 <h1>交付包 ${esc(taskId)}</h1><ul>${items}</ul>`;
 }
 
@@ -154,7 +156,8 @@ export function createPreviewFetch(opts: PreviewCoreOptions) {
     const target = await resolveInsideChecked(roots[kind], cleanRel ? `${taskId}/${cleanRel}` : taskId, { allowDir: true });
     if (!target.ok) return new Response(target.reason === 'escape' ? 'forbidden' : 'not found', { status: target.reason === 'escape' ? 403 : 404 });
     if (target.isDir) {
-      const page = listPage(kind, taskId, target.path, cleanRel !== '', linkFor);
+      const page = listPage(kind, taskId, target.path, cleanRel !== '', linkFor,
+        opts.listPageCss ?? 'body{font:16px/1.8 -apple-system,sans-serif;margin:24px;max-width:760px}a{color:#3aa6a0}.sz{color:#888;font-size:13px}h1{font-size:18px}');
       return page === null
         ? new Response('not found', { status: 404 })
         : new Response(page, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });

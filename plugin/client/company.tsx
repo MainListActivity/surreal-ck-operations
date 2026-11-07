@@ -9,6 +9,7 @@ import { Pressable, ScrollView, Text, TextInput, View, type StyleProp, type Text
 import * as RN from "react-native";
 import * as rpc from "../shared/rpc";
 import { relayPalette } from "./relay-theme";
+import { RELAY_FONT, RELAY_RADIUS, RELAY_SPACE } from "../shared/relay-tokens.ts";
 import type { Brief, DispatchBlockedView, DispatchReasonView, GoalTier, GoalView, Inbox, PermissionRequest, Pulse, Roster, TaskAttachment, TaskView } from "../shared/types";
 
 const newKey = () => `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -28,32 +29,32 @@ function makeStyles({ theme, compact }: Ctx) {
   const c = { ...theme.colors, ...p.core };
   return {
     screen: { flex: 1, backgroundColor: c.surface0 },
-    scroll: { padding: compact ? 14 : 20, gap: 14 },
-    h1: { color: c.foreground, fontSize: compact ? 19 : 23, fontWeight: "700" as const, letterSpacing: -0.4 },
-    h2: { color: c.foreground, fontSize: 14, fontWeight: "700" as const },
-    card: { backgroundColor: c.surface1, borderRadius: 13, borderWidth: 1, borderColor: c.border, padding: compact ? 13 : 17, gap: 8 },
-    text: { color: c.foreground, fontSize: 13, lineHeight: 20 },
-    muted: { color: c.foregroundMuted, fontSize: 11.5, lineHeight: 17 },
-    mono: { color: c.foregroundMuted, fontSize: 11, fontFamily: "Menlo" as const },
-    row: { flexDirection: "row" as const, gap: 8, alignItems: "center" as const, flexWrap: "wrap" as const },
-    button: { paddingHorizontal: 14, paddingVertical: 9, borderRadius: 9, backgroundColor: c.accent },
-    buttonText: { color: c.accentForeground, fontSize: 12.5, fontWeight: "700" as const },
-    buttonSecondary: { paddingHorizontal: 14, paddingVertical: 9, borderRadius: 9, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface1 },
-    buttonSecondaryText: { color: c.foreground, fontSize: 12.5, fontWeight: "600" as const },
-    buttonDanger: { paddingHorizontal: 14, paddingVertical: 9, borderRadius: 9, borderWidth: 1, borderColor: p.dangerBorder, backgroundColor: p.dangerSoft },
-    buttonDangerText: { color: p.danger, fontSize: 12.5, fontWeight: "700" as const },
-    input: { borderWidth: 1, borderColor: c.border, borderRadius: 9, padding: 10, color: c.foreground, fontSize: 13, backgroundColor: c.surface2 },
-    chip: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface1 },
+    scroll: { padding: compact ? RELAY_SPACE.xl : RELAY_SPACE.page, gap: RELAY_SPACE.lg },
+    h1: { color: c.foreground, fontSize: compact ? RELAY_FONT.h1 + 1 : RELAY_FONT.display - 3, fontWeight: "700" as const, letterSpacing: -0.4 },
+    h2: { color: c.foreground, fontSize: RELAY_FONT.h2, fontWeight: "700" as const },
+    card: { backgroundColor: c.surface1, borderRadius: RELAY_RADIUS.xl, borderWidth: 1, borderColor: c.border, padding: compact ? RELAY_SPACE.xl : RELAY_SPACE.xxl - 1, gap: RELAY_SPACE.sm },
+    text: { color: c.foreground, fontSize: RELAY_FONT.body + 1, lineHeight: 20 },
+    muted: { color: c.foregroundMuted, fontSize: RELAY_FONT.small, lineHeight: 17 },
+    mono: { color: c.foregroundMuted, fontSize: RELAY_FONT.small, fontFamily: "Menlo" as const },
+    row: { flexDirection: "row" as const, gap: RELAY_SPACE.sm, alignItems: "center" as const, flexWrap: "wrap" as const },
+    button: { paddingHorizontal: RELAY_SPACE.xl, paddingVertical: RELAY_SPACE.md - 1, borderRadius: RELAY_RADIUS.md, backgroundColor: c.accent },
+    buttonText: { color: c.accentForeground, fontSize: RELAY_FONT.body, fontWeight: "700" as const },
+    buttonSecondary: { paddingHorizontal: RELAY_SPACE.xl, paddingVertical: RELAY_SPACE.md - 1, borderRadius: RELAY_RADIUS.md, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface1 },
+    buttonSecondaryText: { color: c.foreground, fontSize: RELAY_FONT.body, fontWeight: "600" as const },
+    buttonDanger: { paddingHorizontal: RELAY_SPACE.xl, paddingVertical: RELAY_SPACE.md - 1, borderRadius: RELAY_RADIUS.md, borderWidth: 1, borderColor: p.dangerBorder, backgroundColor: p.dangerSoft },
+    buttonDangerText: { color: p.danger, fontSize: RELAY_FONT.body, fontWeight: "700" as const },
+    input: { borderWidth: 1, borderColor: c.border, borderRadius: RELAY_RADIUS.md, padding: RELAY_SPACE.md, color: c.foreground, fontSize: RELAY_FONT.body + 1, backgroundColor: c.surface2 },
+    chip: { paddingHorizontal: RELAY_SPACE.md, paddingVertical: RELAY_SPACE.xs, borderRadius: RELAY_RADIUS.sm, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface1 },
     chipActive: { backgroundColor: p.accentSoft, borderColor: c.accent },
-    chipText: { color: c.foregroundMuted, fontSize: 12, fontWeight: "600" as const },
+    chipText: { color: c.foregroundMuted, fontSize: RELAY_FONT.body, fontWeight: "600" as const },
     chipTextActive: { color: c.accent },
-    tab: { flexGrow: 0, flexShrink: 0, minHeight: 31, borderRadius: 7, alignItems: "center" as const, justifyContent: "center" as const, paddingHorizontal: 8 },
+    tab: { flexGrow: 0, flexShrink: 0, minHeight: 31, borderRadius: 7, alignItems: "center" as const, justifyContent: "center" as const, paddingHorizontal: RELAY_SPACE.sm },
     tabActive: { backgroundColor: c.surface1 },
-    tabText: { color: c.foregroundMuted, fontSize: 12, fontWeight: "600" as const },
+    tabText: { color: c.foregroundMuted, fontSize: RELAY_FONT.body, fontWeight: "600" as const },
     tabTextActive: { color: c.foreground, fontWeight: "700" as const },
-    badge: { paddingHorizontal: 9, paddingVertical: 3, borderRadius: 999, backgroundColor: p.inputBg },
-    badgeText: { color: c.foregroundMuted, fontSize: 10, fontWeight: "600" as const },
-    kicker: { color: c.accent, fontSize: 9, fontWeight: "800" as const, letterSpacing: 1.6 },
+    badge: { paddingHorizontal: RELAY_SPACE.md - 1, paddingVertical: 3, borderRadius: 999, backgroundColor: p.inputBg },
+    badgeText: { color: c.foregroundMuted, fontSize: RELAY_FONT.caption, fontWeight: "600" as const },
+    kicker: { color: c.accent, fontSize: RELAY_FONT.kicker, fontWeight: "800" as const, letterSpacing: 1.6 },
   };
 }
 
