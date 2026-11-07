@@ -388,7 +388,8 @@ const store={get:k=>{try{return localStorage.getItem(k)}catch(e){return null}},s
 function prefTheme(){try{return matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}catch(e){return 'light'}}
 function renderThemeBtn(){const b=$('theme-btn');if(!b)return;const dark=(store.get('relay-theme')||prefTheme())==='dark';b.innerHTML=icon(dark?'sun':'moon')+'<span class="theme-label">'+(dark?'浅色':'深色')+'</span>'}
 function toggleTheme(){const next=(store.get('relay-theme')||prefTheme())==='light'?'dark':'light';store.set('relay-theme',next);document.documentElement.dataset.theme=next;renderThemeBtn()}
-document.documentElement.dataset.theme=store.get('relay-theme')||'light';renderThemeBtn();
+// Without a saved choice the page follows the system; forcing light here kept dark mode off while the button said otherwise.
+{const saved=store.get('relay-theme');if(saved)document.documentElement.dataset.theme=saved;}renderThemeBtn();
 function toast(msg){const el=$('toast');el.textContent=msg;el.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.classList.remove('show'),2200)}
 const TOKEN=location.pathname.split('/')[2];
 const api=async(cmd,o)=>{
@@ -626,7 +627,7 @@ async function saveReassign(id){
 function chainNote(id,task,total){
   const c=(PROGRESS?.chains||[]).find(x=>x.root===bare(id));
   const m=c?.forecast?.remainingMinutes;
-  if(m===0)return '已完成 · '+total+' 个任务';
+  if(m===0)return (task.state==='void'&&!c?.counts?.done?'已作废':'已完成')+' · '+total+' 个任务';
   return (m?'还需 '+duration(m):STATE_ZH[task.state]||task.state||'')+' · '+(c?.counts?.done??0)+'/'+total+' 完成';
 }
 function renderFlow(){

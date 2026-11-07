@@ -61,6 +61,8 @@ test('the console actually loads: every name its load path calls exists at runti
     expect(String(element('flow-pane').innerHTML)).toContain('已完成 · 1 个任务');
     // AC3: the sidebar shows the installed release, never a literal.
     expect(String(element('release-ver').textContent)).toBe('控制面 · v9.9.9');
+    // With no saved choice the page must not pin a theme, or the system dark mode never applies.
+    expect((document.documentElement as { dataset: Record<string, string> }).dataset.theme).toBeUndefined();
     // AC4: the theme switch is never an empty icon-only button.
     expect(String(element('theme-btn').innerHTML)).toContain('theme-label');
   } finally { rmSync(home, { recursive: true, force: true }); }
