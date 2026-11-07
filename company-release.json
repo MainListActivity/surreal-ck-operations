@@ -1,5 +1,5 @@
 {
-  "version": "0.3.86",
+  "version": "0.3.87",
   "title": "公司插件界面一致化",
   "changes": [
     "删除第二套色值 relay-design.ts；所有网页 CSS 的颜色/字号/圆角/间距/控件高引用 relay-tokens.ts 生成的变量。",
@@ -11,5 +11,5 @@
     "只改外观与样式组织方式；owner 接口与任务数据不变。新增回归测试与截图证据，不改业务行为。"
   ],
   "migration": "无 schema 变更，继续使用 schema 053 的 lane_note。",
-  "rollback": "切回 0.3.85，无需数据回滚。"
+  "rollback": "切回 0.3.86，无需数据回滚。"
 }
