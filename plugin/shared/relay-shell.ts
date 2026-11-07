@@ -108,6 +108,7 @@ section h3,h3.sec-title{margin:0 0 var(--relay-sp-6);font-size:var(--relay-fs-h3
 .icon-button .icon{width:15px}
 .icon-button .icon-txt,.theme-label{font-size:var(--relay-fs-small);font-weight:650;white-space:nowrap}
 .icon-button.theme-toggle{width:auto;min-width:34px;padding:0 var(--relay-sp-10)}
+/** 纯文字/次级按钮：与 .primary.small 同族，避免浏览器默认外观。*/
 .small{height:var(--relay-c-md);padding:0 var(--relay-sp-12);border-radius:var(--relay-r-sm);display:inline-flex;align-items:center;gap:var(--relay-sp-7);font-size:var(--relay-fs-small);font-weight:650;color:var(--relay-muted);text-decoration:none}
 .small .icon{width:14px}
 .refresh{height:var(--relay-c-md);padding:0 var(--relay-sp-12);border-radius:var(--relay-r-sm);display:flex;align-items:center;gap:var(--relay-sp-7);font-size:var(--relay-fs-small);font-weight:650;color:var(--relay-muted)}
