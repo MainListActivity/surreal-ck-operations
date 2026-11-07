@@ -1,9 +1,10 @@
 import { expect, test } from 'bun:test';
 import { checkLearned, checkNoteText, laneOf, notesFit, NOTES_MAX_LINES, renderNotes } from '../src/lane-notes.ts';
 import { renderMessage, templateFor } from '../src/outbound-messages.ts';
-import { reclaimIdleSessions } from '../src/dispatcher/idle-sessions.ts';
+import { continuitySession, finishedSessions, reclaimIdleSessions } from '../src/dispatcher/idle-sessions.ts';
 import { observeRuntimeIdle } from '../src/dispatcher/memory-lru.ts';
-import type { EmployeeInst } from '../src/workforce.ts';
+import { RecordId } from 'surrealdb';
+import type { EmployeeInst, SupervisedTask } from '../src/workforce.ts';
 
 const note = (id: string, text: string, createdAt: string, pinned = false) => ({ id, text, createdAt, pinned });
 
@@ -70,4 +71,53 @@ test('a closed runtime keeps its idle clock instead of restarting it every pass'
   await observeRuntimeIdle({ instances: [inst({ idleSince: 50, lastWakeAt: 10 })], states: new Map([['i1', 'sleeping']]), tasks: [], now: 100,
     workforce: { observeSessionIdle: async (rows: unknown[]) => { updates.push(...rows); } } as never });
   expect(updates).toEqual([]);
+});
+
+const sessionTask = (id: string, row: Record<string, unknown> = {}) => ({ id, executorRole: 'engineering', row } as unknown as SupervisedTask);
+const session = (id: string, over: Partial<EmployeeInst>): EmployeeInst => ({ id, role: 'engineering', paseoAgentId: `agent-${id}`, ...over });
+const idle = (...ids: string[]) => new Map(ids.map(id => [id, 'idle']));
+const child = (parent: string, project?: string) => sessionTask('child', { parent: new RecordId('task', parent), project: project ? new RecordId('project', project) : undefined });
+
+test('oneshot continuity: a task returns to the session that last worked it in that phase', () => {
+  const executor = session('a', { lastTask: 't', lastPhase: 'execute', lane: 'p:engineering' });
+  const reviewer = session('b', { lastTask: 't', lastPhase: 'review', lane: 'p:qa' });
+  const other = session('c', { lastTask: 'x', lastPhase: 'execute', lane: 'p:engineering' });
+  const states = idle('a', 'b', 'c');
+  expect(continuitySession([other, reviewer, executor], states, sessionTask('t'), false)?.id).toBe('a');
+  expect(continuitySession([other, executor, reviewer], states, sessionTask('t'), true)?.id).toBe('b');
+  expect(continuitySession([other, executor], states, sessionTask('new'), false)).toBeUndefined();
+  expect(continuitySession([executor], new Map([['a', 'busy']]), sessionTask('t'), false)).toBeUndefined();
+  const older = session('d', { lastTask: 't', lastPhase: 'review', lastWakeAt: 1 });
+  const newer = session('e', { lastTask: 't', lastPhase: 'review', lastWakeAt: 2 });
+  expect(continuitySession([older, newer], idle('d', 'e'), sessionTask('t'), true)?.id).toBe('e');
+});
+
+test('oneshot continuity: a follow-up continues the parent executor only within the lane', () => {
+  const executor = session('a', { lastTask: 'p', lastPhase: 'execute', lane: 'proj:engineering' });
+  expect(continuitySession([executor], idle('a'), child('p', 'proj'), false)?.id).toBe('a');
+  expect(continuitySession([executor], idle('a'), child('p', 'other'), false)).toBeUndefined();
+  expect(continuitySession([executor], idle('a'), child('p', 'proj'), true)).toBeUndefined();
+  const reviewer = session('b', { lastTask: 'p', lastPhase: 'review', lane: 'proj:engineering' });
+  expect(continuitySession([reviewer], idle('b'), child('p', 'proj'), false)).toBeUndefined();
+  const moved = session('c', { lastTask: 'sibling', lastPhase: 'execute', lane: 'proj:engineering' });
+  expect(continuitySession([moved], idle('c'), child('p', 'proj'), false)).toBeUndefined();
+});
+
+test('oneshot finish: only a waiting session whose task is over and has no follow-up in its lane ends', () => {
+  const facts = { states: new Map([['done', 'done'], ['void', 'void'], ['open', 'review'], ['chain', 'done']]), followUps: [{ parent: 'chain', lane: 'p:engineering' }] };
+  const ended = (inst: EmployeeInst, state = 'idle', held = new Set<string>()) =>
+    finishedSessions({ instances: [inst], states: new Map([[inst.id, state]]), held, facts }).length === 1;
+  const on = (lastTask: string, over: Partial<EmployeeInst> = {}) => session('s', { lastTask, lastPhase: 'execute', lane: 'p:engineering', ...over });
+  expect(ended(on('done'))).toBe(true);
+  expect(ended(on('void'))).toBe(true);
+  expect(ended(on('gone'))).toBe(true); // A deleted task is over too.
+  expect(ended(on('done'), 'sleeping')).toBe(true);
+  expect(ended(on('open'))).toBe(false);
+  expect(ended(on('chain'))).toBe(false);
+  expect(ended(on('chain', { lastPhase: 'review', lane: 'p:qa' }))).toBe(true);
+  expect(ended(on('chain', { lane: 'p:qa' }))).toBe(true);
+  expect(ended(on('done'), 'busy')).toBe(false);
+  expect(ended(on('done', { activeTask: 'x' }))).toBe(false);
+  expect(ended(on('done'), 'idle', new Set(['s']))).toBe(false);
+  expect(ended(session('s', {}))).toBe(false); // A session that predates these fields is left to idle cleanup.
 });

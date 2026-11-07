@@ -225,6 +225,14 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     case 'note.pin': return notes().pin(text(input.noteId, 'noteId'), input.pinned === true);
     case 'note.activate': return notes().activate(text(input.noteId, 'noteId'));
     case 'note.remove': await notes().remove(text(input.noteId, 'noteId')); return { removed: true };
+    // ---- 会话策略 ----
+    case 'session.policy': {
+      if (input.policy !== undefined) {
+        if (input.policy !== 'reuse' && input.policy !== 'oneshot') throw new CompanyError('invalid', 'policy must be reuse or oneshot');
+        await db.query('UPSERT company_meta:config MERGE $patch;', { patch: { session_policy: input.policy } });
+      }
+      return { policy: (await ctx.workforce.config()).sessionPolicy };
+    }
     case 'def.list': return { defs: await ctx.workforce.defs() };
     case 'def.ensure': {
       const defId = text(input.id, 'id');

@@ -1,4 +1,5 @@
 import { FaultStore } from './fault-store.ts';
+import { laneOf } from './lane-notes.ts';
 import { closeSync, mkdirSync, openSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
@@ -69,7 +70,13 @@ export interface EmployeeInst {
   principal?: string;
   /** How many times the dispatcher woke this session; used to rotate it before the context grows too large. */
   wakeCount?: number;
+  /** The lane, task and phase of this session's latest claim: what decides whether it may continue or has finished. */
+  lane?: string;
+  lastTask?: string;
+  lastPhase?: 'execute' | 'review';
 }
+
+export interface SessionTaskFacts { states: Map<string, string>; followUps: Array<{ parent: string; lane: string }> }
 
 export interface ProviderHealth {
   provider: string;
@@ -112,6 +119,8 @@ export interface CompanyConfig {
   sessionMaxWakesByRole: Record<string, number>;
   /** 实例上一轮 input token 超过该值（千）即退休换新会话；0 = 不按上下文大小轮换。 */
   sessionMaxInputK: number;
+  /** oneshot：新任务开新会话，任务结束回收会话；reuse：复用空闲会话。切回 reuse 即回滚。 */
+  sessionPolicy: 'reuse' | 'oneshot';
   /** 连续观测为空闲的会话在此分钟数后回收；0 = 关闭。 */
   sessionIdleMinutes: number;
   /** quick 目标的完成任务在 Jev 低置信度时是否升级 LLM 评审员；默认 false，直接记录 Jev 评分。 */
@@ -146,7 +155,7 @@ export const DEFAULT_CONFIG: CompanyConfig = {
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
 
-  quotaFloorPct: 8, quotaWeeklyFloorPct: 6, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxWakesByRole: {}, sessionMaxInputK: 200, sessionIdleMinutes: 120, evalQuickLlm: false, evalBatchHours: 24, ownerBriefHour: 9, blockLoopLimit: 5,
+  quotaFloorPct: 8, quotaWeeklyFloorPct: 6, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxWakesByRole: {}, sessionMaxInputK: 200, sessionPolicy: 'reuse', sessionIdleMinutes: 120, evalQuickLlm: false, evalBatchHours: 24, ownerBriefHour: 9, blockLoopLimit: 5,
   minFreeMemMb: 2048, minFreeDiskMb: 10240,
   artifactReclaimEnabled: true, artifactEvidenceGraceDays: 3, artifactDeliverableGraceDays: 7, artifactHeadroomMb: 10240,
   archiveRetentionDays: 7, commDirGraceHours: 48, scratchGraceHours: 24,
@@ -348,6 +357,7 @@ export class Workforce {
         .filter((e): e is [string, number] => typeof e[1] === 'number' && Number.isInteger(e[1]) && e[1] >= 0)),
       sessionIdleMinutes: typeof row?.session_idle_minutes === 'number' && Number.isFinite(row.session_idle_minutes) && row.session_idle_minutes >= 0 ? row.session_idle_minutes : DEFAULT_CONFIG.sessionIdleMinutes,
       sessionMaxInputK: typeof row?.session_max_input_k === 'number' ? row.session_max_input_k : DEFAULT_CONFIG.sessionMaxInputK,
+      sessionPolicy: row?.session_policy === 'oneshot' ? 'oneshot' : 'reuse',
       evalQuickLlm: row?.eval_quick_llm === true,
       evalBatchHours: typeof row?.eval_batch_hours === 'number' && row.eval_batch_hours > 0 ? row.eval_batch_hours : 24,
       ownerBriefHour: typeof row?.owner_brief_hour === 'number' ? row.owner_brief_hour : 9,
@@ -419,14 +429,25 @@ export class Workforce {
   async insts(): Promise<EmployeeInst[]> {
     type Row = { id: RecordId; role: Role; def?: RecordId; principal?: RecordId; provider?: string; model?: string; thinking?: string;
       paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number; idle_since?: number; runtime_sleep_requested_at?: number;
-      v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; workspace_scope?: string; wake_count?: number };
+      v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; workspace_scope?: string; wake_count?: number; lane?: string; last_task?: RecordId; last_phase?: 'execute' | 'review' };
     const [rows] = await this.db.query<[Row[]]>(
       'SELECT * FROM employee WHERE revoked != true AND retired != true AND (def != NONE OR paseo_agent_id != NONE) ORDER BY id;');
     return rows.map(r => ({ id: asId(r.id), role: r.role, def: r.def ? asId(r.def) : undefined, provider: r.provider,
       model: r.model, thinking: r.thinking, paseoAgentId: r.paseo_agent_id ?? undefined,
       activeTask: r.active_task ? asId(r.active_task) : undefined, credentialFile: r.credential_file, lastWakeAt: r.last_wake_at, idleSince: r.idle_since, runtimeSleepRequestedAt: r.runtime_sleep_requested_at,
       onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, repoHome: r.workspace_repo ?? undefined, workspaceScope: r.workspace_scope ?? undefined, wakeCount: r.wake_count ?? 0,
-      principal: r.principal ? asId(r.principal) : undefined }));
+      principal: r.principal ? asId(r.principal) : undefined,
+      lane: r.lane ?? undefined, lastTask: r.last_task ? asId(r.last_task) : undefined, lastPhase: r.last_phase ?? undefined }));
+  }
+
+  /** What decides whether a session has finished: its tasks' states, and the follow-ups waiting for an executor of each. */
+  async sessionTaskFacts(taskIds: string[]): Promise<SessionTaskFacts> {
+    const ids = taskIds.map(task => id('task', task));
+    const [tasks] = await this.db.query<[Array<{ id: RecordId; state: string }>]>('SELECT id, state FROM task WHERE id IN $ids;', { ids });
+    const [children] = await this.db.query<[Array<{ parent: RecordId; executor_role: string; project?: RecordId }>]>(
+      `SELECT parent, executor_role, project FROM task WHERE parent IN $ids AND state IN ['ready', 'planned'];`, { ids });
+    return { states: new Map((tasks ?? []).map(task => [asId(task.id), task.state])),
+      followUps: (children ?? []).map(child => ({ parent: asId(child.parent), lane: laneOf(child.project ? asId(child.project) : undefined, child.executor_role) })) };
   }
 
   /** Creates an employee identity for a definition; the caller binds the Paseo agent once spawned.

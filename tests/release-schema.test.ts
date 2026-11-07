@@ -25,7 +25,8 @@ describe('the schema a target version must have reached', () => {
     expect(schemaRequirementFor('0.3.79')).toEqual({ schema: 52, tables: ['route'] });
     expect(schemaRequirementFor('0.3.80')).toEqual({ schema: 52, tables: [] });
     expect(schemaRequirementFor('0.3.81')).toEqual({ schema: 53, tables: ['lane_note'] });
-    expect(schemaRequirementFor('0.4.0')).toEqual({ schema: 53, tables: ['lane_note'] });
+    expect(schemaRequirementFor('0.3.82')).toEqual({ schema: 53, tables: [] });
+    expect(schemaRequirementFor('0.4.0')).toEqual({ schema: 53, tables: [] });
   });
 
   test('an older target keeps the older minimum: 49 is not forced onto every historical version', () => {

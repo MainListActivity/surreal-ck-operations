@@ -9,6 +9,7 @@
 | 命令 | 一行示例 |
 |---|---|
 | 建任务（路由类型） | `sck owner task.create '{"type":"software","title":"导出","requirement":"导出 CSV","acceptanceText":"列头正确","tag":"发布线","hold":false}'`（返回 `{task, planned}`：route.next 链上的 planned 后续任务各带草稿） |
+| 会话策略 | `sck owner session.policy '{"policy":"oneshot"}'`（`reuse` 回滚；不带参数只读当前值） |
 | 笔记列表 | `sck owner note.list '{"lane":"surreal_ck:qa"}'`（不带 lane 列全部，含待生效） |
 | 笔记全文 | `sck owner note.preview '{"lane":"surreal_ck:qa"}'`（会话将读到的 `notes.md`） |
 | 加笔记 | `sck owner note.add '{"lane":"surreal_ck:qa","text":"…"}'`（`proposed:true` 进待审） |
