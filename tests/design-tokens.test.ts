@@ -1,7 +1,9 @@
 import { test, expect } from 'bun:test';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import {
-  RELAY_LIGHT, RELAY_DARK, RELAY_FONT_PX, RELAY_RADIUS_PX, RELAY_SPACE_PX,
-  paletteToCssVars, scaleToCssVars, previewListCss,
+  RELAY_LIGHT, RELAY_DARK, RELAY_FONT_PX, RELAY_RADIUS_PX, RELAY_SPACE_PX, RELAY_RN_PX,
+  paletteToCssVars, scaleToCssVars, previewListCss, fs, radius, sp,
 } from '../plugin/shared/relay-tokens.ts';
 import { relayShellCss } from '../plugin/shared/relay-shell.ts';
 import { routingDesignCss } from '../plugin/shared/model-routing-design.ts';
@@ -58,4 +60,42 @@ test('the Paseo panel palette is derived from the same tokens, not a second colo
   expect(dark.core.surface0).toBe(RELAY_DARK.bg);
   expect(dark.core.accent).toBe(RELAY_DARK.accent);
   expect(dark.core.accentForeground).toBe(RELAY_DARK.accentInk);
+});
+
+/** AC1 (round-02 finding): every numeric style value in plugin/client must come from relay-tokens.ts. */
+const CLIENT_DIR = join(import.meta.dir, '..', 'plugin', 'client');
+const STYLE_PROPS = [
+  'fontSize', 'borderRadius', 'padding', 'paddingHorizontal', 'paddingVertical',
+  'paddingTop', 'paddingBottom', 'paddingLeft', 'paddingRight', 'margin',
+  'marginHorizontal', 'marginVertical', 'marginTop', 'marginBottom', 'marginLeft', 'marginRight',
+  'gap', 'rowGap', 'columnGap', 'lineHeight', 'letterSpacing',
+  'minHeight', 'height', 'width', 'minWidth', 'borderWidth', 'borderLeftWidth',
+  'borderTopWidth', 'borderBottomWidth', 'right', 'bottom',
+];
+
+test('every Paseo client file consumes the shared token functions, with no raw numeric style literals', () => {
+  const files = readdirSync(CLIENT_DIR).filter(f => f.endsWith('.tsx'));
+  expect(files.length).toBeGreaterThan(5);
+  for (const file of files) {
+    const src = readFileSync(join(CLIENT_DIR, file), 'utf8');
+    if (!/\b(?:fs|radius|sp)\(/.test(src)) continue; // relay-theme.ts is a .ts file, not included here
+    expect(src, `${file} does not import relay-tokens.ts`).toContain('relay-tokens.ts');
+    for (const match of src.matchAll(new RegExp(`\\b(?:${STYLE_PROPS.join('|')}):\\s*([^,}\\n]+)`, 'g'))) {
+      const value = match[1]!;
+      const stripped = value
+        .replace(/(?:fs|radius|sp)\([^)]*\)/g, '')
+        .replace(/["'][^"']*["']/g, ''); // percentages/strings are not px literals
+      expect(stripped, `${file} still has a raw numeric style value in ${match[0]}`)
+        .not.toMatch(/(?<!\w)-?\d+(?:\.\d+)?/);
+    }
+  }
+});
+
+test('the shared numeric helpers accept exactly the declared RN scale and reject an undeclared value', () => {
+  for (const n of RELAY_RN_PX) {
+    expect(fs(n)).toBe(n);
+    expect(radius(n)).toBe(n);
+    expect(sp(n)).toBe(n);
+  }
+  expect(() => sp(999999 as never)).toThrow('不在共享数值阶梯中');
 });

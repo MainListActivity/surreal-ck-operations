@@ -2,12 +2,13 @@
   "version": "0.3.86",
   "title": "公司插件界面一致化",
   "changes": [
-    "删除第二套色值 relay-design.ts；所有网页 CSS 的颜色/字号/圆角/间距字面量改为 relay-tokens.ts 生成的变量，Paseo 面板同源取值。",
-    "控制台主题按钮服务端即渲染图标与文字；控制台两处 #fff 与 toast/brand/nav 等散点色改走共享 token；新增 design-tokens 回归测试与版本号、主题文字、.small 断言。",
-    "本机假数据预览服务按浅/深各截控制台、模型排序、交付预览三面共 6 张图入证据目录。"
+    "删除第二套色值 relay-design.ts；所有网页 CSS 的颜色/字号/圆角/间距/控件高引用 relay-tokens.ts 生成的变量。",
+    "Paseo 公司面板全部内联样式改由 relay-tokens.ts 的 fs/radius/sp 取值，design-tokens 回归测试静态拦截裸数值与裸颜色。",
+    "交付预览索引页/列表页与本机假数据预览交付物使用同一调色板；三面浅/深共 6 张截图在最终 HEAD 重截。",
+    "控制台主题按钮服务端即渲染图标+文字；侧栏版本读运行时；.small 与 section h3 已定义并有断言。"
   ],
   "impact": [
-    "只改外观与页面样式组织方式；owner 接口与任务数据不变。新增截图与回归测试，不改业务行为。"
+    "只改外观与样式组织方式；owner 接口与任务数据不变。新增回归测试与截图证据，不改业务行为。"
   ],
   "migration": "无 schema 变更，继续使用 schema 053 的 lane_note。",
   "rollback": "切回 0.3.85，无需数据回滚。"

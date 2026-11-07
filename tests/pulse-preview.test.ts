@@ -1,4 +1,5 @@
 import {relayPalette} from '../plugin/client/relay-theme.ts';
+import {fs,radius,sp} from '../plugin/shared/relay-tokens.ts';
 import { expect, test } from 'bun:test';
 import type { Pulse } from '../plugin/shared/types.ts';
 
@@ -95,6 +96,7 @@ const compiled = new Bun.Transpiler({ loader: 'tsx', tsconfig: {
 const render = new Function(
   'React', 's', 'ctx', 'pal', 'MetricCard', 'p', 'loaded', 'data', 'attention',
   'Section', 'Collapsible', 'View', 'Text', 'fmtAge', 'ROLE_LABEL', 'WORKFLOW_LABEL', 'WAIT_KIND_LABEL', 'WAIT_STATE_LABEL', 'clockOf',
+  'fs', 'radius', 'sp',
   compiled,
 );
 
@@ -114,7 +116,7 @@ const View = 'View', Text = 'Text';
 const metricStart=page.indexOf('function MetricCard('),metricEnd=page.indexOf('\n}\n',metricStart)+3;
 if(metricStart<0||metricEnd<3)throw Error('MetricCard missing');
 const metricSource=new Bun.Transpiler({loader:'tsx',tsconfig:{compilerOptions:{jsx:'react',jsxFactory:'React.createElement'}}}).transformSync(page.slice(metricStart,metricEnd));
-const MetricCard=new Function('React','View','Text',metricSource+';return MetricCard;')(React,View,Text);
+const MetricCard=new Function('React','View','Text','fs','radius','sp',metricSource+';return MetricCard;')(React,View,Text,fs,radius,sp);
 const Section = ({ title, children }: { title: string; children: unknown }) =>
   el('section', { title }, children);
 const Collapsible = ({ title, children }: { title: string; children: unknown }) =>
@@ -136,7 +138,7 @@ const attentionOf = (p: Pulse) =>
 const renderPulse = (raw: unknown, q: { isLoading?: boolean; isError?: boolean; error?: Error } = {}) =>
   render(React, s, ctx, relayPalette({ colors: {} } as never), MetricCard, normalizePulse(raw), raw != null,
     { data: raw, isLoading: false, isError: false, error: undefined, ...q },
-    attentionOf(normalizePulse(raw)), Section, Collapsible, View, Text, fmtAge, ROLE_LABEL, WORKFLOW_LABEL, WAIT_KIND_LABEL, WAIT_STATE_LABEL, clockOf);
+    attentionOf(normalizePulse(raw)), Section, Collapsible, View, Text, fmtAge, ROLE_LABEL, WORKFLOW_LABEL, WAIT_KIND_LABEL, WAIT_STATE_LABEL, clockOf, fs, radius, sp);
 
 test('动态页渲染：完整数据呈现全部区块', () => {
   const text = collectText(renderPulse(full));
