@@ -185,9 +185,9 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
         note: text(input.note ?? '', 'note', command === 'approve' ? 0 : 2), source: a, key: key() });
     }
     case 'inbox': {
-      const inbox = await ctx.owner.inbox();
-      if (ctx.upgrades) return { ...inbox, upgrades: await ctx.upgrades.inbox() };
-      return inbox;
+      // The upgrade desk already returns the whole inbox with its upgrades field; wrapping it again hid the running version.
+      if (ctx.upgrades) return ctx.upgrades.inbox();
+      return ctx.owner.inbox();
     }
     case 'upgrade.list': return ctx.upgrades ? await ctx.upgrades.inbox() : { upgrades: { items: [] } };
     case 'upgrade.automatic': { const enabled = input.enabled === true; return ctx.upgrades ? await ctx.upgrades.setAuto(enabled, a) : { ok: false }; }
