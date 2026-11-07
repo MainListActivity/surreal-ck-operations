@@ -45,6 +45,9 @@ export interface EmployeeDef {
   errorStreak: number;
 }
 
+export interface ChainWorkspace { cwd: string; id: string }
+export interface ChainRoot { id: string; title: string; workspaces: ChainWorkspace[] }
+
 export interface EmployeeInst {
   id: string;
   role: Role;
@@ -66,6 +69,8 @@ export interface EmployeeInst {
   repoHome?: string;
   /** Goal-scoped Paseo workspace; absent on legacy employee workspaces. */
   workspaceScope?: string;
+  /** The Paseo container this session lives in; it stays open while the session is on the roster. */
+  paseoWorkspace?: string;
   /** Registered identity principal (schema 029), when one is registered: the only cross-employee identity link (SYS-DISP Q3). */
   principal?: string;
   /** How many times the dispatcher woke this session; used to rotate it before the context grows too large. */
@@ -429,13 +434,13 @@ export class Workforce {
   async insts(): Promise<EmployeeInst[]> {
     type Row = { id: RecordId; role: Role; def?: RecordId; principal?: RecordId; provider?: string; model?: string; thinking?: string;
       paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number; idle_since?: number; runtime_sleep_requested_at?: number;
-      v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; workspace_scope?: string; wake_count?: number; lane?: string; last_task?: RecordId; last_phase?: 'execute' | 'review' };
+      v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; workspace_scope?: string; paseo_workspace?: string; wake_count?: number; lane?: string; last_task?: RecordId; last_phase?: 'execute' | 'review' };
     const [rows] = await this.db.query<[Row[]]>(
       'SELECT * FROM employee WHERE revoked != true AND retired != true AND (def != NONE OR paseo_agent_id != NONE) ORDER BY id;');
     return rows.map(r => ({ id: asId(r.id), role: r.role, def: r.def ? asId(r.def) : undefined, provider: r.provider,
       model: r.model, thinking: r.thinking, paseoAgentId: r.paseo_agent_id ?? undefined,
       activeTask: r.active_task ? asId(r.active_task) : undefined, credentialFile: r.credential_file, lastWakeAt: r.last_wake_at, idleSince: r.idle_since, runtimeSleepRequestedAt: r.runtime_sleep_requested_at,
-      onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, repoHome: r.workspace_repo ?? undefined, workspaceScope: r.workspace_scope ?? undefined, wakeCount: r.wake_count ?? 0,
+      onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, repoHome: r.workspace_repo ?? undefined, workspaceScope: r.workspace_scope ?? undefined, paseoWorkspace: r.paseo_workspace ?? undefined, wakeCount: r.wake_count ?? 0,
       principal: r.principal ? asId(r.principal) : undefined,
       lane: r.lane ?? undefined, lastTask: r.last_task ? asId(r.last_task) : undefined, lastPhase: r.last_phase ?? undefined }));
   }
@@ -448,6 +453,46 @@ export class Workforce {
       `SELECT parent, executor_role, project FROM task WHERE parent IN $ids AND state IN ['ready', 'planned'];`, { ids });
     return { states: new Map((tasks ?? []).map(task => [asId(task.id), task.state])),
       followUps: (children ?? []).map(child => ({ parent: asId(child.parent), lane: laneOf(child.project ? asId(child.project) : undefined, child.executor_role) })) };
+  }
+
+  /** The root of a task's chain: the goal its sessions are grouped under. */
+  async chainRoot(taskId: string): Promise<ChainRoot> {
+    let cursor: RecordId = id('task', taskId) as RecordId;
+    const seen = new Set<string>();
+    for (;;) {
+      const [rows] = await this.db.query<[Array<{ title?: string; parent?: RecordId; paseo_workspaces?: ChainWorkspace[] }>]>(
+        'SELECT title, parent, paseo_workspaces FROM $task;', { task: cursor });
+      const row = rows?.[0];
+      if (!row) throw new CompanyError('not_found', 'Task not found');
+      seen.add(asId(cursor));
+      if (!row.parent || seen.has(asId(row.parent))) return { id: asId(cursor), title: row.title ?? '', workspaces: row.paseo_workspaces ?? [] };
+      cursor = row.parent;
+    }
+  }
+
+  async saveChainWorkspaces(rootId: string, workspaces: ChainWorkspace[]): Promise<void> {
+    await this.db.query(workspaces.length ? 'UPDATE $task SET paseo_workspaces = $workspaces;' : 'UPDATE $task UNSET paseo_workspaces;',
+      { task: id('task', rootId), workspaces });
+  }
+
+  /** Chains with a Paseo container and nothing left to do. */
+  async finishedChains(): Promise<ChainRoot[]> {
+    const [roots] = await this.db.query<[Array<{ id: RecordId; title?: string; paseo_workspaces: ChainWorkspace[] }>]>(
+      'SELECT id, title, paseo_workspaces FROM task WHERE paseo_workspaces != NONE;');
+    const finished: ChainRoot[] = [];
+    for (const root of roots ?? []) {
+      let frontier = [root.id], open = false;
+      const seen = new Set<string>();
+      while (frontier.length && !open) {
+        const [rows] = await this.db.query<[Array<{ id: RecordId; state: string }>]>(
+          'SELECT id, state FROM task WHERE id IN $ids OR parent IN $ids;', { ids: frontier });
+        open = (rows ?? []).some(row => !['done', 'void'].includes(row.state));
+        for (const row of frontier) seen.add(asId(row));
+        frontier = (rows ?? []).map(row => row.id).filter(row => !seen.has(asId(row)));
+      }
+      if (!open) finished.push({ id: asId(root.id), title: root.title ?? '', workspaces: root.paseo_workspaces });
+    }
+    return finished;
   }
 
   /** Creates an employee identity for a definition; the caller binds the Paseo agent once spawned.
@@ -485,12 +530,12 @@ export class Workforce {
     return token;
   }
 
-  async bind(employeeId: string, input: { agentId: string; def?: string; provider?: string; model?: string; thinking?: string; credentialFile?: string; cwd?: string; repoHome?: string; workspaceScope?: string }): Promise<void> {
+  async bind(employeeId: string, input: { agentId: string; def?: string; provider?: string; model?: string; thinking?: string; credentialFile?: string; cwd?: string; repoHome?: string; workspaceScope?: string; paseoWorkspace?: string }): Promise<void> {
     const [rows] = await this.db.query<[unknown[]]>(`UPDATE $e MERGE {
       paseo_agent_id: $agent, def: $def ?? def, provider: $provider ?? provider, model: $model ?? model,
-      thinking: $thinking ?? thinking, credential_file: $file ?? credential_file, workspace_cwd: $cwd ?? workspace_cwd, workspace_repo: $repo_home ?? workspace_repo, workspace_scope: $scope ?? workspace_scope, retired: false } RETURN AFTER;`, {
+      thinking: $thinking ?? thinking, credential_file: $file ?? credential_file, workspace_cwd: $cwd ?? workspace_cwd, workspace_repo: $repo_home ?? workspace_repo, workspace_scope: $scope ?? workspace_scope, paseo_workspace: $paseo_workspace ?? paseo_workspace, retired: false } RETURN AFTER;`, {
       e: id('employee', employeeId), agent: input.agentId, def: input.def ? id('employee_def', input.def) : undefined,
-      provider: input.provider, model: input.model, thinking: input.thinking, file: input.credentialFile, cwd: input.cwd, repo_home: input.repoHome, scope: input.workspaceScope,
+      provider: input.provider, model: input.model, thinking: input.thinking, file: input.credentialFile, cwd: input.cwd, repo_home: input.repoHome, scope: input.workspaceScope, paseo_workspace: input.paseoWorkspace,
     });
     if (!rows?.length) throw new CompanyError('not_found', 'Employee not found');
   }
