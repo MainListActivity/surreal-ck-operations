@@ -42,7 +42,12 @@ test('the console actually loads: every name its load path calls exists at runti
       return elements.get(id)!;
     };
     const document = { documentElement: element('root'), body: element('body'), getElementById: element, addEventListener() {}, querySelector: () => null, querySelectorAll: () => [] };
-    const responses: Record<string, unknown> = { 'api/exchange': { ownerToken: 'fixture' } };
+    // Real shapes: task.list carries record IDs, progress carries bare IDs; the page has to join them.
+    const progress = { counts: { done: 1, doing: 0, waiting: 0, blocked: 0, total: 1 }, defects: [],
+      forecast: { remainingMinutes: 0, basis: 'company', samples: 1, ownerWaiting: 0 },
+      chains: [{ root: 'r1', title: '链一', taskIds: ['r1'], defects: [], counts: { done: 1, doing: 0, waiting: 0, blocked: 0, total: 1 }, forecast: { remainingMinutes: 0, basis: 'chain', samples: 1, ownerWaiting: 0 } }] };
+    const responses: Record<string, unknown> = { 'api/exchange': { ownerToken: 'fixture' }, 'owner/progress': progress,
+      'owner/task.list': { tasks: [{ id: 'task:⟨r1⟩', title: '链一', state: 'done', executor_role: 'product', reviewer_role: 'qa' }] } };
     const fetchStub = async (path: string) => new Response(JSON.stringify(responses[path] ?? {}), { status: 200 });
     const windowStub = { addEventListener() {}, matchMedia: () => ({ matches: false }), location: { href: url + '/', search: '', pathname: new URL(url).pathname + '/' } };
     const run = new Function('document', 'fetch', 'window', 'location', 'localStorage', 'matchMedia', 'setInterval', 'setTimeout', body);
@@ -51,5 +56,6 @@ test('the console actually loads: every name its load path calls exists at runti
     for (let n = 0; n < 50; n++) await new Promise(resolve => setImmediate(resolve));
     expect(String(element('stat').textContent)).toBe('运行中');
     expect(String(element('flow-pane').innerHTML)).toContain('目标进度');
+    expect(String(element('flow-pane').innerHTML)).toContain('已完成 · 1 个任务');
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
