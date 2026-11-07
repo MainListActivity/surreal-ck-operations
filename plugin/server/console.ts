@@ -286,55 +286,55 @@ ${relayShellCss}
 .shell{grid-template-columns:220px minmax(0,1fr)}
 .main-area{display:grid;grid-template-rows:62px minmax(0,1fr)}
 .content{width:100%;max-width:none;margin:0;padding:0;display:grid;grid-template-columns:minmax(0,1fr) 360px;min-height:calc(100vh - 62px)}
-.flow-pane{min-width:0;overflow:auto;padding:18px 20px 40px}
-.chain-rail{display:flex;gap:8px;overflow-x:auto;padding-bottom:12px;margin-bottom:12px}
-.chain-chip{flex:none;min-width:180px;max-width:240px;padding:10px 12px;border:1px solid var(--relay-border);border-radius:10px;background:var(--relay-panel);cursor:pointer;text-align:left;color:var(--relay-text)}
+.flow-pane{min-width:0;overflow:auto;padding:var(--relay-sp-18) var(--relay-sp-20) var(--relay-sp-40)}
+.chain-rail{display:flex;gap:var(--relay-sp-8);overflow-x:auto;padding-bottom:var(--relay-sp-12);margin-bottom:var(--relay-sp-12)}
+.chain-chip{flex:none;min-width:180px;max-width:240px;padding:var(--relay-sp-10) var(--relay-sp-12);border:1px solid var(--relay-border);border-radius:var(--relay-r-10);background:var(--relay-panel);cursor:pointer;text-align:left;color:var(--relay-text)}
 .chain-chip.active{border-color:var(--relay-accent-border);background:var(--relay-accent-soft)}
-.chain-chip strong{display:block;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.chain-chip small{display:block;color:var(--relay-faint);font-size:10px;margin-top:4px}
-.chain-chip .chip-cancel{height:22px;padding:0 7px;margin-left:6px;border:1px solid var(--relay-warning);border-radius:6px;background:transparent;color:var(--relay-warning);font-size:10px;font-weight:700;cursor:pointer}
-.flow-head .row{display:flex;gap:7px;flex-wrap:wrap}
-.retired-box{margin-top:16px;padding:12px;border:1px solid var(--relay-border);border-radius:12px;background:var(--relay-panel)}
-.retired-box h3{margin:0 0 8px;font-size:13px}
-.flow-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:8px 0 12px;flex-wrap:wrap}
-.flow-head h1{margin:0;font-size:20px;letter-spacing:-.02em}
-.flow-legend{display:flex;gap:12px;flex-wrap:wrap;color:var(--relay-muted);font-size:10px}
-.flow-legend span{display:inline-flex;align-items:center;gap:5px}
+.chain-chip strong{display:block;font-size:var(--relay-fs-12);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chain-chip small{display:block;color:var(--relay-faint);font-size:var(--relay-fs-10);margin-top:var(--relay-sp-4)}
+.chain-chip .chip-cancel{height:22px;padding:0 var(--relay-sp-7);margin-left:var(--relay-sp-6);border:1px solid var(--relay-warning);border-radius:var(--relay-r-6);background:transparent;color:var(--relay-warning);font-size:var(--relay-fs-10);font-weight:700;cursor:pointer}
+.flow-head .row{display:flex;gap:var(--relay-sp-7);flex-wrap:wrap}
+.retired-box{margin-top:var(--relay-sp-16);padding:var(--relay-sp-12);border:1px solid var(--relay-border);border-radius:var(--relay-r-12);background:var(--relay-panel)}
+.retired-box h3{margin:0 0 var(--relay-sp-8);font-size:var(--relay-fs-13)}
+.flow-head{display:flex;align-items:center;justify-content:space-between;gap:var(--relay-sp-12);margin:var(--relay-sp-8) 0 var(--relay-sp-12);flex-wrap:wrap}
+.flow-head h1{margin:0;font-size:var(--relay-fs-20);letter-spacing:-.02em}
+.flow-legend{display:flex;gap:var(--relay-sp-12);flex-wrap:wrap;color:var(--relay-muted);font-size:var(--relay-fs-10)}
+.flow-legend span{display:inline-flex;align-items:center;gap:var(--relay-sp-5)}
 .flow-legend i{width:18px;height:2px;display:inline-block;background:var(--relay-accent)}
 .flow-legend i.dash{background:repeating-linear-gradient(90deg,var(--relay-border-strong) 0 4px,transparent 4px 7px)}
 .flow-legend i.hold{background:var(--relay-warning)}
 .flow-legend i.block{background:var(--relay-danger)}
-.graph-scroll{overflow-x:auto;border:1px solid var(--relay-border);border-radius:14px;background:var(--relay-panel)}
+.graph-scroll{overflow-x:auto;border:1px solid var(--relay-border);border-radius:var(--relay-r-14);background:var(--relay-panel)}
 .graph{display:block}
-.lane-label{font:700 10px ui-monospace,Menlo,monospace;fill:var(--relay-faint);letter-spacing:.08em}
+.lane-label{font:700 var(--relay-fs-10) ui-monospace,Menlo,monospace;fill:var(--relay-faint);letter-spacing:.08em}
 .lane-line{stroke:var(--relay-border);stroke-width:1}
 .node-box{fill:var(--relay-panel-soft);stroke:var(--relay-border-strong);stroke-width:1.2;rx:9}
 .node-box.active{stroke:var(--relay-accent);fill:var(--relay-accent-soft)}
 .node-box.block{stroke:var(--relay-danger);fill:var(--relay-danger-soft)}
 .node-box.hold{stroke:var(--relay-warning);fill:var(--relay-warning-soft)}
 .node-box.done{stroke:var(--relay-success);fill:var(--relay-success-soft)}
-.band-title{font:700 13px "PingFang SC",system-ui,sans-serif;fill:var(--relay-text)}
-.band-eta{font:750 20px "PingFang SC",system-ui,sans-serif;fill:var(--relay-accent)}
-.band-meta{font:11px "PingFang SC",system-ui,sans-serif;fill:var(--relay-muted)}
-.band-count{font:650 12px "PingFang SC",system-ui,sans-serif;fill:var(--relay-text)}
+.band-title{font:700 var(--relay-fs-13) "PingFang SC",system-ui,sans-serif;fill:var(--relay-text)}
+.band-eta{font:750 var(--relay-fs-20) "PingFang SC",system-ui,sans-serif;fill:var(--relay-accent)}
+.band-meta{font:var(--relay-fs-11) "PingFang SC",system-ui,sans-serif;fill:var(--relay-muted)}
+.band-count{font:650 var(--relay-fs-12) "PingFang SC",system-ui,sans-serif;fill:var(--relay-text)}
 .bar-track{fill:var(--relay-border)}
 .bar-done{fill:var(--relay-success)}
 .bar-doing{fill:var(--relay-accent)}
 .bar-blocked{fill:var(--relay-danger)}
-.bug-head{font:700 10px "PingFang SC",system-ui,sans-serif;fill:var(--relay-faint)}
+.bug-head{font:700 var(--relay-fs-10) "PingFang SC",system-ui,sans-serif;fill:var(--relay-faint)}
 .bug-row{cursor:pointer}
 .bug-row rect{fill:transparent}
 .bug-row:hover rect{fill:var(--relay-accent-soft)}
-.bug-text{font:11px "PingFang SC",system-ui,sans-serif;fill:var(--relay-text)}
-.bug-state{font:700 11px "PingFang SC",system-ui,sans-serif}
+.bug-text{font:var(--relay-fs-11) "PingFang SC",system-ui,sans-serif;fill:var(--relay-text)}
+.bug-state{font:700 var(--relay-fs-11) "PingFang SC",system-ui,sans-serif}
 .bug-state.fixing,.bug-state.reopened{fill:var(--relay-danger)}
 .bug-state.verifying{fill:var(--relay-warning)}
 .bug-state.fixed{fill:var(--relay-success)}
 .bug-state.dropped{fill:var(--relay-faint)}
 .bug-badge{fill:var(--relay-danger)}
-.bug-badge-text{font:700 9px ui-monospace,Menlo,monospace;fill:#fff}
-.node-title{font:650 11px "PingFang SC",system-ui,sans-serif;fill:var(--relay-text)}
-.node-meta{font:10px ui-monospace,Menlo,monospace;fill:var(--relay-faint)}
+.bug-badge-text{font:700 var(--relay-fs-9) ui-monospace,Menlo,monospace;fill:var(--relay-on-accent)}
+.node-title{font:650 var(--relay-fs-11) "PingFang SC",system-ui,sans-serif;fill:var(--relay-text)}
+.node-meta{font:var(--relay-fs-10) ui-monospace,Menlo,monospace;fill:var(--relay-faint)}
 .edge{fill:none;stroke:var(--relay-accent);stroke-width:1.6;opacity:.75}
 .edge.draft{stroke:var(--relay-border-strong);stroke-dasharray:5 5;animation:dashmove 2.5s linear infinite}
 .edge.hold{stroke:var(--relay-warning);stroke-dasharray:7 4}
@@ -342,23 +342,23 @@ ${relayShellCss}
 .edge-hit{fill:none;stroke:transparent;stroke-width:14;cursor:pointer}
 @keyframes dashmove{to{stroke-dashoffset:-40}}
 .dot{fill:var(--relay-accent)}
-.drawer{border-left:1px solid var(--relay-border);background:var(--relay-panel);padding:18px;overflow:auto;max-height:calc(100vh - 62px)}
-.drawer h2{margin:0 0 4px;font-size:15px}
-.drawer .kicker{margin-bottom:14px;color:var(--relay-accent);font:800 10px ui-monospace,Menlo,monospace;letter-spacing:.12em}
-.drawer section{margin:0 0 16px;padding-bottom:14px;border-bottom:1px solid var(--relay-border)}
-.drawer label{display:grid;gap:6px;margin:8px 0;font-size:11px;color:var(--relay-muted);font-weight:700}
-.drawer textarea{min-height:100px;font-size:12px}
-.drawer .row{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}
-.drawer button{height:32px;padding:0 11px;border:1px solid var(--relay-border);border-radius:8px;background:var(--relay-panel-soft);color:var(--relay-text);font-size:11px;font-weight:700;cursor:pointer}
-.drawer button.primary{background:var(--relay-accent);border:0;color:#fff}
+.drawer{border-left:1px solid var(--relay-border);background:var(--relay-panel);padding:var(--relay-sp-18);overflow:auto;max-height:calc(100vh - 62px)}
+.drawer h2{margin:0 0 var(--relay-sp-4);font-size:var(--relay-fs-15)}
+.drawer .kicker{margin-bottom:var(--relay-sp-14);color:var(--relay-accent);font:800 var(--relay-fs-10) ui-monospace,Menlo,monospace;letter-spacing:.12em}
+.drawer section{margin:0 0 var(--relay-sp-16);padding-bottom:var(--relay-sp-14);border-bottom:1px solid var(--relay-border)}
+.drawer label{display:grid;gap:var(--relay-sp-6);margin:var(--relay-sp-8) 0;font-size:var(--relay-fs-11);color:var(--relay-muted);font-weight:700}
+.drawer textarea{min-height:100px;font-size:var(--relay-fs-12)}
+.drawer .row{display:flex;gap:var(--relay-sp-7);flex-wrap:wrap;margin-top:var(--relay-sp-9)}
+.drawer button{height:32px;padding:0 var(--relay-sp-11);border:1px solid var(--relay-border);border-radius:var(--relay-r-8);background:var(--relay-panel-soft);color:var(--relay-text);font-size:var(--relay-fs-11);font-weight:700;cursor:pointer}
+.drawer button.primary{background:var(--relay-accent);border:0;color:var(--relay-on-accent)}
 .drawer button.warn{color:var(--relay-warning);border-color:var(--relay-warning)}
-.drawer pre{white-space:pre-wrap;word-break:break-word;font:11px/1.7 ui-monospace,Menlo,monospace;color:var(--relay-muted);max-height:220px;overflow:auto;background:var(--relay-input);padding:9px;border-radius:8px}
-.inbox-list{display:grid;gap:8px}
-.inbox-card{padding:10px;border:1px solid var(--relay-border);border-radius:9px;background:var(--relay-panel-soft)}
-.inbox-card h3{margin:0 0 5px;font-size:12px}
-.inbox-card p{margin:0 0 8px;color:var(--relay-muted);font-size:11px;line-height:1.5}
-.task-form{display:grid;gap:8px}
-.task-form input,.task-form select,.task-form textarea{width:100%;font-size:11px}
+.drawer pre{white-space:pre-wrap;word-break:break-word;font:var(--relay-fs-11)/1.7 ui-monospace,Menlo,monospace;color:var(--relay-muted);max-height:220px;overflow:auto;background:var(--relay-input);padding:var(--relay-sp-9);border-radius:var(--relay-r-8)}
+.inbox-list{display:grid;gap:var(--relay-sp-8)}
+.inbox-card{padding:var(--relay-sp-10);border:1px solid var(--relay-border);border-radius:var(--relay-r-9);background:var(--relay-panel-soft)}
+.inbox-card h3{margin:0 0 var(--relay-sp-5);font-size:var(--relay-fs-12)}
+.inbox-card p{margin:0 0 var(--relay-sp-8);color:var(--relay-muted);font-size:var(--relay-fs-11);line-height:1.5}
+.task-form{display:grid;gap:var(--relay-sp-8)}
+.task-form input,.task-form select,.task-form textarea{width:100%;font-size:var(--relay-fs-11)}
 .task-form textarea{min-height:70px}
 @media(max-width:900px){.content{grid-template-columns:1fr}.drawer{border-left:0;border-top:1px solid var(--relay-border);max-height:none}.shell{display:block}.sidebar{height:auto;position:sticky;top:0}.main-nav{flex-direction:row}.topbar{top:56px}}
 </style></head><body>
@@ -370,7 +370,7 @@ ${relayShellCss}
 <button data-t="defs" data-cmd="tab:defs">${relayIcon("layers")}<span>编制</span></button>
 <button data-t="routes" data-cmd="tab:routes">${relayIcon("layers")}<span>路由表</span></button>
 <button data-t="notes" data-cmd="tab:notes">${relayIcon("layers")}<span>线的笔记</span></button>
-<button data-cmd="theme" id="theme-btn" class="icon-button theme-toggle" aria-label="切换主题"></button>
+<button data-cmd="theme" id="theme-btn" class="icon-button theme-toggle" aria-label="切换主题">${relayIcon("moon")}<span class="theme-label">深色</span></button>
 <button onclick="location.href='ranking'" class="refresh">${relayIcon("layers")}<span>模型排序</span></button>
 </nav><div class="sidebar-footer"><div class="operator"><span class="avatar">B</span><span><strong>老板</strong><small id="release-ver">控制面</small></span></div></div></aside>
 <div class="main-area"><header class="topbar"><div class="breadcrumb"><span>公司</span><b>/</b><strong id="crumb">目标进度</strong></div>

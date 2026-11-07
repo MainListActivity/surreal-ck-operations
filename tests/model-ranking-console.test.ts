@@ -6,7 +6,7 @@ import {createConsoleFetch,consoleUrl} from '../plugin/server/console.ts';
 import {startPreview} from '../plugin/server/preview.ts';
 import {DEFAULT_RANKING_RULES} from '../src/model-routing/ranking.ts';
 import {rankingPage} from '../plugin/server/ranking-page.ts';
-import {relayDesignCss} from '../plugin/shared/relay-design.ts';
+import {relayShellCss} from '../plugin/shared/relay-shell.ts';
 const homes:string[]=[];
 afterEach(()=>{for(const home of homes.splice(0))rmSync(home,{recursive:true,force:true});});
 function fixture(){
@@ -37,7 +37,9 @@ test('owner ranking page uses supplied Figma layout, real API, light/dark tokens
  expect(script).not.toContain("$('rule').value");
  expect(script).toContain('rules:state.rules,policy');expect(html).not.toContain('id="refresh"');expect(html).toContain('保存后立即重算并应用');
  expect((await (await f.request('')).text())).toContain("location.href='ranking'");
- expect(relayDesignCss).toContain('grid-template-columns: 340px minmax(0, 1fr)');
+ expect(relayShellCss).toContain('--relay-bg:#0e0f12');
+ expect(relayShellCss).toContain('--relay-fs-12:12px');
+ expect(html).toContain('var(--relay-');
 });
 test('owner ranking GET shares settings without triggering a refresh; saves validate and reset the existing refresher',async()=>{
  const f=fixture();const get=await f.request('api/model-ranking');expect(get.status).toBe(200);expect(await get.json()).toMatchObject({rules:DEFAULT_RANKING_RULES,refreshMinutes:5});expect(f.resets).toEqual([]);

@@ -10,6 +10,12 @@ cp -R ../src server/vendor/src
 cp -R ../schema server/vendor/schema
 find server/vendor -name '*.ts' -exec sh -c 'printf "// @ts-nocheck\n" | cat - "$1" > "$1.tmp" && mv "$1.tmp" "$1"' _ {} \;
 
+# preview-core 在仓库根的 src/ 里用 ../plugin/shared 取唯一设计变量源；vendored 副本位于
+# plugin/server/vendor/src/，同一份 shared 相对它是 ../../../shared，改写这一行而非复制一份。
+sed "s#'../plugin/shared/relay-tokens.ts'#'../../../shared/relay-tokens.ts'#" \
+  server/vendor/src/preview-core.ts > server/vendor/src/preview-core.ts.tmp
+mv server/vendor/src/preview-core.ts.tmp server/vendor/src/preview-core.ts
+
 # Bundled plugin runtimes have no import.meta.url, so the approval-diagnosis code
 # version cannot read sibling sources there (see proof-bridge.ts). Stamp the
 # canonical source digest over the same file list and order into the vendored copy.
