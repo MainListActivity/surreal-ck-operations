@@ -1,18 +1,14 @@
 {
-  "version": "0.3.82",
-  "title": "一次性会话：按线选会话与任务结束回收",
+  "version": "0.3.83",
+  "title": "派工消息补回提交后结束本轮",
   "changes": [
-    "新增 session_policy：oneshot 下新任务开新会话，任务结束回收会话，默认仍为 reuse。",
-    "同一任务同一阶段的会话继续处理返工、恢复和再次复核。",
-    "紧密相关的后续任务沿用父任务的执行会话，只有第一个子任务沿用。",
-    "会话领取任务时记下 lane、last_task、last_phase。",
-    "owner API 新增 session.policy，用于切换和回滚。",
-    "learned 提示改为多数任务不需要写。"
+    "执行和返工消息要求提交后结束本轮，被退回时系统会再通知。",
+    "复核消息要求提交后结束本轮。",
+    "修复会话提交后继续空转，导致返工回不到原会话的问题。"
   ],
   "impact": [
-    "默认策略不变，切换 oneshot 后新任务的冷启动增多。",
-    "切换后不再有会话跨无关任务累积上下文。"
+    "派工消息多一句话。"
   ],
-  "migration": "无 schema 变更，employee 是 schemaless，新字段在下次领取时写入。复用 schema 053 的 lane_note。",
-  "rollback": "sck owner session.policy 切回 reuse；代码回滚切回 0.3.81，无需数据回滚。"
+  "migration": "无 schema 变更，继续使用 schema 053 的 lane_note。只影响新生成的消息草稿。",
+  "rollback": "切回 0.3.82，无需数据回滚。"
 }

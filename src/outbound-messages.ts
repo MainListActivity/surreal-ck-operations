@@ -27,12 +27,14 @@ export const DEFAULT_MACHINE_CRITERION = 'AC-BASE-DEPLOY-1';
 
 /** 表里保存短正文；派工时 renderMessage 才补上真实路径、工具绝对路径与任务 ID。 */
 const NOTES = `先读 notes.md。`;
+/** A session that stays in its turn after handing in burns tokens and cannot be woken for its own rework. */
+const END_TURN = `提交后结束本轮，不要等结果；被退回时系统会再通知你。`;
 const LEARNED = `多数任务不需要写笔记；只有今后同职能的任务都用得上的要求、方法或坑，才加 learned 数组（最多 5 条，每条一行，不写本次任务的内容）。`;
-const EXECUTE_CODE = `${NOTES}实现 task.md 中的需求，合入并发布到生产，按验收标准在生产逐条自验，全部通过后：sck call submit '{"text":"<结果>","sha":"<合入提交>"}'。需要后续任务时在 submit 里加 next 数组。${LEARNED}`;
-const EXECUTE_PLAIN = `${NOTES}完成 task.md 中的需求，按验收标准自验后：sck call submit '{"text":"<结果>"}'。需要后续任务时在 submit 里加 next 数组。${LEARNED}`;
+const EXECUTE_CODE = `${NOTES}实现 task.md 中的需求，合入并发布到生产，按验收标准在生产逐条自验，全部通过后：sck call submit '{"text":"<结果>","sha":"<合入提交>"}'。需要后续任务时在 submit 里加 next 数组。${LEARNED}${END_TURN}`;
+const EXECUTE_PLAIN = `${NOTES}完成 task.md 中的需求，按验收标准自验后：sck call submit '{"text":"<结果>"}'。需要后续任务时在 submit 里加 next 数组。${LEARNED}${END_TURN}`;
 /** 内容线（故事/视频等）的复核不涉及生产发布；软件线的复核才按生产环境逐条复验。 */
-const REVIEW = `${NOTES}按 task.md 的验收标准逐条复验：sck call review '{"decision":"accept|return","text":"<结论>"}'。${LEARNED}`;
-const REVIEW_CODE = `${NOTES}按 task.md 的验收标准在生产逐条复验：sck call review '{"decision":"accept|return","text":"<结论>"}'。${LEARNED}`;
+const REVIEW = `${NOTES}按 task.md 的验收标准逐条复验：sck call review '{"decision":"accept|return","text":"<结论>"}'。${LEARNED}提交后结束本轮。`;
+const REVIEW_CODE = `${NOTES}按 task.md 的验收标准在生产逐条复验：sck call review '{"decision":"accept|return","text":"<结论>"}'。${LEARNED}提交后结束本轮。`;
 const REWORK_CODE = `修复 findings/round-NN.md 中的问题后，` + EXECUTE_CODE;
 const REWORK_PLAIN = `修复 findings/round-NN.md 中的问题后，` + EXECUTE_PLAIN;
 const NUDGE = (phase: string) => phase === 'review' ? REVIEW : EXECUTE_PLAIN;
