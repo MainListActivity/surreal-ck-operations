@@ -3,6 +3,7 @@
  * 所有写操作记 actor=owner 并带 via 标签（请求头 X-Owner-Agent，没有则 web）。
  */
 import { LaneNoteStore } from './lane-notes.ts';
+import { readProgress } from './task-progress.ts';
 import { randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
@@ -157,6 +158,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       const [messages] = await db.query<[unknown[]]>('SELECT * FROM outbound_message WHERE task = $task ORDER BY created_at;', { task: new RecordId('task', taskId) });
       return { task: rows[0], audit, messages };
     }
+    case 'progress': return readProgress(db);
     case 'task.list': { const [rows] = await db.query<[unknown[]]>('SELECT * FROM task ORDER BY created_at DESC LIMIT 300;'); return { tasks: rows }; }
     case 'task.reassign': return ctx.owner.reassign({ taskId: text(input.taskId, 'taskId'),
       executorRole: optionalText(input.executorRole) as Role | undefined,

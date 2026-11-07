@@ -156,3 +156,38 @@ run('a claim records the session\'s lane, task and phase; facts report states an
   expect(facts.followUps).toContainEqual({ parent: parent.id, lane: 'alpha:engineering' });
   await db.db.query(`UPDATE $t SET state = 'void';`, { t: new RecordId('task', next.id) });
 });
+
+run('a chain keeps one workspace record at its root and is finished only when every task is', async () => {
+  const wf = new Workforce(db, join(dir, 'unused-credentials'));
+  const root = await task('目标根任务');
+  const child = await core.createTask(gm, { title: '子任务', context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', parent: root.id, requirement: 'fixture', acceptanceText: 'fixture', idempotencyKey: key() } as never);
+  expect(await wf.chainRoot(child.id)).toEqual({ id: root.id, title: '目标根任务', workspaces: [] });
+  await wf.saveChainWorkspaces(root.id, [{ cwd: '/repo', id: 'wks_1' }]);
+  expect((await wf.chainRoot(child.id)).workspaces).toEqual([{ cwd: '/repo', id: 'wks_1' }]);
+  expect((await wf.finishedChains()).map(c => c.id)).not.toContain(root.id);
+  await db.db.query(`UPDATE task SET state = 'done' WHERE id IN $ids;`, { ids: [new RecordId('task', root.id), new RecordId('task', child.id)] });
+  expect((await wf.finishedChains()).map(c => c.id)).toContain(root.id);
+  await wf.saveChainWorkspaces(root.id, []);
+  expect((await wf.finishedChains()).map(c => c.id)).not.toContain(root.id);
+  expect((await wf.chainRoot(child.id)).workspaces).toEqual([]);
+});
+
+run('progress reads a real chain out of the audit trail', async () => {
+  const { readProgress } = await import('../src/task-progress.ts');
+  const t = await task('进度读取');
+  const c = await core.claim(eng, t.id);
+  await core.submit(eng, proof(c), evidence());
+  const r = await core.claim(qa, t.id);
+  await core.returnTask(qa, proof(r), evidence());
+  const c2 = await core.claim(eng, t.id);
+  await core.submit(eng, proof(c2), evidence());
+  const r2 = await core.claim(qa, t.id);
+  await core.accept(qa, proof(r2), evidence());
+  const chain = (await readProgress(db.db)).chains.find(x => x.root === t.id)!;
+  expect(chain.counts.done).toBe(1);
+  expect(chain.forecast.remainingMinutes).toBe(0);
+  expect(chain.defects).toHaveLength(1);
+  expect(chain.defects[0]!.state).toBe('fixed');
+  expect(chain.defects[0]!.problem.length).toBeGreaterThan(0);
+  expect(chain.defects[0]!.fix!.length).toBeGreaterThan(0);
+});

@@ -25,6 +25,7 @@
 | 删任务（作废） | `sck owner task.delete '{"taskId":"t1","note":"不需要了"}'` |
 | 任务详情/审计/消息记录 | `sck owner task.detail '{"taskId":"t1"}'` |
 | 列出任务 | `sck owner task.list '{}'` |
+| 目标进度 | `sck owner progress '{}'`（每条任务链的完成情况、预计剩余时间、缺陷与修复方案） |
 | 改派 | `sck owner task.reassign '{"taskId":"t1","executorRole":"engineering","reviewerRole":"qa","note":"换人"}'` |
 | 作废 | `sck owner task.void '{"taskId":"t1","note":"重复"}'` |
 | 撤销租约 | `sck owner task.revoke '{"taskId":"t1","note":"终止在途"}'` |

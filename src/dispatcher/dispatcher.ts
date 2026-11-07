@@ -7,7 +7,7 @@ import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, Supervis
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
 import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, RetirementKind, Role, WriteScopeHolder } from '../contracts.ts';
 import { REQUIRED_TRACKS } from '../core.ts';
-import { UNATTENDED_MODE, type PaseoGateway, type PaseoWorkspaceInfo } from './paseo.ts';
+import { MAINTENANCE_WORKSPACE, UNATTENDED_MODE, goneSceneError, workspaceTitleOf, type PaseoGateway, type PaseoWorkspaceInfo } from './paseo.ts';
 import { latestFindings } from './brief.ts';
 import type { PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
@@ -1134,6 +1134,8 @@ export class Dispatcher {
           this.log(`retired ${inst.id}: task ${inst.lastTask} finished`);
         }
       }
+      await this.closeFinishedWorkspaces(insts, report.retired)
+        .catch(error => this.log(`workspace cleanup failed safely: ${(error as Error).message}`));
       let inspected = 0;
       for (const inst of insts) {
         if (!rotationSafe) break;
@@ -1813,10 +1815,11 @@ export class Dispatcher {
           return undefined;
         }
         await hooks?.beforeExternal?.(inst, 'spawn');
+        const container = await this.sessionWorkspace(task ?? anchor?.task, spawnCwd, repoHome);
         const agentId = await paseo.spawn({
           title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model, thinking: def.thinking,
           mode: UNATTENDED_MODE[def.provider], cwd: spawnCwd,
-          workspaceTitle: instHome ? `SCK · ${inst.id}` : `SCK · ${def.id}`,
+          ...container,
           repoHome,
           labels: { company: 'surreal-ck', employee_id: inst.id, role: def.role, def: def.id },
           env: spawnEnv,
@@ -1825,9 +1828,9 @@ export class Dispatcher {
         await this.markOutbound(prepared ?? undefined, inst.id);
         await hooks?.afterExternal?.(inst, 'spawn', agentId);
         const cwd = spawnCwd;
-        await wf.bind(inst.id, { agentId, cwd, repoHome, model, workspaceScope });
+        await wf.bind(inst.id, { agentId, cwd, repoHome, model, workspaceScope, paseoWorkspace: container.workspaceId });
         sidecar?.bindAgent(inst.id, agentId);
-        const bound = { ...inst, paseoAgentId: agentId, cwd, repoHome, model, workspaceScope };
+        const bound = { ...inst, paseoAgentId: agentId, cwd, repoHome, model, workspaceScope, paseoWorkspace: container.workspaceId };
         const prior = insts.findIndex(row => row.id === inst.id);
         if (prior >= 0) insts[prior] = bound; else insts.push(bound);
         this.onboarded.add(inst.id);
@@ -2008,6 +2011,35 @@ export class Dispatcher {
     const workspaces = await this.deps.paseo.listWorkspaces().catch(() => [] as PaseoWorkspaceInfo[]);
     for (const w of workspaces.filter(w => w.cwd === home)) {
       await this.deps.paseo.archiveWorkspace(w.workspaceId).catch(() => undefined);
+    }
+  }
+
+  /** A Paseo workspace holds the sessions of one goal: every task of a chain lands in its root's container. */
+  private async sessionWorkspace(task: { id: string; title?: string } | undefined, cwd: string, repoHome: string): Promise<{ workspaceId?: string; workspaceTitle: string }> {
+    const { paseo, workforce: wf } = this.deps;
+    if (!task) return { workspaceTitle: MAINTENANCE_WORKSPACE };
+    if (typeof wf.chainRoot !== 'function' || typeof paseo.createWorkspace !== 'function') return { workspaceTitle: workspaceTitleOf(task.title) };
+    const root = await wf.chainRoot(task.id);
+    const workspaceTitle = workspaceTitleOf(root.title);
+    const known = root.workspaces.find(w => w.cwd === cwd);
+    if (known && (await paseo.listWorkspaces()).some(w => w.workspaceId === known.id)) return { workspaceId: known.id, workspaceTitle };
+    const workspaceId = await paseo.createWorkspace(workspaceTitle, cwd, repoHome);
+    await wf.saveChainWorkspaces(root.id, [...root.workspaces.filter(w => w.cwd !== cwd), { cwd, id: workspaceId }]);
+    return { workspaceId, workspaceTitle };
+  }
+
+  /** A finished goal's container goes once its last session is off the roster; archiving it ends whatever is still inside. */
+  private async closeFinishedWorkspaces(insts: EmployeeInst[], retired: string[]) {
+    const { paseo, workforce: wf } = this.deps;
+    if (typeof wf.finishedChains !== 'function') return;
+    const occupied = new Set(insts.filter(inst => !retired.includes(inst.id)).map(inst => inst.paseoWorkspace));
+    for (const chain of await wf.finishedChains()) {
+      const kept = chain.workspaces.filter(w => occupied.has(w.id));
+      for (const workspace of chain.workspaces.filter(w => !occupied.has(w.id))) {
+        try { await paseo.archiveWorkspace(workspace.id); }
+        catch (error) { if (!goneSceneError(error)) { kept.push(workspace); this.log(`workspace ${workspace.id} kept: ${(error as Error).message}`); } }
+      }
+      if (kept.length !== chain.workspaces.length) await wf.saveChainWorkspaces(chain.id, kept);
     }
   }
 

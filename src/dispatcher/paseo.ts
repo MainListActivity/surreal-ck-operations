@@ -11,6 +11,11 @@ import { CompanyError } from '../core-errors.ts';
  * prints a bare provider id: unknown, never "unchanged".
  */
 export interface AgentInfo { id: string; status: string; model?: string }
+/** Sessions with no task behind them (eval) share one container. */
+export const MAINTENANCE_WORKSPACE = '日常维护';
+/** The owner reads this in the Paseo sidebar: a goal or task name, never an employee or record ID. */
+export const workspaceTitleOf = (title?: string): string => (title ?? '').replace(/\s+/g, ' ').trim().slice(0, 60) || '未命名任务';
+
 export interface PaseoWorkspaceInfo { workspaceId: string; name: string; cwd: string; project?: string }
 export interface PaseoProjectInfo { projectId: string; name: string; path: string; kind?: string }
 /** One row of `paseo plugin ls --json`: the host's own record of where a plugin is registered from. */
@@ -41,6 +46,8 @@ export interface SpawnInput {
   cwd: string;
   /** Legacy title, or a goal title within the explicitly registered repository project. */
   workspaceTitle: string;
+  /** An existing container; without it the title resolves one. */
+  workspaceId?: string;
   workspaceScope?: string;
   repoHome?: string;
   labels: Record<string, string>;
@@ -82,6 +89,8 @@ export interface PaseoGateway {
   /** Registered plugins as the host records them (id, status and the installation source). Optional so a
    *  focused dispatcher test double need not stub a host query the dispatcher itself never makes. */
   plugins?(): Promise<PaseoPluginInfo[]>;
+  /** A new container for the sessions of one task chain. Titles are not unique, so the caller keeps the ID. */
+  createWorkspace?(title: string, cwd: string, repoHome?: string): Promise<string>;
   /** Archive a workspace and everything it owns; the transcript stays in history. */
   archiveWorkspace(workspaceId: string): Promise<void>;
   /** Delete a project and its workspaces. */
@@ -156,6 +165,12 @@ export function createPaseoCli(
     found.catch(() => projects.delete(root));
     return found;
   };
+  const createWorkspace = async (title: string, cwd: string, project?: string): Promise<string> => {
+    const created = await json<{ workspaceId?: string; id?: string }>(['workspace', 'create', '--isolation', 'local', '--path', cwd, '--title', title, ...(project ? ['--project', project] : [])]);
+    const id = created.workspaceId ?? created.id;
+    if (!id) throw new Error('paseo workspace create did not return a workspace ID');
+    return id;
+  };
   const workspaces = new Map<string, Promise<string>>();
   const ensureWorkspace = (title: string, cwd: string, project?: string, scope?: string): Promise<string> => {
     const key = `${project ?? ''}\0${scope ?? title}\0${cwd}`;
@@ -166,10 +181,7 @@ export function createPaseoCli(
       const existing = rows.find(w => canonicalPath(w.cwd) === canonicalPath(cwd) &&
         (scope ? w.name.endsWith(`[${scope}]`) : w.name === title));
       if (existing) return existing.workspaceId;
-      const created = await json<{ workspaceId?: string; id?: string }>(['workspace', 'create', '--isolation', 'local', '--path', cwd, '--title', title, ...(project ? ['--project', project] : [])]);
-      const id = created.workspaceId ?? created.id;
-      if (!id) throw new Error('paseo workspace create did not return a workspace ID');
-      return id;
+      return createWorkspace(title, cwd, project);
     })();
     workspaces.set(key, found);
     found.catch(() => workspaces.delete(key));
@@ -237,15 +249,20 @@ export function createPaseoCli(
     async plugins() {
       return json<PaseoPluginInfo[]>(['plugin', 'ls']);
     },
+    async createWorkspace(title, cwd, repoHome) {
+      return createWorkspace(title, cwd, repoHome ? await ensureProject(repoHome) : undefined);
+    },
     async archiveWorkspace(workspaceId) {
       await run(['workspace', 'archive', workspaceId]);
+      // A title or scope must not resolve to the container that just went away.
+      workspaces.clear();
     },
     async deleteProject(projectId) {
       await run(['project', 'delete', projectId]);
     },
     async spawn(input) {
-      const project = input.workspaceScope && input.repoHome ? await ensureProject(input.repoHome) : undefined;
-      const workspace = await ensureWorkspace(input.workspaceTitle, input.cwd, project, input.workspaceScope);
+      const project = !input.workspaceId && input.workspaceScope && input.repoHome ? await ensureProject(input.repoHome) : undefined;
+      const workspace = input.workspaceId ?? await ensureWorkspace(input.workspaceTitle, input.cwd, project, input.workspaceScope);
       const args = ['run', '-d', '--json', '--provider', `${input.provider}/${input.model}`, '--title', input.title, '--workspace', workspace];
       if (input.thinking) args.push('--thinking', input.thinking);
       if (input.mode) args.push('--mode', input.mode);
@@ -287,7 +304,7 @@ const withinTree = (candidate: string, root: string) => candidate === root || ca
  * ("unknown flag", "missing required argument") must stay real failures, or a CLI misuse would
  * pass for success, leave the scene behind, and destroy the retry anchor with the tree.
  */
-const goneSceneError = (error: unknown) =>
+export const goneSceneError = (error: unknown) =>
   /not.?found|no such|already|archived/i.test(error instanceof Error ? error.message : String(error));
 
 /** The stable code of a failed employee retirement, or a short message for an unknown failure. It is kept on the scene for the retry. */

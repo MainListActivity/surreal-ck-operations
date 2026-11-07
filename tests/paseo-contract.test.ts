@@ -260,4 +260,11 @@ writeFileSync(file,JSON.stringify(s));console.log(JSON.stringify(out));
   expect(stored.workspaces.every((w: { project: string }) => w.project === 'project-0')).toBe(true);
   const runs = readFileSync(state + '.calls', 'utf8').trim().split('\n').map(line => JSON.parse(line)).filter((a: string[]) => a[0] === 'run');
   expect(runs.slice(0, 3).map((a: string[]) => a[a.indexOf('--workspace') + 1])).toEqual(['workspace-0', 'workspace-0', 'workspace-0']);
+  // A chain's container is created by ID, so two goals with one title stay apart, and spawn uses it as given.
+  const first = await paseo.createWorkspace!('同名目标', '/fixture/repo', '/fixture/repo');
+  const second = await paseo.createWorkspace!('同名目标', '/fixture/repo', '/fixture/repo');
+  expect(first).not.toBe(second);
+  await paseo.spawn({ ...input, workspaceScope: undefined, workspaceId: second, workspaceTitle: '同名目标' });
+  const last = readFileSync(state + '.calls', 'utf8').trim().split('\n').map(line => JSON.parse(line)).filter((a: string[]) => a[0] === 'run').at(-1)!;
+  expect(last[last.indexOf('--workspace') + 1]).toBe(second);
 });

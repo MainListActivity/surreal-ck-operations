@@ -279,7 +279,7 @@ export function consoleUrl(home: string, lanBase: () => string): string {
 const PAGE = `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>公司 · 消息流</title>
+<title>公司 · 目标进度</title>
 <style>
 ${relayShellCss}
 :root{--flow-w:1180px}
@@ -305,13 +305,34 @@ ${relayShellCss}
 .flow-legend i.hold{background:var(--relay-warning)}
 .flow-legend i.block{background:var(--relay-danger)}
 .graph-scroll{overflow-x:auto;border:1px solid var(--relay-border);border-radius:14px;background:var(--relay-panel)}
-.graph{min-width:var(--flow-w);display:block}
+.graph{display:block}
 .lane-label{font:700 10px ui-monospace,Menlo,monospace;fill:var(--relay-faint);letter-spacing:.08em}
 .lane-line{stroke:var(--relay-border);stroke-width:1}
 .node-box{fill:var(--relay-panel-soft);stroke:var(--relay-border-strong);stroke-width:1.2;rx:9}
 .node-box.active{stroke:var(--relay-accent);fill:var(--relay-accent-soft)}
 .node-box.block{stroke:var(--relay-danger);fill:var(--relay-danger-soft)}
 .node-box.hold{stroke:var(--relay-warning);fill:var(--relay-warning-soft)}
+.node-box.done{stroke:var(--relay-success);fill:var(--relay-success-soft)}
+.band-title{font:700 13px "PingFang SC",system-ui,sans-serif;fill:var(--relay-text)}
+.band-eta{font:750 20px "PingFang SC",system-ui,sans-serif;fill:var(--relay-accent)}
+.band-meta{font:11px "PingFang SC",system-ui,sans-serif;fill:var(--relay-muted)}
+.band-count{font:650 12px "PingFang SC",system-ui,sans-serif;fill:var(--relay-text)}
+.bar-track{fill:var(--relay-border)}
+.bar-done{fill:var(--relay-success)}
+.bar-doing{fill:var(--relay-accent)}
+.bar-blocked{fill:var(--relay-danger)}
+.bug-head{font:700 10px "PingFang SC",system-ui,sans-serif;fill:var(--relay-faint)}
+.bug-row{cursor:pointer}
+.bug-row rect{fill:transparent}
+.bug-row:hover rect{fill:var(--relay-accent-soft)}
+.bug-text{font:11px "PingFang SC",system-ui,sans-serif;fill:var(--relay-text)}
+.bug-state{font:700 11px "PingFang SC",system-ui,sans-serif}
+.bug-state.fixing,.bug-state.reopened{fill:var(--relay-danger)}
+.bug-state.verifying{fill:var(--relay-warning)}
+.bug-state.fixed{fill:var(--relay-success)}
+.bug-state.dropped{fill:var(--relay-faint)}
+.bug-badge{fill:var(--relay-danger)}
+.bug-badge-text{font:700 9px ui-monospace,Menlo,monospace;fill:#fff}
 .node-title{font:650 11px "PingFang SC",system-ui,sans-serif;fill:var(--relay-text)}
 .node-meta{font:10px ui-monospace,Menlo,monospace;fill:var(--relay-faint)}
 .edge{fill:none;stroke:var(--relay-accent);stroke-width:1.6;opacity:.75}
@@ -344,7 +365,7 @@ ${relayShellCss}
 <div class="shell">
 <aside class="sidebar"><div class="brand"><span class="brand-mark"><i></i><i></i></span><span><strong>公司</strong><small>Message Flow</small></span></div>
 <p class="nav-label">工作区</p><nav class="main-nav">
-<button data-t="flow" class="on" data-cmd="tab:flow">${relayIcon("activity")}<span>消息流</span></button>
+<button data-t="flow" class="on" data-cmd="tab:flow">${relayIcon("activity")}<span>目标进度</span></button>
 <button data-t="inbox" data-cmd="tab:inbox">${relayIcon("inbox")}<span>收件箱</span><b id="nav-count" hidden></b></button>
 <button data-t="defs" data-cmd="tab:defs">${relayIcon("layers")}<span>编制</span></button>
 <button data-t="routes" data-cmd="tab:routes">${relayIcon("layers")}<span>路由表</span></button>
@@ -352,7 +373,7 @@ ${relayShellCss}
 <button data-cmd="theme" id="theme-btn" class="icon-button" aria-label="切换主题"></button>
 <button onclick="location.href='ranking'" class="refresh">${relayIcon("layers")}<span>模型排序</span></button>
 </nav><div class="sidebar-footer"><div class="operator"><span class="avatar">B</span><span><strong>老板</strong><small>控制面 · v0.3.79</small></span></div></div></aside>
-<div class="main-area"><header class="topbar"><div class="breadcrumb"><span>公司</span><b>/</b><strong id="crumb">消息流</strong></div>
+<div class="main-area"><header class="topbar"><div class="breadcrumb"><span>公司</span><b>/</b><strong id="crumb">目标进度</strong></div>
 <div class="top-actions"><span class="status" id="stat">加载中…</span><button class="refresh" id="pause-btn" data-cmd="toggle-pause">暂停派工</button><button class="refresh" data-cmd="refresh">${relayIcon("refresh")}<span>刷新</span></button></div></header>
 <main class="content"><div class="flow-pane" id="flow-pane"></div><aside class="drawer" id="drawer"></aside>
 <template id="upgrade-card">上线内容：<span class="uc"></span> · 影响范围：<span class="ui"></span> · <button class="upgrade-start">升级至 v<span class="uv"></span></button> · <button class="upgrade-automatic">自动升级已开启</button></template>
@@ -374,7 +395,7 @@ const api=async(cmd,o)=>{
   // 页面在 LAN 面与签名面都从自身前缀下发命令：相对地址留在 /o/<token>/ 内，Bearer 仍是同一把老板令牌。
   const r=await fetch('owner/'+cmd,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+OWNER,'X-Owner-Agent':'web'},body:JSON.stringify({command:cmd,...o})});
   const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.statusText);return j;};
-let OWNER='';let ROUTES=[],TASKS=[],MESSAGES=[],INBOX=null,DEFS=[],SEL=null,CHAIN='',T='flow',PAUSED=false,NOTICES=[];
+let OWNER='';let ROUTES=[],TASKS=[],MESSAGES=[],INBOX=null,DEFS=[],SEL=null,CHAIN='',T='flow',PAUSED=false,NOTICES=[],PROGRESS=null;
 async function boot(){
   const x=await fetch('api/exchange',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pageToken:TOKEN})});
   const j=await x.json().catch(()=>({}));if(!x.ok)throw new Error(j.error||'exchange failed');OWNER=j.ownerToken;
@@ -386,10 +407,11 @@ async function onCommand(ev){
   // Only the first colon separates the command: ids and notice keys may themselves contain colons.
   const raw=String(el.dataset.cmd),cut=raw.indexOf(':');
   const cmd=cut<0?raw:raw.slice(0,cut),arg=cut<0?'':raw.slice(cut+1);
-  if(cmd==='tab'){T=arg;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.t===arg));$('crumb').textContent={flow:'消息流',inbox:'收件箱',defs:'编制',routes:'路由表',notes:'线的笔记'}[arg]||arg;render();}
+  if(cmd==='tab'){T=arg;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.t===arg));$('crumb').textContent={flow:'目标进度',inbox:'收件箱',defs:'编制',routes:'路由表',notes:'线的笔记'}[arg]||arg;render();}
   else if(cmd==='theme')toggleTheme();
   else if(cmd==='refresh')load();
   else if(cmd==='chain'){CHAIN=arg;SEL=null;render();}
+  else if(cmd==='bug'){SEL='b:'+arg;drawerBug(arg);}
   else if(cmd==='task'){SEL=arg;render();}
   else if(cmd==='msg'){SEL='m:'+arg;render();}
   else if(cmd==='save-msg')saveMsg(arg);
@@ -423,16 +445,75 @@ async function onCommand(ev){
 }
 async function load(){
   try{
-    const [nt,g,t,m,i,d,s,n]=await Promise.all([api('note.list',{}),api('route.list',{}),api('task.list',{}),api('message.list',{includeSent:true}),api('inbox',{}),api('def.list',{}),api('status',{}),api('notice.list',{})]);
-    NOTES=nt.notes||[];ROUTES=g.routes||[];TASKS=t.tasks||[];MESSAGES=m.messages||[];INBOX=i;DEFS=d.defs||[];NOTICES=n.notices||[];PAUSED=s.paused===true;
-    await refreshRetired();
+    const [pr,nt,g,t,m,i,d,s,n]=await Promise.all([api('progress',{}).catch(e=>({error:e.message})),api('note.list',{}),api('route.list',{}),api('task.list',{}),api('message.list',{includeSent:true}),api('inbox',{}),api('def.list',{}),api('status',{}),api('notice.list',{})]);
+    PROGRESS=pr;NOTES=nt.notes||[];ROUTES=g.routes||[];TASKS=t.tasks||[];MESSAGES=m.messages||[];INBOX=i;DEFS=d.defs||[];NOTICES=n.notices||[];PAUSED=s.paused===true;
     const n2=(INBOX.gates||[]).length+(INBOX.questions||[]).length;const b=$('nav-count');if(b){b.textContent=n2;b.hidden=!n2}
     $('stat').textContent=n2?('待办 '+n2):'运行中';$('stat').className='status'+(n2?' violet':'');
     const pb=$('pause-btn');if(pb)pb.textContent=PAUSED?'恢复派工':'暂停派工';
     render();
   }catch(e){$('stat').textContent='加载失败：'+e.message}
 }
-const laneY=r=>70+r*104;
+const BAND=96,BUG_ROW=48,BUG_MAX=12,STEP=196;
+const laneY=r=>BAND+70+r*104;
+const STATE_ZH={planned:'待开始',ready:'待开始',doing:'进行中',review:'复核中',blocked:'阻塞',done:'已完成',void:'已作废'};
+const BUG_ZH={fixing:'待修复',verifying:'待复验',fixed:'已修复',reopened:'修复未通过',dropped:'已放弃'};
+const clip=(s,n)=>{const t=String(s??'').replace(/\\s+/g,' ').trim();return t.length>n?t.slice(0,n-1)+'…':t};
+function duration(m){
+  if(m<60)return Math.max(1,Math.round(m))+' 分钟';
+  if(m<1440){const h=Math.floor(m/60),r=Math.round(m%60);return h+' 小时'+(r?' '+r+' 分':'')}
+  const d=Math.floor(m/1440),h=Math.round(m%1440/60);return d+' 天'+(h?' '+h+' 小时':'');
+}
+function clock(iso){const d=new Date(iso),p=n=>String(n).padStart(2,'0');return (d.getMonth()+1)+' 月 '+d.getDate()+' 日 '+p(d.getHours())+':'+p(d.getMinutes())}
+/** The selected chain, or the whole company when none is. */
+function progressScope(){
+  const c=CHAIN?(PROGRESS?.chains||[]).find(x=>x.root===CHAIN):null;
+  if(c)return c;
+  if(PROGRESS?.counts)return PROGRESS;
+  return {error:PROGRESS?.error||'没有返回进度数据',counts:{done:0,doing:0,waiting:0,blocked:0,total:0},forecast:{remainingMinutes:null,basis:'none',samples:0,ownerWaiting:0},defects:[]};
+}
+function forecastText(p){
+  const f=p.forecast,c=p.counts;
+  if(p.error)return {eta:'进度读取失败',why:p.error};
+  if(!c.total)return {eta:'还没有任务',why:''};
+  if(f.remainingMinutes===0)return {eta:'已全部完成',why:''};
+  if(f.remainingMinutes===null)return {eta:'暂无法预测',why:'还没有完成过的任务，第一项完成后开始预测'};
+  const base=f.basis==='chain'?'本链':'全公司';
+  return {eta:'预计还需 '+duration(f.remainingMinutes),
+    why:'约 '+clock(f.finishAt)+' 完成 · 按'+base+' '+f.samples+' 个已完成任务的中位耗时 '+duration(f.medianMinutes)+' 推算，只计已知任务'+(f.ownerWaiting?' · 其中 '+f.ownerWaiting+' 项等你决定':'')};
+}
+function progressBand(W){
+  const p=progressScope(),c=p.counts,x=20,w=W-40,t=forecastText(p);
+  const open=(p.defects||[]).filter(d=>d.state==='fixing'||d.state==='verifying').length,fixed=(p.defects||[]).filter(d=>d.state==='fixed').length;
+  const title=CHAIN?(p.title||'任务链'):'全部任务链';
+  let s='<text class="band-title" x="'+x+'" y="24">'+esc(clip(title,48))+'</text>';
+  s+='<text class="band-eta" x="'+x+'" y="52">'+esc(t.eta)+'</text>';
+  s+='<text class="band-meta" x="'+(x+240)+'" y="51">'+esc(t.why)+'</text>';
+  s+='<rect class="bar-track" x="'+x+'" y="64" width="'+w+'" height="6" rx="3"/>';
+  let at=x;const seg=(n,cls)=>{if(!c.total||!n)return;const sw=w*n/c.total;s+='<rect class="'+cls+'" x="'+at+'" y="64" width="'+sw+'" height="6"/>';at+=sw};
+  seg(c.done,'bar-done');seg(c.doing,'bar-doing');seg(c.blocked,'bar-blocked');
+  s+='<text class="band-count" x="'+x+'" y="88">已完成 '+c.done+' · 进行中 '+c.doing+' · 待开始 '+c.waiting+' · 阻塞 '+c.blocked+' · 缺陷待处理 '+open+' · 已修复 '+fixed+'</text>';
+  return s;
+}
+function bugBand(top,W){
+  const list=(progressScope().defects||[]);
+  const cols=[20,104,270];
+  let s='<line class="lane-line" x1="16" y1="'+top+'" x2="'+(W-16)+'" y2="'+top+'"/>';
+  s+='<text class="band-title" x="20" y="'+(top+24)+'">缺陷与修复</text>';
+  if(!list.length)return s+'<text class="band-meta" x="110" y="'+(top+24)+'">没有被退回的问题</text>';
+  ['状态','任务','问题与修复方案'].forEach((h,i)=>{s+='<text class="bug-head" x="'+cols[i]+'" y="'+(top+46)+'">'+h+'</text>'});
+  const tw=Math.floor((W-cols[2]-24)/11.5);
+  list.slice(0,BUG_MAX).forEach((d,i)=>{
+    const y=top+54+i*BUG_ROW;
+    s+='<g class="bug-row" data-cmd="bug:'+esc(d.id)+'"><rect x="16" y="'+y+'" width="'+(W-32)+'" height="'+BUG_ROW+'"/>';
+    s+='<text class="bug-state '+esc(d.state)+'" x="'+cols[0]+'" y="'+(y+19)+'">'+esc(BUG_ZH[d.state]||d.state)+'</text>';
+    s+='<text class="bug-text" x="'+cols[1]+'" y="'+(y+19)+'">'+esc(clip(d.taskTitle,13))+'</text>';
+    s+='<text class="bug-text" x="'+cols[2]+'" y="'+(y+19)+'">'+esc(clip(d.problem,tw))+'</text>';
+    s+='<text class="band-meta" x="'+cols[2]+'" y="'+(y+37)+'">'+esc(clip(d.fix?'修复：'+d.fix:'还没有修复方案',tw))+'</text></g>';
+  });
+  if(list.length>BUG_MAX)s+='<text class="band-meta" x="20" y="'+(top+54+BUG_MAX*BUG_ROW+18)+'">另有 '+(list.length-BUG_MAX)+' 条，选中任务链查看</text>';
+  return s;
+}
+function bugBandHeight(){const n=(progressScope().defects||[]).length;return n?60+Math.min(n,BUG_MAX)*BUG_ROW+(n>BUG_MAX?30:12):42}
 function graph(){
   const kids=new Map(),byId=new Map();
   for(const t of TASKS){const tid=String(t.id?.id??t.id);byId.set(tid,t);const p=t.parent?String(t.parent?.id??t.parent):'';if(p){if(!kids.has(p))kids.set(p,[]);kids.get(p).push(tid)}}
@@ -440,21 +521,27 @@ function graph(){
   const chainIds=CHAIN?new Set(chainOf(CHAIN)):null;
   const visible=chainIds?TASKS.filter(t=>chainIds.has(String(t.id?.id??t.id))):TASKS.slice(0,60);
   const lanes=[...new Set(['owner',...visible.flatMap(t=>[t.executor_role,t.reviewer_role].filter(Boolean))])].slice(0,12);
-  const W=1180,H=Math.max(320,lanes.length*104+60);
-  let svg='<svg class="graph" viewBox="0 0 '+W+' '+H+'" width="'+W+'" height="'+H+'" role="img" aria-label="消息流">';
+  // Each lane fills from the left, so a long chain stays on screen; the bands use the visible width, never the scroll width.
+  const seat=new Map(),used=new Map();
+  visible.forEach(t=>{const n=used.get(t.executor_role)||0;used.set(t.executor_role,n+1);seat.set(String(t.id?.id??t.id),180+n*STEP)});
+  const V=Math.max(760,($('flow-pane')?.clientWidth||1180)-42),W=Math.max(V,Math.max(0,...used.values())*STEP+260),lanesEnd=BAND+lanes.length*104+40,H=lanesEnd+bugBandHeight();
+  let svg='<svg class="graph" viewBox="0 0 '+W+' '+H+'" width="'+W+'" height="'+H+'" role="img" aria-label="目标进度与消息流">'+progressBand(V);
   lanes.forEach((l,r)=>{const y=laneY(r);svg+='<line class="lane-line" x1="16" y1="'+y+'" x2="'+(W-16)+'" y2="'+y+'"/><text class="lane-label" x="20" y="'+(y-12)+'">'+esc(l)+'</text>'});
   const pos=r=>laneY(Math.max(0,lanes.indexOf(r)));
   visible.forEach((t,n)=>{
-    const x=180+(n%5)*196,y=pos(t.executor_role),ry=pos(t.reviewer_role);
+    const x=seat.get(String(t.id?.id??t.id)),y=pos(t.executor_role),ry=pos(t.reviewer_role);
     const msgs=MESSAGES.filter(m=>String(m.task?.id??m.task??'')===String(t.id?.id??t.id));
     const held=msgs.some(m=>m.hold||m.state==='held'),blocked=t.state==='blocked',sent=msgs.some(m=>m.state==='sent');
-    const cls=blocked?'block':held?'hold':t.state==='doing'?'active':'';
+    const cls=blocked?'block':held?'hold':t.state==='done'?'done':['doing','review'].includes(t.state)?'active':'';
     const tid=esc(String(t.id?.id??t.id));
     const planned=t.state==='planned';
     svg+='<g class="flow-node" data-cmd="task:'+tid+'" style="cursor:pointer">';
     svg+='<rect class="node-box '+(planned?'hold':cls)+'" x="'+(x-72)+'" y="'+(y-24)+'" width="144" height="48" rx="9" '+(planned?'stroke-dasharray="6 4"':'')+'/>';
     svg+='<text class="node-title" x="'+(x-62)+'" y="'+(y-3)+'">'+esc((t.title||'任务').slice(0,15))+'</text>';
-    svg+='<text class="node-meta" x="'+(x-62)+'" y="'+(y+14)+'">'+esc(t.state||'')+' · '+esc(t.executor_role||'')+'</text></g>';
+    svg+='<text class="node-meta" x="'+(x-62)+'" y="'+(y+14)+'">'+esc(STATE_ZH[t.state]||t.state||'')+' · '+esc(t.executor_role||'')+'</text>';
+    const bugs=(PROGRESS?.defects||[]).filter(d=>d.taskId===String(t.id?.id??t.id)&&(d.state==='fixing'||d.state==='verifying')).length;
+    if(bugs)svg+='<circle class="bug-badge" cx="'+(x+68)+'" cy="'+(y-24)+'" r="8"/><text class="bug-badge-text" x="'+(x+65)+'" y="'+(y-21)+'">'+bugs+'</text>';
+    svg+='</g>';
     const ex=x+72,ey=ry-24;
     const path='M'+ex+' '+y+' C'+(ex+48)+' '+y+','+(x+120)+' '+ey+','+(x+170)+' '+ey;
     const edgeCls=sent?(blocked?'block':''):held?'hold':'draft';
@@ -462,11 +549,19 @@ function graph(){
     svg+='<path class="edge-hit" data-cmd="task:'+tid+'" d="'+path+'"/>';
     if(sent&&!held&&!blocked)svg+='<circle class="dot" r="3.5"><animateMotion dur="3s" repeatCount="indefinite" path="'+path+'"/></circle>';
     if(t.parent){const pid=String(t.parent?.id??t.parent);const pi=visible.findIndex(o=>String(o.id?.id??o.id)===pid);
-      if(pi>=0){const px=180+(pi%5)*196,py=pos(visible[pi].executor_role);
+      if(pi>=0){const px=seat.get(pid),py=pos(visible[pi].executor_role);
         const pp='M'+px+' '+py+' C'+px+' '+(py+60)+','+x+' '+(y-70)+','+x+' '+(y-26);
         svg+='<path class="edge '+(t.state==='planned'?'hold':'')+'" stroke-dasharray="'+(t.state==='planned'?'6 4':'none')+'" d="'+pp+'"/>'}}
   });
-  svg+='</svg>';return svg;
+  svg+=bugBand(lanesEnd,V)+'</svg>';return svg;
+}
+function drawerBug(id){
+  const d=(PROGRESS?.defects||[]).find(x=>x.id===id);
+  if(!d){$('drawer').innerHTML='<p class="meta">缺陷不存在</p>';return}
+  $('drawer').innerHTML='<div class="kicker">DEFECT</div><h2>'+esc(d.taskTitle)+'</h2><p class="meta">'+esc(BUG_ZH[d.state]||d.state)+' · '+esc(d.foundBy)+' · '+esc(clock(d.foundAt))+'</p>'
+    +'<section><h3>问题</h3><pre>'+esc(d.problem)+'</pre></section>'
+    +'<section><h3>修复方案</h3>'+(d.fix?'<pre>'+esc(d.fix)+'</pre><p class="meta">'+esc(d.fixedBy||'')+' · '+esc(clock(d.fixedAt))+'</p>':'<p class="meta">还没有提交修复</p>')+'</section>'
+    +'<section><div class="row"><button data-cmd="task:'+esc(d.taskId)+'">查看任务</button></div></section>';
 }
 function drawerDefault(){
   const drafts=MESSAGES.filter(m=>m.state!=='sent');
@@ -525,16 +620,22 @@ async function saveReassign(id){
   if(note.length<1){toast('请填写改派说明');return}
   await api('task.reassign',{taskId:id,executorRole,reviewerRole,note});toast('已改派');SEL=id;await load();
 }
+function chainNote(id,task,total){
+  const c=(PROGRESS?.chains||[]).find(x=>x.root===id);
+  const m=c?.forecast?.remainingMinutes;
+  if(m===0)return '已完成 · '+total+' 个任务';
+  return (m?'还需 '+duration(m):STATE_ZH[task.state]||task.state||'')+' · '+(c?.counts?.done??0)+'/'+total+' 完成';
+}
 function renderFlow(){
   const roots=TASKS.filter(t=>!t.parent);
   const countOf=r=>{let n=0;const walk=id=>{TASKS.filter(t=>t.parent&&String(t.parent?.id??t.parent)===id).forEach(t=>{n++;walk(String(t.id?.id??t.id))})};walk(r);return n};
   const rail='<div class="chain-rail"><button class="chain-chip '+(CHAIN?'':'active')+'" data-cmd="chain:"><strong>全部任务链</strong><small>'+roots.length+' 条链</small></button>'
     +roots.slice(0,30).map(g=>{const gid=String(g.id?.id??g.id),active=CHAIN===gid;
-      return '<div class="chain-chip '+(active?'active':'')+'" data-cmd="chain:'+esc(gid)+'" role="button" tabindex="0"><strong>'+esc((g.title||'').slice(0,20))+'</strong><small>'+esc(g.state||'')+' · '+(countOf(gid)+1)+' 个任务</small></div>';
+      return '<div class="chain-chip '+(active?'active':'')+'" data-cmd="chain:'+esc(gid)+'" role="button" tabindex="0"><strong>'+esc((g.title||'').slice(0,20))+'</strong><small>'+esc(chainNote(gid,g,countOf(gid)+1))+'</small></div>';
     }).join('')+'</div>';
-  $('flow-pane').innerHTML='<div class="flow-head"><h1>消息流</h1><div class="flow-legend"><span><i></i>已发</span><span><i class="dash"></i>待发 draft</span><span><i class="hold"></i>需要我放行</span><span><i class="block"></i>阻塞到老板</span></div><div class="row"><button class="primary small" data-cmd="new-task">+ 新增任务</button><button class="small" data-cmd="tab:routes">路由表</button></div></div>'
+  $('flow-pane').innerHTML='<div class="flow-head"><h1>目标进度</h1><div class="flow-legend"><span><i></i>已发</span><span><i class="dash"></i>待发 draft</span><span><i class="hold"></i>需要我放行</span><span><i class="block"></i>阻塞到老板</span></div><div class="row"><button class="primary small" data-cmd="new-task">+ 新增任务</button><button class="small" data-cmd="tab:routes">路由表</button></div></div>'
     +rail+'<div class="graph-scroll">'+graph()+'</div>';
-  if(SEL)SEL.startsWith('m:')?drawerMsg(SEL.slice(2)):drawerTask(SEL);else drawerDefault();
+  if(SEL)SEL.startsWith('m:')?drawerMsg(SEL.slice(2)):SEL.startsWith('b:')?drawerBug(SEL.slice(2)):drawerTask(SEL);else drawerDefault();
 }
 async function togglePause(){
   await api(PAUSED?'task.resume':'task.pause',{});PAUSED=!PAUSED;toast(PAUSED?'已暂停派工':'已恢复派工');await load();
