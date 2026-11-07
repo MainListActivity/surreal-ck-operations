@@ -42,6 +42,9 @@ export interface RelayPalette {
   sidebarActive: string;
   shadow: string;
   shadowLg: string;
+  /** 页签/浮层的细分阴影。 */
+  shadowTab: string;
+  shadowToast: string;
   /** 图表主色与柔色。 */
   chart: string;
   chartSoft: string;
@@ -51,6 +54,10 @@ export interface RelayPalette {
   /** 品牌渐变起止色。 */
   brandFrom: string;
   brandTo: string;
+  /** 强调色上的文字（网页按钮/徽章）。 */
+  onAccent: string;
+  /** Paseo 面板强调按钮上的文字（深色主题用深字压在浅紫上）。 */
+  accentInk: string;
 }
 
 export const RELAY_LIGHT: RelayPalette = {
@@ -62,6 +69,8 @@ export const RELAY_LIGHT: RelayPalette = {
   sidebar: "#16171b", sidebarText: "#e9e9ec", sidebarMuted: "#888b94", sidebarHover: "#202127", sidebarActive: "#2b2837",
   shadow: "0 12px 34px rgba(27,29,36,.055)", shadowLg: "0 24px 70px rgba(27,29,36,.09)",
   chart: "#7662df", chartSoft: "#dcd6fc", toastBg: "#222329", toastBorder: "#3d3e45", brandFrom: "#9583f3", brandTo: "#6650c4",
+  shadowTab: "0 2px 8px rgba(20,22,28,.08)", shadowToast: "0 14px 40px rgba(0,0,0,.28)",
+  onAccent: "#ffffff", accentInk: "#ffffff",
 };
 
 export const RELAY_DARK: RelayPalette = {
@@ -73,6 +82,8 @@ export const RELAY_DARK: RelayPalette = {
   sidebar: "#111216", sidebarText: "#eeeef0", sidebarMuted: "#858892", sidebarHover: "#1d1f24", sidebarActive: "#29253a",
   shadow: "0 12px 34px rgba(0,0,0,.22)", shadowLg: "0 24px 70px rgba(0,0,0,.34)",
   chart: "#9784ff", chartSoft: "#3b345f", toastBg: "#222329", toastBorder: "#3d3e45", brandFrom: "#9583f3", brandTo: "#6650c4",
+  shadowTab: "0 2px 8px rgba(20,22,28,.16)", shadowToast: "0 14px 40px rgba(0,0,0,.34)",
+  onAccent: "#ffffff", accentInk: "#1c1830",
 };
 
 /** 字号阶梯（px）：只认这一组，页面/面板共用。 */
@@ -128,6 +139,24 @@ export const RELAY_SPACE = {
   section: 24,
 } as const;
 
+/**
+ * 数值阶梯：CSS 里每个 font-size / border-radius / padding / margin / gap 都引用
+ * 由这些数组生成的 `--relay-fs-N` / `--relay-r-N` / `--relay-sp-N`，
+ * 页面里不再出现裸 px。新增值只在这里改。
+ */
+export const RELAY_FONT_PX = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 23, 26, 30] as const;
+export const RELAY_RADIUS_PX = [4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 22, 99] as const;
+export const RELAY_SPACE_PX = [...Array.from({ length: 49 }, (_, i) => i), 49, 50, 56, 60, 69, 70] as const;
+
+/** 由数值阶梯生成 CSS 自定义属性串。 */
+export function scaleToCssVars(): string {
+  return [
+    ...RELAY_FONT_PX.map(n => `--relay-fs-${n}:${n}px;`),
+    ...RELAY_RADIUS_PX.map(n => `--relay-r-${n}:${n}px;`),
+    ...RELAY_SPACE_PX.map(n => `--relay-sp-${n}:${n}px;`),
+  ].join("");
+}
+
 /** 把色板铺成 CSS 自定义属性串（`--relay-foo:val;`）。 */
 export function paletteToCssVars(p: RelayPalette): string {
   const map: Record<string, string> = {
@@ -138,8 +167,9 @@ export function paletteToCssVars(p: RelayPalette): string {
     danger: p.danger, "danger-soft": p.dangerSoft, "danger-border": p.dangerBorder,
     warning: p.warning, "warning-soft": p.warningSoft, blue: p.blue, "blue-soft": p.blueSoft,
     sidebar: p.sidebar, "sidebar-text": p.sidebarText, "sidebar-muted": p.sidebarMuted, "sidebar-hover": p.sidebarHover, "sidebar-active": p.sidebarActive,
-    shadow: p.shadow, "shadow-lg": p.shadowLg, chart: p.chart, "chart-soft": p.chartSoft,
+    shadow: p.shadow, "shadow-lg": p.shadowLg, "shadow-tab": p.shadowTab, "shadow-toast": p.shadowToast, chart: p.chart, "chart-soft": p.chartSoft,
     "toast-bg": p.toastBg, "toast-border": p.toastBorder, "brand-from": p.brandFrom, "brand-to": p.brandTo,
+    "on-accent": p.onAccent, "accent-ink": p.accentInk,
   };
   return Object.entries(map).map(([k, v]) => `--relay-${k}:${v};`).join("");
 }
@@ -150,12 +180,12 @@ export const previewListCss = `
 :root[data-theme="dark"]{${paletteToCssVars(RELAY_DARK)}}
 @media(prefers-color-scheme:dark){:root:not([data-theme="light"]){${paletteToCssVars(RELAY_DARK)}}}
 @media(prefers-color-scheme:light){:root:not([data-theme="dark"]){${paletteToCssVars(RELAY_LIGHT)}}}
-body{font:${RELAY_FONT.body}px/1.8 Inter,"SF Pro Text","PingFang SC","Microsoft YaHei",system-ui,sans-serif;margin:0 auto;max-width:760px;padding:24px;background:var(--relay-bg);color:var(--relay-text)}
+body{font:var(--relay-fs-12)/1.8 Inter,"SF Pro Text","PingFang SC","Microsoft YaHei",system-ui,sans-serif;margin:0 auto;max-width:760px;padding:var(--relay-sp-24);background:var(--relay-bg);color:var(--relay-text)}
 a{color:var(--relay-score);word-break:break-all;text-decoration:none}
-h1{font-size:${RELAY_FONT.h1}px;margin:0 0 14px;letter-spacing:-.02em}
-ul{list-style:none;padding:0;margin:0;border:1px solid var(--relay-border);border-radius:${RELAY_RADIUS.lg}px;background:var(--relay-panel);overflow:hidden}
-li{display:flex;align-items:baseline;gap:8px;padding:9px 13px;border-top:1px solid var(--relay-border)}
+h1{font-size:var(--relay-fs-18);margin:0 0 var(--relay-sp-14);letter-spacing:-.02em}
+ul{list-style:none;padding:0;margin:0;border:1px solid var(--relay-border);border-radius:var(--relay-r-12);background:var(--relay-panel);overflow:hidden}
+li{display:flex;align-items:baseline;gap:var(--relay-sp-8);padding:var(--relay-sp-9) var(--relay-sp-13);border-top:1px solid var(--relay-border);font-size:var(--relay-fs-12)}
 li:first-child{border-top:0}
 li:hover{background:var(--relay-row-hover)}
-.sz{color:var(--relay-faint);font-size:${RELAY_FONT.caption}px;margin-left:auto;white-space:nowrap}
+.sz{color:var(--relay-faint);font-size:var(--relay-fs-10);margin-left:auto;white-space:nowrap}
 `;

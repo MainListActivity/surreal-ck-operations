@@ -28,7 +28,7 @@ function toClientPalette(t: SharedPalette, light: boolean): RelayPalette {
     core: {
       surface0: t.bg, surface1: t.panel, surface2: t.input, foreground: t.text,
       foregroundMuted: t.muted, border: t.border, accent: t.accent,
-      accentForeground: light ? "#ffffff" : "#1c1830",
+      accentForeground: t.accentInk,
     },
     inputBg: t.input,
     score: t.score,

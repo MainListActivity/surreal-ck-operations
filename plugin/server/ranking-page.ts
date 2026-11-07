@@ -18,7 +18,7 @@ export const rankingPage = `<!doctype html><html lang="zh-CN"><head><meta charse
 <div class="main-area">
 <header class="topbar">
 <div class="breadcrumb"><span>公司审核台</span><b>/</b><strong>模型排序</strong></div>
-<div class="top-actions"><button class="icon-button theme-toggle" id="theme-btn" onclick="toggleTheme()" aria-label="切换主题"></button></div>
+<div class="top-actions"><button class="icon-button theme-toggle" id="theme-btn" aria-label="切换主题">${relayIcon("moon")}<span class="theme-label">深色</span></button></div>
 </header>
 <main class="content">
 <header class="page-title"><div><p class="kicker">MODEL ROUTING</p><h1>模型排序</h1><p class="page-copy">评分、真实实测与模型管理。Haiku / Sonnet 自动排序，Opus / Fable 保持手动。</p></div><div class="sync-state"><span class="sync-dot"></span><span id="updated">正在读取…</span></div></header>

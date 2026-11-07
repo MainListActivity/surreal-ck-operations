@@ -1,5 +1,6 @@
 import { test, expect } from 'bun:test';
 import { readFileSync } from 'node:fs';
+import { relayShellCss } from '../plugin/shared/relay-shell.ts';
 
 const consoleSrc = readFileSync('plugin/server/console.ts', 'utf8');
 const script = /<script>([\s\S]*?)<\/script>/.exec(consoleSrc)?.[1] ?? '';
@@ -47,6 +48,7 @@ test('the console actually loads: every name its load path calls exists at runti
       forecast: { remainingMinutes: 0, basis: 'company', samples: 1, ownerWaiting: 0 },
       chains: [{ root: 'r1', title: '链一', taskIds: ['r1'], defects: [], counts: { done: 1, doing: 0, waiting: 0, blocked: 0, total: 1 }, forecast: { remainingMinutes: 0, basis: 'chain', samples: 1, ownerWaiting: 0 } }] };
     const responses: Record<string, unknown> = { 'api/exchange': { ownerToken: 'fixture' }, 'owner/progress': progress,
+      'owner/inbox': { gates: [], questions: [], notices: [], upgrades: { current: { version: '9.9.9', sha: 'a'.repeat(40) }, items: [] } },
       'owner/task.list': { tasks: [{ id: 'task:⟨r1⟩', title: '链一', state: 'done', executor_role: 'product', reviewer_role: 'qa' }] } };
     const fetchStub = async (path: string) => new Response(JSON.stringify(responses[path] ?? {}), { status: 200 });
     const windowStub = { addEventListener() {}, matchMedia: () => ({ matches: false }), location: { href: url + '/', search: '', pathname: new URL(url).pathname + '/' } };
@@ -57,5 +59,25 @@ test('the console actually loads: every name its load path calls exists at runti
     expect(String(element('stat').textContent)).toBe('运行中');
     expect(String(element('flow-pane').innerHTML)).toContain('目标进度');
     expect(String(element('flow-pane').innerHTML)).toContain('已完成 · 1 个任务');
+    // AC3: the sidebar shows the installed release, never a literal.
+    expect(String(element('release-ver').textContent)).toBe('控制面 · v9.9.9');
+    // AC4: the theme switch is never an empty icon-only button.
+    expect(String(element('theme-btn').innerHTML)).toContain('theme-label');
   } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+
+test('console ships the shared design tokens, a labelled theme switch and a styled .small button', () => {
+  // AC1: colours/sizes come from the shared token file; the shell CSS only re-exports them as variables.
+  expect(relayShellCss).toContain('--relay-bg:#0e0f12');
+  expect(relayShellCss).toContain('--relay-fs-12:12px');
+  expect(relayShellCss).toContain('--relay-r-9:9px');
+  expect(relayShellCss).toContain('--relay-sp-8:8px');
+  // AC4: the route-table button's `.small` class is defined, and both theme buttons carry text.
+  expect(relayShellCss).toContain('.small{');
+  expect(relayShellCss).toContain('.theme-label');
+  expect(consoleSrc).toContain('class="icon-button theme-toggle"');
+  expect(consoleSrc).toContain('theme-label">深色');
+  // AC3: no hard-coded release number remains in the console source.
+  expect(consoleSrc).not.toContain('v0.3.79');
 });
