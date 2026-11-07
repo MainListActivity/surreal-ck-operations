@@ -36,7 +36,7 @@ describe('the release notes are registrable', () => {
     expect(notes.version).toBe(pluginPkg.version);
   });
 
-  test('the notes name the schema 053 table', () => {
+  test('the notes name the schema they reuse', () => {
     const text = JSON.stringify(notes);
     expect(text).toContain('lane_note');
     expect(text).toContain('053');

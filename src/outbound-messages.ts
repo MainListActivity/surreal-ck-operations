@@ -27,7 +27,7 @@ export const DEFAULT_MACHINE_CRITERION = 'AC-BASE-DEPLOY-1';
 
 /** 表里保存短正文；派工时 renderMessage 才补上真实路径、工具绝对路径与任务 ID。 */
 const NOTES = `先读 notes.md。`;
-const LEARNED = `有长期可复用的要求、方法或坑，就加 learned 数组（最多 5 条，每条一行，不写本次结论）。`;
+const LEARNED = `多数任务不需要写笔记；只有今后同职能的任务都用得上的要求、方法或坑，才加 learned 数组（最多 5 条，每条一行，不写本次任务的内容）。`;
 const EXECUTE_CODE = `${NOTES}实现 task.md 中的需求，合入并发布到生产，按验收标准在生产逐条自验，全部通过后：sck call submit '{"text":"<结果>","sha":"<合入提交>"}'。需要后续任务时在 submit 里加 next 数组。${LEARNED}`;
 const EXECUTE_PLAIN = `${NOTES}完成 task.md 中的需求，按验收标准自验后：sck call submit '{"text":"<结果>"}'。需要后续任务时在 submit 里加 next 数组。${LEARNED}`;
 /** 内容线（故事/视频等）的复核不涉及生产发布；软件线的复核才按生产环境逐条复验。 */

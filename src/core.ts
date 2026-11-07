@@ -938,7 +938,9 @@ export class SurrealCompanyCore implements CompanyCore {
         version = IF $same THEN $t.version ELSE $t.version + 1 END,
         worktree = IF $assignment != NONE THEN $assignment ELSE $t.worktree END
         RETURN AFTER;
-      UPDATE ONLY $actor SET active_task = $task, workspace_read_active = false;
+      UPDATE ONLY $actor SET active_task = $task, workspace_read_active = false, last_task = $task,
+        last_phase = IF $t.state = 'review' THEN 'review' ELSE 'execute' END,
+        lane = string::concat(IF $t.project != NONE THEN <string>record::id($t.project) ELSE 'company' END, ':', $who.role);
       IF $assignment != NONE {
         UPDATE ONLY $tree SET last_used_at = time::now();
         UPSERT ONLY $reference CONTENT { task: $task, tree: $tree, employee: $employee,

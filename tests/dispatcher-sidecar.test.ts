@@ -52,6 +52,7 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
     }, openPendingWakes: async () => [],
     retireIdle: async (inst: EmployeeInst) => { events.push(`retire:${inst.id}:rotation`); retired.add(inst.id); },
     touchWake: async () => {}, defHealthy: async () => {},
+    sessionTaskFacts: async () => ({ states: new Map([...views].map(([id, v]) => [id, v.state as string])), followUps: [] }),
     markExhausted: async (provider: string, _error: string, resetsAt?: number) => {
       events.push(`exhausted:${provider}`);
       health = new Map(health).set(provider, { provider, state: 'exhausted', until: resetsAt ?? now + 1800, failures: 1 });
@@ -418,6 +419,37 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     w.setNow(1000 + 11 * 60);
     await d.tick();
     expect(d.sessionSnapshot().sessions.get('employee-9')?.state).toBe('down');
+  });
+  test('oneshot: a new task opens a new session, its own session continues it, and a finished session ends', async () => {
+    const w = world();
+    w.setConfig({ sessionPolicy: 'oneshot' });
+    w.addTask('first'); await w.dispatcher().tick();
+    const old = w.instances[0]!;
+    Object.assign(old, { lastTask: 'first', lastPhase: 'execute', activeTask: undefined });
+    Object.assign(w.views.get('first')!, { state: 'done', currentEmployee: undefined });
+    Object.assign(w.rows.find(t => t.id === 'first')!, { state: 'done', currentEmployee: undefined });
+    w.rows.splice(w.rows.findIndex(t => t.id === 'first'), 1);
+    w.agents.get(old.paseoAgentId!)!.status = 'idle';
+    w.addTask('second');
+    const report = await w.dispatcher().tick();
+    expect(report.retired).toContain(old.id);
+    expect(report.woke.find(entry => entry.task === 'second')).toMatchObject({ spawned: true });
+    expect(w.events).not.toContain(`claim:${old.id}:second`);
+  });
+  test('oneshot: an idle session with another task\'s context is not reused; reuse policy still does', async () => {
+    const run = async (policy: 'reuse' | 'oneshot') => {
+      const w = world();
+      w.addTask('first'); await w.dispatcher().tick();
+      const old = w.instances[0]!;
+      expect((await w.relay(w.envs.get(old.paseoAgentId!)!, 'submit', { text: 'fixture' })).ok).toBe(true);
+      Object.assign(old, { lastTask: 'open', lastPhase: 'execute', activeTask: undefined });
+      w.agents.get(old.paseoAgentId!)!.status = 'idle';
+      w.setConfig({ sessionPolicy: policy });
+      w.addTask('open-next');
+      return { spawned: (await w.dispatcher().tick()).woke.find(entry => entry.task === 'open-next')?.spawned };
+    };
+    expect(await run('oneshot')).toEqual({ spawned: true });
+    expect(await run('reuse')).toEqual({ spawned: false });
   });
   test('a per-role wake limit rotates that role sooner and leaves the global limit for the rest', async () => {
     const w = world();

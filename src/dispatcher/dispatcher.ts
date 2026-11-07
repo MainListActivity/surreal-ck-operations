@@ -15,7 +15,7 @@ import { agingLevel, agingText, localDate, renderBrief, type RoleCapacity } from
 import type { ReclaimResult } from './worktree-registry.ts';
 import type { ReclaimTrigger } from './worktree-reclaim.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
-import { reclaimIdleSessions } from './idle-sessions.ts';
+import { continuitySession, finishedSessions, reclaimIdleSessions } from './idle-sessions.ts';
 import { observeRuntimeIdle, reclaimMemoryLru } from './memory-lru.ts';
 import { memoryBlocked, resourceBlocks, type HostResources } from './host.ts';
 import type { ArtifactTrigger } from './artifact-reclaim.ts';
@@ -1122,6 +1122,18 @@ export class Dispatcher {
         }).catch(error => { this.log(`idle cleanup failed safely: ${(error as Error).message}`); return [] as string[]; });
         report.retired.push(...idleRetired);
       }
+      if (rotationSafe && cfg.sessionPolicy === 'oneshot' && typeof wf.sessionTaskFacts === 'function') {
+        const live = insts.filter(inst => inst.lastTask && !report.retired.includes(inst.id));
+        const facts = live.length ? await wf.sessionTaskFacts([...new Set(live.map(inst => inst.lastTask!))])
+          .catch(error => { this.log(`finished sessions unread: ${(error as Error).message}`); return undefined; }) : undefined;
+        for (const inst of facts ? finishedSessions({ instances: live, states, held: holding, facts }) : []) {
+          if (!await this.retireGated(inst, '一次性会话：任务已结束', 'rotation', report)) continue;
+          await paseo.archive(inst.paseoAgentId!).catch(() => undefined);
+          await this.archiveInstScene(inst);
+          report.retired.push(inst.id);
+          this.log(`retired ${inst.id}: task ${inst.lastTask} finished`);
+        }
+      }
       let inspected = 0;
       for (const inst of insts) {
         if (!rotationSafe) break;
@@ -1349,6 +1361,8 @@ export class Dispatcher {
       exclusion?: ReviewExclusion, anchorHome?: string) => {
       const home = task?.repoPath ?? anchorHome ?? this.deps.env.opsRepo;
       const eligible = eligibleInsts(role, home, task, excludeSubmitter, exclusion);
+      // Oneshot: a task never lands on an unrelated session's context. No continuing session means a new one.
+      if (cfg.sessionPolicy === 'oneshot' && task && role !== 'eval') return continuitySession(eligible, states, task, excludeSubmitter);
       const factory = eligible.filter(i => i.provider === FACTORY_PROVIDER);
       const candidates = factory.length ? factory : eligible;
       // A prior hand is demoted in the weighted pick (PRIOR_HAND_WEIGHT_FACTOR), exactly as in the pool.
@@ -1667,7 +1681,9 @@ export class Dispatcher {
     const candidate = pick(role, scopeTask, avoid, forReview, exclusion, anchor?.home);
     // A free Factory seat is used before an idle Claude session. Once Factory has no admitted
     // reuse or spawn candidate (quota, health, capacity, exclusion), ordinary fallback takes over.
-    const picked = candidate?.provider !== FACTORY_PROVIDER && defsOrdered.some(d=>d.provider===FACTORY_PROVIDER) ? undefined : candidate;
+    // A session continuing its own work keeps it: its context is why it was picked.
+    const continuing = candidate !== undefined && (await wf.config()).sessionPolicy === 'oneshot';
+    const picked = !continuing && candidate?.provider !== FACTORY_PROVIDER && defsOrdered.some(d=>d.provider===FACTORY_PROVIDER) ? undefined : candidate;
     // A legacy credential-file session can't be sidecar-claimed for new work; let
     // it finish what it holds and fall through to spawning a comm-mode instance.
     const pending = sidecar && picked && !picked.paseoAgentId ? picked : undefined;

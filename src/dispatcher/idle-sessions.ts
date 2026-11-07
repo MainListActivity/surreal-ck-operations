@@ -1,5 +1,35 @@
-import type { EmployeeInst, Workforce } from '../workforce.ts';
+import { asId } from '../core.ts';
+import { laneOf } from '../lane-notes.ts';
+import type { EmployeeInst, SessionTaskFacts, SupervisedTask, Workforce } from '../workforce.ts';
 import type { PaseoGateway } from './paseo.ts';
+
+const waiting = (state: string | undefined) => state === 'idle' || state === 'sleeping';
+
+/**
+ * The session oneshot lets continue a task: the one that last worked this task in this phase (rework, a repeat review,
+ * a resume), else, for execution, the parent's executor while it has taken nothing since and the lane matches. Taking the
+ * first follow-up moves its last task, so a sibling opens a new session. Anything else starts fresh.
+ */
+export function continuitySession(sessions: readonly EmployeeInst[], states: ReadonlyMap<string, string>, task: SupervisedTask, forReview: boolean): EmployeeInst | undefined {
+  const live = sessions.filter(inst => waiting(states.get(inst.id)));
+  const phase = forReview ? 'review' : 'execute';
+  const same = live.filter(inst => inst.lastTask === task.id && inst.lastPhase === phase).sort((a, b) => (b.lastWakeAt ?? 0) - (a.lastWakeAt ?? 0))[0];
+  if (same || forReview) return same;
+  const row = task.row as { parent?: unknown; project?: unknown };
+  if (!row?.parent) return undefined;
+  const lane = laneOf(row.project ? asId(row.project) : undefined, task.executorRole);
+  return live.find(inst => inst.lastTask === asId(row.parent) && inst.lastPhase === 'execute' && inst.lane === lane);
+}
+
+/** Sessions oneshot ends: waiting, holding nothing, last task over, and no follow-up in their lane for them to continue. */
+export function finishedSessions(input: { instances: readonly EmployeeInst[]; states: ReadonlyMap<string, string>; held: ReadonlySet<string>; facts: SessionTaskFacts }): EmployeeInst[] {
+  return input.instances.filter(inst => {
+    if (!inst.lastTask || !inst.paseoAgentId || inst.activeTask || input.held.has(inst.id) || !waiting(input.states.get(inst.id))) return false;
+    const state = input.facts.states.get(inst.lastTask);
+    if (state !== undefined && state !== 'done' && state !== 'void') return false;
+    return !(inst.lastPhase === 'execute' && input.facts.followUps.some(next => next.parent === inst.lastTask && next.lane === inst.lane));
+  });
+}
 
 /** Only observed idle time counts. Busy/unknown observations and a fresh wake reset the timer. */
 export async function reclaimIdleSessions(input: {
