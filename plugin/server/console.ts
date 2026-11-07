@@ -457,6 +457,8 @@ const BAND=96,BUG_ROW=48,BUG_MAX=12,STEP=196;
 const laneY=r=>BAND+70+r*104;
 const STATE_ZH={planned:'待开始',ready:'待开始',doing:'进行中',review:'复核中',blocked:'阻塞',done:'已完成',void:'已作废'};
 const BUG_ZH={fixing:'待修复',verifying:'待复验',fixed:'已修复',reopened:'修复未通过',dropped:'已放弃'};
+/** task.list sends record IDs as task:⟨uuid⟩; progress sends the bare uuid. */
+const bare=v=>String(v??'').replace(/^task:/,'').replace(/^⟨|⟩$/g,'');
 const clip=(s,n)=>{const t=String(s??'').replace(/\\s+/g,' ').trim();return t.length>n?t.slice(0,n-1)+'…':t};
 function duration(m){
   if(m<60)return Math.max(1,Math.round(m))+' 分钟';
@@ -466,7 +468,7 @@ function duration(m){
 function clock(iso){const d=new Date(iso),p=n=>String(n).padStart(2,'0');return (d.getMonth()+1)+' 月 '+d.getDate()+' 日 '+p(d.getHours())+':'+p(d.getMinutes())}
 /** The selected chain, or the whole company when none is. */
 function progressScope(){
-  const c=CHAIN?(PROGRESS?.chains||[]).find(x=>x.root===CHAIN):null;
+  const c=CHAIN?(PROGRESS?.chains||[]).find(x=>x.root===bare(CHAIN)):null;
   if(c)return c;
   if(PROGRESS?.counts)return PROGRESS;
   return {error:PROGRESS?.error||'没有返回进度数据',counts:{done:0,doing:0,waiting:0,blocked:0,total:0},forecast:{remainingMinutes:null,basis:'none',samples:0,ownerWaiting:0},defects:[]};
@@ -539,7 +541,7 @@ function graph(){
     svg+='<rect class="node-box '+(planned?'hold':cls)+'" x="'+(x-72)+'" y="'+(y-24)+'" width="144" height="48" rx="9" '+(planned?'stroke-dasharray="6 4"':'')+'/>';
     svg+='<text class="node-title" x="'+(x-62)+'" y="'+(y-3)+'">'+esc((t.title||'任务').slice(0,15))+'</text>';
     svg+='<text class="node-meta" x="'+(x-62)+'" y="'+(y+14)+'">'+esc(STATE_ZH[t.state]||t.state||'')+' · '+esc(t.executor_role||'')+'</text>';
-    const bugs=(PROGRESS?.defects||[]).filter(d=>d.taskId===String(t.id?.id??t.id)&&(d.state==='fixing'||d.state==='verifying')).length;
+    const bugs=(PROGRESS?.defects||[]).filter(d=>d.taskId===bare(t.id?.id??t.id)&&(d.state==='fixing'||d.state==='verifying')).length;
     if(bugs)svg+='<circle class="bug-badge" cx="'+(x+68)+'" cy="'+(y-24)+'" r="8"/><text class="bug-badge-text" x="'+(x+65)+'" y="'+(y-21)+'">'+bugs+'</text>';
     svg+='</g>';
     const ex=x+72,ey=ry-24;
@@ -561,7 +563,7 @@ function drawerBug(id){
   $('drawer').innerHTML='<div class="kicker">DEFECT</div><h2>'+esc(d.taskTitle)+'</h2><p class="meta">'+esc(BUG_ZH[d.state]||d.state)+' · '+esc(d.foundBy)+' · '+esc(clock(d.foundAt))+'</p>'
     +'<section><h3>问题</h3><pre>'+esc(d.problem)+'</pre></section>'
     +'<section><h3>修复方案</h3>'+(d.fix?'<pre>'+esc(d.fix)+'</pre><p class="meta">'+esc(d.fixedBy||'')+' · '+esc(clock(d.fixedAt))+'</p>':'<p class="meta">还没有提交修复</p>')+'</section>'
-    +'<section><div class="row"><button data-cmd="task:'+esc(d.taskId)+'">查看任务</button></div></section>';
+    +'<section><div class="row"><button data-cmd="task:'+esc(String((TASKS.find(t=>bare(t.id?.id??t.id)===d.taskId)||{}).id??d.taskId))+'">查看任务</button></div></section>';
 }
 function drawerDefault(){
   const drafts=MESSAGES.filter(m=>m.state!=='sent');
@@ -621,7 +623,7 @@ async function saveReassign(id){
   await api('task.reassign',{taskId:id,executorRole,reviewerRole,note});toast('已改派');SEL=id;await load();
 }
 function chainNote(id,task,total){
-  const c=(PROGRESS?.chains||[]).find(x=>x.root===id);
+  const c=(PROGRESS?.chains||[]).find(x=>x.root===bare(id));
   const m=c?.forecast?.remainingMinutes;
   if(m===0)return '已完成 · '+total+' 个任务';
   return (m?'还需 '+duration(m):STATE_ZH[task.state]||task.state||'')+' · '+(c?.counts?.done??0)+'/'+total+' 完成';
