@@ -13,6 +13,7 @@ import {
 } from "../shared/usage";
 import { agentMetrics, metricNumber, metricSeconds } from "../shared/agent-metrics";
 import { relayTheme } from "./relay-theme";
+import { fs, radius, sp } from '../shared/relay-tokens.ts';
 
 const n = (value: number | undefined) => (value === undefined ? "未知" : metricNumber(value, 0));
 const speed = (value: number | undefined) =>
@@ -39,16 +40,16 @@ function Action({
       disabled={disabled}
       onPress={onPress}
       style={{
-        paddingVertical: 7,
-        paddingHorizontal: 11,
-        borderRadius: 6,
-        borderWidth: 1,
+        paddingVertical:sp(7),
+        paddingHorizontal:sp(11),
+        borderRadius:radius(6),
+        borderWidth:sp(1),
         borderColor: theme.colors.border,
         backgroundColor: active ? theme.colors.surface2 : theme.colors.surface1,
         opacity: disabled ? 0.45 : 1,
       }}
     >
-      <Text style={{ fontSize: 12, color: theme.colors.foreground }}>{label}</Text>
+      <Text style={{ fontSize:fs(12), color: theme.colors.foreground }}>{label}</Text>
     </Pressable>
   );
 }
@@ -66,7 +67,7 @@ function RequestRow({
   const [open, setOpen] = useState(false),
     c = theme.colors;
   return (
-    <View style={{ borderBottomWidth: 1, borderColor: c.border, paddingVertical: 10, gap: 6 }}>
+    <View style={{ borderBottomWidth:sp(1), borderColor: c.border, paddingVertical:sp(10), gap:sp(6) }}>
       <Pressable
         accessibilityRole="button"
         accessibilityLabel={`请求详情 ${row.model ?? "模型待确认"}`}
@@ -77,7 +78,7 @@ function RequestRow({
           style={{
             flexDirection: "row",
             flexWrap: "wrap",
-            gap: 8,
+            gap:sp(8),
             justifyContent: "space-between",
           }}
         >
@@ -85,7 +86,7 @@ function RequestRow({
             selectable
             style={{
               color: c.foreground,
-              fontSize: 12,
+              fontSize:fs(12),
               flexShrink: 1,
               flex: compact ? undefined : 1,
             }}
@@ -94,22 +95,22 @@ function RequestRow({
           </Text>
           {!compact && (
             <>
-              <Text style={{ color: c.foregroundMuted, fontSize: 11, width: 75 }}>
+              <Text style={{ color: c.foregroundMuted, fontSize:fs(11), width:sp(75) }}>
                 {row.terminal}
               </Text>
-              <Text style={{ color: c.foregroundMuted, fontSize: 11, width: 90 }}>
+              <Text style={{ color: c.foregroundMuted, fontSize:fs(11), width:sp(90) }}>
                 {metricSeconds(row.ttftMs)}
               </Text>
-              <Text style={{ color: c.foregroundMuted, fontSize: 11, width: 80 }}>
+              <Text style={{ color: c.foregroundMuted, fontSize:fs(11), width:sp(80) }}>
                 {n(row.output)}
               </Text>
-              <Text style={{ color: c.foregroundMuted, fontSize: 11, width: 90 }}>
+              <Text style={{ color: c.foregroundMuted, fontSize:fs(11), width:sp(90) }}>
                 {metricSeconds(row.totalMs)}
               </Text>
             </>
           )}
           <Text
-            style={{ color: c.foregroundMuted, fontSize: 11, width: compact ? undefined : 140 }}
+            style={{ color: c.foregroundMuted, fontSize:fs(11), width: compact ? undefined : sp(140) }}
           >
             {live && !row.completed ? "进行中" : row.status ? `HTTP ${row.status}` : "状态未知"} ·{" "}
             {new Date(row.at).toLocaleTimeString()}
@@ -117,7 +118,7 @@ function RequestRow({
         </View>
       </Pressable>
       {compact && (
-        <Text style={{ color: c.foregroundMuted, fontSize: 11 }}>
+        <Text style={{ color: c.foregroundMuted, fontSize:fs(11) }}>
           首响应 {metricSeconds(row.ttftMs)} · 输出 {n(row.output)} ·{" "}
           {live && !row.completed
             ? `已等待 ${metricSeconds(Math.max(0, Date.now() - row.at))}`
@@ -125,7 +126,7 @@ function RequestRow({
         </Text>
       )}
       {open && (
-        <Text selectable style={{ color: c.foregroundMuted, fontSize: 11, lineHeight: 19 }}>
+        <Text selectable style={{ color: c.foregroundMuted, fontSize:fs(11), lineHeight:sp(19) }}>
           使用终端 {row.terminal} · {row.accountLinked ? row.accountLabel : "账号未确认"}
           {"\n"}首文字 {metricSeconds(row.firstTextMs)} · 输入 {n(row.input)} · 缓存读取{" "}
           {n(row.cacheRead)} · 缓存写入 {n(row.cacheWrite)}
@@ -149,7 +150,7 @@ function Quotas({
     [page, setPage] = useState(0),
     selected = provider ? rows.filter((q) => q.provider === provider) : rows;
   return (
-    <View style={{ gap: 8 }}>
+    <View style={{ gap:sp(8) }}>
       <Action
         label={`订阅额度 · ${selected.length} 个账号/供应商 ${open ? "收起" : "展开"}`}
         theme={theme}
@@ -157,24 +158,24 @@ function Quotas({
       />
       {open && (
         <>
-          <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>
+          <Text style={{ color: theme.colors.foregroundMuted, fontSize:fs(11) }}>
             按供应商独立展示；只有请求包含明确账号身份时才确认账号归属。额度每 60 秒刷新。
           </Text>
           {selected.slice(page * 10, page * 10 + 10).map((q) => (
             <View
               key={q.id}
               style={{
-                padding: 10,
-                borderWidth: 1,
+                padding:sp(10),
+                borderWidth:sp(1),
                 borderColor: theme.colors.border,
-                borderRadius: 6,
-                gap: 4,
+                borderRadius:radius(6),
+                gap:sp(4),
               }}
             >
-              <Text style={{ color: theme.colors.foreground, fontSize: 12 }}>
+              <Text style={{ color: theme.colors.foreground, fontSize:fs(12) }}>
                 {q.label} · {q.accountLabel ?? "未提供账号身份"}
               </Text>
-              <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>
+              <Text style={{ color: theme.colors.foregroundMuted, fontSize:fs(11) }}>
                 {q.status === "error"
                   ? "额度读取失败"
                   : q.windows
@@ -187,7 +188,7 @@ function Quotas({
               </Text>
             </View>
           ))}
-          <View style={{ flexDirection: "row", gap: 8 }}>
+          <View style={{ flexDirection: "row", gap:sp(8) }}>
             <Action
               theme={theme}
               label="上一批额度"
@@ -232,28 +233,28 @@ function SessionUsage(props: Props & { agentId: string }) {
     active = live.data?.requests.filter((r) => !r.completed) ?? [],
     last = live.data?.requests.at(-1);
   return (
-    <View style={{ gap: 10, padding: 12, minWidth: 0 }}>
-      <Text style={{ color: c.foreground, fontSize: 14, fontWeight: "600" }}>
+    <View style={{ gap:sp(10), padding:sp(12), minWidth:sp(0) }}>
+      <Text style={{ color: c.foreground, fontSize:fs(14), fontWeight: "600" }}>
         Magpie · 当前会话用量
       </Text>
       {(metrics.isError || live.isError) && (
         <Text style={{ color: c.foregroundMuted }}>读取失败，将自动重试；已显示数据可能过期。</Text>
       )}
       {live.data && !live.data.available && (
-        <Text style={{ color: c.foregroundMuted, fontSize: 11 }}>
+        <Text style={{ color: c.foregroundMuted, fontSize:fs(11) }}>
           实时路由暂不可用，保留已确认数据。
         </Text>
       )}
       {active.length ? (
         active.map((row) => <RequestRow key={row.id} row={row} theme={theme} live />)
       ) : (
-        <Text style={{ color: c.foregroundMuted, fontSize: 12 }}>
+        <Text style={{ color: c.foregroundMuted, fontSize:fs(12) }}>
           暂无匹配的进行中请求{last ? "，最近请求如下。" : "；等待请求到达 Magpie。"}
         </Text>
       )}
       {!active.length && last && <RequestRow row={last} theme={theme} />}
       {!!s && (
-        <Text style={{ color: c.foreground, fontSize: 12, lineHeight: 20 }}>
+        <Text style={{ color: c.foreground, fontSize:fs(12), lineHeight:sp(20) }}>
           本轮{view.turn?.endedAt ? "已结束" : "进行中"}
           {s.partial ? " · 部分观测" : ""} · {s.requests} 次请求 · 失败/中断 {s.failed}
           {"\n"}已计量输出 {n(s.outputTokens)} · 首响应 {metricSeconds(s.firstResponseMs)} · 首文字{" "}
@@ -263,7 +264,7 @@ function SessionUsage(props: Props & { agentId: string }) {
         </Text>
       )}
       {view?.latest && !last && (
-        <Text style={{ color: c.foregroundMuted, fontSize: 11 }}>
+        <Text style={{ color: c.foregroundMuted, fontSize:fs(11) }}>
           最近实际模型 {view.latest.model ?? "未知"} · 首响应 {metricSeconds(view.latest.ttft_ms)} ·
           输出 {n(view.latest.output_tokens)}
         </Text>
@@ -271,13 +272,13 @@ function SessionUsage(props: Props & { agentId: string }) {
       {view?.source === "company-gateway" &&
         view.latest?.completed === undefined &&
         view.latest && (
-          <Text style={{ color: c.foregroundMuted, fontSize: 11 }}>
+          <Text style={{ color: c.foregroundMuted, fontSize:fs(11) }}>
             当前流式观测 · 首响应 {metricSeconds(view.latest.ttft_ms)} · 首文字{" "}
             {metricSeconds(view.latest.first_text_ms)} · 已确认输出 {n(view.latest.output_tokens)} ·
             已确认输入 {n(view.latest.input_tokens)}
           </Text>
         )}
-      <Text style={{ color: c.foregroundMuted, fontSize: 11 }}>
+      <Text style={{ color: c.foregroundMuted, fontSize:fs(11) }}>
         按会话与当前租约精确匹配。实时状态每秒读取内存快照；token、首响应只显示上游已确认值。
       </Text>
       {quota.data && (
@@ -303,8 +304,8 @@ function GroupList({
 }) {
   const [page, setPage] = useState(0);
   return (
-    <View style={{ gap: 6 }}>
-      <Text style={{ color: theme.colors.foreground, fontWeight: "600", fontSize: 13 }}>
+    <View style={{ gap:sp(6) }}>
+      <Text style={{ color: theme.colors.foreground, fontWeight: "600", fontSize:fs(13) }}>
         {title}
       </Text>
       {rows.slice(page * 10, page * 10 + 10).map((r) => (
@@ -314,14 +315,14 @@ function GroupList({
           accessibilityLabel={`${title}筛选 ${r.label}`}
           onPress={() => onSelect(r.id)}
         >
-          <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12, lineHeight: 20 }}>
+          <Text style={{ color: theme.colors.foregroundMuted, fontSize:fs(12), lineHeight:sp(20) }}>
             {r.label} · {n(r.requests)} 次 · 失败 {n(r.errors)} · 输出 {n(r.output)} · 首响应{" "}
             {metricSeconds(r.ttftMs)} · {speed(r.decodeTokensPerSecond)}
           </Text>
         </Pressable>
       ))}
       {rows.length > 10 && (
-        <View style={{ flexDirection: "row", gap: 8 }}>
+        <View style={{ flexDirection: "row", gap:sp(8) }}>
           <Action
             label={`${title}上一批`}
             theme={theme}
@@ -382,13 +383,13 @@ function GlobalUsage(props: Props) {
   return (
     <ScrollView
       style={{ flex: 1, backgroundColor: c.surface0 }}
-      contentContainerStyle={{ padding: props.layout.compact ? 12 : 20, gap: 16 }}
+      contentContainerStyle={{ padding: props.layout.compact ? sp(12) : sp(20), gap:sp(16) }}
     >
-      <Text style={{ color: c.foreground, fontSize: 18, fontWeight: "600" }}>Magpie 用量</Text>
-      <Text style={{ color: c.foregroundMuted, fontSize: 12 }}>
+      <Text style={{ color: c.foreground, fontSize:fs(18), fontWeight: "600" }}>Magpie 用量</Text>
+      <Text style={{ color: c.foregroundMuted, fontSize:fs(12) }}>
         覆盖使用终端与实际供应商。汇总每 5 秒刷新，明细每页 50 条。
       </Text>
-      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", gap:sp(8) }}>
         {(["today", "7d", "30d"] as const).map((p, i) => (
           <Action
             key={p}
@@ -432,7 +433,7 @@ function GlobalUsage(props: Props) {
       )}
       {data && s && (
         <>
-          <Text style={{ color: c.foregroundMuted, fontSize: 11 }}>
+          <Text style={{ color: c.foregroundMuted, fontSize:fs(11) }}>
             更新 {new Date(data.at).toLocaleTimeString()}
             {data.stale ? " · 汇总快照已过期" : ""}
             {data.partial ? " · 部分明细/额度暂不可用" : ""}
@@ -441,10 +442,10 @@ function GlobalUsage(props: Props) {
             style={{
               flexDirection: "row",
               flexWrap: "wrap",
-              gap: 16,
-              padding: 14,
+              gap:sp(16),
+              padding:sp(14),
               backgroundColor: c.surface1,
-              borderRadius: 8,
+              borderRadius:radius(8),
             }}
           >
             {[
@@ -460,22 +461,22 @@ function GlobalUsage(props: Props) {
                 s.cost === undefined ? "未知" : `$${s.cost.toFixed(3)} · ${s.unpriced} 次未定价`,
               ],
             ].map(([label, value]) => (
-              <View key={label} style={{ minWidth: 125, gap: 4 }}>
-                <Text style={{ color: c.foregroundMuted, fontSize: 11 }}>{label}</Text>
-                <Text style={{ color: c.foreground, fontSize: 15 }}>{value}</Text>
+              <View key={label} style={{ minWidth:sp(125), gap:sp(4) }}>
+                <Text style={{ color: c.foregroundMuted, fontSize:fs(11) }}>{label}</Text>
+                <Text style={{ color: c.foreground, fontSize:fs(15) }}>{value}</Text>
               </View>
             ))}
           </View>
-          <Text style={{ color: c.foregroundMuted, fontSize: 11 }}>
+          <Text style={{ color: c.foregroundMuted, fontSize:fs(11) }}>
             价格为 Magpie 标价折算，不等于订阅账单；未定价请求不算免费。
           </Text>
-          <View style={{ gap: 7 }}>
-            <Text style={{ color: c.foreground, fontWeight: "600", fontSize: 13 }}>
+          <View style={{ gap:sp(7) }}>
+            <Text style={{ color: c.foreground, fontWeight: "600", fontSize:fs(13) }}>
               请求趋势 · 最近 {Math.min(24, data.series.length)} 个时段
             </Text>
             <View
               accessibilityLabel="请求数量趋势"
-              style={{ height: 60, flexDirection: "row", alignItems: "flex-end", gap: 3 }}
+              style={{ height:sp(60), flexDirection: "row", alignItems: "flex-end", gap:sp(3) }}
             >
               {data.series.slice(-24).map((point, i) => (
                 <View
@@ -490,7 +491,7 @@ function GlobalUsage(props: Props) {
                         55,
                     ),
                     backgroundColor: point.errors ? c.foregroundMuted : c.foreground,
-                    borderRadius: 2,
+                    borderRadius:radius(2),
                   }}
                 />
               ))}
@@ -526,15 +527,15 @@ function GlobalUsage(props: Props) {
           <Quotas key={provider ?? "all"} rows={data.quotas} theme={theme} provider={provider} />
         </>
       )}
-      <Text style={{ color: c.foreground, fontWeight: "600", fontSize: 14 }}>
+      <Text style={{ color: c.foreground, fontWeight: "600", fontSize:fs(14) }}>
         请求明细 · {page.data?.total ?? "未知"} 条
       </Text>
-      <Text style={{ color: c.foregroundMuted, fontSize: 11 }}>
+      <Text style={{ color: c.foregroundMuted, fontSize:fs(11) }}>
         点击每条请求展开账号、token、价格与时延。浏览后续页时暂停自动刷新，返回首屏可查看最新记录。
       </Text>
       {page.data?.stale && <Text style={{ color: c.foregroundMuted }}>明细快照已过期</Text>}
       {!props.layout.compact && (
-        <View style={{ flexDirection: "row", gap: 8 }}>
+        <View style={{ flexDirection: "row", gap:sp(8) }}>
           {[
             ["实际模型 · 供应商", undefined],
             ["终端", 75],
@@ -547,7 +548,7 @@ function GlobalUsage(props: Props) {
               key={label}
               style={{
                 color: c.foregroundMuted,
-                fontSize: 11,
+                fontSize:fs(11),
                 width: typeof width === "number" ? width : undefined,
                 flex: width === undefined ? 1 : undefined,
               }}
@@ -563,7 +564,7 @@ function GlobalUsage(props: Props) {
       {page.data?.total === 0 && (
         <Text style={{ color: c.foregroundMuted }}>当前筛选没有请求。</Text>
       )}
-      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", gap:sp(8) }}>
         <Action label="最新请求" theme={theme} disabled={!offset} onPress={() => setOffset(0)} />
         <Action
           label="上一页"
@@ -571,7 +572,7 @@ function GlobalUsage(props: Props) {
           disabled={offset === 0 || page.isFetching}
           onPress={() => setOffset(Math.max(0, offset - 50))}
         />
-        <Text style={{ color: c.foregroundMuted, fontSize: 12, alignSelf: "center" }}>
+        <Text style={{ color: c.foregroundMuted, fontSize:fs(12), alignSelf: "center" }}>
           第 {Math.floor(offset / 50) + 1} 页
         </Text>
         <Action

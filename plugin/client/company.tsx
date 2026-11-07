@@ -9,7 +9,7 @@ import { Pressable, ScrollView, Text, TextInput, View, type StyleProp, type Text
 import * as RN from "react-native";
 import * as rpc from "../shared/rpc";
 import { relayPalette } from "./relay-theme";
-import { RELAY_FONT, RELAY_RADIUS, RELAY_SPACE } from "../shared/relay-tokens.ts";
+import { fs, radius, sp } from "../shared/relay-tokens.ts";
 import type { Brief, DispatchBlockedView, DispatchReasonView, GoalTier, GoalView, Inbox, PermissionRequest, Pulse, Roster, TaskAttachment, TaskView } from "../shared/types";
 
 const newKey = () => `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -29,32 +29,32 @@ function makeStyles({ theme, compact }: Ctx) {
   const c = { ...theme.colors, ...p.core };
   return {
     screen: { flex: 1, backgroundColor: c.surface0 },
-    scroll: { padding: compact ? RELAY_SPACE.xl : RELAY_SPACE.page, gap: RELAY_SPACE.lg },
-    h1: { color: c.foreground, fontSize: compact ? RELAY_FONT.h1 + 1 : RELAY_FONT.display - 3, fontWeight: "700" as const, letterSpacing: -0.4 },
-    h2: { color: c.foreground, fontSize: RELAY_FONT.h2, fontWeight: "700" as const },
-    card: { backgroundColor: c.surface1, borderRadius: RELAY_RADIUS.xl, borderWidth: 1, borderColor: c.border, padding: compact ? RELAY_SPACE.xl : RELAY_SPACE.xxl - 1, gap: RELAY_SPACE.sm },
-    text: { color: c.foreground, fontSize: RELAY_FONT.body + 1, lineHeight: 20 },
-    muted: { color: c.foregroundMuted, fontSize: RELAY_FONT.small, lineHeight: 17 },
-    mono: { color: c.foregroundMuted, fontSize: RELAY_FONT.small, fontFamily: "Menlo" as const },
-    row: { flexDirection: "row" as const, gap: RELAY_SPACE.sm, alignItems: "center" as const, flexWrap: "wrap" as const },
-    button: { paddingHorizontal: RELAY_SPACE.xl, paddingVertical: RELAY_SPACE.md - 1, borderRadius: RELAY_RADIUS.md, backgroundColor: c.accent },
-    buttonText: { color: c.accentForeground, fontSize: RELAY_FONT.body, fontWeight: "700" as const },
-    buttonSecondary: { paddingHorizontal: RELAY_SPACE.xl, paddingVertical: RELAY_SPACE.md - 1, borderRadius: RELAY_RADIUS.md, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface1 },
-    buttonSecondaryText: { color: c.foreground, fontSize: RELAY_FONT.body, fontWeight: "600" as const },
-    buttonDanger: { paddingHorizontal: RELAY_SPACE.xl, paddingVertical: RELAY_SPACE.md - 1, borderRadius: RELAY_RADIUS.md, borderWidth: 1, borderColor: p.dangerBorder, backgroundColor: p.dangerSoft },
-    buttonDangerText: { color: p.danger, fontSize: RELAY_FONT.body, fontWeight: "700" as const },
-    input: { borderWidth: 1, borderColor: c.border, borderRadius: RELAY_RADIUS.md, padding: RELAY_SPACE.md, color: c.foreground, fontSize: RELAY_FONT.body + 1, backgroundColor: c.surface2 },
-    chip: { paddingHorizontal: RELAY_SPACE.md, paddingVertical: RELAY_SPACE.xs, borderRadius: RELAY_RADIUS.sm, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface1 },
+    scroll: { padding: compact ? sp(14) : sp(20), gap: sp(12) },
+    h1: { color: c.foreground, fontSize: compact ? fs(19) : fs(23), fontWeight: "700" as const, letterSpacing: sp(-0.4) },
+    h2: { color: c.foreground, fontSize: fs(14), fontWeight: "700" as const },
+    card: { backgroundColor: c.surface1, borderRadius: radius(13), borderWidth:sp(1), borderColor: c.border, padding: compact ? sp(14) : sp(17), gap: sp(8) },
+    text: { color: c.foreground, fontSize: fs(13), lineHeight:sp(20) },
+    muted: { color: c.foregroundMuted, fontSize: fs(11), lineHeight:sp(17) },
+    mono: { color: c.foregroundMuted, fontSize: fs(11), fontFamily: "Menlo" as const },
+    row: { flexDirection: "row" as const, gap: sp(8), alignItems: "center" as const, flexWrap: "wrap" as const },
+    button: { paddingHorizontal: sp(14), paddingVertical: sp(9), borderRadius: radius(9), backgroundColor: c.accent },
+    buttonText: { color: c.accentForeground, fontSize: fs(12), fontWeight: "700" as const },
+    buttonSecondary: { paddingHorizontal: sp(14), paddingVertical: sp(9), borderRadius: radius(9), borderWidth:sp(1), borderColor: c.border, backgroundColor: c.surface1 },
+    buttonSecondaryText: { color: c.foreground, fontSize: fs(12), fontWeight: "600" as const },
+    buttonDanger: { paddingHorizontal: sp(14), paddingVertical: sp(9), borderRadius: radius(9), borderWidth:sp(1), borderColor: p.dangerBorder, backgroundColor: p.dangerSoft },
+    buttonDangerText: { color: p.danger, fontSize: fs(12), fontWeight: "700" as const },
+    input: { borderWidth:sp(1), borderColor: c.border, borderRadius: radius(9), padding: sp(10), color: c.foreground, fontSize: fs(13), backgroundColor: c.surface2 },
+    chip: { paddingHorizontal: sp(10), paddingVertical: sp(6), borderRadius: radius(8), borderWidth:sp(1), borderColor: c.border, backgroundColor: c.surface1 },
     chipActive: { backgroundColor: p.accentSoft, borderColor: c.accent },
-    chipText: { color: c.foregroundMuted, fontSize: RELAY_FONT.body, fontWeight: "600" as const },
+    chipText: { color: c.foregroundMuted, fontSize: fs(12), fontWeight: "600" as const },
     chipTextActive: { color: c.accent },
-    tab: { flexGrow: 0, flexShrink: 0, minHeight: 31, borderRadius: 7, alignItems: "center" as const, justifyContent: "center" as const, paddingHorizontal: RELAY_SPACE.sm },
+    tab: { flexGrow: 0, flexShrink: 0, minHeight:sp(31), borderRadius:radius(7), alignItems: "center" as const, justifyContent: "center" as const, paddingHorizontal: sp(8) },
     tabActive: { backgroundColor: c.surface1 },
-    tabText: { color: c.foregroundMuted, fontSize: RELAY_FONT.body, fontWeight: "600" as const },
+    tabText: { color: c.foregroundMuted, fontSize: fs(12), fontWeight: "600" as const },
     tabTextActive: { color: c.foreground, fontWeight: "700" as const },
-    badge: { paddingHorizontal: RELAY_SPACE.md - 1, paddingVertical: 3, borderRadius: 999, backgroundColor: p.inputBg },
-    badgeText: { color: c.foregroundMuted, fontSize: RELAY_FONT.caption, fontWeight: "600" as const },
-    kicker: { color: c.accent, fontSize: RELAY_FONT.kicker, fontWeight: "800" as const, letterSpacing: 1.6 },
+    badge: { paddingHorizontal: sp(9), paddingVertical:sp(3), borderRadius:radius(999), backgroundColor: p.inputBg },
+    badgeText: { color: c.foregroundMuted, fontSize: fs(10), fontWeight: "600" as const },
+    kicker: { color: c.accent, fontSize: fs(10), fontWeight: "800" as const, letterSpacing:sp(1.6) },
   };
 }
 
@@ -64,11 +64,11 @@ function MetricCard({ label, value, detail, tone, palette, ctx }: {
 }) {
   const soft = tone === "amber" ? palette.warningSoft : tone === "blue" ? palette.blueSoft : tone === "green" ? palette.successSoft : palette.accentSoft;
   return (
-    <View style={{ flexGrow: 1, minWidth: 130, backgroundColor: ctx.theme.colors.surface1, borderRadius: 13, borderWidth: 1, borderColor: ctx.theme.colors.border, padding: 14, gap: 4, overflow: "hidden" }}>
-      <Text style={{ color: palette.core.foregroundMuted, fontSize: 11 }}>{label}</Text>
-      <Text style={{ color: palette.core.foreground, fontSize: 22, fontWeight: "700", letterSpacing: -0.4 }}>{value}</Text>
-      {!!detail && <Text style={{ color: palette.core.foregroundMuted, fontSize: 10 }}>{detail}</Text>}
-      <View style={{ position: "absolute", right: -16, bottom: -18, width: 46, height: 46, borderRadius: 23, backgroundColor: soft }} />
+    <View style={{ flexGrow: 1, minWidth:sp(130), backgroundColor: ctx.theme.colors.surface1, borderRadius:radius(13), borderWidth:sp(1), borderColor: ctx.theme.colors.border, padding:sp(14), gap:sp(4), overflow: "hidden" }}>
+      <Text style={{ color: palette.core.foregroundMuted, fontSize:fs(11) }}>{label}</Text>
+      <Text style={{ color: palette.core.foreground, fontSize:fs(22), fontWeight: "700", letterSpacing: sp(-0.4) }}>{value}</Text>
+      {!!detail && <Text style={{ color: palette.core.foregroundMuted, fontSize:fs(10) }}>{detail}</Text>}
+      <View style={{ position: "absolute", right: sp(-16), bottom: sp(-18), width:sp(46), height:sp(46), borderRadius:radius(23), backgroundColor: soft }} />
     </View>
   );
 }
@@ -76,7 +76,7 @@ function MetricCard({ label, value, detail, tone, palette, ctx }: {
 function Section({ title, count, ctx, children }: { title: string; count?: number; ctx: Ctx; children: React.ReactNode }) {
   const s = makeStyles(ctx);
   return (
-    <View style={{ gap: 8 }}>
+    <View style={{ gap:sp(8) }}>
       <View style={s.row}>
         <Text style={s.h2}>{title}</Text>
         {count !== undefined && count > 0 && (
@@ -97,7 +97,7 @@ function ExpandableText({ text, lines, style, ctx }: { text: string; lines: numb
       <Text style={style} numberOfLines={open ? undefined : lines}>{text}</Text>
       {long && (
         <Pressable accessibilityRole="button" onPress={() => setOpen(!open)} style={{ alignSelf: "flex-start" }}>
-          <Text style={{ color: ctx.theme.colors.accent, fontSize: 12 }}>{open ? "收起" : "展开全部"}</Text>
+          <Text style={{ color: ctx.theme.colors.accent, fontSize:fs(12) }}>{open ? "收起" : "展开全部"}</Text>
         </Pressable>
       )}
     </View>
@@ -162,7 +162,7 @@ function AttachmentRow({ taskId, a, label, ctx }: { taskId: string; a: TaskAttac
   });
   return (
     <Pressable accessibilityRole="button" style={s.row} disabled={m.isPending} onPress={() => m.mutate()}>
-      <Text style={{ color: ctx.theme.colors.accent, fontSize: 13 }}>{label}</Text>
+      <Text style={{ color: ctx.theme.colors.accent, fontSize:fs(13) }}>{label}</Text>
       <Text style={[s.text, { flexShrink: 1 }]} numberOfLines={1}>{a.name}</Text>
       <Text style={s.muted}>{formatSize(a.sizeBytes)}</Text>
       {m.isError && <Text style={s.muted}>{String((m.error as Error).message).slice(0, 80)}</Text>}
@@ -190,11 +190,11 @@ function InlineImage({ taskId, a, ctx }: { taskId: string; a: TaskAttachment; ct
   });
   const uri = q.data?.url;
   return (
-    <View style={{ gap: 4 }}>
+    <View style={{ gap:sp(4) }}>
       <View style={s.row}>
         {!!RNImage && (
           <Pressable accessibilityRole="button" onPress={() => setShow(v => !v)}>
-            <Text style={{ color: ctx.theme.colors.accent, fontSize: 13 }}>{show ? "收起" : "预览"}</Text>
+            <Text style={{ color: ctx.theme.colors.accent, fontSize:fs(13) }}>{show ? "收起" : "预览"}</Text>
           </Pressable>
         )}
         <AttachmentRow taskId={taskId} a={a} label="打开" ctx={ctx} />
@@ -203,7 +203,7 @@ function InlineImage({ taskId, a, ctx }: { taskId: string; a: TaskAttachment; ct
         uri && !loadFailed ? (
           <RNImage source={{ uri }} accessibilityLabel={a.name} resizeMode="contain"
             onError={() => setLoadFailed(true)}
-            style={{ width: "100%", height: 200, borderRadius: 8, backgroundColor: ctx.theme.colors.surface2 }} />
+            style={{ width: "100%", height:sp(200), borderRadius:radius(8), backgroundColor: ctx.theme.colors.surface2 }} />
         ) : (
           <Text style={s.muted}>{q.isLoading ? "加载预览…" : "预览不可用，可点打开查看。"}</Text>
         )
@@ -228,7 +228,7 @@ function Attachments({ taskId, ctx }: { taskId: string; ctx: Ctx }) {
   const items = q.data?.attachments ?? [];
   if (!q.data || items.length === 0) return null;
   return (
-    <View style={{ gap: 6 }}>
+    <View style={{ gap:sp(6) }}>
       <Text style={s.muted}>附件 {items.length}</Text>
       {items.map(a => a.kind === "image"
         ? <InlineImage key={a.relPath} taskId={taskId} a={a} ctx={ctx} />
@@ -246,10 +246,10 @@ function LinkRows({ text, ctx }: { text: string; ctx: Ctx }) {
   const links = useMemo(() => [...new Set(text.match(LINK_RE) ?? [])].slice(0, 5), [text]);
   if (links.length === 0) return null;
   return (
-    <View style={{ gap: 2 }}>
+    <View style={{ gap:sp(2) }}>
       {links.map(u => (
         <Pressable key={u} accessibilityRole="button" onPress={() => void openExternalAnywhere(u, ctx.navigation, openRpc)}>
-          <Text style={{ color: ctx.theme.colors.accent, fontSize: 12 }} numberOfLines={1}>打开链接 {u}</Text>
+          <Text style={{ color: ctx.theme.colors.accent, fontSize:fs(12) }} numberOfLines={1}>打开链接 {u}</Text>
         </Pressable>
       ))}
     </View>
@@ -274,7 +274,7 @@ function DecideCard({ taskId, kind, body, ctx, onDone }: {
       <LinkRows text={body} ctx={ctx} />
       <Attachments taskId={taskId} ctx={ctx} />
       <TextInput
-        style={[s.input, { minHeight: 36 }]}
+        style={[s.input, { minHeight:sp(36) }]}
         placeholder={kind === "approve" ? "意见（驳回时必填）" : "回答内容"}
         placeholderTextColor={ctx.theme.colors.foregroundMuted}
         value={note}
@@ -321,7 +321,7 @@ function Collapsible({ title, count, ctx, children, defaultOpen }: {
   const s = makeStyles(ctx);
   const [open, setOpen] = useState(defaultOpen ?? false);
   return (
-    <View style={{ gap: 8 }}>
+    <View style={{ gap:sp(8) }}>
       <Pressable accessibilityRole="button" style={s.row} onPress={() => setOpen(!open)}>
         <Text style={s.h2}>{open ? "▾ " : "▸ "}{title}</Text>
         {count !== undefined && count > 0 && (
@@ -539,9 +539,9 @@ function RegisterDefCard({ ctx, editing, onDone, onCancel }: {
         <>
           <View style={s.row}>
             <Text style={s.muted}>实例上限</Text>
-            <TextInput style={[s.input, { width: 56, paddingVertical: 6 }]} value={maxInstances} onChangeText={setMaxInstances} keyboardType="number-pad" />
+            <TextInput style={[s.input, { width:sp(56), paddingVertical:sp(6) }]} value={maxInstances} onChangeText={setMaxInstances} keyboardType="number-pad" />
             <Text style={s.muted}>派工权重</Text>
-            <TextInput style={[s.input, { width: 64, paddingVertical: 6 }]} value={weight} onChangeText={setWeight} keyboardType="number-pad" />
+            <TextInput style={[s.input, { width:sp(64), paddingVertical:sp(6) }]} value={weight} onChangeText={setWeight} keyboardType="number-pad" />
             <Text style={s.muted}>额度限制</Text>
             <Pressable accessibilityRole="button" style={[s.chip, quotaLimited !== false && s.chipActive]} onPress={() => setQuotaLimited(true)}>
               <Text style={[s.chipText, quotaLimited !== false && s.chipTextActive]}>受限</Text>
@@ -597,8 +597,8 @@ function PulseTab({ ctx }: { ctx: Ctx }) {
   // Each blocked item is counted once: the dispatch list holds both phases, and the ready queue is not added on top.
   const attention = p.waiting.length + p.stuck.length + p.resources.length + p.bounds.dispatchBlocked.total;
   return (
-    <View style={{ gap: 12 }}>
-      <View style={{ gap: 8 }}>
+    <View style={{ gap:sp(12) }}>
+      <View style={{ gap:sp(8) }}>
         <View style={s.row}>
           <View style={[s.badge, { backgroundColor: loaded && !p.paused ? pal.successSoft : pal.warningSoft }]}>
             <Text style={[s.badgeText, { color: loaded && !p.paused ? pal.success : pal.warning }]}>
@@ -607,7 +607,7 @@ function PulseTab({ ctx }: { ctx: Ctx }) {
           </View>
           {attention > 0 && <Text style={s.muted}>需要关注 {attention} 项（往下翻）</Text>}
         </View>
-        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 10 }}>
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap:sp(10) }}>
           <MetricCard label="正在办" value={p.doing.length} detail="持有租约的员工" palette={pal} ctx={ctx} />
           <MetricCard label="就绪待领" value={p.ready.length} detail="等待认领的任务" tone="blue" palette={pal} ctx={ctx} />
           <MetricCard label="无法派工" value={p.bounds.dispatchBlocked.total} detail={p.stuck.length ? `另有卡住 ${p.stuck.length} 项` : "含依赖与关口"} tone={p.bounds.dispatchBlocked.total > 0 ? "amber" : undefined} palette={pal} ctx={ctx} />
@@ -652,7 +652,7 @@ function PulseTab({ ctx }: { ctx: Ctx }) {
               {ROLE_LABEL[r.role] ?? r.role}{r.discipline ? ` · ${r.discipline}` : ""} · 已等 {fmtAge(r.waitingMin)}
             </Text>
             {r.unclaimableReason && (
-              <Text style={{ color: pal.warning, fontSize: 12.5 }}>无人可派：{r.unclaimableReason}</Text>
+              <Text style={{ color: pal.warning, fontSize:fs(12.5) }}>无人可派：{r.unclaimableReason}</Text>
             )}
           </View>
         ))}
@@ -665,7 +665,7 @@ function PulseTab({ ctx }: { ctx: Ctx }) {
             <Text style={s.muted}>
               {v.phase === "review" ? "复核" : "执行"} · 工作流：{WORKFLOW_LABEL[v.workflowState]} · 派工：无法派工 · 可选人数 {v.eligibleCount} · 已等 {fmtAge(v.waitingMinutes)}
             </Text>
-            <Text style={{ color: pal.warning, fontSize: 12.5 }}>{v.summary}</Text>
+            <Text style={{ color: pal.warning, fontSize:fs(12.5) }}>{v.summary}</Text>
             {v.reasons.map((r, i) => (
               <Text key={i} style={s.muted}>
                 {r.text}（{r.candidates.filter(c => c !== "*").join("、") || "全局"}）· 负责：{r.owner === "system" ? "系统" : "老板"} · 恢复：{r.recovery}
@@ -709,10 +709,10 @@ function CompanyUpgradeCard({item,ctx,onDone}:{item:import("../shared/types").Up
  const [feedback,setFeedback]=useState("");
  const mutation=useMutation({mutationFn:()=>start({taskId:item.taskId,taskVersion:item.taskVersion,digest:item.plan.digest}),onSuccess:()=>{setFeedback("升级已启动，完成后自动回复通过");onDone();},onError:e=>setFeedback((e as Error).message)});
  const busy=mutation.isPending||["queued","preparing","checking","installing","verifying"].includes(item.status),done=item.status==="succeeded",stale=item.retired===true;
- const rows=(title:string,items:string[])=><View style={{gap:4}}><Text style={s.muted}>{title}</Text>{items.map((t,i)=><Text key={i} style={s.text}>• {t}</Text>)}</View>;
- return <View style={[s.card,{gap:12}]}>
+ const rows=(title:string,items:string[])=><View style={{gap:sp(4)}}><Text style={s.muted}>{title}</Text>{items.map((t,i)=><Text key={i} style={s.text}>• {t}</Text>)}</View>;
+ return <View style={[s.card,{gap:sp(12)}]}>
   <Text style={s.muted}>公司系统升级 · {item.phase}</Text>
-  <Text style={[s.text,{fontSize:18,fontWeight:"700"}]}>v{item.plan.version} · {item.plan.title}</Text>
+  <Text style={[s.text,{fontSize:fs(18),fontWeight:"700"}]}>v{item.plan.version} · {item.plan.title}</Text>
   {rows("上线内容",item.plan.changes)}{rows("影响范围",item.plan.impact)}
   {rows("数据变化",[item.plan.migration])}{rows("回退方式",[item.plan.rollback])}
   <ExpandableText text={`提交 SHA：${item.plan.sha}`} lines={1} style={s.muted} ctx={ctx}/>
@@ -736,12 +736,12 @@ function InboxTab({ ctx }: { ctx: Ctx }) {
   const box: Inbox | undefined = data.data;
   const empty = box && box.gates.length + box.questions.length + box.notices.length + (box.upgrades?.items.length??0) === 0;
   return (
-    <View style={{ gap: 12 }}>
+    <View style={{ gap:sp(12) }}>
       {consoleQ.data?.url ? (
-        <Pressable accessibilityRole="button" style={[s.card, { backgroundColor: ctx.theme.colors.accent, borderColor: ctx.theme.colors.accent, paddingVertical: 18 }]}
+        <Pressable accessibilityRole="button" style={[s.card, { backgroundColor: ctx.theme.colors.accent, borderColor: ctx.theme.colors.accent, paddingVertical:sp(18) }]}
           onPress={() => void openExternalAnywhere(consoleQ.data!.url, ctx.navigation, openRpc)}>
-          <Text style={{ color: ctx.theme.colors.accentForeground, fontSize: 16, fontWeight: "800" }}>打开「消息流」控制台</Text>
-          <Text style={{ color: ctx.theme.colors.accentForeground, fontSize: 11, marginTop: 5, opacity: .85 }}>看消息沿连线流动 · 编辑待发消息 · 放行 · 审待办</Text>
+          <Text style={{ color: ctx.theme.colors.accentForeground, fontSize:fs(16), fontWeight: "800" }}>打开「消息流」控制台</Text>
+          <Text style={{ color: ctx.theme.colors.accentForeground, fontSize:fs(11), marginTop:sp(5), opacity: 0.85 }}>看消息沿连线流动 · 编辑待发消息 · 放行 · 审待办</Text>
         </Pressable>
       ) : null}
       {box?.upgrades?.current?<View style={s.card}><Text style={s.text}>当前版本 v{box.upgrades.current.version}</Text><Text selectable style={s.muted}>{box.upgrades.current.sha}</Text>
@@ -796,7 +796,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   const r: Roster | undefined = data.data;
   const refreshAll = () => void queryClient.invalidateQueries();
   return (
-    <View style={{ gap: 12 }}>
+    <View style={{ gap:sp(12) }}>
       <Section title="派工开关" ctx={ctx}>
         <View style={[s.card, s.row]}>
           <Text style={[s.text, { flex: 1 }]}>{r?.paused ? "派工已暂停" : "派工运行中"}</Text>
@@ -895,7 +895,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                         {[...g.defs].sort((a, b) => a.provider.localeCompare(b.provider)).map(d => {
                           const defInsts = insts.filter(i => i.def === d.id);
                           return (
-                            <View key={d.id} style={{ gap: 2 }}>
+                            <View key={d.id} style={{ gap:sp(2) }}>
                               <View style={s.row}>
                                 <Text style={[s.text, { flex: 1 }]}>
                                   {d.provider}/{d.resolved ?? d.model} · 上限 {d.maxInstances}{d.avgScore ? ` · 绩效 ${d.avgScore.toFixed(1)}` : ""}{d.quotaLimited === false ? " · 不受额度限制" : ""}{d.enabled ? "" : " · 已停用"}
@@ -932,7 +932,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                 <Text style={s.muted}>当前候选估算；最终派工由调度器执行。回避仅用于对应任务的 review。</Text>
                 {(r?.reviewPools?.length ?? 0) === 0 && <Text style={s.muted}>暂无等待派工的验收任务。</Text>}
                 {r?.reviewPools?.map(p => (
-                  <View key={p.taskId} style={{ gap: 4 }}>
+                  <View key={p.taskId} style={{ gap:sp(4) }}>
                     <Text style={s.text}>{p.title} · {p.taskId} · review · {p.role}</Text>
                     <Text style={s.muted}>项目：{p.home}</Text>
                     {p.status === "history_unavailable" && (
@@ -955,7 +955,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                   <Text style={s.muted}>复核候选只列出 {r.bounds.reviewPools.shown} 项，共 {r.bounds.reviewPools.total} 项。</Text>
                 )}
                 {(r?.pools ?? []).filter(p => p.entries.length).map(p => (
-                  <View key={`${p.role}@${p.home}`} style={{ gap: 2, marginTop: 8 }}>
+                  <View key={`${p.role}@${p.home}`} style={{ gap:sp(2), marginTop:sp(8) }}>
                     <Text style={s.muted}>池 {ROLE_LABEL[p.role] ?? p.role}@{p.home === r?.opsRepo ? "运营仓库" : p.home.split("/").pop()}</Text>
                     {p.entries.map(e => (
                       <Text key={`${e.kind}:${e.ref}`} style={s.muted}>
@@ -997,12 +997,12 @@ export function CompanySurface(props: PluginSurfaceProps & { initialTab?: Compan
   ];
   return (
     <View style={s.screen}>
-      <View style={{ paddingHorizontal: ctx.compact ? 14 : 20, paddingTop: ctx.compact ? 10 : 16, paddingBottom: 10, gap: 8 }}>
+      <View style={{ paddingHorizontal: ctx.compact ? sp(14) : sp(20), paddingTop: ctx.compact ? sp(10) : sp(16), paddingBottom:sp(10), gap:sp(8) }}>
         {!ctx.compact && <Text style={s.kicker}>COMPANY OPERATIONS</Text>}
         <Text style={s.h1}>运营工作台</Text>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ flexGrow: 0 }} contentContainerStyle={{ gap: 4, padding: 3, backgroundColor: relayPalette(ctx.theme).inputBg, borderRadius: 10 }}>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ flexGrow: 0 }} contentContainerStyle={{ gap:sp(4), padding:sp(3), backgroundColor: relayPalette(ctx.theme).inputBg, borderRadius:radius(10) }}>
           {tabs.map(t => (
-            <Pressable key={t.id} accessibilityRole="tab" accessibilityLabel={t.title} accessibilityState={{ selected: tab === t.id }} style={[s.tab, { minHeight: 40, paddingHorizontal: 12 }, tab === t.id && s.tabActive]} onPress={() => setTab(t.id)}>
+            <Pressable key={t.id} accessibilityRole="tab" accessibilityLabel={t.title} accessibilityState={{ selected: tab === t.id }} style={[s.tab, { minHeight:sp(40), paddingHorizontal:sp(12) }, tab === t.id && s.tabActive]} onPress={() => setTab(t.id)}>
               <Text numberOfLines={1} style={[s.tabText, tab === t.id && s.tabTextActive]}>{t.title}</Text>
             </Pressable>
           ))}

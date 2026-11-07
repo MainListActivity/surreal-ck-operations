@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'bun:test';
+import {fs,radius,sp} from '../plugin/shared/relay-tokens.ts';
 import { BLOCK_TEXT, evaluateDispatch, type DispatchVerdict } from '../src/dispatcher/dispatch-blocked.ts';
 type ContributionFacts = { authors: string[]; excluded: string[]; hands: string[] };
 import { snapshotOf, type DispatchSnapshot, type InstState, type PassInputs, type StaffingInput } from '../src/dispatcher/dispatcher.ts';
@@ -130,7 +131,7 @@ if (sectionStart < 0 || sectionEnd < 0) throw new Error('Missing roster debug (è
 const compiled = new Bun.Transpiler({ loader: 'tsx', tsconfig: {
   compilerOptions: { jsx: 'react', jsxFactory: 'React.createElement' },
 } }).transformSync(`return (${page.slice(sectionStart, sectionEnd + '</Collapsible>'.length).trim()});`);
-const render = new Function('r', 's', 'ctx', 'React', 'Section', 'View', 'Text', 'Collapsible', 'ROLE_LABEL', compiled);
+const render = new Function('r', 's', 'ctx', 'React', 'Section', 'View', 'Text', 'Collapsible', 'ROLE_LABEL', 'fs', 'radius', 'sp', compiled);
 const collectText = (node: unknown): string => {
   if (node == null || typeof node === 'boolean') return '';
   if (typeof node === 'string' || typeof node === 'number') return String(node);
@@ -141,7 +142,7 @@ const collectText = (node: unknown): string => {
 const renderText = (response: Roster): string => collectText(render(response,
   { card: {}, text: {}, muted: {} }, {},
   { createElement: (_type: unknown, _props: unknown, ...children: unknown[]) => ({ children }) },
-  'Section', 'View', 'Text', 'Collapsible', {}));
+  'Section', 'View', 'Text', 'Collapsible', {}, fs, radius, sp));
 
 test('roster page JSX displays task, review exclusion and unknown history at zero share', async () => {
   historyFails = false;

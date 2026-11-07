@@ -144,9 +144,29 @@ export const RELAY_SPACE = {
  * 由这些数组生成的 `--relay-fs-N` / `--relay-r-N` / `--relay-sp-N`，
  * 页面里不再出现裸 px。新增值只在这里改。
  */
-export const RELAY_FONT_PX = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 23, 26, 30] as const;
-export const RELAY_RADIUS_PX = [4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 22, 99] as const;
+/** CSS 数值阶梯：网页里每个 font-size / border-radius / padding / margin / gap 引用由此生成的变量。 */
+export const RELAY_FONT_PX = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 22, 23, 26, 28, 30] as const;
+export const RELAY_RADIUS_PX = [2, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 22, 23, 99, 999] as const;
 export const RELAY_SPACE_PX = [...Array.from({ length: 49 }, (_, i) => i), 49, 50, 56, 60, 69, 70] as const;
+
+/**
+ * RN 面板数值阶梯：包含网页 CSS 用不到的分数/负值/大尺寸，仍是同一份文件、同一组阶梯。
+ * 小数字面量（letterSpacing、opacity 不算尺寸）也在此登记，避免散落。
+ */
+export const RELAY_RN_PX = [
+  ...RELAY_FONT_PX, ...RELAY_RADIUS_PX, ...RELAY_SPACE_PX,
+  -18, -16, -0.4, 0.5, 1.5, 1.6, 11.5, 12.5, 17, 19, 36, 46, 55, 62, 64, 65, 75, 80, 90, 125, 130, 140, 160, 200, 280, 390, 1100,
+] as const;
+
+export type RelayPx = (typeof RELAY_RN_PX)[number];
+/** 数值阶梯查表：RN 样式用 fs/radius/sp，网页 CSS 用同值生成的 var()。 */
+const px = (n: RelayPx): number => {
+  if (!(RELAY_RN_PX as readonly number[]).includes(n)) throw new Error(`relay-tokens: ${n} 不在共享数值阶梯中`);
+  return n;
+};
+export const fs = px;
+export const radius = px;
+export const sp = px;
 
 /** 由数值阶梯生成 CSS 自定义属性串。 */
 export function scaleToCssVars(): string {
