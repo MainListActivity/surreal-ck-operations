@@ -10,6 +10,7 @@
  * 配置与状态输出（preview-status.json 供 ops_info 兜底读取）。绑定失败每 2s 重试至
  * teardown（R3：部署顺序不再受固定重试窗口约束）。
  */
+import { previewListCss } from "../shared/relay-tokens.ts";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { writeFileSync } from "node:fs";
 import { networkInterfaces } from "node:os";
@@ -29,7 +30,7 @@ const lanIPv4 = (): string => {
 };
 
 type FetchHandler = (req: Request) => Promise<Response>;
-type CoreFactory = (opts: { home: string; port: number; auth?: { secret: string } }) => FetchHandler;
+type CoreFactory = (opts: { home: string; port: number; auth?: { secret: string }; listPageCss?: string }) => FetchHandler;
 
 export interface PreviewHandle {
   /** LAN 面端口（listen 完成后为实际绑定值）。 */
@@ -177,8 +178,8 @@ export function startPreview(opts: StartPreviewOptions = {}): PreviewHandle {
     try {
       const core: CoreFactory = opts.coreFactory
         ?? ((await import("./vendor/src/preview-core.ts")).createPreviewFetch as CoreFactory);
-      coreRef.lan = core({ home, port: lanPort });
-      if (secret) coreRef.signed = core({ home, port: signedPortCfg, auth: { secret } });
+      coreRef.lan = core({ home, port: lanPort, listPageCss: previewListCss });
+      if (secret) coreRef.signed = core({ home, port: signedPortCfg, auth: { secret }, listPageCss: previewListCss });
     } catch (err) {
       lastError = (err as Error).message;
       writeStatus();

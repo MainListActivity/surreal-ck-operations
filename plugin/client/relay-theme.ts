@@ -1,9 +1,10 @@
 /**
- * Relay Operations 插件面共享调色板（源：redesign2 审核原型的 --relay-* token）。
+ * Relay Operations 插件面共享调色板——数值唯一来源在 plugin/shared/relay-tokens.ts。
  * 只服务 plugin/client 的 React Native 面；网页审核台走 shared/relay-shell.ts。
  * 明暗选择沿用既有做法：从宿主主题的 surface0 亮度判断，不引入宿主之外的运行时依赖。
  */
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
+import { RELAY_DARK, RELAY_LIGHT, type RelayPalette as SharedPalette } from "../shared/relay-tokens.ts";
 
 type Theme = PluginSurfaceProps["theme"];
 
@@ -20,29 +21,27 @@ export interface RelayPalette {
   blue: string; blueSoft: string;
 }
 
-const LIGHT: RelayPalette = {
-  light: true,
-  core: { surface0: "#f4f5f7", surface1: "#ffffff", surface2: "#f5f5f7", foreground: "#202127", foregroundMuted: "#71747e", border: "#e5e6ea", accent: "#6d5bd0", accentForeground: "#ffffff" },
-  inputBg: "#ececef",
-  score: "#6957cc",
-  accentSoft: "#f0edff",
-  success: "#218663", successSoft: "#eaf7f1",
-  warning: "#a7671d", warningSoft: "#fff6e8",
-  danger: "#b14f56", dangerSoft: "#fff0f1", dangerBorder: "rgba(177,79,86,.3)",
-  blue: "#3d6eb1", blueSoft: "#edf4ff",
-};
+/** 共享色板 → RN 面板调色板。面板沿用既有 key 名，数值全部取自共享 token。 */
+function toClientPalette(t: SharedPalette, light: boolean): RelayPalette {
+  return {
+    light,
+    core: {
+      surface0: t.bg, surface1: t.panel, surface2: t.input, foreground: t.text,
+      foregroundMuted: t.muted, border: t.border, accent: t.accent,
+      accentForeground: light ? "#ffffff" : "#1c1830",
+    },
+    inputBg: t.input,
+    score: t.score,
+    accentSoft: t.accentSoft,
+    success: t.success, successSoft: t.successSoft,
+    warning: t.warning, warningSoft: t.warningSoft,
+    danger: t.danger, dangerSoft: t.dangerSoft, dangerBorder: t.dangerBorder,
+    blue: t.blue, blueSoft: t.blueSoft,
+  };
+}
 
-const DARK: RelayPalette = {
-  light: false,
-  core: { surface0: "#0e0f12", surface1: "#17181d", surface2: "#111216", foreground: "#f0f0f2", foregroundMuted: "#9a9da7", border: "#2a2c33", accent: "#9581ff", accentForeground: "#1c1830" },
-  inputBg: "#23252b",
-  score: "#ad9eff",
-  accentSoft: "#28233d",
-  success: "#58c99b", successSoft: "#182c25",
-  warning: "#e1a456", warningSoft: "#302619",
-  danger: "#e08287", dangerSoft: "#321e21", dangerBorder: "rgba(224,130,135,.32)",
-  blue: "#78a4df", blueSoft: "#1a2636",
-};
+const LIGHT: RelayPalette = toClientPalette(RELAY_LIGHT, true);
+const DARK: RelayPalette = toClientPalette(RELAY_DARK, false);
 
 function surfaceIsLight(theme: Theme): boolean {
   const s = theme.colors.surface0 ?? "";

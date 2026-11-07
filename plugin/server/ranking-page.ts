@@ -18,7 +18,7 @@ export const rankingPage = `<!doctype html><html lang="zh-CN"><head><meta charse
 <div class="main-area">
 <header class="topbar">
 <div class="breadcrumb"><span>公司审核台</span><b>/</b><strong>模型排序</strong></div>
-<div class="top-actions"><button class="icon-button" id="theme-btn" onclick="toggleTheme()" aria-label="切换主题"></button></div>
+<div class="top-actions"><button class="icon-button theme-toggle" id="theme-btn" onclick="toggleTheme()" aria-label="切换主题"></button></div>
 </header>
 <main class="content">
 <header class="page-title"><div><p class="kicker">MODEL ROUTING</p><h1>模型排序</h1><p class="page-copy">评分、真实实测与模型管理。Haiku / Sonnet 自动排序，Opus / Fable 保持手动。</p></div><div class="sync-state"><span class="sync-dot"></span><span id="updated">正在读取…</span></div></header>
@@ -37,8 +37,9 @@ let state,policy,preview,dirty=false,previewReady=false,previewTimer,previewSeq=
 const api=async(path,body)=>{const r=await fetch('api/'+path,body===undefined?{cache:'no-store'}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();if(!r.ok)throw Error(j.error||'请求失败');return j;};
 function setTheme(theme){document.documentElement.dataset.theme=theme;try{localStorage.setItem('relay-theme',theme)}catch{}}
 try{const theme=localStorage.getItem('relay-theme');if(theme)setTheme(theme)}catch{}
-$('theme-btn').onclick=()=>setTheme((document.documentElement.dataset.theme||((matchMedia('(prefers-color-scheme:dark)').matches)?'dark':'light'))==='dark'?'light':'dark');
-$('theme-btn').innerHTML='${relayIcon("sun")}';
+function renderTheme(){const dark=(document.documentElement.dataset.theme||((matchMedia('(prefers-color-scheme:dark)').matches)?'dark':'light'))==='dark';$('theme-btn').innerHTML='${relayIcon("sun")}'+'<span class="theme-label">'+(dark?'浅色':'深色')+'</span>'}
+$('theme-btn').onclick=()=>{setTheme((document.documentElement.dataset.theme||((matchMedia('(prefers-color-scheme:dark)').matches)?'dark':'light'))==='dark'?'light':'dark');renderTheme()};
+renderTheme();
 $('formula').textContent=formula;$('cost-help').textContent=costHelp;
 function editor(){
  $('policy-editor').innerHTML=Object.entries(weightLabels).map(([key,title])=>'<label class="weights-row">'+esc(title)+'<input class="routing-input" aria-label="'+esc(title)+'权重" data-weight="'+key+'" type="number" min="0" max="100" value="'+policy.weights[key]+'"></label>').join('');
