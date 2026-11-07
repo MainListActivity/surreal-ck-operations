@@ -131,8 +131,8 @@ export function createPreviewFetch(opts: PreviewCoreOptions) {
     const m = /^\/([ed])\/([A-Za-z0-9_-]{1,128})(?:\/(.*))?$/.exec(url.pathname);
     if (!m) {
       return new Response(
-        `<!doctype html><meta charset="utf-8"><title>交付预览</title><body style="font:16px -apple-system,sans-serif;margin:24px">` +
-        `<h1>交付预览服务</h1><p>/e/&lt;任务ID&gt;/ → evidence 目录 · /d/&lt;任务ID&gt;/ → deliverables 目录</p></body>`,
+        `<!doctype html><meta charset="utf-8"><title>交付预览</title><style>${previewListCss}</style>` +
+        `<h1>交付预览服务</h1><p>/e/&lt;任务ID&gt;/ → evidence 目录 · /d/&lt;任务ID&gt;/ → deliverables 目录</p>`,
         { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
     if (auth) {
