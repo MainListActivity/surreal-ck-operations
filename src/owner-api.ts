@@ -17,6 +17,7 @@ import { HASH, REQUIRED_TRACKS } from './core.ts';
 import { getRoute, listRoutes, saveRoute, disableRoute } from './routes.ts';
 import { defaultAcceptanceCriteria } from './acceptance.ts';
 import { readTaskCost, recordTaskCost, COST_LIST_SQL } from './task-cost.ts';
+import { hostIOOrUndefined } from './host-io.ts';
 
 export type OwnerVia = string;
 export interface OwnerApiContext { db: CompanyDatabase; core: CompanyCore & {
@@ -31,9 +32,18 @@ const text = (value: unknown, field: string, min = 1, max = 20000): string => {
 const optionalText = (value: unknown): string | undefined => typeof value === 'string' && value.trim() ? value.trim() : undefined;
 const strArray = (value: unknown): string[] => Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
 
+/**
+ * Commands that act on the machine they run on: the upgrade desk reads and writes local files and runs local commands.
+ * A process without an execution host (a Worker, for one) answers them with CompanyError('unavailable').
+ */
+export const RUNNER_ONLY_COMMANDS: ReadonlySet<string> = new Set(['upgrade.list', 'upgrade.automatic', 'upgrade.start']);
+
 /** Every command is a flat JSON object: { command, ...args }. */
 export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unknown>, via: OwnerVia): Promise<unknown> {
   const command = String(input.command ?? '');
+  if (RUNNER_ONLY_COMMANDS.has(command) && hostIOOrUndefined() === undefined) {
+    throw new CompanyError('unavailable', `${command} 需要执行端（本机服务或 owner CLI），当前运行环境没有本机宿主`);
+  }
   const a = actor(via);
   const idemp = typeof input.idempotencyKey === 'string' && /^[A-Za-z0-9_:.-]{8,120}$/.test(input.idempotencyKey)
     ? input.idempotencyKey : undefined;
