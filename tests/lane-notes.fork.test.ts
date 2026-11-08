@@ -180,7 +180,7 @@ run('a task approved after two returns keeps only the passing round\'s five note
   }
   expect(execute).toContain('在最终提交上按验收标准逐条自验');
   expect(execute).toContain('合入 main');
-  expect(execute).toContain('自动升级会把 main 装到生产');
+  expect(execute).toContain('安装到生产由老板侧完成');
   expect(execute).toContain('不要登记升级卡');
   expect(review).toContain('先查验收标准第 1 条');
   expect(review).toContain('不成立就直接退回');
