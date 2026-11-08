@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { issueRemoteGrant, listRemoteGrants, revokeRemoteGrant, remoteGrantUrl, validateRemoteBlock, dbWsUrl } from '../src/ops/remote-grant.ts';
+import { assertTaskExists, issueRemoteGrant, listRemoteGrants, REMOTE_OPERATOR_CHANNEL, revokeRemoteGrant, remoteGrantUrl, timedFetch, validateRemoteBlock, dbWsUrl } from '../src/ops/remote-grant.ts';
 import type { RemoteGrantDeps } from '../src/ops/remote-grant.ts';
 import { sha256Base64Url } from '../src/ops/idp-principals.ts';
 import type { D1Client } from '../src/ops/d1.ts';
@@ -48,7 +48,6 @@ const deps = (over: Partial<RemoteGrantDeps> = {}): RemoteGrantDeps => ({
   now: () => NOW,
   randomCode: () => 'fixedcode1234567890fixedcode1234567890=='.slice(0, 43),
   operatorToken: async () => 'ops_tok',
-  customerToken: async () => 'cust_tok',
   audit: async () => undefined,
   ...over,
 });
@@ -87,11 +86,12 @@ describe('issueRemoteGrant', () => {
     expect(result.url).toContain('aud=aud-product');
     expect(result.url).toContain('ops_aud=aud-ops');
     expect(result.url).toContain('db_url=wss%3A%2F%2Fdata.example.test%2Frpc');
-    // 顺序：test-subject PUT 在 workspace POST 之前
-    const putIdx = calls.findIndex((c) => c.path.includes('test-subjects'));
-    const wsIdx = calls.findIndex((c) => c.method === 'POST' && c.path.includes('workspaces'));
+    // 顺序：test-subject PUT 在同 subject 的 workspaces POST 之前
+    const putIdx = calls.findIndex((c) => c.method === 'PUT' && c.path.includes('test-subjects'));
+    const wsIdx = calls.findIndex((c) => c.method === 'POST' && c.path.includes('test-subjects') && c.path.includes('workspaces'));
     expect(putIdx).toBeGreaterThanOrEqual(0);
     expect(wsIdx).toBeGreaterThan(putIdx);
+    expect(calls[wsIdx]?.body).toMatchObject({ slug: result.workspaceSlug });
     // 审计不含码
     expect(audits[0]).not.toContain('fixedcode');
     expect(audits[0]).toContain(result.grantId);
@@ -161,5 +161,26 @@ describe('listRemoteGrants + url helpers', () => {
   test('dbWsUrl derives wss rpc and url helpers encode', () => {
     expect(dbWsUrl(cfg)).toBe('wss://data.example.test/rpc');
     expect(remoteGrantUrl(cfg, 'c#x', false)).toContain('code=c%23x');
+  });
+});
+
+describe('assertTaskExists + operator channel regression', () => {
+  test('operator channel is the consent-auto-approved one, not ops', () => {
+    // ops_operator_login 用 'operator'（cfg.ops clientId，consent 自动批准）；
+    // 'ops'（cfg.idp.ops clientId）会被 IdP 以 consent_required 拒绝。
+    expect(REMOTE_OPERATOR_CHANNEL).toBe('operator');
+    expect(cfg.idp.ops?.clientId).not.toBe(cfg.ops?.clientId ?? 'missing');
+  });
+  test('assertTaskExists rejects a missing task and accepts an existing one', async () => {
+    const missing = { async query() { return []; } };
+    await expect(assertTaskExists(missing, 'task_none')).rejects.toMatchObject({ code: 'not_found' });
+    const found = { async query() { return [[{ id: 'task_x' }]]; } };
+    await expect(assertTaskExists(found, 'task_x')).resolves.toBeUndefined();
+  });
+  test('timedFetch adds an abort signal when the caller gave none', async () => {
+    let seen: AbortSignal | null | undefined;
+    const wrapped = timedFetch(async (_i, init) => { seen = init?.signal; return new Response('{}'); });
+    await wrapped('https://example.test');
+    expect(seen).not.toBeNull();
   });
 });
