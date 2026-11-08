@@ -1086,7 +1086,11 @@ export class SurrealCompanyCore implements CompanyCore {
     const project = input.project ? await this.projects.get(input.project) : undefined;
     if (!project?.repoPath) return undefined;
     let opsCanon: string, projectCanon: string;
-    try { opsCanon = canonicalRepoPath(ops); projectCanon = canonicalRepoPath(project.repoPath); } catch { return undefined; }
+    try { opsCanon = canonicalRepoPath(ops); projectCanon = canonicalRepoPath(project.repoPath); } catch (error) {
+      // Without an execution host the local layout is unknown: refuse, never route the task to the project repo by guess.
+      if (error instanceof CompanyError && error.code === 'unavailable') throw error;
+      return undefined;
+    }
     return opsCanon === projectCanon ? undefined : opsCanon;
   }
 
