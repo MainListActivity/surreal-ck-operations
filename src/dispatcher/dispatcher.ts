@@ -25,6 +25,7 @@ import { summarizeReclaim } from './artifact-sweeper.ts';
 import { isRetireRefused } from '../retirement.ts';
 import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, repoName, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
 export type { BlockCode, DispatchPhase, DispatchVerdict } from './dispatch-blocked.ts';
+import type { BoardEmployeeView, BoardNextEntry, BoardPhase, BoardQueueItem, BoardView } from '../board.ts';
 
 /**
  * Weight factor for a prior hand of a review task (SYS-DISP IR01): they claimed execute but never wrote code with
@@ -546,6 +547,8 @@ export interface DispatchSnapshot {
   pools: Array<{ role: string; home: string; entries: StaffingEntry[] }>;
   reviewPools: ReviewStaffingPreview[];
   ready: ReadyItem[];
+  /** The owner board's queue and per-employee next rows (W2). Absent before the first pass that read its inputs. */
+  board?: BoardView;
 }
 
 const emptySnapshot = (): DispatchSnapshot => ({ at: 0, verdicts: [], pools: [], reviewPools: [], ready: [] });
@@ -565,6 +568,10 @@ export interface PassInputs {
   runtimeModels?: Map<string, string>;
   /** taskId → why the effective policy contract no longer authorizes it, read once in this pass (SYS06 AC02/RB01). */
   factoryQueue?: Map<string, number>;
+  /** Review exclusions this pass read for its queued review items; undefined for an item whose history could not be read. */
+  exclusions?: Map<string, ReviewExclusion | undefined>;
+  /** Instances this pass assigned work to. The board reads them as taken, as the dispatch loop did. */
+  assigned?: ReadonlySet<string>;
 }
 
 export interface TickReport {
@@ -596,7 +603,16 @@ export interface TickReport {
  * read and the verdicts it recorded. The tick builds it at the end of every pass; tests build it from their own inputs, so the
  * owner-facing answers are measured against the same function the tick uses.
  */
-export async function snapshotOf(p: PassInputs, opts: { opsRepo: string; sidecar: boolean; log?: (message: string) => void },
+/** Where a snapshot reads its environment: the repository and sck binary a dispatch names, and each employee's comm dir when there is a sidecar. */
+export interface SnapshotOpts {
+  opsRepo: string;
+  sidecar: boolean;
+  sckBin?: string;
+  commDirFor?: (instId: string) => string;
+  log?: (message: string) => void;
+}
+
+export async function snapshotOf(p: PassInputs, opts: SnapshotOpts,
   verdicts: DispatchVerdict[], wf: Pick<Workforce, 'contributors' | 'readySince'>, at = Date.now()): Promise<DispatchSnapshot> {
   const busyBy = new Map<string, number>();
   for (const inst of p.insts) {
@@ -623,7 +639,72 @@ export async function snapshotOf(p: PassInputs, opts: { opsRepo: string; sidecar
   const ready = readyTasks.map((t): ReadyItem => ({
     taskId: t.id, title: t.title, role: t.executorRole as string, discipline: t.discipline, readySince: since.get(t.id),
   }));
-  return { at, verdicts: [...verdicts], pools, reviewPools, ready };
+  // The board is an extra view: a failure in it must not cost the owner the pools and verdicts of the same pass.
+  const board = await boardOf(p, opts, verdicts, { ...poolBase, assigned: p.assigned }, wf, at)
+    .catch((error: unknown) => { opts.log?.(`board read failed: ${error instanceof Error ? error.message : String(error)}`); return undefined; });
+  return { at, verdicts: [...verdicts], pools, reviewPools, ready, board };
+}
+
+/** Permanent reasons: only an owner edit (task, roster, def) can clear them, so the candidate never appears in the employee's next rows. */
+const BOARD_NEVER = new Set<BlockCode>(['prior_submitter', 'track_mismatch', 'def_disabled', 'credential_file']);
+/** Pass-wide gates: the whole queue waits on them, so each item reads the gate rather than its candidates. */
+const BOARD_GATES = new Set<BlockCode>(['paused', 'budget', 'resources', 'memory_pressure', 'disk_space', 'max_running']);
+/** Codes a holder meets because its own lease is still open: the item is ready and waits for that lease to end. */
+const BOARD_LEASE = new Set<BlockCode>(['held', 'session_busy']);
+/** Rows per employee on the board. */
+export const BOARD_NEXT_ROWS = 5;
+
+/**
+ * The owner board's queue and per-employee next rows (W2). Each row comes from staffingPool with the inputs of this pass, the
+ * function dispatch itself picks with, so a row and the candidate state the tick acts on cannot disagree. A row's position is its
+ * index in the queue of this pass; the board reader renumbers the rows that are still queued.
+ */
+async function boardOf(p: PassInputs, opts: SnapshotOpts, verdicts: readonly DispatchVerdict[],
+  base: Omit<StaffingInput, 'role' | 'home' | 'task' | 'excludeSubmitter' | 'exclusion'>, wf: Pick<Workforce, 'contributors'>, at: number): Promise<BoardView> {
+  const verdictOf = new Map(verdicts.map(verdict => [`${verdict.taskId}:${verdict.phase}`, verdict] as const));
+  const holding = new Set(p.tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
+  // Dispatch order of the pass: review first, then execute, and the Factory reservation order over both (the same sort as tick).
+  const queued: Array<{ task: SupervisedTask; role: string; phase: BoardPhase }> = [
+    ...p.tasks.filter(t => t.state === 'review' && t.reviewerRole !== 'owner' && !t.currentEmployee)
+      .map(task => ({ task, role: task.reviewerRole as string, phase: 'review' as const })),
+    ...p.tasks.filter(t => (t.state === 'ready' || t.state === 'doing') && !t.currentEmployee)
+      .map(task => ({ task, role: task.executorRole as string, phase: 'execute' as const })),
+  ].sort((a, b) => (p.factoryQueue?.get(factoryWorkKey(a.role, a.task, a.phase === 'review')) ?? Infinity)
+    - (p.factoryQueue?.get(factoryWorkKey(b.role, b.task, b.phase === 'review')) ?? Infinity));
+  const queue: BoardQueueItem[] = [];
+  const nextOf = new Map<string, BoardNextEntry[]>();
+  for (const { task, role, phase } of queued) {
+    const review = phase === 'review';
+    const verdict = verdictOf.get(`${task.id}:${phase}`);
+    const gate = verdict?.reasons.find(reason => BOARD_GATES.has(reason.code));
+    const exclusion = !review ? undefined : p.exclusions?.has(task.id) ? p.exclusions.get(task.id)
+      : await readReviewExclusion(wf, task, opts.log);
+    if (review && exclusion === undefined) {
+      queue.push({ taskId: task.id, title: task.title, phase, role, blocked: true, body: '历史读取失败，待重判' });
+      continue;
+    }
+    const blocked = gate !== undefined || (verdict !== undefined && !verdict.dispatchable);
+    const verdictText = verdict && !verdict.dispatchable && verdict.reasons.length ? verdict.reasons.map(reason => reason.text).join('；') : undefined;
+    queue.push({ taskId: task.id, title: task.title, phase, role, blocked,
+      body: gate?.text ?? verdictText ?? (review ? '待复核，等待派工' : '依赖已解锁，等待派工') });
+    const entries = staffingPool({ ...base, role, home: task.repoPath ?? opts.opsRepo, task, excludeSubmitter: review, exclusion });
+    for (const entry of entries) {
+      if (entry.kind !== 'reuse' || !entry.inst) continue;
+      if (!entry.eligible && entry.code && BOARD_NEVER.has(entry.code)) continue;
+      const eligible = gate === undefined && entry.eligible;
+      const body = gate?.text
+        ?? (entry.eligible ? '可接'
+          : entry.code && BOARD_LEASE.has(entry.code) && holding.has(entry.inst.id) ? (review ? '待复核，等租约释放' : '依赖已解锁，等租约释放')
+            : entry.reason ?? (entry.code ? BLOCK_TEXT[entry.code] : '不可接'));
+      const row: BoardNextEntry = { taskId: task.id, title: task.title, phase, eligible, body };
+      nextOf.set(entry.inst.id, [...nextOf.get(entry.inst.id) ?? [], row]);
+    }
+  }
+  const employees: Record<string, BoardEmployeeView> = {};
+  for (const inst of p.insts) {
+    employees[inst.id] = { commDir: opts.commDirFor?.(inst.id) ?? '$SCK_COMM_DIR', next: (nextOf.get(inst.id) ?? []).slice(0, BOARD_NEXT_ROWS) };
+  }
+  return { at, env: { sckBin: opts.sckBin ?? '', opsRepo: opts.opsRepo }, queue, employees };
 }
 
 export class Dispatcher {
@@ -1321,6 +1402,8 @@ export class Dispatcher {
       sidecar: !!this.deps.sidecar, now };
     const queueExclusions = new Map<string,ReviewExclusion|undefined>();
     for(const item of work.filter(item=>item.purpose==='review')) queueExclusions.set(item.task.id,await readReviewExclusion(wf,item.task,message=>this.log(message)));
+    this.passInputs.exclusions=queueExclusions;
+    this.passInputs.assigned=assigned;
     const factoryWaiting = factoryQueue([
       ...work.map(item=>({task:item.task,role:item.role,review:item.purpose==='review'})),
       
@@ -2107,8 +2190,9 @@ export class Dispatcher {
 
   /** The snapshot of this pass: the inputs it read, and the verdicts it recorded. */
   private async buildSnapshot(p: PassInputs): Promise<DispatchSnapshot> {
-    const { workforce: wf, env } = this.deps;
-    return snapshotOf(p, { opsRepo: env.opsRepo, sidecar: !!this.deps.sidecar, log: message => this.log(message) },
+    const { workforce: wf, env, sidecar } = this.deps;
+    return snapshotOf(p, { opsRepo: env.opsRepo, sidecar: !!sidecar, sckBin: env.sckBin,
+      commDirFor: sidecar ? instId => sidecar.commDirFor(instId) : undefined, log: message => this.log(message) },
       [...this.verdicts.values()], wf);
   }
 

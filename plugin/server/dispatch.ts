@@ -1,4 +1,5 @@
 import { DispatchTimings } from "./vendor/src/diagnostics.ts";
+import { writeBoardView } from "./vendor/src/board.ts";
 import { openUserPaths, scratchKeepReason } from "./vendor/src/dispatcher/scratch-gc.ts";
 import { pruneOperationalData } from "./vendor/src/data-retention.ts";
 import { recordPendingTaskCosts } from "./vendor/src/task-cost.ts";
@@ -303,6 +304,15 @@ export async function persistDispatchObservation(ctx: Company): Promise<void> {
   }
 }
 
+/**
+ * Persist the latest pass's owner board (W2): the queue and each employee's next rows, the values a dispatch message names,
+ * and the comm dirs. The board reader joins it with the live database; it never reads the scheduler's memory.
+ */
+export async function persistBoardView(ctx: Company): Promise<void> {
+  const board = ctx.dispatcher.dispatchSnapshot().board;
+  if (board?.at) await writeBoardView(ctx.db.db, board);
+}
+
 export function startDispatch(server: PluginServerContext): () => void {
   let stopped = false;
   const interruptions = new TurnInterruptions();
@@ -407,6 +417,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
             .finally(()=>{autoUpgradePending=false;});
         }
         await timing.measure("observation", () => persistDispatchObservation(ctx)).catch((error) => console.warn(`dispatch observation write failed: ${(error as Error).message}`));
+        await timing.measure("board", () => persistBoardView(ctx)).catch((error) => console.warn(`board view write failed: ${(error as Error).message}`));
         failures = 0;
         const changed = report.commands || report.revoked.length || report.woke.length || report.retired.length ||
           report.exhausted.length || (report.recovered?.length ?? 0) || report.notices.length || report.evals.length || (report.decisions?.length ?? 0) ||
