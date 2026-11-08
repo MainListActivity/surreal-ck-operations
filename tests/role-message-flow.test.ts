@@ -86,6 +86,20 @@ test('the code template instructs a sha submit and resolves absolute paths', () 
   expect(renderMessage(templateFor('rework', true), { ...opts, findingsFile: '/f/round-1.md' })).toContain('round-1.md');
 });
 
+test('company commands are named in every employee execute, rework and review body, with the sck path resolved', () => {
+  // 老板端的运维与管理命令都经 company_cmd 调用，先用 company_cmd_catalog 查可用命令；只能在持有任务时调用。
+  const opts = { sckBin: '/bin/sck', commDir: '/c', taskId: 't1' };
+  const bodies = [templateFor('execute', true), templateFor('execute', false), templateFor('rework', true), templateFor('review', true), templateFor('review', false)];
+  for (const body of bodies) {
+    expect(body).toContain('sck call company_cmd 调用');
+    expect(body).toContain('sck call company_cmd_catalog 查可用命令');
+    expect(body).toContain('只能在持有任务时调用');
+    const rendered = renderMessage(body, { ...opts, findingsFile: '/f/round-1.md' });
+    expect(rendered).toContain("'/bin/sck' call company_cmd 调用");
+    expect(rendered).toContain("'/bin/sck' call company_cmd_catalog 查可用命令");
+  }
+});
+
 test('machineCriterionId reads the first required machine criterion and falls back when absent', async () => {
   const rows: Record<string, unknown>[] = [{
     acceptance_criteria: [
