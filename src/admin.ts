@@ -247,10 +247,13 @@ try {
       if (!cfg) throw new CompanyError('not_configured', `project ${opts.project}/${opts.env} has no broker config`);
       if (cfg.remote) validateRemoteBlock(cfg.remote);
       const controlEnv = controlPlaneEnv();
+      const rglog = (m: string) => console.error(`[remote-grant ${new Date().toISOString().slice(11, 19)}] ${m}`);
+      const fetch30 = timedFetch(fetch, 30_000);
       const d1 = cloudflareD1({
         accountId: controlEnv.cloudflareAccountId ?? '',
         databaseId: cfg.d1?.databaseId ?? '',
         token: controlEnv.cloudflareToken ?? '',
+        fetch: fetch30,
       });
       const secretKey = loadSecretKey(false);
       const sealedPassword = async (alias: string) =>
@@ -258,8 +261,6 @@ try {
       const sealPassword = async (alias: string, password: string) => {
         await store.setSecret({ project: opts.project, env: opts.env, name: passwordSecretName(alias), value: password, roles: [] }, secretKey);
       };
-      const rglog = (m: string) => console.error(`[remote-grant ${new Date().toISOString().slice(11, 19)}] ${m}`);
-      const fetch30 = timedFetch(fetch, 30_000);
       const loginFor = async (alias: string, channel: 'customer' | 'ops' | 'operator') => {
         const password = await sealedPassword(alias);
         if (!password) throw new CompanyError('not_configured', `no sealed password for alias ${alias}; run ops_account_ensure first`);
