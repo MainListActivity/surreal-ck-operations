@@ -116,6 +116,8 @@ run('055 运行器：普通数据可读写；需求、验收、正文与保留�
   await seedMessage('fx_runner', 'fx_runner');
   const runner = await session(tokenFor('runner', 'runner-1'));
   await runner.query("UPDATE task:fx_runner SET state = 'doing';");
+  const [[seen]] = await runner.query<[Array<{ state: string }>]>('SELECT state FROM task:fx_runner;');
+  expect(seen).toMatchObject({ state: 'doing' });
   await rejects(runner.query("UPDATE task:fx_runner SET requirement = '篡改';"), TASK_GUARD);
   await rejects(runner.query("UPDATE task:fx_runner SET acceptance_text = '篡改';"), TASK_GUARD);
   await rejects(runner.query("UPDATE task:fx_runner SET acceptance_criteria = [{ id: 'x', kind: 'machine', required: true }];"), TASK_GUARD);
@@ -132,12 +134,34 @@ run('055 运行器：普通数据可读写；需求、验收、正文与保留�
   expect(message).toMatchObject({ state: 'sent', body: '正文原文', hold: false });
 });
 
+run('055 自动化：普通数据可读写；需求、验收、正文与保留的改动被拒，行保持不变', async () => {
+  await seedTask('fx_auto_edit');
+  await seedMessage('fx_auto_edit', 'fx_auto_edit');
+  const automation = await session(tokenFor('automation', 'automation-1'));
+  await automation.query("UPDATE task:fx_auto_edit SET state = 'doing';");
+  const [[seen]] = await automation.query<[Array<{ state: string }>]>('SELECT state FROM task:fx_auto_edit;');
+  expect(seen).toMatchObject({ state: 'doing' });
+  await rejects(automation.query("UPDATE task:fx_auto_edit SET requirement = '篡改';"), TASK_GUARD);
+  await rejects(automation.query("UPDATE task:fx_auto_edit SET acceptance_text = '篡改';"), TASK_GUARD);
+  await rejects(automation.query("UPDATE task:fx_auto_edit SET acceptance_criteria = [{ id: 'x', kind: 'machine', required: true }];"), TASK_GUARD);
+  await rejects(automation.query("UPDATE task:fx_auto_edit SET context = '篡改';"), TASK_GUARD);
+  await rejects(automation.query("UPDATE outbound_message:fx_auto_edit SET body = '篡改';"), MESSAGE_GUARD);
+  await rejects(automation.query('UPDATE outbound_message:fx_auto_edit SET hold = true;'), MESSAGE_GUARD);
+  const [[task]] = await company.db.query<[Array<Record<string, unknown>>]>(
+    'SELECT state, requirement, acceptance_text, context FROM task:fx_auto_edit;');
+  expect(task).toMatchObject({ state: 'doing', requirement: '需求原文', acceptance_text: '验收原文', context: '老板原话' });
+  const [[message]] = await company.db.query<[Array<Record<string, unknown>>]>('SELECT body, hold FROM outbound_message:fx_auto_edit;');
+  expect(message).toMatchObject({ body: '正文原文', hold: false });
+});
+
 run('055 老板：可以改需求、验收与消息正文、保留；建带需求的任务不受限制', async () => {
   await seedTask('fx_owner');
   await seedMessage('fx_owner', 'fx_owner');
   const owner = await session(tokenFor('owner', 'owner-1'));
   await owner.query("UPDATE task:fx_owner SET requirement = '老板改的需求', acceptance_text = '老板改的验收';");
   await owner.query("UPDATE outbound_message:fx_owner SET body = '老板改的正文', hold = true;");
+  const [[seenByOwner]] = await owner.query<[Array<{ requirement: string }>]>('SELECT requirement FROM task:fx_owner;');
+  expect(seenByOwner).toMatchObject({ requirement: '老板改的需求' });
   await owner.query("CREATE task:fx_owner_new CONTENT { title: '老板建单', context: '老板原话', requirement: '需求', state: 'ready', kind: 'task' };");
   const [[task]] = await company.db.query<[Array<Record<string, unknown>>]>('SELECT requirement, acceptance_text FROM task:fx_owner;');
   expect(task).toMatchObject({ requirement: '老板改的需求', acceptance_text: '老板改的验收' });
