@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { RecordId, Surreal } from 'surrealdb';
 import { CompanyDatabase } from '../src/database.ts';
+import { audit, decide, digestOf } from '../src/command-guard.ts';
 
 setDefaultTimeout(60000);
 // 隔离的公司 fork（内存库，自己起停）。令牌用 HS512 共享密钥代替 JWKS：签名与校验走同一条 JWT 访问路径，
@@ -225,4 +226,60 @@ run('bootstrap 公司模式应用 055：三种访问方式按 JWKS 地址定义�
   } finally {
     await second.close();
   }
+});
+
+run('命令守卫（库内事实）：老板直接放行；员工凭有效租约放行，租约过期或缺失即拒', async () => {
+  const now = nowSec();
+  await company.db.query(`CREATE task:fx_lease CONTENT { title: '租约', state: 'doing', kind: 'task', current_employee: 'emp-g', lease_expires_at: $live, fence: 1, version: 1 };`, { live: now + 600 });
+  await company.db.query(`CREATE task:fx_expired CONTENT { title: '过期', state: 'doing', kind: 'task', current_employee: 'emp-g', lease_expires_at: $past, fence: 1, version: 1 };`, { past: now - 1 });
+  await company.db.query("CREATE task:fx_free CONTENT { title: '空闲', state: 'ready', kind: 'task', fence: 0, version: 1 };");
+  const base = { actor: 'emp-g', command: 'submit', now };
+  expect(await decide(company.db, { ...base, actorKind: 'agent', task: 'fx_lease' })).toMatchObject({ allow: true });
+  expect(await decide(company.db, { ...base, actorKind: 'agent', task: 'fx_expired' })).toMatchObject({ allow: false, reason: '没有该任务的有效租约' });
+  expect(await decide(company.db, { ...base, actorKind: 'agent', task: 'fx_free' })).toMatchObject({ allow: false });
+  expect(await decide(company.db, { ...base, actorKind: 'agent', task: 'fx_missing' })).toMatchObject({ allow: false });
+  expect(await decide(company.db, { actorKind: 'owner', actor: 'owner:web', command: 'task.void', now })).toMatchObject({ allow: true });
+});
+
+run('命令守卫（库内事实）：员工策略的停用、允许与拒绝清单，保护清单与硬性老板命令逐条生效；运行器只受老板命令约束', async () => {
+  const now = nowSec();
+  const seedLease = (task: string, employee: string) => company.db.query(
+    `CREATE task:${task} CONTENT { title: '策略', state: 'doing', kind: 'task', current_employee: $employee, lease_expires_at: $live, fence: 1, version: 1 };`,
+    { employee, live: now + 600 });
+  await seedLease('fx_off', 'emp-off');
+  await seedLease('fx_deny', 'emp-deny');
+  await seedLease('fx_allow', 'emp-allow');
+  await company.db.query("CREATE agent_policy CONTENT { agent: 'emp-off', disabled: true, deny: [], updated_by: 'owner-1', updated_at: time::now() };");
+  await company.db.query("CREATE agent_policy CONTENT { agent: 'emp-deny', disabled: false, deny: ['checkpoint'], updated_by: 'owner-1', updated_at: time::now() };");
+  await company.db.query("CREATE agent_policy CONTENT { agent: 'emp-allow', disabled: false, allow: ['submit'], deny: [], updated_by: 'owner-1', updated_at: time::now() };");
+  await company.db.query("CREATE protected_command CONTENT { command: 'heartbeat', owner_only: true, updated_by: 'owner-1', updated_at: time::now() };");
+  const ask = (actorKind: 'agent' | 'runner', actor: string, command: string, task?: string) =>
+    decide(company.db, { actorKind, actor, command, task, now });
+  expect(await ask('agent', 'emp-off', 'submit', 'fx_off')).toMatchObject({ allow: false, reason: '该员工已停用' });
+  expect(await ask('agent', 'emp-deny', 'checkpoint', 'fx_deny')).toMatchObject({ allow: false, reason: '该员工不能调用此命令' });
+  expect(await ask('agent', 'emp-deny', 'submit', 'fx_deny')).toMatchObject({ allow: true });
+  expect(await ask('agent', 'emp-allow', 'checkpoint', 'fx_allow')).toMatchObject({ allow: false, reason: '命令不在该员工的允许清单内' });
+  expect(await ask('agent', 'emp-allow', 'submit', 'fx_allow')).toMatchObject({ allow: true });
+  expect(await ask('agent', 'emp-deny', 'heartbeat', 'fx_deny')).toMatchObject({ allow: false, reason: '老板保护的命令，只有老板可以调用' });
+  expect(await ask('agent', 'emp-deny', 'agent.policy.set', 'fx_deny')).toMatchObject({ allow: false, reason: '老板专属命令，只有老板可以调用' });
+  expect(await ask('runner', 'runner-1', 'task.void')).toMatchObject({ allow: false });
+  expect(await ask('runner', 'runner-1', 'heartbeat')).toMatchObject({ allow: false });
+  expect(await ask('runner', 'runner-1', 'submit')).toMatchObject({ allow: true });
+});
+
+run('审计（库内）：只写参数与结果的摘要，原文不入库；没有任务时照样记录', async () => {
+  const args = { text: '客户资料原文 ABC-123', idempotencyKey: 'audit-key-1' };
+  await audit(company.db, { actorKind: 'agent', actor: 'emp-audit', task: 'fx_lease', command: 'submit', args, outcome: 'ok', result: { ok: true } });
+  await audit(company.db, { actorKind: 'runner', actor: 'runner-audit', command: 'task.void', args: { taskId: 'x' }, outcome: 'denied', reason: '运行器与自动化不能直接调用老板命令' });
+  const [rows] = await company.db.query<[Array<Record<string, unknown>>]>(
+    "SELECT * FROM ops_audit WHERE actor IN ['emp-audit', 'runner-audit'] ORDER BY actor;");
+  expect(rows).toHaveLength(2);
+  const [agentRow, runnerRow] = rows;
+  expect(agentRow).toMatchObject({ actor_kind: 'agent', actor: 'emp-audit', command: 'submit', outcome: 'ok', args_digest: await digestOf(args), result_digest: await digestOf({ ok: true }) });
+  expect(String(agentRow.task)).toBe('task:fx_lease');
+  expect(runnerRow).toMatchObject({ actor_kind: 'runner', outcome: 'denied', reason: '运行器与自动化不能直接调用老板命令' });
+  expect(runnerRow.task).toBeUndefined();
+  expect(runnerRow.result_digest).toBeUndefined();
+  const stored = JSON.stringify(rows);
+  for (const secret of ['客户资料原文', 'ABC-123', 'audit-key-1']) expect(stored).not.toContain(secret);
 });
