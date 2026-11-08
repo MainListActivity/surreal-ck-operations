@@ -46,7 +46,6 @@ const deps = (over: Record<string, unknown> = {}) => ({
   now: () => NOW,
   randomCode: () => 'fixedcode1234567890fixedcode1234567890=='.slice(0, 43),
   operatorToken: async () => 'ops_tok',
-  customerToken: async () => 'cust_tok',
   audit: async () => undefined,
   ...over,
 });
@@ -85,11 +84,12 @@ describe('issueRemoteGrant', () => {
     expect(result.url).toContain('aud=aud-product');
     expect(result.url).toContain('ops_aud=aud-ops');
     expect(result.url).toContain('db_url=wss%3A%2F%2Fdata.example.test%2Frpc');
-    // 顺序：test-subject PUT 在 workspace POST 之前
-    const putIdx = calls.findIndex((c) => c.path.includes('test-subjects'));
-    const wsIdx = calls.findIndex((c) => c.method === 'POST' && c.path.includes('workspaces'));
+    // 顺序：test-subject PUT 在同 subject 的 workspaces POST 之前
+    const putIdx = calls.findIndex((c) => c.method === 'PUT' && c.path.includes('test-subjects'));
+    const wsIdx = calls.findIndex((c) => c.method === 'POST' && c.path.includes('test-subjects') && c.path.includes('workspaces'));
     expect(putIdx).toBeGreaterThanOrEqual(0);
     expect(wsIdx).toBeGreaterThan(putIdx);
+    expect(calls[wsIdx]?.body).toMatchObject({ slug: result.workspaceSlug });
     // 审计不含码
     expect(audits[0]).not.toContain('fixedcode');
     expect(audits[0]).toContain(result.grantId);

@@ -4,6 +4,7 @@
  * 不写审计、不写日志、不进密封库。
  */
 import { createHash, randomBytes } from 'node:crypto';
+import { RecordId } from 'surrealdb';
 import { CompanyError } from '../core-errors.ts';
 import { canonicalAlias, accountUsername, accountEmail, ensureAccount } from './accounts.ts';
 import { sha256Base64Url } from './idp-principals.ts';
@@ -62,8 +63,6 @@ export interface RemoteGrantDeps {
   sealedPassword?: (alias: string) => Promise<string | undefined>;
   /** 写密码到密封库（alias → password），仅建号时需要。 */
   sealPassword?: (alias: string, password: string) => Promise<void>;
-  /** alias 客户会话 access token（产品 audience）。 */
-  customerToken?: (alias: string) => Promise<string>;
   /** remote.testManagerAlias 运营会话 access token（ops audience）。 */
   operatorToken?: () => Promise<string>;
   /** 审计（绝不含码）。 */
@@ -204,20 +203,19 @@ export async function issueRemoteGrant(
     throw new CompanyError('upstream_error', `test-subject registration failed (HTTP ${put.status})`);
   }
 
-  // d) 测试 workspace：slug = <prefix><alias小写>-<taskId前8位>。
-  if (deps.customerToken === undefined) throw new CompanyError('not_configured', 'customer token wiring is required');
-  const customerToken = await deps.customerToken(alias);
+  // d) 测试 workspace：运营代办开通（POST /api/ops/test-subjects/:subject/workspaces）。
+  //    公共入口 POST /api/workspaces 被 LCA10 商业来源门禁 409 关闭；
+  //    服务端走 manual/trial_v2 来源、owner=subject 且自动打 test_expires_at。
   const slug = `${cfg.accounts.workspacePrefix}${alias.toLowerCase().replaceAll('_', '-')}-${input.taskId.slice(0, 8)}`;
-  const listing = await productRequest(cfg, customerToken, { method: 'GET', path: '/api/session/workspaces' }, { fetch: deps.fetch });
-  const workspaces = ((listing.body ?? {}) as { workspaces?: { slug?: string }[] }).workspaces ?? [];
-  if (!workspaces.some((w) => w.slug === slug)) {
-    const create = await productRequest(cfg, customerToken, {
-      method: 'POST', path: '/api/workspaces',
-      body: { name: `remote-${input.taskId.slice(0, 8)}`, slug },
-    }, { fetch: deps.fetch });
-    if (!create.ok) {
-      throw new CompanyError('upstream_error', `workspace creation failed (HTTP ${create.status})`);
-    }
+  const wsRes = await productRequest(cfg, await deps.operatorToken(), {
+    method: 'POST',
+    path: `/api/ops/test-subjects/${encodeURIComponent(subject)}/workspaces`,
+    body: { name: `remote-${input.taskId.slice(0, 8)}`, slug },
+  }, { fetch: deps.fetch });
+  if (!wsRes.ok) {
+    const detail = ((wsRes.body ?? {}) as { error?: { code?: string } }).error?.code
+      ?? (wsRes.body as { error?: string } | undefined)?.error ?? `http_${wsRes.status}`;
+    throw new CompanyError('upstream_error', `test-subject workspace creation failed (HTTP ${wsRes.status} ${detail})`);
   }
 
   // e) 兑换码只存 hash；resources = 产品 audience（content 时加运营 audience）。
@@ -328,8 +326,8 @@ export async function assertTaskExists(
   taskId: string,
 ): Promise<void> {
   const rows = await db.query(
-    `SELECT id FROM task WHERE id = type::thing('task', $taskId) LIMIT 1;`,
-    { taskId });
+    'SELECT id FROM task WHERE id = $task LIMIT 1;',
+    { task: new RecordId('task', taskId) });
   const list = (Array.isArray(rows) ? rows[0] : rows) as unknown[];
   if (!Array.isArray(list) || list.length === 0) {
     throw new CompanyError('not_found', `task ${taskId} does not exist`);

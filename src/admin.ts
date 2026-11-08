@@ -279,7 +279,7 @@ try {
         await assertTaskExists(database.db, taskId);
         rglog('task exists; issuing');
         const result = await issueRemoteGrant(
-          { d1, fetch: fetch30, sealedPassword, sealPassword, customerToken: (a) => loginFor(a, 'customer'), operatorToken: () => loginFor(canonicalAlias(cfg.remote!.testManagerAlias), REMOTE_OPERATOR_CHANNEL), audit },
+          { d1, fetch: fetch30, sealedPassword, sealPassword, operatorToken: () => loginFor(canonicalAlias(cfg.remote!.testManagerAlias), REMOTE_OPERATOR_CHANNEL), audit },
           { cfg, taskId, alias: opts.alias, ...(opts.days !== undefined ? { days: opts.days } : {}), content: opts.content === true },
         );
         rglog('issue complete');
