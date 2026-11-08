@@ -8,12 +8,25 @@ import { CompanyError } from '../core-errors.ts';
 import { canonicalAlias, accountUsername, accountEmail, ensureAccount } from './accounts.ts';
 import { sha256Base64Url } from './idp-principals.ts';
 import { productRequest } from './product.ts';
+import type { LoginChannel } from './idp.ts';
 import type { D1Client } from './d1.ts';
 import type { Fetcher } from './fetcher.ts';
 import type { BrokerConfig } from './config.ts';
 
 const invalid = (m: string) => new CompanyError('invalid', m);
 const conflict = (m: string) => new CompanyError('conflict', m);
+
+/**
+ * 测试管理员的运营会话通道：'operator'（cfg.ops，产品 /api/auth/ops/token 代理，
+ * consent 只对本公司 operator client 自动批准）。用 'ops'（cfg.idp.ops）会因
+ * consent_required 被拒——该通道是给 ops_operator_login 的 ops session 用的。
+ */
+export const REMOTE_OPERATOR_CHANNEL: LoginChannel = 'operator';
+
+/** 包装 fetch：无显式 signal 的调用统一加 30s 超时，防外部 HTTP 挂起时 CLI 静默卡死。 */
+export function timedFetch(fetcher: Fetcher, timeoutMs = 30_000): Fetcher {
+  return (input, init) => fetcher(input, { ...init, signal: init?.signal ?? AbortSignal.timeout(timeoutMs) });
+}
 
 export interface RemoteGrantRemoteBlock {
   clientId: string;
@@ -308,5 +321,19 @@ export async function listRemoteGrants(
 
 /** 生成 32B base64url 兑换码（公开给测试与签发路径；与 ma_hono 约定一致）。 */
 export const generateRemoteCode = mintCode;
+
+/** 派工校验：任务行必须存在于公司库（任务无 project 字段，无法做项目归属校验）。 */
+export async function assertTaskExists(
+  db: { query(sql: string, params: Record<string, unknown>): Promise<unknown> },
+  taskId: string,
+): Promise<void> {
+  const rows = await db.query(
+    `SELECT id FROM task WHERE id = type::thing('task', $taskId) LIMIT 1;`,
+    { taskId });
+  const list = (Array.isArray(rows) ? rows[0] : rows) as unknown[];
+  if (!Array.isArray(list) || list.length === 0) {
+    throw new CompanyError('not_found', `task ${taskId} does not exist`);
+  }
+}
 
 export { sha256Base64Url };

@@ -15,7 +15,7 @@ import { cloudflareD1 } from './ops/d1.ts';
 import { passwordLogin } from './ops/idp.ts';
 import { controlPlaneEnv } from './ops/config.ts';
 import type { BrokerConfig } from './ops/config.ts';
-import { issueRemoteGrant, listRemoteGrants, revokeRemoteGrant, validateRemoteBlock } from './ops/remote-grant.ts';
+import { assertTaskExists, issueRemoteGrant, listRemoteGrants, REMOTE_OPERATOR_CHANNEL, revokeRemoteGrant, timedFetch, validateRemoteBlock } from './ops/remote-grant.ts';
 import type { Role } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
 import { repairInfrastructureScores, rescoreAggregates } from './scoring.ts';
@@ -258,11 +258,14 @@ try {
       const sealPassword = async (alias: string, password: string) => {
         await store.setSecret({ project: opts.project, env: opts.env, name: passwordSecretName(alias), value: password, roles: [] }, secretKey);
       };
-      const loginFor = async (alias: string, channel: 'customer' | 'ops') => {
+      const rglog = (m: string) => console.error(`[remote-grant ${new Date().toISOString().slice(11, 19)}] ${m}`);
+      const fetch30 = timedFetch(fetch, 30_000);
+      const loginFor = async (alias: string, channel: 'customer' | 'ops' | 'operator') => {
         const password = await sealedPassword(alias);
         if (!password) throw new CompanyError('not_configured', `no sealed password for alias ${alias}; run ops_account_ensure first`);
         const username = accountUsername(alias, cfg.accounts.prefix);
-        const tokens = await passwordLogin(cfg, username, password, { channel });
+        rglog(`passwordLogin ${username} channel=${channel}`);
+        const tokens = await passwordLogin(cfg, username, password, { channel, fetch: fetch30 });
         return tokens.accessToken;
       };
       const audit = async (action: string, evidence: string) => {
@@ -272,10 +275,13 @@ try {
       if (sub === 'issue') {
         const taskId = positional[0] ?? opts.task;
         if (!taskId || !opts.alias) throw new Error('remote-grant issue <taskId> --alias <A> [--days 30] [--content] [--env production] [--attach]');
+        await assertTaskExists(database.db, taskId);
+        rglog('task exists; issuing');
         const result = await issueRemoteGrant(
-          { d1, sealedPassword, sealPassword, customerToken: (a) => loginFor(a, 'customer'), operatorToken: () => loginFor(canonicalAlias(cfg.remote!.testManagerAlias), 'ops'), audit },
+          { d1, fetch: fetch30, sealedPassword, sealPassword, customerToken: (a) => loginFor(a, 'customer'), operatorToken: () => loginFor(canonicalAlias(cfg.remote!.testManagerAlias), REMOTE_OPERATOR_CHANNEL), audit },
           { cfg, taskId, alias: opts.alias, ...(opts.days !== undefined ? { days: opts.days } : {}), content: opts.content === true },
         );
+        rglog('issue complete');
         // url（含一次性码）只出现在 stdout，仅此一次可见；其余信息走 stderr。
         console.error(JSON.stringify({ grantId: result.grantId, expiresAt: result.expiresAt, workspaceSlug: result.workspaceSlug, subject: result.subject }));
         if (opts.attach) {
@@ -294,7 +300,7 @@ try {
       } else if (sub === 'revoke') {
         const grantId = positional[0] ?? opts.grantId;
         const result = await revokeRemoteGrant(
-          { d1, operatorToken: () => loginFor(canonicalAlias(cfg.remote!.testManagerAlias), 'ops'), audit },
+          { d1, fetch: fetch30, operatorToken: () => loginFor(canonicalAlias(cfg.remote!.testManagerAlias), REMOTE_OPERATOR_CHANNEL), audit },
           { cfg, ...(grantId !== undefined ? { grantId } : {}), ...(opts.task !== undefined ? { taskId: opts.task } : {}), purge: opts.purge === true },
         );
         print(result);
