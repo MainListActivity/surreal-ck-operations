@@ -30,8 +30,8 @@ const NOTES = `先读 notes.md。`;
 /** A session that stays in its turn after handing in burns tokens and cannot be woken for its own rework. */
 const END_TURN = `提交后结束本轮，不要等结果；被退回时系统会再通知你。`;
 const LEARNED = `多数任务不需要写笔记；只有今后同职能的任务都用得上的要求、方法或坑，才加 learned 数组（最多 5 条，每条一行，不写本次任务的内容）；被退回那一轮写的笔记不会生效。`;
-/** 员工沙箱不能安装，也读不到生产控制台令牌：自验在最终提交上做，安装由自动升级完成。 */
-const EXECUTE_CODE = `${NOTES}实现 task.md 中的需求，在最终提交上按验收标准逐条自验，合入 main 后：sck call submit '{"text":"<结果>","sha":"<合入提交>"}'。自动升级会把 main 装到生产，你不要安装，也不要登记升级卡。需要后续任务时在 submit 里加 next 数组。${LEARNED}${END_TURN}`;
+/** 员工沙箱不能安装，也读不到生产控制台令牌：自验在最终提交上做，安装到生产由老板侧完成（普通任务登记不了升级卡，自动升级不会接手）。 */
+const EXECUTE_CODE = `${NOTES}实现 task.md 中的需求，在最终提交上按验收标准逐条自验，合入 main 后：sck call submit '{"text":"<结果>","sha":"<合入提交>"}'。安装到生产由老板侧完成，你不要安装，也不要登记升级卡。需要后续任务时在 submit 里加 next 数组。${LEARNED}${END_TURN}`;
 const EXECUTE_PLAIN = `${NOTES}完成 task.md 中的需求，按验收标准自验后：sck call submit '{"text":"<结果>"}'。需要后续任务时在 submit 里加 next 数组。${LEARNED}${END_TURN}`;
 /** 第 1 条写的是老板视角的结果：不成立就没必要再读其余标准；软件线只在最终合入提交上核对。 */
 const REVIEW_FIRST = `先查验收标准第 1 条：这一条写的是老板视角的结果，不成立就直接退回，其余各条不用再看；成立后再逐条复验其余标准。`;

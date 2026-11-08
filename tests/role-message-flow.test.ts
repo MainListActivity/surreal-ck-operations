@@ -52,10 +52,10 @@ test('minimal dispatch message: only what, where, how; no onboarding on first co
 });
 
 test('template bodies are the exact minimal sentences', () => {
-  // 员工沙箱不安装：代码任务在最终提交上自验，合入 main 后 submit，安装交给自动升级。
+  // 员工沙箱不安装：代码任务在最终提交上自验，合入 main 后 submit，安装由老板侧完成。
   expect(templateFor('execute', true)).toContain('在最终提交上按验收标准逐条自验');
   expect(templateFor('execute', true)).toContain('合入 main');
-  expect(templateFor('execute', true)).toContain('自动升级会把 main 装到生产');
+  expect(templateFor('execute', true)).toContain('安装到生产由老板侧完成');
   expect(templateFor('execute', true)).toContain('不要安装');
   expect(templateFor('execute', true)).toContain('不要登记升级卡');
   expect(templateFor('execute', true)).not.toContain('发布到生产');
