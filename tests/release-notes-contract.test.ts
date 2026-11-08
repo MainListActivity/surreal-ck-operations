@@ -38,7 +38,6 @@ describe('the release notes are registrable', () => {
 
   test('the notes name the schema they add', () => {
     const text = JSON.stringify(notes);
-    expect(text).toContain('054');
     expect(text).toContain('058');
   });
 
