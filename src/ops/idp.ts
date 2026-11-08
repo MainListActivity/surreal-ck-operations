@@ -336,7 +336,9 @@ interface Channel {
 function channelFor(config: BrokerConfig, kind: LoginChannel = 'customer'): Channel {
   if (kind === 'customer') {
     return {
-      clientId: config.idp.clientId, redirectUri: config.idp.redirectUri, scope: config.idp.scope,
+      // JSON 里存的 broker 配置可能缺 idp.scope（类型上必填但运行时可为空）；
+      // 缺省与 env 路径一致：openid profile email offline_access。
+      clientId: config.idp.clientId, redirectUri: config.idp.redirectUri, scope: config.idp.scope ?? 'openid profile email offline_access',
       authorize: config.idp.audience ? { audience: config.idp.audience } : {},
       tokenUrl: `${config.product.url}/api/auth/token`, sendsClientId: false,
     };
