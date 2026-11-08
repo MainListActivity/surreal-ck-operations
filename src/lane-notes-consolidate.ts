@@ -339,9 +339,10 @@ export async function listConsolidations(db: Surreal, limit = 20): Promise<Conso
 /**
  * The scheduler's entry point: consolidates every lane when the last check or the last recorded run is at least
  * `intervalMs` old, and returns undefined when it is not due. A pass that fails records no check, so the next tick retries.
+ * `rewrite` is passed on to the pass unchanged (a failed rewrite keeps the newest original text).
  */
 export async function consolidateDue(
-  db: Surreal, options: { now: Date; actor: string; intervalMs?: number },
+  db: Surreal, options: { now: Date; actor: string; intervalMs?: number; rewrite?: RewriteNotes },
 ): Promise<ConsolidationRun | undefined> {
   const marker = new RecordId('company_meta', 'note_consolidation');
   const checked = await db.select<{ checked_at?: Date }>(marker);
@@ -351,7 +352,7 @@ export async function consolidateDue(
     .map(value => new Date(value as Date).getTime());
   const elapsed = options.now.getTime() - Math.max(0, ...seen);
   if (seen.length && elapsed >= 0 && elapsed < (options.intervalMs ?? CONSOLIDATION_INTERVAL_MS)) return undefined;
-  const run = await consolidateAll(db, { now: options.now, actor: options.actor });
+  const run = await consolidateAll(db, { now: options.now, actor: options.actor, rewrite: options.rewrite });
   await db.query('UPSERT $marker CONTENT { checked_at: $now } RETURN NONE;', { marker, now: options.now });
   return run;
 }

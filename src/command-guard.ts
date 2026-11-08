@@ -12,9 +12,20 @@ export function matchesCommand(pattern: string, command: string): boolean {
 
 /**
  * 写死的老板专属命令：除老板外任何身份都不能调用，不受 protected_command 与 agent_policy 影响。
+ * 员工通过网关不得调用决策与写入类老板命令（任务的增删改与流转、决策、消息与笔记的编辑与放行、路由与员工策略、升级等）；
+ * 只读命令（看板、列表、进展、简报等）不在此列，员工与运行器仍按租约与清单判定。
  * `owner.login.*` 为预留，对应老板登录方式相关命令（当前还没有这些命令）。
+ * `agent.*` 覆盖原先的 `agent.policy.*`：员工策略及其它员工管理命令都只能由老板调用。
  */
-export const HARD_OWNER_ONLY: readonly string[] = ['guard.*', 'agent.policy.*', 'owner.login.*', 'def.*'];
+export const HARD_OWNER_ONLY: readonly string[] = [
+  'guard.*', 'agent.*', 'owner.login.*', 'def.*', 'db.write', 'idp.*', 'cf.api',
+  'task.create', 'task.update', 'task.delete', 'task.void', 'task.reassign', 'task.revoke', 'task.pause', 'task.resume',
+  'decide', 'approve', 'reject', 'reply', 'instruct', 'direction.add',
+  'message.edit', 'message.edit_rendered', 'message.hold', 'message.release', 'message.send', 'notice.resolve',
+  'route.save', 'route.disable', 'session.policy',
+  'note.edit', 'note.pin', 'note.activate', 'note.remove', 'note.consolidate', 'note.consolidation.undo',
+  'upgrade.*',
+];
 
 /** 老板接口（owner-api.ts）的全部命令。运行器与自动化不能直接调用；tests/command-guard.test.ts 核对它与 owner-api.ts 一致。 */
 export const OWNER_API_COMMANDS: readonly string[] = [
@@ -90,9 +101,13 @@ export async function decide(db: Surreal, request: GuardRequest): Promise<Decisi
 }
 
 async function factsFor(db: Surreal, request: GuardRequest): Promise<GuardFacts> {
-  const [protectedRows] = await db.query<[Array<{ owner_only?: boolean }>]>(
-    'SELECT owner_only FROM protected_command WHERE command = $command LIMIT 1;', { command: request.command });
-  const facts: GuardFacts = { protectedOwnerOnly: protectedRows[0]?.owner_only === true };
+  // 保护清单可以写成 `task.*` 这样的模式，所以取全部条目，再用同一套匹配规则判断（清单很短）。
+  const [protectedRows] = await db.query<[Array<{ command?: unknown; owner_only?: boolean }>]>(
+    'SELECT command, owner_only FROM protected_command;');
+  const facts: GuardFacts = {
+    protectedOwnerOnly: (protectedRows ?? []).some((row) => row.owner_only === true
+      && typeof row.command === 'string' && matchesCommand(row.command, request.command)),
+  };
   if (request.actorKind !== 'agent') return facts;
   const [policyRows] = await db.query<[PolicyRow[]]>(
     'SELECT disabled, allow, deny FROM agent_policy WHERE agent = $agent LIMIT 1;', { agent: request.actor });
@@ -116,12 +131,24 @@ export interface AuditEntry {
   reason?: string;
   /** 调用结果：同样只写摘要。 */
   result?: unknown;
+  /** 一句话摘要：去首尾空白，超过 500 个字符截断，空则不写。 */
+  summary?: string;
+}
+
+/** 审计摘要的字符上限（与 058 中 ops_audit.summary 的断言一致）。 */
+export const AUDIT_SUMMARY_MAX = 500;
+
+/** 审计摘要：去首尾空白后按字符（码点）截断到上限；空串得到 undefined，即不写该字段。 */
+export function summaryOf(summary: string | undefined): string | undefined {
+  const trimmed = summary?.trim() ?? '';
+  if (!trimmed) return undefined;
+  return Array.from(trimmed).slice(0, AUDIT_SUMMARY_MAX).join('');
 }
 
 /** 追加一条审计记录。ops_audit 只允许新增，修改与删除由库拒绝。 */
 export async function audit(db: Surreal, entry: AuditEntry): Promise<void> {
   await db.query(`CREATE ops_audit CONTENT { actor_kind: $actorKind, actor: $actor, task: $task, command: $command,
-    args_digest: $argsDigest, outcome: $outcome, reason: $reason, result_digest: $resultDigest };`, {
+    args_digest: $argsDigest, outcome: $outcome, reason: $reason, result_digest: $resultDigest, summary: $summary };`, {
     actorKind: entry.actorKind,
     actor: entry.actor,
     task: entry.task ? new RecordId('task', entry.task) : undefined,
@@ -130,6 +157,7 @@ export async function audit(db: Surreal, entry: AuditEntry): Promise<void> {
     outcome: entry.outcome,
     reason: entry.reason,
     resultDigest: entry.result === undefined ? undefined : await digestOf(entry.result),
+    summary: summaryOf(entry.summary),
   });
 }
 

@@ -90,7 +90,7 @@ export function renderNotes(lane: string, notes: readonly Pick<LaneNote, 'text' 
 
 export function notesFit(lane: string, notes: readonly Pick<LaneNote, 'text' | 'pinned' | 'createdAt' | 'id'>[]): boolean {
   const text = renderNotes(lane, notes);
-  return text.split('\n').length <= NOTES_MAX_LINES && Buffer.byteLength(text) <= NOTES_MAX_BYTES;
+  return text.split('\n').length <= NOTES_MAX_LINES && new TextEncoder().encode(text).byteLength <= NOTES_MAX_BYTES;
 }
 
 const rowView = (row: Record<string, unknown>): LaneNote => ({

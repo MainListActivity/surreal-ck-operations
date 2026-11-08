@@ -8,6 +8,7 @@
 import type { RecordId, Surreal } from 'surrealdb';
 import { latestFindings } from './dispatcher/brief.ts';
 import { HANDOVER_ROWS } from './handover-window.ts';
+import { bodyHash, effectiveLangOf } from './outbound-messages.ts';
 import { acIdOf, dispatchText, renderMessage, stepOfTask, type MessageStep, type RenderContext } from './outbound-render.ts';
 
 export type BoardPhase = 'execute' | 'review';
@@ -132,6 +133,17 @@ export interface BoardNextRow {
   reason: string;
 }
 
+/**
+ * A message's translation for an employee's language. `ready` carries the text the employee receives; `stale` means the translation was
+ * made from an older body; `missing` means there is no translation in that language. `text` is rendered on an employee's outbox row and
+ * stored as written in the message list.
+ */
+export interface BoardTranslation {
+  lang: string;
+  status: 'ready' | 'missing' | 'stale';
+  text?: string;
+}
+
 /** An unsent message for this employee, as the employee would receive it. */
 export interface BoardOutboxRow {
   messageId: string;
@@ -147,6 +159,30 @@ export interface BoardOutboxRow {
   workdirPending: boolean;
   hold: boolean;
   lang: 'zh';
+  editable: true;
+  /** Only when the message has a language for this employee (see effectiveLangOf): the translation the employee would receive. */
+  translation?: BoardTranslation;
+}
+
+/** An unsent message as the owner edits it: the stored body, not rendered. */
+export interface BoardMessageRow {
+  messageId: string;
+  taskId: string;
+  title: string;
+  step: MessageStep;
+  state: 'draft' | 'held';
+  hold: boolean;
+  /** The stored body (原文). Not rendered: a queued task names no employee, and the owner edits the stored text. */
+  body: string;
+  /**
+   * The language the message goes out in (see effectiveLangOf): the one the owner chose, else the holder's default. Absent when it goes
+   * out as written. A queued task has no holder, so only a language the owner chose counts there.
+   */
+  lang?: string;
+  /** The translation in that language. Absent when the message goes out as written. */
+  translation?: BoardTranslation;
+  /** The employee who holds the task. Absent for a queued task, which has no employee yet. */
+  employeeId?: string;
   editable: true;
 }
 
@@ -172,6 +208,8 @@ export interface BoardUnassignedRow {
   blocked: boolean;
   eligible: boolean;
   reason: string;
+  /** The draft of this queued item's next step; absent when it has none. Stored body, no employee, no translation. */
+  message?: BoardMessageRow;
 }
 
 export interface BoardActivity {
@@ -193,6 +231,8 @@ export interface OwnerBoard {
   employees: BoardEmployee[];
   unassigned: BoardUnassignedRow[];
   recent: BoardActivity[];
+  /** Every unsent message (state != sent): queued items, held tasks and the rest. Ordered by task title, step and creation. */
+  messages: BoardMessageRow[];
 }
 
 type Row = Record<string, unknown>;
@@ -214,7 +254,7 @@ const dateMs = (value: unknown): number | undefined => {
 const ACTION_LABEL: Record<string, string> = {
   claim: '领取任务', checkpoint: '记录进展', submit: '提交成果', return: '退回返工', owner_reject: '老板退回',
   accept: '验收通过', owner_approve: '老板批准', block: '阻塞', released: '释放租约', revoked: '收回租约',
-  task_project_update: '调整项目', proposal_voided: '提议作废',
+  task_project_update: '调整项目', proposal_voided: '提议作废', create: '创建任务',
 };
 const labelOf = (action: string): string => ACTION_LABEL[action] ?? action;
 
@@ -235,6 +275,28 @@ const projectOfLane = (lane: unknown): string | undefined => {
   const project = typeof lane === 'string' ? lane.split(':')[0] : undefined;
   return project && project !== 'company' ? project : undefined;
 };
+
+/**
+ * A message's translation for one employee's language. Ready when the message is in that language and its translation was made from the
+ * body it has now; stale when it was made from an older body; missing when there is no translation in that language.
+ * `render` turns the stored translation into the text the view shows: the dispatch text on an outbox row, the stored text in the list.
+ */
+const translationOf = (row: Row, lang: string, hashOf: ReadonlyMap<string, string>, render: (text: string) => string): BoardTranslation => {
+  const text = typeof row.translated_text === 'string' ? row.translated_text : '';
+  if (row.lang !== lang || !text.trim()) return { lang, status: 'missing' };
+  if (row.translated_from_hash !== hashOf.get(keyOf(row.id))) return { lang, status: 'stale' };
+  return { lang, status: 'ready', text: render(text) };
+};
+
+/** The language fields of a message row, as effectiveLangOf reads them. */
+const langFieldsOf = (row: Row): { lang?: string; langChosen: boolean } => ({
+  ...(typeof row.lang === 'string' && row.lang ? { lang: row.lang } : {}),
+  langChosen: row.lang_chosen === true,
+});
+
+/** Message steps in the order the owner reads them: the dispatch order of one task. */
+const STEP_ORDER: readonly string[] = ['execute', 'review', 'rework', 'nudge', 'eval', 'notice'];
+const byText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 const rowsOf = (db: Surreal, sql: string, vars?: Record<string, unknown>): Promise<Row[]> =>
   db.query<[Row[]]>(sql, vars).then(result => result[0] ?? []);
@@ -272,7 +334,7 @@ export function renderContextFor(view: BoardView, employeeId: string,
 export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promise<OwnerBoard> {
   const now = opts.now ?? Date.now();
   const nowSec = Math.floor(now / 1000);
-  const [view, beats, employeeRows, openRows, recentRows] = await Promise.all([
+  const [view, beats, employeeRows, openRows, recentRows, policyRows, unsent] = await Promise.all([
     readBoardView(db),
     rowsOf(db, 'SELECT runner, host, version, at FROM runner_heartbeat ORDER BY at DESC LIMIT 1;'),
     rowsOf(db, `SELECT id, role, def, provider, model, idle_since, lane FROM employee
@@ -281,6 +343,9 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
       FROM task WHERE state IN ['ready', 'doing', 'review'] OR current_employee != NONE;`),
     rowsOf(db, `SELECT task, actor, action, at FROM audit WHERE !string::starts_with(action, 'ops_')
       ORDER BY at DESC LIMIT ${BOARD_RECENT_ROWS};`),
+    rowsOf(db, 'SELECT agent, lang FROM agent_policy;'),
+    // Every unsent message, not only the open tasks': the messages list shows all of them.
+    rowsOf(db, "SELECT * FROM outbound_message WHERE state != 'sent' ORDER BY created_at DESC;"),
   ]);
   const tasks = new Map(openRows.map(row => [keyOf(row.id), row] as const));
   const holders = openRows.filter(row => row.current_employee && OPEN_STATES.includes(String(row.state)));
@@ -302,9 +367,8 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
   }
   const focusIds = [...focus.values()].map(row => row.id);
   const rowsIn = (sql: string, ids: unknown[]): Promise<Row[]> => ids.length ? rowsOf(db, sql, { ids }) : Promise.resolve([]);
-  const [returns, drafts, claims, progress] = await Promise.all([
+  const [returns, claims, progress] = await Promise.all([
     rowsIn("SELECT task FROM audit WHERE task IN $ids AND action IN ['return', 'owner_reject'];", focusIds),
-    rowsIn("SELECT * FROM outbound_message WHERE task IN $ids AND state != 'sent' ORDER BY created_at DESC;", focusIds),
     Promise.all(holders.map(row => rowsOf(db, "SELECT at FROM audit WHERE task = $task AND action = 'claim' ORDER BY at DESC LIMIT 1;", { task: row.id }))),
     Promise.all(holders.map(row => rowsOf(db, `SELECT action, evidence, at FROM audit
       WHERE task = $task AND action != 'claim' AND !string::starts_with(action, 'ops_') ORDER BY at DESC LIMIT 1;`, { task: row.id }))),
@@ -319,12 +383,46 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
   });
 
   const returned = new Set(returns.map(row => keyOf(row.task)));
+  // The newest unsent message of each task and step: the draft a dispatch of that step would send. `unsent` is newest first.
   const draftOf = new Map<string, Row>();
-  for (const row of drafts) {
+  for (const row of unsent) {
     const key = `${keyOf(row.task)}:${String(row.step)}`;
     if (!draftOf.has(key)) draftOf.set(key, row);
   }
   const stepOf = (taskId: string): MessageStep => stepOfTask(String(tasks.get(taskId)?.state), returned.has(taskId));
+
+  // Each employee's language, from agent_policy. An employee without one gets no translation rows.
+  const langOf = new Map<string, string>();
+  for (const row of policyRows) {
+    if (typeof row.lang === 'string' && row.lang) langOf.set(keyOf(row.agent), row.lang);
+  }
+  // The hash of each translated body: a translation counts only for the body it was made from.
+  const hashOf = new Map<string, string>();
+  await Promise.all(unsent.filter(row => typeof row.translated_text === 'string' && row.translated_text !== '').map(async row => {
+    hashOf.set(keyOf(row.id), await bodyHash(String(row.body ?? '')));
+  }));
+  // Titles of the tasks the board names only through activity or messages, outside the open set.
+  const outside = new Map<string, unknown>();
+  for (const row of [...recentRows, ...unsent]) if (row.task && !tasks.has(keyOf(row.task))) outside.set(keyOf(row.task), row.task);
+  const titles = new Map<string, string>();
+  if (outside.size) {
+    for (const row of await rowsOf(db, 'SELECT id, title FROM task WHERE id IN $ids;', { ids: [...outside.values()] })) {
+      titles.set(keyOf(row.id), String(row.title ?? ''));
+    }
+  }
+  const titleOf = (taskId: string): string => String(tasks.get(taskId)?.title ?? titles.get(taskId) ?? '');
+  // A message row. The employee is named only when the caller knows the holder: a queued task has none, so it gets no translation.
+  const messageOf = (row: Row, employeeId?: string): BoardMessageRow => {
+    const taskId = keyOf(row.task);
+    const lang = effectiveLangOf(langFieldsOf(row), employeeId ? langOf.get(employeeId) : undefined);
+    return {
+      messageId: keyOf(row.id), taskId, title: titleOf(taskId), step: String(row.step) as MessageStep,
+      state: row.state === 'held' ? 'held' : 'draft', hold: row.hold === true, body: String(row.body ?? ''),
+      ...(lang ? { lang, translation: translationOf(row, lang, hashOf, text => text) } : {}),
+      ...(employeeId ? { employeeId } : {}),
+      editable: true,
+    };
+  };
   // The owner's hold on the message a dispatch of this task would send next. The tick never claims for a held message.
   const heldAt = (taskId: string): boolean => {
     const draft = draftOf.get(`${taskId}:${stepOf(taskId)}`);
@@ -349,8 +447,14 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
     const ctx = renderContextFor(view, employeeId, { taskId, step, acceptanceCriteria: row.acceptance_criteria, findingsFile: findingsFile.get(taskId) });
     if (!ctx) return undefined;
     const workdir = workdirOf(row.worktree);
+    const lang = effectiveLangOf(langFieldsOf(draft), langOf.get(employeeId));
+    // The translation rendered the same way: a translated dispatch names the same paths, workdir line included.
+    const translation = lang
+      ? translationOf(draft, lang, hashOf, text => dispatchText(renderMessage(text, ctx), workdir))
+      : undefined;
     return { messageId: keyOf(draft.id), taskId, title: String(row.title ?? ''), step,
-      body: dispatchText(renderMessage(String(draft.body ?? ''), ctx), workdir), workdirPending: workdir === undefined, hold: heldAt(taskId), lang: 'zh', editable: true };
+      body: dispatchText(renderMessage(String(draft.body ?? ''), ctx), workdir), workdirPending: workdir === undefined, hold: heldAt(taskId), lang: 'zh', editable: true,
+      ...(translation ? { translation } : {}) };
   };
 
   const employees: BoardEmployee[] = employeeRows.map(row => {
@@ -396,18 +500,25 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
     const position = index + 1;
     const held = heldAt(item.taskId);
     const eligible = item.eligible && !held;
+    const draft = draftOf.get(`${item.taskId}:${stepOf(item.taskId)}`);
     return { taskId: item.taskId, title: String(tasks.get(item.taskId)?.title ?? item.title), phase: item.phase, position,
-      blocked: item.blocked || held, eligible, reason: boardReason(position, eligible, held ? HELD_TEXT : item.body) };
+      blocked: item.blocked || held, eligible, reason: boardReason(position, eligible, held ? HELD_TEXT : item.body),
+      ...(draft ? { message: messageOf(draft) } : {}) };
   });
 
-  const outside = new Map<string, unknown>();
-  for (const row of recentRows) if (row.task && !tasks.has(keyOf(row.task))) outside.set(keyOf(row.task), row.task);
-  const titles = new Map<string, string>();
-  if (outside.size) {
-    for (const row of await rowsOf(db, 'SELECT id, title FROM task WHERE id IN $ids;', { ids: [...outside.values()] })) {
-      titles.set(keyOf(row.id), String(row.title ?? ''));
-    }
-  }
+  // Every unsent message, ordered by task title, then task, step and creation. A holder's messages name the holder's language.
+  const stepRank = (step: unknown): number => {
+    const rank = STEP_ORDER.indexOf(String(step));
+    return rank === -1 ? STEP_ORDER.length : rank;
+  };
+  const messages: BoardMessageRow[] = [...unsent]
+    .sort((a, b) => byText(titleOf(keyOf(a.task)), titleOf(keyOf(b.task))) || byText(keyOf(a.task), keyOf(b.task))
+      || stepRank(a.step) - stepRank(b.step) || (dateMs(a.created_at) ?? 0) - (dateMs(b.created_at) ?? 0))
+    .map(row => {
+      const holder = tasks.get(keyOf(row.task))?.current_employee;
+      return messageOf(row, holder ? keyOf(holder) : undefined);
+    });
+
   const recent: BoardActivity[] = recentRows.map(row => {
     const taskId = row.task ? keyOf(row.task) : undefined;
     const taskTitle = taskId ? (tasks.has(taskId) ? String(tasks.get(taskId)?.title ?? '') : titles.get(taskId)) : undefined;
@@ -425,6 +536,6 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
   return {
     at: now,
     ...(view ? { scheduler: { at: view.at, ageMs: Math.max(0, now - view.at) } } : {}),
-    runner, employees, unassigned, recent,
+    runner, employees, unassigned, recent, messages,
   };
 }

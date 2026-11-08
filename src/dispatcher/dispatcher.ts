@@ -786,6 +786,8 @@ export class Dispatcher {
     try {
       const prepared = await store.prepareSend(taskId, step, employeeId);
       if (!prepared) {
+        // Waiting for a translation is not an owner hold: no notice, and the hold and state stay as they are.
+        if (await this.translationPending(taskId, step, employeeId)) return null;
         await this.notice(`message-hold:${taskId}:${step}`,
           `任务 ${taskId} 的 ${step} 消息被标记「需要我放行」；请在消息流里放行后再派工。`,
           { commands: 0, revoked: [], extended: [], woke: [], retired: [], exhausted: [], notices: [], evals: [], decisions: [] });
@@ -820,6 +822,43 @@ export class Dispatcher {
       this.log(`outbound hold read failed for ${taskId}: ${(error as Error).message}`);
       return true; // an unreadable hold gate fails closed: no claim, no version churn
     }
+  }
+
+  /**
+   * Aligns the step's message to the employee's default language before any translation check (see OutboundMessageStore.alignLanguage).
+   * Idempotent, and a failure is only logged: the check then reads the stored state, and the post-claim prepareSend still aligns and
+   * refuses to send a translation that is not ready.
+   */
+  private async alignLanguage(taskId: string, step: MessageStep, employeeId: string): Promise<void> {
+    const store = this.messageStore();
+    if (!store) return;
+    try {
+      await store.alignLanguage(taskId, step, employeeId);
+    } catch (error) {
+      this.log(`outbound language align failed for ${taskId}: ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * Read-only: the message has no ready translation for the employee's language yet. No employee means a new one, which has no default
+   * language, so only a language the owner chose can make it wait. Not an owner hold: no notice, no owner action, nothing written.
+   * An unreadable check returns false; the post-claim prepareOutbound still refuses to send.
+   */
+  private async translationPending(taskId: string, step: MessageStep, employeeId: string | undefined): Promise<boolean> {
+    const store = this.messageStore();
+    if (!store) return false;
+    try {
+      return await store.awaitingTranslation(taskId, step, employeeId);
+    } catch {
+      return false;
+    }
+  }
+
+  /** The reason a claim is released when the message is not sent this pass: a hold for the owner, or a translation still to come. */
+  private async skipReason(taskId: string, step: MessageStep, employeeId: string): Promise<string> {
+    return await this.translationPending(taskId, step, employeeId)
+      ? '派工消息等待译文，已收回本次预领租约，译文就绪后再派工'
+      : '派工消息需要老板放行，已收回本次预领租约并等待放行';
   }
 
   /** Render the table body with the workdir line. No write: the row stays draft until the external send landed. */
@@ -1789,6 +1828,12 @@ export class Dispatcher {
     const pending = sidecar && picked && !picked.paseoAgentId ? picked : undefined;
     if (pending) defsOrdered = (await wf.defs()).filter(d => d.id === pending.def && d.enabled);
     const existing = picked?.paseoAgentId && !(sidecar && task && picked.credentialFile) && (!sidecar || sidecar.canReuse(picked)) ? picked : undefined;
+    // A message still waiting for its translation is skipped before any lease: no claim churn, no notice. The employee's language is
+    // aligned first: a message that never had one queues no translation, so the wait would never end.
+    if (task && existing) {
+      await this.alignLanguage(task.id, preStep, existing.id);
+      if (await this.translationPending(task.id, preStep, existing.id)) return undefined;
+    }
     if (existing) {
       const first = !this.onboarded.has(existing.id) && !existing.onboarded;
       let claim: ClaimResult | undefined;
@@ -1829,7 +1874,7 @@ export class Dispatcher {
           const prepared = evalMessage ?? (task ? await this.prepareOutbound(task.id, await nextStep(claim), existing.id,
             (claim?.worktree ?? workspace)?.worktreePath, claim?.history, env.opsRepo) : null);
           if (task && prepared === null) {
-            if (claim) await sidecar!.releaseClaim(existing.id, task.id, '派工消息需要老板放行，已收回本次预领租约并等待放行');
+            if (claim) await sidecar!.releaseClaim(existing.id, task.id, await this.skipReason(task.id, await nextStep(claim), existing.id));
             return undefined;
           }
           const body = this.outboundBody(prepared);
@@ -1858,6 +1903,12 @@ export class Dispatcher {
         if (claim && task) await sidecar!.releaseClaim(existing.id, task.id, `wake failed: ${(error as Error).message.slice(0, 120)}`);
         return undefined;
       }
+    }
+    // The spawn gate runs before any employee is created: a new one has no default language, so only a language the owner chose can
+    // make the message wait. An unbound instance that already has a language is checked under its own id.
+    if (task) {
+      if (pending) await this.alignLanguage(task.id, preStep, pending.id);
+      if (await this.translationPending(task.id, preStep, pending?.id)) return undefined;
     }
     for (const def of defsOrdered) {
       const model = this.resolveModel(def, slots ?? new Map());
@@ -1899,7 +1950,7 @@ export class Dispatcher {
         const prepared = evalMessage ?? (task ? await this.prepareOutbound(task.id, await nextStep(claim), inst.id,
           workdir, claim?.history, env.opsRepo) : null);
         if (task && prepared === null) {
-          if (claim) await sidecar!.releaseClaim(inst.id, task.id, '派工消息需要老板放行，已收回本次预领租约并等待放行');
+          if (claim) await sidecar!.releaseClaim(inst.id, task.id, await this.skipReason(task.id, await nextStep(claim), inst.id));
           return undefined;
         }
         const body = this.outboundBody(prepared);

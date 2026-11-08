@@ -120,7 +120,7 @@ export async function gateCredentialChange(db: Surreal, employeeId: string, chan
       const cause = error instanceof Error ? error.message : String(error);
       if (!/retire moved|conflict/i.test(cause)) throw error;
       if (attempt >= 4) throw new CompanyError('temporarily_unavailable', 'Credential facts moved while deciding; retry', true);
-      await Bun.sleep(10 * (attempt + 1));
+      await new Promise<void>(resolve => setTimeout(resolve, 10 * (attempt + 1)));
     }
   }
 }

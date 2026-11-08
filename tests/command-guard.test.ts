@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  HARD_OWNER_ONLY, OWNER_API_COMMANDS, canonicalJson, digestOf, judge, matchesCommand,
+  AUDIT_SUMMARY_MAX, HARD_OWNER_ONLY, OWNER_API_COMMANDS, audit, canonicalJson, digestOf, judge, matchesCommand, summaryOf,
   type ActorKind, type GuardFacts, type GuardRequest,
 } from '../src/command-guard.ts';
 
@@ -86,7 +86,9 @@ describe('命令守卫：运行器与自动化', () => {
   test('不能直接调用老板接口的命令', () => {
     expect(judge(request('runner', 'task.void'), {}).allow).toBe(false);
     expect(judge(request('automation', 'message.send'), {}).allow).toBe(false);
-    expect(judge(request('runner', 'task.void'), {}).reason).toBe('运行器与自动化不能直接调用老板命令');
+    // task.void 现在在硬拦截清单里，理由是老板专属；运行器专用理由由不在硬清单的老板接口命令给出。
+    expect(judge(request('runner', 'task.void'), {}).reason).toBe('老板专属命令，只有老板可以调用');
+    expect(judge(request('runner', 'board.snapshot'), {}).reason).toBe('运行器与自动化不能直接调用老板命令');
   });
 
   test('非老板命令放行，且不看员工策略与租约', () => {
@@ -105,7 +107,36 @@ describe('命令守卫：模式与清单', () => {
   });
 
   test('HARD_OWNER_ONLY 含规格列出的写命令前缀', () => {
-    expect(HARD_OWNER_ONLY).toEqual(expect.arrayContaining(['guard.*', 'agent.policy.*', 'owner.login.*']));
+    expect(HARD_OWNER_ONLY).toEqual(expect.arrayContaining(['guard.*', 'agent.*', 'owner.login.*']));
+    // agent.* 取代了原先的 agent.policy.*：原来拦住的命令仍被拦住。
+    expect(HARD_OWNER_ONLY.some(pattern => matchesCommand(pattern, 'agent.policy.set'))).toBe(true);
+  });
+
+  test('HARD_OWNER_ONLY 的清单固定：决策、写入与升级命令都在内，只读命令不在内', () => {
+    expect([...HARD_OWNER_ONLY]).toEqual([
+      'guard.*', 'agent.*', 'owner.login.*', 'def.*', 'db.write', 'idp.*', 'cf.api',
+      'task.create', 'task.update', 'task.delete', 'task.void', 'task.reassign', 'task.revoke', 'task.pause', 'task.resume',
+      'decide', 'approve', 'reject', 'reply', 'instruct', 'direction.add',
+      'message.edit', 'message.edit_rendered', 'message.hold', 'message.release', 'message.send', 'notice.resolve',
+      'route.save', 'route.disable', 'session.policy',
+      'note.edit', 'note.pin', 'note.activate', 'note.remove', 'note.consolidate', 'note.consolidation.undo',
+      'upgrade.*',
+    ]);
+    for (const command of ['board.snapshot', 'brief', 'inbox', 'status', 'task.list', 'task.detail', 'task.cost', 'progress', 'message.list']) {
+      expect(HARD_OWNER_ONLY.some(pattern => matchesCommand(pattern, command))).toBe(false);
+    }
+  });
+
+  test('新增的硬拦截命令：db.write、idp.*、cf.api、agent.* 对员工、运行器与自动化都拒绝', () => {
+    for (const command of ['db.write', 'idp.user.create', 'cf.api', 'agent.enable', 'message.send', 'upgrade.start']) {
+      expect(agent(command).allow).toBe(false);
+      expect(judge(request('runner', command), {}).allow).toBe(false);
+      expect(judge(request('automation', command), {}).allow).toBe(false);
+      expect(judge(request('owner', command, { actor: 'owner:web', task: undefined }), {}).allow).toBe(true);
+    }
+    // 前缀只在 .* 结尾时生效：idp 本身与 cf 的其它命令不被误伤。
+    expect(judge(request('runner', 'idp'), {}).allow).toBe(true);
+    expect(judge(request('runner', 'cf.status'), {}).allow).toBe(true);
   });
 
   test('OWNER_API_COMMANDS 与 owner-api.ts 的命令分支一致：新增老板命令必须同时归类', () => {
@@ -126,6 +157,31 @@ describe('命令守卫：摘要', () => {
     expect(first).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(await digestOf({ idempotencyKey: 'k-1', text: '正文' })).toBe(first);
     expect(await digestOf({ text: '另一段', idempotencyKey: 'k-1' })).not.toBe(first);
+  });
+
+  test('审计摘要：去首尾空白，空则不写，超过上限按字符截断', () => {
+    expect(summaryOf('  老板查看简报  ')).toBe('老板查看简报');
+    expect(summaryOf('   ')).toBeUndefined();
+    expect(summaryOf(undefined)).toBeUndefined();
+    expect(summaryOf('字'.repeat(AUDIT_SUMMARY_MAX + 20))).toBe('字'.repeat(AUDIT_SUMMARY_MAX));
+    // 按字符（码点）计数：一个表情算一个字符，不会切出半个代理对。
+    const emoji = '😀'.repeat(AUDIT_SUMMARY_MAX + 1);
+    expect(Array.from(summaryOf(emoji)!)).toHaveLength(AUDIT_SUMMARY_MAX);
+    expect(summaryOf(emoji)!.endsWith('😀')).toBe(true);
+  });
+
+  test('audit 把摘要写进 CREATE 参数；没有摘要或摘要为空时字段为 undefined', async () => {
+    const calls: Array<{ sql: string; vars: Record<string, unknown> }> = [];
+    const db = { query: async (sql: string, vars: Record<string, unknown>) => { calls.push({ sql, vars }); return []; } } as never;
+    await audit(db, { actorKind: 'owner', actor: 'owner:web', command: 'brief', args: {}, outcome: 'ok', summary: ' 老板查看简报 ' });
+    expect(calls[0]!.sql).toContain('summary: $summary');
+    expect(calls[0]!.sql).toContain('CREATE ops_audit');
+    expect(calls[0]!.vars.summary).toBe('老板查看简报');
+    await audit(db, { actorKind: 'owner', actor: 'owner:web', command: 'brief', args: {}, outcome: 'ok', summary: '   ' });
+    expect(calls[1]!.vars.summary).toBeUndefined();
+    await audit(db, { actorKind: 'owner', actor: 'owner:web', command: 'brief', args: {}, outcome: 'ok' });
+    expect(calls[2]!.vars.summary).toBeUndefined();
+    expect(calls[2]!.vars.argsDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
   });
 });
 

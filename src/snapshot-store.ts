@@ -227,7 +227,7 @@ const headerOf = (row: HeaderRow): SnapshotHeader => ({
 const unavailable = (message: string) => new CompanyError('temporarily_unavailable', message, true);
 const timedOut = (deadlineMs: number, guidance: string) => new CompanyError('temporarily_unavailable',
   `the listing was not built within ${Math.round(deadlineMs / 1000)} seconds, so it was cancelled and nothing was kept; ${guidance}, then retry`, true);
-const pause = () => Bun.sleep(1 + Math.floor(Math.random() * 8));
+const pause = () => new Promise<void>(resolve => setTimeout(resolve, 1 + Math.floor(Math.random() * 8)));
 /** `work` settles before `at` (epoch milliseconds) with its value or its error; otherwise the result is undefined and `work` is left running. */
 export const untilAt = <T>(work: Promise<T>, at: number): Promise<T | undefined> => {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -770,7 +770,7 @@ export class SnapshotStore {
       if (/snapshot write refused|snapshot commit refused|snapshot absent/.test(cause)) return { outcome: 'refused' };
       if (!/conflict/i.test(cause)) throw unavailable('the listing store refused the statement; retry the read');
       // A conflicting transaction rolled back as a whole, so it is run again after a random pause that grows with each try.
-      await Bun.sleep(1 + Math.floor(Math.random() * Math.min(64, 2 ** attempt)));
+      await new Promise<void>(resolve => setTimeout(resolve, 1 + Math.floor(Math.random() * Math.min(64, 2 ** attempt))));
     }
     return { outcome: 'conflict' };
   }
