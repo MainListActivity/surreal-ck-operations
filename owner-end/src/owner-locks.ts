@@ -24,6 +24,13 @@ export const COMPANY_SLUG = 'company';
 /** 老板端的公开域名。请求内容里出现它（自定义域名等）即锁定。 */
 export const COMPANY_HOST = 'company.maplayer.top';
 /**
+ * 认证与数据入口的域名：o.maplayer.top 提供 company 租户的 JWKS，data.maplayer.top 是 SurrealDB 入口。
+ * 改它们的 DNS 或路由就能冒充签发方伪造老板令牌，所以请求内容提到它们即锁定。
+ */
+export const PROTECTED_HOSTS: readonly string[] = [COMPANY_HOST, 'o.maplayer.top', 'data.maplayer.top'];
+/** 承载上述域名的 Cloudflare zone（maplayer.top）。该 zone 下的任何写操作（DNS、路由、证书、设置）都锁定。 */
+export const DEFAULT_PROTECTED_ZONE_IDS: readonly string[] = ['6ace211d0a7ac7c16b52177a37c77f88'];
+/**
  * 默认受保护的 Worker 脚本：老板端自己，以及 ma_hono（它的 wrangler 名是 ma-auth，D1 名才是 ma-hono）。
  * 配置只能追加，不能移除默认项。
  */
@@ -51,7 +58,7 @@ export const TARGET_LOCKS: ReadonlyArray<{ command: string; target: string }> = 
   },
   {
     command: 'cf.api',
-    target: '老板端与 ma_hono 的 Worker（脚本及其机密、设置等子资源）与 D1 数据库，读写都锁定；API 令牌的管理；自定义域名的写入；请求内容提到公司域名或这些资源的调用。其它账号资源不受限',
+    target: '老板端与 ma_hono 的 Worker（脚本及其机密、设置等子资源）与 D1 数据库，读写都锁定；API 令牌的管理；自定义域名的写入；maplayer.top 域名下的写操作（DNS、路由、证书与设置）；请求内容提到公司域名、o/data.maplayer.top 或这些资源的调用。其它账号资源不受限',
   },
 ];
 
@@ -123,6 +130,9 @@ function cloudflareLock(input: Input, targets: LockTargets): string | undefined 
     if (resource[0] === 'workers' && resource[1] === 'domains' && method !== 'GET') return reason('自定义域名的写入');
   }
   if (root === 'user' && rest[0] === 'tokens') return reason('API 令牌的管理');
+  if (root === 'zones' && method !== 'GET' && rest[0] !== undefined && DEFAULT_PROTECTED_ZONE_IDS.includes(rest[0])) {
+    return reason('maplayer.top 域名下的写操作（DNS、路由、证书与设置）');
+  }
   // 请求内容（D1 绑定、域名的服务名、DNS 记录名等）指向受保护资源时同样锁定，防止借道其它资源。
   const text = `${String(input.path ?? '')} ${input.body === undefined ? '' : JSON.stringify(input.body)}`.toLowerCase();
   if (mentionsProtected(text, targets)) return reason('请求内容指向老板端或 ma_hono 的资源（脚本、数据库或公司域名）');
@@ -130,7 +140,7 @@ function cloudflareLock(input: Input, targets: LockTargets): string | undefined 
 }
 
 function mentionsProtected(text: string, targets: LockTargets): boolean {
-  return text.includes(COMPANY_HOST)
+  return PROTECTED_HOSTS.some((host) => text.includes(host))
     || targets.scripts.some((name) => text.includes(name))
     || targets.d1Ids.some((id) => text.includes(id));
 }
