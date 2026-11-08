@@ -55,6 +55,7 @@ sidecar 侧每 400ms（`SWEEP_MS`）扫一遍活跃实例的 `req/`：读到的�
 - **身份关联**：`identity_principal_set`（manage 能力）登记 principal，把多个 employeeId 显式绑定为同一个人；这是唯一的跨员工身份键，编制/provider/模型/名字/目录都不是身份。以 `expectedVersion` 做 compare-and-set，任一被登记员工持有未到期租约时拒绝，`reason` 必填并写审计，同一 `idempotencyKey` 同载荷回放原结果；细则见 agent-operations.md「身份关联」。
 
 - **`ops_*`**：转运维代理，见下节。
+- **`company_cmd` / `company_cmd_catalog`**：转公司网关（只在云端执行端注入网关时可用），见下文「company_cmd 公司命令」。本机模式返回 `not_configured`。
 - **`deliverable_publish`**：本地实现不转 core——把 `{files:[绝对路径…]}` 的文件/目录复制进 `$SCK_SERVICE_HOME/deliverables/<taskId>/`（目录递归保结构、隐藏名跳过、同名覆盖、symlink 解引用），返回 `{taskId,dir,baseUrl,urls,skipped,conflictPolicy}`，`urls` 为 `http://<lanIP>:<port>/d/<taskId>/…` 可点链接（lanIP/端口取 `preview-status.json` 实际监听，缺省 `SCK_PREVIEW_PORT`/18777）。taskId 缺省取在手租约任务，显式传值供老板代发/补发（免租约）；任一输入路径无效即整体报错，不产生半截交付包。
 - **特殊**：`claim_next` 回 `forbidden`（任务已由调度器代领，员工侧不再认领）。认领回显（缩短后的 `task`、`history`、`listsTruncated` 等）由 MCP 的 `claim_next` 产生，通道不产生。员工需要完整认领时读 `claim.json`，超长正文用 `read_task_text` 读取。`heartbeat` 回 `{ok:true}`，这是设计如此：续租由 sidecar 自己每 60 秒完成，员工的心跳不需要回显。`get_secret`/`put_secret` 已下线，回 `unknown_tool` 并提示改用 `ops_*`；其余未知名回 `unknown_tool`。请求 JSON 解析失败回 `malformed request`；无在手租约时写工具回 `no_lease`。
 
@@ -79,6 +80,15 @@ sidecar 侧每 400ms（`SWEEP_MS`）扫一遍活跃实例的 `req/`：读到的�
 - **脱敏**：返回与审计文本都抹掉 token 字段名、JWT/Bearer/密码形态串，以及该员工全部在存会话 token；上游错误只透出机器码。
 - **错误码**：`invalid`（参数）、`forbidden`（岗位/权限）、`not_configured`（环境未配代理或缺 D1/data/Cloudflare 凭证）、`not_found`、`limit_reached`、`conflict`、`login_failed`、`upstream_error`（超时/断连/5xx，`retryable`）。
 - **扩能**：新能力在 `src/ops/` 实现并登记 `OPS_TOOLS` + 处理表 + 测试，协议表加一行，`sh plugin/scripts/vendor.sh` 后 `plugin reload`；通道无需改动。详见 [运行手册](agent-operations.md#运维代理ops-broker)。
+
+## company_cmd 公司命令
+
+`company_cmd` 把员工的命令与参数原样转给公司网关（`POST /api/cmd`），`company_cmd_catalog` 转为网关的 `cmd.catalog`。两者与 `ops_*` 走同一条云端路径，只在 `SidecarPool` 注入了网关（云端执行端）时可用。
+
+- 链路：`sck call company_cmd` → sidecar 核对在手租约（无租约直接 `no_lease`，不换令牌）→ 以员工身份与当前租约任务换取网关令牌 → `GatewayClient.call`（`src/cloud/gateway.ts`）发起调用 → 网关返回 pending 时轮询 `ops.job.get` 直到结束或超时（默认 15 分钟）→ 结果或错误原路返回。
+- 请求顶层的 `taskId` 与 `ops_*` 一样被丢弃。`input` 里的任务号与消息号由网关核对，必须属于当前租约任务。
+- 令牌只在 `callCloud` 的局部变量里存在：错误文本与返回内容中出现的令牌一律替换，不写会话、comm 目录、证据或日志。`tests/cloud-sidecar-route.test.ts` 对此做了扫描断言。
+- 判定、目录过滤与审计在网关侧，见 [运行手册 · 公司命令](agent-operations.md#公司命令)。
 
 ## deliverables/ 交付包约定
 

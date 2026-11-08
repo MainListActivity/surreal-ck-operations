@@ -55,10 +55,16 @@ export interface GuardFacts {
   lease?: { holder?: string | null; expiresAt?: number | null };
 }
 
-interface PolicyRow {
+export interface PolicyRow {
   disabled?: boolean;
   allow?: string[] | null;
   deny?: string[] | null;
+}
+
+/** protected_command 中的一条（command 为完整名或 `.*` 前缀模式）。 */
+export interface ProtectedRow {
+  command?: unknown;
+  owner_only?: boolean;
 }
 
 const allowed = (reason: string): Decision => ({ allow: true, reason });
@@ -66,19 +72,43 @@ const denied = (reason: string): Decision => ({ allow: false, reason });
 const hits = (patterns: readonly string[] | null | undefined, command: string): boolean =>
   (patterns ?? []).some((pattern) => matchesCommand(pattern, command));
 
+/** 保护清单里是否有仅老板的条目命中该命令。 */
+export function protectedOwnerOnlyOf(rows: readonly ProtectedRow[], command: string): boolean {
+  return rows.some((row) => row.owner_only === true && typeof row.command === 'string' && matchesCommand(row.command, command));
+}
+
+/** 写死仅老板与保护清单：对所有非老板身份生效，与租约无关。命中返回拒绝理由。 */
+function ownerOnlyRefusal(command: string, protectedOwnerOnly: boolean): string | undefined {
+  if (hits(HARD_OWNER_ONLY, command)) return '老板专属命令，只有老板可以调用';
+  if (protectedOwnerOnly) return '老板保护的命令，只有老板可以调用';
+  return undefined;
+}
+
+/**
+ * 员工在不看租约时的拒绝理由，按固定顺序：停用、写死与保护、允许清单、禁止清单。
+ * judge 与命令目录（cmd.catalog）共用：目录只列出这里通过的命令，租约另行核对。
+ */
+export function agentRefusal(command: string, policy: PolicyRow | undefined, protectedOwnerOnly: boolean): string | undefined {
+  if (policy?.disabled) return '该员工已停用';
+  const owner = ownerOnlyRefusal(command, protectedOwnerOnly);
+  if (owner) return owner;
+  const allowList = policy?.allow ?? undefined;
+  if (allowList && !hits(allowList, command)) return '命令不在该员工的允许清单内';
+  if (hits(policy?.deny, command)) return '该员工不能调用此命令';
+  return undefined;
+}
+
 /** 纯判定：按固定顺序给出第一条拒绝理由；全部通过才放行。 */
 export function judge(request: GuardRequest, facts: GuardFacts): Decision {
   const { actorKind, command, now } = request;
   if (actorKind === 'owner') return allowed('老板命令，放行');
-  if (actorKind === 'agent' && facts.policy?.disabled) return denied('该员工已停用');
-  if (hits(HARD_OWNER_ONLY, command)) return denied('老板专属命令，只有老板可以调用');
-  if (facts.protectedOwnerOnly) return denied('老板保护的命令，只有老板可以调用');
   if (actorKind !== 'agent') {
+    const owner = ownerOnlyRefusal(command, facts.protectedOwnerOnly === true);
+    if (owner) return denied(owner);
     return hits(OWNER_API_COMMANDS, command) ? denied('运行器与自动化不能直接调用老板命令') : allowed('非老板命令，放行');
   }
-  const allowList = facts.policy?.allow ?? undefined;
-  if (allowList && !hits(allowList, command)) return denied('命令不在该员工的允许清单内');
-  if (hits(facts.policy?.deny, command)) return denied('该员工不能调用此命令');
+  const refusal = agentRefusal(command, facts.policy, facts.protectedOwnerOnly === true);
+  if (refusal) return denied(refusal);
   const lease = facts.lease;
   if (!request.task || !lease || lease.holder !== request.actor || !((lease.expiresAt ?? 0) > now)) {
     return denied('没有该任务的有效租约');
@@ -92,18 +122,24 @@ export async function decide(db: Surreal, request: GuardRequest): Promise<Decisi
   return judge(request, await factsFor(db, request));
 }
 
-async function factsFor(db: Surreal, request: GuardRequest): Promise<GuardFacts> {
+/**
+ * 判定需要的库内记录：全部保护清单条目；指定员工时还有该员工的策略行（没有即默认策略）。
+ * 命令目录（cmd.catalog）与 decide 读同一份，两边的判定才会一致。
+ */
+export async function guardRowsOf(db: Surreal, agent?: string): Promise<{ protectedRows: ProtectedRow[]; policy?: PolicyRow }> {
   // 保护清单可以写成 `task.*` 这样的模式，所以取全部条目，再用同一套匹配规则判断（清单很短）。
-  const [protectedRows] = await db.query<[Array<{ command?: unknown; owner_only?: boolean }>]>(
-    'SELECT command, owner_only FROM protected_command;');
-  const facts: GuardFacts = {
-    protectedOwnerOnly: (protectedRows ?? []).some((row) => row.owner_only === true
-      && typeof row.command === 'string' && matchesCommand(row.command, request.command)),
-  };
-  if (request.actorKind !== 'agent') return facts;
+  const [protectedRows] = await db.query<[ProtectedRow[]]>('SELECT command, owner_only FROM protected_command;');
+  if (agent === undefined) return { protectedRows: protectedRows ?? [] };
   const [policyRows] = await db.query<[PolicyRow[]]>(
-    'SELECT disabled, allow, deny FROM agent_policy WHERE agent = $agent LIMIT 1;', { agent: request.actor });
-  facts.policy = policyRows[0];
+    'SELECT disabled, allow, deny FROM agent_policy WHERE agent = $agent LIMIT 1;', { agent });
+  return { protectedRows: protectedRows ?? [], policy: policyRows?.[0] };
+}
+
+async function factsFor(db: Surreal, request: GuardRequest): Promise<GuardFacts> {
+  const rows = await guardRowsOf(db, request.actorKind === 'agent' ? request.actor : undefined);
+  const facts: GuardFacts = { protectedOwnerOnly: protectedOwnerOnlyOf(rows.protectedRows, request.command) };
+  if (request.actorKind !== 'agent') return facts;
+  facts.policy = rows.policy;
   if (request.task) {
     const [taskRows] = await db.query<[Array<{ current_employee?: string | null; lease_expires_at?: number | null }>]>(
       'SELECT current_employee, lease_expires_at FROM $task;', { task: new RecordId('task', request.task) });

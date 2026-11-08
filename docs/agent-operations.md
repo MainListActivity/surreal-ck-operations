@@ -110,6 +110,24 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME
 - **边界**：这两层是去掉员工环境里“顺手就有”的凭证，不是硬隔离。员工与老板是同一个系统用户，能直接读 `~/.zshrc`，也能 `ZDOTDIR= zsh -i` 绕开垫片；bash 的启动文件（`.bashrc`、`.bash_profile`）不在垫片范围内。要根治，就别把 token 明文写进任何 shell 启动文件，broker 要用的令牌放进 `private/service.env`，最好是权限更窄的 `SCK_OPS_CLOUDFLARE_*`。
 - **环境清理的验证**：新开一个员工会话，在它的进程环境里应看到这些变量为空、`ZDOTDIR` 指向垫片目录（`ps eww <pid>`）；codex 员工的 shell 里 `zsh -ic 'echo ${CLOUDFLARE_API_TOKEN:+set}'` 应无输出。`tests/scrub.test.ts` 用真实 zsh 覆盖了 `-c`、`-lc`、`-ic`、`-lic` 四种启动方式。
 
+## 公司命令
+
+老板端的运维与管理操作（任务、消息、笔记、路由、员工定义、身份与云端、主机命令、发布安装等）都是网关命令。员工用两个工具调用，不直接访问网关：
+
+```
+sck call company_cmd_catalog '{}'
+sck call company_cmd '{"command":"<命令名>","input":{...}}'
+```
+
+- `company_cmd_catalog` 列出本员工当前能调用的命令，附参数说明（网关 `cmd.catalog`）。员工看不到三类命令：仅老板命令、保护清单里标为仅老板的命令、员工策略的禁止清单或允许清单之外的命令；员工已停用时列表为空。按目标锁定的命令仍会列出，并附锁定说明，命中即拒绝。老板看到全部命令。目录只说明能用什么，每次调用仍要过网关判定。命令说明集中在 `owner-end/src/command-catalog.ts`，老板端「运维」页的命令面板与之共用。
+- `company_cmd` 只在云端执行端可用。本机模式返回 `not_configured`，提示需要云端执行端。
+- 调用必须持有任务。无有效租约直接以 `no_lease` 拒绝，不换取令牌。调用以员工身份和当前租约任务换取网关令牌。请求顶层的 `taskId` 被丢弃；`input` 里点名的 `taskId`（可带 `task:` 前缀）与 `messageId` 必须属于当前租约任务，否则拒绝。
+- 执行端作业（如 `host.exec`、`company.release.install`）返回 pending 时，员工侧按作业号轮询，直到完成、失败或超过 15 分钟。员工只能取到自己发起的作业。
+- 每次调用（含被拒绝的和只读的）写一条审计。老板用 `guard.protect` 把命令加入保护清单（`ownerOnly` 缺省为仅老板），用 `agent.policy.set` 停用员工或设允许、禁止清单。
+- 令牌只在网关调用的局部变量里存在。返回与错误文本中出现的令牌一律替换，不写会话、comm 目录、证据或日志。
+
+**风险（待审阅者决定）。** 网关不区分调用方是否老板。除写死的 5 条仅老板命令、员工不可见的 `ops.job.list` 与 `audit.list`、保护清单与员工策略外，持有有效租约的员工可以调用其余全部命令；按目标锁定的命令只拒绝锁定的目标。这包括替老板作决定（`decide`、`approve`、`reject`；`approve` 会写入标为老板签署的人工验收证据）、代老板下指示（`instruct`、`direction.add`）、改路由与派工模板（`route.save`）、暂停全部派工（`task.pause`）、用老板的 Cloudflare 令牌调用未锁定的账号资源（`cf.api`），以及执行端命令（`host.exec`、`company.release.install`、`upgrade.*`、`task.create`）。执行端作业入队后，只有 `ops_*` 在认领时核对租约，其余作业即使租约已结束也会执行。上线前，老板应把这些命令加入保护清单，或由审阅者决定写死为仅老板。细节见 [owner-end 权限模型](../owner-end/README.md#权限模型)。
+
 ## 员工编制（SurrealDB）
 
 - **员工定义** `employee_def`：`role`（八任务岗位 + `eval` 评审）、`provider`（codex / grok / devin）、`model`、`thinking`，可选 `max_instances`（默认 1）、`weight`（派工权重，默认 10）、`enabled`、`tracks`（岗位轨名单：非空则只接 `discipline` 在列的任务，缺省或空 = 全接）。可直接写库，例如：

@@ -104,6 +104,9 @@ test('real SDK initialize/list/call and authenticated core identity', async () =
     expect(tools).toContain('def_list');
     expect(tools).toContain('def_ensure');
     expect(tools).toContain('project_disciplines_update');
+    // W4: company commands ride the same surface; only the cloud sidecar has a gateway to run them.
+    expect(tools).toContain('company_cmd');
+    expect(tools).toContain('company_cmd_catalog');
     // Kept owner/manage tools ride the same surface; capability checks live in core.
     expect(tools).toContain('resume_task');
     expect(tools).toContain('retire_task');
@@ -116,6 +119,9 @@ test('real SDK initialize/list/call and authenticated core identity', async () =
     expect(result.structuredContent).toMatchObject({ ok: true, data: { principal: { employeeId: 'ai-01' } } });
     const claim = await connection.client.callTool({ name: 'claim_next', arguments: {} });
     expect(claim.structuredContent).toMatchObject({ ok: true, data: { deliveryId: 'delivery-1', fence: 1 } });
+    const company = await connection.client.callTool({ name: 'company_cmd', arguments: { command: 'task.list', input: {} } });
+    expect(company.structuredContent).toMatchObject({ ok: false, code: 'not_configured' });
+    expect(JSON.stringify(company.structuredContent)).toContain('需要云端执行端');
     const denied = await connection.client.callTool({ name: 'create_task', arguments: {
       title: 'denied', context: 'synthetic', executorRole: 'qa', reviewerRole: 'owner', idempotencyKey: 'one',
     } });

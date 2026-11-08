@@ -16,6 +16,7 @@ import { ownerApi, RUNNER_ONLY_COMMANDS, type OwnerApiContext } from '../../src/
 import { OwnerDesk } from '../../src/owner.ts';
 import { Workforce } from '../../src/workforce.ts';
 import { auditSummary, listAudit } from './audit.ts';
+import { commandCatalogOf } from './catalog.ts';
 import type { Caller } from './auth/caller.ts';
 import { dbRead, dbWrite } from './db-commands.ts';
 import { withSession, type Sessions } from './db.ts';
@@ -57,11 +58,13 @@ export function isRunnerCommand(command: string): boolean {
 const OWNER_ONLY_REASON = '该命令只能由老板调用';
 
 /** 只读命令不写审计：看板与列表会反复刷新，记下来会淹没真正的操作。员工的调用无论读写都记。 */
-const READ_ONLY = new Set(['status', 'progress', 'brief', 'inbox', 'board.snapshot', 'db.read', 'translate.preview', 'idp.status', 'idp.user.list_agents']);
+const READ_ONLY = new Set(['status', 'progress', 'brief', 'inbox', 'board.snapshot', 'db.read', 'translate.preview', 'idp.status', 'idp.user.list_agents', 'cmd.catalog']);
 const READ_SUFFIX = /\.(list|get|detail|preview|plan|consolidations|records)$/;
 const isReadOnly = (command: string): boolean => READ_ONLY.has(command) || READ_SUFFIX.test(command);
 
 const reasonOf = (error: unknown): string => error instanceof CompanyError ? error.message : '服务暂时出错';
+
+/** 命令参数里的任务号（task:x 与 x 同义）；不是字符串的无法与租约任务核对，视为不符。 */
 
 /** 读取 /api/cmd 的请求体：必须是 {command, input} 形状，input 缺省为空对象。 */
 export function parseCommandBody(body: unknown): { command: string; input: Input } {
@@ -171,6 +174,7 @@ async function dispatch(deps: GatewayDeps, db: Surreal, who: Who, command: strin
     case 'ops.job.list': return { jobs: await listJobs(db, input) };
     case 'ops.job.get': return { job: await jobDetail(db, textOf(input.id, 'id', 200)) };
     case 'audit.list': return listAudit(db, input);
+    case 'cmd.catalog': return commandCatalogOf(db, who.actorKind === 'agent' ? { owner: false, employee: who.actor } : { owner: true });
     case 'message.edit':
     case 'message.edit_rendered': return translateSaved(deps, db, await runOwnerApi(db, command, input, who.via), who.actor);
     case 'message.release':
@@ -230,6 +234,7 @@ async function agentCall(deps: GatewayDeps, caller: AgentCaller, command: string
     if (!employee) return refuse('该令牌没有登记的员工身份');
     const decision = await decide(db, { actorKind: 'agent', actor: employee, task: caller.task, command, now: Math.floor(now.getTime() / 1000) });
     if (!decision.allow) return refuse(decision.reason);
+    // 老板定：员工持有任意任务租约时即可操作老板端全部命令（包括别的任务与消息），限制靠“仅老板”保护清单与员工策略。
     const locked = hardTargetOwnerOnly(command, input, deps.cfg.locks);
     if (locked) return refuse(locked);
     if (OWNER_ONLY_FOR_AGENTS.includes(command)) return refuse(OWNER_ONLY_REASON);

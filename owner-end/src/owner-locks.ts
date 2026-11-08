@@ -85,7 +85,8 @@ export function pathSegments(path: unknown): string[] {
   return String(path ?? '').replace(/[?#].*$/, '').toLowerCase().split('/').filter((segment) => segment.length > 0);
 }
 
-const IDP_READS: ReadonlySet<string> = new Set(['idp.status', 'idp.user.list_agents']);
+/** 身份命令里的只读项：不受按目标锁约束，命令目录也不为它们标注锁定。 */
+export const IDP_READS: ReadonlySet<string> = new Set(['idp.status', 'idp.user.list_agents']);
 
 function identityLock(command: string, input: Input, targets: LockTargets): string | undefined {
   if (IDP_READS.has(command)) return undefined;

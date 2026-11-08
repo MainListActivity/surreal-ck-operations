@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { CLOUD_OWNER_TOOLS, SidecarPool, routesToGateway, type CloudRoute, type SidecarDeps } from '../plugin/server/sidecar.ts';
+import { CLOUD_OWNER_TOOLS, SidecarPool, cloudRequestOf, routesToGateway, type CloudRoute, type SidecarDeps } from '../plugin/server/sidecar.ts';
 import { reqDir, resDir, readJsonFile } from '../src/comm.ts';
 import type { ClaimResult, LeaseProof, TaskView } from '../src/contracts.ts';
 import type { EmployeeInst, SupervisedTask } from '../src/workforce.ts';
@@ -481,5 +481,128 @@ describe('云端运维作业在执行端的执行（runCloudOps）', () => {
     const result = await pool.runCloudOps({ employee: 'eng-1', taskId: 'task-job-clean', tool: 'ops_info', args: {} });
     for (const token of issued) expect(JSON.stringify(result)).not.toContain(token);
     expect(issued.size).toBe(0);
+  });
+});
+
+/** 同步调用抛出的错误码；不抛出返回 undefined。 */
+function codeOf(run: () => unknown): string | undefined {
+  try {
+    run();
+  } catch (error) {
+    return (error as { code?: string }).code;
+  }
+  return undefined;
+}
+
+describe('公司命令 company_cmd 与 company_cmd_catalog', () => {
+  test('两个工具走网关，并列入工具表（__list__）', async () => {
+    expect(routesToGateway('company_cmd')).toBe(true);
+    expect(routesToGateway('company_cmd_catalog')).toBe(true);
+    pool = makePool();
+    const env = pool.env(inst('eng-1'));
+    const reply = await send(env.SCK_COMM_DIR, env.SCK_COMM_KEY, 'r1', '__list__', {});
+    expect(reply.ok).toBe(true);
+    expect((reply.data as { tools: string[] }).tools).toEqual(expect.arrayContaining(['company_cmd', 'company_cmd_catalog']));
+  });
+
+  test('请求映射：company_cmd 原样取命令与输入；catalog 固定为 cmd.catalog；ops_ 与 owner 工具的命名不变', () => {
+    expect(cloudRequestOf('company_cmd', { command: 'task.detail', input: { taskId: 'task:a', q: 1 } }))
+      .toEqual({ command: 'task.detail', input: { taskId: 'task:a', q: 1 } });
+    expect(cloudRequestOf('company_cmd', { command: 'message.list' })).toEqual({ command: 'message.list', input: {} });
+    expect(cloudRequestOf('company_cmd_catalog', { anything: 1 })).toEqual({ command: 'cmd.catalog', input: {} });
+    expect(cloudRequestOf('ops_info', { q: 1 })).toEqual({ command: 'ops_info', input: { q: 1 } });
+    expect(cloudRequestOf('def_ensure', { id: 'x' })).toEqual({ command: 'def.ensure', input: { id: 'x' } });
+    expect(codeOf(() => cloudRequestOf('company_cmd', {}))).toBe('invalid');
+    expect(codeOf(() => cloudRequestOf('company_cmd', { command: 'task.list', input: ['x'] }))).toBe('invalid');
+  });
+
+  test('无租约：直接拒绝，不查身份、不换令牌、不请求网关', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const env = pool.env(inst('eng-1'));
+    const reply = await send(env.SCK_COMM_DIR, env.SCK_COMM_KEY, 'r1', 'company_cmd', { command: 'task.list', input: {} });
+    expect(reply.ok).toBe(false);
+    expect(reply.error).toContain('no_lease');
+    expect(identityLookups).toHaveLength(0);
+    expect(exchangeCalls).toHaveLength(0);
+    expect(gwCalls).toHaveLength(0);
+  });
+
+  test('有租约：命令与输入原样转发，换令牌带当前任务号；请求顶层的 taskId 被丢弃', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-cmd-1');
+    const reply = await send(dir, key, 'r1', 'company_cmd', { command: 'task.detail', input: { taskId: 'task:other', q: 1 }, taskId: 'someone-else' });
+    expect(reply).toEqual({ ok: true, data: { echoed: 'task.detail' } });
+    expect(idpCalls).toHaveLength(1);
+    expect(idpCalls[0]!.taskId).toBe('task-cmd-1');
+    expect(gwCalls).toHaveLength(1);
+    expect(gwCalls[0]!.command).toBe('task.detail');
+    // 输入里点名的任务由网关核对（见 owner-end 的 taskId 范围检查），插件不改写。
+    expect(gwCalls[0]!.input).toEqual({ taskId: 'task:other', q: 1 });
+    expect(gwCalls[0]!.auth.startsWith('Bearer ')).toBe(true);
+  });
+
+  test('company_cmd_catalog 固定请求 cmd.catalog，忽略传入的参数', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-cmd-catalog');
+    const reply = await send(dir, key, 'r1', 'company_cmd_catalog', { anything: 1 });
+    expect(reply).toEqual({ ok: true, data: { echoed: 'cmd.catalog' } });
+    expect(gwCalls.map(call => [call.command, call.input])).toEqual([['cmd.catalog', {}]]);
+  });
+
+  test('网关返回 pending 时，company_cmd 按作业号轮询 ops.job.get 直到 done', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-cmd-pending');
+    const reply = await send(dir, key, 'r1', 'company_cmd', { command: 'ops_slow', input: {} });
+    expect(reply).toEqual({ ok: true, data: { value: 42 } });
+    const polls = gwCalls.filter(call => call.command === 'ops.job.get');
+    expect(polls).toHaveLength(3);
+    for (const poll of polls) expect(poll.input).toEqual({ id: 'job-1' });
+  });
+
+  test('参数不合法（缺命令名、input 不是对象）：以 invalid 拒绝，不换令牌、不请求网关', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-cmd-bad');
+    const missing = await send(dir, key, 'r1', 'company_cmd', { input: {} });
+    const wrongInput = await send(dir, key, 'r2', 'company_cmd', { command: 'task.list', input: ['x'] });
+    expect(missing.error).toContain('invalid');
+    expect(wrongInput.error).toContain('invalid');
+    expect(exchangeCalls).toHaveLength(0);
+    expect(gwCalls).toHaveLength(0);
+  });
+
+  test('网关错误文本回显令牌时，返回给员工的内容已脱敏', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-cmd-leak');
+    const reply = await send(dir, key, 'r1', 'company_cmd', { command: 'ops_leak', input: {} });
+    expect(reply.ok).toBe(false);
+    expect(reply.error).toContain('[已隐藏]');
+    for (const token of issued) expect(reply.error ?? '').not.toContain(token);
+  });
+
+  test('回复、日志与临时目录都不含令牌或机密（含 pending 与失败作业）', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-cmd-scan');
+    await send(dir, key, 'r1', 'company_cmd', { command: 'task.list', input: {} });
+    await send(dir, key, 'r2', 'company_cmd', { command: 'ops_slow', input: {} });
+    await send(dir, key, 'r3', 'company_cmd', { command: 'ops_leak', input: {} });
+    await send(dir, key, 'r4', 'company_cmd', { command: 'ops_failjob', input: {} });
+    await send(dir, key, 'r5', 'company_cmd_catalog', {});
+    expect(issued.size).toBeGreaterThan(0);
+    expect(replies.length).toBe(5);
+    expect(sensitiveHits()).toEqual([]);
+  });
+
+  test('本机模式：两个工具都返回“需要云端执行端”，不查身份、不换令牌、不请求网关', async () => {
+    pool = makePool({ withLocalOps: true });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-cmd-local');
+    for (const tool of ['company_cmd', 'company_cmd_catalog']) {
+      const reply = await send(dir, key, `r-${tool}`, tool, { command: 'task.list', input: {} });
+      expect(reply.ok).toBe(false);
+      expect(reply.error).toContain('not_configured');
+      expect(reply.error).toContain('需要云端执行端');
+    }
+    expect(identityLookups).toHaveLength(0);
+    expect(exchangeCalls).toHaveLength(0);
+    expect(gwCalls).toHaveLength(0);
   });
 });

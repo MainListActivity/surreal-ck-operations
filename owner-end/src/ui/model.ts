@@ -1,6 +1,7 @@
 /**
  * 页面的纯函数：看板视图模型、草稿、错误文案、表单解析。不依赖 DOM 与 preact，供 bun test 直接测试。
  */
+import type { CommandGroup, CommandSpec } from '../command-catalog.ts';
 import type { BoardActivity, BoardEmployee, BoardMessageRow, BoardNow, BoardNextRow, BoardOutboxRow, BoardTranslation, BoardUnassignedRow, OwnerBoard } from './types.ts';
 
 export const RUNNER_ZH: Record<string, string> = { online: '在线', offline: '离线', unknown: '未知' };
@@ -403,4 +404,33 @@ export function noteLanes(notes: ReadonlyArray<{ lane: string }>): string[] {
 export function pageOf(hash: string): 'board' | 'tasks' | 'notes' | 'staff' | 'ops' {
   const name = hash.replace(/^#\/?/, '');
   return name === 'tasks' || name === 'notes' || name === 'staff' || name === 'ops' ? name : 'board';
+}
+
+/** 命令面板的一组命令。 */
+export interface CatalogGroupView {
+  group: CommandGroup;
+  commands: CommandSpec[];
+}
+
+/**
+ * 按关键字筛选（命令名、用途或分组，不分大小写），再按分组归并。组的先后与目录里首次出现的顺序一致；
+ * 没有匹配命令的组不返回。
+ */
+export function catalogGroups(entries: readonly CommandSpec[], query: string): CatalogGroupView[] {
+  const needle = query.trim().toLowerCase();
+  const groups = new Map<CommandGroup, CommandSpec[]>();
+  for (const spec of entries) {
+    if (needle && ![spec.command, spec.title, spec.group].some(text => text.toLowerCase().includes(needle))) continue;
+    groups.set(spec.group, [...(groups.get(spec.group) ?? []), spec]);
+  }
+  return [...groups].map(([group, commands]) => ({ group, commands }));
+}
+
+/** 命令的标记：高危、执行端（网关排队为作业）、只读。没有标记时为空数组。 */
+export function catalogTags(spec: CommandSpec): string[] {
+  return [
+    spec.risk === 'high' ? '高危' : undefined,
+    spec.runner ? '执行端' : undefined,
+    spec.readOnly ? '只读' : undefined,
+  ].filter((tag): tag is string => tag !== undefined);
 }
