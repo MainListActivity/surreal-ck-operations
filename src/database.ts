@@ -99,6 +99,9 @@ const pause = (ms: number): Promise<void> => new Promise(resolve => {
   timer.unref?.();
 });
 
+/** 本版本 applySchema 的最后一个结构版本；云端 bootstrap 只核对库内版本不低于它。 */
+export const CLOUD_SCHEMA_VERSION = 58;
+
 export class CompanyDatabase {
   /** 当前会话的客户端；云端续期或重连时整体替换（见 rebuildNow）。 */
   private session = new Surreal();
@@ -352,9 +355,21 @@ export class CompanyDatabase {
     if (this.config.cloud && this.role !== 'migrator') throw new Error(`云端只有 migrator 可以${action}`);
   }
 
-  /** 本机 bootstrap：认领库，再应用全部结构。云端执行端不跑它，公司库结构由 company-migrate 应用。 */
+  /**
+   * 本机 bootstrap：认领库，再应用全部结构。
+   * 云端不应用结构（由 scripts/company-migrate.ts 用 migrator 应用），只选定库并核对结构版本已到本版本要求，
+   * 这样各入口（MCP、调度器、老板 CLI 等）照旧调用 bootstrap 即可；版本不够时拒绝启动并指明要先跑迁移。
+   */
   async bootstrap(): Promise<void> {
-    if (this.config.cloud) throw new Error('云端执行端不跑 bootstrap：公司库结构由 scripts/company-migrate.ts 应用');
+    if (this.config.cloud) {
+      await this.useDatabase();
+      const [rows] = await this.db.query<[Array<{ schema_version?: number }>]>('SELECT schema_version FROM company_meta:installation;');
+      const version = Number(rows?.[0]?.schema_version ?? 0);
+      if (version < CLOUD_SCHEMA_VERSION) {
+        throw new Error(`云端公司库结构版本 ${version} 低于本版本要求 ${CLOUD_SCHEMA_VERSION}：先用 migrator 运行 scripts/company-migrate.ts`);
+      }
+      return;
+    }
     await this.applySchema(await this.claimDatabase());
   }
 
