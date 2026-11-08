@@ -155,9 +155,9 @@ test('runner-only upgrade commands fail as unavailable without an execution host
   try {
     expect([...RUNNER_ONLY_COMMANDS].sort()).toEqual(['upgrade.automatic', 'upgrade.list', 'upgrade.start']);
     for (const command of RUNNER_ONLY_COMMANDS) {
-      const error = await ownerApi(ctx, { command, taskId: 't1', taskVersion: 1, digest: 'd1', enabled: true }, 'cli').catch(e => e);
+      const error: unknown = await ownerApi(ctx, { command, taskId: 't1', taskVersion: 1, digest: 'd1', enabled: true }, 'cli').then(() => undefined, e => e);
       expect(error).toMatchObject({ name: 'CompanyError', code: 'unavailable' });
-      expect(error.message).toContain('需要执行端');
+      expect((error as Error).message).toContain('需要执行端');
     }
     const { ctx: plain } = makeFakeCtx({ owner: { openNotices: async () => [] } as any });
     expect(await ownerApi(plain, { command: 'notice.list' }, 'cli')).toEqual({ notices: [] });
