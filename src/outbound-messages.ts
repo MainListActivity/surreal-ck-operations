@@ -29,12 +29,14 @@ export const DEFAULT_MACHINE_CRITERION = 'AC-BASE-DEPLOY-1';
 const NOTES = `先读 notes.md。`;
 /** A session that stays in its turn after handing in burns tokens and cannot be woken for its own rework. */
 const END_TURN = `提交后结束本轮，不要等结果；被退回时系统会再通知你。`;
-const LEARNED = `多数任务不需要写笔记；只有今后同职能的任务都用得上的要求、方法或坑，才加 learned 数组（最多 5 条，每条一行，不写本次任务的内容）。`;
-const EXECUTE_CODE = `${NOTES}实现 task.md 中的需求，合入并发布到生产，按验收标准在生产逐条自验，全部通过后：sck call submit '{"text":"<结果>","sha":"<合入提交>"}'。需要后续任务时在 submit 里加 next 数组。${LEARNED}${END_TURN}`;
+const LEARNED = `多数任务不需要写笔记；只有今后同职能的任务都用得上的要求、方法或坑，才加 learned 数组（最多 5 条，每条一行，不写本次任务的内容）；被退回那一轮写的笔记不会生效。`;
+/** 员工沙箱不能安装，也读不到生产控制台令牌：自验在最终提交上做，安装由自动升级完成。 */
+const EXECUTE_CODE = `${NOTES}实现 task.md 中的需求，在最终提交上按验收标准逐条自验，合入 main 后：sck call submit '{"text":"<结果>","sha":"<合入提交>"}'。自动升级会把 main 装到生产，你不要安装，也不要登记升级卡。需要后续任务时在 submit 里加 next 数组。${LEARNED}${END_TURN}`;
 const EXECUTE_PLAIN = `${NOTES}完成 task.md 中的需求，按验收标准自验后：sck call submit '{"text":"<结果>"}'。需要后续任务时在 submit 里加 next 数组。${LEARNED}${END_TURN}`;
-/** 内容线（故事/视频等）的复核不涉及生产发布；软件线的复核才按生产环境逐条复验。 */
-const REVIEW = `${NOTES}按 task.md 的验收标准逐条复验：sck call review '{"decision":"accept|return","text":"<结论>"}'。${LEARNED}提交后结束本轮。`;
-const REVIEW_CODE = `${NOTES}按 task.md 的验收标准在生产逐条复验：sck call review '{"decision":"accept|return","text":"<结论>"}'。${LEARNED}提交后结束本轮。`;
+/** 第 1 条写的是老板视角的结果：不成立就没必要再读其余标准；软件线只在最终合入提交上核对。 */
+const REVIEW_FIRST = `先查验收标准第 1 条：这一条写的是老板视角的结果，不成立就直接退回，其余各条不用再看；成立后再逐条复验其余标准。`;
+const REVIEW = `${NOTES}按 task.md 的验收标准复验。${REVIEW_FIRST}sck call review '{"decision":"accept|return","text":"<结论>"}'。${LEARNED}提交后结束本轮。`;
+const REVIEW_CODE = `${NOTES}按 task.md 的验收标准复验。${REVIEW_FIRST}代码任务在最终合入提交上核对，不检查生产加载的版本。sck call review '{"decision":"accept|return","text":"<结论>"}'。${LEARNED}提交后结束本轮。`;
 const REWORK_CODE = `修复 findings/round-NN.md 中的问题后，` + EXECUTE_CODE;
 const REWORK_PLAIN = `修复 findings/round-NN.md 中的问题后，` + EXECUTE_PLAIN;
 const NUDGE = (phase: string) => phase === 'review' ? REVIEW : EXECUTE_PLAIN;
@@ -106,7 +108,7 @@ export class OutboundMessageStore {
     const have = new Set((existing ?? []).map(row => String(row.step)));
     const out: OutboundMessage[] = [];
     if (!have.has('execute')) out.push(await this.createDraft(taskId, 'execute', executorRole, code, 'doing', routeBody(bodies.execute)));
-    // 复核草稿与执行草稿用同一个 code 标记：软件线的复核才需要在生产逐条复验。
+    // 复核草稿与执行草稿用同一个 code 标记：软件线的复核才需要写明最终合入提交与不检查生产版本。
     if (!have.has('review')) out.push(await this.createDraft(taskId, 'review', reviewerRole, code, 'review', routeBody(bodies.review)));
     return out;
   }
