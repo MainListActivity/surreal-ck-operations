@@ -224,6 +224,10 @@ export class CompanyDatabase {
     // 053：线的笔记。只新增 lane_note 表，不改既有行；旧 release 读不到新表即忽略（RB01）。
     await this.db.query(loadSchema('053-lane-notes.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 53 WHERE schema_version < 53;');
+    // 054：线的笔记整理（合并、清理与可撤销的整理记录）。只新增 note_consolidation 表与 lane_note 的两个可选字段；
+    // 旧 release 读不到即忽略（RB01）。
+    await this.db.query(loadSchema('054-note-consolidation.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 54 WHERE schema_version < 54;');
     // 公司库访问方式（编号 055）：只在 COMPANY_JWKS_URL 与 COMPANY_ISSUER 都配置时应用，否则跳过并留一行日志（本机模式）。
     // 055 只新增访问方式与事件、不新增表，所以不推进 schema_version。
     const { companyJwksUrl, companyIssuer } = this.config;

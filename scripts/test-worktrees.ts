@@ -72,6 +72,8 @@ try {
     'tests/snapshot-quota.fork.test.ts',
     // 线的笔记：提议、生效、作废、上限与线间隔离（自建隔离库）。
     'tests/lane-notes.fork.test.ts',
+    // 线的笔记整理：合并近似笔记、超目标清理、dry run、撤销与并发守卫，以及每日调度（自建隔离库）。
+    'tests/lane-notes-consolidate.fork.test.ts',
     // SYS-INT：演练工具的 Node 宿主门禁与 deployDrillRun/Status 权限回归（自建隔离库，不启动生产演练）。
     'tests/deploy-drill.test.ts', 'tests/deploy-drill-runner.test.ts', 'tests/deploy-drill-node-host.test.ts', 'tests/deploy-drill-access.fork.test.ts',
     // SYS-INT：QA 评审协同的持久事件唤醒（自建隔离库；订阅/信号/事件只解除协同任务自己的 feedback 等待）。

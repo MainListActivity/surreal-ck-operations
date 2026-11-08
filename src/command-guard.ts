@@ -20,7 +20,7 @@ export const HARD_OWNER_ONLY: readonly string[] = ['guard.*', 'agent.policy.*', 
 export const OWNER_API_COMMANDS: readonly string[] = [
   'approve', 'audit.list', 'brief', 'decide', 'def.disable', 'def.enable', 'def.ensure', 'def.list', 'direction.add',
   'inbox', 'instruct', 'message.edit', 'message.hold', 'message.list', 'message.records', 'message.release', 'message.send',
-  'note.activate', 'note.add', 'note.edit', 'note.list', 'note.pin', 'note.preview', 'note.remove', 'notice.list',
+  'note.activate', 'note.add', 'note.consolidate', 'note.consolidation.undo', 'note.consolidations', 'note.edit', 'note.list', 'note.pin', 'note.preview', 'note.remove', 'notice.list',
   'notice.resolve', 'progress', 'reject', 'reply', 'route.disable', 'route.list', 'route.save', 'session.policy', 'status',
   'task.cost', 'task.create', 'task.delete', 'task.detail', 'task.list', 'task.pause', 'task.plan', 'task.reassign',
   'task.resume', 'task.revoke', 'task.update', 'task.void', 'upgrade.automatic', 'upgrade.list', 'upgrade.start',
