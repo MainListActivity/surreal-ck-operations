@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { checkLearned, checkNoteText, laneOf, notesFit, NOTES_MAX_LINES, renderNotes } from '../src/lane-notes.ts';
+import { checkLearned, checkNoteText, isDuplicateNote, laneOf, notesFit, NOTES_MAX_LINES, renderNotes } from '../src/lane-notes.ts';
 import { renderMessage, templateFor } from '../src/outbound-messages.ts';
 import { continuitySession, finishedSessions, reclaimIdleSessions } from '../src/dispatcher/idle-sessions.ts';
 import { observeRuntimeIdle } from '../src/dispatcher/memory-lru.ts';
@@ -35,6 +35,28 @@ test('the notes ceiling counts lines and bytes', () => {
   expect(notesFit('p:qa', rows(NOTES_MAX_LINES - 10))).toBe(true);
   expect(notesFit('p:qa', rows(NOTES_MAX_LINES))).toBe(false);
   expect(notesFit('p:qa', rows(120, 240))).toBe(false);
+});
+
+test('a restated note is a duplicate; the lane\'s other notes are not', () => {
+  // 需求给的两组真实样本：完全重复和换了说法的同一件事都必须判为重复。
+  const tree = '合入核对用树对比：合并提交的 tree 应与已验证 HEAD 的 tree 相同，并以远端主干为准。';
+  expect(isDuplicateNote(tree, [tree])).toBe(true);
+  const screenshot = '截图证据的时间必须晚于最后一次 UI 源提交，并与提交的 HEAD 对应。';
+  expect(isDuplicateNote('截图证据要晚于最后一次 UI 源提交，并对照提交的 HEAD 核对时间顺序。', [screenshot])).toBe(true);
+  // 同线其他真实笔记互不相关，不能被误判。
+  const lane = [
+    '插件 vendor 由 plugin/scripts/vendor.sh 从 src 拷贝生成，改 src 后须重跑；vendor 在 .gitignore，门禁内容比对会跳过它。',
+    '调度器跑在 Paseo 插件宿主，日志不在 logs/stdout.log；勿用 stdout 有无 wake 行判断行为。',
+    tree,
+    '本机门禁 release 目录必须用目标提交的 git archive，再拷 node_modules 并跑 plugin/scripts/vendor.sh；用主 checkout 旧树会静默漏步骤。',
+    '门禁回执在服务 home gates/ 下；日志要有 executed 标记和 pass/fail 计数才算真跑，skip 视为失败，别只看 json 的 result 字段。',
+    screenshot,
+  ];
+  for (const [i, a] of lane.entries()) {
+    for (const [j, b] of lane.entries()) {
+      if (i !== j) expect(isDuplicateNote(a, [b])).toBe(false);
+    }
+  }
 });
 
 test('dispatch messages name notes.md and render it next to task.md', () => {
