@@ -2238,7 +2238,7 @@ export class SurrealCompanyCore implements CompanyCore {
       // The transition is already committed: a note that cannot be stored must not fail the delivery it rode on.
       if (learned) {
         await new LaneNoteStore(this.db).propose(laneOf((await this.taskProject(proof.taskId))?.id, actor.role), proof.taskId,
-          action === 'submit' ? 'execute' : 'review', learned, actor.employeeId)
+          action === 'submit' ? 'execute' : 'review', learned, actor.employeeId, String(auditId.id))
           .catch(error => console.warn(`lane notes for ${proof.taskId} not stored: ${(error as Error).message}`));
       }
       return done;

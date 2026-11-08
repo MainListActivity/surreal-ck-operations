@@ -16,7 +16,7 @@ const ROLE_NAMES: Record<string, string> = {
   screenwriter: '专职编剧：故事与剧本多轮打磨，只接编剧轨',
   'story-author': '长篇故事作者：从总纲到概要再到正文，只接原著轨，不接任何改编和制作',
   cinematography: '摄影摄像：运镜设计、镜头调度、摄影机运动语言，只接摄影轨',
-  qa: '测试：上线后在生产环境逐条实测',
+  qa: '测试：先查老板视角结果，再在最终合入提交上逐条复验',
   cs: '客户成功',
   eval: '评审：任务完成后为参与员工打绩效分',
 };
@@ -62,12 +62,12 @@ function briefWake(task: SupervisedTask, env: PromptEnv, ctx: PromptCtx): string
   const sck = (name: string, args: string) => `'${env.sckBin}' call ${name} '${args}'`;
   const code = ctx.claim?.worktree?.intent.kind === 'code';
   if (task.state === 'review') {
-    return `按 ${dir}/task.md 的验收标准在生产逐条复验，结论：${sck('review', '{"decision":"accept|return","text":"…","idempotencyKey":"…"}')}`;
+    return `先查 ${dir}/task.md 的验收标准第 1 条：这一条写的是老板视角的结果，不成立就直接退回，其余各条不用再看；成立后再逐条复验其余标准。代码任务在最终合入提交上核对，不检查生产加载的版本。结论：${sck('review', '{"decision":"accept|return","text":"…","idempotencyKey":"…"}')}`;
   }
   const findings = latestFindings(ctx.claim?.history);
-  if (findings) return `修复 ${dir}/${findings.file} 中的问题，重新发布并自验后：${sck('submit', '{"text":"…","idempotencyKey":"…"}')}`;
+  if (findings) return `修复 ${dir}/${findings.file} 中的问题，在最终提交上按验收标准自验，合入 main 后：${sck('submit', '{"text":"…","idempotencyKey":"…"}')}`;
   const lead = code
-    ? `实现 ${dir}/task.md 中的需求，合入并发布到生产，按验收标准在生产逐条自验，全部通过后：`
+    ? `实现 ${dir}/task.md 中的需求，在最终提交上按验收标准逐条自验，合入 main 后：`
     : `实现 ${dir}/task.md 中的需求，按验收标准逐条自验，全部通过后：`;
   return `${lead}${sck('submit', '{"text":"…","idempotencyKey":"…"}')}`;
 }

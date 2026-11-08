@@ -52,15 +52,29 @@ test('minimal dispatch message: only what, where, how; no onboarding on first co
 });
 
 test('template bodies are the exact minimal sentences', () => {
-  expect(templateFor('execute', true)).toContain('合入并发布到生产');
-  expect(templateFor('execute', false)).not.toContain('合入并发布');
-  // 复核按工作种类分模板：软件线要求在生产逐条复验，内容线只说逐条复验。
-  expect(templateFor('review', true)).toContain('在生产逐条复验');
+  // 员工沙箱不安装：代码任务在最终提交上自验，合入 main 后 submit，安装交给自动升级。
+  expect(templateFor('execute', true)).toContain('在最终提交上按验收标准逐条自验');
+  expect(templateFor('execute', true)).toContain('合入 main');
+  expect(templateFor('execute', true)).toContain('自动升级会把 main 装到生产');
+  expect(templateFor('execute', true)).toContain('不要安装');
+  expect(templateFor('execute', true)).toContain('不要登记升级卡');
+  expect(templateFor('execute', true)).not.toContain('发布到生产');
+  expect(templateFor('execute', true)).not.toContain('在生产逐条自验');
+  expect(templateFor('execute', false)).not.toContain('合入 main');
+  // 复核先查第 1 条；软件线只在最终合入提交上核对，不检查生产加载的版本。
+  expect(templateFor('review', true)).toContain('先查验收标准第 1 条');
+  expect(templateFor('review', true)).toContain('老板视角');
+  expect(templateFor('review', true)).toContain('最终合入提交上核对');
+  expect(templateFor('review', true)).not.toContain('在生产逐条复验');
+  expect(templateFor('review', false)).toContain('先查验收标准第 1 条');
   expect(templateFor('review', false)).not.toContain('在生产');
   expect(templateFor('review', true)).toContain('call review');
   expect(templateFor('review', false)).toContain('call review');
   expect(templateFor('rework')).toContain('findings/round-NN.md');
   expect(templateFor('eval')).toContain('agents/eval.md');
+  // 被退回那一轮写的笔记不会生效：模板里要说清楚，员工按通过的那轮写。
+  expect(templateFor('execute', true)).toContain('被退回那一轮写的笔记不会生效');
+  expect(templateFor('review', true)).toContain('被退回那一轮写的笔记不会生效');
 });
 
 test('the code template instructs a sha submit and resolves absolute paths', () => {
@@ -105,13 +119,13 @@ test('review drafts and no-draft review sends use the same code flag as execute'
   } as never);
   // 建单草稿：code=true 时执行和复核都按软件线模板。
   await fake({}).createTaskDrafts('t1', 'engineering', 'qa', true);
-  expect(created.find(c => c.step === 'execute')!.body).toContain('合入并发布到生产');
-  expect(created.find(c => c.step === 'review')!.body).toContain('在生产逐条复验');
+  expect(created.find(c => c.step === 'execute')!.body).toContain('合入 main');
+  expect(created.find(c => c.step === 'review')!.body).toContain('先查验收标准第 1 条');
   // 旧任务没有复核草稿：prepareSend 即时生成时也必须按工作种类选模板。
   created.length = 0;
   const codeSend = await fake({ executor_role: 'engineering', reviewer_role: 'qa', kind: 'task', work_intent: { kind: 'code' } })
     .prepareSend('t1', 'review', 'e1');
-  expect(codeSend!.body).toContain('在生产逐条复验');
+  expect(codeSend!.body).toContain('最终合入提交上核对');
   created.length = 0;
   const storySend = await fake({ executor_role: 'story-author', reviewer_role: 'qa', kind: 'task', work_intent: { kind: 'assets' } })
     .prepareSend('t1', 'review', 'e1');

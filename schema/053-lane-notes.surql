@@ -6,6 +6,7 @@ DEFINE FIELD IF NOT EXISTS text ON lane_note TYPE string ASSERT string::len($val
 DEFINE FIELD IF NOT EXISTS state ON lane_note TYPE string ASSERT $value IN ['proposed', 'active', 'removed'];
 DEFINE FIELD IF NOT EXISTS phase ON lane_note TYPE option<string> ASSERT $value = NONE OR $value IN ['execute', 'review'];
 DEFINE FIELD IF NOT EXISTS source_task ON lane_note TYPE option<record<task>>;
+DEFINE FIELD IF NOT EXISTS source_audit ON lane_note TYPE option<record<audit>>;
 DEFINE FIELD IF NOT EXISTS author ON lane_note TYPE string;
 DEFINE FIELD IF NOT EXISTS pinned ON lane_note TYPE bool DEFAULT false;
 DEFINE FIELD IF NOT EXISTS created_at ON lane_note TYPE datetime;
