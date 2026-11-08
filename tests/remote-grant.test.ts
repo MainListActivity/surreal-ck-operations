@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { issueRemoteGrant, listRemoteGrants, revokeRemoteGrant, remoteGrantUrl, validateRemoteBlock, dbWsUrl } from '../src/ops/remote-grant.ts';
+import type { RemoteGrantDeps } from '../src/ops/remote-grant.ts';
 import { sha256Base64Url } from '../src/ops/idp-principals.ts';
 import type { D1Client } from '../src/ops/d1.ts';
 import type { BrokerConfig } from '../src/ops/config.ts';
@@ -42,7 +43,8 @@ function fakeProduct(handlers: { match: string; status?: number; body?: unknown 
 }
 
 const NOW = Date.parse('2026-11-10T00:00:00Z');
-const deps = (over: Record<string, unknown> = {}) => ({
+const deps = (over: Partial<RemoteGrantDeps> = {}): RemoteGrantDeps => ({
+  d1: fakeD1().d1,
   now: () => NOW,
   randomCode: () => 'fixedcode1234567890fixedcode1234567890=='.slice(0, 43),
   operatorToken: async () => 'ops_tok',
