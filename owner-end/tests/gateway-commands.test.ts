@@ -543,48 +543,13 @@ describe('命令目录（cmd.catalog）与员工的任务范围', () => {
     expect(audits[0]!.vars.command).toBe('cmd.catalog');
   });
 
-  test('taskId 指向别的任务：员工调用被拒，denied 审计，不执行；task: 前缀的本任务与裸任务号同义，通过', async () => {
+  test('老板定：员工可以操作别的任务与消息（taskId、messageId 不限于本租约任务），写 ok 审计', async () => {
     const other = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE });
-    const error = await errorOf(() => runCommand(depsWith(fakeSessions(other.db)), agentCaller, 'message.list', { taskId: 't2' }));
-    expect((error as CompanyError).code).toBe('forbidden');
-    expect((error as CompanyError).message).toBe('只能操作本员工当前租约的任务：参数里的任务或消息不属于它');
-    expect(other.calls.some((call) => call.sql.includes('outbound_message'))).toBe(false);
-    const audits = auditsOf(other.calls);
-    expect(audits).toHaveLength(1);
-    expect(audits[0]!.vars.outcome).toBe('denied');
-
-    for (const taskId of ['t1', 'task:t1']) {
-      const own = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE });
-      expect(await runCommand(depsWith(fakeSessions(own.db)), agentCaller, 'message.list', { taskId })).toEqual({ messages: [] });
-    }
-  });
-
-  test('taskId 不是字符串：视为不符，被拒', async () => {
-    const gateway = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE });
-    const error = await errorOf(() => runCommand(depsWith(fakeSessions(gateway.db)), agentCaller, 'task.detail', { taskId: 42 }));
-    expect((error as CompanyError).code).toBe('forbidden');
-    const audits = auditsOf(gateway.calls);
-    expect(audits).toHaveLength(1);
-    expect(audits[0]!.vars.outcome).toBe('denied');
-  });
-
-  test('执行端命令同样核对 taskId：upgrade.start 指向别的任务时不排队', async () => {
-    const gateway = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE });
-    const error = await errorOf(() => runCommand(depsWith(fakeSessions(gateway.db), 0), agentCaller, 'upgrade.start', { taskId: 't2', taskVersion: 1, digest: 'd' }));
-    expect((error as CompanyError).code).toBe('forbidden');
-    expect(gateway.calls.some((call) => call.sql.startsWith('CREATE $job'))).toBe(false);
-  });
-
-  test('messageId 指向别的任务或不存在的消息：员工调用被拒，不修改消息', async () => {
+    expect(await runCommand(depsWith(fakeSessions(other.db)), agentCaller, 'message.list', { taskId: 't2' })).toEqual({ messages: [] });
+    expect(auditsOf(other.calls)[0]!.vars.outcome).toBe('ok');
     const others = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE, message: [messageRow('m2', 't2')] });
-    const error = await errorOf(() => runCommand(depsWith(fakeSessions(others.db)), agentCaller, 'message.hold', { messageId: 'm2' }));
-    expect((error as CompanyError).code).toBe('forbidden');
-    expect(others.calls.some((call) => call.sql.startsWith('UPDATE $msg'))).toBe(false);
-
-    const missing = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE });
-    const absent = await errorOf(() => runCommand(depsWith(fakeSessions(missing.db)), agentCaller, 'message.hold', { messageId: 'm9' }));
-    expect((absent as CompanyError).code).toBe('forbidden');
-    expect(missing.calls.some((call) => call.sql.startsWith('UPDATE $msg'))).toBe(false);
+    const result = await runCommand(depsWith(fakeSessions(others.db)), agentCaller, 'message.hold', { messageId: 'm2' }) as { id: string };
+    expect(result.id).toBe('m2');
   });
 
   test('messageId 属于本员工当前任务：通过，执行命令并写 ok 审计', async () => {

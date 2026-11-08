@@ -65,18 +65,6 @@ const isReadOnly = (command: string): boolean => READ_ONLY.has(command) || READ_
 const reasonOf = (error: unknown): string => error instanceof CompanyError ? error.message : '服务暂时出错';
 
 /** 命令参数里的任务号（task:x 与 x 同义）；不是字符串的无法与租约任务核对，视为不符。 */
-const taskKeyOf = (value: unknown): string | undefined => (typeof value === 'string' ? value.replace(/^task:/, '') : undefined);
-
-/**
- * 员工调用里点名的任务（taskId）或消息（messageId）是否不属于它当前租约的任务。
- * 租约只核对了调用所属的任务；参数里点名别的任务或消息，就能改动别人的任务，所以这里一并核对。
- */
-async function namesOtherTask(db: Surreal, input: Input, task: string): Promise<boolean> {
-  if (input.taskId !== undefined && input.taskId !== null && taskKeyOf(input.taskId) !== task) return true;
-  if (input.messageId === undefined || input.messageId === null) return false;
-  const message = typeof input.messageId === 'string' ? await new OutboundMessageStore(db).get(input.messageId) : undefined;
-  return message?.taskId !== task;
-}
 
 /** 读取 /api/cmd 的请求体：必须是 {command, input} 形状，input 缺省为空对象。 */
 export function parseCommandBody(body: unknown): { command: string; input: Input } {
@@ -246,7 +234,7 @@ async function agentCall(deps: GatewayDeps, caller: AgentCaller, command: string
     if (!employee) return refuse('该令牌没有登记的员工身份');
     const decision = await decide(db, { actorKind: 'agent', actor: employee, task: caller.task, command, now: Math.floor(now.getTime() / 1000) });
     if (!decision.allow) return refuse(decision.reason);
-    if (await namesOtherTask(db, input, caller.task)) return refuse('只能操作本员工当前租约的任务：参数里的任务或消息不属于它');
+    // 老板定：员工持有任意任务租约时即可操作老板端全部命令（包括别的任务与消息），限制靠“仅老板”保护清单与员工策略。
     const locked = hardTargetOwnerOnly(command, input, deps.cfg.locks);
     if (locked) return refuse(locked);
     if (OWNER_ONLY_FOR_AGENTS.includes(command)) return refuse(OWNER_ONLY_REASON);
