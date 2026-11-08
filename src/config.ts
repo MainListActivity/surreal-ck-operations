@@ -12,6 +12,28 @@ export interface DatabaseConfig {
   companyJwksUrl?: string;
   /** 公司库 JWT 访问（055）：令牌 iss 必须等于它。 */
   companyIssuer?: string;
+  /** 云端执行端（COMPANY_DB_URL 配置时）：令牌模式登录；没有它就是本机 root 模式。 */
+  cloud?: CloudConfig;
+}
+
+/**
+ * 云端执行端的配置。secret 从不出现在配置里：这里只有凭证文件的路径，文件权限必须是 600（见 src/cloud/secret.ts）。
+ * 凭证文件固定在服务目录的 private/cloud 下，不能由环境变量指向别处。
+ */
+export interface CloudConfig {
+  /** 身份签发方，例如 https://o.maplayer.top/t/company；token 端点是 `${idpIssuer}/token`。 */
+  idpIssuer: string;
+  /** 执行端机密客户端的 id（RUNNER_CLIENT_ID）。 */
+  runnerClientId?: string;
+  /** 执行端 client secret 的凭证文件，固定为 <服务目录>/private/cloud/runner-client-secret。 */
+  runnerClientSecretFile: string;
+  /** 公司网关地址（GATEWAY_URL）。 */
+  gatewayUrl?: string;
+  /** 老板端地址（OWNER_END_URL），只用于面板里的“打开老板端”链接。 */
+  ownerEndUrl?: string;
+  /** 迁移专用的 migrator 客户端；只有 company-migrate 与首次开通使用。 */
+  migratorClientId?: string;
+  migratorClientSecretFile?: string;
 }
 
 function readProductEnv(): Record<string, string> {
@@ -68,16 +90,42 @@ export function loadDatabaseConfig(): DatabaseConfig {
     if (!value) throw new Error(`Missing ${name}`);
     return value;
   };
-  const namespace = process.env.SCK_COMPANY_NS ?? 'sck_agent_company';
-  const database = process.env.SCK_COMPANY_DB ?? 'control_plane';
+  // 云端执行端：COMPANY_DB_URL 存在即走令牌模式，命名空间与库来自 COMPANY_NS / COMPANY_DB（默认 company / main）。
+  const cloudUrl = lookup('COMPANY_DB_URL');
+  const cloud = !!cloudUrl;
+  const namespace = cloud ? lookup('COMPANY_NS') ?? 'company' : process.env.SCK_COMPANY_NS ?? 'sck_agent_company';
+  const database = cloud ? lookup('COMPANY_DB') ?? 'main' : process.env.SCK_COMPANY_DB ?? 'control_plane';
   if (!/^[a-z][a-z0-9_]{2,62}$/.test(namespace) || !/^[a-z][a-z0-9_]{2,62}$/.test(database)) {
     throw new Error('Invalid company namespace/database name');
   }
-  const url = get('SURREAL_URL');
+  const url = cloud ? cloudUrl! : get('SURREAL_URL');
   // `bun test` loads the product .env by default, which points at the production SurrealDB server.
   // Tests must run on a local fork instead (bun scripts/test-worktrees.ts [files]).
   if (process.env.NODE_ENV === 'test' && !/^wss?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(url)) {
     throw new Error(`Refusing to run tests against a non-local database (${url.replace(/\/\/.*@/, '//')}); run them with: bun scripts/test-worktrees.ts <tests/file.test.ts>`);
+  }
+  if (cloud) {
+    // 令牌模式不读 root 账号；身份与 secret 位置来自下面这些字段。secret 只在凭证文件里，配置里只有路径。
+    const idpIssuer = get('IDP_ISSUER').replace(/\/+$/, '');
+    const home = serviceHome();
+    return {
+      url,
+      rootUser: '',
+      rootPassword: '',
+      namespace,
+      database,
+      companyJwksUrl: lookup('COMPANY_JWKS_URL') ?? `${idpIssuer}/jwks.json`,
+      companyIssuer: lookup('COMPANY_ISSUER') ?? idpIssuer,
+      cloud: {
+        idpIssuer,
+        runnerClientId: lookup('RUNNER_CLIENT_ID'),
+        runnerClientSecretFile: join(home, 'private/cloud/runner-client-secret'),
+        gatewayUrl: lookup('GATEWAY_URL'),
+        ownerEndUrl: lookup('OWNER_END_URL'),
+        migratorClientId: lookup('MIGRATOR_CLIENT_ID'),
+        migratorClientSecretFile: join(home, 'private/cloud/migrator-client-secret'),
+      },
+    };
   }
   return {
     url,

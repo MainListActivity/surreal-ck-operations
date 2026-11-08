@@ -102,6 +102,31 @@ export interface OpsGateway {
   releaseGrant?(grantId: string): number;
 }
 
+/**
+ * 云端执行端的网关路由（只用结构类型，不在此 import src/cloud，避免插件包引入网关依赖）。
+ * 实例由调用方组装：gateway 即 GatewayClient，tokens 即 AgentTokenCache，idpUserOf 从 agent_identity 查 ma_hono 用户 id。
+ */
+export interface CloudRoute {
+  gateway: { call(token: string, command: string, input?: unknown): Promise<unknown> };
+  tokens: {
+    tokenFor(input: { employee: string; agentUserId: string; taskId: string; leaseRemainingMs: number }): Promise<string>;
+    drop(input: { employee?: string; taskId: string }): void;
+  };
+  /** 查不到返回 undefined；查询失败视同查不到。 */
+  idpUserOf(employeeId: string): Promise<string | undefined> | string | undefined;
+}
+
+/**
+ * 走网关的 owner 级工具。网关命令名 = 工具名把 `_` 换成 `.`，且须在 src/command-guard.ts 的
+ * OWNER_API_COMMANDS 或 HARD_OWNER_ONLY（def.*）中；tests/cloud-sidecar-route.test.ts 核对这一对应关系。
+ */
+export const CLOUD_OWNER_TOOLS: ReadonlySet<string> = new Set(["def_list", "def_ensure"]);
+
+/** 云端注入时，这些工具改走公司网关；其余（任务流 checkpoint/submit/review 等）保持本地。 */
+export function routesToGateway(tool: string): boolean {
+  return tool.startsWith("ops_") || CLOUD_OWNER_TOOLS.has(tool);
+}
+
 export interface SidecarDeps {
   core: CompanyCore;
   workforce: Workforce;
@@ -113,6 +138,8 @@ export interface SidecarDeps {
   browser?: OpsGateway;
   /** sync.so video studio (`sync_*` tools): same gateway shape; spend is approval-gated inside. */
   sync?: OpsGateway;
+  /** 云端执行端：注入后 `ops_*` 与 owner 级工具改走公司网关；不注入即本机模式，行为不变。 */
+  cloud?: CloudRoute;
   /** Root under which per-instance comm dirs live. */
   runDir: string;
 
@@ -541,6 +568,8 @@ export class SidecarPool {
   private endLease(instId: string): void {
     const live = this.claims.get(instId);
     if (live) this.lastTask.set(instId, live.taskId);
+    // 任务结束即丢弃该任务的 agent 令牌（只在内存里，丢弃不抛错）。
+    if (live) this.deps.cloud?.tokens.drop({ employee: instId, taskId: live.taskId });
     this.stopBeat(instId);
     this.claims.delete(instId);
     const cleanup = this.deps.ops?.release(instId);
@@ -817,6 +846,15 @@ export class SidecarPool {
     if (tool === "__list__") return { tools: [...BASE_TOOLS, ...(ops?.tools ?? []), ...(media?.tools ?? []), ...(browser?.tools ?? []), ...(sync?.tools ?? [])] };
     if (tool === "heartbeat") return { ok: true }; // the sidecar owns keepalive
     if (tool === "claim_next") throw Object.assign(new Error("任务由调度通道代领，无需手动 claim"), { code: "forbidden" });
+    // 云端路由（只在注入 cloud 时启用）：先核对租约，再去换令牌；无租约直接拒绝，不碰身份服务。
+    const cloud = this.deps.cloud;
+    if (cloud && routesToGateway(tool)) {
+      const claim = this.claims.get(instId);
+      if (!claim || claim !== requestLease) throw Object.assign(new Error("no matching active lease for this request"), { code: "no_lease" });
+      // 与本机网关一样：请求里的 taskId 被丢弃，只作用于当前租约任务。
+      const { taskId: _requested, ...rest } = args;
+      return this.callCloud(cloud, instId, claim, tool, rest);
+    }
     // SYS01 M1: for a snapshot-backed listing the reply ceiling covers the credential phase too, counted from the same
     // arrival as the answer: a stalled re-issue is refused recoverably inside the one deadline instead of delaying past it.
     const resolveCred = () => (forceRotate ? this.rotateCredential(instId) : this.credentialFor(instId));
@@ -1054,6 +1092,73 @@ export class SidecarPool {
         ? `${tool} 已下线：凭证不再交给员工，需要账号、workspace、登录请用运维工具（sck call ops_info '{}' 查看）`
         : `unknown tool: ${tool}`), { code: "unknown_tool" });
     }
+  }
+
+  /**
+   * 经公司网关执行一次工具调用，用员工的 agent 令牌鉴权。令牌只在本函数的局部变量里存在：
+   * 错误文本与返回内容中出现的令牌一律替换掉，不写会话、comm 目录、证据或日志。
+   */
+  private async callCloud(cloud: CloudRoute, instId: string, claim: LiveClaim, tool: string, input: Record<string, unknown>): Promise<unknown> {
+    // 租约剩余秒数以服务端 leaseExpiresAt 为准（claim/心跳/恢复时写入 routingExpiresAt）；取不到即拒绝。
+    const remainingMs = claim.routingExpiresAt === undefined ? Number.NaN : claim.routingExpiresAt - Date.now();
+    if (!(remainingMs >= 1000)) throw Object.assign(new Error("员工没有有效租约，不能调用网关"), { code: "no_lease" });
+    let agentUserId: string | undefined;
+    try {
+      agentUserId = await cloud.idpUserOf(instId);
+    } catch {
+      agentUserId = undefined;
+    }
+    if (!agentUserId) {
+      throw Object.assign(new Error("查不到该员工对应的身份用户（agent_identity），拒绝调用网关"), { code: "forbidden" });
+    }
+    let token = "";
+    try {
+      token = await cloud.tokens.tokenFor({ employee: instId, agentUserId, taskId: claim.taskId, leaseRemainingMs: remainingMs });
+      const command = tool.startsWith("ops_") ? tool : tool.replace(/_/g, ".");
+      const result = await cloud.gateway.call(token, command, input);
+      if (token && JSON.stringify(result ?? null).includes(token)) {
+        throw Object.assign(new Error("网关返回内容含有凭证，已拒绝转交"), { code: "upstream_error" });
+      }
+      return result;
+    } catch (error) {
+      const raw = error as { code?: unknown; message?: unknown };
+      const text = typeof raw?.message === "string" ? raw.message : "网关调用失败";
+      // 错误文本里若回显了令牌，整段替换为占位符。
+      const message = token ? text.split(token).join("[已隐藏]") : text;
+      throw Object.assign(new Error(message), { code: typeof raw?.code === "string" ? raw.code : "upstream_error" });
+    }
+  }
+
+  /**
+   * 云端运维作业（执行端）：以作业里员工的身份，在其当前租约任务上执行一次 ops_* 工具。
+   * 与本机 sck call 走同一条路径：租约必须仍是作业所属的任务，熔断与本机一致；租约一旦变化即拒绝。
+   * 只在执行端这一次调用 OpsBroker，网关路径不再重复计数；这里不产生也不返回任何令牌。
+   */
+  async runCloudOps(input: { employee: string; taskId: string; tool: string; args: Record<string, unknown> }): Promise<unknown> {
+    const { employee, taskId, tool } = input;
+    const ops = this.deps.ops;
+    const claim = this.claims.get(employee);
+    if (!claim || claim.taskId !== taskId) throw Object.assign(new Error("该员工当前没有这个任务的租约，作业已拒绝"), { code: "no_lease" });
+    if (!ops?.tools.includes(tool)) throw Object.assign(new Error(`未知的运维工具：${tool}`), { code: "not_found" });
+    const cred = await this.credentialFor(employee);
+    // 与本机网关一样：作业里的 taskId 被丢弃，只作用于当前租约任务。
+    const { taskId: _requested, ...args } = input.args;
+    const live = () => {
+      if (this.claims.get(employee) !== claim) throw Object.assign(new Error("租约已变化，作业已拒绝"), { code: "no_lease" });
+    };
+    return this.opsCircuit.run({
+      employee, task: taskId, delivery: claim.proof.deliveryId, tool,
+      check: live,
+      invoke: () => ops.call(cred, taskId, tool, args),
+      block: async text => {
+        live();
+        const view = await this.deps.core.block(cred, claim.proof, "owner", {
+          text, idempotencyKey: `ops-circuit:${claim.proof.deliveryId}:${tool}`,
+        });
+        if (this.claims.get(employee) === claim) this.endLease(employee);
+        return view;
+      },
+    });
   }
 
   /** Stops this pool's sweeper and keepalives, as a process exit would. A replacement pool over the same run

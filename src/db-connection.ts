@@ -16,17 +16,22 @@ export interface DbTarget {
   auth: DbAuth;
 }
 
+/** Connect options. `reconnect: false` turns off the SDK's silent socket retry, so a drop surfaces as 'disconnected' at once. */
+export interface ConnectDbOptions {
+  reconnect?: boolean;
+}
+
 /**
  * Connects a client and logs it in. A root login passes its account to the connect call. A token login connects first and then
  * authenticates with the token from `getToken`. Selects no namespace or database.
  */
-export async function connectDb(db: Surreal, target: DbTarget): Promise<void> {
+export async function connectDb(db: Surreal, target: DbTarget, options: ConnectDbOptions = {}): Promise<void> {
   const { auth } = target;
   if (auth.kind === 'root') {
     await db.connect(target.url, { authentication: { username: auth.username, password: auth.password } });
     return;
   }
-  await db.connect(target.url);
+  await db.connect(target.url, options.reconnect === undefined ? undefined : { reconnect: options.reconnect });
   await db.authenticate(await auth.getToken());
 }
 
@@ -36,8 +41,8 @@ export async function useDb(db: Surreal, target: DbTarget): Promise<void> {
 }
 
 /** Connects and logs in a client, then selects the target's namespace and database. */
-export async function openDb(db: Surreal, target: DbTarget): Promise<void> {
-  await connectDb(db, target);
+export async function openDb(db: Surreal, target: DbTarget, options: ConnectDbOptions = {}): Promise<void> {
+  await connectDb(db, target, options);
   await useDb(db, target);
 }
 

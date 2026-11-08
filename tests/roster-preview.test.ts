@@ -123,8 +123,8 @@ test('roster RPC: unknown history blocks all candidates at zero share; recovery 
 });
 
 // Compile and render the actual roster JSX section with wire responses, without a host UI runtime.
-// The review-pool details live inside the collapsed 调度明细 section on the slimmed page.
-const page = await Bun.file(new URL('../plugin/client/company.tsx', import.meta.url)).text();
+// The review-pool details live inside the collapsed 调度明细 section of the migrated copy in owner-views.tsx; company.tsx is now the runner status panel.
+const page = await Bun.file(new URL('../plugin/client/owner-views.tsx', import.meta.url)).text();
 const sectionStart = page.indexOf('<Collapsible title="调度明细');
 const sectionEnd = page.indexOf('</Collapsible>', sectionStart);
 if (sectionStart < 0 || sectionEnd < 0) throw new Error('Missing roster debug (调度明细) UI section');
