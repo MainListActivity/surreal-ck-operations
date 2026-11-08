@@ -156,3 +156,17 @@ describe('其它命令与常量', () => {
     expect(COMPANY_HOST).toBe('company.maplayer.top');
   });
 });
+
+describe('cf.api：认证与数据入口的域名与 zone', () => {
+  const ZONE = '6ace211d0a7ac7c16b52177a37c77f88';
+  test('maplayer.top zone 的写操作锁定，读取放行', () => {
+    expect(locked('cf.api', { method: 'PATCH', path: `/zones/${ZONE}/dns_records/abc`, body: { content: '1.2.3.4' } })).toBeDefined();
+    expect(locked('cf.api', { method: 'POST', path: `/zones/${ZONE}/workers/routes`, body: { pattern: 'x/*', script: 'evil' } })).toBeDefined();
+    expect(locked('cf.api', { method: 'GET', path: `/zones/${ZONE}/dns_records` })).toBeUndefined();
+  });
+  test('请求内容提到 o.maplayer.top 或 data.maplayer.top 锁定；其它 zone 的写入放行', () => {
+    expect(locked('cf.api', { method: 'POST', path: '/zones/otherzone/dns_records', body: { name: 'o.maplayer.top' } })).toBeDefined();
+    expect(locked('cf.api', { method: 'POST', path: '/zones/otherzone/dns_records', body: { name: 'data.maplayer.top' } })).toBeDefined();
+    expect(locked('cf.api', { method: 'POST', path: '/zones/otherzone/dns_records', body: { name: 'www.example.com' } })).toBeUndefined();
+  });
+});
