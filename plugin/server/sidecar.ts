@@ -42,6 +42,8 @@ const BASE_TOOLS = [
   "def_list", "def_ensure", "project_disciplines_update",
   // owner only in core (rebind a blocked task to a registered project; audited, version-guarded).
   "task_project_update",
+  // Company gateway (W4): boss-end commands through company_cmd, listed by company_cmd_catalog. Cloud only; the local face says so.
+  "company_cmd", "company_cmd_catalog",
   // SYS01 bounded reads: owner-only company summary and byte-segment reads of long text (core enforces both).
   "get_admin_summary", "read_task_text", "read_worktree_refs", "record_acceptance_evidence", "acceptance_status", "acceptance_gate", "set_acceptance_gate",
   // SYS-INT controlled non-production deploy drill: host-executed (the service child), never the sandbox.
@@ -122,10 +124,34 @@ export interface CloudRoute {
  */
 export const CLOUD_OWNER_TOOLS: ReadonlySet<string> = new Set(["def_list", "def_ensure"]);
 
+/**
+ * 员工经 company_cmd 调用老板端的网关命令；company_cmd_catalog 列出其中本员工能调用的那部分（网关 cmd.catalog 按身份过滤）。
+ * 只在注入 cloud 时走网关；本机模式直接说明需要云端执行端。
+ */
+export const COMPANY_CMD_TOOLS: ReadonlySet<string> = new Set(["company_cmd", "company_cmd_catalog"]);
+
 /** 云端注入时，这些工具改走公司网关；其余（任务流 checkpoint/submit/review 等）保持本地。 */
 export function routesToGateway(tool: string): boolean {
-  return tool.startsWith("ops_") || CLOUD_OWNER_TOOLS.has(tool);
+  return tool.startsWith("ops_") || CLOUD_OWNER_TOOLS.has(tool) || COMPANY_CMD_TOOLS.has(tool);
 }
+
+/**
+ * 工具调用对应的网关命令与输入（taskId 已由调用方丢弃，只作用于当前租约任务）。
+ * ops_* 保留原名，其余 owner 级工具把 `_` 换成 `.`；company_cmd 原样转发参数里的命令名与 input；company_cmd_catalog 固定为 cmd.catalog。
+ */
+export function cloudRequestOf(tool: string, args: Record<string, unknown>): { command: string; input: Record<string, unknown> } {
+  if (tool === "company_cmd") {
+    const input = args.input ?? {};
+    if (typeof args.command !== "string") throw Object.assign(new Error("company_cmd 需要 command：网关命令名（字符串）"), { code: "invalid" });
+    if (typeof input !== "object" || Array.isArray(input)) throw Object.assign(new Error("company_cmd 的 input 必须是对象"), { code: "invalid" });
+    return { command: args.command, input: input as Record<string, unknown> };
+  }
+  if (tool === "company_cmd_catalog") return { command: "cmd.catalog", input: {} };
+  return { command: tool.startsWith("ops_") ? tool : tool.replace(/_/g, "."), input: args };
+}
+
+/** 本机没有公司网关：company_cmd 与 company_cmd_catalog 只能在云端执行端使用。 */
+const NEEDS_CLOUD = "需要云端执行端：公司命令只在云端模式可用，本机没有公司网关";
 
 export interface SidecarDeps {
   core: CompanyCore;
@@ -853,7 +879,8 @@ export class SidecarPool {
       if (!claim || claim !== requestLease) throw Object.assign(new Error("no matching active lease for this request"), { code: "no_lease" });
       // 与本机网关一样：请求里的 taskId 被丢弃，只作用于当前租约任务。
       const { taskId: _requested, ...rest } = args;
-      return this.callCloud(cloud, instId, claim, tool, rest);
+      const request = cloudRequestOf(tool, rest);
+      return this.callCloud(cloud, instId, claim, request.command, request.input);
     }
     // SYS01 M1: for a snapshot-backed listing the reply ceiling covers the credential phase too, counted from the same
     // arrival as the answer: a stalled re-issue is refused recoverably inside the one deadline instead of delaying past it.
@@ -1037,6 +1064,8 @@ export class SidecarPool {
         : Promise.reject(Object.assign(new Error("core does not expose get_task_cost"), { code: "temporarily_unavailable" }));
       case "def_list": return core.listDefs(cred);
       case "def_ensure": return core.ensureDef(cred, args as never);
+      // 云端注入时已在上面走网关；走到这里即本机模式。
+      case "company_cmd": case "company_cmd_catalog": throw Object.assign(new Error(NEEDS_CLOUD), { code: "not_configured" });
       case "project_disciplines_update": return core.updateProjectDisciplines(cred, args as never);
       case "deliverable_publish": {
         // 显式 taskId 供老板代发/补发（免租约）；缺省才取当前租约任务。
@@ -1095,10 +1124,10 @@ export class SidecarPool {
   }
 
   /**
-   * 经公司网关执行一次工具调用，用员工的 agent 令牌鉴权。令牌只在本函数的局部变量里存在：
+   * 经公司网关执行一次命令，用员工的 agent 令牌鉴权。令牌只在本函数的局部变量里存在：
    * 错误文本与返回内容中出现的令牌一律替换掉，不写会话、comm 目录、证据或日志。
    */
-  private async callCloud(cloud: CloudRoute, instId: string, claim: LiveClaim, tool: string, input: Record<string, unknown>): Promise<unknown> {
+  private async callCloud(cloud: CloudRoute, instId: string, claim: LiveClaim, command: string, input: Record<string, unknown>): Promise<unknown> {
     // 租约剩余秒数以服务端 leaseExpiresAt 为准（claim/心跳/恢复时写入 routingExpiresAt）；取不到即拒绝。
     const remainingMs = claim.routingExpiresAt === undefined ? Number.NaN : claim.routingExpiresAt - Date.now();
     if (!(remainingMs >= 1000)) throw Object.assign(new Error("员工没有有效租约，不能调用网关"), { code: "no_lease" });
@@ -1114,7 +1143,6 @@ export class SidecarPool {
     let token = "";
     try {
       token = await cloud.tokens.tokenFor({ employee: instId, agentUserId, taskId: claim.taskId, leaseRemainingMs: remainingMs });
-      const command = tool.startsWith("ops_") ? tool : tool.replace(/_/g, ".");
       const result = await cloud.gateway.call(token, command, input);
       if (token && JSON.stringify(result ?? null).includes(token)) {
         throw Object.assign(new Error("网关返回内容含有凭证，已拒绝转交"), { code: "upstream_error" });
