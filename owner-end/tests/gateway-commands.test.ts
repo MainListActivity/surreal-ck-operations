@@ -5,6 +5,7 @@ import { CompanyError } from '../../src/core-errors.ts';
 import type { VerifiedToken } from '../src/auth/jwt.ts';
 import type { Caller } from '../src/auth/caller.ts';
 import { parseCommandBody, requireOwner, runCommand, type GatewayDeps } from '../src/commands.ts';
+import { COMMAND_CATALOG } from '../src/command-catalog.ts';
 import type { Sessions } from '../src/db.ts';
 import { PendingJob } from '../src/jobs.ts';
 import { fakeDb, fakeSessions, json, scriptedFetch, testConfig, type FakeCall } from './_support.ts';
@@ -74,11 +75,14 @@ function agentGateway(rows: {
   job?: unknown[];
   /** 作业的发起人（jobOwnedBy 的 SELECT actor_kind, actor）。 */
   jobOwner?: unknown[];
+  /** 消息记录（读取与更新 $msg 时返回）。 */
+  message?: unknown[];
 }) {
   return fakeDb((sql) => {
     if (sql.includes('FROM agent_identity')) return rows.identity ?? [];
     if (sql.includes('FROM agent_policy')) return rows.policy ?? [];
     if (sql.includes('FROM protected_command')) return rows.protectedRows ?? [];
+    if (sql.includes('FROM $msg') || sql.startsWith('UPDATE $msg')) return rows.message ?? [];
     if (sql.includes('FROM $task')) return rows.task ?? [];
     if (sql.startsWith('SELECT actor_kind, actor FROM $job')) return rows.jobOwner ?? [];
     if (sql.includes('FROM $job')) return rows.job ?? [];
@@ -506,5 +510,90 @@ describe('员工调用的命令守卫与审计', () => {
       expect.objectContaining({ command: 'idp.*' }),
       expect.objectContaining({ command: 'cf.api' }),
     ]));
+  });
+});
+
+describe('命令目录（cmd.catalog）与员工的任务范围', () => {
+  const messageRow = (id: string, task: string) => ({
+    id: new RecordId('outbound_message', id), task: new RecordId('task', task), step: 'execute', role: 'engineering',
+    body: '正文', state: 'draft', hold: false, created_at: '2026-11-08T09:00:00Z',
+  });
+
+  test('cmd.catalog：老板拿到全部命令，只读不写审计', async () => {
+    const owner = fakeDb();
+    const deps = depsWith(fakeSessions(owner.db));
+    const result = await runCommand(deps, ownerCaller, 'cmd.catalog', {}) as { scope: string; commands: unknown[] };
+    expect(result.scope).toBe('owner');
+    expect(result.commands).toHaveLength(COMMAND_CATALOG.length);
+    expect(auditsOf(owner.calls)).toHaveLength(0);
+  });
+
+  test('cmd.catalog：员工只看到自己能调用的命令，并写 ok 审计（员工的调用无论读写都记）', async () => {
+    const gateway = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE, policy: [{ deny: ['route.save'] }] });
+    const deps = depsWith(fakeSessions(gateway.db));
+    const result = await runCommand(deps, agentCaller, 'cmd.catalog', {}) as { scope: string; commands: Array<{ command: string }> };
+    const names = result.commands.map((item) => item.command);
+    expect(result.scope).toBe('agent');
+    expect(names).toContain('message.list');
+    expect(names).not.toContain('route.save');
+    expect(names).not.toContain('guard.protect');
+    const audits = auditsOf(gateway.calls);
+    expect(audits).toHaveLength(1);
+    expect(audits[0]!.vars.outcome).toBe('ok');
+    expect(audits[0]!.vars.command).toBe('cmd.catalog');
+  });
+
+  test('taskId 指向别的任务：员工调用被拒，denied 审计，不执行；task: 前缀的本任务与裸任务号同义，通过', async () => {
+    const other = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE });
+    const error = await errorOf(() => runCommand(depsWith(fakeSessions(other.db)), agentCaller, 'message.list', { taskId: 't2' }));
+    expect((error as CompanyError).code).toBe('forbidden');
+    expect((error as CompanyError).message).toBe('只能操作本员工当前租约的任务：参数里的任务或消息不属于它');
+    expect(other.calls.some((call) => call.sql.includes('outbound_message'))).toBe(false);
+    const audits = auditsOf(other.calls);
+    expect(audits).toHaveLength(1);
+    expect(audits[0]!.vars.outcome).toBe('denied');
+
+    for (const taskId of ['t1', 'task:t1']) {
+      const own = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE });
+      expect(await runCommand(depsWith(fakeSessions(own.db)), agentCaller, 'message.list', { taskId })).toEqual({ messages: [] });
+    }
+  });
+
+  test('taskId 不是字符串：视为不符，被拒', async () => {
+    const gateway = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE });
+    const error = await errorOf(() => runCommand(depsWith(fakeSessions(gateway.db)), agentCaller, 'task.detail', { taskId: 42 }));
+    expect((error as CompanyError).code).toBe('forbidden');
+    const audits = auditsOf(gateway.calls);
+    expect(audits).toHaveLength(1);
+    expect(audits[0]!.vars.outcome).toBe('denied');
+  });
+
+  test('执行端命令同样核对 taskId：upgrade.start 指向别的任务时不排队', async () => {
+    const gateway = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE });
+    const error = await errorOf(() => runCommand(depsWith(fakeSessions(gateway.db), 0), agentCaller, 'upgrade.start', { taskId: 't2', taskVersion: 1, digest: 'd' }));
+    expect((error as CompanyError).code).toBe('forbidden');
+    expect(gateway.calls.some((call) => call.sql.startsWith('CREATE $job'))).toBe(false);
+  });
+
+  test('messageId 指向别的任务或不存在的消息：员工调用被拒，不修改消息', async () => {
+    const others = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE, message: [messageRow('m2', 't2')] });
+    const error = await errorOf(() => runCommand(depsWith(fakeSessions(others.db)), agentCaller, 'message.hold', { messageId: 'm2' }));
+    expect((error as CompanyError).code).toBe('forbidden');
+    expect(others.calls.some((call) => call.sql.startsWith('UPDATE $msg'))).toBe(false);
+
+    const missing = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE });
+    const absent = await errorOf(() => runCommand(depsWith(fakeSessions(missing.db)), agentCaller, 'message.hold', { messageId: 'm9' }));
+    expect((absent as CompanyError).code).toBe('forbidden');
+    expect(missing.calls.some((call) => call.sql.startsWith('UPDATE $msg'))).toBe(false);
+  });
+
+  test('messageId 属于本员工当前任务：通过，执行命令并写 ok 审计', async () => {
+    const gateway = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE, message: [messageRow('m1', 't1')] });
+    const result = await runCommand(depsWith(fakeSessions(gateway.db)), agentCaller, 'message.hold', { messageId: 'm1' }) as { id: string };
+    expect(result.id).toBe('m1');
+    expect(gateway.calls.some((call) => call.sql.startsWith('UPDATE $msg'))).toBe(true);
+    const audits = auditsOf(gateway.calls);
+    expect(audits).toHaveLength(1);
+    expect(audits[0]!.vars.outcome).toBe('ok');
   });
 });
