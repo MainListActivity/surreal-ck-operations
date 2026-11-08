@@ -346,6 +346,22 @@ function registerTools(server: McpServer, core: CompanyCore) {
     }),
   }, async (input, ctx) => run(token(ctx), () => core.ensureDef(token(ctx), input)));
 
+  // Company gateway (W4): boss-end commands go through company_cmd, and company_cmd_catalog lists those this employee may call.
+  // Only the cloud sidecar reaches the gateway; this face says a cloud executor is needed.
+  const needsCloud = () => Promise.reject(Object.assign(new Error('需要云端执行端：公司命令只在云端模式可用，本机没有公司网关'), { code: 'not_configured' }));
+  server.registerTool('company_cmd', {
+    description: '老板端全部运维与管理操作都通过 company_cmd 调用，先用 catalog 查可用命令；只能在持有任务时调用；所有调用会审计，老板可以随时停用或限制你',
+    inputSchema: z.object({
+      command: z.string().min(1).max(120),
+      input: z.record(z.string(), z.unknown()).optional(),
+    }),
+  }, async (_input, ctx) => run(token(ctx), needsCloud));
+
+  server.registerTool('company_cmd_catalog', {
+    description: '列出你当前能通过 company_cmd 调用的老板端命令（按你的身份、保护清单与允许清单过滤，带参数说明；按目标锁定的命令附锁定说明）；只能在持有任务时调用',
+    inputSchema: z.object({}),
+  }, async (_input, ctx) => run(token(ctx), needsCloud));
+
   server.registerTool('project_disciplines_update', {
     description: 'manage only (product; owner via owner API): replace a project disciplines vocabulary (unique non-empty names, audited); no other project field is touched.',
     inputSchema: z.object({
