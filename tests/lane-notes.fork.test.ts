@@ -102,12 +102,17 @@ run('a task approved after two returns keeps only the passing round\'s five note
   const occupiedQa = `${project}:qa`;
   const existingTree = '合入核对用树对比：合并提交的 tree 应与已验证 HEAD 的 tree 相同，并以远端主干为准。';
   const restatedScreenshot = '截图证据要晚于最后一次 UI 源提交，并对照提交的 HEAD 核对时间顺序。';
+  const existingQa = '截图证据的时间必须晚于最后一次 UI 源提交，并与提交的 HEAD 对应。';
+  const restatedQa = '截图证据要晚于最后一次 UI 源提交，并对照提交的 HEAD 核对时间顺序。';
+  const dupExecute = '返工后的做法';
+  const dupReview = '通过时的标准';
   await notes.add(occupiedEng, existingTree, 'owner:test', { pinned: true });
   await notes.add(occupiedEng, '截图证据的时间必须晚于最后一次 UI 源提交，并与提交的 HEAD 对应。', 'owner:test');
+  await notes.add(occupiedQa, existingQa, 'owner:test', { pinned: true });
   const beforeEng = await notes.list(occupiedEng);
   const beforeQa = await notes.list(occupiedQa);
   const beforeIds = new Set([...beforeEng, ...beforeQa].map(note => note.id));
-  // 每轮执行与复核都提出 5 条笔记，其中最后一轮有一条与已有笔记完全重复、一条与同轮更早提议重复。
+  // 每轮执行与复核各提 5 条；通过那一轮另含 2 条与已有笔记重复的样本（完全重复与换说法），断言它们不新增。
   const rounds = [
     { execute: ['先跑冒烟测试再改实现，避免带病返工', '报错先看堆栈最内层的故障点', '提交前确认工作树没有多余文件', '改动只碰任务授权的仓库路径', '复现问题先写最小用例'],
       review: ['日志写进任务证据后再排查，别只看终端', '并发问题先查共享状态的生命周期', '依赖升级先确认锁文件同步', '接口改动先搜全部调用方', '验收脚本要在干净环境重跑一次'] },
@@ -118,23 +123,28 @@ run('a task approved after two returns keeps only the passing round\'s five note
     execute: ['核对测试汇总行与失败名单', '检查版本号三处同步', '检查新增测试能在旧代码上失败', '确认没有生产安装动作', '确认证据链接可读'],
     review: ['复核通过也要留下关键证据', '对照验收标准逐条记录结论', '检查提交树与远程一致', '确认工作区已清理', '记录遗留风险与后续建议'],
   };
-  const finalSubmit = passing.execute;
+  const finalSubmit = [...passing.execute.slice(0, 2), existingTree, restatedScreenshot, dupExecute];
+  const finalReview = [...passing.review.slice(0, 2), existingQa, restatedQa, dupReview];
   for (const round of rounds) {
     await core.submit(eng, proof(await core.claim(eng, t.id)), evidence({ learned: round.execute }));
     await core.returnTask(qa, proof(await core.claim(qa, t.id)), evidence({ learned: round.review }));
   }
   await core.submit(eng, proof(await core.claim(eng, t.id)), evidence({ learned: finalSubmit }));
-  await core.accept(qa, proof(await core.claim(qa, t.id)), evidence({ learned: passing.review }));
+  await core.accept(qa, proof(await core.claim(qa, t.id)), evidence({ learned: finalReview }));
   await notes.settle();
 
-  // 控制台「线的笔记」：两次退回和两次失败的复核都不生效；每线只新增通过那一轮的 5 条。
+  // 控制台「线的笔记」：两次退回和两次失败的复核都不生效；每线只新增通过那一轮的非重复条目（最多 5 条）。
   const ownerNotes = (await ownerApi({ db, core, owner: {}, workforce: {}, messages: new OutboundMessageStore(db.db), opsRepo: '/tmp/ops' } as never,
     { command: 'note.list' }, 'web') as { notes: Array<{ id: string; lane: string; text: string; state: string }> }).notes;
   const fresh = ownerNotes.filter(note => !beforeIds.has(note.id) && note.state === 'active');
+  const expectedFresh: Record<string, string[]> = {
+    [occupiedEng]: [...passing.execute.slice(0, 2), dupExecute],
+    [occupiedQa]: [...passing.review.slice(0, 2), dupReview],
+  };
   for (const lane of [occupiedEng, occupiedQa]) {
     const added = fresh.filter(note => note.lane === lane);
-    const expected = lane === occupiedEng ? passing.execute : passing.review;
-    expect(added).toHaveLength(5);
+    const expected = expectedFresh[lane]!;
+    expect(added).toHaveLength(expected.length);
     expect(added.map(note => note.text).sort()).toEqual([...expected].sort());
     for (const [i, a] of expected.entries()) for (const [j, b] of expected.entries()) {
       if (i !== j) expect(isDuplicateNote(a, [b])).toBe(false);
@@ -142,10 +152,10 @@ run('a task approved after two returns keeps only the passing round\'s five note
   }
   const discarded = [
     ...rounds.flatMap(round => [...round.execute, ...round.review]),
-    restatedScreenshot, existingTree,
+    existingTree, restatedScreenshot,
+    existingQa, restatedQa,
   ];
   for (const text of discarded) expect(fresh.some(note => note.text === text)).toBe(false);
-  expect(fresh.some(note => note.text === existingTree)).toBe(false);
 
   // 控制台「待发消息」：新建代码任务使用新模板；已经存在、尚未发送的草稿保持原文。
   const legacy = '老板编辑过的旧草稿：合入并发布到生产，按验收标准在生产逐条自验';
