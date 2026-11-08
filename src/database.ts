@@ -214,6 +214,10 @@ export class CompanyDatabase {
     // 053：线的笔记。只新增 lane_note 表，不改既有行；旧 release 读不到新表即忽略（RB01）。
     await this.db.query(loadSchema('053-lane-notes.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 53 WHERE schema_version < 53;');
+    // 054：线的笔记整理（合并、清理与可撤销的整理记录）。只新增 note_consolidation 表与 lane_note 的两个可选字段；
+    // 旧 release 读不到即忽略（RB01）。
+    await this.db.query(loadSchema('054-note-consolidation.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 54 WHERE schema_version < 54;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {
