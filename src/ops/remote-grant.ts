@@ -137,6 +137,8 @@ export async function issueRemoteGrant(
   const [user] = await deps.d1.query<UserRow>(
     'SELECT id, expires_at FROM users WHERE tenant_id = ? AND username = ? LIMIT 1', [tenant, username]);
   const requestedExpiryMs = now + days * DAY_MS;
+  // 三方到期统一使用 effective 值：已存在测试账号时 max(现值, 新值) ≤ now+31d。
+  let effectiveExpiryMs = requestedExpiryMs;
   let subject: string;
   if (user === undefined) {
     if (deps.sealedPassword === undefined || deps.sealPassword === undefined) {
@@ -160,7 +162,7 @@ export async function issueRemoteGrant(
       throw conflict(`account ${username} is a formal/long-term account (expires_at NULL); pick a new alias`);
     }
     // 取 max(现值, 新值)，且不超过 now+31 天。
-    const effectiveExpiryMs = Math.min(
+    effectiveExpiryMs = Math.min(
       Math.max(Date.parse(user.expires_at), requestedExpiryMs),
       now + MAX_SUBJECT_TTL_MS,
     );
@@ -180,7 +182,7 @@ export async function issueRemoteGrant(
     path: `/api/ops/test-subjects/${encodeURIComponent(subject)}`,
     body: {
       email,
-      expiresAt: iso(requestedExpiryMs),
+      expiresAt: iso(effectiveExpiryMs),
       origin: input.taskId,
       ...(contentCapabilities.length > 0 ? { contentCapabilities } : {}),
     },
@@ -221,18 +223,18 @@ export async function issueRemoteGrant(
     [
       grantId, tenant, subject, remote.clientId, codeHash,
       iso(now + codeTtlHours * 3600_000), JSON.stringify(resources), input.taskId,
-      iso(requestedExpiryMs), iso(now),
+      iso(effectiveExpiryMs), iso(now),
     ]);
 
   await deps.audit?.(
     'ops_remote_grant.issue',
-    `task ${input.taskId} grant ${grantId} alias ${alias} ws ${slug} subject ${subject} exp ${iso(requestedExpiryMs)}`,
+    `task ${input.taskId} grant ${grantId} alias ${alias} ws ${slug} subject ${subject} exp ${iso(effectiveExpiryMs)}`,
   );
 
   return {
     grantId,
     url: remoteGrantUrl(cfg, code, input.content === true),
-    expiresAt: iso(requestedExpiryMs),
+    expiresAt: iso(effectiveExpiryMs),
     workspaceSlug: slug,
     subject,
   };

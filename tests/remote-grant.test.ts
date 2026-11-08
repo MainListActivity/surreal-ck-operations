@@ -112,6 +112,21 @@ describe('issueRemoteGrant', () => {
     expect(upd!.params[0]).toBe(later); // 保留更晚现值
   });
 
+  test('existing test account with later expiry keeps three expiry fields consistent', async () => {
+    const later = '2026-12-01T00:00:00.000Z';
+    const { d1, queries } = fakeD1([{ match: 'FROM users', rows: [{ id: 'u_2', expires_at: later }] }]);
+    const { fetch, calls } = fakeProduct([]);
+    const result = await issueRemoteGrant(
+      deps({ d1, fetch }),
+      { cfg, taskId: 't9', alias: 'QA_Y', days: 5 },
+    );
+    expect(result.expiresAt).toBe(later);
+    const putBody = calls.find((c) => c.path.includes('test-subjects'))?.body as { expiresAt?: string };
+    expect(putBody.expiresAt).toBe(later);
+    const insert = queries.find((q) => q.sql.includes('INSERT INTO remote_grants'));
+    expect(insert!.params[8]).toBe(later); // expires_at
+  });
+
   test('rejects days outside 1..31 and missing remote config', async () => {
     const { d1 } = fakeD1();
     const { fetch } = fakeProduct([]);
