@@ -23,10 +23,26 @@ interface GuardEntry {
   ownerOnly: boolean;
 }
 
+interface TargetLock {
+  command: string;
+  target: string;
+}
+
+interface LockedTargets {
+  companyTenantId: string | null;
+  companyHost: string;
+  scripts: string[];
+  d1Ids: string[];
+}
+
+// 旧版网关响应可能不含以下字段，读取时需兜底。
 interface GuardList {
   protected: GuardEntry[];
   hardOwnerOnly: string[];
   ownerApiCommands: string[];
+  targetLocks?: TargetLock[];
+  lockedTargets?: LockedTargets;
+  ownerOnlyForAgents?: string[];
 }
 
 export function StaffPage() {
@@ -79,10 +95,42 @@ export function StaffPage() {
       </Panel>
 
       {guard ? (
-        <Panel title="只能老板调用的命令" hint="员工通过网关不能调用这些命令。这份清单只读，由系统内置。">
+        <Panel title="只能老板调用的命令" hint="员工通过网关不能调用这些命令。这些命令写死在代码里，本页不能修改。">
           {guard.hardOwnerOnly.length === 0 ? <Empty>没有内置的仅老板命令</Empty> : (
             <ul class="chips">
               {guard.hardOwnerOnly.map(c => <li key={c} class="tag">{c}</li>)}
+            </ul>
+          )}
+          <h4>按目标锁定（写死，不可改）</h4>
+          {(guard.targetLocks ?? []).length === 0 ? <Empty>没有按目标的锁定</Empty> : (
+            <ul class="list compact">
+              {(guard.targetLocks ?? []).map(t => (
+                <li key={`${t.command}|${t.target}`} class="row">
+                  <div class="row-main">
+                    <span class="tag">{t.command}</span>
+                    <span>{t.target}</span>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+          {guard.lockedTargets ? (
+            <dl class="facts">
+              <dt>公司租户 id</dt>
+              <dd>{guard.lockedTargets.companyTenantId ?? '未配置'}</dd>
+              <dt>公司域名</dt>
+              <dd>{guard.lockedTargets.companyHost}</dd>
+              <dt>受保护的 Worker 脚本</dt>
+              <dd>{guard.lockedTargets.scripts.length ? guard.lockedTargets.scripts.join('、') : '无'}</dd>
+              <dt>受保护的 D1 数据库 id</dt>
+              <dd>{guard.lockedTargets.d1Ids.length ? guard.lockedTargets.d1Ids.join('、') : '无'}</dd>
+            </dl>
+          ) : null}
+          <h4>员工拒绝清单（写死，不可改）</h4>
+          <p class="hint">员工调用即拒绝并写审计，老板不受限。</p>
+          {(guard.ownerOnlyForAgents ?? []).length === 0 ? <Empty>没有员工拒绝项</Empty> : (
+            <ul class="chips">
+              {(guard.ownerOnlyForAgents ?? []).map(c => <li key={c} class="tag">{c}</li>)}
             </ul>
           )}
           <details>
