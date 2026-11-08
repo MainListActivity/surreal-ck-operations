@@ -75,6 +75,12 @@ export class OutboundMessageStore {
     return (rows ?? []).map(rowView);
   }
 
+  /** One message by id, whatever its state. */
+  async get(messageId: string): Promise<OutboundMessage | undefined> {
+    const [rows] = await this.db.query<[Array<Record<string, unknown>>]>('SELECT * FROM $msg;', { msg: this.message(messageId) });
+    return rows?.[0] ? rowView(rows[0]) : undefined;
+  }
+
   /** 最新 draft：同一任务同一步骤可有多条编辑草稿，发送只认最新的一条。 */
   async latestDraft(taskId: string, step: MessageStep): Promise<OutboundMessage | undefined> {
     const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(

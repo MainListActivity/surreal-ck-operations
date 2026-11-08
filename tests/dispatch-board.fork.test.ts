@@ -12,6 +12,7 @@ import { Dispatcher, staffingPool, type PassInputs } from '../src/dispatcher/dis
 import { BLOCK_TEXT } from '../src/dispatcher/dispatch-blocked.ts';
 import { RUNNER_BEAT_MS, readBoard, writeBoardView, writeRunnerHeartbeat } from '../src/board.ts';
 import { OutboundMessageStore } from '../src/outbound-messages.ts';
+import { ownerApi } from '../src/owner-api.ts';
 import { DEFAULT_MACHINE_CRITERION, dispatchText, renderMessage } from '../src/outbound-render.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
@@ -70,7 +71,7 @@ async function startFork(name: string) {
       listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {} };
     const newDispatcher = () => new Dispatcher({ workforce: wf, owner, paseo, sidecar: pool!, rand: () => 0,
       env: { opsRepo: dir, sckBin: SCK, paseoBin: '/fixture/paseo' } });
-    return { dir, surreal: db.db, core, wf, gm, rawQuery, agentRows, sends, spawns, pool: pool!, newDispatcher, close };
+    return { dir, database: db, owner, surreal: db.db, core, wf, gm, rawQuery, agentRows, sends, spawns, pool: pool!, newDispatcher, close };
   } catch (error) {
     await close();
     throw error;
@@ -287,6 +288,52 @@ run('owner board: a held message stays home, and an owner edit is what the emplo
     await s.dispatcher.tick();
     expect(w.sends.slice(sentBefore)).toEqual([{ id: agentOf(s.first.employee), prompt: row.body }]);
     expect(await currentEmployeeOf(w, s.open)).toBe(s.first.employee);
+  } finally {
+    await w.close();
+  }
+}, TIMEOUT_MS);
+
+run('owner board: an edit of the shown text is saved as the stored body, and the board then shows what the employee gets', async () => {
+  const w = await startFork('board-edit');
+  try {
+    const s = await scenario(w);
+    const desk = { db: w.database, core: w.core as never, owner: w.owner, workforce: w.wf, messages: new OutboundMessageStore(w.surreal), opsRepo: w.dir };
+    const edit = (messageId: string, employeeId: string, rendered: string) =>
+      ownerApi(desk, { command: 'message.edit_rendered', messageId, employeeId, rendered }, 'test');
+    const commDir = w.pool.commDirFor(s.first.employee);
+    const shown = (await readBoard(w.surreal, { now: Date.now() })).employees.find(row => row.id === s.first.employee)!.outbox.find(row => row.taskId === s.open)!;
+    const stored = (await unsentDraft(w, s.open, 'execute'))!.body;
+
+    // A path the stored body cannot carry is refused, and the stored body stays as it was.
+    await expect(edit(shown.messageId, s.first.employee, shown.body.replace(`${commDir}/task.md`, 'task.md'))).rejects.toThrow(/invalid/);
+    expect((await unsentDraft(w, s.open, 'execute'))!.body).toBe(stored);
+    // An unknown employee and an unknown message are refused.
+    await expect(edit(shown.messageId, 'nobody', shown.body)).rejects.toThrow(/not found/);
+    await expect(edit('missing', s.first.employee, shown.body)).rejects.toThrow(/not found/);
+
+    // The owner adds a line to the text the board shows. The stored body keeps placeholders, not this employee's paths.
+    const edited = `${shown.body}\n老板补充：先核对验收标准第 3 条。`;
+    await edit(shown.messageId, s.first.employee, edited);
+    const next = (await unsentDraft(w, s.open, 'execute'))!.body;
+    expect(next).toContain('老板补充：先核对验收标准第 3 条。');
+    expect(next).not.toContain(commDir);
+    // The board shows the edited text, and a dispatch would send exactly that text.
+    const after = (await readBoard(w.surreal, { now: Date.now() })).employees.find(row => row.id === s.first.employee)!.outbox.find(row => row.taskId === s.open)!;
+    expect(after.body).toBe(edited);
+    expect(after.body).toBe(await dispatchedText(w, s.first.employee, s.open, next));
+
+    // The next dispatch sends that text: the first lease is released and the other queued work is voided, so the tick sends the open task.
+    await w.pool.releaseClaim(s.first.employee, s.first.task, '【看板测试】释放第一位员工的租约，准备派发编辑后的消息');
+    w.agentRows.get(agentOf(s.first.employee))!.status = 'idle';
+    await w.rawQuery("UPDATE $task SET state = 'void';", { task: new RecordId('task', s.first.task) });
+    await w.rawQuery("UPDATE $task SET state = 'void';", { task: new RecordId('task', s.second.task) });
+    const sentBefore = w.sends.length;
+    await s.dispatcher.tick();
+    expect(w.sends.slice(sentBefore)).toEqual([{ id: agentOf(s.first.employee), prompt: edited }]);
+    expect(await currentEmployeeOf(w, s.open)).toBe(s.first.employee);
+
+    // Once the message is sent it is locked against edits.
+    await expect(edit(shown.messageId, s.first.employee, edited)).rejects.toThrow(/conflict/);
   } finally {
     await w.close();
   }

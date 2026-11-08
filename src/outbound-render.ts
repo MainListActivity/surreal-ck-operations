@@ -72,6 +72,15 @@ export function dispatchText(body: string, workdir?: string): string {
   return workdir ? `${body}\n${WORKDIR_HEAD}${workdir}` : body;
 }
 
+/**
+ * The rendered body without the workdir line a dispatch appends. The owner edits the text the employee will read; the workdir line
+ * is the claim's to name, so an edit takes it off before the body is reversed, and the dispatch appends it again.
+ */
+export function bodyOfDispatch(text: string): string {
+  const at = text.lastIndexOf(`\n${WORKDIR_HEAD}`);
+  return at >= 0 && !text.slice(at + 1).includes('\n') ? text.slice(0, at) : text;
+}
+
 /** The step a task's next dispatch sends: review while the task is in review, rework after any return, otherwise execute. */
 export function stepOfTask(state: string | undefined, returned: boolean): MessageStep {
   return state === 'review' ? 'review' : returned ? 'rework' : 'execute';

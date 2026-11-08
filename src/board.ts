@@ -5,10 +5,10 @@
  * 排队与候选判定来自本机调度器：它每轮用同一个 staffingPool 算出排队与每位员工的候选，写进 company_meta:board_view。
  * 这里读回来后与数据库现状对齐：已派走、已完成、已作废的不再显示；租约、交接与放行门按数据库现状计算。
  */
-import type { Surreal } from 'surrealdb';
+import type { RecordId, Surreal } from 'surrealdb';
 import { latestFindings } from './dispatcher/brief.ts';
 import { HANDOVER_ROWS } from './handover-window.ts';
-import { acIdOf, dispatchText, renderMessage, stepOfTask, type MessageStep } from './outbound-render.ts';
+import { acIdOf, dispatchText, renderMessage, stepOfTask, type MessageStep, type RenderContext } from './outbound-render.ts';
 
 export type BoardPhase = 'execute' | 'review';
 
@@ -239,6 +239,35 @@ const projectOfLane = (lane: unknown): string | undefined => {
 const rowsOf = (db: Surreal, sql: string, vars?: Record<string, unknown>): Promise<Row[]> =>
   db.query<[Row[]]>(sql, vars).then(result => result[0] ?? []);
 
+/**
+ * The findings file a rework message names: the newest return's, numbered over the window a claim's handover reads. Undefined when
+ * the task has no return on record.
+ */
+export async function findingsFileOf(db: Surreal, task: RecordId): Promise<string | undefined> {
+  // The window is read newest first and handed over oldest first, as the claim's handover history is.
+  const history = await rowsOf(db, `SELECT id, action, actor, evidence, at, <string>at AS cat FROM audit
+    WHERE task = $task AND !string::starts_with(action, 'ops_') ORDER BY at DESC, id DESC LIMIT ${HANDOVER_ROWS};`, { task });
+  return latestFindings(history.reverse().map(row => ({ auditId: keyOf(row.id), action: String(row.action), actor: keyOf(row.actor),
+    at: String(row.cat), evidence: typeof row.evidence === 'string' ? row.evidence : undefined })))?.file;
+}
+
+/**
+ * The values a message of one task renders with for one employee. The board's outbox and the owner's edit of it both take their
+ * values here, so the text the owner edits is the text the board shows. Undefined when the view lacks the employee's comm dir.
+ */
+export function renderContextFor(view: BoardView, employeeId: string,
+  task: { taskId: string; step: MessageStep; acceptanceCriteria: unknown; findingsFile?: string }): RenderContext | undefined {
+  const commDir = view.employees[employeeId]?.commDir;
+  if (!commDir) return undefined;
+  const acId = acIdOf(task.step, task.acceptanceCriteria);
+  return {
+    sckBin: view.env.sckBin, commDir, taskId: task.taskId,
+    ...(task.findingsFile ? { findingsFile: task.findingsFile } : {}),
+    ...(view.env.opsRepo ? { opsRepo: view.env.opsRepo } : {}),
+    ...(acId ? { acId } : {}),
+  };
+}
+
 /** The owner board, read from the database and the scheduler's latest view. Read-only. */
 export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promise<OwnerBoard> {
   const now = opts.now ?? Date.now();
@@ -302,35 +331,26 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
     return draft !== undefined && (draft.hold === true || draft.state === 'held');
   };
 
-  // A rework message names the findings file of the newest return, numbered over the same window a claim reads. The window is
-  // read newest first and handed over oldest first, as the claim's handover history is.
+  // A rework message names the findings file of the newest return.
   const findingsFile = new Map<string, string>();
   await Promise.all([...focus.keys()].filter(taskId => returned.has(taskId)).map(async taskId => {
-    const history = await rowsOf(db, `SELECT id, action, actor, evidence, at, <string>at AS cat FROM audit
-      WHERE task = $task AND !string::starts_with(action, 'ops_') ORDER BY at DESC, id DESC LIMIT ${HANDOVER_ROWS};`, { task: focus.get(taskId)!.id });
-    const found = latestFindings(history.reverse().map(row => ({ auditId: keyOf(row.id), action: String(row.action), actor: keyOf(row.actor),
-      at: String(row.cat), evidence: typeof row.evidence === 'string' ? row.evidence : undefined })));
-    if (found) findingsFile.set(taskId, found.file);
+    const file = await findingsFileOf(db, focus.get(taskId)!.id as RecordId);
+    if (file) findingsFile.set(taskId, file);
   }));
 
   // The text a dispatch of this task to this employee would send now: the same render and join the send path makes. Undefined when the
   // view lacks the employee's comm dir or the task has no draft for its next step, so the board shows nothing it cannot render exactly.
   const outboxOf = (employeeId: string, taskId: string): BoardOutboxRow | undefined => {
     const row = tasks.get(taskId);
-    const commDir = view?.employees[employeeId]?.commDir;
-    if (!view || !row || !commDir) return undefined;
+    if (!view || !row) return undefined;
     const step = stepOf(taskId);
     const draft = draftOf.get(`${taskId}:${step}`);
     if (!draft) return undefined;
-    const file = findingsFile.get(taskId);
-    const acId = acIdOf(step, row.acceptance_criteria);
-    const rendered = renderMessage(String(draft.body ?? ''), {
-      sckBin: view.env.sckBin, commDir, taskId, ...(file ? { findingsFile: file } : {}),
-      ...(view.env.opsRepo ? { opsRepo: view.env.opsRepo } : {}), ...(acId ? { acId } : {}),
-    });
+    const ctx = renderContextFor(view, employeeId, { taskId, step, acceptanceCriteria: row.acceptance_criteria, findingsFile: findingsFile.get(taskId) });
+    if (!ctx) return undefined;
     const workdir = workdirOf(row.worktree);
     return { messageId: keyOf(draft.id), taskId, title: String(row.title ?? ''), step,
-      body: dispatchText(rendered, workdir), workdirPending: workdir === undefined, hold: heldAt(taskId), lang: 'zh', editable: true };
+      body: dispatchText(renderMessage(String(draft.body ?? ''), ctx), workdir), workdirPending: workdir === undefined, hold: heldAt(taskId), lang: 'zh', editable: true };
   };
 
   const employees: BoardEmployee[] = employeeRows.map(row => {
