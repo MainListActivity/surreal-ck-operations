@@ -10,6 +10,12 @@ import { capabilitiesFor, effectiveWeight, Workforce } from './workforce.ts';
 import { jevFromEnv } from './dispatcher/jev.ts';
 import { parseReclaimCliArgs } from './dispatcher/artifact-reclaim.ts';
 import { loadSecretKey, ProjectStore, type ProjectInput } from './projects.ts';
+import { canonicalAlias, accountUsername, passwordSecretName } from './ops/accounts.ts';
+import { cloudflareD1 } from './ops/d1.ts';
+import { passwordLogin } from './ops/idp.ts';
+import { controlPlaneEnv } from './ops/config.ts';
+import type { BrokerConfig } from './ops/config.ts';
+import { issueRemoteGrant, listRemoteGrants, revokeRemoteGrant, validateRemoteBlock } from './ops/remote-grant.ts';
 import type { Role } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
 import { repairInfrastructureScores, rescoreAggregates } from './scoring.ts';
@@ -194,7 +200,9 @@ try {
         const input = JSON.parse(readFileSync(first, 'utf8')) as ProjectInput;
         print({ action: 'project check', ...(await store.checkInput(input)) });
       } else if (sub === 'broker' && first && second && third) {
-        await store.setBroker(first, second, JSON.parse(readFileSync(third, 'utf8')));
+        const brokerJson = JSON.parse(readFileSync(third, 'utf8'));
+        if (brokerJson?.remote !== undefined) validateRemoteBlock(brokerJson.remote);
+        await store.setBroker(first, second, brokerJson);
         print({ action: 'project broker', project: first, env: second, ok: true });
       } else throw new Error(usage);
       break;
@@ -214,6 +222,85 @@ try {
       if (!key || value === undefined || !/^[a-z_]+$/.test(key)) throw new Error(usage);
       await database.db.query('UPSERT company_meta:config MERGE $patch;', { patch: { [key]: JSON.parse(value) } });
       print(await workforce.config());
+      break;
+    }
+    case 'remote-grant': {
+      const [sub, ...rest] = args;
+      const opts: { alias?: string; days?: number; content?: boolean; purge?: boolean; attach?: boolean; env: string; project: string; task?: string; grantId?: string } = { env: 'production', project: 'surreal_ck' };
+      const positional: string[] = [];
+      for (let i = 0; i < rest.length; i += 1) {
+        const a = rest[i]!;
+        if (a === '--alias') opts.alias = rest[++i];
+        else if (a === '--days') opts.days = Number(rest[++i]);
+        else if (a === '--content') opts.content = true;
+        else if (a === '--purge') opts.purge = true;
+        else if (a === '--attach') opts.attach = true;
+        else if (a === '--env') opts.env = rest[++i]!;
+        else if (a === '--project') opts.project = rest[++i]!;
+        else if (a === '--task') opts.task = rest[++i];
+        else if (a.startsWith('--')) throw new Error(`unknown flag ${a}`);
+        else positional.push(a);
+      }
+      const store = new ProjectStore(database.db);
+      const envRow = (await store.brokerEnvs(opts.project)).find((r) => r.name === opts.env);
+      const cfg = (envRow as { broker?: unknown } | undefined)?.broker as BrokerConfig | undefined;
+      if (!cfg) throw new CompanyError('not_configured', `project ${opts.project}/${opts.env} has no broker config`);
+      if (cfg.remote) validateRemoteBlock(cfg.remote);
+      const controlEnv = controlPlaneEnv();
+      const d1 = cloudflareD1({
+        accountId: controlEnv.cloudflareAccountId ?? '',
+        databaseId: cfg.d1?.databaseId ?? '',
+        token: controlEnv.cloudflareToken ?? '',
+      });
+      const secretKey = loadSecretKey(false);
+      const sealedPassword = async (alias: string) =>
+        store.readSealed(opts.project, opts.env, passwordSecretName(alias), secretKey);
+      const sealPassword = async (alias: string, password: string) => {
+        await store.setSecret({ project: opts.project, env: opts.env, name: passwordSecretName(alias), value: password, roles: [] }, secretKey);
+      };
+      const loginFor = async (alias: string, channel: 'customer' | 'ops') => {
+        const password = await sealedPassword(alias);
+        if (!password) throw new CompanyError('not_configured', `no sealed password for alias ${alias}; run ops_account_ensure first`);
+        const username = accountUsername(alias, cfg.accounts.prefix);
+        const tokens = await passwordLogin(cfg, username, password, { channel });
+        return tokens.accessToken;
+      };
+      const audit = async (action: string, evidence: string) => {
+        console.error(`[remote-grant-audit] ${action} ${evidence}`);
+      };
+
+      if (sub === 'issue') {
+        const taskId = positional[0] ?? opts.task;
+        if (!taskId || !opts.alias) throw new Error('remote-grant issue <taskId> --alias <A> [--days 30] [--content] [--env production] [--attach]');
+        const result = await issueRemoteGrant(
+          { d1, sealedPassword, sealPassword, customerToken: (a) => loginFor(a, 'customer'), operatorToken: () => loginFor(canonicalAlias(cfg.remote!.testManagerAlias), 'ops'), audit },
+          { cfg, taskId, alias: opts.alias, ...(opts.days !== undefined ? { days: opts.days } : {}), content: opts.content === true },
+        );
+        // url（含一次性码）只出现在 stdout，仅此一次可见；其余信息走 stderr。
+        console.error(JSON.stringify({ grantId: result.grantId, expiresAt: result.expiresAt, workspaceSlug: result.workspaceSlug, subject: result.subject }));
+        if (opts.attach) {
+          const block = `
+
+【远程会话】兑换链接：${result.url}
+在 VPS 上执行：bun scripts/remote-session.ts redeem '<链接>'
+之后 bun scripts/remote-session.ts token 取 access token、db <slug> 取 DB token（详见 surreal_ck docs/runbooks/remote-vps-session.md）。
+`;
+          await database.db.query(
+            `UPDATE type::thing('task', $taskId) SET context = (context ?? '') + $block;`,
+            { taskId, block });
+          console.error('说明块已追加到任务 context（含一次性码明文：码一次性、TTL ≤7 天）。');
+        }
+        console.log(result.url);
+      } else if (sub === 'revoke') {
+        const grantId = positional[0] ?? opts.grantId;
+        const result = await revokeRemoteGrant(
+          { d1, operatorToken: () => loginFor(canonicalAlias(cfg.remote!.testManagerAlias), 'ops'), audit },
+          { cfg, ...(grantId !== undefined ? { grantId } : {}), ...(opts.task !== undefined ? { taskId: opts.task } : {}), purge: opts.purge === true },
+        );
+        print(result);
+      } else if (sub === 'list') {
+        print(await listRemoteGrants({ d1 }, { cfg, ...(opts.task !== undefined ? { taskId: opts.task } : {}) }));
+      } else throw new Error('remote-grant: unknown subcommand (issue|revoke|list)');
       break;
     }
     case 'reclaim-artifacts': {
