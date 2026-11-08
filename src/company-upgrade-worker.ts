@@ -6,6 +6,8 @@ import { loadDatabaseConfig } from './config.ts';
 import { OwnerDesk } from './owner.ts';
 import { CompanyUpgrades } from './company-upgrades.ts';
 import { runCompanyUpgrade } from './company-upgrade-runner.ts';
+import { installNodeHost } from './host-node.ts';
+installNodeHost();
 const home=process.env.SCK_SERVICE_HOME??join(homedir(),'Library/Application Support/SurrealCKCompany');
 const {loadServiceEnv}=await import(join(home,'active/plugin/server/env.ts'));loadServiceEnv();
 const id=process.argv[2];if(!id||!/^[a-f0-9-]{36}$/.test(id))throw Error('invalid upgrade job');

@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { installBunShim } from "./server/bun-shim";
+import { installNodeHost } from "./server/vendor/src/host-node.ts";
 import { company } from "./server/company";
 import { createConsoleFetch } from "./server/console";
 import { registerHandlers } from "./server/handlers";
@@ -26,6 +27,7 @@ process.on("uncaughtException", (error) => {
 
 export default function contribute(server: PluginServerContext) {
   installBunShim();
+  installNodeHost();
   loadServiceEnv(); // SCK_SCRUB_ENV lives there, and the zsh shim is written below, before the company stack boots
   registerHandlers(server);
   const stopMetrics=registerAgentMetrics(server);

@@ -12,6 +12,9 @@ import { readPrivateCredential } from './credential-file';
 import { createGhCliGateway, createGithubProjector } from './github-projector';
 import { runProjectionWorker } from './projector-worker';
 import { createMcpHttpService } from './server';
+import { installNodeHost } from '../host-node';
+
+installNodeHost();
 
 const rawPort = process.env.SCK_MCP_PORT;
 if (!rawPort || !/^[0-9]+$/.test(rawPort)) throw new Error('SCK_MCP_PORT is required');

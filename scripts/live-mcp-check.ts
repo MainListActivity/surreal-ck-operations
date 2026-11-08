@@ -10,6 +10,9 @@ import { connectCompanyClient } from '../src/mcp/client';
 import { readPrivateCredential } from '../src/mcp/credential-file';
 import { createGhCliGateway, createGithubProjector } from '../src/mcp/github-projector';
 import { createMcpHttpService } from '../src/mcp/server';
+import { installNodeHost } from '../src/host-node';
+
+installNodeHost();
 
 const credentialDir = process.env.SCK_LIVE_CREDENTIAL_DIR;
 const repository = process.env.SCK_GITHUB_REPOSITORY;

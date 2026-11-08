@@ -8,6 +8,9 @@ import { Workforce } from '../workforce.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { jevFromEnv } from './jev.ts';
 import { createPaseoCli } from './paseo.ts';
+import { installNodeHost } from '../host-node.ts';
+
+installNodeHost();
 
 const required = (name: string) => {
   const value = process.env[name];

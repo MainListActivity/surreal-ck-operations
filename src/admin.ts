@@ -19,6 +19,9 @@ import { assertTaskExists, issueRemoteGrant, listRemoteGrants, REMOTE_OPERATOR_C
 import type { Role } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
 import { repairInfrastructureScores, rescoreAggregates } from './scoring.ts';
+import { installNodeHost } from './host-node.ts';
+
+installNodeHost();
 
 const usage = `Usage: pnpm run admin <command>
   enroll <employee-id> <role>             登记固定身份（写入本 checkout .runtime/credentials）

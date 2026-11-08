@@ -4,6 +4,9 @@ import { CompanyDatabase } from './database.ts';
 import type { Role } from './contracts.ts';
 import { OwnerDesk, type OwnerCommandKind } from './owner.ts';
 import { Workforce } from './workforce.ts';
+import { installNodeHost } from './host-node.ts';
+
+installNodeHost();
 
 const usage = `老板入口（也可直接在 SurrealDB 写 owner_command 表，或在 Paseo 里说）
   pnpm run company goal [--tier quick|standard|program] [--project <项目>] [--pipeline software|video|story] "<目标>"
