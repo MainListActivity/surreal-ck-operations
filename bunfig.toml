@@ -1,0 +1,3 @@
+# `bun test` runs every test file on the node execution host (src/host-node.ts), as the local service does.
+[test]
+preload = ["./tests/host-preload.ts"]
