@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { RecordId, Surreal } from 'surrealdb';
 import type { DatabaseConfig } from './config.ts';
+import { connectDb, openDb, useDb, type DbTarget } from './db-connection.ts';
 import { CompanyError } from './core-errors.ts';
 import type { SnapshotChannel, SnapshotLink } from './snapshot-store.ts';
 
@@ -29,14 +30,16 @@ export class CompanyDatabase {
   readonly db = new Surreal();
   constructor(readonly config: DatabaseConfig) {}
 
+  /** The configured server, namespace and database, logged in with the root account. */
+  private target(): DbTarget {
+    const { url, namespace, database, rootUser, rootPassword } = this.config;
+    return { url, namespace, database, auth: { kind: 'root', username: rootUser, password: rootPassword } };
+  }
+
   async connect(): Promise<void> {
     // The WS engine resolves its open promise only on socket 'close'; a connect that
     // stalls without ever firing close would wedge startup/reconnect forever.
-    await CompanyDatabase.withTimeout(
-      this.db.connect(this.config.url, {
-        authentication: { username: this.config.rootUser, password: this.config.rootPassword },
-      }),
-      15_000, 'db connect');
+    await CompanyDatabase.withTimeout(connectDb(this.db, this.target()), 15_000, 'db connect');
   }
 
   async bootstrap(): Promise<void> {
@@ -241,7 +244,7 @@ export class CompanyDatabase {
 
   /** Selects the configured namespace/database without touching schema (runtimes that only query). */
   async useDatabase(): Promise<void> {
-    await this.db.use({ namespace: this.config.namespace, database: this.config.database });
+    await useDb(this.db, this.target());
   }
 
   private reconnecting: Promise<void> | undefined;
@@ -442,10 +445,7 @@ export class CompanyDatabase {
   }
 
   private async openSocket(socket: Surreal): Promise<void> {
-    await socket.connect(this.config.url, {
-      authentication: { username: this.config.rootUser, password: this.config.rootPassword },
-    });
-    await socket.use({ namespace: this.config.namespace, database: this.config.database });
+    await openDb(socket, this.target());
   }
 
   private async closeBuildSocket(socket: Surreal): Promise<void> {
