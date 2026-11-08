@@ -116,7 +116,11 @@ describe('idp.request 路径与参数守卫', () => {
 
   test('路径穿越与百分号编码被拒绝为 invalid，且不发请求', async () => {
     const { fetch, requests } = scriptedFetch([]);
-    const paths = ['/admin/x/../y', '/admin/%2e%2e/y', '/admin/tenants%2f', '/admin/%41', '/tenants', '/admin/a..b'];
+    const paths = [
+      '/admin/x/../y', '/admin/%2e%2e/y', '/admin/tenants%2f', '/admin/%41', '/tenants', '/admin/a..b',
+      // . 段、空段、末尾斜杠与查询串里的百分号编码：归一化后可能跳出 /admin，或让目标锁判错。
+      '/admin/./service-principals', '/admin//tenants', '/admin/tenants/', '/admin/tenants/..', '/admin/tenants?x=%2e',
+    ];
     for (const path of paths) {
       expect(await codeOf(() => identityCommand(IDP_CFG(), fakeDb().db, 'idp.request', { method: 'GET', path }, fetch))).toBe('invalid');
     }

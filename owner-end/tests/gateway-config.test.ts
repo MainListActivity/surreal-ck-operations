@@ -29,3 +29,21 @@ describe('readConfig：本地 root 口令只许用于本机库', () => {
     expect((caught as CompanyError).message).toContain('DEV_DB_ROOT_*');
   });
 });
+
+describe('readConfig：按目标的老板专属锁', () => {
+  test('默认值：公司租户来自 IDP_TENANT_ID；受保护的脚本与 D1 为默认项', () => {
+    const cfg = readConfig(testEnv({ IDP_TENANT_ID: '46aa29a6-9ee8-4052-bccd-7923f98220d7' }));
+    expect(cfg.locks.companyTenantId).toBe('46aa29a6-9ee8-4052-bccd-7923f98220d7');
+    expect(cfg.locks.scripts).toEqual(['company-owner-end', 'ma-auth']);
+    expect(cfg.locks.d1Ids).toEqual(['621dbcf7-ddcc-4099-8df2-3ec076830857']);
+  });
+
+  test('PROTECTED_CF_SCRIPTS 与 PROTECTED_D1_IDS 只能追加：逗号分隔、忽略空项、小写去重，默认项不会被移除', () => {
+    const cfg = readConfig(testEnv({
+      PROTECTED_CF_SCRIPTS: ' Extra-Worker, ,company-owner-end',
+      PROTECTED_D1_IDS: 'AAAA-1111',
+    }));
+    expect(cfg.locks.scripts).toEqual(['company-owner-end', 'ma-auth', 'extra-worker']);
+    expect(cfg.locks.d1Ids).toEqual(['621dbcf7-ddcc-4099-8df2-3ec076830857', 'aaaa-1111']);
+  });
+});

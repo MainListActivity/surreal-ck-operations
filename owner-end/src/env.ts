@@ -4,6 +4,7 @@
  */
 import { CompanyError } from '../../src/core-errors.ts';
 import { CLIENT_TOKEN_AUDIENCE } from './idp/claims.ts';
+import { lockTargetsOf, type LockTargets } from './owner-locks.ts';
 
 /** Worker 绑定。 */
 export interface Env {
@@ -25,6 +26,10 @@ export interface Env {
   IDP_ADMIN_TOKEN?: string;
   CF_ACCOUNT_ID?: string;
   CF_API_TOKEN?: string;
+  /** 追加到默认受保护 Worker 脚本的脚本名（逗号分隔）。默认已含老板端与 ma_hono，只能追加。 */
+  PROTECTED_CF_SCRIPTS?: string;
+  /** 追加到默认受保护 D1 的数据库 id（逗号分隔）。默认已含 ma_hono 的库，只能追加。 */
+  PROTECTED_D1_IDS?: string;
   MAGPIE_BASE_URL?: string;
   MAGPIE_MODEL?: string;
   MAGPIE_API_KEY?: string;
@@ -42,7 +47,7 @@ export interface IdpConfig {
   authorizeUrl: string;
   audience: string;
   consoleClientId: string;
-  /** 公司租户 id，只用于管理 API 路径；建租户后写入 wrangler.jsonc。 */
+  /** 公司租户 id，用于管理 API 路径；在 wrangler.jsonc 中配置。 */
   tenantId: string;
   agentEmailDomain: string;
 }
@@ -62,6 +67,8 @@ export interface ClientCredential {
 export interface Config {
   idp: IdpConfig;
   db: DbConfig;
+  /** 按目标的老板专属锁（owner-locks.ts）：公司租户、受保护的 Worker 脚本与 D1，默认值加上配置的追加项。 */
+  locks: LockTargets;
   gateway?: ClientCredential;
   cron?: ClientCredential;
   viewer?: ClientCredential;
@@ -78,6 +85,11 @@ const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1']);
 
 function text(value: string | undefined): string {
   return (value ?? '').trim();
+}
+
+/** 逗号分隔的列表：去首尾空白，忽略空项。 */
+function listOf(value: string | undefined): string[] {
+  return text(value).split(',').map((item) => item.trim()).filter((item) => item.length > 0);
 }
 
 function need(value: string | undefined, name: string): string {
@@ -121,7 +133,8 @@ export function readConfig(env: Env): Config {
     namespace: need(env.COMPANY_NS, 'COMPANY_NS'),
     database: need(env.COMPANY_DB, 'COMPANY_DB'),
   };
-  const config: Config = { idp, db };
+  const locks = lockTargetsOf(idp.tenantId, listOf(env.PROTECTED_CF_SCRIPTS), listOf(env.PROTECTED_D1_IDS));
+  const config: Config = { idp, db, locks };
   if (text(env.GATEWAY_CLIENT_ID) && text(env.GATEWAY_CLIENT_SECRET)) {
     config.gateway = { clientId: text(env.GATEWAY_CLIENT_ID), clientSecret: text(env.GATEWAY_CLIENT_SECRET) };
   }

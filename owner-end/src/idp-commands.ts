@@ -1,7 +1,7 @@
 /**
- * 身份命令（只由老板调用）：ma_hono 的租户、机器客户端、员工的 agent 用户，以及员工与 agent 用户的对应关系（agent_identity）。
- * ma_hono 的服务主体只有 tenant.read、user.read、user.provision 三种权限：开租户与管理客户端需要人工管理员会话，
- * 服务主体调用会得到 ma_hono 的 forbidden，网关如实返回。
+ * 身份命令：ma_hono 的租户、机器客户端、员工的 agent 用户，以及员工与 agent 用户的对应关系（agent_identity）。
+ * ma_hono 的服务主体已具备全部 8 个 scope，公司租户已建好（IDP_TENANT_ID）。员工调用时，写入公司租户与服务主体的部分
+ * 由 owner-locks.ts 按目标锁定为仅老板；这里的命令本身不区分调用方。
  */
 import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from '../../src/core-errors.ts';
@@ -19,8 +19,12 @@ export const IDENTITY_COMMANDS: ReadonlySet<string> = new Set([
 
 const MACHINE_ROLES: readonly MachineRole[] = ['gateway', 'viewer', 'automation', 'runner', 'migrator', 'agentClaims'];
 const EMPLOYEE_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
-/** 不允许 %：百分号编码经 URL 归一化后可能跳出 /admin 前缀（如 %2e%2e）。 */
-const ADMIN_PATH = /^\/admin\/[A-Za-z0-9/_.\-?=&]{0,400}$/;
+/**
+ * 管理接口路径：/admin 下的普通段（字母、数字、下划线、短横线）。不允许 . 段、空段与百分号编码，
+ * 它们经 URL 归一化后可能跳出 /admin 前缀（如 /admin/./service-principals、%2e%2e），也会让目标锁判错。
+ * 查询串只允许常见字符。owner-locks.ts 按同一规则切段判断目标。
+ */
+const ADMIN_PATH = /^\/admin(?:\/[A-Za-z0-9_-]+)+(?:\?[A-Za-z0-9_.=&-]*)?$/;
 const METHODS: readonly AdminMethod[] = ['GET', 'POST', 'PATCH', 'DELETE'];
 
 /** 把 ma_hono 的错误转为网关错误。 */
@@ -47,7 +51,7 @@ export function adminOf(cfg: Config, fetchImpl?: typeof fetch): IdpAdminConfig {
 /** 需要租户路径的接口（用户、客户端）：缺少租户 id 时报 not_configured。 */
 function tenantOf(cfg: Config, fetchImpl?: typeof fetch): IdpAdminConfig {
   const admin = adminOf(cfg, fetchImpl);
-  if (!admin.tenantId) throw new CompanyError('not_configured', '缺少 IDP_TENANT_ID（公司租户 id，建租户后写入 wrangler.jsonc）');
+  if (!admin.tenantId) throw new CompanyError('not_configured', '缺少 IDP_TENANT_ID（公司租户 id，在 wrangler.jsonc 中配置）');
   return admin;
 }
 
@@ -159,7 +163,7 @@ export async function identityCommand(
       const method = text(input.method, 'method', 10).toUpperCase() as AdminMethod;
       if (!METHODS.includes(method)) throw new CompanyError('invalid', 'method invalid');
       const path = text(input.path, 'path', 500);
-      if (!ADMIN_PATH.test(path) || path.includes('..')) throw new CompanyError('invalid', '只允许 /admin/ 下的路径');
+      if (!ADMIN_PATH.test(path)) throw new CompanyError('invalid', '只允许 /admin/ 下的路径');
       if (input.body !== undefined && (typeof input.body !== 'object' || input.body === null)) {
         throw new CompanyError('invalid', 'body invalid');
       }

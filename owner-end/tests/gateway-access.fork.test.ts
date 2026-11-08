@@ -8,7 +8,7 @@ import { CompanyDatabase } from '../../src/database.ts';
 
 setDefaultTimeout(60000);
 // 老板端网关的访问规则（fork）：058 应用后，gateway 令牌写 protected_command / agent_policy 被拒，改删 ops_audit 被拒。
-// 055 不定义 gateway 访问方式（W3-RUNNER 后加），所以这里在测试里自己定义一份，形状与 055 一致；
+// 访问方式用生产的 055（owner、gateway 等都在其中定义），这里只把 JWKS 地址换成共享密钥，不在测试里另写访问方式。
 // 令牌用 HS512 共享密钥代替 JWKS，与 company-access.fork.test.ts 同一套替身。
 const run = process.env.RUN_SCK_OWNER_END_TESTS === '1' ? test : test.skip;
 const PASSWORD = 'owner-end-gateway-fixture-only';
@@ -73,15 +73,11 @@ beforeAll(async () => {
   await company.connect();
   // bootstrap 应用到 058（含 056 的守卫事件）；本机模式不应用 055。
   await company.bootstrap();
-  // 测试替身：与生产同一份 055，只把 JWKS 地址换成共享密钥（owner 访问方式由它提供）。
+  // 测试替身：与生产同一份 055（owner、gateway、viewer 等访问方式都由它提供），只把 JWKS 地址换成共享密钥。
   const access = readFileSync(join(import.meta.dir, '..', '..', 'schema', '055-access.surql'), 'utf8')
     .replaceAll("URL '{{COMPANY_JWKS_URL}}'", `ALGORITHM HS512 KEY '${SECRET}'`)
     .replaceAll('{{COMPANY_ISSUER}}', ISS);
   await company.db.query(access);
-  // gateway 访问方式（测试自备）：形状同 055 的 owner / runner，签发方校验与会话时长一致。
-  await company.db.query(`DEFINE ACCESS OVERWRITE gateway ON DATABASE TYPE JWT ALGORITHM HS512 KEY '${SECRET}'
-    AUTHENTICATE { IF $token.iss != '${ISS}' { THROW '令牌签发方不属于公司库' } }
-    DURATION FOR SESSION 15m;`);
 });
 
 afterAll(async () => {
@@ -159,4 +155,10 @@ run('owner 令牌可以写保护清单与员工策略（可选，正控制的访
   expect(protectedRow).toMatchObject({ command: 'gateway.owner' });
   const [[policyRow]] = await company.db.query<[Array<Record<string, unknown>>]>("SELECT agent FROM agent_policy WHERE agent = 'emp-gw-owner';");
   expect(policyRow).toMatchObject({ agent: 'emp-gw-owner' });
+});
+
+run('老板令牌连库：$access 为 owner（老板端用老板自己的令牌执行，不换成网关令牌）', async () => {
+  const owner = await session(tokenFor('owner', 'owner-1', { rl: ['Owner'] }));
+  const [access] = await owner.query<[string]>('RETURN $access;');
+  expect(access).toBe('owner');
 });

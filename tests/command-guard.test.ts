@@ -86,8 +86,8 @@ describe('命令守卫：运行器与自动化', () => {
   test('不能直接调用老板接口的命令', () => {
     expect(judge(request('runner', 'task.void'), {}).allow).toBe(false);
     expect(judge(request('automation', 'message.send'), {}).allow).toBe(false);
-    // task.void 现在在硬拦截清单里，理由是老板专属；运行器专用理由由不在硬清单的老板接口命令给出。
-    expect(judge(request('runner', 'task.void'), {}).reason).toBe('老板专属命令，只有老板可以调用');
+    // 老板接口命令（OWNER_API_COMMANDS）对运行器与自动化给出同一理由，不论它是否在硬清单里。
+    expect(judge(request('runner', 'task.void'), {}).reason).toBe('运行器与自动化不能直接调用老板命令');
     expect(judge(request('runner', 'board.snapshot'), {}).reason).toBe('运行器与自动化不能直接调用老板命令');
   });
 
@@ -112,23 +112,17 @@ describe('命令守卫：模式与清单', () => {
     expect(HARD_OWNER_ONLY.some(pattern => matchesCommand(pattern, 'agent.policy.set'))).toBe(true);
   });
 
-  test('HARD_OWNER_ONLY 的清单固定：决策、写入与升级命令都在内，只读命令不在内', () => {
-    expect([...HARD_OWNER_ONLY]).toEqual([
-      'guard.*', 'agent.*', 'owner.login.*', 'def.*', 'db.write', 'idp.*', 'cf.api',
-      'task.create', 'task.update', 'task.delete', 'task.void', 'task.reassign', 'task.revoke', 'task.pause', 'task.resume',
-      'decide', 'approve', 'reject', 'reply', 'instruct', 'direction.add',
-      'message.edit', 'message.edit_rendered', 'message.hold', 'message.release', 'message.send', 'notice.resolve',
-      'route.save', 'route.disable', 'session.policy',
-      'note.edit', 'note.pin', 'note.activate', 'note.remove', 'note.consolidate', 'note.consolidation.undo',
-      'upgrade.*',
-    ]);
-    for (const command of ['board.snapshot', 'brief', 'inbox', 'status', 'task.list', 'task.detail', 'task.cost', 'progress', 'message.list']) {
+  test('HARD_OWNER_ONLY 的清单固定为 5 类：保护开关、员工身份与策略、登录方式、能力定义、任意写入', () => {
+    expect([...HARD_OWNER_ONLY]).toEqual(['guard.*', 'agent.*', 'owner.login.*', 'def.*', 'db.write']);
+    // 只读命令与员工可按租约和清单调用的写命令都不在硬清单里（后者由 protected_command、allow/deny 与租约判定）。
+    for (const command of ['board.snapshot', 'brief', 'inbox', 'status', 'task.list', 'task.detail', 'task.cost', 'progress', 'message.list',
+      'task.void', 'message.send', 'upgrade.start', 'idp.client.create', 'cf.api', 'route.save']) {
       expect(HARD_OWNER_ONLY.some(pattern => matchesCommand(pattern, command))).toBe(false);
     }
   });
 
-  test('新增的硬拦截命令：db.write、idp.*、cf.api、agent.* 对员工、运行器与自动化都拒绝', () => {
-    for (const command of ['db.write', 'idp.user.create', 'cf.api', 'agent.enable', 'message.send', 'upgrade.start']) {
+  test('HARD_OWNER_ONLY 的硬拦截：db.write、guard.*、agent.*、def.* 对员工、运行器与自动化都拒绝，老板放行', () => {
+    for (const command of ['db.write', 'agent.enable', 'guard.protect', 'def.ensure']) {
       expect(agent(command).allow).toBe(false);
       expect(judge(request('runner', command), {}).allow).toBe(false);
       expect(judge(request('automation', command), {}).allow).toBe(false);
@@ -137,6 +131,13 @@ describe('命令守卫：模式与清单', () => {
     // 前缀只在 .* 结尾时生效：idp 本身与 cf 的其它命令不被误伤。
     expect(judge(request('runner', 'idp'), {}).allow).toBe(true);
     expect(judge(request('runner', 'cf.status'), {}).allow).toBe(true);
+  });
+
+  test('不在硬清单的老板命令（身份、云端、消息、升级、任务的写入）：员工按租约判定，保护清单开启后拒绝', () => {
+    for (const command of ['idp.client.create', 'cf.api', 'message.send', 'upgrade.start', 'task.void']) {
+      expect(agent(command).allow).toBe(true);
+      expect(agent(command, { ...leased, protectedOwnerOnly: true }).allow).toBe(false);
+    }
   });
 
   test('OWNER_API_COMMANDS 与 owner-api.ts 的命令分支一致：新增老板命令必须同时归类', () => {

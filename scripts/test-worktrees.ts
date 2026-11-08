@@ -82,7 +82,7 @@ try {
     // 老板对在途任务追加验收要求（自建隔离库；验证租约不中断、门禁不动、通知可读可 ack、幂等与版本 CAS）。
     // 公司库 JWT 访问方式（055）、字段守卫、命令守卫表（056）与命令守卫判定（自建隔离库，令牌用 HS512 替身）。
     'tests/company-access.test.ts', 'tests/company-access.fork.test.ts', 'tests/command-guard.test.ts',
-    // 老板端网关访问规则（058 之后 gateway 令牌写 protected_command / agent_policy 被拒、改删 ops_audit 被拒；自建隔离库，RUN_SCK_OWNER_END_TESTS）。
+    // 老板端网关访问规则（自建隔离库应用 058，访问方式用生产的 055；058 之后 gateway 令牌写 protected_command / agent_policy 被拒、改删 ops_audit 被拒；RUN_SCK_OWNER_END_TESTS）。
     'owner-end/tests/gateway-access.fork.test.ts',
     ];
   const test = Bun.spawn([process.execPath, 'test', ...targets], { detached: true, stdout: 'inherit', stderr: 'inherit', env: {

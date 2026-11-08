@@ -181,6 +181,17 @@ export async function listJobs(db: Surreal, input: Record<string, unknown>): Pro
   return (rows ?? []).map((row) => viewOf(row, false));
 }
 
+/**
+ * 作业是否由该员工发起（员工取作业详情时用：只能取自己的）。作业不存在、id 不合法都视为否，不泄露作业是否存在。
+ */
+export async function jobOwnedBy(db: Surreal, id: unknown, employee: string): Promise<boolean> {
+  if (typeof id !== 'string' || id.length === 0 || id.length > 200) return false;
+  const [rows] = await db.query<[Array<{ actor_kind?: unknown; actor?: unknown }>]>(
+    'SELECT actor_kind, actor FROM $job;', { job: new RecordId('ops_job', id) });
+  const row = rows?.[0];
+  return row?.actor_kind === 'agent' && row.actor === employee;
+}
+
 /** 单个作业的详情（含 input 与 result）；不存在即 not_found。 */
 export async function jobDetail(db: Surreal, id: string): Promise<JobView> {
   const [rows] = await db.query<[Row[]]>('SELECT * FROM $job;', { job: new RecordId('ops_job', id) });

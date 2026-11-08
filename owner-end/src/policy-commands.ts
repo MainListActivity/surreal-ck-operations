@@ -6,6 +6,7 @@ import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from '../../src/core-errors.ts';
 import { HARD_OWNER_ONLY, OWNER_API_COMMANDS } from '../../src/command-guard.ts';
 import { inServiceEmployees } from './employees.ts';
+import { COMPANY_HOST, OWNER_ONLY_FOR_AGENTS, TARGET_LOCKS, type LockTargets } from './owner-locks.ts';
 import { LANG } from './translate.ts';
 
 /** 本模块处理的命令名。 */
@@ -92,12 +93,23 @@ async function setPolicy(db: Surreal, input: Row, actor: string) {
   return { employee, policy: policyOf(rows?.[0]) };
 }
 
-/** 保护命令清单。 */
-async function guardList(db: Surreal) {
+/**
+ * 保护命令清单。hardOwnerOnly 是写死仅老板的命令（页面锁定显示）；targetLocks 与 lockedTargets 是按目标的锁
+ * （公司租户、受保护的脚本与 D1，见 owner-locks.ts）；ownerOnlyForAgents 是员工调用即拒绝的老板观测命令。
+ */
+async function guardList(db: Surreal, locks: LockTargets) {
   const [rows] = await db.query<[Row[]]>('SELECT command, owner_only FROM protected_command ORDER BY command;');
   return {
     protected: (rows ?? []).map((row) => ({ command: String(row.command), ownerOnly: row.owner_only !== false })),
     hardOwnerOnly: [...HARD_OWNER_ONLY],
+    targetLocks: TARGET_LOCKS.map((lock) => ({ ...lock })),
+    lockedTargets: {
+      companyTenantId: locks.companyTenantId || null,
+      companyHost: COMPANY_HOST,
+      scripts: [...locks.scripts],
+      d1Ids: [...locks.d1Ids],
+    },
+    ownerOnlyForAgents: [...OWNER_ONLY_FOR_AGENTS],
     ownerApiCommands: [...OWNER_API_COMMANDS],
   };
 }
@@ -124,8 +136,8 @@ async function unprotectCommand(db: Surreal, input: Row) {
   return { command, removed: true };
 }
 
-/** 员工与权限命令。只能处理 POLICY_COMMANDS 中的命令。 */
-export async function policyCommand(db: Surreal, command: string, input: Row, actor: string): Promise<unknown> {
+/** 员工与权限命令。只能处理 POLICY_COMMANDS 中的命令。locks 只用于 guard.list 展示。 */
+export async function policyCommand(db: Surreal, command: string, input: Row, actor: string, locks: LockTargets): Promise<unknown> {
   switch (command) {
     case 'agent.list': return agentList(db);
     case 'agent.policy.list': {
@@ -133,7 +145,7 @@ export async function policyCommand(db: Surreal, command: string, input: Row, ac
       return { policies: rows ?? [] };
     }
     case 'agent.policy.set': return setPolicy(db, input, actor);
-    case 'guard.list': return guardList(db);
+    case 'guard.list': return guardList(db, locks);
     case 'guard.protect': return protectCommand(db, input, actor);
     case 'guard.set': return protectCommand(db, input, actor);
     case 'guard.unprotect': return unprotectCommand(db, input);

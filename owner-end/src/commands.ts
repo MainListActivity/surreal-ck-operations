@@ -1,9 +1,10 @@
 /**
  * 命令分流（POST /api/cmd）。按调用方身份决定命令怎么执行；写操作与被拒的调用都写 ops_audit（只存摘要，不存原文）。
- * - 老板（owner）：RUNNER_ONLY_COMMANDS（需要执行端宿主的命令）排队到 ops_job，最多等 25 秒，超时返回 pending；
- *   身份、员工与权限、译文、数据库、Cloudflare 命令在 Worker 内执行；其余交给 src/owner-api.ts。
+ * - 老板（owner）：令牌直接连库（$access='owner'）。执行端命令（isRunnerCommand）排队到 ops_job，最多等 25 秒，超时返回 pending；
+ *   其余在 Worker 内执行：身份、员工与权限、译文、数据库、Cloudflare 命令，其它交给 src/owner-api.ts。
  * - 员工（agent）：先过 command-guard.decide（停用、写死仅老板、保护命令、允许与禁止、当前任务的有效租约），
- *   再过只读白名单 AGENT_COMMANDS。员工的写入仍由执行端直连数据库，不经网关。
+ *   再过按目标的硬锁（owner-locks.ts）与员工拒绝清单；通过后执行端命令以员工身份排队，其它用网关令牌执行。
+ *   db.read 用查看者令牌。员工的每次调用（含被拒）都写审计。
  * - 运行器与定时任务（runner、automation）：一律拒绝老板命令。
  */
 import type { Surreal } from 'surrealdb';
@@ -21,7 +22,8 @@ import { withSession, type Sessions } from './db.ts';
 import type { Config } from './env.ts';
 import { cloudflareApi } from './cf.ts';
 import { identityCommand, IDENTITY_COMMANDS } from './idp-commands.ts';
-import { enqueueJob, jobDetail, jobFailure, listJobs, PendingJob, waitForJob } from './jobs.ts';
+import { enqueueJob, jobDetail, jobFailure, jobOwnedBy, listJobs, PendingJob, waitForJob } from './jobs.ts';
+import { OWNER_ONLY_FOR_AGENTS, hardTargetOwnerOnly } from './owner-locks.ts';
 import { POLICY_COMMANDS, policyCommand } from './policy-commands.ts';
 import { translateChecked, translateMessage, translatePreview, translationFresh, TRANSLATE_COMMANDS } from './messages.ts';
 import { isRecord, textOf } from './rows.ts';
@@ -44,8 +46,15 @@ export interface GatewayDeps {
 
 const COMMAND_NAME = /^[a-z][a-z0-9_.-]{0,119}$/;
 
-/** 员工经网关可以调用的命令：只读。员工的写入仍由执行端直连（见 README）。 */
-export const AGENT_COMMANDS: ReadonlySet<string> = new Set(['db.read', 'task.detail', 'note.list', 'note.preview']);
+/**
+ * 执行端执行的命令（contract：RUNNER_ONLY_COMMANDS、全部 ops_*、host.exec、company.release.*）：
+ * 写 ops_job 排队，网关最多等 25 秒，超时返回 pending。
+ */
+export function isRunnerCommand(command: string): boolean {
+  return RUNNER_ONLY_COMMANDS.has(command) || command.startsWith('ops_') || command === 'host.exec' || command.startsWith('company.release.');
+}
+
+const OWNER_ONLY_REASON = '该命令只能由老板调用';
 
 /** 只读命令不写审计：看板与列表会反复刷新，记下来会淹没真正的操作。员工的调用无论读写都记。 */
 const READ_ONLY = new Set(['status', 'progress', 'brief', 'inbox', 'board.snapshot', 'db.read', 'translate.preview', 'idp.status', 'idp.user.list_agents']);
@@ -110,6 +119,14 @@ export async function runCommand(deps: GatewayDeps, caller: Caller, command: str
 
 type AuditBase = Pick<AuditEntry, 'actorKind' | 'actor' | 'task' | 'command' | 'args'>;
 
+/** 命令的调用方：老板（网页）或员工（经网关，带任务绑定）。执行端作业与核心写入的标签据此区分。 */
+interface Who {
+  actorKind: 'owner' | 'agent';
+  actor: string;
+  task?: string;
+  via: 'web' | 'agent';
+}
+
 /** 写操作的审计：执行后记一条（成功、已排队或出错）。被拒与出错时保留原来的错误。 */
 async function audited<T>(db: Surreal, base: AuditBase, run: () => Promise<T>): Promise<T> {
   const summary = auditSummary(base.command, isRecord(base.args) ? base.args : {});
@@ -130,20 +147,22 @@ async function audited<T>(db: Surreal, base: AuditBase, run: () => Promise<T>): 
 
 async function ownerCall(deps: GatewayDeps, caller: OwnerCaller, command: string, input: Input): Promise<unknown> {
   return withSession(await deps.sessions.owner(caller.token.token), (db) => {
-    const run = () => ownerCommand(deps, db, caller.sub, command, input);
+    const who: Who = { actorKind: 'owner', actor: caller.sub, via: 'web' };
+    const run = () => dispatch(deps, db, who, command, input);
     if (isReadOnly(command)) return run();
     return audited(db, { actorKind: 'owner', actor: caller.sub, command, args: input }, run);
   });
 }
 
-async function ownerCommand(deps: GatewayDeps, db: Surreal, actor: string, command: string, input: Input): Promise<unknown> {
+/** 按命令分派。老板与员工共用，差别只在 who：执行端作业的身份与任务、核心写入的标签。 */
+async function dispatch(deps: GatewayDeps, db: Surreal, who: Who, command: string, input: Input): Promise<unknown> {
   const { cfg } = deps;
-  if (RUNNER_ONLY_COMMANDS.has(command)) return queueJob(deps, db, command, input, actor);
+  if (isRunnerCommand(command)) return queueJob(deps, db, who, command, input);
   if (IDENTITY_COMMANDS.has(command)) return identityCommand(cfg, db, command, input, deps.fetch);
-  if (POLICY_COMMANDS.has(command)) return policyCommand(db, command, input, actor);
+  if (POLICY_COMMANDS.has(command)) return policyCommand(db, command, input, who.actor, cfg.locks);
   if (TRANSLATE_COMMANDS.has(command)) {
     if (command === 'translate.preview') return translatePreview(cfg, input, deps.fetch);
-    return translateMessage(new OutboundMessageStore(db), cfg, input, actor, deps.fetch);
+    return translateMessage(new OutboundMessageStore(db), cfg, input, who.actor, deps.fetch);
   }
   switch (command) {
     case 'db.read': return dbRead(db, input);
@@ -153,16 +172,19 @@ async function ownerCommand(deps: GatewayDeps, db: Surreal, actor: string, comma
     case 'ops.job.get': return { job: await jobDetail(db, textOf(input.id, 'id', 200)) };
     case 'audit.list': return listAudit(db, input);
     case 'message.edit':
-    case 'message.edit_rendered': return translateSaved(deps, db, await runOwnerApi(db, command, input), actor);
+    case 'message.edit_rendered': return translateSaved(deps, db, await runOwnerApi(db, command, input, who.via), who.actor);
     case 'message.release':
-    case 'message.send': return release(deps, db, command, input, actor);
-    default: return runOwnerApi(db, command, input);
+    case 'message.send': return release(deps, db, command, input, who);
+    default: return runOwnerApi(db, command, input, who.via);
   }
 }
 
-/** 执行端命令：排队到 ops_job，最多等 25 秒。完成返回结果，失败转为对应错误，超时返回 pending（202，附任务号）。 */
-async function queueJob(deps: GatewayDeps, db: Surreal, command: string, input: Input, actor: string): Promise<unknown> {
-  const jobId = await enqueueJob(db, { command, input, actorKind: 'owner', actor }, deps.now?.());
+/**
+ * 执行端命令：排队到 ops_job（员工的作业带员工与任务，执行端据此核对租约），最多等 25 秒。
+ * 完成返回结果，失败转为对应错误，超时返回 pending（202，附任务号）。
+ */
+async function queueJob(deps: GatewayDeps, db: Surreal, who: Who, command: string, input: Input): Promise<unknown> {
+  const jobId = await enqueueJob(db, { command, input, actorKind: who.actorKind, actor: who.actor, task: who.task }, deps.now?.());
   const outcome = await waitForJob(db, jobId, deps.waitMs);
   if (outcome.state === 'done') return outcome.result;
   if (outcome.state === 'error') throw jobFailure(outcome);
@@ -185,15 +207,15 @@ async function translateSaved(deps: GatewayDeps, db: Surreal, saved: unknown, ac
 }
 
 /** 放行（message.release / message.send）：选了语言而译文未就绪的，先译好再放行；译文失败则不放行。 */
-async function release(deps: GatewayDeps, db: Surreal, command: string, input: Input, actor: string): Promise<unknown> {
+async function release(deps: GatewayDeps, db: Surreal, command: string, input: Input, who: Who): Promise<unknown> {
   const messageId = textOf(input.messageId, 'messageId', 200);
   const store = new OutboundMessageStore(db);
   const message = await store.get(messageId);
   if (message && message.state !== 'sent' && message.lang && !translationFresh(message)) {
     const translated = await translateChecked(deps.cfg, message.body, message.lang, deps.fetch);
-    await store.setTranslation(message.id, message.lang, translated, message.body, actor);
+    await store.setTranslation(message.id, message.lang, translated, message.body, who.actor);
   }
-  return runOwnerApi(db, command, { ...input, messageId });
+  return runOwnerApi(db, command, { ...input, messageId }, who.via);
 }
 
 async function agentCall(deps: GatewayDeps, caller: AgentCaller, command: string, input: Input): Promise<unknown> {
@@ -202,21 +224,23 @@ async function agentCall(deps: GatewayDeps, caller: AgentCaller, command: string
     const employee = await employeeOfIdentity(db, caller.sub);
     const base: AuditBase = { actorKind: 'agent', actor: employee ?? caller.sub, task: caller.task, command, args: input };
     const refuse = async (reason: string): Promise<never> => {
-      await audit(db, { ...base, outcome: 'denied', reason });
+      await audit(db, { ...base, outcome: 'denied', reason, summary: auditSummary(command, input) });
       throw new CompanyError('forbidden', reason);
     };
     if (!employee) return refuse('该令牌没有登记的员工身份');
     const decision = await decide(db, { actorKind: 'agent', actor: employee, task: caller.task, command, now: Math.floor(now.getTime() / 1000) });
     if (!decision.allow) return refuse(decision.reason);
-    if (!AGENT_COMMANDS.has(command)) return refuse('该命令只能由老板调用');
-    return audited(db, base, () => agentRead(deps, db, command, input));
+    const locked = hardTargetOwnerOnly(command, input, deps.cfg.locks);
+    if (locked) return refuse(locked);
+    if (OWNER_ONLY_FOR_AGENTS.includes(command)) return refuse(OWNER_ONLY_REASON);
+    if (command === 'ops.job.get' && !(await jobOwnedBy(db, input.id, employee))) return refuse('只能查看本员工发起的作业');
+    const who: Who = { actorKind: 'agent', actor: employee, task: caller.task, via: 'agent' };
+    // db.read 走查看者令牌（只读），其它命令按 dispatch 分派：执行端命令排队，其余用网关令牌。
+    const run = async () => (command === 'db.read'
+      ? withSession(await deps.sessions.viewer(), (viewer) => dbRead(viewer, input))
+      : dispatch(deps, db, who, command, input));
+    return audited(db, base, run);
   });
-}
-
-/** 员工的只读命令。db.read 走查看者令牌，其它只读命令用网关令牌。 */
-async function agentRead(deps: GatewayDeps, db: Surreal, command: string, input: Input): Promise<unknown> {
-  if (command === 'db.read') return withSession(await deps.sessions.viewer(), (viewer) => dbRead(viewer, input));
-  return runOwnerApi(db, command, input, 'agent');
 }
 
 /** 运行器与定时任务不能调用老板命令；它们的拒绝也记审计。网关、查看者、迁移的令牌不应出现在这里，直接拒绝。 */
@@ -225,6 +249,7 @@ async function systemCall(deps: GatewayDeps, caller: SystemCaller, command: stri
     const actorKind = caller.ac === 'runner' ? 'runner' : 'automation';
     await withSession(await deps.sessions.gateway(), (db) => audit(db, {
       actorKind, actor: caller.sub, command, args: input, outcome: 'denied', reason: '运行器与定时任务不能调用老板命令',
+      summary: auditSummary(command, input),
     })).catch(() => undefined);
   }
   throw new CompanyError('forbidden', '该身份不能调用老板命令');
