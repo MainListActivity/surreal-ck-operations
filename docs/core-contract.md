@@ -10,7 +10,9 @@ adapter 负责 MCP initialize、工具 schema、错误映射和本地绑定；co
 
 ## 本机接入
 
-在本分支 worktree 中执行 `pnpm install --frozen-lockfile`、`pnpm run typecheck`、`pnpm run bootstrap`、`pnpm run test:db`。配置通过 `SCK_PRODUCT_ENV` 指向产品 `.env`，默认路径为 `/Users/y/IdeaProjects/surreal_ck/.env`；只读取 `SURREAL_URL`、`SURREAL_ROOT_USER`、`SURREAL_ROOT_PASS`，不读取或写入产品库数据。Namespace/database 默认 `sck_agent_company/control_plane`。更改目标需设置 `SCK_COMPANY_NS` / `SCK_COMPANY_DB`，bootstrap 会检查目标归属标记，拒绝已有无关资源。
+在本分支 worktree 中执行 `pnpm install --frozen-lockfile`、`pnpm run typecheck`、`pnpm run bootstrap`、`pnpm run test:db`。配置通过 `SCK_PRODUCT_ENV` 指向产品 `.env`，默认路径为 `/Users/y/IdeaProjects/surreal_ck/.env`；只读取 `SURREAL_URL`、`SURREAL_ROOT_USER`、`SURREAL_ROOT_PASS`（以及可选的 `COMPANY_JWKS_URL`、`COMPANY_ISSUER`，见下段），不读取或写入产品库数据。Namespace/database 默认 `sck_agent_company/control_plane`。更改目标需设置 `SCK_COMPANY_NS` / `SCK_COMPANY_DB`，bootstrap 会检查目标归属标记，拒绝已有无关资源。
+
+公司库 JWT 访问方式（055）的两个可选配置是 `COMPANY_JWKS_URL`（签发令牌的 JWKS 地址，必须是 http(s) 地址）与 `COMPANY_ISSUER`（令牌 `iss` 必须等于它）。两者都配置时，bootstrap 才应用 `owner`、`runner`、`automation` 三种 JWT 访问方式；缺任一项则跳过并在日志中记一行，保持本机访问。命令守卫表（056）与本机模式无关，始终应用。
 
 已登记员工的本机 token 位于本 worktree `.runtime/credentials/<employee-id>.token`，目录 0700、文件 0600、Git 忽略。adapter 从安全通道接收 token，不把文件内容放入日志、Issue 或响应。`test:db` 使用独立测试 Namespace `sck_agent_company_test/control_plane`，合成数据与服务目标库分离；可通过测试库审计记录和 outbox 复核。正式服务只连接 `sck_agent_company/control_plane`。
 

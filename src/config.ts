@@ -8,6 +8,10 @@ export interface DatabaseConfig {
   rootPassword: string;
   namespace: string;
   database: string;
+  /** 公司库 JWT 访问（055）：签发令牌的 JWKS 地址。与 companyIssuer 同时配置才应用公司库访问方式。 */
+  companyJwksUrl?: string;
+  /** 公司库 JWT 访问（055）：令牌 iss 必须等于它。 */
+  companyIssuer?: string;
 }
 
 function readProductEnv(): Record<string, string> {
@@ -58,8 +62,9 @@ function readEnvFile(path: string, required: boolean): Record<string, string> {
 export function loadDatabaseConfig(): DatabaseConfig {
   const fromFile = readProductEnv();
   const company = readCompanyEnv();
+  const lookup = (name: string): string | undefined => process.env[name] || company[name] || fromFile[name] || undefined;
   const get = (name: string): string => {
-    const value = process.env[name] || company[name] || fromFile[name];
+    const value = lookup(name);
     if (!value) throw new Error(`Missing ${name}`);
     return value;
   };
@@ -80,6 +85,8 @@ export function loadDatabaseConfig(): DatabaseConfig {
     rootPassword: get('SURREAL_ROOT_PASS'),
     namespace,
     database,
+    companyJwksUrl: lookup('COMPANY_JWKS_URL'),
+    companyIssuer: lookup('COMPANY_ISSUER'),
   };
 }
 
