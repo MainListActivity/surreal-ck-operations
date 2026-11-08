@@ -2,6 +2,7 @@
 import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from './core-errors.ts';
 import { machineCriterionOf, routeBody, stepOfTask, templateFor, type MessageStep } from './outbound-render.ts';
+import { deliveryOf, sourceHash } from './outbound-delivery.ts';
 export { DEFAULT_MACHINE_CRITERION, renderMessage, templateFor } from './outbound-render.ts';
 
 export type { MessageStep } from './outbound-render.ts';
@@ -58,40 +59,6 @@ const rowView = (row: Record<string, unknown>): OutboundMessage => ({
   // SDK 把 datetime 读成 Date；转成 ISO 字符串，补译排序才能按时间比较。
   translateFailedAt: row.translate_failed_at instanceof Date ? row.translate_failed_at.toISOString() : textOf(row.translate_failed_at),
 });
-
-/** 原文的 SHA-256（小写十六进制）。译文只对应它译过的那一版原文，原文一改哈希即不一致。只用 Web 标准 API，Worker 与 Node 都能跑。 */
-export async function bodyHash(text: string): Promise<string> {
-  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
-  return Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join('');
-}
-
-/** What a message sends to one employee: the stored body, or its translation for that employee's language. */
-export type Delivery = { ok: true; body: string; translated: boolean } | { ok: false; reason: 'awaiting_translation' };
-
-/**
- * 生效语言：老板为这条消息选过语言（含选“原文”）时，以消息自己的语言为准（没有即原文）；没选过的，跟着收件员工走，
- * 取员工默认语言（没有即原文）。消息上的 lang 是派工时对齐过来的员工语言（见 stampLang），员工换了、默认语言改了它就跟着变，
- * 所以这里不看它。投递与老板看板共用这一个判定，老板在看板上看到的译文就是员工会收到的译文。
- */
-export function effectiveLangOf(message: { lang?: string; langChosen?: boolean }, employeeLang: string | undefined): string | undefined {
-  if (message.langChosen) return message.lang || undefined;
-  return employeeLang || undefined;
-}
-
-/**
- * 纯投递判定。没有生效语言：原文照发。有生效语言：只有同语言、非空、且译文哈希与当前原文一致的译文才能发；
- * 其它情况（没有译文、语言不同、原文已改）一律等待补译，不发原文。
- */
-export async function deliveryOf(message: { body: string; lang?: string; langChosen?: boolean; translatedText?: string; translatedFromHash?: string },
-  employeeLang: string | undefined): Promise<Delivery> {
-  const lang = effectiveLangOf(message, employeeLang);
-  if (!lang) return { ok: true, body: message.body, translated: false };
-  const translated = message.translatedText ?? '';
-  if (message.lang === lang && translated.trim() && message.translatedFromHash === await bodyHash(message.body)) {
-    return { ok: true, body: translated, translated: true };
-  }
-  return { ok: false, reason: 'awaiting_translation' };
-}
 
 export class OutboundMessageStore {
   constructor(private readonly db: Surreal) {}
@@ -179,7 +146,7 @@ export class OutboundMessageStore {
     // No draft yet: prepareSend would seed a fresh one, which takes the employee's language and never carries a translation.
     if (!draft) return Boolean(employeeLang);
     if (draft.hold || draft.state === 'held') return false;
-    return !(await deliveryOf(draft, employeeLang)).ok;
+    return !deliveryOf(draft, employeeLang).ok;
   }
 
   /** Public send path for the eval dispatch: marks the table row sent only after the external send succeeded. */
@@ -221,7 +188,7 @@ export class OutboundMessageStore {
     const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
       `UPDATE $msg SET lang = $lang, translated_text = $text, translated_from_hash = $hash, translated_at = time::now()
         WHERE state != 'sent' AND body = $expectedBody RETURN AFTER;`,
-      { msg, lang, text: translatedText, hash: await bodyHash(expectedBody), expectedBody });
+      { msg, lang, text: translatedText, hash: sourceHash(expectedBody), expectedBody });
     const row = rows?.[0];
     if (!row) throw await this.translationRefusal(msg);
     return rowView(row);
@@ -257,11 +224,10 @@ export class OutboundMessageStore {
   }
 
   /**
-   * Held messages do not send; otherwise locks in the table and returns the stored body. `null` means no send.
-   * The mark stays in 'draft' until the caller's external send succeeded (see markSent), so a failed send
-   * never loses the owner's edit. Every dispatch message comes from this table.
-   * An employee with a language gets the translation for that language (see deliveryOf); with no translation
-   * ready the result is also `null`, and the hold and the state stay as they are.
+   * Held messages do not send. Otherwise the delivery rule (deliveryOf) picks the body: the stored body for a message without a
+   * language, the translation for the employee's language once it is ready, and `null` while it waits for that translation.
+   * `null` means no send; the hold and the state stay as they are. The mark stays in 'draft' until the caller's external send
+   * succeeded (see markSent), so a failed send never loses the owner's edit. Every dispatch message comes from this table.
    */
   async prepareSend(taskId: string, step: MessageStep, employeeId: string): Promise<{ body: string; message: OutboundMessage } | null> {
     const employeeLang = await this.langOf(employeeId);
@@ -269,7 +235,7 @@ export class OutboundMessageStore {
     let draft = await this.latestDraft(taskId, step) ?? await this.seedDraft(taskId, step);
     if (draft.hold || draft.state === 'held') return null;
     draft = await this.stampLang(draft, employeeLang);
-    const delivery = await deliveryOf(draft, employeeLang);
+    const delivery = deliveryOf(draft, employeeLang);
     if (!delivery.ok) return null;
     return { body: delivery.body, message: { ...draft, sentTo: employeeId } };
   }
@@ -362,12 +328,26 @@ export class OutboundMessageStore {
   }
 
   async markSent(messageId: string, employeeId: string, body: string): Promise<{ body: string; message: OutboundMessage }> {
-    const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
-      `UPDATE $msg SET state = 'sent', sent_to = $employee, sent_at = time::now(), hold = false WHERE state != 'sent' RETURN AFTER;`,
-      { msg: this.message(messageId), employee: employeeId });
-    if (!rows?.[0]) throw new CompanyError('conflict', 'message already sent or missing');
-    await this.resolveHoldNotice(rows[0].task, rows[0].step);
-    return { body, message: rowView(rows[0]) };
+    // 认领即条件 UPDATE：同一条消息只有一个调用方的 WHERE state != 'sent' 命中并返回行。
+    // 并发写同一行时 SurrealDB 可能直接报 Transaction conflict（可重试）；重试时该行已是 sent，条件不再命中，因此统一映射为 conflict。
+    const row = await this.guardedMarkSent(messageId, employeeId);
+    if (!row) throw new CompanyError('conflict', 'message already sent or missing');
+    await this.resolveHoldNotice(row.task, row.step);
+    return { body, message: rowView(row) };
+  }
+
+  private async guardedMarkSent(messageId: string, employeeId: string): Promise<Record<string, unknown> | undefined> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
+          `UPDATE $msg SET state = 'sent', sent_to = $employee, sent_at = time::now(), hold = false WHERE state != 'sent' RETURN AFTER;`,
+          { msg: this.message(messageId), employee: employeeId });
+        return rows?.[0];
+      } catch (error) {
+        const text = error instanceof Error ? error.message : String(error);
+        if (attempt >= 3 || !/transaction conflict/i.test(text)) throw error;
+      }
+    }
   }
 
   /** 返工/催办触发时追加 draft（幂等：同一任务同一阶段已有未发草稿则不重复）。 */

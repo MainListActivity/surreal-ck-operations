@@ -1,8 +1,9 @@
 /**
  * 译文命令（只由老板调用）。translate.preview 只返回译文，不落库；translate.message 为消息选语言并保存译文。
- * 译文只对应它译过的那一版原文（translated_from_hash）：原文一改即作废，投递前等待补译（见 src/outbound-messages.ts）。
+ * 译文只对应它译过的那一版原文（translated_from_hash）：原文一改即作废，投递前等待补译（见 src/outbound-delivery.ts）。
  */
-import { bodyHash, type OutboundMessage, type OutboundMessageStore } from '../../src/outbound-messages.ts';
+import { type OutboundMessage, type OutboundMessageStore } from '../../src/outbound-messages.ts';
+import { translationStateOf, type DeliveryMessage } from '../../src/outbound-delivery.ts';
 import { CompanyError } from '../../src/core-errors.ts';
 import type { Config } from './env.ts';
 import { LANG, MAX_TRANSLATION, translateText, type Magpie } from './translate.ts';
@@ -24,9 +25,9 @@ export function keepsPlaceholders(source: string, translated: string): boolean {
   return PLACEHOLDERS.every((marker) => !marker.test(source) || marker.test(translated));
 }
 
-/** 译文仍对应当前原文：有译文，且译文时的原文哈希与现在的原文一致。 */
-export async function translationFresh(message: { body: string; translatedText?: string; translatedFromHash?: string }): Promise<boolean> {
-  return Boolean(message.translatedText?.trim()) && message.translatedFromHash === await bodyHash(message.body);
+/** 译文仍对应当前原文：它就是消息自己语言的译文，且译文时的原文哈希与现在的原文一致（投递判定为 ready）。 */
+export function translationFresh(message: DeliveryMessage): boolean {
+  return message.lang !== undefined && translationStateOf(message, message.lang) === 'ready';
 }
 
 function langOf(value: unknown): string {

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { Surreal } from 'surrealdb';
 
-import { bodyHash } from '../../src/outbound-messages.ts';
+import { sourceHash } from '../../src/outbound-delivery.ts';
 import {
   DAILY_CRON,
   MINUTE_CRON,
@@ -223,7 +223,7 @@ describe('refreshTranslations 补译', () => {
     expect(update!.vars.lang).toBe('en');
     expect(update!.vars.text).toBe('Please confirm acceptance m1');
     expect(update!.vars.expectedBody).toBe(source);
-    expect(update!.vars.hash).toBe(await bodyHash(source));
+    expect(update!.vars.hash).toBe(sourceHash(source));
   });
 
   test('没有语言的消息，或译文仍新鲜的消息：跳过，不发请求、不写库', async () => {
@@ -231,7 +231,7 @@ describe('refreshTranslations 补译', () => {
     const { db, calls } = fakeDb(respondWith([
       ['FROM outbound_message', [
         messageRow('no-lang', { lang: undefined }),
-        messageRow('fresh', { body: source, translated_text: 'Confirm fresh', translated_from_hash: await bodyHash(source) }),
+        messageRow('fresh', { body: source, translated_text: 'Confirm fresh', translated_from_hash: sourceHash(source) }),
       ]],
     ]));
     const { fetch, requests } = scriptedFetch([]);

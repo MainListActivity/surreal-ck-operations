@@ -3,8 +3,8 @@ import {fs,radius,sp} from '../plugin/shared/relay-tokens.ts';
 import { expect, test } from 'bun:test';
 import type { Pulse } from '../plugin/shared/types.ts';
 
-// company.tsx 依赖宿主 UI 运行时，不能直接 import；把 normalizePulse 与其帮手从源文件切片编译出来跑真实现。
-const page = await Bun.file(new URL('../plugin/client/company.tsx', import.meta.url)).text();
+// owner-views.tsx（老板端视图的迁出副本）依赖宿主 UI 运行时，不能直接 import；把 normalizePulse 与其帮手从源文件切片编译出来跑真实现。
+const page = await Bun.file(new URL('../plugin/client/owner-views.tsx', import.meta.url)).text();
 const helpersStart = page.indexOf('const arr = <T,>');
 const normStart = page.indexOf('export function normalizePulse');
 if (helpersStart < 0 || normStart < 0) throw new Error('normalizePulse helpers missing');

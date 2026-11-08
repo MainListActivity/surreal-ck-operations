@@ -1,6 +1,7 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 import type { ModelCatalogPage, AuditEntry, ModelRankingAttempt, ModelRankingTable, Brief, Inbox, PermissionRequest, ProviderOptionsResult, Pulse, Roster, TaskAttachment, TaskView } from "./types";
+import type { RunnerStatus } from "./runner-status";
 
 const record = <T>() => z.custom<T>(value => typeof value === "object" && value !== null);
 const key = z.string().min(1);
@@ -15,6 +16,13 @@ export const brief = defineRpc({
   name: "company.brief",
   input: z.object({}),
   output: record<Brief>(),
+});
+
+/** 执行端状态（老板面板）：连接、令牌、最近心跳、执行中作业数、在岗员工数。 */
+export const runnerStatus = defineRpc({
+  name: "runner.status",
+  input: z.object({}),
+  output: record<RunnerStatus>(),
 });
 
 export const pulse = defineRpc({

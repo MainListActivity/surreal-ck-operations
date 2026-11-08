@@ -6,7 +6,8 @@ import { CompanyDatabase } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { CompanyError } from '../src/core-errors.ts';
-import { OutboundMessageStore, bodyHash } from '../src/outbound-messages.ts';
+import { OutboundMessageStore } from '../src/outbound-messages.ts';
+import { sourceHash } from '../src/outbound-delivery.ts';
 
 // 译文投递在真实公司 fork 上的验证：058 字段与约束、UPDATE 的原文守卫、员工语言与投递。隔离的内存库，自己起停。
 // 与 tests/outbound-translation.test.ts 的假库用例互补：这里的 conflict 与 null 来自真实的 SurrealQL。
@@ -87,7 +88,7 @@ run('译文投递：未译不发（不改 hold 与状态）、译后发译文、
 
     // 保存译文：哈希取自被译的原文，不算老板编辑。
     const saved = await store.setTranslation(execute.id, 'ja', 'JA 执行说明', execute.body, 'owner:test');
-    expect(saved).toMatchObject({ lang: 'ja', translatedText: 'JA 执行说明', translatedFromHash: await bodyHash(execute.body) });
+    expect(saved).toMatchObject({ lang: 'ja', translatedText: 'JA 执行说明', translatedFromHash: sourceHash(execute.body) });
     expect(saved.editedBy).toBeUndefined();
 
     // 译文就绪：日语员工拿到译文；原文照旧保存在行里。
@@ -105,7 +106,7 @@ run('译文投递：未译不发（不改 hold 与状态）、译后发译文、
     expect(await store.prepareSend(task.id, 'execute', 'emp-ja')).toBeNull();
     await expect(store.setTranslation(execute.id, 'ja', '旧译文', execute.body, 'owner:test')).rejects.toThrow('body changed, translate again');
     const again = await store.setTranslation(execute.id, 'ja', 'JA 改后的执行说明', '改过的执行说明', 'owner:test');
-    expect(again.translatedFromHash).toBe(await bodyHash('改过的执行说明'));
+    expect(again.translatedFromHash).toBe(sourceHash('改过的执行说明'));
     expect((await store.prepareSend(task.id, 'execute', 'emp-ja'))!.body).toBe('JA 改后的执行说明');
 
     // 空译文与不存在的消息。
@@ -169,7 +170,7 @@ run('译文按哈希判定：同一原文的两次译文，只有最后一次的
     await store.setTranslation(execute.id, 'ja', '第二版', execute.body, 'owner:test');
     const row = (await store.get(execute.id))!;
     expect(row.translatedText).toBe('第二版');
-    expect(row.translatedFromHash).toBe(await bodyHash(execute.body));
+    expect(row.translatedFromHash).toBe(sourceHash(execute.body));
     expect((await store.prepareSend(task.id, 'execute', 'emp-ja'))!.body).toBe('第二版');
   } finally {
     await w.close();

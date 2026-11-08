@@ -189,7 +189,7 @@ async function release(deps: GatewayDeps, db: Surreal, command: string, input: I
   const messageId = textOf(input.messageId, 'messageId', 200);
   const store = new OutboundMessageStore(db);
   const message = await store.get(messageId);
-  if (message && message.state !== 'sent' && message.lang && !(await translationFresh(message))) {
+  if (message && message.state !== 'sent' && message.lang && !translationFresh(message)) {
     const translated = await translateChecked(deps.cfg, message.body, message.lang, deps.fetch);
     await store.setTranslation(message.id, message.lang, translated, message.body, actor);
   }

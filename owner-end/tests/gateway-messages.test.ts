@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 
 import { CompanyError } from '../../src/core-errors.ts';
-import { bodyHash, deliveryOf, effectiveLangOf, type OutboundMessage } from '../../src/outbound-messages.ts';
+import { type OutboundMessage } from '../../src/outbound-messages.ts';
+import { deliveryOf, effectiveLangOf, sourceHash } from '../../src/outbound-delivery.ts';
 import {
   keepsPlaceholders,
   translateChecked,
@@ -92,7 +93,7 @@ class MemoryMessageStore implements MessageStoreLike {
       ...row,
       lang,
       translatedText,
-      translatedFromHash: await bodyHash(expectedBody),
+      translatedFromHash: sourceHash(expectedBody),
       translatedAt: '2026-01-01T00:00:01.000Z',
     };
     this.rows.set(messageId, next);
@@ -115,28 +116,28 @@ class MemoryMessageStore implements MessageStoreLike {
 }
 
 describe('译文新鲜度 translationFresh', () => {
-  test('有译文且译文时的原文哈希与现在的原文一致，则新鲜', async () => {
+  test('有译文且译文时的原文哈希与现在的原文一致，则新鲜', () => {
     const body = '请确认 {taskId} 的验收';
-    const fresh = await translationFresh({ body, translatedText: 'Please confirm {taskId}', translatedFromHash: await bodyHash(body) });
+    const fresh = translationFresh({ body, lang: 'en', translatedText: 'Please confirm {taskId}', translatedFromHash: sourceHash(body) });
     expect(fresh).toBe(true);
   });
 
-  test('原文被改后哈希不一致，译文过期', async () => {
-    const translatedFromHash = await bodyHash('请确认 {taskId} 的验收');
-    const fresh = await translationFresh({ body: '请确认 {taskId} 的验收（改）', translatedText: 'Please confirm {taskId}', translatedFromHash });
+  test('原文被改后哈希不一致，译文过期', () => {
+    const translatedFromHash = sourceHash('请确认 {taskId} 的验收');
+    const fresh = translationFresh({ body: '请确认 {taskId} 的验收（改）', lang: 'en', translatedText: 'Please confirm {taskId}', translatedFromHash });
     expect(fresh).toBe(false);
   });
 
-  test('缺少译文文本（或只有空白）不新鲜', async () => {
+  test('缺少译文文本（或只有空白）不新鲜', () => {
     const body = '请确认 {taskId} 的验收';
-    const translatedFromHash = await bodyHash(body);
-    expect(await translationFresh({ body, translatedFromHash })).toBe(false);
-    expect(await translationFresh({ body, translatedText: '   ', translatedFromHash })).toBe(false);
+    const translatedFromHash = sourceHash(body);
+    expect(translationFresh({ body, lang: 'en', translatedFromHash })).toBe(false);
+    expect(translationFresh({ body, lang: 'en', translatedText: '   ', translatedFromHash })).toBe(false);
   });
 
-  test('没有语言的消息也没有译文：translationFresh 不看语言，结果为不新鲜；“无需译文”由定时任务在语言为空时直接跳过', async () => {
-    // translationFresh 只看译文与哈希。refreshTranslations 先判断 message.lang，无语言的消息根本不会进入这里。
-    expect(await translationFresh({ body: '原文' })).toBe(false);
+  test('没有语言的消息不新鲜：译文只对应消息自己的语言；“无需译文”由定时任务在语言为空时直接跳过', () => {
+    // translationFresh 与投递判定读同一个语言：没有语言就没有可用的译文。refreshTranslations 先判断 message.lang，无语言的消息不会进入这里。
+    expect(translationFresh({ body: '原文' })).toBe(false);
   });
 });
 
@@ -290,7 +291,7 @@ describe('translateMessage 为消息选语言并保存译文', () => {
     expect(store.calls[2]!.args).toEqual(['m1', 'en', 'Please confirm acceptance of {taskId}', source, 'owner']);
     expect(result.lang).toBe('en');
     expect(result.translatedText).toBe('Please confirm acceptance of {taskId}');
-    expect(result.translatedFromHash).toBe(await bodyHash(source));
+    expect(result.translatedFromHash).toBe(sourceHash(source));
   });
 
   test('译文失败（上游 500）时不写库：不调用 setLanguage 与 setTranslation', async () => {
@@ -310,7 +311,7 @@ describe('translateMessage 为消息选语言并保存译文', () => {
   });
 });
 
-describe('投递语义：真实的 bodyHash、deliveryOf、effectiveLangOf 与内存存储配合', () => {
+describe('投递语义：真实的 sourceHash、deliveryOf、effectiveLangOf 与内存存储配合', () => {
   const SOURCE = '请确认 {taskId} 的验收';
 
   test('选了 en 但还没有译文：deliveryOf 为 awaiting_translation，不发原文', async () => {
@@ -319,7 +320,7 @@ describe('投递语义：真实的 bodyHash、deliveryOf、effectiveLangOf 与�
     const row = store.peek('m1');
 
     expect(effectiveLangOf(row, undefined)).toBe('en');
-    expect(await deliveryOf(row, undefined)).toEqual({ ok: false, reason: 'awaiting_translation' });
+    expect(deliveryOf(row, undefined)).toEqual({ ok: false, reason: 'awaiting_translation' });
   });
 
   test('translateMessage 完成后：deliveryOf 返回译文（translated=true）；原文被改后译文作废，再次等待补译', async () => {
@@ -328,7 +329,7 @@ describe('投递语义：真实的 bodyHash、deliveryOf、effectiveLangOf 与�
     const { fetch } = scriptedFetch([() => chatReply('Please confirm acceptance for {taskId}')]);
     await translateMessage(store, testConfig(MAGPIE_ENV), { messageId: 'm1', lang: 'en' }, 'owner', fetch);
 
-    expect(await deliveryOf(store.peek('m1'), undefined)).toEqual({
+    expect(deliveryOf(store.peek('m1'), undefined)).toEqual({
       ok: true,
       body: 'Please confirm acceptance for {taskId}',
       translated: true,
@@ -338,7 +339,7 @@ describe('投递语义：真实的 bodyHash、deliveryOf、effectiveLangOf 与�
     store.editBody('m1', '请确认 {taskId} 的验收，并附上测试结果');
     const edited = store.peek('m1');
     expect(edited.translatedText).toBe('Please confirm acceptance for {taskId}');
-    expect(await deliveryOf(edited, undefined)).toEqual({ ok: false, reason: 'awaiting_translation' });
+    expect(deliveryOf(edited, undefined)).toEqual({ ok: false, reason: 'awaiting_translation' });
   });
 
   test('没有语言且老板未选过语言，员工默认语言 ja 生效：等待 ja 译文；老板清除选择（setLanguage(undefined)）后投递原文', async () => {
@@ -347,7 +348,7 @@ describe('投递语义：真实的 bodyHash、deliveryOf、effectiveLangOf 与�
 
     const before = store.peek('m1');
     expect(effectiveLangOf(before, employeeLang)).toBe('ja');
-    expect(await deliveryOf(before, employeeLang)).toEqual({ ok: false, reason: 'awaiting_translation' });
+    expect(deliveryOf(before, employeeLang)).toEqual({ ok: false, reason: 'awaiting_translation' });
 
     // 老板选“原文”（lang 为 null），记下 langChosen，之后不再套用员工默认语言。
     const { fetch, requests } = scriptedFetch([]);
@@ -357,11 +358,11 @@ describe('投递语义：真实的 bodyHash、deliveryOf、effectiveLangOf 与�
     const after = store.peek('m1');
     expect(after.langChosen).toBe(true);
     expect(effectiveLangOf(after, employeeLang)).toBeUndefined();
-    expect(await deliveryOf(after, employeeLang)).toEqual({ ok: true, body: SOURCE, translated: false });
+    expect(deliveryOf(after, employeeLang)).toEqual({ ok: true, body: SOURCE, translated: false });
   });
 
   test('没有语言也没有员工默认语言：原文直接投递（translated=false）', async () => {
     const store = new MemoryMessageStore(message({ body: SOURCE }));
-    expect(await deliveryOf(store.peek('m1'), undefined)).toEqual({ ok: true, body: SOURCE, translated: false });
+    expect(deliveryOf(store.peek('m1'), undefined)).toEqual({ ok: true, body: SOURCE, translated: false });
   });
 });

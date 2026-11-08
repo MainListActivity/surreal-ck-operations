@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { CompanyError } from '../src/core-errors.ts';
-import { OutboundMessageStore, bodyHash, deliveryOf, effectiveLangOf } from '../src/outbound-messages.ts';
+import { OutboundMessageStore } from '../src/outbound-messages.ts';
+import { deliveryOf, effectiveLangOf, sourceHash } from '../src/outbound-delivery.ts';
 
 // 译文投递的纯判定与存储层守卫：不连数据库，用一个只认语句形状的假 Surreal 面。
 // 真实库上的同一条路径（058 字段、UPDATE 的 WHERE 守卫、员工语言）由 tests/outbound-translation.fork.test.ts 验证。
@@ -11,56 +12,56 @@ const EN_TEXT = 'Read notes.md first, then complete the task.';
 
 describe('原文哈希', () => {
   test('SHA-256 小写十六进制，64 位，同文同哈希', async () => {
-    expect(await bodyHash('abc')).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
-    const first = await bodyHash(ZH);
+    expect(sourceHash('abc')).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+    const first = sourceHash(ZH);
     expect(first).toMatch(/^[0-9a-f]{64}$/);
-    expect(await bodyHash(ZH)).toBe(first);
-    expect(await bodyHash(`${ZH} `)).not.toBe(first);
+    expect(sourceHash(ZH)).toBe(first);
+    expect(sourceHash(`${ZH} `)).not.toBe(first);
   });
 });
 
 describe('投递判定 deliveryOf', () => {
   test('没有消息语言、员工也没有语言：原文照发，与译文无关', async () => {
-    expect(await deliveryOf({ body: ZH }, undefined)).toEqual({ ok: true, body: ZH, translated: false });
-    expect(await deliveryOf({ body: ZH }, '')).toEqual({ ok: true, body: ZH, translated: false });
-    expect(await deliveryOf({ body: ZH, translatedText: JA_TEXT, translatedFromHash: 'x' }, undefined))
+    expect(deliveryOf({ body: ZH }, undefined)).toEqual({ ok: true, body: ZH, translated: false });
+    expect(deliveryOf({ body: ZH }, '')).toEqual({ ok: true, body: ZH, translated: false });
+    expect(deliveryOf({ body: ZH, translatedText: JA_TEXT, translatedFromHash: 'x' }, undefined))
       .toEqual({ ok: true, body: ZH, translated: false });
   });
 
   test('没选过语言的消息跟着员工走：员工没有语言就照发原文，即使消息上残留着别的语言和译文', async () => {
-    expect(await deliveryOf({ body: ZH, lang: 'ja', translatedText: JA_TEXT, translatedFromHash: 'x' }, undefined))
+    expect(deliveryOf({ body: ZH, lang: 'ja', translatedText: JA_TEXT, translatedFromHash: 'x' }, undefined))
       .toEqual({ ok: true, body: ZH, translated: false });
   });
 
   test('老板选过的语言不随员工走：选了日语但没有译文，即使员工没有语言也等待，不发原文', async () => {
-    expect(await deliveryOf({ body: ZH, lang: 'ja', langChosen: true }, undefined))
+    expect(deliveryOf({ body: ZH, lang: 'ja', langChosen: true }, undefined))
       .toEqual({ ok: false, reason: 'awaiting_translation' });
   });
 
   test('ready：语言相同、译文非空、哈希与当前原文一致，发译文', async () => {
-    const message = { body: ZH, lang: 'ja', translatedText: JA_TEXT, translatedFromHash: await bodyHash(ZH) };
-    expect(await deliveryOf(message, 'ja')).toEqual({ ok: true, body: JA_TEXT, translated: true });
+    const message = { body: ZH, lang: 'ja', translatedText: JA_TEXT, translatedFromHash: sourceHash(ZH) };
+    expect(deliveryOf(message, 'ja')).toEqual({ ok: true, body: JA_TEXT, translated: true });
   });
 
   test('missing：没有译文（或只有空白），等待补译', async () => {
-    expect(await deliveryOf({ body: ZH }, 'ja')).toEqual({ ok: false, reason: 'awaiting_translation' });
-    expect(await deliveryOf({ body: ZH, lang: 'ja', translatedText: '   ', translatedFromHash: await bodyHash(ZH) }, 'ja'))
+    expect(deliveryOf({ body: ZH }, 'ja')).toEqual({ ok: false, reason: 'awaiting_translation' });
+    expect(deliveryOf({ body: ZH, lang: 'ja', translatedText: '   ', translatedFromHash: sourceHash(ZH) }, 'ja'))
       .toEqual({ ok: false, reason: 'awaiting_translation' });
   });
 
   test('stale：译文是按旧原文做的，哈希不一致，不发', async () => {
-    const message = { body: ZH, lang: 'ja', translatedText: JA_TEXT, translatedFromHash: await bodyHash('旧的原文') };
-    expect(await deliveryOf(message, 'ja')).toEqual({ ok: false, reason: 'awaiting_translation' });
+    const message = { body: ZH, lang: 'ja', translatedText: JA_TEXT, translatedFromHash: sourceHash('旧的原文') };
+    expect(deliveryOf(message, 'ja')).toEqual({ ok: false, reason: 'awaiting_translation' });
   });
 
   test('老板选过的语言优先于员工默认语言；没选过的消息跟着员工走，语言不同即等待补译', async () => {
-    expect(await deliveryOf({ body: ZH, lang: 'en', langChosen: true }, 'ja')).toEqual({ ok: false, reason: 'awaiting_translation' });
-    expect(await deliveryOf({ body: ZH, lang: 'en' }, 'ja')).toEqual({ ok: false, reason: 'awaiting_translation' });
-    expect(await deliveryOf({ body: ZH }, 'ja')).toEqual({ ok: false, reason: 'awaiting_translation' });
-    const stale = { body: ZH, lang: 'en', translatedText: EN_TEXT, translatedFromHash: await bodyHash(ZH) };
-    expect(await deliveryOf(stale, 'ja')).toEqual({ ok: false, reason: 'awaiting_translation' });
-    const chosen = { body: ZH, lang: 'en', langChosen: true, translatedText: EN_TEXT, translatedFromHash: await bodyHash(ZH) };
-    expect(await deliveryOf(chosen, 'ja')).toEqual({ ok: true, body: EN_TEXT, translated: true });
+    expect(deliveryOf({ body: ZH, lang: 'en', langChosen: true }, 'ja')).toEqual({ ok: false, reason: 'awaiting_translation' });
+    expect(deliveryOf({ body: ZH, lang: 'en' }, 'ja')).toEqual({ ok: false, reason: 'awaiting_translation' });
+    expect(deliveryOf({ body: ZH }, 'ja')).toEqual({ ok: false, reason: 'awaiting_translation' });
+    const stale = { body: ZH, lang: 'en', translatedText: EN_TEXT, translatedFromHash: sourceHash(ZH) };
+    expect(deliveryOf(stale, 'ja')).toEqual({ ok: false, reason: 'awaiting_translation' });
+    const chosen = { body: ZH, lang: 'en', langChosen: true, translatedText: EN_TEXT, translatedFromHash: sourceHash(ZH) };
+    expect(deliveryOf(chosen, 'ja')).toEqual({ ok: true, body: EN_TEXT, translated: true });
   });
 });
 
@@ -86,7 +87,7 @@ describe('生效语言 effectiveLangOf', () => {
   });
 
   test('投递与看板同一判定：选过原文的消息照发原文，即使员工有语言', async () => {
-    expect(await deliveryOf({ body: ZH, langChosen: true }, 'ja')).toEqual({ ok: true, body: ZH, translated: false });
+    expect(deliveryOf({ body: ZH, langChosen: true }, 'ja')).toEqual({ ok: true, body: ZH, translated: false });
   });
 });
 
@@ -149,11 +150,11 @@ describe('OutboundMessageStore.setTranslation', () => {
     const store = new OutboundMessageStore(db as never);
     const saved = await store.setTranslation('m1', 'ja', JA_TEXT, ZH, 'owner:test');
     expect(db.writes).toHaveLength(1);
-    expect(db.writes[0]!.vars).toMatchObject({ lang: 'ja', text: JA_TEXT, hash: await bodyHash(ZH), expectedBody: ZH });
+    expect(db.writes[0]!.vars).toMatchObject({ lang: 'ja', text: JA_TEXT, hash: sourceHash(ZH), expectedBody: ZH });
     expect(db.writes[0]!.sql).toContain("WHERE state != 'sent' AND body = $expectedBody");
     expect(db.writes[0]!.sql).not.toContain('edited_by');
     expect(db.writes[0]!.sql).not.toContain('edited_at');
-    expect(saved).toMatchObject({ lang: 'ja', translatedText: JA_TEXT, translatedFromHash: await bodyHash(ZH) });
+    expect(saved).toMatchObject({ lang: 'ja', translatedText: JA_TEXT, translatedFromHash: sourceHash(ZH) });
     expect(saved.editedBy).toBeUndefined();
   });
 
@@ -197,7 +198,7 @@ describe('OutboundMessageStore.prepareSend 与员工语言', () => {
   });
 
   test('员工有语言且译文就绪：返回译文，返回的 message 保持原行', async () => {
-    const hash = await bodyHash(ZH);
+    const hash = sourceHash(ZH);
     const db = fakeDb({ lang: 'ja', draft: messageRow({ lang: 'ja', translated_text: JA_TEXT, translated_from_hash: hash }) });
     const prepared = await new OutboundMessageStore(db as never).prepareSend('t1', 'execute', 'e1');
     expect(prepared!.body).toBe(JA_TEXT);
@@ -207,12 +208,12 @@ describe('OutboundMessageStore.prepareSend 与员工语言', () => {
   });
 
   test('员工有语言，原文已改（译文过期）：返回 null', async () => {
-    const db = fakeDb({ lang: 'ja', draft: messageRow({ body: '改过的原文', lang: 'ja', translated_text: JA_TEXT, translated_from_hash: await bodyHash(ZH) }) });
+    const db = fakeDb({ lang: 'ja', draft: messageRow({ body: '改过的原文', lang: 'ja', translated_text: JA_TEXT, translated_from_hash: sourceHash(ZH) }) });
     expect(await new OutboundMessageStore(db as never).prepareSend('t1', 'execute', 'e1')).toBeNull();
   });
 
   test('被老板保留的消息仍返回 null（与语言无关）', async () => {
-    const hash = await bodyHash(ZH);
+    const hash = sourceHash(ZH);
     const db = fakeDb({ draft: messageRow({ hold: true, state: 'held', lang: 'ja', translated_text: JA_TEXT, translated_from_hash: hash }) });
     expect(await new OutboundMessageStore(db as never).prepareSend('t1', 'execute', 'e1')).toBeNull();
   });
@@ -239,13 +240,13 @@ describe('OutboundMessageStore.awaitingTranslation：等待译文与老板放行
   });
 
   test('员工有语言且译文就绪：不等待', async () => {
-    const hash = await bodyHash(ZH);
+    const hash = sourceHash(ZH);
     const db = fakeDb({ lang: 'ja', draft: messageRow({ lang: 'ja', translated_text: JA_TEXT, translated_from_hash: hash }) });
     expect(await new OutboundMessageStore(db as never).awaitingTranslation('t1', 'execute', 'e1')).toBe(false);
   });
 
   test('原文已改、译文过期：仍等待译文', async () => {
-    const db = fakeDb({ lang: 'ja', draft: messageRow({ body: '改过的原文', lang: 'ja', translated_text: JA_TEXT, translated_from_hash: await bodyHash(ZH) }) });
+    const db = fakeDb({ lang: 'ja', draft: messageRow({ body: '改过的原文', lang: 'ja', translated_text: JA_TEXT, translated_from_hash: sourceHash(ZH) }) });
     expect(await new OutboundMessageStore(db as never).awaitingTranslation('t1', 'execute', 'e1')).toBe(true);
   });
 
@@ -279,14 +280,14 @@ describe('OutboundMessageStore.alignLanguage：派工前把语言对齐到员工
   });
 
   test('员工换了语言：旧语言的译文清掉，改成新员工的语言', async () => {
-    const db = fakeDb({ lang: 'ja', draft: messageRow({ lang: 'en', translated_text: EN_TEXT, translated_from_hash: await bodyHash(ZH) }) });
+    const db = fakeDb({ lang: 'ja', draft: messageRow({ lang: 'en', translated_text: EN_TEXT, translated_from_hash: sourceHash(ZH) }) });
     await new OutboundMessageStore(db as never).alignLanguage('t1', 'execute', 'e1');
     expect(db.writes).toHaveLength(1);
     expect(db.writes[0]!.vars).toMatchObject({ lang: 'ja' });
   });
 
   test('已经对齐：只读，不写库', async () => {
-    const db = fakeDb({ lang: 'ja', draft: messageRow({ lang: 'ja', translated_text: JA_TEXT, translated_from_hash: await bodyHash(ZH) }) });
+    const db = fakeDb({ lang: 'ja', draft: messageRow({ lang: 'ja', translated_text: JA_TEXT, translated_from_hash: sourceHash(ZH) }) });
     await new OutboundMessageStore(db as never).alignLanguage('t1', 'execute', 'e1');
     expect(db.writes).toEqual([]);
   });

@@ -12,6 +12,7 @@ import { company, notePaseo } from "./company";
 import { answerPermissionFor, pendingPermissionsFor, taskAttachmentsFor, taskAttachmentUrlFor } from "./owner-actions";
 import { isQaContext } from "./owner-context";
 import { refreshModels, refreshQuota } from "./dispatch";
+import { runnerStatusOf } from "./runner-status";
 import { serviceHome } from "./env";
 import * as rpc from "../shared/rpc";
 import type { Pulse, Roster } from "../shared/types";
@@ -55,6 +56,7 @@ export function registerHandlers(server: PluginServerContext): void {
   ownerHandle(rpc.autoUpgrade,async (input:RpcInput<typeof rpc.autoUpgrade>)=>(await company()).upgrades.setAuto(input.enabled,SOURCE));
   ownerHandle(rpc.upgrade, async (input: RpcInput<typeof rpc.upgrade>) => (await company()).upgrades.start(input,SOURCE));
   ownerHandle(rpc.brief, async () => (await company()).owner.brief());
+  ownerHandle(rpc.runnerStatus, async () => runnerStatusOf(await company()));
 
   ownerHandle(rpc.addDirection, async (input: RpcInput<typeof rpc.addDirection>) => {
     await (await company()).owner.addDirection({ text: input.text, source: SOURCE, key: input.key });

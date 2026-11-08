@@ -76,7 +76,7 @@ export async function refreshTranslations(cfg: Config, db: Surreal, options: Cro
   const store = new OutboundMessageStore(db);
   const pending: Array<OutboundMessage & { lang: string }> = [];
   for (const message of await store.list(undefined, false)) {
-    if (message.lang && !(await translationFresh(message))) pending.push({ ...message, lang: message.lang });
+    if (message.lang && !translationFresh(message)) pending.push({ ...message, lang: message.lang });
   }
   pending.sort((a, b) => failedAtOf(a) - failedAtOf(b));
   const result: TranslationSync = { translated: 0, failed: 0 };
