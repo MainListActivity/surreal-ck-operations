@@ -17,6 +17,9 @@
 | 置顶笔记 | `sck owner note.pin '{"noteId":"n1","pinned":true}'` |
 | 笔记生效 | `sck owner note.activate '{"noteId":"n1"}'` |
 | 删笔记 | `sck owner note.remove '{"noteId":"n1"}'` |
+| 整理笔记 | `sck owner note.consolidate '{"lane":"surreal_ck:qa","dryRun":true}'`（合并近似笔记，超出软目标 20 条时清理最旧的非置顶笔记；`dryRun` 只预览；不带 lane 整理全部线；实际整理写入一条可撤销的记录） |
+| 整理记录 | `sck owner note.consolidations '{"limit":20}'`（最近的整理，含逐条改前改后） |
+| 撤销整理 | `sck owner note.consolidation.undo '{"id":"c1"}'`（恢复该次整理的全部改动；之后又改过的笔记跳过并列出；同一次只能撤销一次） |
 | 任务链与消息 | `sck owner task.plan '{"taskId":"t1"}'`（父链回溯 + 下游全链任务与每任务消息） |
 | 路由列表 | `sck owner route.list '{}'` |
 | 保存路由 | `sck owner route.save '{"type":"software","label":"软件需求","executorRole":"engineering","reviewerRole":"qa","code":true,"next":"gate","hold":false}'`（拒绝同岗/未知岗/未启用 next/成环） |

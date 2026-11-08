@@ -3,6 +3,7 @@ import { RUNNER_BEAT_MS, writeBoardView, writeRunnerHeartbeat } from "./vendor/s
 import { openUserPaths, scratchKeepReason } from "./vendor/src/dispatcher/scratch-gc.ts";
 import { pruneOperationalData } from "./vendor/src/data-retention.ts";
 import { recordPendingTaskCosts } from "./vendor/src/task-cost.ts";
+import { consolidateDue } from "./vendor/src/lane-notes-consolidate.ts";
 import { settleCompanyTurn, TurnInterruptions } from "./turn-closeout";
 // Runs the company dispatcher tick loop inside the plugin subprocess and wakes it early on
 // Paseo lifecycle events, replacing the org.surrealck.company-dispatcher launchd service.
@@ -375,6 +376,13 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
     const pruned = await pruneOperationalData(ctx.db.db);
     if (Object.keys(pruned).length) console.log(`lifecycle gc data: ${JSON.stringify(pruned)}`);
   } catch (error) { console.warn(`lifecycle gc data failed: ${(error as Error).message}`); }
+
+  // Lane notes: merge near-duplicates and age out the oldest past the soft target, at most once a day. Each pass is
+  // recorded and can be undone from the console. A failed pass only warns; the next tick retries it.
+  try {
+    const consolidated = await consolidateDue(ctx.db.db, { now, actor: "system:consolidation" });
+    if (consolidated?.changes.length) console.log(`lifecycle gc notes: ${consolidated.changes.length} note changes recorded as ${consolidated.id}`);
+  } catch (error) { console.warn(`lifecycle gc notes consolidation failed: ${(error as Error).message}`); }
 
   if (cfg.archiveRetentionDays > 0) {
     const arch = await sweepArchiveBatches({

@@ -146,6 +146,26 @@ test('task.cost reads task cost for single task', async () => {
   expect(res).toEqual({ cost: fakeCost });
 });
 
+// ---- Lane-note consolidation commands ----
+test('note.consolidate previews or runs a pass for one lane or every lane, as the owner actor', async () => {
+  const { ctx, queries } = makeFakeCtx();
+  const preview = await ownerApi(ctx, { command: 'note.consolidate', lane: 'surreal_ck:qa', dryRun: true }, 'cli') as any;
+  expect(preview).toMatchObject({ dryRun: true, actor: 'owner:cli', lanes: [], changes: [] });
+  expect(queries.some(q => q.params?.lane === 'surreal_ck:qa')).toBe(true);
+  // Nothing to change, so the pass returns its plan without writing a record.
+  const all = await ownerApi(ctx, { command: 'note.consolidate' }, 'cli') as any;
+  expect(all).toMatchObject({ dryRun: false, actor: 'owner:cli', changes: [] });
+  expect(all.id).toBeUndefined();
+});
+
+test('note.consolidations passes the limit on; note.consolidation.undo needs an id and a recorded run', async () => {
+  const { ctx, queries } = makeFakeCtx();
+  expect(await ownerApi(ctx, { command: 'note.consolidations', limit: 5 }, 'cli')).toEqual({ consolidations: [] });
+  expect(queries.at(-1)?.params).toEqual({ limit: 5 });
+  await expect(ownerApi(ctx, { command: 'note.consolidation.undo' }, 'cli')).rejects.toMatchObject({ code: 'invalid' });
+  await expect(ownerApi(ctx, { command: 'note.consolidation.undo', id: 'c1' }, 'cli')).rejects.toMatchObject({ code: 'not_found' });
+});
+
 // ---- ITEM 4: Docs and code stay in sync ----
 test('docs/owner-api.md and both owner API layers stay in sync with zero duplicates', () => {
   const docContent = readFileSync(join(import.meta.dir, '../docs/owner-api.md'), 'utf8');

@@ -409,6 +409,7 @@ async function boot(){
   const x=await fetch('api/exchange',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pageToken:TOKEN})});
   const j=await x.json().catch(()=>({}));if(!x.ok)throw new Error(j.error||'exchange failed');OWNER=j.ownerToken;
   document.addEventListener('click',onCommand);
+  document.addEventListener('toggle',rememberOpen,true);
   // Unsaved words in a staff message survive the periodic refresh: the text is kept as it is typed.
   document.addEventListener('input',ev=>{const t=ev.target;if(t&&t.dataset&&t.dataset.edit)STAFF_EDITS.set(t.dataset.edit,t.value)});
   await load();setInterval(load,10000);
@@ -455,12 +456,13 @@ async function onCommand(ev){
   else if(cmd==='note-pin')pinNote(arg);
   else if(cmd==='note-activate')activateNote(arg);
   else if(cmd==='note-remove')removeNote(arg);
+  else if(cmd==='note-undo')undoConsolidation(arg);
 }
 async function load(){
   try{
-    // The board is read only while the staff tab is open.
-    const [pr,nt,g,t,m,i,d,s,n,bd]=await Promise.all([api('progress',{}).catch(e=>({error:e.message})),api('note.list',{}),api('route.list',{}),api('task.list',{}),api('message.list',{includeSent:true}),api('inbox',{}),api('def.list',{}),api('status',{}),api('notice.list',{}),T==='staff'?api('board.snapshot',{}).catch(e=>({error:e.message})):null]);
+    const [pr,nt,g,t,m,i,d,s,n,cs,bd]=await Promise.all([api('progress',{}).catch(e=>({error:e.message})),api('note.list',{}),api('route.list',{}),api('task.list',{}),api('message.list',{includeSent:true}),api('inbox',{}),api('def.list',{}),api('status',{}),api('notice.list',{}),api('note.consolidations',{limit:20}).catch(e=>({error:e.message})),T==='staff'?api('board.snapshot',{}).catch(e=>({error:e.message})):null]);
     PROGRESS=pr;NOTES=nt.notes||[];ROUTES=g.routes||[];TASKS=t.tasks||[];MESSAGES=m.messages||[];INBOX=i;DEFS=d.defs||[];NOTICES=n.notices||[];PAUSED=s.paused===true;if(bd)BOARD=bd;
+    CONSOLIDATIONS=cs.consolidations||[];CONSOLIDATION_ERROR=cs.error||'';
     const n2=(INBOX.gates||[]).length+(INBOX.questions||[]).length;const b=$('nav-count');if(b){b.textContent=n2;b.hidden=!n2}
     const rv=$('release-ver');if(rv)rv.textContent='控制面'+(INBOX.upgrades&&INBOX.upgrades.current?' · v'+INBOX.upgrades.current.version:'');
     $('stat').textContent=n2?('待办 '+n2):'运行中';$('stat').className='status'+(n2?' violet':'');
@@ -767,7 +769,9 @@ async function createTask(){
   await api('task.create',{type,title,requirement,acceptanceText,...(tag?{tag}:{}) ,...($('n-hold').checked?{hold:true}:{})});
   toast('已创建任务链');SEL=null;await load();
 }
-let NOTES=[],NLANE='';
+let NOTES=[],NLANE='',CONSOLIDATIONS=[],CONSOLIDATION_ERROR='';
+// Runs whose diff is expanded. The page redraws every ten seconds, so the open state is kept here, not in the DOM.
+const OPEN_RUNS=new Set();
 const noteId=n=>String(n.id?.id??n.id);
 function laneOfTask(t,role){const p=String(t.project?.id??t.project??'').replace(/^project:/,'');return (p||'company')+':'+role}
 function renderLaneNotes(){
@@ -780,7 +784,7 @@ function renderLaneNotes(){
     +(rows.length?rows.map(n=>'<article class="decision-card"><div class="card-top"><span class="type-label">'+esc(n.author)+'</span><span class="status '+(n.state==='active'?'success':'')+'">'+(n.state==='active'?'生效':'待生效')+(n.pinned?' · 置顶':'')+'</span></div><p>'+esc(n.text)+'</p><div class="row">'
       +(n.state==='proposed'?'<button class="primary" data-cmd="note-activate:'+esc(noteId(n))+'">生效</button>':'')
       +'<button data-cmd="note-edit:'+esc(noteId(n))+'">编辑</button><button data-cmd="note-pin:'+esc(noteId(n))+'">'+(n.pinned?'取消置顶':'置顶')+'</button><button data-cmd="note-remove:'+esc(noteId(n))+'">删除</button></div></article>').join(''):'<p class="meta">这条线还没有笔记</p>')
-    +'</div></div>';
+    +'</div>'+consolidationsHtml()+'</div>';
   $('drawer').innerHTML='<div class="kicker">NOTES</div><h2>添加笔记</h2><p class="meta">一条线 = 项目 × 职能。只记长期有效的要求、方法和坑，不记某次任务的结论。</p><div class="task-form">'
     +'<label>线<input id="n-lane" value="'+esc(NLANE)+'" placeholder="surreal_ck:qa"/></label>'
     +'<label>内容<textarea id="n-text"></textarea></label>'
@@ -796,6 +800,37 @@ async function saveNote(id){await api('note.edit',{noteId:id,text:$('n-edit').va
 async function pinNote(id){const n=NOTES.find(x=>noteId(x)===id);await api('note.pin',{noteId:id,pinned:!n?.pinned});await load()}
 async function activateNote(id){await api('note.activate',{noteId:id});toast('已生效');await load()}
 async function removeNote(id){await api('note.remove',{noteId:id});toast('已删除');await load()}
+function consolidationsHtml(){
+  const head='<div class="flow-head"><h2>最近整理</h2></div>';
+  if(CONSOLIDATION_ERROR)return head+'<p class="meta">整理记录加载失败：'+esc(CONSOLIDATION_ERROR)+'</p>';
+  if(!CONSOLIDATIONS.length)return head+'<p class="meta">还没有整理记录。相似的笔记会定期合并，超出软目标 20 条时清理最旧的非置顶笔记；每次整理都能在这里撤销。</p>';
+  return head+'<div class="decision-grid">'+CONSOLIDATIONS.map(consolidationCard).join('')+'</div>';
+}
+function consolidationCard(r){
+  const lanes=r.lanes||[];
+  const total=key=>lanes.reduce((sum,lane)=>sum+(lane[key]||0),0);
+  const changes=r.changes||[];
+  const skipped=r.undoSkipped||[];
+  const undone=!!r.undoneAt;
+  return '<article class="decision-card"><div class="card-top"><span class="type-label">'+esc(new Date(r.at).toLocaleString('zh-CN'))+' · '+esc(r.actor)+'</span><span class="status '+(undone?'':'success')+'">'+(undone?'已撤销':'已生效')+'</span></div>'
+    +'<p>合并 '+total('merged')+' 条，清理 '+total('agedOut')+' 条'+(total('rewritten')?'，改写 '+total('rewritten')+' 条':'')+'。线：'+esc(lanes.map(lane=>lane.lane).join('、'))+'</p>'
+    +(undone?'<p class="meta">已于 '+esc(new Date(r.undoneAt).toLocaleString('zh-CN'))+' 由 '+esc(r.undoneBy)+' 撤销</p>':'')
+    +'<details data-run="'+esc(r.id)+'"'+(OPEN_RUNS.has(r.id)?' open':'')+'><summary>逐条前后对比（'+changes.length+' 条）</summary><ul class="meta">'+changes.map(c=>'<li>'+changeLine(c)+'</li>').join('')+'</ul>'
+    +(skipped.length?'<p class="meta">撤销时跳过 '+skipped.length+' 条，它们之后又被改过：'+skipped.map(s=>esc(s.text||'（已不存在）')).join('；')+'</p>':'')+'</details>'
+    +(undone?'':'<div class="row"><button class="reject" data-cmd="note-undo:'+esc(r.id)+'">撤销</button></div>')+'</article>';
+}
+function changeLine(c){
+  const before='「'+esc(c.before.text)+'」';
+  if(c.reason==='rewritten')return '改写：'+before+' → 「'+esc(c.after.text)+'」';
+  if(c.reason==='merged')return '合并：'+before+' → 并入「'+esc(c.keptText)+'」';
+  return '清理：'+before+' → 移出生效';
+}
+async function undoConsolidation(id){
+  try{const r=await api('note.consolidation.undo',{id});const skipped=(r.skipped||[]).length;toast('已撤销：恢复 '+r.restored+' 条'+(skipped?'，跳过 '+skipped+' 条':''))}
+  catch(e){toast('撤销失败：'+e.message)}
+  await load();
+}
+function rememberOpen(ev){const d=ev.target;if(!d||!d.dataset||!d.dataset.run)return;if(d.open)OPEN_RUNS.add(d.dataset.run);else OPEN_RUNS.delete(d.dataset.run)}
 function renderRoutes(){
   $('flow-pane').innerHTML='<div class="flow-pane"><div class="flow-head"><h1>路由表</h1></div><div class="decision-grid">'
     +ROUTES.map(r=>'<article class="decision-card"><div class="card-top"><span class="type-label">'+esc(r.type)+'</span><span class="status '+(r.enabled?'success':'')+'">'+(r.enabled?'启用':'停用')+'</span></div><h3>'+esc(r.label)+'</h3><p class="byline">'+esc(r.executor_role)+' → '+esc(r.reviewer_role)+(r.next?' · 后续 '+esc(r.next):'')+(r.hold?' · hold':'')+(r.code?' · code':'')+'</p><div class="decision-actions"><button data-cmd="route-edit:'+esc(r.type)+'">编辑</button>'+(r.enabled?'<button class="reject" data-cmd="route-disable:'+esc(r.type)+'">停用</button>':'<button class="approve" data-cmd="route-enable:'+esc(r.type)+'">启用</button>')+'</div></article>').join('')+'</div></div>';

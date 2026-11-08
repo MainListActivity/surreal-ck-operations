@@ -12,6 +12,16 @@ const OWNER = 'surreal-ck-operations/issue-23/v1';
 const loadSchema = (file: string) =>
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'schema', file), 'utf8');
 
+/**
+ * 把 055 的占位符换成公司库的 JWKS 地址与签发方。两个值都不许含引号、反斜杠或空白（JWKS 必须是 http(s)），
+ * 免得配置值拼进 SurrealQL 后改写语句；错误信息不回显配置值。
+ */
+export function renderCompanyAccess(schema: string, jwksUrl: string, issuer: string): string {
+  if (!/^https?:\/\/[^'"\\\s]+$/.test(jwksUrl)) throw new Error('COMPANY_JWKS_URL 必须是 http(s) 地址，且不含引号、反斜杠或空白');
+  if (!/^[^'"\\\s]+$/.test(issuer)) throw new Error('COMPANY_ISSUER 不能含引号、反斜杠或空白');
+  return schema.replaceAll('{{COMPANY_JWKS_URL}}', () => jwksUrl).replaceAll('{{COMPANY_ISSUER}}', () => issuer);
+}
+
 /** Snapshot-build connections open at once across the process (SYS01 AC-D). A build that gets none within BUILD_QUEUE_MS is refused. */
 export const MAX_BUILD_CONNECTIONS = 4;
 const BUILD_QUEUE_MS = 2_000;
@@ -214,6 +224,21 @@ export class CompanyDatabase {
     // 053：线的笔记。只新增 lane_note 表，不改既有行；旧 release 读不到新表即忽略（RB01）。
     await this.db.query(loadSchema('053-lane-notes.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 53 WHERE schema_version < 53;');
+    // 054：线的笔记整理（合并、清理与可撤销的整理记录）。只新增 note_consolidation 表与 lane_note 的两个可选字段；
+    // 旧 release 读不到即忽略（RB01）。
+    await this.db.query(loadSchema('054-note-consolidation.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 54 WHERE schema_version < 54;');
+    // 公司库访问方式（编号 055）：只在 COMPANY_JWKS_URL 与 COMPANY_ISSUER 都配置时应用，否则跳过并留一行日志（本机模式）。
+    // 055 只新增访问方式与事件、不新增表，所以不推进 schema_version。
+    const { companyJwksUrl, companyIssuer } = this.config;
+    if (companyJwksUrl && companyIssuer) {
+      await this.db.query(renderCompanyAccess(loadSchema('055-access.surql'), companyJwksUrl, companyIssuer));
+    } else {
+      console.log('跳过公司库访问方式（055）：未同时配置 COMPANY_JWKS_URL 与 COMPANY_ISSUER，保持本机访问');
+    }
+    // 老板保护与员工策略（编号 056）：protected_command / agent_policy / ops_audit 三张新表与写入事件，本机与公司库都应用。
+    await this.db.query(loadSchema('056-command-guard.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 56 WHERE schema_version < 56;');
     // 057：老板看板的执行端心跳（编号 057，054-056 未用）。只新增 runner_heartbeat 表；旧 release 读不到即忽略（RB01）。
     await this.db.query(loadSchema('057-runner-heartbeat.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 57 WHERE schema_version < 57;');
