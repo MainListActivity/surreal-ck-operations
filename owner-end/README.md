@@ -152,8 +152,8 @@ bun run build                                  # 生成 public/app.js
 
 ### 审计
 
-- 写操作、员工的全部调用（含被拒绝的），以及老板的非只读命令，都写入 `ops_audit`。审计只存参数摘要（`args_digest`）和一句摘要（`summary`，不超过 500 字符），不存原文。
-- 只读命令不审计，否则看板的反复刷新会淹没真正的操作。只读判定是：`status`、`progress`、`brief`、`inbox`、`board.snapshot`、`db.read`、`translate.preview`、`idp.status`、`idp.user.list_agents`，以及以 `.list`、`.get`、`.detail`、`.preview`、`.plan`、`.consolidations`、`.records` 结尾的命令。
+- 写操作、员工的全部调用（含被拒绝的和只读的），以及老板的非只读命令，都写入 `ops_audit`。审计只存参数摘要（`args_digest`）和一句摘要（`summary`，不超过 500 字符），不存原文。
+- 老板的只读命令不审计，否则看板的反复刷新会淹没真正的操作。只读判定是：`status`、`progress`、`brief`、`inbox`、`board.snapshot`、`db.read`、`translate.preview`、`idp.status`、`idp.user.list_agents`，以及以 `.list`、`.get`、`.detail`、`.preview`、`.plan`、`.consolidations`、`.records` 结尾的命令。
 - 例外：`upgrade.list` 以 `.list` 结尾，因此也不审计。见「已知偏离」。
 
 ## 译文与投递
@@ -213,7 +213,7 @@ bun run build                                  # 生成 public/app.js
 3. **页面不用 cookie。** 页面用 PKCE 取得访问令牌，令牌只放在页面内存里，并同步到 `sessionStorage`（键 `sck.owner.session`），不用 localStorage。所有接口只认 `Authorization: Bearer`。
 4. **派工译文门在看板侧未计入。** 调度器派工前会等待译文，但看板上的“可接”判断还没有计入这个条件。所以看板可能显示“可接”，而调度器暂不派工。这一项与 W3-RUNNER 的改动可能冲突，合并前需要核对。
 5. **`upgrade.list` 不审计。** 它以 `.list` 结尾，按只读命令处理。测试已锁定这一行为。
-6. **员工只读命令的审计标签。** 员工的只读命令经老板接口执行（`via=agent`），审计里的操作人标签是 `owner:agent`。是否改成员工自己的标签，待 review 确认。
+6. **员工只读命令的审计标签。** 员工的只读命令经老板接口的核心执行（`via=agent`），审计行记录的是员工身份（`actorKind=agent`）。核心对写操作使用的标签 `owner:agent` 目前不会出现，因为员工白名单里没有写命令。若将来开放员工写命令，需要复核网关与核心两层审计是否重复。
 7. **译文没有用真实服务验证。** 测试和截图用的是本地替身，译文形如 `[EN stub] 原文`。译文质量、延迟和费用需要接入真实译文服务后再验证。
 8. **`wrangler.jsonc` 指向生产库。** 本地开发必须用 `.dev.vars` 覆盖，见「本地开发」。
 9. **390px 下导航条横向滚动。** 这是设计如此，没有改。
