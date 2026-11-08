@@ -95,7 +95,8 @@ run('outbound 消息认领：两个执行端并发 markSent 同一条消息，�
 });
 
 run('运维作业认领：两个执行端并发 drain 同一 queued 作业，opsCall 只执行一次', async () => {
-  await dbA.db.query("CREATE ops_job:claim_race CONTENT { command: 'ops_info', input: {}, actor_kind: 'agent', actor: 'agent-1', task: 'task-claim', state: 'queued', created_at: time::now() };");
+  // 作业字段按 058：input 为 JSON 文本，task 为 task 记录（bootstrap 已应用 058，对象形状会被类型拒绝）。
+  await dbA.db.query("CREATE ops_job:claim_race CONTENT { command: 'ops_info', input: '{}', actor_kind: 'agent', actor: 'agent-1', task: task:⟨task-claim⟩, state: 'queued', created_at: time::now() };");
   const calls: string[] = [];
   const deps = (name: string, db: CompanyDatabase): OpsJobDeps => ({
     db: db.db, runner: name, runnerOnlyCommands: new Set<string>(),
