@@ -6,6 +6,8 @@ import { RecordId } from 'surrealdb';
 import { CompanyDatabase } from '../src/database.ts';
 import { LaneNoteStore, type LaneNote } from '../src/lane-notes.ts';
 import { consolidateDue, consolidateLane, listConsolidations, undoConsolidation, type ConsolidationOptions } from '../src/lane-notes-consolidate.ts';
+import { OutboundMessageStore } from '../src/outbound-messages.ts';
+import { ownerApi } from '../src/owner-api.ts';
 import { A, B, C, DISTINCT, MERGED, UNRELATED } from './support/lane-note-fixtures.ts';
 
 setDefaultTimeout(60000);
@@ -219,6 +221,27 @@ run('a note edited between an undo\'s check and its write cancels that undo, and
   const retry = await undo(result.id!);
   expect(retry.restored).toBe(1);
   expect(retry.skipped).toEqual([{ note: a.id, lane, reason: 'changed_after_run', text: '撤销前又改过' }]);
+});
+
+run('owner commands preview, run, list and undo a consolidation', async () => {
+  const lane = 'cons-owner:qa';
+  await add(lane, A, 1);
+  await add(lane, B, 2);
+  await add(lane, C, 3);
+  const ctx = { db, core: undefined, owner: {}, workforce: {}, messages: new OutboundMessageStore(db.db), opsRepo: '/tmp/ops' } as never;
+  const command = (input: Record<string, unknown>) => ownerApi(ctx, input, 'web');
+  const preview = await command({ command: 'note.consolidate', lane, dryRun: true }) as { id?: string; dryRun: boolean; changes: unknown[] };
+  expect(preview).toMatchObject({ dryRun: true, changes: [expect.anything(), expect.anything()] });
+  expect(preview.id).toBeUndefined();
+  expect(await texts(lane)).toEqual([A, B, C].sort());
+  const ran = await command({ command: 'note.consolidate', lane }) as { id: string; actor: string; dryRun: boolean };
+  expect(ran).toMatchObject({ actor: 'owner:web', dryRun: false });
+  expect(await texts(lane)).toEqual([C]);
+  const { consolidations } = await command({ command: 'note.consolidations', limit: 100 }) as { consolidations: Array<{ id: string }> };
+  expect(consolidations.map(item => item.id)).toContain(ran.id);
+  const undone = await command({ command: 'note.consolidation.undo', id: ran.id }) as { restored: number; skipped: unknown[] };
+  expect(undone).toMatchObject({ id: ran.id, restored: 2, skipped: [] });
+  expect(await texts(lane)).toEqual([A, B, C].sort());
 });
 
 run('the daily pass runs when a day has passed since its last check, and not before', async () => {
