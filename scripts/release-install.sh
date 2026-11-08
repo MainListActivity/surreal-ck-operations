@@ -113,7 +113,7 @@ build_snapshot() {
 fail() {
   fl_reason=$1
   if [ "$SWITCHED" = 1 ] && [ -n "$PREVIOUS" ]; then
-    echo "切换后失败（$fl_reason），尝试恢复上一版本" >&2
+    echo "切换后失败（${fl_reason}），尝试恢复上一版本" >&2
     if sh "$target/scripts/company-service.sh" install "$PREVIOUS" && verify_release "$PREVIOUS"; then
       printf '结果: 失败 原因=%s；已恢复上一版本 sha=%s\n' "$fl_reason" "$(basename "$PREVIOUS")"
     else
@@ -129,7 +129,7 @@ fail() {
 if [ "${SCK_RELEASE_INSTALL_DRY_RUN:-0}" = 1 ]; then
   echo "演练：提交 $sha 的安装步骤，只打印，不改动任何东西"
   echo '步骤 1：校验版本（提交须已在 origin/main 上，版本高于现役版本，company-release.json 与 package.json 一致）'
-  echo "步骤 2：生成固定快照 $target（git archive、复制现役 node_modules、vendor.sh；已存在且与提交一致则复用）"
+  echo "步骤 2：生成固定快照 ${target}（git archive、复制现役 node_modules、vendor.sh；已存在且与提交一致则复用）"
   echo '步骤 3：安装依赖并类型检查（根与 plugin 的 pnpm install --frozen-lockfile，plugin 加 --ignore-scripts；typecheck）'
   echo '步骤 4：本机发布门禁（comm-slow-pipe、sidecar-review；0.3.76 起加 recovery-fork）'
   echo '步骤 5：确认派工已暂停（需要 SCK_RELEASE_DISPATCH_PAUSED=1）'
@@ -140,7 +140,7 @@ if [ "${SCK_RELEASE_INSTALL_DRY_RUN:-0}" = 1 ]; then
   fi
   echo "步骤 7：切换现役版本：sh $target/scripts/company-service.sh install $target"
   echo '步骤 8：验证（现役指向、快照内容、vendor schema、插件来源、健康检查）；切换后失败则恢复上一版本'
-  echo "结果: 演练完成 sha=$sha，未改动任何东西"
+  echo "结果: 演练完成 sha=${sha}，未改动任何东西"
   exit 0
 fi
 

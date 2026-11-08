@@ -16,6 +16,8 @@
     // 每分钟：agent 身份同步与译文补译；每天 19:30（UTC）：笔记整理。两条按表达式分派，见 src/cron.ts。
     "crons": ["* * * * *", "30 19 * * *"]
   },
+  // 老板端域名：自定义域名（Cloudflare 自动建 DNS 与证书）。
+  "routes": [{ "pattern": "company.maplayer.top", "custom_domain": true }],
   "observability": {
     "enabled": true
   },
@@ -32,6 +34,9 @@
     "VIEWER_CLIENT_ID": "4cf2c95a-eba3-4c1a-a8ee-b91ac3182019",
     "COMPANY_DB_URL": "wss://data.maplayer.top/rpc",
     "COMPANY_NS": "company",
-    "COMPANY_DB": "main"
+    "COMPANY_DB": "main",
+    // 译文服务：远程 magpie 的 OpenAI 兼容入口与模型（密钥在 secret 里）。
+    "MAGPIE_BASE_URL": "https://data.maplayer.top/ofm/v1",
+    "MAGPIE_MODEL": "auto/deepseek-v4.1-flash"
   }
 }
