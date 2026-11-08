@@ -214,6 +214,9 @@ export class CompanyDatabase {
     // 053：线的笔记。只新增 lane_note 表，不改既有行；旧 release 读不到新表即忽略（RB01）。
     await this.db.query(loadSchema('053-lane-notes.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 53 WHERE schema_version < 53;');
+    // 057：老板看板的执行端心跳（编号 057，054-056 未用）。只新增 runner_heartbeat 表；旧 release 读不到即忽略（RB01）。
+    await this.db.query(loadSchema('057-runner-heartbeat.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 57 WHERE schema_version < 57;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

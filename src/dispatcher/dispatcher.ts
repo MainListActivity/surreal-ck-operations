@@ -680,14 +680,15 @@ async function boardOf(p: PassInputs, opts: SnapshotOpts, verdicts: readonly Dis
     const exclusion = !review ? undefined : p.exclusions?.has(task.id) ? p.exclusions.get(task.id)
       : await readReviewExclusion(wf, task, opts.log);
     if (review && exclusion === undefined) {
-      queue.push({ taskId: task.id, title: task.title, phase, role, blocked: true, body: '历史读取失败，待重判' });
+      queue.push({ taskId: task.id, title: task.title, phase, role, blocked: true, eligible: false, body: '历史读取失败，待重判' });
       continue;
     }
     const blocked = gate !== undefined || (verdict !== undefined && !verdict.dispatchable);
     const verdictText = verdict && !verdict.dispatchable && verdict.reasons.length ? verdict.reasons.map(reason => reason.text).join('；') : undefined;
-    queue.push({ taskId: task.id, title: task.title, phase, role, blocked,
-      body: gate?.text ?? verdictText ?? (review ? '待复核，等待派工' : '依赖已解锁，等待派工') });
     const entries = staffingPool({ ...base, role, home: task.repoPath ?? opts.opsRepo, task, excludeSubmitter: review, exclusion });
+    // Reachable: some candidate, an existing employee or a seat to spawn one, may take the item in this pass.
+    queue.push({ taskId: task.id, title: task.title, phase, role, blocked, eligible: !blocked && entries.some(entry => entry.eligible),
+      body: gate?.text ?? verdictText ?? (review ? '待复核，等待派工' : '依赖已解锁，等待派工') });
     for (const entry of entries) {
       if (entry.kind !== 'reuse' || !entry.inst) continue;
       if (!entry.eligible && entry.code && BOARD_NEVER.has(entry.code)) continue;
@@ -762,6 +763,17 @@ export class Dispatcher {
     } catch { this.messages = undefined; }
     return this.messages;
   }
+  /** Drafts the next message of each queued task (idempotent). A failure is logged; the send path still creates what it needs. */
+  private async draftQueued(taskIds: string[]): Promise<void> {
+    const store = this.messageStore();
+    if (!store || taskIds.length === 0) return;
+    try {
+      await store.ensureQueuedDrafts(taskIds);
+    } catch (error) {
+      this.log(`queued message drafts failed: ${(error as Error).message}`);
+    }
+  }
+
   /**
    * The dispatch message is the latest draft's body, rendered with the receiving employee's real paths.
    * A held message raises the owner notice and returns null; no claim should be taken for it.
@@ -1299,6 +1311,8 @@ export class Dispatcher {
       ...tasks.filter(t => (t.state === 'ready' || t.state === 'doing') && !t.currentEmployee)
         .map(t => ({ task: t, role: t.executorRole as string, purpose: 'execute' as const })),
     ];
+    // The owner board shows each queued item's message, so its draft exists before the first dispatch (a rework message included).
+    await this.draftQueued(work.map(item => item.task.id));
     // Episodes of work that left the queue end here, before any pass-wide gate below returns early.
     await this.endStaleEpisodes(tasks, new Set(work.map(item => `${item.task.id}:${item.purpose}`)));
     const ownerBlocked: SupervisedTask[] = []; // owner retired: blocked-to-owner waits for the boss in the owner inbox

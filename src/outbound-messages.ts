@@ -24,6 +24,9 @@ export interface OutboundMessage {
 
 const STEPS: readonly MessageStep[] = ['execute', 'review', 'rework', 'nudge', 'eval', 'notice'];
 
+/** A record id's key; a plain value stands for itself. */
+const keyOf = (value: unknown): string => String((value as RecordId | undefined)?.id ?? value ?? '');
+
 const rowView = (row: Record<string, unknown>): OutboundMessage => ({
   id: String((row.id as RecordId).id ?? row.id), taskId: String((row.task as RecordId)?.id ?? row.task ?? ''),
   step: String(row.step) as MessageStep, role: String(row.role ?? ''), body: String(row.body ?? ''),
@@ -129,7 +132,7 @@ export class OutboundMessageStore {
     const row = rows?.[0];
     if (!row) throw await this.refusal(msg);
     // A released message has been waiting in the owner inbox; close the notice in the same command.
-    if (!hold) await this.resolveHoldNotice(row.taskId, row.step);
+    if (!hold) await this.resolveHoldNotice(row.task, row.step);
     return rowView(row);
   }
 
@@ -157,23 +160,55 @@ export class OutboundMessageStore {
     const draft = await this.latestDraft(taskId, step);
     if (!draft) {
       // 旧任务没有草稿：按模板即时生成一条，保证派工正文永远来自这张表。
-      const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
-        `SELECT executor_role, reviewer_role, kind, work_intent FROM $task;`, { task: this.task(taskId) });
-      const row = rows?.[0] as { work_intent?: { kind?: string }; kind?: string; reviewer_role?: string; executor_role?: string } | undefined;
-      // 复核与执行看同一个代码工作标记：review 草稿缺失时也要按工作种类选模板。
-      const code = (step === 'execute' || step === 'rework' || step === 'review') &&
-        (row?.work_intent?.kind === 'code' || ['release', 'deploy'].includes(String(row?.kind ?? '')));
-      const role = step === 'review' ? String(row?.reviewer_role ?? 'qa') : String(row?.executor_role ?? 'engineering');
-      // A re-dispatch of the same step (lease expired, instance replaced) repeats what was last sent, so an owner edit survives.
-      const [sent] = await this.db.query<[Array<{ body?: string }>]>(
-        `SELECT body, created_at FROM outbound_message WHERE task = $task AND step = $step AND state = 'sent' ORDER BY created_at DESC LIMIT 1;`,
-        { task: this.task(taskId), step });
-      const fresh = await this.createDraft(taskId, step, role, code, step === 'review' ? 'review' : 'doing', sent?.[0]?.body);
+      const fresh = await this.seedDraft(taskId, step);
       if (fresh.hold) return null;
       return { body: fresh.body, message: { ...fresh, sentTo: employeeId } };
     }
     if (draft.hold || draft.state === 'held') return null;
     return { body: draft.body, message: { ...draft, sentTo: employeeId } };
+  }
+
+  /**
+   * Gives each queued task its next step's draft before the owner board reads it, so a rework message exists from the moment its
+   * task is queued, not only at its first dispatch. Idempotent: a step with an unsent draft is left alone. The step is the one the
+   * next dispatch sends (stepOfTask over the task state and its returns).
+   */
+  async ensureQueuedDrafts(taskIds: readonly string[]): Promise<void> {
+    if (taskIds.length === 0) return;
+    const ids = taskIds.map(id => this.task(id));
+    const [tasks, returns, drafts] = await Promise.all([
+      this.db.query<[Array<{ id: unknown; state: string }>]>('SELECT id, state FROM task WHERE id IN $ids;', { ids }).then(r => r[0] ?? []),
+      this.db.query<[Array<{ task: unknown }>]>("SELECT task FROM audit WHERE task IN $ids AND action IN ['return', 'owner_reject'];", { ids })
+        .then(r => r[0] ?? []),
+      this.db.query<[Array<{ task: unknown; step: string }>]>("SELECT task, step FROM outbound_message WHERE task IN $ids AND state != 'sent';", { ids })
+        .then(r => r[0] ?? []),
+    ]);
+    const returned = new Set(returns.map(row => keyOf(row.task)));
+    const have = new Set(drafts.map(row => `${keyOf(row.task)}:${row.step}`));
+    for (const task of tasks) {
+      const taskId = keyOf(task.id);
+      const step = stepOfTask(task.state, returned.has(taskId));
+      if (!have.has(`${taskId}:${step}`)) await this.seedDraft(taskId, step);
+    }
+  }
+
+  /**
+   * The draft a step gets when it has none: the template, or what was last sent for the same step, so an owner edit survives a
+   * re-dispatch. The send path and the queue both create drafts here, so they produce the same text.
+   */
+  private async seedDraft(taskId: string, step: MessageStep): Promise<OutboundMessage> {
+    const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
+      `SELECT executor_role, reviewer_role, kind, work_intent FROM $task;`, { task: this.task(taskId) });
+    const row = rows?.[0] as { work_intent?: { kind?: string }; kind?: string; reviewer_role?: string; executor_role?: string } | undefined;
+    // 复核与执行看同一个代码工作标记：review 草稿缺失时也要按工作种类选模板。
+    const code = (step === 'execute' || step === 'rework' || step === 'review') &&
+      (row?.work_intent?.kind === 'code' || ['release', 'deploy'].includes(String(row?.kind ?? '')));
+    const role = step === 'review' ? String(row?.reviewer_role ?? 'qa') : String(row?.executor_role ?? 'engineering');
+    // A re-dispatch of the same step (lease expired, instance replaced) repeats what was last sent, so an owner edit survives.
+    const [sent] = await this.db.query<[Array<{ body?: string }>]>(
+      `SELECT body, created_at FROM outbound_message WHERE task = $task AND step = $step AND state = 'sent' ORDER BY created_at DESC LIMIT 1;`,
+      { task: this.task(taskId), step });
+    return this.createDraft(taskId, step, role, code, step === 'review' ? 'review' : 'doing', sent?.[0]?.body);
   }
 
   async markSent(messageId: string, employeeId: string, body: string): Promise<{ body: string; message: OutboundMessage }> {
