@@ -31,6 +31,7 @@ import { companyBlock, companyParts } from './company-context.ts';
 import type { AdminSummary, CompanyPart, ContextView, HistoryPageView, PageInfo, ReferencesCut, TaskTextSegment, WorktreePageView, WorktreeRefsSegment } from './contracts.ts';
 import { CLEANUP_BUDGET_MS, SnapshotStore, type SnapshotBuildStats, type SnapshotHeader, type SnapshotKind, type SnapshotLimits, untilAt } from './snapshot-store.ts';
 import { arrivedAt } from './reply-clock.ts';
+import { HANDOVER_ROWS, HANDOVER_OPS_ROWS } from './handover-window.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 import { FaultStore, type FaultCredential, type FaultReportResult, type FaultReserveResult } from './fault-store.ts';
 import {
@@ -315,13 +316,6 @@ const COMPLETE_TASK_ROWS = 500;
 const COMPLETE_HISTORY_ROWS = 1000;
 /** How long a policy_plan cursor stays valid (SYS06 R1(b)): long enough to walk the pages of one plan, short enough that a stale plan is rerun. */
 const POLICY_PLAN_CURSOR_TTL_MS = 30 * 60_000;
-/**
- * A claim reads at most this many of its task's newest protocol entries and newest ops entries for the handover (SYS01 R3).
- * The whole history is counted, so a claim that read less says so: historyComplete is false and historyCount is the total.
- * The echo of the claim fits as many of the entries it was given as the budget allows; get_task_history pages the rest.
- */
-const HANDOVER_ROWS = 60;
-const HANDOVER_OPS_ROWS = 20;
 
 type AuditHistoryRow = { id: RecordId; action: string; actor: unknown; evidence?: string | null; version?: number; cat: string };
 interface WorktreeCompact { worktreePath: string; releasedReferences: number; referencesTruncated?: ReferencesCut; [key: string]: unknown }

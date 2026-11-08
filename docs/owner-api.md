@@ -54,6 +54,8 @@
 | 取消放行标记 | `sck owner message.release '{"messageId":"m1"}'` |
 | 放行 | `sck owner message.send '{"messageId":"m1"}'` |
 | 消息记录 | `sck owner message.records '{}'` |
+| 按员工看到的原文编辑待发消息 | `sck owner message.edit_rendered '{"messageId":"m1","employeeId":"e1","rendered":"先读 …/notes.md。完成 …/task.md 中的需求…"}'` |
+| 老板看板：每人现在、接下来、待发消息原文，未派员工的排队，最近动态，执行端心跳 | `sck owner board.snapshot '{}'` |
 | 列出编制 | `sck owner def.list '{}'` |
 | 新建/修改编制 | `sck owner def.ensure '{"id":"eng-1","role":"engineering","provider":"codex","model":"auto:sol"}'` |
 | 停用编制 | `sck owner def.disable '{"id":"eng-1","reason":"缩编"}'` |

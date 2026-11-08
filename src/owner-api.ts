@@ -11,7 +11,9 @@ import type { CompanyDatabase } from './database.ts';
 import { OwnerDesk } from './owner.ts';
 import type { CompanyCore } from './contracts.ts';
 import { Workforce } from './workforce.ts';
-import { OutboundMessageStore } from './outbound-messages.ts';
+import { OutboundMessageStore, type OutboundMessage } from './outbound-messages.ts';
+import { bodyOfDispatch, unrenderMessage } from './outbound-render.ts';
+import { findingsFileOf, readBoard, readBoardView, renderContextFor } from './board.ts';
 import { CompanyError } from './core-errors.ts';
 import { ROLES, type CreateTask, type Role } from './contracts.ts';
 import { HASH, REQUIRED_TRACKS } from './core.ts';
@@ -38,6 +40,33 @@ const strArray = (value: unknown): string[] => Array.isArray(value) ? value.filt
  * A process without an execution host (a Worker, for one) answers them with CompanyError('unavailable').
  */
 export const RUNNER_ONLY_COMMANDS: ReadonlySet<string> = new Set(['upgrade.list', 'upgrade.automatic', 'upgrade.start']);
+
+/**
+ * The owner edits the text an employee would receive: the board's outbox text, which is the stored body rendered with that employee's
+ * paths. The edit is reversed to the stored body and saved only when that body renders back to the edited text, so the employee never
+ * reads a path or tool name the owner did not see on the board. The workdir line belongs to the claim and is not part of the edit.
+ */
+async function editRenderedMessage(ctx: OwnerApiContext,
+  input: { messageId: string; employeeId: string; rendered: string; actor: string }): Promise<OutboundMessage> {
+  const message = await ctx.messages.get(input.messageId);
+  if (!message) throw new CompanyError('not_found', 'message not found');
+  if (message.state === 'sent') throw new CompanyError('conflict', 'conflict: message already sent');
+  const db = ctx.db.db;
+  const task = new RecordId('task', message.taskId);
+  const [rows] = await db.query<[Array<{ acceptance_criteria?: unknown }>]>('SELECT acceptance_criteria FROM $task;', { task });
+  if (!rows?.[0]) throw new CompanyError('not_found', 'task not found');
+  // The board shows only the draft of the step the next dispatch sends; an older step's draft is not what the employee would read.
+  const next = await ctx.messages.nextStep(message.taskId);
+  if (next !== message.step) throw new CompanyError('conflict', 'conflict: message is not the next one of its task');
+  const view = await readBoardView(db);
+  if (!view) throw new CompanyError('temporarily_unavailable', 'temporarily_unavailable: owner board not written yet');
+  const renderCtx = renderContextFor(view, input.employeeId, { taskId: message.taskId, step: message.step,
+    acceptanceCriteria: rows[0].acceptance_criteria, findingsFile: await findingsFileOf(db, task) });
+  if (!renderCtx) throw new CompanyError('not_found', 'employee not found on the owner board');
+  const body = unrenderMessage(bodyOfDispatch(input.rendered), renderCtx);
+  if (body === undefined) throw new CompanyError('invalid', 'rendered text invalid: a path or tool name differs from what the board shows');
+  return ctx.messages.edit(input.messageId, body, input.actor);
+}
 
 /** Every command is a flat JSON object: { command, ...args }. */
 export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unknown>, via: OwnerVia): Promise<unknown> {
@@ -228,6 +257,12 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       const [rows] = await db.query<[unknown[]]>("SELECT * FROM outbound_message WHERE state = 'sent' ORDER BY sent_at DESC LIMIT 300;");
       return { records: rows };
     }
+
+    case 'message.edit_rendered': return editRenderedMessage(ctx, { messageId: text(input.messageId, 'messageId'),
+      employeeId: text(input.employeeId, 'employeeId'), rendered: text(input.rendered, 'rendered', 1, 20000), actor: a });
+
+    // ---- 老板看板 ----
+    case 'board.snapshot': return readBoard(db, { now: typeof input.now === 'number' ? input.now : undefined });
 
     // ---- 编制 ----
     // ---- 线的笔记 ----
