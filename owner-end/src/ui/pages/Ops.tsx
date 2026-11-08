@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'preact/hooks';
+import { COMMAND_CATALOG } from '../../command-catalog.ts';
 import { outcomeText, runCommand } from '../api.ts';
 import { Empty, NoticeLine, Panel, Pre, timeText, useAction } from '../common.tsx';
-import { parseJsonObject } from '../model.ts';
+import { catalogGroups, catalogTags, parseJsonObject } from '../model.ts';
 
 interface JobRow {
   id: string;
@@ -41,6 +42,7 @@ const CLIENT_ROLES = ['gateway', 'viewer', 'automation', 'runner', 'migrator', '
 export function OpsPage() {
   return (
     <div class="page">
+      <CommandPanel />
       <JobsPanel />
       <AuditPanel />
       <ReadSqlPanel />
@@ -48,6 +50,39 @@ export function OpsPage() {
       <CfApiPanel />
       <DbWritePanel />
     </div>
+  );
+}
+
+// ---- 命令面板：网关全部命令的用途与参数，只展示不执行 ----
+
+function CommandPanel() {
+  const [query, setQuery] = useState('');
+  const groups = catalogGroups(COMMAND_CATALOG, query);
+  return (
+    <Panel title="命令面板" hint="网关的全部命令与参数。这里只展示，不执行。员工经 company_cmd 调用的也是这些命令，高危命令应先确认保护清单。">
+      <label class="field">
+        <span>搜索（命令名、用途或分组）</span>
+        <input value={query} onInput={e => setQuery(e.currentTarget.value)} />
+      </label>
+      {groups.length === 0 ? <Empty>没有匹配的命令</Empty> : null}
+      {groups.map(view => (
+        <details key={view.group} open={query.trim() !== ''}>
+          <summary>{view.group}（{view.commands.length}）</summary>
+          <ul class="list compact">
+            {view.commands.map(spec => (
+              <li key={spec.command} class="row">
+                <div class="row-main">
+                  <code>{spec.command}</code>
+                  <span>{spec.title}</span>
+                  {catalogTags(spec).map(tag => <span key={tag} class={tag === '高危' ? 'tag danger' : 'tag'}>{tag}</span>)}
+                </div>
+                <div class="hint">参数：{spec.params}</div>
+              </li>
+            ))}
+          </ul>
+        </details>
+      ))}
+    </Panel>
   );
 }
 
