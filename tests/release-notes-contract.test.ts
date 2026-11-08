@@ -38,7 +38,7 @@ describe('the release notes are registrable', () => {
 
   test('the notes name the schema they add', () => {
     const text = JSON.stringify(notes);
-    expect(text).toContain('058');
+    expect(text).toContain('059');
   });
 
   test('the limits are real: an eleventh change or a long one is refused', () => {
