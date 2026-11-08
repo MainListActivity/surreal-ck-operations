@@ -249,3 +249,40 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME
 - 演练 B（GitHub #35）：codex 并发临时设为 0，调度器按定义新开 `cs-grok-9d59da`；它存下 ALPHA 进度后会话被强制归档。约 25 秒内调度器退役该实例并撤销凭证、收回租约并附交接包、新开 `cs-grok-580043` 接手；接手者读到 ALPHA 与交接包，跳过已完成步骤存下 BETA 并提交；`qa-grok-5dfd5a` 独立验收通过。旧凭证调用返回 401。
 - 未在真实环境演练的路径：真实订阅额度耗尽（错误文本分类、冷却与探测恢复由集成测试用模拟网关覆盖），所有订阅耗尽时的充值提醒。
 - 2026-10-26：GitHub 计费拒绝不再算 CI 失败（来源 PR #1713 → main `fcbc828`，发布 `releases/fcbc828…`，active 与插件来源同为该 SHA）。GitHub 因账户付款失败或触及支出上限而拒绝启动作业时，检查以 `failure` 结束但**一个步骤都没跑**，两道门禁此前只看结论，于是交付被一个与代码无关的原因永久卡住。现在 `pr-gate` 判定前先向 GitHub 问该检查是不是它自己拒绝启动的：只有同时满足「检查带 job 链接」「该 job `steps` 为空」「注解确为 GitHub 的拒绝文案（account payments / spending limit / Billing & plans）」才豁免；没有 job 链接、跑过任何步骤、注解或作业读不到一律照旧按失败处理（工作流无法伪造：打印注解必须跑步骤）。验收适配器对「全部作业都没启动」的 run 放行通用 CI criteria，并把拒绝事实写进证据 `source.infrastructure{reason,message,jobs}`；**声明 environment 的 criteria 永不豁免**——环境是部署事实，从未启动的 run 证明不了任何部署。同时按老板指示简化员工提示词：`src/flows.ts` 与 `agents/engineering.md` 不再要求员工确认 PR 的 CI 通过、等 CI 发布完成或复核 CI，门禁只保留在公司系统里。CI 两个工作流因计费仍未启动，如实记录，未改账单、未动检查状态。`fcbc828` 验收：根/插件 typecheck 退出 0；test:comm 19 通过/1 跳过；test:service 53 通过/0 失败；test:bridge 1079 通过/58 跳过/0 失败；新增用例覆盖豁免与三个负例（跑过步骤的作业、不含计费文案的注解、声明 environment 的 criteria 均仍拒绝）；两道本机发布门禁 comm-slow-pipe 与 sidecar-review 在 bun 1.4.2 下 pass。上线后用**生产代码**对 PR #1713 的真实计费拒绝数据实测：插件面 `createSubmitCheck` 返回 head 而非拒收；核心适配器对通用 CI criteria 返回 `ok` 并记 `source.infrastructure{reason:billing}`；对声明 `production` 的同一 run 仍拒绝；对照（不向 GitHub 询问）仍以「CI 未通过（channel、quality）」拒收——豁免只在真的读不到拒绝时失效，方向安全。上线后 MCP 进程 `state = running`，插件已重指到新 release，派工 tick 持续（10:05:37Z 仍有 owner notice 落库）。
+
+## 远程 VPS 授权（remote grant）
+
+给远程 VPS 上的 AI 发一次性兑换码：VPS 用它换到某个测试账号的 IdP token（access ≤1h、refresh 可续期、绝对期 ≤31 天），读写测试 workspace 并可直接写/发布平台内容。VPS 不拿任何数据库/root 凭证；checkpoint/submit 仍走本地。
+
+### 配置
+
+`admin project broker <project> <env> <file.json>` 的 broker 配置加 `remote` 块（写入时校验）：
+
+```json
+{ "remote": { "clientId": "<remote public client_id>", "testManagerAlias": "QA_MGR", "codeTtlHours": 168 } }
+```
+
+`testManagerAlias` 是已建好的运营账号别名（有 test.manage 能力，经 `PLATFORM_OPERATOR_TEST_MANAGERS` 或 ops API 授予）。`codeTtlHours` 兑换码有效期，默认 168h、上限 168h。
+
+### 命令
+
+```bash
+# 签发（url 只打到 stdout 一次，含一次性码，绝不写审计/日志/密封库）
+pnpm run admin remote-grant issue <taskId> --alias QA_X [--days 30] [--content] [--env production] [--attach]
+# 撤销（--purge 同时清测试主体/到期账号）
+pnpm run admin remote-grant revoke <grantId|--task <taskId>> [--purge]
+pnpm run admin remote-grant list [--task <taskId>]
+```
+
+- `--alias`：测试账号别名；若对应 IdP 用户已存在且非测试账号（`expires_at IS NULL`）会拒绝，防止误伤正式账号。
+- `--content`：给测试主体授 `content.read/submit/publish`，可直写/发布平台内容。
+- `--attach`：把「远程会话说明块」（链接 + `bun scripts/remote-session.ts redeem '<链接>'` 用法）追加到任务 `context`；注意该块持久化且含一次性码明文（码一次性、TTL ≤7 天）。
+
+### 生命周期
+
+签发时 IdP `users.expires_at = now+days`（已有更晚值取 max、封顶 31 天）、`test_origin = taskId`；测试主体创建的 workspace 自动标记同到期。到期后 IdP 每日 cron 删账号、origin reaper 每 6h 删 workspace 库与索引；平台内容保留。撤销：`revoke` 置 grant revoked（remote 族 refresh 重放亦触发整 grant 撤销）；`--purge` 再立即清测试主体并把账号到期设为 now 交给 IdP cron。
+
+### 红线
+
+- 链接只发给老板独占的 VPS；码一次性，泄露即失效但也等于让渡该测试账号权限到 TTL。
+- 派工调度目前不支持远程主机 Paseo 会话（`src/dispatcher/host.ts` 仅本机资源、`src/dispatcher/paseo.ts` 仅本机插件），故不做自动 issue + wake 注入，用 `--attach` 显式写入任务 context。

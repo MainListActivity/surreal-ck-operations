@@ -29,6 +29,8 @@ export interface BrokerConfig {
    */
   ops?: { clientId: string; redirectUri: string; resource?: string; scope: string };
   product: { url: string };
+  /** remote grant：一次性兑换码通道（ma_hono remote_grants）。 */
+  remote?: { clientId: string; testManagerAlias: string; codeTtlHours?: number };
   accounts: { prefix: string; emailDomain: string; workspacePrefix: string };
   d1?: { tenantId: string; databaseId: string };
   data?: { url: string; namespace: string };
