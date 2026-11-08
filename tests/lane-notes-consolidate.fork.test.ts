@@ -50,7 +50,7 @@ const recorded = async (id: string | undefined) => (await listConsolidations(db.
 const consolidate = (lane: string, options: Partial<ConsolidationOptions> = {}) =>
   consolidateLane(db.db, lane, { now: new Date(), actor: OWNER, ...options });
 const undo = (id: string, options: { beforeWrite?: () => Promise<void> } = {}) =>
-  undoConsolidation(db.db, id, { actor: OWNER, now: new Date(), ...options });
+  undoConsolidation(db.db, id, OWNER, { now: new Date(), ...options });
 
 run('restating notes merge into the newest one; the unrelated note stays', async () => {
   const lane = 'cons-merge:qa';

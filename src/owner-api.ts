@@ -236,7 +236,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       return lane ? consolidateLane(db, lane, options) : consolidateAll(db, options);
     }
     case 'note.consolidations': return { consolidations: await listConsolidations(db, typeof input.limit === 'number' ? input.limit : undefined) };
-    case 'note.consolidation.undo': return undoConsolidation(db, text(input.id, 'id', 1, 200), { actor: a, now: new Date() });
+    case 'note.consolidation.undo': return undoConsolidation(db, text(input.id, 'id', 1, 200), a);
     // ---- 会话策略 ----
     case 'session.policy': {
       if (input.policy !== undefined) {

@@ -260,13 +260,19 @@ export async function consolidateAll(db: Surreal, options: ConsolidationOptions)
   return consolidate(db, [...byLane].map(([lane, notes]) => ({ lane, notes })), options);
 }
 
+export interface UndoOptions {
+  /** The undo's time. Defaults to now. */
+  now?: Date;
+  /** Test seam: runs after the check and before the guarded write, so a concurrent edit can be simulated. */
+  beforeWrite?: () => Promise<void>;
+}
+
 /**
  * Puts back every note a run changed, in the state and with the text it had before. A note that was edited, pinned or
  * moved since the run is left as it is and listed in the result. A run can be undone once.
  */
-export async function undoConsolidation(
-  db: Surreal, id: string, options: { actor: string; now: Date; beforeWrite?: () => Promise<void> },
-): Promise<UndoResult> {
+export async function undoConsolidation(db: Surreal, id: string, actor: string, options: UndoOptions = {}): Promise<UndoResult> {
+  const now = options.now ?? new Date();
   const record = new RecordId('note_consolidation', id);
   const row = await db.select<Record<string, unknown>>(record);
   if (!row) throw new CompanyError('not_found', `consolidation ${id} not found`);
@@ -292,7 +298,7 @@ export async function undoConsolidation(
   }
   await options.beforeWrite?.();
   const vars: Record<string, unknown> = {
-    record, now: options.now, actor: options.actor, ranAt, skipped: plain(skipped),
+    record, now, actor, ranAt, skipped: plain(skipped),
   };
   const statements = ['BEGIN TRANSACTION;',
     'LET $undone = (UPDATE $record SET undone_at = $now, undone_by = $actor, undo_skipped = $skipped WHERE undone_at = NONE RETURN AFTER);',
@@ -309,7 +315,7 @@ export async function undoConsolidation(
   });
   statements.push('COMMIT TRANSACTION;');
   settle(await db.query(statements.join('\n'), vars).responses());
-  return { id, undoneAt: options.now.toISOString(), restored: restore.length, skipped };
+  return { id, undoneAt: now.toISOString(), restored: restore.length, skipped };
 }
 
 function runView(row: Record<string, unknown>): ConsolidationRun {
