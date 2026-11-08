@@ -6,6 +6,8 @@ import type { DatabaseConfig } from './config.ts';
 import { connectDb, openDb, useDb, type DbTarget } from './db-connection.ts';
 import { CompanyError } from './core-errors.ts';
 import type { SnapshotChannel, SnapshotLink } from './snapshot-store.ts';
+import { IdpClient, type IssuedToken } from './cloud/idp.ts';
+import { readSecretFile } from './cloud/secret.ts';
 
 const OWNER = 'surreal-ck-operations/issue-23/v1';
 
@@ -36,23 +38,335 @@ const BUILD_IDLE_TTL_MS = 30_000;
 /** Longest the reuse probe may take before the socket is treated as gone and a fresh one is opened. */
 const BUILD_REUSE_PROBE_MS = 2_000;
 
-export class CompanyDatabase {
-  readonly db = new Surreal();
-  constructor(readonly config: DatabaseConfig) {}
+/** 云端会话的令牌到期前多久换新会话（续期即重连）。 */
+const RENEW_BEFORE_MS = 60_000;
+/** 续期定时器的最短延迟，防止令牌寿命过短时空转。 */
+const MIN_RENEW_MS = 1_000;
+/** 断线重连的指数退避起点与上限。 */
+const RECONNECT_MIN_MS = 1_000;
+const RECONNECT_MAX_MS = 60_000;
+/** 退役的会话在关闭前保留的时间，让在途请求先结束。 */
+const RETIRE_GRACE_MS = 5_000;
+/** 绑定（建立 LIVE 订阅等）的时限；超时即视为新会话不可用。 */
+const BIND_TIMEOUT_MS = 15_000;
 
-  /** The configured server, namespace and database, logged in with the root account. */
+/**
+ * 会话绑定：每次建立新会话（首次连接、续期、断线重连）时在新客户端上调用，例如建立 LIVE 订阅并请求一次全量 tick。
+ * 返回拆除函数，旧会话关闭前调用它。
+ */
+export type SessionBinder = (client: Surreal) => Promise<() => Promise<void>>;
+
+/** 云端身份：runner 为执行端（默认）；migrator 只供 company-migrate 应用结构。 */
+export type CloudRole = 'runner' | 'migrator';
+
+export interface CompanyDatabaseOptions {
+  role?: CloudRole;
+  /** 令牌到期前多久换新会话，默认 60 秒（测试可调小）。 */
+  renewBeforeMs?: number;
+  /** 断线重连退避的起点与上限，默认 1 秒与 60 秒。 */
+  reconnectMinMs?: number;
+  reconnectMaxMs?: number;
+}
+
+/** 云端的一条会话：客户端、本会话所用令牌的到期时间、在它上面绑定的订阅，以及断线监听的取消函数。 */
+interface CloudSession {
+  client: Surreal;
+  expiresAt: number | undefined;
+  /** 断线后置位：绑定期间或采用前断开，这个会话就不能用。 */
+  broken: boolean;
+  bound: Map<SessionBinder, () => Promise<void>>;
+  unwatch: () => void;
+}
+
+/**
+ * 转发到当前会话的客户端代理。调用方在构造时就拿走了 db.db，所以不能替换对象，只能把调用转到当前会话上：
+ * 方法在调用时绑定到当前会话，续期后自动指向新会话。
+ */
+function forwardTo(current: () => Surreal): Surreal {
+  return new Proxy(Object.create(Surreal.prototype) as Surreal, {
+    get: (_target, property) => {
+      const client = current();
+      const value: unknown = Reflect.get(client, property, client);
+      return typeof value === 'function' ? value.bind(client) : value;
+    },
+    set: (_target, property, value) => Reflect.set(current(), property, value, current()),
+    has: (_target, property) => Reflect.has(current(), property),
+  });
+}
+
+const pause = (ms: number): Promise<void> => new Promise(resolve => {
+  const timer = setTimeout(resolve, ms);
+  timer.unref?.();
+});
+
+export class CompanyDatabase {
+  /** 当前会话的客户端；云端续期或重连时整体替换（见 rebuildNow）。 */
+  private session = new Surreal();
+  /** 调用方持有的客户端：转发到当前会话，续期后自动指向新会话。 */
+  readonly db: Surreal = forwardTo(() => this.session);
+  /** 云端当前采用的会话；本机模式不用。 */
+  private current: CloudSession | undefined;
+  /** 已换下、等在途请求结束再关闭的会话客户端。 */
+  private readonly retiring = new Set<Surreal>();
+  private readonly role: CloudRole;
+  private readonly idp: IdpClient | undefined;
+  private readonly binders = new Set<SessionBinder>();
+  private cachedToken: IssuedToken | undefined;
+  private issuing: Promise<IssuedToken> | undefined;
+  private renewTimer: ReturnType<typeof setTimeout> | undefined;
+  /** 单飞：同一时间只有一次重建在跑。 */
+  private rebuilding: Promise<void> | undefined;
+  /** 单飞：后台重建（续期与断线共用），失败按退避反复尝试。 */
+  private refreshing: Promise<void> | undefined;
+  private readonly renewBeforeMs: number;
+  private readonly reconnectMinMs: number;
+  private readonly reconnectMaxMs: number;
+
+  constructor(readonly config: DatabaseConfig, options: CompanyDatabaseOptions = {}) {
+    this.role = options.role ?? 'runner';
+    this.renewBeforeMs = options.renewBeforeMs ?? RENEW_BEFORE_MS;
+    this.reconnectMinMs = options.reconnectMinMs ?? RECONNECT_MIN_MS;
+    this.reconnectMaxMs = options.reconnectMaxMs ?? RECONNECT_MAX_MS;
+    const cloud = config.cloud;
+    if (!cloud) return;
+    const clientId = this.role === 'runner' ? cloud.runnerClientId : cloud.migratorClientId;
+    const secretFile = this.role === 'runner' ? cloud.runnerClientSecretFile : cloud.migratorClientSecretFile;
+    if (!clientId) throw new Error(this.role === 'runner' ? '云端执行端缺少 RUNNER_CLIENT_ID' : '缺少 MIGRATOR_CLIENT_ID');
+    if (!secretFile) throw new Error('缺少云端凭证文件路径');
+    this.idp = new IdpClient({ issuer: cloud.idpIssuer, clientId, clientSecret: () => readSecretFile(secretFile) });
+  }
+
+  /** 本机模式用 root 账号；云端模式每次登录向身份服务取令牌。 */
   private target(): DbTarget {
+    if (this.config.cloud) return this.cloudTarget();
     const { url, namespace, database, rootUser, rootPassword } = this.config;
     return { url, namespace, database, auth: { kind: 'root', username: rootUser, password: rootPassword } };
   }
 
+  /** 云端目标：record 收到本次登录用的令牌，用来知道会话何时到期。 */
+  private cloudTarget(record?: (issued: IssuedToken) => void): DbTarget {
+    const { url, namespace, database } = this.config;
+    return {
+      url, namespace, database,
+      auth: {
+        kind: 'token',
+        getToken: async () => {
+          const issued = await this.issueToken();
+          record?.(issued);
+          return issued.token;
+        },
+      },
+    };
+  }
+
+  /** 取本进程的客户端令牌：离到期还有 renewBeforeMs 以上才复用缓存，否则重新换发（同一时间只换发一次）。 */
+  private async issueToken(): Promise<IssuedToken> {
+    if (!this.idp) throw new Error('未配置云端身份');
+    const cached = this.cachedToken;
+    if (cached && cached.expiresAt - Date.now() > this.renewBeforeMs) return cached;
+    this.issuing ??= this.idp.clientToken().then(
+      issued => {
+        this.cachedToken = issued;
+        return issued;
+      },
+      error => {
+        this.cachedToken = undefined;
+        throw error;
+      },
+    ).finally(() => {
+      this.issuing = undefined;
+    });
+    return this.issuing;
+  }
+
   async connect(): Promise<void> {
+    if (this.config.cloud) {
+      await this.rebuild();
+      return;
+    }
     // The WS engine resolves its open promise only on socket 'close'; a connect that
     // stalls without ever firing close would wedge startup/reconnect forever.
     await CompanyDatabase.withTimeout(connectDb(this.db, this.target()), 15_000, 'db connect');
   }
 
+  /**
+   * 云端连接状态（供 runner.status 读取）：当前会话是否可用，以及它所用令牌的到期时刻（毫秒）。
+   * 本机模式不跟踪连接，只返回 connected: false 与空到期时间，由调用方按心跳判断。
+   */
+  connectionStatus(): { connected: boolean; tokenExpiresAt?: number } {
+    if (!this.config.cloud) return { connected: false };
+    const session = this.current;
+    return { connected: !!session && !session.broken && !this.closing, tokenExpiresAt: session?.expiresAt };
+  }
+
+  /**
+   * 登记一个会话绑定（仅云端）：当前已有会话就立即在它上面绑定；之后每次建立新会话（续期、断线重连）都会再绑定一次。
+   * 返回的函数取消登记，并拆除当前会话上的绑定。
+   */
+  async bindSession(binder: SessionBinder): Promise<() => Promise<void>> {
+    this.binders.add(binder);
+    const session = this.current;
+    if (session && !this.closing) {
+      try {
+        const teardown = await CompanyDatabase.withTimeout(binder(session.client), BIND_TIMEOUT_MS, 'session bind');
+        if (this.current === session && this.binders.has(binder)) session.bound.set(binder, teardown);
+        else await CompanyDatabase.runTeardown(teardown);
+      } catch (error) {
+        this.binders.delete(binder);
+        throw error;
+      }
+    }
+    return async () => {
+      this.binders.delete(binder);
+      const teardown = this.current?.bound.get(binder);
+      this.current?.bound.delete(binder);
+      if (teardown) await CompanyDatabase.runTeardown(teardown);
+    };
+  }
+
+  /** 建立新会话并换上：先在新会话上完成全部绑定，成功后才替换旧会话，旧会话延后关闭。同一时间只有一次重建在跑。 */
+  private rebuild(): Promise<void> {
+    this.rebuilding ??= this.rebuildNow().finally(() => {
+      this.rebuilding = undefined;
+    });
+    return this.rebuilding;
+  }
+
+  private async rebuildNow(): Promise<void> {
+    if (this.closing) throw new Error('数据库连接已关闭');
+    const client = new Surreal();
+    let expiresAt: number | undefined;
+    // 关闭 SDK 自动重连：断线立即发出 'disconnected'，由 onDisconnected 的退避重建接管（SDK 重连不会恢复 ns/db/登录）。
+    const opening = openDb(client, this.cloudTarget(issued => {
+      expiresAt = issued.expiresAt;
+    }), { reconnect: false });
+    try {
+      await CompanyDatabase.withTimeout(opening, 15_000, 'db connect');
+    } catch (error) {
+      // 超时不取消登录：之后才建成的连接立即关闭，免得超出上限仍占着连接。
+      void opening.catch(() => undefined).then(() => CompanyDatabase.closeClient(client));
+      throw error;
+    }
+    const session: CloudSession = { client, expiresAt, broken: false, bound: new Map(), unwatch: () => undefined };
+    // SDK 断线后不替我们恢复 ns/db/登录状态，所以断线即作废这个会话（见 onDisconnected）。
+    session.unwatch = client.subscribe('disconnected', () => this.onDisconnected(session));
+    try {
+      // 逐个绑定，直到没有遗漏：绑定期间新登记的绑定也在这里补上。
+      for (let next = this.unbound(session); next; next = this.unbound(session)) {
+        const teardown = await CompanyDatabase.withTimeout(next(client), BIND_TIMEOUT_MS, 'session bind');
+        // 绑定进行中若已被取消，立即拆除，不能留下取消之后仍会触发的订阅。
+        if (this.binders.has(next)) session.bound.set(next, teardown);
+        else await CompanyDatabase.runTeardown(teardown);
+      }
+      if (this.closing || session.broken) throw new Error(this.closing ? '数据库连接已关闭' : '新会话在绑定期间断开');
+    } catch (error) {
+      session.unwatch();
+      await CompanyDatabase.unbindAll(session.bound);
+      await CompanyDatabase.closeClient(client);
+      throw error;
+    }
+    // 以下同步完成换上：中间没有 await，绑定集合不会再变。
+    const previous = this.current;
+    this.current = session;
+    this.session = client;
+    this.scheduleRenew(session);
+    if (previous) void this.retire(previous);
+  }
+
+  /** 当前会话断线：标记作废；若它仍是当前会话，就后台重连（与续期共用同一退避流程）。 */
+  private onDisconnected(session: CloudSession): void {
+    session.broken = true;
+    if (this.closing || this.current !== session) return;
+    console.error('公司库连接已断开，正在重连');
+    void this.refresh();
+  }
+
+  /** 后台重建（续期与断线共用）：失败按指数退避反复尝试，直到成功或数据库关闭。同一时间只有一个在跑。 */
+  private refresh(): Promise<void> {
+    this.refreshing ??= this.refreshWithBackoff().finally(() => {
+      this.refreshing = undefined;
+    });
+    return this.refreshing;
+  }
+
+  private async refreshWithBackoff(): Promise<void> {
+    let delay = this.reconnectMinMs;
+    while (!this.closing) {
+      try {
+        await this.rebuild();
+        return;
+      } catch (error) {
+        console.error(`公司库会话重建失败，${delay} 毫秒后重试：${(error as Error).message.slice(0, 200)}`);
+        await pause(delay);
+        delay = Math.min(delay * 2, this.reconnectMaxMs);
+      }
+    }
+  }
+
+  /** 令牌到期前 renewBeforeMs 触发续期，即换新会话。 */
+  private scheduleRenew(session: CloudSession): void {
+    clearTimeout(this.renewTimer);
+    this.renewTimer = undefined;
+    if (session.expiresAt === undefined || this.closing) return;
+    const delay = Math.max(MIN_RENEW_MS, session.expiresAt - Date.now() - this.renewBeforeMs);
+    this.renewTimer = setTimeout(() => {
+      this.renewTimer = undefined;
+      void this.refresh();
+    }, delay);
+    this.renewTimer.unref?.();
+  }
+
+  /** 退役旧会话：先拆除它的绑定（杀掉 LIVE 订阅），等在途请求结束后再关闭连接。 */
+  private async retire(session: CloudSession): Promise<void> {
+    session.unwatch();
+    await CompanyDatabase.unbindAll(session.bound);
+    this.retiring.add(session.client);
+    await pause(RETIRE_GRACE_MS);
+    this.retiring.delete(session.client);
+    await CompanyDatabase.closeClient(session.client);
+  }
+
+  /** 第一个还没绑定到该会话上的登记项。 */
+  private unbound(session: CloudSession): SessionBinder | undefined {
+    for (const binder of this.binders) if (!session.bound.has(binder)) return binder;
+    return undefined;
+  }
+
+  /** 依次拆除绑定，每个都有时限；失败吞掉，清理不能拖住重建或关闭。 */
+  private static async unbindAll(bound: Map<SessionBinder, () => Promise<void>>): Promise<void> {
+    const teardowns = [...bound.values()];
+    bound.clear();
+    for (const teardown of teardowns) await CompanyDatabase.runTeardown(teardown);
+  }
+
+  private static async runTeardown(teardown: () => Promise<void>): Promise<void> {
+    await CompanyDatabase.withTimeout(Promise.resolve().then(teardown), 5_000, 'session unbind').catch(() => undefined);
+  }
+
+  /** 关闭一个会话客户端：错误与超时都吞掉。 */
+  private static async closeClient(client: Surreal): Promise<void> {
+    await CompanyDatabase.withTimeout(Promise.resolve().then(() => client.close()), 5_000, 'db close').catch(() => undefined);
+  }
+
+  private requireMigrator(action: string): void {
+    if (this.config.cloud && this.role !== 'migrator') throw new Error(`云端只有 migrator 可以${action}`);
+  }
+
+  /** 本机 bootstrap：认领库，再应用全部结构。云端执行端不跑它，公司库结构由 company-migrate 应用。 */
   async bootstrap(): Promise<void> {
+    if (this.config.cloud) throw new Error('云端执行端不跑 bootstrap：公司库结构由 scripts/company-migrate.ts 应用');
+    await this.applySchema(await this.claimDatabase());
+  }
+
+  /**
+   * 认领命名空间与库：本机缺则建，并核对归属标记。返回 true 表示库是空的，需要整套应用结构。
+   * 云端不建命名空间与库（由运维开通），只核对库内标记，且只有 migrator 能做。
+   */
+  async claimDatabase(): Promise<boolean> {
+    if (this.config.cloud) {
+      this.requireMigrator('认领公司库');
+      return this.checkDatabaseMarker();
+    }
     const [rootInfo] = await this.db.query<[Record<string, unknown>]>('INFO FOR ROOT;');
     const namespaces = rootInfo.namespaces as Record<string, string> | undefined;
     let fresh = !namespaces?.[this.config.namespace];
@@ -69,35 +383,52 @@ export class CompanyDatabase {
         fresh = true;
       }
       await this.db.use({ namespace: this.config.namespace, database: this.config.database });
-      const [dbInfo] = await this.db.query<[Record<string, unknown>]>('INFO FOR DB;');
-      const tables = dbInfo.tables as Record<string, string> | undefined;
-      const tableNames = Object.keys(tables ?? {});
-      if (tableNames.length === 0) {
-        // 'quota' is server metadata reported by newer SurrealDB versions, not a user-defined resource.
-        const otherDefinitions = Object.entries(dbInfo).filter(([kind, definitions]) =>
-          kind !== 'tables' && kind !== 'quota' && definitions !== null && typeof definitions === 'object' &&
-          Object.keys(definitions as Record<string, unknown>).length > 0
-        );
-        if (otherDefinitions.length > 0) {
-          throw new Error('Target database has resources but no ownership marker; refusing to alter it');
-        }
-        fresh = true;
-      } else if (!tableNames.includes('company_meta')) {
-        throw new Error('Target database has tables but no ownership marker; refusing to alter it');
-      } else {
-        const [markers] = await this.db.query<[Array<{ owner: string }>]>(
-          'SELECT owner FROM company_meta:installation;'
-        );
-        if (!markers?.[0] || markers[0].owner !== OWNER) {
-          throw new Error('Target database ownership marker mismatch; refusing to alter it');
-        }
-      }
+      if (await this.checkDatabaseMarker()) fresh = true;
     } else {
       await this.db.query(`DEFINE NAMESPACE ${this.config.namespace};`);
       await this.db.use({ namespace: this.config.namespace });
       await this.db.query(`DEFINE DATABASE ${this.config.database};`);
       await this.db.use({ namespace: this.config.namespace, database: this.config.database });
     }
+    return fresh;
+  }
+
+  /** 核对库内归属标记。库为空返回 true（需要整套应用结构）；有结构但标记不符则拒绝改写。 */
+  private async checkDatabaseMarker(): Promise<boolean> {
+    const [dbInfo] = await this.db.query<[Record<string, unknown>]>('INFO FOR DB;');
+    const tables = dbInfo.tables as Record<string, string> | undefined;
+    const tableNames = Object.keys(tables ?? {});
+    if (tableNames.length === 0) {
+      // 'quota' is server metadata reported by newer SurrealDB versions, not a user-defined resource.
+      // 云端的访问方式（accesses）可能由 055 或运维预先定义，空库也会有，不算已有资源。
+      const ignored = this.config.cloud ? ['tables', 'quota', 'accesses'] : ['tables', 'quota'];
+      const otherDefinitions = Object.entries(dbInfo).filter(([kind, definitions]) =>
+        !ignored.includes(kind) && definitions !== null && typeof definitions === 'object' &&
+        Object.keys(definitions as Record<string, unknown>).length > 0
+      );
+      if (otherDefinitions.length > 0) {
+        throw new Error('Target database has resources but no ownership marker; refusing to alter it');
+      }
+      return true;
+    }
+    if (!tableNames.includes('company_meta')) {
+      throw new Error('Target database has tables but no ownership marker; refusing to alter it');
+    }
+    const [markers] = await this.db.query<[Array<{ owner: string }>]>(
+      'SELECT owner FROM company_meta:installation;'
+    );
+    if (!markers?.[0] || markers[0].owner !== OWNER) {
+      throw new Error('Target database ownership marker mismatch; refusing to alter it');
+    }
+    return false;
+  }
+
+  /**
+   * 按序应用全部 schema（001 至 057；055 按配置渲染）。fresh 时写入归属标记。本机 bootstrap 与云端 company-migrate 共用；
+   * 云端只有 migrator 能应用。
+   */
+  async applySchema(fresh: boolean): Promise<void> {
+    this.requireMigrator('应用公司库结构');
     await this.db.query(loadSchema('001-control.surql'));
     if (fresh) {
       await this.db.query('CREATE company_meta:installation CONTENT { owner: $owner, schema_version: 1 };', { owner: OWNER });
@@ -305,9 +636,13 @@ export class CompanyDatabase {
         await CompanyDatabase.withTimeout(this.db.query('INFO FOR DB;'), 10_000, 'db probe');
       } catch (probeError) {
         try {
-          await CompanyDatabase.withTimeout(this.db.close().catch(() => {}), 5_000, 'db close').catch(() => {});
-          await CompanyDatabase.withTimeout(this.connect(), 15_000, 'db connect');
-          await CompanyDatabase.withTimeout(this.useDatabase(), 10_000, 'db use');
+          if (this.config.cloud) {
+            await this.rebuild();
+          } else {
+            await CompanyDatabase.withTimeout(this.db.close().catch(() => {}), 5_000, 'db close').catch(() => {});
+            await CompanyDatabase.withTimeout(this.connect(), 15_000, 'db connect');
+            await CompanyDatabase.withTimeout(this.useDatabase(), 10_000, 'db use');
+          }
           console.log(`database connection re-established (was: ${(probeError as Error).message.slice(0, 80)})`);
         } catch (error) {
           console.error(`database reconnect failed: ${(error as Error).message}`);
@@ -500,11 +835,21 @@ export class CompanyDatabase {
     this.closing = true;
     clearInterval(this.keepalive);
     this.keepalive = undefined;
+    clearTimeout(this.renewTimer);
+    this.renewTimer = undefined;
     this.idleBuildSockets.length = 0;
     await Promise.all([...this.buildSockets].map(socket => this.closeBuildSocket(socket)));
     await Promise.all([...this.releaseSockets].map(socket => this.closeReleaseSocket(socket)));
+    const current = this.current;
+    this.current = undefined;
+    if (current) {
+      current.unwatch();
+      await CompanyDatabase.unbindAll(current.bound);
+    }
     // engine.close() awaits a 'disconnected' event that never arrives when the peer
     // silently dropped (close frame sent, no reply) — bound it so shutdown can't wedge.
-    await CompanyDatabase.withTimeout(this.db.close(), 5_000, 'db close').catch(() => {});
+    const clients = new Set<Surreal>([this.session, ...this.retiring]);
+    this.retiring.clear();
+    await Promise.all([...clients].map(client => CompanyDatabase.closeClient(client)));
   }
 }

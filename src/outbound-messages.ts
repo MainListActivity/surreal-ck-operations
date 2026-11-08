@@ -2,6 +2,7 @@
 import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from './core-errors.ts';
 import { machineCriterionOf, routeBody, stepOfTask, templateFor, type MessageStep } from './outbound-render.ts';
+import { deliveryBody } from './outbound-delivery.ts';
 export { DEFAULT_MACHINE_CRITERION, renderMessage, templateFor } from './outbound-render.ts';
 
 export type { MessageStep } from './outbound-render.ts';
@@ -20,6 +21,13 @@ export interface OutboundMessage {
   sentTo?: string;
   sentAt?: string;
   createdAt: string;
+  /** 原文语言；缺失或空表示中文原文。 */
+  lang?: string;
+  /** 译文；与 translatedFromHash 一致时才投递。 */
+  translatedText?: string;
+  /** 译文对应原文的哈希，用于识别过期译文。 */
+  translatedFromHash?: string;
+  translatedAt?: string;
 }
 
 const STEPS: readonly MessageStep[] = ['execute', 'review', 'rework', 'nudge', 'eval', 'notice'];
@@ -36,7 +44,19 @@ const rowView = (row: Record<string, unknown>): OutboundMessage => ({
   sentTo: row.sent_to === undefined || row.sent_to === null ? undefined : String(row.sent_to),
   sentAt: row.sent_at === undefined || row.sent_at === null ? undefined : String(row.sent_at),
   createdAt: String(row.created_at ?? ''),
+  lang: optionalText(row.lang), translatedText: optionalText(row.translated_text),
+  translatedFromHash: optionalText(row.translated_from_hash), translatedAt: optionalText(row.translated_at),
 });
+
+/** 可选字段：缺失（未定义、NONE 即 null）读作 undefined。 */
+const optionalText = (value: unknown): string | undefined => value === undefined || value === null ? undefined : String(value);
+
+/** 按翻译规则选出投递正文；null 表示暂不投递。投递的消息记录带上所选文本。 */
+const deliverable = (message: OutboundMessage, employeeId: string): { body: string; message: OutboundMessage } | null => {
+  const body = deliveryBody(message);
+  if (body === null) return null;
+  return { body, message: { ...message, body, sentTo: employeeId } };
+};
 
 export class OutboundMessageStore {
   constructor(private readonly db: Surreal) {}
@@ -158,7 +178,9 @@ export class OutboundMessageStore {
   }
 
   /**
-   * Held messages do not send; otherwise locks in the table and returns the stored body. `null` means no send.
+   * Held messages do not send; otherwise locks in the table and returns the body to deliver. `null` means no send:
+   * held by the owner, or a translated message whose translation is missing or stale (the gateway fills it in later).
+   * The body follows the translation rule (deliveryBody): a message without lang delivers its own text.
    * The mark stays in 'draft' until the caller's external send succeeded (see markSent), so a failed send
    * never loses the owner's edit. Every dispatch message comes from this table.
    */
@@ -168,10 +190,10 @@ export class OutboundMessageStore {
       // 旧任务没有草稿：按模板即时生成一条，保证派工正文永远来自这张表。
       const fresh = await this.seedDraft(taskId, step);
       if (fresh.hold) return null;
-      return { body: fresh.body, message: { ...fresh, sentTo: employeeId } };
+      return deliverable(fresh, employeeId);
     }
     if (draft.hold || draft.state === 'held') return null;
-    return { body: draft.body, message: { ...draft, sentTo: employeeId } };
+    return deliverable(draft, employeeId);
   }
 
   /**
@@ -218,12 +240,26 @@ export class OutboundMessageStore {
   }
 
   async markSent(messageId: string, employeeId: string, body: string): Promise<{ body: string; message: OutboundMessage }> {
-    const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
-      `UPDATE $msg SET state = 'sent', sent_to = $employee, sent_at = time::now(), hold = false WHERE state != 'sent' RETURN AFTER;`,
-      { msg: this.message(messageId), employee: employeeId });
-    if (!rows?.[0]) throw new CompanyError('conflict', 'message already sent or missing');
-    await this.resolveHoldNotice(rows[0].task, rows[0].step);
-    return { body, message: rowView(rows[0]) };
+    // 认领即条件 UPDATE：同一条消息只有一个调用方的 WHERE state != 'sent' 命中并返回行。
+    // 并发写同一行时 SurrealDB 可能直接报 Transaction conflict（可重试）；重试时该行已是 sent，条件不再命中，因此统一映射为 conflict。
+    const row = await this.guardedMarkSent(messageId, employeeId);
+    if (!row) throw new CompanyError('conflict', 'message already sent or missing');
+    await this.resolveHoldNotice(row.task, row.step);
+    return { body, message: rowView(row) };
+  }
+
+  private async guardedMarkSent(messageId: string, employeeId: string): Promise<Record<string, unknown> | undefined> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
+          `UPDATE $msg SET state = 'sent', sent_to = $employee, sent_at = time::now(), hold = false WHERE state != 'sent' RETURN AFTER;`,
+          { msg: this.message(messageId), employee: employeeId });
+        return rows?.[0];
+      } catch (error) {
+        const text = error instanceof Error ? error.message : String(error);
+        if (attempt >= 3 || !/transaction conflict/i.test(text)) throw error;
+      }
+    }
   }
 
   /** 返工/催办触发时追加 draft（幂等：同一任务同一阶段已有未发草稿则不重复）。 */

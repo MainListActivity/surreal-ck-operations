@@ -930,7 +930,10 @@ export class SurrealCompanyCore implements CompanyCore {
         fence = IF $same THEN $t.fence ELSE $t.fence + 1 END,
         version = IF $same THEN $t.version ELSE $t.version + 1 END,
         worktree = IF $assignment != NONE THEN $assignment ELSE $t.worktree END
+        WHERE fence = $t.fence AND state = $t.state
         RETURN AFTER;
+      // 条件 UPDATE 未命中：读取之后任务已被另一方改动（fence 或状态变化）。按冲突处理，由 txTask 整体重读重试。
+      IF $next = NONE { THROW 'claim conflict: task changed during claim' };
       UPDATE ONLY $actor SET active_task = $task, workspace_read_active = false, last_task = $task,
         last_phase = IF $t.state = 'review' THEN 'review' ELSE 'execute' END,
         lane = string::concat(IF $t.project != NONE THEN <string>record::id($t.project) ELSE 'company' END, ':', $who.role);

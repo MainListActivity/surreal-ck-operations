@@ -14,6 +14,7 @@ import { isCompanyAgent } from "./company-agent";
 import { dirname, join } from "node:path";
 import { hostname } from "node:os";
 import { serviceHome } from "./env";
+import { subscribeWake, TickGate } from "./vendor/src/cloud/wake.ts";
 import { sweepArchiveBatches, sweepInstanceDirs } from "./vendor/src/dispatcher/lifecycle-gc.ts";
 import { missingFrom, poolRoom, readMagpieQuotas, type MagpieUsageEntry } from "./vendor/src/dispatcher/magpie-quota.ts";
 import { readProviderQuotas, readQuotaEntries } from "./vendor/src/dispatcher/quota-store.ts";
@@ -315,6 +316,10 @@ export async function persistBoardView(ctx: Company): Promise<void> {
   if (board?.at) await writeBoardView(ctx.db.db, board);
 }
 
+let lastBeatAt: number | undefined;
+/** 最近一次写入成功的执行端心跳时刻（毫秒），供 runner.status 使用；本进程还没写过则为 undefined。 */
+export function lastRunnerBeatAt(): number | undefined { return lastBeatAt; }
+
 /**
  * One runner heartbeat for the owner board (W2): this plugin process, its host and the installed release. A failure only warns;
  * the board then reads the runner as offline once the last beat ages out.
@@ -324,8 +329,26 @@ function beatRunner(): void {
     .then(async ctx => {
       const installed = await ctx.upgrades.installed().catch(() => undefined);
       await writeRunnerHeartbeat(ctx.db.db, { runner: `plugin:${process.pid}`, host: hostname(), version: installed?.version ?? "unknown" });
+      lastBeatAt = Date.now();
     })
     .catch(error => console.warn(`runner heartbeat failed: ${(error as Error).message}`));
+}
+
+/** 云端周期 tick 的兜底间隔：LIVE 唤醒负责及时性，周期 tick 只防漏。 */
+const CLOUD_FALLBACK_MS = 60_000;
+type WakeClient = Parameters<typeof subscribeWake>[0];
+
+/**
+ * 在一个会话上订阅派工相关表的变化。订阅失败只记录并降级为周期 tick：绑定失败会让整次会话重建失败，
+ * 不能因为一个通知订阅断掉整个会话。
+ */
+async function wakeOnLive(client: WakeClient, onChange: () => void): Promise<() => Promise<void>> {
+  try {
+    return await subscribeWake(client, () => onChange());
+  } catch (error) {
+    console.warn(`LIVE 唤醒订阅失败，本会话改由周期 tick 兜底：${(error as Error).message}`);
+    return async () => {};
+  }
 }
 
 export function startDispatch(server: PluginServerContext): () => void {
@@ -333,6 +356,10 @@ export function startDispatch(server: PluginServerContext): () => void {
   const interruptions = new TurnInterruptions();
   let wake: (() => void) | undefined;
   let running = true;
+  // 云端执行端：LIVE 变化经 TickGate 唤醒派工循环（合并，最短间隔 1 秒），周期 tick 作兜底。本机模式不用它。
+  let cloudWake: TickGate | undefined;
+  let cloudBinding: Promise<void> | undefined;
+  let liveUnbind: (() => Promise<void>) | undefined;
 
   const nap = (ms: number) => new Promise<void>(resolve => {
     const timer = setTimeout(() => { wake = undefined; resolve(); }, ms);
@@ -402,6 +429,22 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
       try {
         const ctx: Company = await timing.measure("init", () => company());
         wait = (await timing.measure("config", () => ctx.workforce.config())).pollSeconds * 1000;
+        if (ctx.db.config.cloud) {
+          // 云端：周期 tick 放宽到至少 60 秒，及时性交给 LIVE 唤醒。会话绑定失败会在下一轮重试。
+          wait = Math.max(wait, CLOUD_FALLBACK_MS);
+          cloudWake ??= new TickGate({ minGapMs: 1000, fallbackMs: CLOUD_FALLBACK_MS });
+          const gate = cloudWake;
+          cloudBinding ??= ctx.db.bindSession(client => wakeOnLive(client, () => gate.request())).then(
+            unbind => { liveUnbind = unbind; },
+            error => {
+              cloudBinding = undefined;
+              console.warn(`LIVE 唤醒未能建立，下一轮重试：${(error as Error).message}`);
+            },
+          );
+          cloudWake.started();
+        }
+        // 运维作业：认领并执行排队中的 ops_job。不等待派工 tick，长作业不挡住派工。
+        if (ctx.opsJobs) void ctx.opsJobs.drain().catch(error => console.warn(`ops job drain failed: ${(error as Error).message}`));
         // Refresh quota and model slots BEFORE the tick so a newly published model is
         // resolved, stale idle sessions are retired, and new work spawns on it in the
         // same dispatch pass instead of lagging one poll behind. Quota runs without a
@@ -456,7 +499,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
       } finally {
         console.log(`dispatch timing: ${JSON.stringify(timing.summary())}`);
       }
-      await nap(wait);
+      await (cloudWake ? cloudWake.wait(wait) : nap(wait));
     }
   };
   void loop();
@@ -466,7 +509,12 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
 
   // A finished turn usually means a checkpoint/submit/review landed; dispatch immediately
   // instead of waiting out the poll interval.
-  const kick = () => { if (!stopped && running) wake?.(); };
+  const kick = () => {
+    if (!stopped && running) {
+      wake?.();
+      cloudWake?.request();
+    }
+  };
   const removers = [
     server.on("agent.turn_started", (event, { paseo }) => {
       interruptions.turnStarted(event.agent.id);
@@ -539,6 +587,9 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
     clearInterval(runnerBeat);
     interruptions.stop();
     wake?.();
+    cloudWake?.stop();
+    // 绑定若仍在进行，等它完成后拆除 LIVE 订阅。
+    void cloudBinding?.then(() => liveUnbind?.()).catch(() => undefined);
     for (const remove of removers) remove();
   };
 }

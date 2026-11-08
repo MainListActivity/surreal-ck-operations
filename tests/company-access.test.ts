@@ -9,14 +9,14 @@ const ISS = 'https://ma.example.test';
 const schema055 = readFileSync(join(import.meta.dir, '..', 'schema', '055-access.surql'), 'utf8');
 
 describe('055 公司库访问方式的渲染', () => {
-  test('两个占位符全部替换，三种访问方式都用 JWKS 地址与签发方定义', () => {
+  test('两个占位符全部替换，六种访问方式都用 JWKS 地址与签发方定义', () => {
     const sql = renderCompanyAccess(schema055, JWKS, ISS);
     expect(sql).not.toContain('{{');
-    for (const name of ['owner', 'runner', 'automation']) {
+    for (const name of ['owner', 'runner', 'automation', 'gateway', 'migrator', 'viewer']) {
       expect(sql).toContain(`DEFINE ACCESS OVERWRITE ${name} ON DATABASE TYPE JWT URL '${JWKS}'`);
     }
-    expect(sql.match(/\$token\.iss != 'https:\/\/ma\.example\.test'/g)?.length).toBe(3);
-    expect(sql.match(/DURATION FOR SESSION 15m;/g)?.length).toBe(3);
+    expect(sql.match(/\$token\.iss != 'https:\/\/ma\.example\.test'/g)?.length).toBe(6);
+    expect(sql.match(/DURATION FOR SESSION 15m;/g)?.length).toBe(6);
   });
 
   test('拒绝会改写语句的配置值，错误信息不回显配置值', () => {
