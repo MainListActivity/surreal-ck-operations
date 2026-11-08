@@ -220,7 +220,7 @@ run('bootstrap 本机模式：不应用 055（没有访问方式），056 的表
     expect(Object.keys(info.accesses ?? {})).toEqual([]);
     expect(Object.keys(info.tables)).toEqual(expect.arrayContaining(['protected_command', 'agent_policy', 'ops_audit']));
     const marker = await local.db.select<{ schema_version: number }>(new RecordId('company_meta', 'installation'));
-    expect(marker?.schema_version).toBe(56);
+    expect(marker?.schema_version).toBeGreaterThanOrEqual(56);
   } finally {
     await local.close();
   }

@@ -19,7 +19,7 @@ export async function authenticationLookup<T>(hash: () => string, query: (digest
   }
 }
 
-type Stage = 'init' | 'config' | 'quota' | 'models' | 'model-routing' | 'model-journal' | 'gc' | 'upgrade-closure' | 'tick' | 'observation' | 'heartbeat';
+type Stage = 'init' | 'config' | 'quota' | 'models' | 'model-routing' | 'model-journal' | 'gc' | 'upgrade-closure' | 'tick' | 'observation' | 'board' | 'heartbeat';
 export class DispatchTimings {
   private readonly start: number;
   private readonly stages: Partial<Record<Stage, number>> = {};

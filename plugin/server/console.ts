@@ -360,6 +360,13 @@ ${relayShellCss}
 .task-form{display:grid;gap:var(--relay-sp-8)}
 .task-form input,.task-form select,.task-form textarea{width:100%;font-size:var(--relay-fs-11)}
 .task-form textarea{min-height:70px}
+.staff-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--relay-sp-12)}
+.staff-card section{margin-top:var(--relay-sp-12);padding-top:var(--relay-sp-10);border-top:1px solid var(--relay-border)}
+.staff-card h4{margin:0 0 var(--relay-sp-6);color:var(--relay-muted);font-size:var(--relay-fs-11)}
+.staff-list{margin:var(--relay-sp-4) 0;padding-left:var(--relay-sp-18);color:var(--relay-muted);font-size:var(--relay-fs-11);line-height:1.6}
+.staff-queue{margin-top:var(--relay-sp-18)}
+.staff-queue h2{margin:0 0 var(--relay-sp-8);font-size:var(--relay-fs-13)}
+@media(max-width:900px){.staff-grid{grid-template-columns:1fr}}
 @media(max-width:900px){.content{grid-template-columns:1fr}.drawer{border-left:0;border-top:1px solid var(--relay-border);max-height:none}.shell{display:block}.sidebar{height:auto;position:sticky;top:0}.main-nav{flex-direction:row}.topbar{top:56px}}
 </style></head><body>
 <div class="shell">
@@ -367,6 +374,7 @@ ${relayShellCss}
 <p class="nav-label">工作区</p><nav class="main-nav">
 <button data-t="flow" class="on" data-cmd="tab:flow">${relayIcon("activity")}<span>目标进度</span></button>
 <button data-t="inbox" data-cmd="tab:inbox">${relayIcon("inbox")}<span>收件箱</span><b id="nav-count" hidden></b></button>
+<button data-t="staff" data-cmd="tab:staff">${relayIcon("layers")}<span>员工</span></button>
 <button data-t="defs" data-cmd="tab:defs">${relayIcon("layers")}<span>编制</span></button>
 <button data-t="routes" data-cmd="tab:routes">${relayIcon("layers")}<span>路由表</span></button>
 <button data-t="notes" data-cmd="tab:notes">${relayIcon("layers")}<span>线的笔记</span></button>
@@ -402,6 +410,8 @@ async function boot(){
   const j=await x.json().catch(()=>({}));if(!x.ok)throw new Error(j.error||'exchange failed');OWNER=j.ownerToken;
   document.addEventListener('click',onCommand);
   document.addEventListener('toggle',rememberOpen,true);
+  // Unsaved words in a staff message survive the periodic refresh: the text is kept as it is typed.
+  document.addEventListener('input',ev=>{const t=ev.target;if(t&&t.dataset&&t.dataset.edit)STAFF_EDITS.set(t.dataset.edit,t.value)});
   await load();setInterval(load,10000);
 }
 async function onCommand(ev){
@@ -409,7 +419,7 @@ async function onCommand(ev){
   // Only the first colon separates the command: ids and notice keys may themselves contain colons.
   const raw=String(el.dataset.cmd),cut=raw.indexOf(':');
   const cmd=cut<0?raw:raw.slice(0,cut),arg=cut<0?'':raw.slice(cut+1);
-  if(cmd==='tab'){T=arg;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.t===arg));$('crumb').textContent={flow:'目标进度',inbox:'收件箱',defs:'编制',routes:'路由表',notes:'线的笔记'}[arg]||arg;render();}
+  if(cmd==='tab'){T=arg;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.t===arg));$('crumb').textContent={flow:'目标进度',inbox:'收件箱',staff:'员工',defs:'编制',routes:'路由表',notes:'线的笔记'}[arg]||arg;render();if(arg==='staff')load();}
   else if(cmd==='theme')toggleTheme();
   else if(cmd==='refresh')load();
   else if(cmd==='chain'){CHAIN=arg;SEL=null;render();}
@@ -419,6 +429,8 @@ async function onCommand(ev){
   else if(cmd==='save-msg')saveMsg(arg);
   else if(cmd==='hold-msg')holdMsg(arg,!MESSAGES.find(m=>String(m.id?.id??m.id)===arg)?.hold);
   else if(cmd==='release-msg')releaseMsg(arg);
+  else if(cmd==='staff-save')staffSave(el.dataset.msg,el.dataset.emp);
+  else if(cmd==='staff-hold')holdMsg(arg,true);
   else if(cmd==='void')voidTask(arg);
   else if(cmd==='revoke')revokeTask(arg);
   else if(cmd==='unlock')unlockTask(arg);
@@ -448,8 +460,8 @@ async function onCommand(ev){
 }
 async function load(){
   try{
-    const [pr,nt,g,t,m,i,d,s,n,cs]=await Promise.all([api('progress',{}).catch(e=>({error:e.message})),api('note.list',{}),api('route.list',{}),api('task.list',{}),api('message.list',{includeSent:true}),api('inbox',{}),api('def.list',{}),api('status',{}),api('notice.list',{}),api('note.consolidations',{limit:20}).catch(e=>({error:e.message}))]);
-    PROGRESS=pr;NOTES=nt.notes||[];ROUTES=g.routes||[];TASKS=t.tasks||[];MESSAGES=m.messages||[];INBOX=i;DEFS=d.defs||[];NOTICES=n.notices||[];PAUSED=s.paused===true;
+    const [pr,nt,g,t,m,i,d,s,n,cs,bd]=await Promise.all([api('progress',{}).catch(e=>({error:e.message})),api('note.list',{}),api('route.list',{}),api('task.list',{}),api('message.list',{includeSent:true}),api('inbox',{}),api('def.list',{}),api('status',{}),api('notice.list',{}),api('note.consolidations',{limit:20}).catch(e=>({error:e.message})),T==='staff'?api('board.snapshot',{}).catch(e=>({error:e.message})):null]);
+    PROGRESS=pr;NOTES=nt.notes||[];ROUTES=g.routes||[];TASKS=t.tasks||[];MESSAGES=m.messages||[];INBOX=i;DEFS=d.defs||[];NOTICES=n.notices||[];PAUSED=s.paused===true;if(bd)BOARD=bd;
     CONSOLIDATIONS=cs.consolidations||[];CONSOLIDATION_ERROR=cs.error||'';
     const n2=(INBOX.gates||[]).length+(INBOX.questions||[]).length;const b=$('nav-count');if(b){b.textContent=n2;b.hidden=!n2}
     const rv=$('release-ver');if(rv)rv.textContent='控制面'+(INBOX.upgrades&&INBOX.upgrades.current?' · v'+INBOX.upgrades.current.version:'');
@@ -571,7 +583,9 @@ function drawerBug(id){
     +'<section><div class="row"><button data-cmd="task:'+esc(String((TASKS.find(t=>bare(t.id?.id??t.id)===d.taskId)||{}).id??d.taskId))+'">查看任务</button></div></section>';
 }
 function drawerDefault(){
-  const drafts=MESSAGES.filter(m=>m.state!=='sent');
+  // An unsent message of a finished or voided task never goes out, so it is not waiting for the owner. Tasks outside the list stay counted.
+  const closed=new Set(TASKS.filter(t=>t.state==='done'||t.state==='void').map(t=>bare(t.id?.id??t.id)));
+  const drafts=MESSAGES.filter(m=>m.state!=='sent'&&!closed.has(bare(m.taskId)));
   $('drawer').innerHTML='<div class="kicker">DRAWER</div><h2>消息与任务</h2><p class="meta">点击节点或连线查看正文、放行与审计。</p>'
     +'<section><h3>待发消息 '+drafts.length+'</h3><div class="inbox-list">'+drafts.slice(0,12).map(m=>'<div class="inbox-card"><h3>'+esc(m.step)+' → '+esc(m.role)+'</h3><p>'+esc(m.body.slice(0,80))+'</p><button data-cmd="msg:'+esc(m.id)+'">查看</button></div>').join('')||'<p class="meta">无</p>'+'</div></section>'
     +'<section><h3>收件箱</h3>'+((INBOX?.gates||[]).length+(INBOX?.questions||[]).length)+' 项待你决定</section>'
@@ -658,12 +672,66 @@ function renderInbox(){
     +'</div></div>';$('drawer').innerHTML='<div class="kicker">INBOX</div><h2>老板决定</h2><p class="meta">批准、退回、回复员工提问都会解除阻塞并恢复任务。</p>'
     +'<section><h3>提醒</h3><div class="inbox-list">'+noticesHtml()+'</div></section>';
 }
+let BOARD={};const STAFF_EDITS=new Map();
+const RUNNER_ZH={online:'在线',offline:'离线',unknown:'未知'};
+const STEP_ZH={execute:'执行',review:'复核',rework:'返工',nudge:'催办',eval:'评审',notice:'通知'};
+const PHASE_ZH={execute:'执行',review:'复核'};
+/** Ages are read against the board's own clock, so a page clock running ahead cannot make a stale beat look fresh. */
+function agoText(at){const s=Math.max(0,Math.round(((BOARD.at||Date.now())-at)/1000));return s<60?s+' 秒前':s<3600?Math.round(s/60)+' 分钟前':clock(at)}
+function staffCard(e){
+  const now=e.now||{state:'idle'},eid=esc(e.id),leased=now.state==='leased';
+  const status=leased?'<span class="status violet">'+(now.phase==='review'?'复核中':'执行中')+'</span>'
+    :'<span class="status">空闲'+(now.idleSeconds!=null?' '+duration(now.idleSeconds/60):'')+'</span>';
+  const facts=leased?[now.elapsedSeconds!=null?'已用 '+duration(now.elapsedSeconds/60):'',now.leaseExpiresAt?(now.leaseActive?'租约到 '+clock(now.leaseExpiresAt):'租约已过期，仍绑定本员工'):''].filter(Boolean).join(' · '):'';
+  const lease=leased
+    ?'<p><strong>'+esc(clip(now.title,40))+'</strong> · '+esc(PHASE_ZH[now.phase]||now.phase)+'</p>'
+      +(facts?'<p class="meta">'+esc(facts)+'</p>':'')
+      +(now.progress?'<p class="meta">最近进展：'+esc(now.progress.label)+(now.progress.at?' · '+esc(agoText(now.progress.at)):'')+(now.progress.summary?' · '+esc(now.progress.summary):'')+'</p>':'')
+    :'<p class="meta">当前没有领取任务</p>';
+  const next=(e.next||[]).length?'<ol class="staff-list">'+e.next.map(n=>'<li>'+esc(clip(n.title,30))+'（'+esc(PHASE_ZH[n.phase]||n.phase)+'）· '+esc(n.reason)+'</li>').join('')+'</ol>'
+    :'<p class="meta">队列里暂无可接的任务</p>';
+  const outbox=(e.outbox||[]).length?'<div class="inbox-list">'+e.outbox.map(o=>{
+    const text=STAFF_EDITS.has(o.messageId)?STAFF_EDITS.get(o.messageId):o.body;
+    return '<div class="inbox-card"><h3>'+esc(clip(o.title,30))+' · '+esc(STEP_ZH[o.step]||o.step)+(o.hold?' · 待你放行':'')+'</h3>'
+      +'<label class="comment-field"><span>原文（发给'+esc(e.name)+'，可改）</span><textarea id="ob-'+esc(o.messageId)+'" data-edit="'+esc(o.messageId)+'"'+(o.editable?'':' disabled')+'>'+esc(text)+'</textarea></label>'
+      +(o.workdirPending?'<p class="meta">领取任务后会追加工作目录行</p>':'')
+      +'<div class="decision-actions"><button class="primary" data-cmd="staff-save" data-msg="'+esc(o.messageId)+'" data-emp="'+eid+'">保存修改</button>'
+      +(o.hold?'<button class="approve" data-cmd="release-msg:'+esc(o.messageId)+'">放行</button>':'<button class="reject" data-cmd="staff-hold:'+esc(o.messageId)+'">需要我放行</button>')+'</div></div>';
+  }).join('')+'</div>':'<p class="meta">没有待发消息</p>';
+  return '<article class="decision-card staff-card"><div class="card-top"><span class="type-label">'+esc(e.role)+'</span>'+status+'</div>'
+    +'<h3>'+esc(e.name)+'</h3><p class="byline">'+esc([e.provider,e.model,e.project].filter(Boolean).join(' · '))+'</p>'
+    +'<section><h4>现在</h4>'+lease+'</section><section><h4>接下来</h4>'+next+'</section><section><h4>待发消息</h4>'+outbox+'</section></article>';
+}
+function renderStaff(){
+  // An open editor keeps the page as it is: a refresh that rebuilt it would drop the caret and the owner's words in progress.
+  const active=document.activeElement;if(active&&active.dataset&&active.dataset.edit)return;
+  const r=BOARD.runner||{state:'unknown'};
+  const head='<div class="flow-head"><h1>员工</h1><div class="row"><span class="status '+(r.state==='online'?'success':r.state==='offline'?'danger':'')+'">'
+    +esc('执行端'+(RUNNER_ZH[r.state]||'未知')+(r.at?' · 心跳 '+agoText(r.at):'')+(r.version&&r.version!=='unknown'?' · v'+r.version:''))+'</span>'
+    +'<span class="meta">'+(BOARD.scheduler?'调度器 '+esc(agoText(BOARD.scheduler.at))+'更新':'调度器还没有写出排队')+'</span></div></div>';
+  if(BOARD.at===undefined){
+    $('flow-pane').innerHTML='<div class="flow-pane">'+head+(BOARD.error?'<p class="err">看板读取失败：'+esc(BOARD.error)+'</p>':'<p class="meta">正在读取员工看板…</p>')+'</div>';
+    $('drawer').innerHTML='';
+    return;
+  }
+  const queue=(BOARD.unassigned||[]).map(u=>'<li>'+esc(clip(u.title,30))+'（'+esc(PHASE_ZH[u.phase]||u.phase)+'）· '+esc(u.reason)+'</li>').join('');
+  $('flow-pane').innerHTML='<div class="flow-pane">'+head+'<div class="staff-grid">'+((BOARD.employees||[]).map(staffCard).join('')||'<p class="meta">还没有在岗员工</p>')+'</div>'
+    +'<section class="staff-queue"><h2>排队中、还没落到员工的任务</h2>'+(queue?'<ol class="staff-list">'+queue+'</ol>':'<p class="meta">没有排队中的任务</p>')+'</section></div>';
+  const recent=(BOARD.recent||[]).map(x=>'<div class="inbox-card"><p>'+esc(clock(x.at))+' · '+esc(x.actor)+' · '+esc(x.label)+(x.taskTitle?' · '+esc(clip(x.taskTitle,24)):'')+'</p></div>').join('');
+  $('drawer').innerHTML='<div class="kicker">RECENT</div><h2>最近动态</h2><p class="meta">全公司最近 20 条操作，新的在上。</p><div class="inbox-list">'+(recent||'<p class="meta">还没有动态</p>')+'</div>';
+}
+async function staffSave(msg,emp){
+  const el=$('ob-'+msg);
+  try{await api('message.edit_rendered',{messageId:msg,employeeId:emp,rendered:el?el.value:''});STAFF_EDITS.delete(msg);toast('已保存，派工时按这段原文发出')}
+  catch(e){toast('保存失败：'+e.message)}
+  await load();
+}
 function renderDefs(){
   $('flow-pane').innerHTML='<div class="flow-pane"><div class="flow-head"><h1>编制</h1></div><div class="decision-grid">'
     +DEFS.map(d=>'<article class="decision-card"><div class="card-top"><span class="type-label">'+esc(d.role)+'</span><span class="status '+(d.enabled?'success':'')+'">'+(d.enabled?'启用':'停用')+'</span></div><h3>'+esc(d.id)+'</h3><p class="byline">'+esc(d.provider)+' · '+esc(d.model||'')+'</p><div class="decision-actions"><button data-cmd="toggle-def:'+esc(d.id)+':'+(d.enabled?0:1)+'">'+(d.enabled?'停用':'启用')+'</button></div></article>').join('')+'</div></div>';
   $('drawer').innerHTML='<div class="kicker">DEF</div><h2>新建 / 修改编制</h2><div class="task-form"><label>ID<input id="d-id"/></label><label>岗位<select id="d-role">'+['product','engineering','qa','concept-design','asset-production','screenwriter','story-author','cinematography','cs','eval'].map(r=>'<option>'+r+'</option>').join('')+'</select></label><label>provider<input id="d-provider" value="codex"/></label><label>model<input id="d-model" value="auto:sol"/></label><div class="row"><button class="primary" data-cmd="create-def">保存编制</button></div></div>';
 }
-function render(){if(T==='flow')renderFlow();else if(T==='inbox')renderInbox();else if(T==='routes')renderRoutes();else if(T==='notes')renderLaneNotes();else renderDefs()}
+function render(){if(T==='flow')renderFlow();else if(T==='inbox')renderInbox();else if(T==='staff')renderStaff();else if(T==='routes')renderRoutes();else if(T==='notes')renderLaneNotes();else renderDefs()}
 async function saveMsg(id){await api('message.edit',{messageId:id,body:$('msg-body').value});toast('已保存');await load()}
 async function holdMsg(id,on){await api(on?'message.hold':'message.release',{messageId:id});toast(on?'已标记需要我放行':'已取消');await load()}
 async function releaseMsg(id){await api('message.release',{messageId:id});toast('已放行，等待派工');await load()}

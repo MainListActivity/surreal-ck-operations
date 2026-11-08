@@ -1,8 +1,10 @@
 /** 待发消息表：建单时为执行岗与复核岗各生成一条 draft；返工/催办在触发时生成。 */
 import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from './core-errors.ts';
+import { machineCriterionOf, routeBody, stepOfTask, templateFor, type MessageStep } from './outbound-render.ts';
+export { DEFAULT_MACHINE_CRITERION, renderMessage, templateFor } from './outbound-render.ts';
 
-export type MessageStep = 'execute' | 'review' | 'rework' | 'nudge' | 'eval' | 'notice';
+export type { MessageStep } from './outbound-render.ts';
 export type MessageState = 'draft' | 'held' | 'sent';
 
 export interface OutboundMessage {
@@ -22,57 +24,8 @@ export interface OutboundMessage {
 
 const STEPS: readonly MessageStep[] = ['execute', 'review', 'rework', 'nudge', 'eval', 'notice'];
 
-/** The deploy-leg machine criterion id every code dispatch may name when the task carries no readable criteria. */
-export const DEFAULT_MACHINE_CRITERION = 'AC-BASE-DEPLOY-1';
-
-/** 表里保存短正文；派工时 renderMessage 才补上真实路径、工具绝对路径与任务 ID。 */
-const NOTES = `先读 notes.md。`;
-/** A session that stays in its turn after handing in burns tokens and cannot be woken for its own rework. */
-const END_TURN = `提交后结束本轮，不要等结果；被退回时系统会再通知你。`;
-const LEARNED = `多数任务不需要写笔记；只有今后同职能的任务都用得上的要求、方法或坑，才加 learned 数组（最多 5 条，每条一行，不写本次任务的内容）；被退回那一轮写的笔记不会生效。`;
-/** 员工沙箱不能安装，也读不到生产控制台令牌：自验在最终提交上做，安装到生产由老板侧完成（普通任务登记不了升级卡，自动升级不会接手）。 */
-const EXECUTE_CODE = `${NOTES}实现 task.md 中的需求，在最终提交上按验收标准逐条自验，合入 main 后：sck call submit '{"text":"<结果>","sha":"<合入提交>"}'。安装到生产由老板侧完成，你不要安装，也不要登记升级卡。需要后续任务时在 submit 里加 next 数组。${LEARNED}${END_TURN}`;
-const EXECUTE_PLAIN = `${NOTES}完成 task.md 中的需求，按验收标准自验后：sck call submit '{"text":"<结果>"}'。需要后续任务时在 submit 里加 next 数组。${LEARNED}${END_TURN}`;
-/** 第 1 条写的是老板视角的结果：不成立就没必要再读其余标准；软件线只在最终合入提交上核对。 */
-const REVIEW_FIRST = `先查验收标准第 1 条：这一条写的是老板视角的结果，不成立就直接退回，其余各条不用再看；成立后再逐条复验其余标准。`;
-const REVIEW = `${NOTES}按 task.md 的验收标准复验。${REVIEW_FIRST}sck call review '{"decision":"accept|return","text":"<结论>"}'。${LEARNED}提交后结束本轮。`;
-const REVIEW_CODE = `${NOTES}按 task.md 的验收标准复验。${REVIEW_FIRST}代码任务在最终合入提交上核对，不检查生产加载的版本。sck call review '{"decision":"accept|return","text":"<结论>"}'。${LEARNED}提交后结束本轮。`;
-const REWORK_CODE = `修复 findings/round-NN.md 中的问题后，` + EXECUTE_CODE;
-const REWORK_PLAIN = `修复 findings/round-NN.md 中的问题后，` + EXECUTE_PLAIN;
-const NUDGE = (phase: string) => phase === 'review' ? REVIEW : EXECUTE_PLAIN;
-/** eval 不读本任务 task.md：评分规则在运营仓的 agents/eval.md，由派工时补成绝对路径。 */
-const EVAL = `任务 {taskId} 已完成，读 sck call get_task_history 和 sck call get_model_evidence，按 agents/eval.md 为全部参与员工打分，用 sck call record_score '{"taskId":"{taskId}","summary":"<本轮一句话总结>","complexity":3,"scores":[{"employee":"<员工编号>","quality":4,"evidence":4,"discipline":4,"timeliness":4,"overall":4,"notes":"<评语>","modelScores":[]}]}' 提交`;
-
-/** A route's own template still has to point the session at its notes; the stored draft is the full text the owner previews. */
-const routeBody = (body?: string): string | undefined =>
-  body?.trim() ? (body.includes('notes.md') ? body : `${NOTES}${body}`) : undefined;
-
-export const templateFor = (step: MessageStep, code = false, phase = 'doing'): string =>
-  step === 'execute' ? (code ? EXECUTE_CODE : EXECUTE_PLAIN)
-    : step === 'review' ? (code ? REVIEW_CODE : REVIEW)
-      : step === 'rework' ? (code ? REWORK_CODE : REWORK_PLAIN)
-        : step === 'nudge' ? NUDGE(phase)
-          : EVAL;
-
-/**
- * Pure send-time rewriting of the stored short body. The owner edits the short form; the employee receives
- * concrete absolute paths and a tool binary that is actually on disk. No database or host state is read here.
- */
-export function renderMessage(body: string, opts: {
-  sckBin: string; commDir: string; findingsFile?: string; taskId: string; opsRepo?: string; acId?: string;
-}): string {
-  const { sckBin, commDir, findingsFile, taskId, opsRepo, acId } = opts;
-  const taskFile = `${commDir.replace(/\/+$/, '')}/task.md`;
-  const findings = findingsFile ? `${commDir.replace(/\/+$/, '')}/${findingsFile.replace(/^\/+/, '')}` : undefined;
-  return body
-    .replaceAll('{taskId}', taskId)
-    .replaceAll('{acId}', acId ?? DEFAULT_MACHINE_CRITERION)
-    .replaceAll('sck call', `'${sckBin}' call`)
-    .replaceAll('task.md', taskFile)
-    .replaceAll('notes.md', `${commDir.replace(/\/+$/, '')}/notes.md`)
-    .replaceAll(/findings\/round-(?:\d+|NN)\.md/g, findings ?? 'findings/round-NN.md')
-    .replaceAll('agents/eval.md', opsRepo ? `${opsRepo.replace(/\/+$/, '')}/agents/eval.md` : 'agents/eval.md');
-}
+/** A record id's key; a plain value stands for itself. */
+const keyOf = (value: unknown): string => String((value as RecordId | undefined)?.id ?? value ?? '');
 
 const rowView = (row: Record<string, unknown>): OutboundMessage => ({
   id: String((row.id as RecordId).id ?? row.id), taskId: String((row.task as RecordId)?.id ?? row.task ?? ''),
@@ -122,6 +75,12 @@ export class OutboundMessageStore {
     return (rows ?? []).map(rowView);
   }
 
+  /** One message by id, whatever its state. */
+  async get(messageId: string): Promise<OutboundMessage | undefined> {
+    const [rows] = await this.db.query<[Array<Record<string, unknown>>]>('SELECT * FROM $msg;', { msg: this.message(messageId) });
+    return rows?.[0] ? rowView(rows[0]) : undefined;
+  }
+
   /** 最新 draft：同一任务同一步骤可有多条编辑草稿，发送只认最新的一条。 */
   async latestDraft(taskId: string, step: MessageStep): Promise<OutboundMessage | undefined> {
     const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
@@ -134,16 +93,7 @@ export class OutboundMessageStore {
   async machineCriterionId(taskId: string): Promise<string> {
     const [rows] = await this.db.query<[Array<{ acceptance_criteria?: unknown }>]>(
       'SELECT acceptance_criteria FROM $task;', { task: this.task(taskId) });
-    const raw = rows?.[0]?.acceptance_criteria;
-    if (Array.isArray(raw)) {
-      for (const item of raw) {
-        if (item && typeof item === 'object' && (item as { kind?: unknown }).kind === 'machine' &&
-          (item as { required?: unknown }).required === true && typeof (item as { id?: unknown }).id === 'string') {
-          return (item as { id: string }).id;
-        }
-      }
-    }
-    return DEFAULT_MACHINE_CRITERION;
+    return machineCriterionOf(rows?.[0]?.acceptance_criteria);
   }
 
   /** The next step of an unfinished task: the phase plus the audit's last return decides which draft applies. */
@@ -153,7 +103,7 @@ export class OutboundMessageStore {
       this.db.query<[Array<{ id: unknown }>]>(
         "SELECT id, at FROM audit WHERE task = $task AND action IN ['return','owner_reject'] ORDER BY at DESC LIMIT 1;", { task: this.task(taskId) }).then(r => r[0]),
     ]);
-    return row?.[0]?.state === 'review' ? 'review' : (returns?.length ?? 0) > 0 ? 'rework' : 'execute';
+    return stepOfTask(row?.[0]?.state, (returns?.length ?? 0) > 0);
   }
 
   /** Whether the next dispatch of this task is held by the owner. Checks a draft and, absent one, what prepareSend would create. */
@@ -188,7 +138,7 @@ export class OutboundMessageStore {
     const row = rows?.[0];
     if (!row) throw await this.refusal(msg);
     // A released message has been waiting in the owner inbox; close the notice in the same command.
-    if (!hold) await this.resolveHoldNotice(row.taskId, row.step);
+    if (!hold) await this.resolveHoldNotice(row.task, row.step);
     return rowView(row);
   }
 
@@ -216,23 +166,55 @@ export class OutboundMessageStore {
     const draft = await this.latestDraft(taskId, step);
     if (!draft) {
       // 旧任务没有草稿：按模板即时生成一条，保证派工正文永远来自这张表。
-      const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
-        `SELECT executor_role, reviewer_role, kind, work_intent FROM $task;`, { task: this.task(taskId) });
-      const row = rows?.[0] as { work_intent?: { kind?: string }; kind?: string; reviewer_role?: string; executor_role?: string } | undefined;
-      // 复核与执行看同一个代码工作标记：review 草稿缺失时也要按工作种类选模板。
-      const code = (step === 'execute' || step === 'rework' || step === 'review') &&
-        (row?.work_intent?.kind === 'code' || ['release', 'deploy'].includes(String(row?.kind ?? '')));
-      const role = step === 'review' ? String(row?.reviewer_role ?? 'qa') : String(row?.executor_role ?? 'engineering');
-      // A re-dispatch of the same step (lease expired, instance replaced) repeats what was last sent, so an owner edit survives.
-      const [sent] = await this.db.query<[Array<{ body?: string }>]>(
-        `SELECT body, created_at FROM outbound_message WHERE task = $task AND step = $step AND state = 'sent' ORDER BY created_at DESC LIMIT 1;`,
-        { task: this.task(taskId), step });
-      const fresh = await this.createDraft(taskId, step, role, code, step === 'review' ? 'review' : 'doing', sent?.[0]?.body);
+      const fresh = await this.seedDraft(taskId, step);
       if (fresh.hold) return null;
       return { body: fresh.body, message: { ...fresh, sentTo: employeeId } };
     }
     if (draft.hold || draft.state === 'held') return null;
     return { body: draft.body, message: { ...draft, sentTo: employeeId } };
+  }
+
+  /**
+   * Gives each queued task its next step's draft before the owner board reads it, so a rework message exists from the moment its
+   * task is queued, not only at its first dispatch. Idempotent: a step with an unsent draft is left alone. The step is the one the
+   * next dispatch sends (stepOfTask over the task state and its returns).
+   */
+  async ensureQueuedDrafts(taskIds: readonly string[]): Promise<void> {
+    if (taskIds.length === 0) return;
+    const ids = taskIds.map(id => this.task(id));
+    const [tasks, returns, drafts] = await Promise.all([
+      this.db.query<[Array<{ id: unknown; state: string }>]>('SELECT id, state FROM task WHERE id IN $ids;', { ids }).then(r => r[0] ?? []),
+      this.db.query<[Array<{ task: unknown }>]>("SELECT task FROM audit WHERE task IN $ids AND action IN ['return', 'owner_reject'];", { ids })
+        .then(r => r[0] ?? []),
+      this.db.query<[Array<{ task: unknown; step: string }>]>("SELECT task, step FROM outbound_message WHERE task IN $ids AND state != 'sent';", { ids })
+        .then(r => r[0] ?? []),
+    ]);
+    const returned = new Set(returns.map(row => keyOf(row.task)));
+    const have = new Set(drafts.map(row => `${keyOf(row.task)}:${row.step}`));
+    for (const task of tasks) {
+      const taskId = keyOf(task.id);
+      const step = stepOfTask(task.state, returned.has(taskId));
+      if (!have.has(`${taskId}:${step}`)) await this.seedDraft(taskId, step);
+    }
+  }
+
+  /**
+   * The draft a step gets when it has none: the template, or what was last sent for the same step, so an owner edit survives a
+   * re-dispatch. The send path and the queue both create drafts here, so they produce the same text.
+   */
+  private async seedDraft(taskId: string, step: MessageStep): Promise<OutboundMessage> {
+    const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
+      `SELECT executor_role, reviewer_role, kind, work_intent FROM $task;`, { task: this.task(taskId) });
+    const row = rows?.[0] as { work_intent?: { kind?: string }; kind?: string; reviewer_role?: string; executor_role?: string } | undefined;
+    // 复核与执行看同一个代码工作标记：review 草稿缺失时也要按工作种类选模板。
+    const code = (step === 'execute' || step === 'rework' || step === 'review') &&
+      (row?.work_intent?.kind === 'code' || ['release', 'deploy'].includes(String(row?.kind ?? '')));
+    const role = step === 'review' ? String(row?.reviewer_role ?? 'qa') : String(row?.executor_role ?? 'engineering');
+    // A re-dispatch of the same step (lease expired, instance replaced) repeats what was last sent, so an owner edit survives.
+    const [sent] = await this.db.query<[Array<{ body?: string }>]>(
+      `SELECT body, created_at FROM outbound_message WHERE task = $task AND step = $step AND state = 'sent' ORDER BY created_at DESC LIMIT 1;`,
+      { task: this.task(taskId), step });
+    return this.createDraft(taskId, step, role, code, step === 'review' ? 'review' : 'doing', sent?.[0]?.body);
   }
 
   async markSent(messageId: string, employeeId: string, body: string): Promise<{ body: string; message: OutboundMessage }> {

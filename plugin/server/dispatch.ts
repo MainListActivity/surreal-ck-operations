@@ -1,4 +1,5 @@
 import { DispatchTimings } from "./vendor/src/diagnostics.ts";
+import { RUNNER_BEAT_MS, writeBoardView, writeRunnerHeartbeat } from "./vendor/src/board.ts";
 import { openUserPaths, scratchKeepReason } from "./vendor/src/dispatcher/scratch-gc.ts";
 import { pruneOperationalData } from "./vendor/src/data-retention.ts";
 import { recordPendingTaskCosts } from "./vendor/src/task-cost.ts";
@@ -11,6 +12,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import { company, currentPaseo, notePaseo, type Company } from "./company";
 import { isCompanyAgent } from "./company-agent";
 import { dirname, join } from "node:path";
+import { hostname } from "node:os";
 import { serviceHome } from "./env";
 import { sweepArchiveBatches, sweepInstanceDirs } from "./vendor/src/dispatcher/lifecycle-gc.ts";
 import { missingFrom, poolRoom, readMagpieQuotas, type MagpieUsageEntry } from "./vendor/src/dispatcher/magpie-quota.ts";
@@ -304,6 +306,28 @@ export async function persistDispatchObservation(ctx: Company): Promise<void> {
   }
 }
 
+/**
+ * Persist the latest pass's owner board (W2): the queue and each employee's next rows, the values a dispatch message names,
+ * and the comm dirs. The board reader joins it with the live database; it never reads the scheduler's memory.
+ */
+export async function persistBoardView(ctx: Company): Promise<void> {
+  const board = ctx.dispatcher.dispatchSnapshot().board;
+  if (board?.at) await writeBoardView(ctx.db.db, board);
+}
+
+/**
+ * One runner heartbeat for the owner board (W2): this plugin process, its host and the installed release. A failure only warns;
+ * the board then reads the runner as offline once the last beat ages out.
+ */
+function beatRunner(): void {
+  void company()
+    .then(async ctx => {
+      const installed = await ctx.upgrades.installed().catch(() => undefined);
+      await writeRunnerHeartbeat(ctx.db.db, { runner: `plugin:${process.pid}`, host: hostname(), version: installed?.version ?? "unknown" });
+    })
+    .catch(error => console.warn(`runner heartbeat failed: ${(error as Error).message}`));
+}
+
 export function startDispatch(server: PluginServerContext): () => void {
   let stopped = false;
   const interruptions = new TurnInterruptions();
@@ -415,6 +439,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
             .finally(()=>{autoUpgradePending=false;});
         }
         await timing.measure("observation", () => persistDispatchObservation(ctx)).catch((error) => console.warn(`dispatch observation write failed: ${(error as Error).message}`));
+        await timing.measure("board", () => persistBoardView(ctx)).catch((error) => console.warn(`board view write failed: ${(error as Error).message}`));
         failures = 0;
         const changed = report.commands || report.revoked.length || report.woke.length || report.retired.length ||
           report.exhausted.length || (report.recovered?.length ?? 0) || report.notices.length || report.evals.length || (report.decisions?.length ?? 0) ||
@@ -435,6 +460,9 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
     }
   };
   void loop();
+  // The runner beats on its own timer, not on the tick: a long pass must not make the runner read as offline.
+  beatRunner();
+  const runnerBeat = setInterval(beatRunner, RUNNER_BEAT_MS);
 
   // A finished turn usually means a checkpoint/submit/review landed; dispatch immediately
   // instead of waiting out the poll interval.
@@ -508,6 +536,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
 
   return () => {
     stopped = true;
+    clearInterval(runnerBeat);
     interruptions.stop();
     wake?.();
     for (const remove of removers) remove();

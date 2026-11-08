@@ -239,6 +239,9 @@ export class CompanyDatabase {
     // 老板保护与员工策略（编号 056）：protected_command / agent_policy / ops_audit 三张新表与写入事件，本机与公司库都应用。
     await this.db.query(loadSchema('056-command-guard.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 56 WHERE schema_version < 56;');
+    // 057：老板看板的执行端心跳（编号 057，054-056 未用）。只新增 runner_heartbeat 表；旧 release 读不到即忽略（RB01）。
+    await this.db.query(loadSchema('057-runner-heartbeat.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 57 WHERE schema_version < 57;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {
