@@ -1,12 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
-import { existsSync, realpathSync } from 'node:fs';
-import { rm } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { RecordId } from 'surrealdb';
 import type { Surreal } from 'surrealdb';
 import type { Principal, ProjectView, Role, TaskView, WorkIntent, WorktreeAssignment, WorktreeView } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
+import { hostIO } from '../host-io.ts';
 import { MAX_ASSET_PATHS, MAX_ASSET_PATH_CHARS } from '../input-bounds.ts';
 import {
   decideReclaim, parseGraceDays, reclaimEnabledFrom, type ReclaimTrigger,
@@ -15,6 +12,11 @@ import { junkPathsFromPorcelain, meaningfulChanges } from './lifecycle-gc.ts';
 
 const hash = (s: string) => createHash('sha256').update(s).digest('hex');
 const record = (table: string, key: string) => new RecordId(table, key);
+/** The allocation path beside a repository: <repo dir>-sck-<8 hex of the repo path>-<suffix>. */
+const siblingPath = (repo: string, suffix: string): string => {
+  const io = hostIO();
+  return io.path.join(io.path.dirname(repo), `${io.path.basename(repo)}-sck-${hash(repo).slice(0, 8)}-${suffix}`);
+};
 export const worktreeId = (repo: string, path: string) => hash(`${repo}\0${path}`);
 export interface SceneCleanupResult { workspacesArchived?: number; projectsDeleted?: number; employeesRetired?: number }
 export interface RegistryOptions {
@@ -49,47 +51,29 @@ interface Ref { task?: RecordId; session_active?: boolean; employee: string; del
   at: unknown; tree: RecordId; current?: string; current_delivery?: string; task_state?: string; tree_mode?: string;
   assigned_tree?: string; current_fence?: number; handover?: boolean; resume_state?: string }
 
-/** No shell, no credential files, and bounded git processes. */
+/** No shell, no credential files, and bounded git processes (the host runs the program with a 30 s limit). */
 async function git(repo: string, args: string[]): Promise<string> {
-  return new Promise((resolveOut, reject) => {
-    const child = spawn('git', ['-C', repo, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = ''; let err = '';
-    const timer = setTimeout(() => child.kill('SIGKILL'), 30_000);
-    child.stdout.on('data', chunk => { out += chunk; });
-    child.stderr.on('data', chunk => { err += chunk; });
-    child.on('error', error => { clearTimeout(timer); reject(error); });
-    child.on('close', code => { clearTimeout(timer); code === 0 ? resolveOut(out.trimEnd()) : reject(new CompanyError('conflict', `git worktree operation failed: ${err.slice(0, 300)}`)); });
-  });
+  const run = await hostIO().proc.run('git', ['-C', repo, ...args], { timeoutMs: 30_000 });
+  if (run.code === 0) return run.stdout.trimEnd();
+  throw new CompanyError('conflict', `git worktree operation failed: ${run.stderr.slice(0, 300)}`);
 }
 async function trees(repo: string): Promise<Tree[]> {
+  const io = hostIO();
   const out = await git(repo, ['worktree', 'list', '--porcelain']);
   return out.split('\n\n').filter(Boolean).map((block, i) => {
     const lines = block.split('\n');
     const path = lines.find(l => l.startsWith('worktree '))!.slice(9);
-    return { path: existsSync(path) ? realpathSync(path) : resolve(path), main: i === 0,
+    return { path: io.fs.exists(path) ? io.fs.realpath(path) : io.path.resolve(path), main: i === 0,
       branch: lines.find(l => l.startsWith('branch '))?.slice(7).replace(/^refs\/heads\//, '') };
   });
 }
 
-/** Kernel flock spans plugin + MCP processes and is released on crash/EOF, with no stale lease timeout.
- * The helper reads only its lock file. Its stdin is closed even when the caller dies.
+/**
+ * Runs `action` under the repository's allocation lock. The host holds a kernel flock (released on crash/EOF, with no stale
+ * lease timeout); see HostLock and host-node.ts.
  */
 export async function withRepoLock<T>(commonDir: string, action: () => Promise<T>): Promise<T> {
-  const helper = spawn('/usr/bin/python3', ['-c',
-    'import fcntl,sys; f=open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); print("locked", flush=True); sys.stdin.buffer.read()',
-    join(commonDir, 'sck-worktree-allocation.lock')], { stdio: ['pipe', 'pipe', 'pipe'] });
-  let exited = false;
-  const closed = new Promise<void>(done => helper.once('close', () => { exited = true; done(); }));
-  try {
-    await new Promise<void>((done, reject) => {
-      const timer = setTimeout(() => { helper.kill(); reject(new CompanyError('conflict', 'Repository allocation lock busy')); }, 35_000);
-      helper.once('error', error => { clearTimeout(timer); reject(error); });
-      helper.once('close', () => { clearTimeout(timer); reject(new CompanyError('conflict', 'Repository allocation lock unavailable')); });
-      helper.stdout.once('data', () => { clearTimeout(timer); done(); });
-    });
-    if (exited) throw new CompanyError('conflict', 'Repository allocation lock lost');
-    return await action();
-  } finally { helper.stdin.end(); await closed; }
+  return hostIO().lock.withRepoLock(commonDir, action);
 }
 
 export function validateIntent(intent: WorkIntent | undefined): void {
@@ -100,7 +84,7 @@ export function validateIntent(intent: WorkIntent | undefined): void {
   if (intent.kind === 'assets' && (!intent.paths?.length || intent.paths.length > MAX_ASSET_PATHS)) throw new CompanyError('invalid', 'Asset writes require authorized relative directories');
   if (intent.kind !== 'assets' && intent.paths?.length) throw new CompanyError('invalid', 'Only assets use directory write scopes');
   for (const p of intent.paths ?? []) {
-    if (typeof p !== 'string' || isAbsolute(p) || p.length > MAX_ASSET_PATH_CHARS || p.split('/').some(s => !s || s === '.' || s === '..' || /^(\.git|\.env.*|\.runtime|credentials|private)$/i.test(s)) || /[\\\x00-\x1f]/.test(p)) throw new CompanyError('invalid', 'Unsafe asset write directory');
+    if (typeof p !== 'string' || p.startsWith('/') || p.length > MAX_ASSET_PATH_CHARS || p.split('/').some(s => !s || s === '.' || s === '..' || /^(\.git|\.env.*|\.runtime|credentials|private)$/i.test(s)) || /[\\\x00-\x1f]/.test(p)) throw new CompanyError('invalid', 'Unsafe asset write directory');
   }
 }
 export const overlap = (a: string, b: string) => {
@@ -158,8 +142,9 @@ export class WorktreeRegistry {
   private readonly retained = new Map<string, string>();
   constructor(private readonly db: Surreal, readonly options: RegistryOptions) {}
   async identity(repoPath: string) {
-    const path = realpathSync(repoPath);
-    const common = realpathSync(resolve(path, await git(path, ['rev-parse', '--git-common-dir'])));
+    const io = hostIO();
+    const path = io.fs.realpath(repoPath);
+    const common = io.fs.realpath(io.path.resolve(path, await git(path, ['rev-parse', '--git-common-dir'])));
     const list = await trees(path);
     return { repo: list[0]!.path, common, list };
   }
@@ -189,7 +174,7 @@ export class WorktreeRegistry {
         if (project && !existing.project) await this.db.query('UPDATE ONLY $tree SET project = $project;', { tree: existing.id, project });
         continue;
       }
-      const managedRead = t.path === join(dirname(repo), `${basename(repo)}-sck-${hash(repo).slice(0, 8)}-shared`) && t.branch === `sck/shared-${hash(repo).slice(0, 12)}`;
+      const managedRead = t.path === siblingPath(repo, 'shared') && t.branch === `sck/shared-${hash(repo).slice(0, 12)}`;
       const protection = managedRead ? undefined : t.main ? 'repository-main' : 'legacy-or-release: manual adoption required';
       await this.db.query(`CREATE ONLY $tree CONTENT { repo: $repo, project: $project, path: $path,
         branch: $branch, mode: $mode, protection: $protection, created_at: time::now(), last_used_at: time::now() };`,
@@ -200,7 +185,7 @@ export class WorktreeRegistry {
   private async restoreShared(repo: string, list: Tree[], shared: Row, base: string, writing: boolean) {
     const expected = `sck/shared-${hash(repo).slice(0, 12)}`;
     const tree = list.find(t => t.path === shared.path);
-    if (!tree || basename(shared.path) !== `${basename(repo)}-sck-${hash(repo).slice(0, 8)}-shared`) return;
+    if (!tree || hostIO().path.basename(shared.path) !== hostIO().path.basename(siblingPath(repo, 'shared'))) return;
     if (tree.branch !== expected) {
       if (writing || await git(shared.path, ['status', '--porcelain'])) return;
       let exists = false;
@@ -234,9 +219,9 @@ export class WorktreeRegistry {
     let chosen = chooseTree(rows, list, task, shape);
     if (!chosen) {
       const mode = desired ? 'exclusive' : 'shared';
-      const path = join(dirname(repo), `${basename(repo)}-sck-${hash(repo).slice(0, 8)}-${mode === 'shared' ? 'shared' : task.id.slice(0, 8)}`);
+      const path = siblingPath(repo, mode === 'shared' ? 'shared' : task.id.slice(0, 8));
       // Do not treat an existing unregistered path as an empty target.
-      if (existsSync(path)) throw new CompanyError('conflict', 'Unregistered allocation path exists; preserve it for reconciliation');
+      if (hostIO().fs.exists(path)) throw new CompanyError('conflict', 'Unregistered allocation path exists; preserve it for reconciliation');
       const branch = desired ?? `sck/shared-${hash(repo).slice(0, 12)}`;
       let branchExists = false;
       try { await git(repo, ['show-ref', '--verify', `refs/heads/${branch}`]); branchExists = true; } catch {}
@@ -245,7 +230,7 @@ export class WorktreeRegistry {
         try { await git(repo, ['merge-base', '--is-ancestor', branch, base]); await git(repo, ['branch', '-f', branch, base]); } catch {}
       }
       await git(repo, ['worktree', 'add', ...(branchExists ? [] : ['-b', branch]), path, branchExists ? branch : base]);
-      const canonical = realpathSync(path);
+      const canonical = hostIO().fs.realpath(path);
       chosen = { id: record('worktree', worktreeId(repo, canonical)), repo, project: project?.id, path: canonical, branch, mode, created_at: new Date(), last_used_at: new Date() };
       // Persist the physical tree before the task claim. On failure it has no effective reference.
       await this.db.query(`UPSERT ONLY $tree CONTENT { repo: $repo, project: $project, path: $path,
@@ -255,11 +240,12 @@ export class WorktreeRegistry {
     // Refuse branch drift (manual checkout) instead of silently restoring/resetting the tree.
     const actualBranch = await git(chosen.path, ['symbolic-ref', '--short', 'HEAD']).catch(() => undefined);
     if (actualBranch !== chosen.branch) throw new CompanyError('conflict', 'Registered branch differs from git; manual reconciliation required');
+    const io = hostIO();
     for (const p of intent.paths ?? []) {
-      let candidate = join(chosen.path, p);
-      while (!existsSync(candidate)) candidate = dirname(candidate);
-      const resolved = realpathSync(candidate);
-      if (resolved !== candidate || (resolved !== chosen.path && !resolved.startsWith(chosen.path + sep))) throw new CompanyError('invalid', 'Asset directory escapes worktree through symlink');
+      let candidate = io.path.join(chosen.path, p);
+      while (!io.fs.exists(candidate)) candidate = io.path.dirname(candidate);
+      const resolved = io.fs.realpath(candidate);
+      if (resolved !== candidate || (resolved !== chosen.path && !resolved.startsWith(chosen.path + io.path.sep))) throw new CompanyError('invalid', 'Asset directory escapes worktree through symlink');
     }
     return { id: String(chosen.id.id), repo, project: project?.id, worktreePath: chosen.path, branch: chosen.branch,
       mode: chosen.mode, intent,
@@ -348,8 +334,9 @@ export class WorktreeRegistry {
    */
   private async removeTree(repo: string, path: string): Promise<{ ok: boolean; reason?: string }> {
     try {
+      const io = hostIO();
       const junk = junkPathsFromPorcelain(await git(path, ['status', '--porcelain']).catch(() => ''));
-      for (const rel of junk) await rm(join(path, rel), { recursive: true, force: true }).catch(() => undefined);
+      for (const rel of junk) await io.fs.removeTreeAsync(io.path.join(path, rel)).catch(() => undefined);
       await git(repo, ['worktree', 'remove', path]);
       return { ok: true };
     } catch (error) {
@@ -617,7 +604,8 @@ export class WorktreeRegistry {
               }
             }
           }
-          if (result.removed.some(p => dirname(p) === dirname(repo) || p.startsWith(dirname(repo)))) {
+          const parent = hostIO().path.dirname(repo);
+          if (result.removed.some(p => hostIO().path.dirname(p) === parent || p.startsWith(parent))) {
             await git(repo, ['worktree', 'prune']).catch(() => undefined);
           }
         });

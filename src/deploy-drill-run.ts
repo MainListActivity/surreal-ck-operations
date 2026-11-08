@@ -4,6 +4,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { runDrillDetached } from './deploy-drill-service.ts';
+import { installNodeHost } from './host-node.ts';
 
 const runId = process.argv[2];
 if (!runId) {
@@ -12,4 +13,5 @@ if (!runId) {
 }
 const serviceHome = process.env.SCK_DRILL_HOME ?? join(homedir(), 'Library', 'Application Support', 'SurrealCKCompany');
 const repo = process.env.SCK_DRILL_REPO ?? '/Users/y/IdeaProjects/surreal-ck-operations';
+installNodeHost();
 await runDrillDetached(serviceHome, repo, runId);
