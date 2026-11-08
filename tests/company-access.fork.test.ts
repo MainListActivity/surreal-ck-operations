@@ -16,9 +16,6 @@ const SECRET = 'company-access-fixture-secret-0123456789-abcdef';
 const ISS = 'https://ma.example.test';
 const NS = 'company_access';
 const DATABASE = 'control_plane';
-const TASK_GUARD = '需求与验收标准只能由老板修改';
-const MESSAGE_GUARD = '消息正文与放行保留只能由老板修改';
-const CREATE_GUARD = '非提议任务不能由员工直接写入需求或验收标准';
 const PROTECTED_GUARD = '只有老板可以修改保护命令';
 const POLICY_GUARD = '只有老板可以修改员工策略';
 const AUDIT_GUARD = '审计账本只追加';
@@ -111,47 +108,18 @@ run('055 令牌：ac 与签发方校验通过；无 ac、签发方不符、签�
   await expect(session(tokenFor('runner', 'x', { id: 'runner:1' }))).rejects.toThrow();
 });
 
-run('055 运行器：普通数据可读写；需求、验收、正文与保留的改动被拒，行保持不变', async () => {
-  await seedTask('fx_runner');
-  await seedMessage('fx_runner', 'fx_runner');
-  const runner = await session(tokenFor('runner', 'runner-1'));
-  await runner.query("UPDATE task:fx_runner SET state = 'doing';");
-  const [[seen]] = await runner.query<[Array<{ state: string }>]>('SELECT state FROM task:fx_runner;');
-  expect(seen).toMatchObject({ state: 'doing' });
-  await rejects(runner.query("UPDATE task:fx_runner SET requirement = '篡改';"), TASK_GUARD);
-  await rejects(runner.query("UPDATE task:fx_runner SET acceptance_text = '篡改';"), TASK_GUARD);
-  await rejects(runner.query("UPDATE task:fx_runner SET acceptance_criteria = [{ id: 'x', kind: 'machine', required: true }];"), TASK_GUARD);
-  await rejects(runner.query("UPDATE task:fx_runner SET context = '篡改';"), TASK_GUARD);
-  await rejects(runner.query("UPDATE outbound_message:fx_runner SET body = '篡改';"), MESSAGE_GUARD);
-  await rejects(runner.query('UPDATE outbound_message:fx_runner SET hold = true;'), MESSAGE_GUARD);
-  // 原样回写同一个值，以及发送时把原本未保留的 hold 写回 false，都放行。
-  await runner.query("UPDATE task:fx_runner SET requirement = '需求原文';");
-  await runner.query("UPDATE outbound_message:fx_runner SET state = 'sent', sent_at = time::now(), hold = false;");
-  const [[task]] = await company.db.query<[Array<Record<string, unknown>>]>(
-    'SELECT state, requirement, acceptance_text, context FROM task:fx_runner;');
-  expect(task).toMatchObject({ state: 'doing', requirement: '需求原文', acceptance_text: '验收原文', context: '老板原话' });
-  const [[message]] = await company.db.query<[Array<Record<string, unknown>>]>('SELECT state, body, hold FROM outbound_message:fx_runner;');
-  expect(message).toMatchObject({ state: 'sent', body: '正文原文', hold: false });
-});
-
-run('055 自动化：普通数据可读写；需求、验收、正文与保留的改动被拒，行保持不变', async () => {
-  await seedTask('fx_auto_edit');
-  await seedMessage('fx_auto_edit', 'fx_auto_edit');
-  const automation = await session(tokenFor('automation', 'automation-1'));
-  await automation.query("UPDATE task:fx_auto_edit SET state = 'doing';");
-  const [[seen]] = await automation.query<[Array<{ state: string }>]>('SELECT state FROM task:fx_auto_edit;');
-  expect(seen).toMatchObject({ state: 'doing' });
-  await rejects(automation.query("UPDATE task:fx_auto_edit SET requirement = '篡改';"), TASK_GUARD);
-  await rejects(automation.query("UPDATE task:fx_auto_edit SET acceptance_text = '篡改';"), TASK_GUARD);
-  await rejects(automation.query("UPDATE task:fx_auto_edit SET acceptance_criteria = [{ id: 'x', kind: 'machine', required: true }];"), TASK_GUARD);
-  await rejects(automation.query("UPDATE task:fx_auto_edit SET context = '篡改';"), TASK_GUARD);
-  await rejects(automation.query("UPDATE outbound_message:fx_auto_edit SET body = '篡改';"), MESSAGE_GUARD);
-  await rejects(automation.query('UPDATE outbound_message:fx_auto_edit SET hold = true;'), MESSAGE_GUARD);
-  const [[task]] = await company.db.query<[Array<Record<string, unknown>>]>(
-    'SELECT state, requirement, acceptance_text, context FROM task:fx_auto_edit;');
-  expect(task).toMatchObject({ state: 'doing', requirement: '需求原文', acceptance_text: '验收原文', context: '老板原话' });
-  const [[message]] = await company.db.query<[Array<Record<string, unknown>>]>('SELECT body, hold FROM outbound_message:fx_auto_edit;');
-  expect(message).toMatchObject({ body: '正文原文', hold: false });
+run('059 运行器与自动化：需求、验收、正文与保留都可改（字段守卫已移除）', async () => {
+  for (const [ac, id] of [['runner', 'fx_runner'], ['automation', 'fx_auto_edit']] as const) {
+    await seedTask(id);
+    await seedMessage(id, id);
+    const actor = await session(tokenFor(ac, `${ac}-1`));
+    await actor.query(`UPDATE task:${id} SET requirement = '改后的需求', acceptance_text = '改后的验收', context = '改后的原话';`);
+    await actor.query(`UPDATE outbound_message:${id} SET body = '改后的正文', hold = true;`);
+    const [[task]] = await company.db.query<[Array<Record<string, unknown>>]>(`SELECT requirement, acceptance_text, context FROM task:${id};`);
+    expect(task).toMatchObject({ requirement: '改后的需求', acceptance_text: '改后的验收', context: '改后的原话' });
+    const [[message]] = await company.db.query<[Array<Record<string, unknown>>]>(`SELECT body, hold FROM outbound_message:${id};`);
+    expect(message).toMatchObject({ body: '改后的正文', hold: true });
+  }
 });
 
 run('055 老板：可以改需求、验收与消息正文、保留；建带需求的任务不受限制', async () => {
@@ -169,11 +137,11 @@ run('055 老板：可以改需求、验收与消息正文、保留；建带需�
   expect(message).toMatchObject({ body: '老板改的正文', hold: true });
 });
 
-run('055 员工建单：直接建带需求的非提议任务被拒；提议建单与员工草稿放行', async () => {
+run('059 员工建单：直接建带需求的任务放行；提议建单与员工草稿照常', async () => {
   const runner = await session(tokenFor('runner', 'runner-1'));
   const automation = await session(tokenFor('automation', 'automation-1'));
-  await rejects(runner.query("CREATE task:fx_direct CONTENT { title: '直建', context: '需求', requirement: '需求', state: 'ready', kind: 'task' };"), CREATE_GUARD);
-  await rejects(automation.query("CREATE task:fx_auto CONTENT { title: '自动化直建', context: '需求', state: 'ready', kind: 'task' };"), CREATE_GUARD);
+  await runner.query("CREATE task:fx_direct CONTENT { title: '直建', context: '需求', requirement: '需求', state: 'ready', kind: 'task' };");
+  await automation.query("CREATE task:fx_auto CONTENT { title: '自动化直建', context: '需求', state: 'ready', kind: 'task' };");
   await runner.query("CREATE task:fx_proposal CONTENT { title: '提议', context: '需求', requirement: '需求', proposed_in: 'audit:fx', state: 'planned', kind: 'task' };");
   await runner.query("CREATE outbound_message:fx_draft CONTENT { task: task:fx_proposal, step: 'execute', role: 'engineering', body: '路线正文', state: 'draft', hold: false, created_at: time::now() };");
   const [[draft]] = await company.db.query<[Array<Record<string, unknown>>]>('SELECT body FROM outbound_message:fx_draft;');

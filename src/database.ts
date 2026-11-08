@@ -100,7 +100,7 @@ const pause = (ms: number): Promise<void> => new Promise(resolve => {
 });
 
 /** 本版本 applySchema 的最后一个结构版本；云端 bootstrap 只核对库内版本不低于它。 */
-export const CLOUD_SCHEMA_VERSION = 58;
+export const CLOUD_SCHEMA_VERSION = 59;
 
 export class CompanyDatabase {
   /** 当前会话的客户端；云端续期或重连时整体替换（见 rebuildNow）。 */
@@ -594,6 +594,9 @@ export class CompanyDatabase {
     // 058：老板端共享核心（编号 058）。只新增 ops_job、agent_identity 与译文、员工语言、审计摘要字段；旧 release 读不到即忽略（RB01）。
     await this.db.query(loadSchema('058-owner-end.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 58 WHERE schema_version < 58;');
+    // 059：移除 runner / automation 字段守卫（老板定：员工有任务即可执行老板端全部操作）。
+    await this.db.query(loadSchema('059-drop-runner-field-guards.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 59 WHERE schema_version < 59;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {
