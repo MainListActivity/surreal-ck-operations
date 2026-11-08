@@ -576,6 +576,9 @@ export class CompanyDatabase {
     // 057：老板看板的执行端心跳（编号 057，054-056 未用）。只新增 runner_heartbeat 表；旧 release 读不到即忽略（RB01）。
     await this.db.query(loadSchema('057-runner-heartbeat.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 57 WHERE schema_version < 57;');
+    // 058：老板端共享核心（编号 058）。只新增 ops_job、agent_identity 与译文、员工语言、审计摘要字段；旧 release 读不到即忽略（RB01）。
+    await this.db.query(loadSchema('058-owner-end.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 58 WHERE schema_version < 58;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

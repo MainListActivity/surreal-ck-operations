@@ -141,6 +141,8 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
   let realign: RealignFn | undefined;
   /** Quota snapshot the breaker and the pre-warning read; empty unless a test sets one. */
   let quotaRows: ProviderQuota[] = [];
+  // Translation gate (Dispatcher.translationPending): a task in `waiting` has no ready translation; `aligned` logs each alignment.
+  const waiting = new Set<string>(), aligned: string[] = [];
   const messages = {
     prepareSend: async (taskId: string, step: string, employeeId: string) => ({
       body: `fixture ${step} body for ${taskId}`,
@@ -153,6 +155,8 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
       id: `d-${taskId}-${step}`, taskId, step, role, body: `fixture ${step} body`, state: 'draft', hold: false, createdAt: '',
     }),
     isHeld: async () => false,
+    alignLanguage: async (taskId: string, step: string, employeeId: string) => { aligned.push(`${taskId}:${step}:${employeeId}`); },
+    awaitingTranslation: async (taskId: string) => waiting.has(taskId),
     markSent: async (messageId: string) => { events.push(`markSent:${messageId}`); },
     latestDraft: async () => undefined,
     machineCriterionId: async () => 'AC-1',
@@ -172,7 +176,7 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
     const r = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(dir), name)); if (!r) throw new Error('relay timeout'); return r;
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
-  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, logs, views, relay, denied, held, scopeUnreadable, sentBodies, spawnBodies,
+  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, logs, views, relay, denied, held, scopeUnreadable, sentBodies, spawnBodies, waiting, aligned,
     holdAssets: (paths: string[], holder: WriteScopeHolder) => { assetHolds.push({ paths, holder }); }, freeAssets: () => { assetHolds.splice(0); },
     authorsOf, unreadable, paseo, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
@@ -282,6 +286,42 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     expect(r.retired).not.toContain('employee-9');
     expect(r.woke.map(x => x.employee)).toContain('employee-9');
     expect(w.views.get('t1')!.currentEmployee).toBe('employee-9');
+  });
+  test('a message waiting for its translation holds a free session before any lease, then dispatches once translated', async () => {
+    const w = world();
+    const home = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture',
+      credential: 'fixture-9', repoHome: '/repo' } as EmployeeInst;
+    home.cwd = w.pool.commDirFor(home.id);
+    w.instances.push(home);
+    w.pool.env(home); w.pool.bindAgent(home.id, 'agent-9'); home.paseoAgentId = 'agent-9';
+    w.agents.set('agent-9', { id: 'agent-9', status: 'idle' });
+    w.addTask('t1', { state: 'ready', worktreePath: '/repo-task-t1' });
+    w.rows[0].previousEmployee = home.id;
+    w.waiting.add('t1');
+    const d = w.dispatcher();
+    await d.tick();
+    // The session's language is aligned to the message first; the wait then stops the pass before any claim, send or notice.
+    expect(w.aligned).toContain('t1:execute:employee-9');
+    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('send:'))).toBe(false);
+    expect(w.notices.size).toBe(0);
+    w.waiting.delete('t1');
+    await d.tick();
+    expect(w.events).toContain('claim:employee-9:t1');
+    expect(w.events).toContain('send:agent-9');
+  });
+  test('a waiting message creates no employee and takes no lease; the pass after its translation spawns the seat', async () => {
+    const w = world();
+    w.addTask('t2', { state: 'ready' });
+    w.waiting.add('t2');
+    const d = w.dispatcher();
+    await d.tick();
+    expect(w.instances).toHaveLength(0);
+    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('spawn:'))).toBe(false);
+    w.waiting.delete('t2');
+    await d.tick();
+    expect(w.instances).toHaveLength(1);
+    expect(w.events).toContain(`claim:${w.instances[0]!.id}:t2`);
+    expect(w.spawnBodies[0]).toContain('t2');
   });
   test('a spawned instance binds the repository root as cwd and keeps private comm separately', async () => {
     const w = world();

@@ -153,7 +153,7 @@ test('runner-only upgrade commands fail as unavailable without an execution host
   const { ctx } = makeFakeCtx();
   installHost(undefined);
   try {
-    expect([...RUNNER_ONLY_COMMANDS].sort()).toEqual(['upgrade.automatic', 'upgrade.list', 'upgrade.start']);
+    expect([...RUNNER_ONLY_COMMANDS].sort()).toEqual(['task.create', 'upgrade.automatic', 'upgrade.list', 'upgrade.start']);
     for (const command of RUNNER_ONLY_COMMANDS) {
       const error: unknown = await ownerApi(ctx, { command, taskId: 't1', taskVersion: 1, digest: 'd1', enabled: true }, 'cli').then(() => undefined, e => e);
       expect(error).toMatchObject({ name: 'CompanyError', code: 'unavailable' });

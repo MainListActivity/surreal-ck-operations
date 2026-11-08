@@ -27,6 +27,7 @@ export const WORKER_ENTRIES: readonly string[] = [
   'src/outbound-messages.ts',
   'src/task-progress.ts',
   'src/db-connection.ts',
+  'owner-end/src/worker.ts',
 ];
 
 /** 允许出现在依赖图里的 node 内建模块 */

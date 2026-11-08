@@ -82,10 +82,12 @@ try {
     // 老板对在途任务追加验收要求（自建隔离库；验证租约不中断、门禁不动、通知可读可 ack、幂等与版本 CAS）。
     // 公司库 JWT 访问方式（055）、字段守卫、命令守卫表（056）与命令守卫判定（自建隔离库，令牌用 HS512 替身）。
     'tests/company-access.test.ts', 'tests/company-access.fork.test.ts', 'tests/command-guard.test.ts',
+    // 老板端网关访问规则（自建隔离库应用 058，访问方式用生产的 055；058 之后 gateway 令牌写 protected_command / agent_policy 被拒、改删 ops_audit 被拒；RUN_SCK_OWNER_END_TESTS）。
+    'owner-end/tests/gateway-access.fork.test.ts',
     ];
   const test = Bun.spawn([process.execPath, 'test', ...targets], { detached: true, stdout: 'inherit', stderr: 'inherit', env: {
     ...process.env, SCK_PRODUCT_ENV: '/dev/null', SURREAL_URL: `ws://127.0.0.1:${port}/rpc`, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: rootPassword,
-    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_UPGRADE_FORK_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_ROLLBACK_FORK_TESTS: '1', RUN_SCK_DRILL_ACCESS_TESTS: '1', RUN_SCK_TASK_ROUTES_TESTS: '1', RUN_SCK_DB_CONNECTION_TESTS: '1', RUN_SCK_COMPANY_ACCESS_TESTS: '1',
+    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_UPGRADE_FORK_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_ROLLBACK_FORK_TESTS: '1', RUN_SCK_DRILL_ACCESS_TESTS: '1', RUN_SCK_TASK_ROUTES_TESTS: '1', RUN_SCK_DB_CONNECTION_TESTS: '1', RUN_SCK_COMPANY_ACCESS_TESTS: '1', RUN_SCK_OWNER_END_TESTS: '1',
   } });
   groups.push(test.pid); save();
   exit = await test.exited;

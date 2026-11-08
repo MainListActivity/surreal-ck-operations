@@ -16,7 +16,7 @@ function emptyCtx() {
 test('board.snapshot reads the board through the owner API at the time the owner asked for', async () => {
   const { ctx, queries } = emptyCtx();
   const board = await ownerApi(ctx, { command: 'board.snapshot', now: 1_000_000 }, 'cli') as OwnerBoard;
-  expect(board).toEqual({ at: 1_000_000, runner: { state: 'unknown' }, employees: [], unassigned: [], recent: [] });
+  expect(board).toEqual({ at: 1_000_000, runner: { state: 'unknown' }, employees: [], unassigned: [], recent: [], messages: [] });
   // The snapshot only reads: no statement it sends writes.
   expect(queries.length).toBeGreaterThan(0);
   expect(queries.filter(sql => /\b(CREATE|UPDATE|UPSERT|DELETE|INSERT|RELATE)\b/.test(sql))).toEqual([]);

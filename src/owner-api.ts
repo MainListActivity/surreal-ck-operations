@@ -36,10 +36,12 @@ const optionalText = (value: unknown): string | undefined => typeof value === 's
 const strArray = (value: unknown): string[] => Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
 
 /**
- * Commands that act on the machine they run on: the upgrade desk reads and writes local files and runs local commands.
- * A process without an execution host (a Worker, for one) answers them with CompanyError('unavailable').
+ * Commands that act on the machine they run on: the upgrade desk reads and writes local files and runs local commands, and
+ * task.create signs the new task with the owner's credential (SCK_OWNER_TOKEN), which only the local owner process holds.
+ * A process without an execution host (a Worker, for one) answers them with CompanyError('unavailable'); the owner gateway
+ * queues them as ops_job records for the execution end instead.
  */
-export const RUNNER_ONLY_COMMANDS: ReadonlySet<string> = new Set(['upgrade.list', 'upgrade.automatic', 'upgrade.start']);
+export const RUNNER_ONLY_COMMANDS: ReadonlySet<string> = new Set(['upgrade.list', 'upgrade.automatic', 'upgrade.start', 'task.create']);
 
 /**
  * The owner edits the text an employee would receive: the board's outbox text, which is the stored body rendered with that employee's

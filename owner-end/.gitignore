@@ -1,0 +1,6 @@
+public/app.js
+public/app.js.map
+public/*.map
+dist/
+.wrangler/
+.dev.vars

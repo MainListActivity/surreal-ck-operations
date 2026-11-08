@@ -80,8 +80,11 @@ async function settleTurn(ctx: Pick<Company, "sidecar" | "workforce" | "messages
           });
           await paseo.agents.ref(event.agent.id).send(body);
           await messages.markSent(prepared.message.id, instId, prepared.message.body);
+          console.log(`silent-turn nudge ${nudges}/${MAX_SILENT_NUDGES} sent to ${instId} on ${taskId}`);
+        } else {
+          // Held by the owner, or waiting for its translation: no send and no notice here (behaviour unchanged, log corrected).
+          console.log(`silent-turn nudge ${nudges}/${MAX_SILENT_NUDGES} skipped for ${instId} on ${taskId}: message held or awaiting translation`);
         }
-        console.log(`silent-turn nudge ${nudges}/${MAX_SILENT_NUDGES} sent to ${instId} on ${taskId}`);
       } catch (error) {
         console.warn(`silent-turn nudge failed for ${instId} on ${taskId}: ${(error as Error).message}`);
         await ctx.sidecar.releaseClaim(instId, taskId, `第 ${nudges} 轮无收尾退出且会话无法唤醒，收回任务重派`);

@@ -2,7 +2,7 @@
 import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from './core-errors.ts';
 import { machineCriterionOf, routeBody, stepOfTask, templateFor, type MessageStep } from './outbound-render.ts';
-import { deliveryBody } from './outbound-delivery.ts';
+import { deliveryOf, sourceHash } from './outbound-delivery.ts';
 export { DEFAULT_MACHINE_CRITERION, renderMessage, templateFor } from './outbound-render.ts';
 
 export type { MessageStep } from './outbound-render.ts';
@@ -21,19 +21,26 @@ export interface OutboundMessage {
   sentTo?: string;
   sentAt?: string;
   createdAt: string;
-  /** 原文语言；缺失或空表示中文原文。 */
+  /** 译文的语言；缺省即中文原文。员工默认语言在派工时写入（见 prepareSend）。 */
   lang?: string;
-  /** 译文；与 translatedFromHash 一致时才投递。 */
+  /** 老板为这条消息选过语言（含选“原文”）：选过后不再套用员工默认语言。 */
+  langChosen?: boolean;
+  /** 译文正文：只在投递给 lang 语言的员工时才会使用。 */
   translatedText?: string;
-  /** 译文对应原文的哈希，用于识别过期译文。 */
+  /** 译文时的原文哈希（SHA-256，小写十六进制）：与当前原文不一致即过期。 */
   translatedFromHash?: string;
   translatedAt?: string;
+  /** 最近一次补译失败的时间：定时补译据此轮流处理译不出的消息（见 owner-end/src/cron.ts）。 */
+  translateFailedAt?: string;
 }
 
 const STEPS: readonly MessageStep[] = ['execute', 'review', 'rework', 'nudge', 'eval', 'notice'];
 
 /** A record id's key; a plain value stands for itself. */
 const keyOf = (value: unknown): string => String((value as RecordId | undefined)?.id ?? value ?? '');
+
+/** A stored text field as a string, or undefined when the row has no value for it. */
+const textOf = (value: unknown): string | undefined => value === undefined || value === null ? undefined : String(value);
 
 const rowView = (row: Record<string, unknown>): OutboundMessage => ({
   id: String((row.id as RecordId).id ?? row.id), taskId: String((row.task as RecordId)?.id ?? row.task ?? ''),
@@ -44,19 +51,14 @@ const rowView = (row: Record<string, unknown>): OutboundMessage => ({
   sentTo: row.sent_to === undefined || row.sent_to === null ? undefined : String(row.sent_to),
   sentAt: row.sent_at === undefined || row.sent_at === null ? undefined : String(row.sent_at),
   createdAt: String(row.created_at ?? ''),
-  lang: optionalText(row.lang), translatedText: optionalText(row.translated_text),
-  translatedFromHash: optionalText(row.translated_from_hash), translatedAt: optionalText(row.translated_at),
+  lang: textOf(row.lang),
+  ...(row.lang_chosen === true ? { langChosen: true } : {}),
+  translatedText: textOf(row.translated_text),
+  translatedFromHash: textOf(row.translated_from_hash),
+  translatedAt: textOf(row.translated_at),
+  // SDK 把 datetime 读成 Date；转成 ISO 字符串，补译排序才能按时间比较。
+  translateFailedAt: row.translate_failed_at instanceof Date ? row.translate_failed_at.toISOString() : textOf(row.translate_failed_at),
 });
-
-/** 可选字段：缺失（未定义、NONE 即 null）读作 undefined。 */
-const optionalText = (value: unknown): string | undefined => value === undefined || value === null ? undefined : String(value);
-
-/** 按翻译规则选出投递正文；null 表示暂不投递。投递的消息记录带上所选文本。 */
-const deliverable = (message: OutboundMessage, employeeId: string): { body: string; message: OutboundMessage } | null => {
-  const body = deliveryBody(message);
-  if (body === null) return null;
-  return { body, message: { ...message, body, sentTo: employeeId } };
-};
 
 export class OutboundMessageStore {
   constructor(private readonly db: Surreal) {}
@@ -133,6 +135,20 @@ export class OutboundMessageStore {
     return false;
   }
 
+  /**
+   * Read-only twin of prepareSend's null for translation: true when the step's message has no ready translation for the employee's
+   * language yet (the owner hold is a separate question, see isHeld). No employee means a new one, which has no default language, so
+   * only a language the owner chose can make the message wait. Writes nothing, so it can run before a lease is taken or an employee made.
+   */
+  async awaitingTranslation(taskId: string, step: MessageStep, employeeId: string | undefined): Promise<boolean> {
+    const employeeLang = employeeId ? await this.langOf(employeeId) : undefined;
+    const draft = await this.latestDraft(taskId, step);
+    // No draft yet: prepareSend would seed a fresh one, which takes the employee's language and never carries a translation.
+    if (!draft) return Boolean(employeeLang);
+    if (draft.hold || draft.state === 'held') return false;
+    return !deliveryOf(draft, employeeLang).ok;
+  }
+
   /** Public send path for the eval dispatch: marks the table row sent only after the external send succeeded. */
   async sendPrepared(prepared: { body: string; message: OutboundMessage }): Promise<void> {
     await this.markSent(prepared.message.id, prepared.message.sentTo ?? '', prepared.body);
@@ -162,6 +178,36 @@ export class OutboundMessageStore {
     return rowView(row);
   }
 
+  /**
+   * Stores a translation of the message's body for one language. The guard is the body the translator saw: when the owner edited the
+   * body since, nothing matches and the caller must translate again. The owner's edit fields stay as they are (a translation is not an edit).
+   */
+  async setTranslation(messageId: string, lang: string, translatedText: string, expectedBody: string, _actor: string): Promise<OutboundMessage> {
+    if (!translatedText.trim()) throw new CompanyError('invalid', 'translation must not be empty');
+    const msg = this.message(messageId);
+    const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
+      `UPDATE $msg SET lang = $lang, translated_text = $text, translated_from_hash = $hash, translated_at = time::now()
+        WHERE state != 'sent' AND body = $expectedBody RETURN AFTER;`,
+      { msg, lang, text: translatedText, hash: sourceHash(expectedBody), expectedBody });
+    const row = rows?.[0];
+    if (!row) throw await this.translationRefusal(msg);
+    return rowView(row);
+  }
+
+  /** 补译失败：记下失败时间，定时补译据此把它排到其它待译消息之后。已发送的消息不记。 */
+  async markTranslationFailed(messageId: string): Promise<void> {
+    await this.db.query(`UPDATE $msg SET translate_failed_at = time::now() WHERE state != 'sent';`, { msg: this.message(messageId) });
+  }
+
+  /** The guarded translation UPDATE matched nothing: a missing message, a sent one, or one whose body moved on. */
+  private async translationRefusal(msg: RecordId): Promise<CompanyError> {
+    const [rows] = await this.db.query<[Array<{ state?: string }>]>(`SELECT state FROM $msg;`, { msg });
+    const row = rows?.[0];
+    if (!row) return new CompanyError('not_found', 'message not found');
+    if (row.state === 'sent') return new CompanyError('conflict', 'conflict: message already sent');
+    return new CompanyError('conflict', 'conflict: body changed, translate again');
+  }
+
   /** The guarded UPDATE matched nothing: a sent message is locked, anything else does not exist. */
   private async refusal(msg: RecordId): Promise<CompanyError> {
     const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(`SELECT state FROM $msg;`, { msg });
@@ -178,22 +224,64 @@ export class OutboundMessageStore {
   }
 
   /**
-   * Held messages do not send; otherwise locks in the table and returns the body to deliver. `null` means no send:
-   * held by the owner, or a translated message whose translation is missing or stale (the gateway fills it in later).
-   * The body follows the translation rule (deliveryBody): a message without lang delivers its own text.
-   * The mark stays in 'draft' until the caller's external send succeeded (see markSent), so a failed send
-   * never loses the owner's edit. Every dispatch message comes from this table.
+   * Held messages do not send. Otherwise the delivery rule (deliveryOf) picks the body: the stored body for a message without a
+   * language, the translation for the employee's language once it is ready, and `null` while it waits for that translation.
+   * `null` means no send; the hold and the state stay as they are. The mark stays in 'draft' until the caller's external send
+   * succeeded (see markSent), so a failed send never loses the owner's edit. Every dispatch message comes from this table.
    */
   async prepareSend(taskId: string, step: MessageStep, employeeId: string): Promise<{ body: string; message: OutboundMessage } | null> {
-    const draft = await this.latestDraft(taskId, step);
-    if (!draft) {
-      // 旧任务没有草稿：按模板即时生成一条，保证派工正文永远来自这张表。
-      const fresh = await this.seedDraft(taskId, step);
-      if (fresh.hold) return null;
-      return deliverable(fresh, employeeId);
-    }
+    const employeeLang = await this.langOf(employeeId);
+    // 旧任务没有草稿：按模板即时生成一条，保证派工正文永远来自这张表。
+    let draft = await this.latestDraft(taskId, step) ?? await this.seedDraft(taskId, step);
     if (draft.hold || draft.state === 'held') return null;
-    return deliverable(draft, employeeId);
+    draft = await this.stampLang(draft, employeeLang);
+    const delivery = deliveryOf(draft, employeeLang);
+    if (!delivery.ok) return null;
+    return { body: delivery.body, message: { ...draft, sentTo: employeeId } };
+  }
+
+  /**
+   * 派工前把消息的语言对齐到收件员工的默认语言（只对没选过语言的消息）：员工换了（改派）或默认语言改了，消息上的语言跟着变。
+   * 语言变了，旧译文一并清掉（它是另一种语言的），由网关补译成新语言；译文就绪前投递会等待。已经对齐则不写库。
+   */
+  async stampLang(draft: OutboundMessage, employeeLang: string | undefined): Promise<OutboundMessage> {
+    if (draft.langChosen || (draft.lang || undefined) === (employeeLang || undefined)) return draft;
+    const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
+      `UPDATE $msg SET ${employeeLang ? 'lang = $lang' : 'lang = NONE'}, translated_text = NONE, translated_from_hash = NONE,
+        translated_at = NONE WHERE state != 'sent' AND lang_chosen != true RETURN AFTER;`,
+      { msg: this.message(draft.id), ...(employeeLang ? { lang: employeeLang } : {}) });
+    return rows?.[0] ? rowView(rows[0]) : draft;
+  }
+
+  /**
+   * 派工循环在领租约之前调用：没有草稿的先补一条，再把语言对齐到员工默认语言。已对齐则只读。
+   * 不先对齐的话，有语言的员工会一直等一份没有人开始补译的译文（补译只译已带语言的消息），派工卡住。
+   */
+  async alignLanguage(taskId: string, step: MessageStep, employeeId: string): Promise<void> {
+    const draft = await this.latestDraft(taskId, step) ?? await this.seedDraft(taskId, step);
+    await this.stampLang(draft, await this.langOf(employeeId));
+  }
+
+  /**
+   * 老板为消息选择（或清除）译文语言：换语言即作废旧译文。清除（lang 为 undefined）即回到中文原文投递，
+   * 并记下 lang_chosen，之后不再套用员工默认语言。
+   */
+  async setLanguage(messageId: string, lang: string | undefined): Promise<OutboundMessage> {
+    const msg = this.message(messageId);
+    const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
+      `UPDATE $msg SET ${lang ? 'lang = $lang' : 'lang = NONE'}, translated_text = NONE, translated_from_hash = NONE,
+        translated_at = NONE, lang_chosen = true WHERE state != 'sent' RETURN AFTER;`,
+      { msg, ...(lang ? { lang } : {}) });
+    const row = rows?.[0];
+    if (!row) throw await this.refusal(msg);
+    return rowView(row);
+  }
+
+  /** The employee's language from agent_policy; undefined when the employee has none (the original body is sent). */
+  private async langOf(employeeId: string): Promise<string | undefined> {
+    const [rows] = await this.db.query<[Array<{ lang?: unknown }>]>('SELECT lang FROM agent_policy WHERE agent = $agent LIMIT 1;', { agent: employeeId });
+    const lang = rows?.[0]?.lang;
+    return typeof lang === 'string' && lang ? lang : undefined;
   }
 
   /**

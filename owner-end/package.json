@@ -1,0 +1,25 @@
+{
+  "name": "company-owner-end",
+  "private": true,
+  "description": "老板端网关：Cloudflare Worker 上的老板看板、命令网关与定时任务",
+  "type": "module",
+  "packageManager": "pnpm@10.32.1",
+  "scripts": {
+    "build:ui": "bun build ./src/ui/main.tsx --outdir ./public --entry-naming app.js --sourcemap=external --minify --target browser --jsx-import-source preact",
+    "build": "bun run build:ui",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "bun test tests",
+    "dev": "bun run build && wrangler dev",
+    "deploy:dry-run": "bun run build && wrangler deploy --dry-run --outdir dist"
+  },
+  "dependencies": {
+    "hono": "^4.13.17",
+    "jose": "^6.2.15",
+    "preact": "^11.2.0"
+  },
+  "devDependencies": {
+    "bun-types": "1.3.12",
+    "typescript": "5.9.3",
+    "wrangler": "^4.158.0"
+  }
+}
