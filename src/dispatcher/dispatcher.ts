@@ -3,6 +3,7 @@ import { managedModel, employeeClientModel } from "../model-routing/policy.ts";
 import type { OwnerDesk } from '../owner.ts';
 import { LaneNoteStore } from '../lane-notes.ts';
 import { OutboundMessageStore, renderMessage, type MessageStep, type OutboundMessage } from '../outbound-messages.ts';
+import { dispatchText } from '../outbound-render.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
 import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, RetirementKind, Role, WriteScopeHolder } from '../contracts.ts';
@@ -731,7 +732,7 @@ export class Dispatcher {
   /** Render the table body with the workdir line. No write: the row stays draft until the external send landed. */
   private outboundBody(prepared: PreparedOutbound | null | undefined): string | null | undefined {
     if (!prepared) return prepared;
-    return prepared.workdir ? `${prepared.body}\n工作目录：${prepared.workdir}` : prepared.body;
+    return dispatchText(prepared.body, prepared.workdir);
   }
 
   /** Lock the drafted message as sent, and close its hold notice, after the external send succeeded. */
