@@ -1,5 +1,5 @@
-import { join } from 'node:path';
 import { CompanyError } from './core-errors.ts';
+import { hostIO } from './host-io.ts';
 
 /**
  * SYS-INT: controlled non-production two-face switch & rollback drill.
@@ -49,7 +49,7 @@ export interface DrillHostContext {
 }
 
 export function drillRootFor(serviceHome: string, runId: string): string {
-  return join(serviceHome, 'drills', runId);
+  return hostIO().path.join(serviceHome, 'drills', runId);
 }
 
 /**
@@ -75,6 +75,7 @@ export async function validateDrillPlan(input: DrillPlanInput, ctx: DrillHostCon
   if (mcpPort === dbPort) throw new CompanyError('conflict', 'drill ports must be distinct');
   const root = drillRootFor(ctx.serviceHome, input.runId);
   const namespace = `sck_drill_${input.runId.replaceAll('-', '').slice(0, 13)}`;
+  const { join } = hostIO().path;
   return {
     ...input,
     root,

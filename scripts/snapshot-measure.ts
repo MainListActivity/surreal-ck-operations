@@ -25,6 +25,9 @@ import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { CompanyError } from '../src/core-errors.ts';
 import { answerBytes, RESPONSE_BUDGET_BYTES } from '../src/response-budget.ts';
 import { DEFAULT_SNAPSHOT_LIMITS, type SnapshotBuildStats } from '../src/snapshot-store.ts';
+import { installNodeHost } from '../src/host-node.ts';
+
+installNodeHost();
 
 const args = process.argv.slice(2);
 const label = args[0] ?? 'run';

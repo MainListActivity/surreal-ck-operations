@@ -16,6 +16,8 @@ if (!root) {
 }
 process.env.SCK_SERVICE_HOME = root;
 
+const { installNodeHost } = await import('../src/host-node.ts');
+installNodeHost();
 const { loadDatabaseConfig } = await import('../src/config.ts');
 const { CompanyDatabase } = await import('../src/database.ts');
 const { SurrealCompanyCore } = await import('../src/core.ts');

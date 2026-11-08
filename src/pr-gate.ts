@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { hostIO } from './host-io.ts';
 
 export interface PrInfo {
   url: string;
@@ -89,15 +89,14 @@ export function judgePr(pr: PrInfo, branch: string | undefined): string | undefi
   return undefined;
 }
 
-export const ghCli: GhRunner = args => new Promise((resolve, reject) => {
-  const child = spawn('gh', args, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PATH: `${process.env.PATH ?? ''}:/opt/homebrew/bin:/usr/local/bin` } });
-  let out = '', err = '';
-  const timer = setTimeout(() => child.kill('SIGKILL'), 15_000);
-  child.stdout.on('data', chunk => { out += chunk; });
-  child.stderr.on('data', chunk => { err += chunk; });
-  child.on('error', error => { clearTimeout(timer); reject(error); });
-  child.on('close', code => { clearTimeout(timer); code === 0 ? resolve(out) : reject(new Error(err.slice(0, 200))); });
-});
+/** The gh CLI, run by the execution host. A non-zero exit rejects with the start of its stderr. */
+export const ghCli: GhRunner = async args => {
+  const { code, stdout, stderr } = await hostIO().proc.run('gh', args, {
+    env: { ...process.env, PATH: `${process.env.PATH ?? ''}:/opt/homebrew/bin:/usr/local/bin` }, timeoutMs: 15_000,
+  });
+  if (code === 0) return stdout;
+  throw new Error(stderr.slice(0, 200));
+};
 
 /** Looks the linked PRs up through gh; any lookup problem lets the submission through (the reviewer still checks). */
 export function createSubmitCheck(run: GhRunner = ghCli): SubmitCheck {

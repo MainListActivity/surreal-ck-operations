@@ -72,6 +72,8 @@ try {
     'tests/snapshot-quota.fork.test.ts',
     // 线的笔记：提议、生效、作废、上限与线间隔离（自建隔离库）。
     'tests/lane-notes.fork.test.ts',
+    // 数据库连接层：root 登录与数据库用户 token 登录，在自建隔离库上验证（RUN_SCK_DB_CONNECTION_TESTS）。
+    'tests/db-connection.test.ts',
     // 线的笔记整理：合并近似笔记、超目标清理、dry run、撤销与并发守卫，以及每日调度（自建隔离库）。
     'tests/lane-notes-consolidate.fork.test.ts',
     // SYS-INT：演练工具的 Node 宿主门禁与 deployDrillRun/Status 权限回归（自建隔离库，不启动生产演练）。
@@ -83,7 +85,7 @@ try {
     ];
   const test = Bun.spawn([process.execPath, 'test', ...targets], { detached: true, stdout: 'inherit', stderr: 'inherit', env: {
     ...process.env, SCK_PRODUCT_ENV: '/dev/null', SURREAL_URL: `ws://127.0.0.1:${port}/rpc`, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: rootPassword,
-    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_UPGRADE_FORK_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_ROLLBACK_FORK_TESTS: '1', RUN_SCK_DRILL_ACCESS_TESTS: '1', RUN_SCK_TASK_ROUTES_TESTS: '1', RUN_SCK_COMPANY_ACCESS_TESTS: '1',
+    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_UPGRADE_FORK_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_ROLLBACK_FORK_TESTS: '1', RUN_SCK_DRILL_ACCESS_TESTS: '1', RUN_SCK_TASK_ROUTES_TESTS: '1', RUN_SCK_DB_CONNECTION_TESTS: '1', RUN_SCK_COMPANY_ACCESS_TESTS: '1',
   } });
   groups.push(test.pid); save();
   exit = await test.exited;

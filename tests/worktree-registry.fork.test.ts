@@ -103,7 +103,7 @@ run('untagged engineering tasks each get their own task tree and branch; the sha
 run('two first claims across independent processes get distinct writers; dirty first scene stays untouched', async () => {
   const path = repo(), core = coreFor(path), a = await employee('engineering'), b = await employee('engineering');
   const ta = await task(core, 'engineering'), tb = await task(core, 'engineering');
-  const code = `import {CompanyDatabase} from './src/database.ts'; import {SurrealCompanyCore} from './src/core.ts';
+  const code = `import {installNodeHost} from './src/host-node.ts'; installNodeHost(); import {CompanyDatabase} from './src/database.ts'; import {SurrealCompanyCore} from './src/core.ts';
     const input=await new Response(Bun.stdin.stream()).json(); const db=new CompanyDatabase(input.config);
     await db.connect(); await db.useDatabase(); try { const core=new SurrealCompanyCore(db,{worktrees:{opsRepo:input.repo}});
     const c=await core.claim(input.credential,input.task); console.log('FIXTURE_RESULT='+JSON.stringify(c)); } finally {await db.close();}`;

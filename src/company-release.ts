@@ -1,11 +1,7 @@
 import { z } from 'zod';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import { readFile, realpath } from 'node:fs/promises';
-import { join, basename } from 'node:path';
 import { createHash } from 'node:crypto';
+import { hostIO } from './host-io.ts';
 import { CompanyError } from './core-errors.ts';
-const exec = promisify(execFile);
 export const releaseNotesSchema = z.object({
   version:z.string().max(32).regex(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/),
   title:z.string().min(2).max(100),
@@ -88,7 +84,12 @@ export function gatesFor(version: string): string[] {
   return chosen ? [...chosen.gates] : [...BASE_GATES];
 }
 export async function git(repo:string,args:string[]):Promise<string>{
- try{return (await exec('git',['-C',repo,...args],{timeout:30_000,maxBuffer:128_000,env:{...process.env,GIT_TERMINAL_PROMPT:'0'}})).stdout.trim();}
+ const host=hostIO();
+ try{
+  const result=await host.proc.run('git',['-C',repo,...args],{timeoutMs:30_000,maxBytes:128_000,env:{...process.env,GIT_TERMINAL_PROMPT:'0'}});
+  if(result.code!==0)throw new Error('git exited with a failure code');
+  return result.stdout.trim();
+ }
  catch{throw new CompanyError('invalid','版本校验失败：目标必须已合入 origin/main，且可从本机仓库读取');}
 }
 export async function readCompanyRelease(repo:string,sha:string):Promise<CompanyRelease>{
@@ -102,10 +103,11 @@ export async function readCompanyRelease(repo:string,sha:string):Promise<Company
  const plan={...notes,sha};return {...plan,digest:releaseDigest(plan)};
 }
 export async function installedRelease(home:string):Promise<{version:string;sha:string;path:string}>{
- const path=await realpath(join(home,'active'));
- const sha=basename(path);
+ const io=hostIO();
+ const path=await io.fs.realpathAsync(io.path.join(home,'active'));
+ const sha=io.path.basename(path);
  if(!/^[a-f0-9]{40}$/.test(sha))throw new CompanyError('invalid','现役版本目录无法核验');
- const pkg=JSON.parse(await readFile(join(path,'package.json'),'utf8'));
+ const pkg=JSON.parse(await io.fs.readTextAsync(io.path.join(path,'package.json')));
  if(!/^\d+\.\d+\.\d+$/.test(pkg.version))throw new CompanyError('invalid','现役版本号无效');
  return {version:pkg.version,sha,path};
 }

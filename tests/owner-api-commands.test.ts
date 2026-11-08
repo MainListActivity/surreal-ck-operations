@@ -3,7 +3,9 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
-import { ownerApi, type OwnerApiContext } from '../src/owner-api.ts';
+import { ownerApi, RUNNER_ONLY_COMMANDS, type OwnerApiContext } from '../src/owner-api.ts';
+import { installHost } from '../src/host-io.ts';
+import { installNodeHost } from '../src/host-node.ts';
 import { pluginOwnerCommand } from '../plugin/server/owner-api.ts';
 
 function makeFakeCtx(overrides?: Partial<OwnerApiContext>) {
@@ -144,6 +146,48 @@ test('task.cost reads task cost for single task', async () => {
   const { ctx } = makeFakeCtx({ db: { db: fakeDb } as any });
   const res = await ownerApi(ctx, { command: 'task.cost', taskId: 't1' }, 'cli') as any;
   expect(res).toEqual({ cost: fakeCost });
+});
+
+// ---- Runner-only commands: a process without an execution host answers them as unavailable ----
+test('runner-only upgrade commands fail as unavailable without an execution host; other commands still answer', async () => {
+  const { ctx } = makeFakeCtx();
+  installHost(undefined);
+  try {
+    expect([...RUNNER_ONLY_COMMANDS].sort()).toEqual(['upgrade.automatic', 'upgrade.list', 'upgrade.start']);
+    for (const command of RUNNER_ONLY_COMMANDS) {
+      const error: unknown = await ownerApi(ctx, { command, taskId: 't1', taskVersion: 1, digest: 'd1', enabled: true }, 'cli').then(() => undefined, e => e);
+      expect(error).toMatchObject({ name: 'CompanyError', code: 'unavailable' });
+      expect((error as Error).message).toContain('需要执行端');
+    }
+    const { ctx: plain } = makeFakeCtx({ owner: { openNotices: async () => [] } as any });
+    expect(await ownerApi(plain, { command: 'notice.list' }, 'cli')).toEqual({ notices: [] });
+  } finally {
+    installNodeHost();
+  }
+});
+
+test('upgrade commands keep their answers on a host that has no upgrade desk', async () => {
+  const { ctx } = makeFakeCtx();
+  expect(await ownerApi(ctx, { command: 'upgrade.list' }, 'cli')).toEqual({ upgrades: { items: [] } });
+  expect(await ownerApi(ctx, { command: 'upgrade.automatic', enabled: true }, 'cli')).toEqual({ ok: false });
+  expect(await ownerApi(ctx, { command: 'upgrade.start', taskId: 't1', taskVersion: 1, digest: 'd1' }, 'cli')).toEqual({ ok: false });
+});
+
+test('upgrade commands go to the upgrade desk when the process has one', async () => {
+  const calls: unknown[] = [];
+  const upgrades = {
+    inbox: async () => ({ upgrades: { items: [{ id: 'u1' }] } }),
+    setAuto: async (enabled: boolean, source: string) => { calls.push(['auto', enabled, source]); return { ok: true }; },
+    start: async (input: unknown, source: string) => { calls.push(['start', input, source]); return { jobId: 'j1' }; },
+  };
+  const { ctx } = makeFakeCtx({ upgrades: upgrades as any });
+  expect(await ownerApi(ctx, { command: 'upgrade.list' }, 'cli')).toEqual({ upgrades: { items: [{ id: 'u1' }] } });
+  await ownerApi(ctx, { command: 'upgrade.automatic', enabled: true }, 'cli');
+  await ownerApi(ctx, { command: 'upgrade.start', taskId: 't1', taskVersion: 2, digest: 'd1' }, 'cli');
+  expect(calls).toEqual([
+    ['auto', true, 'owner:cli'],
+    ['start', { taskId: 't1', taskVersion: 2, digest: 'd1' }, 'owner:cli'],
+  ]);
 });
 
 // ---- Lane-note consolidation commands ----

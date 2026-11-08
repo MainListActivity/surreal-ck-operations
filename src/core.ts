@@ -2,13 +2,10 @@ import { git, readCompanyRelease, type CompanyRelease } from './company-release.
 import { checkLearned, LaneNoteStore, laneOf } from './lane-notes.ts';
 import { getRoute, listRoutes, CHAIN_LIMIT, type RouteRow } from './routes.ts';
 import { OutboundMessageStore } from './outbound-messages.ts';
-import { drillHost, startDrill, readDrillStatus, type DrillState } from './deploy-drill-service.ts';
+import type { DrillState } from './deploy-drill-service.ts';
 import { validateDrillPlan } from './deploy-drill.ts';
 import { authenticationLookup } from './diagnostics.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { existsSync, realpathSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateTask, Credential, DefView, EnsureDef, ProjectView, EmployeeScore, Evidence, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
@@ -49,6 +46,7 @@ import type { PluginRuntimeView } from './contracts.ts';
 import { PLUGIN_RUNTIME_ROLES } from './contracts.ts';
 
 import { CompanyError } from './core-errors.ts';
+import { hostIO } from './host-io.ts';
 import { parseBrokerConfig } from './ops/config.ts';
 import { assertEmployeeCiBlockAllowed, createCiBillingCheck, isCiBlockCause, refuseEmployeeCiBlock, type CiBillingCheck } from './github-ci-control.ts';
 import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
@@ -268,11 +266,12 @@ export function namesRepo(text: string, repo: string): boolean {
  * parent can never smuggle a path outside the registered set.
  */
 export function canonicalRepoPath(input: string): string {
-  let probe = resolve(input);
+  const io = hostIO();
+  let probe = io.path.resolve(input);
   const tail: string[] = [];
-  while (!existsSync(probe)) { tail.unshift(basename(probe)); probe = dirname(probe); }
-  const base = realpathSync(probe);
-  return tail.length ? join(base, ...tail) : base;
+  while (!io.fs.exists(probe)) { tail.unshift(io.path.basename(probe)); probe = io.path.dirname(probe); }
+  const base = io.fs.realpath(probe);
+  return tail.length ? io.path.join(base, ...tail) : base;
 }
 
 export function requireText(value: string, name: string, min = 1, max = 10000): void {
@@ -586,7 +585,7 @@ export class SurrealCompanyCore implements CompanyCore {
           const cause = failures.map(response => response.error.message).find(message =>
             !message.includes('not executed due to') && !message.startsWith('Cannot COMMIT')) ?? '';
           if (/conflict/i.test(cause) && attempt < 4) {
-            await Bun.sleep(10 * (attempt + 1));
+            await new Promise(done => setTimeout(done, 10 * (attempt + 1)));
             continue;
           }
           if (/conflict/i.test(cause)) throw new CompanyError('temporarily_unavailable', 'Database contention; retry request', true);
@@ -1067,7 +1066,7 @@ export class SurrealCompanyCore implements CompanyCore {
   private async creationCodeRepo(input: Pick<CreateTask, 'codeRepoPath' | 'context' | 'project' | 'workIntent'>, kind: TaskKind): Promise<string | undefined> {
     if (input.codeRepoPath !== undefined) {
       requireText(input.codeRepoPath, 'codeRepoPath', 1, 1000);
-      if (!isAbsolute(input.codeRepoPath) || input.codeRepoPath.includes('\0') || input.codeRepoPath.split('/').includes('..')) {
+      if (!input.codeRepoPath.startsWith('/') || input.codeRepoPath.includes('\0') || input.codeRepoPath.split('/').includes('..')) {
         throw new CompanyError('invalid', 'codeRepoPath must be an absolute path without traversal');
       }
       const bound = canonicalRepoPath(input.codeRepoPath);
@@ -1081,7 +1080,11 @@ export class SurrealCompanyCore implements CompanyCore {
     const project = input.project ? await this.projects.get(input.project) : undefined;
     if (!project?.repoPath) return undefined;
     let opsCanon: string, projectCanon: string;
-    try { opsCanon = canonicalRepoPath(ops); projectCanon = canonicalRepoPath(project.repoPath); } catch { return undefined; }
+    try { opsCanon = canonicalRepoPath(ops); projectCanon = canonicalRepoPath(project.repoPath); } catch (error) {
+      // Without an execution host the local layout is unknown: refuse, never route the task to the project repo by guess.
+      if (error instanceof CompanyError && error.code === 'unavailable') throw error;
+      return undefined;
+    }
     return opsCanon === projectCanon ? undefined : opsCanon;
   }
 
@@ -1752,13 +1755,14 @@ export class SurrealCompanyCore implements CompanyCore {
     const row = await this.db.select<{ current_employee?: string; state: string }>(id('task', input.taskId));
     if (!row) throw new CompanyError('not_found', 'Task not found');
     if (row.current_employee !== actor.employeeId && actor.role !== 'owner') throw new CompanyError('forbidden', 'Only the task holder may run a drill for this task');
-    const home = process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library', 'Application Support', 'SurrealCKCompany');
+    const io = hostIO();
+    const home = process.env.SCK_SERVICE_HOME ?? io.path.join(io.os.homeDir(), 'Library', 'Application Support', 'SurrealCKCompany');
     const repo = this.companyReleaseRepo ?? this.worktrees?.options.opsRepo ?? process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
-    const host = drillHost(home, repo);
+    const host = io.drill.host(home, repo);
     const plan = await validateDrillPlan(input, host.ctx);
     await this.db.query('CREATE audit CONTENT {task:$task,actor:$actor,action:"deploy_drill_run",evidence:$evidence,at:time::now()};',
       { task: input.taskId, actor: actor.employeeId, evidence: `runId ${input.runId} base ${input.baseSha} candidate ${input.candidateSha} root ${plan.root}` });
-    const pid = (this.drillLaunch ?? startDrill)(home, repo, plan);
+    const pid = (this.drillLaunch ?? io.drill.start)(home, repo, plan);
     return { runId: input.runId, pid, root: plan.root };
   }
 
@@ -1766,8 +1770,9 @@ export class SurrealCompanyCore implements CompanyCore {
   async deployDrillStatus(credential: Credential, input: { runId: string }): Promise<{ state?: DrillState; stages?: string[] }> {
     const actor = await this.authenticate(credential);
     if (!['engineering', 'owner', 'qa', 'product'].includes(actor.role ?? '')) throw new CompanyError('forbidden', 'Not allowed to read drill status');
-    const home = process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library', 'Application Support', 'SurrealCKCompany');
-    return readDrillStatus(home, input.runId);
+    const io = hostIO();
+    const home = process.env.SCK_SERVICE_HOME ?? io.path.join(io.os.homeDir(), 'Library', 'Application Support', 'SurrealCKCompany');
+    return io.drill.status(home, input.runId);
   }
 
   /** SYS02: owner read of the versioned gate record. */
@@ -2001,7 +2006,7 @@ export class SurrealCompanyCore implements CompanyCore {
         throw new CompanyError('forbidden','只有当前工程租约可以登记公司系统上线版本');
       const repo = this.companyReleaseRepo ?? this.worktrees?.options.opsRepo ?? process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
       const project = await this.taskProject(proof.taskId);
-      if (!(row.code_repo_path ?? project?.repoPath) || realpathSync((row.code_repo_path ?? project?.repoPath)!) !== realpathSync(repo)) throw new CompanyError('forbidden','此任务不是公司系统仓库的上线任务');
+      if (!(row.code_repo_path ?? project?.repoPath) || hostIO().fs.realpath((row.code_repo_path ?? project?.repoPath)!) !== hostIO().fs.realpath(repo)) throw new CompanyError('forbidden','此任务不是公司系统仓库的上线任务');
       companyUpgrade = await readCompanyRelease(repo,evidence.companyUpgrade.sha);
     }
     let prHead: string | undefined;

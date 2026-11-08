@@ -20,6 +20,9 @@ import { execFileSync } from "node:child_process";
 import { TIERS, employeeTier, employeeClientModel } from "../src/model-routing/policy.ts";
 import { applyRoutingRoster } from "../src/model-routing/roster.ts";
 import { Workforce } from "../src/workforce.ts";
+import { installNodeHost } from "../src/host-node.ts";
+
+installNodeHost();
 const release = resolve(import.meta.dir, "..");
 const { loadServiceEnv, serviceHome } = await import("../plugin/server/env.ts");
 loadServiceEnv();

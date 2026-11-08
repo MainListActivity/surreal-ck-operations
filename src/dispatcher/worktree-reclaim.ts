@@ -1,5 +1,5 @@
-import { basename } from 'node:path';
 import type { WorktreeAssignment } from '../contracts.ts';
+import { hostIO } from '../host-io.ts';
 
 /** Path / branch patterns that identify company-managed task scenes (not releases or external tools). */
 const PATH_MANAGED = /-(?:task|wt|review|sck-[0-9a-f]+)-[0-9a-f]{8}$/i;
@@ -45,7 +45,7 @@ export interface TreeVerdictInput {
 
 export function isCompanyManagedPath(path: string, branch?: string): boolean {
   if (RELEASE_MARKER.test(path) || EXTERNAL_TOOL.test(path)) return false;
-  const name = basename(path);
+  const name = hostIO().path.basename(path);
   if (SHARED_PATH.test(name) || (branch && SHARED_BRANCH.test(branch))) return true;
   if (PATH_MANAGED.test(name)) return true;
   if (branch && BRANCH_MANAGED.test(branch)) return true;
