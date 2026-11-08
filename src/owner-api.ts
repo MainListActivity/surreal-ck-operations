@@ -3,6 +3,7 @@
  * 所有写操作记 actor=owner 并带 via 标签（请求头 X-Owner-Agent，没有则 web）。
  */
 import { LaneNoteStore } from './lane-notes.ts';
+import { consolidateAll, consolidateLane, listConsolidations, undoConsolidation } from './lane-notes-consolidate.ts';
 import { readProgress } from './task-progress.ts';
 import { randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
@@ -237,6 +238,15 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     case 'note.pin': return notes().pin(text(input.noteId, 'noteId'), input.pinned === true);
     case 'note.activate': return notes().activate(text(input.noteId, 'noteId'));
     case 'note.remove': await notes().remove(text(input.noteId, 'noteId')); return { removed: true };
+    // No rewrite here: the command and the daily pass only merge and age out, keeping the newest original text.
+    // dryRun returns the plan without writing anything.
+    case 'note.consolidate': {
+      const options = { now: new Date(), actor: a, dryRun: input.dryRun === true };
+      const lane = optionalText(input.lane);
+      return lane ? consolidateLane(db, lane, options) : consolidateAll(db, options);
+    }
+    case 'note.consolidations': return { consolidations: await listConsolidations(db, typeof input.limit === 'number' ? input.limit : undefined) };
+    case 'note.consolidation.undo': return undoConsolidation(db, text(input.id, 'id', 1, 200), a);
     // ---- 会话策略 ----
     case 'session.policy': {
       if (input.policy !== undefined) {
