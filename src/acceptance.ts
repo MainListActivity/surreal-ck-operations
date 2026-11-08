@@ -3,9 +3,7 @@
 // the same facts the same way. Self-written text or an arbitrary URL never becomes a machine pass fact: only the source
 // adapter can set verified=true.
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { hostIO } from './host-io.ts';
 import { RecordId, type Surreal } from 'surrealdb';
 import type {
   AcceptanceCriterion, AcceptanceCriterionKind, AcceptanceEvidenceRecord, AcceptanceEvidenceType, AcceptanceGateView,
@@ -489,15 +487,16 @@ export type ArtifactReader = (input: { owner: string; repo: string; runId: strin
 
 /** Read-only artifact download through gh; the file is read from a private temporary directory and removed. */
 const ghArtifactReader = (run: GhRunner): ArtifactReader => async ({ owner, repo, runId, name }) => {
-  const dir = mkdtempSync(join(tmpdir(), 'sck-acceptance-artifact-'));
+  const { fs, path } = hostIO();
+  const dir = fs.mkdtemp('sck-acceptance-artifact-');
   try {
     await run(['run', 'download', runId, '--repo', `${owner}/${repo}`, '--name', name, '--dir', dir]);
-    const files = readdirSync(dir, { recursive: true }) as string[];
+    const files = fs.readdirTree(dir);
     const file = files.find(entry => entry.endsWith('acceptance-probe.json')) ?? files.find(entry => entry.endsWith('.json'));
     if (!file) throw new Error('the artifact has no acceptance probe JSON record');
-    return { name: file, content: readFileSync(join(dir, file), 'utf8') };
+    return { name: file, content: fs.readText(path.join(dir, file)) };
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    fs.removeTree(dir);
   }
 };
 

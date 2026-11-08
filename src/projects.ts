@@ -1,8 +1,8 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
 import { RecordId, type Surreal } from 'surrealdb';
 import { ROLES, type ProjectView, type Role } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
+import { hostIO } from './host-io.ts';
 
 import { parseBrokerConfig } from './ops/config.ts';
 import { projectTextLengths, validateProjectTexts, type ProjectTextExisting, type ProjectTextLengths } from './input-bounds.ts';
@@ -17,14 +17,14 @@ const KEYCHAIN_ACCOUNT = 'env-secret-key';
 export function loadSecretKey(create = false): Buffer {
   const fromEnv = process.env.SCK_SECRET_KEY;
   if (fromEnv) return checked(Buffer.from(fromEnv, 'base64'));
-  const read = () => execFileSync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', KEYCHAIN_ACCOUNT, '-w'],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  const keychain = hostIO().keychain;
+  const read = () => keychain.read(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).trim();
   try {
     return checked(Buffer.from(read(), 'base64'));
   } catch (error) {
     if (!create) throw new CompanyError('temporarily_unavailable', 'secret key is not available in the keychain');
     const key = randomBytes(32).toString('base64');
-    execFileSync('security', ['add-generic-password', '-s', KEYCHAIN_SERVICE, '-a', KEYCHAIN_ACCOUNT, '-w', key, '-U'], { stdio: 'ignore' });
+    keychain.write(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key);
     return checked(Buffer.from(read(), 'base64'));
   }
 }

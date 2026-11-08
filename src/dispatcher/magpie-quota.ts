@@ -11,9 +11,7 @@
  * Everything here is pure except `readMagpieQuotas`, which fails open (`undefined`) so a
  * missing, slow or reconfigured magpie can never block dispatch.
  */
-import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { hostIO } from '../host-io.ts';
 
 /** One allowance window as magpie serves it. `remaining` is a 0-100 percentage. */
 export interface MagpieWindow {
@@ -120,11 +118,12 @@ export function usageEntriesFrom(providers: readonly MagpieProvider[]): MagpieUs
  * Where magpie serves the gateway: `MAGPIE_ADDR` wins (magpie's own documented override),
  * then the address magpie last wired into Claude Code, then the built-in default.
  */
-export function magpieBase(env: NodeJS.ProcessEnv = process.env, readFile: (path: string) => string = p => readFileSync(p, 'utf8')): string {
+export function magpieBase(env: NodeJS.ProcessEnv = process.env, readFile: (path: string) => string = p => hostIO().fs.readText(p)): string {
   const explicit = (env.MAGPIE_ADDR ?? '').trim();
   if (explicit) return /^https?:\/\//i.test(explicit) ? explicit : `http://${explicit}`;
   try {
-    const stash = readFile(join(homedir(), '.config', 'magpie', 'stash.json'));
+    const { os, path } = hostIO();
+    const stash = readFile(path.join(os.homeDir(), '.config', 'magpie', 'stash.json'));
     const wired = (JSON.parse(stash) as Record<string, unknown>)['claude.wired_at'];
     if (typeof wired === 'string' && /^https?:\/\//i.test(wired)) return wired;
   } catch { /* magpie absent or never wired: fall through to the default */ }

@@ -1,11 +1,10 @@
 import { FaultStore } from './fault-store.ts';
 import { laneOf } from './lane-notes.ts';
-import { closeSync, mkdirSync, openSync, writeSync } from 'node:fs';
-import { join } from 'node:path';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import type { Principal, RetirementKind, Role, TaskId, TaskKind } from './contracts.ts';
+import { hostIO } from './host-io.ts';
 import { ownerActionKey } from './dispatcher/dispatch-blocked.ts';
 import { asId, CompanyError, HASH, id, ROLES, view, type TaskRow } from './core.ts';
 import { LocalEnrollmentAdmin, revokedCredentialDigest } from './enrollment.ts';
@@ -511,10 +510,10 @@ export class Workforce {
 
   /** Legacy agent delivery: write the credential to a 600 file the agent's env can point at. */
   writeCredentialFile(inst: EmployeeInst, credential: string): string {
-    mkdirSync(this.credentialDir, { recursive: true, mode: 0o700 });
-    const credentialFile = join(this.credentialDir, `${inst.id}.token`);
-    const fd = openSync(credentialFile, 'wx', 0o600);
-    try { writeSync(fd, credential); } finally { closeSync(fd); }
+    const { fs, path } = hostIO();
+    fs.mkdirp(this.credentialDir, 0o700);
+    const credentialFile = path.join(this.credentialDir, `${inst.id}.token`);
+    fs.createText(credentialFile, credential, 0o600);
     return credentialFile;
   }
 

@@ -11,8 +11,7 @@
  * Nothing here touches task evidence: it only removes dependency trees from the
  * dirty test, dead instance channels by age, and cold-archive batches by age.
  */
-import { lstat, readdir, rm } from 'node:fs/promises';
-import { join, sep } from 'node:path';
+import { hostIO } from '../host-io.ts';
 
 /** Dependency/build output: never evidence, never a reason to keep a worktree alive. */
 const JUNK_SEGMENT = /(?:^|\/)(?:node_modules|\.venv|venv|__pycache__|\.pnpm-store|\.cache|\.next|\.turbo|dist|build|target)(?:\/|$)/;
@@ -58,14 +57,15 @@ const ARCHIVE_BATCH = /^(?:evidence|deliverables)-\d{4}-\d{2}-\d{2}$|\.tar\.gz$/
 export interface GcEntry { name: string; path: string; mtimeMs: number }
 
 async function entries(root: string): Promise<GcEntry[]> {
+  const io = hostIO();
   let names: string[];
-  try { names = await readdir(root); } catch { return []; }
+  try { names = await io.fs.readdirAsync(root); } catch { return []; }
   const out: GcEntry[] = [];
   for (const name of names) {
     if (name.startsWith('.')) continue;
-    const path = join(root, name);
+    const path = io.path.join(root, name);
     try {
-      const st = await lstat(path);
+      const st = await io.fs.lstatAsync(path);
       if (st.isSymbolicLink()) continue;
       out.push({ name, path, mtimeMs: st.mtimeMs });
     } catch { /* raced away */ }
@@ -75,14 +75,15 @@ async function entries(root: string): Promise<GcEntry[]> {
 
 async function sizeOf(path: string): Promise<number> {
   let total = 0;
+  const io = hostIO();
   const walk = async (dir: string, depth: number): Promise<void> => {
     if (depth > 24) return;
     let names: string[];
-    try { names = await readdir(dir); } catch { return; }
+    try { names = await io.fs.readdirAsync(dir); } catch { return; }
     for (const name of names) {
-      const p = join(dir, name);
+      const p = io.path.join(dir, name);
       try {
-        const st = await lstat(p);
+        const st = await io.fs.lstatAsync(p);
         if (st.isSymbolicLink()) continue;
         if (st.isDirectory()) await walk(p, depth + 1);
         else total += st.size;
@@ -116,7 +117,7 @@ export async function sweepInstanceDirs(opts: {
     if (reason) { keep(entry.name, reason); continue; }
     const bytes = await sizeOf(entry.path);
     if (!opts.dryRun) {
-      try { await rm(entry.path, { recursive: true, force: true }); }
+      try { await hostIO().fs.removeTreeAsync(entry.path); }
       catch { result.failed!.push(entry.name); keep(entry.name, 'remove-failed'); continue; }
     }
     result.bytes += bytes;
@@ -140,11 +141,13 @@ export async function sweepArchiveBatches(opts: {
     if (entry.mtimeMs > cutoff) { result.skipped++; continue; }
     result.bytes += await sizeOf(entry.path);
     result.removed.push(entry.name);
-    if (!opts.dryRun) await rm(entry.path, { recursive: true, force: true }).catch(() => undefined);
+    if (!opts.dryRun) await hostIO().fs.removeTreeAsync(entry.path).catch(() => undefined);
   }
   return result;
 }
 
 /** Root-escape guard reused by callers that assemble paths from names. */
-export const isDirectChild = (root: string, path: string): boolean =>
-  path.startsWith(root + sep) && !path.slice(root.length + 1).includes(sep);
+export const isDirectChild = (root: string, path: string): boolean => {
+  const sep = hostIO().path.sep;
+  return path.startsWith(root + sep) && !path.slice(root.length + 1).includes(sep);
+};

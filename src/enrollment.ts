@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
+import { hostIO } from './host-io.ts';
 import { ensureOwnerToken } from './owner-token.ts';
 import type { Credential, EmployeeId, EnrollmentAdmin, Principal, Role } from './contracts.ts';
 import { CompanyError, ROLES } from './core.ts';
@@ -30,7 +31,7 @@ export class LocalEnrollmentAdmin implements EnrollmentAdmin {
       row: {
         role, capabilities: [...capabilities],
         credential_digest: createHash('sha256').update(token).digest('hex'),
-        credential_hash: await Bun.password.hash(token, { algorithm: 'argon2id' }),
+        credential_hash: await hostIO().password.hash(token),
         revoked: false, active_task: null,
       },
     });
@@ -49,7 +50,7 @@ export class LocalEnrollmentAdmin implements EnrollmentAdmin {
       row: {
         role: 'owner', capabilities: ['execute', 'review', 'manage'],
         credential_digest: digest,
-        credential_hash: await Bun.password.hash(token, { algorithm: 'argon2id' }),
+        credential_hash: await hostIO().password.hash(token),
         revoked: false, retired: false, active_task: null,
       },
     });
