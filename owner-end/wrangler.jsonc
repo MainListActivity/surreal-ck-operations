@@ -23,8 +23,8 @@
     "IDP_ISSUER": "https://o.maplayer.top/t/company",
     "IDP_JWKS_URL": "https://o.maplayer.top/t/company/jwks.json",
     "CONSOLE_CLIENT_ID": "aafe1504-b72a-4f0b-9a42-5146695c82b2",
-    // 公司租户 id（ma_hono 管理接口路径用）。建租户后填入；空则 idp.* 的租户与客户端命令返回 not_configured。
-    "IDP_TENANT_ID": "",
+    // 公司租户 id（ma_hono 的 company 租户，管理接口路径用）。空则 idp.* 的租户与客户端命令返回 not_configured。
+    "IDP_TENANT_ID": "46aa29a6-9ee8-4052-bccd-7923f98220d7",
     "AGENT_EMAIL_DOMAIN": "agents.maplayer.top",
     // 公开的客户端 id（密钥在 secret 里）。
     "GATEWAY_CLIENT_ID": "8db885f7-8d42-4c96-9870-47088af6fadc",

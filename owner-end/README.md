@@ -11,6 +11,8 @@
 | `src/worker.ts` | 入口。`/api/*` 进 Hono 路由，其余交给静态资源；`scheduled` 进定时任务 |
 | `src/auth/` | 访问令牌验签（jose，RS256）和身份分流 |
 | `src/commands.ts` | `POST /api/cmd` 的分流。老板、员工、系统身份各走各的路径 |
+| `src/owner-locks.ts` | 按目标的老板专属锁：公司租户、老板端与 ma_hono 的 Worker 和 D1、API 令牌、自定义域名。员工命中即拒绝并写审计 |
+| `src/policy-commands.ts`、`src/audit.ts` | 员工与权限命令（员工策略、保护清单、锁定项展示）；审计摘要与审计列表 |
 | `src/jobs.ts` | 执行端作业（`ops_job`）的排队、等待、结果与错误码 |
 | `src/messages.ts`、`src/translate.ts` | 译文预览与保存、补译、笔记改写（OpenAI 兼容的译文服务） |
 | `src/cron.ts` | 定时任务：员工身份同步、补译、笔记整理 |
@@ -28,10 +30,11 @@
 | --- | --- |
 | `IDP_ISSUER`、`IDP_JWKS_URL` | ma_hono 公司租户的签发者和公钥地址（生产为 `https://o.maplayer.top/t/company`） |
 | `CONSOLE_CLIENT_ID` | 老板页面的 PKCE 客户端 id（公开） |
-| `IDP_TENANT_ID` | 公司租户 id，用于 ma_hono 管理接口路径。**当前为空**：为空时 `idp.*` 的租户与客户端命令返回 `not_configured` |
+| `IDP_TENANT_ID` | 公司租户 id（ma_hono 的 `company` 租户，已填为 `46aa29a6-9ee8-4052-bccd-7923f98220d7`）。用于 ma_hono 管理接口路径；为空时 `idp.*` 的租户与客户端命令返回 `not_configured`。员工对公司租户的写入由按目标锁定拒绝（见「权限模型」） |
 | `AGENT_EMAIL_DOMAIN` | 员工 agent 账号使用的邮箱域名 |
 | `GATEWAY_CLIENT_ID`、`CRON_CLIENT_ID`、`VIEWER_CLIENT_ID` | 网关、定时任务、查看者的机器客户端 id（公开） |
 | `COMPANY_DB_URL`、`COMPANY_NS`、`COMPANY_DB` | 公司 SurrealDB 的地址、命名空间和数据库（生产为 `wss://data.maplayer.top/rpc`、`company`、`main`） |
+| `PROTECTED_CF_SCRIPTS`、`PROTECTED_D1_IDS` | 可选，逗号分隔。追加到按目标锁定的 Worker 脚本名与 D1 数据库 id，只能追加，不能移除默认项。默认已含老板端 `company-owner-end`、ma_hono 的 Worker `ma-auth`，以及 ma_hono 的 D1 `621dbcf7-ddcc-4099-8df2-3ec076830857` |
 
 ### 密钥（用 `wrangler secret put` 设置，不写进代码或 `wrangler.jsonc`）
 
@@ -65,7 +68,7 @@ MAGPIE_API_KEY=<本地假值>
 
 - `DEV_DB_ROOT_*` 让每个数据库会话都以 root 连接（见 `src/db.ts`）。所以 `readConfig` 只在 `COMPANY_DB_URL` 指向 `localhost` 或 `127.0.0.1` 时接受它。指向其它地址时配置直接失败（返回 503），不会悄悄放开权限。
 - 本地需要两个替身服务，仓库里不包含：兼容的身份服务（OIDC 授权码加 PKCE，RS256 访问令牌），以及兼容的 `chat/completions` 译文服务。
-- 本地数据库要先应用本仓库的 schema（到 058）。`tests/gateway-access.fork.test.ts` 演示了在隔离库上做引导的方式。
+- 本地数据库要先应用本仓库的 schema（到 058）。`tests/gateway-access.fork.test.ts` 演示了在隔离库上做引导的方式：应用 058，访问方式直接用生产的 `schema/055-access.surql`，只替换 JWKS 地址。
 
 启动：
 
@@ -86,7 +89,7 @@ bun run build                                  # 生成 public/app.js
 | `bun run typecheck` | `tsc --noEmit`，严格模式，覆盖 `src/` 和 `tests/` |
 | `bun run test` | `bun test tests`：网关、身份、页面的单测 |
 | `bun run build:ui` | 把页面打包到 `public/app.js` |
-| `RUN_SCK_OWNER_END_TESTS=1 bun test tests/gateway-access.fork.test.ts` | 在自建隔离库上验证 058 之后的访问规则 |
+| `RUN_SCK_OWNER_END_TESTS=1 bun test tests/gateway-access.fork.test.ts` | 在自建隔离库上验证网关令牌的访问规则：应用 058 后，写 `protected_command`、`agent_policy` 与改删 `ops_audit` 都被拒。访问方式用生产的 055 |
 | `bun run deploy:dry-run` | build 后执行 `wrangler deploy --dry-run --outdir dist`，只打包，不上传 |
 
 在仓库根目录下：
@@ -113,7 +116,7 @@ bun run build                                  # 生成 public/app.js
 | `GET /api/config` | 无需登录 | 登录参数：`issuer`、`clientId`、`authorizeUrl`、`tokenUrl`、`audience` |
 | `GET /api/me` | 老板 | 当前老板的 `sub`、`roles`、`exp`。非老板返回 403 |
 | `GET /api/board` | 老板 | 看板数据，与 `board.snapshot` 是同一份（`src/board.ts`） |
-| `POST /api/cmd` | 老板；员工只能调用只读白名单 | 请求体 `{"command": "...", "input": {...}}`，`input` 缺省为 `{}`。请求带 `Origin` 时必须与请求同源；请求体上限 256 KB |
+| `POST /api/cmd` | 老板；员工按身份、租约与守卫判定（见「权限模型」） | 请求体 `{"command": "...", "input": {...}}`，`input` 缺省为 `{}`。请求带 `Origin` 时必须与请求同源；请求体上限 256 KB |
 | 其它 `/api/*` | - | 404，`code: not_found` |
 
 其余路径交给静态资源。未知路径回落到 `index.html`，`/auth/callback` 由页面自己处理（`run_worker_first` 只包含 `/api/*`）。
@@ -133,21 +136,28 @@ bun run build                                  # 生成 public/app.js
 
 ### 执行端作业
 
-需要执行端宿主的命令（`RUNNER_ONLY_COMMANDS`，见 `src/owner-api.ts`）会排队到 `ops_job`。网关最多等 25 秒：完成则返回结果，失败则返回对应错误码，超时返回 `pending`。`ops.job.list` 和 `ops.job.get` 用来查询作业。
+需要执行端宿主的命令（`RUNNER_ONLY_COMMANDS`、`ops_*`、`host.exec`、`company.release.*`，见 `src/commands.ts` 的 `isRunnerCommand`）会排队到 `ops_job`。员工发起的作业记录员工与任务。网关最多等 25 秒：完成则返回结果，失败则返回对应错误码，超时返回 `pending`。`ops.job.list` 和 `ops.job.get` 用来查询作业；员工只能查询本人发起的作业，`ops.job.list` 对员工拒绝。
 
 ## 权限模型
 
 身份由访问令牌决定（`src/auth/caller.ts`）：
 
-- **老板**：`ac=owner` 且带 `Owner` 角色。可以调用全部老板命令。数据库会话用老板令牌登录，权限由数据库访问规则决定（`schema/055-access.surql`）。
-- **员工**：`ac=agent`，令牌必须带任务绑定。员工的命令经过命令守卫（`src/command-guard.ts`），按固定顺序判定，第一条不通过即拒绝：
-  1. 员工已停用；
-  2. 命中写死的老板专属命令（`HARD_OWNER_ONLY`，如 `guard.*`、`agent.*`、`task.create`、`message.send`、`note.edit`）；
-  3. 命中 `protected_command` 中标记为 `owner_only` 的命令；
+- **老板**：`ac=owner` 且带 `Owner` 角色。可以调用全部老板命令，不经过下面的员工判定。数据库会话用老板自己的令牌连库（`$access='owner'`），权限由数据库访问规则决定（`schema/055-access.surql`）。
+- **员工**：`ac=agent`，令牌必须带任务绑定。员工的命令经过命令守卫（`src/command-guard.ts`）和网关的专属规则，按固定顺序判定，第一条不通过即拒绝并写审计：
+  1. 员工已停用（`agent_policy.disabled`）；
+  2. 命中写死的老板专属命令（`HARD_OWNER_ONLY`，共 5 条：`guard.*`、`agent.*`、`owner.login.*`、`def.*`、`db.write`）；
+  3. 命中 `protected_command` 中标记为 `owner_only` 的命令。老板可以在「仅老板」清单里增删；
   4. 不在员工的允许清单（`agent_policy.allow`）内，或命中禁止清单（`agent_policy.deny`）；
-  5. 没有该任务的有效租约（持有人是本员工且未过期）。
+  5. 没有该任务的有效租约（持有人是本员工且未过期）；
+  6. 命中按目标的硬锁（`src/owner-locks.ts`，只看命令与输入里的目标，不看调用方）：
+     - `idp.*`：公司租户（`IDP_TENANT_ID` 或 slug `company`）的写操作，以及 ma_hono 服务主体（`/admin/service-principals`）与其它管理路径的写入。读取和其它租户不受限；
+     - `cf.api`：老板端与 ma_hono 的 Worker（脚本及其子资源）、ma_hono 的 D1、API 令牌的管理、自定义域名的写入，以及请求内容提到 `company.maplayer.top` 或这些资源的调用。其它账号资源不受限；
+  7. 员工拒绝清单（`OWNER_ONLY_FOR_AGENTS`：`ops.job.list`、`audit.list`，它们记录其它员工和老板的操作）；
+  8. `ops.job.get` 只能取本员工发起的作业。
 
-  通过后，命令还必须在只读白名单内：`db.read`、`task.detail`、`note.list`、`note.preview`。员工的写入仍由执行端直连数据库，不经过网关。
+  通过后：执行端命令（`RUNNER_ONLY_COMMANDS`、`ops_*`、`host.exec`、`company.release.*`）以员工身份排队到 `ops_job`；`db.read` 用查看者令牌执行（只读）；其余命令用网关令牌执行。员工不再有只读白名单，写命令同样按上面的判定放行。
+
+  插件只把 `ops_*`、`def_list` 与 `def_ensure` 转发到网关（`def.*` 对员工拒绝）。任务流工具（checkpoint、submit、review 等）仍在本机执行，直连数据库，不经过网关。所以插件里员工能到达网关的命令只有 `ops_*`。
 - **系统身份**（`gateway`、`runner`、`automation`、`migrator`、`viewer`）：不能调用网关接口。运行器和定时任务调用老板命令会被拒绝，并写入审计。
 
 ### 审计
@@ -158,7 +168,7 @@ bun run build                                  # 生成 public/app.js
 
 ## 译文与投递
 
-消息有一个“生效语言”，它决定员工收到原文还是译文（`effectiveLangOf`、`deliveryOf`，见 `src/outbound-messages.ts`）：
+消息有一个“生效语言”，它决定员工收到原文还是译文（`effectiveLangOf`、`deliveryOf`，见 `src/outbound-delivery.ts`。看板与派工共用这一份判定）：
 
 1. 老板为这条消息选过语言（包括选了“不翻译（原文投递）”）：以消息自己的语言为准。
 2. 老板没有选过：跟着收件员工走，取员工策略的译文语言（`agent_policy.lang`）。消息上残留的旧语言不算。
@@ -202,18 +212,24 @@ bun run build                                  # 生成 public/app.js
 ## 部署（本 PR 未执行）
 
 1. 用 `wrangler secret put` 设置上文「密钥」中需要的值。
-2. 建好租户后，在 `wrangler.jsonc` 中填入 `IDP_TENANT_ID`。
+2. `IDP_TENANT_ID` 已在 `wrangler.jsonc` 中填为公司租户 id（`46aa29a6-9ee8-4052-bccd-7923f98220d7`），部署前核对一次。
 3. 执行 `bun run deploy:dry-run` 确认打包通过。静态资源上传 `app.css`、`app.js`、`index.html` 三个文件，`app.js.map` 按 `public/.assetsignore` 排除。
 4. 老板批准后再执行 `wrangler deploy`。
 
 ## 已知偏离与遗留
 
-1. **ma_hono 服务主体权限不足。** `IDP_ADMIN_TOKEN` 对应的服务主体只有 `tenant.read`、`user.read`、`user.provision`。创建租户（`POST /admin/tenants`）、客户端管理、租户的 PATCH、keys、DELETE 需要人工管理员会话，服务主体调用会返回 403。因此租户与客户端管理命令暂不可用，`IDP_TENANT_ID` 需要人工建租户后填入。
+1. **服务主体与公司租户。** `IDP_ADMIN_TOKEN` 对应的 ma_hono 服务主体已有全部 8 个 scope，公司租户已存在，`IDP_TENANT_ID` 已填入。`idp.*` 管理命令可以直接使用；作用于公司租户的写入，以及服务主体与其它管理路径的写入，员工不能调用（见「权限模型」）。
 2. **`surrealdb` 解析自仓库根。** `owner-end/package.json` 没有声明 `surrealdb`，它来自根目录的 `node_modules`，版本见根目录 `package.json`。
 3. **页面不用 cookie。** 页面用 PKCE 取得访问令牌，令牌只放在页面内存里，并同步到 `sessionStorage`（键 `sck.owner.session`），不用 localStorage。所有接口只认 `Authorization: Bearer`。
-4. **派工译文门在看板侧未计入。** 调度器派工前会等待译文，但看板上的“可接”判断还没有计入这个条件。所以看板可能显示“可接”，而调度器暂不派工。这一项与 W3-RUNNER 的改动可能冲突，合并前需要核对。
-5. **`upgrade.list` 不审计。** 它以 `.list` 结尾，按只读命令处理。测试已锁定这一行为。
-6. **员工只读命令的审计标签。** 员工的只读命令经老板接口的核心执行（`via=agent`），审计行记录的是员工身份（`actorKind=agent`）。核心对写操作使用的标签 `owner:agent` 目前不会出现，因为员工白名单里没有写命令。若将来开放员工写命令，需要复核网关与核心两层审计是否重复。
-7. **译文没有用真实服务验证。** 测试和截图用的是本地替身，译文形如 `[EN stub] 原文`。译文质量、延迟和费用需要接入真实译文服务后再验证。
-8. **`wrangler.jsonc` 指向生产库。** 本地开发必须用 `.dev.vars` 覆盖，见「本地开发」。
-9. **390px 下导航条横向滚动。** 这是设计如此，没有改。
+4. **`upgrade.list` 不审计。** 它以 `.list` 结尾，按只读命令处理。测试已锁定这一行为。
+5. **员工写命令的审计标签。** 员工的写命令经网关执行时，核心记录的操作人标签是 `owner:agent`（`src/owner-api.ts`）；网关的 `ops_audit` 行记录的是员工身份（`actorKind=agent`）。同一次调用可能有两层记录，看审计时以员工身份为准。
+6. **员工能调用的命令范围变大，需要复核。** 员工的只读白名单已移除，网关按「权限模型」判定放行。插件目前只转发 `ops_*`、`def_list` 与 `def_ensure`，其中 `def.*` 对员工拒绝，所以员工经插件实际可达的仍只有 `ops_*`。但在网关层面，`host.exec`（在白名单主机 `arm-free-1` 上执行任意命令）、`company.release.*` 与 `upgrade.*` 不在 `HARD_OWNER_ONLY` 中，有有效租约的员工令牌按默认配置会被放行。建议老板把它们加入「仅老板」清单；若要写死为仅老板，需要审阅者决定。
+7. **员工拿不到执行端作业的结果。** 作业超过 25 秒返回 `pending` 时，插件的 sidecar 把它当作错误返回，不轮询，员工因此无法用 `ops.job.get` 取结果。这需要插件侧补轮询，本次未改插件。
+8. **执行端的 RUNNER_ONLY 命令不再核对员工。** `task.create`、`upgrade.*` 在执行端以无员工身份的方式执行（`src/cloud/ops-jobs.ts` 的 `runnerOnly` 分支只接收命令与输入）。员工的身份与租约只在网关入队时判定。
+9. **`ops.job.list`、`audit.list` 的拒绝不是数据层边界。** 这两条只在网关拒绝。viewer 令牌的 `db.read` 理论上能直接读 `ops_audit` 与 `ops_job`，因为系统用户不受表权限约束（见 `schema/056` 的注释）。要在数据层收紧，需要另做 schema 改动。
+10. **按目标的硬锁只作用于网关。** 它们只对经网关的调用生效。插件本机的任务流工具直连数据库，不经网关。
+11. **`Bun.sleep` 与 `process.env` 的残留。** `src/mcp/client-cli.ts` 仍用 `Bun.sleep` 与 `Bun.sleepSync`，它不在 Worker 的依赖闭包里。`src/owner-api.ts` 读取 `SCK_OWNER_TOKEN`，只在 `task.create` 的本机分支里用到，Worker 不走这个分支（RUNNER_ONLY 命令先排队）。`scripts/worker-compat-check.ts` 不检查 `process.env`，这一点靠代码审阅确认。
+12. **译文没有用真实服务验证。** 测试和截图用的是本地替身，译文形如 `[EN stub] 原文`。译文质量、延迟和费用需要接入真实译文服务后再验证。
+13. **`wrangler.jsonc` 指向生产库。** 本地开发必须用 `.dev.vars` 覆盖，见「本地开发」。
+14. **390px 下导航条横向滚动。** 这是设计如此，没有改。
+15. **员工与权限页的截图较旧。** `desktop-permissions.png` 拍于「按目标锁定」与「员工拒绝清单」区块加入之前，这两块还没有截图。
