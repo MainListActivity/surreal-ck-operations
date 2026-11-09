@@ -4,10 +4,12 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  TOOL_SCRIPTS,
   buildManifest,
   missingPluginImports,
   packTarball,
   stagePlugin,
+  stageToolScripts,
   writeReleaseJson,
   writeReleaseStamp,
 } from '../scripts/plugin-package.ts';
@@ -15,6 +17,7 @@ import { releaseManifestSchema, sha256File } from '../src/release-manifest.ts';
 
 const SHA = 'a'.repeat(40);
 const VERSION = '0.5.0';
+const REPO_SCRIPTS = join(import.meta.dir, '..', 'scripts');
 let root: string;
 let pluginDir: string;
 
@@ -76,6 +79,23 @@ describe('stagePlugin', () => {
   });
 });
 
+describe('stageToolScripts', () => {
+  test('TOOL_SCRIPTS 为 sck.sh 与 bun-runtime.sh，并按原文复制到发行副本的 scripts/', async () => {
+    expect([...TOOL_SCRIPTS]).toEqual(['sck.sh', 'bun-runtime.sh']);
+    const stageScripts = join(root, 'stage-tools', 'scripts');
+    await stageToolScripts(REPO_SCRIPTS, stageScripts);
+    for (const name of TOOL_SCRIPTS) {
+      expect(readFileSync(join(stageScripts, name), 'utf8')).toBe(readFileSync(join(REPO_SCRIPTS, name), 'utf8'));
+    }
+  });
+
+  test('scripts/ 缺少任一工具脚本时拒绝暂存，发行包不会缺工具', async () => {
+    const partial = join(root, 'partial-scripts');
+    write(join(partial, 'sck.sh'), '#!/bin/sh\n');
+    await expect(stageToolScripts(partial, join(root, 'stage-partial', 'scripts'))).rejects.toThrow('scripts/bun-runtime.sh');
+  });
+});
+
 describe('writeReleaseStamp', () => {
   test('写入版本与提交常量，导入结果与参数一致', async () => {
     const stage = join(root, 'stage-stamp', 'plugin');
@@ -109,6 +129,7 @@ describe('packTarball 与 buildManifest', () => {
   beforeAll(async () => {
     const stageDir = join(root, 'stage-pack');
     await stagePlugin(pluginDir, join(stageDir, 'plugin'));
+    await stageToolScripts(REPO_SCRIPTS, join(stageDir, 'scripts'));
     await writeReleaseStamp(join(stageDir, 'plugin'), { version: VERSION, sha: SHA });
     await writeReleaseJson(stageDir, { version: VERSION, sha: SHA, requiredSchema: 60 });
     tgz = join(root, 'out', `sck-company-${VERSION}.tgz`);
@@ -118,15 +139,18 @@ describe('packTarball 与 buildManifest', () => {
     writeFileSync(updater, '// stub updater\n');
   });
 
-  test('tgz 只含 release.json 与 plugin/，不含 AppleDouble 文件', () => {
+  test('tgz 只含 release.json、plugin/ 与 scripts/（含 sck.sh、bun-runtime.sh），不含 AppleDouble 文件', () => {
     const entries = execFileSync('tar', ['-tzf', tgz], { encoding: 'utf8' }).split('\n').filter(Boolean);
     expect(entries.length).toBeGreaterThan(0);
     for (const entry of entries) {
-      expect(entry === 'release.json' || entry === 'plugin/' || entry.startsWith('plugin/')).toBe(true);
+      const allowed = entry === 'release.json' || ['plugin/', 'scripts/'].some(dir => entry === dir || entry.startsWith(dir));
+      expect(allowed).toBe(true);
       expect(entry.split('/').some(part => part.startsWith('._'))).toBe(false);
     }
     expect(entries).toContain('release.json');
     expect(entries).toContain('plugin/pnpm-lock.yaml');
+    expect(entries).toContain('scripts/sck.sh');
+    expect(entries).toContain('scripts/bun-runtime.sh');
   });
 
   test('manifest 通过 releaseManifestSchema，package.sha256 等于 tgz 的 sha256', async () => {
@@ -166,7 +190,8 @@ describe('missingPluginImports', () => {
         "const s = 'a from \": weird, \"';",
         'export const run = 1;',
       ].join('\n'));
-      write(join(dir, 'server', 'vendor', 'unused.ts'), "import { McpServer } from '@modelcontextprotocol/server';\n");
+      // Not reachable from the entries, so its unresolved import must not be reported (the package name is a stand-in).
+      write(join(dir, 'server', 'vendor', 'unused.ts'), "import { thing } from '@sck-test/unreachable-only';\n");
       write(join(dir, 'node_modules', 'surrealdb', 'package.json'), '{}');
       expect(await missingPluginImports(dir)).toEqual(['@getpaseo/client']);
       write(join(dir, 'node_modules', '@getpaseo', 'client', 'package.json'), '{}');

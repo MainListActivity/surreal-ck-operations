@@ -1,5 +1,5 @@
 // SYS-QUOTA 端到端：员工的额度阻塞必须真的立起门禁。本用例跑真实层——隔离 SurrealDB、真实 core、
-// 真实 Workforce/Dispatcher、真实 SidecarPool，员工侧用真实 `sck` 通道（client-cli 进程写 req/ 读 res/），
+// 真实 Workforce/Dispatcher、真实 SidecarPool，员工侧用真实 `sck` 通道（sck-cli 进程写 req/ 读 res/），
 // 不 mock 调度器、不直接调 core.block。缺陷原文见 comm 目录的 gm-bc728b-defect-quota-resets-dropped.md：
 // sidecar 只转发 text，第 5 参 quotaResetsAt 缺省 ⇒ 任务 quota_resets_at 不写、provider 不标 exhausted、
 // 经理在恢复点前被反复唤醒。本用例断言的是这三件事的反面。
@@ -20,9 +20,9 @@ import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
 import { blockerPath } from '../src/comm.ts';
 
 const run = process.env.RUN_SCK_CHANNEL_FORK_TESTS === '1' ? test : test.skip;
-const CLIENT_CLI = join(import.meta.dir, '..', 'src', 'mcp', 'client-cli.ts');
+const CLIENT_CLI = join(import.meta.dir, '..', 'src', 'sck-cli.ts');
 
-/** The real `sck call` path: a separate client-cli process writes req/ and reads res/. */
+/** The real `sck call` path: a separate sck-cli process writes req/ and reads res/. */
 async function relay(comm: Record<string, string>, tool: string, args: Record<string, unknown> = {}) {
   // Spawn asynchronously: the sidecar sweeper lives in this same Bun process, so a blocking
   // spawnSync would prevent it from answering the child client.
@@ -60,7 +60,7 @@ run('SYS-QUOTA fork: a real sck quota block writes the task row and the provider
       quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0,
       minFreeMemMb: 0, minFreeDiskMb: 0, artifactReclaimEnabled: false, blockLoopLimit: 0, redispatch_minutes: 15,
       max_running: 4, provider_max: { codex: 1, anthropic: 1 } });
-    const wf = new Workforce(db, join(dir, 'unused-credential-files'));
+    const wf = new Workforce(db);
     await wf.upsertDef('fixture-eng-codex', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
     // 复核席位与工程同 provider：服务恢复前「所有订阅都不可用」，公司才该压住队列。
     await wf.upsertDef('fixture-qa-codex', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });

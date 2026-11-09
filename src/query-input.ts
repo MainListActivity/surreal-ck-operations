@@ -40,7 +40,7 @@ function optionalText(value: unknown, name: string, max: number): string | undef
 
 /**
  * A required task id (get_task_history). null is not an id: it is refused, as a missing one is. Every layer that reads
- * a task id from arguments (MCP schema, sidecar, core) takes the same rule, so null never becomes the string "null".
+ * a task id from arguments (tool schema, sidecar, core) takes the same rule, so null never becomes the string "null".
  */
 export function taskIdOf(value: unknown): string {
   if (typeof value !== 'string' || value.trim().length === 0 || value.length > 200) {
@@ -181,7 +181,7 @@ export function parseWorktreeInput(input: Record<string, unknown>): {
 const isRepoPath = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0 && value.length <= 4096;
 
 /**
- * Arguments of reclaim_worktrees (SYS01, D3). One rule on every layer (MCP, sidecar, core): an omitted dryRun is a reclaim, and
+ * Arguments of reclaim_worktrees (SYS01, D3). One rule on every layer (tool schema, sidecar, core): an omitted dryRun is a reclaim, and
  * dryRun, when given, must be true or false, so null, "true", 1 and 0 are refused. repos, when given, is a list of paths, and
  * anything else (a string, a null, a number inside the list) is refused. A refused call touches no tree: the value is never read
  * as a default, so a bad value cannot widen into a reclaim of every repository.

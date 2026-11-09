@@ -1,5 +1,7 @@
 # WT01 受控验证手册
 
+> 0.7.0 说明：MCP 服务与其工具（`list_worktrees`、`get_context` 等）已删除。下文中经 MCP 调用的步骤与 `SurrealCKCompany/releases/*`、`active` 相关描述仅为历史参考，替代入口（插件运维代理或 `sck` 命令）待确认后重写，执行前不要照用。
+
 ## 本地演练（QA 不需要公司凭证）
 
 在 PR 的独立 checkout/worktree 安装根和 plugin 依赖、执行 vendor.sh，运行：

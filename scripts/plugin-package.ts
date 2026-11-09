@@ -1,6 +1,6 @@
 // 插件发行包打包：bun scripts/plugin-package.ts --out <dir> [--sha <40位小写 hex>] [--verify-install]
 //
-// 产物写入 --out：sck-company-<version>.tgz（release.json + plugin/，不含 node_modules）、node-updater.js、manifest.json。
+// 产物写入 --out：sck-company-<version>.tgz（release.json、plugin/（不含 node_modules）、scripts/（sck.sh、bun-runtime.sh））、node-updater.js、manifest.json。
 // 节点更新器会对 plugin/ 执行 pnpm install --prod --frozen-lockfile --ignore-scripts，所以锁文件必须与 package.json 一致。
 import { execFile } from 'node:child_process';
 import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
@@ -38,6 +38,12 @@ export const PLUGIN_ENTRIES = [
   'server',
   'shared',
 ] as const;
+
+/**
+ * 发行包 scripts/ 里的 sck 工具脚本：节点更新器把 sck.sh 装为 bin/sck，把 bun-runtime.sh 装到 bin/（sck.sh 按同目录找它）。
+ * 缺任一文件都不打包，发行包不会缺工具。
+ */
+export const TOOL_SCRIPTS = ['sck.sh', 'bun-runtime.sh'] as const;
 
 /** 排除规则：node_modules、*.tmp、.ignored_*、AppleDouble（._*）、*.test.*、tsconfig.json。 */
 export function excluded(name: string): boolean {
@@ -83,6 +89,19 @@ export async function stagePlugin(pluginDir: string, stagePluginDir: string): Pr
   }
 }
 
+/** 把 TOOL_SCRIPTS 从检出的 scripts/ 复制到发行副本的 scripts/（即发行包内的 scripts/ 目录）。 */
+export async function stageToolScripts(scriptsDir: string, stageScriptsDir: string): Promise<void> {
+  await rm(stageScriptsDir, { recursive: true, force: true });
+  await mkdir(stageScriptsDir, { recursive: true });
+  for (const name of TOOL_SCRIPTS) {
+    const src = join(scriptsDir, name);
+    await stat(src).catch(() => {
+      throw new Error(`发行包缺少 scripts/${name}`);
+    });
+    await copyFile(src, join(stageScriptsDir, name));
+  }
+}
+
 /** 覆写发行副本中的版本戳（源码检出里保持 dev 占位）。 */
 export async function writeReleaseStamp(
   stagePluginDir: string,
@@ -103,9 +122,9 @@ export async function writeReleaseJson(
   await writeFile(join(stageDir, 'release.json'), `${JSON.stringify(body, null, 2)}\n`);
 }
 
-/** 打包 release.json 与 plugin/，COPYFILE_DISABLE 禁止生成 AppleDouble 文件。 */
+/** 打包 release.json、plugin/ 与 scripts/，COPYFILE_DISABLE 禁止生成 AppleDouble 文件。 */
 export async function packTarball(stageDir: string, tgzPath: string): Promise<void> {
-  await execFileAsync('tar', ['-czf', resolve(tgzPath), '-C', stageDir, 'release.json', 'plugin'], {
+  await execFileAsync('tar', ['-czf', resolve(tgzPath), '-C', stageDir, 'release.json', 'plugin', 'scripts'], {
     env: { ...process.env, COPYFILE_DISABLE: '1' },
   });
 }
@@ -270,6 +289,7 @@ export async function main(argv: string[]): Promise<void> {
   const stage = join(out, 'stage');
   const stagePluginDir = join(stage, 'plugin');
   await stagePlugin(PLUGIN_DIR, stagePluginDir);
+  await stageToolScripts(join(ROOT, 'scripts'), join(stage, 'scripts'));
   await writeReleaseStamp(stagePluginDir, { version, sha });
   await writeReleaseJson(stage, { version, sha, requiredSchema });
 

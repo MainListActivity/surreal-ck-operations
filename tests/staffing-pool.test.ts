@@ -36,21 +36,19 @@ test('pool: reuse instance gets def effective weight and normalized share', () =
   expect(spawn.share).toBeCloseTo(0.5);
 });
 
-test('pool: busy / holding / legacy instances are ineligible with reasons', () => {
+test('pool: busy and holding instances are ineligible with reasons', () => {
   const d = def('d1');
   const busy = inst('i1');
   const held = inst('i2');
-  const legacy = inst('i3', { credentialFile: '/cred/i3.json' });
   const entries = staffingPool(base({
-    defs: [d], insts: [busy, held, legacy],
-    states: new Map([['i1', 'busy'], ['i2', 'idle'], ['i3', 'idle']]),
+    defs: [d], insts: [busy, held],
+    states: new Map([['i1', 'busy'], ['i2', 'idle']]),
     holding: new Set(['i2']),
   }));
   const by = new Map(entries.filter(e => e.kind === 'reuse').map(e => [e.ref, e]));
   expect(by.get('i1')!.reason).toBe(BLOCK_TEXT.session_busy);
   expect(by.get('i1')!.code).toBe('session_busy');
   expect(by.get('i2')!.reason).toBe(BLOCK_TEXT.held);
-  expect(by.get('i3')!.reason).toBe(BLOCK_TEXT.credential_file);
 });
 
 test('pool: a session nobody observed is unknown, never reported as busy', () => {
@@ -63,17 +61,6 @@ test('pool: a session nobody observed is unknown, never reported as busy', () =>
   // No state entry at all is the same observation gap, not a busy session.
   const absent = staffingPool(base({ defs: [d], insts: [inst('i1')], states: new Map() })).find(e => e.kind === 'reuse')!;
   expect(absent.code).toBe('unknown');
-});
-
-test('pool: legacy instance does not consume a maxInstances seat in sidecar mode', () => {
-  const d = def('d1', { maxInstances: 1 });
-  const legacy = inst('i1', { credentialFile: '/cred/i1.json' });
-  const pool = staffingPool(base({ defs: [d], insts: [legacy], states: new Map([['i1', 'idle']]) }));
-  const spawn = pool.find(e => e.kind === 'spawn')!;
-  expect(spawn.eligible).toBe(true);   // seat free despite the live legacy inst
-  // Non-sidecar mode: the same inst would consume the seat.
-  const pool2 = staffingPool(base({ defs: [d], insts: [legacy], states: new Map([['i1', 'busy']]), sidecar: false }));
-  expect(pool2.find(e => e.kind === 'spawn')!.reason).toBe('编制席位已满（1/1 个实例，仓库 repo）');
 });
 
 test('pool: model drift and unresolved slots are ineligible', () => {

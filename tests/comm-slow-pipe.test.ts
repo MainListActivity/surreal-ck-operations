@@ -4,13 +4,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ensureCommDirs, reqDir, resDir, writeFileAtomic } from '../src/comm.ts';
 
-// Regression for the comm client's stdout (SYS01 AC01, AC03). The pre-SYS01 client wrote with process.stdout.write
-// and then called process.exit, so a reader slower than the writer cut the answer at the 64 KiB pipe buffer.
+// Regression for the comm client's stdout (SYS01 AC01, AC03). A client that wrote with process.stdout.write and then
+// called process.exit would let a reader slower than the writer cut the answer at the 64 KiB pipe buffer.
 // Only a real shell pipe with a slow reader reproduces that: a Bun.spawn pipe drains at once and hides it.
 // The stand-in sidecar answers with an unguarded 1000-task payload on purpose, so the transport alone is tested.
 const ROOT = join(import.meta.dir, '..');
-const CLIENT = join(ROOT, 'src/mcp/client-cli.ts');
-const LEGACY_CLIENT = join(ROOT, 'tests/fixtures/comm-client-8d03d35.ts');
+const CLIENT = join(ROOT, 'src/sck-cli.ts');
 const TASKS = 1000;
 const unit = '中文🙂字符';
 
@@ -28,7 +27,7 @@ function fixturePayload() {
 function cleanEnv(overrides: Record<string, string>): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined && !key.startsWith('SCK_COMM_') && !key.startsWith('SCK_EMPLOYEE_') && key !== 'SCK_MCP_URL') env[key] = value;
+    if (value !== undefined && !key.startsWith('SCK_COMM_')) env[key] = value;
   }
   return { ...env, ...overrides };
 }
@@ -78,16 +77,5 @@ test('the comm client delivers every byte of a 1000-task answer through a slow s
   const parsed = JSON.parse(run.bytes.toString('utf8')) as typeof payload;
   expect(parsed.tasks).toHaveLength(TASKS);
   expect(parsed.tasks.every(task => task.title.includes('🙂'))).toBe(true);
-  console.log(JSON.stringify({ check: 'comm-slow-pipe', client: 'src/mcp/client-cli.ts', expectedBytes, receivedBytes: run.bytes.length, exit: run.status }));
-});
-
-// Red control (not a CI gate: the pipe behaviour depends on the host). Run locally with SCK_COMM_CONTROL=1 to show
-// that the pre-SYS01 client loses the tail through the same pipe; the harness above is only trusted if this is red.
-const control = process.env.SCK_COMM_CONTROL === '1' ? test : test.skip;
-control('control: the 8d03d35 client cuts the same answer at the pipe buffer', async () => {
-  const payload = fixturePayload();
-  const expectedBytes = Buffer.byteLength(`${JSON.stringify(payload)}\n`, 'utf8');
-  const run = await throughSlowPipe(LEGACY_CLIENT, payload);
-  console.log(JSON.stringify({ check: 'comm-slow-pipe-control', client: 'comm-client-8d03d35', expectedBytes, receivedBytes: run.bytes.length, exit: run.status }));
-  expect(run.bytes.length).toBeLessThan(expectedBytes);
+  console.log(JSON.stringify({ check: 'comm-slow-pipe', client: 'src/sck-cli.ts', expectedBytes, receivedBytes: run.bytes.length, exit: run.status }));
 });

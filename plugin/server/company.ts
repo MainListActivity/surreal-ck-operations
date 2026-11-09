@@ -103,9 +103,9 @@ export function company(): Promise<Company> {
     const nodeId = ensureNodeId(serviceHome());
     const db = new CompanyDatabase(databaseConfig);
     await db.connect();
-    await db.useDatabase(); // schema is owned by the launchd MCP service; we only query.
+    await db.useDatabase(); // schema is applied by the migrator (cloud) or the local bootstrap; the plugin only queries.
 
-    const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/private/credentials`);
+    const workforce = new Workforce(db);
     const opsRepo = process.env.SCK_AGENT_CWD ?? "/Users/y/IdeaProjects/surreal-ck-operations";
     // The ops repo lets triage bind a company-system quick goal's code legs to it (see OwnerDesk.triage).
     const owner = new OwnerDesk(db, opsRepo);
@@ -130,7 +130,7 @@ export function company(): Promise<Company> {
     };
     const { createSubmitCheck } = await import("./vendor/src/pr-gate.ts");
     const { createSystemCheck } = await import("./vendor/src/submit-checks.ts");
-    // Same build-cost line as the MCP process: the plugin's sidecar serves the same paged reads, so both surfaces must be diagnosable.
+    // The build-cost line for paged snapshot reads, so a build stays diagnosable from the plugin's service log.
     const snapshotObserve = (stats: { outcome: string; kind: string; rows: number; bytes: number; batches: number; loadMs: number; reserveMs: number; writeMs: number; commitMs: number; totalMs: number; serverMs: number; loadAttempts: number; release: string; releaseMs: number }) =>
       console.log(`snapshot build ${stats.kind} ${stats.outcome} rows=${stats.rows} bytes=${stats.bytes} batches=${stats.batches} load=${Math.round(stats.loadMs)} reserve=${Math.round(stats.reserveMs)} write=${Math.round(stats.writeMs)} commit=${Math.round(stats.commitMs)} server=${Math.round(stats.serverMs)} total=${Math.round(stats.totalMs)} reads=${stats.loadAttempts} release=${stats.release} releaseMs=${Math.round(stats.releaseMs)}`);
     const core = new SurrealCompanyCore(db, { workforce, snapshotObserve, worktrees: worktreeOpts, nodeId, submitCheck: process.env.SCK_PR_GATE === "0" ? undefined : createSubmitCheck(),

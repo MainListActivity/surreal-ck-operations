@@ -3,14 +3,13 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ensureCommDirs, reqDir, resDir, writeFileAtomic } from '../src/comm.ts';
-import type { CompanyCore } from '../src/contracts.ts';
-import { createMcpHttpService } from '../src/mcp/server.ts';
 
 // The comm client's own refusals (SYS01 AC03): every outcome is one line of JSON on stdout, with a recoverable
-// code and the reason on stderr. Each case runs the real client file; no network is needed for these paths.
+// code and the reason on stderr. The client is src/sck-cli.ts and relays only through SCK_COMM_DIR with SCK_COMM_KEY;
+// it holds no credential and opens no connection. Each case runs the real client file; no sidecar is needed for the refusals.
 const ROOT = join(import.meta.dir, '..');
-const CLIENT = join(ROOT, 'src/mcp/client-cli.ts');
-const CREDENTIAL_ENV = ['SCK_COMM_DIR', 'SCK_COMM_KEY', 'SCK_MCP_URL', 'SCK_MCP_TOKEN', 'SCK_EMPLOYEE_CREDENTIAL', 'SCK_EMPLOYEE_CREDENTIAL_FILE'];
+const CLIENT = join(ROOT, 'src/sck-cli.ts');
+const CREDENTIAL_ENV = ['SCK_COMM_DIR', 'SCK_COMM_KEY'];
 
 function cleanEnv(overrides: Record<string, string | undefined> = {}): Record<string, string> {
   const env: Record<string, string> = {};
@@ -64,11 +63,11 @@ test('local refusals are one JSON line with a recoverable code, the reason on st
     { args: ['call', 'get_context', '[]'], env: withComm, code: 'invalid_arguments', reason: /one JSON object/ },
     { args: ['call', 'get_context', 'null'], env: withComm, code: 'invalid_arguments', reason: /one JSON object/ },
     { args: ['call', 'get_context', '"text"'], env: withComm, code: 'invalid_arguments', reason: /one JSON object/ },
+    { args: ['call', 'get_context'], env: { SCK_COMM_DIR: undefined, SCK_COMM_KEY: 'comm-client-key' }, code: 'missing_comm_dir', reason: /SCK_COMM_DIR/ },
     { args: ['call', 'get_context'], env: { SCK_COMM_DIR: dir, SCK_COMM_KEY: undefined }, code: 'missing_comm_key', reason: /SCK_COMM_KEY/ },
     { args: ['call', 'get_context'], env: { SCK_COMM_DIR: join(dir, 'absent'), SCK_COMM_KEY: 'k' }, code: 'comm_unavailable', reason: /SCK_COMM_DIR/ },
-    { args: ['call', 'get_context'], env: {}, code: 'missing_endpoint', reason: /SCK_MCP_URL/ },
-    { args: ['call', 'get_context'], env: { SCK_MCP_URL: 'http://127.0.0.1:9/mcp' }, code: 'missing_credential', reason: /SCK_EMPLOYEE_CREDENTIAL/ },
-    { args: ['call', 'get_context', '{bad'], env: { SCK_MCP_URL: 'http://127.0.0.1:9/mcp', SCK_EMPLOYEE_CREDENTIAL: 'x' }, code: 'invalid_arguments', reason: /not valid JSON/ },
+    // Legacy direct-connection variables are not read: without the comm directory the client still refuses.
+    { args: ['call', 'get_context'], env: { SCK_COMM_DIR: undefined }, code: 'missing_comm_dir', reason: /SCK_COMM_DIR/ },
   ];
   for (const item of cases) {
     const run = await client(item.args, item.env);
@@ -91,6 +90,21 @@ test('an empty argument string means no arguments, and the request is written wi
   child.kill();
   await child.exited;
   expect(request).toEqual({ key: 'comm-client-key', tool: 'get_context', args: {} });
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('sck list asks the sidecar for the tool list with the reserved __list__ tool and prints its answer as one line', async () => {
+  const dir = commDir();
+  const child = Bun.spawn([process.execPath, CLIENT, 'list'], {
+    cwd: ROOT, stdout: 'pipe', stderr: 'pipe', env: cleanEnv({ SCK_COMM_DIR: dir, SCK_COMM_KEY: 'comm-client-key' }),
+  });
+  const file = await waitForRequest(dir);
+  const request = JSON.parse(readFileSync(join(reqDir(dir), file), 'utf8')) as Record<string, unknown>;
+  expect(request).toEqual({ key: 'comm-client-key', tool: '__list__', args: {} });
+  writeFileAtomic(join(resDir(dir), file), JSON.stringify({ ok: true, data: { tools: ['get_context', 'checkpoint'] } }));
+  const out = await new Response(child.stdout).text();
+  expect(await child.exited).toBe(0);
+  expect(oneJsonLine(out)).toEqual({ tools: ['get_context', 'checkpoint'] });
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -145,49 +159,34 @@ test('unacked holder notices ride along with the next answer, still as one JSON 
   expect(await run([1, 2], 'array data')).toEqual({ data: [1, 2], notices });
 });
 
-test('a direct call prints one answer: the data within the budget on success; one refusal line and exit 1 on failure (SYS01 AC03, F1)', async () => {
-  // The same 60-task page with 200-character contexts fits. The MCP result carries the answer twice (as text and as
-  // structuredContent), and the 48 KiB budget counts both copies, so the direct call prints the answer once and it is
-  // within the budget. With 400-character contexts the whole result is over the budget and is refused as one line.
-  const principal = { employeeId: 'gm-01', role: 'owner', capabilities: ['execute', 'review'] };
-  const page = (contextLength: number) => ({
-    principal,
-    tasks: Array.from({ length: 60 }, (_, i) => ({ id: `task:${i}`, title: `样例 ${i} 中文🙂`, state: 'ready', context: `正文 "${i}" ${'x'.repeat(contextLength)}` })),
-    page: { pageSize: 60, returned: 60, hasMore: false, total: 60 },
-  });
-  const fits = page(200);
-  let answer: unknown = fits;
-  const core = {
-    async authenticate(credential: string) {
-      if (credential !== 'sck_direct_valid') throw { code: 'unauthorized' };
-      return principal;
+test('a sidecar refusal of an over-budget or missing answer is one refusal line and exit 1 (SYS01 AC03, F1)', async () => {
+  const cases: Array<{ error: string; code: string; reason: RegExp; line: Record<string, unknown> }> = [
+    {
+      error: 'response_too_large: the answer is over the 49152-byte budget; narrow the query',
+      code: 'response_too_large',
+      reason: /49152-byte budget/,
+      line: { ok: false, code: 'response_too_large', error: 'response_too_large: the answer is over the 49152-byte budget; narrow the query', retryable: false },
     },
-    async contextView(_credential: string, input: Record<string, unknown>) {
-      if (input.taskId === 'missing') throw Object.assign(new Error('no such task'), { code: 'not_found' });
-      return answer;
+    {
+      error: 'not_found: no such task',
+      code: 'not_found',
+      reason: /no such task/,
+      line: { ok: false, code: 'not_found', error: 'not_found: no such task', retryable: false },
     },
-  } as unknown as CompanyCore;
-  const service = createMcpHttpService({ core, port: 0 });
-  const env = { SCK_MCP_URL: `http://127.0.0.1:${service.port}/mcp`, SCK_EMPLOYEE_CREDENTIAL: 'sck_direct_valid' };
-  try {
-    const answered = await client(['call', 'get_context', '{"pageSize":60}'], env);
-    expect(answered.exit).toBe(0);
-    expect(answered.out.trimEnd().split('\n')).toHaveLength(1);
-    expect(Buffer.byteLength(answered.out, 'utf8')).toBeLessThanOrEqual(49_152);
-    expect(JSON.parse(answered.out)).toEqual(fits);
-
-    answer = page(400);
-    const oversized = await client(['call', 'get_context', '{"pageSize":60}'], env);
-    expect(oversized.exit).toBe(1);
-    expect(oneJsonLine(oversized.out)).toMatchObject({ ok: false, code: 'response_too_large', retryable: false });
-    expect(oversized.err).toContain('49152-byte budget');
-
-    const refused = await client(['call', 'get_context', '{"taskId":"missing"}'], env);
-    expect(refused.exit).toBe(1);
-    expect(oneJsonLine(refused.out)).toEqual({ ok: false, code: 'not_found', error: 'not_found: no such task', retryable: false });
-    expect(refused.err).toContain('no such task');
-  } finally {
-    await service.close();
+  ];
+  for (const item of cases) {
+    const dir = commDir();
+    const child = Bun.spawn([process.execPath, CLIENT, 'call', 'get_context', '{"taskId":"missing"}'], {
+      cwd: ROOT, stdout: 'pipe', stderr: 'pipe', env: cleanEnv({ SCK_COMM_DIR: dir, SCK_COMM_KEY: 'comm-client-key' }),
+    });
+    const file = await waitForRequest(dir);
+    writeFileAtomic(join(resDir(dir), file), JSON.stringify({ ok: false, error: item.error }));
+    const out = await new Response(child.stdout).text();
+    const err = await new Response(child.stderr).text();
+    expect(await child.exited, item.code).toBe(1);
+    expect(oneJsonLine(out), item.code).toEqual(item.line);
+    expect(err, item.code).toMatch(item.reason);
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

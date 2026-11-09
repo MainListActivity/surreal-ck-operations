@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
-import { releaseNotesSchema } from '../src/company-release.ts';
+import { RELEASE_SCHEMA_REQUIREMENTS, releaseNotesSchema } from '../src/company-release.ts';
 
 // company-release.json holds this release's notes (title, changes, impact, migration, rollback). The release job
 // reads only its version, but the notes must still satisfy `releaseNotesSchema`; checking the contract here on
@@ -37,8 +37,9 @@ describe('the release notes are registrable', () => {
   });
 
   test('the notes name the schema they add', () => {
-    const text = JSON.stringify(notes);
-    expect(text).toContain('061');
+    const entry = RELEASE_SCHEMA_REQUIREMENTS.find(requirement => requirement.version === notes.version);
+    expect(entry).toBeDefined();
+    expect(JSON.stringify(notes)).toContain(String(entry!.schema).padStart(3, '0'));
   });
 
   test('the limits are real: an eleventh change or a long one is refused', () => {

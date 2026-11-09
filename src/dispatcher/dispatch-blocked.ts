@@ -24,7 +24,7 @@ export type WorkflowState = 'ready' | 'doing' | 'review';
 /** Stable machine codes. The text is for owners; codes drive grouping, notices and auto-clear. */
 export type BlockCode =
   | 'paused' | 'budget' | 'resources' | 'memory_pressure' | 'disk_space' | 'max_running'
-  | 'prior_submitter' | 'no_candidate' | 'session_busy' | 'held' | 'assigned' | 'credential_file' | 'track_mismatch' | 'model_slot'
+  | 'prior_submitter' | 'no_candidate' | 'session_busy' | 'held' | 'assigned' | 'track_mismatch' | 'model_slot'
   | 'quota' | 'probe_busy' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'wake_failed' | 'unknown' | 'factory_wait';
 
 /** One staffing entry, reduced to what the evaluator reads. `key` is the employee id or `spawn:<def>`. */
@@ -123,7 +123,7 @@ export interface EvaluateInput {
 
 /** Codes that only an owner edit (task, roster, pool) can change; waiting never clears them. */
 const PERMANENT: ReadonlySet<BlockCode> = new Set<BlockCode>([
-  'prior_submitter', 'track_mismatch', 'credential_file', 'def_disabled', 'no_candidate',
+  'prior_submitter', 'track_mismatch', 'def_disabled', 'no_candidate',
 ]);
 
 /** Codes meaning a qualified candidate exists and is only occupied right now; they clear without anyone acting. */
@@ -167,7 +167,6 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
   session_busy: '会话占用中或异常',
   held: '持有在办任务',
   assigned: '本轮已分配',
-  credential_file: '凭证文件实例不可接新任务',
   track_mismatch: '岗位轨不匹配',
   model_slot: '模型槽位未解析或已漂移',
   quota: '订阅额度或健康冷却中',
@@ -181,7 +180,7 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
 
 const OWNER: Record<BlockCode, RecoveryAuthority> = {
   factory_wait: 'system',
-  paused: 'owner', budget: 'owner', resources: 'owner', memory_pressure: 'system', disk_space: 'owner', max_running: 'owner', prior_submitter: 'owner', no_candidate: 'owner',  session_busy: 'owner', held: 'owner', assigned: 'owner', credential_file: 'owner', track_mismatch: 'owner', model_slot: 'owner',
+  paused: 'owner', budget: 'owner', resources: 'owner', memory_pressure: 'system', disk_space: 'owner', max_running: 'owner', prior_submitter: 'owner', no_candidate: 'owner',  session_busy: 'owner', held: 'owner', assigned: 'owner', track_mismatch: 'owner', model_slot: 'owner',
   quota: 'owner', provider_capacity: 'owner', seat_full: 'owner', def_disabled: 'owner', wake_failed: 'owner', unknown: 'owner', probe_busy: 'owner',
 };
 
@@ -198,7 +197,6 @@ const RECOVERY: Record<BlockCode, string> = {
   session_busy: '等待在办任务完成或租约到期',
   held: '等待在办任务完成或租约到期',
   assigned: '下一轮派工自动处理',
-  credential_file: '等待该实例退役，新实例接任务',
   track_mismatch: '老板调整编制轨或任务轨',
   model_slot: '等待模型槽位刷新，或老板检查订阅',
   quota: '等待订阅额度或健康恢复；老板可充值',
@@ -223,7 +221,6 @@ const NEXT: Record<BlockCode, string> = {
   session_busy: '候选会话空闲',
   held: '在办租约结束或任务完成',
   assigned: '下一轮派工',
-  credential_file: '实例退役',
   track_mismatch: '编制轨或任务轨调整',
   model_slot: '模型槽位解析',
   quota: '订阅额度或健康恢复',
@@ -239,7 +236,7 @@ const NEXT: Record<BlockCode, string> = {
 const BASIS: Record<BlockCode, string> = {
   factory_wait: 'tick:factory-queue',
   paused: 'tick:global-gate', budget: 'tick:global-gate', resources: 'tick:global-gate', memory_pressure: 'host:memory', disk_space: 'host:disk', max_running: 'tick:global-gate', prior_submitter: 'contribution-audit',  no_candidate: 'tick:staffing-pool', session_busy: 'paseo:session-status', held: 'tick:staffing-pool', assigned: 'tick:staffing-pool',
-  credential_file: 'tick:staffing-pool', track_mismatch: 'tick:staffing-pool', model_slot: 'tick:model-slots',
+  track_mismatch: 'tick:staffing-pool', model_slot: 'tick:model-slots',
   quota: 'tick:quota-rows', provider_capacity: 'tick:quota-rows', seat_full: 'tick:staffing-pool',
   def_disabled: 'tick:workforce-defs', wake_failed: 'tick:wake', unknown: 'read:state-or-audit', probe_busy: 'tick:provider-health',
 };
@@ -258,7 +255,6 @@ const ACTIONS: Record<BlockCode, RecoveryAction[]> = {
   session_busy: [{ authority: 'owner', label: '等待在办任务完成或租约到期', executable: false }],
   held: [{ authority: 'owner', label: '等待在办任务完成或租约到期', executable: false }],
   assigned: [{ authority: 'owner', label: '下一轮派工自动处理', executable: false }],
-  credential_file: [{ authority: 'owner', label: '等待该实例退役，新实例接任务', executable: false }],
   track_mismatch: [{ authority: 'owner', label: '老板用 def_ensure 调整编制轨', tool: 'def_ensure', executable: true }],
   model_slot: [{ authority: 'owner', label: '等待模型槽位刷新，或老板检查订阅', executable: false }],
   quota: [{ authority: 'owner', label: '老板充值，或等待额度与健康恢复', executable: false }],

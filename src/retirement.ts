@@ -4,7 +4,7 @@ import { CompanyError } from './core-errors.ts';
 /**
  * The retirement gate. Retiring an employee revokes its credential, so the refusal sits at the one boundary every
  * retirement and credential revocation passes (`gateCredentialChange`): `Workforce.retire` (admin CLI, dispatcher
- * rotation and failure paths, scene archive, MCP and plugin) and the admin revocation (`LocalEnrollmentAdmin.revoke`),
+ * rotation and failure paths, scene archive, sidecar tools and plugin) and the admin revocation (`LocalEnrollmentAdmin.revoke`),
  * not in the callers. An employee is refused while it holds a task lease (`active_lease`). Finished or voided tasks
  * never block. The refusal is decided before any write, and the write re-checks every task version the decision used,
  * in the same transaction.

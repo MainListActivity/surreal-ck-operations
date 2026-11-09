@@ -15,7 +15,7 @@ run('real fork: the third ops refusal blocks exactly the held task and drops its
  let pool:SidecarPool|undefined;
  try {
   await db.connect();await db.bootstrap();
-  const workforce=new Workforce(db,join(root,'unused-credentials'));
+  const workforce=new Workforce(db);
   const core=new SurrealCompanyCore(db,{workforce});
   const admin=new LocalEnrollmentAdmin(db);
   const gm=await admin.enroll('fixture-gm','owner',['manage','execute','review']);

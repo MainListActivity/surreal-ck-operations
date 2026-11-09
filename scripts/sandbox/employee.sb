@@ -28,9 +28,11 @@
   (at home "/.ssh/id_ed25519.pub"))
 
 (deny file-write*
+  (under service "/plugin-releases")
+  (under service "/current")
+  (under service "/updater")
   (under service "/releases")
   (under service "/release-staging")
-  (under service "/active")
   (under service "/runtime-bun")
   (under service "/bin")
   (under service "/sandbox")

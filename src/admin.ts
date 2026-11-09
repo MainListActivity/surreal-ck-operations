@@ -1,12 +1,12 @@
-import { chmodSync, mkdirSync, openSync, readFileSync, writeSync, closeSync, existsSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
 import { loadDatabaseConfig } from './config.ts';
 import { CompanyDatabase } from './database.ts';
 import { LocalEnrollmentAdmin } from './enrollment.ts';
 import { SEED_DEFS } from './seed.ts';
-import { capabilitiesFor, effectiveWeight, Workforce } from './workforce.ts';
+import { effectiveWeight, Workforce } from './workforce.ts';
 import { jevFromEnv } from './dispatcher/jev.ts';
 import { parseReclaimCliArgs } from './dispatcher/artifact-reclaim.ts';
 import { loadSecretKey, ProjectStore, type ProjectInput } from './projects.ts';
@@ -23,7 +23,6 @@ import { installNodeHost } from './host-node.ts';
 installNodeHost();
 
 const usage = `Usage: pnpm run admin <command>
-  enroll <employee-id> <role>             登记固定身份（写入本 checkout .runtime/credentials）
   revoke <employee-id>                    撤销身份
   def list                                列出员工定义（含权重）
   def set <id> <role> <provider> <model> [thinking] [max-instances] [priority] [weight]
@@ -33,7 +32,7 @@ const usage = `Usage: pnpm run admin <command>
   def quota <id> limited|unlimited     是否受订阅额度限制（unlimited = 剩余额度为 0 也继续派工）
   seed-defs                               写入默认员工定义（七个岗位各接 codex/grok/devin 订阅，另加 screenwriter-agy、story-author-agy（antigravity 单座）、cinematography-codex（codex 单座），已存在则不覆盖）
   inst list                               列出在职员工实例
-  bind <employee-id> <paseo-agent-id> [def-id] [credential-file]
+  bind <employee-id> <paseo-agent-id> [def-id]
   retire <employee-id> <reason>           退役实例并撤销凭证
   jev-test                                测试 Jev 决策模型连通性（需 JEV_API_KEY）
   project set <file.json>                 写入/更新项目环境（结构见 docs/agent-operations.md）
@@ -58,7 +57,7 @@ try {
   await database.connect();
   await database.bootstrap();
   const admin = new LocalEnrollmentAdmin(database);
-  const workforce = new Workforce(database, resolve(process.env.SCK_CREDENTIAL_DIR ?? join(import.meta.dir, '..', '.runtime', 'credentials')));
+  const workforce = new Workforce(database);
   switch (action) {
     case 'revoke': {
       // The same gate as retirement (LocalEnrollmentAdmin.revoke): a refusal writes nothing and exits non-zero with its stable code.
@@ -71,21 +70,6 @@ try {
         break;
       }
       print({ action, employeeId: args[0], ok: true });
-      break;
-    }
-    case 'enroll': {
-      const [employeeId, roleArg] = args;
-      if (!employeeId) throw new Error(usage);
-      const role = roleArg as Role;
-      const directory = join(import.meta.dir, '..', '.runtime', 'credentials');
-      mkdirSync(directory, { recursive: true, mode: 0o700 });
-      chmodSync(directory, 0o700);
-      const path = join(directory, `${employeeId}.token`);
-      if (existsSync(path)) throw new Error('Credential file already exists; revoke and archive it before replacement');
-      const credential = await admin.enroll(employeeId, role, capabilitiesFor(role));
-      const fd = openSync(path, 'wx', 0o600);
-      try { writeSync(fd, credential); } finally { closeSync(fd); }
-      print({ action, employeeId, path, ok: true });
       break;
     }
     case 'def': {
@@ -147,12 +131,12 @@ try {
       break;
     }
     case 'bind': {
-      const [employeeId, agentId, defId, credentialFile] = args;
+      const [employeeId, agentId, defId] = args;
       if (!employeeId || !agentId) throw new Error(usage);
       const def = defId ? (await workforce.defs()).find(d => d.id === defId) : undefined;
       if (defId && !def) throw new Error('Unknown def');
       await workforce.bind(employeeId, { agentId, def: def?.id, provider: def?.provider, model: def?.model,
-        thinking: def?.thinking, credentialFile });
+        thinking: def?.thinking });
       print({ action, employeeId, agentId, def: def?.id, ok: true });
       break;
     }

@@ -42,12 +42,11 @@ test('a spare seat keeps the path open with no reservation, even when its provid
   expect(reviewPlanOf([{ key: 'spawn:def-x', kind: 'spawn', eligible: false, code: 'provider_capacity' }]).feasible).toBe(true);
 });
 
-test('track, disabled, model-slot and credential-file reviewers are not legal and never keep the path open', () => {
+test('track, disabled and model-slot reviewers are not legal and never keep the path open', () => {
   const plan = reviewPlanOf([
     { key: 'emp-track', kind: 'reuse', eligible: false, code: 'track_mismatch' },
     { key: 'emp-off', kind: 'reuse', eligible: false, code: 'def_disabled' },
     { key: 'emp-slot', kind: 'reuse', eligible: false, code: 'model_slot' },
-    { key: 'emp-file', kind: 'reuse', eligible: false, code: 'credential_file' },
     { key: 'spawn:def-off', kind: 'spawn', eligible: false, code: 'def_disabled' },
     { key: 'spawn:def-full', kind: 'spawn', eligible: false, code: 'seat_full' },
   ]);

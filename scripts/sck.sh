@@ -1,15 +1,17 @@
 #!/bin/sh
-# Employee tool entry: SCK_EMPLOYEE_CREDENTIAL_FILE=<path> sck call <tool> '<json>' | sck list
+# Employee tool entry, installed by the node updater as bin/sck: sck call <tool> '<json>' | sck list | sck owner <command> '<json>'
 set -eu
-# The Bun runtime is resolved exactly as the services resolve it (scripts/bun-runtime.sh, installed beside this file as
-# bin/bun-runtime.sh): SCK_BUN, then the SCK_BUN line of private/service.env, then runtime-bun, then ~/.bun. PATH is never searched.
+# The Bun runtime is resolved the same way the node updater resolves it (scripts/bun-runtime.sh, installed beside this
+# file as bin/bun-runtime.sh): SCK_BUN, then the SCK_BUN line of private/service.env, then runtime-bun, then ~/.bun.
+# PATH is never searched.
 . "$(dirname "$0")/bun-runtime.sh"
 service_home=${SCK_SERVICE_HOME:-"$HOME/Library/Application Support/SurrealCKCompany"}
-if [ "${1:-}" = "sync-gate" ]; then
-  resolve_bun "$service_home"
-  cd "$service_home/active"
-  exec "$BUN" src/mcp/sync-gate.ts
-fi
+# One JSON line on stdout, the same shape as every sck outcome, then the reason on stderr and exit 1.
+refuse() {
+  printf '{"ok":false,"code":"%s","error":"%s","retryable":false}\n' "$1" "$2"
+  printf '%s\n' "$2" >&2
+  exit 1
+}
 # Owner CLI: bin/sck owner <command> '<JSON>' — reads private/owner-token by path, never prints it.
 if [ "${1:-}" = "owner" ]; then
   [ -n "${2:-}" ] || { echo 'usage: sck owner <command> <JSON>' >&2; exit 2; }
@@ -52,25 +54,13 @@ if [ -n "${PASEO_AGENT_ID:-}" ] && [ -f "$service_home/comm-agents/$PASEO_AGENT_
   SCK_COMM_KEY=$(/usr/bin/sed -n '2p' "$service_home/comm-agents/$PASEO_AGENT_ID")
   export SCK_COMM_DIR SCK_COMM_KEY
 fi
-# Comm mode: the plugin sidecar owns the credential; the agent relays through
-# $SCK_COMM_DIR and carries no auth material at all.
-if [ -n "${SCK_COMM_DIR:-}" ]; then
-  resolve_bun "$service_home"
-  cd "$service_home/active"
-  exec "$BUN" src/mcp/client-cli.ts "$@"
-fi
-: "${SCK_EMPLOYEE_CREDENTIAL_FILE:?SCK_EMPLOYEE_CREDENTIAL_FILE is required}"
-port=$(/usr/bin/sed -n 's/^SCK_MCP_PORT=//p' "$service_home/private/service.env" | /usr/bin/tr -d "\"'")
-# Remote endpoint override: written by `sck sync-gate` (private/mcp-remote.env, mode 600);
-# presence switches all sck callers to the public MCP endpoint.
-remote_env="$service_home/private/mcp-remote.env"
-if [ -z "${SCK_MCP_URL:-}" ] && [ -f "$remote_env" ]; then
-  set -a; . "$remote_env"; set +a
-fi
-SCK_MCP_URL=${SCK_MCP_URL:-"http://127.0.0.1:${port:-38473}/mcp"}
-export SCK_MCP_URL SCK_MCP_TOKEN SCK_EMPLOYEE_CREDENTIAL_FILE
-cd "$service_home/active"
-# Global ~/.bun (1.3.11) has a broken stream/SSE client that leaves calls hanging;
-# the service-pinned runtime is the same build the server runs on.
+# Comm only: the plugin sidecar owns the credential; the agent relays through $SCK_COMM_DIR and carries no auth material.
+# current is the plugin directory the node updater made live, and the client runs from it.
+client="$service_home/current/server/vendor/src/sck-cli.ts"
+[ -f "$client" ] || refuse missing_plugin "no live plugin at $service_home/current: the node updater has not switched this node yet"
 resolve_bun "$service_home"
-exec "$BUN" src/mcp/client-cli.ts "$@"
+[ -x "$BUN" ] || refuse missing_runtime "Bun runtime not found at $BUN: set SCK_BUN or install runtime-bun under $service_home"
+cd "$service_home/current"
+# Global ~/.bun (1.3.11) has a broken stream/SSE client that leaves calls hanging;
+# the service-pinned runtime is the same build the plugin runs on.
+exec "$BUN" "$client" "$@"

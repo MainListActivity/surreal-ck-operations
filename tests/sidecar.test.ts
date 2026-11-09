@@ -89,7 +89,6 @@ const core = {
     calls.push({ tool: 'append_dependency_prerequisites', text: String(input.text ?? '') });
     return taskView(String(input.taskId));
   },
-  listOutbox: async () => [],
   dispositionNotices: async (c: string, input?: { ids?: string[] }) => {
     noticeReads.push(c);
     if (noticeReadFails) throw new Error('notice store unavailable');
@@ -179,7 +178,7 @@ describe('sidecar', () => {
     const env = pool.env(inst('e1'));
     expect(env.SCK_COMM_DIR).toBe(join(runDir, 'e1'));
     expect(env.SCK_COMM_KEY?.length).toBe(32);
-    expect(Object.keys(env)).not.toContain('SCK_EMPLOYEE_CREDENTIAL');
+    expect(Object.keys(env).filter(key => /CREDENTIAL|TOKEN|MCP/.test(key))).toEqual([]);
     expect(existsSync(reqDir(env.SCK_COMM_DIR))).toBe(true);
   });
 
@@ -190,13 +189,6 @@ describe('sidecar', () => {
     expect(result?.deliveryId).toBe('d-task-1');
     const staged = JSON.parse(readFileSync(join(runDir, 'e2', 'claim.json'), 'utf8')) as ClaimResult;
     expect(staged.fence).toBe(7);
-  });
-
-  test('legacy credential-file instances are never claimed by the sidecar', async () => {
-    const i = inst('legacy-1', { credentialFile: '/tmp/x.token', credential: undefined });
-    const result = await pool.claim(i, task('task-2'));
-    expect(result).toBeUndefined();
-    expect(calls.filter(c => c.tool === 'claim')).toHaveLength(0);
   });
 
   test('relay injects the held lease proof into checkpoint', async () => {
@@ -485,7 +477,7 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
       .toEqual(expect.arrayContaining(['reclaim_worktrees', 'list_worktree_audits', 'read_worktree_refs']));
   });
 
-  test('reclaim_worktrees is strict on the sidecar relay as in core and MCP (SYS01, D3): a null or non-boolean dryRun, and a repos that is not a list of paths, are refused before the registry runs', async () => {
+  test('reclaim_worktrees is strict on the sidecar relay as in core (SYS01, D3): a null or non-boolean dryRun, and a repos that is not a list of paths, are refused before the registry runs', async () => {
     const i = inst('e15');
     const env = pool.env(i);
     await pool.claim(i, task('task-15'));
@@ -503,7 +495,7 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     const nullArgs = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'bad-args-null', 'reclaim_worktrees', null);
     expect({ name: 'args-null', ok: nullArgs.ok, error: nullArgs.error?.slice(0, 7) }).toEqual({ name: 'args-null', ok: false, error: 'invalid' });
     expect(reclaimCalls.length).toBe(before);
-    // An omitted dryRun is a reclaim and dryRun true a dry run, under the same rule as core and MCP.
+    // An omitted dryRun is a reclaim and dryRun true a dry run, under the same rule as core.
     await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'ok-reclaim', 'reclaim_worktrees', {});
     await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'ok-dry', 'reclaim_worktrees', { dryRun: true });
     expect(reclaimCalls.slice(before)).toEqual([
@@ -512,7 +504,7 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     ]);
   });
 
-  test('null is absent on the sidecar relay as in core and MCP (SYS01, defect 2): paging and filters are absent, a null task id is refused for get_task_history and resume_task', async () => {
+  test('null is absent on the sidecar relay as in core (SYS01, defect 2): paging and filters are absent, a null task id is refused for get_task_history and resume_task', async () => {
     const i = inst('e14');
     const env = pool.env(i);
     await pool.claim(i, task('task-14'));

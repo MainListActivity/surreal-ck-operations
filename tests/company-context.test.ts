@@ -7,7 +7,7 @@ import { parseContextInput } from '../src/query-input.ts';
 import { RESPONSE_BUDGET_BYTES, answerBytes } from '../src/response-budget.ts';
 
 // SYS01 AC-A, the pure contract of get_context with scope company: the parts of the company block, the reader's join, and the
-// refusals. The fork-backed suite (company-scope.integration.test.ts) holds the same contract through the database and MCP.
+// refusals. The database-backed suites hold the same contract through the database and the comm channel.
 
 const unit = '中文🙂字符';
 const sha256 = (text: string) => createHash('sha256').update(text).digest('hex');

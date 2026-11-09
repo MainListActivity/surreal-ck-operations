@@ -9,7 +9,6 @@ import { lstat, readdir, readFile, realpath, rm } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { CompanyError } from './core-errors.ts';
-import { drillHost, readDrillStatus, startDrill } from './deploy-drill-service.ts';
 import { hostIOOrUndefined, installHost, type HostIO, type HostProcOptions, type HostProcResult } from './host-io.ts';
 
 /** Runs a program without a shell; output is collected per stream, and the program is killed at the timeout or past the byte limit. */
@@ -34,7 +33,7 @@ function runProcess(file: string, args: readonly string[], options: HostProcOpti
   });
 }
 
-/** Kernel flock spans plugin + MCP processes and is released on crash/EOF, with no stale lease timeout.
+/** Kernel flock spans every plugin process and is released on crash/EOF, with no stale lease timeout.
  * The helper reads only its lock file. Its stdin is closed even when the caller dies.
  */
 async function withRepoLock<T>(commonDir: string, action: () => Promise<T>): Promise<T> {
@@ -103,11 +102,6 @@ const nodeHost: HostIO = {
   },
   password: {
     hash: secret => Bun.password.hash(secret, { algorithm: 'argon2id' }),
-  },
-  drill: {
-    host: drillHost,
-    start: startDrill,
-    status: readDrillStatus,
   },
   context: {
     createStorage<T>() {

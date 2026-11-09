@@ -242,7 +242,7 @@ bun run build                                  # 生成 public/app.js
 7. **执行端的命令不核对员工租约。** `task.create` 在执行端以无员工身份的方式执行（`src/cloud/ops-jobs.ts` 的 `runnerOnly` 分支只接收命令与输入）；`host.exec` 同样不核对（`mayClaim` 只对 `ops_*` 作业核对租约）。员工的身份与租约只在网关入队时判定，作业入队后即使租约已结束也会执行。
 8. **`ops.job.list`、`audit.list` 的拒绝不是数据层边界。** 这两条只在网关拒绝。viewer 令牌的 `db.read` 理论上能直接读 `ops_audit` 与 `ops_job`，因为系统用户不受表权限约束（见 `schema/056` 的注释）。要在数据层收紧，需要另做 schema 改动。
 9. **按目标的硬锁只作用于网关。** 它们只对经网关的调用生效。插件本机的任务流工具直连数据库，不经网关。
-10. **`Bun.sleep` 与 `process.env` 的残留。** `src/mcp/client-cli.ts` 仍用 `Bun.sleep` 与 `Bun.sleepSync`，它不在 Worker 的依赖闭包里。`src/owner-api.ts` 读取 `SCK_OWNER_TOKEN`，只在 `task.create` 的本机分支里用到，Worker 不走这个分支（RUNNER_ONLY 命令先排队）。`scripts/worker-compat-check.ts` 不检查 `process.env`，这一点靠代码审阅确认。
+10. **`Bun.sleep` 与 `process.env` 的残留。** `src/sck-cli.ts` 仍用 `Bun.sleep` 与 `Bun.sleepSync`，它不在 Worker 的依赖闭包里。`src/owner-api.ts` 读取 `SCK_OWNER_TOKEN`，只在 `task.create` 的本机分支里用到，Worker 不走这个分支（RUNNER_ONLY 命令先排队）。`scripts/worker-compat-check.ts` 不检查 `process.env`，这一点靠代码审阅确认。
 11. **译文没有用真实服务验证。** 测试和截图用的是本地替身，译文形如 `[EN stub] 原文`。译文质量、延迟和费用需要接入真实译文服务后再验证。
 12. **`wrangler.jsonc` 指向生产库。** 本地开发必须用 `.dev.vars` 覆盖，见「本地开发」。
 13. **390px 下导航条横向滚动。** 这是设计如此，没有改。

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { Surreal } from 'surrealdb';
 import type { DatabaseConfig } from '../src/config.ts';
 import { connectDb, useDb, type DbTarget } from '../src/db-connection.ts';
-import { renderCompanyAccess } from '../src/database.ts';
+import { CLOUD_SCHEMA_VERSION, renderCompanyAccess } from '../src/database.ts';
 import { SEED_DEFS } from '../src/seed.ts';
 import { runCompanyMigrate } from '../scripts/company-migrate.ts';
 import { runCloudBootstrap } from '../scripts/cloud-bootstrap.ts';
@@ -181,7 +181,7 @@ afterAll(async () => {
   }
 });
 
-run('空库上 company-migrate 应用全部 schema 到版本 57；再次运行结果不变（幂等）', async () => {
+run('空库上 company-migrate 应用全部 schema 到 CLOUD_SCHEMA_VERSION；再次运行结果不变（幂等）', async () => {
   scope = { ns: MIGRATE_NS, db: DATABASE };
   const firstLines: string[] = [];
   const first = await runCompanyMigrate(configFor(MIGRATE_NS), { log: line => firstLines.push(line) });
@@ -191,6 +191,8 @@ run('空库上 company-migrate 应用全部 schema 到版本 57；再次运行�
   // 055 生产渲染：六个访问方式的定义里是 JWKS 地址；随后换成测试替身，使下一次登录可用。
   const probe = await rootSession(MIGRATE_NS);
   const [infoAfterFirst] = await probe.query<[Record<string, unknown>]>('INFO FOR DB;');
+  // 062：迁移之后不再有 outbox 表。
+  expect(Object.keys((infoAfterFirst.tables ?? {}) as Record<string, unknown>)).not.toContain('outbox');
   const renderedAccesses = (infoAfterFirst.accesses ?? {}) as Record<string, string>;
   for (const name of ACCESS_NAMES) expect(renderedAccesses[name]).toContain(`URL '${jwksUrl}'`);
   await standInAccesses(MIGRATE_NS);
@@ -198,7 +200,7 @@ run('空库上 company-migrate 应用全部 schema 到版本 57；再次运行�
   const admin = await rootSession(MIGRATE_NS);
   const [marker] = await admin.query<[Array<{ owner: string; schema_version: number }>]>(
     'SELECT owner, schema_version FROM company_meta:installation;');
-  expect(marker?.[0]?.schema_version).toBe(57);
+  expect(marker?.[0]?.schema_version).toBe(CLOUD_SCHEMA_VERSION);
   const before = await countRows(admin);
 
   const secondLines: string[] = [];
@@ -209,7 +211,7 @@ run('空库上 company-migrate 应用全部 schema 到版本 57；再次运行�
 
   const [after] = await admin.query<[Array<{ owner: string; schema_version: number }>]>(
     'SELECT owner, schema_version FROM company_meta:installation;');
-  expect(after?.[0]?.schema_version).toBe(57);
+  expect(after?.[0]?.schema_version).toBe(CLOUD_SCHEMA_VERSION);
   expect(after?.[0]?.owner).toBe(marker?.[0]?.owner);
   expect(await countRows(admin)).toEqual(before);
 });

@@ -1,5 +1,7 @@
 # SYS-DISP 发布清单与运行手册（退役硬门禁）
 
+> 历史记录：本文档记录 0.7.0 之前的状态（MCP 服务、`releases/` 与 `active`），已被 0.7.0 取代。正文不再适用，命令与路径不要照用。
+
 适用范围：PR #1469 分支上的 SYS-DISP 派工改动，包括退役与撤凭证硬门禁（`src/retirement.ts`、`Workforce.retire`、`LocalEnrollmentAdmin.revoke`、`admin retire`、`admin revoke`、调度器各退役点与场景回收）。本文件是部署腿的执行依据，本身不授权合入或部署。合入、部署与上线申请仍按 [company-service-operations.md](../company-service-operations.md) 的双面流程与既有审批执行。
 
 ## 0. 本次交付的边界

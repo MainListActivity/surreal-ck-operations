@@ -22,8 +22,9 @@ const SECRET = 'deploy-token';
 const SECRET_VALUE = 'synthetic-secret-value-never-shown';
 const database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
 const core = new SurrealCompanyCore(database);
-// A core whose leases are one second long, for the expiry check.
-const shortCore = new SurrealCompanyCore(database, { leaseSeconds: 1 });
+// A core whose leases are three seconds long, for the expiry check. A lease ends at a whole unix second (floor(now) + leaseSeconds),
+// so a one-second lease can already be over when the first read follows the claim; three seconds leaves room for that read.
+const shortCore = new SurrealCompanyCore(database, { leaseSeconds: 3 });
 const owner = new OwnerDesk(database);
 const projects = new ProjectStore(database.db);
 const suffix = randomUUID().slice(0, 8);
@@ -139,7 +140,7 @@ test('the holder of a valid lease on a task of the project reads its environment
 test('an expired lease withholds the environments at once', async () => {
   await shortCore.claim(expiring, taskExpiring);
   expect(projectOf(await core.companyBrief(expiring)).envs).toEqual([expect.objectContaining({ name: ENV })]);
-  await Bun.sleep(2_100);
+  await Bun.sleep(3_500);
   expect(projectOf(await core.companyBrief(expiring)).envsWithheld).toBe(true);
 });
 
@@ -216,7 +217,7 @@ test('a project read started under a valid lease cannot be continued by its hash
   const first = await shortCore.taskText(shortHolder, { taskId, field: 'project', offset: 0, limit: 64 });
   expect(first.sha256).toMatch(/^[0-9a-f]{64}$/);
   expect(first.nextOffset).toBeGreaterThan(0);
-  await Bun.sleep(2_100); // the one-second lease is over
+  await Bun.sleep(3_500); // the three-second lease is over
   // The hash is not a capability: the continuation is refused exactly like a fresh read.
   await expectRefused(
     shortCore.taskText(shortHolder, { taskId, field: 'project', offset: first.nextOffset!, expectSha256: first.sha256 }),

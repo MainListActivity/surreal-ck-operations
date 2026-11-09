@@ -1,7 +1,5 @@
 import { expect, test } from 'bun:test';
-import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 // CI gate guard (SYS01 review defect 1). A missing space once glued two test paths into one token, so the bridge
@@ -33,13 +31,6 @@ test('the comm gate runs the client and slow pipe regressions, and CI runs the c
 });
 
 // SYS01 AC-B: no workflow may name a hosted macOS runner. The macOS slow-pipe regression runs at release time, not in hosted CI.
-test('the rollback runbook uses the guarded installer of the current release, never the old release installer', () => {
-  const docs = readFileSync(join(ROOT, 'docs/company-service-operations.md'), 'utf8');
-  expect(docs).not.toMatch(/SCK_PREVIOUS_RELEASE\/scripts\/company-service\.sh/);
-  expect(docs).toContain('sh "$SCK_RELEASE_DIR/scripts/company-service.sh" install "$SCK_PREVIOUS_RELEASE"');
-  expect(readFileSync(join(ROOT, 'scripts/company-service.sh'), 'utf8')).toContain('acceptance_target_supported "$release"');
-});
-
 test('no workflow runs on a hosted macOS runner', () => {
   // Every workflow file, not a fixed list: a new file must not name a macOS runner either. Comment lines are skipped, so a note
   // that says "macOS" does not count as a runner label.
@@ -49,120 +40,5 @@ test('no workflow runs on a hosted macOS runner', () => {
   for (const workflow of workflows) {
     const jobs = readFileSync(join(dir, workflow), 'utf8').split('\n').filter(line => !line.trimStart().startsWith('#'));
     expect(jobs.join('\n'), `${workflow}: names no macOS runner`).not.toMatch(/macos/i);
-  }
-});
-
-// The remote switch to a commit refuses a value that is not a commit sha before any step reaches the host.
-const deploy = join(ROOT, 'scripts/deploy-mcp-remote.sh');
-const deploySha = '0123456789abcdef0123456789abcdef01234567';
-
-// The remote Bun check is run, not only ordered. The real deploy script runs against a sandbox:
-// ssh, scp, sudo and the account tools are stubs; the remote home, the deploy key and the product env are sandbox paths (the key is
-// never read); the ssh stub ends a run at its first payload step, so nothing reaches the switch.
-function runDeploy(sandbox: string, remoteBun: string) {
-  const bin = join(sandbox, 'bin');
-  const home = join(sandbox, 'home');
-  const remote = join(sandbox, 'remote');
-  const log = join(sandbox, 'remote.log');
-  const sha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: ROOT, encoding: 'utf8' }).stdout.trim();
-  const stub = (name: string, body: string) => {
-    writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`);
-    chmodSync(join(bin, name), 0o755);
-  };
-  mkdirSync(bin);
-  writeFileSync(join(sandbox, 'product.env'), 'SURREAL_ROOT_USER=stub\nSURREAL_ROOT_PASS=stub\n');
-  writeFileSync(join(sandbox, 'deploy.key'), '');
-  const remoteBunPath = join(remote, 'runtime-bun/bin/bun');
-  mkdirSync(join(remote, 'runtime-bun/bin'), { recursive: true });
-  writeFileSync(remoteBunPath, `#!/bin/sh\n[ "$1" = --version ] && echo '${remoteBun}'\nexit 0\n`);
-  chmodSync(remoteBunPath, 0o755);
-  stub('ssh', `while [ "$1" = -o ]; do shift 2; done\nshift\necho "ssh: $*" >> '${log}'\ncase "$*" in\n  *releases/*) echo 'stub: deploy stopped at the payload step' >&2; exit 255 ;;\nesac\nexec sh -c "$*"`);
-  stub('scp', `echo "scp: $*" >> '${log}'`);
-  stub('sudo', 'while [ "$1" = -u ]; do shift 2; done\nexec "$@"');
-  stub('id', 'exit 0');
-  stub('chown', 'exit 0');
-  const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('SCK_')));
-  const result = spawnSync('sh', [deploy, sha], {
-    encoding: 'utf8',
-    env: {
-      ...inherited,
-      PATH: `${bin}:${process.env.PATH ?? ''}`,
-      SCK_SERVICE_HOME: home,
-      SCK_PRODUCT_ENV: join(sandbox, 'product.env'),
-      SCK_DEPLOY_KEY: join(sandbox, 'deploy.key'),
-      SCK_REMOTE_HOST: 'deploy-test.invalid',
-      SCK_REMOTE_HOME: remote,
-    },
-  });
-  return { status: result.status, stderr: result.stderr, log: existsSync(log) ? readFileSync(log, 'utf8') : '', remote };
-}
-
-test('the remote Bun check refuses a runtime that is not the pinned version, before any payload upload or switch', () => {
-  for (const reported of ['1.3.11', '']) {
-    const sandbox = mkdtempSync(join(tmpdir(), 'sck-deploy-bun-'));
-    try {
-      const run = runDeploy(sandbox, reported);
-      expect(run.log, `bun '${reported}': the remote check was reached`).toContain('ssh: sudo bash -s');
-      expect(run.status, `bun '${reported}': refused`).not.toBe(0);
-      expect(run.stderr, `bun '${reported}': reason`).toContain('refused: remote bun');
-      expect(run.log, `bun '${reported}': no payload step`).not.toContain('releases/');
-      expect(run.log, `bun '${reported}': no scp`).not.toContain('scp:');
-      expect(existsSync(join(run.remote, 'current')), `bun '${reported}': no switch`).toBe(false);
-    } finally {
-      rmSync(sandbox, { recursive: true, force: true });
-    }
-  }
-}, 20_000);
-
-test('a remote runtime of the pinned version passes the check and reaches the payload step, without a switch', () => {
-  const sandbox = mkdtempSync(join(tmpdir(), 'sck-deploy-bun-'));
-  try {
-    const run = runDeploy(sandbox, '1.4.2');
-    expect(run.stderr, 'the check passed').not.toContain('refused');
-    expect(run.stderr, 'the run stopped at its first payload step').toContain('stub: deploy stopped at the payload step');
-    expect(run.log, 'the payload step was reached').toContain('releases/');
-    expect(existsSync(join(run.remote, 'current')), 'no switch before the stop').toBe(false);
-  } finally {
-    rmSync(sandbox, { recursive: true, force: true });
-  }
-}, 20_000);
-
-test('the deploy script checks the remote Bun version before any payload upload or switch', () => {
-  const lines = readFileSync(deploy, 'utf8').split('\n').filter(line => !line.trimStart().startsWith('#'));
-  const compare = lines.findIndex(line => line.includes('actual" = "$bun_version"'));
-  const payload = lines.findIndex(line => line.includes('releases/$commit'));
-  const switchLink = lines.findIndex(line => line.includes('ln -sfn'));
-  expect(compare, 'the remote version comparison exists').toBeGreaterThan(-1);
-  expect(compare, 'the comparison precedes the first payload step').toBeLessThan(payload);
-  expect(compare, 'the comparison precedes the switch').toBeLessThan(switchLink);
-});
-
-test('a commit that is not a sha is refused before any remote step, and a valid one reaches the local product env check', () => {
-  const sandbox = mkdtempSync(join(tmpdir(), 'sck-deploy-sha-'));
-  try {
-    mkdirSync(join(sandbox, 'bin'));
-    const reached = join(sandbox, 'reached.log');
-    for (const tool of ['ssh', 'scp']) {
-      writeFileSync(join(sandbox, 'bin', tool), `#!/bin/sh\necho ${tool} >> '${reached}'\nexit 0\n`);
-      chmodSync(join(sandbox, 'bin', tool), 0o755);
-    }
-    const run = (sha: string) => spawnSync('sh', [deploy, sha], {
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        PATH: `${join(sandbox, 'bin')}:${process.env.PATH ?? ''}`,
-        SCK_SERVICE_HOME: join(sandbox, 'home'),
-        SCK_PRODUCT_ENV: join(sandbox, 'missing.env'),
-        SCK_REMOTE_HOST: 'deploy-test.invalid',
-      },
-    });
-    const refused = run('main');
-    expect(refused.status).not.toBe(0);
-    expect(refused.stderr).toContain('is not a commit sha');
-    const passed = run(deploySha);
-    expect(passed.stderr).toContain('product env missing');
-    expect(existsSync(reached), 'no ssh or scp before the local checks pass').toBe(false);
-  } finally {
-    rmSync(sandbox, { recursive: true, force: true });
   }
 });

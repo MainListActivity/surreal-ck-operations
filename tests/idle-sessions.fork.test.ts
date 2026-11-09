@@ -9,7 +9,7 @@ run('persistent idle observations survive restart, manager wakes and a fresh dis
   const db = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: 'idle_session_fixture', database: 'control_plane' });
   try {
     await db.connect(); await db.bootstrap();
-    const wf = new Workforce(db, '/tmp/unused-idle-fixture');
+    const wf = new Workforce(db);
     await db.db.query(`CREATE employee:fixture CONTENT { role: 'engineering', paseo_agent_id: 'fixture-agent', last_wake_at: 10, idle_since: 20, revoked: false, retired: false };`);
     const find = async () => (await wf.insts()).find(i => i.id === 'fixture')!;
     const input = () => ({ instances: [] as Awaited<ReturnType<Workforce['insts']>>, states: new Map([['fixture','idle']]), held: new Set<string>(), bound: new Set<string>(), now: 8000, minutes: 120, workforce: wf,

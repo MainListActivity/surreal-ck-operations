@@ -4,7 +4,7 @@
 // listing that is gone, expired or over capacity is refused with a recoverable error.
 //
 // Capacity lives in the database, not in memory: one record, query_snapshot_quota:global (schema 022), is shared by every
-// process that reads through this store (the MCP server and the plugin sidecar are separate processes). A reservation,
+// process that reads through this store (the company service and the plugin sidecar are separate processes). A reservation,
 // commit, eviction or release changes that record in the same transaction as the listing rows, and bumps its version.
 // A reservation reads the record and then writes new totals only if the version is still the one it read; a concurrent
 // change makes it read again. A reservation counts toward the caps from the moment it is made, so a listing still being
@@ -506,7 +506,7 @@ export class SnapshotStore {
     await this.release(id);
   }
 
-  /** Number of stored listings and their rows, for tests and the RB01 drill. */
+  /** Number of stored listings and their rows, for tests. */
   async census(): Promise<{ listings: number; rows: number }> {
     const [listings] = await this.db.query<[Array<{ n: number }>]>('SELECT count() AS n FROM query_snapshot GROUP ALL;');
     const [rows] = await this.db.query<[Array<{ n: number }>]>('SELECT count() AS n FROM query_snapshot_row GROUP ALL;');
@@ -525,7 +525,7 @@ export class SnapshotStore {
     return { due: due?.[0]?.n ?? 0, listings: all?.[0]?.n ?? 0 };
   }
 
-  /** The quota record beside what the stored listings add up to, for tests and the RB01 drill. */
+  /** The quota record beside what the stored listings add up to, for tests. */
   async accounting(): Promise<SnapshotAccounting> {
     await this.ensureQuotaOn(this.db);
     const quota = (await this.db.select<QuotaRow>(QUOTA)) ?? { listings: 0, bytes: 0, version: 0, seq: 0 };

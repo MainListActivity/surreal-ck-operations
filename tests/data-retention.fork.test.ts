@@ -30,9 +30,6 @@ run('retention drops operational exhaust and keeps what open work still reads', 
     CREATE idempotency:legacy CONTENT { payload_digest: 'd', result: { id: 'x' } };
     CREATE idempotency:stamped CONTENT { payload_digest: 'd', result: { created_at: $new } };
     CREATE idempotency:old CONTENT { at: $old, payload_digest: 'd', result: {} };
-    CREATE outbox:old CONTENT { kind: 'claimed', task: task:open, at: $old, sequence: 1 };
-    CREATE outbox:revoked CONTENT { kind: 'revoked', task: task:done, at: $old, sequence: 2 };
-    CREATE outbox:fresh CONTENT { kind: 'claimed', task: task:open, at: $new, sequence: 3 };
     CREATE audit:ops_open CONTENT { action: 'ops_call', task: task:open, at: $old };
     CREATE audit:ops_done CONTENT { action: 'ops_error', task: task:done, at: $old };
     CREATE audit:submit_done CONTENT { action: 'submit', task: task:done, at: $old };`);
@@ -40,9 +37,8 @@ run('retention drops operational exhaust and keeps what open work still reads', 
   const left = async (table: string) => ((await db.db.query<[Array<{ id: { id: string } }>]>(`SELECT id FROM type::table($t);`, { t: table }))[0] ?? []).map(r => String(r.id.id)).sort();
   expect(await left('worktree_audit')).toEqual(['new']);
   expect(await left('idempotency')).toEqual(['stamped']);
-  expect(await left('outbox')).toEqual(['fresh']);
   expect(await left('audit')).toEqual(expect.arrayContaining(['ops_open', 'submit_done']));
   expect(await left('audit')).not.toContain('ops_done');
-  expect(removed).toMatchObject({ worktree_audit: 1, idempotency: 2, outbox: 2, audit: 1 });
+  expect(removed).toMatchObject({ worktree_audit: 1, idempotency: 2, audit: 1 });
   expect(await pruneOperationalData(db.db)).toEqual({});
 });
