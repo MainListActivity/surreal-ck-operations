@@ -161,7 +161,8 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       const workIntent = isEngineering && !input.workIntent
         ? { kind: 'code' as const }
         : input.workIntent as CreateTask['workIntent'] | undefined;
-      const acceptanceCriteria = isEngineering && !input.acceptanceCriteria
+      // deploy 模板（CI + QA 生产签署）只给代码工作；只读巡检等非代码的工程任务走默认的老板签署。
+      const acceptanceCriteria = isEngineering && workIntent?.kind === 'code' && !input.acceptanceCriteria
         ? defaultAcceptanceCriteria('deploy')
         : input.acceptanceCriteria as CreateTask['acceptanceCriteria'] | undefined;
       const task = await ctx.core.createTask(ownerCred, {
