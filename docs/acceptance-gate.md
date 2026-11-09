@@ -24,7 +24,7 @@ GitHub CI 计费判定属于系统能力。普通 `report_blocker`（到老板�
 
 直接以 CI 计费为理由的请求，即使未提供来源也会被拒绝；这只是限制员工阻塞能力，不能签发豁免。真实来源检查只处理本次与 CI/检查未执行有关的理由；历史“已完成”或其他分句提到 GitHub，不会单凭关键词与客户账单审批混为一谈，也不禁止后续真实依赖等待。多个 run 中有真实或未知失败时，不凭另一个 run 的 billing 禁止员工报修。员工应调用 `record_acceptance_evidence`，提供 `taskId`、机器 `acId`、当前 `sha` 和 `source{provider:"github-actions",runUrl}`，再正常提交；缺少来源、读取失败、错误 SHA 和真实测试失败都不会获得豁免。
 
-已合入 main 的结构化 `companyUpgrade` 是安装申请，仍由当前工程租约、任务仓库和 main 版本核验，不属于要求老板修复 CI 账单的普通阻塞。独立上线签核和部署事实不能由此替代。
+0.6.0 已删除结构化 `companyUpgrade` 升级卡，升级不再是 block 的豁免理由：每次 block 都先经过 CI 计费来源检查。独立上线签核和部署事实不能由此替代。
 
 ## 3. 统一评估器（AC03）
 

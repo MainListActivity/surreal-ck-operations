@@ -6,13 +6,15 @@ import { stopGroups } from './test-processes.ts';
 const parent = Number(process.argv[2]);
 const dir = process.argv[3]!;
 if (!Number.isSafeInteger(parent) || parent < 2 || !basename(dir).startsWith('sck-wt-regression-') || !dir.startsWith(tmpdir())) process.exit(2);
+// Bun keeps reporting the startup ppid after adoption, so probe the runner pid instead.
+const parentAlive = () => { try { process.kill(parent, 0); return true; } catch (error) { return (error as { code?: string }).code === 'EPERM'; } };
 for (;;) {
   let state: { parent: number; groups: number[]; finished: boolean };
   try { state = JSON.parse(readFileSync(join(dir, 'processes.json'), 'utf8')); }
-  catch { if (process.ppid !== parent) process.exit(1); await Bun.sleep(100); continue; }
+  catch { if (!parentAlive()) process.exit(1); await Bun.sleep(100); continue; }
   if (state.parent !== parent) process.exit(2);
   if (state.finished) process.exit(0);
-  if (process.ppid !== parent) {
+  if (!parentAlive()) {
     await stopGroups(state.groups);
     rmSync(dir, { recursive: true, force: true });
     process.exit(0);

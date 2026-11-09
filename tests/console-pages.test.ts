@@ -48,7 +48,7 @@ test('the console actually loads: every name its load path calls exists at runti
       forecast: { remainingMinutes: 0, basis: 'company', samples: 1, ownerWaiting: 0 },
       chains: [{ root: 'r1', title: '链一', taskIds: ['r1'], defects: [], counts: { done: 1, doing: 0, waiting: 0, blocked: 0, total: 1 }, forecast: { remainingMinutes: 0, basis: 'chain', samples: 1, ownerWaiting: 0 } }] };
     const responses: Record<string, unknown> = { 'api/exchange': { ownerToken: 'fixture' }, 'owner/progress': progress,
-      'owner/inbox': { gates: [], questions: [], notices: [], upgrades: { current: { version: '9.9.9', sha: 'a'.repeat(40) }, items: [] } },
+      'owner/inbox': { gates: [], questions: [], notices: [] },
       'owner/task.list': { tasks: [{ id: 'task:⟨r1⟩', title: '链一', state: 'done', executor_role: 'product', reviewer_role: 'qa' }] } };
     const fetchStub = async (path: string) => new Response(JSON.stringify(responses[path] ?? {}), { status: 200 });
     const windowStub = { addEventListener() {}, matchMedia: () => ({ matches: false }), location: { href: url + '/', search: '', pathname: new URL(url).pathname + '/' } };
@@ -59,8 +59,6 @@ test('the console actually loads: every name its load path calls exists at runti
     expect(String(element('stat').textContent)).toBe('运行中');
     expect(String(element('flow-pane').innerHTML)).toContain('目标进度');
     expect(String(element('flow-pane').innerHTML)).toContain('已完成 · 1 个任务');
-    // AC3: the sidebar shows the installed release, never a literal.
-    expect(String(element('release-ver').textContent)).toBe('控制面 · v9.9.9');
     // With no saved choice the page must not pin a theme, or the system dark mode never applies.
     expect((document.documentElement as { dataset: Record<string, string> }).dataset.theme).toBeUndefined();
     // AC4: the theme switch is never an empty icon-only button.
@@ -111,7 +109,7 @@ async function mountConsole(responses: Record<string, unknown>, status: Record<s
     'api/exchange': { ownerToken: 'fixture' }, 'owner/note.list': { notes: [] }, 'owner/task.list': { tasks: [] },
     'owner/progress': { counts: { done: 0, doing: 0, waiting: 0, blocked: 0, total: 0 }, defects: [], chains: [],
       forecast: { remainingMinutes: 0, basis: 'company', samples: 0, ownerWaiting: 0 } },
-    'owner/inbox': { gates: [], questions: [], notices: [], upgrades: { current: { version: '9.9.9', sha: 'a'.repeat(40) }, items: [] } },
+    'owner/inbox': { gates: [], questions: [], notices: [] },
     ...responses,
   };
   const calls: Array<{ path: string; body: Record<string, unknown> }> = [];

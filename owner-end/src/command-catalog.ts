@@ -10,7 +10,7 @@ export type CommandGroup =
   | '任务'
   | '决策与消息'
   | '笔记'
-  | '路由与升级'
+  | '路由'
   | '员工与权限'
   | '身份与云端'
   | '数据与审计'
@@ -85,12 +85,9 @@ export const COMMAND_CATALOG: readonly CommandSpec[] = [
   c('note.consolidations', '笔记', '整理记录', 'limit?', { readOnly: true }),
   c('note.consolidation.undo', '笔记', '撤销一次整理', 'id'),
 
-  c('route.list', '路由与升级', '任务路由（任务类型）列表', '无', { readOnly: true }),
-  c('route.save', '路由与升级', '新增或修改任务路由', 'type, label, executorRole, reviewerRole, code?, executeBody?, reviewBody?, next?, hold?', { risk: 'high' }),
-  c('route.disable', '路由与升级', '停用任务路由', 'type', { risk: 'high' }),
-  c('upgrade.list', '路由与升级', '公司升级收件箱', '无', { readOnly: true, runner: true }),
-  c('upgrade.automatic', '路由与升级', '开关自动升级', 'enabled', { risk: 'high', runner: true }),
-  c('upgrade.start', '路由与升级', '启动公司升级（需要版本与摘要）', 'taskId, taskVersion, digest', { risk: 'high', runner: true }),
+  c('route.list', '路由', '任务路由（任务类型）列表', '无', { readOnly: true }),
+  c('route.save', '路由', '新增或修改任务路由', 'type, label, executorRole, reviewerRole, code?, executeBody?, reviewBody?, next?, hold?', { risk: 'high' }),
+  c('route.disable', '路由', '停用任务路由', 'type', { risk: 'high' }),
 
   c('agent.list', '员工与权限', '员工列表', '无', { readOnly: true }),
   c('agent.policy.list', '员工与权限', '员工策略列表', '无', { readOnly: true }),
@@ -125,7 +122,6 @@ export const COMMAND_CATALOG: readonly CommandSpec[] = [
   c('audit.list', '数据与审计', '审计记录（可按员工、任务、命令筛选）', 'limit?, agent?, task?, command?', { readOnly: true }),
 
   c('host.exec', '主机与发布', '在主机上执行命令（以受限用户身份）', 'host, command, timeoutSec?', { risk: 'high', runner: true }),
-  c('company.release.install', '主机与发布', '安装指定提交的公司版本', 'sha（40 位小写十六进制）', { risk: 'high', runner: true }),
 
   c('translate.preview', '翻译', '预览译文', 'lang, text', { readOnly: true }),
   c('translate.message', '翻译', '为待发消息补译（lang 为 null 时清除）', 'messageId, lang'),

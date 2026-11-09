@@ -31,27 +31,8 @@ repo_root=$(cd "$(dirname "$0")/.." && pwd)
 product_env=${SCK_PRODUCT_ENV:-/Users/y/IdeaProjects/surreal_ck/.env}
 service_home=${SCK_SERVICE_HOME:-"$HOME/Library/Application Support/SurrealCKCompany"}
 
-# Release gate (SYS01 AC-B, scripts/release-gate.sh): the remote switch to a commit needs a passing comm-slow-pipe record for that
-# exact SHA, made on darwin with the Bun version the remote runs (SCK_BUN_VERSION). Checked here, before any step reaches the host.
-release_gate_ok() {
-  record="$service_home/gates/comm-slow-pipe/$1.json"
-  [ -f "$record" ] || return 1
-  /usr/bin/python3 - "$record" "$1" "$2" <<'PY'
-import json, sys
-record, sha, bun = sys.argv[1], sys.argv[2], sys.argv[3]
-try:
-    with open(record, encoding='utf-8') as handle:
-        data = json.load(handle)
-except (OSError, ValueError):
-    sys.exit(1)
-ok = (data.get('gate') == 'comm-slow-pipe' and data.get('sha') == sha and data.get('bun') == bun
-      and data.get('platform') == 'darwin' and data.get('result') == 'pass')
-sys.exit(0 if ok else 1)
-PY
-}
 case "$commit" in *[!0-9a-f]*|'') echo "refused: release commit '$commit' is not a commit sha" >&2; exit 1;; esac
 [ ${#commit} -eq 40 ] || { echo "refused: release commit '$commit' is not a 40-character commit sha" >&2; exit 1; }
-release_gate_ok "$commit" "$bun_version" || { echo "refused: no passing comm-slow-pipe gate for $commit on bun $bun_version in $service_home; run 'sh scripts/release-gate.sh slow-pipe <absolute release dir>' on this Mac first" >&2; exit 1; }
 
 [ -f "$product_env" ] || { echo "product env missing: $product_env" >&2; exit 1; }
 [ -f "$deploy_key" ] || { echo "deploy key missing: $deploy_key (ssh-keygen -t ed25519 -f $deploy_key, then add its .pub to the host's authorized_keys)" >&2; exit 1; }
@@ -95,10 +76,10 @@ chmod 750 $remote_home $remote_home/private
 if [ ! -x $remote_home/runtime-bun/bin/bun ]; then
   sudo -u sckcompany bash -c 'curl -fsSL https://bun.sh/install | BUN_INSTALL=$remote_home/runtime-bun bash -s "bun-v$bun_version"'
 fi
-# The release gate is for bun $bun_version. A runtime installed earlier must report that version, or the deploy stops here,
+# The pinned bun version is $bun_version. A runtime installed earlier must report that version, or the deploy stops here,
 # before any release payload is uploaded: an old binary is never reused on trust.
 actual=\$(sudo -u sckcompany $remote_home/runtime-bun/bin/bun --version 2>/dev/null || true)
-[ "\$actual" = "$bun_version" ] || { echo "refused: remote bun is '\$actual', the release gate is for bun $bun_version; reinstall the pinned runtime, then deploy again" >&2; exit 1; }
+[ "\$actual" = "$bun_version" ] || { echo "refused: remote bun is '\$actual', the pinned version is bun $bun_version; reinstall the pinned runtime, then deploy again" >&2; exit 1; }
 REMOTE_SETUP
 
 # --- remote: release payload -------------------------------------------------

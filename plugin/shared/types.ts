@@ -6,7 +6,6 @@ export type Role = "owner" | "product" | "engineering" | "ai-content" | "concept
 export type TaskKind = "goal" | "task" | "gate" | "release" | "deploy";
 
 export interface TaskView {
-  companyUpgrade?: CompanyRelease;
   id: string;
   title: string;
   context: string;
@@ -64,10 +63,7 @@ export interface AuditEntry {
   at: string;
 }
 
-export interface CompanyRelease {version:string;sha:string;digest:string;title:string;changes:string[];impact:string[];migration:string;rollback:string}
-export interface UpgradeCard {taskId:string;taskVersion:number;plan:CompanyRelease;status:string;phase:string;error?:string;jobId?:string;retired?:boolean}
 export interface Inbox {
-  upgrades?: {automatic?:{enabled:boolean;revision:number};current:{version:string;sha:string};items:UpgradeCard[]};
   gates: Array<{ task: TaskView; submission?: string }>;
   questions: Array<{ task: TaskView; question?: string }>;
   notices: Array<{ key: string; text: string; at: string }>;

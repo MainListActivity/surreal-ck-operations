@@ -12,7 +12,6 @@ import { relayShellCss, relayIcon, RELAY_ICON_PATHS } from "../shared/relay-shel
 import { createOwnerApiFetch } from "./owner-api.ts";
 
 type CompanyApi = {
-  upgrades?: import("./vendor/src/company-upgrades.ts").CompanyUpgrades;
   owner: {
     inbox(): Promise<unknown>;
     brief(): Promise<unknown>;
@@ -121,7 +120,7 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
 
     try {
       if (req.method === "GET" && sub === "/") return text(PAGE, 200, "text/html; charset=utf-8");
-      if (req.method === "GET" && sub === "/api/inbox") return json(await (async()=>{const c=await opts.company();return c.upgrades?c.upgrades.inbox():c.owner.inbox();})());
+      if (req.method === "GET" && sub === "/api/inbox") return json(await (await opts.company()).owner.inbox());
       if (req.method === "GET" && sub === "/api/brief") return json(await (await opts.company()).owner.brief());
       if (req.method === "GET" && sub === "/api/tasks") {
         const tag = url.searchParams.get("tag") ?? "";
@@ -159,18 +158,6 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
         const { opsRepo } = await opts.company();
         const body = readDoc(opsRepo, url.searchParams.get("name") ?? "");
         return body === undefined ? json({ error: "not found" }, 404) : json({ name: url.searchParams.get("name"), text: body });
-      }
-      if(req.method==='POST'&&sub==='/api/upgrade/automatic'){
-        if(req.headers.get('origin')&&req.headers.get('origin')!==url.origin)return json({error:'origin mismatch'},403);
-        const b=await req.json() as {enabled?:unknown};if(typeof b.enabled!=='boolean')return json({error:'enabled must be boolean'},400);
-        const c=await opts.company();if(!c.upgrades)return json({error:'升级服务尚未就绪'},409);
-        return json(await c.upgrades.setAuto(b.enabled,SOURCE));
-      }
-      if (req.method === "POST" && sub === "/api/upgrade") {
-        if(req.headers.get("origin") && req.headers.get("origin")!==url.origin)return json({error:"origin mismatch"},403);
-        const b=await req.json() as {taskId:string;taskVersion:number;digest:string};
-        const c=await opts.company();if(!c.upgrades)return json({error:"升级服务尚未就绪"},409);
-        return json(await c.upgrades.start(b,SOURCE));
       }
       if (req.method === "POST" && sub === "/api/decide") {
         const b = await req.json() as { taskId?: string; decision?: string; note?: string; key?: string };
@@ -331,7 +318,6 @@ ${relayShellCss}
 <div class="main-area"><header class="topbar"><div class="breadcrumb"><span>公司</span><b>/</b><strong id="crumb">目标进度</strong></div>
 <div class="top-actions"><span class="status" id="stat">加载中…</span><button class="refresh" id="pause-btn" data-cmd="toggle-pause">暂停派工</button><button class="refresh" data-cmd="refresh">${relayIcon("refresh")}<span>刷新</span></button></div></header>
 <main class="content"><div class="flow-pane" id="flow-pane"></div><aside class="drawer" id="drawer"></aside>
-<template id="upgrade-card">上线内容：<span class="uc"></span> · 影响范围：<span class="ui"></span> · <button class="upgrade-start">升级至 v<span class="uv"></span></button> · <button class="upgrade-automatic">自动升级已开启</button></template>
 </main></div></div>
 <div id="toast" class="toast" role="status"></div>
 <script>
@@ -383,8 +369,6 @@ async function onCommand(ev){
   else if(cmd==='unlock')unlockTask(arg);
   else if(cmd==='decide'){const [id,dec]=String(arg).split(':');decide(id,dec,el.dataset.note||'');}
   else if(cmd==='toggle-def'){const [id,on]=String(arg).split(':');toggleDef(id,on==='1');}
-  else if(cmd==='upgrade-automatic'){await api('upgrade.automatic',{enabled:!(INBOX?.upgrades?.automatic?.enabled)});toast('已切换自动升级');await load();}
-  else if(cmd==='upgrade-start'){await api('upgrade.start',{taskId:arg.split(':')[0],taskVersion:Number(arg.split(':')[1]),digest:arg.split(':')[2]});toast('已启动升级');await load();}
   else if(cmd==='create-task')createTask();
   else if(cmd==='new-task')newTaskForm();
   else if(cmd==='route-edit')routeEditForm(arg);
@@ -411,7 +395,6 @@ async function load(){
     PROGRESS=pr;NOTES=nt.notes||[];ROUTES=g.routes||[];TASKS=t.tasks||[];MESSAGES=m.messages||[];INBOX=i;DEFS=d.defs||[];NOTICES=n.notices||[];PAUSED=s.paused===true;if(bd)BOARD=bd;
     CONSOLIDATIONS=cs.consolidations||[];CONSOLIDATION_ERROR=cs.error||'';
     const n2=(INBOX.gates||[]).length+(INBOX.questions||[]).length;const b=$('nav-count');if(b){b.textContent=n2;b.hidden=!n2}
-    const rv=$('release-ver');if(rv)rv.textContent='控制面'+(INBOX.upgrades&&INBOX.upgrades.current?' · v'+INBOX.upgrades.current.version:'');
     $('stat').textContent=n2?('待办 '+n2):'运行中';$('stat').className='status'+(n2?' violet':'');
     const pb=$('pause-btn');if(pb)pb.textContent=PAUSED?'恢复派工':'暂停派工';
     render();
@@ -536,13 +519,7 @@ function drawerDefault(){
   $('drawer').innerHTML='<div class="kicker">DRAWER</div><h2>消息与任务</h2><p class="meta">点击节点或连线查看正文、放行与审计。</p>'
     +'<section><h3>待发消息 '+drafts.length+'</h3><div class="inbox-list">'+drafts.slice(0,12).map(m=>'<div class="inbox-card"><h3>'+esc(m.step)+' → '+esc(m.role)+'</h3><p>'+esc(m.body.slice(0,80))+'</p><button data-cmd="msg:'+esc(m.id)+'">查看</button></div>').join('')||'<p class="meta">无</p>'+'</div></section>'
     +'<section><h3>收件箱</h3>'+((INBOX?.gates||[]).length+(INBOX?.questions||[]).length)+' 项待你决定</section>'
-    +'<section><h3>提醒 '+(noticeList().length||'')+'</h3><div class="inbox-list">'+noticesHtml()+'</div></section>'
-    +'<section><h3>公司系统升级</h3>'+upgradeHtml()+'</section>';
-}
-function upgradeHtml(){
-  const items=INBOX?.upgrades?.items||[];
-  if(!items.length)return '<p class="meta">无待升级版本</p>';
-  return items.map(x=>'<div class="inbox-card"><h3>v'+esc(x.plan?.version||'')+' · '+esc(x.status||'')+'</h3><p>'+esc(x.taskId||'')+'</p><div class="row"><button data-cmd="upgrade-start:'+esc(String(x.taskId))+':'+esc(String(x.taskVersion))+':'+esc(String(x.plan?.digest||''))+'">升级至 v'+esc(x.plan?.version||'')+'</button></div></div>').join('');
+    +'<section><h3>提醒 '+(noticeList().length||'')+'</h3><div class="inbox-list">'+noticesHtml()+'</div></section>';
 }
 function noticeList(){return (NOTICES&&NOTICES.length)?NOTICES:(INBOX?.notices||[])}
 function noticesHtml(){

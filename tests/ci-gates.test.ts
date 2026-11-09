@@ -32,8 +32,7 @@ test('the comm gate runs the client and slow pipe regressions, and CI runs the c
   expect(readFileSync(join(ROOT, '.github/workflows/quality-gate.yml'), 'utf8')).toContain('pnpm test:comm');
 });
 
-// SYS01 AC-B: the macOS slow-pipe regression is no longer a hosted paid job. It runs at release time through the local gate, and
-// install refuses a release that has no passing record for it. No workflow may name a hosted macOS runner again.
+// SYS01 AC-B: no workflow may name a hosted macOS runner. The macOS slow-pipe regression runs at release time, not in hosted CI.
 test('the rollback runbook uses the guarded installer of the current release, never the old release installer', () => {
   const docs = readFileSync(join(ROOT, 'docs/company-service-operations.md'), 'utf8');
   expect(docs).not.toMatch(/SCK_PREVIOUS_RELEASE\/scripts\/company-service\.sh/);
@@ -41,7 +40,7 @@ test('the rollback runbook uses the guarded installer of the current release, ne
   expect(readFileSync(join(ROOT, 'scripts/company-service.sh'), 'utf8')).toContain('acceptance_target_supported "$release"');
 });
 
-test('no workflow runs on a hosted macOS runner, and the release gate for the slow pipe exists', () => {
+test('no workflow runs on a hosted macOS runner', () => {
   // Every workflow file, not a fixed list: a new file must not name a macOS runner either. Comment lines are skipped, so a note
   // that says "macOS" does not count as a runner label.
   const dir = join(ROOT, '.github/workflows');
@@ -51,20 +50,16 @@ test('no workflow runs on a hosted macOS runner, and the release gate for the sl
     const jobs = readFileSync(join(dir, workflow), 'utf8').split('\n').filter(line => !line.trimStart().startsWith('#'));
     expect(jobs.join('\n'), `${workflow}: names no macOS runner`).not.toMatch(/macos/i);
   }
-  expect(existsSync(join(ROOT, 'scripts/release-gate.sh'))).toBe(true);
-  expect(readFileSync(join(ROOT, 'scripts/release-gate.sh'), 'utf8')).toContain('tests/comm-slow-pipe.test.ts');
 });
 
-// SYS01 AC-B (review fix): the remote switch to a commit refuses before any step reaches the host, unless the release gate holds a
-// passing comm-slow-pipe record for that exact SHA and the Bun version the remote runs.
+// The remote switch to a commit refuses a value that is not a commit sha before any step reaches the host.
 const deploy = join(ROOT, 'scripts/deploy-mcp-remote.sh');
 const deploySha = '0123456789abcdef0123456789abcdef01234567';
 
-// SYS01 AC-B (manager ruling v31, M2): the remote Bun check is run, not only ordered. The real deploy script runs against a sandbox:
+// The remote Bun check is run, not only ordered. The real deploy script runs against a sandbox:
 // ssh, scp, sudo and the account tools are stubs; the remote home, the deploy key and the product env are sandbox paths (the key is
 // never read); the ssh stub ends a run at its first payload step, so nothing reaches the switch.
-// `record` overrides fields of the passing gate record that is written for this SHA; null writes no record at all.
-function runDeploy(sandbox: string, remoteBun: string, record: Record<string, string> | null = {}) {
+function runDeploy(sandbox: string, remoteBun: string) {
   const bin = join(sandbox, 'bin');
   const home = join(sandbox, 'home');
   const remote = join(sandbox, 'remote');
@@ -75,10 +70,6 @@ function runDeploy(sandbox: string, remoteBun: string, record: Record<string, st
     chmodSync(join(bin, name), 0o755);
   };
   mkdirSync(bin);
-  mkdirSync(join(home, 'gates/comm-slow-pipe'), { recursive: true });
-  if (record !== null) {
-    writeFileSync(join(home, 'gates/comm-slow-pipe', `${sha}.json`), JSON.stringify({ gate: 'comm-slow-pipe', sha, bun: '1.4.2', platform: 'darwin', result: 'pass', ...record }));
-  }
   writeFileSync(join(sandbox, 'product.env'), 'SURREAL_ROOT_USER=stub\nSURREAL_ROOT_PASS=stub\n');
   writeFileSync(join(sandbox, 'deploy.key'), '');
   const remoteBunPath = join(remote, 'runtime-bun/bin/bun');
@@ -106,7 +97,7 @@ function runDeploy(sandbox: string, remoteBun: string, record: Record<string, st
   return { status: result.status, stderr: result.stderr, log: existsSync(log) ? readFileSync(log, 'utf8') : '', remote };
 }
 
-test('the remote Bun check refuses a runtime that is not the gated version, before any payload upload or switch', () => {
+test('the remote Bun check refuses a runtime that is not the pinned version, before any payload upload or switch', () => {
   for (const reported of ['1.3.11', '']) {
     const sandbox = mkdtempSync(join(tmpdir(), 'sck-deploy-bun-'));
     try {
@@ -123,7 +114,7 @@ test('the remote Bun check refuses a runtime that is not the gated version, befo
   }
 }, 20_000);
 
-test('a remote runtime of the gated version passes the check and reaches the payload step, without a switch', () => {
+test('a remote runtime of the pinned version passes the check and reaches the payload step, without a switch', () => {
   const sandbox = mkdtempSync(join(tmpdir(), 'sck-deploy-bun-'));
   try {
     const run = runDeploy(sandbox, '1.4.2');
@@ -136,38 +127,6 @@ test('a remote runtime of the gated version passes the check and reaches the pay
   }
 }, 20_000);
 
-// SYS01 AC-B (manager ruling v31, M2): a local gate refusal reaches no host at all. Each case runs the real script with a gate record
-// that is missing or does not match this SHA and the Bun version the deploy expects.
-test('without a passing gate record for this SHA and Bun, the deploy refuses before any ssh, scp or switch', () => {
-  const cases: Array<[string, Record<string, string> | null]> = [
-    ['no record', null],
-    ['a failed run', { result: 'fail' }],
-    ['a record that names another SHA', { sha: '1'.repeat(40) }],
-    ['a record for another Bun', { bun: '1.3.11' }],
-    ['a record from another platform', { platform: 'linux' }],
-  ];
-  for (const [name, record] of cases) {
-    const sandbox = mkdtempSync(join(tmpdir(), 'sck-deploy-gate-'));
-    try {
-      const run = runDeploy(sandbox, '1.4.2', record);
-      expect(run.status, `${name}: refused`).not.toBe(0);
-      expect(run.stderr, `${name}: reason`).toContain('refused: no passing comm-slow-pipe gate');
-      expect(run.log, `${name}: no remote step reached`).toBe('');
-      expect(existsSync(join(run.remote, 'current')), `${name}: no switch`).toBe(false);
-    } finally {
-      rmSync(sandbox, { recursive: true, force: true });
-    }
-  }
-}, 60_000);
-
-test('the deploy script checks the release gate before any remote step', () => {
-  const lines = readFileSync(deploy, 'utf8').split('\n').filter(line => !line.trimStart().startsWith('#'));
-  const gate = lines.findIndex(line => line.startsWith('release_gate_ok "$commit"'));
-  const remote = lines.findIndex(line => /(^|[\s|])(ssh|scp)\s/.test(line) || line.includes('ln -sfn') || line.includes('git -C "$repo_root" archive'));
-  expect(gate, 'the gate call exists').toBeGreaterThan(-1);
-  expect(remote, 'a remote step exists after the gate').toBeGreaterThan(gate);
-});
-
 test('the deploy script checks the remote Bun version before any payload upload or switch', () => {
   const lines = readFileSync(deploy, 'utf8').split('\n').filter(line => !line.trimStart().startsWith('#'));
   const compare = lines.findIndex(line => line.includes('actual" = "$bun_version"'));
@@ -178,8 +137,8 @@ test('the deploy script checks the remote Bun version before any payload upload 
   expect(compare, 'the comparison precedes the switch').toBeLessThan(switchLink);
 });
 
-test('without a passing record for the SHA and Bun version, the deploy script never reaches ssh or scp', () => {
-  const sandbox = mkdtempSync(join(tmpdir(), 'sck-deploy-gate-'));
+test('a commit that is not a sha is refused before any remote step, and a valid one reaches the local product env check', () => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'sck-deploy-sha-'));
   try {
     mkdirSync(join(sandbox, 'bin'));
     const reached = join(sandbox, 'reached.log');
@@ -197,28 +156,12 @@ test('without a passing record for the SHA and Bun version, the deploy script ne
         SCK_REMOTE_HOST: 'deploy-test.invalid',
       },
     });
-    const refused = (sha: string, reason: string) => {
-      const result = run(sha);
-      expect(result.status, `${sha}: refused`).not.toBe(0);
-      expect(result.stderr, `${sha}: reason`).toContain(reason);
-      expect(existsSync(reached), `${sha}: no remote step ran`).toBe(false);
-    };
-    const writeRecord = (fields: Record<string, string>) => {
-      mkdirSync(join(sandbox, 'home/gates/comm-slow-pipe'), { recursive: true });
-      writeFileSync(join(sandbox, 'home/gates/comm-slow-pipe', `${deploySha}.json`), JSON.stringify({ gate: 'comm-slow-pipe', sha: deploySha, bun: '1.4.2', platform: 'darwin', result: 'pass', ...fields }));
-    };
-    refused('main', 'is not a commit sha');
-    refused(deploySha, 'no passing comm-slow-pipe gate');
-    const stale: Record<string, string>[] = [{ sha: 'f'.repeat(40) }, { bun: '1.3.11' }, { platform: 'linux' }, { result: 'fail' }];
-    for (const fields of stale) {
-      writeRecord(fields);
-      refused(deploySha, 'no passing comm-slow-pipe gate');
-    }
-    writeRecord({});
+    const refused = run('main');
+    expect(refused.status).not.toBe(0);
+    expect(refused.stderr).toContain('is not a commit sha');
     const passed = run(deploySha);
-    expect(passed.stderr).not.toContain('no passing comm-slow-pipe gate');
     expect(passed.stderr).toContain('product env missing');
-    expect(existsSync(reached), 'a passing record stops at the local product env check, before any ssh').toBe(false);
+    expect(existsSync(reached), 'no ssh or scp before the local checks pass').toBe(false);
   } finally {
     rmSync(sandbox, { recursive: true, force: true });
   }

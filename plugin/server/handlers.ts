@@ -52,9 +52,7 @@ export function registerHandlers(server: PluginServerContext): void {
     return readSessionHistory({...input,home:homedir(),paseoHome:process.env.PASEO_HOME??join(homedir(),'.paseo')});
   });
 
-  ownerHandle(rpc.inbox, async () => (await company()).upgrades.inbox());
-  ownerHandle(rpc.autoUpgrade,async (input:RpcInput<typeof rpc.autoUpgrade>)=>(await company()).upgrades.setAuto(input.enabled,SOURCE));
-  ownerHandle(rpc.upgrade, async (input: RpcInput<typeof rpc.upgrade>) => (await company()).upgrades.start(input,SOURCE));
+  ownerHandle(rpc.inbox, async () => (await company()).owner.inbox());
   ownerHandle(rpc.brief, async () => (await company()).owner.brief());
   ownerHandle(rpc.runnerStatus, async () => runnerStatusOf(await company()));
 

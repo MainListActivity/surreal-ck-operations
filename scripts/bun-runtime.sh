@@ -1,6 +1,6 @@
 # shellcheck shell=sh
-# The Bun runtime the services run with. Sourced by run-service.sh (installed as bin/run.sh beside this file), release-gate.sh and
-# company-service.sh, so the release gate runs and records the runtime production executes. Order: SCK_BUN (environment, else the
+# The Bun runtime the services run with. Sourced by run-service.sh (installed as bin/run.sh beside this file) and
+# company-service.sh, so the install and the running service resolve the same runtime. Order: SCK_BUN (environment, else the
 # SCK_BUN line of private/service.env), then the service-pinned runtime-bun under the service home, then ~/.bun/bin/bun.
 # PATH is never searched: the Bun there is not the runtime the services run.
 resolve_bun() {

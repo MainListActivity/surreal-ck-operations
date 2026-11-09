@@ -14,7 +14,6 @@ const ROOT_PASSWORD = 'fixture-only';
 const NAMESPACE = 'cloud_ops_jobs_fixture';
 const DATABASE = 'control_plane';
 const SECRET = 'sk-test-secret-123';
-const SHA = 'b'.repeat(40);
 let dir: string, server: ReturnType<typeof Bun.spawn>, url: string;
 const serverTarget = (): DbTarget => ({
   url, namespace: NAMESPACE, database: DATABASE,
@@ -68,7 +67,6 @@ async function runnerDeps(name: string, overrides: Partial<OpsJobDeps>): Promise
     opsCall: async () => ({ ok: true }),
     runnerOnly: async () => ({}),
     hostExec: async () => ({ exitCode: 0 }),
-    releaseInstall: async () => ({ installed: true }),
   };
   return { db, runner: new OpsJobRunner({ ...base, ...overrides }) };
 }
@@ -134,20 +132,17 @@ run('注入失败：作业 error，错误码沿用，message 脱敏', async () =
   }
 });
 
-run('host.exec 与 company.release.install 路由的返回值写入 result；非法 timeoutSec 得到 invalid', async () => {
+run('host.exec 路由的返回值写入 result；非法 timeoutSec 得到 invalid', async () => {
   await seedJobs(`
     CREATE ops_job:j3 CONTENT { command: 'host.exec', input: { host: 'arm-free-1', command: 'echo hi' }, actor_kind: 'agent', actor: 'agent-1', state: 'queued', created_at: time::now() };
-    CREATE ops_job:j4 CONTENT { command: 'company.release.install', input: { sha: '${SHA}' }, actor_kind: 'agent', actor: 'agent-1', state: 'queued', created_at: time::now() };
     CREATE ops_job:j5 CONTENT { command: 'host.exec', input: { host: 'arm-free-1', command: 'echo hi', timeoutSec: 0 }, actor_kind: 'agent', actor: 'agent-1', state: 'queued', created_at: time::now() };
   `);
   const runner = await runnerDeps('runner-d', {
     hostExec: async (input) => ({ host: input.host, exitCode: 0, stdout: 'hi\n' }),
-    releaseInstall: async (input) => ({ installed: input.sha }),
   });
   try {
     await runner.runner.drain();
     expect(parsed((await readJob('j3')).result)).toEqual({ host: 'arm-free-1', exitCode: 0, stdout: 'hi\n' });
-    expect(parsed((await readJob('j4')).result)).toEqual({ installed: SHA });
     const invalid = await readJob('j5');
     expect(invalid.state).toBe('error');
     expect(invalid.error?.startsWith('invalid: ')).toBe(true);

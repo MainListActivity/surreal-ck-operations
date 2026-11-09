@@ -48,11 +48,11 @@ export interface GatewayDeps {
 const COMMAND_NAME = /^[a-z][a-z0-9_.-]{0,119}$/;
 
 /**
- * 执行端执行的命令（contract：RUNNER_ONLY_COMMANDS、全部 ops_*、host.exec、company.release.*）：
+ * 执行端执行的命令（contract：RUNNER_ONLY_COMMANDS、全部 ops_*、host.exec）：
  * 写 ops_job 排队，网关最多等 25 秒，超时返回 pending。
  */
 export function isRunnerCommand(command: string): boolean {
-  return RUNNER_ONLY_COMMANDS.has(command) || command.startsWith('ops_') || command === 'host.exec' || command.startsWith('company.release.');
+  return RUNNER_ONLY_COMMANDS.has(command) || command.startsWith('ops_') || command === 'host.exec';
 }
 
 const OWNER_ONLY_REASON = '该命令只能由老板调用';

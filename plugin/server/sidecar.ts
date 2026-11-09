@@ -529,8 +529,7 @@ export class SidecarPool {
     instId: string, live: LiveClaim, to: "owner" | undefined,
     text: string, path: string,
   ): Promise<void> {
-    const upgradeSha = /^\s*companyUpgradeSha:\s*(\S+)\s*$/m.exec(text)?.[1];
-    const evidence: Evidence = { ...(upgradeSha ? {companyUpgrade:{sha:upgradeSha}}:{}), text, idempotencyKey: `sidecar-file:${instId}:${live.proof.deliveryId}:${hash(text)}` };
+    const evidence: Evidence = { text, idempotencyKey: `sidecar-file:${instId}:${live.proof.deliveryId}:${hash(text)}` };
     try {
       const cred = await this.credentialFor(instId);
       if (to) {
@@ -911,7 +910,6 @@ export class SidecarPool {
       return raw;
     };
     const evidence = (): Evidence => ({
-      ...(args.companyUpgrade === undefined ? {} : { companyUpgrade: args.companyUpgrade as Evidence["companyUpgrade"] }),
       text: String(args.text ?? ""),
       idempotencyKey: String(args.idempotencyKey ?? `sidecar-relay:${instId}:${randomBytes(6).toString("hex")}`),
       ...(declared ? { acceptance: declared } : {}),

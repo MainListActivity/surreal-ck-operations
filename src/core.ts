@@ -1,4 +1,4 @@
-import { git, readCompanyRelease, type CompanyRelease } from './company-release.ts';
+import { git } from './company-release.ts';
 import { checkLearned, LaneNoteStore, laneOf } from './lane-notes.ts';
 import { getRoute, listRoutes, CHAIN_LIMIT, type RouteRow } from './routes.ts';
 import { OutboundMessageStore } from './outbound-messages.ts';
@@ -127,7 +127,6 @@ interface EmployeeRow {
 }
 
 export interface TaskRow {
-  company_upgrade?: CompanyRelease;
   recovery_stopped?: boolean;
   id: RecordId;
   title: string;
@@ -226,7 +225,6 @@ export function view(row: TaskRow): TaskView {
     leaseExpiresAt: row.lease_expires_at ? new Date(row.lease_expires_at * 1000).toISOString() : undefined,
     fence: row.fence,
     blockedTo: row.blocked_to,
-    companyUpgrade: row.company_upgrade ?? undefined,
     resumeState: row.state === 'blocked' ? row.resume_state : undefined,
     resumeRole: row.state === 'blocked' ? row.resume_role : undefined,
     handover: row.handover || undefined,
@@ -416,12 +414,15 @@ export class SurrealCompanyCore implements CompanyCore {
   /** Test seam (SYS-DISP AC06): runs after a contribution view is read and before the lease transaction that checks it. */
   private readonly contributionReadHook?: (taskId: string) => Promise<void>;
   private readonly companyReleaseRepo?:string;
+  /** 本执行端的节点 ID（见 node-identity.ts）；认领租约时写入 task.lease_node，供节点更新器判断本节点的租约。 */
+  readonly nodeId?: string;
   private readonly drillLaunch?: (home: string, repo: string, plan: { runId: string; root: string }) => number;
-  constructor(readonly database: CompanyDatabase, options?: { companyReleaseRepo?:string; leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; systemCheck?: SystemCheck; ciBillingCheck?: CiBillingCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter; runs?: AcceptanceRunLister };
+  constructor(readonly database: CompanyDatabase, options?: { companyReleaseRepo?:string; nodeId?: string; leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; systemCheck?: SystemCheck; ciBillingCheck?: CiBillingCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter; runs?: AcceptanceRunLister };
     faults?: { limits?: FaultBudgetLimits; clock?: () => number };
     /** Test seam only: replaces the detached drill launch so a gate can assert the guards without a real run. */
     drillLaunch?: (home: string, repo: string, plan: { runId: string; root: string }) => number }) {
     this.companyReleaseRepo=options?.companyReleaseRepo;
+    this.nodeId=options?.nodeId;
     this.drillLaunch = options?.drillLaunch;
     this.submitCheck = options?.submitCheck;
     this.systemCheck = options?.systemCheck;
@@ -915,6 +916,7 @@ export class SurrealCompanyCore implements CompanyCore {
       LET $next = UPDATE ONLY $task SET
         state = IF $t.state = 'review' THEN 'review' ELSE 'doing' END,
         current_employee = $employee,
+        lease_node = IF $node != NONE THEN $node ELSE NONE END,
         delivery_id = IF $same THEN $t.delivery_id ELSE $delivery END,
         lease_expires_at = $now + $lease_seconds,
         progress_at = IF $same THEN $t.progress_at ELSE $now END,
@@ -940,7 +942,7 @@ export class SurrealCompanyCore implements CompanyCore {
       };
       RETURN SELECT * FROM ONLY $task;
       COMMIT;`, {
-      actor: id('employee', actor.employeeId), employee: actor.employeeId, task,
+      actor: id('employee', actor.employeeId), employee: actor.employeeId, task, node: this.nodeId,
       delivery: randomUUID(), lease_seconds: this.leaseSeconds,
       assignment: worktree, tree: worktree ? id('worktree', worktree.id) : undefined, reference: id('worktree_ref', taskId),
       audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
@@ -1991,18 +1993,6 @@ export class SurrealCompanyCore implements CompanyCore {
       const prior = await this.replay(idem, digest);
       if (prior) return prior;
     }
-    let companyUpgrade: CompanyRelease | undefined;
-    if (evidence?.companyUpgrade !== undefined) {
-      const row = await this.db.select<TaskRow>(id('task', proof.taskId));
-      if (!row || actor.role !== 'engineering' || row.state !== 'doing' || !['release','deploy'].includes(row.kind ?? '') ||
-          !['submit','block'].includes(action) || row.current_employee !== actor.employeeId || row.delivery_id !== proof.deliveryId ||
-          row.fence !== proof.fence || row.version !== proof.expectedVersion || (row.lease_expires_at ?? 0) <= Date.now()/1000)
-        throw new CompanyError('forbidden','只有当前工程租约可以登记公司系统上线版本');
-      const repo = this.companyReleaseRepo ?? this.worktrees?.options.opsRepo ?? process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
-      const project = await this.taskProject(proof.taskId);
-      if (!(row.code_repo_path ?? project?.repoPath) || hostIO().fs.realpath((row.code_repo_path ?? project?.repoPath)!) !== hostIO().fs.realpath(repo)) throw new CompanyError('forbidden','此任务不是公司系统仓库的上线任务');
-      companyUpgrade = await readCompanyRelease(repo,evidence.companyUpgrade.sha);
-    }
     let prHead: string | undefined;
     if (action === 'submit' && evidence?.sha && !evidence.acceptance?.sha) {
       evidence = { ...evidence, acceptance: { ...(evidence.acceptance ?? {}), sha: evidence.sha } };
@@ -2162,7 +2152,6 @@ export class SurrealCompanyCore implements CompanyCore {
         IF ($cpn[0] ?? 0) >= $checkpoint_limit { THROW 'checkpoint limit reached' };
       };
       LET $next = UPDATE ONLY $task SET
-        company_upgrade = IF $has_company_upgrade THEN $company_upgrade ELSE $t.company_upgrade END,
         state = IF $submit { 'review' } ELSE IF $accept { 'done' } ELSE IF $returning { 'ready' } ELSE IF $block { 'blocked' } ELSE { $t.state },
         submitted_by = IF $submit THEN $employee ELSE $t.submitted_by END,
         current_employee = IF $heartbeat OR $checkpoint THEN $employee ELSE NONE END,
@@ -2216,7 +2205,7 @@ export class SurrealCompanyCore implements CompanyCore {
         actor: id('employee', actor.employeeId), employee: actor.employeeId,
         task: id('task', proof.taskId), delivery: proof.deliveryId,
         fence: proof.fence, expected: proof.expectedVersion, lease_seconds: this.leaseSeconds,
-        ...flags, action, has_company_upgrade: companyUpgrade !== undefined, company_upgrade: companyUpgrade, recovery_reason: undefined, evidence: evidence?.text ?? '', to: to ?? '', checkpoint_limit: this.checkpointLimit,
+        ...flags, action, recovery_reason: undefined, evidence: evidence?.text ?? '', to: to ?? '', checkpoint_limit: this.checkpointLimit,
         acceptance_head: acceptance?.head ?? null, acceptance_environment: acceptance?.environment ?? null,
         has_head: acceptance?.head !== undefined, has_environment: acceptance?.environment !== undefined,
         human_evidence: acceptance?.human ?? [],
@@ -2343,9 +2332,8 @@ export class SurrealCompanyCore implements CompanyCore {
   async block(credential: Credential, proof: LeaseProof, to: 'owner', evidence: Evidence, quotaResetsAt?: string, fault?: FaultInput): Promise<TaskView> {
     const until = quotaResetsAt === undefined ? undefined : parseQuotaResetsAt(quotaResetsAt, Date.now());
     const actor = await this.authenticate(credential);
-    // A structured upgrade is an install request, validated against main and the current lease by transition.
     // Every ordinary block is checked before recording faults, quota gates, audit or changing the task/lease.
-    if (evidence.companyUpgrade === undefined) await this.assertCiBlockAllowed(proof, actor.employeeId, [evidence.text]);
+    await this.assertCiBlockAllowed(proof, actor.employeeId, [evidence.text]);
     // The fault is recorded before the state change, so a crash between the two leaves the attempt charged (the
     // attempt really happened) rather than a block that no budget accounts for.
     if (fault !== undefined) await this.reportTaskFault(actor.employeeId, proof.taskId, fault);

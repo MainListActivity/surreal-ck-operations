@@ -2,9 +2,9 @@ import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 import { releaseNotesSchema } from '../src/company-release.ts';
 
-// The release notes are the material the upgrade card is built from: `readCompanyRelease` parses them with
-// `releaseNotesSchema` and refuses anything else. A green CI that ships notes the schema rejects leaves the
-// upgrade unregistrable, so the contract is checked here on every pull request.
+// company-release.json holds this release's notes (title, changes, impact, migration, rollback). The release job
+// reads only its version, but the notes must still satisfy `releaseNotesSchema`; checking the contract here on
+// every pull request keeps a non-conforming notes file from reaching main.
 const ROOT = join(import.meta.dir, '..');
 
 const notes = JSON.parse(await Bun.file(join(ROOT, 'company-release.json')).text()) as Record<string, unknown>;
@@ -38,7 +38,7 @@ describe('the release notes are registrable', () => {
 
   test('the notes name the schema they add', () => {
     const text = JSON.stringify(notes);
-    expect(text).toContain('060');
+    expect(text).toContain('061');
   });
 
   test('the limits are real: an eleventh change or a long one is refused', () => {
