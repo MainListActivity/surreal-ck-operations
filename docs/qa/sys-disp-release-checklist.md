@@ -112,7 +112,7 @@
 
 1. 先由经理用 `def_ensure` 暂停受影响编制（做法同 §6），并先记录原 `enabled` 值。
 2. 旧代码失去新绑定防护时，先冻结相关新派工，保留全部新作者、绑定、审计与租约。完成兼容验证后才恢复派工。
-3. 回滚同时恢复 MCP `active` 与插件固定来源：`install <previous-release>` 加 `plugin install <previous-release>/plugin`，命令形式与顺序以 company-service-operations.md「双面回滚」为准，然后重做 §7 的验证。不能只切 `active`，不能删除新字段。
+3. 回滚同时恢复 MCP `active` 与插件版本：先停用节点更新器（`sh scripts/node-updater.sh uninstall`），再用当前受审 release 的 `install <previous-release>` 切回 MCP，最后按 company-upgrades.md「手动回退」把插件指回上一版目录。命令形式与顺序以 company-service-operations.md「回滚」为准，然后重做 §7 的验证。不能只切 `active`，不能删除新字段。
 4. 旧版忽略 `implementer_bound_at`，保留该字段不影响回滚。
 5. 回滚后的编制恢复（F-C，回滚路径）：回滚后的 §7 层 1 至层 3 验证全部通过，再按 §6 记录的原 `enabled` 值逐个恢复；原本即为 false 的保持 false。不归档作者，不减少席位，不启用原停用渠道。
 6. 回滚失败时保留现场并报阻塞。不回退到 v3 历史树作为生产来源。

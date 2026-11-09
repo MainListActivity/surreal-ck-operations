@@ -57,7 +57,7 @@ test('template bodies are the exact minimal sentences', () => {
   expect(templateFor('execute', true)).toContain('合入 main');
   expect(templateFor('execute', true)).toContain('安装到生产由老板侧完成');
   expect(templateFor('execute', true)).toContain('不要安装');
-  expect(templateFor('execute', true)).toContain('不要登记升级卡');
+  expect(templateFor('execute', true)).not.toContain('升级卡');
   expect(templateFor('execute', true)).not.toContain('发布到生产');
   expect(templateFor('execute', true)).not.toContain('在生产逐条自验');
   expect(templateFor('execute', false)).not.toContain('合入 main');

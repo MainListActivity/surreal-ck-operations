@@ -101,7 +101,7 @@ run('运维作业认领：两个执行端并发 drain 同一 queued 作业，ops
   const deps = (name: string, db: CompanyDatabase): OpsJobDeps => ({
     db: db.db, runner: name, runnerOnlyCommands: new Set<string>(),
     opsCall: async () => { calls.push(name); return { ok: true, by: name }; },
-    runnerOnly: async () => ({}), hostExec: async () => ({ exitCode: 0 }), releaseInstall: async () => ({ installed: true }),
+    runnerOnly: async () => ({}), hostExec: async () => ({ exitCode: 0 }),
   });
   const a = new OpsJobRunner(deps('runner-a', dbA));
   const b = new OpsJobRunner(deps('runner-b', dbB));

@@ -65,7 +65,6 @@ function deps(over: Partial<OpsJobDeps> & { db: Surreal }): OpsJobDeps {
     opsCall: async () => ({ ok: true }),
     runnerOnly: async () => ({ only: true }),
     hostExec: async () => ({ exitCode: 0 }),
-    releaseInstall: async () => ({ installed: true }),
     ...over,
   };
 }
@@ -75,13 +74,12 @@ const find = (rows: Row[], key: string) => rows.find(row => String(row.id) === `
 const parsedResult = (rows: Row[], key: string): unknown => JSON.parse(String(find(rows, key).result));
 
 describe('路由与终态', () => {
-  test('ops_*、runner-only、host.exec、company.release.install 各自路由到对应注入函数并写入 done', async () => {
+  test('ops_*、runner-only、host.exec 各自路由到对应注入函数并写入 done', async () => {
     const calls: Array<[string, unknown]> = [];
     const rows = [
       job('ops', 'ops_info'),
       job('only', 'company.dashboard', { input: { a: 1 } }),
       job('host', 'host.exec', { input: { host: 'arm-free-1', command: 'echo hi', timeoutSec: 5 } }),
-      job('release', 'company.release.install', { input: { sha: 'a'.repeat(40) } }),
     ];
     const { db } = fakeDb(rows);
     const runner = new OpsJobRunner(deps({
@@ -89,18 +87,15 @@ describe('路由与终态', () => {
       opsCall: async (j) => { calls.push(['opsCall', j]); return { tool: j.tool }; },
       runnerOnly: async (j) => { calls.push(['runnerOnly', j]); return { only: true }; },
       hostExec: async (i) => { calls.push(['hostExec', i]); return { exitCode: 0 }; },
-      releaseInstall: async (i) => { calls.push(['releaseInstall', i]); return { installed: true }; },
     }));
-    expect(await runner.drain()).toBe(4);
+    expect(await runner.drain()).toBe(3);
     expect(calls).toEqual([
       ['opsCall', { actor: 'agent-1', task: 'task-1', tool: 'ops_info', args: {} }],
       ['runnerOnly', { command: 'company.dashboard', input: { a: 1 } }],
       ['hostExec', { host: 'arm-free-1', command: 'echo hi', timeoutSec: 5 }],
-      ['releaseInstall', { sha: 'a'.repeat(40) }],
     ]);
     expect(find(rows, 'ops')).toMatchObject({ state: 'done', runner: 'plugin:1', result: JSON.stringify({ tool: 'ops_info' }) });
     expect(parsedResult(rows, 'host')).toEqual({ exitCode: 0 });
-    expect(parsedResult(rows, 'release')).toEqual({ installed: true });
   });
 
   test('未知命令得到 invalid 且消息为“未知命令”', async () => {
@@ -217,7 +212,7 @@ describe('作业字段形状（058）', () => {
   });
 });
 
-describe('host.exec 与 company.release.install 输入校验', () => {
+describe('host.exec 输入校验', () => {
   const badHost: Array<[string, unknown]> = [
     ['host 非字符串', { host: 1, command: 'ls' }],
     ['command 为空', { host: 'arm-free-1', command: '   ' }],
@@ -238,16 +233,6 @@ describe('host.exec 与 company.release.install 输入校验', () => {
     expect(String(find(rows, 'h').error).startsWith('invalid: ')).toBe(true);
   });
 
-  const badSha = ['A'.repeat(40), 'a'.repeat(39), 'g'.repeat(40), 'a'.repeat(41), 12345];
-  test.each(badSha)('company.release.install：sha=%p → invalid，不调用 releaseInstall', async (sha) => {
-    let called = 0;
-    const rows = [job('r', 'company.release.install', { input: { sha } })];
-    const runner = new OpsJobRunner(deps({ db: fakeDb(rows).db, releaseInstall: async () => { called++; return {}; } }));
-    await runner.drain();
-    expect(called).toBe(0);
-    expect(find(rows, 'r')).toMatchObject({ state: 'error' });
-    expect(String(find(rows, 'r').error).startsWith('invalid: ')).toBe(true);
-  });
 });
 
 describe('结果体积与脱敏', () => {
@@ -267,6 +252,12 @@ describe('结果体积与脱敏', () => {
     expect(Buffer.byteLength(String(stored.result), 'utf8')).toBeLessThanOrEqual(64 * 1024);
     expect(String(stored.result)).not.toContain('sk-test-secret-123');
     expect(result.preview).toContain('[redacted]');
+  });
+
+  test('长串字母的结果脱敏耗时线性增长（URL 凭证正则不得平方级回溯）', () => {
+    const started = performance.now();
+    storeResult({ blob: 'a'.repeat(128 * 1024) });
+    expect(performance.now() - started).toBeLessThan(1500);
   });
 
   test('未超过上限的结果脱敏后作为 JSON 文本存入', () => {

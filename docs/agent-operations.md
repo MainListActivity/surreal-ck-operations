@@ -13,7 +13,7 @@
 
 数据位于**本机 SurrealDB**：连接地址与 root 凭证在 `private/company-db.env`（`scripts/company-db.sh install` 生成，优先于产品 `.env`；测试环境不隐式读取）。产品数据仍在 129，由产品 `.env` 描述。备份由 `scripts/company-backup.ts` 完成：zstd 压缩，单文件超过 20MB 拒传并发老板通知，R2 上保留 2 份小时备份加若干每日备份，总量不超过 40MB；`verify` 把最新备份恢复到临时内存库核对行数。运营流水按 `src/data-retention.ts` 的保留期由插件生命周期清理删除。
 
-服务目录：`~/Library/Application Support/SurrealCKCompany/`（`active` 指向固定发布目录；`private/` 为配置与凭证，0700；`logs/` 为日志）。安装、启停：发布目录内 `sh scripts/company-service.sh install|status|restart|stop|uninstall`，默认只管理 `mcp`（任务服务 + GitHub 投影）。调度器、员工通道和运维代理都跑在 Paseo 插件 `sck-company` 里，改了 `plugin/` 或 `src/` 后用 `$PASEO_CLI plugin reload sck-company` 重载（不要重启 Paseo 守护进程）；**不要再装 launchd 的 dispatcher**（`SCK_COMPONENTS=dispatcher` 仅为旧部署保留），否则会和插件重复派工。服务依赖本机 Paseo、SurrealDB、网络与 GitHub 登录；Mac 合盖或关机时公司暂停。
+服务目录：`~/Library/Application Support/SurrealCKCompany/`（`active` 指向固定发布目录；`private/` 为配置与凭证，0700；`logs/` 为日志）。安装、启停：发布目录内 `sh scripts/company-service.sh install|status|restart|stop|uninstall`，默认只管理 `mcp`（任务服务 + GitHub 投影）。调度器、员工通道和运维代理都跑在 Paseo 插件 `sck-company` 里。节点上的插件版本由节点更新器按 Release 切换（见 [company-upgrades.md](company-upgrades.md)），不要手工 `plugin install` 或 `reload` 来升级。本机调试改了 `plugin/` 或 `src/` 时，可用 `$PASEO_CLI plugin reload sck-company` 重载（不要重启 Paseo 守护进程）；开发树登记会被节点更新器拒绝切换，调试结束后执行 `paseo plugin remove sck-company`，再运行 `sh scripts/node-updater.sh run` 重新登记发行版本；**不要再装 launchd 的 dispatcher**（`SCK_COMPONENTS=dispatcher` 仅为旧部署保留），否则会和插件重复派工。服务依赖本机 Paseo、SurrealDB、网络与 GitHub 登录；Mac 合盖或关机时公司暂停。
 
 ## 老板入口
 
@@ -122,11 +122,11 @@ sck call company_cmd '{"command":"<命令名>","input":{...}}'
 - `company_cmd_catalog` 列出本员工当前能调用的命令，附参数说明（网关 `cmd.catalog`）。员工看不到三类命令：仅老板命令、保护清单里标为仅老板的命令、员工策略的禁止清单或允许清单之外的命令；员工已停用时列表为空。按目标锁定的命令仍会列出，并附锁定说明，命中即拒绝。老板看到全部命令。目录只说明能用什么，每次调用仍要过网关判定。命令说明集中在 `owner-end/src/command-catalog.ts`，老板端「运维」页的命令面板与之共用。
 - `company_cmd` 只在云端执行端可用。本机模式返回 `not_configured`，提示需要云端执行端。
 - 调用必须持有任务。无有效租约直接以 `no_lease` 拒绝，不换取令牌。调用以员工身份和当前租约任务换取网关令牌。请求顶层的 `taskId` 被丢弃；`input` 里点名的 `taskId`（可带 `task:` 前缀）与 `messageId` 必须属于当前租约任务，否则拒绝。
-- 执行端作业（如 `host.exec`、`company.release.install`）返回 pending 时，员工侧按作业号轮询，直到完成、失败或超过 15 分钟。员工只能取到自己发起的作业。
+- 执行端作业（如 `host.exec`）返回 pending 时，员工侧按作业号轮询，直到完成、失败或超过 15 分钟。员工只能取到自己发起的作业。
 - 每次调用（含被拒绝的和只读的）写一条审计。老板用 `guard.protect` 把命令加入保护清单（`ownerOnly` 缺省为仅老板），用 `agent.policy.set` 停用员工或设允许、禁止清单。
 - 令牌只在网关调用的局部变量里存在。返回与错误文本中出现的令牌一律替换，不写会话、comm 目录、证据或日志。
 
-**风险（待审阅者决定）。** 网关不区分调用方是否老板。除写死的 5 条仅老板命令、员工不可见的 `ops.job.list` 与 `audit.list`、保护清单与员工策略外，持有有效租约的员工可以调用其余全部命令；按目标锁定的命令只拒绝锁定的目标。这包括替老板作决定（`decide`、`approve`、`reject`；`approve` 会写入标为老板签署的人工验收证据）、代老板下指示（`instruct`、`direction.add`）、改路由与派工模板（`route.save`）、暂停全部派工（`task.pause`）、用老板的 Cloudflare 令牌调用未锁定的账号资源（`cf.api`），以及执行端命令（`host.exec`、`company.release.install`、`upgrade.*`、`task.create`）。执行端作业入队后，只有 `ops_*` 在认领时核对租约，其余作业即使租约已结束也会执行。上线前，老板应把这些命令加入保护清单，或由审阅者决定写死为仅老板。细节见 [owner-end 权限模型](../owner-end/README.md#权限模型)。
+**风险（待审阅者决定）。** 网关不区分调用方是否老板。除写死的 5 条仅老板命令、员工不可见的 `ops.job.list` 与 `audit.list`、保护清单与员工策略外，持有有效租约的员工可以调用其余全部命令；按目标锁定的命令只拒绝锁定的目标。这包括替老板作决定（`decide`、`approve`、`reject`；`approve` 会写入标为老板签署的人工验收证据）、代老板下指示（`instruct`、`direction.add`）、改路由与派工模板（`route.save`）、暂停全部派工（`task.pause`）、用老板的 Cloudflare 令牌调用未锁定的账号资源（`cf.api`），以及执行端命令（`host.exec`、`task.create`）。执行端作业入队后，只有 `ops_*` 在认领时核对租约，其余作业即使租约已结束也会执行。上线前，老板应把这些命令加入保护清单，或由审阅者决定写死为仅老板。细节见 [owner-end 权限模型](../owner-end/README.md#权限模型)。
 
 ## 员工编制（SurrealDB）
 

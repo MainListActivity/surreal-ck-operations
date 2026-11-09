@@ -1,5 +1,7 @@
 import { DispatchTimings } from "./vendor/src/diagnostics.ts";
 import { RUNNER_BEAT_MS, writeBoardView, writeRunnerHeartbeat } from "./vendor/src/board.ts";
+import { beatNodeRelease } from "./vendor/src/node-release.ts";
+import { RELEASE } from "./release-stamp";
 import { openUserPaths, scratchKeepReason } from "./vendor/src/dispatcher/scratch-gc.ts";
 import { pruneOperationalData } from "./vendor/src/data-retention.ts";
 import { magpieSessionRows, recordPendingTaskCosts } from "./vendor/src/task-cost.ts";
@@ -80,10 +82,6 @@ let quotaRefreshedAt = 0;
 /** Lifecycle GC (dead comm channels + cold archive) runs on its own slow clock. */
 let gcRefreshedAt = 0;
 const GC_MS = 30 * 60_000;
-/** Closing the version cards an install already answered is cheap but not per-tick work. */
-let upgradeClosureAt = 0;
-let autoUpgradeAt = 0;
-let autoUpgradePending = false;
 // Model family matchers: an `auto:<family>` def resolves to the newest id of that family
 // among the provider's selectable models. Families are deliberately narrow so a provider
 // publishing an unrelated line (e.g. gpt-7, or a renamed workhorse) never silently switches.
@@ -335,8 +333,11 @@ export function lastRunnerBeatAt(): number | undefined { return lastBeatAt; }
 function beatRunner(): void {
   void company()
     .then(async ctx => {
-      const installed = await ctx.upgrades.installed().catch(() => undefined);
-      await writeRunnerHeartbeat(ctx.db.db, { runner: `plugin:${process.pid}`, host: hostname(), version: installed?.version ?? "unknown" });
+      const version = await ctx.runnerVersion().catch(() => "unknown");
+      await writeRunnerHeartbeat(ctx.db.db, { runner: `plugin:${process.pid}`, host: hostname(), version });
+      // 节点记录：同一次心跳里登记本执行端的节点、主机与发行版本；失败只记 warn，与运行心跳一致。
+      await beatNodeRelease(ctx.db, { node: ctx.nodeId, host: hostname(), platform: process.platform, version, sha: RELEASE.sha, at: Math.floor(Date.now() / 1000) })
+        .catch(error => console.warn(`node release heartbeat failed: ${(error as Error).message}`));
       lastBeatAt = Date.now();
     })
     .catch(error => console.warn(`runner heartbeat failed: ${(error as Error).message}`));
@@ -469,23 +470,6 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
           await timing.measure("gc", () => runLifecycleGc(ctx)).catch((error) => console.warn(`lifecycle gc failed: ${(error as Error).message}`));
         }
         const report = await timing.measure("tick", () => ctx.dispatcher.tick());
-        // An installed version answers every older pending version card, however it got installed: through the upgrade
-        // job, by hand, or before this process started. The job closes its own batch right after verifying; this pass
-        // catches everything else, and a card it cannot close stays put for the next tick.
-        if (Date.now() - upgradeClosureAt > 600_000) {
-          upgradeClosureAt = Date.now();
-          await timing.measure("upgrade-closure", async () => {
-            const now = await ctx.upgrades.installed();
-            if (now) await ctx.upgrades.closeSuperseded(now, "system:dispatcher");
-          }).catch((error) => console.warn(`superseded upgrade cards left open: ${(error as Error).message}`));
-        }
-        if (!autoUpgradePending && Date.now() - autoUpgradeAt > 60_000) {
-          autoUpgradeAt = Date.now();autoUpgradePending = true;
-          // Version validation and DB round trips must not hold up dispatch.
-          void ctx.upgrades.autoStart()
-            .catch(error=>console.warn(`automatic upgrade deferred: ${(error as Error).message}`))
-            .finally(()=>{autoUpgradePending=false;});
-        }
         await timing.measure("observation", () => persistDispatchObservation(ctx)).catch((error) => console.warn(`dispatch observation write failed: ${(error as Error).message}`));
         await timing.measure("board", () => persistBoardView(ctx)).catch((error) => console.warn(`board view write failed: ${(error as Error).message}`));
         failures = 0;

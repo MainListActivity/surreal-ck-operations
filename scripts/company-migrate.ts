@@ -1,7 +1,7 @@
 // 云端公司库迁移：bun scripts/company-migrate.ts（不带参数）
 //
 // 只从环境变量读配置（loadDatabaseConfig），只用于云端：必须设置 COMPANY_DB_URL。
-// 以 migrator 令牌登录（不用 root 账号），流程：连接 → 选定 ns/db → 核对库归属（claimDatabase）→ 按序应用 schema 001 至 057。
+// 以 migrator 令牌登录（不用 root 账号），流程：连接 → 选定 ns/db → 核对库归属（claimDatabase）→ 按序应用全部 schema 文件。
 // 不做 namespace / database 的 DEFINE，也不跑本机 bootstrap。失败时输出“结果: 失败”并非零退出。
 // 输出不含令牌、client secret 或带凭证的 URL。
 import { loadDatabaseConfig, type DatabaseConfig } from '../src/config.ts';
@@ -30,7 +30,7 @@ export async function migrateCompanySchema(db: CompanyDatabase, log: MigrateLog)
   log('阶段 2/3：核对库归属（claimDatabase）');
   const fresh = await db.claimDatabase();
   log(fresh ? '  空库：按新装处理' : '  已有公司库：按序补齐 schema');
-  log('阶段 3/3：应用 schema 001 至 057');
+  log('阶段 3/3：按序应用全部 schema 文件');
   await db.applySchema(fresh);
   return { fresh };
 }

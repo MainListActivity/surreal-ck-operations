@@ -20,7 +20,7 @@
 
 全量回归另发现 origin/main 原有过时断言（已在未修改的 main 快照复现）：GM 测试未提供持久唤醒 API、旧测试把项目身份与员工私有 cwd 混为一谈、snapshot 测试固定旧 schema 版本、GitHub 投影测试仍期待单事件故障终止整批投影。本次补齐测试桩、分别核对私有 cwd 与 repoHome、允许后续 schema 迁移，并核对投影失败事件保持待重试。
 
-发布必须跑根/插件 typecheck、全量 fork 回归、PR CI 和当前 SHA 的 slow-pipe / sidecar-review 本机门禁。两面发布和回滚遵循 `docs/company-service-operations.md`；保留上一固定版本，回滚同时恢复 MCP 与插件来源。配置回滚单独恢复发布前记录的值。
+发布前须通过根/插件 typecheck 与 PR CI；全量 fork 回归不再由脚本强制执行，需手动运行（`bun scripts/test-worktrees.ts <文件>`）并把结果写进部署记录。合入 main 后，发布 job 发布插件发行包，各执行端的节点更新器自动升级插件（见 `docs/company-upgrades.md`）；MCP 服务仍按 `docs/company-service-operations.md` 手动切换，回滚同时恢复 MCP 与插件来源。配置回滚单独恢复发布前记录的值。
 
 老板审批关口不属于技术故障，继续由老板本人决定；本修复不代批内容。孤儿进程、磁盘归档、status-tunnel、防睡眠和 Paseo daemon 托管属于独立主机维护范围，未在本变更中修改。
 

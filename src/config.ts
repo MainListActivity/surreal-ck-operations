@@ -92,7 +92,7 @@ export function loadDatabaseConfig(): DatabaseConfig {
   };
   // 云端执行端：COMPANY_DB_URL 存在即走令牌模式，命名空间与库来自 COMPANY_NS / COMPANY_DB（默认 company / main）。
   // 测试进程只认环境变量里显式给的云端地址：服务目录 company-db.env 里的 COMPANY_DB_URL 是生产执行端用的，
-  // 测试运行器把 SURREAL_URL 指向临时 fork，不能被它盖过（否则发布门禁的 fork 测试全部被拒）。
+  // 测试运行器把 SURREAL_URL 指向临时 fork，不能被它盖过（否则 fork 测试全部被拒）。
   const cloudUrl = process.env.NODE_ENV === 'test' ? process.env.COMPANY_DB_URL || undefined : lookup('COMPANY_DB_URL');
   const cloud = !!cloudUrl;
   const namespace = cloud ? lookup('COMPANY_NS') ?? 'company' : process.env.SCK_COMPANY_NS ?? 'sck_agent_company';

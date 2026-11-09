@@ -1,9 +1,11 @@
-import { resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { loadDatabaseConfig } from '../config.ts';
 import { CompanyDatabase } from '../database.ts';
 import { OwnerDesk } from '../owner.ts';
 import { SurrealCompanyCore } from '../core.ts';
+import { ensureNodeId } from '../node-identity.ts';
 import { Workforce } from '../workforce.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { jevFromEnv } from './jev.ts';
@@ -33,7 +35,7 @@ process.once('SIGTERM', () => stop.abort());
 try {
   await db.bootstrap();
   const workforce = new Workforce(db, resolve(required('SCK_CREDENTIAL_DIR')));
-  const core = new SurrealCompanyCore(db);
+  const core = new SurrealCompanyCore(db, { nodeId: ensureNodeId(process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library/Application Support/SurrealCKCompany')) });
   const dispatcher = new Dispatcher({
     workforce, owner: new OwnerDesk(db, required('SCK_AGENT_CWD')), paseo: createPaseoCli(),
     env: { opsRepo: required('SCK_AGENT_CWD'), sckBin: required('SCK_TOOL_BIN'),

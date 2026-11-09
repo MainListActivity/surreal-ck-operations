@@ -23,7 +23,6 @@ const proofShape = {
   expectedVersion: z.number().int().nonnegative(),
 };
 const evidenceShape = {
-  companyUpgrade: z.object({ sha:z.string().regex(/^[a-f0-9]{40}$/) }).strict().optional(),
   text: z.string().min(1),
   idempotencyKey: z.string().min(1),
   // SYS02: the head a submission is bound to; machine evidence must match it.

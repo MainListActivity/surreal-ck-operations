@@ -138,7 +138,7 @@ bun run build                                  # 生成 public/app.js
 
 ### 执行端作业
 
-需要执行端宿主的命令（`RUNNER_ONLY_COMMANDS`、`ops_*`、`host.exec`、`company.release.*`，见 `src/commands.ts` 的 `isRunnerCommand`）会排队到 `ops_job`。员工发起的作业记录员工与任务。网关最多等 25 秒：完成则返回结果，失败则返回对应错误码，超时返回 `pending`。`ops.job.list` 和 `ops.job.get` 用来查询作业；员工只能查询本人发起的作业，`ops.job.list` 对员工拒绝。
+需要执行端宿主的命令（`RUNNER_ONLY_COMMANDS`、`ops_*`、`host.exec`，见 `src/commands.ts` 的 `isRunnerCommand`）会排队到 `ops_job`。员工发起的作业记录员工与任务。网关最多等 25 秒：完成则返回结果，失败则返回对应错误码，超时返回 `pending`。`ops.job.list` 和 `ops.job.get` 用来查询作业；员工只能查询本人发起的作业，`ops.job.list` 对员工拒绝。
 
 ## 权限模型
 
@@ -158,7 +158,7 @@ bun run build                                  # 生成 public/app.js
   8. 员工拒绝清单（`OWNER_ONLY_FOR_AGENTS`：`ops.job.list`、`audit.list`，它们记录其它员工和老板的操作）；
   9. `ops.job.get` 只能取本员工发起的作业。
 
-  通过后：执行端命令（`RUNNER_ONLY_COMMANDS`、`ops_*`、`host.exec`、`company.release.*`）以员工身份排队到 `ops_job`；`db.read` 用查看者令牌执行（只读）；其余命令用网关令牌执行。员工不再有只读白名单，写命令同样按上面的判定放行。
+  通过后：执行端命令（`RUNNER_ONLY_COMMANDS`、`ops_*`、`host.exec`）以员工身份排队到 `ops_job`；`db.read` 用查看者令牌执行（只读）；其余命令用网关令牌执行。员工不再有只读白名单，写命令同样按上面的判定放行。
 
   插件把 `ops_*`、`company_cmd` 与 `company_cmd_catalog`（网关的 `cmd.catalog`）、`def_list` 与 `def_ensure` 转发到网关（`def.*` 对员工拒绝）。任务流工具（checkpoint、submit、review 等）仍在本机执行，直连数据库，不经过网关。`company_cmd` 把员工的任意命令转给网关，所以员工经插件能到达的范围与网关一致，见下节。
 - **系统身份**（`gateway`、`runner`、`automation`、`migrator`、`viewer`）：不能调用网关接口。运行器和定时任务调用老板命令会被拒绝，并写入审计。
@@ -171,7 +171,7 @@ bun run build                                  # 生成 public/app.js
 - **代老板下指示或改方向**：`instruct`（新建任务，正文标为「老板原话」）、`direction.add`（写入公司方向）。
 - **改派工规则**：`route.save`、`route.disable`（路由与派工模板）；`task.pause`（暂停全部派工）；`task.void`、`task.delete`、`task.reassign`、`task.revoke`。
 - **云端资源**：`cf.api` 用老板的 Cloudflare 令牌调用 `/accounts/<账号>/` 下的接口。只锁定老板端与 ma_hono 的 Worker、D1、API 令牌、`maplayer.top` 域名下的写操作，其它账号资源不受限。
-- **执行端命令**：`host.exec`（在 `arm-free-1` 上以 `sck-agent` 用户执行命令）、`company.release.install`、`upgrade.*`、`task.create`。执行端作业入队后，只有 `ops_*` 在认领时核对租约，其余作业即使租约已结束也会执行。
+- **执行端命令**：`host.exec`（在 `arm-free-1` 上以 `sck-agent` 用户执行命令）、`task.create`。执行端作业入队后，只有 `ops_*` 在认领时核对租约，其余作业即使租约已结束也会执行。
 
 守卫里写死的只有 `HARD_OWNER_ONLY` 的 5 条。老板可以用 `guard.protect` 把命令加入保护清单（`ownerOnly` 缺省为仅老板），或在员工策略（`agent.policy.set`）里设禁止清单。上线前应先把上面的命令加入保护清单。是否写死为仅老板，由审阅者决定。
 
@@ -179,7 +179,6 @@ bun run build                                  # 生成 public/app.js
 
 - 写操作、员工的全部调用（含被拒绝的和只读的），以及老板的非只读命令，都写入 `ops_audit`。审计只存参数摘要（`args_digest`）和一句摘要（`summary`，不超过 500 字符），不存原文。
 - 老板的只读命令不审计，否则看板的反复刷新会淹没真正的操作。只读判定是：`status`、`progress`、`brief`、`inbox`、`board.snapshot`、`cmd.catalog`、`db.read`、`translate.preview`、`idp.status`、`idp.user.list_agents`，以及以 `.list`、`.get`、`.detail`、`.preview`、`.plan`、`.consolidations`、`.records` 结尾的命令。
-- 例外：`upgrade.list` 以 `.list` 结尾，因此也不审计。见「已知偏离」。
 
 ## 译文与投递
 
@@ -237,17 +236,16 @@ bun run build                                  # 生成 public/app.js
 1. **服务主体与公司租户。** `IDP_ADMIN_TOKEN` 对应的 ma_hono 服务主体已有全部 8 个 scope，公司租户已存在，`IDP_TENANT_ID` 已填入。`idp.*` 管理命令可以直接使用；作用于公司租户的写入，以及服务主体与其它管理路径的写入，员工不能调用（见「权限模型」）。
 2. **`surrealdb` 解析自仓库根。** `owner-end/package.json` 没有声明 `surrealdb`，它来自根目录的 `node_modules`，版本见根目录 `package.json`。
 3. **页面不用 cookie。** 页面用 PKCE 取得访问令牌，令牌只放在页面内存里，并同步到 `sessionStorage`（键 `sck.owner.session`），不用 localStorage。所有接口只认 `Authorization: Bearer`。
-4. **`upgrade.list` 不审计。** 它以 `.list` 结尾，按只读命令处理。测试已锁定这一行为。
-5. **员工写命令的审计标签。** 员工的写命令经网关执行时，核心记录的操作人标签是 `owner:agent`（`src/owner-api.ts`）；网关的 `ops_audit` 行记录的是员工身份（`actorKind=agent`）。同一次调用可能有两层记录，看审计时以员工身份为准。
-6. **员工能调用的命令范围变大，需要复核。** 员工的只读白名单已移除，网关按「权限模型」判定放行。插件用 `company_cmd` 把员工的调用转给网关，员工能到达的范围因此与网关一致，只扣除守卫拒绝的部分，见「员工可达的范围」。`HARD_OWNER_ONLY` 只写死 5 条，`host.exec`、`company.release.*`、`upgrade.*` 与 `task.create` 不在其中。建议老板把它们和其它高危命令加入「仅老板」清单；若要写死为仅老板，需要审阅者决定（改 `HARD_OWNER_ONLY` 会与既有测试的固定清单冲突）。
-7. **执行端作业的结果由插件轮询取回。** 作业超过 25 秒返回 `pending` 时，插件的网关客户端（`src/cloud/gateway.ts`）按作业号轮询 `ops.job.get`，最长 15 分钟，员工收到的是最终结果或错误。轮询只能取到本员工发起的作业。
-8. **执行端的命令不核对员工租约。** `task.create`、`upgrade.*` 在执行端以无员工身份的方式执行（`src/cloud/ops-jobs.ts` 的 `runnerOnly` 分支只接收命令与输入）；`host.exec` 与 `company.release.install` 同样不核对（`mayClaim` 只对 `ops_*` 作业核对租约）。员工的身份与租约只在网关入队时判定，作业入队后即使租约已结束也会执行。
-9. **`ops.job.list`、`audit.list` 的拒绝不是数据层边界。** 这两条只在网关拒绝。viewer 令牌的 `db.read` 理论上能直接读 `ops_audit` 与 `ops_job`，因为系统用户不受表权限约束（见 `schema/056` 的注释）。要在数据层收紧，需要另做 schema 改动。
-10. **按目标的硬锁只作用于网关。** 它们只对经网关的调用生效。插件本机的任务流工具直连数据库，不经网关。
-11. **`Bun.sleep` 与 `process.env` 的残留。** `src/mcp/client-cli.ts` 仍用 `Bun.sleep` 与 `Bun.sleepSync`，它不在 Worker 的依赖闭包里。`src/owner-api.ts` 读取 `SCK_OWNER_TOKEN`，只在 `task.create` 的本机分支里用到，Worker 不走这个分支（RUNNER_ONLY 命令先排队）。`scripts/worker-compat-check.ts` 不检查 `process.env`，这一点靠代码审阅确认。
-12. **译文没有用真实服务验证。** 测试和截图用的是本地替身，译文形如 `[EN stub] 原文`。译文质量、延迟和费用需要接入真实译文服务后再验证。
-13. **`wrangler.jsonc` 指向生产库。** 本地开发必须用 `.dev.vars` 覆盖，见「本地开发」。
-14. **390px 下导航条横向滚动。** 这是设计如此，没有改。
-15. **员工与权限页的截图较旧。** `desktop-permissions.png` 拍于「按目标锁定」与「员工拒绝清单」区块加入之前，这两块还没有截图。
-16. **替老板作决定的命令不检查调用方。** `ownerApi` 只把来源记为 `owner:agent`，不判断调用者是否老板。`decide`、`approve`、`reject`、`instruct`、`direction.add`、`route.save` 等命令对持有有效租约的员工同样放行。决定类命令另有任务状态检查（如 `approve` 只对等待老板复核的任务生效）。见「员工可达的范围」。
-17. **`cf.api` 对员工只锁定老板端与 ma_hono 资源。** 员工持有租约即可用老板的 Cloudflare 令牌调用 `/accounts/<账号>/` 下的其它接口（GET、POST、PUT、PATCH、DELETE）。
+4. **员工写命令的审计标签。** 员工的写命令经网关执行时，核心记录的操作人标签是 `owner:agent`（`src/owner-api.ts`）；网关的 `ops_audit` 行记录的是员工身份（`actorKind=agent`）。同一次调用可能有两层记录，看审计时以员工身份为准。
+5. **员工能调用的命令范围变大，需要复核。** 员工的只读白名单已移除，网关按「权限模型」判定放行。插件用 `company_cmd` 把员工的调用转给网关，员工能到达的范围因此与网关一致，只扣除守卫拒绝的部分，见「员工可达的范围」。`HARD_OWNER_ONLY` 只写死 5 条，`host.exec` 与 `task.create` 不在其中。建议老板把它们和其它高危命令加入「仅老板」清单；若要写死为仅老板，需要审阅者决定（改 `HARD_OWNER_ONLY` 会与既有测试的固定清单冲突）。
+6. **执行端作业的结果由插件轮询取回。** 作业超过 25 秒返回 `pending` 时，插件的网关客户端（`src/cloud/gateway.ts`）按作业号轮询 `ops.job.get`，最长 15 分钟，员工收到的是最终结果或错误。轮询只能取到本员工发起的作业。
+7. **执行端的命令不核对员工租约。** `task.create` 在执行端以无员工身份的方式执行（`src/cloud/ops-jobs.ts` 的 `runnerOnly` 分支只接收命令与输入）；`host.exec` 同样不核对（`mayClaim` 只对 `ops_*` 作业核对租约）。员工的身份与租约只在网关入队时判定，作业入队后即使租约已结束也会执行。
+8. **`ops.job.list`、`audit.list` 的拒绝不是数据层边界。** 这两条只在网关拒绝。viewer 令牌的 `db.read` 理论上能直接读 `ops_audit` 与 `ops_job`，因为系统用户不受表权限约束（见 `schema/056` 的注释）。要在数据层收紧，需要另做 schema 改动。
+9. **按目标的硬锁只作用于网关。** 它们只对经网关的调用生效。插件本机的任务流工具直连数据库，不经网关。
+10. **`Bun.sleep` 与 `process.env` 的残留。** `src/mcp/client-cli.ts` 仍用 `Bun.sleep` 与 `Bun.sleepSync`，它不在 Worker 的依赖闭包里。`src/owner-api.ts` 读取 `SCK_OWNER_TOKEN`，只在 `task.create` 的本机分支里用到，Worker 不走这个分支（RUNNER_ONLY 命令先排队）。`scripts/worker-compat-check.ts` 不检查 `process.env`，这一点靠代码审阅确认。
+11. **译文没有用真实服务验证。** 测试和截图用的是本地替身，译文形如 `[EN stub] 原文`。译文质量、延迟和费用需要接入真实译文服务后再验证。
+12. **`wrangler.jsonc` 指向生产库。** 本地开发必须用 `.dev.vars` 覆盖，见「本地开发」。
+13. **390px 下导航条横向滚动。** 这是设计如此，没有改。
+14. **员工与权限页的截图较旧。** `desktop-permissions.png` 拍于「按目标锁定」与「员工拒绝清单」区块加入之前，这两块还没有截图。
+15. **替老板作决定的命令不检查调用方。** `ownerApi` 只把来源记为 `owner:agent`，不判断调用者是否老板。`decide`、`approve`、`reject`、`instruct`、`direction.add`、`route.save` 等命令对持有有效租约的员工同样放行。决定类命令另有任务状态检查（如 `approve` 只对等待老板复核的任务生效）。见「员工可达的范围」。
+16. **`cf.api` 对员工只锁定老板端与 ma_hono 资源。** 员工持有租约即可用老板的 Cloudflare 令牌调用 `/accounts/<账号>/` 下的其它接口（GET、POST、PUT、PATCH、DELETE）。

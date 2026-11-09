@@ -62,7 +62,7 @@ try {
     // 与上面的同形态先例共用 tests/fixtures/rb01-old-runner.ts 的旧版运行时驱动器，同样只在
     // RUN_SCK_ROLLBACK_FORK_TESTS=1 时运行。
     // SYS04：故障分类与持久预算、真实 TLS 传输的回归。
-    'tests/company-upgrades.fork.test.ts', 'tests/company-upgrade-console.test.ts', 'tests/faults.test.ts', 'tests/fault-budget.fork.test.ts', // SYS05：时间/外部事件等待状态机、调度零派工与租约结束回收；fork 用例在隔离库验证原子进入、一次释放与版本锁。
+    'tests/faults.test.ts', 'tests/fault-budget.fork.test.ts', // SYS05：时间/外部事件等待状态机、调度零派工与租约结束回收；fork 用例在隔离库验证原子进入、一次释放与版本锁。
     // SYS07：目标终验图、成果证据、只读看板/指标与最终验收阻断；隔离库验证 CAS、分页、权限与历史不回写。
     // SYS07：needs_repair / goal_outcome / goal_evidence 在真实上一版运行时下的回滚隔离演练（RUN_SCK_ROLLBACK_FORK_TESTS）。
     // QA 的 SYS03 独立重演（真实 sck → 真实 sidecar → 真实 core → fork 库）；本轮起纳入本 lane 的回归，见该文件头部说明。
@@ -82,12 +82,14 @@ try {
     'tests/company-access.test.ts', 'tests/company-access.fork.test.ts', 'tests/command-guard.test.ts',
     // 老板端网关访问规则（自建隔离库应用 058，访问方式用生产的 055；058 之后 gateway 令牌写 protected_command / agent_policy 被拒、改删 ops_audit 被拒；RUN_SCK_OWNER_END_TESTS）。
     'owner-end/tests/gateway-access.fork.test.ts',
+    // 节点记录、升级结果、回退记录与租约计数（自建隔离库，RUN_SCK_NODE_RELEASE_TESTS）。
+    'tests/node-release.test.ts',
     ];
   const test = Bun.spawn([process.execPath, 'test', ...targets], { detached: true, stdout: 'inherit', stderr: 'inherit', env: {
     ...process.env, SCK_PRODUCT_ENV: '/dev/null', SURREAL_URL: `ws://127.0.0.1:${port}/rpc`, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: rootPassword,
-    // 隔离运行一律连本次自建的 fork：清掉调用方带来的云端地址（例如 release-install 在云端模式下调用发布门禁）。
+    // 隔离运行一律连本次自建的 fork：清掉调用方带来的云端地址（例如云端模式下调用的安装脚本）。
     COMPANY_DB_URL: '',
-    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_UPGRADE_FORK_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_ROLLBACK_FORK_TESTS: '1', RUN_SCK_DRILL_ACCESS_TESTS: '1', RUN_SCK_TASK_ROUTES_TESTS: '1', RUN_SCK_DB_CONNECTION_TESTS: '1', RUN_SCK_COMPANY_ACCESS_TESTS: '1', RUN_SCK_OWNER_END_TESTS: '1',
+    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_NODE_RELEASE_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_ROLLBACK_FORK_TESTS: '1', RUN_SCK_DRILL_ACCESS_TESTS: '1', RUN_SCK_TASK_ROUTES_TESTS: '1', RUN_SCK_DB_CONNECTION_TESTS: '1', RUN_SCK_COMPANY_ACCESS_TESTS: '1', RUN_SCK_OWNER_END_TESTS: '1',
   } });
   groups.push(test.pid); save();
   exit = await test.exited;

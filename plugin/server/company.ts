@@ -16,13 +16,17 @@ import { GatewayClient } from "./vendor/src/cloud/gateway.ts";
 import { AgentTokenCache } from "./vendor/src/cloud/agent-tokens.ts";
 import { OpsJobRunner } from "./vendor/src/cloud/ops-jobs.ts";
 import { hostExec } from "./vendor/src/cloud/host-exec.ts";
-import { releaseInstall } from "./vendor/src/cloud/release-install.ts";
+import { ensureNodeId } from "./vendor/src/node-identity.ts";
+import { RELEASE } from "./release-stamp";
 import { ownerApi, RUNNER_ONLY_COMMANDS } from "./vendor/src/owner-api.ts";
 import type { CloudRoute } from "./sidecar";
 import type { PaseoApi } from "@getpaseo/client";
 
 export interface Company {
-  upgrades: import("./vendor/src/company-upgrades.ts").CompanyUpgrades;
+  /** 本执行端的节点 ID（保存在服务目录 private/node-id，首次启动时生成）。 */
+  nodeId: string;
+  /** 当前安装的发行版本号（打包时由 release-stamp 写入；源码检出为 "dev"）。 */
+  runnerVersion: () => Promise<string>;
   db: import("./vendor/src/database").CompanyDatabase;
   owner: import("./vendor/src/owner").OwnerDesk;
   workforce: import("./vendor/src/workforce").Workforce;
@@ -96,6 +100,7 @@ export function company(): Promise<Company> {
     const cloud = databaseConfig.cloud;
     // 云端执行端就是这台机器上的插件进程：装上本机宿主，RUNNER_ONLY_COMMANDS 才能在这里执行。本机模式不变。
     if (cloud) installNodeHost();
+    const nodeId = ensureNodeId(serviceHome());
     const db = new CompanyDatabase(databaseConfig);
     await db.connect();
     await db.useDatabase(); // schema is owned by the launchd MCP service; we only query.
@@ -128,7 +133,7 @@ export function company(): Promise<Company> {
     // Same build-cost line as the MCP process: the plugin's sidecar serves the same paged reads, so both surfaces must be diagnosable.
     const snapshotObserve = (stats: { outcome: string; kind: string; rows: number; bytes: number; batches: number; loadMs: number; reserveMs: number; writeMs: number; commitMs: number; totalMs: number; serverMs: number; loadAttempts: number; release: string; releaseMs: number }) =>
       console.log(`snapshot build ${stats.kind} ${stats.outcome} rows=${stats.rows} bytes=${stats.bytes} batches=${stats.batches} load=${Math.round(stats.loadMs)} reserve=${Math.round(stats.reserveMs)} write=${Math.round(stats.writeMs)} commit=${Math.round(stats.commitMs)} server=${Math.round(stats.serverMs)} total=${Math.round(stats.totalMs)} reads=${stats.loadAttempts} release=${stats.release} releaseMs=${Math.round(stats.releaseMs)}`);
-    const core = new SurrealCompanyCore(db, { workforce, snapshotObserve, worktrees: worktreeOpts, submitCheck: process.env.SCK_PR_GATE === "0" ? undefined : createSubmitCheck(),
+    const core = new SurrealCompanyCore(db, { workforce, snapshotObserve, worktrees: worktreeOpts, nodeId, submitCheck: process.env.SCK_PR_GATE === "0" ? undefined : createSubmitCheck(),
       systemCheck: process.env.SCK_SUBMIT_CHECKS === "0" ? undefined : createSystemCheck({ serviceHome: serviceHome(), home: homedir() }) });
     // Sealed credentials, login tokens and the Cloudflare token live only in this process; agents
     // reach them through the sidecar relay as named, audited, lease-gated operations.
@@ -263,8 +268,6 @@ export function company(): Promise<Company> {
     });
     // Rebuild agent↔instance bindings and live leases after a plugin restart.
     await sidecar.adopt(await workforce.insts());
-    const {CompanyUpgrades}=await import("./vendor/src/company-upgrades.ts");
-    const upgrades=new CompanyUpgrades(db,owner,{home:serviceHome(),repo:opsRepo});
     // 云端执行端的运维作业：员工身份与租约只在本进程的 sidecar 里，作业经 sidecar.runCloudOps 执行。
     // 作业的执行者（ma_hono 用户 id 或员工编号）经 agent_identity 对到员工。
     const employeeOf = async (actor: string): Promise<string> => {
@@ -273,11 +276,6 @@ export function company(): Promise<Company> {
       const employee = rows?.[0]?.employee;
       if (!employee) throw Object.assign(new Error("作业的执行者没有对应的员工身份"), { code: "forbidden" });
       return employee;
-    };
-    // 装 release 前老板必须已暂停派工：以库里的 company_meta:config.paused 为准，执行端不替老板设置。
-    const dispatchPaused = async (): Promise<boolean> => {
-      const [config] = await db.db.query<[{ paused?: boolean } | undefined]>("SELECT paused FROM ONLY company_meta:config;");
-      return config?.paused === true;
     };
     const opsJobs = cloud ? new OpsJobRunner({
       db: db.db,
@@ -288,12 +286,11 @@ export function company(): Promise<Company> {
         try { return sidecar.holdsLease(await employeeOf(job.actor), job.task); } catch { return false; }
       },
       opsCall: async job => sidecar.runCloudOps({ employee: await employeeOf(job.actor), taskId: job.task, tool: job.tool, args: job.args }),
-      runnerOnly: job => ownerApi({ db, core: core as never, owner, workforce, messages, opsRepo, upgrades }, { ...job.input, command: job.command }, "runner"),
+      runnerOnly: job => ownerApi({ db, core: core as never, owner, workforce, messages, opsRepo }, { ...job.input, command: job.command }, "runner"),
       hostExec: input => hostExec(input, { keyPath: join(serviceHome(), "private", "cloud", "sck-agent-ed25519") }),
-      releaseInstall: async ({ sha }) => releaseInstall({ sha }, { repo: opsRepo, serviceHome: serviceHome(), dispatchPaused: await dispatchPaused() }),
       log: message => console.log(message),
     }) : undefined;
-    return readyCompany={ upgrades, messages, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops, sckBin, opsJobs,
+    return readyCompany={ nodeId, runnerVersion: async () => RELEASE.version, messages, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops, sckBin, opsJobs,
       get paseo(){ return currentPaseo(); } };
   })();
   boot.catch(() => { boot = undefined; }); // a failed boot must not poison later calls

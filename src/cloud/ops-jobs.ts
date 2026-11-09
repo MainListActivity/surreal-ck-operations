@@ -15,7 +15,6 @@ export interface OpsJobDeps {
   opsCall(job: { actor: string; task: string; tool: string; args: Record<string, unknown> }): Promise<unknown>;
   runnerOnly(job: { command: string; input: Record<string, unknown> }): Promise<unknown>;
   hostExec(input: { host: string; command: string; timeoutSec?: number }): Promise<unknown>;
-  releaseInstall(input: { sha: string }): Promise<unknown>;
   /**
    * 本执行端是否持有该作业执行者在该任务上的租约。ops_* 作业只由持有者认领，避免备用执行端把作业以 no_lease 写回失败。
    * 缺省视为持有（单执行端部署）。
@@ -46,7 +45,6 @@ const ERROR_LIMIT_CHARS = 500; // 作业 error 字符串总上限（与 058 审�
 const HOST_COMMAND_LIMIT_BYTES = 8192;
 const HOST_TIMEOUT_MIN_SEC = 1;
 const HOST_TIMEOUT_MAX_SEC = 900;
-const SHA_PATTERN = /^[0-9a-f]{40}$/;
 // 本模块在 redactText 之外额外遮蔽形如 sk-xxxx 的密钥样式字符串。
 const API_KEY_SHAPE = /\bsk-[A-Za-z0-9_-]{8,}/g;
 // Bearer 令牌与 URL 中的用户名密码（scheme://user:pass@host）。
@@ -137,14 +135,6 @@ function hostExecInput(value: unknown): HostExecInput {
     return { host, command, timeoutSec: timeoutSec as number };
   }
   return { host, command };
-}
-
-/** 校验 company.release.install 输入，返回提交号。 */
-function releaseSha(value: unknown): string {
-  const input = plainObject(value, 'company.release.install 输入必须是对象');
-  const sha = input.sha;
-  if (typeof sha !== 'string' || !SHA_PATTERN.test(sha)) throw invalid('sha 必须是 40 位小写十六进制提交号');
-  return sha;
 }
 
 /**
@@ -293,9 +283,6 @@ export class OpsJobRunner {
     }
     if (command === 'host.exec') {
       return this.deps.hostExec(hostExecInput(input));
-    }
-    if (command === 'company.release.install') {
-      return this.deps.releaseInstall({ sha: releaseSha(input) });
     }
     throw invalid('未知命令');
   }

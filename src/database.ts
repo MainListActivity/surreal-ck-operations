@@ -100,7 +100,7 @@ const pause = (ms: number): Promise<void> => new Promise(resolve => {
 });
 
 /** 本版本 applySchema 的最后一个结构版本；云端 bootstrap 只核对库内版本不低于它。 */
-export const CLOUD_SCHEMA_VERSION = 60;
+export const CLOUD_SCHEMA_VERSION = 61;
 
 export class CompanyDatabase {
   /** 当前会话的客户端；云端续期或重连时整体替换（见 rebuildNow）。 */
@@ -525,8 +525,6 @@ export class CompanyDatabase {
     // 队列不收），旧版读不到新表即忽略，因此回滚后不会认领或拉起等待中的任务（RB01）。
     await this.db.query(loadSchema('040-waits.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 40 WHERE schema_version < 40;');
-    await this.db.query(loadSchema('041-company-upgrades.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 41 WHERE schema_version < 41;');
     // SYS07 P2：目标成果契约、证据、终验缺口与指标。只新增 goal_outcome / goal_evidence 两张表与 goal 的可选
     // 新字段；旧版忽略这些字段和表，历史任务、验收与老板决定不被改写（RB01）。
     await this.db.query(loadSchema('042-goal-governance.surql'));
@@ -600,6 +598,9 @@ export class CompanyDatabase {
     // 060：删除模型评分、排序与本地网关的账本；员工会话绑定任务（session_task）。
     await this.db.query(loadSchema('060-drop-scoring-gateway.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 60 WHERE schema_version < 60;');
+    // 061：节点记录与升级回退记录（每台执行端一行 node_release；node_rollback 追加写）。只新增表与索引，不改任何既有行；旧 release 读不到即忽略（RB01）。
+    await this.db.query(loadSchema('061-node-release.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 61 WHERE schema_version < 61;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

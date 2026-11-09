@@ -162,7 +162,6 @@ export interface Principal {
 /**
  */
 export interface TaskView {
-  companyUpgrade?: import('./company-release.ts').CompanyRelease;
   id: TaskId;
   title: string;
   context: string;
@@ -554,8 +553,6 @@ export interface LeaseProof {
 }
 
 export interface Evidence {
-  /** Engineering company-system release/deploy only. Bound to this lease write and a reviewed main commit. */
-  companyUpgrade?: { sha: string };
   text: string;
   idempotencyKey: string;
   /** SYS02: the head this submission is bound to; machine evidence must match it. */

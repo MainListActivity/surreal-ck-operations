@@ -1,6 +1,6 @@
 // Deploy-drill plugin-side face driver (SYS-INT). Runs this release's vendored core behind the real
 // sck comm channel inside a drill root: `bun scripts/deploy-drill-face.ts serve <drill-root>`.
-// Same wiring as the sidecar-review gate harness: a real SidecarPool answers a real client-cli on the
+// Same wiring as the sidecar test harness: a real SidecarPool answers a real client-cli on the
 // comm channel it minted. Nothing here touches production — the database, ports, credential and comm
 // directories all live under the drill root, and the drill runner stops this process when done.
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -25,7 +25,8 @@ const { SidecarPool } = await import('../plugin/server/sidecar.ts');
 const db = new CompanyDatabase(loadDatabaseConfig());
 await db.connect();
 await db.bootstrap();
-const core = new SurrealCompanyCore(db);
+const { ensureNodeId } = await import('../src/node-identity.ts');
+const core = new SurrealCompanyCore(db, { nodeId: ensureNodeId(root) });
 const enrollment = new LocalEnrollmentAdmin(db);
 await enrollment.enroll('drill-fixture-manager', 'owner', ['execute', 'review', 'manage']);
 const wf = new Workforce(db, join(root, 'credentials'));
