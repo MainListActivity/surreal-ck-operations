@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   buildManifest,
+  missingPluginImports,
   packTarball,
   stagePlugin,
   writeReleaseJson,
@@ -147,5 +148,31 @@ describe('packTarball 与 buildManifest', () => {
     expect(manifest.updater.name).toBe('node-updater.js');
     expect(manifest.format).toBe(1);
     expect(manifest.product).toBe('sck-company');
+  });
+});
+
+describe('missingPluginImports', () => {
+  test('沿入口可达的源码里仅类型导入的包也要能在 node_modules 解析；宿主模块、内置模块与不可达文件不计', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sck-plugin-imports-'));
+    try {
+      write(join(dir, 'index.server.ts'), "import { run } from './server/main';\nexport default run;\n");
+      write(join(dir, 'index.client.tsx'), "import React from 'react';\nimport { View } from 'react-native';\nexport {};\n");
+      write(join(dir, 'server', 'main.ts'), [
+        "import type { PaseoApi } from '@getpaseo/client';",
+        "import { z } from 'zod';",
+        "import { readFileSync } from 'node:fs';",
+        "import { join } from 'path';",
+        "import { Surreal } from 'surrealdb';",
+        "const s = 'a from \": weird, \"';",
+        'export const run = 1;',
+      ].join('\n'));
+      write(join(dir, 'server', 'vendor', 'unused.ts'), "import { McpServer } from '@modelcontextprotocol/server';\n");
+      write(join(dir, 'node_modules', 'surrealdb', 'package.json'), '{}');
+      expect(await missingPluginImports(dir)).toEqual(['@getpaseo/client']);
+      write(join(dir, 'node_modules', '@getpaseo', 'client', 'package.json'), '{}');
+      expect(await missingPluginImports(dir)).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

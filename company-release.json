@@ -1,12 +1,13 @@
 {
   "version": "0.6.1",
-  "title": "修复节点更新器安装脚本在 macOS 上的 unbound variable",
+  "title": "修复节点更新器首次切换失败：插件缺类型依赖、安装脚本 unbound variable",
   "changes": [
-    "scripts/node-updater.sh 里紧跟中文全角标点的变量改用花括号：macOS 的 /bin/sh（bash 3.2）在 UTF-8 locale 下会把多字节首字节并入变量名，install 在下载提示处报 release_repo unbound variable 退出。",
-    "新增测试：脚本内不得出现紧跟非 ASCII 字符的未加花括号变量；UTF-8 locale 下 /bin/sh 正常展开加花括号的变量。"
+    "plugin/package.json 把 @getpaseo/client 从 devDependencies 移到 dependencies：服务端源码 import type 它，Paseo 编译插件时要求类型导入也能在插件 node_modules 里解析，--prod 安装缺它导致 0.6.0 切换后编译失败并回退。",
+    "plugin-package --verify-install 增加检查：--prod 安装后，从入口可达的源码（含仅类型导入）引用的非宿主包必须都已安装，否则发布失败。",
+    "scripts/node-updater.sh 里紧跟中文全角标点的变量改用花括号：macOS 的 /bin/sh（bash 3.2）在 UTF-8 locale 下把多字节首字节并入变量名，install 报 release_repo unbound variable 退出。"
   ],
   "impact": [
-    "只影响节点更新器的安装脚本；插件代码与 0.6.0 相同，已装更新器的节点会按正常流程切到 0.6.1。"
+    "已装更新器的节点按正常流程切到 0.6.1；0.6.0 在节点上会编译失败并自动回退，不要手动切到 0.6.0。"
   ],
   "migration": "无 schema 变化，沿用 schema 061。",
   "rollback": "同 0.6.0：停用节点更新器后把 sck-company 插件指回上一版 plugin-releases 或 releases 目录；无 schema 回退。"
