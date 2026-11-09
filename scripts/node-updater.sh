@@ -116,7 +116,7 @@ check_tools() {
   case "$node_major" in
     ''|*[!0-9]*) die "无法读取 node 版本：$node_bin" ;;
   esac
-  [ "$node_major" -ge 22 ] || die "node 版本过低（当前 v$node_ver，需要 22 或以上）：$node_bin"
+  [ "$node_major" -ge 22 ] || die "node 版本过低（当前 v${node_ver}，需要 22 或以上）：$node_bin"
 
   command -v tar >/dev/null 2>&1 || die "未找到 tar"
 
@@ -224,7 +224,7 @@ install_cmd() {
   if [ "$no_load" -eq 0 ]; then
     case "$plat" in
       Darwin|Linux) ;;
-      *) die "不支持的系统：$plat（仅支持 macOS 与 Linux）" ;;
+      *) die "不支持的系统：${plat}（仅支持 macOS 与 Linux）" ;;
     esac
   fi
 
@@ -241,9 +241,9 @@ install_cmd() {
     [ -f "$src_dir/node-updater.js" ] || die "缺少 $src_dir/node-updater.js"
   else
     src_dir=$tmp
-    echo "正在从 GitHub Release 下载节点更新器（$release_repo）..."
+    echo "正在从 GitHub Release 下载节点更新器（${release_repo}）..."
     gh release download --repo "$release_repo" --pattern manifest.json --pattern node-updater.js --dir "$tmp" --clobber \
-      || die "从 GitHub Release 下载失败（仓库：$release_repo）"
+      || die "从 GitHub Release 下载失败（仓库：${release_repo}）"
     [ -f "$tmp/manifest.json" ] && [ -f "$tmp/node-updater.js" ] || die "Release 中缺少 manifest.json 或 node-updater.js"
   fi
 
@@ -270,12 +270,12 @@ install_cmd() {
     write_plist
     launchd_unload
     launchctl bootstrap "$domain" "$(plist_path)" || die "launchctl bootstrap 失败：$(plist_path)"
-    echo "已注册 launchd 定时任务：$label（每 15 分钟一次）"
+    echo "已注册 launchd 定时任务：${label}（每 15 分钟一次）"
   else
     write_systemd_units
     systemctl --user daemon-reload || die "systemctl --user daemon-reload 失败"
     systemctl --user enable --now "$systemd_timer" || die "启用定时器失败：$systemd_timer"
-    echo "已启用 systemd 定时器：$systemd_timer（每 15 分钟一次）"
+    echo "已启用 systemd 定时器：${systemd_timer}（每 15 分钟一次）"
     echo "提示：服务器上若无登录会话，需要执行 loginctl enable-linger \"\$USER\"，否则定时器不会在登出后运行。"
   fi
 
@@ -284,7 +284,7 @@ install_cmd() {
 }
 
 run_cmd() {
-  [ -f "$run_sh" ] || die "节点更新器未安装（缺少 $run_sh），请先执行 install"
+  [ -f "$run_sh" ] || die "节点更新器未安装（缺少 ${run_sh}），请先执行 install"
   exec sh "$run_sh"
 }
 
@@ -293,21 +293,21 @@ status_cmd() {
   case "$plat" in
     Darwin)
       if launchctl print "$domain/$label" >/dev/null 2>&1; then
-        echo "定时任务：已加载（$label）"
+        echo "定时任务：已加载（${label}）"
       else
-        echo "定时任务：未加载（$label）"
+        echo "定时任务：未加载（${label}）"
       fi
       ;;
     Linux)
       state=$(systemctl --user is-enabled "$systemd_timer" 2>/dev/null || true)
-      echo "定时任务：${state:-未安装}（$systemd_timer）"
+      echo "定时任务：${state:-未安装}（${systemd_timer}）"
       ;;
     *)
       echo "定时任务：不支持的系统 $plat"
       ;;
   esac
   if [ -f "$log_file" ]; then
-    echo "--- 日志最后 40 行（$log_file）---"
+    echo "--- 日志最后 40 行（${log_file}）---"
     tail -n 40 "$log_file"
   else
     echo "日志不存在：$log_file"
@@ -329,10 +329,10 @@ uninstall_cmd() {
       echo "已卸载 systemd 定时任务：$systemd_timer"
       ;;
     *)
-      die "不支持的系统：$plat（仅支持 macOS 与 Linux）"
+      die "不支持的系统：${plat}（仅支持 macOS 与 Linux）"
       ;;
   esac
-  echo "已保留 plugin-releases 与日志：$plugin_releases_dir，$logs_dir"
+  echo "已保留 plugin-releases 与日志：${plugin_releases_dir}，$logs_dir"
 }
 
 action=${1:-}

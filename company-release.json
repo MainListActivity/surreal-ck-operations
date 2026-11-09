@@ -1,20 +1,13 @@
 {
-  "version": "0.6.0",
-  "title": "插件由各执行端的节点更新器自动升级，发布改为 main 合入后自动发布",
+  "version": "0.6.1",
+  "title": "修复节点更新器安装脚本在 macOS 上的 unbound variable",
   "changes": [
-    "main 通过 Quality gate 后，发布 job 先对云端公司库执行 schema 迁移（只做一次），再打插件发行包并发布 GitHub Release 资产：sck-company-<版本>.tgz、manifest.json、node-updater.js。",
-    "新增节点更新器（scripts/node-updater.ts）：launchd 或 systemd --user 定时查询最新 Release，校验清单与 sha256 后解压到 plugin-releases/<sha>，只安装运行依赖。",
-    "节点无进行中租约时才把 sck-company 插件切到新目录，不重启 Paseo daemon；有租约则等下一轮。切换后核验插件 running 与云端 schema，失败切回上一版本。",
-    "每台执行端在 node_release 记录当前版本与上次升级结果，回退追加到 node_rollback；任务租约记录所在节点（task.lease_node）。",
-    "删除升级卡、公司升级任务、本机发布门禁（scripts/release-gate.sh）与 scripts/release-install.sh；company-service.sh install 不再改写插件来源。",
-    "schema 061：只新增 node_release、node_rollback 表与 task.lease_node 字段，不改既有行，不删表。"
+    "scripts/node-updater.sh 里紧跟中文全角标点的变量改用花括号：macOS 的 /bin/sh（bash 3.2）在 UTF-8 locale 下会把多字节首字节并入变量名，install 在下载提示处报 release_repo unbound variable 退出。",
+    "新增测试：脚本内不得出现紧跟非 ASCII 字符的未加花括号变量；UTF-8 locale 下 /bin/sh 正常展开加花括号的变量。"
   ],
   "impact": [
-    "节点只有安装节点更新器后才会自动升级；未安装的执行端停留在旧插件，首次安装见 docs/company-upgrades.md。",
-    "MCP 服务（org.surrealck.company-mcp）不随更新器升级，仍需 company-service.sh install 手动切换，两者版本可能暂时不一致。",
-    "切换会重启 sck-company 插件进程，只在节点无进行中租约时发生。",
-    "远程部署不再核对本机门禁回执，只保留 40 位 SHA、验收基线与 bun 版本检查。"
+    "只影响节点更新器的安装脚本；插件代码与 0.6.0 相同，已装更新器的节点会按正常流程切到 0.6.1。"
   ],
-  "migration": "schema 061：新增 node_release、node_rollback 表与 task.lease_node 字段，只新增结构，不改既有行，不删表；原 company_upgrade 表不再读写。发布 job 在打包前执行迁移。",
-  "rollback": "回退到 0.5.0：1）sh scripts/node-updater.sh uninstall 停用节点更新器；2）用当前受审 release 的 company-service.sh install 0.5.0 的 release 切换 MCP，守卫拒绝则停止；3）paseo plugin remove sck-company 后，install 服务目录下的 releases/bdb6c7a76f650b8f0e028fbf2ce33cb464e3eff3/plugin。schema 061 只新增结构，无需回退。"
+  "migration": "无 schema 变化，沿用 schema 061。",
+  "rollback": "同 0.6.0：停用节点更新器后把 sck-company 插件指回上一版 plugin-releases 或 releases 目录；无 schema 回退。"
 }
