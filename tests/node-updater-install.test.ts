@@ -180,3 +180,19 @@ test('node 版本低于 22 时 install 失败', () => {
   expect(res.output).toContain('版本过低');
   expect(existsSync(join(ctx.serviceHome, 'updater', 'node-updater.js'))).toBe(false);
 });
+
+test('脚本里紧跟非 ASCII 字符的变量都用花括号（macOS 的 bash 3.2 在 UTF-8 locale 下会把多字节首字节并入变量名）', () => {
+  const text = readFileSync(SCRIPT, 'utf8');
+  const offenders = text.split('\n')
+    .map((line, i) => ({ line: i + 1, text: line }))
+    .filter(({ text: line }) => /\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]/.test(line));
+  expect(offenders).toEqual([]);
+});
+
+test('UTF-8 locale 下 /bin/sh 对加花括号的变量正常展开（未加花括号时 macOS bash 3.2 报 unbound variable）', () => {
+  const env = { ...process.env, LANG: 'en_US.UTF-8', LC_CTYPE: 'en_US.UTF-8' };
+  delete (env as Record<string, string | undefined>).LC_ALL;
+  const run = spawnSync('/bin/sh', ['-c', 'set -u; release_repo=o/r; echo "从（${release_repo}）"'], { env, encoding: 'utf8' });
+  expect(run.status).toBe(0);
+  expect(run.stdout.trim()).toBe('从（o/r）');
+});

@@ -4,6 +4,8 @@
 // 节点更新器会对 plugin/ 执行 pnpm install --prod --frozen-lockfile --ignore-scripts，所以锁文件必须与 package.json 一致。
 import { execFile } from 'node:child_process';
 import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { builtinModules } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseArgs, promisify } from 'node:util';
@@ -139,6 +141,57 @@ export async function buildUpdater(entry: string, outFile: string): Promise<void
   await run(process.execPath, ['build', entry, '--target', 'node', '--outfile', outFile], ROOT);
 }
 
+/**
+ * Paseo 宿主提供、插件无需本地安装的模块（照 Paseo 插件编译器的运行时边界规则）：react、react-native、
+ * @tanstack/react-query、zod、@types/node、node 内置模块，以及只做类型导入的 @getpaseo/protocol/*。
+ * 其余裸模块即使只做 `import type` 也必须能在插件自己的 node_modules 里解析到，否则 Paseo 编译失败。
+ */
+const HOST_PROVIDED = /^(zod|react|react-native|@tanstack\/react-query|@getpaseo\/protocol)(\/|$)/;
+const IMPORT_SPECIFIER = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)['"]([^'"]+)['"]/g;
+
+const PACKAGE_SPECIFIER = /^(@[\w.-]+\/)?[\w.-]+(\/[\w.@-]+)*$/;
+const SOURCE_EXTENSIONS = ['', '.ts', '.tsx', '/index.ts', '/index.tsx'];
+
+function packageOf(specifier: string): string {
+  const parts = specifier.split('/');
+  return specifier.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0]!;
+}
+
+function resolveRelative(from: string, specifier: string): string | undefined {
+  const base = join(from, '..', specifier);
+  for (const ext of SOURCE_EXTENSIONS) {
+    const candidate = base + ext;
+    if (existsSync(candidate) && /\.(ts|tsx)$/.test(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+/**
+ * 从 index.client.tsx / index.server.ts 沿相对导入走到的源码里（含仅类型导入），
+ * 列出在 pluginDir/node_modules 里找不到、又不由宿主提供的包。
+ */
+export async function missingPluginImports(pluginDir: string): Promise<string[]> {
+  const queue = ['index.client.tsx', 'index.server.ts'].map(entry => join(pluginDir, entry)).filter(file => existsSync(file));
+  const seen = new Set<string>(queue);
+  const missing = new Set<string>();
+  while (queue.length) {
+    const file = queue.shift()!;
+    for (const match of (await readFile(file, 'utf8')).matchAll(IMPORT_SPECIFIER)) {
+      const specifier = match[1]!;
+      if (specifier.startsWith('.')) {
+        const next = resolveRelative(file, specifier);
+        if (next && !seen.has(next)) { seen.add(next); queue.push(next); }
+        continue;
+      }
+      if (!PACKAGE_SPECIFIER.test(specifier) || specifier.startsWith('node:') || specifier === 'bun' || specifier.startsWith('bun:')) continue;
+      const pkg = packageOf(specifier);
+      if (HOST_PROVIDED.test(specifier) || builtinModules.includes(pkg)) continue;
+      if (!existsSync(join(pluginDir, 'node_modules', pkg, 'package.json'))) missing.add(pkg);
+    }
+  }
+  return [...missing].sort();
+}
+
 /** 在临时目录按 --prod 锁定安装，并确认服务端入口可以打包。 */
 export async function verifyInstall(stagePluginDir: string): Promise<void> {
   const tmp = await mkdtemp(join(tmpdir(), 'sck-plugin-verify-'));
@@ -146,6 +199,8 @@ export async function verifyInstall(stagePluginDir: string): Promise<void> {
     const dir = join(tmp, 'plugin');
     await copyTree(stagePluginDir, dir);
     await run('pnpm', ['install', '--prod', '--frozen-lockfile', '--ignore-scripts'], dir);
+    const missing = await missingPluginImports(dir);
+    if (missing.length) throw new Error(`--prod 安装后插件源码引用的包缺失（含仅类型导入，Paseo 编译会失败）：${missing.join('、')}；移到 plugin/package.json 的 dependencies`);
     await run(process.execPath, ['build', join(dir, 'index.server.ts'), '--target=bun', '--outdir', join(tmp, 'out')], dir);
   } finally {
     await rm(tmp, { recursive: true, force: true });
