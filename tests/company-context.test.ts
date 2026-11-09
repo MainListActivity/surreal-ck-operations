@@ -123,7 +123,7 @@ test('the reader refuses a missing part, a repeated part, a gap, an altered text
 test('scope company is a task-free read: task filters and an unknown section are refused, and tasks scope keeps the company block out by default', () => {
   expect(parseContextInput({ scope: 'company' })).toMatchObject({ scope: 'company', includeCompany: true, paged: false });
   expect(parseContextInput({ scope: 'company', section: 'projects', pageSize: 3 })).toMatchObject({ section: 'projects', paged: true, pageSize: 3 });
-  for (const filter of [{ taskId: 'task-1' }, { state: 'ready' }, { goalId: 'goal-1' }, { role: 'owner' }, { since: '2026-10-01' }, { fields: ['id'] }, { includeCompany: true }]) {
+  for (const filter of [{ taskId: 'task-1' }, { state: 'ready' }, { tag: 'tag-1' }, { role: 'owner' }, { since: '2026-10-01' }, { fields: ['id'] }, { includeCompany: true }]) {
     expect(() => parseContextInput({ scope: 'company', ...filter })).toThrow(CompanyError);
   }
   expect(() => parseContextInput({ scope: 'company', section: 'secrets' })).toThrow(CompanyError);

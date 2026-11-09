@@ -284,7 +284,7 @@ test('AC-A rejections: another caller, another section, another query, an altere
   expect(cursor.length).toBeGreaterThan(0);
   // Another caller, another section, another query: each forbidden.
   await expectRefused(fx.core.contextView(fx.eng, { scope: 'company', pageSize: 1, cursor }), 'forbidden', /another caller or query/);
-  await expectRefused(fx.core.contextView(fx.gm, { scope: 'company', section: 'goals', pageSize: 1, cursor }), 'forbidden', /another caller or query/);
+  await expectRefused(fx.core.contextView(fx.gm, { scope: 'company', section: 'projects', pageSize: 1, cursor }), 'forbidden', /another caller or query/);
   await expectRefused(fx.core.contextView(fx.gm, { pageSize: 1, cursor }), 'forbidden', /another caller or another query/);
   // An altered cursor: the first payload character changes, so the signature no longer verifies.
   const altered = cursor.replace(/^v1\.(.)/, (_, head: string) => `v1.${head === 'A' ? 'B' : 'A'}`);

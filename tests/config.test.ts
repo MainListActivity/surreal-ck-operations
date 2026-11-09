@@ -27,5 +27,8 @@ test('a look-alike host is not local', () => {
 
 test('outside tests the configured server is used as is', () => {
   withEnv('wss://data.example.com/rpc'); process.env.NODE_ENV = 'production';
+  // A Mac that runs the control plane has a live private/company-db.env; outside tests its COMPANY_DB_URL wins over
+  // SURREAL_URL. Isolate this case from the machine's company env, as SCK_PRODUCT_ENV isolates the product .env.
+  process.env.SCK_COMPANY_DB_ENV = '/dev/null'; delete process.env.COMPANY_DB_URL;
   expect(loadDatabaseConfig().url).toBe('wss://data.example.com/rpc');
 });
