@@ -51,8 +51,9 @@ const SHA_PATTERN = /^[0-9a-f]{40}$/;
 const API_KEY_SHAPE = /\bsk-[A-Za-z0-9_-]{8,}/g;
 // Bearer 令牌与 URL 中的用户名密码（scheme://user:pass@host）。
 const BEARER_TOKEN = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
-// 协议名限 64 字符：不设上限时，长字母数字串上每个起点都要扫到串尾再回溯，整体为 O(n²)（70 KB 约 2.5 秒）。
-const URL_CREDENTIAL = /([a-z][a-z0-9+.-]{0,63}:\/\/)[^\s/?#@"']+@/gi;
+// 协议名不设长度上限（超长协议名里的凭证也要脱敏）。每段字母数字串只从边界开始尝试一次，且整段捕获后不回溯
+// （前瞻 + 回溯引用模拟原子组）。旧写法在长字母数字串上每个起点都回溯到串尾，整体 O(n²)，70 KB 约 2.5 秒。
+const URL_CREDENTIAL = /(?<![a-z0-9+.-])(?=([a-z0-9+.-]*[a-z][a-z0-9+.-]*))\1:\/\/[^\s/?#@"']+@/gi;
 
 // 认领仅在行仍为 queued 时成功；写回仅在本执行端仍持有 running 行时成功。两者都用 RETURN AFTER 检查是否真的更新到了行。
 const CLAIM_SQL = "UPDATE $job SET state = 'running', runner = $runner, started_at = time::now() WHERE state = 'queued' RETURN AFTER;";
@@ -72,7 +73,7 @@ function invalid(message: string): InvalidJobError {
 function scrub(text: string): string {
   return redactText(text)
     .replace(BEARER_TOKEN, 'Bearer [redacted]')
-    .replace(URL_CREDENTIAL, '$1[redacted]@')
+    .replace(URL_CREDENTIAL, '$1://[redacted]@')
     .replace(API_KEY_SHAPE, '[redacted]');
 }
 

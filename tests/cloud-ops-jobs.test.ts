@@ -276,6 +276,12 @@ describe('结果体积与脱敏', () => {
     expect(stored).not.toContain('sk-test-secret-123');
   });
 
+  test('协议名超过 64 字符时，URL 中的凭证仍被脱敏', () => {
+    const stored = storeResult({ note: `a${'1'.repeat(70)}://user:pass@host.example/x` });
+    expect(stored).not.toContain('user:pass');
+    expect(stored).toContain('@host.example/x');
+  });
+
   test('注入函数抛出的错误：沿用字符串 code，message 脱敏且不超过 200 字符', async () => {
     const rows = [job('e1', 'ops_info')];
     const runner = new OpsJobRunner(deps({
