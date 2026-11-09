@@ -316,9 +316,11 @@ function registerTools(server: McpServer, core: CompanyCore) {
       discipline: z.string().min(1).max(60).optional(),
       project: z.string().min(1).max(60).optional(),
       codeRepoPath: z.string().min(1).max(1000).optional(),
-      // The 50-dependency and asset-path limits are enforced by core.createTask, the same
-      // validator the sidecar reaches. Keeping them out of this schema preserves the structured
-      // `invalid` result; a schema failure here would be a plain protocol error instead.
+      // The asset-path limits are enforced by core.createTask, the same validator the sidecar reaches.
+      // Keeping them out of this schema preserves the structured `invalid` result; a schema failure here
+      // would be a plain protocol error instead. The retired fields are declared for the same reason: zod
+      // strips undeclared keys, so an undeclared `dependencies` would create the task as if it were never sent.
+      goalId: z.string().optional(), dependencies: z.array(z.string()).optional(), revises: z.string().optional(),
       workIntent: z.object({ kind: z.enum(['read', 'code', 'assets']), paths: z.array(z.string()).optional(), lane: z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/).optional() }).optional(),
       kind: z.enum(['task', 'gate']).optional(), tag: z.string().min(1).optional(),
       idempotencyKey: z.string().min(1),

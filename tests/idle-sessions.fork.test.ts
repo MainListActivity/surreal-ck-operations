@@ -19,7 +19,7 @@ run('persistent idle observations survive restart, manager wakes and a fresh dis
     await db.db.query(`CREATE dispatch:fixture CONTENT { purpose: 'gm-manager-wake', state: 'running', employee: 'fixture', agent: 'fixture-agent', task: 'fixture-task', phase: 'execute', episode: 1 };`);
     expect(await reclaimIdleSessions({ ...input(), instances: [await find()] })).toEqual([]);
     // The server guard protects even a caller whose manager-wake snapshot was stale.
-    await expect(wf.retireIdle(await find())).rejects.toThrow('manager wake');
+    await expect(wf.retireIdle(await find())).rejects.toThrow('protected by pending wake');
     await db.db.query("UPDATE dispatch:fixture SET state = 'finished';");
     const lifecycleOld = await find();
     await wf.clearIdleForAgent('fixture-agent');

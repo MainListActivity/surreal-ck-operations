@@ -1,7 +1,5 @@
 import { CompanyError } from './core-errors.ts';
 
-/** External task creation: a raw input list, checked before de-duplication. */
-export const MAX_TASK_DEPENDENCIES = 50;
 /** Task IDs are opaque strings at the core boundary; this is the same cap the task-reading inputs use. */
 export const MAX_TASK_ID_CHARS = 200;
 /** Existing asset-intent limits, kept in one place so MCP, sidecar and core cannot drift. */
@@ -20,13 +18,6 @@ export const PROJECT_TEXT_LIMITS = {
 
 const invalid = (message: string) => new CompanyError('invalid', message);
 const utf8Bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
-
-/**
- * The external create_task entry point: the raw dependency list is capped before `new Set(...)`,
- * so 51 duplicates cannot slip through as one de-duplicated edge. Each item is a non-empty task id
- * with the same 200-character bound as the task-reading inputs; existence and role checks remain in
- * the task transaction.
- */
 
 export interface ProjectTextInput {
   release: string;

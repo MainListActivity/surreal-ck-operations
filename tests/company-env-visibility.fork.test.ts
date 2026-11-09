@@ -184,9 +184,9 @@ test('a listing taken under a valid lease is refused once the lease ends: its la
 test('read_task_text of the project field: gm and the valid holder read it; an unrelated employee is refused', async () => {
   const read = (who: string, taskId: string) => core.taskText(who, { taskId, field: 'project' });
   expect(JSON.stringify(await read(gm, taskHolder))).toContain(ENV);
-  await expectRefused(Promise.resolve().then(() => read(other, taskHolder)), 'forbidden', /gm or the holder of a valid task lease/);
+  await expectRefused(Promise.resolve().then(() => read(other, taskHolder)), 'forbidden', /owner or the holder of a valid task lease/);
   // The expired holder's lease on taskExpiring has ended, so that holder is refused as well.
-  await expectRefused(Promise.resolve().then(() => read(expiring, taskExpiring)), 'forbidden', /gm or the holder of a valid task lease/);
+  await expectRefused(Promise.resolve().then(() => read(expiring, taskExpiring)), 'forbidden', /owner or the holder of a valid task lease/);
 });
 
 test('the holder of the review lease on a task of the project reads its environments too, and loses them when the review ends', async () => {
@@ -220,5 +220,5 @@ test('a project read started under a valid lease cannot be continued by its hash
   // The hash is not a capability: the continuation is refused exactly like a fresh read.
   await expectRefused(
     shortCore.taskText(shortHolder, { taskId, field: 'project', offset: first.nextOffset!, expectSha256: first.sha256 }),
-    'forbidden', /gm or the holder of a valid task lease/);
+    'forbidden', /owner or the holder of a valid task lease/);
 });

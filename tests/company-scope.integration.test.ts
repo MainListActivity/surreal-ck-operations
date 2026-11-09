@@ -154,7 +154,7 @@ test('a company cursor is bound to its caller, its section and its scope, and an
   const cursor = first.page!.nextCursor!;
   expect(cursor.length).toBeGreaterThan(0);
   await expectRefused(core.contextView(eng, { scope: 'company', pageSize: 2, cursor }), 'forbidden', /another caller/);
-  await expectRefused(core.contextView(gm, { scope: 'company', section: 'goals', pageSize: 2, cursor }), 'forbidden', /another caller or query/);
+  await expectRefused(core.contextView(gm, { scope: 'company', section: 'projects', pageSize: 2, cursor }), 'forbidden', /another caller or query/);
   await expectRefused(core.contextView(gm, { pageSize: 2, cursor }), 'forbidden', /another caller or another query/);
   // The first payload character changes, so the signature no longer verifies (a change to the last character of the signature
   // can leave its decoded bytes unchanged, and is not an alteration).
