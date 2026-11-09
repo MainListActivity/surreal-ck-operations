@@ -173,7 +173,7 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
    * prove it never leaves the sampler.
    */
   magpie = {
-    base: 'http://127.0.0.1:3425',
+    base: 'http://127.0.0.1:4425',
     accountUser: 'snv-magpie-account',
     accountProvider: 'sensenova',
     quotaKind: 'subscription',

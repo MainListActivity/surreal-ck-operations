@@ -11,7 +11,7 @@ import { Workforce } from '../src/workforce.ts';
 import { PLUGIN_RUNTIME_ROLES, type PluginRuntimeView } from '../src/contracts.ts';
 
 // SYS04: the plugin runtime diagnostics name the release the company service is loaded from, so they are an
-// operator fact. gm/product/qa may read them; a general employee may not, and an unauthorized read must
+// operator fact. owner/product/qa may read them; a general employee may not, and an unauthorized read must
 // produce NO diagnostic at all — not a refused one that still touched the filesystem.
 //
 // The core owns the authorization and the plugin host owns the sampling, so this runs the real core against
@@ -51,7 +51,6 @@ beforeAll(async () => {
     ['qa', 'qa', ['review']],
     ['eng', 'engineering', ['execute', 'review']],
     ['cs', 'cs', ['execute', 'review']],
-    ['eval', 'eval', ['review']],
   ] as const) tokens[name] = await enrollment.enroll(`t-${name}`, role, caps);
 });
 
@@ -65,7 +64,7 @@ const failureOf = async (run: Promise<unknown>): Promise<CompanyError> => {
   throw new Error('expected the call to fail');
 };
 
-test('gm, product and qa may read the plugin runtime diagnostics, and the sampler runs', async () => {
+test('owner, product and qa may read the plugin runtime diagnostics, and the sampler runs', async () => {
   for (const who of ['owner', 'product', 'qa']) {
     const calls: string[] = [];
     const view = await core.pluginRuntimeDiagnostics(tokens[who]!, sampler(calls));
@@ -75,7 +74,7 @@ test('gm, product and qa may read the plugin runtime diagnostics, and the sample
   }
 });
 
-test('the allowed roles are exactly gm, product and qa', async () => {
+test('the allowed roles are exactly owner, product and qa', async () => {
   // The set is the contract, not a side effect of who happened to be tested.
   expect([...PLUGIN_RUNTIME_ROLES].sort()).toEqual(['owner', 'product', 'qa']);
 });
@@ -83,7 +82,7 @@ test('the allowed roles are exactly gm, product and qa', async () => {
 test('an unauthorized role is refused and NO diagnostic is produced', async () => {
   // The sample is the sensitive part: a refusal must arrive before the plugin host is asked to touch the
   // filesystem, so `calls` stays empty for a role that may not read.
-  for (const who of ['eng', 'cs', 'eval']) {
+  for (const who of ['eng', 'cs']) {
     const calls: string[] = [];
     const refusal = await failureOf(core.pluginRuntimeDiagnostics(tokens[who]!, sampler(calls)));
     expect([who, refusal.code]).toEqual([who, 'forbidden']);
@@ -100,7 +99,7 @@ test('an invalid credential is refused before any sampling', async () => {
 
 test('the refusal names the roles that may read, and leaks nothing about the host', async () => {
   const refusal = await failureOf(core.pluginRuntimeDiagnostics(tokens.cs, sampler([])));
-  expect(refusal.message).toContain('gm, product or qa');
+  expect(refusal.message).toContain('owner, product or qa');
   // The message is a role statement, not a runtime fact: it must not name a path or a version.
   expect(refusal.message).not.toContain('/');
   expect(refusal.message).not.toContain('plugin/server');

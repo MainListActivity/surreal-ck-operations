@@ -1,14 +1,13 @@
 /**
- * Per-task cost: tokens, money and time each finished task consumed, read from Magpie's per-request usage rows and
- * kept in task_cost so the numbers outlive model_execution retention.
+ * Per-task cost: tokens, money and time each finished task consumed, read from the VPS magpie's per-request usage rows
+ * and kept in task_cost.
  *
- * Attribution: the gateway sends every employee request with x-magpie-session = sck-<digest(task:employee:fence:phase:tier)>
- * (model-routing/gateway.ts), so a task's sessions are recomputed from its model_execution rows and Magpie's rows are
- * matched by exact session. Requests Magpie could not price are counted, never priced at zero silently (`unpriced`).
+ * Attribution: every employee session sends x-magpie-session = sessionKey(task, employee) (model-routing/magpie-contract.ts).
+ * A task's sessions are therefore the employees who claimed it (audit action 'claim'), and magpie's rows match by that
+ * exact session. Requests magpie could not price are counted, never priced at zero silently (`unpriced`).
  */
 import { RecordId, type Surreal } from 'surrealdb';
-import { digest } from './model-routing/policy.ts';
-import { magpieBase } from './dispatcher/magpie-quota.ts';
+import { MAGPIE_BASE, sessionKey } from './model-routing/magpie-contract.ts';
 
 export interface UsageRow {
   session?: string; t?: string; model?: string; in?: number; out?: number; cache_read?: number; cache_write?: number;
@@ -47,10 +46,7 @@ export function addRow(into: CostTotals, row: UsageRow): void {
   else into.usd += n(row.cost);
 }
 
-export const sessionOf = (s: { task: string; employee: string; fence: number; phase: string; tier: string }) =>
-  `sck-${digest(`${s.task}:${s.employee}:${s.fence}:${s.phase}:${s.tier}`)}`;
-
-/** Roll Magpie rows up by session owner. Rows whose session belongs to no listed lease are ignored. */
+/** Roll Magpie rows up by session owner. Rows whose session belongs to no listed employee are ignored. */
 export function rollUp(taskId: string, sessions: Map<string, string>, rows: Iterable<UsageRow>, elapsedSeconds?: number, complete = true): TaskCost {
   const total = emptyTotals();
   const byEmployee: Record<string, CostTotals> = {};
@@ -74,15 +70,19 @@ export function rollUp(taskId: string, sessions: Map<string, string>, rows: Iter
 
 export type UsageFetch = (session: string) => Promise<UsageRow[] | undefined>;
 
-/** Every Magpie request row of one session in the 30-day window, paged; undefined when Magpie cannot be read. */
-export function magpieSessionRows(base = magpieBase(), fetchImpl: typeof fetch = fetch): UsageFetch {
+/**
+ * Every magpie request row of one session in the 30-day window, paged; undefined when magpie cannot be read.
+ * `headers` carries the employee key: the usage endpoint is authenticated like any other employee request.
+ */
+export function magpieSessionRows(headers: Record<string, string>, base = MAGPIE_BASE, fetchImpl: typeof fetch = fetch): UsageFetch {
   return async session => {
     const out: UsageRow[] = [];
     for (let offset = 0, page = 0; page < 40; page++) {
       const q = new URLSearchParams({ period: '30d', offset: String(offset), limit: '500', q: session });
       let body: { rows?: UsageRow[]; total?: number };
       try {
-        const res = await fetchImpl(new URL(`/v1/magpie/usage/requests?${q}`, base), { signal: AbortSignal.timeout(15_000) });
+        // A string join, not new URL(path, base): the URL constructor would drop the base path (/ofm) of the VPS relay.
+        const res = await fetchImpl(`${base.replace(/\/+$/, '')}/v1/magpie/usage/requests?${q}`, { headers, signal: AbortSignal.timeout(15_000) });
         if (!res.ok) return undefined;
         body = await res.json() as typeof body;
       } catch { return undefined; }
@@ -98,22 +98,23 @@ export function magpieSessionRows(base = magpieBase(), fetchImpl: typeof fetch =
 
 /**
  * Compute and persist one task's cost. Idempotent: the row is replaced. Returns undefined, writing nothing, when the
- * task has no leased model traffic recorded or Magpie cannot be read (the next pass retries).
+ * task has no employee claim recorded or magpie cannot be read (the next pass retries).
  */
-export async function recordTaskCost(db: Surreal, taskId: string, fetchRows: UsageFetch = magpieSessionRows()): Promise<TaskCost | undefined> {
+export async function recordTaskCost(db: Surreal, taskId: string, fetchRows: UsageFetch): Promise<TaskCost | undefined> {
   const task = new RecordId('task', taskId);
-  const [leases, , , time] = await db.query<[
-    Array<{ employee: string; fence: number; phase: string; tier: string }>, unknown, unknown,
+  const [claims, , , time] = await db.query<[
+    Array<{ actor: RecordId | string }>, unknown, unknown,
     { created?: number | null; done?: number | null } | undefined,
-  ]>(`SELECT employee, fence, phase, tier FROM model_execution WHERE task = $task AND phase != NONE AND tier != NONE GROUP BY employee, fence, phase, tier;
+  ]>(`SELECT actor FROM audit WHERE task = $task AND action = 'claim' GROUP BY actor;
       LET $accepted = (SELECT VALUE at FROM audit WHERE task = $task AND action = 'accept' ORDER BY at DESC LIMIT 1)[0];
       LET $row = SELECT created_at FROM ONLY $task;
       RETURN { created: IF type::is_datetime($row.created_at) THEN time::unix($row.created_at) END,
         done: IF type::is_datetime($accepted) THEN time::unix($accepted) END };`,
     { task });
-  if (!leases?.length) return undefined;
+  const employees = [...new Set((claims ?? []).map(row => String(row.actor instanceof RecordId ? row.actor.id : row.actor).replace(/^employee:/, '')))];
+  if (!employees.length) return undefined;
   const sessions = new Map<string, string>();
-  for (const lease of leases) sessions.set(sessionOf({ task: taskId, ...lease }), lease.employee);
+  for (const employee of employees) sessions.set(sessionKey(taskId, employee), employee);
   const rows: UsageRow[] = [];
   let complete = true;
   for (const session of sessions.keys()) {
@@ -130,14 +131,13 @@ export async function recordTaskCost(db: Surreal, taskId: string, fetchRows: Usa
 }
 
 /** Cost rows of finished tasks not yet recorded, newest first, bounded; for the lifecycle pass. */
-export async function recordPendingTaskCosts(db: Surreal, opts: { limit?: number; fetchRows?: UsageFetch } = {}): Promise<number> {
+export async function recordPendingTaskCosts(db: Surreal, opts: { limit?: number; fetchRows: UsageFetch }): Promise<number> {
   const [ids] = await db.query<[RecordId[]]>(
     `SELECT VALUE id FROM task WHERE state = 'done' AND created_at > time::now() - 30d
        AND id NOT IN (SELECT VALUE task FROM task_cost) ORDER BY created_at DESC LIMIT $limit;`,
     { limit: opts.limit ?? 20 });
-  const fetchRows = opts.fetchRows ?? magpieSessionRows();
   let written = 0;
-  for (const rid of ids ?? []) if (await recordTaskCost(db, String(rid.id), fetchRows)) written++;
+  for (const rid of ids ?? []) if (await recordTaskCost(db, String(rid.id), opts.fetchRows)) written++;
   return written;
 }
 
@@ -146,20 +146,6 @@ export async function readTaskCost(db: Surreal, taskId: string): Promise<TaskCos
   return row?.cost;
 }
 
-/** Median USD and elapsed seconds of other scored tasks of the same complexity; undefined below `min` samples. */
-export async function costBaseline(db: Surreal, complexity: number, exceptTask: string, min = 5): Promise<{ usd: number; elapsedSeconds: number; samples: number } | undefined> {
-  const [rows] = await db.query<[Array<{ usd?: number; elapsed?: number }>]>(
-    `SELECT cost.usd AS usd, cost.elapsedSeconds AS elapsed FROM task_cost
-       WHERE complexity = $complexity AND task != $task AND at > time::now() - 60d ORDER BY at DESC LIMIT 200;`,
-    { complexity, task: new RecordId('task', exceptTask) });
-  const median = (xs: number[]) => { const s = [...xs].sort((a, b) => a - b); return s.length ? s[Math.floor(s.length / 2)]! : 0; };
-  const usd = (rows ?? []).map(r => r.usd).filter((v): v is number => typeof v === 'number' && v > 0);
-  const elapsed = (rows ?? []).map(r => r.elapsed).filter((v): v is number => typeof v === 'number' && v > 0);
-  if (usd.length < min || elapsed.length < min) return undefined;
-  return { usd: median(usd), elapsedSeconds: median(elapsed), samples: Math.min(usd.length, elapsed.length) };
-}
-
-/** The owner's cost list: settled tasks in a window, newest first, with complexity and the mean calibrated score. */
-export const COST_LIST_SQL = `SELECT task, task.title AS title, complexity, cost, at,
-    math::mean((SELECT VALUE overall FROM scorecard WHERE task = $parent.task)) AS score
+/** The owner's cost list: settled tasks in a window, newest first. */
+export const COST_LIST_SQL = `SELECT task, task.title AS title, cost, at
   FROM task_cost WHERE at > time::now() - type::duration($span) ORDER BY at DESC LIMIT 200;`;

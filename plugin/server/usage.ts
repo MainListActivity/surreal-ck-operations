@@ -1,11 +1,14 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { MagpieUsage } from "./vendor/src/usage/magpie.ts";
-import { digest, TIERS } from "./vendor/src/model-routing/policy.ts";
+import { magpieAuthorization } from "./vendor/src/model-routing/employee-env.ts";
+import { sessionKey } from "./vendor/src/model-routing/magpie-contract.ts";
 import { usageOverview, usageRequests, usageLive } from "../shared/usage";
 import { currentCompany } from "./company";
 import { isQaContext } from "./owner-context";
+import { serviceHome } from "./env";
 export function registerUsage(server: PluginServerContext) {
-  const source = new MagpieUsage();
+  // The employee key authorizes these reads against the VPS magpie. It is read per request, so a missing key fails the read, not the plugin.
+  const source = new MagpieUsage(undefined, undefined, undefined, () => magpieAuthorization(serviceHome()));
   server.handle(usageOverview, async (input, context) => {
     if (isQaContext(context)) throw Error("用量仅对老板开放");
     return source.overview(input);
@@ -21,13 +24,9 @@ export function registerUsage(server: PluginServerContext) {
     const sessions = new Set<string>();
     const session = snapshot.agent.runtimeInfo?.sessionId ?? snapshot.agent.persistence?.sessionId;
     if (session) sessions.add(session);
-    // The lease is local sidecar state. Never query the remote DB or infer sessions from model names.
-    const lease = currentCompany()?.sidecar.routingLease(agentId);
-    if (lease)
-      for (const tier of TIERS)
-        sessions.add(
-          `sck-${digest(`${lease.task}:${lease.employee}:${lease.fence}:${lease.phase}:${tier}`)}`,
-        );
+    // The session key is local sidecar state. Never query the remote DB or infer sessions from model names.
+    const bound = currentCompany()?.sidecar.sessionOf(agentId);
+    if (bound) sessions.add(sessionKey(bound.task ?? "", bound.employee));
     return source.live(sessions);
   });
   return () => source.stop();

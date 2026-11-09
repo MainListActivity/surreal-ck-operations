@@ -130,7 +130,7 @@ export function resolveEndpoint(input: Pick<MagpieSampleInput, 'base' | 'endpoin
     if (!['127.0.0.1', 'localhost', '[::1]', '::1'].includes(u.hostname) || !u.port) return null;
     if (u.pathname !== '/' && u.pathname !== '') return null;
     const endpoint = `${base}/v1`;
-    return { base, source: input.base ? source : (source === 'default' && raw !== 'http://127.0.0.1:3425' ? 'stash' : source), endpoint };
+    return { base, source, endpoint };
   } catch { return null; }
 }
 

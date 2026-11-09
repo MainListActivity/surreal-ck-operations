@@ -61,7 +61,7 @@ beforeAll(async () => {
   peerEngineer = await enroll.enroll('access-eng-peer', 'engineering', ['execute', 'review']);
   qa = await enroll.enroll('access-qa', 'qa', ['execute', 'review']);
   product = await enroll.enroll('access-product', 'product', ['execute', 'review', 'manage']);
-  evaluator = await enroll.enroll('access-eval', 'eval', ['execute', 'review']);
+  evaluator = await enroll.enroll('access-cs', 'cs', ['execute', 'review']);
 }, 60_000);
 
 afterAll(async () => {
@@ -120,7 +120,7 @@ run('a non-holder engineering caller is refused before any process, file or audi
   expect(existsSync(join(home, 'drills', t.runId))).toBe(false);
 });
 
-run('product, qa and eval callers are refused, each with no side effect', async () => {
+run('product, qa and cs callers are refused, each with no side effect', async () => {
   const t = await heldTask('roles');
   const audits = await auditCount();
   const roots = drillRoots();

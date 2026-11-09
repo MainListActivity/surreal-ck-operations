@@ -31,7 +31,7 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
   // Tasks whose audit history cannot be read right now (R3 replay): the read throws until the test clears the entry.
   const unreadable = new Set<string>();
   // Two seats: an independent reviewer other than the implementer needs a second engineer, so the fixture keeps a spare seat (R1).
-  const def: EmployeeDef = { id: 'test', role, provider: 'codex', model: 'fixture', enabled: true, maxInstances: 2, priority: 0, weight: 1, scored: 0, errorStreak: 0 };
+  const def: EmployeeDef = { id: 'test', role, provider: 'codex', model: 'fixture', enabled: true, maxInstances: 2, priority: 0, weight: 1, errorStreak: 0 };
   let next = 0, request = 0, now = 1000;
   const addTask = (id: string, opts: { state?: TaskView['state']; submittedBy?: string; worktreePath?: string; discipline?: string; assets?: string[] } = {}) => {
     if (opts.assets) assetPaths.set(id, opts.assets);
@@ -41,25 +41,25 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
       wtPaths.set(id, opts.worktreePath);
       v.worktree = { id: `wt-${id}`, repo: '/repo', worktreePath: opts.worktreePath, mode: 'exclusive', intent: { kind: 'code' }, discipline: '' };
     }
-    views.set(id, v); rows.push({ ...v, row: {}, evalAttempts: 0, repoPath: opts.worktreePath ? '/repo' : undefined } as unknown as SupervisedTask); };
+    views.set(id, v); rows.push({ ...v, row: {}, repoPath: opts.worktreePath ? '/repo' : undefined } as unknown as SupervisedTask); };
   /** Per-test config overrides; the breaker floors stay 0 unless a test asks for them. */
   let cfgOverride: Partial<typeof DEFAULT_CONFIG> = {};
   const wf = {
-    config: async () => ({ ...DEFAULT_CONFIG, quotaFloorPct: 0, quotaWeeklyFloorPct: 0, sessionMaxWakes: 0, sessionMaxInputK: 0, evalEnabled: false, jevDecisions: false, ...cfgOverride }),
+    config: async () => ({ ...DEFAULT_CONFIG, quotaFloorPct: 0, quotaWeeklyFloorPct: 0, sessionMaxWakes: 0, sessionMaxInputK: 0, jevDecisions: false, ...cfgOverride }),
     defs: async () => [def], serverNow: async () => now, insts: async () => instances.filter(i => !retired.has(i.id)), tasks: async () => rows,
     providerHealth: async () => health, lastDispatch: async () => undefined, recordDispatch: async () => {}, observeSessionIdle: async (observations: Array<{ id: string; since?: number }>) => {
       for (const o of observations) { const i = instances.find(i => i.id === o.id); if (i) i.idleSince = o.since; }
     }, openPendingWakes: async () => [],
     retireIdle: async (inst: EmployeeInst) => { events.push(`retire:${inst.id}:rotation`); retired.add(inst.id); },
     touchWake: async () => {}, defHealthy: async () => {},
-    sessionTaskFacts: async () => ({ states: new Map([...views].map(([id, v]) => [id, v.state as string])), followUps: [] }),
+    sessionTaskFacts: async () => ({ states: new Map([...views].map(([id, v]) => [id, v.state as string])) }),
     markExhausted: async (provider: string, _error: string, resetsAt?: number) => {
       events.push(`exhausted:${provider}`);
       health = new Map(health).set(provider, { provider, state: 'exhausted', until: resetsAt ?? now + 1800, failures: 1 });
       return health.get(provider)!; },
     markHealthy: async (provider: string) => { events.push(`healthy:${provider}`); health = new Map(health).set(provider, { provider, state: 'healthy', failures: 0 }); },
     defFailure: async () => { events.push('performance-failure'); return 1; },
-    spawnInst: async () => { const i: EmployeeInst = { id: `employee-${++next}`, def: def.id, role: def.role, provider: def.provider, model: def.model, credential: `fixture-${next}` }; instances.push(i); return i; },
+    spawnInst: async (_def: EmployeeDef, _repoHome?: string, _scope?: string, sessionTask?: string) => { const i: EmployeeInst = { id: `employee-${++next}`, def: def.id, role: def.role, provider: def.provider, model: def.model, credential: `fixture-${next}`, sessionTask }; instances.push(i); return i; },
     bind: async (id: string, b: { agentId: string; cwd: string; repoHome?: string }) => {
       const { agentId, ...rest } = b;
       Object.assign(instances.find(i => i.id === id)!, { paseoAgentId: agentId, ...rest });
@@ -200,12 +200,13 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     expect((await w.relay(env, 'submit', { text: 'fixture' })).ok).toBe(true);
     w.agents.get(i.paseoAgentId!)!.status = 'idle'; w.addTask('next');
     writeFileSync(join(reqDir(env.SCK_COMM_DIR!), 'old-review.json'), JSON.stringify({ key: env.SCK_COMM_KEY, tool: 'review', args: { decision: 'accept' } }));
-    await d.tick(); expect(w.instances).toHaveLength(1);
+    await d.tick(); expect(w.instances).toHaveLength(2); // a session serves only its own task: 'next' opens a new one
     const oldRequest = readJsonFile<{ ok: boolean }>(join(resDir(env.SCK_COMM_DIR!), 'old-review.json'));
-    expect(oldRequest?.ok).toBe(false); expect(w.events).not.toContain('review:next');
-    expect((await w.relay(env, 'get_task_history', { taskId: 'next' })).ok).toBe(true);
-    expect((await w.relay(env, 'ops_info')).ok).toBe(true);
-    expect((await w.relay(env, 'review', { decision: 'accept', text: 'fixture' })).ok).toBe(true);
+    expect(oldRequest?.ok).not.toBe(true); expect(w.events).not.toContain('review:next');
+    const nextEnv = w.envs.get(w.instances[1]!.paseoAgentId!)!;
+    expect((await w.relay(nextEnv, 'get_task_history', { taskId: 'next' })).ok).toBe(true);
+    expect((await w.relay(nextEnv, 'ops_info')).ok).toBe(true);
+    expect((await w.relay(nextEnv, 'review', { decision: 'accept', text: 'fixture' })).ok).toBe(true);
   });
   test('healthy management-only GM survives idempotent adoption in the same process', async () => {
     const w = world('owner');
@@ -245,7 +246,7 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     const w = world();
     // A free, reusable engineering session anchored to the repo's shared tree.
     const stale = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture',
-      credential: 'fixture-9', cwd: '/repo', repoHome: '/repo' } as EmployeeInst;
+      credential: 'fixture-9', cwd: '/repo', repoHome: '/repo', sessionTask: 't1' } as EmployeeInst;
     w.instances.push(stale);
     w.pool.env(stale); w.pool.bindAgent(stale.id, 'agent-9'); stale.paseoAgentId = 'agent-9';
     w.agents.set('agent-9', { id: 'agent-9', status: 'idle' });
@@ -272,7 +273,7 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     const w = world();
     // A free session parked on its private comm dir — the shape bind() now records.
     const home = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture',
-      credential: 'fixture-9', repoHome: '/repo' } as EmployeeInst;
+      credential: 'fixture-9', repoHome: '/repo', sessionTask: 't1' } as EmployeeInst;
     home.cwd = w.pool.commDirFor(home.id);
     w.instances.push(home);
     w.pool.env(home); w.pool.bindAgent(home.id, 'agent-9'); home.paseoAgentId = 'agent-9';
@@ -290,7 +291,7 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
   test('a message waiting for its translation holds a free session before any lease, then dispatches once translated', async () => {
     const w = world();
     const home = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture',
-      credential: 'fixture-9', repoHome: '/repo' } as EmployeeInst;
+      credential: 'fixture-9', repoHome: '/repo', sessionTask: 't1' } as EmployeeInst;
     home.cwd = w.pool.commDirFor(home.id);
     w.instances.push(home);
     w.pool.env(home); w.pool.bindAgent(home.id, 'agent-9'); home.paseoAgentId = 'agent-9';
@@ -476,7 +477,7 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     expect(report.woke.find(entry => entry.task === 'second')).toMatchObject({ spawned: true });
     expect(w.events).not.toContain(`claim:${old.id}:second`);
   });
-  test('oneshot: an idle session with another task\'s context is not reused; reuse policy still does', async () => {
+  test('an idle session with another task\'s context is not reused under either session policy', async () => {
     const run = async (policy: 'reuse' | 'oneshot') => {
       const w = world();
       w.addTask('first'); await w.dispatcher().tick();
@@ -489,7 +490,7 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
       return { spawned: (await w.dispatcher().tick()).woke.find(entry => entry.task === 'open-next')?.spawned };
     };
     expect(await run('oneshot')).toEqual({ spawned: true });
-    expect(await run('reuse')).toEqual({ spawned: false });
+    expect(await run('reuse')).toEqual({ spawned: true });
   });
   test('a per-role wake limit rotates that role sooner and leaves the global limit for the rest', async () => {
     const w = world();

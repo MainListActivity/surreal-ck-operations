@@ -34,7 +34,7 @@ export interface OutboundMessage {
   translateFailedAt?: string;
 }
 
-const STEPS: readonly MessageStep[] = ['execute', 'review', 'rework', 'nudge', 'eval', 'notice'];
+const STEPS: readonly MessageStep[] = ['execute', 'review', 'rework', 'nudge', 'notice'];
 
 /** A record id's key; a plain value stands for itself. */
 const keyOf = (value: unknown): string => String((value as RecordId | undefined)?.id ?? value ?? '');
@@ -147,11 +147,6 @@ export class OutboundMessageStore {
     if (!draft) return Boolean(employeeLang);
     if (draft.hold || draft.state === 'held') return false;
     return !deliveryOf(draft, employeeLang).ok;
-  }
-
-  /** Public send path for the eval dispatch: marks the table row sent only after the external send succeeded. */
-  async sendPrepared(prepared: { body: string; message: OutboundMessage }): Promise<void> {
-    await this.markSent(prepared.message.id, prepared.message.sentTo ?? '', prepared.body);
   }
 
   async edit(messageId: string, body: string, actor: string): Promise<OutboundMessage> {

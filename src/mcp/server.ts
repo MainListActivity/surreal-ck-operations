@@ -14,7 +14,6 @@ import { answerBytes, answerResult, echoClaim, MAX_REQUEST_ID_BYTES, oversizeReq
 import { REPLY_CEILING_MS, untilAt } from '../snapshot-store';
 
 const roles = ['product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs'] as const;
-const defRoles = [...roles, 'eval'] as const;
 const reviewerRoles = [...roles, 'owner'] as const;
 const states = ['blocked', 'ready', 'doing', 'review', 'done', 'void'] as const;
 const proofShape = {
@@ -338,7 +337,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   server.registerTool('def_ensure', {
     description: 'manage only (product; owner via owner API): create or update an employee_def (audited). tracks [] clears tracks, omitted keeps; enabled=false disables; quotaLimited=false keeps the def dispatchable even at 0% quota (omitted keeps the stored value). Basic fields are required on every call.',
     inputSchema: z.object({
-      id: z.string().min(1).max(60), role: z.enum(defRoles), provider: z.string().min(1).max(60), model: z.string().min(1).max(120),
+      id: z.string().min(1).max(60), role: z.enum(roles), provider: z.string().min(1).max(60), model: z.string().min(1).max(120),
       thinking: z.string().min(1).max(40).optional(), tracks: z.array(z.string().min(1).max(60)).max(50).optional(),
       maxInstances: z.number().int().min(0).max(8).optional(), priority: z.number().int().optional(),
       weight: z.number().int().min(0).max(1000).optional(), enabled: z.boolean().optional(),
@@ -513,37 +512,12 @@ server.registerTool('task_project_update', {
   
   
   
-  server.registerTool('get_model_evidence', {
-    description:'eval/owner only: actual models and execution fences for final task evaluation. Combine with full submission/return/accept history; request counts are not quality scores.',
-    inputSchema:z.object({taskId:z.string().min(1).max(200)}),
-  },async(input,ctx)=>run(token(ctx),()=> {
-    if(!core.modelEvidence) throw new Error('Model evidence unavailable');
-    return core.modelEvidence(token(ctx),input.taskId);
-  }));
   server.registerTool('get_task_cost', {
-    description: 'eval/owner, read-only: what one task consumed, from Magpie per-request usage matched by the task\'s lease sessions — requests, failed requests, input/output/cache tokens, USD over priced requests, unpriced count, model time, wall time from creation to acceptance, and the same per employee and per model. Settled once when the task is done and kept after raw request rows are pruned; complete=false means some session had no rows left in Magpie\'s window, so the totals are a lower bound.',
+    description: 'owner, read-only: what one task consumed, from Magpie per-request usage matched by the task\'s lease sessions: requests, failed requests, input/output/cache tokens, USD over priced requests, unpriced count, model time, wall time from creation to acceptance, and the same per employee and per model. Settled once when the task is done and kept after raw request rows are pruned; complete=false means some session had no rows left in Magpie\'s window, so the totals are a lower bound.',
     inputSchema: z.object({ taskId: z.string().min(1).max(200) }),
   }, async (input, ctx) => run(token(ctx), () => core.taskCost
     ? core.taskCost(token(ctx), input.taskId)
     : Promise.reject({ code: 'temporarily_unavailable' })));
-  server.registerTool('record_score', {
-    description: 'eval employees only: record a performance scorecard for every participant of a finished task. complexity (1-5) is your rating of how hard the task was; the system keeps your overall as judge_overall and stores a calibrated overall: deductions for returns, revocations and refused submits from the audit trail, and an efficiency step for the authors against the median cost and time of tasks of the same complexity.',
-    inputSchema: z.object({
-      taskId: z.string().min(1),
-      summary: z.string().min(1).max(20000),
-      complexity: z.number().min(1).max(5).optional(),
-      scores: z.array(z.object({
-        employee: z.string().min(1),
-        modelScores: z.array(z.object({model:z.string().min(1).max(200),overall:z.number().min(1).max(5),notes:z.string().max(2000).optional()})).max(50).optional(),
-        quality: z.number().min(1).max(5),
-        evidence: z.number().min(1).max(5),
-        discipline: z.number().min(1).max(5),
-        timeliness: z.number().min(1).max(5),
-        overall: z.number().min(1).max(5),
-        notes: z.string().max(4000).optional(),
-      })).max(50),
-    }),
-  }, async (input, ctx) => run(token(ctx), () => core.recordScore(token(ctx), input)));
   // ---- QA 受限只读取证（SYS-DISP 7454fc89） ----
   const qaRelease = (): string | undefined => {
     try { return process.env.SCK_RELEASE ?? basename(realpathSync(process.cwd())); } catch { return undefined; }
@@ -568,7 +542,7 @@ export function createMcpHttpService(options: McpServiceOptions) {
   const server = Bun.serve({
     hostname,
     port: options.port,
-    // Remote DB roundtrips make heavy calls (record_score etc.) exceed Bun's 10s default.
+    // Remote DB roundtrips make heavy calls (company_cmd etc.) exceed Bun's 10s default.
     idleTimeout: 120,
     async fetch(request) {
       const rejected = hostHeaderValidationResponse(request, allowedHosts)

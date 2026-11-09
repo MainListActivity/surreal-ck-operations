@@ -18,7 +18,7 @@ import { loadDatabaseConfig } from '../src/config.ts';
 export const FILE_LIMIT = 20 * 1024 * 1024;
 export const TOTAL_LIMIT = 40 * 1024 * 1024;
 export const KEEP_HOURLY = 2;
-const COUNTED = ['task', 'audit', 'goal', 'employee', 'scorecard'];
+const COUNTED = ['task', 'audit', 'goal', 'employee'];
 
 const home = process.env.SCK_SERVICE_HOME || join(homedir(), 'Library/Application Support/SurrealCKCompany');
 const surreal = process.env.SCK_SURREAL_BIN || join(homedir(), '.surrealdb/surreal');

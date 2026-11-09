@@ -1,5 +1,6 @@
 import { FACTORY_PROVIDER, FACTORY_WAIT_LIMIT, factoryFirst, factoryQueue, leaveFactoryQueue } from './provider-order.ts';
-import { managedModel, employeeClientModel } from "../model-routing/policy.ts";
+import { employeeTier, managedModel, taskTier } from "../model-routing/policy.ts";
+import { groupModel, isGroupModel } from "../model-routing/magpie-contract.ts";
 import type { OwnerDesk } from '../owner.ts';
 import { LaneNoteStore } from '../lane-notes.ts';
 import { OutboundMessageStore, renderMessage, type MessageStep, type OutboundMessage } from '../outbound-messages.ts';
@@ -15,7 +16,7 @@ import { sweepWorktrees, type GitGateway } from './worktrees.ts';
 import { agingLevel, agingText, localDate, renderBrief, type RoleCapacity } from '../owner-brief.ts';
 import type { ReclaimResult } from './worktree-registry.ts';
 import type { ReclaimTrigger } from './worktree-reclaim.ts';
-import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
+import type { JevClient } from './jev.ts';
 import { continuitySession, finishedSessions, reclaimIdleSessions } from './idle-sessions.ts';
 import { observeRuntimeIdle, reclaimMemoryLru } from './memory-lru.ts';
 import { memoryBlocked, resourceBlocks, type HostResources } from './host.ts';
@@ -263,10 +264,6 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     if (p.qualificationOnly) return undefined;
     return cap(provider, exempt) ? undefined : ['provider_capacity', BLOCK_TEXT.provider_capacity];
   };
-  const gate = (_id?: string): Block | undefined => {
-    const until=p.task?.row?.model_route_until;
-    return until&&until>p.now?['quota','模型组暂不可用，等待通道恢复',new Date(until*1000).toISOString()]:undefined;
-  };
   // Track gating: a task with discipline X only routes to defs whose tracks list covers X.
   const trackOk = (task: SupervisedTask | undefined, tracks: string[] | undefined) =>
     trackOkFor(p.role as Role, task, tracks);
@@ -281,10 +278,11 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     if (inst.role !== p.role) continue;
     if ((inst.repoHome ?? inst.cwd ?? p.opsRepo) !== p.home) continue;
     if (!inWorkspace(inst)) continue;
+    // A session serves one task: one bound to another task, or to none, is never a candidate for this one.
+    if (p.task && inst.sessionTask !== p.task.id) continue;
     const def = p.defs.find(d => d.id === inst.def);
-    // Prior-submitter exclusion and the execute gate come first: a candidate that can never take the task must not be reported as merely busy.
+    // Prior-submitter exclusion comes first: a candidate that can never take the task must not be reported as merely busy.
     const hit: Block | undefined =
-      gate(inst.id) ??
       (p.exclusion?.authors.has(inst.id) ? ['prior_submitter', BLOCK_TEXT.prior_submitter] : undefined) ??
       (p.excludeSubmitter && inst.id === p.task?.submittedBy ? ['prior_submitter', BLOCK_TEXT.prior_submitter] : undefined) ??
       ((inst.def && !def) || (def && !def.enabled) ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
@@ -313,7 +311,6 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     const seats = p.insts.filter(i => i.def === def.id && (i.repoHome ?? i.cwd ?? p.opsRepo) === p.home &&
       inWorkspace(i) && !(p.sidecar && i.credentialFile) && !waiting(i)).length;
     const hit: Block | undefined =
-      gate(undefined) ??
       (!def.enabled ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
       (!trackOk(p.task, def.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (resolved === undefined ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
@@ -424,7 +421,7 @@ export interface DispatcherDeps {
   log?: (message: string) => void;
   /** Randomness source for weighted picks; injectable for tests. */
   rand?: () => number;
-  /** Jev System One decision model; undefined disables the Jev evaluation path. */
+  /** Jev System One decision model for notice triage; undefined sends every notice as it is. */
   jev?: JevClient;
   /** Legacy regex sweeper (pre-WT01). Prefer reclaimWorktrees when the managed registry is enabled. */
   git?: GitGateway;
@@ -510,10 +507,8 @@ export interface SidecarBridge {
   adoptRecovery?(inst: EmployeeInst, grantId?: string): Promise<unknown>;
 }
 
-/** Jev-chosen override for one dispatch: force an existing instance, or skip reuse and spawn a chosen def. */
-
 /**
- * Workspace anchor for task-less management dispatches (owner-attention, triage, eval).
+ * Workspace anchor for task-less management dispatches (owner-attention, triage).
  * `task` anchors by task identity: its repoPath picks the candidate home and its id
  * drives readWorkspace project resolution. `home`+`project` anchor a goal directly
  * when no task exists yet (triage): `home` is the resolved repo the candidate pool,
@@ -584,7 +579,6 @@ export interface TickReport {
   refused?: string[];
   exhausted: string[];
   notices: string[];
-  evals: string[];
   /** Jev decisions taken this tick, e.g. "triage:<goal>=quick", "release:<task>", "reroute:<task>". */
   decisions: string[];
   /** Terminal-task artifacts trimmed this tick (see report.skipped === 'resources'). */
@@ -780,7 +774,7 @@ export class Dispatcher {
    * The store keeps the message in draft until the caller confirms the external send succeeded.
    */
   private async prepareOutbound(taskId: string, step: MessageStep, employeeId: string,
-    workdir?: string, history?: ClaimResult['history'], opsRepo?: string): Promise<PreparedOutbound | null | undefined> {
+    workdir?: string, history?: ClaimResult['history']): Promise<PreparedOutbound | null | undefined> {
     const store = this.messageStore();
     if (!store) return undefined;
     try {
@@ -790,7 +784,7 @@ export class Dispatcher {
         if (await this.translationPending(taskId, step, employeeId)) return null;
         await this.notice(`message-hold:${taskId}:${step}`,
           `任务 ${taskId} 的 ${step} 消息被标记「需要我放行」；请在消息流里放行后再派工。`,
-          { commands: 0, revoked: [], extended: [], woke: [], retired: [], exhausted: [], notices: [], evals: [], decisions: [] });
+          { commands: 0, revoked: [], extended: [], woke: [], retired: [], exhausted: [], notices: [], decisions: [] });
         return null;
       }
       const findings = latestFindings(history);
@@ -798,7 +792,7 @@ export class Dispatcher {
       const acId = step === 'execute' || step === 'rework' ? await store.machineCriterionId(taskId) : undefined;
       const body = renderMessage(prepared.body, {
         sckBin: this.deps.env.sckBin, commDir: this.deps.sidecar?.commDirFor(employeeId) ?? '$SCK_COMM_DIR',
-        ...(findings ? { findingsFile: findings.file } : {}), taskId, ...(opsRepo ? { opsRepo } : {}),
+        ...(findings ? { findingsFile: findings.file } : {}), taskId,
         ...(acId ? { acId } : {}),
       });
       return { ...prepared, body, workdir };
@@ -1010,7 +1004,7 @@ export class Dispatcher {
 
   private async pass(): Promise<TickReport> {
     const { workforce: wf, owner, paseo } = this.deps;
-    const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], refused: [], exhausted: [], notices: [], evals: [], decisions: [], realigned: [], recovered: [] };
+    const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], refused: [], exhausted: [], notices: [], decisions: [], realigned: [], recovered: [] };
     report.commands = (await owner.applyPending()).length;
     const cfg = await wf.config();
     const [agents, defs, now, quotaRows, slotRows] = await Promise.all([paseo.list(), wf.defs(), wf.serverNow(),
@@ -1290,7 +1284,8 @@ export class Dispatcher {
         // all stay valid. Realign it in place, and when that is not possible leave it for the next
         // pass rather than throwing the session away.
         const def = defs.find(d => d.id === inst.def);
-        const target = def ? resolveModel(def) : undefined;
+        // A managed group is chosen per task at spawn: the session's own bound model is its target, not a def-level one.
+        const target = !def ? undefined : managedModel(def) ? inst.model : resolveModel(def);
         const served = runtimeModels.get(inst.id) ?? inst.model;
         // Realign only once the subscription has recovered. A provider that switched models because
         // its standard allowance ran out switches back on its own at reset; asking every pass during
@@ -1501,7 +1496,7 @@ export class Dispatcher {
       const home = task?.repoPath ?? anchorHome ?? this.deps.env.opsRepo;
       const eligible = eligibleInsts(role, home, task, excludeSubmitter, exclusion);
       // Oneshot: a task never lands on an unrelated session's context. No continuing session means a new one.
-      if (cfg.sessionPolicy === 'oneshot' && task && role !== 'eval') return continuitySession(eligible, states, task, excludeSubmitter);
+      if (cfg.sessionPolicy === 'oneshot' && task) return continuitySession(eligible, states, task, excludeSubmitter);
       const factory = eligible.filter(i => i.provider === FACTORY_PROVIDER);
       const candidates = factory.length ? factory : eligible;
       // A prior hand is demoted in the weighted pick (PRIOR_HAND_WEIGHT_FACTOR), exactly as in the pool.
@@ -1617,124 +1612,7 @@ export class Dispatcher {
       }
     }
 
-    // 5. Performance evaluation. Jev (System One decision model) scores the finished task in
-    //    one ~500ms round trip; low-confidence or repeated failures escalate to an LLM eval
-    //    employee, which stays the only path when Jev is not configured.
-    if (cfg.evalEnabled) {
-      const jevReady = this.deps.jev !== undefined && cfg.evalEngine !== 'llm';
-      const llmCapable = cfg.evalEngine !== 'jev' && defs.some(d => d.role === 'eval' && d.enabled);
-      for (const task of await wf.pendingEvaluations(3)) {
-        // A recent eval dispatch (LLM or Jev in flight) pauses both engines for this task.
-        const last = await wf.lastDispatch(task.id, task.version, 'eval');
-        const dispatched = last && now - last.at < cfg.redispatchMinutes * 60;
-        const fullHistory = task.row.model_eval_full_history===true;
-        if (!dispatched && !fullHistory && jevReady && task.evalAttempts < 3) {
-          const outcome = await this.jevEvaluate(task, cfg, report);
-          if (outcome === 'done') { report.evals.push(task.id); continue; }
-          if (outcome === 'retry') continue;
-        }
-      }
-      // LLM eval is one batched message every eval_batch_hours (company_meta:config, default 24): it lists
-      // at most 30 done task ids that are unscored or whose Jev verdict was low-confidence. No per-task
-      // eval dispatch exists; the row is an owner-previewable outbound_message marked sent after the send.
-      if (llmCapable && running < cfg.maxRunning) {
-        const lastBatch = await wf.lastEvalBatchAt().catch(() => 0);
-        if (Date.now() - lastBatch >= cfg.evalBatchHours * 3_600_000) {
-          const batch = await wf.pendingEvalBatch(cfg.jevMinConfidence, 30).catch(() => []);
-          const store = this.messageStore();
-          if (batch.length && store) {
-            const draft = await store.createDraft(batch[0].id, 'eval', 'eval', false, 'done',
-              `按 agents/eval.md 的评分规则为以下完成任务的本轮参与员工逐个 record_score：${batch.map(task => task.id).join('、')}。`)
-              .catch(() => undefined);
-            if (draft && (draft.hold || draft.state === 'held')) {
-              await this.notice(`message-hold:${batch[0].id}:eval`,
-                `任务 ${batch[0].id} 的 eval 批量消息被标记「需要我放行」；请在消息流里放行后再派工。`, report);
-            } else if (draft) {
-              const body = renderMessage(draft.body, { sckBin: this.deps.env.sckBin, commDir: '$SCK_COMM_DIR',
-                taskId: batch[0].id, opsRepo: this.deps.env.opsRepo });
-              const prepared: PreparedOutbound = { message: draft, body };
-              const result = await this.assign('eval', undefined, undefined, pick, spawnable,
-                report, insts, false, slotMap, undefined, { task: batch[0] }, undefined, prepared);
-              if (result) {
-                await wf.recordDispatch(batch[0].id, batch[0].version, 'eval', result.id);
-                running++;
-                busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);
-                assigned.add(result.id);
-                report.evals.push(...batch.map(task => task.id));
-                report.woke.push({ task: batch[0].id, employee: result.id, spawned: result.spawned });
-              }
-            }
-          }
-        }
-      }
-    }
     return report;
-  }
-
-  /**
-   * One Jev round trip scores every participant of a finished task.
-   * Returns 'done' when scorecards were written, 'retry' to try again next tick,
-   * 'escalate' to hand the task to the LLM eval role.
-   */
-  private async jevEvaluate(task: SupervisedTask, cfg: CompanyConfig, report: TickReport): Promise<'done' | 'retry' | 'escalate' | 'full-history'> {
-    const { workforce: wf, jev } = this.deps;
-    if (!jev) return 'escalate';
-    const attempts = await wf.bumpEvalAttempt(task.id);
-    let parsed: JevScoreAnswers;
-    try {
-      const state = await wf.evalState(task.id);
-      if(state.timelineTruncated && state.modelExecutions?.length) {
-        await wf.requireFullModelEvaluation(task.id);
-        return 'full-history'; // persisted across retries/restarts; eval reads complete paged history
-      }
-      const questions = jevEvalQuestions(state.participants);
-      const modelJudgements: Array<{key:string;employee:string;model:string}> = [];
-      for (const employee of state.participants) {
-        const models = [...new Set((state.modelExecutions ?? []).filter(r=>r.employee===employee && r.model).map(r=>r.model!))];
-        for (const model of models) {
-          const key = `m${modelJudgements.length}`;
-          modelJudgements.push({key,employee,model});
-          questions[key] = {type:'score',instructions:`根据实际执行轮次和全部提交、退回、修复、最终验收记录，给员工 ${employee} 使用模型 ${model} 的实际贡献打1到5分。区分造成返工和修复返工，排除账号额度、网络等基础设施故障；不得按调用次数分配质量。证据不足时降低置信度。`,criteria:['1：严重缺陷造成返工','2：明显未达标','3：基本完成','4：可靠交付','5：高质量完成或有效修复']};
-        }
-      }
-      const result = Object.keys(questions).length
-        ? await jev.ask({
-          task: { id: task.id, title: state.title, context: state.context, executorRole: state.executorRole, reviewerRole: state.reviewerRole },
-          participants: state.participants,
-          metrics: state.metrics,
-          timeline: state.timeline,
-          modelExecutions: state.modelExecutions,
-        }, questions)
-        : { model: jev.model, answers: {} };
-      parsed = parseJevEval(state.participants, result.answers, cfg.jevFlagThreshold);
-      for (const judgement of modelJudgements) {
-        const answer = result.answers[judgement.key];
-        const entry = parsed.scores.find(s=>s.employee===judgement.employee);
-        if (entry && answer?.type==='score' && Number.isFinite(answer.score)) {
-          (entry.modelScores ??= []).push({model:judgement.model,overall:Math.max(1,Math.min(5,answer.score!)),notes:'最终任务验收后的模型独立评价'});
-          parsed.minConfidence = Math.min(parsed.minConfidence,answer.confidence ?? 0);
-        } else parsed.minConfidence = 0;
-      }
-      const quickNoEscalate = false;
-      if (state.participants.length === 0 || parsed.minConfidence >= cfg.jevMinConfidence || cfg.evalEngine === 'jev' || quickNoEscalate) {
-        const summary = `Jev 评审（${result.model}）：${parsed.topPerformer ? `本轮最佳 ${parsed.topPerformer}；` : ''}` +
-          `${parsed.scores.map(s => `${s.employee} 综合 ${s.overall.toFixed(1)} 置信 ${s.confidence.toFixed(2)}`).join('；') || '无参与者'}` +
-          (quickNoEscalate && parsed.minConfidence < cfg.jevMinConfidence ? '；置信度偏低，quick 目标按规则不升级 LLM 评审' : '');
-        await wf.recordJevEvaluation(task.id, result.model, summary,
-          parsed.scores.map(s => ({ ...s, flagged: parsed.flagged.includes(s.employee) })), state, parsed.topPerformer);
-        for (const emp of parsed.flagged) {
-          await this.notice(`eval-flag:${task.id}:${emp}`,
-            `Jev 评审标记：任务 ${task.id} 中员工 ${emp} 的行为需要你关注（详见 scorecard）。`, report);
-        }
-        this.log(`jev evaluated ${task.id}: ${parsed.scores.length} scorecards, min confidence ${parsed.minConfidence.toFixed(2)}`);
-        return 'done';
-      }
-      this.log(`jev low confidence on ${task.id} (${parsed.minConfidence.toFixed(2)} < ${cfg.jevMinConfidence}); escalating to eval employee`);
-      return 'escalate';
-    } catch (error) {
-      this.log(`jev evaluation failed for ${task.id} (attempt ${attempts}): ${(error as Error).message}`);
-      return attempts >= 3 ? 'escalate' : 'retry';
-    }
   }
 
   /** Every 10 minutes: ownership reclaim (WT02) or legacy done-branch sweep. Dirty / protected trees stay with reasons. */
@@ -1768,9 +1646,12 @@ export class Dispatcher {
     }
   }
 
-  /** `auto:<family>` resolves through the plugin-maintained slot map; literal model ids pin. */
-  private resolveModel(def: EmployeeDef, slots: Map<string, string>): string | undefined {
-    if (managedModel(def)) return employeeClientModel(def.role);
+  /**
+   * `auto:<family>` resolves through the plugin-maintained slot map; literal model ids pin. A managed (claude) def runs on
+   * the magpie group of the task's tier, so the task decides its model; without a task the employee's own tier does.
+   */
+  private resolveModel(def: EmployeeDef, slots: Map<string, string>, task?: SupervisedTask): string | undefined {
+    if (managedModel(def)) return groupModel(task ? taskTier(task.row) : employeeTier(def.role), def.role);
     const model = def.model ?? '';
     return model.startsWith('auto:') ? slots.get(`${def.provider}:${model.slice(5)}`) : model || undefined;
   }
@@ -1797,7 +1678,7 @@ export class Dispatcher {
     spawnable: (role: string, home: string, task?: SupervisedTask, forReview?: boolean) => EmployeeDef[],
     report: TickReport, insts: EmployeeInst[], forReview = false,
     slots?: Map<string, string>, exclusion?: ReviewExclusion, anchor?: DispatchAnchor,
-    hooks?: AssignHooks, evalMessage?: PreparedOutbound,
+    hooks?: AssignHooks,
   ): Promise<(EmployeeInst & { spawned: boolean }) | undefined> {
     const { workforce: wf, paseo, env, sidecar } = this.deps;
     const stepFor = (claim?: ClaimResult): MessageStep => task?.state === 'review' ? 'review'
@@ -1871,8 +1752,8 @@ export class Dispatcher {
           // instance's claim re-resolves the same registered worktree, so its
           // spawn cwd matches by construction.
         } else {
-          const prepared = evalMessage ?? (task ? await this.prepareOutbound(task.id, await nextStep(claim), existing.id,
-            (claim?.worktree ?? workspace)?.worktreePath, claim?.history, env.opsRepo) : null);
+          const prepared = task ? await this.prepareOutbound(task.id, await nextStep(claim), existing.id,
+            (claim?.worktree ?? workspace)?.worktreePath, claim?.history) : null;
           if (task && prepared === null) {
             if (claim) await sidecar!.releaseClaim(existing.id, task.id, await this.skipReason(task.id, await nextStep(claim), existing.id));
             return undefined;
@@ -1911,9 +1792,10 @@ export class Dispatcher {
       if (await this.translationPending(task.id, preStep, pending?.id)) return undefined;
     }
     for (const def of defsOrdered) {
-      const model = this.resolveModel(def, slots ?? new Map());
+      const model = this.resolveModel(def, slots ?? new Map(), task);
       if (!model) continue;
-      const inst = pending ?? await wf.spawnInst(def, repoHome, sidecar ? 'maintenance' : undefined);
+      // The task is written onto the new session before its env is built: model traffic is attributed by it from the first request.
+      const inst = pending ?? await wf.spawnInst(def, repoHome, sidecar ? 'maintenance' : undefined, task?.id);
       let spawnEnv: Record<string, string>;
       let claim: ClaimResult | undefined;
       let workspace: WorktreeAssignment | undefined;
@@ -1947,8 +1829,8 @@ export class Dispatcher {
         const spawnCwd = workspaceScope ? repoHome : instHome ?? (claim?.worktree ?? workspace)?.worktreePath ?? repoHome;
         // A workspace-scoped session keeps its repo-root cwd, but the workdir line must still name the claim's tree.
         const workdir = (claim?.worktree ?? workspace)?.worktreePath ?? spawnCwd;
-        const prepared = evalMessage ?? (task ? await this.prepareOutbound(task.id, await nextStep(claim), inst.id,
-          workdir, claim?.history, env.opsRepo) : null);
+        const prepared = task ? await this.prepareOutbound(task.id, await nextStep(claim), inst.id,
+          workdir, claim?.history) : null;
         if (task && prepared === null) {
           if (claim) await sidecar!.releaseClaim(inst.id, task.id, await this.skipReason(task.id, await nextStep(claim), inst.id));
           return undefined;
@@ -1966,7 +1848,8 @@ export class Dispatcher {
         await hooks?.beforeExternal?.(inst, 'spawn');
         const container = await this.sessionWorkspace(task ?? anchor?.task, spawnCwd, repoHome);
         const agentId = await paseo.spawn({
-          title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model, thinking: def.thinking,
+          // A managed group name is not a Claude model id the thinking flag can address: the level is left unset and says so in the PR.
+          title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model, thinking: isGroupModel(model) ? undefined : def.thinking,
           mode: UNATTENDED_MODE[def.provider], cwd: spawnCwd,
           ...container,
           repoHome,

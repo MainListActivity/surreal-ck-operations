@@ -15,7 +15,7 @@ rtk proxy pnpm run test:worktrees
 
 入口 `scripts/test-worktrees.ts` 只启动 `~/.surrealdb/surreal` 公司 fork 的临时 rocksdb 实例；随机回环端口、合成测试身份、临时 Git 仓库，结束停止该实例并清除临时目录。显式 `SCK_PRODUCT_ENV=/dev/null`，不加载产品 `.env`、私人凭证或生产任务服务。不起真实 dispatcher/Paseo agent。`SCK_WORKTREE_EVIDENCE=<当前任务 evidenceDir 的绝对 JSON 路径>` 可输出本地实际任务/路径/branch/audit ID/时间和登记 before/after；临时路径在结束后不存在，JSON 明确 production=false，不替代生产验收。
 
-覆盖：两次串行 QA 与 GM 共路径；两次串行工程共物理路径但独立分支，第二分支基线不带第一任务改动；两个独立进程同时首次 claim 分得 shared/exclusive，未提交改动互不串改；资产祖孙目录重叠排队、分离目录共享；读引用保护 checkout；重复 claim 不换 fence；真实 fork 重启后登记恢复、撤销交接保留 dirty 旧现场、旧 proof 拒绝；未授权/失败领取无有效引用；穿越、凭证目录与符号链接授权拒绝；真实 Dispatcher→Sidecar→claim.json→派工正文→Paseo cwd 同源；GM/eval 非租约只读引用。原身份、租约、独立验收、任务流和通道重启隔离一并回归。
+覆盖：两次串行 QA 与 GM 共路径；两次串行工程共物理路径但独立分支，第二分支基线不带第一任务改动；两个独立进程同时首次 claim 分得 shared/exclusive，未提交改动互不串改；资产祖孙目录重叠排队、分离目录共享；读引用保护 checkout；重复 claim 不换 fence；真实 fork 重启后登记恢复、撤销交接保留 dirty 旧现场、旧 proof 拒绝；未授权/失败领取无有效引用；穿越、凭证目录与符号链接授权拒绝；真实 Dispatcher→Sidecar→claim.json→派工正文→Paseo cwd 同源；GM 非租约只读引用。原身份、租约、独立验收、任务流和通道重启隔离一并回归。
 
 ## 生产演练（上线后的部署/QA 腿）
 

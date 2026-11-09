@@ -52,7 +52,7 @@ test('renderContextFor renders for an employee the view saw, with the view paths
   const view: BoardView = { at: 1, env: { sckBin: '/bin/sck', opsRepo: '/ops' }, queue: [], employees: { e1: { commDir: '/comm/e1', next: [] } } };
   expect(renderContextFor(view, 'e2', { taskId: 't1', step: 'execute', acceptanceCriteria: undefined })).toBeUndefined();
   expect(renderContextFor(view, 'e1', { taskId: 't1', step: 'execute', acceptanceCriteria: undefined }))
-    .toEqual({ sckBin: '/bin/sck', commDir: '/comm/e1', taskId: 't1', opsRepo: '/ops', acId: DEFAULT_MACHINE_CRITERION });
+    .toEqual({ sckBin: '/bin/sck', commDir: '/comm/e1', taskId: 't1', acId: DEFAULT_MACHINE_CRITERION });
   expect(renderContextFor(view, 'e1', { taskId: 't1', step: 'review', acceptanceCriteria: undefined, findingsFile: 'findings/round-01.md' }))
-    .toEqual({ sckBin: '/bin/sck', commDir: '/comm/e1', taskId: 't1', findingsFile: 'findings/round-01.md', opsRepo: '/ops' });
+    .toEqual({ sckBin: '/bin/sck', commDir: '/comm/e1', taskId: 't1', findingsFile: 'findings/round-01.md' });
 });

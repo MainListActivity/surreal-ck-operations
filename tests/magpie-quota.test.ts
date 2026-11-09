@@ -87,19 +87,13 @@ describe('merging with the Paseo usage list', () => {
 });
 
 describe('gateway address', () => {
-  const never = () => { throw new Error('unreadable'); };
   test('MAGPIE_ADDR wins, with or without a scheme', () => {
-    expect(magpieBase({ MAGPIE_ADDR: '127.0.0.1:4000' }, never)).toBe('http://127.0.0.1:4000');
-    expect(magpieBase({ MAGPIE_ADDR: 'http://10.0.0.5:3425' }, never)).toBe('http://10.0.0.5:3425');
+    expect(magpieBase({ MAGPIE_ADDR: '127.0.0.1:4000' })).toBe('http://127.0.0.1:4000');
+    expect(magpieBase({ MAGPIE_ADDR: 'http://10.0.0.5:4000' })).toBe('http://10.0.0.5:4000');
   });
-  test('the address magpie wired into Claude Code is used when the env has none', () => {
-    const read = () => JSON.stringify({ 'claude.wired_at': 'http://127.0.0.1:3499' });
-    expect(magpieBase({}, read)).toBe('http://127.0.0.1:3499');
-  });
-  test('an absent or unreadable stash falls back to the built-in default', () => {
-    expect(magpieBase({}, never)).toBe('http://127.0.0.1:3425');
-    expect(magpieBase({}, () => JSON.stringify({}))).toBe('http://127.0.0.1:3425');
-    expect(magpieBase({}, () => 'not json')).toBe('http://127.0.0.1:3425');
+  test('the VPS relay is the address when the env names none', () => {
+    expect(magpieBase({})).toBe('https://data.maplayer.top/ofm');
+    expect(magpieBase({ MAGPIE_ADDR: '   ' })).toBe('https://data.maplayer.top/ofm');
   });
 });
 
@@ -119,6 +113,15 @@ describe('reading the snapshot', () => {
     expect(await readMagpieQuotas({ base: 'http://x', fetchImpl: ok({}, 404) })).toBeUndefined();
     expect(await readMagpieQuotas({ base: 'http://x', fetchImpl: ok({ data: 'nope' }) })).toBeUndefined();
     expect(await readMagpieQuotas({ base: 'http://x', fetchImpl: ok([{ provider: 'x' }]) })).toEqual([]);
+  });
+  test('the employee key rides on the VPS read', async () => {
+    const sent: unknown[] = [];
+    const recording = (async (_url: string, init?: RequestInit) => {
+      sent.push(init?.headers);
+      return new Response(JSON.stringify({ data: [] }));
+    }) as unknown as typeof fetch;
+    await readMagpieQuotas({ base: 'https://data.maplayer.top/ofm', headers: { Authorization: 'Bearer employee-key' }, fetchImpl: recording });
+    expect(sent).toEqual([{ Authorization: 'Bearer employee-key' }]);
   });
   test('a bare array body is accepted as well as { data }', async () => {
     const entries = await readMagpieQuotas({ base: 'http://x', fetchImpl: ok([provider({ provider: 'claude' })]) });

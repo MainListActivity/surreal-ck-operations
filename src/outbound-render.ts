@@ -2,7 +2,7 @@
  * 派工消息的纯渲染：模板、占位替换、工作目录行与反向渲染。不读数据库，也不读宿主状态。
  * 派工投递与老板看板共用这里的函数，员工收到的文本与看板上显示的文本逐字相等。
  */
-export type MessageStep = 'execute' | 'review' | 'rework' | 'nudge' | 'eval' | 'notice';
+export type MessageStep = 'execute' | 'review' | 'rework' | 'nudge' | 'notice';
 
 /** The concrete values a stored body renders with. A preview and the real send use the same context, so they match. */
 export interface RenderContext {
@@ -10,7 +10,6 @@ export interface RenderContext {
   commDir: string;
   findingsFile?: string;
   taskId: string;
-  opsRepo?: string;
   acId?: string;
 }
 
@@ -34,8 +33,6 @@ const REVIEW_CODE = `${NOTES}按 task.md 的验收标准复验。${REVIEW_FIRST}
 const REWORK_CODE = `修复 findings/round-NN.md 中的问题后，` + EXECUTE_CODE;
 const REWORK_PLAIN = `修复 findings/round-NN.md 中的问题后，` + EXECUTE_PLAIN;
 const NUDGE = (phase: string) => phase === 'review' ? REVIEW : EXECUTE_PLAIN;
-/** eval 不读本任务 task.md：评分规则在运营仓的 agents/eval.md，由派工时补成绝对路径。 */
-const EVAL = `任务 {taskId} 已完成，读 sck call get_task_history 和 sck call get_model_evidence，按 agents/eval.md 为全部参与员工打分，用 sck call record_score '{"taskId":"{taskId}","summary":"<本轮一句话总结>","complexity":3,"scores":[{"employee":"<员工编号>","quality":4,"evidence":4,"discipline":4,"timeliness":4,"overall":4,"notes":"<评语>","modelScores":[]}]}' 提交`;
 
 /** A route's own template still has to point the session at its notes; the stored draft is the full text the owner previews. */
 export const routeBody = (body?: string): string | undefined =>
@@ -45,15 +42,14 @@ export const templateFor = (step: MessageStep, code = false, phase = 'doing'): s
   step === 'execute' ? (code ? EXECUTE_CODE : EXECUTE_PLAIN)
     : step === 'review' ? (code ? REVIEW_CODE : REVIEW)
       : step === 'rework' ? (code ? REWORK_CODE : REWORK_PLAIN)
-        : step === 'nudge' ? NUDGE(phase)
-          : EVAL;
+        : NUDGE(phase);
 
 /**
  * Pure send-time rewriting of the stored short body. The owner edits the short form; the employee receives
  * concrete absolute paths and a tool binary that is actually on disk. No database or host state is read here.
  */
 export function renderMessage(body: string, opts: RenderContext): string {
-  const { sckBin, commDir, findingsFile, taskId, opsRepo, acId } = opts;
+  const { sckBin, commDir, findingsFile, taskId, acId } = opts;
   const taskFile = `${commDir.replace(/\/+$/, '')}/task.md`;
   const findings = findingsFile ? `${commDir.replace(/\/+$/, '')}/${findingsFile.replace(/^\/+/, '')}` : undefined;
   return body
@@ -62,8 +58,7 @@ export function renderMessage(body: string, opts: RenderContext): string {
     .replaceAll('sck call', `'${sckBin}' call`)
     .replaceAll('task.md', taskFile)
     .replaceAll('notes.md', `${commDir.replace(/\/+$/, '')}/notes.md`)
-    .replaceAll(/findings\/round-(?:\d+|NN)\.md/g, findings ?? 'findings/round-NN.md')
-    .replaceAll('agents/eval.md', opsRepo ? `${opsRepo.replace(/\/+$/, '')}/agents/eval.md` : 'agents/eval.md');
+    .replaceAll(/findings\/round-(?:\d+|NN)\.md/g, findings ?? 'findings/round-NN.md');
 }
 
 /** Head of the workdir line a dispatch appends after the rendered body. The line is absent when the claim names no worktree. */
@@ -119,7 +114,6 @@ export function unrenderMessage(rendered: string, ctx: RenderContext): string | 
   body = swap(body, `'${ctx.sckBin}' call`, 'sck call');
   body = swap(body, `${commDir}/notes.md`, 'notes.md');
   body = swap(body, `${commDir}/task.md`, 'task.md');
-  if (ctx.opsRepo) body = swap(body, `${ctx.opsRepo.replace(/\/+$/, '')}/agents/eval.md`, 'agents/eval.md');
   body = swap(body, ctx.taskId, '{taskId}');
   body = swap(body, ctx.acId ?? DEFAULT_MACHINE_CRITERION, '{acId}');
   return renderMessage(body, ctx) === rendered ? body : undefined;

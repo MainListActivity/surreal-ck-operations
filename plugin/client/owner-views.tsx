@@ -5,7 +5,6 @@
  */
 import { MagpieUsageSurface } from "./usage";
 import { SessionHistorySurface } from "./session-history";
-import {ModelRoutingPanel} from "./model-routing";
 import { openInNewWindow } from "./web";
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
@@ -412,7 +411,7 @@ export function normalizePulse(raw: unknown): Pulse {
 }
 
 /** The workflow state of a blocked item, in the owner's words. */
-const ROLE_LABEL: Record<string, string> = { product: "运营/产品", engineering: "工程", "ai-content": "AI 内容", "concept-design": "原型/概念设计", "asset-production": "量产制作", screenwriter: "专职编剧", "story-author": "长篇故事作者", cinematography: "摄影摄像", qa: "测试", cs: "客户成功", eval: "评审" };
+const ROLE_LABEL: Record<string, string> = { product: "运营/产品", engineering: "工程", "ai-content": "AI 内容", "concept-design": "原型/概念设计", "asset-production": "量产制作", screenwriter: "专职编剧", "story-author": "长篇故事作者", cinematography: "摄影摄像", qa: "测试", cs: "客户成功" };
 const MODEL_PREVIEW = 10;
 
 function RegisterDefCard({ ctx, editing, onDone, onCancel }: {
@@ -900,7 +899,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                             <View key={d.id} style={{ gap:sp(2) }}>
                               <View style={s.row}>
                                 <Text style={[s.text, { flex: 1 }]}>
-                                  {d.provider}/{d.resolved ?? d.model} · 上限 {d.maxInstances}{d.avgScore ? ` · 绩效 ${d.avgScore.toFixed(1)}` : ""}{d.quotaLimited === false ? " · 不受额度限制" : ""}{d.enabled ? "" : " · 已停用"}
+                                  {d.provider}/{d.resolved ?? d.model} · 上限 {d.maxInstances}{d.quotaLimited === false ? " · 不受额度限制" : ""}{d.enabled ? "" : " · 已停用"}
                                 </Text>
                                 <Pressable accessibilityRole="button" style={s.chip} onPress={() => setEditDef(d)}>
                                   <Text style={s.chipText}>编辑</Text>

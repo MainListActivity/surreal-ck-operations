@@ -9,7 +9,7 @@ const PRODUCT = '/product/repo';
 
 const def = (id: string, over: Partial<EmployeeDef> = {}): EmployeeDef =>
   ({ id, role: 'engineering', provider: 'codex', model: 'm1', enabled: true, maxInstances: 2,
-    priority: 100, weight: 10, scored: 0, errorStreak: 0, ...over });
+    priority: 100, weight: 10, errorStreak: 0, ...over });
 
 const inst = (id: string, over: Partial<EmployeeInst> = {}): EmployeeInst =>
   ({ id, role: 'engineering', def: 'd1', provider: 'codex', model: 'm1', paseoAgentId: `ag-${id}`, workspaceScope: 'maintenance', ...over });
@@ -23,15 +23,15 @@ const base = (over: Partial<StaffingInput> = {}): StaffingInput => ({
 });
 
 test('pool: reuse instance gets def effective weight and normalized share', () => {
-  const d = def('d1', { weight: 10, avgScore: 4.5 });   // factor 1.5 → effective 15
+  const d = def('d1', { weight: 10 });   // effective weight is the configured weight
   const i = inst('i1');
   const entries = staffingPool(base({ defs: [d], insts: [i], states: new Map([['i1', 'idle']]) }));
   const reuse = entries.find(e => e.kind === 'reuse')!;
   const spawn = entries.find(e => e.kind === 'spawn')!;
-  expect(reuse.weight).toBeCloseTo(15);
+  expect(reuse.weight).toBeCloseTo(10);
   expect(reuse.eligible).toBe(true);
   expect(spawn.eligible).toBe(true);
-  // 15 / (15 + 15) = 0.5 each
+  // 10 / (10 + 10) = 0.5 each
   expect(reuse.share).toBeCloseTo(0.5);
   expect(spawn.share).toBeCloseTo(0.5);
 });
@@ -269,17 +269,8 @@ test('pool: the seat cap still bounds an exempt def', () => {
   expect(entries.every(e => !e.eligible && e.code === 'provider_capacity')).toBe(true);
 });
 
-test('pool: aggregate magpie group backoff applies even to a native-quota-exempt harness',()=>{
- const d=def('d1',{quotaLimited:false});const i=inst('i1');const task={row:{model_route_until:1_000_060}} as SupervisedTask;
- const input=base({defs:[d],insts:[i],states:new Map([['i1','idle']]),task,sidecar:false});
- expect(staffingPool(input).filter(e=>e.eligible)).toHaveLength(0);
- expect(staffingPool(input).find(e=>e.kind==='reuse')?.code).toBe('quota');
- expect(staffingPool({...input,now:1_000_061}).some(e=>e.eligible)).toBe(true);
-});
-
-
 test('managed Claude pool ignores subscription model quotas and provider capacity but preserves lease and exclusion gates',()=>{
-  const d=def('d1',{provider:'claude',model:'group/sck-haiku',quotaLimited:false,avgScore:1});
+  const d=def('d1',{provider:'claude',model:'group/sck-haiku',quotaLimited:false});
   const i=inst('i1',{provider:'claude',model:'actual-model'});
   const p=base({defs:[d],insts:[i],states:new Map([['i1','idle']]),providerMax:{claude:0},busyBy:new Map([['claude',20]]),quotaBlocked:new Map([['claude','spent']]),health:new Map([['claude',{provider:'claude',state:'exhausted',failures:4,until:2000000}]])});
   expect(staffingPool(p).every(e=>e.eligible)).toBe(true);
@@ -316,7 +307,7 @@ test('managed recency order: least recently woken first, a prior hand last, and 
 test('Factory queue admission preserves exclusion and allows overflow and exhausted-quota fallback',()=>{
  const factory=def('factory',{provider:'factory-droid',maxInstances:1});
  const claude=def('claude',{provider:'claude',model:'group/sck-haiku',quotaLimited:false});
- const f=inst('f',{def:'factory',provider:'factory-droid'}),c=inst('c',{def:'claude',provider:'claude',model:'group/sck-haiku'});
+ const f=inst('f',{def:'factory',provider:'factory-droid',sessionTask:'queued'}),c=inst('c',{def:'claude',provider:'claude',model:'group/sck-haiku',sessionTask:'queued'});
  const t={id:'queued',state:'review',executorRole:'engineering',reviewerRole:'engineering',row:{}} as unknown as SupervisedTask;
  const input=base({defs:[factory,claude],insts:[f,c],task:t,excludeSubmitter:true,states:new Map([['f','busy'],['c','idle']]),providerMax:{'factory-droid':1,claude:4},factoryQueue:new Map([['queued:engineering:review',3]])});
  expect(staffingPool(input).find(e=>e.key==='c')).toMatchObject({eligible:false,code:'factory_wait',share:0});
@@ -341,4 +332,15 @@ test('pool: a session waiting between turns frees its seat; one that holds a lea
   expect(spawnOf({ states: new Map([['i1', 'sleeping']]) }).eligible).toBe(true);
   expect(spawnOf({ states: new Map([['i1', 'busy']]) }).code).toBe('seat_full');
   expect(spawnOf({ states: new Map([['i1', 'idle']]), holding: new Set(['i1']) }).code).toBe('seat_full');
+});
+
+test('pool: a session serves one task, so one bound to another task or to none is never a candidate for this one', () => {
+  const d = def('d1', { maxInstances: 3 });
+  const t = { id: 'queued', state: 'doing', executorRole: 'engineering', reviewerRole: 'engineering', row: {} } as unknown as SupervisedTask;
+  const insts = [inst('bound', { sessionTask: 'queued' }), inst('other', { sessionTask: 'elsewhere' }), inst('unbound')];
+  const reuseKeys = (over: Partial<StaffingInput>) => staffingPool(base({ defs: [d], insts, states: new Map([['bound', 'idle'], ['other', 'idle'], ['unbound', 'idle']]), ...over }))
+    .filter(e => e.kind === 'reuse').map(e => e.key);
+  expect(reuseKeys({ task: t })).toEqual(['bound']);
+  // Without a task the pool is the repository-wide preview, which lists every session.
+  expect(reuseKeys({}).sort()).toEqual(['bound', 'other', 'unbound']);
 });

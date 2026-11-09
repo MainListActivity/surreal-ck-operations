@@ -25,8 +25,6 @@ type CompanyApi = {
     revokeTaskLease(taskId: string, reason: string, handover: string, actor: string): Promise<{ ok: boolean; employee?: string }>;
   };
   db: { db: import("surrealdb").Surreal };
-  modelRouting: import("./vendor/src/model-routing/controller.ts").ModelRoutingController;
-  modelRanking: import("./vendor/src/model-routing/ranking.ts").RankingRefresher;
   opsRepo: string;
 };
 
@@ -123,56 +121,6 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
 
     try {
       if (req.method === "GET" && sub === "/") return text(PAGE, 200, "text/html; charset=utf-8");
-      if (req.method === "GET" && sub === "/ranking") {
-        const { rankingPage }=await import("./ranking-page.ts");
-        return text(rankingPage,200,"text/html; charset=utf-8");
-      }
-      if(req.method==='GET'&&sub==='/api/model-catalog'){
-        try{const {ownerModelCatalog}=await import('./owner-actions.ts');return json(await ownerModelCatalog(await opts.company(),{query:url.searchParams.get('query')??'',offset:Number(url.searchParams.get('offset')??0),limit:40}));}
-        catch{return json({error:'模型目录读取失败'},400);}
-      }
-      if(req.method==='POST'&&['/api/model-membership','/api/model-alias'].includes(sub)){
-        if(req.headers.get('origin')&&req.headers.get('origin')!==url.origin)return json({error:'origin mismatch'},403);
-        try{
-          const b=await req.json();
-          if(sub==='/api/model-membership'){
-            const {ownerModelMembership}=await import('./owner-actions.ts');
-            return json(await ownerModelMembership(await opts.company(),b));
-          }
-          const {ownerModelAlias}=await import('./owner-actions.ts');
-          return json(await ownerModelAlias(await opts.company(),b as {model?:unknown;slug?:unknown}));
-        }catch(error){return json({error:(error as Error).message.slice(0,300)},409);}
-      }
-      if (req.method === "GET" && sub === "/api/model-ranking") {
-        const { ownerModelRanking }=await import("./owner-actions.ts");
-        return json(await ownerModelRanking(await opts.company()));
-      }
-      if(req.method==='POST'&&sub==='/api/model-ranking/preview'){
-        if(req.headers.get('origin')&&req.headers.get('origin')!==url.origin)return json({error:'origin mismatch'},403);
-        try{const b=await req.json() as {policy:unknown;refresh?:boolean};
-          const {ownerModelRankingPreview}=await import('./owner-actions.ts');
-          return json(await ownerModelRankingPreview(await opts.company(),b.policy,b.refresh));
-        }catch{return json({error:'预览失败：请检查权重或点击更新观测'},400);}
-      }
-      if (req.method === "POST" && sub === "/api/model-ranking/pin") {
-        if(req.headers.get("origin")&&req.headers.get("origin")!==url.origin)return json({error:"origin mismatch"},403);
-        const b=await req.json() as {group?:unknown;model?:unknown;pinned?:unknown};
-        try {
-          const {ownerModelRankingPin}=await import('./owner-actions.ts');
-          return json(await ownerModelRankingPin(await opts.company(),b));
-        } catch (error) {
-          const invalid = /invalid/.test((error as Error).message);
-          return json({error:invalid?"置顶参数无效":"置顶更新失败，请刷新后重试"},invalid?400:409);
-        }
-      }
-      if (req.method === "POST" && sub === "/api/model-ranking") {
-        if(req.headers.get("origin")&&req.headers.get("origin")!==url.origin)return json({error:"origin mismatch"},403);
-        try{
-          const b=await req.json() as {rules?:unknown;refreshMinutes?:unknown;policy?:unknown};
-          const {ownerModelRankingSave}=await import('./owner-actions.ts');
-          return json(await ownerModelRankingSave(await opts.company(),b));
-        }catch{return json({error:'排序设置无效或保存失败'},400);}
-      }
       if (req.method === "GET" && sub === "/api/inbox") return json(await (async()=>{const c=await opts.company();return c.upgrades?c.upgrades.inbox():c.owner.inbox();})());
       if (req.method === "GET" && sub === "/api/brief") return json(await (await opts.company()).owner.brief());
       if (req.method === "GET" && sub === "/api/tasks") {
@@ -379,7 +327,6 @@ ${relayShellCss}
 <button data-t="routes" data-cmd="tab:routes">${relayIcon("layers")}<span>路由表</span></button>
 <button data-t="notes" data-cmd="tab:notes">${relayIcon("layers")}<span>线的笔记</span></button>
 <button data-cmd="theme" id="theme-btn" class="icon-button theme-toggle" aria-label="切换主题">${relayIcon("moon")}<span class="theme-label">深色</span></button>
-<button onclick="location.href='ranking'" class="refresh">${relayIcon("layers")}<span>模型排序</span></button>
 </nav><div class="sidebar-footer"><div class="operator"><span class="avatar">B</span><span><strong>老板</strong><small id="release-ver">控制面</small></span></div></div></aside>
 <div class="main-area"><header class="topbar"><div class="breadcrumb"><span>公司</span><b>/</b><strong id="crumb">目标进度</strong></div>
 <div class="top-actions"><span class="status" id="stat">加载中…</span><button class="refresh" id="pause-btn" data-cmd="toggle-pause">暂停派工</button><button class="refresh" data-cmd="refresh">${relayIcon("refresh")}<span>刷新</span></button></div></header>
@@ -674,7 +621,7 @@ function renderInbox(){
 }
 let BOARD={};const STAFF_EDITS=new Map();
 const RUNNER_ZH={online:'在线',offline:'离线',unknown:'未知'};
-const STEP_ZH={execute:'执行',review:'复核',rework:'返工',nudge:'催办',eval:'评审',notice:'通知'};
+const STEP_ZH={execute:'执行',review:'复核',rework:'返工',nudge:'催办',notice:'通知'};
 const PHASE_ZH={execute:'执行',review:'复核'};
 /** Ages are read against the board's own clock, so a page clock running ahead cannot make a stale beat look fresh. */
 function agoText(at){const s=Math.max(0,Math.round(((BOARD.at||Date.now())-at)/1000));return s<60?s+' 秒前':s<3600?Math.round(s/60)+' 分钟前':clock(at)}
@@ -729,7 +676,7 @@ async function staffSave(msg,emp){
 function renderDefs(){
   $('flow-pane').innerHTML='<div class="flow-pane"><div class="flow-head"><h1>编制</h1></div><div class="decision-grid">'
     +DEFS.map(d=>'<article class="decision-card"><div class="card-top"><span class="type-label">'+esc(d.role)+'</span><span class="status '+(d.enabled?'success':'')+'">'+(d.enabled?'启用':'停用')+'</span></div><h3>'+esc(d.id)+'</h3><p class="byline">'+esc(d.provider)+' · '+esc(d.model||'')+'</p><div class="decision-actions"><button data-cmd="toggle-def:'+esc(d.id)+':'+(d.enabled?0:1)+'">'+(d.enabled?'停用':'启用')+'</button></div></article>').join('')+'</div></div>';
-  $('drawer').innerHTML='<div class="kicker">DEF</div><h2>新建 / 修改编制</h2><div class="task-form"><label>ID<input id="d-id"/></label><label>岗位<select id="d-role">'+['product','engineering','qa','concept-design','asset-production','screenwriter','story-author','cinematography','cs','eval'].map(r=>'<option>'+r+'</option>').join('')+'</select></label><label>provider<input id="d-provider" value="codex"/></label><label>model<input id="d-model" value="auto:sol"/></label><div class="row"><button class="primary" data-cmd="create-def">保存编制</button></div></div>';
+  $('drawer').innerHTML='<div class="kicker">DEF</div><h2>新建 / 修改编制</h2><div class="task-form"><label>ID<input id="d-id"/></label><label>岗位<select id="d-role">'+['product','engineering','qa','concept-design','asset-production','screenwriter','story-author','cinematography','cs'].map(r=>'<option>'+r+'</option>').join('')+'</select></label><label>provider<input id="d-provider" value="codex"/></label><label>model<input id="d-model" value="auto:sol"/></label><div class="row"><button class="primary" data-cmd="create-def">保存编制</button></div></div>';
 }
 function render(){if(T==='flow')renderFlow();else if(T==='inbox')renderInbox();else if(T==='staff')renderStaff();else if(T==='routes')renderRoutes();else if(T==='notes')renderLaneNotes();else renderDefs()}
 async function saveMsg(id){await api('message.edit',{messageId:id,body:$('msg-body').value});toast('已保存');await load()}

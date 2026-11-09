@@ -26,7 +26,7 @@ let seq = 0;
 const key = (label: string) => `nul-${suffix}-${label}-${++seq}`;
 const ids = {
   gmA: `nul-gma-${suffix}`, gmB: `nul-gmb-${suffix}`, engA: `nul-enga-${suffix}`, engB: `nul-engb-${suffix}`,
-  holderA: `nul-hla-${suffix}`, holderB: `nul-hlb-${suffix}`, evalH: `nul-evh-${suffix}`,
+  holderA: `nul-hla-${suffix}`, holderB: `nul-hlb-${suffix}`, csH: `nul-csh-${suffix}`,
 };
 setDefaultTimeout(180_000);
 
@@ -37,7 +37,7 @@ let repo: string;
 let pool: SidecarPool;
 let service: ReturnType<typeof createMcpHttpService>;
 let mcpUrl: URL;
-let gmA: Credential, gmB: Credential, engA: Credential, engB: Credential, holderA: Credential, holderB: Credential, evalH: Credential;
+let gmA: Credential, gmB: Credential, engA: Credential, engB: Credential, holderA: Credential, holderB: Credential, csH: Credential;
 const env: Record<string, { SCK_COMM_DIR: string; SCK_COMM_KEY: string }> = {};
 let taskA: TaskView, taskB: TaskView, taskQa: TaskView, queueA: TaskView, queueB: TaskView;
 let treeA = '', treeB = '';
@@ -109,7 +109,7 @@ beforeAll(async () => {
   engB = await enrollment.enroll(ids.engB, 'engineering', ['execute', 'review']);
   holderA = await enrollment.enroll(ids.holderA, 'asset-production', ['execute']);
   holderB = await enrollment.enroll(ids.holderB, 'asset-production', ['execute']);
-  evalH = await enrollment.enroll(ids.evalH, 'eval', ['execute']);
+  csH = await enrollment.enroll(ids.csH, 'cs', ['execute']);
 
   // A git repository for the registry. Its trees are created beside it, inside the temporary parent removed in afterAll.
   base = realpathSync(mkdtempSync(join(tmpdir(), 'sck-null-absent-')));
@@ -141,7 +141,7 @@ beforeAll(async () => {
   env.engA = channel(ids.engA, 'engineering', engA);
   env.holderA = channel(ids.holderA, 'asset-production', holderA);
   env.holderB = channel(ids.holderB, 'asset-production', holderB);
-  env.evalH = channel(ids.evalH, 'eval', evalH);
+  env.csH = channel(ids.csH, 'cs', csH);
 
   // engA holds a real sidecar lease on taskA (its tree A). engB claims taskB directly on the core (its tree B).
   const leased = await pool.claim({ id: ids.engA, role: 'engineering', credential: engA } as unknown as EmployeeInst, { id: taskA.id } as unknown as SupervisedTask);

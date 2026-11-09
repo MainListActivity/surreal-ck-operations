@@ -1,8 +1,7 @@
 import { employeeSessionLookup } from "./server/employee-session";
 import {registerUsage} from './server/usage';
-import {registerAgentMetrics} from "./server/agent-metrics";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { installBunShim } from "./server/bun-shim";
 import { installNodeHost } from "./server/vendor/src/host-node.ts";
@@ -11,8 +10,8 @@ import { createConsoleFetch } from "./server/console";
 import { registerHandlers } from "./server/handlers";
 import { startDispatch } from "./server/dispatch";
 import { loadServiceEnv, serviceHome } from "./server/env";
+import { employeeModelEnv } from "./server/model-env";
 import { startPreview, type PreviewHandle } from "./server/preview";
-import { routingEnv, installRoutingSettings } from "./server/vendor/src/model-routing/gateway.ts";
 import { registerScrub, sandboxGap } from "./server/scrub";
 
 // The company DB lives on a remote WSS; when it drops, the SDK rejects every
@@ -30,7 +29,6 @@ export default function contribute(server: PluginServerContext) {
   installNodeHost();
   loadServiceEnv(); // SCK_SCRUB_ENV lives there, and the zsh shim is written below, before the company stack boots
   registerHandlers(server);
-  const stopMetrics=registerAgentMetrics(server);
   const stopUsage=registerUsage(server);
   const paseoConfig = join(process.env.PASEO_HOME ?? join(homedir(), ".paseo"), "config.json");
   const identifyEmployee = employeeSessionLookup(async agentId => {
@@ -41,27 +39,15 @@ export default function contribute(server: PluginServerContext) {
     }, join(serviceHome(), "private", "employee-agents.json"));
   const stopScrub = registerScrub(server, process.env, { zdotdir: join(serviceHome(), "zdot"),
     employee: identifyEmployee, rememberEmployee: identifyEmployee.remember,
-    sandbox: provider => sandboxGap(provider, paseoConfig, join(serviceHome(), "sandbox", "bin")), modelEnv: async request => {
-    if(request.provider !== "claude") return {};
-    const ctx=await company();
-    if(!ctx.modelRouting.enabled) return {};
-    const ref=request.env.SCK_COMM_DIR ? `employee:${basename(request.env.SCK_COMM_DIR)}` : request.agentId;
-    const session=ctx.sidecar.routingSession(ref);
-    if(session?.role === "story-author") return {};
-    if(!session)throw new Error("公司模型路由尚未恢复员工会话登记");
-    const env=routingEnv(`employee:${session.employee}`);
-    installRoutingSettings(session.comm,env);
-    return { ...env, SCK_CLAUDE_SETTINGS: join(session.comm, ".claude", "settings.local.json") };
-  } });
+    sandbox: provider => sandboxGap(provider, paseoConfig, join(serviceHome(), "sandbox", "bin")),
+    modelEnv: async request => employeeModelEnv(request, (await company()).sidecar, serviceHome()) });
   const stopDispatch = startDispatch(server);
   let preview!: PreviewHandle;
   const consoleFetch = createConsoleFetch({ home: serviceHome(), company, lanBase: () => preview.lanUrl });
   preview = startPreview({ consoleFetch });
   return () => {
     stopDispatch();
-    stopMetrics();
     stopUsage();
-    void company().then(ctx=>ctx.stopModelGateway());
     void preview.stop();
     stopScrub();
   };

@@ -130,7 +130,7 @@ sck call company_cmd '{"command":"<命令名>","input":{...}}'
 
 ## 员工编制（SurrealDB）
 
-- **员工定义** `employee_def`：`role`（八任务岗位 + `eval` 评审）、`provider`（codex / grok / devin）、`model`、`thinking`，可选 `max_instances`（默认 1）、`weight`（派工权重，默认 10）、`enabled`、`tracks`（岗位轨名单：非空则只接 `discipline` 在列的任务，缺省或空 = 全接）。可直接写库，例如：
+- **员工定义** `employee_def`：`role`（任务岗位）、`provider`（codex / grok / devin）、`model`、`thinking`，可选 `max_instances`（默认 1）、`weight`（派工权重，默认 10）、`enabled`、`tracks`（岗位轨名单：非空则只接 `discipline` 在列的任务，缺省或空 = 全接）。可直接写库，例如：
 
   ```sql
   UPSERT employee_def:engineering-grok CONTENT { role: 'engineering', provider: 'grok', model: 'auto:grok', thinking: 'medium', max_instances: 2, weight: 25 };
@@ -138,32 +138,27 @@ sck call company_cmd '{"command":"<命令名>","input":{...}}'
 
   `model` 是槽位而非钉子：`auto:<族>`（`auto:sol` / `auto:grok` / `auto:swe`）表示跟随该 provider 该模型族的最新版——Paseo 插件每 5 分钟经 `providers.listModels` 刷新 `company_meta:model_slots`，调度器在派工前把槽位解析成具体模型 id（如 `auto:sol → gpt-6.1-sol`）再 spawn。厂家发布 `gpt-6.2-sol` 后：槽位更新 → 当 tick 先退役空闲旧模型实例（忙碌中的跑完当前会话）→ 下一个任务用新模型起新会话，全过程零人工。字面量（如 `gpt-6.1-sol`）则 pin 死。跨族/改名（`gpt-7`、新命名线）不会被 auto 匹配，等人工决策；槽位解析失败时该 def 不可新开并给老板发通知，存量实例继续跑上次的模型。首次采用新版本时插件发一条告知通知（不需要批准）。
 
-  或 `pnpm run admin def set|list|weight|tracks|enable|disable`、`pnpm run admin seed-defs`（写入默认 30 个定义：九岗位含 eval × codex/grok/devin 三订阅，另加 screenwriter-agy、story-author-agy（antigravity 单座）、cinematography-codex（codex 单座））。`def tracks <id> <轨,轨|->` 限定编制的岗位轨；`def set` 不带轨参数，不会清掉已设的 tracks。也可在 Paseo 编制页用「注册员工」表单：岗位/provider/模型/thinking 全部下拉自 Paseo 实时数据（`providers.snapshot` + `listModels`），服务端注册前再校验一遍，杜绝手填错字。def id 自动取 `<role>-<provider>`。
+  或 `pnpm run admin def set|list|weight|tracks|enable|disable`、`pnpm run admin seed-defs`（写入默认定义：各任务岗位 × codex/grok/devin 三订阅（不含 eval 岗位），另加 screenwriter-agy、story-author-agy（antigravity 单座）、cinematography-codex（codex 单座））。`def tracks <id> <轨,轨|->` 限定编制的岗位轨；`def set` 不带轨参数，不会清掉已设的 tracks。也可在 Paseo 编制页用「注册员工」表单：岗位/provider/模型/thinking 全部下拉自 Paseo 实时数据（`providers.snapshot` + `listModels`），服务端注册前再校验一遍，杜绝手填错字。def id 自动取 `<role>-<provider>`。
 
-- **派工权重**：同岗位多个合格候选（空闲实例或可新开的定义）按 `weight × 绩效系数` 加权随机选取；`weight=0` 不会被主动选中（同岗位所有候选都是 0 时才均匀分配）。绩效系数 = `clamp(avg_score/3, 0.3, 2)`，尚无评分时为 1。调权：`pnpm run admin def weight <id> <n>`，或直接改 `employee_def.weight`——下一轮 tick 生效，无需重启。
+- **派工权重**：同岗位多个合格候选（空闲实例或可新开的定义）按 `weight` 加权随机选取；`weight=0` 不会被主动选中（同岗位所有候选都是 0 时才均匀分配）。员工绩效系数已于 0.5.0 删除，不再参与加权。调权：`pnpm run admin def weight <id> <n>`，或直接改 `employee_def.weight`——下一轮 tick 生效，无需重启。
 
-- **绩效评分**：任务进入 done 后进入评审。默认走 **Jev**（TypeSafe System One 决策模型）：调度器进程内一次 HTTPS 调用（约 70–500ms，每任务一次往返），把任务审计时间线和行为指标作为 state，让 Jev 对每位参与者打 1–5 分 × 5 维度（quality / evidence / discipline / timeliness / overall），同时返回逐题**校准置信度**与概率分布，写入 `scorecard`（`judge='jev'`）并滚动更新 `avg_score`。
-  - Jev 不信任自己拿不准的判断：任一题 confidence < `jev_min_confidence`（默认 0.7）→ 不记分，任务升级给 `eval` 岗位的 LLM 评审员做深审；Jev 调用连续失败 3 次（`eval_attempts`）同样升级。
-  - Jev 对每位参与者另问一条风险 noul：概率 ≥ `jev_flag_threshold`（默认 0.65）→ scorecard 标 `flagged` 并给老板收件箱写一条提醒（是否弹窗再由 Jev 分诊）。
-  - `eval_engine`：`auto`（默认，Jev 优先、LLM 兜底）/ `llm`（只用 LLM 评审员）/ `jev`（只用 Jev，低置信度也记录）。
-  - 没有 Jev key 时整条 Jev 通道自动关闭，行为与原来一致（LLM 评审员兜底）。
-  - 查看：`pnpm run admin scores [任务ID]`、`pnpm run company status`。关闭评审：`pnpm run admin config eval_enabled false`。
+- **绩效评分（0.5.0 已删除）**：`scorecard`、`record_score`、`get_model_evidence`、eval 岗位、每日 eval 批次与 Jev 评分均已删除，`eval_*`、`jev_*` 配置项同时失效。Jev 本身保留，用于通知分级与派工辅助。
 - **员工实例**：`employee` 表中带 `def` 的记录，由调度器按需生成；`paseo_agent_id` 登记实际会话，是实例身份的权威绑定。新实例的凭证不落盘——由插件 sidecar 在内存中代持，`spawn` 环境只注入 `SCK_COMM_DIR`/`SCK_COMM_KEY`；`claim`/续租/提交由 sidecar 以该凭证程序化执行，agent 进程拿不到也不认识它。`retired=true` 或凭证撤销后所有调用即 401，实例随会话关闭退役。同一定义连续 3 次异常会自动停用并通知老板。`pnpm run admin inst list` 查看。
   旧的凭证文件会话（`credential_file` 非空的实例）继续按原方式收尾，但不再被通道代领新任务，自然淘汰。
 - 旧员工（gm-01 等）以 `admin bind <员工编号> <agentId> <def>` 挂到定义上，继续保留身份和历史。
 
-## 任务成本与综合评分
+## 任务成本
 
-每个完成的任务在生命周期轮询（约 30 分钟一轮）或评分时结算成本，存入 `task_cost`：
+每个任务在完成时结算成本，存入 `task_cost`。结算不依赖评分（0.5.0 起）：
 
-- **来源**：Magpie 本机 `/v1/magpie/usage/requests` 的逐请求行（`cost`、`priced`、token、`ms`）。网关给每个租约请求带 `x-magpie-session = sck-<digest(task:employee:fence:phase:tier)>`，结算时从该任务的 `model_execution` 重算会话并精确匹配。未定价的请求单独计数（`unpriced`），不按 0 冒充；某个会话在 Magpie 30 天窗口里已无记录时 `complete=false`，金额是下限。
-- **内容**：请求数、失败数、输入/输出/缓存读写 token、USD、模型耗时、建单到最后一次 accept 的总时长，再按员工和模型拆分。原始 `model_execution` 行在结算前不会被保留期清理。
-- **查看**：`pnpm run company cost <任务ID>` 看单个任务；`pnpm run company cost --days 7` 列出近 N 天已结算任务及复杂度与评分。员工侧 eval/owner 用 `get_task_cost`。
-- **评分**：评审在 `record_score` 里给 `complexity`（1–5）。评审原分保存为 `scorecard.judge_overall`，进入均分的 `overall` 是校准后的分数，`scorecard.calibration.adjustments` 写明每一步依据：被退回每次 −0.5（最多 −1.5）、租约被收回每次 −0.5（最多 −1）、系统检查退回的提交每次 −0.5（最多 −1）；作者的成本或时长超过同复杂度任务中位数 2 倍 −0.5、4 倍 −1，两者都不到一半且无其他扣分 +0.5（需要至少 5 个同复杂度样本）。结果按 0.5 取整并限在 1–5。
+- **来源**：VPS magpie 的用量接口 `usage/requests?q=<session>`，同一个专用 key 鉴权，按会话精确匹配。会话为 `sck-<digest(任务:员工)>`，与员工请求头 `x-magpie-session` 一致。
+- **未定价**：未定价的请求单独计数（`unpriced`），不按 0 冒充；某个会话在 magpie 窗口里已无记录时 `complete=false`，金额是下限。
+- **内容**：请求数、失败数、输入/输出/缓存读写 token、USD、模型耗时、建单到最后一次 accept 的总时长，再按员工和模型拆分。
+- **查看**：`pnpm run company cost <任务ID>` 看单个任务；`pnpm run company cost --days 7` 列出近 N 天已结算任务。成本列表不再显示复杂度与评分。老板侧用 `get_task_cost`（仅老板可读）。
 
 ## 提交前系统检查
 
-工程员工在 ops 仓提交 code 任务时，服务先在其工作树上做只读检查，不通过直接退回原员工（租约保留，不派评审），审计记 `submit_check_failed` 并计入评分：
+工程员工在 ops 仓提交 code 任务时，服务先在其工作树上做只读检查，不通过直接退回原员工（租约保留，不派评审），审计记 `submit_check_failed`：
 
 - 改了 `src/`、`plugin/`、`scripts/` 时 `package.json` 版本必须高于 main，`plugin/package.json` 与 `company-release.json` 版本一致；
 - `src/mcp/server.ts` 注册的每个工具都接到 sidecar 分发与工具表；`package.json` 测试脚本里列的文件都存在；
@@ -216,13 +211,6 @@ sck call company_cmd '{"command":"<命令名>","input":{...}}'
 | `stall_minutes` | 90 | 无 checkpoint 多久视为卡死 |
 | `redispatch_minutes` | 15 | 派工后多久未领取可改派（评审派工同样受该去重窗口约束） |
 | `paused` | false | 暂停派工（也可用 `company pause`） |
-| `eval_enabled` | true | 任务完成后是否自动评审打绩效分 |
-| `eval_engine` | auto | `auto`=Jev 逐任务直评 + 批量 LLM 兜底；`llm`=只用 eval 员工批量；`jev`=只用 Jev |
-| `jev_min_confidence` | 0.7 | Jev 单题置信度下限，低于则入下一批量 LLM eval 候选 |
-| `jev_flag_threshold` | 0.65 | Jev 员工风险标记阈值，达到则任务入低置信批量 eval |
-
-| `eval_batch_hours` | 24 | LLM eval 批量节奏：每隔该时长若有未评分或 Jev 低置信 done 任务发一条批量 eval 消息（≤30 id） |
-
 | `quota_floor_pct` | 8 | 订阅短窗口/余额剩余低于该百分比即停止复用与新开；0 = 不熔断 |
 | `quota_weekly_floor_pct` | 2 | 订阅周/月窗口剩余低于该百分比即停止复用与新开；0 = 不熔断 |
 | `quota_warn_pct` | 20 | 订阅剩余低于该百分比但未触底时，给老板发一次「即将用尽」提醒；0 = 不提醒 |
@@ -233,13 +221,12 @@ sck call company_cmd '{"command":"<命令名>","input":{...}}'
 - 订阅状态：`pnpm run company status`，或查询 `SELECT * FROM provider_health`。
 - 手动让某订阅立即重试：`UPDATE provider_health:<provider> SET until = 0;`（下一轮只派一个探测任务）。
 - 任务历史：相关员工或老板 `get_task_history`，或查询 `SELECT * FROM audit WHERE task = task:<id> ORDER BY at`。
-- 绩效记录：`pnpm run admin scores [任务ID]`；员工定义均分 `SELECT id, weight, avg_score, scored FROM employee_def`；想给某任务重新评审：`UPDATE task:<id> SET evaluated_at = NONE;`。
-- **Jev 接入**：在 `private/service.env` 加 `JEV_API_KEY`（也可用 `TYPESAFE_API_KEY`）即启用；可选 `JEV_BASE_URL`（默认官方 `https://api.typesafe.ai/v1/systemone`，托管计费网关为 `https://jevtypesafeai.com/api/v1/decide`）、`JEV_MODEL`（默认固定 `jev-1.13.0`，避免阈值漂移）。key 从 TypeSafe 早期访问 waitlist 或托管网关获取。验证连通性：`pnpm run admin jev-test`。Jev 不产生文本输出，scorecard 的 `notes` 为空，判据与置信度在 `probabilities`/`confidence` 字段。
+- **Jev 接入**：在 `private/service.env` 加 `JEV_API_KEY`（也可用 `TYPESAFE_API_KEY`）即启用；可选 `JEV_BASE_URL`（默认官方 `https://api.typesafe.ai/v1/systemone`，托管计费网关为 `https://jevtypesafeai.com/api/v1/decide`）、`JEV_MODEL`（默认固定 `jev-1.13.0`，避免阈值漂移）。key 从 TypeSafe 早期访问 waitlist 或托管网关获取。验证连通性：`pnpm run admin jev-test`。Jev 只返回结构化判断（`probabilities`/`confidence`），不产生文本输出。Jev 用于通知分级与派工辅助。
 - devin 订阅不接受 `thinking=low`（`paseo run` 报 AGENT_CREATE_FAILED）；devin 定义请用 medium/high。定义连续 spawn 失败 3 次会自动停用，修正后 `pnpm run admin def enable <id>` 恢复。
 - 不想让某类员工再接任务但保留定义：`pnpm run admin def weight <id> 0`（软停用，全部候选为 0 时仍可能兜底）；彻底停用用 `def disable <id>`。
-- **订阅额度从哪读**：Paseo 的用量列表只覆盖它自己驱动的订阅（本机是 claude/codex/grok）。magpie 网关（`GET /v1/magpie/quotas`，本机回环）覆盖老板配置的全部订阅，调度器只把 Paseo 没报的那几个补进来（`factory` → `factory-droid`），两边都报时以 Paseo 为准。magpie 未运行或超时按“没有答案”处理，绝不当成“额度为 0”。
+- **订阅额度从哪读**：Paseo 的用量列表只覆盖它自己驱动的订阅（本机是 claude/codex/grok）。0.5.0 起额度补充默认读取 VPS magpie（`https://data.maplayer.top/ofm`，带员工专用密钥）；配置了 `MAGPIE_ADDR` 时改读该地址。调度器读取 `GET <magpie 地址>/v1/magpie/quotas`，把 Paseo 没报的订阅补进来（`factory` → `factory-droid`），两边都报时以 Paseo 为准。读取失败、超时或 magpie 未运行，一律按“没有答案”处理，绝不当成“额度为 0”。该端点在 0.5.0 上线后需确认，见下文上线记录。
 - **员工实例什么时候退役**：只有“这个会话不可能再接任何任务”才退役——凭证文件实例在 sidecar 模式下不可复用（通道轮换）、派工轮次或上下文超过 `session_max_wakes` / `session_max_input_k`（会话轮换）、Paseo 报会话已归档（正常结束）、启动绑定失效且会话还活着（通道隔离）、spawn 失败且不是额度类错误、claim 被拒或写权被占且未绑定实现人、任务现场销毁（场景回收），以及老板手工退役。
-- **不因额度耗尽退役**：额度失败只把 provider 记进 `provider_health`（冷却按指数退避：30 分钟起、最长 6 小时），任务留在原实现人名下等待恢复，不再记员工定义的违规次数。长时间耗尽由额度下限熔断挡住派工（magpie 补上 Paseo 不报的订阅），不靠冷却时长兜底。
+- **不因额度耗尽退役**：额度失败只把 provider 记进 `provider_health`（冷却按指数退避：30 分钟起、最长 6 小时），任务留在原实现人名下等待恢复，不再记员工定义的违规次数。长时间耗尽由额度下限熔断挡住派工（额度来源见上文“订阅额度从哪读”），不靠冷却时长兜底。
 - **老板待办路由**：基础设施原因（配额、探测忙、席位满、主机资源、唤醒失败、候选为空、先前提交人、未知）导致的无法派工记为持久待办并升级成老板通知（同一 task+阶段+episode+reason 去重，理由变化或派工成功时收口并保留审计）。需要老板决定的问题走 `blocked_to='owner'` 进收件箱，由 `sck owner decide`/`task.reassign`/`task.void` 处置。
 
 - **复核回避**：唯一排除规则是先前提交人——任务 `submit` 审计里的 actor 不能领该任务的复核；读不出按 `unknown` 等待。返工时上一轮提交人优先续做，claim-only 经手人按 `PRIOR_HAND_WEIGHT_FACTOR` 降权。没有自动接替：候选为空按 `no_candidate` 记无法派工。
@@ -247,7 +234,7 @@ sck call company_cmd '{"command":"<命令名>","input":{...}}'
 - **按编制豁免额度限制**：`employee_def.quota_limited`（默认 true）设为 false 时，该编制不受额度下限熔断与额度类健康冷却影响：剩余额度为 0 也继续派工；停在 error 的会话按 5 分钟重试间隔就地重载后继续尝试。并发席位上限（`provider_max`）仍然生效。设置方式：编制页编辑「额度限制：不受限」、老板 `def_ensure` 的 `quotaLimited` 字段（`sck owner def.ensure`），或 `pnpm run admin def quota <id> unlimited`。
 - **额度恢复后会话自动重启**：额度失败会把会话停在 Paseo 的 `error` 状态，而 Paseo 不会自己把它放出来；调度器只往 `idle` 会话派工，所以冷却结束后调度器用 `paseo agent reload` 就地重启该会话（agent、对话与通道绑定都保留），不退役、不重开新员工。重载失败按 5 分钟间隔重试。
 - **不因模型漂移退役**：供应商可能在会话中途换模型（Factory 标准额度用尽后会切到更便宜的模型，恢复后再切回）。调度器读到 Paseo 报的实际模型与编制不符时，通过 Paseo daemon 的 `update_agent` 就地改回；改不动就留到下一轮，会话、上下文与席位都不丢。订阅还在冷却或低于额度下限时不做改回——那期间的改回不可能生效，调度器等订阅恢复后的第一轮再改。
-- 订阅耗尽的排查顺序：`pnpm run company status` 看订阅状态 → `SELECT * FROM provider_health` 看冷却与 `last_error` → `GET http://127.0.0.1:3425/v1/magpie/quotas` 看真实剩余额度（含 Paseo 不报的订阅）。
+- 订阅耗尽的排查顺序：`pnpm run company status` 看订阅状态 → `SELECT * FROM provider_health` 看冷却与 `last_error` → `GET <magpie 地址>/v1/magpie/quotas` 看真实剩余额度（含 Paseo 不报的订阅）。magpie 地址默认是 `https://data.maplayer.top/ofm`（需带员工专用密钥），配置了 `MAGPIE_ADDR` 时为该地址。
 
 ## v2 归档
 
@@ -255,6 +242,19 @@ sck call company_cmd '{"command":"<命令名>","input":{...}}'
 
 ## 上线记录
 
+以下记录为历史事实。其中涉及绩效评分、模型排序、本机 magpie 与本机网关的条目已被 0.5.0 替代，仅保留原文供追溯。
+
+- 0.5.0（待上线）：删除本机 18779 模型网关，员工 Claude 会话直连 VPS magpie `https://data.maplayer.top/ofm`。员工会话的环境变量由插件在会话打开时注入：`ANTHROPIC_BASE_URL` 指向 VPS；`ANTHROPIC_AUTH_TOKEN` 取自服务目录 `private/magpie-remote.key`，该文件缺失或为空则拒绝启动员工会话，不静默直连；`x-magpie-session` 头为 `sck-<digest(任务:员工)>`；模型为 `group/sck-haiku`、`group/sck-sonnet`、`group/sck-opus`，按任务档位选择。配置经 `--settings` 私有文件加载（员工通信目录下 `.claude/settings.local.json`，权限 0600），因为用户全局 `settings.env` 会覆盖进程环境变量。story-author 与老板手动会话不注入。
+  会话归因改为换任务即换会话，reuse 与 oneshot 两种策略都是：同一任务内的返工、复审接续原会话。升级前已存在、没有绑定任务的旧会话，在下次派工时换新会话，因为旧会话环境里仍是已停用的网关地址。
+  删除模型排序整套（ranking、aa 榜单、alias、inventory、health、roster、trends、urgency、weights、内置 benchmarks）、agent 模型指标页、模型切换时间线与 model_execution 台账。
+  删除全部员工评分（scorecard、record_score、get_model_evidence、eval 岗位、每日 eval 批次、Jev 评分）。Jev 保留，用于通知分级与派工辅助。员工绩效系数不再影响派工权重，`weight` 基值保留。
+  task_cost 改为按会话精确匹配 VPS magpie 用量（`usage/requests?q=<session>`，同一个专用 key 鉴权），任务完成时结算，不依赖评分。成本列表不再显示复杂度与评分。
+  不再依赖本机 magpie 中转（127.0.0.1:3425）。额度补充与配额熔断改读 VPS magpie（带员工专用密钥），配置 `MAGPIE_ADDR` 时改读该地址。
+  放弃项：员工思考等级（thinking）控件对组名模型不再传给 Paseo，因为组名模型未经 Paseo 验证。
+  ops 的 magpie 证据采样只接受回环地址，默认指向 VPS 时报 blocked，需另行适配。
+  schema 迁移 060：删除 model_execution、model_scorecard、scorecard 表，删除 task 与 employee 上的评分字段，新增 employee.session_task。
+  回滚：切回 0.4.3。schema 降级不支持，060 删除的表数据丢失可接受。0.4.3 依赖本机 18779 网关与 127.0.0.1:3425，切回前需确认两者可用。
+  上线验证项：Paseo 是否接受 `claude/group/sck-*` 模型名；VPS magpie 对 group 的处理；VPS 额度端点 `/v1/magpie/quotas` 可读；Factory 等供应商的配额熔断来源；员工密钥缺失时会话启动失败的表现；升级时旧会话的过渡。
 - 2026-11-07：线的笔记与会话回收修复（v0.3.81）。新增 `lane_note` 与 `notes.md`，修复带范围的会话不轮转、不回收，等待中的会话占席位，路由模板不生效。设计见 [session-lanes-design.md](session-lanes-design.md)。
 
 - 2026-11-02：运营客户端默认走 IPv4 建连上线，缓解 IdP AAAA 路径超时（来源 PR #2076 → main `a2c355f31114fd074dfde84c8683f487064631b2`，版本 v0.3.72，发布 `releases/a2c355f31114fd074dfde84c8683f487064631b2`；回滚目标 v0.3.71 `releases/caf84b5022d21f02efcc5e9ba5d1865e375baa5e`）。依据诊断 `4e2c6f94`（本机到 IdP/Cloudflare 真实 AAAA 路径超时；vendored undici 默认 6 次 4 失败，connect family:4 为 6 次 0 失败）。改动：`src/ops/fetcher.ts` 的 `OpsFetchOptions` 增加严格类型 `family?: 4|6`，ops 私有 undici dispatcher 的 connect 默认 family=4（显式 6 仅供受控探测）；主连接池与 `freshConnection()` 共用同一份 connect（timeout/ca/family），TLS 校验、AbortSignal、重试上限与 close 逻辑不变。不改主机 IPv6/DNS/TUN/代理，不用全局 NODE_OPTIONS，不增加登录次数/预算，不对一次性 token exchange 新增重试，无数据库迁移与新环境变量。CI：Quality gate run 41454420216、Channel quality run 41454420374 在 `a2c355f` 上均 success。升级（老板已开启自动升级通道）：装前根/插件双 typecheck 退出 0，两道本机门禁 comm-slow-pipe 与 sidecar-review 均 pass（记录在 `gates/<sha>.json`）；审计 `company_upgrade_verified` 记固定快照、双门禁、active、健康/ready、插件来源与 schema/vendor 核验通过。双面核验：`active` → `releases/a2c355f…`；插件来源 → `releases/a2c355f…/plugin`；`schema/` 与 `plugin/server/vendor/schema/` 无差异；`plugin/server/vendor/src/ops/fetcher.ts` 去首行 `@ts-nocheck` 后与 `src/ops/fetcher.ts` 逐行一致且含 `family: options.family ?? 4`；本机 MCP `127.0.0.1:38473/health` 与 `/ready` 均 200（ok/ready），真实员工通道 `sck call get_context` 可用。生产健康：产品 `https://l.maplayer.top/health` 返回 200（status=ok，surrealdb=up，探测 9.0s）；本机实测到 Cloudflare 的 IPv6(AAAA) TCP 不通、IPv4 TCP 通，佐证诊断。局限：IPv4 只缓解已证实的 AAAA 路径问题，不承诺消除全部网络超时；真实登录仍失败须按 hop 与 errno 区分，不以公开 health 200 签收登录可用。回滚：切回 v0.3.71 固定发布 `releases/caf84b5022d21f02efcc5e9ba5d1865e375baa5e`（升级作业验证失败时自动恢复上一固定发布）。生产实测（`ops_login` LCA04_ADMIN 与 `ops_operator_login` LCA04_OPS 各一次、成功即 logout）由 QA 在任务 `b4eee43c-1599-4ba2-b88a-49a828d57f11` 独立签署。

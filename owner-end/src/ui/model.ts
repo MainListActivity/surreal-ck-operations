@@ -6,7 +6,7 @@ import type { BoardActivity, BoardEmployee, BoardMessageRow, BoardNow, BoardNext
 
 export const RUNNER_ZH: Record<string, string> = { online: '在线', offline: '离线', unknown: '未知' };
 export const PHASE_ZH: Record<string, string> = { execute: '执行', review: '复核' };
-export const STEP_ZH: Record<string, string> = { execute: '执行', review: '复核', rework: '返工', nudge: '催办', eval: '评审', notice: '通知' };
+export const STEP_ZH: Record<string, string> = { execute: '执行', review: '复核', rework: '返工', nudge: '催办', notice: '通知' };
 
 /** 秒数 → 中文时长：不足一分钟写秒，超过一小时写小时。 */
 export function durationText(seconds: number): string {

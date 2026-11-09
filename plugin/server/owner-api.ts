@@ -8,9 +8,7 @@ import { OutboundMessageStore } from "./vendor/src/outbound-messages.ts";
 import { OwnerDesk } from "./vendor/src/owner.ts";
 import { Workforce } from "./vendor/src/workforce.ts";
 import {
-  answerPermissionFor, ownerModelAlias, ownerModelCatalog, ownerModelMembership, ownerModelRanking,
-  ownerModelRankingPin, ownerModelRankingPreview, ownerModelRankingSave, pendingPermissionsFor,
-  taskAttachmentsFor, taskAttachmentUrlFor,
+  answerPermissionFor, pendingPermissionsFor, taskAttachmentsFor, taskAttachmentUrlFor,
 } from "./owner-actions.ts";
 
 export interface OwnerHttpOptions { home: string; company: () => Promise<Company>; opsRepo?: string }
@@ -31,19 +29,12 @@ const requirePaseo = (c: Company) => {
 export type PluginCommandResult = { handled: true; value: unknown } | { handled: false };
 
 /**
- * Plugin-only owner commands: model management, Paseo permissions and task attachments.
+ * Plugin-only owner commands: Paseo permissions and task attachments.
  * They run the exact helpers the web console routes use, then fall back to src/owner-api.ts
  * for every command that does not need the plugin host.
  */
 export async function pluginOwnerCommand(c: Company, home: string, input: Record<string, unknown>): Promise<PluginCommandResult> {
   switch (String(input.command ?? "")) {
-    case 'model.ranking': return { handled: true, value: await ownerModelRanking(c) };
-    case 'model.ranking.preview': return { handled: true, value: await ownerModelRankingPreview(c, input.policy, input.refresh) };
-    case 'model.ranking.save': return { handled: true, value: await ownerModelRankingSave(c, input) };
-    case 'model.ranking.pin': return { handled: true, value: await ownerModelRankingPin(c, input) };
-    case 'model.catalog': return { handled: true, value: await ownerModelCatalog(c, input) };
-    case 'model.membership': return { handled: true, value: await ownerModelMembership(c, input.input) };
-    case 'model.alias': return { handled: true, value: await ownerModelAlias(c, input) };
     case 'permission.list': return { handled: true, value: await pendingPermissionsFor(requirePaseo(c)) };
     case 'permission.answer': {
       const behavior = requiredText(input.behavior, 'behavior');

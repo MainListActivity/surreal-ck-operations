@@ -7,11 +7,12 @@ import {
   usageOverview,
   usageRequests,
   usageLive,
+  metricNumber,
+  metricSeconds,
   type UsageRequest,
   type UsageGroup,
   type UsageQuota,
 } from "../shared/usage";
-import { agentMetrics, metricNumber, metricSeconds } from "../shared/agent-metrics";
 import { relayTheme } from "./relay-theme";
 import { fs, radius, sp } from '../shared/relay-tokens.ts';
 
@@ -210,14 +211,8 @@ function Quotas({
 function SessionUsage(props: Props & { agentId: string }) {
   const { theme, agentId } = props,
     c = theme.colors,
-    read = useRpc(agentMetrics),
     liveRead = useRpc(usageLive),
     readOverview = useRpc(usageOverview);
-  const metrics = useQuery({
-    queryKey: ["agent-model-metrics", agentId],
-    queryFn: () => read({ agentId }),
-    refetchInterval: 5000,
-  });
   const live = useQuery({
     queryKey: ["magpie-usage-live", agentId],
     queryFn: () => liveRead({ agentId }),
@@ -228,16 +223,14 @@ function SessionUsage(props: Props & { agentId: string }) {
     queryFn: () => readOverview({ period: "today", offset: 0, limit: 1 }),
     refetchInterval: 60000,
   });
-  const view = metrics.data,
-    s = view?.summary,
-    active = live.data?.requests.filter((r) => !r.completed) ?? [],
+  const active = live.data?.requests.filter((r) => !r.completed) ?? [],
     last = live.data?.requests.at(-1);
   return (
     <View style={{ gap:sp(10), padding:sp(12), minWidth:sp(0) }}>
       <Text style={{ color: c.foreground, fontSize:fs(14), fontWeight: "600" }}>
         Magpie · 当前会话用量
       </Text>
-      {(metrics.isError || live.isError) && (
+      {live.isError && (
         <Text style={{ color: c.foregroundMuted }}>读取失败，将自动重试；已显示数据可能过期。</Text>
       )}
       {live.data && !live.data.available && (
@@ -253,31 +246,6 @@ function SessionUsage(props: Props & { agentId: string }) {
         </Text>
       )}
       {!active.length && last && <RequestRow row={last} theme={theme} />}
-      {!!s && (
-        <Text style={{ color: c.foreground, fontSize:fs(12), lineHeight:sp(20) }}>
-          本轮{view.turn?.endedAt ? "已结束" : "进行中"}
-          {s.partial ? " · 部分观测" : ""} · {s.requests} 次请求 · 失败/中断 {s.failed}
-          {"\n"}已计量输出 {n(s.outputTokens)} · 首响应 {metricSeconds(s.firstResponseMs)} · 首文字{" "}
-          {metricSeconds(s.firstTextMs)}
-          {"\n"}输出吞吐（含等待）{speed(s.tokensPerSecond)} · 原生生成速度{" "}
-          {speed(s.decodeTokensPerSecond)}
-        </Text>
-      )}
-      {view?.latest && !last && (
-        <Text style={{ color: c.foregroundMuted, fontSize:fs(11) }}>
-          最近实际模型 {view.latest.model ?? "未知"} · 首响应 {metricSeconds(view.latest.ttft_ms)} ·
-          输出 {n(view.latest.output_tokens)}
-        </Text>
-      )}
-      {view?.source === "company-gateway" &&
-        view.latest?.completed === undefined &&
-        view.latest && (
-          <Text style={{ color: c.foregroundMuted, fontSize:fs(11) }}>
-            当前流式观测 · 首响应 {metricSeconds(view.latest.ttft_ms)} · 首文字{" "}
-            {metricSeconds(view.latest.first_text_ms)} · 已确认输出 {n(view.latest.output_tokens)} ·
-            已确认输入 {n(view.latest.input_tokens)}
-          </Text>
-        )}
       <Text style={{ color: c.foregroundMuted, fontSize:fs(11) }}>
         按会话与当前租约精确匹配。实时状态每秒读取内存快照；token、首响应只显示上游已确认值。
       </Text>

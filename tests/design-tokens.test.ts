@@ -6,14 +6,12 @@ import {
   paletteToCssVars, scaleToCssVars, previewListCss, fs, radius, sp,
 } from '../plugin/shared/relay-tokens.ts';
 import { relayShellCss } from '../plugin/shared/relay-shell.ts';
-import { routingDesignCss } from '../plugin/shared/model-routing-design.ts';
 import { relayPalette } from '../plugin/client/relay-theme.ts';
 
 // AC1: colours, font sizes, radii and spacing are defined once (relay-tokens.ts) and every
 // surface consumes that file. These assertions fail if a literal drifts back into a page CSS.
 const WEB_CSS: Array<[string, string]> = [
   ['relay-shell', relayShellCss],
-  ['model-routing-design', routingDesignCss],
   ['preview-list', previewListCss],
 ];
 /** The token declarations themselves are the one place values may appear; check the rules they feed. */
@@ -75,7 +73,8 @@ const STYLE_PROPS = [
 
 test('every Paseo client file consumes the shared token functions, with no raw numeric style literals', () => {
   const files = readdirSync(CLIENT_DIR).filter(f => f.endsWith('.tsx'));
-  expect(files.length).toBeGreaterThan(5);
+  // The scan must reach the owner page and the shared pages; the model-routing pages were removed with the eval role.
+  expect(files).toEqual(expect.arrayContaining(['owner-views.tsx', 'company.tsx', 'usage.tsx']));
   for (const file of files) {
     const src = readFileSync(join(CLIENT_DIR, file), 'utf8');
     if (!/\b(?:fs|radius|sp)\(/.test(src)) continue; // relay-theme.ts is a .ts file, not included here

@@ -10,9 +10,9 @@ import { PULSE_BUDGET_BYTES, PULSE_LIST_CAPS } from '../src/dispatcher/pulse-ans
 import { ROSTER_BUDGET_BYTES, ROSTER_LIST_CAPS, rosterAnswer as boundRosterAnswer, type RosterListName } from '../src/dispatcher/roster-answer.ts';
 
 const defs: StaffingInput['defs'] = [{ id: 'd1', role: 'engineering', provider: 'codex', model: 'm1',
-  enabled: true, maxInstances: 3, priority: 100, weight: 10, scored: 0, errorStreak: 0 }];
+  enabled: true, maxInstances: 3, priority: 100, weight: 10, errorStreak: 0 }];
 const insts: StaffingInput['insts'] = ['author', 'fresh', 'rework-submitter'].map(id => ({ id, role: 'engineering',
-  def: 'd1', provider: 'codex', model: 'm1', paseoAgentId: id, cwd: '/ops', workspaceScope: 'maintenance' }));
+  def: 'd1', provider: 'codex', model: 'm1', paseoAgentId: id, cwd: '/ops', workspaceScope: 'maintenance', sessionTask: 'review-task' }));
 const task = { id: 'review-task', title: '独立验收', state: 'review', reviewerRole: 'engineering',
   submittedBy: 'rework-submitter', repoPath: '/ops' } as SupervisedTask;
 const readyTask = { id: 'ready-task', title: '就绪实现', state: 'ready', executorRole: 'engineering',
@@ -198,7 +198,7 @@ test('roster RPC: instance rows carry only the name, its def and the tick status
 
 test('roster RPC: defs enabled with a live instance sort first, so truncation keeps actionable rows', async () => {
   const idleDef: StaffingInput['defs'][number] = { id: 'no-instance', role: 'engineering', provider: 'grok', model: 'm',
-    enabled: true, maxInstances: 1, priority: 100, weight: 10, scored: 0, errorStreak: 0 };
+    enabled: true, maxInstances: 1, priority: 100, weight: 10, errorStreak: 0 };
   const offDef: StaffingInput['defs'][number] = { ...idleDef, id: 'off', enabled: false };
   // Input order: enabled-without-instance, disabled, then the fixture's enabled-with-instance def.
   defs.splice(0, 0, idleDef, offDef);

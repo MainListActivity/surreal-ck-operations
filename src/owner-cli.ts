@@ -1,5 +1,5 @@
 import { RecordId } from 'surrealdb';
-import { loadDatabaseConfig } from './config.ts';
+import { loadDatabaseConfig, serviceHome } from './config.ts';
 import { CompanyDatabase } from './database.ts';
 import type { Role } from './contracts.ts';
 import { OwnerDesk, type OwnerCommandKind } from './owner.ts';
@@ -92,7 +92,8 @@ try {
     const task = await desk.retire({ taskId, note: note.join(' '), source: 'owner:cli', key: `cli-void:${taskId}` });
     console.log(`已作废：${task.title}（${task.state}）`);
   } else if (action === 'cost') {
-    const { COST_LIST_SQL, readTaskCost, recordTaskCost } = await import('./task-cost.ts');
+    const { COST_LIST_SQL, magpieSessionRows, readTaskCost, recordTaskCost } = await import('./task-cost.ts');
+    const { magpieAuthorization } = await import('./model-routing/employee-env.ts');
     const argv = [first ?? '', ...rest].filter(Boolean);
     const days = Number(flag(argv, 'days') ?? 7);
     const money = (usd: number) => `$${usd.toFixed(usd < 1 ? 4 : 2)}`;
@@ -101,7 +102,7 @@ try {
     const line = (c: import('./task-cost.ts').TaskCost) =>
       `${money(c.usd)}${c.unpriced ? `（另 ${c.unpriced} 次未定价）` : ''} · 请求 ${c.requests}${c.failed ? `（失败 ${c.failed}）` : ''} · 输入 ${tokens(c.inputTokens)} 输出 ${tokens(c.outputTokens)} 缓存读 ${tokens(c.cacheReadTokens)} · 模型 ${minutes(c.modelMs / 1000)} · 总时长 ${minutes(c.elapsedSeconds)}${c.complete ? '' : ' · 部分会话已超出 Magpie 保留期（下限）'}`;
     if (argv[0]) {
-      const cost = await readTaskCost(db.db, argv[0]) ?? await recordTaskCost(db.db, argv[0]);
+      const cost = await readTaskCost(db.db, argv[0]) ?? await recordTaskCost(db.db, argv[0], magpieSessionRows(magpieAuthorization(serviceHome())));
       if (!cost) { console.log('该任务没有可结算的租约模型请求（未完成、无请求或 Magpie 暂不可读）。'); }
       else {
         console.log(`任务 ${argv[0]}：${line(cost)}`);
@@ -109,26 +110,22 @@ try {
         for (const [model, m] of Object.entries(cost.byModel).sort((a, b) => b[1].usd - a[1].usd)) console.log(`  模型 ${model}：${money(m.usd)} / ${m.requests} 次`);
       }
     } else {
-      const [rows] = await db.db.query<[Array<{ task: RecordId; title?: string; complexity?: number; cost: import('./task-cost.ts').TaskCost; score?: number }>]>(
+      const [rows] = await db.db.query<[Array<{ task: RecordId; title?: string; cost: import('./task-cost.ts').TaskCost }>]>(
         `${COST_LIST_SQL}`, { span: `${Number.isFinite(days) && days > 0 ? Math.min(60, days) : 7}d` });
       const total = rows.reduce((a, r) => a + r.cost.usd, 0);
       console.log(`近 ${days} 天已结算 ${rows.length} 个任务，合计 ${money(total)}`);
-      for (const r of rows) console.log(`- ${String(r.task.id).slice(0, 8)} ${(r.title ?? '').slice(0, 40)}｜复杂度 ${r.complexity ?? '?'}｜评分 ${r.score?.toFixed(1) ?? '未评'}｜${line(r.cost)}`);
+      for (const r of rows) console.log(`- ${String(r.task.id).slice(0, 8)} ${(r.title ?? '').slice(0, 40)}｜${line(r.cost)}`);
     }
   } else if (action === 'status') {
     const workforce = new Workforce(db, '/nonexistent');
-    const [brief, tasks, insts, health, config, defs] = await Promise.all([
-      desk.brief(), workforce.tasks(), workforce.insts(), workforce.providerHealth(), workforce.config(), workforce.defs()]);
+    const [brief, tasks, insts, health, config] = await Promise.all([
+      desk.brief(), workforce.tasks(), workforce.insts(), workforce.providerHealth(), workforce.config()]);
     const count = (state: string) => tasks.filter(t => t.state === state).length;
     console.log(`派工：${config.paused ? '已暂停' : '运行中'}（最多同时 ${config.maxRunning} 位员工）`);
     console.log(`任务：待办 ${count('ready')} · 进行中 ${count('doing')} · 待验收 ${count('review')} · 阻塞 ${count('blocked')}`);
     if (brief.projects.length) console.log(`项目环境：${brief.projects.map(p => `${p.id}（${p.envs.map(e => e.name).join('/')}）`).join('、')}`);
     console.log(`在职员工：${insts.map(i => `${i.id}@${i.provider ?? '?'}`).join('、') || '无'}`);
     console.log(`订阅：${[...health.values()].map(h => `${h.provider}=${h.state}${h.until ? `(至 ${new Date(h.until * 1000).toLocaleString('zh-CN')})` : ''}`).join('、') || '全部正常'}`);
-    const scored = defs.filter(d => d.scored > 0);
-    if (scored.length) {
-      console.log(`绩效均分：${scored.map(d => `${d.id}=${d.avgScore?.toFixed(1)}分/${d.scored}次`).join('、')}`);
-    }
     if (brief.directions.length) console.log(`公司方向：\n${brief.directions.map(d => `- ${d.text}`).join('\n')}`);
   } else {
     console.log(usage);

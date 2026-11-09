@@ -45,14 +45,12 @@ try {
   if (!ready) throw new Error('Company fork fixture did not become healthy');
   const explicit = process.argv.slice(2).filter(arg => arg.endsWith('.test.ts'));
   const targets = explicit.length ? explicit : process.argv.includes('--all') ? [] : [
-    'tests/model-ranking-nonlinear.test.ts', 'tests/model-management.test.ts', 'tests/model-ranking-layers.test.ts', 'tests/model-ranking-rules.test.ts', 'tests/model-ranking-weights.test.ts', 'tests/model-ranking.test.ts', 'tests/model-ranking.fork.test.ts',
-    'tests/model-routing.test.ts', 'tests/model-routing.fork.test.ts',
     'tests/worktree-lock.test.ts', 'tests/worktree-reclaim.test.ts', 'tests/worktree-registry.fork.test.ts',
     'tests/artifact-reclaim.test.ts', 'tests/artifact-sweeper.test.ts', 'tests/artifact-reclaim.fork.test.ts',
     'tests/magpie-quota.test.ts', 'tests/agent-model.test.ts', 'tests/quota-store.fork.test.ts',
     'tests/mcp-run-reclaim.fork.test.ts', 'tests/paseo-dead-paths.test.ts',
     'tests/db.integration.test.ts', 'tests/dispatcher-sidecar.fork.test.ts', 'tests/dispatch-episode.fork.test.ts', 'tests/dispatch-board.fork.test.ts', 'tests/memory-lru.fork.test.ts', 'tests/idle-sessions.fork.test.ts', 'tests/ops-denial-circuit.fork.test.ts', 'tests/ops-denial-circuit.test.ts', 'tests/company-db-runtime.test.ts', 'tests/host-resources.test.ts', 'tests/scratch-gc.test.ts', 'tests/test-runner-cleanup.test.ts',
-    'tests/quota-turn.test.ts', 'tests/turn-closeout.test.ts', 'tests/quota-scoring.fork.test.ts',
+    'tests/quota-turn.test.ts', 'tests/turn-closeout.test.ts',
     'tests/session-history.test.ts', 'tests/factory-queue.test.ts', 'tests/dispatcher-sidecar.test.ts', 'tests/sidecar.test.ts', 'tests/sidecar-quota-gate.fork.test.ts',
     'tests/sidecar-late-lease.test.ts', 'tests/mcp.transport.test.ts', 'tests/worktrees.test.ts',
     'tests/owner-aging.fork.test.ts', 'tests/story-author.fork.test.ts', 'tests/cinematography.fork.test.ts', 'tests/owner-reassign.fork.test.ts', 'tests/pr-gate.fork.test.ts', 'tests/owner-commands.fork.test.ts',

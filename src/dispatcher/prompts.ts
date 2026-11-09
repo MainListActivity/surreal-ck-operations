@@ -18,7 +18,6 @@ const ROLE_NAMES: Record<string, string> = {
   cinematography: '摄影摄像：运镜设计、镜头调度、摄影机运动语言，只接摄影轨',
   qa: '测试：先查老板视角结果，再在最终合入提交上逐条复验',
   cs: '客户成功',
-  eval: '评审：任务完成后为参与员工打绩效分',
 };
 
 // comm 模式下命令表面不变——sck 走会话内的私有通道，凭证由通道持有，无需出示。
@@ -70,10 +69,4 @@ function briefWake(task: SupervisedTask, env: PromptEnv, ctx: PromptCtx): string
     ? `实现 ${dir}/task.md 中的需求，在最终提交上按验收标准逐条自验，合入 main 后：`
     : `实现 ${dir}/task.md 中的需求，按验收标准逐条自验，全部通过后：`;
   return `${lead}${sck('submit', '{"text":"…","idempotencyKey":"…"}')}`;
-}
-
-export function evalPrompt(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, firstContact: boolean, ctx?: PromptCtx): string {
-  const dir = ctx?.commDir ?? '$SCK_COMM_DIR';
-  const body = `按 ${dir}/task.md 的评分规则为本轮参与员工打绩效分。`;
-  return firstContact ? body : body;
 }

@@ -165,7 +165,7 @@ run('failed authorization/claim and symlink scopes never leave effective referen
 });
 run('actual dispatcher and sidecar stage one registry source in claim.json, prompt and Paseo cwd', async () => {
   const path = repo(), core = coreFor(path), wf = new Workforce(db, join(dir, 'unused')), owner = new OwnerDesk(db);
-  await db.db.upsert(new RecordId('company_meta', 'config')).content({ eval_enabled: false, jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
+  await db.db.upsert(new RecordId('company_meta', 'config')).content({ jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
   // Limit the scheduler to this synthetic task; no real employees or dispatcher are created.
   const t = await task(core, 'qa'); const originalTasks = wf.tasks.bind(wf); wf.tasks = async () => (await originalTasks()).filter(x => x.id === t.id);
   await wf.upsertDef('worktree-qa-def', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
@@ -244,8 +244,8 @@ run('managed allocator keeps expired-lease takeover semantics and preserves scen
   await submit(recovery, next, b);
 });
 
-run('project-bound non-lease eval uses project repo and carries persistent project/default branch metadata', async () => {
-  const path = repo(), opsPath = repo(), core = coreFor(opsPath), judge = await employee('eval');
+run('project-bound non-lease reviewer uses project repo and carries persistent project/default branch metadata', async () => {
+  const path = repo(), opsPath = repo(), core = coreFor(opsPath), judge = await employee('owner');
   git(path, 'checkout', '-b', 'project-default'); writeFileSync(join(path, 'source.txt'), 'project baseline');
   git(path, 'add', '.'); git(path, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'project baseline'); git(path, 'checkout', 'main');
   const project = await new ProjectStore(db.db).upsert({ id: `fixture-project-${++count}`, name: 'Isolated worktree project', repoPath: path, defaultBranch: 'project-default', release: 'Fixture only', envs: [] });
@@ -463,7 +463,7 @@ run('WT03: return and releaseWorkspace evaluate their tree in place without harm
   expect((await core.listWorktreeAudits(gm, 50)).some(a => a.trigger === 'return' && a.event === 'skip' && String(a.reason).includes('unfinished-scene'))).toBe(true);
 
   // Session release runs the same single-tree evaluation; the shared tree is protected anyway.
-  const judge = await employee('eval');
+  const judge = await employee('owner');
   const workspace = await core.readWorkspace(judge, claim.task.id);
   await core.releaseWorkspace(judge);
   expect((await core.listWorktreeAudits(gm, 50)).some(a => a.trigger === 'release' && a.event === 'skip' && String(a.reason).includes('shared-retained'))).toBe(true);

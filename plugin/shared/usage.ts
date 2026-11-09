@@ -136,3 +136,7 @@ export type UsageQuota = z.output<typeof usageQuotaSchema>;
 export type UsageOverview = z.output<typeof usageOverviewSchema>;
 export type UsagePage = z.output<typeof usagePageSchema>;
 export type UsageLive = z.output<typeof usageLiveSchema>;
+
+// 数值展示辅助函数（仅用于格式化用量数字）。
+export const metricNumber = (v: number | undefined, decimals = 1) => (v === undefined ? "未知" : v.toFixed(decimals));
+export const metricSeconds = (v: number | undefined) => (v === undefined ? "未知" : `${(v / 1000).toFixed(2)} 秒`);

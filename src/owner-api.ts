@@ -19,7 +19,7 @@ import { ROLES, type CreateTask, type Role } from './contracts.ts';
 import { HASH, REQUIRED_TRACKS } from './core.ts';
 import { getRoute, listRoutes, saveRoute, disableRoute } from './routes.ts';
 import { defaultAcceptanceCriteria } from './acceptance.ts';
-import { readTaskCost, recordTaskCost, COST_LIST_SQL } from './task-cost.ts';
+import { readTaskCost, COST_LIST_SQL } from './task-cost.ts';
 import { hostIOOrUndefined } from './host-io.ts';
 
 export type OwnerVia = string;
@@ -218,7 +218,8 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     case 'task.cost': {
       if (input.taskId !== undefined) {
         const taskId = text(input.taskId, 'taskId');
-        const cost = await readTaskCost(db, taskId) ?? await recordTaskCost(db, taskId);
+        // Read only: settlement runs in the dispatch pass, which holds the magpie reader.
+        const cost = await readTaskCost(db, taskId);
         return { cost: cost ?? null };
       }
       const days = typeof input.days === 'number' && Number.isFinite(input.days) && input.days > 0 ? Math.min(60, input.days) : 7;

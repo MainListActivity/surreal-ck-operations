@@ -50,6 +50,7 @@ export const RELEASE_SCHEMA_REQUIREMENTS: ReleaseSchemaRequirement[] = [
   { version: '0.4.1', schema: 58, tables: [] },
   { version: '0.4.2', schema: 59, tables: [] },
   { version: '0.4.3', schema: 59, tables: [] },
+  { version: '0.5.0', schema: 60, tables: [] },
 ];
 /** The requirement that applies to a target version: the newest one that is not newer than the target. */
 export function schemaRequirementFor(version: string): { schema: number; tables: string[] } {

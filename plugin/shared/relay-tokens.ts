@@ -1,6 +1,6 @@
 /**
  * 公司插件唯一设计变量源。颜色、字号、圆角、间距、阴影只在这里定义；
- * 网页（relay-shell.ts / model-routing-design.ts / preview-core.ts）、
+ * 网页（relay-shell.ts / preview-core.ts）、
  * Paseo 公司面板（relay-theme.ts / client/*.tsx）全部从这里取值。
  * 改一处，四个面一起变。纯数据零依赖——RN 面、网页、vendored 交付预览都能直接 import。
  */

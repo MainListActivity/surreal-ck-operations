@@ -128,7 +128,7 @@ test('B4d: empty stdout, or a reply without a Status field, reads as unknown', a
 });
 
 // The dispatcher-level check: one real tick with a single instance, read back through the dispatcher's own state mapping.
-const DEF: EmployeeDef = { id: 'test', role: 'engineering', provider: 'codex', model: 'fixture', enabled: true, maxInstances: 1, priority: 0, weight: 1, scored: 0, errorStreak: 0 };
+const DEF: EmployeeDef = { id: 'test', role: 'engineering', provider: 'codex', model: 'fixture', enabled: true, maxInstances: 1, priority: 0, weight: 1, errorStreak: 0 };
 
 async function observe(body: string) {
   const bin = fakeCli({ [AGENT]: body }, 'echo []');
@@ -144,7 +144,7 @@ async function observe(body: string) {
   };
   const inst = { id: 'employee-1', def: DEF.id, role: DEF.role, provider: DEF.provider, model: DEF.model, credential: 'fixture-1', paseoAgentId: AGENT } as unknown as EmployeeInst;
   const workforce = {
-    config: async () => ({ ...DEFAULT_CONFIG, quotaFloorPct: 0, quotaWeeklyFloorPct: 0, sessionMaxWakes: 0, sessionMaxInputK: 0, evalEnabled: false, jevDecisions: false }),
+    config: async () => ({ ...DEFAULT_CONFIG, quotaFloorPct: 0, quotaWeeklyFloorPct: 0, sessionMaxWakes: 0, sessionMaxInputK: 0, jevDecisions: false }),
     defs: async () => [DEF], serverNow: async () => 1000, insts: async () => [inst], tasks: async () => [], providerHealth: async () => new Map(),
     retire: async (id: string, _reason: string, kind: string) => { events.push(`retire:${id}:${kind}`); },
     defFailure: async () => { events.push('defFailure'); return 1; },
