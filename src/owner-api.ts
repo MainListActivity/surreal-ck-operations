@@ -170,11 +170,14 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
         project: optionalText(input.project),
         kind: 'task',
         discipline, codeRepoPath, workIntent, acceptanceCriteria,
+        hold: input.hold === true ? true : undefined,
         idempotencyKey: key(),
       } as never);
       await db.query('UPDATE ONLY $task SET requirement = $requirement, acceptance_text = $acceptance;',
         { task: new RecordId('task', task.id), requirement: requirement2, acceptance: acceptanceText });
-      await ctx.messages.createTaskDrafts(task.id, executor, reviewer, isEngineering);
+      const drafts = await ctx.messages.createTaskDrafts(task.id, executor, reviewer, isEngineering);
+      // 扣住 = 扣住派工消息（调度器派工前核对 isHeld）；与按路线建单的 hold 语义一致。
+      if (input.hold === true) for (const draft of drafts) await ctx.messages.setHold(draft.id, true, 'owner');
       return task;
     }
     case 'task.update': {

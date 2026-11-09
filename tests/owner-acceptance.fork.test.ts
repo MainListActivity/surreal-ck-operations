@@ -71,3 +71,11 @@ run('submit next proposal stores its acceptance text', async () => {
   expect(props[0]?.acceptance_text).toBe('后续验收标准正文');
   expect(props[0]?.requirement).toBe('后续需求正文');
 });
+
+run('owner task.create by executorRole honours hold: the task stays held until released', async () => {
+  const out = await ownerApi(apiCtx(), { command: 'task.create', executorRole: 'product', reviewerRole: 'owner', hold: true,
+    title: '按岗位建单扣住', requirement: '需求原文', acceptanceText: '验收原文' }, 'web') as { task?: { id: string }; id?: string };
+  const id = out.task?.id ?? out.id!;
+  const store = new OutboundMessageStore(db.db);
+  expect(await store.isHeld(id, 'execute')).toBe(true);
+});
