@@ -71,7 +71,6 @@ test('template bodies are the exact minimal sentences', () => {
   expect(templateFor('review', true)).toContain('call review');
   expect(templateFor('review', false)).toContain('call review');
   expect(templateFor('rework')).toContain('findings/round-NN.md');
-  expect(templateFor('eval')).toContain('agents/eval.md');
   // 被退回那一轮写的笔记不会生效：模板里要说清楚，员工按通过的那轮写。
   expect(templateFor('execute', true)).toContain('被退回那一轮写的笔记不会生效');
   expect(templateFor('review', true)).toContain('被退回那一轮写的笔记不会生效');
@@ -272,37 +271,6 @@ test('dispatcher markOutbound resolves hold notice after successful send lock (I
   await (dispatcher as any).markOutbound(prepared, 'e1');
 
   expect(resolvedNotices).toEqual(['message-hold:task-abc:execute']);
-});
-
-test('dispatcher markOutbound handles eval path and resolves eval hold notice (ITEM 2 & 3)', async () => {
-  const sentCalls: Array<{ id: string; employeeId: string; body: string }> = [];
-  const resolvedNotices: string[] = [];
-  const fakeStore = {
-    markSent: async (id: string, employeeId: string, body: string) => {
-      sentCalls.push({ id, employeeId, body });
-      return { body, message: {} as OutboundMessage };
-    },
-  };
-  const fakeOwner = {
-    resolveNotice: async (key: string) => {
-      resolvedNotices.push(key);
-    },
-  };
-  const dispatcher = new Dispatcher({
-    owner: fakeOwner,
-    messages: fakeStore as unknown as OutboundMessageStore,
-  } as never);
-
-  const preparedEval = {
-    message: { id: 'm-eval', taskId: 'task-eval-99', step: 'eval', sentTo: '' } as OutboundMessage,
-    body: 'eval 评分说明',
-  };
-
-  await (dispatcher as any).markOutbound(preparedEval, 'eval-inst-7');
-
-  expect(sentCalls).toHaveLength(1);
-  expect(sentCalls[0].employeeId).toBe('eval-inst-7');
-  expect(resolvedNotices).toEqual(['message-hold:task-eval-99:eval']);
 });
 
 test('dispatcher markOutbound logs and does not throw when resolveNotice fails (ITEM 3)', async () => {

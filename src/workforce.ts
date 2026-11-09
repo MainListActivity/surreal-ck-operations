@@ -8,7 +8,6 @@ import { hostIO } from './host-io.ts';
 import { ownerActionKey } from './dispatcher/dispatch-blocked.ts';
 import { asId, CompanyError, HASH, id, ROLES, view, type TaskRow } from './core.ts';
 import { LocalEnrollmentAdmin, revokedCredentialDigest } from './enrollment.ts';
-import { collectEvalState, writeScorecards, type EvalState, type ScoredEmployee } from './scoring.ts';
 import { gateCredentialChange } from './retirement.ts';
 import { acceptanceSubject, evaluateAcceptance, loadAcceptanceEvidence, loadAcceptanceGate, type AcceptanceTaskRow } from './acceptance.ts';
 /**
@@ -32,15 +31,13 @@ export interface EmployeeDef {
   enabled: boolean;
   maxInstances: number;
   priority: number;
-  /** 派工权重：同岗位候选中按 weight × 绩效系数 加权随机选取；0 = 永不主动选中。 */
+  /** 派工权重：同岗位候选中按 weight 加权随机选取；0 = 永不主动选中。 */
   weight: number;
   /**
    * false = this def ignores quota-based dispatch gating: it is dispatched even when the
    * subscription's remaining allowance is 0. Absent/true = limited (the default).
    */
   quotaLimited?: boolean;
-  scored: number;
-  avgScore?: number;
   errorStreak: number;
 }
 
@@ -78,9 +75,14 @@ export interface EmployeeInst {
   lane?: string;
   lastTask?: string;
   lastPhase?: 'execute' | 'review';
+  /**
+   * The one task this session was opened for (schema 060). A session serves only that task, so its model traffic
+   * is attributed to it: a session for another task is never reused, and a session without one is never reused.
+   */
+  sessionTask?: string;
 }
 
-export interface SessionTaskFacts { states: Map<string, string>; followUps: Array<{ parent: string; lane: string }> }
+export interface SessionTaskFacts { states: Map<string, string> }
 
 export interface ProviderHealth {
   provider: string;
@@ -99,13 +101,6 @@ export interface CompanyConfig {
   redispatchMinutes: number;
   extendWithinSeconds: number;
   handoverChars: number;
-  evalEnabled: boolean;
-  /** auto: Jev 直评、低置信度升级 LLM 评审员；llm: 只走 LLM 评审员；jev: 只走 Jev（低置信度也记录）。 */
-  evalEngine: 'auto' | 'llm' | 'jev';
-  /** Jev 单题置信度下限，低于则升级 LLM 评审员（auto 模式）。 */
-  jevMinConfidence: number;
-  /** Jev 员工风险标记 noul 阈值，达到则给老板发提醒。 */
-  jevFlagThreshold: number;
   /** 配置了 Jev 时，用 noul 决定系统提醒是否弹桌面通知（否则只进收件箱）。 */
   jevNotifyTriage: boolean;
   /** 配置了 Jev 时，由 Jev 做目标分级、上线决定和老板升级路由；拿不准交回老板/运营。 */
@@ -127,9 +122,6 @@ export interface CompanyConfig {
   sessionPolicy: 'reuse' | 'oneshot';
   /** 连续观测为空闲的会话在此分钟数后回收；0 = 关闭。 */
   sessionIdleMinutes: number;
-  /** quick 目标的完成任务在 Jev 低置信度时是否升级 LLM 评审员；默认 false，直接记录 Jev 评分。 */
-  evalQuickLlm: boolean;
-  evalBatchHours: number;
   /** 每日简报的本地发送时刻（0-23 点，之后第一个周期发送）；-1 = 关闭。 */
   ownerBriefHour: number;
   /** 同一任务在员工与老板之间 block→resume 往返达到该次数就不再自动循环，升级给老板；0 = 关闭。 */
@@ -157,20 +149,16 @@ export interface CompanyConfig {
 export const DEFAULT_CONFIG: CompanyConfig = {
   paused: false, maxRunning: 4, providerMax: { codex: 3, grok: 2, devin: 2 },
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
-  evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
+  jevNotifyTriage: true,
 
-  quotaFloorPct: 8, quotaWeeklyFloorPct: 6, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxWakesByRole: {}, sessionMaxInputK: 200, sessionPolicy: 'reuse', sessionIdleMinutes: 120, evalQuickLlm: false, evalBatchHours: 24, ownerBriefHour: 9, blockLoopLimit: 5,
+  quotaFloorPct: 8, quotaWeeklyFloorPct: 6, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxWakesByRole: {}, sessionMaxInputK: 200, sessionPolicy: 'reuse', sessionIdleMinutes: 120, ownerBriefHour: 9, blockLoopLimit: 5,
   minFreeMemMb: 2048, minFreeDiskMb: 10240,
   artifactReclaimEnabled: true, artifactEvidenceGraceDays: 3, artifactDeliverableGraceDays: 7, artifactHeadroomMb: 10240,
   archiveRetentionDays: 7, commDirGraceHours: 48, scratchGraceHours: 24,
 };
 
-/** 有效派工权重 = 配置的 weight × 绩效系数（无评分记录时系数为 1；5 分约 1.7 倍，1 分约 0.33 倍）。 */
-export const effectiveWeight = (def: EmployeeDef | undefined): number => {
-  const base = Math.max(0, def?.weight ?? 10);
-  const factor = def?.avgScore && def.avgScore > 0 ? Math.min(Math.max(def.avgScore / 3, 0.3), 2) : 1;
-  return base * factor;
-};
+/** 有效派工权重即配置的 weight（0 = 永不主动选中）。 */
+export const effectiveWeight = (def: EmployeeDef | undefined): number => Math.max(0, def?.weight ?? 10);
 
 /** 加权随机排序（不放回），rand 注入便于测试；权重全为 0 时退化为均匀随机。 */
 export function weightedOrder<T>(items: T[], weightOf: (item: T) => number, rand: () => number): T[] {
@@ -215,7 +203,6 @@ export interface SupervisedTask {
   quotaResetsAt?: number;
   kind: string;
   title: string;
-  evalAttempts: number;
   ownerRerouted: boolean;
   /**
    * Effective code repo for dispatch (home grouping, spawn cwd/repoHome): the task's explicit
@@ -249,7 +236,6 @@ const supervised = (row: TaskRow): SupervisedTask => {
     resumeState: row.state === 'blocked' ? row.resume_state : undefined, resumeRole: row.state === 'blocked' ? row.resume_role : undefined,
     quotaResetsAt: row.quota_resets_at ?? undefined,
     kind: v.kind, title: v.title,
-    evalAttempts: row.eval_attempts ?? 0,
     ownerRerouted: row.owner_rerouted === true, repoPath: row.repo_path ?? undefined,
     codeRepoPath: row.code_repo_path ?? undefined };
 };
@@ -257,7 +243,7 @@ const supervised = (row: TaskRow): SupervisedTask => {
 const COOLDOWN_BASE = 30 * 60;
 const COOLDOWN_MAX = 6 * 60 * 60;
 export const capabilitiesFor = (role: Role): Principal['capabilities'] =>
-  role === 'eval' ? [] : role === 'owner' || role === 'gm' || role === 'product' ? ['execute', 'review', 'manage'] : ['execute', 'review'];
+  role === 'owner' || role === 'gm' || role === 'product' ? ['execute', 'review', 'manage'] : ['execute', 'review'];
 
 /** One pending-wake attempt. It lives in the same schemaless dispatch table, keyed by task+phase+episode. */
 export type ManagerWakeState = 'pending' | 'running' | 'finished' | 'unknown';
@@ -348,10 +334,6 @@ export class Workforce {
       redispatchMinutes: pick('redispatchMinutes', 'redispatch_minutes'),
       extendWithinSeconds: pick('extendWithinSeconds', 'extend_within_seconds'),
       handoverChars: pick('handoverChars', 'handover_chars'),
-      evalEnabled: row?.eval_enabled !== false,
-      evalEngine: (engine => (engine === 'llm' || engine === 'jev' ? engine : 'auto'))(String(row?.eval_engine ?? 'auto')),
-      jevMinConfidence: typeof row?.jev_min_confidence === 'number' ? row.jev_min_confidence : 0.7,
-      jevFlagThreshold: typeof row?.jev_flag_threshold === 'number' ? row.jev_flag_threshold : 0.65,
       jevNotifyTriage: row?.jev_notify_triage !== false,
       quotaFloorPct: typeof row?.quota_floor_pct === 'number' ? row.quota_floor_pct : 8,
       quotaWeeklyFloorPct: typeof row?.quota_weekly_floor_pct === 'number' ? row.quota_weekly_floor_pct : DEFAULT_CONFIG.quotaWeeklyFloorPct,
@@ -362,8 +344,6 @@ export class Workforce {
       sessionIdleMinutes: typeof row?.session_idle_minutes === 'number' && Number.isFinite(row.session_idle_minutes) && row.session_idle_minutes >= 0 ? row.session_idle_minutes : DEFAULT_CONFIG.sessionIdleMinutes,
       sessionMaxInputK: typeof row?.session_max_input_k === 'number' ? row.session_max_input_k : DEFAULT_CONFIG.sessionMaxInputK,
       sessionPolicy: row?.session_policy === 'oneshot' ? 'oneshot' : 'reuse',
-      evalQuickLlm: row?.eval_quick_llm === true,
-      evalBatchHours: typeof row?.eval_batch_hours === 'number' && row.eval_batch_hours > 0 ? row.eval_batch_hours : 24,
       ownerBriefHour: typeof row?.owner_brief_hour === 'number' ? row.owner_brief_hour : 9,
       minFreeMemMb: typeof row?.min_free_mem_mb === 'number' ? row.min_free_mem_mb : DEFAULT_CONFIG.minFreeMemMb,
       minFreeDiskMb: typeof row?.min_free_disk_mb === 'number' ? row.min_free_disk_mb : DEFAULT_CONFIG.minFreeDiskMb,
@@ -407,13 +387,13 @@ export class Workforce {
 
   async defs(): Promise<EmployeeDef[]> {
     type Row = { id: RecordId; role: Role; provider: string; model: string; thinking?: string; tracks?: string[]; enabled: boolean;
-      max_instances: number; priority: number; weight?: number; quota_limited?: boolean; scored?: number; avg_score?: number; error_streak?: number };
+      max_instances: number; priority: number; weight?: number; quota_limited?: boolean; error_streak?: number };
     const [rows] = await this.db.query<[Row[]]>('SELECT * FROM employee_def ORDER BY weight DESC, priority, id;');
     return rows.map(r => ({ id: asId(r.id), role: r.role, provider: r.provider, model: r.model, thinking: r.thinking ?? undefined,
       tracks: r.tracks ?? undefined,
       enabled: r.enabled !== false, maxInstances: r.max_instances ?? 1, priority: r.priority ?? 100,
       weight: r.weight ?? 10, quotaLimited: r.quota_limited === false ? false : undefined,
-      scored: r.scored ?? 0, avgScore: r.avg_score ?? undefined, errorStreak: r.error_streak ?? 0 }));
+      errorStreak: r.error_streak ?? 0 }));
   }
 
   async defFailure(defId: string): Promise<number> {
@@ -433,7 +413,7 @@ export class Workforce {
   async insts(): Promise<EmployeeInst[]> {
     type Row = { id: RecordId; role: Role; def?: RecordId; principal?: RecordId; provider?: string; model?: string; thinking?: string;
       paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number; idle_since?: number; runtime_sleep_requested_at?: number;
-      v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; workspace_scope?: string; paseo_workspace?: string; wake_count?: number; lane?: string; last_task?: RecordId; last_phase?: 'execute' | 'review' };
+      v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; workspace_scope?: string; paseo_workspace?: string; wake_count?: number; lane?: string; last_task?: RecordId; last_phase?: 'execute' | 'review'; session_task?: string };
     const [rows] = await this.db.query<[Row[]]>(
       'SELECT * FROM employee WHERE revoked != true AND retired != true AND (def != NONE OR paseo_agent_id != NONE) ORDER BY id;');
     return rows.map(r => ({ id: asId(r.id), role: r.role, def: r.def ? asId(r.def) : undefined, provider: r.provider,
@@ -441,17 +421,15 @@ export class Workforce {
       activeTask: r.active_task ? asId(r.active_task) : undefined, credentialFile: r.credential_file, lastWakeAt: r.last_wake_at, idleSince: r.idle_since, runtimeSleepRequestedAt: r.runtime_sleep_requested_at,
       onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, repoHome: r.workspace_repo ?? undefined, workspaceScope: r.workspace_scope ?? undefined, paseoWorkspace: r.paseo_workspace ?? undefined, wakeCount: r.wake_count ?? 0,
       principal: r.principal ? asId(r.principal) : undefined,
-      lane: r.lane ?? undefined, lastTask: r.last_task ? asId(r.last_task) : undefined, lastPhase: r.last_phase ?? undefined }));
+      lane: r.lane ?? undefined, lastTask: r.last_task ? asId(r.last_task) : undefined, lastPhase: r.last_phase ?? undefined,
+      sessionTask: r.session_task ?? undefined }));
   }
 
-  /** What decides whether a session has finished: its tasks' states, and the follow-ups waiting for an executor of each. */
+  /** What decides whether a session has finished: the states of its tasks. A follow-up task starts its own session. */
   async sessionTaskFacts(taskIds: string[]): Promise<SessionTaskFacts> {
     const ids = taskIds.map(task => id('task', task));
     const [tasks] = await this.db.query<[Array<{ id: RecordId; state: string }>]>('SELECT id, state FROM task WHERE id IN $ids;', { ids });
-    const [children] = await this.db.query<[Array<{ parent: RecordId; executor_role: string; project?: RecordId }>]>(
-      `SELECT parent, executor_role, project FROM task WHERE parent IN $ids AND state IN ['ready', 'planned'];`, { ids });
-    return { states: new Map((tasks ?? []).map(task => [asId(task.id), task.state])),
-      followUps: (children ?? []).map(child => ({ parent: asId(child.parent), lane: laneOf(child.project ? asId(child.project) : undefined, child.executor_role) })) };
+    return { states: new Map((tasks ?? []).map(task => [asId(task.id), task.state])) };
   }
 
   /** The root of a task's chain: the goal its sessions are grouped under. */
@@ -497,15 +475,16 @@ export class Workforce {
   /** Creates an employee identity for a definition; the caller binds the Paseo agent once spawned.
    *  The credential is returned in memory only — file delivery is the caller's choice
    *  (writeCredentialFile for the legacy standalone dispatcher; plugin sidecar keeps it in RAM). */
-  async spawnInst(def: EmployeeDef, repoHome?: string, workspaceScope?: string): Promise<EmployeeInst> {
+  /** `sessionTask` is written before the session is opened: model traffic is attributed by it from the first request. */
+  async spawnInst(def: EmployeeDef, repoHome?: string, workspaceScope?: string, sessionTask?: string): Promise<EmployeeInst> {
     const employeeId = `${def.id}-${randomBytes(3).toString('hex')}`;
     const credential = await this.enrollment.enroll(employeeId, def.role, capabilitiesFor(def.role));
     await this.db.query(`UPDATE $e MERGE { def: $def, provider: $provider, model: $model, thinking: $thinking,
-      retired: false, workspace_repo: $repo_home, workspace_scope: $scope, created_at: time::now() };`, {
+      retired: false, workspace_repo: $repo_home, workspace_scope: $scope, session_task: $session_task, created_at: time::now() };`, {
       e: id('employee', employeeId), def: id('employee_def', def.id), provider: def.provider, model: def.model,
-      thinking: def.thinking, repo_home: repoHome, scope: workspaceScope,
+      thinking: def.thinking, repo_home: repoHome, scope: workspaceScope, session_task: sessionTask,
     });
-    return { repoHome, workspaceScope, id: employeeId, role: def.role, def: def.id, provider: def.provider, model: def.model, thinking: def.thinking, credential };
+    return { repoHome, workspaceScope, id: employeeId, role: def.role, def: def.id, provider: def.provider, model: def.model, thinking: def.thinking, credential, sessionTask };
   }
 
   /** Legacy agent delivery: write the credential to a 600 file the agent's env can point at. */
@@ -681,16 +660,6 @@ export class Workforce {
 
   
 
-  /** Metrics + timeline a judge needs to score a finished task (shared with the Jev dispatcher path). */
-  async requireFullModelEvaluation(taskId: TaskId): Promise<void> {    await this.db.query("UPDATE $task SET model_eval_full_history=true WHERE state='done';",{task:id('task',taskId)});
-  }
-
-  async evalState(taskId: TaskId): Promise<EvalState> {
-    return collectEvalState(this.db, taskId);
-  }
-
-  
-
   /** Persists or clears a task's open dispatch-blocked episode (phase and start, unix seconds). */
   async setDispatchBlock(taskId: TaskId, phase: string | undefined, since?: number): Promise<void> {
     await this.db.query('UPDATE $task SET dispatch_blocked_phase = $phase, dispatch_blocked_since = $since;',
@@ -729,50 +698,6 @@ export class Workforce {
       if (!since.has(key) && row.at !== undefined && row.at !== null) since.set(key, Date.parse(String(row.at)));
     }
     return since;
-  }
-
-  /** Record a Jev-produced evaluation: scorecards + evaluated_at + audit/outbox + rolling averages. */
-  async recordJevEvaluation(
-    taskId: TaskId, judge: string, summary: string,
-    scores: ScoredEmployee[], state: EvalState, topPerformer?: string,
-  ): Promise<{ recorded: number; participants: string[] }> {
-    return writeScorecards(this.db, { taskId, summary, judge, judgeKind: 'jev', scores, state, topPerformer });
-  }
-
-  /** Count one Jev attempt so repeated API failures fall back to the LLM judge path. */
-  async bumpEvalAttempt(taskId: TaskId): Promise<number> {
-    const [row] = await this.db.query<[{ eval_attempts?: number }]>(
-      'UPDATE ONLY $t SET eval_attempts = (eval_attempts ?? 0) + 1 RETURN AFTER;', { t: new RecordId('task', taskId) });
-    return row?.eval_attempts ?? 1;
-  }
-
-  /** Done tasks not yet performance-evaluated, oldest first. */
-  async pendingEvaluations(limit = 3): Promise<SupervisedTask[]> {
-    const [rows] = await this.db.query<[TaskRow[]]>(
-      "SELECT * FROM task WHERE state = 'done' AND evaluated_at = NONE ORDER BY created_at, id LIMIT $limit;", { limit });
-    return rows.map(supervised);
-  }
-
-  /**
-   * The LLM eval batch candidates: done tasks with no evaluation yet, or ones whose Jev verdict was
-   * below confidence (flagged scorecard) and never re-scored. Batches cap at 30 ids per message.
-   */
-  async pendingEvalBatch(minConfidence: number, limit = 30): Promise<SupervisedTask[]> {
-    const [rows] = await this.db.query<[TaskRow[]]>(
-      `SELECT * FROM task WHERE state = 'done' AND (
-        evaluated_at = NONE OR id IN (SELECT VALUE task FROM scorecard WHERE flagged = true))
-        ORDER BY created_at LIMIT $limit;`, { limit });
-    void minConfidence;
-    return rows.map(supervised);
-  }
-
-  /** The creation time of the latest sent eval outbound message — the batch cadence's persistence. */
-  async lastEvalBatchAt(): Promise<number> {
-    const [rows] = await this.db.query<[Array<{ sent_at?: string | number }>]>(
-      "SELECT sent_at FROM outbound_message WHERE step = 'eval' AND state = 'sent' ORDER BY sent_at DESC LIMIT 1;");
-    const at = rows?.[0]?.sent_at;
-    const ms = typeof at === 'number' ? at * 1000 : Date.parse(String(at ?? ''));
-    return Number.isFinite(ms) ? ms : 0;
   }
 
   /** Extends a live holder's lease without changing version, fence or delivery. */

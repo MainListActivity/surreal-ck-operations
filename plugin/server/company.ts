@@ -1,4 +1,3 @@
-import {telemetry} from "./agent-metrics";
 // Lazily boots the company stack inside the plugin's Node subprocess.
 // Repo modules live under server/vendor (copied by scripts/vendor.sh at install/update).
 import { installBunShim } from "./bun-shim";
@@ -29,10 +28,6 @@ export interface Company {
   workforce: import("./vendor/src/workforce").Workforce;
   dispatcher: import("./vendor/src/dispatcher/dispatcher").Dispatcher;
   core: import("./vendor/src/contracts").CompanyCore;
-  modelRanking: import("./vendor/src/model-routing/ranking").RankingRefresher;
-  modelRouting: import("./vendor/src/model-routing/controller").ModelRoutingController;
-  stopModelGateway: () => Promise<void>;
-  modelJournal: import("./vendor/src/model-routing/journal").ExecutionJournal;
   sidecar: import("./sidecar").SidecarPool;
   /** Agent home repo — the default project staffing pools are scoped to. */
   opsRepo: string;
@@ -104,15 +99,6 @@ export function company(): Promise<Company> {
     const db = new CompanyDatabase(databaseConfig);
     await db.connect();
     await db.useDatabase(); // schema is owned by the launchd MCP service; we only query.
-    const { ModelRoutingController } = await import("./vendor/src/model-routing/controller.ts");
-    const { startModelGateway } = await import("./vendor/src/model-routing/gateway.ts");
-    const modelRouting = new ModelRoutingController(db.db, serviceHome(), undefined, { jev: jevFromEnv() });
-    const { readMagpieGroups } = await import("./vendor/src/model-routing/controller.ts");
-    const { RankingRefresher } = await import("./vendor/src/model-routing/ranking.ts");
-    const modelRanking = new RankingRefresher({db:db.db, groups:readMagpieGroups,
-      facts:async ids => { await modelRouting.refresh(); return modelRouting.rankingFacts(ids); },
-      apply:(orders,isCurrent)=>modelRouting.applyOrders(orders,isCurrent),log:message=>console.warn(message)});
-    void modelRouting.refresh().catch(error=>console.warn(`model routing startup: ${(error as Error).message}`));
 
     const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/private/credentials`);
     const opsRepo = process.env.SCK_AGENT_CWD ?? "/Users/y/IdeaProjects/surreal-ck-operations";
@@ -229,27 +215,8 @@ export function company(): Promise<Company> {
       },
       log: message => console.log(message),
     });
-    const { ExecutionJournal } = await import("./vendor/src/model-routing/journal.ts");
-    const modelJournal=new ExecutionJournal(join(serviceHome(),"model-routing","queue"));
     // One sink for the dispatcher's lifetime: it opens the logs directory once and appends from then on.
     const dispatcherLog = dispatcherLogSink(serviceHome());
-    let routingReady=false;
-    const metricStore=telemetry(),requestAgents=new Map<string,string>();
-    const modelGateway = await startModelGateway({ready:()=>routingReady,onRequest:()=>modelRanking.trigger(),lease:async ref=>{
-      const lease=sidecar.routingLease(ref);if(!lease?.agent)return lease;
-      try{const turn=metricStore.current(lease.agent)??metricStore.begin(lease.agent,null,Date.now(),true);return {...lease,turn_key:turn.key};}
-      catch{console.warn("agent model metrics: turn attribution unavailable");return lease;}
-    },record:async row=>{
-      await modelJournal.record(row);
-      if(typeof row.agent==='string'){
-        requestAgents.set(String(row.id),row.agent);
-        try{metricStore.record(row.agent,{id:String(row.id),at:new Date(row.at as Date).getTime(),model:typeof row.model==='string'?row.model:undefined,status:Number(row.status),source:'company-gateway',turnKey:row.turn_key as string|undefined});}catch{console.warn('agent model metrics: local observation unavailable');}
-      }
-    },progress:(id,metrics)=>{const agent=requestAgents.get(id);if(agent)metricStore.progress(agent,id,metrics);},complete:async(id,done,metrics)=>{
-      await modelJournal.complete(id,done,metrics);
-      const agent=requestAgents.get(id);requestAgents.delete(id);
-      if(agent){try{metricStore.complete(agent,id,done,metrics);}catch{console.warn('agent model metrics: local completion unavailable');}}
-    }});
     const messages = new OutboundMessageStore(db.db);
     const sckBin = process.env.SCK_TOOL_BIN ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/bin/sck`;
     const dispatcher = new Dispatcher({
@@ -295,9 +262,7 @@ export function company(): Promise<Company> {
       },
     });
     // Rebuild agent↔instance bindings and live leases after a plugin restart.
-    try { await sidecar.adopt(await workforce.insts()); }
-    catch(error) { await modelGateway.stop(); throw error; }
-    routingReady=true;
+    await sidecar.adopt(await workforce.insts());
     const {CompanyUpgrades}=await import("./vendor/src/company-upgrades.ts");
     const upgrades=new CompanyUpgrades(db,owner,{home:serviceHome(),repo:opsRepo});
     // 云端执行端的运维作业：员工身份与租约只在本进程的 sidecar 里，作业经 sidecar.runCloudOps 执行。
@@ -328,7 +293,7 @@ export function company(): Promise<Company> {
       releaseInstall: async ({ sha }) => releaseInstall({ sha }, { repo: opsRepo, serviceHome: serviceHome(), dispatchPaused: await dispatchPaused() }),
       log: message => console.log(message),
     }) : undefined;
-    return readyCompany={ upgrades, modelJournal, modelRouting, modelRanking, messages, stopModelGateway:async()=>{modelRanking.stop();await modelGateway.stop();}, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops, sckBin, opsJobs,
+    return readyCompany={ upgrades, messages, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops, sckBin, opsJobs,
       get paseo(){ return currentPaseo(); } };
   })();
   boot.catch(() => { boot = undefined; }); // a failed boot must not poison later calls

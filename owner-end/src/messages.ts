@@ -17,7 +17,7 @@ export const TRANSLATE_COMMANDS: ReadonlySet<string> = new Set(['translate.previ
  * 否则员工收到的指令会缺少路径或命令。
  */
 const PLACEHOLDERS: readonly RegExp[] = [
-  /\{taskId\}/, /\{acId\}/, /sck call/, /task\.md/, /notes\.md/, /findings\/round-(?:\d+|NN)\.md/, /agents\/eval\.md/,
+  /\{taskId\}/, /\{acId\}/, /sck call/, /task\.md/, /notes\.md/, /findings\/round-(?:\d+|NN)\.md/,
 ];
 
 /** 原文里出现过的占位标记，译文里都还在。 */

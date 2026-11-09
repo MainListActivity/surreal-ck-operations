@@ -1,5 +1,3 @@
-import { taskTier } from './vendor/src/model-routing/policy.ts';
-import type { RoutingLease } from './vendor/src/model-routing/gateway.ts';
 // Per-agent sidecar pool. Each company employee instance gets a private comm
 // directory and an in-memory credential held by the plugin; agents receive only
 // SCK_COMM_DIR/SCK_COMM_KEY in their spawn env and never see auth material.
@@ -37,7 +35,7 @@ const SWEEP_MS = 400;
 const BASE_TOOLS = [
   "get_context", "get_task_history", "list_worktrees", "reclaim_worktrees", "list_worktree_audits", "checkpoint", "submit", "review", "report_blocker",
   "create_task", "resume_task", "retire_task",
-  "record_owner_decision", "set_direction", "record_score", "get_model_evidence", "get_task_cost", "heartbeat", "deliverable_publish",
+  "record_owner_decision", "set_direction", "get_task_cost", "heartbeat", "deliverable_publish",
   // Manage capability (owner/product) only, enforced in core; writes land in audit.
   "def_list", "def_ensure", "project_disciplines_update",
   // owner only in core (rebind a blocked task to a registered project; audited, version-guarded).
@@ -193,8 +191,8 @@ interface LiveClaim {
   blockerHash?: string;
   /** Turns that ended without any closeout artifact while this claim was live. */
   nudges?: number;
-  routing?: RoutingLease;
-  routingExpiresAt?: number;
+  /** Server-side lease end, written by claim, heartbeat and recovery. The cloud gateway bounds its token by what is left of it. */
+  leaseExpiresAt?: number;
 }
 
 /** What settle() found for a finished turn; `silent` carries the still-open round. */
@@ -232,8 +230,8 @@ export class SidecarPool {
   private readonly quarantined = new Set<string>();
   private readonly creds = new Map<string, string>();
   private readonly keys = new Map<string, string>();
-  private readonly routingUnconfirmed = new Set<string>();
-  private readonly routingEmployees = new Map<string, {role:string}>();
+  /** Role and the task each instance's model session is keyed on. Fixed at spawn: a session serves one task. */
+  private readonly roles = new Map<string, {role:string; task?:string}>();
   private readonly claims = new Map<string, LiveClaim>();
   /** instId → task of the last lease it held; names the task a report written after the lease ended belongs to. */
   private readonly lastTask = new Map<string, string>();
@@ -249,34 +247,22 @@ export class SidecarPool {
   constructor(private readonly deps: SidecarDeps) { this.opsCircuit = new OpsCircuit(deps.runDir); }
   private log(message: string) { this.deps.log?.(message); }
 
-  routingSession(ref:string):{employee:string;comm:string;role?:string}|undefined {
+  /** The company employee behind a session: its instance, comm dir, role, and the task its model session is keyed on. */
+  sessionOf(ref:string):{employee:string;comm:string;role?:string;task?:string}|undefined {
     const employee=ref.startsWith('employee:')?ref.slice(9):this.instByAgent.get(ref);
     if(!employee||!this.launched.has(employee)||this.quarantined.has(employee))return;
-    return {employee,comm:commDir(this.deps.runDir,employee),role:this.routingEmployees.get(employee)?.role};
+    const known=this.roles.get(employee);
+    return {employee,comm:commDir(this.deps.runDir,employee),role:known?.role,task:known?.task};
   }
 
   /** The receiving employee's real role, for nudge drafts that must not be labelled 'owner'. */
   roleFor(instId: string): string | undefined {
-    return this.routingEmployees.get(instId)?.role;
-  }
-
-  /** Read-only projection of the sidecar's authoritative local claim; never queries the remote DB. */
-  routingLease(ref:string):RoutingLease|undefined {
-    const inst=ref.startsWith('employee:')?ref.slice(9):this.instByAgent.get(ref);
-    if(!inst||this.quarantined.has(inst)||!this.launched.has(inst)||this.routingUnconfirmed.has(inst))return;
-    const agent=[...this.instByAgent].find(([,id])=>id===inst)?.[0];
-    const live=this.claims.get(inst);
-    if(live){if(!live.routing||!(live.routingExpiresAt!>Date.now()))return;return {...live.routing,agent,fence:live.proof.fence};}
-    const role=this.routingEmployees.get(inst)?.role;
-    // A task lease authorizes task writes, not the employee's ability to speak.
-    // submit/review consumes the lease before Claude's next call handles the tool result.
-    // Keep authenticated sessions routable without attributing closeout/chat to the finished task.
-    if(role)return {employee:inst,agent,task:'',fence:0,role,tier:taskTier({executor_role:role}),phase:role==='eval'?'planning':'idle'};
+    return this.roles.get(instId)?.role;
   }
 
   /** Spawn env for a fresh instance: comm channel only. Minted credential stays in memory. */
   env(inst: EmployeeInst): Record<string, string> {
-    this.routingEmployees.set(inst.id,{role:inst.role});
+    this.roles.set(inst.id,{role:inst.role,task:inst.sessionTask});
     if (this.quarantined.has(inst.id) || (inst.paseoAgentId && !this.canReuse(inst))) {
       throw Object.assign(new Error("session channel cannot be restored; retire the instance"), { code: "stale_channel" });
     }
@@ -470,11 +456,9 @@ export class SidecarPool {
     // identical-looking new report still submits instead of matching a stale hash.
     this.archive(reportPath(dir), "stale");
     this.archive(blockerPath(dir), "stale");
-    this.routingUnconfirmed.delete(inst.id);
     this.claims.set(inst.id, {
       instId: inst.id, taskId: task.id, phase: result.task.state === "review" ? "review" : "doing",
-      routing: {employee:inst.id,task:task.id,fence:result.fence,role:inst.role,tier:taskTier({model_tier:result.task.modelTier,kind:result.task.kind,title:result.task.title,executor_role:inst.role,reviewer_role:result.task.reviewerRole}),phase:result.task.state==='review'?'review':'execute'},
-      routingExpiresAt:Date.parse(result.leaseExpiresAt),
+      leaseExpiresAt: Date.parse(result.leaseExpiresAt),
       proof: { taskId: task.id, deliveryId: result.deliveryId, fence: result.fence, expectedVersion: result.task.version },
     });
     this.startBeat(inst.id);
@@ -644,7 +628,6 @@ export class SidecarPool {
     if (!instId) return;
     if ([...this.instByAgent.values()].includes(instId)) return;
     this.endLease(instId);
-    this.routingUnconfirmed.delete(instId);
     this.launched.delete(instId);
     this.quarantined.add(instId);
     this.creds.delete(instId);
@@ -661,7 +644,7 @@ export class SidecarPool {
    */
   async adopt(insts: EmployeeInst[]): Promise<void> {
     for (const inst of insts) {
-      this.routingEmployees.set(inst.id,{role:inst.role});
+      this.roles.set(inst.id,{role:inst.role,task:inst.sessionTask});
       if (inst.credentialFile || !inst.paseoAgentId || this.canReuse(inst)) continue;
       try {
         const cred = await this.deps.workforce.rotate(inst.id); // retired/revoked insts throw
@@ -691,8 +674,6 @@ export class SidecarPool {
     // instance keeps its seat (and any artifacts it wrote) across the restart.
     for (const inst of insts) {
       if (!this.launched.has(inst.id) || this.claims.has(inst.id)) continue;
-      // A failed/ambiguous lookup must not turn an in-flight employee into idle routing.
-      this.routingUnconfirmed.add(inst.id);
       try { await this.rebuildClaim(inst); }
       catch (error) { this.log(`adopt lease check ${inst.id} failed: ${(error as Error).message}`); }
     }
@@ -738,7 +719,6 @@ export class SidecarPool {
       return;
     }
     if (!mine.length) {
-      this.routingUnconfirmed.delete(inst.id);
       // No server lease: the channel may still be live, but claim.json and artifacts are dead.
       // Artifacts finished after the lease was lost stay with their task as evidence.
       const lost = readJsonFile<Partial<ClaimResult>>(join(dir, "claim.json"))?.task?.id;
@@ -778,11 +758,9 @@ export class SidecarPool {
       evidenceDir,
       orphanedArtifacts: orphanedArtifacts(evidenceDir),
     } as ClaimResult & { evidenceDir: string };
-    this.routingUnconfirmed.delete(inst.id);
     this.claims.set(inst.id, {
       instId: inst.id, taskId: task.id, phase: lease.state,
-      routing: {employee:inst.id,task:task.id,fence:task.fence,role:inst.role,tier:taskTier({model_tier:task.modelTier,kind:task.kind,title:task.title,executor_role:inst.role,reviewer_role:task.reviewerRole}),phase:lease.state==='review'?'review':'execute'},
-      routingExpiresAt:Date.parse(task.leaseExpiresAt),
+      leaseExpiresAt: Date.parse(task.leaseExpiresAt),
       proof: { taskId: task.id, deliveryId: lease.deliveryId, fence: task.fence, expectedVersion: task.version },
     });
     this.startBeat(inst.id);
@@ -824,7 +802,7 @@ export class SidecarPool {
           const result = await this.callWithCred(instId, cred => this.deps.core.heartbeat(cred, live.proof));
           if (this.claims.get(instId) === live) {
             live.proof.expectedVersion = result.task.version;
-            if(result.task.leaseExpiresAt)live.routingExpiresAt=Date.parse(result.task.leaseExpiresAt);
+            if(result.task.leaseExpiresAt)live.leaseExpiresAt=Date.parse(result.task.leaseExpiresAt);
           }
         } catch (error) {
           // Version drift (a concurrent write bumped the task) must not kill the
@@ -838,7 +816,7 @@ export class SidecarPool {
                 && (!task.leaseExpiresAt || Date.parse(task.leaseExpiresAt) > Date.now())) {
               live.proof.expectedVersion = task.version;
               live.proof.fence = task.fence;
-              if(task.leaseExpiresAt)live.routingExpiresAt=Date.parse(task.leaseExpiresAt);
+              if(task.leaseExpiresAt)live.leaseExpiresAt=Date.parse(task.leaseExpiresAt);
               this.log(`heartbeat ${instId} resynced after: ${(error as Error).message}`);
               return;
             }
@@ -1054,11 +1032,6 @@ export class SidecarPool {
       case "task_project_update": return core.taskProjectUpdate
         ? core.taskProjectUpdate(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose task_project_update"), { code: "temporarily_unavailable" }));
-      case "get_model_evidence": return withinReplyCeiling(async()=> {
-        if(!core.modelEvidence) throw new Error("Model evidence unavailable");
-        return core.modelEvidence(cred,taskIdOf(args.taskId));
-      });
-      case "record_score": return core.recordScore(cred, args as never);
       case "get_task_cost": return core.taskCost
         ? core.taskCost(cred, (args as { taskId: string }).taskId)
         : Promise.reject(Object.assign(new Error("core does not expose get_task_cost"), { code: "temporarily_unavailable" }));
@@ -1128,8 +1101,8 @@ export class SidecarPool {
    * 错误文本与返回内容中出现的令牌一律替换掉，不写会话、comm 目录、证据或日志。
    */
   private async callCloud(cloud: CloudRoute, instId: string, claim: LiveClaim, command: string, input: Record<string, unknown>): Promise<unknown> {
-    // 租约剩余秒数以服务端 leaseExpiresAt 为准（claim/心跳/恢复时写入 routingExpiresAt）；取不到即拒绝。
-    const remainingMs = claim.routingExpiresAt === undefined ? Number.NaN : claim.routingExpiresAt - Date.now();
+    // 租约剩余秒数以服务端 leaseExpiresAt 为准（claim/心跳/恢复时写入 leaseExpiresAt）；取不到即拒绝。
+    const remainingMs = claim.leaseExpiresAt === undefined ? Number.NaN : claim.leaseExpiresAt - Date.now();
     if (!(remainingMs >= 1000)) throw Object.assign(new Error("员工没有有效租约，不能调用网关"), { code: "no_lease" });
     let agentUserId: string | undefined;
     try {

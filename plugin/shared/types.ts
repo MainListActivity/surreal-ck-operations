@@ -2,7 +2,7 @@
 
 export type GoalTier = "quick" | "standard" | "program";
 export type TaskState = "blocked" | "ready" | "doing" | "review" | "done" | "void";
-export type Role = "owner" | "product" | "engineering" | "ai-content" | "concept-design" | "asset-production" | "screenwriter" | "story-author" | "cinematography" | "qa" | "cs" | "eval";
+export type Role = "owner" | "product" | "engineering" | "ai-content" | "concept-design" | "asset-production" | "screenwriter" | "story-author" | "cinematography" | "qa" | "cs";
 export type TaskKind = "goal" | "task" | "gate" | "release" | "deploy";
 
 export interface TaskView {
@@ -232,7 +232,7 @@ export interface Roster {
   /** The operations repo; pools whose home equals this render as the default project. */
   opsRepo: string;
   usage: ProviderUsageView[];
-  defs: Array<{ id: string; role: string; provider: string; model: string; resolved?: string; thinking?: string; enabled: boolean; maxInstances: number; weight?: number; avgScore?: number; quotaLimited?: boolean }>;
+  defs: Array<{ id: string; role: string; provider: string; model: string; resolved?: string; thinking?: string; enabled: boolean; maxInstances: number; weight?: number; quotaLimited?: boolean }>;
   /** What the roster renders: the instance name, its def, and the tick's session status. */
   instances: Array<{ id: string; def?: string; agentStatus?: string }>;
   health: Array<{ provider: string; state: string; lastError?: string; until?: number }>;
@@ -275,30 +275,4 @@ export interface PermissionRequest {
   employeeId?: string;
   role?: string;
   request: { id: string; kind?: string; summary?: string; detail?: string };
-}
-
-/** Actual Magpie member order with facts from its latest successful Jev ranking. */
-export interface ModelRankingAttempt {
-  at:string;modelCount:number;encoding:string;stateBytes:number;requestBytes:number;
-  limits:{stateBytes:number;requestBytes:number};status:string;
-}
-export interface ModelRankingTable {
-  group: string; at?: string; rules?: string; bandWidth?:number; bandRanges?:Record<string,{top:number;bottom:number}>; scored: boolean;
-  rows: Array<{
-    model: string; previousRank?:number; price?:{free:boolean;input?:number|null;output?:number|null;cacheHit?:number|null}; pinned?: boolean; tailReason?:string; urgency?:{active:boolean;kind:'gift'|'subscription'|'reset';expiresAt:string;amount:number;unit:string;requests:number;reason:string}; decision?:{sampleAgeMs?:number;factors?:{base:number;latency:number;availability:number;reliability:number;urgency:number;exploration:number;utility?:number;staleness?:number;estimatedCost?:number};urgent?:boolean;score?:number;coldStart?:boolean;costClass?:string;contributions?:Record<string,{value?:number;weight:number;points:number;factor?:number}>;band?:number;ttftMs?:number;latencySource:string;billing:string;quota:string;remainingPct?:number;pace?:number;tail?:string;reason:string}; trends?: import("./model-trends.ts").ModelTrends; trendSource?: {available:boolean;collectedAt:string}; aaScore?: number; aaRank?: number; effort?: string;
-    cacheHitRate?: number; tokensPerSecond?: number; ttftMs?: number; stabilityPct?: number; stabilitySamples?: number;
-    accounts: Array<{account: string; remainingPct?: number}>;
-    performanceScore?: number; performanceSamples?: number;
-    jevScore?: number; jevConfidence?: number;
-    /** Magpie routing log, every try; `excluded` is the automatic risk status; explicit manual pins retain first-tier priority. */
-    health?: { excluded: boolean; reason?: "unavailable" | "consecutive_errors" | "error_rate"; attempts: number; errors: number; consecutiveErrors: number; lastStatus?: number; lastAttemptAt?: string };
-  }>;
-}
-
-export interface ModelRankingPolicy {bandWidth:number;weights:Record<'pace'|'latency'|'intelligence'|'speed'|'performance'|'price'|'staleness',number>;billingOverrides:Record<string,'free'|'included'|'unknown'|'paid'>}
-
-export interface ModelCatalogPage {
- models:Array<{id:string;name:string;levels:string[];groups:string[];members:Record<string,string[]>;slug:string|null;aa?:{score:number;name:string};status:string}>;
- total:number;offset:number;nextOffset:number|null;
- benchmarks:Array<{slug:string;name:string;score:number}>;groups:string[];
 }

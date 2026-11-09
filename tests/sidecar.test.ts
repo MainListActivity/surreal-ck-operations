@@ -678,8 +678,8 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     fresh.close();
   });
 
-  test('adopt keeps unknown leases unroutable until an authoritative retry confirms idle', async () => {
-    const i = inst('e-unconfirmed', { paseoAgentId: 'agent-unconfirmed', credential: undefined });
+  test('adopt keeps the session registered while the lease lookup is unavailable, keyed on its spawn task', async () => {
+    const i = inst('e-unconfirmed', { paseoAgentId: 'agent-unconfirmed', credential: undefined, sessionTask: 'task-unconfirmed' });
     let unavailable = true;
     const recoveringCore = { ...core, activeLeases: async () => {
       if (unavailable) throw new Error('database unavailable');
@@ -687,11 +687,12 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     }};
     const fresh = new SidecarPool({ core: recoveringCore as never, workforce: workforce as never, runDir, heartbeatMs: 10_000, sweepMs: 20 });
     try {
+      // The model session does not wait for the lease: magpie attribution needs the session, not a claim.
       await fresh.adopt([i]);
-      expect(fresh.routingLease('agent-unconfirmed')).toBeUndefined();
+      expect(fresh.sessionOf('agent-unconfirmed')).toMatchObject({ employee: 'e-unconfirmed', task: 'task-unconfirmed' });
       unavailable = false;
       await fresh.adopt([i]);
-      expect(fresh.routingLease('agent-unconfirmed')).toMatchObject({ task: '', phase: 'idle' });
+      expect(fresh.sessionOf('agent-unconfirmed')).toMatchObject({ employee: 'e-unconfirmed', task: 'task-unconfirmed' });
     } finally { fresh.close(); }
   });
 
@@ -706,7 +707,7 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
     authRole = 'qa';
     const fresh = new SidecarPool({ core: core as never, workforce: workforce as never, runDir, heartbeatMs: 10_000, sweepMs: 20 });
     await fresh.adopt([i]);
-    expect(fresh.routingLease('agent-ambiguous')).toBeUndefined();
+    expect(fresh.sessionOf('agent-ambiguous')).toMatchObject({ employee: 'e-ambiguous', role: 'qa' });
     const env = fresh.env(i);
     const checkpoint = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'amb1', 'checkpoint', { text: 'ambiguous lease must not revive' });
     expect(checkpoint.ok).toBe(false);

@@ -56,7 +56,7 @@ run('SYS-QUOTA fork: a real sck quota block writes the task row and the provider
     const gm = await enrollment.enroll('fixture-manager', 'owner', ['execute', 'review', 'manage']);
     // 额度下限熔断关掉（quota_floor_pct 0）：本用例证明的是 provider_health 这一条门禁，不是 magpie 的剩余额度熔断。
     // provider_max 每个订阅一个席位：一席在手时新任务只能去另一个订阅，本用例的派工落点是确定的。
-    await db.db.upsert(new RecordId('company_meta', 'config')).content({ eval_enabled: false, jev_decisions: false,
+    await db.db.upsert(new RecordId('company_meta', 'config')).content({ jev_decisions: false,
       quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0,
       minFreeMemMb: 0, minFreeDiskMb: 0, artifactReclaimEnabled: false, blockLoopLimit: 0, redispatch_minutes: 15,
       max_running: 4, provider_max: { codex: 1, anthropic: 1 } });

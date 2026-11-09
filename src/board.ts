@@ -303,7 +303,7 @@ const translationOf = (message: DeliveryMessage, employeeLang: string | undefine
 };
 
 /** Message steps in the order the owner reads them: the dispatch order of one task. */
-const STEP_ORDER: readonly string[] = ['execute', 'review', 'rework', 'nudge', 'eval', 'notice'];
+const STEP_ORDER: readonly string[] = ['execute', 'review', 'rework', 'nudge', 'notice'];
 const byText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 const rowsOf = (db: Surreal, sql: string, vars?: Record<string, unknown>): Promise<Row[]> =>
@@ -333,7 +333,6 @@ export function renderContextFor(view: BoardView, employeeId: string,
   return {
     sckBin: view.env.sckBin, commDir, taskId: task.taskId,
     ...(task.findingsFile ? { findingsFile: task.findingsFile } : {}),
-    ...(view.env.opsRepo ? { opsRepo: view.env.opsRepo } : {}),
     ...(acId ? { acId } : {}),
   };
 }

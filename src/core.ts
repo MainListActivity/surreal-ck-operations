@@ -8,15 +8,14 @@ import { authenticationLookup } from './diagnostics.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateTask, Credential, DefView, EnsureDef, ProjectView, EmployeeScore, Evidence, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
+import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateTask, Credential, DefView, EnsureDef, ProjectView, Evidence, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
 import { ghCli, type GhRunner, type SubmitCheck } from './pr-gate.ts';
 import { githubRepoSlug } from './external-actions.ts';
 import type { SystemCheck } from './submit-checks.ts';
 import { ProjectStore } from './projects.ts';
-import { collectEvalState, summarizeModelEvidence, validateScores, writeScorecards, type ModelEvidence } from './scoring.ts';
-import { readTaskCost, recordTaskCost, type TaskCost } from './task-cost.ts';
+import { readTaskCost, type TaskCost } from './task-cost.ts';
 import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, SEGMENT_DEFAULT_BYTES, SEGMENT_MAX_BYTES, answerBytes, dualBytes, echoTask, fitCount, longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Bytes, worktreeRefsSegment, worktreeRefsSegmentAnswer, type TaskTextHead } from './response-budget.ts';
 import { DEFAULT_PAGE_SIZE, TASK_STATES, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput, parseWorktreeRefsInput, queryDigest, type ContextParams } from './query-input.ts';
 import {
@@ -156,7 +155,6 @@ export interface TaskRow {
   /** Explicit code-repo binding (schema 017); workspace/dispatch routing only, never business project resolution. */
   code_repo_path?: string;
   model_tier?: 'fable' | 'opus' | 'sonnet' | 'haiku' | 'high' | 'medium' | 'low';
-  model_route_until?:number;
   handover?: boolean;
   previous_employee?: string;
   /** Open dispatch-blocked episode (schemaless): the phase it blocks and when it began, unix seconds. */
@@ -173,10 +171,6 @@ export interface TaskRow {
   tag?: string;
   /** Unix seconds: a quota-caused block may not be re-announced to owner before this instant. */
   quota_resets_at?: number | null;
-  evaluated_at?: string;
-  model_eval_full_history?: boolean;
-  eval_via?: string;
-  eval_attempts?: number;
   owner_rerouted?: boolean;
   /** SYS02 acceptance fields (schema 026); every one is optional, so rows written before SYS02 stay valid. */
   acceptance_criteria?: AcceptanceCriterion[];
@@ -547,7 +541,7 @@ export class SurrealCompanyCore implements CompanyCore {
     const actor = await this.authorized(credential);
     const row = await this.db.select<TaskRow>(id('task', taskId));
     if (!row) throw new CompanyError('not_found', 'Task not found');
-    if (actor.role !== row.executor_role && actor.role !== row.reviewer_role && actor.role !== 'owner' && actor.role !== 'eval') {
+    if (actor.role !== row.executor_role && actor.role !== row.reviewer_role && actor.role !== 'owner') {
       throw new CompanyError('forbidden', 'Task access denied');
     }
     return view(row);
@@ -657,9 +651,6 @@ export class SurrealCompanyCore implements CompanyCore {
       }
     }
     assertRoleContract(contract, input.executorRole, input.discipline);
-    if (input.executorRole === 'eval' || input.reviewerRole === 'eval') {
-      throw new CompanyError('invalid', 'eval is a workforce-only role and cannot take tasks');
-    }
     validateIntent(input.workIntent);
     if (input.workIntent?.kind === 'code' && input.executorRole !== 'engineering') throw new CompanyError('invalid', 'Code writes require engineering');
     // SYS02 AC01: new code deliveries need structured criteria while the gate is enabled. Old rows stay valid because the
@@ -868,7 +859,7 @@ export class SurrealCompanyCore implements CompanyCore {
   
   async readWorkspace(credential: Credential, taskId?: TaskId, project?: string): Promise<WorktreeAssignment | undefined> {
     const actor = await this.authorized(credential);
-    if (!['owner', 'eval'].includes(actor.role)) throw new CompanyError('forbidden', 'Non-lease workspace requires owner/eval');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Non-lease workspace requires owner');
     if (!this.worktrees) return undefined;
     const bound = taskId ? await this.getTask(credential, taskId) : undefined;
     const resolved = taskId ? await this.taskProject(taskId!) : project ? await this.projects.get(project) : undefined;
@@ -1037,7 +1028,7 @@ export class SurrealCompanyCore implements CompanyCore {
    * Submit-time system checks (type errors, version metadata, tool wiring) on an engineering code submit to the ops repo.
    * The release task that carries a quick chain's code leg is checked the same way; read-intent legs are not.
    * A failure refuses the submit before review: the author keeps the lease and fixes it, no reviewer is dispatched. Each
-   * refusal is audited as submit_check_failed, which scoring counts against the author. A check that cannot run lets
+   * refusal is audited as submit_check_failed. A check that cannot run lets
    * the submit through; the reviewer still checks.
    */
   private async refuseFailedSystemChecks(proof: LeaseProof, employeeId: string): Promise<void> {
@@ -2789,57 +2780,17 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   /**
-   * owner only: turn a blocked read-only engineering task into a code task in place (read → code, optional lane), instead of
-   * retiring it and creating a sibling code task. Allowed on the same execute-phase blocks bind_task_code_repo accepts
-   * (owner gates, review-phase blocks and live leases refuse); kind=task only, so the release leg stays a read leg.
-   * Write authority is re-judged under the task's own policy chain, the implement-leg baseline criteria are merged when
-   * the acceptance gate is on, and the read assignment is cleared so the next claim allocates an exclusive code tree.
+   * owner only: what a task consumed, from the magpie usage rows of its employee sessions. The row is written by the
+   * dispatch pass once the task is done (task-cost.ts); until then the reason says it is waiting for settlement.
    */
-  async modelEvidence(credential: Credential, taskId: TaskId): Promise<ModelEvidence[]> {
-    const actor = await this.authorized(credential);
-    if (!['eval','owner'].includes(actor.role)) throw new CompanyError('forbidden','Only eval or owner may read model evaluation evidence');
-    if (!await this.db.select(id('task', taskId))) throw new CompanyError('not_found', 'Task not found');
-    // The same rows collectEvalState validates against, read alone: the full eval state rebuilt the whole timeline per call.
-    const [rows] = await this.db.query<[NonNullable<Parameters<typeof summarizeModelEvidence>[0]>]>(
-      "SELECT employee,model,fence,phase,<string>at AS at FROM model_execution WHERE task=$task AND completed=true AND status>=200 AND status<300 AND phase!='auxiliary' AND employee!=$actor;",
-      { task: id('task', taskId), actor: actor.employeeId });
-    return summarizeModelEvidence(rows ?? []);
-  }
-
   async taskCost(credential: Credential, taskId: TaskId): Promise<TaskCost | { taskId: TaskId; available: false; reason: string }> {
     const actor = await this.authorized(credential);
-    if (!['eval', 'owner'].includes(actor.role)) throw new CompanyError('forbidden', 'Only eval or owner may read task cost');
+    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Only owner may read task cost');
     requireText(taskId, 'task', 1, 200);
     const row = await this.db.select<TaskRow>(id('task', taskId));
     if (!row) throw new CompanyError('not_found', 'Task not found');
-    const cost = await readTaskCost(this.db, taskId) ?? (row.state === 'done' ? await recordTaskCost(this.db, taskId) : undefined);
-    return cost ?? { taskId, available: false, reason: row.state === 'done' ? '没有该任务的租约模型请求记录，或 Magpie 用量暂不可读' : '任务未完成，完成后结算成本' };
-  }
-
-  async recordScore(credential: Credential, input: { taskId: TaskId; summary: string; scores: EmployeeScore[]; complexity?: number }): Promise<{ recorded: number; participants: string[] }> {
-    const actor = await this.authorized(credential);
-    if (actor.role !== 'eval') throw new CompanyError('forbidden', 'Only eval employees may record scores');
-    requireText(input.summary, 'summary', 1, 20000);
-    if (!Array.isArray(input.scores) || input.scores.length > 50) throw new CompanyError('invalid', 'Invalid scores');
-    const row = await this.db.select<TaskRow>(id('task', input.taskId));
-    if (!row) throw new CompanyError('not_found', 'Task not found');
-    if (row.state !== 'done') throw new CompanyError('conflict', 'Task is not finished');
-    // Response timeouts can cut the reply after writes landed; retries must not
-    // duplicate the evaluated audit/outbox events (scorecards themselves upsert).
-    if (row.evaluated_at) return { recorded: 0, participants: [] };
-
-    const state = await collectEvalState(this.db, input.taskId, actor.employeeId);
-    const invalid = validateScores(state, input.scores);
-    if (invalid) throw new CompanyError('invalid', invalid);
-    for (const s of input.scores) if (s.notes !== undefined) requireText(s.notes, 'notes', 0, 4000);
-
-    if (input.complexity !== undefined && (!Number.isFinite(input.complexity) || input.complexity < 1 || input.complexity > 5)) {
-      throw new CompanyError('invalid', 'complexity must be 1-5');
-    }
-    return writeScorecards(this.db, {
-      taskId: input.taskId, summary: input.summary, judge: actor.employeeId, judgeKind: 'llm',
-      scores: input.scores, state, ...(input.complexity !== undefined ? { complexity: input.complexity } : {}),
-    });
+    const cost = await readTaskCost(this.db, taskId);
+    return cost ?? { taskId, available: false, reason: row.state === 'done' ? '任务已完成，成本等待结算（派工周期内写入）' : '任务未完成，完成后结算成本' };
   }
 
   async listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]> {

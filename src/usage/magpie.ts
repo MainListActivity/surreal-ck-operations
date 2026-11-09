@@ -1,7 +1,22 @@
 /** Read-only, bounded Magpie usage adapter. No prompts, credentials or sessions cross this boundary. */
 import { createHash } from "node:crypto";
-import { nativeDecode } from "../model-routing/trends.ts";
-import { magpieBase } from "../dispatcher/magpie-quota.ts";
+import { MAGPIE_BASE } from "../model-routing/magpie-contract.ts";
+const finite = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+/** Magpie usage.Record.DecodeOf/DecodeWindow: reasoning and burst exclusions match its native summary. */
+export function nativeDecode(r: Record<string, unknown>): number | undefined {
+  let out = r.out, start = r.ttft_ms;
+  const ms = r.ms, think = finite(r.reasoning) ? r.reasoning : 0, first = r.first_text_ms, flow = finite(r.flow_ms) ? r.flow_ms : 0;
+  if (!finite(out) || !finite(start) || !finite(ms) || start <= 0 || (r.reasoning_hidden === true && !(finite(first) && first > 0))) return;
+  if (think > 0) {
+    if (finite(first) && first > 0) { out -= think; start = first; }
+    else if (finite(r.first_reasoning_ms) && r.first_reasoning_ms >= start && flow > 0 && think <= out) start = r.first_reasoning_ms;
+    else return;
+  }
+  const window = ms - Number(start);
+  if (out <= 0 || window < 100 || out * 1000 > 10000 * window || (flow > 0 && flow * 4 < window)) return;
+  if (think > 0 && finite(first) && first > 0 && out * (first - Number(r.ttft_ms)) > 20 * think * window) return;
+  return out * 1000 / window;
+}
 export function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -245,12 +260,15 @@ export class MagpieUsage {
   private stopped = false;
   private controller?: AbortController;
   constructor(
-    private readonly base = magpieBase(),
+    private readonly base = MAGPIE_BASE,
     private readonly request: (url: string, init?: RequestInit) => Promise<Response> = fetch,
     private readonly now = Date.now,
+    /** The employee key for the VPS magpie; the caller reads it, so this module never touches the key file. */
+    private readonly authorization: () => Record<string, string> = () => ({}),
   ) {}
   private async read(path: string, signal?: AbortSignal) {
     const response = await this.request(this.base + path, {
+      headers: this.authorization(),
       signal: signal ?? AbortSignal.timeout(8000),
     });
     if (!response.ok) throw Error(`Magpie HTTP ${response.status}`);

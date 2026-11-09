@@ -18,7 +18,6 @@ import type { BrokerConfig } from './ops/config.ts';
 import { assertTaskExists, issueRemoteGrant, listRemoteGrants, REMOTE_OPERATOR_CHANNEL, revokeRemoteGrant, timedFetch, validateRemoteBlock } from './ops/remote-grant.ts';
 import type { Role } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
-import { repairInfrastructureScores, rescoreAggregates } from './scoring.ts';
 import { installNodeHost } from './host-node.ts';
 
 installNodeHost();
@@ -26,17 +25,16 @@ installNodeHost();
 const usage = `Usage: pnpm run admin <command>
   enroll <employee-id> <role>             登记固定身份（写入本 checkout .runtime/credentials）
   revoke <employee-id>                    撤销身份
-  def list                                列出员工定义（含权重与绩效均分）
+  def list                                列出员工定义（含权重）
   def set <id> <role> <provider> <model> [thinking] [max-instances] [priority] [weight]
   def weight <id> <n>                     调整派工权重（0-1000，0=不主动派工；概率按权重占比）
   def tracks <id> <轨,轨|->               限定编制的岗位轨（- 或空 = 全接；非空则只接 discipline 在列的任务）
   def enable|disable <id>
   def quota <id> limited|unlimited     是否受订阅额度限制（unlimited = 剩余额度为 0 也继续派工）
-  seed-defs                               写入默认员工定义（30 个：九岗位含 eval × codex/grok/devin 订阅，另加 screenwriter-agy、story-author-agy（antigravity 单座）、cinematography-codex（codex 单座），已存在则不覆盖）
+  seed-defs                               写入默认员工定义（七个岗位各接 codex/grok/devin 订阅，另加 screenwriter-agy、story-author-agy（antigravity 单座）、cinematography-codex（codex 单座），已存在则不覆盖）
   inst list                               列出在职员工实例
   bind <employee-id> <paseo-agent-id> [def-id] [credential-file]
   retire <employee-id> <reason>           退役实例并撤销凭证
-  scores [任务ID]                          查看绩效评分记录（默认最近 50 条）
   jev-test                                测试 Jev 决策模型连通性（需 JEV_API_KEY）
   project set <file.json>                 写入/更新项目环境（结构见 docs/agent-operations.md）
   project list                            列出项目环境与凭证名（不含值）
@@ -47,9 +45,7 @@ const usage = `Usage: pnpm run admin <command>
   secret set <项目> <环境> <名称> <角色,角色|-> [用途]
                                           从标准输入读取凭证值，加密后入库（值不回显、不进参数）；
                                           凭证只有运维代理能解密，员工拿不到（角色仅作清单标签，- 表示无）
-  repair-infrastructure-scores [--execute]  排除有明确额度故障证据的纯空转评分；默认只演练，保留原始卡片
-  config <key> <json-value>               修改 company_meta:config（如 max_running 4、eval_enabled false）
-  rescore                                 从评分卡重算员工与编制的 scored/avg_score（幂等；修复评分汇总失败留下的落后）
+  config <key> <json-value>               修改 company_meta:config（如 max_running 4、jev_notify_triage false）
   reclaim-artifacts [--execute] [任务ID] [目标空闲MB]
                                           回收终态任务的大文件（evidence/deliverables）；
                                           缺省只演练不删，加 --execute 才真正动手，带目标 MB 则按压力模式回收`;
@@ -99,7 +95,6 @@ try {
           thinking: d.thinking, tracks: d.tracks ?? [], enabled: d.enabled, max: d.maxInstances, weight: d.weight,
           quotaLimited: d.quotaLimited !== false,
           effectiveWeight: Number(effectiveWeight(d).toFixed(2)),
-          avgScore: d.avgScore ? Number(d.avgScore.toFixed(2)) : undefined, scored: d.scored,
           errorStreak: d.errorStreak })));
         break;
       }
@@ -129,14 +124,6 @@ try {
       print(await workforce.defs());
       break;
     }
-    case 'repair-infrastructure-scores': {
-      print(await repairInfrastructureScores(database.db, args.includes('--execute')));
-      break;
-    }
-    case 'rescore': {
-      print(await rescoreAggregates(database.db));
-      break;
-    }
     case 'jev-test': {
       const jev = jevFromEnv();
       if (!jev) { console.log('未配置 JEV_API_KEY / TYPESAFE_API_KEY（service.env）；Jev 评审通道未启用'); break; }
@@ -147,14 +134,6 @@ try {
       });
       console.log(`jev ${result.model} 应答正常（${Date.now() - started}ms）:`);
       print(result.answers);
-      break;
-    }
-    case 'scores': {
-      const taskId = args[0];
-      print((await database.db.query<unknown[]>(
-        taskId ? 'SELECT * FROM scorecard WHERE task = $task ORDER BY at DESC LIMIT 50;'
-          : 'SELECT * FROM scorecard ORDER BY at DESC LIMIT 50;',
-        { task: taskId ? new RecordId('task', taskId) : undefined }))[0]);
       break;
     }
     case 'seed-defs': {

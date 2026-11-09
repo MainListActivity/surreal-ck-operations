@@ -196,7 +196,7 @@ bun run build                                  # 生成 public/app.js
 
 - 译文服务失败不回滚原文。保存原文时如果已选语言，网关会立即补译；失败时返回 `translationPending`，由每分钟的定时任务补译。
 - 选语言时先译好再保存。保存时以译过的那一版原文为守卫，期间原文被改则报冲突，请重新译。
-- 派工时会替换的占位标记（`{taskId}`、`{acId}`、`sck call`、`task.md`、`notes.md`、`findings/round-NN.md`、`agents/eval.md`）如果在原文里出现，译文里也必须保留。否则返回 `upstream_error`，请重试。
+- 派工时会替换的占位标记（`{taskId}`、`{acId}`、`sck call`、`task.md`、`notes.md`、`findings/round-NN.md`）如果在原文里出现，译文里也必须保留。否则返回 `upstream_error`，请重试。
 - 原文和译文都不超过 20000 个字符。
 - 语言代码须符合 `^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?$`，如 `en`、`ja`。
 

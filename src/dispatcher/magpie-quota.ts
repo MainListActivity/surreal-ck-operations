@@ -1,6 +1,6 @@
 /**
- * Magpie is the owner's local subscription gateway. It holds every provider's live remaining
- * allowance and serves it at `GET /v1/magpie/quotas` on loopback (measured 0.04 s, no auth).
+ * Magpie (the VPS relay every employee session talks to) holds the providers' live remaining
+ * allowance and serves it at `GET /v1/magpie/quotas`.
  *
  * Paseo's own usage list reports only claude/codex/grok, so a Factory subscription whose
  * monthly allowance ran out never reached the dispatcher's quota breaker: the provider looked
@@ -11,7 +11,7 @@
  * Everything here is pure except `readMagpieQuotas`, which fails open (`undefined`) so a
  * missing, slow or reconfigured magpie can never block dispatch.
  */
-import { hostIO } from '../host-io.ts';
+import { MAGPIE_BASE } from '../model-routing/magpie-contract.ts';
 
 /** One allowance window as magpie serves it. `remaining` is a 0-100 percentage. */
 export interface MagpieWindow {
@@ -47,8 +47,6 @@ export interface MagpieUsageEntry {
 
 /** magpie names a provider after its CLI; the company names it by the def's `provider` field. */
 const PROVIDER_ALIASES: Record<string, string> = { factory: 'factory-droid' };
-
-const DEFAULT_BASE = 'http://127.0.0.1:3425';
 
 /**
  * Window names → the ids `isLongWindow` (/week|month|billing|cycle/) already classifies.
@@ -114,24 +112,17 @@ export function usageEntriesFrom(providers: readonly MagpieProvider[]): MagpieUs
   return providers.map(toUsageEntry).filter((e): e is MagpieUsageEntry => e !== undefined);
 }
 
-/**
- * Where magpie serves the gateway: `MAGPIE_ADDR` wins (magpie's own documented override),
- * then the address magpie last wired into Claude Code, then the built-in default.
- */
-export function magpieBase(env: NodeJS.ProcessEnv = process.env, readFile: (path: string) => string = p => hostIO().fs.readText(p)): string {
+/** Where magpie serves: `MAGPIE_ADDR` wins (magpie's own documented override), then the VPS relay. */
+export function magpieBase(env: NodeJS.ProcessEnv = process.env): string {
   const explicit = (env.MAGPIE_ADDR ?? '').trim();
   if (explicit) return /^https?:\/\//i.test(explicit) ? explicit : `http://${explicit}`;
-  try {
-    const { os, path } = hostIO();
-    const stash = readFile(path.join(os.homeDir(), '.config', 'magpie', 'stash.json'));
-    const wired = (JSON.parse(stash) as Record<string, unknown>)['claude.wired_at'];
-    if (typeof wired === 'string' && /^https?:\/\//i.test(wired)) return wired;
-  } catch { /* magpie absent or never wired: fall through to the default */ }
-  return DEFAULT_BASE;
+  return MAGPIE_BASE;
 }
 
 export interface ReadMagpieOptions {
   base?: string;
+  /** The employee key for the VPS relay; omitted for an explicitly configured local address. */
+  headers?: Record<string, string>;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
 }
@@ -145,6 +136,7 @@ export async function readMagpieQuotas(options: ReadMagpieOptions = {}): Promise
   const doFetch = options.fetchImpl ?? fetch;
   try {
     const reply = await doFetch(`${base.replace(/\/+$/, '')}/v1/magpie/quotas`, {
+      headers: options.headers,
       signal: AbortSignal.timeout(options.timeoutMs ?? 3_000),
     });
     if (!reply.ok) return undefined;

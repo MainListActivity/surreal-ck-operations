@@ -51,12 +51,13 @@ run('company fork: restart quarantine, actual lease fencing, fresh dispatch and 
     expect(ready).toBe(true); await db.connect(); await db.bootstrap();
     const core = new SurrealCompanyCore(db), enrollment = new LocalEnrollmentAdmin(db), owner = new OwnerDesk(db);
     const gm = await enrollment.enroll('fixture-manager', 'owner', ['execute', 'review', 'manage']);
-    await db.db.upsert(new RecordId('company_meta', 'config')).content({ eval_enabled: false, jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
+    await db.db.upsert(new RecordId('company_meta', 'config')).content({ jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
     const wf = new Workforce(db, join(dir, 'unused-credential-files'));
     await wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
     const minted = new Map<string, string>();
     const originalSpawn = wf.spawnInst.bind(wf);
-    wf.spawnInst = async d => { const i = await originalSpawn(d); minted.set(i.id, i.credential!); return i; };
+    // All arguments are forwarded: the session's task binding (sessionTask) decides whether it is ever reused.
+    wf.spawnInst = async (...args) => { const i = await originalSpawn(...args); minted.set(i.id, i.credential!); return i; };
     let releases = 0;
     const ops = { tools: ['ops_info'], call: async (credential: string, taskId: string) => {
       const actor = await core.authenticate(credential), task = await core.getTask(credential, taskId);
@@ -135,13 +136,14 @@ run('company fork: two rounds, A implements, B returns, A reworks, B re-reviews;
     expect(ready).toBe(true); await db.connect(); await db.bootstrap();
     const core = new SurrealCompanyCore(db), enrollment = new LocalEnrollmentAdmin(db), owner = new OwnerDesk(db);
     const gm = await enrollment.enroll('fixture-manager', 'owner', ['execute', 'review', 'manage']);
-    await db.db.upsert(new RecordId('company_meta', 'config')).content({ eval_enabled: false, jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
+    await db.db.upsert(new RecordId('company_meta', 'config')).content({ jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
     const wf = new Workforce(db, join(dir, 'unused-credential-files'));
     // Two seats of one engineering def: the implementer takes one, and the independent reviewer keeps the other (R1).
     await wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 2 });
     const minted = new Map<string, string>();
     const originalSpawn = wf.spawnInst.bind(wf);
-    wf.spawnInst = async d => { const i = await originalSpawn(d); minted.set(i.id, i.credential!); return i; };
+    // All arguments are forwarded: the session's task binding (sessionTask) decides whether it is ever reused.
+    wf.spawnInst = async (...args) => { const i = await originalSpawn(...args); minted.set(i.id, i.credential!); return i; };
     const ops = { tools: ['ops_info'], call: async () => ({ available: true }), release: () => {} };
     pool = new SidecarPool({ core, workforce: wf as unknown as SidecarDeps['workforce'], ops, runDir: join(dir, 'comm'), sweepMs: 5 });
     const envs = new Map<string, Record<string, string>>();
@@ -215,7 +217,7 @@ async function startCompanyFork(name: string, tempRoot = tmpdir()) {
   await db.connect(); await db.bootstrap();
   const core = new SurrealCompanyCore(db), enrollment = new LocalEnrollmentAdmin(db), owner = new OwnerDesk(db);
   const gm = await enrollment.enroll('fixture-manager', 'owner', ['execute', 'review', 'manage']);
-  await db.db.upsert(new RecordId('company_meta', 'config')).content({ eval_enabled: false, jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
+  await db.db.upsert(new RecordId('company_meta', 'config')).content({ jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
   const wf = new Workforce(db, join(dir, 'unused-credential-files'));
   const agentRows = new Map<string, { id: string; status: string }>();
   const errors = new Map<string, string>();

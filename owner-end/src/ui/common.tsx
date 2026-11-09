@@ -81,7 +81,7 @@ export function Empty({ children }: { children: ComponentChildren }) {
 
 /** 员工岗位（与 src/contracts.ts 的 ROLES 一致）。复核岗另可选 owner。 */
 export const ROLE_OPTIONS: readonly string[] = [
-  'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs', 'eval',
+  'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs',
 ];
 
 export function RoleSelect({ value, onChange, allowBlank, blankText, withOwner, id, disabled }: {

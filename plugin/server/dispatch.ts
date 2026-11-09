@@ -2,7 +2,7 @@ import { DispatchTimings } from "./vendor/src/diagnostics.ts";
 import { RUNNER_BEAT_MS, writeBoardView, writeRunnerHeartbeat } from "./vendor/src/board.ts";
 import { openUserPaths, scratchKeepReason } from "./vendor/src/dispatcher/scratch-gc.ts";
 import { pruneOperationalData } from "./vendor/src/data-retention.ts";
-import { recordPendingTaskCosts } from "./vendor/src/task-cost.ts";
+import { magpieSessionRows, recordPendingTaskCosts } from "./vendor/src/task-cost.ts";
 import { consolidateDue } from "./vendor/src/lane-notes-consolidate.ts";
 import { settleCompanyTurn, TurnInterruptions } from "./turn-closeout";
 // Runs the company dispatcher tick loop inside the plugin subprocess and wakes it early on
@@ -16,8 +16,10 @@ import { hostname } from "node:os";
 import { serviceHome } from "./env";
 import { subscribeWake, TickGate } from "./vendor/src/cloud/wake.ts";
 import { sweepArchiveBatches, sweepInstanceDirs } from "./vendor/src/dispatcher/lifecycle-gc.ts";
-import { missingFrom, poolRoom, readMagpieQuotas, type MagpieUsageEntry } from "./vendor/src/dispatcher/magpie-quota.ts";
+import { magpieBase, missingFrom, poolRoom, readMagpieQuotas, type MagpieUsageEntry } from "./vendor/src/dispatcher/magpie-quota.ts";
 import { readProviderQuotas, readQuotaEntries } from "./vendor/src/dispatcher/quota-store.ts";
+import { magpieAuthorization } from "./vendor/src/model-routing/employee-env.ts";
+import { MAGPIE_BASE } from "./vendor/src/model-routing/magpie-contract.ts";
 export { readProviderQuotas };
 
 type ProviderUsageEntry = {
@@ -164,6 +166,12 @@ export async function readModelSlots(ctx: Company): Promise<Record<string, strin
 // Lifecycle hooks and RPC handlers are the only places a paseo handle is handed out;
 // company.ts remembers the latest one so the tick loop can also refresh quota during quiet periods.
 
+/** The employee key for the VPS magpie quota read. A configured local magpie gets none; a missing key file reads as no answer. */
+function quotaHeaders(): Record<string, string> | undefined {
+  if (magpieBase() !== MAGPIE_BASE) return undefined;
+  try { return magpieAuthorization(serviceHome()); } catch { return undefined; }
+}
+
 /**
  * Persists the latest quota snapshot to company_meta for the dispatcher. Hooks carry a Paseo
  * handle; the tick loop may not have one yet (it only arrives with the first session event), so
@@ -184,7 +192,7 @@ export async function refreshQuota(paseo: PaseoApi | undefined, ctx: Company): P
   // every subscription the owner configured, so a provider whose allowance ran out is visible here
   // even when Paseo never mentions it — that is how Factory's spent month stayed invisible until
   // its sessions started failing. Paseo's numbers win wherever both report.
-  const magpie = await readMagpieQuotas().catch(() => undefined);
+  const magpie = await readMagpieQuotas({ headers: quotaHeaders() }).catch(() => undefined);
   if (magpie?.length) {
     const extra = missingFrom(providers, magpie);
     if (extra.length) {
@@ -395,7 +403,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
 
   // Settle the cost of finished tasks before their raw request rows can be pruned.
   try {
-    const costed = await recordPendingTaskCosts(ctx.db.db);
+    const costed = await recordPendingTaskCosts(ctx.db.db, { fetchRows: magpieSessionRows(magpieAuthorization(serviceHome())) });
     if (costed) console.log(`lifecycle gc task cost: ${costed} tasks settled`);
   } catch (error) { console.warn(`lifecycle gc task cost failed: ${(error as Error).message}`); }
 
@@ -460,9 +468,6 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
           gcRefreshedAt = Date.now();
           await timing.measure("gc", () => runLifecycleGc(ctx)).catch((error) => console.warn(`lifecycle gc failed: ${(error as Error).message}`));
         }
-        // Policy compilation may wait on the remote DB and magpie management. It never holds dispatch or inference.
-        void ctx.modelRouting.refresh().catch(error => console.warn(`model routing refresh failed: ${(error as Error).message}`));
-        await timing.measure("model-journal",()=>ctx.modelJournal.drain(ctx.db.db));
         const report = await timing.measure("tick", () => ctx.dispatcher.tick());
         // An installed version answers every older pending version card, however it got installed: through the upgrade
         // job, by hand, or before this process started. The job closes its own batch right after verifying; this pass
@@ -485,10 +490,9 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
         await timing.measure("board", () => persistBoardView(ctx)).catch((error) => console.warn(`board view write failed: ${(error as Error).message}`));
         failures = 0;
         const changed = report.commands || report.revoked.length || report.woke.length || report.retired.length ||
-          report.exhausted.length || (report.recovered?.length ?? 0) || report.notices.length || report.evals.length || (report.decisions?.length ?? 0) ||
+          report.exhausted.length || (report.recovered?.length ?? 0) || report.notices.length || (report.decisions?.length ?? 0) ||
           report.reclaimed;
         if (changed) console.log(`tick ${JSON.stringify(report)}`);
-        await ctx.modelRouting.activateIdle().catch(error=>console.warn(`model routing session activation: ${(error as Error).message}`));
         await timing.measure("heartbeat", async () => { await ctx.db.db.query("UPSERT company_meta:dispatcher_heartbeat SET at = time::now();"); });
       } catch (error) {
         failures++;

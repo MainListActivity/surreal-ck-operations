@@ -249,7 +249,7 @@ run('a route template reaches the task drafts, with the notes pointer added', as
   expect(rows.find(r => r.step === 'review')?.body).toBe('先读 notes.md 再按模板复核');
 });
 
-run('a claim records the session\'s lane, task and phase; facts report states and follow-ups', async () => {
+run('a claim records the session\'s lane, task and phase; facts report task states', async () => {
   const wf = new Workforce(db, '/tmp/unused-lane-fixture');
   const parent = await task('父任务记录', 'alpha');
   const c = await core.claim(eng, parent.id);
@@ -260,12 +260,9 @@ run('a claim records the session\'s lane, task and phase; facts report states an
   const r = await core.claim(qa, parent.id);
   expect(await seen('lanes-qa')).toMatchObject({ lane: 'alpha:qa', last_phase: 'review' });
   await core.accept(qa, proof(r), evidence());
-  const next = await core.createTask(gm, { title: '后续任务记录', context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', project: 'alpha', parent: parent.id, idempotencyKey: key() } as never);
   const facts = await wf.sessionTaskFacts([parent.id, 'missing-task']);
   expect(facts.states.get(parent.id)).toBe('done');
   expect(facts.states.has('missing-task')).toBe(false);
-  expect(facts.followUps).toContainEqual({ parent: parent.id, lane: 'alpha:engineering' });
-  await db.db.query(`UPDATE $t SET state = 'void';`, { t: new RecordId('task', next.id) });
 });
 
 run('a chain keeps one workspace record at its root and is finished only when every task is', async () => {

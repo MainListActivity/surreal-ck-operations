@@ -60,13 +60,6 @@
 | 新建/修改编制 | `sck owner def.ensure '{"id":"eng-1","role":"engineering","provider":"codex","model":"auto:sol"}'` |
 | 停用编制 | `sck owner def.disable '{"id":"eng-1","reason":"缩编"}'` |
 | 启用编制 | `sck owner def.enable '{"id":"eng-1"}'` |
-| 模型排序视图 | `sck owner model.ranking '{}'` |
-| 模型排序预览 | `sck owner model.ranking.preview '{"policy":{},"refresh":false}'` |
-| 保存模型排序 | `sck owner model.ranking.save '{"rules":"优先级规则","refreshMinutes":5}'` |
-| 置顶模型 | `sck owner model.ranking.pin '{"group":"sck-opus","model":"m1","pinned":true}'` |
-| 模型目录 | `sck owner model.catalog '{"query":"opus","offset":0,"limit":40}'` |
-| 模型启用范围 | `sck owner model.membership '{"input":{"group":"sck-opus","model":"m1","present":true,"expectedMembers":["m1"]}}'` |
-| 模型别名 | `sck owner model.alias '{"model":"m1","slug":"opus-main"}'` |
 | 待批权限 | `sck owner permission.list '{}'` |
 | 回答权限 | `sck owner permission.answer '{"agentId":"a1","requestId":"r1","behavior":"allow"}'` |
 | 任务附件 | `sck owner task.attachments '{"taskId":"t1"}'` |

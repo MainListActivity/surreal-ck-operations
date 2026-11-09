@@ -173,7 +173,7 @@ handle_path /pv/* { reverse_proxy 127.0.0.1:18778 }
 
 ## WT01 登记、分配与上线验证
 
-物理工作目录以任务服务的 `worktree` 登记为准，任务分支与物理树分开：每仓一个 shared（QA/老板/产品/CS/内容默认只读），串行工程在无活动引用且干净时复用它、每项独立 `task/<id8>` 分支/PR（基线优先仓库已取回的 origin/defaultBranch，未配置 remote 时用默认主线）；已有引用或 dirty 时新代码写手用 exclusive，原现场不切分支。内容写任务由管理方在 `create_task.workIntent` 显式授予 `{kind:"assets",paths:["assets/characters"]}`；重叠目录排队（大小写保守视为相同），互不重叠可共用，路径穿越/凭证目录/符号链接目录拒绝。GM/eval 无租约唤醒用 `workspace.json` 的 shared 只读登记与会话引用。附件保持 `evidenceDir`。
+物理工作目录以任务服务的 `worktree` 登记为准，任务分支与物理树分开：每仓一个 shared（QA/老板/产品/CS/内容默认只读），串行工程在无活动引用且干净时复用它、每项独立 `task/<id8>` 分支/PR（基线优先仓库已取回的 origin/defaultBranch，未配置 remote 时用默认主线）；已有引用或 dirty 时新代码写手用 exclusive，原现场不切分支。内容写任务由管理方在 `create_task.workIntent` 显式授予 `{kind:"assets",paths:["assets/characters"]}`；重叠目录排队（大小写保守视为相同），互不重叠可共用，路径穿越/凭证目录/符号链接目录拒绝。GM 无租约唤醒用 `workspace.json` 的 shared 只读登记与会话引用。附件保持 `evidenceDir`。
 
 仓库身份由 realpath + git common-dir 确定，未绑定 project 使用 `SCK_AGENT_CWD` 的规范仓库身份。MCP 与插件共同使用 Git common-dir 下的 `sck-worktree-allocation.lock`，由系统 `/usr/bin/python3` 的 kernel flock 持有（进程退出释放）；机器已有 Python，不安装全局工具。领取事务同时更新 task assignment、worktree_ref、employee active_task 和租约，失败不会落有效引用；网络丢响应重复 claim 保留 fence/路径。Git 树先登记，异常中断后未知树受保护，已存在的 task 分支现场就地接管，不 reset。引用有效性实时由任务 current_employee/delivery/fence/状态对账；撤销交接与被阻塞的写现场继续保护。main、常驻插件、active/回滚 release 均登记 protected。
 
@@ -217,7 +217,7 @@ QA 步骤对应如下。统计工作树数量时，先以老板身份执行 `lis
 
 不同产线流程不同（软件交付、视频、长篇故事），所以目标模板按产线选，不再全公司一套。
 
-- **路由**：任务唯一的编排单位。`route` 表把任务类型（`software` / `story` / `film` / `eval` …）映射到执行岗、复核岗与消息模板，可选 `next` 后继类型在创建时展开为 `planned` 链（accept 同事务激活）。新任务经 `sck owner task.create '{"type":"<类型>","title":"…"}'` 创建，`task.plan` 先预演链；路由由 `route.list`/`route.save`/`route.disable` 管理（`route.save` 拒绝执行岗=复核岗与成环后继）。
+- **路由**：任务唯一的编排单位。`route` 表把任务类型（`software` / `story` / `film` …）映射到执行岗、复核岗与消息模板，可选 `next` 后继类型在创建时展开为 `planned` 链（accept 同事务激活）。新任务经 `sck owner task.create '{"type":"<类型>","title":"…"}'` 创建，`task.plan` 先预演链；路由由 `route.list`/`route.save`/`route.disable` 管理（`route.save` 拒绝执行岗=复核岗与成环后继）。
 - **岗位契约**：项目岗位轨词表里每条轨可写 `roles: [...]`，限定能承接它的岗位。建单（`create_task` / `create_delivery`）时校验：派给轨不允许的岗位会被拒绝；任何出现在某条轨 `roles` 里的岗位都是产线岗，建单必须挂轨。没有出现在任何 `roles` 里的岗位（gm、product、qa 等）仍可建不挂轨的协调任务。契约写在项目记录里，改项目配置即生效，不需要改代码。
 - `screenwriter` 仍保留原有的"必须挂 编剧 轨"硬规则。
 
@@ -353,65 +353,47 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plis
 
 `deploy-mcp-remote.sh` 在任何远端步骤前核对同一记录（Bun 版本取 `SCK_BUN_VERSION`，缺省 1.4.2）。随后在远端执行 `runtime-bun/bin/bun --version`，实际版本与门禁不符时在上传载荷前拒绝，不复用旧二进制。两项都通过后才上传 release、写入 `service.env`、切换 `current` 并重启。`SCK_REMOTE_HOME` 只供测试覆盖：`tests/ci-gates.test.ts` 以桩化的 ssh 与 scp 运行脚本，不触及真实主机；生产路径不设置。最终集成提交若与审查过的提交不同，必须对该集成 SHA 重新生成门禁记录，不能复制旧记录或改写 JSON。
 
-## Magpie 四档模型与最终绩效路由
+## Magpie 四档模型路由（0.5.0）
 
-故事作者保持原有编制、客户端和模型。其余角色各保留一个 Claude 编制，合并原岗位轨；产品默认 `group/sck-sonnet`，owner（老板）默认 `group/sck-opus`，其他岗位（含 QA、eval）默认 `group/sck-haiku`。Fable 仅作为老板手动入口，不进入员工请求；员工网关把旧会话残留的 Fable 模型名映射到岗位默认档位，老板个人通过 Magpie 手动使用 Fable。旧客户端编制停用，已有任务及历史身份保留；旧会话完成任务、解除实现人绑定后按既有退役保护正常回收。
+故事作者保持原有编制、客户端和模型。其余角色各保留一个 Claude 编制；产品默认 `group/sck-sonnet`，owner（老板）默认 `group/sck-opus`，其他岗位（含 QA）默认 `group/sck-haiku`。Fable 仅作为老板手动入口，不进入员工请求，老板个人通过 Magpie 手动使用 Fable。
 
-四个公开入口为 `group/sck-fable`、`group/sck-opus`、`group/sck-sonnet`、`group/sck-haiku`。员工网关把每个请求改写成一个 magpie 档位分组：租约档位是上限，手动选择可以降到更便宜的档，不能升档；任何具体模型名（含 Claude Code 自带的 `claude/claude-sonnet-5-5` 等）都改写成租约档位分组。网关从不发送具体模型 ID：2026-10-23 曾因固定了一个下架的具体模型，被 magpie 改由 Claude 订阅的 sonnet 应答并继续固定，越出档位。岗位不再拆分能力档和绩效排名。请求名含 Haiku 也属于任务工作，只有 count_tokens 为辅助接口。老板个人配置和压缩窗口471000不改。
+员工组为 `group/sck-opus`、`group/sck-sonnet`、`group/sck-haiku` 三个，Fable 不进入员工请求。0.5.0 起员工会话不再经过本机网关（18779 已删除），直连 VPS magpie `https://data.maplayer.top/ofm`。租约档位是上限，手动选择可以降到更便宜的档，不能升档。
 
-`src/model-routing/benchmarks.json` 保留公开 AA 榜单的采集时间、测量等级与价格，生产使用每日刷新快照。老板 2026-10-28 最新规则覆盖旧的固定 38 分与能力上下界：最低能力取最新版本 Luna Max 的实测 AA 分数，不设智能分上界；达到底线后，AA 输入价 ≤$1/M 进入 Haiku，>$1/M 且 ≤$2/M 进入 Sonnet。未知或更贵价格不自动加入员工组，Magpie 免费标签不改写 AA 入组价格。Opus/Fable 手动维护，空档不借用其他组。模型绩效只按完整渠道/模型 ID 汇总，均值、任务趋势及回退排序一致，原始历史评分不删不重写；不同渠道的同款模型不共享执行证据。详细规则见 [渠道绩效与动态准入](channel-performance-admission.md)。
+### 员工会话环境注入
 
-派工器只处理角色/岗位轨、仓库与写入隔离、独立验收、实现人连续性、租约和本机总并发。受管员工复用空闲会话，保留返工接续，不再按订阅额度/账号并发/配置模型漂移或员工分数挑模型，也不再调用 Jev 做二次员工选择。故事作者维持原派工策略。Magpie 负责模型/账号可用性、额度、顺序回退和档内隔离；公司代码只自动维护 Sonnet、Haiku；Opus/Fable 的成员、顺序和组内配置由老板在 Magpie 手动维护。
+插件在员工会话打开时注入以下配置：
 
-四个入口为 Magpie 分组 `sck-fable/opus/sonnet/haiku`。Opus/Fable 由老板手动维护，公司不创建、重建、删除、添加成员或归一化其配置。Haiku/Sonnet 新模型按动态能力底线与 AA 输入价格独立入组；本次不升级已有成员初始化版本，保留人工增删，不全量重建，空组不跨档补位。自动排序与 Magpie 会话粘性仍按现行规则工作，执行元数据经本地持久队列入库，热路径不查远端数据库。
+- `ANTHROPIC_BASE_URL`：VPS magpie 地址。
+- `ANTHROPIC_AUTH_TOKEN`：取自服务目录 `private/magpie-remote.key`。该文件缺失或为空时拒绝启动员工会话，不静默直连。
+- `x-magpie-session` 头：`sck-<digest(任务:员工)>`，供 `task_cost` 精确匹配用量。
+- 模型：`group/sck-haiku`、`group/sck-sonnet`、`group/sck-opus`，按任务档位选择。
 
-有效员工会话的模型调用资格与任务写入租约分开：submit/review 成功会立即消耗任务租约，随后 Claude 仍需处理工具结果、输出收尾；工程、产品等已登记会话此时按岗位默认档位继续调用，记录 task 为空、phase=idle，不进入任务模型绩效。owner/eval 的 planning 行为不变。新任务写入和供应商操作仍须原有有效租约；未登记、隔离或过期的在途租约不会获得任务权限。插件重载恢复期间模型网关返回503及 Retry-After:1，恢复完成后才核对会话；未登记会话仍拒绝409。
+配置经 `--settings` 私有文件加载（员工通信目录下 `.claude/settings.local.json`，权限 0600），因为用户全局 `settings.env` 会覆盖进程环境变量。story-author 与老板手动会话不注入。
 
-任务经过所有提交、退回和修复，最终达到 done 后才进入 eval。普通返工中不结算。eval 使用 `get_task_history` 和 `get_model_evidence` 关联 employee、实际 model、fence、阶段和时间，分别评价返工责任与修复贡献。`record_score.scores[].modelScores` 为实际模型独立的 overall/notes；单模型可继承该员工的最终综合分，多模型缺少独立判断时不虚构质量分。每模型按1/模型数量分配参与者样本权重，请求数量不决定质量。历史记录写 actual_models，配置保留 configured_model。已重新打开的任务不进入排序，重新结算按确定ID替换旧样本。上线测试中的模型选择与评分证据来自隔离公司 fork，不制造生产绩效。
+### 会话归因
 
-发布从 main 固定提交生成快照，运行加法迁移033。暂停新派工后、切换生产代码前执行新 main release 的迁移入口（此时旧租约继续有效）：
+换任务即换会话。reuse 与 oneshot 两种策略都是：同一任务内的返工、复审接续原会话，绑定的任务记录在 `employee.session_task`。升级前已存在、没有绑定任务的旧会话，在下次派工时换新会话，因为旧会话环境里仍是已停用的网关地址。
 
-```sh
-"$HOME/Library/Application Support/SurrealCKCompany/runtime-bun/bin/bun" "$SCK_RELEASE_DIR/scripts/model-routing-admin.ts" migrate
-```
+### 已删除与放弃的内容
 
-迁移先备份完整编制到私有 model-routing/employee-defs-four-tier-before.json，准备四档分组和插件，再停用非故事作者的旧客户端编制、更新 Claude 编制/员工默认模型，最后启用。切换双面 release 后，仅空闲无租约会话更新 Paseo 模型默认和 v2 网关配置；忙会话先完成当前工作。`model-routing-admin.ts status` 查看计数。恢复维护前的 paused 状态，核对真实派工与实际模型执行。
+- 0.5.0 删除模型排序整套（ranking、aa 榜单、alias、inventory、health、roster、trends、urgency、weights、内置 benchmarks）、agent 模型指标页、模型切换时间线、model_execution 台账，以及 Jev 组内排序。
+- 派工器只处理角色/岗位轨、仓库与写入隔离、独立验收、实现人连续性、租约和本机总并发，不按订阅额度、账号并发、配置模型漂移或员工分数挑模型。
+- 公司代码不再自动排序或入组模型。Sonnet、Haiku 组的实际成员与顺序以 Magpie 侧配置为准，本仓库代码不维护它们，上线后需核对。
+- 放弃项：员工思考等级（thinking）控件对组名模型不再传给 Paseo，因为组名模型未经 Paseo 验证。
 
-回滚：先暂停新派工，用本 release 的 `model-routing-admin.ts disable` 恢复编制和员工私有网关设置并停用插件；等待 pendingSessionReloads 清零，再按双面回滚流程恢复前一 release。历史证据不删除。
+### 会话与租约
 
+有效员工会话的模型调用资格与任务写入租约分开：submit/review 成功会立即消耗任务租约，随后 Claude 仍需处理工具结果、输出收尾，此时记录 task 为空、phase=idle。新任务写入和供应商操作仍须原有有效租约；未登记、隔离或过期的在途租约不会获得任务权限。
 
-### Jev 组内排序
+### 历史迁移
 
-老板工作台「编制 → 模型排序」提供自然语言规则与 2/5/10 分钟下拉选项（默认 5）。自然语言规则默认为「智能程度和速度综合优先」，未设置或保存空白时也使用该规则；已有非空规则保持不变。每组最近一次 Jev 调用前保存实际请求体（model/state/questions）及调用开始时间到 company_meta:model_ranking_request_<tier>，Sonnet、Haiku 各保留一条；旧 Opus 请求及评分保留为历史但不再展示或应用。界面可折叠查看结构与完整 JSON，失败尝试也保留，不含 HTTP 认证头。旧调用没有快照时显示尚无记录，不用当前数据补造历史。保存只更新这两个设置并重置触发时钟，下一次有效员工模型请求（含 count_tokens）到达公司网关后，后台启动一次刷新；同一时刻只有一轮，前台请求不等待数据库、额度查询或 Jev。到期且没有新请求时不调用 Jev。重启后首个请求会刷新。
-
-每轮共用一次数据采集，仅对 `sck-sonnet`、`sck-haiku` 各独立调用一次 Jev。Opus 不采集排序事实、不调用 Jev、不参与公司置顶操作；在 Magpie 编辑其成员、顺序与组内配置。输入包含组内每个模型的订阅标签（不传邮箱）、最紧窗口剩余额度百分比、AA 排名和分数、每百万 token 输入/输出/缓存命中价格（Magpie 标注免费时为 0）、近 7 天缓存命中率与输出 tokens/s、首 token 延迟，以及已最终验收任务的模型绩效和样本权重。缺失数据保持未知；调用失败、答案不完整或分数越界时保留该组顺序，界面显示刷新结果。保存期间旧轮次作废，关闭插件停止发布结果。
-
-完整老板规则会写入每个独立评分问题及每个评分档位，明确排最后条件不能被其他综合优势抵消；首 token 延迟额外换算为秒直接提供，未知数据不被视为满足或违反条件。阈值来自老板自然语言规则，不在代码中写死 10 秒；最终仍按 Jev 返回的分数排序，实测通过不代表所有未来规则都必然正确。
-
-实时使用统计取自本机 Magpie `GET http://127.0.0.1:3425/v1/magpie/usage?period=7d`，每轮排序在调用 Jev 之前重新读取一次，不缓存到下一轮。严格按原生 `provider/model` 路径匹配；供应商内嵌路径（如 `remote-magpie/codearts/...`）完整保留，不再用去供应商的模型简称。原生统计按通道汇总历史各思考等级，提示词明确说明该范围；无本通道样本时保持未知，不用别的供应商或远端分组的统计补齐。输出速度直接使用 Magpie 已筛选的 `decode_out / (decode_ms / 1000)`，不从 CSV 的总输出 token/耗时另算；首 token 延迟使用原生平均值。Jev 的 usage 数据同时带来源、7d 窗口及起点、采集时间、测速与延迟样本数；原生 API 失败或格式不符则终止本轮并保留原排序，不用旧快照继续刷新。接口返回的账号、host、key 与会话信息不进入 Jev 数据。
-
-AA 榜单与价格保存在服务目录 `model-routing/aa.json`，本次格式升级首次重新拉取后每日刷新。网络或页面解析失败保留上次有效快照；成功解析的榜单若最新 Luna 没有 Max 测量，保留旧模型数据并持久记录 `admissionBlocked`，控制器停止分组修改，下一次有效刷新解除。自动入组只处理首次出现的新 ID；原有成员及人工移除决定不因 AA 改分被重置。组内排序由代码完成，不调用 Jev；Jev 只用于尚未裁决的新名称映射。
-
-### 思考等级与模型对应（老板 2026-10-23 定）
-
-AA 按思考等级分别打分（显示名括号中的 Max/Xhigh/High 等），自动管理的 Haiku/Sonnet 入组使用成员实际发送等级下的 AA 分数。控制器只选 Magpie 目录 `reasoning_levels` 能发送且 AA 已测的等级，并以 `provider/model:<等级>` 固定；厂商已在 ID 写死等级的模型不再加后缀。老板手动写上的等级保留。现有成员若低于动态 Luna Max 底线、无该等级测分或不符价格档，仅在 `company_meta:model_routing_status.issues` 提示，不自动移除。Opus/Fable 不做等级归一化。
-
-名称匹配：AA slug 与显示名（去括号再拼等级）都参与精确匹配；去掉厂商前缀（`zai_glm-5.3-flash`）和 Magpie 上下文变体后缀（`grok-4.7@500k`）；日期快照后缀照旧。规则仍对不上的新模型，每个只问一次 Jev（选择题：按名称相近取 8 个 AA 候选加「都不是」），置信 ≥0.7 才采用，否则只记为建议；结果存 `model-routing/aliases.json`，老板可在同一页面改为某个 slug 或设为不对应，尚未进组的模型下次同步按新分数分组。远端 Magpie 新增模型需要本地重新拉取清单：控制器每天对 `preset=remote-magpie` 的供应商执行一次 `magpie provider refresh`。
-
-本地 `model-routing/inventory.json` 是持久模型处理台账：按供应商完整模型 ID 记录当前目录、当前分组与历史裁决（规则精确匹配、Jev、人工或既有分组接纳）。首次部署扫描全量可调用模型，之后仅处理台账尚无裁决且未在组内的 ID；已裁决无对应/未达准入线的模型不会再次询问 Jev，分组版本升级、重启与暂时下架不清空历史。旧 `aliases.json` 自动迁入；该文件仍保留为映射兼容文件，必要时从台账恢复。每个 Jev 有效答案立即原子保存，后续请求或组同步失败不重问已完成的答案；无效答案不标为完成。台账损坏时停止同步，避免从空状态重新付费裁决。
-
-编制页分别显示「已入组」「已裁决但未入组」「待裁决/待人工确认」，已完成映射默认收入历史；既有组成员不会再次进入待裁决。人工修改与后台目录同步串行执行并更新台账；名称确认不代表移动已有组成员，分档警告单独展示。
-
-设置和结果分别位于 `company_meta:model_routing` 的 `ranking_rules`/`ranking_refresh_minutes` 与 `company_meta:model_ranking`。设置 RPC 只允许老板上下文。发布后通过界面保存当前规则，再对一个已登记的空闲员工调用 `count_tokens` 触发后台刷新，检查 Sonnet/Haiku 两组结果和 Magpie 顺序，同时确认成员集合、Fable 顺序及 Opus 的完整分组配置未变。
-
+0.4.x 的四档迁移（加法迁移 033，以及原 `model-routing-admin.ts` 的 migrate、disable、roster 等步骤，该脚本已随 0.5.0 删除）已经完成，不再适用于 0.5.0。0.5.0 的回滚与上线验证项见 [运行手册 · 上线记录](agent-operations.md#上线记录)。
 
 ### Factory 优先的原生员工编制
 
 编制保留 Claude、Factory（`factory-droid`）及故事作者特例；删除其他 provider 的非故事作者定义。Factory 保留原生 provider、模型与思考设置，并恢复额度门禁；Claude 继续使用岗位默认的 Magpie 组。老板编制列表把 Factory 排在前面。
 
-派工选人不调用 Jev。资格检查（岗位/轨道、项目、额度与健康、席位与并发、原实现人绑定、验收回避及独立性）通过后，先复用 Factory，再使用可新建的 Factory 席位。Factory 额度与健康可用且岗位编制启用时，全公司按任务创建时间和稳定键排序，最多保留 3 个待派工作项等待 Factory；席位或并发满不立即分流这 3 项，第 4 项起可使用其他合格员工。执行、验收与 blocked_to=owner 的老板关口恢复工作共用名额；批次含保留等待项时整批等 Factory。任务实际派出才释放名额并递补。额度耗尽/冷却或该岗位无启用 Factory 编制时按原候选规则回退。任务原因用 factory_wait 解释等待，不绕过负责人、作者回避或独立性限制。Factory 编制显式设置 thinking=max，与 auto-high 工具权限模式分开。候选排序在本机执行，不为派工产生 Jev 调用。组内模型排序、最终验收绩效和上线判断仍使用各自原有机制。
-
-从已合入 main 的固定 release 执行 `bun scripts/model-routing-admin.ts roster` 前暂停新增派工。该模式备份原编制后新增/更新保留定义并物理删除其余非 Claude 定义，不重建 Magpie 分组或改写排序规则。旧实例、任务和绩效历史保留；删除定义的实例不得接新任务，在途租约照常收尾，空闲且不再被未完成任务保护时退休。完成后检查 Factory 模型/provider 未变、非保留定义为零、故事作者前后相同，再恢复原派工开关。
+派工选人不调用 Jev。资格检查（岗位/轨道、项目、额度与健康、席位与并发、原实现人绑定、验收回避及独立性）通过后，先复用 Factory，再使用可新建的 Factory 席位。Factory 额度与健康可用且岗位编制启用时，全公司按任务创建时间和稳定键排序，最多保留 3 个待派工作项等待 Factory；席位或并发满不立即分流这 3 项，第 4 项起可使用其他合格员工。执行、验收与 blocked_to=owner 的老板关口恢复工作共用名额；批次含保留等待项时整批等 Factory。任务实际派出才释放名额并递补。额度耗尽/冷却或该岗位无启用 Factory 编制时按原候选规则回退。任务原因用 factory_wait 解释等待，不绕过负责人、作者回避或独立性限制。Factory 编制显式设置 thinking=max，与 auto-high 工具权限模式分开。候选排序在本机执行，不为派工产生 Jev 调用。
 
 ## 源站主机：受限账号与只读运维工具
 

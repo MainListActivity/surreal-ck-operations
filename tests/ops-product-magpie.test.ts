@@ -35,13 +35,13 @@ test('partial request and unknown pricing are not fabricated into completion or 
  const out=await observeProductMagpie({readProvider:()=>provider,fetch:r.fetcher,now:()=>r.now});expect(out.usage[0]!.completed).toBe(false);expect(out.usage[0]!.pricing.free).toBe(false);expect(out.usage[0]!.pricing.inputPerToken).toBeNull();
 });
 test('untrusted overrides, missing connection, redirects and malformed bodies fail without local fallback',async()=>{
- const r=remote();for(const config of [undefined,{...provider,chat:'http://127.0.0.1:3425/v1'},{...provider,chat:'https://user:pass@remote.test/v1'}])await expect(observeProductMagpie({readProvider:()=>config,fetch:r.fetcher})).rejects.toMatchObject({code:'not_configured'});expect(r.requests).toHaveLength(0);
+ const r=remote();for(const config of [undefined,{...provider,chat:'http://127.0.0.1:4425/v1'},{...provider,chat:'https://user:pass@remote.test/v1'}])await expect(observeProductMagpie({readProvider:()=>config,fetch:r.fetcher})).rejects.toMatchObject({code:'not_configured'});expect(r.requests).toHaveLength(0);
  await expect(observeProductMagpie({readProvider:()=>provider,fetch:async()=>new Response('secret-fixture-key',{status:302})})).rejects.toThrow('HTTP 302');
  await expect(observeProductMagpie({readProvider:()=>provider,fetch:async()=>Response.json({bad:true})})).rejects.toThrow('结构不兼容');
 });
 test('employee surface exposes remote observation and rejects arbitrary source overrides',async()=>{
  const r=rig();const info=await r.broker.call(r.token,'task-1','ops_info') as any;expect(info.productMagpieObservation.source).toBe('configured-remote-magpie');expect(info.magpieRouteSampling.applicable).toBe(false);
- await expect(r.broker.call(r.token,'task-1','ops_product_magpie_observe',{url:'http://127.0.0.1:3425'})).rejects.toMatchObject({code:'invalid'});
+ await expect(r.broker.call(r.token,'task-1','ops_product_magpie_observe',{url:'http://127.0.0.1:4425'})).rejects.toMatchObject({code:'invalid'});
 });
 
 test('64-bit route ids retain their original integer text for product correlation',async()=>{
@@ -192,7 +192,7 @@ test('model capacity is separate from the proposed per-request ceiling and local
 
 test('the remote candidate tool accepts only a budget and refuses endpoint or credential overrides before any read',async()=>{
  const r=rig();
- await expect(r.broker.call(r.token,'task-1','ops_product_magpie_candidate',{url:'http://127.0.0.1:3425'})).rejects.toMatchObject({code:'invalid'});
+ await expect(r.broker.call(r.token,'task-1','ops_product_magpie_candidate',{url:'http://127.0.0.1:4425'})).rejects.toMatchObject({code:'invalid'});
  await expect(r.broker.call(r.token,'task-1','ops_product_magpie_candidate',{budget:{currency:'USD',totalNanoUsd:1,perAttemptNanoUsd:1,maxAttempts:1,extra:true}})).rejects.toMatchObject({code:'invalid'});
  expect(r.world.requests).toHaveLength(0);
 });

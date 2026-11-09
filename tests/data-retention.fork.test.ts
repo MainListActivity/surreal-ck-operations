@@ -20,12 +20,9 @@ beforeAll(async () => {
 }, 20000);
 afterAll(async () => { if (!dir) return; await db.close().catch(() => {}); server.kill(); rmSync(dir, { recursive: true, force: true }); });
 
-run('retention drops operational exhaust and keeps what open work and pending scoring still read', async () => {
+run('retention drops operational exhaust and keeps what open work still reads', async () => {
   const q = (sql: string) => db.db.query(sql);
-  await q(`CREATE task:scored SET title = 'scored', state = 'done', evaluated_at = time::now();
-    CREATE task:pending SET title = 'pending', state = 'done';
-    CREATE task:uncosted SET title = 'scored, cost not settled', state = 'done', evaluated_at = time::now();
-    CREATE task_cost:scored CONTENT { task: task:scored, cost: {} };
+  await q(`CREATE task:done SET title = 'done', state = 'done';
     CREATE task:open SET title = 'open', state = 'doing';`);
   await q(`LET $old = time::now() - 40d; LET $new = time::now() - 1h;
     CREATE worktree_audit:old CONTENT { repo: '/r', path: '/p', event: 'skip', trigger: 'sweep', decision: 'skip', result: 'skipped', reason: 'x', at: $old };
@@ -34,24 +31,18 @@ run('retention drops operational exhaust and keeps what open work and pending sc
     CREATE idempotency:stamped CONTENT { payload_digest: 'd', result: { created_at: $new } };
     CREATE idempotency:old CONTENT { at: $old, payload_digest: 'd', result: {} };
     CREATE outbox:old CONTENT { kind: 'claimed', task: task:open, at: $old, sequence: 1 };
-    CREATE outbox:revoked_pending CONTENT { kind: 'revoked', task: task:pending, at: $old, sequence: 2 };
-    CREATE outbox:revoked_scored CONTENT { kind: 'revoked', task: task:scored, at: $old, sequence: 3 };
-    CREATE model_execution:scored CONTENT { task: task:scored, employee: 'e', at: $old };
-    CREATE model_execution:pending CONTENT { task: task:pending, employee: 'e', at: $old };
-    CREATE model_execution:uncosted CONTENT { task: task:uncosted, employee: 'e', at: $old };
-    CREATE model_execution:idle CONTENT { employee: 'e', at: $old };
+    CREATE outbox:revoked CONTENT { kind: 'revoked', task: task:done, at: $old, sequence: 2 };
+    CREATE outbox:fresh CONTENT { kind: 'claimed', task: task:open, at: $new, sequence: 3 };
     CREATE audit:ops_open CONTENT { action: 'ops_call', task: task:open, at: $old };
-    CREATE audit:ops_done CONTENT { action: 'ops_error', task: task:scored, at: $old };
-    CREATE audit:submit_done CONTENT { action: 'submit', task: task:scored, at: $old };`);
+    CREATE audit:ops_done CONTENT { action: 'ops_error', task: task:done, at: $old };
+    CREATE audit:submit_done CONTENT { action: 'submit', task: task:done, at: $old };`);
   const removed = await pruneOperationalData(db.db);
   const left = async (table: string) => ((await db.db.query<[Array<{ id: { id: string } }>]>(`SELECT id FROM type::table($t);`, { t: table }))[0] ?? []).map(r => String(r.id.id)).sort();
   expect(await left('worktree_audit')).toEqual(['new']);
   expect(await left('idempotency')).toEqual(['stamped']);
-  expect(await left('outbox')).toEqual(['revoked_pending']);
-  // A scored task keeps its request rows until its cost is settled into task_cost.
-  expect(await left('model_execution')).toEqual(['pending', 'uncosted']);
+  expect(await left('outbox')).toEqual(['fresh']);
   expect(await left('audit')).toEqual(expect.arrayContaining(['ops_open', 'submit_done']));
   expect(await left('audit')).not.toContain('ops_done');
-  expect(removed).toMatchObject({ worktree_audit: 1, idempotency: 2, outbox: 2, model_execution: 2, audit: 1 });
+  expect(removed).toMatchObject({ worktree_audit: 1, idempotency: 2, outbox: 2, audit: 1 });
   expect(await pruneOperationalData(db.db)).toEqual({});
 });

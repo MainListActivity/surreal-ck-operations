@@ -161,34 +161,6 @@ export function registerHandlers(server: PluginServerContext): void {
     return { dataUri: `data:${attachmentMime(input.name)};base64,${buf.toString("base64")}`, mime: attachmentMime(input.name), sizeBytes: buf.byteLength };
   });
 
-  ownerHandle(rpc.pinModelRanking, async (input: RpcInput<typeof rpc.pinModelRanking>) => {
-    const ctx = await company();
-    await ctx.modelRanking.setPin(input.group,input.model,input.pinned);
-    return {ok:true};
-  });
-  ownerHandle(rpc.previewModelRanking,async(input:RpcInput<typeof rpc.previewModelRanking>)=>(await company()).modelRanking.preview(input.policy,input.refresh));
-  ownerHandle(rpc.modelRanking, async () => {
-    const ctx = await company();
-    const { modelRankingView } = await import("./model-ranking.ts");
-    return modelRankingView(ctx.db.db);
-  });
-  ownerHandle(rpc.saveModelRanking, async (input: RpcInput<typeof rpc.saveModelRanking>) => {
-    const ctx = await company();
-    const { saveRankingSettings } = await import("./vendor/src/model-routing/ranking.ts");
-    await saveRankingSettings(ctx.db.db,input,ctx.modelRanking);
-    return {ok:true};
-  });
-
-  ownerHandle(rpc.modelCatalog,async(input:RpcInput<typeof rpc.modelCatalog>)=>(await company()).modelRouting.catalogPage(input.query,input.offset,input.limit));
-  ownerHandle(rpc.setModelMembership,async(input:RpcInput<typeof rpc.setModelMembership>)=>{
-    const {updateModelMembership}=await import('./model-ranking.ts');return updateModelMembership(await company(),input);
-  });
-  ownerHandle(rpc.modelIdentity, async () => (await company()).modelRouting.identity());
-  ownerHandle(rpc.setModelAlias, async (input: RpcInput<typeof rpc.setModelAlias>) => {
-    const {updateModelAlias}=await import("./model-ranking.ts");
-    return updateModelAlias(await company(),input);
-  });
-
   ownerHandle(rpc.roster, async (_input: unknown, { paseo }: { paseo: any }) => {
     const { db, workforce, opsRepo, dispatcher } = await company();
     const { dispatchBlockedRows } = await import("./vendor/src/dispatcher/dispatch-list.ts");
@@ -230,7 +202,7 @@ export function registerHandlers(server: PluginServerContext): void {
       })),
       defs: orderedDefs.map(d => ({
         id: d.id, role: d.role, provider: d.provider, model: d.model, resolved: resolveDisplay(d),
-        thinking: d.thinking, enabled: d.enabled, maxInstances: d.maxInstances, weight: d.weight, avgScore: d.avgScore,
+        thinking: d.thinking, enabled: d.enabled, maxInstances: d.maxInstances, weight: d.weight,
         quotaLimited: d.quotaLimited,
       })),
       // Only what the roster renders: the instance name, its def and the tick's status.

@@ -1,9 +1,9 @@
 import { expect, test } from 'bun:test';
 import { effectiveWeight, weightedOrder, type EmployeeDef } from '../src/workforce.ts';
 
-const def = (id: string, weight: number, avgScore?: number): EmployeeDef =>
+const def = (id: string, weight: number): EmployeeDef =>
   ({ id, role: 'engineering', provider: 'x', model: 'm', enabled: true, maxInstances: 1, priority: 100,
-    weight, scored: 0, avgScore, errorStreak: 0 });
+    weight, errorStreak: 0 });
 
 test('weightedOrder picks in proportion to weights', () => {
   const items = ['a', 'b', 'c'];
@@ -31,11 +31,9 @@ test('weightedOrder: weight 0 is never picked while a positive weight exists', (
   expect(weightedOrder(['x', 'y'], () => 0, () => 0)).toEqual(['x', 'y']);
 });
 
-test('effectiveWeight multiplies config weight by the performance factor', () => {
-  expect(effectiveWeight(def('d1', 60))).toBe(60);            // no scores yet: neutral
-  expect(effectiveWeight(def('d2', 60, 3))).toBe(60);         // average score: neutral
-  expect(effectiveWeight(def('d3', 60, 5))).toBeCloseTo(100); // great: 60 × 5/3
-  expect(effectiveWeight(def('d4', 60, 1))).toBeCloseTo(20);  // poor: 60 × 1/3
-  expect(effectiveWeight(def('d5', 10, 0.5))).toBeCloseTo(3); // factor clamped at 0.3
+test('effectiveWeight is the configured weight, floored at 0', () => {
+  expect(effectiveWeight(def('d1', 60))).toBe(60);
+  expect(effectiveWeight(def('d2', 0))).toBe(0);              // 0 = never picked on its own
+  expect(effectiveWeight(def('d3', -5))).toBe(0);             // negative weights are clamped
   expect(effectiveWeight(undefined)).toBe(10);                // unknown def: default weight
 });

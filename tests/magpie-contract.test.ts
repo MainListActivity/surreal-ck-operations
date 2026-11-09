@@ -13,7 +13,7 @@ const routable = [{ model: 'sn-sensenova-6-8-flash', provider: 'sensenova' }];
 const hash = (value: string) => sha256(value);
 const source = (name: 'catalog' | 'quotas' | 'usage' | 'providers') => ({
   name, kind: name === 'providers' ? 'local-config' as const : 'http' as const,
-  locator: name === 'providers' ? 'config:magpie/providers.json' : `http://127.0.0.1:3425/v1/${name}`,
+  locator: name === 'providers' ? 'config:magpie/providers.json' : `http://127.0.0.1:4425/v1/${name}`,
   status: 200, capturedAt: iso(sampled), httpDate: name === 'providers' ? null : iso(sampled - (sampled % 1000)),
   clockSkewMs: name === 'providers' ? null : sampled % 1000, ageSeconds: null, cacheControl: null,
   rawSha256: hash(name), bodyBytes: 100, readAt: name === 'quotas' ? iso(sampled) : null,
@@ -21,7 +21,7 @@ const source = (name: 'catalog' | 'quotas' | 'usage' | 'providers') => ({
 function document(overrides: Record<string, unknown> = {}) {
   return {
     schemaVersion: 4, type: 'magpie-controlled-route', evidenceClass: 'controlled-route-snapshot',
-    accountRef: 'mgp' + 'a'.repeat(24), endpoint: 'http://127.0.0.1:3425/v1', priceRevision: 'magpie-catalog-abc123456789',
+    accountRef: 'mgp' + 'a'.repeat(24), endpoint: 'http://127.0.0.1:4425/v1', priceRevision: 'magpie-catalog-abc123456789',
     sampledAt: iso(sampled), expiresAt: iso(sampled + 6_000_000), serviceApproved: true,
     account: { provider: 'sensenova', accountHash: hash('account'), identityHash: hash('identity'), binding: 'company-sealed-account', ownership: 'company-sealed-account', source: 'magpie-quotas' },
     endpointBinding: { source: 'injected', loopback: true },
@@ -56,7 +56,7 @@ function manifest(overrides: Record<string, unknown> = {}) {
   const rest: ProofManifestBody = {
     schemaVersion: 2 as const, goalId: PROOF_GOAL, project: 'surreal_ck' as const, env: 'production' as const,
     activityId: 'activity1', workspaceSlug: 'demo', documentHash: hash('doc'),
-    service: { kind: 'magpie-route' as const, accountRef: 'mgp' + 'a'.repeat(24), endpoint: 'http://127.0.0.1:3425/v1', routeId: 'group/work' as const, routeDigest: magpieRouteDigest(routable), priceRevision: 'magpie-catalog-abc123456789' },
+    service: { kind: 'magpie-route' as const, accountRef: 'mgp' + 'a'.repeat(24), endpoint: 'http://127.0.0.1:4425/v1', routeId: 'group/work' as const, routeDigest: magpieRouteDigest(routable), priceRevision: 'magpie-catalog-abc123456789' },
     budget: { currency: 'USD' as const, totalNanoUsd: 1_000_000_000, perAttemptNanoUsd: 100_000_000, maxAttempts: 30, autoTopupDisabled: true as const },
     identities: [{ alias: 'LCA04_REMOVABLE' as const, workspaceRole: 'admin' as const, billingRole: 'owner' as const }, { alias: 'LCA04_MEMBER' as const, workspaceRole: 'participant' as const, billingRole: 'member' as const }],
     ...overrides,
@@ -67,7 +67,7 @@ function manifest(overrides: Record<string, unknown> = {}) {
 describe('magpie manifest v2', () => {
   test('accepts a loopback route binding and rejects remote, portless, query or foreign-route endpoints', () => {
     expect(manifestV2Schema.safeParse(manifest()).success).toBe(true);
-    for (const endpoint of ['https://api.example.com/v1', 'http://127.0.0.1/v1', 'http://127.0.0.1:3425/v1?x=1', 'http://user:pass@127.0.0.1:3425/v1', 'http://127.0.0.1:3425/other']) {
+    for (const endpoint of ['https://api.example.com/v1', 'http://127.0.0.1/v1', 'http://127.0.0.1:4425/v1?x=1', 'http://user:pass@127.0.0.1:4425/v1', 'http://127.0.0.1:4425/other']) {
       expect(manifestV2Schema.safeParse(manifest({ service: { ...manifest().service, endpoint } })).success).toBe(false);
     }
     expect(manifestV2Schema.safeParse(manifest({ service: { ...manifest().service, routeId: 'group/fast' } })).success).toBe(false);

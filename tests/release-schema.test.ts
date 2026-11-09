@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Surreal } from 'surrealdb';
 import { RECOVERY_READ_TABLES, schemaRequirementFor, LEGACY_SCHEMA_MINIMUM } from '../src/company-release.ts';
+import { CLOUD_SCHEMA_VERSION } from '../src/database.ts';
 import { readReleaseSchema, verifyReleaseSchema } from '../src/release-schema.ts';
 
 // The upgrade records a release as verified only after the running database proves it reached the schema that
@@ -65,5 +68,11 @@ describe('the schema a target version must have reached', () => {
   test('an older target is verified by the old minimum alone', async () => {
     const result = await verifyReleaseSchema(fakeDb(41, []), '0.3.75');
     expect(result).toMatchObject({ schema: LEGACY_SCHEMA_MINIMUM, schemaVersion: 41, tables: [] });
+  });
+
+  test('0.5.0 needs schema 60, and the version in package.json needs the schema this code applies', () => {
+    expect(schemaRequirementFor('0.5.0')).toEqual({ schema: 60, tables: [] });
+    const pkg = JSON.parse(readFileSync(join(import.meta.dir, '../package.json'), 'utf8')) as { version: string };
+    expect(schemaRequirementFor(pkg.version).schema).toBe(CLOUD_SCHEMA_VERSION);
   });
 });

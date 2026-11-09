@@ -1,8 +1,7 @@
 /** v1 core/adapter boundary. The MCP adapter supplies an opaque credential on every call. */
-/** 'eval' is a workforce-only judge role: it reads task history and writes scorecards, never claims tasks. */
 /** 'owner' is the control-plane principal (no employee_def); 'gm' is a retired literal kept only so legacy enrollment fixtures can be mapped to owner. */
-export type Role = 'gm' | 'owner' | 'product' | 'engineering' | 'ai-content' | 'concept-design' | 'asset-production' | 'screenwriter' | 'story-author' | 'cinematography' | 'qa' | 'cs' | 'eval';
-export const ROLES: readonly Role[] = ['product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs', 'eval'];
+export type Role = 'gm' | 'owner' | 'product' | 'engineering' | 'ai-content' | 'concept-design' | 'asset-production' | 'screenwriter' | 'story-author' | 'cinematography' | 'qa' | 'cs';
+export const ROLES: readonly Role[] = ['product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs'];
 /** 'void' is terminal: retired work never re-enters dispatch and counts as satisfied in dependency evaluation. */
 export type TaskState = 'blocked' | 'ready' | 'doing' | 'review' | 'done' | 'void' | 'planned';
 /** Trusted retirement type, set only by server-side callers (session rotation, scene archive, failures),
@@ -579,7 +578,7 @@ export interface OutboxEvent {
 }
 
 /**
- * SYS04: what the plugin process is actually running. Read-only, and read by product/qa only: it names the
+ * SYS04: what the plugin process is actually running. Read-only, and read by owner, product and qa only: it names the
  * release the company service is loaded from, so it is an operator fact rather than a general employee read.
  *
  * The view is produced in the plugin host's own execution context (the face every employee channel reaches),
@@ -620,7 +619,7 @@ export interface PluginRuntimeView {
  * produce no diagnostic at all — not a refused one that still touched the filesystem — so the check runs
  * before any sampling.
  */
-export const PLUGIN_RUNTIME_ROLES: readonly Role[] = ['product', 'qa'];
+export const PLUGIN_RUNTIME_ROLES: readonly Role[] = ['owner', 'product', 'qa'];
 
 
 
@@ -712,7 +711,7 @@ export interface CompanyCore {
     phase: FaultPhase; target?: FaultTargetKind; refund: FaultRefund;
   }): Promise<{ refunded: boolean }>;
   /**
-   * SYS04: authorize a read of the plugin runtime diagnostics (product/qa only) and answer it from the
+   * SYS04: authorize a read of the plugin runtime diagnostics (owner/product/qa only) and answer it from the
    * caller's own execution context.
    *
    * `sample` is invoked only after the caller is known to be allowed, so an unauthorized read produces no
@@ -756,15 +755,11 @@ export interface CompanyCore {
   opsCount(project: string, action: string, windowSeconds: number): Promise<number>;
   relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView>;
   relayDirection(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<void>;
-  /** eval role only: score every employee who participated in a finished task. Marks the task evaluated. */
-  /** eval/owner only: each participant's actual models (executions, fences, phases, first/last) for modelScores. */
-  modelEvidence?(credential: Credential, taskId: TaskId): Promise<Array<{employee:string;models:Array<{model:string;executions:number;fences:number[];phases:string[];first:string;last:string}>}>>;
-  recordScore(credential: Credential, input: { taskId: TaskId; summary: string; scores: EmployeeScore[]; complexity?: number }): Promise<{ recorded: number; participants: string[] }>;
-  /** eval/product: what a task consumed (tokens, USD, model time, elapsed) from Magpie, computed on first read. */
+  /** owner: what a task consumed (tokens, USD, model time, elapsed) from the magpie usage rows, settled once when done. */
   taskCost?(credential: Credential, taskId: TaskId): Promise<import('./task-cost.ts').TaskCost | { taskId: TaskId; available: false; reason: string }>;
 }
 
-/** Employee definition as returned by the manage tools (score internals stay server-side). */
+/** Employee definition as returned by the manage tools. */
 export interface DefView {
   id: string;
   role: Role;
@@ -782,7 +777,7 @@ export interface DefView {
 /**
  * def_ensure input. `tracks` sent as [] clears the track list, omitted leaves it untouched;
  * `enabled: false` disables the def (retire/track-revocation requests). `role` must be a
- * valid Role including eval; other omitted fields reuse the workforce upsert defaults.
+ * valid Role; other omitted fields reuse the workforce upsert defaults.
  */
 export interface EnsureDef {
   id: string;
@@ -797,19 +792,6 @@ export interface EnsureDef {
   enabled?: boolean;
   /** false = dispatched even when the subscription's remaining allowance is 0. Absent keeps the stored value. */
   quotaLimited?: boolean;
-}
-
-export interface ModelAssessment { model: string; overall: number; notes?: string }
-
-export interface EmployeeScore {
-  modelScores?: ModelAssessment[];
-  employee: EmployeeId;
-  quality: number;
-  evidence: number;
-  discipline: number;
-  timeliness: number;
-  overall: number;
-  notes?: string;
 }
 
 /**

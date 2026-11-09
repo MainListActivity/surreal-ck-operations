@@ -26,7 +26,7 @@ const claimResult = (taskId: string): ClaimResult => ({
 });
 
 /**
- * The core the sidecar talks to. It mirrors core's own rule (SYS04: gm/product/qa may read the plugin runtime
+ * The core the sidecar talks to. It mirrors core's own rule (SYS04: owner/product/qa may read the plugin runtime
  * diagnostics) and — the part this file is about — it refuses BEFORE calling the sampler, exactly as the real
  * core does, so an unauthorized read produces no diagnostic at all.
  */
@@ -73,7 +73,7 @@ const core = {
   pluginRuntimeDiagnostics: async (_credential: string, sample: () => unknown) => {
     if (!['owner', 'product', 'qa'].includes(actorRole)) {
       // Shaped like the real CompanyError: the code is separate from the message, and the relay prefixes it.
-      throw Object.assign(new Error('Only gm, product or qa may read the plugin runtime diagnostics'), { code: 'forbidden' });
+      throw Object.assign(new Error('Only owner, product or qa may read the plugin runtime diagnostics'), { code: 'forbidden' });
     }
     samplerCalls++;
     return sample();
@@ -225,7 +225,7 @@ describe('plugin_runtime_diagnostics through the employee channel', () => {
     // SYS04 review R1: the diagnostic names the release the service is loaded from, so it is an operator fact.
     // A role that may not read it gets a refusal — and the plugin host is never asked to sample, so no
     // diagnostic is produced at all (not a refused one that still touched the filesystem).
-    for (const role of ['engineering', 'cs', 'eval']) {
+    for (const role of ['engineering', 'cs']) {
       actorRole = role;
       const i = inst(`e-${role}`);
       const env = pool.env(i);
@@ -233,7 +233,7 @@ describe('plugin_runtime_diagnostics through the employee channel', () => {
       const answer = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, `r-${role}`, 'plugin_runtime_diagnostics', {});
       expect([role, answer.ok]).toEqual([role, false]);
       expect(String(answer.error)).toContain('forbidden');
-      expect(String(answer.error)).toContain('gm, product or qa');
+      expect(String(answer.error)).toContain('owner, product or qa');
       // No sample was taken for a refused call: neither core's callback nor the plugin host's collector ran,
       // and the host registry was not queried either.
       expect([role, samplerCalls]).toEqual([role, 0]);
@@ -242,7 +242,7 @@ describe('plugin_runtime_diagnostics through the employee channel', () => {
     }
   });
 
-  test('gm, product and qa are answered with the plugin execution context', async () => {
+  test('owner, product and qa are answered with the plugin execution context', async () => {
     for (const role of ['owner', 'product', 'qa']) {
       actorRole = role;
       const before = samplerCalls;

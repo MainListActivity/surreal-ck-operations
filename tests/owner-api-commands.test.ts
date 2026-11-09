@@ -237,86 +237,13 @@ function fakeCompany(overrides: Record<string, unknown> = {}) {
   return {
     company: {
       db: { db: { query: async (sql: string, params?: any) => { queries.push({ sql, params }); return [[]]; }, select: async () => undefined } },
-      modelRanking: {}, modelRouting: {}, paseo: undefined,
+      paseo: undefined,
       ...overrides,
     } as never,
     queries,
   };
 }
 const home = () => mkdtempSync(join(tmpdir(), 'owner-plugin-'));
-
-test('plugin model.ranking returns the console ranking view', async () => {
-  const { company } = fakeCompany();
-  const result = await pluginOwnerCommand(company, home(), { command: 'model.ranking' });
-  expect(result.handled).toBe(true);
-  if (result.handled) expect(result.value).toMatchObject({ configured: true, requests: [] });
-});
-
-test('plugin model.ranking.preview passes policy and refresh to the refresher', async () => {
-  const calls: any[] = [];
-  const { company } = fakeCompany({ modelRanking: { preview: async (policy: unknown, refresh: unknown) => { calls.push({ policy, refresh }); return { ok: true }; } } });
-  const result = await pluginOwnerCommand(company, home(), { command: 'model.ranking.preview', policy: { order: ['a'] }, refresh: true });
-  expect(result).toEqual({ handled: true, value: { ok: true } });
-  expect(calls).toEqual([{ policy: { order: ['a'] }, refresh: true }]);
-  await expect(pluginOwnerCommand(company, home(), { command: 'model.ranking.preview', policy: {}, refresh: 'yes' })).rejects.toThrow(/invalid/);
-});
-
-test('plugin model.ranking.save validates rules and hands the policy to the shared save path', async () => {
-  const calls: any[] = [];
-  const { company, queries } = fakeCompany({
-    modelRanking: { configure: async (write: () => Promise<void>, minutes: number) => { calls.push({ minutes }); await write(); } },
-  });
-  const result = await pluginOwnerCommand(company, home(), { command: 'model.ranking.save', rules: 'haiku>sonnet', refreshMinutes: 10 });
-  expect(result).toEqual({ handled: true, value: { ok: true } });
-  expect(calls).toEqual([{ minutes: 10 }]);
-  const upsert = queries.find(q => q.sql.includes('UPSERT company_meta:model_routing'));
-  expect(upsert?.params.minutes).toBe(10);
-  await expect(pluginOwnerCommand(company, home(), { command: 'model.ranking.save', rules: 'x', refreshMinutes: 3 })).rejects.toThrow(/invalid/);
-  await expect(pluginOwnerCommand(company, home(), { command: 'model.ranking.save', rules: 5, refreshMinutes: 5 })).rejects.toThrow(/invalid/);
-});
-
-test('plugin model.ranking.pin validates the group and calls setPin', async () => {
-  const pins: any[] = [];
-  const { company } = fakeCompany({ modelRanking: { setPin: async (group: string, model: string, pinned: boolean) => { pins.push({ group, model, pinned }); } } });
-  const result = await pluginOwnerCommand(company, home(), { command: 'model.ranking.pin', group: 'sck-opus', model: 'm1', pinned: true });
-  expect(result).toEqual({ handled: true, value: { ok: true } });
-  expect(pins).toEqual([{ group: 'sck-opus', model: 'm1', pinned: true }]);
-  await expect(pluginOwnerCommand(company, home(), { command: 'model.ranking.pin', group: 'sck-fable', model: 'm1', pinned: true })).rejects.toThrow(/invalid/);
-  await expect(pluginOwnerCommand(company, home(), { command: 'model.ranking.pin', group: 'sck-opus', model: '', pinned: true })).rejects.toThrow(/invalid/);
-});
-
-test('plugin model.catalog bounds the query and defaults offset/limit', async () => {
-  const calls: any[] = [];
-  const { company } = fakeCompany({ modelRouting: { catalogPage: async (query: string, offset: number, limit: number) => { calls.push({ query, offset, limit }); return { models: [] }; } } });
-  await pluginOwnerCommand(company, home(), { command: 'model.catalog', query: 'opus', offset: 20, limit: 500 });
-  await pluginOwnerCommand(company, home(), { command: 'model.catalog' });
-  expect(calls).toEqual([{ query: 'opus', offset: 20, limit: 100 }, { query: '', offset: 0, limit: 40 }]);
-});
-
-test('plugin model.membership parses the shared input and calls setMembership', async () => {
-  const members: any[] = [];
-  const { company } = fakeCompany({
-    modelRouting: { setMembership: async (input: unknown) => { members.push(input); return { ok: true }; } },
-    modelRanking: { configure: async (write: () => Promise<void>) => { await write(); } },
-  });
-  const input = { group: 'sck-opus', model: 'm1', present: true, expectedMembers: ['m1'] };
-  const result = await pluginOwnerCommand(company, home(), { command: 'model.membership', input });
-  expect(result).toEqual({ handled: true, value: { ok: true } });
-  expect(members).toEqual([input]);
-  await expect(pluginOwnerCommand(company, home(), { command: 'model.membership', input: { group: 'nope' } })).rejects.toThrow();
-});
-
-test('plugin model.alias validates the slug and calls setAlias', async () => {
-  const aliases: any[] = [];
-  const { company } = fakeCompany({
-    modelRouting: { setAlias: async (model: string, slug: string | null) => { aliases.push({ model, slug }); return { synchronized: true }; } },
-    modelRanking: { configure: async (write: () => Promise<void>) => { await write(); } },
-  });
-  const result = await pluginOwnerCommand(company, home(), { command: 'model.alias', model: 'm1', slug: null });
-  expect(result).toEqual({ handled: true, value: { ok: true, synchronized: true } });
-  expect(aliases).toEqual([{ model: 'm1', slug: null }]);
-  await expect(pluginOwnerCommand(company, home(), { command: 'model.alias', model: 'm1', slug: '' })).rejects.toThrow(/invalid/);
-});
 
 test('plugin permission.list reads the fake paseo and filters company agents', async () => {
   const refreshed: string[] = [];

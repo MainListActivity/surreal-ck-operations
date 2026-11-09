@@ -127,7 +127,7 @@ export class OwnerDesk {
     requireText(input.note, 'note', 4, 4000);
     if (!input.executorRole && !input.reviewerRole) throw new CompanyError('invalid', 'executorRole or reviewerRole is required');
     for (const role of [input.executorRole, input.reviewerRole]) {
-      if (role && role !== 'owner' && (!ROLES.includes(role) || role === 'eval')) throw new CompanyError('invalid', `Invalid role ${role}`);
+      if (role && role !== 'owner' && !ROLES.includes(role)) throw new CompanyError('invalid', `Invalid role ${role}`);
     }
     if (input.executorRole === ('owner' as string)) throw new CompanyError('invalid', 'owner cannot execute tasks');
     const idem = id('idempotency', HASH(`owner\0reassign\0${input.key}`));

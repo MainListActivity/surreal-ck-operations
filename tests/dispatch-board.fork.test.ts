@@ -55,7 +55,7 @@ async function startFork(name: string) {
     await db.connect(); await db.bootstrap();
     const core = new SurrealCompanyCore(db), enrollment = new LocalEnrollmentAdmin(db), owner = new OwnerDesk(db);
     const gm = await enrollment.enroll('fixture-manager', 'owner', ['execute', 'review', 'manage']);
-    await db.db.upsert(new RecordId('company_meta', 'config')).content({ eval_enabled: false, jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
+    await db.db.upsert(new RecordId('company_meta', 'config')).content({ jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
     const wf = new Workforce(db, join(dir, 'unused-credential-files'));
     const rawQuery = db.db.query.bind(db.db) as unknown as typeof db.db.query;
     const ops = { tools: ['ops_info'], call: async () => ({ available: true }), release: () => {} };
@@ -100,7 +100,7 @@ const currentEmployeeOf = async (w: Fork, taskId: string): Promise<string | unde
 /** The text a real dispatch of this task to this employee sends: the same render and join the send path makes. */
 const dispatchedText = async (w: Fork, employeeId: string, taskId: string, body?: string): Promise<string> => {
   const stored = body ?? (await unsentDraft(w, taskId, 'execute'))!.body;
-  return dispatchText(renderMessage(stored, { sckBin: SCK, commDir: w.pool.commDirFor(employeeId), taskId, opsRepo: w.dir, acId: DEFAULT_MACHINE_CRITERION }));
+  return dispatchText(renderMessage(stored, { sckBin: SCK, commDir: w.pool.commDirFor(employeeId), taskId, acId: DEFAULT_MACHINE_CRITERION }));
 };
 
 /**
@@ -138,7 +138,7 @@ interface Scenario {
   titles: Map<string, string>;
   /** Keeps its lease, with a checkpoint on record. */
   first: { task: string; employee: string };
-  /** Gave its lease back; its session stays busy, so it holds nothing and cannot take work. */
+  /** Gave its lease back; its session stays busy and is bound to this task, so it can take only this task's next step. */
   second: { task: string; employee: string };
   /** Queued and still open. */
   open: string;
@@ -202,17 +202,17 @@ run('owner board: leases, idle employee, queue and next rows, and closed tasks l
       expect(row.reason).toMatch(/^排在第 \d 位/);
     }
 
-    // Each employee's next rows are the scheduler's own reuse rows for the same inputs, in queue order.
+    // A session serves one task. The lease holder's session has no row for queued work, and the released session has a row only for
+    // its own task. Each row is the scheduler's own reuse row for the same inputs.
     const expected = schedulerRows(s.dispatcher, w.dir, order);
-    expect(expected.get(s.first.employee)?.length).toBe(2);
-    expect(expected.get(s.second.employee)?.length).toBe(2);
+    expect(expected.get(s.first.employee)).toBeUndefined();
+    expect(expected.get(s.second.employee)?.map(row => row.taskId)).toEqual([s.second.task]);
     for (const id of [s.first.employee, s.second.employee]) {
       expect(employee(id).next.map(row => ({ taskId: row.taskId, eligible: row.eligible }))).toEqual(expected.get(id) ?? []);
     }
-    expect(employee(s.first.employee).next.map(row => row.reason)).toEqual(order.map((_, index) =>
-      `排在第 ${index + 1} 位；依赖已解锁，等租约释放`));
-    expect(employee(s.second.employee).next.map(row => row.reason)).toEqual(order.map((_, index) =>
-      `排在第 ${index + 1} 位；${BLOCK_TEXT.session_busy}`));
+    expect(employee(s.first.employee).next).toEqual([]);
+    expect(employee(s.second.employee).next.map(row => row.reason)).toEqual([
+      `排在第 ${order.indexOf(s.second.task) + 1} 位；${BLOCK_TEXT.session_busy}`]);
 
     // Each outbox row is the text a dispatch to that employee would send, and it lists the next rows' open tasks only.
     for (const id of [s.first.employee, s.second.employee]) {
@@ -251,43 +251,42 @@ run('owner board: a held message stays home, and an owner edit is what the emplo
   try {
     const s = await scenario(w);
     const store = new OutboundMessageStore(w.surreal);
-    const draft = (await unsentDraft(w, s.open, 'execute'))!;
+    // The released session can take only its own task, so that task's message is the one its next dispatch would send.
+    const draft = (await unsentDraft(w, s.second.task, 'execute'))!;
     await store.setHold(draft.id, true, 'owner');
 
-    // While held, the board reads the queued row and both employees' rows as waiting for the owner, and the outbox says so.
+    // While held, the board reads the employee's row and the queued row as waiting for the owner, and the outbox says so.
     const held = await readBoard(w.surreal, { now: Date.now() });
-    const heldRow = held.employees.find(row => row.id === s.second.employee)!.next.find(row => row.taskId === s.open)!;
+    const heldRow = held.employees.find(row => row.id === s.second.employee)!.next.find(row => row.taskId === s.second.task)!;
     expect(heldRow).toMatchObject({ eligible: false, reason: expect.stringContaining('消息待老板放行') });
-    expect(held.unassigned.find(row => row.taskId === s.open)).toMatchObject({ eligible: false, blocked: true });
-    expect(held.employees.find(row => row.id === s.second.employee)!.outbox.find(row => row.taskId === s.open)?.hold).toBe(true);
+    expect(held.unassigned.find(row => row.taskId === s.second.task)).toMatchObject({ eligible: false, blocked: true });
+    expect(held.employees.find(row => row.id === s.second.employee)!.outbox.find(row => row.taskId === s.second.task)?.hold).toBe(true);
 
-    // Free the first employee and close the other open tasks, so the only queued work is the held message.
-    await w.pool.releaseClaim(s.first.employee, s.first.task, '【看板测试】释放第一位员工的租约，准备派发下一条');
-    w.agentRows.get(agentOf(s.first.employee))!.status = 'idle';
-    await w.rawQuery("UPDATE $task SET state = 'void';", { task: new RecordId('task', s.first.task) });
-    await w.rawQuery("UPDATE $task SET state = 'void';", { task: new RecordId('task', s.second.task) });
+    // Idle the released session and close the other open task, so the only queued work is the held message.
+    w.agentRows.get(agentOf(s.second.employee))!.status = 'idle';
+    await w.rawQuery("UPDATE $task SET state = 'void';", { task: new RecordId('task', s.open) });
     const sentBefore = w.sends.length;
-    // The first employee is idle and the message is held: the tick neither claims the task nor sends anything.
+    // The session is idle and the message is held: the tick neither claims the task nor sends anything.
     await s.dispatcher.tick();
     await publish(w, s.dispatcher);
     expect(w.sends.length).toBe(sentBefore);
-    expect(await currentEmployeeOf(w, s.open)).toBeUndefined();
+    expect(await currentEmployeeOf(w, s.second.task)).toBeUndefined();
 
     // The owner releases the hold and edits the text. The board then shows the edited text, and it is what the next dispatch sends.
     await store.setHold(draft.id, false, 'owner');
     const edited = `${draft.body}\n老板补充：先核对验收标准第 3 条。`;
     await store.edit(draft.id, edited, 'owner');
     const released = await readBoard(w.surreal, { now: Date.now() });
-    const row = released.employees.find(item => item.id === s.first.employee)!.outbox.find(item => item.taskId === s.open)!;
-    expect(row.body).toBe(await dispatchedText(w, s.first.employee, s.open, edited));
+    const row = released.employees.find(item => item.id === s.second.employee)!.outbox.find(item => item.taskId === s.second.task)!;
+    expect(row.body).toBe(await dispatchedText(w, s.second.employee, s.second.task, edited));
     expect(row.body).toContain('老板补充：先核对验收标准第 3 条。');
     expect(row).toMatchObject({ hold: false, workdirPending: true });
-    expect(released.employees.find(item => item.id === s.first.employee)!.next.find(item => item.taskId === s.open))
+    expect(released.employees.find(item => item.id === s.second.employee)!.next.find(item => item.taskId === s.second.task))
       .toMatchObject({ eligible: true, reason: '排在第 1 位，可接' });
 
     await s.dispatcher.tick();
-    expect(w.sends.slice(sentBefore)).toEqual([{ id: agentOf(s.first.employee), prompt: row.body }]);
-    expect(await currentEmployeeOf(w, s.open)).toBe(s.first.employee);
+    expect(w.sends.slice(sentBefore)).toEqual([{ id: agentOf(s.second.employee), prompt: row.body }]);
+    expect(await currentEmployeeOf(w, s.second.task)).toBe(s.second.employee);
   } finally {
     await w.close();
   }
@@ -300,40 +299,63 @@ run('owner board: an edit of the shown text is saved as the stored body, and the
     const desk = { db: w.database, core: w.core as never, owner: w.owner, workforce: w.wf, messages: new OutboundMessageStore(w.surreal), opsRepo: w.dir };
     const edit = (messageId: string, employeeId: string, rendered: string) =>
       ownerApi(desk, { command: 'message.edit_rendered', messageId, employeeId, rendered }, 'test');
-    const commDir = w.pool.commDirFor(s.first.employee);
-    const shown = (await readBoard(w.surreal, { now: Date.now() })).employees.find(row => row.id === s.first.employee)!.outbox.find(row => row.taskId === s.open)!;
-    const stored = (await unsentDraft(w, s.open, 'execute'))!.body;
+    const commDir = w.pool.commDirFor(s.second.employee);
+    const shown = (await readBoard(w.surreal, { now: Date.now() })).employees.find(row => row.id === s.second.employee)!.outbox.find(row => row.taskId === s.second.task)!;
+    const stored = (await unsentDraft(w, s.second.task, 'execute'))!.body;
 
     // A path the stored body cannot carry is refused, and the stored body stays as it was.
-    await expect(edit(shown.messageId, s.first.employee, shown.body.replace(`${commDir}/task.md`, 'task.md'))).rejects.toThrow(/invalid/);
-    expect((await unsentDraft(w, s.open, 'execute'))!.body).toBe(stored);
+    await expect(edit(shown.messageId, s.second.employee, shown.body.replace(`${commDir}/task.md`, 'task.md'))).rejects.toThrow(/invalid/);
+    expect((await unsentDraft(w, s.second.task, 'execute'))!.body).toBe(stored);
     // An unknown employee and an unknown message are refused.
     await expect(edit(shown.messageId, 'nobody', shown.body)).rejects.toThrow(/not found/);
-    await expect(edit('missing', s.first.employee, shown.body)).rejects.toThrow(/not found/);
+    await expect(edit('missing', s.second.employee, shown.body)).rejects.toThrow(/not found/);
 
     // The owner adds a line to the text the board shows. The stored body keeps placeholders, not this employee's paths.
     const edited = `${shown.body}\n老板补充：先核对验收标准第 3 条。`;
-    await edit(shown.messageId, s.first.employee, edited);
-    const next = (await unsentDraft(w, s.open, 'execute'))!.body;
+    await edit(shown.messageId, s.second.employee, edited);
+    const next = (await unsentDraft(w, s.second.task, 'execute'))!.body;
     expect(next).toContain('老板补充：先核对验收标准第 3 条。');
     expect(next).not.toContain(commDir);
     // The board shows the edited text, and a dispatch would send exactly that text.
-    const after = (await readBoard(w.surreal, { now: Date.now() })).employees.find(row => row.id === s.first.employee)!.outbox.find(row => row.taskId === s.open)!;
+    const after = (await readBoard(w.surreal, { now: Date.now() })).employees.find(row => row.id === s.second.employee)!.outbox.find(row => row.taskId === s.second.task)!;
     expect(after.body).toBe(edited);
-    expect(after.body).toBe(await dispatchedText(w, s.first.employee, s.open, next));
+    expect(after.body).toBe(await dispatchedText(w, s.second.employee, s.second.task, next));
 
-    // The next dispatch sends that text: the first lease is released and the other queued work is voided, so the tick sends the open task.
-    await w.pool.releaseClaim(s.first.employee, s.first.task, '【看板测试】释放第一位员工的租约，准备派发编辑后的消息');
+    // The next dispatch sends that text: the released session is idle and the other queued task is voided, so the tick sends it.
+    w.agentRows.get(agentOf(s.second.employee))!.status = 'idle';
+    await w.rawQuery("UPDATE $task SET state = 'void';", { task: new RecordId('task', s.open) });
+    const sentBefore = w.sends.length;
+    await s.dispatcher.tick();
+    expect(w.sends.slice(sentBefore)).toEqual([{ id: agentOf(s.second.employee), prompt: edited }]);
+    expect(await currentEmployeeOf(w, s.second.task)).toBe(s.second.employee);
+
+    // Once the message is sent it is locked against edits.
+    await expect(edit(shown.messageId, s.second.employee, edited)).rejects.toThrow(/conflict/);
+  } finally {
+    await w.close();
+  }
+}, TIMEOUT_MS);
+
+run('owner board: a task gets a session of its own, and an idle session of another task is never reused', async () => {
+  const w = await startFork('session-own');
+  try {
+    const s = await scenario(w);
+    // Both earlier sessions are idle and their tasks are gone, so the open task is the only queued work.
+    w.agentRows.get(agentOf(s.second.employee))!.status = 'idle';
+    await w.pool.releaseClaim(s.first.employee, s.first.task, '【看板测试】释放第一位员工的租约，准备派发新任务');
     w.agentRows.get(agentOf(s.first.employee))!.status = 'idle';
     await w.rawQuery("UPDATE $task SET state = 'void';", { task: new RecordId('task', s.first.task) });
     await w.rawQuery("UPDATE $task SET state = 'void';", { task: new RecordId('task', s.second.task) });
-    const sentBefore = w.sends.length;
+    const spawnedBefore = w.spawns.length;
     await s.dispatcher.tick();
-    expect(w.sends.slice(sentBefore)).toEqual([{ id: agentOf(s.first.employee), prompt: edited }]);
-    expect(await currentEmployeeOf(w, s.open)).toBe(s.first.employee);
 
-    // Once the message is sent it is locked against edits.
-    await expect(edit(shown.messageId, s.first.employee, edited)).rejects.toThrow(/conflict/);
+    // The open task goes to a new session, not to either idle one, and the spawn binds that session to the open task.
+    const holder = await currentEmployeeOf(w, s.open);
+    expect(holder).toBeDefined();
+    expect([s.first.employee, s.second.employee]).not.toContain(holder!);
+    expect(w.spawns.slice(spawnedBefore).map(row => row.id)).toEqual([agentOf(holder!)]);
+    const [row] = await rowsOf<{ session_task?: string | null }>(w, 'SELECT session_task FROM $employee;', { employee: new RecordId('employee', holder!) });
+    expect(row?.session_task).toBe(s.open);
   } finally {
     await w.close();
   }

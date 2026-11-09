@@ -11,8 +11,8 @@ beforeAll(async () => {
     entrypoints: [join(import.meta.dir, '../plugin/index.client.tsx')],
     outdir: dir, target: 'bun',
     plugins: [{name: 'ui-registration-fixtures', setup(build) {
-      build.onLoad({filter: /\/client\/(company|usage|session-history|model-switch|agent-metrics)\.tsx$/}, () => ({
-        contents: ['CompanySurface', 'MagpieUsageSurface', 'AgentUsagePanel', 'SessionHistoryPanel', 'SessionHistorySurface', 'ModelSwitchTimeline', 'AgentMetricsTimeline']
+      build.onLoad({filter: /\/client\/(company|usage|session-history)\.tsx$/}, () => ({
+        contents: ['CompanySurface', 'MagpieUsageSurface', 'AgentUsagePanel', 'SessionHistoryPanel', 'SessionHistorySurface']
           .map(name => `export function ${name}(){return null}`).join('\n'), loader: 'js',
       }));
     }}],
@@ -34,12 +34,13 @@ function registry() {
   return {surfaces, sidebar, panels, commands, timelines};
 }
 
-test('company owns exactly one sidebar entry and retains per-agent panels and timelines', () => {
+test('company owns exactly one sidebar entry and keeps the per-agent usage and history panels', () => {
   const r = registry();
   expect(r.sidebar.map(({id, title, surface}) => ({id, title, surface})))
     .toEqual([{id: 'company', title: '公司', surface: 'company'}]);
   expect(r.panels.map(p => p.id).sort()).toEqual(['agent-model-metrics', 'employee-history']);
-  expect(r.timelines.map(t => t.kind).sort()).toEqual(['sck-model-metrics', 'sck-model-switch']);
+  // The model switch and model metrics timelines went with the model ranking and scoring: none is registered now.
+  expect(r.timelines).toEqual([]);
 });
 
 test('legacy routes and global shortcuts open the same company workbench at the relevant section', () => {

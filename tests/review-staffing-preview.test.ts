@@ -18,7 +18,8 @@ const readable = { contributors: async () => ({ excluded: ['emp-author'] }) } as
 const unreadable = { contributors: async () => { throw new Error('history read failed'); } } as unknown as Pick<Workforce, 'contributors'>;
 
 const def = { id: 'def-eng', role: 'engineering', provider: 'claude', model: 'fixture-model', enabled: true, maxInstances: 2, weight: 1, tracks: [] } as unknown as EmployeeDef;
-const reviewer = { id: 'emp-reviewer', def: 'def-eng', role: 'engineering', provider: 'claude', model: 'fixture-model', repoHome: '/fixture/repo' } as unknown as EmployeeInst;
+// A session serves one task (sessionTask): the candidates are sessions bound to rev-task, the task under review.
+const reviewer = { id: 'emp-reviewer', def: 'def-eng', role: 'engineering', provider: 'claude', model: 'fixture-model', repoHome: '/fixture/repo', sessionTask: 'rev-task' } as unknown as EmployeeInst;
 
 const preview = (over: Partial<typeof base>, workforce: Pick<Workforce, 'contributors'> = readable) =>
   reviewStaffingPreviews([task], { ...base, ...over }, workforce).then(([p]) => p!);

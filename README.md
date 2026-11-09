@@ -26,6 +26,6 @@ pnpm run company status                       # 公司运行概况
 - [任务服务运维](docs/company-service-operations.md)、[核心契约](docs/core-contract.md)、[老板接口](docs/owner-api.md)、[MCP 接入](docs/mcp-adapter.md)。
 - [业务流程](docs/playbooks.md)、[经营节奏](docs/management.md)。
 
-任务、身份、租约与审计存于自托管 SurrealDB 的 `sck_agent_company/control_plane`（与产品同一实例、独立 namespace，地址与凭证读自产品 `.env`），GitHub Issue 为投影看板。员工按 `employee_def.weight` 加权派工；任务完成后由 `eval` 评审员打绩效分并回馈权重。v2 的 `scripts/queue.py` 与 `agents/registry.json` 仅用于收尾旧工单。
+任务、身份、租约与审计存于自托管 SurrealDB 的 `sck_agent_company/control_plane`（与产品同一实例、独立 namespace，地址与凭证读自产品 `.env`），GitHub Issue 为投影看板。员工按 `employee_def.weight` 加权派工。0.5.0 起不再有员工绩效评分，任务完成后按 `task_cost` 结算成本。v2 的 `scripts/queue.py` 与 `agents/registry.json` 仅用于收尾旧工单。
 
 技术规格与代码在 [产品仓库](https://github.com/MainListActivity/surreal_ck)。客户原件、凭证和合同正文留在授权存储，运营仓库只保留必要证据。

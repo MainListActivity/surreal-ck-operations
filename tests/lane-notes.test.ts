@@ -115,19 +115,15 @@ test('oneshot continuity: a task returns to the session that last worked it in t
   expect(continuitySession([older, newer], idle('d', 'e'), sessionTask('t'), true)?.id).toBe('e');
 });
 
-test('oneshot continuity: a follow-up continues the parent executor only within the lane', () => {
+test('oneshot continuity: a follow-up never continues its parent\'s session, even in the same lane', () => {
   const executor = session('a', { lastTask: 'p', lastPhase: 'execute', lane: 'proj:engineering' });
-  expect(continuitySession([executor], idle('a'), child('p', 'proj'), false)?.id).toBe('a');
-  expect(continuitySession([executor], idle('a'), child('p', 'other'), false)).toBeUndefined();
-  expect(continuitySession([executor], idle('a'), child('p', 'proj'), true)).toBeUndefined();
+  expect(continuitySession([executor], idle('a'), child('p', 'proj'), false)).toBeUndefined();
   const reviewer = session('b', { lastTask: 'p', lastPhase: 'review', lane: 'proj:engineering' });
-  expect(continuitySession([reviewer], idle('b'), child('p', 'proj'), false)).toBeUndefined();
-  const moved = session('c', { lastTask: 'sibling', lastPhase: 'execute', lane: 'proj:engineering' });
-  expect(continuitySession([moved], idle('c'), child('p', 'proj'), false)).toBeUndefined();
+  expect(continuitySession([reviewer], idle('b'), child('p', 'proj'), true)).toBeUndefined();
 });
 
-test('oneshot finish: only a waiting session whose task is over and has no follow-up in its lane ends', () => {
-  const facts = { states: new Map([['done', 'done'], ['void', 'void'], ['open', 'review'], ['chain', 'done']]), followUps: [{ parent: 'chain', lane: 'p:engineering' }] };
+test('oneshot finish: only a waiting session whose task is over ends', () => {
+  const facts = { states: new Map([['done', 'done'], ['void', 'void'], ['open', 'review'], ['chain', 'done']]) };
   const ended = (inst: EmployeeInst, state = 'idle', held = new Set<string>()) =>
     finishedSessions({ instances: [inst], states: new Map([[inst.id, state]]), held, facts }).length === 1;
   const on = (lastTask: string, over: Partial<EmployeeInst> = {}) => session('s', { lastTask, lastPhase: 'execute', lane: 'p:engineering', ...over });
@@ -136,9 +132,8 @@ test('oneshot finish: only a waiting session whose task is over and has no follo
   expect(ended(on('gone'))).toBe(true); // A deleted task is over too.
   expect(ended(on('done'), 'sleeping')).toBe(true);
   expect(ended(on('open'))).toBe(false);
-  expect(ended(on('chain'))).toBe(false);
+  expect(ended(on('chain'))).toBe(true); // A follow-up opens its own session, so this finished one is over.
   expect(ended(on('chain', { lastPhase: 'review', lane: 'p:qa' }))).toBe(true);
-  expect(ended(on('chain', { lane: 'p:qa' }))).toBe(true);
   expect(ended(on('done'), 'busy')).toBe(false);
   expect(ended(on('done', { activeTask: 'x' }))).toBe(false);
   expect(ended(on('done'), 'idle', new Set(['s']))).toBe(false);

@@ -11,7 +11,7 @@ import { CompanyError } from '../core-errors.ts';
  * prints a bare provider id: unknown, never "unchanged".
  */
 export interface AgentInfo { id: string; status: string; model?: string }
-/** Sessions with no task behind them (eval) share one container. */
+/** Sessions with no task behind them (day-to-day maintenance) share one container. */
 export const MAINTENANCE_WORKSPACE = '日常维护';
 /** The owner reads this in the Paseo sidebar: a goal or task name, never an employee or record ID. */
 export const workspaceTitleOf = (title?: string): string => (title ?? '').replace(/\s+/g, ' ').trim().slice(0, 60) || '未命名任务';
