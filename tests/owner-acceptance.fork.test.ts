@@ -79,3 +79,11 @@ run('owner task.create by executorRole honours hold: the task stays held until r
   const store = new OutboundMessageStore(db.db);
   expect(await store.isHeld(id, 'execute')).toBe(true);
 });
+
+run('owner task.create for read-only engineering work does not get the deploy template', async () => {
+  const out = await ownerApi(apiCtx(), { command: 'task.create', executorRole: 'engineering', reviewerRole: 'owner', workIntent: { kind: 'read' },
+    title: '只读巡检', requirement: '需求原文', acceptanceText: '验收原文' }, 'web') as { task?: { id: string }; id?: string };
+  const id = out.task?.id ?? out.id!;
+  const [rows] = await db.db.query<[Array<{ acceptance_criteria?: Array<{ verify: string }> }>]>('SELECT acceptance_criteria FROM type::record("task", $id);', { id });
+  expect((rows[0]?.acceptance_criteria ?? []).some(c => c.verify === 'deploy-run')).toBe(false);
+});
