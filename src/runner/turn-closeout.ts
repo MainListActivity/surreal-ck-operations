@@ -128,7 +128,8 @@ export function settleCompanyTurn(ctx: TurnContext, runtime: Pick<AgentRuntime, 
   if (!event.turnId) return settleTurn(ctx, runtime, event, interruptions);
   let seen = turns.get(ctx.sidecar);
   if (!seen) { seen = new Map(); turns.set(ctx.sidecar, seen); }
-  const key = `${event.agent.id}:${event.turnId}`;
+  const key = ctx.sidecar.turnCloseoutKey?.(event.agent.id, event.turnId)
+    ?? JSON.stringify([event.agent.id, event.turnId]);
   const prior = seen.get(key);
   if (prior) return prior;
   const pending = settleTurn(ctx, runtime, event, interruptions);

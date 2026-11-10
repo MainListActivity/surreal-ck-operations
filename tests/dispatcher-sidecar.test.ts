@@ -939,28 +939,33 @@ describe('派工外部副作用不确定状态', () => {
       const fail = async () => { throw new Error(`injected ${failure}`); };
       if (failure === 'markSent') w.messages.markSent = fail;
       else w.wf[failure] = fail;
-      await expect(w.dispatcher().tick()).rejects.toThrow(`injected ${failure}`);
+      const failureResult = await w.dispatcher().tick().then(() => undefined, error => error);
+      expect(w.events.some(e => /^(release|retire|revoke|performance-failure):/.test(e))).toBe(false);
       expect(w.spawnBodies).toHaveLength(1);
       expect(w.attempts.size).toBe(1);
       expect(w.rows[0]!.currentEmployee).toBe('employee-1');
-      expect(w.events.some(e => /^(release|retire|revoke|performance-failure):/.test(e))).toBe(false);
       w.setNow(100000); // Even an expired/stale lease must not authorize a blind retry.
       const report = await w.dispatcher().tick();
       expect(report.notices).toContain('dispatch-uncertain');
       expect(report.revoked).toHaveLength(0);
       expect(w.spawnBodies).toHaveLength(1);
+      expect(failureResult).toBeInstanceOf(Error);
+      expect(failureResult.message).toContain(`injected ${failure}`);
     });
   }
   test('spawn 运行端已接收但响应丢失，禁止尝试下一员工', async () => {
     const w = world(); w.addTask('lost-spawn-reply');
     const spawn = w.paseo.spawn;
     w.paseo.spawn = async input => { await spawn(input); throw new Error('reply lost'); };
-    await expect(w.dispatcher().tick()).rejects.toThrow('reply lost');
+    const failureResult = await w.dispatcher().tick().then(() => undefined, error => error);
+    expect(w.events.some(e => /^(release|retire|revoke|performance-failure):/.test(e))).toBe(false);
     expect(w.spawnBodies).toHaveLength(1);
     expect(w.instances).toHaveLength(1);
     expect(w.attempts.size).toBe(1);
     await w.dispatcher().tick();
     expect(w.spawnBodies).toHaveLength(1);
+    expect(failureResult).toBeInstanceOf(Error);
+    expect(failureResult.message).toContain('reply lost');
   });
   test('写前日志失败不得调用运行端；日志查询失败不得开始派工', async () => {
     const w = world(); w.addTask('journal-failure');
@@ -986,12 +991,14 @@ for (const failure of ['reply', 'markSent', 'touchWake'] as const) {
     if (failure === 'reply') { const send = w.paseo.send; w.paseo.send = async (...args) => { await send(...args); await fail(); }; }
     else if (failure === 'markSent') w.messages.markSent = fail;
     else w.wf.touchWake = fail;
-    await expect(w.dispatcher().tick()).rejects.toThrow(`send ${failure}`);
-    expect(w.sentBodies).toHaveLength(1); expect(w.attempts.size).toBe(1);
+    const failureResult = await w.dispatcher().tick().then(() => undefined, error => error);
     expect(w.rows[0]!.currentEmployee).toBe(inst.id);
     expect(w.events).not.toContain('release:send-task');
+    expect(w.sentBodies).toHaveLength(1); expect(w.attempts.size).toBe(1);
     const report = await w.dispatcher().tick();
     expect(report.woke).toHaveLength(0); expect(w.sentBodies).toHaveLength(1);
+    expect(failureResult).toBeInstanceOf(Error);
+    expect(failureResult.message).toContain(`send ${failure}`);
   });
 }
 
