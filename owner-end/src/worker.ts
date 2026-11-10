@@ -1,3 +1,4 @@
+import { feedbackEndpoint } from './feedback.ts';
 /**
  * 老板端 Worker：/api 下的接口（登录身份、看板、命令）与定时任务入口；其余路径交给静态页面（assets）。
  * 鉴权只认 Bearer 令牌、不用 cookie，所以不存在跨站请求伪造；命令接口仍核对 Origin，挡住其它站点的页面误用。
@@ -86,6 +87,8 @@ app.post('/api/cmd', (c) => respond(async () => {
   const { command, input } = parseCommandBody(await jsonBody(c.req.raw));
   return runCommand({ cfg, sessions: sessionsOf(cfg) }, caller, command, input);
 }));
+
+app.on(['POST', 'OPTIONS'], '/api/feedback/:project', c => feedbackEndpoint(c.req.raw, c.env, c.req.param('project')));
 
 app.all('/api/*', () => json(404, { ok: false, error: { code: 'not_found', message: '接口不存在' } }));
 

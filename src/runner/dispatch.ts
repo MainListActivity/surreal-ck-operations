@@ -1,3 +1,4 @@
+import { reconcileIterations, iterationMessages } from '../iteration/execution.ts';
 import { DispatchTimings } from "../diagnostics.ts";
 import { RUNNER_BEAT_MS, writeBoardView, writeRunnerHeartbeat } from "../board.ts";
 import { beatNodeRelease } from "../node-release.ts";
@@ -468,6 +469,18 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
         if (Date.now() - gcRefreshedAt > GC_MS) {
           gcRefreshedAt = Date.now();
           await timing.measure("gc", () => runLifecycleGc(ctx)).catch((error) => console.warn(`lifecycle gc failed: ${(error as Error).message}`));
+        }
+        if (!(await ctx.workforce.config()).paused) {
+          await timing.measure("iterations", () => reconcileIterations(ctx.db.db, {
+            create: async input => {
+              const credential = process.env.SCK_OWNER_TOKEN;
+              if (!credential) throw new Error('owner credential unavailable');
+              const task = await ctx.core.createTask(credential, input);
+              // Core 幂等回放后也补齐消息，恢复创建成功但消息尚未落库的中断。
+              await ctx.messages.createTaskDrafts(task.id, task.executorRole, task.reviewerRole, input.workIntent?.kind === 'code', iterationMessages(input));
+              return task;
+            },
+          })).catch(() => console.warn('iteration reconciliation failed'));
         }
         const report = await timing.measure("tick", () => ctx.dispatcher.tick());
         await timing.measure("observation", () => persistDispatchObservation(ctx)).catch((error) => console.warn(`dispatch observation write failed: ${(error as Error).message}`));

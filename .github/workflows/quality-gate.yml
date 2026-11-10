@@ -24,6 +24,10 @@ jobs:
         working-directory: plugin
       - run: pnpm test:bridge
       - run: pnpm test:service
+      - run: pnpm install --frozen-lockfile
+        working-directory: owner-end
+      - run: pnpm typecheck && pnpm test && pnpm build
+        working-directory: owner-end
       - run: pnpm test:comm
       # Fork integration is independently run on the company's installed fork.
       # No upstream database or private production credentials in hosted CI.

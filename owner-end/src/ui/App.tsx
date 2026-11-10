@@ -1,3 +1,4 @@
+import { RequirementsPage } from './pages/Requirements.tsx';
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { beginLogin, CALLBACK_PATH, completeLogin } from './auth.ts';
 import { logout, onUnauthorized, readMe, type Me } from './api.ts';
@@ -16,7 +17,8 @@ type Session =
 
 const TABS: Array<{ id: ReturnType<typeof pageOf>; label: string }> = [
   { id: 'board', label: '看板' },
-  { id: 'tasks', label: '需求与任务' },
+  { id: 'requirements', label: '需求池' },
+  { id: 'tasks', label: '执行任务' },
   { id: 'notes', label: '笔记' },
   { id: 'staff', label: '员工与权限' },
   { id: 'ops', label: '运维' },
@@ -51,6 +53,7 @@ function LoginPage({ notice }: { notice?: string }) {
 }
 
 export function App() {
+  const [requirementDirty,setRequirementDirty]=useState(false);
   const [session, setSession] = useState<Session>({ kind: 'loading' });
   const [hash, setHash] = useState(() => location.hash);
   /** 未保存的消息原文，按 messageId 保存；切换页面或刷新数据后仍保留。退出登录时清空。 */
@@ -124,7 +127,7 @@ export function App() {
         <div class="brand">老板端</div>
         <div class="who">当前老板：{me.sub}</div>
         <div class="top-actions">
-          <button type="button" onClick={() => setPageKey(k => k + 1)}>刷新</button>
+          <button type="button" disabled={requirementDirty} title={requirementDirty?'请先保存或放弃需求修改':undefined} onClick={() => setPageKey(k => k + 1)}>刷新</button>
           <button type="button" onClick={() => void signOut()}>退出</button>
         </div>
       </header>
@@ -144,6 +147,7 @@ export function App() {
         {page === 'board' ? (
           <BoardPage key={`board-${pageKey}`} drafts={drafts} onDraft={setDraft} onDraftSaved={dropDraft} />
         ) : null}
+        <div hidden={page !== 'requirements'}><RequirementsPage key={`requirements-${pageKey}`} onDirtyChange={setRequirementDirty} /></div>
         {page === 'tasks' ? <TasksPage key={`tasks-${pageKey}`} /> : null}
         {page === 'notes' ? <NotesPage key={`notes-${pageKey}`} /> : null}
         {page === 'staff' ? <StaffPage key={`staff-${pageKey}`} /> : null}

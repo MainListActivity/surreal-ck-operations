@@ -8,6 +8,7 @@
 export type CommandGroup =
   | '看板与状态'
   | '任务'
+  | '产品与需求'
   | '决策与消息'
   | '笔记'
   | '路由'
@@ -38,6 +39,19 @@ const c = (command: string, group: CommandGroup, title: string, params: string, 
   ({ command, group, title, params, ...flags });
 
 export const COMMAND_CATALOG: readonly CommandSpec[] = [
+  c('feedback.list', '产品与需求', '查看反馈原文、整理理由与关联需求', 'project, offset?, requirement?', { readOnly: true }),
+  c('feedback.retry', '产品与需求', '重新整理失败或已忽略的反馈', 'id'),
+  c('requirement.control', '产品与需求', '暂停后续推进、恢复、拒绝或重试规划', 'id, revision, action'),
+  c('requirement.execution', '产品与需求', '需求计划、执行任务与发布结果', 'id', { readOnly: true }),
+  c('requirement.release', '产品与需求', '按当前产品发布策略批准该需求上线', 'id, revision, expectedPolicy?', { risk: 'high' }),
+  c('product.iteration.list', '产品与需求', '已登记产品列表', '无', { readOnly: true }),
+  c('product.iteration.get', '产品与需求', '产品反馈及发布策略', 'project', { readOnly: true }),
+  c('product.iteration.configure', '产品与需求', '配置产品反馈来源、发布与回退策略（仅老板）', 'project, enabled, feedbackOrigins, autoRelease, releaseInstructions, verifyInstructions, rollbackInstructions', { risk: 'high' }),
+  c('requirement.list', '产品与需求', '需求池，每页最多 100 项', 'project?, offset?', { readOnly: true }),
+  c('requirement.get', '产品与需求', '需求详情', 'id', { readOnly: true }),
+  c('requirement.create', '产品与需求', '创建待确认需求，不启动开发', 'project, title, problem, acceptance?, priority?'),
+  c('requirement.edit', '产品与需求', '按修订号编辑尚未开工的需求', 'id, revision, title?, problem?, acceptance?, priority?'),
+  c('requirement.approve', '产品与需求', '老板确认需求修订并开始实施', 'id, revision, expectedPolicy?', { risk: 'high' }),
   c('status', '看板与状态', '公司状态摘要（任务数、是否暂停、草稿数）', '无', { readOnly: true }),
   c('progress', '看板与状态', '公司进度概览', '无', { readOnly: true }),
   c('brief', '看板与状态', '老板简报', '无', { readOnly: true }),

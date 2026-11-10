@@ -1,3 +1,7 @@
+import { planRequirements } from '../../src/iteration/planning.ts';
+import { planRequirementWith } from './iteration-planner.ts';
+import { triageFeedback } from '../../src/iteration/triage.ts';
+import { classifyFeedbackWith } from './feedback-triage.ts';
 /**
  * 定时任务（Worker 的 scheduled 入口，按 cron 表达式分派）：
  * - 每分钟：为在岗员工补齐 agent 身份（ma_hono 的 kind=agent 用户，记入 agent_identity）；
@@ -105,6 +109,10 @@ export async function runScheduled(cfg: Config, sessions: Sessions, cron: string
     }
     const identities = await syncAgentIdentities(cfg, db, options);
     const translations = await refreshTranslations(cfg, db, options);
-    return { identities, translations };
+    const feedback = cfg.magpie
+      ? await triageFeedback(db, classifyFeedbackWith(cfg.magpie, options.fetch), now.getTime()).catch(() => ({ failed: true }))
+      : { skipped: 'not_configured' };
+    const planning = cfg.magpie ? await planRequirements(db, planRequirementWith(cfg.magpie, options.fetch), now.getTime()).catch(() => ({ failed: true })) : { skipped: 'not_configured' };
+    return { identities, translations, feedback, planning };
   });
 }
