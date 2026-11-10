@@ -122,3 +122,9 @@ Mac系统libSystem的flock已实测；Linux libc.so.6及实际部署镜像尚未
 - `SCK_TEST_TIMEOUT_SECONDS=180 bun scripts/test-worktrees.ts tests/dispatch-attempt.fork.test.ts tests/company-access.fork.test.ts tests/dispatcher-sidecar.fork.test.ts tests/dispatch-episode.fork.test.ts tests/runner-lifecycle.fork.test.ts`：40/40，363断言；日志`/tmp/dispatch-recovery-delivery-matrix.log`。
 - `bun test tests/dispatcher-sidecar.test.ts tests/native-runtime.test.ts tests/outbound-delivery.test.ts tests/role-message-flow.test.ts tests/paseo-contract.test.ts tests/cloud-schema-version.test.ts tests/dispatch-blocked.test.ts tests/dispatch-list.test.ts tests/release-schema.test.ts tests/release-notes-contract.test.ts`：163/163，875断言；日志`/tmp/dispatch-recovery-delivery-focused.log`。
 - 类型检查、diff格式检查通过。全test:bridge未在最终改动后重跑，不标全量通过。
+
+## 后续阶段验证
+
+- 独立人工确认命令已接线（scripts/dispatch-recovery.ts），不通过会bootstrap的admin入口；不迁移、不扩权、非TTY写入拒绝、响应丢失给精确operation/approval用于对账。
+- `SCK_TEST_TIMEOUT_SECONDS=180 bun scripts/test-worktrees.ts tests/dispatch-attempt.fork.test.ts tests/company-access.fork.test.ts`：31通过、199断言，日志`/tmp/recovery-terminal-fork-final.log`。
+- 现成本机Podman VM上的现成`docker.io/oven/bun:1-alpine`，以`--pull=never --network=none`只读挂载本分支运行`bun test tests/native-runtime.test.ts`：19通过、67断言，日志`/tmp/native-linux-alpine.log`。Linux aarch64，VM glibc2.42；此结果属于已有Bun容器，不等同生产镜像全链验收。之后VM停止/socket拒绝连接，尚未完成Linux公司fork组合验证。

@@ -399,3 +399,20 @@ run('受控人工收尾：过期/错身份/陈旧核验拒绝，故障回滚，�
     expect(receipts).toHaveLength(1); expect(employees[0]!.wake_count).toBe(3); expect(await w.wf.pendingDispatchAttempts()).toHaveLength(0);
   } finally { await second?.close(); await w.db.close(); }
 },20000);
+
+run('人工入口：取消零写入，确认期间变更拒绝，精确确认后真实收尾', async () => {
+  const { confirmAndFinalizeDispatch } = await import('../src/dispatch-recovery-command.ts');
+  const w = await fixture();
+  try {
+    const request = await w.wf.beginDispatchAttempt({...w.input,request:randomUUID(),activationRequired:true});
+    await w.wf.acknowledgeDispatchAttempt(request,'terminal-agent');
+    await w.core.submit(w.employee,{taskId:w.task.id,deliveryId:w.claim.deliveryId,fence:w.claim.fence,expectedVersion:w.claim.task.version},{text:'Synthetic verified task result for terminal confirmation tests.',idempotencyKey:randomUUID()});
+    await expect(confirmAndFinalizeDispatch(w.db,request,'synthetic-operator',async()=> 'no')).rejects.toThrow('canceled');
+    let [approvals] = await w.db.db.query<[unknown[]]>('SELECT id FROM dispatch_recovery_approval;'); expect(approvals).toHaveLength(0);
+    await expect(confirmAndFinalizeDispatch(w.db,request,'synthetic-operator',async(_report,phrase)=> { await w.db.db.query('UPDATE employee:synthetic SET wake_count=4;'); return phrase; })).rejects.toThrow();
+    [approvals] = await w.db.db.query<[unknown[]]>('SELECT id FROM dispatch_recovery_approval;'); expect(approvals).toHaveLength(0);
+    const result=await confirmAndFinalizeDispatch(w.db,request,'synthetic-operator',async(_report,phrase)=>phrase);
+    expect(result.receipt).toMatchObject({request,operator:'synthetic-operator'});
+    expect(await w.wf.pendingDispatchAttempts()).toHaveLength(0);
+  } finally { await w.db.close(); }
+},20000);

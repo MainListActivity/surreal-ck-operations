@@ -74,3 +74,13 @@
 ## 内核锁修复后的说明
 
 上述EEXIST为第六轮历史实测。本地第七轮实现永久kernel锁inode与分离元数据；正常/强制退出后内核释放锁，已通过实际进程竞争和SIGKILL测试，不再通过删除锁接管。原CLI若仍活，运行端仅标unknown，数据库pending屏障保留，绝不自动重发。旧格式锁PID仍活、身份不符或损坏时仍拒绝；生产无权擅自删锁、杀会话或部署新版本。Linux目标环境及线上canary未验证。
+
+## 独立人工确认命令（未部署）
+
+- `bun scripts/dispatch-recovery.ts inspect <request>`：只读核验。
+- `bun scripts/dispatch-recovery.ts finalize <request> <operator>`：必须真实交互终端，展示脱敏核验单后要求逐字输入包含request与完整hash的确认短语；无无人值守确认参数。确认取消不写审批；确认期间状态改变则拒绝，不自动替换hash。仅补已提交真实结果的收尾。
+- `bun scripts/dispatch-recovery.ts receipt <operation>`：在响应丢失时只读查询精确回执；没有回执不等于从未执行，不自动重发。
+
+命令只connect/useDatabase并核对schema，不bootstrap、不迁移、不获取额外权限。现有runner身份不能创建审批；只有既有获准特权操作身份才可运行人工批准步骤，命令不会绕过拒绝。operator为操作人记录标签，真实权限由数据库已有认证决定。任何生产运行仍需明确本次动作授权。
+
+实测：非TTY调用在连接数据库前拒绝；真实fork覆盖取消零写入、确认过程中读集变化拒绝、精确确认后真实CAS收尾。终端输入回调在测试中为合成确认，未把它冒称真人生产批准。
