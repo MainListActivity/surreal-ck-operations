@@ -439,7 +439,7 @@ export class CompanyDatabase {
   }
 
   /**
-   * 按序应用全部 schema（001 至 063；055 按配置渲染）。fresh 时写入归属标记。本机 bootstrap 与云端 company-migrate 共用；
+   * 按序应用全部 schema（001 至 064；055 按配置渲染）。fresh 时写入归属标记。本机 bootstrap 与云端 company-migrate 共用；
    * 云端只有 migrator 能应用。
    */
   async applySchema(fresh: boolean): Promise<void> {
@@ -603,8 +603,9 @@ export class CompanyDatabase {
     await this.db.query(loadSchema('062-drop-outbox.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 62 WHERE schema_version < 62;');
     await this.db.query(loadSchema('063-product-iteration.surql'));
-    await this.db.query(loadSchema('064-runner-lifecycle.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 63 WHERE schema_version < 63;');
+    await this.db.query(loadSchema('064-runner-lifecycle.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 64 WHERE schema_version < 64;');
   }
 
   /** Selects the configured namespace/database without touching schema (runtimes that only query). */

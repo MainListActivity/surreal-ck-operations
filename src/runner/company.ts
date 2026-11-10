@@ -223,7 +223,7 @@ export function company(): Promise<Company> {
     const sidecar = new SidecarPool({
       nativeExecution: runtimeOptions.native,
       managedLifecycle: true,
-      readTurnResult: runtimeOptions.native ? undefined : (agent, turn) => readTurnResult(currentHost(), agent, turn),
+      readTurnResult: runtimeOptions.native ? undefined : (agent, turn, startedAt) => readTurnResult(currentHost(), agent, turn, startedAt),
       executionChanged: async row => {
         const { RecordId } = await import('surrealdb');
         await db.db.query(`UPDATE $task SET runtime_execution = $execution

@@ -2,7 +2,7 @@ import { afterAll, beforeAll, expect, test, setDefaultTimeout } from 'bun:test';
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CompanyDatabase } from '../src/database.ts';
+import { CompanyDatabase, CLOUD_SCHEMA_VERSION } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { Workforce } from '../src/workforce.ts';
@@ -60,4 +60,10 @@ run('模板迁移可重复执行，保留老板修改的正文与已发送记录
   expect((await store.get(one.id))?.body).not.toContain('checkpoint / submit');
   expect((await store.get(edited.id))?.body).toBe(old + '老板补充：只读核对。');
   expect((await store.get(sent.id))?.body).toBe(old);
+});
+
+run('完整迁移保存当前 schema 回执，重复迁移不降级', async () => {
+  await db.applySchema(false);
+  const [rows] = await db.db.query('SELECT schema_version FROM company_meta:installation;');
+  expect((rows as Array<{schema_version:number}>)[0]?.schema_version).toBe(CLOUD_SCHEMA_VERSION);
 });
