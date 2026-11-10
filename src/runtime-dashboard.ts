@@ -138,11 +138,16 @@ export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): R
   const telemetry = new Map(input.telemetry.map((t) => [String(t.runner), t]));
   const hosts = new Map<string, RuntimeHostView>();
   const runnerHost = new Map<string, string>();
+  const employeeMap = new Map(input.employees.map((e) => [key(e.id), e]));
+  const assignedRunners = new Set(input.board.employees.map(e => employeeMap.get(e.id)?.runner_id).filter(Boolean));
   for (const b of input.beats) {
     const runner = String(b.runner);
+    const at = time(b.at);
+    // 已退出且没有在岗员工归属的旧进程心跳是历史记录，不代表当前仍有一台主机。
+    // 有员工的离线节点仍显示；在线但暂未分配员工的节点也保留。
+    if (!online(at, now) && !assignedRunners.has(runner)) continue;
     const t = telemetry.get(runner);
     const id = typeof t?.node === 'string' ? t.node : runner;
-    const at = time(b.at);
     runnerHost.set(runner, id);
     const h = hosts.get(id) ?? {
       id,
@@ -161,7 +166,6 @@ export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): R
     hosts.set(id, h);
   }
   const taskMap = new Map(input.tasks.map((t) => [key(t.id), t]));
-  const employeeMap = new Map(input.employees.map((e) => [key(e.id), e]));
   const agents: RuntimeAgentView[] = input.board.employees.map((e) => {
     const row = employeeMap.get(e.id);
     const hostId =
