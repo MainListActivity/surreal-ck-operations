@@ -69,7 +69,7 @@ function LoginPage({ notice }: { notice?: string }) {
         <ul class="login-points">
           <li>需要你决策的事项排在最前</li>
           <li>确认后的需求修订锁定，执行以确认快照为准</li>
-          <li>发布上线需要你按产品策略单独授权</li>
+          <li>确认开工后，独立复核通过即可合并 PR，由 GitHub 自动部署并验收线上效果</li>
         </ul>
         {notice ? <div class="notice err" role="alert"><span class="notice-text">{notice}</span></div> : null}
         {error ? <div class="notice err" role="alert"><span class="notice-text">{error}</span></div> : null}

@@ -119,7 +119,7 @@ function RequirementList({ route, products, productError, reloadProducts, onDirt
     <div class="page">
       <PageHeader
         title="需求"
-        description="用户反馈由 Agent 整理成需求；你确认开工后，修订锁定并交给 Agent 拆解执行。上线需要你单独授权。"
+        description="用户反馈由 Agent 整理成需求；你确认开工后，修订锁定并交给 Agent 拆解执行。独立复核通过后合并 PR，由 GitHub 自动部署，再验收线上效果。"
         actions={(
           <>
             {project ? <a class="button" href={hrefOf('requirements', undefined, { ...params, settings: '1' })}>产品设置</a> : null}
