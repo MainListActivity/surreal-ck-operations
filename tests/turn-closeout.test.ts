@@ -143,3 +143,25 @@ for (const phase of ['doing', 'review'] as const) test(`silent nudge names the $
   expect(sent[0]).toContain(`call ${phase === 'review' ? 'review' : 'submit'}`);
   if (phase === 'review') expect(sent[0]).not.toContain('call submit');
 });
+
+
+test('续跑先到、旧取消后处理时，不回收新回合租约', async () => {
+  const w=silentWorld();try {
+    await w.pool.claim(w.inst,{id:'fixture-task',state:'doing'} as never);
+    const interruptions=new TurnInterruptions(20);
+    interruptions.turnStarted('fixture-agent','new-turn');
+    await Bun.sleep(3);await w.cancel(interruptions);await Bun.sleep(60);
+    expect(w.calls).toEqual([]);expect(w.pool.holdsLease(w.inst.id,'fixture-task')).toBe(true);
+    interruptions.stop();
+  }finally{w.close();}
+});
+test('复用回合编号时用事件收到时间保护续跑，租约检查也隔离派工批次', async () => {
+  const interruptions=new TurnInterruptions(20);const observedAt=Date.now()-100;
+  interruptions.turnStarted('agent','same-turn');
+  expect(interruptions.startedSince('agent',observedAt,'same-turn')).toBe(true);
+  const w=silentWorld();try{
+    await w.pool.claim(w.inst,{id:'fixture-task',state:'doing'} as never);
+    expect(w.pool.holdsLease(w.inst.id,'fixture-task','old-delivery')).toBe(false);
+    expect(w.pool.holdsLease(w.inst.id,'fixture-task','fixture-delivery')).toBe(true);
+  }finally{w.close();interruptions.stop();}
+});

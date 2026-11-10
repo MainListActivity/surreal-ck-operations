@@ -94,6 +94,8 @@ export interface AgentRuntime {
 
 
 export interface TurnEnded {
+  /** 本机收到事件的时刻，早于任何异步数据库/身份检查。 */
+  observedAt?: number;
   agent: { id: string; title?: string | null; provider?: string };
   turnId?: string | null;
   outcome: { kind: string; error?: { message: string; code?: string } };
