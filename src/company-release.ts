@@ -58,6 +58,7 @@ export const RELEASE_SCHEMA_REQUIREMENTS: ReleaseSchemaRequirement[] = [
   { version: '0.10.0', schema: 64, tables: ['task', 'outbound_message', 'route'] },
   { version: '0.10.1', schema: 64, tables: ['task', 'outbound_message', 'route'] },
   { version: '0.10.2', schema: 64, tables: ['task', 'outbound_message', 'route'] },
+  { version: '0.11.0', schema: 64, tables: ['task', 'outbound_message', 'route', 'runner_heartbeat', 'company_meta'] },
 ];
 /** The requirement that applies to a target version: the newest one that is not newer than the target. */
 export function schemaRequirementFor(version: string): { schema: number; tables: string[] } {
