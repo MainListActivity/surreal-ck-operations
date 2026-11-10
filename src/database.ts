@@ -100,7 +100,7 @@ const pause = (ms: number): Promise<void> => new Promise(resolve => {
 });
 
 /** 本版本 applySchema 的最后一个结构版本；云端 bootstrap 只核对库内版本不低于它。 */
-export const CLOUD_SCHEMA_VERSION = 63;
+export const CLOUD_SCHEMA_VERSION = 64;
 
 export class CompanyDatabase {
   /** 当前会话的客户端；云端续期或重连时整体替换（见 rebuildNow）。 */
@@ -603,6 +603,7 @@ export class CompanyDatabase {
     await this.db.query(loadSchema('062-drop-outbox.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 62 WHERE schema_version < 62;');
     await this.db.query(loadSchema('063-product-iteration.surql'));
+    await this.db.query(loadSchema('064-runner-lifecycle.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 63 WHERE schema_version < 63;');
   }
 

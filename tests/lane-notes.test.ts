@@ -62,7 +62,7 @@ test('a restated note is a duplicate; the lane\'s other notes are not', () => {
 test('dispatch messages name notes.md and render it next to task.md', () => {
   for (const body of [templateFor('execute', true), templateFor('execute'), templateFor('review', true, 'review'), templateFor('review', false, 'review')]) {
     expect(body).toContain('notes.md');
-    expect(body).toContain('learned');
+    expect(body).not.toContain('learned');
     expect(body).toContain('结束本轮');
   }
   const sent = renderMessage(templateFor('execute'), { sckBin: '/bin/sck', commDir: '/comm/x/', taskId: 't' });

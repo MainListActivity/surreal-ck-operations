@@ -1,3 +1,4 @@
+import { LIFECYCLE_COMMANDS } from '../../src/lifecycle-policy.ts';
 import { ITERATION_COMMANDS } from '../src/iteration-commands.ts';
 import { describe, expect, test } from 'bun:test';
 import { RecordId } from 'surrealdb';
@@ -314,7 +315,7 @@ describe('员工调用的命令守卫与审计', () => {
   });
 
   test('h. 有有效租约，但老板观测命令在员工拒绝清单里（ops.job.list、audit.list）：forbidden 只能由老板调用，denied 审计', async () => {
-    for (const command of ['ops.job.list', 'audit.list', ...ITERATION_COMMANDS]) {
+    for (const command of ['ops.job.list', 'audit.list', ...ITERATION_COMMANDS, ...LIFECYCLE_COMMANDS]) {
       const gateway = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE });
       const deps = depsWith(fakeSessions(gateway.db));
       const error = await errorOf(() => runCommand(deps, agentCaller, command, {}));
@@ -447,7 +448,7 @@ describe('员工调用的命令守卫与审计', () => {
     const deps = { ...depsWith(fakeSessions(owner.db)), cfg: testConfig({ IDP_TENANT_ID: '46aa29a6-9ee8-4052-bccd-7923f98220d7' }) };
     const result = await runCommand(deps, ownerCaller, 'guard.list', {}) as Record<string, unknown>;
     expect(result.hardOwnerOnly).toEqual(['guard.*', 'agent.*', 'owner.login.*', 'def.*', 'db.write']);
-    expect(result.ownerOnlyForAgents).toEqual(['ops.job.list', 'audit.list', ...ITERATION_COMMANDS]);
+    expect(result.ownerOnlyForAgents).toEqual(['ops.job.list', 'audit.list', ...ITERATION_COMMANDS, ...LIFECYCLE_COMMANDS]);
     expect(result.lockedTargets).toMatchObject({
       companyTenantId: '46aa29a6-9ee8-4052-bccd-7923f98220d7',
       companyHost: 'company.maplayer.top',
@@ -489,22 +490,13 @@ describe('命令目录（cmd.catalog）与员工的任务范围', () => {
     expect(audits[0]!.vars.command).toBe('cmd.catalog');
   });
 
-  test('老板定：员工可以操作别的任务与消息（taskId、messageId 不限于本租约任务），写 ok 审计', async () => {
-    const other = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE });
-    expect(await runCommand(depsWith(fakeSessions(other.db)), agentCaller, 'message.list', { taskId: 't2' })).toEqual({ messages: [] });
-    expect(auditsOf(other.calls)[0]!.vars.outcome).toBe('ok');
-    const others = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE, message: [messageRow('m2', 't2')] });
-    const result = await runCommand(depsWith(fakeSessions(others.db)), agentCaller, 'message.hold', { messageId: 'm2' }) as { id: string };
-    expect(result.id).toBe('m2');
+  test('员工可读取任务资料，但不再控制本任务或其他任务的派工', async () => {
+    const gateway = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE, message: [messageRow('m1', 't1')] });
+    expect(await runCommand(depsWith(fakeSessions(gateway.db)), agentCaller, 'message.list', { taskId: 't2' })).toEqual({ messages: [] });
+    for (const command of ['message.hold', 'task.revoke', 'task.create']) {
+      await expect(runCommand(depsWith(fakeSessions(gateway.db)), agentCaller, command, { messageId: 'm1', taskId: 't1' })).rejects.toThrow();
+    }
+    expect(gateway.calls.some(call => call.sql.startsWith('UPDATE $msg'))).toBe(false);
   });
 
-  test('messageId 属于本员工当前任务：通过，执行命令并写 ok 审计', async () => {
-    const gateway = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE, message: [messageRow('m1', 't1')] });
-    const result = await runCommand(depsWith(fakeSessions(gateway.db)), agentCaller, 'message.hold', { messageId: 'm1' }) as { id: string };
-    expect(result.id).toBe('m1');
-    expect(gateway.calls.some((call) => call.sql.startsWith('UPDATE $msg'))).toBe(true);
-    const audits = auditsOf(gateway.calls);
-    expect(audits).toHaveLength(1);
-    expect(audits[0]!.vars.outcome).toBe('ok');
-  });
 });

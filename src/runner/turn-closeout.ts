@@ -52,7 +52,8 @@ async function settleTurn(ctx: TurnContext, runtime: Pick<AgentRuntime, "send">,
     // write fails, leave the lease intact; never turn a failed cooldown into a nudge.
     await ctx.workforce.markExhausted(inst.provider, failure.reason, failure.resetsAt);
   }
-  const res = await ctx.sidecar.settle(event.agent.id, { infrastructureFailure: !!failure });
+  const managed = await ctx.sidecar.settleExecution?.(failure ? { ...event, outcome: { kind: 'failed' } } : event);
+  const res = managed ?? await ctx.sidecar.settle(event.agent.id, { infrastructureFailure: !!failure });
   if (failure) {
     if (res.silent) {
       const { instId, taskId } = res.silent;

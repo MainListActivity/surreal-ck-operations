@@ -221,6 +221,16 @@ export function company(): Promise<Company> {
     }
     const sidecar = new SidecarPool({
       nativeExecution: runtimeOptions.native,
+      managedLifecycle: true,
+      executionChanged: async row => {
+        const { RecordId } = await import('surrealdb');
+        await db.db.query(`UPDATE $task SET runtime_execution = $execution
+          WHERE (delivery_id = $delivery AND current_employee = $employee)
+          OR (delivery_id = NONE AND runtime_execution.delivery = $delivery);`, {
+          task: new RecordId('task', row.task), delivery: row.proof.deliveryId, employee: row.employee,
+          execution: { delivery: row.proof.deliveryId, state: row.state, agent: row.agent, turn: row.turn, attempts: row.tries, error: row.error, at: row.at },
+        });
+      },
       core, workforce, ops, media, browser, sync,
       cloud: cloudRoute,
       runDir,

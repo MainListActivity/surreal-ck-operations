@@ -482,6 +482,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
             },
           })).catch(() => console.warn('iteration reconciliation failed'));
         }
+        await ctx.sidecar.retryExecutions();
         const report = await timing.measure("tick", () => ctx.dispatcher.tick());
         await timing.measure("observation", () => persistDispatchObservation(ctx)).catch((error) => console.warn(`dispatch observation write failed: ${(error as Error).message}`));
         await timing.measure("board", () => persistBoardView(ctx)).catch((error) => console.warn(`board view write failed: ${(error as Error).message}`));
@@ -521,7 +522,11 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
     server.on("agent.turn_started", (event, { paseo }) => {
       interruptions.turnStarted(event.agent.id);
       return isCompanyAgent(paseo, event.agent).then(async ok => {
-        if (ok) await (await company()).workforce.clearIdleForAgent(event.agent.id);
+        if (ok) {
+          const ctx = await company();
+          await ctx.sidecar.turnStarted(event.agent.id, event.turnId ?? undefined);
+          await ctx.workforce.clearIdleForAgent(event.agent.id);
+        }
       }).catch((error: unknown) => console.warn(`idle activity update failed: ${(error as Error).message}`));
     }),
     server.on("agent.turn_ended", (event, { paseo }) => {

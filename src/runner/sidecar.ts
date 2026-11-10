@@ -1,9 +1,13 @@
+import { execFile } from 'node:child_process';
+import { LIFECYCLE_COMMANDS } from '../lifecycle-policy.ts';
 // Per-agent sidecar pool. Each company employee instance gets a private comm
 // directory and an in-memory credential held by the plugin; agents receive only
 // SCK_COMM_DIR/SCK_COMM_KEY in their spawn env and never see auth material.
 // The sidecar claims tasks on the instance's behalf (dispatcher calls claim()),
 // keeps the lease alive while a turn runs, relays `sck call` requests through
 // req/res files, and ingests report.md/blocker.md when a turn ends.
+import { ExecutionJournal, workResult, finalAnswer, type ExecutionAttempt } from './lifecycle.ts';
+import type { TurnEnded } from './contracts.ts';
 import { OpsCircuit } from "./ops-circuit.ts";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readdirSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
@@ -150,6 +154,8 @@ export function cloudRequestOf(tool: string, args: Record<string, unknown>): { c
 const NEEDS_CLOUD = "需要云端执行端：公司命令只在云端模式可用，本机没有公司网关";
 
 export interface SidecarDeps {
+  managedLifecycle?: boolean;
+  executionChanged?: (row: ExecutionAttempt) => Promise<void>;
   nativeExecution?: boolean;
   core: CompanyCore;
   workforce: Workforce;
@@ -196,7 +202,7 @@ interface LiveClaim {
 
 /** What settle() found for a finished turn; `silent` carries the still-open round. */
 export interface SettleResult {
-  status: "ingested" | "no_claim" | "silent";
+  status: "ingested" | "no_claim" | "silent" | "pending";
   silent?: { instId: string; taskId: string; nudges: number; phase: "doing" | "review" };
 }
 
@@ -243,7 +249,137 @@ export class SidecarPool {
   /** Last claim denial code per instance: the dispatcher reads it after a lost claim (see claimDenial). */
   private readonly denials = new Map<string, string>();
   private readonly opsCircuit: OpsCircuit;
-  constructor(private readonly deps: SidecarDeps) { this.opsCircuit = new OpsCircuit(deps.runDir); }
+  private readonly journal?: ExecutionJournal;
+  private readonly flushing = new Set<string>();
+  private readonly starts = new Map<string, string | undefined>();
+  private closed = false;
+  constructor(private readonly deps: SidecarDeps) {
+    this.opsCircuit = new OpsCircuit(deps.runDir);
+    if (deps.managedLifecycle) this.journal = new ExecutionJournal(join(dirname(deps.runDir), 'private', 'executions', hash(deps.runDir)!));
+  }
+  private async changed(row: ExecutionAttempt): Promise<void> {
+    this.journal!.save(row);
+    await this.deps.executionChanged?.(row).catch(() => this.log(`execution status mirror deferred: ${row.task}`));
+  }
+  /** A runtime start acknowledgement, never merely a queued prompt. */
+  async turnStarted(agent: string, turn?: string): Promise<void> {
+    if (!this.journal) return;
+    if (turn && this.journal.rows().some(row => row.agent === agent && row.turns.includes(turn))) return;
+    this.starts.set(agent, turn);
+    const employee = this.instByAgent.get(agent), live = employee ? this.claims.get(employee) : undefined;
+    if (!employee || !live) return; // spawn can emit before bindAgent; bind replays this acknowledgement
+    const row = this.journal.reserve(employee, live.phase, live.proof);
+    if (row.result || ['settled', 'superseded'].includes(row.state)) return;
+    row.agent = agent; row.turn = turn; row.state = 'running';
+    await this.changed(row);
+  }
+  /** Capture the result before attempting cloud writes. Duplicate/late events cannot consume a new lease. */
+  async settleExecution(event: TurnEnded): Promise<SettleResult | undefined> {
+    if (!this.journal) return;
+    const employee = this.instByAgent.get(event.agent.id);
+    if (!employee) return { status: 'no_claim' };
+    const prior = this.journal.rows().find(r => r.employee === employee && !!event.turnId && r.turns.includes(event.turnId));
+    if (prior) { if (prior.state === 'collecting') await this.collectExecution(prior); else await this.flushExecution(prior); return { status: prior.state === 'settled' ? 'ingested' : 'pending' }; }
+    const live = this.claims.get(employee);
+    const row = live ? this.journal.reserve(employee, live.phase, live.proof)
+      : this.journal.rows().filter(r => r.employee === employee && r.agent === event.agent.id
+        && ['reserved', 'running', 'interrupted', 'collecting'].includes(r.state)).sort((a, b) => b.at - a.at)[0];
+    // Losing an in-memory claim must not discard completed work. Its saved proof is only used for a fenced core call.
+    if (!row) return { status: 'no_claim' };
+    if (row.turn && event.turnId && row.turn !== event.turnId) return { status: 'no_claim' };
+    if (row.result) { await this.flushExecution(row); return { status: 'pending' }; }
+    if (event.turnId) row.turns.push(event.turnId);
+    row.agent = event.agent.id;
+    row.turn = event.turnId ?? row.turn;
+    row.finalText = finalAnswer(event);
+    if (event.outcome.kind !== 'completed') {
+      row.state = 'interrupted'; await this.changed(row);
+      // Failed/canceled output is never treated as a successful business result.
+      return { status: 'silent', silent: { instId: employee, taskId: row.task, nudges: 3, phase: row.phase } };
+    }
+    const dir = this.commDirFor(employee);
+    // Snapshot artifacts with this delivery before any asynchronous cloud mirror can yield to a new claim.
+    row.artifacts = live?.proof.deliveryId === row.proof.deliveryId
+      ? { raw: readTextFile(join(dir, 'result.json')), blocker: readTextFile(blockerPath(dir)), report: readTextFile(reportPath(dir)) } : {};
+    row.state = 'collecting'; await this.changed(row);
+    return this.collectExecution(row);
+  }
+  private async collectExecution(row: ExecutionAttempt): Promise<SettleResult> {
+    try {
+      const { raw, blocker, report } = row.artifacts ?? {}; // Never read a later delivery's shared files during recovery.
+      row.result = blocker !== undefined ? workResult('', row.phase, { summary: blocker, outcome: 'blocked' })
+        : workResult(report || row.finalText || '', row.phase, raw === undefined ? undefined : JSON.parse(raw));
+      row.state = 'pending'; row.nextRetry = 0;
+    } catch {
+      row.state = 'attention'; row.error = '工作结果缺失或复核结论不明确';
+      // Missing business output is a genuine work gap; the runner records it, no protocol troubleshooting is assigned.
+      row.result = workResult('', row.phase, { outcome: 'blocked', summary: '本轮已结束，但工作结果缺失或复核结论不明确，需要补充工作结论。' });
+      row.state = 'pending';
+    }
+    await this.changed(row);
+    await this.flushExecution(row);
+    return { status: (row as ExecutionAttempt).state === 'settled' ? 'ingested' : 'pending' };
+  }
+  /** Also called by the existing dispatcher cadence after restart; no additional scheduler. */
+  async retryExecutions(): Promise<void> {
+    if (!this.journal || this.closed) return;
+    for (const row of this.journal.rows()) {
+      if (row.state === 'collecting') {
+        await this.collectExecution(row);
+      } else if (row.state === 'pending' && row.nextRetry <= Date.now()) await this.flushExecution(row);
+    }
+  }
+  private async flushExecution(row: ExecutionAttempt): Promise<void> {
+    if (!this.journal || !row.result || row.state !== 'pending' || this.closed || this.flushing.has(row.employee)) return;
+    if (!this.launched.has(row.employee) || this.quarantined.has(row.employee)) return;
+    this.flushing.add(row.employee);
+    try {
+      // Frozen proof + evidence: retry an uncertain commit exactly, before reading/updating its version.
+      const core = this.deps.core;
+      if (!row.prepared && row.result.action === 'submit') {
+        const task = await this.callWithCred(row.employee, cred => core.getTask(cred, row.task));
+        if (!row.result.evidence.sha && task.workIntent?.kind === 'code' && task.worktree?.worktreePath) {
+          const head = await new Promise<string | undefined>(resolve => execFile('git', ['-C', task.worktree!.worktreePath, 'rev-parse', 'HEAD'],
+            { timeout: 10000, maxBuffer: 1024 * 1024 }, (error, stdout) => resolve(!error && /^[a-f0-9]{40}$/i.test(stdout.trim()) ? stdout.trim() : undefined)));
+          if (head) row.result.evidence.sha = head;
+        }
+        if (task.acceptanceEnvironment) row.result.evidence.acceptance = { ...row.result.evidence.acceptance, environment: task.acceptanceEnvironment };
+        row.prepared = true;
+        this.journal.save(row);
+      }
+      const evidence = this.journal.evidence(row);
+      await this.callWithCred(row.employee, cred => row.result!.action === 'submit' ? core.submit(cred, row.proof, evidence)
+        : row.result!.action === 'accept' ? core.accept(cred, row.proof, evidence)
+        : row.result!.action === 'return' ? core.returnTask(cred, row.proof, evidence)
+        : core.block(cred, row.proof, 'owner', evidence));
+      row.state = 'settled'; row.error = undefined;
+      await this.changed(row);
+      const live = this.claims.get(row.employee);
+      if (live?.proof.deliveryId === row.proof.deliveryId) {
+        for (const path of [reportPath(this.commDirFor(row.employee)), blockerPath(this.commDirFor(row.employee)), join(this.commDirFor(row.employee), 'result.json')]) this.archive(path, 'done');
+        this.endLease(row.employee);
+      }
+      this.log(`runner ${row.result.action} ${row.task} for ${row.employee}`);
+    } catch (error) {
+      const code = String((error as { code?: string }).code ?? 'unavailable');
+      row.tries++; row.error = code; row.nextRetry = Date.now() + Math.min(60000, 2000 * 2 ** Math.min(row.tries, 5));
+      // Only a definitive version refusal permits changing the request; transport errors keep the original request.
+      if (code === 'conflict' || code === 'lease_expired') {
+        try {
+          const task = await this.callWithCred(row.employee, cred => this.deps.core.getTask(cred, row.task));
+          if (task.currentEmployee !== row.employee || task.deliveryId !== row.proof.deliveryId || task.fence !== row.proof.fence) row.state = 'superseded';
+          else row.proof.expectedVersion = task.version;
+        } catch { /* unknown is not proof that the lease disappeared */ }
+      }
+      if (row.state === 'pending' && row.tries >= 10 && row.result.action !== 'block' && ['invalid', 'acceptance_failed', 'conflict'].includes(code)) {
+        row.originalResult = row.result;
+        row.result = workResult('', row.phase, { outcome: 'blocked', summary: `执行端自动收尾持续未通过校验（${code}）。原始工作成果已经保存在执行记录，需检查验收或环境条件后恢复。` });
+        row.prepared = true;
+      }
+      await this.changed(row);
+      this.log(`runner result pending ${row.task}: ${code}, attempt ${row.tries}`);
+    } finally { this.flushing.delete(row.employee); }
+  }
   private log(message: string) { this.deps.log?.(message); }
 
   /** The company employee behind a session: its instance, comm dir, role, and the task its model session is keyed on. */
@@ -340,6 +476,7 @@ export class SidecarPool {
     }
     this.instByAgent.set(agentId, instId);
     this.writeBinding(agentId, instId);
+    if (this.starts.has(agentId)) void this.turnStarted(agentId, this.starts.get(agentId)).catch(error => this.log(`start record failed: ${String(error)}`));
   }
 
   private async credentialFor(instId: string): Promise<string> {
@@ -365,7 +502,7 @@ export class SidecarPool {
   }
 
   private static isAuthError(error: unknown): boolean {
-    return error instanceof Error && /invalid credential|unauthorized|forbidden/i.test(error.message);
+    return (error as {code?:string})?.code === 'unauthorized' || error instanceof Error && /invalid credential|unauthorized/i.test(error.message);
   }
 
   /** Retry once with a re-issued credential when a call rejects auth — a concurrent adopter may have rotated it. */
@@ -390,7 +527,7 @@ export class SidecarPool {
           || task.deliveryId !== held.proof.deliveryId
           || (task.leaseExpiresAt !== undefined && Date.parse(task.leaseExpiresAt) <= Date.now());
     } catch {
-      return true; // unreachable/removed task — never worth blocking dispatch on
+      return false; // A failed read is unknown, not proof that an active reservation can be overwritten.
     }
   }
 
@@ -457,6 +594,12 @@ export class SidecarPool {
       leaseExpiresAt: Date.parse(result.leaseExpiresAt),
       proof: { taskId: task.id, deliveryId: result.deliveryId, fence: result.fence, expectedVersion: result.task.version },
     });
+    if (this.journal) {
+      const row = this.journal.reserve(inst.id, result.task.state === 'review' ? 'review' : 'doing', this.claims.get(inst.id)!.proof);
+      row.agent = inst.paseoAgentId ?? undefined;
+      await this.changed(row);
+      this.archive(join(dir, 'result.json'), 'stale');
+    }
     this.startBeat(inst.id);
     this.log(`sidecar claimed ${task.id} for ${inst.id}`);
     return result;
@@ -768,6 +911,11 @@ export class SidecarPool {
       // turn a valid recovered lease into no_lease.
       this.log(`adopted claim.json refresh ${inst.id} failed: ${(error as Error).message}`);
     }
+    if (this.journal) {
+      this.journal.reserve(inst.id, lease.state, this.claims.get(inst.id)!.proof);
+      // Managed outputs are consumed only after a recorded turn end, never a partially written report.
+      return;
+    }
     if (!trustedArtifacts) return;
     const blocker = readTextFile(blockerPath(dir));
     const report = readTextFile(reportPath(dir));
@@ -787,41 +935,57 @@ export class SidecarPool {
     else if (report !== undefined) await this.finish(inst.id, claim, undefined, report, reportPath(dir));
   }
 
+  private readonly renewals = new Map<string, Promise<boolean>>();
+  /** Both supervision and periodic keepalive use this one proof owner. */
+  async maintainLease(inst: EmployeeInst, taskId: string): Promise<boolean> {
+    if (!this.claims.has(inst.id)) await this.rebuildClaim(inst);
+    if (this.claims.get(inst.id)?.taskId !== taskId) return false;
+    return this.renewCurrent(inst.id);
+  }
+  private renewCurrent(instId: string): Promise<boolean> {
+    const prior = this.renewals.get(instId);
+    if (prior) return prior;
+    const pending = this.renewOnce(instId);
+    this.renewals.set(instId, pending);
+    void pending.finally(() => { if (this.renewals.get(instId) === pending) this.renewals.delete(instId); });
+    return pending;
+  }
+  private async renewOnce(instId: string): Promise<boolean> {
+    const live = this.claims.get(instId);
+    if (!live || this.closed) return false;
+    try {
+      const result = await this.callWithCred(instId, cred => this.deps.core.heartbeat(cred, live.proof));
+      if (this.claims.get(instId) !== live) return false;
+      live.proof.expectedVersion = result.task.version;
+      if (result.task.leaseExpiresAt) live.leaseExpiresAt = Date.parse(result.task.leaseExpiresAt);
+      return true;
+    } catch (error) {
+      if (this.claims.get(instId) !== live) return false;
+      try {
+        const task = await this.callWithCred(instId, cred => this.deps.core.getTask(cred, live.taskId));
+        if (this.claims.get(instId) === live && task.currentEmployee === instId && task.deliveryId === live.proof.deliveryId
+            && (!task.leaseExpiresAt || Date.parse(task.leaseExpiresAt) > Date.now())) {
+          live.proof.expectedVersion = task.version; live.proof.fence = task.fence;
+          if (task.leaseExpiresAt) live.leaseExpiresAt = Date.parse(task.leaseExpiresAt);
+          this.log(`heartbeat ${instId} resynced after: ${(error as Error).message}`);
+          return false;
+        }
+      } catch {
+        this.log(`heartbeat ${instId} deferred: identity or database unavailable; retaining execution proof`);
+        return false;
+      }
+      this.log(`heartbeat ${instId} failed: ${(error as Error).message}`);
+      if (this.claims.get(instId) === live) this.endLease(instId);
+      return false;
+    }
+  }
   private startBeat(instId: string): void {
     this.stopBeat(instId);
     const beat = setInterval(() => {
-      const live = this.claims.get(instId);
-      if (!live) { this.stopBeat(instId); return; }
-      void (async () => {
-        try {
-          const result = await this.callWithCred(instId, cred => this.deps.core.heartbeat(cred, live.proof));
-          if (this.claims.get(instId) === live) {
-            live.proof.expectedVersion = result.task.version;
-            if(result.task.leaseExpiresAt)live.leaseExpiresAt=Date.parse(result.task.leaseExpiresAt);
-          }
-        } catch (error) {
-          // Version drift (a concurrent write bumped the task) must not kill the
-          // lease: re-read the task and resync the proof. End it only when the
-          // lease is genuinely dead — wrong holder, wrong delivery, or expired.
-          if (this.claims.get(instId) !== live) return;
-          try {
-            const cred = await this.credentialFor(instId);
-            const task = await this.deps.core.getTask(cred, live.taskId);
-            if (this.claims.get(instId) === live && task.currentEmployee === instId && task.deliveryId === live.proof.deliveryId
-                && (!task.leaseExpiresAt || Date.parse(task.leaseExpiresAt) > Date.now())) {
-              live.proof.expectedVersion = task.version;
-              live.proof.fence = task.fence;
-              if(task.leaseExpiresAt)live.leaseExpiresAt=Date.parse(task.leaseExpiresAt);
-              this.log(`heartbeat ${instId} resynced after: ${(error as Error).message}`);
-              return;
-            }
-          } catch { /* getTask failed too — the lease is gone */ }
-          this.log(`heartbeat ${instId} failed: ${(error as Error).message}`);
-          if (this.claims.get(instId) === live) this.endLease(instId);
-        }
-      })();
+      if (!this.claims.has(instId)) { this.stopBeat(instId); return; }
+      void this.renewCurrent(instId);
     }, this.deps.heartbeatMs ?? HEARTBEAT_MS);
-    if (typeof beat === "object" && "unref" in beat) beat.unref();
+    if (typeof beat === 'object' && 'unref' in beat) beat.unref();
     this.beats.set(instId, beat);
   }
 
@@ -842,10 +1006,25 @@ export class SidecarPool {
     const media = this.deps.media;
     const browser = this.deps.browser;
     const sync = this.deps.sync;
-    if (tool === "__list__") return { tools: [...BASE_TOOLS, ...(ops?.tools ?? []), ...(media?.tools ?? []), ...(browser?.tools ?? []), ...(sync?.tools ?? [])] };
+    const lifecycleTools = new Set(['checkpoint', 'submit', 'review', 'report_blocker', 'heartbeat', 'create_task', 'resume_task', 'retire_task']);
+    if (this.journal && lifecycleTools.has(tool)) {
+      const current = this.claims.get(instId);
+      if (!current || current !== requestLease) return { managedBy: 'runner', message: '执行端负责保存和处理本轮结果，请直接输出工作结论并结束本轮。' };
+      if (tool === 'checkpoint' || tool === 'heartbeat') return { recorded: true, managedBy: 'runner' };
+      if (['create_task', 'resume_task', 'retire_task'].includes(tool)) return { managedBy: 'runner', message: '任务推进由执行端管理；请在工作结论中说明后续建议。' };
+      // Compatibility for an already-running old prompt. This stores business output only.
+      const value = { summary: String(args.text ?? ''), ...(tool === 'review' ? { review: args.decision } : {}),
+        ...(tool === 'report_blocker' ? { outcome: 'blocked' } : {}), ...((args.sha ?? (args.acceptance as {sha?:string} | undefined)?.sha) ? { sha: args.sha ?? (args.acceptance as {sha?:string}).sha } : {}) };
+      writeFileAtomic(join(this.commDirFor(instId), 'result.json'), JSON.stringify(value));
+      return { recorded: true, managedBy: 'runner', message: '工作结果已保存，结束本轮即可，执行端自动处理。' };
+    }
+    if (tool === "__list__") return { tools: [...BASE_TOOLS.filter(tool => !this.journal || !lifecycleTools.has(tool)), ...(ops?.tools ?? []), ...(media?.tools ?? []), ...(browser?.tools ?? []), ...(sync?.tools ?? [])] };
     if (tool === "heartbeat") return { ok: true }; // the sidecar owns keepalive
     if (tool === "claim_next") throw Object.assign(new Error("任务由调度通道代领，无需手动 claim"), { code: "forbidden" });
     // 云端路由（只在注入 cloud 时启用）：先核对租约，再去换令牌；无租约直接拒绝，不碰身份服务。
+    if (this.journal && tool === 'company_cmd' && (LIFECYCLE_COMMANDS as readonly string[]).includes(String(args.command))) {
+      return { managedBy: 'runner', message: '任务状态和派工由执行端处理，请在工作结果中说明需要的调整。' };
+    }
     const cloud = this.deps.cloud;
     if (cloud && routesToGateway(tool)) {
       const claim = this.claims.get(instId);
@@ -1148,6 +1327,7 @@ export class SidecarPool {
   /** Stops this pool's sweeper and keepalives, as a process exit would. A replacement pool over the same run
    *  directory must be the only one answering it, so a restarted pool closes its predecessor first. */
   close(): void {
+    this.closed = true;
     for (const instId of [...this.beats.keys()]) this.stopBeat(instId);
     if (this.sweeper) clearInterval(this.sweeper);
     this.sweeper = undefined;

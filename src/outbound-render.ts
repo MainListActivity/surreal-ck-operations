@@ -18,18 +18,15 @@ export const DEFAULT_MACHINE_CRITERION = 'AC-BASE-DEPLOY-1';
 
 /** 表里保存短正文；派工时 renderMessage 才补上真实路径、工具绝对路径与任务 ID。 */
 const NOTES = `先读 notes.md。`;
-/** A session that stays in its turn after handing in burns tokens and cannot be woken for its own rework. */
-const END_TURN = `提交后结束本轮，不要等结果；被退回时系统会再通知你。`;
-const LEARNED = `多数任务不需要写笔记；只有今后同职能的任务都用得上的要求、方法或坑，才加 learned 数组（最多 5 条，每条一行，不写本次任务的内容）；被退回那一轮写的笔记不会生效。`;
-/** 老板端的运维与管理命令都经 company_cmd 调用：网关按身份与当前租约判定，全部审计，老板可以随时停用或限制。 */
-const COMPANY = `老板端全部运维与管理操作都通过 sck call company_cmd 调用（参数 {"command":"<命令名>","input":{}}），先用 sck call company_cmd_catalog 查可用命令；只能在持有任务时调用；所有调用会审计，老板可以随时停用或限制你。`;
-/** 员工沙箱不能安装，也读不到生产控制台令牌：自验在最终提交上做，安装到生产由老板侧完成（合入 main 后由 CI 发布，各节点的更新器自动升级，员工不参与）。 */
-const EXECUTE_CODE = `${NOTES}实现 task.md 中的需求，在最终提交上按验收标准逐条自验，合入 main 后：sck call submit '{"text":"<结果>","sha":"<合入提交>"}'。安装到生产由老板侧完成，你不要安装。需要后续任务时在 submit 里加 next 数组。${COMPANY}${LEARNED}${END_TURN}`;
-const EXECUTE_PLAIN = `${NOTES}完成 task.md 中的需求，按验收标准自验后：sck call submit '{"text":"<结果>"}'。需要后续任务时在 submit 里加 next 数组。${COMPANY}${LEARNED}${END_TURN}`;
-/** 第 1 条写的是老板视角的结果：不成立就没必要再读其余标准；软件线只在最终合入提交上核对。 */
-const REVIEW_FIRST = `先查验收标准第 1 条：这一条写的是老板视角的结果，不成立就直接退回，其余各条不用再看；成立后再逐条复验其余标准。`;
-const REVIEW = `${NOTES}按 task.md 的验收标准复验。${REVIEW_FIRST}sck call review '{"decision":"accept|return","text":"<结论>"}'。${COMPANY}${LEARNED}提交后结束本轮。`;
-const REVIEW_CODE = `${NOTES}按 task.md 的验收标准复验。${REVIEW_FIRST}代码任务在最终合入提交上核对，不检查生产加载的版本。sck call review '{"decision":"accept|return","text":"<结论>"}'。${COMPANY}${LEARNED}提交后结束本轮。`;
+/** 工作结果是业务输出；任务生命周期由执行端接管。 */
+const END_TURN = `完成后直接给出最终答复：完成情况、验证结果和产物位置，然后结束本轮。执行端自动保存并送审。`;
+const COMPANY = `需要账号、登录态、带登录链接或远程执行工具时，用 sck call company_cmd_catalog 查询可用工作能力。`;
+const RESULT = `遇到实际前置缺口，最终答复首行写“工作结果：受阻”并说明缺少什么。`;
+const EXECUTE_CODE = `${NOTES}实现 task.md 中的需求，在最终提交上按验收标准逐条自验。最终答复用单独一行“提交：<完整40位SHA>”标明被验证的提交。${COMPANY}${RESULT}${END_TURN}`;
+const EXECUTE_PLAIN = `${NOTES}完成 task.md 中的需求，按验收标准自验。${COMPANY}${RESULT}${END_TURN}`;
+const REVIEW_FIRST = `先查验收标准第 1 条（老板视角的结果）；不成立就说明原因并退回，成立后再逐条复验其余标准。`;
+const REVIEW = `${NOTES}按 task.md 的验收标准独立复验。${REVIEW_FIRST}最终答复首行写“复核结论：通过”或“复核结论：退回”，正文给出逐条证据和发现。${COMPANY}${RESULT}结束本轮，执行端自动记录评审结果。`;
+const REVIEW_CODE = REVIEW.replace('按 task.md 的验收标准独立复验。', '按 task.md 的验收标准独立复验，代码任务在最终合入提交上核对。');
 const REWORK_CODE = `修复 findings/round-NN.md 中的问题后，` + EXECUTE_CODE;
 const REWORK_PLAIN = `修复 findings/round-NN.md 中的问题后，` + EXECUTE_PLAIN;
 const NUDGE = (phase: string) => phase === 'review' ? REVIEW : EXECUTE_PLAIN;

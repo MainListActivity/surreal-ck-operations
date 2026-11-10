@@ -56,7 +56,7 @@ const runtime = new NativeRuntime({ root: join(serviceHome(), 'native', hostId),
     const inherited = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
     return { ...inherited, ...scrubEnv(channel), ...SANDBOX_MARKER, ...modelEnv, PASEO_AGENT_ID: "", ZDOTDIR: zdotdir };
   },
-  onStarted: session => { void bus.emit('agent.turn_started', { agent: session }).catch(() => console.warn('回合开始事件处理失败')); },
+  onStarted: session => { void bus.emit('agent.turn_started', { agent: session, turnId: session.turnId }).catch(() => console.warn('回合开始事件处理失败')); },
   onEnded: event => bus.emit('agent.turn_ended', event),
 });
 const host: RuntimeHost = {
@@ -77,6 +77,7 @@ let stop: import('./dispatch.ts').RunnerControl | undefined;
 try {
   const ctx = await company();
   stop = startDispatch(bus);
+  await runtime.recoverFinishedTurns();
   console.log(`原生执行端 ${hostId} 已启动；支持 ${Object.keys(config.commands).join(', ')}`);
   await new Promise<void>(resolve => { process.once('SIGTERM', resolve); process.once('SIGINT', resolve); });
   stop();
