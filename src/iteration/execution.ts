@@ -23,7 +23,7 @@ export async function deployedSha(db: Surreal, task: TaskRow): Promise<string | 
 export async function reconcileIterations(db: Surreal, host: ExecutionHost, now = Date.now()): Promise<{ advanced: number; failed: number }> {
   const result = { advanced: 0, failed: 0 };
   const [requirements] = await db.query<[Array<{ id: RecordId; approved_revision: number }>]>(
-    `SELECT * FROM product_requirement WHERE state IN ['queued','implementing','release_pending'] AND (execution_until=NONE OR execution_until < $now)
+    `SELECT * FROM product_requirement WHERE project IN (SELECT VALUE project FROM product_iteration WHERE enabled=true) AND planned=true AND state IN ['queued','implementing','release_pending'] AND (execution_until=NONE OR execution_until < $now)
       ORDER BY updated_at LIMIT 5;`, { now });
   for (const row of requirements) {
     const requirement = String(row.id.id), revision = row.approved_revision;
@@ -121,7 +121,7 @@ export async function reconcileIterations(db: Surreal, host: ExecutionHost, now 
       await db.query('UPDATE $id SET execution_error=$note WHERE execution_claim=$claim;', { id: row.id, claim, note });
       result.failed++;
     } finally {
-      await db.query('UPDATE $id SET execution_until=$until, execution_busy=false WHERE execution_claim=$claim;', { id: row.id, claim, until: now + 30000 });
+      await db.query('UPDATE $id SET execution_until=$until, execution_busy=false, updated_at=time::now() WHERE execution_claim=$claim;', { id: row.id, claim, until: now + 30000 });
     }
   }
   return result;

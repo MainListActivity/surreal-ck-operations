@@ -216,3 +216,19 @@ run('页面展示的发布策略发生变化时拒绝确认，员工不能伪造
   expect(results.every(r=>r.status==='fulfilled')).toBe(true);
   const [approvals]=await db.query<[unknown[]]>('SELECT * FROM requirement_approval WHERE requirement=$id;',{id:req.id});expect(approvals).toHaveLength(1);
 });
+
+run('停用产品不占住反馈整理与需求规划的扫描名额',async()=>{
+  const {receiveFeedback}=await import('../src/iteration/feedback.ts');
+  const {triageFeedback}=await import('../src/iteration/triage.ts');
+  const {planRequirements}=await import('../src/iteration/planning.ts');
+  await db.query("UPDATE product_requirement SET state='paused' WHERE state='queued'; UPDATE product_feedback SET state='dismissed' WHERE state='new'; CREATE project:disabled CONTENT {name:'停用测试'};");
+  await store.configure('disabled',{enabled:true,autoRelease:false,feedbackOrigins:['https://disabled.example']},'owner');
+  const disabled=await store.create({...content,project:'disabled',priority:0},'owner');await store.approve(disabled.id,1,'owner');
+  for(let i=0;i<3;i++)await receiveFeedback(db,'disabled','https://disabled.example','192.0.2.8',{requestKey:`disabled-feedback-${i}`,text:'停用产品反馈'});
+  await store.configure('disabled',{enabled:false,autoRelease:false,feedbackOrigins:[]},'owner');
+  await store.configure('sample',{enabled:true,autoRelease:false,feedbackOrigins:['https://sample.example']},'owner');
+  const enabled=await store.create(content,'owner');await store.approve(enabled.id,1,'owner');
+  const planning=await planRequirements(db,async approval=>{expect(approval.requirement).toBe(enabled.id);return {steps:[{title:'实施需求',context:'实现需求并完成测试',acceptance:'符合验收标准'}]};});expect(planning.planned).toBe(1);
+  await receiveFeedback(db,'sample','https://sample.example','192.0.2.8',{requestKey:'enabled-feedback-001',text:'启用产品反馈'});
+  const triage=await triageFeedback(db,async input=>{expect(input.feedback.text).toBe('启用产品反馈');return {disposition:'dismiss',category:'noise',reason:'测试反馈'};});expect(triage.dismissed).toBe(1);
+});

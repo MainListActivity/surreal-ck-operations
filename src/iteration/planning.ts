@@ -25,7 +25,7 @@ export async function planRequirements(db: Surreal, plan: PlanRequirement, now =
   const result = { planned: 0, failed: 0 };
   await db.query(`UPDATE product_requirement SET planning_error='规划重试次数已用尽，请检查后重试' WHERE state='queued' AND planning_attempts >= 3 AND planning_until < $now;`, { now });
   const [rows] = await db.query<[Array<{ id: RecordId; project: string; approved_revision: number }>]>(
-    `SELECT * FROM product_requirement WHERE state='queued' AND planned != true AND (planning_attempts ?? 0) < 3
+    `SELECT * FROM product_requirement WHERE project IN (SELECT VALUE project FROM product_iteration WHERE enabled=true) AND state='queued' AND planned != true AND (planning_attempts ?? 0) < 3
       AND (planning_until = NONE OR planning_until < $now) ORDER BY priority, updated_at LIMIT 1;`, { now });
   for (const row of rows) {
     if (!(await new Requirements(db).policy(row.project))?.enabled) continue;

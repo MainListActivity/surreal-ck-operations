@@ -80,8 +80,8 @@ export class Requirements {
   async configure(project: string, input: Record<string, unknown>, actor: string): Promise<ProductPolicy> {
     await this.project(project);
     const policy = productPolicy(input);
-    await this.db.query('UPSERT $id CONTENT { project: $project, policy: $policy, actor: $actor, updated_at: time::now() };',
-      { id: new RecordId('product_iteration', project), project, policy: JSON.stringify(policy), actor });
+    await this.db.query('UPSERT $id CONTENT { project: $project, enabled: $enabled, policy: $policy, actor: $actor, updated_at: time::now() };',
+      { id: new RecordId('product_iteration', project), project, enabled:policy.enabled, policy: JSON.stringify(policy), actor });
     return policy;
   }
   async policy(project: string): Promise<ProductPolicy | undefined> {

@@ -29,7 +29,7 @@ export async function triageFeedback(db:Surreal,classify:ClassifyFeedback,now=Da
   const result={linked:0,dismissed:0,failed:0};
   await db.query(`UPDATE product_feedback SET state='failed', last_error='整理重试次数已用尽，请人工检查或重试', updated_at=time::now() WHERE state='processing' AND lease_until < $now AND attempts >= 3;`,{now});
   const [pending]=await db.query<[Array<{id:RecordId;project:string;body:string}>]>(
-    `SELECT * FROM product_feedback WHERE (state = 'new' OR (state = 'processing' AND lease_until < $now)) AND attempts < 3 ORDER BY created_at LIMIT 3;`,{now});
+    `SELECT * FROM product_feedback WHERE project IN (SELECT VALUE project FROM product_iteration WHERE enabled=true) AND (state = 'new' OR (state = 'processing' AND lease_until < $now)) AND attempts < 3 ORDER BY created_at LIMIT 3;`,{now});
   for(const feedback of pending){
     if(!(await new Requirements(db).policy(feedback.project))?.enabled)continue;
     const claimToken=crypto.randomUUID();
