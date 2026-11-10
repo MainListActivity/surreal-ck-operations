@@ -14,7 +14,7 @@ test('独立服务离线安装支持含空格和引号的路径，不改变路�
     for(const platform of ['darwin','linux']){
       const path=installNativeService({home,userHome:home,id:'fixture',config,platform,load:false});
       const text=readFileSync(path,'utf8');expect(text).not.toContain('StartInterval');expect(text).not.toContain('[Timer]');
-      execFileSync('/bin/sh',['-n',join(home,'native/fixture/run.sh')]);
+      execFileSync('/bin/sh',['-n',join(home,'bin/native-fixture.sh')]);
     }
     expect(existsSync(join(home,'private/runtime-routes.json'))).toBe(false);
     expect(()=>installNativeService({home,userHome:home,id:'../bad',config,platform:'darwin',load:false})).toThrow();

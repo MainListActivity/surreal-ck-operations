@@ -16,7 +16,8 @@ export function installNativeService(options: {home: string; userHome: string; i
     if (!existsSync(path)) throw new Error(`已安装的发行文件缺失：${path}`);
   const dir = join(home,'native',id); mkdirSync(dir,{recursive:true,mode:0o700});
   mkdirSync(join(home,'logs'),{recursive:true,mode:0o700});
-  const launcher = join(dir,'run.sh');
+  // The employee sandbox forbids writes to bin; launchd must never execute an employee-writable file.
+  const launcher = join(home,'bin',`native-${id}.sh`);
   writeFileSync(launcher, `#!/bin/sh\nset -eu\nexport SCK_SERVICE_HOME=${quote(home)}\nexport SCK_RUNNER_ID=${quote(id)}\nexport SCK_NATIVE_CONFIG=${quote(config)}\nexport SCK_NATIVE_FOLLOW_CURRENT=1\nexport PATH=${quote(join(userHome,'.local/bin') + ':' + join(userHome,'.bun/bin') + ':/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin')}\n. ${quote(join(home,'bin/bun-runtime.sh'))}\nresolve_bun "$SCK_SERVICE_HOME"\ncd "$SCK_SERVICE_HOME/current"\nexec "$BUN" "$SCK_SERVICE_HOME/current/server/vendor/src/runner/run.ts"\n`, {mode:0o700});
   if (platform === 'darwin') {
     const label = `org.surrealck.native.${id}`;
