@@ -9,9 +9,9 @@
 | 员工通道 | Paseo 插件内 `plugin/server/sidecar.ts`（每实例一个） | 代持实例凭证、代领任务、自动续租、relay `sck call`、回收 `report.md`/`blocker.md` 为提交/阻塞；把 `ops_*` 转给运维代理。架构与排障详见 [sidecar 通道](sidecar-channel.md) |
 | 运维代理 | Paseo 插件内 `src/ops/`（`OpsBroker`，由通道调用） | 持有密封凭证与 Cloudflare/IdP 权限，替员工建账号、建 workspace、管成员、登录、调产品接口、查 workspace 数据、给浏览器登录；员工只拿会话句柄，见下文「运维代理」 |
 | 员工 | Paseo 会话 | 按 [协议](../agents/PROTOCOL.md) 执行、写 `.sck` 交付物；进程内无任何凭证，环境里的凭证变量在 spawn 前被清空 |
-| 数据 | 云端公司库 SurrealDB（`sck_agent_company/control_plane`），节点不执行迁移 | 唯一事实来源；可选的本机库与备份见 [节点运维手册](company-service-operations.md#数据库与云端迁移) |
+| 数据 | 云端公司库 SurrealDB（生产默认 `company/main`），节点不执行迁移 | 唯一事实来源；0.7.1 起没有本机公司库与备份，见 [节点运维手册](company-service-operations.md#数据库与云端迁移) |
 
-公司库位于云端 SurrealDB，节点连接它的方式见 [company-upgrades.md](company-upgrades.md)。可选的本机库的凭证在 `private/company-db.env`（`scripts/company-db.sh install` 生成，测试环境不隐式读取）。产品数据仍在 129，由产品 `.env` 描述。本机库的备份由 `scripts/company-backup.ts` 完成：zstd 压缩，单文件超过 20MB 拒传并发老板通知，R2 上保留 2 份小时备份加若干每日备份，总量不超过 40MB；`verify` 把最新备份恢复到临时内存库核对行数。运营流水按 `src/data-retention.ts` 的保留期由插件生命周期清理删除。
+公司库只在云端 SurrealDB，节点连接它的方式见 [company-upgrades.md](company-upgrades.md)。`private/company-db.env` 只放云端字段（`COMPANY_DB_URL` 等）；缺少 `COMPANY_DB_URL` 时插件与节点更新器拒绝启动，不回落到本机。产品数据仍在 129，由产品 `.env` 描述。运营流水按 `src/data-retention.ts` 的保留期由插件生命周期清理删除。
 
 服务目录：`~/Library/Application Support/SurrealCKCompany/`，布局与安装见 [节点运维手册](company-service-operations.md)。节点上只有 Paseo 插件 `sck-company`（调度器、员工通道、运维代理与老板接口都在插件里）和节点更新器。节点上的插件版本由节点更新器按 Release 切换（见 [company-upgrades.md](company-upgrades.md)），不要手工 `plugin install` 或 `reload` 来升级。本机调试改了 `plugin/` 或 `src/` 时，可用 `$PASEO_CLI plugin reload sck-company` 重载（不要重启 Paseo 守护进程）；开发树登记会被节点更新器拒绝切换，调试结束后执行 `paseo plugin remove sck-company`，再运行 `sh scripts/node-updater.sh run` 重新登记发行版本；**不要再装 launchd 的 dispatcher**，调度器已在插件内，否则会和插件重复派工。服务依赖本机 Paseo、云端公司库、网络与 GitHub 登录；Mac 合盖或关机时公司暂停。
 
@@ -34,7 +34,7 @@
    pnpm run company cost [任务ID] [--days N]
    ```
 
-2. **直接写 SurrealDB**（`sck_agent_company/control_plane`）：
+2. **直接写 SurrealDB**（云端公司库，生产默认 `company/main`）：
 
    ```sql
    CREATE owner_command CONTENT { kind: 'task.create', type: 'software', text: '我要一个 B2C 商城' };

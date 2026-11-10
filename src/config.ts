@@ -12,7 +12,7 @@ export interface DatabaseConfig {
   companyJwksUrl?: string;
   /** 公司库 JWT 访问（055）：令牌 iss 必须等于它。 */
   companyIssuer?: string;
-  /** 云端执行端（COMPANY_DB_URL 配置时）：令牌模式登录；没有它就是本机 root 模式。 */
+  /** 云端执行端：令牌模式登录。生产路径必定有它；只有测试的 root 连接没有。 */
   cloud?: CloudConfig;
 }
 
@@ -44,10 +44,8 @@ function readProductEnv(): Record<string, string> {
 }
 
 /**
- * The company's own database (`private/company-db.env`: SURREAL_URL / SURREAL_ROOT_USER / SURREAL_ROOT_PASS) once the
- * control plane runs on this Mac; it wins over the product .env, which keeps describing the product's server. Tests never
- * pick it up implicitly: its URL is local, so the non-local guard below would not stop a stray `bun test` from writing
- * into the live company database.
+ * 服务目录的 private/company-db.env 只放云端字段（COMPANY_DB_URL、IDP_ISSUER、RUNNER_CLIENT_ID 等），优先于产品 .env。
+ * 测试从不隐式读取它：里面的 COMPANY_DB_URL 指向生产云端，stray `bun test` 不能借它连上生产库。
  */
 function readCompanyEnv(): Record<string, string> {
   const explicit = process.env.SCK_COMPANY_DB_ENV;
@@ -81,6 +79,21 @@ function readEnvFile(path: string, required: boolean): Record<string, string> {
   return values;
 }
 
+/** 生产没有 COMPANY_DB_URL：拒绝启动并说明原因。本机库已停用，不回落到 SURREAL_URL 或本机 root 账号。 */
+function missingCloudUrl(): Error {
+  return new Error(
+    '未配置 COMPANY_DB_URL，拒绝启动：公司库只连接云端，本机公司库已停用，不回落到 SURREAL_URL。' +
+    `请在环境变量或 ${join(serviceHome(), 'private/company-db.env')} 中设置云端公司库地址。`,
+  );
+}
+
+/** 测试的根连接只认环境变量：scripts/test-worktrees.ts 自起的临时 fork 经此传入，不读服务目录与产品 .env。 */
+function testRootEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing ${name}`);
+  return value;
+}
+
 export function loadDatabaseConfig(): DatabaseConfig {
   const fromFile = readProductEnv();
   const company = readCompanyEnv();
@@ -90,20 +103,22 @@ export function loadDatabaseConfig(): DatabaseConfig {
     if (!value) throw new Error(`Missing ${name}`);
     return value;
   };
-  // 云端执行端：COMPANY_DB_URL 存在即走令牌模式，命名空间与库来自 COMPANY_NS / COMPANY_DB（默认 company / main）。
-  // 测试进程只认环境变量里显式给的云端地址：服务目录 company-db.env 里的 COMPANY_DB_URL 是生产执行端用的，
-  // 测试运行器把 SURREAL_URL 指向临时 fork，不能被它盖过（否则 fork 测试全部被拒）。
-  const cloudUrl = process.env.NODE_ENV === 'test' ? process.env.COMPANY_DB_URL || undefined : lookup('COMPANY_DB_URL');
+  const testing = process.env.NODE_ENV === 'test';
+  // 云端执行端：COMPANY_DB_URL 即令牌模式，命名空间与库来自 COMPANY_NS / COMPANY_DB（默认 company / main）。
+  // 生产只连云端：没有它就拒绝启动。测试进程只认环境变量里显式给的云端地址：服务目录 company-db.env 里的
+  // COMPANY_DB_URL 是生产执行端用的，测试运行器把 SURREAL_URL 指向临时 fork，不能被它盖过（否则 fork 测试全部被拒）。
+  const cloudUrl = testing ? process.env.COMPANY_DB_URL || undefined : lookup('COMPANY_DB_URL');
+  if (!cloudUrl && !testing) throw missingCloudUrl();
   const cloud = !!cloudUrl;
   const namespace = cloud ? lookup('COMPANY_NS') ?? 'company' : process.env.SCK_COMPANY_NS ?? 'sck_agent_company';
   const database = cloud ? lookup('COMPANY_DB') ?? 'main' : process.env.SCK_COMPANY_DB ?? 'control_plane';
   if (!/^[a-z][a-z0-9_]{2,62}$/.test(namespace) || !/^[a-z][a-z0-9_]{2,62}$/.test(database)) {
     throw new Error('Invalid company namespace/database name');
   }
-  const url = cloud ? cloudUrl! : get('SURREAL_URL');
+  const url = cloud ? cloudUrl! : testRootEnv('SURREAL_URL');
   // `bun test` loads the product .env by default, which points at the production SurrealDB server.
   // Tests must run on a local fork instead (bun scripts/test-worktrees.ts [files]).
-  if (process.env.NODE_ENV === 'test' && !/^wss?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(url)) {
+  if (testing && !/^wss?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(url)) {
     throw new Error(`Refusing to run tests against a non-local database (${url.replace(/\/\/.*@/, '//')}); run them with: bun scripts/test-worktrees.ts <tests/file.test.ts>`);
   }
   if (cloud) {
@@ -129,10 +144,11 @@ export function loadDatabaseConfig(): DatabaseConfig {
       },
     };
   }
+  // 没有云端地址只可能是测试：根连接来自环境变量（见 testRootEnv）。
   return {
     url,
-    rootUser: get('SURREAL_ROOT_USER'),
-    rootPassword: get('SURREAL_ROOT_PASS'),
+    rootUser: testRootEnv('SURREAL_ROOT_USER'),
+    rootPassword: testRootEnv('SURREAL_ROOT_PASS'),
     namespace,
     database,
     companyJwksUrl: lookup('COMPANY_JWKS_URL'),

@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, expect, setDefaultTimeout, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
 import { loadDatabaseConfig } from '../src/config.ts';
 import { CompanyDatabase } from '../src/database.ts';
@@ -362,23 +364,32 @@ test('real DB: retire_task voids work, unblocks dependents, idempotent, releases
   }
 });
 
-test('real DB: 0.7.0 writes no outbox rows, and the outbox table stays until the next release drops it', async () => {
-  // 001 and 002 still define the outbox table. Nothing in 0.7.0 writes to it, so task writes leave its row count unchanged.
-  const count = async (): Promise<number> => {
-    const [rows] = await database.db.query<[Array<{ count: number }>]>('SELECT count() AS count FROM outbox GROUP ALL;');
-    return rows[0]?.count ?? 0;
-  };
-  const before = await count();
+test('real DB: bootstrap leaves no outbox table or counter, and task writes do not recreate them', async () => {
+  // bootstrap 每次都按 001–062 应用结构，062 之后库里不该再有 outbox 表与计数器。
   const created = await core.createTask(gm, {
-    title: `Outbox quiet ${suffix}`, context: 'A task write in 0.7.0 leaves the outbox table unchanged.',
-    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `outbox-quiet-${suffix}`,
+    title: `Outbox gone ${suffix}`, context: 'A task write after 0.7.1 must not recreate the outbox table.',
+    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `outbox-gone-${suffix}`,
   });
   const claimant = await enrollment.enroll(`test-outbox-${suffix}`, 'engineering', ['execute', 'review']);
   await core.claim(claimant, created.id);
-  expect(await count()).toBe(before);
   const [info] = await database.db.query<[{ tables: Record<string, unknown> }]>('INFO FOR DB;');
-  expect(Object.keys(info.tables)).toContain('outbox');
-  // The counter stays too: 0.6.1 nodes still take outbox sequence numbers from it.
+  expect(Object.keys(info.tables)).not.toContain('outbox');
   const [counter] = await database.db.query<[unknown]>('SELECT * FROM ONLY company_meta:outbox_counter;');
-  expect(counter).toBeTruthy();
+  expect(counter).toBeFalsy();
+});
+
+test('real DB: 062 drops a leftover 0.7.0 outbox table, its index and counter; rerunning is harmless', async () => {
+  // 0.7.0 库的形状：outbox 表（含一条旧事件）、outbox_sequence 索引、company_meta:outbox_counter。
+  await database.db.query(`DEFINE TABLE IF NOT EXISTS outbox SCHEMALESS PERMISSIONS NONE;
+    DEFINE INDEX IF NOT EXISTS outbox_sequence ON TABLE outbox FIELDS sequence UNIQUE;
+    CREATE outbox CONTENT { at: 1, sequence: 1, kind: 'legacy' };
+    UPSERT company_meta:outbox_counter CONTENT { value: 1 };`);
+  const drop = readFileSync(join(import.meta.dir, '../schema/062-drop-outbox.surql'), 'utf8');
+  await database.db.query(drop);
+  const [info] = await database.db.query<[{ tables: Record<string, unknown> }]>('INFO FOR DB;');
+  expect(Object.keys(info.tables)).not.toContain('outbox');
+  const [counter] = await database.db.query<[unknown]>('SELECT * FROM ONLY company_meta:outbox_counter;');
+  expect(counter).toBeFalsy();
+  // 再执行一次不报错（IF EXISTS 与删除不存在的计数器都是空操作）。
+  await database.db.query(drop);
 });

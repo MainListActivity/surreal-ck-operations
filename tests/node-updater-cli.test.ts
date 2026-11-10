@@ -26,8 +26,26 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
-test('没有云端配置时拒绝运行，不回落到本机库', async () => {
+test('生产没有 COMPANY_DB_URL：拒绝运行并说明原因，不回落到本机库，不进入切换流程', async () => {
   // 本机库配置齐全也不能用来执行升级；127.0.0.1 上没有服务，即使误连也会失败。
+  process.env.SURREAL_URL = 'ws://127.0.0.1:9/rpc';
+  process.env.SURREAL_ROOT_USER = 'root';
+  process.env.SURREAL_ROOT_PASS = 'fixture';
+  const previous = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'production';
+  try {
+    const lines: string[] = [];
+    const code = await main(['run'], { log: line => lines.push(line), env: process.env, home });
+    expect(code).toBe(1);
+    expect(lines.join('\n')).toContain('COMPANY_DB_URL');
+    expect(lines.join('\n')).toContain('未切换');
+  } finally {
+    if (previous === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previous;
+  }
+});
+
+test('测试进程里没有云端配置：节点更新器仍只认云端，拒绝执行', async () => {
   process.env.SURREAL_URL = 'ws://127.0.0.1:9/rpc';
   process.env.SURREAL_ROOT_USER = 'root';
   process.env.SURREAL_ROOT_PASS = 'fixture';
