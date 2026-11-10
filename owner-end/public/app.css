@@ -691,6 +691,8 @@ label.inline input:not([type="checkbox"]), label.inline select { width: auto; }
 .work-context { min-width: 0; }
 .work-context details { margin: 8px 0; }
 .work-context summary { cursor: pointer; font-size: 12px; font-weight: 600; }
+.runtime-host:only-child { grid-column: 1 / -1; }
+.runtime-host:only-child .host-agents { grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); align-items: start; }
 @media (min-width: 1600px) {
   .runtime-hosts { gap: 24px; }
   .host-agents { grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); align-items: start; }
