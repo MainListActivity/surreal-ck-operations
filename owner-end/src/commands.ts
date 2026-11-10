@@ -95,7 +95,7 @@ export function ownerContextOf(db: Surreal): OwnerApiContext {
     db: database,
     core: NO_CORE,
     owner: new OwnerDesk(database),
-    workforce: new Workforce(database, ''),
+    workforce: new Workforce(database),
     messages: new OutboundMessageStore(db),
     opsRepo: '',
   };

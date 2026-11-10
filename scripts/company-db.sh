@@ -5,11 +5,13 @@
 #   org.surrealck.company-db      the database, kept alive by launchd
 #   org.surrealck.company-backup  hourly export → zstd → R2 (scripts/company-backup.ts backup)
 #   org.surrealck.company-verify  weekly restore drill of the newest backup (scripts/company-backup.ts verify)
+# The jobs run from the checkout this script is run in (WorkingDirectory and scripts/company-backup.ts): re-run install after moving it.
 set -eu
 service=${SCK_SERVICE_HOME:-$HOME/Library/Application Support/SurrealCKCompany}
 surreal=${SCK_SURREAL_BIN:-$HOME/.surrealdb/surreal}
 port=${SCK_COMPANY_DB_PORT:-38480}
 agents=$HOME/Library/LaunchAgents
+repo=$(cd "$(dirname "$0")/.." && pwd)
 creds="$service/private/company-db.env"
 
 [ "${1:-}" = install ] || { echo "usage: sh scripts/company-db.sh install" >&2; exit 2; }
@@ -43,7 +45,7 @@ plist() { # plist <label> <schedule xml> <program args xml>
 <plist version="1.0"><dict>
   <key>Label</key><string>$1</string>
   <key>ProgramArguments</key><array>$3</array>
-  <key>WorkingDirectory</key><string>$service/active</string>
+  <key>WorkingDirectory</key><string>$repo</string>
   $2
   <key>StandardOutPath</key><string>$service/logs/$1.log</string>
   <key>StandardErrorPath</key><string>$service/logs/$1.log</string>
@@ -54,7 +56,7 @@ EOF
   launchctl bootstrap "gui/$(id -u)" "$agents/$1.plist"
 }
 bun="$service/runtime-bun/bin/bun"
-backup="$service/active/scripts/company-backup.ts"
+backup="$repo/scripts/company-backup.ts"
 plist org.surrealck.company-db '<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>' "<string>$service/bin/company-db</string>"
 for n in $(seq 1 100); do curl -sf "http://127.0.0.1:$port/health" >/dev/null && break; sleep 0.2; done
 curl -sf "http://127.0.0.1:$port/health" >/dev/null || { echo "company db did not come up on 127.0.0.1:$port" >&2; exit 1; }

@@ -9,17 +9,13 @@ import { CompanyDatabase } from '../src/database.ts';
 import { CompanyError, SurrealCompanyCore, asId, id } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
-import { ProjectStore } from '../src/projects.ts';
 import { ensureCommDirs, reqDir, resDir, writeFileAtomic } from '../src/comm.ts';
-import type { HistoryEntry, TaskTextField, TaskTextSegment, TaskView } from '../src/contracts.ts';
+import type { HistoryEntry, TaskTextField, TaskView } from '../src/contracts.ts';
 import type { EmployeeInst } from '../src/workforce.ts';
 import { queryDigest } from '../src/query-input.ts';
-import { RESPONSE_BUDGET_BYTES, answerBytes, guardRelayResponse, sealCursor, type ClaimEcho } from '../src/response-budget.ts';
+import { RESPONSE_BUDGET_BYTES, answerBytes, guardRelayResponse, sealCursor } from '../src/response-budget.ts';
 import { SnapshotStore } from '../src/snapshot-store.ts';
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
-import { connectCompanyClient } from '../src/mcp/client';
-import { createMcpHttpService } from '../src/mcp/server';
-import { countingFetch, lastBody } from './support/mcp-wire.ts';
 
 // SYS01 bounded reads on the isolated company fork started by scripts/test-worktrees.ts. Never production.
 const config = { ...loadDatabaseConfig(), namespace: 'sck_agent_company_test', database: 'control_plane' };
@@ -138,7 +134,7 @@ async function reassemble(args: { taskId: string; field: TaskTextField; auditId?
  * same guard the sidecar uses, and the client prints what it received. Only the sidecar's core call is stubbed.
  */
 async function relay(tool: string, args: Record<string, unknown>, answer: (input: Record<string, unknown>) => Promise<unknown>, dir = newCommDir()) {
-  const child = Bun.spawn([process.execPath, join(ROOT, 'src/mcp/client-cli.ts'), 'call', tool, JSON.stringify(args)], {
+  const child = Bun.spawn([process.execPath, join(ROOT, 'src/sck-cli.ts'), 'call', tool, JSON.stringify(args)], {
     cwd: ROOT, stdout: 'pipe', stderr: 'pipe',
     env: { ...process.env, SCK_COMM_DIR: dir, SCK_COMM_KEY: 'sys01-relay-key' },
   });
@@ -178,7 +174,7 @@ function newCommDir(): string {
  * before any answer is read, and the answer lands in the comm directory with nobody waiting for it.
  */
 async function relayAndDrop(dir: string, tool: string, args: Record<string, unknown>, answer: (input: Record<string, unknown>) => Promise<unknown>) {
-  const child = Bun.spawn([process.execPath, join(ROOT, 'src/mcp/client-cli.ts'), 'call', tool, JSON.stringify(args)], {
+  const child = Bun.spawn([process.execPath, join(ROOT, 'src/sck-cli.ts'), 'call', tool, JSON.stringify(args)], {
     cwd: ROOT, stdout: 'pipe', stderr: 'pipe',
     env: { ...process.env, SCK_COMM_DIR: dir, SCK_COMM_KEY: 'sys01-relay-key' },
   });
@@ -699,18 +695,18 @@ test('invalid arguments are refused before any query runs', async () => {
   await expectRefused(core.taskText(gm, { taskId: 'missing', field: 'context', limit: 999_999 }), 'invalid', /limit/);
 });
 
-test('reads add no task, audit or outbox state; the only new rows are stored listings and the cursor secret (RB01)', async () => {
+test('reads add no task or audit state; the only new rows are stored listings and the cursor secret (RB01)', async () => {
   const listingIds = async () => {
     const [rows] = await database.db.query<[Array<{ id: RecordId }>]>('SELECT id FROM query_snapshot;');
     return (rows ?? []).map(row => String(row.id.id));
   };
-  const before = { task: await countRows('task'), audit: await countRows('audit'), outbox: await countRows('outbox') };
+  const before = { task: await countRows('task'), audit: await countRows('audit') };
   const listingsBefore = await listingIds();
   await core.contextView(gm, { tag: goalId, pageSize: 10 });
   await core.historyView(gm, expectedWorking[0]!, { pageSize: 5 });
   await core.adminSummary(gm, { tag: goalId });
   const emptyWorktrees = await core.worktreePage(gm, { pageSize: 5 });
-  const after = { task: await countRows('task'), audit: await countRows('audit'), outbox: await countRows('outbox') };
+  const after = { task: await countRows('task'), audit: await countRows('audit') };
   expect(after).toEqual(before);
   // Each non-empty paged first page stored exactly one listing; the worktree registry is empty in this fixture, and an empty
   // first page stores nothing at all (SYS01 AC02 production return). The per-identity cap may evict older listings of the same
@@ -1189,40 +1185,6 @@ test('the cut worktree and its references read back through the real sidecar cha
   }
 });
 
-test('read_worktree_refs over MCP: a cut worktree reassembles in segments, and each whole MCP response stays within 48 KiB (SYS01 R1)', async () => {
-  const { views, shared, fullText } = longReferences('r1');
-  const original = core.listWorktrees;
-  core.listWorktrees = async () => views as never;
-  const session = await mcpSession(gm);
-  try {
-    const pieces: string[] = [];
-    let offset: number | null = 0;
-    let pinned: string | undefined;
-    while (offset !== null) {
-      const answer = await session.client.callTool({
-        name: 'read_worktree_refs',
-        arguments: { worktreePath: shared.worktreePath, includeReleased: true, offset, limit: 16 * 1024, ...(pinned ? { expectSha256: pinned } : {}) },
-      });
-      expect(answer.structuredContent).toMatchObject({ ok: true });
-      expect(lastBody(session)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-      const segment = (answer.structuredContent as { data: { sha256: string; text: string; nextOffset: number | null } }).data;
-      expect(segment.sha256).toBe(sha256(fullText));
-      pinned = segment.sha256;
-      pieces.push(segment.text);
-      offset = segment.nextOffset;
-    }
-    expect(pieces.join('')).toBe(fullText);
-    const listed = await session.client.callTool({ name: 'list_worktrees', arguments: { pageSize: 1, includeReleased: true } });
-    expect(listed.structuredContent).toMatchObject({ ok: true });
-    expect(lastBody(session)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    const page = (listed.structuredContent as { data: { worktrees: Array<{ referencesTruncated?: unknown }> } }).data;
-    expect(page.worktrees).toHaveLength(1);
-  } finally {
-    core.listWorktrees = original;
-    await session.close();
-  }
-});
-
 test('concurrent traversals with writers: each listing is delivered exactly once, with no duplicate and no miss, and each row shows its state at the listing (C4)', async () => {
   const concurrent = await core.createTask(gm, { title: `并发目标 ${suffix}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('goal-conc') });
   for (let i = 0; i < 120; i++) {
@@ -1276,7 +1238,7 @@ test('the real sidecar and comm client carry a traversal and the legacy answers,
     const pool = new SidecarPool({ core, workforce: { rotate: async () => gm } as unknown as SidecarDeps['workforce'], runDir, sweepMs: 5 });
     const channel = pool.env({ id: `qp-e2e-${suffix}`, credential: gm } as unknown as EmployeeInst);
     const call = async (tool: string, args: Record<string, unknown>) => {
-      const child = Bun.spawn([process.execPath, join(ROOT, 'src/mcp/client-cli.ts'), 'call', tool, JSON.stringify(args)], {
+      const child = Bun.spawn([process.execPath, join(ROOT, 'src/sck-cli.ts'), 'call', tool, JSON.stringify(args)], {
         cwd: ROOT, stdout: 'pipe', stderr: 'pipe',
         env: { ...process.env, SCK_COMM_DIR: channel.SCK_COMM_DIR, SCK_COMM_KEY: channel.SCK_COMM_KEY },
       });
@@ -1403,75 +1365,11 @@ test('a write answers with its task inside the budget: a long context is cut and
   expect(whole.sha256).toBe(sha256(context));
 });
 
-test('claim_next over MCP answers a claim whose context is over the budget: the lease comes back, the context is cut and flagged, and the whole text reassembles (SYS01, defect 1)', async () => {
-  // A claim commits before its answer is built (lease, audit, outbox, claim.json), so the answer must arrive whole, never as response_too_large.
-  const claimant = await enrollment.enroll(`qp-claim-${suffix}`, 'engineering', ['execute', 'review']);
-  const context = `认领回显 ${suffix} ` + '中'.repeat(19_000);
-  expect(utf8(context)).toBeGreaterThan(RESPONSE_BUDGET_BYTES);
-  const task = await core.createTask(gm, {
-    title: `认领回显样例 ${suffix}`, context, executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('claim-echo'),
-  });
-  const service = createMcpHttpService({ core, port: 0 });
-  const wire = countingFetch();
-  const connection = await connectCompanyClient({
-    url: new URL(`http://127.0.0.1:${service.port}/mcp`), credential: claimant, clientName: 'sys01-claim-echo', fetch: wire.fetch,
-  });
-  try {
-    const answer = await connection.client.callTool({ name: 'claim_next', arguments: { taskId: task.id } });
-    expect(answer.structuredContent).toMatchObject({ ok: true });
-    const data = (answer.structuredContent as { data: ClaimEcho }).data;
-    expect(lastBody(wire)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    expect(typeof data.deliveryId).toBe('string');
-    expect(typeof data.fence).toBe('number');
-    expect(typeof data.leaseExpiresAt).toBe('string');
-    expect(data.task).toMatchObject({ id: task.id, contextTruncated: true, contextBytes: utf8(context), contextSha256: sha256(context) });
-    expect(context.startsWith(data.task.context)).toBe(true);
-    expect(data.task.contextNextOffset).toBe(utf8(data.task.context));
-    // The lease is the one the claim committed; the rest of the text reads back whole, verified against its digest.
-    expect((await core.getTask(gm, task.id)).currentEmployee).toBe(`qp-claim-${suffix}`);
-    const whole = await reassemble({ taskId: task.id, field: 'context', limit: 16 * 1024 }, claimant);
-    expect(whole.text).toBe(context);
-    expect(whole.sha256).toBe(sha256(context));
-  } finally {
-    await connection.close();
-    await service.close();
-  }
-});
-
-// ---- SYS01 R3 (GM ruling v25): the claim, heartbeat and task-text echoes on the real MCP, sidecar and fork paths. ----
-// Each test enrolls its own employee. The concept-design role has no other task in this file, so the queue path
-// (claim_next without taskId) can only pick the task the test created.
-
-const designerCredential = (label: string) => enrollment.enroll(`qp-${label}-${suffix}`, 'concept-design', ['execute', 'review']);
-
-/** A real MCP client on a fresh HTTP service, for one caller. `bodies` counts the whole response of each tools/call (SYS01, F5). */
-async function mcpSession(credential: string) {
-  const service = createMcpHttpService({ core, port: 0 });
-  const wire = countingFetch();
-  const connection = await connectCompanyClient({
-    url: new URL(`http://127.0.0.1:${service.port}/mcp`), credential, clientName: `sys01-r3-${suffix}`, fetch: wire.fetch,
-  });
-  return {
-    client: connection.client,
-    bodies: wire.bodies,
-    close: async () => { await connection.close(); await service.close(); },
-  };
-}
-
-/** One audit entry at a fixed time, so that the history order is known. Returns the audit id. */
-async function seedAudit(taskId: string, evidence: string, at: string): Promise<string> {
-  const auditId = randomUUID();
-  await database.db.query(
-    'CREATE $rid CONTENT { task: $task, actor: $actor, action: "checkpoint", evidence: $evidence, version: 1, at: <datetime>$at };',
-    { rid: id('audit', auditId), task: id('task', taskId), actor: id('employee', ids.gm), evidence, at });
-  return auditId;
-}
-
 /** A sck call through the real comm client and an in-process sidecar pool, as the employee's own calls run. */
 function sckCall(pool: SidecarPool, label: string, credential: string) {
   const channel = pool.env({ id: `qp-${label}-${suffix}`, credential } as unknown as EmployeeInst);
   return async (tool: string, args: Record<string, unknown>) => {
-    const child = Bun.spawn([process.execPath, join(ROOT, 'src/mcp/client-cli.ts'), 'call', tool, JSON.stringify(args)], {
+    const child = Bun.spawn([process.execPath, join(ROOT, 'src/sck-cli.ts'), 'call', tool, JSON.stringify(args)], {
       cwd: ROOT, stdout: 'pipe', stderr: 'pipe',
       env: { ...process.env, SCK_COMM_DIR: channel.SCK_COMM_DIR, SCK_COMM_KEY: channel.SCK_COMM_KEY },
     });
@@ -1479,219 +1377,3 @@ function sckCall(pool: SidecarPool, label: string, credential: string) {
     return { out, stderr, exit };
   };
 }
-
-test('claim_next over MCP with no taskId claims from the queue: a 57 KB Chinese and emoji context is cut and flagged inside the budget, reassembles whole through read_task_text, and the heartbeat echoes the same lease (SYS01 R3)', async () => {
-  const holder = await designerCredential('queue');
-  // createTask caps a context at 20,000 UTF-16 units; this one is 19,914 units and 57,7xx UTF-8 bytes (CJK 3 bytes, emoji 4 bytes).
-  const context = `队列认领 ${suffix} ` + '中'.repeat(17_900) + '🙂'.repeat(1_000);
-  expect(utf8(context)).toBeGreaterThan(56 * 1024);
-  const task = await core.createTask(gm, {
-    title: `队列认领样例 ${suffix}`, context, executorRole: 'concept-design', reviewerRole: 'qa', idempotencyKey: key('queue-echo'),
-  });
-  const session = await mcpSession(holder);
-  try {
-    const answer = await session.client.callTool({ name: 'claim_next', arguments: {} });
-    expect(answer.structuredContent).toMatchObject({ ok: true });
-    const claim = (answer.structuredContent as { data: ClaimEcho }).data;
-    expect(claim.task.id).toBe(task.id);
-    expect(lastBody(session)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    // The lease fields are read out and checked one by one: Bun's toMatchObject writes its matchers into the object it checks.
-    const { deliveryId, fence } = claim;
-    expect(typeof deliveryId).toBe('string');
-    expect(typeof fence).toBe('number');
-    expect(typeof claim.leaseExpiresAt).toBe('string');
-    expect(claim.task).toMatchObject({ contextTruncated: true, contextBytes: utf8(context), contextSha256: sha256(context) });
-    expect(context.startsWith(claim.task.context)).toBe(true);
-    const beat = await session.client.callTool({
-      name: 'heartbeat', arguments: { taskId: task.id, deliveryId, fence, expectedVersion: claim.task.version },
-    });
-    expect(beat.structuredContent).toMatchObject({ ok: true });
-    const lease = (beat.structuredContent as { data: ClaimEcho }).data;
-    expect(lastBody(session)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    expect(lease.deliveryId).toBe(deliveryId);
-    expect(lease.fence).toBe(fence);
-    expect(typeof lease.leaseExpiresAt).toBe('string');
-    // A heartbeat reads no history, so it carries no history flags and no entries.
-    expect(lease).not.toHaveProperty('historyComplete');
-    expect(lease.history).toEqual([]);
-    expect(lease.task).toMatchObject({ id: task.id, contextTruncated: true, contextSha256: sha256(context) });
-    expect((await reassemble({ taskId: task.id, field: 'context', limit: 16 * 1024 }, holder)).text).toBe(context);
-  } finally {
-    await session.close();
-  }
-});
-
-test('a claim over more than 16 KiB of history echoes the newest entries that fit: the count is whole, historyComplete is false, the cut entry reads back whole, and the pages reach every entry (SYS01 R3)', async () => {
-  const holder = await designerCredential('history');
-  const task = await core.createTask(gm, {
-    title: `历史回显样例 ${suffix}`, context: '短正文', executorRole: 'concept-design', reviewerRole: 'qa', idempotencyKey: key('history-echo'),
-  });
-  // Seeded history, oldest first: 70 entries of about 250 bytes (about 1 KiB each in both copies), and one entry of 96 KB that is
-  // 30th from the newest. The 29 newer entries fit the echo room whole, so the big entry is the boundary, cut at its longest prefix.
-  const base = Date.parse('2026-10-18T08:00:00Z');
-  const at = (i: number) => new Date(base + i * 60_000).toISOString();
-  const big = codePoints(30_000, `大条目 ${suffix} `);
-  let bigId = '';
-  for (let i = 0; i < 70; i++) {
-    if (i === 40) {
-      bigId = await seedAudit(task.id, big, at(i));
-    } else {
-      await seedAudit(task.id, `历史条目 ${i} ${suffix} ` + '证'.repeat(60), at(i));
-    }
-  }
-  const session = await mcpSession(holder);
-  try {
-    const answer = await session.client.callTool({ name: 'claim_next', arguments: { taskId: task.id } });
-    expect(answer.structuredContent).toMatchObject({ ok: true });
-    const claim = (answer.structuredContent as { data: ClaimEcho }).data;
-    expect(lastBody(session)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    const count = await historyRows(task.id);
-    expect(count).toBeGreaterThan(70);
-    expect(claim.historyCount).toBe(count);
-    expect(claim.historyComplete).toBe(false);
-    expect(claim.history.length).toBeGreaterThan(0);
-    expect(claim.history.length).toBeLessThan(count);
-    // The echo holds the newest suffix of the history, oldest first.
-    const everything = await historyEntries(task.id);
-    expect(new Set(everything.map(entry => entry.auditId)).size).toBe(count);
-    const oldestFirst = [...everything].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
-    expect(claim.history.map(entry => entry.auditId)).toEqual(oldestFirst.slice(-claim.history.length).map(entry => entry.auditId));
-    // The entry over 2 KiB is cut at its boundary: its leading part, with the size and digest of the whole text.
-    const cut = claim.history.find(entry => entry.evidenceTruncated === true);
-    expect(cut).toMatchObject({ auditId: bigId, evidenceBytes: utf8(big), evidenceSha256: sha256(big) });
-    expect(big.startsWith(cut!.evidence!)).toBe(true);
-    expect(cut!.evidenceNextOffset).toBe(utf8(cut!.evidence!));
-    // read_task_text continues the entry, and its segments reassemble to the whole text.
-    expect((await reassemble({ taskId: task.id, field: 'evidence', auditId: bigId, limit: 16 * 1024 }, holder)).text).toBe(big);
-    // The pages carry the same entry; it is cut there as well, because it is larger than one page.
-    expect(everything.find(entry => entry.auditId === bigId)).toMatchObject({ evidenceBytes: utf8(big), evidenceSha256: sha256(big), evidenceTruncated: true });
-  } finally {
-    await session.close();
-  }
-});
-
-test('a claim with a long project, dependency list and intent paths echoes each part in the budget and flags it; the holder reads each back whole through MCP and through the real sidecar, and another employee is refused the project (SYS01 R3)', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'sys01-r3-project-'));
-  const projectId = `qp-r3-${suffix}`;
-  await new ProjectStore(database.db).upsert({
-    id: projectId, name: `长项目 ${suffix}`, repoPath: dir, release: '本地发布', envs: [],
-    redLines: Array.from({ length: 40 }, (_, i) => `红线${i}：${'禁'.repeat(300)}`),
-  });
-  const holder = await designerCredential('long');
-  const outsider = await designerCredential('outsider');
-  const paths = Array.from({ length: 50 }, (_, i) => `资产/第${i}组/${'镜头草图'.repeat(20)}-${i}`);
-  const task = await core.createTask(gm, {
-    title: `长列表样例 ${suffix} ` + '题'.repeat(180), context: '短正文', executorRole: 'concept-design', reviewerRole: 'qa',
-    project: projectId, workIntent: { kind: 'assets', paths }, idempotencyKey: key('long-lists'),
-  });
-  const wholeProject = (await new ProjectStore(database.db).get(projectId))!;
-  const session = await mcpSession(holder);
-  const pool = new SidecarPool({ core, workforce: { rotate: async () => holder } as unknown as SidecarDeps['workforce'], runDir: mkdtempSync(join(tmpdir(), 'sys01-r3-sidecar-')), sweepMs: 5 });
-  try {
-    const answer = await session.client.callTool({ name: 'claim_next', arguments: { taskId: task.id } });
-    expect(answer.structuredContent).toMatchObject({ ok: true });
-    const claim = (answer.structuredContent as { data: ClaimEcho }).data;
-    expect(lastBody(session)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    expect(claim.projectTruncated).toBe(true);
-    expect(claim.projectBytes).toBe(utf8(JSON.stringify(wholeProject)));
-    expect(claim.projectSha256).toBe(sha256(JSON.stringify(wholeProject)));
-    expect(claim.project).toMatchObject({ id: projectId, name: `长项目 ${suffix}` });
-    expect(claim.project!.redLines!.length).toBeGreaterThan(0);
-    expect(claim.project!.redLines!.length).toBeLessThan(40);
-    expect(claim.listsTruncated).toMatchObject({ workIntentPaths: { count: 50 } });
-    expect(claim.listsTruncated!.workIntentPaths!.sha256).toBe(sha256(JSON.stringify(paths)));
-    // Each cut list reads back whole through read_task_text, verified against the digest the echo carried.
-    const readWhole = async (field: TaskTextField, credential: string) => (await reassemble({ taskId: task.id, field, limit: 16 * 1024 }, credential)).text;
-    expect(JSON.parse(await readWhole('workIntentPaths', holder))).toEqual(paths);
-    const projectText = await readWhole('project', holder);
-    expect(JSON.parse(projectText)).toEqual(wholeProject);
-    expect(claim.projectSha256).toBeDefined();
-    expect(sha256(projectText)).toBe(claim.projectSha256!);
-    // The same reads through the real sidecar and comm client: the holder's sck gets the project, the other employee is refused it.
-    const mine = sckCall(pool, 'r3-holder', holder);
-    const theirs = sckCall(pool, 'r3-outsider', outsider);
-    const viaSidecar = await mine('read_task_text', { taskId: task.id, field: 'project', offset: 0, limit: 16 * 1024 });
-    expect(viaSidecar.exit).toBe(0);
-    expect(JSON.parse(viaSidecar.out)).toMatchObject({ field: 'project', sha256: claim.projectSha256 });
-    const refused = await theirs('read_task_text', { taskId: task.id, field: 'project', offset: 0, limit: 16 * 1024 });
-    expect(refused.exit).toBe(1);
-    expect(refused.out).toContain('owner or the holder of a valid task lease');
-    // A page of this task's history through the sidecar stays inside the budget.
-    const history = await mine('get_task_history', { taskId: task.id, pageSize: 5 });
-    expect(history.exit).toBe(0);
-    expect(Buffer.byteLength(history.out, 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    // gm reads the project too.
-    expect(JSON.parse((await reassemble({ taskId: task.id, field: 'project', limit: 16 * 1024 }, gm)).text)).toEqual(wholeProject);
-  } finally {
-    pool.close();
-    await session.close();
-  }
-});
-
-test('create_task over MCP with 50 long asset paths: the committed write answers inside the budget, its cut list is flagged with the whole count and digest, and the whole list reads back through read_task_text (SYS01 R3)', async () => {
-  // 50 relative directories of 300 characters each (892 bytes): the longest list validateIntent accepts. The list alone is about 45 KB.
-  const paths = Array.from({ length: 50 }, (_, i) => `${String(i).padStart(3, '0')}-${'甲'.repeat(296)}`);
-  expect(utf8(JSON.stringify(paths))).toBeGreaterThan(40 * 1024);
-  const session = await mcpSession(gm);
-  try {
-    const answer = await session.client.callTool({
-      name: 'create_task',
-      arguments: {
-        title: `写入回显样例 ${suffix}`, context: `写入回显 ${suffix}`, executorRole: 'concept-design', reviewerRole: 'qa',
-        workIntent: { kind: 'assets', paths }, idempotencyKey: key('write-echo-lists'),
-      },
-    });
-    expect(answer.structuredContent).toMatchObject({ ok: true });
-    const created = (answer.structuredContent as { data: TaskView }).data;
-    expect(lastBody(session)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    expect(created.workIntent).toMatchObject({ kind: 'assets' });
-    expect(created.workIntent!.paths!.length).toBeGreaterThan(0);
-    expect(created.workIntent!.paths!.length).toBeLessThan(50);
-    expect(created.workIntent!.paths).toEqual(paths.slice(0, created.workIntent!.paths!.length));
-    expect(created.listsTruncated).toEqual({ workIntentPaths: { count: 50, sha256: sha256(JSON.stringify(paths)) } });
-    // The commit stands: the whole list is stored, and read_task_text returns it whole, verified against the digest.
-    const stored = await reassemble({ taskId: created.id, field: 'workIntentPaths', limit: 16 * 1024 }, gm);
-    expect(sha256(stored.text)).toBe(sha256(JSON.stringify(paths)));
-    expect(JSON.parse(stored.text)).toEqual(paths);
-  } finally {
-    await session.close();
-  }
-});
-
-test('read_task_text over MCP: a 57 KB Chinese and emoji context reads back in 24 KiB segments, each whole MCP response stays within 48 KiB, and the segments reassemble to the original (SYS01, F5)', async () => {
-  const context = `分段读取 ${suffix} ` + '中'.repeat(17_900) + '🙂'.repeat(1_000);
-  expect(utf8(context)).toBeGreaterThan(56 * 1024);
-  const task = await core.createTask(gm, {
-    title: `分段读取样例 ${suffix}`, context, executorRole: 'concept-design', reviewerRole: 'qa', idempotencyKey: key('segments-mcp'),
-  });
-  const session = await mcpSession(gm);
-  try {
-    const pieces: Buffer[] = [];
-    let offset: number | null = 0;
-    let expectSha256: string | undefined;
-    let segments = 0;
-    while (offset !== null) {
-      const answer = await session.client.callTool({
-        name: 'read_task_text',
-        arguments: { taskId: task.id, field: 'context', offset, limit: 24 * 1024, ...(expectSha256 ? { expectSha256 } : {}) },
-      });
-      expect(answer.structuredContent).toMatchObject({ ok: true });
-      // The whole response of this segment is inside the budget, text copy and frame included.
-      expect(lastBody(session)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-      const segment = (answer.structuredContent as { data: TaskTextSegment }).data;
-      expect(segment.totalBytes).toBe(utf8(context));
-      expect(segment.sha256).toBe(sha256(context));
-      pieces.push(Buffer.from(segment.text, 'utf8'));
-      expectSha256 = segment.sha256;
-      offset = segment.nextOffset;
-      segments++;
-      expect(segments).toBeLessThan(20);
-    }
-    expect(segments).toBeGreaterThan(1);
-    const whole = Buffer.concat(pieces).toString('utf8');
-    expect(whole).toBe(context);
-    expect(sha256(whole)).toBe(sha256(context));
-  } finally {
-    await session.close();
-  }
-});

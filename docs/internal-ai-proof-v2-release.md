@@ -1,5 +1,7 @@
 # internal-ai 公司签发端 v2 发布配套
 
+> 历史记录：本文档记录 0.7.0 之前的发布配套，已被 0.7.0 取代。正文中的 MCP、`active`、`releases/` 等描述不再适用，仅供追溯。
+
 本变更只实现公司端，不构成上线批准。产品候选为 [PR175](https://github.com/MainListActivity/surreal_ck/pull/175)，固定 SHA `1adf73aeaf8b14a7e9b30c1ef0d7a340f63dc16a`。前置冻结任务 `19b2f4d9-b63d-42c2-98b9-902ccd9095fb` 已独立验收；公司实现从 `43af0eefeb5149f6e77e1b027ebda87d48712ef2` 起步。产品 head 有变须重新提取、比较，并同时重核公司链和原申请 a75520d3。
 
 ## 源码镜像与复验

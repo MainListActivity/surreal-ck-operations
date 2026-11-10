@@ -358,7 +358,7 @@ export class CompanyDatabase {
   /**
    * 本机 bootstrap：认领库，再应用全部结构。
    * 云端不应用结构（由 scripts/company-migrate.ts 用 migrator 应用），只选定库并核对结构版本已到本版本要求，
-   * 这样各入口（MCP、调度器、老板 CLI 等）照旧调用 bootstrap 即可；版本不够时拒绝启动并指明要先跑迁移。
+   * 这样各入口（插件 sidecar、调度器、老板 CLI 等）照旧调用 bootstrap 即可；版本不够时拒绝启动并指明要先跑迁移。
    */
   async bootstrap(): Promise<void> {
     if (this.config.cloud) {
@@ -439,7 +439,7 @@ export class CompanyDatabase {
   }
 
   /**
-   * 按序应用全部 schema（001 至 057；055 按配置渲染）。fresh 时写入归属标记。本机 bootstrap 与云端 company-migrate 共用；
+   * 按序应用全部 schema（001 至 061；055 按配置渲染）。fresh 时写入归属标记。本机 bootstrap 与云端 company-migrate 共用；
    * 云端只有 migrator 能应用。
    */
   async applySchema(fresh: boolean): Promise<void> {

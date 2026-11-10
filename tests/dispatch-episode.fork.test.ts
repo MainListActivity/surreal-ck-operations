@@ -46,7 +46,7 @@ async function startFork(name: string) {
     const core = new SurrealCompanyCore(db), enrollment = new LocalEnrollmentAdmin(db), owner = new OwnerDesk(db);
     const gm = await enrollment.enroll('fixture-manager', 'owner', ['execute', 'review', 'manage']);
     await db.db.upsert(new RecordId('company_meta', 'config')).content({ jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
-    const wf = new Workforce(db, join(dir, 'unused-credential-files'));
+    const wf = new Workforce(db);
     // The original query stays reachable for every assertion below, even when a test wraps db.db.query to inject a failure.
     const rawQuery = db.db.query.bind(db.db) as unknown as typeof db.db.query;
     const ops = { tools: ['ops_info'], call: async () => ({ available: true }), release: () => {} };

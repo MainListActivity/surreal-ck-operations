@@ -1,14 +1,18 @@
 {
-  "version": "0.6.1",
-  "title": "修复节点更新器首次切换失败：插件缺类型依赖、安装脚本 unbound variable",
+  "version": "0.7.0",
+  "title": "删除公司 MCP 服务与 GitHub 镜像，sck 只走插件通道",
   "changes": [
-    "plugin/package.json 把 @getpaseo/client 从 devDependencies 移到 dependencies：服务端源码 import type 它，Paseo 编译插件时要求类型导入也能在插件 node_modules 里解析，--prod 安装缺它导致 0.6.0 切换后编译失败并回退。",
-    "plugin-package --verify-install 增加检查：--prod 安装后，从入口可达的源码（含仅类型导入）引用的非宿主包必须都已安装，否则发布失败。",
-    "scripts/node-updater.sh 里紧跟中文全角标点的变量改用花括号：macOS 的 /bin/sh（bash 3.2）在 UTF-8 locale 下把多字节首字节并入变量名，install 报 release_repo unbound variable 退出。"
+    "删除公司 MCP 服务（launchd 任务、/mcp 端点、端口 38473）、远程部署脚本、company-service.sh 与 releases 快照；节点不再有 MCP 服务与手工安装步骤。",
+    "删除 GitHub 镜像：核心不再写 outbox 事件，投影进程与 SCK_GITHUB_REPOSITORY、SCK_PROJECTOR_CREDENTIAL_FILE、SCK_PROJECTION_STATE_FILE 配置一并删除；outbox 表保留，下个版本再删。",
+    "sck 只走 comm 通道（SCK_COMM_DIR 指向的插件 sidecar），删除凭证文件模式（SCK_EMPLOYEE_CREDENTIAL_FILE、SCK_MCP_URL）与 admin enroll 的 token 文件。",
+    "节点更新器切换成功或回退后维护 <serviceHome>/current 指向现役插件目录，并把 sck.sh、bun-runtime.sh 安装到 <serviceHome>/bin/。",
+    "调度器删除非 sidecar 回退：没有 sidecar 的员工不派工；提示词只保留 comm 形态的工具说明。"
   ],
   "impact": [
-    "已装更新器的节点按正常流程切到 0.6.1；0.6.0 在节点上会编译失败并自动回退，不要手动切到 0.6.0。"
+    "节点上若曾安装 org.surrealck.company-mcp，需先手工停用并删除其 plist（见节点运维手册「停用与卸载」）；0.7.0 不会自动停用它。",
+    "员工通道只剩 comm 文件协议；仍设置 SCK_EMPLOYEE_CREDENTIAL_FILE 或 SCK_MCP_URL 的环境不再生效。",
+    "GitHub 上已有的 [Company] issue 与评论不会删除，但之后不再更新。"
   ],
-  "migration": "无 schema 变化，沿用 schema 061。",
-  "rollback": "同 0.6.0：停用节点更新器后把 sck-company 插件指回上一版 plugin-releases 或 releases 目录；无 schema 回退。"
+  "migration": "无 schema 变化，沿用 schema 061。outbox 表保留但 0.7.0 不再写入，下个版本再删。",
+  "rollback": "把 <serviceHome>/current 指回上一版 plugin-releases/<sha>/plugin 即可；schema 仍为 061，无需恢复任何表。回退后 0.6.1 核心会重新写入 outbox 事件，GitHub 投影已随 MCP 服务删除，不会恢复。"
 }

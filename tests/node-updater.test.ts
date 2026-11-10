@@ -2,7 +2,7 @@
 // 不读写真实服务目录，不调用 paseo / launchctl / systemctl。
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { NodeUpgradeStatus } from '../src/node-release.ts';
@@ -25,7 +25,13 @@ const SHA_NEW = 'a'.repeat(40);
 const SHA_EXTRA = 'd'.repeat(40);
 const SHA_ACTIVE = 'e'.repeat(40);
 const SHA_SNAPSHOT = 'b'.repeat(40);
+const SHA_THIRD = '9'.repeat(40);
 const SCHEMA = 61;
+const SCK_V1 = '# sck v1\n';
+const SCK_V2 = '# sck v2\n';
+const BUN_V1 = '# bun-runtime v1\n';
+const BUN_V2 = '# bun-runtime v2\n';
+const SCK_PREVIOUS = '# sck previous\n';
 
 let sourceRoot: string;
 const trash: string[] = [];
@@ -60,6 +66,8 @@ interface FixtureOptions {
   /** 原样写入清单文件（用于非法 JSON）。 */
   manifestText?: string;
   updaterText?: string;
+  /** 发行包内 scripts/ 下的工具脚本（文件名 -> 内容）；缺省则包内不含 scripts/。 */
+  scripts?: Record<string, string>;
 }
 
 /** 生成一套发行资产：真实 tar.gz 包、更新器文件与清单，sha256 与大小都按实际内容计算。 */
@@ -75,7 +83,13 @@ async function buildFixture(options: FixtureOptions = {}): Promise<Fixture> {
   writeFileSync(join(stage, 'release.json'), JSON.stringify(
     options.releaseJson ?? { product: 'sck-company', version, sha, requiredSchema: SCHEMA }, null, 2));
   const packageName = packageAssetName(version);
-  execFileSync('tar', ['-czf', join(dir, packageName), '-C', stage, 'release.json', 'plugin'], {
+  const tarArgs = ['-czf', join(dir, packageName), '-C', stage, 'release.json', 'plugin'];
+  if (options.scripts) {
+    mkdirSync(join(stage, 'scripts'), { recursive: true });
+    for (const [name, text] of Object.entries(options.scripts)) writeFileSync(join(stage, 'scripts', name), text);
+    tarArgs.push('scripts');
+  }
+  execFileSync('tar', tarArgs, {
     env: { ...process.env, COPYFILE_DISABLE: '1' },
   });
   const updaterText = options.updaterText ?? `// node updater ${version} ${sha}\n`;
@@ -255,6 +269,16 @@ function reasonOf(outcome: UpdateOutcome): string {
 
 function pluginReleasesDir(h: Harness): string {
   return join(h.home, 'plugin-releases');
+}
+
+/** 在发行目录下写入 scripts/ 里的工具脚本。 */
+function writeScripts(releaseDir: string, scripts: Record<string, string>): void {
+  mkdirSync(join(releaseDir, 'scripts'), { recursive: true });
+  for (const [name, text] of Object.entries(scripts)) writeFileSync(join(releaseDir, 'scripts', name), text);
+}
+
+function binFile(h: Harness, name: string): string {
+  return join(h.home, 'bin', name);
 }
 
 describe('清单与包校验', () => {
@@ -484,7 +508,7 @@ describe('切换与回退', () => {
     expect(existsSync(join(h.home, 'updater', 'rolled-back.json'))).toBe(false);
   });
 
-  test('成功：ok，记录带 target 的升级，更新器替换，回收旧目录但保留回退目标、快照与 active 目录', async () => {
+  test('成功：ok，记录带 target 的升级，更新器替换，回收旧目录但保留回退目标、不触碰 releases/（active 不再受保护，只保护 current）', async () => {
     const h = harness();
     installCurrent(h, '0.5.0', SHA_OLD);
     makeReleaseDir(h.home, SHA_EXTRA, '0.4.0');
@@ -507,24 +531,11 @@ describe('切换与回退', () => {
     expect(existsSync(join(pluginReleasesDir(h), SHA_OLD, 'release.json'))).toBe(true);
     expect(existsSync(join(pluginReleasesDir(h), SHA_NEW, 'release.json'))).toBe(true);
     expect(existsSync(snapshot)).toBe(true);
-    expect(existsSync(activeDir)).toBe(true);
+    // 旧的 active 目录不是回退目标，也不再被 current 指向，按回收规则删除。
+    expect(existsSync(activeDir)).toBe(false);
+    expect(realpathSync(join(h.home, 'current'))).toBe(realpathSync(join(pluginReleasesDir(h), SHA_NEW, 'plugin')));
     expect(existsSync(join(h.home, 'updater', 'lock'))).toBe(false);
     expect(readdirSync(pluginReleasesDir(h)).filter(name => name.startsWith('.staging-'))).toEqual([]);
-  });
-
-  test('MCP 快照与插件发行包来自同一提交：快照原样保留，插件装进 plugin-releases', async () => {
-    const h = harness();
-    installCurrent(h, '0.5.0', SHA_OLD);
-    // 手动切换 MCP 时快照目录是 releases/<提交>，内容是整棵源码树，没有 release.json。
-    const snapshot = join(h.home, 'releases', SHA_NEW);
-    mkdirSync(join(snapshot, 'src', 'mcp'), { recursive: true });
-    writeFileSync(join(snapshot, 'src', 'mcp', 'run.ts'), '// mcp snapshot\n');
-    h.release.publish(await buildFixture());
-    expect(await runNodeUpdate(h.deps)).toEqual({ kind: 'ok', version: '0.6.0', sha: SHA_NEW });
-    expect(readFileSync(join(snapshot, 'src', 'mcp', 'run.ts'), 'utf8')).toBe('// mcp snapshot\n');
-    expect(existsSync(join(snapshot, 'release.json'))).toBe(false);
-    expect(h.plugin.reg?.path).toBe(join(pluginReleasesDir(h), SHA_NEW, 'plugin'));
-    expect(existsSync(join(pluginReleasesDir(h), SHA_NEW, 'release.json'))).toBe(true);
   });
 
   test('已安装依赖的发行目录被复用时，更新器仍按清单校验后替换', async () => {
@@ -604,6 +615,99 @@ describe('版本与状态门禁', () => {
     const out = await runNodeUpdate(h.deps);
     expect(out).toEqual({ kind: 'no_release' });
     expect(h.release.downloads).toEqual([]);
+  });
+});
+
+describe('current 与 bin 工具脚本', () => {
+  test('a) 切换成功后：current 是指向新插件目录的符号链接，bin/sck 与 bin/bun-runtime.sh 等于发行包 scripts/ 且权限 700', async () => {
+    const h = harness();
+    installCurrent(h, '0.5.0', SHA_OLD);
+    h.release.publish(await buildFixture({ scripts: { 'sck.sh': SCK_V1, 'bun-runtime.sh': BUN_V1 } }));
+    const newPlugin = join(pluginReleasesDir(h), SHA_NEW, 'plugin');
+
+    expect(await runNodeUpdate(h.deps)).toEqual({ kind: 'ok', version: '0.6.0', sha: SHA_NEW });
+    const link = join(h.home, 'current');
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(realpathSync(link)).toBe(realpathSync(newPlugin));
+    expect(readFileSync(binFile(h, 'sck'), 'utf8')).toBe(SCK_V1);
+    expect(readFileSync(binFile(h, 'bun-runtime.sh'), 'utf8')).toBe(BUN_V1);
+    expect(statSync(binFile(h, 'sck')).mode & 0o777).toBe(0o700);
+    expect(statSync(binFile(h, 'bun-runtime.sh')).mode & 0o777).toBe(0o700);
+  });
+
+  test('b) 再次切换到更新的发行包后，bin/sck 与 bin/bun-runtime.sh 随新包内容更新', async () => {
+    const h = harness();
+    installCurrent(h, '0.5.0', SHA_OLD);
+    h.release.publish(await buildFixture({ scripts: { 'sck.sh': SCK_V1, 'bun-runtime.sh': BUN_V1 } }));
+    expect(await runNodeUpdate(h.deps)).toEqual({ kind: 'ok', version: '0.6.0', sha: SHA_NEW });
+    expect(readFileSync(binFile(h, 'sck'), 'utf8')).toBe(SCK_V1);
+
+    h.release.publish(await buildFixture({
+      version: '0.7.0', sha: SHA_THIRD, scripts: { 'sck.sh': SCK_V2, 'bun-runtime.sh': BUN_V2 },
+    }));
+    expect(await runNodeUpdate(h.deps)).toEqual({ kind: 'ok', version: '0.7.0', sha: SHA_THIRD });
+    expect(readFileSync(binFile(h, 'sck'), 'utf8')).toBe(SCK_V2);
+    expect(readFileSync(binFile(h, 'bun-runtime.sh'), 'utf8')).toBe(BUN_V2);
+    expect(realpathSync(join(h.home, 'current'))).toBe(realpathSync(join(pluginReleasesDir(h), SHA_THIRD, 'plugin')));
+  });
+
+  test('c) 切换后回退：current 指回旧插件目录，bin/sck 更新为旧发行包的 sck.sh，结果仍为 rolled_back', async () => {
+    const h = harness();
+    const oldPlugin = installCurrent(h, '0.5.0', SHA_OLD);
+    writeScripts(join(pluginReleasesDir(h), SHA_OLD), { 'sck.sh': SCK_V1, 'bun-runtime.sh': BUN_V1 });
+    const newPlugin = join(pluginReleasesDir(h), SHA_NEW, 'plugin');
+    h.plugin.statusFor = dir => (dir === newPlugin ? 'error' : 'running');
+    h.release.publish(await buildFixture({ scripts: { 'sck.sh': SCK_V2, 'bun-runtime.sh': BUN_V2 } }));
+
+    const out = await runNodeUpdate(h.deps);
+    expect(out).toEqual({ kind: 'rolled_back', reason: expect.any(String), version: '0.6.0', sha: SHA_NEW });
+    expect(reasonOf(out)).toContain('插件未在');
+    expect(h.plugin.reg?.path).toBe(oldPlugin);
+    expect(realpathSync(join(h.home, 'current'))).toBe(realpathSync(oldPlugin));
+    expect(readFileSync(binFile(h, 'sck'), 'utf8')).toBe(SCK_V1);
+    expect(readFileSync(binFile(h, 'bun-runtime.sh'), 'utf8')).toBe(BUN_V1);
+    expect(statSync(binFile(h, 'sck')).mode & 0o777).toBe(0o700);
+  });
+
+  test('d1) 现役已是清单版本但 current 缺失：一轮更新后 current 对齐到注册路径，bin 随之安装', async () => {
+    const h = harness();
+    const plugin = installCurrent(h, '0.6.0', SHA_NEW);
+    writeScripts(join(pluginReleasesDir(h), SHA_NEW), { 'sck.sh': SCK_V2, 'bun-runtime.sh': BUN_V2 });
+    h.release.publish(await buildFixture());
+    expect(existsSync(join(h.home, 'current'))).toBe(false);
+
+    expect(await runNodeUpdate(h.deps)).toEqual({ kind: 'current', version: '0.6.0', sha: SHA_NEW });
+    expect(lstatSync(join(h.home, 'current')).isSymbolicLink()).toBe(true);
+    expect(realpathSync(join(h.home, 'current'))).toBe(realpathSync(plugin));
+    expect(readFileSync(binFile(h, 'sck'), 'utf8')).toBe(SCK_V2);
+    expect(h.plugin.calls).toEqual([]);
+  });
+
+  test('d2) 现役已是清单版本但 current 指向别处：一轮更新后 current 对齐到注册路径', async () => {
+    const h = harness();
+    const plugin = installCurrent(h, '0.6.0', SHA_NEW);
+    const elsewhere = makeReleaseDir(h.home, SHA_OLD, '0.5.0');
+    symlinkSync(elsewhere, join(h.home, 'current'));
+    h.release.publish(await buildFixture());
+
+    expect(await runNodeUpdate(h.deps)).toEqual({ kind: 'current', version: '0.6.0', sha: SHA_NEW });
+    expect(realpathSync(join(h.home, 'current'))).toBe(realpathSync(plugin));
+    expect(realpathSync(join(h.home, 'current'))).not.toBe(realpathSync(elsewhere));
+    expect(h.plugin.calls).toEqual([]);
+  });
+
+  test('e) 发行目录缺 sck.sh：切换仍成功，bin/sck 保留切换前的旧内容，日志说明缺少', async () => {
+    const h = harness();
+    installCurrent(h, '0.5.0', SHA_OLD);
+    mkdirSync(join(h.home, 'bin'), { recursive: true });
+    writeFileSync(binFile(h, 'sck'), SCK_PREVIOUS);
+    h.release.publish(await buildFixture({ scripts: { 'bun-runtime.sh': BUN_V2 } }));
+
+    expect(await runNodeUpdate(h.deps)).toEqual({ kind: 'ok', version: '0.6.0', sha: SHA_NEW });
+    expect(realpathSync(join(h.home, 'current'))).toBe(realpathSync(join(pluginReleasesDir(h), SHA_NEW, 'plugin')));
+    expect(readFileSync(binFile(h, 'sck'), 'utf8')).toBe(SCK_PREVIOUS);
+    expect(existsSync(binFile(h, 'bun-runtime.sh'))).toBe(false);
+    expect(h.logs.some(line => line.includes('缺少') && line.includes('sck.sh'))).toBe(true);
   });
 });
 

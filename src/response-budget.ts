@@ -7,8 +7,8 @@ import { CompanyError } from './core-errors.ts';
 import { MAX_CURSOR_CHARS } from './query-input.ts';
 
 /**
- * Hard ceiling for one response, in UTF-8 bytes, as it is sent: on the MCP path the whole HTTP body (see RESPONSE_FRAME_BYTES),
- * on the sidecar path the relayed answer. Every bounded read, complete or paged, is measured by answerBytes. No response is cut to fit.
+ * Hard ceiling for one response, in UTF-8 bytes, as it is sent: on the sidecar tool path the whole reply frame (see RESPONSE_FRAME_BYTES),
+ * on the comm relay path the relayed answer. Every bounded read, complete or paged, is measured by answerBytes. No response is cut to fit.
  */
 export const RESPONSE_BUDGET_BYTES = 48 * 1024;
 /**
@@ -49,7 +49,7 @@ export const jsonBytes = (value: unknown): number => utf8Bytes(JSON.stringify(va
 export const dualBytes = (value: unknown): number => jsonBytes(value) + utf8Bytes(JSON.stringify(JSON.stringify(value))) - 2;
 
 /**
- * The MCP tool result that carries one answer (SYS01, D1). content[0].text is the answer's JSON, the same text the service sent
+ * The sidecar tool result that carries one answer (SYS01, D1). content[0].text is the answer's JSON, the same text the service sent
  * before SYS01 (8d03d35), and structuredContent holds { ok: true, data } for clients that read it. Both carry the same data.
  */
 export function answerResult(data: unknown): { content: { type: 'text'; text: string }[]; structuredContent: { ok: true; data: unknown } } {
@@ -58,8 +58,8 @@ export function answerResult(data: unknown): { content: { type: 'text'; text: st
 }
 
 /**
- * The bytes one answer takes on the wire inside the budget: its MCP tool result, both copies included, plus the frame reserved
- * around it. Every answer budget is checked against this one measure, on MCP, on the sidecar relay, in pages, segments and echoes,
+ * The bytes one answer takes on the wire inside the budget: its sidecar tool result, both copies included, plus the frame reserved
+ * around it. Every answer budget is checked against this one measure, on the sidecar tool path, on the comm relay, in pages, segments and echoes,
  * so one answer is admitted or refused the same way on every path.
  */
 export function answerBytes(data: unknown): number {
@@ -267,7 +267,7 @@ export function fitAttachedNotices(data: unknown, notices: unknown[], limit: num
 }
 
 /**
- * Last line of defence on the relay path. A successful answer over the budget, measured as the MCP path measures it
+ * Last line of defence on the relay path. A successful answer over the budget, measured as the sidecar tool path measures it
  * (answerBytes of its data, and the whole reply line when attached notices ride along with it), is replaced by a
  * recoverable, JSON-legal error with its code, so an oversize value can never reach the caller as a cut byte stream.
  */
@@ -383,7 +383,7 @@ const PROJECT_IDENTITY = ['id', 'name', 'repoPath', 'defaultBranch', 'release', 
 export type ClaimListName = 'workIntentPaths' | 'worktreePaths';
 
 /**
- * A claim as an MCP caller receives it. task.worktree is left out: the worktree is the top-level field. projectTruncated marks a
+ * A claim as a sidecar tool caller receives it. task.worktree is left out: the worktree is the top-level field. projectTruncated marks a
  * partial project, and listsTruncated names each list that was cut (absent when every list is whole).
  */
 export interface ClaimEcho extends Omit<ClaimResult, 'project'> {

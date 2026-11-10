@@ -11,9 +11,6 @@ importers:
       '@modelcontextprotocol/client':
         specifier: 2.1.0
         version: 2.1.0
-      '@modelcontextprotocol/server':
-        specifier: 2.1.0
-        version: 2.1.0
       surrealdb:
         specifier: 2.0.8
         version: 2.0.8(tslib@2.8.1)(typescript@5.9.3)
@@ -39,10 +36,6 @@ packages:
 
   '@modelcontextprotocol/core@2.1.0':
     resolution: {integrity: sha512-YdFj5gMRHr0gYNAhTbQDgjLHiEJdIAUYxomhKseUNye7ZGlISQmUoLh2sveFFCiQ7j2YMffT1kgSND0FSfIFjQ==}
-    engines: {node: '>=20'}
-
-  '@modelcontextprotocol/server@2.1.0':
-    resolution: {integrity: sha512-FdvwZU5N03O77Suh35JqjAqq5R1ZTEPFtwu6N4BgBq28qrQtrCnpbLL5U2pwYCuE194jAw0xnlOVmIqhfoYuUQ==}
     engines: {node: '>=20'}
 
   '@surrealdb/cbor@2.0.0-alpha.4':
@@ -142,11 +135,6 @@ snapshots:
 
   '@modelcontextprotocol/core@2.1.0':
     dependencies:
-      zod: 4.6.5
-
-  '@modelcontextprotocol/server@2.1.0':
-    dependencies:
-      '@modelcontextprotocol/core': 2.1.0
       zod: 4.6.5
 
   '@surrealdb/cbor@2.0.0-alpha.4': {}

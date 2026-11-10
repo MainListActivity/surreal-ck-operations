@@ -2,7 +2,7 @@ import { CompanyError } from './core-errors.ts';
 
 /** Task IDs are opaque strings at the core boundary; this is the same cap the task-reading inputs use. */
 export const MAX_TASK_ID_CHARS = 200;
-/** Existing asset-intent limits, kept in one place so MCP, sidecar and core cannot drift. */
+/** Existing asset-intent limits, kept in one place so the tool schema, sidecar and core cannot drift. */
 export const MAX_ASSET_PATHS = 50;
 export const MAX_ASSET_PATH_CHARS = 300;
 

@@ -802,7 +802,7 @@ describe('reclaim_worktrees arguments (SYS01, D3): one strict rule on every laye
       { trigger: 'dry_run', dryRun: true, repos: undefined },
       { trigger: 'manual', dryRun: false, repos: undefined },
     ]);
-    // The arguments are checked before the role, as on MCP and the sidecar: a malformed call from another caller is invalid; a well-formed one is forbidden.
+    // The arguments are checked before the role, as on the sidecar: a malformed call from another caller is invalid; a well-formed one is forbidden.
     await expect(core.reclaimWorktrees('eng-token', { dryRun: null } as never)).rejects.toMatchObject({ code: 'invalid' });
     await expect(core.reclaimWorktrees('eng-token', { dryRun: true })).rejects.toMatchObject({ code: 'forbidden' });
     expect(runs.length).toBe(2);

@@ -43,7 +43,7 @@ run('void retires a task, voids its planned descendants, is idempotent, and refu
 
 run('revoke releases the live lease back to ready with owner provenance; no-ops without a lease', async () => {
   const { Workforce } = await import('../src/workforce.ts');
-  const wf = new Workforce(db, '/nonexistent');
+  const wf = new Workforce(db);
   const a = await task();
   await db.db.query("CREATE employee:`fixture-worker` CONTENT { role: 'engineering', active_task: $t };", { t: new RecordId('task', a.id) });
   await db.db.query("UPDATE $t SET state = 'doing', current_employee = 'fixture-worker', lease_expires_at = time::unix(time::now()) + 3600;", { t: new RecordId('task', a.id) });

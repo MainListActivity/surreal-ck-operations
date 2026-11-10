@@ -56,7 +56,7 @@ mock.module('../plugin/server/runtime-diagnostics.ts', () => ({
       notRead: [
         'private/ (service credentials)',
         'active symlink (names a target, not a loaded module)',
-        'MCP face tree (release/src, a different execution context)',
+        'release/src tree (a different execution context)',
         'process environment values',
       ],
     };
@@ -128,7 +128,7 @@ describe('plugin_runtime_diagnostics through the employee channel', () => {
     const answer = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'rt1', 'plugin_runtime_diagnostics', {});
     expect(answer.ok).toBe(true);
     const data = answer.data as Record<string, unknown>;
-    // The context is explicit, and the stamp says this answer came from the plugin face rather than the MCP one.
+    // The context is explicit, and the stamp says this answer came from the plugin sidecar rather than another process.
     expect(data.context).toBe('plugin-host');
     expect(data.channel).toBe('plugin-sidecar');
     expect(data.instanceId).toBe('e-rt');
@@ -181,7 +181,7 @@ describe('plugin_runtime_diagnostics through the employee channel', () => {
     const home = mkdtempSync(join(tmpdir(), 'sck-rt-home-'));
     // A private service env with a real-looking secret must not surface in the answer.
     mkdirSync(join(home, 'private'), { recursive: true });
-    writeFileSync(join(home, 'private', 'service.env'), 'SCK_MCP_TOKEN=secret-token-value\nSCK_EMPLOYEE_CREDENTIAL=cred-value\n');
+    writeFileSync(join(home, 'private', 'service.env'), 'SCK_OWNER_TOKEN=secret-token-value\nSCK_SERVICE_GATE=cred-value\n');
     const prev = process.env.SCK_SERVICE_HOME;
     process.env.SCK_SERVICE_HOME = home;
     try {
@@ -193,8 +193,8 @@ describe('plugin_runtime_diagnostics through the employee channel', () => {
       const text = JSON.stringify(answer.data);
       expect(text).not.toContain('secret-token-value');
       expect(text).not.toContain('cred-value');
-      expect(text).not.toContain('SCK_MCP_TOKEN');
-      expect(text).not.toContain('SCK_EMPLOYEE_CREDENTIAL');
+      expect(text).not.toContain('SCK_OWNER_TOKEN');
+      expect(text).not.toContain('SCK_SERVICE_GATE');
       // The boundary is declared in the answer itself, so a reader can check it without the source.
       expect(text).toContain('process environment values');
     } finally { restoreServiceHome(prev); }

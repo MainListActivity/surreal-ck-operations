@@ -739,7 +739,7 @@ type Lifecycle = Awaited<ReturnType<typeof lifecycleApproval>>;
 const lifecycleDiagnose = (c: Lifecycle) => ops.call(c.consumer, c.consuming, 'ops_internal_ai_approval_diagnose', {approvalTask:c.approval, manifestPath:c.files.manifestPath, documentPath:c.files.documentPath, activityId:'ui01-internal'}) as Promise<DiagnosticResult>;
 const lifecycleProve = (c: Lifecycle, key: string) => ops.call(c.consumer, c.consuming, 'ops_internal_ai_prove', {mode:'enable', approvalTask:c.approval, manifestPath:c.files.manifestPath, documentPath:c.files.documentPath, activityId:'ui01-internal', nonce:'nonce-lifecycle-'+key, idempotencyKey:key}) as Promise<Record<string,unknown>>;
 check('FV06 normal session rotation and archive keep a formed independent approval valid for diagnosis, approval and prove', async () => {
-  const workforce = new Workforce(database, dir);
+  const workforce = new Workforce(database);
   for (const kind of ['rotation', 'archive'] as const) {
     const c = await lifecycleApproval(kind);
     await workforce.retire(c.reviewerId, `synthetic ${kind}`, kind);
@@ -754,7 +754,7 @@ check('FV06 normal session rotation and archive keep a formed independent approv
   }
 });
 check('FV06 security revocation, unknown or failed retirement, forged audit and stale or raced evidence still fail closed without writes', async () => {
-  const workforce = new Workforce(database, dir), enroll = new LocalEnrollmentAdmin(database);
+  const workforce = new Workforce(database), enroll = new LocalEnrollmentAdmin(database);
   const writes = () => world.sql.filter(r => /^\s*(INSERT|UPDATE|DELETE|CREATE)\b/i.test(r.sql)).length;
   const requestsBefore = world.requests.length, writesBefore = writes(), deliveredBefore = delivered;
   // 显式安全撤权覆盖曾正常轮换的历史评审人。
@@ -824,13 +824,13 @@ check('FV06 key rotation approval shares the reviewer lifecycle: normal retireme
   const review = await core.claim(reviewer, task.id);
   await core.accept(reviewer, {taskId:task.id, deliveryId:review.deliveryId, fence:review.fence, expectedVersion:review.task.version}, {text:'company-internal-ai-key-rotation:v1:surreal_ck:production:'+trusted.kid, idempotencyKey:randomUUID()});
   const store = new CompanyProofStore(database.db, now);
-  await new Workforce(database, dir).retire('lc-keyrot-reviewer', 'synthetic rotation', 'rotation');
+  await new Workforce(database).retire('lc-keyrot-reviewer', 'synthetic rotation', 'rotation');
   await expect(store.rotationApproval(task.id, trusted.kid)).resolves.toBeUndefined();
   await enroll.revoke('lc-keyrot-reviewer');
   await expect(store.rotationApproval(task.id, trusted.kid)).rejects.toBeDefined();
 });
 check('FV06 real archive entry: a dispatcher tick after the agent is archived keeps the approval; a crashed session still fails closed', async () => {
-  const workforce = new Workforce(database, dir);
+  const workforce = new Workforce(database);
   const writes = () => world.sql.filter(r => /^\s*(INSERT|UPDATE|DELETE|CREATE)\b/i.test(r.sql)).length;
   // 真实 Paseo 接缝：名册不含已归档会话，status 按服务端 Archived 标记报 'archived'。
   const agentsMap = new Map<string, { id: string; status: string }>();
@@ -843,7 +843,8 @@ check('FV06 real archive entry: a dispatcher tick after the agent is archived ke
     listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {},
   } as unknown as PaseoGateway;
   const owner = { applyPending: async () => [], resolveNotice: async () => true, openNotices: async () => [], triagePending: async () => [], raiseNotice: async () => true };
-  const dispatcher = new Dispatcher({ workforce, owner: owner as unknown as OwnerDesk, paseo, env: { opsRepo: dir, sckBin: 'sck', paseoBin: 'paseo' }, rand: () => 0 });
+  // No sidecar here on purpose: the archive and crash retirements this tick checks run without one.
+  const dispatcher = new Dispatcher({ workforce, owner: owner as unknown as OwnerDesk, paseo, env: { opsRepo: dir, sckBin: 'sck', paseoBin: 'paseo' }, rand: () => 0 } as unknown as ConstructorParameters<typeof Dispatcher>[0]);
   // 正常归档走真实入口：评审人实例绑定 Paseo 代理 → 代理被归档（名册消失、status=archived）→ tick 退役。
   const archived = await lifecycleApproval('realarch');
   await workforce.bind(archived.reviewerId, { agentId: 'agent-realarch', cwd: dir });

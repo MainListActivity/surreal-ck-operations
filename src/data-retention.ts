@@ -5,7 +5,6 @@ import type { Surreal } from 'surrealdb';
  * here; these rules only drop rows whose only reader has a bounded window:
  *  - worktree_audit: read by list_worktree_audits for recent reclaim decisions;
  *  - idempotency: replayed only by a retry of the same write;
- *  - outbox: consumed by sequence, and nothing reads a row once it is older than the window;
  *  - ops_* audit: shown in the history of open tasks only.
  * Each rule deletes in bounded batches so one pass never holds a long transaction.
  */
@@ -14,7 +13,6 @@ export interface RetentionRule { table: string; days: number; where: string }
 export const RETENTION_RULES: RetentionRule[] = [
   { table: 'worktree_audit', days: 14, where: 'at < $cutoff' },
   { table: 'idempotency', days: 14, where: 'at = NONE OR at < $cutoff' },
-  { table: 'outbox', days: 14, where: 'at < $cutoff' },
   { table: 'audit', days: 30, where: "string::starts_with(action, 'ops_') AND at < $cutoff AND (task = NONE OR task.state = 'done')" },
 ];
 

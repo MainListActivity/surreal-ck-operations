@@ -23,7 +23,7 @@ beforeAll(async () => {
   for (let n = 0; n < 160; n++) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break; } catch {} await Bun.sleep(25); }
   db = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: 'fixture-only', namespace: 'cinematography_fixture', database: 'control_plane' });
   await db.connect(); await db.bootstrap();
-  workforce = new Workforce(db, join(dir, 'credentials')); core = new SurrealCompanyCore(db, { workforce });
+  workforce = new Workforce(db); core = new SurrealCompanyCore(db, { workforce });
   gm = await new LocalEnrollmentAdmin(db).enroll('cinema-gm', 'owner', ['execute', 'review', 'manage']);
 });
 afterAll(async () => { if (!dir) return; await db.close(); server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true }); });

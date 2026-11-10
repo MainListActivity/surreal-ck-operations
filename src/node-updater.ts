@@ -2,8 +2,8 @@
 // 只依赖 node 内置模块与发行清单模块。云端、插件控制、发行源与打包工具全部经 UpdaterDeps 注入，
 // 生产适配在 scripts/node-updater.ts。核心代码不使用 Bun 专有 API（打包目标为 node）。
 import { randomUUID } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, type Dirent } from 'node:fs';
-import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, type Dirent } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { NodeUpgradeStatus } from './node-release.ts';
 import {
   assertAssetIntegrity,
@@ -77,8 +77,15 @@ export interface UpdaterDeps {
 
 const SHA40 = /^[0-9a-f]{40}$/;
 const SEMVER = /^\d+\.\d+\.\d+$/;
-/** 插件发行目录的根：<服务目录>/plugin-releases/<sha>。不与 MCP 快照共用 releases/，二者都以提交 SHA 命名，同一提交会互相覆盖。 */
+/** 插件发行目录的根：<服务目录>/plugin-releases/<sha>，内含 release.json、plugin/ 与 scripts/（sck.sh、bun-runtime.sh）。 */
 const PLUGIN_RELEASES = 'plugin-releases';
+/** 现役插件目录的符号链接：<服务目录>/current -> plugin-releases/<sha>/plugin。sck 只从这里运行。 */
+const CURRENT_LINK = 'current';
+/** 发行包 scripts/ 里需要安装到 <服务目录>/bin/ 的 sck 工具脚本（源文件名 -> 安装名）。 */
+const TOOL_SCRIPTS = [
+  { from: 'sck.sh', to: 'sck' },
+  { from: 'bun-runtime.sh', to: 'bun-runtime.sh' },
+] as const;
 const LOCK_STALE_MS = 60_000;
 const DEFAULT_WAIT_RUNNING_MS = 60_000;
 const DEFAULT_POLL_MS = 2_000;
@@ -175,6 +182,7 @@ async function runLocked(deps: UpdaterDeps, staging: string): Promise<UpdateOutc
   }
   const cur: Current = reg ? currentOf(reg) : {};
   if (cur.sha === manifest.sha) {
+    if (reg && realOrUndefined(join(home, CURRENT_LINK)) !== realOrUndefined(reg.path)) serveCurrent(home, reg.path, log);
     await refreshUpdater(deps, tag, manifest, staging);
     return { kind: 'current', version: cur.version ?? manifest.version, sha: manifest.sha };
   }
@@ -225,6 +233,7 @@ async function runLocked(deps: UpdaterDeps, staging: string): Promise<UpdateOutc
     return rollback(deps, { reg, cur, target: newRef, reason: errorText(error) });
   }
 
+  serveCurrent(home, targetPlugin, log);
   try {
     installUpdater(home, updaterFile);
   } catch (error) {
@@ -269,6 +278,7 @@ async function rollback(
   } catch (error) {
     rollbackError = errorText(error);
   }
+  serveCurrent(deps.home, reg.path, log);
 
   const to: ReleaseRef = { version: ctx.cur.version ?? 'unknown', sha: ctx.cur.sha ?? 'unknown' };
   if (rollbackError === undefined) {
@@ -402,6 +412,57 @@ function installUpdater(home: string, source: string): void {
   }
 }
 
+/**
+ * 把 current 指向 pluginDir，并把 pluginDir 所在发行目录里的 sck 工具脚本装到 bin/。
+ * 插件已处于目标状态，这两步失败只记日志，不回退插件；发行目录缺脚本时保留 bin/ 里原有的文件。
+ */
+function serveCurrent(home: string, pluginDir: string, log: (line: string) => void): void {
+  try {
+    pointCurrent(home, pluginDir);
+  } catch (error) {
+    log(`current 指向更新失败（sck 仍指向旧版本）：${errorText(error)}`);
+  }
+  try {
+    installToolScripts(home, dirname(pluginDir), log);
+  } catch (error) {
+    log(`sck 工具脚本安装失败（保留旧文件）：${errorText(error)}`);
+  }
+}
+
+/** current 是符号链接：先在同目录建临时链接，再 rename 覆盖，替换是原子的。 */
+function pointCurrent(home: string, pluginDir: string): void {
+  const link = join(home, CURRENT_LINK);
+  const tmp = join(home, `.current.${randomUUID()}.tmp`);
+  try {
+    symlinkSync(resolve(pluginDir), tmp);
+    renameSync(tmp, link);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+}
+
+/** 把发行目录 scripts/ 里的 sck 工具脚本复制到 bin/（权限 700，临时文件 + rename）；缺任一源文件则整体不替换。 */
+function installToolScripts(home: string, releaseDir: string, log: (line: string) => void): void {
+  const tools = TOOL_SCRIPTS.map(tool => ({ ...tool, source: join(releaseDir, 'scripts', tool.from) }));
+  const missing = tools.filter(tool => !existsSync(tool.source)).map(tool => tool.from);
+  if (missing.length > 0) {
+    log(`发行目录缺少 ${missing.join('、')}，保留 bin/ 里原有的 sck 工具脚本`);
+    return;
+  }
+  const bin = join(home, 'bin');
+  mkdirSync(bin, { recursive: true, mode: 0o700 });
+  for (const tool of tools) {
+    const tmp = join(bin, `.${tool.to}.${randomUUID()}.tmp`);
+    try {
+      copyFileSync(tool.source, tmp);
+      chmodSync(tmp, 0o700);
+      renameSync(tmp, join(bin, tool.to));
+    } finally {
+      rmSync(tmp, { force: true });
+    }
+  }
+}
+
 /** 现役版本已是清单版本时，只把节点更新器文件对齐到清单；失败只记日志，不影响插件。 */
 async function refreshUpdater(deps: UpdaterDeps, tag: string, manifest: ReleaseManifest, staging: string): Promise<void> {
   const bundle = join(deps.home, 'updater', UPDATER_ASSET);
@@ -451,12 +512,12 @@ function clearRolledBack(home: string, log: (line: string) => void): void {
 
 /**
  * 回收 plugin-releases 下的旧发行目录：名称为 40 位 hex、含 release.json，且不是目标或现役旧版本。
- * 绝不删除 active 指向的目录（及其包含关系上的目录），不删除不含 release.json 的目录（MCP 快照）。
+ * 绝不删除 current 指向的目录（及其包含关系上的目录），不删除不含 release.json 的目录。
  */
 function recycle(home: string, keep: Array<string | undefined>, log: (line: string) => void): void {
   const root = join(home, PLUGIN_RELEASES);
   const kept = new Set(keep.filter((sha): sha is string => sha !== undefined));
-  const activeReal = realOrUndefined(join(home, 'active'));
+  const currentReal = realOrUndefined(join(home, CURRENT_LINK));
   let entries: Dirent[];
   try {
     entries = readdirSync(root, { withFileTypes: true });
@@ -469,8 +530,8 @@ function recycle(home: string, keep: Array<string | undefined>, log: (line: stri
     if (!existsSync(join(dir, 'release.json'))) continue;
     const dirReal = realOrUndefined(dir);
     if (dirReal === undefined) continue;
-    if (activeReal !== undefined && (activeReal === dirReal || isInside(activeReal, dirReal) || isInside(dirReal, activeReal))) {
-      log(`保留 active 指向的目录：${entry.name}`);
+    if (currentReal !== undefined && (currentReal === dirReal || isInside(currentReal, dirReal) || isInside(dirReal, currentReal))) {
+      log(`保留 current 指向的目录：${entry.name}`);
       continue;
     }
     try {

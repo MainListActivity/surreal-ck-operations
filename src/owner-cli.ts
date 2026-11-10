@@ -79,7 +79,7 @@ try {
   } else if (action === 'revoke') {
     const [taskId, ...note] = [first ?? '', ...rest].filter(Boolean);
     if (!taskId) throw new Error('用法：pnpm run company revoke <任务ID> [原因]');
-    const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? '/nonexistent');
+    const workforce = new Workforce(db);
     const reason = note.join(' ') || '老板终止在途执行';
     const result = await workforce.revokeTaskLease(taskId, reason,
       '【交接包】老板终止了上一棒的在途执行。先核对任务分支/授权目录中的实际改动与已有 checkpoint，再继续；不要重复已完成且已验证的步骤。',
@@ -117,7 +117,7 @@ try {
       for (const r of rows) console.log(`- ${String(r.task.id).slice(0, 8)} ${(r.title ?? '').slice(0, 40)}｜${line(r.cost)}`);
     }
   } else if (action === 'status') {
-    const workforce = new Workforce(db, '/nonexistent');
+    const workforce = new Workforce(db);
     const [brief, tasks, insts, health, config] = await Promise.all([
       desk.brief(), workforce.tasks(), workforce.insts(), workforce.providerHealth(), workforce.config()]);
     const count = (state: string) => tasks.filter(t => t.state === state).length;

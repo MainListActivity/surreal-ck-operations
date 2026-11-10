@@ -17,7 +17,7 @@ import type { PluginServerContext } from "@getpaseo/plugin/server";
  */
 const EXTERNAL = ["CLOUDFLARE_", "CF_API_", "SURREAL", "JEV_", "TYPESAFE_", "ELEVENLABS_", "XI_API_KEY"];
 /** Plumbing variables only the company itself sets; a shell startup file never exports these. */
-const INTERNAL = ["SCK_OPS_", "SCK_PRODUCT_ENV", "SCK_MCP_TOKEN", "SCK_OWNER_TOKEN", "SCK_SERVICE_GATE", "SCK_EMPLOYEE_CREDENTIAL"];
+const INTERNAL = ["SCK_OPS_", "SCK_PRODUCT_ENV", "SCK_OWNER_TOKEN", "SCK_SERVICE_GATE"];
 
 const LOOKUP_MS = 2_000;
 /** Read by scripts/sandbox/launch.sh, which Paseo runs in place of each provider binary. */
@@ -97,9 +97,8 @@ export function scrubEnv(launch: Record<string, string>, inherited: Env = proces
 
 interface SessionOpen { agentId: string; reason: string; env: Record<string, string> }
 
-/** A company launch always carries its channel (comm mode) or credential file (legacy mode). */
-const launchedByCompany = (env: Record<string, string>) =>
-  env.SCK_COMM_DIR !== undefined || env.SCK_EMPLOYEE_CREDENTIAL_FILE !== undefined;
+/** A company launch always carries its comm channel (SCK_COMM_DIR). */
+const launchedByCompany = (env: Record<string, string>) => env.SCK_COMM_DIR !== undefined;
 
 /** Bound startup waits, but never turn a registry outage into permission to bypass employee routing. */
 function withinLookup<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {

@@ -51,15 +51,15 @@ describe('plugin runtime diagnostics', () => {
     expect(sample(serverDir).context).toBe('plugin-host');
   });
 
-  test('the reported paths come from the plugin execution context, not the MCP face', () => {
-    // The MCP face loads <release>/src; the plugin loads <release>/plugin/server/vendor/src. Both hold
+  test('the reported paths come from the plugin execution context, not the release/src tree', () => {
+    // The service's tree is <release>/src; the plugin loads <release>/plugin/server/vendor/src. Both hold
     // company code, so the answer must show which one was actually loaded.
     const { serverDir, root } = makeRelease();
     const answer = sample(serverDir);
     expect(answer.loaded.basis).toBe('module-dir');
     expect(answer.loaded.serverDir).toBe(serverDir);
     expect(answer.loaded.vendorDir).toBe(join(serverDir, 'vendor'));
-    // The vendored source is the plugin's own; the MCP face's tree is never reported as the loaded one.
+    // The vendored source is the plugin's own; the release/src tree is never reported as the loaded one.
     expect(answer.loaded.vendorDir).not.toBe(join(root, 'src'));
     expect(answer.loaded.selfPath).toBe(join(serverDir, 'runtime-diagnostics.ts'));
   });
@@ -81,12 +81,12 @@ describe('plugin runtime diagnostics', () => {
     expect(own.every(m => m.sha256 !== null)).toBe(true);
   });
 
-  test('a module read from the MCP face tree cannot be mistaken for the plugin path', () => {
+  test('a module read from the release/src tree cannot be mistaken for the plugin path', () => {
     // Pointed at <release>/src: there is no vendor directory there and no release manifest one level up,
-    // so the answer says unavailable rather than reporting the MCP tree as the plugin's loaded code.
+    // so the answer says unavailable rather than reporting the release/src tree as the plugin's loaded code.
     const { root } = makeRelease();
-    const mcpTree = join(root, 'src');
-    const answer = sample(mcpTree);
+    const serviceTree = join(root, 'src');
+    const answer = sample(serviceTree);
     expect(answer.context).toBe('plugin-host');
     expect(answer.loaded.vendorDir).toBeNull();
     expect(answer.loaded.vendorResolvedBy).toBe('unavailable');
@@ -145,8 +145,8 @@ describe('plugin runtime diagnostics', () => {
     const text = JSON.stringify(sample(serverDir));
     // Nothing that identifies a secret, and no private/ or env content rides along.
     expect(text).not.toContain('private/service.env');
-    expect(text).not.toContain('SCK_MCP_TOKEN');
-    expect(text).not.toContain('SCK_EMPLOYEE_CREDENTIAL');
+    expect(text).not.toContain('SCK_OWNER_TOKEN');
+    expect(text).not.toContain('SCK_SERVICE_GATE');
     // The declared boundary is part of the answer, so a reader can check it without reading the source.
     expect(sample(serverDir).notRead).toContain('process environment values');
   });

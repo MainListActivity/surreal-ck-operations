@@ -1,6 +1,6 @@
 # 任务状态与流转 v3
 
-执行细节以 [员工协议](../agents/PROTOCOL.md) 为准。任务存于本机公司任务服务（SurrealDB `sck_agent_company/control_plane`），GitHub Issue 为投影看板。
+执行细节以 [员工协议](../agents/PROTOCOL.md) 为准。任务存于本机公司任务服务（SurrealDB `sck_agent_company/control_plane`）。0.7.0 起不再有 GitHub Issue 投影看板。
 
 | 状态 | 含义 | 谁推进 |
 |---|---|---|

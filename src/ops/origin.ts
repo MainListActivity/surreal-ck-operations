@@ -12,7 +12,7 @@ export type OriginRequest =
 export type OriginAgent = (origin: OriginConfig, request: OriginRequest) => Promise<Record<string, unknown>>;
 
 /** Mirrors the agent's allowlist so a bad request is refused before any connection is made. */
-export const ORIGIN_SERVICES = ['surreal-ck-hono', 'surrealdb', 'caddy', 'sck-company-mcp'] as const;
+export const ORIGIN_SERVICES = ['surreal-ck-hono', 'surrealdb', 'caddy'] as const;
 const PRIORITIES = ['err', 'warning', 'info'];
 const invalid = (message: string) => new CompanyError('invalid', message);
 

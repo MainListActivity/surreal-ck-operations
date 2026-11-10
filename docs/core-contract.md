@@ -1,23 +1,41 @@
-# 核心与 MCP adapter 契约 v1
+# 核心契约 v1（0.7.0）
 
-`src/contracts.ts` 是唯一导出边界。MCP adapter 只能接收用户提供的 opaque credential，每次调用由 core 从数据库凭证哈希查出 `Principal`；调用者不能传入 employeeId、role、capabilities。`LocalEnrollmentAdmin` 在 `src/enrollment.ts` 中，是独立对象，仅供本机运维命令，不注册为普通 MCP tool；adapter 只实例化 `SurrealCompanyCore`。
+`src/contracts.ts` 是核心的导出边界。核心（`SurrealCompanyCore`，`src/core.ts`）由插件进程内的员工通道（sidecar）与老板接口调用。调用方只能传入自己持有的凭证，由核心从数据库凭证摘要查出 `Principal`。调用方不能在参数中指定 employeeId、role 或 capabilities。
 
-任务写入时，`deliveryId + fence + expectedVersion` 共同约束本次领取和乐观版本。成功状态变更返回新 `TaskView.version`；下一次写入必须用新版本。重试时同一 `idempotencyKey` 返回原结果或无副作用地确认完成，键被不同内容重用必须冲突。数据库时间决定租约生效和过期；旧执行人的过期写入拒绝。
+`LocalEnrollmentAdmin`（`src/enrollment.ts`）是独立对象，仅供本机运维命令使用，不对员工开放。
 
-`createTask` 由管理能力控制，输入带上下文和依赖。`claim` 由当前任务岗位与执行/验收能力控制；验收人不能是 `submittedBy`。`block` 保存恢复岗位/状态；`resume` 仅管理岗位。接受任务解锁依赖，所有转移同事务写审计及持久 outbox，供 #25 transport 与 #27 同步器消费。租约由数据库 `time::unix(time::now())` 计算；`SurrealCompanyCore` 默认 TTL 600 秒，构造选项 `leaseSeconds` 可在受控测试进程设为 1–3600 秒，MCP 请求参数不能设置 TTL。
+## 写入、租约与版本
 
-adapter 负责 MCP initialize、工具 schema、错误映射和本地绑定；core 不承担传输或进程常驻。错误代码以 `CompanyError.code` 为准。数据库配置仅由后端环境加载，不交给 MCP 客户端。
+- 任务写入时，`deliveryId + fence + expectedVersion` 共同约束本次领取和乐观版本。成功状态变更返回新的 `TaskView.version`，下一次写入必须用新版本。
+- 重试时同一 `idempotencyKey` 返回原结果，或无副作用地确认完成。同一键被不同内容重用时必须冲突。
+- 租约的生效与过期由数据库时间决定（`time::unix(time::now())`）。旧执行人的过期写入会被拒绝。
+- 默认租约时长为 600 秒（`DEFAULT_LEASE_SECONDS`，`src/core.ts`）。构造选项 `leaseSeconds` 只能由受控测试进程设置在 1 到 3600 秒之间，员工请求参数不能设置租约时长。
+- sidecar 在写工具（`checkpoint`、`submit`、`review`、`report_blocker`）调用时组装 `LeaseProof`（`taskId`、`deliveryId`、`fence`、`expectedVersion`），员工不传这些字段。
 
-## 本机接入
+## 权限
 
-在本分支 worktree 中执行 `pnpm install --frozen-lockfile`、`pnpm run typecheck`、`pnpm run bootstrap`、`pnpm run test:db`。配置通过 `SCK_PRODUCT_ENV` 指向产品 `.env`，默认路径为 `/Users/y/IdeaProjects/surreal_ck/.env`；只读取 `SURREAL_URL`、`SURREAL_ROOT_USER`、`SURREAL_ROOT_PASS`（以及可选的 `COMPANY_JWKS_URL`、`COMPANY_ISSUER`，见下段），不读取或写入产品库数据。Namespace/database 默认 `sck_agent_company/control_plane`。更改目标需设置 `SCK_COMPANY_NS` / `SCK_COMPANY_DB`，bootstrap 会检查目标归属标记，拒绝已有无关资源。
+- `createTask` 由管理能力控制，输入可以带上下文与依赖。
+- `claim` 由当前任务的岗位与执行或验收能力控制。验收人不能是 `submittedBy`。
+- `block` 保存恢复岗位与状态；`resume` 仅管理岗位可用。
+- 验收通过（`accept`）会解锁依赖任务。
 
-公司库 JWT 访问方式（055）的两个可选配置是 `COMPANY_JWKS_URL`（签发令牌的 JWKS 地址，必须是 http(s) 地址）与 `COMPANY_ISSUER`（令牌 `iss` 必须等于它）。两者都配置时，bootstrap 才应用 `owner`、`runner`、`automation` 三种 JWT 访问方式；缺任一项则跳过并在日志中记一行，保持本机访问。命令守卫表（056）与本机模式无关，始终应用。
+## 审计
 
-已登记员工的本机 token 位于本 worktree `.runtime/credentials/<employee-id>.token`，目录 0700、文件 0600、Git 忽略。adapter 从安全通道接收 token，不把文件内容放入日志、Issue 或响应。`test:db` 使用独立测试 Namespace `sck_agent_company_test/control_plane`，合成数据与服务目标库分离；可通过测试库审计记录和 outbox 复核。正式服务只连接 `sck_agent_company/control_plane`。
+核心的每次状态转移都在同一事务内写入审计（`audit` 表，`CREATE audit` 与状态变更同事务提交）。审计不包含凭证值。
 
-`CompanyDatabase.connect()` 后先 `bootstrap()`，再创建 `SurrealCompanyCore`。adapter 每次调用 core 方法均传 credential。对于租约相关写入，从 `claim()` 返回的 `deliveryId`、`fence` 和 `task.version` 构造 `LeaseProof`；`checkpoint()` 等成功后用新版本更新 proof。`CompanyError` 的 `code` 和 `retryable` 映射为 MCP 工具错误，不返回数据库底层错误与凭证。代码包括 `unauthorized`、`forbidden`、`not_found`、`conflict`、`invalid`、`already_claimed`、`lease_expired`、`self_review`、`temporarily_unavailable`。只有最后一项表示数据库争用已在内部有限重试后仍失败，`retryable=true`。
+0.7.0 起核心不再写 `outbox` 事件，也没有 `listOutbox()` 接口。`outbox` 事件表与 `company_meta:outbox_counter` 计数器保留在库中（schema 仍为 061），下个版本再删除。下游如需同步任务变化，只能通过审计表或直接查询任务状态。
 
-`listOutbox()` 仅 owner（管理能力）可访问。`after` 是上次事件 ID，内部查对应持久 `sequence`，数据库侧返回序号严格更大的最多 1000 条，按序号递增。consumer 使用最后一条事件 ID 继续取页直到返回空页；不可把少于 1000 条当成服务永久静止。所有业务事件和全局序号在同一事务提交；并发写争用同一序号记录，冲突时事务重试，因此后提交的事件不会落在已经确认的游标之前。bootstrap 把旧事件按原有 `at,id` 一次性补序号，后续重复启动不改已有序号。
+## 错误
 
-事件 `kind`：`created`（payload.state）、`claimed`（employee/fence）、`checkpoint`、`submit`、`accept`、`return`、`block`（version/state）、`resumed`（state）、`dependency_unlocked`（state）。heartbeat 不发 outbox 事件。`taskId` 只属于本新库任务；原 GitHub queue.py v2 工单不在此 outbox。#25 的 GitHub 投影应在消费端保存处理标记，并按事件 ID 去重。
+`CompanyError.code` 为错误码的权威来源（`src/core-errors.ts`）。完整列表包括：
+
+`unauthorized`、`forbidden`、`not_found`、`conflict`、`invalid`、`worktree_busy`、`already_claimed`、`lease_expired`、`self_review`、`temporarily_unavailable`、`checkpoint_limit`、`not_configured`、`unavailable`、`payment_approval_required`、`upstream_error`、`login_failed`、`limit_reached`、`response_too_large`、`snapshot_gone`、`retire_refused`。
+
+`retryable` 为 true 的只有 `temporarily_unavailable`，表示数据库争用已在内部有限次重试后仍失败。其他错误需要调用方改变请求或状态后再试。
+
+## 数据库访问
+
+- `CompanyDatabase.connect()` 之后先执行 bootstrap，再创建 `SurrealCompanyCore`。
+- 节点上的核心连接由插件的运行配置决定，凭证路径与角色见 `src/config.ts`。节点更新器只使用 runner 角色，并且只连接云端库（需要 `COMPANY_DB_URL`）。
+- 数据库访问凭证不进入日志、Issue 或员工会话。
+- 测试只使用公司 fork（`~/.surrealdb/surreal`）。测试进程只认环境变量显式给出的地址，不读取服务目录中的生产配置。

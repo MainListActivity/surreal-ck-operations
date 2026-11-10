@@ -21,7 +21,7 @@ const NS = 'sck_sha_evidence_test';
 const database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
 const credDir = mkdtempSync(join(tmpdir(), 'sck-sha-evidence-'));
 const repoDir = mkdtempSync(join(tmpdir(), 'sck-sha-repo-'));
-const workforce = new Workforce(database, credDir);
+const workforce = new Workforce(database);
 const enrollment = new LocalEnrollmentAdmin(database);
 const tokens: Record<string, string> = {};
 const key = () => crypto.randomUUID();

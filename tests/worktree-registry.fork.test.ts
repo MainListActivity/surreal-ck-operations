@@ -131,7 +131,7 @@ run('restart persistence, revoked handover preserves dirty scene and fencing; le
   git(path, 'worktree', 'add', '-b', `task/${t.id.slice(0, 8)}`, legacy); writeFileSync(join(legacy, 'source.txt'), 'old scene');
   const first = await core.claim(eng, t.id); expect(first.worktree!.worktreePath).toBe(legacy); expect(first.worktree!.mode).toBe('protected');
   const actor = (await core.authenticate(eng)).employeeId;
-  await new Workforce(db, join(dir, 'unused')).revokeLease(t.id, actor, 'fixture handover', 'fixture previous employee stopped');
+  await new Workforce(db).revokeLease(t.id, actor, 'fixture handover', 'fixture previous employee stopped');
   expect((await core.listWorktrees(gm)).find(w => w.id === first.worktree!.id)!.reasons).toContain('unfinished-scene');
   await db.close(); server.kill(); await server.exited; await start();
   const restarted = coreFor(path);
@@ -164,7 +164,7 @@ run('failed authorization/claim and symlink scopes never leave effective referen
   await submit(core, eng, isolated);
 });
 run('actual dispatcher and sidecar stage one registry source in claim.json, prompt and Paseo cwd', async () => {
-  const path = repo(), core = coreFor(path), wf = new Workforce(db, join(dir, 'unused')), owner = new OwnerDesk(db);
+  const path = repo(), core = coreFor(path), wf = new Workforce(db), owner = new OwnerDesk(db);
   await db.db.upsert(new RecordId('company_meta', 'config')).content({ jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
   // Limit the scheduler to this synthetic task; no real employees or dispatcher are created.
   const t = await task(core, 'qa'); const originalTasks = wf.tasks.bind(wf); wf.tasks = async () => (await originalTasks()).filter(x => x.id === t.id);
@@ -297,7 +297,9 @@ run('WT02: done exclusive is removed, shared retained; dirty exclusive kept with
 run('WT02: lease expire keeps recovery scene; orphan past grace reclaims managed legacy tree', async () => {
   const path = repo();
   const clock = { now: new Date('2026-10-10T12:00:00.000Z') };
-  const core = new SurrealCompanyCore(db, { leaseSeconds: 1, worktrees: { opsRepo: path, now: () => clock.now } });
+  // Whole-second lease stamps: a 1 s lease can lapse between the reviewer's claim and accept under load (intermittent).
+  // lapseLease forces the expiry this test needs, so the reclaimed and review leases can be long.
+  const core = new SurrealCompanyCore(db, { leaseSeconds: 30, worktrees: { opsRepo: path, now: () => clock.now } });
   const eng = await employee('engineering'), next = await employee('engineering');
   const t = await task(core, 'engineering');
   const a = await core.claim(eng, t.id);

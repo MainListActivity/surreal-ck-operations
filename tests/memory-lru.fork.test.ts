@@ -9,7 +9,7 @@ const run=process.env.RUN_SCK_CHANNEL_FORK_TESTS==='1'?test:test.skip;
 run('runtime sleep reservation fences claims and manager wakes while preserving identity, bindings and credentials',async()=>{
  const db=new CompanyDatabase({...loadDatabaseConfig(),namespace:'memory_lru_fixture',database:'control_plane'});
  try{
-  await db.connect();await db.bootstrap();const wf=new Workforce(db,'/tmp/unused-lru'),core=new SurrealCompanyCore(db),enroll=new LocalEnrollmentAdmin(db);
+  await db.connect();await db.bootstrap();const wf=new Workforce(db),core=new SurrealCompanyCore(db),enroll=new LocalEnrollmentAdmin(db);
   const gm=await enroll.enroll('manager','owner',['manage','execute','review']),worker=await enroll.enroll('worker','qa',['execute','review']);
   const now=await wf.serverNow();
   await db.db.query('UPDATE employee:worker SET paseo_agent_id="agent-worker", idle_since=$since,last_wake_at=$wake;',{since:now-7200,wake:now-7300});
@@ -32,7 +32,7 @@ run('runtime sleep reservation fences claims and manager wakes while preserving 
 run('stale idle snapshots and active task ownership cannot reserve sleep; idle CAS survives activity events',async()=>{
  const db=new CompanyDatabase({...loadDatabaseConfig(),namespace:'memory_lru_races',database:'control_plane'});
  try{
-  await db.connect();await db.bootstrap();const wf=new Workforce(db,'/tmp/unused-lru'),now=await wf.serverNow();
+  await db.connect();await db.bootstrap();const wf=new Workforce(db),now=await wf.serverNow();
   await db.db.query('CREATE employee:worker CONTENT {role:"engineering",paseo_agent_id:"agent-worker",idle_since:$since,last_wake_at:1,revoked:false,retired:false};',{since:now-7200});
   const old=(await wf.insts())[0];await wf.clearIdleForAgent('agent-worker');
   await wf.observeSessionIdle([{id:'worker',since:old.idleSince,lastWakeAt:old.lastWakeAt,previousIdleSince:old.idleSince}]);

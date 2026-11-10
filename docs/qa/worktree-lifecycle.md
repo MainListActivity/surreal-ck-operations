@@ -1,5 +1,7 @@
 # WT02 工作树生命周期：回收、孤儿 sweep 与四仓对账
 
+> 0.7.0 说明：MCP 服务与其工具（`list_worktrees`、`get_context` 等）已删除。下文中经 MCP 调用的步骤、`releases/*` 与 `active` 相关描述仅为历史参考，替代入口待确认后重写，执行前不要照用。
+
 ## 语义摘要
 
 | 事件 | 引用 | 物理树 |
@@ -63,7 +65,7 @@ sck call list_worktree_audits '{"limit":100}'
 
 覆盖 `surreal-ck-operations`、`surreal_ck`、`ma_hono`、`maplayer-content` 的 `git worktree list`：
 
-- 主 checkout、shared、插件长期树、`SurrealCKCompany/releases/*`、外部工具（如 `~/.codex/worktrees`）、归属不明 detached：`protected` / `unknown`，无引用也不自动删
+- 主 checkout、shared、插件长期树、`SurrealCKCompany/releases/*`（0.7.0 前的固定发布目录）、外部工具（如 `~/.codex/worktrees`）、归属不明 detached：`protected` / `unknown`，无引用也不自动删
 - 公司任务形态：`*-task-<id8>`、`*-wt-<id8>`、`*-review-<id8>`、`task/<id8>` 与带后缀分支；存量无可靠时间时以首次登记为宽限起点
 - 先 dry-run 清单（逐项理由），再同一判定清理已确认孤儿
 

@@ -45,7 +45,7 @@ const evidence = () => ({ text: 'fixture evidence long enough to be accepted by 
 async function gateTask(title: string) { const t = await make(title, { reviewerRole: 'owner' }); const c = await core.claim(eng, t.id); await core.submit(eng, proofOf(c), evidence()); return t; }
 async function questionTask(title: string) { const t = await make(title); const c = await core.claim(eng, t.id); await core.block(eng, proofOf(c), 'owner', evidence()); return t; }
 const dispatcher = (notified: string[]) => {
-  const d = new Dispatcher({ workforce: { config: async () => DEFAULT_CONFIG, defs: async () => [{ role: 'engineering', provider: 'codex', enabled: true }], providerHealth: async () => new Map() } as never, quota: async () => [{ provider: 'codex', lowestPct: 0, fetchedAt: new Date().toISOString() }] as never, owner, paseo: {} as never, env: {} as never, notify: async (_title, text) => { notified.push(text); } });
+  const d = new Dispatcher({ workforce: { config: async () => DEFAULT_CONFIG, defs: async () => [{ role: 'engineering', provider: 'codex', enabled: true }], providerHealth: async () => new Map() } as never, quota: async () => [{ provider: 'codex', lowestPct: 0, fetchedAt: new Date().toISOString() }] as never, owner, paseo: {} as never, env: {} as never, sidecar: {} as never, notify: async (_title, text) => { notified.push(text); } });
   return d as unknown as { ownerAging(now: number, report: { notices: string[] }): Promise<void>; dailyBrief(now: number, cfg: typeof DEFAULT_CONFIG, report: { notices: string[] }): Promise<void> };
 };
 
