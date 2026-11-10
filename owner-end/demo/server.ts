@@ -1,6 +1,6 @@
 import { resolve } from 'node:path';
 import { DemoStore, DemoError } from './store.ts';
-import { parseSnapshot, seed, type Snapshot } from './data.ts';
+import { parseSnapshot } from './data.ts';
 
 export const CSP="default-src 'self'; script-src 'self'; connect-src 'self'; style-src 'self'; img-src 'self' data: blob:; font-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 const root=resolve(import.meta.dir,'..');
@@ -46,8 +46,10 @@ if(import.meta.main){
   if(args.some((x,i)=>i%2===0&&!['--port','--snapshot'].includes(x))||args.length%2)throw Error('用法：pnpm demo [--port 6006] [--snapshot /绝对路径/design-snapshot.json]');
   const port=args.includes('--port')?Number(arg('--port')):6006;
   if(!Number.isInteger(port)||port<1024||port>65535)throw Error('端口必须为 1024–65535');
-  let data:Snapshot=seed();
-  if(args.includes('--snapshot')){const file=Bun.file(resolve(arg('--snapshot')!));if(file.size>10_000_000)throw Error('快照超过 10 MB');data=parseSnapshot(await file.json());}
+  const snapshotPath=args.includes('--snapshot')?resolve(arg('--snapshot')!):resolve(import.meta.dir,'production.snapshot.json');
+  const file=Bun.file(snapshotPath);
+  if(file.size>10_000_000)throw Error('快照超过 10 MB');
+  const data=parseSnapshot(await file.json());
   await buildDemo();
   const origin=`http://127.0.0.1:${port}`;
   Bun.serve({hostname:'127.0.0.1',port,maxRequestBodySize:1_000_000,fetch:handler(new DemoStore(data),origin)});

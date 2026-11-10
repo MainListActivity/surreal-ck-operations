@@ -73,3 +73,18 @@ test('生产导出脚本仅请求固定只读接口，下载文件不含会话�
  expect(parseSnapshot(JSON.parse(text)).requirements.length).toBe(9);
  expect(calls).not.toContain('db.write');expect(calls).not.toContain('db.read');
 });
+
+test('仓库生产快照可直接加载，关联有效且本地修改不污染快照', async()=>{
+ const original=await Bun.file(resolve(import.meta.dir,'../demo/production.snapshot.json')).json();
+ expect(original.source).toBe('sanitized-production');
+ const data=parseSnapshot(original);
+ expect([data.products.length,data.requirements.length,data.feedback.length,data.tasks.length,data.agents.length,data.notes.length]).toEqual([3,1,1,13,1,88]);
+ const store=new DemoStore(data);
+ for(const row of data.requirements)expect(data.products.some(p=>p.id===row.project)).toBe(true);
+ for(const row of data.feedback){expect(data.products.some(p=>p.id===row.project)).toBe(true);if(row.requirement)expect(data.requirements.some(r=>r.id===row.requirement)).toBe(true);}
+ const before=JSON.stringify(original);
+ store.command('requirement.create',{project:data.products[0]!.id,title:'设计师本地新增',problem:'测试本地编辑',acceptance:'只修改内存'});
+ expect(store.data.requirements.length).toBe(2);
+ store.reset();expect(store.data.requirements.length).toBe(1);
+ expect(JSON.stringify(await Bun.file(resolve(import.meta.dir,'../demo/production.snapshot.json')).json())).toBe(before);
+});
