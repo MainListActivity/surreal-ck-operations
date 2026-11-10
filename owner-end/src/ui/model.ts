@@ -401,9 +401,9 @@ export function noteLanes(notes: ReadonlyArray<{ lane: string }>): string[] {
   return [...new Set(notes.map(n => n.lane))].sort();
 }
 
-export function pageOf(hash: string): 'board' | 'tasks' | 'notes' | 'staff' | 'ops' {
+export function pageOf(hash: string): 'board' | 'requirements' | 'tasks' | 'notes' | 'staff' | 'ops' {
   const name = hash.replace(/^#\/?/, '');
-  return name === 'tasks' || name === 'notes' || name === 'staff' || name === 'ops' ? name : 'board';
+  return name === 'requirements' || name === 'tasks' || name === 'notes' || name === 'staff' || name === 'ops' ? name : 'board';
 }
 
 /** 命令面板的一组命令。 */

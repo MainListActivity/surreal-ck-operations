@@ -75,7 +75,8 @@ describe('the schema a target version must have reached', () => {
     expect(schemaRequirementFor('0.6.0')).toEqual({ schema: 61, tables: ['node_release', 'node_rollback'] });
     expect(schemaRequirementFor('0.7.0')).toEqual({ schema: 61, tables: [] });
     expect(schemaRequirementFor('0.7.1')).toEqual({ schema: 62, tables: [] });
-    expect(CLOUD_SCHEMA_VERSION).toBe(62);
+    expect(schemaRequirementFor('0.9.0').schema).toBe(63);
+    expect(CLOUD_SCHEMA_VERSION).toBe(63);
   });
 
   test('the version in package.json needs the schema this code applies', () => {

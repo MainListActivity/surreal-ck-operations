@@ -1,3 +1,4 @@
+import { ITERATION_COMMANDS, iterationCommand } from './iteration-commands.ts';
 /**
  * 命令分流（POST /api/cmd）。按调用方身份决定命令怎么执行；写操作与被拒的调用都写 ops_audit（只存摘要，不存原文）。
  * - 老板（owner）：令牌直接连库（$access='owner'）。执行端命令（isRunnerCommand）排队到 ops_job，最多等 25 秒，超时返回 pending；
@@ -160,6 +161,10 @@ async function ownerCall(deps: GatewayDeps, caller: OwnerCaller, command: string
 /** 按命令分派。老板与员工共用，差别只在 who：执行端作业的身份与任务、核心写入的标签。 */
 async function dispatch(deps: GatewayDeps, db: Surreal, who: Who, command: string, input: Input): Promise<unknown> {
   const { cfg } = deps;
+  if (ITERATION_COMMANDS.has(command)) {
+    if (who.actorKind !== 'owner') throw new CompanyError('forbidden', '需求决策只能由老板执行');
+    return iterationCommand(db, command, input, who.actor);
+  }
   if (isRunnerCommand(command)) return queueJob(deps, db, who, command, input);
   if (IDENTITY_COMMANDS.has(command)) return identityCommand(cfg, db, command, input, deps.fetch);
   if (POLICY_COMMANDS.has(command)) return policyCommand(db, command, input, who.actor, cfg.locks);

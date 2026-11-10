@@ -76,9 +76,9 @@ export class OutboundMessageStore {
 
   /** 建任务时为执行岗与复核岗各生成一条 draft；幂等：已有 draft 不重复生成。 */
   async createTaskDrafts(taskId: string, executorRole: string, reviewerRole: string, code: boolean,
-    bodies: { execute?: string; review?: string } = {}): Promise<OutboundMessage[]> {
+    bodies: { execute?: string; review?: string; includeSent?: boolean } = {}): Promise<OutboundMessage[]> {
     const [existing] = await this.db.query<[Array<Record<string, unknown>>]>(
-      `SELECT * FROM outbound_message WHERE task = $task AND step IN ['execute','review'] AND state != 'sent' ORDER BY created_at;`,
+      `SELECT * FROM outbound_message WHERE task = $task AND step IN ['execute','review'] ${bodies.includeSent ? '' : "AND state != 'sent'"} ORDER BY created_at;`,
       { task: this.task(taskId) });
     const have = new Set((existing ?? []).map(row => String(row.step)));
     const out: OutboundMessage[] = [];

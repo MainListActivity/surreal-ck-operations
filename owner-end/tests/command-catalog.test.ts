@@ -1,3 +1,4 @@
+import { ITERATION_COMMANDS } from '../src/iteration-commands.ts';
 import { describe, expect, test } from 'bun:test';
 
 import { commandCatalogOf, type CatalogEntry } from '../src/catalog.ts';
@@ -41,7 +42,7 @@ describe('命令目录的内容', () => {
       'message.edit', 'message.edit_rendered', 'message.release', 'message.send', 'host.exec',
     ];
     const known = new Set([
-      ...OWNER_API_COMMANDS, ...RUNNER_ONLY_COMMANDS, ...IDENTITY_COMMANDS, ...POLICY_COMMANDS, ...TRANSLATE_COMMANDS, ...local,
+      ...ITERATION_COMMANDS, ...OWNER_API_COMMANDS, ...RUNNER_ONLY_COMMANDS, ...IDENTITY_COMMANDS, ...POLICY_COMMANDS, ...TRANSLATE_COMMANDS, ...local,
     ]);
     const listed = new Set(namesOf(COMMAND_CATALOG));
     expect([...known].filter((command) => !listed.has(command))).toEqual([]);

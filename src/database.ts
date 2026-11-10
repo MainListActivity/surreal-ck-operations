@@ -100,7 +100,7 @@ const pause = (ms: number): Promise<void> => new Promise(resolve => {
 });
 
 /** 本版本 applySchema 的最后一个结构版本；云端 bootstrap 只核对库内版本不低于它。 */
-export const CLOUD_SCHEMA_VERSION = 62;
+export const CLOUD_SCHEMA_VERSION = 63;
 
 export class CompanyDatabase {
   /** 当前会话的客户端；云端续期或重连时整体替换（见 rebuildNow）。 */
@@ -439,7 +439,7 @@ export class CompanyDatabase {
   }
 
   /**
-   * 按序应用全部 schema（001 至 062；055 按配置渲染）。fresh 时写入归属标记。本机 bootstrap 与云端 company-migrate 共用；
+   * 按序应用全部 schema（001 至 063；055 按配置渲染）。fresh 时写入归属标记。本机 bootstrap 与云端 company-migrate 共用；
    * 云端只有 migrator 能应用。
    */
   async applySchema(fresh: boolean): Promise<void> {
@@ -602,6 +602,8 @@ export class CompanyDatabase {
     // 062：删除 outbox 事件表、序号索引与计数器（0.7.1）。0.7.0 起核心不再写 outbox；前提是所有执行端已是 0.7.0 或更新。
     await this.db.query(loadSchema('062-drop-outbox.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 62 WHERE schema_version < 62;');
+    await this.db.query(loadSchema('063-product-iteration.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 63 WHERE schema_version < 63;');
   }
 
   /** Selects the configured namespace/database without touching schema (runtimes that only query). */

@@ -95,9 +95,9 @@ export function TasksPage() {
       </Panel>
 
       <Panel
-        title="需求与任务"
-        hint="新建需求会进入队列，由调度器派给执行岗。"
-        actions={<button type="button" class="primary" onClick={() => setCreating(c => !c)}>{creating ? '收起' : '新建需求'}</button>}
+        title="执行任务"
+        hint="这里直接创建执行任务；尚未决定开工的问题请先放入需求池。"
+        actions={<button type="button" class="primary" onClick={() => setCreating(c => !c)}>{creating ? '收起' : '新建任务'}</button>}
       >
         {creating ? <TaskForm onDone={() => { setCreating(false); void loadList(); }} onCancel={() => setCreating(false)} /> : null}
         {listError ? <p class="notice err">任务列表读取失败：{listError}</p> : null}
@@ -190,7 +190,7 @@ export function TaskForm({ parent, onDone, onCancel }: {
       reviewerRole: form.reviewerRole,
       ...(form.type.trim() ? { type: form.type.trim() } : {}),
       ...(parent ? { parent } : {}),
-    }, parent ? '已添加子任务' : '已创建需求', () => {
+    }, parent ? '已添加子任务' : '已创建任务', () => {
       setForm(EMPTY_FORM);
       onDone();
     });
@@ -198,7 +198,7 @@ export function TaskForm({ parent, onDone, onCancel }: {
 
   return (
     <form class="form" onSubmit={submit} noValidate>
-      <h4>{parent ? '新建子任务' : '新建需求'}</h4>
+      <h4>{parent ? '新建子任务' : '新建任务'}</h4>
       <label class="field">
         <span>标题（必填）</span>
         <input value={form.title} disabled={busy} onInput={e => set('title')(e.currentTarget.value)} />
@@ -228,7 +228,7 @@ export function TaskForm({ parent, onDone, onCancel }: {
       {problems.length ? <ul class="errors">{problems.map(p => <li key={p}>{p}</li>)}</ul> : null}
       <NoticeLine notice={notice} />
       <div class="button-row">
-        <button type="submit" class="primary" disabled={busy}>{parent ? '添加子任务' : '提交需求'}</button>
+        <button type="submit" class="primary" disabled={busy}>{parent ? '添加子任务' : '提交任务'}</button>
         {onCancel ? <button type="button" disabled={busy} onClick={onCancel}>取消</button> : null}
       </div>
     </form>
