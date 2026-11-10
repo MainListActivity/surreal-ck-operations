@@ -31,6 +31,13 @@ test('整理模型只能关联给定候选，不能通过模型输出伪造批�
   expect(()=>feedbackDecision({disposition:'existing',category:'bug',reason:'重复',requirementId:'foreign'},['local'])).toThrow();
   expect(feedbackDecision({disposition:'existing',category:'bug',reason:'重复',requirementId:'local'},['local']).requirementId).toBe('local');
 });
+test('模型逐条验收数组转为需求文本，拒绝对象与超长内容',()=>{
+  const base={disposition:'new',category:'bug',reason:'需要修复',title:'主机统计',problem:'重复计算主机'};
+  expect(feedbackDecision({...base,acceptance:[' 主机不重复 ', '离线员工仍可见']},[]).acceptance).toBe('主机不重复\n离线员工仍可见');
+  expect(()=>feedbackDecision({...base,acceptance:[{text:'不能猜测对象语义'}]},[])).toThrow();
+  expect(()=>feedbackDecision({...base,acceptance:['字'.repeat(3001)]},[])).toThrow();
+  expect(()=>feedbackDecision({...base,acceptance:Array(31).fill('标准')},[])).toThrow();
+});
 
 import { iterationPlan } from '../src/iteration/planning.ts';
 import { iterationMessages } from '../src/iteration/execution.ts';
