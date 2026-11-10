@@ -11,7 +11,7 @@ export async function feedbackList(db: Surreal, project: string, offset = 0, req
   return rows.map(row => ({ ...row, id:String(row.id.id), body:JSON.parse(row.body) }) as FeedbackView);
 }
 export async function retryFeedback(db: Surreal, id: string, actor: string): Promise<void> {
-  const [rows] = await db.query<[unknown[]]>(`UPDATE $id SET state='new', attempts=0, worker=NONE, reason=NONE, last_error=NONE, actor=$actor, updated_at=time::now()
+  const [rows] = await db.query<[unknown[]]>(`UPDATE $id SET state='new', attempts=0, worker=NONE, reason=NONE, last_error=NONE, diagnostic=NONE, actor=$actor, updated_at=time::now()
     WHERE state IN ['failed','dismissed'] RETURN AFTER;`, {id:new RecordId('product_feedback',id),actor});
   if (!rows.length) throw new CompanyError('conflict','仅失败或已忽略的反馈可以重新整理');
 }

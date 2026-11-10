@@ -183,7 +183,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
   const t = detail.task;
   const text = (key: string) => (typeof t[key] === 'string' && (t[key] as string).trim() ? t[key] as string : undefined);
   const description = text('requirement');
-  const acceptance = text('acceptanceText') ?? text('acceptance') ?? text('acceptance_head');
+  const acceptance = text('acceptance_text') ?? text('acceptanceText') ?? text('acceptance');
   const parent = t.parent ? taskIdOf({ id: t.parent }) : undefined;
   const done = (message: string) => { setPanel(null); setNotice(message); setTick(x => x + 1); };
 
