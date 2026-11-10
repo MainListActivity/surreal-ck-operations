@@ -21,13 +21,12 @@ export function RequirementsPage({onDirtyChange}:{onDirtyChange?:(dirty:boolean)
   const [busy,setBusy]=useState(false),[error,setError]=useState(''),[notice,setNotice]=useState('');
   useEffect(()=>{void runCommand<{products:Product[]}>('product.iteration.list').then(out=>{if(out.kind==='ok')setProducts(out.result.products);else setError(outcomeText(out,''));}).catch(()=>setError('产品列表读取失败'));},[]);
   const load=useCallback(async()=>{
-    if(!project)return;
     const current=++generation.current;
-    const out=await runCommand<{requirements:Requirement[]}>('requirement.list',{project,offset});
+    const out=await runCommand<{requirements:Requirement[]}>('requirement.list',{...(project?{project}:{}),offset});
     if(current!==generation.current)return;
     if(out.kind==='ok')setItems(out.result.requirements);else setError(outcomeText(out,''));
   },[project,offset]);
-  useEffect(()=>{let active=true;setSelected(undefined);setEditing(false);setPolicy(undefined);setPolicyLoaded(false);setSettings(false);setError('');
+  useEffect(()=>{let active=true;setSelected(previous=>previous?.project===project?previous:undefined);setEditing(previous=>selected?.project===project?previous:false);setPolicy(undefined);setPolicyLoaded(false);setSettings(false);setError('');
     void load().catch(()=>active&&setError('需求列表读取失败'));
     if(project)void runCommand<{policy:ProductPolicy|null}>('product.iteration.get',{project}).then(out=>{if(!active)return;if(out.kind==='ok'){setPolicy(out.result.policy??undefined);setPolicyLoaded(true);}else setError(outcomeText(out,''));}).catch(()=>active&&setError('配置读取失败'));
     return()=>{active=false;generation.current++;};
@@ -44,16 +43,17 @@ export function RequirementsPage({onDirtyChange}:{onDirtyChange?:(dirty:boolean)
   const editable=!selected||['draft','pending','rejected'].includes(selected.state);
   return <div class="page">
     <Panel title="需求池" hint="先整理问题和验收标准；只有确认开工后才会进入执行流程。">
-      <label>产品<select value={project} disabled={busy||dirty} onChange={e=>{setProject(e.currentTarget.value);setOffset(0);setItems([]);setNotice('');}}><option value="">选择产品</option>{products.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label>
+      <label>产品<select value={project} disabled={busy||dirty} onChange={e=>{setProject(e.currentTarget.value);setOffset(0);setItems([]);setNotice('');}}><option value="">全部产品</option>{products.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label>
+      {!project?<button disabled={busy||dirty} onClick={()=>void load().catch(()=>setError('刷新失败'))}>刷新全部需求</button>:null}
       {!products.length?<Empty>请先登记产品项目，再录入需求。</Empty>:null}
       {project?<div class="actions"><button disabled={busy||dirty} onClick={()=>{setSelected(undefined);setDraft(EMPTY);setEditing(true);}}>新建需求</button><button disabled={busy||!policyLoaded} onClick={()=>setSettings(!settings)}>产品反馈与发布设置</button><button disabled={busy||dirty} onClick={()=>{if(selected)void act('requirement.get',{id:selected.id},'需求进度已刷新');else void load().catch(()=>setError('刷新失败'));}}>刷新需求与进度</button></div>:null}
       {error?<p role="alert" class="notice err">{error}</p>:null}{notice?<p role="status" class="notice">{notice}</p>:null}
       {project&&settings?<PolicyEditor key={project+JSON.stringify(policy)} initial={policy??EMPTY_POLICY} busy={busy} save={async value=>{if(await act('product.iteration.configure',{project,...value},'产品配置已保存')){setPolicy(value);setSettings(false);}}}/>:null}
     </Panel>
-    {project?<Panel title="产品需求">
-      {items.length?<table><thead><tr><th>需求</th><th>状态</th><th>优先级</th><th>修订</th></tr></thead><tbody>{items.map(r=><tr key={r.id}><td><button disabled={busy||dirty} onClick={()=>{setSelected(r);setDraft(draftOf(r));setEditing(true);setNotice('');}}>{r.title}</button></td><td>{STATES[r.state]??r.state}</td><td>P{r.priority}</td><td>{r.revision}</td></tr>)}</tbody></table>:<Empty>当前页没有需求。</Empty>}
+    <Panel title={project?'产品需求':'全部产品需求'}>
+      {items.length?<table><thead><tr><th>产品</th><th>需求</th><th>状态</th><th>优先级</th><th>修订</th></tr></thead><tbody>{items.map(r=><tr key={r.id}><td>{products.find(p=>p.id===r.project)?.name??r.project}</td><td><button disabled={busy||dirty} onClick={()=>{setSelected(r);setDraft(draftOf(r));setEditing(true);setNotice('');if(project!==r.project){setProject(r.project);setOffset(0);}}}>{r.title}</button></td><td>{STATES[r.state]??r.state}</td><td>P{r.priority}</td><td>{r.revision}</td></tr>)}</tbody></table>:<Empty>当前页没有需求。</Empty>}
       <div class="actions"><button disabled={busy||dirty||offset===0} onClick={()=>setOffset(Math.max(0,offset-100))}>上一页</button><span>第 {offset/100+1} 页</span><button disabled={busy||dirty||items.length<100} onClick={()=>setOffset(offset+100)}>下一页</button></div>
-    </Panel>:null}
+    </Panel>
     {project&&editing?<Panel title={selected?'需求详情':'新建需求'}>
       <form onSubmit={e=>{e.preventDefault();void act(selected?'requirement.edit':'requirement.create',{project,...draft,...(selected?{id:selected.id,revision:selected.revision}:{})},'需求已保存，尚未开工');}}>
         <label>标题<input required maxLength={200} disabled={!editable||busy} value={draft.title} onInput={e=>setDraft({...draft,title:e.currentTarget.value})}/></label>
