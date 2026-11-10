@@ -23,11 +23,14 @@ export const INTERRUPT_GRACE_MS = 45_000;
 export class TurnInterruptions {
   private stopped = false;
   private readonly timers = new Set<ReturnType<typeof setTimeout>>();
-  private readonly started = new Map<string, number>();
+  private readonly started = new Map<string, {at: number; turn?: string | null}>();
   constructor(private readonly graceMs = INTERRUPT_GRACE_MS) {}
   get stopping(): boolean { return this.stopped; }
-  turnStarted(agentId: string): void { this.started.set(agentId, Date.now()); }
-  startedSince(agentId: string, at: number): boolean { return (this.started.get(agentId) ?? 0) >= at; }
+  turnStarted(agentId: string, turn?: string | null): void { this.started.set(agentId, {at: Date.now(), turn}); }
+  startedSince(agentId: string, at: number, endedTurn?: string | null): boolean {
+    const started = this.started.get(agentId);
+    return !!started && (started.at >= at || !!(endedTurn && started.turn && started.turn !== endedTurn));
+  }
   defer(run: () => Promise<void>): void {
     if (this.stopped) return;
     const timer = setTimeout(() => {
@@ -95,13 +98,13 @@ async function settleTurn(ctx: TurnContext, runtime: Pick<AgentRuntime, "send">,
         await ctx.sidecar.releaseClaim(instId, taskId, `第 ${nudges} 轮无收尾退出且会话无法唤醒，收回任务重派`);
       }
     } else if (kind !== "completed" && interruptions) {
-      const endedAt = Date.now();
+      const endedAt = event.observedAt ?? Date.now();
       if (interruptions.stopping) {
         console.log(`silent-turn kept ${taskId} on ${instId}: turn ${kind} while the plugin is stopping`);
         return;
       }
       interruptions.defer(async () => {
-        if (interruptions.startedSince(event.agent.id, endedAt) || !ctx.sidecar.holdsLease(instId, taskId)) return;
+        if (interruptions.startedSince(event.agent.id, endedAt, event.turnId) || !ctx.sidecar.holdsLease(instId, taskId, res.silent?.deliveryId)) return;
         await ctx.sidecar.releaseClaim(instId, taskId, `turn 以 ${kind} 结束且未提交 report.md/blocker.md，回收任务重派`);
         console.log(`silent-turn released ${taskId} from ${instId} (outcome=${kind}, silent turns=${nudges})`);
       });
