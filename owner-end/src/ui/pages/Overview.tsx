@@ -1,9 +1,10 @@
+import { WorkContextFiles } from "../WorkContext.tsx";
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import type { RuntimeDashboard, RuntimeAgentView } from '../../../../src/runtime-dashboard.ts';
 import { readDashboard, outcomeText } from '../api.ts';
 import { useLiveRefresh, useLiveState } from '../realtime.ts';
-import { expireObservations, useObservationClock } from '../runtime-state.ts';
-import { Badge, Dialog, ErrorState, Loading, ProgressBar, roleText } from '../common.tsx';
+import { expireObservations, remainingText, useObservationClock } from '../runtime-state.ts';
+import { Badge, ErrorState, Loading, ProgressBar, roleText } from '../common.tsx';
 import { hrefOf, clockText, durationText } from '../model.ts';
 
 const states = {
@@ -169,68 +170,63 @@ function Connections({
 }
 function AgentCard({
   agent: a,
-  open,
+  hostName,
+  focus,
   selected,
 }: {
   agent: RuntimeAgentView;
-  open(): void;
+  hostName: string;
+  focus(): void;
   selected: boolean;
 }) {
   const state = states[a.state];
   return (
-    <button
-      type="button"
+    <article
       class={`runtime-agent ${selected ? 'selected' : ''}`}
       data-agent={a.id}
-      onClick={open}
+      aria-label={`${a.name}的执行情况`}
     >
-      <span class="agent-identity">
+      <header class="agent-identity">
         <span class={`agent-symbol role-${a.role}`}>
           <Glyph kind={a.role} />
         </span>
         <span>
-          <strong>{a.name}</strong>
+          <strong>{a.name} <small>{roleText(a.role)}</small></strong>
           <small>
             {a.model ?? '模型未上报'}
-            {a.modelSource === 'configured' ? ' · 配置值' : ''}
+            {a.modelSource === 'configured' ? ' · 配置值' : ''} · {a.runtime === 'native' ? '原生执行' : a.runtime === 'paseo' ? 'Paseo' : '运行器待上报'}
           </small>
         </span>
         <Badge tone={state[1]}>{state[0]}</Badge>
-      </span>
-      <span class="agent-work">
-        <strong>{a.taskTitle ? '正在处理：' : '当前：'}</strong>
+      </header>
+      <div class="agent-work">
+        <span>{a.taskTitle ? a.phase === 'review' ? '正在复核' : '当前任务' : '当前'}</span>
         {a.taskTitle ?? (a.state === 'idle' ? '等待下一项任务' : '暂无任务信息')}
-      </span>
-      <span class="agent-prompt" title={a.currentPrompt?.text}>
-        {a.currentPrompt?.text ?? '尚无本轮已发送提示词记录'}
-      </span>
-      <span class="agent-progress">
-        {a.progress ? (
-          <>
-            <ProgressBar
-              value={a.progress.total ? (a.progress.done / a.progress.total) * 100 : 0}
-              label={a.progress.label}
-            />
-            <span title={a.progress.label}>
-              {Math.round((a.progress.done / a.progress.total) * 100)}%（{a.progress.done} /{' '}
-              {a.progress.total}）
-            </span>
-          </>
-        ) : (
-          <span class="muted">{a.action || '暂无可量化进度'}</span>
-        )}
-        <span class="elapsed">
-          ◷ {a.elapsedSeconds === undefined ? '—' : durationText(a.elapsedSeconds)}
-        </span>
-      </span>
-      <span class="agent-next">
-        ☷ <b>本 Agent 下一条</b> · {a.next ? `预计：${a.next.title}` : '暂无候选任务'}
-      </span>
-      <span class="agent-destination">
-        ↗ <b>当前任务下一站</b> ·{' '}
-        {a.destination ? `${roleText(a.destination.role)}（待调度）` : '待上游结果或计划确定'}
-      </span>
-    </button>
+      </div>
+      <dl class="agent-facts">
+        <div><dt>所属项目</dt><dd>{a.project?.name ?? (a.taskId ? '项目未关联' : '待分配')}</dd></div>
+        <div><dt>执行电脑</dt><dd>{hostName}</dd></div>
+        <div><dt>本阶段已用</dt><dd>{a.elapsedSeconds === undefined ? '—' : durationText(a.elapsedSeconds)}</dd></div>
+        <div class="agent-eta"><dt>预计还需{a.estimate?.samples ? ` · 历史 ${a.estimate.samples} 次` : ''}</dt><dd>{remainingText(a)}</dd></div>
+      </dl>
+      {a.taskId || a.activity ? <ActivityFeed agent={a} /> : null}
+      {a.progress ? <div class="agent-progress">
+        <span>{a.progress.label} {a.progress.done}/{a.progress.total}</span>
+        <ProgressBar value={a.progress.total ? (a.progress.done / a.progress.total) * 100 : 0} label={a.progress.label} />
+      </div> : null}
+      <div class="agent-next"><b>下一条</b> · {a.next?.title ?? '暂无候选任务'}</div>
+      {a.destination ? <div class="agent-destination"><b>交给</b> · {roleText(a.destination.role)}（提交后调度）</div> : null}
+      <details class="agent-brief">
+        <summary>任务资料与派工内容</summary>
+        <p class="hint">{a.currentPrompt?.source === 'sent' ? '实际发送内容' : a.currentPrompt ? '历史模板，旧执行端未记录实际正文' : '尚无本轮派工内容'}</p>
+        {a.currentPrompt ? <pre class="runtime-prompt-full">{a.currentPrompt.text}{a.currentPrompt.truncated ? '\n（内容已截断）' : ''}</pre> : null}
+        <WorkContextFiles value={a.currentPrompt?.context} />
+        {a.next ? <><h3>下一条 · 尚未派工</h3><p class="hint">{a.next.reason}</p>
+          <pre class="runtime-prompt-full">{a.next.prompt?.text ?? a.next.title}</pre>
+          <WorkContextFiles value={a.next.prompt?.context} /></> : null}
+        {a.taskId ? <div class="agent-detail-links"><a href={hrefOf('tasks', a.taskId)}>查看任务</a><button class="link" onClick={focus}>高亮任务流转</button></div> : null}
+      </details>
+    </article>
   );
 }
 export function OverviewPage() {
@@ -238,9 +234,7 @@ export function OverviewPage() {
   const [focusedTask, setFocusedTask] = useState<string>();
   const [error, setError] = useState('');
   const [paused, setPaused] = useState(false);
-  const [selected, setSelected] = useState<string>();
   const [active, setActive] = useState(new Set<string>());
-  const [eventsOpen, setEventsOpen] = useState(false);
   const seen = useRef<Set<string> | undefined>(undefined);
   const loading = useRef(false);
   const pending = useRef(false);
@@ -290,7 +284,7 @@ export function OverviewPage() {
   }, [load]);
   useLiveRefresh(
     [
-      'task',
+      'agent_activity', 'task', 'project',
       'employee',
       'audit',
       'runner_heartbeat',
@@ -332,7 +326,6 @@ export function OverviewPage() {
         )}
       </div>
     );
-  const chosen = data.agents.find((a) => a.id === selected);
   const flow = focusedTask
     ? data.transfers.filter((t) => t.taskId === focusedTask)
     : data.transfers.slice(-4);
@@ -451,10 +444,8 @@ export function OverviewPage() {
                     <AgentCard
                       key={a.id}
                       agent={a}
-                      open={() => {
-                        setSelected(a.id);
-                        setFocusedTask(a.taskId);
-                      }}
+                      hostName={h.name}
+                      focus={() => setFocusedTask(a.taskId)}
                       selected={!!focusedTask && focusedTask === a.taskId}
                     />
                   ))}
@@ -501,12 +492,10 @@ export function OverviewPage() {
         <section class="panel">
           <header class="panel-head">
             <h2>最近事件</h2>
-            <button class="link" onClick={() => setEventsOpen(true)}>
-              查看全部
-            </button>
+            <small>最近 {data.events.length} 条</small>
           </header>
           <ul class="runtime-events">
-            {data.events.slice(0, 5).map((e) => (
+            {data.events.map((e) => (
               <li key={e.id}>
                 <time>{clockText(e.at)}</time>
                 <span>
@@ -566,67 +555,36 @@ export function OverviewPage() {
           <p class="hint">暂无已回传的 GitHub 证据，暂不能判断构建或生产部署结果。</p>
         )}
       </section>
-      {chosen ? (
-        <Dialog
-          title={`${chosen.name} · ${data.hosts.find((h) => h.id === chosen.hostId)?.name ?? '主机未知'}`}
-          onClose={() => setSelected(undefined)}
-          footer={
-            <>
-              {chosen.taskId ? (
-                <a class="button primary" href={hrefOf('tasks', chosen.taskId)}>
-                  查看执行任务
-                </a>
-              ) : null}
-              <button onClick={() => setSelected(undefined)}>关闭</button>
-            </>
-          }
-        >
-          <p>
-            {chosen.provider} · {chosen.model ?? '模型未上报'} · {states[chosen.state][0]}
-          </p>
-          <h3>当前提示词</h3>
-          <p class="hint">
-            {chosen.currentPrompt?.source === 'sent'
-              ? '实际发送内容'
-              : chosen.currentPrompt
-                ? '历史模板，旧执行端未记录实际发送文本'
-                : '尚无本轮提示词记录'}
-            {chosen.currentPrompt?.truncated ? '（超过 16000 字，已截断）' : ''}
-          </p>
-          <pre class="runtime-prompt-full">{chosen.currentPrompt?.text ?? '未知'}</pre>
-          <h3>本 Agent 下一条 · 预计候选</h3>
-          <p>{chosen.next?.reason ?? '尚无候选，不进行远期预测'}</p>
-          <pre class="runtime-prompt-full">
-            {chosen.next?.prompt?.text ?? chosen.next?.title ?? '待上游结果生成'}
-          </pre>
-          <h3>当前任务下一站</h3>
-          <p>
-            {chosen.destination
-              ? `${roleText(chosen.destination.role)} · ${chosen.destination.label}`
-              : '待当前结果与调度决策确定'}
-          </p>
-          <p class="hint">
-            需求任务的验收数量表示整体进展，不代表当前模型响应的完成百分比。运行记录与已提交成果见执行任务详情。
-          </p>
-        </Dialog>
-      ) : null}
-      {eventsOpen ? (
-        <Dialog title="最近运行事件（最多 40 条）" onClose={() => setEventsOpen(false)}>
-          <ul class="runtime-events">
-            {data.events.map((e) => (
-              <li key={e.id}>
-                <time>{clockText(e.at)}</time>
-                <span>
-                  {e.actor} · {e.label}{' '}
-                  {e.taskId ? (
-                    <a href={hrefOf('tasks', e.taskId)}>{e.taskTitle ?? e.taskId}</a>
-                  ) : null}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </Dialog>
-      ) : null}
+      <p class="runtime-data-note">公开输出每 30 秒上报，新内容自动滚动到末尾；只展示近 24 小时内每轮最近 40 条记录。工具次数不代表完成比例。预计时间参考近 30 天同项目、岗位和阶段的历史耗时，至少 5 次；不含后续复核和上线。</p>
     </div>
   );
+}
+
+function ActivityFeed({agent}: {agent: RuntimeAgentView}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const follow = useRef(true);
+  const activity = agent.activity;
+  useEffect(() => { follow.current = true; }, [activity?.turn]);
+  useEffect(() => { if (follow.current && ref.current) ref.current.scrollTop = ref.current.scrollHeight; }, [activity?.turn, activity?.events.at(-1)?.seq]);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const observer = new ResizeObserver(() => { if (follow.current) el.scrollTop = el.scrollHeight; });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [activity?.turn]);
+  if (!activity) return <div class="agent-activity-empty">{agent.runtime === 'paseo' ? 'Paseo 会话尚未接入实时输出' : '等待执行端上报本轮进度'}{agent.action ? ` · ${agent.action}` : ''}</div>;
+  return <section class="agent-activity" aria-label={`${agent.name}的近期输出`}>
+    <div class="agent-activity-heading">
+      <strong>{agent.state === 'unknown' ? '连接中断 · 保留最近输出' : activity.tool ? `正在调用 ${activity.tool}` : activity.state === 'running' ? '本轮执行中' : activity.state === 'completed' ? '本轮已结束 · 等待流程收尾' : activity.state === 'failed' ? '本轮执行失败' : '本轮已停止'}</strong>
+      <span>上报 {clockText(activity.observedAt)} · 工具 {activity.toolsCompleted} 次</span>
+    </div>
+    <div class="agent-activity-feed" ref={ref} tabIndex={0} aria-label="近期公开输出，自动跟随最新内容"
+      onWheel={e => { if (e.deltaY < 0) follow.current = false; }} onTouchStart={() => { follow.current = false; }}
+      onPointerDown={() => { follow.current = false; }} onKeyDown={e => { if (['ArrowUp','PageUp','Home'].includes(e.key)) follow.current = false; }}
+      onScroll={() => { const el = ref.current!; if (el.scrollHeight - el.scrollTop - el.clientHeight < 32) follow.current = true; }}>
+      {activity.events.map(e => <div key={`${activity.turn}:${e.seq}`} class={`activity-${e.kind}`}><time>{clockText(e.at)}</time><pre>{e.text}</pre></div>)}
+      {!activity.events.length ? <p class="hint">回合已启动，等待公开输出</p> : null}
+    </div>
+  </section>;
 }

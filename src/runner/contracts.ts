@@ -51,6 +51,10 @@ export interface SpawnInput {
 
 /** The dispatcher's only view of Paseo. Implemented by the paseo CLI; faked in tests. */
 export interface AgentRuntime {
+  heartbeat?(): Promise<void>;
+  /** Bounded public progress; separate from business completion. */
+  activity?(): import('../agent-activity.ts').AgentActivity[];
+  acknowledgeActivity?(agent: string, turn: string): void;
   list(): Promise<Map<string, AgentInfo>>;
   /**
    * `undefined` only when the CLI confirms the agent does not exist (AGENT_NOT_FOUND). When the CLI could not answer

@@ -1,4 +1,5 @@
 import { createHostSampler, writeHostTelemetry, writeRuntimeObservation } from './telemetry.ts';
+import { writeAgentActivity, expireAgentActivity } from './activity-store.ts';
 import { reconcileIterations, iterationMessages } from '../iteration/execution.ts';
 import { DispatchTimings } from "../diagnostics.ts";
 import { RUNNER_BEAT_MS, writeBoardView, writeRunnerHeartbeat } from "../board.ts";
@@ -338,6 +339,7 @@ function beatRunner(): void {
   beatBusy = true;
   void company()
     .then(async ctx => {
+      await ctx.runtime.heartbeat?.();
       const version = await ctx.runnerVersion().catch(() => "unknown");
       await writeRunnerHeartbeat(ctx.db.db, { runner: ctx.runnerId ?? `plugin:${process.pid}`, host: hostname(), version });
       await writeHostTelemetry(ctx.db.db, ctx.runnerId ?? `plugin:${process.pid}`, ctx.nodeId, sampleHost())
@@ -347,6 +349,12 @@ function beatRunner(): void {
         const agents = await ctx.runtime.list();
         await Promise.all([...agents.values()].map(a => writeRuntimeObservation(ctx.db.db, a.id, a.status, observedAt, a.model)));
       } catch { console.warn('agent telemetry unavailable'); }
+      try {
+        const activities = ctx.runtime.activity?.() ?? [];
+        const saved = await writeAgentActivity(ctx.db.db, ctx.runnerId ?? `plugin:${process.pid}`, activities);
+        for (const a of saved) ctx.runtime.acknowledgeActivity?.(a.agent, a.turn);
+        await expireAgentActivity(ctx.db.db);
+      } catch { console.warn('agent activity upload deferred'); }
       // 节点记录：同一次心跳里登记本执行端的节点、主机与发行版本；失败只记 warn，与运行心跳一致。
       await beatNodeRelease(ctx.db, { node: ctx.nodeId, host: hostname(), platform: process.platform, version, sha: ctx.runnerSha, at: Math.floor(Date.now() / 1000) })
         .catch(error => console.warn(`node release heartbeat failed: ${(error as Error).message}`));

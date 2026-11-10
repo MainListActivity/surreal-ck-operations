@@ -58,6 +58,7 @@ export class DemoRuntime {
         model: row.model,
         modelSource: row.model ? 'configured' : 'unknown',
         provider: row.provider,
+        runtime: 'native',
         observedAt: at,
         state: row.policy?.disabled
           ? 'unknown'
@@ -68,12 +69,28 @@ export class DemoRuntime {
               : 'idle',
         ...(working
           ? {
+              activity: {
+                agent: `design:${id}`, turn: `design:${this.sequence}`, runtime: 'native', state: 'running',
+                startedAt: at - 180000, observedAt: at, lastActivityAt: at - 2000, toolsCompleted: 3, tool: 'Read', toolStartedAt: at - 2000,
+                events: [
+                  {seq:-3,at:at-75000,kind:'status',text:'【设计案例】原生执行端已绑定本轮任务'},
+                  {seq:-2,at:at-65000,kind:'tool_start',text:'开始调用 Read'},
+                  {seq:-1,at:at-55000,kind:'tool_end',text:'Read 调用结束'},
+                  {seq:0,at:at-45000,kind:'output',text:'【设计案例】已读取验收标准，接下来检查相关实现。'},
+                  {seq:1,at:at-25000,kind:'output',text:'【设计案例】已核对任务范围，正在检查受影响的模块与测试。'},
+                  {seq:2,at:at-18000,kind:'tool_end',text:'Read 调用结束'},
+                  {seq:3,at:at-2000,kind:'tool_start',text:'开始调用 Read'},
+                ],
+              },
               taskId: String(current?.id ?? taskId),
               taskTitle: title,
+              project: {id: String(current?.project ?? 'design-company'), name: String(this.store.data.products.find(p => p.id === current?.project)?.name ?? '【设计案例】公司工作台')},
               phase: isReviewer ? 'review' : 'execute',
               elapsedSeconds: 180 + i * 65,
+              estimate: {status: 'estimated' as const, samples: 12, lowerSeconds: 300, upperSeconds: 720},
               action: isReviewer ? '核对 PR head 的实现与 CI 结果' : '按已确认需求实施',
               currentPrompt: {
+                context: {source:'dispatched', at, delivery:'design',files:[{name:'task.md',text:`# ${title}\n\n【设计案例】需求：检查实现与验收标准的一致性。\n\n验收：附上测试结果、PR 链接与验证证据。`,truncated:false},{name:'notes.md',text:'【设计案例】PR 合并后由 GitHub 自动部署。',truncated:false}]},
                 text: `【设计案例】${title.replace(/^【设计案例】\s*/, '')}。按当前任务验收标准提交实现和测试证据，交现有 QA 独立复核。PR 合并后的构建与生产部署由 GitHub CI/CD 自动完成。`,
                 source: 'sent' as const,
                 truncated: false,

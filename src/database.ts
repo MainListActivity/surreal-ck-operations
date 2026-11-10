@@ -100,7 +100,7 @@ const pause = (ms: number): Promise<void> => new Promise(resolve => {
 });
 
 /** 本版本 applySchema 的最后一个结构版本；云端 bootstrap 只核对库内版本不低于它。 */
-export const CLOUD_SCHEMA_VERSION = 65;
+export const CLOUD_SCHEMA_VERSION = 66;
 
 export class CompanyDatabase {
   /** 当前会话的客户端；云端续期或重连时整体替换（见 rebuildNow）。 */
@@ -439,7 +439,7 @@ export class CompanyDatabase {
   }
 
   /**
-   * 按序应用全部 schema（001 至 065；055 按配置渲染）。fresh 时写入归属标记。本机 bootstrap 与云端 company-migrate 共用；
+   * 按序应用全部 schema（001 至 066；055 按配置渲染）。fresh 时写入归属标记。本机 bootstrap 与云端 company-migrate 共用；
    * 云端只有 migrator 能应用。
    */
   async applySchema(fresh: boolean): Promise<void> {
@@ -608,6 +608,8 @@ export class CompanyDatabase {
     await this.db.query('UPDATE company_meta:installation SET schema_version = 64 WHERE schema_version < 64;');
     await this.db.query(loadSchema('065-dispatch-attempt.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 65 WHERE schema_version < 65;');
+    await this.db.query(loadSchema('066-agent-activity.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 66 WHERE schema_version < 66;');
   }
 
   /** Selects the configured namespace/database without touching schema (runtimes that only query). */

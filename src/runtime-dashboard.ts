@@ -1,4 +1,7 @@
 import type { Surreal } from 'surrealdb';
+import type { AgentActivity } from './agent-activity.ts';
+import type { WorkContext } from './work-context.ts';
+import { estimateRemaining, phaseDurations, type RuntimeEstimate } from './runtime-timing.ts';
 import { readBoard, RUNNER_STALE_MS, type OwnerBoard } from './board.ts';
 
 /** 可观测性读模型，不导入宿主 SDK；数据不足时保留未知状态。 */
@@ -20,12 +23,15 @@ export interface RuntimeHostView {
   metrics?: HostMetrics;
 }
 export interface RuntimePrompt {
+  context?: WorkContext;
   text: string;
   source: 'sent' | 'template' | 'candidate';
   at?: number;
   truncated: boolean;
 }
 export interface RuntimeAgentView {
+  runtime?: 'native' | 'paseo' | 'unknown';
+  activity?: AgentActivity;
   id: string;
   name: string;
   role: string;
@@ -37,6 +43,8 @@ export interface RuntimeAgentView {
   observedAt?: number;
   taskId?: string;
   taskTitle?: string;
+  project?: { id: string; name: string };
+  estimate?: RuntimeEstimate;
   phase?: string;
   elapsedSeconds?: number;
   action?: string;
@@ -103,7 +111,7 @@ export interface RuntimeDashboard {
 type Row = Record<string, any>;
 const key = (v: any): string =>
   String(v && typeof v === 'object' && 'id' in v ? v.id : (v ?? ''))
-    .replace(/^(employee|task|runner_heartbeat):/, '')
+    .replace(/^(employee|task|project|runner_heartbeat):/, '')
     .replace(/^⟨|⟩$/g, '');
 const time = (v: any): number | undefined => {
   const n = typeof v === 'number' ? v : new Date(v?.toDate?.() ?? v).getTime();
@@ -117,6 +125,8 @@ const bounded = (
   typeof text === 'string' && text
     ? { text: text.slice(0, 16000), source, at, truncated: text.length > 16000 }
     : undefined;
+const promptContext = (prompt: RuntimePrompt | undefined, context?: WorkContext): RuntimePrompt | undefined =>
+  prompt ? { ...prompt, context } : undefined;
 const online = (at: number | undefined, now: number) =>
   at !== undefined && at <= now + 5000 && now - at <= RUNNER_STALE_MS;
 export interface DashboardRows {
@@ -131,6 +141,8 @@ export interface DashboardRows {
   executions?: Row[];
   evidence?: Row[];
   warnings?: string[];
+  activities?: Row[];
+  timingEvents?: Row[];
 }
 
 export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): RuntimeDashboard {
@@ -166,6 +178,10 @@ export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): R
     hosts.set(id, h);
   }
   const taskMap = new Map(input.tasks.map((t) => [key(t.id), t]));
+  const timings = phaseDurations((input.timingEvents ?? []).map(e => ({
+    task: key(e.task), actor: key(e.actor), action: e.action, phase: e.phase,
+    project: key(e.project_ref), kind: e.kind, role: e.role, at: time(e.at) ?? 0,
+  })), now);
   const agents: RuntimeAgentView[] = input.board.employees.map((e) => {
     const row = employeeMap.get(e.id);
     const hostId =
@@ -183,6 +199,9 @@ export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): R
     const fresh = host.state === 'online' && online(observedAt, now);
     const leased = e.now.state === 'leased' ? e.now : undefined;
     const task = leased ? taskMap.get(leased.taskId) : undefined;
+    const project = task?.project_ref ? {id: key(task.project_ref), name: String(task.project_name || key(task.project_ref))} : undefined;
+    const elapsedSeconds = leased?.leaseStartedAt !== undefined
+      ? Math.max(0, Math.floor((now - leased.leaseStartedAt) / 1000)) : leased?.elapsedSeconds;
     const state: RuntimeAgentView['state'] = !fresh
       ? 'unknown'
       : ['running', 'starting'].includes(row?.runtime_state)
@@ -202,6 +221,10 @@ export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): R
         ? sent
         : undefined;
     const next = e.next[0];
+    const activity = input.activities?.find(a => a.agent === row?.paseo_agent_id &&
+      key(a.employee) === e.id && (!leased || key(a.task) === leased.taskId) &&
+      (!leased || (task?.runtime_execution?.agent === a.agent && task?.runtime_execution?.turn === a.activity?.turn)) &&
+      (!leased?.leaseStartedAt || a.activity?.startedAt >= leased.leaseStartedAt - 1000))?.activity as AgentActivity | undefined;
     const draft = next ? e.outbox.find((m) => m.taskId === next.taskId) : undefined;
     // parent 是前置任务，不能误当子任务。百分比只能来自已落地的需求执行清单。
     const execution = leased
@@ -236,6 +259,12 @@ export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): R
       name: e.name,
       role: e.role,
       hostId,
+      runtime: row?.paseo_agent_id ? String(row.paseo_agent_id).startsWith('native:') ? 'native' : 'paseo' : 'unknown',
+      activity,
+      project,
+      ...(leased ? { estimate: state === 'running' && (!activity || activity.state === 'running')
+        ? estimateRemaining({task: leased.taskId, phase: leased.phase, project: project?.id ?? '', role: e.role, kind: task?.kind ?? ''}, elapsedSeconds, timings)
+        : {status: 'unavailable' as const, samples: 0} } : {}),
       provider: e.provider,
       model: fresh && row?.runtime_model ? row.runtime_model : e.model,
       modelSource: fresh && row?.runtime_model ? 'observed' : e.model ? 'configured' : 'unknown',
@@ -246,17 +275,17 @@ export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): R
             taskId: leased.taskId,
             taskTitle: leased.title,
             phase: leased.phase,
-            elapsedSeconds: leased.elapsedSeconds,
+            elapsedSeconds,
             action: leased.progress?.summary || leased.progress?.label,
           }
         : {}),
       ...(eligibleSent
         ? {
-            currentPrompt: bounded(
+            currentPrompt: promptContext(bounded(
               eligibleSent.sent_body ?? eligibleSent.body,
               eligibleSent.sent_body ? 'sent' : 'template',
               time(eligibleSent.sent_at),
-            ),
+            ), task?.runtime_context?.delivery === task?.delivery_id ? task?.runtime_context : undefined),
           }
         : {}),
       ...(completePlan && steps.length
@@ -275,10 +304,10 @@ export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): R
               title: next.title,
               source: 'candidate' as const,
               reason: next.reason,
-              prompt: bounded(
+              prompt: promptContext(bounded(
                 draft?.translation?.status === 'ready' ? draft.translation.text : draft?.body,
                 'candidate',
-              ),
+              ), draft?.context),
             },
           }
         : {}),
@@ -409,16 +438,16 @@ export async function readRuntimeDashboard(db: Surreal): Promise<RuntimeDashboar
   const read = async (sql: string, vars?: Record<string, unknown>): Promise<Row[]> =>
     (await db.query<[Row[]]>(sql, vars))[0] ?? [];
   // 核心数据失败则整次失败，让页面保留旧快照并明确报错；不把失败伪装为零。
-  const [board, employees, beats, telemetry, tasks, sent, audits, executions, evidence] =
+  const [board, employees, beats, telemetry, tasks, sent, audits, executions, evidence, activities, timingEvents] =
     await Promise.all([
       readBoard(db),
       read(
-        'SELECT id, runner_id, runtime_at, runtime_state, runtime_model FROM employee WHERE revoked != true AND retired != true;',
+        'SELECT id, runner_id, paseo_agent_id, runtime_at, runtime_state, runtime_model FROM employee WHERE revoked != true AND retired != true;',
       ),
       read('SELECT runner, host, version, at FROM runner_heartbeat;'),
       read('SELECT runner, node, at, metrics FROM company_meta WHERE kind = "runner_telemetry";'),
       read(
-        'SELECT id, title, state, parent, executor_role, reviewer_role, acceptance_head, acceptance_attempt FROM task;',
+        'SELECT id, title, state, kind, parent, executor_role, reviewer_role, acceptance_head, acceptance_attempt, runtime_context, runtime_execution, delivery_id, project AS project_ref, project.name AS project_name FROM task;',
       ),
       read(
         'SELECT id, task, sent_to, sent_at, step FROM outbound_message WHERE state = "sent" AND step IN ["execute", "review", "rework"] ORDER BY sent_at DESC LIMIT 240;',
@@ -430,6 +459,12 @@ export async function readRuntimeDashboard(db: Surreal): Promise<RuntimeDashboar
       read(
         'SELECT id, task, sha, attempt, environment, source, verified, verifier, at FROM acceptance_evidence WHERE verified = true AND verifier = "github-actions" ORDER BY at DESC LIMIT 100;',
       ),
+      read('SELECT employee, agent, task, activity, observed_at FROM agent_activity WHERE expires_at > time::now() ORDER BY observed_at DESC LIMIT 400;'),
+      read(`SELECT task, actor, action, phase, at, task.kind AS kind,
+        task.project AS project_ref,
+        IF phase = 'review' THEN task.reviewer_role ELSE task.executor_role END AS role
+        FROM audit WHERE at > time::now() - 30d AND action IN ['claim', 'submit', 'accept', 'return', 'block', 'released', 'expire', 'void']
+        ORDER BY at DESC LIMIT 2000;`),
     ]);
   const ids = board.employees.filter((e) => e.now.state === 'leased').map((e) => e.id);
   const current = ids.length
@@ -455,5 +490,7 @@ export async function readRuntimeDashboard(db: Surreal): Promise<RuntimeDashboar
     audits,
     executions,
     evidence,
+    activities,
+    timingEvents,
   });
 }

@@ -1,3 +1,5 @@
+import { WorkContextFiles } from "../WorkContext.tsx";
+import type { WorkContext } from "../../../../src/work-context.ts";
 import { useLiveRefresh } from '../realtime.ts';
 import { OBSERVATION_TTL, useObservationClock } from '../runtime-state.ts';
 import type { ComponentChildren } from 'preact';
@@ -36,6 +38,7 @@ interface Preview {
 }
 
 interface MessageBlockProps {
+  context?: WorkContext;
   messageId: string;
   title: string;
   meta: string;
@@ -54,7 +57,7 @@ interface MessageBlockProps {
 }
 
 /** 每条消息都共用的字段；保存函数由卡片所在位置决定（员工待发用 edit_rendered，其它用 edit）。 */
-type CommonMessageProps = Pick<MessageBlockProps, 'messageId' | 'title' | 'body' | 'hold' | 'draft' | 'dirty' | 'busy' | 'flash' | 'onDraft' | 'onHold'>;
+type CommonMessageProps = Pick<MessageBlockProps, 'context' | 'messageId' | 'title' | 'body' | 'hold' | 'draft' | 'dirty' | 'busy' | 'flash' | 'onDraft' | 'onHold'>;
 
 /**
  * 有未保存修改的消息卡片在刷新时不重绘：草稿与忙碌状态都没变时直接跳过渲染，
@@ -86,6 +89,7 @@ const MessageBlock = memo(function MessageBlock(p: MessageBlockProps) {
       </label>
       {p.workdirPending ? <p class="hint">领取任务后会追加工作目录行</p> : null}
       {!editable ? <p class="hint">这条消息缺少编号，只能查看。</p> : null}
+      <WorkContextFiles value={p.context} />
       {p.extra}
       <div class="button-row">
         <button type="button" class="primary" disabled={!editable || p.busy || !p.dirty} onClick={() => p.onSave(p.messageId, text)}>
@@ -301,6 +305,7 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
     messageId: m.messageId,
     title: m.title,
     body: m.body,
+    context: m.context,
     hold: m.hold,
     draft: draftOf(drafts, m.messageId),
     dirty: isDirty(drafts, m.messageId, m.body),

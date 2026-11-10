@@ -62,3 +62,14 @@ test('派工说明只描述工作与结果，不要求生命周期命令', () =>
   expect(review).toContain('复核结论：通过');
   expect(review).not.toContain('call review');
 });
+
+test('老板看到的派工文件与实际任务正文同源，当前预览不冒充已派工快照', async () => {
+  const {workContext}=await import('../src/work-context.ts');
+  const claim={task:{id:'t',title:'任务',context:'实际需求',state:'doing'},deliveryId:'delivery',laneNotes:'本线笔记',history:[{action:'return',evidence:'补充边界用例'}]} as any;
+  const saved=workContext(claim,'dispatched',100);
+  expect(saved.delivery).toBe('delivery');expect(saved.files[0]!.text).toBe(taskBrief(claim));
+  expect(saved.files.map(f=>f.name)).toEqual(['task.md','notes.md','findings/round-01.md']);
+  expect(workContext({task:claim.task},'preview',100).files).toHaveLength(1);
+  claim.task.context='x'.repeat(20000);
+  expect(workContext(claim,'dispatched').files[0]).toMatchObject({truncated:true});
+});

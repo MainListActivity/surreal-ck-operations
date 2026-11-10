@@ -1,14 +1,15 @@
-import { join, isAbsolute } from 'node:path';
-import { readFileSync, accessSync, constants } from 'node:fs';
+import { join, isAbsolute, dirname } from 'node:path';
+import { readFileSync, accessSync, constants, realpathSync } from 'node:fs';
 import { installNodeHost } from '../host-node.ts';
 import { configureCompanyRuntime, company, noteHost } from './company.ts';
 import { startDispatch } from './dispatch.ts';
-import { loadServiceEnv, serviceHome } from './env.ts';
+import { loadNativeOwnerCredential, loadServiceEnv, serviceHome } from './env.ts';
 import { NativeRuntime, type NativeProvider } from './native.ts';
 import { RuntimeEventsBus } from './events.ts';
 import type { RuntimeHost } from './host.ts';
 import { scrubEnv, SANDBOX_MARKER, installZdot, userZshDir, externalPatterns } from './launch-env.ts';
 import { employeeModelEnv } from './model-env.ts';
+import { writeAgentActivity } from './activity-store.ts';
 
 installNodeHost();
 loadServiceEnv();
@@ -38,10 +39,28 @@ if (process.platform === 'darwin') {
   throw new Error('远程原生执行要求显式配置 isolation=external，并由容器或沙箱启动命令提供员工隔离');
 }
 if (!Object.keys(config.commands ?? {}).length) throw new Error('至少配置一个原生执行命令');
+loadNativeOwnerCredential();
 const zdotdir = join(serviceHome(), 'zdot');
 installZdot(zdotdir, userZshDir(zdotdir), externalPatterns());
 let bus: RuntimeEventsBus;
+// Installed services follow the already verified current release; development runs remain pinned to their checkout.
+const installed = process.env.SCK_NATIVE_FOLLOW_CURRENT === '1';
+const installedPath = installed ? realpathSync(join(serviceHome(), 'current')) : undefined;
+const release = installedPath ? JSON.parse(readFileSync(join(dirname(installedPath), 'release.json'), 'utf8')) : undefined;
+let draining = false;
+let endService!: () => void;
+const serviceEnded = new Promise<void>(resolve => { endService = resolve; });
 const runtime = new NativeRuntime({ root: join(serviceHome(), 'native', hostId), host: hostId,
+  onHeartbeat: async () => {
+    if (!installedPath || realpathSync(join(serviceHome(), 'current')) === installedPath) return;
+    draining = true;
+    const agents = await runtime.list();
+    if ([...agents.values()].some(a => ['running', 'starting', 'unknown'].includes(a.status))) return;
+    const ctx = await company();
+    const ids = (await ctx.workforce.insts()).map(i => i.id);
+    const [held] = await ctx.db.db.query<[unknown[]]>(`SELECT id FROM task WHERE current_employee IN $ids AND lease_expires_at > time::unix(time::now()) LIMIT 1;`, {ids});
+    if (!held?.length) endService();
+  },
   command(provider) {
     const command = config.commands[provider];
     if (!command) throw new Error(`本节点没有配置 ${provider} 的员工沙箱命令`);
@@ -56,9 +75,16 @@ const runtime = new NativeRuntime({ root: join(serviceHome(), 'native', hostId),
     const inherited = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
     return { ...inherited, ...scrubEnv(channel), ...SANDBOX_MARKER, ...modelEnv, PASEO_AGENT_ID: "", ZDOTDIR: zdotdir };
   },
-  onStarted: session => { void bus.emit('agent.turn_started', { agent: session, turnId: session.turnId }).catch(() => console.warn('回合开始事件处理失败')); },
-  onEnded: event => bus.emit('agent.turn_ended', event),
+  onStarted: async session => { await bus.emit('agent.turn_started', { agent: session, turnId: session.turnId }); await uploadActivity(); },
+  onEnded: async event => { await uploadActivity(); await bus.emit('agent.turn_ended', event); },
 });
+async function uploadActivity(): Promise<void> {
+  try {
+    const ctx = await company();
+    const saved = await writeAgentActivity(ctx.db.db, `native:${hostId}`, runtime.activity());
+    for (const value of saved) runtime.acknowledgeActivity(value.agent, value.turn);
+  } catch { console.warn('agent activity upload deferred to heartbeat'); }
+}
 const host: RuntimeHost = {
   providers: {
     // 原生 CLI 没有统一订阅查询入口；额度继续由现有 Magpie 观测链提供，未知时不伪造数值。
@@ -71,18 +97,23 @@ const host: RuntimeHost = {
   }) },
 };
 bus = new RuntimeEventsBus(host);
-configureCompanyRuntime({ gateway: runtime, native: true, providers: Object.keys(config.commands), runner: { id: `native:${hostId}`, adoptLegacy: false } });
+configureCompanyRuntime({ gateway: runtime, native: true, release, requireProviderRoute: installed, dispatchAllowed: () => !draining, providers: Object.keys(config.commands), runner: { id: `native:${hostId}`, adoptLegacy: false } });
 noteHost(host);
 let stop: import('./dispatch.ts').RunnerControl | undefined;
+let ctx: Awaited<ReturnType<typeof company>> | undefined;
 try {
-  const ctx = await company();
+  ctx = await company();
+  const principal = await ctx.core.authenticate(process.env.SCK_OWNER_TOKEN!);
+  if (principal.role !== 'owner') throw new Error('原生执行端老板凭证身份不匹配，拒绝启动');
   stop = startDispatch(bus);
   await runtime.recoverFinishedTurns();
   console.log(`原生执行端 ${hostId} 已启动；支持 ${Object.keys(config.commands).join(', ')}`);
-  await new Promise<void>(resolve => { process.once('SIGTERM', resolve); process.once('SIGINT', resolve); });
-  stop();
-  await stop.done;
+  process.once('SIGTERM', endService); process.once('SIGINT', endService);
+  await serviceEnded;
+} finally {
+  stop?.();
+  await stop?.done;
   await runtime.close();
-  ctx.sidecar.close();
-  await ctx.db.close();
-} finally { stop?.(); await runtime.close(); }
+  ctx?.sidecar.close();
+  await ctx?.db.close();
+}
