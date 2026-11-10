@@ -206,3 +206,28 @@ test('宿主读取只接受目标回合的最终答复，不串新回合也不�
   await expect(readTurnResult(host([{turnId:'b',seqEnd:1,item:{type:'assistant_message',text:'旧结果'}}]),'agent','a')).rejects.toThrow('unavailable');
   await expect(readTurnResult(host([{turnId:'a',seqEnd:1,item:{type:'assistant_message',text:'正在检查'}},{turnId:'a',seqEnd:2,item:{type:'tool_call'}}]),'agent','a')).rejects.toThrow('not yet');
 });
+
+
+test('Paseo 重开会话复用回合编号，新派工仍记录启动并自动收尾', async () => {
+  const f = fixture();try {
+    await f.claim();await f.pool.turnStarted('agent','turn-a');await f.pool.settleExecution(f.event());
+    f.nextDelivery();await f.claim();await f.pool.turnStarted('agent','turn-a');
+    expect(f.journal().read('worker','delivery-b')?.state).toBe('running');
+    await f.pool.settleExecution(f.event());
+    expect(f.calls.map(c=>c.proof.deliveryId)).toEqual(['delivery-a','delivery-b']);
+  } finally {f.close();}
+});
+test('相同宿主回合号使用启动时间隔离，运行中事件不能提前送审', async () => {
+  const base={epoch:'e',hasOlder:false,entries:[{timestamp:'2026-11-10T08:00:00Z',turnId:'turn-1',seqEnd:1,item:{type:'assistant_message',text:'旧轮成果'}}]};
+  const host=(page:unknown)=>({agents:{ref:()=>({timeline:{refetch:async()=>page}})}}) as never;
+  await expect(readTurnResult(host(base),'agent','turn-1',Date.parse('2026-11-10T09:00:00Z'))).rejects.toThrow('unavailable');
+  await expect(readTurnResult(host({...base,agent:{status:'running'}}),'agent','turn-1')).rejects.toThrow('still active');
+});
+
+test('取消后同批次重开复用回合号，新的启动可以正常完成', async () => {
+  const f=fixture();try {
+    await f.claim();await f.pool.turnStarted('agent','turn-a');await f.pool.settleExecution(f.event('turn-a','部分进度','canceled'));
+    await f.pool.turnStarted('agent','turn-a');expect(f.journal().rows()[0]?.state).toBe('running');
+    await f.pool.settleExecution(f.event());expect(f.calls.map(c=>c.action)).toEqual(['submit']);
+  }finally{f.close();}
+});

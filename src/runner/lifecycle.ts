@@ -18,6 +18,8 @@ export interface ExecutionAttempt {
   phase: 'doing' | 'review';
   state: 'reserved' | 'running' | 'collecting' | 'pending' | 'settled' | 'interrupted' | 'superseded' | 'attention';
   turn?: string;
+  startedAt?: number;
+  createdAt?: number;
   turns: string[];
   result?: WorkResult;
   finalText?: string;
@@ -99,7 +101,7 @@ export class ExecutionJournal {
     const prior = this.read(employee, proof.deliveryId);
     if (prior) return prior;
     const row: ExecutionAttempt = { employee, task: proof.taskId, phase, proof: { ...proof }, state: 'reserved',
-      turns: [], tries: 0, nextRetry: 0, at: Date.now() };
+      turns: [], tries: 0, nextRetry: 0, at: Date.now(), createdAt: Date.now() };
     this.save(row); return row;
   }
   rows(): ExecutionAttempt[] {

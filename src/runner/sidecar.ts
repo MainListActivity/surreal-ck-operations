@@ -155,7 +155,7 @@ const NEEDS_CLOUD = "需要云端执行端：公司命令只在云端模式可�
 
 export interface SidecarDeps {
   managedLifecycle?: boolean;
-  readTurnResult?: (agent: string, turn: string) => Promise<string>;
+  readTurnResult?: (agent: string, turn: string, startedAt: number) => Promise<string>;
   executionChanged?: (row: ExecutionAttempt) => Promise<void>;
   nativeExecution?: boolean;
   core: CompanyCore;
@@ -265,12 +265,14 @@ export class SidecarPool {
   /** A runtime start acknowledgement, never merely a queued prompt. */
   async turnStarted(agent: string, turn?: string): Promise<void> {
     if (!this.journal) return;
-    if (turn && this.journal.rows().some(row => row.agent === agent && row.turns.includes(turn))) return;
     this.starts.set(agent, turn);
     const employee = this.instByAgent.get(agent), live = employee ? this.claims.get(employee) : undefined;
     if (!employee || !live) return; // spawn can emit before bindAgent; bind replays this acknowledgement
     const row = this.journal.reserve(employee, live.phase, live.proof);
-    if (row.result || ['settled', 'superseded'].includes(row.state)) return;
+    if (row.result || ['settled', 'superseded', 'collecting'].includes(row.state)) return;
+    if (row.state === 'interrupted' && turn) row.turns = row.turns.filter(value => value !== turn);
+    if (row.state === 'running' && row.turn === turn) return;
+    row.startedAt = Date.now();
     row.agent = agent; row.turn = turn; row.state = 'running';
     await this.changed(row);
   }
@@ -279,9 +281,13 @@ export class SidecarPool {
     if (!this.journal) return;
     const employee = this.instByAgent.get(event.agent.id);
     if (!employee) return { status: 'no_claim' };
-    const prior = this.journal.rows().find(r => r.employee === employee && !!event.turnId && r.turns.includes(event.turnId));
-    if (prior) { if (prior.state === 'collecting') await this.collectExecution(prior); else await this.flushExecution(prior); return { status: prior.state === 'settled' ? 'ingested' : 'pending' }; }
     const live = this.claims.get(employee);
+    const current = live ? this.journal.read(employee, live.proof.deliveryId) : undefined;
+    // Paseo can reuse foreground-turn-1 after refreshing a provider session. A new delivery's actual start wins.
+    const belongsToCurrent = current?.startedAt && current.turn === event.turnId && !['settled','superseded'].includes(current.state);
+    const prior = event.turnId && current?.turns.includes(event.turnId) ? current
+      : !belongsToCurrent && this.journal.rows().find(r => r.employee === employee && !!event.turnId && r.turns.includes(event.turnId));
+    if (prior) { if (prior.state === 'collecting') await this.collectExecution(prior); else await this.flushExecution(prior); return { status: prior.state === 'settled' ? 'ingested' : 'pending' }; }
     const row = live ? this.journal.reserve(employee, live.phase, live.proof)
       : this.journal.rows().filter(r => r.employee === employee && r.agent === event.agent.id
         && ['reserved', 'running', 'interrupted', 'collecting'].includes(r.state)).sort((a, b) => b.at - a.at)[0];
@@ -309,7 +315,7 @@ export class SidecarPool {
     if (!row.finalText && !row.artifacts?.raw && !row.artifacts?.report && !row.artifacts?.blocker && this.deps.readTurnResult) {
       try {
         if (!row.agent || !row.turn) throw new Error('missing turn identity');
-        row.finalText = await this.deps.readTurnResult(row.agent, row.turn);
+        row.finalText = await this.deps.readTurnResult(row.agent, row.turn, row.startedAt ?? row.createdAt ?? 0);
         if (!row.finalText.trim()) throw new Error('empty runtime result');
         row.error = undefined;
         await this.changed(row);
