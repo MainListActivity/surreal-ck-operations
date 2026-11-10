@@ -1,4 +1,5 @@
 import { ITERATION_COMMANDS, iterationCommand } from './iteration-commands.ts';
+import { isReadOnlyCommand as isReadOnly } from './command-effects.ts';
 /**
  * 命令分流（POST /api/cmd）。按调用方身份决定命令怎么执行；写操作与被拒的调用都写 ops_audit（只存摘要，不存原文）。
  * - 老板（owner）：令牌直接连库（$access='owner'）。执行端命令（isRunnerCommand）排队到 ops_job，最多等 25 秒，超时返回 pending；
@@ -58,10 +59,6 @@ export function isRunnerCommand(command: string): boolean {
 
 const OWNER_ONLY_REASON = '该命令只能由老板调用';
 
-/** 只读命令不写审计：看板与列表会反复刷新，记下来会淹没真正的操作。员工的调用无论读写都记。 */
-const READ_ONLY = new Set(['status', 'progress', 'brief', 'inbox', 'board.snapshot', 'db.read', 'translate.preview', 'idp.status', 'idp.user.list_agents', 'cmd.catalog']);
-const READ_SUFFIX = /\.(list|get|detail|preview|plan|consolidations|records)$/;
-const isReadOnly = (command: string): boolean => READ_ONLY.has(command) || READ_SUFFIX.test(command);
 
 const reasonOf = (error: unknown): string => error instanceof CompanyError ? error.message : '服务暂时出错';
 

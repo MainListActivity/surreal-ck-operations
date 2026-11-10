@@ -5,7 +5,7 @@ import { CompanyError } from '../../src/core-errors.ts';
 import { textOf } from './rows.ts';
 
 export const ITERATION_COMMANDS = new Set([
-  'feedback.list', 'feedback.retry', 'requirement.control', 'requirement.release', 'requirement.execution',
+  'feedback.list', 'feedback.retry', 'requirement.control', 'requirement.execution',
   'product.iteration.list', 'product.iteration.get', 'product.iteration.configure',
   'requirement.list', 'requirement.get', 'requirement.create', 'requirement.edit', 'requirement.approve',
 ]);
@@ -16,7 +16,6 @@ export async function iterationCommand(db: Surreal, command: string, input: Reco
     case 'feedback.list': return { feedback: await feedbackList(db,textOf(input.project,'project',80),Number(input.offset??0),input.requirement===undefined?undefined:textOf(input.requirement,'requirement',160)) };
     case 'feedback.retry': await retryFeedback(db,textOf(input.id,'id',160),actor); return {retried:true};
     case 'requirement.control': return {requirement:await store.control(textOf(input.id,'id',160),input.revision as number,textOf(input.action,'action',20),actor)};
-    case 'requirement.release': await store.approveRelease(textOf(input.id,'id',160),input.revision as number,actor,input.expectedPolicy as Record<string,unknown>); return {approved:true};
     case 'requirement.execution': { const req=await store.get(textOf(input.id,'id',160)); return executionDetail(db,req.id,req.approved_revision??req.revision); }
 
     case 'product.iteration.list': {

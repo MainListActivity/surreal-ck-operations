@@ -1,3 +1,4 @@
+import type { RuntimeDashboard } from '../../../src/runtime-dashboard.ts';
 /**
  * 页面与 Worker 的接口。每个请求带 `Authorization: Bearer <accessToken>`，令牌见 auth.ts（内存 + sessionStorage）。
  * 不读写 cookie，不使用 localStorage。
@@ -129,3 +130,5 @@ export function outcomeText<T>(out: Outcome<T>, okText: string): string {
   if (out.kind === 'pending') return out.jobId ? `已排队，执行端处理中（任务 ${out.jobId}）` : '已排队，执行端处理中';
   return errorText(out);
 }
+
+export const readDashboard = (): Promise<Outcome<RuntimeDashboard>> => call<RuntimeDashboard>('/api/dashboard', 'GET');

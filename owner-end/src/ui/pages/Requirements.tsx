@@ -1,88 +1,312 @@
-import { useCallback, useEffect, useState, useRef } from 'preact/hooks';
+import { useLiveRefresh } from '../realtime.ts';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { ProductPolicy, Requirement } from '../../../../src/iteration/requirements.ts';
 import { runCommand, outcomeText } from '../api.ts';
-import { FeedbackPanel, ExecutionPanel } from './RequirementDetails.tsx';
-import { Panel, Empty } from '../common.tsx';
+import { Badge, Dialog, EmptyState, ErrorState, Field, FilterTabs, Loading, NoticeLine, PageHeader, type Notice } from '../common.tsx';
+import { REQUIREMENT_GROUPS, groupCounts, inGroup, nextStep, priorityText, stateOf } from '../iteration.ts';
+import { hrefOf, splitLines, type Route } from '../model.ts';
+import { timeText } from '../common.tsx';
+import { FeedbackInbox } from './Feedback.tsx';
+import { RequirementCreate, RequirementDetail } from './RequirementDetails.tsx';
 
-const STATES: Record<string,string> = {draft:'待整理',pending:'待确认',queued:'已确认待规划',implementing:'实施中',release_pending:'待发布',released:'已上线',paused:'已暂停',rejected:'已拒绝',merged:'已归并'};
-interface Product {id:string;name:string}
-const EMPTY_POLICY:ProductPolicy={enabled:true,autoRelease:false,feedbackOrigins:[],releaseInstructions:'',verifyInstructions:'',rollbackInstructions:''};
-interface Draft {title:string;problem:string;acceptance:string;priority:number}
-const EMPTY:Draft={title:'',problem:'',acceptance:'',priority:2};
-const draftOf=(r:Requirement):Draft=>({title:r.title,problem:r.problem,acceptance:r.acceptance,priority:r.priority});
+export interface Product { id: string; name: string }
+export const EMPTY_POLICY: ProductPolicy = { enabled: true, autoRelease: true, feedbackOrigins: [], releaseInstructions: '', verifyInstructions: '', rollbackInstructions: '' };
+const PAGE = 100;
 
-export function RequirementsPage({onDirtyChange}:{onDirtyChange?:(dirty:boolean)=>void}){
-  const generation=useRef(0);
-  const [policyLoaded,setPolicyLoaded]=useState(false);
-  const [products,setProducts]=useState<Product[]>([]),[project,setProject]=useState('');
-  const [items,setItems]=useState<Requirement[]>([]),[offset,setOffset]=useState(0),[selected,setSelected]=useState<Requirement>();
-  const [draft,setDraft]=useState<Draft>(EMPTY),[editing,setEditing]=useState(false);
-  const [policy,setPolicy]=useState<ProductPolicy>(),[settings,setSettings]=useState(false);
-  const [busy,setBusy]=useState(false),[error,setError]=useState(''),[notice,setNotice]=useState('');
-  useEffect(()=>{void runCommand<{products:Product[]}>('product.iteration.list').then(out=>{if(out.kind==='ok')setProducts(out.result.products);else setError(outcomeText(out,''));}).catch(()=>setError('产品列表读取失败'));},[]);
-  const load=useCallback(async()=>{
-    const current=++generation.current;
-    const out=await runCommand<{requirements:Requirement[]}>('requirement.list',{...(project?{project}:{}),offset});
-    if(current!==generation.current)return;
-    if(out.kind==='ok')setItems(out.result.requirements);else setError(outcomeText(out,''));
-  },[project,offset]);
-  useEffect(()=>{let active=true;setSelected(previous=>previous?.project===project?previous:undefined);setEditing(previous=>selected?.project===project?previous:false);setPolicy(undefined);setPolicyLoaded(false);setSettings(false);setError('');
-    void load().catch(()=>active&&setError('需求列表读取失败'));
-    if(project)void runCommand<{policy:ProductPolicy|null}>('product.iteration.get',{project}).then(out=>{if(!active)return;if(out.kind==='ok'){setPolicy(out.result.policy??undefined);setPolicyLoaded(true);}else setError(outcomeText(out,''));}).catch(()=>active&&setError('配置读取失败'));
-    return()=>{active=false;generation.current++;};
-  },[load,project]);
-  const act=async(command:string,input:Record<string,unknown>,message:string)=>{
-    setBusy(true);setError('');setNotice('');
-    try{const out=await runCommand<{requirement?:Requirement}> (command,input);if(out.kind!=='ok'){setError(outcomeText(out,''));return false;}
-      setNotice(message);if(out.result.requirement){setSelected(out.result.requirement);setDraft(draftOf(out.result.requirement));}await load();return true;
-    }catch{setError('操作失败，请刷新核对后再重试');return false;}finally{setBusy(false);}
-  };
-  const dirty=editing&&(selected?JSON.stringify(draft)!==JSON.stringify(draftOf(selected)):JSON.stringify(draft)!==JSON.stringify(EMPTY));
-  useEffect(()=>{const protect=(event:BeforeUnloadEvent)=>{if(dirty){event.preventDefault();event.returnValue='';}};window.addEventListener('beforeunload',protect);return()=>window.removeEventListener('beforeunload',protect);},[dirty]);
-  useEffect(()=>{onDirtyChange?.(dirty);},[dirty,onDirtyChange]);
-  const editable=!selected||['draft','pending','rejected'].includes(selected.state);
-  return <div class="page">
-    <Panel title="需求池" hint="先整理问题和验收标准；只有确认开工后才会进入执行流程。">
-      <label>产品<select value={project} disabled={busy||dirty} onChange={e=>{setProject(e.currentTarget.value);setOffset(0);setItems([]);setNotice('');}}><option value="">全部产品</option>{products.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label>
-      {!project?<button disabled={busy||dirty} onClick={()=>void load().catch(()=>setError('刷新失败'))}>刷新全部需求</button>:null}
-      {!products.length?<Empty>请先登记产品项目，再录入需求。</Empty>:null}
-      {project?<div class="actions"><button disabled={busy||dirty} onClick={()=>{setSelected(undefined);setDraft(EMPTY);setEditing(true);}}>新建需求</button><button disabled={busy||!policyLoaded} onClick={()=>setSettings(!settings)}>产品反馈与发布设置</button><button disabled={busy||dirty} onClick={()=>{if(selected)void act('requirement.get',{id:selected.id},'需求进度已刷新');else void load().catch(()=>setError('刷新失败'));}}>刷新需求与进度</button></div>:null}
-      {error?<p role="alert" class="notice err">{error}</p>:null}{notice?<p role="status" class="notice">{notice}</p>:null}
-      {project&&settings?<PolicyEditor key={project+JSON.stringify(policy)} initial={policy??EMPTY_POLICY} busy={busy} save={async value=>{if(await act('product.iteration.configure',{project,...value},'产品配置已保存')){setPolicy(value);setSettings(false);}}}/>:null}
-    </Panel>
-    <Panel title={project?'产品需求':'全部产品需求'}>
-      {items.length?<table><thead><tr><th>产品</th><th>需求</th><th>状态</th><th>优先级</th><th>修订</th></tr></thead><tbody>{items.map(r=><tr key={r.id}><td>{products.find(p=>p.id===r.project)?.name??r.project}</td><td><button disabled={busy||dirty} onClick={()=>{setSelected(r);setDraft(draftOf(r));setEditing(true);setNotice('');if(project!==r.project){setProject(r.project);setOffset(0);}}}>{r.title}</button></td><td>{STATES[r.state]??r.state}</td><td>P{r.priority}</td><td>{r.revision}</td></tr>)}</tbody></table>:<Empty>当前页没有需求。</Empty>}
-      <div class="actions"><button disabled={busy||dirty||offset===0} onClick={()=>setOffset(Math.max(0,offset-100))}>上一页</button><span>第 {offset/100+1} 页</span><button disabled={busy||dirty||items.length<100} onClick={()=>setOffset(offset+100)}>下一页</button></div>
-    </Panel>
-    {project&&editing?<Panel title={selected?'需求详情':'新建需求'}>
-      <form onSubmit={e=>{e.preventDefault();void act(selected?'requirement.edit':'requirement.create',{project,...draft,...(selected?{id:selected.id,revision:selected.revision}:{})},'需求已保存，尚未开工');}}>
-        <label>标题<input required maxLength={200} disabled={!editable||busy} value={draft.title} onInput={e=>setDraft({...draft,title:e.currentTarget.value})}/></label>
-        <label>要解决的问题<textarea required maxLength={6000} disabled={!editable||busy} value={draft.problem} onInput={e=>setDraft({...draft,problem:e.currentTarget.value})}/></label>
-        <label>验收标准<textarea maxLength={3000} disabled={!editable||busy} value={draft.acceptance} onInput={e=>setDraft({...draft,acceptance:e.currentTarget.value})}/></label>
-        <label>优先级<select disabled={!editable||busy} value={draft.priority} onChange={e=>setDraft({...draft,priority:Number(e.currentTarget.value)})}>{[0,1,2,3].map(p=><option value={p}>P{p}</option>)}</select></label>
-        {editable?<button type="submit" disabled={busy}>保存需求</button>:<p class="hint">已确认的修订保持不变，执行以确认快照为准。</p>}
-      </form>
-      {dirty?<button disabled={busy} onClick={()=>setDraft(selected?draftOf(selected):EMPTY)}>放弃未保存修改</button>:null}
-      {selected&&['draft','pending'].includes(selected.state)?<div>
-        <p>{policy?.autoRelease?'满足验收和产品发布策略后，允许自动上线。':'完成交付后等待老板放行发布。'}</p>
-        {!policy?.enabled?<p class="hint">请先在产品设置中启用迭代。</p>:null}
-        {dirty?<p class="hint">请先保存修改，再确认开工。</p>:null}
-        <button class="primary" disabled={busy||dirty||!policy?.enabled||!selected.acceptance.trim()} onClick={()=>void act('requirement.approve',{id:selected.id,revision:selected.revision,expectedPolicy:policy},'已确认开工，等待规划任务。').then(async ok=>{if(ok){const out=await runCommand<{requirement:Requirement}>('requirement.get',{id:selected.id});if(out.kind==='ok')setSelected(out.result.requirement);}}).catch(()=>setError('状态刷新失败，请重新读取需求'))}>确认并开始实施</button>
-      </div>:null}
-      {selected?<ExecutionPanel key={selected.id+selected.state} requirement={selected} busy={busy} policy={policy} act={act}/>:null}
-      {selected?.root_task?<p>规划任务：{selected.root_task} · <a href="#tasks">查看任务</a></p>:null}
-    </Panel>:null}
-    {project?<FeedbackPanel key={project} project={project}/>:null}
-  </div>;
+export function useProducts() {
+  const [products, setProducts] = useState<Product[]>();
+  const [error, setError] = useState('');
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    let active = true;
+    setError('');
+    void runCommand<{ products: Product[] }>('product.iteration.list').then(out => {
+      if (!active) return;
+      if (out.kind === 'ok') setProducts(out.result.products);
+      else setError(outcomeText(out, ''));
+    }).catch(() => active && setError('产品列表读取失败'));
+    return () => { active = false; };
+  }, [tick]);
+  useLiveRefresh(['project','product_iteration'], () => setTick(t => t + 1));
+  return { products, error, reload: () => setTick(t => t + 1) };
 }
-function PolicyEditor({initial,busy,save}:{initial:ProductPolicy;busy:boolean;save:(p:ProductPolicy)=>Promise<void>}){
-  const [value,setValue]=useState(initial),[origins,setOrigins]=useState(initial.feedbackOrigins.join('\n'));
-  return <form onSubmit={e=>{e.preventDefault();void save({...value,feedbackOrigins:origins.split('\n').map(s=>s.trim()).filter(Boolean)});}}>
-    <p class="hint">发布策略只影响后续确认，已确认需求保留原授权快照。停用产品会停止新的自动整理和后续任务推进。</p>
-    <label><input type="checkbox" checked={value.enabled} disabled={busy} onChange={e=>setValue({...value,enabled:e.currentTarget.checked})}/>启用该产品的迭代流程</label>
-    <label>允许嵌入反馈入口的站点（每行一个 HTTPS 来源）<textarea value={origins} disabled={busy} onInput={e=>setOrigins(e.currentTarget.value)}/></label>
-    <label><input type="checkbox" checked={value.autoRelease} disabled={busy} onChange={e=>setValue({...value,autoRelease:e.currentTarget.checked})}/>验收通过后自动发布</label>
-    {(['releaseInstructions','verifyInstructions','rollbackInstructions'] as const).map((field,i)=><label>{['发布流程','上线验证方法','回退流程'][i]}<textarea maxLength={2000} required={value.autoRelease} value={value[field]} disabled={busy} onInput={e=>setValue({...value,[field]:e.currentTarget.value})}/></label>)}
-    <button disabled={busy} type="submit">保存产品设置</button>
-  </form>;
+
+export function RequirementsPage({ route, onDirtyChange }: { route: Route; onDirtyChange(dirty: boolean): void }) {
+  const { products, error, reload } = useProducts();
+  useEffect(() => () => onDirtyChange(false), [onDirtyChange]);
+  if (route.id === 'new') return <RequirementCreate products={products ?? []} project={route.params.p} onDirtyChange={onDirtyChange} />;
+  if (route.id) return <RequirementDetail key={route.id} id={route.id} products={products ?? []} onDirtyChange={onDirtyChange} />;
+  return <RequirementList route={route} products={products} productError={error} reloadProducts={reload} onDirtyChange={onDirtyChange} />;
+}
+
+function go(params: Record<string, string | undefined>) {
+  location.hash = hrefOf('requirements', undefined, params);
+}
+
+function RequirementList({ route, products, productError, reloadProducts, onDirtyChange }: {
+  route: Route;
+  products?: Product[];
+  productError: string;
+  reloadProducts(): void;
+  onDirtyChange(dirty: boolean): void;
+}) {
+  const project = route.params.p ?? '';
+  const view = route.params.view === 'feedback' ? 'feedback' : 'list';
+  const group = REQUIREMENT_GROUPS.some(g => g.id === route.params.s) ? route.params.s! : 'all';
+  const settingsOpen = route.params.settings === '1';
+  const params = { p: project || undefined, view: view === 'feedback' ? 'feedback' : undefined, s: group === 'all' ? undefined : group };
+
+  const [items, setItems] = useState<Requirement[]>();
+  const [stages, setStages] = useState<Record<string, string>>({});
+  const [offset, setOffset] = useState(0);
+  const [error, setError] = useState('');
+  const [query, setQuery] = useState('');
+  const [tick, setTick] = useState(0);
+  const [policy, setPolicy] = useState<ProductPolicy>();
+  const [policyLoaded, setPolicyLoaded] = useState(false);
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const generation = useRef(0);
+  const listScope = useRef('');
+  const policyScope = useRef('');
+
+  useEffect(() => { setOffset(0); }, [project]);
+
+  useEffect(() => {
+    const current = ++generation.current;
+    setError('');
+    const scope = `${project}:${offset}`;
+    if (listScope.current !== scope) { setItems(undefined); listScope.current = scope; }
+    void runCommand<{ requirements: Requirement[] }>('requirement.list', { ...(project ? { project } : {}), offset }).then(async out => {
+      if (current !== generation.current) return;
+      if (out.kind !== 'ok') { setError(outcomeText(out, '')); return; }
+      setItems(out.result.requirements);
+      // 待发布的需求再读执行阶段，区分合并、上线核验及证据缺失。
+      const pending = out.result.requirements.filter(r => r.state === 'release_pending' || r.state === 'implementing').slice(0, 20);
+      const found: Record<string, string> = {};
+      await Promise.all(pending.map(async r => {
+        const ex = await runCommand<{ execution: { stage: string } | null }>('requirement.execution', { id: r.id }).catch(() => undefined);
+        if (ex?.kind === 'ok' && ex.result.execution?.stage) found[r.id] = ex.result.execution.stage;
+      }));
+      if (current === generation.current) setStages(found);
+    }).catch(() => current === generation.current && setError('需求列表读取失败'));
+  }, [project, offset, tick]);
+
+  useEffect(() => {
+    let active = true;
+    if (policyScope.current !== project) { setPolicy(undefined); setPolicyLoaded(false); policyScope.current = project; }
+    if (!project) return;
+    void runCommand<{ policy: ProductPolicy | null }>('product.iteration.get', { project }).then(out => {
+      if (!active) return;
+      if (out.kind === 'ok') { setPolicy(out.result.policy ?? undefined); setPolicyLoaded(true); }
+    }).catch(() => undefined);
+    return () => { active = false; };
+  }, [project, tick]);
+
+  useLiveRefresh(['product_requirement','product_iteration','requirement_execution','task'], () => setTick(t => t + 1), !settingsOpen);
+  const productName = (id: string) => products?.find(p => p.id === id)?.name ?? id;
+  const counts = useMemo(() => groupCounts(items ?? []), [items]);
+  const needle = query.trim().toLowerCase();
+  const rows = useMemo(() => (items ?? [])
+    .filter(r => inGroup(r.state, group) && (!needle || r.title.toLowerCase().includes(needle) || r.problem.toLowerCase().includes(needle)))
+    .map(r => ({ r, next: nextStep(r, stages[r.id]) }))
+    .sort((a, b) => Number(b.next.owner) - Number(a.next.owner) || a.r.priority - b.r.priority || String(b.r.updated_at).localeCompare(String(a.r.updated_at))),
+  [items, group, needle, stages]);
+  const decide = (items ?? []).filter(r => nextStep(r, stages[r.id]).owner).length;
+
+  const product = products?.find(p => p.id === project);
+
+  return (
+    <div class="page">
+      <PageHeader
+        title="需求"
+        description="用户反馈由 Agent 整理成需求；你确认开工后，修订锁定并交给 Agent 拆解执行。独立复核通过后合并 PR，由 GitHub 自动部署，再验收线上效果。"
+        actions={(
+          <>
+            {project ? <a class="button" href={hrefOf('requirements', undefined, { ...params, settings: '1' })}>产品设置</a> : null}
+            <a class="button primary" href={hrefOf('requirements', 'new', { p: project || undefined })}>新建需求</a>
+          </>
+        )}
+      />
+
+      <div class="toolbar product-bar">
+        <label class="inline-field">
+          <span>产品</span>
+          <select value={project} onChange={e => go({ ...params, p: e.currentTarget.value || undefined, view: e.currentTarget.value ? params.view : undefined })}>
+            <option value="">全部产品</option>
+            {(products ?? []).map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        </label>
+        <div class="view-switch" role="group" aria-label="视图">
+          <a class="seg" href={hrefOf('requirements', undefined, { ...params, view: undefined })} aria-current={view === 'list' ? 'page' : undefined}>需求池</a>
+          <a class="seg" href={hrefOf('requirements', undefined, { ...params, view: 'feedback' })} aria-current={view === 'feedback' ? 'page' : undefined}>用户反馈</a>
+        </div>
+        {project && policyLoaded && !policy?.enabled ? <Badge tone="blocked">迭代未启用</Badge> : null}
+        {project && policyLoaded && policy?.enabled ? <Badge tone="neutral">独立复核后合并 · GitHub 自动部署</Badge> : null}
+      </div>
+
+      {productError ? <ErrorState title="产品列表读取失败" message={productError} onRetry={reloadProducts} /> : null}
+      <NoticeLine notice={notice} onClose={() => setNotice(null)} />
+
+      {view === 'feedback' ? (
+        project
+          ? <FeedbackInbox key={project} project={project} />
+          : (
+            <EmptyState title="请选择一个产品查看反馈">
+              反馈按产品收集。选择产品后，可以看到用户原文、Agent 的整理理由和关联的需求。
+              {products?.length ? <span class="chip-row">{products.map(p => <a key={p.id} class="chip" href={hrefOf('requirements', undefined, { p: p.id, view: 'feedback' })}>{p.name}</a>)}</span> : null}
+            </EmptyState>
+          )
+      ) : (
+        <>
+          <div class="toolbar">
+            <FilterTabs label="按需求状态筛选" value={group} onChange={id => go({ ...params, s: id === 'all' ? undefined : id })} items={REQUIREMENT_GROUPS.map(g => ({ id: g.id, label: g.label, count: counts[g.id] ?? 0 }))} />
+            <label class="search">
+              <span class="visually-hidden">搜索需求</span>
+              <input type="search" placeholder="搜索标题或问题描述" value={query} onInput={e => setQuery(e.currentTarget.value)} />
+            </label>
+          </div>
+          {items && decide ? <p class="list-summary"><strong>{decide}</strong> 条需要你处理，已排在最前。</p> : null}
+          {error ? <ErrorState message={error} onRetry={() => setTick(t => t + 1)} /> : null}
+          {!items && !error ? <Loading label="正在读取需求…" rows={5} /> : null}
+          {items && !rows.length ? (
+            items.length ? (
+              <EmptyState title="没有符合条件的需求" action={<button type="button" onClick={() => { setQuery(''); go({ ...params, s: undefined }); }}>清除筛选</button>}>
+                换一个状态或搜索词看看。
+              </EmptyState>
+            ) : (
+              <EmptyState
+                title={product ? `「${product.name}」还没有需求` : products && !products.length ? '还没有登记产品' : '还没有需求'}
+                action={products?.length ? <a class="button primary" href={hrefOf('requirements', 'new', { p: project || undefined })}>新建需求</a> : undefined}
+              >
+                {products && !products.length ? '登记产品项目后，用户反馈会在这里整理成需求。' : '用户反馈经 Agent 整理后会出现在这里；你也可以直接新建需求。'}
+              </EmptyState>
+            )
+          ) : null}
+          {rows.length ? (
+            <div class="table-wrap">
+              <table class="data-table req-table">
+                <thead>
+                  <tr><th scope="col">需求</th><th scope="col">状态</th><th scope="col">下一步</th><th scope="col">优先级</th><th scope="col">更新</th></tr>
+                </thead>
+                <tbody>
+                  {rows.map(({ r, next }) => {
+                    const st = stateOf(r.state);
+                    return (
+                      <tr key={r.id} class={next.owner ? 'needs-owner' : undefined}>
+                        <td class="cell-title">
+                          <a class="row-link" href={hrefOf('requirements', r.id)}>{r.title}</a>
+                          <span class="cell-sub">{productName(r.project)} · 修订 {r.revision}</span>
+                        </td>
+                        <td data-label="状态"><Badge tone={st.tone}>{st.label}</Badge></td>
+                        <td data-label="下一步"><span class={`next-step tone-${next.tone}`}>{next.text}</span></td>
+                        <td data-label="优先级"><span class={`priority p${r.priority}`}>{priorityText(r.priority)}</span></td>
+                        <td data-label="更新" class="cell-time">{timeText(r.updated_at)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+          {items && (offset > 0 || items.length >= PAGE) ? (
+            <div class="pager">
+              <button type="button" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE))}>上一页</button>
+              <span>第 {offset / PAGE + 1} 页 · 筛选与计数只作用于本页</span>
+              <button type="button" disabled={items.length < PAGE} onClick={() => setOffset(offset + PAGE)}>下一页</button>
+            </div>
+          ) : null}
+        </>
+      )}
+
+      {settingsOpen && project ? (
+        <PolicyDialog
+          key={project}
+          productName={product?.name ?? project}
+          initial={policy ?? EMPTY_POLICY}
+          loaded={policyLoaded}
+          onDirtyChange={onDirtyChange}
+          onClose={() => { onDirtyChange(false); go(params); }}
+          save={async value => {
+            const out = await runCommand('product.iteration.configure', { project, ...value });
+            if (out.kind !== 'ok') return outcomeText(out, '');
+            setPolicy(value);
+            setNotice({ tone: 'ok', text: '产品设置已保存。已确认的需求仍按确认时的授权快照执行。' });
+            setTick(t => t + 1);
+            return undefined;
+          }}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/** 产品设置：迭代开关、反馈来源、发布方式与发布/验证/回退流程。 */
+export function PolicyDialog({ productName, initial, loaded, save, onClose, onDirtyChange }: {
+  productName: string;
+  initial: ProductPolicy;
+  loaded: boolean;
+  save(p: ProductPolicy): Promise<string | undefined>;
+  onClose(): void;
+  onDirtyChange(dirty: boolean): void;
+}) {
+  const [value, setValue] = useState(initial);
+  const [origins, setOrigins] = useState(initial.feedbackOrigins.join('\n'));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [confirmClose, setConfirmClose] = useState(false);
+  useEffect(() => { setValue(initial); setOrigins(initial.feedbackOrigins.join('\n')); }, [initial]);
+  const next: ProductPolicy = { ...value, feedbackOrigins: splitLines(origins) };
+  const dirty = JSON.stringify(next) !== JSON.stringify({ ...initial, feedbackOrigins: initial.feedbackOrigins });
+  const report = useCallback(onDirtyChange, [onDirtyChange]);
+  useEffect(() => { report(dirty); }, [dirty, report]);
+  const close = () => { if (dirty && !busy) setConfirmClose(true); else onClose(); };
+  const submit = async () => {
+    setBusy(true);
+    setError('');
+    const problem = await save(next).catch(() => '保存失败，请稍后重试');
+    setBusy(false);
+    if (problem) setError(problem);
+    else { onDirtyChange(false); onClose(); }
+  };
+  const fields = [
+    { key: 'releaseInstructions', label: 'GitHub 流水线说明（可选）', hint: '现有仓库、默认分支、必需检查与自动部署入口；不需要手工部署步骤。' },
+    { key: 'verifyInstructions', label: '上线验证补充（可选）', hint: '上线后如何确认功能正常。' },
+    { key: 'rollbackInstructions', label: '回退方案补充（可选）', hint: '出现问题时如何恢复上一版本。' },
+  ] as const;
+  return (
+    <Dialog
+      wide
+      title={`产品设置 · ${productName}`}
+      onClose={close}
+      footer={confirmClose ? (
+        <>
+          <span class="foot-note">放弃未保存的设置？</span>
+          <button type="button" data-autofocus onClick={() => setConfirmClose(false)}>继续编辑</button>
+          <button type="button" class="danger" onClick={() => { onDirtyChange(false); onClose(); }}>放弃修改</button>
+        </>
+      ) : (
+        <>
+          {dirty ? <span class="foot-note unsaved">有未保存的修改</span> : null}
+          <button type="button" disabled={busy} onClick={close}>取消</button>
+          <button type="button" class="primary" disabled={busy || !loaded || !dirty} onClick={() => void submit()}>{busy ? '正在保存…' : '保存设置'}</button>
+        </>
+      )}
+    >
+      {!loaded ? <Loading label="正在读取产品设置…" /> : (
+        <form class="form" onSubmit={e => { e.preventDefault(); void submit(); }}>
+          <p class="hint">需求确认即授权独立复核后的 PR 合并，GitHub 自动部署，QA 验收线上效果。补充说明随开工确认锁定；留空时读取项目现有流程。停用后不再整理反馈或推进任务。</p>
+          {error ? <div class="notice err" role="alert"><span class="notice-text">{error}</span></div> : null}
+          <label class="check"><input type="checkbox" checked={value.enabled} disabled={busy} onChange={e => setValue({ ...value, enabled: e.currentTarget.checked })} /><span><strong>启用迭代流程</strong><small>关闭后不能确认新的需求开工。</small></span></label>
+          {fields.map(f => (
+            <Field key={f.key} label={f.label} hint={f.hint} count={value[f.key].length} max={2000}>
+              <textarea rows={3} maxLength={2000} value={value[f.key]} disabled={busy} onInput={e => setValue({ ...value, [f.key]: e.currentTarget.value })} />
+            </Field>
+          ))}
+          <Field label="允许嵌入反馈入口的站点" hint="每行一个完整的 HTTPS 来源，例如 https://app.example.com，不含路径。最多 20 个。">
+            <textarea rows={3} value={origins} disabled={busy} onInput={e => setOrigins(e.currentTarget.value)} />
+          </Field>
+        </form>
+      )}
+    </Dialog>
+  );
 }

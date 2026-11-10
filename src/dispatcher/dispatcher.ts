@@ -867,7 +867,7 @@ export class Dispatcher {
     const store = this.messageStore();
     if (!store) return;
     try {
-      await store.markSent(prepared.message.id, employeeId, prepared.message.body);
+      await store.markSent(prepared.message.id, employeeId, this.outboundBody(prepared)!);
     } catch (error) {
       this.log(`outbound message sent-lock failed: ${(error as Error).message}`);
       return;
@@ -1968,7 +1968,7 @@ export class Dispatcher {
       messageId = draft.id;
       const body = renderMessage(text, { sckBin: this.deps.env.sckBin, commDir: this.deps.sidecar?.commDirFor(employeeId) ?? '$SCK_COMM_DIR', taskId });
       await this.deps.paseo.send(agent, body);
-      await store.markSent(messageId, employeeId, text);
+      await store.markSent(messageId, employeeId, body);
       return true;
     } catch (error) {
       this.log(`${step} notice to ${agent} failed: ${(error as Error).message}`);

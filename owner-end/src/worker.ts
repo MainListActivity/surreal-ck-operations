@@ -1,3 +1,5 @@
+import { ownerEventStream } from './realtime.ts';
+import { readRuntimeDashboard } from '../../src/runtime-dashboard.ts';
 import { feedbackEndpoint } from './feedback.ts';
 /**
  * 老板端 Worker：/api 下的接口（登录身份、看板、命令）与定时任务入口；其余路径交给静态页面（assets）。
@@ -77,6 +79,21 @@ app.get('/api/board', (c) => respond(async () => {
   const cfg = readConfig(c.env);
   const caller = requireOwner(await authenticate(c.req.raw, cfg));
   return withSession(await sessionsOf(cfg).owner(caller.token.token), (db) => readBoard(db));
+}));
+
+app.get('/api/events', async c => {
+  try {
+    const cfg = readConfig(c.env);
+    const caller = requireOwner(await authenticate(c.req.raw, cfg));
+    const db = await sessionsOf(cfg).owner(caller.token.token);
+    return ownerEventStream(db, c.req.raw.signal, caller.token.exp * 1000);
+  } catch (error) { return failed(error); }
+});
+
+app.get('/api/dashboard', c => respond(async () => {
+  const cfg = readConfig(c.env);
+  const caller = requireOwner(await authenticate(c.req.raw, cfg));
+  return withSession(await sessionsOf(cfg).owner(caller.token.token), db => readRuntimeDashboard(db));
 }));
 
 /** 执行命令：先认身份，再分流（见 commands.ts）。 */

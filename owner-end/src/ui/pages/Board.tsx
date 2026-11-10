@@ -1,8 +1,10 @@
+import { useLiveRefresh } from '../realtime.ts';
+import { OBSERVATION_TTL, useObservationClock } from '../runtime-state.ts';
 import type { ComponentChildren } from 'preact';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { readBoard, outcomeText } from '../api.ts';
-import { Empty, NoticeLine, Panel, useAction } from '../common.tsx';
+import { Empty, NoticeLine, PageHeader, Panel, roleText, useAction } from '../common.tsx';
 import {
   buildBoardView, clockText, draftOf, isDirty, translationView, type BoardViewModel, type Drafts, type EmployeeView, type MessageView,
   type QueueView, type TranslationView,
@@ -10,8 +12,7 @@ import {
 import { LANG_OPTIONS, boardSignatures, changedIds, langLabel, langPayload } from '../lang.ts';
 import type { BoardTranslation, OwnerBoard } from '../types.ts';
 
-/** 看板每 3 秒自动刷新一次。 */
-export const BOARD_REFRESH_MS = 3_000;
+/** 看板数据库变更实时更新一次。 */
 /** 变化处高亮保留的时长。 */
 export const FLASH_MS = 2_500;
 
@@ -159,14 +160,17 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
   const [picks, setPicks] = useState<Readonly<Record<string, string>>>({});
   const [previews, setPreviews] = useState<Readonly<Record<string, Preview>>>({});
   const loading = useRef(false);
+  const pendingLoad = useRef(false);
   const sigs = useRef<Map<string, string> | undefined>(undefined);
   const timers = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
   const { busy, notice, run } = useAction();
 
   const load = useCallback(async () => {
-    if (loading.current) return;
+    if (loading.current) { pendingLoad.current = true; return; }
     loading.current = true;
     try {
+      do {
+      pendingLoad.current = false;
       const out = await readBoard();
       if (out.kind !== 'ok') {
         setState(prev => ({ ...prev, error: outcomeText(out, '') }));
@@ -191,6 +195,7 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
         }, FLASH_MS);
         timers.current.add(timer);
       }
+      } while (pendingLoad.current);
     } finally {
       loading.current = false;
     }
@@ -198,14 +203,16 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
 
   useEffect(() => {
     void load();
-    const timer = setInterval(() => void load(), BOARD_REFRESH_MS);
+
     const pending = timers.current;
     return () => {
-      clearInterval(timer);
+
       for (const t of pending) clearTimeout(t);
       pending.clear();
     };
   }, [load]);
+
+  useLiveRefresh(['task','employee','audit','outbound_message','company_meta','runner_heartbeat'], load);
 
   /** 员工待发消息：按员工渲染后的原文保存（message.edit_rendered）。 */
   const saveRendered = (employeeId: string, messageId: string, text: string) =>
@@ -225,7 +232,9 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
     void run(on ? 'message.hold' : 'message.release', { messageId }, on ? '已扣住，等待放行' : '已放行', () => load());
 
   const board = state.board;
-  const view: BoardViewModel | undefined = board ? buildBoardView(board) : undefined;
+  const observedNow = useObservationClock([board?.runner.at]);
+  const runner = board?.runner;
+  const view: BoardViewModel | undefined = board ? buildBoardView(runner?.state === 'online' && runner.at !== undefined && observedNow - runner.at > OBSERVATION_TTL ? { ...board, runner: { ...runner, state: 'offline' } } : board) : undefined;
 
   /** 按编号找原料（员工卡片、排队项与 messages 三处合并，先到先用）。 */
   const raw = new Map<string, RawMessage>();
@@ -303,34 +312,27 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
 
   return (
     <div class="page board-page">
-      <div class="status-bar">
-        {view
-          ? <span class={`badge ${view.runner.tone}`}>{view.runner.stateText}</span>
-          : <span class="badge">执行端未知</span>}
-        {view && view.runner.detail ? <span class="hint">{view.runner.detail}</span> : null}
-        {view ? <span class="hint">{view.scheduler}</span> : null}
-        <span class="hint">上次刷新 {state.loadedAt ? clockText(state.loadedAt) : '—'}（每 3 秒自动刷新）</span>
-        <button type="button" onClick={() => void load()}>刷新</button>
-      </div>
-      {state.error ? <p class="notice err">看板读取失败：{state.error}</p> : null}
+      <PageHeader
+        title="派工消息"
+        description="员工正在做什么、接下来做什么，以及发给他们的消息原文。发送前可以改写、翻译或扣住。最近活动见总览。"
+        actions={<button type="button" class="ghost" onClick={() => void load()}>刷新</button>}
+        meta={(
+          <>
+            {view
+              ? <span class={`badge tone-${view.runner.tone === 'success' ? 'done' : view.runner.tone === 'danger' ? 'blocked' : 'neutral'}`}>{view.runner.stateText}</span>
+              : <span class="badge tone-neutral">执行端未知</span>}
+            {view && view.runner.detail ? <span>{view.runner.detail}</span> : null}
+            {view ? <span>{view.scheduler}</span> : null}
+            <span>上次刷新 {state.loadedAt ? clockText(state.loadedAt) : '—'}（数据库变更实时更新）</span>
+          </>
+        )}
+      />
+      {state.error ? <p class="notice err" role="alert"><span class="notice-text">看板读取失败：{state.error}</span></p> : null}
       <NoticeLine notice={notice} />
-      {!board && !state.error ? <p class="hint">正在读取看板…</p> : null}
+      {!board && !state.error ? <p class="hint" role="status">正在读取员工动态…</p> : null}
 
       {view ? (
         <>
-          <Panel title="公司在动" hint="全公司最近的操作，新的在上。">
-            {view.recent.length === 0 ? <Empty>还没有动态</Empty> : (
-              <ul class="activity">
-                {view.recent.map(r => (
-                  <li key={r.key}>
-                    <span class="hint">{r.time}</span> {r.actor} · {r.label}
-                    {r.taskTitle ? <> · {r.taskTitle}</> : null}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </Panel>
-
           <h2 class="section-title">员工</h2>
           <div class="grid">
             {view.employees.map(e => (
@@ -395,8 +397,8 @@ function EmployeeCard({ e, busy, drafts, common, translateFor, onSaveRendered, o
   return (
     <article class="card staff-card">
       <header class="card-head">
-        <span class="tag">{e.role}</span>
-        <span class={`badge ${n.status === 'idle' ? '' : 'violet'}`}>{n.statusText}</span>
+        <span class="tag" title={e.role}>{roleText(e.role)}</span>
+        <span class={`badge tone-${n.status === 'idle' ? 'neutral' : 'progress'}`}>{n.statusText}</span>
       </header>
       <h3>{e.name}</h3>
       {e.subtitle ? <p class="hint">{e.subtitle}</p> : null}

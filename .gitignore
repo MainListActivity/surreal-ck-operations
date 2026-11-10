@@ -6,3 +6,7 @@ plugin/node_modules/
 plugin/server/vendor/
 history.txt
 vault/build/
+
+# 本地设计快照及导出脚本
+owner-end/.demo/
+**/owner-design-snapshot*.json
