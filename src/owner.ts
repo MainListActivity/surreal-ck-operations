@@ -37,9 +37,7 @@ const GATE_EVIDENCE_CHARS = 8000;
 
 
 const EMIT_CREATED = (task: string) => `
-  CREATE audit CONTENT { task: ${task}, actor: $source, action: 'create', version: 1, at: time::now() };
-  LET $seq = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-  CREATE outbox CONTENT { task: ${task}, kind: 'created', sequence: $seq.value, payload: { state: ${task}.state }, at: time::now() };`;
+  CREATE audit CONTENT { task: ${task}, actor: $source, action: 'create', version: 1, at: time::now() };`;
 
 /** Owner-side operations. Used by the owner CLI, the dispatcher (owner_command table) and owner relay. */
 /** The brief names this many blocked items; the rest are counted in `total` and said so, never dropped silently. */
@@ -97,8 +95,6 @@ export class OwnerDesk {
         delivery_id = NONE, lease_expires_at = NONE, version = $t.version + 1
         RETURN AFTER;
       CREATE audit CONTENT { task: $task, actor: $actor, action: 'owner_' + $decision, evidence: $evidence, version: $next.version, at: time::now() };
-      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE outbox CONTENT { task: $task, kind: 'owner_decision', sequence: $sequence.value, payload: { decision: $decision, state: $next.state }, at: time::now() };
       IF $decision = 'approve' {
         FOR $e IN $human_evidence {
           CREATE acceptance_evidence CONTENT {
@@ -152,8 +148,6 @@ export class OwnerDesk {
       IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'task is not awaiting start: active lease' };
       LET $next = UPDATE ONLY $task SET executor_role = $executor, reviewer_role = $reviewer, version = $t.version + 1 RETURN AFTER;
       CREATE audit CONTENT { task: $task, actor: $actor, action: 'reassign', evidence: $evidence, version: $next.version, at: time::now() };
-      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE outbox CONTENT { task: $task, kind: 'reassigned', sequence: $sequence.value, payload: { executor: $executor, reviewer: $reviewer }, at: time::now() };
       CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`, { task: id('task', input.taskId), expected: before.version, executor, reviewer, evidence, actor: input.source, idem, digest });
@@ -191,8 +185,6 @@ export class OwnerDesk {
       };
       UPDATE employee SET active_task = NONE WHERE active_task = $task;
       CREATE audit CONTENT { task: $task, actor: $actor, action: 'retire', evidence: $evidence, version: $next.version, at: time::now() };
-      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE outbox CONTENT { task: $task, kind: 'retired', sequence: $sequence.value, payload: { state: 'void', retired_holder: $holder }, at: time::now() };
       CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`, { task: id('task', input.taskId), actor: input.source, evidence, holder: before.current_employee, idem, digest, descendants: await this.plannedDescendants(input.taskId) });
@@ -341,8 +333,6 @@ export class OwnerDesk {
         IF $t = NONE OR $t.state != 'blocked' OR $t.blocked_to != 'owner' OR $t.version != $expected { THROW 'task is not blocked on owner' };
         LET $next = UPDATE ONLY $task SET blocked_to = 'owner', version = $t.version + 1 RETURN AFTER;
         CREATE audit CONTENT { task: $task, actor: 'system:loop-breaker', action: 'escalate', evidence: $evidence, version: $next.version, at: time::now() };
-        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        CREATE outbox CONTENT { task: $task, kind: 'escalated', sequence: $sequence.value, payload: { loops: $loops }, at: time::now() };
         COMMIT;`, { task: id('task', task.id), expected: task.version, evidence, loops });
       return true;
     } catch { return false; }

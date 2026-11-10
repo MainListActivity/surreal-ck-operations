@@ -21,7 +21,7 @@ const fork = process.env.RUN_SCK_WORKTREE_FORK_TESTS === '1' ? test : test.skip;
 const NS = 'sck_acceptance_gate_test';
 const database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
 const credDir = mkdtempSync(join(tmpdir(), 'sck-acceptance-gate-'));
-const workforce = new Workforce(database, credDir);
+const workforce = new Workforce(database);
 const owner = new OwnerDesk(database);
 const enrollment = new LocalEnrollmentAdmin(database);
 const tokens: Record<string, string> = {};

@@ -1,209 +1,355 @@
-# 本机公司任务服务运维与员工接入（#27）
+# 节点运维手册（0.7.0）
 
-## 固定版本和边界
+本文说明执行节点（老板的 Mac 或其他执行端）上需要运维的部分，并记录仍然有效的业务规则与运行约定。0.7.0 起，节点只运行两样东西：
 
-本服务从 #24 核心 `7fc39c3`、#25 adapter `5f06b793` 集成，另纳入 [#29 官方 MCP 接入准备](./mcp-integration-preparation.md)和 [#26 QA 验收矩阵](./qa/mcp-company-acceptance.md)。代码发布为独立只读版本目录；运行中的 `active` 链接仅指向已提交、已安装依赖的 release，不指向工程或 QA worktree。服务权威是 SurrealDB 独立 `sck_agent_company/control_plane`；新建任务投影为带 `sck-company-task` marker 的 GitHub Issue。旧 #23—#29 的 v2 票仍由中央 `scripts/queue.py` 管理，不能用新 MCP 修改。
+1. **Paseo 插件 `sck-company`**：派工调度器、员工通道 sidecar、老板接口（端口 18777）、交付预览与运维代理都在插件进程内。
+2. **节点更新器**：安装为定时任务，按最新正式 Release 把插件切换到新版本。
 
-## 私有目录和进程
+节点上没有独立的任务服务进程，也没有 MCP 端点。任务、租约与审计都在云端公司库（SurrealDB）。节点只通过插件访问它。升级与回退见 [company-upgrades.md](./company-upgrades.md)。
 
-默认服务目录：`~/Library/Application Support/SurrealCKCompany`，权限 0700。目录结构：`releases/<commit>/` 为固定程序与 pnpm 依赖，`active` 为当前版本链接，`private/service.env` 为 0600 的路径/端口配置，`private/credentials/*.token` 为各员工独立 0600 文件，`private/gh-projection.json` 为 0600 持久投影进度，`logs/` 为仅本人可读日志。root 密码仅由现有产品 `.env` 在进程内加载；日志、Issue、客户端和提交不携带其值。
+## 服务目录
 
-用户级 launchd label 为 `org.surrealck.company-mcp`（任务服务）与 `org.surrealck.company-dispatcher`（v3 调度器，同一发布目录）。脚本 `scripts/company-service.sh` 默认只操作 `mcp`；v3 的调度器已迁入 Paseo 插件 `sck-company`（连同员工通道与运维代理），不要再装 launchd 调度器，否则会重复派工。`SCK_COMPONENTS=dispatcher`（或 `"mcp dispatcher"`）仅为旧部署保留；安装时同时把员工工具 `bin/sck` 复制到服务目录。旧版 launchd 调度器需要 `private/service.env` 中的 `SCK_AGENT_CWD`（员工工作目录，运营仓库 checkout），可选 `SCK_PASEO_BIN`、`SCK_NOTIFY=0`（关闭 macOS 通知）。Plist 位于 `~/Library/LaunchAgents/org.surrealck.company-<组件>.plist`，`KeepAlive` 在进程异常退出后重启。停止后不会删除数据库、凭证、日志或发布目录。卸载只去掉本服务 plist 与进程，不动数据。
+默认服务目录为 `~/Library/Application Support/SurrealCKCompany`，可用 `SCK_SERVICE_HOME` 覆盖。目录权限为 0700。
 
-发布按下文双面流程先固定集成提交、生成快照并安装依赖。首次安装才由获授权的配置管理方将 `.env.example` 复制到上述 `private/service.env`，登记现有产品 env **路径**、空闲端口、GitHub 仓库和私有老板（owner）凭证**路径**，文件权限 0600；后续发布沿用现有私有配置，不复制覆盖或读取凭证。`rtk proxy sh scripts/company-service.sh install '/absolute/release/path'` 安装并立即启动。常用命令（在任意固定版本目录执行）：
+| 路径 | 内容 | 来源 |
+|---|---|---|
+| `current` | 符号链接，指向现役插件目录 `plugin-releases/<sha>/plugin`。员工命令从这里运行。 | 节点更新器（`src/node-updater.ts` 的 `pointCurrent`） |
+| `plugin-releases/<sha>/` | `release.json`、`plugin/`（含 node_modules）、`scripts/sck.sh`、`scripts/bun-runtime.sh` | 节点更新器从发行包解压 |
+| `bin/sck` | `scripts/sck.sh` 的副本，权限 700 | 节点更新器（切换成功后） |
+| `bin/bun-runtime.sh` | `scripts/bun-runtime.sh` 的副本，权限 700 | 节点更新器 |
+| `updater/` | `node-updater.js`（600）、`run.sh`（700）、运行锁 `lock`、回退冷却记录 `rolled-back.json` | 节点更新器安装与运行 |
+| `private/` | `owner-token`（0600，插件启动时生成）、`node-id`、`cloud/`（云端凭证文件）、`company-db.env`（只放云端字段，见「节点组成与首次安装」）、`service.env`（可选，路径与端口配置） | 插件与运维人员 |
+| `logs/` | `node-updater.log`、插件的日志 | 各组件 |
+| `runtime-bun/` | 可选，服务固定的 Bun 运行时 | 运维人员 |
 
-```sh
-rtk proxy sh scripts/company-service.sh status
-rtk proxy sh scripts/company-service.sh restart
-rtk proxy sh scripts/company-service.sh stop
-rtk proxy sh scripts/company-service.sh start
-rtk proxy sh scripts/company-service.sh uninstall
-```
+`sck` 与 `bun-runtime.sh` 解析 Bun 的顺序为：环境变量 `SCK_BUN`，`private/service.env` 中的 `SCK_BUN=` 行，`runtime-bun/bin/bun`，最后是 `~/.bun/bin/bun`。不查找 PATH（见 `scripts/bun-runtime.sh`）。显式指定的 `SCK_BUN` 即使不存在也不会被替换。
 
-`GET http://127.0.0.1:<port>/health` 是进程存活探针；`GET /ready` 检查实际目标库 ownership marker 可读，200 为 ready、503 为不可用。两者仅本机可访问，且同样应用 Host/Origin 检查；MCP `/mcp` 仍须每次 Bearer 鉴权。检查时用 `rtk proxy curl --fail http://127.0.0.1:<port>/ready`，`rtk proxy lsof -nP -iTCP:<port> -sTCP:LISTEN`，`rtk proxy sh scripts/company-service.sh status`。日志在 `logs/stdout.log` 和 `logs/stderr.log`（调度器为 `logs/stdout-dispatcher.log`、`logs/stderr-dispatcher.log`），只记录监听端口、投影数量和不含原始错误的重试消息；不要把完整日志上传到 Issue。启动失败先检查私有配置路径、文件权限、端口占用、现有 SurrealDB 可达性与本机 gh 登录。回滚须按下文「双面回滚」同时恢复 launchd 与插件来源；仅运行 `install <previous-release>` 不足以完成回滚。卸载如上。
+`private/service.env` 只写路径与端口，权限 0600，不进仓库。常用项：
 
-## 插件面同步（基线集成 + 固定 release 双面发布）
+- `SCK_PREVIEW_PORT`：LAN 面端口，缺省 18777。老板接口 `sck owner` 也读这一项。
+- `SCK_PREVIEW_SIGNED_PORT`：签名面端口，缺省 18778。
+- `SCK_PREVIEW_SECRET`：签名面 HMAC 密钥，未配置则签名面不启动。
+- `SCK_PRODUCT_ENV`、`SCK_AGENT_CWD`、`SCK_PASEO_BIN`、`SCK_NOTIFY`、`SCK_NOTIFY_WEBHOOK`：见仓库根 `.env.example`。
 
-任务系统有两个部署面：launchd `org.surrealck.company-mcp` 从 `active` 指向的 release 运行；员工 comm 通道（sck → sidecar → vendored core）、运维代理、调度器与交付预览运行在 Paseo 插件 `sck-company` 内。**两面必须使用同一个集成基线的固定 release**。只切 `active` 或只 reload 旧来源，会让两面 core/schema 不一致（曾出现新岗位被旧 ROLES 拒为 `invalid: Invalid role`）。
+## 节点组成与首次安装
 
-**部署只用 main 分支**：自 2026-10-10 起取消"生产基线任务分支"模式——所有变更必须先经 PR 合入 `origin/main`，release 一律从 `main` 的合并提交切出，`company-service.sh install` 会强制校验 release SHA 可达自 `origin/main`，不在 main 上的提交一律拒绝安装。历史上 `task/d7697420`、`task/b7fdaa55` 等生产基线分支曾让部署面与 main 漂移（双面跑过不同版本），该模式已废止；`/Users/y/IdeaProjects/surreal-ck-operations-v3`（`ops/v3-paseo-dispatch`）保留为 **protected 历史工作树**，不再是生产插件来源。
+首次安装顺序：
 
-固定 release 内的 `plugin/server/vendor/` 仍是 `src/` + `schema/` 的生成拷贝，每次打包都须重生成。
+1. 准备工具：Node.js 22 或以上、`tar`、`pnpm`、已登录的 `gh`，以及 Paseo CLI。
+2. 准备云端凭证文件（只放路径，不复制内容）：`private/cloud/runner-client-secret`（权限 0600）；`COMPANY_DB_URL`、`IDP_ISSUER`、`RUNNER_CLIENT_ID` 可作为环境变量设置，也可写入 `private/company-db.env`（只读这些云端字段，文件里的 `SURREAL_*` 不生效）。缺少 `COMPANY_DB_URL` 时节点更新器拒绝运行，插件的公司栈也拒绝启动，两者都不回落到本机库。
+3. 在干净的 main 检出目录执行 `sh scripts/node-updater.sh install`。它下载最新正式 Release 的 `manifest.json` 与 `node-updater.js`，校验后注册定时任务，并立即运行一轮。这一轮会注册并启动插件。
+4. 按 [company-upgrades.md](./company-upgrades.md#首次安装节点更新器) 的验证步骤确认插件状态与 `current` 指向。
+5. 员工沙箱（`sh scripts/sandbox/install.sh`）按下文「员工沙箱」一节手工安装，节点更新器不负责它。
 
-### 1. 合入 main 并固定提交
+`scripts/node-updater.sh` 支持 `install`、`run`、`status`、`uninstall`。`install` 与 `uninstall` 的细节见 company-upgrades.md。
 
-以下操作仅由已获上线批准的部署腿在其登记任务分支/工作目录执行，不在共享 main checkout 直接写代码，不自行建树或切分支。先记录 `active` 的完整路径和插件 SOURCE/DIRECTORY，保留上一版双面回滚目录及依赖。
+## 员工命令 `sck`
 
-变更在登记任务分支完成、通过评审后，按正常流程 PR 合入 `origin/main`（不允许把未合并的基线/任务分支直接切 release）。
-
-**SYS02 验收基线守卫**：安装、回滚与远程切换在 active、插件、MCP 或 ssh 任何副作用前，用当前健康 release（或部署树）的脚本读取目标 release 自身的 `src/acceptance.ts`/`core.ts`/`database.ts` 与 `schema/*acceptance*.surql`，要求其内容（已由 `release-content.sh` 绑定提交）证明不可移除的 required 机器 AC + 真实独立签署基线。旧版、不完整、注释冒充或不可读目标一律拒绝，不以“当前无 gated 行/先关 gate”开窗；无兼容回退目标时保留健康版本或受审前修。回滚必须用当前健康 release 的脚本，不能用目标自带的旧 installer 绕过。合入后 `rtk git fetch origin`，取 `origin/main` 的完整 SHA 作为本次 `SCK_BASELINE_SHA`——release 快照即该提交的内容。
-
-部署记录应包含来源 PR/SHA、最终 main SHA 与批准范围。该 SHA 须通过根与插件 typecheck、该变更要求的回归；本地数据库测试只用公司 fork。根/schema 与插件/vendor 来自这同一个 main 提交。
-
-### 2. 从提交生成固定 release
-
-下例变量须在同一个 shell 会话设置；`SCK_DEPLOY_REPO` 是当前登记部署工作目录，`SCK_BASELINE_SHA` 填已提交的完整集成 SHA，`SCK_PLUGIN_DEPS` 填上一步记录的上一固定 release 的 `plugin/node_modules`（首次切换时才用已核实的 v3 依赖目录）。不读取凭证或私有 env；不覆盖已存在的 release。所有占位符须替换后执行。
-
-```sh
-SCK_DEPLOY_REPO='/absolute/registered/deploy/worktree'
-SCK_BASELINE_SHA='<full-integrated-commit-sha>'
-SCK_RELEASE_ROOT="$HOME/Library/Application Support/SurrealCKCompany"
-SCK_RELEASE_DIR="$SCK_RELEASE_ROOT/releases/$SCK_BASELINE_SHA"
-SCK_PREVIOUS_RELEASE='/absolute/previous/release'
-SCK_PLUGIN_DEPS="$SCK_PREVIOUS_RELEASE/plugin/node_modules"
-PASEO_CLI='/Applications/Paseo.app/Contents/Resources/bin/paseo'
-rtk proxy test ! -e "$SCK_RELEASE_DIR"
-rtk proxy mkdir -p "$SCK_RELEASE_DIR"
-rtk git -C "$SCK_DEPLOY_REPO" archive --format=tar --output="$SCK_RELEASE_DIR/source.tar" "$SCK_BASELINE_SHA"
-rtk proxy tar -xf "$SCK_RELEASE_DIR/source.tar" -C "$SCK_RELEASE_DIR"
-rtk proxy rm "$SCK_RELEASE_DIR/source.tar"
-rtk proxy cp -RL "$SCK_PLUGIN_DEPS" "$SCK_RELEASE_DIR/plugin/node_modules"
-rtk proxy sh "$SCK_RELEASE_DIR/plugin/scripts/vendor.sh"
-rtk proxy pnpm --dir "$SCK_RELEASE_DIR" install --frozen-lockfile
-rtk proxy pnpm --dir "$SCK_RELEASE_DIR/plugin" install --frozen-lockfile --ignore-scripts
-rtk proxy pnpm --dir "$SCK_RELEASE_DIR" typecheck
-rtk proxy pnpm --dir "$SCK_RELEASE_DIR/plugin" typecheck
-```
-
-逐条检查退出码，任何一步失败都停止，保留当前生产版本。依赖拷贝要解引用，避免 release 指向会被回收的开发树；随后以该基线锁文件安装校准，不能以旧 `node_modules` 代替 frozen-lockfile 校验。预安装与 vendor 生成完才允许切换；上线后 release 不再原地修改。同 SHA 已有目录只可在核对完整快照、依赖和 vendor 后复用，不盲目覆盖。
-
-### 3. 安装 launchd 与重注册现有插件
-
-先安排短暂维护窗口，记录在办任务/编制状态并暂停新增派工；由老板使用现有管理通道处理受影响编制，不新建员工或 dispatcher。不要重启整个 Paseo 守护进程。现有私有配置由运行脚本加载，安装命令只传固定 release 路径。
+员工会话里的工具入口是 `bin/sck`（即 `scripts/sck.sh`）。它把请求交给 `current/server/vendor/src/sck-cli.ts` 运行。
 
 ```sh
-rtk proxy env SCK_COMPONENTS=mcp sh "$SCK_RELEASE_DIR/scripts/company-service.sh" install "$SCK_RELEASE_DIR"
-# MCP ready / bootstrap 成功后再切插件（端口用已登记配置）
-rtk proxy curl --fail 'http://127.0.0.1:<mcp-port>/ready'
-rtk proxy "$PASEO_CLI" plugin install "$SCK_RELEASE_DIR/plugin" --id sck-company
-rtk proxy "$PASEO_CLI" plugin reload sck-company
-rtk proxy "$PASEO_CLI" plugin ls sck-company
+"$HOME/Library/Application Support/SurrealCKCompany/bin/sck" list
+"$HOME/Library/Application Support/SurrealCKCompany/bin/sck" call get_context '{}'
 ```
 
-`install` 校验 main 祖先关系、切 `active`，并在插件已登记于本服务目录时自动执行 `plugin remove` + `plugin install <release>/plugin --id sck-company` 完成重指——daemon 只在登记时解析来源路径，`reload` 不重读 config、`install` 不允许覆盖既有 ID，所以重指只能走 remove+install（插件进程重启，sidecar `adopt()` 会恢复在编通道与活租约）。已指向本次 release 时 install 只做 reload。插件登记在服务目录之外的路径（如开发树）时 install 不干预，只提示。不要继续加载 v3 checkout，也不要另装 launchd dispatcher。任何一步失败，按第 5 节恢复两面后再修复。
+- `sck list` 与 `sck call <工具> '<JSON>'` 只走员工通道（comm）。需要环境变量 `SCK_COMM_DIR` 与 `SCK_COMM_KEY`。插件 sidecar 在会话启动时注入这两个变量。`sck.sh` 也会读取 `comm-agents/<PASEO_AGENT_ID>` 指针文件，以便插件重启后找到最新的通道。
+- 缺少 `SCK_COMM_DIR` 时 `sck` 报 `missing_comm_dir` 并退出，不会回退到其他身份。
+- 没有现役插件（`current` 不存在）时报 `missing_plugin`；Bun 运行时缺失时报 `missing_runtime`。
+- 每次输出都是一行 JSON。失败时同时在 stderr 给出原因，退出码为 1。
 
-### 4. 双面验证与恢复派工
+员工的身份由插件通道决定，不能在参数里指定。员工凭证不落盘，也不进入环境变量（见 [sidecar 通道](./sidecar-channel.md)）。
 
-- `rtk proxy readlink "$SCK_RELEASE_ROOT/active"` 必须等于本次 release；`rtk proxy sh "$SCK_RELEASE_DIR/scripts/company-service.sh" status` 应显示 MCP running；`/health`、`/ready` 都返回 200。
-- `paseo plugin ls sck-company` 必须为 running、enabled、无 error，**SOURCE 和 DIRECTORY 都必须等于 `$SCK_RELEASE_DIR/plugin`**。只看 running 不足以证明已切版本。
-- 比对 release `schema/` 与 `plugin/server/vendor/schema/`：`rtk proxy diff -qr "$SCK_RELEASE_DIR/schema" "$SCK_RELEASE_DIR/plugin/server/vendor/schema"` 无差异。vendor 的 TypeScript 多一行 `// @ts-nocheck`，核对 core 时去掉该首行再比对源文件，记录基线 SHA 与生成物哈希。
-- 用真实已登记员工通道 `rtk proxy "$SCK_RELEASE_ROOT/bin/sck" call get_context '{}'` 验证 core 可用；恢复维护前的编制状态后，由老板安排一次实际派工，核对 spawn/claim 与任务记录，不能把命令成功当成已验证派工。无分页参数的 `get_context` 默认不含公司块（答复中 `companyIncluded` 为 false），所以公司块再大也不会让它超限。若它返回 `response_too_large`，说明匹配的任务本身超过 48 KiB 整包预算，即旧的全量任务查询过宽，应视为需要分页的查询问题，而不是可忽略的正常结果：改用 `'{"pageSize":25}'`，并把返回的 `page.nextCursor` 作为 `cursor` 逐页读取，直到 `page.hasMore` 为 false；需要收窄时加 `state`、`tag`、`role` 或 `since`。公司方向与项目用 `'{"scope":"company","pageSize":25}'` 分页读取（`companyRead` 字段给出同样的参数），按段的长度与 SHA-256 重组。`response_too_large` 时核心仍在运行，可用分页调用复验。预览健康与监听进程按下节检查。公司块中的项目环境（`envs`、凭证别名与角色）只对老板与持有该项目有效任务租约的员工返回；其它员工看到项目身份，并得到 `envsWithheld: true`。老板控制台仍是完整视图。
+## 老板接口 `sck owner`
 
-证据分别记录两面路径、SHA、进程状态、探针与真实派工结果/时间；若真实派工尚未验证须明确标注，不能宣布部署完成。
-
-### 5. 双面回滚
-
-**兼容目标是回滚的前提（RW06）**：切换（install 与远端 deploy）在内容绑定之后、任何副作用之前，用 `scripts/acceptance-guard.sh` 读取**目标自身的代码**判定兼容性：目标必须带 SYS02 验收基线（`src/acceptance.ts` 的 criterion/verdict 判定与 `record_acceptance_evidence` 记录接缝）。本地 install（scope=`full`）还要求插件树与其 vendor 同源；远端 deploy（scope=`core`）只查核心。不兼容、不可读或无法证明的目标一律拒绝，拒绝发生在任何切换副作用之前。与其它内容探针一样，它只证明目标带着这份契约、不能证明其行为，不代替真实派工证据。
-
-
-
-
-**先停用受影响编制再回滚**：由老板通过现有管理通道暂停这些编制，记录原 enabled 状态，防止旧 core 对新岗位/策略继续派工；核对在办任务并保留租约、comm、登记与审计。回滚目标须同时兼容当前岗位与 WT01/WT02 登记，不能任意选更早版本；不删除 schema、历史或任务数据。
+老板命令走插件的老板接口，即 LAN 面上的 `/api/owner/<命令>`：
 
 ```sh
-# 用当前（受审、带守卫）release 的 installer 安装回滚目标：守卫与内容/门禁校验都在这一步完成。
-rtk proxy env SCK_COMPONENTS=mcp sh "$SCK_RELEASE_DIR/scripts/company-service.sh" install "$SCK_PREVIOUS_RELEASE"
-rtk proxy curl --fail 'http://127.0.0.1:<mcp-port>/ready'
-# 插件面由上面的 install 自动重指（登记在服务目录内时）；这里只核对，不重复 install。
-rtk proxy "$PASEO_CLI" plugin ls sck-company
+"$HOME/Library/Application Support/SurrealCKCompany/bin/sck" owner <命令> '<JSON>'
 ```
 
-**不得调用旧 release 自带的 installer**：旧版本的 `scripts/company-service.sh` 没有 RW06 守卫（也没有 SYS02/IR06/SYS06/FV06 守卫），实测对不兼容目标会直接 `rc=0` 切 `active` 并复制 bin（全新 installer 对同一目标则拒绝且零副作用）。回滚命令固定用 `$SCK_RELEASE_DIR/scripts/company-service.sh`（`$SCK_RELEASE_DIR` 为当前受审 release）。若 install 输出 `warning: plugin repoint failed`（插件登记在服务目录之外），按第 3 节 R3 手工 `remove` + `install` 指向**已被守卫放行的同一目标**，顺序不得颠倒。
+命令名以 `plugin/server/owner-api.ts` 的路由为准，例如 `task.create`。
 
-回滚恢复的是上一版完整固定 release（含集成过的在途功能、依赖与 vendor），不能只改 `active` 或只 reload。 SYS02 的回滚边界：新增内容只有可选 `acceptance_*` 字段、`acceptance_evidence` 表与 gate 记录，没有新 task 状态；旧 release 会绕过门禁 accept。存在启用 criteria 的在办任务时不得回滚，必须排空或保留新 release；演练须覆盖“新版写入 gated 数据 → 固定旧 release（a925222）dispatcher/core → 拒绝恢复”，且新守卫拒绝旧目标。重做第 4 节的双面验证；仅恢复与回滚版本兼容的编制，其余保持停用并报老板。旧 release 不完整/不兼容或回滚失败时保留现场并报阻塞，不回退到 v3 历史树作为生产源。
+- 端口读取 `private/service.env` 中的 `SCK_PREVIEW_PORT`，缺省 18777。请求发往 `127.0.0.1`。
+- 鉴权使用 `private/owner-token`（由插件 `ensureOwnerToken` 在启动时生成，权限 0600）。命令行只读取该文件，不打印令牌。
+- `X-Owner-Agent` 头取自环境变量 `SCK_OWNER_AGENT`，缺省为 `cli`。
+- 服务端的 `/api/owner/*` 路由由 `plugin/server/owner-api.ts` 处理，要求 Bearer 令牌。
 
-内部AI证明契约（`src/ops/proof-*.ts`，含 `reviewed-token-plan` 配额型证据类型，字段契约见 [internal-ai-proof-contract.md](./internal-ai-proof-contract.md)）同样只经 vendor 拷贝进入员工通道面与调度器：契约变更随固定 release 安装上线，但 `vendor.sh` 重新生成 + `paseo plugin reload sck-company` 完成前，员工侧仍按旧契约校验证据文档与 enable 配额语义，不能跳过插件面同步。
+## 健康检查
 
-## 交付预览服务（插件内嵌正式版 · LAN/公网双面）
+| 检查 | 命令 | 正常结果 |
+|---|---|---|
+| 交付预览与老板接口端口 | `curl -sf http://127.0.0.1:18777/healthz` | `{"ok":true,"port":18777,"uptime":...}`（`src/preview-core.ts`） |
+| 签名面（配置了 `SCK_PREVIEW_SECRET` 时） | `curl -sf http://127.0.0.1:18778/healthz` | 同上 |
+| 插件注册 | `paseo plugin ls sck-company --json` | `status` 为 running，`enabled` 为 true，`path` 指向 `plugin-releases/<sha>/plugin` |
+| 节点更新器 | `sh scripts/node-updater.sh status` | 定时任务已加载，日志最后 40 行 |
+| 云端节点记录 | 见 company-upgrades.md 的 `node_release` 查询 | `checked_at` 为近期时间 |
+| 预览状态 | 读取 `<服务目录>/preview-status.json` | 插件写入，记录两个监听面的状态 |
 
-交付预览 HTTP 服务正式版内嵌在 sck-company 插件 server 进程（`plugin/server/preview.ts` 生命周期层 + vendor 的 `src/preview-core.ts` 路由/安全），随插件启动、随 reload/卸载停止，不另起 daemon。**两个监听面分工明确**：
+`/healthz` 不鉴权。0.7.0 的插件没有 `/health` 或 `/ready` 路由。
 
-- **LAN 面** `0.0.0.0:$SCK_PREVIEW_PORT`（缺省 18777，保持已公布 URL）：无鉴权、无白名单，仅老板 Mac 局域网设备可达
-- **签名面** `127.0.0.1:$SCK_PREVIEW_SIGNED_PORT`（缺省 18778）：仅当 `SCK_PREVIEW_SECRET` 已配置才起，所有 `/e/`、`/d/` 请求强制 `exp`+`sig` HMAC 签名（未签/坏签 401、过期 403）；本机回环绑定，公网只能经 VPS→SSH 反向隧道到达，LAN 侧无法直连
+日志：节点更新器写 `logs/node-updater.log`；插件日志前缀为 `[preview]` 等。排查时先看 `node-updater.log` 的最后一行 `结果: …`。
 
-两面共用同一路由/安全核心：`/e/<taskId>[/<file>]`→`evidence/`、`/d/<taskId>[/<file>]`→`deliverables/`、目录/任务根可点击列表页（`../` 可回上级；签名面链接由服务端同密钥签发）、`/healthz`→`{ok,port,uptime}` 免签；mp4 等视频 Range/206 支持拖放。`..`/隐藏段/符号链接逃逸一律 403（词法 resolve + realpath 双重）。
+## 数据库与云端迁移
 
-**`private/service.env` 需配**（0600，不进仓库）：
-- `SCK_PREVIEW_SECRET`：HMAC-SHA256 密钥（如 `openssl rand -hex 32`），签名面与插件 `company.attachments.url` 签发方共享；不配置则签名面不起（LAN 面不受影响）
-- `SCK_PREVIEW_PUBLIC_BASE`：公网可达的 https base，插件校验必须 `https://` 前缀，示例 `https://data.maplayer.top/pv`
-- `SCK_PREVIEW_TTL_MS`（可选）：签名有效期，默认 3600000；`SCK_PREVIEW_PORT`/`SCK_PREVIEW_SIGNED_PORT` 可选改端口
+- **云端公司库**：节点通过 runner 身份连接，凭证为 `private/cloud/runner-client-secret`。节点不执行 schema 迁移。
+- **迁移**：只由 CI 的 release 作业执行一次，即 `bun scripts/company-migrate.ts`，使用 migrator 凭证。节点与运维人员不需要运行它。迁移只在 `v<版本>` 尚未发布时执行，见 company-upgrades.md。
+- **本机公司库已删除（0.7.1）**：仓库不再提供 `scripts/company-db.sh`、`scripts/company-db-runtime.sh` 与 `scripts/company-backup.ts`，不再有本机公司库、每小时 R2 备份与每周恢复演练。节点与运维人员都只连接云端公司库。0.7.0 及更早版本若在本机装过三个 launchd 任务，需按「停用与卸载」人工停用。`private/db` 数据目录与 R2 备份不会被删除，是否归档由老板决定。
+- 本地测试只用公司 fork（`~/.surrealdb/surreal`），不使用上游 SurrealDB。
 
-**公网暴露（推荐：复用现有 VPS + 域名，零新增付费）**：本机向远端主机开持久反向隧道，把本地**签名面** :18778 暴露为 VPS loopback 端口，再由 Caddy 路径前缀对外——公网流量必经签名门控，永远打不到无鉴权的 LAN 面：
+## 交付预览
+
+交付预览服务内嵌在插件进程中（`plugin/server/preview.ts`），随插件启动、随 reload 或卸载停止，不另起守护进程。
+
+- **LAN 面**：`0.0.0.0:SCK_PREVIEW_PORT`（缺省 18777）。提供 `/e/`、`/d/`、`/healthz` 与 `/o/`、`/api/owner/` 等路径。除 `/api/owner/*` 外无鉴权，仅供老板局域网设备访问。
+- **签名面**：`127.0.0.1:SCK_PREVIEW_SIGNED_PORT`（缺省 18778），仅在配置了 `SCK_PREVIEW_SECRET` 时启动。所有 `/e/`、`/d/` 请求必须带 `exp` 与 `sig`，未签名返回 401，过期返回 403。
+- 签名面只监听回环地址。若要公网访问，需要自行配置隧道或反向代理，并以签名面为入口。此仓库中的代码不包含隧道配置。待确认：`SCK_PREVIEW_PUBLIC_BASE` 当前代码不读取，原文中的公网基址设置已删除。
+- 绑定失败时每 2 秒重试，直到插件停止。
+
+员工交付使用 `deliverable_publish` 工具，把文件复制到 `deliverables/<任务ID>/` 并返回可点击的 `/d/` 链接。
+
+## 员工沙箱
+
+员工与老板、插件是同一个 macOS 用户 `y`，文件权限挡不住员工读取公司凭证。所以公司会话在 Seatbelt 沙箱（`scripts/sandbox/employee.sb`）中启动，子进程会继承：
+
+- **不可读写**：`<服务目录>/private`、`~/.ssh`（只放行 `config`、`known_hosts`、`id_ed25519.pub`，git 经 ssh-agent 推送）、`~/.paseo`、`~/.config/magpie`、Cloudflare/wrangler 配置。
+- **不可连接**：Paseo daemon `localhost:6767`（员工会话里的 Paseo 自带 MCP 因此失效，公司流程不依赖它）、`~/.ssh` 与 `~/.paseo` 下的 unix socket、`sck-vault` socket。
+- **不可执行**：`launchctl`、`osascript`、`open`、`crontab`/`at`、Paseo CLI；同时禁止 AppleEvents 和 LaunchServices。
+- **不可写**：插件发布与运行时目录、沙箱自身、`~/Library/LaunchAgents`、shell 启动文件、`~/.gitconfig`、`~/.claude` 的全局设置/hooks/skills/plugins、`~/.local/bin`、`~/.local/share/claude`、`~/.bun/bin`、`~/node/bin`、`/Applications`、`/opt/homebrew`。
+
+接线方式：插件在 `agent.session_open` 给公司会话加 `SCK_SANDBOX=employee`（resume 的会话按 label 识别后同样加上）。Paseo 的 `claude`、`factory-droid`、`antigravity` provider 命令替换成 `<服务目录>/sandbox/bin/*` 包装脚本，经 `launch.sh` 处理：有标记或 `SCK_COMM_DIR` 的会话进沙箱，profile 缺失时拒绝启动（exit 78）；老板自己的会话和 Paseo 的版本/登录探测原样运行。安装或更新（幂等，会备份 `~/.paseo/config.json` 并执行 `paseo reload`）：
 
 ```sh
-# 本机（launchd 或 autossh 持久化，复用 deploy 用 SSH 通道）
-ssh -N -F /dev/null -i <tunnel-key> -o IdentitiesOnly=yes -o UserKnownHostsFile="<known_hosts>" -R 127.0.0.1:18778:127.0.0.1:18778 scktunnel@<remote-host>
-# VPS Caddyfile（data.maplayer.top 站点内追加）
-handle_path /pv/* { reverse_proxy 127.0.0.1:18778 }
+sh scripts/sandbox/install.sh
 ```
 
-签名只覆盖 `pathname`（如 `/e/<taskId>/<file>`），Caddy 去前缀后一致，`SCK_PREVIEW_PUBLIC_BASE=https://data.maplayer.top/pv`。备选：cloudflared named tunnel 直指 :18778（需 CF 凭证经 ops_* 申请）。
+插件每次打开公司交互会话时都会重读 `~/.paseo/config.json`。provider 不在 claude、factory-droid、antigravity 之列（codex 由多个 agent 共用同一个 app-server 进程，无法按会话进沙箱），或配置没有指向包装脚本时，直接拒绝打开会话（fail closed）；只读历史不受影响。已在运行的会话会沿用旧的启动方式，要重新打开会话才进沙箱：空闲时执行 `paseo agent reload <id>`。
 
-签发链路：收件箱附件行按下 → 插件 `company.attachments.url` 校验文件确在 `evidence/<taskId>` 内 → 返回预览 URL → `openExternalUrl` 打开；老板任意设备浏览器直接消费，图片仍走 `attachments.read` data-URI 内联。URL 形态按老板口径为 LAN `http://<lanIP>:<port>/e/…`（无签名、无时效）；公网签名 URL 通道保留待用（签名面 :18778 + 隧道/Caddy），激活后此 RPC 如需恢复 `base+签名路径` 形态只需切回签发分支。
+沙箱挡不住的同用户风险：埋进共享仓库、留给老板日后运行的代码（`.git/hooks`、依赖脚本），`~/.claude.json` 里的 Claude 自身 MCP 配置（claude 本身要写这个文件），以及钥匙串里允许 `security` 读取的条目。要彻底隔离，只能让员工改用独立的 macOS 用户运行。
 
-**员工交付发布工具 `deliverable_publish`**（sidecar 基础工具，`sck call deliverable_publish '{"files":[绝对路径…],"taskId"?}'`）：把文件/目录复制进 `$SCK_SERVICE_HOME/deliverables/<taskId>/` 并返回 `/d/` 路由的 LAN 可点 URL；taskId 缺省取在手租约。同名覆盖、隐藏名跳过、symlink 解引用；任一输入路径无效即整体报错不落半截包。员工证据里的预览链接一律用它返回的 URL。收件箱 `attachments.url` 当前按老板 LAN 口径直接返回 `/e/` 无签名 URL；公网签名通道（preview-sign + 签名面 :18778 + 隧道/Caddy）保留待用，配置 `SCK_PREVIEW_SECRET` 后插件 reload 即激活签名面。
+待确认：`scripts/sandbox/install.sh` 当前每次运行都会复制 `launch.sh`（第 15 行）。0.7.0 设计要求安装时不再刷新 `launch.sh`，代码尚未对齐。
 
-**部署（插件面同步之外多一步退役桥接）**：先 `launchctl bootout gui/$(id -u)/org.surrealck.deliverable-preview` 退役旧桥接（plist 可留档），再走上文「插件面同步」的基线集成、固定 release 打包、launchd install 与 `paseo plugin install <release>/plugin` 重注册流程——插件侧 EADDRINUSE 每 2s 重试至 teardown，bootout 先行即无竞态。`lsof -nP -iTCP:18777 -sTCP:LISTEN` 与 `:18778` 确认监听进程已是 Paseo/插件而非独立 bun，`curl http://<lanIP>:18777/healthz` 200 即接管完成，旧 `/e/`、`/d/` URL 不变继续有效。
+## 媒体生成（sck-vault）
 
-**状态观测**：`ops_info` 响应含 `preview` 段 `{lan:{running,port,lanUrl,uptime,lastError}, signed:{configured,running,port,uptime,lastError}, roots, lastError}`——loopback 探测 healthz 为准，失败回读插件写的 `$SCK_SERVICE_HOME/preview-status.json`。插件日志前缀 `[preview]`。
+ElevenLabs 的 key 只存在于 `sck-vault` 里。它是一个独立的小程序，key 保存在登录钥匙串中，钥匙串只信任这一份二进制。插件和员工进程都拿不到 key，员工只调用 `media_*` 工具，拿回的是文件路径和大小。`private/service.env` 里不再配置 `ELEVENLABS_API_KEY`。
 
-**应急兜底**：`src/preview-server.ts` 为同 core 的 bun 独立脚本（`bun src/preview-server.ts`，双监听与插件一致），插件整体不可用时可用 launchd 临时顶回；复制到 `bin/` 时连同 `preview-core.ts`、`preview-sign.ts` 一起（`cp src/{preview-server,preview-core,preview-sign}.ts $SCK_SERVICE_HOME/bin/`）。
+**安装（老板在终端做，一次性）**
 
-## SYS05 时间与外部事件等待
+```sh
+sh vault/build.sh                                  # 构建，装到 <服务目录>/bin/sck-vault，并生成 plist（待确认：构建在 main 检出目录执行，vault/ 不在插件发行包白名单内）
+<服务目录>/bin/sck-vault setup                     # 先用 Touch ID 确认，再隐藏输入 ElevenLabs key，只写入钥匙串
+cp <服务目录>/vault/org.surrealck.vault.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plist
+```
+
+`build.sh` 与插件必须使用同一个服务目录：构建时用 `SCK_SERVICE_HOME` 指定，插件启动时使用同样的环境变量。
+
+首次录入后正常不会弹窗。签名决定信任粒度：
+
+- 登录钥匙串里存在 `SCK Vault Code Sign` 签名身份时，`build.sh` 自动用它签名，钥匙串信任锚在证书上，**重建二进制不再弹窗**。创建一次即可：生成自签名代码签名证书（代码签名 EKU）导入登录钥匙串。
+- 没有该身份时回退 ad-hoc 签名：信任绑定这份二进制的确切哈希，**每次重新执行 `build.sh` 后钥匙串弹窗一次**。确认弹窗来自 sck-vault 后选择「始终允许」，然后执行 `launchctl kickstart -k gui/$(id -u)/org.surrealck.vault` 重启。
+
+`private/service.env` 中的 `ELEVENLABS_API_KEY=` 一行，在新插件生效并验证之后删除，然后轮换该 key（旧 key 以明文存在过，员工可能读到过）。
+
+**调用（无需授权）**
+
+```sh
+<服务目录>/bin/sck-vault status   # {"configured": true} 表示密钥就绪
+```
+
+操作种类：`tts`、`dialogue`、`sfx`、`music`、`voice_design`、`voice_create`、`voices`、`subscription`。密钥录入后员工即可调用，不需要老板批准。vault 的职责只有一条：密钥不出进程。员工侧的租约、角色与项目每日配额由插件代码判断。
+
+**安全边界**
+
+- 员工进程、插件和 TypeScript 代码都没有 key。vault 的回复里也不含 key：上游回显的 key 会被替换成 `[已遮盖]`。
+- vault 只访问 `api.elevenlabs.io` 的固定端点，不跟随重定向，调用方不能指定 URL 或请求头。
+- 钥匙串只信任这一份二进制。副本放在别的路径运行时，会拒绝读取密钥。
+- 加固运行时，且没有调试权限，同用户的其它进程拿不到 vault 的内存。
+- 同一台 Mac 上的任何本地进程都能调用固定端点操作。vault 分辨不出调用者身份，员工级的租约和角色检查仍在插件里；绕过插件直调 socket 无法拿到 key，但能发起上游调用，这是已接受的残余面。
+- 同一时间只能有一个 sck-vault 监听 socket。
+
+**配额与审计**
+
+- 每个项目每日的上限（tts 1500、dialogue 600、sfx 300、music 60、voice_design 30）仍由公司侧计数，可用 `SCK_MEDIA_DAILY_*` 调整。`media_info`、`media_voices` 不计次数。
+- 成功生成写 `ops_media_*` 审计。
+- vault 另有哈希链审计 `<服务目录>/vault/audit.log`，只记录事件、操作种类、次数和字节数，不含 key。
+
+## 源站只读运维代理
+
+源站（VPS）上有两个专用账号，各绑定一把只在本机的无口令密钥。它们存放在 `<服务目录>/private/origin/`（权限 0600）。
+
+| 账号 | 密钥 | 能做的事 |
+|---|---|---|
+| `scktunnel` | `tunnel-ed25519` | 开反向转发 `127.0.0.1:18778`。无 shell、无本地转发。 |
+| `sckops` | `ops-ed25519` | 运行强制命令 `/usr/local/bin/sck-origin-agent`，只提供 `status`、`health`、`logs` 三个只读操作。无 sudo。 |
+
+限制两层叠加：`authorized_keys` 的 `restrict,command=…`/`permitlisten=…`，以及 `sshd_config` 末尾 `# sck-origin begin…end` 的 `Match User` 块（`PermitOpen none`、`ForceCommand`）。
+
+源站的安装由老板在源站上用自己的 deploy 密钥执行（幂等）：
+
+```sh
+scp scripts/origin-agent/{sck-origin-agent.py,install-remote.sh} <owner>@<host>:/tmp/
+ssh <owner>@<host> 'sudo sh /tmp/install-remote.sh "$(cat tunnel.pub)" "$(cat ops.pub)" < /tmp/sck-origin-agent.py'
+```
+
+项目环境配置中加入 `origin: {host, user:"sckops", keyFile, knownHosts}`（本机绝对路径）即开放 `ops_origin_*` 工具。`ops_info` 的 `can.originHost` 反映是否已配置。服务白名单在 agent 与 `src/ops/origin.ts` 两处保持一致。写操作（重启、改配置、升级 SurrealDB）不在此通道内。
+
+待确认：原文记录的本机 `org.surrealck.status-tunnel` 任务当时已停用。0.7.0 是否仍需要它，由老板确认。
+
+## 磁盘与产物回收
+
+`evidence/<任务ID>/` 与 `deliverables/<任务ID>/` 是工作存储，终态任务的这两个目录会被定期回收。老板可手工运行：
+
+```sh
+pnpm run admin reclaim-artifacts                      # 只读试算
+pnpm run admin reclaim-artifacts 20480                # 压力模式试算：目标空闲 20480 MB
+pnpm run admin reclaim-artifacts --execute            # 真的回收
+pnpm run admin reclaim-artifacts <任务ID> --execute   # 只回收指定任务
+```
+
+参数里的裸数字是目标空闲 MB，不是任务 ID。目标目录只接受 `<根>/<任务ID>` 这一层普通目录，符号链接不跟随。台账写在 `<服务目录>/logs/artifact-reclaim.jsonl`，每次运行一行汇总，被删目录各一行。回收的保留期、开关语义与资源闸门见下文「资源、产物与数据库」。
+
+## 停用与卸载
+
+| 动作 | 命令 | 说明 |
+|---|---|---|
+| 停用节点更新器 | `sh scripts/node-updater.sh uninstall` | 移除定时任务，保留 `plugin-releases`、`updater` 与日志。之后节点不会自动升级。 |
+| 停用插件 | `paseo plugin remove sck-company` | 移除插件注册，插件进程随之停止。节点上不再有派工与员工通道。 |
+| 停用本机库（0.7.0 及更早安装过） | `launchctl bootout gui/$(id -u)/org.surrealck.company-db`、`launchctl bootout gui/$(id -u)/org.surrealck.company-backup`、`launchctl bootout gui/$(id -u)/org.surrealck.company-verify`，再删除 `~/Library/LaunchAgents/` 下的 `org.surrealck.company-db.plist`、`org.surrealck.company-backup.plist`、`org.surrealck.company-verify.plist` | 0.7.1 起仓库没有安装或卸载脚本，只能手工停用。不停用的话，`company-db` 仍在本机运行却无人使用，备份与恢复演练会因入口脚本已删除而失败。`private/db` 数据目录与 R2 备份保留，是否归档由老板决定。 |
+| 停用旧公司 MCP 服务（0.6.x 节点若曾安装） | `launchctl bootout gui/$(id -u)/org.surrealck.company-mcp`，再删除 `~/Library/LaunchAgents/org.surrealck.company-mcp.plist` | 0.7.0 不会自动停用它。它若仍在运行，会继续从旧的 `active` 目录提供旧代码。 |
+| 清理旧版遗留（0.6.x 节点） | 确认旧 MCP 已停用后：`rm "<服务目录>/active"`（只删链接），再 `rm -r "<服务目录>/releases"` | 节点更新器不删除它们，0.7.0 的 `sck` 与插件也不读取它们。`releases/` 只是旧 MCP 的源码快照，`private/` 中的凭证与配置不受影响。 |
+| 停用员工沙箱 | 手工还原 `~/.paseo/config.json` 中 provider 命令（备份文件 `config.json.bak-sandbox-*`） | 之后公司会话不再进入沙箱。 |
+
+停用与卸载都不删除数据库、凭证、日志或插件发行目录。
+
+## 业务规则与运行约定
+
+本节是仍然有效的业务规则与运行约定，与节点部署方式无关。节点切换到 0.7.0 不改变这些规则。
+
+### 任务与目标
+
+#### SYS05 时间与外部事件等待
 
 任务等待语义已收敛为两件事：链上前驱未完成时子任务保持 `planned`（accept 同事务激活）；需要老板决定时任务 `blocked` 且 `blocked_to='owner'`（进老板收件箱）。结构化等待、处置账本与 CI 处置工具已随目标层一起删除。
 
-## SYS07 目标终验图、客户成果与经营指标
+#### SYS07 目标终验图、客户成果与经营指标
 
 目标不再由「最后一个任务被接受」隐式关闭；`accept` 之后的完成判定改为显式重算，写不进证据的目标停在 `needs_repair`。
 
+#### 产线与岗位契约
 
-## 员工客户端
+不同产线流程不同（软件交付、视频、长篇故事），所以目标模板按产线选，不再全公司一套。
 
-> **v3 更新（sidecar/comm 通道）**：员工实例由 Paseo 插件 `sck-company` 注册代管，agent 进程零凭证——spawn env 只注入 `SCK_COMM_DIR` 和 `SCK_COMM_KEY`，实例凭证与租约证明留在插件进程内。claim/heartbeat/submit/review/blocker 由 sidecar 程序化代执行，租约证明自动注入，员工参数只写业务字段，`claim_next` 在员工侧不可用。comm 文件协议：`claim.json` 下发任务上下文，`report.md` 落盘即提交，`blocker.md` 上报阻塞（回合结束时由 sidecar 回收为 submit/report_blocker），`req/`+`res/` 原子转发 `sck call`。`get_secret`/`put_secret` 等凭证工具已下线，需要账号、workspace、生产登录走 `ops_*` 运维工具（先 `ops_info` 查能力清单）。legacy `credential_file` 实例不再被代领新任务，自然淘汰。架构、调用路径、安全边界与排障详见 [sidecar 通道](./sidecar-channel.md)；本节下述的凭证文件方式（`SCK_EMPLOYEE_CREDENTIAL_FILE` 与 `private/credentials/*.token`）仅为旧部署与 legacy 实例保留。
+- **路由**：任务唯一的编排单位。`route` 表把任务类型（`software` / `story` / `film` …）映射到执行岗、复核岗与消息模板，可选 `next` 后继类型在创建时展开为 `planned` 链（accept 同事务激活）。新任务经 `sck owner task.create '{"type":"<类型>","title":"…"}'` 创建，`task.plan` 先预演链；路由由 `route.list`/`route.save`/`route.disable` 管理（`route.save` 拒绝执行岗=复核岗与成环后继）。
+- **岗位契约**：项目岗位轨词表里每条轨可写 `roles: [...]`，限定能承接它的岗位。建单（`create_task` / `create_delivery`）时校验：派给轨不允许的岗位会被拒绝；任何出现在某条轨 `roles` 里的岗位都是产线岗，建单必须挂轨。没有出现在任何 `roles` 里的岗位（gm、product、qa 等）仍可建不挂轨的协调任务。契约写在项目记录里，改项目配置即生效，不需要改代码。
+- `screenwriter` 仍保留原有的"必须挂 编剧 轨"硬规则。
 
-实际员工身份由公司库的 `employee` 凭证记录确定。七个固定身份为 `gm-01`(gm)、`product-01`(product)、`eng-01`/`eng-02`(engineering)、`ai-01`(ai-content)、`qa-01`(qa)、`cs-01`(cs)（concept-design、asset-production 等内容产线岗位由调度器按 employee_def 动态生成实例，不走固定身份）。令 `SCK_MCP_URL=http://127.0.0.1:<port>/mcp` 和 `SCK_EMPLOYEE_CREDENTIAL_FILE=<对应私人路径>`，执行 `rtk proxy pnpm run mcp:client -- list`、`rtk proxy pnpm run mcp:client -- call get_context '{}'`。客户端初始化和调用使用官方 MCP SDK；身份仅由 Bearer 凭证决定，不能在工具参数中伪装。`claim_next` 可传 `{"taskId":"..."}`；返回的 `deliveryId`、`fence`、`task.version` 构成后续 heartbeat/checkpoint/submit 的 proof。提交的 `idempotencyKey` 在网络丢响应重试时保持相同。
+#### 老板改派命令
 
-首次真实员工接入任务由老板管理工具创建，执行岗位 cs、验收岗位 qa。cs-01 必须在**自己的真实会话**用自己的凭证领取、heartbeat、checkpoint、submit；qa-01 在自己的会话领取 review 并 accept/return。工程的合成轮换凭证测试仅证明实现，不替代该交接。回执说明应含实际岗位、允许动作、四个操作的脱敏命令摘要和遇到的问题，不能包含凭证。任务 ID 与各自凭证**路径**交 #28；不要在 Issue 写值。
+任务被派错岗位时（例如岗位或产线调整后，存量任务还挂着旧岗位），不要直接改库：
 
-## QA 对接
+```sh
+pnpm run company reassign <任务ID> [--executor <岗位>] [--reviewer <岗位|owner>] "<原因>"
+```
 
-按 [#26 B01—B12](./qa/mcp-company-acceptance.md) 独立执行，尤其 B09 重启持久化、B11 非目标库与日志、B12 两位真实员工。#29 的 SDK/Bun 探针属于前期资料，#25 的合成三 token 联调也不等于 B12。QA 应记录本集成提交、`pnpm-lock.yaml` 哈希、URL、目标库、进程状态和脱敏日志路径。当前核心与 adapter 的准确 DTO、错误码、工具参数参见 `src/contracts.ts`、`src/mcp/server.ts` 和 [adapter 文档](./mcp-adapter.md)；本说明不修改已冻结的业务权限与租约语义。
+只改还没开工的任务：状态必须是 blocked 或 ready，没有有效租约，也从未提交过。改派前会按创建时同样的规则校验：项目岗位契约（轨限定的承接岗位）和必配轨岗位（screenwriter、story-author、cinematography），并写一条 `reassign` 审计，任务版本加一。同一请求重放是幂等的。已开工、已提交或已完成的任务会被拒绝。
 
+#### 老板作废、解锁与取消目标
 
-## WT01 登记、分配与上线验证
+```sh
+pnpm run company revoke <任务ID> ["<原因>"]      # 终止在途执行：撤当前持有人租约回 ready，任务保留等下一位
+pnpm run company void <任务ID> "<原因>"          # 作废：只等它的下游自动解锁；终验关口作废不会关闭目标
+pnpm run company unlock <任务ID>                 # 补跑依赖解锁：依赖都完成了任务却还是 blocked 时用
+sck owner task.void '{"taskId":"<任务>","reason":"<原因>"}'   # 作废任务并级联作废其 planned 后继
+```
+
+`revoke` 与 `void` 的区别：revoke 只撤在途租约（员工换人或路线变更时用，任务本身继续），void 是把任务整个作废。两者在插件「目标进展」页（任务详情与目标卡按钮）和网页审核台（/o/<token>/，目标页与待办关口按钮）也能直接操作，不用开终端。
+
+都带审计和幂等键，规则与老板入口的 `task.void`/`task.revoke` 一致：已完成的任务不能作废，还有活下游的老板关口不能作废。**不要再直接改库改任务状态**。绕过解锁逻辑会让下游一直卡在 blocked（2026-10-11 的小说目标就这样卡过一次）。
+
+#### 往返熔断
+
+同一个任务在员工与老板之间反复"阻塞 → 老板处理 → 再阻塞"（`block` 审计），达到 `block_loop_limit`（默认 5）次，调度器不再重复提醒，而是把任务转成老板的待办问题：写明往返次数和最近三次阻塞原因，老板回复后任务按回复继续，并重新计数。`pnpm run admin config block_loop_limit <n>` 调整，`0` 关闭。起因：一个生产实测任务曾在 18 小时内往返 19 次、换了 18 个员工，每轮都在重复同样的失败。
+
+#### 代码仓改绑后的实现人恢复
+
+老板通过 `bind_task_code_repo` 明确改绑代码仓后，旧实现人会话仍可能绑定在原仓，仓库隔离与实现人连续性会共同挡住派工。调度器把这一明确错配纳入既有自动接替：仅在执行阶段，从任务当前仓库选择符合岗位、轨道、额度、独立性及策略约束的空闲工程员工，走版本校验与 `system:dispatcher` 接替审计，保留历史贡献及验收回避；下一轮正常领取。没有合法候选时等待并明确展示原因，不放宽跨仓隔离、不清实现人或作者记录。任务有效仓库（显式代码仓 > 任务项目仓 > 目标项目仓 > ops 仓）与实现人会话仓库不一致时也触发恢复；接替继续执行独立性门禁；同仓原实现人继续接续。
+
+### 员工与通道
+
+#### 员工客户端
+
+员工通过 `sck` 命令与插件通道通信，不直接调用 MCP。在员工会话内执行：
+
+```sh
+'<sck>' list
+'<sck>' call get_context '{}'
+'<sck>' call get_task_history '{"taskId":"<任务ID>"}'
+```
+
+`<sck>` 指 `bin/sck`（完整路径见「员工命令」一节）。工具调用统一写作 `'<sck>' call <工具名> '<JSON参数>'`。
+
+- 身份仅由插件通道决定，不能在参数里伪装；`claim_next` 在员工侧不可用，领取由 sidecar 代执行，见 [sidecar 通道](./sidecar-channel.md)。
+- 领取返回的 `deliveryId`、`fence`、`task.version` 构成后续 heartbeat、checkpoint、submit 的 proof，由 sidecar 自动注入，员工参数只写业务字段。待确认：`idempotencyKey` 在网络丢响应重试时是否仍需由调用方保持相同，sidecar 是否自动生成，需核对 `plugin/server/sidecar.ts`。
+- `get_secret` / `put_secret` 已下线。需要账号、workspace、生产登录，走 `ops_*` 运维工具（先 `ops_info` 查能力清单）。
+
+实际员工身份由公司库的 `employee` 凭证记录确定。七个固定身份为 `gm-01`(gm)、`product-01`(product)、`eng-01`/`eng-02`(engineering)、`ai-01`(ai-content)、`qa-01`(qa)、`cs-01`(cs)（concept-design、asset-production 等内容产线岗位由调度器按 employee_def 动态生成实例，不走固定身份）。
+
+0.7.0 起没有员工凭证文件：旧的 `SCK_EMPLOYEE_CREDENTIAL_FILE` 与 `private/credentials/*.token` 已删除，legacy 实例也不再代领新任务。
+
+#### QA 对接
+
+0.6.x 的 MCP 验收清单 `docs/qa/mcp-company-acceptance.md` 已在 0.7.0 删除。待确认：替代的 QA 验收清单尚未建立，由 QA 与老板确定。发布后的真实员工 `sck` 最终验收由 QA 任务执行，验收记录应包含本集成提交、`pnpm-lock.yaml` 哈希、目标库、进程状态与脱敏日志路径。当前工具参数与 DTO 以代码为准，待确认：`src/contracts.ts` 与 `plugin/server/sidecar.ts` 的对应范围。
+
+#### WT01 登记、分配与上线验证
 
 物理工作目录以任务服务的 `worktree` 登记为准，任务分支与物理树分开：每仓一个 shared（QA/老板/产品/CS/内容默认只读），串行工程在无活动引用且干净时复用它、每项独立 `task/<id8>` 分支/PR（基线优先仓库已取回的 origin/defaultBranch，未配置 remote 时用默认主线）；已有引用或 dirty 时新代码写手用 exclusive，原现场不切分支。内容写任务由管理方在 `create_task.workIntent` 显式授予 `{kind:"assets",paths:["assets/characters"]}`；重叠目录排队（大小写保守视为相同），互不重叠可共用，路径穿越/凭证目录/符号链接目录拒绝。GM 无租约唤醒用 `workspace.json` 的 shared 只读登记与会话引用。附件保持 `evidenceDir`。
 
-仓库身份由 realpath + git common-dir 确定，未绑定 project 使用 `SCK_AGENT_CWD` 的规范仓库身份。MCP 与插件共同使用 Git common-dir 下的 `sck-worktree-allocation.lock`，由系统 `/usr/bin/python3` 的 kernel flock 持有（进程退出释放）；机器已有 Python，不安装全局工具。领取事务同时更新 task assignment、worktree_ref、employee active_task 和租约，失败不会落有效引用；网络丢响应重复 claim 保留 fence/路径。Git 树先登记，异常中断后未知树受保护，已存在的 task 分支现场就地接管，不 reset。引用有效性实时由任务 current_employee/delivery/fence/状态对账；撤销交接与被阻塞的写现场继续保护。main、常驻插件、active/回滚 release 均登记 protected。
+仓库身份由 realpath + git common-dir 确定，未绑定 project 使用 `SCK_AGENT_CWD` 的规范仓库身份。插件与 sidecar 共同使用 Git common-dir 下的 `sck-worktree-allocation.lock`，由系统 `/usr/bin/python3` 的 kernel flock 持有（进程退出释放）；机器已有 Python，不安装全局工具。领取事务同时更新 task assignment、worktree_ref、employee active_task 和租约，失败不会落有效引用；网络丢响应重复 claim 保留 fence/路径。Git 树先登记，异常中断后未知树受保护，已存在的 task 分支现场就地接管，不 reset。引用有效性实时由任务 current_employee/delivery/fence/状态对账；撤销交接与被阻塞的写现场继续保护。main、常驻插件目录、`current` 与回滚用的插件发行目录均登记 protected。
 
-WT02 在 WT01 登记之上启用按归属回收：持久引用是唯一删除依据；租约过期/交接只释放员工 fence，非终态保留 recovery；done 后 exclusive 干净树可事件触发删除，shared 与保护树保留；脏树与未合并分支不强制删除。孤儿宽限默认 7 天（`SCK_WORKTREE_ORPHAN_GRACE_DAYS` / `company_meta:config.worktree_orphan_grace_days`），时钟用 last_released_at → last_used_at → created_at。调度器沿用既有 10 分钟 sweep，不新建定时器。紧急关闭：`SCK_WORKTREE_RECLAIM=0`。审计表 schema 012 `worktree_audit` 可查。细节与演练见 [WT02 生命周期手册](./qa/worktree-lifecycle.md)。
+WT02 在 WT01 登记之上启用按归属回收：持久引用是唯一删除依据；租约过期/交接只释放员工 fence，非终态保留 recovery；done 后 exclusive 干净树可事件触发删除，shared 与保护树保留；脏树与未合并分支不强制删除。孤儿宽限默认 7 天（`SCK_WORKTREE_ORPHAN_GRACE_DAYS` / `company_meta:config.worktree_orphan_grace_days`），时钟用 last_released_at → last_used_at → created_at。调度器沿用既有 10 分钟 sweep，不新建定时器。紧急关闭：`SCK_WORKTREE_RECLAIM=0`（设在插件服务环境中）。审计表 schema 012 `worktree_audit` 可查。细节与演练见 [WT02 生命周期手册](./qa/worktree-lifecycle.md)。
 
-查询入口：员工 `sck call list_worktrees '{"taskId":"当前任务ID"}'`，权限沿用 get_task；老板可不传 taskId 查询全局。非老板不带 taskId 一律 `forbidden`，通道不回退到当前租约任务。released 引用默认只计数，加 `"includeReleased":true` 才列出。返回规范路径、稳定 ID、project/repo、mode、实际/登记 branch 状态、创建/最后使用时间、各引用持有人/任务/时间、`deletable` 与 reasons；不含凭证。不带 `pageSize`、`cursor` 时返回完整数组，超出 48 KiB 预算则报 `response_too_large`，不截尾；带分页参数时返回 `{worktrees, page}`，按 `page.nextCursor` 逐页读完再统计（见 [query-paging.md](./query-paging.md) 第 3、4 节）。GM 另可 `reclaim_worktrees`（支持 dryRun）与 `list_worktree_audits`。branch 漂移或丢失只报告，不自动修复。
+查询入口：员工 `'<sck>' call list_worktrees '{"taskId":"当前任务ID"}'`，权限沿用 get_task；老板可不传 taskId 查询全局。非老板不带 taskId 一律 `forbidden`，通道不回退到当前租约任务。released 引用默认只计数，加 `"includeReleased":true` 才列出。返回规范路径、稳定 ID、project/repo、mode、实际/登记 branch 状态、创建/最后使用时间、各引用持有人/任务/时间、`deletable` 与 reasons；不含凭证。不带 `pageSize`、`cursor` 时返回完整数组，超出 48 KiB 预算则报 `response_too_large`，不截尾；带分页参数时返回 `{worktrees, page}`，按 `page.nextCursor` 逐页读完再统计（见 [query-paging.md](./query-paging.md) 第 3、4 节）。GM 另可 `reclaim_worktrees`（支持 dryRun）与 `list_worktree_audits`。branch 漂移或丢失只报告，不自动修复。待确认：`list_worktrees`、`reclaim_worktrees`、`list_worktree_audits` 在 0.7.0 的 sidecar 工具列表中是否仍然暴露，`sidecar-channel.md` 的工具列表未列出它们。
 
 管理查询分页与预算（SYS01，v25）：运营需要知道以下行为。
 
-- `get_context`、`get_task_history`、`list_worktrees` 的每个响应不超过 48 KiB，即 49152 字节（UTF-8）。计量为 MCP 结果的 JSON 字节加 256 字节帧预留（`answerBytes`），答案的文本副本与 `structuredContent` 两份都计入。不带 `pageSize`、`cursor` 的旧调用返回完整结果，超出则报 `response_too_large`，不截尾。
+- `get_context`、`get_task_history`、`list_worktrees` 的每个响应不超过 48 KiB，即 49152 字节（UTF-8）。计量为结果的 JSON 字节加 256 字节帧预留（`answerBytes`），答案的文本副本与 `structuredContent` 两份都计入（双份计量待确认，见 query-paging.md）。不带 `pageSize`、`cursor` 的旧调用返回完整结果，超出则报 `response_too_large`，不截尾。
 - 需要统计或遍历全部条目时，带 `pageSize`（1 至 100，缺省 25）逐页读取，直到 `page.hasMore` 为 false，并累加每页的 `returned`。`page.total` 为快照内的总数，可用于核对。每页条数由预算决定，可能少于 `pageSize`。
-- 分页快照由数据库统一计数，MCP 与插件 sidecar 共用上限：每身份 4 个，全库 64 个，合计 64 MiB；单个快照最多 5000 行或 8 MiB，有效期 6 小时。上限在代码中固定，没有运营配置项。
+- 分页快照由数据库统一计数，插件 sidecar 共用上限：每身份 4 个，全库 64 个，合计 64 MiB；单个快照最多 5000 行或 8 MiB，有效期 6 小时。上限在代码中固定，没有运营配置项。
 - 全库快照已满时返回 `temporarily_unavailable`，可重试。同一身份的快照全部仍在写入时，请求最多等待 5 秒，且不超过本次构建的 10 秒截止。构建超过 10 秒截止，或排队超过 2 秒仍拿不到构建连接，都返回可恢复的 `temporarily_unavailable`；答复最迟在 13 秒内返回。已预留的配额在截止后 2 秒内释放，来不及释放的标记为待清扫，下一次清扫释放一次。50 KiB/s 等受限链路上，超过 10 秒可传输量的大工作集会以该错误返回，这是可恢复的拒绝而不是数据损坏，应按答复指引收窄 `state`、`tag`、`role`、`since` 或投影字段后重试。超过 5 分钟仍未完成的快照视为遗弃并删除。持续出现容量错误时，核对 `query_snapshot` 表的行数与 `query_snapshot_quota:global` 的 `listings`、`bytes` 计数是否一致。
 - 长文本用 `read_task_text` 按字节段读取，每段默认 16 KiB、最大 24 KiB。第二段起必须带首段返回的 `expectSha256`，若原文已变，返回 `conflict`，须从 `offset: 0` 重读。
 - 写入先于回显提交。回显先裁切超长列表（依赖、意图路径，标注 `listsTruncated`，完整列表用 `read_task_text` 读取），再裁切正文（标注 `contextTruncated`）；其余顶层文本字段超过 2 KiB 时同样裁切并标注。只有整条应答仍超过 49 152 字节时，调用方才会收到 `response_too_large`。此时写入已经提交，用 `get_context`（带 `taskId`）核对状态，不得重复提交。
 - 全局库存只有老板可读，即不带 `taskId` 的 `list_worktrees`。非老板角色必须带 `taskId`，缺省或 null 一律返回 `forbidden`。
 - `reclaim_worktrees` 参数严格（经理裁定 v44）：`dryRun` 只接受 true、false 或省略（省略即回收）；整包 null、`dryRun` 为 null 或字符串、`repos` 不是路径列表，一律返回 `invalid`，不触碰任何工作树。
 
-QA 步骤对应如下。统计工作树数量时，先以老板身份执行 `list_worktrees` 分页读取，或对具体任务带 `taskId` 读取。遇到 `response_too_large` 时改用 `'{"pageSize":25}'` 并按 `page.nextCursor` 逐页读完。`get_admin_summary` 为老板专用的只读汇总，口径与完整性标志见 [query-paging.md](./query-paging.md) 第 5 节。发布后的真实员工 sck 最终验收由 QA 任务 `6b6cb5b9` 执行。
+QA 步骤对应如下。统计工作树数量时，先以老板身份执行 `list_worktrees` 分页读取，或对具体任务带 `taskId` 读取。遇到 `response_too_large` 时改用 `'{"pageSize":25}'` 并按 `page.nextCursor` 逐页读完。`get_admin_summary` 为老板专用的只读汇总，口径与完整性标志见 [query-paging.md](./query-paging.md) 第 5 节。
 
-本链实现提交只创建 PR，不发布。上线申请批准后的部署腿执行以下验证，具体演练见 [WT01 分配手册](./qa/worktree-allocation.md) 与 [WT02 生命周期手册](./qa/worktree-lifecycle.md)：
-
-1. 记录 MCP active release 提交、插件 SOURCE/DIRECTORY 对应的固定 release 基线、vendor 的 core/schema 哈希及进程 running；在已批准提交建立固定 release，运行依赖安装和本地 fork 回归。MCP bootstrap 新增 schema 011/012（只新增结构，无数据删除/改写）；插件必须在 bootstrap 成功后同步相同 src/schema。
-2. 按上文双面流程把生产基线、v3 在途提交与已批准主线集成为固定 release，重生成 vendor/schema，安装 launchd，再用 `paseo plugin install <release>/plugin` 重注册并 reload **现有** `sck-company`；v3 checkout 保留为 protected 历史树，不另起 dispatcher。
-3. 验证 MCP `/ready`、插件 running、真实员工 `get_context` 与真实派发恢复；记录两面实际提交/时间。老板安排真实串行 QA/工程及并行代码写手演练，QA 用普通通道读登记，不取得凭证、不自行建员工。证据含任务 ID、实际路径/branch、audit ID/时间、登记/有效引用 before/after，区分本地与生产。
-4. 回收需要关闭时两面设置 `SCK_WORKTREE_RECLAIM=0`（`SCK_WORKTREE_STRATEGY` 已移除：代码任务始终独占任务树或所属线的树）。restart MCP + reload 现有插件。保留 schema 011/012、登记、审计与在办现场。两面代码回滚也须保留 WT01/WT02 登记兼容版本。
+0.6.x 上线验证记录（历史，0.7.0 不再执行）：当时的步骤是记录 MCP active release 提交、节点 `sck-company` 的 path 与版本、vendor 哈希与进程状态；按已合入 main 的提交生成固定 release 并安装 MCP（launchd）；验证 `/ready`、插件 running、真实员工 `get_context` 与真实派发恢复。插件由节点更新器切换为该 main 提交的发行版本，不手工 `plugin install` 或 `reload` 现有 `sck-company`。0.7.0 没有 MCP 与 `active`，这些步骤已不适用。
 
 新业务环境变量：可选 `SCK_WORKTREE_RECLAIM`、`SCK_WORKTREE_ORPHAN_GRACE_DAYS`；系统 Python 和现有 Git 是本机准备项。
 
-## 老板提醒：老化升级与每日简报
+#### 目标员工休眠与只读会话审阅（v0.3.56）
+
+目标员工的身份、Paseo agent ID 与 provider session ID 独立于运行进程和每项任务租约。Paseo 空闲回收造成 closed 时，无在途租约且编制仍启用的目标员工进入 sleeping，保留原身份、通道及上下文，不主动 reload。下一次合法派工先取得新租约再通过同一 agent send 按需恢复。持有在途租约的 closed 员工仍走原有恢复与故障宽限；明确归档、真实错误、通道隔离仍保留退役规则。历史已退役身份不自动复活。休眠员工仍占编制实例名额，但不计入运行并发。Factory 优先于 Claude 上下文复用：合法 Factory 有空位时先创建或复用 Factory，席位满按三个等待项及溢出分流规则处理。
+
+Paseo 公司插件「公司 → 只读审阅」允许粘贴员工 agent ID；会话命令中心和面板也有「只读审阅历史」。通过本地 Claude/Factory 持久 transcript 分页显示文本和工具记录摘要，不恢复模型运行时、员工凭证或租约，不提供输入发送和工具执行。关闭未归档、已归档、已退役、无租约历史均可审阅；隐藏思考、配置、工具输入和原始工具输出不展示，常见凭证脱敏。普通长文本按正文续页保持可达。单条过大记录省略，文件缺失明确报错，不触发模型补取。老板 RPC 验证公司员工登记，QA 会话不开放此老板入口。归档的 Paseo 原生 history 打开跳过路由配置检查，仍保留环境清洗；非 history 交互保持路由与沙箱校验。普通原生聊天与只读审阅是不同入口，后者不激活前者。
+
+#### 公司插件导航约定（v0.3.58）
+
+公司插件在 Paseo 侧栏只注册「公司」一个入口。用量、历史审阅及后续公司功能放在公司工作台内部，不再新增侧栏菜单。手机端内部导航单行横向滑动，各页面独立滚动。保留原有命令与会话内用量、只读审阅面板；旧 surface ID 进入相同工作台。
+
+Paseo 0.14.0 原生已归档会话走 history 恢复，但已关闭、未归档的持久会话走 interactive 恢复（安装包 agent-manager.js 的 resumeAgentFromPersistenceInternal）。因此「只读审阅」保留为公司内部补充功能：直接读持久记录，不恢复进程或执行权限。普通会话历史仍可直接使用 Paseo；若以后原生对所有关闭状态提供无需恢复运行的只读查看，再移除此补充界面。
+
+### 提交与交付检查
+
+#### 提交前检查（PR 门）
+
+工程的实现任务（kind=task）提交时，系统会读 submit 证据里链接的 GitHub PR（`gh pr view`），只检查**头分支就是本任务登记分支**的那个 PR：与主干冲突、已关闭未合并、或有失败的 CI 检查，提交会被直接拒收（`invalid`，任务仍是 doing），员工修好后重新提交，不再占用一次验收。CI 还在跑不算失败；GitHub 因账户付款失败或触及支出上限而未启动作业的检查也不算失败。判定前会读该检查的注解（含 account payments / spending limit / Billing & plans 文案）与其作业，只有**一步都没执行**的作业才算基础设施拒绝，跑过步骤的失败、没有 job 链接的检查、读不到注解或作业一律照旧视为失败。证据里没有 PR 链接、链接的是别的分支、或 `gh` 查询出任何问题时一律放行，由验收人照常检查。上线申请、合入部署和其他岗位不受影响。`SCK_PR_GATE=0` 关闭（设在插件服务环境中）。
+
+简报里的"退回"只统计真正的验收退回；系统因工作区路径变化换会话产生的"通道回滚"单列。
+
+### 老板提醒与简报
+
+#### 老板提醒：老化升级与每日简报
 
 调度器每个周期都会检查等老板的东西（待批关口、待回答的问题），不再只在出现时提醒一次：
 
@@ -213,40 +359,14 @@ QA 步骤对应如下。统计工作树数量时，先以老板身份执行 `lis
 
 集成测试用受控本地 fork 运行：`pnpm test`（全部）或 `bun scripts/test-worktrees.ts [tests/xxx.test.ts …]`（指定文件）。直接 `bun test` 读 `surreal_ck/.env` 会连到生产 SurrealDB 服务器，所以 `loadDatabaseConfig()` 在测试环境（`NODE_ENV=test`）下遇到非本机地址会直接报错拒绝。
 
-## 产线与岗位契约
+#### 每日简报里的产能与员工流动
 
-不同产线流程不同（软件交付、视频、长篇故事），所以目标模板按产线选，不再全公司一套。
-
-- **路由**：任务唯一的编排单位。`route` 表把任务类型（`software` / `story` / `film` …）映射到执行岗、复核岗与消息模板，可选 `next` 后继类型在创建时展开为 `planned` 链（accept 同事务激活）。新任务经 `sck owner task.create '{"type":"<类型>","title":"…"}'` 创建，`task.plan` 先预演链；路由由 `route.list`/`route.save`/`route.disable` 管理（`route.save` 拒绝执行岗=复核岗与成环后继）。
-- **岗位契约**：项目岗位轨词表里每条轨可写 `roles: [...]`，限定能承接它的岗位。建单（`create_task` / `create_delivery`）时校验：派给轨不允许的岗位会被拒绝；任何出现在某条轨 `roles` 里的岗位都是产线岗，建单必须挂轨。没有出现在任何 `roles` 里的岗位（gm、product、qa 等）仍可建不挂轨的协调任务。契约写在项目记录里，改项目配置即生效，不需要改代码。
-- `screenwriter` 仍保留原有的"必须挂 编剧 轨"硬规则。
-
-## 老板改派命令
-
-任务被派错岗位时（例如岗位或产线调整后，存量任务还挂着旧岗位），不要直接改库：
-
-```sh
-pnpm run company reassign <任务ID> [--executor <岗位>] [--reviewer <岗位|owner>] "<原因>"
-```
-
-只改还没开工的任务：状态必须是 blocked 或 ready，没有有效租约，也从未提交过。改派前会按创建时同样的规则校验——项目岗位契约（轨限定的承接岗位）和必配轨岗位（screenwriter、story-author、cinematography）——并写一条 `reassign` 审计，任务版本加一。同一请求重放是幂等的。已开工、已提交或已完成的任务会被拒绝。
-
-## 每日简报里的产能与员工流动
-
-- **产能**：按岗位列出"当前可用编制/总编制"——供应商额度低于下限或处在冷却期的编制算不可用，并写明原因（例如 codex 额度不足、grok 402 欠费）。有岗位一个可用编制都没有时会明说。派工本来就会跳过这些编制，权重在可用的编制之间重新分配；这一段是给老板看的：该充值、换模型还是加编制。
+- **产能**：按岗位列出"当前可用编制/总编制"。供应商额度低于下限或处在冷却期的编制算不可用，并写明原因（例如 codex 额度不足、grok 402 欠费）。有岗位一个可用编制都没有时会明说。派工本来就会跳过这些编制，权重在可用的编制之间重新分配；这一段是给老板看的：该充值、换模型还是加编制。
 - **员工流动**：近 24 小时新建与退役的员工实例数，以及其中"认领失败"的数量。正常情况下认领失败应接近 0；持续偏高说明调度在反复新建又丢弃实例（2026-10-10 曾因共享 worktree 争用每天上百次，worktree 按线分配后已降到 0）。
 
-## 提交前检查（PR 门）
+### 资源、产物与数据库
 
-工程的实现任务（kind=task）提交时，系统会读 submit 证据里链接的 GitHub PR（`gh pr view`），只检查**头分支就是本任务登记分支**的那个 PR：与主干冲突、已关闭未合并、或有失败的 CI 检查，提交会被直接拒收（`invalid`，任务仍是 doing），员工修好后重新提交，不再占用一次验收。CI 还在跑不算失败；GitHub 因账户付款失败或触及支出上限而未启动作业的检查也不算失败——判定前会读该检查的注解（含 account payments / spending limit / Billing & plans 文案）与其作业，只有**一步都没执行**的作业才算基础设施拒绝，跑过步骤的失败、没有 job 链接的检查、读不到注解或作业一律照旧视为失败。证据里没有 PR 链接、链接的是别的分支、或 `gh` 查询出任何问题时一律放行，由验收人照常检查。上线申请、合入部署和其他岗位不受影响。`SCK_PR_GATE=0` 关闭（MCP 与插件两面都要设）。
-
-简报里的"退回"只统计真正的验收退回；系统因工作区路径变化换会话产生的"通道回滚"单列。
-
-## 往返熔断
-
-同一个任务在员工与老板之间反复"阻塞 → 老板处理 → 再阻塞"（`block` 审计），达到 `block_loop_limit`（默认 5）次，调度器不再重复提醒，而是把任务转成老板的待办问题：写明往返次数和最近三次阻塞原因，老板回复后任务按回复继续，并重新计数。`pnpm run admin config block_loop_limit <n>` 调整，`0` 关闭。起因：一个生产实测任务曾在 18 小时内往返 19 次、换了 18 个员工，每轮都在重复同样的失败。
-
-## 终态产物回收与资源闸门自救
+#### 终态产物回收与资源闸门自救
 
 `evidence/<任务ID>/` 与 `deliverables/<任务ID>/` 是工作存储，不是长期档案。终态（done/void）任务的这两个目录按任务生命周期回收：宽限期 evidence 3 天、deliverables 7 天、作废任务 1 天，时钟取该任务最后一条审计，永远不取文件 mtime；只删大文件（媒体、压缩包、依赖/VCS 目录），保留小型文本与 `.reclaimed.json` 墓碑。派工闸门（`min_free_disk_mb`，默认 10240 MB）每轮先做一次压力回收，目标水位是 `min_free_disk_mb + artifact_headroom_mb`（默认共 20 GB）；水位达标后自动恢复派工。
 
@@ -254,19 +374,10 @@ pnpm run company reassign <任务ID> [--executor <岗位>] [--reviewer <岗位|o
 
 | 开关 | 位置 | 作用 |
 |---|---|---|
-| `artifact_reclaim_enabled` | `company_meta:config` | 关闭**例行**回收（30 分钟惰性 sweep、普通 sweep 触发）。资源闸门触发的**紧急回收不受它影响**——否则磁盘一低就会把公司锁死。 |
-| `SCK_ARTIFACT_RECLAIM=0` | 服务环境（两面都要设） | 硬停，连紧急回收一起停。此时闸门阻塞期间会发 `resources-reclaim-blocked` 通告（强制提醒），写明是哪一级开关停的。 |
+| `artifact_reclaim_enabled` | `company_meta:config` | 关闭**例行**回收（30 分钟惰性 sweep、普通 sweep 触发）。资源闸门触发的**紧急回收不受它影响**，否则磁盘一低就会把公司锁死。 |
+| `SCK_ARTIFACT_RECLAIM=0` | 插件服务环境 | 硬停，连紧急回收一起停。此时闸门阻塞期间会发 `resources-reclaim-blocked` 通告（强制提醒），写明是哪一级开关停的。 |
 
-**运维命令**
-
-```sh
-pnpm run admin reclaim-artifacts                      # 只读试算（dry-run，受配置开关约束以外的自动路径不适用）
-pnpm run admin reclaim-artifacts 20480                # 压力模式试算：目标空闲 20480 MB
-pnpm run admin reclaim-artifacts --execute            # 真的回收（人工运行不受配置开关限制）
-pnpm run admin reclaim-artifacts <任务ID> --execute   # 只回收指定任务
-```
-
-参数里的裸数字一律是目标空闲 MB，不是任务 ID（任务 ID 是 UUID）。回收台账在 `<服务目录>/logs/artifact-reclaim.jsonl`，每次运行一行汇总，被删目录各一行。目标目录只接受 `<根>/<任务ID>` 这一层普通目录：符号链接不跟随、不删除，越界与非法 ID 直接拒绝。
+人工运行的命令与台账见上文「磁盘与产物回收」。注意：参数里的裸数字一律是目标空闲 MB，不是任务 ID（任务 ID 是 UUID）。人工运行不受配置开关限制。
 
 2026-10-20 事故：`artifact_reclaim_enabled` 被人工置为 false（无审计记录），磁盘降到 8.8 GB 后闸门连续阻塞全部派工十余小时，两个 ready 任务无人接手。修复后紧急回收绕过配置开关，闸门不会再被软开关死锁；此后该开关只影响例行清理频率。
 
@@ -285,81 +396,27 @@ GC 只删目录本身，不碰 `evidence/`、`deliverables/` 与任何已跟踪�
 
 删除工作树前，GC 先清掉未跟踪的依赖/构建目录（`junkPathsFromPorcelain`），再执行**不带 `--force`** 的 `git worktree remove`；已跟踪文件的任何修改仍会让删除被拒并记 `git-remove-failed`。登记行指向的目录已消失、任务已终态（引用全部 released）且该分支没有未终态任务时，扫描直接摘除这一行（审计 `drop_stale_row`），只对 `exclusive` 生效，`shared`/`protected` 行留给人工判断。审计事件名是 `worktree_audit.event` 的 ASSERT 白名单：新增事件必须同时在 `schema/021-worktree-audit-events.surql` 放行，否则审计写入被拒、仓库级 catch 会中断整轮扫描（2026-10-21 事故）；`tests/audit-event-whitelist.test.ts` 在 `test:channel` 里校验两边一致。
 
-## 老板作废、解锁与取消目标
+#### 资源阻塞分类（v0.3.57）
 
-```sh
-pnpm run company revoke <任务ID> ["<原因>"]      # 终止在途执行：撤当前持有人租约回 ready，任务保留等下一位
-pnpm run company void <任务ID> "<原因>"          # 作废：只等它的下游自动解锁；终验关口作废不会关闭目标
-pnpm run company unlock <任务ID>                 # 补跑依赖解锁：依赖都完成了任务却还是 blocked 时用
-sck owner task.void '{"taskId":"<任务>","reason":"<原因>"}'   # 作废任务并级联作废其 planned 后继
-```
+派工任务结论区分 memory_pressure 和 disk_space，两者同时低时分别显示，不复用磁盘清理说明。内存判断仍优先 macOS 内核压力等级，正常压力时不以少量空闲页误拦截。磁盘产物回收只由磁盘回收水位触发，内存不足不触发无关清盘；回收禁用通知仅在磁盘确实阻断派工时出现。旧 resources 代码保留兼容，恢复提示改为检查内存和磁盘，实时结论会在下一 tick 更新。
 
-`revoke` 与 `void` 的区别：revoke 只撤在途租约（员工换人或路线变更时用，任务本身继续），void 是把任务整个作废。两者在插件「目标进展」页（任务详情与目标卡按钮）和网页审核台（/o/<token>/，目标页与待办关口按钮）也能直接操作，不用开终端。
+#### 内存压力 LRU 休眠（v0.3.60）
 
-都带审计和幂等键，规则与老板入口的 `task.void`/`task.revoke` 一致：已完成的任务不能作废，还有活下游的老板关口不能作废。**不要再直接改库改任务状态**——绕过解锁逻辑会让下游一直卡在 blocked（2026-10-11 的小说目标就这样卡过一次）。
+有待派工作且内存门禁阻断时，按连续空闲起点升序关闭一个闲置员工运行时，硬下限 3600 秒。未知起点从观测开始，不用进程年龄或上次领取时间代替。每轮最多关闭一个，再探测内存；仍有压力时等待下一轮，磁盘不足不触发此回收。
 
-## 媒体生成（ElevenLabs）
+持有任务、待办唤醒中、权限待处理、运行中、状态不明或快照变动均跳过。事务登记两分钟领取屏障，任务 claim 与待办唤醒均遵守；关闭确认后解除，结果不明时自然过期。不退役、不撤销凭证、不归档工作空间，绑定的实现人也可休眠，下次合法派工复用原身份和会话。
 
-ElevenLabs 的 key 只存在于 `sck-vault` 里。它是一个独立的小程序，key 保存在登录钥匙串中，钥匙串只信任这一份二进制。插件和员工进程都拿不到 key，员工只调用 `media_*` 工具，拿回的是文件路径和大小。`private/service.env` 里不再配置 `ELEVENLABS_API_KEY`。
+使用本机 Paseo 自带的 `/mcp/agents` 端点（Paseo 自身的接口，不是公司 MCP 服务）的 `kill_agent`。安装版 0.14.0 中它仅调用 `closeAgentCommand → closeAgent`，保留持久记录，与 delete、archive、close-items 不同。默认端点 `http://127.0.0.1:6767/mcp/agents`，可通过 `SCK_PASEO_RUNTIME_MCP_URL` 指定其他本机端口，仅接受回环 HTTP。Paseo 升级后应复核该关闭契约。
 
-**安装（老板在终端做，一次性）**
+### 模型路由（0.5.0）
 
-```sh
-sh <release>/vault/build.sh                        # 在固定 release 目录里构建（与插件同一提交），装到 <服务目录>/bin/sck-vault，并生成 plist
-<服务目录>/bin/sck-vault setup                     # 先用 Touch ID 确认，再隐藏输入 ElevenLabs key，只写入钥匙串
-cp <服务目录>/vault/org.surrealck.vault.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plist
-```
-
-首次录入后正常不会弹窗。签名决定信任粒度：
-
-- 登录钥匙串里存在 `SCK Vault Code Sign` 签名身份时，`build.sh` 自动用它签名，钥匙串信任锚在证书上，**重建二进制不再弹窗**。创建一次即可：生成自签名代码签名证书（代码签名 EKU）导入登录钥匙串。
-- 没有该身份时回退 ad-hoc 签名：信任绑定这份二进制的确切哈希，**每次重新执行 `build.sh` 后钥匙串弹窗一次**。确认弹窗来自 sck-vault 后选择「始终允许」，然后执行 `launchctl kickstart -k gui/$(id -u)/org.surrealck.vault` 重启。
-
-`build.sh` 与插件必须使用同一个服务目录：构建时用 `SCK_SERVICE_HOME` 指定，插件启动时使用同样的环境变量。
-
-`private/service.env` 中的 `ELEVENLABS_API_KEY=` 一行，在新插件生效并验证之后删除，然后轮换该 key（旧 key 以明文存在过，员工可能读到过）。
-
-**调用（无需授权）**
-
-```sh
-<服务目录>/bin/sck-vault status   # {"configured": true} 表示密钥就绪
-```
-
-操作种类：`tts`、`dialogue`、`sfx`、`music`、`voice_design`、`voice_create`、`voices`、`subscription`。密钥录入后员工即可调用，不需要老板批准——vault 的职责只有一条：密钥不出进程。员工侧的租约、角色与项目每日配额由插件代码判断。
-
-**安全边界**
-
-- 员工进程、插件和 TypeScript 代码都没有 key。vault 的回复里也不含 key：上游回显的 key 会被替换成 `[已遮盖]`。
-- vault 只访问 `api.elevenlabs.io` 的固定端点，不跟随重定向，调用方不能指定 URL 或请求头。
-- 钥匙串只信任这一份二进制。副本放在别的路径运行时，会拒绝读取密钥。
-- 加固运行时，且没有调试权限，同用户的其它进程拿不到 vault 的内存。
-- 同一台 Mac 上的任何本地进程都能调用固定端点操作。vault 分辨不出调用者身份，员工级的租约和角色检查仍在插件里；绕过插件直调 socket 无法拿到 key，但能发起上游调用，这是已接受的残余面。
-- 同一时间只能有一个 sck-vault 监听 socket。
-
-**配额与审计**
-
-- 每个项目每日的上限（tts 1500、dialogue 600、sfx 300、music 60、voice_design 30）仍由公司侧计数，可用 `SCK_MEDIA_DAILY_*` 调整。`media_info`、`media_voices` 不计次数。
-- 成功生成写 `ops_media_*` 审计。
-- vault 另有哈希链审计 `<服务目录>/vault/audit.log`，只记录事件、操作种类、次数和字节数，不含 key。
-
-## 远程部署（VPS MCP 服务）
-
-`sh scripts/deploy-mcp-remote.sh <main 提交 SHA>` 把指定提交部署到 VPS 的 `sckcompany` 服务，并校验 `/ready`。部署认证只用专用密钥 `~/.ssh/sck-deploy-ed25519`：密码短语保护、不进 ssh-agent、不存钥匙串，`SCK_DEPLOY_KEY` 可换路径。`IdentitiesOnly` 固定身份，全部连接复用一条控制通道，每次部署只需输一次密码短语。VPS 的 `authorized_keys` 只保留这把部署密钥；日常使用或已加载到 agent 的钥匙一律不得授权，否则任何同用户进程都能登录 VPS。
-
-发布门禁（SYS01 AC-B）：慢管道回归与 sidecar review 回归只在本机 macOS 上执行，不用托管 macOS 作业，也不新增付费资源。发布某个提交前，把该提交导出到以 40 位提交 SHA 命名的目录，分别运行 `SCK_SERVICE_HOME=<服务目录> sh scripts/release-gate.sh slow-pipe <该目录的绝对路径>` 和 `SCK_SERVICE_HOME=<服务目录> sh scripts/release-gate.sh sidecar-review <该目录的绝对路径>`。脚本按 `SCK_BUN`、`private/service.env` 中的 `SCK_BUN`、服务目录的 `runtime-bun`、`~/.bun/bin/bun` 的顺序选定 Bun，不查 PATH；慢管道运行包含红色对照，sidecar-review 运行真实 client-cli -> 临时 sidecar -> 公司 fork 的整组用例，并连同演练（deploy-drill）套件一起执行：Node 宿主端口探测与 Bun 解析、依赖安装来源、以及 `deployDrillRun`/`deployDrillStatus` 的角色与持有人守卫回归（`tests/deploy-drill{,-runner,-node-host}.test.ts` 与 `tests/deploy-drill-access.fork.test.ts`，后者由 `RUN_SCK_DRILL_ACCESS_TESTS=1` 打开）。这几项托管 CI 都跑不了——Node 探针需要真实 Node 二进制，权限与演练需要公司 fork 与真实 macOS 进程树——所以它们必须在这里挡住发布。门禁在跑之前逐个核对清单里的文件都在 release 内：`bun test` 对匹配不到任何文件的过滤参数会以 0 退出，缺一个演练测试而不核对，就会为一段从未执行的测试记下 pass。两项 `result` 都为 `pass` 时分别写入 `<服务目录>/gates/comm-slow-pipe/<SHA>.json` 与 `<服务目录>/gates/sidecar-review/<SHA>.json`，记录 `sha`、`bun`、`platform` 与 `result`。`company-service.sh install` 与 `company-service.sh check-gate <SHA>` 在切换前核对两项记录；任一缺失、失败、SHA 不符或 Bun 版本不符都拒绝。这两项不读调用方 shell 中的 `SCK_BUN`：launchd 启动的服务不继承它，门禁只核对服务实际会运行的运行时（`private/service.env` 中的 `SCK_BUN`、`runtime-bun`、`~/.bun/bin/bun`）。显式指定的 pin 缺失时拒绝，不回落到其它 Bun。
-
-已披露的残留（SYS01 复核）：`deploy-mcp-remote.sh` 安装远端 Bun 时直接执行 bun.sh 的安装脚本，未做 sha256 校验；`scripts/release-content.sh` 的清单比较只看文件内容，不看权限位。前者列为后续跟进。`release-gate.sh` 按目录名取 SHA 一项已关闭：`release-gate.sh` 与 `company-service.sh install` 都调用 `scripts/release-content.sh`，把目录内容与提交归档逐文件比较（依赖、生成的 `plugin/server/vendor`、`vault/build` 与 `.runtime/` 不计入），内容不符即拒绝。
-
-`deploy-mcp-remote.sh` 在任何远端步骤前核对同一记录（Bun 版本取 `SCK_BUN_VERSION`，缺省 1.4.2）。随后在远端执行 `runtime-bun/bin/bun --version`，实际版本与门禁不符时在上传载荷前拒绝，不复用旧二进制。两项都通过后才上传 release、写入 `service.env`、切换 `current` 并重启。`SCK_REMOTE_HOME` 只供测试覆盖：`tests/ci-gates.test.ts` 以桩化的 ssh 与 scp 运行脚本，不触及真实主机；生产路径不设置。最终集成提交若与审查过的提交不同，必须对该集成 SHA 重新生成门禁记录，不能复制旧记录或改写 JSON。
-
-## Magpie 四档模型路由（0.5.0）
+#### Magpie 四档模型路由（0.5.0）
 
 故事作者保持原有编制、客户端和模型。其余角色各保留一个 Claude 编制；产品默认 `group/sck-sonnet`，owner（老板）默认 `group/sck-opus`，其他岗位（含 QA）默认 `group/sck-haiku`。Fable 仅作为老板手动入口，不进入员工请求，老板个人通过 Magpie 手动使用 Fable。
 
 员工组为 `group/sck-opus`、`group/sck-sonnet`、`group/sck-haiku` 三个，Fable 不进入员工请求。0.5.0 起员工会话不再经过本机网关（18779 已删除），直连 VPS magpie `https://data.maplayer.top/ofm`。租约档位是上限，手动选择可以降到更便宜的档，不能升档。
 
-### 员工会话环境注入
+##### 员工会话环境注入
 
 插件在员工会话打开时注入以下配置：
 
@@ -370,94 +427,42 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plis
 
 配置经 `--settings` 私有文件加载（员工通信目录下 `.claude/settings.local.json`，权限 0600），因为用户全局 `settings.env` 会覆盖进程环境变量。story-author 与老板手动会话不注入。
 
-### 会话归因
+##### 会话归因
 
 换任务即换会话。reuse 与 oneshot 两种策略都是：同一任务内的返工、复审接续原会话，绑定的任务记录在 `employee.session_task`。升级前已存在、没有绑定任务的旧会话，在下次派工时换新会话，因为旧会话环境里仍是已停用的网关地址。
 
-### 已删除与放弃的内容
+##### 已删除与放弃的内容
 
 - 0.5.0 删除模型排序整套（ranking、aa 榜单、alias、inventory、health、roster、trends、urgency、weights、内置 benchmarks）、agent 模型指标页、模型切换时间线、model_execution 台账，以及 Jev 组内排序。
 - 派工器只处理角色/岗位轨、仓库与写入隔离、独立验收、实现人连续性、租约和本机总并发，不按订阅额度、账号并发、配置模型漂移或员工分数挑模型。
 - 公司代码不再自动排序或入组模型。Sonnet、Haiku 组的实际成员与顺序以 Magpie 侧配置为准，本仓库代码不维护它们，上线后需核对。
 - 放弃项：员工思考等级（thinking）控件对组名模型不再传给 Paseo，因为组名模型未经 Paseo 验证。
 
-### 会话与租约
+##### 会话与租约
 
 有效员工会话的模型调用资格与任务写入租约分开：submit/review 成功会立即消耗任务租约，随后 Claude 仍需处理工具结果、输出收尾，此时记录 task 为空、phase=idle。新任务写入和供应商操作仍须原有有效租约；未登记、隔离或过期的在途租约不会获得任务权限。
 
-### 历史迁移
+##### 历史迁移
 
 0.4.x 的四档迁移（加法迁移 033，以及原 `model-routing-admin.ts` 的 migrate、disable、roster 等步骤，该脚本已随 0.5.0 删除）已经完成，不再适用于 0.5.0。0.5.0 的回滚与上线验证项见 [运行手册 · 上线记录](agent-operations.md#上线记录)。
 
-### Factory 优先的原生员工编制
+##### Factory 优先的原生员工编制
 
 编制保留 Claude、Factory（`factory-droid`）及故事作者特例；删除其他 provider 的非故事作者定义。Factory 保留原生 provider、模型与思考设置，并恢复额度门禁；Claude 继续使用岗位默认的 Magpie 组。老板编制列表把 Factory 排在前面。
 
 派工选人不调用 Jev。资格检查（岗位/轨道、项目、额度与健康、席位与并发、原实现人绑定、验收回避及独立性）通过后，先复用 Factory，再使用可新建的 Factory 席位。Factory 额度与健康可用且岗位编制启用时，全公司按任务创建时间和稳定键排序，最多保留 3 个待派工作项等待 Factory；席位或并发满不立即分流这 3 项，第 4 项起可使用其他合格员工。执行、验收与 blocked_to=owner 的老板关口恢复工作共用名额；批次含保留等待项时整批等 Factory。任务实际派出才释放名额并递补。额度耗尽/冷却或该岗位无启用 Factory 编制时按原候选规则回退。任务原因用 factory_wait 解释等待，不绕过负责人、作者回避或独立性限制。Factory 编制显式设置 thinking=max，与 auto-high 工具权限模式分开。候选排序在本机执行，不为派工产生 Jev 调用。
 
-## 源站主机：受限账号与只读运维工具
+## 已删除的旧做法
 
-员工不持有源站 SSH 账号。源站上有两个专用账号，各绑一把只在本机的无口令密钥（`$SCK_SERVICE_HOME/private/origin/`，0600，连同固定的 `known_hosts`）：
+以下内容属于 0.7.0 之前的节点布局，或 0.7.1 已删除的本机公司库。它们已删除，不要按这些内容操作。
 
-| 账号 | 密钥 | 能做的唯一一件事 |
-|---|---|---|
-| `scktunnel` | `tunnel-ed25519` | 开状态面反向转发 `127.0.0.1:18778`；无 shell、无本地转发、无命令（`launchd` 任务 `org.surrealck.status-tunnel`） |
-| `sckops` | `ops-ed25519` | 运行强制命令 `/usr/local/bin/sck-origin-agent`：`status`/`health`/`logs` 三个只读操作；无 sudo，经 `systemd-journal` 组读日志 |
-
-限制两层叠加：`authorized_keys` 的 `restrict,command=…`/`permitlisten=…`，以及 `sshd_config` 末尾 `# sck-origin begin…end` 的 `Match User` 块（`PermitOpen none`、`ForceCommand`）。部署/重装由老板用自己的 deploy 密钥执行（幂等）：
-
-```sh
-scp scripts/origin-agent/{sck-origin-agent.py,install-remote.sh} <owner>@<host>:/tmp/
-ssh <owner>@<host> 'sudo sh /tmp/install-remote.sh "$(cat tunnel.pub)" "$(cat ops.pub)" < /tmp/sck-origin-agent.py'
-```
-
-broker 侧在项目环境配置加 `origin: {host, user:"sckops", keyFile, knownHosts}`（本机绝对路径）即开放 `ops_origin_*`；`ops_info.can.originHost` 反映是否已配置。服务白名单在 agent 与 `src/ops/origin.ts` 两处保持一致。写操作（重启、改配置、升级 SurrealDB）不在此通道内。
-
-## 员工沙箱
-
-员工与老板、插件同是 macOS 用户 `y`，文件权限挡不住员工读公司凭证。所以公司会话一律在 Seatbelt 沙箱（`scripts/sandbox/employee.sb`）里启动，子进程会继承：
-
-- **不可读写**：`<服务目录>/private`、`~/.ssh`（只放行 `config`、`known_hosts`、`id_ed25519.pub`，git 经 ssh-agent 推送）、`~/.paseo`、`~/.config/magpie`、Cloudflare/wrangler 配置。
-- **不可连接**：Paseo daemon `localhost:6767`（员工会话里的 Paseo MCP 因此失效，公司流程不依赖它）、`~/.ssh` 与 `~/.paseo` 下的 unix socket、`sck-vault` socket。
-- **不可执行**：`launchctl`、`osascript`、`open`、`crontab`/`at`、Paseo CLI；同时禁止 AppleEvents 和 LaunchServices。
-- **不可写**：插件发布与运行时目录、沙箱自身、`~/Library/LaunchAgents`、shell 启动文件、`~/.gitconfig`、`~/.claude` 的全局设置/hooks/skills/plugins、`~/.local/bin`、`~/.local/share/claude`、`~/.bun/bin`、`~/node/bin`、`/Applications`、`/opt/homebrew`。
-
-接线方式：插件在 `agent.session_open` 给公司会话加 `SCK_SANDBOX=employee`（resume 的会话按 label 识别后同样加上）。Paseo 的 `claude`、`factory-droid`、`antigravity` provider 命令替换成 `<服务目录>/sandbox/bin/*` 包装脚本，经 `launch.sh` 处理：有标记或 `SCK_COMM_DIR` 的会话进沙箱，profile 缺失时拒绝启动（exit 78）；老板自己的会话和 Paseo 的版本/登录探测原样运行。安装或更新（幂等，会备份 `~/.paseo/config.json` 并执行 `paseo reload`）：
-
-```sh
-sh scripts/sandbox/install.sh
-```
-
-插件每次打开公司交互会话时都会重读 `~/.paseo/config.json`。provider 不在 claude、factory-droid、antigravity 之列（codex 由多个 agent 共用同一个 app-server 进程，无法按会话进沙箱），或配置没有指向包装脚本时，直接拒绝打开会话（fail closed）；只读历史不受影响。已在运行的会话会沿用旧的启动方式，要重新打开会话才进沙箱：空闲时执行 `paseo agent reload <id>`。沙箱挡不住的同用户风险：埋进共享仓库、留给老板日后运行的代码（`.git/hooks`、依赖脚本），`~/.claude.json` 里的 MCP 配置（claude 本身要写这个文件），以及钥匙串里允许 `security` 读取的条目。要彻底隔离，只能让员工改用独立的 macOS 用户运行。
-
-### 代码仓改绑后的实现人恢复
-
-老板通过 `bind_task_code_repo` 明确改绑代码仓后，旧实现人会话仍可能绑定在原仓，仓库隔离与实现人连续性会共同挡住派工。调度器把这一明确错配纳入既有自动接替：仅在执行阶段，从任务当前仓库选择符合岗位、轨道、额度、独立性及策略约束的空闲工程员工，走版本校验与 `system:dispatcher` 接替审计，保留历史贡献及验收回避；下一轮正常领取。没有合法候选时等待并明确展示原因，不放宽跨仓隔离、不清实现人或作者记录。任务有效仓库（显式代码仓 > 任务项目仓 > 目标项目仓 > ops 仓）与实现人会话仓库不一致时也触发恢复；接替继续执行独立性门禁；同仓原实现人继续接续。
-
-### 目标员工休眠与只读会话审阅（v0.3.56）
-
-目标员工的身份、Paseo agent ID 与 provider session ID 独立于运行进程和每项任务租约。Paseo 空闲回收造成 closed 时，无在途租约且编制仍启用的目标员工进入 sleeping，保留原身份、通道及上下文，不主动 reload。下一次合法派工先取得新租约再通过同一 agent send 按需恢复。持有在途租约的 closed 员工仍走原有恢复与故障宽限；明确归档、真实错误、通道隔离仍保留退役规则。历史已退役身份不自动复活。休眠员工仍占编制实例名额，但不计入运行并发。Factory 优先于 Claude 上下文复用：合法 Factory 有空位时先创建或复用 Factory，席位满按三个等待项及溢出分流规则处理。
-
-Paseo 公司插件「公司 → 只读审阅」允许粘贴员工 agent ID；会话命令中心和面板也有「只读审阅历史」。通过本地 Claude/Factory 持久 transcript 分页显示文本和工具记录摘要，不恢复模型运行时、员工凭证或租约，不提供输入发送和工具执行。关闭未归档、已归档、已退役、无租约历史均可审阅；隐藏思考、配置、工具输入和原始工具输出不展示，常见凭证脱敏。普通长文本按正文续页保持可达。单条过大记录省略，文件缺失明确报错，不触发模型补取。老板 RPC 验证公司员工登记，QA 会话不开放此老板入口。归档的 Paseo 原生 history 打开跳过路由配置检查，仍保留环境清洗；非 history 交互保持路由与沙箱校验。普通原生聊天与只读审阅是不同入口，后者不激活前者。
-
-### 本机数据库内存预算与资源阻塞分类（v0.3.57）
-
-公司 fork 的默认 RocksDB 预算会随宿主机物理内存放大：16GB Mac 的 block cache 默认约7GiB，write buffer 默认128MiB×8。公司 launchd 数据库通过 scripts/company-db-runtime.sh 设置本机预算：block cache 512MiB，write buffer 32MiB×4，受跟踪内存阈值2GiB；值均使用整数 bytes，避免尺寸后缀解析差异。该阈值由 fork 的分配跟踪与查询取消检查实现，不是 macOS 对整个进程 RSS 的硬上限，缓存、映射、线程及其它分配仍可能造成差异。不能使用 launchd RSS 限制冒称硬隔离。只读日志记录这四项非敏感预算，不记录认证信息。
-
-升级代码不会擅自重启数据库；首次应用须在新增派工暂停期间运行 main 固定发布的 company-db.sh install，验证原数据库健康和查询恢复后再解除同一暂停。凭证与持久数据目录保持原路径。安装将运行脚本复制到服务 bin 目录，数据库启动不依赖 active 发布；代码回退不破坏数据库入口。后续安装沿用该运行脚本，避免手改启动脚本后重装丢失预算。需要覆盖时在 launchd 环境中设置相同 SURREAL_* 整数字段；默认配置适用于当前16GB共享宿主机。
-
-派工任务结论区分 memory_pressure 和 disk_space，两者同时低时分别显示，不复用磁盘清理说明。内存判断仍优先 macOS 内核压力等级，正常压力时不以少量空闲页误拦截。磁盘产物回收只由磁盘回收水位触发，内存不足不触发无关清盘；回收禁用通知仅在磁盘确实阻断派工时出现。旧 resources 代码保留兼容，恢复提示改为检查内存和磁盘，实时结论会在下一 tick 更新。
-
-### 内存压力 LRU 休眠（v0.3.60）
-
-有待派工作且内存门禁阻断时，按连续空闲起点升序关闭一个闲置员工运行时，硬下限 3600 秒。未知起点从观测开始，不用进程年龄或上次领取时间代替。每轮最多关闭一个，再探测内存；仍有压力时等待下一轮，磁盘不足不触发此回收。
-
-持有任务、待办唤醒中、权限待处理、运行中、状态不明或快照变动均跳过。事务登记两分钟领取屏障，任务 claim 与待办唤醒均遵守；关闭确认后解除，结果不明时自然过期。不退役、不撤销凭证、不归档工作空间，绑定的实现人也可休眠，下次合法派工复用原身份和会话。
-
-使用本机 Paseo MCP `/mcp/agents` 的 `kill_agent`。安装版 0.14.0 中它仅调用 `closeAgentCommand → closeAgent`，保留持久记录，与 delete、archive、close-items 不同。默认端点 `http://127.0.0.1:6767/mcp/agents`，可通过 SCK_PASEO_RUNTIME_MCP_URL 指定其他本机端口，仅接受回环 HTTP。Paseo 升级后应复核该关闭契约。
-
-### 公司插件导航约定（v0.3.58）
-
-公司插件在 Paseo 侧栏只注册「公司」一个入口。用量、历史审阅及后续公司功能放在公司工作台内部，不再新增侧栏菜单。手机端内部导航单行横向滑动，各页面独立滚动。保留原有命令与会话内用量、只读审阅面板；旧 surface ID 进入相同工作台。
-
-Paseo 0.14.0 原生已归档会话走 history 恢复，但已关闭、未归档的持久会话走 interactive 恢复（安装包 agent-manager.js 的 resumeAgentFromPersistenceInternal）。因此「只读审阅」保留为公司内部补充功能：直接读持久记录，不恢复进程或执行权限。普通会话历史仍可直接使用 Paseo；若以后原生对所有关闭状态提供无需恢复运行的只读查看，再移除此补充界面。
+- MCP 任务服务：launchd 任务 `org.surrealck.company-mcp`、端口 38473、`/mcp` 端点、`/ready` 检查、`SCK_MCP_PORT`、`SCK_MCP_URL`，以及 `scripts/company-service.sh`、`scripts/run-service.sh`。
+- 远程 VPS 部署 MCP：`scripts/deploy-mcp-remote.sh`、`sync-gate` 命令、`private/mcp-remote.env`，以及远端 bun 版本核对与 SYS02 上传前守卫。远程部署整节已删除，发布只走节点更新器与 CI 发行包。
+- 固定快照目录：`releases/<sha>/`、`active` 符号链接。插件发行目录是 `plugin-releases/`。
+- 两面切换演练（deploy drill）与 `scripts/acceptance-guard.sh`。
+- 本机门禁回执 `gates/` 目录与 `release-gate.sh`。发布前的公司 fork 回归需手动运行 `bun scripts/test-worktrees.ts <文件>`。
+- GitHub 看板投影：`SCK_GITHUB_REPOSITORY`、`SCK_PROJECTOR_CREDENTIAL_FILE`、`SCK_PROJECTION_STATE_FILE`，以及 `private/gh-projection.json`。
+- 员工凭证文件模式：`SCK_EMPLOYEE_CREDENTIAL_FILE` 与 `private/credentials/*.token`。员工通道只使用 comm 文件协议。
+- 独立调度器 launchd 任务 `org.surrealck.company-dispatcher`：调度器已经并入插件。
+- `npm` 或 `pnpm` 脚本 `mcp:client`、`mcp:serve`、`test:mcp:live` 与 `dispatcher`。
+- 本机公司库（0.7.1 删除）：`scripts/company-db.sh`、`scripts/company-db-runtime.sh`、`scripts/company-backup.ts`，launchd 任务 `org.surrealck.company-db`、`org.surrealck.company-backup`、`org.surrealck.company-verify`，以及 `private/company-db.env` 里的本机库字段。节点的公司库只在云端。

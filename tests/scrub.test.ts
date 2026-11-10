@@ -37,8 +37,8 @@ describe('scrubEnv', () => {
   });
 
   test('values the launch sets explicitly win over the blanking', () => {
-    const env = scrubEnv({ SCK_EMPLOYEE_CREDENTIAL_FILE: '/creds/e1.token' }, { ...daemonEnv, SCK_EMPLOYEE_CREDENTIAL_FILE: '/stale' });
-    expect(env.SCK_EMPLOYEE_CREDENTIAL_FILE).toBe('/creds/e1.token');
+    const env = scrubEnv({ SCK_COMM_DIR: '/comm/e1' }, { ...daemonEnv, SCK_COMM_DIR: '/stale' });
+    expect(env.SCK_COMM_DIR).toBe('/comm/e1');
   });
 
   test('SCK_SCRUB_ENV adds names and prefixes', () => {

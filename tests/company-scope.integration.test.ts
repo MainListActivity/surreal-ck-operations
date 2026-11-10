@@ -13,15 +13,12 @@ import { ProjectStore } from '../src/projects.ts';
 import { COMPANY_PART_BYTES, reassembleCompany } from '../src/company-context.ts';
 import type { CompanyBrief, CompanyPart, ContextView } from '../src/contracts.ts';
 import { RESPONSE_BUDGET_BYTES, answerBytes } from '../src/response-budget.ts';
-import { connectCompanyClient } from '../src/mcp/client';
-import { createMcpHttpService } from '../src/mcp/server';
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
 import type { EmployeeInst } from '../src/workforce.ts';
-import { countingFetch, lastBody } from './support/mcp-wire.ts';
 
 // SYS01 AC-A on the isolated company fork (scripts/test-worktrees.ts): get_context with scope company, the company block read in
-// stored parts, and the task answers that now leave the block out by default. The same block is read through core, the MCP HTTP
-// service and the sidecar channel, and every answer is measured against the budget as it is sent. Never production.
+// stored parts, and the task answers that now leave the block out by default. The same block is read through core and the sidecar
+// channel, and every answer is measured against the budget as it is sent. Never production.
 const NS = 'sck_agent_company_test_scope';
 const database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
 const core = new SurrealCompanyCore(database);
@@ -154,41 +151,13 @@ test('a company cursor is bound to its caller, its section and its scope, and an
   const cursor = first.page!.nextCursor!;
   expect(cursor.length).toBeGreaterThan(0);
   await expectRefused(core.contextView(eng, { scope: 'company', pageSize: 2, cursor }), 'forbidden', /another caller/);
-  await expectRefused(core.contextView(gm, { scope: 'company', section: 'goals', pageSize: 2, cursor }), 'forbidden', /another caller or query/);
+  await expectRefused(core.contextView(gm, { scope: 'company', section: 'projects', pageSize: 2, cursor }), 'forbidden', /another caller or query/);
   await expectRefused(core.contextView(gm, { pageSize: 2, cursor }), 'forbidden', /another caller or another query/);
   // The first payload character changes, so the signature no longer verifies (a change to the last character of the signature
   // can leave its decoded bytes unchanged, and is not an alteration).
   const altered = cursor.replace(/^v1\.(.)/, (_, first: string) => `v1.${first === 'A' ? 'B' : 'A'}`);
   expect(altered).not.toBe(cursor);
   await expectRefused(core.contextView(gm, { scope: 'company', pageSize: 2, cursor: altered }), 'invalid', /altered|verification/);
-});
-
-test('the MCP HTTP service returns the same block, and every answer on the wire stays inside the budget', async () => {
-  const service = createMcpHttpService({ core, port: 0 });
-  const wire = countingFetch();
-  const connection = await connectCompanyClient({
-    url: new URL(`http://127.0.0.1:${service.port}/mcp`), credential: gm, clientName: 'company-scope', fetch: wire.fetch,
-  });
-  try {
-    const parts: CompanyPart[] = [];
-    let cursor: string | undefined;
-    for (let page = 0; page < 1000; page++) {
-      const answer = await connection.client.callTool({ name: 'get_context', arguments: { scope: 'company', pageSize: 6, ...(cursor ? { cursor } : {}) } });
-      expect(answer.structuredContent).toMatchObject({ ok: true });
-      expect(lastBody(wire)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-      const data = (answer.structuredContent as { data: { parts: CompanyPart[]; page: { hasMore: boolean; nextCursor?: string } } }).data;
-      parts.push(...data.parts);
-      if (!data.page.hasMore) break;
-      cursor = data.page.nextCursor;
-    }
-    expectBlock(reassembleCompany(parts), await live());
-    const tasks = await connection.client.callTool({ name: 'get_context', arguments: { pageSize: 2 } });
-    expect(tasks.structuredContent).toMatchObject({ ok: true, data: { companyIncluded: false, companyRead: { scope: 'company', pageSize: 25 } } });
-    expect(lastBody(wire)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-  } finally {
-    await connection.close();
-    await service.close();
-  }
 });
 
 test('the real sidecar channel and comm client read the same block in pages, every page inside the budget', async () => {
@@ -198,7 +167,7 @@ test('the real sidecar channel and comm client read the same block in pages, eve
     const pool = new SidecarPool({ core, workforce: { rotate: async () => gm } as unknown as SidecarDeps['workforce'], runDir, sweepMs: 5 });
     const channel = pool.env({ id: `cs-channel-${suffix}`, credential: gm } as unknown as EmployeeInst);
     const call = async (args: Record<string, unknown>) => {
-      const child = Bun.spawn([process.execPath, join(ROOT, 'src/mcp/client-cli.ts'), 'call', 'get_context', JSON.stringify(args)], {
+      const child = Bun.spawn([process.execPath, join(ROOT, 'src/sck-cli.ts'), 'call', 'get_context', JSON.stringify(args)], {
         cwd: ROOT, stdout: 'pipe', stderr: 'pipe',
         env: { ...process.env, SCK_COMM_DIR: channel.SCK_COMM_DIR, SCK_COMM_KEY: channel.SCK_COMM_KEY },
       });

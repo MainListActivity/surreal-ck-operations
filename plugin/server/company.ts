@@ -1,3 +1,4 @@
+import { RELEASE } from './release-stamp';
 import { loadServiceEnv } from './env';
 import type { PaseoApi } from '@getpaseo/client';
 import { installBunShim } from './bun-shim';
@@ -8,7 +9,7 @@ import type { Company as RuntimeCompany } from './vendor/src/runner/company.ts';
 import type { RuntimeHost } from './vendor/src/runner/host.ts';
 installBunShim();
 loadServiceEnv();
-configureCompanyRuntime({ gateway: createPaseoCli(), realign: setAgentModel,
+configureCompanyRuntime({ gateway: createPaseoCli(), release: RELEASE, realign: setAgentModel,
   runner: { id: process.env.SCK_RUNNER_ID ?? 'paseo:legacy', adoptLegacy: process.env.SCK_RUNNER_ADOPT_LEGACY !== '0' } });
 export type Company = Omit<RuntimeCompany, 'paseo'> & { paseo: PaseoApi | undefined };
 export const company = () => boot() as Promise<Company>;

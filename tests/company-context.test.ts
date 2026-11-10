@@ -7,7 +7,7 @@ import { parseContextInput } from '../src/query-input.ts';
 import { RESPONSE_BUDGET_BYTES, answerBytes } from '../src/response-budget.ts';
 
 // SYS01 AC-A, the pure contract of get_context with scope company: the parts of the company block, the reader's join, and the
-// refusals. The fork-backed suite (company-scope.integration.test.ts) holds the same contract through the database and MCP.
+// refusals. The database-backed suites hold the same contract through the database and the comm channel.
 
 const unit = '中文🙂字符';
 const sha256 = (text: string) => createHash('sha256').update(text).digest('hex');
@@ -123,7 +123,7 @@ test('the reader refuses a missing part, a repeated part, a gap, an altered text
 test('scope company is a task-free read: task filters and an unknown section are refused, and tasks scope keeps the company block out by default', () => {
   expect(parseContextInput({ scope: 'company' })).toMatchObject({ scope: 'company', includeCompany: true, paged: false });
   expect(parseContextInput({ scope: 'company', section: 'projects', pageSize: 3 })).toMatchObject({ section: 'projects', paged: true, pageSize: 3 });
-  for (const filter of [{ taskId: 'task-1' }, { state: 'ready' }, { goalId: 'goal-1' }, { role: 'owner' }, { since: '2026-10-01' }, { fields: ['id'] }, { includeCompany: true }]) {
+  for (const filter of [{ taskId: 'task-1' }, { state: 'ready' }, { tag: 'tag-1' }, { role: 'owner' }, { since: '2026-10-01' }, { fields: ['id'] }, { includeCompany: true }]) {
     expect(() => parseContextInput({ scope: 'company', ...filter })).toThrow(CompanyError);
   }
   expect(() => parseContextInput({ scope: 'company', section: 'secrets' })).toThrow(CompanyError);

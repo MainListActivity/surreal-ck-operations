@@ -40,9 +40,6 @@
 | 退回 | `sck owner reject '{"taskId":"t1","note":"补齐证据"}'` |
 | 回复员工提问 | `sck owner reply '{"taskId":"t1","note":"按方案 A"}'` |
 | 收件箱 | `sck owner inbox '{}'` |
-| 升级清单 | `sck owner upgrade.list '{}'` |
-| 自动升级策略 | `sck owner upgrade.automatic '{"enabled":true}'` |
-| 启动升级 | `sck owner upgrade.start '{"taskId":"t1","taskVersion":1,"digest":"d1"}'` |
 | 简报 | `sck owner brief '{}'` |
 | 添加方向 | `sck owner direction.add '{"text":"优先解决交付延迟"}'` |
 | 老板指示 | `sck owner instruct '{"text":"清查近期阻塞任务"}'` |

@@ -17,10 +17,9 @@ import urllib.error
 import urllib.request
 
 # Services an employee may inspect. Proxies, monitoring and the subscription gateway stay out.
-SERVICES = ("surreal-ck-hono", "surrealdb", "caddy", "sck-company-mcp")
+SERVICES = ("surreal-ck-hono", "surrealdb", "caddy")
 HEALTH = {
     "surreal-ck-hono": "http://127.0.0.1:8080/health",
-    "sck-company-mcp": "http://127.0.0.1:38473/ready",
     "surrealdb": "http://127.0.0.1:8000/health",
     "status-face": "http://127.0.0.1:18778/healthz",
 }

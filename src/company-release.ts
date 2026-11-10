@@ -1,5 +1,4 @@
 import { z } from 'zod';
-import { createHash } from 'node:crypto';
 import { hostIO } from './host-io.ts';
 import { CompanyError } from './core-errors.ts';
 export const releaseNotesSchema = z.object({
@@ -11,8 +10,6 @@ export const releaseNotesSchema = z.object({
   rollback:z.string().min(2).max(400),
 }).strict().refine(v=>Buffer.byteLength(JSON.stringify(v))<=5000,'Release notes exceed 5000 bytes');
 export type ReleaseNotes = z.infer<typeof releaseNotesSchema>;
-export type CompanyRelease = ReleaseNotes & {sha:string;digest:string};
-export const releaseDigest=(v:ReleaseNotes&{sha:string})=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
 export function compareRelease(a:string,b:string):number {
  const aa=a.split('.').map(BigInt),bb=b.split('.').map(BigInt);
  for(let i=0;i<3;i++)if(aa[i]!==bb[i])return aa[i]!>bb[i]!?1:-1;
@@ -51,6 +48,11 @@ export const RELEASE_SCHEMA_REQUIREMENTS: ReleaseSchemaRequirement[] = [
   { version: '0.4.2', schema: 59, tables: [] },
   { version: '0.4.3', schema: 59, tables: [] },
   { version: '0.5.0', schema: 60, tables: [] },
+  { version: '0.6.0', schema: 61, tables: ['node_release', 'node_rollback'] },
+  { version: '0.6.1', schema: 61, tables: [] },
+  { version: '0.7.0', schema: 61, tables: [] },
+  { version: '0.7.1', schema: 62, tables: [] },
+  { version: '0.8.0', schema: 62, tables: [] },
 ];
 /** The requirement that applies to a target version: the newest one that is not newer than the target. */
 export function schemaRequirementFor(version: string): { schema: number; tables: string[] } {
@@ -61,33 +63,6 @@ export function schemaRequirementFor(version: string): { schema: number; tables:
   }
   return chosen ? { schema: chosen.schema, tables: [...chosen.tables] } : { schema: LEGACY_SCHEMA_MINIMUM, tables: [] };
 }
-/**
- * The local release gates a version must have passed on this host before it may be installed.
- *
- * The two historical gates are always required. The recovery-fork gate is part of the contract of the releases
- * that carry it (0.3.76 and later): a release before that does not know the gate, so demanding its record would
- * make a rollback to an older release impossible — and a rollback has to keep working. The same rule is mirrored
- * in scripts/company-service.sh (required_gates), which reads the version from the release's own package.json.
- */
-export const BASE_GATES = ['comm-slow-pipe', 'sidecar-review'] as const;
-/** The script argument of each gate, as scripts/release-gate.sh names it. */
-export const GATE_ARGUMENTS: Record<string, string> = {
-  'comm-slow-pipe': 'slow-pipe',
-  'sidecar-review': 'sidecar-review',
-  'recovery-fork': 'recovery-fork',
-};
-export const RELEASE_GATE_SETS: { version: string; gates: string[] }[] = [
-  { version: '0.3.76', gates: [...BASE_GATES, 'recovery-fork'] },
-];
-/** The gates a target version must have passed: the newest set that is not newer than the target. */
-export function gatesFor(version: string): string[] {
-  let chosen: { version: string; gates: string[] } | undefined;
-  for (const set of RELEASE_GATE_SETS) {
-    if (compareRelease(set.version, version) > 0) continue;
-    if (!chosen || compareRelease(set.version, chosen.version) > 0) chosen = set;
-  }
-  return chosen ? [...chosen.gates] : [...BASE_GATES];
-}
 export async function git(repo:string,args:string[]):Promise<string>{
  const host=hostIO();
  try{
@@ -96,23 +71,4 @@ export async function git(repo:string,args:string[]):Promise<string>{
   return result.stdout.trim();
  }
  catch{throw new CompanyError('invalid','版本校验失败：目标必须已合入 origin/main，且可从本机仓库读取');}
-}
-export async function readCompanyRelease(repo:string,sha:string):Promise<CompanyRelease>{
- if(!/^[a-f0-9]{40}$/.test(sha))throw new CompanyError('invalid','升级需要完整的 main 提交 SHA');
- await git(repo,['merge-base','--is-ancestor',sha,'origin/main']);
- const raw=await git(repo,['show',`${sha}:company-release.json`]);
- let notes:ReleaseNotes;
- try{notes=releaseNotesSchema.parse(JSON.parse(raw));}catch{throw new CompanyError('invalid','缺少有效版本号或升级说明，请工程完善 company-release.json');}
- const pkg=JSON.parse(await git(repo,['show',`${sha}:package.json`]));
- if(pkg.version!==notes.version)throw new CompanyError('invalid','版本说明与 package.json 版本不一致');
- const plan={...notes,sha};return {...plan,digest:releaseDigest(plan)};
-}
-export async function installedRelease(home:string):Promise<{version:string;sha:string;path:string}>{
- const io=hostIO();
- const path=await io.fs.realpathAsync(io.path.join(home,'active'));
- const sha=io.path.basename(path);
- if(!/^[a-f0-9]{40}$/.test(sha))throw new CompanyError('invalid','现役版本目录无法核验');
- const pkg=JSON.parse(await io.fs.readTextAsync(io.path.join(path,'package.json')));
- if(!/^\d+\.\d+\.\d+$/.test(pkg.version))throw new CompanyError('invalid','现役版本号无效');
- return {version:pkg.version,sha,path};
 }

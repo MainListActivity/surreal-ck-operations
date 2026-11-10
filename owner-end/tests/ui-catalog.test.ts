@@ -20,8 +20,7 @@ describe('命令面板的分组与筛选', () => {
 
   test('关键字不分大小写，匹配命令名、用途或分组', () => {
     expect(commandsOf('HOST.EXEC')).toEqual(['host.exec']);
-    expect(commandsOf('公司版本')).toEqual(['company.release.install']);
-    expect(commandsOf('主机与发布')).toEqual(['host.exec', 'company.release.install']);
+    expect(commandsOf('主机与发布')).toEqual(['host.exec']);
     expect(catalogGroups(COMMAND_CATALOG, '翻译').map(view => view.group)).toEqual(['翻译']);
   });
 

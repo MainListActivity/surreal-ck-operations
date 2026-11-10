@@ -10,7 +10,7 @@ import { gateCredentialChange } from './retirement.ts';
 /** The digest a revocation writes in place of the credential digest: it matches no token, so the old credential dies. */
 export const revokedCredentialDigest = (): string => `revoked-${randomUUID()}`;
 
-/** Local root-only enrollment API. Never pass this object to the MCP adapter. */
+/** Local root-only enrollment API. Never pass this object to the sidecar or comm adapter. */
 export class LocalEnrollmentAdmin implements EnrollmentAdmin {
   /** `afterDecision` is a test seam (see gateCredentialChange); production passes nothing. */
   constructor(private readonly database: CompanyDatabase, private readonly afterDecision?: (employeeId: EmployeeId) => Promise<void>) {}

@@ -38,7 +38,7 @@ export function nativeArgs(s: Pick<NativeSession, 'provider' | 'nativeSessionId'
     ...(s.thinking ? ['--effort', s.thinking] : []),
     ...(s.mode === 'bypassPermissions' ? ['--permission-mode', 'bypassPermissions'] : []),
     ...(s.nativeSessionId ? ['--resume', s.nativeSessionId] : [])];
-  return ['exec', ...(s.nativeSessionId ? ['resume', s.nativeSessionId] : []), '--json', ...model,
+  return ['exec', ...(s.nativeSessionId ? ['resume', s.nativeSessionId] : []), '--json', '--skip-git-repo-check', ...model,
     ...(s.thinking ? ['-c', `model_reasoning_effort=${JSON.stringify(s.thinking)}`] : []),
     // 无人值守权限由外层员工沙箱承担，沿用已授权的 full-access 模式。
     ...(s.mode === 'full-access' ? ['--dangerously-bypass-approvals-and-sandbox'] : []), '-'];
@@ -51,7 +51,9 @@ export function parseNativeResult(provider: NativeProvider, output: string): Nat
   if (provider !== 'codex') {
     let value: any;
     try { value = JSON.parse(output.trim()); } catch { return { ...result, error: '原生 CLI 没有返回有效 JSON 结果' }; }
-    if (value.type !== 'result') return { ...result, error: '原生 CLI 缺少 result 终态' };
+    // Claude 的 verbose 配置会让 json 输出成为完整事件数组；只接受末尾正式结果。
+    if (provider === 'claude' && Array.isArray(value)) value = value.at(-1);
+    if (!value || value.type !== 'result') return { ...result, error: '原生 CLI 缺少 result 终态' };
     if (typeof value.session_id === 'string' && value.session_id) result.sessionId = value.session_id;
     result.text = typeof value.result === 'string' ? value.result : '';
     result.completed = value.is_error === false && value.subtype === 'success';

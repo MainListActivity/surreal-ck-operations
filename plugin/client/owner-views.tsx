@@ -705,29 +705,10 @@ function PulseTab({ ctx }: { ctx: Ctx }) {
   );
 }
 
-function CompanyUpgradeCard({item,ctx,onDone}:{item:import("../shared/types").UpgradeCard;ctx:Ctx;onDone:()=>void}) {
- const s=makeStyles(ctx),start=useRpc(rpc.upgrade);
- const [feedback,setFeedback]=useState("");
- const mutation=useMutation({mutationFn:()=>start({taskId:item.taskId,taskVersion:item.taskVersion,digest:item.plan.digest}),onSuccess:()=>{setFeedback("升级已启动，完成后自动回复通过");onDone();},onError:e=>setFeedback((e as Error).message)});
- const busy=mutation.isPending||["queued","preparing","checking","installing","verifying"].includes(item.status),done=item.status==="succeeded",stale=item.retired===true;
- const rows=(title:string,items:string[])=><View style={{gap:sp(4)}}><Text style={s.muted}>{title}</Text>{items.map((t,i)=><Text key={i} style={s.text}>• {t}</Text>)}</View>;
- return <View style={[s.card,{gap:sp(12)}]}>
-  <Text style={s.muted}>公司系统升级 · {item.phase}</Text>
-  <Text style={[s.text,{fontSize:fs(18),fontWeight:"700"}]}>v{item.plan.version} · {item.plan.title}</Text>
-  {rows("上线内容",item.plan.changes)}{rows("影响范围",item.plan.impact)}
-  {rows("数据变化",[item.plan.migration])}{rows("回退方式",[item.plan.rollback])}
-  <ExpandableText text={`提交 SHA：${item.plan.sha}`} lines={1} style={s.muted} ctx={ctx}/>
-  {(item.error||feedback)?<Text style={s.text}>{item.error||feedback}</Text>:null}
-  {done?<Text style={s.text}>升级完成，已自动回复通过</Text>:stale?<Text style={s.text}>该版本已被现役版本取代，无需再安装；这张旧待办会自动收口。</Text>:<Pressable accessibilityRole="button" accessibilityLabel={`升级至 v${item.plan.version}`} disabled={busy} style={[s.button,{opacity:busy?0.55:1}]} onPress={()=>mutation.mutate()}><Text style={s.buttonText}>{busy?item.phase:`升级至 v${item.plan.version}`}</Text></Pressable>}
- </View>;
-}
-
 function InboxTab({ ctx }: { ctx: Ctx }) {
   const s = makeStyles(ctx);
   const queryClient = useQueryClient();
   const inboxRpc = useRpc(rpc.inbox);
-  const autoRpc = useRpc(rpc.autoUpgrade);
-  const autoUpgrade=useMutation({mutationFn:(enabled:boolean)=>autoRpc({enabled}),onSuccess:()=>void queryClient.invalidateQueries({queryKey:["inbox"]})});
   const resolve = useRpc(rpc.resolveNotice);
   const consoleRpc = useRpc(rpc.consoleUrl);
   const openRpc = useRpc(rpc.openExternal);
@@ -735,7 +716,7 @@ function InboxTab({ ctx }: { ctx: Ctx }) {
   const data = useQuery({ queryKey: ["inbox"], queryFn: () => inboxRpc({}), refetchInterval: 10_000 });
   const refresh = () => void queryClient.invalidateQueries({ queryKey: ["inbox"] });
   const box: Inbox | undefined = data.data;
-  const empty = box && box.gates.length + box.questions.length + box.notices.length + (box.upgrades?.items.length??0) === 0;
+  const empty = box && box.gates.length + box.questions.length + box.notices.length === 0;
   return (
     <View style={{ gap:sp(12) }}>
       {consoleQ.data?.url ? (
@@ -745,20 +726,14 @@ function InboxTab({ ctx }: { ctx: Ctx }) {
           <Text style={{ color: ctx.theme.colors.accentForeground, fontSize:fs(11), marginTop:sp(5), opacity: 0.85 }}>看消息沿连线流动 · 编辑待发消息 · 放行 · 审待办</Text>
         </Pressable>
       ) : null}
-      {box?.upgrades?.current?<View style={s.card}><Text style={s.text}>当前版本 v{box.upgrades.current.version}</Text><Text selectable style={s.muted}>{box.upgrades.current.sha}</Text>
-        <Text style={s.muted}>自动安装已合 main 的公司版本；全部门禁和上线验证通过后才回复。失败退避24小时，同一版本累计失败2次后停止自动尝试。</Text>
-        <Pressable accessibilityRole="button" disabled={autoUpgrade.isPending} style={s.button} onPress={()=>autoUpgrade.mutate(!box.upgrades?.automatic?.enabled)}><Text style={s.buttonText}>{autoUpgrade.isPending?'正在保存':box.upgrades.automatic?.enabled?'自动升级已开启 · 点击关闭':'自动升级已关闭 · 点击开启'}</Text></Pressable>
-        {autoUpgrade.error?<Text style={s.text}>设置失败，请重试</Text>:null}
-      </View>:null}
-      {box?.upgrades?.items.map(item=><CompanyUpgradeCard key={`${item.taskId}:${item.jobId??item.plan.sha}`} item={item} ctx={ctx} onDone={refresh}/>)}
       <Section title="待批关口" count={box?.gates.length} ctx={ctx}>
-        {box?.gates.filter(g=>!g.task.companyUpgrade).map(g => (
+        {box?.gates.map(g => (
           <DecideCard key={g.task.id} taskId={g.task.id} kind="approve" ctx={ctx} onDone={refresh}
             body={`${g.task.title}\n\n${g.submission ?? "（无提交说明）"}`} />
         ))}
       </Section>
       <Section title="待回问题" count={box?.questions.length} ctx={ctx}>
-        {box?.questions.filter(q=>!q.task.companyUpgrade).map(q => (
+        {box?.questions.map(q => (
           <DecideCard key={q.task.id} taskId={q.task.id} kind="reply" ctx={ctx} onDone={refresh}
             body={`${q.task.title}\n\n${q.question ?? ""}`} />
         ))}

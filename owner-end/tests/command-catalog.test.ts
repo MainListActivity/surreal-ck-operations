@@ -38,7 +38,7 @@ describe('命令目录的内容', () => {
     // 网关在 commands.ts 的 dispatch 中直接分派的命令（不经老板接口、身份、策略与译文模块）。
     const local = [
       'db.read', 'db.write', 'cf.api', 'ops.job.list', 'ops.job.get', 'audit.list', 'cmd.catalog',
-      'message.edit', 'message.edit_rendered', 'message.release', 'message.send', 'host.exec', 'company.release.install',
+      'message.edit', 'message.edit_rendered', 'message.release', 'message.send', 'host.exec',
     ];
     const known = new Set([
       ...OWNER_API_COMMANDS, ...RUNNER_ONLY_COMMANDS, ...IDENTITY_COMMANDS, ...POLICY_COMMANDS, ...TRANSLATE_COMMANDS, ...local,
@@ -48,17 +48,17 @@ describe('命令目录的内容', () => {
     expect([...listed].filter((command) => !known.has(command))).toEqual([]);
   });
 
-  test('执行端标记与网关的排队规则一致（isRunnerCommand），RUNNER_ONLY_COMMANDS 与 host.exec、company.release.* 都有标记', () => {
+  test('执行端标记与网关的排队规则一致（isRunnerCommand），RUNNER_ONLY_COMMANDS 与 host.exec 都有标记', () => {
     for (const spec of COMMAND_CATALOG) {
       expect(spec.runner === true).toBe(isRunnerCommand(spec.command));
     }
-    for (const command of [...RUNNER_ONLY_COMMANDS, 'host.exec', 'company.release.install']) {
+    for (const command of [...RUNNER_ONLY_COMMANDS, 'host.exec']) {
       expect(specOf(command)?.runner).toBe(true);
     }
   });
 
   test('高危命令标为 high：会改变主机、生产或外部状态，或替老板作决定', () => {
-    const risky = ['host.exec', 'company.release.install', 'upgrade.start', 'upgrade.automatic', 'cf.api', 'idp.request', 'db.write', 'decide', 'approve', 'message.send', 'instruct', 'direction.add'];
+    const risky = ['host.exec', 'cf.api', 'idp.request', 'db.write', 'decide', 'approve', 'message.send', 'instruct', 'direction.add'];
     for (const command of risky) {
       expect(specOf(command)?.risk).toBe('high');
     }

@@ -38,7 +38,7 @@ interface SessionOpen { agentId: string; reason: string; env: Record<string, str
 
 /** A company launch always carries its channel (comm mode) or credential file (legacy mode). */
 const launchedByCompany = (env: Record<string, string>) =>
-  env.SCK_COMM_DIR !== undefined || env.SCK_EMPLOYEE_CREDENTIAL_FILE !== undefined;
+  env.SCK_COMM_DIR !== undefined;
 
 /** Bound startup waits, but never turn a registry outage into permission to bypass employee routing. */
 function withinLookup<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {

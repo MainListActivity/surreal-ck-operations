@@ -72,7 +72,7 @@ afterAll(async () => {
 });
 
 const core = () => new SurrealCompanyCore(db, { worktrees: { opsRepo: repoOps } });
-const workforce = () => new Workforce(db, join(dir, 'unused-creds'));
+const workforce = () => new Workforce(db);
 
 let c = 0;
 const key = () => `tp-${++c}-${crypto.randomUUID().slice(0, 8)}`;

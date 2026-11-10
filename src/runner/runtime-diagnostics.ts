@@ -1,9 +1,9 @@
 // SYS04: a read-only diagnostic of what the plugin process is ACTUALLY running.
 //
 // The company service has two execution contexts that both hold company code, and they are not the same
-// tree: the launchd MCP face loads `release/src/*`, while the Paseo plugin `sck-company` — the one every
+// tree: the service's own `release/src/*`, while the Paseo plugin `sck-company` — the one every
 // employee's `sck call` reaches — loads `release/plugin/server/vendor/src/*`. A version read from the wrong
-// context looks authoritative and is worthless, which is why this module never reads the MCP face's path,
+// context looks authoritative and is worthless, which is why this module never reads the `release/src` path,
 // the `active` symlink, or a client-side directory: it reports what this process loaded.
 //
 // The Paseo host does not run the plugin module through a module loader at all: it bundles the server entry
@@ -196,7 +196,7 @@ export function collectPluginRuntimeDiagnostics(options: {
     notRead: [
       "private/ (service credentials)",
       "active symlink (names a target, not a loaded module)",
-      "MCP face tree (release/src, a different execution context)",
+      "release/src tree (a different execution context)",
       "process environment values",
       "in-memory bundle (the host evaluates generated CJS; only the registered source tree is read)",
     ],

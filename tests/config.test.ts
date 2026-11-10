@@ -25,7 +25,16 @@ test('a look-alike host is not local', () => {
   expect(() => loadDatabaseConfig()).toThrow(/Refusing/);
 });
 
-test('outside tests the configured server is used as is', () => {
-  withEnv('wss://data.example.com/rpc'); process.env.NODE_ENV = 'production';
-  expect(loadDatabaseConfig().url).toBe('wss://data.example.com/rpc');
+test('outside tests a missing COMPANY_DB_URL refuses to start, and the local SURREAL_URL is never used', () => {
+  withEnv('ws://127.0.0.1:38480/rpc'); process.env.NODE_ENV = 'production';
+  // A Mac that runs the control plane has a live private/company-db.env; isolate this case from the machine's company env.
+  process.env.SCK_COMPANY_DB_ENV = '/dev/null'; delete process.env.COMPANY_DB_URL;
+  expect(() => loadDatabaseConfig()).toThrow(/未配置 COMPANY_DB_URL，拒绝启动/);
+});
+
+test('outside tests the configured cloud server is used as is, even a remote one', () => {
+  withEnv('ws://127.0.0.1:38480/rpc'); process.env.NODE_ENV = 'production';
+  process.env.SCK_COMPANY_DB_ENV = '/dev/null'; process.env.COMPANY_DB_URL = 'wss://data.example.com/rpc';
+  process.env.IDP_ISSUER = 'https://o.example.com/t/company';
+  expect(loadDatabaseConfig()).toMatchObject({ url: 'wss://data.example.com/rpc', rootUser: '', rootPassword: '' });
 });

@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import {
-  MAX_ASSET_PATHS, MAX_ASSET_PATH_CHARS, MAX_TASK_DEPENDENCIES, MAX_TASK_ID_CHARS,
+  MAX_ASSET_PATHS, MAX_ASSET_PATH_CHARS, MAX_TASK_ID_CHARS,
   PROJECT_TEXT_LIMITS, projectTextLengths, validateProjectTexts,
 } from '../src/input-bounds.ts';
 import { validateIntent } from '../src/dispatcher/worktree-registry.ts';

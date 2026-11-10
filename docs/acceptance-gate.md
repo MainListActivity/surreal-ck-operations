@@ -24,7 +24,7 @@ GitHub CI 计费判定属于系统能力。普通 `report_blocker`（到老板�
 
 直接以 CI 计费为理由的请求，即使未提供来源也会被拒绝；这只是限制员工阻塞能力，不能签发豁免。真实来源检查只处理本次与 CI/检查未执行有关的理由；历史“已完成”或其他分句提到 GitHub，不会单凭关键词与客户账单审批混为一谈，也不禁止后续真实依赖等待。多个 run 中有真实或未知失败时，不凭另一个 run 的 billing 禁止员工报修。员工应调用 `record_acceptance_evidence`，提供 `taskId`、机器 `acId`、当前 `sha` 和 `source{provider:"github-actions",runUrl}`，再正常提交；缺少来源、读取失败、错误 SHA 和真实测试失败都不会获得豁免。
 
-已合入 main 的结构化 `companyUpgrade` 是安装申请，仍由当前工程租约、任务仓库和 main 版本核验，不属于要求老板修复 CI 账单的普通阻塞。独立上线签核和部署事实不能由此替代。
+0.6.0 已删除结构化 `companyUpgrade` 升级卡，升级不再是 block 的豁免理由：每次 block 都先经过 CI 计费来源检查。独立上线签核和部署事实不能由此替代。
 
 ## 3. 统一评估器（AC03）
 
@@ -56,7 +56,7 @@ GitHub CI 计费判定属于系统能力。普通 `report_blocker`（到老板�
 
 - 旧版按 schemaless 行读取，忽略 `acceptance_*` 字段与新表；它不会崩溃，也不会把任务认领到不存在的新状态（任务仍只在 ready/doing/review/blocked 中）。
 - 旧版没有评估器，会绕过新门禁直接 accept。因此**在存在已启用 criteria 的在办任务时不得回滚**；上线申请必须列出该边界，部署腿的回滚演练要覆盖「新版写入 → 回滚旧版 → 调度若干轮」并证明没有误认领/误拉起，且回滚计划包含排空或保留新 release。
-- `tests/acceptance-gate.fork.test.ts` 的 RB01 用例用隔离 fork 记录旧阅读器忽略新字段、任务状态不变、旧门禁关闭时可通过（即回滚边界）。SYS02 还把目标能力守卫并入 `scripts/review-wait-guard.sh`：本地 install/回滚与远程 deploy 在任何 active/插件/MCP/ssh 副作用前读取目标自身（内容绑定提交）的基线声明、评估器合并、schema/bootstrap 与 plugin vendor；旧 a925222、缺失、注释冒充或不可读目标一律拒绝，没有“当前 gated 任务为 0/先关 gate”的宽松例外。公司 fork 演练固定 a925222 的旧 dispatcher/core：旧 tick 认领 gated review（`tickClaims=1`）且旧 core 无证据 accept 到 done，新守卫拒绝该目标（`code=1`）。
+- `tests/acceptance-gate.fork.test.ts` 的 RB01 用例用隔离 fork 记录旧阅读器忽略新字段、任务状态不变、旧门禁关闭时可通过（即回滚边界）。当前仓库已没有 `scripts/review-wait-guard.sh`，也没有与之对应的部署前目标能力守卫。0.7.0 的节点只通过节点更新器切换插件，回滚边界改由插件回退承担（见 [company-upgrades.md](company-upgrades.md)）。待确认：是否需要为 gated 任务重新建立部署前守卫，由老板或复核人决定。
 
 ## 7. 工具与字段
 
@@ -64,10 +64,10 @@ GitHub CI 计费判定属于系统能力。普通 `report_blocker`（到老板�
 | --- | --- | --- |
 | `record_acceptance_evidence` | `taskId`、`acId`、`sha`、`environment?`（只用于与受控声明比对，不能新增要求）、`source{provider,runUrl,artifactId,probe?}`、`idempotencyKey` | probe 必须带 artifactId；声明的环境由 Deployments API 核验；服务端写入本次 attempt 与 criteria 版本 |
 | `acceptance_status` | `taskId` | 读 gate、criteria、证据与当前未满足清单 |
-| `acceptance_gate` | — | owner 读 gate 记录 |
+| `acceptance_gate` | 无 | owner 读 gate 记录 |
 | `set_acceptance_gate` | `enabled`、`reason`、`expectedVersion`、`idempotencyKey` | owner 版本化启停，审计理由 |
 
-`create_task`/`create_delivery` 的 MCP schema 携带 `acceptanceCriteria`、`acceptanceEnvironment`；`submit`/`review` 携带 `acceptance{sha,environment}`。`submit` 的声明 head 必须等于 PR 门禁实际 head，声明的环境必须等于受控声明；`accept` 使用提交时持久化的环境与 attempt。
+`create_task`/`create_delivery` 的工具 schema 携带 `acceptanceCriteria`、`acceptanceEnvironment`；`submit`/`review` 携带 `acceptance{sha,environment}`。`submit` 的声明 head 必须等于 PR 门禁实际 head，声明的环境必须等于受控声明；`accept` 使用提交时持久化的环境与 attempt。
 
 通道（中继）边界：**sidecar 只做转发，不做判定**。它把调用方声明的 `acceptance{sha,environment}` 原样转给 core；格式非法时中继直接拒绝，不会静默丢弃（被丢弃的 head 到门禁会变成“未声明”）；字段缺失时不转发，由门禁按门禁状态判断。判定一律在 core 的统一评估器里完成，所以 sidecar 与 core 是同源判定、不是两套规则。由 report.md 文件触发的提交没有结构化 acceptance：门禁关闭时走旧路径（只附 PR 链接不会被 head 检查挡住），门禁开启且该行不是 legacy 时被拒（有 PR 链接时是缺 head 的 head 检查，没有链接时是缺 head 的机器 AC），这是 AC05 的预期行为。
 

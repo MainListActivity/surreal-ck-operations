@@ -1,6 +1,6 @@
 # 公司执行模块与原生 agent
 
-本改动基于 `simplify/drop-gateway-ranking-scoring` 的 `56332d5`，应在该分支之后集成。不要用本分支的旧升级逻辑覆盖并行的自动升级、删除本地数据库、删除 MCP 改动；合入时以这些功能各自最终版本为准。
+0.8.0 已融合 main 的 0.7.1：保留节点自动升级、云端公司库直连，以及删除本机库和 MCP 的行为。共享模块从宿主注入发行版本戳，不依赖插件目录。
 
 ## 模块与兼容策略
 
@@ -69,7 +69,7 @@ SIGINT/SIGTERM 停止派工循环，再停止本执行器拥有的进程组并�
 
 新增测试使用真实子进程执行可控 fixture，验证首轮绑定、stdin、provider 终态、续跑、重复发送、进程停止、输出上限、重启与单写者。公司 fork 临时数据库测试验证节点归属、看板合并、心跳及既有任务/消息/运维作业竞争认领。
 
-尚未启动真实 provider 会话、连接远程节点或切换生产插件。发布应先部署兼容抽离版本，确认现有 Paseo 派工，再在单个节点对 Factory 做真实任务灰度，之后 Claude、Codex。现有任务继续运行到收尾，不搬运正在运行的会话。
+本机真实 Factory、Codex CLI 已通过员工 sandbox 启动，验证首轮、同会话 ID 续跑、上下文保留和自动回到 idle。Codex 对非 Git 工作目录显式传入 `--skip-git-repo-check`；Claude 兼容 verbose 配置产生的 JSON 事件数组，只接受末项正式 result。真实业务派工和远程节点验证仍需单独执行，不能以 CLI 冒烟结果替代。生产默认继续使用 Paseo 执行层，不迁移在途会话。
 
 协议依据：
 - Factory：https://docs.factory.com/droid-exec/overview

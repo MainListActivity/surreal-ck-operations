@@ -48,14 +48,14 @@ const claim = (state: string, history: HistoryEntry[], intent: 'code' | 'read' =
 const task = (state: string) => ({ id: 't1', title: '导出 · 实现', state, row: {} }) as never;
 
 test('the dispatch message is three sentences: what, finish, which tool', () => {
-  const first = wake({ id: 'e1', role: 'engineering' } as never, task('doing'), env, true, { comm: true, claim: claim('doing', []), commDir: '/c' });
+  const first = wake({ id: 'e1', role: 'engineering' } as never, task('doing'), env, true, { claim: claim('doing', []), commDir: '/c' });
   expect(first).toContain('实现 /c/task.md 中的需求');
   expect(first).toContain(`'/bin/sck' call submit '{"text":"…","idempotencyKey":"…"}'`);
   expect(first).not.toContain('工作目录');
-  const rework = wake({ id: 'e1', role: 'engineering' } as never, task('doing'), env, false, { comm: true, claim: claim('doing', [ret('a'), ret('b'), ret('c')]), commDir: '/c' });
+  const rework = wake({ id: 'e1', role: 'engineering' } as never, task('doing'), env, false, { claim: claim('doing', [ret('a'), ret('b'), ret('c')]), commDir: '/c' });
   expect(rework).toContain('修复 /c/findings/round-03.md 中的问题');
   for (const text of [first, rework]) for (const word of ['AGENTS.md', 'PROTOCOL', 'claim.json', 'checkpoint', 'report_blocker', 'wait_task', '员工编号']) expect(text).not.toContain(word);
-  const review = wake({ id: 'e2', role: 'engineering' } as never, task('review'), env, true, { comm: true, claim: claim('review', []), commDir: '/c' });
+  const review = wake({ id: 'e2', role: 'engineering' } as never, task('review'), env, true, { claim: claim('review', []), commDir: '/c' });
   expect(review).toContain('先查 /c/task.md 的验收标准第 1 条');
   expect(review).not.toContain('在生产逐条复验');
   expect(review).toContain("call review");

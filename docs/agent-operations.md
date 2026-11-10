@@ -4,22 +4,22 @@
 
 | 组件 | 位置 | 作用 |
 |---|---|---|
-| 任务服务 | 本机 launchd `org.surrealck.company-mcp`（`127.0.0.1:38473`），兼跑 GitHub 投影；129 上的远端入口 `data.maplayer.top/sck-mcp` 已停用 | 任务、租约、审计、目标、关口；admin/owner 通道 |
+| 任务服务 | 云端公司库（0.7.0 起节点上没有 MCP 服务，节点只通过插件访问） | 任务、租约、审计、目标、关口；admin/owner 通道 |
 | 调度器 | Paseo 插件内（`plugin/server/dispatch.ts` tick 循环） | 不消耗模型 token：读队列、叫醒/新开员工、收回并改派、订阅健康、老板通知 |
 | 员工通道 | Paseo 插件内 `plugin/server/sidecar.ts`（每实例一个） | 代持实例凭证、代领任务、自动续租、relay `sck call`、回收 `report.md`/`blocker.md` 为提交/阻塞；把 `ops_*` 转给运维代理。架构与排障详见 [sidecar 通道](sidecar-channel.md) |
 | 运维代理 | Paseo 插件内 `src/ops/`（`OpsBroker`，由通道调用） | 持有密封凭证与 Cloudflare/IdP 权限，替员工建账号、建 workspace、管成员、登录、调产品接口、查 workspace 数据、给浏览器登录；员工只拿会话句柄，见下文「运维代理」 |
 | 员工 | Paseo 会话 | 按 [协议](../agents/PROTOCOL.md) 执行、写 `.sck` 交付物；进程内无任何凭证，环境里的凭证变量在 spawn 前被清空 |
-| 数据 | 本机 SurrealDB（公司 fork，`org.surrealck.company-db`，`127.0.0.1:38480`，数据在 `private/db`）`sck_agent_company/control_plane` | 唯一事实来源；每小时备份到 R2 `sck-company-backup`，每周恢复演练 |
+| 数据 | 云端公司库 SurrealDB（生产默认 `company/main`），节点不执行迁移 | 唯一事实来源；0.7.1 起没有本机公司库与备份，见 [节点运维手册](company-service-operations.md#数据库与云端迁移) |
 
-数据位于**本机 SurrealDB**：连接地址与 root 凭证在 `private/company-db.env`（`scripts/company-db.sh install` 生成，优先于产品 `.env`；测试环境不隐式读取）。产品数据仍在 129，由产品 `.env` 描述。备份由 `scripts/company-backup.ts` 完成：zstd 压缩，单文件超过 20MB 拒传并发老板通知，R2 上保留 2 份小时备份加若干每日备份，总量不超过 40MB；`verify` 把最新备份恢复到临时内存库核对行数。运营流水按 `src/data-retention.ts` 的保留期由插件生命周期清理删除。
+公司库只在云端 SurrealDB，节点连接它的方式见 [company-upgrades.md](company-upgrades.md)。`private/company-db.env` 只放云端字段（`COMPANY_DB_URL` 等）；缺少 `COMPANY_DB_URL` 时插件与节点更新器拒绝启动，不回落到本机。产品数据仍在 129，由产品 `.env` 描述。运营流水按 `src/data-retention.ts` 的保留期由插件生命周期清理删除。
 
-服务目录：`~/Library/Application Support/SurrealCKCompany/`（`active` 指向固定发布目录；`private/` 为配置与凭证，0700；`logs/` 为日志）。安装、启停：发布目录内 `sh scripts/company-service.sh install|status|restart|stop|uninstall`，默认只管理 `mcp`（任务服务 + GitHub 投影）。调度器、员工通道和运维代理都跑在 Paseo 插件 `sck-company` 里，改了 `plugin/` 或 `src/` 后用 `$PASEO_CLI plugin reload sck-company` 重载（不要重启 Paseo 守护进程）；**不要再装 launchd 的 dispatcher**（`SCK_COMPONENTS=dispatcher` 仅为旧部署保留），否则会和插件重复派工。服务依赖本机 Paseo、SurrealDB、网络与 GitHub 登录；Mac 合盖或关机时公司暂停。
+服务目录：`~/Library/Application Support/SurrealCKCompany/`，布局与安装见 [节点运维手册](company-service-operations.md)。节点上只有 Paseo 插件 `sck-company`（调度器、员工通道、运维代理与老板接口都在插件里）和节点更新器。节点上的插件版本由节点更新器按 Release 切换（见 [company-upgrades.md](company-upgrades.md)），不要手工 `plugin install` 或 `reload` 来升级。本机调试改了 `plugin/` 或 `src/` 时，可用 `$PASEO_CLI plugin reload sck-company` 重载（不要重启 Paseo 守护进程）；开发树登记会被节点更新器拒绝切换，调试结束后执行 `paseo plugin remove sck-company`，再运行 `sh scripts/node-updater.sh run` 重新登记发行版本；**不要再装 launchd 的 dispatcher**，调度器已在插件内，否则会和插件重复派工。服务依赖本机 Paseo、云端公司库、网络与 GitHub 登录；Mac 合盖或关机时公司暂停。
 
 ## 老板入口
 
 三种方式等价，都会写入 `owner_command` 表，由调度器（或命令行本身）执行：
 
-1. **命令行**（在发布目录 `~/Library/Application Support/SurrealCKCompany/active` 下）：
+1. **命令行**（`sck owner` 从节点的 `bin/sck` 运行，可在任意目录执行；`pnpm run company` 在 main 检出目录下执行）：
 
    ```
    sck owner task.create '{"type":"software","title":"我要一个 B2C 商城"}'
@@ -34,7 +34,7 @@
    pnpm run company cost [任务ID] [--days N]
    ```
 
-2. **直接写 SurrealDB**（`sck_agent_company/control_plane`）：
+2. **直接写 SurrealDB**（云端公司库，生产默认 `company/main`）：
 
    ```sql
    CREATE owner_command CONTENT { kind: 'task.create', type: 'software', text: '我要一个 B2C 商城' };
@@ -93,7 +93,7 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME
 }
 ```
 
-`roles` 是可用 ops 工具的岗位（缺省 qa / engineering / product）；`accounts` 决定命名：用户名 `<prefix><别名小写>`、邮箱 `<用户名>@<emailDomain>`，新 workspace 的 slug 必须以 `workspacePrefix` 开头；`d1` 缺省则不能建/修账号；`data` 缺省则不能 `ops_query` 与列成员；`browser.bin` 指定 ego-browser 路径（缺省 `~/.local/bin/ego-browser`）；`ops` 缺省则没有运营通道，`ops_operator_login` 返回 `not_configured`。`ops.resource` 是产品运营 audience（IdP 运营 client 的 `access_token_audience` 与之对应）。 运营 client 由 IdP 的受管资源动态注册端点 `POST {issuer}/connect/mcp/register` 自助登记（公开 client、`token_endpoint_auth_method=none`、`scope=openid`），返回的 `client_id` 与 `resource` 填入此块；registration token 不入库。`idp.ops` 缺省则 `ops_login` 的 `audience:"ops"` 返回 `not_configured`：该块配置的公开客户端走 authorize（`resource`=`audience` 值）→ login → 回调 code → 直连 `POST {issuer}/token`（`client_id`+`code_verifier`，无 client_secret），不走产品 `/api/auth/token`；`idp.ops.audience` 即 IdP 侧该 client 的 `access_token_audience`（须等于产品运营 audience）。DCR 登记的运营 client 带 `consent_policy=require`：login 返回的是 IdP consent 页 URL，代理携 login 设置的 `user_session` cookie 自动 approve（IdP 审计 `oidc.authorization.consent.granted`），再跟随 302 拿到 code。自动批准只对 `ops.clientId`（公司自有运营 client）生效；其它 client 或 customer 通道遇到 consent 要求一律 `login_failed(consent_required)`，绝不自动同意。
+`roles` 是可用 ops 工具的岗位（缺省 qa / engineering / product）；`accounts` 决定命名：用户名 `<prefix><别名小写>`、邮箱 `<用户名>@<emailDomain>`，新 workspace 的 slug 必须以 `workspacePrefix` 开头；`d1` 缺省则不能建/修账号；`data` 缺省则不能 `ops_query` 与列成员；`browser.bin` 指定 ego-browser 路径（缺省 `~/.local/bin/ego-browser`）；`ops` 缺省则没有运营通道，`ops_operator_login` 返回 `not_configured`。`ops.resource` 是产品运营 audience（IdP 运营 client 的 `access_token_audience` 与之对应）。配置里 audience 与 `resource` 中的 `mcp` 是 IdP 上登记的资源标识，与已删除的 MCP 服务无关，不要改名。 运营 client 由 IdP 的受管资源动态注册端点 `POST {issuer}/connect/mcp/register` 自助登记（公开 client、`token_endpoint_auth_method=none`、`scope=openid`），返回的 `client_id` 与 `resource` 填入此块；registration token 不入库。`idp.ops` 缺省则 `ops_login` 的 `audience:"ops"` 返回 `not_configured`：该块配置的公开客户端走 authorize（`resource`=`audience` 值）→ login → 回调 code → 直连 `POST {issuer}/token`（`client_id`+`code_verifier`，无 client_secret），不走产品 `/api/auth/token`；`idp.ops.audience` 即 IdP 侧该 client 的 `access_token_audience`（须等于产品运营 audience）。DCR 登记的运营 client 带 `consent_policy=require`：login 返回的是 IdP consent 页 URL，代理携 login 设置的 `user_session` cookie 自动 approve（IdP 审计 `oidc.authorization.consent.granted`），再跟随 302 拿到 code。自动批准只对 `ops.clientId`（公司自有运营 client）生效；其它 client 或 customer 通道遇到 consent 要求一律 `login_failed(consent_required)`，绝不自动同意。
 
 控制措施：
 - **租约门**：每次调用由 `core.opsScope` 重新核验调用者的在手租约，项目取自任务所属目标；通道丢弃员工自带的 `taskId`，只用租约里的任务。任务所属目标没有关联项目返回 `invalid`，项目环境没配置运维代理返回 `not_configured`。
@@ -122,11 +122,11 @@ sck call company_cmd '{"command":"<命令名>","input":{...}}'
 - `company_cmd_catalog` 列出本员工当前能调用的命令，附参数说明（网关 `cmd.catalog`）。员工看不到三类命令：仅老板命令、保护清单里标为仅老板的命令、员工策略的禁止清单或允许清单之外的命令；员工已停用时列表为空。按目标锁定的命令仍会列出，并附锁定说明，命中即拒绝。老板看到全部命令。目录只说明能用什么，每次调用仍要过网关判定。命令说明集中在 `owner-end/src/command-catalog.ts`，老板端「运维」页的命令面板与之共用。
 - `company_cmd` 只在云端执行端可用。本机模式返回 `not_configured`，提示需要云端执行端。
 - 调用必须持有任务。无有效租约直接以 `no_lease` 拒绝，不换取令牌。调用以员工身份和当前租约任务换取网关令牌。请求顶层的 `taskId` 被丢弃；`input` 里点名的 `taskId`（可带 `task:` 前缀）与 `messageId` 必须属于当前租约任务，否则拒绝。
-- 执行端作业（如 `host.exec`、`company.release.install`）返回 pending 时，员工侧按作业号轮询，直到完成、失败或超过 15 分钟。员工只能取到自己发起的作业。
+- 执行端作业（如 `host.exec`）返回 pending 时，员工侧按作业号轮询，直到完成、失败或超过 15 分钟。员工只能取到自己发起的作业。
 - 每次调用（含被拒绝的和只读的）写一条审计。老板用 `guard.protect` 把命令加入保护清单（`ownerOnly` 缺省为仅老板），用 `agent.policy.set` 停用员工或设允许、禁止清单。
 - 令牌只在网关调用的局部变量里存在。返回与错误文本中出现的令牌一律替换，不写会话、comm 目录、证据或日志。
 
-**风险（待审阅者决定）。** 网关不区分调用方是否老板。除写死的 5 条仅老板命令、员工不可见的 `ops.job.list` 与 `audit.list`、保护清单与员工策略外，持有有效租约的员工可以调用其余全部命令；按目标锁定的命令只拒绝锁定的目标。这包括替老板作决定（`decide`、`approve`、`reject`；`approve` 会写入标为老板签署的人工验收证据）、代老板下指示（`instruct`、`direction.add`）、改路由与派工模板（`route.save`）、暂停全部派工（`task.pause`）、用老板的 Cloudflare 令牌调用未锁定的账号资源（`cf.api`），以及执行端命令（`host.exec`、`company.release.install`、`upgrade.*`、`task.create`）。执行端作业入队后，只有 `ops_*` 在认领时核对租约，其余作业即使租约已结束也会执行。上线前，老板应把这些命令加入保护清单，或由审阅者决定写死为仅老板。细节见 [owner-end 权限模型](../owner-end/README.md#权限模型)。
+**风险（待审阅者决定）。** 网关不区分调用方是否老板。除写死的 5 条仅老板命令、员工不可见的 `ops.job.list` 与 `audit.list`、保护清单与员工策略外，持有有效租约的员工可以调用其余全部命令；按目标锁定的命令只拒绝锁定的目标。这包括替老板作决定（`decide`、`approve`、`reject`；`approve` 会写入标为老板签署的人工验收证据）、代老板下指示（`instruct`、`direction.add`）、改路由与派工模板（`route.save`）、暂停全部派工（`task.pause`）、用老板的 Cloudflare 令牌调用未锁定的账号资源（`cf.api`），以及执行端命令（`host.exec`、`task.create`）。执行端作业入队后，只有 `ops_*` 在认领时核对租约，其余作业即使租约已结束也会执行。上线前，老板应把这些命令加入保护清单，或由审阅者决定写死为仅老板。细节见 [owner-end 权限模型](../owner-end/README.md#权限模型)。
 
 ## 员工编制（SurrealDB）
 
@@ -144,7 +144,7 @@ sck call company_cmd '{"command":"<命令名>","input":{...}}'
 
 - **绩效评分（0.5.0 已删除）**：`scorecard`、`record_score`、`get_model_evidence`、eval 岗位、每日 eval 批次与 Jev 评分均已删除，`eval_*`、`jev_*` 配置项同时失效。Jev 本身保留，用于通知分级与派工辅助。
 - **员工实例**：`employee` 表中带 `def` 的记录，由调度器按需生成；`paseo_agent_id` 登记实际会话，是实例身份的权威绑定。新实例的凭证不落盘——由插件 sidecar 在内存中代持，`spawn` 环境只注入 `SCK_COMM_DIR`/`SCK_COMM_KEY`；`claim`/续租/提交由 sidecar 以该凭证程序化执行，agent 进程拿不到也不认识它。`retired=true` 或凭证撤销后所有调用即 401，实例随会话关闭退役。同一定义连续 3 次异常会自动停用并通知老板。`pnpm run admin inst list` 查看。
-  旧的凭证文件会话（`credential_file` 非空的实例）继续按原方式收尾，但不再被通道代领新任务，自然淘汰。
+  0.7.0 起代码不再读取 `credential_file`，凭证文件模式已删除。没有内存凭证的旧实例不能再领取任务，会话关闭后自然退役。
 - 旧员工（gm-01 等）以 `admin bind <员工编号> <agentId> <def>` 挂到定义上，继续保留身份和历史。
 
 ## 任务成本
@@ -161,20 +161,20 @@ sck call company_cmd '{"command":"<命令名>","input":{...}}'
 工程员工在 ops 仓提交 code 任务时，服务先在其工作树上做只读检查，不通过直接退回原员工（租约保留，不派评审），审计记 `submit_check_failed`：
 
 - 改了 `src/`、`plugin/`、`scripts/` 时 `package.json` 版本必须高于 main，`plugin/package.json` 与 `company-release.json` 版本一致；
-- `src/mcp/server.ts` 注册的每个工具都接到 sidecar 分发与工具表；`package.json` 测试脚本里列的文件都存在；
+- 插件 sidecar（`plugin/server/sidecar.ts`）注册的每个工具都接到分发与工具表；`package.json` 测试脚本里列的文件都存在；
 - `tsc --noEmit` 无类型错误（服务自带编译器，在员工沙箱内运行；工作树缺依赖或编译器无法运行时放行，由评审把关）。
 
 `SCK_SUBMIT_CHECKS=0` 关闭。
 
 ## 管理工具（manage）
 
-老板（owner，`capabilities` 含 `manage`）除常规任务工具外，还可通过 MCP 工具面或 `sck call` 调用三个仅限 manage 能力的编制管理工具——全部写审计，不带凭证值：
+老板（owner，`capabilities` 含 `manage`）除常规任务工具外，还可通过 `sck call` 调用三个仅限 manage 能力的编制管理工具——全部写审计，不带凭证值：
 
 - `def_list`：只读列出全部 `employee_def`（`id`/`role`/`provider`/`model`/`thinking`/`tracks`/`enabled`/`max_instances`/`priority`/`weight`）。任何岗位可读（只要能力里有 manage 即可调用，不写库）；无 manage 能力的岗位调用返回 `forbidden`。
 - `def_ensure`：创建或更新 `employee_def`，复用 `workforce.upsertDef` 的校验与写入逻辑；`tracks` 传 `[]` 清轨、不传则不动；`enabled=false` 停用（覆盖退役/收轨诉求）。`role` 必须是合法 `Role`（screenwriter 上线后含它）。调用者必须有 manage 能力，写入同时落审计（`actor`、`action=def_ensure`、参数摘要）。
 - `project_disciplines_update`：只改写 `project.disciplines` 词表（名字唯一非空校验沿用 `ProjectStore`），不碰项目其它字段。调用者必须有 manage 能力，写入同时落审计（`actor`、`action=project_disciplines_update`、参数摘要）。
 
-三次写入的审计条目可查：`SELECT * FROM audit WHERE action IN ('def_ensure','project_disciplines_update') ORDER BY at DESC`。owner console 与 admin CLI 继续可用，与 MCP 管理工具并存。
+三次写入的审计条目可查：`SELECT * FROM audit WHERE action IN ('def_ensure','project_disciplines_update') ORDER BY at DESC`。owner console 与 admin CLI 继续可用。
 
 ## 在途任务验收要求追加（task_acceptance_amend）
 
@@ -182,13 +182,13 @@ sck call company_cmd '{"command":"<命令名>","input":{...}}'
 
 - 范围：只接受 `ready` / `doing` / `review` / `blocked`；`done` / `void` 返回 `conflict`。非 owner 一律返回 `forbidden`。
 - 只追加：不改 `state`、`blocked_to` / `resume_*`、依赖、`acceptance_criteria` / `acceptance_version`、独立性策略、worktree 与租约字段（持有人、delivery、fence、到期时间），不放宽验收机器项、独立验收、额度或依赖。任务版本也不移动——版本是持有人租约证明的一部分，移动会让持有人在通道心跳重新同步前（最多 60 秒）的 checkpoint/submit 撞上租约失效；`expectedVersion` 仍做 compare-and-set，读到过期任务即 `conflict`。
-- 落库：单事务把修订追加到 `task.context`——拼接在事务内由被锁的行算出（`$t.context + 修订块`），不在事务外读旧值再整体覆写；同一版本并发两次修订两条都落地（输的一方拿到可重试的写冲突后整笔重跑，重跑会读到对手的正文）。追加后总长上限 20000 字符（与创建时一致），超限整笔回滚并返回 `invalid`，检查也在同一事务内。审计 `action=acceptance_amend`（`evidence` 为 JSON：`ownerQuote` 逐字原话、`text`、`notify` 入参、`expectedVersion`）与 outbox 同事务写入。
+- 落库：单事务把修订追加到 `task.context`——拼接在事务内由被锁的行算出（`$t.context + 修订块`），不在事务外读旧值再整体覆写；同一版本并发两次修订两条都落地（输的一方拿到可重试的写冲突后整笔重跑，重跑会读到对手的正文）。追加后总长上限 20000 字符（与创建时一致），超限整笔回滚并返回 `invalid`，检查也在同一事务内。审计 `action=acceptance_amend`（`evidence` 为 JSON：`ownerQuote` 逐字原话、`text`、`notify` 入参、`expectedVersion`）与状态变更同事务写入。
 - 通知：`notify` 缺省为「当前活租约持有人 + 最近 submitter」去重；显式传入以传入为准，`[]` 表示不通知（审计照写）。每条通知是一行 `outbound_message`（step=notice），老板可在控制台预览/扣留；送达由调度器在下一次唤醒或回包补发，标记 sent 只在外部发送成功之后。
 - 幂等：同一 `idempotencyKey` 同载荷回放首次结果（不重复追加、不重复通知），异载荷 `conflict`。
 
 ## 任务输入上限
 
-任务的编排字段：`type`（路由键）、`parent`（链上前驱；未完成前子任务保持 `planned`）、`proposed_in`（提议来源 submit 审计）、`tag`（自由分组）、`requirement`/`acceptance_text`（task.md 的两节）。显式 `dependencies` 与 `goalId` 已退役：入参带它们返回 `invalid`（`goalId is retired; use tag`）。asset 类 `workIntent.paths` 至多 50 条、每条至多 300 字符，非 assets 不接受 paths。判定在 core 统一完成：超限返回结构化 `invalid`，任务/审计/outbox/幂等零写入。
+任务的编排字段：`type`（路由键）、`parent`（链上前驱；未完成前子任务保持 `planned`）、`proposed_in`（提议来源 submit 审计）、`tag`（自由分组）、`requirement`/`acceptance_text`（task.md 的两节）。显式 `dependencies` 与 `goalId` 已退役：入参带它们返回 `invalid`（`goalId is retired; use tag`）。asset 类 `workIntent.paths` 至多 50 条、每条至多 300 字符，非 assets 不接受 paths。判定在 core 统一完成：超限返回结构化 `invalid`，任务/审计/幂等零写入。
 
 ## 身份关联（identity_principal_set）
 
@@ -243,6 +243,8 @@ sck call company_cmd '{"command":"<命令名>","input":{...}}'
 ## 上线记录
 
 以下记录为历史事实。其中涉及绩效评分、模型排序、本机 magpie 与本机网关的条目已被 0.5.0 替代，仅保留原文供追溯。
+
+> 历史记录横幅：2026-09-28 至 2026-11-07 的条目记录 0.7.0 之前的 MCP 服务、`releases/` 快照与 `active` 链接，已被 0.7.0 取代，仅供追溯，其中的命令与路径不要照用。
 
 - 0.5.0（待上线）：删除本机 18779 模型网关，员工 Claude 会话直连 VPS magpie `https://data.maplayer.top/ofm`。员工会话的环境变量由插件在会话打开时注入：`ANTHROPIC_BASE_URL` 指向 VPS；`ANTHROPIC_AUTH_TOKEN` 取自服务目录 `private/magpie-remote.key`，该文件缺失或为空则拒绝启动员工会话，不静默直连；`x-magpie-session` 头为 `sck-<digest(任务:员工)>`；模型为 `group/sck-haiku`、`group/sck-sonnet`、`group/sck-opus`，按任务档位选择。配置经 `--settings` 私有文件加载（员工通信目录下 `.claude/settings.local.json`，权限 0600），因为用户全局 `settings.env` 会覆盖进程环境变量。story-author 与老板手动会话不注入。
   会话归因改为换任务即换会话，reuse 与 oneshot 两种策略都是：同一任务内的返工、复审接续原会话。升级前已存在、没有绑定任务的旧会话，在下次派工时换新会话，因为旧会话环境里仍是已停用的网关地址。

@@ -76,10 +76,9 @@ export function createOwnerApiFetch(opts: OwnerHttpOptions): (req: Request) => P
       await ownerReady;
       const ctx = {
         db: c.db, core: c.core as never, owner: c.owner ?? new OwnerDesk(c.db, opts.opsRepo),
-        workforce: c.workforce ?? new Workforce(c.db, ""),
+        workforce: c.workforce ?? new Workforce(c.db),
         messages: new OutboundMessageStore(c.db.db),
         opsRepo: opts.opsRepo ?? c.opsRepo,
-        upgrades: c.upgrades,
       };
       const result = await ownerApi(ctx, body, via);
       return json(result);

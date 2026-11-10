@@ -58,10 +58,10 @@ afterAll(async () => {
 });
 
 run('节点归属隔离：只管理本节点员工和租约，兼容节点可接管旧记录', async () => {
-  const a = new Workforce(dbA, '/unused', undefined, { id: 'native:a' });
-  const b = new Workforce(dbB, '/unused', undefined, { id: 'native:b' });
-  const legacy = new Workforce(dbA, '/unused', undefined, { id: 'paseo:legacy', adoptLegacy: true });
-  const admin = new Workforce(dbA, '/unused');
+  const a = new Workforce(dbA, undefined, { id: 'native:a' });
+  const b = new Workforce(dbB, undefined, { id: 'native:b' });
+  const legacy = new Workforce(dbA, undefined, { id: 'paseo:legacy', adoptLegacy: true });
+  const admin = new Workforce(dbA);
   await admin.upsertDef('ownership-fixture', { role: 'engineering', provider: 'factory-droid', model: 'fixture' });
   const def = (await admin.defs()).find(d => d.id === 'ownership-fixture')!;
   const ia = await a.spawnInst(def), ib = await b.spawnInst(def), old = await admin.spawnInst(def);

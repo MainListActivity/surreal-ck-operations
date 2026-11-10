@@ -5,8 +5,7 @@
 // 必须可重复执行：每个编制按固定 id 检查是否存在，已存在的整行不动（老板改过的值保留），只补缺的行。
 // 失败不留半成品的做法：不包整体事务（schema 本身就是多条语句、非原子）。每一步都幂等：
 // 中途失败后再次运行，迁移照常补齐，缺失的编制逐条补上，已写入的不会重复。
-import { join } from 'node:path';
-import { loadDatabaseConfig, serviceHome, type DatabaseConfig } from '../src/config.ts';
+import { loadDatabaseConfig, type DatabaseConfig } from '../src/config.ts';
 import { CompanyDatabase } from '../src/database.ts';
 import { SEED_DEFS } from '../src/seed.ts';
 import { Workforce } from '../src/workforce.ts';
@@ -17,8 +16,7 @@ import { CLOUD_ONLY_MESSAGE, migrateCompanySchema, reasonOf, type MigrateLog } f
  * 返回本次新写入的编制 id。
  */
 export async function seedInitialData(db: CompanyDatabase, log: MigrateLog): Promise<string[]> {
-  // credentialDir 只在绑定员工时使用，初始编制写入不涉及；这里传服务目录下的 credentials 占位即可。
-  const workforce = new Workforce(db, join(serviceHome(), 'credentials'));
+  const workforce = new Workforce(db);
   const existing = new Set((await workforce.defs()).map(def => def.id));
   const inserted: string[] = [];
   for (const def of SEED_DEFS) {

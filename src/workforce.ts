@@ -4,7 +4,6 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import type { Principal, RetirementKind, Role, TaskId, TaskKind } from './contracts.ts';
-import { hostIO } from './host-io.ts';
 import { ownerActionKey } from './dispatcher/dispatch-blocked.ts';
 import { asId, CompanyError, HASH, id, ROLES, view, type TaskRow } from './core.ts';
 import { LocalEnrollmentAdmin, revokedCredentialDigest } from './enrollment.ts';
@@ -12,7 +11,7 @@ import { gateCredentialChange } from './retirement.ts';
 import { acceptanceSubject, evaluateAcceptance, loadAcceptanceEvidence, loadAcceptanceGate, type AcceptanceTaskRow } from './acceptance.ts';
 /**
  * Root-level workforce and lease supervision for the local dispatcher and admin CLI.
- * Never hand this object to the MCP adapter.
+ * Never hand this object to the employee-facing sidecar tools.
  */
 export const PROVIDERS = ['codex', 'grok', 'devin'] as const;
 export type Provider = typeof PROVIDERS[number];
@@ -53,7 +52,6 @@ export interface EmployeeInst {
   thinking?: string;
   paseoAgentId?: string;
   activeTask?: string;
-  credentialFile?: string;
   /** Minted at spawnInst or re-issued by rotate(); held by the caller (plugin sidecar) only. */
   credential?: string;
   lastWakeAt?: number;
@@ -311,7 +309,7 @@ export class Workforce {
    * `retirementHook` is a test seam (SYS-DISP R1 race tests): it runs once the retirement decision has been read and before its
    * write, so a test can land a claim or takeover in exactly that window.
    */
-  constructor(private readonly database: CompanyDatabase, private readonly credentialDir: string,
+  constructor(private readonly database: CompanyDatabase,
     private readonly retirementHook?: (employeeId: string) => Promise<void>,
     private readonly runner?: { id: string; adoptLegacy?: boolean }) {
     this.enrollment = new LocalEnrollmentAdmin(database);
@@ -413,14 +411,14 @@ export class Workforce {
   // ---- employee instances ----
   async insts(): Promise<EmployeeInst[]> {
     type Row = { id: RecordId; role: Role; def?: RecordId; principal?: RecordId; provider?: string; model?: string; thinking?: string;
-      paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number; idle_since?: number; runtime_sleep_requested_at?: number;
+      paseo_agent_id?: string; active_task?: RecordId; last_wake_at?: number; idle_since?: number; runtime_sleep_requested_at?: number;
       v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; workspace_scope?: string; paseo_workspace?: string; wake_count?: number; lane?: string; last_task?: RecordId; last_phase?: 'execute' | 'review'; session_task?: string };
     const [rows] = await this.db.query<[Row[]]>(
       `SELECT * FROM employee WHERE revoked != true AND retired != true AND (def != NONE OR paseo_agent_id != NONE)${this.runner ? ' AND (runner_id = $runner OR ($legacy AND runner_id = NONE))' : ''} ORDER BY id;`,
       this.runner ? { runner: this.runner.id, legacy: this.runner.adoptLegacy === true } : {});
     return rows.map(r => ({ id: asId(r.id), role: r.role, def: r.def ? asId(r.def) : undefined, provider: r.provider,
       model: r.model, thinking: r.thinking, paseoAgentId: r.paseo_agent_id ?? undefined,
-      activeTask: r.active_task ? asId(r.active_task) : undefined, credentialFile: r.credential_file, lastWakeAt: r.last_wake_at, idleSince: r.idle_since, runtimeSleepRequestedAt: r.runtime_sleep_requested_at,
+      activeTask: r.active_task ? asId(r.active_task) : undefined, lastWakeAt: r.last_wake_at, idleSince: r.idle_since, runtimeSleepRequestedAt: r.runtime_sleep_requested_at,
       onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, repoHome: r.workspace_repo ?? undefined, workspaceScope: r.workspace_scope ?? undefined, paseoWorkspace: r.paseo_workspace ?? undefined, wakeCount: r.wake_count ?? 0,
       principal: r.principal ? asId(r.principal) : undefined,
       lane: r.lane ?? undefined, lastTask: r.last_task ? asId(r.last_task) : undefined, lastPhase: r.last_phase ?? undefined,
@@ -475,8 +473,7 @@ export class Workforce {
   }
 
   /** Creates an employee identity for a definition; the caller binds the Paseo agent once spawned.
-   *  The credential is returned in memory only — file delivery is the caller's choice
-   *  (writeCredentialFile for the legacy standalone dispatcher; plugin sidecar keeps it in RAM). */
+   *  The credential is returned in memory only (the plugin sidecar holds it in RAM). */
   /** `sessionTask` is written before the session is opened: model traffic is attributed by it from the first request. */
   async spawnInst(def: EmployeeDef, repoHome?: string, workspaceScope?: string, sessionTask?: string): Promise<EmployeeInst> {
     const employeeId = `${def.id}-${randomBytes(3).toString('hex')}`;
@@ -487,15 +484,6 @@ export class Workforce {
       thinking: def.thinking, repo_home: repoHome, scope: workspaceScope, session_task: sessionTask, runner: this.runner?.id,
     });
     return { repoHome, workspaceScope, id: employeeId, role: def.role, def: def.id, provider: def.provider, model: def.model, thinking: def.thinking, credential, sessionTask };
-  }
-
-  /** Legacy agent delivery: write the credential to a 600 file the agent's env can point at. */
-  writeCredentialFile(inst: EmployeeInst, credential: string): string {
-    const { fs, path } = hostIO();
-    fs.mkdirp(this.credentialDir, 0o700);
-    const credentialFile = path.join(this.credentialDir, `${inst.id}.token`);
-    fs.createText(credentialFile, credential, 0o600);
-    return credentialFile;
   }
 
   /** Re-issues the instance credential and returns it; the old one dies with the digest swap. */
@@ -510,12 +498,12 @@ export class Workforce {
     return token;
   }
 
-  async bind(employeeId: string, input: { agentId: string; def?: string; provider?: string; model?: string; thinking?: string; credentialFile?: string; cwd?: string; repoHome?: string; workspaceScope?: string; paseoWorkspace?: string }): Promise<void> {
+  async bind(employeeId: string, input: { agentId: string; def?: string; provider?: string; model?: string; thinking?: string; cwd?: string; repoHome?: string; workspaceScope?: string; paseoWorkspace?: string }): Promise<void> {
     const [rows] = await this.db.query<[unknown[]]>(`UPDATE $e MERGE {
       paseo_agent_id: $agent, def: $def ?? def, provider: $provider ?? provider, model: $model ?? model,
-      thinking: $thinking ?? thinking, credential_file: $file ?? credential_file, workspace_cwd: $cwd ?? workspace_cwd, workspace_repo: $repo_home ?? workspace_repo, workspace_scope: $scope ?? workspace_scope, paseo_workspace: $paseo_workspace ?? paseo_workspace, retired: false } RETURN AFTER;`, {
+      thinking: $thinking ?? thinking, workspace_cwd: $cwd ?? workspace_cwd, workspace_repo: $repo_home ?? workspace_repo, workspace_scope: $scope ?? workspace_scope, paseo_workspace: $paseo_workspace ?? paseo_workspace, retired: false } RETURN AFTER;`, {
       e: id('employee', employeeId), agent: input.agentId, def: input.def ? id('employee_def', input.def) : undefined,
-      provider: input.provider, model: input.model, thinking: input.thinking, file: input.credentialFile, cwd: input.cwd, repo_home: input.repoHome, scope: input.workspaceScope, paseo_workspace: input.paseoWorkspace,
+      provider: input.provider, model: input.model, thinking: input.thinking, cwd: input.cwd, repo_home: input.repoHome, scope: input.workspaceScope, paseo_workspace: input.paseoWorkspace,
     });
     if (!rows?.length) throw new CompanyError('not_found', 'Employee not found');
   }
@@ -741,8 +729,6 @@ export class Workforce {
         handover = true, previous_employee = $employee, version = $t.version + 1 RETURN AFTER;
       UPDATE employee SET active_task = NONE WHERE active_task = $task;
       CREATE audit CONTENT { task: $task, actor: $actor, action: 'revoked', evidence: $evidence, version: $next.version, at: time::now() };
-      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE outbox CONTENT { task: $task, kind: 'revoked', sequence: $sequence.value, payload: { employee: $employee, state: $next.state }, at: time::now() };
       COMMIT;`, { task: id('task', taskId), employee: employeeId, evidence, actor }).responses();
     return responses.every(r => r.success);
   }

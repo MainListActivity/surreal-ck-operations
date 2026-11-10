@@ -11,11 +11,9 @@ import { readJsonFile, reqDir, resDir, writeFileAtomic } from '../src/comm.ts';
 import type { ClaimResult, Credential, TaskView } from '../src/contracts.ts';
 import type { EmployeeInst, SupervisedTask } from '../src/workforce.ts';
 import { SidecarPool } from '../plugin/server/sidecar.ts';
-import { connectCompanyClient } from '../src/mcp/client';
-import { createMcpHttpService } from '../src/mcp/server';
 
 // SYS01 R8 (non-gm list_worktrees without a task is forbidden; the lease never stands in) and null-as-absent, on the
-// isolated company fork started by scripts/test-worktrees.ts. Real core, real MCP HTTP service, real sidecar pool.
+// isolated company fork started by scripts/test-worktrees.ts. Real core and real sidecar pool.
 // Never production: the fork is the only database this file touches.
 const config = { ...loadDatabaseConfig(), namespace: 'sck_agent_company_test', database: 'control_plane' };
 const database = new CompanyDatabase(config);
@@ -35,31 +33,12 @@ let core: SurrealCompanyCore;
 let base: string;
 let repo: string;
 let pool: SidecarPool;
-let service: ReturnType<typeof createMcpHttpService>;
-let mcpUrl: URL;
 let gmA: Credential, gmB: Credential, engA: Credential, engB: Credential, holderA: Credential, holderB: Credential, csH: Credential;
 const env: Record<string, { SCK_COMM_DIR: string; SCK_COMM_KEY: string }> = {};
 let taskA: TaskView, taskB: TaskView, taskQa: TaskView, queueA: TaskView, queueB: TaskView;
 let treeA = '', treeB = '';
-/** The lease holderA took from the queue (claim_next with no taskId), read back by the heartbeat test. */
-let holderLease: { taskId: string; deliveryId: string; fence: number; expectedVersion: number } | undefined;
 
 type Answer = { ok: boolean; code?: string; data?: unknown; error?: string; thrown?: string };
-
-/** One real MCP call over the HTTP service, as a caller sees it: the structured answer, or the transport failure. */
-async function viaMcp(credential: Credential, name: string, args: Record<string, unknown>): Promise<Answer> {
-  const connection = await connectCompanyClient({ url: mcpUrl, credential, clientName: 'null-absent-fork' });
-  try {
-    const answer = await connection.client.callTool({ name, arguments: args });
-    const body = answer.structuredContent as { ok?: boolean; code?: string; data?: unknown; error?: string } | undefined;
-    if (!body) return { ok: false, thrown: `no structured answer: ${JSON.stringify(answer.content).slice(0, 300)}` };
-    return { ok: body.ok === true, code: body.code, data: body.data, error: body.error };
-  } catch (error) {
-    return { ok: false, thrown: String(error) };
-  } finally {
-    await connection.close();
-  }
-}
 
 /** One real sidecar relay: the request file goes through the pool's sweeper and the pool's own dispatch to core. */
 let relaySeq = 0;
@@ -151,24 +130,17 @@ beforeAll(async () => {
   treeB = claimedB.worktree!.id;
   expect(treeA).not.toBe(treeB);
 
-  service = createMcpHttpService({ core, port: 0 });
-  mcpUrl = new URL(`http://127.0.0.1:${service.port}/mcp`);
 }, 600_000);
 
 afterAll(async () => {
   if (pool) pool.close();
-  if (service) await service.close();
   await database.close();
   if (base) rmSync(base, { recursive: true, force: true });
 });
 
-test('R8: a non-gm employee without taskId is forbidden on MCP, sidecar and core, with absent or null arguments alike', async () => {
+test('R8: a non-gm employee without taskId is forbidden on sidecar and core, with absent or null arguments alike', async () => {
   const unscoped: Array<Record<string, unknown>> = [{}, { taskId: null }, { pageSize: null, cursor: null }, { taskId: null, pageSize: null, cursor: null, includeReleased: null }];
   for (const args of unscoped) {
-    const mcp = await viaMcp(engA, 'list_worktrees', args);
-    expect(mcp.ok).toBe(false);
-    expect(mcp.code).toBe('forbidden');
-    expect(mcp.data).toBeUndefined();
     // The sidecar answers the same refusal; a null task id is not read as the task "null" (that would be not_found).
     const side = await viaSidecar(env.engA!, 'list_worktrees', args);
     expect(side.ok).toBe(false);
@@ -204,16 +176,8 @@ test('R8: the sidecar lease is not a fallback scope: an employee holding a live 
   expect(idsOf(scoped.data)).toContain(treeA);
 });
 
-test('explicit taskId: an authorized task reads the repository inventory, an unauthorized one is forbidden, a missing one is not_found, on all three layers', async () => {
+test('explicit taskId: an authorized task reads the repository inventory, an unauthorized one is forbidden, a missing one is not_found, on the sidecar and core layers', async () => {
   // Authorized: engA is the engineering executor of taskA. The answer is the repository's inventory (tree A is in it).
-  const mcpArray = await viaMcp(engA, 'list_worktrees', { taskId: taskA.id });
-  expect(mcpArray.ok).toBe(true);
-  expect(Array.isArray(mcpArray.data)).toBe(true);
-  expect(idsOf(mcpArray.data)).toContain(treeA);
-  const mcpPaged = await viaMcp(engA, 'list_worktrees', { taskId: taskA.id, pageSize: 5, cursor: null });
-  expect(mcpPaged.ok).toBe(true);
-  expect(pagedOf(mcpPaged.data).worktrees.map(w => w.id)).toContain(treeA);
-  expect(typeof pagedOf(mcpPaged.data).page.returned).toBe('number');
   const side = await viaSidecar(env.engA!, 'list_worktrees', { taskId: taskA.id, includeReleased: null });
   expect(side.ok).toBe(true);
   expect(idsOf(side.data)).toContain(treeA);
@@ -224,11 +188,6 @@ test('explicit taskId: an authorized task reads the repository inventory, an una
   expect(coreArray.map(w => w.id)).toContain(treeA);
 
   // Unauthorized: taskQa is an executor qa task, so an engineering caller has no role access to it.
-  const mcpDenied = await viaMcp(engA, 'list_worktrees', { taskId: taskQa.id });
-  expect(mcpDenied.code).toBe('forbidden');
-  expect(mcpDenied.data).toBeUndefined();
-  const mcpDeniedPaged = await viaMcp(engA, 'list_worktrees', { taskId: taskQa.id, pageSize: 5 });
-  expect(mcpDeniedPaged.code).toBe('forbidden');
   const sideDenied = await viaSidecar(env.engA!, 'list_worktrees', { taskId: taskQa.id });
   expect(sideDenied.ok).toBe(false);
   expect(sidecarCode(sideDenied)).toBe('forbidden');
@@ -238,21 +197,12 @@ test('explicit taskId: an authorized task reads the repository inventory, an una
 
   // Missing: a task id that names nothing is not_found, before any access rule is applied.
   const missing = `nul-missing-${suffix}`;
-  expect((await viaMcp(engA, 'list_worktrees', { taskId: missing })).code).toBe('not_found');
   expect(sidecarCode(await viaSidecar(env.engA!, 'list_worktrees', { taskId: missing }))).toBe('not_found');
   expect((await coreError(core.listWorktrees(engA, missing as never)))?.code).toBe('not_found');
 });
 
 test('gm global: no taskId is the repository inventory, and null is absent (an array, never a page)', async () => {
   // Global reads are gm-only and unchanged by R8: both of this fixture's trees are listed.
-  const mcp = await viaMcp(gmA, 'list_worktrees', {});
-  expect(mcp.ok).toBe(true);
-  expect(Array.isArray(mcp.data)).toBe(true);
-  expect(idsOf(mcp.data)).toEqual(expect.arrayContaining([treeA, treeB]));
-  const mcpNull = await viaMcp(gmA, 'list_worktrees', { taskId: null, includeReleased: null, pageSize: null, cursor: null });
-  expect(mcpNull.ok).toBe(true);
-  expect(Array.isArray(mcpNull.data)).toBe(true);
-  expect(mcpNull.data).toEqual(mcp.data);
   const side = await viaSidecar(env.gmA!, 'list_worktrees', {});
   const sideNull = await viaSidecar(env.gmA!, 'list_worktrees', { taskId: null, pageSize: null, cursor: null });
   expect(Array.isArray(side.data)).toBe(true);
@@ -266,77 +216,33 @@ test('gm global: no taskId is the repository inventory, and null is absent (an a
   expect(coreScoped.map(w => w.id)).toEqual(expect.arrayContaining([treeB]));
 });
 
-test('gm paging: pages walk every stored row once, the cursor is bound to the gm identity and to the query, and page sizes outside 1 to 100 are invalid', async () => {
-  // Traverse the global inventory one row at a time over MCP. Each page re-checks the caller.
-  const seen: string[] = [];
-  let args: Record<string, unknown> = { pageSize: 1 };
-  let pages = 0;
-  for (;;) {
-    const answer = await viaMcp(gmA, 'list_worktrees', args);
-    expect(answer.ok).toBe(true);
-    const body = pagedOf(answer.data);
-    expect(Array.isArray(body.worktrees)).toBe(true);
-    expect(body.page.returned).toBe(body.worktrees.length);
-    seen.push(...body.worktrees.map(w => w.id));
-    pages++;
-    if (!body.page.hasMore) break;
-    expect(typeof body.page.nextCursor).toBe('string');
-    args = { pageSize: 1, cursor: body.page.nextCursor };
-    if (pages > 500) throw new Error('paging did not finish');
-  }
-  expect(new Set(seen).size).toBe(seen.length);
-  expect(seen).toEqual(expect.arrayContaining([treeA, treeB]));
-
+test('gm paging: the cursor is bound to the gm identity, and page sizes outside 1 to 100 are invalid, on the sidecar and core', async () => {
   // The first page of gm A, its cursor, and a second gm: the cursor is refused for the other identity.
-  const first = pagedOf((await viaMcp(gmA, 'list_worktrees', { pageSize: 1 })).data);
+  const first = pagedOf(await core.worktreePage(gmA, { pageSize: 1 } as never));
   expect(first.page.hasMore).toBe(true);
   const cursor = first.page.nextCursor!;
-  const other = await viaMcp(gmB, 'list_worktrees', { pageSize: 1, cursor });
-  expect(other.ok).toBe(false);
-  expect(other.code).toBe('forbidden');
-  expect(other.error).toMatch(/cursor belongs to another caller/);
   expect((await coreError(core.worktreePage(gmB, { pageSize: 1, cursor } as never)))?.code).toBe('forbidden');
   expect(sidecarCode(await viaSidecar(env.gmB!, 'list_worktrees', { pageSize: 1, cursor }))).toBe('forbidden');
-  // The same cursor with another query (a task scope) is refused too.
-  const otherQuery = await viaMcp(gmA, 'list_worktrees', { taskId: taskA.id, pageSize: 1, cursor });
-  expect(otherQuery.code).toBe('forbidden');
-  expect(otherQuery.error).toMatch(/another query/);
-  // The owner of the cursor still reads the next page.
-  expect((await viaMcp(gmA, 'list_worktrees', { pageSize: 1, cursor })).ok).toBe(true);
 
   // Sidecar paged read, with a null cursor and taskId beside a real page size: the paged branch, unscoped.
   const sidePaged = await viaSidecar(env.gmA!, 'list_worktrees', { pageSize: 1, cursor: null, taskId: null });
   expect(sidePaged.ok).toBe(true);
   expect(pagedOf(sidePaged.data).page.returned).toBe(1);
 
-  // Page size bounds: 0 and 101 are refused as invalid on core and on the sidecar; the MCP schema refuses them too.
+  // Page size bounds: 0 and 101 are refused as invalid on core and on the sidecar.
   for (const size of [0, 101]) {
     expect((await coreError(core.worktreePage(gmA, { pageSize: size } as never)))?.code).toBe('invalid');
     const side = await viaSidecar(env.gmA!, 'list_worktrees', { pageSize: size });
     expect(side.ok).toBe(false);
     expect(sidecarCode(side)).toBe('invalid');
-    // The MCP schema refuses the size before the handler runs: an SDK input-validation error, with no structured answer.
-    // That is a refusal, but not the core's { code: "invalid" } body; the difference is reported, not papered over.
-    const mcp = await viaMcp(gmA, 'list_worktrees', { pageSize: size });
-    expect(mcp.ok).toBe(false);
-    expect(mcp.data).toBeUndefined();
-    expect(mcp.thrown).toMatch(/Input validation error.*pageSize/);
   }
 });
 
-test('get_context: null arguments are absent on MCP and on the sidecar, and a null page size keeps the complete answer', async () => {
+test('get_context: null arguments are absent on the sidecar, and a null page size keeps the complete answer', async () => {
   const nulls = { taskId: null, state: null, tag: null, role: null, since: null, includeCompany: null, fields: null, pageSize: null, cursor: null };
   const taskIdsOf = (data: unknown) => ((data as { tasks: Array<{ id: string }> }).tasks).map(task => String(task.id)).sort();
   const keysOf = (data: unknown) => Object.keys(data as object).sort();
   // holderB's working set holds this file's queue tasks (asset-production); the answer is the complete one, not a page.
-  const absent = await viaMcp(holderB, 'get_context', {});
-  const withNulls = await viaMcp(holderB, 'get_context', nulls);
-  expect(absent.ok).toBe(true);
-  expect(withNulls.ok).toBe(true);
-  expect(keysOf(withNulls.data)).toEqual(['companyIncluded', 'companyRead', 'principal', 'tasks']);
-  expect(keysOf(withNulls.data)).toEqual(keysOf(absent.data));
-  expect(taskIdsOf(withNulls.data)).toEqual(taskIdsOf(absent.data));
-  expect(taskIdsOf(withNulls.data)).toContain(queueB.id);
 
   const sideAbsent = await viaSidecar(env.holderB!, 'get_context', {});
   const sideNulls = await viaSidecar(env.holderB!, 'get_context', nulls);
@@ -344,30 +250,9 @@ test('get_context: null arguments are absent on MCP and on the sidecar, and a nu
   expect(keysOf(sideNulls.data)).toEqual(keysOf(sideAbsent.data));
   expect(taskIdsOf(sideNulls.data)).toEqual(taskIdsOf(sideAbsent.data));
   expect(taskIdsOf(sideNulls.data)).toContain(queueB.id);
-
-  // A real page size is the paged branch; a null page size or cursor beside it is not.
-  const paged = await viaMcp(holderB, 'get_context', { pageSize: 2, cursor: null, taskId: null });
-  expect(paged.ok).toBe(true);
-  expect(Object.keys(paged.data as object)).toContain('page');
-  expect(Object.keys(withNulls.data as object)).not.toContain('page');
 });
 
-test('get_task_history: null pageSize, cursor and an absent page are the same answer on MCP and on the sidecar; a null task id is refused', async () => {
-  const wholeAnswer = await viaMcp(gmA, 'get_task_history', { taskId: taskA.id });
-  const withNulls = await viaMcp(gmA, 'get_task_history', { taskId: taskA.id, pageSize: null, cursor: null });
-  expect(wholeAnswer.ok).toBe(true);
-  expect(Array.isArray(wholeAnswer.data)).toBe(true);
-  expect(withNulls.ok).toBe(true);
-  expect(withNulls.data).toEqual(wholeAnswer.data);
-  expect(Array.isArray(withNulls.data)).toBe(true);
-  // The paged form is { history, page }, and it is reached only by a real page size.
-  const paged = await viaMcp(gmA, 'get_task_history', { taskId: taskA.id, pageSize: 1 });
-  expect(paged.ok).toBe(true);
-  expect(Object.keys(paged.data as object).sort()).toEqual(['history', 'page']);
-  // A null task id is refused on MCP (the schema requires it) and on the sidecar (taskIdOf), never read as "null".
-  const nullTask = await viaMcp(gmA, 'get_task_history', { taskId: null });
-  expect(nullTask.ok).toBe(false);
-  expect(nullTask.data).toBeUndefined();
+test('get_task_history: null pageSize and cursor are the same answer as absent on the sidecar; a null task id is refused', async () => {
   const sideAbsent = await viaSidecar(env.gmA!, 'get_task_history', { taskId: taskA.id });
   const sideNulls = await viaSidecar(env.gmA!, 'get_task_history', { taskId: taskA.id, pageSize: null, cursor: null });
   expect(sideNulls.data).toEqual(sideAbsent.data);
@@ -378,21 +263,7 @@ test('get_task_history: null pageSize, cursor and an absent page are the same an
   expect(sideNullTask.error).not.toMatch(/Task not found/);
 });
 
-test('claim_next: an absent and a null taskId both take the queue path on MCP; the sidecar never claims from the queue', async () => {
-  // The shared queue may hold other fixtures' tasks, so the claims are checked by what they prove, not by which task wins.
-  const absent = await viaMcp(holderA, 'claim_next', {});
-  expect(absent.ok).toBe(true);
-  const absentClaim = absent.data as { deliveryId: string; fence: number; task: { id: string; version: number; state: string; currentEmployee?: string } };
-  expect(absentClaim.task.state).toBe('doing');
-  expect(absentClaim.task.currentEmployee).toBe(ids.holderA);
-  holderLease = { taskId: absentClaim.task.id, deliveryId: absentClaim.deliveryId, fence: absentClaim.fence, expectedVersion: absentClaim.task.version };
-  // A null taskId is the queue path too: a "null" task id would be not_found, so this claim proves the null was absent.
-  const nulled = await viaMcp(holderB, 'claim_next', { taskId: null });
-  expect(nulled.ok).toBe(true);
-  const nulledClaim = nulled.data as { task: { id: string; state: string; currentEmployee?: string } };
-  expect(nulledClaim.task.state).toBe('doing');
-  expect(nulledClaim.task.currentEmployee).toBe(ids.holderB);
-  expect(nulledClaim.task.id).not.toBe(absentClaim.task.id);
+test('claim_next: the sidecar never claims from the queue, with absent and null taskId alike', async () => {
   // The sidecar channel never claims for the employee: the dispatcher does. Absent and null are refused alike.
   for (const args of [{}, { taskId: null }]) {
     const side = await viaSidecar(env.holderA!, 'claim_next', args);
@@ -401,26 +272,7 @@ test('claim_next: an absent and a null taskId both take the queue path on MCP; t
   }
 });
 
-test('heartbeat: null arguments beside the lease fields change nothing; a null required field is refused like a missing one', async () => {
-  // holderA's lease is the one the claim_next test took from the queue; the proof is that claim's own answer.
-  expect(holderLease).toBeDefined();
-  const proof = { ...holderLease! };
-  const leased = await core.getTask(holderA, proof.taskId as never);
-  expect(leased.currentEmployee).toBe(ids.holderA);
-
-  const plain = await viaMcp(holderA, 'heartbeat', proof);
-  expect(plain.ok).toBe(true);
-  const beatPlain = plain.data as { deliveryId: string; fence: number; task: { version: number } };
-  const withNulls = await viaMcp(holderA, 'heartbeat', { ...proof, expectedVersion: beatPlain.task.version, pageSize: null, cursor: null });
-  expect(withNulls.ok).toBe(true);
-  const beatNulls = withNulls.data as { deliveryId: string; fence: number };
-  expect(beatNulls.deliveryId).toBe(beatPlain.deliveryId);
-  expect(beatNulls.fence).toBe(beatPlain.fence);
-  expect(Object.keys(withNulls.data as object)).not.toContain('page');
-  // A null required field is refused, exactly as a missing one is.
-  const nullDelivery = await viaMcp(holderA, 'heartbeat', { ...proof, deliveryId: null });
-  expect(nullDelivery.ok).toBe(false);
-  expect(nullDelivery.data).toBeUndefined();
+test('heartbeat: the sidecar keepalive answers absent and null arguments alike', async () => {
   // The sidecar heartbeat is a keepalive answer that the sidecar owns; absent and null give the same answer.
   expect(await viaSidecar(env.holderA!, 'heartbeat', {})).toEqual(await viaSidecar(env.holderA!, 'heartbeat', { pageSize: null, cursor: null }));
 });

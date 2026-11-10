@@ -17,9 +17,9 @@ import type { ClaimResult, LeaseProof } from '../src/contracts.ts';
 import { RESPONSE_BUDGET_BYTES, answerBytes, guardRelayResponse } from '../src/response-budget.ts';
 
 const run = process.env.RUN_SCK_CHANNEL_FORK_TESTS === '1' ? test : test.skip;
-const CLIENT_CLI = join(import.meta.dir, '..', 'src', 'mcp', 'client-cli.ts');
+const CLIENT_CLI = join(import.meta.dir, '..', 'src', 'sck-cli.ts');
 
-/** Exercise the same comm path a real `sck call` uses: a separate client-cli process writes req and reads res. */
+/** Exercise the same comm path a real `sck call` uses: a separate sck-cli process writes req and reads res. */
 async function relayViaClient(env: Record<string, string>, tool: string, args: Record<string, unknown> = {}) {
   // Spawn asynchronously: the sidecar sweeper lives in this same Bun process, so a blocking
   // spawnSync would prevent it from answering the child client.
@@ -52,7 +52,7 @@ run('company fork: restart quarantine, actual lease fencing, fresh dispatch and 
     const core = new SurrealCompanyCore(db), enrollment = new LocalEnrollmentAdmin(db), owner = new OwnerDesk(db);
     const gm = await enrollment.enroll('fixture-manager', 'owner', ['execute', 'review', 'manage']);
     await db.db.upsert(new RecordId('company_meta', 'config')).content({ jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
-    const wf = new Workforce(db, join(dir, 'unused-credential-files'));
+    const wf = new Workforce(db);
     await wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
     const minted = new Map<string, string>();
     const originalSpawn = wf.spawnInst.bind(wf);
@@ -137,7 +137,7 @@ run('company fork: two rounds, A implements, B returns, A reworks, B re-reviews;
     const core = new SurrealCompanyCore(db), enrollment = new LocalEnrollmentAdmin(db), owner = new OwnerDesk(db);
     const gm = await enrollment.enroll('fixture-manager', 'owner', ['execute', 'review', 'manage']);
     await db.db.upsert(new RecordId('company_meta', 'config')).content({ jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
-    const wf = new Workforce(db, join(dir, 'unused-credential-files'));
+    const wf = new Workforce(db);
     // Two seats of one engineering def: the implementer takes one, and the independent reviewer keeps the other (R1).
     await wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 2 });
     const minted = new Map<string, string>();
@@ -218,7 +218,7 @@ async function startCompanyFork(name: string, tempRoot = tmpdir()) {
   const core = new SurrealCompanyCore(db), enrollment = new LocalEnrollmentAdmin(db), owner = new OwnerDesk(db);
   const gm = await enrollment.enroll('fixture-manager', 'owner', ['execute', 'review', 'manage']);
   await db.db.upsert(new RecordId('company_meta', 'config')).content({ jev_decisions: false, quota_floor_pct: 0, quota_weekly_floor_pct: 0, session_max_wakes: 0, session_max_input_k: 0 });
-  const wf = new Workforce(db, join(dir, 'unused-credential-files'));
+  const wf = new Workforce(db);
   const agentRows = new Map<string, { id: string; status: string }>();
   const errors = new Map<string, string>();
   const envs = new Map<string, Record<string, string>>();

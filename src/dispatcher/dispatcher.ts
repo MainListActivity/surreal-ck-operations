@@ -289,7 +289,6 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       (!p.qualificationOnly && !ready(inst) ? notReady(p.states.get(inst.id), inst.provider ?? '') : undefined) ??
       (!p.qualificationOnly && p.assigned?.has(inst.id) ? ['assigned', BLOCK_TEXT.assigned] : undefined) ??
       (!p.qualificationOnly && p.holding.has(inst.id) ? ['held', BLOCK_TEXT.held] : undefined) ??
-      (p.sidecar && inst.credentialFile ? ['credential_file', BLOCK_TEXT.credential_file] : undefined) ??
       (!trackOk(p.task, def?.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (!currentModel(inst) ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
       capHit(inst.provider ?? '', def?.quotaLimited === false, managedModel(def));
@@ -309,7 +308,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     // sessions wait for review. maxRunning still bounds what actually runs on the host.
     const waiting = (i: EmployeeInst) => ['idle', 'sleeping'].includes(p.states.get(i.id) ?? '') && !p.holding.has(i.id) && !p.assigned?.has(i.id);
     const seats = p.insts.filter(i => i.def === def.id && (i.repoHome ?? i.cwd ?? p.opsRepo) === p.home &&
-      inWorkspace(i) && !(p.sidecar && i.credentialFile) && !waiting(i)).length;
+      inWorkspace(i) && !waiting(i)).length;
     const hit: Block | undefined =
       (!def.enabled ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
       (!trackOk(p.task, def.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
@@ -436,11 +435,11 @@ export interface DispatcherDeps {
   /** Current "<provider>:<family>" → model id resolution for defs using `auto:<family>`; the Paseo plugin refreshes it. */
   models?: () => Promise<ModelSlots>;
   /**
-   * Plugin sidecar mode: when set, the dispatcher never hands credentials to
-   * agents. The bridge injects comm env at spawn, claims tasks on the
-   * instance's behalf, and records the agentId↔instance binding.
+   * The plugin sidecar. The dispatcher never hands credentials to agents: the bridge injects
+   * comm env at spawn, claims tasks on the instance's behalf, and records the agentId↔instance binding.
+   * Without it no employee session is started or woken (see assign).
    */
-  sidecar?: SidecarBridge;
+  sidecar: SidecarBridge;
   /**
    * Host free-resource probe (memory + disk in MB). When provided, ticks below the
    * configured floors skip the whole dispatch pass; absent or throwing = no gate.
@@ -640,7 +639,7 @@ export async function snapshotOf(p: PassInputs, opts: SnapshotOpts,
 }
 
 /** Permanent reasons: only an owner edit (task, roster, def) can clear them, so the candidate never appears in the employee's next rows. */
-const BOARD_NEVER = new Set<BlockCode>(['prior_submitter', 'track_mismatch', 'def_disabled', 'credential_file']);
+const BOARD_NEVER = new Set<BlockCode>(['prior_submitter', 'track_mismatch', 'def_disabled']);
 /** Pass-wide gates: the whole queue waits on them, so each item reads the gate rather than its candidates. */
 const BOARD_GATES = new Set<BlockCode>(['paused', 'budget', 'resources', 'memory_pressure', 'disk_space', 'max_running']);
 /** Codes a holder meets because its own lease is still open: the item is ready and waits for that lease to end. */
@@ -1073,7 +1072,7 @@ export class Dispatcher {
         if (await this.retireGated(inst, 'spawn did not bind a Paseo agent', 'failure', report)) report.retired.push(inst.id);
         continue;
       }
-      if (this.deps.sidecar && !inst.credentialFile && !this.deps.sidecar.canReuse(inst)) {
+      if (this.deps.sidecar && !this.deps.sidecar.canReuse(inst)) {
         // Infrastructure failure, not a model/provider or employee performance failure.
         // An archived session also loses its launch binding; the Paseo-reported archived
         // status is the trusted structured normal-end signal (FV06) — only a live
@@ -1267,14 +1266,10 @@ export class Dispatcher {
       for (const inst of insts) {
         if (!rotationSafe) break;
         if (report.retired.includes(inst.id) || states.get(inst.id) !== 'idle' || holding.has(inst.id) || bound.has(inst.id) || !inst.paseoAgentId) continue;
-        // Sidecar mode: a credential-file instance can never take new work (the pool
-        // refuses to claim for it), so an idle one only wastes a provider seat and
-        // misleads Jev's staffing picks. Retire it on sight.
-        const legacyEol = Boolean(this.deps.sidecar && inst.credentialFile);
         const maxWakes = cfg.sessionMaxWakesByRole?.[inst.role] ?? cfg.sessionMaxWakes;
         const overWakes = maxWakes > 0 && (inst.wakeCount ?? 0) >= maxWakes;
         let inputK = 0;
-        if (!legacyEol && !overWakes && cfg.sessionMaxInputK > 0 && (inst.wakeCount ?? 0) >= 3 && inspected < 8) {
+        if (!overWakes && cfg.sessionMaxInputK > 0 && (inst.wakeCount ?? 0) >= 3 && inspected < 8) {
           inspected++;
           inputK = ((await paseo.lastInputTokens(inst.paseoAgentId!).catch(() => undefined)) ?? 0) / 1000;
         }
@@ -1317,9 +1312,8 @@ export class Dispatcher {
           }
           continue;
         }
-        if (!legacyEol && !overWakes && !(cfg.sessionMaxInputK > 0 && inputK > cfg.sessionMaxInputK)) continue;
-        const reason = legacyEol ? '通道轮换：凭证文件实例在 sidecar 模式下不可再接任务'
-          : overWakes ? `会话轮换：已派工 ${inst.wakeCount} 轮` : `会话轮换：上一轮 input ${Math.round(inputK)}k tokens`;
+        if (!overWakes && !(cfg.sessionMaxInputK > 0 && inputK > cfg.sessionMaxInputK)) continue;
+        const reason = overWakes ? `会话轮换：已派工 ${inst.wakeCount} 轮` : `会话轮换：上一轮 input ${Math.round(inputK)}k tokens`;
         if (!await this.retireGated(inst, reason, 'rotation', report)) continue;
         await paseo.archive(inst.paseoAgentId!).catch(() => undefined);
         await this.archiveInstScene(inst);
@@ -1681,6 +1675,8 @@ export class Dispatcher {
     hooks?: AssignHooks,
   ): Promise<(EmployeeInst & { spawned: boolean }) | undefined> {
     const { workforce: wf, paseo, env, sidecar } = this.deps;
+    // No sidecar, no employee session: nothing is woken, claimed or spawned. Same outcome as a lost claim.
+    if (!sidecar) return undefined;
     const stepFor = (claim?: ClaimResult): MessageStep => task?.state === 'review' ? 'review'
       : claim?.history?.some(h => h.action === 'return' || h.action === 'owner_reject') ? 'rework' : 'execute';
     const nextStep = async (claim?: ClaimResult): Promise<MessageStep> => {
@@ -1691,7 +1687,7 @@ export class Dispatcher {
     // Both the reuse and spawn paths share this gate; the post-claim read stays as a backstop.
     const preStep = await nextStep(undefined);
     if (task && await this.heldMessage(task.id, preStep, report)) return undefined;
-    if (task && sidecar) {
+    if (task) {
       const deny = this.taskDeny.get(task.id);
       if (deny && deny.version === task.version && Date.now() - deny.at < CLAIM_DENY_COOLDOWN_MS) return undefined;
     }
@@ -1704,11 +1700,9 @@ export class Dispatcher {
     // A session continuing its own work keeps it: its context is why it was picked.
     const continuing = candidate !== undefined && (await wf.config()).sessionPolicy === 'oneshot';
     const picked = !continuing && candidate?.provider !== FACTORY_PROVIDER && defsOrdered.some(d=>d.provider===FACTORY_PROVIDER) ? undefined : candidate;
-    // A legacy credential-file session can't be sidecar-claimed for new work; let
-    // it finish what it holds and fall through to spawning a comm-mode instance.
-    const pending = sidecar && picked && !picked.paseoAgentId ? picked : undefined;
+    const pending = picked && !picked.paseoAgentId ? picked : undefined;
     if (pending) defsOrdered = (await wf.defs()).filter(d => d.id === pending.def && d.enabled);
-    const existing = picked?.paseoAgentId && !(sidecar && task && picked.credentialFile) && (!sidecar || sidecar.canReuse(picked)) ? picked : undefined;
+    const existing = picked?.paseoAgentId && sidecar.canReuse(picked) ? picked : undefined;
     // A message still waiting for its translation is skipped before any lease: no claim churn, no notice. The employee's language is
     // aligned first: a message that never had one queues no translation, so the wait would never end.
     if (task && existing) {
@@ -1801,9 +1795,9 @@ export class Dispatcher {
       let workspace: WorktreeAssignment | undefined;
       try {
         await hooks?.beforeClaim?.(inst);
-        spawnEnv = sidecar ? sidecar.env(inst) : { SCK_EMPLOYEE_CREDENTIAL_FILE: wf.writeCredentialFile(inst, inst.credential!) };
-        claim = sidecar && task ? await sidecar.claim(inst, task) : undefined;
-        if (sidecar && !task) workspace = await sidecar.readWorkspace?.(inst, anchor?.task?.id, anchor?.project);
+        spawnEnv = sidecar.env(inst);
+        claim = task ? await sidecar.claim(inst, task) : undefined;
+        if (!task) workspace = await sidecar.readWorkspace?.(inst, anchor?.task?.id, anchor?.project);
       }
       catch (error) {
         if (await this.retireGated(inst, 'allocation unavailable', 'failure', report)) {

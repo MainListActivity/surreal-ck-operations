@@ -20,7 +20,7 @@ const NS = 'sck_agent_company_test_plugin_runtime';
 const database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
 setDefaultTimeout(180_000);
 const credDir = mkdtempSync(join(tmpdir(), 'sck-plugin-runtime-'));
-const workforce = new Workforce(database, credDir);
+const workforce = new Workforce(database);
 const enrollment = new LocalEnrollmentAdmin(database);
 const core = new SurrealCompanyCore(database, { workforce });
 const tokens: Record<string, string> = {};

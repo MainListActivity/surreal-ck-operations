@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, expect, setDefaultTimeout, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
 import { loadDatabaseConfig } from '../src/config.ts';
 import { CompanyDatabase } from '../src/database.ts';
@@ -7,7 +9,6 @@ import { CompanyError, SurrealCompanyCore, asId, id } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
 import type { LeaseProof } from '../src/contracts.ts';
-import type { OutboxEvent } from '../src/contracts.ts';
 
 const database = new CompanyDatabase({
   ...loadDatabaseConfig(),
@@ -35,18 +36,6 @@ beforeAll(async () => {
 });
 
 afterAll(async () => { await database.close(); });
-
-async function allOutbox(): Promise<OutboxEvent[]> {
-  const rows: OutboxEvent[] = [];
-  let after: string | undefined;
-  for (let page = 0; page < 100; page++) {
-    const batch = await core.listOutbox(gm, after);
-    if (batch.length === 0) return rows;
-    rows.push(...batch);
-    after = batch.at(-1)!.id;
-  }
-  throw new Error('Outbox pagination exceeded test safety bound');
-}
 
 test('real DB: bootstrap, identity, concurrent claim, fencing, idempotency, independent review', async () => {
   expect((await core.authenticate(gm)).role).toBe('owner');
@@ -95,10 +84,6 @@ test('real DB: bootstrap, identity, concurrent claim, fencing, idempotency, inde
     text: 'Synthetic delivery with durable evidence and idempotency.', idempotencyKey: `submit-${suffix}`,
   });
   expect(replay.version).toBe(delivered.version);
-  const [submitEvents] = await database.db.query<[Array<{ id: RecordId }>]>(
-    "SELECT * FROM outbox WHERE task = $task AND kind = 'submit';", { task: new RecordId('task', first.id) }
-  );
-  expect(submitEvents).toHaveLength(1);
   await expect(core.claim(winningToken, first.id)).rejects.toMatchObject({ code: 'self_review' });
   const review = await core.claim(qa, first.id);
   const accepted = await core.accept(qa, { taskId: first.id, deliveryId: review.deliveryId,
@@ -106,7 +91,6 @@ test('real DB: bootstrap, identity, concurrent claim, fencing, idempotency, inde
     text: 'Independent review accepted integration evidence.', idempotencyKey: `accept-${suffix}`,
   });
   expect(accepted.state).toBe('done');
-  expect((await allOutbox()).some(e => e.taskId === first.id && e.kind === 'accept')).toBe(true);
   expect(otherClaim.task.state).toBe('doing');
 });
 
@@ -166,7 +150,7 @@ test('real DB: expired lease fences old writer, dependencies and blocked recover
   await expect(core.authenticate(engC)).rejects.toBeInstanceOf(CompanyError);
 });
 
-test('real DB: heartbeat, one active task, return and outbox cursor', async () => {
+test('real DB: heartbeat, one active task and return', async () => {
   await expect(core.createTask(engE, {
     title: 'Forbidden task', context: 'A normal worker cannot create tasks.',
     executorRole: 'owner', reviewerRole: 'qa', idempotencyKey: `forbidden-${suffix}`,
@@ -198,51 +182,6 @@ test('real DB: heartbeat, one active task, return and outbox cursor', async () =
   expect(returned.state).toBe('ready');
   const secondClaim = await core.claim(engE, two.id);
   expect(secondClaim.task.state).toBe('doing');
-  const events = await allOutbox();
-  const cursor = events.findIndex(event => event.taskId === one.id);
-  expect(cursor).toBeGreaterThanOrEqual(0);
-  const after = await core.listOutbox(gm, events[cursor]!.id);
-  expect(after.every(event => event.id !== events[cursor]!.id)).toBe(true);
-});
-
-test('real DB: persisted outbox pagination beyond 1000 and concurrent append stays reachable', async () => {
-  const seed = await core.createTask(gm, {
-    title: `Outbox page seed ${suffix}`, context: 'Synthetic outbox pagination in isolated company database.',
-    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `page-seed-${suffix}`,
-  });
-  const [counter] = await database.db.query<[{ value: number }]>(
-    'SELECT * FROM ONLY company_meta:outbox_counter;'
-  );
-  const count = 1005;
-  const rows = Array.from({ length: count }, (_, index) => ({
-    id: new RecordId('outbox', `page-${suffix}-${index}`),
-    sequence: counter.value + index + 1,
-    task: new RecordId('task', seed.id),
-    kind: 'test-page', payload: { index }, at: new Date(),
-  }));
-  const responses = await database.db.query(
-    'BEGIN; UPDATE ONLY company_meta:outbox_counter SET value += $count; INSERT INTO outbox $rows; COMMIT;',
-    { count, rows }
-  ).responses();
-  expect(responses.every(response => response.success)).toBe(true);
-  const first = await core.listOutbox(gm);
-  expect(first).toHaveLength(1000);
-  const appended = await core.createTask(gm, {
-    title: `Outbox appended task ${suffix}`, context: 'Event written after first outbox page was read.',
-    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `page-append-${suffix}`,
-  });
-  const seen = [...first];
-  let cursor = first.at(-1)!.id;
-  for (let page = 0; page < 30; page++) {
-    const next = await core.listOutbox(gm, cursor);
-    if (next.length === 0) break;
-    expect(next[0]!.sequence).toBeGreaterThan(seen.at(-1)!.sequence);
-    seen.push(...next);
-    cursor = next.at(-1)!.id;
-  }
-  expect(seen.filter(event => event.kind === 'test-page' && event.taskId === seed.id)).toHaveLength(count);
-  expect(seen.some(event => event.taskId === appended.id && event.kind === 'created')).toBe(true);
-  expect(new Set(seen.map(event => event.sequence)).size).toBe(seen.length);
 });
 
 test('real DB: different tasks can be claimed concurrently by same-role workers', async () => {
@@ -255,8 +194,6 @@ test('real DB: different tasks can be claimed concurrently by same-role workers'
   const claims = await Promise.all([core.claim(engF, a.id), core.claim(engG, b.id)]);
   expect(claims.map(claim => claim.task.state)).toEqual(['doing', 'doing']);
   expect(claims[0]!.task.currentEmployee).not.toBe(claims[1]!.task.currentEmployee);
-  const events = await allOutbox();
-  expect(events.every((event, index) => index === 0 || event.sequence > events[index - 1]!.sequence)).toBe(true);
 });
 
 test('real DB: retire_task voids work, unblocks dependents, idempotent, releases leases', async () => {
@@ -425,4 +362,34 @@ test('real DB: retire_task voids work, unblocks dependents, idempotent, releases
     expect(r1.value.state).toBe('void');
     expect(r2.value.version).toBe(r1.value.version);
   }
+});
+
+test('real DB: bootstrap leaves no outbox table or counter, and task writes do not recreate them', async () => {
+  // bootstrap 每次都按 001–062 应用结构，062 之后库里不该再有 outbox 表与计数器。
+  const created = await core.createTask(gm, {
+    title: `Outbox gone ${suffix}`, context: 'A task write after 0.7.1 must not recreate the outbox table.',
+    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `outbox-gone-${suffix}`,
+  });
+  const claimant = await enrollment.enroll(`test-outbox-${suffix}`, 'engineering', ['execute', 'review']);
+  await core.claim(claimant, created.id);
+  const [info] = await database.db.query<[{ tables: Record<string, unknown> }]>('INFO FOR DB;');
+  expect(Object.keys(info.tables)).not.toContain('outbox');
+  const [counter] = await database.db.query<[unknown]>('SELECT * FROM ONLY company_meta:outbox_counter;');
+  expect(counter).toBeFalsy();
+});
+
+test('real DB: 062 drops a leftover 0.7.0 outbox table, its index and counter; rerunning is harmless', async () => {
+  // 0.7.0 库的形状：outbox 表（含一条旧事件）、outbox_sequence 索引、company_meta:outbox_counter。
+  await database.db.query(`DEFINE TABLE IF NOT EXISTS outbox SCHEMALESS PERMISSIONS NONE;
+    DEFINE INDEX IF NOT EXISTS outbox_sequence ON TABLE outbox FIELDS sequence UNIQUE;
+    CREATE outbox CONTENT { at: 1, sequence: 1, kind: 'legacy' };
+    UPSERT company_meta:outbox_counter CONTENT { value: 1 };`);
+  const drop = readFileSync(join(import.meta.dir, '../schema/062-drop-outbox.surql'), 'utf8');
+  await database.db.query(drop);
+  const [info] = await database.db.query<[{ tables: Record<string, unknown> }]>('INFO FOR DB;');
+  expect(Object.keys(info.tables)).not.toContain('outbox');
+  const [counter] = await database.db.query<[unknown]>('SELECT * FROM ONLY company_meta:outbox_counter;');
+  expect(counter).toBeFalsy();
+  // 再执行一次不报错（IF EXISTS 与删除不存在的计数器都是空操作）。
+  await database.db.query(drop);
 });

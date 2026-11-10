@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { Surreal } from 'surrealdb';
 import type { DatabaseConfig } from '../src/config.ts';
 import { connectDb, useDb, type DbTarget } from '../src/db-connection.ts';
-import { renderCompanyAccess } from '../src/database.ts';
+import { CLOUD_SCHEMA_VERSION, renderCompanyAccess } from '../src/database.ts';
 import { SEED_DEFS } from '../src/seed.ts';
 import { runCompanyMigrate } from '../scripts/company-migrate.ts';
 import { runCloudBootstrap } from '../scripts/cloud-bootstrap.ts';
@@ -28,6 +28,7 @@ const CLIENT_SECRET = 'cloud-migrate-client-secret-fixture-only';
 const HS_STAND_IN_SECRET = 'cloud-migrate-hs512-standin-fixture-only-0123456789';
 const MIGRATE_NS = 'cloud_migrate_fixture';
 const BOOT_NS = 'cloud_bootstrap_fixture';
+const LEGACY_NS = 'cloud_outbox_drop_fixture';
 const DATABASE = 'main';
 const ACCESS_NAMES = ['owner', 'runner', 'automation', 'gateway', 'migrator', 'viewer'];
 
@@ -157,7 +158,7 @@ beforeAll(async () => {
   }
 
   // 空的 ns/db 由 root 建好；首次登录前 055 尚未应用，所以先定义同名的 HS512 migrator 访问（测试替身）。
-  for (const namespace of [MIGRATE_NS, BOOT_NS]) {
+  for (const namespace of [MIGRATE_NS, BOOT_NS, LEGACY_NS]) {
     const admin = new Surreal();
     await connectDb(admin, rootTarget(namespace));
     await admin.query(`DEFINE NAMESPACE ${namespace};`);
@@ -181,7 +182,7 @@ afterAll(async () => {
   }
 });
 
-run('空库上 company-migrate 应用全部 schema 到版本 57；再次运行结果不变（幂等）', async () => {
+run('空库上 company-migrate 应用全部 schema 到 CLOUD_SCHEMA_VERSION；再次运行结果不变（幂等）', async () => {
   scope = { ns: MIGRATE_NS, db: DATABASE };
   const firstLines: string[] = [];
   const first = await runCompanyMigrate(configFor(MIGRATE_NS), { log: line => firstLines.push(line) });
@@ -191,6 +192,8 @@ run('空库上 company-migrate 应用全部 schema 到版本 57；再次运行�
   // 055 生产渲染：六个访问方式的定义里是 JWKS 地址；随后换成测试替身，使下一次登录可用。
   const probe = await rootSession(MIGRATE_NS);
   const [infoAfterFirst] = await probe.query<[Record<string, unknown>]>('INFO FOR DB;');
+  // 0.7.1 的 062 删除 outbox 表：空库按 001–062 应用之后不再有它。
+  expect(Object.keys((infoAfterFirst.tables ?? {}) as Record<string, unknown>)).not.toContain('outbox');
   const renderedAccesses = (infoAfterFirst.accesses ?? {}) as Record<string, string>;
   for (const name of ACCESS_NAMES) expect(renderedAccesses[name]).toContain(`URL '${jwksUrl}'`);
   await standInAccesses(MIGRATE_NS);
@@ -198,7 +201,7 @@ run('空库上 company-migrate 应用全部 schema 到版本 57；再次运行�
   const admin = await rootSession(MIGRATE_NS);
   const [marker] = await admin.query<[Array<{ owner: string; schema_version: number }>]>(
     'SELECT owner, schema_version FROM company_meta:installation;');
-  expect(marker?.[0]?.schema_version).toBe(57);
+  expect(marker?.[0]?.schema_version).toBe(CLOUD_SCHEMA_VERSION);
   const before = await countRows(admin);
 
   const secondLines: string[] = [];
@@ -209,7 +212,7 @@ run('空库上 company-migrate 应用全部 schema 到版本 57；再次运行�
 
   const [after] = await admin.query<[Array<{ owner: string; schema_version: number }>]>(
     'SELECT owner, schema_version FROM company_meta:installation;');
-  expect(after?.[0]?.schema_version).toBe(57);
+  expect(after?.[0]?.schema_version).toBe(CLOUD_SCHEMA_VERSION);
   expect(after?.[0]?.owner).toBe(marker?.[0]?.owner);
   expect(await countRows(admin)).toEqual(before);
 });
@@ -219,6 +222,37 @@ run('055 渲染后：owner、runner、automation、gateway、migrator、viewer �
   const [info] = await admin.query<[Record<string, unknown>]>('INFO FOR DB;');
   const accesses = (info.accesses ?? {}) as Record<string, string>;
   for (const name of ACCESS_NAMES) expect(accesses[name]).toBeDefined();
+});
+
+run('0.7.0 遗留的 outbox 表与计数器：迁移到 062 后删除；再次迁移无错且行数不变', async () => {
+  scope = { ns: LEGACY_NS, db: DATABASE };
+  await runCompanyMigrate(configFor(LEGACY_NS), { log: () => {} });
+  await standInAccesses(LEGACY_NS);
+
+  // 模拟 0.7.0 库：outbox 表（含索引与一条旧事件）、company_meta:outbox_counter，结构版本停在 61。
+  const admin = await rootSession(LEGACY_NS);
+  await admin.query(`DEFINE TABLE IF NOT EXISTS outbox SCHEMALESS PERMISSIONS NONE;
+    DEFINE INDEX IF NOT EXISTS outbox_sequence ON TABLE outbox FIELDS sequence UNIQUE;
+    CREATE outbox CONTENT { at: 1, sequence: 1, kind: 'legacy' };
+    UPSERT company_meta:outbox_counter CONTENT { value: 1 };
+    UPDATE company_meta:installation SET schema_version = 61;`);
+
+  const migrated = await runCompanyMigrate(configFor(LEGACY_NS), { log: () => {} });
+  expect(migrated.fresh).toBe(false);
+  await standInAccesses(LEGACY_NS);
+  const [info] = await admin.query<[Record<string, unknown>]>('INFO FOR DB;');
+  expect(Object.keys((info.tables ?? {}) as Record<string, unknown>)).not.toContain('outbox');
+  const [counter] = await admin.query<[unknown]>('SELECT * FROM ONLY company_meta:outbox_counter;');
+  expect(counter).toBeFalsy();
+  const [marker] = await admin.query<[Array<{ schema_version: number }>]>(
+    'SELECT schema_version FROM company_meta:installation;');
+  expect(marker?.[0]?.schema_version).toBe(CLOUD_SCHEMA_VERSION);
+  const before = await countRows(admin);
+
+  const again = await runCompanyMigrate(configFor(LEGACY_NS), { log: () => {} });
+  expect(again.fresh).toBe(false);
+  await standInAccesses(LEGACY_NS);
+  expect(await countRows(admin)).toEqual(before);
 });
 
 run('cloud-bootstrap 对空库运行两次：初始编制写入一次，第二次行数不变', async () => {

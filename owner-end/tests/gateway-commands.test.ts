@@ -7,7 +7,6 @@ import type { Caller } from '../src/auth/caller.ts';
 import { parseCommandBody, requireOwner, runCommand, type GatewayDeps } from '../src/commands.ts';
 import { COMMAND_CATALOG } from '../src/command-catalog.ts';
 import type { Sessions } from '../src/db.ts';
-import { PendingJob } from '../src/jobs.ts';
 import { fakeDb, fakeSessions, json, scriptedFetch, testConfig, type FakeCall } from './_support.ts';
 
 // 命令分流的单测：通过 runCommand 驱动，会话全部用假数据库替身，不访问网络、不读 process.env。
@@ -201,60 +200,6 @@ describe('老板命令的执行与审计', () => {
     expect(audits[0]!.vars.summary).toBe('guard.protect 命令=x.y');
   });
 
-  test('老板调用执行端命令 upgrade.start：排队后在第一次轮询即完成，返回解析后的结果并写 ok 审计', async () => {
-    const owner = fakeDb((sql) => (sql.startsWith('SELECT')
-      ? [{ id: 'job-1', command: 'upgrade.start', state: 'done', result: '{"ok":1}' }]
-      : []));
-    const deps = depsWith(fakeSessions(owner.db), 0);
-    const result = await runCommand(deps, ownerCaller, 'upgrade.start', {});
-    expect(result).toEqual({ ok: 1 });
-    const created = owner.calls.find((call) => call.sql.startsWith('CREATE $job'));
-    expect(created).toBeDefined();
-    const audits = auditsOf(owner.calls);
-    expect(audits).toHaveLength(1);
-    expect(audits[0]!.vars.outcome).toBe('ok');
-    expect(audits[0]!.vars.command).toBe('upgrade.start');
-  });
-
-  test('upgrade.list 按只读后缀判定不写审计，但仍排队并返回结果', async () => {
-    const owner = fakeDb((sql) => (sql.startsWith('SELECT')
-      ? [{ id: 'job-2', command: 'upgrade.list', state: 'done', result: '{"ok":1}' }]
-      : []));
-    const deps = depsWith(fakeSessions(owner.db), 0);
-    const result = await runCommand(deps, ownerCaller, 'upgrade.list', {});
-    expect(result).toEqual({ ok: 1 });
-    expect(owner.calls.some((call) => call.sql.startsWith('CREATE $job'))).toBe(true);
-    expect(auditsOf(owner.calls)).toHaveLength(0);
-  });
-
-  test('执行端始终未完成（等待为 0）：抛出 PendingJob，带任务号，审计 reason 以“已排队”开头', async () => {
-    const owner = fakeDb((sql) => (sql.startsWith('SELECT')
-      ? [{ id: 'job-3', command: 'upgrade.start', state: 'queued' }]
-      : []));
-    const deps = depsWith(fakeSessions(owner.db), 0);
-    const error = await errorOf(() => runCommand(deps, ownerCaller, 'upgrade.start', {}));
-    expect(error).toBeInstanceOf(PendingJob);
-    expect(typeof (error as PendingJob).jobId).toBe('string');
-    expect((error as PendingJob).jobId.length).toBeGreaterThan(0);
-    const audits = auditsOf(owner.calls);
-    expect(audits).toHaveLength(1);
-    expect(audits[0]!.vars.outcome).toBe('ok');
-    expect(String(audits[0]!.vars.reason).startsWith('已排队')).toBe(true);
-  });
-
-  test('执行端返回 error：抛出对应的 CompanyError，审计 outcome 为 error', async () => {
-    const owner = fakeDb((sql) => (sql.startsWith('SELECT')
-      ? [{ id: 'job-4', command: 'upgrade.start', state: 'error', error: '{"code":"forbidden","message":"no"}' }]
-      : []));
-    const deps = depsWith(fakeSessions(owner.db), 0);
-    const error = await errorOf(() => runCommand(deps, ownerCaller, 'upgrade.start', {}));
-    expect(error).toBeInstanceOf(CompanyError);
-    expect((error as CompanyError).code).toBe('forbidden');
-    expect((error as CompanyError).message).toBe('no');
-    const audits = auditsOf(owner.calls);
-    expect(audits).toHaveLength(1);
-    expect(audits[0]!.vars.outcome).toBe('error');
-  });
 });
 
 describe('员工调用的命令守卫与审计', () => {
@@ -381,8 +326,8 @@ describe('员工调用的命令守卫与审计', () => {
     }
   });
 
-  test('i. 员工调用执行端命令（ops_call、upgrade.start）：以员工身份排队（actor_kind 为 agent，actor 为员工，task 为当前任务），完成后返回结果，写 ok 审计', async () => {
-    for (const command of ['ops_call', 'upgrade.start']) {
+  test('i. 员工调用执行端命令（ops_call）：以员工身份排队（actor_kind 为 agent，actor 为员工，task 为当前任务），完成后返回结果，写 ok 审计', async () => {
+    for (const command of ['ops_call']) {
       const gateway = agentGateway({
         identity: IDENTITY_ALICE,
         task: VALID_LEASE,
@@ -432,7 +377,7 @@ describe('员工调用的命令守卫与审计', () => {
         identity: IDENTITY_ALICE,
         task: VALID_LEASE,
         jobOwner,
-        job: [{ id: 'job-k', command: 'upgrade.start', state: 'done', result: '{}' }],
+        job: [{ id: 'job-k', command: 'ops_call', state: 'done', result: '{}' }],
       });
       const deps = depsWith(fakeSessions(gateway.db));
       const error = await errorOf(() => runCommand(deps, agentCaller, 'ops.job.get', { id: 'job-k' }));
@@ -446,7 +391,7 @@ describe('员工调用的命令守卫与审计', () => {
       identity: IDENTITY_ALICE,
       task: VALID_LEASE,
       jobOwner: [{ actor_kind: 'agent', actor: 'alice' }],
-      job: [{ id: 'job-k', command: 'upgrade.start', state: 'done', result: '{"ok":1}' }],
+      job: [{ id: 'job-k', command: 'ops_call', state: 'done', result: '{"ok":1}' }],
     });
     const result = await runCommand(depsWith(fakeSessions(mine.db)), agentCaller, 'ops.job.get', { id: 'job-k' });
     expect(result).toMatchObject({ job: { id: 'job-k', state: 'done', result: { ok: 1 } } });

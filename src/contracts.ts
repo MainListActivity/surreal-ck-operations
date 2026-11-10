@@ -1,4 +1,4 @@
-/** v1 core/adapter boundary. The MCP adapter supplies an opaque credential on every call. */
+/** v1 core/adapter boundary. The sidecar adapter supplies an opaque credential on every call. */
 /** 'owner' is the control-plane principal (no employee_def); 'gm' is a retired literal kept only so legacy enrollment fixtures can be mapped to owner. */
 export type Role = 'gm' | 'owner' | 'product' | 'engineering' | 'ai-content' | 'concept-design' | 'asset-production' | 'screenwriter' | 'story-author' | 'cinematography' | 'qa' | 'cs';
 export const ROLES: readonly Role[] = ['product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs'];
@@ -162,7 +162,6 @@ export interface Principal {
 /**
  */
 export interface TaskView {
-  companyUpgrade?: import('./company-release.ts').CompanyRelease;
   id: TaskId;
   title: string;
   context: string;
@@ -390,7 +389,6 @@ export interface AdminSummary {
   scope: { tasks: string; audit: string };
   tasks: Record<string, number>;
   audit: Record<string, number>;
-  outboxSequence: number;
   integrity: {
     /**
      * True only when the read was consistent (its two in-transaction reads agree), every row is grouped under a
@@ -554,8 +552,6 @@ export interface LeaseProof {
 }
 
 export interface Evidence {
-  /** Engineering company-system release/deploy only. Bound to this lease write and a reviewed main commit. */
-  companyUpgrade?: { sha: string };
   text: string;
   idempotencyKey: string;
   /** SYS02: the head this submission is bound to; machine evidence must match it. */
@@ -568,21 +564,12 @@ export interface Evidence {
   learned?: string[];
 }
 
-export interface OutboxEvent {
-  id: string;
-  sequence: number;
-  kind: string;
-  taskId: TaskId;
-  payload: Record<string, unknown>;
-  createdAt: string;
-}
-
 /**
  * SYS04: what the plugin process is actually running. Read-only, and read by owner, product and qa only: it names the
  * release the company service is loaded from, so it is an operator fact rather than a general employee read.
  *
- * The view is produced in the plugin host's own execution context (the face every employee channel reaches),
- * never from the MCP face's tree and never from the `active` symlink — a symlink names what the service
+ * The view is produced in the plugin host's own execution context (the entry every employee channel reaches),
+ * never from another process's view, and never from the `current` symlink: a symlink names what the service
  * points at, which is the claim needing evidence rather than the evidence.
  */
 export interface PluginRuntimeView {
@@ -666,7 +653,7 @@ export interface CompanyCore {
   resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView>;
   /** product: mark a task 'void' (terminal), release any lease on it, and release any planned children. */
   retireTask(credential: Credential, input: RetireTask): Promise<TaskView>;
-  /** SYS01 bounded reads: optional so older adapters still compile; the sidecar and MCP layers check for them. */
+  /** SYS01 bounded reads: optional so older adapters still compile; the sidecar layer checks for them. */
   contextView?(credential: Credential, input: Record<string, unknown>): Promise<ContextView>;
   historyView?(credential: Credential, taskId: TaskId, input: Record<string, unknown>): Promise<HistoryPageView>;
   worktreePage?(credential: Credential, input: Record<string, unknown>): Promise<WorktreePageView>;
@@ -720,17 +707,12 @@ export interface CompanyCore {
    */
   pluginRuntimeDiagnostics?(credential: Credential, sample: () => PluginRuntimeView | Promise<PluginRuntimeView>): Promise<PluginRuntimeView>;
 
-  listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]>;
   history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]>;
   companyBrief(credential: Credential): Promise<CompanyBrief>;
   /** SYS02: record server-verified machine evidence for one acceptance criterion. */
   recordAcceptanceEvidence?(credential: Credential, input: AcceptanceEvidenceInput): Promise<AcceptanceEvidenceRecord>;
   /** SYS02: read the gate and the current verdict for one task (its holder, reviewer, or owner). */
   acceptanceStatus?(credential: Credential, input: { taskId: TaskId }): Promise<AcceptanceStatusView>;
-  /** SYS-INT: start one controlled non-production deploy drill (task holder or owner; audited, host-executed). */
-  deployDrillRun?(credential: Credential, input: { taskId: TaskId; runId: string; baseSha: string; candidateSha: string; idempotencyKey: string }): Promise<{ runId: string; pid: number; root: string }>;
-  /** SYS-INT: read one deploy drill's state and structured stage records. */
-  deployDrillStatus?(credential: Credential, input: { runId: string }): Promise<{ state?: { runId: string; status: string; phase?: string; error?: string }; stages?: string[] }>;
   /** SYS02: owner read of the versioned gate record. */
   acceptanceGate?(credential: Credential): Promise<AcceptanceGateView>;
   /** SYS02: owner versioned change of the gate; the reason and before/after are audited. */
@@ -832,7 +814,7 @@ export interface CompanyBrief {
   paused: boolean;
 }
 
-/** Administrative enrollment is deliberately outside the MCP adapter. */
+/** Administrative enrollment is deliberately outside the sidecar adapter. */
 export interface EnrollmentAdmin {
   enroll(employeeId: EmployeeId, role: Role, capabilities: Principal['capabilities']): Promise<Credential>;
   revoke(employeeId: EmployeeId): Promise<void>;

@@ -1,14 +1,12 @@
-import { git, readCompanyRelease, type CompanyRelease } from './company-release.ts';
+import { git } from './company-release.ts';
 import { checkLearned, LaneNoteStore, laneOf } from './lane-notes.ts';
 import { getRoute, listRoutes, CHAIN_LIMIT, type RouteRow } from './routes.ts';
 import { OutboundMessageStore } from './outbound-messages.ts';
-import type { DrillState } from './deploy-drill-service.ts';
-import { validateDrillPlan } from './deploy-drill.ts';
 import { authenticationLookup } from './diagnostics.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateTask, Credential, DefView, EnsureDef, ProjectView, Evidence, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
+import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateTask, Credential, DefView, EnsureDef, ProjectView, Evidence, HistoryEntry, LeaseProof, OpsScope, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
 import { ghCli, type GhRunner, type SubmitCheck } from './pr-gate.ts';
@@ -69,7 +67,7 @@ const DEFAULT_CHECKPOINT_LIMIT = 6;
 const OPS_EVIDENCE_CHARS = 600;
 const LIST_CONTEXT_CHARS = 1200;
 const LIST_TASKS_LIMIT = 500;
-/** A contributor dry-run answer is held to this many UTF-8 JSON bytes (24 KiB). The MCP result carries the JSON both as text and as
+/** A contributor dry-run answer is held to this many UTF-8 JSON bytes (24 KiB). The tool result carries the JSON both as text and as
  *  structuredContent in this lane, so twice this figure stays inside the 48 KiB response budget (SYS01). */
 const DRY_RUN_BYTE_BUDGET = 24 * 1024;
 /** Newest audit rows read per task for the dry-run. Rows beyond what fits the budget are cut and marked (timelineTotal). */
@@ -127,7 +125,6 @@ interface EmployeeRow {
 }
 
 export interface TaskRow {
-  company_upgrade?: CompanyRelease;
   recovery_stopped?: boolean;
   id: RecordId;
   title: string;
@@ -226,7 +223,6 @@ export function view(row: TaskRow): TaskView {
     leaseExpiresAt: row.lease_expires_at ? new Date(row.lease_expires_at * 1000).toISOString() : undefined,
     fence: row.fence,
     blockedTo: row.blocked_to,
-    companyUpgrade: row.company_upgrade ?? undefined,
     resumeState: row.state === 'blocked' ? row.resume_state : undefined,
     resumeRole: row.state === 'blocked' ? row.resume_role : undefined,
     handover: row.handover || undefined,
@@ -243,7 +239,7 @@ export function view(row: TaskRow): TaskView {
   };
 }
 
-/** Ops repo (agent home); mirrors the plugin/MCP wiring fallback for SCK_AGENT_CWD. */
+/** Ops repo (agent home); mirrors the plugin wiring fallback for SCK_AGENT_CWD. */
 const opsRepoPath = () => process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
 
 /** Whether `text` names `repo` as a whole path (…/surreal-ck-operations, not …/surreal-ck-operations-four-tier). */
@@ -416,13 +412,12 @@ export class SurrealCompanyCore implements CompanyCore {
   /** Test seam (SYS-DISP AC06): runs after a contribution view is read and before the lease transaction that checks it. */
   private readonly contributionReadHook?: (taskId: string) => Promise<void>;
   private readonly companyReleaseRepo?:string;
-  private readonly drillLaunch?: (home: string, repo: string, plan: { runId: string; root: string }) => number;
-  constructor(readonly database: CompanyDatabase, options?: { companyReleaseRepo?:string; leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; systemCheck?: SystemCheck; ciBillingCheck?: CiBillingCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter; runs?: AcceptanceRunLister };
-    faults?: { limits?: FaultBudgetLimits; clock?: () => number };
-    /** Test seam only: replaces the detached drill launch so a gate can assert the guards without a real run. */
-    drillLaunch?: (home: string, repo: string, plan: { runId: string; root: string }) => number }) {
+  /** 本执行端的节点 ID（见 node-identity.ts）；认领租约时写入 task.lease_node，供节点更新器判断本节点的租约。 */
+  readonly nodeId?: string;
+  constructor(readonly database: CompanyDatabase, options?: { companyReleaseRepo?:string; nodeId?: string; leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; systemCheck?: SystemCheck; ciBillingCheck?: CiBillingCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter; runs?: AcceptanceRunLister };
+    faults?: { limits?: FaultBudgetLimits; clock?: () => number } }) {
     this.companyReleaseRepo=options?.companyReleaseRepo;
-    this.drillLaunch = options?.drillLaunch;
+    this.nodeId=options?.nodeId;
     this.submitCheck = options?.submitCheck;
     this.systemCheck = options?.systemCheck;
     this.acceptanceAdapter = options?.acceptance?.adapter ?? createGithubActionsAdapter();
@@ -693,7 +688,7 @@ export class SurrealCompanyCore implements CompanyCore {
     const task = id('task', taskId);
     const vars = {
       actor: id('employee', actor.employeeId), task, idem, digest,
-      audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+      audit: id('audit', randomUUID()),
       title: input.title, context: input.context, executor: input.executorRole,
       reviewer: input.reviewerRole, tag: input.tag,
       type: input.type, parent: input.parent ? id('task', input.parent) : undefined,
@@ -728,8 +723,6 @@ export class SurrealCompanyCore implements CompanyCore {
           acceptance_attempt: 0${options.acceptanceChain !== undefined ? ', acceptance_chain: $acceptance_chain' : ''}
         };
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'create', version: 1, at: time::now() };
-        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        CREATE ONLY $outbox CONTENT { task: $task, kind: 'created', sequence: $sequence.value, payload: { state: $created.state }, at: time::now() };
         CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $created };
         RETURN $created;
         COMMIT;`, vars);
@@ -915,6 +908,7 @@ export class SurrealCompanyCore implements CompanyCore {
       LET $next = UPDATE ONLY $task SET
         state = IF $t.state = 'review' THEN 'review' ELSE 'doing' END,
         current_employee = $employee,
+        lease_node = IF $node != NONE THEN $node ELSE NONE END,
         delivery_id = IF $same THEN $t.delivery_id ELSE $delivery END,
         lease_expires_at = $now + $lease_seconds,
         progress_at = IF $same THEN $t.progress_at ELSE $now END,
@@ -935,15 +929,13 @@ export class SurrealCompanyCore implements CompanyCore {
       };
       IF !$same {
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'claim', version: $next.version, at: time::now(), phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END, evidence: IF $assignment != NONE THEN type::string($assignment) ELSE NONE END };
-        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        CREATE ONLY $outbox CONTENT { task: $task, kind: 'claimed', sequence: $sequence.value, payload: { employee: $employee, fence: $next.fence }, at: time::now() };
       };
       RETURN SELECT * FROM ONLY $task;
       COMMIT;`, {
-      actor: id('employee', actor.employeeId), employee: actor.employeeId, task,
+      actor: id('employee', actor.employeeId), employee: actor.employeeId, task, node: this.nodeId,
       delivery: randomUUID(), lease_seconds: this.leaseSeconds,
       assignment: worktree, tree: worktree ? id('worktree', worktree.id) : undefined, reference: id('worktree_ref', taskId),
-      audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+      audit: id('audit', randomUUID()),
       // 必配轨岗位（screenwriter）：要求任务轨恰为必配轨且编制 tracks 显式覆盖——
       // 空 tracks、无 def 的员工与缺轨任务一律 forbidden（claim 端，派工端同规则过滤）。
       req: REQUIRED_TRACKS[actor.role] ?? null, has_req: REQUIRED_TRACKS[actor.role] !== undefined,
@@ -1596,8 +1588,8 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   /**
-   * get_admin_summary (SYS01, C5, owner only): counts by state and by audit action in a window, with the cutoff time and the
-   * outbox sequence. The counts are read twice inside one transaction. integrity.complete is true only when the two reads
+   * get_admin_summary (SYS01, C5, owner only): counts by state and by audit action in a window, with the cutoff time.
+   * The counts are read twice inside one transaction. integrity.complete is true only when the two reads
    * agree and each count matches the rows it grouped. Nothing here carries task text.
    */
   async adminSummary(credential: Credential, input: Record<string, unknown> = {}): Promise<AdminSummary> {
@@ -1619,13 +1611,12 @@ export class SurrealCompanyCore implements CompanyCore {
       states?: Array<{ state?: string | null; n: number }>; taskTotal?: number | null;
       actions?: Array<{ action?: string | null; n: number }>; auditTotal?: number | null;
     };
-    type SummaryRead = Counts & { cutoff: string; outbox?: number | null; again?: Counts };
+    type SummaryRead = Counts & { cutoff: string; again?: Counts };
     const read = await this.consistentRead<SummaryRead>(`LET $cutoff = time::now();
-      LET $outbox = (SELECT VALUE value FROM company_meta:outbox_counter)[0];
       ${counts('')}
       ${counts('_again')}
       RETURN { read: {
-        cutoff: <string>$cutoff, outbox: $outbox,
+        cutoff: <string>$cutoff,
         states: $states, taskTotal: $taskTotal, actions: $actions, auditTotal: $auditTotal,
         again: { states: $states_again, taskTotal: $taskTotal_again, actions: $actions_again, auditTotal: $auditTotal_again },
       } };`, { since, tag: params.tag ?? null });
@@ -1662,10 +1653,10 @@ export class SurrealCompanyCore implements CompanyCore {
         tasks: params.tag ? `tag ${params.tag} 的任务，各处于 cutoffAt 时的状态；since does not apply to them` : 'every task, each in the state it holds at cutoffAt; since does not apply to them',
         audit: params.tag ? 'audit entries of this tag with at from since up to cutoffAt' : 'audit entries with at from since up to cutoffAt',
       },
-      tasks, audit, outboxSequence: Number(read.outbox ?? 0),
+      tasks, audit,
       integrity: {
         complete: Object.values(checks).every(Boolean),
-        method: 'one BEGIN…COMMIT transaction: cutoff, outbox sequence and counts read together; counts read twice must agree (repeatableRead), and each count must match the rows it grouped; task counts ignore since, audit counts cover [since, cutoffAt]',
+        method: 'one BEGIN…COMMIT transaction: cutoff and counts read together; counts read twice must agree (repeatableRead), and each count must match the rows it grouped; task counts ignore since, audit counts cover [since, cutoffAt]',
         taskRows, auditRows, checks, ...(unknownStates.length ? { unknownStates } : {}),
       },
     };
@@ -1740,33 +1731,6 @@ export class SurrealCompanyCore implements CompanyCore {
       actor: { employeeId: actor.employeeId, role: actor.role ?? '', human: true }, gate,
     });
     return { taskId: input.taskId, gate, verdict };
-  }
-
-  /** SYS-INT: read-only versioned acceptance-mapping preview for one task. The holder, reviewer or owner may read it; it never writes. */
-  async deployDrillRun(credential: Credential, input: { taskId: string; runId: string; baseSha: string; candidateSha: string; idempotencyKey: string }): Promise<{ runId: string; pid: number; root: string }> {
-    const actor = await this.authenticate(credential);
-    if (actor.role !== 'engineering' && actor.role !== 'owner') throw new CompanyError('forbidden', 'Only engineering or owner may run a deploy drill');
-    const row = await this.db.select<{ current_employee?: string; state: string }>(id('task', input.taskId));
-    if (!row) throw new CompanyError('not_found', 'Task not found');
-    if (row.current_employee !== actor.employeeId && actor.role !== 'owner') throw new CompanyError('forbidden', 'Only the task holder may run a drill for this task');
-    const io = hostIO();
-    const home = process.env.SCK_SERVICE_HOME ?? io.path.join(io.os.homeDir(), 'Library', 'Application Support', 'SurrealCKCompany');
-    const repo = this.companyReleaseRepo ?? this.worktrees?.options.opsRepo ?? process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
-    const host = io.drill.host(home, repo);
-    const plan = await validateDrillPlan(input, host.ctx);
-    await this.db.query('CREATE audit CONTENT {task:$task,actor:$actor,action:"deploy_drill_run",evidence:$evidence,at:time::now()};',
-      { task: input.taskId, actor: actor.employeeId, evidence: `runId ${input.runId} base ${input.baseSha} candidate ${input.candidateSha} root ${plan.root}` });
-    const pid = (this.drillLaunch ?? io.drill.start)(home, repo, plan);
-    return { runId: input.runId, pid, root: plan.root };
-  }
-
-  /** SYS-INT: read one drill's state and stage records; the task holder, owner, qa or product may read. */
-  async deployDrillStatus(credential: Credential, input: { runId: string }): Promise<{ state?: DrillState; stages?: string[] }> {
-    const actor = await this.authenticate(credential);
-    if (!['engineering', 'owner', 'qa', 'product'].includes(actor.role ?? '')) throw new CompanyError('forbidden', 'Not allowed to read drill status');
-    const io = hostIO();
-    const home = process.env.SCK_SERVICE_HOME ?? io.path.join(io.os.homeDir(), 'Library', 'Application Support', 'SurrealCKCompany');
-    return io.drill.status(home, input.runId);
   }
 
   /** SYS02: owner read of the versioned gate record. */
@@ -1991,18 +1955,6 @@ export class SurrealCompanyCore implements CompanyCore {
       const prior = await this.replay(idem, digest);
       if (prior) return prior;
     }
-    let companyUpgrade: CompanyRelease | undefined;
-    if (evidence?.companyUpgrade !== undefined) {
-      const row = await this.db.select<TaskRow>(id('task', proof.taskId));
-      if (!row || actor.role !== 'engineering' || row.state !== 'doing' || !['release','deploy'].includes(row.kind ?? '') ||
-          !['submit','block'].includes(action) || row.current_employee !== actor.employeeId || row.delivery_id !== proof.deliveryId ||
-          row.fence !== proof.fence || row.version !== proof.expectedVersion || (row.lease_expires_at ?? 0) <= Date.now()/1000)
-        throw new CompanyError('forbidden','只有当前工程租约可以登记公司系统上线版本');
-      const repo = this.companyReleaseRepo ?? this.worktrees?.options.opsRepo ?? process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
-      const project = await this.taskProject(proof.taskId);
-      if (!(row.code_repo_path ?? project?.repoPath) || hostIO().fs.realpath((row.code_repo_path ?? project?.repoPath)!) !== hostIO().fs.realpath(repo)) throw new CompanyError('forbidden','此任务不是公司系统仓库的上线任务');
-      companyUpgrade = await readCompanyRelease(repo,evidence.companyUpgrade.sha);
-    }
     let prHead: string | undefined;
     if (action === 'submit' && evidence?.sha && !evidence.acceptance?.sha) {
       evidence = { ...evidence, acceptance: { ...(evidence.acceptance ?? {}), sha: evidence.sha } };
@@ -2162,7 +2114,6 @@ export class SurrealCompanyCore implements CompanyCore {
         IF ($cpn[0] ?? 0) >= $checkpoint_limit { THROW 'checkpoint limit reached' };
       };
       LET $next = UPDATE ONLY $task SET
-        company_upgrade = IF $has_company_upgrade THEN $company_upgrade ELSE $t.company_upgrade END,
         state = IF $submit { 'review' } ELSE IF $accept { 'done' } ELSE IF $returning { 'ready' } ELSE IF $block { 'blocked' } ELSE { $t.state },
         submitted_by = IF $submit THEN $employee ELSE $t.submitted_by END,
         current_employee = IF $heartbeat OR $checkpoint THEN $employee ELSE NONE END,
@@ -2204,8 +2155,6 @@ export class SurrealCompanyCore implements CompanyCore {
       };
       IF !$heartbeat {
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: $action, evidence: $evidence, version: $next.version, at: time::now(), recovery_reason: $recovery_reason, phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END };
-        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        CREATE ONLY $outbox CONTENT { task: $task, kind: $action, sequence: $sequence.value, payload: { version: $next.version, state: $next.state }, at: time::now() };
       };
       ${idem ? 'CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };' : ''}
       RETURN $next;
@@ -2216,11 +2165,11 @@ export class SurrealCompanyCore implements CompanyCore {
         actor: id('employee', actor.employeeId), employee: actor.employeeId,
         task: id('task', proof.taskId), delivery: proof.deliveryId,
         fence: proof.fence, expected: proof.expectedVersion, lease_seconds: this.leaseSeconds,
-        ...flags, action, has_company_upgrade: companyUpgrade !== undefined, company_upgrade: companyUpgrade, recovery_reason: undefined, evidence: evidence?.text ?? '', to: to ?? '', checkpoint_limit: this.checkpointLimit,
+        ...flags, action, recovery_reason: undefined, evidence: evidence?.text ?? '', to: to ?? '', checkpoint_limit: this.checkpointLimit,
         acceptance_head: acceptance?.head ?? null, acceptance_environment: acceptance?.environment ?? null,
         has_head: acceptance?.head !== undefined, has_environment: acceptance?.environment !== undefined,
         human_evidence: acceptance?.human ?? [],
-        audit: auditId, outbox: id('outbox', randomUUID()), idem, digest,
+        audit: auditId, idem, digest,
       });
       const done = view(row);
       if (action === 'submit' && evidence?.next?.length) {
@@ -2304,8 +2253,6 @@ export class SurrealCompanyCore implements CompanyCore {
         version = $t.version + 1 RETURN AFTER;
       UPDATE employee SET active_task = NONE WHERE id = $actor AND active_task = $task;
       CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'released', evidence: $evidence, version: $next.version, at: time::now(), phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END };
-      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE ONLY $outbox CONTENT { task: $task, kind: 'released', sequence: $sequence.value, payload: { version: $next.version, state: $next.state }, at: time::now() };
       CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`;
@@ -2315,7 +2262,7 @@ export class SurrealCompanyCore implements CompanyCore {
         actor: id('employee', actor.employeeId), employee: actor.employeeId,
         task: id('task', proof.taskId), delivery: proof.deliveryId,
         fence: proof.fence, expected: proof.expectedVersion, evidence: evidence.text,
-        audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()), idem, digest,
+        audit: id('audit', randomUUID()), idem, digest,
       });
       const task = view(row);
       // Same event point as return: a released claim may have been the scene's last reference.
@@ -2343,9 +2290,8 @@ export class SurrealCompanyCore implements CompanyCore {
   async block(credential: Credential, proof: LeaseProof, to: 'owner', evidence: Evidence, quotaResetsAt?: string, fault?: FaultInput): Promise<TaskView> {
     const until = quotaResetsAt === undefined ? undefined : parseQuotaResetsAt(quotaResetsAt, Date.now());
     const actor = await this.authenticate(credential);
-    // A structured upgrade is an install request, validated against main and the current lease by transition.
     // Every ordinary block is checked before recording faults, quota gates, audit or changing the task/lease.
-    if (evidence.companyUpgrade === undefined) await this.assertCiBlockAllowed(proof, actor.employeeId, [evidence.text]);
+    await this.assertCiBlockAllowed(proof, actor.employeeId, [evidence.text]);
     // The fault is recorded before the state change, so a crash between the two leaves the attempt charged (the
     // attempt really happened) rather than a block that no budget accounts for.
     if (fault !== undefined) await this.reportTaskFault(actor.employeeId, proof.taskId, fault);
@@ -2562,7 +2508,7 @@ export class SurrealCompanyCore implements CompanyCore {
   /**
    * owner: run ownership reclaim (or dry-run) across registered repos. Uses the same lock and audit path as the dispatcher sweep.
    * Order: the credential, then the arguments (parseReclaimInput, SYS01 D3), then the owner role. The arguments come before the role,
-   * as on MCP and the sidecar, so a malformed call gets the same invalid refusal from any caller. A bad argument never reaches
+   * as on the sidecar, so a malformed call gets the same invalid refusal from any caller. A bad argument never reaches
    * reclaimAll, so no tree is touched.
    */
   async reclaimWorktrees(credential: Credential, input?: { dryRun?: boolean; repos?: string[] }) {
@@ -2611,15 +2557,12 @@ export class SurrealCompanyCore implements CompanyCore {
           version += 1 RETURN AFTER;
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'resume', evidence: $evidence, version: $next.version, at: time::now(),
           result: $next.state };
-        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        CREATE ONLY $outbox CONTENT { task: $task, kind: 'resumed', sequence: $sequence.value,
-          payload: { state: $next.state }, at: time::now() };
         CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
         RETURN $next;
         COMMIT;`, {
         actor: id('employee', actor.employeeId), task: id('task', taskId), evidence: evidence.text,
         expected_version: before.version,
-        audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+        audit: id('audit', randomUUID()),
         idem, digest,
       });
       return view(row);
@@ -2693,15 +2636,13 @@ export class SurrealCompanyCore implements CompanyCore {
       };
       UPDATE employee SET active_task = NONE WHERE active_task = $task;
       CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'retire', evidence: $evidence, version: $next.version, at: time::now() };
-      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE ONLY $outbox CONTENT { task: $task, kind: 'retired', sequence: $sequence.value, payload: { state: 'void', retired_holder: $holder }, at: time::now() };
       CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`, {
         actor: id('employee', actor.employeeId), task: id('task', input.taskId),
         expected: input.expectedVersion, evidence, holder: before.current_employee,
         descendants,
-        idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+        idem, digest, audit: id('audit', randomUUID()),
       });
     } catch (error) {
       const replayed = await this.replay(idem, digest);
@@ -2721,7 +2662,7 @@ export class SurrealCompanyCore implements CompanyCore {
 
   // ------------------------------------------------------------------ SYS03 老板处置账本
   // 老板对一个 blocking episode 的处置走这一组方法：先认领（episode 唯一、租约、版本），再带 CAS 与全局业务
-  // 幂等键决定，最后由持久 outbox 通知当前持有人。授权与既有通道同源：角色与能力仍由本类判定，处置动作本身
+  // 幂等键决定，最后由持久的 holder_notice 通知当前持有人。授权与既有通道同源：角色与能力仍由本类判定，处置动作本身
   // 复用 resume/defer/retire/create 的既有状态机，不新增任何旁路写权。
 
   /**
@@ -2761,15 +2702,13 @@ export class SurrealCompanyCore implements CompanyCore {
           lease_expires_at = NONE, handover = NONE, version = $t.version + 1 RETURN AFTER;
         UPDATE employee SET active_task = NONE WHERE active_task = $task;
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'task_project_update', evidence: $evidence, version: $next.version, at: time::now() };
-        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        CREATE ONLY $outbox CONTENT { task: $task, kind: 'task_project_updated', sequence: $sequence.value, payload: { project: $project_id, version: $next.version }, at: time::now() };
         CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
         RETURN $next;
         COMMIT;`, {
         actor: id('employee', actor.employeeId), task: id('task', input.taskId),
         project: id('project', input.project), project_id: input.project,
         expected: input.expectedVersion, evidence: input.text,
-        idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+        idem, digest, audit: id('audit', randomUUID()),
       });
       return view(row);
     } catch (error) {
@@ -2791,24 +2730,5 @@ export class SurrealCompanyCore implements CompanyCore {
     if (!row) throw new CompanyError('not_found', 'Task not found');
     const cost = await readTaskCost(this.db, taskId);
     return cost ?? { taskId, available: false, reason: row.state === 'done' ? '任务已完成，成本等待结算（派工周期内写入）' : '任务未完成，完成后结算成本' };
-  }
-
-  async listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]> {
-    const actor = await this.authorized(credential, 'manage');
-    if (actor.role !== 'owner') throw new CompanyError('forbidden', 'Outbox access denied');
-    type Row = { id: RecordId; sequence: number; kind: string; task: RecordId; payload: Record<string, unknown>; at: Date };
-    let rows: Row[];
-    if (after) {
-      const cursor = await this.db.select<Row>(id('outbox', after));
-      if (!cursor) throw new CompanyError('not_found', 'Outbox cursor not found');
-      [rows] = await this.db.query<[Row[]]>(
-        'SELECT * FROM outbox WHERE sequence > $sequence ORDER BY sequence LIMIT 1000;',
-        { sequence: cursor.sequence }
-      );
-    } else {
-      [rows] = await this.db.query<[Row[]]>('SELECT * FROM outbox ORDER BY sequence LIMIT 1000;');
-    }
-    return rows.map(row => ({ id: asId(row.id), sequence: row.sequence, kind: row.kind, taskId: asId(row.task),
-      payload: row.payload, createdAt: String(row.at) }));
   }
 }

@@ -13,14 +13,11 @@ import { ProjectStore } from '../src/projects.ts';
 import { COMPANY_PART_BYTES, companyBlock, reassembleCompany } from '../src/company-context.ts';
 import type { CompanyBrief, CompanyPart } from '../src/contracts.ts';
 import { RESPONSE_BUDGET_BYTES, answerBytes } from '../src/response-budget.ts';
-import { connectCompanyClient } from '../src/mcp/client';
-import { createMcpHttpService } from '../src/mcp/server';
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
 import type { EmployeeInst } from '../src/workforce.ts';
-import { countingFetch, lastBody } from './support/mcp-wire.ts';
 
 // SYS01 AC-A, sample by sample. Each test builds its own fresh namespace on the company fork (scripts/test-worktrees.ts) and
-// reads the company block through core, the MCP HTTP service and the sidecar channel. The samples are: the 30683-byte operations
+// reads the company block through core and the sidecar channel. The samples are: the 30683-byte operations
 // sample; a 131 KiB sample with over-long CJK and emoji items and a growing project set. Every answer is measured against the
 // 49152-byte budget as it is sent. Never production.
 
@@ -148,27 +145,11 @@ async function walkCore(fx: Fixture, pageSize: number, section?: 'directions' | 
   throw new Error('the company listing did not end');
 }
 
-/** Walks every page through the MCP HTTP service; every tools/call body on the wire is counted and must fit the budget. */
-async function walkMcp(connection: Awaited<ReturnType<typeof connectCompanyClient>>, wire: ReturnType<typeof countingFetch>, args: Record<string, unknown>): Promise<CompanyPart[]> {
-  const parts: CompanyPart[] = [];
-  let cursor: string | undefined;
-  for (let page = 0; page < 1000; page++) {
-    const answer = await connection.client.callTool({ name: 'get_context', arguments: { ...args, ...(cursor ? { cursor } : {}) } });
-    expect(answer.structuredContent).toMatchObject({ ok: true });
-    expect(lastBody(wire)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    const data = (answer.structuredContent as { data: { parts: CompanyPart[]; page: { hasMore: boolean; nextCursor?: string } } }).data;
-    parts.push(...data.parts);
-    if (!data.page.hasMore) return parts;
-    cursor = data.page.nextCursor;
-  }
-  throw new Error('the company listing did not end over MCP');
-}
-
 type SidecarEnv = ReturnType<SidecarPool['env']>;
 
 /** One call through the real comm client (the same process the agents run), with its stdout and exit code. */
 async function sidecarCall(channel: SidecarEnv, args: Record<string, unknown>): Promise<{ out: string; exit: number }> {
-  const child = Bun.spawn([process.execPath, join(ROOT, 'src/mcp/client-cli.ts'), 'call', 'get_context', JSON.stringify(args)], {
+  const child = Bun.spawn([process.execPath, join(ROOT, 'src/sck-cli.ts'), 'call', 'get_context', JSON.stringify(args)], {
     cwd: ROOT, stdout: 'pipe', stderr: 'pipe',
     env: { ...process.env, SCK_COMM_DIR: channel.SCK_COMM_DIR, SCK_COMM_KEY: channel.SCK_COMM_KEY },
   });
@@ -284,7 +265,7 @@ test('AC-A rejections: another caller, another section, another query, an altere
   expect(cursor.length).toBeGreaterThan(0);
   // Another caller, another section, another query: each forbidden.
   await expectRefused(fx.core.contextView(fx.eng, { scope: 'company', pageSize: 1, cursor }), 'forbidden', /another caller or query/);
-  await expectRefused(fx.core.contextView(fx.gm, { scope: 'company', section: 'goals', pageSize: 1, cursor }), 'forbidden', /another caller or query/);
+  await expectRefused(fx.core.contextView(fx.gm, { scope: 'company', section: 'projects', pageSize: 1, cursor }), 'forbidden', /another caller or query/);
   await expectRefused(fx.core.contextView(fx.gm, { pageSize: 1, cursor }), 'forbidden', /another caller or another query/);
   // An altered cursor: the first payload character changes, so the signature no longer verifies.
   const altered = cursor.replace(/^v1\.(.)/, (_, head: string) => `v1.${head === 'A' ? 'B' : 'A'}`);
@@ -307,48 +288,12 @@ test('AC-A rejections: another caller, another section, another query, an altere
   await expectRefused(fx.core.contextView(leaver, { scope: 'company', pageSize: 1, cursor: leaverFirst.page!.nextCursor! }), 'unauthorized', /./);
 });
 
-test('AC-A 30683-byte sample (MCP HTTP): the block pages back whole, every tools/call body on the wire fits the budget, and the complete answers are refused on the wire', async () => {
-  const fx = await fresh();
-  const brief = await operationsSample(fx);
-  const service = createMcpHttpService({ core: fx.core, port: 0 });
-  const wire = countingFetch();
-  const connection = await connectCompanyClient({
-    url: new URL(`http://127.0.0.1:${service.port}/mcp`), credential: fx.gm, clientName: 'company-paging-samples', fetch: wire.fetch,
-  });
-  try {
-    expectBlock(reassembleCompany(await walkMcp(connection, wire, { scope: 'company', pageSize: 4 })), brief);
-    const refused = await connection.client.callTool({ name: 'get_context', arguments: { scope: 'company' } });
-    expect(refused.structuredContent).toMatchObject({ ok: false, code: 'response_too_large' });
-    expect(lastBody(wire)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    const withBlock = await connection.client.callTool({ name: 'get_context', arguments: { includeCompany: true, state: 'done' } });
-    expect(withBlock.structuredContent).toMatchObject({ ok: false, code: 'response_too_large' });
-    expect(lastBody(wire)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    const legacy = await connection.client.callTool({ name: 'get_context', arguments: { state: 'done' } });
-    expect(legacy.structuredContent).toMatchObject({
-      ok: true, data: { companyIncluded: false, companyRead: { scope: 'company', pageSize: 25 } },
-    });
-    expect((legacy.structuredContent as { data: object }).data).not.toHaveProperty('company');
-    expect(lastBody(wire)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-  } finally {
-    await connection.close();
-    await service.close();
-  }
-});
-
-test('AC-A 131 KiB sample (MCP HTTP and sidecar channel): both readers return the same parts as core, every answer inside the budget', async () => {
+test('AC-A 131 KiB sample (sidecar channel): the reader returns the same parts as core, every answer inside the budget', async () => {
   const fx = await fresh();
   const brief = await growthSample(fx);
   const fromCore = await walkCore(fx, 5);
-  const service = createMcpHttpService({ core: fx.core, port: 0 });
-  const wire = countingFetch();
-  const connection = await connectCompanyClient({
-    url: new URL(`http://127.0.0.1:${service.port}/mcp`), credential: fx.gm, clientName: 'company-paging-samples', fetch: wire.fetch,
-  });
   const runDir = mkdtempSync(join(tmpdir(), 'cp-sidecar-'));
   try {
-    const fromMcp = await walkMcp(connection, wire, { scope: 'company', pageSize: 5 });
-    expect(fromMcp).toEqual(fromCore);
-    expectBlock(reassembleCompany(fromMcp), brief);
     // The sidecar channel holds the credential it is given (the workforce stub is never asked for another).
     const pool = new SidecarPool({ core: fx.core, workforce: { rotate: async () => fx.gm } as unknown as SidecarDeps['workforce'], runDir, sweepMs: 5 });
     const channel = pool.env({ id: `cp-channel-${suffix}`, credential: fx.gm } as unknown as EmployeeInst);
@@ -356,8 +301,6 @@ test('AC-A 131 KiB sample (MCP HTTP and sidecar channel): both readers return th
     expect(fromSidecar).toEqual(fromCore);
     expectBlock(reassembleCompany(fromSidecar), brief);
   } finally {
-    await connection.close();
-    await service.close();
     rmSync(runDir, { recursive: true, force: true });
   }
 });

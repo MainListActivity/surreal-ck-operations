@@ -2,7 +2,7 @@ import { afterAll, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { typeProblems, versionProblems, wiringProblems, type Runner } from '../src/submit-checks.ts';
+import { sidecarToolTable, typeProblems, versionProblems, wiringProblems, type Runner } from '../src/submit-checks.ts';
 
 const roots: string[] = [];
 afterAll(() => { for (const root of roots) rmSync(root, { recursive: true, force: true }); });
@@ -48,19 +48,21 @@ test('a code change that does not raise the version is refused; docs-only change
   expect(await versionProblems(root)).toEqual([]);
 });
 
-test('tool wiring names tools missing from the sidecar and test lists naming missing files', () => {
+test('tool wiring names sidecar tools missing from dispatch and test lists naming missing files', () => {
   const root = repo('1.0.0');
-  write(root, 'src/mcp/server.ts', "server.registerTool('alpha', {}); server.registerTool('beta', {}); server.registerTool('claim_next', {});");
-  write(root, 'plugin/server/sidecar.ts', 'const BASE_TOOLS = ["alpha"];\nswitch (x) { case "alpha": break; }');
+  write(root, 'src/runner/sidecar.ts', 'const BASE_TOOLS = [\n  "alpha", // comment "ignored"\n  "beta",\n];\nswitch (x) { case "alpha": break; }');
   write(root, 'package.json', JSON.stringify({ version: '1.0.0', scripts: { test: 'bun test tests/a.test.ts tests/gone.test.ts' } }));
   expect(wiringProblems(root)).toEqual([
-    'MCP 工具未接到 sidecar 分发：beta',
+    'sidecar 工具未接到分发：beta',
     'package.json 测试脚本引用了不存在的文件：tests/gone.test.ts',
   ]);
-  write(root, 'plugin/server/sidecar.ts', 'switch (x) { case "alpha": break; case "beta": break; }\nconst BASE_TOOLS = ["alpha"];');
-  expect(wiringProblems(root)).toContain('MCP 工具未列入 sidecar 工具表：beta');
-  write(root, 'src/runner/sidecar.ts', 'const BASE_TOOLS = ["alpha", "beta"]; switch (x) { case "alpha": break; case "beta": break; }');
-  expect(wiringProblems(root).filter(p => p.includes('MCP 工具'))).toEqual([]);
+  write(root, 'src/runner/sidecar.ts', 'switch (x) { case "alpha": break; case "beta": break; }\nconst BASE_TOOLS = ["alpha"];');
+  expect(wiringProblems(root)).toContain('sidecar 分发了未列入工具表的工具：beta');
+});
+
+test('the sidecar tool table is read from the text, never by importing the employee sidecar', () => {
+  expect(sidecarToolTable('const BASE_TOOLS = ["get_context", "heartbeat"];\nconst X = ["not_a_tool"];')).toEqual(['get_context', 'heartbeat']);
+  expect(sidecarToolTable('no table here')).toEqual([]);
 });
 
 test('type errors refuse; a compiler that cannot run or a tree without packages does not', async () => {

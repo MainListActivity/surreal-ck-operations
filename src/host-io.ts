@@ -1,12 +1,9 @@
 // The execution host: everything the core needs from the machine it runs on (files, paths, the home directory, external
-// programs, the keychain, the drill runner, password hashing, request-scoped storage). Core modules reach the machine only
+// programs, the keychain, password hashing, request-scoped storage). Core modules reach the machine only
 // through this interface, so the core's import graph contains no node built-in (scripts/worker-compat-check.ts enforces it).
 // host-node.ts is the node implementation; each process that runs the core installs one at its entry. A process without a
 // host gets CompanyError('unavailable') from hostIO() for any operation that needs one.
 import { CompanyError } from './core-errors.ts';
-import type { DrillHost } from './deploy-drill-runner.ts';
-import type { DrillHostContext, DrillPlan } from './deploy-drill.ts';
-import type { DrillState } from './deploy-drill-service.ts';
 
 export interface HostPath {
   readonly sep: string;
@@ -90,12 +87,6 @@ export interface HostPassword {
   hash(secret: string): Promise<string>;
 }
 
-export interface HostDrill {
-  host(serviceHome: string, repo: string): DrillHost & { ctx: DrillHostContext };
-  start(serviceHome: string, repo: string, plan: DrillPlan): number;
-  status(serviceHome: string, runId: string): { state?: DrillState; stages?: string[] };
-}
-
 export interface HostStorage<T> {
   run<R>(store: T, fn: () => R): R;
   getStore(): T | undefined;
@@ -114,7 +105,6 @@ export interface HostIO {
   readonly keychain: HostKeychain;
   readonly lock: HostLock;
   readonly password: HostPassword;
-  readonly drill: HostDrill;
   readonly context: HostContext;
 }
 

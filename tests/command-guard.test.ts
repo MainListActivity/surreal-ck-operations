@@ -116,7 +116,7 @@ describe('命令守卫：模式与清单', () => {
     expect([...HARD_OWNER_ONLY]).toEqual(['guard.*', 'agent.*', 'owner.login.*', 'def.*', 'db.write']);
     // 只读命令与员工可按租约和清单调用的写命令都不在硬清单里（后者由 protected_command、allow/deny 与租约判定）。
     for (const command of ['board.snapshot', 'brief', 'inbox', 'status', 'task.list', 'task.detail', 'task.cost', 'progress', 'message.list',
-      'task.void', 'message.send', 'upgrade.start', 'idp.client.create', 'cf.api', 'route.save']) {
+      'task.void', 'message.send', 'idp.client.create', 'cf.api', 'route.save']) {
       expect(HARD_OWNER_ONLY.some(pattern => matchesCommand(pattern, command))).toBe(false);
     }
   });
@@ -133,8 +133,8 @@ describe('命令守卫：模式与清单', () => {
     expect(judge(request('runner', 'cf.status'), {}).allow).toBe(true);
   });
 
-  test('不在硬清单的老板命令（身份、云端、消息、升级、任务的写入）：员工按租约判定，保护清单开启后拒绝', () => {
-    for (const command of ['idp.client.create', 'cf.api', 'message.send', 'upgrade.start', 'task.void']) {
+  test('不在硬清单的老板命令（身份、云端、消息、任务的写入）：员工按租约判定，保护清单开启后拒绝', () => {
+    for (const command of ['idp.client.create', 'cf.api', 'message.send', 'task.void']) {
       expect(agent(command).allow).toBe(true);
       expect(agent(command, { ...leased, protectedOwnerOnly: true }).allow).toBe(false);
     }

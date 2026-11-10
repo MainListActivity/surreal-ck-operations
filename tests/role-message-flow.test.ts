@@ -27,8 +27,6 @@ test('report_blocker entries route only to owner', () => {
   expect(schema).toContain("blocked_to = 'owner'");
   const sidecar = readFileSync(join(import.meta.dir, '..', 'src/runner/sidecar.ts'), 'utf8');
   expect(sidecar).toContain('args.to === "owner" ? "owner" : "owner"');
-  const mcp = readFileSync(join(import.meta.dir, '..', 'src/mcp/server.ts'), 'utf8');
-  expect(mcp).toContain("to: z.enum(['owner'])");
 });
 
 test('task.md contains only title, requirement and acceptance criteria', () => {
@@ -41,10 +39,10 @@ test('task.md contains only title, requirement and acceptance criteria', () => {
 test('minimal dispatch message: only what, where, how; no onboarding on first contact', () => {
   const first = wake({ id: 'e1', role: 'engineering' } as never,
     { id: 't1', title: 'x', state: 'doing', row: {} } as never, env, true,
-    { comm: true, claim: { task: { id: 't1', state: 'doing' }, history: [], worktree: { worktreePath: '/w', intent: { kind: 'code' } } } as never, commDir: '/c' });
+    { claim: { task: { id: 't1', state: 'doing' }, history: [], worktree: { worktreePath: '/w', intent: { kind: 'code' } } } as never, commDir: '/c' });
   const second = wake({ id: 'e1', role: 'engineering' } as never,
     { id: 't1', title: 'x', state: 'doing', row: {} } as never, env, false,
-    { comm: true, claim: { task: { id: 't1', state: 'doing' }, history: [], worktree: { worktreePath: '/w', intent: { kind: 'code' } } } as never, commDir: '/c' });
+    { claim: { task: { id: 't1', state: 'doing' }, history: [], worktree: { worktreePath: '/w', intent: { kind: 'code' } } } as never, commDir: '/c' });
   expect(first).toBe(second);
   expect(first).toContain('task.md');
   expect(first).toContain('submit');
@@ -57,7 +55,7 @@ test('template bodies are the exact minimal sentences', () => {
   expect(templateFor('execute', true)).toContain('合入 main');
   expect(templateFor('execute', true)).toContain('安装到生产由老板侧完成');
   expect(templateFor('execute', true)).toContain('不要安装');
-  expect(templateFor('execute', true)).toContain('不要登记升级卡');
+  expect(templateFor('execute', true)).not.toContain('升级卡');
   expect(templateFor('execute', true)).not.toContain('发布到生产');
   expect(templateFor('execute', true)).not.toContain('在生产逐条自验');
   expect(templateFor('execute', false)).not.toContain('合入 main');

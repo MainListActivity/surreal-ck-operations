@@ -181,7 +181,7 @@ run('a task approved after two returns keeps only the passing round\'s five note
   expect(execute).toContain('在最终提交上按验收标准逐条自验');
   expect(execute).toContain('合入 main');
   expect(execute).toContain('安装到生产由老板侧完成');
-  expect(execute).toContain('不要登记升级卡');
+  expect(execute).not.toContain('升级卡');
   expect(review).toContain('先查验收标准第 1 条');
   expect(review).toContain('不成立就直接退回');
   expect((await ownerApi({ db, core, owner: {}, workforce: {}, messages: messageStore, opsRepo: '/tmp/ops' } as never,
@@ -250,7 +250,7 @@ run('a route template reaches the task drafts, with the notes pointer added', as
 });
 
 run('a claim records the session\'s lane, task and phase; facts report task states', async () => {
-  const wf = new Workforce(db, '/tmp/unused-lane-fixture');
+  const wf = new Workforce(db);
   const parent = await task('父任务记录', 'alpha');
   const c = await core.claim(eng, parent.id);
   const seen = async (who: string) => (await db.db.select<{ lane?: string; last_task?: RecordId; last_phase?: string }>(new RecordId('employee', who)))!;
@@ -266,7 +266,7 @@ run('a claim records the session\'s lane, task and phase; facts report task stat
 });
 
 run('a chain keeps one workspace record at its root and is finished only when every task is', async () => {
-  const wf = new Workforce(db, join(dir, 'unused-credentials'));
+  const wf = new Workforce(db);
   const root = await task('目标根任务');
   const child = await core.createTask(gm, { title: '子任务', context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', parent: root.id, requirement: 'fixture', acceptanceText: 'fixture', idempotencyKey: key() } as never);
   expect(await wf.chainRoot(child.id)).toEqual({ id: root.id, title: '目标根任务', workspaces: [] });

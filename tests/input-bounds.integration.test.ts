@@ -10,8 +10,6 @@ import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
 import { ProjectStore } from '../src/projects.ts';
-import { createMcpHttpService } from '../src/mcp/server.ts';
-import { connectCompanyClient } from '../src/mcp/client.ts';
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
 import type { EmployeeInst } from '../src/workforce.ts';
 import type { CreateTask } from '../src/contracts.ts';
@@ -44,12 +42,12 @@ const input = (label: string, extra: Partial<CreateTask> = {}): CreateTask => ({
   context: 'Synthetic input-bounds fixture; isolated company fork only.',
   executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key(label), ...extra,
 });
-async function count(table: 'task' | 'audit' | 'outbox' | 'idempotency'): Promise<number> {
+async function count(table: 'task' | 'audit' | 'idempotency'): Promise<number> {
   const [rows] = await database.db.query<[Array<{ c: number }>]>(`SELECT count() AS c FROM ${table} GROUP ALL;`);
   return rows[0]?.c ?? 0;
 }
 const counts = async () => ({
-  task: await count('task'), audit: await count('audit'), outbox: await count('outbox'), idempotency: await count('idempotency'),
+  task: await count('task'), audit: await count('audit'), idempotency: await count('idempotency'),
 });
 async function errorOf(action: Promise<unknown>): Promise<Error & { code?: string }> {
   return action.then(() => { throw new Error('expected a refusal'); }, error => error as Error & { code?: string });
@@ -85,31 +83,7 @@ test('asset intent has the same 50-entry and 300-character limits through core, 
   expect((await counts()).task).toBe(before.task + 1);
 });
 
-test('MCP create_task reaches the same real core refusal for the 51st dependency', async () => {
-  const dep = await core.createTask(gm, input('mcp-dependency'));
-  const service = createMcpHttpService({ core, port: 0 });
-  const connection = await connectCompanyClient({
-    url: new URL(`http://127.0.0.1:${service.port}/mcp`), credential: gm, clientName: `input-bounds-${suffix}`,
-  });
-  try {
-    const result = await connection.client.callTool({
-      name: 'create_task',
-      arguments: { ...input('mcp-fifty-one'), dependencies: Array(51).fill(dep.id) },
-    });
-    expect(result.structuredContent).toMatchObject({ ok: false, code: 'invalid' });
-    expect(String((result.structuredContent as { error?: string }).error)).toContain('dependencies count 51 exceeds limit 50');
-    const tooManyPaths = await connection.client.callTool({
-      name: 'create_task',
-      arguments: { ...input('mcp-paths-fifty-one'), executorRole: 'asset-production', workIntent: { kind: 'assets', paths: paths(51) } },
-    });
-    expect(tooManyPaths.structuredContent).toMatchObject({ ok: false, code: 'invalid' });
-  } finally {
-    await connection.close();
-    await service.close();
-  }
-});
-
-test('the real sidecar channel reaches the same core refusal for the 51st dependency', async () => {
+test('the real sidecar channel refuses retired dependencies with the same core refusal', async () => {
   const dep = await core.createTask(gm, input('sidecar-dependency'));
   const runDir = mkdtempSync(join(tmpdir(), 'input-bounds-sidecar-'));
   const pool = new SidecarPool({
@@ -117,8 +91,8 @@ test('the real sidecar channel reaches the same core refusal for the 51st depend
   });
   try {
     const channel = pool.env({ id: `input-bounds-${suffix}`, credential: gm } as EmployeeInst);
-    const child = Bun.spawn([process.execPath, join(import.meta.dir, '..', 'src/mcp/client-cli.ts'), 'call', 'create_task',
-      JSON.stringify({ ...input('sidecar-fifty-one'), dependencies: Array(51).fill(dep.id) })], {
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, '..', 'src/sck-cli.ts'), 'call', 'create_task',
+      JSON.stringify({ ...input('sidecar-retired-dependency'), dependencies: [dep.id] })], {
       cwd: join(import.meta.dir, '..'), stdout: 'pipe', stderr: 'pipe',
       env: { ...process.env, SCK_COMM_DIR: channel.SCK_COMM_DIR, SCK_COMM_KEY: channel.SCK_COMM_KEY },
     });
@@ -126,8 +100,8 @@ test('the real sidecar channel reaches the same core refusal for the 51st depend
     expect(exit, stderr).toBe(1);
     const answer = JSON.parse(out) as { ok: boolean; code?: string; error?: string };
     expect(answer).toMatchObject({ ok: false, code: 'invalid' });
-    expect(answer.error).toContain('dependencies count 51 exceeds limit 50');
-    const pathsChild = Bun.spawn([process.execPath, join(import.meta.dir, '..', 'src/mcp/client-cli.ts'), 'call', 'create_task',
+    expect(answer.error).toContain('dependencies are retired; use parent');
+    const pathsChild = Bun.spawn([process.execPath, join(import.meta.dir, '..', 'src/sck-cli.ts'), 'call', 'create_task',
       JSON.stringify({ ...input('sidecar-paths-fifty-one'), executorRole: 'asset-production', workIntent: { kind: 'assets', paths: paths(51) } })], {
       cwd: join(import.meta.dir, '..'), stdout: 'pipe', stderr: 'pipe',
       env: { ...process.env, SCK_COMM_DIR: channel.SCK_COMM_DIR, SCK_COMM_KEY: channel.SCK_COMM_KEY },

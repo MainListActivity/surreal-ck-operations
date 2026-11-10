@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 /**
  * System checks an engineering submit to the company repo must pass before any reviewer is spent on it. They catch the
- * defects reviewers returned most often (type errors, the version not raised, a tool registered on one surface only, a
+ * defects reviewers returned most often (type errors, the version not raised, a sidecar tool missing its dispatch, a
  * test list naming a missing file) and send the submit straight back to its author.
  *
  * Employee code is never executed here: the version and wiring checks only read files and git objects, and the
@@ -27,8 +27,9 @@ export const runProcess: Runner = (cmd, args, opts) => new Promise(resolve => {
 });
 
 const SOURCE = /^(src|plugin\/server|plugin\/client|scripts)\//;
-/** MCP tools the sidecar serves through its own lease path instead of a `case`. */
+/** Sidecar tools answered through its own lease path instead of a dispatch `case`. */
 const SIDECAR_NATIVE = new Set(['claim_next', 'heartbeat']);
+const SIDECAR = 'src/runner/sidecar.ts';
 
 const version = (text: string | undefined): string | undefined => {
   try { const v = JSON.parse(text ?? '').version; return typeof v === 'string' ? v : undefined; } catch { return undefined; }
@@ -65,19 +66,27 @@ export async function versionProblems(root: string, run: Runner = runProcess): P
   return problems;
 }
 
-/** Tool wiring: every MCP tool reaches the sidecar, and every test file a package script names exists. */
+/**
+ * The sidecar's tool table (`BASE_TOOLS`) read as text: the employee's tree is checked, so its sidecar is never
+ * imported or executed here. Line comments are dropped before the quoted names are taken.
+ */
+export function sidecarToolTable(sidecar: string): string[] {
+  const table = /const BASE_TOOLS = \[([\s\S]*?)\];/.exec(sidecar)?.[1] ?? '';
+  return [...table.replace(/\/\/[^\n]*/g, '').matchAll(/"([a-z_]+)"/g)].map(m => m[1]!);
+}
+
+/** Tool wiring: every sidecar tool dispatches, every dispatched tool is listed, and every test file a package script names exists. */
 export function wiringProblems(root: string): string[] {
   const problems: string[] = [];
-  const server = read(root, 'src/mcp/server.ts'), sidecar = read(root, 'src/runner/sidecar.ts') ?? read(root, 'plugin/server/sidecar.ts');
-  if (server && sidecar) {
-    const tools = [...server.matchAll(/registerTool\('([a-z_]+)'/g)].map(m => m[1]!);
+  const sidecar = read(root, SIDECAR);
+  if (sidecar) {
+    const tools = sidecarToolTable(sidecar);
     const cases = new Set([...sidecar.matchAll(/case "([a-z_]+)":/g)].map(m => m[1]!));
-    // The tool tables are the quoted names outside the dispatch `case` labels and their error strings.
-    const listed = new Set([...sidecar.replace(/case "[a-z_]+":[^\n]*(\n\s+[?:][^\n]*)*/g, '').matchAll(/"([a-z_]+)"/g)].map(m => m[1]!));
+    const listed = new Set(tools);
     const unrouted = tools.filter(tool => !SIDECAR_NATIVE.has(tool) && !cases.has(tool));
-    if (unrouted.length) problems.push(`MCP 工具未接到 sidecar 分发：${unrouted.join('、')}`);
-    const unlisted = tools.filter(tool => !SIDECAR_NATIVE.has(tool) && cases.has(tool) && !listed.has(tool));
-    if (unlisted.length) problems.push(`MCP 工具未列入 sidecar 工具表：${unlisted.join('、')}`);
+    if (unrouted.length) problems.push(`sidecar 工具未接到分发：${unrouted.join('、')}`);
+    const unlisted = [...cases].filter(tool => !listed.has(tool));
+    if (unlisted.length) problems.push(`sidecar 分发了未列入工具表的工具：${unlisted.join('、')}`);
   }
   const pkg = read(root, 'package.json');
   if (pkg) {

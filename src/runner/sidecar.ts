@@ -20,9 +20,9 @@ import { guardRelayResponse } from "../response-budget.ts";
 import { isPaged, parseReclaimInput, parseWorktreeInput, taskIdOf } from "../query-input.ts";
 import { arriving, SNAPSHOT_TOOLS, withinReplyCeiling } from "../reply-clock.ts";
 
-/** The release the service is running (the `active` symlink); undefined when it cannot be read. */
+/** The release the node updater made live (the `current` symlink to plugin-releases/<sha>/plugin); undefined when it cannot be read. */
 const qaRuntimeRelease = (): string | undefined => {
-  try { return basename(realpathSync(join(serviceHome(), "active"))); } catch { return undefined; }
+  try { return basename(dirname(realpathSync(join(serviceHome(), "current")))); } catch { return undefined; }
 };
 /** Stamp the actual running release onto a QA read answer; never a guessed value. */
 const withQaRelease = <T extends { meta: object }>(value: T): T => {
@@ -44,10 +44,8 @@ const BASE_TOOLS = [
   "company_cmd", "company_cmd_catalog",
   // SYS01 bounded reads: owner-only company summary and byte-segment reads of long text (core enforces both).
   "get_admin_summary", "read_task_text", "read_worktree_refs", "record_acceptance_evidence", "acceptance_status", "acceptance_gate", "set_acceptance_gate",
-  // SYS-INT controlled non-production deploy drill: host-executed (the service child), never the sandbox.
-  "deploy_drill_run", "deploy_drill_status",
   // SYS04: what the plugin process is actually running. Answered in the plugin host's own context, never from
-  // the MCP face's tree or the `active` symlink, so it can serve as evidence of the loaded version.
+  // a client-side tree or the `active` symlink, so it can serve as evidence of the loaded version.
   "plugin_runtime_diagnostics",
 ];
 
@@ -403,9 +401,6 @@ export class SidecarPool {
 
   /** Claims the task as the instance and stages claim.json in its comm dir. */
   async claim(inst: EmployeeInst, task: SupervisedTask): Promise<ClaimResult | undefined> {
-    // Legacy instances still carry a credential file their agent reads directly;
-    // rotating it here would kill their in-flight work. They phase out naturally.
-    if (inst.credentialFile) return undefined;
     if (this.quarantined.has(inst.id) || !this.launched.has(inst.id) || !this.keys.has(inst.id) ||
         (inst.paseoAgentId && !this.canReuse(inst))) {
       throw Object.assign(new Error("unhealthy session channel cannot claim"), { code: "stale_channel" });
@@ -530,8 +525,7 @@ export class SidecarPool {
     instId: string, live: LiveClaim, to: "owner" | undefined,
     text: string, path: string,
   ): Promise<void> {
-    const upgradeSha = /^\s*companyUpgradeSha:\s*(\S+)\s*$/m.exec(text)?.[1];
-    const evidence: Evidence = { ...(upgradeSha ? {companyUpgrade:{sha:upgradeSha}}:{}), text, idempotencyKey: `sidecar-file:${instId}:${live.proof.deliveryId}:${hash(text)}` };
+    const evidence: Evidence = { text, idempotencyKey: `sidecar-file:${instId}:${live.proof.deliveryId}:${hash(text)}` };
     try {
       const cred = await this.credentialFor(instId);
       if (to) {
@@ -646,7 +640,7 @@ export class SidecarPool {
   async adopt(insts: EmployeeInst[]): Promise<void> {
     for (const inst of insts) {
       this.roles.set(inst.id,{role:inst.role,task:inst.sessionTask});
-      if (inst.credentialFile || !inst.paseoAgentId || this.canReuse(inst)) continue;
+      if (!inst.paseoAgentId || this.canReuse(inst)) continue;
       try {
         const cred = await this.deps.workforce.rotate(inst.id); // retired/revoked insts throw
         this.creds.set(inst.id, cred);
@@ -912,7 +906,6 @@ export class SidecarPool {
       return raw;
     };
     const evidence = (): Evidence => ({
-      ...(args.companyUpgrade === undefined ? {} : { companyUpgrade: args.companyUpgrade as Evidence["companyUpgrade"] }),
       text: String(args.text ?? ""),
       idempotencyKey: String(args.idempotencyKey ?? `sidecar-relay:${instId}:${randomBytes(6).toString("hex")}`),
       ...(declared ? { acceptance: declared } : {}),
@@ -952,7 +945,7 @@ export class SidecarPool {
     switch (tool) {
       case "list_worktrees": return withinReplyCeiling(async () => {
         // R8：不带 taskId 即全局库存，只有 owner 可读，由 core 判定并拒绝员工；租约任务不再作为回退范围。
-        // 显式 taskId 走 core 的 getTask 授权。null 与缺省相同（与 MCP、core 同源）：parseWorktreeInput 只接受字符串 taskId。
+        // 显式 taskId 走 core 的 getTask 授权。null 与缺省相同（与 core 同源）：parseWorktreeInput 只接受字符串 taskId。
         const scope = parseWorktreeInput(args).taskId;
         // C1 default: a call that names neither pageSize nor cursor keeps the pre-SYS01 array; a paged call returns { worktrees, page }.
         if (isPaged(args) && core.worktreePage) return core.worktreePage(cred, { ...args, taskId: scope });
@@ -962,7 +955,7 @@ export class SidecarPool {
         return core.listWorktrees(cred, scope);
       });
       case "reclaim_worktrees": {
-        // Strict, as on MCP and in core (SYS01, D3): a null or non-boolean dryRun, and a repos that is not a list of paths, are
+        // Strict, as in core (SYS01, D3): a null or non-boolean dryRun, and a repos that is not a list of paths, are
         // refused before any tree is touched. A non-list repos used to widen silently into a reclaim of every repository.
         const params = parseReclaimInput(args);
         return core.reclaimWorktrees
@@ -1029,7 +1022,7 @@ export class SidecarPool {
       case "set_direction": await core.relayDirection(cred, args as never); return { recorded: true };
       case "resume_task": return core.resume(cred, taskIdOf(args.taskId), evidence());
       case "retire_task": return core.retireTask(cred, args as never);
-      // SYS03 老板处置账本：授权与全部写入都在 core；这里只是同一通道上的入口（sck 与 MCP 同源判定）。
+      // SYS03 老板处置账本：授权与全部写入都在 core；这里只是同一通道上的入口（sck 与 core 同源判定）。
       case "task_project_update": return core.taskProjectUpdate
         ? core.taskProjectUpdate(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose task_project_update"), { code: "temporarily_unavailable" }));
@@ -1052,8 +1045,8 @@ export class SidecarPool {
       }
       // SYS04: a read-only sample of what THIS process is running.
       //
-      // The sample is taken here, in the plugin host, because core also runs in the MCP face and a path read
-      // there would describe a different execution context than the one the employee's `sck call` reaches. The
+      // The sample is taken here, in the plugin host, because a path read in any other process would describe a
+      // different execution context than the one the employee's `sck call` reaches. The
       // authorization is core's: it decides whether this caller may read the diagnostics at all, and it does so
       // BEFORE the sample is taken, so an unauthorized read produces no diagnostic at all rather than a refused
       // one that still touched the filesystem. The role set is owner/product/qa — the operators who act on a
@@ -1075,23 +1068,11 @@ export class SidecarPool {
             this.log(`plugin source lookup failed: ${(error as Error).message}`);
           }
           const sample = collectPluginRuntimeDiagnostics(pluginSourceDir ? { pluginSourceDir } : {});
-          // The stamp that proves this answer came from the plugin face rather than the MCP one: the MCP process
-          // has no plugin server directory, so its own attempt to answer would report the binding unavailable.
+          // The stamp that marks this answer as coming from the plugin sidecar, so it can be told apart from a read
+          // taken in another process (which has no plugin server directory and would report the binding unavailable).
           return { ...sample, channel: "plugin-sidecar", instanceId: instId };
         });
       });
-      case "deploy_drill_run": return core.deployDrillRun
-        ? core.deployDrillRun(cred, {
-            taskId: String(args.taskId ?? live().taskId),
-            runId: String(args.runId ?? ""),
-            baseSha: String(args.baseSha ?? ""),
-            candidateSha: String(args.candidateSha ?? ""),
-            idempotencyKey: String(args.idempotencyKey ?? ""),
-          })
-        : Promise.reject(Object.assign(new Error("core does not expose deploy_drill_run"), { code: "temporarily_unavailable" }));
-      case "deploy_drill_status": return core.deployDrillStatus
-        ? core.deployDrillStatus(cred, { runId: String(args.runId ?? "") })
-        : Promise.reject(Object.assign(new Error("core does not expose deploy_drill_status"), { code: "temporarily_unavailable" }));
       default: throw Object.assign(new Error(RETIRED_TOOLS.has(tool)
         ? `${tool} 已下线：凭证不再交给员工，需要账号、workspace、登录请用运维工具（sck call ops_info '{}' 查看）`
         : `unknown tool: ${tool}`), { code: "unknown_tool" });

@@ -154,3 +154,12 @@ test('环境解析期间停止不会留下迟到启动的进程', async () => {
     expect(f.events).toHaveLength(0);
   } finally { release(); await f.close(); }
 });
+
+ test('Claude verbose JSON 数组只以最后的正式 result 判断完成', () => {
+  const result = { type: 'result', subtype: 'success', is_error: false, session_id: 'real-session', result: 'done' };
+  expect(parseNativeResult('claude', JSON.stringify([{ type: 'system' }, result]))).toMatchObject({ completed: true, sessionId: 'real-session', text: 'done' });
+  expect(parseNativeResult('claude', JSON.stringify([result, { type: 'assistant' }])).completed).toBe(false);
+  expect(parseNativeResult('claude', '[]').completed).toBe(false);
+  expect(nativeArgs({ provider: 'codex', model: '' })).toContain('--skip-git-repo-check');
+  expect(nativeArgs({ provider: 'codex', model: '', nativeSessionId: 'resumed' })).toContain('--skip-git-repo-check');
+});

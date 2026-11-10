@@ -25,7 +25,7 @@ import { hostIOOrUndefined } from './host-io.ts';
 export type OwnerVia = string;
 export interface OwnerApiContext { db: CompanyDatabase; core: CompanyCore & {
   contributorDryRun(credential: string, input: { taskIds: string[] }): Promise<unknown>;
-}; owner: OwnerDesk; workforce: Workforce; messages: OutboundMessageStore; opsRepo: string; upgrades?: { inbox(): Promise<unknown>; setAuto(enabled: boolean, source: string): Promise<unknown>; start(input: { taskId: string; taskVersion: number; digest: string }, source: string): Promise<unknown> } }
+}; owner: OwnerDesk; workforce: Workforce; messages: OutboundMessageStore; opsRepo: string }
 
 const actor = (via: string) => `owner:${via || 'web'}`;
 const text = (value: unknown, field: string, min = 1, max = 20000): string => {
@@ -36,12 +36,11 @@ const optionalText = (value: unknown): string | undefined => typeof value === 's
 const strArray = (value: unknown): string[] => Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
 
 /**
- * Commands that act on the machine they run on: the upgrade desk reads and writes local files and runs local commands, and
- * task.create signs the new task with the owner's credential (SCK_OWNER_TOKEN), which only the local owner process holds.
+ * Commands that act on the machine they run on: task.create signs the new task with the owner's credential (SCK_OWNER_TOKEN), which only the local owner process holds.
  * A process without an execution host (a Worker, for one) answers them with CompanyError('unavailable'); the owner gateway
  * queues them as ops_job records for the execution end instead.
  */
-export const RUNNER_ONLY_COMMANDS: ReadonlySet<string> = new Set(['upgrade.list', 'upgrade.automatic', 'upgrade.start', 'task.create']);
+export const RUNNER_ONLY_COMMANDS: ReadonlySet<string> = new Set(['task.create']);
 
 /**
  * The owner edits the text an employee would receive: the board's outbox text, which is the stored body rendered with that employee's
@@ -231,14 +230,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       return ctx.owner.decide({ taskId: text(input.taskId, 'taskId'), decision: decision as 'approve' | 'reject' | 'reply',
         note: text(input.note ?? '', 'note', command === 'approve' ? 0 : 2), source: a, key: key() });
     }
-    case 'inbox': {
-      // The upgrade desk already returns the whole inbox with its upgrades field; wrapping it again hid the running version.
-      if (ctx.upgrades) return ctx.upgrades.inbox();
-      return ctx.owner.inbox();
-    }
-    case 'upgrade.list': return ctx.upgrades ? await ctx.upgrades.inbox() : { upgrades: { items: [] } };
-    case 'upgrade.automatic': { const enabled = input.enabled === true; return ctx.upgrades ? await ctx.upgrades.setAuto(enabled, a) : { ok: false }; }
-    case 'upgrade.start': return ctx.upgrades ? await ctx.upgrades.start({ taskId: text(input.taskId, 'taskId'), taskVersion: Number(input.taskVersion), digest: text(input.digest, 'digest') }, a) : { ok: false };
+    case 'inbox': return ctx.owner.inbox();
     case 'brief': return ctx.owner.brief();
     case 'direction.add':
       await ctx.owner.addDirection({ text: text(input.text, 'text', 2), source: a, key: key() });
