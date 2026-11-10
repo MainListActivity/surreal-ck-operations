@@ -83,10 +83,11 @@ run('真实反馈到需求：幂等接收、限流、去掉联系信息、只生
   expect(await receiveFeedback(db,'sample','https://sample.example','192.0.2.1',input)).toEqual(receipt);
   const triage=await triageFeedback(db,async input=>{
     expect(input.feedback.contact).toBe('');expect(input.feedback.page).toBe('https://sample.example/settings');
-    return {disposition:'new',category:'bug',reason:'可整理为缺陷',title:'修复保存设置',problem:'点击保存没有生效',acceptance:'保存后刷新保留新值',priority:1};
+    return {disposition:'new',category:'bug',reason:'可整理为缺陷',title:'修复保存设置',problem:'点击保存没有生效',acceptance:['保存后刷新保留新值','错误时保留用户输入'],priority:1};
   });
   expect(triage.linked).toBe(1);
   const req=await store.get('feedback-'+receipt.id);expect(req.state).toBe('pending');expect(req.approved_revision).toBeUndefined();
+  expect(req.acceptance).toBe('保存后刷新保留新值\n错误时保留用户输入');
   for(let i=1;i<20;i++)await receiveFeedback(db,'sample','https://sample.example','192.0.2.1',{...input,requestKey:`feedback-test-${i+100}`});
   await denied(receiveFeedback(db,'sample','https://sample.example','192.0.2.1',{...input,requestKey:'feedback-too-many'}),'过于频繁');
 });

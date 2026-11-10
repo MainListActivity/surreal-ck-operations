@@ -21,6 +21,15 @@ export function feedbackDecision(value:unknown,candidates:readonly string[]):Fee
   if(!['new','existing','dismiss'].includes(String(v.disposition))||!['bug','feature','question','noise'].includes(String(v.category)))throw new CompanyError('invalid','反馈整理结果分类无效');
   if(typeof v.reason!=='string'||!v.reason.trim()||v.reason.length>1200)throw new CompanyError('invalid','反馈整理必须给出有界理由');
   if(v.disposition==='existing'&&(typeof v.requirementId!=='string'||!candidates.includes(v.requirementId)))throw new CompanyError('invalid','反馈只能关联本产品提供的候选需求');
+  if(v.disposition==='new'&&v.acceptance!==undefined){
+    let acceptance=v.acceptance;
+    if(Array.isArray(acceptance)){
+      if(acceptance.length>30||acceptance.some(item=>typeof item!=='string'))throw new CompanyError('invalid','验收标准须为文本或最多 30 条文本');
+      acceptance=acceptance.map(item=>(item as string).trim()).filter(Boolean).join('\n');
+    }
+    if(typeof acceptance!=='string'||acceptance.length>3000)throw new CompanyError('invalid','验收标准须为不超过 3000 字符的文本');
+    return {...v,acceptance} as unknown as FeedbackDecision;
+  }
   return v as unknown as FeedbackDecision;
 }
 
