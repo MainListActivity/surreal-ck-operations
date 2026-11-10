@@ -108,8 +108,14 @@ test('网络失败不丢结果不清租约，重启后自动重试，agent 无�
     await f.settle(f.event());
     expect(f.pool.holdsLease('worker', 'task')).toBe(true);
     expect(f.journal().rows()[0]?.state).toBe('pending');
-    await f.restart(); f.fail(false); await f.retry();
+    expect(f.pool.hasPendingResult('worker', 'task', 'delivery-a')).toBe(true);
+    expect(f.pool.hasPendingResult('worker', 'task', 'other-delivery')).toBe(false);
+    expect(f.pool.hasPendingResult('worker', 'other-task', 'delivery-a')).toBe(false);
+    await f.restart();
+    expect(f.pool.hasPendingResult('worker', 'task', 'delivery-a')).toBe(true);
+    f.fail(false); await f.retry();
     expect(f.journal().rows()[0]?.state).toBe('settled');
+    expect(f.pool.hasPendingResult('worker', 'task', 'delivery-a')).toBe(false);
     expect(f.calls[0]?.key).toBe(f.calls[1]?.key);
   } finally { f.close(); }
 });
@@ -195,7 +201,10 @@ test('宿主结束事件没有正文时按回合读取，读取失败由执行�
     await f.claim(); await f.pool.turnStarted('agent','turn-a');
     await f.pool.settleExecution({...f.event(),timeline:[]});
     expect(f.calls).toHaveLength(0);expect(f.journal().rows()[0]?.state).toBe('collecting');
-    await f.restart();available = true;await f.retry();
+    expect(f.pool.hasPendingResult('worker', 'task', 'delivery-a')).toBe(true);
+    await f.restart();
+    expect(f.pool.hasPendingResult('worker', 'task', 'delivery-a')).toBe(true);
+    available = true;await f.retry();
     expect(f.calls.map(c=>c.action)).toEqual(['submit']);expect(f.journal().rows()[0]?.state).toBe('settled');
   } finally { f.close(); }
 });

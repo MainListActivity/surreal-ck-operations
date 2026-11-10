@@ -118,7 +118,7 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
       const refusal = denied.get(id);
       if (refusal) { events.push(`claim-denied:${i.id}:${id}`); throw Object.assign(new Error(`refused: ${refusal}`), { code: refusal }); }
       events.push(`claim:${i.id}:${id}`); const v = views.get(id)!; Object.assign(v, { state: v.state === 'review' ? 'review' : 'doing', currentEmployee: i.id, version: v.version + 1, fence: v.fence + 1 }); v.deliveryId = `d-${id}-${v.fence}`;
-      Object.assign(rows.find(t => t.id === id)!, v, { leaseExpiresAt: 2000 }); i.activeTask = id;
+      Object.assign(rows.find(t => t.id === id)!, v, { leaseExpiresAt: 2000 }); rows.find(t => t.id === id)!.row.delivery_id = v.deliveryId; i.activeTask = id;
       return { task: { ...v }, deliveryId: v.deliveryId, fence: v.fence, leaseExpiresAt: new Date().toISOString(), history: [], worktree: v.worktree }; },
     getTask: async (_c: string, id: string) => ({ ...views.get(id)! }), history: async () => [], authenticate: async () => ({ employeeId: 'fixture', role: 'owner' }),
     companyBrief: async () => ({}), listTasks: async () => [], relayDirection: async () => { events.push('management'); }, heartbeat: async (_c: string, p: LeaseProof) => ({ task: check(p) }),
@@ -210,6 +210,81 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
     setLastError: (text: string) => { lastError = text; },
     restart: async () => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); pool = makePool(); await pool.adopt(instances.map(i => ({ ...i, credential: undefined }))); } };
 }
+describe('lease supervision requires a confirmed runtime stop', () => {
+  for (const stopResult of ['throws', 'still-running', 'unknown', 'status-throws'] as const) {
+    test(`a stalled holder is not reassigned when stopping ${stopResult}`, async () => {
+      const w = world(); w.addTask('stalled'); await w.dispatcher().tick();
+      const employee = w.rows[0]!.currentEmployee;
+      w.rows[0]!.progressAt = 0; w.setNow(100000);
+      w.paseo.stop = async () => {
+        if (stopResult === 'throws') throw new Error('stop response lost');
+      };
+      if (stopResult === 'unknown') w.paseo.status = async () => ({ status: 'unknown', pendingPermissions: 0 });
+      if (stopResult === 'status-throws') w.paseo.status = async () => { throw new Error('status unavailable'); };
+      // Reconstructing the dispatcher cannot turn an unconfirmed stop into permission to retry.
+      for (let n = 0; n < 2; n++) {
+        const report = await w.dispatcher().tick();
+        expect(report.revoked).toEqual([]);
+        expect(w.rows[0]!.currentEmployee).toBe(employee);
+      }
+      expect(w.events.filter(e => e.startsWith('claim:'))).toHaveLength(1);
+      expect(w.spawnBodies).toHaveLength(1);
+    });
+  }
+  test('an expired holder with unknown runtime status keeps its lease and raises an operational notice', async () => {
+    const w = world(); w.addTask('unreachable'); await w.dispatcher().tick();
+    const employee = w.rows[0]!.currentEmployee;
+    w.agents.get(w.instances[0]!.paseoAgentId!)!.status = 'unknown';
+    w.rows[0]!.progressAt = 0; w.setNow(100000);
+    const report = await w.dispatcher().tick();
+    expect(report.revoked).toEqual([]);
+    expect(w.rows[0]!.currentEmployee).toBe(employee);
+    expect([...w.notices.keys()]).toContain(`runtime-uncertain:${employee}:unreachable`);
+    expect(w.events.filter(e => e.startsWith('claim:'))).toHaveLength(1);
+  });
+  test('a confirmed idle runtime after stop can release the stalled lease', async () => {
+    const w = world(); w.addTask('stalled'); await w.dispatcher().tick();
+    w.rows[0]!.progressAt = 0; w.setNow(100000);
+    await w.dispatcher().tick();
+    expect(w.events).toContain('revoke:stalled');
+  });
+  test('a captured result waiting for storage is retained even if the runtime is idle and the lease expired', async () => {
+    const w = world(); w.addTask('pending'); await w.dispatcher().tick();
+    const employee = w.rows[0]!.currentEmployee;
+    w.agents.get(w.instances[0]!.paseoAgentId!)!.status = 'idle';
+    w.pool.hasPendingResult = (inst, task, delivery) => inst === employee && task === 'pending'
+      && delivery === w.rows[0]!.row.delivery_id;
+    w.rows[0]!.progressAt = 0; w.setNow(100000);
+    const report = await w.dispatcher().tick();
+    expect(report.revoked).toEqual([]);
+    expect(w.rows[0]!.currentEmployee).toBe(employee);
+    expect(w.events.filter(e => e.startsWith('claim:'))).toHaveLength(1);
+  });
+  test('a result captured while stopping is retained before the next dispatch', async () => {
+    const w = world(); w.addTask('stopping'); await w.dispatcher().tick();
+    let pending = false;
+    w.pool.hasPendingResult = () => pending;
+    const stop = w.paseo.stop;
+    w.paseo.stop = async id => { await stop(id); pending = true; };
+    w.rows[0]!.progressAt = 0; w.setNow(100000);
+    expect((await w.dispatcher().tick()).revoked).toEqual([]);
+    expect(w.events.filter(e => e.startsWith('claim:'))).toHaveLength(1);
+  });
+  test('resolved uncertainty clears only this node employee notice', async () => {
+    const w = world(); w.addTask('local'); await w.dispatcher().tick();
+    const employee = w.rows[0]!.currentEmployee;
+    w.agents.get(w.instances[0]!.paseoAgentId!)!.status = 'unknown';
+    await w.dispatcher().tick();
+    const own = `runtime-uncertain:${employee}:local`, foreign = 'runtime-uncertain:other-node-worker:foreign';
+    w.notices.set(foreign, 'another node is waiting');
+    expect(w.notices.has(own)).toBe(true);
+    w.rows[0]!.currentEmployee = undefined;
+    w.rows[0]!.state = 'done';
+    await w.dispatcher().tick();
+    expect(w.notices.has(own)).toBe(false);
+    expect(w.notices.has(foreign)).toBe(true);
+  });
+});
 describe('dispatcher + sidecar launch/reuse/restart', () => {
   test('same-process reuse keeps launch binding for management, ops and review', async () => {
     const w = world(); w.addTask('first'); const d = w.dispatcher(); await d.tick();
