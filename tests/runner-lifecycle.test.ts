@@ -34,6 +34,7 @@ test('执行批次与结果重启后保持，重放使用同一幂等键', () =>
 });
 
 import { SidecarPool } from '../src/runner/sidecar.ts';
+import { settleCompanyTurn, TurnInterruptions } from '../src/runner/turn-closeout.ts';
 import { writeFileSync, existsSync } from 'node:fs';
 import type { LeaseProof, ClaimResult } from '../src/contracts.ts';
 
@@ -66,7 +67,9 @@ function fixture(readTurnResult?: (agent: string, turn: string) => Promise<strin
   const event = (turn = 'turn-a', text = '工作已完成，全部只读检查通过，证据已生成。', kind = 'completed') =>
     ({ agent: { id: 'agent' }, turnId: turn, outcome: { kind }, timeline: [{ type: 'assistant_message', text }] });
   const journal = () => new ExecutionJournal(join(root, 'private', 'executions', createHash('sha256').update(options.runDir).digest('hex')));
-  return { root, calls, inst, event, journal, get pool() { return pool; },
+  return { root, calls, inst, event, journal,
+    settle: (value = event(), interruptions?: TurnInterruptions) => settleCompanyTurn({sidecar: pool, workforce} as never, {} as never, value as never, interruptions),
+    get pool() { return pool; },
     fail(value: boolean) { fail = value; }, loseReply() { loseReply = true; }, failRead(value: boolean) { failRead = value; },
     async claim(review = false) { phase = review ? 'review' : 'doing'; pool.env(inst); inst.paseoAgentId = 'agent'; pool.bindAgent(inst.id, 'agent'); await pool.claim(inst, { id: 'task' } as never); },
     async restart() { pool.close(); pool = new SidecarPool(options); await pool.adopt([inst]); },
@@ -80,7 +83,7 @@ test('执行 agent 不调用命令，最终答复自动送审；重复结束只�
   const f = fixture(); try {
     await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
     expect(f.journal().rows()[0]?.state).toBe('running');
-    await f.pool.settleExecution(f.event()); await f.pool.settleExecution(f.event());
+    await f.settle(f.event()); await f.settle(f.event());
     expect(f.calls.map(c => c.action)).toEqual(['submit']);
     expect(f.journal().rows()[0]?.state).toBe('settled');
     expect(f.pool.holdsLease('worker', 'task')).toBe(false);
@@ -89,7 +92,7 @@ test('执行 agent 不调用命令，最终答复自动送审；重复结束只�
 test('复核结果由执行端记录，失败回合即使留下报告也不提交', async () => {
   const f = fixture(); try {
     await f.claim(true); await f.pool.turnStarted('agent', 'turn-a');
-    await f.pool.settleExecution(f.event('turn-a', '复核结论：通过\n逐条核对了证据，全部满足标准。'));
+    await f.settle(f.event('turn-a', '复核结论：通过\n逐条核对了证据，全部满足标准。'));
     expect(f.calls.map(c => c.action)).toEqual(['accept']);
   } finally { f.close(); }
   const g = fixture(); try {
@@ -102,7 +105,7 @@ test('复核结果由执行端记录，失败回合即使留下报告也不提�
 test('网络失败不丢结果不清租约，重启后自动重试，agent 无需补交', async () => {
   const f = fixture(); try {
     await f.claim(); f.fail(true);
-    await f.pool.settleExecution(f.event());
+    await f.settle(f.event());
     expect(f.pool.holdsLease('worker', 'task')).toBe(true);
     expect(f.journal().rows()[0]?.state).toBe('pending');
     await f.restart(); f.fail(false); await f.retry();
@@ -112,7 +115,7 @@ test('网络失败不丢结果不清租约，重启后自动重试，agent 无�
 });
 test('提交已成功但回复丢失：重启后重放原请求，不重复变更任务', async () => {
   const f = fixture(); try {
-    await f.claim(); f.loseReply(); await f.pool.settleExecution(f.event());
+    await f.claim(); f.loseReply(); await f.settle(f.event());
     await f.restart(); await f.retry();
     expect(f.journal().rows()[0]?.state).toBe('settled');
     expect(f.calls).toHaveLength(2); expect(f.calls[0]).toEqual(f.calls[1]);
@@ -120,18 +123,18 @@ test('提交已成功但回复丢失：重启后重放原请求，不重复变�
 });
 test('明确的版本冲突由执行端刷新 proof 后补交', async () => {
   const f = fixture(); try {
-    await f.claim(); f.nextVersion(); await f.pool.settleExecution(f.event()); await f.retry();
+    await f.claim(); f.nextVersion(); await f.settle(f.event()); await f.retry();
     expect(f.calls.map(c => c.proof.expectedVersion)).toEqual([2, 3]);
     expect(f.journal().rows()[0]?.state).toBe('settled');
   } finally { f.close(); }
 });
 test('旧回合重复结束不会提交新批次，新的回合必须匹配', async () => {
   const f = fixture(); try {
-    await f.claim(); await f.pool.turnStarted('agent', 'turn-a'); await f.pool.settleExecution(f.event());
+    await f.claim(); await f.pool.turnStarted('agent', 'turn-a'); await f.settle(f.event());
     f.nextDelivery(); await f.claim(); await f.pool.turnStarted('agent', 'turn-b');
-    await f.pool.settleExecution(f.event()); await f.pool.settleExecution(f.event('late-unknown'));
+    await f.settle(f.event()); await f.settle(f.event('late-unknown'));
     expect(f.calls).toHaveLength(1); expect(f.pool.holdsLease('worker', 'task')).toBe(true);
-    await f.pool.settleExecution(f.event('turn-b')); expect(f.calls).toHaveLength(2);
+    await f.settle(f.event('turn-b')); expect(f.calls).toHaveLength(2);
   } finally { f.close(); }
 });
 test('心跳与复查同时暂时不可用，不把本地 claim 当作失效删除', async () => {
@@ -150,7 +153,7 @@ test('本地 claim 丢失仍保存并提交结束结果，不要求 agent 补交
   const f = fixture(); try {
     await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
     f.pool.dropLease('worker', 'task');
-    await f.pool.settleExecution(f.event());
+    await f.settle(f.event());
     expect(f.calls.map(c => c.action)).toEqual(['submit']);
     expect(f.journal().rows()[0]?.state).toBe('settled');
   } finally { f.close(); }
@@ -178,7 +181,7 @@ test('重复结束恢复同一 collecting 快照，不重新读取被覆盖的�
     row.state = 'collecting'; row.turns.push('turn-a');
     row.artifacts = {raw: JSON.stringify({summary:'已完成真实工作检查，成果已经持久保存。'})}; f.journal().save(row);
     writeFileSync(join(f.pool.commDirFor('worker'), 'result.json'), 'invalid');
-    await f.pool.settleExecution(f.event()); await f.retry();
+    await f.settle(f.event()); await f.retry();
     expect(f.calls.map(c => c.action)).toEqual(['submit']);
     expect(f.journal().rows()[0]?.state).toBe('settled');
   } finally { f.close(); }
@@ -210,10 +213,13 @@ test('宿主读取只接受目标回合的最终答复，不串新回合也不�
 
 test('Paseo 重开会话复用回合编号，新派工仍记录启动并自动收尾', async () => {
   const f = fixture();try {
-    await f.claim();await f.pool.turnStarted('agent','turn-a');await f.pool.settleExecution(f.event());
-    f.nextDelivery();await f.claim();await f.pool.turnStarted('agent','turn-a');
+    await f.claim();await f.pool.turnStarted('agent','turn-a');await f.settle(f.event());
+    f.nextDelivery();await f.claim();
+    await f.settle(f.event()); // duplicate from old delivery before any new start
+    expect(f.calls).toHaveLength(1);
+    await f.pool.turnStarted('agent','turn-a');
     expect(f.journal().read('worker','delivery-b')?.state).toBe('running');
-    await f.pool.settleExecution(f.event());
+    await f.settle(f.event());
     expect(f.calls.map(c=>c.proof.deliveryId)).toEqual(['delivery-a','delivery-b']);
   } finally {f.close();}
 });
@@ -225,9 +231,27 @@ test('相同宿主回合号使用启动时间隔离，运行中事件不能提�
 });
 
 test('取消后同批次重开复用回合号，新的启动可以正常完成', async () => {
-  const f=fixture();try {
-    await f.claim();await f.pool.turnStarted('agent','turn-a');await f.pool.settleExecution(f.event('turn-a','部分进度','canceled'));
+  const f=fixture(), interruptions = new TurnInterruptions();try {
+    await f.claim();await f.pool.turnStarted('agent','turn-a');await f.settle(f.event('turn-a','部分进度','canceled'), interruptions);
     await f.pool.turnStarted('agent','turn-a');expect(f.journal().rows()[0]?.state).toBe('running');
-    await f.pool.settleExecution(f.event());expect(f.calls.map(c=>c.action)).toEqual(['submit']);
-  }finally{f.close();}
+    await f.settle(f.event());expect(f.calls.map(c=>c.action)).toEqual(['submit']);
+  }finally{interruptions.stop();f.close();}
+});
+
+
+test('同毫秒重开同号回合与重复启动事件：只为每个实际启动收尾一次', async () => {
+  const f = fixture(), interruptions = new TurnInterruptions();
+  const now = Date.now;
+  try {
+    Date.now = () => 1800000000000;
+    await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
+    await f.settle(f.event('turn-a', '部分进度', 'canceled'), interruptions);
+    await f.pool.turnStarted('agent', 'turn-a');
+    const key = f.pool.turnCloseoutKey('agent', 'turn-a');
+    await f.pool.turnStarted('agent', 'turn-a');
+    expect(f.pool.turnCloseoutKey('agent', 'turn-a')).toBe(key);
+    await Promise.all([f.settle(), f.settle()]);
+    expect(f.calls.map(c => c.action)).toEqual(['submit']);
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+  } finally { Date.now = now; interruptions.stop(); f.close(); }
 });

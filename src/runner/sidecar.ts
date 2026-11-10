@@ -253,6 +253,14 @@ export class SidecarPool {
   private readonly journal?: ExecutionJournal;
   private readonly flushing = new Set<string>();
   private readonly starts = new Map<string, string | undefined>();
+  // Host turn IDs can be reused after a canceled execution or a new delivery.
+  // Count accepted starts, rather than timestamps (two starts may share a millisecond).
+  private startSequence = 0;
+  private readonly closeoutStarts = new Map<string, number>();
+  turnCloseoutKey(agent: string, turn: string): string {
+    const identity = JSON.stringify([agent, turn]);
+    return JSON.stringify([agent, turn, this.closeoutStarts.get(identity) ?? 0]);
+  }
   private closed = false;
   constructor(private readonly deps: SidecarDeps) {
     this.opsCircuit = new OpsCircuit(deps.runDir);
@@ -272,6 +280,12 @@ export class SidecarPool {
     if (row.result || ['settled', 'superseded', 'collecting'].includes(row.state)) return;
     if (row.state === 'interrupted' && turn) row.turns = row.turns.filter(value => value !== turn);
     if (row.state === 'running' && row.turn === turn) return;
+    if (turn) {
+      const identity = JSON.stringify([agent, turn]);
+      this.closeoutStarts.delete(identity);
+      this.closeoutStarts.set(identity, ++this.startSequence);
+      if (this.closeoutStarts.size > 512) this.closeoutStarts.delete(this.closeoutStarts.keys().next().value!);
+    }
     row.startedAt = Date.now();
     row.agent = agent; row.turn = turn; row.state = 'running';
     await this.changed(row);
