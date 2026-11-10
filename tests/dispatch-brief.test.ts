@@ -47,10 +47,11 @@ const claim = (state: string, history: HistoryEntry[], intent: 'code' | 'read' =
 }) as unknown as ClaimResult;
 const task = (state: string) => ({ id: 't1', title: '导出 · 实现', state, row: {} }) as never;
 
-test('the dispatch message is three sentences: what, finish, which tool', () => {
+test('派工说明只描述工作与结果，不要求生命周期命令', () => {
   const first = wake({ id: 'e1', role: 'engineering' } as never, task('doing'), env, true, { claim: claim('doing', []), commDir: '/c' });
   expect(first).toContain('实现 /c/task.md 中的需求');
-  expect(first).toContain(`'/bin/sck' call submit '{"text":"…","idempotencyKey":"…"}'`);
+  expect(first).toContain('执行端自动保存');
+  expect(first).not.toContain('call submit');
   expect(first).not.toContain('工作目录');
   const rework = wake({ id: 'e1', role: 'engineering' } as never, task('doing'), env, false, { claim: claim('doing', [ret('a'), ret('b'), ret('c')]), commDir: '/c' });
   expect(rework).toContain('修复 /c/findings/round-03.md 中的问题');
@@ -58,5 +59,6 @@ test('the dispatch message is three sentences: what, finish, which tool', () => 
   const review = wake({ id: 'e2', role: 'engineering' } as never, task('review'), env, true, { claim: claim('review', []), commDir: '/c' });
   expect(review).toContain('先查 /c/task.md 的验收标准第 1 条');
   expect(review).not.toContain('在生产逐条复验');
-  expect(review).toContain("call review");
+  expect(review).toContain('复核结论：通过');
+  expect(review).not.toContain('call review');
 });

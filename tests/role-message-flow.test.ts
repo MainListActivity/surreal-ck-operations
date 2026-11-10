@@ -45,56 +45,25 @@ test('minimal dispatch message: only what, where, how; no onboarding on first co
     { claim: { task: { id: 't1', state: 'doing' }, history: [], worktree: { worktreePath: '/w', intent: { kind: 'code' } } } as never, commDir: '/c' });
   expect(first).toBe(second);
   expect(first).toContain('task.md');
-  expect(first).toContain('submit');
+  expect(first).toContain('执行端自动保存');
+  expect(first).not.toContain('submit');
   for (const forbidden of ['AGENTS.md', 'PROTOCOL', '公司唯一真人', 'checkpoint', '员工编号', '凭证']) expect(first).not.toContain(forbidden);
 });
 
-test('template bodies are the exact minimal sentences', () => {
-  // 员工沙箱不安装：代码任务在最终提交上自验，合入 main 后 submit，安装由老板侧完成。
-  expect(templateFor('execute', true)).toContain('在最终提交上按验收标准逐条自验');
-  expect(templateFor('execute', true)).toContain('合入 main');
-  expect(templateFor('execute', true)).toContain('安装到生产由老板侧完成');
-  expect(templateFor('execute', true)).toContain('不要安装');
-  expect(templateFor('execute', true)).not.toContain('升级卡');
-  expect(templateFor('execute', true)).not.toContain('发布到生产');
-  expect(templateFor('execute', true)).not.toContain('在生产逐条自验');
-  expect(templateFor('execute', false)).not.toContain('合入 main');
-  // 复核先查第 1 条；软件线只在最终合入提交上核对，不检查生产加载的版本。
-  expect(templateFor('review', true)).toContain('先查验收标准第 1 条');
-  expect(templateFor('review', true)).toContain('老板视角');
-  expect(templateFor('review', true)).toContain('最终合入提交上核对');
-  expect(templateFor('review', true)).not.toContain('在生产逐条复验');
-  expect(templateFor('review', false)).toContain('先查验收标准第 1 条');
-  expect(templateFor('review', false)).not.toContain('在生产');
-  expect(templateFor('review', true)).toContain('call review');
-  expect(templateFor('review', false)).toContain('call review');
-  expect(templateFor('rework')).toContain('findings/round-NN.md');
-  // 被退回那一轮写的笔记不会生效：模板里要说清楚，员工按通过的那轮写。
-  expect(templateFor('execute', true)).toContain('被退回那一轮写的笔记不会生效');
-  expect(templateFor('review', true)).toContain('被退回那一轮写的笔记不会生效');
-});
-
-test('the code template instructs a sha submit and resolves absolute paths', () => {
+test('默认派工模板只要求工作产出，辅助工具仍可用', () => {
   const opts = { sckBin: '/bin/sck', commDir: '/c', taskId: 't1' };
-  const body = templateFor('execute', true);
-  expect(body).toContain('"sha":"<合入提交>"');
-  expect(renderMessage(body, opts)).toContain("'/bin/sck' call submit");
-  // Rework prefixes the same instruction with the findings repair step.
-  expect(renderMessage(templateFor('rework', true), { ...opts, findingsFile: '/f/round-1.md' })).toContain('round-1.md');
-});
-
-test('company commands are named in every employee execute, rework and review body, with the sck path resolved', () => {
-  // 老板端的运维与管理命令都经 company_cmd 调用，先用 company_cmd_catalog 查可用命令；只能在持有任务时调用。
-  const opts = { sckBin: '/bin/sck', commDir: '/c', taskId: 't1' };
-  const bodies = [templateFor('execute', true), templateFor('execute', false), templateFor('rework', true), templateFor('review', true), templateFor('review', false)];
-  for (const body of bodies) {
-    expect(body).toContain('sck call company_cmd 调用');
-    expect(body).toContain('sck call company_cmd_catalog 查可用命令');
-    expect(body).toContain('只能在持有任务时调用');
-    const rendered = renderMessage(body, { ...opts, findingsFile: '/f/round-1.md' });
-    expect(rendered).toContain("'/bin/sck' call company_cmd 调用");
-    expect(rendered).toContain("'/bin/sck' call company_cmd_catalog 查可用命令");
+  for (const step of ['execute', 'review', 'rework', 'nudge'] as const) for (const code of [false, true]) {
+    const body = templateFor(step, code);
+    expect(body).toContain('task.md');
+    expect(body).toContain('sck call company_cmd_catalog');
+    expect(body).not.toMatch(/call (submit|review|checkpoint|heartbeat|claim_next)/);
+    expect(body).not.toContain('idempotencyKey');
+    expect(renderMessage(body, opts)).toContain("'/bin/sck' call company_cmd_catalog");
   }
+  expect(templateFor('review', true)).toContain('复核结论：通过');
+  expect(templateFor('review', true)).toContain('最终合入提交上核对');
+  expect(templateFor('review', false)).not.toContain('最终合入提交');
+  expect(templateFor('rework')).toContain('findings/round-NN.md');
 });
 
 test('machineCriterionId reads the first required machine criterion and falls back when absent', async () => {
@@ -130,7 +99,7 @@ test('review drafts and no-draft review sends use the same code flag as execute'
   } as never);
   // 建单草稿：code=true 时执行和复核都按软件线模板。
   await fake({}).createTaskDrafts('t1', 'engineering', 'qa', true);
-  expect(created.find(c => c.step === 'execute')!.body).toContain('合入 main');
+  expect(created.find(c => c.step === 'execute')!.body).toContain('在最终提交上');
   expect(created.find(c => c.step === 'review')!.body).toContain('先查验收标准第 1 条');
   // 旧任务没有复核草稿：prepareSend 即时生成时也必须按工作种类选模板。
   created.length = 0;

@@ -18,7 +18,7 @@ export interface RuntimeHost {
   } };
 }
 export interface RuntimeEvents {
-  'agent.turn_started': { agent: RuntimeAgent };
+  'agent.turn_started': { agent: RuntimeAgent; turnId?: string | null };
   'agent.turn_ended': TurnEnded;
   'agent.archived': { agent: RuntimeAgent };
   'workspace.archived': unknown;

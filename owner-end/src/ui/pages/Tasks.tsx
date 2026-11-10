@@ -10,6 +10,7 @@ interface TaskRow {
   executor_role?: string;
   reviewer_role?: string;
   type?: string;
+  runtime_execution?: { state: string; attempts?: number; error?: string };
   [key: string]: unknown;
 }
 
@@ -134,6 +135,12 @@ export function TasksPage() {
                 <span class="tag">{TASK_STATE_ZH[detail.task.state ?? ''] ?? detail.task.state ?? '未知状态'}</span>{' '}
                 执行 {detail.task.executor_role ?? '—'} · 复核 {detail.task.reviewer_role ?? '—'}
               </p>
+              {detail.task.runtime_execution ? <p class="hint">执行端：{
+                ({ reserved: '已预留，等待启动确认', running: '执行中', collecting: '正在保存结果', pending: '结果已保存，自动处理中',
+                  settled: '结果已入库', interrupted: '本轮中断，等待恢复', superseded: '执行批次已被接替', attention: '等待处理' } as Record<string, string>)[detail.task.runtime_execution.state]
+                  ?? detail.task.runtime_execution.state
+              }{detail.task.runtime_execution.attempts ? ` · 已重试 ${detail.task.runtime_execution.attempts} 次` : ''}
+              {detail.task.runtime_execution.error ? ` · ${detail.task.runtime_execution.error}` : ''}</p> : null}
               <div class="button-row">
                 <button type="button" onClick={() => setSubtaskOf(subtaskOf ? undefined : selected)}>
                   {subtaskOf ? '收起子任务' : '加子任务'}

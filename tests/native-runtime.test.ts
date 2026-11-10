@@ -163,3 +163,20 @@ test('环境解析期间停止不会留下迟到启动的进程', async () => {
   expect(nativeArgs({ provider: 'codex', model: '' })).toContain('--skip-git-repo-check');
   expect(nativeArgs({ provider: 'codex', model: '', nativeSessionId: 'resumed' })).toContain('--skip-git-repo-check');
 });
+
+test('原生回合结束通知失败后持久保存结果，重启只重放结果不重跑模型', async () => {
+  const f = fixture(success, { onEnded: async () => { throw new Error('synthetic host unavailable'); } });
+  let replacement: NativeRuntime | undefined;
+  try {
+    const id = await f.runtime.spawn(input()); await f.runtime.activate(id);
+    await until(() => !!f.runtime.describe(id)?.pendingEnd);
+    await f.runtime.close();
+    const recovered: TurnEnded[] = [];
+    replacement = new NativeRuntime({ root: f.root, host: 'test', command: () => { throw new Error('must not start a process'); },
+      environment: async () => ({}), onEnded: async event => { recovered.push(event); } });
+    await replacement.recoverFinishedTurns(); await replacement.recoverFinishedTurns();
+    expect(recovered).toHaveLength(1); expect(recovered[0]?.outcome.kind).toBe('completed');
+    expect(recovered[0]?.timeline[0]?.text).toBe('完成');
+    expect(replacement.describe(id)?.pendingEnd).toBeUndefined();
+  } finally { await replacement?.close(); await f.close(); }
+});
