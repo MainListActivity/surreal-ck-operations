@@ -7,10 +7,11 @@ test('需求内容有界，未确认草稿允许尚未填写验收标准', () =>
   expect(() => requirementContent({project:'sample',title:'x',problem:'x'.repeat(12001)})).toThrow();
 });
 
-test('自动发布必须同时定义发布、验证和回退；反馈只允许明确的 HTTPS origin', () => {
+test('GitHub 自动部署不需要二次授权；兼容旧策略快照且反馈只允许 HTTPS origin', () => {
   const base={enabled:true,autoRelease:false,feedbackOrigins:['https://product.example']};
   expect(productPolicy(base).autoRelease).toBe(false);
-  expect(() => productPolicy({...base,autoRelease:true})).toThrow('自动发布');
+  expect(productPolicy({...base,autoRelease:undefined}).autoRelease).toBe(true);
+  expect(productPolicy({...base,autoRelease:true}).releaseInstructions).toBe('');
   expect(() => productPolicy({...base,feedbackOrigins:['https://user:pass@product.example']})).toThrow();
   expect(() => productPolicy({...base,feedbackOrigins:['https://product.example/feedback']})).toThrow();
   expect(() => productPolicy({...base,feedbackOrigins:['*']})).toThrow();
@@ -46,4 +47,6 @@ test('迭代派工提交与发布分离，不继承旧模板的合入后提交�
   expect(iterationMessages(base).review).toContain('不发布');
   const release=iterationMessages({...base,acceptanceEnvironment:'production'});
   expect(release.execute).toContain('真实部署提交');expect(release.review).toContain('在生产独立复测');
+  expect(release.execute).toContain('无需二次老板审批');
+  expect(release.execute).toContain('不得手工构建或部署');
 });

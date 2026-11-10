@@ -361,3 +361,6 @@ export function signOutLocal(): void {
     // 忽略
   }
 }
+
+export const LOGIN_LABEL = "用 ma_hono 账号登录";
+export const LOGIN_HINT = "看板、需求与运维操作都需要老板身份。请用 ma_hono 账号登录。";

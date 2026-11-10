@@ -1,6 +1,7 @@
+import { useLiveRefresh } from '../realtime.ts';
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { outcomeText, runCommand } from '../api.ts';
-import { Empty, NoticeLine, Panel, Pre, timeText, useAction } from '../common.tsx';
+import { Empty, NoticeLine, PageHeader, Panel, Pre, timeText, useAction } from '../common.tsx';
 import { noteLanes } from '../model.ts';
 
 interface NoteRow {
@@ -74,6 +75,7 @@ export function NotesPage() {
     if (!addLane && lane) setAddLane(lane);
   }, [lane]);
 
+  useLiveRefresh(['lane_note','note_consolidation'], () => refresh(lane), !editing && !busy);
   const after = () => refresh(lane);
   const laneOptions = lane && !lanes.includes(lane) ? [...lanes, lane] : lanes;
 
@@ -101,6 +103,7 @@ export function NotesPage() {
 
   return (
     <div class="page">
+      <PageHeader title="笔记" description="按线（lane）维护的经验笔记，派工时附在 notes.md 里交给员工。待确认的笔记需要你启用后才生效。" />
       <Panel
         title="线的笔记"
         hint="笔记会附在该线每次派工的 notes.md 里。待确认的笔记需要你启用后才生效。"

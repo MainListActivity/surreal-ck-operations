@@ -1,0 +1,10 @@
+{
+  "description": "I can’t determine the app’s purpose from setup instructions alone; they describe project bootstrapping and deployment verification, not user-facing functionality.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

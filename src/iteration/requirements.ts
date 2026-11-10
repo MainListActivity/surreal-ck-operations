@@ -24,6 +24,7 @@ export interface Requirement extends RequirementContent {
 export interface ProductPolicy {
   enabled: boolean;
   feedbackOrigins: string[];
+  /** 兼容旧策略快照；不再控制二次审批，新配置固定为 true。 */
   autoRelease: boolean;
   releaseInstructions: string;
   verifyInstructions: string;
@@ -50,7 +51,7 @@ export function requirementContent(input: Record<string, unknown>): RequirementC
     acceptance: text(input.acceptance ?? '', '验收标准', 3000, true), priority: Number(priority) };
 }
 export function productPolicy(input: Record<string, unknown>): ProductPolicy {
-  if (typeof input.enabled !== 'boolean' || typeof input.autoRelease !== 'boolean') throw new CompanyError('invalid', '产品启用与自动发布必须明确设置');
+  if (typeof input.enabled !== 'boolean' || (input.autoRelease !== undefined && typeof input.autoRelease !== 'boolean')) throw new CompanyError('invalid', '产品启用状态或旧版策略字段无效');
   if (!Array.isArray(input.feedbackOrigins) || input.feedbackOrigins.length > 20) throw new CompanyError('invalid', '反馈来源须为最多 20 个 HTTPS 站点');
   const origins = input.feedbackOrigins.map(value => {
     const raw = text(value, '反馈来源', 300);
@@ -59,13 +60,10 @@ export function productPolicy(input: Record<string, unknown>): ProductPolicy {
     if (url.protocol !== 'https:' || url.username || url.password || url.origin !== raw) throw new CompanyError('invalid', '反馈来源须为完整 HTTPS origin，不含路径或凭证');
     return raw;
   });
-  const policy = { enabled: input.enabled, autoRelease: input.autoRelease, feedbackOrigins: [...new Set(origins)],
+  const policy = { enabled: input.enabled, autoRelease: (input.autoRelease as boolean | undefined) ?? true, feedbackOrigins: [...new Set(origins)],
     releaseInstructions: text(input.releaseInstructions ?? '', '发布说明', 2000, true),
     verifyInstructions: text(input.verifyInstructions ?? '', '验证说明', 2000, true),
     rollbackInstructions: text(input.rollbackInstructions ?? '', '回退说明', 2000, true) };
-  if (policy.autoRelease && (!policy.releaseInstructions || !policy.verifyInstructions || !policy.rollbackInstructions)) {
-    throw new CompanyError('invalid', '自动发布必须配置发布、验证及回退说明');
-  }
   return policy;
 }
 function revisionOf(value: unknown): number {
@@ -79,7 +77,7 @@ export class Requirements {
   constructor(private readonly db: Surreal) {}
   async configure(project: string, input: Record<string, unknown>, actor: string): Promise<ProductPolicy> {
     await this.project(project);
-    const policy = productPolicy(input);
+    const policy = productPolicy({ ...input, autoRelease: true });
     await this.db.query('UPSERT $id CONTENT { project: $project, enabled: $enabled, policy: $policy, actor: $actor, updated_at: time::now() };',
       { id: new RecordId('product_iteration', project), project, enabled:policy.enabled, policy: JSON.stringify(policy), actor });
     return policy;
@@ -137,23 +135,6 @@ export class Requirements {
       "UPDATE $id SET planning_attempts=0, planning_until=NONE, planning_error=NONE, planning_diagnostic=NONE, actor=$actor, updated_at=time::now() WHERE revision=$revision AND state='queued' AND (planning_until=NONE OR planning_until < $now) RETURN AFTER;", {id:ref,revision,actor,now:Date.now()});
     if (!rows.length) throw new CompanyError('conflict', '需求状态或修订已变更，请刷新后操作');
     return requirementOf(rows[0]!);
-  }
-  async approveRelease(id: string, revision: number, actor: string, expectedPolicy?: Record<string,unknown>): Promise<void> {
-    revisionOf(revision);
-    const req = await this.get(id);
-    if (req.revision !== revision || req.state !== 'release_pending') throw new CompanyError('conflict','需求尚未到待发布状态');
-    const policy = await this.policy(req.project);
-    if (expectedPolicy && JSON.stringify(productPolicy(expectedPolicy)) !== JSON.stringify(policy)) throw new CompanyError('conflict','产品策略已变更，请刷新并重新确认');
-    if (!policy?.enabled || !policy.releaseInstructions || !policy.verifyInstructions || !policy.rollbackInstructions) throw new CompanyError('not_configured','请先配置发布、生产验证及回退流程');
-    const ref = new RecordId('requirement_release_approval', `${id}:${revision}`);
-    await this.db.query(`BEGIN TRANSACTION;
-      LET $policyRow=SELECT * FROM ONLY $policyId;
-      IF $policyRow.policy!=$policy { THROW 'product_policy_changed'; };
-      LET $req=SELECT * FROM ONLY $reqId;
-      IF $req.revision!=$revision OR $req.state!='release_pending' { THROW 'release_approval_conflict'; };
-      IF !record::exists($approval) { THROW 'missing_owner_approval'; };
-      IF !record::exists($id) { CREATE $id CONTENT { requirement:$requirement, revision:$revision, policy:$policy, actor:$actor, created_at:time::now() }; };
-      COMMIT TRANSACTION;`, {id:ref,reqId:new RecordId('product_requirement',id),approval:new RecordId('requirement_approval',`${id}:${revision}`),requirement:id,revision,policy:JSON.stringify(policy),policyId:new RecordId('product_iteration',req.project),actor}).retry();
   }
   async approve(id: string, revision: number, actor: string, expectedPolicy?: Record<string,unknown>): Promise<Approval> {
     revisionOf(revision);

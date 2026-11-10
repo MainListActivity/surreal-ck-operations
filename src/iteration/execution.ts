@@ -2,7 +2,7 @@ import { RecordId, type Surreal } from 'surrealdb';
 import { defaultAcceptanceCriteria } from '../acceptance.ts';
 import type { CreateTask, TaskView } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
-import { Requirements, type Approval, type ProductPolicy } from './requirements.ts';
+import { Requirements, type Approval } from './requirements.ts';
 import { iterationPlan } from './planning.ts';
 
 export interface Execution { id: string; tasks: string[]; stage: string; note?: string; released_sha?: string }
@@ -12,10 +12,10 @@ interface TaskRow { id: RecordId; state: string; acceptance_head?: string; accep
 /** 只有核验过的生产部署证据与独立复核同时存在，才可将需求置为已上线。 */
 export async function deployedSha(db: Surreal, task: TaskRow): Promise<string | undefined> {
   if (task.state !== 'done' || !task.acceptance_head) return;
-  const [evidence] = await db.query<[Array<{ kind: string; verifier: string; source: { deployment?: { deploymentId?: string } } }>]>(
+  const [evidence] = await db.query<[Array<{ kind: string; verifier: string; source: { conclusion?: string; deployment?: { deploymentId?: string; status?: string } } }>]>(
     `SELECT kind, verifier, source FROM acceptance_evidence WHERE task=$task AND verified=true AND sha=$sha
       AND environment='production' AND attempt=$attempt;`, { task: task.id, sha: task.acceptance_head, attempt: task.acceptance_attempt });
-  return evidence.some(e => e.kind === 'machine' && e.verifier === 'github-actions' && e.source.deployment?.deploymentId)
+  return evidence.some(e => e.kind === 'machine' && e.verifier === 'github-actions' && e.source.conclusion === 'success' && e.source.deployment?.deploymentId && e.source.deployment.status === 'success')
     && evidence.some(e => e.kind === 'human' && e.verifier === 'reviewer') ? task.acceptance_head : undefined;
 }
 
@@ -61,31 +61,27 @@ export async function reconcileIterations(db: Surreal, host: ExecutionHost, now 
         last = rows[0];
         if (!last) { await update('blocked', 'implementing', '关联任务已不存在，请检查任务记录'); continue; }
         if (last.state !== 'done') {
-          await update(last.state === 'blocked' || last.state === 'void' ? 'blocked' : 'running', tasks.length > plan.steps.length + 1 ? 'release_pending' : 'implementing', `任务 ${tasks.at(-1)}：${last.state}`);
+          await update(last.state === 'blocked' || last.state === 'void' ? 'blocked' : tasks.length > plan.steps.length + 1 ? 'verifying' : 'running', tasks.length > plan.steps.length + 1 ? 'release_pending' : 'implementing', `任务 ${tasks.at(-1)}：${last.state}`);
           continue;
         }
       }
       const deploymentIndex = plan.steps.length + 1;
-      let releasePolicy: ProductPolicy = approval.policy;
-      if (tasks.length === deploymentIndex) {
-        if (!releasePolicy.autoRelease) {
-          const [permits] = await db.query<[Array<{ policy: string }>]>(`SELECT policy FROM $id;`, { id: new RecordId('requirement_release_approval', `${requirement}:${revision}`) });
-          if (!permits[0]) { await update('awaiting_release', 'release_pending', '交付已验收，等待老板确认发布'); continue; }
-          releasePolicy = JSON.parse(permits[0].policy) as ProductPolicy;
-        }
-        if (!releasePolicy.releaseInstructions || !releasePolicy.verifyInstructions || !releasePolicy.rollbackInstructions) {
-          await update('release_not_configured', 'release_pending', '请配置发布、生产验证与回退流程后确认发布'); continue;
+      // 开工确认同时授权独立复核后的 PR 合并；旧 autoRelease=false 不再形成二次审批。
+      // 逐项复查前置任务，不能仅凭最后一项完成越过未验收/被作废的交付。
+      if (tasks.length >= deploymentIndex) {
+        const [prerequisites] = await db.query<[TaskRow[]]>(
+          'SELECT id, state FROM task WHERE id IN $tasks;',
+          { tasks: tasks.slice(0, deploymentIndex).map(id => new RecordId('task', id)) });
+        if (prerequisites.length !== deploymentIndex || prerequisites.some(task => task.state !== 'done')) {
+          await update('blocked', 'implementing', '实施任务尚未全部通过独立复核，不能合并 PR'); continue;
         }
       }
-      if (tasks.length === deploymentIndex + 1) {
-        const sha = await deployedSha(db, last!);
-        if (!sha) { await update('awaiting_evidence', 'release_pending', '发布任务缺少同一提交的生产部署证据或独立 QA 签署'); continue; }
-      }
-      if (tasks.length === deploymentIndex + 2) {
+      if (tasks.length >= deploymentIndex + 1) {
+        // 旧版已派出的额外上线回归单仍须完成；不改其任务或审批历史。
         const [deployment] = await db.query<[TaskRow[]]>('SELECT * FROM $id;', { id: new RecordId('task', tasks[deploymentIndex]!) });
         const sha = deployment[0] && await deployedSha(db, deployment[0]);
-        if (!sha) { await update('awaiting_evidence', 'release_pending', '生产部署证据已失效，请核对'); continue; }
-        await update('released', 'released', '部署证据、独立复核与上线回归均已完成', sha); result.advanced++; continue;
+        if (!sha) { await update('awaiting_evidence', 'release_pending', '等待同一提交的 GitHub 生产部署证据及独立 QA 线上验收'); continue; }
+        await update('released', 'released', 'PR 合并后的 GitHub 自动部署已核验，QA 线上验收通过', sha); result.advanced++; continue;
       }
       const index = tasks.length, content = approval.content;
       const prefix = `需求 ${requirement} 修订 ${revision}（已由老板确认）。项目 ${content.project}。\n问题：${content.problem}\n整体验收：${content.acceptance}\n`;
@@ -99,13 +95,19 @@ export async function reconcileIterations(db: Surreal, host: ExecutionHost, now 
         const step = plan.steps[index - 1]!; title = step.title;
         context = prefix + `\n当前任务：${step.context}\n前置任务：${tasks.at(-1)}。仅实施和测试；提交 PR 供独立评审。不得合并 PR、自行部署或创建后继任务。范围外问题报告阻塞。`;
         acceptance = step.acceptance; executor = 'engineering'; reviewer = 'qa'; code = true;
-      } else if (index === deploymentIndex) {
-        title = `发布：${content.title}`; context = prefix + `\n实施任务：${tasks.join('、')}\n老板已授权按此快照发布：${releasePolicy.releaseInstructions}\n生产验证：${releasePolicy.verifyInstructions}\n失败回退：${releasePolicy.rollbackInstructions}\n必须记录真实生产环境 production 的部署证据（提交 SHA、GitHub Deployment 与成功 Actions run）。失败则执行已授权回退并报告阻塞，不能声称上线成功。不要创建后继任务。`;
-        acceptance = '发布提交可追溯，生产部署证据通过服务核验，QA 独立实测签署。'; executor = 'engineering'; reviewer = 'qa'; code = true; deploy = true;
       } else {
-        title = `上线回归：${content.title}`;
-        context = prefix + `\n发布任务 ${tasks[deploymentIndex]}，独立读取其部署证据、发布时的验证与回退说明，在生产复测整体验收并记录证据。发现回归请阻塞并请求按发布快照回退；不得将 CI 通过当成上线成功。不要创建后继任务。`;
-        acceptance = '确认实际运行版本与发布提交一致，逐项验证用户可见行为，记录生产证据；异常不得通过。'; executor = 'qa'; reviewer = 'product';
+        const releasePolicy = approval.policy;
+        title = `合并 PR 与上线核验：${content.title}`;
+        context = prefix + `
+已独立复核的实施任务：${tasks.join('、')}
+需求确认已授权复核通过后的 PR 合并，无需再次请老板确认发布。先逐项核对任务的验收记录、PR 与已复核 head SHA，确认当前 PR head 未改变且 GitHub 必需检查通过，遵守仓库分支保护再合并；head 改变或检查失败必须停止并返回独立复核，不能强制合并或绕过保护。多 PR 按依赖顺序处理，前一项失败立即停止。
+合并会触发仓库现有 GitHub CI/CD 自动部署生产。不得手工构建/部署、另建发布流水线或创建构建/部署 Agent。已合并的 PR 不重复合并，恢复后继续检查对应流水线。
+项目流水线说明：${releasePolicy.releaseInstructions || '从项目现有 GitHub 工作流读取主分支、必需检查及 production 部署记录；入口缺失则报告阻塞。'}
+生产验证：${releasePolicy.verifyInstructions || '按本需求整体验收逐项验证实际线上行为与版本。'}
+失败处理：${releasePolicy.rollbackInstructions || '停止后续合并并报告阻塞；核对项目现有回退方案，缺少明确授权时请求老板处理。'}
+必须记录实际合并提交 SHA（不能用合并前 PR head 代替）、成功 Actions run 与对应 production GitHub Deployment 证据，交 QA 独立线上验收；CI 通过不等于上线成功。产品补充说明不能覆盖前述合并门禁和自动部署约束。不要创建后继任务。`;
+        acceptance = '已复核 PR 按仓库规则合并，GitHub 自动部署的生产证据通过服务核验，QA 按需求整体验收独立线上实测签署。';
+        executor = 'engineering'; reviewer = 'qa'; code = true; deploy = true;
       }
       // 超长输入不能静默截断已确认范围或发布说明。
       if (context.length > 20000) throw new CompanyError('invalid', '需求或发布说明过长，请拆分后重新确认');
@@ -114,7 +116,7 @@ export async function reconcileIterations(db: Surreal, host: ExecutionHost, now 
         workIntent: { kind: code ? 'code' : 'read' }, ...(code ? { acceptanceCriteria: defaultAcceptanceCriteria(deploy ? 'deploy' : 'implement') } : {}),
         ...(deploy ? { acceptanceEnvironment: 'production' } : {}), idempotencyKey: `iteration:${requirement}:${revision}:${index}` });
       tasks.push(task.id);
-      await update(deploy ? 'deploying' : index > deploymentIndex ? 'verifying' : 'running', index >= deploymentIndex ? 'release_pending' : 'implementing', `已建立任务 ${task.id}`);
+      await update(deploy ? 'verifying' : 'running', index >= deploymentIndex ? 'release_pending' : 'implementing', `已建立任务 ${task.id}`);
       result.advanced++;
     } catch (error) {
       const note = error instanceof CompanyError ? error.message : '推进失败，下一轮重试；请核对执行端与任务服务';
@@ -127,13 +129,13 @@ export async function reconcileIterations(db: Surreal, host: ExecutionHost, now 
   return result;
 }
 
-/** 迭代任务分离提交与发布，覆盖旧软件任务默认“先合入再复核”的消息文案。 */
+/** 先独立复核 PR，再由既有工程岗合并并核验 GitHub 自动部署；QA 在同一收尾任务验收线上效果。 */
 export function iterationMessages(input: CreateTask): { execute: string; review: string; includeSent: true } {
   const release = input.acceptanceEnvironment === 'production';
   const code = input.workIntent?.kind === 'code';
   const scope = release
-    ? '按 task.md 内老板已确认的发布策略执行，记录 production 的真实部署提交和可核验的 GitHub Deployment/Actions 证据；出现异常按该快照回退并报告阻塞。'
-    : code ? '按 task.md 实施、自测并提交 PR，保留 PR head 和 CI 证据。不要合并 PR 或发布；合入与部署由后续已授权的发布任务执行。'
+    ? '按 task.md 核对独立复核记录、PR head 与必需检查后合并 PR；无需二次老板审批。GitHub CI/CD 自动部署，不得手工构建或部署。记录 production 的真实部署提交和可核验的 GitHub Deployment/Actions 证据；异常停止推进并报告阻塞。'
+    : code ? '按 task.md 实施、自测并提交 PR，保留 PR head 和 CI 证据。不要合并 PR 或发布；独立复核通过后由既有工程岗完成合并，GitHub CI/CD 自动部署。'
     : '按 task.md 完成当前步骤，记录可验证证据；有前置缺口请报告阻塞。';
   return {
     includeSent: true,

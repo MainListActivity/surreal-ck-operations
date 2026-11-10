@@ -91,12 +91,13 @@ run('真实反馈到需求：幂等接收、限流、去掉联系信息、只生
   await denied(receiveFeedback(db,'sample','https://sample.example','192.0.2.1',{...input,requestKey:'feedback-too-many'}),'过于频繁');
 });
 
-run('确认后规划与执行可恢复，暂停不推进，手动发布门禁及生产证据完整才闭环',async()=>{
+run('确认后规划与执行可恢复，暂停不推进，独立复核后无二次审批合并、生产证据与 QA 完整才闭环',async()=>{
   const {planRequirements}=await import('../src/iteration/planning.ts');
   const {reconcileIterations}=await import('../src/iteration/execution.ts');
   const {RecordId}=await import('surrealdb');
   await db.query("UPDATE product_requirement SET state='paused' WHERE state='queued';");
   await store.configure('sample',{enabled:true,autoRelease:false,feedbackOrigins:[],releaseInstructions:'按项目发布工作流部署',verifyInstructions:'检查生产版本及保存行为',rollbackInstructions:'回退到上一成功版本'},'owner');
+  await db.query('UPDATE product_iteration:sample SET policy=$policy;', {policy:JSON.stringify({enabled:true,autoRelease:false,feedbackOrigins:[],releaseInstructions:'',verifyInstructions:'',rollbackInstructions:''})});
   const req=await store.create(content,'owner');
   let planCalls=0;
   const planner=async()=>{planCalls++;return {steps:[{title:'实现反馈检索',context:'实现检索并添加真实检索测试',acceptance:'检索结果符合输入关键字'}]};};
@@ -106,10 +107,10 @@ run('确认后规划与执行可恢复，暂停不推进，手动发布门禁及
   const automation=await sessionFor('automation');
   expect((await planRequirements(automation,planner,now)).planned).toBe(1);
   expect((await planRequirements(automation,planner,now+180000)).planned).toBe(0);expect(planCalls).toBe(1);
-  const taskIds=new Map<string,string>();let interrupt=true;
+  const taskIds=new Map<string,string>();const inputs:import('../src/contracts.ts').CreateTask[]=[];let interrupt=true;
   const host={create:async(input:import('../src/contracts.ts').CreateTask)=>{
     let id=taskIds.get(input.idempotencyKey);
-    if(!id){id=crypto.randomUUID();taskIds.set(input.idempotencyKey,id);await db.query('CREATE $id CONTENT {state:"ready",title:$title};',{id:new RecordId('task',id),title:input.title});}
+    if(!id){inputs.push(input);id=crypto.randomUUID();taskIds.set(input.idempotencyKey,id);await db.query('CREATE $id CONTENT {state:"ready",title:$title};',{id:new RecordId('task',id),title:input.title});}
     if(interrupt){interrupt=false;throw new Error('simulate crash after task creation');}
     return {id};
   }};
@@ -120,17 +121,29 @@ run('确认后规划与执行可恢复，暂停不推进，手动发布门禁及
   await store.control(req.id,1,'resume','owner');await tick();expect(taskIds.size).toBe(1);
   const finish=async()=>{const id=[...taskIds.values()].at(-1)!;await db.query('UPDATE $id SET state="done";',{id:new RecordId('task',id)});return id;};
   await finish();await tick();expect(taskIds.size).toBe(2);
-  await finish();await tick();expect(taskIds.size).toBe(2);expect((await store.get(req.id)).state).toBe('release_pending');
-  const owner=await sessionFor('owner');await new Requirements(owner).approveRelease(req.id,1,'owner');
-  await tick();expect(taskIds.size).toBe(3);
+  // review/返工不能触发合并；完成后即自动推进，无 release approval。
+  await db.query('UPDATE $task SET state="review";', {task:new RecordId('task',[...taskIds.values()].at(-1)!)});
+  await tick();expect(taskIds.size).toBe(2);
+  await finish();
+  await db.query('UPSERT $id CONTENT {tasks:$tasks,stage:"awaiting_release"}; UPDATE $req SET state="release_pending";', {id:new RecordId('requirement_execution',`${req.id}:1`),tasks:[...taskIds.values()],req:new RecordId('product_requirement',req.id)});
+  await tick();expect(taskIds.size).toBe(3);expect((await store.get(req.id)).state).toBe('release_pending');
+  expect(inputs[2]!.title).toContain('合并 PR 与上线核验');
+  expect(inputs[2]!.context).toContain('head 改变');
+  expect(inputs[2]!.acceptanceEnvironment).toBe('production');
+  const [permits]=await db.query<[unknown[]]>('SELECT * FROM requirement_release_approval WHERE requirement=$id;', {id:req.id});expect(permits).toHaveLength(0);
   const deploy=await finish();await tick();expect(taskIds.size).toBe(3);expect((await store.get(req.id)).state).toBe('release_pending');
   const ref=new RecordId('task',deploy);
-  await db.query('UPDATE $task SET acceptance_head="abcdef", acceptance_attempt=2; CREATE acceptance_evidence CONTENT { task:$task,verified:true,sha:"wrong",environment:"production",attempt:2,kind:"machine",verifier:"github-actions",source:{deployment:{deploymentId:"fixture"}} };',{task:ref});
+  await db.query('UPDATE $task SET acceptance_head="abcdef", acceptance_attempt=2; CREATE acceptance_evidence CONTENT { task:$task,verified:true,sha:"wrong",environment:"production",attempt:2,kind:"machine",verifier:"github-actions",source:{conclusion:"success",deployment:{deploymentId:"fixture",status:"success"}} };',{task:ref});
   await tick();expect(taskIds.size).toBe(3);
   await db.query('UPDATE acceptance_evidence SET sha="abcdef" WHERE task=$task; CREATE acceptance_evidence CONTENT {task:$task,verified:true,sha:"abcdef",environment:"production",attempt:2,kind:"human",verifier:"reviewer",source:{}};',{task:ref});
-  await tick();expect(taskIds.size).toBe(4);expect((await store.get(req.id)).state).toBe('release_pending');
-  await finish();await tick();expect((await store.get(req.id)).state).toBe('released');
-  await tick();expect(taskIds.size).toBe(4);
+  // 错误 attempt、部署失败、缺独立签署均不能冒充上线。
+  await db.query('UPDATE acceptance_evidence SET attempt=1 WHERE task=$task AND kind="human";', {task:ref});
+  await tick();expect((await store.get(req.id)).state).toBe('release_pending');
+  await db.query('UPDATE acceptance_evidence SET attempt=2 WHERE task=$task AND kind="human"; UPDATE acceptance_evidence SET source.deployment.status="failure" WHERE task=$task AND kind="machine";', {task:ref});
+  await tick();expect((await store.get(req.id)).state).toBe('release_pending');
+  await db.query('UPDATE acceptance_evidence SET source.deployment.status="success" WHERE task=$task AND kind="machine";', {task:ref});
+  await tick();expect((await store.get(req.id)).state).toBe('released');
+  await tick();expect(taskIds.size).toBe(3);
 });
 
 run('多个接收者并发重放同一反馈只落一条；整理失败有上限且可人工恢复',async()=>{
@@ -217,7 +230,7 @@ run('公开反馈 HTTP：来源隔离、预检、JSON 与体积限制、仅返�
   const wrong=await send('POST','https://other.example',JSON.stringify({requestKey:'public-endpoint-test',text:'页面无法保存'}));expect(wrong.status).toBe(403);expect(wrong.headers.get('access-control-allow-origin')).toBeNull();
 });
 
-run('页面展示的发布策略发生变化时拒绝确认，员工不能伪造发布批准或计划',async()=>{
+run('页面展示的发布策略发生变化时拒绝确认，员工不能伪造需求批准或计划',async()=>{
   const policy=await store.configure('sample',{enabled:true,autoRelease:false,feedbackOrigins:[]},'owner');
   const req=await store.create(content,'owner');
   await store.configure('sample',{...policy,autoRelease:true,releaseInstructions:'受控发布',verifyInstructions:'生产验证',rollbackInstructions:'回退版本'},'owner');
@@ -225,7 +238,7 @@ run('页面展示的发布策略发生变化时拒绝确认，员工不能伪造
   expect((await store.get(req.id)).state).toBe('pending');
   for(const ac of ['gateway','runner','automation']){
     const conn=await sessionFor(ac);
-    await denied(conn.query('CREATE requirement_release_approval CONTENT {requirement:"forged",revision:1,policy:"{}"};'),'requires owner');
+    await denied(conn.query('CREATE requirement_approval CONTENT {requirement:"forged",revision:1,snapshot:"{}"};'),'requires owner');
     if(ac!=='automation')await denied(conn.query('CREATE requirement_plan CONTENT {body:"{}"};'),'requires automation');
   }
   const before=await store.policy('sample');
@@ -248,4 +261,26 @@ run('停用产品不占住反馈整理与需求规划的扫描名额',async()=>{
   const planning=await planRequirements(db,async approval=>{expect(approval.requirement).toBe(enabled.id);return {steps:[{title:'实施需求',context:'实现需求并完成测试',acceptance:'符合验收标准'}]};});expect(planning.planned).toBe(1);
   await receiveFeedback(db,'sample','https://sample.example','192.0.2.8',{requestKey:'enabled-feedback-001',text:'启用产品反馈'});
   const triage=await triageFeedback(db,async input=>{expect(input.feedback.text).toBe('启用产品反馈');return {disposition:'dismiss',category:'noise',reason:'测试反馈'};});expect(triage.dismissed).toBe(1);
+});
+
+run('兼容已派出的旧版上线回归：不重复建单、不越过未完成复核、不改写确认快照',async()=>{
+  const {RecordId}=await import('surrealdb');
+  const {reconcileIterations}=await import('../src/iteration/execution.ts');
+  await db.query("UPDATE product_requirement SET state='paused' WHERE state IN ['queued','implementing','release_pending'];");
+  await store.configure('sample',{enabled:true,feedbackOrigins:[]},'owner');
+  const req=await store.create(content,'owner');const approval=await store.approve(req.id,1,'owner');
+  const ids=Array.from({length:4},()=>crypto.randomUUID());
+  for(const [i,id] of ids.entries())await db.query('CREATE $id CONTENT {state:$state,acceptance_head:"merge-sha",acceptance_attempt:1};',{id:new RecordId('task',id),state:i===3?'review':'done'});
+  await db.query('CREATE $plan CONTENT {body:$body,requirement:$requirement,revision:1,approval:$approval}; CREATE $execution CONTENT {tasks:$tasks,stage:"verifying"}; UPDATE $req SET planned=true,state="release_pending";',{
+    requirement:req.id,approval:new RecordId('requirement_approval',`${req.id}:1`),plan:new RecordId('requirement_plan',`${req.id}:1`),body:JSON.stringify({steps:[{title:'旧实施步骤',context:'已存在的旧版任务',acceptance:'验收通过'}]}),execution:new RecordId('requirement_execution',`${req.id}:1`),tasks:ids,req:new RecordId('product_requirement',req.id)});
+  const deploy=new RecordId('task',ids[2]!);
+  await db.query('CREATE acceptance_evidence CONTENT {task:$task,verified:true,sha:"merge-sha",environment:"production",attempt:1,kind:"machine",verifier:"github-actions",source:{conclusion:"success",deployment:{deploymentId:"fixture",status:"success"}}}; CREATE acceptance_evidence CONTENT {task:$task,verified:true,sha:"merge-sha",environment:"production",attempt:1,kind:"human",verifier:"reviewer",source:{}};',{task:deploy});
+  let now=Date.now(),created=0;
+  const tick=()=>reconcileIterations(db,{create:async()=>{created++;throw Error('不应新增任务');}},now+=180000);
+  await tick();expect((await store.get(req.id)).state).toBe('release_pending');
+  await db.query('UPDATE $last SET state="done"; UPDATE $first SET state="blocked";',{last:new RecordId('task',ids[3]!),first:new RecordId('task',ids[0]!)});
+  await tick();expect((await store.get(req.id)).state).toBe('implementing');
+  await db.query('UPDATE $first SET state="done";',{first:new RecordId('task',ids[0]!)});
+  await tick();expect((await store.get(req.id)).state).toBe('released');expect(created).toBe(0);
+  expect(await store.approve(req.id,1,'owner')).toEqual(approval);
 });

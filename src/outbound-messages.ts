@@ -325,18 +325,18 @@ export class OutboundMessageStore {
   async markSent(messageId: string, employeeId: string, body: string): Promise<{ body: string; message: OutboundMessage }> {
     // 认领即条件 UPDATE：同一条消息只有一个调用方的 WHERE state != 'sent' 命中并返回行。
     // 并发写同一行时 SurrealDB 可能直接报 Transaction conflict（可重试）；重试时该行已是 sent，条件不再命中，因此统一映射为 conflict。
-    const row = await this.guardedMarkSent(messageId, employeeId);
+    const row = await this.guardedMarkSent(messageId, employeeId, body);
     if (!row) throw new CompanyError('conflict', 'message already sent or missing');
     await this.resolveHoldNotice(row.task, row.step);
     return { body, message: rowView(row) };
   }
 
-  private async guardedMarkSent(messageId: string, employeeId: string): Promise<Record<string, unknown> | undefined> {
+  private async guardedMarkSent(messageId: string, employeeId: string, body: string): Promise<Record<string, unknown> | undefined> {
     for (let attempt = 1; ; attempt++) {
       try {
         const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
-          `UPDATE $msg SET state = 'sent', sent_to = $employee, sent_at = time::now(), hold = false WHERE state != 'sent' RETURN AFTER;`,
-          { msg: this.message(messageId), employee: employeeId });
+          `UPDATE $msg SET state = 'sent', sent_body = $body, sent_to = $employee, sent_at = time::now(), hold = false WHERE state != 'sent' RETURN AFTER;`,
+          { msg: this.message(messageId), employee: employeeId, body });
         return rows?.[0];
       } catch (error) {
         const text = error instanceof Error ? error.message : String(error);

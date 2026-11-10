@@ -1,6 +1,7 @@
+import { useLiveRefresh } from '../realtime.ts';
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { outcomeText, runCommand } from '../api.ts';
-import { Empty, NoticeLine, Panel, useAction } from '../common.tsx';
+import { Empty, NoticeLine, PageHeader, Panel, roleText, useAction } from '../common.tsx';
 import { splitLines } from '../model.ts';
 
 export interface AgentPolicy {
@@ -71,6 +72,8 @@ export function StaffPage() {
     }
   }, []);
 
+  useLiveRefresh(['employee','agent_identity','agent_policy'], loadAgents);
+  useLiveRefresh(['protected_command'], loadGuard);
   useEffect(() => {
     void loadAgents();
     void loadGuard();
@@ -78,7 +81,9 @@ export function StaffPage() {
 
   return (
     <div class="page">
-      <Panel title="员工" hint="策略决定员工能调用哪些命令、是否停用、译文语言。语言留空表示不翻译。">
+      <PageHeader title="员工与权限" description="员工的命令范围、停用与译文语言，以及哪些命令需要老板确认。低频设置，修改会写入审计。" />
+      <nav class="jump-bar" aria-label="页内导航"><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-agents')?.scrollIntoView({ behavior: 'smooth' }); }}>员工策略</a><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-guard')?.scrollIntoView({ behavior: 'smooth' }); }}>受保护命令</a><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-locked')?.scrollIntoView({ behavior: 'smooth' }); }}>固定限制</a></nav>
+      <Panel id="staff-agents" title="员工" hint="策略决定员工能调用哪些命令、是否停用、译文语言。语言留空表示不翻译。">
         {agentError ? <p class="notice err">员工列表读取失败：{agentError}</p> : null}
         {agents === undefined && !agentError ? <p class="hint">正在读取员工…</p> : null}
         {agents && agents.length === 0 ? <Empty>还没有员工</Empty> : null}
@@ -89,13 +94,13 @@ export function StaffPage() {
         ) : null}
       </Panel>
 
-      <Panel title="受保护命令" hint="受保护的命令需要老板确认后员工才能调用；仅老板的命令只有老板能调用。">
+      <Panel id="staff-guard" title="受保护命令" hint="受保护的命令需要老板确认后员工才能调用；仅老板的命令只有老板能调用。">
         {guardError ? <p class="notice err">保护列表读取失败：{guardError}</p> : null}
         {guard ? <GuardSection guard={guard} onChanged={() => void loadGuard()} /> : <p class="hint">正在读取…</p>}
       </Panel>
 
       {guard ? (
-        <Panel title="只能老板调用的命令" hint="员工通过网关不能调用这些命令。这些命令写死在代码里，本页不能修改。">
+        <Panel id="staff-locked" title="只能老板调用的命令" hint="员工通过网关不能调用这些命令。这些命令写死在代码里，本页不能修改。">
           {guard.hardOwnerOnly.length === 0 ? <Empty>没有内置的仅老板命令</Empty> : (
             <ul class="chips">
               {guard.hardOwnerOnly.map(c => <li key={c} class="tag">{c}</li>)}
@@ -180,8 +185,8 @@ function AgentCard({ agent, onChanged }: { agent: AgentRow; onChanged(): void })
   return (
     <article class="card">
       <header class="card-head">
-        <span class="tag">{agent.role}</span>
-        <span class={p.disabled ? 'badge danger' : 'badge success'}>{p.disabled ? '已停用' : '启用中'}</span>
+        <span class="tag" title={agent.role}>{roleText(agent.role)}</span>
+        <span class={p.disabled ? 'badge tone-blocked' : 'badge tone-done'}>{p.disabled ? '已停用' : '启用中'}</span>
       </header>
       <h3>{agent.name}</h3>
       <p class="hint">员工 {agent.employee}</p>
