@@ -566,13 +566,23 @@ function ActivityFeed({agent}: {agent: RuntimeAgentView}) {
   const activity = agent.activity;
   useEffect(() => { follow.current = true; }, [activity?.turn]);
   useEffect(() => { if (follow.current && ref.current) ref.current.scrollTop = ref.current.scrollHeight; }, [activity?.turn, activity?.events.at(-1)?.seq]);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const observer = new ResizeObserver(() => { if (follow.current) el.scrollTop = el.scrollHeight; });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [activity?.turn]);
   if (!activity) return <div class="agent-activity-empty">{agent.runtime === 'paseo' ? 'Paseo 会话尚未接入实时输出' : '等待执行端上报本轮进度'}{agent.action ? ` · ${agent.action}` : ''}</div>;
   return <section class="agent-activity" aria-label={`${agent.name}的近期输出`}>
     <div class="agent-activity-heading">
       <strong>{agent.state === 'unknown' ? '连接中断 · 保留最近输出' : activity.tool ? `正在调用 ${activity.tool}` : activity.state === 'running' ? '本轮执行中' : activity.state === 'completed' ? '本轮已结束 · 等待流程收尾' : activity.state === 'failed' ? '本轮执行失败' : '本轮已停止'}</strong>
       <span>上报 {clockText(activity.observedAt)} · 工具 {activity.toolsCompleted} 次</span>
     </div>
-    <div class="agent-activity-feed" ref={ref} tabIndex={0} aria-label="近期公开输出，自动跟随最新内容" onScroll={() => { const el = ref.current!; follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 32; }}>
+    <div class="agent-activity-feed" ref={ref} tabIndex={0} aria-label="近期公开输出，自动跟随最新内容"
+      onWheel={e => { if (e.deltaY < 0) follow.current = false; }} onTouchStart={() => { follow.current = false; }}
+      onPointerDown={() => { follow.current = false; }} onKeyDown={e => { if (['ArrowUp','PageUp','Home'].includes(e.key)) follow.current = false; }}
+      onScroll={() => { const el = ref.current!; if (el.scrollHeight - el.scrollTop - el.clientHeight < 32) follow.current = true; }}>
       {activity.events.map(e => <div key={`${activity.turn}:${e.seq}`} class={`activity-${e.kind}`}><time>{clockText(e.at)}</time><pre>{e.text}</pre></div>)}
       {!activity.events.length ? <p class="hint">回合已启动，等待公开输出</p> : null}
     </div>
