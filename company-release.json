@@ -1,5 +1,5 @@
 {
-  "version": "0.11.5",
+  "version": "0.11.6",
   "title": "原生运行进度与真实派工内容预览",
   "changes": [
     "Claude Code 与 Factory 支持原生流事件采集，执行端每 30 秒上报工具状态和公开输出。",

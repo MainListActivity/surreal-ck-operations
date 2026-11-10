@@ -486,6 +486,7 @@ export interface SidecarBridge {
   /** Why the last claim of this instance was denied (for example worktree_busy), until its next claim. */
   claimDenial(instId: string): string | undefined;
   maintainLease?(inst: EmployeeInst, taskId: string): Promise<boolean>;
+  hasPendingResult?(instId: string, taskId: string, deliveryId?: string): boolean;
   /** Records the freshly spawned Paseo agentId for this instance. */
   readWorkspace?(inst: EmployeeInst, taskId?: string, project?: string): Promise<WorktreeAssignment | undefined>;
   releaseWorkspace?(inst: EmployeeInst): Promise<void>;
@@ -1184,8 +1185,25 @@ export class Dispatcher {
       [id, { agentId: agentOf.get(id), status: observedStatus.get(id) ?? state, state }] as const)) };
     const byId = new Map(insts.map(i => [i.id, i]));
 
-    // 2. Lease supervision: extend live holders, revoke dead or stalled ones with a handover packet.
-    for (const task of await wf.tasks()) {
+    // 2. Lease supervision: a deadline requests a stop; only a confirmed end permits reassignment.
+    const keepLease = async (task: SupervisedTask, inst?: EmployeeInst) => {
+      // Employee heartbeats cannot renew an already expired lease. The trusted runner may retain
+      // exactly the observed generation, without bumping its fence or reclaiming the task.
+      const proof = task.row.delivery_id && Number.isInteger(task.row.fence)
+        ? { deliveryId: task.row.delivery_id, fence: task.row.fence } : undefined;
+      const extended = await (proof
+        ? wf.extendLease(task.id, task.currentEmployee!, LEASE_SECONDS, proof)
+        : inst && this.deps.sidecar?.maintainLease ? this.deps.sidecar.maintainLease(inst, task.id)
+        : Promise.resolve(false)).catch(() => false);
+      if (extended) report.extended.push(task.id);
+    };
+    const keepUncertain = async (task: SupervisedTask, inst?: EmployeeInst) => {
+      await keepLease(task, inst);
+      await this.notice(`runtime-uncertain:${task.currentEmployee}:${task.id}`,
+        `任务 ${task.id} 的执行状态或停止结果尚未确认，保留原分配并等待运行端恢复，禁止重复派工。`, report);
+    };
+    const supervised = await wf.tasks();
+    for (const task of supervised) {
       if (!task.currentEmployee) continue;
       const inst = byId.get(task.currentEmployee);
       if (isolatedTasks.has(task.id)) {
@@ -1195,12 +1213,35 @@ export class Dispatcher {
       const state = inst ? states.get(inst.id) : undefined;
       const expired = (task.leaseExpiresAt ?? 0) <= now;
       const stale = task.progressAt !== undefined && now - task.progressAt > cfg.stallMinutes * 60;
+      const pendingResult = () => this.deps.sidecar?.hasPendingResult?.(task.currentEmployee!, task.id, task.row.delivery_id);
+      if (pendingResult()) {
+        await keepLease(task, inst);
+        continue;
+      }
+      if (state === 'unknown' || state === undefined) {
+        await keepUncertain(task, inst);
+        continue;
+      }
       if (state === 'busy') {
+        if (!stale) await owner.resolveNotice(`runtime-uncertain:${task.currentEmployee}:${task.id}`);
         if (stale && !(now - task.progressAt! <= cfg.stallMinutes * 60 * STALL_ACTIVITY_CAP &&
           await this.stillWorking(inst!.paseoAgentId!, task, cfg.stallMinutes, now))) {
           this.activity.delete(inst!.paseoAgentId!);
-          await paseo.stop(inst!.paseoAgentId!).catch(() => undefined);
-          await this.revoke(task, `员工 ${inst!.id} 超过 ${cfg.stallMinutes} 分钟没有任何 checkpoint，且会话已 ${ACTIVITY_WINDOW_SECONDS / 60} 分钟无动静或超过 ${cfg.stallMinutes * STALL_ACTIVITY_CAP} 分钟上限，已中止其会话`, inst, report);
+          try {
+            await paseo.stop(inst!.paseoAgentId!);
+            // Some hosts acknowledge the stop request before the process actually ends.
+            const stopped = await paseo.status(inst!.paseoAgentId!);
+            if (stopped && !['idle', 'closed', 'archived', 'error'].includes(stopped.status)) {
+              await keepUncertain(task, inst);
+              continue;
+            }
+          } catch {
+            await keepUncertain(task, inst);
+            continue;
+          }
+          if (pendingResult()) { await keepLease(task, inst); continue; }
+          await owner.resolveNotice(`runtime-uncertain:${task.currentEmployee}:${task.id}`);
+          await this.revoke(task, `员工 ${inst!.id} 超过 ${cfg.stallMinutes} 分钟没有工作进度，且会话已 ${ACTIVITY_WINDOW_SECONDS / 60} 分钟无动静或超过 ${cfg.stallMinutes * STALL_ACTIVITY_CAP} 分钟上限；运行端已确认停止`, inst, report);
         } else if ((task.leaseExpiresAt ?? 0) - now < cfg.extendWithinSeconds &&
           await (this.deps.sidecar?.maintainLease
             ? this.deps.sidecar.maintainLease(inst!, task.id).catch(() => false)
@@ -1209,6 +1250,7 @@ export class Dispatcher {
         }
         continue;
       }
+      await owner.resolveNotice(`runtime-uncertain:${task.currentEmployee}:${task.id}`);
       if (state === 'down' || state === 'exhausted') {
         await this.revoke(task, `员工 ${inst!.id} 的会话${state === 'exhausted' ? '所在订阅额度耗尽/限流' : '已中断'}`, inst, report);
       } else if (stale) {
@@ -1216,10 +1258,14 @@ export class Dispatcher {
         // idle) produces no work, yet the sidecar heartbeat keeps the server lease
         // fresh forever — `expired` never fires. Reclaim on progress stall instead:
         // progress_at moves only on checkpoint, so staleness means parked work.
-        await this.revoke(task, `员工 ${task.currentEmployee} 会话${state === 'idle' ? '空闲' : state === 'unknown' ? '状态未知' : '失联'}且超过 ${cfg.stallMinutes} 分钟没有 checkpoint`, inst, report);
+        await this.revoke(task, `员工 ${task.currentEmployee} 会话${state === 'idle' ? '空闲' : '已结束'}且超过 ${cfg.stallMinutes} 分钟没有工作进度`, inst, report);
       } else if (expired) {
         await this.revoke(task, `员工 ${task.currentEmployee} 结束本轮但未交接，租约已过期`, inst, report, 'expire');
       }
+    }
+    for (const notice of await owner.openNotices()) {
+      if (insts.some(inst => notice.key.startsWith(`runtime-uncertain:${inst.id}:`)) && !supervised.some(task => task.currentEmployee
+        && notice.key === `runtime-uncertain:${task.currentEmployee}:${task.id}`)) await owner.resolveNotice(notice.key);
     }
     for (const inst of insts) {
       if (states.get(inst.id)!=='idle' || (!inst.def || defs.some(d=>d.id===inst.def && d.enabled))) continue;

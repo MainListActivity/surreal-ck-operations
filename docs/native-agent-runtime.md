@@ -76,7 +76,7 @@ SIGINT/SIGTERM 停止派工循环，再停止本执行器拥有的进程组并�
 - Claude：https://code.claude.com/docs/en/headless
 - Codex：本机 `codex exec --help` 与 `codex exec resume --help`
 
-## 0.11.5：明确路由与独立常驻服务
+## 0.11.6：明确路由与独立常驻服务
 
 `bun scripts/native-service.ts <节点ID> <配置绝对路径>` 安装 launchd/systemd 常驻服务；`--no-load` 仅生成配置。服务不是定时任务，不依赖 Paseo 进程。安装需要正式发行的 `current` 和现有 `bin/bun-runtime.sh`，不复制凭证。新服务默认待命，安装不会改变派工路由。
 
