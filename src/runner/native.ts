@@ -1,6 +1,7 @@
+import { acquireNativeWriter } from './native-lock.ts';
 import { spawn as spawnProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, openSync, closeSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AgentRuntime, SpawnInput, RuntimeWorkspace, TurnEnded } from './contracts.ts';
 
@@ -89,14 +90,12 @@ export class NativeRuntime implements AgentRuntime {
   private readonly settling = new Map<string, string>();
   private readonly logs = new Map<string, string>();
   private closed = false;
-  private readonly lock: string;
+  private readonly releaseWriter: () => void;
   constructor(private readonly options: NativeOptions) {
     if (!/^[a-zA-Z0-9_-]+$/.test(options.host)) throw new Error('执行节点 host ID 必须是字母、数字、_、-');
     mkdirSync(options.root, { recursive: true, mode: 0o700 });
-    this.lock = join(options.root, 'writer.lock');
-    const fd = openSync(this.lock, 'wx', 0o600);
+    this.releaseWriter = acquireNativeWriter(join(options.root, 'writer.lock'), options.host);
     try {
-      writeFileSync(fd, JSON.stringify({ pid: process.pid, host: options.host }));
       let state: State | undefined;
       try { state = JSON.parse(readFileSync(join(options.root, 'sessions.json'), 'utf8')); }
       catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
@@ -111,8 +110,7 @@ export class NativeRuntime implements AgentRuntime {
         }
         for (const workspace of state.workspaces) this.workspaces.set(workspace.workspaceId, workspace);
       }
-    } catch (error) { unlinkSync(this.lock); throw error; }
-    finally { closeSync(fd); }
+    } catch (error) { this.releaseWriter(); throw error; }
   }
   private save(): void {
     const path = join(this.options.root, 'sessions.json');
@@ -273,6 +271,6 @@ export class NativeRuntime implements AgentRuntime {
       try { await active.done; } finally { clearTimeout(timer); }
     }));
     await Promise.all([...this.turns]);
-    unlinkSync(this.lock);
+    this.releaseWriter();
   }
 }

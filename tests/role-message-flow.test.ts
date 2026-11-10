@@ -7,7 +7,7 @@ import { OutboundMessageStore, renderMessage, templateFor, type OutboundMessage 
 import { taskBrief } from '../src/dispatcher/brief.ts';
 import { wake } from '../src/dispatcher/prompts.ts';
 import { scrubEnv } from '../plugin/server/scrub.ts';
-import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
+import { Workforce } from '../src/workforce.ts';
 
 const env = { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' };
 const recordId = (id: string) => ({ id, tb: 'task', toString: () => `task:${id}` });
@@ -85,13 +85,15 @@ test('machineCriterionId reads the first required machine criterion and falls ba
 
 test('review drafts and no-draft review sends use the same code flag as execute', async () => {
   const created: Array<{ step: string; body: string }> = [];
+  let latest: Record<string, unknown> | undefined;
   const fake = (task: Record<string, unknown>) => new OutboundMessageStore({
     query: async (sql: string, vars: Record<string, any>) => {
       if (sql.includes('CREATE outbound_message')) {
         created.push({ step: vars.step, body: vars.body });
-        return [[{ id: { id: `m${created.length}` }, task: { id: 't1' }, step: vars.step, role: vars.role,
-          body: vars.body, state: 'draft', hold: false, created_at: 'now' }]];
+        latest = { id: { id: `m${created.length}` }, task: { id: 't1' }, step: vars.step, role: vars.role,
+          body: vars.body, state: 'draft', hold: false, created_at: 'now' }; return [[latest]];
       }
+      if (sql.includes('AS dispatch_revision')) return [latest ? [{ ...latest, dispatch_revision: 'fixture-token' }] : []];
       if (sql.includes('SELECT executor_role')) return [[task]];
       if (sql.includes('SELECT body, created_at FROM outbound_message')) return [[]];
       return [[]];
@@ -146,6 +148,7 @@ test('hold refuses to send; sent locks editing; the sent body is the table body'
         const task = (vars as { task?: { id?: string } }).task?.id;
         return [rows.filter(r => (r.task as { id: string }).id === task && (sql.includes('state !=') ? r.state !== 'sent' : true))];
       }
+      if (sql.includes('AS dispatch_revision')) return [rows.filter(r => (r.id as { id: string }).id === (vars.msg as { id: string }).id).map(r => ({ ...r, dispatch_revision: 'fixture-token' }))];
       if (sql.includes('SELECT state FROM $msg')) return [rows.filter(r => (r.id as { id: string }).id === (vars.msg as { id: string }).id)];
       if (sql.includes('UPDATE $msg SET hold')) {
         const row = rows.find(r => (r.id as { id: string }).id === (vars.msg as { id: string }).id)!;
@@ -187,82 +190,30 @@ test('hold refuses to send; sent locks editing; the sent body is the table body'
   expect(locked.hold).toBe(false);
 });
 
-test('dispatcher markOutbound passes non-empty employee id to markSent (ITEM 2)', async () => {
-  const sentCalls: Array<{ id: string; employeeId: string; body: string }> = [];
-  const fakeStore = {
-    markSent: async (id: string, employeeId: string, body: string) => {
-      sentCalls.push({ id, employeeId, body });
-      return { body, message: { id, taskId: 't1', step: 'execute' } as OutboundMessage };
-    },
-  };
-  const fakeOwner = {
-    resolveNotice: async () => {},
-  };
-  const dispatcher = new Dispatcher({
-    owner: fakeOwner,
-    messages: fakeStore as unknown as OutboundMessageStore,
-  } as never);
-
-  const prepared = {
-    message: { id: 'm1', taskId: 't1', step: 'execute', sentTo: '' } as OutboundMessage,
-    body: '正文',
-  };
-
-  await (dispatcher as any).markOutbound(prepared, 'eng-instance-42');
-
-  expect(sentCalls).toHaveLength(1);
-  expect(sentCalls[0].employeeId).toBe('eng-instance-42');
-  expect(sentCalls[0].employeeId.length).toBeGreaterThan(0);
+test('dispatch finalizer keeps employee attribution, message audit and binding inside one transaction', async () => {
+  const calls: Array<{ sql: string; vars: Record<string, unknown> }> = [];
+  const wf = new Workforce({ db: { query: async (sql: string, vars: Record<string, unknown>) => { calls.push({ sql, vars }); return []; } } } as never);
+  await wf.finishDispatchAttempt('attempt-fixture', 'agent-fixture');
+  expect(calls).toHaveLength(1);
+  expect(calls[0]!.sql).toContain('BEGIN;');
+  expect(calls[0]!.sql).toContain('sent_to = $a.employee');
+  expect(calls[0]!.sql).toContain('paseo_agent_id = $agent');
+  expect(calls[0]!.sql).toContain('dispatch finalization generation changed');
 });
 
-test('dispatcher markOutbound resolves hold notice after successful send lock (ITEM 3)', async () => {
-  const resolvedNotices: string[] = [];
-  const fakeStore = {
-    markSent: async (_id: string, _emp: string, body: string) => ({ body, message: {} as OutboundMessage }),
-  };
-  const fakeOwner = {
-    resolveNotice: async (key: string) => {
-      resolvedNotices.push(key);
-    },
-  };
-  const dispatcher = new Dispatcher({
-    owner: fakeOwner,
-    messages: fakeStore as unknown as OutboundMessageStore,
-  } as never);
-
-  const prepared = {
-    message: { id: 'm1', taskId: 'task-abc', step: 'execute', sentTo: '' } as OutboundMessage,
-    body: '正文',
-  };
-
-  await (dispatcher as any).markOutbound(prepared, 'e1');
-
-  expect(resolvedNotices).toEqual(['message-hold:task-abc:execute']);
+test('dispatch finalizer resolves hold notice in the same commit as sent-lock', async () => {
+  let sql = '';
+  const wf = new Workforce({ db: { query: async (query: string) => { sql = query; return []; } } } as never);
+  await wf.finishDispatchAttempt('attempt-fixture', 'agent-fixture');
+  expect(sql).toContain('UPDATE owner_notice SET resolved_at');
+  expect(sql.indexOf('UPDATE owner_notice')).toBeLessThan(sql.indexOf('COMMIT;'));
 });
 
-test('dispatcher markOutbound logs and does not throw when resolveNotice fails (ITEM 3)', async () => {
-  const logs: string[] = [];
-  const fakeStore = {
-    markSent: async (_id: string, _emp: string, body: string) => ({ body, message: {} as OutboundMessage }),
-  };
-  const fakeOwner = {
-    resolveNotice: async () => {
-      throw new Error('rpc disconnect');
-    },
-  };
-  const dispatcher = new Dispatcher({
-    owner: fakeOwner,
-    messages: fakeStore as unknown as OutboundMessageStore,
-    log: (msg: string) => logs.push(msg),
-  } as never);
-
-  const prepared = {
-    message: { id: 'm1', taskId: 't1', step: 'execute' } as OutboundMessage,
-    body: '正文',
-  };
-
-  await expect((dispatcher as any).markOutbound(prepared, 'e1')).resolves.toBeUndefined();
-  expect(logs.some(l => l.includes('failed to resolve message-hold notice'))).toBe(true);
+test('dispatch finalizer propagates transaction failure without an unguarded fallback', async () => {
+  let calls = 0;
+  const wf = new Workforce({ db: { query: async () => { calls++; throw new Error('rpc disconnect'); } } } as never);
+  await expect(wf.finishDispatchAttempt('attempt-fixture', 'agent-fixture')).rejects.toThrow('rpc disconnect');
+  expect(calls).toBe(1);
 });
 
 test('employee sandbox still forbids reading private/', () => {

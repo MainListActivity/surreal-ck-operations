@@ -1,5 +1,6 @@
+import { NativeRuntime } from '../src/runner/native.ts';
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
@@ -44,7 +45,27 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
     views.set(id, v); rows.push({ ...v, row: {}, repoPath: opts.worktreePath ? '/repo' : undefined } as unknown as SupervisedTask); };
   /** Per-test config overrides; the breaker floors stay 0 unless a test asks for them. */
   let cfgOverride: Partial<typeof DEFAULT_CONFIG> = {};
+  const attempts = new Map<string, { id: string; employee: string; task?: string; kind: string; agent?: string; message?: string; activationRequired?: boolean; activation_state?: string; binding?: { cwd: string; repoHome?: string; workspaceScope?: string; model?: string } }>();
   const wf = {
+    pendingDispatchAttempts: async () => [...attempts.values()],
+    recoverDispatchBindings: async () => [] as string[],
+    beginDispatchAttempt: async (input: { employee: string; task?: string; kind: string; agent?: string }) => {
+      const id = `attempt-${attempts.size + 1}`; attempts.set(id, { id, ...input }); return id;
+    },
+    acknowledgeDispatchAttempt: async (id: string, agent: string) => { attempts.get(id)!.agent = agent; },
+    prepareDispatchActivation: async (id: string, agent: string) => {
+      const attempt = attempts.get(id)!;
+      await wf.bind(attempt.employee, { ...attempt.binding, agentId: agent, cwd: attempt.binding?.cwd ?? '/fixture' });
+      attempt.activation_state = 'calling';
+    },
+    confirmDispatchActivation: async (id: string) => { attempts.get(id)!.activation_state = 'activated'; },
+    finishDispatchAttempt: async (id: string, agent: string) => {
+      const attempt = attempts.get(id)!;
+      await messages.markSent(attempt.message ?? 'fixture');
+      if (attempt.kind === 'spawn') await wf.bind(attempt.employee, { ...attempt.binding, agentId: agent, cwd: attempt.binding?.cwd ?? '/fixture' });
+      await wf.touchWake();
+      attempts.delete(id);
+    },
     config: async () => ({ ...DEFAULT_CONFIG, quotaFloorPct: 0, quotaWeeklyFloorPct: 0, sessionMaxWakes: 0, sessionMaxInputK: 0, jevDecisions: false, ...cfgOverride }),
     defs: async () => [def], serverNow: async () => now, insts: async () => instances.filter(i => !retired.has(i.id)), tasks: async () => rows,
     providerHealth: async () => health, lastDispatch: async () => undefined, recordDispatch: async () => {}, observeSessionIdle: async (observations: Array<{ id: string; since?: number }>) => {
@@ -176,7 +197,7 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
     const r = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(dir), name)); if (!r) throw new Error('relay timeout'); return r;
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
-  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, logs, views, relay, denied, held, scopeUnreadable, sentBodies, spawnBodies, waiting, aligned,
+  return { wf, messages, attempts, addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, logs, views, relay, denied, held, scopeUnreadable, sentBodies, spawnBodies, waiting, aligned,
     holdAssets: (paths: string[], holder: WriteScopeHolder) => { assetHolds.push({ paths, holder }); }, freeAssets: () => { assetHolds.splice(0); },
     authorsOf, unreadable, paseo, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
@@ -910,3 +931,113 @@ test('a stall nudge travels as an outbound row marked sent', async () => {
   expect(nudge.body).toContain('分钟没有 checkpoint');
   expect(w.sentBodies.every(b => typeof b.body === 'string' && b.body.length > 0)).toBe(true);
 });
+
+describe('派工外部副作用不确定状态', () => {
+  for (const failure of ['acknowledgeDispatchAttempt', 'markSent', 'bind', 'touchWake', 'finishDispatchAttempt'] as const) {
+    test(`spawn 成功后 ${failure} 失败不得释放、退休或重派，重建 dispatcher 后仍阻断`, async () => {
+      const w = world(); w.addTask(`uncertain-${failure}`);
+      const fail = async () => { throw new Error(`injected ${failure}`); };
+      if (failure === 'markSent') w.messages.markSent = fail;
+      else w.wf[failure] = fail;
+      await expect(w.dispatcher().tick()).rejects.toThrow(`injected ${failure}`);
+      expect(w.spawnBodies).toHaveLength(1);
+      expect(w.attempts.size).toBe(1);
+      expect(w.rows[0]!.currentEmployee).toBe('employee-1');
+      expect(w.events.some(e => /^(release|retire|revoke|performance-failure):/.test(e))).toBe(false);
+      w.setNow(100000); // Even an expired/stale lease must not authorize a blind retry.
+      const report = await w.dispatcher().tick();
+      expect(report.notices).toContain('dispatch-uncertain');
+      expect(report.revoked).toHaveLength(0);
+      expect(w.spawnBodies).toHaveLength(1);
+    });
+  }
+  test('spawn 运行端已接收但响应丢失，禁止尝试下一员工', async () => {
+    const w = world(); w.addTask('lost-spawn-reply');
+    const spawn = w.paseo.spawn;
+    w.paseo.spawn = async input => { await spawn(input); throw new Error('reply lost'); };
+    await expect(w.dispatcher().tick()).rejects.toThrow('reply lost');
+    expect(w.spawnBodies).toHaveLength(1);
+    expect(w.instances).toHaveLength(1);
+    expect(w.attempts.size).toBe(1);
+    await w.dispatcher().tick();
+    expect(w.spawnBodies).toHaveLength(1);
+  });
+  test('写前日志失败不得调用运行端；日志查询失败不得开始派工', async () => {
+    const w = world(); w.addTask('journal-failure');
+    w.wf.beginDispatchAttempt = async () => { throw new Error('journal write lost'); };
+    await expect(w.dispatcher().tick()).rejects.toThrow('journal write lost');
+    expect(w.spawnBodies).toHaveLength(0);
+    w.wf.pendingDispatchAttempts = async () => { throw new Error('journal unavailable'); };
+    await expect(w.dispatcher().tick()).rejects.toThrow('journal unavailable');
+    expect(w.spawnBodies).toHaveLength(0);
+  });
+});
+
+for (const failure of ['reply', 'markSent', 'touchWake'] as const) {
+  test(`复用 send 后 ${failure} 失败保留租约且重启不补发`, async () => {
+    const w = world();
+    const inst: EmployeeInst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture',
+      credential: 'fixture-9', repoHome: '/repo', sessionTask: 'send-task' };
+    inst.cwd = w.pool.commDirFor(inst.id);
+    w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(inst.id, 'agent-9'); inst.paseoAgentId = 'agent-9';
+    w.agents.set('agent-9', { id: 'agent-9', status: 'idle' });
+    w.addTask('send-task', { worktreePath: '/repo-send-task' }); w.rows[0]!.previousEmployee = inst.id;
+    const fail = async () => { throw new Error(`send ${failure}`); };
+    if (failure === 'reply') { const send = w.paseo.send; w.paseo.send = async (...args) => { await send(...args); await fail(); }; }
+    else if (failure === 'markSent') w.messages.markSent = fail;
+    else w.wf.touchWake = fail;
+    await expect(w.dispatcher().tick()).rejects.toThrow(`send ${failure}`);
+    expect(w.sentBodies).toHaveLength(1); expect(w.attempts.size).toBe(1);
+    expect(w.rows[0]!.currentEmployee).toBe(inst.id);
+    expect(w.events).not.toContain('release:send-task');
+    const report = await w.dispatcher().tick();
+    expect(report.woke).toHaveLength(0); expect(w.sentBodies).toHaveLength(1);
+  });
+}
+
+test('不确定任务局部隔离，不阻止无关任务新派工及运行监督', async () => {
+  const w = world(); w.addTask('uncertain');
+  const bind = w.wf.bind;
+  w.wf.bind = async () => { throw new Error('bind uncertain'); };
+  await expect(w.dispatcher().tick()).rejects.toThrow('bind uncertain');
+  w.wf.bind = bind;
+  w.addTask('unrelated');
+  const report = await w.dispatcher().tick();
+  expect(report.woke.map(x => x.task)).toContain('unrelated');
+  expect(w.spawnBodies).toHaveLength(2);
+  expect(w.rows[0]!.currentEmployee).toBe('employee-1');
+  expect(w.events).not.toContain('release:uncertain');
+});
+
+for (const lostReply of [false, true]) {
+  test(`真实 NativeRuntime 经 dispatcher spawn→绑定→activate，激活回执丢失=${lostReply}`, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dispatch-native-'));
+    const script = join(root, 'fixture.cjs'), received = join(root, 'received.txt');
+    writeFileSync(script, `let p='';process.stdin.setEncoding('utf8');process.stdin.on('data',s=>p+=s);process.stdin.on('end',()=>{require('fs').writeFileSync(process.env.FIXTURE_ROOT+'/received.txt',p);console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,session_id:'fixture-session',result:'完成'}));});`);
+    const runtime = new NativeRuntime({ root: join(root, 'runtime'), host: 'fixture', command: () => [process.execPath, script], environment: async () => ({ PATH: process.env.PATH ?? '', FIXTURE_ROOT: root }), onEnded: async () => {} });
+    try {
+      const w = world(); w.def.provider = 'factory-droid'; w.addTask('native-activation'); w.rows[0]!.repoPath = root;
+      let calls = 0;
+      w.paseo.spawn = input => runtime.spawn(input);
+      w.paseo.activate = async agent => {
+        calls++;
+        expect(w.instances[0]!.paseoAgentId).toBe(agent);
+        expect([...w.attempts.values()][0]!.activation_state).toBe('calling');
+        expect(w.events.some(e => e.startsWith('markSent:'))).toBe(false);
+        await runtime.activate(agent);
+        if (lostReply) throw new Error('activation reply lost');
+      };
+      if (lostReply) await expect(w.dispatcher().tick()).rejects.toThrow('activation reply lost');
+      else await w.dispatcher().tick();
+      for (let i = 0; i < 100 && !existsSync(received); i++) await Bun.sleep(10);
+      expect(readFileSync(received, 'utf8')).toContain('native-activation');
+      expect(calls).toBe(1);
+      if (lostReply) {
+        expect(w.attempts.size).toBe(1);
+        await w.dispatcher().tick();
+        expect(calls).toBe(1);
+        expect(w.events.some(e => e.startsWith('markSent:'))).toBe(false);
+      } else { expect(w.attempts.size).toBe(0); expect(w.events.some(e => e.startsWith('markSent:'))).toBe(true); }
+    } finally { await runtime.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+}

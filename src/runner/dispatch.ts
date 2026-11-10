@@ -390,6 +390,9 @@ export function startDispatch(server: PluginServerContext): RunnerControl {
 
 
 async function runLifecycleGc(ctx: Company): Promise<void> {
+  // Until every GC reference source understands attempt fences, retain artifacts only;
+  // this does not pause dispatch, lease maintenance, or execution-result ingestion.
+  if ((await ctx.workforce.pendingDispatchAttempts()).length) return;
   const cfg = await ctx.workforce.config();
   const now = new Date();
   const commRoot = process.env.SCK_COMM_ROOT ?? join(serviceHome(), "comm");
@@ -494,6 +497,9 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
             },
           })).catch(() => console.warn('iteration reconciliation failed'));
         }
+        const uncertainWorkers = new Set((await ctx.workforce.pendingDispatchAttempts()).map(a => a.employee));
+        for (const error of await ctx.workforce.recoverDispatchBindings()) console.warn(`dispatch recovery retained: ${error}`);
+        if (uncertainWorkers.size) await ctx.sidecar.adopt((await ctx.workforce.insts()).filter(i => uncertainWorkers.has(i.id)));
         await ctx.sidecar.retryExecutions();
         const report = await timing.measure("tick", () => ctx.dispatcher.tick());
         await timing.measure("observation", () => persistDispatchObservation(ctx)).catch((error) => console.warn(`dispatch observation write failed: ${(error as Error).message}`));

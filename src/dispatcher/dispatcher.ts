@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto';
 import { FACTORY_PROVIDER, FACTORY_WAIT_LIMIT, factoryFirst, factoryQueue, leaveFactoryQueue } from './provider-order.ts';
 import { employeeTier, managedModel, taskTier } from "../model-routing/policy.ts";
 import { groupModel, isGroupModel } from "../model-routing/magpie-contract.ts";
@@ -473,6 +474,7 @@ export interface DispatcherDeps {
 export interface SidecarBridge {
   /** Environment for a fresh spawn: comm dir + key, never credentials. */
   env(inst: EmployeeInst): Record<string, string>;
+  adopt?(insts: EmployeeInst[]): Promise<void>;
   /** A live launch binding in this plugin process; false after restart or detach. */
   canReuse(inst: EmployeeInst): boolean;
   /** Releases a session binding and all of its ops sessions. */
@@ -861,25 +863,6 @@ export class Dispatcher {
     return dispatchText(prepared.body, prepared.workdir);
   }
 
-  /** Lock the drafted message as sent, and close its hold notice, after the external send succeeded. */
-  private async markOutbound(prepared: PreparedOutbound | null | undefined, employeeId: string): Promise<void> {
-    if (!prepared) return;
-    const store = this.messageStore();
-    if (!store) return;
-    try {
-      await store.markSent(prepared.message.id, employeeId, this.outboundBody(prepared)!);
-    } catch (error) {
-      this.log(`outbound message sent-lock failed: ${(error as Error).message}`);
-      return;
-    }
-    try {
-      await this.deps.owner.resolveNotice(`message-hold:${prepared.message.taskId}:${prepared.message.step}`);
-    } catch (error) {
-      this.log(`failed to resolve message-hold notice for ${prepared.message.taskId}:${prepared.message.step}: ${(error as Error).message}`);
-    }
-  }
-
-
   /** Dispatch-blocked conclusions from the latest pass, keyed by task and phase. Dispatchable work is absent. */
   private readonly verdicts = new Map<string, DispatchVerdict>();
   /** Tasks whose claim lost the write scope to another writer in this pass: settled as write_scope, never as a wake failure. */
@@ -1005,6 +988,15 @@ export class Dispatcher {
   private async pass(): Promise<TickReport> {
     const { workforce: wf, owner, paseo } = this.deps;
     const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], refused: [], exhausted: [], notices: [], decisions: [], realigned: [], recovered: [] };
+    const uncertain = await wf.pendingDispatchAttempts();
+    const isolatedEmployees = new Set(uncertain.map(a => a.employee));
+    const isolatedTasks = new Set(uncertain.map(a => a.task).filter((id): id is string => !!id));
+    if (uncertain.length) {
+      for (const error of await wf.recoverDispatchBindings()) this.log(`dispatch recovery retained: ${error}`);
+      await this.deps.sidecar?.adopt?.((await wf.insts()).filter(i => isolatedEmployees.has(i.id)));
+      await this.notice('dispatch-uncertain',
+        `派工结果待核验，仅隔离关联任务与员工，禁止直接重试。记录：${uncertain.map(a => a.id).join(', ')}`, report);
+    } else await owner.resolveNotice('dispatch-uncertain');
     report.commands = (await owner.applyPending()).length;
     const cfg = await wf.config();
     const [agents, defs, now, quotaRows, slotRows] = await Promise.all([paseo.list(), wf.defs(), wf.serverNow(),
@@ -1069,6 +1061,7 @@ export class Dispatcher {
     const observedStatus = new Map<string, string>();
     let openTasks: SupervisedTask[] | undefined;
     for (const inst of insts) {
+      if (isolatedEmployees.has(inst.id)) { states.set(inst.id, 'unknown'); continue; }
       if (!inst.paseoAgentId) {
         if (await this.retireGated(inst, 'spawn did not bind a Paseo agent', 'failure', report)) report.retired.push(inst.id);
         continue;
@@ -1192,6 +1185,10 @@ export class Dispatcher {
     for (const task of await wf.tasks()) {
       if (!task.currentEmployee) continue;
       const inst = byId.get(task.currentEmployee);
+      if (isolatedTasks.has(task.id)) {
+        if (inst && await this.deps.sidecar?.maintainLease?.(inst, task.id).catch(() => false)) report.extended.push(task.id);
+        continue;
+      }
       const state = inst ? states.get(inst.id) : undefined;
       const expired = (task.leaseExpiresAt ?? 0) <= now;
       const stale = task.progressAt !== undefined && now - task.progressAt > cfg.stallMinutes * 60;
@@ -1263,7 +1260,7 @@ export class Dispatcher {
           this.log(`retired ${inst.id}: task ${inst.lastTask} finished`);
         }
       }
-      await this.closeFinishedWorkspaces(insts, report.retired)
+      await this.closeFinishedWorkspaces(insts.filter(i => !isolatedEmployees.has(i.id)), report.retired)
         .catch(error => this.log(`workspace cleanup failed safely: ${(error as Error).message}`));
       let inspected = 0;
       for (const inst of insts) {
@@ -1337,9 +1334,9 @@ export class Dispatcher {
     // 4. Work that needs an employee.
     const holding = new Set(tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
     const work = [
-      ...tasks.filter(t => t.state === 'review' && t.reviewerRole !== 'owner' && !t.currentEmployee)
+      ...tasks.filter(t => !isolatedTasks.has(t.id) && t.state === 'review' && t.reviewerRole !== 'owner' && !t.currentEmployee)
         .map(t => ({ task: t, role: t.reviewerRole, purpose: 'review' as const })),
-      ...tasks.filter(t => (t.state === 'ready' || t.state === 'doing') && !t.currentEmployee)
+      ...tasks.filter(t => !isolatedTasks.has(t.id) && (t.state === 'ready' || t.state === 'doing') && !t.currentEmployee)
         .map(t => ({ task: t, role: t.executorRole as string, purpose: 'execute' as const })),
     ];
     // The owner board shows each queued item's message, so its draft exists before the first dispatch (a rework message included).
@@ -1390,7 +1387,7 @@ export class Dispatcher {
       // Try to buy our way back with terminal-task artifacts before bailing out:
       // no new task can run until free space recovers, and reclaim takes real free
       // space away from nothing (clones only) while the probe is what decides.
-      if (this.deps.reclaimArtifacts) {
+      if (this.deps.reclaimArtifacts && !uncertain.length) {
         const targetFreeMb = cfg.minFreeDiskMb + (cfg.artifactHeadroomMb ?? 0);
         const reclaimed = reclaimAttempt = await this.deps.reclaimArtifacts({
           // Emergency: the config switch must not be able to deadlock dispatch; only the
@@ -1430,7 +1427,7 @@ export class Dispatcher {
     const busyBy = new Map<string, number>();
     let running = 0;
     for (const inst of insts) {
-      if (states.get(inst.id) !== 'busy') continue;
+      if (states.get(inst.id) !== 'busy' && !isolatedEmployees.has(inst.id)) continue;
       running++;
       busyBy.set(inst.provider ?? '', (busyBy.get(inst.provider ?? '') ?? 0) + 1);
     }
@@ -1591,10 +1588,10 @@ export class Dispatcher {
     await dispatchLateBefore();
 
     // Jev 拿不准的目标留在老板收件箱，由老板通过 owner 接口分级；不再拉起老板分级会话。
-    await this.sweep(now);
+    if (!uncertain.length) await this.sweep(now);
     // Slow lazy pass over terminal-task artifacts: keeps evidence/deliverables from growing
     // without bound. Skipped when the resource gate already reclaimed above (pressure path).
-    if (this.deps.reclaimArtifacts && !report.reclaimed) {
+    if (this.deps.reclaimArtifacts && !report.reclaimed && !uncertain.length) {
       // `now` here is server time in seconds, not epoch ms: keep the cadence clock local.
       const wall = Date.now();
       if (wall - this.lastArtifactSweep >= 30 * 60_000) {
@@ -1716,6 +1713,7 @@ export class Dispatcher {
       const first = !this.onboarded.has(existing.id) && !existing.onboarded;
       let claim: ClaimResult | undefined;
       let workspace: WorktreeAssignment | undefined;
+      let externalAttempt = false;
       try {
         if (sidecar && !task) workspace = await sidecar.readWorkspace?.(existing, anchor?.task?.id, anchor?.project);
         if (sidecar && task) {
@@ -1766,17 +1764,22 @@ export class Dispatcher {
             return undefined;
           }
           await hooks?.beforeExternal?.(existing, 'send');
+          externalAttempt = true;
+          const attempt = await wf.beginDispatchAttempt({ request: randomUUID(), message: prepared?.message.id,
+            messageRevision: prepared?.message.dispatchRevision, body: body!, bodyHash: createHash('sha256').update(body!).digest('hex'), employee: existing.id, task: task?.id, kind: 'send',
+            agent: existing.paseoAgentId, delivery: claim?.deliveryId, fence: claim?.fence });
           await paseo.send(existing.paseoAgentId!, body!);
-          await this.markOutbound(prepared ?? undefined, existing.id);
+          await wf.acknowledgeDispatchAttempt(attempt, existing.paseoAgentId!);
           await hooks?.afterExternal?.(existing, 'send', existing.paseoAgentId!);
           this.onboarded.add(existing.id);
           this.lastStatus.set(existing.paseoAgentId!, 'running');
-          await wf.touchWake(existing.id);
+          await wf.finishDispatchAttempt(attempt, existing.paseoAgentId!);
           this.log(`woke ${existing.id} for ${task?.id ?? `dispatch:${role}`}`);
           return { ...existing, spawned: false };
         }
       } catch (error) {
         this.log(`wake ${existing.id} failed: ${(error as Error).message}`);
+        if (externalAttempt) throw error; // Never release or redispatch an uncertain external call.
         if (workspace) await sidecar?.releaseWorkspace?.(existing);
         if (claim && task) await sidecar!.releaseClaim(existing.id, task.id, `wake failed: ${(error as Error).message.slice(0, 120)}`);
         return undefined;
@@ -1817,6 +1820,7 @@ export class Dispatcher {
         if (await this.retireGated(inst, scopeLost ? 'write scope held' : 'claim denied', 'failure', report)) report.retired.push(inst.id);
         return undefined;
       }
+      let externalAttempt = false;
       try {
         // Goal conversations live at the repository root; private comm remains per employee.
         // Worktree allocation stays in claim.json and never changes the Paseo workspace.
@@ -1844,33 +1848,44 @@ export class Dispatcher {
         }
         await hooks?.beforeExternal?.(inst, 'spawn');
         const container = await this.sessionWorkspace(task ?? anchor?.task, spawnCwd, repoHome);
+        externalAttempt = true;
+        const attempt = await wf.beginDispatchAttempt({ request: randomUUID(), message: prepared?.message.id,
+          messageRevision: prepared?.message.dispatchRevision, body: body!, bodyHash: createHash('sha256').update(body!).digest('hex'),
+          activationRequired: !!paseo.activate, binding: { cwd: spawnCwd, repoHome, model, workspaceScope, paseoWorkspace: container.workspaceId }, employee: inst.id, task: task?.id, kind: 'spawn',
+          delivery: claim?.deliveryId, fence: claim?.fence });
         const agentId = await paseo.spawn({
           // A managed group name is not a Claude model id the thinking flag can address: the level is left unset and says so in the PR.
           title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model, thinking: isGroupModel(model) ? undefined : def.thinking,
           mode: UNATTENDED_MODE[def.provider], cwd: spawnCwd,
           ...container,
           repoHome,
-          labels: { company: 'surreal-ck', employee_id: inst.id, role: def.role, def: def.id },
+          labels: { company: 'surreal-ck', employee_id: inst.id, role: def.role, def: def.id, dispatch_request: attempt },
           env: spawnEnv,
           prompt: body!,
         });
-        await this.markOutbound(prepared ?? undefined, inst.id);
+        this.log(`dispatch receipt ${attempt}: ${inst.id} agent=${agentId}`);
+        await wf.acknowledgeDispatchAttempt(attempt, agentId);
         await hooks?.afterExternal?.(inst, 'spawn', agentId);
         const cwd = spawnCwd;
-        await wf.bind(inst.id, { agentId, cwd, repoHome, model, workspaceScope, paseoWorkspace: container.workspaceId });
+        if (paseo.activate) {
+          await wf.prepareDispatchActivation(attempt, agentId);
+          sidecar.bindAgent(inst.id, agentId);
+          await paseo.activate(agentId);
+          await wf.confirmDispatchActivation(attempt, agentId);
+        }
+        await wf.finishDispatchAttempt(attempt, agentId);
         sidecar?.bindAgent(inst.id, agentId);
-        await paseo.activate?.(agentId);
         const bound = { ...inst, paseoAgentId: agentId, cwd, repoHome, model, workspaceScope, paseoWorkspace: container.workspaceId };
         const prior = insts.findIndex(row => row.id === inst.id);
         if (prior >= 0) insts[prior] = bound; else insts.push(bound);
         this.onboarded.add(inst.id);
         this.lastStatus.set(agentId, 'running');
-        await wf.touchWake(inst.id);
         this.log(`spawned ${inst.id} (${def.provider}/${model}${def.model?.startsWith('auto:') ? ` ← ${def.model}` : ''}) for ${task?.id ?? `dispatch:${role}`}`);
         return { ...bound, spawned: true };
       } catch (error) {
         const message = (error as Error).message;
         this.log(`spawn ${inst.id} failed: ${message}`);
+        if (externalAttempt) throw error; // Keep lease, instance and barrier; no next-def fallback.
         if (workspace) await sidecar?.releaseWorkspace?.(inst);
         if (claim) await sidecar!.releaseClaim(inst.id, task!.id, `spawn failed: ${message.slice(0, 120)}`);
         if (await this.retireGated(inst, `spawn failed: ${message.slice(0, 200)}`, 'failure', report)) report.retired.push(inst.id);
