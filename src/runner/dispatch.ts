@@ -520,7 +520,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
   };
   const removers = [
     server.on("agent.turn_started", (event, { paseo }) => {
-      interruptions.turnStarted(event.agent.id);
+      interruptions.turnStarted(event.agent.id, event.turnId);
       return isCompanyAgent(paseo, event.agent).then(async ok => {
         if (ok) {
           const ctx = await company();
@@ -530,6 +530,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
       }).catch((error: unknown) => console.warn(`idle activity update failed: ${(error as Error).message}`));
     }),
     server.on("agent.turn_ended", (event, { paseo }) => {
+      event = { ...event, observedAt: Date.now() };
       noteHost(paseo);
       return isCompanyAgent(paseo, event.agent).then(async ok => {
         console.log(`turn_ended ${event.agent.title ?? event.agent.id} company=${ok}`);

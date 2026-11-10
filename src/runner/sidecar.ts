@@ -204,7 +204,7 @@ interface LiveClaim {
 /** What settle() found for a finished turn; `silent` carries the still-open round. */
 export interface SettleResult {
   status: "ingested" | "no_claim" | "silent" | "pending";
-  silent?: { instId: string; taskId: string; nudges: number; phase: "doing" | "review" };
+  silent?: { deliveryId?: string; instId: string; taskId: string; nudges: number; phase: "doing" | "review" };
 }
 
 const ORPHAN_PREFIX = "orphaned-";
@@ -302,7 +302,7 @@ export class SidecarPool {
     if (event.outcome.kind !== 'completed') {
       row.state = 'interrupted'; await this.changed(row);
       // Failed/canceled output is never treated as a successful business result.
-      return { status: 'silent', silent: { instId: employee, taskId: row.task, nudges: 3, phase: row.phase } };
+      return { status: 'silent', silent: { deliveryId: row.proof.deliveryId, instId: employee, taskId: row.task, nudges: 3, phase: row.phase } };
     }
     const dir = this.commDirFor(employee);
     // Snapshot artifacts with this delivery before any asynchronous cloud mirror can yield to a new claim.
@@ -681,7 +681,7 @@ export class SidecarPool {
     // between a wake nudge and a server-side release; the count feeds that decision.
     if (!options.infrastructureFailure) live.nudges = (live.nudges ?? 0) + 1;
     this.log(`turn ended without new report/blocker: ${instId} on ${live.taskId} (silent turn ${live.nudges})`);
-    return { status: "silent", silent: { instId, taskId: live.taskId, nudges: live.nudges ?? 0, phase: live.phase } };
+    return { status: "silent", silent: { deliveryId: live.proof.deliveryId, instId, taskId: live.taskId, nudges: live.nudges ?? 0, phase: live.phase } };
   }
 
   private async finish(
@@ -719,7 +719,10 @@ export class SidecarPool {
   }
 
   /** The instance still holds its local lease on the task. */
-  holdsLease(instId: string, taskId: string): boolean { return this.claims.get(instId)?.taskId === taskId; }
+  holdsLease(instId: string, taskId: string, deliveryId?: string): boolean {
+    const live = this.claims.get(instId);
+    return live?.taskId === taskId && (!deliveryId || live.proof.deliveryId === deliveryId);
+  }
 
   /**
    * The lease was ended elsewhere (dispatcher revoked it server-side, or the task
