@@ -279,7 +279,7 @@ export class SidecarPool {
     const employee = this.instByAgent.get(event.agent.id);
     if (!employee) return { status: 'no_claim' };
     const prior = this.journal.rows().find(r => r.employee === employee && !!event.turnId && r.turns.includes(event.turnId));
-    if (prior) { await this.flushExecution(prior); return { status: prior.state === 'settled' ? 'ingested' : 'pending' }; }
+    if (prior) { if (prior.state === 'collecting') await this.collectExecution(prior); else await this.flushExecution(prior); return { status: prior.state === 'settled' ? 'ingested' : 'pending' }; }
     const live = this.claims.get(employee);
     const row = live ? this.journal.reserve(employee, live.phase, live.proof)
       : this.journal.rows().filter(r => r.employee === employee && r.agent === event.agent.id
@@ -297,12 +297,16 @@ export class SidecarPool {
       // Failed/canceled output is never treated as a successful business result.
       return { status: 'silent', silent: { instId: employee, taskId: row.task, nudges: 3, phase: row.phase } };
     }
-    row.state = 'collecting'; await this.changed(row);
     const dir = this.commDirFor(employee);
+    // Snapshot artifacts with this delivery before any asynchronous cloud mirror can yield to a new claim.
+    row.artifacts = live?.proof.deliveryId === row.proof.deliveryId
+      ? { raw: readTextFile(join(dir, 'result.json')), blocker: readTextFile(blockerPath(dir)), report: readTextFile(reportPath(dir)) } : {};
+    row.state = 'collecting'; await this.changed(row);
+    return this.collectExecution(row);
+  }
+  private async collectExecution(row: ExecutionAttempt): Promise<SettleResult> {
     try {
-      const raw = readTextFile(join(dir, 'result.json'));
-      const blocker = readTextFile(blockerPath(dir));
-      const report = readTextFile(reportPath(dir));
+      const { raw, blocker, report } = row.artifacts ?? {}; // Never read a later delivery's shared files during recovery.
       row.result = blocker !== undefined ? workResult('', row.phase, { summary: blocker, outcome: 'blocked' })
         : workResult(report || row.finalText || '', row.phase, raw === undefined ? undefined : JSON.parse(raw));
       row.state = 'pending'; row.nextRetry = 0;
@@ -320,9 +324,8 @@ export class SidecarPool {
   async retryExecutions(): Promise<void> {
     if (!this.journal || this.closed) return;
     for (const row of this.journal.rows()) {
-      if (row.state === 'collecting' && row.agent) {
-        await this.settleExecution({ agent: { id: row.agent }, outcome: { kind: 'completed' },
-          timeline: row.finalText ? [{ type: 'assistant_message', text: row.finalText }] : [] });
+      if (row.state === 'collecting') {
+        await this.collectExecution(row);
       } else if (row.state === 'pending' && row.nextRetry <= Date.now()) await this.flushExecution(row);
     }
   }

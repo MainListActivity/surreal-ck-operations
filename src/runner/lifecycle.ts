@@ -21,6 +21,7 @@ export interface ExecutionAttempt {
   turns: string[];
   result?: WorkResult;
   finalText?: string;
+  artifacts?: { raw?: string; blocker?: string; report?: string };
   prepared?: boolean;
   originalResult?: WorkResult;
   tries: number;

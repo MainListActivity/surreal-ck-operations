@@ -155,3 +155,31 @@ test('本地 claim 丢失仍保存并提交结束结果，不要求 agent 补交
     expect(f.journal().rows()[0]?.state).toBe('settled');
   } finally { f.close(); }
 });
+
+
+test('恢复旧批次 collecting 不消费新任务产物，也不提交新租约', async () => {
+  const f = fixture(); try {
+    await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
+    const old = f.journal().rows()[0]!;
+    old.state = 'collecting'; old.finalText = '旧任务只读核对结果已完成，等待执行端收尾。'; old.turns.push('turn-a'); f.journal().save(old);
+    f.nextDelivery(); await f.claim(); await f.pool.turnStarted('agent', 'turn-b');
+    writeFileSync(join(f.pool.commDirFor('worker'), 'result.json'), JSON.stringify({summary:'新任务仍在执行的草稿',outcome:'blocked'}));
+    await f.retry();
+    expect(f.calls.map(c => [c.action, c.proof.deliveryId])).toEqual([['submit', 'delivery-a']]);
+    expect(f.journal().read('worker','delivery-a')?.state).toBe('superseded');
+    expect(f.journal().read('worker','delivery-b')?.state).toBe('running');
+    expect(f.pool.holdsLease('worker','task')).toBe(true);
+  } finally { f.close(); }
+});
+test('重复结束恢复同一 collecting 快照，不重新读取被覆盖的文件', async () => {
+  const f = fixture(); try {
+    await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
+    const row = f.journal().rows()[0]!;
+    row.state = 'collecting'; row.turns.push('turn-a');
+    row.artifacts = {raw: JSON.stringify({summary:'已完成真实工作检查，成果已经持久保存。'})}; f.journal().save(row);
+    writeFileSync(join(f.pool.commDirFor('worker'), 'result.json'), 'invalid');
+    await f.pool.settleExecution(f.event()); await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['submit']);
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+  } finally { f.close(); }
+});
