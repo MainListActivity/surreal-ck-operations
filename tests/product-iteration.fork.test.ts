@@ -156,9 +156,13 @@ run('多个接收者并发重放同一反馈只落一条；整理失败有上限
   expect(new Set(replies.map(r=>r.id)).size).toBe(1);
   await db.query("UPDATE product_feedback SET state='dismissed' WHERE request_key!=$key;",{key:input.requestKey});
   for(let i=0;i<3;i++)await triageFeedback(db,async()=>{throw new Error('upstream failure');});
-  const [rows]=await db.query<[Array<{id:import('surrealdb').RecordId;state:string;attempts:number}>]>('SELECT * FROM product_feedback WHERE request_key=$key;',{key:input.requestKey});
+  const [rows]=await db.query<[Array<{id:import('surrealdb').RecordId;state:string;attempts:number;diagnostic:unknown}>]>('SELECT * FROM product_feedback WHERE request_key=$key;',{key:input.requestKey});
   expect(rows[0]?.state).toBe('failed');expect(rows[0]?.attempts).toBe(3);
+  expect(rows[0]?.diagnostic).toMatchObject({stage:'model',code:'unexpected_error'});
+  expect(JSON.stringify(rows[0]?.diagnostic)).not.toContain('upstream failure');
   await retryFeedback(db,String(rows[0]!.id.id),'owner');
+  const [retried]=await db.query<[Array<{diagnostic?:unknown}>]>('SELECT diagnostic FROM product_feedback WHERE request_key=$key;',{key:input.requestKey});
+  expect(retried[0]?.diagnostic).toBeUndefined();
   const out=await triageFeedback(db,async()=>({disposition:'dismiss',category:'noise',reason:'测试反馈'}));expect(out.dismissed).toBe(1);
 });
 

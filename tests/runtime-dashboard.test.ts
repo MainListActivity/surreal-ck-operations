@@ -92,6 +92,18 @@ test('心跳过期与归属缺失如实显示；未上报设备不能伪归当�
   expect(data.summary.hosts).toBe(1);
 });
 
+test('退出的旧插件进程不重复计算主机；有在岗员工的离线节点仍可见', () => {
+  const input = fixture();
+  input.beats.push({ runner: 'plugin:old-pid', host: 'mac', at: now - 3600000 });
+  input.beats.push({ runner: 'native:empty', host: 'remote-empty', at: now });
+  expect(buildRuntimeDashboard(input, now).summary.hosts).toBe(2);
+  input.employees[1]!.runner_id = 'plugin:old-pid';
+  const data = buildRuntimeDashboard(input, now);
+  expect(data.summary.hosts).toBe(3);
+  expect(data.hosts.find(h => h.id === 'plugin:old-pid')?.state).toBe('offline');
+  expect(data.agents.find(a => a.id === 'qa')?.state).toBe('unknown');
+});
+
 test('进度来自需求的实际任务清单，作废项排除，缺失项不能伪报 100%', () => {
   const input = fixture();
   input.tasks.push({ id: 'accepted', state: 'done' }, { id: 'voided', state: 'void' });

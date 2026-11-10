@@ -36,6 +36,8 @@ export async function triageFeedback(db:Surreal,classify:ClassifyFeedback,now=Da
     const [claimed]=await db.query<[unknown[]]>(`UPDATE $id SET state='processing', worker=$claimToken, lease_until=$until, attempts+=1, updated_at=time::now()
       WHERE (state='new' OR (state='processing' AND lease_until < $now)) AND attempts < 3 RETURN AFTER;`,{id:feedback.id,claimToken,now,until:now+120000});
     if(!claimed.length)continue;
+    let stage='load';
+    const started=Date.now();
     try{
       const store=new Requirements(db);
       const policy=await store.policy(feedback.project);
@@ -43,11 +45,15 @@ export async function triageFeedback(db:Surreal,classify:ClassifyFeedback,now=Da
       const candidates=(await store.list(feedback.project)).filter(r=>!['rejected','merged'].includes(r.state)).slice(0,30).map(r=>({id:r.id,title:r.title,problem:r.problem.slice(0,600)}));
       const original=JSON.parse(feedback.body) as FeedbackInput;
       // 联系方式不参与模型推理；仅供老板按需回访。
-      const answer=feedbackDecision(await classify({feedback:{...original,contact:''},candidates}),candidates.map(r=>r.id));
+      stage='model';
+      const classified=await classify({feedback:{...original,contact:''},candidates});
+      stage='validate';
+      const answer=feedbackDecision(classified,candidates.map(r=>r.id));
       const id=answer.disposition==='new'?`feedback-${String(feedback.id.id)}`:answer.requirementId;
       const content=answer.disposition==='new'?requirementContent({project:feedback.project,title:answer.title,problem:answer.problem,acceptance:answer.acceptance??'',priority:answer.priority??2}):undefined;
+      stage='persist';
       await db.query(`BEGIN TRANSACTION;
-        LET $changed=UPDATE $feedback SET state=$state, category=$category, reason=$reason, requirement=$requirement, updated_at=time::now()
+        LET $changed=UPDATE $feedback SET state=$state, category=$category, reason=$reason, requirement=$requirement, last_error=NONE, diagnostic=NONE, updated_at=time::now()
           WHERE state='processing' AND worker=$claimToken RETURN AFTER;
         IF array::len($changed)!=1 { THROW 'feedback_claim_lost'; };
         IF $create = true AND !record::exists($req) {
@@ -57,10 +63,11 @@ export async function triageFeedback(db:Surreal,classify:ClassifyFeedback,now=Da
         COMMIT TRANSACTION;`,{feedback:feedback.id,claimToken,state:answer.disposition==='dismiss'?'dismissed':'linked',category:answer.category,reason:answer.reason,
           requirement:id,req:new RecordId('product_requirement',id??'unused'),create:answer.disposition==='new',content});
       if(answer.disposition==='dismiss')result.dismissed++;else result.linked++;
-    }catch{
+    }catch(error){
       // 不把原始反馈或上游响应写进日志；错误可重试最多三次，老板可以手动恢复。
-      await db.query(`UPDATE $id SET state=IF attempts >= 3 THEN 'failed' ELSE 'new' END, last_error='反馈整理未完成，请重试或人工整理', updated_at=time::now()
-        WHERE state='processing' AND worker=$claimToken;`,{id:feedback.id,claimToken});
+      const diagnostic={stage,elapsedMs:Date.now()-started,code:error instanceof CompanyError?error.code:error instanceof SyntaxError?'invalid_json':'unexpected_error',reason:error instanceof CompanyError?error.message:undefined};
+      await db.query(`UPDATE $id SET state=IF attempts >= 3 THEN 'failed' ELSE 'new' END, last_error='反馈整理未完成，请重试或人工整理', diagnostic=$diagnostic, updated_at=time::now()
+        WHERE state='processing' AND worker=$claimToken;`,{id:feedback.id,claimToken,diagnostic});
       result.failed++;
     }
   }
