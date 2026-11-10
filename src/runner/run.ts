@@ -3,7 +3,7 @@ import { readFileSync, accessSync, constants, realpathSync } from 'node:fs';
 import { installNodeHost } from '../host-node.ts';
 import { configureCompanyRuntime, company, noteHost } from './company.ts';
 import { startDispatch } from './dispatch.ts';
-import { loadServiceEnv, serviceHome } from './env.ts';
+import { loadNativeOwnerCredential, loadServiceEnv, serviceHome } from './env.ts';
 import { NativeRuntime, type NativeProvider } from './native.ts';
 import { RuntimeEventsBus } from './events.ts';
 import type { RuntimeHost } from './host.ts';
@@ -39,6 +39,7 @@ if (process.platform === 'darwin') {
   throw new Error('远程原生执行要求显式配置 isolation=external，并由容器或沙箱启动命令提供员工隔离');
 }
 if (!Object.keys(config.commands ?? {}).length) throw new Error('至少配置一个原生执行命令');
+loadNativeOwnerCredential();
 const zdotdir = join(serviceHome(), 'zdot');
 installZdot(zdotdir, userZshDir(zdotdir), externalPatterns());
 let bus: RuntimeEventsBus;
@@ -99,16 +100,20 @@ bus = new RuntimeEventsBus(host);
 configureCompanyRuntime({ gateway: runtime, native: true, release, requireProviderRoute: installed, dispatchAllowed: () => !draining, providers: Object.keys(config.commands), runner: { id: `native:${hostId}`, adoptLegacy: false } });
 noteHost(host);
 let stop: import('./dispatch.ts').RunnerControl | undefined;
+let ctx: Awaited<ReturnType<typeof company>> | undefined;
 try {
-  const ctx = await company();
+  ctx = await company();
+  const principal = await ctx.core.authenticate(process.env.SCK_OWNER_TOKEN!);
+  if (principal.role !== 'owner') throw new Error('原生执行端老板凭证身份不匹配，拒绝启动');
   stop = startDispatch(bus);
   await runtime.recoverFinishedTurns();
   console.log(`原生执行端 ${hostId} 已启动；支持 ${Object.keys(config.commands).join(', ')}`);
   process.once('SIGTERM', endService); process.once('SIGINT', endService);
   await serviceEnded;
-  stop();
-  await stop.done;
+} finally {
+  stop?.();
+  await stop?.done;
   await runtime.close();
-  ctx.sidecar.close();
-  await ctx.db.close();
-} finally { stop?.(); await runtime.close(); }
+  ctx?.sidecar.close();
+  await ctx?.db.close();
+}
