@@ -1184,9 +1184,14 @@ export class Dispatcher {
 
     // 2. Lease supervision: a deadline requests a stop; only a confirmed end permits reassignment.
     const keepLease = async (task: SupervisedTask, inst?: EmployeeInst) => {
-      const extended = await (inst && this.deps.sidecar?.maintainLease
-        ? this.deps.sidecar.maintainLease(inst, task.id)
-        : wf.extendLease(task.id, task.currentEmployee!, LEASE_SECONDS)).catch(() => false);
+      // Employee heartbeats cannot renew an already expired lease. The trusted runner may retain
+      // exactly the observed generation, without bumping its fence or reclaiming the task.
+      const proof = task.row.delivery_id && Number.isInteger(task.row.fence)
+        ? { deliveryId: task.row.delivery_id, fence: task.row.fence } : undefined;
+      const extended = await (proof
+        ? wf.extendLease(task.id, task.currentEmployee!, LEASE_SECONDS, proof)
+        : inst && this.deps.sidecar?.maintainLease ? this.deps.sidecar.maintainLease(inst, task.id)
+        : Promise.resolve(false)).catch(() => false);
       if (extended) report.extended.push(task.id);
     };
     const keepUncertain = async (task: SupervisedTask, inst?: EmployeeInst) => {
