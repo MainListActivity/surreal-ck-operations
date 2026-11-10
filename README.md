@@ -26,6 +26,6 @@ pnpm run company status                       # 公司运行概况
 - [节点运维手册](docs/company-service-operations.md)、[节点升级与回退](docs/company-upgrades.md)、[核心契约](docs/core-contract.md)、[老板接口](docs/owner-api.md)。
 - [业务流程](docs/playbooks.md)、[经营节奏](docs/management.md)。
 
-任务、身份、租约与审计存于自托管 SurrealDB 的 `sck_agent_company/control_plane`（与产品同一实例、独立 namespace，地址与凭证读自产品 `.env`）。0.7.0 起节点只运行 Paseo 插件 `sck-company` 与节点更新器，不再有 MCP 服务与 GitHub 投影看板。员工按 `employee_def.weight` 加权派工。0.5.0 起不再有员工绩效评分，任务完成后按 `task_cost` 结算成本。v2 的 `scripts/queue.py` 与 `agents/registry.json` 仅用于收尾旧工单。
+任务、身份、租约与审计存于云端公司库（SurrealDB，生产默认 `company/main`），节点只通过云端配置（`COMPANY_DB_URL`、`IDP_ISSUER` 等）连接它。0.7.0 起节点只运行 Paseo 插件 `sck-company` 与节点更新器，不再有 MCP 服务与 GitHub 投影看板。0.7.1 起没有本机公司库与备份。员工按 `employee_def.weight` 加权派工。0.5.0 起不再有员工绩效评分，任务完成后按 `task_cost` 结算成本。v2 的 `scripts/queue.py` 与 `agents/registry.json` 仅用于收尾旧工单。
 
 技术规格与代码在 [产品仓库](https://github.com/MainListActivity/surreal_ck)。客户原件、凭证和合同正文留在授权存储，运营仓库只保留必要证据。

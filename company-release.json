@@ -1,18 +1,19 @@
 {
-  "version": "0.7.0",
-  "title": "删除公司 MCP 服务与 GitHub 镜像，sck 只走插件通道",
+  "version": "0.7.1",
+  "title": "删除本机公司库与备份，删除 outbox 表（schema 062）",
   "changes": [
-    "删除公司 MCP 服务（launchd 任务、/mcp 端点、端口 38473）、远程部署脚本、company-service.sh 与 releases 快照；节点不再有 MCP 服务与手工安装步骤。",
-    "删除 GitHub 镜像：核心不再写 outbox 事件，投影进程与 SCK_GITHUB_REPOSITORY、SCK_PROJECTOR_CREDENTIAL_FILE、SCK_PROJECTION_STATE_FILE 配置一并删除；outbox 表保留，下个版本再删。",
-    "sck 只走 comm 通道（SCK_COMM_DIR 指向的插件 sidecar），删除凭证文件模式（SCK_EMPLOYEE_CREDENTIAL_FILE、SCK_MCP_URL）与 admin enroll 的 token 文件。",
-    "节点更新器切换成功或回退后维护 <serviceHome>/current 指向现役插件目录，并把 sck.sh、bun-runtime.sh 安装到 <serviceHome>/bin/。",
-    "调度器删除非 sidecar 回退：没有 sidecar 的员工不派工；提示词只保留 comm 形态的工具说明。"
+    "删除本机公司库与备份的脚本和测试：company-db.sh、company-db-runtime.sh、company-backup.ts 等；仓库不再提供 company-db、company-backup、company-verify 三个 launchd 任务的安装。",
+    "生产路径只连云端：插件的公司栈、节点更新器与老板 CLI（company、admin、bootstrap）缺 COMPANY_DB_URL 时拒绝启动并说明原因，不再回落到 SURREAL_URL 或本机 root 账号。sck 经插件访问，同样不回落。",
+    "private/company-db.env 只读云端字段（COMPANY_DB_URL、IDP_ISSUER、RUNNER_CLIENT_ID 等）。测试的根连接只认环境变量。",
+    "新增 schema 062：删除 outbox 事件表、序号索引与 company_meta:outbox_counter；全新库不再创建 outbox。",
+    "版本号升到 0.7.1；company-release.json 与 RELEASE_SCHEMA_REQUIREMENTS 同步登记 062。"
   ],
   "impact": [
-    "节点上若曾安装 org.surrealck.company-mcp，需先手工停用并删除其 plist（见节点运维手册「停用与卸载」）；0.7.0 不会自动停用它。",
-    "员工通道只剩 comm 文件协议；仍设置 SCK_EMPLOYEE_CREDENTIAL_FILE 或 SCK_MCP_URL 的环境不再生效。",
-    "GitHub 上已有的 [Company] issue 与评论不会删除，但之后不再更新。"
+    "062 删除表与计数器后，0.6.x 核心的任务写入会失败，或写入无序号的 outbox 行（取决于服务端）。合入 main 前必须确认所有执行端已是 0.7.0 或更新。",
+    "没有 COMPANY_DB_URL 的执行端拒绝启动；环境里残留的 SURREAL_URL 不再生效。",
+    "本机已安装的 company-db、company-backup、company-verify 三个 launchd 任务不会被发布停用，需要人工 bootout 并删除 plist（入口脚本已删除，它们会失败）。",
+    "本版本不删除本机数据目录（private/db）与 R2 备份，由老板另行决定。"
   ],
-  "migration": "无 schema 变化，沿用 schema 061。outbox 表保留但 0.7.0 不再写入，下个版本再删。",
-  "rollback": "把 <serviceHome>/current 指回上一版 plugin-releases/<sha>/plugin 即可；schema 仍为 061，无需恢复任何表。回退后 0.6.1 核心会重新写入 outbox 事件，GitHub 投影已随 MCP 服务删除，不会恢复。"
+  "migration": "合入 main 后 release 作业自动执行 company-migrate，应用 062：删除 outbox 表、索引与计数器，只删不改既有行。合入前在 node_release 核对每台执行端的 version 都已是 0.7.0 或更新。",
+  "rollback": "回退到 0.7.0 不需要恢复任何表：0.7.0 不读写 outbox，结构版本 62 满足它的 61 要求。回退到 0.6.x 不能只回退插件：0.6.x 会写 outbox，需先由运维从云端备份恢复 outbox 表与 company_meta:outbox_counter，本版本不提供该步骤。"
 }

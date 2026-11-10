@@ -49,7 +49,7 @@ try {
     'tests/artifact-reclaim.test.ts', 'tests/artifact-sweeper.test.ts', 'tests/artifact-reclaim.fork.test.ts',
     'tests/magpie-quota.test.ts', 'tests/agent-model.test.ts', 'tests/quota-store.fork.test.ts',
     'tests/paseo-dead-paths.test.ts',
-    'tests/db.integration.test.ts', 'tests/dispatcher-sidecar.fork.test.ts', 'tests/dispatch-episode.fork.test.ts', 'tests/dispatch-board.fork.test.ts', 'tests/memory-lru.fork.test.ts', 'tests/idle-sessions.fork.test.ts', 'tests/ops-denial-circuit.fork.test.ts', 'tests/ops-denial-circuit.test.ts', 'tests/company-db-runtime.test.ts', 'tests/host-resources.test.ts', 'tests/scratch-gc.test.ts', 'tests/test-runner-cleanup.test.ts',
+    'tests/db.integration.test.ts', 'tests/dispatcher-sidecar.fork.test.ts', 'tests/dispatch-episode.fork.test.ts', 'tests/dispatch-board.fork.test.ts', 'tests/memory-lru.fork.test.ts', 'tests/idle-sessions.fork.test.ts', 'tests/ops-denial-circuit.fork.test.ts', 'tests/ops-denial-circuit.test.ts', 'tests/host-resources.test.ts', 'tests/scratch-gc.test.ts', 'tests/test-runner-cleanup.test.ts',
     'tests/quota-turn.test.ts', 'tests/turn-closeout.test.ts',
     'tests/session-history.test.ts', 'tests/factory-queue.test.ts', 'tests/dispatcher-sidecar.test.ts', 'tests/sidecar.test.ts', 'tests/sidecar-quota-gate.fork.test.ts',
     'tests/sidecar-late-lease.test.ts', 'tests/worktrees.test.ts',
@@ -82,7 +82,7 @@ try {
     ...process.env, SCK_PRODUCT_ENV: '/dev/null', SURREAL_URL: `ws://127.0.0.1:${port}/rpc`, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: rootPassword,
     // 隔离运行一律连本次自建的 fork：清掉调用方带来的云端地址（例如云端模式下调用的安装脚本）。
     COMPANY_DB_URL: '',
-    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_NODE_RELEASE_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_TASK_ROUTES_TESTS: '1', RUN_SCK_DB_CONNECTION_TESTS: '1', RUN_SCK_COMPANY_ACCESS_TESTS: '1', RUN_SCK_OWNER_END_TESTS: '1',
+    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_NODE_RELEASE_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_TASK_ROUTES_TESTS: '1', RUN_SCK_DB_CONNECTION_TESTS: '1', RUN_SCK_COMPANY_ACCESS_TESTS: '1', RUN_SCK_OWNER_END_TESTS: '1', RUN_SCK_CLOUD_RUNNER_TESTS: '1',
   } });
   groups.push(test.pid); save();
   exit = await test.exited;

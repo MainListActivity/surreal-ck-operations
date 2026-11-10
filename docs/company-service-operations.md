@@ -18,8 +18,8 @@
 | `bin/sck` | `scripts/sck.sh` 的副本，权限 700 | 节点更新器（切换成功后） |
 | `bin/bun-runtime.sh` | `scripts/bun-runtime.sh` 的副本，权限 700 | 节点更新器 |
 | `updater/` | `node-updater.js`（600）、`run.sh`（700）、运行锁 `lock`、回退冷却记录 `rolled-back.json` | 节点更新器安装与运行 |
-| `private/` | `owner-token`（0600，插件启动时生成）、`node-id`、`cloud/`（云端凭证文件）、`company-db.env`（本机库，若使用）、`service.env`（可选，路径与端口配置） | 插件与运维人员 |
-| `logs/` | `node-updater.log`、插件与本机数据库的日志 | 各组件 |
+| `private/` | `owner-token`（0600，插件启动时生成）、`node-id`、`cloud/`（云端凭证文件）、`company-db.env`（只放云端字段，见「节点组成与首次安装」）、`service.env`（可选，路径与端口配置） | 插件与运维人员 |
+| `logs/` | `node-updater.log`、插件的日志 | 各组件 |
 | `runtime-bun/` | 可选，服务固定的 Bun 运行时 | 运维人员 |
 
 `sck` 与 `bun-runtime.sh` 解析 Bun 的顺序为：环境变量 `SCK_BUN`，`private/service.env` 中的 `SCK_BUN=` 行，`runtime-bun/bin/bun`，最后是 `~/.bun/bin/bun`。不查找 PATH（见 `scripts/bun-runtime.sh`）。显式指定的 `SCK_BUN` 即使不存在也不会被替换。
@@ -36,7 +36,7 @@
 首次安装顺序：
 
 1. 准备工具：Node.js 22 或以上、`tar`、`pnpm`、已登录的 `gh`，以及 Paseo CLI。
-2. 准备云端凭证文件（只放路径，不复制内容）：`private/cloud/runner-client-secret`（权限 0600）；`COMPANY_DB_URL`、`IDP_ISSUER`、`RUNNER_CLIENT_ID` 可作为环境变量设置，也可写入 `private/company-db.env`。缺少 `COMPANY_DB_URL` 时节点更新器拒绝运行。
+2. 准备云端凭证文件（只放路径，不复制内容）：`private/cloud/runner-client-secret`（权限 0600）；`COMPANY_DB_URL`、`IDP_ISSUER`、`RUNNER_CLIENT_ID` 可作为环境变量设置，也可写入 `private/company-db.env`（只读这些云端字段，文件里的 `SURREAL_*` 不生效）。缺少 `COMPANY_DB_URL` 时节点更新器拒绝运行，插件的公司栈也拒绝启动，两者都不回落到本机库。
 3. 在干净的 main 检出目录执行 `sh scripts/node-updater.sh install`。它下载最新正式 Release 的 `manifest.json` 与 `node-updater.js`，校验后注册定时任务，并立即运行一轮。这一轮会注册并启动插件。
 4. 按 [company-upgrades.md](./company-upgrades.md#首次安装节点更新器) 的验证步骤确认插件状态与 `current` 指向。
 5. 员工沙箱（`sh scripts/sandbox/install.sh`）按下文「员工沙箱」一节手工安装，节点更新器不负责它。
@@ -93,14 +93,8 @@
 
 - **云端公司库**：节点通过 runner 身份连接，凭证为 `private/cloud/runner-client-secret`。节点不执行 schema 迁移。
 - **迁移**：只由 CI 的 release 作业执行一次，即 `bun scripts/company-migrate.ts`，使用 migrator 凭证。节点与运维人员不需要运行它。迁移只在 `v<版本>` 尚未发布时执行，见 company-upgrades.md。
-- **本机 company-db（可选）**：在仓库检出目录执行 `sh scripts/company-db.sh install`，即可在本机启动公司 fork 的 SurrealDB（只监听 127.0.0.1，端口缺省 38480，可用 `SCK_COMPANY_DB_PORT` 覆盖），并安排每小时一次的 R2 备份与每周一次的恢复演练。它只用于本机测试或回放，不是节点运行的必要部分。待确认：0.7.0 后节点是否仍需要本机库，由老板决定。
-  - 安装写入三个 launchd 任务：`org.surrealck.company-db`、`org.surrealck.company-backup`、`org.surrealck.company-verify`。
-  - 工作目录与备份入口来自执行安装的检出目录：launchd 的 `WorkingDirectory` 为该仓库根目录，备份与 verify 使用该目录下的 `scripts/company-backup.ts`（见 `scripts/company-db.sh` 第 8 行）。不再使用 `$service/active`。
-  - 移动或删除该检出目录后，需要在新位置重新执行 `sh scripts/company-db.sh install`，否则备份与恢复演练的入口会找不到。
-  - 凭证写入 `private/company-db.env`（权限 600，随机生成）。运行入口 `bin/company-db` 通过环境变量读取凭证，不放在命令行参数里。
-  - 数据目录为 `private/db`。
-  - 内存预算（`scripts/company-db-runtime.sh`）：跟踪内存阈值 2 GiB（`SURREAL_MEMORY_THRESHOLD`），RocksDB block cache 512 MiB，write buffer 32 MiB，最多 4 个 write buffer。这些是准入控制，不是操作系统对进程 RSS 的硬上限。
-  - 本地测试只用公司 fork（`~/.surrealdb/surreal`），不使用上游 SurrealDB。
+- **本机公司库已删除（0.7.1）**：仓库不再提供 `scripts/company-db.sh`、`scripts/company-db-runtime.sh` 与 `scripts/company-backup.ts`，不再有本机公司库、每小时 R2 备份与每周恢复演练。节点与运维人员都只连接云端公司库。0.7.0 及更早版本若在本机装过三个 launchd 任务，需按「停用与卸载」人工停用。`private/db` 数据目录与 R2 备份不会被删除，是否归档由老板决定。
+- 本地测试只用公司 fork（`~/.surrealdb/surreal`），不使用上游 SurrealDB。
 
 ## 交付预览
 
@@ -220,7 +214,7 @@ pnpm run admin reclaim-artifacts <任务ID> --execute   # 只回收指定任务
 |---|---|---|
 | 停用节点更新器 | `sh scripts/node-updater.sh uninstall` | 移除定时任务，保留 `plugin-releases`、`updater` 与日志。之后节点不会自动升级。 |
 | 停用插件 | `paseo plugin remove sck-company` | 移除插件注册，插件进程随之停止。节点上不再有派工与员工通道。 |
-| 停用本机库（若安装过） | `launchctl bootout gui/$(id -u)/org.surrealck.company-db` 等三个任务 | 待确认：`company-db.sh` 没有卸载子命令。停用后数据目录 `private/db` 保留。 |
+| 停用本机库（0.7.0 及更早安装过） | `launchctl bootout gui/$(id -u)/org.surrealck.company-db`、`launchctl bootout gui/$(id -u)/org.surrealck.company-backup`、`launchctl bootout gui/$(id -u)/org.surrealck.company-verify`，再删除 `~/Library/LaunchAgents/` 下的 `org.surrealck.company-db.plist`、`org.surrealck.company-backup.plist`、`org.surrealck.company-verify.plist` | 0.7.1 起仓库没有安装或卸载脚本，只能手工停用。不停用的话，`company-db` 仍在本机运行却无人使用，备份与恢复演练会因入口脚本已删除而失败。`private/db` 数据目录与 R2 备份保留，是否归档由老板决定。 |
 | 停用旧公司 MCP 服务（0.6.x 节点若曾安装） | `launchctl bootout gui/$(id -u)/org.surrealck.company-mcp`，再删除 `~/Library/LaunchAgents/org.surrealck.company-mcp.plist` | 0.7.0 不会自动停用它。它若仍在运行，会继续从旧的 `active` 目录提供旧代码。 |
 | 清理旧版遗留（0.6.x 节点） | 确认旧 MCP 已停用后：`rm "<服务目录>/active"`（只删链接），再 `rm -r "<服务目录>/releases"` | 节点更新器不删除它们，0.7.0 的 `sck` 与插件也不读取它们。`releases/` 只是旧 MCP 的源码快照，`private/` 中的凭证与配置不受影响。 |
 | 停用员工沙箱 | 手工还原 `~/.paseo/config.json` 中 provider 命令（备份文件 `config.json.bak-sandbox-*`） | 之后公司会话不再进入沙箱。 |
@@ -402,11 +396,7 @@ GC 只删目录本身，不碰 `evidence/`、`deliverables/` 与任何已跟踪�
 
 删除工作树前，GC 先清掉未跟踪的依赖/构建目录（`junkPathsFromPorcelain`），再执行**不带 `--force`** 的 `git worktree remove`；已跟踪文件的任何修改仍会让删除被拒并记 `git-remove-failed`。登记行指向的目录已消失、任务已终态（引用全部 released）且该分支没有未终态任务时，扫描直接摘除这一行（审计 `drop_stale_row`），只对 `exclusive` 生效，`shared`/`protected` 行留给人工判断。审计事件名是 `worktree_audit.event` 的 ASSERT 白名单：新增事件必须同时在 `schema/021-worktree-audit-events.surql` 放行，否则审计写入被拒、仓库级 catch 会中断整轮扫描（2026-10-21 事故）；`tests/audit-event-whitelist.test.ts` 在 `test:channel` 里校验两边一致。
 
-#### 本机数据库内存预算与资源阻塞分类（v0.3.57）
-
-公司 fork 的默认 RocksDB 预算会随宿主机物理内存放大：16GB Mac 的 block cache 默认约 7GiB，write buffer 默认 128MiB×8。公司本机数据库通过 `scripts/company-db-runtime.sh` 设置本机预算：block cache 512MiB，write buffer 32MiB×4，受跟踪内存阈值 2GiB；值均使用整数 bytes，避免尺寸后缀解析差异。该阈值由 fork 的分配跟踪与查询取消检查实现，不是 macOS 对整个进程 RSS 的硬上限，缓存、映射、线程及其它分配仍可能造成差异。不能使用 launchd RSS 限制冒称硬隔离。只读日志记录这四项非敏感预算，不记录认证信息。
-
-升级代码不会擅自重启数据库。需要应用新预算时，在仓库检出目录执行 `sh scripts/company-db.sh install`（见「数据库与云端迁移」）。凭证与持久数据目录保持原路径。安装会把运行脚本复制到服务 bin 目录，数据库启动不依赖 `current` 或发布目录；后续安装沿用该运行脚本，避免手改启动脚本后重装丢失预算。需要覆盖时在 launchd 环境中设置相同 `SURREAL_*` 整数字段；默认配置适用于当前 16GB 共享宿主机。
+#### 资源阻塞分类（v0.3.57）
 
 派工任务结论区分 memory_pressure 和 disk_space，两者同时低时分别显示，不复用磁盘清理说明。内存判断仍优先 macOS 内核压力等级，正常压力时不以少量空闲页误拦截。磁盘产物回收只由磁盘回收水位触发，内存不足不触发无关清盘；回收禁用通知仅在磁盘确实阻断派工时出现。旧 resources 代码保留兼容，恢复提示改为检查内存和磁盘，实时结论会在下一 tick 更新。
 
@@ -464,7 +454,7 @@ GC 只删目录本身，不碰 `evidence/`、`deliverables/` 与任何已跟踪�
 
 ## 已删除的旧做法
 
-以下内容属于 0.7.0 之前的节点布局。它们已删除，不要按这些内容操作。
+以下内容属于 0.7.0 之前的节点布局，或 0.7.1 已删除的本机公司库。它们已删除，不要按这些内容操作。
 
 - MCP 任务服务：launchd 任务 `org.surrealck.company-mcp`、端口 38473、`/mcp` 端点、`/ready` 检查、`SCK_MCP_PORT`、`SCK_MCP_URL`，以及 `scripts/company-service.sh`、`scripts/run-service.sh`。
 - 远程 VPS 部署 MCP：`scripts/deploy-mcp-remote.sh`、`sync-gate` 命令、`private/mcp-remote.env`，以及远端 bun 版本核对与 SYS02 上传前守卫。远程部署整节已删除，发布只走节点更新器与 CI 发行包。
@@ -475,3 +465,4 @@ GC 只删目录本身，不碰 `evidence/`、`deliverables/` 与任何已跟踪�
 - 员工凭证文件模式：`SCK_EMPLOYEE_CREDENTIAL_FILE` 与 `private/credentials/*.token`。员工通道只使用 comm 文件协议。
 - 独立调度器 launchd 任务 `org.surrealck.company-dispatcher`：调度器已经并入插件。
 - `npm` 或 `pnpm` 脚本 `mcp:client`、`mcp:serve`、`test:mcp:live` 与 `dispatcher`。
+- 本机公司库（0.7.1 删除）：`scripts/company-db.sh`、`scripts/company-db-runtime.sh`、`scripts/company-backup.ts`，launchd 任务 `org.surrealck.company-db`、`org.surrealck.company-backup`、`org.surrealck.company-verify`，以及 `private/company-db.env` 里的本机库字段。节点的公司库只在云端。

@@ -23,7 +23,7 @@
 
 核心的每次状态转移都在同一事务内写入审计（`audit` 表，`CREATE audit` 与状态变更同事务提交）。审计不包含凭证值。
 
-0.7.0 起核心不再写 `outbox` 事件，也没有 `listOutbox()` 接口。`outbox` 事件表与 `company_meta:outbox_counter` 计数器保留在库中（schema 仍为 061），下个版本再删除。下游如需同步任务变化，只能通过审计表或直接查询任务状态。
+0.7.0 起核心不再写 `outbox` 事件，也没有 `listOutbox()` 接口。0.7.1 的 schema 062 删除了 `outbox` 事件表、`outbox_sequence` 索引与 `company_meta:outbox_counter` 计数器。下游如需同步任务变化，只能通过审计表或直接查询任务状态。
 
 ## 错误
 

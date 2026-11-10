@@ -133,7 +133,7 @@ SELECT id, version, sha, seen_at, checked_at, last_status, last_target, last_err
 2. 工具：Node.js 22 或以上（可用 `SCK_NODE_BIN` 指定绝对路径）、`tar`、`pnpm`（可用 `SCK_PNPM_BIN` 指定）、已登录的 `gh`（账号能读取发行仓库的 Release）。
 3. Paseo CLI：macOS 上若存在 `/Applications/Paseo.app/Contents/Resources/bin/paseo` 则使用它，否则从 PATH 查找 `paseo`，也可用 `SCK_PASEO_BIN` 指定。找不到时安装仍会继续，但更新器无法工作。
 4. 云端连接配置，只写入服务目录：
-   - `COMPANY_DB_URL`、`IDP_ISSUER`、`RUNNER_CLIENT_ID`：可作为环境变量设置，也可写入 `<服务目录>/private/company-db.env`（权限 0600）。缺少 `COMPANY_DB_URL` 时更新器拒绝运行，不会回落到本机库。
+   - `COMPANY_DB_URL`、`IDP_ISSUER`、`RUNNER_CLIENT_ID`：可作为环境变量设置，也可写入 `<服务目录>/private/company-db.env`（权限 0600，只读这些云端字段，文件里的 `SURREAL_*` 不生效）。缺少 `COMPANY_DB_URL` 时更新器拒绝运行，不会回落到本机库。
    - 执行端 client secret 放在 `<服务目录>/private/cloud/runner-client-secret`（权限 0600）。只需确认路径存在，不要把内容复制到文档、日志或工单。
 5. 插件运行所需的其他本机配置（如 `private/service.env`、员工沙箱 `sh scripts/sandbox/install.sh`）仍按原流程准备，更新器不负责这些。
 
@@ -195,25 +195,45 @@ loginctl enable-linger "$USER"
 4. 把 `current` 指向上一版插件目录（`ln -sfn "<上一版 plugin 目录>" "<服务目录>/current"`，与 `pointCurrent` 的结果一致），并用上一版发行包的 `scripts/sck.sh` 与 `scripts/bun-runtime.sh` 覆盖 `bin/sck` 与 `bin/bun-runtime.sh`（权限 700）。员工命令 `bin/sck` 依赖 `current`，两者需要同时恢复。
 5. 修复并发布新版本之前，不要运行节点更新器的 `install` 或 `run`，否则它会立即升级到最新 Release。
 
-0.7.0 没有 schema 变化（仍为 061），回退时无需删除表或字段，细节见下节。
+0.7.0 没有 schema 变化（仍为 061），回退时无需删除表或字段，细节见下节。0.7.1 起的回退见「0.7.1 迁移与回退」。
 
 ## 0.7.0 迁移与回退
 
 ### 变化
 
 - 删除 MCP 服务：节点上不再有 `org.surrealck.company-mcp` launchd 任务、`/mcp` 端点（端口 38473）、`releases/` 快照目录、`active` 符号链接、`scripts/company-service.sh`、`scripts/run-service.sh` 与 `scripts/deploy-mcp-remote.sh`。
-- 删除 GitHub 看板投影（`SCK_GITHUB_REPOSITORY` 等）：核心不再写 `outbox` 事件。`outbox` 表与 `company_meta:outbox_counter` 保留在库中，0.7.0 不删除：0.6.1 核心仍在事务里写入它们，过早删表会让仍在 0.6.1 的节点写入失败，下个版本再删。`CLOUD_SCHEMA_VERSION` 仍为 61。`get_admin_summary` 不再返回 `outboxSequence`。
+- 删除 GitHub 看板投影（`SCK_GITHUB_REPOSITORY` 等）：核心不再写 `outbox` 事件。`outbox` 表与 `company_meta:outbox_counter` 在 0.7.0 保留在库中：0.6.1 核心仍在事务里写入它们，过早删表会让仍在 0.6.1 的节点写入失败。删除由 0.7.1 的 schema 062 完成（见下节）。`CLOUD_SCHEMA_VERSION` 在 0.7.0 仍为 61。`get_admin_summary` 不再返回 `outboxSequence`。
 - 新增 `current` 符号链接与 `bin/`：员工命令 `bin/sck` 从 `current/server/vendor/src/sck-cli.ts` 运行。
 
 ### 迁移
 
 迁移由 CI 的 release 作业执行一次（`scripts/company-migrate.ts`），节点不执行迁移。0.7.0 的 `requiredSchema` 为 061，云端库已在 061 时迁移只重放已有 schema（幂等），库结构不变。节点更新器在切换前核验云端 schema 是否满足清单的 `requiredSchema`，不满足则拒绝切换，节点停留在旧版本。
 
-下个版本删除 `outbox` 表前，需要先确认节点都已升到不再写入 outbox 的版本（0.7.0 或更新），并在该版本的迁移说明中写明删表。
+删除 `outbox` 表的前提是节点都已升到不再写入 outbox 的版本（0.7.0 或更新）。该前提与删表步骤写在 0.7.1 的迁移说明中（见下节）。
 
 ### 回退
 
 0.7.0 回退到 0.6.1 时，插件回退到上一版目录即可，不涉及 MCP 回退，也没有 `releases/` 回退。两个版本的 schema 都是 061，`outbox` 表保留，回退不需要恢复任何表。回退后 0.6.1 核心会重新写入 `outbox` 事件，但 GitHub 投影已随 MCP 服务删除，不会恢复。
+
+## 0.7.1 迁移与回退
+
+### 变化
+
+- 删除本机公司库：仓库不再提供 `scripts/company-db.sh`、`scripts/company-db-runtime.sh` 与 `scripts/company-backup.ts`，也不再安装 `company-db`、`company-backup`、`company-verify` 三个 launchd 任务。每小时 R2 备份与每周恢复演练一并停止。
+- 生产只连云端：插件的公司栈、节点更新器与老板 CLI（`company`、`admin`、`bootstrap`）缺 `COMPANY_DB_URL` 时拒绝启动并说明原因，不回落到 `SURREAL_URL` 或本机 root 账号。`private/company-db.env` 只读云端字段。
+- 删除 `outbox`：schema 062 删除 `outbox` 事件表、`outbox_sequence` 索引与 `company_meta:outbox_counter` 计数器，只删除，不改写其它表的既有行。全新库按 001 至 062 应用后不再有它们。`CLOUD_SCHEMA_VERSION` 与 0.7.1 的 `requiredSchema` 为 062。
+
+### 迁移
+
+- 迁移由 CI 的 release 作业执行一次（`scripts/company-migrate.ts`），节点不执行迁移。`main` 合入后，release 作业先把云端库迁到 062，再发布 0.7.1 Release。节点更新器切换前核验云端 schema 不低于 062。
+- 合入 `main` 前必须确认：所有执行端的插件都已是 0.7.0 或更新。0.6.x 核心仍在任务事务里写 `outbox`，并用计数器分配序号。云端删除表与计数器后，它的写入会失败，或写入无序号的行（取决于服务端）。在云端 `node_release` 表逐台核对 `version`（版本号是字符串，需按段比较，不能按字典序比较）。
+- 合入 `main` 会立即在生产云端执行 062。删除的 `outbox` 数据不会自动恢复。
+
+### 回退
+
+- 0.7.1 回退到 0.7.0：插件回退到上一版目录即可，见上文「手动回退到上一版」。0.7.0 只需要结构版本 61，062 满足它；0.7.0 不读写 `outbox`，回退不需要恢复任何表。
+- 0.7.1 不能只回退插件到 0.6.x。0.6.x 会写 `outbox` 与 `company_meta:outbox_counter`，回到 0.6.x 前，运维需先从云端备份恢复这两样，本版本不提供该步骤。
+- 节点更新器的自动回退回到切换前的版本。在前提满足（节点已是 0.7.0）时，那就是 0.7.0。
 
 ## 已知限制
 
