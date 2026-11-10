@@ -9,5 +9,5 @@
       "scripts/vendor.sh"
     ]
   ],
-  "description": "SCK \u516c\u53f8\uff1a\u8001\u677f\u5de5\u4f5c\u53f0\uff08\u76ee\u6807/\u6536\u4ef6\u7bb1/\u9a8c\u6536\uff09\u4e0e\u6d3e\u5de5\u8c03\u5ea6\u5668"
+  "description": "SCK 公司执行适配器：接入 Paseo 生命周期，页面统一使用云端老板端"
 }

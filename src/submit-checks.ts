@@ -68,7 +68,7 @@ export async function versionProblems(root: string, run: Runner = runProcess): P
 /** Tool wiring: every MCP tool reaches the sidecar, and every test file a package script names exists. */
 export function wiringProblems(root: string): string[] {
   const problems: string[] = [];
-  const server = read(root, 'src/mcp/server.ts'), sidecar = read(root, 'plugin/server/sidecar.ts');
+  const server = read(root, 'src/mcp/server.ts'), sidecar = read(root, 'src/runner/sidecar.ts') ?? read(root, 'plugin/server/sidecar.ts');
   if (server && sidecar) {
     const tools = [...server.matchAll(/registerTool\('([a-z_]+)'/g)].map(m => m[1]!);
     const cases = new Set([...sidecar.matchAll(/case "([a-z_]+)":/g)].map(m => m[1]!));

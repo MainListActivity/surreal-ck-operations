@@ -239,7 +239,7 @@ describe('agent.session_open hook with the zsh startup shim', () => {
     const out = await hook({}, { zdotdir }).open({ ...base, reason: 'create', env: launch });
     expect(out?.env.ZDOTDIR).toBe(zdotdir);
     expect(readFileSync(join(zdotdir, '.zshrc'), 'utf8')).toContain(`'/Users/x/.zshrc'`);
-    expect(readFileSync(join(zdotdir, '.zshrc'), 'utf8')).toContain('(CLOUDFLARE_|CF_API_|SURREAL|JEV_|TYPESAFE_|ELEVENLABS_|XI_API_KEY)*');
+    expect(readFileSync(join(zdotdir, '.zshrc'), 'utf8')).toContain('(CLOUDFLARE_|CF_API_|SURREAL|JEV_|TYPESAFE_|ELEVENLABS_|XI_API_KEY|COMPANY_|RUNNER_|IDP_|GATEWAY_)*');
   });
 
   test('the shim sources the user\'s ZDOTDIR when they have one, and never itself', async () => {
@@ -310,4 +310,12 @@ test('archived history never requires a live model route, while an interactive r
  const result=await open({request},{paseo:{},signal:new AbortController().signal});expect(result.env.SURREAL_ROOT_PASS).toBe('');expect(calls).toBe(0);
  await expect(open({request:{...request,purpose:'interactive'}},{paseo:{},signal:new AbortController().signal})).rejects.toThrow('route unavailable');expect(calls).toBe(1);
  }finally{stop();}
+});
+
+test('原生执行端不向员工继承云端公司连接和执行端凭证环境', () => {
+  const inherited = { COMPANY_DB_TOKEN: 'fixture', RUNNER_CLIENT_SECRET: 'fixture', IDP_SECRET: 'fixture', GATEWAY_TOKEN: 'fixture', OPENAI_API_KEY: 'provider-login' };
+  const env = { ...inherited, ...scrubEnv({}, inherited) };
+  expect(env.COMPANY_DB_TOKEN).toBe(''); expect(env.RUNNER_CLIENT_SECRET).toBe('');
+  expect(env.IDP_SECRET).toBe(''); expect(env.GATEWAY_TOKEN).toBe('');
+  expect(env.OPENAI_API_KEY).toBe('provider-login');
 });

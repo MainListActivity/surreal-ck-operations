@@ -38,6 +38,8 @@ export interface BoardNextEntry {
 export interface BoardEmployeeView {
   /** Absolute comm dir of the employee's channel, the one a dispatch message names. */
   commDir: string;
+  /** 多执行节点时保留此员工所在节点的命令路径。 */
+  env?: { sckBin: string; opsRepo: string };
   next: BoardNextEntry[];
 }
 
@@ -57,20 +59,37 @@ export const boardReason = (position: number, eligible: boolean, body: string): 
   eligible ? `排在第 ${position} 位，可接` : `排在第 ${position} 位；${body}`;
 
 /** Writes the latest pass's view. One row, replaced on every pass. */
-export async function writeBoardView(db: Surreal, view: BoardView): Promise<void> {
-  await db.query('UPSERT company_meta:board_view CONTENT { at: $at, json: $json };', { at: view.at, json: JSON.stringify(view) });
+export async function writeBoardView(db: Surreal, view: BoardView, runner?: string): Promise<void> {
+  if (!runner) {
+    await db.query('UPSERT company_meta:board_view CONTENT { at: $at, json: $json };', { at: view.at, json: JSON.stringify(view) });
+    return;
+  }
+  await db.query('UPSERT type::record("company_meta", $key) CONTENT { kind: "runner_board", runner: $runner, at: $at, json: $json };',
+    { key: `board_view:${runner}`, runner, at: view.at, json: JSON.stringify(view) });
 }
 
-/** The latest pass's view, or undefined before the first pass has written one. */
+/** 合并节点快照，保留原版单行格式的读取兼容；一个节点不能覆盖另一节点的员工。 */
 export async function readBoardView(db: Surreal): Promise<BoardView | undefined> {
-  const [rows] = await db.query<[Array<{ json?: string }>]>('SELECT json FROM company_meta:board_view;');
-  const raw = rows?.[0]?.json;
-  if (!raw) return undefined;
-  try {
-    return JSON.parse(raw) as BoardView;
-  } catch {
-    return undefined;
+  const [rows] = await db.query<[Array<{ json?: string }>]>(
+    'SELECT json, at FROM company_meta WHERE id = company_meta:board_view OR kind = "runner_board" ORDER BY at DESC;');
+  const views: BoardView[] = [];
+  for (const row of rows ?? []) {
+    try { const view = JSON.parse(row.json ?? '') as BoardView;
+      if (typeof view.at === 'number' && view.env && Array.isArray(view.queue) && view.employees) views.push(view);
+    } catch { /* 未完成/旧格式快照不参与合并。 */ }
   }
+  views.sort((a, b) => b.at - a.at);
+  if (!views.length) return undefined;
+  const employees: BoardView['employees'] = {};
+  const queue = new Map<string, BoardQueueItem>();
+  for (const view of views) {
+    for (const [id, employee] of Object.entries(view.employees)) employees[id] ??= { ...employee, env: employee.env ?? view.env };
+    for (const item of view.queue) {
+      const key = `${item.taskId}:${item.phase}`, prev = queue.get(key);
+      if (!prev || !prev.eligible && item.eligible) queue.set(key, item);
+    }
+  }
+  return { ...views[0]!, employees, queue: [...queue.values()] };
 }
 
 /** The local runner beats every thirty seconds; three missed beats read as offline. */
@@ -86,7 +105,7 @@ const OPEN_STATES = ['ready', 'doing', 'review'];
 
 /** Writes the runner's heartbeat. One row for the local runner, replaced on every beat. */
 export async function writeRunnerHeartbeat(db: Surreal, beat: { runner: string; host: string; version: string }): Promise<void> {
-  await db.query('UPSERT runner_heartbeat:current CONTENT { runner: $runner, host: $host, version: $version, at: time::now() };', beat);
+  await db.query('UPSERT type::record("runner_heartbeat", $runner) CONTENT { runner: $runner, host: $host, version: $version, at: time::now() };', beat);
 }
 
 export interface BoardRunner {
@@ -331,7 +350,7 @@ export function renderContextFor(view: BoardView, employeeId: string,
   if (!commDir) return undefined;
   const acId = acIdOf(task.step, task.acceptanceCriteria);
   return {
-    sckBin: view.env.sckBin, commDir, taskId: task.taskId,
+    sckBin: (view.employees[employeeId]?.env ?? view.env).sckBin, commDir, taskId: task.taskId,
     ...(task.findingsFile ? { findingsFile: task.findingsFile } : {}),
     ...(acId ? { acId } : {}),
   };

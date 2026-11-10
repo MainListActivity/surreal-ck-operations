@@ -59,6 +59,8 @@ test('tool wiring names tools missing from the sidecar and test lists naming mis
   ]);
   write(root, 'plugin/server/sidecar.ts', 'switch (x) { case "alpha": break; case "beta": break; }\nconst BASE_TOOLS = ["alpha"];');
   expect(wiringProblems(root)).toContain('MCP 工具未列入 sidecar 工具表：beta');
+  write(root, 'src/runner/sidecar.ts', 'const BASE_TOOLS = ["alpha", "beta"]; switch (x) { case "alpha": break; case "beta": break; }');
+  expect(wiringProblems(root).filter(p => p.includes('MCP 工具'))).toEqual([]);
 });
 
 test('type errors refuse; a compiler that cannot run or a tree without packages does not', async () => {
