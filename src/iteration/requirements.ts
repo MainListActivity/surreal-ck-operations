@@ -134,7 +134,7 @@ export class Requirements {
     else if (action === 'reject') [rows] = await this.db.query<[Record<string, any>[]]>(
       "UPDATE $id SET state='rejected', actor=$actor, updated_at=time::now() WHERE revision=$revision AND state IN ['draft','pending'] RETURN AFTER;", {id:ref,revision,actor});
     else [rows] = await this.db.query<[Record<string, any>[]]>(
-      "UPDATE $id SET planning_attempts=0, planning_until=NONE, planning_error=NONE, actor=$actor, updated_at=time::now() WHERE revision=$revision AND state='queued' AND (planning_until=NONE OR planning_until < $now) RETURN AFTER;", {id:ref,revision,actor,now:Date.now()});
+      "UPDATE $id SET planning_attempts=0, planning_until=NONE, planning_error=NONE, planning_diagnostic=NONE, actor=$actor, updated_at=time::now() WHERE revision=$revision AND state='queued' AND (planning_until=NONE OR planning_until < $now) RETURN AFTER;", {id:ref,revision,actor,now:Date.now()});
     if (!rows.length) throw new CompanyError('conflict', '需求状态或修订已变更，请刷新后操作');
     return requirementOf(rows[0]!);
   }

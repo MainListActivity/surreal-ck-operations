@@ -149,6 +149,23 @@ run('多个接收者并发重放同一反馈只落一条；整理失败有上限
   const out=await triageFeedback(db,async()=>({disposition:'dismiss',category:'noise',reason:'测试反馈'}));expect(out.dismissed).toBe(1);
 });
 
+run('规划错误只记录安全诊断，老板重试和成功后清除旧错误',async()=>{
+  const {planRequirements}=await import('../src/iteration/planning.ts');
+  await db.query("UPDATE product_requirement SET state='paused' WHERE state='queued';");
+  const req=await store.create(content,'owner');await store.approve(req.id,1,'owner');
+  const now=Date.now();
+  await planRequirements(db,async()=>{throw new SyntaxError('private-model-body');},now-180000);
+  const failed=await store.get(req.id) as unknown as Record<string,any>;
+  expect(failed.planning_diagnostic.stage).toBe('model');
+  expect(failed.planning_diagnostic.code).toBe('invalid_json');
+  expect(JSON.stringify(failed)).not.toContain('private-model-body');
+  await store.control(req.id,1,'retry','owner');
+  expect((await store.get(req.id) as any).planning_diagnostic).toBeUndefined();
+  await planRequirements(db,async()=>({steps:[{title:'核对记录',context:'读取记录并验证关联',acceptance:'记录核对结果'}]}),now);
+  expect((await store.get(req.id) as any).planned).toBe(true);
+  expect((await store.get(req.id)).planning_error).toBeUndefined();
+});
+
 run('完整公司 schema 与真实 core：幂等建规划单、真实租约提交评审、工程任务建立及消息恢复',async()=>{
   const {CompanyDatabase}=await import('../src/database.ts');
   const {SurrealCompanyCore}=await import('../src/core.ts');
