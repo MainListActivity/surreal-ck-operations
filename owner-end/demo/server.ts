@@ -11,11 +11,17 @@ export async function buildDemo(){
 }
 export function handler(store:DemoStore,origin:string,build=buildDemo){
   const json=(result:unknown,status=200)=>Response.json(result,{status});
+  const allowedOrigins=new Set([origin]);
+  if(process.env.FIGMA){
+    const port=new URL(origin).port;
+    allowedOrigins.add(`http://localhost:${port}`);
+    if(process.env.FIGMA_PUBLIC_URL)allowedOrigins.add(new URL(process.env.FIGMA_PUBLIC_URL).origin);
+  }
   return async(request:Request):Promise<Response>=>{
     const url=new URL(request.url);
     let response:Response;
-    if(url.origin!==origin||request.headers.get('host')!==new URL(origin).host)return new Response('仅允许本机设计环境访问',{status:403});
-    if(request.headers.get('origin')&&request.headers.get('origin')!==origin)return new Response('不允许跨站请求',{status:403});
+    if(!allowedOrigins.has(url.origin))return new Response('仅允许本机设计环境访问',{status:403});
+    if(request.headers.get('origin')&&!allowedOrigins.has(request.headers.get('origin')!))return new Response('不允许跨站请求',{status:403});
     try {
       if(request.method==='POST'){
         if(Number(request.headers.get('content-length')??0)>1_000_000)throw new DemoError('本地请求过大',413);

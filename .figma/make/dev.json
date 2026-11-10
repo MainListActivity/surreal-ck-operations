@@ -1,0 +1,9 @@
+{
+  "installOn": [
+    "owner-end/package.json",
+    "owner-end/pnpm-lock.yaml"
+  ],
+  "restartOn": [
+    "owner-end/demo/**"
+  ]
+}
