@@ -1,3 +1,4 @@
+import type { WorkContext } from "../../../src/work-context.ts";
 /**
  * 页面侧的数据形状。镜像 src/board.ts 的 OwnerBoard（字段以该文件为准）。
  * 页面不 import 服务端模块（那些会拉进 surrealdb 等依赖）。
@@ -15,6 +16,7 @@ export interface BoardTranslation {
 
 /** 一条未发消息，按老板看到的原文（存储原文，未渲染）。 */
 export interface BoardMessageRow {
+  context?: WorkContext;
   messageId: string;
   taskId: string;
   title: string;
@@ -57,6 +59,7 @@ export interface BoardNextRow {
 
 /** 员工待发消息（渲染后的派工文本，员工收到的样子）。 */
 export interface BoardOutboxRow {
+  context?: WorkContext;
   messageId: string;
   taskId: string;
   title: string;

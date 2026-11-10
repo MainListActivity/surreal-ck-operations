@@ -1,3 +1,4 @@
+import type { WorkContext } from "../../../src/work-context.ts";
 /**
  * 页面的纯函数：看板视图模型、草稿、错误文案、表单解析。不依赖 DOM 与 preact，供 bun test 直接测试。
  */
@@ -113,6 +114,7 @@ export function nextView(row: BoardNextRow): NextView {
 }
 
 export interface MessageView {
+  context?: WorkContext;
   /** 空串表示后端没有给消息编号：这条消息只能查看，不能操作。 */
   messageId: string;
   title: string;
@@ -151,6 +153,7 @@ export function messageView(row: BoardMessageRow): MessageView {
     title: row.title ?? row.taskId ?? '',
     stepText: stepText(row.step),
     body: row.body,
+    context: row.context,
     hold: row.hold === true,
     taskId: row.taskId,
   };
@@ -162,6 +165,7 @@ export function outboxView(row: BoardOutboxRow): OutboxView {
     title: row.title,
     stepText: stepText(row.step),
     body: row.body,
+    context: row.context,
     hold: row.hold === true,
     taskId: row.taskId,
     workdirPending: row.workdirPending === true,

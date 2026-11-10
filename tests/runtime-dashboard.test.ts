@@ -81,6 +81,20 @@ test('按物理节点归组，模型来自观测；租约、候选和链上后�
   });
 });
 
+test('大屏直接给出项目和本阶段耗时，未知连接不继续承诺预计时间', () => {
+  const input = fixture();
+  Object.assign(input.tasks[0]!, {kind: 'task', project_ref: 'project:company', project_name: '公司工作台'});
+  input.timingEvents = Array.from({length: 5}, (_, i) => [
+    {task: `task:past-${i}`, actor: 'employee:dev', project_ref: 'project:company', role: 'engineering', kind: 'task', phase: 'execute', action: 'claim', at: now - 600000},
+    {task: `task:past-${i}`, actor: 'employee:dev', project_ref: 'project:company', role: 'engineering', kind: 'task', phase: 'execute', action: 'submit', at: now - 60000},
+  ]).flat();
+  expect(buildRuntimeDashboard(input, now).agents.find(a => a.id === 'dev')).toMatchObject({
+    project: {id: 'company', name: '公司工作台'}, elapsedSeconds: 5,
+    estimate: {status: 'estimated', samples: 5, lowerSeconds: 535, upperSeconds: 535},
+  });
+  expect(buildRuntimeDashboard(input, now + 100000).agents.find(a => a.id === 'dev')?.estimate?.status).toBe('unavailable');
+});
+
 test('心跳过期与归属缺失如实显示；未上报设备不能伪归当前主机', () => {
   const input = fixture();
   input.beats.forEach((b) => (b.at = now - 91_000));
@@ -208,4 +222,16 @@ test('GitHub CI/CD 不产生 Agent；CI 通过、生产部署证据与历史提�
   expect(data.deliveries[1]!.runUrl).toBeUndefined();
   input.evidence[1]!.source.conclusion = 'failure';
   expect(buildRuntimeDashboard(input, now).deliveries[1]!.status).toBe('ci_failed');
+});
+
+test('本轮进度精确匹配运行回合；历史回合更晚补报也不会覆盖；失联保留输出但状态未知',()=>{
+  const f=fixture();f.employees[0]!.paseo_agent_id='native:a:s';
+  f.tasks[0]!.runtime_execution={agent:'native:a:s',turn:'current'};
+  const activity={agent:'native:a:s',turn:'current',runtime:'native',state:'running',startedAt:now-1000,observedAt:now,lastActivityAt:now,toolsCompleted:2,events:[]};
+  f.activities=[{employee:'dev',agent:activity.agent,task:'work',activity:{...activity,turn:'old'}},{employee:'dev',agent:activity.agent,task:'work',activity}];
+  expect(buildRuntimeDashboard(f,now).agents.find(a=>a.id==='dev')?.activity?.turn).toBe('current');
+  const stale=buildRuntimeDashboard(f,now+100000).agents.find(a=>a.id==='dev');
+  expect(stale?.state).toBe('unknown');expect(stale?.activity?.turn).toBe('current');
+  f.tasks[0]!.runtime_execution=undefined;
+  expect(buildRuntimeDashboard(f,now).agents.find(a=>a.id==='dev')?.activity).toBeUndefined();
 });

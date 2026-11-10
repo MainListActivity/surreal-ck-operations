@@ -1,6 +1,8 @@
 // 公司执行栈：由 Paseo 兼容宿主或独立原生执行端提供执行器。
 
 import { readTurnResult } from './turn-result.ts';
+import { workContext } from '../work-context.ts';
+import { readProviderRoutes, ownsProvider } from './provider-routing.ts';
 import { loadServiceEnv, serviceHome } from "./env.ts";
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
@@ -58,7 +60,7 @@ let paseoApi: PaseoApi | undefined;
 export function noteHost(api: PaseoApi | undefined): void { if (api) paseoApi = api; }
 export function currentHost(): PaseoApi | undefined { return paseoApi; }
 
-let runtimeOptions: { gateway: AgentRuntime; release?: { version: string; sha: string }; native?: boolean; providers?: string[]; runner?: { id: string; adoptLegacy?: boolean }; realign?: (id: string, model: string) => Promise<boolean> } | undefined;
+let runtimeOptions: { gateway: AgentRuntime; release?: { version: string; sha: string }; native?: boolean; providers?: string[]; requireProviderRoute?: boolean; dispatchAllowed?: () => boolean; runner?: { id: string; adoptLegacy?: boolean }; realign?: (id: string, model: string) => Promise<boolean> } | undefined;
 export function configureCompanyRuntime(options: NonNullable<typeof runtimeOptions>): void {
   if (boot) throw new Error('执行端启动后不能替换运行后端');
   runtimeOptions = options;
@@ -117,10 +119,15 @@ export function company(): Promise<Company> {
     await db.useDatabase(); // schema is applied by the migrator (cloud) or the local bootstrap; the plugin only queries.
 
     const workforce = new Workforce(db, undefined, runtimeOptions?.runner);
-    if (runtimeOptions?.providers) {
+    {
       const defs = workforce.defs.bind(workforce);
-      const supported = new Set(runtimeOptions.providers);
-      workforce.defs = async () => (await defs()).filter(def => supported.has(def.provider));
+      const supported = runtimeOptions?.providers ? new Set(runtimeOptions.providers) : undefined;
+      workforce.defs = async () => {
+        if (runtimeOptions?.dispatchAllowed?.() === false) return [];
+        const routes = readProviderRoutes(serviceHome());
+        return (await defs()).filter(def => (!supported || supported.has(def.provider)) &&
+          (!runtimeOptions?.requireProviderRoute || !!routes.routes[def.provider]) && ownsProvider(routes, def.provider, runtimeOptions?.runner?.id));
+      };
     }
     const opsRepo = process.env.SCK_AGENT_CWD ?? "/Users/y/IdeaProjects/surreal-ck-operations";
     // The ops repo lets triage bind a company-system quick goal's code legs to it (see OwnerDesk.triage).
@@ -222,6 +229,13 @@ export function company(): Promise<Company> {
       };
     }
     const sidecar = new SidecarPool({
+      briefStaged: async (employee, claim) => {
+        const { RecordId } = await import('surrealdb');
+        await db.db.query('UPDATE $task SET runtime_context = $context WHERE current_employee = $employee AND delivery_id = $delivery AND fence = $fence;', {
+          task: new RecordId('task', claim.task.id), employee, delivery: claim.deliveryId, fence: claim.fence,
+          context: workContext(claim, 'dispatched'),
+        });
+      },
       nativeExecution: runtimeOptions.native,
       managedLifecycle: true,
       readTurnResult: runtimeOptions.native ? undefined : (agent, turn, startedAt) => readTurnResult(currentHost(), agent, turn, startedAt),
@@ -254,6 +268,11 @@ export function company(): Promise<Company> {
     const messages = new OutboundMessageStore(db.db);
     const sckBin = process.env.SCK_TOOL_BIN ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/bin/sck`;
     const dispatcher = new Dispatcher({
+      providerAllowed: provider => {
+        const routes = readProviderRoutes(serviceHome());
+        return runtimeOptions?.dispatchAllowed?.() !== false && (!runtimeOptions?.providers || runtimeOptions.providers.includes(provider)) &&
+          (!runtimeOptions?.requireProviderRoute || !!routes.routes[provider]) && ownsProvider(routes, provider, runtimeOptions?.runner?.id);
+      },
       workforce,
       owner,
       messages,

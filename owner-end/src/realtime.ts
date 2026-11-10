@@ -3,6 +3,7 @@ import { Table, type LiveSubscription, type Surreal } from 'surrealdb';
 export const LIVE_TABLES = [
   'task',
   'employee',
+  'agent_activity',
   'audit',
   'acceptance_evidence',
   'runner_heartbeat',

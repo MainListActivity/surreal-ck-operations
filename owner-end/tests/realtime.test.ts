@@ -2,7 +2,8 @@ import { expect, test } from 'bun:test';
 import type { Surreal } from 'surrealdb';
 import { LIVE_TABLES, ownerEventStream, subscribeOwnerChanges } from '../src/realtime.ts';
 import { parseLiveFrame, readLiveChunk } from '../src/ui/realtime.ts';
-import { expireObservations } from '../src/ui/runtime-state.ts';
+import { expireObservations, remainingText } from '../src/ui/runtime-state.ts';
+import type { RuntimeAgentView } from '../../src/runtime-dashboard.ts';
 import { DemoRuntime } from '../demo/runtime.ts';
 import { DemoStore } from '../demo/store.ts';
 import { seed, withDesignCases } from '../demo/data.ts';
@@ -159,4 +160,12 @@ test('设计大盘的员工数量来自同一份员工数据，CI/CD 不创建�
   const reduced=runtime.snapshot();
   expect(reduced.agents).toHaveLength(1);
   expect(reduced.summary.agents).toBe(1);
+});
+
+test('剩余时间是有依据的范围，断线、超时和样本不足不显示假倒计时', () => {
+  const agent: RuntimeAgentView = {id:'e',name:'开发',role:'engineering',hostId:'h',modelSource:'unknown',state:'running',taskId:'t',estimate:{status:'estimated',samples:8,lowerSeconds:180,upperSeconds:600}};
+  expect(remainingText(agent)).toBe('约 3–10 分钟');
+  expect(remainingText({...agent,state:'unknown'})).toContain('剩余未知');
+  expect(remainingText({...agent,estimate:{status:'overrun',samples:8}})).toContain('超过常见用时');
+  expect(remainingText({...agent,estimate:{status:'insufficient',samples:3}})).toBe('暂无法估计');
 });

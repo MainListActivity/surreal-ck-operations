@@ -154,6 +154,7 @@ export function cloudRequestOf(tool: string, args: Record<string, unknown>): { c
 const NEEDS_CLOUD = "需要云端执行端：公司命令只在云端模式可用，本机没有公司网关";
 
 export interface SidecarDeps {
+  briefStaged?: (employee: string, claim: ClaimResult) => Promise<void>;
   managedLifecycle?: boolean;
   readTurnResult?: (agent: string, turn: string, startedAt: number) => Promise<string>;
   executionChanged?: (row: ExecutionAttempt) => Promise<void>;
@@ -212,8 +213,8 @@ const ORPHAN_PREFIX = "orphaned-";
  * task.md and findings/round-NN.md for the lease just taken: what the dispatch message points the employee at. The comm
  * dir outlives tasks, so an earlier task's findings are removed first.
  */
-function stageBrief(dir: string, claim: ClaimResult): void {
-  try { writeBrief(dir, claim); } catch (error) { console.warn(`task brief for ${claim.task?.id} not staged: ${(error as Error).message}`); }
+function stageBrief(dir: string, claim: ClaimResult): boolean {
+  try { writeBrief(dir, claim); return true; } catch (error) { console.warn(`task brief for ${claim.task?.id} not staged: ${(error as Error).message}`); return false; }
 }
 function writeBrief(dir: string, claim: ClaimResult): void {
   rmSync(join(dir, "findings"), { recursive: true, force: true });
@@ -618,7 +619,8 @@ export class SidecarPool {
     mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
     const { laneNotes: _notes, ...claimView } = result; // notes.md carries the text; claim.json stays small.
     writeFileAtomic(join(dir, "claim.json"), JSON.stringify({ ...claimView, evidenceDir, orphanedArtifacts: orphanedArtifacts(evidenceDir) }));
-    stageBrief(dir, result);
+    if (stageBrief(dir, result)) await this.deps.briefStaged?.(inst.id, result)
+      .catch(() => this.log(`work context snapshot unavailable: ${result.task.id}`));
     // A new lease must not inherit a previous turn's artifacts: archive them so an
     // identical-looking new report still submits instead of matching a stale hash.
     this.archive(reportPath(dir), "stale");

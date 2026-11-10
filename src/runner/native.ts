@@ -1,4 +1,5 @@
 import { acquireNativeWriter } from './native-lock.ts';
+import { ActivityCollector, type AgentActivity } from '../agent-activity.ts';
 import { spawn as spawnProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
@@ -16,12 +17,13 @@ export interface NativeSession {
 }
 interface State { version: 1; host: string; sessions: NativeSession[]; workspaces: RuntimeWorkspace[] }
 export interface NativeOptions {
+  onHeartbeat?(): Promise<void>;
   root: string; host: string;
   /** 已配置的员工沙箱启动命令；不从 PATH 猜测，也不执行 shell 字符串。 */
   command(provider: NativeProvider): string[];
   /** 每轮从 sidecar 重新取得通道、员工沙箱和模型环境，不持久化 env/凭证。 */
   environment(session: Readonly<NativeSession>): Promise<Record<string, string>>;
-  onStarted?(session: Readonly<NativeSession>): void;
+  onStarted?(session: Readonly<NativeSession>): void | Promise<void>;
   onEnded?(event: TurnEnded): Promise<void>;
   maxOutputBytes?: number;
   stopGraceMs?: number;
@@ -32,11 +34,11 @@ const supported = (provider: string): provider is NativeProvider => ['factory-dr
 /** CLI 参数来自原生非交互入口，不经 ACP，不把 prompt 放在进程参数中。 */
 export function nativeArgs(s: Pick<NativeSession, 'provider' | 'nativeSessionId' | 'model' | 'thinking' | 'mode'>): string[] {
   const model = s.model ? ['--model', s.model] : [];
-  if (s.provider === 'factory-droid') return ['exec', '--output-format', 'json', ...model,
+  if (s.provider === 'factory-droid') return ['exec', '--output-format', 'stream-json', ...model,
     ...(s.mode === 'auto-high' ? ['--auto', 'high'] : []),
     ...(s.thinking ? ['--reasoning-effort', s.thinking] : []),
     ...(s.nativeSessionId ? ['--session-id', s.nativeSessionId] : [])];
-  if (s.provider === 'claude') return ['-p', '--output-format', 'json', ...model,
+  if (s.provider === 'claude') return ['-p', '--output-format', 'stream-json', '--verbose', ...model,
     ...(s.thinking ? ['--effort', s.thinking] : []),
     ...(s.mode === 'bypassPermissions' ? ['--permission-mode', 'bypassPermissions'] : []),
     ...(s.nativeSessionId ? ['--resume', s.nativeSessionId] : [])];
@@ -52,13 +54,28 @@ export function parseNativeResult(provider: NativeProvider, output: string): Nat
   const result: NativeResult = { completed: false, text: '' };
   if (provider !== 'codex') {
     let value: any;
-    try { value = JSON.parse(output.trim()); } catch { return { ...result, error: '原生 CLI 没有返回有效 JSON 结果' }; }
+    try { value = JSON.parse(output.trim()); } catch {
+      try { value = output.trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line)); }
+      catch { return { ...result, error: '原生 CLI 没有返回有效 JSON 结果' }; }
+    }
     // Claude 的 verbose 配置会让 json 输出成为完整事件数组；只接受末尾正式结果。
-    if (provider === 'claude' && Array.isArray(value)) value = value.at(-1);
+    if (Array.isArray(value)) {
+      const start = value.find(e => e.type === 'system');
+      result.sessionId = start?.session_id ?? start?.sessionId;
+      if (value.some(e => e?.type === 'error' || (['result', 'completion'].includes(e?.type) && (e.is_error === true || e.isError === true))))
+        result.error = '原生 CLI 事件流返回错误';
+      value = value.at(-1);
+    }
+    if (provider === 'factory-droid' && value?.type === 'completion') value = {
+      ...value, type: 'result', session_id: value.session_id ?? value.sessionId ?? result.sessionId,
+      result: value.finalText ?? value.text ?? value.result,
+      subtype: value.isError === true || value.is_error === true ? 'error' : 'success',
+      is_error: value.isError === true || value.is_error === true,
+    };
     if (!value || value.type !== 'result') return { ...result, error: '原生 CLI 缺少 result 终态' };
     if (typeof value.session_id === 'string' && value.session_id) result.sessionId = value.session_id;
     result.text = typeof value.result === 'string' ? value.result : '';
-    result.completed = value.is_error === false && value.subtype === 'success';
+    result.completed = !result.error && value.is_error === false && value.subtype === 'success';
     if (!result.completed) result.error = typeof value.error === 'string' ? value.error : result.text || '原生 CLI 返回失败终态';
     if (Number.isFinite(value.usage?.input_tokens)) result.inputTokens = value.usage.input_tokens;
     return result;
@@ -81,6 +98,7 @@ export function parseNativeResult(provider: NativeProvider, output: string): Nat
 
 /** 一台执行节点一个写者。持久化会话映射；每轮只持有一个原生 CLI 子进程。 */
 export class NativeRuntime implements AgentRuntime {
+  async heartbeat(): Promise<void> { await this.options.onHeartbeat?.(); }
   private readonly sessions = new Map<string, NativeSession>();
   private readonly workspaces = new Map<string, RuntimeWorkspace>();
   private readonly pending = new Map<string, string>();
@@ -89,6 +107,12 @@ export class NativeRuntime implements AgentRuntime {
   private readonly turns = new Set<Promise<void>>();
   private readonly settling = new Map<string, string>();
   private readonly logs = new Map<string, string>();
+  private readonly activities = new Map<string, ActivityCollector>();
+  activity(): AgentActivity[] { return [...this.activities.values()].map(a => a.snapshot()); }
+  acknowledgeActivity(agent: string, turn: string): void {
+    const activity = this.activities.get(turn);
+    if (activity?.value.agent === agent && activity.value.state !== 'running') this.activities.delete(turn);
+  }
   private closed = false;
   private readonly releaseWriter: () => void;
   constructor(private readonly options: NativeOptions) {
@@ -174,15 +198,44 @@ export class NativeRuntime implements AgentRuntime {
     });
     s.pid = child.pid; this.save();
     const turnId = s.turnId;
-    let stdout = '', bytes = 0, canceled = false, processError: string | undefined;
+    const activity = new ActivityCollector(s.id, turnId!, Date.now());
+    this.activities.set(turnId!, activity);
+    // Unacknowledged observations are diagnostic only; never retain them without a bound.
+    for (const [id, old] of this.activities) if (old.value.state !== 'running' &&
+      (old.value.lastActivityAt < Date.now() - 86_400_000 || this.activities.size > 200)) this.activities.delete(id);
+    let lineBuffer = '', canceled = false, processError: string | undefined;
+    // Retain only terminal facts. Tool payloads must not accumulate for the duration of a long task.
+    const facts = new Map<string, unknown>();
     const limit = this.options.maxOutputBytes ?? 8 * 1024 * 1024;
     const terminate = (signal: NodeJS.Signals) => {
       try { if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, signal); else child.kill(signal); } catch {}
     };
+    const consume = (line: string) => {
+      if (!line.trim()) return;
+      if (Buffer.byteLength(line) > limit) { processError = '原生 CLI 输出超过限制'; terminate('SIGKILL'); return; }
+      try {
+        const e = JSON.parse(line);
+        activity.ingest(s.provider, e, Date.now());
+        if (s.provider === 'codex') {
+          if (e.type === 'thread.started') facts.set('session', {type:e.type, thread_id:e.thread_id});
+          if (e.type === 'item.completed' && e.item?.type === 'agent_message') facts.set('text', e);
+          if (e.type === 'turn.completed') facts.set('terminal', {type:e.type,usage:e.usage});
+          if (e.type === 'turn.failed' || e.type === 'error') facts.set('error', {type:'error', message:'原生 CLI 事件流返回错误'});
+        } else {
+          if (e.type === 'system') facts.set('session', {type:e.type, session_id:e.session_id ?? e.sessionId});
+          if (e.type === 'error') facts.set('error', {type:'error'});
+          facts.set('terminal', ['completion','result'].includes(e.type) ? e : {type:e.type});
+        }
+      } catch { processError = '原生 CLI 事件流包含无效 JSON'; }
+    };
     const capture = (chunk: string) => {
-      bytes += Buffer.byteLength(chunk);
-      if (bytes > limit) { processError = '原生 CLI 输出超过限制'; terminate('SIGKILL'); return; }
-      stdout += chunk;
+      lineBuffer += chunk;
+      let newline: number;
+      while ((newline = lineBuffer.indexOf('\n')) >= 0) {
+        const line = lineBuffer.slice(0, newline); lineBuffer = lineBuffer.slice(newline + 1);
+        consume(line);
+      }
+      if (Buffer.byteLength(lineBuffer) > limit) { processError = '原生 CLI 输出超过限制'; lineBuffer = ''; terminate('SIGKILL'); }
     };
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', capture);
@@ -195,12 +248,17 @@ export class NativeRuntime implements AgentRuntime {
     void done.then(() => this.turns.delete(done));
     this.processes.set(s.id, { child, done, cancel: () => { canceled = true; }, kill: terminate });
     child.once('error', error => { processError = error.message; });
+    let started: Promise<void> = Promise.resolve();
     child.once('close', (code, signal) => {
       void (async () => {
+        await started;
+        consume(lineBuffer); lineBuffer = '';
+        const stdout = ['session','text','error','terminal'].flatMap(k => facts.has(k) ? [JSON.stringify(facts.get(k))] : []).join('\n');
         const result = parseNativeResult(s.provider, stdout);
         if (result.sessionId) s.nativeSessionId = result.sessionId;
         s.inputTokens = result.inputTokens;
         const success = !canceled && !processError && code === 0 && result.completed && !!s.nativeSessionId;
+        activity.finish(canceled ? 'canceled' : success ? 'completed' : 'failed', result.text, Date.now());
         s.status = success || canceled && !!s.nativeSessionId ? 'idle' : 'error';
         s.pid = undefined;
         s.error = success || canceled ? undefined : processError ?? result.error ?? `原生回合未完整结束（exit=${code}, signal=${signal ?? 'none'}）`;
@@ -220,8 +278,8 @@ export class NativeRuntime implements AgentRuntime {
     });
     // A failed spawn must never produce a start acknowledgement.
     child.once('spawn', () => {
-      try { this.options.onStarted?.(structuredClone(s)); }
-      catch { processError = "回合开始通知失败"; terminate("SIGKILL"); }
+      started = Promise.resolve().then(() => this.options.onStarted?.(structuredClone(s)))
+        .catch(() => { processError = '回合开始通知失败'; terminate('SIGKILL'); });
     });
     child.stdin.end(prompt);
     await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });

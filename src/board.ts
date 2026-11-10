@@ -6,6 +6,7 @@
  * 这里读回来后与数据库现状对齐：已派走、已完成、已作废的不再显示；租约、交接与放行门按数据库现状计算。
  */
 import type { RecordId, Surreal } from 'surrealdb';
+import { workContext, type WorkContext } from './work-context.ts';
 import { latestFindings } from './dispatcher/brief.ts';
 import { HANDOVER_ROWS } from './handover-window.ts';
 import { deliveryOf, effectiveLangOf, translationStateOf, type DeliveryMessage } from './outbound-delivery.ts';
@@ -167,6 +168,7 @@ export interface BoardTranslation {
 
 /** An unsent message for this employee, as the employee would receive it. */
 export interface BoardOutboxRow {
+  context?: WorkContext;
   messageId: string;
   taskId: string;
   title: string;
@@ -187,6 +189,7 @@ export interface BoardOutboxRow {
 
 /** An unsent message as the owner edits it: the stored body, not rendered. */
 export interface BoardMessageRow {
+  context?: WorkContext;
   messageId: string;
   taskId: string;
   title: string;
@@ -374,6 +377,10 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
     rowsOf(db, "SELECT * FROM outbound_message WHERE state != 'sent' ORDER BY created_at DESC;"),
   ]);
   const tasks = new Map(openRows.map(row => [keyOf(row.id), row] as const));
+  const previewIds = [...new Map(unsent.map(row => [keyOf(row.task), row.task])).values()];
+  const previewRows = previewIds.length ? await rowsOf(db,
+    'SELECT id, title, context, requirement, acceptance_text FROM task WHERE id IN $ids;', {ids: previewIds}) : [];
+  const contexts = new Map(previewRows.map(row => [keyOf(row.id), workContext({task: row as never}, 'preview', now)]));
   const holders = openRows.filter(row => row.current_employee && OPEN_STATES.includes(String(row.state)));
 
   // The queue as it stands now: only items whose task still waits for the same phase and has no holder.
@@ -440,6 +447,7 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
     return {
       messageId: keyOf(row.id), taskId, title: titleOf(taskId), step: String(row.step) as MessageStep,
       state: row.state === 'held' ? 'held' : 'draft', hold: row.hold === true, body: message.body,
+      context: contexts.get(taskId),
       ...(translation ? { lang: translation.lang, translation } : {}),
       ...(employeeId ? { employeeId } : {}),
       editable: true,
@@ -481,6 +489,7 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
     // The translation rendered the same way: a translated dispatch names the same paths, workdir line included.
     const translation = translationOf(message, langOf.get(employeeId), text => dispatchText(renderMessage(text, ctx), workdir));
     return { messageId: keyOf(draft.id), taskId, title: String(row.title ?? ''), step,
+      context: contexts.get(taskId),
       body: dispatchText(renderMessage(message.body, ctx), workdir), workdirPending: workdir === undefined, hold: heldAt(taskId), lang: 'zh', editable: true,
       ...(translation ? { translation } : {}) };
   };

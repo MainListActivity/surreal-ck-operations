@@ -133,9 +133,20 @@ run('新运行数据在真实 schema 可写可读，已发正文保存实际渲�
   const observedAt=Date.now();
   await writeRuntimeObservation(company.db,'fixture-session','running',observedAt,'fixture-model');
   await writeRuntimeObservation(company.db,'fixture-session','idle',observedAt-1000,'stale-model');
+  await company.db.query(`CREATE project:timing_fixture SET name = '真实项目关联', repo_path = '/fixture';
+    CREATE task:runtime_fixture SET project = project:timing_fixture, title = '本轮任务', kind = 'task', state = 'doing',
+      executor_role = 'engineering', reviewer_role = 'qa', current_employee = 'runtime_fixture', lease_expires_at = time::unix(time::now()) + 60;
+    CREATE audit SET task = task:runtime_fixture, actor = employee:runtime_fixture, action = 'claim', phase = 'execute', at = time::now() - 10s;
+    FOR $i IN [1,2,3,4,5] {
+      LET $task = type::record('task', 'timing-history-' + <string>$i);
+      CREATE $task SET project = project:timing_fixture, kind = 'task', state = 'done', executor_role = 'engineering';
+      CREATE audit SET task = $task, actor = employee:runtime_fixture, action = 'claim', phase = 'execute', at = time::now() - 10m;
+      CREATE audit SET task = $task, actor = employee:runtime_fixture, action = 'submit', phase = 'execute', at = time::now() - 1m;
+    };`);
   const result = await readRuntimeDashboard(owner);
   expect(result.hosts.find(h=>h.id==='fixture-node')).toMatchObject({state:'online',metrics:{cpuPercent:25,cores:8}});
   expect(result.agents.find(a=>a.id==='runtime_fixture')).toMatchObject({hostId:'fixture-node',state:'running',model:'fixture-model',modelSource:'observed'});
+  expect(result.agents.find(a=>a.id==='runtime_fixture')).toMatchObject({project:{id:'timing_fixture',name:'真实项目关联'}, estimate:{status:'estimated',samples:5}});
   await company.db.query("CREATE outbound_message:runtime_sent CONTENT {task: task:runtime_fixture, step:'execute', role:'engineering', body:'模板 {{employee}}'};");
   await new OutboundMessageStore(company.db).markSent('runtime_sent','fixture-employee','实际渲染文本与工作目录');
   const [[row]] = await company.db.query<[Array<{body:string;sent_body:string}>]>('SELECT body, sent_body FROM outbound_message:runtime_sent;');

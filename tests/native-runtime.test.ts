@@ -118,7 +118,7 @@ test('不存在的 CLI 路径返回启动失败并退出 running', async () => {
 });
 
 test('Claude 与 Codex 使用原生明确续跑参数，Codex 只接受正式终态', () => {
-  expect(nativeArgs({ provider: 'claude', model: 'm', nativeSessionId: 'session' })).toEqual(['-p', '--output-format', 'json', '--model', 'm', '--resume', 'session']);
+  expect(nativeArgs({ provider: 'claude', model: 'm', nativeSessionId: 'session' })).toEqual(['-p', '--output-format', 'stream-json', '--verbose', '--model', 'm', '--resume', 'session']);
   expect(nativeArgs({ provider: 'codex', model: 'm', nativeSessionId: 'session' }).slice(0, 4)).toEqual(['exec', 'resume', 'session', '--json']);
   const lines = [{ type: 'thread.started', thread_id: 's' }, { type: 'item.completed', item: { type: 'agent_message', text: 'done' } }];
   expect(parseNativeResult('codex', lines.map(value => JSON.stringify(value)).join('\n')).completed).toBe(false);
@@ -266,4 +266,34 @@ test('旧锁迁移：活PID及损坏锁保守拒绝，实测已退出PID可接�
     expect(() => new NativeRuntime(options)).toThrow('写锁已占用');
     await runtime.close(); runtime = new NativeRuntime(options); await runtime.close();
   } finally { await runtime?.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('分块事件在进程结束前可读；开始镜像先完成，旧终态在新回合后仍待确认', async () => {
+  const f = fixture(`process.stdin.resume(); process.stdin.on('end', () => {
+    const e=JSON.stringify({type:'message',role:'assistant',text:'执行中'});process.stdout.write(e.slice(0,10));
+    setTimeout(()=>process.stdout.write(e.slice(10)+'\\n'),20);
+    setTimeout(()=>console.log(JSON.stringify({type:'completion',session_id:'s',finalText:'完成'})),100);
+  });`, {onStarted:async () => {await Bun.sleep(40);}});
+  try {
+    const id = await f.runtime.spawn(input()); await f.runtime.activate(id);
+    await until(() => f.runtime.activity().some(a => a.events.some(e => e.text === '执行中')));
+    expect(f.events).toHaveLength(0);
+    await until(() => f.events.length === 1);
+    const first = f.runtime.activity()[0]!;
+    await f.runtime.send(id,'继续');
+    expect(f.runtime.activity().some(a => a.turn === first.turn && a.state === 'completed')).toBe(true);
+    f.runtime.acknowledgeActivity(id,first.turn);
+    expect(f.runtime.activity().some(a => a.turn === first.turn)).toBe(false);
+    await until(() => f.events.length === 2);
+  } finally {await f.close();}
+});
+
+test('合法工具事件总量超过缓冲上限仍继续；只保留有界公开事件', async () => {
+  const f = fixture(`process.stdin.resume(); process.stdin.on('end',()=>{
+    for(let i=0;i<100;i++)console.log(JSON.stringify({type:'tool_result',id:String(i),toolId:String(i),value:'x'.repeat(200)}));
+    console.log(JSON.stringify({type:'completion',session_id:'s',finalText:'done'}));
+  });`,{maxOutputBytes:512});
+  try {const id = await f.runtime.spawn(input());await f.runtime.activate(id);await until(()=>f.events.length===1);
+    expect(f.events[0]!.outcome.kind).toBe('completed');expect(JSON.stringify(f.runtime.activity()).length).toBeLessThan(1500);
+  } finally {await f.close();}
 });

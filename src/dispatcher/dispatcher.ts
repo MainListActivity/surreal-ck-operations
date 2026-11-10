@@ -156,6 +156,7 @@ export interface StaffingEntry {
 }
 
 export interface StaffingInput {
+  providerAllowed?: (provider: string) => boolean;
   /** Internal planning pass: preserve static admission and quota, ignore temporary occupancy and provider preference. */
   qualificationOnly?: boolean;
   /** Global FIFO of work waiting for Factory; positions after three may use other providers. */
@@ -286,7 +287,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     const hit: Block | undefined =
       (p.exclusion?.authors.has(inst.id) ? ['prior_submitter', BLOCK_TEXT.prior_submitter] : undefined) ??
       (p.excludeSubmitter && inst.id === p.task?.submittedBy ? ['prior_submitter', BLOCK_TEXT.prior_submitter] : undefined) ??
-      ((inst.def && !def) || (def && !def.enabled) ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
+      ((inst.def && !def) || (def && !def.enabled) || p.providerAllowed?.(inst.provider ?? '') === false ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
       (!p.qualificationOnly && !ready(inst) ? notReady(p.states.get(inst.id), inst.provider ?? '') : undefined) ??
       (!p.qualificationOnly && p.assigned?.has(inst.id) ? ['assigned', BLOCK_TEXT.assigned] : undefined) ??
       (!p.qualificationOnly && p.holding.has(inst.id) ? ['held', BLOCK_TEXT.held] : undefined) ??
@@ -311,7 +312,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     const seats = p.insts.filter(i => i.def === def.id && (i.repoHome ?? i.cwd ?? p.opsRepo) === p.home &&
       inWorkspace(i) && !waiting(i)).length;
     const hit: Block | undefined =
-      (!def.enabled ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
+      (!def.enabled || p.providerAllowed?.(def.provider) === false ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
       (!trackOk(p.task, def.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (resolved === undefined ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
       (!p.qualificationOnly && seats >= def.maxInstances ? ['seat_full', `编制席位已满（${seats}/${def.maxInstances} 个实例，仓库 ${repoName(p.home)}）`] : undefined) ??
@@ -411,6 +412,7 @@ export async function reviewStaffingPreviews(
 }
 
 export interface DispatcherDeps {
+  providerAllowed?: (provider: string) => boolean;
   workforce: Workforce;
   owner: OwnerDesk;
   /** Outbound message store. Injected; defaults to a store over workforce's DB when absent. */
@@ -552,6 +554,7 @@ const emptySnapshot = (): DispatchSnapshot => ({ at: 0, verdicts: [], pools: [],
 
 /** What a pass read before it decided. The snapshot is taken from these at the end of the tick, so every view shares them. */
 export interface PassInputs {
+  providerAllowed?: (provider: string) => boolean;
   now: number;
   cfg: CompanyConfig;
   defs: EmployeeDef[];
@@ -616,7 +619,7 @@ export async function snapshotOf(p: PassInputs, opts: SnapshotOpts,
     busyBy.set(inst.provider ?? '', (busyBy.get(inst.provider ?? '') ?? 0) + 1);
   }
   const holding = new Set(p.tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
-  const poolBase = { defs: p.defs, insts: p.insts, states: p.states, holding, health: p.health, quotaBlocked: p.quotaBlocked,
+  const poolBase = { providerAllowed: p.providerAllowed, defs: p.defs, insts: p.insts, states: p.states, holding, health: p.health, quotaBlocked: p.quotaBlocked,
     factoryQueue:p.factoryQueue, busyBy, providerMax: p.cfg.providerMax, slots: p.slots, runtimeModels: p.runtimeModels,
     opsRepo: opts.opsRepo, sidecar: opts.sidecar, now: p.now };
   const homes = [...new Set([opts.opsRepo, ...p.insts.map(i => i.repoHome ?? i.cwd ?? opts.opsRepo), ...p.tasks.map(t => t.repoPath ?? opts.opsRepo)])];
@@ -1325,7 +1328,7 @@ export class Dispatcher {
     }
 
     // What this pass has read before it decides. The snapshot and the daily brief are taken from these at the end of the tick.
-    this.passInputs = { now, cfg, defs, insts, states, health, quotaBlocked, tasks, slots: slotMap, runtimeModels };
+    this.passInputs = { providerAllowed: this.deps.providerAllowed, now, cfg, defs, insts, states, health, quotaBlocked, tasks, slots: slotMap, runtimeModels };
 
     // 3. Owner inbox notices (gates, questions) and staffing gaps.
     await this.ownerNotices(tasks, report, now);
@@ -1439,7 +1442,7 @@ export class Dispatcher {
     const activeOwnerTasks = new Set<string>();
     // no owner wake ownership: owner-blocked work stays in the owner inbox
     const factoryCanRoute = availabilityOf(health.get(FACTORY_PROVIDER),now) !== 'down' && !quotaBlocked.has(FACTORY_PROVIDER);
-    const poolBase = { factoryQueue:undefined as Map<string,number>|undefined, defs, states, holding, health, quotaBlocked, busyBy,
+    const poolBase = { providerAllowed: this.deps.providerAllowed, factoryQueue:undefined as Map<string,number>|undefined, defs, states, holding, health, quotaBlocked, busyBy,
       providerMax: cfg.providerMax, slots: slotMap, runtimeModels, opsRepo: this.deps.env.opsRepo,
       sidecar: !!this.deps.sidecar, now };
     const queueExclusions = new Map<string,ReviewExclusion|undefined>();

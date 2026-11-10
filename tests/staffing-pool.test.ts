@@ -331,3 +331,9 @@ test('pool: a session serves one task, so one bound to another task or to none i
   // Without a task the pool is the repository-wide preview, which lists every session.
   expect(reuseKeys({}).sort()).toEqual(['bound', 'other', 'unbound']);
 });
+
+test('运行器路由也阻止无编制定向的旧会话复用', () => {
+  const entries = staffingPool(base({defs:[def('d1')],insts:[inst('legacy',{def:undefined})],states:new Map([['legacy','idle']]),providerAllowed:() => false}));
+  expect(entries.length).toBeGreaterThan(0);
+  expect(entries.every(e => !e.eligible && e.code === 'def_disabled')).toBe(true);
+});
