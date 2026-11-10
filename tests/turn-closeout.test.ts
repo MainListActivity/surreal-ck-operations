@@ -35,13 +35,18 @@ for (const phase of ['doing', 'review'] as const) test(`completed 429: ${phase} 
 
 test('failed circuit-breaker persistence retains the lease and sends no nudge', async () => {
   const calls: string[] = [];
+  let unavailable = true;
   const ctx = { workforce: {
     insts: async () => [{ id: 'i', provider: 'claude', paseoAgentId: 'a' }],
-    markExhausted: async () => { throw new Error('synthetic db unavailable'); },
-  }, sidecar: { settle: async () => { calls.push('settle'); }, releaseClaim: async () => { calls.push('release'); } } };
+    markExhausted: async () => { if (unavailable) throw new Error('synthetic db unavailable'); },
+  }, sidecar: { settle: async () => { calls.push('settle'); return {status: 'no_claim'}; }, releaseClaim: async () => { calls.push('release'); } } };
   await expect(settleCompanyTurn(ctx as never, {} as never, { agent: { id: 'a' }, turnId: 't',
     outcome: { kind: 'failed', error: { message: '429' } }, timeline: [] } as never)).rejects.toThrow('synthetic db unavailable');
   expect(calls).toEqual([]);
+  unavailable = false;
+  await settleCompanyTurn(ctx as never, {} as never, { agent: { id: 'a' }, turnId: 't',
+    outcome: { kind: 'failed', error: { message: '429' } }, timeline: [] } as never);
+  expect(calls).toEqual(['settle']);
 });
 
 function silentWorld() {

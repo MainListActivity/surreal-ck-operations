@@ -144,6 +144,7 @@ async function observe(body: string) {
   };
   const inst = { id: 'employee-1', def: DEF.id, role: DEF.role, provider: DEF.provider, model: DEF.model, credential: 'fixture-1', paseoAgentId: AGENT } as unknown as EmployeeInst;
   const workforce = {
+    pendingDispatchAttempts: async () => [],
     config: async () => ({ ...DEFAULT_CONFIG, quotaFloorPct: 0, quotaWeeklyFloorPct: 0, sessionMaxWakes: 0, sessionMaxInputK: 0, jevDecisions: false }),
     defs: async () => [DEF], serverNow: async () => 1000, insts: async () => [inst], tasks: async () => [], providerHealth: async () => new Map(),
     retire: async (id: string, _reason: string, kind: string) => { events.push(`retire:${id}:${kind}`); },

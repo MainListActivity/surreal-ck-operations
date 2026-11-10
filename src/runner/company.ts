@@ -296,6 +296,7 @@ export function company(): Promise<Company> {
       },
     });
     // Rebuild agent↔instance bindings and live leases after a plugin restart.
+    for (const error of await workforce.recoverDispatchBindings()) console.warn(`dispatch startup recovery retained: ${error}`);
     await sidecar.adopt(await workforce.insts());
     // 云端执行端的运维作业：员工身份与租约只在本进程的 sidecar 里，作业经 sidecar.runCloudOps 执行。
     // 作业的执行者（ma_hono 用户 id 或员工编号）经 agent_identity 对到员工。

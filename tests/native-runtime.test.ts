@@ -180,3 +180,90 @@ test('原生回合结束通知失败后持久保存结果，重启只重放结�
     expect(replacement.describe(id)?.pendingEnd).toBeUndefined();
   } finally { await replacement?.close(); await f.close(); }
 });
+
+test('真实执行端进程 SIGKILL 后内核锁释放，可接管但不自动激活或重发', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sck-native-process-crash-'));
+  const source = new URL('../src/runner/native.ts', import.meta.url).pathname;
+  const script = join(root, 'runner.ts');
+  const ready = join(root, 'ready');
+  writeFileSync(script, `import { NativeRuntime } from ${JSON.stringify(source)};
+    import { writeFileSync } from 'node:fs';
+    const runtime = new NativeRuntime({ root: ${JSON.stringify(root)}, host: 'crash-fixture',
+      command: () => { throw new Error('No execution permitted in this fixture'); }, environment: async () => ({}) });
+    if (process.env.REOPEN === '1') {
+      writeFileSync(${JSON.stringify(join(root, 'reopened'))}, JSON.stringify([...await runtime.list()]));
+      await runtime.close();
+    } else {
+      const id = await runtime.spawn(${JSON.stringify(input())});
+      writeFileSync(${JSON.stringify(ready)}, id); setInterval(() => {}, 1000);
+    }`);
+  let child: ReturnType<typeof Bun.spawn> | undefined;
+  try {
+    child = Bun.spawn([process.execPath, script], { stdout: 'ignore', stderr: 'ignore' });
+    await until(() => existsSync(ready));
+    child.kill('SIGKILL'); await child.exited; child = undefined;
+    const before = readFileSync(join(root, 'sessions.json'), 'utf8');
+    expect(JSON.parse(before).sessions[0].status).toBe('starting');
+    const replacement = Bun.spawn([process.execPath, script], { stdout: 'ignore', stderr: 'pipe', env: { ...process.env, REOPEN: '1' } });
+    child = replacement;
+    expect(await replacement.exited).toBe(0);
+    const recovered = JSON.parse(readFileSync(join(root, 'reopened'), 'utf8'));
+    expect(recovered).toHaveLength(1); expect(recovered[0][1].status).toBe('error');
+    expect(readFileSync(join(root, 'sessions.json'), 'utf8')).toBe(before);
+    // Permanent inode remains; takeover never deletes the lock or replays a prompt.
+  } finally { if (child && child.exitCode === null) { child.kill(); await child.exited; } rmSync(root, { recursive: true, force: true }); }
+}, 10000);
+
+test('真实并发启动仅一个写者；SIGKILL后多个候选仍仅一个；PID复用不影响内核锁', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sck-writer-contenders-'));
+  const source = new URL('../src/runner/native.ts', import.meta.url).pathname;
+  const script = join(root, 'contender.ts');
+  writeFileSync(script, `import { NativeRuntime } from ${JSON.stringify(source)};
+    import { writeFileSync, existsSync } from 'node:fs';
+    while (!existsSync(${JSON.stringify(join(root, 'go'))})) await Bun.sleep(5);
+    try {
+      const r = new NativeRuntime({ root: ${JSON.stringify(root)}, host: 'test', command: () => [], environment: async () => ({}) });
+      writeFileSync(${JSON.stringify(root)} + '/winner-' + process.pid, 'held');
+      setInterval(() => {}, 1000);
+    } catch { process.exit(17); }`);
+  const children: Array<ReturnType<typeof Bun.spawn>> = [];
+  const launch = () => { const p = Bun.spawn([process.execPath, script], { stdout: 'ignore', stderr: 'ignore' }); children.push(p); return p; };
+  try {
+    // Stale v2 metadata deliberately names a live unrelated process (simulated PID reuse).
+    // Kernel ownership, not this diagnostic PID, determines who may enter.
+    writeFileSync(join(root, 'writer.lock'), JSON.stringify({ version: 2, host: 'test', pid: process.pid }));
+    const first = Array.from({ length: 6 }, launch);
+    writeFileSync(join(root, 'go'), 'go');
+    await until(() => first.filter(p => p.exitCode !== null).length === 5);
+    const winner = first.find(p => p.exitCode === null)!;
+    expect(first.filter(p => existsSync(join(root, `winner-${p.pid}`)))).toHaveLength(1);
+    expect(first.filter(p => p.exitCode === 17)).toHaveLength(5);
+    const liveContender = launch(); expect(await liveContender.exited).toBe(17);
+    winner.kill('SIGKILL'); await winner.exited;
+    const next = Array.from({ length: 6 }, launch);
+    await until(() => next.filter(p => p.exitCode !== null).length === 5);
+    expect(next.filter(p => existsSync(join(root, `winner-${p.pid}`)))).toHaveLength(1);
+    expect(next.filter(p => p.exitCode === 17)).toHaveLength(5);
+  } finally {
+    for (const p of children) if (p.exitCode === null) p.kill('SIGKILL');
+    await Promise.all(children.map(p => p.exited)); rmSync(root, { recursive: true, force: true });
+  }
+}, 15000);
+
+test('旧锁迁移：活PID及损坏锁保守拒绝，实测已退出PID可接管', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sck-legacy-lock-'));
+  const options = { root, host: 'test', command: () => [], environment: async () => ({}) };
+  let runtime: NativeRuntime | undefined;
+  try {
+    writeFileSync(join(root, 'writer.lock'), JSON.stringify({ host: 'test', pid: process.pid }));
+    expect(() => new NativeRuntime(options)).toThrow('旧执行端仍存活');
+    writeFileSync(join(root, 'writer.lock'), '');
+    expect(() => new NativeRuntime(options)).toThrow('损坏');
+    const dead = Bun.spawn([process.execPath, '-e', 'process.exit(0)'], { stdout: 'ignore', stderr: 'ignore' }); await dead.exited;
+    writeFileSync(join(root, 'writer.lock'), JSON.stringify({ host: 'test', pid: dead.pid }));
+    runtime = new NativeRuntime(options);
+    expect(JSON.parse(readFileSync(join(root, 'writer.lock'), 'utf8')).version).toBe(2);
+    expect(() => new NativeRuntime(options)).toThrow('写锁已占用');
+    await runtime.close(); runtime = new NativeRuntime(options); await runtime.close();
+  } finally { await runtime?.close(); rmSync(root, { recursive: true, force: true }); }
+});

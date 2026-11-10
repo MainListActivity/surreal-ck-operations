@@ -886,6 +886,7 @@ export class SurrealCompanyCore implements CompanyCore {
       LET $t = SELECT * FROM ONLY $task;
       IF $who = NONE OR $who.revoked = true OR $t = NONE { THROW 'not found or revoked' };
       ${EMPLOYEE_WORKSPACE_SQL('$who', 'execute denied')}
+      IF $t.dispatch_attempt != NONE OR $who.dispatch_attempt != NONE { THROW 'dispatch outcome uncertain' };
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.state NOT IN ['ready', 'review', 'doing'] { THROW 'task not claimable' };
       IF $t.state = 'review' {
@@ -2113,7 +2114,17 @@ export class SurrealCompanyCore implements CompanyCore {
         LET $cpn = SELECT VALUE count() FROM audit WHERE task = $task AND action = 'checkpoint' AND actor = $actor GROUP ALL;
         IF ($cpn[0] ?? 0) >= $checkpoint_limit { THROW 'checkpoint limit reached' };
       };
+      // A legal result with this exact lease proof is stronger evidence than a lost send receipt.
+      // Settle isolation atomically with the result; the database event validates the transition.
+      IF $t.dispatch_attempt != NONE AND !$heartbeat AND !$checkpoint {
+        LET $attempt = SELECT * FROM ONLY $t.dispatch_attempt;
+        IF $attempt.state != 'pending' OR $attempt.employee != $employee OR $attempt.delivery != $delivery OR $attempt.fence != $fence OR $who.dispatch_attempt != $t.dispatch_attempt { THROW 'dispatch result conflict' };
+        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: $action, evidence: $evidence, version: $t.version + 1, at: time::now(), phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END };
+        UPDATE ONLY $t.dispatch_attempt SET result_confirmed = true,
+          result_action = $action, result_version = $t.version, result_audit = $audit, result_at = time::now();
+      };
       LET $next = UPDATE ONLY $task SET
+        dispatch_attempt = $t.dispatch_attempt,
         state = IF $submit { 'review' } ELSE IF $accept { 'done' } ELSE IF $returning { 'ready' } ELSE IF $block { 'blocked' } ELSE { $t.state },
         submitted_by = IF $submit THEN $employee ELSE $t.submitted_by END,
         current_employee = IF $heartbeat OR $checkpoint THEN $employee ELSE NONE END,
@@ -2153,7 +2164,7 @@ export class SurrealCompanyCore implements CompanyCore {
             evidence: '提交被退回，提议任务作废', version: $c.version + 1, at: time::now() };
         };
       };
-      IF !$heartbeat {
+      IF !$heartbeat AND ($t.dispatch_attempt = NONE OR $checkpoint) {
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: $action, evidence: $evidence, version: $next.version, at: time::now(), recovery_reason: $recovery_reason, phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END };
       };
       ${idem ? 'CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };' : ''}
@@ -2243,6 +2254,7 @@ export class SurrealCompanyCore implements CompanyCore {
       LET $who = SELECT * FROM ONLY $actor;
       LET $t = SELECT * FROM ONLY $task;
       IF $who = NONE OR $who.revoked = true OR $t = NONE { THROW 'not found or revoked' };
+      IF $t.dispatch_attempt != NONE { THROW 'dispatch outcome uncertain' };
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.lease_expires_at <= $now { THROW 'lease expired' };
       IF $t.current_employee != $employee OR $t.delivery_id != $delivery OR $t.fence != $fence OR $t.version != $expected { THROW 'stale lease or version' };
@@ -2623,6 +2635,7 @@ export class SurrealCompanyCore implements CompanyCore {
       LET $t = SELECT * FROM ONLY $task;
       IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'owner' { THROW 'retire denied' };
       IF $t = NONE { THROW 'task not found' };
+      IF $t.dispatch_attempt != NONE { THROW 'dispatch outcome uncertain' };
       IF $t.state IN ['done', 'void'] { THROW 'task already terminal' };
       IF $expected != NONE AND $t.version != $expected { THROW 'task version moved' };
       LET $next = UPDATE ONLY $task SET
@@ -2693,7 +2706,8 @@ export class SurrealCompanyCore implements CompanyCore {
         LET $t = SELECT * FROM ONLY $task;
         IF $t = NONE { THROW 'task not found' };
         IF $t.version != $expected { THROW 'task changed' };
-        IF $t.state != 'blocked' { THROW 'rebind denied: only blocked tasks can be rebound' };
+        IF $t.dispatch_attempt != NONE { THROW 'dispatch outcome uncertain' };
+      IF $t.state != 'blocked' { THROW 'rebind denied: only blocked tasks can be rebound' };
         IF $t.blocked_to = 'owner' { THROW 'rebind denied: owner blocked task' };
         IF $t.submitted_by != NONE { THROW 'rebind denied: task has submitted results' };
         IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'rebind denied: active lease' };

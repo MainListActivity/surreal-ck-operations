@@ -57,8 +57,9 @@ function fakeStore(draft: Record<string, unknown> | undefined, created: Array<Re
         // 模拟库里带有 lang 字段的新建草稿（例如 schema 默认值）。
         const row = { id: { id: 'fresh' }, task: { id: 't1' }, step: vars.step, role: vars.role, body: vars.body,
           state: 'draft', hold: false, created_at: 'now', ...(created[0] ?? {}) };
-        return [[row]];
+        draft = row; return [[row]];
       }
+      if (sql.includes('AS dispatch_revision')) return [draft ? [{ ...draft, dispatch_revision: 'fixture-token' }] : []];
       if (sql.includes('FROM agent_policy')) return [employeeLang ? [{ lang: employeeLang }] : []];
       if (sql.includes('AND step = $step AND state')) return [draft ? [draft] : []];
       if (sql.includes('SELECT executor_role')) return [[{ executor_role: 'engineering', reviewer_role: 'qa', kind: 'task', work_intent: { kind: 'code' } }]];

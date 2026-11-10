@@ -1,3 +1,4 @@
+import { outboundRevisionSql } from './outbound-revision.ts';
 /** 待发消息表：建单时为执行岗与复核岗各生成一条 draft；返工/催办在触发时生成。 */
 import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from './core-errors.ts';
@@ -21,6 +22,7 @@ export interface OutboundMessage {
   sentTo?: string;
   sentAt?: string;
   createdAt: string;
+  dispatchRevision?: string;
   /** 译文的语言；缺省即中文原文。员工默认语言在派工时写入（见 prepareSend）。 */
   lang?: string;
   /** 老板为这条消息选过语言（含选“原文”）：选过后不再套用员工默认语言。 */
@@ -42,15 +44,18 @@ const keyOf = (value: unknown): string => String((value as RecordId | undefined)
 /** A stored text field as a string, or undefined when the row has no value for it. */
 const textOf = (value: unknown): string | undefined => value === undefined || value === null ? undefined : String(value);
 
+const timestamp = (value: unknown): string | undefined => value instanceof Date ? value.toISOString() : textOf(value);
+
 const rowView = (row: Record<string, unknown>): OutboundMessage => ({
   id: String((row.id as RecordId).id ?? row.id), taskId: String((row.task as RecordId)?.id ?? row.task ?? ''),
   step: String(row.step) as MessageStep, role: String(row.role ?? ''), body: String(row.body ?? ''),
   state: (String(row.state ?? 'draft')) as MessageState, hold: row.hold === true,
   editedBy: row.edited_by === undefined || row.edited_by === null ? undefined : String(row.edited_by),
-  editedAt: row.edited_at === undefined || row.edited_at === null ? undefined : String(row.edited_at),
+  editedAt: timestamp(row.edited_at),
   sentTo: row.sent_to === undefined || row.sent_to === null ? undefined : String(row.sent_to),
-  sentAt: row.sent_at === undefined || row.sent_at === null ? undefined : String(row.sent_at),
-  createdAt: String(row.created_at ?? ''),
+  sentAt: timestamp(row.sent_at),
+  createdAt: timestamp(row.created_at) ?? '',
+  dispatchRevision: textOf(row.dispatch_revision),
   lang: textOf(row.lang),
   ...(row.lang_chosen === true ? { langChosen: true } : {}),
   translatedText: textOf(row.translated_text),
@@ -230,6 +235,12 @@ export class OutboundMessageStore {
     let draft = await this.latestDraft(taskId, step) ?? await this.seedDraft(taskId, step);
     if (draft.hold || draft.state === 'held') return null;
     draft = await this.stampLang(draft, employeeLang);
+    // Re-read payload + database-computed revision together after language alignment.
+    const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
+      `SELECT *, ${outboundRevisionSql()} AS dispatch_revision FROM $msg;`, { msg: this.message(draft.id) });
+    if (!rows?.[0]) return null;
+    draft = rowView(rows[0]);
+    if (draft.hold || draft.state !== 'draft') return null;
     const delivery = deliveryOf(draft, employeeLang);
     if (!delivery.ok) return null;
     return { body: delivery.body, message: { ...draft, sentTo: employeeId } };

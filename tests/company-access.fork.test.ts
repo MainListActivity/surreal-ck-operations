@@ -275,3 +275,50 @@ run('审计（库内）：只写参数与结果的摘要，原文不入库；没
   const stored = JSON.stringify(rows);
   for (const secret of ['客户资料原文', 'ABC-123', 'audit-key-1']) expect(stored).not.toContain(secret);
 });
+
+run('065 runner JWT：可读派工账本，但不能自造审批、改审批、伪造收尾回执；viewer只读', async () => {
+  const runner = await session(tokenFor('runner','dispatch-runner'));
+  const viewer = await session(tokenFor('viewer','dispatch-viewer',{rl:['Viewer']}));
+  await company.db.query("CREATE dispatch_attempt:jwt_fixture CONTENT {request:'jwt_fixture',state:'pending',employee:'synthetic',bodyHash:'hash'}; CREATE dispatch_recovery_approval:jwt_fixture CONTENT {request:'jwt_fixture',agent:'agent',action:'finalize_result',fingerprint:'hash',operation:'op',operator:'synthetic-owner',confirmation_ref:'synthetic-confirmation',expires_at:time::now()+5m};");
+  const [rows] = await runner.query<[unknown[]]>('SELECT id FROM dispatch_attempt WHERE id=dispatch_attempt:jwt_fixture;');
+  expect(rows).toHaveLength(1);
+  await rejects(runner.query("CREATE dispatch_recovery_approval:forged CONTENT {action:'finalize_result'};"), 'confirmed operator');
+  await rejects(runner.query("UPDATE dispatch_recovery_approval:jwt_fixture SET fingerprint='forged';"), 'confirmed operator');
+  await rejects(runner.query("UPDATE dispatch_recovery_approval:jwt_fixture SET used_by=dispatch_recovery_receipt:fake;"), 'lacks receipt');
+  await rejects(runner.query("CREATE dispatch_recovery_receipt:fake CONTENT {request:'jwt_fixture',approval:dispatch_recovery_approval:jwt_fixture};"), 'identity mismatch');
+  const read = await viewer.query('SELECT id FROM dispatch_attempt;'); expect(read).toBeDefined();
+  const denied = await viewer.query("UPDATE dispatch_attempt:jwt_fixture SET state='confirmed';").then(()=>false,()=>true);
+  const [[after]] = await company.db.query<[Array<{state:string}>]>("SELECT state FROM dispatch_attempt:jwt_fixture;");
+  expect(after!.state).toBe('pending'); // fork may silently filter Viewer writes rather than throw
+});
+
+run('065 runner JWT：真实core结果与审批CAS收尾、幂等重放成功，审批不可再次篡改', async () => {
+  const { LocalEnrollmentAdmin } = await import('../src/enrollment.ts');
+  const { SurrealCompanyCore } = await import('../src/core.ts');
+  const { Workforce } = await import('../src/workforce.ts');
+  const { inspectDispatchRecovery } = await import('../src/dispatch-recovery-inspection.ts');
+  const { finalizeApprovedDispatch } = await import('../src/dispatch-recovery-finalize.ts');
+  const { createHash, randomUUID } = await import('node:crypto');
+  const enrollment = new LocalEnrollmentAdmin(company);
+  const owner = await enrollment.enroll('jwt-recovery-owner','owner',['manage','execute','review']);
+  const employee = await enrollment.enroll('jwt-recovery-worker','engineering',['execute','review']);
+  const runner = await session(tokenFor('runner','recovery-runner'));
+  const database = {db:runner} as CompanyDatabase;
+  const core = new SurrealCompanyCore(database), wf = new Workforce(database);
+  const task = await core.createTask(owner,{title:'JWT recovery fixture',context:'Synthetic read task',executorRole:'engineering',reviewerRole:'qa',workIntent:{kind:'read'},idempotencyKey:randomUUID()});
+  const claim = await core.claim(employee,task.id);
+  const message = new RecordId('outbound_message','jwt_recovery_message');
+  await runner.query("CREATE $message CONTENT {task:$task,step:'execute',role:'engineering',body:'fixture',state:'draft',hold:false};",{message,task:new RecordId('task',task.id)});
+  const body='Synthetic JWT recovery body';
+  const request=await wf.beginDispatchAttempt({request:randomUUID(),employee:'jwt-recovery-worker',task:task.id,kind:'spawn',delivery:claim.deliveryId,fence:claim.fence,message:'jwt_recovery_message',body,bodyHash:createHash('sha256').update(body).digest('hex'),activationRequired:true});
+  await wf.acknowledgeDispatchAttempt(request,'jwt-recovery-agent');
+  await core.submit(employee,{taskId:task.id,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version},{text:'Synthetic real JWT result completed for manual bookkeeping test.',idempotencyKey:randomUUID()});
+  const report=await inspectDispatchRecovery(database,request);
+  const input={request,agent:'jwt-recovery-agent',approval:randomUUID(),operation:randomUUID(),fingerprint:report.fingerprint};
+  await company.db.query("CREATE $approval CONTENT {action:'finalize_result',request:$request,agent:$agent,fingerprint:$fingerprint,operation:$operation,operator:'synthetic-owner',confirmation_ref:'synthetic-explicit-confirmation',expires_at:time::now()+5m};",{...input,approval:new RecordId('dispatch_recovery_approval',input.approval)});
+  expect(await finalizeApprovedDispatch(database,input)).toMatchObject({request,action:'finalize_result'});
+  expect(await finalizeApprovedDispatch(database,input)).toMatchObject({request,action:'finalize_result'});
+  const [[result]] = await company.db.query<[Array<{state:string;sent_body:string}>]>('SELECT state,sent_body FROM $message;',{message});
+  expect(result).toMatchObject({state:'sent',sent_body:body});
+  await rejects(runner.query('UPDATE $approval SET used_by=NONE;',{approval:new RecordId('dispatch_recovery_approval',input.approval)}),'confirmed operator');
+});

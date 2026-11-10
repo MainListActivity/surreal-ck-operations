@@ -83,6 +83,7 @@ export class OwnerDesk {
     const rows = await this.run(`BEGIN;
       LET $t = SELECT * FROM ONLY $task;
       IF $t = NONE { THROW 'task not found' };
+      IF $t.dispatch_attempt != NONE { THROW 'dispatch outcome uncertain' };
       IF $expected_version != NONE AND $t.version != $expected_version { THROW 'task version moved' };
       IF $decision IN ['approve', 'reject'] AND ($t.state != 'review' OR $t.reviewer_role != 'owner') { THROW 'task is not awaiting owner review' };
       IF $decision = 'reply' AND ($t.state != 'blocked' OR $t.blocked_to != 'owner') { THROW 'task is not waiting for an owner answer' };
@@ -143,6 +144,7 @@ export class OwnerDesk {
     const rows = await this.run(`BEGIN;
       LET $t = SELECT * FROM ONLY $task;
       IF $t = NONE { THROW 'task not found' };
+      IF $t.dispatch_attempt != NONE { THROW 'dispatch outcome uncertain' };
       IF $t.version != $expected { THROW 'task version moved' };
       IF $t.state NOT IN ['blocked', 'ready'] OR $t.submitted_by != NONE { THROW 'task is not awaiting start' };
       IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'task is not awaiting start: active lease' };
@@ -175,6 +177,7 @@ export class OwnerDesk {
     const rows = await this.run(`BEGIN;
       LET $t = SELECT * FROM ONLY $task;
       IF $t = NONE { THROW 'task not found' };
+      IF $t.dispatch_attempt != NONE { THROW 'dispatch outcome uncertain' };
       IF $t.state IN ['done', 'void'] { THROW 'task is not awaiting: already terminal' };
       LET $next = UPDATE ONLY $task SET state = 'void', blocked_to = NONE, resume_role = NONE, resume_state = NONE,
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE, version = $t.version + 1 RETURN AFTER;

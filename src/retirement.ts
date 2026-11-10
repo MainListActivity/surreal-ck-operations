@@ -128,6 +128,8 @@ export async function gateCredentialChange(db: Surreal, employeeId: string, chan
 /** One transaction: the relations and versions must still be the decided ones, then the credential change is written. */
 async function writeGuarded(db: Surreal, employeeId: string, candidates: readonly RetirementCandidate[], change: CredentialChange): Promise<void> {
   const responses = await db.query<unknown[]>(`BEGIN TRANSACTION;
+    LET $actor = SELECT * FROM ONLY $employee;
+    IF $actor.dispatch_attempt != NONE { THROW 'dispatch outcome uncertain: cannot retire' };
     LET $live = SELECT VALUE id FROM task WHERE state NOT IN $finished AND current_employee = $key;
     IF array::len($live) != $expected OR array::len(array::complement($live, $ids)) > 0 { THROW 'retire moved: task set changed' };
     FOR $c IN $candidates {

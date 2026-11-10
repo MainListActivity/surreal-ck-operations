@@ -1,3 +1,5 @@
+import { dispatchFinalizationSql } from './dispatch-finalization.ts';
+import { outboundRevisionSql } from './outbound-revision.ts';
 import { FaultStore } from './fault-store.ts';
 import { laneOf } from './lane-notes.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
@@ -581,6 +583,110 @@ export class Workforce {
     await this.retire(inst.id, '连续观测空闲超过配置时长，正常回收会话', 'rotation', inst);
   }
 
+  /** Atomically fence task + employee before an external call; request identity is caller-owned. */
+  async beginDispatchAttempt(input: { request: string; employee: string; task?: string; kind: 'send' | 'spawn'; agent?: string;
+    delivery?: string; fence?: number; message?: string; bodyHash: string; body: string; messageRevision?: string; activationRequired?: boolean;
+    binding?: { cwd: string; repoHome: string; model: string; workspaceScope?: string; paseoWorkspace?: string } }): Promise<string> {
+    if (!input.task || !input.delivery || !input.fence || !input.message) throw new Error('dispatch requires lease and message identity');
+    const { body, ...snapshot } = input;
+    await this.db.query(`BEGIN;
+      LET $t = SELECT * FROM ONLY $task;
+      LET $e = SELECT * FROM ONLY $employee;
+      IF $t = NONE OR $e = NONE OR $e.retired = true OR $e.revoked = true { THROW 'dispatch actor unavailable' };
+      IF $t.current_employee != $key OR $t.delivery_id != $delivery OR $t.fence != $fence OR $t.lease_expires_at <= time::unix(time::now()) { THROW 'dispatch lease changed' };
+      IF $t.dispatch_attempt != NONE OR $e.dispatch_attempt != NONE { THROW 'dispatch already isolated' };
+      LET $msg = SELECT * FROM ONLY $message;
+      IF $msg = NONE OR $msg.task != $task OR $msg.state = 'sent' OR $msg.hold = true OR $msg.dispatch_attempt != NONE { THROW 'dispatch message changed' };
+      IF $input.messageRevision != NONE AND ${outboundRevisionSql('$msg.')} != $input.messageRevision { THROW 'dispatch message revision changed' };
+      CREATE $attempt CONTENT $input;
+      UPDATE ONLY $message SET dispatch_attempt = $attempt, dispatch_body = $body;
+      UPDATE ONLY $task SET dispatch_attempt = $attempt;
+      UPDATE ONLY $employee SET dispatch_attempt = $attempt;
+      COMMIT;`, { task: id('task', input.task), employee: id('employee', input.employee), key: input.employee,
+      delivery: input.delivery, fence: input.fence, attempt: id('dispatch_attempt', input.request),
+      message: id('outbound_message', input.message), body,
+      input: { ...snapshot, state: 'pending', revision: 0, created_at: new Date() } });
+    return input.request;
+  }
+
+  /** Agent identity is a session receipt, not proof of receipt of this exact prompt. */
+  async acknowledgeDispatchAttempt(attempt: string, agent: string): Promise<void> {
+    await this.db.query(`BEGIN;
+      LET $a = SELECT * FROM ONLY $attempt;
+      IF $a = NONE OR $a.state != 'pending' OR $a.revision != 0 OR ($a.agent != NONE AND $a.agent != $agent) { THROW 'dispatch receipt conflict' };
+      UPDATE ONLY $attempt SET agent = $agent, revision = $a.revision + 1, acknowledged_at = time::now();
+      COMMIT;`, { attempt: id('dispatch_attempt', attempt), agent });
+  }
+
+  /** Persist the activation boundary and establish identity while all barriers remain held. */
+  async prepareDispatchActivation(attempt: string, agent: string): Promise<void> {
+    await this.db.query(`BEGIN;
+      LET $a = SELECT * FROM ONLY $attempt;
+      LET $task = type::record('task', $a.task);
+      LET $employee = type::record('employee', $a.employee);
+      LET $t = SELECT * FROM ONLY $task;
+      LET $e = SELECT * FROM ONLY $employee;
+      IF $a.state != 'pending' OR $a.revision != 1 OR $a.agent != $agent OR $a.activationRequired != true OR $a.activation_state != NONE { THROW 'dispatch activation conflict' };
+      IF $t.dispatch_attempt != $attempt OR $e.dispatch_attempt != $attempt OR $e.retired = true OR $e.revoked = true OR ($e.paseo_agent_id != NONE AND $e.paseo_agent_id != $agent) { THROW 'dispatch activation generation changed' };
+      IF $t.current_employee != $a.employee OR $t.delivery_id != $a.delivery OR $t.fence != $a.fence { THROW 'dispatch activation lease changed' };
+      UPDATE ONLY $employee SET paseo_agent_id = $agent,
+        workspace_cwd = $a.binding.cwd ?? workspace_cwd, workspace_repo = $a.binding.repoHome ?? workspace_repo,
+        workspace_scope = $a.binding.workspaceScope ?? workspace_scope, paseo_workspace = $a.binding.paseoWorkspace ?? paseo_workspace,
+        model = $a.binding.model ?? model;
+      UPDATE ONLY $task SET lease_expires_at = math::max([$t.lease_expires_at ?? 0, time::unix(time::now()) + 600]);
+      UPDATE ONLY $attempt SET activation_state = 'calling', activation_at = time::now();
+      COMMIT;`, { attempt: id('dispatch_attempt', attempt), agent });
+  }
+
+  async confirmDispatchActivation(attempt: string, agent: string): Promise<void> {
+    await this.db.query(`BEGIN;
+      LET $a = SELECT * FROM ONLY $attempt;
+      IF $a.state != 'pending' OR $a.agent != $agent OR $a.activation_state != 'calling' { THROW 'dispatch activation receipt conflict' };
+      UPDATE ONLY $attempt SET activation_state = 'activated';
+      COMMIT;`, { attempt: id('dispatch_attempt', attempt), agent });
+  }
+
+  /** The only dispatch finalizer: all database side effects and barrier removal share one CAS. */
+  async finishDispatchAttempt(attempt: string, agent: string): Promise<void> {
+    await this.db.query(`BEGIN; ${dispatchFinalizationSql} COMMIT;`, { attempt: id('dispatch_attempt', attempt), agent });
+  }
+
+  async pendingDispatchAttempts(): Promise<Array<{ id: string; employee: string; task?: string; kind: string; agent?: string; revision?: number; result_confirmed?: boolean; activationRequired?: boolean; activation_state?: string }>> {
+    const [rows] = await this.db.query<[Array<{ id: RecordId; employee: string; task?: string; kind: string; agent?: string; revision?: number; result_confirmed?: boolean; activationRequired?: boolean; activation_state?: string }>]>(
+      "SELECT * FROM dispatch_attempt WHERE state = 'pending';");
+    return rows.map(row => ({ ...row, id: asId(row.id) }));
+  }
+
+  /** Restore only a known receipt under the same lease proof. Never sends or clears uncertainty. */
+  async recoverDispatchBindings(): Promise<string[]> {
+    const errors: string[] = [];
+    for (const attempt of await this.pendingDispatchAttempts()) {
+      try {
+        if (attempt.agent && (attempt.revision === 1 || attempt.result_confirmed) && (!attempt.activationRequired || attempt.activation_state === 'activated' || attempt.result_confirmed)) {
+          await this.finishDispatchAttempt(attempt.id, attempt.agent);
+          continue;
+        }
+        if (attempt.result_confirmed) { errors.push(`${attempt.id}: result confirmed; runtime agent receipt missing`); continue; }
+        await this.db.query(`BEGIN;
+        LET $a = SELECT * FROM ONLY $attempt;
+        LET $task = type::record('task', $a.task);
+        LET $employee = type::record('employee', $a.employee);
+        LET $t = SELECT * FROM ONLY $task;
+        LET $e = SELECT * FROM ONLY $employee;
+        IF $a.state != 'pending' OR $t.dispatch_attempt != $attempt OR $e.dispatch_attempt != $attempt { THROW 'dispatch recovery moved' };
+        IF $e.retired = true OR $e.revoked = true OR ($a.agent != NONE AND $e.paseo_agent_id != NONE AND $e.paseo_agent_id != $a.agent) { THROW 'dispatch recovery actor changed' };
+        IF $t.current_employee != $a.employee OR $t.delivery_id != $a.delivery OR $t.fence != $a.fence OR $t.state NOT IN ['doing', 'review'] { THROW 'dispatch recovery lease changed' };
+        IF $a.agent != NONE { UPDATE ONLY $employee SET paseo_agent_id = $a.agent,
+          workspace_cwd = $a.binding.cwd ?? workspace_cwd, workspace_repo = $a.binding.repoHome ?? workspace_repo,
+          workspace_scope = $a.binding.workspaceScope ?? workspace_scope, paseo_workspace = $a.binding.paseoWorkspace ?? paseo_workspace,
+          model = $a.binding.model ?? model; };
+        UPDATE ONLY $task SET lease_expires_at = math::max([$t.lease_expires_at ?? 0, time::unix(time::now()) + 300]);
+        COMMIT;`, { attempt: id('dispatch_attempt', attempt.id) });
+      } catch (error) { errors.push(`${attempt.id}: ${(error as Error).message}`); }
+    }
+    return errors;
+  }
+
   async touchWake(employeeId: string): Promise<void> {
     await this.db.query('UPDATE $e SET last_wake_at = time::unix(time::now()), idle_since = NONE, runtime_sleep_requested_at = NONE, v3_onboarded = true, wake_count = (wake_count ?? 0) + 1;',
       { e: id('employee', employeeId) });
@@ -723,6 +829,7 @@ export class Workforce {
     const responses = await this.db.query<unknown[]>(`BEGIN;
       LET $t = SELECT * FROM ONLY $task;
       IF $t = NONE OR $t.current_employee != $employee { THROW 'lease changed' };
+      IF $t.dispatch_attempt != NONE { THROW 'dispatch outcome uncertain' };
       LET $next = UPDATE ONLY $task SET
         state = IF $t.state = 'doing' THEN 'ready' ELSE $t.state END,
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
