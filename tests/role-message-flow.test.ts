@@ -25,7 +25,7 @@ test('owner token is created 0600 and stable; a missing Authorization header is 
 test('report_blocker entries route only to owner', () => {
   const schema = readFileSync(join(import.meta.dir, '..', 'schema/051-role-message-flow.surql'), 'utf8');
   expect(schema).toContain("blocked_to = 'owner'");
-  const sidecar = readFileSync(join(import.meta.dir, '..', 'plugin/server/sidecar.ts'), 'utf8');
+  const sidecar = readFileSync(join(import.meta.dir, '..', 'src/runner/sidecar.ts'), 'utf8');
   expect(sidecar).toContain('args.to === "owner" ? "owner" : "owner"');
 });
 

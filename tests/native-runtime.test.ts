@@ -1,0 +1,165 @@
+import { expect, test } from 'bun:test';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { NativeRuntime, nativeArgs, parseNativeResult, type NativeOptions } from '../src/runner/native.ts';
+import type { SpawnInput, TurnEnded } from '../src/runner/contracts.ts';
+
+const input = (provider = 'factory-droid'): SpawnInput => ({ title: 'SCK · fixture', provider, model: 'fixture-model',
+  cwd: tmpdir(), workspaceTitle: 'fixture', labels: { employee_id: 'fixture' }, env: { SECRET: 'never-persist-this' }, prompt: '你好 $(no-shell) `no-exec`' });
+const until = async (fn: () => boolean | Promise<boolean>) => {
+  for (let i = 0; i < 300; i++) { if (await fn()) return; await Bun.sleep(10); }
+  throw new Error('fixture timeout');
+};
+function fixture(code: string, options: Partial<NativeOptions> = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'sck-native-'));
+  const script = join(root, 'fixture.cjs');
+  writeFileSync(script, code);
+  const events: TurnEnded[] = [];
+  const runtime = new NativeRuntime({ root, host: 'test', command: () => [process.execPath, script],
+    environment: async () => ({ PATH: process.env.PATH ?? '', FIXTURE_ROOT: root }),
+    onEnded: async event => { events.push(event); }, stopGraceMs: 25, ...options });
+  return { runtime, root, events, async close() { await runtime.close(); rmSync(root, { recursive: true, force: true }); } };
+}
+const success = `let prompt = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', s => prompt += s);
+process.stdin.on('end', () => {
+ require('fs').writeFileSync(process.env.FIXTURE_ROOT + '/received.json', JSON.stringify({ argv: process.argv.slice(2), prompt }));
+ console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, session_id: 'native-session', result: '完成', usage: { input_tokens: 7 } }));
+});`;
+
+test('原生 CLI 首轮在绑定后激活；prompt 走 stdin，续跑固定 session，凭证不入持久状态', async () => {
+  const f = fixture(success);
+  try {
+    const id = await f.runtime.spawn(input());
+    expect((await f.runtime.status(id))?.status).toBe('running');
+    expect(f.events).toHaveLength(0);
+    await f.runtime.activate(id);
+    await until(() => f.events.length === 1);
+    expect(f.events[0]?.outcome.kind).toBe('completed');
+    expect(await f.runtime.lastInputTokens(id)).toBe(7);
+    const first = JSON.parse(readFileSync(join(f.root, 'received.json'), 'utf8'));
+    expect(first.prompt).toBe(input().prompt);
+    expect(first.argv).not.toContain(input().prompt);
+    await f.runtime.send(id, '继续');
+    await until(() => f.events.length === 2);
+    expect(JSON.parse(readFileSync(join(f.root, 'received.json'), 'utf8')).argv).toContain('--session-id');
+    const state = readFileSync(join(f.root, 'sessions.json'), 'utf8');
+    expect(state).toContain('native-session');
+    expect(state).not.toContain('never-persist-this');
+    expect(state).not.toContain(input().prompt);
+    expect(f.events[0]!.turnId).not.toBe(f.events[1]!.turnId);
+  } finally { await f.close(); }
+});
+
+for (const [name, output, exit] of [
+  ['空输出', '', 0], ['普通文本', 'looks done', 0],
+  ['供应商失败', JSON.stringify({ type: 'result', subtype: 'error', is_error: true, result: '429 usage cap reached' }), 0],
+  ['缺少会话标识', JSON.stringify({ type: 'result', subtype: 'success', is_error: false }), 0],
+  ['非零退出', JSON.stringify({ type: 'result', subtype: 'success', is_error: false, session_id: 's' }), 1],
+] as const) test(`不能把${name}判为成功`, async () => {
+  const f = fixture(`process.stdin.resume(); process.stdin.on('end', () => { process.stdout.write(${JSON.stringify(output)}); process.exitCode = ${exit}; });`);
+  try { const id = await f.runtime.spawn(input()); await f.runtime.activate(id); await until(() => f.events.length === 1);
+    expect(f.events[0]?.outcome.kind).toBe('failed'); expect((await f.runtime.status(id))?.status).toBe('error');
+  } finally { await f.close(); }
+});
+
+test('同一会话拒绝并发发送；stop 强制结束不响应 TERM 的进程且只产生一次取消事件', async () => {
+  const f = fixture(`process.on('SIGTERM', () => {}); require('fs').writeFileSync(process.env.FIXTURE_ROOT + '/ready', 'ready'); process.stdin.resume(); setInterval(() => {}, 1000);`);
+  try {
+    const id = await f.runtime.spawn(input()); await f.runtime.activate(id);
+    await until(() => existsSync(join(f.root, 'ready')));
+    await expect(f.runtime.send(id, 'duplicate')).rejects.toThrow('不可发送');
+    await f.runtime.stop(id); expect(f.events).toHaveLength(1); expect(f.events[0]?.outcome.kind).toBe('canceled');
+    expect((await f.runtime.status(id))?.status).not.toBe('running');
+  } finally { await f.close(); }
+});
+
+test('一个节点只允许一个写者；正常退出后重新加载会话可续跑', async () => {
+  const f = fixture(success);
+  let replacement: NativeRuntime | undefined;
+  try {
+    expect(() => new NativeRuntime({ root: f.root, host: 'test', command: () => [], environment: async () => ({}) })).toThrow();
+    const id = await f.runtime.spawn(input()); await f.runtime.activate(id); await until(() => f.events.length === 1);
+    await f.runtime.close();
+    replacement = new NativeRuntime({ root: f.root, host: 'test', command: () => [process.execPath, join(f.root, 'fixture.cjs')],
+      environment: async () => ({ FIXTURE_ROOT: f.root }) });
+    expect(replacement.describe(id)?.nativeSessionId).toBe('native-session');
+    await replacement.send(id, 'after restart');
+    await until(async () => (await replacement!.status(id))?.status === 'idle');
+  } finally { await replacement?.close(); await f.close(); }
+});
+
+test('崩溃后仍存活的原进程标记 unknown，拒绝重载和重复发送', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sck-native-orphan-'));
+  writeFileSync(join(root, 'sessions.json'), JSON.stringify({ version: 1, host: 'test', workspaces: [], sessions: [{
+    id: 'orphan', host: 'test', provider: 'factory-droid', status: 'running', pid: process.pid, nativeSessionId: 's', labels: {},
+  }] }));
+  const runtime = new NativeRuntime({ root, host: 'test', command: () => [], environment: async () => ({}) });
+  try { expect((await runtime.status('orphan'))?.status).toBe('unknown');
+    await expect(runtime.reload('orphan')).rejects.toThrow(); await expect(runtime.send('orphan', 'duplicate')).rejects.toThrow();
+  } finally { await runtime.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('输出超限杀掉进程并报错；关闭执行端不触发派工收尾', async () => {
+  const f = fixture(`process.stdin.resume(); process.stdin.on('end', () => process.stdout.write('x'.repeat(2000)));`, { maxOutputBytes: 30 });
+  try { const id = await f.runtime.spawn(input()); await f.runtime.activate(id); await until(() => f.events.length === 1);
+    expect(await f.runtime.lastError(id)).toContain('超过限制');
+  } finally { await f.close(); }
+  const g = fixture(`process.stdin.resume(); setInterval(() => {}, 1000);`);
+  try { const id = await g.runtime.spawn(input()); await g.runtime.activate(id); await g.runtime.close(); expect(g.events).toHaveLength(0); }
+  finally { await g.close(); }
+});
+
+test('不存在的 CLI 路径返回启动失败并退出 running', async () => {
+  const f = fixture('', { command: () => ['/nonexistent/sck-fixture'] });
+  try { const id = await f.runtime.spawn(input()); await expect(f.runtime.activate(id)).rejects.toThrow();
+    await until(() => f.events.length === 1); expect((await f.runtime.status(id))?.status).toBe('error');
+  } finally { await f.close(); }
+});
+
+test('Claude 与 Codex 使用原生明确续跑参数，Codex 只接受正式终态', () => {
+  expect(nativeArgs({ provider: 'claude', model: 'm', nativeSessionId: 'session' })).toEqual(['-p', '--output-format', 'json', '--model', 'm', '--resume', 'session']);
+  expect(nativeArgs({ provider: 'codex', model: 'm', nativeSessionId: 'session' }).slice(0, 4)).toEqual(['exec', 'resume', 'session', '--json']);
+  const lines = [{ type: 'thread.started', thread_id: 's' }, { type: 'item.completed', item: { type: 'agent_message', text: 'done' } }];
+  expect(parseNativeResult('codex', lines.map(value => JSON.stringify(value)).join('\n')).completed).toBe(false);
+  const done = [...lines, { type: 'turn.completed', usage: { input_tokens: 9 } }].map(value => JSON.stringify(value)).join('\n');
+  expect(parseNativeResult('codex', done)).toMatchObject({ completed: true, sessionId: 's', inputTokens: 9 });
+  expect(parseNativeResult('codex', done + '\n' + JSON.stringify({ type: 'turn.failed', error: { message: 'failure' } })).completed).toBe(false);
+});
+
+test('业务收尾完成前保持忙碌，关闭等待收尾后才释放节点写锁', async () => {
+  let finish!: () => void, entered = false;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  const f = fixture(success, { onEnded: async () => { entered = true; await gate; } });
+  try {
+    const id = await f.runtime.spawn(input()); await f.runtime.activate(id); await until(() => entered);
+    expect((await f.runtime.status(id))?.status).toBe('running');
+    let closed = false;
+    const stopping = f.runtime.close().then(() => { closed = true; });
+    await Bun.sleep(10); expect(closed).toBe(false);
+    finish(); await stopping; expect(closed).toBe(true);
+  } finally { finish(); await f.close(); }
+});
+
+test('环境解析期间停止不会留下迟到启动的进程', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const f = fixture(success, { environment: async () => { await gate; return {}; } });
+  try {
+    const id = await f.runtime.spawn(input());
+    const starting = f.runtime.activate(id);
+    const result = starting.then(() => undefined, error => error as Error);
+    const stopping = f.runtime.close();
+    release(); expect((await result)?.message).toContain('正在关闭'); await stopping;
+    expect(f.events).toHaveLength(0);
+  } finally { release(); await f.close(); }
+});
+
+ test('Claude verbose JSON 数组只以最后的正式 result 判断完成', () => {
+  const result = { type: 'result', subtype: 'success', is_error: false, session_id: 'real-session', result: 'done' };
+  expect(parseNativeResult('claude', JSON.stringify([{ type: 'system' }, result]))).toMatchObject({ completed: true, sessionId: 'real-session', text: 'done' });
+  expect(parseNativeResult('claude', JSON.stringify([result, { type: 'assistant' }])).completed).toBe(false);
+  expect(parseNativeResult('claude', '[]').completed).toBe(false);
+  expect(nativeArgs({ provider: 'codex', model: '' })).toContain('--skip-git-repo-check');
+  expect(nativeArgs({ provider: 'codex', model: '', nativeSessionId: 'resumed' })).toContain('--skip-git-repo-check');
+});

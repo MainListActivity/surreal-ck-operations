@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SidecarPool } from '../plugin/server/sidecar.ts';
+import { SidecarPool } from '../src/runner/sidecar.ts';
 import { commDir, reqDir, resDir, readJsonFile } from '../src/comm.ts';
 import type { ActiveLease, ClaimResult, LeaseProof, TaskView } from '../src/contracts.ts';
 import type { EmployeeInst, SupervisedTask } from '../src/workforce.ts';
@@ -42,7 +42,7 @@ let samplerCalls = 0;
 let collectorCalls = 0;
 /** The options the sidecar handed the collector on the last authorized sample. */
 let lastCollectorOptions: unknown;
-mock.module('../plugin/server/runtime-diagnostics.ts', () => ({
+mock.module('../src/runner/runtime-diagnostics.ts', () => ({
   collectPluginRuntimeDiagnostics: (options: unknown) => {
     collectorCalls++;
     lastCollectorOptions = options;

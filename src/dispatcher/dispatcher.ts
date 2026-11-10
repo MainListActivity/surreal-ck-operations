@@ -1856,6 +1856,7 @@ export class Dispatcher {
         const cwd = spawnCwd;
         await wf.bind(inst.id, { agentId, cwd, repoHome, model, workspaceScope, paseoWorkspace: container.workspaceId });
         sidecar?.bindAgent(inst.id, agentId);
+        await paseo.activate?.(agentId);
         const bound = { ...inst, paseoAgentId: agentId, cwd, repoHome, model, workspaceScope, paseoWorkspace: container.workspaceId };
         const prior = insts.findIndex(row => row.id === inst.id);
         if (prior >= 0) insts[prior] = bound; else insts.push(bound);

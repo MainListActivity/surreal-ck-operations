@@ -34,27 +34,11 @@ function registry() {
   return {surfaces, sidebar, panels, commands, timelines};
 }
 
-test('company owns exactly one sidebar entry and keeps the per-agent usage and history panels', () => {
+test('公司插件不再注册页面、面板或导航，老板工作流使用云端网页', () => {
   const r = registry();
-  expect(r.sidebar.map(({id, title, surface}) => ({id, title, surface})))
-    .toEqual([{id: 'company', title: '公司', surface: 'company'}]);
-  expect(r.panels.map(p => p.id).sort()).toEqual(['agent-model-metrics', 'employee-history']);
-  // The model switch and model metrics timelines went with the model ranking and scoring: none is registered now.
+  expect(r.surfaces.size).toBe(0);
+  expect(r.sidebar).toEqual([]);
+  expect(r.panels).toEqual([]);
+  expect(r.commands).toEqual([]);
   expect(r.timelines).toEqual([]);
-});
-
-test('legacy routes and global shortcuts open the same company workbench at the relevant section', () => {
-  const r = registry(), props = {host: {id: 'test-host'}, layout: {compact: true}, theme: {}};
-  for (const [id, tab, command] of [
-    ['employee-history', 'history', 'employee-history-global'],
-    ['magpie-usage', 'usage', 'open-magpie-usage'],
-  ]) {
-    const element = r.surfaces.get(id)(props);
-    expect(element.type).toBe(r.surfaces.get('company'));
-    expect(element.props.initialTab).toBe(tab);
-    expect(element.props.host).toBe(props.host);
-    const opened: string[] = [];
-    r.commands.find(c => c.id === command).onSelect({openSurface: (target: string) => opened.push(target)});
-    expect(opened).toEqual([id]);
-  }
 });

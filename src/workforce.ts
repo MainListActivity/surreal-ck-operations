@@ -310,7 +310,8 @@ export class Workforce {
    * write, so a test can land a claim or takeover in exactly that window.
    */
   constructor(private readonly database: CompanyDatabase,
-    private readonly retirementHook?: (employeeId: string) => Promise<void>) {
+    private readonly retirementHook?: (employeeId: string) => Promise<void>,
+    private readonly runner?: { id: string; adoptLegacy?: boolean }) {
     this.enrollment = new LocalEnrollmentAdmin(database);
   }
   private get db() { return this.database.db; }
@@ -413,7 +414,8 @@ export class Workforce {
       paseo_agent_id?: string; active_task?: RecordId; last_wake_at?: number; idle_since?: number; runtime_sleep_requested_at?: number;
       v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; workspace_scope?: string; paseo_workspace?: string; wake_count?: number; lane?: string; last_task?: RecordId; last_phase?: 'execute' | 'review'; session_task?: string };
     const [rows] = await this.db.query<[Row[]]>(
-      'SELECT * FROM employee WHERE revoked != true AND retired != true AND (def != NONE OR paseo_agent_id != NONE) ORDER BY id;');
+      `SELECT * FROM employee WHERE revoked != true AND retired != true AND (def != NONE OR paseo_agent_id != NONE)${this.runner ? ' AND (runner_id = $runner OR ($legacy AND runner_id = NONE))' : ''} ORDER BY id;`,
+      this.runner ? { runner: this.runner.id, legacy: this.runner.adoptLegacy === true } : {});
     return rows.map(r => ({ id: asId(r.id), role: r.role, def: r.def ? asId(r.def) : undefined, provider: r.provider,
       model: r.model, thinking: r.thinking, paseoAgentId: r.paseo_agent_id ?? undefined,
       activeTask: r.active_task ? asId(r.active_task) : undefined, lastWakeAt: r.last_wake_at, idleSince: r.idle_since, runtimeSleepRequestedAt: r.runtime_sleep_requested_at,
@@ -477,9 +479,9 @@ export class Workforce {
     const employeeId = `${def.id}-${randomBytes(3).toString('hex')}`;
     const credential = await this.enrollment.enroll(employeeId, def.role, capabilitiesFor(def.role));
     await this.db.query(`UPDATE $e MERGE { def: $def, provider: $provider, model: $model, thinking: $thinking,
-      retired: false, workspace_repo: $repo_home, workspace_scope: $scope, session_task: $session_task, created_at: time::now() };`, {
+      retired: false, runner_id: $runner, workspace_repo: $repo_home, workspace_scope: $scope, session_task: $session_task, created_at: time::now() };`, {
       e: id('employee', employeeId), def: id('employee_def', def.id), provider: def.provider, model: def.model,
-      thinking: def.thinking, repo_home: repoHome, scope: workspaceScope, session_task: sessionTask,
+      thinking: def.thinking, repo_home: repoHome, scope: workspaceScope, session_task: sessionTask, runner: this.runner?.id,
     });
     return { repoHome, workspaceScope, id: employeeId, role: def.role, def: def.id, provider: def.provider, model: def.model, thinking: def.thinking, credential, sessionTask };
   }
@@ -630,7 +632,8 @@ export class Workforce {
     // channel carrying it would stall every other query behind megabytes of backlog.
     const [rows] = await this.db.query<[TaskRow[]]>(
       `SELECT *, NONE AS context, code_repo_path ?? project.repo_path ?? goal.project.repo_path AS repo_path, goal.tier AS goal_tier, goal.title AS goal_title
-       FROM task WHERE state IN ['ready', 'doing', 'review', 'blocked'] ORDER BY created_at, id;`);
+       FROM task WHERE state IN ['ready', 'doing', 'review', 'blocked']${this.runner ? ' AND (current_employee = NONE OR current_employee IN (SELECT VALUE record::id(id) FROM employee WHERE runner_id = $runner OR ($legacy AND runner_id = NONE)))' : ''} ORDER BY created_at, id;`,
+      this.runner ? { runner: this.runner.id, legacy: this.runner.adoptLegacy === true } : {});
     return rows.map(supervised);
   }
 

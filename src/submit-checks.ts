@@ -29,7 +29,7 @@ export const runProcess: Runner = (cmd, args, opts) => new Promise(resolve => {
 const SOURCE = /^(src|plugin\/server|plugin\/client|scripts)\//;
 /** Sidecar tools answered through its own lease path instead of a dispatch `case`. */
 const SIDECAR_NATIVE = new Set(['claim_next', 'heartbeat']);
-const SIDECAR = 'plugin/server/sidecar.ts';
+const SIDECAR = 'src/runner/sidecar.ts';
 
 const version = (text: string | undefined): string | undefined => {
   try { const v = JSON.parse(text ?? '').version; return typeof v === 'string' ? v : undefined; } catch { return undefined; }

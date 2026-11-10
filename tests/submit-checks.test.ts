@@ -50,13 +50,13 @@ test('a code change that does not raise the version is refused; docs-only change
 
 test('tool wiring names sidecar tools missing from dispatch and test lists naming missing files', () => {
   const root = repo('1.0.0');
-  write(root, 'plugin/server/sidecar.ts', 'const BASE_TOOLS = [\n  "alpha", // comment "ignored"\n  "beta",\n];\nswitch (x) { case "alpha": break; }');
+  write(root, 'src/runner/sidecar.ts', 'const BASE_TOOLS = [\n  "alpha", // comment "ignored"\n  "beta",\n];\nswitch (x) { case "alpha": break; }');
   write(root, 'package.json', JSON.stringify({ version: '1.0.0', scripts: { test: 'bun test tests/a.test.ts tests/gone.test.ts' } }));
   expect(wiringProblems(root)).toEqual([
     'sidecar 工具未接到分发：beta',
     'package.json 测试脚本引用了不存在的文件：tests/gone.test.ts',
   ]);
-  write(root, 'plugin/server/sidecar.ts', 'switch (x) { case "alpha": break; case "beta": break; }\nconst BASE_TOOLS = ["alpha"];');
+  write(root, 'src/runner/sidecar.ts', 'switch (x) { case "alpha": break; case "beta": break; }\nconst BASE_TOOLS = ["alpha"];');
   expect(wiringProblems(root)).toContain('sidecar 分发了未列入工具表的工具：beta');
 });
 
