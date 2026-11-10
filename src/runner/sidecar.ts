@@ -738,6 +738,13 @@ export class SidecarPool {
     return live?.taskId === taskId && (!deliveryId || live.proof.deliveryId === deliveryId);
   }
 
+  /** A captured result must finish its fenced write before lease supervision can retry the work. */
+  hasPendingResult(instId: string, taskId: string, deliveryId?: string): boolean {
+    const delivery = deliveryId ?? this.claims.get(instId)?.proof.deliveryId;
+    const row = delivery ? this.journal?.read(instId, delivery) : undefined;
+    return !!row && row.task === taskId && ['collecting', 'pending'].includes(row.state);
+  }
+
   /**
    * The lease was ended elsewhere (dispatcher revoked it server-side, or the task
    * moved on): drop the matching local claim so the instance can claim again.

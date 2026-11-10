@@ -158,58 +158,41 @@ run('B2 (SYS-DISP AC03/AC06): ten real ticks with a restart in the middle keep o
   }
 }, 120000);
 
-run('B3 (SYS-DISP AC06) (a): a session the tick cannot observe is unknown, never busy and never dispatched; recovery resumes the bound task and clears the notice', async () => {
+run('B3: unknown runtime preserves the original lease across supervisor restarts; observed recovery never reclaims or resends', async () => {
   const w = await startFork('b3-observe');
   try {
     await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
     const task = await w.core.createTask(w.gm, { title: 'B3 unobserved session', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'owner', idempotencyKey: 'b3-observe-create' });
-    const key = `dispatch-blocked:${task.id}:execute`;
-    // The first pass binds the only engineer seat to the task.
     expect((await w.newDispatcher().tick()).woke.find(x => x.task === task.id)?.spawned).toBe(true);
-    const A = (await w.wf.insts())[0]!;
-    expect(claimsOf(await w.auditRows(task.id))).toHaveLength(1);
-    // A goes idle and its lease lapses, while Paseo gives no usable answer for A: the task returns to ready, still bound to A.
-    w.agentRows.get(A.paseoAgentId!)!.status = 'idle';
-    await w.db.db.query('UPDATE $t SET lease_expires_at = time::unix(time::now()) - 1;', { t: new RecordId('task', task.id) });
-    w.hidden.add(A.paseoAgentId!);
-    const dispatcher = w.newDispatcher();
-    const second = await dispatcher.tick();
-    const verdict = w.verdictOf(dispatcher, task.id);
-    console.log('B3(a) revoked', JSON.stringify(second.revoked), 'woke', JSON.stringify(second.woke), 'verdict', JSON.stringify(verdict));
-    expect(second.revoked).toEqual([task.id]);
-    // The roster reads A as unknown, never busy.
-    expect(dispatcher.sessionSnapshot().sessions.get(A.id)).toMatchObject({ status: 'unknown', state: 'unknown' });
-    // Not dispatched: no woke, no new employee instance, A is not retired, and the audit stream still holds only the first claim.
-    expect(second.woke.filter(x => x.task === task.id)).toEqual([]);
-    expect(second.retired).toEqual([]);
-    expect((await w.wf.insts()).map(i => i.id)).toEqual([A.id]);
-    expect(claimsOf(await w.auditRows(task.id))).toHaveLength(1);
-    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'ready' });
-    expect(verdict).toMatchObject({ dispatchable: false, feasible: true });
-    expect(verdict?.reasons.map(r => r.code)).toContain('unknown');
-    expect(verdict?.reasons.map(r => r.code)).not.toContain('session_busy');
-    // A feasible unknown block becomes an owner notice once the episode ages past the grace; backdate it and re-tick.
-    expect(second.notices).not.toContain(key);
-    await w.wf.setDispatchBlock(task.id, 'execute', Math.floor(Date.now() / 1000) - 600);
-    const third = await w.newDispatcher().tick();
-    expect(third.notices).toContain(key);
-    const open = await w.noticeRows(`dispatch-blocked:${task.id}:`);
-    expect(open.map(r => r.key)).toEqual([key]);
-    expect(open[0]!.resolved_at).toBeFalsy();
-    expect(open[0]!.text).toContain(BLOCK_TEXT.unknown);
-    expect(open[0]!.text).not.toContain(BLOCK_TEXT.session_busy);
-    // Recovery: Paseo answers again and A is idle. The same implementer resumes its own task, and the notice clears with an audit row.
-    w.hidden.delete(A.paseoAgentId!);
+    const employee = (await w.wf.insts())[0]!;
+    const assigned = await w.core.getTask(w.gm, task.id);
+    const key = `runtime-uncertain:${employee.id}:${task.id}`;
+    expect(await w.wf.extendLease(task.id, employee.id, 600, { deliveryId: 'other-delivery', fence: assigned.fence })).toBe(false);
+    expect(await w.wf.extendLease(task.id, employee.id, 600, { deliveryId: assigned.deliveryId!, fence: assigned.fence + 1 })).toBe(false);
+    // Expiry is not evidence that the runtime stopped. Hide its status on every fresh dispatcher.
+    w.hidden.add(employee.paseoAgentId!);
+    for (let pass = 0; pass < 3; pass++) {
+      await w.db.db.query('UPDATE $t SET lease_expires_at = time::unix(time::now()) - 1;', { t: new RecordId('task', task.id) });
+      const dispatcher = w.newDispatcher();
+      const result = await dispatcher.tick();
+      expect(result.revoked).toEqual([]);
+      expect(result.woke).toEqual([]);
+      expect(result.retired).toEqual([]);
+      expect(dispatcher.sessionSnapshot().sessions.get(employee.id)).toMatchObject({ status: 'unknown', state: 'unknown' });
+      expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'doing', currentEmployee: employee.id,
+        deliveryId: assigned.deliveryId, fence: assigned.fence });
+      expect(claimsOf(await w.auditRows(task.id))).toHaveLength(1);
+      const [lease] = await w.rawQuery<[{ lease_expires_at: number }]>('SELECT lease_expires_at FROM ONLY $t;', { t: new RecordId('task', task.id) });
+      expect(lease.lease_expires_at).toBeGreaterThan(Math.floor(Date.now() / 1000));
+    }
+    expect((await w.owner.openNotices()).filter(n => n.key === key)).toHaveLength(1);
+    // Observation recovers while the same original execution is running; no wake or new claim is needed.
+    w.hidden.delete(employee.paseoAgentId!);
     const recovered = await w.newDispatcher().tick();
-    expect(recovered.woke.find(x => x.task === task.id)).toMatchObject({ employee: A.id, spawned: false });
-    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'doing', currentEmployee: A.id });
+    expect(recovered.woke).toEqual([]);
+    expect(recovered.revoked).toEqual([]);
     expect((await w.owner.openNotices()).some(n => n.key === key)).toBe(false);
-    const unblocked = (await w.auditRows(task.id)).filter(r => r.action === 'dispatch_unblocked');
-    expect(unblocked).toHaveLength(1);
-    expect(unblocked[0]!.evidence).toBe('dispatch-blocked execute episode ended: dispatched');
-    expect(claimsOf(await w.auditRows(task.id))).toHaveLength(2);
-    expect((await w.wf.insts()).map(i => i.id)).toEqual([A.id]);
-  } finally {
-    await w.close();
-  }
+    expect(claimsOf(await w.auditRows(task.id))).toHaveLength(1);
+    expect((await w.wf.insts()).map(i => i.id)).toEqual([employee.id]);
+  } finally { await w.close(); }
 }, 120000);

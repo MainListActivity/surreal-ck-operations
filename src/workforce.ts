@@ -813,10 +813,12 @@ export class Workforce {
 
   
 
-  async extendLease(taskId: TaskId, employeeId: string, seconds: number): Promise<boolean> {
-    const [rows] = await this.db.query<[unknown[]]>(`UPDATE $task SET lease_expires_at = time::unix(time::now()) + $seconds
-      WHERE current_employee = $employee AND delivery_id != NONE RETURN AFTER;`,
-      { task: id('task', taskId), employee: employeeId, seconds });
+  async extendLease(taskId: TaskId, employeeId: string, seconds: number,
+    proof?: { deliveryId: string; fence: number }): Promise<boolean> {
+    const [rows] = await this.db.query<[unknown[]]>(`UPDATE $task SET lease_expires_at = math::max([lease_expires_at ?? 0, time::unix(time::now()) + $seconds])
+      WHERE current_employee = $employee AND delivery_id != NONE
+      ${proof ? "AND delivery_id = $delivery AND fence = $fence AND state IN ['doing', 'review']" : ''} RETURN AFTER;`,
+      { task: id('task', taskId), employee: employeeId, seconds, delivery: proof?.deliveryId, fence: proof?.fence });
     return Boolean(rows?.length);
   }
 
