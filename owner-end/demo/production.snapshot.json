@@ -1,0 +1,979 @@
+{
+  "format": "sck-owner-design-v1",
+  "source": "sanitized-production",
+  "exportedAt": "2026-11-10T06:52:52.487Z",
+  "products": [
+    {
+      "id": "product-1",
+      "name": "产品 1"
+    },
+    {
+      "id": "product-2",
+      "name": "产品 2"
+    },
+    {
+      "id": "product-3",
+      "name": "产品 3"
+    }
+  ],
+  "requirements": [
+    {
+      "id": "req-1",
+      "project": "product-3",
+      "title": "需求 1：改进产品使用体验",
+      "problem": "此处为脱敏后的问题描述。此处为脱敏后的问题描述。此处为脱敏后的问题描述。此处为脱敏后的问题描述。",
+      "acceptance": "按步骤核对用户可见行为，并记录验证结果。",
+      "state": "paused",
+      "priority": 2,
+      "revision": 2,
+      "created_at": "2026-11-10T06:52:52.489Z",
+      "updated_at": "2026-11-10T06:52:52.489Z",
+      "root_task": "task-1"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "task-1",
+      "title": "执行任务 1",
+      "project": "product-3",
+      "state": "doing",
+      "executor_role": "product",
+      "reviewer_role": "qa",
+      "requirement": "已替换的任务说明",
+      "acceptanceText": "已替换的验收标准"
+    },
+    {
+      "id": "task-2",
+      "title": "执行任务 2",
+      "state": "review",
+      "executor_role": "engineering",
+      "reviewer_role": "owner",
+      "requirement": "已替换的任务说明",
+      "acceptanceText": "已替换的验收标准"
+    },
+    {
+      "id": "task-3",
+      "title": "执行任务 3",
+      "state": "done",
+      "executor_role": "engineering",
+      "reviewer_role": "qa",
+      "requirement": "已替换的任务说明",
+      "acceptanceText": "已替换的验收标准"
+    },
+    {
+      "id": "task-4",
+      "title": "执行任务 4",
+      "state": "void",
+      "executor_role": "engineering",
+      "reviewer_role": "qa",
+      "requirement": "已替换的任务说明",
+      "acceptanceText": "已替换的验收标准",
+      "parent": "task-5"
+    },
+    {
+      "id": "task-5",
+      "title": "执行任务 5",
+      "state": "done",
+      "executor_role": "engineering",
+      "reviewer_role": "qa",
+      "requirement": "已替换的任务说明",
+      "acceptanceText": "已替换的验收标准"
+    },
+    {
+      "id": "task-6",
+      "title": "执行任务 6",
+      "state": "void",
+      "executor_role": "product",
+      "reviewer_role": "qa",
+      "requirement": "已替换的任务说明",
+      "acceptanceText": "已替换的验收标准"
+    },
+    {
+      "id": "task-7",
+      "title": "执行任务 7",
+      "state": "done",
+      "executor_role": "product",
+      "reviewer_role": "qa",
+      "requirement": "已替换的任务说明",
+      "acceptanceText": "已替换的验收标准"
+    },
+    {
+      "id": "task-8",
+      "title": "执行任务 8",
+      "state": "done",
+      "executor_role": "product",
+      "reviewer_role": "qa",
+      "requirement": "已替换的任务说明",
+      "acceptanceText": "已替换的验收标准"
+    },
+    {
+      "id": "task-9",
+      "title": "执行任务 9",
+      "state": "done",
+      "executor_role": "product",
+      "reviewer_role": "qa",
+      "requirement": "已替换的任务说明",
+      "acceptanceText": "已替换的验收标准",
+      "parent": "task-10"
+    },
+    {
+      "id": "task-10",
+      "title": "执行任务 10",
+      "state": "done",
+      "executor_role": "product",
+      "reviewer_role": "qa",
+      "requirement": "已替换的任务说明",
+      "acceptanceText": "已替换的验收标准"
+    },
+    {
+      "id": "task-11",
+      "title": "执行任务 11",
+      "state": "done",
+      "executor_role": "product",
+      "reviewer_role": "qa",
+      "requirement": "已替换的任务说明",
+      "acceptanceText": "已替换的验收标准"
+    },
+    {
+      "id": "task-12",
+      "title": "执行任务 12",
+      "state": "void",
+      "executor_role": "product",
+      "reviewer_role": "qa",
+      "requirement": "已替换的任务说明",
+      "acceptanceText": "已替换的验收标准"
+    },
+    {
+      "id": "task-13",
+      "title": "执行任务 13",
+      "state": "done",
+      "executor_role": "product",
+      "reviewer_role": "qa",
+      "requirement": "已替换的任务说明",
+      "acceptanceText": "已替换的验收标准"
+    }
+  ],
+  "feedback": [
+    {
+      "id": "feedback-1",
+      "project": "product-3",
+      "state": "linked",
+      "category": "feature",
+      "body": {
+        "text": "用户反馈 1：希望改进当前页面的交互体验。",
+        "contact": "",
+        "page": "https://example.invalid/feedback",
+        "version": "演示版本"
+      },
+      "reason": "反馈已脱敏，保留分类和关联状态。",
+      "requirement": "req-1"
+    }
+  ],
+  "agents": [
+    {
+      "employee": "agent-1",
+      "name": "员工 1",
+      "role": "product",
+      "policy": {
+        "disabled": false,
+        "allow": null,
+        "deny": [],
+        "lang": null
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "note-1",
+      "lane": "company",
+      "text": "笔记 1：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-2",
+      "lane": "company",
+      "text": "笔记 2：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-3",
+      "lane": "company",
+      "text": "笔记 3：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-4",
+      "lane": "company",
+      "text": "笔记 4：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-5",
+      "lane": "company",
+      "text": "笔记 5：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-6",
+      "lane": "company",
+      "text": "笔记 6：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-7",
+      "lane": "company",
+      "text": "笔记 7：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-8",
+      "lane": "company",
+      "text": "笔记 8：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-9",
+      "lane": "company",
+      "text": "笔记 9：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-10",
+      "lane": "company",
+      "text": "笔记 10：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-11",
+      "lane": "company",
+      "text": "笔记 11：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-12",
+      "lane": "company",
+      "text": "笔记 12：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-13",
+      "lane": "company",
+      "text": "笔记 13：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-14",
+      "lane": "company",
+      "text": "笔记 14：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-15",
+      "lane": "company",
+      "text": "笔记 15：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-16",
+      "lane": "company",
+      "text": "笔记 16：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-17",
+      "lane": "company",
+      "text": "笔记 17：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-18",
+      "lane": "company",
+      "text": "笔记 18：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-19",
+      "lane": "company",
+      "text": "笔记 19：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-20",
+      "lane": "company",
+      "text": "笔记 20：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-21",
+      "lane": "company",
+      "text": "笔记 21：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-22",
+      "lane": "company",
+      "text": "笔记 22：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-23",
+      "lane": "company",
+      "text": "笔记 23：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-24",
+      "lane": "company",
+      "text": "笔记 24：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-25",
+      "lane": "company",
+      "text": "笔记 25：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-26",
+      "lane": "company",
+      "text": "笔记 26：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-27",
+      "lane": "company",
+      "text": "笔记 27：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-28",
+      "lane": "company",
+      "text": "笔记 28：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-29",
+      "lane": "company",
+      "text": "笔记 29：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-30",
+      "lane": "company",
+      "text": "笔记 30：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-31",
+      "lane": "company",
+      "text": "笔记 31：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-32",
+      "lane": "company",
+      "text": "笔记 32：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-33",
+      "lane": "company",
+      "text": "笔记 33：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-34",
+      "lane": "company",
+      "text": "笔记 34：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-35",
+      "lane": "company",
+      "text": "笔记 35：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-36",
+      "lane": "company",
+      "text": "笔记 36：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-37",
+      "lane": "company",
+      "text": "笔记 37：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-38",
+      "lane": "company",
+      "text": "笔记 38：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-39",
+      "lane": "company",
+      "text": "笔记 39：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-40",
+      "lane": "company",
+      "text": "笔记 40：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-41",
+      "lane": "company",
+      "text": "笔记 41：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-42",
+      "lane": "company",
+      "text": "笔记 42：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-43",
+      "lane": "company",
+      "text": "笔记 43：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-44",
+      "lane": "company",
+      "text": "笔记 44：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-45",
+      "lane": "company",
+      "text": "笔记 45：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-46",
+      "lane": "company",
+      "text": "笔记 46：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-47",
+      "lane": "company",
+      "text": "笔记 47：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-48",
+      "lane": "company",
+      "text": "笔记 48：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-49",
+      "lane": "company",
+      "text": "笔记 49：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-50",
+      "lane": "company",
+      "text": "笔记 50：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-51",
+      "lane": "company",
+      "text": "笔记 51：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-52",
+      "lane": "company",
+      "text": "笔记 52：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-53",
+      "lane": "company",
+      "text": "笔记 53：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-54",
+      "lane": "company",
+      "text": "笔记 54：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-55",
+      "lane": "company",
+      "text": "笔记 55：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-56",
+      "lane": "company",
+      "text": "笔记 56：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-57",
+      "lane": "company",
+      "text": "笔记 57：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-58",
+      "lane": "company",
+      "text": "笔记 58：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-59",
+      "lane": "company",
+      "text": "笔记 59：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-60",
+      "lane": "company",
+      "text": "笔记 60：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-61",
+      "lane": "company",
+      "text": "笔记 61：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-62",
+      "lane": "company",
+      "text": "笔记 62：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-63",
+      "lane": "company",
+      "text": "笔记 63：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-64",
+      "lane": "company",
+      "text": "笔记 64：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-65",
+      "lane": "company",
+      "text": "笔记 65：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-66",
+      "lane": "company",
+      "text": "笔记 66：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-67",
+      "lane": "company",
+      "text": "笔记 67：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-68",
+      "lane": "company",
+      "text": "笔记 68：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-69",
+      "lane": "company",
+      "text": "笔记 69：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-70",
+      "lane": "company",
+      "text": "笔记 70：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-71",
+      "lane": "company",
+      "text": "笔记 71：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-72",
+      "lane": "company",
+      "text": "笔记 72：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-73",
+      "lane": "company",
+      "text": "笔记 73：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-74",
+      "lane": "company",
+      "text": "笔记 74：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-75",
+      "lane": "company",
+      "text": "笔记 75：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-76",
+      "lane": "company",
+      "text": "笔记 76：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-77",
+      "lane": "company",
+      "text": "笔记 77：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-78",
+      "lane": "company",
+      "text": "笔记 78：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-79",
+      "lane": "company",
+      "text": "笔记 79：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-80",
+      "lane": "company",
+      "text": "笔记 80：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-81",
+      "lane": "company",
+      "text": "笔记 81：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-82",
+      "lane": "company",
+      "text": "笔记 82：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-83",
+      "lane": "company",
+      "text": "笔记 83：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-84",
+      "lane": "company",
+      "text": "笔记 84：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-85",
+      "lane": "company",
+      "text": "笔记 85：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-86",
+      "lane": "company",
+      "text": "笔记 86：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-87",
+      "lane": "company",
+      "text": "笔记 87：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    },
+    {
+      "id": "note-88",
+      "lane": "company",
+      "text": "笔记 88：已替换原文，用于评估列表和编辑交互。",
+      "state": "active",
+      "pinned": false,
+      "author": "示例员工",
+      "updatedAt": "2026-11-10T06:52:52.489Z"
+    }
+  ]
+}
