@@ -15,6 +15,7 @@ interface TaskRow {
   reviewer_role?: string;
   type?: string;
   parent?: unknown;
+  runtime_execution?: { state: string; attempts?: number; error?: string };
   [key: string]: unknown;
 }
 
@@ -201,6 +202,12 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
         )}
         actions={<button type="button" class="ghost" onClick={() => setTick(x => x + 1)}>刷新</button>}
       />
+      {t.runtime_execution ? <p class="hint">执行端：{
+        ({ reserved: '已预留，等待启动确认', running: '执行中', collecting: '正在保存结果', pending: '结果已保存，自动处理中',
+          settled: '结果已入库', interrupted: '本轮中断，等待恢复', superseded: '执行批次已被接替', attention: '等待处理' } as Record<string, string>)[t.runtime_execution.state]
+          ?? t.runtime_execution.state
+      }{t.runtime_execution.attempts ? ` · 已重试 ${t.runtime_execution.attempts} 次` : ''}
+      {t.runtime_execution.error ? ` · ${t.runtime_execution.error}` : ''}</p> : null}
       {notice ? <NoticeLine notice={{ tone: 'ok', text: notice }} onClose={() => setNotice('')} /> : null}
       {t.state === 'blocked' ? <div class="callout tone-blocked"><div class="callout-body"><p class="callout-title">任务受阻</p><div class="callout-text"><p>查看下方进展记录了解原因；可以改派岗位，或作废后重新拆分。</p></div></div></div> : null}
 

@@ -1,3 +1,4 @@
+import { LIFECYCLE_COMMANDS } from '../../src/lifecycle-policy.ts';
 import { ITERATION_COMMANDS } from '../src/iteration-commands.ts';
 import { describe, expect, test } from 'bun:test';
 
@@ -153,7 +154,7 @@ describe('其它命令与常量', () => {
 
   test('TARGET_LOCKS 只列 idp.* 与 cf.api 两条；OWNER_ONLY_FOR_AGENTS 为 ops.job.list 与 audit.list；公司域名固定', () => {
     expect(TARGET_LOCKS.map((lock) => lock.command)).toEqual(['idp.*', 'cf.api']);
-    expect([...OWNER_ONLY_FOR_AGENTS]).toEqual(['ops.job.list', 'audit.list', ...ITERATION_COMMANDS]);
+    expect([...OWNER_ONLY_FOR_AGENTS]).toEqual(['ops.job.list', 'audit.list', ...ITERATION_COMMANDS, ...LIFECYCLE_COMMANDS]);
     expect(COMPANY_HOST).toBe('company.maplayer.top');
   });
 });

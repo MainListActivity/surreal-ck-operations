@@ -10,6 +10,7 @@ export interface NativeSession {
   title: string; cwd: string; model: string; thinking?: string; mode?: string;
   labels: Record<string, string>; workspaceId?: string;
   status: 'starting' | 'running' | 'idle' | 'error' | 'unknown' | 'archived';
+  pendingEnd?: TurnEnded;
   turnId?: string; pid?: number; error?: string; inputTokens?: number;
 }
 interface State { version: 1; host: string; sessions: NativeSession[]; workspaces: RuntimeWorkspace[] }
@@ -161,6 +162,7 @@ export class NativeRuntime implements AgentRuntime {
     return pending;
   }
   private async launch(s: NativeSession, prompt: string): Promise<void> {
+    if (s.pendingEnd) { await this.recoverFinishedTurns(); if (s.pendingEnd) throw new Error('上一轮结果尚未交付执行端'); }
     s.status = 'running'; s.turnId = randomUUID(); s.error = undefined; this.save();
     let command: string[], env: Record<string, string>;
     try {
@@ -208,16 +210,32 @@ export class NativeRuntime implements AgentRuntime {
         this.processes.delete(s.id);
         this.settling.set(s.id, turnId!);
         this.save();
-        if (!this.closed) await this.options.onEnded?.({ agent: { id: s.id, title: s.title, provider: s.provider }, turnId,
+        s.pendingEnd = { agent: { id: s.id, title: s.title, provider: s.provider }, turnId,
           outcome: canceled ? { kind: 'canceled' } : success ? { kind: 'completed' } : { kind: 'failed', error: { message: s.error! } },
-          timeline: result.text ? [{ type: 'assistant_message', text: result.text }] : [] });
+          timeline: result.text ? [{ type: 'assistant_message', text: result.text }] : [] };
+        this.save();
+        if (!this.closed && this.options.onEnded) {
+          await this.options.onEnded(s.pendingEnd);
+          s.pendingEnd = undefined; this.save();
+        }
       })().catch(error => { s.status = 'error'; s.error = `回合收尾失败：${(error as Error).message}`; this.save(); }).finally(() => { if (this.settling.get(s.id) === turnId) this.settling.delete(s.id); resolveDone(); });
     });
-    // onStarted 不阻塞，也不拿任务成功作返回值。
-    try { this.options.onStarted?.(structuredClone(s)); }
-    catch { processError = "回合开始通知失败"; terminate("SIGKILL"); }
+    // A failed spawn must never produce a start acknowledgement.
+    child.once('spawn', () => {
+      try { this.options.onStarted?.(structuredClone(s)); }
+      catch { processError = "回合开始通知失败"; terminate("SIGKILL"); }
+    });
     child.stdin.end(prompt);
     await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+  }
+  /** Replay recorded ends after binding recovery, without starting another model process. */
+  async recoverFinishedTurns(): Promise<void> {
+    if (!this.options.onEnded) return;
+    for (const session of this.sessions.values()) {
+      if (!session.pendingEnd) continue;
+      await this.options.onEnded(session.pendingEnd);
+      session.pendingEnd = undefined; this.save();
+    }
   }
   async stop(id: string): Promise<void> {
     const s = this.get(id), active = this.processes.get(id);

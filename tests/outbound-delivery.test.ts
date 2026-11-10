@@ -108,6 +108,6 @@ test('prepareSend without a draft seeds one; a seeded message with lang and no t
   expect(await withLang.prepareSend('t1', 'execute', 'e1')).toBeNull();
   const plain = fakeStore(undefined, [{}]);
   const prepared = await plain.prepareSend('t1', 'execute', 'e1');
-  expect(prepared!.body).toContain('合入 main');
+  expect(prepared!.body).toContain('在最终提交上');
   expect(prepared!.message.sentTo).toBe('e1');
 });

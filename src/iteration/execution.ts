@@ -139,7 +139,7 @@ export function iterationMessages(input: CreateTask): { execute: string; review:
     : '按 task.md 完成当前步骤，记录可验证证据；有前置缺口请报告阻塞。';
   return {
     includeSent: true,
-    execute: `${scope} 使用派工消息中的 sck 命令记录 checkpoint / submit。不要创建后继任务，由迭代流程统一推进。提交后结束本轮。`,
-    review: `${release ? '在生产独立复测 task.md 验收，核对部署 SHA 和生产部署证据。' : code ? '在 PR head 上独立复验需求与 CI，不合并 PR、不发布。' : '独立复验 task.md 的验收与证据。'} 使用 sck call review 提交 accept 或 return；未满足标准不得通过。不要创建后继任务，评审后结束本轮。`,
+    execute: `${scope} 最终答复写明完成情况、验证证据和产物位置；有代码变更时用单独一行“提交：<完整40位SHA>”标明验证提交。遇到前置缺口首行写“工作结果：受阻”。结束本轮，由执行端保存结果并推进任务。`,
+    review: `${release ? '在生产独立复测 task.md 验收，核对部署 SHA 和生产部署证据。' : code ? '在 PR head 上独立复验需求与 CI，不合并 PR、不发布。' : '独立复验 task.md 的验收与证据。'} 最终答复首行写“复核结论：通过”或“复核结论：退回”，正文列出逐条验收结论与证据；遇到前置缺口首行写“工作结果：受阻”。结束本轮，执行端自动记录结果。`,
   };
 }

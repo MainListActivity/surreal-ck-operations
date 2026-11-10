@@ -45,15 +45,9 @@ export function wake(_inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, 
  */
 function briefWake(task: SupervisedTask, env: PromptEnv, ctx: PromptCtx): string {
   const dir = ctx.commDir ?? '$SCK_COMM_DIR';
-  const sck = (name: string, args: string) => `'${env.sckBin}' call ${name} '${args}'`;
-  const code = ctx.claim?.worktree?.intent.kind === 'code';
-  if (task.state === 'review') {
-    return `先查 ${dir}/task.md 的验收标准第 1 条：这一条写的是老板视角的结果，不成立就直接退回，其余各条不用再看；成立后再逐条复验其余标准。代码任务在最终合入提交上核对，不检查生产加载的版本。结论：${sck('review', '{"decision":"accept|return","text":"…","idempotencyKey":"…"}')}`;
-  }
+  const finish = '完成后直接给出最终答复，包含工作结果、验证证据和产物位置，然后结束本轮；执行端自动保存并推进。遇到前置缺口首行写“工作结果：受阻”。';
+  if (task.state === 'review') return `先查 ${dir}/task.md 的验收标准第 1 条，再按要求独立复验。最终答复首行写“复核结论：通过”或“复核结论：退回”，给出逐条证据并结束本轮。`;
   const findings = latestFindings(ctx.claim?.history);
-  if (findings) return `修复 ${dir}/${findings.file} 中的问题，在最终提交上按验收标准自验，合入 main 后：${sck('submit', '{"text":"…","idempotencyKey":"…"}')}`;
-  const lead = code
-    ? `实现 ${dir}/task.md 中的需求，在最终提交上按验收标准逐条自验，合入 main 后：`
-    : `实现 ${dir}/task.md 中的需求，按验收标准逐条自验，全部通过后：`;
-  return `${lead}${sck('submit', '{"text":"…","idempotencyKey":"…"}')}`;
+  if (findings) return `修复 ${dir}/${findings.file} 中的问题，按验收标准自验。${finish}`;
+  return `实现 ${dir}/task.md 中的需求，按验收标准逐条自验。${finish}`;
 }

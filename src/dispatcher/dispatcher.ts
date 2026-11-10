@@ -481,6 +481,7 @@ export interface SidecarBridge {
   claim(inst: EmployeeInst, task: SupervisedTask): Promise<ClaimResult | undefined>;
   /** Why the last claim of this instance was denied (for example worktree_busy), until its next claim. */
   claimDenial(instId: string): string | undefined;
+  maintainLease?(inst: EmployeeInst, taskId: string): Promise<boolean>;
   /** Records the freshly spawned Paseo agentId for this instance. */
   readWorkspace?(inst: EmployeeInst, taskId?: string, project?: string): Promise<WorktreeAssignment | undefined>;
   releaseWorkspace?(inst: EmployeeInst): Promise<void>;
@@ -1201,7 +1202,9 @@ export class Dispatcher {
           await paseo.stop(inst!.paseoAgentId!).catch(() => undefined);
           await this.revoke(task, `员工 ${inst!.id} 超过 ${cfg.stallMinutes} 分钟没有任何 checkpoint，且会话已 ${ACTIVITY_WINDOW_SECONDS / 60} 分钟无动静或超过 ${cfg.stallMinutes * STALL_ACTIVITY_CAP} 分钟上限，已中止其会话`, inst, report);
         } else if ((task.leaseExpiresAt ?? 0) - now < cfg.extendWithinSeconds &&
-          await wf.extendLease(task.id, task.currentEmployee, LEASE_SECONDS)) {
+          await (this.deps.sidecar?.maintainLease
+            ? this.deps.sidecar.maintainLease(inst!, task.id).catch(() => false)
+            : wf.extendLease(task.id, task.currentEmployee, LEASE_SECONDS))) {
           report.extended.push(task.id);
         }
         continue;

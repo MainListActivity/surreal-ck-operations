@@ -1,3 +1,4 @@
+import { LIFECYCLE_COMMANDS } from '../../src/lifecycle-policy.ts';
 import { ITERATION_COMMANDS } from './iteration-commands.ts';
 /**
  * 网关层的老板专属锁，在命令守卫（src/command-guard.ts）之外，只对员工路径生效（老板始终放行）：
@@ -64,7 +65,7 @@ export const TARGET_LOCKS: ReadonlyArray<{ command: string; target: string }> = 
 ];
 
 /** 员工调用即拒绝的老板命令（网关规则，不属于 HARD_OWNER_ONLY）：作业与审计记录其它员工与老板的操作，只给老板看。 */
-export const OWNER_ONLY_FOR_AGENTS: readonly string[] = ['ops.job.list', 'audit.list', ...ITERATION_COMMANDS];
+export const OWNER_ONLY_FOR_AGENTS: readonly string[] = ['ops.job.list', 'audit.list', ...ITERATION_COMMANDS, ...LIFECYCLE_COMMANDS];
 
 /**
  * 按目标的硬锁。命中时返回拒绝理由（调用方据此拒绝并写审计），否则返回 undefined。

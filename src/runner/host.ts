@@ -12,13 +12,19 @@ export interface RuntimeHost {
     listUsage(): Promise<{ fetchedAt?: string; providers?: ProviderUsage[] }>;
   };
   agents: { ref(id: string): {
+    timeline?: { refetch(options: { direction: 'tail' | 'before'; cursor?: {epoch: string; seq: number}; limit: number; projection: 'projected' }): Promise<{
+      agent?: {status?: string; activeTurn?: {turnId: string} | null} | null;
+      error?: string | null; gap?: boolean; staleCursor?: boolean; epoch: string; hasOlder: boolean;
+      startCursor?: {epoch: string; seq: number} | null;
+      entries: Array<{ timestamp?: string; turnId?: string; seqEnd: number; item: { type: string; text?: string } }>;
+    }> };
     send(prompt: string): Promise<unknown>;
     refresh(): Promise<{ agent?: { labels?: Record<string, string> } } | null>;
     respondToPermission(input: { requestId: string; response: { behavior: "allow" } }): Promise<unknown>;
   } };
 }
 export interface RuntimeEvents {
-  'agent.turn_started': { agent: RuntimeAgent };
+  'agent.turn_started': { agent: RuntimeAgent; turnId?: string | null };
   'agent.turn_ended': TurnEnded;
   'agent.archived': { agent: RuntimeAgent };
   'workspace.archived': unknown;
