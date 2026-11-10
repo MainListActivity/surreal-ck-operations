@@ -25,8 +25,8 @@ test('老板下一步：待决策、进行中、阻塞与完成各有明确文�
   expect(nextStep({ state: 'draft', acceptance: '' }).text).toBe('补充验收标准后确认');
   expect(nextStep({ state: 'queued', acceptance: 'a', planning_error: 'x' })).toMatchObject({ tone: 'blocked', owner: true });
   expect(nextStep({ state: 'implementing', acceptance: 'a' }, 'blocked').tone).toBe('blocked');
-  expect(nextStep({ state: 'release_pending', acceptance: 'a' }, 'awaiting_release')).toMatchObject({ tone: 'decide', text: '等你确认发布' });
-  expect(nextStep({ state: 'release_pending', acceptance: 'a' }, 'release_not_configured').text).toBe('先配置发布流程');
+  expect(nextStep({ state: 'release_pending', acceptance: 'a' }, 'awaiting_release')).toMatchObject({ tone: 'progress', text: '等待执行端接续', owner: false });
+  expect(nextStep({ state: 'release_pending', acceptance: 'a' }, 'release_not_configured').text).toBe('等待执行端接续');
   expect(nextStep({ state: 'released', acceptance: 'a' }).tone).toBe('done');
   expect(stateOf('merged').tone).toBe('neutral');
   expect(flowIndex('paused', 'implementing')).toBe(3);
@@ -39,6 +39,7 @@ test('需求已确认、任务已完成、产品已上线是三个独立里程�
   const tasks = [{ state: 'done' }, { state: 'done' }, { state: 'void' }];
   expect(taskProgress(tasks)).toMatchObject({ done: 2, total: 2, percent: 100 });
   expect(milestones({ state: 'release_pending', approved_revision: 1, revision: 1 }, tasks).map(m => m.done)).toEqual([true, true, false]);
+  expect(milestones({state:'release_pending',revision:1},[{state:'done'},{state:'review'}])[1]!.done).toBe(false);
   expect(milestones({ state: 'released', approved_revision: 1, revision: 1 }, tasks, 'abc')[2]).toMatchObject({ done: true, detail: '发布提交 abc' });
 });
 
@@ -71,7 +72,7 @@ test('设计案例全部带标注、覆盖各状态，且不改动生产快照',
   expect(data.feedback.slice(base.feedback.length).every(f => f.requirement === undefined || data.requirements.some(r => r.id === f.requirement))).toBe(true);
 });
 
-test('本地闭环：编辑回到待确认 → 确认锁定 → 拆解执行 → 授权发布 → 上线，全部只在内存', async () => {
+test('本地闭环：编辑回到待确认 → 确认锁定 → 拆解执行 → 复核合并与自动部署 → 上线，全部只在内存', async () => {
   const store = new DemoStore(withDesignCases(await snapshot()));
   const id = 'design-req-1';
   const r = store.find(store.data.requirements, id);
@@ -87,15 +88,14 @@ test('本地闭环：编辑回到待确认 → 确认锁定 → 拆解执行 →
   expect(exec.execution.stage).toBe('running');
   expect(exec.tasks).toHaveLength(3);
 
-  // 待发布：未配置发布流程的产品不能授权；配置齐全的产品授权后部署并上线。
-  expect(() => store.command('requirement.release', { id: 'design-req-9' })).toThrow('发布');
-  expect(() => store.command('requirement.release', { id: 'design-req-10' })).toThrow();
-  store.command('requirement.release', { id: 'design-req-8' });
-  const rel = store.find(store.data.requirements, 'design-req-8');
-  expect(rel.state).toBe('release_pending');
-  expect((store.command('requirement.execution', { id: 'design-req-8' }) as { execution: { stage: string } }).execution.stage).toBe('deploying');
-  store.tick(Date.now() + 6000);
-  expect(rel.state).toBe('released');
+  // 无二次发布入口；独立复核后模拟 GitHub 自动部署与 QA 线上验收。
+  expect(() => store.command('requirement.release', { id })).toThrow('没有执行外部操作');
+  store.tick(Date.now() + 11000);
+  expect(r.state).toBe('release_pending');
+  expect((store.command('requirement.execution', { id }) as { execution: { stage: string } }).execution.stage).toBe('verifying');
+  store.tick(Date.now() + 17000);
+  expect(r.state).toBe('released');
+  expect((store.command('requirement.execution', { id }) as { tasks: {state:string}[] }).tasks.every(t=>t.state==='done')).toBe(true);
 
   // 拒绝后编辑回到待确认；规划失败可重试。
   const rej = store.find(store.data.requirements, 'design-req-14');

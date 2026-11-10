@@ -1,5 +1,5 @@
 /**
- * 需求与反馈的展示规则：状态文案、下一步、阻止确认/发布的原因、里程碑。纯函数，不依赖 DOM，供 bun test 测试。
+ * 需求与反馈的展示规则：状态文案、下一步、阻止确认的原因、里程碑。纯函数，不依赖 DOM，供 bun test 测试。
  * 只 import 类型，不把服务端模块打进页面。
  */
 import type { ProductPolicy, Requirement, RequirementState } from '../../../src/iteration/requirements.ts';
@@ -12,7 +12,7 @@ export const REQUIREMENT_STATE: Record<RequirementState, { label: string; tone: 
   pending: { label: '待确认', tone: 'decide' },
   queued: { label: '已确认 · 规划中', tone: 'progress' },
   implementing: { label: '实施中', tone: 'progress' },
-  release_pending: { label: '待发布', tone: 'decide' },
+  release_pending: { label: '上线核验中', tone: 'progress' },
   released: { label: '已上线', tone: 'done' },
   paused: { label: '已暂停', tone: 'neutral' },
   rejected: { label: '已拒绝', tone: 'neutral' },
@@ -30,7 +30,7 @@ export const REQUIREMENT_GROUPS: readonly RequirementGroup[] = [
   { id: 'all', label: '全部' },
   { id: 'confirm', label: '待确认', states: ['draft', 'pending'] },
   { id: 'active', label: '实施中', states: ['queued', 'implementing'] },
-  { id: 'release', label: '待发布', states: ['release_pending'] },
+  { id: 'release', label: '上线核验', states: ['release_pending'] },
   { id: 'released', label: '已上线', states: ['released'] },
   { id: 'paused', label: '已暂停', states: ['paused'] },
   { id: 'closed', label: '已关闭', states: ['rejected', 'merged'] },
@@ -54,10 +54,10 @@ export const priorityText = (p: number): string => PRIORITY_TEXT[p] ?? `P${p}`;
 export const EXECUTION_STAGE: Record<string, { label: string; tone: Tone }> = {
   running: { label: '执行中', tone: 'progress' },
   blocked: { label: '执行受阻', tone: 'blocked' },
-  deploying: { label: '部署中', tone: 'progress' },
-  verifying: { label: '上线验证中', tone: 'progress' },
-  awaiting_release: { label: '等你确认发布', tone: 'decide' },
-  release_not_configured: { label: '发布流程未配置', tone: 'decide' },
+  deploying: { label: 'GitHub 自动部署中', tone: 'progress' },
+  verifying: { label: '合并与上线核验中', tone: 'progress' },
+  awaiting_release: { label: '等待执行端接续', tone: 'progress' },
+  release_not_configured: { label: '等待执行端接续', tone: 'progress' },
   awaiting_evidence: { label: '等待部署证据', tone: 'blocked' },
   released: { label: '已上线', tone: 'done' },
 };
@@ -82,10 +82,11 @@ export function nextStep(r: Pick<Requirement, 'state' | 'acceptance' | 'planning
       if (r.execution_error || stage === 'blocked') return { text: '执行受阻，需要查看', tone: 'blocked', owner: true };
       return { text: 'Agent 执行中', tone: 'progress', owner: false };
     case 'release_pending':
-      if (stage === 'release_not_configured') return { text: '先配置发布流程', tone: 'decide', owner: true };
+      if (r.execution_error || stage === 'blocked') return { text: '合并或上线核验受阻', tone: 'blocked', owner: true };
+      if (stage === 'awaiting_release' || stage === 'release_not_configured') return { text: '等待执行端接续', tone: 'progress', owner: false };
       if (stage === 'awaiting_evidence') return { text: '等待部署证据', tone: 'blocked', owner: false };
       if (stage === 'deploying' || stage === 'verifying') return { text: stageOf(stage)!.label, tone: 'progress', owner: false };
-      return { text: '等你确认发布', tone: 'decide', owner: true };
+      return { text: '合并与上线核验中', tone: 'progress', owner: false };
     case 'released': return { text: '已上线', tone: 'done', owner: false };
     case 'paused': return { text: '已暂停，可恢复', tone: 'neutral', owner: true };
     case 'rejected': return { text: '已拒绝，可修改后重提', tone: 'neutral', owner: false };
@@ -95,7 +96,7 @@ export function nextStep(r: Pick<Requirement, 'state' | 'acceptance' | 'planning
 }
 
 /** 流程步骤：整理 → 确认 → 规划 → 实施 → 发布 → 上线。返回当前所在步骤下标；已上线返回 6（全部完成）。 */
-export const FLOW_STEPS = ['整理需求', '老板确认', 'Agent 规划', '执行与验收', '发布', '已上线'] as const;
+export const FLOW_STEPS = ['整理需求', '老板确认', 'Agent 规划', '执行与验收', 'GitHub 部署与核验', '已上线'] as const;
 export function flowIndex(state: string, pausedFrom?: string): number {
   const s = state === 'paused' ? pausedFrom ?? 'queued' : state;
   switch (s) {
@@ -124,16 +125,6 @@ export function approveBlockers(r: Pick<Requirement, 'state' | 'acceptance'>, po
   return out;
 }
 
-/** 「确认发布」被禁用的原因。 */
-export function releaseBlockers(policy: ProductPolicy | undefined): string[] {
-  const out: string[] = [];
-  if (!policy?.enabled) out.push('该产品未启用迭代流程');
-  if (!policy?.releaseInstructions?.trim()) out.push('未配置发布流程');
-  if (!policy?.verifyInstructions?.trim()) out.push('未配置上线验证方法');
-  if (!policy?.rollbackInstructions?.trim()) out.push('未配置回退流程');
-  return out;
-}
-
 /** 验收标准按行拆成可逐条核对的条目；去掉常见的列表前缀。 */
 export function acceptanceItems(text: string | undefined): string[] {
   return (text ?? '').split(/\r?\n/).map(line => line.trim().replace(/^([-*•·]|\d+[.、)）]|\[[ xX]?\])\s*/, '').trim()).filter(Boolean);
@@ -158,12 +149,12 @@ export interface Milestone { key: 'approved' | 'tasks' | 'released'; label: stri
 export function milestones(r: Pick<Requirement, 'state' | 'approved_revision' | 'revision'>, tasks: readonly TaskLike[], releasedSha?: string): Milestone[] {
   const approved = r.approved_revision != null || ['queued', 'implementing', 'release_pending', 'released'].includes(r.state);
   const p = taskProgress(tasks);
-  const tasksDone = r.state === 'release_pending' || r.state === 'released' || (p.total > 0 && p.done === p.total);
+  const tasksDone = r.state === 'released' || (p.total > 0 && p.done === p.total);
   const released = r.state === 'released';
   return [
     { key: 'approved', label: '需求已确认', done: approved, detail: approved ? `修订 ${r.approved_revision ?? r.revision} 已锁定` : '等你确认开工' },
     { key: 'tasks', label: '任务已完成', done: tasksDone, detail: p.total ? `${p.done} / ${p.total} 项完成${p.blocked ? `，${p.blocked} 项受阻` : ''}` : tasksDone ? '已全部验收' : approved ? '等待 Agent 拆解任务' : '确认后开始' },
-    { key: 'released', label: '产品已上线', done: released, detail: released ? releasedSha ? `发布提交 ${releasedSha}` : '已上线' : r.state === 'release_pending' ? '等待发布' : '尚未上线' },
+    { key: 'released', label: '产品已上线', done: released, detail: released ? releasedSha ? `发布提交 ${releasedSha}` : '已上线' : r.state === 'release_pending' ? '等待生产证据及 QA 验收' : '尚未上线' },
   ];
 }
 

@@ -1,3 +1,4 @@
+import { useLiveRefresh } from '../realtime.ts';
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { outcomeText, runCommand } from '../api.ts';
 import { Empty, NoticeLine, PageHeader, Panel, roleText, useAction } from '../common.tsx';
@@ -71,6 +72,8 @@ export function StaffPage() {
     }
   }, []);
 
+  useLiveRefresh(['employee','agent_identity','agent_policy'], loadAgents);
+  useLiveRefresh(['protected_command'], loadGuard);
   useEffect(() => {
     void loadAgents();
     void loadGuard();

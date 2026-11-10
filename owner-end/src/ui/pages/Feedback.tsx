@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'preact/hooks';
+import { useLiveRefresh } from '../realtime.ts';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import type { FeedbackView } from '../../../../src/iteration/inspection.ts';
 import { runCommand, outcomeText } from '../api.ts';
 import { Badge, EmptyState, ErrorState, FilterTabs, Loading, NoticeLine, type Notice } from '../common.tsx';
@@ -37,6 +38,7 @@ const STATE_TABS = [{ id: 'all', label: '全部' }, ...Object.entries(FEEDBACK_S
 /** 产品的反馈收件箱：用户反馈 → Agent 整理 → 关联需求。重新整理只对失败或已忽略的反馈开放。 */
 export function FeedbackInbox({ project }: { project: string }) {
   const [rows, setRows] = useState<FeedbackView[]>();
+  const listScope = useRef('');
   const [offset, setOffset] = useState(0);
   const [refresh, setRefresh] = useState(0);
   const [error, setError] = useState('');
@@ -45,7 +47,8 @@ export function FeedbackInbox({ project }: { project: string }) {
   const [notice, setNotice] = useState<Notice | null>(null);
   useEffect(() => {
     let active = true;
-    setRows(undefined);
+    const scope = `${project}:${offset}`;
+    if (listScope.current !== scope) { setRows(undefined); listScope.current = scope; }
     setError('');
     void runCommand<{ feedback: FeedbackView[] }>('feedback.list', { project, offset }).then(out => {
       if (!active) return;
@@ -55,6 +58,7 @@ export function FeedbackInbox({ project }: { project: string }) {
     return () => { active = false; };
   }, [project, offset, refresh]);
 
+  useLiveRefresh(['product_feedback'], () => setRefresh(r => r + 1), !busy);
   const retry = (id: string) => {
     setBusy(true);
     void runCommand('feedback.retry', { id }).then(out => {

@@ -1,230 +1,632 @@
-import { useCallback, useEffect, useState } from 'preact/hooks';
-import type { Requirement } from '../../../../src/iteration/requirements.ts';
-import { readBoard, runCommand, outcomeText } from '../api.ts';
-import { Badge, EmptyState, ErrorState, Loading, PageHeader, ProgressBar, Section, roleText, timeText } from '../common.tsx';
-import { nextStep, priorityText, stageOf, stateOf, taskProgress, type Tone } from '../iteration.ts';
-import { buildBoardView, clockText, hrefOf, taskIdOf, TASK_STATE_ZH, type BoardViewModel } from '../model.ts';
-import type { Product } from './Requirements.tsx';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
+import type { RuntimeDashboard, RuntimeAgentView } from '../../../../src/runtime-dashboard.ts';
+import { readDashboard, outcomeText } from '../api.ts';
+import { useLiveRefresh, useLiveState } from '../realtime.ts';
+import { expireObservations, useObservationClock } from '../runtime-state.ts';
+import { Badge, Dialog, ErrorState, Loading, ProgressBar, roleText } from '../common.tsx';
+import { hrefOf, clockText, durationText } from '../model.ts';
 
-interface TaskRow { id?: unknown; title?: string; state?: string; executor_role?: string; reviewer_role?: string }
-interface Exec { execution: { stage: string; note?: string; released_sha?: string } | null; tasks: Array<{ state?: string }> }
-
-interface Item { key: string; href: string; title: string; reason: string; tone: Tone; badge: string; sub?: string; progress?: number }
-
-interface Data {
-  requirements: Requirement[];
-  tasks: TaskRow[];
-  products: Product[];
-  exec: Record<string, Exec>;
-  board?: BoardViewModel;
-  messages: { total: number; held: number };
-  boardError?: string;
-  at: number;
-}
-
-export function OverviewPage() {
-  const [data, setData] = useState<Data>();
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(false);
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const [reqOut, taskOut, prodOut, boardOut] = await Promise.all([
-        runCommand<{ requirements: Requirement[] }>('requirement.list', {}),
-        runCommand<{ tasks?: TaskRow[] }>('task.list'),
-        runCommand<{ products: Product[] }>('product.iteration.list'),
-        readBoard(),
-      ]);
-      if (reqOut.kind !== 'ok') { setError(outcomeText(reqOut, '')); return; }
-      const requirements = reqOut.result.requirements;
-      const exec: Record<string, Exec> = {};
-      // 只为推进中的需求读取执行记录：进度与发布阶段。
-      await Promise.all(requirements.filter(r => ['implementing', 'release_pending', 'released'].includes(r.state)).slice(0, 20).map(async r => {
-        const out = await runCommand<Exec>('requirement.execution', { id: r.id }).catch(() => undefined);
-        if (out?.kind === 'ok') exec[r.id] = out.result;
-      }));
-      const board = boardOut.kind === 'ok' ? boardOut.result : undefined;
-      const messages = board?.messages ?? [];
-      setData({
-        requirements,
-        tasks: taskOut.kind === 'ok' ? taskOut.result.tasks ?? [] : [],
-        products: prodOut.kind === 'ok' ? prodOut.result.products : [],
-        exec,
-        board: board ? buildBoardView(board) : undefined,
-        messages: { total: messages.length, held: messages.filter(m => m.hold).length },
-        boardError: boardOut.kind === 'ok' ? undefined : outcomeText(boardOut, ''),
-        at: Date.now(),
-      });
-      setError('');
-    } catch {
-      setError('总览读取失败，请检查网络后重试');
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void load();
-    const timer = setInterval(() => void load(), 30_000);
-    return () => clearInterval(timer);
-  }, [load]);
-
-  const header = (
-    <PageHeader
-      title="总览"
-      description="需要你决定的事项排在最前。点击任一项进入对应需求或任务。"
-      actions={<button type="button" class="ghost" disabled={loading} onClick={() => void load()}>{loading ? '正在刷新…' : '刷新'}</button>}
-      meta={data ? <span>更新于 {clockText(data.at)} · 每 30 秒自动刷新</span> : undefined}
-    />
-  );
-
-  if (error && !data) return <div class="page">{header}<ErrorState message={error} onRetry={() => void load()} /></div>;
-  if (!data) return <div class="page">{header}<Loading label="正在汇总需求、任务和员工动态…" rows={6} /></div>;
-
-  const productName = (id: string) => data.products.find(p => p.id === id)?.name ?? id;
-  const reqItem = (r: Requirement, reason?: string, tone?: Tone): Item => {
-    const stage = data.exec[r.id]?.execution?.stage;
-    const next = nextStep(r, stage);
-    const st = stateOf(r.state);
-    const p = data.exec[r.id] ? taskProgress(data.exec[r.id]!.tasks) : undefined;
-    return {
-      key: `r-${r.id}`, href: hrefOf('requirements', r.id), title: r.title, reason: reason ?? next.text, tone: tone ?? next.tone,
-      badge: stageOf(stage)?.label && r.state !== 'released' ? stageOf(stage)!.label : st.label,
-      sub: `${productName(r.project)} · ${priorityText(r.priority)}`,
-      progress: p && p.total && r.state === 'implementing' ? p.percent : undefined,
-    };
-  };
-  const taskItem = (t: TaskRow, reason: string, tone: Tone): Item => ({
-    key: `t-${taskIdOf(t)}`, href: hrefOf('tasks', taskIdOf(t)), title: t.title || taskIdOf(t), reason, tone,
-    badge: TASK_STATE_ZH[t.state ?? ''] ?? t.state ?? '', sub: `执行任务 · ${roleText(t.executor_role)}`,
-  });
-
-  const reqs = data.requirements;
-  const decide = reqs.filter(r => nextStep(r, data.exec[r.id]?.execution?.stage).owner && !(r.state === 'queued' && r.planning_error) && r.state !== 'paused')
-    .sort((a, b) => a.priority - b.priority).map(r => reqItem(r));
-  const blockedReqs = reqs.filter(r => (r.state === 'queued' && r.planning_error) || r.execution_error || data.exec[r.id]?.execution?.stage === 'blocked' || data.exec[r.id]?.execution?.stage === 'awaiting_evidence')
-    .map(r => reqItem(r, r.planning_error ?? r.execution_error ?? data.exec[r.id]?.execution?.note ?? '执行受阻', 'blocked'));
-  const blockedTasks = data.tasks.filter(t => t.state === 'blocked').map(t => taskItem(t, '任务受阻，等待处理', 'blocked'));
-  const queueBlocked = (data.board?.queue ?? []).filter(q => q.blocked).map(q => ({ key: `q-${q.key}`, href: hrefOf('tasks', q.taskId), title: q.title, reason: q.reason, tone: 'blocked' as Tone, badge: '排队受阻', sub: '派工队列' }));
-  const blocked = dedupe([...blockedReqs, ...blockedTasks, ...queueBlocked]);
-  const paused = reqs.filter(r => r.state === 'paused').map(r => reqItem(r, '已暂停，恢复后继续推进', 'neutral'));
-  const active = reqs.filter(r => (r.state === 'implementing' || r.state === 'queued') && !r.planning_error && !r.execution_error && data.exec[r.id]?.execution?.stage !== 'blocked').map(r => reqItem(r));
-  const released = reqs.filter(r => r.state === 'released').sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at))).slice(0, 6)
-    .map(r => reqItem(r, data.exec[r.id]?.execution?.released_sha ? `已上线 · 提交 ${data.exec[r.id]!.execution!.released_sha}` : `已上线 · ${timeText(r.updated_at)}`, 'done'));
-  const doneTasks = data.tasks.filter(t => t.state === 'done').slice(0, 5).map(t => taskItem(t, '执行与复核已完成', 'done'));
-
-  const tiles = [
-    { label: '待你决策', value: decide.length, tone: 'decide' as Tone, href: '#overview-decide' },
-    { label: '受阻', value: blocked.length, tone: 'blocked' as Tone, href: '#overview-blocked' },
-    { label: '推进中', value: active.length, tone: 'progress' as Tone, href: hrefOf('requirements', undefined, { s: 'active' }) },
-    { label: '已上线', value: reqs.filter(r => r.state === 'released').length, tone: 'done' as Tone, href: hrefOf('requirements', undefined, { s: 'released' }) },
-  ];
-
+const states = {
+  running: ['运行中', 'done'],
+  waiting: ['等待输入', 'decide'],
+  idle: ['空闲', 'neutral'],
+  error: ['运行异常', 'blocked'],
+  unknown: ['状态未知', 'neutral'],
+} as const;
+const platform = (s: string) => ({ darwin: 'macOS', linux: 'Linux', win32: 'Windows' })[s] ?? s;
+function Glyph({ kind = 'host' }: { kind?: string }) {
   return (
-    <div class="page overview-page">
-      {header}
-      {error ? <div class="notice warn" role="status"><span class="notice-text">部分数据刷新失败：{error}</span></div> : null}
-      <div class="tiles">
-        {tiles.map(t => (
-          <a key={t.label} class={`tile tone-${t.tone}`} href={t.href} onClick={e => {
-            if (t.href.startsWith('#overview-')) { e.preventDefault(); document.getElementById(t.href.slice(1))?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
-          }}>
-            <span class="tile-value">{t.value}</span>
-            <span class="tile-label">{t.label}</span>
-          </a>
-        ))}
-      </div>
-
-      <div class="overview-grid">
-        <div class="overview-main">
-          <Section id="overview-decide" title="待你决策" hint="确认开工、确认发布、补齐验收标准或发布流程。">
-            <ItemList items={decide} empty="没有等你决策的事项。" />
-          </Section>
-          <Section id="overview-blocked" title="受阻" hint="规划失败、任务受阻或缺少发布证据。">
-            <ItemList items={blocked} empty="没有受阻的事项。" />
-            {paused.length ? <><h3 class="sub-head">已暂停（{paused.length}）</h3><ItemList items={paused} empty="" /></> : null}
-          </Section>
-          <Section title="推进中" hint="已确认的需求，由 Agent 规划与执行。" actions={<a class="more-link" href={hrefOf('requirements', undefined, { s: 'active' })}>全部</a>}>
-            <ItemList items={active} empty="当前没有推进中的需求。" />
-          </Section>
-          <Section title="最近交付" hint="已上线的需求与已完成的执行任务。任务完成不代表已上线。">
-            {released.length ? <><h3 class="sub-head">已上线的需求</h3><ItemList items={released} empty="" /></> : null}
-            {doneTasks.length ? <><h3 class="sub-head">已完成的执行任务</h3><ItemList items={doneTasks} empty="" /></> : null}
-            {!released.length && !doneTasks.length ? <EmptyState title="还没有交付">需求上线或任务完成后会出现在这里。</EmptyState> : null}
-          </Section>
-        </div>
-
-        <aside class="overview-side">
-          <Section title="员工现在" actions={<a class="more-link" href="#messages">派工消息</a>}>
-            {data.boardError ? <p class="notice warn"><span class="notice-text">员工动态读取失败：{data.boardError}</span></p> : null}
-            {data.board ? (
-              <>
-                <p class="status-line">
-                  <span class={`dot tone-${data.board.runner.tone === 'success' ? 'done' : data.board.runner.tone === 'danger' ? 'blocked' : 'neutral'}`} aria-hidden="true" />
-                  {data.board.runner.stateText}{data.board.runner.detail ? ` · ${data.board.runner.detail}` : ''}
-                </p>
-                {data.board.employees.length ? (
-                  <ul class="people">
-                    {data.board.employees.map(e => (
-                      <li key={e.id}>
-                        <span class="avatar" aria-hidden="true">{e.name.slice(0, 1)}</span>
-                        <span class="people-main">
-                          <strong>{e.name}</strong><small>{roleText(e.role)}</small>
-                          <span class={`people-task${e.now.title ? '' : ' idle'}`}>{e.now.title ? `${e.now.statusText}：${e.now.title}` : e.now.statusText}</span>
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                ) : <p class="hint">还没有在岗员工。</p>}
-                {data.messages.total ? (
-                  <a class="inline-alert" href="#messages">
-                    <span>{data.messages.total} 条待发消息{data.messages.held ? `，其中 ${data.messages.held} 条已扣住` : ''}</span>
-                    <span aria-hidden="true">查看</span>
-                  </a>
-                ) : null}
-              </>
-            ) : null}
-          </Section>
-          <Section title="最近活动">
-            {data.board?.recent.length ? (
-              <ol class="timeline">
-                {data.board.recent.slice(0, 8).map(r => (
-                  <li key={r.key}><time>{r.time}</time><span>{r.actor} · {r.label}{r.taskTitle ? <span class="hint"> · {r.taskTitle}</span> : null}</span></li>
-                ))}
-              </ol>
-            ) : <p class="hint">还没有动态。</p>}
-          </Section>
-        </aside>
-      </div>
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.7"
+      aria-hidden="true"
+    >
+      {kind === 'host' ? (
+        <>
+          <rect x="3" y="3" width="18" height="7" rx="2" />
+          <rect x="3" y="14" width="18" height="7" rx="2" />
+          <path d="M6 6h2m3 0h7M6 17h2m3 0h7" />
+        </>
+      ) : kind === 'product' ? (
+        <path d="m12 2 3 7 7 3-7 3-3 7-3-7-7-3 7-3Z" />
+      ) : kind === 'qa' ? (
+        <>
+          <path d="M8 3h8m-6 0v7l-5 9q-1 2 2 2h10q3 0 2-2l-5-9V3M8 15h8" />
+        </>
+      ) : (
+        <>
+          <path d="m8 6-6 6 6 6m8-12 6 6-6 6M14 3l-4 18" />
+        </>
+      )}
+    </svg>
+  );
+}
+function Meter({ label, value }: { label: string; value?: number }) {
+  return (
+    <div class="runtime-meter">
+      <span>
+        {label} <b>{value === undefined ? '未上报' : `${Math.round(value)}%`}</b>
+      </span>
+      <progress max="100" value={value ?? 0} aria-label={label} />
     </div>
   );
 }
-
-function dedupe(items: Item[]): Item[] {
-  const seen = new Set<string>();
-  return items.filter(i => (seen.has(i.href) ? false : (seen.add(i.href), true)));
+interface Line {
+  id: string;
+  d: string;
+  x: number;
+  y: number;
+  label: string;
+  active: boolean;
+  planned: boolean;
+  taskId: string;
 }
-
-function ItemList({ items, empty }: { items: Item[]; empty: string }) {
-  if (!items.length) return empty ? <p class="empty">{empty}</p> : null;
+function Connections({
+  data,
+  active,
+  selected,
+}: {
+  data: RuntimeDashboard;
+  active: Set<string>;
+  selected?: string;
+}) {
+  const [lines, setLines] = useState<Line[]>([]);
+  useEffect(() => {
+    const root = document.getElementById('runtime-map');
+    if (!root) return;
+    const calc = () => {
+      const box = root.getBoundingClientRect();
+      const cards = new Map(
+        Array.from(root.querySelectorAll<HTMLElement>('[data-agent]')).map((el) => [
+          el.dataset.agent!,
+          el.getBoundingClientRect(),
+        ]),
+      );
+      const all: Array<{
+        id: string;
+        from: string;
+        to: string;
+        label: string;
+        taskId: string;
+        planned: boolean;
+      }> = data.transfers
+        .filter((e) => active.has(e.id) || selected === e.taskId)
+        .map((e) => ({ ...e, planned: false }));
+      if (selected)
+        for (const a of data.agents)
+          if (a.taskId === selected && a.destination?.agentId)
+            all.push({
+              id: `planned-${a.id}`,
+              from: a.id,
+              to: a.destination.agentId,
+              label: '预计下一站',
+              taskId: selected,
+              planned: true,
+            });
+      setLines(
+        all.flatMap((e) => {
+          const a = cards.get(e.from),
+            b = cards.get(e.to);
+          if (!a || !b) return [];
+          const right = b.left > a.left + 20;
+          const same = Math.abs(a.left - b.left) < 20;
+          const x1 = (same ? a.right - 18 : right ? a.right : a.left) - box.left;
+          const x2 = (same ? b.right - 18 : right ? b.left : b.right) - box.left;
+          const y1 = a.top + a.height / 2 - box.top,
+            y2 = b.top + b.height / 2 - box.top;
+          const bend = same ? Math.max(x1, x2) + 20 : (x1 + x2) / 2;
+          return [
+            {
+              id: e.id,
+              d: `M ${x1} ${y1} C ${bend} ${y1}, ${bend} ${y2}, ${x2} ${y2}`,
+              x: (x1 + x2) / 2,
+              y: (y1 + y2) / 2,
+              label: e.label,
+              active: active.has(e.id),
+              planned: e.planned,
+              taskId: e.taskId,
+            },
+          ];
+        }),
+      );
+    };
+    calc();
+    const observer = new ResizeObserver(calc);
+    observer.observe(root);
+    for (const el of Array.from(root.querySelectorAll('[data-agent]'))) observer.observe(el);
+    return () => observer.disconnect();
+  }, [data, active, selected]);
   return (
-    <ul class="item-list">
-      {items.map(i => (
-        <li key={i.key}>
-          <a href={i.href} class={`item tone-${i.tone}`}>
-            <span class="item-main">
-              <span class="item-title">{i.title}</span>
-              <span class="item-reason">{i.reason}</span>
-              {i.progress !== undefined ? <ProgressBar value={i.progress} label={`${i.title} 完成比例`} /> : null}
-            </span>
-            <span class="item-meta">
-              <Badge tone={i.tone}>{i.badge}</Badge>
-              {i.sub ? <small>{i.sub}</small> : null}
-            </span>
-          </a>
-        </li>
+    <svg class="runtime-connections" aria-hidden="true">
+      <defs>
+        <filter id="flow-glow">
+          <feGaussianBlur stdDeviation="3" />
+        </filter>
+      </defs>
+      {lines.map((l) => (
+        <g key={l.id} class={`${l.active ? 'flow-active' : ''} ${l.planned ? 'flow-planned' : ''}`}>
+          <path class="flow-halo" d={l.d} />
+          <path id={`flow-${l.id}`} class="flow-path" d={l.d} />
+          {l.active ? (
+            <circle r="5" class="flow-dot">
+              <animateMotion dur="2s" repeatCount="1" fill="freeze">
+                <mpath href={`#flow-${l.id}`} />
+              </animateMotion>
+            </circle>
+          ) : null}
+          <g transform={`translate(${l.x - 54},${l.y - 14})`}>
+            <rect class="flow-label-bg" width="108" height="28" rx="14" />
+            <text x="54" y="19" text-anchor="middle">
+              {l.label}
+            </text>
+          </g>
+        </g>
       ))}
-    </ul>
+    </svg>
+  );
+}
+function AgentCard({
+  agent: a,
+  open,
+  selected,
+}: {
+  agent: RuntimeAgentView;
+  open(): void;
+  selected: boolean;
+}) {
+  const state = states[a.state];
+  return (
+    <button
+      type="button"
+      class={`runtime-agent ${selected ? 'selected' : ''}`}
+      data-agent={a.id}
+      onClick={open}
+    >
+      <span class="agent-identity">
+        <span class={`agent-symbol role-${a.role}`}>
+          <Glyph kind={a.role} />
+        </span>
+        <span>
+          <strong>{a.name}</strong>
+          <small>
+            {a.model ?? '模型未上报'}
+            {a.modelSource === 'configured' ? ' · 配置值' : ''}
+          </small>
+        </span>
+        <Badge tone={state[1]}>{state[0]}</Badge>
+      </span>
+      <span class="agent-work">
+        <strong>{a.taskTitle ? '正在处理：' : '当前：'}</strong>
+        {a.taskTitle ?? (a.state === 'idle' ? '等待下一项任务' : '暂无任务信息')}
+      </span>
+      <span class="agent-prompt" title={a.currentPrompt?.text}>
+        {a.currentPrompt?.text ?? '尚无本轮已发送提示词记录'}
+      </span>
+      <span class="agent-progress">
+        {a.progress ? (
+          <>
+            <ProgressBar
+              value={a.progress.total ? (a.progress.done / a.progress.total) * 100 : 0}
+              label={a.progress.label}
+            />
+            <span title={a.progress.label}>
+              {Math.round((a.progress.done / a.progress.total) * 100)}%（{a.progress.done} /{' '}
+              {a.progress.total}）
+            </span>
+          </>
+        ) : (
+          <span class="muted">{a.action || '暂无可量化进度'}</span>
+        )}
+        <span class="elapsed">
+          ◷ {a.elapsedSeconds === undefined ? '—' : durationText(a.elapsedSeconds)}
+        </span>
+      </span>
+      <span class="agent-next">
+        ☷ <b>本 Agent 下一条</b> · {a.next ? `预计：${a.next.title}` : '暂无候选任务'}
+      </span>
+      <span class="agent-destination">
+        ↗ <b>当前任务下一站</b> ·{' '}
+        {a.destination ? `${roleText(a.destination.role)}（待调度）` : '待上游结果或计划确定'}
+      </span>
+    </button>
+  );
+}
+export function OverviewPage() {
+  const [snapshot, setData] = useState<RuntimeDashboard>();
+  const [focusedTask, setFocusedTask] = useState<string>();
+  const [error, setError] = useState('');
+  const [paused, setPaused] = useState(false);
+  const [selected, setSelected] = useState<string>();
+  const [active, setActive] = useState(new Set<string>());
+  const [eventsOpen, setEventsOpen] = useState(false);
+  const seen = useRef<Set<string> | undefined>(undefined);
+  const loading = useRef(false);
+  const pending = useRef(false);
+  const mounted = useRef(true);
+  const live = useLiveState();
+  const animationTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const load = useCallback(async () => {
+    if (loading.current) {
+      pending.current = true;
+      return;
+    }
+    loading.current = true;
+    try {
+      do {
+        pending.current = false;
+        const out = await readDashboard();
+        if (!mounted.current) return;
+        if (out.kind !== 'ok') {
+          setError(outcomeText(out, ''));
+          return;
+        }
+        const next = out.result;
+        const fresh = seen.current ? next.transfers.filter((e) => !seen.current!.has(e.id)) : [];
+        seen.current = new Set([...(seen.current ?? []), ...next.transfers.map((e) => e.id)]);
+        if (seen.current.size > 4096) seen.current = new Set([...seen.current].slice(-2048));
+        setData(next);
+        setError('');
+        if (fresh.length) {
+          setActive(new Set(fresh.map((e) => e.id)));
+          clearTimeout(animationTimer.current);
+          animationTimer.current = setTimeout(() => setActive(new Set()), 4500);
+        }
+      } while (pending.current);
+    } catch {
+      setError('运行大盘读取失败，已保留最后快照');
+    } finally {
+      loading.current = false;
+    }
+  }, []);
+  useEffect(() => {
+    mounted.current = true;
+    void load();
+    return () => {
+      mounted.current = false;
+      clearTimeout(animationTimer.current);
+    };
+  }, [load]);
+  useLiveRefresh(
+    [
+      'task',
+      'employee',
+      'audit',
+      'runner_heartbeat',
+      'company_meta',
+      'outbound_message',
+      'requirement_execution',
+      'acceptance_evidence',
+    ],
+    load,
+    !paused,
+  );
+  const resume = () => {
+    setPaused((p) => !p);
+    if (paused) void load();
+  };
+  const full = async () => {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await document.querySelector('.runtime-page')?.requestFullscreen();
+    } catch {
+      setError('浏览器未允许全屏');
+    }
+  };
+  const observedNow = useObservationClock(
+    snapshot
+      ? [...snapshot.hosts.map((h) => h.at), ...snapshot.agents.map((a) => a.observedAt)]
+      : [],
+    paused || snapshot?.sample,
+  );
+  const data = snapshot ? expireObservations(snapshot, observedNow) : undefined;
+  if (!data)
+    return (
+      <div class="page">
+        <h1>总览</h1>
+        {error ? (
+          <ErrorState message={error} onRetry={() => void load()} />
+        ) : (
+          <Loading label="正在连接运行大盘…" />
+        )}
+      </div>
+    );
+  const chosen = data.agents.find((a) => a.id === selected);
+  const flow = focusedTask
+    ? data.transfers.filter((t) => t.taskId === focusedTask)
+    : data.transfers.slice(-4);
+  const summary = data.summary;
+  return (
+    <div class="page runtime-page">
+      <header class="runtime-header">
+        <div>
+          <h1>总览</h1>
+          <span>AI 团队实时运行大盘</span>
+        </div>
+        <div class="runtime-controls">
+          <Badge tone={paused ? 'decide' : live === 'live' ? 'done' : 'blocked'}>
+            {paused
+              ? '画面已暂停'
+              : live === 'live'
+                ? 'LIVE 已连接'
+                : live === 'connecting'
+                  ? '正在连接'
+                  : '连接中断'}
+          </Badge>
+          <small>最后更新 {clockText(data.at)}</small>
+          <button onClick={resume} title="只暂停显示，不暂停 Agent">
+            {paused ? '▶ 继续' : 'Ⅱ 暂停画面'}
+          </button>
+          <button onClick={() => void full()} aria-label="切换全屏">
+            ⛶
+          </button>
+        </div>
+      </header>
+      {error ? (
+        <div class="notice err" role="alert">
+          {error}
+          <button onClick={() => void load()}>重试</button>
+        </div>
+      ) : null}
+      {live !== 'live' && !paused ? (
+        <div class="notice warn">实时连接尚未恢复，以下为最后收到的快照，不代表当前运行状态。</div>
+      ) : null}
+      <div class="runtime-summary">
+        <span>
+          <Glyph />
+          <b>{summary.hosts}</b> 台主机 <small>（{summary.onlineHosts} 在线）</small>
+        </span>
+        <span>
+          <b>{summary.agents}</b> 个 Agent{' '}
+          <small>
+            （{summary.runningAgents} 运行 · {summary.idleAgents} 空闲）
+          </small>
+        </span>
+        <span>
+          <b>{summary.tasks}</b> 项任务执行中
+        </span>
+        <span>
+          <b>{summary.queued}</b> 项排队中
+        </span>
+        <span class={summary.blocked ? 'text-blocked' : ''}>
+          <b>{summary.blocked}</b> 项受阻
+        </span>
+      </div>
+      <div class="runtime-context">
+        {data.warnings.length ? (
+          <details class="runtime-warnings">
+            <summary>数据说明 · {data.warnings.length} 项</summary>
+            {data.warnings.map((w) => (
+              <p key={w}>{w}</p>
+            ))}
+          </details>
+        ) : null}
+        {data.sample ? (
+          <div class="runtime-demo-controls">
+            <span>运行状态与 CI/CD 结果为【设计案例】</span>
+            <button onClick={() => void fetch('/api/demo/transfer', { method: 'POST' })}>
+              演示一次交接
+            </button>
+          </div>
+        ) : null}
+      </div>
+      <div class="runtime-map" id="runtime-map">
+        <div class="runtime-hosts">
+          {data.hosts.map((h) => (
+            <section class="runtime-host" key={h.id}>
+              <header class="host-header">
+                <span class="host-title">
+                  <Glyph />
+                  <strong>{h.name}</strong>
+                  <small>
+                    {h.metrics
+                      ? `${platform(h.metrics.platform)} · ${h.metrics.cores}C / ${Math.round(h.metrics.memoryTotal / 2 ** 30)}G`
+                      : '设备规格未上报'}
+                  </small>
+                  <Badge
+                    tone={
+                      h.state === 'online' ? 'done' : h.state === 'offline' ? 'blocked' : 'neutral'
+                    }
+                  >
+                    {h.state === 'online' ? '在线' : h.state === 'offline' ? '离线' : '未知'}
+                  </Badge>
+                </span>
+                <span class="host-meters">
+                  <Meter label="CPU" value={h.metrics?.cpuPercent} />
+                  <Meter
+                    label="内存"
+                    value={
+                      h.metrics && h.metrics.memoryTotal
+                        ? (h.metrics.memoryUsed / h.metrics.memoryTotal) * 100
+                        : undefined
+                    }
+                  />
+                </span>
+              </header>
+              <div class="host-agents">
+                {data.agents
+                  .filter((a) => a.hostId === h.id)
+                  .map((a) => (
+                    <AgentCard
+                      key={a.id}
+                      agent={a}
+                      open={() => {
+                        setSelected(a.id);
+                        setFocusedTask(a.taskId);
+                      }}
+                      selected={!!focusedTask && focusedTask === a.taskId}
+                    />
+                  ))}
+                {!data.agents.some((a) => a.hostId === h.id) ? (
+                  <p class="runtime-empty">此主机暂无在岗 Agent</p>
+                ) : null}
+              </div>
+            </section>
+          ))}
+        </div>
+        <Connections data={data} active={active} selected={focusedTask} />
+        {!data.hosts.length ? (
+          <p class="runtime-empty">尚未收到执行主机心跳。启动执行端后会自动出现在这里。</p>
+        ) : null}
+      </div>
+      <div class="runtime-bottom">
+        <section class="panel">
+          <header class="panel-head">
+            <h2>
+              任务流转 <small>{focusedTask ? '已选任务' : '真实交接记录'}</small>
+            </h2>
+            {focusedTask ? (
+              <button class="link" onClick={() => setFocusedTask(undefined)}>
+                显示全部
+              </button>
+            ) : null}
+          </header>
+          {flow.length ? (
+            <ol class="runtime-flow">
+              {flow.map((t) => (
+                <li key={t.id} class={active.has(t.id) ? 'current' : ''}>
+                  <span>{data.agents.find((a) => a.id === t.from)?.name ?? t.from}</span>
+                  <strong>→ {t.label} →</strong>
+                  <span>{data.agents.find((a) => a.id === t.to)?.name ?? t.to}</span>
+                  <a href={hrefOf('tasks', t.taskId)}>{t.title}</a>
+                  <small>{clockText(t.at)}</small>
+                </li>
+              ))}
+            </ol>
+          ) : (
+            <p class="hint">暂无已送达的跨 Agent 交接。候选任务不会被当作交接事件。</p>
+          )}
+        </section>
+        <section class="panel">
+          <header class="panel-head">
+            <h2>最近事件</h2>
+            <button class="link" onClick={() => setEventsOpen(true)}>
+              查看全部
+            </button>
+          </header>
+          <ul class="runtime-events">
+            {data.events.slice(0, 5).map((e) => (
+              <li key={e.id}>
+                <time>{clockText(e.at)}</time>
+                <span>
+                  {e.actor} · {e.label}{' '}
+                  {e.taskId ? (
+                    <a href={hrefOf('tasks', e.taskId)}>{e.taskTitle ?? e.taskId}</a>
+                  ) : null}
+                </span>
+              </li>
+            ))}
+          </ul>
+          {!data.events.length ? <p class="hint">等待新的运行事件</p> : null}
+        </section>
+      </div>
+      <section class="panel runtime-delivery">
+        <header class="panel-head">
+          <h2>GitHub CI/CD</h2>
+          <small>PR 合并后自动构建与部署 · 不占用 Agent 席位</small>
+        </header>
+        <p class="hint">{data.sample?'以下为本地 CI/CD 设计案例。':'显示系统已核验的流水线结果。'}CI 检查通过与生产部署完成分别展示。</p>
+        {data.deliveries.length ? (
+          <ul class="runtime-deliveries">
+            {data.deliveries.map((d) => (
+              <li key={d.id}>
+                <a href={hrefOf('tasks', d.taskId)}>{d.title}</a>
+                <Badge
+                  tone={
+                    !d.current
+                      ? 'neutral'
+                      : d.status === 'ci_failed'
+                        ? 'blocked'
+                        : d.status === 'unknown'
+                          ? 'neutral'
+                          : 'done'
+                  }
+                >
+                  {!d.current ? '历史提交 · ' : ''}
+                  {
+                    {
+                      ci_passed: 'CI 检查通过',
+                      ci_failed: 'CI 检查未通过',
+                      production_verified: '生产部署已核验',
+                      unknown: '结果待确认',
+                    }[d.status]
+                  }
+                </Badge>
+                <code>{d.sha.slice(0, 12)}</code>
+                {d.runUrl ? (
+                  <a href={d.runUrl} target="_blank" rel="noopener noreferrer">
+                    查看 Actions ↗
+                  </a>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p class="hint">暂无已回传的 GitHub 证据，暂不能判断构建或生产部署结果。</p>
+        )}
+      </section>
+      {chosen ? (
+        <Dialog
+          title={`${chosen.name} · ${data.hosts.find((h) => h.id === chosen.hostId)?.name ?? '主机未知'}`}
+          onClose={() => setSelected(undefined)}
+          footer={
+            <>
+              {chosen.taskId ? (
+                <a class="button primary" href={hrefOf('tasks', chosen.taskId)}>
+                  查看执行任务
+                </a>
+              ) : null}
+              <button onClick={() => setSelected(undefined)}>关闭</button>
+            </>
+          }
+        >
+          <p>
+            {chosen.provider} · {chosen.model ?? '模型未上报'} · {states[chosen.state][0]}
+          </p>
+          <h3>当前提示词</h3>
+          <p class="hint">
+            {chosen.currentPrompt?.source === 'sent'
+              ? '实际发送内容'
+              : chosen.currentPrompt
+                ? '历史模板，旧执行端未记录实际发送文本'
+                : '尚无本轮提示词记录'}
+            {chosen.currentPrompt?.truncated ? '（超过 16000 字，已截断）' : ''}
+          </p>
+          <pre class="runtime-prompt-full">{chosen.currentPrompt?.text ?? '未知'}</pre>
+          <h3>本 Agent 下一条 · 预计候选</h3>
+          <p>{chosen.next?.reason ?? '尚无候选，不进行远期预测'}</p>
+          <pre class="runtime-prompt-full">
+            {chosen.next?.prompt?.text ?? chosen.next?.title ?? '待上游结果生成'}
+          </pre>
+          <h3>当前任务下一站</h3>
+          <p>
+            {chosen.destination
+              ? `${roleText(chosen.destination.role)} · ${chosen.destination.label}`
+              : '待当前结果与调度决策确定'}
+          </p>
+          <p class="hint">
+            需求任务的验收数量表示整体进展，不代表当前模型响应的完成百分比。运行记录与已提交成果见执行任务详情。
+          </p>
+        </Dialog>
+      ) : null}
+      {eventsOpen ? (
+        <Dialog title="最近运行事件（最多 40 条）" onClose={() => setEventsOpen(false)}>
+          <ul class="runtime-events">
+            {data.events.map((e) => (
+              <li key={e.id}>
+                <time>{clockText(e.at)}</time>
+                <span>
+                  {e.actor} · {e.label}{' '}
+                  {e.taskId ? (
+                    <a href={hrefOf('tasks', e.taskId)}>{e.taskTitle ?? e.taskId}</a>
+                  ) : null}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </Dialog>
+      ) : null}
+    </div>
   );
 }

@@ -10,6 +10,12 @@ import { OverviewPage } from './pages/Overview.tsx';
 import { RequirementsPage } from './pages/Requirements.tsx';
 import { StaffPage } from './pages/Staff.tsx';
 import { TasksPage } from './pages/Tasks.tsx';
+import { useLiveState } from './realtime.ts';
+
+function LiveIndicator() {
+  const state = useLiveState();
+  return <p class={`live-indicator live-${state}`} role="status">{state === 'live' ? '● LIVE 实时连接' : state === 'connecting' ? '◌ 正在连接实时数据' : '● 实时连接中断 · 正在重连'}</p>;
+}
 
 type Session =
   | { kind: 'loading' }
@@ -21,7 +27,7 @@ interface NavItem { id: PageId; label: string; hint: string }
 
 /** 主导航：老板每天用的三项。管理：低频功能。旧入口的对应关系见 docs/owner-workbench.md。 */
 const PRIMARY: NavItem[] = [
-  { id: 'overview', label: '总览', hint: '待决策、受阻与最近交付' },
+  { id: 'overview', label: '总览', hint: '主机、Agent、当前任务与实时交接' },
   { id: 'requirements', label: '需求', hint: '反馈、需求确认、进度与发布' },
   { id: 'tasks', label: '执行任务', hint: '需求拆出的任务与执行结果' },
 ];
@@ -208,6 +214,7 @@ export function App() {
           </div>
         </nav>
         <div class="sidebar-foot">
+          <LiveIndicator />
           <p class="who" title={me.sub}><span class="avatar" aria-hidden="true">{me.sub.slice(0, 1)}</span><span>{me.sub}</span></p>
           <div class="foot-actions">
             <button type="button" class="ghost" disabled={dirty} title={dirty ? '请先保存或放弃修改' : '重新读取当前页面数据'} onClick={() => setPageKey(k => k + 1)}>刷新</button>

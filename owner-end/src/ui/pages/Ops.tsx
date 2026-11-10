@@ -1,3 +1,4 @@
+import { useLiveRefresh } from '../realtime.ts';
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { COMMAND_CATALOG } from '../../command-catalog.ts';
 import { outcomeText, runCommand } from '../api.ts';
@@ -123,6 +124,7 @@ function JobsPanel() {
     else setJobError(out.kind === 'ok' ? '没有找到这个任务' : outcomeText(out, ''));
   };
 
+  useLiveRefresh(['ops_job'], async () => { await load(filter); if(job?.id) await open(job.id); });
   useEffect(() => {
     void load('');
   }, [load]);
@@ -185,6 +187,7 @@ function AuditPanel() {
     }
   }, []);
 
+  useLiveRefresh(['ops_audit'], load);
   useEffect(() => {
     void load();
   }, [load]);

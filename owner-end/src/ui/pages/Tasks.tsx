@@ -1,3 +1,4 @@
+import { useLiveRefresh } from '../realtime.ts';
 import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
 import { outcomeText, runCommand } from '../api.ts';
 import {
@@ -52,6 +53,7 @@ function DispatchControl() {
     if (out.kind === 'ok') setPaused(out.result.paused === true);
   }, []);
   useEffect(() => { void load(); }, [load]);
+  useLiveRefresh(['company_meta'], load, !confirm);
   const toggle = () => void action.run(paused ? 'task.resume' : 'task.pause', {}, paused ? '已恢复派工' : '已暂停派工。在途执行不受影响。', () => { setConfirm(false); return load(); });
   return (
     <div class="dispatch">
@@ -96,6 +98,7 @@ function TaskList({ route }: { route: Route }) {
     return () => { active = false; };
   }, [tick]);
 
+  useLiveRefresh(['task'], () => setTick(t => t + 1), !creating);
   const counts = useMemo(() => Object.fromEntries(GROUPS.map(g => [g.id, (tasks ?? []).filter(t => inGroup(t.state, g.id)).length])), [tasks]);
   const needle = query.trim().toLowerCase();
   const rows = (tasks ?? []).filter(t => inGroup(t.state, group) && (!needle || (t.title ?? '').toLowerCase().includes(needle) || taskIdOf(t).includes(needle)));
@@ -171,6 +174,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
     return () => { active = false; };
   }, [taskId, tick]);
 
+  useLiveRefresh(['task','audit','outbound_message'], () => setTick(t => t + 1), !panel);
   const crumbs = [{ label: '执行任务', href: '#tasks' }];
   if (error && !detail) return <div class="page"><PageHeader title="任务详情" crumbs={crumbs} /><ErrorState title="没有读取到这个任务" message={error} onRetry={() => setTick(t => t + 1)} /></div>;
   if (!detail) return <div class="page"><PageHeader title="任务详情" crumbs={crumbs} /><Loading label="正在读取任务…" rows={5} /></div>;

@@ -1,3 +1,5 @@
+import { DemoRuntime } from './runtime.ts';
+import { isReadOnlyCommand } from '../src/command-effects.ts';
 import { resolve } from 'node:path';
 import { DemoStore, DemoError } from './store.ts';
 import { parseSnapshot, withDesignCases, DESIGN_TAG } from './data.ts';
@@ -10,6 +12,22 @@ export async function buildDemo(){
   return result.outputs[0]!;
 }
 export function handler(store:DemoStore,origin:string,build=buildDemo){
+  const runtime=new DemoRuntime(store);
+  const peers=new Set<ReadableStreamDefaultController<Uint8Array>>();
+  const encode=new TextEncoder();
+  const notify=()=>{for(const peer of peers)try{peer.enqueue(encode.encode('event: change\ndata: {"tables":["*"]}\n\n'));}catch{peers.delete(peer);}};
+  // 单次到期推进本地模拟并主动推送；不依靠页面轮询，也不访问生产。
+  let advanceTimer: ReturnType<typeof setTimeout> | undefined;
+  const scheduleAdvance=()=>{
+    clearTimeout(advanceTimer);
+    const due=[...store.timers].filter(([id])=>store.data.requirements.find(r=>r.id===id)?.state!=='paused').map(([,at])=>at);
+    if(!due.length)return;
+    advanceTimer=setTimeout(()=>{store.tick();notify();scheduleAdvance();},Math.max(0,Math.min(...due)-Date.now()));
+    advanceTimer.unref?.();
+  };
+  const events=(signal:AbortSignal)=>{let peer:ReadableStreamDefaultController<Uint8Array>;let heartbeat:ReturnType<typeof setInterval>|undefined;const cleanup=()=>{clearInterval(heartbeat);peers.delete(peer);signal.removeEventListener('abort',close);};const close=()=>{cleanup();try{peer.close();}catch{}};
+    return new Response(new ReadableStream<Uint8Array>({start(c){peer=c;peers.add(c);signal.addEventListener('abort',close,{once:true});c.enqueue(encode.encode('event: ready\ndata: {"tables":["*"]}\n\n'));heartbeat=setInterval(()=>{try{peer.enqueue(encode.encode('event: heartbeat\ndata: {}\n\n'));}catch{close();}},20_000);if(signal.aborted)close();},cancel:cleanup}),{headers:{'content-type':'text/event-stream'}});
+  };
   const json=(result:unknown,status=200)=>Response.json(result,{status});
   const allowedOrigins=new Set([origin]);
   if(process.env.FIGMA){
@@ -24,15 +42,21 @@ export function handler(store:DemoStore,origin:string,build=buildDemo){
     if(request.headers.get('origin')&&!allowedOrigins.has(request.headers.get('origin')!))return new Response('不允许跨站请求',{status:403});
     try {
       if(request.method==='POST'){
+        let changed=true;
         if(Number(request.headers.get('content-length')??0)>1_000_000)throw new DemoError('本地请求过大',413);
         const text=await request.text();if(text.length>1_000_000)throw new DemoError('本地请求过大',413);
-        if(url.pathname==='/api/demo/reset')response=json({ok:true,result:store.reset()});
+        if(url.pathname==='/api/demo/reset'){runtime.reset();response=json({ok:true,result:store.reset()});}
+        else if(url.pathname==='/api/demo/transfer'){runtime.transfer();response=json({ok:true});}
         else if(url.pathname==='/api/cmd'){
           const body=JSON.parse(text);if(typeof body.command!=='string')throw new DemoError('命令格式无效');
           response=json({ok:true,result:store.command(body.command,body.input??{})});
+          changed=!isReadOnlyCommand(body.command);
         }else throw new DemoError('本地接口不存在',404);
+        if(changed){notify();scheduleAdvance();}
       }else if(request.method!=='GET')throw new DemoError('不支持此方法',405);
       else if(url.pathname==='/api/me')response=json({ok:true,result:{sub:'设计预览',roles:['owner'],exp:Math.floor(Date.now()/1000)+86400}});
+      else if(url.pathname==='/api/events')response=events(request.signal);
+      else if(url.pathname==='/api/dashboard')response=json({ok:true,result:runtime.snapshot()});
       else if(url.pathname==='/api/board')response=json({ok:true,result:store.board()});
       else if(url.pathname==='/app.js')response=new Response(await build(),{headers:{'content-type':'text/javascript'}});
       else if(url.pathname==='/app.css')response=new Response(Bun.file(resolve(root,'public/app.css')));
@@ -59,6 +83,6 @@ if(import.meta.main){
   const data=arg('--cases')==='off'&&args.includes('--cases')?snapshot:withDesignCases(snapshot);
   await buildDemo();
   const origin=`http://127.0.0.1:${port}`;
-  Bun.serve({hostname:'127.0.0.1',port,maxRequestBodySize:1_000_000,fetch:handler(new DemoStore(data),origin)});
+  Bun.serve({hostname:'127.0.0.1',port,idleTimeout:0,maxRequestBodySize:1_000_000,fetch:handler(new DemoStore(data),origin)});
   console.log(`老板端设计模式：${origin}\n点击登录直接进入；刷新页面可查看代码/CSS 修改；重启或点击顶部按钮重置数据。\n数据来源：${data.source}${data===snapshot?'':`，另含本地设计案例（标注 ${DESIGN_TAG}，可用 --cases off 关闭）`}；产品 ${data.products.length}，需求 ${data.requirements.length}，任务 ${data.tasks.length}。`);
 }

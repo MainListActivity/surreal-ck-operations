@@ -5,20 +5,27 @@ export class DemoStore {
   data:Snapshot; paused=false; policies=new Map<string,Row>(); executions=new Map<string,Row>(); timers=new Map<string,number>(); messages:Row[]=[]; guards:Row[]=[{command:'task.void',ownerOnly:true}];
   constructor(readonly initial:Snapshot){this.data=structuredClone(initial);this.reset();}
   reset(){this.data=structuredClone(this.initial);this.paused=false;this.policies=new Map(Object.entries(structuredClone(this.initial.policies??{})));this.executions=new Map(Object.entries(structuredClone(this.initial.executions??{})));this.timers.clear();this.guards=[{command:'task.void',ownerOnly:true}];this.messages=this.data.tasks.slice(0,3).map((t,i)=>({messageId:`msg-${i+1}`,taskId:t.id,title:t.title,step:'execute',state:i===1?'held':'draft',hold:i===1,body:'请核对当前任务范围和验收标准。这是可编辑的本地示例消息。',editable:true}));return{reset:true};}
-  /** 本地模拟推进：确认后约 4 秒生成计划与任务；授权发布后约 5 秒完成部署验证。只改内存，不触发任何员工。 */
+  /** 本地模拟推进：确认后依次模拟实施、独立复核、PR 合并与 GitHub 上线核验。只改内存，不触发任何员工。 */
   tick(now=Date.now()){
     for(const r of this.data.requirements){
       const due=this.timers.get(r.id);if(due===undefined||now<due)continue;
+      if(r.state==='paused')continue;
       this.timers.delete(r.id);
       if(r.state==='queued'&&!r.planning_error&&!this.executions.has(r.id)){
-        const steps=['梳理方案与影响范围','实现并自测','按验收标准逐条核对'];
-        const tasks=steps.map((title,i)=>({id:`${r.id}-local-${i+1}`,title:`【本地模拟】${title}`,state:i===0?'doing':'ready',executor_role:i===2?'qa':'engineering',reviewer_role:i===2?'product':'qa',project:r.project,parent:i?`${r.id}-local-1`:undefined,requirement:`${r.title}\n\n${title}（本地模拟任务，不会派给任何员工）`,acceptanceText:r.acceptance}));
+        const steps=['核对实施计划','实现并独立复核 PR','合并 PR 与上线核验'];
+        const tasks=steps.map((title,i)=>({id:`${r.id}-local-${i+1}`,title:`【本地模拟】${title}`,state:i===0?'doing':'ready',executor_role:i===0?'product':'engineering',reviewer_role:'qa',project:r.project,parent:i?`${r.id}-local-${i}`:undefined,requirement:`${r.title}\n\n${title}（本地模拟任务，不会派给任何员工）`,acceptanceText:r.acceptance}));
         this.data.tasks.unshift(...tasks);
         this.executions.set(r.id,{execution:{stage:'running',note:`任务 ${tasks[0]!.id}：doing`},plan:{steps:steps.map(title=>({title,context:`${title}（本地模拟计划）`,acceptance:r.acceptance}))},tasks:tasks.map(t=>t.id)});
-        r.root_task=tasks[0]!.id;r.state='implementing';r.updated_at=new Date(now).toISOString();
+        r.root_task=tasks[0]!.id;r.state='implementing';r.updated_at=new Date(now).toISOString();this.timers.set(r.id,now+5000);
+      }else if(r.state==='implementing'){
+        const e=this.executions.get(r.id);if(!e)continue;
+        for(const id of e.tasks){const t=this.find(this.data.tasks,id);t.state=id===e.tasks.at(-1)?'doing':'done';}
+        e.execution={stage:'verifying',note:'【本地模拟】PR 已独立复核，正在合并与核验 GitHub 自动部署'};
+        r.state='release_pending';this.touch(r);this.timers.set(r.id,now+5000);
       }else if(r.state==='release_pending'){
         const e=this.executions.get(r.id);
-        this.executions.set(r.id,{...(e??{plan:null,tasks:[]}),execution:{stage:'released',note:'本地模拟：部署证据、复核与上线回归均已完成',released_sha:`demo-${r.id.slice(-6)}`}});
+        for(const id of e?.tasks??[])this.find(this.data.tasks,id).state='done';
+        this.executions.set(r.id,{...(e??{plan:null,tasks:[]}),execution:{stage:'released',note:'【本地模拟】GitHub 自动部署已核验，QA 线上验收通过',released_sha:`demo-${r.id.slice(-6)}`}});
         r.state='released';r.updated_at=new Date(now).toISOString();
       }
     }
@@ -41,14 +48,13 @@ export class DemoStore {
     switch(command){
       case 'product.iteration.list':return{products:this.data.products};
       case 'product.iteration.get':return{policy:this.policies.get(input.project)??policy()};
-      case 'product.iteration.configure':{this.find(this.data.products,input.project);const value={enabled:!!input.enabled,autoRelease:!!input.autoRelease,feedbackOrigins:input.feedbackOrigins??[],releaseInstructions:String(input.releaseInstructions??''),verifyInstructions:String(input.verifyInstructions??''),rollbackInstructions:String(input.rollbackInstructions??'')};this.policies.set(input.project,value);return{policy:value};}
+      case 'product.iteration.configure':{this.find(this.data.products,input.project);const value={enabled:!!input.enabled,autoRelease:true,feedbackOrigins:input.feedbackOrigins??[],releaseInstructions:String(input.releaseInstructions??''),verifyInstructions:String(input.verifyInstructions??''),rollbackInstructions:String(input.rollbackInstructions??'')};this.policies.set(input.project,value);return{policy:value};}
       case 'requirement.list':return{requirements:page(filtered(this.data.requirements),100)};
       case 'requirement.get':return{requirement:req()};
       case 'requirement.create':{this.find(this.data.products,input.project);if(!input.title?.trim()||!input.problem?.trim())throw new DemoError('请填写标题和问题');const r={id:crypto.randomUUID(),project:input.project,title:input.title,problem:input.problem,acceptance:input.acceptance??'',priority:input.priority??2,state:'pending',revision:1,created_at:new Date().toISOString(),updated_at:new Date().toISOString()};this.data.requirements.unshift(r);return{requirement:r};}
       case 'requirement.edit':{const r=editable();Object.assign(r,{title:input.title,problem:input.problem,acceptance:input.acceptance,priority:input.priority,revision:r.revision+1,state:'pending'});this.touch(r);return{requirement:r};}
       case 'requirement.approve':{const r=req();if(r.approved_revision===input.revision)return{approval:{revision:r.revision}};editable();if(!(this.policies.get(r.project)??policy()).enabled||!r.acceptance?.trim())throw new DemoError('请启用产品并填写验收标准');r.approved_revision=r.revision;r.state='queued';this.touch(r);this.timers.set(r.id,Date.now()+4000);return{approval:{revision:r.revision},requirement:r};}
       case 'requirement.control':{const r=req();if(input.revision!==r.revision)throw new DemoError('修订已变化',409);if(input.action==='pause'&&['queued','implementing','release_pending'].includes(r.state)){r.paused_from=r.state;r.state='paused';}else if(input.action==='resume'&&r.state==='paused')r.state=r.paused_from??'queued';else if(input.action==='reject'&&['draft','pending'].includes(r.state))r.state='rejected';else if(input.action==='retry'&&r.state==='queued'){delete r.planning_error;this.timers.set(r.id,Date.now()+4000);}else throw new DemoError('当前状态不支持该操作',409);this.touch(r);const e=this.executions.get(r.id);if(e?.execution&&(input.action==='pause'||input.action==='resume'))e.execution={...e.execution,note:input.action==='pause'?'已暂停：当前步骤完成后不再推进':'已恢复推进'};return{requirement:r};}
-      case 'requirement.release':{const r=req();if(r.state!=='release_pending')throw new DemoError('尚未到待发布阶段',409);const e=this.executions.get(r.id);const stage=e?.execution?.stage;if(stage==='release_not_configured'||!String((this.policies.get(r.project)??policy()).releaseInstructions??'').trim())throw new DemoError('请先在产品设置中填写发布、生产验证与回退流程',409);if(stage==='awaiting_evidence')throw new DemoError('发布任务缺少生产部署证据或独立复核，暂不能确认发布',409);if(stage==='deploying')return{approved:true,simulated:true};this.executions.set(r.id,{...(e??{plan:null,tasks:[]}),execution:{stage:'deploying',note:'已获老板授权（本地模拟），正在部署与生产验证'}});this.touch(r);this.timers.set(r.id,Date.now()+5000);return{approved:true,simulated:true};}
       case 'requirement.execution':{const r=req();const known=this.executions.get(r.id);if(known)return{execution:known.execution??null,plan:known.plan??null,tasks:(known.tasks as string[]).map(id=>this.data.tasks.find(t=>t.id===id)).filter(Boolean)};const t=this.data.tasks.find(t=>t.id===r.root_task);const active=['implementing','release_pending','released'].includes(r.state)||!!t;return{execution:active?{stage:r.state==='released'?'released':'running',note:'静态执行示例；本地确认不会创建真实任务',...(r.state==='released'?{released_sha:'demo-commit'}:{})}:null,plan:active?{steps:[{title:'核对并实施需求',context:'本地展示用计划',acceptance:r.acceptance}]}:null,tasks:t?[t]:[]};}
       case 'feedback.list':return{feedback:page(filtered(this.data.feedback).filter(f=>!input.requirement||f.requirement===input.requirement).filter(f=>!input.state||f.state===input.state),50)};
       case 'feedback.retry':{const f=this.find(this.data.feedback,input.id);f.state='new';delete f.reason;delete f.last_error;return{retried:true};}

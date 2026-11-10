@@ -11,7 +11,7 @@ export interface Snapshot {
   policies?: Record<string, Row>;
 }
 export const requirementStates = ['draft','pending','queued','implementing','release_pending','released','paused','rejected','merged'];
-export const policy = () => ({enabled:true, autoRelease:false, feedbackOrigins:['https://example.invalid'], releaseInstructions:'演示：模拟发布',verifyInstructions:'演示：检查页面',rollbackInstructions:'演示：恢复上一版本'});
+export const policy = () => ({enabled:true, autoRelease:true, feedbackOrigins:['https://example.invalid'], releaseInstructions:'演示：PR 合并后由 GitHub 自动部署',verifyInstructions:'演示：检查页面',rollbackInstructions:'演示：恢复上一版本'});
 export function seed(): Snapshot {
   const at = new Date().toISOString();
   return {
@@ -61,6 +61,12 @@ export const DESIGN_TAG = '【设计案例】';
 export function withDesignCases(base: Snapshot, now = Date.now()): Snapshot {
   const data: Snapshot = structuredClone(base);
   const T = DESIGN_TAG;
+  // 只补已有业务岗位的设计案例，不按参考图虚构构建或部署岗位。
+  for (const [role, name] of [['product','产品员工'],['engineering','工程员工'],['qa','验收员工']]) {
+    if (!data.agents.some(a => a.role === role && !a.policy?.disabled)) data.agents.push({
+      employee: `design-agent-${role}`, name: `${T}${name}`, role, policy: {disabled:false,allow:null,deny:[],lang:null},
+    });
+  }
   const ago = (minutes: number) => new Date(now - minutes * 60_000).toISOString();
   const A = 'design-workspace', B = 'design-content', E = 'design-empty';
   data.products.push({ id: A, name: `${T}客户工作台` }, { id: B, name: `${T}内容平台` }, { id: E, name: `${T}新产品（暂无需求）` });
@@ -135,23 +141,23 @@ export function withDesignCases(base: Snapshot, now = Date.now()): Snapshot {
     task('design-task-7-2', '接入分片上传', 'blocked', 'engineering', 'qa', { project: B }),
     task('design-task-7-3', '大文件上传验收', 'planned', 'qa', 'engineering', { project: B }),
   ]);
-  add('design-req-8', 'awaiting_release', '交付已验收，等待老板确认发布', [
+  add('design-req-8', 'verifying', '【本地模拟】独立复核通过，工程员工正在合并 PR 并核验 GitHub 自动部署', [
     task('design-task-8-1', '联系记录接口', 'done'),
     task('design-task-8-2', '客户详情页展示', 'done'),
-    task('design-task-8-3', '联系记录验收', 'done', 'qa', 'product'),
+    task('design-task-8-3', '合并 PR 与上线核验', 'doing'),
   ]);
-  add('design-req-9', 'release_not_configured', '请配置发布、生产验证与回退流程后确认发布', [
+  add('design-req-9', 'blocked', '【本地模拟】GitHub 必需检查失败，已停止合并，工程员工正在处理', [
     task('design-task-9-1', '热度排序算法', 'done', 'engineering', 'qa', { project: B }),
-    task('design-task-9-2', '排序切换界面', 'done', 'engineering', 'qa', { project: B }),
+    task('design-task-9-2', '排序切换界面', 'blocked', 'engineering', 'qa', { project: B }),
   ]);
-  add('design-req-10', 'awaiting_evidence', '发布任务缺少同一提交的生产部署证据或独立 QA 签署', [
+  add('design-req-10', 'awaiting_evidence', '等待同一提交的 GitHub 生产部署证据或独立 QA 线上验收', [
     task('design-task-10-1', '定时上下线配置', 'done', 'engineering', 'qa', { project: B }),
-    task('design-task-10-2', '生产部署并提交证据', 'review', 'engineering', 'qa', { project: B }),
+    task('design-task-10-2', '核验 GitHub 自动部署与线上效果', 'review', 'engineering', 'qa', { project: B }),
   ]);
   add('design-req-11', 'released', '部署证据、独立复核与上线回归均已完成', [
     task('design-task-11-1', '记住账号功能', 'done'),
     task('design-task-11-2', '登录页验收', 'done', 'qa', 'product'),
-    task('design-task-11-3', '生产发布', 'done'),
+    task('design-task-11-3', '合并 PR 与上线核验', 'done'),
   ], { released_sha: 'a1b2c3d' });
   add('design-req-12', 'released', '部署证据、独立复核与上线回归均已完成', [
     task('design-task-12-1', '列表分页与缓存', 'done', 'engineering', 'qa', { project: B }),
@@ -182,9 +188,9 @@ export function withDesignCases(base: Snapshot, now = Date.now()): Snapshot {
 
   data.policies = {
     ...(data.policies ?? {}),
-    [A]: { enabled: true, autoRelease: false, feedbackOrigins: ['https://app.example.invalid'], releaseInstructions: '合并到 main 后由发布流水线部署到生产环境；先灰度 10% 流量，观察 30 分钟。', verifyInstructions: '打开客户详情页，核对最近 30 天联系记录与后台一致；检查错误率看板无上升。', rollbackInstructions: '在发布流水线回滚到上一版本，并关闭对应功能开关。' },
-    [B]: { enabled: true, autoRelease: false, feedbackOrigins: [], releaseInstructions: '', verifyInstructions: '', rollbackInstructions: '' },
-    [E]: { enabled: false, autoRelease: false, feedbackOrigins: [], releaseInstructions: '', verifyInstructions: '', rollbackInstructions: '' },
+    [A]: { enabled: true, autoRelease: true, feedbackOrigins: ['https://app.example.invalid'], releaseInstructions: '合并到 main 后由发布流水线部署到生产环境；先灰度 10% 流量，观察 30 分钟。', verifyInstructions: '打开客户详情页，核对最近 30 天联系记录与后台一致；检查错误率看板无上升。', rollbackInstructions: '在发布流水线回滚到上一版本，并关闭对应功能开关。' },
+    [B]: { enabled: true, autoRelease: true, feedbackOrigins: [], releaseInstructions: '', verifyInstructions: '', rollbackInstructions: '' },
+    [E]: { enabled: false, autoRelease: true, feedbackOrigins: [], releaseInstructions: '', verifyInstructions: '', rollbackInstructions: '' },
   };
   return data;
 }

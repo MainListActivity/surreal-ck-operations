@@ -1,3 +1,4 @@
+import { useLiveRefresh } from '../realtime.ts';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { ProductPolicy, Requirement } from '../../../../src/iteration/requirements.ts';
 import { runCommand, outcomeText } from '../api.ts';
@@ -9,7 +10,7 @@ import { FeedbackInbox } from './Feedback.tsx';
 import { RequirementCreate, RequirementDetail } from './RequirementDetails.tsx';
 
 export interface Product { id: string; name: string }
-export const EMPTY_POLICY: ProductPolicy = { enabled: true, autoRelease: false, feedbackOrigins: [], releaseInstructions: '', verifyInstructions: '', rollbackInstructions: '' };
+export const EMPTY_POLICY: ProductPolicy = { enabled: true, autoRelease: true, feedbackOrigins: [], releaseInstructions: '', verifyInstructions: '', rollbackInstructions: '' };
 const PAGE = 100;
 
 export function useProducts() {
@@ -26,6 +27,7 @@ export function useProducts() {
     }).catch(() => active && setError('产品列表读取失败'));
     return () => { active = false; };
   }, [tick]);
+  useLiveRefresh(['project','product_iteration'], () => setTick(t => t + 1));
   return { products, error, reload: () => setTick(t => t + 1) };
 }
 
@@ -64,18 +66,21 @@ function RequirementList({ route, products, productError, reloadProducts, onDirt
   const [policyLoaded, setPolicyLoaded] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
   const generation = useRef(0);
+  const listScope = useRef('');
+  const policyScope = useRef('');
 
   useEffect(() => { setOffset(0); }, [project]);
 
   useEffect(() => {
     const current = ++generation.current;
     setError('');
-    setItems(undefined);
+    const scope = `${project}:${offset}`;
+    if (listScope.current !== scope) { setItems(undefined); listScope.current = scope; }
     void runCommand<{ requirements: Requirement[] }>('requirement.list', { ...(project ? { project } : {}), offset }).then(async out => {
       if (current !== generation.current) return;
       if (out.kind !== 'ok') { setError(outcomeText(out, '')); return; }
       setItems(out.result.requirements);
-      // 待发布的需求再读执行阶段，区分「等你确认发布」与「发布流程未配置」等。
+      // 待发布的需求再读执行阶段，区分合并、上线核验及证据缺失。
       const pending = out.result.requirements.filter(r => r.state === 'release_pending' || r.state === 'implementing').slice(0, 20);
       const found: Record<string, string> = {};
       await Promise.all(pending.map(async r => {
@@ -88,8 +93,7 @@ function RequirementList({ route, products, productError, reloadProducts, onDirt
 
   useEffect(() => {
     let active = true;
-    setPolicy(undefined);
-    setPolicyLoaded(false);
+    if (policyScope.current !== project) { setPolicy(undefined); setPolicyLoaded(false); policyScope.current = project; }
     if (!project) return;
     void runCommand<{ policy: ProductPolicy | null }>('product.iteration.get', { project }).then(out => {
       if (!active) return;
@@ -98,6 +102,7 @@ function RequirementList({ route, products, productError, reloadProducts, onDirt
     return () => { active = false; };
   }, [project, tick]);
 
+  useLiveRefresh(['product_requirement','product_iteration','requirement_execution','task'], () => setTick(t => t + 1), !settingsOpen);
   const productName = (id: string) => products?.find(p => p.id === id)?.name ?? id;
   const counts = useMemo(() => groupCounts(items ?? []), [items]);
   const needle = query.trim().toLowerCase();
@@ -136,7 +141,7 @@ function RequirementList({ route, products, productError, reloadProducts, onDirt
           <a class="seg" href={hrefOf('requirements', undefined, { ...params, view: 'feedback' })} aria-current={view === 'feedback' ? 'page' : undefined}>用户反馈</a>
         </div>
         {project && policyLoaded && !policy?.enabled ? <Badge tone="blocked">迭代未启用</Badge> : null}
-        {project && policyLoaded && policy?.enabled ? <Badge tone="neutral">{policy.autoRelease ? '验收后自动发布' : '上线需你确认'}</Badge> : null}
+        {project && policyLoaded && policy?.enabled ? <Badge tone="neutral">独立复核后合并 · GitHub 自动部署</Badge> : null}
       </div>
 
       {productError ? <ErrorState title="产品列表读取失败" message={productError} onRetry={reloadProducts} /> : null}
@@ -254,7 +259,6 @@ export function PolicyDialog({ productName, initial, loaded, save, onClose, onDi
   const dirty = JSON.stringify(next) !== JSON.stringify({ ...initial, feedbackOrigins: initial.feedbackOrigins });
   const report = useCallback(onDirtyChange, [onDirtyChange]);
   useEffect(() => { report(dirty); }, [dirty, report]);
-  const missing = value.autoRelease && (!value.releaseInstructions.trim() || !value.verifyInstructions.trim() || !value.rollbackInstructions.trim());
   const close = () => { if (dirty && !busy) setConfirmClose(true); else onClose(); };
   const submit = async () => {
     setBusy(true);
@@ -265,9 +269,9 @@ export function PolicyDialog({ productName, initial, loaded, save, onClose, onDi
     else { onDirtyChange(false); onClose(); }
   };
   const fields = [
-    { key: 'releaseInstructions', label: '发布流程', hint: 'Agent 如何把交付部署到生产环境。' },
-    { key: 'verifyInstructions', label: '上线验证方法', hint: '上线后如何确认功能正常。' },
-    { key: 'rollbackInstructions', label: '回退流程', hint: '出现问题时如何恢复上一版本。' },
+    { key: 'releaseInstructions', label: 'GitHub 流水线说明（可选）', hint: '现有仓库、默认分支、必需检查与自动部署入口；不需要手工部署步骤。' },
+    { key: 'verifyInstructions', label: '上线验证补充（可选）', hint: '上线后如何确认功能正常。' },
+    { key: 'rollbackInstructions', label: '回退方案补充（可选）', hint: '出现问题时如何恢复上一版本。' },
   ] as const;
   return (
     <Dialog
@@ -284,18 +288,17 @@ export function PolicyDialog({ productName, initial, loaded, save, onClose, onDi
         <>
           {dirty ? <span class="foot-note unsaved">有未保存的修改</span> : null}
           <button type="button" disabled={busy} onClick={close}>取消</button>
-          <button type="button" class="primary" disabled={busy || !loaded || !dirty || missing} onClick={() => void submit()}>{busy ? '正在保存…' : '保存设置'}</button>
+          <button type="button" class="primary" disabled={busy || !loaded || !dirty} onClick={() => void submit()}>{busy ? '正在保存…' : '保存设置'}</button>
         </>
       )}
     >
       {!loaded ? <Loading label="正在读取产品设置…" /> : (
         <form class="form" onSubmit={e => { e.preventDefault(); void submit(); }}>
-          <p class="hint">设置只影响之后的确认与发布；已确认的需求保留确认时的授权快照。停用后不再自动整理反馈，也不推进后续任务。</p>
+          <p class="hint">需求确认即授权独立复核后的 PR 合并，GitHub 自动部署，QA 验收线上效果。补充说明随开工确认锁定；留空时读取项目现有流程。停用后不再整理反馈或推进任务。</p>
           {error ? <div class="notice err" role="alert"><span class="notice-text">{error}</span></div> : null}
           <label class="check"><input type="checkbox" checked={value.enabled} disabled={busy} onChange={e => setValue({ ...value, enabled: e.currentTarget.checked })} /><span><strong>启用迭代流程</strong><small>关闭后不能确认新的需求开工。</small></span></label>
-          <label class="check"><input type="checkbox" checked={value.autoRelease} disabled={busy} onChange={e => setValue({ ...value, autoRelease: e.currentTarget.checked })} /><span><strong>验收通过后自动发布</strong><small>需要同时填写发布、验证和回退流程。不勾选时，每次上线都等你确认。</small></span></label>
           {fields.map(f => (
-            <Field key={f.key} label={f.label} hint={f.hint} required={value.autoRelease} count={value[f.key].length} max={2000} error={value.autoRelease && !value[f.key].trim() ? '自动发布时必填' : undefined}>
+            <Field key={f.key} label={f.label} hint={f.hint} count={value[f.key].length} max={2000}>
               <textarea rows={3} maxLength={2000} value={value[f.key]} disabled={busy} onInput={e => setValue({ ...value, [f.key]: e.currentTarget.value })} />
             </Field>
           ))}

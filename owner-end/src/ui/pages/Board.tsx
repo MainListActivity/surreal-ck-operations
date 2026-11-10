@@ -1,3 +1,5 @@
+import { useLiveRefresh } from '../realtime.ts';
+import { OBSERVATION_TTL, useObservationClock } from '../runtime-state.ts';
 import type { ComponentChildren } from 'preact';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { memo } from 'preact/compat';
@@ -10,8 +12,7 @@ import {
 import { LANG_OPTIONS, boardSignatures, changedIds, langLabel, langPayload } from '../lang.ts';
 import type { BoardTranslation, OwnerBoard } from '../types.ts';
 
-/** 看板每 3 秒自动刷新一次。 */
-export const BOARD_REFRESH_MS = 3_000;
+/** 看板数据库变更实时更新一次。 */
 /** 变化处高亮保留的时长。 */
 export const FLASH_MS = 2_500;
 
@@ -159,14 +160,17 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
   const [picks, setPicks] = useState<Readonly<Record<string, string>>>({});
   const [previews, setPreviews] = useState<Readonly<Record<string, Preview>>>({});
   const loading = useRef(false);
+  const pendingLoad = useRef(false);
   const sigs = useRef<Map<string, string> | undefined>(undefined);
   const timers = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
   const { busy, notice, run } = useAction();
 
   const load = useCallback(async () => {
-    if (loading.current) return;
+    if (loading.current) { pendingLoad.current = true; return; }
     loading.current = true;
     try {
+      do {
+      pendingLoad.current = false;
       const out = await readBoard();
       if (out.kind !== 'ok') {
         setState(prev => ({ ...prev, error: outcomeText(out, '') }));
@@ -191,6 +195,7 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
         }, FLASH_MS);
         timers.current.add(timer);
       }
+      } while (pendingLoad.current);
     } finally {
       loading.current = false;
     }
@@ -198,14 +203,16 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
 
   useEffect(() => {
     void load();
-    const timer = setInterval(() => void load(), BOARD_REFRESH_MS);
+
     const pending = timers.current;
     return () => {
-      clearInterval(timer);
+
       for (const t of pending) clearTimeout(t);
       pending.clear();
     };
   }, [load]);
+
+  useLiveRefresh(['task','employee','audit','outbound_message','company_meta','runner_heartbeat'], load);
 
   /** 员工待发消息：按员工渲染后的原文保存（message.edit_rendered）。 */
   const saveRendered = (employeeId: string, messageId: string, text: string) =>
@@ -225,7 +232,9 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
     void run(on ? 'message.hold' : 'message.release', { messageId }, on ? '已扣住，等待放行' : '已放行', () => load());
 
   const board = state.board;
-  const view: BoardViewModel | undefined = board ? buildBoardView(board) : undefined;
+  const observedNow = useObservationClock([board?.runner.at]);
+  const runner = board?.runner;
+  const view: BoardViewModel | undefined = board ? buildBoardView(runner?.state === 'online' && runner.at !== undefined && observedNow - runner.at > OBSERVATION_TTL ? { ...board, runner: { ...runner, state: 'offline' } } : board) : undefined;
 
   /** 按编号找原料（员工卡片、排队项与 messages 三处合并，先到先用）。 */
   const raw = new Map<string, RawMessage>();
@@ -314,7 +323,7 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
               : <span class="badge tone-neutral">执行端未知</span>}
             {view && view.runner.detail ? <span>{view.runner.detail}</span> : null}
             {view ? <span>{view.scheduler}</span> : null}
-            <span>上次刷新 {state.loadedAt ? clockText(state.loadedAt) : '—'}（每 3 秒自动刷新）</span>
+            <span>上次刷新 {state.loadedAt ? clockText(state.loadedAt) : '—'}（数据库变更实时更新）</span>
           </>
         )}
       />

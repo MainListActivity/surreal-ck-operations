@@ -1,3 +1,4 @@
+import { createHostSampler, writeHostTelemetry, writeRuntimeObservation } from './telemetry.ts';
 import { reconcileIterations, iterationMessages } from '../iteration/execution.ts';
 import { DispatchTimings } from "../diagnostics.ts";
 import { RUNNER_BEAT_MS, writeBoardView, writeRunnerHeartbeat } from "../board.ts";
@@ -322,6 +323,8 @@ export async function persistBoardView(ctx: Company): Promise<void> {
   if (board?.at) await writeBoardView(ctx.db.db, board, ctx.runnerId);
 }
 
+const sampleHost = createHostSampler();
+let beatBusy = false;
 let lastBeatAt: number | undefined;
 /** 最近一次写入成功的执行端心跳时刻（毫秒），供 runner.status 使用；本进程还没写过则为 undefined。 */
 export function lastRunnerBeatAt(): number | undefined { return lastBeatAt; }
@@ -331,16 +334,25 @@ export function lastRunnerBeatAt(): number | undefined { return lastBeatAt; }
  * the board then reads the runner as offline once the last beat ages out.
  */
 function beatRunner(): void {
+  if (beatBusy) return;
+  beatBusy = true;
   void company()
     .then(async ctx => {
       const version = await ctx.runnerVersion().catch(() => "unknown");
       await writeRunnerHeartbeat(ctx.db.db, { runner: ctx.runnerId ?? `plugin:${process.pid}`, host: hostname(), version });
+      await writeHostTelemetry(ctx.db.db, ctx.runnerId ?? `plugin:${process.pid}`, ctx.nodeId, sampleHost())
+        .catch(() => console.warn('host telemetry unavailable'));
+      const observedAt = Date.now();
+      try {
+        const agents = await ctx.runtime.list();
+        await Promise.all([...agents.values()].map(a => writeRuntimeObservation(ctx.db.db, a.id, a.status, observedAt, a.model)));
+      } catch { console.warn('agent telemetry unavailable'); }
       // 节点记录：同一次心跳里登记本执行端的节点、主机与发行版本；失败只记 warn，与运行心跳一致。
       await beatNodeRelease(ctx.db, { node: ctx.nodeId, host: hostname(), platform: process.platform, version, sha: ctx.runnerSha, at: Math.floor(Date.now() / 1000) })
         .catch(error => console.warn(`node release heartbeat failed: ${(error as Error).message}`));
       lastBeatAt = Date.now();
     })
-    .catch(error => console.warn(`runner heartbeat failed: ${(error as Error).message}`));
+    .catch(error => console.warn(`runner heartbeat failed: ${(error as Error).message}`)).finally(() => { beatBusy = false; });
 }
 
 /** 云端周期 tick 的兜底间隔：LIVE 唤醒负责及时性，周期 tick 只防漏。 */
@@ -521,7 +533,12 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
     server.on("agent.turn_started", (event, { paseo }) => {
       interruptions.turnStarted(event.agent.id);
       return isCompanyAgent(paseo, event.agent).then(async ok => {
-        if (ok) await (await company()).workforce.clearIdleForAgent(event.agent.id);
+        if (ok) {
+          const ctx = await company();
+          await writeRuntimeObservation(ctx.db.db, event.agent.id, 'running', Date.now())
+            .catch(() => console.warn('agent telemetry unavailable'));
+          await ctx.workforce.clearIdleForAgent(event.agent.id);
+        }
       }).catch((error: unknown) => console.warn(`idle activity update failed: ${(error as Error).message}`));
     }),
     server.on("agent.turn_ended", (event, { paseo }) => {
@@ -530,6 +547,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
         console.log(`turn_ended ${event.agent.title ?? event.agent.id} company=${ok}`);
         if (!ok) return;
         const ctx = await company();
+        await writeRuntimeObservation(ctx.db.db, event.agent.id, 'idle', Date.now()).catch(() => undefined);
         // The sidecar ingests report.md/blocker.md and lands submit/block before
         // the usage snapshot looks for freshly-reviewed tasks.
         try {

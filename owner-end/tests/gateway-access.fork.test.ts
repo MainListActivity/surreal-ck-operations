@@ -5,6 +5,11 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { RecordId, Surreal } from 'surrealdb';
 import { CompanyDatabase } from '../../src/database.ts';
+import { ownerEventStream, LIVE_TABLES } from '../src/realtime.ts';
+import { readRuntimeDashboard } from '../../src/runtime-dashboard.ts';
+import { writeHostTelemetry, writeRuntimeObservation } from '../../src/runner/telemetry.ts';
+import { writeRunnerHeartbeat } from '../../src/board.ts';
+import { OutboundMessageStore } from '../../src/outbound-messages.ts';
 
 setDefaultTimeout(60000);
 // 老板端网关的访问规则（fork）：058 应用后，gateway 令牌写 protected_command / agent_policy 被拒，改删 ops_audit 被拒。
@@ -85,6 +90,56 @@ afterAll(async () => {
   if (company) await company.close();
   server?.kill();
   await server?.exited;
+});
+
+async function nextFrame(reader: ReadableStreamDefaultReader<Uint8Array>) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(Error('LIVE event timeout')), 5000); }),
+    ]);
+    return new TextDecoder().decode(result.value);
+  } finally { clearTimeout(timer); }
+}
+
+run('老板身份在公司 fork 上建立全部 LIVE，跨连接写入主动推送；取消流释放连接', async () => {
+  const owner = await session(tokenFor('owner', 'live-owner', { rl: ['Owner'] }));
+  const abort = new AbortController();
+  const response = ownerEventStream(owner, abort.signal, Date.now() + 60000);
+  const reader = response.body!.getReader();
+  try {
+    const ready = await nextFrame(reader);
+    expect(ready).toContain('event: ready');
+    for (const table of LIVE_TABLES) expect(ready).toContain(table);
+    await company.db.query("UPSERT company_meta:live_probe CONTENT { marker: '不得传给前端的原始正文' };");
+    const changed = await nextFrame(reader);
+    expect(changed).toContain('event: change');
+    expect(changed).toContain('company_meta');
+    expect(changed).not.toContain('原始正文');
+    await company.db.query('DELETE company_meta:live_probe;');
+    expect(await nextFrame(reader)).toContain('company_meta');
+  } finally { await reader.cancel(); }
+  expect(owner.isConnected).toBe(false);
+});
+
+run('新运行数据在真实 schema 可写可读，已发正文保存实际渲染文本', async () => {
+  const owner = await session(tokenFor('owner', 'dashboard-owner', { rl: ['Owner'] }));
+  await writeRunnerHeartbeat(company.db, {runner:'fixture:runtime',host:'test-host',version:'test'});
+  await writeHostTelemetry(company.db,'fixture:runtime','fixture-node',{
+    platform:'darwin',arch:'arm64',cpuModel:'fixture',cores:8,memoryTotal:16*2**30,memoryUsed:8*2**30,cpuPercent:25,
+  });
+  await company.db.query("CREATE employee:runtime_fixture CONTENT {role:'engineering',paseo_agent_id:'fixture-session',runner_id:'fixture:runtime',model:'configured-model'};");
+  const observedAt=Date.now();
+  await writeRuntimeObservation(company.db,'fixture-session','running',observedAt,'fixture-model');
+  await writeRuntimeObservation(company.db,'fixture-session','idle',observedAt-1000,'stale-model');
+  const result = await readRuntimeDashboard(owner);
+  expect(result.hosts.find(h=>h.id==='fixture-node')).toMatchObject({state:'online',metrics:{cpuPercent:25,cores:8}});
+  expect(result.agents.find(a=>a.id==='runtime_fixture')).toMatchObject({hostId:'fixture-node',state:'running',model:'fixture-model',modelSource:'observed'});
+  await company.db.query("CREATE outbound_message:runtime_sent CONTENT {task: task:runtime_fixture, step:'execute', role:'engineering', body:'模板 {{employee}}'};");
+  await new OutboundMessageStore(company.db).markSent('runtime_sent','fixture-employee','实际渲染文本与工作目录');
+  const [[row]] = await company.db.query<[Array<{body:string;sent_body:string}>]>('SELECT body, sent_body FROM outbound_message:runtime_sent;');
+  expect(row).toEqual({body:'模板 {{employee}}',sent_body:'实际渲染文本与工作目录'});
 });
 
 run('gateway 令牌：ac 与签发方校验通过；签发方不符、签名错、带 id 声明都被拒', async () => {

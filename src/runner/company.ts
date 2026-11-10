@@ -22,6 +22,7 @@ import type { RuntimeHost as PaseoApi } from "./host.ts";
 import type { AgentRuntime } from "./contracts.ts";
 
 export interface Company {
+  runtime: AgentRuntime;
   runnerId?: string;
   native?: boolean;
   /** 本执行端的节点 ID（保存在服务目录 private/node-id，首次启动时生成）。 */
@@ -306,7 +307,7 @@ export function company(): Promise<Company> {
       hostExec: input => hostExec(input, { keyPath: join(serviceHome(), "private", "cloud", "sck-agent-ed25519") }),
       log: message => console.log(message),
     }) : undefined;
-    return readyCompany={ native: runtimeOptions?.native, runnerId: runtimeOptions?.runner?.id, nodeId, runnerVersion: async () => runtimeOptions?.release?.version ?? "dev", runnerSha: runtimeOptions?.release?.sha ?? "dev", messages, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops, sckBin, opsJobs,
+    return readyCompany={ runtime: paseo, native: runtimeOptions?.native, runnerId: runtimeOptions?.runner?.id, nodeId, runnerVersion: async () => runtimeOptions?.release?.version ?? "dev", runnerSha: runtimeOptions?.release?.sha ?? "dev", messages, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops, sckBin, opsJobs,
       get paseo(){ return currentHost(); } };
   })();
   boot.catch(() => { boot = undefined; }); // a failed boot must not poison later calls

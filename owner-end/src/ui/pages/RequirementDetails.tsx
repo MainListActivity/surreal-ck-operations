@@ -1,3 +1,4 @@
+import { useLiveRefresh } from '../realtime.ts';
 import type { ComponentChildren } from 'preact';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import type { FeedbackView } from '../../../../src/iteration/inspection.ts';
@@ -8,7 +9,7 @@ import {
 } from '../common.tsx';
 import {
   EMPTY_DRAFT, FLOW_STEPS, LIMITS, PRIORITY_TEXT, acceptanceItems, approveBlockers, draftFrom, flowIndex, isApprovable, isEditable, isPausable,
-  milestones, priorityText, releaseBlockers, sameDraft, stageOf, stateOf, taskProgress, taskTone, validateRequirement, type RequirementDraft, type Tone,
+  milestones, priorityText, sameDraft, stageOf, stateOf, taskProgress, taskTone, validateRequirement, type RequirementDraft, type Tone,
 } from '../iteration.ts';
 import { TASK_STATE_ZH, hrefOf, taskIdOf } from '../model.ts';
 import { FeedbackItem } from './Feedback.tsx';
@@ -21,10 +22,9 @@ interface Details {
   tasks: ExecTask[];
 }
 type Req = Requirement & { paused_from?: string };
-type DialogKind = 'approve' | 'release' | 'reject' | 'pause' | 'discard' | 'settings';
+type DialogKind = 'approve' | 'reject' | 'pause' | 'discard' | 'settings';
 
-/** 自动刷新间隔：规划、实施与发布阶段，执行记录由后台推进。 */
-const POLL_MS = 5_000;
+/** 需求、执行进度与关联反馈由 LIVE 变更驱动。 */
 
 export function RequirementDetail({ id, products, onDirtyChange }: { id: string; products: Product[]; onDirtyChange(dirty: boolean): void }) {
   const [r, setR] = useState<Req>();
@@ -80,12 +80,7 @@ export function RequirementDetail({ id, products, onDirtyChange }: { id: string;
   const dirty = mode === 'edit' && !!r && !sameDraft(draft, draftFrom(r));
   useEffect(() => { onDirtyChange(dirty); }, [dirty, onDirtyChange]);
 
-  // 规划、实施、发布阶段自动刷新；编辑或对话框打开时暂停，避免打断操作。
-  useEffect(() => {
-    if (!r || mode !== 'view' || dialog || !isPausable(r.state)) return;
-    const timer = setInterval(() => void refresh(), POLL_MS);
-    return () => clearInterval(timer);
-  }, [r?.state, mode, dialog, refresh]);
+  useLiveRefresh(['product_requirement','product_feedback','product_iteration','requirement_plan','requirement_execution','task','audit','requirement_approval'], () => refresh(true), mode === 'view' && !dialog && !busy);
 
   const act = async (command: string, input: Record<string, unknown>, okText: string): Promise<boolean> => {
     setBusy(true);
@@ -145,7 +140,6 @@ export function RequirementDetail({ id, products, onDirtyChange }: { id: string;
     pause: () => setDialog('pause'),
     resume: () => control('resume', '已恢复推进，后续步骤将继续执行。'),
     retry: () => control('retry', '已重新排队规划。'),
-    release: () => setDialog('release'),
     settings: () => setDialog('settings'),
   }, busy, policy);
 
@@ -223,9 +217,9 @@ export function RequirementDetail({ id, products, onDirtyChange }: { id: string;
             {!policyLoaded ? <p class="hint">正在读取…</p> : !policy ? <p class="hint">产品尚未配置，使用默认设置。</p> : (
               <dl class="facts">
                 <dt>迭代流程</dt><dd>{policy.enabled ? '已启用' : <span class="text-blocked">未启用</span>}</dd>
-                <dt>上线方式</dt><dd>{policy.autoRelease ? '验收通过后自动发布' : '每次上线由你确认'}</dd>
-                <dt>发布流程</dt><dd>{policy.releaseInstructions ? '已配置' : <span class="text-decide">未配置</span>}</dd>
-                <dt>验证与回退</dt><dd>{policy.verifyInstructions && policy.rollbackInstructions ? '已配置' : <span class="text-decide">未配置</span>}</dd>
+                <dt>上线方式</dt><dd>独立复核后合并 PR，GitHub 自动部署</dd>
+                <dt>发布流程</dt><dd>{policy.releaseInstructions ? '已补充说明' : '使用项目现有 GitHub 流水线'}</dd>
+                <dt>验证与回退</dt><dd>{policy.verifyInstructions && policy.rollbackInstructions ? '已补充说明' : '按需求验收与项目现有方案'}</dd>
               </dl>
             )}
           </Section>
@@ -245,7 +239,7 @@ export function RequirementDetail({ id, products, onDirtyChange }: { id: string;
               {r.root_task ? <><dt>规划任务</dt><dd><a href={hrefOf('tasks', r.root_task)}>{r.root_task}</a></dd></> : null}
               <dt>编号</dt><dd><code>{r.id}</code></dd>
             </dl>
-            {refreshedAt && isPausable(r.state) ? <p class="hint">每 5 秒自动刷新进度 · 上次 {timeText(refreshedAt).slice(11)}</p> : null}
+            {refreshedAt && isPausable(r.state) ? <p class="hint">LIVE 变更实时更新进度 · 上次 {timeText(refreshedAt).slice(11)}</p> : null}
           </Section>
         </aside>
       </div>
@@ -268,7 +262,7 @@ export function RequirementDetail({ id, products, onDirtyChange }: { id: string;
           <ol class="steps-list">
             <li>修订 {r.revision} 锁定，不能再编辑；执行以此为准。</li>
             <li>Agent 按下面的验收标准拆解任务并开始执行。</li>
-            <li>{policy?.autoRelease ? '交付验收通过后，按产品策略自动发布。' : '交付验收后会停在「待发布」，等你确认才上线。'}</li>
+            <li>独立复核通过后即可合并 PR，由 GitHub 自动部署，再由 QA 验收线上效果，无需再次确认发布。</li>
           </ol>
           <div class="confirm-summary">
             <p class="label">需求</p>
@@ -277,34 +271,6 @@ export function RequirementDetail({ id, products, onDirtyChange }: { id: string;
             <ol class="checklist small">{acceptanceItems(r.acceptance).map((a, i) => <li key={i}>{a}</li>)}</ol>
           </div>
           {blockers.length ? <ul class="blockers">{blockers.map(b => <li key={b}>{b}</li>)}</ul> : null}
-        </Dialog>
-      ) : null}
-
-      {dialog === 'release' ? (
-        <Dialog
-          title={`确认发布：修订 ${r.approved_revision ?? r.revision}`}
-          onClose={() => setDialog(null)}
-          footer={(
-            <>
-              <button type="button" disabled={busy} onClick={() => setDialog(null)}>暂不发布</button>
-              <button type="button" class="primary" data-autofocus disabled={busy || releaseBlockers(policy).length > 0}
-                onClick={() => void act('requirement.release', { id: r.id, revision: r.revision, expectedPolicy: policy }, '已授权按当前产品策略发布。上线完成并验证后，需求会变为「已上线」。').then(ok => { if (ok) setDialog(null); })}>
-                {busy ? '正在提交…' : '授权发布'}
-              </button>
-            </>
-          )}
-        >
-          <p>交付已通过验收。授权后，Agent 会按以下流程部署并在线验证；这次授权会写入审计。</p>
-          <dl class="facts stacked">
-            <dt>发布流程</dt><dd class="prose">{policy?.releaseInstructions || <span class="text-decide">未配置</span>}</dd>
-            <dt>上线验证</dt><dd class="prose">{policy?.verifyInstructions || <span class="text-decide">未配置</span>}</dd>
-            <dt>回退流程</dt><dd class="prose">{policy?.rollbackInstructions || <span class="text-decide">未配置</span>}</dd>
-          </dl>
-          {releaseBlockers(policy).length ? (
-            <Callout tone="decide" title="发布前需要补齐产品设置" actions={<button type="button" onClick={() => setDialog('settings')}>打开产品设置</button>}>
-              <ul class="blockers plain">{releaseBlockers(policy).map(b => <li key={b}>{b}</li>)}</ul>
-            </Callout>
-          ) : null}
         </Dialog>
       ) : null}
 
@@ -366,7 +332,7 @@ export function RequirementDetail({ id, products, onDirtyChange }: { id: string;
 }
 
 interface DecisionActions {
-  approve(): void; edit(): void; reject(): void; pause(): void; resume(): void; retry(): void; release(): void; settings(): void;
+  approve(): void; edit(): void; reject(): void; pause(): void; resume(): void; retry(): void; settings(): void;
 }
 
 /** 决策栏：告诉老板现在需要做什么、为什么，以及能做什么。 */
@@ -383,7 +349,7 @@ function decisionFor(r: Req, stage: string | undefined, note: string | undefined
         title: '等你确认开工',
         body: (
           <>
-            <p>确认后修订 {r.revision} 锁定，Agent 按验收标准拆解任务。{policy?.autoRelease ? '验收通过后按策略自动发布。' : '上线前还会再请你确认。'}</p>
+            <p>确认后修订 {r.revision} 锁定，Agent 按验收标准拆解任务。独立复核通过后即可合并 PR，由 GitHub 自动部署，随后 QA 验收线上效果。</p>
             {real.length ? <ul class="blockers">{real.map(b => <li key={b}>{b}</li>)}</ul> : null}
           </>
         ),
@@ -408,17 +374,10 @@ function decisionFor(r: Req, stage: string | undefined, note: string | undefined
       }
       return { tone: 'progress', title: `Agent 执行中 · 已完成 ${progress.done} / ${progress.total || '—'} 项`, body: note ? <p>{note}</p> : undefined, actions: pause };
     case 'release_pending':
-      if (stage === 'release_not_configured') {
-        return { tone: 'decide', title: '交付已验收，但发布流程未配置', body: <p>请在产品设置中填写发布、上线验证与回退流程，然后确认发布。</p>, actions: <>{pause}<button type="button" class="primary" disabled={busy} onClick={a.settings}>配置发布流程</button></> };
-      }
-      if (stage === 'awaiting_evidence') return { tone: 'blocked', title: '等待部署证据', body: <p>{note ?? '发布任务需要同一提交的生产部署证据和独立 QA 签署。'}</p>, actions: pause };
-      if (stage === 'deploying' || stage === 'verifying') return { tone: 'progress', title: stageOf(stage)!.label, body: <p>{note ?? '已授权发布，Agent 正在部署与验证。'}</p>, actions: pause };
-      return {
-        tone: 'decide',
-        title: '交付已验收，等你确认发布',
-        body: <p>任务已完成并通过验收，但产品还没有上线。授权后按产品发布策略部署。</p>,
-        actions: <>{pause}<button type="button" class="primary" disabled={busy} onClick={a.release}>确认发布…</button></>,
-      };
+      if (r.execution_error || stage === 'blocked') return { tone: 'blocked', title: '合并或上线核验受阻', body: <p>{r.execution_error ?? note ?? '请查看关联任务的阻塞原因。'}</p>, actions: pause };
+      if (stage === 'awaiting_evidence') return { tone: 'blocked', title: '等待部署证据', body: <p>{note ?? '需要同一提交的 GitHub 生产部署证据和独立 QA 线上验收。'}</p>, actions: pause };
+      if (stage === 'awaiting_release' || stage === 'release_not_configured') return { tone: 'progress', title: '等待执行端继续推进', body: <p>旧版发布等待已取消。执行端升级后将自动接续，独立复核通过后合并 PR，无需再次授权。</p>, actions: pause };
+      return { tone: 'progress', title: stageOf(stage)?.label ?? '合并与上线核验中', body: <p>{note ?? '工程员工核对已复核的 PR 并合并，GitHub CI/CD 自动部署，QA 验收线上效果。'}</p>, actions: pause };
     case 'released':
       return { tone: 'done', title: '已上线', body: <p>{note ?? '部署证据、独立复核与上线回归均已完成。'}</p> };
     case 'paused':

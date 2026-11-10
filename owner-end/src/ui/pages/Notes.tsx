@@ -1,3 +1,4 @@
+import { useLiveRefresh } from '../realtime.ts';
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { outcomeText, runCommand } from '../api.ts';
 import { Empty, NoticeLine, PageHeader, Panel, Pre, timeText, useAction } from '../common.tsx';
@@ -74,6 +75,7 @@ export function NotesPage() {
     if (!addLane && lane) setAddLane(lane);
   }, [lane]);
 
+  useLiveRefresh(['lane_note','note_consolidation'], () => refresh(lane), !editing && !busy);
   const after = () => refresh(lane);
   const laneOptions = lane && !lanes.includes(lane) ? [...lanes, lane] : lanes;
 

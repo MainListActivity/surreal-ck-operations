@@ -33,6 +33,14 @@ const req = (path: string, init?: RequestInit): Request => new Request(`${ORIGIN
 const bearer = async (claims: Record<string, unknown> = {}): Promise<string> =>
   `Bearer ${await signToken(key, claims)}`;
 
+test('实时事件和运行大盘仅老板可读：匿名 401、员工 403', async () => {
+  for (const path of ['/api/events','/api/dashboard']) {
+    expect((await worker.fetch(req(path),testEnv())).status).toBe(401);
+    const response=await worker.fetch(req(path,{headers:{authorization:await bearer({ac:'agent',task:'t1',rl:[]})}}),testEnv());
+    expect(response.status).toBe(403);
+  }
+});
+
 async function call(path: string, init: RequestInit = {}, env: Env = testEnv()): Promise<{ status: number; body: any }> {
   const response = await worker.fetch(req(path, init), env);
   return { status: response.status, body: await response.json() };
