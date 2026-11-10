@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { COMMAND_CATALOG } from '../../command-catalog.ts';
 import { outcomeText, runCommand } from '../api.ts';
-import { Empty, NoticeLine, Panel, Pre, timeText, useAction } from '../common.tsx';
+import { Empty, NoticeLine, PageHeader, Panel, Pre, timeText, useAction } from '../common.tsx';
 import { catalogGroups, catalogTags, parseJsonObject } from '../model.ts';
 
 interface JobRow {
@@ -37,11 +37,19 @@ interface ClientSecret {
   note: string;
 }
 
+const OPS_SECTIONS = [['ops-commands', '命令目录'], ['ops-jobs', '执行端作业'], ['ops-audit', '审计'], ['ops-read', '只读查询'], ['ops-idp', '身份服务'], ['ops-cf', 'Cloudflare'], ['ops-write', '直接写库']] as const;
+
 const CLIENT_ROLES = ['gateway', 'viewer', 'automation', 'runner', 'migrator', 'agentClaims'] as const;
 
 export function OpsPage() {
   return (
     <div class="page">
+      <PageHeader title="运维" description="面向排障与维护的低频工具：命令目录、执行端作业、审计、只读查询、身份服务与 Cloudflare。直接写库默认折叠，执行前二次确认。" />
+      <nav class="jump-bar" aria-label="页内导航">
+        {OPS_SECTIONS.map(([id, label]) => (
+          <a key={id} href="#ops" onClick={e => { e.preventDefault(); document.getElementById(id)?.scrollIntoView({ behavior: 'smooth' }); }}>{label}</a>
+        ))}
+      </nav>
       <CommandPanel />
       <JobsPanel />
       <AuditPanel />
@@ -59,7 +67,7 @@ function CommandPanel() {
   const [query, setQuery] = useState('');
   const groups = catalogGroups(COMMAND_CATALOG, query);
   return (
-    <Panel title="命令面板" hint="网关的全部命令与参数。这里只展示，不执行。员工经 company_cmd 调用的也是这些命令，高危命令应先确认保护清单。">
+    <Panel id="ops-commands" title="命令面板" hint="网关的全部命令与参数。这里只展示，不执行。员工经 company_cmd 调用的也是这些命令，高危命令应先确认保护清单。">
       <label class="field">
         <span>搜索（命令名、用途或分组）</span>
         <input value={query} onInput={e => setQuery(e.currentTarget.value)} />
@@ -120,7 +128,7 @@ function JobsPanel() {
   }, [load]);
 
   return (
-    <Panel title="执行端任务队列" hint="执行端提交的老板命令在这里排队与完成情况。">
+    <Panel id="ops-jobs" title="执行端任务队列" hint="执行端提交的老板命令在这里排队与完成情况。">
       <div class="button-row">
         <label class="inline">
           <span>状态过滤（留空为全部）</span>
@@ -136,7 +144,7 @@ function JobsPanel() {
             <li key={j.id} class="row">
               <div class="row-main">
                 <code>{j.command}</code>
-                <span class="tag">{j.state}</span>
+                <span class={`badge tone-${j.state === 'done' ? 'done' : j.state === 'error' ? 'blocked' : j.state === 'running' ? 'progress' : 'neutral'}`}>{j.state}</span>
                 <span class="hint">{j.actorKind ?? ''} {j.actor ?? ''} · {timeText(j.createdAt)}</span>
               </div>
               {j.error ? <div class="notice err">{String(j.error)}</div> : null}
@@ -182,7 +190,7 @@ function AuditPanel() {
   }, [load]);
 
   return (
-    <Panel title="审计" hint="最近的操作记录，摘要由服务端生成。" actions={<button type="button" disabled={loading} onClick={() => void load()}>刷新</button>}>
+    <Panel id="ops-audit" title="审计" hint="最近的操作记录，摘要由服务端生成。" actions={<button type="button" disabled={loading} onClick={() => void load()}>刷新</button>}>
       {error ? <p class="notice err">审计读取失败：{error}</p> : null}
       {rows && rows.length === 0 ? <Empty>还没有审计记录</Empty> : null}
       {rows && rows.length > 0 ? (
@@ -193,7 +201,7 @@ function AuditPanel() {
                 <span class="hint">{timeText(r.at)}</span>
                 <span>{r.actorKind ?? ''} {r.actor ?? ''}</span>
                 <code>{r.command ?? ''}</code>
-                <span class={r.outcome === 'ok' || r.outcome === 'success' ? 'tag success' : 'tag'}>{r.outcome ?? ''}</span>
+                <span class={r.outcome === 'ok' || r.outcome === 'success' ? 'badge tone-done' : 'badge tone-blocked'}>{r.outcome ?? ''}</span>
               </div>
               {r.summary ? <div>{r.summary}</div> : null}
               {r.reason ? <div class="hint">原因：{r.reason}</div> : null}
@@ -230,7 +238,7 @@ function ReadSqlPanel() {
   };
 
   return (
-    <Panel title="只读查询" hint="只允许读取。结果原样显示，请不要粘贴敏感数据。">
+    <Panel id="ops-read" title="只读查询" hint="只允许读取。结果原样显示，请不要粘贴敏感数据。">
       <div class="form">
         <label class="field">
           <span>SQL</span>
@@ -289,7 +297,7 @@ function IdpPanel() {
   };
 
   return (
-    <Panel title="身份服务（idp）" hint="ma_hono 租户与各类客户端的状态。" actions={<button type="button" onClick={() => void loadStatus()}>刷新</button>}>
+    <Panel id="ops-idp" title="身份服务（idp）" hint="ma_hono 租户与各类客户端的状态。" actions={<button type="button" onClick={() => void loadStatus()}>刷新</button>}>
       {statusError ? <p class="notice err">读取失败：{statusError}</p> : null}
       {status ? (
         <dl class="facts">
@@ -381,7 +389,7 @@ function CfApiPanel() {
   };
 
   return (
-    <Panel title="Cloudflare 只读接口" hint="只发起 GET 请求。">
+    <Panel id="ops-cf" title="Cloudflare 只读接口" hint="只发起 GET 请求。">
       <div class="form">
         <label class="field">
           <span>路径（以 / 开头）</span>
@@ -431,7 +439,7 @@ function DbWritePanel() {
   };
 
   return (
-    <details class="danger-zone bottom">
+    <details id="ops-write" class="danger-zone bottom">
       <summary>高危：直接写数据库（db.write）</summary>
       <div class="form">
         <p class="warn-text">这里的 SQL 会直接修改生产数据，没有撤销。执行前会再次显示 SQL 并要求确认。</p>

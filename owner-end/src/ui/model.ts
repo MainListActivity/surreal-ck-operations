@@ -401,9 +401,45 @@ export function noteLanes(notes: ReadonlyArray<{ lane: string }>): string[] {
   return [...new Set(notes.map(n => n.lane))].sort();
 }
 
-export function pageOf(hash: string): 'board' | 'requirements' | 'tasks' | 'notes' | 'staff' | 'ops' {
-  const name = hash.replace(/^#\/?/, '');
-  return name === 'requirements' || name === 'tasks' || name === 'notes' || name === 'staff' || name === 'ops' ? name : 'board';
+// ---- 路由：#page[/id][?k=v] ----
+
+export type PageId = 'overview' | 'requirements' | 'tasks' | 'messages' | 'notes' | 'staff' | 'ops';
+export const PAGES: readonly PageId[] = ['overview', 'requirements', 'tasks', 'messages', 'notes', 'staff', 'ops'];
+
+export interface Route {
+  page: PageId;
+  /** 详情页的记录编号（需求或任务）；`new` 表示新建。 */
+  id?: string;
+  params: Record<string, string>;
+}
+
+/**
+ * 旧入口仍可打开：#board → 总览（原看板的派工消息在 #messages）；#feedback → 需求池的反馈视图。未知地址回到总览。
+ */
+export function routeOf(hash: string): Route {
+  const raw = hash.replace(/^#\/?/, '');
+  const [path = '', query = ''] = raw.split('?', 2);
+  const params: Record<string, string> = {};
+  for (const [k, v] of new URLSearchParams(query)) if (v) params[k] = v;
+  const [name = '', ...rest] = path.split('/');
+  const id = rest.length ? decodeURIComponent(rest.join('/')) : undefined;
+  if (name === 'board') return { page: 'overview', params };
+  if (name === 'feedback') return { page: 'requirements', params: { ...params, view: 'feedback' } };
+  const page = (PAGES as readonly string[]).includes(name) ? name as PageId : 'overview';
+  return { page, ...(id && page !== 'overview' ? { id } : {}), params };
+}
+
+export function hrefOf(page: PageId, id?: string, params: Record<string, string | undefined> = {}): string {
+  const query = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) if (v) query.set(k, v);
+  const q = query.toString();
+  return `#${page}${id ? `/${encodeURIComponent(id)}` : ''}${q ? `?${q}` : ''}`;
+}
+
+/** 旧版页面判断（兼容保留）：总览即原「看板」，返回 `board`。新代码请用 {@link routeOf}。 */
+export function pageOf(hash: string): Exclude<PageId, 'overview'> | 'board' {
+  const page = routeOf(hash).page;
+  return page === 'overview' ? 'board' : page;
 }
 
 /** 命令面板的一组命令。 */
