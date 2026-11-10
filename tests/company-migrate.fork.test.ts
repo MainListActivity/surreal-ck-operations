@@ -191,8 +191,8 @@ run('空库上 company-migrate 应用全部 schema 到 CLOUD_SCHEMA_VERSION；�
   // 055 生产渲染：六个访问方式的定义里是 JWKS 地址；随后换成测试替身，使下一次登录可用。
   const probe = await rootSession(MIGRATE_NS);
   const [infoAfterFirst] = await probe.query<[Record<string, unknown>]>('INFO FOR DB;');
-  // 062：迁移之后不再有 outbox 表。
-  expect(Object.keys((infoAfterFirst.tables ?? {}) as Record<string, unknown>)).not.toContain('outbox');
+  // 0.7.0 不删 outbox 表：迁移之后它仍在，下个版本再删。
+  expect(Object.keys((infoAfterFirst.tables ?? {}) as Record<string, unknown>)).toContain('outbox');
   const renderedAccesses = (infoAfterFirst.accesses ?? {}) as Record<string, string>;
   for (const name of ACCESS_NAMES) expect(renderedAccesses[name]).toContain(`URL '${jwksUrl}'`);
   await standInAccesses(MIGRATE_NS);

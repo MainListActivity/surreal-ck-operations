@@ -195,25 +195,25 @@ loginctl enable-linger "$USER"
 4. 把 `current` 指向上一版插件目录（`ln -sfn "<上一版 plugin 目录>" "<服务目录>/current"`，与 `pointCurrent` 的结果一致），并用上一版发行包的 `scripts/sck.sh` 与 `scripts/bun-runtime.sh` 覆盖 `bin/sck` 与 `bin/bun-runtime.sh`（权限 700）。员工命令 `bin/sck` 依赖 `current`，两者需要同时恢复。
 5. 修复并发布新版本之前，不要运行节点更新器的 `install` 或 `run`，否则它会立即升级到最新 Release。
 
-0.7.0 的 schema 变化见下节，回退时无需删除表或字段。
+0.7.0 没有 schema 变化（仍为 061），回退时无需删除表或字段，细节见下节。
 
 ## 0.7.0 迁移与回退
 
 ### 变化
 
 - 删除 MCP 服务：节点上不再有 `org.surrealck.company-mcp` launchd 任务、`/mcp` 端点（端口 38473）、`releases/` 快照目录、`active` 符号链接、`scripts/company-service.sh`、`scripts/run-service.sh` 与 `scripts/deploy-mcp-remote.sh`。
-- 删除 GitHub 看板投影（`SCK_GITHUB_REPOSITORY` 等）与 `outbox` 事件表：schema 062 删除 `outbox` 表与 `company_meta:outbox_counter`（只有 GitHub 投影读取它）。`CLOUD_SCHEMA_VERSION` 为 62。`get_admin_summary` 不再返回 `outboxSequence`。
+- 删除 GitHub 看板投影（`SCK_GITHUB_REPOSITORY` 等）：核心不再写 `outbox` 事件。`outbox` 表与 `company_meta:outbox_counter` 保留在库中，0.7.0 不删除：0.6.1 核心仍在事务里写入它们，过早删表会让仍在 0.6.1 的节点写入失败，下个版本再删。`CLOUD_SCHEMA_VERSION` 仍为 61。`get_admin_summary` 不再返回 `outboxSequence`。
 - 新增 `current` 符号链接与 `bin/`：员工命令 `bin/sck` 从 `current/server/vendor/src/sck-cli.ts` 运行。
 
 ### 迁移
 
-迁移由 CI 的 release 作业执行一次（`scripts/company-migrate.ts`），节点不执行迁移。节点更新器在切换前核验云端 schema 是否满足清单的 `requiredSchema`，不满足则拒绝切换，节点停留在旧版本。
+迁移由 CI 的 release 作业执行一次（`scripts/company-migrate.ts`），节点不执行迁移。0.7.0 的 `requiredSchema` 为 061，云端库已在 061 时迁移只重放已有 schema（幂等），库结构不变。节点更新器在切换前核验云端 schema 是否满足清单的 `requiredSchema`，不满足则拒绝切换，节点停留在旧版本。
 
-待确认：当前工作区的 `schema/` 仍只到 061，`CLOUD_SCHEMA_VERSION` 为 61，`package.json`、`plugin/package.json` 与 `company-release.json` 仍为 0.6.1。0.7.0 的 schema 062 与版本号提升应与这些代码改动在同一提交完成后，本节才与发布内容一致。
+下个版本删除 `outbox` 表前，需要先确认节点都已升到不再写入 outbox 的版本（0.7.0 或更新），并在该版本的迁移说明中写明删表。
 
 ### 回退
 
-0.7.0 回退到 0.6.1 时，插件回退到上一版目录即可，不涉及 MCP 回退，也没有 `releases/` 回退。schema 062 删除的 `outbox` 表与 `company_meta:outbox_counter` 不会自动恢复。0.6.1 的 GitHub 投影读取这张表。待确认：0.6.1 能否在缺少 `outbox` 表的云端库上运行，回退前需要核对。
+0.7.0 回退到 0.6.1 时，插件回退到上一版目录即可，不涉及 MCP 回退，也没有 `releases/` 回退。两个版本的 schema 都是 061，`outbox` 表保留，回退不需要恢复任何表。回退后 0.6.1 核心会重新写入 `outbox` 事件，但 GitHub 投影已随 MCP 服务删除，不会恢复。
 
 ## 已知限制
 

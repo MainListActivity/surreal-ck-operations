@@ -475,4 +475,3 @@ GC 只删目录本身，不碰 `evidence/`、`deliverables/` 与任何已跟踪�
 - 员工凭证文件模式：`SCK_EMPLOYEE_CREDENTIAL_FILE` 与 `private/credentials/*.token`。员工通道只使用 comm 文件协议。
 - 独立调度器 launchd 任务 `org.surrealck.company-dispatcher`：调度器已经并入插件。
 - `npm` 或 `pnpm` 脚本 `mcp:client`、`mcp:serve`、`test:mcp:live` 与 `dispatcher`。
-- 云端 `outbox` 事件表与 `company_meta:outbox_counter`（schema 062）。

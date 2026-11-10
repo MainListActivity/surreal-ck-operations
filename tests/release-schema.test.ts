@@ -70,11 +70,11 @@ describe('the schema a target version must have reached', () => {
     expect(result).toMatchObject({ schema: LEGACY_SCHEMA_MINIMUM, schemaVersion: 41, tables: [] });
   });
 
-  test('0.5.0 needs schema 60; 0.6.0 needs schema 61 and the node tables; 0.7.0 needs schema 62 with no tables', () => {
+  test('0.5.0 needs schema 60; 0.6.0 needs schema 61 and the node tables; 0.7.0 needs schema 61 with no new tables', () => {
     expect(schemaRequirementFor('0.5.0')).toEqual({ schema: 60, tables: [] });
     expect(schemaRequirementFor('0.6.0')).toEqual({ schema: 61, tables: ['node_release', 'node_rollback'] });
-    expect(schemaRequirementFor('0.7.0')).toEqual({ schema: 62, tables: [] });
-    expect(CLOUD_SCHEMA_VERSION).toBe(62);
+    expect(schemaRequirementFor('0.7.0')).toEqual({ schema: 61, tables: [] });
+    expect(CLOUD_SCHEMA_VERSION).toBe(61);
   });
 
   test('the version in package.json needs the schema this code applies', () => {

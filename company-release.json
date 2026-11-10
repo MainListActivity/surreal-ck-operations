@@ -3,7 +3,7 @@
   "title": "删除公司 MCP 服务与 GitHub 镜像，sck 只走插件通道",
   "changes": [
     "删除公司 MCP 服务（launchd 任务、/mcp 端点、端口 38473）、远程部署脚本、company-service.sh 与 releases 快照；节点不再有 MCP 服务与手工安装步骤。",
-    "删除 GitHub 镜像：outbox 事件、投影进程，以及 SCK_GITHUB_REPOSITORY、SCK_PROJECTOR_CREDENTIAL_FILE、SCK_PROJECTION_STATE_FILE 配置。",
+    "删除 GitHub 镜像：核心不再写 outbox 事件，投影进程与 SCK_GITHUB_REPOSITORY、SCK_PROJECTOR_CREDENTIAL_FILE、SCK_PROJECTION_STATE_FILE 配置一并删除；outbox 表保留，下个版本再删。",
     "sck 只走 comm 通道（SCK_COMM_DIR 指向的插件 sidecar），删除凭证文件模式（SCK_EMPLOYEE_CREDENTIAL_FILE、SCK_MCP_URL）与 admin enroll 的 token 文件。",
     "节点更新器切换成功或回退后维护 <serviceHome>/current 指向现役插件目录，并把 sck.sh、bun-runtime.sh 安装到 <serviceHome>/bin/。",
     "调度器删除非 sidecar 回退：没有 sidecar 的员工不派工；提示词只保留 comm 形态的工具说明。"
@@ -13,6 +13,6 @@
     "员工通道只剩 comm 文件协议；仍设置 SCK_EMPLOYEE_CREDENTIAL_FILE 或 SCK_MCP_URL 的环境不再生效。",
     "GitHub 上已有的 [Company] issue 与评论不会删除，但之后不再更新。"
   ],
-  "migration": "schema 062：删除 outbox 事件表、outbox_sequence 索引与 company_meta:outbox_counter。本机库启动时自动应用；云端库须由 migrator 先应用到 062。",
-  "rollback": "把 <serviceHome>/current 指回上一版 plugin-releases/<sha>/plugin 即可；无 schema 回退，回退后 GitHub 镜像不会恢复。降级前需先确认旧版能在缺少 outbox 表的库上运行，此点尚未验证。"
+  "migration": "无 schema 变化，沿用 schema 061。outbox 表保留但 0.7.0 不再写入，下个版本再删。",
+  "rollback": "把 <serviceHome>/current 指回上一版 plugin-releases/<sha>/plugin 即可；schema 仍为 061，无需恢复任何表。回退后 0.6.1 核心会重新写入 outbox 事件，GitHub 投影已随 MCP 服务删除，不会恢复。"
 }

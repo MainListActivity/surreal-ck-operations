@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Surreal } from 'surrealdb';
+import { RecordId, Surreal } from 'surrealdb';
 import type { DatabaseConfig } from './config.ts';
 import { connectDb, openDb, useDb, type DbTarget } from './db-connection.ts';
 import { CompanyError } from './core-errors.ts';
@@ -100,7 +100,7 @@ const pause = (ms: number): Promise<void> => new Promise(resolve => {
 });
 
 /** 本版本 applySchema 的最后一个结构版本；云端 bootstrap 只核对库内版本不低于它。 */
-export const CLOUD_SCHEMA_VERSION = 62;
+export const CLOUD_SCHEMA_VERSION = 61;
 
 export class CompanyDatabase {
   /** 当前会话的客户端；云端续期或重连时整体替换（见 rebuildNow）。 */
@@ -439,7 +439,7 @@ export class CompanyDatabase {
   }
 
   /**
-   * 按序应用全部 schema（001 至 062；055 按配置渲染）。fresh 时写入归属标记。本机 bootstrap 与云端 company-migrate 共用；
+   * 按序应用全部 schema（001 至 061；055 按配置渲染）。fresh 时写入归属标记。本机 bootstrap 与云端 company-migrate 共用；
    * 云端只有 migrator 能应用。
    */
   async applySchema(fresh: boolean): Promise<void> {
@@ -448,6 +448,7 @@ export class CompanyDatabase {
     if (fresh) {
       await this.db.query('CREATE company_meta:installation CONTENT { owner: $owner, schema_version: 1 };', { owner: OWNER });
     }
+    await this.ensureOutboxSequence();
     await this.db.query(loadSchema('002-outbox-sequence.surql'));
     await this.db.query(loadSchema('003-workforce.surql'));
     await this.db.query(loadSchema('004-eval.surql'));
@@ -600,9 +601,29 @@ export class CompanyDatabase {
     // 061：节点记录与升级回退记录（每台执行端一行 node_release；node_rollback 追加写）。只新增表与索引，不改任何既有行；旧 release 读不到即忽略（RB01）。
     await this.db.query(loadSchema('061-node-release.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 61 WHERE schema_version < 61;');
-    // 062：删除 GitHub 镜像的事件表与序号计数器（0.7.0）。只删不改既有行。
-    await this.db.query(loadSchema('062-drop-github-mirror.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 62 WHERE schema_version < 62;');
+  }
+
+  private async ensureOutboxSequence(): Promise<void> {
+    const counter = new RecordId('company_meta', 'outbox_counter');
+    if (await this.db.select(counter)) {
+      const marker = await this.db.select<{ schema_version: number }>(new RecordId('company_meta', 'installation'));
+      if (marker && marker.schema_version < 2) {
+        await this.db.query('UPDATE company_meta:installation SET schema_version = 2;');
+      }
+      return;
+    }
+    const [events] = await this.db.query<[Array<{ id: RecordId }>]>(
+      'SELECT id, at FROM outbox ORDER BY at, id;'
+    );
+    for (const [index, event] of events.entries()) {
+      await this.db.query('UPDATE $event SET sequence = $sequence;', {
+        event: event.id, sequence: index + 1,
+      });
+    }
+    await this.db.query('CREATE $counter CONTENT { value: $value };', {
+      counter, value: events.length,
+    });
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 2;');
   }
 
   /** Selects the configured namespace/database without touching schema (runtimes that only query). */

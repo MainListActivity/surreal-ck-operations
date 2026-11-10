@@ -297,7 +297,9 @@ run('WT02: done exclusive is removed, shared retained; dirty exclusive kept with
 run('WT02: lease expire keeps recovery scene; orphan past grace reclaims managed legacy tree', async () => {
   const path = repo();
   const clock = { now: new Date('2026-10-10T12:00:00.000Z') };
-  const core = new SurrealCompanyCore(db, { leaseSeconds: 1, worktrees: { opsRepo: path, now: () => clock.now } });
+  // Whole-second lease stamps: a 1 s lease can lapse between the reviewer's claim and accept under load (intermittent).
+  // lapseLease forces the expiry this test needs, so the reclaimed and review leases can be long.
+  const core = new SurrealCompanyCore(db, { leaseSeconds: 30, worktrees: { opsRepo: path, now: () => clock.now } });
   const eng = await employee('engineering'), next = await employee('engineering');
   const t = await task(core, 'engineering');
   const a = await core.claim(eng, t.id);

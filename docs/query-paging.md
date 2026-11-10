@@ -141,7 +141,7 @@ null 语义（sidecar 与核心一致）：
 - `integrity.complete` 为真，当且仅当以下四项全部成立：`taskCountsMatchRows`（状态计数之和等于任务总数）、`auditCountsMatchRows`（动作计数之和等于审计总数）、`statesKnown`（所有状态均为已知状态）、`repeatableRead`（同一事务内第二次读取与第一次一致）。
 - `integrity.complete` 为假时，返回的数字不能作为完整结论，应重试。
 
-0.7.0 起汇总不再返回 `outboxSequence`，因为 outbox 事件表已删除（schema 062）。
+0.7.0 起汇总不再返回 `outboxSequence`，因为核心不再写 outbox 事件（表保留，下个版本再删）。
 
 读取在一个 `BEGIN…COMMIT` 事务内完成。`repeatableRead` 只是一致性的一项检查。并发一致性另由公司 fork 的并发用例验证：任务状态变化与审计写入同时进行时，每次汇总的完整性检查都通过，任务总数保持不变，审计计数不减少。
 

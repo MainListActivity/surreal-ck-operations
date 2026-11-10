@@ -362,12 +362,23 @@ test('real DB: retire_task voids work, unblocks dependents, idempotent, releases
   }
 });
 
-test('real DB: schema 062 leaves no outbox table or counter behind', async () => {
-  // applySchema defines outbox in 001 and 002, then 062 removes it as the last step of every run.
-  const [, info] = await database.db.query<[unknown, { tables: Record<string, unknown> }]>(
-    'SELECT schema_version FROM ONLY company_meta:installation; INFO FOR DB;'
-  );
-  expect(Object.keys(info.tables)).not.toContain('outbox');
+test('real DB: 0.7.0 writes no outbox rows, and the outbox table stays until the next release drops it', async () => {
+  // 001 and 002 still define the outbox table. Nothing in 0.7.0 writes to it, so task writes leave its row count unchanged.
+  const count = async (): Promise<number> => {
+    const [rows] = await database.db.query<[Array<{ count: number }>]>('SELECT count() AS count FROM outbox GROUP ALL;');
+    return rows[0]?.count ?? 0;
+  };
+  const before = await count();
+  const created = await core.createTask(gm, {
+    title: `Outbox quiet ${suffix}`, context: 'A task write in 0.7.0 leaves the outbox table unchanged.',
+    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `outbox-quiet-${suffix}`,
+  });
+  const claimant = await enrollment.enroll(`test-outbox-${suffix}`, 'engineering', ['execute', 'review']);
+  await core.claim(claimant, created.id);
+  expect(await count()).toBe(before);
+  const [info] = await database.db.query<[{ tables: Record<string, unknown> }]>('INFO FOR DB;');
+  expect(Object.keys(info.tables)).toContain('outbox');
+  // The counter stays too: 0.6.1 nodes still take outbox sequence numbers from it.
   const [counter] = await database.db.query<[unknown]>('SELECT * FROM ONLY company_meta:outbox_counter;');
-  expect(counter).toBeFalsy();
+  expect(counter).toBeTruthy();
 });
