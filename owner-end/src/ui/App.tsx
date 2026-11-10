@@ -1,6 +1,6 @@
 import { RequirementsPage } from './pages/Requirements.tsx';
 import { useCallback, useEffect, useState } from 'preact/hooks';
-import { beginLogin, CALLBACK_PATH, completeLogin } from './auth.ts';
+import { beginLogin, CALLBACK_PATH, completeLogin, LOGIN_LABEL, LOGIN_HINT } from './auth.ts';
 import { logout, onUnauthorized, readMe, type Me } from './api.ts';
 import { pageOf, withDraft, withoutDraft, type Drafts } from './model.ts';
 import { BoardPage } from './pages/Board.tsx';
@@ -42,11 +42,11 @@ function LoginPage({ notice }: { notice?: string }) {
   return (
     <main class="login">
       <h1>老板端</h1>
-      <p>看板、需求与运维操作都需要老板身份。请用 ma_hono 账号登录。</p>
+      <p>{LOGIN_HINT}</p>
       {notice ? <p class="notice err" role="alert">{notice}</p> : null}
       {error ? <p class="notice err" role="alert">{error}</p> : null}
       <button type="button" class="primary" disabled={busy} onClick={() => void start()}>
-        {busy ? '正在跳转…' : '用 ma_hono 账号登录'}
+        {busy ? '正在跳转…' : LOGIN_LABEL}
       </button>
     </main>
   );

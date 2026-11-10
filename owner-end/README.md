@@ -49,6 +49,10 @@
 | `CF_ACCOUNT_ID`、`CF_API_TOKEN` | `cf.api` 命令的账号 id 与令牌（都要设置） | `cf.api` 返回 `not_configured` |
 | `MAGPIE_BASE_URL`、`MAGPIE_MODEL`、`MAGPIE_API_KEY` | 译文服务（三者都要设置）。`MAGPIE_BASE_URL` 是 OpenAI 兼容接口的基址，代码在其后追加 `/chat/completions`，所以基址要写到 API 版本路径（如 `/v1`）为止 | 译文与笔记改写不可用，定时补译跳过 |
 
+## 设计师离线预览
+
+仅改交互和 UI 时，使用 `pnpm --dir owner-end demo`（仓库根目录也可用 `pnpm owner:demo`）。点击登录直接进入静态数据环境，无需生产账号或数据库。支持导入老板导出的脱敏快照；详见 [本地设计环境](demo/README.md)。
+
 ## 本地开发
 
 本地用 `wrangler dev --local` 运行 Worker，数据库用公司 fork 的本机 SurrealDB（不要用上游官方版本），不连生产库。
