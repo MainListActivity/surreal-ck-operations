@@ -155,6 +155,7 @@ const NEEDS_CLOUD = "需要云端执行端：公司命令只在云端模式可�
 
 export interface SidecarDeps {
   managedLifecycle?: boolean;
+  readTurnResult?: (agent: string, turn: string) => Promise<string>;
   executionChanged?: (row: ExecutionAttempt) => Promise<void>;
   nativeExecution?: boolean;
   core: CompanyCore;
@@ -305,6 +306,19 @@ export class SidecarPool {
     return this.collectExecution(row);
   }
   private async collectExecution(row: ExecutionAttempt): Promise<SettleResult> {
+    if (!row.finalText && !row.artifacts?.raw && !row.artifacts?.report && !row.artifacts?.blocker && this.deps.readTurnResult) {
+      try {
+        if (!row.agent || !row.turn) throw new Error('missing turn identity');
+        row.finalText = await this.deps.readTurnResult(row.agent, row.turn);
+        if (!row.finalText.trim()) throw new Error('empty runtime result');
+        row.error = undefined;
+        await this.changed(row);
+      } catch {
+        row.tries++; row.error = 'runtime_result_unavailable'; row.nextRetry = Date.now() + 10000;
+        await this.changed(row);
+        return {status: 'pending'}; // Transport/history availability is never a business blocker.
+      }
+    }
     try {
       const { raw, blocker, report } = row.artifacts ?? {}; // Never read a later delivery's shared files during recovery.
       row.result = blocker !== undefined ? workResult('', row.phase, { summary: blocker, outcome: 'blocked' })
@@ -324,7 +338,7 @@ export class SidecarPool {
   async retryExecutions(): Promise<void> {
     if (!this.journal || this.closed) return;
     for (const row of this.journal.rows()) {
-      if (row.state === 'collecting') {
+      if (row.state === 'collecting' && row.nextRetry <= Date.now()) {
         await this.collectExecution(row);
       } else if (row.state === 'pending' && row.nextRetry <= Date.now()) await this.flushExecution(row);
     }

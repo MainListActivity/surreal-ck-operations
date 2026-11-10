@@ -37,7 +37,7 @@ import { SidecarPool } from '../src/runner/sidecar.ts';
 import { writeFileSync, existsSync } from 'node:fs';
 import type { LeaseProof, ClaimResult } from '../src/contracts.ts';
 
-function fixture() {
+function fixture(readTurnResult?: (agent: string, turn: string) => Promise<string>) {
   const root = mkdtempSync(join(tmpdir(), 'sck-runner-flow-'));
   const calls: Array<{ action: string; proof: LeaseProof; key: string }> = [];
   let delivery = 'delivery-a', version = 2, phase: 'doing' | 'review' = 'doing', submitted = false;
@@ -61,7 +61,7 @@ function fixture() {
     activeLeases: async () => submitted ? [] : [{ ...task(), taskId: 'task' }],
     submit: transition('submit'), accept: transition('accept'), returnTask: transition('return'), block: transition('block') };
   const workforce = { rotate: async () => 'synthetic', insts: async () => [inst] };
-  const options = { core: core as never, workforce: workforce as never, runDir: join(root, 'comm'), managedLifecycle: true, heartbeatMs: 15 };
+  const options = { core: core as never, workforce: workforce as never, runDir: join(root, 'comm'), managedLifecycle: true, readTurnResult, heartbeatMs: 15 };
   let pool = new SidecarPool(options);
   const event = (turn = 'turn-a', text = '工作已完成，全部只读检查通过，证据已生成。', kind = 'completed') =>
     ({ agent: { id: 'agent' }, turnId: turn, outcome: { kind }, timeline: [{ type: 'assistant_message', text }] });
@@ -182,4 +182,27 @@ test('重复结束恢复同一 collecting 快照，不重新读取被覆盖的�
     expect(f.calls.map(c => c.action)).toEqual(['submit']);
     expect(f.journal().rows()[0]?.state).toBe('settled');
   } finally { f.close(); }
+});
+
+
+test('宿主结束事件没有正文时按回合读取，读取失败由执行端持久重试而非报告业务阻塞', async () => {
+  let available = false;
+  const f = fixture(async (agent, turn) => { expect([agent,turn]).toEqual(['agent','turn-a']); if (!available) throw new Error('history unavailable'); return '真实会话最终成果已读取，计算与验证均已完成。'; });
+  try {
+    await f.claim(); await f.pool.turnStarted('agent','turn-a');
+    await f.pool.settleExecution({...f.event(),timeline:[]});
+    expect(f.calls).toHaveLength(0);expect(f.journal().rows()[0]?.state).toBe('collecting');
+    await f.restart();available = true;await f.retry();
+    expect(f.calls.map(c=>c.action)).toEqual(['submit']);expect(f.journal().rows()[0]?.state).toBe('settled');
+  } finally { f.close(); }
+});
+import { readTurnResult } from '../src/runner/turn-result.ts';
+test('宿主读取只接受目标回合的最终答复，不串新回合也不把进度当成果', async () => {
+  const host = (entries: unknown[]) => ({agents:{ref:()=>({timeline:{refetch:async()=>({epoch:'e',hasOlder:false,entries})}})}}) as never;
+  expect(await readTurnResult(host([
+    {turnId:'a',seqEnd:2,item:{type:'assistant_message',text:'正确成果'}},
+    {turnId:'b',seqEnd:3,item:{type:'assistant_message',text:'另一个任务'}}
+  ]),'agent','a')).toBe('正确成果');
+  await expect(readTurnResult(host([{turnId:'b',seqEnd:1,item:{type:'assistant_message',text:'旧结果'}}]),'agent','a')).rejects.toThrow('unavailable');
+  await expect(readTurnResult(host([{turnId:'a',seqEnd:1,item:{type:'assistant_message',text:'正在检查'}},{turnId:'a',seqEnd:2,item:{type:'tool_call'}}]),'agent','a')).rejects.toThrow('not yet');
 });

@@ -1,5 +1,6 @@
 // 公司执行栈：由 Paseo 兼容宿主或独立原生执行端提供执行器。
 
+import { readTurnResult } from './turn-result.ts';
 import { loadServiceEnv, serviceHome } from "./env.ts";
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
@@ -222,6 +223,7 @@ export function company(): Promise<Company> {
     const sidecar = new SidecarPool({
       nativeExecution: runtimeOptions.native,
       managedLifecycle: true,
+      readTurnResult: runtimeOptions.native ? undefined : (agent, turn) => readTurnResult(currentHost(), agent, turn),
       executionChanged: async row => {
         const { RecordId } = await import('surrealdb');
         await db.db.query(`UPDATE $task SET runtime_execution = $execution

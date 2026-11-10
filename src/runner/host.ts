@@ -12,6 +12,11 @@ export interface RuntimeHost {
     listUsage(): Promise<{ fetchedAt?: string; providers?: ProviderUsage[] }>;
   };
   agents: { ref(id: string): {
+    timeline?: { refetch(options: { direction: 'tail' | 'before'; cursor?: {epoch: string; seq: number}; limit: number; projection: 'projected' }): Promise<{
+      error?: string | null; gap?: boolean; staleCursor?: boolean; epoch: string; hasOlder: boolean;
+      startCursor?: {epoch: string; seq: number} | null;
+      entries: Array<{ turnId?: string; seqEnd: number; item: { type: string; text?: string } }>;
+    }> };
     send(prompt: string): Promise<unknown>;
     refresh(): Promise<{ agent?: { labels?: Record<string, string> } } | null>;
     respondToPermission(input: { requestId: string; response: { behavior: "allow" } }): Promise<unknown>;
