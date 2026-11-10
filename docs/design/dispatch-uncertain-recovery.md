@@ -128,3 +128,11 @@ Mac系统libSystem的flock已实测；Linux libc.so.6及实际部署镜像尚未
 - 独立人工确认命令已接线（scripts/dispatch-recovery.ts），不通过会bootstrap的admin入口；不迁移、不扩权、非TTY写入拒绝、响应丢失给精确operation/approval用于对账。
 - `SCK_TEST_TIMEOUT_SECONDS=180 bun scripts/test-worktrees.ts tests/dispatch-attempt.fork.test.ts tests/company-access.fork.test.ts`：31通过、199断言，日志`/tmp/recovery-terminal-fork-final.log`。
 - 现成本机Podman VM上的现成`docker.io/oven/bun:1-alpine`，以`--pull=never --network=none`只读挂载本分支运行`bun test tests/native-runtime.test.ts`：19通过、67断言，日志`/tmp/native-linux-alpine.log`。Linux aarch64，VM glibc2.42；此结果属于已有Bun容器，不等同生产镜像全链验收。之后VM停止/socket拒绝连接，尚未完成Linux公司fork组合验证。
+
+## 全量桥接与Linux环境结果
+
+`bun run test:bridge`最终完成：1278通过、86跳过、0失败，7928断言，103文件，223.31秒。日志`/tmp/dispatch-recovery-full-bridge.log`。86项跳过不计通过；新增人工确认入口另由真实fork31项矩阵覆盖，非线上验收。
+
+Linux现成公司fork镜像读取成功：`ghcr.io/mainlistactivity/surrealdb-native-quota:3.3.0-native-quota.1`，本地image ID `1c07e8b57710ad0cd01a8964e03a8f57b2083a47bfd4a7bd16a2a521b73af773`，arm64，实际`version`输出`3.3.0-native-quota.1+sha.f30704bce914 for linux on aarch64`。不将其宣称为Mac二进制对应源码版本。
+
+Linux NativeRuntime命令：`podman run --rm --pull=never --network=none -v /Users/y/IdeaProjects/surreal-ck-operations-dispatch-recovery:/work:ro -w /work docker.io/oven/bun:1-alpine bun test tests/native-runtime.test.ts`。19/19通过（67断言）。之后两次VM启动后再次停止，socket拒绝连接；原因未确认，没有改安全/资源设置。Linux公司fork组合矩阵未完成，不计通过；没有拉取镜像或下载软件。
