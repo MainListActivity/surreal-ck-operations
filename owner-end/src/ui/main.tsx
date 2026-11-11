@@ -1,3 +1,5 @@
+// 必须最先求值：为共享核心补 Buffer / process 全局（见 node-shim/globals.ts）。
+import './node-shim/globals.ts';
 import { render } from 'preact';
 import { App } from './App.tsx';
 

@@ -30,12 +30,23 @@ import { OWNER_ONLY_FOR_AGENTS, hardTargetOwnerOnly } from './owner-locks.ts';
 import { POLICY_COMMANDS, policyCommand } from './policy-commands.ts';
 import { translateChecked, translateMessage, translatePreview, translationFresh, TRANSLATE_COMMANDS } from './messages.ts';
 import { isRecord, textOf } from './rows.ts';
+import { BACKEND_OWNER_COMMANDS } from './command-routing.ts';
+export { BACKEND_OWNER_COMMANDS };
 
 export type Input = Record<string, unknown>;
 
 type OwnerCaller = Extract<Caller, { kind: 'owner' }>;
 type AgentCaller = Extract<Caller, { kind: 'agent' }>;
 type SystemCaller = Extract<Caller, { kind: 'system' }>;
+
+/** 分派命令需要的依赖。cfg 缺省表示没有服务端配置（浏览器直连），只能执行不读配置、不调外部服务的命令。 */
+export interface DispatchDeps {
+  cfg?: Config;
+  fetch?: typeof fetch;
+  now?: () => Date;
+  /** 执行端作业的等待毫秒数；缺省 25 秒。 */
+  waitMs?: number;
+}
 
 /** 命令执行需要的依赖。fetch 与 now 只在测试里替换。 */
 export interface GatewayDeps {
@@ -58,6 +69,12 @@ export function isRunnerCommand(command: string): boolean {
 }
 
 const OWNER_ONLY_REASON = '该命令只能由老板调用';
+
+
+function configOf(deps: DispatchDeps): Config {
+  if (!deps.cfg) throw new CompanyError('unavailable', '该命令需要服务端执行');
+  return deps.cfg;
+}
 
 
 const reasonOf = (error: unknown): string => error instanceof CompanyError ? error.message : '服务暂时出错';
@@ -147,32 +164,36 @@ async function audited<T>(db: Surreal, base: AuditBase, run: () => Promise<T>): 
 }
 
 async function ownerCall(deps: GatewayDeps, caller: OwnerCaller, command: string, input: Input): Promise<unknown> {
-  return withSession(await deps.sessions.owner(caller.token.token), (db) => {
-    const who: Who = { actorKind: 'owner', actor: caller.sub, via: 'web' };
-    const run = () => dispatch(deps, db, who, command, input);
-    if (isReadOnly(command)) return run();
-    return audited(db, { actorKind: 'owner', actor: caller.sub, command, args: input }, run);
-  });
+  return withSession(await deps.sessions.owner(caller.token.token), (db) => runOwnerCommandOn(deps, db, caller.sub, command, input));
+}
+
+/** 老板命令在给定的老板连接上执行（不关闭连接）。服务端与浏览器直连共用；写命令照常记审计。 */
+export function runOwnerCommandOn(deps: DispatchDeps, db: Surreal, actor: string, command: string, input: Input): Promise<unknown> {
+  if (!deps.cfg && BACKEND_OWNER_COMMANDS.has(command)) return Promise.reject(new CompanyError('unavailable', '该命令需要服务端执行'));
+  const who: Who = { actorKind: 'owner', actor, via: 'web' };
+  const run = () => dispatch(deps, db, who, command, input);
+  if (isReadOnly(command)) return run();
+  return audited(db, { actorKind: 'owner', actor, command, args: input }, run);
 }
 
 /** 按命令分派。老板与员工共用，差别只在 who：执行端作业的身份与任务、核心写入的标签。 */
-async function dispatch(deps: GatewayDeps, db: Surreal, who: Who, command: string, input: Input): Promise<unknown> {
-  const { cfg } = deps;
+async function dispatch(deps: DispatchDeps, db: Surreal, who: Who, command: string, input: Input): Promise<unknown> {
+  const cfg = () => configOf(deps);
   if (ITERATION_COMMANDS.has(command)) {
     if (who.actorKind !== 'owner') throw new CompanyError('forbidden', '需求决策只能由老板执行');
     return iterationCommand(db, command, input, who.actor);
   }
   if (isRunnerCommand(command)) return queueJob(deps, db, who, command, input);
-  if (IDENTITY_COMMANDS.has(command)) return identityCommand(cfg, db, command, input, deps.fetch);
-  if (POLICY_COMMANDS.has(command)) return policyCommand(db, command, input, who.actor, cfg.locks);
+  if (IDENTITY_COMMANDS.has(command)) return identityCommand(cfg(), db, command, input, deps.fetch);
+  if (POLICY_COMMANDS.has(command)) return policyCommand(db, command, input, who.actor, cfg().locks);
   if (TRANSLATE_COMMANDS.has(command)) {
-    if (command === 'translate.preview') return translatePreview(cfg, input, deps.fetch);
-    return translateMessage(new OutboundMessageStore(db), cfg, input, who.actor, deps.fetch);
+    if (command === 'translate.preview') return translatePreview(cfg(), input, deps.fetch);
+    return translateMessage(new OutboundMessageStore(db), cfg(), input, who.actor, deps.fetch);
   }
   switch (command) {
     case 'db.read': return dbRead(db, input);
     case 'db.write': return dbWrite(db, input);
-    case 'cf.api': return cloudflareApi(cfg, { method: String(input.method ?? ''), path: String(input.path ?? ''), body: input.body }, deps.fetch);
+    case 'cf.api': return cloudflareApi(cfg(), { method: String(input.method ?? ''), path: String(input.path ?? ''), body: input.body }, deps.fetch);
     case 'ops.job.list': return { jobs: await listJobs(db, input) };
     case 'ops.job.get': return { job: await jobDetail(db, textOf(input.id, 'id', 200)) };
     case 'audit.list': return listAudit(db, input);
@@ -189,7 +210,7 @@ async function dispatch(deps: GatewayDeps, db: Surreal, who: Who, command: strin
  * 执行端命令：排队到 ops_job（员工的作业带员工与任务，执行端据此核对租约），最多等 25 秒。
  * 完成返回结果，失败转为对应错误，超时返回 pending（202，附任务号）。
  */
-async function queueJob(deps: GatewayDeps, db: Surreal, who: Who, command: string, input: Input): Promise<unknown> {
+async function queueJob(deps: DispatchDeps, db: Surreal, who: Who, command: string, input: Input): Promise<unknown> {
   const jobId = await enqueueJob(db, { command, input, actorKind: who.actorKind, actor: who.actor, task: who.task }, deps.now?.());
   const outcome = await waitForJob(db, jobId, deps.waitMs);
   if (outcome.state === 'done') return outcome.result;
@@ -201,11 +222,11 @@ async function queueJob(deps: GatewayDeps, db: Surreal, who: Who, command: strin
  * 原文已保存。消息选了语言的，立即补译；补译失败不回滚原文，返回里带 translationPending，
  * 由定时任务稍后补上（见 cron.ts）。
  */
-async function translateSaved(deps: GatewayDeps, db: Surreal, saved: unknown, actor: string): Promise<unknown> {
+async function translateSaved(deps: DispatchDeps, db: Surreal, saved: unknown, actor: string): Promise<unknown> {
   const message = saved as OutboundMessage;
   if (!message.lang) return message;
   try {
-    const translated = await translateChecked(deps.cfg, message.body, message.lang, deps.fetch);
+    const translated = await translateChecked(configOf(deps), message.body, message.lang, deps.fetch);
     return await new OutboundMessageStore(db).setTranslation(message.id, message.lang, translated, message.body, actor);
   } catch (error) {
     return { ...message, translationPending: reasonOf(error) };
@@ -213,12 +234,12 @@ async function translateSaved(deps: GatewayDeps, db: Surreal, saved: unknown, ac
 }
 
 /** 放行（message.release / message.send）：选了语言而译文未就绪的，先译好再放行；译文失败则不放行。 */
-async function release(deps: GatewayDeps, db: Surreal, command: string, input: Input, who: Who): Promise<unknown> {
+async function release(deps: DispatchDeps, db: Surreal, command: string, input: Input, who: Who): Promise<unknown> {
   const messageId = textOf(input.messageId, 'messageId', 200);
   const store = new OutboundMessageStore(db);
   const message = await store.get(messageId);
   if (message && message.state !== 'sent' && message.lang && !translationFresh(message)) {
-    const translated = await translateChecked(deps.cfg, message.body, message.lang, deps.fetch);
+    const translated = await translateChecked(configOf(deps), message.body, message.lang, deps.fetch);
     await store.setTranslation(message.id, message.lang, translated, message.body, who.actor);
   }
   return runOwnerApi(db, command, { ...input, messageId }, who.via);

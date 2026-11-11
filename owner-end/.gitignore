@@ -4,3 +4,4 @@ public/*.map
 dist/
 .wrangler/
 .dev.vars
+public/chunks/

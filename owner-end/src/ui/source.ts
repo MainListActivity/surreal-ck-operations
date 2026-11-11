@@ -8,6 +8,7 @@
 import { AuthenticationError, InvalidSessionError, NotAllowedError, Surreal, Table } from 'surrealdb';
 import { readBoard } from '../../../src/board.ts';
 import { readRuntimeDashboard, type RuntimeDashboard } from '../../../src/runtime-dashboard.ts';
+import { BACKEND_OWNER_COMMANDS } from '../command-routing.ts';
 import { LIVE_TABLES } from '../live-tables.ts';
 import { accessToken, currentSession, loadConfig, refreshSession } from './auth.ts';
 import { SessionKeeper } from './session-keeper.ts';
@@ -107,7 +108,7 @@ export function isSessionExpired(error: unknown): boolean {
  * 读数据前确保会话未过期（休眠唤醒后计时器可能还没来得及续期）；
  * 仍收到会话过期就立即重新鉴权（同时触发 LIVE 重建）并重试一次。
  */
-async function withSession<T>(read: (db: Surreal) => Promise<T>): Promise<T> {
+async function withSession<T>(read: (db: Surreal) => Promise<T>, retry = true): Promise<T> {
   const db = await database();
   await keeper?.ensure();
   try {
@@ -115,6 +116,7 @@ async function withSession<T>(read: (db: Surreal) => Promise<T>): Promise<T> {
   } catch (error) {
     if (!keeper || !isSessionExpired(error)) throw error;
     await keeper.ensure(true);
+    if (!retry) throw new SourceError('network', '与公司库的会话已过期并已恢复，请重试');
     return read(db);
   }
 }
@@ -144,6 +146,42 @@ export async function readDashboardData(): Promise<RuntimeDashboard> {
     return plain(await withSession(readRuntimeDashboard));
   } catch (error) {
     throw classify(error);
+  }
+}
+
+/** 该命令能否在页面里直接执行。读服务端配置或调外部服务的命令仍经 /api/cmd。 */
+export function runsInPage(command: string): boolean {
+  return !BACKEND_OWNER_COMMANDS.has(command);
+}
+
+/** 令牌里的 sub：审计与核心写入里记录的老板身份，与服务端从已验签令牌取得的一致。 */
+function ownerSub(): string {
+  const raw = currentSession()?.accessToken.split('.')[1];
+  if (!raw) throw new SourceError('unauthorized');
+  try {
+    const payload = JSON.parse(atob(raw.replace(/-/g, '+').replace(/_/g, '/'))) as { sub?: unknown };
+    if (typeof payload.sub === 'string' && payload.sub) return payload.sub;
+  } catch {
+    // 落到下方
+  }
+  throw new SourceError('unauthorized');
+}
+
+/**
+ * 在页面里执行老板命令：老板令牌直连，用与服务端相同的 dispatch 与审计（commands.ts）。
+ * 业务错误原样抛出（由调用方按 errors.ts 的同一套规则映射）；鉴权失败抛 SourceError('unauthorized')。
+ */
+export async function runOwnerCommand(command: string, input: Record<string, unknown>): Promise<unknown> {
+  // 命令执行链（共享核心的大部分）单独成块，第一次在页面里执行命令时才下载。
+  const { parseCommandBody, runOwnerCommandOn } = await import('../commands.ts');
+  const body = parseCommandBody({ command, input });
+  const actor = ownerSub();
+  try {
+    // 一条命令可能分多条语句写库，会话中途过期时前面的写入已生效，所以不自动重试，交给老板重试。
+    return plain(await withSession((db) => runOwnerCommandOn({}, db, actor, body.command, body.input), false));
+  } catch (error) {
+    if (error instanceof SourceError || isAuthFailure(error)) throw classify(error);
+    throw error;
   }
 }
 

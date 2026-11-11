@@ -31,6 +31,12 @@ async function read<T>(path: string): Promise<T> {
   throw new SourceError('unavailable', body?.error?.message ?? '');
 }
 
+/** 设计模式下所有命令都交给本机演示服务的 /api/cmd。 */
+export const runsInPage = (_command: string): boolean => false;
+export async function runOwnerCommand(): Promise<never> {
+  throw new SourceError('unavailable', '设计模式不在页面内执行命令');
+}
+
 export const readDashboardData = (): Promise<RuntimeDashboard> => read<RuntimeDashboard>('/api/dashboard');
 export const readBoardData = (): Promise<OwnerBoard> => read<OwnerBoard>('/api/board');
 
