@@ -47,6 +47,7 @@ export function handler(store:DemoStore,origin:string,build=buildDemo){
         const text=await request.text();if(text.length>1_000_000)throw new DemoError('本地请求过大',413);
         if(url.pathname==='/api/demo/reset'){runtime.reset();response=json({ok:true,result:store.reset()});}
         else if(url.pathname==='/api/demo/transfer'){runtime.transfer();response=json({ok:true});}
+        else if(url.pathname==='/api/demo/crowd')response=json({ok:true,result:runtime.crowd()});
         else if(url.pathname==='/api/cmd'){
           const body=JSON.parse(text);if(typeof body.command!=='string')throw new DemoError('命令格式无效');
           response=json({ok:true,result:store.command(body.command,body.input??{})});
@@ -60,6 +61,9 @@ export function handler(store:DemoStore,origin:string,build=buildDemo){
       else if(url.pathname==='/api/board')response=json({ok:true,result:store.board()});
       else if(url.pathname==='/app.js')response=new Response(await build(),{headers:{'content-type':'text/javascript'}});
       else if(url.pathname==='/app.css')response=new Response(Bun.file(resolve(root,'public/app.css')));
+      else if(url.pathname==='/people/office-closeup.png')response=new Response(Bun.file(resolve(root,'public/people/office-closeup.png')));
+      else if(url.pathname==='/people/meeting-room.png')response=new Response(Bun.file(resolve(root,'public/people/meeting-room.png')));
+      else if(url.pathname==='/people/team-atlas.png')response=new Response(Bun.file(resolve(root,'public/people/team-atlas.png')),{headers:{'content-type':'image/png'}});
       else if(url.pathname==='/demo.css')response=new Response('.design-banner{position:relative;z-index:30;padding:8px 20px;background:#fdf2de;color:#6b3f00;border-bottom:1px solid #efd29c;font:13px/1.5 "PingFang SC","Microsoft YaHei",system-ui,sans-serif;display:flex;gap:6px 16px;align-items:center;flex-wrap:wrap}.design-banner strong{font-weight:600}.design-banner button{min-height:28px;padding:3px 12px;font-size:13px}',{headers:{'content-type':'text/css'}});
       else if(url.pathname==='/demo-controls.js')response=new Response("document.getElementById('demo-reset').onclick=async()=>{await fetch('/api/demo/reset',{method:'POST'});location.reload()}",{headers:{'content-type':'text/javascript'}});
       else if(url.pathname==='/'){

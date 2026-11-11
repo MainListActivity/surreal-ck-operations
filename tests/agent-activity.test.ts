@@ -46,3 +46,49 @@ test('Factory stream-json 以 toolId 配对，工具结果正文不进入进度'
 test('JSON/env 形式的凭证与 URL 用户密码也脱敏',()=>{
   expect(activityText('{"API_KEY":"private-a", "token": "private-b"} SECRET=private-c https://user:private-d@host/path')).not.toMatch(/private-[abcd]/);
 });
+
+test('工作清单只接受成功更新，保存计数而不保存清单正文', () => {
+  const c=new ActivityCollector('a','t',1);
+  const start=(id:string,statuses:string[],at:number)=>c.ingest('claude',{type:'assistant',message:{content:[{type:'tool_use',id,name:'TodoWrite',input:{todos:statuses.map(status=>({status,content:'PRIVATE_TASK'}))}}]}},at);
+  const end=(id:string,at:number,is_error=false)=>c.ingest('claude',{type:'user',message:{content:[{type:'tool_result',tool_use_id:id,is_error}]}},at);
+  start('first',['completed','pending'],2);
+  expect(c.snapshot(2).checklist).toBeUndefined();
+  end('first',3);
+  expect(c.snapshot(3).checklist).toEqual({done:1,total:2,at:2});
+  start('failed',['completed','completed'],4);end('failed',5,true);
+  expect(c.snapshot(5).checklist?.done).toBe(1);
+  expect(JSON.stringify(c.snapshot(5))).not.toContain('PRIVATE_TASK');
+  c.finish('completed','完成本轮',6);
+  expect(c.snapshot(6).checklist?.done).toBe(1); // provider 结束不等于清单、任务全部验收
+});
+
+test('晚返回的旧 TodoWrite 不覆盖更新的清单，开始时间相同也按事件顺序处理', () => {
+  const c=new ActivityCollector('a','t',1);
+  const start=(id:string,status:string)=>c.ingest('factory-droid',{type:'tool_call',toolId:id,toolName:'TodoWrite',parameters:{todos:[{status,content:'SECRET'}]}},2);
+  const end=(id:string)=>c.ingest('factory-droid',{type:'tool_result',toolId:id,isError:false},3);
+  start('old','pending');start('new','completed');end('new');end('old');
+  expect(c.snapshot(3).checklist).toEqual({done:1,total:1,at:2});
+  expect(JSON.stringify(c.snapshot(3))).not.toContain('SECRET');
+});
+
+test('未知清单格式不生成百分比，普通工具参数不能伪装清单', () => {
+  const c=new ActivityCollector('a','t',1);
+  for(const [i,name,todos] of [[1,'Read',[{status:'completed'}]],[2,'TodoWrite','- [x] one'],[3,'TodoWrite',[{status:'unknown'}]],[4,'TodoWrite',[]]] as const){
+    c.ingest('factory-droid',{type:'tool_call',id:String(i),toolName:name,parameters:{todos}},2);
+    c.ingest('factory-droid',{type:'tool_result',id:String(i),isError:false},3);
+  }
+  expect(c.snapshot(3).checklist).toBeUndefined();
+});
+
+test('Factory 原生带状态的文本清单可量化，混入未知格式时整份不估算', () => {
+  const c=new ActivityCollector('a','t',1);
+  const update=(id:string,todos:string)=>{
+    c.ingest('factory-droid',{type:'tool_call',id,toolName:'TodoWrite',parameters:{todos}},2);
+    c.ingest('factory-droid',{type:'tool_result',id,isError:false},3);
+  };
+  update('one','1. [completed] PRIVATE_A\n2. [in_progress] PRIVATE_B\n3. [pending] PRIVATE_C');
+  expect(c.snapshot(3).checklist).toEqual({done:1,total:3,at:2});
+  expect(JSON.stringify(c.snapshot(3))).not.toContain('PRIVATE_');
+  update('two','1. [completed] PRIVATE_A\n2. unknown');
+  expect(c.snapshot(3).checklist).toBeUndefined();
+});

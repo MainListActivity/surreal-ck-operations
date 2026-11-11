@@ -88,3 +88,155 @@ test('仓库生产快照可直接加载，关联有效且本地修改不污染�
  store.reset();expect(store.data.requirements.length).toBe(1);
  expect(JSON.stringify(await Bun.file(resolve(import.meta.dir,'../demo/production.snapshot.json')).json())).toBe(before);
 });
+
+test('会议室 4/8 人案例和项目进度来自同一份内存任务，重置不会污染来源快照',async()=>{
+ const {DemoRuntime}=await import('../demo/runtime.ts');
+ const source=seed(),before=JSON.stringify(source),store=new DemoStore(source),runtime=new DemoRuntime(store);
+ expect(runtime.snapshot().projects?.map(p=>p.id)).toEqual(expect.arrayContaining(source.products.map(p=>p.id)));
+ for(const count of [4,8,4]){
+   expect(runtime.crowd()).toMatchObject({employees:count,project:'design-crowd'});
+   const snapshot=runtime.snapshot();
+   const room=snapshot.projects!.find(p=>p.id==='design-crowd')!;
+   const employees=snapshot.agents.filter(a=>a.project?.id===room.id);
+   expect(employees).toHaveLength(count);
+   expect(new Set(employees.map(a=>a.taskId)).size).toBe(count);
+   expect(room.progress).toMatchObject({done:2,total:2*count+2,percent:Math.round(2/(2*count+2)*100)});
+   expect(room.blocked).toBe(1);expect(room.estimate.status).toBe('unavailable');
+   expect(room.estimateReason).toBe('存在阻塞');
+   expect(room.pendingMessages).toHaveLength(count);
+   for(const employee of employees){
+     expect(employee.name).toContain('【设计案例】');
+     expect(employee.model).toBeTruthy();expect(employee.activity?.checklist?.total).toBe(7);
+     expect(employee.pendingMessages).toHaveLength(1);
+     const message=employee.pendingMessages![0]!;
+     expect(message.assignment).toBe('candidate');
+     expect(message.taskId).not.toBe(employee.taskId);
+     expect(employee.next?.taskId).toBe(message.taskId);
+     expect(message.stage).toBe(employee.taskState==='blocked'?'later':'next');
+     expect(store.messages.find(m=>m.messageId===message.messageId)?.step).toBe(employee.role==='qa'?'review':'execute');
+     expect(store.data.tasks.some(t=>t.id===message.taskId&&t.project===room.id)).toBe(true);
+     expect(store.data.tasks.some(t=>t.id===employee.taskId)).toBe(true);
+   }
+   expect(employees.filter(a=>a.state==='running').every(a=>a.estimate?.status==='estimated')).toBe(true);
+ }
+ expect(JSON.stringify(source)).toBe(before);
+ runtime.reset();store.reset();
+ expect(runtime.snapshot().projects?.some(p=>p.id==='design-crowd')).toBe(false);
+ expect(store.data.agents).toEqual(source.agents);
+});
+
+test('本地消息编辑采用正文比较，拒绝冲突和已发送消息，页面读到保存后的同一正文',async()=>{
+ const {DemoRuntime}=await import('../demo/runtime.ts');
+ const store=new DemoStore(seed()),runtime=new DemoRuntime(store);runtime.crowd();
+ const message=store.messages.find(m=>m.messageId.startsWith('design-crowd-'))!;
+ const original=message.body;
+ store.command('message.edit',{messageId:message.messageId,body:'【设计案例】老板修改后的工作要求',expectedBody:original});
+ expect(()=>store.command('message.edit',{messageId:message.messageId,body:'旧窗口覆盖',expectedBody:original})).toThrow('消息已被修改');
+ const snapshot=runtime.snapshot();
+ expect(snapshot.agents.find(a=>a.id===message.candidateEmployeeId)!.pendingMessages![0]!.preview).toBe(message.body);
+ expect(snapshot.projects!.find(p=>p.id==='design-crowd')!.pendingMessages.find(m=>m.messageId===message.messageId)!.body).toBe(message.body);
+ expect(snapshot.agents.find(a=>a.id===message.candidateEmployeeId)!.pendingMessages![0]!.context?.files.some(f=>f.name==='task.md'&&f.text.includes('验收'))).toBe(true);
+ store.command('message.send',{messageId:message.messageId});
+ expect(()=>store.command('message.edit',{messageId:message.messageId,body:'不能重写'})).toThrow('消息已发送');
+ expect(store.board().messages?.some(m=>m.messageId===message.messageId)).toBe(false);
+ expect(runtime.snapshot().agents.flatMap(a=>a.pendingMessages??[]).some(m=>m.messageId===message.messageId)).toBe(false);
+ expect(()=>store.command('message.edit',{messageId:'missing',body:'不存在'})).toThrow('本地记录不存在');
+});
+
+test('4/8 人交接案例覆盖隔人、跨排与离场头像，关联当前任务且不增加在场人数',async()=>{
+ const {withDesignCases}=await import('../demo/data.ts');
+ const {DemoRuntime}=await import('../demo/runtime.ts');
+ const {roomAgents,roomHandoffs}=await import('../src/ui/meeting-rooms.ts');
+ const source=withDesignCases(seed()),before=JSON.stringify(source),store=new DemoStore(source),runtime=new DemoRuntime(store);
+ const project='design-crowd',employee=(position:number)=>`${project}-employee-${position}`;
+ const departed=`${project}-previous-engineer`;
+ for(const count of [4,8]){
+   runtime.crowd();
+   if(count===4)expect(runtime.snapshot().transfers).toHaveLength(0);
+   for(const kind of ['review','rework'] as const){
+     runtime.transfer();
+     const snapshot=runtime.snapshot(),present=roomAgents(snapshot,project);
+     expect(present).toHaveLength(count);
+     expect(present.some(a=>a.id===departed)).toBe(false);
+     const previous=snapshot.agents.find(a=>a.id===departed)!;
+     expect(previous.state).toBe('idle');
+     expect(previous.taskId).toBeUndefined();expect(previous.project).toBeUndefined();
+     const base=snapshot.transfers.find(t=>t.id.startsWith('design-transfer-'))!;
+     expect(base.kind).toBe(kind);
+     expect(snapshot.agents.find(a=>a.id===base.to)?.taskId).toBe(base.taskId);
+     expect(snapshot.agents.find(a=>a.id===base.from)?.state).toBe('idle');
+     const handoffs=roomHandoffs(snapshot,project,new Set());
+     expect(handoffs.transfers.map(t=>[t.from,t.to])).toEqual([
+       [employee(1),employee(3)],
+       [employee(2),employee(count===8?7:4)],
+       [departed,employee(count===8?8:2)],
+     ]);
+     expect(new Set(handoffs.transfers.map(t=>t.taskId)).size).toBe(3);
+     expect(handoffs.references).toHaveLength(1);
+     expect(handoffs.references[0]).toMatchObject({id:departed,status:'已离场'});
+     for(const transfer of handoffs.transfers){
+       expect(snapshot.agents.some(a=>a.id===transfer.from)).toBe(true);
+       expect(present.find(a=>a.id===transfer.to)?.taskId).toBe(transfer.taskId);
+       expect(snapshot.events.some(e=>e.id===transfer.id&&e.taskId===transfer.taskId)).toBe(true);
+     }
+     // 快照重复读取保持关系标识，只有新的演示交接才产生新事件。
+     expect(runtime.snapshot().transfers).toEqual(snapshot.transfers);
+   }
+ }
+ expect(JSON.stringify(source)).toBe(before);
+ runtime.reset();store.reset();
+ expect(runtime.snapshot().transfers).toHaveLength(0);
+ expect(store.data.agents.some(a=>String(a.employee).startsWith(project))).toBe(false);
+});
+
+test('4/8 人切换与消息编辑经 HTTP 主动推送，人物图片只开放固定文件',async()=>{
+ const store=new DemoStore(seed()),serve=handler(store,origin);
+ const reader=(await serve(request('/api/events'))).body!.getReader();await reader.read();
+ const decoder=new TextDecoder();
+ const crowd=await serve(request('/api/demo/crowd',{}));expect(crowd.status).toBe(200);
+ expect((await crowd.json()).result.employees).toBe(4);
+ expect(decoder.decode((await reader.read()).value)).toContain('event: change');
+ const message=store.messages.find(m=>m.messageId.startsWith('design-crowd-'))!;
+ const body=message.body;
+ expect((await serve(request('/api/cmd',{command:'message.edit',input:{messageId:message.messageId,body:'【设计案例】HTTP 更新',expectedBody:body}}))).status).toBe(200);
+ expect(decoder.decode((await reader.read()).value)).toContain('event: change');
+ expect((await serve(request('/api/cmd',{command:'message.edit',input:{messageId:message.messageId,body:'过期写入',expectedBody:body}}))).status).toBe(409);
+ const snapshot=(await (await serve(request('/api/dashboard'))).json()).result;
+ expect(snapshot.agents.flatMap((a:any)=>a.pendingMessages??[]).find((m:any)=>m.messageId===message.messageId).body).toBe('【设计案例】HTTP 更新');
+ const image=await serve(request('/people/team-atlas.png'));expect(image.status).toBe(200);expect(image.headers.get('content-type')).toBe('image/png');
+ expect((await image.arrayBuffer()).byteLength).toBeGreaterThan(1000);
+ expect((await serve(request('/people/other.png'))).status).toBe(404);
+ await reader.cancel();
+});
+
+test('已上线设计案例的计划只含实施步骤，不虚增未派工范围',async()=>{
+ const {withDesignCases}=await import('../demo/data.ts');
+ const {DemoRuntime}=await import('../demo/runtime.ts');
+ const store=new DemoStore(withDesignCases(seed()));
+ const released=store.data.requirements.filter(r=>r.state==='released'&&r.id.startsWith('design-req-'));
+ for(const r of released){
+   const run=store.executions.get(r.id)!;
+   expect(run.plan.steps.length+2).toBe(run.tasks.length);
+   expect(run.tasks.every((id:string)=>store.data.tasks.find(t=>t.id===id)?.state==='done')).toBe(true);
+ }
+ // 保留一个已完成范围，确认与生产范围算法一致。
+ const r=released[0]!;
+ store.data.requirements=[r];
+ store.data.products=store.data.products.filter(p=>p.id===r.project);
+ const ids=store.executions.get(r.id)!.tasks;
+ store.data.tasks=store.data.tasks.filter(t=>ids.includes(t.id));
+ const room=new DemoRuntime(store).snapshot().projects!.find(p=>p.id===r.project)!;
+ expect(room.progress.percent).toBe(100);expect(room.queued).toBe(0);
+});
+
+test('演示只展示调度可消费的最新派工模板，不把系统提醒当作可修改的待发工作',async()=>{
+ const {DemoRuntime}=await import('../demo/runtime.ts');
+ const store=new DemoStore(seed()),runtime=new DemoRuntime(store);runtime.crowd();
+ const first=store.messages.find(m=>m.messageId==='design-crowd-message-1')!;
+ store.messages.push({...first,messageId:'design-newest-template',body:'【设计案例】最新候选派工正文'});
+ for(const step of ['nudge','notice'])store.messages.push({...first,messageId:`design-ignored-${step}`,step});
+ const snapshot=runtime.snapshot(),employee=snapshot.agents.find(a=>a.id===first.candidateEmployeeId)!;
+ expect(employee.pendingMessages).toHaveLength(1);
+ expect(employee.pendingMessages![0]).toMatchObject({messageId:'design-newest-template',assignment:'candidate',stage:'next'});
+ expect(snapshot.projects!.flatMap(p=>p.pendingMessages).some(m=>m.messageId.startsWith('design-ignored-'))).toBe(false);
+});

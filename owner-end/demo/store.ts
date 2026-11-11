@@ -4,7 +4,20 @@ export class DemoError extends Error { constructor(message:string,readonly statu
 export class DemoStore {
   data:Snapshot; paused=false; policies=new Map<string,Row>(); executions=new Map<string,Row>(); timers=new Map<string,number>(); messages:Row[]=[]; guards:Row[]=[{command:'task.void',ownerOnly:true}];
   constructor(readonly initial:Snapshot){this.data=structuredClone(initial);this.reset();}
-  reset(){this.data=structuredClone(this.initial);this.paused=false;this.policies=new Map(Object.entries(structuredClone(this.initial.policies??{})));this.executions=new Map(Object.entries(structuredClone(this.initial.executions??{})));this.timers.clear();this.guards=[{command:'task.void',ownerOnly:true}];this.messages=this.data.tasks.slice(0,3).map((t,i)=>({messageId:`msg-${i+1}`,taskId:t.id,title:t.title,step:'execute',state:i===1?'held':'draft',hold:i===1,body:'请核对当前任务范围和验收标准。这是可编辑的本地示例消息。',editable:true}));return{reset:true};}
+  reset(){this.data=structuredClone(this.initial);this.paused=false;this.policies=new Map(Object.entries(structuredClone(this.initial.policies??{})));this.executions=new Map(Object.entries(structuredClone(this.initial.executions??{})));this.timers.clear();this.guards=[{command:'task.void',ownerOnly:true}];this.messages=this.data.tasks.slice(0,3).map((t,i)=>({messageId:`msg-${i+1}`,taskId:t.id,title:t.title,step:'execute',state:i===1?'held':'draft',hold:i===1,body:'【设计案例】请核对当前任务范围和验收标准。这是可编辑的本地示例消息。',editable:true}));this.normalizeDesignPlans();return{reset:true};}
+  /** 旧案例的计划曾列出全部执行任务；统一为计划核对 + 实施步骤 + PR 合并/上线核验。 */
+  private normalizeDesignPlans(){
+    for(const [id,run] of this.executions){
+      if(!id.startsWith('design-req-')||!Array.isArray(run.tasks))continue;
+      const requirement=this.data.requirements.find(r=>r.id===id);
+      if(!requirement)continue;
+      if(run.tasks.length<3){
+        const task={id:`${id}-design-verification`,title:'【设计案例】合并 PR 与上线核验',project:requirement.project,executor_role:'engineering',reviewer_role:'qa',state:run.execution?.stage==='released'?'done':'planned',requirement:'【设计案例】独立复核通过后合并 PR，核验 GitHub 自动部署。',acceptanceText:requirement.acceptance};
+        this.data.tasks.push(task);run.tasks.push(task.id);
+      }
+      run.plan={steps:run.tasks.slice(1,-1).map((taskId:string)=>{const t=this.find(this.data.tasks,taskId);return{title:t.title,context:t.requirement,acceptance:t.acceptanceText};})};
+    }
+  }
   /** 本地模拟推进：确认后依次模拟实施、独立复核、PR 合并与 GitHub 上线核验。只改内存，不触发任何员工。 */
   tick(now=Date.now()){
     for(const r of this.data.requirements){
@@ -15,7 +28,7 @@ export class DemoStore {
         const steps=['核对实施计划','实现并独立复核 PR','合并 PR 与上线核验'];
         const tasks=steps.map((title,i)=>({id:`${r.id}-local-${i+1}`,title:`【本地模拟】${title}`,state:i===0?'doing':'ready',executor_role:i===0?'product':'engineering',reviewer_role:'qa',project:r.project,parent:i?`${r.id}-local-${i}`:undefined,requirement:`${r.title}\n\n${title}（本地模拟任务，不会派给任何员工）`,acceptanceText:r.acceptance}));
         this.data.tasks.unshift(...tasks);
-        this.executions.set(r.id,{execution:{stage:'running',note:`任务 ${tasks[0]!.id}：doing`},plan:{steps:steps.map(title=>({title,context:`${title}（本地模拟计划）`,acceptance:r.acceptance}))},tasks:tasks.map(t=>t.id)});
+        this.executions.set(r.id,{execution:{stage:'running',note:`任务 ${tasks[0]!.id}：doing`},plan:{steps:steps.slice(1,-1).map(title=>({title,context:`${title}（本地模拟计划）`,acceptance:r.acceptance}))},tasks:tasks.map(t=>t.id)});
         r.root_task=tasks[0]!.id;r.state='implementing';r.updated_at=new Date(now).toISOString();this.timers.set(r.id,now+5000);
       }else if(r.state==='implementing'){
         const e=this.executions.get(r.id);if(!e)continue;
@@ -37,7 +50,7 @@ export class DemoStore {
     return {at:now,scheduler:{at:now,ageMs:0},runner:{state:'online',id:'demo-node',host:'本地设计环境',version:'demo',at:now},
       employees:this.data.agents.map((a,i)=>{const t=this.data.tasks.find(t=>(t.state==='doing'&&t.executor_role===a.role)||(t.state==='review'&&t.reviewer_role===a.role));return{id:a.employee,name:a.name,role:a.role,provider:'demo',model:'静态示例',now:t?{state:'leased' as const,taskId:t.id,title:t.title,phase:t.state==='review'?'review' as const:'execute' as const,leaseActive:true,elapsedSeconds:240,progress:{at:now,action:'checkpoint',label:'正在核对',summary:'仅模拟展示，不会启动 agent。'}}:{state:'idle' as const,idleSeconds:90},next:[],outbox:[]};}),
       unassigned:this.data.tasks.filter(t=>['ready','blocked'].includes(t.state)).map((t,i)=>({taskId:t.id,title:t.title,phase:'execute',position:i+1,blocked:t.state==='blocked',eligible:t.state!=='blocked',reason:t.state==='blocked'?'等待老板补充验收资料':'等待可用员工'})),
-      recent:this.data.tasks.slice(0,4).map((t,i)=>({at:now-i*60000,actor:'示例员工',action:'checkpoint',label:'更新进度',taskId:t.id,taskTitle:t.title})),messages:this.messages as OwnerBoard['messages']};
+      recent:this.data.tasks.slice(0,4).map((t,i)=>({at:now-i*60000,actor:'示例员工',action:'checkpoint',label:'更新进度',taskId:t.id,taskTitle:t.title})),messages:this.messages.filter(m=>m.state!=='sent') as OwnerBoard['messages']};
   }
   command(command:string,input:Row={}):unknown {
     this.tick();
@@ -83,9 +96,16 @@ export class DemoStore {
       case 'ops.job.get':return{job:this.find(this.jobs(),input.id)};
       case 'audit.list':return{audit:[{at:new Date().toISOString(),actorKind:'owner',actor:'本地老板',command:'requirement.approve',outcome:'ok',summary:'本地模拟确认，不执行生产操作'}]};
       case 'idp.status':return{tenantId:'demo-tenant',configured:{gateway:true,runner:true,automation:false}};
-      case 'message.edit':case 'message.edit_rendered':this.find(this.messages,input.messageId,'messageId').body=input.body??input.rendered;return{updated:true};
-      case 'message.hold':case 'message.release':{const m=this.find(this.messages,input.messageId,'messageId');m.hold=command==='message.hold';m.state=m.hold?'held':'draft';return{updated:true};}
-      case 'message.send':this.messages=this.messages.filter(m=>m.messageId!==input.messageId);return{sent:true,simulated:true};
+      case 'message.edit':case 'message.edit_rendered':{
+        const m=this.find(this.messages,input.messageId,'messageId');
+        if(m.state==='sent')throw new DemoError('消息已发送，不能再修改',409);
+        if(typeof input.expectedBody==='string'&&m.body!==input.expectedBody)throw new DemoError('消息已被修改，请核对最新正文后重新保存',409);
+        const body=input.body??input.rendered;
+        if(typeof body!=='string'||!body.trim()||body.length>20000)throw new DemoError('请填写不超过 20000 字的消息正文');
+        m.body=body;return{updated:true};
+      }
+      case 'message.hold':case 'message.release':{const m=this.find(this.messages,input.messageId,'messageId');if(m.state==='sent')throw new DemoError('消息已发送',409);m.hold=command==='message.hold';m.state=m.hold?'held':'draft';return{updated:true};}
+      case 'message.send':{const m=this.find(this.messages,input.messageId,'messageId');m.state='sent';m.hold=false;return{sent:true,simulated:true};}
       default:throw new DemoError(`设计模式未模拟 ${command}，没有执行外部操作。`,501);
     }
   }
