@@ -99,11 +99,26 @@ async function open(): Promise<Surreal> {
   return db;
 }
 
-/** 读数据前确保会话未过期（休眠唤醒后计时器可能还没来得及续期）。 */
-async function liveDatabase(): Promise<Surreal> {
+/** 库回复会话过期（details: Auth / SessionExpired）。SDK 没有对应的判断属性。 */
+export function isSessionExpired(error: unknown): boolean {
+  const details = (error as { details?: { kind?: string; details?: { kind?: string } } } | null)?.details;
+  return error instanceof NotAllowedError && details?.kind === 'Auth' && details.details?.kind === 'SessionExpired';
+}
+
+/**
+ * 读数据前确保会话未过期（休眠唤醒后计时器可能还没来得及续期）；
+ * 仍收到会话过期就立即重新鉴权（同时触发 LIVE 重建）并重试一次。
+ */
+async function withSession<T>(read: (db: Surreal) => Promise<T>): Promise<T> {
   const db = await database();
   await keeper?.ensure();
-  return db;
+  try {
+    return await read(db);
+  } catch (error) {
+    if (!keeper || !isSessionExpired(error)) throw error;
+    await keeper.ensure(true);
+    return read(db);
+  }
 }
 
 /** 全页面共用一个连接；连接失败后下次调用重新建立。 */
@@ -128,7 +143,7 @@ const plain = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
 export async function readDashboardData(): Promise<RuntimeDashboard> {
   try {
-    return plain(await readRuntimeDashboard(await liveDatabase()));
+    return plain(await withSession(readRuntimeDashboard));
   } catch (error) {
     throw classify(error);
   }
@@ -136,7 +151,7 @@ export async function readDashboardData(): Promise<RuntimeDashboard> {
 
 export async function readBoardData(): Promise<OwnerBoard> {
   try {
-    return plain(await readBoard(await liveDatabase())) as unknown as OwnerBoard;
+    return plain(await withSession(readBoard)) as unknown as OwnerBoard;
   } catch (error) {
     throw classify(error);
   }

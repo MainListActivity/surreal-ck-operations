@@ -53,3 +53,10 @@ test('续期失败把错误交给调用方，不通知重建；下次检查会�
   await expect(t.k.ensure()).rejects.toThrow('refresh failed');
   expect(t.counts()).toEqual({ renewals: 2, lapses: 0 });
 });
+
+test('库明确回复会话过期时：即使时钟显示未到期，也立即续期并通知重建', async () => {
+  const t = keeper();
+  t.advance(60_000);
+  await t.k.ensure(true);
+  expect(t.counts()).toEqual({ renewals: 1, lapses: 1 });
+});

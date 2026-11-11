@@ -36,11 +36,14 @@ export class SessionKeeper {
     };
   }
 
-  /** 读数据前与定时检查时调用：会话快到期就重新鉴权（并发调用合并为一次）。 */
-  ensure(): Promise<void> {
-    if (this.now() - this.#at < SESSION_RENEW_MS) return Promise.resolve();
+  /**
+   * 读数据前与定时检查时调用：会话快到期就重新鉴权（并发调用合并为一次）。
+   * expired=true 表示库已明确回复会话过期：立即重新鉴权并按已失效处理。
+   */
+  ensure(expired = false): Promise<void> {
+    if (!expired && this.now() - this.#at < SESSION_RENEW_MS) return Promise.resolve();
     this.#renewing ??= (async () => {
-      const lapsed = this.now() - this.#at >= SESSION_LAPSE_MS;
+      const lapsed = expired || this.now() - this.#at >= SESSION_LAPSE_MS;
       try {
         await this.renew();
       } finally {
