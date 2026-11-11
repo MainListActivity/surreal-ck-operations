@@ -12,7 +12,7 @@ const legacyImages=new Map([
   ['/people/office-closeup.png','/people/office-closeup.78cbb5a011ed.webp'],
 ]);
 export async function buildDemo(){
-  const result=await Bun.build({entrypoints:[resolve(root,'src/ui/main.tsx')],target:'browser',jsx:{importSource:'preact'},plugins:[{name:'local-design-auth',setup(build){build.onResolve({filter:/^\.\/auth\.ts$/},args=>args.importer.includes('/src/ui/')?{path:resolve(import.meta.dir,'auth.ts')}:undefined);}}]});
+  const result=await Bun.build({entrypoints:[resolve(root,'src/ui/main.tsx')],target:'browser',jsx:{importSource:'preact'},plugins:[{name:'local-design-auth',setup(build){build.onResolve({filter:/^\.\/(auth|source)\.ts$/},args=>args.importer.includes('/src/ui/')?{path:resolve(import.meta.dir,args.path.slice(2))}:undefined);}}]});
   if(!result.success)throw Error(result.logs.map(String).join('\n'));
   return result.outputs[0]!;
 }

@@ -246,5 +246,5 @@ export function buildProjectRooms(input: {
         pendingMessages: input.messages.filter((m) => taskIds.has(m.taskId)),
       };
     })
-    .sort((a, b) => b.blocked - a.blocked || a.name.localeCompare(b.name));
+    .sort((a, b) => b.blocked - a.blocked || a.name.localeCompare(b.name, 'zh-Hans-CN'));
 }

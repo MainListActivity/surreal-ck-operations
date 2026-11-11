@@ -55,13 +55,15 @@ const app = new Hono<{ Bindings: Env }>();
 /** 页面登录所需的公开配置（无需登录）。裸 JSON，不包在 ok 里。 */
 app.get('/api/config', (c) => {
   try {
-    const { idp } = readConfig(c.env);
+    const { idp, db } = readConfig(c.env);
     return json(200, {
       issuer: idp.issuer,
       clientId: idp.consoleClientId,
       authorizeUrl: idp.authorizeUrl,
       tokenUrl: idp.tokenUrl,
       audience: idp.audience,
+      // 浏览器用老板自己的令牌直连公司库（权限由 DEFINE ACCESS 与表权限执行），只下发地址，不含任何凭证。
+      db: { url: db.url, namespace: db.namespace, database: db.database },
     });
   } catch (error) {
     return failed(error);

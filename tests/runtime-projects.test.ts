@@ -62,3 +62,9 @@ test('并行任务ETA以最慢下界与保守总上界汇总，阻塞任务撤�
   expect(rooms({tasks,agents})[0]?.estimate).toMatchObject({lowerSeconds:30,upperSeconds:110});
   expect(rooms({tasks:[tasks[0]!,{...tasks[1]!,state:'blocked'}],agents})[0]?.estimate.status).toBe('unavailable');
 });
+
+test('同等阻塞的项目按中文拼音排序，浏览器与服务端结果一致（不依赖运行环境语言）', () => {
+  const names = rooms({projects:[{id:'project:b', name:'老板端验收'}, {id:'project:a', name:'迭代流程验证'}]})
+    .filter(r => r.id !== 'company-unassigned').map(r => r.name);
+  expect(names).toEqual(['迭代流程验证', '老板端验收']);
+});

@@ -3,7 +3,7 @@ import { createLocalJWKSet, exportJWK, generateKeyPair } from 'jose';
 
 import worker from '../src/worker.ts';
 import type { Env } from '../src/env.ts';
-import { ISSUER, JWKS_URL, json, signToken, testEnv, type KeyFixture } from './_support.ts';
+import { DB_URL, ISSUER, JWKS_URL, json, signToken, testEnv, type KeyFixture } from './_support.ts';
 
 // Worker 路由的单测：经默认导出的 fetch 与 scheduled 调用，不访问网络。
 // 老板令牌的验签需要 JWKS：这里临时替换 globalThis.fetch，只对 JWKS_URL 返回本文件生成的公钥，其它地址走原始 fetch。
@@ -57,7 +57,10 @@ describe('GET /api/config 登录配置', () => {
       authorizeUrl: `${ISSUER}/authorize`,
       tokenUrl: `${ISSUER}/token`,
       audience: 'company',
+      db: { url: DB_URL, namespace: 'company', database: 'main' },
     });
+    // 只下发库地址，不含任何凭证。
+    expect(JSON.stringify(body)).not.toMatch(/secret|password/i);
   });
 
   test('缺少 IDP_ISSUER：返回非 200 的 {ok:false,error:{code,message}}，code 为 unavailable，不抛出异常', async () => {

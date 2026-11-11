@@ -573,7 +573,7 @@ export function OverviewPage() {
       Number(roomAgents(data, b.id).length > 0) -
         Number(roomAgents(data, a.id).length > 0) ||
       b.blocked - a.blocked ||
-      a.name.localeCompare(b.name),
+      a.name.localeCompare(b.name, 'zh-Hans-CN'),
   );
   const current = rooms.find((p) => p.id === project);
   const visible = current
