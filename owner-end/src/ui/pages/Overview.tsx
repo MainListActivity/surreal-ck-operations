@@ -4,7 +4,10 @@ import type {
   RuntimeAgentView,
   RuntimePendingMessage,
 } from '../../../../src/runtime-dashboard.ts';
-import type { RuntimeProgress } from '../../../../src/runtime-projects.ts';
+import type {
+  RuntimeProgress,
+  RuntimeProjectView,
+} from '../../../../src/runtime-projects.ts';
 import type { RuntimeEstimate } from '../../../../src/runtime-timing.ts';
 import { WorkContextFiles } from '../WorkContext.tsx';
 import { readDashboard, runCommand, outcomeText } from '../api.ts';
@@ -166,6 +169,7 @@ function EmployeeSeat({
   host,
   compact,
   focused,
+  showInstance,
   at,
   edit,
 }: {
@@ -173,6 +177,7 @@ function EmployeeSeat({
   host: string;
   compact: boolean;
   focused: boolean;
+  showInstance: boolean;
   at: number;
   edit(m: RuntimePendingMessage): void;
 }) {
@@ -186,16 +191,23 @@ function EmployeeSeat({
       aria-label={`${a.name}的执行情况`}
     >
       <div class="seat-speech">
-        <div
-          class="seat-work"
-          title={a.blockedReason ?? a.taskTitle ?? a.action}
-        >
-          {(
-            a.blockedReason ??
-            a.taskTitle ??
-            a.action ??
-            '等待执行端确认任务'
-          ).replace(/^【设计案例】\s*/, '')}
+        <div class="seat-work-heading">
+          <div
+            class="seat-work"
+            title={a.blockedReason ?? a.taskTitle ?? a.action}
+          >
+            {(
+              a.blockedReason ??
+              a.taskTitle ??
+              a.action ??
+              '等待执行端确认任务'
+            ).replace(/^【设计案例】\s*/, '')}
+          </div>
+          {!focused && a.activity ? (
+            <time title="最近一次执行端采样">
+              {clockText(a.activity.observedAt)}
+            </time>
+          ) : null}
         </div>
         <ActivityFeed agent={a} />
       </div>
@@ -203,36 +215,57 @@ function EmployeeSeat({
       <div class="seat-console">
         <div class="seat-identity">
           <strong>{name}</strong>
-          <span class="instance-tag">#{a.id.slice(-6)}</span>
+          {showInstance ? <span class="instance-tag">#{a.id.slice(-6)}</span> : null}
+          {!focused && state.kind !== 'working' ? (
+            <span class="seat-status">{state.text}</span>
+          ) : null}
         </div>
-        <div class="seat-model">
-          <span class="seat-status">{state.text}</span>
-          <span>
-            {a.model ?? '模型未上报'}
-            {a.modelSource === 'configured' ? ' · 配置' : ''}
-          </span>
-        </div>
+        {focused ? (
+          <div class="seat-model">
+            <span class="seat-status">{state.text}</span>
+            <span>
+              {a.model ?? '模型未上报'}
+              {a.modelSource === 'configured' ? ' · 配置' : ''}
+            </span>
+          </div>
+        ) : null}
         <TimeProgress
           compact
           estimate={state.kind === 'working' ? a.estimate : undefined}
           at={at}
           elapsed={a.elapsedSeconds}
           reason={
-            a.taskState === 'blocked'
-              ? '受阻，时间待定'
+            state.kind === 'unknown'
+              ? '连接待确认，时间待定'
+              : state.kind === 'blocked'
+                ? `${state.text}，时间待定`
+                : a.activity?.state === 'canceled'
+                  ? '执行已停止，等待处理'
               : a.activity && a.activity.state !== 'running'
                 ? '本轮已结束，等待流转'
                 : remainingText(a)
           }
         />
-        <div class="seat-machine">
-          <span>▣ {host}</span>
-          <span>
-            {a.elapsedSeconds !== undefined
-              ? `已用 ${durationText(a.elapsedSeconds)}`
-              : ''}
-          </span>
-        </div>
+        {focused ? (
+          <div class="seat-machine">
+            <span>▣ {host}</span>
+            <span>
+              {a.elapsedSeconds !== undefined
+                ? `已用 ${durationText(a.elapsedSeconds)}`
+                : ''}
+            </span>
+          </div>
+        ) : (
+          <div class="seat-equipment">
+            <span
+              title={`${a.model ?? '模型未上报'}${a.modelSource === 'configured' ? ' · 配置值' : ''}`}
+            >
+              {a.model ?? '模型未上报'}
+              {a.modelSource === 'configured' ? ' · 配置' : ''}
+            </span>
+            <span title={host}>▣ {host}</span>
+          </div>
+        )}
         <div class="seat-next">
           <span>下一条</span>
           {messages.length ? (
@@ -250,14 +283,14 @@ function EmployeeSeat({
                       ? '候选 · '
                       : ''}
                   {m.hold ? '暂缓 · ' : ''}
-                  {messagePreview(m)}
-                  <small>{m.preview}</small>
+                  {messagePreview(m).replace(/^【设计案例】\s*/, '')}
+                  {focused ? <small>{m.preview}</small> : null}
                 </span>
                 <b aria-hidden="true">✎</b>
               </button>
             ))
           ) : (
-            <small>暂无确定的待发消息</small>
+            <small>{focused ? '暂无确定的待发消息' : '暂无待发消息'}</small>
           )}
         </div>
         {focused ? (
@@ -627,7 +660,12 @@ export function OverviewPage() {
       a.name.localeCompare(b.name),
   );
   const current = rooms.find((p) => p.id === project);
-  const visible = current ? [current] : rooms;
+  const visible = current
+    ? [current]
+    : rooms.filter((p) => roomAgents(data, p.id).length > 0);
+  const quietRooms = current
+    ? []
+    : rooms.filter((p) => roomAgents(data, p.id).length === 0);
   const duty = current
       ? roomAgents(data, current.id)
       : data.agents.filter(onDuty),
@@ -648,9 +686,134 @@ export function OverviewPage() {
       setError('浏览器未允许全屏');
     }
   };
+  const renderRoom = (p: RuntimeProjectView) => {
+    const people = roomAgents(data, p.id),
+      compact = useAvatars(people.length, !!current);
+    const projectEstimate = people.some((a) => a.state === 'unknown')
+      ? undefined
+      : p.estimate;
+    const assigned = new Set(
+      people.flatMap((a) =>
+        (a.pendingMessages ?? []).map((m) => m.messageId),
+      ),
+    );
+    const waitingMessages = p.pendingMessages.filter(
+      (m) => !assigned.has(m.messageId),
+    );
+    return (
+      <section
+        key={p.id}
+        class={`project-room ${compact ? 'crowded' : ''} ${current ? 'room-focused' : ''} ${people.length ? '' : 'room-empty'}`}
+        aria-label={`${p.name}项目部`}
+      >
+        <header class="room-heading">
+          <div>
+            <span class="room-sign" aria-hidden="true">
+              ◈
+            </span>
+            <h2>
+              {p.name.replace(/^【设计案例】\s*/, '')}
+              <small>
+                {p.name.startsWith('【设计案例】')
+                  ? '示例项目部'
+                  : '项目部'}
+              </small>
+            </h2>
+          </div>
+          <span class={p.blocked ? 'room-issue' : 'room-active'}>
+            {people.length
+              ? `${people.length} 位在场`
+              : p.queued
+                ? `${p.queued} 项待派`
+                : '暂无在岗'}
+            {p.blocked ? ` · ${p.blocked} 项受阻` : ''}
+          </span>
+          {!current ? (
+            <a href={hrefOf('overview', undefined, { project: p.id })}>
+              展开项目 ↗
+            </a>
+          ) : null}
+        </header>
+        <div
+          class={`room-seats seats-${people.length} ${compact ? 'avatar-seats' : 'figure-seats'}`}
+        >
+          {people.map((a) => (
+            <EmployeeSeat
+              key={a.id}
+              agent={a}
+              compact={compact}
+              focused={!!current}
+              showInstance={!!current || people.some((other) => other.id !== a.id && other.name === a.name)}
+              at={data.at}
+              host={
+                data.hosts.find((h) => h.id === a.hostId)?.name ??
+                '电脑待上报'
+              }
+              edit={setEditing}
+            />
+          ))}
+        </div>
+        {!people.length ? (
+          <div class="quiet-room">
+            <span aria-hidden="true">▱</span>
+            <p>
+              {p.blocked
+                ? '项目存在阻塞，当前没有执行中的员工'
+                : p.queued
+                  ? '任务等待派工，当前没有执行中的员工'
+                  : '当前没有工作中或阻塞的员工'}
+            </p>
+          </div>
+        ) : null}
+        <div class="room-project-progress">
+          <WorkProgress value={p.progress} />
+          <TimeProgress
+            estimate={projectEstimate}
+            at={data.at}
+            reason={
+              people.some((a) => a.state === 'unknown')
+                ? '连接待确认'
+                : p.estimateReason
+            }
+          />
+        </div>
+        <footer class="room-footer">
+          <span>
+            {p.queued} 项等待派工 · {p.blocked} 项受阻
+          </span>
+          <small>{p.progress.detail}</small>
+        </footer>
+        {waitingMessages.length ? (
+          <details class="room-dispatch" open={!!current}>
+            <summary>
+              {waitingMessages.length} 条待发与后续消息 ·
+              接收人由调度决定
+            </summary>
+            <div>
+              {waitingMessages.map((m) => (
+                <button key={m.messageId} onClick={() => setEditing(m)}>
+                  <b>{m.title}</b>
+                  <span>{messagePreview(m)}</span>
+                  {m.context ? (
+                    <small class="next-instruction">
+                      指令：{m.preview}
+                    </small>
+                  ) : null}
+                  <small>
+                    {m.stage === 'later' ? '后续步骤 · ' : ''}
+                    {m.hold ? '已暂缓 · ' : ''}点击修改 ↗
+                  </small>
+                </button>
+              ))}
+            </div>
+          </details>
+        ) : null}
+      </section>
+    );
+  };
   return (
     <div
-      class={`page runtime-page company-scene ${current ? 'project-closeup' : ''} ${paused ? 'scene-paused' : ''}`}
+      class={`page runtime-page company-scene ${current ? 'project-closeup' : 'company-overview'} ${paused ? 'scene-paused' : ''}`}
     >
       <header class="runtime-header">
         <div>
@@ -779,126 +942,16 @@ export function OverviewPage() {
       ) : null}
       <div class="runtime-map meeting-floor" id="runtime-map">
         <div class="project-rooms">
-          {visible.map((p) => {
-            const people = roomAgents(data, p.id),
-              compact = useAvatars(people.length, !!current);
-            const projectEstimate = people.some((a) => a.state === 'unknown')
-              ? undefined
-              : p.estimate;
-            const assigned = new Set(
-              people.flatMap((a) =>
-                (a.pendingMessages ?? []).map((m) => m.messageId),
-              ),
-            );
-            const waitingMessages = p.pendingMessages.filter(
-              (m) => !assigned.has(m.messageId),
-            );
-            return (
-              <section
-                key={p.id}
-                class={`project-room ${compact ? 'crowded' : ''} ${current ? 'room-focused' : ''} ${people.length ? '' : 'room-empty'}`}
-                aria-label={`${p.name}项目部`}
-              >
-                <header class="room-heading">
-                  <div>
-                    <span class="room-sign" aria-hidden="true">
-                      ◈
-                    </span>
-                    <h2>
-                      {p.name.replace(/^【设计案例】\s*/, '')}
-                      <small>
-                        {p.name.startsWith('【设计案例】')
-                          ? '示例项目部'
-                          : '项目部'}
-                      </small>
-                    </h2>
-                  </div>
-                  <span class={p.blocked ? 'room-issue' : 'room-active'}>
-                    {people.length} 位在场
-                    {p.blocked ? ` · ${p.blocked} 项受阻` : ''}
-                  </span>
-                  {!current ? (
-                    <a href={hrefOf('overview', undefined, { project: p.id })}>
-                      展开项目 ↗
-                    </a>
-                  ) : null}
-                </header>
-                <div
-                  class={`room-seats seats-${people.length} ${compact ? 'avatar-seats' : 'figure-seats'}`}
-                >
-                  {people.map((a) => (
-                    <EmployeeSeat
-                      key={a.id}
-                      agent={a}
-                      compact={compact}
-                      focused={!!current}
-                      at={data.at}
-                      host={
-                        data.hosts.find((h) => h.id === a.hostId)?.name ??
-                        '电脑待上报'
-                      }
-                      edit={setEditing}
-                    />
-                  ))}
-                </div>
-                {!people.length ? (
-                  <div class="quiet-room">
-                    <span aria-hidden="true">▱</span>
-                    <p>
-                      {p.blocked
-                        ? '项目存在阻塞，当前没有执行中的员工'
-                        : p.queued
-                          ? '任务等待派工，当前没有执行中的员工'
-                          : '当前没有工作中或阻塞的员工'}
-                    </p>
-                  </div>
-                ) : null}
-                <div class="room-project-progress">
-                  <WorkProgress value={p.progress} />
-                  <TimeProgress
-                    estimate={projectEstimate}
-                    at={data.at}
-                    reason={
-                      people.some((a) => a.state === 'unknown')
-                        ? '连接待确认'
-                        : p.estimateReason
-                    }
-                  />
-                </div>
-                <footer class="room-footer">
-                  <span>
-                    {p.queued} 项等待派工 · {p.blocked} 项受阻
-                  </span>
-                  <small>{p.progress.detail}</small>
-                </footer>
-                {waitingMessages.length ? (
-                  <details class="room-dispatch" open={!!current}>
-                    <summary>
-                      {waitingMessages.length} 条待发与后续消息 ·
-                      接收人由调度决定
-                    </summary>
-                    <div>
-                      {waitingMessages.map((m) => (
-                        <button key={m.messageId} onClick={() => setEditing(m)}>
-                          <b>{m.title}</b>
-                          <span>{messagePreview(m)}</span>
-                          {m.context ? (
-                            <small class="next-instruction">
-                              指令：{m.preview}
-                            </small>
-                          ) : null}
-                          <small>
-                            {m.stage === 'later' ? '后续步骤 · ' : ''}
-                            {m.hold ? '已暂缓 · ' : ''}点击修改 ↗
-                          </small>
-                        </button>
-                      ))}
-                    </div>
-                  </details>
-                ) : null}
-              </section>
-            );
-          })}
+          {visible.map(renderRoom)}
+          {quietRooms.length ? (
+            <aside class="quiet-projects" aria-label="其他项目进度">
+              <header>
+                <h2>其他项目 <span>{quietRooms.length}</span></h2>
+                <small>待派与暂无在岗</small>
+              </header>
+              {quietRooms.map(renderRoom)}
+            </aside>
+          ) : null}
         </div>
         <Connections data={data} active={paused ? new Set() : active} />
       </div>

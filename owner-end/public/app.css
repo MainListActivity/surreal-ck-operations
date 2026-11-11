@@ -827,3 +827,100 @@ label.inline input:not([type="checkbox"]), label.inline select { width: auto; }
 .employee-seat .agent-activity-heading strong{min-width:0;flex:1;}
 .employee-seat .agent-activity-heading span{flex:none;}
 .room-time>div>span,.room-progress>div>span{white-space:nowrap;}
+
+/* 总览为紧凑的办公场景：员工信息直接贴在桌沿，详细工位仅在项目内展开。 */
+.company-overview{gap:7px;}
+.main:has(.company-overview){padding-top:14px;}
+.company-overview .runtime-header h1{font-size:26px;}
+.company-overview .runtime-header>div:first-child>span{font-size:13px;}
+.company-overview .company-counters{gap:22px;padding-bottom:6px;font-size:12px;}
+.company-overview .company-counters b{font-size:21px;}
+.company-overview .scene-attention{padding:4px 10px;font-size:12px;}
+.company-overview .meeting-floor{padding-top:0;}
+.company-overview .project-rooms{gap:14px;}
+.company-overview .project-room{padding:16px 28px 10px;border-radius:25px 25px 16px 16px;}
+.company-overview .room-heading{gap:7px;margin-bottom:6px;flex-wrap:nowrap;}
+.company-overview .room-heading>div{padding:4px 8px 4px 4px;gap:7px;}
+.company-overview .room-heading h2{font-size:16px;}
+.company-overview .room-heading h2 small{display:none;}
+.company-overview .room-sign{width:25px;height:25px;font-size:20px;}
+.company-overview .room-heading>span{font-size:10px;padding:3px 7px;}
+.company-overview .room-heading>a{font-size:10px;padding:3px 7px;}
+.company-overview .room-seats{gap:12px 10px;padding:0 4px;}
+.company-overview .room-seats::before{display:none!important;}
+.company-overview .seat-speech{height:42px;margin:4px 0 8px;padding:5px 7px;border-radius:10px;box-shadow:0 2px 5px #59419c0a;}
+.company-overview .seat-speech::after{width:10px;height:10px;bottom:-6px;}
+.seat-work-heading{min-width:0;}
+.company-overview .seat-work-heading{display:flex;align-items:baseline;gap:4px;}
+.company-overview .seat-work{min-width:0;flex:1;font-size:11px;line-height:15px;}
+.company-overview .seat-work-heading time{flex:none;font-size:8px;color:#96879b;}
+.company-overview .employee-seat .agent-activity{margin:1px 0 0;}
+.company-overview .employee-seat .agent-activity-heading{display:none;}
+.company-overview .employee-seat .agent-activity-feed{height:14px;}
+.company-overview .employee-seat .agent-activity-feed>div{padding:0;}
+.company-overview .employee-seat .agent-activity-feed pre{font-size:10px;line-height:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.company-overview .employee-seat .agent-activity-empty{font-size:10px;line-height:14px;height:14px;margin:1px 0 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.company-overview .employee-figure.character,.company-overview .character .figure-crop{width:116px;height:112px;}
+.company-overview .character .person-sprite{width:116px;height:116px;}
+.company-overview .employee-figure.character{margin-bottom:15px;}
+.company-overview .character .person-halo{height:23px;bottom:-11px;}
+.company-overview .halo-value{font-size:10px;padding:0 6px;}
+.company-overview .seat-console{padding:0 3px;background:none!important;box-shadow:none;border:0;border-radius:0;}
+.company-overview .seat-identity{min-height:17px;padding:0!important;margin:0!important;background:none!important;border-radius:0;gap:3px;flex-wrap:nowrap;}
+.company-overview .seat-identity strong{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.company-overview .instance-tag{font-size:7px;flex:none;padding:0 3px;}
+.company-overview .time-caption{margin:1px 0 0;}
+.company-overview .time-caption>div{justify-content:center;gap:4px;font-size:9px;}
+.company-overview .time-caption b{font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.seat-equipment{display:flex;justify-content:center;gap:4px;font-size:9px;line-height:16px;color:#7f6b82;min-width:0;}
+.seat-equipment span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.seat-equipment span+span{flex-shrink:0;max-width:45%;border-left:1px solid #bcaeab80;padding-left:4px;}
+.company-overview .seat-next{display:grid;grid-template-columns:auto minmax(0,1fr);margin:0;gap:0 3px;font-size:9px;}
+.company-overview .seat-next button,.company-overview .seat-next>small{grid-column:2;}
+.company-overview .seat-next>span{color:#917c97;}
+.company-overview .seat-next button{border:0;border-radius:0;background:none;padding:0;min-height:18px;font-size:10px;color:#6c53b2;}
+.company-overview .seat-next button:hover{text-decoration:underline;}
+.company-overview .seat-next button:focus-visible{outline:2px solid #8a70dc;outline-offset:2px;}
+.company-overview .seat-next button>b{font-size:11px;}
+.company-overview .seat-next>small{font-size:9px;}
+.company-overview .room-project-progress{margin-top:8px;padding:5px 8px 0;gap:16px;background:#fffaf0c9;border:0;box-shadow:none;border-radius:8px 8px 0 0;}
+.company-overview .room-project-progress .room-progress>div,.company-overview .room-project-progress .room-time>div,.company-overview .room-project-progress b{font-size:9px;}
+.company-overview .room-project-progress progress{height:3px;margin:2px 0 3px;}
+.company-overview .room-footer{padding:0 8px 4px;font-size:8px;background:#fffaf0c9;}
+.company-overview .room-footer small{font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.company-overview .avatar-seats{grid-template-columns:repeat(8,minmax(0,1fr));padding:0;gap:10px;}
+.company-overview .crowded .seat-speech{height:42px;}
+.company-overview .employee-figure.portrait{margin-bottom:9px;}
+.company-overview .room-empty{grid-column:1/-1;display:grid;grid-template-columns:minmax(260px,1fr) minmax(320px,1fr);gap:6px 24px;align-items:center;padding:8px 4px;border-bottom:1px solid #e2d8ce;border-radius:0;box-shadow:none;background:none;}
+.company-overview .room-empty::before,.company-overview .room-empty::after,.company-overview .room-empty .room-seats,.company-overview .room-empty .quiet-room,.company-overview .room-empty .room-footer{display:none;}
+.company-overview .room-empty .room-heading{margin:0;}
+.company-overview .room-empty .room-heading>div{background:none;box-shadow:none;border:0;padding:0;}
+.company-overview .room-empty .room-heading h2{font-size:13px;}
+.company-overview .room-empty .room-heading>a{margin-left:auto;}
+.company-overview .room-empty .room-project-progress{margin:0;padding:0;background:none;}
+.company-overview .room-empty .room-dispatch{grid-column:1/-1;margin:0;}
+.company-overview .room-dispatch{margin-top:5px;padding:3px 7px;background:#fffaf299;}
+.company-overview .scene-deliveries{padding:5px 0;font-size:10px;}
+@media(max-width:1399px){.company-overview .avatar-seats{grid-template-columns:repeat(4,minmax(0,1fr));}}
+@media(max-width:1100px){.company-overview .project-rooms{grid-template-columns:1fr;}}
+@media(max-width:750px){.company-overview .runtime-header{gap:8px;}.company-overview .runtime-header h1{font-size:24px;}.company-overview .runtime-controls{gap:10px;}.company-overview .project-room{padding:14px 16px 10px;}.company-overview .room-seats,.company-overview .figure-seats.seats-4,.company-overview .avatar-seats{grid-template-columns:repeat(2,minmax(0,1fr));padding:0;gap:16px 10px;}.company-overview .room-empty{grid-template-columns:1fr;padding:7px 2px;}.company-overview .room-heading{flex-wrap:wrap;}.company-overview .room-heading>div{max-width:100%;}.company-overview .room-heading>a{margin-left:auto;}.company-overview .room-project-progress{grid-template-columns:1fr 1fr;}.company-overview .seat-equipment{font-size:8px;}}
+.company-overview .project-room::after{background:linear-gradient(180deg,#ffffff12,transparent 45%,#fff7ef55 65%,#fffaf1de);}
+.company-overview .seat-equipment{color:#6b5670;}
+.company-overview .room-project-progress .room-progress>div,.company-overview .room-project-progress .room-time>div,.company-overview .room-project-progress b{font-size:10px;}
+.quiet-projects{min-width:0;padding:12px 15px 4px;align-self:start;}
+.quiet-projects>header{display:flex;align-items:baseline;justify-content:space-between;gap:10px;padding-bottom:9px;border-bottom:1px solid #ddcec3;color:#625469;}
+.quiet-projects>header h2{font-size:15px;margin:0;}.quiet-projects>header h2 span{font-size:11px;font-weight:400;margin-left:5px;}.quiet-projects>header small{font-size:10px;color:#9c8a96;}
+.company-overview .quiet-projects .room-empty{grid-template-columns:1fr;padding:10px 0;gap:7px;opacity:1;}
+.company-overview .quiet-projects .room-project-progress{padding-left:32px;}
+.company-overview .quiet-projects:only-child{grid-column:1/-1;}
+@media(max-width:750px){.quiet-projects{padding:8px 2px;}.company-overview .quiet-projects .room-project-progress{padding-left:0;}}
+.company-overview .seat-work{font-size:12px;}
+.company-overview .employee-seat .agent-activity-feed pre{font-size:11px;}
+.company-overview .seat-identity strong{font-size:13px;}
+.company-overview .instance-tag{font-size:9px;}
+.company-overview .seat-identity .seat-status{font-size:10px;flex:none;}
+.company-overview .time-caption>div,.company-overview .time-caption b{font-size:11px;}
+.company-overview .seat-equipment{flex-direction:column;align-items:center;gap:0;font-size:10px;line-height:13px;}
+.company-overview .seat-equipment span{max-width:100%;}
+.company-overview .seat-equipment span+span{border:0;padding:0;max-width:100%;font-size:9px;}
+.company-overview .seat-next,.company-overview .seat-next button{font-size:11px;}
