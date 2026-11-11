@@ -2,6 +2,7 @@ import type {
   RuntimeAgentView,
   RuntimeDashboard,
   RuntimePendingMessage,
+  RuntimeTransfer,
 } from '../../../src/runtime-dashboard.ts';
 import type { RuntimeEstimate } from '../../../src/runtime-timing.ts';
 export { employeeProgress } from '../../../src/runtime-projects.ts';
@@ -22,6 +23,61 @@ export function roomAgents(data: RuntimeDashboard, project: string) {
   return data.agents
     .filter((a) => roomId(a) === project && onDuty(a))
     .sort((a, b) => a.id.localeCompare(b.id));
+}
+export interface RoomHandoffReference {
+  id: string;
+  agent?: RuntimeAgentView;
+  name: string;
+  status: string;
+}
+export interface RoomHandoffs {
+  transfers: RuntimeTransfer[];
+  references: RoomHandoffReference[];
+}
+/** Delivered work keeps its employee identity even after that employee leaves the room. */
+export function roomHandoffs(
+  data: RuntimeDashboard,
+  projectId: string,
+  active: Set<string>,
+): RoomHandoffs {
+  const present = new Map(roomAgents(data, projectId).map((agent) => [agent.id, agent]));
+  const employees = new Map(data.agents.map((agent) => [agent.id, agent]));
+  const latest = new Map<string, RuntimeTransfer>();
+  for (const transfer of data.transfers) {
+    if (
+      !transfer.id?.trim() || !transfer.taskId?.trim() ||
+      !transfer.from?.trim() || !transfer.to?.trim() ||
+      transfer.from === transfer.to || !Number.isFinite(transfer.at)
+    ) continue;
+    const previous = latest.get(transfer.taskId);
+    // Choose before room filtering: an older review must not reappear after rework.
+    if (!previous || transfer.at > previous.at ||
+        (transfer.at === previous.at && transfer.id.localeCompare(previous.id) > 0))
+      latest.set(transfer.taskId, transfer);
+  }
+  const transfers = [...latest.values()]
+    .filter((transfer) => [transfer.from, transfer.to].some((id) => {
+      const agent = present.get(id);
+      return agent && (agent.taskId === transfer.taskId || active.has(transfer.id));
+    }))
+    .sort((a, b) => a.at - b.at || a.id.localeCompare(b.id));
+  const references = new Map<string, RoomHandoffReference>();
+  for (const transfer of transfers) {
+    for (const id of [transfer.from, transfer.to]) {
+      if (present.has(id) || references.has(id)) continue;
+      const agent = employees.get(id);
+      references.set(id, {
+        id,
+        ...(agent ? { agent } : {}),
+        name: agent?.name || `员工 ${id.slice(0, 8)}`,
+        status: !agent ? '身份待补'
+          : agent.state === 'unknown' ? '状态待确认'
+          : onDuty(agent) && roomId(agent) !== projectId ? '其他项目'
+          : '已离场',
+      });
+    }
+  }
+  return { transfers, references: [...references.values()] };
 }
 export const useAvatars = (count: number, focused: boolean) =>
   !focused && count > 4;

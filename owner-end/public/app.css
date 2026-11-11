@@ -924,3 +924,21 @@ label.inline input:not([type="checkbox"]), label.inline select { width: auto; }
 .company-overview .seat-equipment span{max-width:100%;}
 .company-overview .seat-equipment span+span{border:0;padding:0;max-width:100%;font-size:9px;}
 .company-overview .seat-next,.company-overview .seat-next button{font-size:11px;}
+
+/* 场外员工只作交接端点：不占工位、不显示工作进度，也不计入在岗。 */
+.handoff-references{display:flex;align-items:center;flex-wrap:wrap;gap:7px;min-width:0;}
+.handoff-caption{font-size:10px;color:#93869a;}
+.handoff-reference{display:flex;align-items:center;gap:5px;min-width:0;}
+.handoff-avatar{position:relative;display:block;overflow:hidden;flex:none;width:40px;height:40px;border:2px solid #bdb0ca;border-radius:50%;background:#f1e7df;filter:saturate(.65);}
+.handoff-avatar .person-sprite{width:74px;height:74px;left:-19px;top:-3px;}
+.handoff-unknown{display:grid;place-items:center;width:100%;height:100%;font-size:18px;color:#8b789a;}
+.handoff-identity{display:flex;flex-direction:column;gap:1px;min-width:0;}
+.handoff-identity strong{font-size:11px;line-height:14px;font-weight:500;color:#68576e;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.handoff-identity small{font-size:9px;line-height:12px;color:#938198;}
+.company-overview .room-heading:has(.handoff-references){flex-wrap:wrap;}
+.room-focused .room-heading:has(.handoff-references){display:flex;margin-bottom:10px;}
+.room-focused .room-heading:has(.handoff-references)>:not(.handoff-references){display:none;}
+.flow-context .flow-path{stroke:#8c8ab5;stroke-width:1.5;opacity:.65;}
+.flow-context .flow-halo{display:none;}
+.room-heading>.handoff-references{padding:0;margin:0 4px;border:0;border-radius:0;background:none;box-shadow:none;}
+.company-scene .runtime-connections{display:block;}
