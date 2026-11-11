@@ -40,7 +40,8 @@ export async function subscribeOwnerChanges(
   };
   try {
     for (const table of LIVE_TABLES) {
-      const sub = await db.live(new Table(table));
+      // 页面只需要表级失效；在数据库端投影，避免 Worker 解码整条正文。
+      const sub = await db.live(new Table(table)).fields('id');
       subs.push({ sub, off: sub.subscribe(() => notify(table)) });
     }
   } catch (error) {

@@ -13,17 +13,23 @@ function database(failAt = -1) {
   let closed = 0,
     killed = 0;
   const listeners: Array<() => void> = [];
+  const projections: string[][] = [];
   const events = new Map<string, () => void>();
   const db = {
-    async live() {
-      if (listeners.length === failAt) throw Error('unavailable');
+    live() {
       return {
-        subscribe(fn: () => void) {
-          listeners.push(fn);
-          return () => {};
-        },
-        async kill() {
-          killed++;
+        async fields(...fields: string[]) {
+          projections.push(fields);
+          if (listeners.length === failAt) throw Error('unavailable');
+          return {
+            subscribe(fn: () => void) {
+              listeners.push(fn);
+              return () => {};
+            },
+            async kill() {
+              killed++;
+            },
+          };
         },
       };
     },
@@ -37,7 +43,7 @@ function database(failAt = -1) {
       closed++;
     },
   } as unknown as Surreal;
-  return { db, listeners, events, counts: () => ({ closed, killed }) };
+  return { db, listeners, projections, events, counts: () => ({ closed, killed }) };
 }
 
 test('LIVE 订阅中途失败会释放已经建立的订阅', async () => {
@@ -59,6 +65,7 @@ test('SSE 合并变更且只传表名；取消后释放全部订阅、事件监�
   const abort = new AbortController();
   const reader = ownerEventStream(fake.db, abort.signal, Date.now() + 60000).body!.getReader();
   expect(new TextDecoder().decode((await reader.read()).value)).toContain('event: ready');
+  expect(fake.projections).toEqual(LIVE_TABLES.map(() => ['id']));
   fake.listeners[0]!();
   fake.listeners[0]!();
   fake.listeners[1]!();

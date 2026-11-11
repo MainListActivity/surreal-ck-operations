@@ -3,7 +3,7 @@ import { createHmac } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { RecordId, Surreal } from 'surrealdb';
+import { CborCodec, RecordId, Surreal, Table } from 'surrealdb';
 import { CompanyDatabase } from '../../src/database.ts';
 import { ownerEventStream, LIVE_TABLES } from '../src/realtime.ts';
 import { readRuntimeDashboard } from '../../src/runtime-dashboard.ts';
@@ -117,10 +117,57 @@ run('老板身份在公司 fork 上建立全部 LIVE，跨连接写入主动推�
     expect(changed).toContain('event: change');
     expect(changed).toContain('company_meta');
     expect(changed).not.toContain('原始正文');
+    // id 没变、仅修改未投影的正文，也必须触发页面失效。
+    await company.db.query("UPDATE company_meta:live_probe SET marker = '正文已修改';");
+    const updated = await nextFrame(reader);
+    expect(updated).toContain('event: change');
+    expect(updated).toContain('company_meta');
+    expect(updated).not.toContain('正文已修改');
     await company.db.query('DELETE company_meta:live_probe;');
     expect(await nextFrame(reader)).toContain('company_meta');
   } finally { await reader.cancel(); }
   expect(owner.isConnected).toBe(false);
+});
+
+run('LIVE 仅投影 id 仍逐次收到同一记录的创建、正文更新和删除，正文不进入 SDK 通知', async () => {
+  const owner = await session(tokenFor('owner', 'live-projection-owner', { rl: ['Owner'] }));
+  const full = await owner.live(new Table('company_meta'));
+  const projected = await owner.live(new Table('company_meta')).fields('id');
+  const fullEvents = full[Symbol.asyncIterator]();
+  const projectedEvents = projected[Symbol.asyncIterator]();
+  const codec = new CborCodec({});
+  const nextEvent = async (events: typeof fullEvents) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const event = await Promise.race([
+        events.next(),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(Error('LIVE projection timeout')), 5000); }),
+      ]);
+      expect(event.done).toBe(false);
+      return event.value!;
+    } finally { clearTimeout(timer); }
+  };
+  try {
+    const body = '仅限本地测试的示例正文'.repeat(4000);
+    const writes = [
+      ['CREATE', 'CREATE company_meta:projection_probe SET body = $body;'],
+      ['UPDATE', 'UPDATE company_meta:projection_probe SET body = $body + "已修改";'],
+      ['DELETE', 'DELETE company_meta:projection_probe;'],
+    ] as const;
+    for (const [action, sql] of writes) {
+      await company.db.query(sql, { body });
+      const [original, slim] = await Promise.all([nextEvent(fullEvents), nextEvent(projectedEvents)]);
+      expect(original.action).toBe(action);
+      expect(slim.action).toBe(action);
+      expect(String(slim.recordId)).toBe('company_meta:projection_probe');
+      expect(Object.keys(slim.value)).toEqual(['id']);
+      expect(String(slim.value.id)).toBe('company_meta:projection_probe');
+      expect(codec.encode(slim.value).byteLength).toBeLessThan(codec.encode(original.value).byteLength / 100);
+    }
+  } finally {
+    await Promise.all([full.kill(), projected.kill()]);
+    await owner.close();
+  }
 });
 
 run('新运行数据在真实 schema 可写可读，已发正文保存实际渲染文本', async () => {
