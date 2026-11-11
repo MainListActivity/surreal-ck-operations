@@ -35,6 +35,8 @@ run('真实公司 fork：读取长期阻塞员工及原因，不依赖近期事�
       DEFINE TABLE requirement_plan SCHEMALESS;
       CREATE project:app SET name='测试项目';
       CREATE task:blocked SET title='缺少权限', state='blocked', project=project:app;
+      CREATE outbound_message:execute SET task=task:blocked, state='sent', step='execute', sent_to='dev', sent_at=time::now()-1m;
+      CREATE outbound_message:review SET task=task:blocked, state='sent', step='review', sent_to='reviewer', sent_at=time::now();
       CREATE employee:dev SET role='engineering', def=employee_def:engineering, session_task='blocked',
         last_task=task:blocked, runner_id='native:fixture', runtime_state='idle', runtime_at=time::now();
       CREATE runner_heartbeat:fixture SET runner='native:fixture',host='测试电脑',at=time::now();
@@ -52,6 +54,7 @@ run('真实公司 fork：读取长期阻塞员工及原因，不依赖近期事�
     expect(employee?.blockedReason).toContain('缺少仓库权限');
     expect(employee?.blockedReason).not.toContain('should-be-redacted');
     expect(data.projects?.find(p=>p.id==='app')).toMatchObject({blocked:1,estimateReason:'存在阻塞'});
+    expect(data.transfers.find(t=>t.taskId==='blocked')).toMatchObject({projectId:'app',from:'dev',to:'reviewer'});
   } finally {
     await db.close();child.kill();await child.exited;rmSync(dir,{recursive:true,force:true});
   }
