@@ -1,5 +1,5 @@
 /**
- * What an employee is handed for one task: task.md (the requirement only) and, after a return, findings/round-NN.md
+ * What an employee is handed for one task: task.md (requirement and, for review, the submitted result) and, after a return, findings/round-NN.md
  * (the reviewer's words verbatim). The dispatch message then points at these files in three sentences.
  *
  * Company rules, role descriptions and protocol text stay out: the system enforces leases, worktrees, quota and
@@ -34,12 +34,22 @@ export function requirementOf(context: string): string {
   return [legacy[1]!.trim(), amended < 0 ? '' : context.slice(amended).trim()].filter(Boolean).join('\n\n');
 }
 
-/** This leg's own job, for the executor or the reviewer; undefined for tasks outside a delivery chain. */
-/** task.md for one claim: only the title, requirement and acceptance criteria. */
-export function taskBrief(claim: Pick<ClaimResult, 'task' | 'project'> & { task: { requirement?: string; acceptanceText?: string } }): string {
+/** task.md includes the current submitted result for review; gathering it is the runner's job. */
+export function taskBrief(claim: Pick<ClaimResult, 'task' | 'project'> & Partial<Pick<ClaimResult, 'history'>> & { task: { requirement?: string; acceptanceText?: string } }): string {
   const task = claim.task as typeof claim.task & { requirement?: string; acceptance_text?: string; acceptanceText?: string };
   const parts = [`# ${task.title ?? ''}`, '', '## 需求', '', task.requirement?.trim() || requirementOf(task.context ?? '')];
   const acceptance = task.acceptanceText?.trim() || task.acceptance_text?.trim();
   if (acceptance) parts.push('', '## 验收标准', '', acceptance);
+  if (task.state === 'review') {
+    const submitted = claim.history?.filter(entry => entry.action === 'submit' || entry.action === 'owner_submit').at(-1);
+    parts.push('', '## 待复核成果', '');
+    if (!submitted?.evidence?.trim()) {
+      parts.push('执行端未取得提交成果；当前交接不完整。');
+    } else {
+      parts.push(`提交者：${submitted.actor}；提交时间：${submitted.at}`, '');
+      if (submitted.evidenceTruncated) parts.push('提交成果不完整：以下仅为片段，不能据此完成复核。', '');
+      parts.push(submitted.evidence);
+    }
+  }
   return `${parts.join('\n')}\n`;
 }

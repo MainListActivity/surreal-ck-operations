@@ -944,7 +944,7 @@ export class SurrealCompanyCore implements CompanyCore {
     });
     const taskView = view(row);
     const project = await this.taskProject(taskId);
-    const handover = await this.handoverHistory(taskId);
+    const handover = await this.handoverHistory(taskId, taskView.state === 'review');
     const lane = laneOf(project?.id, actor.role);
     const laneNotes = await new LaneNoteStore(this.db).render(lane).catch(() => undefined);
     return { task: taskView, deliveryId: taskView.deliveryId!, fence: taskView.fence, lane, laneNotes,
@@ -1087,20 +1087,24 @@ export class SurrealCompanyCore implements CompanyCore {
    * The handover window of a claim (SYS01 R3): the newest HANDOVER_ROWS protocol entries and the newest HANDOVER_OPS_ROWS ops
    * entries, oldest first, each whole. historyCount is the task's entry count in all, read in the same transaction as the
    * window, and historyComplete is true only when every entry was read. A claim has committed when its answer is built, so the
-   * window is bounded, never refused: the echo (echoClaim) keeps the entries its response can hold, and get_task_history
-   * pages the rest.
+   * window is bounded, never refused. Review also pins the latest submission so later protocol activity cannot evict
+   * the result being reviewed. The echo (echoClaim) keeps the entries its response can hold, and get_task_history pages the rest.
    */
-  private async handoverHistory(taskId: TaskId): Promise<{ history: HistoryEntry[]; historyComplete: boolean; historyCount: number }> {
+  private async handoverHistory(taskId: TaskId, review: boolean): Promise<{ history: HistoryEntry[]; historyComplete: boolean; historyCount: number }> {
     // Ops rows get their own window so a chatty broker session cannot push claims and checkpoints out of the handover.
-    const read = await this.consistentRead<{ protocol: AuditHistoryRow[]; ops: AuditHistoryRow[]; count: number | null }>(`LET $protocol = (SELECT id, action, actor, evidence, version, at, <string>at AS cat FROM audit
+    const read = await this.consistentRead<{ protocol: AuditHistoryRow[]; ops: AuditHistoryRow[]; submitted: AuditHistoryRow[]; count: number | null }>(`LET $protocol = (SELECT id, action, actor, evidence, version, at, <string>at AS cat FROM audit
         WHERE task = $task AND !string::starts_with(action, 'ops_') ORDER BY at DESC, id DESC LIMIT $limit);
       LET $ops = (SELECT id, action, actor, evidence, version, at, <string>at AS cat FROM audit
         WHERE task = $task AND string::starts_with(action, 'ops_') AND action != 'ops_call' ORDER BY at DESC, id DESC LIMIT $ops_limit);
       LET $counted = (SELECT count() AS n FROM audit WHERE task = $task AND action != 'ops_call' GROUP ALL);
-      RETURN { read: { protocol: $protocol, ops: $ops, count: $counted[0].n ?? 0 } };`,
-    { task: id('task', taskId), limit: HANDOVER_ROWS + 1, ops_limit: HANDOVER_OPS_ROWS + 1 });
-    const rows = [...read.protocol.slice(0, HANDOVER_ROWS), ...read.ops.slice(0, HANDOVER_OPS_ROWS)]
-      .sort((a, b) => (a.cat < b.cat ? 1 : a.cat > b.cat ? -1 : 0));
+      LET $submitted = (SELECT id, action, actor, evidence, version, at, <string>at AS cat FROM audit
+        WHERE $review AND task = $task AND action IN ['submit', 'owner_submit'] ORDER BY at DESC, id DESC LIMIT 1);
+      RETURN { read: { protocol: $protocol, ops: $ops, submitted: $submitted, count: $counted[0].n ?? 0 } };`,
+    { task: id('task', taskId), review, limit: HANDOVER_ROWS + 1, ops_limit: HANDOVER_OPS_ROWS + 1 });
+    const unique = new Map([...read.protocol.slice(0, HANDOVER_ROWS), ...read.ops.slice(0, HANDOVER_OPS_ROWS), ...read.submitted]
+      .map(row => [String(row.id), row]));
+    const rows = [...unique.values()]
+      .sort((a, b) => a.cat < b.cat ? 1 : a.cat > b.cat ? -1 : String(a.id).localeCompare(String(b.id)) * -1);
     const historyCount = Number(read.count ?? 0);
     const history = rows.map(row => historyEntry(row)).reverse();
     const complete = read.protocol.length <= HANDOVER_ROWS && read.ops.length <= HANDOVER_OPS_ROWS && rows.length === historyCount;
