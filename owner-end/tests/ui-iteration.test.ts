@@ -10,11 +10,13 @@ import { DemoStore } from '../demo/store.ts';
 const enabled = { enabled: true, autoRelease: false, feedbackOrigins: [], releaseInstructions: '', verifyInstructions: '', rollbackInstructions: '' };
 
 test('新路由：页面、详情编号与查询参数；旧地址兼容', () => {
-  expect(routeOf('')).toEqual({ page: 'overview', params: {} });
+  expect(routeOf('')).toEqual({ page: 'today', params: {} });
+  expect(routeOf('#overview?project=p1')).toEqual({ page: 'overview', params: { project: 'p1' } });
+  expect(routeOf('#projects/p1')).toEqual({ page: 'projects', id: 'p1', params: {} });
   expect(routeOf('#requirements/abc?project=p1')).toEqual({ page: 'requirements', id: 'abc', params: { project: 'p1' } });
   expect(routeOf('#board').page).toBe('overview');
   expect(routeOf('#feedback?project=p1')).toEqual({ page: 'requirements', params: { project: 'p1', view: 'feedback' } });
-  expect(routeOf('#nope/1').page).toBe('overview');
+  expect(routeOf('#nope/1').page).toBe('today');
   expect(hrefOf('requirements', 'a b', { project: 'p', q: undefined })).toBe('#requirements/a%20b?project=p');
   expect(routeOf(hrefOf('tasks', 'task:⟨x⟩'))).toEqual({ page: 'tasks', id: 'task:⟨x⟩', params: {} });
   expect(pageOf('#overview')).toBe('board');

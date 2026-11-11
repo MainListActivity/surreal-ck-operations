@@ -81,7 +81,7 @@ export function StaffPage() {
 
   return (
     <div class="page">
-      <PageHeader title="员工与权限" description="员工的命令范围、停用与译文语言，以及哪些命令需要老板确认。低频设置，修改会写入审计。" />
+      <PageHeader title="员工与权限" description="员工的命令范围与受保护命令；修改会写入审计。" />
       <nav class="jump-bar" aria-label="页内导航"><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-agents')?.scrollIntoView({ behavior: 'smooth' }); }}>员工策略</a><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-guard')?.scrollIntoView({ behavior: 'smooth' }); }}>受保护命令</a><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-locked')?.scrollIntoView({ behavior: 'smooth' }); }}>固定限制</a></nav>
       <Panel id="staff-agents" title="员工" hint="策略决定员工能调用哪些命令、是否停用、译文语言。语言留空表示不翻译。">
         {agentError ? <p class="notice err">员工列表读取失败：{agentError}</p> : null}

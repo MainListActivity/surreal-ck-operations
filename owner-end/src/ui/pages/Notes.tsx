@@ -103,7 +103,7 @@ export function NotesPage() {
 
   return (
     <div class="page">
-      <PageHeader title="笔记" description="按线（lane）维护的经验笔记，派工时附在 notes.md 里交给员工。待确认的笔记需要你启用后才生效。" />
+      <PageHeader title="笔记" description="派工时附给员工的经验笔记；待确认的需要你启用。" />
       <Panel
         title="线的笔记"
         hint="笔记会附在该线每次派工的 notes.md 里。待确认的笔记需要你启用后才生效。"

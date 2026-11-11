@@ -407,8 +407,10 @@ export function noteLanes(notes: ReadonlyArray<{ lane: string }>): string[] {
 
 // ---- 路由：#page[/id][?k=v] ----
 
-export type PageId = 'overview' | 'requirements' | 'tasks' | 'messages' | 'notes' | 'staff' | 'ops';
-export const PAGES: readonly PageId[] = ['overview', 'requirements', 'tasks', 'messages', 'notes', 'staff', 'ops'];
+export type PageId = 'today' | 'projects' | 'overview' | 'requirements' | 'tasks' | 'messages' | 'notes' | 'staff' | 'ops';
+export const PAGES: readonly PageId[] = ['today', 'projects', 'overview', 'requirements', 'tasks', 'messages', 'notes', 'staff', 'ops'];
+/** 「系统」分区里的低频页面；左侧导航只显示一个入口。 */
+export const SYSTEM_PAGES: readonly PageId[] = ['messages', 'notes', 'staff', 'ops'];
 
 export interface Route {
   page: PageId;
@@ -418,7 +420,7 @@ export interface Route {
 }
 
 /**
- * 旧入口仍可打开：#board → 总览（原看板的派工消息在 #messages）；#feedback → 需求池的反馈视图。未知地址回到总览。
+ * 首页是 #today。旧入口仍可打开：#overview 是现场大屏，#board → 现场大屏；#feedback → 需求池的反馈视图。未知地址回到首页。
  */
 export function routeOf(hash: string): Route {
   const raw = hash.replace(/^#\/?/, '');
@@ -429,8 +431,8 @@ export function routeOf(hash: string): Route {
   const id = rest.length ? decodeURIComponent(rest.join('/')) : undefined;
   if (name === 'board') return { page: 'overview', params };
   if (name === 'feedback') return { page: 'requirements', params: { ...params, view: 'feedback' } };
-  const page = (PAGES as readonly string[]).includes(name) ? name as PageId : 'overview';
-  return { page, ...(id && page !== 'overview' ? { id } : {}), params };
+  const page = (PAGES as readonly string[]).includes(name) ? name as PageId : 'today';
+  return { page, ...(id && page !== 'overview' && page !== 'today' ? { id } : {}), params };
 }
 
 export function hrefOf(page: PageId, id?: string, params: Record<string, string | undefined> = {}): string {

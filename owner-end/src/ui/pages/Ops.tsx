@@ -45,7 +45,7 @@ const CLIENT_ROLES = ['gateway', 'viewer', 'automation', 'runner', 'migrator', '
 export function OpsPage() {
   return (
     <div class="page">
-      <PageHeader title="运维" description="面向排障与维护的低频工具：命令目录、执行端作业、审计、只读查询、身份服务与 Cloudflare。直接写库默认折叠，执行前二次确认。" />
+      <PageHeader title="运维" description="排障与维护工具。直接写库默认折叠，执行前二次确认。" />
       <nav class="jump-bar" aria-label="页内导航">
         {OPS_SECTIONS.map(([id, label]) => (
           <a key={id} href="#ops" onClick={e => { e.preventDefault(); document.getElementById(id)?.scrollIntoView({ behavior: 'smooth' }); }}>{label}</a>

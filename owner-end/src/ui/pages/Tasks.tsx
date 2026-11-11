@@ -45,41 +45,6 @@ export function TasksPage({ route }: { route: Route }) {
   return route.id ? <TaskDetailPage key={route.id} taskId={route.id} /> : <TaskList route={route} />;
 }
 
-function DispatchControl() {
-  const [paused, setPaused] = useState<boolean>();
-  const [confirm, setConfirm] = useState(false);
-  const action = useAction();
-  const load = useCallback(async () => {
-    const out = await runCommand<{ paused?: boolean }>('status');
-    if (out.kind === 'ok') setPaused(out.result.paused === true);
-  }, []);
-  useEffect(() => { void load(); }, [load]);
-  useLiveRefresh(['company_meta'], load, !confirm);
-  const toggle = () => void action.run(paused ? 'task.resume' : 'task.pause', {}, paused ? '已恢复派工' : '已暂停派工。在途执行不受影响。', () => { setConfirm(false); return load(); });
-  return (
-    <div class="dispatch">
-      <span class="status-line">
-        <span class={`dot tone-${paused === undefined ? 'neutral' : paused ? 'blocked' : 'done'}`} aria-hidden="true" />
-        {paused === undefined ? '派工状态未知' : paused ? '派工已暂停' : '派工运行中'}
-      </span>
-      {paused !== undefined ? (
-        <button type="button" disabled={action.busy} onClick={() => (paused ? toggle() : setConfirm(true))}>{paused ? '恢复派工' : '暂停派工'}</button>
-      ) : null}
-      <NoticeLine notice={action.notice} onClose={() => action.setNotice(null)} />
-      {confirm ? (
-        <Dialog title="暂停全公司派工？" onClose={() => setConfirm(false)} footer={(
-          <>
-            <button type="button" data-autofocus onClick={() => setConfirm(false)}>取消</button>
-            <button type="button" class="primary" disabled={action.busy} onClick={toggle}>暂停派工</button>
-          </>
-        )}>
-          <p>暂停后调度器不再派出新任务；员工手上的执行继续做完。需求本身的状态不变。</p>
-        </Dialog>
-      ) : null}
-    </div>
-  );
-}
-
 function TaskList({ route }: { route: Route }) {
   const [tasks, setTasks] = useState<TaskRow[]>();
   const [error, setError] = useState('');
@@ -108,8 +73,8 @@ function TaskList({ route }: { route: Route }) {
     <div class="page">
       <PageHeader
         title="执行任务"
-        description="需求确认后由 Agent 拆出的任务，以及直接派给员工的任务。任务完成表示执行与复核结束，不代表产品已上线。"
-        actions={<><DispatchControl /><button type="button" class="primary" onClick={() => setCreating(true)}>新建任务</button></>}
+        description="任务完成表示执行与复核结束，不代表已上线。"
+        actions={<button type="button" class="primary" onClick={() => setCreating(true)}>新建任务</button>}
       />
       <div class="toolbar">
         <FilterTabs label="按任务状态筛选" value={group} onChange={id => { location.hash = hrefOf('tasks', undefined, { s: id === 'all' ? undefined : id }); }}
@@ -135,7 +100,7 @@ function TaskList({ route }: { route: Route }) {
                 const id = taskIdOf(t);
                 return (
                   <tr key={id} class={t.state === 'blocked' ? 'is-blocked' : undefined}>
-                    <td class="cell-title"><a class="row-link" href={hrefOf('tasks', id)}>{t.title || id}</a><span class="cell-sub"><code>{id}</code></span></td>
+                    <td class="cell-title"><a class="row-link" href={hrefOf('tasks', id)}>{t.title || id}</a><span class="cell-sub" title={id}><code>#{id.slice(0, 8)}</code></span></td>
                     <td data-label="状态"><Badge tone={taskTone(t.state)}>{TASK_STATE_ZH[t.state ?? ''] ?? t.state ?? '未知'}</Badge></td>
                     <td data-label="执行岗">{roleText(t.executor_role)}</td>
                     <td data-label="复核岗">{roleText(t.reviewer_role)}</td>

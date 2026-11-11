@@ -319,7 +319,7 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
     <div class="page board-page">
       <PageHeader
         title="派工消息"
-        description="员工正在做什么、接下来做什么，以及发给他们的消息原文。发送前可以改写、翻译或扣住。最近活动见总览。"
+        description="发给员工的消息原文，发送前可以改写、翻译或扣住。"
         actions={<button type="button" class="ghost" onClick={() => void load()}>刷新</button>}
         meta={(
           <>
