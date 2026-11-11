@@ -1,8 +1,9 @@
 import type { Surreal } from 'surrealdb';
-import type { AgentActivity } from './agent-activity.ts';
+import { activityText, type AgentActivity } from './agent-activity.ts';
 import type { WorkContext } from './work-context.ts';
 import { estimateRemaining, phaseDurations, type RuntimeEstimate } from './runtime-timing.ts';
 import { readBoard, RUNNER_STALE_MS, type OwnerBoard } from './board.ts';
+import { buildProjectRooms, type RuntimeProjectView } from './runtime-projects.ts';
 
 /** 可观测性读模型，不导入宿主 SDK；数据不足时保留未知状态。 */
 export interface HostMetrics {
@@ -30,6 +31,10 @@ export interface RuntimePrompt {
   truncated: boolean;
 }
 export interface RuntimeAgentView {
+  definitionId?: string;
+  taskState?: string;
+  blockedReason?: string;
+  pendingMessages?: RuntimePendingMessage[];
   runtime?: 'native' | 'paseo' | 'unknown';
   activity?: AgentActivity;
   id: string;
@@ -58,6 +63,19 @@ export interface RuntimeAgentView {
     reason: string;
   };
   destination?: { role: string; agentId?: string; source: 'planned'; label: string };
+}
+export interface RuntimePendingMessage {
+  messageId: string;
+  taskId: string;
+  title: string;
+  body: string;
+  preview: string;
+  context?: WorkContext;
+  hold: boolean;
+  /** A later-stage template is editable, but is not about to be delivered. */
+  stage?: 'next' | 'later';
+  /** Candidate assignment is not a delivery promise. */
+  assignment: 'candidate' | 'current' | 'unassigned';
 }
 export interface RuntimeTransfer {
   id: string;
@@ -89,6 +107,7 @@ export interface RuntimeDelivery {
   runUrl?: string;
 }
 export interface RuntimeDashboard {
+  projects?: RuntimeProjectView[];
   at: number;
   hosts: RuntimeHostView[];
   agents: RuntimeAgentView[];
@@ -130,6 +149,9 @@ const promptContext = (prompt: RuntimePrompt | undefined, context?: WorkContext)
 const online = (at: number | undefined, now: number) =>
   at !== undefined && at <= now + 5000 && now - at <= RUNNER_STALE_MS;
 export interface DashboardRows {
+  projects?: Row[];
+  requirements?: Row[];
+  plans?: Row[];
   board: OwnerBoard;
   employees: Row[];
   beats: Row[];
@@ -143,6 +165,8 @@ export interface DashboardRows {
   warnings?: string[];
   activities?: Row[];
   timingEvents?: Row[];
+  /** Latest block audit for each currently blocked task; independent of the recent-event window. */
+  blockedAudits?: Row[];
 }
 
 export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): RuntimeDashboard {
@@ -178,6 +202,29 @@ export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): R
     hosts.set(id, h);
   }
   const taskMap = new Map(input.tasks.map((t) => [key(t.id), t]));
+  // readBoard orders drafts by task/step then creation, oldest first. Only the newest unsent
+  // execute/review/rework draft can be consumed by the dispatcher's latestDraft path.
+  // System notice/nudge sends create a new body on each attempt; editing their leftover rows
+  // does not affect a later send, so they must not be advertised as editable upcoming work.
+  const latestDrafts = new Map<string, OwnerBoard['messages'][number]>();
+  for (const m of input.board.messages) {
+    const task = taskMap.get(m.taskId);
+    if (!task || !['planned','ready','doing','review','blocked'].includes(task.state) ||
+      !['execute','review','rework'].includes(m.step)) continue;
+    if (task.state === 'review' && m.step !== 'review') continue;
+    latestDrafts.set(`${m.taskId}:${m.step}`, m);
+  }
+  const messages: RuntimePendingMessage[] = [...latestDrafts.values()].map(m => {
+    const task = taskMap.get(m.taskId)!;
+    return {messageId:m.messageId,taskId:m.taskId,title:m.title,body:m.body,preview:m.body,
+      context:m.context,hold:m.hold,assignment:'unassigned',
+      stage:task.state === 'planned' || task.state === 'blocked' || (m.step === 'review' && task.state !== 'review') ? 'later' : 'next'};
+  });
+  const blockedAudit = new Map<string, Row>();
+  for (const audit of [...(input.blockedAudits ?? input.audits.filter(a => a.action === 'block'))]
+    .sort((a,b)=>(time(b.at) ?? 0)-(time(a.at) ?? 0))) {
+    if (!blockedAudit.has(key(audit.task))) blockedAudit.set(key(audit.task),audit);
+  }
   const timings = phaseDurations((input.timingEvents ?? []).map(e => ({
     task: key(e.task), actor: key(e.actor), action: e.action, phase: e.phase,
     project: key(e.project_ref), kind: e.kind, role: e.role, at: time(e.at) ?? 0,
@@ -198,7 +245,13 @@ export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): R
     const observedAt = time(row?.runtime_at);
     const fresh = host.state === 'online' && online(observedAt, now);
     const leased = e.now.state === 'leased' ? e.now : undefined;
-    const task = leased ? taskMap.get(leased.taskId) : undefined;
+    const blockedTask = leased ? undefined : input.tasks.find(t => t.state === 'blocked' &&
+      [key(row?.session_task),key(row?.last_task)].includes(key(t.id)) &&
+      key(blockedAudit.get(key(t.id))?.actor) === e.id);
+    const task = leased ? taskMap.get(leased.taskId) : blockedTask;
+    const blockedReason = blockedTask
+      ? activityText(String(blockedAudit.get(key(blockedTask.id))?.evidence ?? '')).trim() || '等待前置条件恢复'
+      : undefined;
     const project = task?.project_ref ? {id: key(task.project_ref), name: String(task.project_name || key(task.project_ref))} : undefined;
     const elapsedSeconds = leased?.leaseStartedAt !== undefined
       ? Math.max(0, Math.floor((now - leased.leaseStartedAt) / 1000)) : leased?.elapsedSeconds;
@@ -222,8 +275,8 @@ export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): R
         : undefined;
     const next = e.next[0];
     const activity = input.activities?.find(a => a.agent === row?.paseo_agent_id &&
-      key(a.employee) === e.id && (!leased || key(a.task) === leased.taskId) &&
-      (!leased || (task?.runtime_execution?.agent === a.agent && task?.runtime_execution?.turn === a.activity?.turn)) &&
+      key(a.employee) === e.id && (!task || key(a.task) === key(task.id)) &&
+      (!task || (task?.runtime_execution?.agent === a.agent && task?.runtime_execution?.turn === a.activity?.turn)) &&
       (!leased?.leaseStartedAt || a.activity?.startedAt >= leased.leaseStartedAt - 1000))?.activity as AgentActivity | undefined;
     const draft = next ? e.outbox.find((m) => m.taskId === next.taskId) : undefined;
     // parent 是前置任务，不能误当子任务。百分比只能来自已落地的需求执行清单。
@@ -256,13 +309,22 @@ export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): R
     );
     return {
       id: e.id,
+      definitionId: e.def,
+      taskState: task?.state,
+      blockedReason,
+      pendingMessages: messages.flatMap<RuntimePendingMessage>(m => {
+        const draft=e.outbox.find(o=>o.messageId===m.messageId);
+        if (draft) return [{...m,preview:draft.translation?.status === 'ready' ? draft.translation.text ?? draft.body : draft.body,
+          context:draft.context,assignment:'candidate' as const}];
+        return [];
+      }),
       name: e.name,
       role: e.role,
       hostId,
       runtime: row?.paseo_agent_id ? String(row.paseo_agent_id).startsWith('native:') ? 'native' : 'paseo' : 'unknown',
       activity,
       project,
-      ...(leased ? { estimate: state === 'running' && (!activity || activity.state === 'running')
+      ...(leased ? { estimate: leased.leaseActive && state === 'running' && (!activity || activity.state === 'running')
         ? estimateRemaining({task: leased.taskId, phase: leased.phase, project: project?.id ?? '', role: e.role, kind: task?.kind ?? ''}, elapsedSeconds, timings)
         : {status: 'unavailable' as const, samples: 0} } : {}),
       provider: e.provider,
@@ -270,6 +332,7 @@ export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): R
       modelSource: fresh && row?.runtime_model ? 'observed' : e.model ? 'configured' : 'unknown',
       state,
       observedAt,
+      ...(blockedTask ? {taskId:key(blockedTask.id),taskTitle:String(blockedTask.title),action:blockedReason} : {}),
       ...(leased
         ? {
             taskId: leased.taskId,
@@ -415,6 +478,8 @@ export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): R
   for (const q of input.board.unassigned) if (q.blocked) blocked.add(q.taskId);
   return {
     at: now,
+    projects: buildProjectRooms({projects:input.projects,tasks:input.tasks,requirements:input.requirements,
+      plans:input.plans,executions:input.executions,agents,messages,history:timings}),
     hosts: list,
     agents,
     transfers: transfers.slice(-60),
@@ -438,16 +503,16 @@ export async function readRuntimeDashboard(db: Surreal): Promise<RuntimeDashboar
   const read = async (sql: string, vars?: Record<string, unknown>): Promise<Row[]> =>
     (await db.query<[Row[]]>(sql, vars))[0] ?? [];
   // 核心数据失败则整次失败，让页面保留旧快照并明确报错；不把失败伪装为零。
-  const [board, employees, beats, telemetry, tasks, sent, audits, executions, evidence, activities, timingEvents] =
+  const [board, employees, beats, telemetry, tasks, sent, audits, executions, evidence, activities, timingEvents, projects, requirements, plans] =
     await Promise.all([
       readBoard(db),
       read(
-        'SELECT id, runner_id, paseo_agent_id, runtime_at, runtime_state, runtime_model FROM employee WHERE revoked != true AND retired != true;',
+        'SELECT id, runner_id, paseo_agent_id, runtime_at, runtime_state, runtime_model, session_task, last_task FROM employee WHERE revoked != true AND retired != true;',
       ),
       read('SELECT runner, host, version, at FROM runner_heartbeat;'),
       read('SELECT runner, node, at, metrics FROM company_meta WHERE kind = "runner_telemetry";'),
       read(
-        'SELECT id, title, state, kind, parent, executor_role, reviewer_role, acceptance_head, acceptance_attempt, runtime_context, runtime_execution, delivery_id, project AS project_ref, project.name AS project_name FROM task;',
+        'SELECT id, title, state, kind, parent, proposed_in, executor_role, reviewer_role, current_employee, previous_employee, acceptance_head, acceptance_attempt, runtime_context, runtime_execution, delivery_id, project AS project_ref, project.name AS project_name FROM task;',
       ),
       read(
         'SELECT id, task, sent_to, sent_at, step FROM outbound_message WHERE state = "sent" AND step IN ["execute", "review", "rework"] ORDER BY sent_at DESC LIMIT 240;',
@@ -455,7 +520,7 @@ export async function readRuntimeDashboard(db: Surreal): Promise<RuntimeDashboar
       read(
         'SELECT id, task, actor, action, at FROM audit WHERE action IN ["claim", "checkpoint", "submit", "return", "accept", "block", "owner_approve"] ORDER BY at DESC LIMIT 40;',
       ),
-      read('SELECT tasks FROM requirement_execution;'),
+      read('SELECT requirement, revision, tasks FROM requirement_execution;'),
       read(
         'SELECT id, task, sha, attempt, environment, source, verified, verifier, at FROM acceptance_evidence WHERE verified = true AND verifier = "github-actions" ORDER BY at DESC LIMIT 100;',
       ),
@@ -465,20 +530,28 @@ export async function readRuntimeDashboard(db: Surreal): Promise<RuntimeDashboar
         IF phase = 'review' THEN task.reviewer_role ELSE task.executor_role END AS role
         FROM audit WHERE at > time::now() - 30d AND action IN ['claim', 'submit', 'accept', 'return', 'block', 'released', 'expire', 'void']
         ORDER BY at DESC LIMIT 2000;`),
+      read('SELECT id, name FROM project;'),
+      read('SELECT id, project, approved_revision, state FROM product_requirement WHERE approved_revision != NONE;'),
+      read('SELECT requirement, revision, body FROM requirement_plan;'),
     ]);
   const ids = board.employees.filter((e) => e.now.state === 'leased').map((e) => e.id);
-  const current = ids.length
-    ? (
-        await Promise.all(
+  const [current, blockedAudits] = await Promise.all([ids.length
+    ? Promise.all(
           ids.map((employee) =>
             read(
               'SELECT id, task, sent_to, sent_at, body, sent_body FROM outbound_message WHERE state = "sent" AND sent_to = $employee ORDER BY sent_at DESC LIMIT 1;',
               { employee },
             ),
           ),
-        )
-      ).flat()
-    : [];
+        ).then(rows=>rows.flat())
+    : Promise.resolve([]),
+    // A block can last much longer than the 40-event feed or 30-day timing window.
+    // Read one bounded latest audit per blocked task, never infer its author from a released lease.
+    Promise.all(tasks.filter(t => t.state === 'blocked').map(t => read(
+      'SELECT task, actor, evidence, at FROM audit WHERE task = $task AND action = "block" ORDER BY at DESC LIMIT 1;',
+      {task:t.id},
+    ))).then(rows=>rows.flat()),
+  ]);
   return buildRuntimeDashboard({
     board,
     employees,
@@ -492,5 +565,9 @@ export async function readRuntimeDashboard(db: Surreal): Promise<RuntimeDashboar
     evidence,
     activities,
     timingEvents,
+    blockedAudits,
+    projects,
+    requirements,
+    plans,
   });
 }

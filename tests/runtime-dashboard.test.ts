@@ -59,6 +59,54 @@ function fixture(): DashboardRows {
   };
 }
 
+test('正常阻塞清空租约后按最后阻塞审计保留员工、项目和原因，不依赖最近事件窗口', () => {
+  const input=fixture();
+  input.board.employees[0]!.now={state:'idle'};
+  Object.assign(input.employees[0]!, {runtime_state:'idle',session_task:'work',last_task:'task:work'});
+  Object.assign(input.tasks[0]!, {state:'blocked',project_ref:'project:app',project_name:'产品'});
+  input.audits=Array.from({length:40},(_,i)=>({task:`other-${i}`,action:'checkpoint',at:now-i}));
+  input.blockedAudits=[{task:'task:work',actor:'employee:dev',at:now-40*86400000,evidence:'等待仓库权限；token=private-secret'}];
+  const result=buildRuntimeDashboard(input,now);
+  expect(result.agents.find(a=>a.id==='dev')).toMatchObject({taskId:'work',taskState:'blocked',project:{id:'app',name:'产品'}});
+  expect(result.agents.find(a=>a.id==='dev')?.blockedReason).toContain('等待仓库权限');
+  expect(result.agents.find(a=>a.id==='dev')?.blockedReason).not.toContain('private-secret');
+  expect(result.projects?.find(p=>p.id==='app')?.blocked).toBe(1);
+});
+
+test('同一任务旧执行员工和复核员工都在册时，只把最近报告阻塞的人标成受阻', () => {
+  const input=fixture();
+  for(const e of input.board.employees)e.now={state:'idle'};
+  for(const e of input.employees)Object.assign(e,{runtime_state:'idle',session_task:'work'});
+  Object.assign(input.tasks[0]!,{state:'blocked'});
+  input.blockedAudits=[{task:'work',actor:'dev',at:now-20,evidence:'旧阻塞'},{task:'work',actor:'qa',at:now-10,evidence:'复核阻塞'}];
+  const result=buildRuntimeDashboard(input,now);
+  expect(result.agents.find(a=>a.id==='dev')?.taskId).toBeUndefined();
+  expect(result.agents.find(a=>a.id==='qa')).toMatchObject({taskId:'work',blockedReason:'复核阻塞'});
+});
+
+test('待发只展示最新可消费草稿，后续复核不误归当前执行员工', () => {
+  const input=fixture();
+  input.tasks.push({id:'done',state:'done'});
+  input.board.messages=[
+    {messageId:'old',taskId:'next',title:'下一单',step:'execute',state:'draft',hold:false,body:'旧正文',editable:true},
+    {messageId:'new',taskId:'next',title:'下一单',step:'execute',state:'draft',hold:false,body:'新正文',editable:true},
+    {messageId:'review',taskId:'work',title:'复核',step:'review',state:'draft',hold:false,body:'QA正文',editable:true,employeeId:'dev'},
+    {messageId:'done',taskId:'done',title:'已结',step:'review',state:'draft',hold:false,body:'不再派发',editable:true},
+    {messageId:'notice',taskId:'work',title:'通知',step:'notice',state:'draft',hold:false,body:'遗留通知',editable:true,employeeId:'dev'},
+  ];
+  input.board.employees[0]!.outbox=[{...input.board.messages[1]!,step:'execute',workdirPending:false,lang:'zh'}];
+  const data=buildRuntimeDashboard(input,now);
+  expect(data.projects?.flatMap(p=>p.pendingMessages.map(m=>m.messageId))).toEqual(['new','review']);
+  expect(data.agents.find(a=>a.id==='dev')?.pendingMessages?.map(m=>m.messageId)).toEqual(['new']);
+  expect(data.projects?.flatMap(p=>p.pendingMessages).find(m=>m.messageId==='review')?.stage).toBe('later');
+});
+
+test('租约已过期时即使运行观测还新鲜也不能给出员工结束时间', () => {
+  const input=fixture();
+  if(input.board.employees[0]!.now.state==='leased')input.board.employees[0]!.now.leaseActive=false;
+  expect(buildRuntimeDashboard(input,now).agents.find(a=>a.id==='dev')?.estimate?.status).toBe('unavailable');
+});
+
 test('按物理节点归组，模型来自观测；租约、候选和链上后续不能冒充运行进度', () => {
   const input = fixture();
   const data = buildRuntimeDashboard(input, now);

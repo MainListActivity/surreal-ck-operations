@@ -245,7 +245,8 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
 
     // ---- 待发消息 ----
     case 'message.list': return { messages: await ctx.messages.list(optionalText(input.taskId), input.includeSent !== false) };
-    case 'message.edit': return ctx.messages.edit(text(input.messageId, 'messageId'), text(input.body, 'body'), a);
+    case 'message.edit': return ctx.messages.edit(text(input.messageId, 'messageId'), text(input.body, 'body'), a,
+      typeof input.expectedBody === 'string' ? input.expectedBody : undefined);
     case 'message.hold': return ctx.messages.setHold(text(input.messageId, 'messageId'), true, a);
     case 'message.release': return ctx.messages.setHold(text(input.messageId, 'messageId'), false, a);
     case 'message.send': {

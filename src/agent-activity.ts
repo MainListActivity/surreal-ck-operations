@@ -16,6 +16,8 @@ export interface AgentActivity {
   tool?: string;
   toolStartedAt?: number;
   toolsCompleted: number;
+  /** Only counts from a successful structured todo write; no task text or tool arguments are stored. */
+  checklist?: { done: number; total: number; at: number };
   events: ActivityEvent[];
 }
 /** Defense in depth for ordinary assistant output; event selection excludes sensitive channels first. */
@@ -29,11 +31,21 @@ export function activityText(text: string): string {
     .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '').slice(0, 1200);
 }
 
+/** Provider-native todo formats. Count status markers only; never persist todo descriptions. */
+function checklistCounts(todos: unknown): {done: number; total: number} | undefined {
+  const statuses = Array.isArray(todos) ? todos.map(t => t?.status) :
+    typeof todos === 'string' && todos.length <= 100_000 ? todos.split(/\r?\n/).filter(l => l.trim()).map(line =>
+      /^\s*(?:\d+[.)]|[-*])\s+\[(pending|in_progress|completed)\]\s+\S/.exec(line)?.[1]) : [];
+  if (!statuses.length || statuses.length > 200 || !statuses.every(s => ['pending','in_progress','completed'].includes(s))) return;
+  return {done: statuses.filter(s => s === 'completed').length, total: statuses.length};
+}
+
 /** Bounded, deterministic projection of provider events; no model call and no guessed completion %. */
 export class ActivityCollector {
   readonly value: AgentActivity;
   private seq = 0;
-  private tools = new Map<string, {name: string; at: number}>();
+  private checklistSequence = -1;
+  private tools = new Map<string, {name: string; at: number; sequence: number; updatesChecklist: boolean; checklist?: {done: number; total: number}}>();
   constructor(agent: string, turn: string, now: number) {
     this.value = { agent, turn, runtime: 'native', state: 'running', startedAt: now,
       observedAt: now, lastActivityAt: now, toolsCompleted: 0, events: [] };
@@ -46,10 +58,14 @@ export class ActivityCollector {
     this.value.events.push({ seq: ++this.seq, at, kind, text: safe });
     this.value.events = this.value.events.slice(-40);
   }
-  private start(id: unknown, name: unknown, at: number) {
+  private start(id: unknown, name: unknown, at: number, input?: unknown) {
     if (typeof id !== 'string' || typeof name !== 'string' || this.tools.has(id)) return;
     const safe = name.replace(/[^\p{L}\p{N}_.:/-]/gu, '').slice(0, 100) || '工具';
-    this.tools.set(id, {name: safe, at}); this.value.tool = safe; this.value.toolStartedAt = at;
+    const updatesChecklist = /^(TodoWrite|todo_write)$/i.test(name);
+    const todos = updatesChecklist && input && typeof input === 'object'
+      ? (input as {todos?: unknown}).todos : undefined;
+    const checklist = checklistCounts(todos);
+    this.tools.set(id, {name: safe, at, sequence: this.seq, updatesChecklist, checklist}); this.value.tool = safe; this.value.toolStartedAt = at;
     this.append('tool_start', `开始调用 ${safe}`, at);
   }
   private end(id: unknown, failed: boolean, at: number) {
@@ -57,6 +73,10 @@ export class ActivityCollector {
     const tool = this.tools.get(id);
     if (!tool) return;
     this.tools.delete(id); this.value.toolsCompleted++;
+    if (!failed && tool.updatesChecklist && tool.sequence > this.checklistSequence) {
+      this.value.checklist = tool.checklist ? {...tool.checklist, at: tool.at} : undefined;
+      this.checklistSequence = tool.sequence;
+    }
     this.append('tool_end', `${tool.name} ${failed ? '调用失败' : '调用结束'}`, at);
     const active = [...this.tools.values()].at(-1);
     this.value.tool = active?.name; this.value.toolStartedAt = active?.at;
@@ -67,13 +87,13 @@ export class ActivityCollector {
     if (provider === 'claude') {
       if (e.type === 'assistant') for (const b of e.message?.content ?? []) {
         if (b.type === 'text' && typeof b.text === 'string') this.append('output', b.text, at);
-        if (b.type === 'tool_use') this.start(b.id, b.name, at);
+        if (b.type === 'tool_use') this.start(b.id, b.name, at, b.input);
       }
       if (e.type === 'user') for (const b of e.message?.content ?? [])
         if (b.type === 'tool_result') this.end(b.tool_use_id, b.is_error === true, at);
     } else if (provider === 'factory-droid') {
       if (e.type === 'message' && e.role === 'assistant' && typeof e.text === 'string') this.append('output', e.text, at);
-      if (e.type === 'tool_call') this.start(e.toolId ?? e.toolCallId ?? e.id, e.toolName, at);
+      if (e.type === 'tool_call') this.start(e.toolId ?? e.toolCallId ?? e.id, e.toolName, at, e.parameters);
       if (e.type === 'tool_result') this.end(e.toolId ?? e.toolCallId ?? e.id, e.isError === true, at);
     } else if (provider === 'codex') {
       if (e.type === 'item.completed' && e.item?.type === 'agent_message' && typeof e.item.text === 'string') this.append('output', e.item.text, at);

@@ -154,13 +154,17 @@ export class OutboundMessageStore {
     return !deliveryOf(draft, employeeLang).ok;
   }
 
-  async edit(messageId: string, body: string, actor: string): Promise<OutboundMessage> {
+  async edit(messageId: string, body: string, actor: string, expectedBody?: string): Promise<OutboundMessage> {
     if (!body.trim()) throw new CompanyError('invalid', 'message body must not be empty');
     const msg = this.message(messageId);
     const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
-      `UPDATE $msg SET body = $body, edited_by = $actor, edited_at = time::now() WHERE state != 'sent' RETURN AFTER;`,
-      { msg, body, actor });
+      `UPDATE $msg SET body = $body, edited_by = $actor, edited_at = time::now() WHERE state != 'sent' AND ($expected = NONE OR body = $expected) RETURN AFTER;`,
+      { msg, body, actor, expected: expectedBody });
     const row = rows?.[0];
+    if (!row && expectedBody !== undefined) {
+      const current = await this.get(messageId);
+      if (current && current.state !== 'sent') throw new CompanyError('conflict', '消息已被修改，请核对最新正文后重新保存');
+    }
     if (!row) throw await this.refusal(msg);
     return rowView(row);
   }

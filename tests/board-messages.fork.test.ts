@@ -155,3 +155,20 @@ run('owner board messages: every unsent message, queued drafts, and the holder a
     await w.close();
   }
 });
+
+run('老板页内改消息：原文比较防覆盖、发送后拒绝、兼容原编辑入口', async () => {
+  const w=await startFork('edit-cas');
+  try {
+    const task=await w.core.createTask(w.gm,{title:'消息编辑比较',context:'仅隔离测试',executorRole:'engineering',reviewerRole:'qa',idempotencyKey:'edit-cas'});
+    const store=new OutboundMessageStore(w.surreal);
+    await store.createTaskDrafts(task.id,'engineering','qa',false);
+    const message=(await store.list(task.id,false)).find(m=>m.step==='execute')!;
+    expect((await store.edit(message.id,'老板修订正文','owner:test',message.body)).body).toBe('老板修订正文');
+    await expect(store.edit(message.id,'过期页面的修改','owner:test',message.body)).rejects.toMatchObject({code:'conflict'});
+    expect((await store.get(message.id))?.body).toBe('老板修订正文');
+    await store.edit(message.id,'旧入口修改仍有效','owner:test');
+    await store.markSent(message.id,'fixture-employee','旧入口修改仍有效');
+    await expect(store.edit(message.id,'发送后不能改','owner:test','旧入口修改仍有效')).rejects.toThrow();
+    await expect(store.edit('missing','不存在','owner:test','old')).rejects.toMatchObject({code:'not_found'});
+  } finally {await w.close();}
+});
