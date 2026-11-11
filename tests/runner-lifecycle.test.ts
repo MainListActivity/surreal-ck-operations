@@ -67,7 +67,7 @@ function fixture(readTurnResult?: (agent: string, turn: string) => Promise<strin
   const event = (turn = 'turn-a', text = '工作已完成，全部只读检查通过，证据已生成。', kind = 'completed') =>
     ({ agent: { id: 'agent' }, turnId: turn, outcome: { kind }, timeline: [{ type: 'assistant_message', text }] });
   const journal = () => new ExecutionJournal(join(root, 'private', 'executions', createHash('sha256').update(options.runDir).digest('hex')));
-  return { root, calls, inst, event, journal,
+  return { core, workforce, root, calls, inst, event, journal,
     settle: (value = event(), interruptions?: TurnInterruptions) => settleCompanyTurn({sidecar: pool, workforce} as never, {} as never, value as never, interruptions),
     get pool() { return pool; },
     fail(value: boolean) { fail = value; }, loseReply() { loseReply = true; }, failRead(value: boolean) { failRead = value; },
@@ -263,4 +263,35 @@ test('同毫秒重开同号回合与重复启动事件：只为每个实际启�
     expect(f.calls.map(c => c.action)).toEqual(['submit']);
     expect(f.journal().rows()[0]?.state).toBe('settled');
   } finally { Date.now = now; interruptions.stop(); f.close(); }
+});
+
+test('明确供应商失败先保存预算；保存失败保留租约，同回合重试可继续收尾且不调用模型', async () => {
+  const f = fixture();
+  const actions: string[] = [];
+  let failBudget = true;
+  Object.assign(f.inst, { provider:'codex' });
+  Object.assign(f.workforce, {
+    markExhausted: async()=>{}, refundQuotaWake:async()=>{},
+    recordProviderFailure: async(_employee:string,proof:LeaseProof)=>{
+      expect(proof.deliveryId).toBe('delivery-a'); actions.push('budget');
+      if(failBudget)throw new Error('synthetic budget write failure');
+    },
+  });
+  Object.assign(f.core,{release:async()=>{actions.push('release');}});
+  try {
+    await f.claim(); await f.pool.turnStarted('agent','turn-a');
+    const event={...f.event(),outcome:{kind:'failed',error:{message:'503 service unavailable'}},timeline:[]};
+    await expect(f.settle(event as never)).rejects.toThrow('budget write failure');
+    expect(actions).toEqual(['budget']);
+    expect(f.journal().rows()[0]?.state).toBe('interrupted');
+    expect(f.pool.hasPendingResult('worker','task','delivery-a')).toBe(true);
+    await f.restart();
+    expect(f.pool.hasPendingResult('worker','task','delivery-a')).toBe(true);
+    failBudget=false;
+    await f.retry();
+    expect(actions).toEqual(['budget','budget','release']);
+    expect(f.pool.hasPendingResult('worker','task','delivery-a')).toBe(false);
+    await f.settle(event as never);
+    expect(actions).toEqual(['budget','budget','release']);
+  } finally { f.close(); }
 });

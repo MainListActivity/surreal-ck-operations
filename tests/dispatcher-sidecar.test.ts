@@ -1123,3 +1123,43 @@ for (const lostReply of [false, true]) {
     } finally { await runtime.close(); rmSync(root, { recursive: true, force: true }); }
   });
 }
+
+describe('delivery scheduling', () => {
+  test('confirmed requirement priority wins over an older fresh review and Factory FIFO', async () => {
+    const w = world();
+    w.setConfig({ maxRunning: 1 });
+    w.def.provider = 'factory-droid';
+    w.addTask('ordinary-review', { state: 'review' }); w.addTask('critical-delivery');
+    Object.assign(w.wf, { schedulingFacts: async () => new Map([
+      ['ordinary-review', { readyAt: 999_000, priority: 3, requirement: 'low', revision: 1 }],
+      ['critical-delivery', { readyAt: 1_000_000, priority: 0, requirement: 'critical', revision: 2 }],
+    ]) });
+    w.rows[0]!.row.created_at = new Date(999_000).toISOString();
+    w.rows[1]!.row.created_at = new Date(1_000_000).toISOString();
+    const result = await w.dispatcher().tick();
+    expect(result.woke.map(r => r.task)).toEqual(['critical-delivery']);
+    expect(w.events.filter(e => e.startsWith('claim:'))).toHaveLength(1);
+  });
+
+  test('long-waiting ordinary execution wins over a newly arrived critical review', async () => {
+    const w = world(); w.setConfig({ maxRunning: 1 });
+    w.addTask('new-review', { state: 'review' }); w.addTask('waiting-execution');
+    Object.assign(w.wf, { schedulingFacts: async () => new Map([
+      ['new-review', { readyAt: 1_000_000, priority: 0, requirement: 'critical', revision: 1 }],
+      ['waiting-execution', { readyAt: -1_000_000 }],
+    ]) });
+    const result = await w.dispatcher().tick();
+    expect(result.woke.map(r => r.task)).toEqual(['waiting-execution']);
+  });
+
+  test('an unavailable critical candidate does not block eligible normal work', async () => {
+    const w = world(); w.setConfig({ maxRunning: 1 });
+    w.addTask('unavailable-critical'); w.addTask('eligible-normal');
+    w.rows[0]!.executorRole = 'qa';
+    Object.assign(w.wf, { schedulingFacts: async () => new Map([
+      ['unavailable-critical', { readyAt: 1_000_000, priority: 0 }],
+      ['eligible-normal', { readyAt: 1_000_000, priority: 3 }],
+    ]) });
+    expect((await w.dispatcher().tick()).woke.map(r => r.task)).toEqual(['eligible-normal']);
+  });
+});
