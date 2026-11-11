@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, expect, test, setDefaultTimeout } from 'bun:test';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { RecordId } from 'surrealdb';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CompanyDatabase, CLOUD_SCHEMA_VERSION } from '../src/database.ts';
@@ -8,6 +9,7 @@ import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { Workforce } from '../src/workforce.ts';
 import { SidecarPool } from '../src/runner/sidecar.ts';
 import { saveRoute } from '../src/routes.ts';
+import { HANDOVER_ROWS } from '../src/handover-window.ts';
 setDefaultTimeout(60000);
 const run = process.env.RUN_SCK_CLOUD_RUNNER_TESTS === '1' ? test : test.skip;
 let dir: string, server: ReturnType<typeof Bun.spawn>, db: CompanyDatabase, core: SurrealCompanyCore, owner: string, wf: Workforce;
@@ -27,6 +29,7 @@ beforeAll(async () => {
 afterAll(async () => { for (const pool of pools) pool.close(); if (db) await db.close(); if (server) { server.kill(); await server.exited; } if (dir) rmSync(dir, { recursive: true, force: true }); });
 run('真实 fork：模型零生命周期命令，从领取、自动送审到独立 QA 验收完成', async () => {
   const task = await core.createTask(owner, { type: 'lifecycle-fixture', title: '执行端自动收尾', context: '验证自动状态转换', idempotencyKey: crypto.randomUUID() } as never);
+  const report = `工作结果：完成\n已核对任务目标和验收要求，输出完整可核验的测试结果。\n报告与原始输出：/evidence/${task.id}/tests.log`;
   for (const role of ['engineering', 'qa'] as const) {
     await wf.upsertDef(`fixture-${role}`, { role, provider: 'claude', model: 'fixture' });
     const def = (await wf.defs()).find(d => d.id === `fixture-${role}`)!;
@@ -34,11 +37,25 @@ run('真实 fork：模型零生命周期命令，从领取、自动送审到独�
     const pool = new SidecarPool({ runDir: join(dir, role, 'comm'), core, workforce: wf, managedLifecycle: true }); pools.push(pool);
     pool.env(inst); inst.paseoAgentId = role; pool.bindAgent(inst.id, role);
     await pool.claim(inst, { id: task.id } as never);
+    if (role === 'qa') {
+      const commDir = pool.commDirFor(inst.id)!;
+      expect(readFileSync(join(commDir, 'task.md'), 'utf8')).toContain(report);
+      const snapshot = JSON.parse(readFileSync(join(commDir, 'claim.json'), 'utf8'));
+      expect(snapshot.history.filter((h: { action: string }) => h.action === 'submit')).toHaveLength(1);
+      expect(snapshot.historyComplete).toBe(false);
+      expect(snapshot.historyCount).toBeGreaterThan(snapshot.history.length);
+    }
     await pool.turnStarted(role, role + '-turn');
     const result = await pool.settleExecution({ agent: { id: role }, turnId: role + '-turn', outcome: { kind: 'completed' },
-      timeline: [{ type: 'assistant_message', text: role === 'qa' ? '复核结论：通过\n已独立核对自动收尾的执行证据与结果，全部符合本任务验收要求。' : '工作结果：完成\n已核对任务目标和验收要求，输出完整可核验的测试结果。' }] });
+      timeline: [{ type: 'assistant_message', text: role === 'qa' ? '复核结论：通过\n已独立核对自动收尾的执行证据与结果，全部符合本任务验收要求。' : report }] });
     expect(result?.status).toBe('ingested');
     expect((await core.getTask(owner, task.id)).state).toBe(role === 'qa' ? 'done' : 'review');
+    if (role === 'engineering') {
+      // Ordinary protocol activity can push the submit outside the bounded handover window.
+      for (let i = 0; i <= HANDOVER_ROWS; i++) {
+        await db.db.query('CREATE audit CONTENT { task: $task, actor: "fixture", action: "handover_noise", evidence: "unrelated activity", at: time::now() };', { task: new RecordId('task', task.id) });
+      }
+    }
   }
   const history = await core.history(owner, task.id);
   expect(history.filter(h => h.action === 'submit')).toHaveLength(1);

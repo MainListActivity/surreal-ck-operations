@@ -73,3 +73,33 @@ test('老板看到的派工文件与实际任务正文同源，当前预览不�
   claim.task.context='x'.repeat(20000);
   expect(workContext(claim,'dispatched').files[0]).toMatchObject({truncated:true});
 });
+
+test('复核任务自动交接本任务最新提交原文、提交者和产物路径，老板快照同源', async () => {
+  const { workContext } = await import('../src/work-context.ts');
+  const report = '工作结果：完成\n31 项通过，0 项失败。\n报告：/evidence/t1/report.md\n原始输出：/evidence/t1/tests.log';
+  const handed = claim('review', [
+    { action: 'submit', actor: 'old-author', at, evidence: '已被替代的旧成果' },
+    ret('补充原始输出'),
+    { action: 'owner_submit', actor: 'author', at, evidence: report },
+    { action: 'claim', actor: 'reviewer', at },
+  ]);
+  const md = taskBrief(handed);
+  expect(md).toContain('## 待复核成果');
+  expect(md).toContain(report);
+  expect(md).toContain('提交者：author');
+  expect(md).toContain(at);
+  expect(md).not.toContain('已被替代的旧成果');
+  expect(md).not.toContain('read_task_text');
+  expect(workContext(handed, 'dispatched').files[0]!.text).toBe(md);
+  handed.task.state = 'doing';
+  expect(taskBrief(handed)).not.toContain(report);
+});
+
+test('复核交接缺失或截断时明确标示，不以旧提交冒充当前成果', () => {
+  expect(taskBrief(claim('review', []))).toContain('执行端未取得提交成果');
+  const old = { action: 'submit', actor: 'old', at, evidence: '旧成果' };
+  expect(taskBrief(claim('review', [old, { action: 'submit', actor: 'new', at }]))).not.toContain('旧成果');
+  const md = taskBrief(claim('review', [{ action: 'submit', actor: 'author', at, evidence: '片段', evidenceTruncated: true }]));
+  expect(md).toContain('提交成果不完整');
+  expect(md).not.toContain('sck call');
+});
