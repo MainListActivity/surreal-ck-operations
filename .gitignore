@@ -10,3 +10,6 @@ vault/build/
 # 本地设计快照及导出脚本
 owner-end/.demo/
 **/owner-design-snapshot*.json
+
+# 本地工作暂存（不进库）
+scratch/
