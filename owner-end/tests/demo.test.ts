@@ -3,6 +3,7 @@ import { parseSnapshot, sanitize, seed } from '../demo/data.ts';
 import { DemoStore } from '../demo/store.ts';
 import { handler } from '../demo/server.ts';
 import { resolve } from 'node:path';
+import { createHash } from 'node:crypto';
 
 const origin='http://127.0.0.1:6006';
 const request=(path:string,body?:unknown,headers:Record<string,string>={})=>new Request(origin+path,{headers:{host:'127.0.0.1:6006',...headers},...(body===undefined?{}:{method:'POST',body:JSON.stringify(body)})});
@@ -203,9 +204,34 @@ test('4/8 人切换与消息编辑经 HTTP 主动推送，人物图片只开放�
  expect((await serve(request('/api/cmd',{command:'message.edit',input:{messageId:message.messageId,body:'过期写入',expectedBody:body}}))).status).toBe(409);
  const snapshot=(await (await serve(request('/api/dashboard'))).json()).result;
  expect(snapshot.agents.flatMap((a:any)=>a.pendingMessages??[]).find((m:any)=>m.messageId===message.messageId).body).toBe('【设计案例】HTTP 更新');
- const image=await serve(request('/people/team-atlas.png'));expect(image.status).toBe(200);expect(image.headers.get('content-type')).toBe('image/png');
- expect((await image.arrayBuffer()).byteLength).toBeGreaterThan(1000);
- expect((await serve(request('/people/other.png'))).status).toBe(404);
+ const css=await Bun.file(resolve(import.meta.dir,'../public/app.css')).text();
+ const paths=[...new Set([...css.matchAll(/url\('(\/people\/[^']+\.webp)'\)/g)].map(match=>match[1]!))];
+ expect(paths).toHaveLength(3);
+ const headers=await Bun.file(resolve(import.meta.dir,'../public/_headers')).text();
+ expect(headers.split('\n').filter(line=>line.startsWith('/')).sort()).toEqual([...paths].sort());
+ let bytes=0;
+ for(const path of paths){
+   const image=await serve(request(path));
+   expect(image.status).toBe(200);expect(image.headers.get('content-type')).toBe('image/webp');
+   expect(image.headers.get('cache-control')).toBe('no-store'); // 本地设计刷新继续读取修改。
+   const body=Buffer.from(await image.arrayBuffer());bytes+=body.byteLength;
+   expect(body.toString('ascii',0,4)).toBe('RIFF');expect(body.toString('ascii',8,12)).toBe('WEBP');
+   expect(path).toContain(`.${createHash('sha256').update(body).digest('hex').slice(0,12)}.webp`);
+   expect(headers).toContain(`${path}\n  Cache-Control: public, max-age=31536000, immutable`);
+ }
+ expect(bytes).toBeLessThan(500_000);
+ const redirects=await Bun.file(resolve(import.meta.dir,'../public/_redirects')).text();
+ const rules=redirects.split('\n').filter(line=>line.startsWith('/')).map(line=>line.split(/\s+/));
+ expect(rules).toHaveLength(3);
+ for(const [legacy,target,status] of rules){
+   expect(legacy).toMatch(/^\/people\/(team-atlas|meeting-room|office-closeup)\.png$/);
+   expect(paths).toContain(target!);expect(status).toBe('302');
+   const response=await serve(request(legacy!));expect(response.status).toBe(302);
+   expect(response.headers.get('location')).toBe(target!);expect(response.headers.get('cache-control')).toBe('no-store');
+   expect(await Bun.file(resolve(import.meta.dir,'../public'+legacy)).exists()).toBe(false);
+ }
+ for(const path of ['/people/other.webp','/people/other.png'])
+   expect((await serve(request(path))).status).toBe(404);
  await reader.cancel();
 });
 

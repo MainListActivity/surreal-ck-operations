@@ -1,0 +1,4 @@
+# Existing tabs may still hold the previous stylesheet. Redirect without shipping duplicate PNGs.
+/people/team-atlas.png /people/team-atlas.4e778a21bb0b.webp 302
+/people/meeting-room.png /people/meeting-room.587f3ad68e38.webp 302
+/people/office-closeup.png /people/office-closeup.78cbb5a011ed.webp 302
