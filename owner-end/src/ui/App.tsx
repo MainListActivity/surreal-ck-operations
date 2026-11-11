@@ -1,9 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { beginLogin, CALLBACK_PATH, completeLogin, LOGIN_LABEL, LOGIN_HINT } from './auth.ts';
 import { logout, onUnauthorized, readMe, type Me } from './api.ts';
-import { Dialog } from './common.tsx';
-import { routeOf, withDraft, withoutDraft, type Drafts, type PageId } from './model.ts';
+import { Dialog, NoticeLine, useAction } from './common.tsx';
+import { onDuty } from './meeting-rooms.ts';
+import { clockText, hrefOf, routeOf, SYSTEM_PAGES, withDraft, withoutDraft, type Drafts, type PageId } from './model.ts';
+import { Palette } from './Palette.tsx';
 import { BoardPage } from './pages/Board.tsx';
+import { ProjectsPage } from './pages/Projects.tsx';
+import { TodayPage } from './pages/Today.tsx';
+import { resetShared, useDispatch, useLiveDashboard, useRequirements, useTasks } from './store.ts';
+import { decisionQueue, projectTone } from './today.ts';
 import { NotesPage } from './pages/Notes.tsx';
 import { OpsPage } from './pages/Ops.tsx';
 import { OverviewPage } from './pages/Overview.tsx';
@@ -14,8 +20,92 @@ import { holdLive, useLiveState } from './realtime.ts';
 
 function LiveIndicator() {
   const state = useLiveState();
-  return <p class={`live-indicator live-${state}`} role="status">{state === 'live' ? '● LIVE 实时连接' : state === 'connecting' ? '◌ 正在连接实时数据' : '● 实时连接中断 · 正在重连'}</p>;
+  return (
+    <span class={`top-status live-indicator live-${state}`} role="status">
+      <span class={`dot is-${state === 'live' ? 'done' : state === 'connecting' ? 'idle' : 'blocked'}`} aria-hidden="true" />
+      {state === 'live' ? '实时同步' : state === 'connecting' ? '正在连接' : '实时连接中断 · 重连中'}
+    </span>
+  );
 }
+
+/** 执行端（老板的电脑）是否在线：取各主机最近一次心跳。 */
+function ExecutorStatus() {
+  // 过期按心跳截止时间本地判断：执行端掉线后不再有推送，这里也会转为离线。
+  const { data } = useLiveDashboard();
+  if (!data) return null;
+  const online = data.hosts.filter((h) => h.state === 'online');
+  const last = Math.max(0, ...data.hosts.map((h) => h.at ?? 0));
+  return (
+    <span class="top-status" title={last ? `最近心跳 ${clockText(last)}` : undefined}>
+      <span class={`dot is-${online.length ? 'done' : 'blocked'}`} aria-hidden="true" />
+      {online.length ? '执行端在线' : last ? `执行端离线 · 最近心跳 ${clockText(last)}` : '执行端未上报'}
+    </span>
+  );
+}
+
+/** 全公司派工开关。暂停前确认；在途执行不受影响。 */
+function DispatchToggle() {
+  const { data, reload } = useDispatch();
+  const [confirm, setConfirm] = useState(false);
+  const action = useAction();
+  if (!data) return null;
+  const toggle = () => void action.run(data.paused ? 'task.resume' : 'task.pause', {}, data.paused ? '已恢复派工' : '已暂停派工。在途执行不受影响。', () => { setConfirm(false); return reload(); });
+  return (
+    <>
+      <span class="top-status">
+        <span class={`dot is-${data.paused ? 'blocked' : 'running'}`} aria-hidden="true" />
+        {data.paused ? '派工已暂停' : '派工运行中'}
+        <button type="button" class="ghost tiny" disabled={action.busy} onClick={() => (data.paused ? toggle() : setConfirm(true))}>{data.paused ? '恢复' : '暂停'}</button>
+      </span>
+      {action.notice?.tone === 'err' ? <div class="top-notice"><NoticeLine notice={action.notice} onClose={() => action.setNotice(null)} /></div> : null}
+      {confirm ? (
+        <Dialog title="暂停全公司派工？" onClose={() => setConfirm(false)} footer={(
+          <>
+            <button type="button" data-autofocus onClick={() => setConfirm(false)}>取消</button>
+            <button type="button" class="primary" disabled={action.busy} onClick={toggle}>暂停派工</button>
+          </>
+        )}>
+          <p>暂停后调度器不再派出新任务；员工手上的执行继续做完。需求本身的状态不变。</p>
+        </Dialog>
+      ) : null}
+    </>
+  );
+}
+
+function TodayCount() {
+  const dash = useLiveDashboard();
+  const reqs = useRequirements();
+  const tasks = useTasks();
+  const n = decisionQueue({ requirements: reqs.data, tasks: tasks.data, dashboard: dash.data }).length;
+  return n ? <span class="nav-count" aria-label={`${n} 件事等你决定`}>{n}</span> : null;
+}
+
+function ProjectLinks({ current }: { current?: string }) {
+  const { data } = useLiveDashboard();
+  const projects = data?.projects ?? [];
+  if (!projects.length) return null;
+  return (
+    <div class="nav-sub">
+      {projects.map((p) => {
+        const working = data!.agents.filter((a) => onDuty(a) && a.project?.id === p.id).length;
+        return (
+          <a key={p.id} href={hrefOf('projects', p.id)} class={current === p.id ? 'nav-sub-link active' : 'nav-sub-link'} aria-current={current === p.id ? 'page' : undefined}>
+            <span class={`dot is-${projectTone(p.blocked, working)}`} aria-hidden="true" />
+            <span class="nav-sub-name">{p.name}</span>
+          </a>
+        );
+      })}
+    </div>
+  );
+}
+
+const Icon = {
+  today: <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11.5l8-7 8 7" /><path d="M6 10v9.5h12V10" /></svg>,
+  projects: <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5" /><path d="M3.5 9.5h17" /></svg>,
+  live: <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="11" rx="2" /><path d="M8.5 19.5h7M12 15.5v4" /></svg>,
+  system: <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M12 3.5v2M12 18.5v2M3.5 12h2M18.5 12h2M6 6l1.4 1.4M16.6 16.6L18 18M6 18l1.4-1.4M16.6 7.4L18 6" /></svg>,
+  search: <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5" /><path d="M20 20l-4.2-4.2" /></svg>,
+};
 
 type Session =
   | { kind: 'loading' }
@@ -23,26 +113,15 @@ type Session =
   | { kind: 'in'; me: Me }
   | { kind: 'error'; message: string };
 
-interface NavItem { id: PageId; label: string; hint: string }
-
-/** 主导航：老板每天用的三项。管理：低频功能。旧入口的对应关系见 docs/owner-workbench.md。 */
-const PRIMARY: NavItem[] = [
-  { id: 'overview', label: '总览', hint: '主机、Agent、当前任务与实时交接' },
-  { id: 'requirements', label: '需求', hint: '反馈、需求确认、进度与发布' },
-  { id: 'tasks', label: '执行任务', hint: '需求拆出的任务与执行结果' },
-];
-const SECONDARY: NavItem[] = [
-  { id: 'messages', label: '派工消息', hint: '员工动态、排队与待发消息' },
-  { id: 'notes', label: '笔记', hint: '派工时附带的线笔记' },
-  { id: 'staff', label: '员工与权限', hint: '员工策略与命令保护' },
-  { id: 'ops', label: '运维', hint: '命令目录、作业、审计与身份' },
+const SYSTEM_TABS: Array<{ id: PageId; label: string }> = [
+  { id: 'messages', label: '派工消息' },
+  { id: 'notes', label: '笔记' },
+  { id: 'staff', label: '员工与权限' },
+  { id: 'ops', label: '运维' },
 ];
 
 const Mark = () => (
-  <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
-    <rect x="2" y="2" width="20" height="20" rx="6" />
-    <path d="M7 12.5l3.2 3.2L17 8.8" />
-  </svg>
+  <span class="brand-mark" aria-hidden="true">CK</span>
 );
 
 /** 登录页：点击后取 /api/config，生成 PKCE 并跳转到 ma_hono 授权页。 */
@@ -99,6 +178,7 @@ export function App() {
   const hashRef = useRef(location.hash);
   const [leaveTo, setLeaveTo] = useState<string | null>(null);
   const [navOpen, setNavOpen] = useState(false);
+  const [palette, setPalette] = useState(false);
 
   const setDirty = useCallback((value: boolean) => {
     dirtyRef.current = value;
@@ -117,6 +197,7 @@ export function App() {
 
   useEffect(() => {
     onUnauthorized(() => {
+      resetShared();
       setDrafts({});
       setDirty(false);
       setSession({ kind: 'out', notice: '登录已过期，请重新登录' });
@@ -143,9 +224,9 @@ export function App() {
       if (location.pathname === CALLBACK_PATH) {
         const result = await completeLogin(location.search, location.origin);
         // 去掉地址栏的 code 与 state，进入总览。
-        history.replaceState(null, '', '/#overview');
-        hashRef.current = '#overview';
-        setHash('#overview');
+        history.replaceState(null, '', '/#today');
+        hashRef.current = '#today';
+        setHash('#today');
         if (!result.ok) {
           setSession({ kind: 'out', notice: result.message });
           return;
@@ -166,8 +247,22 @@ export function App() {
   const setDraft = useCallback((messageId: string, value: string) => setDrafts(d => withDraft(d, messageId, value)), []);
   const dropDraft = useCallback((messageId: string) => setDrafts(d => withoutDraft(d, messageId)), []);
 
+  // ⌘K / Ctrl+K 打开搜索与跳转。
+  useEffect(() => {
+    if (session.kind !== 'in') return;
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setPalette((open) => !open);
+      }
+    };
+    addEventListener('keydown', onKey);
+    return () => removeEventListener('keydown', onKey);
+  }, [session.kind]);
+
   async function signOut() {
     await logout();
+    resetShared();
     setDrafts({});
     setDirty(false);
     setSession({ kind: 'out' });
@@ -194,9 +289,10 @@ export function App() {
 
   const route = routeOf(hash);
   const me = session.me;
-  const navLink = (item: NavItem) => (
-    <a key={item.id} href={`#${item.id}`} class={route.page === item.id ? 'nav-link active' : 'nav-link'} aria-current={route.page === item.id ? 'page' : undefined} title={item.hint}>
-      <span>{item.label}</span>
+  const inSystem = SYSTEM_PAGES.includes(route.page);
+  const nav = (id: PageId, label: string, icon: preact.JSX.Element, active: boolean, extra?: preact.ComponentChildren) => (
+    <a href={hrefOf(id)} class={active ? 'nav-link active' : 'nav-link'} aria-current={active ? 'page' : undefined}>
+      {icon}<span>{label}</span>{extra}
     </a>
   );
 
@@ -205,36 +301,55 @@ export function App() {
       <a class="skip-link" href="#main" onClick={e => { e.preventDefault(); document.getElementById('main')?.focus(); }}>跳到主要内容</a>
       <aside class={`sidebar${navOpen ? ' open' : ''}`}>
         <div class="sidebar-top">
-          <a class="brand" href="#overview"><Mark /><span class="brand-text"><strong>老板端</strong><small>AI 公司工作台</small></span></a>
+          <a class="brand" href={hrefOf('today')}><Mark /><span class="brand-text"><strong>老板端</strong></span></a>
           <button type="button" class="ghost nav-toggle" aria-expanded={navOpen} aria-controls="primary-nav" onClick={() => setNavOpen(o => !o)}>
             {navOpen ? '收起' : '菜单'}
           </button>
         </div>
         <nav id="primary-nav" class="nav" aria-label="主导航">
-          <div class="nav-group">{PRIMARY.map(navLink)}</div>
-          <div class="nav-group">
-            <p class="nav-label">管理</p>
-            {SECONDARY.map(navLink)}
-          </div>
+          {nav('today', '今天', Icon.today, route.page === 'today', <TodayCount />)}
+          {nav('projects', '项目', Icon.projects, route.page === 'projects' && !route.id)}
+          <ProjectLinks current={route.page === 'projects' ? route.id : undefined} />
+          {nav('overview', '现场大屏', Icon.live, route.page === 'overview')}
         </nav>
         <div class="sidebar-foot">
-          <LiveIndicator />
+          {nav('messages', '系统', Icon.system, inSystem)}
           <p class="who" title={me.sub}><span class="avatar" aria-hidden="true">{me.sub.slice(0, 1)}</span><span>{me.sub}</span></p>
-          <div class="foot-actions">
-            <button type="button" class="ghost" disabled={dirty} title={dirty ? '请先保存或放弃修改' : '重新读取当前页面数据'} onClick={() => setPageKey(k => k + 1)}>刷新</button>
-            <button type="button" class="ghost" onClick={() => { if (dirtyRef.current) setLeaveTo('__signout__'); else void signOut(); }}>退出</button>
-          </div>
+          <button type="button" class="ghost signout" onClick={() => { if (dirtyRef.current) setLeaveTo('__signout__'); else void signOut(); }}>退出登录</button>
         </div>
       </aside>
-      <main id="main" class="main" tabIndex={-1}>
-        {route.page === 'overview' ? <OverviewPage key={`overview-${pageKey}`} /> : null}
-        {route.page === 'requirements' ? <RequirementsPage key={`requirements-${pageKey}`} route={route} onDirtyChange={setDirty} /> : null}
-        {route.page === 'tasks' ? <TasksPage key={`tasks-${pageKey}`} route={route} /> : null}
-        {route.page === 'messages' ? <BoardPage key={`board-${pageKey}`} drafts={drafts} onDraft={setDraft} onDraftSaved={dropDraft} /> : null}
-        {route.page === 'notes' ? <NotesPage key={`notes-${pageKey}`} /> : null}
-        {route.page === 'staff' ? <StaffPage key={`staff-${pageKey}`} /> : null}
-        {route.page === 'ops' ? <OpsPage key={`ops-${pageKey}`} /> : null}
-      </main>
+      <div class="main-wrap">
+        <header class="topbar">
+          <button type="button" class="search-trigger" onClick={() => setPalette(true)} aria-label="搜索需求、任务、项目（⌘K）">
+            {Icon.search}<span>搜索需求、任务、项目</span><kbd>⌘K</kbd>
+          </button>
+          <div class="top-right">
+            <LiveIndicator />
+            <ExecutorStatus />
+            <DispatchToggle />
+            <button type="button" class="ghost tiny" disabled={dirty} title={dirty ? '请先保存或放弃修改' : '重新读取当前页面数据'} onClick={() => setPageKey(k => k + 1)}>刷新</button>
+          </div>
+        </header>
+        <main id="main" class="main" tabIndex={-1}>
+          {inSystem ? (
+            <nav class="system-tabs" aria-label="系统">
+              {SYSTEM_TABS.map((t) => (
+                <a key={t.id} href={hrefOf(t.id)} class={route.page === t.id ? 'system-tab active' : 'system-tab'} aria-current={route.page === t.id ? 'page' : undefined}>{t.label}</a>
+              ))}
+            </nav>
+          ) : null}
+          {route.page === 'today' ? <TodayPage key={`today-${pageKey}`} /> : null}
+          {route.page === 'projects' ? <ProjectsPage key={`projects-${pageKey}`} route={route} /> : null}
+          {route.page === 'overview' ? <OverviewPage key={`overview-${pageKey}`} /> : null}
+          {route.page === 'requirements' ? <RequirementsPage key={`requirements-${pageKey}`} route={route} onDirtyChange={setDirty} /> : null}
+          {route.page === 'tasks' ? <TasksPage key={`tasks-${pageKey}`} route={route} /> : null}
+          {route.page === 'messages' ? <BoardPage key={`board-${pageKey}`} drafts={drafts} onDraft={setDraft} onDraftSaved={dropDraft} /> : null}
+          {route.page === 'notes' ? <NotesPage key={`notes-${pageKey}`} /> : null}
+          {route.page === 'staff' ? <StaffPage key={`staff-${pageKey}`} /> : null}
+          {route.page === 'ops' ? <OpsPage key={`ops-${pageKey}`} /> : null}
+        </main>
+      </div>
+      {palette ? <Palette onClose={() => setPalette(false)} /> : null}
       {leaveTo !== null ? (
         <Dialog
           title="有未保存的修改"

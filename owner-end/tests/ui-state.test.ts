@@ -123,10 +123,11 @@ describe('表单解析与校验', () => {
     expect(validateReassign({ executorRole: 'qa', reviewerRole: '', note: '换人' })).toEqual([]);
   });
 
-  test('路由按 hash 取页面，未知值回到看板', () => {
-    expect(pageOf('')).toBe('board');
+  test('路由按 hash 取页面，未知值回到首页', () => {
+    expect(pageOf('')).toBe('today');
     expect(pageOf('#tasks')).toBe('tasks');
     expect(pageOf('#/ops')).toBe('ops');
-    expect(pageOf('#unknown')).toBe('board');
+    expect(pageOf('#unknown')).toBe('today');
+    expect(pageOf('#board')).toBe('board');
   });
 });

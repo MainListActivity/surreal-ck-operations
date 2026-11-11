@@ -753,7 +753,7 @@ export function OverviewPage() {
             {paused
               ? '画面已暂停'
               : live === 'live'
-                ? '● 实时协作'
+                ? '实时协作'
                 : '实时连接待恢复'}
           </Badge>
           <small>更新 {clockText(data.at)}</small>
