@@ -5,11 +5,12 @@
  * - 大盘与看板用共享核心在浏览器里计算，结果过一次 JSON 序列化，和原 HTTP 接口的形状逐字段一致。
  * 本地设计模式（demo/server.ts）把本模块替换为 demo/source.ts，不连接任何数据库。
  */
-import { Surreal, Table } from 'surrealdb';
+import { AuthenticationError, InvalidSessionError, NotAllowedError, Surreal, Table } from 'surrealdb';
 import { readBoard } from '../../../src/board.ts';
 import { readRuntimeDashboard, type RuntimeDashboard } from '../../../src/runtime-dashboard.ts';
 import { LIVE_TABLES } from '../live-tables.ts';
 import { accessToken, currentSession, loadConfig, refreshSession } from './auth.ts';
+import { SessionKeeper } from './session-keeper.ts';
 import type { OwnerBoard } from './types.ts';
 
 export type LiveState = 'connecting' | 'live' | 'offline';
@@ -33,9 +34,14 @@ export class SourceError extends Error {
 const RENEW_WITHIN_MS = 5 * 60_000;
 /** 同一批变更合并成一次通知，避免一次写入多表时页面连续重算。 */
 const FLUSH_MS = 150;
+/** 会话保活的检查间隔（按真实时钟判断，休眠唤醒后第一次检查就会补上）。 */
+const SESSION_TICK_MS = 30_000;
 
 let connection: Promise<Surreal> | undefined;
+let keeper: SessionKeeper | undefined;
 let rejected = false;
+/** 保活时发现令牌已无法续期：通知打开中的 LIVE 回登录页。 */
+const sessionLost = new Set<() => void>();
 
 async function token(): Promise<string | null> {
   const session = currentSession();
@@ -45,10 +51,15 @@ async function token(): Promise<string | null> {
   return value ?? null;
 }
 
-function isAuthFailure(error: unknown): boolean {
+/**
+ * 只有鉴权本身失败才算未登录（会清会话、回登录页）。表权限拒绝、库里事件抛出的业务错误等按普通错误处理，
+ * 不能因为消息里带 token / permission / expired 之类的词就退出登录。
+ */
+export function isAuthFailure(error: unknown): boolean {
   if (rejected) return true;
-  const text = error instanceof Error ? `${error.name} ${error.message}` : String(error);
-  return /auth|token|expired|permission|not allowed|unauthori/i.test(text);
+  if (error instanceof SourceError) return error.code === 'unauthorized';
+  if (error instanceof AuthenticationError || error instanceof InvalidSessionError) return true;
+  return error instanceof NotAllowedError && (error.isTokenExpired || error.isInvalidAuth);
 }
 
 async function open(): Promise<Surreal> {
@@ -56,6 +67,14 @@ async function open(): Promise<Surreal> {
   if (!cfg.db) throw new SourceError('unavailable', '登录配置缺少公司库地址');
   const db = new Surreal();
   rejected = false;
+  const session = new SessionKeeper(async () => {
+    const value = await token();
+    if (!value) throw new SourceError('unauthorized');
+    await db.authenticate(value);
+  });
+  db.subscribe('auth', (tokens: unknown) => {
+    if (tokens) session.authenticated();
+  });
   try {
     await db.connect(cfg.db.url, {
       namespace: cfg.db.namespace,
@@ -69,6 +88,21 @@ async function open(): Promise<Surreal> {
     await db.close().catch(() => undefined);
     throw error;
   }
+  session.authenticated();
+  keeper = session;
+  setInterval(() => {
+    session.ensure().catch((error: unknown) => {
+      // 网络问题交给 SDK 重连与下一次检查；令牌续不上才回登录页。
+      if (isAuthFailure(error)) for (const fn of [...sessionLost]) fn();
+    });
+  }, SESSION_TICK_MS);
+  return db;
+}
+
+/** 读数据前确保会话未过期（休眠唤醒后计时器可能还没来得及续期）。 */
+async function liveDatabase(): Promise<Surreal> {
+  const db = await database();
+  await keeper?.ensure();
   return db;
 }
 
@@ -94,7 +128,7 @@ const plain = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
 export async function readDashboardData(): Promise<RuntimeDashboard> {
   try {
-    return plain(await readRuntimeDashboard(await database()));
+    return plain(await readRuntimeDashboard(await liveDatabase()));
   } catch (error) {
     throw classify(error);
   }
@@ -102,7 +136,7 @@ export async function readDashboardData(): Promise<RuntimeDashboard> {
 
 export async function readBoardData(): Promise<OwnerBoard> {
   try {
-    return plain(await readBoard(await database())) as unknown as OwnerBoard;
+    return plain(await readBoard(await liveDatabase())) as unknown as OwnerBoard;
   } catch (error) {
     throw classify(error);
   }
@@ -111,12 +145,13 @@ export async function readBoardData(): Promise<OwnerBoard> {
 /**
  * 订阅全部老板端表的变更。连上（含断线重连成功）时通知 ['*'] 让页面全量重读；
  * 断线重连后 SDK 会自动重建托管的 LIVE 订阅（ManagedLiveSubscription 在 connected 时重新注册）。
+ * 会话可能已过期后重新鉴权时（见 session-keeper.ts），库端旧订阅已不再推送：这里重建全部订阅并全量重读。
  * 返回的函数关闭订阅（连接保留给数据读取复用）。
  */
 export function openLive(handlers: LiveHandlers): () => void {
   let closed = false;
   const offs: Array<() => void> = [];
-  const kills: Array<() => Promise<void>> = [];
+  const subs: Array<{ off(): void; kill(): Promise<void> }> = [];
   const pending = new Set<string>();
   let flush: ReturnType<typeof setTimeout> | undefined;
   const changed = (table: string) => {
@@ -129,12 +164,36 @@ export function openLive(handlers: LiveHandlers): () => void {
       if (!closed && tables.length) handlers.change(tables);
     }, FLUSH_MS);
   };
+  const release = () => {
+    for (const sub of subs.splice(0)) {
+      sub.off();
+      void sub.kill().catch(() => undefined);
+    }
+  };
+  const subscribeAll = async (db: Surreal) => {
+    release();
+    for (const table of LIVE_TABLES) {
+      const live = await db.live(new Table(table)).fields('id');
+      const sub = { off: live.subscribe(() => changed(table)), kill: () => live.kill() };
+      if (closed) {
+        sub.off();
+        await sub.kill().catch(() => undefined);
+        return;
+      }
+      subs.push(sub);
+    }
+  };
+  const fail = (error: unknown) => {
+    if (closed) return;
+    handlers.state('offline');
+    if (isAuthFailure(error)) handlers.unauthorized();
+    else handlers.failed();
+  };
 
   void (async () => {
     handlers.state('connecting');
-    let db: Surreal;
     try {
-      db = await database();
+      const db = await database();
       if (closed) return;
       offs.push(
         db.subscribe('connected', () => {
@@ -149,22 +208,25 @@ export function openLive(handlers: LiveHandlers): () => void {
           if (rejected) handlers.unauthorized();
         }),
       );
-      for (const table of LIVE_TABLES) {
-        const sub = await db.live(new Table(table)).fields('id');
-        if (closed) {
-          await sub.kill().catch(() => undefined);
-          return;
-        }
-        kills.push(() => sub.kill());
-        offs.push(sub.subscribe(() => changed(table)));
+      const lost = () => { if (!closed) { handlers.state('offline'); handlers.unauthorized(); } };
+      sessionLost.add(lost);
+      offs.push(() => sessionLost.delete(lost));
+      if (keeper) {
+        offs.push(keeper.onLapsed(() => {
+          if (closed) return;
+          subscribeAll(db).then(() => {
+            if (closed) return;
+            handlers.state('live');
+            handlers.change(['*']);
+          }, fail);
+        }));
       }
+      await subscribeAll(db);
+      if (closed) return;
       handlers.state('live');
       handlers.change(['*']);
     } catch (error) {
-      if (closed) return;
-      handlers.state('offline');
-      if (classify(error).code === 'unauthorized') handlers.unauthorized();
-      else handlers.failed();
+      fail(error);
     }
   })();
 
@@ -172,6 +234,6 @@ export function openLive(handlers: LiveHandlers): () => void {
     closed = true;
     clearTimeout(flush);
     for (const off of offs.splice(0)) off();
-    for (const kill of kills.splice(0)) void kill().catch(() => undefined);
+    release();
   };
 }
