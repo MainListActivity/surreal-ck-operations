@@ -6,7 +6,7 @@ import type { RuntimeDashboard } from '../../../src/runtime-dashboard.ts';
 import { accessToken, clearSession, signOutLocal, type Fetcher } from './auth.ts';
 import { errorText } from './model.ts';
 import type { OwnerBoard } from './types.ts';
-import { readBoardData, readDashboardData, SourceError } from './source.ts';
+import { readBoardData, readDashboardData, runOwnerCommand, runsInPage, SourceError } from './source.ts';
 
 export type Outcome<T> =
   | { kind: 'ok'; result: T }
@@ -102,9 +102,22 @@ async function call<T>(path: string, method: 'GET' | 'POST', body?: unknown, fet
   return outcomeOf<T>(res);
 }
 
-/** 执行老板命令。 */
-export function runCommand<T = unknown>(command: string, input: Record<string, unknown> = {}): Promise<Outcome<T>> {
-  return call<T>('/api/cmd', 'POST', { command, input });
+/** 执行老板命令：能在页面里执行的直连公司库执行，其余经 /api/cmd 由服务端执行。结果与错误形状两条路径一致。 */
+export async function runCommand<T = unknown>(command: string, input: Record<string, unknown> = {}): Promise<Outcome<T>> {
+  if (!runsInPage(command)) return call<T>('/api/cmd', 'POST', { command, input });
+  try {
+    return { kind: 'ok', result: (await runOwnerCommand(command, input)) as T };
+  } catch (error) {
+    if (error instanceof SourceError) {
+      if (error.code === 'unauthorized') return unauthorized();
+      if (error.code === 'unavailable') return { kind: 'error', status: 503, code: 'unavailable', message: error.message };
+      return networkError();
+    }
+    const { failureOf } = await import('../errors.ts');
+    const { status, body } = failureOf(error);
+    if (body.error.code === 'pending') return { kind: 'pending', jobId: body.error.jobId, message: '已排队，执行端处理中' };
+    return { kind: 'error', status, code: body.error.code, message: body.error.message, jobId: body.error.jobId };
+  }
 }
 
 /** 直连公司库读取（见 source.ts），失败按 HTTP 版的同一套分类返回。 */
