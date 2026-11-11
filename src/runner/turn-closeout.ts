@@ -1,3 +1,4 @@
+import { unavailableProvider } from '../dispatcher/provider-failover.ts';
 import type { TurnEnded, AgentRuntime } from "./contracts.ts";
 
 import type { SidecarPool } from './sidecar.ts';
@@ -48,7 +49,9 @@ export class TurnInterruptions {
 
 async function settleTurn(ctx: TurnContext, runtime: Pick<AgentRuntime, "send">,
   event: TurnEnded, interruptions?: TurnInterruptions): Promise<void> {
-  const failure = quotaFailure(event.outcome, event.timeline);
+  const quota = quotaFailure(event.outcome, event.timeline);
+  const unavailable = unavailableProvider(event.outcome);
+  const failure = quota ?? (unavailable ? { reason: '供应商明确返回服务不可用（终止回合）', resetsAt: undefined } : undefined);
   const inst = failure ? (await ctx.workforce.insts()).find(i => i.paseoAgentId === event.agent.id) : undefined;
   if (failure && inst?.provider) {
     // Persist the circuit breaker before returning the task to the queue. If this
@@ -60,7 +63,7 @@ async function settleTurn(ctx: TurnContext, runtime: Pick<AgentRuntime, "send">,
   if (failure) {
     if (res.silent) {
       const { instId, taskId } = res.silent;
-      await ctx.sidecar.releaseClaim(instId, taskId, `${QUOTA_RELEASE}${failure.reason}；保留任务阶段，等待通道恢复后重派。`, { strict: true });
+      await ctx.sidecar.releaseClaim(instId, taskId, `${QUOTA_RELEASE}${failure.reason}；保留任务阶段，等待通道恢复后重派。`, { strict: true, providerFailure: quota ? 'quota' : 'unavailable' });
       if (event.turnId) await ctx.workforce.refundQuotaWake(instId, event.turnId);
     }
     return;

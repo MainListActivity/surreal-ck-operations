@@ -125,6 +125,7 @@ interface EmployeeRow {
 }
 
 export interface TaskRow {
+  provider_failures?: import('./dispatcher/provider-failover.ts').ProviderFailure[];
   recovery_stopped?: boolean;
   id: RecordId;
   title: string;

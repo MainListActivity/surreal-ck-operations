@@ -23,6 +23,7 @@ export interface ExecutionAttempt {
   turns: string[];
   result?: WorkResult;
   finalText?: string;
+  providerFailure?: import('../dispatcher/provider-failover.ts').ProviderFailure['cause'];
   artifacts?: { raw?: string; blocker?: string; report?: string };
   prepared?: boolean;
   originalResult?: WorkResult;
