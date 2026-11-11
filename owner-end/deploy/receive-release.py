@@ -157,8 +157,13 @@ class Receiver:
 
     def restart(self) -> None:
         # A crashed candidate may exhaust StartLimitBurst; don't let that prevent
-        # the known previous version from starting during rollback.
-        self.control('reset-failed')
+        # the known previous version from starting during rollback. systemd 249
+        # exits 1 for a unit that is not loaded yet (first install), so a failed
+        # reset is not fatal; the restart and health probe decide the outcome.
+        try:
+            self.control('reset-failed')
+        except Exception:
+            pass
         self.control('restart')
 
     def deploy(self, sha: str, version: str, contents: dict[str, bytes]) -> None:

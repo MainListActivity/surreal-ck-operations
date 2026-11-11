@@ -148,6 +148,16 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual((self.root / 'current').resolve().name, OLD)
         self.assertEqual(self.calls, ['reset-failed', 'restart', 'reset-failed', 'restart'])
 
+    def test_reset_failed_error_on_unloaded_unit_is_not_fatal(self):
+        def control(action):
+            self.calls.append(action)
+            if action == 'reset-failed':
+                raise receiver.Rejected('unit not loaded')
+        self.receiver.control = control
+        self.receiver.deploy(NEW, '0.11.13', payload())
+        self.assertEqual((self.root / 'current').resolve().name, NEW)
+        self.assertEqual(self.calls, ['reset-failed', 'restart'])
+
     def test_failed_rollback_reports_failure(self):
         self.deploy_old()
         self.receiver.probe = lambda sha, version: False
