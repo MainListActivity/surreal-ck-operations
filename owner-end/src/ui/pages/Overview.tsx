@@ -56,11 +56,13 @@ function TimeProgress({
   at,
   elapsed,
   reason,
+  compact = false,
 }: {
   estimate?: RuntimeEstimate;
   at: number;
   elapsed?: number;
   reason?: string;
+  compact?: boolean;
 }) {
   const text = finishText(estimate, at);
   const value =
@@ -74,7 +76,9 @@ function TimeProgress({
         )
       : undefined;
   return (
-    <div class={`room-time ${text ? 'estimated' : ''}`}>
+    <div
+      class={`room-time ${text ? 'estimated' : ''} ${compact ? 'time-caption' : ''}`}
+    >
       <div>
         <span>预计结束</span>
         <b>
@@ -83,22 +87,36 @@ function TimeProgress({
             '暂无法估计'}
         </b>
       </div>
-      <progress
-        max={100}
-        value={value}
-        aria-label="参考耗时"
-        aria-valuetext={text ?? reason ?? '暂无法估计'}
-      />
+      {!compact ? (
+        <progress
+          max={100}
+          value={value}
+          aria-label="参考耗时"
+          aria-valuetext={text ?? reason ?? '暂无法估计'}
+        />
+      ) : null}
     </div>
   );
 }
 function EmployeeFigure({
   agent,
   compact,
+  progress,
 }: {
   agent: RuntimeAgentView;
   compact: boolean;
+  progress: RuntimeProgress;
 }) {
+  const percent = progress.percent;
+  const state = staffStatus(agent);
+  const progressText =
+    percent === undefined
+      ? '待上报'
+      : `${state.kind === 'unknown' ? '上次 ' : ''}${percent}%`;
+  const description = `${state.text}。${progress.label}：${progressText}${progress.total ? `（${progress.done}/${progress.total}）` : ''}。${progress.detail}`;
+  const ring = compact
+    ? 'M50 5a45 45 0 1 1 0 90a45 45 0 1 1 0-90'
+    : 'M100 37a94 16 0 1 1 0-32a94 16 0 1 1 0 32';
   return (
     <div
       class={`employee-figure ${compact ? 'portrait' : 'character'}`}
@@ -111,8 +129,35 @@ function EmployeeFigure({
       >
         <span class={`person-sprite person-${portraitIndex(agent)}`} />
       </div>
-      <span class="person-halo" />
-      <span class="person-state" aria-hidden="true" />
+      <div
+        class={`person-halo ${percent === undefined ? 'progress-unknown' : ''}`}
+        role="progressbar"
+        aria-label={`${agent.name}的${progress.label}`}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent}
+        aria-valuetext={description}
+        title={description}
+      >
+        <svg
+          viewBox={compact ? '0 0 100 100' : '0 0 200 44'}
+          preserveAspectRatio="none"
+          aria-hidden="true"
+        >
+          <path class="halo-track" d={ring} pathLength={100} />
+          {percent !== undefined && percent > 0 ? (
+            <path
+              class="halo-fill"
+              d={ring}
+              pathLength={100}
+              stroke-dasharray={`${percent} 100`}
+            />
+          ) : null}
+        </svg>
+        <span class="halo-value" aria-hidden="true">
+          {progressText}
+        </span>
+      </div>
     </div>
   );
 }
@@ -154,7 +199,7 @@ function EmployeeSeat({
         </div>
         <ActivityFeed agent={a} />
       </div>
-      <EmployeeFigure agent={a} compact={compact} />
+      <EmployeeFigure agent={a} compact={compact} progress={progress} />
       <div class="seat-console">
         <div class="seat-identity">
           <strong>{name}</strong>
@@ -167,8 +212,8 @@ function EmployeeSeat({
             {a.modelSource === 'configured' ? ' · 配置' : ''}
           </span>
         </div>
-        <WorkProgress value={progress} />
         <TimeProgress
+          compact
           estimate={state.kind === 'working' ? a.estimate : undefined}
           at={at}
           elapsed={a.elapsedSeconds}
