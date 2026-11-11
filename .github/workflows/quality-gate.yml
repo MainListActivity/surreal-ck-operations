@@ -29,6 +29,7 @@ jobs:
       - run: pnpm typecheck && pnpm test && pnpm build
         working-directory: owner-end
       - run: pnpm test:comm
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s owner-end/deploy -p 'test_*.py'
       # Fork integration is independently run on the company's installed fork.
       # No upstream database or private production credentials in hosted CI.
       # 发布由下方 release 作业完成：本作业通过后，main 上的合入会迁移云端库并发布 GitHub Release 资产。
@@ -117,3 +118,72 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "sck-company $VERSION" \
             --notes "版本 $VERSION；main 提交 $GITHUB_SHA；云端 schema 版本 $SCHEMA。"
+  deploy-owner:
+    name: 发布老板端云后端与免费边缘
+    needs: [release, workflow-lint]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: owner-production
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm install --frozen-lockfile
+        working-directory: owner-end
+      - name: 只发布当前 main
+        id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          HEAD_SHA=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if [ "$HEAD_SHA" = "$GITHUB_SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "main 已有更新，交由新提交的发布任务部署"
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: 打包云后端
+        if: steps.head.outputs.current == 'true'
+        run: |
+          set -eu
+          VERSION=$(node -p "require('./package.json').version")
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          bun --no-env-file scripts/owner-backend-package.ts --out "$RUNNER_TEMP/owner-backend" --sha "$GITHUB_SHA" --version "$VERSION"
+      - name: 部署云后端并验证健康
+        if: steps.head.outputs.current == 'true'
+        env:
+          OWNER_BACKEND_DEPLOY_KEY: ${{ secrets.OWNER_BACKEND_DEPLOY_KEY }}
+          OWNER_BACKEND_KNOWN_HOSTS: ${{ secrets.OWNER_BACKEND_KNOWN_HOSTS }}
+        run: |
+          set -eu
+          umask 077
+          test -n "$OWNER_BACKEND_DEPLOY_KEY"
+          test -n "$OWNER_BACKEND_KNOWN_HOSTS"
+          printf '%s\n' "$OWNER_BACKEND_DEPLOY_KEY" > "$RUNNER_TEMP/owner-deploy-key"
+          printf '%s\n' "$OWNER_BACKEND_KNOWN_HOSTS" > "$RUNNER_TEMP/owner-known-hosts"
+          trap 'rm -f "$RUNNER_TEMP/owner-deploy-key" "$RUNNER_TEMP/owner-known-hosts"' EXIT
+          tar --format=ustar -C "$RUNNER_TEMP/owner-backend" -cf - server.js server-cron.js manifest.json | \
+            ssh -F /dev/null -T -i "$RUNNER_TEMP/owner-deploy-key" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$RUNNER_TEMP/owner-known-hosts" \
+              ubuntu@129.146.179.37 "deploy $GITHUB_SHA $VERSION"
+      - name: 发布免费边缘与静态页面
+        if: steps.head.outputs.current == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.OWNER_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: b1cb2b3566aada6271907480eed9524e
+        run: |
+          set -eu
+          test -n "$CLOUDFLARE_API_TOKEN"
+          pnpm --dir owner-end build
+          pnpm --dir owner-end exec wrangler deploy --tag "v$VERSION" --message "main $GITHUB_SHA"

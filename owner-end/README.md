@@ -1,6 +1,8 @@
 # 老板端（owner-end）
 
-老板端由两部分组成：Cloudflare Worker 网关（`src/`）和老板页面（`src/ui/`，构建到 `public/`）。页面只负责展示和提交。权限判断、命令分流和译文投递规则都在 Worker 与仓库共享核心（`../src/`）里。
+老板端的页面由 Cloudflare 免费静态资源分发；`src/edge.ts` 只把 `/api/*` 同源流式转发到现有云主机。云端 Bun 运行原有 Hono 业务、身份鉴权与 SurrealDB LIVE Query，后台工作由系统 timer 单次执行。浏览器与执行端继续使用 `https://company.maplayer.top`，不需要跨域登录或本地薄网关。
+
+本次拆分源于生产实测：原业务请求超过 Workers Free 的 10ms CPU 限额并出现 `exceededCpu`。边缘不再加载数据库或业务 SDK，SSE 响应直接转发，不解析或缓存正文。部署、定时工作切换与回滚见 [云后端部署说明](deploy/README.md)。
 
 老板在这里能做的事：看每个员工正在做什么、接下来做什么、待发消息原文；编辑原文，选择译文语言，预览后保存；发布需求、加任务、改派、暂停或作废；管理笔记；管理员工策略和受保护命令；查看运维作业和审计，执行运维命令；命令面板列出网关全部命令的用途与参数，只展示不执行。
 
@@ -8,7 +10,10 @@
 
 | 路径 | 作用 |
 | --- | --- |
-| `src/worker.ts` | 入口。`/api/*` 进 Hono 路由，其余交给静态资源；`scheduled` 进定时任务 |
+| `src/edge.ts` | 免费边缘入口：静态文件与同源 API 转发 |
+| `src/server.ts`、`src/server-env.ts` | 云端生产 HTTP 服务、代理认证与环境配置 |
+| `src/server-cron.ts` | 原有两种后台工作的一次性 CLI 入口 |
+| `src/worker.ts` | 复用的 Hono 业务处理器；保留旧 Worker 适配以支持回滚 |
 | `src/auth/` | 访问令牌验签（jose，RS256）和身份分流 |
 | `src/commands.ts` | `POST /api/cmd` 的分流。老板、员工、系统身份各走各的路径 |
 | `src/command-catalog.ts` | 命令目录：每条命令的中文用途、参数与风险标记。纯数据，老板端命令面板与员工的 `company_cmd_catalog` 共用 |
@@ -26,7 +31,9 @@
 
 ## 配置
 
-### 非机密变量（`wrangler.jsonc` 的 `vars`）
+边缘仅配置 `OWNER_BACKEND_ORIGIN`（固定 HTTPS 地址含路径前缀）和 secret `OWNER_PROXY_KEY`。业务配置仅保存在云主机 `/etc/sck-owner/backend.env`，权限 `0600`；生产 Bun 入口拒绝任何 `DEV_DB_ROOT_*`。`OWNER_PUBLIC_ORIGIN` 固定为老板端公网 origin，用于同源校验；不信任客户端转发头。
+
+### 云后端非机密变量
 
 | 变量 | 说明 |
 | --- | --- |
@@ -38,7 +45,7 @@
 | `COMPANY_DB_URL`、`COMPANY_NS`、`COMPANY_DB` | 公司 SurrealDB 的地址、命名空间和数据库（生产为 `wss://data.maplayer.top/rpc`、`company`、`main`） |
 | `PROTECTED_CF_SCRIPTS`、`PROTECTED_D1_IDS` | 可选，逗号分隔。追加到按目标锁定的 Worker 脚本名与 D1 数据库 id，只能追加，不能移除默认项。默认已含老板端 `company-owner-end`、ma_hono 的 Worker `ma-auth`，以及 ma_hono 的 D1 `621dbcf7-ddcc-4099-8df2-3ec076830857` |
 
-### 密钥（用 `wrangler secret put` 设置，不写进代码或 `wrangler.jsonc`）
+### 云后端密钥（由服务管理器读取保护配置文件，不写进代码）
 
 | 名称 | 用途 | 缺失时 |
 | --- | --- | --- |
@@ -55,36 +62,11 @@
 
 ## 本地开发
 
-本地用 `wrangler dev --local` 运行 Worker，数据库用公司 fork 的本机 SurrealDB（不要用上游官方版本），不连生产库。
+只改 UI 使用 `pnpm owner:demo`，默认不连接生产。边缘 `wrangler dev` 使用缺少代理密钥的配置时会拒绝 API；不要给设计环境提供生产代理密钥。
 
-> `wrangler.jsonc` 的 `COMPANY_DB_URL` 指向生产库。本地运行前必须在 `.dev.vars` 里覆盖成本机地址，否则 `wrangler dev` 会连生产库。
+业务回归使用 `bun test tests/server.test.ts` 的真实回环 HTTP 服务和本地替身，数据库集成测试仅使用公司 fork。生产 Bun 入口始终拒绝 root 配置；`worker.ts` 保留的测试适配允许显式本机 fork root，范围由 `readConfig` 限定。不要把 `demo/server.ts` 用作生产服务器。
 
-`.dev.vars` 已被 `.gitignore` 忽略，只放本地值，不提交：
-
-```ini
-IDP_ISSUER=http://127.0.0.1:<端口>/t/company
-IDP_JWKS_URL=http://127.0.0.1:<端口>/t/company/jwks.json
-COMPANY_DB_URL=ws://127.0.0.1:<端口>/rpc
-DEV_DB_ROOT_USER=root
-DEV_DB_ROOT_PASS=<本地实例口令>
-MAGPIE_BASE_URL=http://127.0.0.1:<端口>/v1
-MAGPIE_MODEL=<任意模型名>
-MAGPIE_API_KEY=<本地假值>
-```
-
-- `DEV_DB_ROOT_*` 让每个数据库会话都以 root 连接（见 `src/db.ts`）。所以 `readConfig` 只在 `COMPANY_DB_URL` 指向 `localhost` 或 `127.0.0.1` 时接受它。指向其它地址时配置直接失败（返回 503），不会悄悄放开权限。
-- 本地需要两个替身服务，仓库里不包含：兼容的身份服务（OIDC 授权码加 PKCE，RS256 访问令牌），以及兼容的 `chat/completions` 译文服务。
-- 本地数据库要先应用本仓库的 schema（到 058）。`tests/gateway-access.fork.test.ts` 演示了在隔离库上做引导的方式：应用 058，访问方式直接用生产的 `schema/055-access.surql`，只替换 JWKS 地址。
-
-启动：
-
-```sh
-cd owner-end
-bun run build                                  # 生成 public/app.js
-./node_modules/.bin/wrangler dev --local --ip 127.0.0.1 --port 8787
-```
-
-`bun run dev` 会先 build 再启动 `wrangler dev`。依赖用 pnpm 安装（`pnpm install`，锁文件是 `pnpm-lock.yaml`）。
+依赖使用 pnpm 安装；云后端通过 `bun --no-env-file src/server.ts` 启动，环境由调用者或 systemd 显式提供。`server-cron.ts` 仅接受现有两个 cron 表达式，一次执行后退出。
 
 ## 测试与检查
 
@@ -227,13 +209,11 @@ bun run build                                  # 生成 public/app.js
 
 截图用 ego-browser 自动化采集，采集脚本没有入库。
 
-## 部署（本 PR 未执行）
+## 部署
 
-1. 用 `wrangler secret put` 设置上文「密钥」中需要的值。
-2. `IDP_TENANT_ID` 已在 `wrangler.jsonc` 中填为公司租户 id（`46aa29a6-9ee8-4052-bccd-7923f98220d7`），部署前核对一次。
-3. 执行 `bun run deploy:dry-run` 确认打包通过。静态资源上传 `app.css`、`app.js`、`index.html` 三个文件，`app.js.map` 按 `public/.assetsignore` 排除。
-4. 老板批准后再执行 `wrangler deploy`。
-5. 部署顺序：先部署老板端（新增网关命令 `cmd.catalog`），再发布插件新版（sidecar 转发 `company_cmd` 与 `company_cmd_catalog`）。老板端部署前，员工的 `company_cmd_catalog` 调用会失败。
+main 的 Quality gate 和 Release 成功后，`deploy-owner` 作业先构建云后端，通过限定命令的独立 SSH key 发布并核对版本健康，再部署免费边缘与静态页面。后端接收端校验归档文件、摘要、版本和提交；启动失败自动恢复原 current。
+
+首次迁移需先安装独立服务及受保护配置，部署云后端并验证，再切换边缘、移除原 Worker cron，最后启用云端 timer。具体命令、回滚顺序及所需 GitHub secrets 见 [部署说明](deploy/README.md)。
 
 ## 已知偏离与遗留
 
@@ -248,7 +228,7 @@ bun run build                                  # 生成 public/app.js
 9. **按目标的硬锁只作用于网关。** 它们只对经网关的调用生效。插件本机的任务流工具直连数据库，不经网关。
 10. **`Bun.sleep` 与 `process.env` 的残留。** `src/sck-cli.ts` 仍用 `Bun.sleep` 与 `Bun.sleepSync`，它不在 Worker 的依赖闭包里。`src/owner-api.ts` 读取 `SCK_OWNER_TOKEN`，只在 `task.create` 的本机分支里用到，Worker 不走这个分支（RUNNER_ONLY 命令先排队）。`scripts/worker-compat-check.ts` 不检查 `process.env`，这一点靠代码审阅确认。
 11. **译文没有用真实服务验证。** 测试和截图用的是本地替身，译文形如 `[EN stub] 原文`。译文质量、延迟和费用需要接入真实译文服务后再验证。
-12. **`wrangler.jsonc` 指向生产库。** 本地开发必须用 `.dev.vars` 覆盖，见「本地开发」。
+12. **边缘配置指向生产云后端。** 设计与测试环境不应提供生产代理密钥，见「本地开发」。
 13. **390px 下导航条横向滚动。** 这是设计如此，没有改。
 14. **员工与权限页的截图较旧。** `desktop-permissions.png` 拍于「按目标锁定」与「员工拒绝清单」区块加入之前，这两块还没有截图。
 15. **替老板作决定的命令不检查调用方。** `ownerApi` 只把来源记为 `owner:agent`，不判断调用者是否老板。`decide`、`approve`、`reject`、`instruct`、`direction.add`、`route.save` 等命令对持有有效租约的员工同样放行。决定类命令另有任务状态检查（如 `approve` 只对等待老板复核的任务生效）。见「员工可达的范围」。

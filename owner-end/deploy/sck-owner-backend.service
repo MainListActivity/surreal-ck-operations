@@ -1,0 +1,38 @@
+[Unit]
+Description=Company owner API and live events
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=sck-owner
+Group=sck-owner
+WorkingDirectory=/opt/sck-owner/current
+EnvironmentFile=/etc/sck-owner/backend.env
+EnvironmentFile=/opt/sck-owner/current/release.env
+ExecStart=/opt/sck-owner/bin/bun --no-env-file /opt/sck-owner/current/server.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+KillMode=mixed
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+UMask=0077
+MemoryHigh=384M
+MemoryMax=768M
+CPUQuota=100%
+TasksMax=64
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

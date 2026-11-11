@@ -1,42 +1,41 @@
+// 免费边缘仅提供静态资源与同源流式转发；业务与原有 cron 在云端 Bun。
+// OWNER_PROXY_KEY 用 wrangler secret put 注入，不进入仓库。
 {
-  // 老板端网关。静态页面由 assets 提供；只有 /api/* 先经 Worker，其余路径（含 /auth/callback）交给页面的单页兜底。
-  // 客户端密钥、ma_hono 管理令牌、Cloudflare 令牌与译文服务密钥只用 `wrangler secret put` 设置，不写进本文件（清单见 README）。
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "company-owner-end",
-  "main": "src/worker.ts",
+  "main": "src/edge.ts",
   "compatibility_date": "2025-09-15",
-  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "compatibility_flags": [
+    "nodejs_compat",
+    "global_fetch_strictly_public",
+    "enable_request_signal"
+  ],
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*"]
+    "run_worker_first": [
+      "/api",
+      "/api/*"
+    ]
   },
   "triggers": {
-    // 每分钟：agent 身份同步与译文补译；每天 19:30（UTC）：笔记整理。两条按表达式分派，见 src/cron.ts。
-    "crons": ["* * * * *", "30 19 * * *"]
+    "crons": []
   },
-  // 老板端域名：自定义域名（Cloudflare 自动建 DNS 与证书）。
-  "routes": [{ "pattern": "company.maplayer.top", "custom_domain": true }],
+  "routes": [
+    {
+      "pattern": "company.maplayer.top",
+      "custom_domain": true
+    }
+  ],
   "observability": {
-    "enabled": true
+    "enabled": true,
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.1
+    }
   },
   "vars": {
-    "IDP_ISSUER": "https://o.maplayer.top/t/company",
-    "IDP_JWKS_URL": "https://o.maplayer.top/t/company/jwks.json",
-    "CONSOLE_CLIENT_ID": "aafe1504-b72a-4f0b-9a42-5146695c82b2",
-    // 公司租户 id（ma_hono 的 company 租户，管理接口路径用）。空则 idp.* 的租户与客户端命令返回 not_configured。
-    "IDP_TENANT_ID": "46aa29a6-9ee8-4052-bccd-7923f98220d7",
-    "AGENT_EMAIL_DOMAIN": "agents.maplayer.top",
-    // 公开的客户端 id（密钥在 secret 里）。
-    "GATEWAY_CLIENT_ID": "8db885f7-8d42-4c96-9870-47088af6fadc",
-    "CRON_CLIENT_ID": "489b93ba-b87f-4b29-a4e2-d25173842ad2",
-    "VIEWER_CLIENT_ID": "4cf2c95a-eba3-4c1a-a8ee-b91ac3182019",
-    "COMPANY_DB_URL": "wss://data.maplayer.top/rpc",
-    "COMPANY_NS": "company",
-    "COMPANY_DB": "main",
-    // 译文服务：远程 magpie 的 OpenAI 兼容入口与模型（密钥在 secret 里）。
-    "MAGPIE_BASE_URL": "https://data.maplayer.top/ofm/v1",
-    "MAGPIE_MODEL": "auto/deepseek-v4.1-flash"
+    "OWNER_BACKEND_ORIGIN": "https://data.maplayer.top/__company_owner"
   }
 }

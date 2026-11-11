@@ -1,7 +1,7 @@
 {
   "name": "company-owner-end",
   "private": true,
-  "description": "老板端网关：Cloudflare Worker 上的老板看板、命令网关与定时任务",
+  "description": "老板端：Cloudflare 免费静态与同源转发，云端 Bun 业务与 LIVE 实时服务",
   "type": "module",
   "packageManager": "pnpm@10.32.1",
   "scripts": {
@@ -12,7 +12,9 @@
     "dev": "bun run build && wrangler dev",
     "deploy:dry-run": "bun run build && wrangler deploy --dry-run --outdir dist",
     "demo": "bun --no-env-file demo/server.ts",
-    "demo:export-script": "bun build ./demo/export.ts --target browser --format iife --outfile .demo/export.js"
+    "demo:export-script": "bun build ./demo/export.ts --target browser --format iife --outfile .demo/export.js",
+    "start:backend": "bun --no-env-file src/server.ts",
+    "cron:backend": "bun --no-env-file src/server-cron.ts"
   },
   "dependencies": {
     "hono": "^4.13.17",
