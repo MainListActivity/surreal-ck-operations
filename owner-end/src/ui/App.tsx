@@ -10,7 +10,7 @@ import { OverviewPage } from './pages/Overview.tsx';
 import { RequirementsPage } from './pages/Requirements.tsx';
 import { StaffPage } from './pages/Staff.tsx';
 import { TasksPage } from './pages/Tasks.tsx';
-import { useLiveState } from './realtime.ts';
+import { holdLive, useLiveState } from './realtime.ts';
 
 function LiveIndicator() {
   const state = useLiveState();
@@ -158,6 +158,10 @@ export function App() {
       removeEventListener('beforeunload', protect);
     };
   }, [check, setDirty]);
+
+  // 登录期间只建一次实时连接；切换菜单、刷新当前页都复用它。
+  const signedIn = session.kind === 'in';
+  useEffect(() => (signedIn ? holdLive() : undefined), [signedIn]);
 
   const setDraft = useCallback((messageId: string, value: string) => setDrafts(d => withDraft(d, messageId, value)), []);
   const dropDraft = useCallback((messageId: string) => setDrafts(d => withoutDraft(d, messageId)), []);
