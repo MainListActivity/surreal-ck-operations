@@ -1,0 +1,33 @@
+[Unit]
+Description=Company owner daily notes consolidation (single run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=sck-owner
+Group=sck-owner
+WorkingDirectory=/opt/sck-owner/current
+EnvironmentFile=/etc/sck-owner/backend.env
+EnvironmentFile=/opt/sck-owner/current/release.env
+StateDirectory=sck-owner-cron
+StateDirectoryMode=0700
+ExecStart=/usr/bin/flock --wait 300 /var/lib/sck-owner-cron/cron.lock /opt/sck-owner/bin/bun --no-env-file /opt/sck-owner/current/server-cron.js "30 19 * * *"
+TimeoutStartSec=900
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+UMask=0077
+MemoryHigh=256M
+MemoryMax=512M
+CPUQuota=50%
+TasksMax=64
+

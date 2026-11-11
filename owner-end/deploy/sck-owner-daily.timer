@@ -1,0 +1,11 @@
+[Unit]
+Description=Run company owner daily jobs at 19:30 UTC
+
+[Timer]
+OnCalendar=*-*-* 19:30:00 UTC
+AccuracySec=1s
+Persistent=true
+Unit=sck-owner-daily.service
+
+[Install]
+WantedBy=timers.target
