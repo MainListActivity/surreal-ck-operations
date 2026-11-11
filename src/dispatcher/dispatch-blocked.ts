@@ -25,7 +25,7 @@ export type WorkflowState = 'ready' | 'doing' | 'review';
 export type BlockCode =
   | 'paused' | 'budget' | 'resources' | 'memory_pressure' | 'disk_space' | 'max_running'
   | 'prior_submitter' | 'no_candidate' | 'session_busy' | 'held' | 'assigned' | 'track_mismatch' | 'model_slot'
-  | 'quota' | 'probe_busy' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'wake_failed' | 'unknown' | 'factory_wait';
+  | 'provider_retry' | 'quota' | 'probe_busy' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'wake_failed' | 'unknown' | 'factory_wait';
 
 /** One staffing entry, reduced to what the evaluator reads. `key` is the employee id or `spawn:<def>`. */
 export interface EvaluatedEntry {
@@ -155,6 +155,7 @@ export function staffingShortage(
 
 /** Owner-facing text per code. The staffing pool and the evaluator both read this table. */
 export const BLOCK_TEXT: Record<BlockCode, string> = {
+  provider_retry: '本任务供应商失败冷却或切换预算已用尽',
   factory_wait: 'Factory 仍有额度，本任务保留等待 Factory；已有 3 个等待任务后新任务可分流',
   paused: '全局暂停派工',
   budget: '订阅额度耗尽或限流',
@@ -179,12 +180,14 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
 };
 
 const OWNER: Record<BlockCode, RecoveryAuthority> = {
+  provider_retry: 'system',
   factory_wait: 'system',
   paused: 'owner', budget: 'owner', resources: 'owner', memory_pressure: 'system', disk_space: 'owner', max_running: 'owner', prior_submitter: 'owner', no_candidate: 'owner',  session_busy: 'owner', held: 'owner', assigned: 'owner', track_mismatch: 'owner', model_slot: 'owner',
   quota: 'owner', provider_capacity: 'owner', seat_full: 'owner', def_disabled: 'owner', wake_failed: 'owner', unknown: 'owner', probe_busy: 'owner',
 };
 
 const RECOVERY: Record<BlockCode, string> = {
+  provider_retry: '等待本任务冷却或切换预算恢复；不会绕过已有派工屏障',
   factory_wait: '等待 Factory 空闲后自动派工；额度耗尽后回退其他合格员工',
   paused: '老板解除全局暂停',
   budget: '老板充值，或等待额度恢复',
@@ -209,6 +212,7 @@ const RECOVERY: Record<BlockCode, string> = {
 };
 
 const NEXT: Record<BlockCode, string> = {
+  provider_retry: '冷却期限到达后重新评估合格供应商',
   factory_wait: 'Factory 空闲或额度状态变化',
   paused: '全局暂停解除',
   budget: '额度恢复或老板充值',
@@ -234,6 +238,7 @@ const NEXT: Record<BlockCode, string> = {
 
 /** The source each code is read from. Stable strings: the roster, the cards and the brief show them as they are. */
 const BASIS: Record<BlockCode, string> = {
+  provider_retry: 'task.provider_failures（明确终止回合，按 delivery 去重）',
   factory_wait: 'tick:factory-queue',
   paused: 'tick:global-gate', budget: 'tick:global-gate', resources: 'tick:global-gate', memory_pressure: 'host:memory', disk_space: 'host:disk', max_running: 'tick:global-gate', prior_submitter: 'contribution-audit',  no_candidate: 'tick:staffing-pool', session_busy: 'paseo:session-status', held: 'tick:staffing-pool', assigned: 'tick:staffing-pool',
   track_mismatch: 'tick:staffing-pool', model_slot: 'tick:model-slots',
@@ -243,6 +248,7 @@ const BASIS: Record<BlockCode, string> = {
 
 /** Recovery actions per code. Only the ones with a tool are executable; the rest name who must act outside the system. */
 const ACTIONS: Record<BlockCode, RecoveryAction[]> = {
+  provider_retry: [{ authority: 'system', label: '预算或冷却到期后自动重判', executable: false }],
   factory_wait: [{authority:'system',label:'等待 Factory 空闲后自动重试；队列之外的任务可分流',executable:false}],
   paused: [{ authority: 'owner', label: '老板解除全局暂停', executable: false }],
   budget: [{ authority: 'owner', label: '老板充值，或等待额度恢复', executable: false }],
@@ -336,6 +342,7 @@ const detailsOf = (list: readonly EvaluatedEntry[]): string =>
  * rests on: a prior-submitter conflict names its source task and excluded employee, and an unreadable history names itself.
  */
 function reasonText(code: BlockCode, list: readonly EvaluatedEntry[], until: string | undefined, home: string): string {
+  if (code === 'provider_retry') return `${detailsOf(list) || BLOCK_TEXT.provider_retry}，${until ? `恢复时间 ${until}` : '恢复时间未知'}`;
   if (code === 'quota') return `${BLOCK_TEXT.quota}，${until ? `恢复时间 ${until}` : '恢复时间未知'}`;
   if (code === 'seat_full') return detailsOf(list) || `${BLOCK_TEXT.seat_full}（仓库 ${repoName(home)}）`;
   if (code === 'unknown') return detailsOf(list) || BLOCK_TEXT[code];
@@ -368,7 +375,7 @@ export function evaluateDispatch(input: EvaluateInput): DispatchVerdict {
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([code, candidates]) => {
       const list = pool.filter(entry => !entry.eligible && (entry.code ?? 'unknown') === code);
-      const until = code === 'quota' ? quotaUntil(list) : undefined;
+      const until = code === 'quota' || code === 'provider_retry' ? quotaUntil(list) : undefined;
       return {
         code,
         text: reasonText(code, list, until, input.home),

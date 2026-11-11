@@ -337,3 +337,16 @@ test('运行器路由也阻止无编制定向的旧会话复用', () => {
   expect(entries.length).toBeGreaterThan(0);
   expect(entries.every(e => !e.eligible && e.code === 'def_disabled')).toBe(true);
 });
+
+test('bounded provider retry bypasses Factory reservation only after definite failure, even for quota-exempt groups', () => {
+  const task={id:'task',state:'ready',executorRole:'engineering',row:{provider_failures:[{delivery:'d1',phase:'doing',provider:'factory-droid',cause:'unavailable',at:999_999}]}} as unknown as SupervisedTask;
+  const defs=[def('factory',{provider:'factory-droid',quotaLimited:false}),def('codex')];
+  const entries=staffingPool(base({defs,task}));
+  expect(entries.find(e=>e.provider==='factory-droid')).toMatchObject({eligible:false,code:'provider_retry'});
+  expect(entries.find(e=>e.provider==='codex')?.eligible).toBe(true);
+});
+test('bounded provider retry cannot be evaded by adding a fourth provider or restarting pool evaluation', () => {
+  const task={id:'task',state:'ready',executorRole:'engineering',row:{provider_failures:['a','b','c'].map((provider,index)=>({delivery:`d${index}`,phase:'doing',provider,cause:'unavailable',at:999_999}))}} as unknown as SupervisedTask;
+  const input=base({defs:[def('new-provider',{provider:'d',quotaLimited:false})],task});
+  for(let restart=0;restart<3;restart++)expect(staffingPool(input)).toMatchObject([{eligible:false,code:'provider_retry'}]);
+});

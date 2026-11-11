@@ -1,3 +1,5 @@
+import { PROVIDER_FAILURE_WINDOW_SECONDS, type ProviderFailure } from './dispatcher/provider-failover.ts';
+import type { SchedulingFact, SchedulingDecision } from './dispatcher/scheduling.ts';
 import { dispatchFinalizationSql } from './dispatch-finalization.ts';
 import { outboundRevisionSql } from './outbound-revision.ts';
 import { FaultStore } from './fault-store.ts';
@@ -727,6 +729,28 @@ export class Workforce {
     return { provider, state: 'exhausted', until, failures, lastError: error };
   }
 
+  /** A terminal provider rejection may charge only the exact current allocation, once.
+   * Persist before release; a failed write keeps the allocation isolated and retryable. */
+  async recordProviderFailure(employee: string, proof: { taskId: string; deliveryId: string; fence: number }, cause: ProviderFailure['cause']): Promise<void> {
+    await this.db.query(`BEGIN TRANSACTION;
+      LET $t = SELECT * FROM ONLY $task;
+      LET $now = time::unix(time::now());
+      IF array::len(($t.provider_failures ?? [])[WHERE delivery=$delivery]) = 0 {
+      IF $t.current_employee != $employee OR $t.delivery_id != $delivery OR $t.fence != $fence
+        OR $t.state NOT IN ['doing','review'] { THROW 'provider_failure_stale_allocation'; };
+      LET $e = SELECT * FROM ONLY $emp;
+      IF $e.provider = NONE { THROW 'provider_failure_missing_provider'; };
+      LET $recent = SELECT * FROM ($t.provider_failures ?? []) WHERE at > $now - $window;
+      IF array::len($recent[WHERE delivery=$delivery]) = 0 {
+        UPDATE $task SET provider_failures = array::append($recent, {
+          delivery: $delivery, phase: $t.state, provider: $e.provider, cause: $cause, at: $now
+        });
+      };
+      };
+      COMMIT TRANSACTION;`, { task: id('task',proof.taskId), emp:id('employee',employee), employee,
+      delivery:proof.deliveryId, fence:proof.fence, cause, window: PROVIDER_FAILURE_WINDOW_SECONDS }).retry();
+  }
+
   async markHealthy(provider: string): Promise<void> {
     await this.db.query(`UPSERT $p CONTENT { state: 'healthy', failures: 0, changed_at: time::now() };`,
       { p: id('provider_health', provider) });
@@ -788,13 +812,45 @@ export class Workforce {
     if (taskIds.length === 0) return since;
     const [rows] = await this.db.query<[Array<{ task: unknown; at: unknown }>]>(
       `SELECT task, at FROM audit WHERE task IN $ids
-       AND action IN ['create', 'dependency_unlocked', 'return', 'release', 'revoke', 'resume'] ORDER BY at DESC;`,
+       AND action IN ['create', 'dependency_unlocked', 'submit', 'owner_submit', 'return', 'release', 'revoke', 'resume'] ORDER BY at DESC;`,
       { ids: taskIds.map(taskId => id('task', taskId)) });
     for (const row of rows ?? []) {
       const key = asId(row.task);
       if (!since.has(key) && row.at !== undefined && row.at !== null) since.set(key, Date.parse(String(row.at)));
     }
     return since;
+  }
+
+  /** Membership is taken from the execution ledger, never an agent-supplied task tag.
+   * Approval is immutable; editing a new draft cannot reprioritize the approved scope. */
+  async schedulingFacts(taskIds: readonly string[]): Promise<Map<string, SchedulingFact>> {
+    if (!taskIds.length) return new Map();
+    const [since, [runs]] = await Promise.all([
+      this.readySince(taskIds),
+      this.db.query<[Array<{ requirement: string; revision: number; tasks: string[] }>]>(
+        'SELECT requirement, revision, tasks FROM requirement_execution WHERE tasks CONTAINSANY $tasks;', { tasks: [...taskIds] }),
+    ]);
+    const facts = new Map<string, SchedulingFact>([...since].map(([task, readyAt]) => [task, { readyAt }]));
+    const keys = [...new Set(runs.filter(r => typeof r.requirement === 'string' && Number.isInteger(r.revision))
+      .map(r => `${r.requirement}:${r.revision}`))];
+    if (!keys.length) return facts;
+    const [approvals] = await this.db.query<[Array<{ id: RecordId; snapshot: string }>]>(
+      'SELECT id, snapshot FROM requirement_approval WHERE id IN $ids;', { ids: keys.map(key => id('requirement_approval', key)) });
+    const approved = new Map(approvals.map(a => [asId(a.id), a.snapshot]));
+    const wanted = new Set(taskIds), ambiguous = new Set<string>();
+    for (const run of runs) {
+      let snapshot: { requirement?: string; revision?: number; content?: { priority?: number } };
+      try { snapshot = JSON.parse(approved.get(`${run.requirement}:${run.revision}`) ?? 'null'); } catch { continue; }
+      const priority = snapshot?.content?.priority;
+      if (snapshot?.requirement !== run.requirement || snapshot?.revision !== run.revision
+        || !Number.isInteger(priority) || priority! < 0 || priority! > 3) continue;
+      for (const task of run.tasks) {
+        if (!wanted.has(task) || ambiguous.has(task)) continue;
+        if (facts.get(task)?.requirement) { facts.set(task, { readyAt: since.get(task) }); ambiguous.add(task); continue; }
+        facts.set(task, { readyAt: since.get(task), priority, requirement: run.requirement, revision: run.revision });
+      }
+    }
+    return facts;
   }
 
   /** Extends a live holder's lease without changing version, fence or delivery. */
@@ -873,9 +929,9 @@ export class Workforce {
     for (const r of rows ?? []) out.set(`${r.task}:${r.version}`, { employee: r.employee, at: r.at });
     return out;
   }
-  async recordDispatch(taskId: string, version: number, purpose: string, employee: string): Promise<void> {
-    await this.db.query('UPSERT $d CONTENT { task: $task, version: $version, purpose: $purpose, employee: $employee, at: time::unix(time::now()) };',
-      { d: this.dispatchId(taskId, version, purpose), task: taskId, version, purpose, employee });
+  async recordDispatch(taskId: string, version: number, purpose: string, employee: string, scheduling?: SchedulingDecision): Promise<void> {
+    await this.db.query('UPSERT $d CONTENT { task: $task, version: $version, purpose: $purpose, employee: $employee, scheduling: $scheduling, at: time::unix(time::now()) };',
+      { d: this.dispatchId(taskId, version, purpose), task: taskId, version, purpose, employee, scheduling });
   }
 
   

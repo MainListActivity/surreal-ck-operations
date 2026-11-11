@@ -1,3 +1,5 @@
+import { providerRetryBlock } from './provider-failover.ts';
+import { orderWork, schedulingDecision, type SchedulingFact } from './scheduling.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { FACTORY_PROVIDER, FACTORY_WAIT_LIMIT, factoryFirst, factoryQueue, leaveFactoryQueue } from './provider-order.ts';
 import { employeeTier, managedModel, taskTier } from "../model-routing/policy.ts";
@@ -254,6 +256,8 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
    * session; while it runs, the rest wait as probe_busy, which never carries a recovery time.
    */
   const capHit = (provider: string, exempt = false, managed = false): Block | undefined => {
+    const retry = p.task && providerRetryBlock(p.task.row?.provider_failures, provider, p.excludeSubmitter ? 'review' : 'doing', p.now);
+    if (retry) return ['provider_retry', retry.reason, retry.until];
     if (managed) return undefined; // Magpie owns model/account capacity; maxRunning guards the Mac.
     if (!exempt) {
       const quota = quotaOf(provider);
@@ -595,7 +599,7 @@ export interface TickReport {
   recovered?: string[];
   /** FV06 recovery read grants woken this tick (grant ids only). */
   recovery?: string[];
-  skipped?: 'paused' | 'budget' | 'resources';
+  skipped?: 'paused' | 'budget' | 'resources' | 'scheduling-unavailable';
 }
 
 /**
@@ -1252,6 +1256,9 @@ export class Dispatcher {
       }
       await owner.resolveNotice(`runtime-uncertain:${task.currentEmployee}:${task.id}`);
       if (state === 'down' || state === 'exhausted') {
+        if (state === 'exhausted' && task.row.delivery_id && Number.isInteger(task.row.fence)) {
+          await wf.recordProviderFailure?.(task.currentEmployee, { taskId: task.id, deliveryId: task.row.delivery_id, fence: task.row.fence }, 'quota');
+        }
         await this.revoke(task, `员工 ${inst!.id} 的会话${state === 'exhausted' ? '所在订阅额度耗尽/限流' : '已中断'}`, inst, report);
       } else if (stale) {
         // A non-busy holder (typically a session whose turn ended mid-claim and went
@@ -1382,12 +1389,22 @@ export class Dispatcher {
 
     // 4. Work that needs an employee.
     const holding = new Set(tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
-    const work = [
+    let work = [
       ...tasks.filter(t => !isolatedTasks.has(t.id) && t.state === 'review' && t.reviewerRole !== 'owner' && !t.currentEmployee)
         .map(t => ({ task: t, role: t.reviewerRole, purpose: 'review' as const })),
       ...tasks.filter(t => !isolatedTasks.has(t.id) && (t.state === 'ready' || t.state === 'doing') && !t.currentEmployee)
         .map(t => ({ task: t, role: t.executorRole as string, purpose: 'execute' as const })),
     ];
+    let scheduling: Map<string, SchedulingFact>;
+    try { scheduling = await wf.schedulingFacts?.(work.map(item => item.task.id)) ?? new Map(); }
+    catch {
+      await this.notice('scheduling-unavailable', '交付优先级或等待历史暂不可读，本轮保留队列；已在运行的任务继续受监督。', report);
+      await this.markGlobal(work, globalBlock('unknown'), now, report);
+      report.skipped = 'scheduling-unavailable';
+      return report;
+    }
+    await owner.resolveNotice('scheduling-unavailable');
+    work = orderWork(work, scheduling, now * 1000);
     // The owner board shows each queued item's message, so its draft exists before the first dispatch (a rework message included).
     await this.draftQueued(work.map(item => item.task.id));
     // Episodes of work that left the queue end here, before any pass-wide gate below returns early.
@@ -1504,11 +1521,10 @@ export class Dispatcher {
         excludeSubmitter:item.review,exclusion:item.review?queueExclusions.get(item.task.id):undefined,
                 })
         .some(entry=>entry.provider===FACTORY_PROVIDER && entry.eligible))
-      .map(item=>({key:factoryWorkKey(item.role,item.task,item.review),createdAt:Date.parse(String(item.task.row.created_at??''))||undefined})));
+      .map((item,rank)=>({key:factoryWorkKey(item.role,item.task,item.review),rank})));
     this.passInputs.factoryQueue=factoryWaiting;
     poolBase.factoryQueue=factoryWaiting;
-    // Reservation order takes precedence over the ordinary review-first order for queued Factory work.
-    work.sort((a,b)=>(factoryWaiting.get(factoryWorkKey(a.role,a.task,a.purpose==='review'))??Infinity)-(factoryWaiting.get(factoryWorkKey(b.role,b.task,b.purpose==='review'))??Infinity));
+    // Factory reservations follow the same delivery/fairness order; provider preference cannot reorder tasks.
     const poolFor = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false, exclusion?: ReviewExclusion) =>
       staffingPool({ ...poolBase, insts, role, home, task, excludeSubmitter, exclusion, assigned });
     const eligibleInsts = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false,
@@ -1608,7 +1624,7 @@ export class Dispatcher {
           continue;
         }
         await this.clearBlocked(item.task, item.purpose);
-        await wf.recordDispatch(item.task.id, item.task.version, item.purpose, result.id);
+        await wf.recordDispatch(item.task.id, item.task.version, item.purpose, result.id, schedulingDecision(item, scheduling, now * 1000));
         running++;
         busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);
         assigned.add(result.id);

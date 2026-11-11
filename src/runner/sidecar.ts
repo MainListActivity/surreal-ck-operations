@@ -1,3 +1,4 @@
+import type { ProviderFailure } from '../dispatcher/provider-failover.ts';
 import { execFile } from 'node:child_process';
 import { LIFECYCLE_COMMANDS } from '../lifecycle-policy.ts';
 // Per-agent sidecar pool. Each company employee instance gets a private comm
@@ -302,6 +303,9 @@ export class SidecarPool {
     const belongsToCurrent = current?.startedAt && current.turn === event.turnId && !['settled','superseded'].includes(current.state);
     const prior = event.turnId && current?.turns.includes(event.turnId) ? current
       : !belongsToCurrent && this.journal.rows().find(r => r.employee === employee && !!event.turnId && r.turns.includes(event.turnId));
+    if (prior && prior.state === 'interrupted' && live?.proof.deliveryId === prior.proof.deliveryId) {
+      return { status: 'silent', silent: { deliveryId: prior.proof.deliveryId, instId: employee, taskId: prior.task, nudges: 3, phase: prior.phase } };
+    }
     if (prior) { if (prior.state === 'collecting') await this.collectExecution(prior); else await this.flushExecution(prior); return { status: prior.state === 'settled' ? 'ingested' : 'pending' }; }
     const row = live ? this.journal.reserve(employee, live.phase, live.proof)
       : this.journal.rows().filter(r => r.employee === employee && r.agent === event.agent.id
@@ -359,10 +363,32 @@ export class SidecarPool {
   async retryExecutions(): Promise<void> {
     if (!this.journal || this.closed) return;
     for (const row of this.journal.rows()) {
-      if (row.state === 'collecting' && row.nextRetry <= Date.now()) {
+      if (row.state === 'interrupted' && row.providerFailure && row.nextRetry <= Date.now()) {
+        await this.releaseProviderFailure(row).catch(() => undefined);
+      } else if (row.state === 'collecting' && row.nextRetry <= Date.now()) {
         await this.collectExecution(row);
       } else if (row.state === 'pending' && row.nextRetry <= Date.now()) await this.flushExecution(row);
     }
+  }
+  private async releaseProviderFailure(row: ExecutionAttempt): Promise<void> {
+    if (!row.providerFailure || this.flushing.has(row.employee)) return;
+    this.flushing.add(row.employee);
+    try {
+      await this.deps.workforce.recordProviderFailure?.(row.employee, row.proof, row.providerFailure);
+      if (!this.deps.core.release) throw new Error('core release unavailable');
+      const cred = await this.credentialFor(row.employee);
+      await this.deps.core.release(cred, row.proof, {
+        text: '【通道回滚】供应商明确失败，执行端已记录分流预算，保留任务阶段。',
+        idempotencyKey: `sidecar-release:${row.employee}:${row.proof.deliveryId}`,
+      });
+      row.state = 'settled'; row.providerFailure = undefined; row.error = undefined;
+      await this.changed(row);
+      if (this.claims.get(row.employee)?.proof.deliveryId === row.proof.deliveryId) this.endLease(row.employee);
+    } catch (error) {
+      row.tries++; row.error = 'provider_failure_release_pending'; row.nextRetry = Date.now() + Math.min(60_000, 1000 * 2 ** Math.min(row.tries, 6));
+      await this.changed(row);
+      throw error;
+    } finally { this.flushing.delete(row.employee); }
   }
   private async flushExecution(row: ExecutionAttempt): Promise<void> {
     if (!this.journal || !row.result || row.state !== 'pending' || this.closed || this.flushing.has(row.employee)) return;
@@ -644,11 +670,18 @@ export class SidecarPool {
   /** Spawn/wake/workspace-handoff rollback after a pre-claim: hand the lease back without a
    * reviewer verdict — never routed through returnTask, which would fake a return and bounce
    * a review task back to doing. Cores without the release op let the lease expire on its own. */
-  async releaseClaim(instId: string, _taskId: string, reason: string, options: { strict?: boolean } = {}): Promise<void> {
+  async releaseClaim(instId: string, _taskId: string, reason: string, options: { strict?: boolean; providerFailure?: ProviderFailure['cause'] } = {}): Promise<void> {
     const live = this.claims.get(instId);
     if (!options.strict) this.endLease(instId);
     if (!live) return;
+    if (live.taskId !== _taskId) throw new Error('release task does not match allocation');
+    const row = options.providerFailure ? this.journal?.read(instId, live.proof.deliveryId) : undefined;
+    if (row) {
+      row.providerFailure = options.providerFailure; row.state = 'interrupted'; await this.changed(row);
+      await this.releaseProviderFailure(row); return;
+    }
     try {
+      if (options.providerFailure) await this.deps.workforce.recordProviderFailure?.(instId, live.proof, options.providerFailure);
       const cred = await this.credentialFor(instId);
       if (options.strict && !this.deps.core.release) throw new Error("core release unavailable");
       await this.deps.core.release?.(cred, live.proof, { text: `【通道回滚】${reason}`, idempotencyKey: `sidecar-release:${instId}:${live.proof.deliveryId}` });
@@ -744,7 +777,7 @@ export class SidecarPool {
   hasPendingResult(instId: string, taskId: string, deliveryId?: string): boolean {
     const delivery = deliveryId ?? this.claims.get(instId)?.proof.deliveryId;
     const row = delivery ? this.journal?.read(instId, delivery) : undefined;
-    return !!row && row.task === taskId && ['collecting', 'pending'].includes(row.state);
+    return !!row && row.task === taskId && (['collecting', 'pending'].includes(row.state) || row.state === 'interrupted' && !!row.providerFailure);
   }
 
   /**

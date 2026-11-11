@@ -77,7 +77,7 @@ async function startFork(name: string) {
     const dispatchRows = async (taskId: string) => ((await rawQuery<[unknown[]]>('SELECT purpose, employee FROM dispatch WHERE task = $t;', { t: taskId }))[0] ?? []);
     const verdictOf = (dispatcher: Dispatcher, taskId: string) => dispatcher.dispatchVerdicts().find(v => v.taskId === taskId && v.phase === 'execute');
     return {
-      core, owner, wf, db, gm, hidden, agentRows, envs, rawQuery, dispatchBlockCalls,
+      pool: pool!, paseo, core, owner, wf, db, gm, hidden, agentRows, envs, rawQuery, dispatchBlockCalls,
       newDispatcher, taskRow, auditRows, noticeRows, dispatchRows, verdictOf, close,
     };
   } catch (error) {
@@ -196,3 +196,89 @@ run('B3: unknown runtime preserves the original lease across supervisor restarts
     expect((await w.wf.insts()).map(i => i.id)).toEqual([employee.id]);
   } finally { await w.close(); }
 }, 120000);
+
+run('approved delivery scheduling: real ledger priority, forged tag ignored, dependency and persisted selection survive a new dispatcher', async () => {
+  const w = await startFork('delivery-priority');
+  try {
+    await w.wf.upsertDef('eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    await w.rawQuery('UPDATE company_meta:config SET max_running=1;');
+    const ordinary = await w.core.createTask(w.gm, { title: 'ordinary', context: 'synthetic', executorRole: 'engineering', reviewerRole: 'owner', tag: 'requirement:critical', idempotencyKey: 'delivery-ordinary' });
+    const critical = await w.core.createTask(w.gm, { title: 'critical', context: 'synthetic', executorRole: 'engineering', reviewerRole: 'owner', idempotencyKey: 'delivery-critical' });
+    const child = await w.core.createTask(w.gm, { title: 'blocked-child', context: 'synthetic', executorRole: 'engineering', reviewerRole: 'owner', parent: critical.id, idempotencyKey: 'delivery-child' });
+    await w.rawQuery('CREATE $a CONTENT $body;', { a: new RecordId('requirement_approval', 'critical:1'), body: {
+      requirement: 'critical', revision: 1, snapshot: JSON.stringify({requirement: 'critical', revision: 1, content:{priority:0}}),
+    } });
+    await w.rawQuery('CREATE $e CONTENT $body;', { e: new RecordId('requirement_execution', 'critical:1'), body: {requirement:'critical',revision:1,tasks:[critical.id,child.id]} });
+    // Mutable draft priority is unrelated to the immutable approval used for this delivery.
+    await w.rawQuery('CREATE product_requirement:critical SET priority=3;');
+    const facts = await new Workforce(w.db).schedulingFacts([ordinary.id,critical.id,child.id]);
+    expect(facts.get(ordinary.id)?.priority).toBeUndefined();
+    expect(facts.get(critical.id)).toMatchObject({priority:0,requirement:'critical',revision:1});
+    const report = await w.newDispatcher().tick();
+    expect(report.woke.map(row => row.task)).toEqual([critical.id]);
+    expect(claimsOf(await w.auditRows(ordinary.id))).toHaveLength(0);
+    expect(claimsOf(await w.auditRows(child.id))).toHaveLength(0);
+    const [dispatch] = await w.rawQuery<[Array<{scheduling:unknown}>]>('SELECT scheduling FROM dispatch WHERE task=$task;', {task:critical.id});
+    expect(dispatch[0]?.scheduling).toMatchObject({priority:0,requirement:'critical',revision:1,reason:'approved_priority'});
+    expect((await w.newDispatcher().tick()).woke).toEqual([]);
+    expect(claimsOf(await w.auditRows(critical.id))).toHaveLength(1);
+  } finally { await w.close(); }
+});
+
+run('fair queue uses latest ready transition, persists across restart, and a fresh high priority cannot starve old work', async () => {
+  const w = await startFork('delivery-fairness');
+  try {
+    await w.wf.upsertDef('eng', { role: 'engineering', provider: 'factory-droid', model: 'fixture', maxInstances: 1 });
+    await w.rawQuery('UPDATE company_meta:config SET max_running=1;');
+    const old = await w.core.createTask(w.gm,{title:'old-waiter',context:'synthetic',executorRole:'engineering',reviewerRole:'owner',idempotencyKey:'fairness-old'});
+    const fresh = await w.core.createTask(w.gm,{title:'new-urgent',context:'synthetic',executorRole:'engineering',reviewerRole:'owner',idempotencyKey:'fairness-new'});
+    // Only fixture audit time is shifted, with server time; no sleeps and no production writes.
+    await w.rawQuery('UPDATE audit SET at=time::now()-31m WHERE task=$task;',{task:new RecordId('task',old.id)});
+    await w.rawQuery('CREATE $a CONTENT $body;',{a:new RecordId('requirement_approval','fresh:1'),body:{snapshot:JSON.stringify({requirement:'fresh',revision:1,content:{priority:0}})}});
+    await w.rawQuery('CREATE $e CONTENT $body;',{e:new RecordId('requirement_execution','fresh:1'),body:{requirement:'fresh',revision:1,tasks:[fresh.id]}});
+    const report = await w.newDispatcher().tick();
+    expect(report.woke.map(row=>row.task)).toEqual([old.id]);
+    const [dispatch] = await w.rawQuery<[Array<{scheduling:{reason:string}}>] >('SELECT scheduling FROM dispatch WHERE task=$task;',{task:old.id});
+    expect(dispatch[0]?.scheduling.reason).toBe('aged');
+    expect(claimsOf(await w.auditRows(fresh.id))).toHaveLength(0);
+  } finally { await w.close(); }
+});
+
+run('bounded provider failover: definitive rejected turns route to alternatives, duplicate/late evidence cannot charge a new allocation, restart retains the budget', async () => {
+  const { settleCompanyTurn } = await import('../src/runner/turn-closeout.ts');
+  const w = await startFork('provider-failover');
+  try {
+    for (const provider of ['factory-droid','codex','claude']) await w.wf.upsertDef(`eng-${provider}`,{role:'engineering',provider,model:'fixture',maxInstances:1});
+    await w.rawQuery('UPDATE company_meta:config SET max_running=1;');
+    const task = await w.core.createTask(w.gm,{title:'bounded provider retry',context:'synthetic',executorRole:'engineering',reviewerRole:'owner',idempotencyKey:'provider-retry'});
+    const providers: string[] = [];
+    for(let attempt=0;attempt<3;attempt++) {
+      const report = await w.newDispatcher().tick();
+      expect(report.woke.map(row=>row.task)).toEqual([task.id]);
+      const employee = (await w.wf.insts()).find(i=>i.id===report.woke[0]!.employee)!;
+      expect(providers).not.toContain(employee.provider!); providers.push(employee.provider!);
+      const [row] = await w.rawQuery<[{delivery_id:string;fence:number}]>('SELECT delivery_id, fence FROM ONLY $id;',{id:new RecordId('task',task.id)});
+      const proof={taskId:task.id,deliveryId:row.delivery_id,fence:row.fence};
+      await w.wf.recordProviderFailure(employee.id,proof,'unavailable');
+      await new Workforce(w.db).recordProviderFailure(employee.id,proof,'unavailable');
+      w.agentRows.get(employee.paseoAgentId!)!.status='idle';
+      const event={agent:{id:employee.paseoAgentId!},turnId:`rejected-${attempt}`,outcome:{kind:'failed',error:{message:'503 service unavailable'}},timeline:[]};
+      await settleCompanyTurn({sidecar:w.pool,workforce:w.wf} as never,{} as never,event as never);
+      await settleCompanyTurn({sidecar:w.pool,workforce:w.wf} as never,{} as never,event as never);
+      const [failureRows] = await w.rawQuery<[{provider_failures:unknown[];current_employee?:string}]>('SELECT provider_failures,current_employee FROM ONLY $id;',{id:new RecordId('task',task.id)});
+      expect(failureRows.provider_failures).toHaveLength(attempt+1);
+      expect(failureRows.current_employee ?? null).toBeNull();
+      await w.wf.recordProviderFailure(employee.id,proof,'unavailable'); // durable duplicate receipt, no charge
+      await expect(w.wf.recordProviderFailure(employee.id,{...proof,deliveryId:'stale-unrecorded'},'unavailable')).rejects.toThrow();
+      // Global provider recovery must not bypass this task's own persisted budget.
+      await w.wf.markHealthy(employee.provider!);
+    }
+    const exhausted = w.newDispatcher();
+    expect((await exhausted.tick()).woke).toEqual([]);
+    expect(exhausted.dispatchVerdicts().find(v=>v.taskId===task.id)?.reasons.map(r=>r.code)).toContain('provider_retry');
+    expect(claimsOf(await w.auditRows(task.id))).toHaveLength(3);
+    await w.rawQuery('UPDATE $id SET provider_failures = provider_failures.map(|$f| { delivery:$f.delivery, phase:$f.phase, provider:$f.provider, cause:$f.cause, at:time::unix(time::now())-1801 });',{id:new RecordId('task',task.id)});
+    expect((await w.newDispatcher().tick()).woke.map(row=>row.task)).toEqual([task.id]);
+    expect(claimsOf(await w.auditRows(task.id))).toHaveLength(4);
+  } finally { await w.close(); }
+});
