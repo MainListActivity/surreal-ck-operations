@@ -2,6 +2,7 @@ import type {
   RuntimeDashboard,
   RuntimeAgentView,
   RuntimePendingMessage,
+  RuntimeTransfer,
 } from '../../src/runtime-dashboard.ts';
 import { buildProjectRooms, recordKey } from '../../src/runtime-projects.ts';
 import type { PhaseDuration } from '../../src/runtime-timing.ts';
@@ -112,6 +113,16 @@ export class DemoRuntime {
         body: `【设计案例】${nextTitle.replace('【设计案例】', '')}。按 task.md 的验收标准完成工作并提交验证证据。这是候选派工正文，实际接收人由调度确定。`,
       });
     }
+    // 仅作为交接来源保留身份：没有当前任务、项目或候选派工，不占现场工位。
+    data.agents.push({
+      employee: `${CROWD}-previous-engineer`,
+      name: '【设计案例】前序工程员工',
+      role: 'engineering',
+      definitionId: 'design-engineering-claude',
+      provider: 'claude',
+      model: 'Claude · 示例模型',
+      policy: { disabled: false },
+    });
     // 已验收范围和未完成范围来自同一份任务数据，不用员工百分比替代项目进度。
     for (let i = 0; i < 2; i++)
       data.tasks.push({
@@ -408,6 +419,38 @@ export class DemoRuntime {
           label: reverse ? '退回返工' : '交付独立复核',
         }
       : undefined;
+    const transfers: RuntimeTransfer[] = transfer ? [transfer] : [];
+    if (this.sequence > 0 && this.crowdCount > 0) {
+      const employee = (position: number) => `${CROWD}-employee-${position}`;
+      // 三条独立任务关系足以检查隔人工位、窄屏换行与离场头像，避免画成杂乱线网。
+      const examples = [
+        { from: employee(1), to: employee(3), label: '补交验收边界' },
+        {
+          from: employee(2),
+          to: employee(this.crowdCount === 8 ? 7 : 4),
+          label: this.crowdCount === 8 ? '交接无障碍资料' : '交接移动端资料',
+        },
+        {
+          from: `${CROWD}-previous-engineer`,
+          to: employee(this.crowdCount === 8 ? 8 : 2),
+          label: '交接前序实现',
+        },
+      ];
+      for (const [index, example] of examples.entries()) {
+        const receiver = agents.find((a) => a.id === example.to);
+        if (!receiver?.taskId || !agents.some((a) => a.id === example.from)) continue;
+        transfers.push({
+          id: `${CROWD}-transfer-${this.crowdCount}-${this.sequence}-${index + 1}`,
+          taskId: receiver.taskId,
+          title: receiver.taskTitle ?? '【设计案例】并行协作交接',
+          from: example.from,
+          to: example.to,
+          at: this.transferredAt,
+          kind: 'handoff',
+          label: example.label,
+        });
+      }
+    }
     const plans: Row[] = [],
       executions: Row[] = [];
     for (const [requirement, run] of this.store.executions) {
@@ -446,7 +489,7 @@ export class DemoRuntime {
       hosts,
       agents,
       projects,
-      transfers: transfer ? [transfer] : [],
+      transfers,
       deliveries: [...this.store.executions.values()]
         .filter(
           (run) =>
@@ -468,20 +511,14 @@ export class DemoRuntime {
             workflow: 'GitHub 自动部署（设计案例）',
           };
         }),
-      events: transfer
-        ? [
-            {
-              id: transfer.id,
-              at: transfer.at,
-              label: transfer.label,
-              actor:
-                rows.find((a) => a.employee === transfer.from)?.name ??
-                transfer.from,
-              taskId,
-              taskTitle: transfer.title,
-            },
-          ]
-        : [],
+      events: transfers.map((item) => ({
+        id: item.id,
+        at: item.at,
+        label: item.label,
+        actor: rows.find((a) => a.employee === item.from)?.name ?? item.from,
+        taskId: item.taskId,
+        taskTitle: item.title,
+      })),
       summary: {
         hosts: hosts.length,
         onlineHosts: hosts.length,

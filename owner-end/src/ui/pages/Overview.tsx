@@ -3,13 +3,13 @@ import type {
   RuntimeDashboard,
   RuntimeAgentView,
   RuntimePendingMessage,
-  RuntimeTransfer,
 } from '../../../../src/runtime-dashboard.ts';
 import type {
   RuntimeProgress,
   RuntimeProjectView,
 } from '../../../../src/runtime-projects.ts';
 import type { RuntimeEstimate } from '../../../../src/runtime-timing.ts';
+import { HandoffConnections } from '../HandoffConnections.tsx';
 import { WorkContextFiles } from '../WorkContext.tsx';
 import { readDashboard, runCommand, outcomeText } from '../api.ts';
 import { useLiveRefresh, useLiveState } from '../realtime.ts';
@@ -460,122 +460,6 @@ function HandoffReferences({ value, data }: {
     </div>
   );
 }
-interface Line {
-  id: string;
-  d: string;
-  x: number;
-  y: number;
-  label: string;
-  active: boolean;
-  taskId: string;
-}
-function Connections({
-  connections,
-  active,
-}: {
-  connections: Array<RuntimeTransfer & { projectId: string }>;
-  active: Set<string>;
-}) {
-  const [lines, setLines] = useState<Line[]>([]);
-  useEffect(() => {
-    const root = document.getElementById('runtime-map');
-    if (!root) return;
-    const calc = () => {
-      const box = root.getBoundingClientRect();
-      const rooms = new Map(
-        Array.from(root.querySelectorAll<HTMLElement>('[data-project]')).map(
-          (el) => [el.dataset.project!, el],
-        ),
-      );
-      setLines(
-        connections.flatMap((e) => {
-          const room = rooms.get(e.projectId);
-          if (!room) return [];
-          const figures = new Map(
-            Array.from(room.querySelectorAll<HTMLElement>('[data-agent]')).map(
-              (el) => [el.dataset.agent!, el],
-            ),
-          );
-          const from = figures.get(e.from),
-            to = figures.get(e.to);
-          // Every endpoint must resolve to a named employee in this project, including
-          // off-stage references. Never substitute a room sign for a missing employee.
-          const a = (from?.querySelector('.person-halo') ?? from)?.getBoundingClientRect(),
-            b = (to?.querySelector('.person-halo') ?? to)?.getBoundingClientRect();
-          if (!a || !b) return [];
-          const fromReference = from!.classList.contains('handoff-avatar'),
-            toReference = to!.classList.contains('handoff-avatar');
-          const right = b.left > a.left + 20;
-          const same = Math.abs(a.left - b.left) < 20;
-          const x1 =
-            (fromReference ? a.left + a.width / 2 : same ? a.right - 18 : right ? a.right : a.left) - box.left;
-          const x2 =
-            (toReference ? b.left + b.width / 2 : same ? b.right - 18 : right ? b.left : b.right) - box.left;
-          const y1 = (fromReference ? a.bottom : a.top + a.height / 2) - box.top,
-            y2 = (toReference ? b.bottom : b.top + b.height / 2) - box.top;
-          const bend = same ? Math.max(x1, x2) + 20 : (x1 + x2) / 2;
-          // Header references descend beside the speech bubble, then join the work ring.
-          const curve = fromReference
-            ? `${x1} ${y2}, ${x1} ${y2}, ${x2} ${y2}`
-            : toReference
-              ? `${x2} ${y1}, ${x2} ${y1}, ${x2} ${y2}`
-              : `${bend} ${y1}, ${bend} ${y2}, ${x2} ${y2}`;
-          return [
-            {
-              id: `${e.projectId}-${e.id}`,
-              d: `M ${x1} ${y1} C ${curve}`,
-              x: (x1 + x2) / 2,
-              y: (y1 + y2) / 2,
-              label: e.label,
-              active: active.has(e.id),
-              taskId: e.taskId,
-            },
-          ];
-        }),
-      );
-    };
-    calc();
-    const observer = new ResizeObserver(calc);
-    observer.observe(root);
-    for (const el of Array.from(root.querySelectorAll('[data-agent]')))
-      observer.observe(el);
-    return () => observer.disconnect();
-  }, [connections, active]);
-  return (
-    <svg class="runtime-connections" aria-hidden="true">
-      <defs>
-        <filter id="flow-glow">
-          <feGaussianBlur stdDeviation="3" />
-        </filter>
-        <marker id="flow-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto" markerUnits="userSpaceOnUse">
-          <path d="M0 0L7 3.5L0 7Z" fill="#8c8ab5" />
-        </marker>
-      </defs>
-      {lines.map((l) => (
-        <g
-          key={l.id}
-          class={l.active ? 'flow-active' : 'flow-context'}
-        >
-          <path class="flow-halo" d={l.d} />
-          <path id={`flow-${l.id}`} class="flow-path" d={l.d} marker-end="url(#flow-arrow)" />
-          {l.active ? (
-            <circle r="5" class="flow-dot">
-              <animateMotion dur="2s" repeatCount="1" fill="freeze">
-                <mpath href={`#flow-${l.id}`} />
-              </animateMotion>
-            </circle>
-          ) : null}
-          {l.active ? <g transform={`translate(${l.x - 54},${l.y - 14})`}>
-            <rect class="flow-label-bg" width="108" height="28" rx="14" />
-            <text x="54" y="19" text-anchor="middle">
-              {l.label}
-            </text>
-          </g> : null}
-        </g>
-      ))}
-    </svg>
-  );
-}
 export function OverviewPage() {
   const [snapshot, setData] = useState<RuntimeDashboard>(),
     [error, setError] = useState(''),
@@ -993,7 +877,7 @@ export function OverviewPage() {
             </aside>
           ) : null}
         </div>
-        <Connections connections={connections} active={paused ? new Set() : active} />
+        <HandoffConnections connections={connections} active={paused ? new Set() : active} />
       </div>
       {!rooms.length ? (
         <p class="runtime-empty">暂无项目，确认需求后将在这里建立工作现场。</p>

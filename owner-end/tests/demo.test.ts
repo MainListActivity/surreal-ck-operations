@@ -143,6 +143,52 @@ test('本地消息编辑采用正文比较，拒绝冲突和已发送消息，�
  expect(()=>store.command('message.edit',{messageId:'missing',body:'不存在'})).toThrow('本地记录不存在');
 });
 
+test('4/8 人交接案例覆盖隔人、跨排与离场头像，关联当前任务且不增加在场人数',async()=>{
+ const {withDesignCases}=await import('../demo/data.ts');
+ const {DemoRuntime}=await import('../demo/runtime.ts');
+ const {roomAgents,roomHandoffs}=await import('../src/ui/meeting-rooms.ts');
+ const source=withDesignCases(seed()),before=JSON.stringify(source),store=new DemoStore(source),runtime=new DemoRuntime(store);
+ const project='design-crowd',employee=(position:number)=>`${project}-employee-${position}`;
+ const departed=`${project}-previous-engineer`;
+ for(const count of [4,8]){
+   runtime.crowd();
+   if(count===4)expect(runtime.snapshot().transfers).toHaveLength(0);
+   for(const kind of ['review','rework'] as const){
+     runtime.transfer();
+     const snapshot=runtime.snapshot(),present=roomAgents(snapshot,project);
+     expect(present).toHaveLength(count);
+     expect(present.some(a=>a.id===departed)).toBe(false);
+     const previous=snapshot.agents.find(a=>a.id===departed)!;
+     expect(previous.state).toBe('idle');
+     expect(previous.taskId).toBeUndefined();expect(previous.project).toBeUndefined();
+     const base=snapshot.transfers.find(t=>t.id.startsWith('design-transfer-'))!;
+     expect(base.kind).toBe(kind);
+     expect(snapshot.agents.find(a=>a.id===base.to)?.taskId).toBe(base.taskId);
+     expect(snapshot.agents.find(a=>a.id===base.from)?.state).toBe('idle');
+     const handoffs=roomHandoffs(snapshot,project,new Set());
+     expect(handoffs.transfers.map(t=>[t.from,t.to])).toEqual([
+       [employee(1),employee(3)],
+       [employee(2),employee(count===8?7:4)],
+       [departed,employee(count===8?8:2)],
+     ]);
+     expect(new Set(handoffs.transfers.map(t=>t.taskId)).size).toBe(3);
+     expect(handoffs.references).toHaveLength(1);
+     expect(handoffs.references[0]).toMatchObject({id:departed,status:'已离场'});
+     for(const transfer of handoffs.transfers){
+       expect(snapshot.agents.some(a=>a.id===transfer.from)).toBe(true);
+       expect(present.find(a=>a.id===transfer.to)?.taskId).toBe(transfer.taskId);
+       expect(snapshot.events.some(e=>e.id===transfer.id&&e.taskId===transfer.taskId)).toBe(true);
+     }
+     // 快照重复读取保持关系标识，只有新的演示交接才产生新事件。
+     expect(runtime.snapshot().transfers).toEqual(snapshot.transfers);
+   }
+ }
+ expect(JSON.stringify(source)).toBe(before);
+ runtime.reset();store.reset();
+ expect(runtime.snapshot().transfers).toHaveLength(0);
+ expect(store.data.agents.some(a=>String(a.employee).startsWith(project))).toBe(false);
+});
+
 test('4/8 人切换与消息编辑经 HTTP 主动推送，人物图片只开放固定文件',async()=>{
  const store=new DemoStore(seed()),serve=handler(store,origin);
  const reader=(await serve(request('/api/events'))).body!.getReader();await reader.read();
