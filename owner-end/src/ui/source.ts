@@ -72,9 +72,7 @@ async function open(): Promise<Surreal> {
     if (!value) throw new SourceError('unauthorized');
     await db.authenticate(value);
   });
-  db.subscribe('auth', (tokens: unknown) => {
-    if (tokens) session.authenticated();
-  });
+  db.subscribe('connected', () => session.authenticated());
   try {
     await db.connect(cfg.db.url, {
       namespace: cfg.db.namespace,
@@ -160,7 +158,8 @@ export async function readBoardData(): Promise<OwnerBoard> {
 /**
  * 订阅全部老板端表的变更。连上（含断线重连成功）时通知 ['*'] 让页面全量重读；
  * 断线重连后 SDK 会自动重建托管的 LIVE 订阅（ManagedLiveSubscription 在 connected 时重新注册）。
- * 会话可能已过期后重新鉴权时（见 session-keeper.ts），库端旧订阅已不再推送：这里重建全部订阅并全量重读。
+ * LIVE 绑定注册时的会话，会话 15 分钟到期后不再推送：每次定期重新鉴权后（见 session-keeper.ts）在新会话下重建全部订阅；
+ * 会话可能已失效过（休眠、节流）时再全量重读补上空档。
  * 返回的函数关闭订阅（连接保留给数据读取复用）。
  */
 export function openLive(handlers: LiveHandlers): () => void {
@@ -179,24 +178,28 @@ export function openLive(handlers: LiveHandlers): () => void {
       if (!closed && tables.length) handlers.change(tables);
     }, FLUSH_MS);
   };
-  const release = () => {
-    for (const sub of subs.splice(0)) {
+  const drop = (list: typeof subs) => {
+    for (const sub of list) {
       sub.off();
       void sub.kill().catch(() => undefined);
     }
   };
+  const release = () => drop(subs.splice(0));
+  /** 先在当前会话下注册全部新订阅，再撤掉旧的，替换期间不漏推送。 */
   const subscribeAll = async (db: Surreal) => {
-    release();
-    for (const table of LIVE_TABLES) {
-      const live = await db.live(new Table(table)).fields('id');
-      const sub = { off: live.subscribe(() => changed(table)), kill: () => live.kill() };
-      if (closed) {
-        sub.off();
-        await sub.kill().catch(() => undefined);
-        return;
+    const fresh: typeof subs = [];
+    try {
+      for (const table of LIVE_TABLES) {
+        if (closed) break;
+        const live = await db.live(new Table(table)).fields('id');
+        fresh.push({ off: live.subscribe(() => changed(table)), kill: () => live.kill() });
       }
-      subs.push(sub);
+    } catch (error) {
+      drop(fresh);
+      throw error;
     }
+    if (closed) drop(fresh);
+    else drop(subs.splice(0, subs.length, ...fresh));
   };
   const fail = (error: unknown) => {
     if (closed) return;
@@ -227,10 +230,10 @@ export function openLive(handlers: LiveHandlers): () => void {
       sessionLost.add(lost);
       offs.push(() => sessionLost.delete(lost));
       if (keeper) {
-        offs.push(keeper.onLapsed(() => {
+        offs.push(keeper.onRenewed((lapsed) => {
           if (closed) return;
           subscribeAll(db).then(() => {
-            if (closed) return;
+            if (closed || !lapsed) return;
             handlers.state('live');
             handlers.change(['*']);
           }, fail);
