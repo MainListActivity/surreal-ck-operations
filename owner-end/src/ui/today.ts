@@ -40,13 +40,13 @@ const timeOf = (v: unknown): number | undefined => {
 const RANK: Record<DecisionKind, number> = { blocked: 0, confirm: 1, held: 2 };
 
 export function decisionQueue(input: {
-  requirements?: readonly Requirement[];
+  requirements?: ReadonlyArray<Requirement & { stage?: string }>;
   tasks?: readonly TaskLike[];
   dashboard?: RuntimeDashboard;
 }): DecisionItem[] {
   const out: DecisionItem[] = [];
   for (const r of input.requirements ?? []) {
-    const step = nextStep(r);
+    const step = nextStep(r, r.stage);
     if (!step.owner || (step.tone !== 'decide' && step.tone !== 'blocked')) continue;
     const blocked = step.tone === 'blocked';
     out.push({

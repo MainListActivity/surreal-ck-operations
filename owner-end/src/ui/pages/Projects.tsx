@@ -5,8 +5,7 @@ import { EmptyState, ErrorState, Loading, roleText } from '../common.tsx';
 import { REQUIREMENT_GROUPS, inGroup, nextStep, priorityText } from '../iteration.ts';
 import { employeeProgress, messagePreview, roomAgents, staffStatus } from '../meeting-rooms.ts';
 import { hrefOf, type Route } from '../model.ts';
-import { expireObservations } from '../runtime-state.ts';
-import { useDashboard, useRequirements } from '../store.ts';
+import { useLiveDashboard, useRequirements } from '../store.ts';
 import { projectTone } from '../today.ts';
 
 const STAFF_TONE: Record<string, string> = { working: 'progress', blocked: 'blocked', waiting: 'decide', unknown: 'neutral', idle: 'neutral' };
@@ -25,12 +24,12 @@ export function ProjectsPage({ route }: { route: Route }) {
 }
 
 function ProjectList() {
-  const dash = useDashboard();
+  const dash = useLiveDashboard();
   const reqs = useRequirements();
   if (!dash.data) {
     return <div class="page"><h1>项目</h1>{dash.error ? <ErrorState message={dash.error} onRetry={() => void dash.reload()} /> : <Loading />}</div>;
   }
-  const data = expireObservations(dash.data, Date.now());
+  const data = dash.data;
   const projects = data.projects ?? [];
   return (
     <div class="page">
@@ -39,7 +38,7 @@ function ProjectList() {
         <div class="project-grid">
           {projects.map((p) => {
             const people = roomAgents(data, p.id);
-            const waiting = (reqs.data ?? []).filter((r) => r.project === p.id && nextStep(r).owner && nextStep(r).tone === 'decide').length;
+            const waiting = (reqs.data ?? []).filter((r) => r.project === p.id && inGroup(r.state, 'confirm')).length;
             return (
               <a key={p.id} class="project-card" href={hrefOf('projects', p.id)}>
                 <span class="project-card-top">
@@ -86,8 +85,8 @@ function Stage({ agent }: { agent: RuntimeAgentView }) {
   );
 }
 
-function RequirementCard({ r }: { r: Requirement }) {
-  const step = nextStep(r);
+function RequirementCard({ r }: { r: Requirement & { stage?: string } }) {
+  const step = nextStep(r, r.stage);
   return (
     <a class={`req-card${step.owner ? ' needs-you' : ''}`} href={hrefOf('requirements', r.id)}>
       <span class="req-card-title">{r.title}</span>
@@ -101,12 +100,12 @@ function RequirementCard({ r }: { r: Requirement }) {
 }
 
 function ProjectDetail({ id }: { id: string }) {
-  const dash = useDashboard();
+  const dash = useLiveDashboard();
   const reqs = useRequirements();
   if (!dash.data) {
     return <div class="page"><h1>项目</h1>{dash.error ? <ErrorState message={dash.error} onRetry={() => void dash.reload()} /> : <Loading />}</div>;
   }
-  const data = expireObservations(dash.data, Date.now());
+  const data = dash.data;
   const project: RuntimeProjectView | undefined = data.projects?.find((p) => p.id === id);
   const name = project?.name ?? id;
   const people = roomAgents(data, id).sort((a, b) =>

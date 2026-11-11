@@ -3,12 +3,12 @@ import { beginLogin, CALLBACK_PATH, completeLogin, LOGIN_LABEL, LOGIN_HINT } fro
 import { logout, onUnauthorized, readMe, type Me } from './api.ts';
 import { Dialog, NoticeLine, useAction } from './common.tsx';
 import { onDuty } from './meeting-rooms.ts';
-import { agoText, hrefOf, routeOf, SYSTEM_PAGES, withDraft, withoutDraft, type Drafts, type PageId } from './model.ts';
+import { clockText, hrefOf, routeOf, SYSTEM_PAGES, withDraft, withoutDraft, type Drafts, type PageId } from './model.ts';
 import { Palette } from './Palette.tsx';
 import { BoardPage } from './pages/Board.tsx';
 import { ProjectsPage } from './pages/Projects.tsx';
 import { TodayPage } from './pages/Today.tsx';
-import { resetShared, useDashboard, useDispatch, useRequirements, useTasks } from './store.ts';
+import { resetShared, useDispatch, useLiveDashboard, useRequirements, useTasks } from './store.ts';
 import { decisionQueue, projectTone } from './today.ts';
 import { NotesPage } from './pages/Notes.tsx';
 import { OpsPage } from './pages/Ops.tsx';
@@ -30,15 +30,15 @@ function LiveIndicator() {
 
 /** 执行端（老板的电脑）是否在线：取各主机最近一次心跳。 */
 function ExecutorStatus() {
-  const { data } = useDashboard();
+  // 过期按心跳截止时间本地判断：执行端掉线后不再有推送，这里也会转为离线。
+  const { data } = useLiveDashboard();
   if (!data) return null;
   const online = data.hosts.filter((h) => h.state === 'online');
   const last = Math.max(0, ...data.hosts.map((h) => h.at ?? 0));
   return (
-    <span class="top-status" title={online.map((h) => h.name).join('、') || undefined}>
+    <span class="top-status" title={last ? `最近心跳 ${clockText(last)}` : undefined}>
       <span class={`dot is-${online.length ? 'done' : 'blocked'}`} aria-hidden="true" />
-      {online.length ? '执行端在线' : '执行端离线'}
-      {last ? <span class="top-muted"> · 心跳 {agoText(last, data.at)}</span> : null}
+      {online.length ? '执行端在线' : last ? `执行端离线 · 最近心跳 ${clockText(last)}` : '执行端未上报'}
     </span>
   );
 }
@@ -51,11 +51,13 @@ function DispatchToggle() {
   if (!data) return null;
   const toggle = () => void action.run(data.paused ? 'task.resume' : 'task.pause', {}, data.paused ? '已恢复派工' : '已暂停派工。在途执行不受影响。', () => { setConfirm(false); return reload(); });
   return (
-    <span class="top-status">
-      <span class={`dot is-${data.paused ? 'blocked' : 'running'}`} aria-hidden="true" />
-      {data.paused ? '派工已暂停' : '派工运行中'}
-      <button type="button" class="ghost tiny" disabled={action.busy} onClick={() => (data.paused ? toggle() : setConfirm(true))}>{data.paused ? '恢复' : '暂停'}</button>
-      {action.notice?.tone === 'err' ? <NoticeLine notice={action.notice} onClose={() => action.setNotice(null)} /> : null}
+    <>
+      <span class="top-status">
+        <span class={`dot is-${data.paused ? 'blocked' : 'running'}`} aria-hidden="true" />
+        {data.paused ? '派工已暂停' : '派工运行中'}
+        <button type="button" class="ghost tiny" disabled={action.busy} onClick={() => (data.paused ? toggle() : setConfirm(true))}>{data.paused ? '恢复' : '暂停'}</button>
+      </span>
+      {action.notice?.tone === 'err' ? <div class="top-notice"><NoticeLine notice={action.notice} onClose={() => action.setNotice(null)} /></div> : null}
       {confirm ? (
         <Dialog title="暂停全公司派工？" onClose={() => setConfirm(false)} footer={(
           <>
@@ -66,12 +68,12 @@ function DispatchToggle() {
           <p>暂停后调度器不再派出新任务；员工手上的执行继续做完。需求本身的状态不变。</p>
         </Dialog>
       ) : null}
-    </span>
+    </>
   );
 }
 
 function TodayCount() {
-  const dash = useDashboard();
+  const dash = useLiveDashboard();
   const reqs = useRequirements();
   const tasks = useTasks();
   const n = decisionQueue({ requirements: reqs.data, tasks: tasks.data, dashboard: dash.data }).length;
@@ -79,7 +81,7 @@ function TodayCount() {
 }
 
 function ProjectLinks({ current }: { current?: string }) {
-  const { data } = useDashboard();
+  const { data } = useLiveDashboard();
   const projects = data?.projects ?? [];
   if (!projects.length) return null;
   return (

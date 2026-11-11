@@ -197,7 +197,8 @@ input[type="checkbox"], input[type="radio"] { width: 16px; height: 16px; margin:
 }
 .top-right { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; margin-left: auto; }
 .top-status { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--text-2); white-space: nowrap; }
-.top-status .notice { position: absolute; top: 52px; right: 24px; z-index: 30; box-shadow: var(--shadow-lg); }
+.top-notice { position: absolute; top: 52px; right: 24px; z-index: 30; max-width: 420px; }
+.top-notice .notice { box-shadow: var(--shadow-lg); background: var(--surface); }
 .top-muted { color: var(--muted); }
 button.tiny { min-height: 26px; padding: 0 8px; font-size: 12.5px; }
 .main { min-width: 0; padding: 32px 40px 72px; outline: none; flex: 1; }
@@ -233,7 +234,7 @@ button.tiny { min-height: 26px; padding: 0 8px; font-size: 12.5px; }
 .sub-head { font-size: 13px; color: var(--muted); margin: 16px 0 6px; }
 .panel > .sub-head:first-child { margin-top: 0; }
 .more-link { font-size: 13px; font-weight: 500; }
-.jump-bar { display: flex; flex-wrap: wrap; gap: 6px; position: sticky; top: 0; z-index: 4; padding: 8px 0; background: var(--bg); }
+.jump-bar { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 0; }
 .jump-bar a { padding: 3px 10px; border-radius: 999px; background: var(--surface-2); color: var(--text-2); font-size: 12.5px; text-decoration: none; }
 .jump-bar a:hover { background: var(--surface-3); color: var(--text); text-decoration: none; }
 .section-title { font-size: 15px; margin: 8px 0 0; }
@@ -1108,4 +1109,11 @@ label.inline input:not([type="checkbox"]), label.inline select { width: auto; }
   .decision-action { align-self: flex-start; min-height: 40px; }
   .top-status .top-muted { display: none; }
   .main { padding: 20px 16px 48px; }
+}
+
+/* 键盘焦点：放在所有按钮、标签样式之后，保证每个可聚焦元素都有可见的焦点环。 */
+button:focus-visible, a.button:focus-visible, .filter-tab:focus-visible, .search-trigger:focus-visible,
+.nav-link:focus-visible, .nav-sub-link:focus-visible, .system-tab:focus-visible, .view-switch .seg:focus-visible,
+.req-card:focus-visible, .project-card:focus-visible, .line-row:focus-visible, .project-line:focus-visible, .palette-item:focus-visible {
+  outline: none; box-shadow: var(--focus), var(--ring);
 }

@@ -2,8 +2,7 @@ import type { RuntimeAgentView, RuntimeDelivery } from '../../../../src/runtime-
 import { ErrorState, Loading, roleText } from '../common.tsx';
 import { employeeProgress, onDuty, staffStatus } from '../meeting-rooms.ts';
 import { hrefOf } from '../model.ts';
-import { expireObservations } from '../runtime-state.ts';
-import { useDashboard, useRequirements, useTasks } from '../store.ts';
+import { useLiveDashboard, useRequirements, useTasks } from '../store.ts';
 import { decisionQueue, friendlyTime, pausedCount, projectTone, type DecisionItem } from '../today.ts';
 
 const DELIVERY: Record<RuntimeDelivery['status'], { label: string; tone: string }> = {
@@ -61,7 +60,7 @@ function Worker({ agent }: { agent: RuntimeAgentView }) {
 }
 
 export function TodayPage() {
-  const dash = useDashboard();
+  const dash = useLiveDashboard();
   const reqs = useRequirements();
   const tasks = useTasks();
   const snapshot = dash.data;
@@ -75,7 +74,7 @@ export function TodayPage() {
     );
   }
   const now = snapshot?.at ?? Date.now();
-  const data = snapshot ? expireObservations(snapshot, Date.now()) : undefined;
+  const data = snapshot;
   const names = new Map((data?.projects ?? []).map((p) => [p.id, p.name]));
   const queue = decisionQueue({ requirements: reqs.data, tasks: tasks.data, dashboard: data });
   const working = (data?.agents ?? []).filter(onDuty);

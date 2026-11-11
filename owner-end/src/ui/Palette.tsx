@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { hrefOf, taskIdOf } from './model.ts';
-import { useDashboard, useRequirements, useTasks } from './store.ts';
+import { useLiveDashboard, useRequirements, useTasks } from './store.ts';
 
 interface Entry { key: string; group: string; label: string; hint?: string; href: string }
 
@@ -28,7 +28,7 @@ export function Palette({ onClose }: { onClose(): void }) {
   const [query, setQuery] = useState('');
   const [cursor, setCursor] = useState(0);
   const input = useRef<HTMLInputElement>(null);
-  const dash = useDashboard();
+  const dash = useLiveDashboard();
   const reqs = useRequirements();
   const tasks = useTasks();
 
