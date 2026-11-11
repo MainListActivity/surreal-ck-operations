@@ -6,6 +6,11 @@ import { parseSnapshot, withDesignCases, DESIGN_TAG } from './data.ts';
 
 export const CSP="default-src 'self'; script-src 'self'; connect-src 'self'; style-src 'self'; img-src 'self' data: blob:; font-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 const root=resolve(import.meta.dir,'..');
+const legacyImages=new Map([
+  ['/people/team-atlas.png','/people/team-atlas.4e778a21bb0b.webp'],
+  ['/people/meeting-room.png','/people/meeting-room.587f3ad68e38.webp'],
+  ['/people/office-closeup.png','/people/office-closeup.78cbb5a011ed.webp'],
+]);
 export async function buildDemo(){
   const result=await Bun.build({entrypoints:[resolve(root,'src/ui/main.tsx')],target:'browser',jsx:{importSource:'preact'},plugins:[{name:'local-design-auth',setup(build){build.onResolve({filter:/^\.\/auth\.ts$/},args=>args.importer.includes('/src/ui/')?{path:resolve(import.meta.dir,'auth.ts')}:undefined);}}]});
   if(!result.success)throw Error(result.logs.map(String).join('\n'));
@@ -61,9 +66,10 @@ export function handler(store:DemoStore,origin:string,build=buildDemo){
       else if(url.pathname==='/api/board')response=json({ok:true,result:store.board()});
       else if(url.pathname==='/app.js')response=new Response(await build(),{headers:{'content-type':'text/javascript'}});
       else if(url.pathname==='/app.css')response=new Response(Bun.file(resolve(root,'public/app.css')));
-      else if(url.pathname==='/people/office-closeup.png')response=new Response(Bun.file(resolve(root,'public/people/office-closeup.png')));
-      else if(url.pathname==='/people/meeting-room.png')response=new Response(Bun.file(resolve(root,'public/people/meeting-room.png')));
-      else if(url.pathname==='/people/team-atlas.png')response=new Response(Bun.file(resolve(root,'public/people/team-atlas.png')),{headers:{'content-type':'image/png'}});
+      else if(legacyImages.has(url.pathname))response=new Response(null,{status:302,headers:{location:legacyImages.get(url.pathname)!}});
+      else if(url.pathname==='/people/office-closeup.78cbb5a011ed.webp')response=new Response(Bun.file(resolve(root,'public/people/office-closeup.78cbb5a011ed.webp')));
+      else if(url.pathname==='/people/meeting-room.587f3ad68e38.webp')response=new Response(Bun.file(resolve(root,'public/people/meeting-room.587f3ad68e38.webp')));
+      else if(url.pathname==='/people/team-atlas.4e778a21bb0b.webp')response=new Response(Bun.file(resolve(root,'public/people/team-atlas.4e778a21bb0b.webp')),{headers:{'content-type':'image/webp'}});
       else if(url.pathname==='/demo.css')response=new Response('.design-banner{position:relative;z-index:30;padding:8px 20px;background:#fdf2de;color:#6b3f00;border-bottom:1px solid #efd29c;font:13px/1.5 "PingFang SC","Microsoft YaHei",system-ui,sans-serif;display:flex;gap:6px 16px;align-items:center;flex-wrap:wrap}.design-banner strong{font-weight:600}.design-banner button{min-height:28px;padding:3px 12px;font-size:13px}',{headers:{'content-type':'text/css'}});
       else if(url.pathname==='/demo-controls.js')response=new Response("document.getElementById('demo-reset').onclick=async()=>{await fetch('/api/demo/reset',{method:'POST'});location.reload()}",{headers:{'content-type':'text/javascript'}});
       else if(url.pathname==='/'){

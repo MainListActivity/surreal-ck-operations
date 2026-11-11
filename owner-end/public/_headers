@@ -1,0 +1,10 @@
+# Only content-addressed scene images may be cached immutably.
+
+/people/team-atlas.4e778a21bb0b.webp
+  Cache-Control: public, max-age=31536000, immutable
+
+/people/meeting-room.587f3ad68e38.webp
+  Cache-Control: public, max-age=31536000, immutable
+
+/people/office-closeup.78cbb5a011ed.webp
+  Cache-Control: public, max-age=31536000, immutable
