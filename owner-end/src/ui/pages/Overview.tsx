@@ -93,7 +93,9 @@ function TimeProgress({
         </b>
       </div>
       {!compact ? (
-        <progress
+        text && value === undefined ? (
+          <div class="eta-window" role="img" aria-label={`预计结束窗口：${text}`} />
+        ) : <progress
           max={100}
           value={value}
           aria-label="参考耗时"

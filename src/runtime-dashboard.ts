@@ -80,6 +80,8 @@ export interface RuntimePendingMessage {
 export interface RuntimeTransfer {
   id: string;
   taskId: string;
+  /** Task ownership is stable even when the sender starts work in another project. */
+  projectId?: string;
   title: string;
   from: string;
   to: string;
@@ -401,6 +403,7 @@ export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): R
       transfers.push({
         id: key(m.id),
         taskId,
+        ...(taskMap.has(taskId) ? { projectId: key(taskMap.get(taskId)?.project_ref) || 'company-unassigned' } : {}),
         title: String(taskMap.get(taskId)?.title ?? taskId),
         from: key(from.sent_to),
         to,

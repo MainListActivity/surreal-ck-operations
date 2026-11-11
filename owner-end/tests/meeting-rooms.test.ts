@@ -3,7 +3,7 @@ import type {RuntimeAgentView,RuntimeDashboard,RuntimeTransfer} from '../../src/
 import {onDuty,roomAgents,roomHandoffs,staffStatus,portraitIndex,finishText} from '../src/ui/meeting-rooms.ts';
 import {employeeProgress} from '../../src/runtime-projects.ts';
 const a=(state:RuntimeAgentView['state'],extra:Partial<RuntimeAgentView>={}):RuntimeAgentView=>({id:'e',name:'工程',role:'engineering',hostId:'local',state,modelSource:'unknown',action:'',...extra});
-const transfer=(extra:Partial<RuntimeTransfer>={}):RuntimeTransfer=>({id:'delivery',taskId:'t',title:'实现功能',from:'developer',to:'reviewer',at:10,kind:'review',label:'交付复核',...extra});
+const transfer=(extra:Partial<RuntimeTransfer>={}):RuntimeTransfer=>({id:'delivery',taskId:'t',projectId:'p',title:'实现功能',from:'developer',to:'reviewer',at:10,kind:'review',label:'交付复核',...extra});
 const project={id:'p',name:'项目'};
 const handoffData=(agents:RuntimeAgentView[],transfers:RuntimeTransfer[]):RuntimeDashboard=>({agents,transfers} as RuntimeDashboard);
 
@@ -46,6 +46,22 @@ test('返工只显示该任务最新方向；时间相同按 ID 稳定选择，�
   // The latest delivery moved to other employees; an old matching endpoint is not enough.
   data.transfers.push(transfer({id:'elsewhere',at:3,from:'other-one',to:'other-two'}));
   expect(roomHandoffs(data,'p',new Set(['review']))).toEqual({transfers:[],references:[]});
+});
+
+test('交接动画不能跟随发送员工串到新项目，旧快照仅从当前任务推断项目',()=>{
+  const data=handoffData([
+    a('running',{id:'developer',taskId:'next-task',project:{id:'other',name:'新项目'}}),
+    a('running',{id:'reviewer',taskId:'t',project}),
+  ],[transfer()]);
+  const active=new Set(['delivery']);
+  expect(roomHandoffs(data,'p',active).transfers).toHaveLength(1);
+  expect(roomHandoffs(data,'other',active)).toEqual({transfers:[],references:[]});
+  data.transfers[0]!.projectId=undefined;
+  expect(roomHandoffs(data,'p',active).transfers).toHaveLength(1);
+  expect(roomHandoffs(data,'other',active).transfers).toHaveLength(0);
+  data.agents[1]!.taskId='next-review';
+  expect(roomHandoffs(data,'p',active).transfers).toHaveLength(0);
+  expect(roomHandoffs(data,'other',active).transfers).toHaveLength(0);
 });
 
 test('跨项目员工、失联员工和已删除档案使用明确身份状态，同一参考人去重',()=>{

@@ -213,6 +213,8 @@ test('已送达交付、返工与链上交接有方向；notice 和草稿不能�
     ['qa', 'dev', 'rework'],
     ['dev', 'qa', 'handoff'],
   ]);
+  input.tasks[0]!.project_ref = 'original-project';
+  expect(buildRuntimeDashboard(input, now).transfers[0]?.projectId).toBe('original-project');
 });
 
 test('CPU 首样本未知，后续按累计时间差计算，时钟重置不输出假指标', () => {

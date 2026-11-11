@@ -56,10 +56,20 @@ export function roomHandoffs(
       latest.set(transfer.taskId, transfer);
   }
   const transfers = [...latest.values()]
-    .filter((transfer) => [transfer.from, transfer.to].some((id) => {
-      const agent = present.get(id);
-      return agent && (agent.taskId === transfer.taskId || active.has(transfer.id));
-    }))
+    .filter((transfer) => {
+      // Older snapshots can infer ownership only from an endpoint still doing this task.
+      const matchingProjects = new Set([transfer.from, transfer.to].flatMap((id) => {
+        const agent = employees.get(id);
+        return agent && onDuty(agent) && agent.taskId === transfer.taskId ? [roomId(agent)] : [];
+      }));
+      const ownerProject = transfer.projectId ??
+        (matchingProjects.size === 1 ? [...matchingProjects][0] : undefined);
+      if (ownerProject !== projectId) return false;
+      return [transfer.from, transfer.to].some((id) => {
+        const agent = present.get(id);
+        return agent && (agent.taskId === transfer.taskId || active.has(transfer.id));
+      });
+    })
     .sort((a, b) => a.at - b.at || a.id.localeCompare(b.id));
   const references = new Map<string, RoomHandoffReference>();
   for (const transfer of transfers) {

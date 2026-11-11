@@ -411,6 +411,7 @@ export class DemoRuntime {
       ? {
           id: `design-transfer-${this.sequence}`,
           taskId,
+          projectId: recordKey(task?.project) || 'company-unassigned',
           title: String(task?.title ?? '设计案例任务'),
           from: String(reverse ? reviewer!.employee : engineer!.employee),
           to: String(reverse ? engineer!.employee : reviewer!.employee),
@@ -442,6 +443,7 @@ export class DemoRuntime {
         transfers.push({
           id: `${CROWD}-transfer-${this.crowdCount}-${this.sequence}-${index + 1}`,
           taskId: receiver.taskId,
+          projectId: CROWD,
           title: receiver.taskTitle ?? '【设计案例】并行协作交接',
           from: example.from,
           to: example.to,
