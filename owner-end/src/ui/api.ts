@@ -6,6 +6,7 @@ import type { RuntimeDashboard } from '../../../src/runtime-dashboard.ts';
 import { accessToken, clearSession, signOutLocal, type Fetcher } from './auth.ts';
 import { errorText } from './model.ts';
 import type { OwnerBoard } from './types.ts';
+import { readBoardData, readDashboardData, SourceError } from './source.ts';
 
 export type Outcome<T> =
   | { kind: 'ok'; result: T }
@@ -106,7 +107,19 @@ export function runCommand<T = unknown>(command: string, input: Record<string, u
   return call<T>('/api/cmd', 'POST', { command, input });
 }
 
-export const readBoard = (): Promise<Outcome<OwnerBoard>> => call<OwnerBoard>('/api/board', 'GET');
+/** 直连公司库读取（见 source.ts），失败按 HTTP 版的同一套分类返回。 */
+async function fromSource<T>(read: () => Promise<T>): Promise<Outcome<T>> {
+  try {
+    return { kind: 'ok', result: await read() };
+  } catch (error) {
+    if (error instanceof SourceError && error.code === 'unauthorized') return unauthorized();
+    if (error instanceof SourceError && error.code === 'unavailable')
+      return { kind: 'error', status: 503, code: 'unavailable', message: error.message };
+    return networkError();
+  }
+}
+
+export const readBoard = (): Promise<Outcome<OwnerBoard>> => fromSource(readBoardData);
 
 /**
  * 当前登录的老板。令牌无效返回 undefined；非老板（403）抛出可显示的中文原因；其它失败同样抛出。
@@ -131,4 +144,4 @@ export function outcomeText<T>(out: Outcome<T>, okText: string): string {
   return errorText(out);
 }
 
-export const readDashboard = (): Promise<Outcome<RuntimeDashboard>> => call<RuntimeDashboard>('/api/dashboard', 'GET');
+export const readDashboard = (): Promise<Outcome<RuntimeDashboard>> => fromSource(readDashboardData);

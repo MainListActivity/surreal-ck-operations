@@ -12,6 +12,14 @@ export interface AuthConfig {
   authorizeUrl: string;
   tokenUrl: string;
   audience: string;
+  /** 公司库地址；页面以老板令牌直连。缺失时页面无法读取数据。 */
+  db?: DbConfig;
+}
+
+export interface DbConfig {
+  url: string;
+  namespace: string;
+  database: string;
 }
 
 export interface Session {

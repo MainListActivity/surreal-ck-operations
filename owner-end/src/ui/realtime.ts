@@ -1,29 +1,12 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { accessToken } from './auth.ts';
 import { outcomeOf } from './api.ts';
-export type LiveState = 'connecting' | 'live' | 'offline';
+import { openLive, type LiveState } from './source.ts';
+export type { LiveState };
 type Listener = (tables: string[]) => void;
-/** 心跳超时只重建实时连接；不会以定时查询业务数据作为降级。 */
-export async function readLiveChunk(
-  reader: { read(): Promise<{ done: boolean; value?: Uint8Array }> },
-  timeoutMs = 45_000,
-) {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      reader.read(),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(Error('live heartbeat timeout')), timeoutMs);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
 const listeners = new Set<Listener>();
 const stateListeners = new Set<(s: LiveState) => void>();
 let state: LiveState = 'connecting';
-let abort: AbortController | undefined;
+let close: (() => void) | undefined;
 let reconnect: ReturnType<typeof setTimeout> | undefined;
 let failures = 0;
 const status = (s: LiveState) => {
@@ -33,97 +16,47 @@ const status = (s: LiveState) => {
 const broadcast = (tables: string[]) => {
   for (const fn of listeners) fn(tables);
 };
-/** SSE 的块可以跨网络分片；心跳不产生业务刷新。 */
-export function parseLiveFrame(frame: string): { event: string; tables?: string[] } {
-  const lines = frame.split('\n');
-  const event =
-    lines
-      .find((l) => l.startsWith('event:'))
-      ?.slice(6)
-      .trim() ?? 'message';
-  const data = lines
-    .filter((l) => l.startsWith('data:'))
-    .map((l) => l.slice(5).trim())
-    .join('\n');
-  try {
-    const parsed = JSON.parse(data);
-    return { event, tables: Array.isArray(parsed.tables) ? parsed.tables : undefined };
-  } catch {
-    return { event };
-  }
+function stop() {
+  clearTimeout(reconnect);
+  reconnect = undefined;
+  close?.();
+  close = undefined;
 }
-async function connect() {
-  if (abort || !listeners.size) return;
-  const own = new AbortController();
-  abort = own;
-  status('connecting');
-  try {
-    const token = await accessToken();
-    if (!token) {
-      await outcomeOf(new Response('', { status: 401 }));
-      return;
-    }
-    const response = await fetch('/api/events', {
-      headers: { Authorization: `Bearer ${token}`, Accept: 'text/event-stream' },
-      signal: own.signal,
-    });
-    if (response.status === 401) {
-      await outcomeOf(response);
-      return;
-    }
-    if (!response.ok || !response.body) throw Error('stream');
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    try {
-      while (!own.signal.aborted) {
-        const { value, done } = await readLiveChunk(reader);
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true }).replace(/\r/g, '');
-        if (buffer.length > 65536) throw Error('frame');
-        let end: number;
-        while ((end = buffer.indexOf('\n\n')) >= 0) {
-          const msg = parseLiveFrame(buffer.slice(0, end));
-          buffer = buffer.slice(end + 2);
-          if (msg.event === 'ready') {
-            failures = 0;
-            status('live');
-            broadcast(['*']);
-          } else if (msg.event === 'change') broadcast(msg.tables ?? []);
-          else if (msg.event === 'unavailable' || msg.event === 'reconnect')
-            throw Error('reconnect');
-        }
-      }
-    } finally {
-      await reader.cancel().catch(() => undefined);
-      reader.releaseLock();
-    }
-  } catch {
-    /* 状态在 finally 统一反馈；无业务轮询回退。 */
-  } finally {
-    if (abort === own) abort = undefined;
-    if (!own.signal.aborted && listeners.size) {
+/**
+ * 全页面一条实时订阅（生产：浏览器直连公司库的 LIVE；设计模式：本地 SSE）。
+ * 断线后由 SDK 自动重连；只有首次建立失败才在这里按退避重开。没有业务轮询回退。
+ */
+function connect() {
+  if (close || !listeners.size) return;
+  close = openLive({
+    change(tables) {
+      if (tables.includes('*')) failures = 0;
+      broadcast(tables);
+    },
+    state: status,
+    unauthorized() {
+      stop();
       status('offline');
-      reconnect = setTimeout(
-        () => {
-          reconnect = undefined;
-          void connect();
-        },
-        Math.min(30000, 1000 * 2 ** Math.min(failures++, 5)),
-      );
-    }
-  }
+      void outcomeOf(new Response('', { status: 401 }));
+    },
+    failed() {
+      stop();
+      status('offline');
+      if (!listeners.size) return;
+      reconnect = setTimeout(() => {
+        reconnect = undefined;
+        connect();
+      }, Math.min(30000, 1000 * 2 ** Math.min(failures++, 5)));
+    },
+  });
 }
 function subscribe(fn: Listener) {
   listeners.add(fn);
-  void connect();
+  connect();
   return () => {
     listeners.delete(fn);
     if (!listeners.size) {
-      clearTimeout(reconnect);
-      reconnect = undefined;
-      abort?.abort();
-      abort = undefined;
+      stop();
       status('offline');
     }
   };

@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import type { Surreal } from 'surrealdb';
 import { LIVE_TABLES, ownerEventStream, subscribeOwnerChanges } from '../src/realtime.ts';
-import { parseLiveFrame, readLiveChunk } from '../src/ui/realtime.ts';
+import { parseLiveFrame, readLiveChunk } from '../src/ui/sse.ts';
 import { expireObservations, remainingText } from '../src/ui/runtime-state.ts';
 import type { RuntimeAgentView } from '../../src/runtime-dashboard.ts';
 import { DemoRuntime } from '../demo/runtime.ts';

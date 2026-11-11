@@ -1,29 +1,7 @@
 import { Table, type LiveSubscription, type Surreal } from 'surrealdb';
 
-export const LIVE_TABLES = [
-  'task',
-  'employee',
-  'agent_activity',
-  'audit',
-  'acceptance_evidence',
-  'runner_heartbeat',
-  'company_meta',
-  'outbound_message',
-  'product_requirement',
-  'product_feedback',
-  'product_iteration',
-  'project',
-  'requirement_plan',
-  'requirement_execution',
-  'requirement_approval',
-  'ops_job',
-  'ops_audit',
-  'lane_note',
-  'note_consolidation',
-  'agent_policy',
-  'agent_identity',
-  'protected_command',
-] as const;
+import { LIVE_TABLES } from './live-tables.ts';
+export { LIVE_TABLES };
 /** 只传失效通知，不把 LIVE 记录正文/凭证发送给页面。每个连接使用老板自己的数据库身份。 */
 export async function subscribeOwnerChanges(
   db: Surreal,
