@@ -71,7 +71,7 @@ const runtime = new NativeRuntime({ root: join(serviceHome(), 'native', hostId),
     const inst = (await ctx.workforce.insts()).find(i => i.id === session.labels.employee_id);
     if (!inst || !ctx.sidecar.canReuse(inst)) throw new Error('员工身份或 sidecar 通道不可用');
     const channel = ctx.sidecar.env(inst);
-    const modelEnv = employeeModelEnv({ agentId: session.id, provider: session.provider, env: channel }, ctx.sidecar, serviceHome());
+    const modelEnv = employeeModelEnv({ agentId: session.id, provider: session.provider, env: channel, runtime: 'native' }, ctx.sidecar, serviceHome());
     const inherited = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
     return { ...inherited, ...scrubEnv(channel), ...SANDBOX_MARKER, ...modelEnv, PASEO_AGENT_ID: "", ZDOTDIR: zdotdir };
   },
