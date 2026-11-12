@@ -6,7 +6,8 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AgentRuntime, SpawnInput, RuntimeWorkspace, TurnEnded } from './contracts.ts';
 
-export type NativeProvider = 'factory-droid' | 'claude' | 'codex';
+import { nativeArgs, type NativeProvider } from './native-args.ts';
+export { nativeArgs, type NativeProvider };
 export interface NativeSession {
   id: string; host: string; provider: NativeProvider; nativeSessionId?: string;
   title: string; cwd: string; model: string; thinking?: string; mode?: string;
@@ -30,23 +31,6 @@ export interface NativeOptions {
 }
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code !== 'ESRCH'; } };
 const supported = (provider: string): provider is NativeProvider => ['factory-droid', 'claude', 'codex'].includes(provider);
-
-/** CLI 参数来自原生非交互入口，不经 ACP，不把 prompt 放在进程参数中。 */
-export function nativeArgs(s: Pick<NativeSession, 'provider' | 'nativeSessionId' | 'model' | 'thinking' | 'mode'>): string[] {
-  const model = s.model ? ['--model', s.model] : [];
-  if (s.provider === 'factory-droid') return ['exec', '--output-format', 'stream-json', ...model,
-    ...(s.mode === 'auto-high' ? ['--auto', 'high'] : []),
-    ...(s.thinking ? ['--reasoning-effort', s.thinking] : []),
-    ...(s.nativeSessionId ? ['--session-id', s.nativeSessionId] : [])];
-  if (s.provider === 'claude') return ['-p', '--output-format', 'stream-json', '--verbose', ...model,
-    ...(s.thinking ? ['--effort', s.thinking] : []),
-    ...(s.mode === 'bypassPermissions' ? ['--permission-mode', 'bypassPermissions'] : []),
-    ...(s.nativeSessionId ? ['--resume', s.nativeSessionId] : [])];
-  return ['exec', ...(s.nativeSessionId ? ['resume', s.nativeSessionId] : []), '--json', '--skip-git-repo-check', ...model,
-    ...(s.thinking ? ['-c', `model_reasoning_effort=${JSON.stringify(s.thinking)}`] : []),
-    // 无人值守权限由外层员工沙箱承担，沿用已授权的 full-access 模式。
-    ...(s.mode === 'full-access' ? ['--dangerously-bypass-approvals-and-sandbox'] : []), '-'];
-}
 
 export interface NativeResult { sessionId?: string; completed: boolean; error?: string; text: string; inputTokens?: number }
 /** 只识别正式终态；空输出、任意 stdout、只有 assistant 文本均不能算完成。 */

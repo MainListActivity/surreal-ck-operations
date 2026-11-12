@@ -42,6 +42,8 @@ export interface EmployeeDef {
    */
   quotaLimited?: boolean;
   errorStreak: number;
+  /** 停用原因（老板停用或连续会话异常自动停用）；只在停用时有。 */
+  disabledReason?: string;
 }
 
 export interface ChainWorkspace { cwd: string; id: string }
@@ -390,13 +392,14 @@ export class Workforce {
 
   async defs(): Promise<EmployeeDef[]> {
     type Row = { id: RecordId; role: Role; provider: string; model: string; thinking?: string; tracks?: string[]; enabled: boolean;
-      max_instances: number; priority: number; weight?: number; quota_limited?: boolean; error_streak?: number };
+      max_instances: number; priority: number; weight?: number; quota_limited?: boolean; error_streak?: number; disabled_reason?: string };
     const [rows] = await this.db.query<[Row[]]>('SELECT * FROM employee_def ORDER BY weight DESC, priority, id;');
     return rows.map(r => ({ id: asId(r.id), role: r.role, provider: r.provider, model: r.model, thinking: r.thinking ?? undefined,
       tracks: r.tracks ?? undefined,
       enabled: r.enabled !== false, maxInstances: r.max_instances ?? 1, priority: r.priority ?? 100,
       weight: r.weight ?? 10, quotaLimited: r.quota_limited === false ? false : undefined,
-      errorStreak: r.error_streak ?? 0 }));
+      errorStreak: r.error_streak ?? 0,
+      ...(r.enabled === false && typeof r.disabled_reason === 'string' && r.disabled_reason ? { disabledReason: r.disabled_reason } : {}) }));
   }
 
   async defFailure(defId: string): Promise<number> {

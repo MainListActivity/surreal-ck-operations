@@ -2,7 +2,9 @@ import { useLiveRefresh } from '../realtime.ts';
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { outcomeText, runCommand } from '../api.ts';
 import { Empty, NoticeLine, PageHeader, Panel, roleText, useAction } from '../common.tsx';
-import { splitLines } from '../model.ts';
+import { LANG_OPTIONS, langLabel } from '../lang.ts';
+import { CommandPicker, CommandSelect } from '../CommandPicker.tsx';
+import { DefList, type DefRow } from './StaffDefs.tsx';
 
 export interface RolePolicy {
   disabled: boolean;
@@ -49,17 +51,23 @@ interface GuardList {
 export function StaffPage() {
   const [roles, setRoles] = useState<RoleRow[]>();
   const [roleError, setRoleError] = useState<string>();
+  const [defs, setDefs] = useState<DefRow[]>([]);
   const [guard, setGuard] = useState<GuardList>();
   const [guardError, setGuardError] = useState<string>();
 
   const loadRoles = useCallback(async () => {
-    const out = await runCommand<{ roles?: RoleRow[] }>('agent.list');
+    const [out, defOut] = await Promise.all([
+      runCommand<{ roles?: RoleRow[] }>('agent.list'),
+      runCommand<{ defs?: DefRow[] }>('def.list'),
+    ]);
     if (out.kind === 'ok') {
       setRoles(out.result.roles ?? []);
       setRoleError(undefined);
     } else {
       setRoleError(outcomeText(out, ''));
     }
+    if (defOut.kind === 'ok') setDefs(defOut.result.defs ?? []);
+    else setRoleError(`员工定义读取失败：${outcomeText(defOut, '')}`);
   }, []);
 
   const loadGuard = useCallback(async () => {
@@ -83,13 +91,13 @@ export function StaffPage() {
     <div class="page">
       <PageHeader title="员工与权限" description="按职能设置命令范围与译文语言，对该职能的所有员工生效；修改会写入审计。" />
       <nav class="jump-bar" aria-label="页内导航"><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-agents')?.scrollIntoView({ behavior: 'smooth' }); }}>职能策略</a><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-guard')?.scrollIntoView({ behavior: 'smooth' }); }}>受保护命令</a><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-locked')?.scrollIntoView({ behavior: 'smooth' }); }}>固定限制</a></nav>
-      <Panel id="staff-agents" title="职能" hint="每轮会话都会新开员工实例，所以策略按职能保存：停用、允许/拒绝清单与译文语言对这个职能的所有员工生效。">
+      <Panel id="staff-agents" title="职能" hint="每轮会话都会新开员工实例，所以策略按职能保存：停用、允许/拒绝清单与译文语言对这个职能的所有员工生效。员工定义决定这个职能由哪些 CLI 与模型来干活。">
         {roleError ? <p class="notice err">职能列表读取失败：{roleError}</p> : null}
         {roles === undefined && !roleError ? <p class="hint">正在读取职能…</p> : null}
         {roles && roles.length === 0 ? <Empty>还没有员工定义</Empty> : null}
         {roles && roles.length > 0 ? (
           <div class="grid">
-            {roles.map(r => <RoleCard key={r.role} row={r} onChanged={() => void loadRoles()} />)}
+            {roles.map(r => <RoleCard key={r.role} row={r} defs={defs.filter(d => d.role === r.role)} allDefs={defs} onChanged={() => void loadRoles()} />)}
           </div>
         ) : null}
       </Panel>
@@ -150,21 +158,21 @@ export function StaffPage() {
   );
 }
 
-function RoleCard({ row, onChanged }: { row: RoleRow; onChanged(): void }) {
+function RoleCard({ row, defs, allDefs, onChanged }: { row: RoleRow; defs: DefRow[]; allDefs: DefRow[]; onChanged(): void }) {
   const p = row.policy;
   const [open, setOpen] = useState(false);
   const [disabled, setDisabled] = useState(p.disabled);
   const [unrestricted, setUnrestricted] = useState(p.allow === null);
-  const [allow, setAllow] = useState((p.allow ?? []).join('\n'));
-  const [deny, setDeny] = useState(p.deny.join('\n'));
+  const [allow, setAllow] = useState<string[]>(p.allow ?? []);
+  const [deny, setDeny] = useState<string[]>(p.deny);
   const [lang, setLang] = useState(p.lang ?? '');
   const { busy, notice, run } = useAction();
 
   const openEditor = () => {
     setDisabled(p.disabled);
     setUnrestricted(p.allow === null);
-    setAllow((p.allow ?? []).join('\n'));
-    setDeny(p.deny.join('\n'));
+    setAllow(p.allow ?? []);
+    setDeny(p.deny);
     setLang(p.lang ?? '');
     setOpen(o => !o);
   };
@@ -172,15 +180,16 @@ function RoleCard({ row, onChanged }: { row: RoleRow; onChanged(): void }) {
   const save = () => void run('agent.policy.set', {
     role: row.role,
     disabled,
-    allow: unrestricted ? null : splitLines(allow),
-    deny: splitLines(deny),
-    lang: lang.trim() || null,
+    allow: unrestricted ? null : allow,
+    deny,
+    lang: lang || null,
   }, '已保存策略', () => {
     setOpen(false);
     onChanged();
   });
 
-  const enabledDefs = row.defs.filter(d => d.enabled);
+  const enabledDefs = defs.filter(d => d.enabled);
+  const langOptions = lang && !LANG_OPTIONS.some(o => o.value === lang) ? [{ value: lang, label: lang }, ...LANG_OPTIONS] : LANG_OPTIONS;
   return (
     <article class="card">
       <header class="card-head">
@@ -189,18 +198,16 @@ function RoleCard({ row, onChanged }: { row: RoleRow; onChanged(): void }) {
       </header>
       <p class="hint">
         <span class={row.onDuty.length ? 'dot is-running' : 'dot'} /> {row.onDuty.length ? `${row.onDuty.length} 人在岗` : '空闲'}
-        {' · '}{enabledDefs.length} 个员工定义{row.defs.length > enabledDefs.length ? `（另有 ${row.defs.length - enabledDefs.length} 个已停用）` : ''}
+        {' · '}{enabledDefs.length} 个员工定义启用{defs.length > enabledDefs.length ? `（另有 ${defs.length - enabledDefs.length} 个已停用）` : ''}
       </p>
       <dl class="facts">
-        <dt>员工定义</dt>
-        <dd>{row.defs.length ? row.defs.map(d => d.enabled ? d.id : `${d.id}（停用）`).join('、') : '无'}</dd>
         {row.onDuty.length ? (<><dt>在岗实例</dt><dd>{row.onDuty.map(m => m.employee).join('、')}</dd></>) : null}
         <dt>允许清单</dt>
         <dd>{p.allow === null ? '不限制' : p.allow.length ? p.allow.join('、') : '空（什么都不能调用）'}</dd>
         <dt>拒绝清单</dt>
         <dd>{p.deny.length ? p.deny.join('、') : '无'}</dd>
         <dt>译文语言</dt>
-        <dd>{p.lang ?? '不翻译'}</dd>
+        <dd>{langLabel(p.lang)}</dd>
       </dl>
       <div class="button-row">
         <button type="button" onClick={openEditor}>{open ? '收起策略' : '编辑策略'}</button>
@@ -208,20 +215,24 @@ function RoleCard({ row, onChanged }: { row: RoleRow; onChanged(): void }) {
       {open ? (
         <div class="form">
           <label class="inline"><input type="checkbox" checked={disabled} disabled={busy} onChange={e => setDisabled(e.currentTarget.checked)} /> 停用这个职能的所有员工</label>
-          <label class="inline"><input type="checkbox" checked={unrestricted} disabled={busy} onChange={e => setUnrestricted(e.currentTarget.checked)} /> 允许清单不限制</label>
+          <label class="inline"><input type="checkbox" checked={unrestricted} disabled={busy} onChange={e => setUnrestricted(e.currentTarget.checked)} /> 允许清单不限制（可以调用除拒绝清单外的全部命令）</label>
           {unrestricted ? null : (
-            <label class="field">
-              <span>允许清单（每行一个命令；留空表示什么都不能调用）</span>
-              <textarea rows={3} value={allow} disabled={busy} onInput={e => setAllow(e.currentTarget.value)} />
-            </label>
+            <div class="field">
+              <span class="field-label"><span>允许清单</span></span>
+              <CommandPicker label="添加允许的命令" value={allow} disabled={busy} onChange={setAllow} />
+              <span class="field-hint">{allow.length ? '只能调用清单里的命令。' : '清单为空：这个职能什么命令都不能调用。'}</span>
+            </div>
           )}
+          <div class="field">
+            <span class="field-label"><span>拒绝清单</span></span>
+            <CommandPicker label="添加拒绝的命令" value={deny} disabled={busy} onChange={setDeny} />
+          </div>
           <label class="field">
-            <span>拒绝清单（每行一个命令）</span>
-            <textarea rows={3} value={deny} disabled={busy} onInput={e => setDeny(e.currentTarget.value)} />
-          </label>
-          <label class="field">
-            <span>译文语言（留空表示不翻译）</span>
-            <input value={lang} disabled={busy} onInput={e => setLang(e.currentTarget.value)} />
+            <span class="field-label"><span>译文语言</span></span>
+            <select value={lang} disabled={busy} onChange={e => setLang(e.currentTarget.value)}>
+              {langOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+            <span class="field-hint">派给这个职能的消息先译成这种语言再发。</span>
           </label>
           <NoticeLine notice={notice} />
           <div class="button-row">
@@ -232,6 +243,7 @@ function RoleCard({ row, onChanged }: { row: RoleRow; onChanged(): void }) {
       ) : (
         <NoticeLine notice={notice} />
       )}
+      <DefList role={row.role} defs={defs} allDefs={allDefs} onChanged={onChanged} />
     </article>
   );
 }
@@ -268,8 +280,8 @@ function GuardSection({ guard, onChanged }: { guard: GuardList; onChanged(): voi
       )}
       <div class="form">
         <label class="field">
-          <span>命令名</span>
-          <input value={command} disabled={busy} onInput={e => setCommand(e.currentTarget.value)} />
+          <span>命令</span>
+          <CommandSelect label="要保护的命令" value={command} disabled={busy} onChange={setCommand} exclude={guard.protected.map(g => g.command)} />
         </label>
         <label class="inline"><input type="checkbox" checked={ownerOnly} disabled={busy} onChange={e => setOwnerOnly(e.currentTarget.checked)} /> 仅老板可调用</label>
         {problem ? <p class="notice err">{problem}</p> : null}
@@ -281,11 +293,12 @@ function GuardSection({ guard, onChanged }: { guard: GuardList; onChanged(): voi
             disabled={busy}
             onClick={() => {
               if (!command.trim()) {
-                setProblem('请填写命令名');
+                setProblem('请选择命令');
                 return;
               }
               setProblem('');
               protect(command.trim(), ownerOnly, '已加入保护');
+              setCommand('');
             }}
           >
             加入保护

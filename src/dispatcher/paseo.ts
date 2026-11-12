@@ -12,8 +12,8 @@ export { MAINTENANCE_WORKSPACE, workspaceTitleOf };
 export type { AgentInfo, SpawnInput, AgentRuntime as PaseoGateway, RuntimeWorkspace as PaseoWorkspaceInfo,
   RuntimeProject as PaseoProjectInfo, RuntimePlugin as PaseoPluginInfo, SceneCleanupResult, SceneEmployee, SceneEmployees } from '../runner/contracts.ts';
 
-/** Paseo mode needed for unattended work; grok exposes no modes. */
-export const UNATTENDED_MODE: Record<string, string | undefined> = { codex: 'full-access', claude: 'bypassPermissions', devin: 'bypass', 'factory-droid': 'auto-high' };
+/** Paseo mode needed for unattended work; grok exposes no modes (defined with the native launch args, see native-args.ts). */
+export { UNATTENDED_MODE } from '../runner/native-args.ts';
 
 /** A Paseo CLI call that did not answer: non-zero exit, a spawn failure, or a timeout. `stderr` is what the CLI wrote. */
 export class PaseoCliError extends Error {
