@@ -25,7 +25,7 @@ export type WorkflowState = 'ready' | 'doing' | 'review';
 export type BlockCode =
   | 'paused' | 'budget' | 'resources' | 'memory_pressure' | 'disk_space' | 'max_running'
   | 'prior_submitter' | 'no_candidate' | 'session_busy' | 'held' | 'assigned' | 'track_mismatch' | 'model_slot'
-  | 'provider_retry' | 'quota' | 'probe_busy' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'wake_failed' | 'unknown' | 'factory_wait';
+  | 'provider_retry' | 'quota' | 'probe_busy' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'off_hours' | 'wake_failed' | 'unknown' | 'factory_wait';
 
 /** One staffing entry, reduced to what the evaluator reads. `key` is the employee id or `spawn:<def>`. */
 export interface EvaluatedEntry {
@@ -174,6 +174,7 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
   provider_capacity: '订阅并发已满',
   seat_full: '编制席位已满',
   def_disabled: '编制已停用',
+  off_hours: '不在员工定义的工作时间',
   wake_failed: '派工未能唤醒或创建会话，下一轮重试',
   unknown: '状态或贡献者历史读取失败，不能判定（不视为忙），恢复后自动重判',
   probe_busy: '单次探测会话占用中（冷却已过，探测结束前不派其他会话）',
@@ -183,7 +184,7 @@ const OWNER: Record<BlockCode, RecoveryAuthority> = {
   provider_retry: 'system',
   factory_wait: 'system',
   paused: 'owner', budget: 'owner', resources: 'owner', memory_pressure: 'system', disk_space: 'owner', max_running: 'owner', prior_submitter: 'owner', no_candidate: 'owner',  session_busy: 'owner', held: 'owner', assigned: 'owner', track_mismatch: 'owner', model_slot: 'owner',
-  quota: 'owner', provider_capacity: 'owner', seat_full: 'owner', def_disabled: 'owner', wake_failed: 'owner', unknown: 'owner', probe_busy: 'owner',
+  quota: 'owner', provider_capacity: 'owner', seat_full: 'owner', def_disabled: 'owner', off_hours: 'system', wake_failed: 'owner', unknown: 'owner', probe_busy: 'owner',
 };
 
 const RECOVERY: Record<BlockCode, string> = {
@@ -206,6 +207,7 @@ const RECOVERY: Record<BlockCode, string> = {
   provider_capacity: '等待在办任务释放该订阅并发',
   seat_full: '老板扩编（maxInstances）或等待席位释放',
   def_disabled: '老板重新启用编制或更换编制',
+  off_hours: '到工作时间后自动派工，或老板调整工作时间',
   wake_failed: '检查 Paseo 会话与插件日志，下一轮自动重试',
   unknown: '检查 Paseo 插件、运行时日志与审计读取，恢复后自动重判',
   probe_busy: '等待单次探测会话结束，探测结果决定恢复或再次冷却',
@@ -231,6 +233,7 @@ const NEXT: Record<BlockCode, string> = {
   provider_capacity: '订阅并发释放',
   seat_full: '编制席位释放或扩编',
   def_disabled: '编制重新启用',
+  off_hours: '进入工作时间',
   wake_failed: '下一轮唤醒成功',
   unknown: '状态与审计读取恢复',
   probe_busy: '探测会话结束',
@@ -243,7 +246,7 @@ const BASIS: Record<BlockCode, string> = {
   paused: 'tick:global-gate', budget: 'tick:global-gate', resources: 'tick:global-gate', memory_pressure: 'host:memory', disk_space: 'host:disk', max_running: 'tick:global-gate', prior_submitter: 'contribution-audit',  no_candidate: 'tick:staffing-pool', session_busy: 'paseo:session-status', held: 'tick:staffing-pool', assigned: 'tick:staffing-pool',
   track_mismatch: 'tick:staffing-pool', model_slot: 'tick:model-slots',
   quota: 'tick:quota-rows', provider_capacity: 'tick:quota-rows', seat_full: 'tick:staffing-pool',
-  def_disabled: 'tick:workforce-defs', wake_failed: 'tick:wake', unknown: 'read:state-or-audit', probe_busy: 'tick:provider-health',
+  def_disabled: 'tick:workforce-defs', off_hours: 'tick:workforce-defs', wake_failed: 'tick:wake', unknown: 'read:state-or-audit', probe_busy: 'tick:provider-health',
 };
 
 /** Recovery actions per code. Only the ones with a tool are executable; the rest name who must act outside the system. */
@@ -267,6 +270,7 @@ const ACTIONS: Record<BlockCode, RecoveryAction[]> = {
   provider_capacity: [{ authority: 'owner', label: '等待在办任务释放该订阅并发', executable: false }],
   seat_full: [{ authority: 'owner', label: '老板用 def_ensure 调高 maxInstances 扩编', tool: 'def_ensure', executable: true }],
   def_disabled: [{ authority: 'owner', label: '老板用 def_ensure 重新启用编制', tool: 'def_ensure', executable: true }],
+  off_hours: [{ authority: 'system', label: '到工作时间后自动派工', executable: false }, { authority: 'owner', label: '老板在员工定义里调整工作时间', tool: 'def_ensure', executable: true }],
   wake_failed: [{ authority: 'owner', label: '检查 Paseo 会话与插件日志，下一轮自动重试', executable: false }],
   unknown: [{ authority: 'owner', label: '检查 Paseo 插件、运行时日志与审计读取，恢复后自动重判', executable: false }],
   probe_busy: [{ authority: 'owner', label: '等待单次探测会话结束', executable: false }],

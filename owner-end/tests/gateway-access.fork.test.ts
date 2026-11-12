@@ -270,6 +270,15 @@ run('老板令牌在页面里编辑员工定义：未给出的字段保持原值
   // thinking 传 null 清空。
   await ensure({ id: 'gw-def-a', role: 'engineering', provider: 'factory-droid', model: 'claude-haiku-5-5', thinking: null });
   expect((await read()).thinking).toBeUndefined();
+  // 工作时间：保存规范化后的值，不提即保留，null 清除；不合法的拒绝。
+  await ensure({ id: 'gw-def-a', role: 'engineering', provider: 'factory-droid', model: 'claude-haiku-5-5', workHours: { days: [5, 1], start: '09:00', end: '18:00' } });
+  expect((await read()).work_hours).toEqual({ days: [1, 5], start: '09:00', end: '18:00' });
+  await ensure({ id: 'gw-def-a', role: 'engineering', provider: 'factory-droid', model: 'claude-haiku-5-5' });
+  expect((await read()).work_hours).toEqual({ days: [1, 5], start: '09:00', end: '18:00' });
+  await expect(ensure({ id: 'gw-def-a', role: 'engineering', provider: 'factory-droid', model: 'claude-haiku-5-5', workHours: { days: [], start: '09:00', end: '18:00' } }))
+    .rejects.toThrow('workHours invalid');
+  await ensure({ id: 'gw-def-a', role: 'engineering', provider: 'factory-droid', model: 'claude-haiku-5-5', workHours: null });
+  expect((await read()).work_hours).toBeUndefined();
   await runOwnerCommandOn({}, owner, 'owner-1', 'def.enable', { id: 'gw-def-a' });
   expect(await read()).toMatchObject({ enabled: true });
   expect((await read()).disabled_reason).toBeUndefined();

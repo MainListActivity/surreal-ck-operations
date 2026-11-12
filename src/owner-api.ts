@@ -1,3 +1,4 @@
+import { parseWorkHours } from './work-hours.ts';
 /**
  * 老板接口：任何持有 owner-token 的 agent 都能调用（网页控制台与 sck owner 共用同一套 JSON 命令）。
  * 所有写操作记 actor=owner 并带 via 标签（请求头 X-Owner-Agent，没有则 web）。
@@ -308,6 +309,8 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
           : (() => { throw new CompanyError('invalid', 'tracks invalid'); })();
       if (input.quotaLimited !== undefined && typeof input.quotaLimited !== 'boolean') throw new CompanyError('invalid', 'quotaLimited invalid');
       if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new CompanyError('invalid', 'enabled invalid');
+      const workHours = input.workHours === undefined || input.workHours === null ? input.workHours as undefined | null
+        : parseWorkHours(input.workHours) ?? (() => { throw new CompanyError('invalid', 'workHours invalid'); })();
       const def = await ctx.workforce.upsertDef(defId, { role, provider: text(input.provider, 'provider'),
         model: text(input.model, 'model'),
         thinking: input.thinking === null ? undefined : optionalText(input.thinking) ?? existing?.thinking,
@@ -315,7 +318,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
         priority: count(input.priority, 'priority') ?? existing?.priority,
         weight: count(input.weight, 'weight') ?? existing?.weight,
         enabled: typeof input.enabled === 'boolean' ? input.enabled : existing?.enabled ?? true,
-        tracks, quotaLimited: input.quotaLimited as boolean | undefined });
+        tracks, quotaLimited: input.quotaLimited as boolean | undefined, workHours });
       return def;
     }
     case 'def.disable': { const defId = text(input.id, 'id'); await db.query('UPDATE $def SET enabled = false, disabled_reason = $reason;',

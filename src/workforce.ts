@@ -1,3 +1,4 @@
+import { parseWorkHours, type WorkHours } from './work-hours.ts';
 import { PROVIDER_FAILURE_WINDOW_SECONDS, type ProviderFailure } from './dispatcher/provider-failover.ts';
 import type { SchedulingFact, SchedulingDecision } from './dispatcher/scheduling.ts';
 import { dispatchFinalizationSql } from './dispatch-finalization.ts';
@@ -44,6 +45,8 @@ export interface EmployeeDef {
   errorStreak: number;
   /** 停用原因（老板停用或连续会话异常自动停用）；只在停用时有。 */
   disabledReason?: string;
+  /** 工作时间（见 work-hours.ts）；没有即全天可派。 */
+  workHours?: WorkHours;
 }
 
 export interface ChainWorkspace { cwd: string; id: string }
@@ -364,7 +367,7 @@ export class Workforce {
   }
 
   // ---- employee definitions ----
-  async upsertDef(defId: string, input: { role: Role; provider: string; model: string; thinking?: string; tracks?: string[]; maxInstances?: number; priority?: number; weight?: number; enabled?: boolean; quotaLimited?: boolean }): Promise<void> {
+  async upsertDef(defId: string, input: { role: Role; provider: string; model: string; thinking?: string; tracks?: string[]; maxInstances?: number; priority?: number; weight?: number; enabled?: boolean; quotaLimited?: boolean; workHours?: WorkHours | null }): Promise<void> {
     if (!/^[a-z0-9][a-z0-9-]{2,40}$/.test(defId)) throw new CompanyError('invalid', 'Invalid def ID');
     if (!ROLES.includes(input.role)) throw new CompanyError('invalid', 'Invalid role');
     if (!/^[a-z0-9][a-z0-9-]{1,40}$/.test(input.provider)) throw new CompanyError('invalid', 'Invalid provider');
@@ -388,18 +391,24 @@ export class Workforce {
     if (input.quotaLimited !== undefined) {
       await this.db.query('UPDATE $def SET quota_limited = $q;', { def: id('employee_def', defId), q: input.quotaLimited });
     }
+    // 工作时间同样单独写：不提即保持，null 清除（回到全天）。
+    if (input.workHours === null) await this.db.query('UPDATE $def SET work_hours = NONE;', { def: id('employee_def', defId) });
+    else if (input.workHours !== undefined) {
+      await this.db.query('UPDATE $def SET work_hours = $hours;', { def: id('employee_def', defId), hours: input.workHours });
+    }
   }
 
   async defs(): Promise<EmployeeDef[]> {
     type Row = { id: RecordId; role: Role; provider: string; model: string; thinking?: string; tracks?: string[]; enabled: boolean;
-      max_instances: number; priority: number; weight?: number; quota_limited?: boolean; error_streak?: number; disabled_reason?: string };
+      max_instances: number; priority: number; weight?: number; quota_limited?: boolean; error_streak?: number; disabled_reason?: string; work_hours?: unknown };
     const [rows] = await this.db.query<[Row[]]>('SELECT * FROM employee_def ORDER BY weight DESC, priority, id;');
     return rows.map(r => ({ id: asId(r.id), role: r.role, provider: r.provider, model: r.model, thinking: r.thinking ?? undefined,
       tracks: r.tracks ?? undefined,
       enabled: r.enabled !== false, maxInstances: r.max_instances ?? 1, priority: r.priority ?? 100,
       weight: r.weight ?? 10, quotaLimited: r.quota_limited === false ? false : undefined,
       errorStreak: r.error_streak ?? 0,
-      ...(r.enabled === false && typeof r.disabled_reason === 'string' && r.disabled_reason ? { disabledReason: r.disabled_reason } : {}) }));
+      ...(r.enabled === false && typeof r.disabled_reason === 'string' && r.disabled_reason ? { disabledReason: r.disabled_reason } : {}),
+      ...(parseWorkHours(r.work_hours) ? { workHours: parseWorkHours(r.work_hours) } : {}) }));
   }
 
   async defFailure(defId: string): Promise<number> {

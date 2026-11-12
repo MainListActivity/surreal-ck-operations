@@ -61,3 +61,16 @@ test('an unreadable author history is history_unavailable, and every candidate r
   expect(p.status).toBe('history_unavailable');
   expect(p.entries.every(entry => !entry.eligible && entry.code === 'unknown')).toBe(true);
 });
+
+test('a def outside its working hours takes no new work: its session and its spawn seat are off_hours, back in hours both are ready', async () => {
+  // 周三（2026-11-11 是周三）本地 20:00，定义的工作时间是工作日 09:00–18:00。
+  const evening = new Date(2026, 10, 11, 20, 0).getTime() / 1000;
+  const morning = new Date(2026, 10, 11, 10, 0).getTime() / 1000;
+  const hours = { days: [1, 2, 3, 4, 5], start: '09:00', end: '18:00' };
+  const over = { defs: [{ ...def, workHours: hours }], insts: [reviewer], states: new Map([['emp-reviewer', 'idle' as const]]) };
+  const off = await preview({ ...over, now: evening });
+  expect(off.status).toBe('blocked');
+  expect(off.entries.map(entry => entry.code).sort()).toEqual(['off_hours', 'off_hours']);
+  expect(off.entries[0]!.reason).toContain('周一至周五 09:00–18:00');
+  expect((await preview({ ...over, now: morning })).status).toBe('ready');
+});
