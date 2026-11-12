@@ -4,6 +4,7 @@
  */
 import { useState } from 'preact/hooks';
 import { launchPreview } from '../../../../src/runner/native-args.ts';
+import { parseWorkHours, workHoursText, type WorkHours } from '../../../../src/work-hours.ts';
 import { Dialog, Field, NoticeLine, useAction } from '../common.tsx';
 
 /** def.list 返回的一条（见 src/workforce.ts EmployeeDef）。 */
@@ -21,6 +22,7 @@ export interface DefRow {
   quotaLimited?: boolean;
   errorStreak: number;
   disabledReason?: string;
+  workHours?: WorkHours;
 }
 
 const PROVIDERS: ReadonlyArray<{ value: string; label: string }> = [
@@ -50,6 +52,10 @@ const EFFORTS: ReadonlyArray<{ value: string; label: string }> = [
 
 const DEF_ID = /^[a-z0-9][a-z0-9-]{2,40}$/;
 
+const DAYS: ReadonlyArray<[number, string]> = [[1, '一'], [2, '二'], [3, '三'], [4, '四'], [5, '五'], [6, '六'], [0, '日']];
+/** 半小时一档。 */
+const TIMES: string[] = Array.from({ length: 48 }, (_, i) => `${String(Math.floor(i / 2)).padStart(2, '0')}:${i % 2 ? '30' : '00'}`);
+
 const withCurrent = (options: readonly string[], current: string) => current && !options.includes(current) ? [current, ...options] : [...options];
 
 /** 一行可读的启动方式：原生启动给出命令行，经 Paseo 的说明没有命令行。 */
@@ -72,7 +78,7 @@ export function DefList({ role, defs, allDefs, onChanged }: { role: string; defs
               <div class="row-main">
                 <strong>{def.id}</strong>
                 <span class={def.enabled ? 'badge tone-done' : 'badge tone-blocked'}>{def.enabled ? '启用' : '停用'}</span>
-                <span class="hint">最多 {def.maxInstances} 人 · 权重 {def.weight}</span>
+                <span class="hint">最多 {def.maxInstances} 人 · 权重 {def.weight} · {workHoursText(def.workHours)}</span>
               </div>
               {!def.enabled && def.disabledReason ? <p class="hint">停用原因：{def.disabledReason}</p> : null}
               <code class="launch" title="新开会话时的启动命令">{launchText(def)}</code>
@@ -109,6 +115,10 @@ function DefEditor({ role, def, allDefs, onClose, onSaved }: {
   const [weight, setWeight] = useState(String(def?.weight ?? 10));
   const [priority, setPriority] = useState(String(def?.priority ?? 100));
   const [unlimited, setUnlimited] = useState(def?.quotaLimited === false);
+  const [allDay, setAllDay] = useState(!def?.workHours);
+  const [days, setDays] = useState<number[]>(def?.workHours?.days ?? [1, 2, 3, 4, 5]);
+  const [start, setStart] = useState(def?.workHours?.start ?? '09:00');
+  const [end, setEnd] = useState(def?.workHours?.end ?? '18:00');
   const [problem, setProblem] = useState('');
   const { busy, notice, run } = useAction();
 
@@ -133,10 +143,12 @@ function DefEditor({ role, def, allDefs, onClose, onSaved }: {
     const w = Number(weight), p = Number(priority);
     if (!Number.isInteger(w) || w < 0 || w > 1000) return setProblem('派工权重是 0 到 1000 的整数');
     if (!Number.isInteger(p)) return setProblem('优先级是整数');
+    const workHours = allDay ? null : parseWorkHours({ days, start, end });
+    if (workHours === undefined) return setProblem(days.length ? '开始和结束不能是同一时间' : '至少选一天');
     setProblem('');
     void run('def.ensure', {
       id: defId, role, provider, model, thinking: thinking || null,
-      maxInstances, weight: w, priority: p, enabled: def?.enabled ?? true, quotaLimited: !unlimited,
+      maxInstances, weight: w, priority: p, enabled: def?.enabled ?? true, quotaLimited: !unlimited, workHours,
     }, def ? `已保存 ${defId}` : `已新增 ${defId}`, onSaved);
   };
 
@@ -182,6 +194,33 @@ function DefEditor({ role, def, allDefs, onClose, onSaved }: {
           </Field>
         </div>
         <label class="inline"><input type="checkbox" checked={unlimited} disabled={busy} onChange={e => setUnlimited(e.currentTarget.checked)} /> 不受订阅额度限制（额度用完照样派工）</label>
+        <div class="field">
+          <span class="field-label"><span>工作时间</span></span>
+          <label class="inline"><input type="checkbox" checked={allDay} disabled={busy} onChange={e => setAllDay(e.currentTarget.checked)} /> 全天可派工</label>
+          {allDay ? null : (
+            <div class="work-hours">
+              <div class="day-picks" role="group" aria-label="工作日">
+                {DAYS.map(([day, label]) => (
+                  <label key={day} class={days.includes(day) ? 'day on' : 'day'}>
+                    <input type="checkbox" checked={days.includes(day)} disabled={busy}
+                      onChange={e => setDays(e.currentTarget.checked ? [...days, day].sort((a, b) => a - b) : days.filter(d => d !== day))} />
+                    {label}
+                  </label>
+                ))}
+              </div>
+              <div class="time-range">
+                <select aria-label="开始时间" value={start} disabled={busy} onChange={e => setStart(e.currentTarget.value)}>
+                  {TIMES.map(t => <option key={t} value={t}>{t}</option>)}
+                </select>
+                <span>至</span>
+                <select aria-label="结束时间" value={end} disabled={busy} onChange={e => setEnd(e.currentTarget.value)}>
+                  {TIMES.map(t => <option key={t} value={t}>{t}</option>)}
+                </select>
+              </div>
+            </div>
+          )}
+          <span class="field-hint">按执行端（你的 Mac）本地时间。时间外不派新活，正在跑的一轮照常跑完；结束早于开始表示跨到次日。</span>
+        </div>
         {def?.tracks?.length ? <p class="hint">擅长方向：{def.tracks.join('、')}（保存不会改动）</p> : null}
         <div class="field">
           <span class="field-label"><span>启动命令</span></span>

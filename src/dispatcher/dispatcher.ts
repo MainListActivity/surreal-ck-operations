@@ -1,3 +1,4 @@
+import { inWorkHours, workHoursText } from '../work-hours.ts';
 import { providerRetryBlock } from './provider-failover.ts';
 import { orderWork, schedulingDecision, type SchedulingFact } from './scheduling.ts';
 import { createHash, randomUUID } from 'node:crypto';
@@ -191,6 +192,9 @@ export interface StaffingInput {
   now: number;
 }
 
+/** A def outside its working hours takes no new work (no spawn, no wake); a running turn is left alone. Judged in the Mac's local time. */
+const offHours = (def: EmployeeDef): Block => ['off_hours', `${BLOCK_TEXT.off_hours}（${workHoursText(def.workHours)}）`];
+
 // Empty/absent tracks accept every discipline; untracked tasks keep plain role matching.
 // Required-track roles (REQUIRED_TRACKS, e.g. screenwriter) are stricter: their tasks must
 // carry exactly the required track and the def must list it — empty tracks grants nothing.
@@ -292,6 +296,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       (p.exclusion?.authors.has(inst.id) ? ['prior_submitter', BLOCK_TEXT.prior_submitter] : undefined) ??
       (p.excludeSubmitter && inst.id === p.task?.submittedBy ? ['prior_submitter', BLOCK_TEXT.prior_submitter] : undefined) ??
       ((inst.def && !def) || (def && !def.enabled) || p.providerAllowed?.(inst.provider ?? '') === false ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
+      (def && !inWorkHours(def.workHours, new Date(p.now * 1000)) ? offHours(def) : undefined) ??
       (!p.qualificationOnly && !ready(inst) ? notReady(p.states.get(inst.id), inst.provider ?? '') : undefined) ??
       (!p.qualificationOnly && p.assigned?.has(inst.id) ? ['assigned', BLOCK_TEXT.assigned] : undefined) ??
       (!p.qualificationOnly && p.holding.has(inst.id) ? ['held', BLOCK_TEXT.held] : undefined) ??
@@ -317,6 +322,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       inWorkspace(i) && !waiting(i)).length;
     const hit: Block | undefined =
       (!def.enabled || p.providerAllowed?.(def.provider) === false ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
+      (!inWorkHours(def.workHours, new Date(p.now * 1000)) ? offHours(def) : undefined) ??
       (!trackOk(p.task, def.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (resolved === undefined ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
       (!p.qualificationOnly && seats >= def.maxInstances ? ['seat_full', `编制席位已满（${seats}/${def.maxInstances} 个实例，仓库 ${repoName(p.home)}）`] : undefined) ??
@@ -1766,7 +1772,7 @@ export class Dispatcher {
     const continuing = candidate !== undefined && (await wf.config()).sessionPolicy === 'oneshot';
     const picked = !continuing && candidate?.provider !== FACTORY_PROVIDER && defsOrdered.some(d=>d.provider===FACTORY_PROVIDER) ? undefined : candidate;
     const pending = picked && !picked.paseoAgentId ? picked : undefined;
-    if (pending) defsOrdered = (await wf.defs()).filter(d => d.id === pending.def && d.enabled);
+    if (pending) defsOrdered = (await wf.defs()).filter(d => d.id === pending.def && d.enabled && inWorkHours(d.workHours, new Date()));
     const existing = picked?.paseoAgentId && sidecar.canReuse(picked) ? picked : undefined;
     // A message still waiting for its translation is skipped before any lease: no claim churn, no notice. The employee's language is
     // aligned first: a message that never had one queues no translation, so the wait would never end.
