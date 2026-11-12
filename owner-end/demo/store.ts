@@ -4,7 +4,7 @@ export class DemoError extends Error { constructor(message:string,readonly statu
 export class DemoStore {
   data:Snapshot; paused=false; policies=new Map<string,Row>(); executions=new Map<string,Row>(); timers=new Map<string,number>(); messages:Row[]=[]; guards:Row[]=[{command:'task.void',ownerOnly:true}];
   constructor(readonly initial:Snapshot){this.data=structuredClone(initial);this.reset();}
-  reset(){this.data=structuredClone(this.initial);this.paused=false;this.policies=new Map(Object.entries(structuredClone(this.initial.policies??{})));this.executions=new Map(Object.entries(structuredClone(this.initial.executions??{})));this.timers.clear();this.guards=[{command:'task.void',ownerOnly:true}];this.messages=this.data.tasks.slice(0,3).map((t,i)=>({messageId:`msg-${i+1}`,taskId:t.id,title:t.title,step:'execute',state:i===1?'held':'draft',hold:i===1,body:'【设计案例】请核对当前任务范围和验收标准。这是可编辑的本地示例消息。',editable:true}));this.normalizeDesignPlans();return{reset:true};}
+  reset(){this.defRows=undefined;this.data=structuredClone(this.initial);this.paused=false;this.policies=new Map(Object.entries(structuredClone(this.initial.policies??{})));this.executions=new Map(Object.entries(structuredClone(this.initial.executions??{})));this.timers.clear();this.guards=[{command:'task.void',ownerOnly:true}];this.messages=this.data.tasks.slice(0,3).map((t,i)=>({messageId:`msg-${i+1}`,taskId:t.id,title:t.title,step:'execute',state:i===1?'held':'draft',hold:i===1,body:'【设计案例】请核对当前任务范围和验收标准。这是可编辑的本地示例消息。',editable:true}));this.normalizeDesignPlans();return{reset:true};}
   /** 旧案例的计划曾列出全部执行任务；统一为计划核对 + 实施步骤 + PR 合并/上线核验。 */
   private normalizeDesignPlans(){
     for(const [id,run] of this.executions){
@@ -43,6 +43,9 @@ export class DemoStore {
       }
     }
   }
+  defRows?:Row[];
+  /** 演示的员工定义：每个演示职能一条 Claude 定义；重置数据后重新生成。 */
+  defs():Row[]{return this.defRows??=[...new Set(this.data.agents.map(a=>String(a.role)))].sort().map(role=>({id:`${role}-demo`,role,provider:'claude',model:'claude-haiku-5-5',thinking:'max',enabled:true,maxInstances:2,priority:100,weight:10,errorStreak:0}));}
   touch(r:Row){r.updated_at=new Date().toISOString();}
   find(list:Row[],id:unknown,key='id'){const row=list.find(x=>x[key]===id);if(!row)throw new DemoError('本地记录不存在',404);return row;}
   board():OwnerBoard {
@@ -80,7 +83,11 @@ export class DemoStore {
       case 'task.pause':this.paused=true;return{paused:true};
       case 'task.resume':this.paused=false;return{paused:false};
       // 与生产一致按职能返回：同职能的演示员工共用一条策略（取该职能第一位员工的策略）。
-      case 'agent.list':return{roles:[...new Set(this.data.agents.map(a=>String(a.role)))].sort().map(role=>{const members=this.data.agents.filter(a=>a.role===role);return{role,defs:[{id:`${role}-demo`,enabled:true}],onDuty:members.map(a=>({employee:a.employee,def:`${role}-demo`})),policy:members[0].policy};})};
+      case 'agent.list':return{roles:[...new Set(this.data.agents.map(a=>String(a.role)))].sort().map(role=>{const members=this.data.agents.filter(a=>a.role===role);return{role,defs:this.defs().filter(d=>d.role===role).map(d=>({id:d.id,enabled:d.enabled,model:d.model})),onDuty:members.map(a=>({employee:a.employee,def:`${role}-demo`})),policy:members[0].policy};})};
+      case 'def.list':return{defs:this.defs()};
+      case 'def.ensure':{if(!/^[a-z0-9][a-z0-9-]{2,40}$/.test(String(input.id)))throw new DemoError('Invalid def ID');const row=this.defs().find(d=>d.id===input.id);const next={errorStreak:0,...row,id:input.id,role:input.role,provider:input.provider,model:input.model,thinking:input.thinking??undefined,maxInstances:input.maxInstances??row?.maxInstances??1,priority:input.priority??row?.priority??100,weight:input.weight??row?.weight??10,enabled:input.enabled??row?.enabled??true,...(input.quotaLimited===false?{quotaLimited:false}:{quotaLimited:undefined})};if(row)Object.assign(row,next);else this.defs().push(next);return{};}
+      case 'def.disable':{const d=this.find(this.defs(),input.id);d.enabled=false;d.disabledReason=input.reason??'老板停用';return{ok:true};}
+      case 'def.enable':{const d=this.find(this.defs(),input.id);d.enabled=true;delete d.disabledReason;return{ok:true};}
       case 'agent.policy.set':{const members=this.data.agents.filter(a=>a.role===input.role);if(!members.length)throw new DemoError(`没有职能为 ${input.role} 的员工定义`);for(const a of members)a.policy={disabled:!!input.disabled,allow:input.allow,deny:input.deny??[],lang:input.lang};return{role:input.role,policy:members[0].policy};}
       case 'agent.identity.ensure':this.find(this.data.agents,input.employee,'employee').idpUser='local-demo-identity';return{created:true};
       case 'guard.list':return{protected:this.guards,hardOwnerOnly:['db.write','requirement.approve'],ownerApiCommands:['task.list','task.create','requirement.list'],targetLocks:[],ownerOnlyForAgents:['product.iteration.configure']};

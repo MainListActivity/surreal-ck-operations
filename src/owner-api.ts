@@ -295,12 +295,27 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       const defId = text(input.id, 'id');
       const role = text(input.role, 'role') as Role;
       if (!ROLES.includes(role)) throw new CompanyError('invalid', 'unknown role');
+      // 修改已有定义时，没有给出的字段保持原值（thinking 传 null 才清空）；启用状态只经 enabled 或 def.enable/def.disable 改变。
+      const existing = (await ctx.workforce.defs()).find((def) => def.id === defId);
+      const count = (value: unknown, field: string): number | undefined => {
+        if (value === undefined) return undefined;
+        if (typeof value !== 'number' || !Number.isInteger(value)) throw new CompanyError('invalid', `${field} invalid`);
+        return value;
+      };
+      const tracks = input.tracks === undefined ? undefined
+        : Array.isArray(input.tracks) && input.tracks.length <= 50 && input.tracks.every((item) => typeof item === 'string' && item.trim() && item.length <= 40)
+          ? (input.tracks as string[]).map((item) => item.trim())
+          : (() => { throw new CompanyError('invalid', 'tracks invalid'); })();
+      if (input.quotaLimited !== undefined && typeof input.quotaLimited !== 'boolean') throw new CompanyError('invalid', 'quotaLimited invalid');
+      if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new CompanyError('invalid', 'enabled invalid');
       const def = await ctx.workforce.upsertDef(defId, { role, provider: text(input.provider, 'provider'),
-        model: text(input.model, 'model'), thinking: optionalText(input.thinking),
-        maxInstances: typeof input.maxInstances === 'number' ? input.maxInstances : undefined,
-        priority: typeof input.priority === 'number' ? input.priority : undefined,
-        weight: typeof input.weight === 'number' ? input.weight : undefined });
-      if (input.enabled === false) await db.query('UPDATE $def SET enabled = false;', { def: new RecordId('employee_def', defId) });
+        model: text(input.model, 'model'),
+        thinking: input.thinking === null ? undefined : optionalText(input.thinking) ?? existing?.thinking,
+        maxInstances: count(input.maxInstances, 'maxInstances') ?? existing?.maxInstances,
+        priority: count(input.priority, 'priority') ?? existing?.priority,
+        weight: count(input.weight, 'weight') ?? existing?.weight,
+        enabled: typeof input.enabled === 'boolean' ? input.enabled : existing?.enabled ?? true,
+        tracks, quotaLimited: input.quotaLimited as boolean | undefined });
       return def;
     }
     case 'def.disable': { const defId = text(input.id, 'id'); await db.query('UPDATE $def SET enabled = false, disabled_reason = $reason;',

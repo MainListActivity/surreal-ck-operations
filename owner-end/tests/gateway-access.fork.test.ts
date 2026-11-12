@@ -11,6 +11,7 @@ import { writeHostTelemetry, writeRuntimeObservation } from '../../src/runner/te
 import { writeRunnerHeartbeat } from '../../src/board.ts';
 import { OutboundMessageStore } from '../../src/outbound-messages.ts';
 import { decide } from '../../src/command-guard.ts';
+import { runOwnerCommandOn } from '../src/commands.ts';
 
 setDefaultTimeout(60000);
 // 老板端网关的访问规则（fork）：058 应用后，gateway 令牌写 protected_command / agent_policy 被拒，改删 ops_audit 被拒。
@@ -248,6 +249,30 @@ run('网关会话下的命令守卫按职能取策略：职能停用即拒绝该
     .toMatchObject({ allow: false, reason: '该员工已停用' });
   expect(await decide(gateway, { actorKind: 'agent', actor: 'gw-role-on-1', task: 'gw_role_on', command: 'submit', now }))
     .toMatchObject({ allow: true });
+});
+
+run('老板令牌在页面里编辑员工定义：未给出的字段保持原值，停用的定义改其它字段后仍停用，thinking 传 null 才清空', async () => {
+  const owner = await session(tokenFor('owner', 'owner-1', { rl: ['Owner'] }));
+  const ensure = (input: Record<string, unknown>) => runOwnerCommandOn({}, owner, 'owner-1', 'def.ensure', input);
+  await ensure({ id: 'gw-def-a', role: 'engineering', provider: 'claude', model: 'claude-haiku-5-5', thinking: 'max', maxInstances: 3, weight: 20, priority: 50 });
+  await company.db.query("UPDATE employee_def:⟨gw-def-a⟩ SET tracks = ['编剧'];");
+  const read = async () => (await company.db.query<[Array<Record<string, unknown>>]>('SELECT * FROM employee_def:⟨gw-def-a⟩;'))[0][0]!;
+
+  // 只改模型：思考强度、上限、权重、优先级、擅长方向都不变。
+  await ensure({ id: 'gw-def-a', role: 'engineering', provider: 'claude', model: 'claude-sonnet-5-5' });
+  expect(await read()).toMatchObject({ model: 'claude-sonnet-5-5', thinking: 'max', max_instances: 3, weight: 20, priority: 50, tracks: ['编剧'], enabled: true });
+
+  // 停用后再改其它字段：仍停用。
+  await runOwnerCommandOn({}, owner, 'owner-1', 'def.disable', { id: 'gw-def-a', reason: '老板停用' });
+  await ensure({ id: 'gw-def-a', role: 'engineering', provider: 'factory-droid', model: 'claude-haiku-5-5', quotaLimited: false });
+  expect(await read()).toMatchObject({ provider: 'factory-droid', enabled: false, quota_limited: false, disabled_reason: '老板停用' });
+
+  // thinking 传 null 清空。
+  await ensure({ id: 'gw-def-a', role: 'engineering', provider: 'factory-droid', model: 'claude-haiku-5-5', thinking: null });
+  expect((await read()).thinking).toBeUndefined();
+  await runOwnerCommandOn({}, owner, 'owner-1', 'def.enable', { id: 'gw-def-a' });
+  expect(await read()).toMatchObject({ enabled: true });
+  expect((await read()).disabled_reason).toBeUndefined();
 });
 
 run('正控制：老板与 root 写 protected_command、agent_policy 放行，拒绝只来自访问方式而非 schema 故障', async () => {
