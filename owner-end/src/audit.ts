@@ -26,6 +26,7 @@ const FIELDS: ReadonlyMap<string, ReadonlyArray<readonly [label: string, key: st
   ['message.release', [['消息', 'messageId']]],
   ['message.send', [['消息', 'messageId']]],
   ['translate.message', [['消息', 'messageId'], ['语言', 'lang']]],
+  ['owner.settings.set', [['语言', 'lang']]],
   ['agent.policy.set', [['职能', 'role'], ['停用', 'disabled'], ['语言', 'lang'], ['允许', 'allow'], ['禁止', 'deny']]],
   ['agent.identity.ensure', [['员工', 'employee']]],
   ['guard.protect', [['命令', 'command'], ['仅老板', 'ownerOnly']]],

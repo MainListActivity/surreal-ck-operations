@@ -1,3 +1,4 @@
+import { ownerLangOf, replyTranslationsOf } from './owner-lang.ts';
 import type { Surreal } from 'surrealdb';
 import { activityText, type AgentActivity } from './agent-activity.ts';
 import type { WorkContext } from './work-context.ts';
@@ -34,6 +35,8 @@ export interface RuntimeAgentView {
   definitionId?: string;
   taskState?: string;
   blockedReason?: string;
+  /** The blocker as the employee wrote it, when blockedReason is its translation into the owner's language. */
+  blockedReasonOriginal?: string;
   pendingMessages?: RuntimePendingMessage[];
   runtime?: 'native' | 'paseo' | 'unknown';
   activity?: AgentActivity;
@@ -254,6 +257,9 @@ export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): R
     const blockedReason = blockedTask
       ? activityText(String(blockedAudit.get(key(blockedTask.id))?.evidence ?? '')).trim() || '等待前置条件恢复'
       : undefined;
+    const blockedOriginal = blockedTask && blockedAudit.get(key(blockedTask.id))?.evidence_original !== undefined
+      ? activityText(String(blockedAudit.get(key(blockedTask.id))?.evidence_original ?? '')).trim() || undefined
+      : undefined;
     const project = task?.project_ref ? {id: key(task.project_ref), name: String(task.project_name || key(task.project_ref))} : undefined;
     const elapsedSeconds = leased?.leaseStartedAt !== undefined
       ? Math.max(0, Math.floor((now - leased.leaseStartedAt) / 1000)) : leased?.elapsedSeconds;
@@ -314,6 +320,7 @@ export function buildRuntimeDashboard(input: DashboardRows, now = Date.now()): R
       definitionId: e.def,
       taskState: task?.state,
       blockedReason,
+      ...(blockedOriginal ? { blockedReasonOriginal: blockedOriginal } : {}),
       pendingMessages: messages.flatMap<RuntimePendingMessage>(m => {
         const draft=e.outbox.find(o=>o.messageId===m.messageId);
         if (draft) return [{...m,preview:draft.translation?.status === 'ready' ? draft.translation.text ?? draft.body : draft.body,
@@ -551,10 +558,16 @@ export async function readRuntimeDashboard(db: Surreal): Promise<RuntimeDashboar
     // A block can last much longer than the 40-event feed or 30-day timing window.
     // Read one bounded latest audit per blocked task, never infer its author from a released lease.
     Promise.all(tasks.filter(t => t.state === 'blocked').map(t => read(
-      'SELECT task, actor, evidence, at FROM audit WHERE task = $task AND action = "block" ORDER BY at DESC LIMIT 1;',
+      'SELECT id, task, actor, evidence, at FROM audit WHERE task = $task AND action = "block" ORDER BY at DESC LIMIT 1;',
       {task:t.id},
     ))).then(rows=>rows.flat()),
   ]);
+  // A blocker written in a role's own language shows in the owner's language once the cron has translated it (067 reply_translation).
+  const translated = blockedAudits.length ? await replyTranslationsOf(db, blockedAudits, await ownerLangOf(db)) : new Map<string, string>();
+  for (const audit of blockedAudits) {
+    const text = translated.get(key(audit.id));
+    if (text) Object.assign(audit, { evidence_original: audit.evidence, evidence: text });
+  }
   return buildRuntimeDashboard({
     board,
     employees,

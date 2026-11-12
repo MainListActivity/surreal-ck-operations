@@ -82,7 +82,9 @@ describe('the schema a target version must have reached', () => {
     expect(schemaRequirementFor('0.11.4').tables).toContain('dispatch_recovery_receipt');
     expect(schemaRequirementFor('0.11.5').schema).toBe(65);
     expect(schemaRequirementFor('0.11.6').tables).toContain('agent_activity');
-    expect(CLOUD_SCHEMA_VERSION).toBe(66);
+    expect(schemaRequirementFor('0.11.23').schema).toBe(66);
+    expect(schemaRequirementFor('0.11.24').tables).toContain('reply_translation');
+    expect(CLOUD_SCHEMA_VERSION).toBe(67);
   });
 
   test('the version in package.json needs the schema this code applies', () => {

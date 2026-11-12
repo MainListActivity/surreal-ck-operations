@@ -170,6 +170,11 @@ run('语言按职能：还没有员工时按要派的职能判定，消息先对
     // 派工前（还没有员工）：要派的职能有语言即等待译文；没有职能或职能无语言则不等。
     expect(await store.awaitingTranslation(task.id, 'execute', undefined, 'engineering')).toBe(true);
     expect(await store.awaitingTranslation(task.id, 'execute', undefined)).toBe(false);
+    // 老板常用语言与职能语言相同即不翻译；改回中文后恢复等待译文。
+    await w.surreal.query("UPSERT company_meta:config SET owner_lang = 'en';");
+    expect(await store.awaitingTranslation(task.id, 'execute', undefined, 'engineering')).toBe(false);
+    await w.surreal.query("UPSERT company_meta:config SET owner_lang = 'zh';");
+    expect(await store.awaitingTranslation(task.id, 'execute', undefined, 'engineering')).toBe(true);
     expect(await store.awaitingTranslation(task.id, 'execute', undefined, 'qa')).toBe(false);
 
     // 对齐到职能语言：消息带上语言，补译才会开始。

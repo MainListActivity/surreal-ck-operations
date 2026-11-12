@@ -126,7 +126,7 @@ sck call company_cmd '{"command":"<命令名>","input":{...}}'
 - 每次调用（含被拒绝的和只读的）写一条审计。老板用 `guard.protect` 把命令加入保护清单（`ownerOnly` 缺省为仅老板），用 `agent.policy.set` 按职能停用员工或设允许、禁止清单（策略存在职能上，对该职能每轮新开的员工实例同样生效）。
 - 令牌只在网关调用的局部变量里存在。返回与错误文本中出现的令牌一律替换，不写会话、comm 目录、证据或日志。
 
-**风险（待审阅者决定）。** 网关不区分调用方是否老板。除写死的 5 条仅老板命令、员工不可见的 `ops.job.list` 与 `audit.list`、保护清单与员工策略外，持有有效租约的员工可以调用其余全部命令；按目标锁定的命令只拒绝锁定的目标。这包括替老板作决定（`decide`、`approve`、`reject`；`approve` 会写入标为老板签署的人工验收证据）、代老板下指示（`instruct`、`direction.add`）、改路由与派工模板（`route.save`）、暂停全部派工（`task.pause`）、用老板的 Cloudflare 令牌调用未锁定的账号资源（`cf.api`），以及执行端命令（`host.exec`、`task.create`）。执行端作业入队后，只有 `ops_*` 在认领时核对租约，其余作业即使租约已结束也会执行。上线前，老板应把这些命令加入保护清单，或由审阅者决定写死为仅老板。细节见 [owner-end 权限模型](../owner-end/README.md#权限模型)。
+**风险（待审阅者决定）。** 网关不区分调用方是否老板。除写死的 6 条仅老板命令、员工不可见的 `ops.job.list` 与 `audit.list`、保护清单与员工策略外，持有有效租约的员工可以调用其余全部命令；按目标锁定的命令只拒绝锁定的目标。这包括替老板作决定（`decide`、`approve`、`reject`；`approve` 会写入标为老板签署的人工验收证据）、代老板下指示（`instruct`、`direction.add`）、改路由与派工模板（`route.save`）、暂停全部派工（`task.pause`）、用老板的 Cloudflare 令牌调用未锁定的账号资源（`cf.api`），以及执行端命令（`host.exec`、`task.create`）。执行端作业入队后，只有 `ops_*` 在认领时核对租约，其余作业即使租约已结束也会执行。上线前，老板应把这些命令加入保护清单，或由审阅者决定写死为仅老板。细节见 [owner-end 权限模型](../owner-end/README.md#权限模型)。
 
 ## 员工编制（SurrealDB）
 

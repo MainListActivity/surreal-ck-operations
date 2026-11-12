@@ -25,6 +25,7 @@ function Decision({ item, projectName, now }: { item: DecisionItem; projectName?
         <Status tone={item.tone}>{item.label}</Status>
         <a class="decision-title" href={item.href}>{item.title}</a>
         <p class="decision-reason">{item.reason}</p>
+        {item.reasonOriginal ? <details class="original"><summary>原文</summary><span>{item.reasonOriginal}</span></details> : null}
         <p class="decision-meta">
           {projectName ? <span>{projectName}</span> : null}
           {item.at ? <span>{friendlyTime(item.at, now)}</span> : null}

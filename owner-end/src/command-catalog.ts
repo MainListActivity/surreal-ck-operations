@@ -56,6 +56,8 @@ export const COMMAND_CATALOG: readonly CommandSpec[] = [
   c('brief', '看板与状态', '老板简报', '无', { readOnly: true }),
   c('board.snapshot', '看板与状态', '老板看板快照（线、卡片与待发消息）', 'now?', { readOnly: true }),
   c('cmd.catalog', '看板与状态', '列出可调用的命令（员工只看到自己能用的）', '无', { readOnly: true }),
+  c('owner.settings.get', '翻译', '老板设置：常用语言', '无', { readOnly: true }),
+  c('owner.settings.set', '翻译', '设置老板常用语言（员工回报译成这种语言）', 'lang'),
 
   c('task.list', '任务', '最近 300 个任务', '无', { readOnly: true }),
   c('task.detail', '任务', '任务详情、审计记录与消息', 'taskId', { readOnly: true }),

@@ -1,3 +1,4 @@
+import { ownerLangOf, replyTranslationsOf } from './owner-lang.ts';
 import { parseWorkHours } from './work-hours.ts';
 /**
  * 老板接口：任何持有 owner-token 的 agent 都能调用（网页控制台与 sck owner 共用同一套 JSON 命令）。
@@ -202,7 +203,10 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       if (!rows?.length) throw new CompanyError('not_found', 'task not found');
       const [audit] = await db.query<[unknown[]]>('SELECT * FROM audit WHERE task = $task ORDER BY at;', { task: new RecordId('task', taskId) });
       const [messages] = await db.query<[unknown[]]>('SELECT * FROM outbound_message WHERE task = $task ORDER BY created_at;', { task: new RecordId('task', taskId) });
-      return { task: rows[0], audit, messages };
+      // 员工回报的译文（audit 编号 → 老板常用语言的译文）；没有译文的回报照原文显示。
+      const translations = Object.fromEntries(await replyTranslationsOf(db,
+        (audit ?? []) as Array<{ id?: unknown; evidence?: unknown; action?: unknown }>, await ownerLangOf(db)));
+      return { task: rows[0], audit, messages, translations };
     }
     case 'progress': return readProgress(db);
     case 'task.list': { const [rows] = await db.query<[unknown[]]>('SELECT * FROM task ORDER BY created_at DESC LIMIT 300;'); return { tasks: rows }; }

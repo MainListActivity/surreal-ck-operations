@@ -5,11 +5,14 @@ import { classifyFeedbackWith } from './feedback-triage.ts';
 /**
  * 定时任务（Worker 的 scheduled 入口，按 cron 表达式分派）：
  * - 每分钟：为在岗员工补齐 agent 身份（ma_hono 的 kind=agent 用户，记入 agent_identity）；
- *   为选了语言但译文缺失或过期的待发消息补译（一次最多 TRANSLATIONS_PER_RUN 条，避免超时）。
+ *   为选了语言但译文缺失或过期的待发消息补译（一次最多 TRANSLATIONS_PER_RUN 条，避免超时）；
+ *   把员工用职能语言写的提交、退回、受阻说明译回老板常用语言（refreshReplyTranslations，同样每次最多 TRANSLATIONS_PER_RUN 条）。
  * - 每天一次：笔记整理（consolidateDue，到期才真正运行）；配置了 magpie 时用它做改写，改写失败回退为原文。
  * 任何一步失败只记录，不影响其它步骤。定时任务用自动化令牌（ac=automation）访问数据库。
  */
-import type { Surreal } from 'surrealdb';
+import { RecordId, type Surreal } from 'surrealdb';
+import { langMatches, ownerLangOf, replyHash, REPLY_ACTIONS } from '../../src/owner-lang.ts';
+import { MAX_TRANSLATION } from './translate.ts';
 import { consolidateDue } from '../../src/lane-notes-consolidate.ts';
 import { CompanyError } from '../../src/core-errors.ts';
 import { OutboundMessageStore, type OutboundMessage } from '../../src/outbound-messages.ts';
@@ -19,7 +22,7 @@ import { inServiceEmployees } from './employees.ts';
 import { ensureEmployeeIdentity } from './idp-commands.ts';
 import { translateChecked, translationFresh } from './messages.ts';
 import { rewriteNotesWith } from './translate.ts';
-import type { Row } from './rows.ts';
+import { keyOf, type Row } from './rows.ts';
 
 /** 每分钟一次：身份同步与补译。 */
 export const MINUTE_CRON = '* * * * *';
@@ -98,6 +101,61 @@ export async function refreshTranslations(cfg: Config, db: Surreal, options: Cro
   return result;
 }
 
+/** 译回只看最近这段时间的员工回报；更早的说明不再补译。 */
+export const REPLY_WINDOW_DAYS = 14;
+/** 译回失败后隔这么久再试（毫秒），一直译不出的说明不会每分钟都调一次翻译。 */
+export const REPLY_RETRY_MS = 30 * 60_000;
+
+/**
+ * 员工回报译回老板语言（067 reply_translation）：员工所属职能设了语言、且与老板常用语言不同时，
+ * 把它最近的提交、退回、受阻说明译成老板语言。已译且原文未变的跳过；失败记下时间，先译没失败过的，失败过的隔 REPLY_RETRY_MS 再试。
+ */
+export async function refreshReplyTranslations(cfg: Config, db: Surreal, options: CronOptions = {}): Promise<TranslationSync> {
+  if (!cfg.magpie) return { translated: 0, failed: 0, skipped: 'not_configured' };
+  const ownerLang = await ownerLangOf(db);
+  const [policies] = await db.query<[Row[]]>('SELECT agent, lang FROM agent_policy WHERE lang != NONE;');
+  const foreign = new Set((policies ?? []).filter((row) => typeof row.lang === 'string' && !langMatches(row.lang, ownerLang)).map((row) => String(row.agent)));
+  const result: TranslationSync = { translated: 0, failed: 0 };
+  if (!foreign.size) return result;
+  const [audits] = await db.query<[Row[]]>(
+    `SELECT id, actor, evidence, at FROM audit WHERE at > time::now() - ${REPLY_WINDOW_DAYS}d AND action IN $actions
+      AND type::is_string(evidence) AND evidence != '' ORDER BY at DESC LIMIT 200;`, { actions: [...REPLY_ACTIONS] });
+  if (!audits?.length) return result;
+  const actors = [...new Set(audits.map((row) => keyOf(row.actor)))];
+  const [employees] = await db.query<[Row[]]>('SELECT id, role FROM employee WHERE id IN $ids;',
+    { ids: actors.map((actor) => new RecordId('employee', actor)) });
+  const roleOf = new Map((employees ?? []).map((row) => [keyOf(row.id), String(row.role ?? '')]));
+  const candidates = audits.filter((row) => foreign.has(roleOf.get(keyOf(row.actor)) ?? '') && String(row.evidence).length <= MAX_TRANSLATION);
+  if (!candidates.length) return result;
+  const [done] = await db.query<[Row[]]>('SELECT source, source_hash, text, failed_at FROM reply_translation WHERE source IN $ids AND lang = $lang;',
+    { ids: candidates.map((row) => row.id), lang: ownerLang });
+  const existing = new Map((done ?? []).map((row) => [keyOf(row.source), row]));
+  const pending: Array<{ row: Row; hash: string; failedAt: number }> = [];
+  for (const row of candidates) {
+    const hash = await replyHash(String(row.evidence));
+    const prior = existing.get(keyOf(row.id));
+    if (prior && prior.source_hash === hash && typeof prior.text === 'string' && prior.text) continue;
+    pending.push({ row, hash, failedAt: prior?.source_hash === hash ? Date.parse(String(prior.failed_at ?? '')) || 0 : 0 });
+  }
+  pending.sort((a, b) => a.failedAt - b.failedAt);
+  const retryBefore = (options.now ?? new Date()).getTime() - REPLY_RETRY_MS;
+  for (const { row, hash } of pending.filter((item) => item.failedAt < retryBefore).slice(0, TRANSLATIONS_PER_RUN)) {
+    const rid = new RecordId('reply_translation', `${keyOf(row.id)}:${ownerLang}`);
+    try {
+      const text = await translateChecked(cfg, String(row.evidence), ownerLang, options.fetch);
+      await db.query('UPSERT $rid SET source = $source, lang = $lang, source_hash = $hash, text = $text, failed_at = NONE, at = time::now();',
+        { rid, source: row.id, lang: ownerLang, hash, text });
+      result.translated += 1;
+    } catch (error) {
+      console.error('owner-end reply translation failed', keyOf(row.id), reasonOf(error));
+      await db.query('UPSERT $rid SET source = $source, lang = $lang, source_hash = $hash, failed_at = time::now(), at = time::now();',
+        { rid, source: row.id, lang: ownerLang, hash }).catch(() => undefined);
+      result.failed += 1;
+    }
+  }
+  return result;
+}
+
 /** 按 cron 表达式执行一轮定时任务，返回可记录的摘要。 */
 export async function runScheduled(cfg: Config, sessions: Sessions, cron: string, options: CronOptions = {}): Promise<unknown> {
   const now = options.now ?? new Date();
@@ -109,10 +167,14 @@ export async function runScheduled(cfg: Config, sessions: Sessions, cron: string
     }
     const identities = await syncAgentIdentities(cfg, db, options);
     const translations = await refreshTranslations(cfg, db, options);
+    const replies = await refreshReplyTranslations(cfg, db, options).catch((error) => {
+      console.error('owner-end reply translations failed', reasonOf(error));
+      return { failed: true };
+    });
     const feedback = cfg.magpie
       ? await triageFeedback(db, classifyFeedbackWith(cfg.magpie, options.fetch), now.getTime()).catch(() => ({ failed: true }))
       : { skipped: 'not_configured' };
     const planning = cfg.magpie ? await planRequirements(db, planRequirementWith(cfg.magpie, options.fetch), now.getTime()).catch(() => ({ failed: true })) : { skipped: 'not_configured' };
-    return { identities, translations, feedback, planning };
+    return { identities, translations, replies, feedback, planning };
   });
 }

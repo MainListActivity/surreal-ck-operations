@@ -19,8 +19,11 @@ interface TaskRow {
   [key: string]: unknown;
 }
 
-interface AuditRow { action?: string; actor?: unknown; at?: unknown; evidence?: string }
-interface TaskDetail { task: TaskRow; audit?: AuditRow[]; messages?: unknown[] }
+interface AuditRow { id?: unknown; action?: string; actor?: unknown; at?: unknown; evidence?: string }
+interface TaskDetail { task: TaskRow; audit?: AuditRow[]; messages?: unknown[]; translations?: Record<string, string> }
+
+/** 审计编号的键部分（JSON 里是 `audit:xxx` 或 `audit:⟨xxx⟩`），用来找它的译文。 */
+const auditKey = (id: unknown): string => String(id ?? '').replace(/^audit:/, '').replace(/^⟨(.*)⟩$/, '$1');
 
 const EMPTY_FORM: TaskFormValues = { title: '', requirement: '', acceptanceText: '', executorRole: '', reviewerRole: '', type: '' };
 
@@ -38,7 +41,7 @@ const inGroup = (state: string | undefined, group: string) => {
 };
 
 const ACTION_ZH: Record<string, string> = {
-  create: '创建', claim: '领取', checkpoint: '更新进度', submit: '提交交付', review: '复核', approve: '通过', accept: '验收通过', reject: '退回', reassign: '改派', void: '作废', release: '释放',
+  create: '创建', claim: '领取', checkpoint: '更新进度', submit: '提交交付', review: '复核', return: '退回返工', block: '报告受阻', approve: '通过', accept: '验收通过', reject: '退回', reassign: '改派', void: '作废', release: '释放',
 };
 
 export function TasksPage({ route }: { route: Route }) {
@@ -186,7 +189,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                 {detail.audit.map((a, i) => (
                   <li key={i}>
                     <time>{timeText(a.at)}</time>
-                    <span><strong>{ACTION_ZH[a.action ?? ''] ?? a.action ?? '—'}</strong> · {String(a.actor ?? '')}{a.evidence ? <span class="timeline-note">{a.evidence}</span> : null}</span>
+                    <span><strong>{ACTION_ZH[a.action ?? ''] ?? a.action ?? '—'}</strong> · {String(a.actor ?? '')}{a.evidence ? <Evidence text={a.evidence} translated={detail.translations?.[auditKey(a.id)]} /> : null}</span>
                   </li>
                 ))}
               </ol>
@@ -333,5 +336,16 @@ function VoidForm({ taskId, onDone, onCancel }: { taskId: string; onDone(): void
         <button type="button" class="danger" disabled={busy || note.trim().length < 2} onClick={() => void run('task.void', { taskId, note: note.trim() }, '已作废', () => { setNote(''); onDone(); })}>确认作废</button>
       </div>
     </div>
+  );
+}
+
+/** 员工回报：有老板语言的译文时显示译文，原文折叠在下面。 */
+function Evidence({ text, translated }: { text: string; translated?: string }) {
+  if (!translated) return <span class="timeline-note">{text}</span>;
+  return (
+    <span class="timeline-note">
+      {translated}
+      <details class="original"><summary>原文</summary><span>{text}</span></details>
+    </span>
   );
 }

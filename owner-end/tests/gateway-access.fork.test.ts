@@ -12,6 +12,8 @@ import { writeRunnerHeartbeat } from '../../src/board.ts';
 import { OutboundMessageStore } from '../../src/outbound-messages.ts';
 import { decide } from '../../src/command-guard.ts';
 import { runOwnerCommandOn } from '../src/commands.ts';
+import { refreshReplyTranslations, REPLY_RETRY_MS } from '../src/cron.ts';
+import type { Config } from '../src/env.ts';
 
 setDefaultTimeout(60000);
 // 老板端网关的访问规则（fork）：058 应用后，gateway 令牌写 protected_command / agent_policy 被拒，改删 ops_audit 被拒。
@@ -282,6 +284,52 @@ run('老板令牌在页面里编辑员工定义：未给出的字段保持原值
   await runOwnerCommandOn({}, owner, 'owner-1', 'def.enable', { id: 'gw-def-a' });
   expect(await read()).toMatchObject({ enabled: true });
   expect((await read()).disabled_reason).toBeUndefined();
+});
+
+run('员工回报译回老板语言：只译设了外语的职能的提交/退回/受阻说明，译过不重译，任务详情带译文；老板语言与职能语言相同即不译', async () => {
+  const cron = await session(tokenFor('automation', 'cron-1'));
+  const owner = await session(tokenFor('owner', 'owner-1', { rl: ['Owner'] }));
+  await company.db.query(`UPSERT employee:⟨rt-cs-1⟩ SET role = 'rt-cs', paseo_agent_id = 'agent-rt-cs';
+    UPSERT employee:⟨rt-plain-1⟩ SET role = 'rt-plain', paseo_agent_id = 'agent-rt-plain';
+    CREATE agent_policy CONTENT { agent: 'rt-cs', lang: 'en', deny: [], updated_by: 'root', updated_at: time::now() };
+    CREATE task:rt_task CONTENT { title: '回译', state: 'blocked', kind: 'task', fence: 1, version: 3 };
+    CREATE audit:rt_block CONTENT { task: task:rt_task, actor: 'rt-cs-1', action: 'block', evidence: 'Waiting for the API key', version: 2, at: time::now() };
+    CREATE audit:rt_progress CONTENT { task: task:rt_task, actor: 'rt-cs-1', action: 'checkpoint', evidence: 'Half done', version: 1, at: time::now() };
+    CREATE audit:rt_plain CONTENT { task: task:rt_task, actor: 'rt-plain-1', action: 'submit', evidence: '已完成', version: 3, at: time::now() };`);
+  const asked: string[] = [];
+  const fakeFetch = (async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as { messages: Array<{ content: string }> };
+    asked.push(`${body.messages[0]!.content.match(/语言代码 (\S+) /)?.[1]}|${body.messages[1]!.content}`);
+    return Response.json({ choices: [{ message: { content: '等待 API 密钥' } }] });
+  }) as unknown as typeof fetch;
+  const cfg = { magpie: { baseUrl: 'http://magpie.test', apiKey: 'k', model: 'm' } } as unknown as Config;
+
+  expect(await refreshReplyTranslations(cfg, cron, { fetch: fakeFetch })).toEqual({ translated: 1, failed: 0 });
+  expect(asked).toEqual(['zh|Waiting for the API key']);
+  expect(await refreshReplyTranslations(cfg, cron, { fetch: fakeFetch })).toEqual({ translated: 0, failed: 0 });
+
+  // 译不出的说明记下失败，冷却期内不再调翻译，过了冷却期再试。
+  await company.db.query("CREATE audit:rt_fail CONTENT { task: task:rt_task, actor: 'rt-cs-1', action: 'return', evidence: 'Tests are failing', version: 4, at: time::now() };");
+  let calls = 0;
+  const failing = (async () => { calls += 1; return new Response('down', { status: 503 }); }) as unknown as typeof fetch;
+  expect(await refreshReplyTranslations(cfg, cron, { fetch: failing })).toEqual({ translated: 0, failed: 1 });
+  expect(await refreshReplyTranslations(cfg, cron, { fetch: failing })).toEqual({ translated: 0, failed: 0 });
+  expect(calls).toBeGreaterThan(0);
+  const before = calls;
+  expect(await refreshReplyTranslations(cfg, cron, { fetch: failing, now: new Date(Date.now() + REPLY_RETRY_MS + 60_000) })).toEqual({ translated: 0, failed: 1 });
+  expect(calls).toBeGreaterThan(before);
+  await company.db.query('DELETE audit:rt_fail; DELETE reply_translation WHERE source = audit:rt_fail;');
+
+  const detail = await runOwnerCommandOn({}, owner, 'owner-1', 'task.detail', { taskId: 'rt_task' }) as { translations: Record<string, string> };
+  expect(detail.translations).toEqual({ rt_block: '等待 API 密钥' });
+
+  // 老板改用英文：英文职能的回报不再需要翻译，详情里也没有英文译文。
+  expect(await runOwnerCommandOn({}, owner, 'owner-1', 'owner.settings.set', { lang: 'en' })).toEqual({ lang: 'en' });
+  expect(await runOwnerCommandOn({}, owner, 'owner-1', 'owner.settings.get', {})).toEqual({ lang: 'en' });
+  expect(await refreshReplyTranslations(cfg, cron, { fetch: fakeFetch })).toEqual({ translated: 0, failed: 0 });
+  expect((await runOwnerCommandOn({}, owner, 'owner-1', 'task.detail', { taskId: 'rt_task' }) as { translations: Record<string, string> }).translations).toEqual({});
+  await expect(runOwnerCommandOn({}, owner, 'owner-1', 'owner.settings.set', { lang: 'not a lang' })).rejects.toThrow('lang invalid');
+  await runOwnerCommandOn({}, owner, 'owner-1', 'owner.settings.set', { lang: 'zh' });
 });
 
 run('正控制：老板与 root 写 protected_command、agent_policy 放行，拒绝只来自访问方式而非 schema 故障', async () => {

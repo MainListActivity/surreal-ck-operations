@@ -134,7 +134,7 @@
 - **员工**：`ac=agent`，令牌必须带任务绑定。员工的命令经过命令守卫（`src/command-guard.ts`）和网关的专属规则，按固定顺序判定，第一条不通过即拒绝并写审计：
   员工策略（`agent_policy`）按职能保存：`agent` 字段存职能名，员工按自己所属的职能取策略，同一职能的所有实例（含每轮新开的）共用一条。
   1. 员工所属职能已停用（`agent_policy.disabled`）；
-  2. 命中写死的老板专属命令（`HARD_OWNER_ONLY`，共 5 条：`guard.*`、`agent.*`、`owner.login.*`、`def.*`、`db.write`）；
+  2. 命中写死的老板专属命令（`HARD_OWNER_ONLY`，共 6 条：`guard.*`、`agent.*`、`owner.login.*`、`owner.settings.*`、`def.*`、`db.write`）；
   3. 命中 `protected_command` 中标记为 `owner_only` 的命令。老板可以在「仅老板」清单里增删；
   4. 不在员工的允许清单（`agent_policy.allow`）内，或命中禁止清单（`agent_policy.deny`）；
   5. 没有该任务的有效租约（持有人是本员工且未过期）；
@@ -160,7 +160,7 @@
 - **云端资源**：`cf.api` 用老板的 Cloudflare 令牌调用 `/accounts/<账号>/` 下的接口。只锁定老板端与 ma_hono 的 Worker、D1、API 令牌、`maplayer.top` 域名下的写操作，其它账号资源不受限。
 - **执行端命令**：`host.exec`（在 `arm-free-1` 上以 `sck-agent` 用户执行命令）、`task.create`。执行端作业入队后，只有 `ops_*` 在认领时核对租约，其余作业即使租约已结束也会执行。
 
-守卫里写死的只有 `HARD_OWNER_ONLY` 的 5 条。老板可以用 `guard.protect` 把命令加入保护清单（`ownerOnly` 缺省为仅老板），或在员工策略（`agent.policy.set`）里设禁止清单。上线前应先把上面的命令加入保护清单。是否写死为仅老板，由审阅者决定。
+守卫里写死的只有 `HARD_OWNER_ONLY` 的 6 条。老板可以用 `guard.protect` 把命令加入保护清单（`ownerOnly` 缺省为仅老板），或在员工策略（`agent.policy.set`）里设禁止清单。上线前应先把上面的命令加入保护清单。是否写死为仅老板，由审阅者决定。
 
 ### 审计
 
@@ -222,7 +222,7 @@ main 的 Quality gate 和 Release 成功后，`deploy-owner` 作业先构建云�
 2. **`surrealdb` 解析自仓库根。** `owner-end/package.json` 没有声明 `surrealdb`，它来自根目录的 `node_modules`，版本见根目录 `package.json`。
 3. **页面不用 cookie。** 页面用 PKCE 取得访问令牌，令牌只放在页面内存里，并同步到 `sessionStorage`（键 `sck.owner.session`），不用 localStorage。所有接口只认 `Authorization: Bearer`。
 4. **员工写命令的审计标签。** 员工的写命令经网关执行时，核心记录的操作人标签是 `owner:agent`（`src/owner-api.ts`）；网关的 `ops_audit` 行记录的是员工身份（`actorKind=agent`）。同一次调用可能有两层记录，看审计时以员工身份为准。
-5. **员工能调用的命令范围变大，需要复核。** 员工的只读白名单已移除，网关按「权限模型」判定放行。插件用 `company_cmd` 把员工的调用转给网关，员工能到达的范围因此与网关一致，只扣除守卫拒绝的部分，见「员工可达的范围」。`HARD_OWNER_ONLY` 只写死 5 条，`host.exec` 与 `task.create` 不在其中。建议老板把它们和其它高危命令加入「仅老板」清单；若要写死为仅老板，需要审阅者决定（改 `HARD_OWNER_ONLY` 会与既有测试的固定清单冲突）。
+5. **员工能调用的命令范围变大，需要复核。** 员工的只读白名单已移除，网关按「权限模型」判定放行。插件用 `company_cmd` 把员工的调用转给网关，员工能到达的范围因此与网关一致，只扣除守卫拒绝的部分，见「员工可达的范围」。`HARD_OWNER_ONLY` 只写死 6 条，`host.exec` 与 `task.create` 不在其中。建议老板把它们和其它高危命令加入「仅老板」清单；若要写死为仅老板，需要审阅者决定（改 `HARD_OWNER_ONLY` 会与既有测试的固定清单冲突）。
 6. **执行端作业的结果由插件轮询取回。** 作业超过 25 秒返回 `pending` 时，插件的网关客户端（`src/cloud/gateway.ts`）按作业号轮询 `ops.job.get`，最长 15 分钟，员工收到的是最终结果或错误。轮询只能取到本员工发起的作业。
 7. **执行端的命令不核对员工租约。** `task.create` 在执行端以无员工身份的方式执行（`src/cloud/ops-jobs.ts` 的 `runnerOnly` 分支只接收命令与输入）；`host.exec` 同样不核对（`mayClaim` 只对 `ops_*` 作业核对租约）。员工的身份与租约只在网关入队时判定，作业入队后即使租约已结束也会执行。
 8. **`ops.job.list`、`audit.list` 的拒绝不是数据层边界。** 这两条只在网关拒绝。viewer 令牌的 `db.read` 理论上能直接读 `ops_audit` 与 `ops_job`，因为系统用户不受表权限约束（见 `schema/056` 的注释）。要在数据层收紧，需要另做 schema 改动。

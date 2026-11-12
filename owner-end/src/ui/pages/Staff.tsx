@@ -91,6 +91,8 @@ export function StaffPage() {
     <div class="page">
       <PageHeader title="员工与权限" description="按职能设置命令范围与译文语言，对该职能的所有员工生效；修改会写入审计。" />
       <nav class="jump-bar" aria-label="页内导航"><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-agents')?.scrollIntoView({ behavior: 'smooth' }); }}>职能策略</a><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-guard')?.scrollIntoView({ behavior: 'smooth' }); }}>受保护命令</a><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-locked')?.scrollIntoView({ behavior: 'smooth' }); }}>固定限制</a></nav>
+      <OwnerLangPanel />
+
       <Panel id="staff-agents" title="职能" hint="每轮会话都会新开员工实例，所以策略按职能保存：停用、允许/拒绝清单与译文语言对这个职能的所有员工生效。员工定义决定这个职能由哪些 CLI 与模型来干活。">
         {roleError ? <p class="notice err">职能列表读取失败：{roleError}</p> : null}
         {roles === undefined && !roleError ? <p class="hint">正在读取职能…</p> : null}
@@ -232,7 +234,7 @@ function RoleCard({ row, defs, allDefs, onChanged }: { row: RoleRow; defs: DefRo
             <select value={lang} disabled={busy} onChange={e => setLang(e.currentTarget.value)}>
               {langOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
             </select>
-            <span class="field-hint">派给这个职能的消息先译成这种语言再发。</span>
+            <span class="field-hint">派给这个职能的消息先译成这种语言再发；他们的提交、退回与受阻说明译回你的常用语言。与你的常用语言相同则不翻译。</span>
           </label>
           <NoticeLine notice={notice} />
           <div class="button-row">
@@ -306,5 +308,32 @@ function GuardSection({ guard, onChanged }: { guard: GuardList; onChanged(): voi
         </div>
       </div>
     </>
+  );
+}
+
+const OWNER_LANG_OPTIONS = [{ value: 'zh', label: '中文 zh' }, ...LANG_OPTIONS.filter(o => o.value)];
+
+/** 老板常用语言：员工的提交、退回、受阻说明译成这种语言；职能语言与之相同的消息不翻译。 */
+function OwnerLangPanel() {
+  const [saved, setSaved] = useState<string>();
+  const [lang, setLang] = useState('zh');
+  const { busy, notice, run } = useAction();
+  useEffect(() => {
+    void runCommand<{ lang: string }>('owner.settings.get').then(out => {
+      if (out.kind === 'ok') { setSaved(out.result.lang); setLang(out.result.lang); }
+    });
+  }, []);
+  const options = OWNER_LANG_OPTIONS.some(o => o.value === lang) ? OWNER_LANG_OPTIONS : [{ value: lang, label: lang }, ...OWNER_LANG_OPTIONS];
+  return (
+    <Panel id="staff-owner-lang" title="你的常用语言" hint="设了译文语言的职能：派给他们的消息从这种语言译过去，他们的提交、退回与受阻说明译回这种语言（原文随时可看）。">
+      <div class="inline-field">
+        <select aria-label="老板常用语言" value={lang} disabled={busy || saved === undefined} onChange={e => setLang(e.currentTarget.value)}>
+          {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+        <button type="button" class="primary" disabled={busy || saved === undefined || lang === saved}
+          onClick={() => void run('owner.settings.set', { lang }, '已保存常用语言', () => setSaved(lang))}>保存</button>
+      </div>
+      <NoticeLine notice={notice} />
+    </Panel>
   );
 }

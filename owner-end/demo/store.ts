@@ -43,7 +43,7 @@ export class DemoStore {
       }
     }
   }
-  defRows?:Row[];
+  defRows?:Row[]; ownerLang='zh';
   /** 演示的员工定义：每个演示职能一条 Claude 定义；重置数据后重新生成。 */
   defs():Row[]{return this.defRows??=[...new Set(this.data.agents.map(a=>String(a.role)))].sort().map(role=>({id:`${role}-demo`,role,provider:'claude',model:'claude-haiku-5-5',thinking:'max',enabled:true,maxInstances:2,priority:100,weight:10,errorStreak:0}));}
   touch(r:Row){r.updated_at=new Date().toISOString();}
@@ -84,6 +84,8 @@ export class DemoStore {
       case 'task.resume':this.paused=false;return{paused:false};
       // 与生产一致按职能返回：同职能的演示员工共用一条策略（取该职能第一位员工的策略）。
       case 'agent.list':return{roles:[...new Set(this.data.agents.map(a=>String(a.role)))].sort().map(role=>{const members=this.data.agents.filter(a=>a.role===role);return{role,defs:this.defs().filter(d=>d.role===role).map(d=>({id:d.id,enabled:d.enabled,model:d.model})),onDuty:members.map(a=>({employee:a.employee,def:`${role}-demo`})),policy:members[0].policy};})};
+      case 'owner.settings.get':return{lang:this.ownerLang};
+      case 'owner.settings.set':{if(typeof input.lang!=='string'||!/^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?$/.test(input.lang))throw new DemoError('lang invalid');this.ownerLang=input.lang;return{lang:input.lang};}
       case 'def.list':return{defs:this.defs()};
       case 'def.ensure':{if(!/^[a-z0-9][a-z0-9-]{2,40}$/.test(String(input.id)))throw new DemoError('Invalid def ID');const row=this.defs().find(d=>d.id===input.id);const next={errorStreak:0,...row,id:input.id,role:input.role,provider:input.provider,model:input.model,thinking:input.thinking??undefined,maxInstances:input.maxInstances??row?.maxInstances??1,priority:input.priority??row?.priority??100,weight:input.weight??row?.weight??10,enabled:input.enabled??row?.enabled??true,...(input.quotaLimited===false?{quotaLimited:false}:{quotaLimited:undefined}),workHours:input.workHours===undefined?row?.workHours:input.workHours??undefined};if(row)Object.assign(row,next);else this.defs().push(next);return{};}
       case 'def.disable':{const d=this.find(this.defs(),input.id);d.enabled=false;d.disabledReason=input.reason??'老板停用';return{ok:true};}

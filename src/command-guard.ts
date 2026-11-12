@@ -12,12 +12,12 @@ export function matchesCommand(pattern: string, command: string): boolean {
 
 /**
  * 写死的老板专属命令：除老板外任何身份都不能调用，不受 protected_command 与 agent_policy 影响。
- * 只有五类：保护开关（guard.*）、员工身份与策略（agent.*，覆盖原先的 agent.policy.*）、老板登录方式（owner.login.*，预留）、
+ * 只有六类：保护开关（guard.*）、员工身份与策略（agent.*，覆盖原先的 agent.policy.*）、老板登录方式（owner.login.*，预留）、老板设置（owner.settings.*）、
  * 能力定义（def.*）、任意 SurrealQL 写入（db.write，员工不能拿到任意写语句）。
  * 其余老板命令（任务、决策、消息、笔记、路由、身份、云端）由员工按身份、当前租约、保护清单与允许/禁止清单判定；
  * 老板可以在“仅老板”清单里把它们加入保护。按目标的硬锁（公司租户、老板端 Worker 等）在 owner-end/src/owner-locks.ts。
  */
-export const HARD_OWNER_ONLY: readonly string[] = ['guard.*', 'agent.*', 'owner.login.*', 'def.*', 'db.write'];
+export const HARD_OWNER_ONLY: readonly string[] = ['guard.*', 'agent.*', 'owner.login.*', 'owner.settings.*', 'def.*', 'db.write'];
 
 /** 老板接口（owner-api.ts）的全部命令。运行器与自动化不能直接调用；tests/command-guard.test.ts 核对它与 owner-api.ts 一致。 */
 export const OWNER_API_COMMANDS: readonly string[] = [
