@@ -12,7 +12,7 @@ import { writeRunnerHeartbeat } from '../../src/board.ts';
 import { OutboundMessageStore } from '../../src/outbound-messages.ts';
 import { decide } from '../../src/command-guard.ts';
 import { runOwnerCommandOn } from '../src/commands.ts';
-import { refreshReplyTranslations } from '../src/cron.ts';
+import { refreshReplyTranslations, REPLY_RETRY_MS } from '../src/cron.ts';
 import type { Config } from '../src/env.ts';
 
 setDefaultTimeout(60000);
@@ -307,6 +307,18 @@ run('员工回报译回老板语言：只译设了外语的职能的提交/退�
   expect(await refreshReplyTranslations(cfg, cron, { fetch: fakeFetch })).toEqual({ translated: 1, failed: 0 });
   expect(asked).toEqual(['zh|Waiting for the API key']);
   expect(await refreshReplyTranslations(cfg, cron, { fetch: fakeFetch })).toEqual({ translated: 0, failed: 0 });
+
+  // 译不出的说明记下失败，冷却期内不再调翻译，过了冷却期再试。
+  await company.db.query("CREATE audit:rt_fail CONTENT { task: task:rt_task, actor: 'rt-cs-1', action: 'return', evidence: 'Tests are failing', version: 4, at: time::now() };");
+  let calls = 0;
+  const failing = (async () => { calls += 1; return new Response('down', { status: 503 }); }) as unknown as typeof fetch;
+  expect(await refreshReplyTranslations(cfg, cron, { fetch: failing })).toEqual({ translated: 0, failed: 1 });
+  expect(await refreshReplyTranslations(cfg, cron, { fetch: failing })).toEqual({ translated: 0, failed: 0 });
+  expect(calls).toBeGreaterThan(0);
+  const before = calls;
+  expect(await refreshReplyTranslations(cfg, cron, { fetch: failing, now: new Date(Date.now() + REPLY_RETRY_MS + 60_000) })).toEqual({ translated: 0, failed: 1 });
+  expect(calls).toBeGreaterThan(before);
+  await company.db.query('DELETE audit:rt_fail; DELETE reply_translation WHERE source = audit:rt_fail;');
 
   const detail = await runOwnerCommandOn({}, owner, 'owner-1', 'task.detail', { taskId: 'rt_task' }) as { translations: Record<string, string> };
   expect(detail.translations).toEqual({ rt_block: '等待 API 密钥' });

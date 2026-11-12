@@ -78,9 +78,11 @@ test('受阻说明已译成老板语言时，原因显示译文，员工写的�
   input.board.employees[0]!.now={state:'idle'};
   Object.assign(input.employees[0]!, {runtime_state:'idle',session_task:'work'});
   Object.assign(input.tasks[0]!, {state:'blocked'});
-  input.blockedAudits=[{task:'work',actor:'dev',at:now-10,evidence:'等待 API 密钥',evidence_original:'Waiting for the API key'}];
+  input.blockedAudits=[{task:'work',actor:'dev',at:now-10,evidence:'等待 API 密钥',evidence_original:'Waiting for the API key; token=private-secret'}];
   const dev=buildRuntimeDashboard(input,now).agents.find(a=>a.id==='dev');
-  expect(dev).toMatchObject({blockedReason:'等待 API 密钥',blockedReasonOriginal:'Waiting for the API key'});
+  expect(dev).toMatchObject({blockedReason:'等待 API 密钥'});
+  expect(dev?.blockedReasonOriginal).toContain('Waiting for the API key');
+  expect(dev?.blockedReasonOriginal).not.toContain('private-secret');
   input.blockedAudits=[{task:'work',actor:'dev',at:now-10,evidence:'等待仓库权限'}];
   expect('blockedReasonOriginal' in buildRuntimeDashboard(input,now).agents.find(a=>a.id==='dev')!).toBe(false);
 });

@@ -103,10 +103,12 @@ export async function refreshTranslations(cfg: Config, db: Surreal, options: Cro
 
 /** 译回只看最近这段时间的员工回报；更早的说明不再补译。 */
 export const REPLY_WINDOW_DAYS = 14;
+/** 译回失败后隔这么久再试（毫秒），一直译不出的说明不会每分钟都调一次翻译。 */
+export const REPLY_RETRY_MS = 30 * 60_000;
 
 /**
  * 员工回报译回老板语言（067 reply_translation）：员工所属职能设了语言、且与老板常用语言不同时，
- * 把它最近的提交、退回、受阻说明译成老板语言。已译且原文未变的跳过；失败记下时间，下一轮先译没失败过的。
+ * 把它最近的提交、退回、受阻说明译成老板语言。已译且原文未变的跳过；失败记下时间，先译没失败过的，失败过的隔 REPLY_RETRY_MS 再试。
  */
 export async function refreshReplyTranslations(cfg: Config, db: Surreal, options: CronOptions = {}): Promise<TranslationSync> {
   if (!cfg.magpie) return { translated: 0, failed: 0, skipped: 'not_configured' };
@@ -136,7 +138,8 @@ export async function refreshReplyTranslations(cfg: Config, db: Surreal, options
     pending.push({ row, hash, failedAt: prior?.source_hash === hash ? Date.parse(String(prior.failed_at ?? '')) || 0 : 0 });
   }
   pending.sort((a, b) => a.failedAt - b.failedAt);
-  for (const { row, hash } of pending.slice(0, TRANSLATIONS_PER_RUN)) {
+  const retryBefore = (options.now ?? new Date()).getTime() - REPLY_RETRY_MS;
+  for (const { row, hash } of pending.filter((item) => item.failedAt < retryBefore).slice(0, TRANSLATIONS_PER_RUN)) {
     const rid = new RecordId('reply_translation', `${keyOf(row.id)}:${ownerLang}`);
     try {
       const text = await translateChecked(cfg, String(row.evidence), ownerLang, options.fetch);
