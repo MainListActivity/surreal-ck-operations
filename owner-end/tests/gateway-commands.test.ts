@@ -443,11 +443,11 @@ describe('员工调用的命令守卫与审计', () => {
     }
   });
 
-  test('n. guard.list 返回写死清单：仅老板的 5 条、员工拒绝清单、按目标锁定的规则与公司租户 id（来自配置）', async () => {
+  test('n. guard.list 返回写死清单：仅老板的 6 条、员工拒绝清单、按目标锁定的规则与公司租户 id（来自配置）', async () => {
     const owner = fakeDb();
     const deps = { ...depsWith(fakeSessions(owner.db)), cfg: testConfig({ IDP_TENANT_ID: '46aa29a6-9ee8-4052-bccd-7923f98220d7' }) };
     const result = await runCommand(deps, ownerCaller, 'guard.list', {}) as Record<string, unknown>;
-    expect(result.hardOwnerOnly).toEqual(['guard.*', 'agent.*', 'owner.login.*', 'def.*', 'db.write']);
+    expect(result.hardOwnerOnly).toEqual(['guard.*', 'agent.*', 'owner.login.*', 'owner.settings.*', 'def.*', 'db.write']);
     expect(result.ownerOnlyForAgents).toEqual(['ops.job.list', 'audit.list', ...ITERATION_COMMANDS, ...LIFECYCLE_COMMANDS]);
     expect(result.lockedTargets).toMatchObject({
       companyTenantId: '46aa29a6-9ee8-4052-bccd-7923f98220d7',

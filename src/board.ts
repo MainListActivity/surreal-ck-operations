@@ -1,3 +1,4 @@
+import { langMatches, ownerLangOf } from './owner-lang.ts';
 /**
  * 老板看板的数据层：每个员工现在在干什么、接下来干什么、要发给他的消息原文。
  *
@@ -181,7 +182,8 @@ export interface BoardOutboxRow {
    */
   workdirPending: boolean;
   hold: boolean;
-  lang: 'zh';
+  /** The language the stored body is written in: the owner's language (company_meta:config.owner_lang, zh by default). */
+  lang: string;
   editable: true;
   /** Only when the message has a language for this employee (see effectiveLangOf): the translation the employee would receive. */
   translation?: BoardTranslation;
@@ -363,7 +365,7 @@ export function renderContextFor(view: BoardView, employeeId: string,
 export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promise<OwnerBoard> {
   const now = opts.now ?? Date.now();
   const nowSec = Math.floor(now / 1000);
-  const [view, beats, employeeRows, openRows, recentRows, policyRows, unsent] = await Promise.all([
+  const [view, beats, employeeRows, openRows, recentRows, policyRows, unsent, ownerLang] = await Promise.all([
     readBoardView(db),
     rowsOf(db, 'SELECT runner, host, version, at FROM runner_heartbeat ORDER BY at DESC LIMIT 1;'),
     rowsOf(db, `SELECT id, role, def, provider, model, idle_since, lane FROM employee
@@ -375,6 +377,7 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
     rowsOf(db, 'SELECT agent, lang FROM agent_policy;'),
     // Every unsent message, not only the open tasks': the messages list shows all of them.
     rowsOf(db, "SELECT * FROM outbound_message WHERE state != 'sent' ORDER BY created_at DESC;"),
+    ownerLangOf(db),
   ]);
   const tasks = new Map(openRows.map(row => [keyOf(row.id), row] as const));
   const previewIds = [...new Map(unsent.map(row => [keyOf(row.task), row.task])).values()];
@@ -428,7 +431,8 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
   // translation rows.
   const langByRole = new Map<string, string>();
   for (const row of policyRows) {
-    if (typeof row.lang === 'string' && row.lang) langByRole.set(String(row.agent), row.lang);
+    // A role that speaks the owner's language gets no translation (see OutboundMessageStore.langOf).
+    if (typeof row.lang === 'string' && row.lang && !langMatches(row.lang, ownerLang)) langByRole.set(String(row.agent), row.lang);
   }
   const roleOfEmployee = new Map(employeeRows.map(row => [keyOf(row.id), String(row.role ?? '')] as const));
   const langOf = { get: (employeeId: string): string | undefined => langByRole.get(roleOfEmployee.get(employeeId) ?? '') };
@@ -493,7 +497,7 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
     const translation = translationOf(message, langOf.get(employeeId), text => dispatchText(renderMessage(text, ctx), workdir));
     return { messageId: keyOf(draft.id), taskId, title: String(row.title ?? ''), step,
       context: contexts.get(taskId),
-      body: dispatchText(renderMessage(message.body, ctx), workdir), workdirPending: workdir === undefined, hold: heldAt(taskId), lang: 'zh', editable: true,
+      body: dispatchText(renderMessage(message.body, ctx), workdir), workdirPending: workdir === undefined, hold: heldAt(taskId), lang: ownerLang, editable: true,
       ...(translation ? { translation } : {}) };
   };
 

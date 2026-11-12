@@ -305,6 +305,7 @@ describe('runScheduled 按 cron 表达式分派', () => {
     expect(result).toEqual({
       identities: { linked: 0, created: 0, failed: [], skipped: 'not_configured' },
       translations: { translated: 0, failed: 0, skipped: 'not_configured' },
+      replies: { translated: 0, failed: 0, skipped: 'not_configured' },
       feedback: { skipped: 'not_configured' }, planning: { skipped: 'not_configured' },
     });
     expect(requests).toHaveLength(0);
@@ -332,6 +333,7 @@ describe('runScheduled 按 cron 表达式分派', () => {
     expect(result).toEqual({
       identities: { linked: 1, created: 1, failed: [] },
       translations: { translated: 1, failed: 0 },
+      replies: { translated: 0, failed: 0 },
       feedback: {linked:0,dismissed:0,failed:0}, planning:{planned:0,failed:0},
     });
     expect(requests.map((r) => `${r.method} ${r.url}`)).toEqual([

@@ -73,6 +73,18 @@ test('正常阻塞清空租约后按最后阻塞审计保留员工、项目和�
   expect(result.projects?.find(p=>p.id==='app')?.blocked).toBe(1);
 });
 
+test('受阻说明已译成老板语言时，原因显示译文，员工写的原文另附', () => {
+  const input=fixture();
+  input.board.employees[0]!.now={state:'idle'};
+  Object.assign(input.employees[0]!, {runtime_state:'idle',session_task:'work'});
+  Object.assign(input.tasks[0]!, {state:'blocked'});
+  input.blockedAudits=[{task:'work',actor:'dev',at:now-10,evidence:'等待 API 密钥',evidence_original:'Waiting for the API key'}];
+  const dev=buildRuntimeDashboard(input,now).agents.find(a=>a.id==='dev');
+  expect(dev).toMatchObject({blockedReason:'等待 API 密钥',blockedReasonOriginal:'Waiting for the API key'});
+  input.blockedAudits=[{task:'work',actor:'dev',at:now-10,evidence:'等待仓库权限'}];
+  expect('blockedReasonOriginal' in buildRuntimeDashboard(input,now).agents.find(a=>a.id==='dev')!).toBe(false);
+});
+
 test('同一任务旧执行员工和复核员工都在册时，只把最近报告阻塞的人标成受阻', () => {
   const input=fixture();
   for(const e of input.board.employees)e.now={state:'idle'};

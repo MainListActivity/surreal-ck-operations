@@ -28,6 +28,7 @@ import { identityCommand, IDENTITY_COMMANDS } from './idp-commands.ts';
 import { enqueueJob, jobDetail, jobFailure, jobOwnedBy, listJobs, PendingJob, waitForJob } from './jobs.ts';
 import { OWNER_ONLY_FOR_AGENTS, hardTargetOwnerOnly } from './owner-locks.ts';
 import { POLICY_COMMANDS, policyCommand } from './policy-commands.ts';
+import { LANG_CODE, ownerLangOf } from '../../src/owner-lang.ts';
 import { translateChecked, translateMessage, translatePreview, translationFresh, TRANSLATE_COMMANDS } from './messages.ts';
 import { isRecord, textOf } from './rows.ts';
 import { BACKEND_OWNER_COMMANDS } from './command-routing.ts';
@@ -198,6 +199,15 @@ async function dispatch(deps: DispatchDeps, db: Surreal, who: Who, command: stri
     case 'ops.job.get': return { job: await jobDetail(db, textOf(input.id, 'id', 200)) };
     case 'audit.list': return listAudit(db, input);
     case 'cmd.catalog': return commandCatalogOf(db, who.actorKind === 'agent' ? { owner: false, employee: who.actor } : { owner: true });
+    case 'owner.settings.get': return { lang: await ownerLangOf(db) };
+    case 'owner.settings.set': {
+      // 老板常用语言：员工回报译成这种语言；职能语言与之相同的消息不翻译。写死仅老板（HARD_OWNER_ONLY 的 owner.settings.*）。
+      if (who.actorKind !== 'owner') throw new CompanyError('forbidden', '只有老板可以修改老板设置');
+      const lang = typeof input.lang === 'string' ? input.lang.trim() : '';
+      if (!LANG_CODE.test(lang)) throw new CompanyError('invalid', 'lang invalid');
+      await db.query('UPSERT company_meta:config SET owner_lang = $lang;', { lang });
+      return { lang };
+    }
     case 'message.edit':
     case 'message.edit_rendered': return translateSaved(deps, db, await runOwnerApi(db, command, input, who.via), who.actor);
     case 'message.release':

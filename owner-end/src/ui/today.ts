@@ -17,6 +17,8 @@ export interface DecisionItem {
   label: string;
   title: string;
   reason: string;
+  /** reason 是员工受阻说明的译文时，员工写的原文。 */
+  reasonOriginal?: string;
   projectId?: string;
   at?: number;
   href: string;
@@ -66,9 +68,9 @@ export function decisionQueue(input: {
   }
 
   // 员工报告的受阻原因按任务归并到任务条目上。
-  const reasons = new Map<string, { reason: string; project?: string }>();
+  const reasons = new Map<string, { reason: string; original?: string; project?: string }>();
   for (const a of input.dashboard?.agents ?? []) {
-    if (a.taskId && a.blockedReason) reasons.set(a.taskId, { reason: a.blockedReason, project: a.project?.id });
+    if (a.taskId && a.blockedReason) reasons.set(a.taskId, { reason: a.blockedReason, original: a.blockedReasonOriginal, project: a.project?.id });
   }
   for (const t of input.tasks ?? []) {
     if (t.state !== 'blocked') continue;
@@ -81,6 +83,7 @@ export function decisionQueue(input: {
       label: '任务受阻',
       title: t.title || id,
       reason: found?.reason ?? '员工报告受阻，打开任务查看原因与证据',
+      ...(found?.original ? { reasonOriginal: found.original } : {}),
       projectId: found?.project,
       at: timeOf(t.updated_at),
       href: hrefOf('tasks', id),

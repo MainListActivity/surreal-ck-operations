@@ -3,6 +3,7 @@ import { outboundRevisionSql } from './outbound-revision.ts';
 import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from './core-errors.ts';
 import { rolePolicyOf } from './command-guard.ts';
+import { langMatches, ownerLangOf } from './owner-lang.ts';
 import { machineCriterionOf, routeBody, stepOfTask, templateFor, type MessageStep } from './outbound-render.ts';
 import { deliveryOf, sourceHash } from './outbound-delivery.ts';
 export { DEFAULT_MACHINE_CRITERION, renderMessage, templateFor } from './outbound-render.ts';
@@ -300,7 +301,9 @@ export class OutboundMessageStore {
       const [rows] = await this.db.query<[Array<{ lang?: unknown }>]>('SELECT lang FROM agent_policy WHERE agent = $role LIMIT 1;', { role });
       lang = rows?.[0]?.lang;
     }
-    return typeof lang === 'string' && lang ? lang : undefined;
+    if (typeof lang !== 'string' || !lang) return undefined;
+    // A role that speaks the owner's language needs no translation: the owner wrote the message in it.
+    return langMatches(lang, await ownerLangOf(this.db)) ? undefined : lang;
   }
 
   /**

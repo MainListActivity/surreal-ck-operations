@@ -67,7 +67,7 @@ export interface BoardOutboxRow {
   body: string;
   workdirPending: boolean;
   hold: boolean;
-  lang: 'zh';
+  lang: string;
   editable: true;
   translation?: BoardTranslation;
 }

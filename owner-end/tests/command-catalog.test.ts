@@ -38,7 +38,7 @@ describe('命令目录的内容', () => {
   test('覆盖网关全部老板命令，且没有网关不认识的命令', () => {
     // 网关在 commands.ts 的 dispatch 中直接分派的命令（不经老板接口、身份、策略与译文模块）。
     const local = [
-      'db.read', 'db.write', 'cf.api', 'ops.job.list', 'ops.job.get', 'audit.list', 'cmd.catalog',
+      'db.read', 'db.write', 'cf.api', 'ops.job.list', 'ops.job.get', 'audit.list', 'cmd.catalog', 'owner.settings.get', 'owner.settings.set',
       'message.edit', 'message.edit_rendered', 'message.release', 'message.send', 'host.exec',
     ];
     const known = new Set([
