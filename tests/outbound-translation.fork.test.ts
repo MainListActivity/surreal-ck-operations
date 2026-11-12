@@ -157,6 +157,35 @@ run('等待译文与老板放行分开：真实库上 awaitingTranslation 只读
   }
 });
 
+run('语言按职能：还没有员工时按要派的职能判定，消息先对齐到职能语言并等待译文；新开的同职能实例拿到译文', async () => {
+  const w = await startFork('role-lang');
+  try {
+    const task = await w.core.createTask(w.gm, { title: '职能语言任务', context: '合成数据：仅用于职能语言回归测试',
+      executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'translation-create-role-lang' });
+    const store = new OutboundMessageStore(w.surreal);
+    await store.createTaskDrafts(task.id, 'engineering', 'qa', false);
+    const execute = (await unsentOf(store, task.id)).find(message => message.step === 'execute')!;
+    await w.surreal.query("CREATE agent_policy CONTENT { agent: 'engineering', lang: 'en', updated_by: 'owner:test' };");
+
+    // 派工前（还没有员工）：要派的职能有语言即等待译文；没有职能或职能无语言则不等。
+    expect(await store.awaitingTranslation(task.id, 'execute', undefined, 'engineering')).toBe(true);
+    expect(await store.awaitingTranslation(task.id, 'execute', undefined)).toBe(false);
+    expect(await store.awaitingTranslation(task.id, 'execute', undefined, 'qa')).toBe(false);
+
+    // 对齐到职能语言：消息带上语言，补译才会开始。
+    await store.alignLanguage(task.id, 'execute', undefined, 'engineering');
+    expect((await store.get(execute.id))?.lang).toBe('en');
+
+    // 译文就绪后不再等待；新开的同职能实例按职能取语言，拿到译文。
+    await store.setTranslation(execute.id, 'en', 'EN execute', execute.body, 'owner:test');
+    expect(await store.awaitingTranslation(task.id, 'execute', undefined, 'engineering')).toBe(false);
+    await w.surreal.query("CREATE employee:⟨engineering-claude-new⟩ CONTENT { role: 'engineering', paseo_agent_id: 'agent-new' };");
+    expect((await store.prepareSend(task.id, 'execute', 'engineering-claude-new'))!.body).toBe('EN execute');
+  } finally {
+    await w.close();
+  }
+});
+
 run('译文按哈希判定：同一原文的两次译文，只有最后一次的哈希有效', async () => {
   const w = await startFork('hash');
   try {

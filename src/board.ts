@@ -540,8 +540,8 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
   const unassigned: BoardUnassignedRow[] = queue.map((item, index) => {
     const position = index + 1;
     const held = heldAt(item.taskId);
-    // A queued item has no holder yet, so only a language the owner chose can make its message wait (see awaitingAt).
-    const awaiting = awaitingAt(item.taskId, undefined);
+    // A queued item has no holder yet: the instance spawned for it takes its role's language.
+    const awaiting = awaitingAt(item.taskId, langByRole.get(String(item.role ?? '')));
     const eligible = item.eligible && !held && !awaiting;
     const draft = draftOf.get(`${item.taskId}:${stepOf(item.taskId)}`);
     return { taskId: item.taskId, title: String(tasks.get(item.taskId)?.title ?? item.title), phase: item.phase, position,

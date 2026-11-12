@@ -10,6 +10,7 @@ import { readRuntimeDashboard } from '../../src/runtime-dashboard.ts';
 import { writeHostTelemetry, writeRuntimeObservation } from '../../src/runner/telemetry.ts';
 import { writeRunnerHeartbeat } from '../../src/board.ts';
 import { OutboundMessageStore } from '../../src/outbound-messages.ts';
+import { decide } from '../../src/command-guard.ts';
 
 setDefaultTimeout(60000);
 // 老板端网关的访问规则（fork）：058 应用后，gateway 令牌写 protected_command / agent_policy 被拒，改删 ops_audit 被拒。
@@ -232,6 +233,21 @@ run('058 之后 gateway 令牌写 agent_policy 被拒：新建与改动都拒绝
   await rejects(gateway.query("UPDATE agent_policy SET disabled = true WHERE agent = 'emp-gw';"), POLICY_GUARD);
   const [[policy]] = await company.db.query<[Array<Record<string, unknown>>]>("SELECT disabled, deny FROM agent_policy WHERE agent = 'emp-gw';");
   expect(policy).toMatchObject({ disabled: false, deny: ['task.pause'] });
+});
+
+run('网关会话下的命令守卫按职能取策略：职能停用即拒绝该职能的任何实例，其它职能照常（读不到职能时不能放行）', async () => {
+  const gateway = await session(tokenFor('gateway', 'gateway-client-id'));
+  const now = Math.floor(Date.now() / 1000);
+  await company.db.query(`UPSERT employee:⟨gw-role-off-1⟩ SET role = 'gw-role-off', paseo_agent_id = 'agent-gw-off';
+    UPSERT employee:⟨gw-role-on-1⟩ SET role = 'gw-role-on', paseo_agent_id = 'agent-gw-on';
+    CREATE agent_policy CONTENT { agent: 'gw-role-off', disabled: true, deny: [], updated_by: 'root', updated_at: time::now() };
+    CREATE task:gw_role_off CONTENT { title: '职能停用', state: 'doing', kind: 'task', current_employee: 'gw-role-off-1', lease_expires_at: $live, fence: 1, version: 1 };
+    CREATE task:gw_role_on CONTENT { title: '职能启用', state: 'doing', kind: 'task', current_employee: 'gw-role-on-1', lease_expires_at: $live, fence: 1, version: 1 };`,
+    { live: now + 600 });
+  expect(await decide(gateway, { actorKind: 'agent', actor: 'gw-role-off-1', task: 'gw_role_off', command: 'submit', now }))
+    .toMatchObject({ allow: false, reason: '该员工已停用' });
+  expect(await decide(gateway, { actorKind: 'agent', actor: 'gw-role-on-1', task: 'gw_role_on', command: 'submit', now }))
+    .toMatchObject({ allow: true });
 });
 
 run('正控制：老板与 root 写 protected_command、agent_policy 放行，拒绝只来自访问方式而非 schema 故障', async () => {

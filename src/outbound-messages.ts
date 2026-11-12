@@ -143,11 +143,12 @@ export class OutboundMessageStore {
 
   /**
    * Read-only twin of prepareSend's null for translation: true when the step's message has no ready translation for the employee's
-   * language yet (the owner hold is a separate question, see isHeld). No employee means a new one, which has no default language, so
-   * only a language the owner chose can make the message wait. Writes nothing, so it can run before a lease is taken or an employee made.
+   * language yet (the owner hold is a separate question, see isHeld). Languages live on roles, so with no employee yet the role about to
+   * be dispatched decides: a new instance of that role takes its language. With neither, only a language the owner chose can make the
+   * message wait. Writes nothing, so it can run before a lease is taken or an employee made.
    */
-  async awaitingTranslation(taskId: string, step: MessageStep, employeeId: string | undefined): Promise<boolean> {
-    const employeeLang = employeeId ? await this.langOf(employeeId) : undefined;
+  async awaitingTranslation(taskId: string, step: MessageStep, employeeId: string | undefined, role?: string): Promise<boolean> {
+    const employeeLang = await this.langOf(employeeId, role);
     const draft = await this.latestDraft(taskId, step);
     // No draft yet: prepareSend would seed a fresh one, which takes the employee's language and never carries a translation.
     if (!draft) return Boolean(employeeLang);
@@ -268,9 +269,9 @@ export class OutboundMessageStore {
    * 派工循环在领租约之前调用：没有草稿的先补一条，再把语言对齐到员工默认语言。已对齐则只读。
    * 不先对齐的话，有语言的员工会一直等一份没有人开始补译的译文（补译只译已带语言的消息），派工卡住。
    */
-  async alignLanguage(taskId: string, step: MessageStep, employeeId: string): Promise<void> {
+  async alignLanguage(taskId: string, step: MessageStep, employeeId: string | undefined, role?: string): Promise<void> {
     const draft = await this.latestDraft(taskId, step) ?? await this.seedDraft(taskId, step);
-    await this.stampLang(draft, await this.langOf(employeeId));
+    await this.stampLang(draft, await this.langOf(employeeId, role));
   }
 
   /**
@@ -288,9 +289,17 @@ export class OutboundMessageStore {
     return rowView(row);
   }
 
-  /** The language of the employee's role, from agent_policy (keyed by role); undefined when the role has none (the original body is sent). */
-  private async langOf(employeeId: string): Promise<string | undefined> {
-    const lang = (await rolePolicyOf(this.db, employeeId))?.lang;
+  /**
+   * The language of the employee's role, from agent_policy (keyed by role); with no employee, the language of the given role (the role a
+   * new instance would be spawned for). Undefined when the role has none (the original body is sent).
+   */
+  private async langOf(employeeId: string | undefined, role?: string): Promise<string | undefined> {
+    let lang: unknown;
+    if (employeeId) lang = (await rolePolicyOf(this.db, employeeId))?.lang;
+    else if (role) {
+      const [rows] = await this.db.query<[Array<{ lang?: unknown }>]>('SELECT lang FROM agent_policy WHERE agent = $role LIMIT 1;', { role });
+      lang = rows?.[0]?.lang;
+    }
     return typeof lang === 'string' && lang ? lang : undefined;
   }
 
