@@ -59,10 +59,11 @@ run('owner board messages: every unsent message, queued drafts, and the holder a
     await w.surreal.query('DELETE outbound_message WHERE task = $task;', { task: new RecordId('task', bare.id) });
     await w.surreal.query("UPDATE $task SET state = 'done';", { task: new RecordId('task', finished.id) });
 
-    // Employees: emp_ja speaks Japanese, emp_plain has no language. emp_ja holds task A.
+    // Employees: emp_ja's role (engineering) speaks Japanese, emp_plain's role (qa) has no language. emp_ja holds task A.
+    // agent_policy is keyed by role, so the two employees need different roles to differ in language.
     await w.surreal.query("CREATE employee:emp_ja CONTENT { role: 'engineering', paseo_agent_id: 'agent-emp-ja', lane: 'company:engineering' };");
-    await w.surreal.query("CREATE employee:emp_plain CONTENT { role: 'engineering', paseo_agent_id: 'agent-emp-plain', lane: 'company:engineering' };");
-    await w.surreal.query("CREATE agent_policy CONTENT { agent: 'emp_ja', lang: 'ja', updated_by: 'owner:test' };");
+    await w.surreal.query("CREATE employee:emp_plain CONTENT { role: 'qa', paseo_agent_id: 'agent-emp-plain', lane: 'company:qa' };");
+    await w.surreal.query("CREATE agent_policy CONTENT { agent: 'engineering', lang: 'ja', updated_by: 'owner:test' };");
     await w.surreal.query("UPDATE $task SET current_employee = $emp, state = 'doing', lease_expires_at = $exp;",
       { task: new RecordId('task', holder.id), emp: new RecordId('employee', 'emp_ja'), exp: nowSec() + 600 });
 

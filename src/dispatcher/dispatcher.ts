@@ -833,26 +833,26 @@ export class Dispatcher {
    * Idempotent, and a failure is only logged: the check then reads the stored state, and the post-claim prepareSend still aligns and
    * refuses to send a translation that is not ready.
    */
-  private async alignLanguage(taskId: string, step: MessageStep, employeeId: string): Promise<void> {
+  private async alignLanguage(taskId: string, step: MessageStep, employeeId: string | undefined, role?: string): Promise<void> {
     const store = this.messageStore();
     if (!store) return;
     try {
-      await store.alignLanguage(taskId, step, employeeId);
+      await store.alignLanguage(taskId, step, employeeId, role);
     } catch (error) {
       this.log(`outbound language align failed for ${taskId}: ${(error as Error).message}`);
     }
   }
 
   /**
-   * Read-only: the message has no ready translation for the employee's language yet. No employee means a new one, which has no default
-   * language, so only a language the owner chose can make it wait. Not an owner hold: no notice, no owner action, nothing written.
+   * Read-only: the message has no ready translation for the employee's language yet. Languages live on roles: with no employee, the
+   * role about to be spawned decides. Not an owner hold: no notice, no owner action, nothing written.
    * An unreadable check returns false; the post-claim prepareOutbound still refuses to send.
    */
-  private async translationPending(taskId: string, step: MessageStep, employeeId: string | undefined): Promise<boolean> {
+  private async translationPending(taskId: string, step: MessageStep, employeeId: string | undefined, role?: string): Promise<boolean> {
     const store = this.messageStore();
     if (!store) return false;
     try {
-      return await store.awaitingTranslation(taskId, step, employeeId);
+      return await store.awaitingTranslation(taskId, step, employeeId, role);
     } catch {
       return false;
     }
@@ -1850,11 +1850,12 @@ export class Dispatcher {
         return undefined;
       }
     }
-    // The spawn gate runs before any employee is created: a new one has no default language, so only a language the owner chose can
-    // make the message wait. An unbound instance that already has a language is checked under its own id.
+    // The spawn gate runs before any employee is created. Languages live on roles, so a new instance takes the language of the role it is
+    // spawned for: the message is aligned to that language and waits for its translation here, before a session is spent on it. An
+    // unbound instance is checked under its own id.
     if (task) {
-      if (pending) await this.alignLanguage(task.id, preStep, pending.id);
-      if (await this.translationPending(task.id, preStep, pending?.id)) return undefined;
+      await this.alignLanguage(task.id, preStep, pending?.id, role);
+      if (await this.translationPending(task.id, preStep, pending?.id, role)) return undefined;
     }
     for (const def of defsOrdered) {
       const model = this.resolveModel(def, slots ?? new Map(), task);

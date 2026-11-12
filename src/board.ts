@@ -424,11 +424,14 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
   }
   const stepOf = (taskId: string): MessageStep => stepOfTask(String(tasks.get(taskId)?.state), returned.has(taskId));
 
-  // Each employee's language, from agent_policy. An employee without one gets no translation rows.
-  const langOf = new Map<string, string>();
+  // Each employee's language: agent_policy is keyed by role, so an employee takes its role's language. A role without one gets no
+  // translation rows.
+  const langByRole = new Map<string, string>();
   for (const row of policyRows) {
-    if (typeof row.lang === 'string' && row.lang) langOf.set(keyOf(row.agent), row.lang);
+    if (typeof row.lang === 'string' && row.lang) langByRole.set(String(row.agent), row.lang);
   }
+  const roleOfEmployee = new Map(employeeRows.map(row => [keyOf(row.id), String(row.role ?? '')] as const));
+  const langOf = { get: (employeeId: string): string | undefined => langByRole.get(roleOfEmployee.get(employeeId) ?? '') };
   // Titles of the tasks the board names only through activity or messages, outside the open set.
   const outside = new Map<string, unknown>();
   for (const row of [...recentRows, ...unsent]) if (row.task && !tasks.has(keyOf(row.task))) outside.set(keyOf(row.task), row.task);
@@ -537,8 +540,8 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
   const unassigned: BoardUnassignedRow[] = queue.map((item, index) => {
     const position = index + 1;
     const held = heldAt(item.taskId);
-    // A queued item has no holder yet, so only a language the owner chose can make its message wait (see awaitingAt).
-    const awaiting = awaitingAt(item.taskId, undefined);
+    // A queued item has no holder yet: the instance spawned for it takes its role's language.
+    const awaiting = awaitingAt(item.taskId, langByRole.get(String(item.role ?? '')));
     const eligible = item.eligible && !held && !awaiting;
     const draft = draftOf.get(`${item.taskId}:${stepOf(item.taskId)}`);
     return { taskId: item.taskId, title: String(tasks.get(item.taskId)?.title ?? item.title), phase: item.phase, position,

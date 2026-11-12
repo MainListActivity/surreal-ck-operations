@@ -4,19 +4,19 @@ import { outcomeText, runCommand } from '../api.ts';
 import { Empty, NoticeLine, PageHeader, Panel, roleText, useAction } from '../common.tsx';
 import { splitLines } from '../model.ts';
 
-export interface AgentPolicy {
+export interface RolePolicy {
   disabled: boolean;
   allow: string[] | null;
   deny: string[];
   lang: string | null;
 }
 
-export interface AgentRow {
-  employee: string;
-  name: string;
+/** 一个职能：它的员工定义、当前在岗的实例与职能策略。策略对该职能的所有员工（含以后新开的实例）生效。 */
+export interface RoleRow {
   role: string;
-  idpUser?: string;
-  policy: AgentPolicy;
+  defs: Array<{ id: string; enabled: boolean; model?: string }>;
+  onDuty: Array<{ employee: string; def: string }>;
+  policy: RolePolicy;
 }
 
 interface GuardEntry {
@@ -47,18 +47,18 @@ interface GuardList {
 }
 
 export function StaffPage() {
-  const [agents, setAgents] = useState<AgentRow[]>();
-  const [agentError, setAgentError] = useState<string>();
+  const [roles, setRoles] = useState<RoleRow[]>();
+  const [roleError, setRoleError] = useState<string>();
   const [guard, setGuard] = useState<GuardList>();
   const [guardError, setGuardError] = useState<string>();
 
-  const loadAgents = useCallback(async () => {
-    const out = await runCommand<{ agents?: AgentRow[] }>('agent.list');
+  const loadRoles = useCallback(async () => {
+    const out = await runCommand<{ roles?: RoleRow[] }>('agent.list');
     if (out.kind === 'ok') {
-      setAgents(out.result.agents ?? []);
-      setAgentError(undefined);
+      setRoles(out.result.roles ?? []);
+      setRoleError(undefined);
     } else {
-      setAgentError(outcomeText(out, ''));
+      setRoleError(outcomeText(out, ''));
     }
   }, []);
 
@@ -72,24 +72,24 @@ export function StaffPage() {
     }
   }, []);
 
-  useLiveRefresh(['employee','agent_identity','agent_policy'], loadAgents);
+  useLiveRefresh(['employee', 'agent_policy'], loadRoles);
   useLiveRefresh(['protected_command'], loadGuard);
   useEffect(() => {
-    void loadAgents();
+    void loadRoles();
     void loadGuard();
-  }, [loadAgents, loadGuard]);
+  }, [loadRoles, loadGuard]);
 
   return (
     <div class="page">
-      <PageHeader title="员工与权限" description="员工的命令范围与受保护命令；修改会写入审计。" />
-      <nav class="jump-bar" aria-label="页内导航"><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-agents')?.scrollIntoView({ behavior: 'smooth' }); }}>员工策略</a><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-guard')?.scrollIntoView({ behavior: 'smooth' }); }}>受保护命令</a><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-locked')?.scrollIntoView({ behavior: 'smooth' }); }}>固定限制</a></nav>
-      <Panel id="staff-agents" title="员工" hint="策略决定员工能调用哪些命令、是否停用、译文语言。语言留空表示不翻译。">
-        {agentError ? <p class="notice err">员工列表读取失败：{agentError}</p> : null}
-        {agents === undefined && !agentError ? <p class="hint">正在读取员工…</p> : null}
-        {agents && agents.length === 0 ? <Empty>还没有员工</Empty> : null}
-        {agents && agents.length > 0 ? (
+      <PageHeader title="员工与权限" description="按职能设置命令范围与译文语言，对该职能的所有员工生效；修改会写入审计。" />
+      <nav class="jump-bar" aria-label="页内导航"><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-agents')?.scrollIntoView({ behavior: 'smooth' }); }}>职能策略</a><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-guard')?.scrollIntoView({ behavior: 'smooth' }); }}>受保护命令</a><a href="#staff" onClick={e => { e.preventDefault(); document.getElementById('staff-locked')?.scrollIntoView({ behavior: 'smooth' }); }}>固定限制</a></nav>
+      <Panel id="staff-agents" title="职能" hint="每轮会话都会新开员工实例，所以策略按职能保存：停用、允许/拒绝清单与译文语言对这个职能的所有员工生效。">
+        {roleError ? <p class="notice err">职能列表读取失败：{roleError}</p> : null}
+        {roles === undefined && !roleError ? <p class="hint">正在读取职能…</p> : null}
+        {roles && roles.length === 0 ? <Empty>还没有员工定义</Empty> : null}
+        {roles && roles.length > 0 ? (
           <div class="grid">
-            {agents.map(a => <AgentCard key={a.employee} agent={a} onChanged={() => void loadAgents()} />)}
+            {roles.map(r => <RoleCard key={r.role} row={r} onChanged={() => void loadRoles()} />)}
           </div>
         ) : null}
       </Panel>
@@ -150,8 +150,8 @@ export function StaffPage() {
   );
 }
 
-function AgentCard({ agent, onChanged }: { agent: AgentRow; onChanged(): void }) {
-  const p = agent.policy;
+function RoleCard({ row, onChanged }: { row: RoleRow; onChanged(): void }) {
+  const p = row.policy;
   const [open, setOpen] = useState(false);
   const [disabled, setDisabled] = useState(p.disabled);
   const [unrestricted, setUnrestricted] = useState(p.allow === null);
@@ -170,7 +170,7 @@ function AgentCard({ agent, onChanged }: { agent: AgentRow; onChanged(): void })
   };
 
   const save = () => void run('agent.policy.set', {
-    agent: agent.employee,
+    role: row.role,
     disabled,
     allow: unrestricted ? null : splitLines(allow),
     deny: splitLines(deny),
@@ -180,39 +180,38 @@ function AgentCard({ agent, onChanged }: { agent: AgentRow; onChanged(): void })
     onChanged();
   });
 
-  const ensureIdentity = () => void run('agent.identity.ensure', { employee: agent.employee }, '已创建身份', () => onChanged());
-
+  const enabledDefs = row.defs.filter(d => d.enabled);
   return (
     <article class="card">
       <header class="card-head">
-        <span class="tag" title={agent.role}>{roleText(agent.role)}</span>
+        <h3 title={row.role}>{roleText(row.role)}</h3>
         <span class={p.disabled ? 'badge tone-blocked' : 'badge tone-done'}>{p.disabled ? '已停用' : '启用中'}</span>
       </header>
-      <h3>{agent.name}</h3>
-      <p class="hint">员工 {agent.employee}</p>
+      <p class="hint">
+        <span class={row.onDuty.length ? 'dot is-running' : 'dot'} /> {row.onDuty.length ? `${row.onDuty.length} 人在岗` : '空闲'}
+        {' · '}{enabledDefs.length} 个员工定义{row.defs.length > enabledDefs.length ? `（另有 ${row.defs.length - enabledDefs.length} 个已停用）` : ''}
+      </p>
       <dl class="facts">
+        <dt>员工定义</dt>
+        <dd>{row.defs.length ? row.defs.map(d => d.enabled ? d.id : `${d.id}（停用）`).join('、') : '无'}</dd>
+        {row.onDuty.length ? (<><dt>在岗实例</dt><dd>{row.onDuty.map(m => m.employee).join('、')}</dd></>) : null}
         <dt>允许清单</dt>
-        <dd>{p.allow === null ? '不限制（null）' : p.allow.length ? p.allow.join('、') : '空列表'}</dd>
+        <dd>{p.allow === null ? '不限制' : p.allow.length ? p.allow.join('、') : '空（什么都不能调用）'}</dd>
         <dt>拒绝清单</dt>
         <dd>{p.deny.length ? p.deny.join('、') : '无'}</dd>
         <dt>译文语言</dt>
         <dd>{p.lang ?? '不翻译'}</dd>
-        <dt>ma_hono 身份</dt>
-        <dd>{agent.idpUser ?? '未创建'}</dd>
       </dl>
       <div class="button-row">
         <button type="button" onClick={openEditor}>{open ? '收起策略' : '编辑策略'}</button>
-        {agent.idpUser ? null : (
-          <button type="button" disabled={busy} onClick={ensureIdentity}>创建 ma_hono 身份</button>
-        )}
       </div>
       {open ? (
         <div class="form">
-          <label class="inline"><input type="checkbox" checked={disabled} disabled={busy} onChange={e => setDisabled(e.currentTarget.checked)} /> 停用这位员工</label>
-          <label class="inline"><input type="checkbox" checked={unrestricted} disabled={busy} onChange={e => setUnrestricted(e.currentTarget.checked)} /> 允许清单不限制（保存为 null）</label>
+          <label class="inline"><input type="checkbox" checked={disabled} disabled={busy} onChange={e => setDisabled(e.currentTarget.checked)} /> 停用这个职能的所有员工</label>
+          <label class="inline"><input type="checkbox" checked={unrestricted} disabled={busy} onChange={e => setUnrestricted(e.currentTarget.checked)} /> 允许清单不限制</label>
           {unrestricted ? null : (
             <label class="field">
-              <span>允许清单（每行一个命令；保存为列表）</span>
+              <span>允许清单（每行一个命令；留空表示什么都不能调用）</span>
               <textarea rows={3} value={allow} disabled={busy} onInput={e => setAllow(e.currentTarget.value)} />
             </label>
           )}

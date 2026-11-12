@@ -132,7 +132,8 @@
 
 - **老板**：`ac=owner` 且带 `Owner` 角色。可以调用全部老板命令，不经过下面的员工判定。数据库会话用老板自己的令牌连库（`$access='owner'`），权限由数据库访问规则决定（`schema/055-access.surql`）。
 - **员工**：`ac=agent`，令牌必须带任务绑定。员工的命令经过命令守卫（`src/command-guard.ts`）和网关的专属规则，按固定顺序判定，第一条不通过即拒绝并写审计：
-  1. 员工已停用（`agent_policy.disabled`）；
+  员工策略（`agent_policy`）按职能保存：`agent` 字段存职能名，员工按自己所属的职能取策略，同一职能的所有实例（含每轮新开的）共用一条。
+  1. 员工所属职能已停用（`agent_policy.disabled`）；
   2. 命中写死的老板专属命令（`HARD_OWNER_ONLY`，共 5 条：`guard.*`、`agent.*`、`owner.login.*`、`def.*`、`db.write`）；
   3. 命中 `protected_command` 中标记为 `owner_only` 的命令。老板可以在「仅老板」清单里增删；
   4. 不在员工的允许清单（`agent_policy.allow`）内，或命中禁止清单（`agent_policy.deny`）；
@@ -171,7 +172,7 @@
 消息有一个“生效语言”，它决定员工收到原文还是译文（`effectiveLangOf`、`deliveryOf`，见 `src/outbound-delivery.ts`。看板与派工共用这一份判定）：
 
 1. 老板为这条消息选过语言（包括选了“不翻译（原文投递）”）：以消息自己的语言为准。
-2. 老板没有选过：跟着收件员工走，取员工策略的译文语言（`agent_policy.lang`）。消息上残留的旧语言不算。
+2. 老板没有选过：跟着收件员工走，取员工所属职能策略的译文语言（`agent_policy.lang`）。消息上残留的旧语言不算。
 
 有生效语言时，只有同时满足以下三条的译文才会投递。否则消息显示“等待译文”，不发原文：语言与生效语言相同；译文非空；译文记下的原文哈希与当前原文一致。原文一改，旧译文自动作废。
 
@@ -204,7 +205,7 @@
 | --- | --- | --- |
 | `desktop-board.png` | 1440 宽，整页 | 首页看板：公司在动、员工卡片、排队与其它未发消息 |
 | `desktop-message-translate.png` | 1440×900 | 消息编辑与译文预览：未保存草稿、英文预览。译文是替身输出 `[EN stub]` |
-| `desktop-permissions.png` | 1440 宽，整页 | 员工与权限：员工策略、受保护命令、只能老板调用的命令 |
+| `desktop-permissions.png` | 1440 宽，整页 | 员工与权限：职能策略、受保护命令、只能老板调用的命令 |
 | `mobile-390-board.png` | 390 宽，整页 | 首页看板，移动端单列布局 |
 
 截图用 ego-browser 自动化采集，采集脚本没有入库。

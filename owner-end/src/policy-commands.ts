@@ -1,6 +1,7 @@
 /**
- * 员工与权限命令（只由老板调用）：员工列表（身份、策略）、员工策略（停用、允许/禁止、默认语言），
- * 以及保护命令清单（protected_command）。写入由数据库的 EVENT 限定为老板，这里再做一次参数校验。
+ * 员工与权限命令（只由老板调用）：按职能的员工策略（停用、允许/禁止、默认语言），以及保护命令清单（protected_command）。
+ * 员工策略按职能保存（agent_policy.agent 存职能）：一次性会话下员工实例只活一轮，同一职能的所有实例共用一条策略。
+ * 写入由数据库的 EVENT 限定为老板，这里再做一次参数校验。
  */
 import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from '../../src/core-errors.ts';
@@ -14,17 +15,12 @@ export const POLICY_COMMANDS: ReadonlySet<string> = new Set([
   'agent.list', 'agent.policy.list', 'agent.policy.set', 'guard.list', 'guard.protect', 'guard.unprotect', 'guard.set',
 ]);
 
-const EMPLOYEE_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const ROLE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const COMMAND_NAME = /^[a-z][a-z0-9_.*-]{0,119}$/;
 
 type Row = Record<string, unknown>;
 
 const keyOf = (value: unknown): string => String((value as RecordId | undefined)?.id ?? value ?? '');
-
-function employeeOf(value: unknown): string {
-  if (typeof value !== 'string' || !EMPLOYEE_ID.test(value.trim())) throw new CompanyError('invalid', 'employee invalid');
-  return value.trim();
-}
 
 function stringList(value: unknown, field: string): string[] | null | undefined {
   if (value === undefined) return undefined;
@@ -35,7 +31,7 @@ function stringList(value: unknown, field: string): string[] | null | undefined 
   return value.map((item) => item.trim()).filter((item) => item.length > 0);
 }
 
-/** 员工策略的读出形状（与老板页面的 AgentPolicy 一致）。没有策略行即默认：启用、不限制、无拒绝、无语言。 */
+/** 职能策略的读出形状（与老板页面的 RolePolicy 一致）。没有策略行即默认：启用、不限制、无拒绝、无语言。 */
 function policyOf(row: Row | undefined) {
   return {
     disabled: row?.disabled === true,
@@ -45,32 +41,54 @@ function policyOf(row: Row | undefined) {
   };
 }
 
-/** 员工列表：在岗员工（与看板的筛选一致），附身份、策略。 */
-async function agentList(db: Surreal) {
-  const staff = await inServiceEmployees(db);
-  const [policies] = await db.query<[Row[]]>('SELECT * FROM agent_policy;');
-  const [identities] = await db.query<[Row[]]>('SELECT employee, idp_user FROM agent_identity;');
+/**
+ * 职能列表：员工定义里出现过的全部职能（以及已有策略行的职能），每个职能附它的员工定义、当前在岗实例与策略。
+ * 没有会话在跑时在岗实例为空，职能照样列出，策略照样可改。
+ */
+async function roleList(db: Surreal) {
+  const [[defs], [policies], staff] = await Promise.all([
+    db.query<[Row[]]>('SELECT id, role, enabled, model FROM employee_def ORDER BY id;'),
+    db.query<[Row[]]>('SELECT * FROM agent_policy;'),
+    inServiceEmployees(db),
+  ]);
   const policyBy = new Map((policies ?? []).map((row) => [String(row.agent), row]));
-  const identityBy = new Map((identities ?? []).map((row) => [String(row.employee), String(row.idp_user ?? '')]));
+  const roles = new Map<string, { defs: Array<{ id: string; enabled: boolean; model?: string }>; onDuty: Array<{ employee: string; def: string }> }>();
+  const roleEntry = (role: string) => {
+    let entry = roles.get(role);
+    if (!entry) roles.set(role, entry = { defs: [], onDuty: [] });
+    return entry;
+  };
+  for (const row of defs ?? []) {
+    roleEntry(String(row.role ?? '')).defs.push({
+      id: keyOf(row.id), enabled: row.enabled !== false, ...(typeof row.model === 'string' ? { model: row.model } : {}),
+    });
+  }
+  for (const role of policyBy.keys()) roleEntry(role);
+  for (const member of staff) if (roles.has(member.role)) roleEntry(member.role).onDuty.push({ employee: member.employee, def: member.name });
   return {
-    agents: staff.map((member) => {
-      const idpUser = identityBy.get(member.employee);
-      return {
-        employee: member.employee,
-        name: member.name,
-        role: member.role,
-        ...(idpUser ? { idpUser } : {}),
-        policy: policyOf(policyBy.get(member.employee)),
-      };
-    }),
+    roles: [...roles.entries()].filter(([role]) => role).sort(([a], [b]) => a.localeCompare(b)).map(([role, entry]) => ({
+      role, defs: entry.defs, onDuty: entry.onDuty, policy: policyOf(policyBy.get(role)),
+    })),
   };
 }
 
-/** 员工策略写入。null 表示清空（allow 为 NONE 即不限制；lang 为 NONE 即中文原文）。未给出的字段保持不变。 */
+/** 职能必须出现在员工定义里，或已有策略行，免得手误写出一条永远不生效的策略。 */
+async function roleOf(db: Surreal, value: unknown): Promise<string> {
+  if (typeof value !== 'string' || !ROLE.test(value.trim())) throw new CompanyError('invalid', 'role invalid');
+  const role = value.trim();
+  const [rows] = await db.query<[Row[]]>(
+    'SELECT VALUE id FROM employee_def WHERE role = $role LIMIT 1;', { role });
+  if (rows?.length) return role;
+  const [policies] = await db.query<[Row[]]>('SELECT VALUE id FROM agent_policy WHERE agent = $role LIMIT 1;', { role });
+  if (policies?.length) return role;
+  throw new CompanyError('invalid', `没有职能为 ${role} 的员工定义`);
+}
+
+/** 职能策略写入。null 表示清空（allow 为 NONE 即不限制；lang 为 NONE 即中文原文）。未给出的字段保持不变。 */
 async function setPolicy(db: Surreal, input: Row, actor: string) {
-  const employee = employeeOf(input.agent ?? input.employee);
-  const sets: string[] = ['agent = $agent', 'updated_by = $actor', 'updated_at = time::now()'];
-  const vars: Record<string, unknown> = { rid: new RecordId('agent_policy', employee), agent: employee, actor };
+  const role = await roleOf(db, input.role);
+  const sets: string[] = ['agent = $role', 'updated_by = $actor', 'updated_at = time::now()'];
+  const vars: Record<string, unknown> = { rid: new RecordId('agent_policy', role), role, actor };
   if (input.disabled !== undefined) {
     if (typeof input.disabled !== 'boolean') throw new CompanyError('invalid', 'disabled invalid');
     sets.push('disabled = $disabled');
@@ -90,7 +108,7 @@ async function setPolicy(db: Surreal, input: Row, actor: string) {
   }
   await db.query(`UPSERT $rid SET ${sets.join(', ')};`, vars);
   const [rows] = await db.query<[Row[]]>('SELECT * FROM $rid;', { rid: vars.rid });
-  return { employee, policy: policyOf(rows?.[0]) };
+  return { role, policy: policyOf(rows?.[0]) };
 }
 
 /**
@@ -139,7 +157,7 @@ async function unprotectCommand(db: Surreal, input: Row) {
 /** 员工与权限命令。只能处理 POLICY_COMMANDS 中的命令。locks 只用于 guard.list 展示。 */
 export async function policyCommand(db: Surreal, command: string, input: Row, actor: string, locks: LockTargets): Promise<unknown> {
   switch (command) {
-    case 'agent.list': return agentList(db);
+    case 'agent.list': return roleList(db);
     case 'agent.policy.list': {
       const [rows] = await db.query<[Row[]]>('SELECT * FROM agent_policy ORDER BY agent;');
       return { policies: rows ?? [] };

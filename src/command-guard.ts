@@ -47,7 +47,7 @@ export interface Decision {
 
 /** judge 需要的事实，由 decide 从库里读出。 */
 export interface GuardFacts {
-  /** agent_policy 中该员工的行；没有行即默认策略：启用、不限制、无拒绝。 */
+  /** agent_policy 中该员工所属职能的行；没有行即默认策略：启用、不限制、无拒绝。 */
   policy?: PolicyRow;
   /** protected_command 中该命令的 owner_only 为 true。 */
   protectedOwnerOnly?: boolean;
@@ -130,9 +130,19 @@ export async function guardRowsOf(db: Surreal, agent?: string): Promise<{ protec
   // 保护清单可以写成 `task.*` 这样的模式，所以取全部条目，再用同一套匹配规则判断（清单很短）。
   const [protectedRows] = await db.query<[ProtectedRow[]]>('SELECT command, owner_only FROM protected_command;');
   if (agent === undefined) return { protectedRows: protectedRows ?? [] };
-  const [policyRows] = await db.query<[PolicyRow[]]>(
-    'SELECT disabled, allow, deny FROM agent_policy WHERE agent = $agent LIMIT 1;', { agent });
-  return { protectedRows: protectedRows ?? [], policy: policyRows?.[0] };
+  return { protectedRows: protectedRows ?? [], policy: await rolePolicyOf(db, agent) };
+}
+
+/**
+ * 员工策略按职能保存：agent_policy.agent 存的是职能（如 `engineering`），不是员工实例。
+ * 一次性会话下实例只活一轮，按实例存的策略会随实例退休失效；同一职能的所有实例共用一条策略。
+ * 按员工实例 key 查它所属职能的策略行；员工不存在或职能没有策略行时返回 undefined（默认策略）。
+ */
+export async function rolePolicyOf(db: Surreal, employee: string): Promise<(PolicyRow & { lang?: unknown }) | undefined> {
+  const [rows] = await db.query<[Array<PolicyRow & { lang?: unknown }>]>(
+    'SELECT disabled, allow, deny, lang FROM agent_policy WHERE agent = $employee.role LIMIT 1;',
+    { employee: new RecordId('employee', employee) });
+  return rows?.[0];
 }
 
 async function factsFor(db: Surreal, request: GuardRequest): Promise<GuardFacts> {
