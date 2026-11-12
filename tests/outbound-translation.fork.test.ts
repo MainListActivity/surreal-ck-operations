@@ -81,7 +81,7 @@ run('译文投递：未译不发（不改 hold 与状态）、译后发译文、
     expect(review).toBeDefined();
 
     // 员工 emp-ja 的语言是日语；没有译文时不发，hold 与状态都不变。
-    await w.surreal.query("CREATE agent_policy CONTENT { agent: 'emp-ja', lang: 'ja', updated_by: 'owner:test' };");
+    await w.surreal.query("UPSERT employee:⟨emp-ja⟩ SET role = 'screenwriter', paseo_agent_id = 'agent-emp-ja'; CREATE agent_policy CONTENT { agent: 'screenwriter', lang: 'ja', updated_by: 'owner:test' };");
     expect(await store.prepareSend(task.id, 'execute', 'emp-ja')).toBeNull();
     const untouched = (await unsentOf(store, task.id)).find(message => message.id === execute.id)!;
     expect(untouched).toMatchObject({ state: 'draft', hold: false, body: execute.body });
@@ -97,7 +97,7 @@ run('译文投递：未译不发（不改 hold 与状态）、译后发译文、
     expect(prepared!.message.body).toBe(execute.body);
 
     // 语言不同的员工：日语译文不发给英语员工；无语言员工照发原文。
-    await w.surreal.query("CREATE agent_policy CONTENT { agent: 'emp-en', lang: 'en', updated_by: 'owner:test' };");
+    await w.surreal.query("UPSERT employee:⟨emp-en⟩ SET role = 'cs', paseo_agent_id = 'agent-emp-en'; CREATE agent_policy CONTENT { agent: 'cs', lang: 'en', updated_by: 'owner:test' };");
     expect(await store.prepareSend(task.id, 'execute', 'emp-en')).toBeNull();
     expect((await store.prepareSend(task.id, 'review', 'emp-none'))!.body).toBe(review.body);
 
@@ -134,7 +134,7 @@ run('等待译文与老板放行分开：真实库上 awaitingTranslation 只读
     const store = new OutboundMessageStore(w.surreal);
     await store.createTaskDrafts(task.id, 'engineering', 'qa', false);
     const execute = (await unsentOf(store, task.id)).find(message => message.step === 'execute')!;
-    await w.surreal.query("CREATE agent_policy CONTENT { agent: 'emp-ja', lang: 'ja', updated_by: 'owner:test' };");
+    await w.surreal.query("UPSERT employee:⟨emp-ja⟩ SET role = 'screenwriter', paseo_agent_id = 'agent-emp-ja'; CREATE agent_policy CONTENT { agent: 'screenwriter', lang: 'ja', updated_by: 'owner:test' };");
 
     // 没有译文：等待译文，不是老板放行；判定本身不写库。
     const before = JSON.stringify(await store.get(execute.id));
@@ -165,7 +165,7 @@ run('译文按哈希判定：同一原文的两次译文，只有最后一次的
     const store = new OutboundMessageStore(w.surreal);
     await store.createTaskDrafts(task.id, 'engineering', 'qa', false);
     const execute = (await unsentOf(store, task.id)).find(message => message.step === 'execute')!;
-    await w.surreal.query("CREATE agent_policy CONTENT { agent: 'emp-ja', lang: 'ja', updated_by: 'owner:test' };");
+    await w.surreal.query("UPSERT employee:⟨emp-ja⟩ SET role = 'screenwriter', paseo_agent_id = 'agent-emp-ja'; CREATE agent_policy CONTENT { agent: 'screenwriter', lang: 'ja', updated_by: 'owner:test' };");
     await store.setTranslation(execute.id, 'ja', '第一版', execute.body, 'owner:test');
     await store.setTranslation(execute.id, 'ja', '第二版', execute.body, 'owner:test');
     const row = (await store.get(execute.id))!;
@@ -211,8 +211,8 @@ run('派工前对齐语言：真实库上消息跟着收件员工走，改派清
     await store.createTaskDrafts(task.id, 'engineering', 'qa', false);
     const execute = (await unsentOf(store, task.id)).find(message => message.step === 'execute')!;
     const current = async () => (await store.get(execute.id))!;
-    await w.surreal.query("CREATE agent_policy CONTENT { agent: 'emp-ja', lang: 'ja', updated_by: 'owner:test' };");
-    await w.surreal.query("CREATE agent_policy CONTENT { agent: 'emp-en', lang: 'en', updated_by: 'owner:test' };");
+    await w.surreal.query("UPSERT employee:⟨emp-ja⟩ SET role = 'screenwriter', paseo_agent_id = 'agent-emp-ja'; CREATE agent_policy CONTENT { agent: 'screenwriter', lang: 'ja', updated_by: 'owner:test' };");
+    await w.surreal.query("UPSERT employee:⟨emp-en⟩ SET role = 'cs', paseo_agent_id = 'agent-emp-en'; CREATE agent_policy CONTENT { agent: 'cs', lang: 'en', updated_by: 'owner:test' };");
 
     // 派工前对齐：消息跟着收件员工的语言走，译文就绪前等待。
     await store.alignLanguage(task.id, 'execute', 'emp-ja');

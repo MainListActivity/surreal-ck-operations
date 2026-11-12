@@ -241,13 +241,21 @@ run('命令守卫（库内事实）：员工策略的停用、允许与拒绝清
   await seedLease('fx_off', 'emp-off');
   await seedLease('fx_deny', 'emp-deny');
   await seedLease('fx_allow', 'emp-allow');
-  await company.db.query("CREATE agent_policy CONTENT { agent: 'emp-off', disabled: true, deny: [], updated_by: 'owner-1', updated_at: time::now() };");
-  await company.db.query("CREATE agent_policy CONTENT { agent: 'emp-deny', disabled: false, deny: ['checkpoint'], updated_by: 'owner-1', updated_at: time::now() };");
-  await company.db.query("CREATE agent_policy CONTENT { agent: 'emp-allow', disabled: false, allow: ['submit'], deny: [], updated_by: 'owner-1', updated_at: time::now() };");
+  // 策略按职能保存：员工实例经自己的职能取到策略；同职能的新实例（emp-off-2）沿用同一条策略。
+  for (const [employee, role] of [['emp-off', 'cs'], ['emp-off-2', 'cs'], ['emp-deny', 'screenwriter'], ['emp-allow', 'cinematography']]) {
+    await company.db.query(`UPSERT employee:⟨${employee}⟩ SET role = $role, paseo_agent_id = $agent;`, { role, agent: `agent-${employee}` });
+  }
+  await seedLease('fx_off2', 'emp-off-2');
+  await company.db.query("CREATE agent_policy CONTENT { agent: 'cs', disabled: true, deny: [], updated_by: 'owner-1', updated_at: time::now() };");
+  await company.db.query("CREATE agent_policy CONTENT { agent: 'screenwriter', disabled: false, deny: ['checkpoint'], updated_by: 'owner-1', updated_at: time::now() };");
+  await company.db.query("CREATE agent_policy CONTENT { agent: 'cinematography', disabled: false, allow: ['submit'], deny: [], updated_by: 'owner-1', updated_at: time::now() };");
+  // 以员工实例 key 写的旧式策略行不再生效。
+  await company.db.query("CREATE agent_policy CONTENT { agent: 'emp-allow', disabled: true, deny: [], updated_by: 'owner-1', updated_at: time::now() };");
   await company.db.query("CREATE protected_command CONTENT { command: 'heartbeat', owner_only: true, updated_by: 'owner-1', updated_at: time::now() };");
   const ask = (actorKind: 'agent' | 'runner', actor: string, command: string, task?: string) =>
     decide(company.db, { actorKind, actor, command, task, now });
   expect(await ask('agent', 'emp-off', 'submit', 'fx_off')).toMatchObject({ allow: false, reason: '该员工已停用' });
+  expect(await ask('agent', 'emp-off-2', 'submit', 'fx_off2')).toMatchObject({ allow: false, reason: '该员工已停用' });
   expect(await ask('agent', 'emp-deny', 'checkpoint', 'fx_deny')).toMatchObject({ allow: false, reason: '该员工不能调用此命令' });
   expect(await ask('agent', 'emp-deny', 'submit', 'fx_deny')).toMatchObject({ allow: true });
   expect(await ask('agent', 'emp-allow', 'checkpoint', 'fx_allow')).toMatchObject({ allow: false, reason: '命令不在该员工的允许清单内' });

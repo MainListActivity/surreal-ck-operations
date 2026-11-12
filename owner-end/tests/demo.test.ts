@@ -61,7 +61,7 @@ test('生产导出脚本仅请求固定只读接口，下载文件不含会话�
   sessionStorage:{getItem:()=>JSON.stringify({accessToken:'PRIVATE_SESSION_TOKEN'})},
   fetch:async(path:string,init:RequestInit)=>{
    expect(path).toBe('/api/cmd');const {command}=JSON.parse(String(init.body));calls.push(command);
-   const results:Record<string,unknown>={'product.iteration.list':{products:data.products},'requirement.list':{requirements:data.requirements},'feedback.list':{feedback:[]},'task.list':{tasks:data.tasks},'agent.list':{agents:data.agents},'note.list':{notes:data.notes}};
+   const results:Record<string,unknown>={'product.iteration.list':{products:data.products},'requirement.list':{requirements:data.requirements},'feedback.list':{feedback:[]},'task.list':{tasks:data.tasks},'agent.list':{roles:data.agents.map(a=>({role:a.role,defs:[],onDuty:[],policy:a.policy}))},'note.list':{notes:data.notes}};
    if(!(command in results))throw Error('不允许的请求');return Response.json({ok:true,result:results[command]});
   },Blob,AbortSignal,URL:{createObjectURL:(blob:Blob)=>{download=blob;return'blob:local';},revokeObjectURL:()=>{}},
   document:{createElement:()=>({click:()=>{}})},setTimeout:(fn:()=>void)=>fn(),console:{info:()=>{},error:(message:string)=>{throw Error(message);}},

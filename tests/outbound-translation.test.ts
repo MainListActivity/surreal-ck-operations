@@ -100,7 +100,7 @@ const messageRow = (extra: Record<string, unknown> = {}) => ({
 interface FakeOptions {
   /** latestDraft 返回的行。 */
   draft?: Record<string, unknown>;
-  /** agent_policy 里该员工的语言；缺省即没有语言。 */
+  /** agent_policy 里该员工所属职能的语言；缺省即没有语言。 */
   lang?: string;
   /** 译文 UPDATE 是否命中（原文仍与 expectedBody 相同且未发送）。 */
   matches?: boolean;
@@ -117,7 +117,7 @@ function fakeDb(opts: FakeOptions = {}) {
     writes,
     query: async (sql: string, vars: Record<string, unknown> = {}) => {
       statements.push(sql);
-      if (sql.includes('SELECT lang FROM agent_policy')) return [opts.lang ? [{ lang: opts.lang }] : []];
+      if (sql.includes('FROM agent_policy')) return [opts.lang ? [{ lang: opts.lang }] : []];
       if (sql.includes("AND step = $step AND state != 'sent' ORDER BY created_at DESC LIMIT 1")) return [opts.draft ? [opts.draft] : []];
       if (sql.includes('SELECT executor_role')) return [[{ executor_role: 'engineering', reviewer_role: 'qa', kind: 'task' }]];
       if (sql.includes("state = 'sent' ORDER BY created_at DESC")) return [[]];

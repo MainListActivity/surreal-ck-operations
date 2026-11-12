@@ -102,9 +102,9 @@ export const COMMAND_CATALOG: readonly CommandSpec[] = [
   c('route.save', '路由', '新增或修改任务路由', 'type, label, executorRole, reviewerRole, code?, executeBody?, reviewBody?, next?, hold?', { risk: 'high' }),
   c('route.disable', '路由', '停用任务路由', 'type', { risk: 'high' }),
 
-  c('agent.list', '员工与权限', '员工列表', '无', { readOnly: true }),
-  c('agent.policy.list', '员工与权限', '员工策略列表', '无', { readOnly: true }),
-  c('agent.policy.set', '员工与权限', '设置员工策略（停用、允许、禁止、语言）', 'agent, disabled?, allow?, deny?, lang?'),
+  c('agent.list', '员工与权限', '职能列表（员工定义、在岗实例与职能策略）', '无', { readOnly: true }),
+  c('agent.policy.list', '员工与权限', '职能策略列表', '无', { readOnly: true }),
+  c('agent.policy.set', '员工与权限', '设置职能策略（停用、允许、禁止、语言），对该职能的所有员工生效', 'role, disabled?, allow?, deny?, lang?'),
   c('guard.list', '员工与权限', '保护清单与锁定说明', '无', { readOnly: true }),
   c('guard.protect', '员工与权限', '把命令加入保护清单（ownerOnly 缺省为仅老板可调用）', 'command, ownerOnly?'),
   c('guard.set', '员工与权限', '同 guard.protect（别名）', 'command, ownerOnly?'),

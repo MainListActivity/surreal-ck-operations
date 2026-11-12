@@ -79,8 +79,9 @@ export class DemoStore {
       case 'status':return{paused:this.paused};
       case 'task.pause':this.paused=true;return{paused:true};
       case 'task.resume':this.paused=false;return{paused:false};
-      case 'agent.list':return{agents:this.data.agents};
-      case 'agent.policy.set':this.find(this.data.agents,input.agent,'employee').policy={disabled:!!input.disabled,allow:input.allow,deny:input.deny??[],lang:input.lang};return{updated:true};
+      // 与生产一致按职能返回：同职能的演示员工共用一条策略（取该职能第一位员工的策略）。
+      case 'agent.list':return{roles:[...new Set(this.data.agents.map(a=>String(a.role)))].sort().map(role=>{const members=this.data.agents.filter(a=>a.role===role);return{role,defs:[{id:`${role}-demo`,enabled:true}],onDuty:members.map(a=>({employee:a.employee,def:`${role}-demo`})),policy:members[0].policy};})};
+      case 'agent.policy.set':{const members=this.data.agents.filter(a=>a.role===input.role);if(!members.length)throw new DemoError(`没有职能为 ${input.role} 的员工定义`);for(const a of members)a.policy={disabled:!!input.disabled,allow:input.allow,deny:input.deny??[],lang:input.lang};return{role:input.role,policy:members[0].policy};}
       case 'agent.identity.ensure':this.find(this.data.agents,input.employee,'employee').idpUser='local-demo-identity';return{created:true};
       case 'guard.list':return{protected:this.guards,hardOwnerOnly:['db.write','requirement.approve'],ownerApiCommands:['task.list','task.create','requirement.list'],targetLocks:[],ownerOnlyForAgents:['product.iteration.configure']};
       case 'guard.protect':this.guards=this.guards.filter(g=>g.command!==input.command);this.guards.push({command:input.command,ownerOnly:!!input.ownerOnly});return{updated:true};

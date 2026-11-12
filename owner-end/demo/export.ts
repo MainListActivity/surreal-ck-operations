@@ -13,7 +13,9 @@ import { sanitize, type Row } from './data.ts';
   const requirements=await paged('requirement.list','requirements',100);
   const feedback:Row[]=[];for(const project of products){feedback.push(...await paged('feedback.list','feedback',50,{project:project.id}));if(feedback.length>10000)throw Error('反馈总量超过 10000 条，请缩小导出范围');}
   const tasks=(await call('task.list')).tasks;
-  const agents=(await call('agent.list')).agents;
+  // agent.list 按职能返回；快照里每个职能记一位演示员工，带上该职能的策略。
+  const roles=(await call('agent.list')).roles;
+  const agents=Array.isArray(roles)?roles.map((r:Row)=>({employee:r.role,name:r.role,role:r.role,policy:r.policy})):roles;
   const notes=(await call('note.list')).notes;
   if(![products,requirements,feedback,tasks,agents,notes].every(Array.isArray))throw Error('快照响应字段不完整，未生成文件');
   const snapshot=sanitize({products,requirements,feedback,tasks,agents,notes});

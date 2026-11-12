@@ -2,6 +2,7 @@ import { outboundRevisionSql } from './outbound-revision.ts';
 /** 待发消息表：建单时为执行岗与复核岗各生成一条 draft；返工/催办在触发时生成。 */
 import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from './core-errors.ts';
+import { rolePolicyOf } from './command-guard.ts';
 import { machineCriterionOf, routeBody, stepOfTask, templateFor, type MessageStep } from './outbound-render.ts';
 import { deliveryOf, sourceHash } from './outbound-delivery.ts';
 export { DEFAULT_MACHINE_CRITERION, renderMessage, templateFor } from './outbound-render.ts';
@@ -287,10 +288,9 @@ export class OutboundMessageStore {
     return rowView(row);
   }
 
-  /** The employee's language from agent_policy; undefined when the employee has none (the original body is sent). */
+  /** The language of the employee's role, from agent_policy (keyed by role); undefined when the role has none (the original body is sent). */
   private async langOf(employeeId: string): Promise<string | undefined> {
-    const [rows] = await this.db.query<[Array<{ lang?: unknown }>]>('SELECT lang FROM agent_policy WHERE agent = $agent LIMIT 1;', { agent: employeeId });
-    const lang = rows?.[0]?.lang;
+    const lang = (await rolePolicyOf(this.db, employeeId))?.lang;
     return typeof lang === 'string' && lang ? lang : undefined;
   }
 

@@ -308,7 +308,7 @@ export const ROLE_OPTIONS: readonly string[] = [
 export const ROLE_ZH: Record<string, string> = {
   product: '产品', engineering: '工程', 'ai-content': 'AI 内容', 'concept-design': '概念设计', 'asset-production': '素材制作',
   screenwriter: '编剧', 'story-author': '故事作者', cinematography: '摄影', qa: '质量验收', cs: '客服', owner: '老板',
-  research: '研究', operations: '运营',
+  research: '研究', operations: '运营', gm: '总经理',
 };
 export const roleText = (role: string | undefined): string => role ? ROLE_ZH[role] ?? role : '未指定';
 
