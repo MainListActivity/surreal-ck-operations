@@ -16,7 +16,7 @@ const LOOKUP_MS = 2_000;
 /** Read by scripts/sandbox/launch.sh, which Paseo runs in place of each provider binary. */
 
 /** Providers whose launch scripts/sandbox/install.sh wraps; codex shares one app-server across agents and cannot be. */
-const WRAPPERS: Record<string, string> = { claude: "claude", "factory-droid": "droid", antigravity: "agy" };
+const WRAPPERS: Record<string, string> = { claude: "claude", "factory-droid": "droid", "factory-paseo": "droid", antigravity: "agy", grok: "grok", muse: "muse" };
 
 /**
  * Why a company session of this provider would start outside the sandbox, or undefined when Paseo
