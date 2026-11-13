@@ -40,6 +40,7 @@ async function main(): Promise<number> {
   const deps: WarpDeps = {
     spawn: (cmd, args, opts) => Bun.spawn([cmd, ...args], { cwd: opts.cwd, env: opts.env, stdout: 'pipe', stderr: 'pipe' }) as unknown as import('./turn.ts').WarpProcess,
     now: () => Date.now(),
+    sleep: ms => new Promise(r => setTimeout(r, ms)),
     progress: status => emit({ type: 'lane_status', status }),
   };
   emit({ type: 'system', session_id: resumeId ?? sessionStart });
