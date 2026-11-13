@@ -2,9 +2,10 @@
  * 员工定义：每个职能下由哪些 CLI / 模型 / 思考强度的员工干活、最多同时几人在岗、派工权重。
  * 启动命令只能从下拉里选（CLI、模型、思考强度），页面按执行端同一份参数构造（native-args.ts）预览实际命令，不接受自由文本。
  */
-import { useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { launchPreview } from '../../../../src/runner/native-args.ts';
 import { parseWorkHours, workHoursText, type WorkHours } from '../../../../src/work-hours.ts';
+import { outcomeText, runCommand } from '../api.ts';
 import { Dialog, Field, NoticeLine, useAction } from '../common.tsx';
 
 /** def.list 返回的一条（见 src/workforce.ts EmployeeDef）。 */
@@ -68,6 +69,39 @@ const withCurrent = (options: readonly string[], current: string) => current && 
 export function launchText(def: Pick<DefRow, 'provider' | 'model' | 'thinking'>): string {
   const preview = launchPreview(def);
   return preview.via === 'native' ? preview.argv.join(' ') : `经 Paseo 启动 ${def.provider}，模型 ${def.model}`;
+}
+
+/**
+ * 优先订阅：该 CLI 还有合格候选时，新任务先保留等它（其余供应商候选显示「优先订阅 … 等待中」）；
+ * 「不设优先」则所有合格候选纯按权重竞争。写入 company_meta:config.preferred_provider。
+ */
+export function ProviderPreference({ defs }: { defs: DefRow[] }) {
+  const [value, setValue] = useState<string>();
+  const [problem, setProblem] = useState('');
+  const { busy, notice, run } = useAction();
+  useEffect(() => {
+    void runCommand<{ preferredProvider?: string }>('dispatch.preference').then(out => {
+      if (out.kind === 'ok') setValue(out.result.preferredProvider ?? '');
+      else setProblem(`优先订阅读取失败：${outcomeText(out, '')}`);
+    });
+  }, []);
+  const providers = [...new Set(defs.filter(d => d.enabled).map(d => d.provider))].sort();
+  const options = value !== undefined && value !== '' && !providers.includes(value) ? [value, ...providers] : providers;
+  const choose = (provider: string) => void run('dispatch.preference', { provider },
+    provider === '' ? '已改为不设优先（按权重派工）' : `已把优先订阅改为 ${provider}`,
+    () => setValue(provider));
+  return (
+    <div class="field preference">
+      <span class="field-label"><span>优先订阅</span></span>
+      <select value={value ?? ''} disabled={busy || value === undefined} onChange={e => choose(e.currentTarget.value)}>
+        <option value="">不设优先（按权重派工）</option>
+        {options.map(v => <option key={v} value={v}>{PROVIDERS.find(p => p.value === v)?.label ?? v}</option>)}
+      </select>
+      <span class="field-hint">优先订阅仍有合格候选时，新任务先等它（至多 3 个等待名额）；额度耗尽自动回退按权重分流。</span>
+      {problem ? <p class="notice err">{problem}</p> : null}
+      <NoticeLine notice={notice} />
+    </div>
+  );
 }
 
 /** 职能卡片里的员工定义列表：状态、启动方式，以及编辑、启用/停用、新增。 */

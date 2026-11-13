@@ -12,7 +12,7 @@ import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import { OwnerDesk } from './owner.ts';
 import type { CompanyCore } from './contracts.ts';
-import { Workforce } from './workforce.ts';
+import { preferredProviderValue, Workforce } from './workforce.ts';
 import { OutboundMessageStore, type OutboundMessage } from './outbound-messages.ts';
 import { bodyOfDispatch, unrenderMessage } from './outbound-render.ts';
 import { findingsFileOf, readBoard, readBoardView, renderContextFor } from './board.ts';
@@ -288,6 +288,16 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     }
     case 'note.consolidations': return { consolidations: await listConsolidations(db, typeof input.limit === 'number' ? input.limit : undefined) };
     case 'note.consolidation.undo': return undoConsolidation(db, text(input.id, 'id', 1, 200), a);
+    // ---- 优先订阅 ----
+    case 'dispatch.preference': {
+      if (input.provider !== undefined) {
+        const provider = preferredProviderValue(input.provider);
+        await db.query('UPSERT company_meta:config MERGE $patch;', { patch: { preferred_provider: provider } });
+        await db.query("CREATE audit CONTENT { actor: $actor, action: 'owner_dispatch_preference', evidence: $evidence, at: time::now() };",
+          { actor: a, evidence: `preferred_provider=${input.provider === '' ? '（不设优先）' : input.provider}` });
+      }
+      return { preferredProvider: (await ctx.workforce.config()).preferredProvider };
+    }
     // ---- 会话策略 ----
     case 'session.policy': {
       if (input.policy !== undefined) {

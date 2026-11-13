@@ -2,7 +2,7 @@ import { inWorkHours, workHoursText } from '../work-hours.ts';
 import { providerRetryBlock } from './provider-failover.ts';
 import { orderWork, schedulingDecision, type SchedulingFact } from './scheduling.ts';
 import { createHash, randomUUID } from 'node:crypto';
-import { FACTORY_PROVIDER, FACTORY_WAIT_LIMIT, factoryFirst, factoryQueue, leaveFactoryQueue } from './provider-order.ts';
+import { FACTORY_PROVIDER, FACTORY_WAIT_LIMIT, factoryFirst, factoryQueue, leaveFactoryQueue, preferredWaitText } from './provider-order.ts';
 import { employeeTier, managedModel, taskTier } from "../model-routing/policy.ts";
 import { groupModel, isGroupModel } from "../model-routing/magpie-contract.ts";
 import type { OwnerDesk } from '../owner.ts';
@@ -164,6 +164,8 @@ export interface StaffingInput {
   qualificationOnly?: boolean;
   /** Global FIFO of work waiting for Factory; positions after three may use other providers. */
   factoryQueue?: ReadonlyMap<string, number>;
+  /** The subscription work is reserved for; '' disables reservation entirely. Absent = FACTORY_PROVIDER. */
+  preferredProvider?: string;
   role: string;
   home: string;
   task?: SupervisedTask;
@@ -209,8 +211,8 @@ export function factoryWorkKey(role: string, task: SupervisedTask, review = fals
   return `${task.id}:${role}:${phase}`;
 }
 
-export function factoryConfigured(defs: readonly EmployeeDef[], role: string, task?: SupervisedTask): boolean {
-  return defs.some(def => def.enabled && def.provider === FACTORY_PROVIDER && def.role === role && trackOkFor(role as Role,task,def.tracks));
+export function factoryConfigured(defs: readonly EmployeeDef[], role: string, task?: SupervisedTask, provider = FACTORY_PROVIDER): boolean {
+  return defs.some(def => def.enabled && def.provider === provider && def.role === role && trackOkFor(role as Role,task,def.tracks));
 }
 
 /**
@@ -331,19 +333,20 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       provider: def.provider, model: resolved ?? def.model, def,
       weight: managedModel(def) ? 1 : effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2] });
   }
+  const preferred = p.preferredProvider ?? FACTORY_PROVIDER;
   const position = p.task ? p.factoryQueue?.get(factoryWorkKey(p.role,p.task,!!p.excludeSubmitter)) : undefined;
-  const factoryOnly = !p.qualificationOnly &&
+  const factoryOnly = !!preferred && !p.qualificationOnly &&
     (!p.task || !p.factoryQueue || (position !== undefined && position <= FACTORY_WAIT_LIMIT)) &&
-    factoryConfigured(p.defs,p.role,p.task) && staffingPool({...p,qualificationOnly:true}).some(entry=>entry.provider===FACTORY_PROVIDER && entry.eligible);
+    factoryConfigured(p.defs,p.role,p.task,preferred) && staffingPool({...p,qualificationOnly:true}).some(entry=>entry.provider===preferred && entry.eligible);
   if(factoryOnly) for(const entry of entries) {
-    if(entry.provider === FACTORY_PROVIDER || !entry.eligible) continue;
+    if(entry.provider === preferred || !entry.eligible) continue;
     entry.eligible=false;
     entry.code='factory_wait';
-    entry.reason=position === undefined ? BLOCK_TEXT.factory_wait : `${BLOCK_TEXT.factory_wait}（第 ${position}/${FACTORY_WAIT_LIMIT} 个保留等待名额）`;
+    entry.reason=position === undefined ? preferredWaitText(preferred) : `${preferredWaitText(preferred)}（第 ${position}/${FACTORY_WAIT_LIMIT} 个保留等待名额）`;
   }
-  if(!p.qualificationOnly && position!==undefined && position>FACTORY_WAIT_LIMIT && !quotaOf(FACTORY_PROVIDER)) {
-    for(const entry of entries) if(entry.provider!==FACTORY_PROVIDER && entry.eligible) {
-      entry.note=[entry.note,`Factory 已保留 ${FACTORY_WAIT_LIMIT} 个等待项，本任务第 ${position} 项允许分流`].filter(Boolean).join('；');
+  if(!!preferred && !p.qualificationOnly && position!==undefined && position>FACTORY_WAIT_LIMIT && !quotaOf(preferred)) {
+    for(const entry of entries) if(entry.provider!==preferred && entry.eligible) {
+      entry.note=[entry.note,`优先订阅 ${preferred} 已保留 ${FACTORY_WAIT_LIMIT} 个等待项，本任务第 ${position} 项允许分流`].filter(Boolean).join('；');
     }
   }
   const total = entries.filter(e => e.eligible).reduce((s, e) => s + Math.max(0, e.weight), 0);
@@ -631,7 +634,7 @@ export async function snapshotOf(p: PassInputs, opts: SnapshotOpts,
   }
   const holding = new Set(p.tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
   const poolBase = { providerAllowed: p.providerAllowed, defs: p.defs, insts: p.insts, states: p.states, holding, health: p.health, quotaBlocked: p.quotaBlocked,
-    factoryQueue:p.factoryQueue, busyBy, providerMax: p.cfg.providerMax, slots: p.slots, runtimeModels: p.runtimeModels,
+    factoryQueue:p.factoryQueue, busyBy, providerMax: p.cfg.providerMax, preferredProvider: p.cfg.preferredProvider, slots: p.slots, runtimeModels: p.runtimeModels,
     opsRepo: opts.opsRepo, sidecar: opts.sidecar, now: p.now };
   const homes = [...new Set([opts.opsRepo, ...p.insts.map(i => i.repoHome ?? i.cwd ?? opts.opsRepo), ...p.tasks.map(t => t.repoPath ?? opts.opsRepo)])];
   const roles = [...new Set([...p.defs.map(d => d.role), ...p.insts.map(i => i.role)])];
@@ -1510,9 +1513,10 @@ export class Dispatcher {
     // Reserve only pending work; active owner turns are not waiting jobs.
     const activeOwnerTasks = new Set<string>();
     // no owner wake ownership: owner-blocked work stays in the owner inbox
-    const factoryCanRoute = availabilityOf(health.get(FACTORY_PROVIDER),now) !== 'down' && !quotaBlocked.has(FACTORY_PROVIDER);
+    const preferred = cfg.preferredProvider;
+    const factoryCanRoute = !!preferred && availabilityOf(health.get(preferred),now) !== 'down' && !quotaBlocked.has(preferred);
     const poolBase = { providerAllowed: this.deps.providerAllowed, factoryQueue:undefined as Map<string,number>|undefined, defs, states, holding, health, quotaBlocked, busyBy,
-      providerMax: cfg.providerMax, slots: slotMap, runtimeModels, opsRepo: this.deps.env.opsRepo,
+      providerMax: cfg.providerMax, preferredProvider: preferred, slots: slotMap, runtimeModels, opsRepo: this.deps.env.opsRepo,
       sidecar: !!this.deps.sidecar, now };
     const queueExclusions = new Map<string,ReviewExclusion|undefined>();
     for(const item of work.filter(item=>item.purpose==='review')) queueExclusions.set(item.task.id,await readReviewExclusion(wf,item.task,message=>this.log(message)));
@@ -1521,12 +1525,12 @@ export class Dispatcher {
     const factoryWaiting = factoryQueue([
       ...work.map(item=>({task:item.task,role:item.role,review:item.purpose==='review'})),
       
-    ].filter(item=>factoryCanRoute && factoryConfigured(defs,item.role,item.task) &&
+    ].filter(item=>factoryCanRoute && factoryConfigured(defs,item.role,item.task,preferred) &&
       (!item.review || queueExclusions.get(item.task.id)!==undefined) &&
       staffingPool({...poolBase,qualificationOnly:true,insts,role:item.role,home:item.task.repoPath??this.deps.env.opsRepo,task:item.task,
         excludeSubmitter:item.review,exclusion:item.review?queueExclusions.get(item.task.id):undefined,
                 })
-        .some(entry=>entry.provider===FACTORY_PROVIDER && entry.eligible))
+        .some(entry=>entry.provider===preferred && entry.eligible))
       .map((item,rank)=>({key:factoryWorkKey(item.role,item.task,item.review),rank})));
     this.passInputs.factoryQueue=factoryWaiting;
     poolBase.factoryQueue=factoryWaiting;
@@ -1562,7 +1566,7 @@ export class Dispatcher {
       const eligible = eligibleInsts(role, home, task, excludeSubmitter, exclusion);
       // Oneshot: a task never lands on an unrelated session's context. No continuing session means a new one.
       if (cfg.sessionPolicy === 'oneshot' && task) return continuitySession(eligible, states, task, excludeSubmitter);
-      const factory = eligible.filter(i => i.provider === FACTORY_PROVIDER);
+      const factory = preferred ? eligible.filter(i => i.provider === preferred) : [];
       const candidates = factory.length ? factory : eligible;
       // A prior hand is demoted in the weighted pick (PRIOR_HAND_WEIGHT_FACTOR), exactly as in the pool.
       const weight = (inst: EmployeeInst) => effectiveWeight(defs.find(d => d.id === inst.def))
@@ -1764,13 +1768,18 @@ export class Dispatcher {
     }
     const scopeTask = task ?? anchor?.task;
     const repoHome = scopeTask?.repoPath ?? anchor?.home ?? env.opsRepo;
-    let defsOrdered = factoryFirst(spawnable(role, repoHome, scopeTask, forReview));
+    const assignCfg = await wf.config();
+    const preferredProvider = assignCfg.preferredProvider;
+    // '' means no preferred subscription: spawn order stays purely weight-ranked.
+    let defsOrdered = preferredProvider
+      ? factoryFirst(spawnable(role, repoHome, scopeTask, forReview), preferredProvider)
+      : spawnable(role, repoHome, scopeTask, forReview);
     const candidate = pick(role, scopeTask, avoid, forReview, exclusion, anchor?.home);
-    // A free Factory seat is used before an idle Claude session. Once Factory has no admitted
+    // A free preferred-provider seat is used before another provider's idle session. Once it has no admitted
     // reuse or spawn candidate (quota, health, capacity, exclusion), ordinary fallback takes over.
     // A session continuing its own work keeps it: its context is why it was picked.
-    const continuing = candidate !== undefined && (await wf.config()).sessionPolicy === 'oneshot';
-    const picked = !continuing && candidate?.provider !== FACTORY_PROVIDER && defsOrdered.some(d=>d.provider===FACTORY_PROVIDER) ? undefined : candidate;
+    const continuing = candidate !== undefined && assignCfg.sessionPolicy === 'oneshot';
+    const picked = !continuing && !!preferredProvider && candidate?.provider !== preferredProvider && defsOrdered.some(d=>d.provider===preferredProvider) ? undefined : candidate;
     const pending = picked && !picked.paseoAgentId ? picked : undefined;
     if (pending) defsOrdered = (await wf.defs()).filter(d => d.id === pending.def && d.enabled && inWorkHours(d.workHours, new Date()));
     const existing = picked?.paseoAgentId && sidecar.canReuse(picked) ? picked : undefined;

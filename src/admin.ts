@@ -6,7 +6,7 @@ import { loadDatabaseConfig } from './config.ts';
 import { CompanyDatabase } from './database.ts';
 import { LocalEnrollmentAdmin } from './enrollment.ts';
 import { SEED_DEFS } from './seed.ts';
-import { effectiveWeight, Workforce } from './workforce.ts';
+import { effectiveWeight, preferredProviderValue, Workforce } from './workforce.ts';
 import { jevFromEnv } from './dispatcher/jev.ts';
 import { parseReclaimCliArgs } from './dispatcher/artifact-reclaim.ts';
 import { loadSecretKey, ProjectStore, type ProjectInput } from './projects.ts';
@@ -186,7 +186,8 @@ try {
     case 'config': {
       const [key, value] = args;
       if (!key || value === undefined || !/^[a-z_]+$/.test(key)) throw new Error(usage);
-      await database.db.query('UPSERT company_meta:config MERGE $patch;', { patch: { [key]: JSON.parse(value) } });
+      const parsed = key === 'preferred_provider' ? preferredProviderValue(JSON.parse(value)) : JSON.parse(value) as unknown;
+      await database.db.query('UPSERT company_meta:config MERGE $patch;', { patch: { [key]: parsed } });
       print(await workforce.config());
       break;
     }

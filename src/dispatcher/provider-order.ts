@@ -1,10 +1,23 @@
 /** Factory runs its native agent first; this orders only candidates already admitted by staffing rules. */
 export const FACTORY_PROVIDER = 'factory-droid';
-export function factoryFirst<T extends {provider?: string}>(rows: readonly T[]): T[] {
-  return [...rows].sort((a,b)=>Number(b.provider===FACTORY_PROVIDER)-Number(a.provider===FACTORY_PROVIDER));
+
+/**
+ * The subscription the boss prefers for new work. `company_meta:config.preferred_provider`
+ * overrides it (workforce CompanyConfig.preferredProvider); '' means no preference and every
+ * eligible candidate competes purely by weight.
+ */
+export type PreferredProvider = string;
+
+export function factoryFirst<T extends {provider?: string}>(rows: readonly T[], provider: PreferredProvider = FACTORY_PROVIDER): T[] {
+  return [...rows].sort((a,b)=>Number(b.provider===provider)-Number(a.provider===provider));
 }
 
-/** At most three pending work items are reserved for Factory across all roles/projects. */
+/** Owner-facing text for a task held back while the preferred subscription still has quota. */
+export function preferredWaitText(provider: string): string {
+  return `优先订阅 ${provider} 仍有额度，本任务保留等待 ${provider}；已有 ${FACTORY_WAIT_LIMIT} 个等待任务后新任务可分流`;
+}
+
+/** At most three pending work items are reserved for the preferred provider across all roles/projects. */
 export const FACTORY_WAIT_LIMIT = 3;
 export interface FactoryQueueItem { key: string; createdAt?: number; rank?: number }
 

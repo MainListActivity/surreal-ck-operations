@@ -63,4 +63,5 @@
 | 附件链接 | `sck owner attachment.url '{"taskId":"t1","file":"report.md"}'` |
 | 审计 | `sck owner audit.list '{}'` |
 | 订阅额度（各供应商快照与耗尽冷却） | `sck owner quota.list '{}'` |
+| 优先订阅（不带 provider 只读；`""` 不设优先按权重派工） | `sck owner dispatch.preference '{"provider":"codex-cloud"}'` |
 | 概况 | `sck owner status '{}'` |
