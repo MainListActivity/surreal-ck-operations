@@ -143,3 +143,22 @@ describe('pool room', () => {
     expect(poolRoom([])).toBeUndefined();
   });
 });
+
+describe('quota read key', () => {
+  test('a dedicated private/magpie-quota.key wins; without it the employee key is used', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const { magpieQuotaAuthorization } = await import('../src/model-routing/employee-env.ts');
+    const home = mkdtempSync(join(tmpdir(), 'sck-quota-key-'));
+    try {
+      mkdirSync(join(home, 'private'));
+      writeFileSync(join(home, 'private', 'magpie-remote.key'), 'employee-key\n');
+      expect(magpieQuotaAuthorization(home)).toEqual({ Authorization: 'Bearer employee-key' });
+      writeFileSync(join(home, 'private', 'magpie-quota.key'), '  \n');
+      expect(magpieQuotaAuthorization(home)).toEqual({ Authorization: 'Bearer employee-key' });
+      writeFileSync(join(home, 'private', 'magpie-quota.key'), 'quota-key\n');
+      expect(magpieQuotaAuthorization(home)).toEqual({ Authorization: 'Bearer quota-key' });
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+});
