@@ -43,6 +43,7 @@ describe('install.sh 员工沙箱安装', () => {
       const providers = config.agents.providers;
       const bindir = join(env.service, 'sandbox', 'bin');
       expect(providers.grok.command).toEqual([join(bindir, 'grok'), 'agent', '--always-approve', 'stdio']);
+      expect(providers.grok.extends).toBe('acp');
       const paseo = providers['factory-paseo'];
       expect(paseo.extends).toBe('acp');
       expect(paseo.command).toEqual([join(bindir, 'droid'), 'exec', '--output-format', 'acp-daemon']);

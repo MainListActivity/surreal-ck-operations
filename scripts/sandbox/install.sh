@@ -50,10 +50,13 @@ point("factory-droid", "droid", ["exec", "--output-format", "acp-daemon"])
 point("antigravity", "agy")
 point("grok", "grok", ["agent", "--always-approve", "stdio"])
 # grok needs the unattended ACP argv verbatim; keep argv[0] but correct the tail if it drifted.
-grok_entry = providers.get("grok", {})
-grok_cmd = grok_entry.get("command")
-if isinstance(grok_cmd, list) and grok_cmd and grok_cmd[1:] != ["agent", "--always-approve", "stdio"]:
-    grok_entry["command"] = [grok_cmd[0], "agent", "--always-approve", "stdio"]
+# Paseo has no built-in grok provider: it is a custom ACP provider, so it needs extends/label as well.
+grok_entry = providers.get("grok")
+grok_cmd = grok_entry.get("command") if isinstance(grok_entry, dict) else None
+if isinstance(grok_cmd, list) and grok_cmd:
+    grok_entry.update({"extends": "acp", "label": grok_entry.get("label", "Grok Build"),
+        "description": grok_entry.get("description", "Grok Build via Agent Client Protocol（公司员工）"),
+        "command": [grok_cmd[0], "agent", "--always-approve", "stdio"]})
     print(f"grok: {' '.join(grok_entry['command'])}")
 
 # factory-paseo is the Paseo-mode face of the Factory subscription: a separate provider id so a def can
