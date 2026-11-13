@@ -18,12 +18,18 @@ const bad = (stderr = 'boom'): ExecResult => ({ code: 1, stdout: '', stderr });
 const dirs: string[] = [];
 afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true }); });
 
-function world(opts: { task?: string; prompt?: string; git?: Route; extra?: Route } = {}) {
+function world(opts: { task?: string; prompt?: string; git?: Route; extra?: Route;
+    /** 默认把 cwd 当任务工作树写进 claim.json（分支 sck/task-1）；'none' 不写，对象自定义。 */
+    claim?: 'none' | { worktreePath: string; branch: string } } = {}) {
   const commDir = mkdtempSync(join(tmpdir(), 'sck-lane-comm-'));
   const cwd = mkdtempSync(join(tmpdir(), 'sck-lane-wt-'));
   const stateRoot = mkdtempSync(join(tmpdir(), 'sck-lane-state-'));
   dirs.push(commDir, cwd, stateRoot);
   writeFileSync(join(commDir, 'task.md'), opts.task ?? '# 云端任务\n\n实现需求甲。\n');
+  if (opts.claim !== 'none') {
+    const wt = opts.claim ?? { worktreePath: cwd, branch: 'sck/task-1' };
+    writeFileSync(join(commDir, 'claim.json'), JSON.stringify({ worktree: { worktreePath: wt.worktreePath, branch: wt.branch, intent: { kind: 'code' }, mode: 'exclusive' } }));
+  }
   const calls: Call[] = [];
   const progress: string[] = [];
   const git: Route = call => {
@@ -72,7 +78,7 @@ describe('codex-cloud 通道', () => {
       if (call.cmd === 'codex' && a === 'cloud' && b === 'diff') return ok('diff --git a/x b/x\n+hello\n');
       if (call.cmd === 'codex' && a === 'cloud' && b === 'apply') return ok('applied\n');
       if (call.cmd === 'git' && a === 'add') return ok('');
-      if (call.cmd === 'git' && a === 'status' && b === '--porcelain') return ok(' M x\n');
+      if (call.cmd === 'git' && a === 'diff' && b === '--cached') return ok('x\n');
       if (call.cmd === 'git' && a === 'commit') return ok('');
       if (call.cmd === 'gh' && a === 'pr' && b === 'list') return ok('[]');
       if (call.cmd === 'gh' && a === 'pr' && b === 'create') return ok('https://github.com/acme/widget/pull/7\n');
@@ -495,5 +501,83 @@ describe('lanes.bin 配置校验', () => {
     expect(() => validateLanes({ 'codex-cloud': { bin: { 'a b': '/abs/x' } } })).toThrow(/bin/);
     expect(() => validateLanes({ 'codex-cloud': { bin: [] } })).toThrow(/bin/);
     expect(() => validateLanes({ nope: { bin: { x: '/abs/x' } } })).toThrow(/lanes/);
+  });
+});
+
+describe('任务工作树边界', () => {
+  const happyCodex: Route = call => {
+    const [a, b] = call.args;
+    if (call.cmd === 'codex' && a === 'cloud' && b === 'exec') return ok('https://chatgpt.com/codex/tasks/task_b_wt\n');
+    if (call.cmd === 'codex' && a === 'cloud' && b === 'status') return ok('[READY] t\nenv  •  now\nno diff\n');
+    if (call.cmd === 'codex' && a === 'cloud' && b === 'diff') return ok('diff --git a/README.md b/README.md\n+line\n');
+    if (call.cmd === 'codex' && a === 'cloud' && b === 'apply') return ok('applied\n');
+    if (call.cmd === 'git' && a === 'add') return ok('');
+    if (call.cmd === 'git' && a === 'diff' && b === '--cached') return ok('README.md\n');
+    if (call.cmd === 'git' && a === 'commit') return ok('');
+    if (call.cmd === 'gh' && a === 'pr' && b === 'list') return ok('[]');
+    if (call.cmd === 'gh' && a === 'pr' && b === 'create') return ok('https://github.com/acme/widget/pull/8\n');
+    return undefined;
+  };
+
+  test('全部命令在 claim 指定的任务工作树执行，不碰会话 cwd', async () => {
+    // input.cwd 是共享 checkout（可能正被老板使用），claim.json 指向任务工作树 B（分支 task/x）。
+    const worktree = mkdtempSync(join(tmpdir(), 'sck-lane-task-wt-'));
+    dirs.push(worktree);
+    const w = world({ claim: { worktreePath: worktree, branch: 'task/x' }, extra: happyCodex,
+      git: call => {
+        if (call.cmd === 'git' && call.args[0] === 'rev-parse' && call.args[1] === '--abbrev-ref') return ok('task/x\n');
+        return undefined;
+      }});
+    const out = await runLane(w.input(), w.deps);
+    expect(out.status).toBe('success');
+    // 任何一次 git/gh/codex 调用都不许落在共享 cwd 上。
+    expect(w.calls.every(c => c.cwd === worktree)).toBe(true);
+    const push = w.callsOf(c => c.cmd === 'git' && c.args[0] === 'push');
+    expect(push.some(c => c.args.includes('HEAD:task/x'))).toBe(true);
+  });
+
+  test('没有 claim.json → 受阻，且一个供应商/git 命令都不发', async () => {
+    const w = world({ claim: 'none', extra: happyCodex });
+    const out = await runLane(w.input(), w.deps);
+    expect(out.status).toBe('success');
+    expect(out.text).toContain('工作结果：受阻');
+    expect(out.text).toContain('任务工作树');
+    expect(w.calls.filter(c => c.cmd === 'codex' || c.cmd === 'gh' ||
+      (c.cmd === 'git' && ['commit', 'push', 'add'].includes(c.args[0]!)))).toHaveLength(0);
+    expect(w.calls).toHaveLength(0);
+  });
+
+  test('工作树当前分支与 claim 分支不一致 → 受阻，无提交类调用', async () => {
+    const w = world({ claim: { worktreePath: '', branch: 'task/x' }, extra: happyCodex });
+    // claim 指向一个真实目录但分支要求 task/x，而工作树检出的是 design/foo。
+    const wt = w.cwd;
+    writeFileSync(join(w.commDir, 'claim.json'), JSON.stringify({ worktree: { worktreePath: wt, branch: 'task/x', intent: { kind: 'code' } } }));
+    const w2 = world({ claim: { worktreePath: wt, branch: 'task/x' }, extra: happyCodex,
+      git: call => {
+        if (call.cmd === 'git' && call.args[0] === 'rev-parse' && call.args[1] === '--abbrev-ref') return ok('design/foo\n');
+        return undefined;
+      }});
+    const out = await runLane(w2.input(), w2.deps);
+    expect(out.status).toBe('success');
+    expect(out.text).toContain('design/foo');
+    expect(w2.callsOf(c => c.cmd === 'codex' || (c.cmd === 'git' && ['commit', 'push', 'add'].includes(c.args[0]!)))).toHaveLength(0);
+  });
+
+  test('只暂存补丁内路径：补丁外的暂存项被 reset 取消暂存', async () => {
+    const w = world({ extra: call => {
+      if (call.cmd === 'git' && call.args[0] === 'diff' && call.args[1] === '--cached')
+        return ok('README.md\nerror.log\n');
+      if (call.cmd === 'git' && call.args[0] === 'reset') return ok('');
+      return happyCodex(call);
+    }});
+    const out = await runLane(w.input(), w.deps);
+    expect(out.status).toBe('success');
+    const add = w.callsOf(c => c.cmd === 'git' && c.args[0] === 'add');
+    expect(add).toHaveLength(1);
+    expect(add[0]!.args).toEqual(['add', '-A', '--', 'README.md']);
+    const reset = w.callsOf(c => c.cmd === 'git' && c.args[0] === 'reset');
+    expect(reset).toHaveLength(1);
+    expect(reset[0]!.args).toContain('error.log');
+    expect(out.text).toContain('取消暂存');
   });
 });
