@@ -17,7 +17,7 @@ interface Ctx {
   digest: string; deadline: number;
 }
 
-export async function driveDevin(ctx: Ctx): Promise<{ kind: 'done' | 'blocked' | 'error'; text: string }> {
+export async function driveDevin(ctx: Ctx): Promise<{ kind: 'done' | 'blocked' | 'error'; text: string; vendorTerminal?: boolean }> {
   const { input, deps, repo, material, prompt } = ctx;
   const continuing = Boolean(ctx.state.taskId) || Boolean(input.resumeId);
   try { await ensureBranchOnOrigin(deps.exec, input.cwd, repo.branch); }

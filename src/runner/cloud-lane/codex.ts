@@ -8,7 +8,7 @@
  */
 import { ensureBranchOnOrigin, ensurePullRequest, type RepoInfo } from './repo.ts';
 import type { LaneDeps, LaneInput } from './lane.ts';
-import { writeLaneState } from './state.ts';
+import { recordInflight, writeLaneState } from './state.ts';
 
 interface Ctx {
   input: LaneInput; deps: LaneDeps; repo: RepoInfo;
@@ -21,14 +21,16 @@ const TERMINAL: Record<string, 'done' | 'failed'> = { READY: 'done', APPLIED: 'd
 const TASK_ID = /(task_[A-Za-z0-9_-]+)/;
 const REVIEW_FILE = '.sck/review.md';
 
-async function statusOf(ctx: Ctx, taskId: string): Promise<{ code: 'pending' | 'done' | 'failed'; head: string }> {
+async function statusOf(ctx: Ctx, taskId: string): Promise<{ code: 'pending' | 'done' | 'failed'; head: string; vendor: boolean }> {
   const { deps, input } = ctx;
   const r = await deps.exec('codex', ['cloud', 'status', taskId], { cwd: input.cwd });
   const head = r.stdout.split('\n').find(l => l.trim()) ?? '';
   const mark = /^\[([A-Z_]+)\]/.exec(head)?.[1] ?? '';
-  const terminal = TERMINAL[mark];
-  if (!terminal && r.code !== 0) return { code: 'failed', head: r.stderr.trim() || head };
-  return { code: terminal ?? 'pending', head };
+  // 状态标记是权威：CLI 在任务未结束时也以退出码 1 返回（实测 [PENDING] → exit 1），
+  // 只有解析不到标记时退出码才作为失败依据。
+  if (mark) return { code: TERMINAL[mark] ?? 'pending', head, vendor: TERMINAL[mark] === 'failed' };
+  if (r.code !== 0) return { code: 'failed', head: r.stderr.trim() || head, vendor: false };
+  return { code: 'pending', head, vendor: false };
 }
 
 /** 从 `codex cloud diff` 的统一补丁提取 .sck/review.md 的新增行（复核轮的供应商结论）。 */
@@ -47,10 +49,13 @@ async function reviewFromDiff(ctx: Ctx, taskId: string): Promise<string | undefi
   return text || undefined;
 }
 
-export async function driveCodex(ctx: Ctx): Promise<{ kind: 'done' | 'blocked' | 'error'; text: string }> {
+export async function driveCodex(ctx: Ctx): Promise<{ kind: 'done' | 'blocked' | 'error'; text: string; vendorTerminal?: boolean }> {
   const { input, deps, repo, material, prompt, state } = ctx;
   const env = input.config.environments?.[repo.slug] ?? repo.repo;
-  const save = () => writeLaneState(input.commDir, { ...state, submittedAt: state.submittedAt ?? deps.now() });
+  const save = () => {
+    writeLaneState(input.commDir, { ...state, submittedAt: state.submittedAt ?? deps.now() });
+    recordInflight(input.stateRoot, input.provider, ctx.digest, state);
+  };
 
   let taskId = state.taskId;
   let taskUrl = state.taskUrl;
@@ -67,18 +72,18 @@ export async function driveCodex(ctx: Ctx): Promise<{ kind: 'done' | 'blocked' |
     deps.progress(`已提交 Codex Cloud 任务 ${taskId}`);
   } else deps.progress(`重连 Codex Cloud 任务 ${taskId}`);
 
-  let head = '', terminal: 'done' | 'failed' = 'done';
+  let head = '', terminal: 'done' | 'failed' = 'done', vendorTerminal = false;
   for (;;) {
     const s = await statusOf(ctx, taskId);
     head = s.head;
-    if (s.code !== 'pending') { terminal = s.code; break; }
+    if (s.code !== 'pending') { terminal = s.code; vendorTerminal = s.vendor; break; }
     if (deps.now() > ctx.deadline)
       return { kind: 'error', text: `Codex Cloud 任务超时仍未结束（${taskUrl}）；它可能仍在运行，请人工核对后再重试。` };
     deps.progress(`云端运行中：${head || '等待任务状态'}`);
     await deps.sleep(input.config.pollMs ?? 25_000);
   }
   if (terminal === 'failed')
-    return { kind: 'error', text: `Codex Cloud 任务失败（${taskUrl}）：${head || '无状态输出'}` };
+    return { kind: 'error', vendorTerminal, text: `Codex Cloud 任务失败（${taskUrl}）：${head || '无状态输出'}` };
 
   if (material.review) {
     const text = await reviewFromDiff(ctx, taskId);
