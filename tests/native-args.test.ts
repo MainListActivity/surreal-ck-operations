@@ -19,3 +19,11 @@ test('经 Paseo 启动的 provider 没有命令行可预览；空的思考强度
   expect(launchPreview({ provider: 'antigravity', model: 'gemini-3.8-flash-medium' })).toEqual({ via: 'paseo', argv: [] });
   expect(launchPreview({ provider: 'claude', model: 'm', thinking: '' }).argv).not.toContain('--effort');
 });
+
+test('云端通道：桥接进程参数只有 --resume 与非 default 的 --model', () => {
+  expect(nativeArgs({ provider: 'codex-cloud', model: 'default' })).toEqual([]);
+  expect(nativeArgs({ provider: 'devin-cloud', model: 'default', nativeSessionId: 'lane-1' })).toEqual(['--resume', 'lane-1']);
+  expect(nativeArgs({ provider: 'jules', model: 'other' })).toEqual(['--model', 'other']);
+  expect(launchPreview({ provider: 'jules', model: 'default' }).argv)
+    .toEqual(['bun', 'src/runner/cloud-lane/main.ts', 'jules']);
+});

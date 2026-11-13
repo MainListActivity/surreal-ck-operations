@@ -296,6 +296,13 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       return { policy: (await ctx.workforce.config()).sessionPolicy };
     }
     case 'def.list': return { defs: await ctx.workforce.defs() };
+    case 'quota.list': {
+      const [quotas] = await db.query<[unknown[]]>(
+        `SELECT * FROM company_meta WHERE string::starts_with(<string>id, 'company_meta:quota_');`);
+      const [exhausted] = await db.query<[unknown[]]>(
+        `SELECT * FROM provider_health WHERE state = 'exhausted';`);
+      return { quotas: quotas ?? [], exhausted: exhausted ?? [] };
+    }
     case 'def.ensure': {
       const defId = text(input.id, 'id');
       const role = text(input.role, 'role') as Role;

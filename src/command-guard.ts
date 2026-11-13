@@ -24,7 +24,7 @@ export const OWNER_API_COMMANDS: readonly string[] = [
   'approve', 'audit.list', 'board.snapshot', 'brief', 'decide', 'def.disable', 'def.enable', 'def.ensure', 'def.list', 'direction.add',
   'inbox', 'instruct', 'message.edit', 'message.edit_rendered', 'message.hold', 'message.list', 'message.records', 'message.release', 'message.send',
   'note.activate', 'note.add', 'note.consolidate', 'note.consolidation.undo', 'note.consolidations', 'note.edit', 'note.list', 'note.pin', 'note.preview', 'note.remove', 'notice.list',
-  'notice.resolve', 'progress', 'reject', 'reply', 'route.disable', 'route.list', 'route.save', 'session.policy', 'status',
+  'notice.resolve', 'progress', 'quota.list', 'reject', 'reply', 'route.disable', 'route.list', 'route.save', 'session.policy', 'status',
   'task.cost', 'task.create', 'task.delete', 'task.detail', 'task.list', 'task.pause', 'task.plan', 'task.reassign',
   'task.resume', 'task.revoke', 'task.update', 'task.void',
 ];

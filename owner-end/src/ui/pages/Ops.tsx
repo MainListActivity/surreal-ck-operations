@@ -38,7 +38,7 @@ interface ClientSecret {
   note: string;
 }
 
-const OPS_SECTIONS = [['ops-commands', '命令目录'], ['ops-jobs', '执行端作业'], ['ops-audit', '审计'], ['ops-read', '只读查询'], ['ops-idp', '身份服务'], ['ops-cf', 'Cloudflare'], ['ops-write', '直接写库']] as const;
+const OPS_SECTIONS = [['ops-commands', '命令目录'], ['ops-quota', '订阅额度'], ['ops-jobs', '执行端作业'], ['ops-audit', '审计'], ['ops-read', '只读查询'], ['ops-idp', '身份服务'], ['ops-cf', 'Cloudflare'], ['ops-write', '直接写库']] as const;
 
 const CLIENT_ROLES = ['gateway', 'viewer', 'automation', 'runner', 'migrator', 'agentClaims'] as const;
 
@@ -52,6 +52,7 @@ export function OpsPage() {
         ))}
       </nav>
       <CommandPanel />
+      <QuotaPanel />
       <JobsPanel />
       <AuditPanel />
       <ReadSqlPanel />
@@ -91,6 +92,89 @@ function CommandPanel() {
           </ul>
         </details>
       ))}
+    </Panel>
+  );
+}
+
+// ---- 订阅额度：执行端写入 company_meta:quota_* 的快照 + 耗尽冷却 ----
+
+interface QuotaWindow { id?: string; label?: string; remainingPct?: number | null; resetsAt?: string | null }
+interface QuotaRow {
+  id?: string;
+  provider?: string;
+  summary?: string;
+  status?: string;
+  fetched_at?: string;
+  payload?: { providerId?: string; displayName?: string; planLabel?: string | null; status?: string; windows?: QuotaWindow[] };
+}
+interface ExhaustedRow { id?: string; state?: string; until?: number; last_error?: string; failures?: number }
+
+const STALE_MS = 15 * 60 * 1000;
+
+function QuotaPanel() {
+  const [rows, setRows] = useState<QuotaRow[]>();
+  const [exhausted, setExhausted] = useState<ExhaustedRow[]>([]);
+  const [error, setError] = useState<string>();
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    const out = await runCommand<{ quotas?: QuotaRow[]; exhausted?: ExhaustedRow[] }>('quota.list', {});
+    setLoading(false);
+    if (out.kind === 'ok') {
+      setError(undefined);
+      setRows(out.result.quotas ?? []);
+      setExhausted(out.result.exhausted ?? []);
+    } else {
+      setError(outcomeText(out, ''));
+    }
+  }, []);
+  useEffect(() => { void load(); }, [load]);
+
+  const providerName = (row: QuotaRow) => row.payload?.displayName ?? row.payload?.providerId ?? row.provider ?? String(row.id ?? '');
+  const stale = (row: QuotaRow) => !row.fetched_at || Date.now() - Date.parse(row.fetched_at) > STALE_MS;
+
+  return (
+    <Panel id="ops-quota" title="订阅额度" hint="执行端定期写入的各订阅剩余额度快照与耗尽冷却。超过 15 分钟未更新视为过期。">
+      <div class="button-row">
+        <button type="button" disabled={loading} onClick={() => void load()}>{loading ? '读取中…' : '刷新'}</button>
+      </div>
+      {error ? <p class="notice err">{error}</p> : null}
+      {rows === undefined ? null : rows.length === 0 ? <Empty>还没有额度快照</Empty> : (
+        <ul class="list">
+          {rows.map(row => (
+            <li key={String(row.id ?? row.provider)} class="row">
+              <div class="row-main">
+                <strong>{providerName(row)}</strong>
+                {row.payload?.planLabel ? <span class="tag">{row.payload.planLabel}</span> : null}
+                {row.status && row.status !== 'available' ? <span class="tag danger">{row.status}</span> : null}
+                {stale(row) ? <span class="tag danger">已过期</span> : null}
+              </div>
+              <div class="hint">
+                {(row.payload?.windows ?? []).map(w =>
+                  `${w.label ?? w.id}：剩余 ${w.remainingPct ?? '—'}%${w.resetsAt ? `（${timeText(w.resetsAt)} 重置）` : ''}`).join('；') || row.summary || '无窗口数据'}
+                {row.fetched_at ? ` · 取自 ${timeText(row.fetched_at)}` : ''}
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+      {exhausted.length ? (
+        <ul class="list">
+          {exhausted.map(row => (
+            <li key={String(row.id)} class="row">
+              <div class="row-main">
+                <strong>{String(row.id).replace(/^provider_health:/, '').replace(/[⟨⟩]/g, '')}</strong>
+                <span class="tag danger">额度耗尽冷却中</span>
+              </div>
+              <div class="hint">
+                {row.until ? `冷却至 ${timeText(new Date(row.until * 1000).toISOString())}` : '冷却中'}
+                {row.last_error ? ` · 最近错误：${row.last_error.slice(0, 200)}` : ''}
+              </div>
+            </li>
+          ))}
+        </ul>
+      ) : null}
     </Panel>
   );
 }

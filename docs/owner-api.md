@@ -62,4 +62,5 @@
 | 任务附件 | `sck owner task.attachments '{"taskId":"t1"}'` |
 | 附件链接 | `sck owner attachment.url '{"taskId":"t1","file":"report.md"}'` |
 | 审计 | `sck owner audit.list '{}'` |
+| 订阅额度（各供应商快照与耗尽冷却） | `sck owner quota.list '{}'` |
 | 概况 | `sck owner status '{}'` |

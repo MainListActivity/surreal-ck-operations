@@ -8,7 +8,7 @@ export function readProviderRoutes(home: string): ProviderRoutes {
   catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return {version: 1, routes: {}}; throw e; }
   const value = JSON.parse(raw);
   if (value?.version !== 1 || !value.routes || Array.isArray(value.routes) || typeof value.routes !== 'object' ||
-    Object.entries(value.routes).some(([provider, runner]) => !['claude','factory-droid','codex'].includes(provider) ||
+    Object.entries(value.routes).some(([provider, runner]) => !['claude','factory-droid','codex','codex-cloud','devin-cloud','jules'].includes(provider) ||
       typeof runner !== 'string' || !/^native:[a-zA-Z0-9_-]+$/.test(runner))) throw new Error('runtime-routes.json 配置无效，停止新派工');
   return value;
 }

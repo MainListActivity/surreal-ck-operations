@@ -95,6 +95,9 @@ export class ActivityCollector {
       if (e.type === 'message' && e.role === 'assistant' && typeof e.text === 'string') this.append('output', e.text, at);
       if (e.type === 'tool_call') this.start(e.toolId ?? e.toolCallId ?? e.id, e.toolName, at, e.parameters);
       if (e.type === 'tool_result') this.end(e.toolId ?? e.toolCallId ?? e.id, e.isError === true, at);
+    } else if (provider === 'codex-cloud' || provider === 'devin-cloud' || provider === 'jules') {
+      // 云端通道桥接进程的进展行：只取状态短语，不取供应商转录。
+      if (e.type === 'lane_status' && typeof e.status === 'string') this.append('status', `云端运行中：${e.status}`, at);
     } else if (provider === 'codex') {
       if (e.type === 'item.completed' && e.item?.type === 'agent_message' && typeof e.item.text === 'string') this.append('output', e.item.text, at);
       if (e.type === 'item.started' && e.item?.type === 'command_execution') this.start(e.item.id, '命令执行', at);

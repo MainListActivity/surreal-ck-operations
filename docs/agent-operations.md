@@ -130,7 +130,7 @@ sck call company_cmd '{"command":"<命令名>","input":{...}}'
 
 ## 员工编制（SurrealDB）
 
-- **员工定义** `employee_def`：`role`（任务岗位）、`provider`（codex / grok / devin）、`model`、`thinking`，可选 `max_instances`（默认 1）、`weight`（派工权重，默认 10）、`enabled`、`tracks`（岗位轨名单：非空则只接 `discipline` 在列的任务，缺省或空 = 全接）。可直接写库，例如：
+- **员工定义** `employee_def`：`role`（任务岗位）、`provider`（codex / grok / devin / claude / factory-droid / antigravity，及云端通道 codex-cloud / devin-cloud / jules）、`model`、`thinking`，可选 `max_instances`（默认 1）、`weight`（派工权重，默认 10）、`enabled`、`tracks`（岗位轨名单：非空则只接 `discipline` 在列的任务，缺省或空 = 全接）。云端通道 provider 的 `model` 固定 `default`，由原生执行端桥接进程驱动，配置与额度行为见 [cloud-lanes.md](cloud-lanes.md)。可直接写库，例如：
 
   ```sql
   UPSERT employee_def:engineering-grok CONTENT { role: 'engineering', provider: 'grok', model: 'auto:grok', thinking: 'medium', max_instances: 2, weight: 25 };
