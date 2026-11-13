@@ -5,6 +5,9 @@ import { configureCompanyRuntime, company, noteHost } from './company.ts';
 import { startDispatch } from './dispatch.ts';
 import { loadNativeOwnerCredential, loadServiceEnv, serviceHome } from './env.ts';
 import { NativeRuntime, type NativeProvider } from './native.ts';
+import { isLaneProvider, LANE_PROVIDERS, type LaneProvider } from './native-args.ts';
+import { julesUsageEntry, readCodexCloudUsage } from './cloud-lane/quota.ts';
+import type { LaneConfig } from './cloud-lane/lane.ts';
 import { RuntimeEventsBus } from './events.ts';
 import type { RuntimeHost } from './host.ts';
 import { scrubEnv, SANDBOX_MARKER, installZdot, userZshDir, externalPatterns } from './launch-env.ts';
@@ -23,11 +26,38 @@ const config = JSON.parse(readFileSync(configPath, 'utf8')) as {
   commands: Partial<Record<NativeProvider, string[]>>;
   isolation?: "external";
   models?: Partial<Record<NativeProvider, string[]>>;
+  lanes?: Partial<Record<LaneProvider, LaneConfig>>;
 };
 for (const [provider, command] of Object.entries(config.commands ?? {})) {
-  if (!['factory-droid', 'claude', 'codex'].includes(provider) || !Array.isArray(command) || !command.length || command.some(x => typeof x !== 'string') || !isAbsolute(command[0]!)) {
+  if (!['factory-droid', 'claude', 'codex', ...LANE_PROVIDERS].includes(provider) || !Array.isArray(command) || !command.length || command.some(x => typeof x !== 'string') || !isAbsolute(command[0]!)) {
     throw new Error('原生执行端 commands 配置无效；每个命令必须是以绝对路径开头的参数数组');
   }
+}
+for (const [provider, lane] of Object.entries(config.lanes ?? {})) {
+  if (!isLaneProvider(provider) || !lane || typeof lane !== 'object')
+    throw new Error('原生执行端 lanes 配置无效：只允许 codex-cloud、devin-cloud、jules');
+  for (const [key, value] of Object.entries(lane)) {
+    if (key === 'environments') {
+      if (!value || typeof value !== 'object' || Array.isArray(value) ||
+        Object.entries(value as Record<string, unknown>).some(([repo, env]) => !/^[\w.-]+\/[\w.-]+$/.test(repo) || typeof env !== 'string' || !env))
+        throw new Error(`lanes.${provider}.environments 必须是 "owner/repo" → 环境 ID/标签 的映射`);
+    } else if (!['dailyLimit', 'maxConcurrent', 'maxMinutes', 'pollMs'].includes(key) || typeof value !== 'number' || !(value > 0))
+      throw new Error(`lanes.${provider}.${key} 必须是正数`);
+  }
+}
+// 通道级状态目录：桥接进程（沙箱内可写）与额度读取（沙箱外可读）共用。
+const laneStateRoot = join(serviceHome(), 'native', hostId, 'lanes');
+/** 通道供应商的私密环境变量：沙箱外由执行端读取 private/lanes/<provider>.env（KEY=VALUE），桥接进程只继承变量不读文件。 */
+function laneSecretEnv(provider: string): Record<string, string> {
+  if (!isLaneProvider(provider)) return {};
+  try {
+    const env: Record<string, string> = {};
+    for (const line of readFileSync(join(serviceHome(), 'private', 'lanes', `${provider}.env`), 'utf8').split(/\r?\n/)) {
+      const m = /^([A-Z][A-Z0-9_]*)=(.*)$/.exec(line.trim());
+      if (m?.[2]) env[m[1]] = m[2];
+    }
+    return env;
+  } catch { return {}; }
 }
 if (process.platform === 'darwin') {
   for (const command of Object.values(config.commands)) {
@@ -73,7 +103,12 @@ const runtime = new NativeRuntime({ root: join(serviceHome(), 'native', hostId),
     const channel = ctx.sidecar.env(inst);
     const modelEnv = employeeModelEnv({ agentId: session.id, provider: session.provider, env: channel, runtime: 'native' }, ctx.sidecar, serviceHome());
     const inherited = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
-    return { ...inherited, ...scrubEnv(channel), ...SANDBOX_MARKER, ...modelEnv, PASEO_AGENT_ID: "", ZDOTDIR: zdotdir };
+    const lane = isLaneProvider(session.provider) ? {
+      SCK_LANE_CONFIG: JSON.stringify(config.lanes?.[session.provider as LaneProvider] ?? {}),
+      SCK_LANE_STATE_ROOT: laneStateRoot,
+      ...laneSecretEnv(session.provider),
+    } : {};
+    return { ...inherited, ...scrubEnv(channel), ...SANDBOX_MARKER, ...modelEnv, ...lane, PASEO_AGENT_ID: "", ZDOTDIR: zdotdir };
   },
   onStarted: async session => { await bus.emit('agent.turn_started', { agent: session, turnId: session.turnId }); await uploadActivity(); },
   onEnded: async event => { await uploadActivity(); await bus.emit('agent.turn_ended', event); },
@@ -87,8 +122,17 @@ async function uploadActivity(): Promise<void> {
 }
 const host: RuntimeHost = {
   providers: {
-    // 原生 CLI 没有统一订阅查询入口；额度继续由现有 Magpie 观测链提供，未知时不伪造数值。
-    listUsage: async () => ({ providers: [] }),
+    // 本地 CLI 没有统一订阅查询入口；云端通道按各自渠道读。读取失败一律 fail open（缺行不等于额度为零）。
+    listUsage: async () => {
+      const providers: import('./host.ts').ProviderUsage[] = [];
+      if (config.commands['codex-cloud']) {
+        const entry = await readCodexCloudUsage().catch(() => undefined);
+        if (entry) providers.push(entry);
+      }
+      if (config.commands.jules)
+        providers.push(julesUsageEntry(laneStateRoot, config.lanes?.jules?.dailyLimit ?? 100));
+      return { fetchedAt: new Date().toISOString(), providers };
+    },
     listModels: async provider => ({ models: (config.models?.[provider as NativeProvider] ?? []).map(id => ({ id })) }),
   },
   agents: { ref: id => ({ send: prompt => runtime.send(id, prompt),

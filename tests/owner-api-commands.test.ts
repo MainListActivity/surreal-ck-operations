@@ -55,6 +55,29 @@ test('idempotencyKey produces identical key on retry, random UUID when omitted',
   expect(recordedKeys[3]).toStartWith('owner:test-agent:direction.add:');
 });
 
+// ---- quota.list ----
+test('quota.list 用记录名前缀取额度行（连字符 provider 不漏）并附带耗尽冷却', async () => {
+  const queries: Array<{ sql: string; params?: any }> = [];
+  const quotaRow = { id: 'company_meta:⟨quota_codex-cloud⟩', provider: 'codex-cloud', status: 'available' };
+  const fakeDb = {
+    query: async (sql: string, params?: any) => {
+      queries.push({ sql, params });
+      if (sql.includes('FROM company_meta')) return [[quotaRow]];
+      if (sql.includes('FROM provider_health')) return [[{ id: 'provider_health:devin-cloud', state: 'exhausted', until: 1 }]];
+      return [[]];
+    },
+  };
+  const { ctx } = makeFakeCtx({ db: { db: fakeDb } as any });
+  const result = await ownerApi(ctx, { command: 'quota.list' }, 'owner') as { quotas: unknown[]; exhausted: unknown[] };
+  const metaQuery = queries.find(q => q.sql.includes('FROM company_meta'))!;
+  // 整行字符串前缀测试会漏掉 company_meta:⟨quota_codex-cloud⟩ 这类行；必须只按记录名过滤。
+  expect(metaQuery.sql).toContain("record::id(id)");
+  expect(metaQuery.sql).toContain("'quota_'");
+  expect(metaQuery.sql).not.toContain("<string>id");
+  expect(result.quotas).toEqual([quotaRow]);
+  expect(result.exhausted).toHaveLength(1);
+});
+
 // ---- ITEM 2: task.update audit ----
 test('task.update writes an audit row with actor owner:<via> and changed fields', async () => {
   const queries: Array<{ sql: string; params?: any }> = [];

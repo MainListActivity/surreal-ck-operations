@@ -16,7 +16,7 @@ import type { ProviderQuota } from '../contracts.ts';
  * exactly the providers whose id contains a hyphen — `factory-droid` among them. That is how a
  * spent Factory month stayed invisible to the breaker even after magpie reported it.
  */
-const QUOTA_ROWS = `string::starts_with(<string>record::id(id), 'quota_')`;
+export const QUOTA_ROWS = `string::starts_with(<string>record::id(id), 'quota_')`;
 
 /** ProviderQuota rows the dispatcher's circuit breaker consumes; shared with the roster preview. */
 export async function readProviderQuotas(db: Surreal): Promise<ProviderQuota[]> {

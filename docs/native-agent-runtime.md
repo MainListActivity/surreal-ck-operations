@@ -103,3 +103,11 @@ SIGINT/SIGTERM 停止派工循环，再停止本执行器拥有的进程组并�
 大屏默认展示员工、当前任务、项目、电脑、本阶段已用时间和预计剩余时间，公开输出在卡片内自动跟随最新内容；上翻查看历史时暂停跟随。核心信息不依赖点击、悬停或弹窗。长任务资料在原页面展开，最近事件也直接在页面滚动查看。
 
 预计时间取最近 30 天同项目、岗位、阶段和任务类型的成功历史，最多 40 个不同任务，至少 5 个样本，显示历史用时的四分位范围扣除已用时间。只配对未被阻塞、退回或新租约打断的领取→提交/领取→验收；小于 15 秒的探针及超过 6 小时的异常记录不参与。样本不足、范围差异过大、超过历史范围或连接未知时明确显示无法估计，不用工具次数假造进度，不承诺后续复核或 GitHub 上线时间。数据变化仍由 Live Query 驱动。
+
+## 0.12.0：云端员工通道
+
+`codex-cloud`、`devin-cloud`、`jules` 三个 provider 走同一原生执行面：命令是 `sandbox/launch.sh bun <服务目录>/current/server/vendor/src/runner/cloud-lane/main.ts <provider>`，桥接进程把回合转交给供应商云端 agent（Codex Cloud / Devin Cloud / Jules），输出与非 codex 原生 CLI 相同的 system/lane_status/result 事件流。模型只用 `default`；续轮参数只有 `--resume <逻辑会话ID>`（云端任务凭任务 ID 重连，逻辑会话 ID 只是会话标识）。
+
+路由、命令校验、额度熔断与 provider_health 与本地 CLI 完全同构：`runtime-routes.json` 可指派云端 provider；`native-runner.json` 新增可选 `lanes` 配置（环境映射、轮询上限），`private/lanes/<provider>.env` 的私密变量由执行端在沙箱外读出后注入，沙箱内桥接进程不读 private。云端额度经 `listUsage` 上报（codex-cloud 读 wham/usage，jules 按本地记录的 24 小时会话数），读取失败不造数。
+
+回合语义：task.md 与最新复核意见内联进云端 prompt；复核轮强制首行复核结论；非 GitHub 工作树按受阻收尾；在途云端任务按 prompt 摘要重连不重复提交。详见 [cloud-lanes.md](cloud-lanes.md)。

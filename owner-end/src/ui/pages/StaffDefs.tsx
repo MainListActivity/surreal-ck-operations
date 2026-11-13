@@ -30,6 +30,9 @@ const PROVIDERS: ReadonlyArray<{ value: string; label: string }> = [
   { value: 'factory-droid', label: 'Factory Droid（droid）' },
   { value: 'codex', label: 'Codex（codex）' },
   { value: 'antigravity', label: 'Antigravity（经 Paseo）' },
+  { value: 'codex-cloud', label: 'Codex Cloud（ChatGPT 云端）' },
+  { value: 'devin-cloud', label: 'Devin Cloud（云端）' },
+  { value: 'jules', label: 'Jules（Google AI Pro 云端）' },
 ];
 
 const CLAUDE_MODELS = ['claude-fable-5-2', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'];
@@ -39,6 +42,9 @@ const MODELS: Record<string, string[]> = {
   'factory-droid': CLAUDE_MODELS,
   codex: ['auto:sol', 'auto:astra', 'auto:luna', 'auto:terra'],
   antigravity: ['gemini-3.8-flash-medium'],
+  'codex-cloud': ['default'],
+  'devin-cloud': ['default'],
+  jules: ['default'],
 };
 
 const EFFORTS: ReadonlyArray<{ value: string; label: string }> = [
