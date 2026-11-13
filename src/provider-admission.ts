@@ -9,6 +9,24 @@
 export type AdmissionHealth = { state: 'healthy' | 'exhausted'; until?: number; lastError?: string };
 /** Minimal structural shape of contracts.ts's ProviderQuota. */
 export interface AdmissionQuotaRow { provider: string; sessionPct?: number; weeklyPct?: number; lowestPct?: number; fetchedAt?: string }
+
+/**
+ * Different company provider ids that bill the same vendor subscription: quota windows and
+ * exhaustion cooldowns are shared. `factory-paseo` is the Paseo-mode face of the Factory
+ * subscription that `factory-droid` runs natively; either one consuming quota blocks both.
+ */
+export const SUBSCRIPTION_ALIAS: Record<string, string> = { 'factory-paseo': 'factory-droid' };
+/** Canonical subscription id of a company provider id. */
+export function subscriptionId(provider: string): string { return SUBSCRIPTION_ALIAS[provider] ?? provider; }
+/** Every provider id billing the same subscription, canonical first. */
+export function subscriptionPeers(provider: string): string[] {
+  const id = subscriptionId(provider);
+  return [id, ...Object.keys(SUBSCRIPTION_ALIAS).filter(k => SUBSCRIPTION_ALIAS[k] === id)];
+}
+/** Same-subscription comparison for preferred-provider preference checks. */
+export function sameSubscription(a: string | undefined, b: string | undefined): boolean {
+  return a !== undefined && b !== undefined && subscriptionId(a) === subscriptionId(b);
+}
 export interface AdmissionFloors { quotaFloorPct: number; quotaWeeklyFloorPct: number }
 
 /** 'ok' healthy / 'probe' single trial session allowed / 'down' cooling off. */
@@ -41,10 +59,15 @@ export function providerAdmission(input: { provider?: string; quotaLimited?: boo
   ctx: { health: ReadonlyMap<string, AdmissionHealth>; quotaRows: ReadonlyArray<AdmissionQuotaRow>; floors: AdmissionFloors; now: number }): { ok: boolean; reason?: string } {
   if (input.quotaLimited === false) return { ok: true };
   const provider = input.provider ?? '';
-  const blockedReason = quotaBlockedProviders(ctx.quotaRows, ctx.floors, ctx.now).get(provider);
-  if (blockedReason) return { ok: false, reason: blockedReason };
-  const h = ctx.health.get(provider);
-  if (availabilityOf(h, ctx.now) === 'down')
-    return { ok: false, reason: `额度耗尽或异常${h?.lastError ? `：${h.lastError.slice(0, 40)}` : ''}` };
+  const blocked = quotaBlockedProviders(ctx.quotaRows, ctx.floors, ctx.now);
+  for (const peer of subscriptionPeers(provider)) {
+    const reason = blocked.get(peer);
+    if (reason) return { ok: false, reason };
+  }
+  for (const peer of subscriptionPeers(provider)) {
+    const h = ctx.health.get(peer);
+    if (availabilityOf(h, ctx.now) === 'down')
+      return { ok: false, reason: `额度耗尽或异常${h?.lastError ? `：${h.lastError.slice(0, 40)}` : ''}` };
+  }
   return { ok: true };
 }

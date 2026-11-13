@@ -381,3 +381,32 @@ test('优先订阅额度耗尽：其余合格候选照常分流',()=>{
  expect(entries.find(e=>e.provider==='codex-cloud')).toMatchObject({eligible:false,code:'quota'});
  expect(entries.find(e=>e.provider==='factory-droid')?.eligible).toBe(true);
 });
+
+test('订阅别名：factory-paseo 与 factory-droid 共享额度窗口与耗尽冷却',()=>{
+ // factory-droid 的额度行挡住 factory-paseo 的候选，反向同样成立。
+ const paseo=def('paseo',{provider:'factory-paseo'});
+ const entries=staffingPool(base({defs:[paseo],quotaBlocked:new Map([['factory-droid','额度不足（周/月额度 0%<2%）']])}));
+ expect(entries.find(e=>e.provider==='factory-paseo')).toMatchObject({eligible:false,code:'quota'});
+ const droid=def('droid',{provider:'factory-droid'});
+ const reverse=staffingPool(base({defs:[droid],quotaBlocked:new Map([['factory-paseo','额度不足（周/月额度 0%<2%）']])}));
+ expect(reverse.find(e=>e.provider==='factory-droid')).toMatchObject({eligible:false,code:'quota'});
+ // 任一侧的耗尽冷却对双方都生效。
+ const cooled=staffingPool(base({defs:[droid],
+   health:new Map([['factory-paseo',{provider:'factory-paseo',state:'exhausted' as const,until:2_000_000,failures:1,lastError:'quota'}]])}));
+ expect(cooled.find(e=>e.provider==='factory-droid')).toMatchObject({eligible:false,code:'quota'});
+ const cooled2=staffingPool(base({defs:[paseo],
+   health:new Map([['factory-droid',{provider:'factory-droid',state:'exhausted' as const,until:2_000_000,failures:1,lastError:'quota'}]])}));
+ expect(cooled2.find(e=>e.provider==='factory-paseo')).toMatchObject({eligible:false,code:'quota'});
+});
+
+test('订阅别名：preferredProvider=factory-droid 时 factory-paseo 也算优先订阅候选',()=>{
+ const paseo=def('paseo',{provider:'factory-paseo'});
+ const other=def('other',{provider:'codex'});
+ const entries=staffingPool(base({defs:[paseo,other],preferredProvider:'factory-droid'}));
+ expect(entries.find(e=>e.provider==='factory-paseo')?.eligible).toBe(true);
+ expect(entries.find(e=>e.provider==='codex')).toMatchObject({eligible:false,code:'factory_wait'});
+ // 反向：优先订阅设成 factory-paseo 时原生 factory-droid 也算优先。
+ const swapped=staffingPool(base({defs:[def('droid',{provider:'factory-droid'}),other],preferredProvider:'factory-paseo'}));
+ expect(swapped.find(e=>e.provider==='factory-droid')?.eligible).toBe(true);
+ expect(swapped.find(e=>e.provider==='codex')).toMatchObject({eligible:false,code:'factory_wait'});
+});

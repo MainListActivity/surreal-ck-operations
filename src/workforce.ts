@@ -411,7 +411,11 @@ export class Workforce {
     }
   }
 
-  async defs(): Promise<EmployeeDef[]> {
+  /**
+   * Every configured def, unfiltered. company.ts wraps `defs()` with runner/provider-route scoping for
+   * dispatch; owner surfaces (def.list, def.ensure, admin) must see the whole roster, so they call this.
+   */
+  async allDefs(): Promise<EmployeeDef[]> {
     type Row = { id: RecordId; role: Role; provider: string; model: string; thinking?: string; tracks?: string[]; enabled: boolean;
       max_instances: number; priority: number; weight?: number; quota_limited?: boolean; error_streak?: number; disabled_reason?: string; work_hours?: unknown };
     const [rows] = await this.db.query<[Row[]]>('SELECT * FROM employee_def ORDER BY weight DESC, priority, id;');
@@ -423,6 +427,9 @@ export class Workforce {
       ...(r.enabled === false && typeof r.disabled_reason === 'string' && r.disabled_reason ? { disabledReason: r.disabled_reason } : {}),
       ...(parseWorkHours(r.work_hours) ? { workHours: parseWorkHours(r.work_hours) } : {}) }));
   }
+
+  /** Dispatch-scoped view: overridden by company.ts with runner/route filtering. Defaults to the full roster. */
+  async defs(): Promise<EmployeeDef[]> { return this.allDefs(); }
 
   async defFailure(defId: string): Promise<number> {
     const [[row]] = await this.db.query<[[{ error_streak: number }]]>(

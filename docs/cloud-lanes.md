@@ -84,3 +84,14 @@
 - 执行目录边界：通道只在 `claim.json` 指定的任务工作树里执行，会话 cwd（可能是共享主 checkout）不是回退。缺 claim、无 worktree、路径无效、工作树分支与派工要求不一致或在默认分支上时，回合安全受阻且一个 git/供应商命令都不发。codex 通道只暂存 `codex cloud diff` 补丁覆盖的路径（`git add -A -- <paths>`），暂存后出现补丁外路径只取消暂存不动文件，因此工作树里的无关未跟踪文件（error.log、.wrangler 状态等）不会被提交。
 - 云端任务可能仍在运行时只报错误回合，不自动取消、不重发；老板可凭任务 URL 人工核对。
 - 回退：停用对应员工定义、从 `runtime-routes.json` 移除路由、从 `native-runner.json` 移除 commands 条目即可；在途云端任务按上文人工核对，通道不自动接管。
+
+## 本地员工：Warp / Grok / Muse / Factory 双模式
+
+云端通道之外，公司还可以这样补充员工：
+
+- **Warp（provider `warp`）**：Warp Build 的 oz agent 走原生执行端的本地桥接进程（`src/runner/warp/main.ts`），事件流与云端通道相同。配置步骤：在 `runtime-routes.json` 把 `warp` 路由到本节点（`"warp": "native:<节点ID>"`），在 `native-runner.json` 的 `commands` 加 `"warp": ["<服务>/sandbox/launch.sh", "<bun 绝对路径>", "<服务>/current/server/vendor/src/runner/warp/main.ts", "warp"]`，并按需加 `lanes.warp`：`{"bin": {"oz": "/Applications/Warp.app/Contents/Resources/bin/oz"}, "maxMinutes": 120}`。每轮 prompt 正文写进 commDir 的 `.warp/turn-<时间戳>.md`（0600），oz 参数只带文件路径；有 claim 任务工作树就用它，否则用会话 cwd（本地 agent 与普通员工同规则，公司提交由 agent 自己在任务分支完成）。Warp 没有可读额度端点，额度保持 unknown。
+- **Grok（provider `grok`）**：走 Paseo ACP。`scripts/sandbox/install.sh` 会把 `~/.local/bin/grok` 包进员工沙箱并把 provider command 设为 `[<包装脚本>, "agent", "--always-approve", "stdio"]`（`--always-approve` 是无人值守必需）。升级后需重跑 install.sh。
+- **Muse Code（provider `muse`）**：Paseo 内置 provider。安装并登录后重跑 install.sh，脚本会把包装脚本写进其 command 并启用；未安装则跳过。
+- **Factory 双模式（provider `factory-paseo`）**：与原生 `factory-droid` 并存的 Paseo ACP 入口（同一 droid 包装脚本、`exec --output-format acp-daemon`），install.sh 自动创建。两个 provider id 走同一份订阅：额度窗口、耗尽冷却与「优先订阅」判定都按订阅合并，任一侧耗尽另一侧同步冷却；`preferredProvider` 设任一个，另一个也算优先候选。
+
+`factory-paseo`、`grok`、`muse` 不路由（不在 runtime-routes.json 出现），由 Paseo 直接派工。

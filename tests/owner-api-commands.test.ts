@@ -348,3 +348,17 @@ test('preferredProviderValue 接受供应商编号或空串，拒绝其他形状
     expect(() => preferredProviderValue(bad)).toThrow();
   }
 });
+
+test('def.list 返回全量编制：路由到原生执行端的定义也对老板端可见', async () => {
+  const all = [
+    { id: 'author-antigravity', role: 'screenwriter', provider: 'antigravity' },
+    { id: 'eng-factory', role: 'engineering', provider: 'factory-droid' },
+  ];
+  const workforce = {
+    defs: async () => [all[0]],       // 派工过滤视图：只剩 Paseo 侧
+    allDefs: async () => all,         // 全量编制
+  };
+  const { ctx } = makeFakeCtx({ workforce: workforce as any });
+  const out = await ownerApi(ctx, { command: 'def.list' }, 'owner') as { defs: typeof all };
+  expect(out.defs.map(d => d.id)).toEqual(['author-antigravity', 'eng-factory']);
+});

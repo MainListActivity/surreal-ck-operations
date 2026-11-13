@@ -27,3 +27,11 @@ test('云端通道：桥接进程参数只有 --resume 与非 default 的 --mode
   expect(launchPreview({ provider: 'jules', model: 'default' }).argv)
     .toEqual(['bun', 'src/runner/cloud-lane/main.ts', 'jules']);
 });
+
+test('warp 走本地桥接：launchPreview 指向 warp main.ts，参数与通道一致', () => {
+  const preview = launchPreview({ provider: 'warp', model: 'default' });
+  expect(preview.via).toBe('native');
+  expect(preview.argv.slice(0, 3)).toEqual(['bun', 'src/runner/warp/main.ts', 'warp']);
+  const resumed = launchPreview({ provider: 'warp', model: 'oz-big' });
+  expect(resumed.argv).toEqual(expect.arrayContaining(['--model', 'oz-big']));
+});
