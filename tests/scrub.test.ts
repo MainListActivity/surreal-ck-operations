@@ -294,6 +294,14 @@ describe('employee sandbox gate', () => {
     expect(sandboxGap('claude', '/nope/config.json', wrappers)).toContain('Paseo');
   });
 
+  test('factory-paseo, grok and muse pass through their wrappers like the built-in providers', () => {
+    const file = config({ 'factory-paseo': { command: ['/svc/sandbox/bin/droid', 'exec', '--output-format', 'acp-daemon'] },
+      grok: { command: ['/svc/sandbox/bin/grok', 'agent', '--always-approve', 'stdio'] }, muse: { command: ['/Users/x/.local/bin/muse'] } });
+    expect(sandboxGap('factory-paseo', file, wrappers)).toBeUndefined();
+    expect(sandboxGap('grok', file, wrappers)).toBeUndefined();
+    expect(sandboxGap('muse', file, wrappers)).toContain('install.sh');
+  });
+
   test('an interactive company session the sandbox does not cover is refused; history and other agents are not', async () => {
     const h = hook({}, { sandbox: provider => provider === 'claude' ? undefined : 'not covered' });
     await expect(h.open({ ...base, provider: 'codex', reason: 'create', env: { SCK_COMM_DIR: '/c' } })).rejects.toThrow('员工沙箱');

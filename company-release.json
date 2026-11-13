@@ -1,13 +1,12 @@
 {
-  "version": "0.13.1",
-  "title": "warp 通道对启动失败自动重试",
+  "version": "0.13.2",
+  "title": "Paseo 员工沙箱放行 factory-paseo / grok / muse",
   "changes": [
-    "warp 通道：oz 在发出 run_started 事件之前非零退出（如 Warp 服务端偶发的 team metadata 刷新超时，此时 run 尚未开始）自动重试至多 2 次、间隔 5 秒，每次重试发 lane_status 进展；收到 run_started 之后任何失败都不再重试，避免重复执行；超时与运行中失败语义不变。",
-    "install.sh：grok 是自定义 ACP provider，补齐 extends=acp 与 label（上一提交）。"
+    "插件员工沙箱门禁的包装脚本表加入 factory-paseo（droid）、grok、muse：0.13.0 新增的 Paseo 模式员工此前被拒绝启动（「provider factory-paseo 无法放进员工沙箱」）。门禁仍要求 Paseo 配置的启动命令指向 sandbox/bin 包装脚本。"
   ],
   "impact": [
-    "派工与执行：warp 员工首轮不再因 Warp 服务端偶发元数据刷新超时而整轮失败。"
+    "派工与执行：factory-paseo、grok、muse 员工可经 Paseo 在员工沙箱中启动；其他 provider 不变。"
   ],
-  "migration": "无 schema 变更（沿用 schema 067）；无需配置变更。",
-  "rollback": "回退至 v0.13.0。"
+  "migration": "无 schema 变更（沿用 schema 067）；需已按 0.13.0 说明重跑 scripts/sandbox/install.sh。",
+  "rollback": "回退至 v0.13.1（这三类 Paseo 员工会再次被拒绝启动）。"
 }
