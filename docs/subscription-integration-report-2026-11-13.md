@@ -1,6 +1,6 @@
 # 订阅接入与派工整合报告（2026-11-13）
 
-目标：把老板的各家订阅接成公司员工，按擅长领域派工，老板不用盯。本报告覆盖 0.12.2 – 0.13.4 的结果，状态分四类：**已端到端验证**、**已接入未验证**、**等老板操作**、**未开始**。
+目标：把老板的各家订阅接成公司员工，按擅长领域派工，老板不用盯。本报告覆盖 0.12.2 – 0.13.6 的结果，状态分四类：**已端到端验证**、**已接入未验证**、**等老板操作**、**未开始**。
 
 ## 1. 各订阅状态
 
@@ -12,11 +12,11 @@
 | Warp Build | 原生桥接 `warp`（oz） | 已端到端验证 | 任务 cea218b6 → PR #248，CI 过；首启偶发 “team metadata” 超时，0.13.1 起自动重试 |
 | Grok（CLI） | Paseo ACP `grok`，经员工沙箱 | 等老板操作 | 本机未登录（无 `~/.grok/auth.json`），需 `grok login` 后验证 |
 | Muse | Paseo `muse`，经员工沙箱 | 等老板操作 | 本机未安装 muse CLI；安装登录后重跑 install.sh |
-| Devin | Paseo `devin-paseo`，经员工沙箱（不走云端，按老板决定） | 已接入未验证 | 0.13.4（PR #2244）；Devin 周额度已耗尽，重置后建编制验证；`engineering-devin-cloud` 已停用 |
+| Devin | Paseo `devin-paseo`，经员工沙箱（不走云端，按老板决定） | 已端到端验证 | 0.13.4（PR #2244）。编制 `engineering-devin-paseo` 用免费的 swe-2-high，设 `quotaLimited:false` 不受 Devin 周额度限制；只读任务 314b418a 不到 1 分钟送审，结果与工作树提交精确一致。换成 adaptive 等付费模型时要恢复额度限制。`engineering-devin-cloud` 已停用 |
 | Grok Bot | 设计：公司通道调 Routine 的 webhook，结果回 GitHub | 未开始 | 无公开 API；需老板装桌面端、登录、建 Routine 并给出 webhook 地址后才能写通道 |
 | Figma Make | 设计：经 ego-browser 驱动网页 | 未开始 | Figma MCP 的 send_prompt 对 student 档未开放；需老板先在 ego-browser 登录 Figma |
-| Google AI Pro | Antigravity（`antigravity`，story-author 编制）；Jules 已下线 | 已在用，本轮未触碰 | 额度读数停在 11-09 |
-| Higgsfield | 公司浏览器供应商框架（`src/media/browser.ts`） | 本轮未触碰 | — |
+| Google AI Pro | Antigravity（`antigravity`，story-author 编制）；Jules 已下线 | 已端到端验证 | 任务 6666cedf（原著轨短篇梗概）约 1.5 分钟送审；重复且无轨的编制 `story-author-antigravity` 已停用 |
+| Higgsfield | 网页免费通道（ego-browser，无限模式）+ CLI 付费兜底 `higgsfield-cli`（0.13.6） | CLI 已实测；网页通道未验证 | CLI 无无限模式，每张扣 credits；实测 gpt_image_2_6 一张 0.25 credits、PNG 1024²。只在免费通道都失败后使用，单张 ≤0.5、近 24 小时 ≤20 credits（套餐每月 600，月初清零） |
 
 ## 2. 额度现状（`sck owner quota.list`，2026-11-13 13:00 UTC）
 
@@ -24,10 +24,10 @@
 | --- | --- | --- |
 | claude | 96% 可用 | 当天读数 |
 | codex / codex-cloud | 77% 可用 | 当天读数，两者共用 |
-| factory-droid | 100% | **过期读数（11-01）**，不能当现状 |
-| antigravity | ~100% | **过期读数（11-09）** |
+| factory-droid | 36% | 0.13.5 起恢复更新（11-13 14:16 UTC；30 天窗口） |
+| antigravity | ~100% | 0.13.5 起恢复更新 |
 | grok | 不可用 | 未登录 |
-| devin | 未进额度表 | 周额度已耗尽（Devin 会话报错确认） |
+| devin | 0% | 周额度耗尽；swe-2 系列免费，不受影响 |
 | warp | 无读数 | oz 不提供额度查询 |
 
 ## 3. 老板一次性操作清单
@@ -37,7 +37,6 @@
 3. 在 ego-browser 里登录一次 Figma。
 4. Grok Bot：安装桌面端并登录，新建一个由 webhook 触发的 Routine，把 webhook 地址交给我；通道代码在此之后写。
 5. surreal_ck 合并 #243（.editorconfig）和 #249（.gitignore）：main 受保护需审批，不代为绕过。
-6. Devin：等周额度重置，或在 Devin 设置里开按量付费。
 
 ## 4. 本轮事故与修复
 
@@ -47,11 +46,11 @@
 ## 5. 已知问题（未修）
 
 - **原生执行端切版本后首轮卡住一次**：重启后首个 tick 持有运营仓库 worktree 分配锁超过 8 分钟无日志，重启后恢复；原因未查明，下次切版本时可能复现。
-- **插件调度器误报“没有任何编制或员工”**：某职能的编制全在原生执行端时（如 qa），插件侧照样给老板发此提醒，实际原生执行端会正常派工。
-- **factory-droid / antigravity 额度读数过期**：额度采集对这两家已停更多日。
 
 ## 6. 下一步
 
 1. 老板完成第 3 节操作后：验证 grok、muse；写 Grok Bot webhook 通道和 Figma Make 网页通道并实测。
-2. Devin 额度重置后：建 `engineering-devin-paseo` 编制做一次端到端验证。
-3. 修插件误报与额度读数过期；复现并定位执行端首轮卡锁。
+2. 复现并定位执行端首轮卡锁。
+3. 老板在 ego-browser 登录 Higgsfield 后验证免费网页通道。
+
+已修（0.13.5）：插件对原生端职能的“无编制”误报；额度改用 `private/magpie-quota.key` 后 Factory/Devin/antigravity 读数恢复。

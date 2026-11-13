@@ -181,7 +181,10 @@ export function company(): Promise<Company> {
     // Browser-session generation (ChatGPT/Gemini/Grok web UIs): ego-browser drives the owner's
     // logged-in accounts; sessions and any account secrets stay inside that browser profile.
     const { BrowserStudio } = await import("../media/browser.ts");
+    const { defaultHfRun } = await import("../media/higgsfield-cli.ts");
     const browser = new BrowserStudio({ core, evidenceRoot: join(dirname(runDir), "evidence"),
+      // Paid Higgsfield CLI image fallback (credits, cost-checked, daily cap); SCK_HIGGSFIELD_CLI=0 turns it off.
+      hfRun: process.env.SCK_HIGGSFIELD_CLI === "0" ? undefined : defaultHfRun(),
       // Gemini write lane: default composer model, owner-tunable via admin config.
       notebookModel: async () => {
         const [rows] = await db.db.query<[Array<{ media_notebook_model?: string }>]>(
