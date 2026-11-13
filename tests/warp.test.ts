@@ -21,6 +21,20 @@ function fakeSpawn(lines: string[], opts: { code?: number; stderr?: string } = {
   return { calls, spawn };
 }
 
+/** 多次 spawn 各回放一份剧本（按调用顺序取，超出取最后一份）。 */
+function fakeSpawnSeq(steps: Array<{ lines?: string[]; code?: number; stderr?: string }>) {
+  const calls: SpawnCall[] = [];
+  const spawn: WarpDeps['spawn'] = (cmd, args, o) => {
+    const step = steps[Math.min(calls.length, steps.length - 1)]!;
+    calls.push({ cmd, args: [...args], cwd: o.cwd });
+    return { stdout: stream(`${(step.lines ?? []).join('\n')}\n`), stderr: stream(step.stderr ?? ''),
+      exited: Promise.resolve(step.code ?? 0), kill() {} } satisfies WarpProcess;
+  };
+  return { calls, spawn };
+}
+
+const noSleep = async () => {};
+
 const commWith = (worktree?: { path: string; branch: string }) => {
   const commDir = tmp('sck-warp-comm-');
   if (worktree) writeFileSync(join(commDir, 'claim.json'),
@@ -43,7 +57,7 @@ describe('warp 本地通道', () => {
     const progress: string[] = [];
     const out = await runWarpTurn(
       { prompt: '# 任务\n\n实现需求甲。', cwd: shared, commDir, config: { bin: { oz: '/opt/oz/bin/oz' } } },
-      { spawn, now: () => 1_000, progress: s => progress.push(s) });
+      { spawn, now: () => 1_000, sleep: noSleep, progress: s => progress.push(s) });
     expect(out.status).toBe('success');
     expect(out.sessionId).toBe('cd2c7f38-aaaa');
     expect(out.text).toContain('工作结果：完成');
@@ -70,7 +84,7 @@ describe('warp 本地通道', () => {
     const { calls, spawn } = fakeSpawn(NDJSON);
     const out = await runWarpTurn(
       { prompt: '继续', cwd: shared, commDir, resumeId: 'conv-1', model: 'oz-big', config: { bin: { oz: '/usr/bin/oz' } } },
-      { spawn, now: () => 5, progress: () => {} });
+      { spawn, now: () => 5, sleep: noSleep, progress: () => {} });
     expect(out.status).toBe('success');
     const call = calls[0]!;
     expect(call.args).toEqual(expect.arrayContaining(['--conversation', 'conv-1']));
@@ -82,7 +96,7 @@ describe('warp 本地通道', () => {
     const commDir = commWith();
     const { calls, spawn } = fakeSpawn(NDJSON);
     await runWarpTurn({ prompt: 'p', cwd: '/tmp', commDir, model: 'default' },
-      { spawn, now: () => 5, progress: () => {} });
+      { spawn, now: () => 5, sleep: noSleep, progress: () => {} });
     expect(calls[0]!.args).not.toContain('--model');
   });
 
@@ -90,7 +104,7 @@ describe('warp 本地通道', () => {
     const commDir = commWith();
     const { spawn } = fakeSpawn(NDJSON.slice(0, 1), { code: 3, stderr: 'oz exploded\n' });
     const out = await runWarpTurn({ prompt: '秘密需求正文', cwd: '/tmp', commDir },
-      { spawn, now: () => 5, progress: () => {} });
+      { spawn, now: () => 5, sleep: noSleep, progress: () => {} });
     expect(out.status).toBe('error');
     expect(out.text).toContain('退出码 3');
     expect(out.text).toContain('oz exploded');
@@ -101,8 +115,45 @@ describe('warp 本地通道', () => {
     const commDir = commWith();
     const { spawn } = fakeSpawn(NDJSON.slice(0, 2));
     const out = await runWarpTurn({ prompt: 'p', cwd: '/tmp', commDir },
-      { spawn, now: () => 5, progress: () => {} });
+      { spawn, now: () => 5, sleep: noSleep, progress: () => {} });
     expect(out.status).toBe('error');
     expect(out.text).toContain('没有给出答复');
+  });
+});
+
+describe('warp 启动失败重试', () => {
+  const fails = { code: 1, stderr: 'Error: Failed to refresh team metadata\n' };
+
+  test('run_started 之前失败自动重试：第二次正常 → success，共 2 次 spawn', async () => {
+    const commDir = commWith();
+    const { calls, spawn } = fakeSpawnSeq([fails, { lines: NDJSON }]);
+    const progress: string[] = [];
+    const out = await runWarpTurn({ prompt: 'p', cwd: '/tmp', commDir },
+      { spawn, now: () => 5, sleep: noSleep, progress: s => progress.push(s) });
+    expect(out.status).toBe('success');
+    expect(out.sessionId).toBe('cd2c7f38-aaaa');
+    expect(calls).toHaveLength(2);
+    expect(progress.some(s => s.includes('第 1 次重试') && s.includes('team metadata'))).toBe(true);
+  });
+
+  test('三次都启动失败 → error，共 3 次 spawn，文案含 stderr 尾部', async () => {
+    const commDir = commWith();
+    const { calls, spawn } = fakeSpawnSeq([fails, fails, fails]);
+    const progress: string[] = [];
+    const out = await runWarpTurn({ prompt: 'p', cwd: '/tmp', commDir },
+      { spawn, now: () => 5, sleep: noSleep, progress: s => progress.push(s) });
+    expect(out.status).toBe('error');
+    expect(calls).toHaveLength(3);
+    expect(out.text).toContain('team metadata');
+    expect(progress.filter(s => s.includes('重试'))).toHaveLength(2);
+  });
+
+  test('run_started 已发出后失败不重试：spawn 只 1 次', async () => {
+    const commDir = commWith();
+    const { calls, spawn } = fakeSpawnSeq([{ lines: [NDJSON[0]!, NDJSON[1]!], code: 1, stderr: 'boom\n' }]);
+    const out = await runWarpTurn({ prompt: 'p', cwd: '/tmp', commDir },
+      { spawn, now: () => 5, sleep: noSleep, progress: () => {} });
+    expect(out.status).toBe('error');
+    expect(calls).toHaveLength(1);
   });
 });

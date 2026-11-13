@@ -1,17 +1,13 @@
 {
-  "version": "0.13.0",
-  "title": "新增 Warp / Grok / Muse / Factory 双模式员工并修复老板端编制可见性",
+  "version": "0.13.1",
+  "title": "warp 通道对启动失败自动重试",
   "changes": [
-    "新增 warp provider：原生执行端本地桥接（src/runner/warp/main.ts），事件流与云端通道相同（system/lane_status/result）；prompt 正文写入 commDir/.warp/turn-*.md（0600），oz --prompt 只带文件路径；优先在 claim 任务工作树执行，否则用会话 cwd；续轮经 --conversation；lanes.warp 支持 bin 与 maxMinutes（默认 120）。",
-    "新增 factory-paseo provider：Factory 订阅的 Paseo ACP 模式，与原生 factory-droid 并存可同时派工；install.sh 自动写入 extends=acp 的 provider 条目（droid 包装脚本 + acp-daemon argv + 禁自动更新 env）。",
-    "订阅别名：factory-paseo 与 factory-droid 按同一订阅合并额度窗口、耗尽冷却与优先订阅判定（SUBSCRIPTION_ALIAS），任一侧耗尽两侧同步冷却。",
-    "install.sh 新增 grok 包装与 ACP provider（agent --always-approve stdio，尾参漂移自动纠正）；装了 Muse Code 时把 muse provider command 指向包装脚本并启用，未安装则跳过提示。",
-    "修复：老板端 def.list 只显示 Paseo 侧定义——company.ts 包装前的过滤视图被 owner API 复用，现在 Workforce.allDefs() 返回全量编制，def.list/def.ensure 查 existing 改用未过滤版，路由到原生执行端的定义恢复可见且修改不丢字段。",
-    "老板端员工定义 provider 下拉新增 factory-paseo、warp、grok、muse。"
+    "warp 通道：oz 在发出 run_started 事件之前非零退出（如 Warp 服务端偶发的 team metadata 刷新超时，此时 run 尚未开始）自动重试至多 2 次、间隔 5 秒，每次重试发 lane_status 进展；收到 run_started 之后任何失败都不再重试，避免重复执行；超时与运行中失败语义不变。",
+    "install.sh：grok 是自定义 ACP provider，补齐 extends=acp 与 label（上一提交）。"
   ],
   "impact": [
-    "派工与执行：可用员工类型扩展为 Warp（原生）、Grok / Muse / Factory Paseo 模式（Paseo）；factory 双模式共享订阅额度与优先权；老板端编制页恢复显示全部定义。"
+    "派工与执行：warp 员工首轮不再因 Warp 服务端偶发元数据刷新超时而整轮失败。"
   ],
-  "migration": "无 schema 变更（沿用 schema 067）。生产启用需：重跑 scripts/sandbox/install.sh 写入新 Paseo provider；在 native-runner.json 为 warp 加 commands 条目（可选 lanes.warp.bin/maxMinutes）；在 private/runtime-routes.json 把 warp 路由到本节点。旧版本不含这些 provider，配置后回退会导致对应定义不可派工。",
-  "rollback": "回退至 v0.12.4；先停用 warp/factory-paseo/grok/muse 定义并从 runtime-routes.json、native-runner.json 移除对应条目。"
+  "migration": "无 schema 变更（沿用 schema 067）；无需配置变更。",
+  "rollback": "回退至 v0.13.0。"
 }

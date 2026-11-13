@@ -36,6 +36,7 @@ export interface WarpProcess {
 export interface WarpDeps {
   spawn(cmd: string, args: string[], opts: { cwd: string; env: Record<string, string | undefined> }): WarpProcess;
   now(): number;
+  sleep(ms: number): Promise<void>;
   /** 每步进展以 lane_status 事件输出给执行端活动流。 */
   progress(status: string): void;
 }
@@ -92,34 +93,50 @@ export async function runWarpTurn(input: WarpInput, deps: WarpDeps): Promise<War
     ...(input.resumeId ? ['--conversation', input.resumeId] : []),
     ...(input.model && input.model !== 'default' ? ['--model', input.model] : [])];
 
-  const proc = deps.spawn(oz, args, { cwd, env: childEnv(input) });
-  const deadline = deps.now() + (input.config?.maxMinutes ?? 120) * 60_000;
-  const stderr = stderrTail(proc.stderr);
-
-  let conversation: string | undefined;
-  let answer = '';
-  let timedOut = false;
-  const timer = setInterval(() => { if (deps.now() > deadline) { timedOut = true; proc.kill(); } }, 1000);
-  try {
-    for await (const line of lines(proc.stdout)) {
-      if (!line.trim()) continue;
-      let event: { type?: string; event_type?: string; conversation_id?: string; run_url?: string; text?: string };
-      try { event = JSON.parse(line); } catch { continue; }
-      if (event.type === 'system' && event.event_type === 'conversation_started' && typeof event.conversation_id === 'string')
-        conversation = event.conversation_id;
-      else if (event.type === 'system' && event.event_type === 'run_started' && typeof event.run_url === 'string')
-        deps.progress(`Warp 运行中：${event.run_url}`);
-      else if (event.type === 'agent' && typeof event.text === 'string')
-        answer += event.text;
-    }
-    const code = await proc.exited;
-    if (timedOut) return { sessionId: conversation ?? sessionStart, status: 'error', text: `Warp 单轮超过 ${input.config?.maxMinutes ?? 120} 分钟上限，已终止` };
-    const tail = await stderr;
-    if (code !== 0) return { sessionId: conversation ?? sessionStart, status: 'error',
-      text: `Warp 退出码 ${code}${tail ? `：${tail.slice(-400)}` : ''}` };
-    if (!answer.trim()) return { sessionId: conversation ?? sessionStart, status: 'error',
-      text: `Warp 没有给出答复${tail ? `：${tail.slice(-400)}` : ''}` };
-    return { sessionId: conversation ?? sessionStart, status: 'success', text: answer.trim() };
-  } finally { clearInterval(timer); }
+  // oz 在发出 run_started 之前失败属于启动失败（如 Warp 服务端偶发的 team metadata 刷新超时），
+  // 此时 run 尚未开始、重试不会重复执行，自动重试至多 2 次；收到 run_started 后任何失败都不重试。
+  const maxMinutes = input.config?.maxMinutes ?? 120;
+  const deadline = deps.now() + maxMinutes * 60_000;
+  let lastError: WarpOutcome | undefined;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const proc = deps.spawn(oz, args, { cwd, env: childEnv(input) });
+    const stderr = stderrTail(proc.stderr);
+    let conversation: string | undefined;
+    let answer = '';
+    let runStarted = false;
+    let timedOut = false;
+    const timer = setInterval(() => { if (deps.now() > deadline) { timedOut = true; proc.kill(); } }, 1000);
+    try {
+      for await (const line of lines(proc.stdout)) {
+        if (!line.trim()) continue;
+        let event: { type?: string; event_type?: string; conversation_id?: string; run_url?: string; text?: string };
+        try { event = JSON.parse(line); } catch { continue; }
+        if (event.type === 'system' && event.event_type === 'conversation_started' && typeof event.conversation_id === 'string')
+          conversation = event.conversation_id;
+        else if (event.type === 'system' && event.event_type === 'run_started') {
+          runStarted = true;
+          if (typeof event.run_url === 'string') deps.progress(`Warp 运行中：${event.run_url}`);
+        } else if (event.type === 'agent' && typeof event.text === 'string')
+          answer += event.text;
+      }
+      const code = await proc.exited;
+      if (timedOut) return { sessionId: conversation ?? sessionStart, status: 'error', text: `Warp 单轮超过 ${maxMinutes} 分钟上限，已终止` };
+      const tail = await stderr;
+      if (code !== 0) {
+        if (!runStarted && attempt < 3) {
+          deps.progress(`Warp 启动失败，第 ${attempt} 次重试：${tail.split('\n').at(-1)?.slice(0, 200) ?? `退出码 ${code}`}`);
+          await deps.sleep(5000);
+          continue;
+        }
+        lastError = { sessionId: conversation ?? sessionStart, status: 'error',
+          text: `Warp 退出码 ${code}${tail ? `：${tail.slice(-400)}` : ''}` };
+        return lastError;
+      }
+      if (!answer.trim()) return { sessionId: conversation ?? sessionStart, status: 'error',
+        text: `Warp 没有给出答复${tail ? `：${tail.slice(-400)}` : ''}` };
+      return { sessionId: conversation ?? sessionStart, status: 'success', text: answer.trim() };
+    } finally { clearInterval(timer); }
+  }
+  return lastError!;
 }
 
