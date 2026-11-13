@@ -141,15 +141,40 @@ async function drive(ctx: {
   return driveJules(ctx);
 }
 
+/**
+ * 通道的任务工作树：claim.json 里派工分配的 worktree（code 任务是独立 task/<id8> 分支工作树）。
+ * 会话 cwd 可能是共享主 checkout（老板可能在用），通道绝不在那上面执行 git/供应商命令。
+ */
+function claimWorktree(commDir: string): { path: string; branch: string } | { blocked: string } {
+  let claim: { worktree?: { worktreePath?: unknown; branch?: unknown } } | undefined;
+  try { claim = JSON.parse(readFileSync(join(commDir, 'claim.json'), 'utf8')); } catch { /* 缺 claim.json */ }
+  const worktree = claim?.worktree;
+  const path = typeof worktree?.worktreePath === 'string' ? worktree.worktreePath : undefined;
+  const branch = typeof worktree?.branch === 'string' && worktree.branch.trim() ? worktree.branch.trim() : undefined;
+  if (!path || !isAbsolute(path) || !existsSync(path) || !branch)
+    return { blocked: '本次派工没有可用的任务工作树（claim.json 未给出存在的 worktreePath 与分支）' };
+  return { path, branch };
+}
+
 /** 一轮云端执行：识别仓库 → 组装 prompt → 提交或重连 → 收尾成公司协议文本。 */
 export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOutcome> {
   const state = readLaneState(input.commDir) ?? { sessionId: `lane-${crypto.randomUUID()}` };
   const sessionId = input.resumeId ?? state.sessionId;
   const fail = (text: string): LaneOutcome => ({ sessionId, status: 'error', text });
+  const blocked = (text: string): LaneOutcome => ({ sessionId, status: 'success', text: `${BLOCKED}：${text}` });
   if (!isLaneProvider(input.provider)) return fail(`未知云端通道：${input.provider}`);
 
-  const repo = await repoInfo(deps.exec, input.cwd).catch(() => undefined);
-  if (!repo) return { sessionId, status: 'success', text: `${BLOCKED}：当前目录不是已关联 GitHub origin 的代码工作树，云端通道只承接代码任务。` };
+  // 云端命令只允许在派工分配的任务工作树里执行；没有可用工作树时一个 git/供应商命令都不发。
+  const worktree = claimWorktree(input.commDir);
+  if ('blocked' in worktree)
+    return blocked(`云端通道只在任务分配的工作树中执行，${worktree.blocked}。`);
+  const repo = await repoInfo(deps.exec, worktree.path).catch(() => undefined);
+  if (!repo) return blocked('任务工作树不是已关联 GitHub origin 的代码工作树，云端通道只承接代码任务。');
+  if (repo.branch !== worktree.branch)
+    return blocked(`任务工作树当前分支 ${repo.branch} 与派工要求的分支 ${worktree.branch} 不一致，拒绝在其中执行。`);
+  if (repo.branch === repo.defaultBranch)
+    return blocked(`任务工作树在默认分支 ${repo.defaultBranch} 上，云端通道只在任务分支上执行。`);
+  input = { ...input, cwd: worktree.path };
 
   const material = taskMaterial(input.commDir, input.prompt);
   const prompt = vendorPrompt(input, repo, material);

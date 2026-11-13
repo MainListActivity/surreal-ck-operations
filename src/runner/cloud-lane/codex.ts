@@ -33,6 +33,18 @@ async function statusOf(ctx: Ctx, taskId: string): Promise<{ code: 'pending' | '
   return { code: 'pending', head, vendor: false };
 }
 
+/** 统一补丁里 diff --git 行给出的仓库相对路径集合（a、b 两侧都收，覆盖改名/删除；/dev/null 忽略）。 */
+export function diffPaths(patch: string): Set<string> {
+  const paths = new Set<string>();
+  for (const line of patch.split('\n')) {
+    const m = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
+    if (!m) continue;
+    if (m[1] !== 'dev/null') paths.add(m[1]!);
+    if (m[2] !== 'dev/null') paths.add(m[2]!);
+  }
+  return paths;
+}
+
 /** 从 `codex cloud diff` 的统一补丁提取 .sck/review.md 的新增行（复核轮的供应商结论）。 */
 async function reviewFromDiff(ctx: Ctx, taskId: string): Promise<string | undefined> {
   const r = await ctx.deps.exec('codex', ['cloud', 'diff', taskId], { cwd: ctx.input.cwd });
@@ -103,14 +115,25 @@ export async function driveCodex(ctx: Ctx): Promise<{ kind: 'done' | 'blocked' |
     return r.stdout.trim();
   };
   try {
-    await must(['add', '-A'], '暂存云端改动');
-    const dirty = await deps.exec('git', ['status', '--porcelain'], { cwd: input.cwd });
-    if (!dirty.stdout.trim()) return { kind: 'blocked', text: `云端补丁应用后没有任何改动（${taskUrl}）。` };
+    // 只暂存云端补丁覆盖的路径：工作树里可能有无关文件（如 codex CLI 自己写的 error.log），不能一起提交。
+    const paths = [...diffPaths(diff.stdout)];
+    if (paths.length) await must(['add', '-A', '--', ...paths], '暂存云端改动');
+    const staged = (await deps.exec('git', ['diff', '--cached', '--name-only'], { cwd: input.cwd })).stdout
+      .split('\n').map(l => l.trim()).filter(Boolean);
+    const wanted = new Set(paths);
+    const extra = staged.filter(p => !wanted.has(p));
+    let note = '';
+    if (extra.length) {
+      await deps.exec('git', ['reset', '-q', '--', ...extra], { cwd: input.cwd });
+      note = `（另有 ${extra.length} 个与云端补丁无关的暂存改动已取消暂存，未动文件）`;
+    }
+    const kept = staged.filter(p => wanted.has(p));
+    if (!kept.length) return { kind: 'blocked', text: `云端补丁应用后没有任何改动（${taskUrl}）。` };
     await must(['commit', '-m', `${material.title} (Codex Cloud ${taskId})`], '提交云端改动');
     await must(['push', 'origin', `HEAD:${repo.branch}`], '推送云端改动');
     const sha = await must(['rev-parse', 'HEAD'], '读取提交');
     const pr = await ensurePullRequest(deps.exec, input.cwd, repo, material.title,
       `云端任务：${taskUrl}\n\n由 ${input.provider} 员工通道完成。`);
-    return { kind: 'done', text: `云端任务完成：${head}\n任务：${taskUrl}\nPR: ${pr}\nSHA: ${sha}` };
+    return { kind: 'done', text: `云端任务完成：${head}\n任务：${taskUrl}\nPR: ${pr}\nSHA: ${sha}${note ? `\n${note}` : ''}` };
   } catch (error) { return { kind: 'error', text: (error as Error).message }; }
 }
