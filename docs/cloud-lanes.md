@@ -32,12 +32,15 @@
   },
   "models": { "codex-cloud": ["default"], "devin-cloud": ["default"], "jules": ["default"] },
   "lanes": {
-    "codex-cloud": { "environments": { "MainListActivity/surreal_ck": "surreal_ck" }, "maxMinutes": 180 },
-    "devin-cloud": { "maxMinutes": 180 },
+    "codex-cloud": { "environments": { "MainListActivity/surreal_ck": "surreal_ck" }, "maxMinutes": 180,
+      "bin": { "codex": "/Users/y/node/bin/codex", "gh": "/opt/homebrew/bin/gh" } },
+    "devin-cloud": { "maxMinutes": 180, "bin": { "devin": "/Users/y/.local/bin/devin" } },
     "jules": { "dailyLimit": 100, "maxConcurrent": 3, "maxMinutes": 180 }
   }
 }
 ```
+
+`lanes.<通道>.bin`：命令名 → 绝对路径（`codex`、`devin`、`gh`、`git` 等），给不在服务 PATH 里的 CLI 指路；配置后该命令按此路径执行，其所在目录（不是 realpath）前置进子进程 PATH，node shim 形式的 CLI 因此找得到同目录的 `node`。重装服务（`bun scripts/native-service.ts`）时这些目录连同 `commands` 里的绝对路径一并并入服务脚本 PATH。
 
 `private/runtime-routes.json` 与本地 CLI 一样写：`{"version":1,"routes":{"codex-cloud":"native:<节点>","devin-cloud":"native:<节点>","jules":"native:<节点>"}}`。不改文件就不启用通道，行为与旧版一致。
 
@@ -76,6 +79,7 @@
 
 ## 失败与回退
 
+- 回合报「<供应商> 提交失败：找不到可执行文件 <命令>」：服务 PATH 里没有该 CLI。把它的绝对路径配进 `lanes.<通道>.bin`（见上）并重装服务，或直接修好服务脚本 PATH；同一原因重复三次会自动停用该员工定义，修好后重新启用。
 - 供应商额度耗尽的报错（Devin「weekly usage quota has been exhausted」、Codex 限流、Jules 429）走既有 quota-failure 链：记入 `provider_health` 冷却，任务留在原员工名下。
 - 云端任务可能仍在运行时只报错误回合，不自动取消、不重发；老板可凭任务 URL 人工核对。
 - 回退：停用对应员工定义、从 `runtime-routes.json` 移除路由、从 `native-runner.json` 移除 commands 条目即可；在途云端任务按上文人工核对，通道不自动接管。

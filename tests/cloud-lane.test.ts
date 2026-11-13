@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runLane, taskMaterial, vendorPrompt, type LaneDeps, type LaneInput } from '../src/runner/cloud-lane/lane.ts';
+import { runLane, taskMaterial, validateLanes, vendorPrompt, type LaneDeps, type LaneInput } from '../src/runner/cloud-lane/lane.ts';
+import { laneExecFile } from '../src/runner/cloud-lane/exec.ts';
 import { laneDigest, readLaneState, writeLaneState } from '../src/runner/cloud-lane/state.ts';
 import { julesUsageCount, julesUsageEntry, whamToUsageEntry } from '../src/runner/cloud-lane/quota.ts';
 import { recordJulesUsage } from '../src/runner/cloud-lane/jules.ts';
@@ -367,5 +368,39 @@ describe('额度映射', () => {
     const entry = julesUsageEntry(root, 100);
     expect(entry.providerId).toBe('jules');
     expect(entry.windows?.[0]?.remainingPct).toBe(98);
+  });
+});
+
+describe('通道子进程执行器', () => {
+  test('ENOENT（PATH 里没有该命令）→ 非零退出且 stderr 带可读原因', async () => {
+    const r = await laneExecFile()('sck-no-such-binary-xyz', [], {});
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain('找不到可执行文件 sck-no-such-binary-xyz');
+    expect(r.stderr).toContain('PATH=');
+  });
+
+  test('bin 映射：命令名换成绝对路径执行，其目录前置进子进程 PATH', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sck-lane-bin-'));
+    dirs.push(dir);
+    const probe = join(dir, 'probe');
+    writeFileSync(probe, '#!/bin/sh\necho "$PATH"\n');
+    chmodSync(probe, 0o755);
+    const exec = laneExecFile({ probe });
+    const mapped = await exec('probe', [], {});
+    expect(mapped.code).toBe(0);
+    expect(mapped.stdout.trim().split(':')[0]).toBe(dir);
+    // 未配置的命令名不受影响
+    const plain = await laneExecFile({ probe })('/bin/echo', ['ok'], {});
+    expect(plain.stdout.trim()).toBe('ok');
+  });
+});
+
+describe('lanes.bin 配置校验', () => {
+  test('合法 bin 通过；相对路径、非法命令名、未知通道拒绝', () => {
+    expect(() => validateLanes({ 'codex-cloud': { bin: { codex: '/abs/codex', gh: '/opt/homebrew/bin/gh' } } })).not.toThrow();
+    expect(() => validateLanes({ 'codex-cloud': { bin: { codex: 'codex' } } })).toThrow(/bin/);
+    expect(() => validateLanes({ 'codex-cloud': { bin: { 'a b': '/abs/x' } } })).toThrow(/bin/);
+    expect(() => validateLanes({ 'codex-cloud': { bin: [] } })).toThrow(/bin/);
+    expect(() => validateLanes({ nope: { bin: { x: '/abs/x' } } })).toThrow(/lanes/);
   });
 });
