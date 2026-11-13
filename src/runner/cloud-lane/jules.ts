@@ -9,7 +9,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fetchAndFastForward, type RepoInfo } from './repo.ts';
 import type { LaneDeps, LaneInput } from './lane.ts';
-import { writeLaneState, type LaneState } from './state.ts';
+import { recordInflight, writeLaneState, type LaneState } from './state.ts';
 
 const BASE = 'https://jules.googleapis.com/v1alpha';
 const WAITING = new Set(['AWAITING_USER_FEEDBACK', 'AWAITING_PLAN_APPROVAL']);
@@ -60,7 +60,7 @@ function lastAgentText(activities: any): string {
   return '';
 }
 
-export async function driveJules(ctx: Ctx): Promise<{ kind: 'done' | 'blocked' | 'error'; text: string }> {
+export async function driveJules(ctx: Ctx): Promise<{ kind: 'done' | 'blocked' | 'error'; text: string; vendorTerminal?: boolean }> {
   const { input, deps, repo, material, prompt, state } = ctx;
   const key = input.env.JULES_API_KEY?.trim();
   if (!key) throw new Error('缺少 JULES_API_KEY：请在 <service>/private/lanes/jules.env 配置后重启执行端');
@@ -85,6 +85,7 @@ export async function driveJules(ctx: Ctx): Promise<{ kind: 'done' | 'blocked' |
   state.taskUrl = `https://jules.google.com/session/${name!.split('/').pop()}`;
   state.submittedAt = state.submittedAt ?? deps.now();
   writeLaneState(input.commDir, state);
+  recordInflight(input.stateRoot, input.provider, ctx.digest, state);
 
   const sessionName = name!.replace(/^sessions\//, '');
   let session: any;
@@ -104,7 +105,7 @@ export async function driveJules(ctx: Ctx): Promise<{ kind: 'done' | 'blocked' |
     const question = lastAgentText(await activities());
     return { kind: 'blocked', text: `Jules 会话等待人工输入（${lastState}）${question ? `：${question}` : ''}。会话：${name}` };
   }
-  if (lastState === 'FAILED') return { kind: 'error', text: `Jules 会话失败（${name}）` };
+  if (lastState === 'FAILED') return { kind: 'error', vendorTerminal: true, text: `Jules 会话失败（${name}）` };
 
   if (material.review) {
     const text = lastAgentText(await activities());

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runLane, taskMaterial, validateLanes, vendorPrompt, type LaneDeps, type LaneInput } from '../src/runner/cloud-lane/lane.ts';
 import { laneExecFile } from '../src/runner/cloud-lane/exec.ts';
-import { laneDigest, readLaneState, writeLaneState } from '../src/runner/cloud-lane/state.ts';
+import { laneDigest, readInflight, readLaneState, writeLaneState } from '../src/runner/cloud-lane/state.ts';
 import { julesUsageCount, julesUsageEntry, whamToUsageEntry } from '../src/runner/cloud-lane/quota.ts';
 import { recordJulesUsage } from '../src/runner/cloud-lane/jules.ts';
 import type { ExecResult } from '../src/runner/cloud-lane/repo.ts';
@@ -197,6 +197,99 @@ describe('codex-cloud 通道', () => {
     const err = await runLane(badWorld.input(), badWorld.deps);
     expect(err.status).toBe('error');
     expect(err.text).toContain('复核结论');
+  });
+});
+
+describe('codex-cloud 状态判定与在途登记', () => {
+  test('status 退出码 1 但输出 [PENDING] 仍按进行中轮询，不误判失败', async () => {
+    let polls = 0;
+    const w = world({ extra: call => {
+      const [a, b] = call.args;
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'exec') return ok('https://chatgpt.com/codex/tasks/task_b_p1\n');
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'status')
+        return ++polls === 1 ? { code: 1, stdout: '[PENDING] t\nenv  •  now\nno diff\n', stderr: '' } : ok('[READY] t\nenv  •  now\nno diff\n');
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'diff') return ok('');
+      return undefined;
+    }});
+    const out = await runLane(w.input(), w.deps);
+    expect(out.status).toBe('success');
+    expect(polls).toBe(2);
+  });
+
+  test('status 无标记且退出码 1 → 错误回合，文案取 stderr', async () => {
+    const w = world({ extra: call => {
+      const [a, b] = call.args;
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'exec') return ok('https://chatgpt.com/codex/tasks/task_b_p2\n');
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'status') return bad('boom');
+      return undefined;
+    }});
+    const out = await runLane(w.input(), w.deps);
+    expect(out.status).toBe('error');
+    expect(out.text).toContain('boom');
+  });
+
+  test('换员工实例（不同 comm 目录）按摘要重连在途任务，不重复提交', async () => {
+    const task = '# 云端任务\n\n实现需求甲。\n';
+    const w1 = world({ task, extra: call => {
+      const [a, b] = call.args;
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'exec') return ok('https://chatgpt.com/codex/tasks/task_b_dup\n');
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'status') return bad('轮询命令失败');
+      return undefined;
+    }});
+    const out1 = await runLane(w1.input(), w1.deps);
+    expect(out1.status).toBe('error');
+    expect(w1.callsOf(c => c.args[0] === 'cloud' && c.args[1] === 'exec')).toHaveLength(1);
+
+    // 第二个实例：全新 comm 目录，同一 stateRoot，同一份 task.md → 摘要相同 → 直接重连。
+    const w2 = world({ task, extra: call => {
+      const [a, b] = call.args;
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'status') return ok('[READY] t\nenv  •  now\nno diff\n');
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'diff') return ok('');
+      return undefined;
+    }});
+    const out2 = await runLane(w2.input({ stateRoot: w1.stateRoot }), w2.deps);
+    expect(out2.status).toBe('success');
+    expect(w2.callsOf(c => c.args[0] === 'cloud' && c.args[1] === 'exec')).toHaveLength(0);
+    const statuses = w2.callsOf(c => c.args[0] === 'cloud' && c.args[1] === 'status');
+    expect(statuses).toHaveLength(1);
+    expect(statuses[0]!.args).toContain('task_b_dup');
+  });
+
+  test('供应商终态失败（[ERROR]）清除登记，下一实例重新提交', async () => {
+    const task = '# 云端任务\n\n实现需求甲。\n';
+    const w1 = world({ task, extra: call => {
+      const [a, b] = call.args;
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'exec') return ok('https://chatgpt.com/codex/tasks/task_b_f1\n');
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'status') return ok('[ERROR] t\n');
+      return undefined;
+    }});
+    const out1 = await runLane(w1.input(), w1.deps);
+    expect(out1.status).toBe('error');
+
+    const w2 = world({ task, extra: call => {
+      const [a, b] = call.args;
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'exec') return ok('https://chatgpt.com/codex/tasks/task_b_f2\n');
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'status') return ok('[READY] t\nenv  •  now\nno diff\n');
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'diff') return ok('');
+      return undefined;
+    }});
+    const out2 = await runLane(w2.input({ stateRoot: w1.stateRoot }), w2.deps);
+    expect(out2.status).toBe('success');
+    expect(w2.callsOf(c => c.args[0] === 'cloud' && c.args[1] === 'exec')).toHaveLength(1);
+  });
+
+  test('任务完成后登记被清除', async () => {
+    const w = world({ extra: call => {
+      const [a, b] = call.args;
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'exec') return ok('https://chatgpt.com/codex/tasks/task_b_done\n');
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'status') return ok('[READY] t\nenv  •  now\nno diff\n');
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'diff') return ok('');
+      return undefined;
+    }});
+    const out = await runLane(w.input(), w.deps);
+    expect(out.status).toBe('success');
+    const digest = readLaneState(w.commDir)!.digest!;
+    expect(readInflight(w.stateRoot, 'codex-cloud', digest)).toBeUndefined();
   });
 });
 

@@ -3,7 +3,7 @@
  * 文件放在 $SCK_COMM_DIR/.lane/state.json（原子写），员工沙箱可写。
  */
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 export interface LaneState {
@@ -42,4 +42,44 @@ export function writeLaneState(commDir: string, state: LaneState): void {
   const path = join(dir, 'state.json');
   writeFileSync(`${path}.tmp`, JSON.stringify(state), { mode: 0o600 });
   renameSync(`${path}.tmp`, path);
+}
+
+/**
+ * 跨员工实例的在途云端任务登记：同一公司任务换实例（comm 目录不同）时，
+ * 凭 provider + 回合摘要找到已提交的云端任务并重连，而不是重复提交。
+ * 存放于 <stateRoot>/<provider>/inflight/<digest>.json（原子写，0600）。
+ */
+export interface InflightEntry { taskId?: string; taskUrl?: string; submittedAt?: number; vendorSession?: string }
+
+function inflightPath(stateRoot: string, provider: string, digest: string): string {
+  return join(stateRoot, provider, 'inflight', `${digest}.json`);
+}
+
+export function readInflight(stateRoot: string | undefined, provider: string, digest: string): InflightEntry | undefined {
+  if (!stateRoot) return undefined;
+  try {
+    const value = JSON.parse(readFileSync(inflightPath(stateRoot, provider, digest), 'utf8')) as InflightEntry;
+    return value && typeof value.taskId === 'string' ? value : undefined;
+  } catch { return undefined; }
+}
+
+export function writeInflight(stateRoot: string | undefined, provider: string, digest: string, entry: InflightEntry): void {
+  if (!stateRoot) return;
+  const dir = join(stateRoot, provider, 'inflight');
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const path = inflightPath(stateRoot, provider, digest);
+  writeFileSync(`${path}.tmp`, JSON.stringify(entry), { mode: 0o600 });
+  renameSync(`${path}.tmp`, path);
+}
+
+export function clearInflight(stateRoot: string | undefined, provider: string, digest: string): void {
+  if (!stateRoot) return;
+  try { rmSync(inflightPath(stateRoot, provider, digest), { force: true }); } catch { /* 登记清理失败不影响回合收尾 */ }
+}
+
+/** 驱动提交到云端任务后落登记；没有 taskId（如 devin-cloud 拿不到云端会话 ID）时无登记可写。 */
+export function recordInflight(stateRoot: string | undefined, provider: string, digest: string | undefined, state: LaneState): void {
+  if (!stateRoot || !digest || !state.taskId) return;
+  writeInflight(stateRoot, provider, digest,
+    { taskId: state.taskId, taskUrl: state.taskUrl, submittedAt: state.submittedAt, vendorSession: state.vendorSession });
 }

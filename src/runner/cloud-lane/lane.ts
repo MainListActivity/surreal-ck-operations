@@ -6,7 +6,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { isLaneProvider, type LaneProvider } from '../native-args.ts';
-import { laneDigest, readLaneState, writeLaneState, type LaneState } from './state.ts';
+import { clearInflight, laneDigest, readInflight, readLaneState, recordInflight, writeLaneState, type LaneState } from './state.ts';
 import { repoInfo, type ExecFn, type RepoInfo } from './repo.ts';
 import { driveCodex } from './codex.ts';
 import { driveDevin } from './devin.ts';
@@ -122,7 +122,12 @@ export function vendorPrompt(input: LaneInput, repo: RepoInfo, material: ReturnT
   return parts.join('\n');
 }
 
-interface VendorOutcome { kind: 'done' | 'blocked' | 'error'; text: string }
+interface VendorOutcome {
+  kind: 'done' | 'blocked' | 'error';
+  text: string;
+  /** error 且为供应商明确报告的终态失败（如 codex [ERROR]、Jules FAILED）：清除在途登记，允许重新提交。 */
+  vendorTerminal?: boolean;
+}
 
 /** 按供应商分派；返回该轮最终答复文本与性质。 */
 async function drive(ctx: {
@@ -156,9 +161,27 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
   // 相同 prompt 摘要重连在途云端任务；新回合清空 taskId 但保留可复用的供应商会话（vendorSession）。
   const next: LaneState = { ...state, sessionId, digest, branch: repo.branch };
   if (state.digest !== digest) { delete next.taskId; delete next.taskUrl; delete next.submittedAt; }
+  // 本 comm 目录没有在途任务时查共享登记：同一公司任务换员工实例也能重连，而不是重复提交云端任务。
+  if (!next.taskId) {
+    const reg = readInflight(input.stateRoot, input.provider, digest);
+    if (reg) {
+      next.taskId = reg.taskId;
+      next.taskUrl = reg.taskUrl;
+      next.submittedAt = reg.submittedAt;
+      next.vendorSession ??= reg.vendorSession;
+    }
+  }
   try {
     const outcome = await drive({ input, deps, repo, material, prompt, state: next, digest, deadline });
-    writeLaneState(input.commDir, outcome.kind === 'error' ? next : { ...next, taskId: undefined, taskUrl: undefined, submittedAt: undefined });
+    if (outcome.kind !== 'error' || outcome.vendorTerminal) {
+      // 完成、受阻、供应商终态失败：回合有了定论，清除登记并清掉在途任务标记（失败可重新提交）。
+      clearInflight(input.stateRoot, input.provider, digest);
+      writeLaneState(input.commDir, { ...next, taskId: undefined, taskUrl: undefined, submittedAt: undefined,
+        ...(outcome.vendorTerminal ? { vendorSession: undefined } : {}) });
+    } else {
+      writeLaneState(input.commDir, next);
+      recordInflight(input.stateRoot, input.provider, digest, next);
+    }
     if (outcome.kind === 'error') return fail(outcome.text);
     if (outcome.kind === 'blocked') return { sessionId, status: 'success', text: outcome.text.startsWith(BLOCKED) ? outcome.text : `${BLOCKED}：${outcome.text}` };
     if (material.review && !REVIEW_PREFIX.test(outcome.text.trimStart()))
@@ -166,6 +189,7 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
     return { sessionId, status: 'success', text: outcome.text };
   } catch (error) {
     writeLaneState(input.commDir, next);
+    recordInflight(input.stateRoot, input.provider, digest, next);
     return fail((error as Error).message);
   }
 }

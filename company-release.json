@@ -1,15 +1,15 @@
 {
-  "version": "0.12.2",
-  "title": "云端通道可执行文件定位与失败原因（lanes.bin）",
+  "version": "0.12.3",
+  "title": "云端通道状态判定与跨实例在途去重",
   "changes": [
-    "native-runner.json 的 lanes.<通道> 新增 bin 配置：命令名 → 绝对路径（codex、devin、gh、git 等），不在服务 PATH 里的 CLI 按此路径执行，其所在目录前置进子进程 PATH，node shim 找得到同目录 node。",
-    "通道子进程拿不到退出码时（ENOENT、EACCES、超时/被终止）把可读原因写进 stderr，「Codex Cloud 提交失败」等错误文案不再空白。",
-    "重装服务脚本（scripts/native-service.ts）把 commands 与 lanes.*.bin 里绝对路径的目录并入服务 PATH（追加在既有条目之后、去重）。",
-    "云端通道文档补充 bin 配置示例与「找不到可执行文件」排查项。"
+    "codex cloud status 在未完成任务上也以退出码 1 返回（实测 [PENDING] → exit 1）：状态判定改为以首行 [XXX] 标记为权威，解析到标记一律按标记处理（终态表内 done/failed，其余进行中），只有解析不到标记且退出码非 0 才判失败，文案取 stderr。",
+    "新增跨员工实例的在途云端任务登记 <stateRoot>/<provider>/inflight/<digest>.json（原子写、0600）：同一公司任务换实例后凭 provider + 回合摘要重连已提交的云端任务，不再重复 exec 造成云端重复任务。",
+    "登记清理规则：完成、受阻、供应商明确报告的终态失败（codex [ERROR]/[FAILED]、Jules FAILED，新增 vendorTerminal 标记）时清除并允许重新提交；轮询命令失败、超时、异常保留登记供重连。Jules 终态失败同时清掉 vendorSession。",
+    "Jules 创建/续接会话后同步写登记；devin-cloud 拿不到云端任务 ID，无登记可写（行为不变）。"
   ],
   "impact": [
-    "执行端：服务 PATH 与通道子进程环境包含配置的二进制目录；通道失败文本带原因，不再因空原因重复失败自动停用员工定义。"
+    "派工与执行：codex-cloud 任务不再把 PENDING 误判为失败；云端提交按 provider+摘要全局去重，换实例不再生成重复云端任务。"
   ],
-  "migration": "无 schema 变更（沿用 schema 067）。已按 0.12.x 部署的节点在 native-runner.json 给缺失的 CLI 配置 lanes.<通道>.bin 并重装服务即可；不配则行为同 0.12.1。",
-  "rollback": "回退至 v0.12.1；lanes.*.bin 配置在旧版校验中会被拒绝，回退前先从 native-runner.json 移除该键并重装服务。"
+  "migration": "无 schema 变更（沿用 schema 067）。登记目录在执行端 native/<host>/lanes 下自动创建，无需配置。",
+  "rollback": "回退至 v0.12.2；残留的 inflight 登记文件不再被读取（无任务 ID 回连），可按 native/<host>/lanes/<provider>/inflight/ 手工核对后删除。"
 }
