@@ -1,0 +1,57 @@
+# 订阅接入与派工整合报告（2026-11-13）
+
+目标：把老板的各家订阅接成公司员工，按擅长领域派工，老板不用盯。本报告覆盖 0.12.2 – 0.13.4 的结果，状态分四类：**已端到端验证**、**已接入未验证**、**等老板操作**、**未开始**。
+
+## 1. 各订阅状态
+
+| 订阅 | 接入方式 | 状态 | 证据 / 说明 |
+| --- | --- | --- | --- |
+| Factory | 原生 `factory-droid` + Paseo `factory-paseo`（双模式，共用额度） | 已端到端验证 | Paseo 模式：任务 bd9c5e4f → surreal_ck PR #249（只改 .gitignore，CI 过）→ QA 复核通过 |
+| Codex | 原生 `codex` + 云端 `codex-cloud` | 已端到端验证 | 云端：任务 eb57a119 在任务工作树完成，CI 过，复核通过（0.12.4 修复了云端补丁误提交到老板分支的事故） |
+| Claude Code | 原生 `claude` | 已在用 | 主力员工；TUI 指挥按老板决定不做，Claude Code 作私人助手手动使用 |
+| Warp Build | 原生桥接 `warp`（oz） | 已端到端验证 | 任务 cea218b6 → PR #248，CI 过；首启偶发 “team metadata” 超时，0.13.1 起自动重试 |
+| Grok（CLI） | Paseo ACP `grok`，经员工沙箱 | 等老板操作 | 本机未登录（无 `~/.grok/auth.json`），需 `grok login` 后验证 |
+| Muse | Paseo `muse`，经员工沙箱 | 等老板操作 | 本机未安装 muse CLI；安装登录后重跑 install.sh |
+| Devin | Paseo `devin-paseo`，经员工沙箱（不走云端，按老板决定） | 已接入未验证 | 0.13.4（PR #2244）；Devin 周额度已耗尽，重置后建编制验证；`engineering-devin-cloud` 已停用 |
+| Grok Bot | 设计：公司通道调 Routine 的 webhook，结果回 GitHub | 未开始 | 无公开 API；需老板装桌面端、登录、建 Routine 并给出 webhook 地址后才能写通道 |
+| Figma Make | 设计：经 ego-browser 驱动网页 | 未开始 | Figma MCP 的 send_prompt 对 student 档未开放；需老板先在 ego-browser 登录 Figma |
+| Google AI Pro | Antigravity（`antigravity`，story-author 编制）；Jules 已下线 | 已在用，本轮未触碰 | 额度读数停在 11-09 |
+| Higgsfield | 公司浏览器供应商框架（`src/media/browser.ts`） | 本轮未触碰 | — |
+
+## 2. 额度现状（`sck owner quota.list`，2026-11-13 13:00 UTC）
+
+| 订阅 | 读数 | 说明 |
+| --- | --- | --- |
+| claude | 96% 可用 | 当天读数 |
+| codex / codex-cloud | 77% 可用 | 当天读数，两者共用 |
+| factory-droid | 100% | **过期读数（11-01）**，不能当现状 |
+| antigravity | ~100% | **过期读数（11-09）** |
+| grok | 不可用 | 未登录 |
+| devin | 未进额度表 | 周额度已耗尽（Devin 会话报错确认） |
+| warp | 无读数 | oz 不提供额度查询 |
+
+## 3. 老板一次性操作清单
+
+1. 终端运行 `grok login`（浏览器登录）。
+2. 安装并登录 Muse Code CLI，然后用发布目录里那份重跑 `scripts/sandbox/install.sh`。
+3. 在 ego-browser 里登录一次 Figma。
+4. Grok Bot：安装桌面端并登录，新建一个由 webhook 触发的 Routine，把 webhook 地址交给我；通道代码在此之后写。
+5. surreal_ck 合并 #243（.editorconfig）和 #249（.gitignore）：main 受保护需审批，不代为绕过。
+6. Devin：等周额度重置，或在 Devin 设置里开按量付费。
+
+## 4. 本轮事故与修复
+
+- **云端补丁提交到老板分支（0.12.4 修复）**：通道在共享 checkout 里 `git add -A` 推到了 `design/collaboration-client-v1`，已恢复到 `7231e2c0`，PR #244 已关；GitHub 的 `refs/pull/244` 仍可访问到那次提交（内容无密钥，仅 codex 的 account_id）。
+- **spawn 被拒导致节点更新死锁（0.13.3 修复）**：0.13.0 的沙箱门禁拒绝 factory-paseo，派工记录卡在 pending，租约被无限续期，节点更新器一直暂缓，修复门禁的 0.13.2 上不去。已人工结案后上线；0.13.3 起插件拒绝建会话会自动结案为 `rejected`（schema 068）。人工结案那一条记录显示为 `confirmed` / 消息 `sent`，实际没有投递（实例 `engineering-factory-paseo-cda44c`）。
+
+## 5. 已知问题（未修）
+
+- **原生执行端切版本后首轮卡住一次**：重启后首个 tick 持有运营仓库 worktree 分配锁超过 8 分钟无日志，重启后恢复；原因未查明，下次切版本时可能复现。
+- **插件调度器误报“没有任何编制或员工”**：某职能的编制全在原生执行端时（如 qa），插件侧照样给老板发此提醒，实际原生执行端会正常派工。
+- **factory-droid / antigravity 额度读数过期**：额度采集对这两家已停更多日。
+
+## 6. 下一步
+
+1. 老板完成第 3 节操作后：验证 grok、muse；写 Grok Bot webhook 通道和 Figma Make 网页通道并实测。
+2. Devin 额度重置后：建 `engineering-devin-paseo` 编制做一次端到端验证。
+3. 修插件误报与额度读数过期；复现并定位执行端首轮卡锁。

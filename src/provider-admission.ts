@@ -13,9 +13,10 @@ export interface AdmissionQuotaRow { provider: string; sessionPct?: number; week
 /**
  * Different company provider ids that bill the same vendor subscription: quota windows and
  * exhaustion cooldowns are shared. `factory-paseo` is the Paseo-mode face of the Factory
- * subscription that `factory-droid` runs natively; either one consuming quota blocks both.
+ * subscription that `factory-droid` runs natively; either one consuming quota blocks both. `devin-paseo`
+ * is the sandboxed employee face of the owner's own `devin` Paseo provider.
  */
-export const SUBSCRIPTION_ALIAS: Record<string, string> = { 'factory-paseo': 'factory-droid' };
+export const SUBSCRIPTION_ALIAS: Record<string, string> = { 'factory-paseo': 'factory-droid', 'devin-paseo': 'devin' };
 /** Canonical subscription id of a company provider id. */
 export function subscriptionId(provider: string): string { return SUBSCRIPTION_ALIAS[provider] ?? provider; }
 /** Every provider id billing the same subscription, canonical first. */

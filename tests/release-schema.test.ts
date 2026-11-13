@@ -86,6 +86,7 @@ describe('the schema a target version must have reached', () => {
     expect(schemaRequirementFor('0.11.24').tables).toContain('reply_translation');
     expect(schemaRequirementFor('0.13.2').schema).toBe(67);
     expect(schemaRequirementFor('0.13.3').schema).toBe(68);
+    expect(schemaRequirementFor('0.13.4').schema).toBe(68);
     expect(CLOUD_SCHEMA_VERSION).toBe(68);
   });
 

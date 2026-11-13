@@ -10,7 +10,7 @@ function setup(opts: { muse?: boolean; config?: unknown } = {}) {
   const paseoHome = join(home, '.paseo');
   mkdirSync(join(home, '.local', 'bin'), { recursive: true });
   mkdirSync(paseoHome, { recursive: true });
-  for (const name of ['claude', 'droid', 'agy', 'grok', ...(opts.muse ? ['muse'] : [])]) {
+  for (const name of ['claude', 'droid', 'agy', 'grok', 'devin', ...(opts.muse ? ['muse'] : [])]) {
     const bin = join(home, '.local', 'bin', name);
     writeFileSync(bin, '#!/bin/sh\nexit 0\n');
     chmodSync(bin, 0o755);
@@ -49,6 +49,7 @@ describe('install.sh 员工沙箱安装', () => {
       expect(paseo.command).toEqual([join(bindir, 'droid'), 'exec', '--output-format', 'acp-daemon']);
       expect(paseo.env.DROID_DISABLE_AUTO_UPDATE).toBe('true');
       expect(paseo.params.supportsMcpServers).toBe(false);
+      expect(providers['devin-paseo']).toMatchObject({ extends: 'acp', command: [join(bindir, 'devin'), 'acp'], enabled: true });
       expect(providers.muse.enabled).toBe(false);
       expect(err).toContain('skip muse');
     } finally { rmSync(env.home, { recursive: true, force: true }); }

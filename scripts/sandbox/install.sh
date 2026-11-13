@@ -25,6 +25,7 @@ wrap claude "$HOME/.local/bin/claude"
 wrap droid "$HOME/.local/bin/droid"
 wrap agy "$HOME/.local/bin/agy"
 wrap grok "$HOME/.local/bin/grok"
+wrap devin "$HOME/.local/bin/devin"
 if [ -x "$HOME/.local/bin/muse" ]; then wrap muse "$HOME/.local/bin/muse";
 elif [ -x "$HOME/.muse/bin/muse" ]; then wrap muse "$HOME/.muse/bin/muse";
 else echo "skip muse: 未安装 Muse Code（安装并登录后重跑本脚本）" >&2; fi
@@ -70,6 +71,16 @@ if os.access(droid, os.X_OK):
         "env": {"DROID_DISABLE_AUTO_UPDATE": "true", "FACTORY_DROID_AUTO_UPDATE_ENABLED": "false"},
         "params": {"supportsMcpServers": False}, "enabled": True})
     print(f"factory-paseo: {' '.join(entry['command'])}")
+
+# devin-paseo is the employee face of the Devin subscription: the owner's own `devin` provider keeps the
+# plain binary, company sessions get a separate provider id that goes through the sandbox wrapper.
+devin = os.path.join(bindir, "devin")
+if os.access(devin, os.X_OK):
+    entry = providers.setdefault("devin-paseo", {})
+    entry.update({"extends": "acp", "label": "Devin CLI（公司 Paseo 模式）",
+        "description": "Devin CLI via Agent Client Protocol（公司员工，经员工沙箱）",
+        "command": [devin, "acp"], "enabled": True})
+    print(f"devin-paseo: {' '.join(entry['command'])}")
 
 # Muse Code: built-in Paseo provider. If it already carries a command we only retarget argv[0] at the
 # wrapper (same rule as point()); otherwise enable it once a wrapper exists.

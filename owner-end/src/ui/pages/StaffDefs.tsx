@@ -38,6 +38,7 @@ const PROVIDERS: ReadonlyArray<{ value: string; label: string }> = [
   { value: 'warp', label: 'Warp Build（原生执行端）' },
   { value: 'grok', label: 'Grok Build（经 Paseo）' },
   { value: 'muse', label: 'Muse Code（经 Paseo）' },
+  { value: 'devin-paseo', label: 'Devin CLI（Paseo 模式）' },
 ];
 
 const CLAUDE_MODELS = ['claude-fable-5-2', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'];
@@ -54,6 +55,7 @@ const MODELS: Record<string, string[]> = {
   warp: ['default'],
   grok: ['grok-4.6'],
   muse: ['default'],
+  'devin-paseo': ['swe-2-high', 'swe-2-flash-medium', 'adaptive'],
 };
 
 const EFFORTS: ReadonlyArray<{ value: string; label: string }> = [
