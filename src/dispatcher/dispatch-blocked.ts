@@ -156,7 +156,7 @@ export function staffingShortage(
 /** Owner-facing text per code. The staffing pool and the evaluator both read this table. */
 export const BLOCK_TEXT: Record<BlockCode, string> = {
   provider_retry: '本任务供应商失败冷却或切换预算已用尽',
-  factory_wait: 'Factory 仍有额度，本任务保留等待 Factory；已有 3 个等待任务后新任务可分流',
+  factory_wait: '优先订阅仍有额度，本任务保留等待优先订阅；已有 3 个等待任务后新任务可分流',
   paused: '全局暂停派工',
   budget: '订阅额度耗尽或限流',
   resources: '宿主机资源低于水位',
@@ -189,7 +189,7 @@ const OWNER: Record<BlockCode, RecoveryAuthority> = {
 
 const RECOVERY: Record<BlockCode, string> = {
   provider_retry: '等待本任务冷却或切换预算恢复；不会绕过已有派工屏障',
-  factory_wait: '等待 Factory 空闲后自动派工；额度耗尽后回退其他合格员工',
+  factory_wait: '等待优先订阅空闲后自动派工；额度耗尽后回退其他合格员工',
   paused: '老板解除全局暂停',
   budget: '老板充值，或等待额度恢复',
   resources: '检查宿主机内存和磁盘，等待对应水位恢复',
@@ -215,7 +215,7 @@ const RECOVERY: Record<BlockCode, string> = {
 
 const NEXT: Record<BlockCode, string> = {
   provider_retry: '冷却期限到达后重新评估合格供应商',
-  factory_wait: 'Factory 空闲或额度状态变化',
+  factory_wait: '优先订阅空闲或额度状态变化',
   paused: '全局暂停解除',
   budget: '额度恢复或老板充值',
   resources: '宿主机水位恢复',
@@ -252,7 +252,7 @@ const BASIS: Record<BlockCode, string> = {
 /** Recovery actions per code. Only the ones with a tool are executable; the rest name who must act outside the system. */
 const ACTIONS: Record<BlockCode, RecoveryAction[]> = {
   provider_retry: [{ authority: 'system', label: '预算或冷却到期后自动重判', executable: false }],
-  factory_wait: [{authority:'system',label:'等待 Factory 空闲后自动重试；队列之外的任务可分流',executable:false}],
+  factory_wait: [{authority:'system',label:'等待优先订阅空闲后自动重试；队列之外的任务可分流',executable:false}],
   paused: [{ authority: 'owner', label: '老板解除全局暂停', executable: false }],
   budget: [{ authority: 'owner', label: '老板充值，或等待额度恢复', executable: false }],
   resources: [{ authority: 'owner', label: '检查宿主机内存和磁盘，等待对应水位恢复', executable: false }],

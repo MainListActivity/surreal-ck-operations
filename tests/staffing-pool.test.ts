@@ -350,3 +350,34 @@ test('bounded provider retry cannot be evaded by adding a fourth provider or res
   const input=base({defs:[def('new-provider',{provider:'d',quotaLimited:false})],task});
   for(let restart=0;restart<3;restart++)expect(staffingPool(input)).toMatchObject([{eligible:false,code:'provider_retry'}]);
 });
+
+test('优先订阅换成 codex-cloud：云端有合格候选时 factory 候选挂 factory_wait 并指名',()=>{
+ const cloud=def('cloud',{provider:'codex-cloud',maxInstances:1});
+ const factory=def('factory',{provider:'factory-droid',maxInstances:1});
+ const entries=staffingPool(base({defs:[cloud,factory],preferredProvider:'codex-cloud'}));
+ expect(entries.find(e=>e.provider==='codex-cloud')?.eligible).toBe(true);
+ const held=entries.find(e=>e.provider==='factory-droid')!;
+ expect(held).toMatchObject({eligible:false,code:'factory_wait'});
+ expect(held.reason).toContain('优先订阅 codex-cloud');
+ // 缺省（未设 preferredProvider）仍是 Factory 优先，旧行为不变。
+ const fallback=staffingPool(base({defs:[cloud,factory]}));
+ expect(fallback.find(e=>e.provider==='factory-droid')?.eligible).toBe(true);
+ expect(fallback.find(e=>e.provider==='codex-cloud')?.code).toBe('factory_wait');
+});
+
+test('preferredProvider=""：不设优先，无 factory_wait，全部合格候选按权重竞争',()=>{
+ const cloud=def('cloud',{provider:'codex-cloud',weight:1000});
+ const factory=def('factory',{provider:'factory-droid',weight:10});
+ const entries=staffingPool(base({defs:[cloud,factory],preferredProvider:''}));
+ expect(entries.filter(e=>e.eligible)).toHaveLength(2);
+ expect(entries.some(e=>e.code==='factory_wait')).toBe(false);
+ expect(entries.find(e=>e.provider==='codex-cloud')!.share).toBeCloseTo(1000/1010);
+});
+
+test('优先订阅额度耗尽：其余合格候选照常分流',()=>{
+ const cloud=def('cloud',{provider:'codex-cloud'});
+ const factory=def('factory',{provider:'factory-droid'});
+ const entries=staffingPool(base({defs:[cloud,factory],preferredProvider:'codex-cloud',quotaBlocked:new Map([['codex-cloud','exhausted']])}));
+ expect(entries.find(e=>e.provider==='codex-cloud')).toMatchObject({eligible:false,code:'quota'});
+ expect(entries.find(e=>e.provider==='factory-droid')?.eligible).toBe(true);
+});

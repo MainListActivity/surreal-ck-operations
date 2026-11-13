@@ -103,6 +103,8 @@ export interface CompanyConfig {
   paused: boolean;
   maxRunning: number;
   providerMax: Record<string, number>;
+  /** 优先订阅：该 CLI 还有合格候选时其他供应商保留等待（factory_wait）；'' = 不设优先，全部按权重竞争。 */
+  preferredProvider: string;
   pollSeconds: number;
   stallMinutes: number;
   redispatchMinutes: number;
@@ -153,8 +155,18 @@ export interface CompanyConfig {
   scratchGraceHours: number;
 }
 
+/** 供应商编号（CLI / 云端通道）的合法形状：preferred_provider 与 employee_def.provider 共用。 */
+export const PROVIDER_ID = /^[a-z0-9][a-z0-9-]{1,40}$/;
+
+/** preferred_provider 的合法取值：供应商编号，或 ""（不设优先）。admin config 与 owner 命令共用。 */
+export function preferredProviderValue(raw: unknown): string {
+  if (raw !== '' && (typeof raw !== 'string' || !PROVIDER_ID.test(raw)))
+    throw new CompanyError('invalid', 'preferred_provider 必须是供应商编号（小写字母数字连字符）或 ""（不设优先）');
+  return raw as string;
+}
+
 export const DEFAULT_CONFIG: CompanyConfig = {
-  paused: false, maxRunning: 4, providerMax: { codex: 3, grok: 2, devin: 2 },
+  paused: false, maxRunning: 4, providerMax: { codex: 3, grok: 2, devin: 2 }, preferredProvider: 'factory-droid',
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   jevNotifyTriage: true,
 
@@ -337,6 +349,7 @@ export class Workforce {
       paused: Boolean(row?.paused),
       maxRunning: pick('maxRunning', 'max_running'),
       providerMax: { ...DEFAULT_CONFIG.providerMax, ...(pick('providerMax', 'provider_max') as Record<string, number>) },
+      preferredProvider: pick('preferredProvider', 'preferred_provider'),
       pollSeconds: pick('pollSeconds', 'poll_seconds'),
       stallMinutes: pick('stallMinutes', 'stall_minutes'),
       redispatchMinutes: pick('redispatchMinutes', 'redispatch_minutes'),
@@ -370,7 +383,7 @@ export class Workforce {
   async upsertDef(defId: string, input: { role: Role; provider: string; model: string; thinking?: string; tracks?: string[]; maxInstances?: number; priority?: number; weight?: number; enabled?: boolean; quotaLimited?: boolean; workHours?: WorkHours | null }): Promise<void> {
     if (!/^[a-z0-9][a-z0-9-]{2,40}$/.test(defId)) throw new CompanyError('invalid', 'Invalid def ID');
     if (!ROLES.includes(input.role)) throw new CompanyError('invalid', 'Invalid role');
-    if (!/^[a-z0-9][a-z0-9-]{1,40}$/.test(input.provider)) throw new CompanyError('invalid', 'Invalid provider');
+    if (!PROVIDER_ID.test(input.provider)) throw new CompanyError('invalid', 'Invalid provider');
     if (input.weight !== undefined && (!Number.isInteger(input.weight) || input.weight < 0 || input.weight > 1000)) {
       throw new CompanyError('invalid', 'Invalid weight');
     }

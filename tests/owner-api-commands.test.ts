@@ -308,3 +308,43 @@ test('scripts/sck.sh passes token file path and does not pass token in argv', ()
   expect(scriptContent).toContain('with open(token_file, "r"');
   expect(scriptContent).toContain('token = f.readline().strip()');
 });
+
+// ---- dispatch.preference ----
+test('dispatch.preference 读当前值、写入合法编号并记审计、拒绝非法取值', async () => {
+  const queries: Array<{ sql: string; params?: any }> = [];
+  const fakeDb = {
+    query: async (sql: string, params?: any) => { queries.push({ sql, params }); return [[]]; },
+  };
+  const workforce = { config: async () => ({ preferredProvider: 'codex-cloud' }) };
+  const { ctx } = makeFakeCtx({ db: { db: fakeDb } as any, workforce: workforce as any });
+
+  const read = await ownerApi(ctx, { command: 'dispatch.preference' }, 'owner') as { preferredProvider: string };
+  expect(read.preferredProvider).toBe('codex-cloud');
+  expect(queries).toHaveLength(0);
+
+  await ownerApi(ctx, { command: 'dispatch.preference', provider: 'jules' }, 'owner');
+  const write = queries.find(q => q.sql.includes('MERGE $patch'))!;
+  expect(write.params.patch).toEqual({ preferred_provider: 'jules' });
+  const audit = queries.find(q => q.sql.includes('CREATE audit'))!;
+  expect(audit.params.actor).toBe('owner:owner');
+  expect(audit.params.evidence).toContain('jules');
+
+  queries.length = 0;
+  await ownerApi(ctx, { command: 'dispatch.preference', provider: '' }, 'owner');
+  expect(queries.find(q => q.sql.includes('MERGE $patch'))!.params.patch).toEqual({ preferred_provider: '' });
+
+  for (const provider of ['Factory Droid', 'a b', '../x', 42, null]) {
+    await expect(ownerApi(ctx, { command: 'dispatch.preference', provider }, 'owner') as Promise<unknown>)
+      .rejects.toMatchObject({ code: 'invalid' });
+  }
+});
+
+test('preferredProviderValue 接受供应商编号或空串，拒绝其他形状', async () => {
+  const { preferredProviderValue } = await import('../src/workforce.ts');
+  expect(preferredProviderValue('factory-droid')).toBe('factory-droid');
+  expect(preferredProviderValue('codex-cloud')).toBe('codex-cloud');
+  expect(preferredProviderValue('')).toBe('');
+  for (const bad of ['Factory Droid', 'x'.repeat(60), 'a_b', 1, null, undefined, {}]) {
+    expect(() => preferredProviderValue(bad)).toThrow();
+  }
+});

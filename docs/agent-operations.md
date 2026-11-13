@@ -142,6 +142,8 @@ sck call company_cmd '{"command":"<命令名>","input":{...}}'
 
 - **派工权重**：同岗位多个合格候选（空闲实例或可新开的定义）按 `weight` 加权随机选取；`weight=0` 不会被主动选中（同岗位所有候选都是 0 时才均匀分配）。员工绩效系数已于 0.5.0 删除，不再参与加权。调权：`pnpm run admin def weight <id> <n>`，或直接改 `employee_def.weight`——下一轮 tick 生效，无需重启。
 
+- **优先订阅** `preferred_provider`：`company_meta:config` 的公司配置项（camel `preferredProvider`，缺省 `factory-droid`）。该订阅在此岗位还有合格候选时，新任务先保留等它（阻塞码 `factory_wait`，至多 3 个保留名额，第 4 个起允许分流）；额度耗尽或健康冷却时自动回退按权重派工。设为 `""` 表示不设优先——无保留队列、无优先挑选，纯按权重竞争。改法：`pnpm run admin config preferred_provider '"codex-cloud"'`、`sck owner dispatch.preference '{"provider":"codex-cloud"}'`（`""` 取消优先），或老板端员工页「职能」面板的「优先订阅」下拉。
+
 - **绩效评分（0.5.0 已删除）**：`scorecard`、`record_score`、`get_model_evidence`、eval 岗位、每日 eval 批次与 Jev 评分均已删除，`eval_*`、`jev_*` 配置项同时失效。Jev 本身保留，用于通知分级与派工辅助。
 - **员工实例**：`employee` 表中带 `def` 的记录，由调度器按需生成；`paseo_agent_id` 登记实际会话，是实例身份的权威绑定。新实例的凭证不落盘——由插件 sidecar 在内存中代持，`spawn` 环境只注入 `SCK_COMM_DIR`/`SCK_COMM_KEY`；`claim`/续租/提交由 sidecar 以该凭证程序化执行，agent 进程拿不到也不认识它。`retired=true` 或凭证撤销后所有调用即 401，实例随会话关闭退役。同一定义连续 3 次异常会自动停用并通知老板。`pnpm run admin inst list` 查看。
   0.7.0 起代码不再读取 `credential_file`，凭证文件模式已删除。没有内存凭证的旧实例不能再领取任务，会话关闭后自然退役。

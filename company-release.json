@@ -1,17 +1,16 @@
 {
-  "version": "0.12.0",
-  "title": "云端员工通道（Codex Cloud、Devin Cloud、Jules）",
+  "version": "0.12.1",
+  "title": "优先订阅可配置（preferred_provider）",
   "changes": [
-    "员工定义新增三种云端 provider：codex-cloud（ChatGPT 云端 Codex）、devin-cloud（Devin Cloud）、jules（Google AI Pro 的 Jules），由原生执行端经桥接进程驱动，云端 agent 在供应商侧跑、公司按 PR/SHA 收尾。",
-    "每轮把 task.md 与最新复核意见内联进云端 prompt；复核轮强制首行复核结论；在途云端任务按 prompt 摘要重连不重复提交；非代码任务按受阻收尾。",
-    "Codex Cloud 任务完成后本地 apply 补丁、提交推送并自动建 PR；Devin/Jules 在远端分支上完成后本地快进；非快进只报错不 reset。",
-    "原生执行端 listUsage 上报云端额度：codex-cloud 读 chatgpt wham/usage，jules 按桥接记录的 24 小时会话数对照 dailyLimit；读取失败一律不造数。",
-    "老板命令与运维页新增 quota.list 与「订阅额度」面板（各订阅快照 + 耗尽冷却）；Jules API key 由执行端从 private/lanes/jules.env 注入，沙箱内桥接进程读不到 private。"
+    "派工的「Factory 优先」改为公司配置 preferred_provider（company_meta:config，camel preferredProvider）：该订阅还有合格候选时新任务保留等待（沿用 factory_wait 与 3 个等待名额），额度耗尽或健康冷却自动回退按权重分流。",
+    "preferred_provider 设为 \"\" 表示不设优先：没有保留队列、没有 factory_wait 门槛、没有优先挑选，所有合格候选纯按派工权重竞争；缺省仍为 factory-droid，旧行为不变。",
+    "保留等待与分流说明的文案改为指名实际优先订阅（如「优先订阅 codex-cloud …」），阻塞码 factory_wait 保持不变。",
+    "老板命令新增 dispatch.preference（group 员工与权限，provider? 参数）：不传读当前值，传入合法供应商编号或 \"\" 则写入并记审计；admin config preferred_provider 增加取值校验；员工页「职能」面板新增「优先订阅」下拉。"
   ],
   "impact": [
-    "派工与执行：NativeProvider 新增三个通道 provider，runtime-routes.json 与 native-runner.json 可配置云端命令；员工定义页 provider 下拉新增三项。",
-    "老板端运维页新增订阅额度面板；命令目录新增 quota.list。"
+    "派工与执行：等待队列、候选门槛、挑选与开新顺序全部按配置的优先订阅判定；roster 预览文案随配置变化。",
+    "老板端：员工页新增优先订阅下拉；命令目录新增 dispatch.preference。"
   ],
-  "migration": "无 schema 变更（沿用 schema 067）。启用某条通道需在该节点 native-runner.json 的 commands 里配置云端命令、在 runtime-routes.json 指派 provider，并按 docs/cloud-lanes.md 完成一次性授权（Codex Cloud 环境、Devin 组织仓库连接、Jules GitHub App + private/lanes/jules.env）。",
-  "rollback": "回退至 v0.11.24；停用云端通道即可：从 native-runner.json 移除对应 commands、从 runtime-routes.json 移除路由、停用相关员工定义，quota.list 与额度面板随旧版命令目录消失。"
+  "migration": "无 schema 变更（沿用 schema 067）。存量部署不写 preferred_provider 即维持原「Factory 优先」；要改用云端通道优先可执行 admin config preferred_provider '\"codex-cloud\"' 或在员工页选择。",
+  "rollback": "回退至 v0.12.0；或先把 preferred_provider 设回 \"factory-droid\"（或删除该键）再回退，行为与旧版一致。"
 }

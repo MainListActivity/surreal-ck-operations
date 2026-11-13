@@ -117,6 +117,7 @@ export const COMMAND_CATALOG: readonly CommandSpec[] = [
   c('def.enable', '员工与权限', '启用员工定义', 'id'),
   c('def.disable', '员工与权限', '停用员工定义', 'id, reason?'),
   c('session.policy', '员工与权限', '读取或设置会话策略（reuse 或 oneshot）', 'policy?'),
+  c('dispatch.preference', '员工与权限', '读取或设置优先订阅（"" 表示不设优先，按权重派工）', 'provider?'),
 
   c('idp.status', '身份与云端', '身份服务状态', '无', { readOnly: true }),
   c('idp.user.list_agents', '身份与云端', '员工身份用户列表', '无', { readOnly: true }),

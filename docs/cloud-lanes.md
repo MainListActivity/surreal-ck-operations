@@ -43,6 +43,16 @@
 
 员工定义在老板端编制页选对应 provider（模型 default），或 `sck owner def.ensure '{"id":"engineering-codex-cloud","role":"engineering","provider":"codex-cloud","model":"default"}'`。
 
+### 让云端通道优先接活
+
+派工默认「Factory 优先」：factory-droid 还有合格候选时新任务保留等它。要把空闲的云端额度用起来，把公司配置 `preferred_provider` 改成通道 provider：
+
+- `sck owner dispatch.preference '{"provider":"codex-cloud"}'` 或 `pnpm run admin config preferred_provider '"codex-cloud"'`；
+- 老板端员工页「职能」面板的「优先订阅」下拉同样生效；
+- 传 `""` 表示不设优先，所有合格候选纯按 `weight` 竞争。
+
+优先订阅额度耗尽或健康冷却时照常回退：其余合格供应商按权重分流，不会卡死任务。
+
 ## 回合怎么跑
 
 - 桥接进程（`src/runner/cloud-lane/main.ts`）被当成普通原生 CLI 启动：prompt 走 stdin，逐行输出 `system`(session_id) → `lane_status`（老板端活动流显示「云端运行中：…」）→ `result` 事件。

@@ -4,7 +4,7 @@ import { outcomeText, runCommand } from '../api.ts';
 import { Empty, NoticeLine, PageHeader, Panel, roleText, useAction } from '../common.tsx';
 import { LANG_OPTIONS, langLabel } from '../lang.ts';
 import { CommandPicker, CommandSelect } from '../CommandPicker.tsx';
-import { DefList, type DefRow } from './StaffDefs.tsx';
+import { DefList, ProviderPreference, type DefRow } from './StaffDefs.tsx';
 
 export interface RolePolicy {
   disabled: boolean;
@@ -95,6 +95,7 @@ export function StaffPage() {
 
       <Panel id="staff-agents" title="职能" hint="每轮会话都会新开员工实例，所以策略按职能保存：停用、允许/拒绝清单与译文语言对这个职能的所有员工生效。员工定义决定这个职能由哪些 CLI 与模型来干活。">
         {roleError ? <p class="notice err">职能列表读取失败：{roleError}</p> : null}
+        <ProviderPreference defs={defs} />
         {roles === undefined && !roleError ? <p class="hint">正在读取职能…</p> : null}
         {roles && roles.length === 0 ? <Empty>还没有员工定义</Empty> : null}
         {roles && roles.length > 0 ? (
