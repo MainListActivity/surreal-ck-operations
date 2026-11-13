@@ -9,11 +9,15 @@ import { spawn } from 'node:child_process';
 import type { CompanyCore, OpsScope } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
 import { buildScript } from './browser-scripts.ts';
+import { hfImage, hfLimits, type HfRun } from './higgsfield-cli.ts';
 
 export const BROWSER_TOOLS = ['media_browser_info', 'media_image', 'media_video', 'notebook_list', 'notebook_create', 'notebook_query', 'notebook_add_source', 'notebook_remove_source', 'notebook_write', 'notebook_recover'] as const;
 export type BrowserTool = typeof BROWSER_TOOLS[number];
 export const BROWSER_PROVIDERS = ['chatgpt', 'higgsfield', 'gemini', 'grok', 'notebook'] as const;
 export type Provider = typeof BROWSER_PROVIDERS[number];
+/** Paid CLI lane (credits): not a browser provider, always the last image fallback. */
+export const HF_CLI = 'higgsfield-cli' as const;
+type Lane = Provider | typeof HF_CLI;
 
 const KINDS = ['image', 'video', 'notebook'] as const;
 type Kind = typeof KINDS[number];
@@ -27,7 +31,8 @@ const TIMEOUT: Record<Kind, number> = { image: 300_000, video: 420_000, notebook
 // grok works but carries a shared weekly cap, so it stays last.
 // 'notebook' is the NotebookLM lane — a pseudo-provider covering notebook_* tools only.
 // 'higgsfield' is the free image lane: only the plan's unlimited image models are used, web UI only.
-const ROUTES = { image: ['chatgpt', 'higgsfield', 'gemini', 'grok'], video: ['gemini', 'grok'], notebook: ['notebook'] } as const;
+// 'higgsfield-cli' spends plan credits (no unlimited mode in the CLI), so it only runs after every free lane failed.
+const ROUTES = { image: ['chatgpt', 'higgsfield', 'gemini', 'grok', HF_CLI], video: ['gemini', 'grok'], notebook: ['notebook'] } as const;
 
 const IMG_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.png$/;
 const VID_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.(mp4|webm)$/;
@@ -53,6 +58,10 @@ export interface BrowserDeps {
   spawn?: typeof spawn;
   /** Company-wide default for the Gemini composer picker (company_meta:config.media_notebook_model). */
   notebookModel?: () => Promise<string | undefined> | string | undefined;
+  /** Paid Higgsfield CLI lane; opt-in (production passes defaultHfRun()) so nothing spends credits by default. */
+  hfRun?: HfRun;
+  /** Injected in tests to download Higgsfield results. */
+  fetchFn?: typeof fetch;
 }
 
 const invalid = (message: string) => new CompanyError('invalid', message);
@@ -69,11 +78,10 @@ const num = (args: Args, key: string, min: number, max: number): number | undefi
   return value;
 };
 
-function providerArg(args: Args, kind: 'image' | 'video'): Provider[] {
-  const routes: readonly Provider[] = ROUTES[kind];
+function providerArg(args: Args, routes: readonly Lane[]): Lane[] {
   const value = args.provider;
   if (value === undefined || value === 'auto') return [...routes];
-  if (typeof value === 'string' && routes.includes(value as Provider)) return [value as Provider];
+  if (typeof value === 'string' && routes.includes(value as Lane)) return [value as Lane];
   throw invalid(`provider 仅支持 auto 或 ${routes.join('/')}`);
 }
 
@@ -206,13 +214,17 @@ export class BrowserStudio {
   private readonly run: Runner;
   /** One shared browser profile: every job takes a turn, no parallel pages across providers. */
   private tail: Promise<unknown> = Promise.resolve();
-  private readonly lastError = new Map<Provider, { code: string; message: string; at: number }>();
+  /** CLI jobs serialize among themselves so the daily credit check and the spend it guards cannot interleave. */
+  private hfTail: Promise<unknown> = Promise.resolve();
+  private readonly hfRun?: HfRun;
+  private readonly lastError = new Map<Lane, { code: string; message: string; at: number }>();
 
   constructor(private readonly deps: BrowserDeps) {
     this.roles = deps.roles ?? envRoles() ?? DEFAULT_ROLES;
     this.limits = { ...DEFAULT_LIMITS, ...envLimits(), ...deps.limits };
     this.now = deps.now ?? Date.now;
     this.run = deps.runner ?? defaultRunner(deps.spawn ?? spawn);
+    this.hfRun = deps.hfRun;
   }
 
   release(_employeeId: string): void {}
@@ -262,20 +274,21 @@ export class BrowserStudio {
     }])));
     return { value: {
       at: new Date(this.now()).toISOString(),
-      providers: ROUTES,
+      providers: this.routes(),
       quotas,
       providerStatus: Object.fromEntries([...this.lastError].map(([p, e]) => [p, `${e.code}: ${e.message.slice(0, 120)}`])),
       outputDir: this.outputDir(scope),
       notes: [
-        '网页会话生成：provider=auto 按 ' + ROUTES.image.join(' → ') + ' 顺序 failover',
+        '网页会话生成：provider=auto 按 ' + this.routes().image.join(' → ') + ' 顺序 failover',
         'higgsfield 仅使用套餐内标记为“无限”的图像模型（Seedream 4.5 / FLUX.2 Pro / Seedream 5.0 lite / GPT Image / Nano Banana / Kling O1），不花 credits；未登录返回 login_required',
+        `higgsfield-cli 是付费兜底：CLI 没有无限模式，每张按 credits 计费；只在前面的免费通道都失败后才用，或显式指定 provider=higgsfield-cli；单张不超过 ${hfLimits().perJob} credits，近 24 小时合计不超过 ${hfLimits().daily} credits`,
         '图片产物为 PNG（透明底能力以会话实际支持为准）；视频产物 mp4 优先、提取失败回落 webm',
         'notebook_* 为笔记本通道：一部作品一本（如《作品名》），源按一卷一个（卷正文汇编）；write 在 Gemini 壳内基于笔记本源写作，query 查证/读取，add_source/remove_source 维护卷源',
         'login_required 错误 = 对应平台网页会话过期，需要老板在 ego 浏览器里重新登录该站',
         'limit_reached 为账号级配额（Grok 按周），等重置或换 provider',
       ],
       tools: {
-        media_image: '{"prompt","file":"x.png","refs?"[:至多4张参考图绝对路径],"provider?"[:auto/chatgpt/higgsfield/gemini/grok]}',
+        media_image: '{"prompt","file":"x.png","refs?"[:至多4张参考图绝对路径],"provider?"[:auto/chatgpt/higgsfield/gemini/grok/higgsfield-cli]}',
         media_video: '{"prompt","file":"x.mp4","seconds?"(4-10),"provider?"[:auto/gemini/grok]}',
         notebook_list: '{}',
         notebook_create: '{"title":"作品名"}',
@@ -296,22 +309,26 @@ export class BrowserStudio {
     if (!fileRe.test(file)) throw invalid(kind === 'image' ? 'file 只能是纯文件名 xxx.png' : 'file 只能是纯文件名 xxx.mp4/.webm');
     const refs = refsArg(args);
     const seconds = kind === 'video' ? num(args, 'seconds', 4, 10) : undefined;
-    const providers = providerArg(args, kind);
+    const providers = providerArg(args, this.routes()[kind]);
     const timeoutMs = TIMEOUT[kind];
     const outDir = this.outputDir(scope);
     mkdirSync(outDir, { recursive: true, mode: 0o700 });
 
     const attempts: string[] = [];
     for (const provider of providers) {
-      const script = buildScript(provider, { kind, prompt, outDir, file, refs, seconds, timeoutMs });
-      const result = await this.enqueue(() => this.run(provider, script, timeoutMs));
+      const hfRun = this.hfRun;
+      const result = provider === HF_CLI
+        ? hfRun ? await this.hfEnqueue(() => hfImage({ prompt, outDir, file, refs, timeoutMs }, { run: hfRun, now: this.now, fetchFn: this.deps.fetchFn }))
+          : { ok: false, code: 'failed', message: 'higgsfield CLI 通道未启用' }
+        : await this.enqueue(() => this.run(provider, buildScript(provider, { kind, prompt, outDir, file, refs, seconds, timeoutMs }), timeoutMs));
       if (result.ok && result.file) {
         const rel = join(scope.taskId, 'media', file);
         return { value: {
           file: result.file, bytes: result.bytes, provider, via: result.via,
           evidencePath: rel,
           attempts: attempts.length ? attempts : undefined,
-        }, audit: { action: `ops_browser_${kind}`, evidence: `media_${kind} ${provider} ${file} refs=${refs.length} prompt=${prompt.slice(0, 80)}` } };
+          credits: 'credits' in result ? result.credits : undefined,
+        }, audit: { action: `ops_browser_${kind}`, evidence: `media_${kind} ${provider}${'credits' in result && result.credits !== undefined ? ` credits=${result.credits}` : ''} ${file} refs=${refs.length} prompt=${prompt.slice(0, 80)}` } };
       }
       const code = result.code ?? 'failed';
       const message = result.message ?? '未知错误';
@@ -410,6 +427,17 @@ export class BrowserStudio {
       file: result.file, bytes: result.bytes, url: result.url, text: result.text,
       turns: result.turns, sha256: result.sha256, source: result.source, model: result.model,
     }, audit: { action: 'ops_browser_notebook', evidence: `notebook_${op} ${evidenceBits}`.slice(0, 160) } };
+  }
+
+  /** Failover routes in effect: the paid CLI lane only exists when it was wired in. */
+  private routes(): { image: readonly Lane[]; video: readonly Lane[]; notebook: readonly Lane[] } {
+    return this.hfRun ? ROUTES : { ...ROUTES, image: ROUTES.image.filter(lane => lane !== HF_CLI) };
+  }
+
+  private hfEnqueue<T>(job: () => Promise<T>): Promise<T> {
+    const next = this.hfTail.then(job, job);
+    this.hfTail = next.catch(() => {});
+    return next;
   }
 
   /** Serial execution over the single shared ego profile. */

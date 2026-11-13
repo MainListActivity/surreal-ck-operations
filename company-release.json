@@ -1,14 +1,14 @@
 {
-  "version": "0.13.5",
-  "title": "误报与额度读取修复",
+  "version": "0.13.6",
+  "title": "Higgsfield CLI 兜底",
   "changes": [
-    "两个派工端（Paseo 插件、原生执行端）各按自己负责的编制派工：某职能的启用编制全在另一端时，本端不再给老板发“该岗位与仓库下没有任何编制或员工”的派工受阻提醒，也不改写任务的受阻起点。",
-    "额度读取可用专用密钥：存在 private/magpie-quota.key 时，执行端读 VPS /v1/magpie/quotas 用它（员工密钥按模型组限制，该接口返回 403，导致 Factory、Devin 等额度停更）；不存在时行为不变。"
+    "新增付费图片兜底通道 higgsfield-cli：media_image 在 chatgpt、higgsfield 网页、gemini、grok 都失败后才走 Higgsfield CLI，也可显式指定 provider=higgsfield-cli；视频不走此通道。",
+    "CLI 没有无限模式，每张扣套餐 credits：只用白名单便宜模型（gpt_image_2_6 约 0.25、kling_omni_image 约 0.5），生成前先查价，单张超过 0.5 credits 拒绝；按账户流水算近 24 小时花费，超过 20 credits 拒绝；读不到流水也拒绝。",
+    "额度可调：SCK_HIGGSFIELD_DAILY_CREDITS、SCK_HIGGSFIELD_MAX_JOB_CREDITS；SCK_HIGGSFIELD_CLI=0 关闭通道。审计记录每张实际 credits。"
   ],
   "impact": [
-    "老板提醒：QA 等全在原生执行端的职能不再出现误报。",
-    "额度：放置专用密钥后 Factory、Devin 等订阅额度恢复更新。"
+    "媒体生成：免费网页通道全部不可用时，图片仍能产出，每天最多花 20 credits（套餐每月 600，月初清零）。"
   ],
-  "migration": "无 schema 变更（沿用 schema 068）；如需恢复额度更新，老板在服务目录 private/ 放置 magpie-quota.key（权限 600）。",
-  "rollback": "回退至 v0.13.4（误报恢复，额度读取回到员工密钥）。"
+  "migration": "无 schema 变更（沿用 schema 068）；本机需已安装并登录 Higgsfield CLI（higgsfield auth login）。",
+  "rollback": "回退至 v0.13.5（图片兜底只剩免费网页通道）。"
 }
