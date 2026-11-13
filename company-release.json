@@ -1,14 +1,14 @@
 {
-  "version": "0.13.4",
-  "title": "Devin 经 Paseo 接入员工",
+  "version": "0.13.5",
+  "title": "误报与额度读取修复",
   "changes": [
-    "新增员工 provider devin-paseo：Devin CLI 经 Paseo ACP 启动，命令指向员工沙箱包装脚本 sandbox/bin/devin；老板自己的 devin provider 不变。",
-    "install.sh 自动包装 devin 并写入 devin-paseo；插件沙箱门禁放行 devin-paseo；无人值守模式 bypass；与 devin 共用订阅额度与耗尽冷却。",
-    "老板端编制页可选 Devin CLI（Paseo 模式），模型 swe-2-high / swe-2-flash-medium / adaptive。"
+    "两个派工端（Paseo 插件、原生执行端）各按自己负责的编制派工：某职能的启用编制全在另一端时，本端不再给老板发“该岗位与仓库下没有任何编制或员工”的派工受阻提醒，也不改写任务的受阻起点。",
+    "额度读取可用专用密钥：存在 private/magpie-quota.key 时，执行端读 VPS /v1/magpie/quotas 用它（员工密钥按模型组限制，该接口返回 403，导致 Factory、Devin 等额度停更）；不存在时行为不变。"
   ],
   "impact": [
-    "派工与执行：可为任意职能新增 devin-paseo 编制；未建编制时无变化。"
+    "老板提醒：QA 等全在原生执行端的职能不再出现误报。",
+    "额度：放置专用密钥后 Factory、Devin 等订阅额度恢复更新。"
   ],
-  "migration": "无 schema 变更（沿用 schema 068）；上线后老板（或执行端）重跑 scripts/sandbox/install.sh 生成 devin 包装脚本与 provider。",
-  "rollback": "回退至 v0.13.3（devin-paseo 员工会被沙箱门禁拒绝启动，0.13.3 起会自动结案不卡租约）。"
+  "migration": "无 schema 变更（沿用 schema 068）；如需恢复额度更新，老板在服务目录 private/ 放置 magpie-quota.key（权限 600）。",
+  "rollback": "回退至 v0.13.4（误报恢复，额度读取回到员工密钥）。"
 }

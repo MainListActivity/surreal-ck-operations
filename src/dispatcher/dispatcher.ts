@@ -1608,6 +1608,16 @@ export class Dispatcher {
     // and never guessed at, while the rest of the queue keeps moving. Items beyond the concurrency cap are recorded
     // after the loop as blocked by max_running.
     const unplaced: typeof work = [];
+    // Two runtimes (Paseo plugin, native runner) dispatch from one roster, each over its own scoped defs. A role whose
+    // enabled defs all belong to the other runtime is that runtime's work: an empty pool here is not "no employee".
+    let foreignRoles: Set<string> | undefined;
+    const ownedElsewhere = async (role: string): Promise<boolean> => {
+      if (!foreignRoles) {
+        const scoped = new Set((await wf.defs()).map(def => def.id));
+        foreignRoles = new Set((await wf.allDefs().catch(() => [])).filter(def => def.enabled && !scoped.has(def.id)).map(def => def.role));
+      }
+      return foreignRoles.has(role);
+    };
     const dispatchWorkItems = async (items: typeof work) => {
       for (const item of items) {
         if (running >= cfg.maxRunning) { unplaced.push(item); continue; }
@@ -1635,6 +1645,7 @@ export class Dispatcher {
           const entries = poolFor(item.role, home, item.task, item.purpose === 'review', exclusion).map(entry => entry.eligible
             ? { ...entry, eligible: false, code: 'wake_failed' as const, reason: '唤醒或创建失败，下一轮重试' }
             : entry);
+          if (entries.length === 0 && await ownedElsewhere(item.role)) continue;
           await this.settleBlocked(item.task, item.purpose, home, entries, now, report, [],
             otherRepoCount(insts, item.role, home, this.deps.env.opsRepo));
           continue;

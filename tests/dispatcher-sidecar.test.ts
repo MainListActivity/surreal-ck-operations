@@ -625,6 +625,26 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     await d.tick();
     expect(w.events.some(e => e.startsWith('claim:'))).toBe(true);
   });
+  // The fake roster holds one engineering def; a qa task has no candidate in this runtime's scope.
+  const qaTask = (w: ReturnType<typeof world>, id: string) => {
+    w.addTask(id);
+    (w.rows[w.rows.length - 1] as { executorRole: string }).executorRole = 'qa';
+  };
+  test('a role whose enabled defs all belong to the other runtime raises no dispatch-blocked notice here', async () => {
+    const w = world();
+    (w.wf as { allDefs?: () => Promise<unknown[]> }).allDefs = async () => [w.def, { ...w.def, id: 'qa-native', role: 'qa' }];
+    qaTask(w, 'foreign-role');
+    const r = await w.dispatcher().tick();
+    expect(r.notices).not.toContain('dispatch-blocked:foreign-role:execute');
+    expect(w.notices.has('dispatch-blocked:foreign-role:execute')).toBe(false);
+  });
+  test('a role nobody owns still raises the no-candidate notice; a disabled foreign def does not count', async () => {
+    const w = world();
+    (w.wf as { allDefs?: () => Promise<unknown[]> }).allDefs = async () => [w.def, { ...w.def, id: 'qa-off', role: 'qa', enabled: false }];
+    qaTask(w, 'orphan-role');
+    const r = await w.dispatcher().tick();
+    expect(r.notices).toContain('dispatch-blocked:orphan-role:execute');
+  });
   test('dispatch-blocked notice names a track-mismatched def as 岗位轨不匹配, not a spawn failure', async () => {
     const w = world();
     w.def.tracks = ['角色设计'];

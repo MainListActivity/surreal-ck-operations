@@ -25,6 +25,20 @@ export function readMagpieKey(serviceHome: string): string {
 export const magpieAuthorization = (serviceHome: string): Record<string, string> => ({ Authorization: `Bearer ${readMagpieKey(serviceHome)}` });
 
 /**
+ * Optional key for the VPS `/v1/magpie/quotas` read. The employee key is model-scoped and the quota endpoint answers
+ * it 403, so the runner reads quota with this key when the owner has placed one; otherwise it falls back to the
+ * employee key. It never reaches an employee session: only the runner process reads it, and the sandbox denies `private/`.
+ */
+export const MAGPIE_QUOTA_KEY_RELATIVE = join("private", "magpie-quota.key");
+export function magpieQuotaAuthorization(serviceHome: string): Record<string, string> {
+  try {
+    const key = readFileSync(join(serviceHome, MAGPIE_QUOTA_KEY_RELATIVE), "utf8").trim();
+    if (key) return { Authorization: `Bearer ${key}` };
+  } catch { /* no dedicated quota key: use the employee key */ }
+  return magpieAuthorization(serviceHome);
+}
+
+/**
  * Environment of an employee Claude session. The same values go to the process env and to the private settings file,
  * because a user's global settings.env wins over the process env (verified against Claude Code 2.1.319).
  * The alias pins keep Claude Code's own aliases (haiku/sonnet/opus) on the groups: without them a subagent or a

@@ -22,7 +22,7 @@ import { subscribeWake, TickGate } from "../cloud/wake.ts";
 import { sweepArchiveBatches, sweepInstanceDirs } from "../dispatcher/lifecycle-gc.ts";
 import { magpieBase, missingFrom, poolRoom, readMagpieQuotas, type MagpieUsageEntry } from "../dispatcher/magpie-quota.ts";
 import { readProviderQuotas, readQuotaEntries } from "../dispatcher/quota-store.ts";
-import { magpieAuthorization } from "../model-routing/employee-env.ts";
+import { magpieAuthorization, magpieQuotaAuthorization } from "../model-routing/employee-env.ts";
 import { MAGPIE_BASE } from "../model-routing/magpie-contract.ts";
 export { readProviderQuotas };
 
@@ -169,7 +169,7 @@ export async function readModelSlots(ctx: Company): Promise<Record<string, strin
 /** The employee key for the VPS magpie quota read. A configured local magpie gets none; a missing key file reads as no answer. */
 function quotaHeaders(): Record<string, string> | undefined {
   if (magpieBase() !== MAGPIE_BASE) return undefined;
-  try { return magpieAuthorization(serviceHome()); } catch { return undefined; }
+  try { return magpieQuotaAuthorization(serviceHome()); } catch { return undefined; }
 }
 
 /**
