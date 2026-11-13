@@ -416,3 +416,35 @@ run('人工入口：取消零写入，确认期间变更拒绝，精确确认后
     expect(await w.wf.pendingDispatchAttempts()).toHaveLength(0);
   } finally { await w.db.close(); }
 },20000);
+
+run('运行端建会话前拒绝：rejected 结案解除三处屏障，消息仍为草稿，撤租约后节点无在途租约', async () => {
+  const { activeLeaseCount } = await import('../src/node-release.ts');
+  const w = await fixture();
+  try {
+    const node = 'fixture-node';
+    await w.db.db.query('UPDATE $task SET lease_node = $node;', { task: w.record, node });
+    // An acknowledged spawn may have a live session: rejection is refused and every barrier stays.
+    const acked = await w.wf.beginDispatchAttempt({ ...w.input, request: randomUUID() });
+    await w.wf.acknowledgeDispatchAttempt(acked, 'maybe-live-agent');
+    await expect(w.wf.rejectDispatchAttempt(acked, 'synthetic')).rejects.toThrow();
+    expect(await w.wf.pendingDispatchAttempts()).toHaveLength(1);
+    // Before rejection a direct barrier removal stays forbidden by the schema events.
+    await w.db.db.query('UPDATE $a SET agent = NONE, revision = 0;', { a: new RecordId('dispatch_attempt', acked) });
+    await expect(w.db.db.query('UPDATE outbound_message:fixture SET dispatch_attempt = NONE;').then(value => value)).rejects.toThrow();
+    expect(await w.wf.revokeLease(w.task.id, 'synthetic', 'synthetic', 'synthetic')).toBe(false);
+    expect(await activeLeaseCount(w.db, node)).toBe(1);
+    await w.wf.rejectDispatchAttempt(acked, 'Plugin sck-company agent.open.before failed: synthetic');
+    expect(await w.wf.pendingDispatchAttempts()).toEqual([]);
+    const [rows] = await w.db.db.query<[Array<{ t: unknown; e: unknown; m: unknown; state: string; body?: string; a: string }>]>(
+      `SELECT (SELECT VALUE dispatch_attempt FROM ONLY $task) AS t, (SELECT VALUE dispatch_attempt FROM ONLY employee:synthetic) AS e,
+        dispatch_attempt AS m, state, dispatch_body AS body, (SELECT VALUE state FROM ONLY $attempt) AS a FROM outbound_message:fixture;`,
+      { task: w.record, attempt: new RecordId('dispatch_attempt', acked) });
+    expect(rows[0]).toMatchObject({ state: 'draft', a: 'rejected' });
+    expect(rows[0]!.t ?? null).toBeNull(); expect(rows[0]!.e ?? null).toBeNull(); expect(rows[0]!.m ?? null).toBeNull(); expect(rows[0]!.body ?? null).toBeNull();
+    // A settled rejection cannot be replayed, and the lease now releases normally.
+    await expect(w.wf.rejectDispatchAttempt(acked, 'again')).rejects.toThrow();
+    expect(await w.wf.revokeLease(w.task.id, 'synthetic', 'synthetic', 'synthetic')).toBe(true);
+    expect(await activeLeaseCount(w.db, node)).toBe(0);
+    await w.db.db.query('UPDATE employee:synthetic SET retired = true;');
+  } finally { await w.db.close(); }
+}, 20000);

@@ -36,6 +36,24 @@ const isAgentNotFound = (error: unknown): boolean => {
   }
 };
 
+/**
+ * A spawn our own plugin refused before any session existed: `paseo run` reports AGENT_CREATE_FAILED with the
+ * `agent.open.before` hook's refusal. AGENT_CREATE_FAILED alone is not enough — the CLI wraps every error of
+ * `run` in it, including ones after the agent was created — so only the pre-open hook refusal counts.
+ */
+export const isOpenRefused = (error: unknown): boolean => {
+  if (!(error instanceof PaseoCliError) || error.timedOut) return false;
+  const start = error.stderr.search(/^\{/m);
+  if (start < 0) return false;
+  try {
+    const parsed = JSON.parse(error.stderr.slice(start)) as { error?: { code?: unknown; message?: unknown } };
+    return parsed.error?.code === 'AGENT_CREATE_FAILED' && typeof parsed.error.message === 'string'
+      && /\bPlugin \S+ agent\.open\.before failed:/.test(parsed.error.message);
+  } catch {
+    return false;
+  }
+};
+
 export function createPaseoCli(
   bin = process.env.SCK_PASEO_BIN ?? '/Applications/Paseo.app/Contents/Resources/bin/paseo',
   options: { timeoutMs?: number; runtimeMcpUrl?: string } = {},

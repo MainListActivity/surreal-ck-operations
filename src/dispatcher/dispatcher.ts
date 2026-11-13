@@ -13,7 +13,7 @@ import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, Supervis
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
 import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, RetirementKind, Role, WriteScopeHolder } from '../contracts.ts';
 import { REQUIRED_TRACKS } from '../core.ts';
-import { MAINTENANCE_WORKSPACE, UNATTENDED_MODE, goneSceneError, workspaceTitleOf, type PaseoGateway, type PaseoWorkspaceInfo } from './paseo.ts';
+import { MAINTENANCE_WORKSPACE, UNATTENDED_MODE, goneSceneError, isOpenRefused, workspaceTitleOf, type PaseoGateway, type PaseoWorkspaceInfo } from './paseo.ts';
 import { latestFindings } from './brief.ts';
 import type { PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
@@ -1908,6 +1908,7 @@ export class Dispatcher {
         return undefined;
       }
       let externalAttempt = false;
+      let attemptId: string | undefined;
       try {
         // Goal conversations live at the repository root; private comm remains per employee.
         // Worktree allocation stays in claim.json and never changes the Paseo workspace.
@@ -1940,6 +1941,7 @@ export class Dispatcher {
           messageRevision: prepared?.message.dispatchRevision, body: body!, bodyHash: createHash('sha256').update(body!).digest('hex'),
           activationRequired: !!paseo.activate, binding: { cwd: spawnCwd, repoHome, model, workspaceScope, paseoWorkspace: container.workspaceId }, employee: inst.id, task: task?.id, kind: 'spawn',
           delivery: claim?.deliveryId, fence: claim?.fence });
+        attemptId = attempt;
         const agentId = await paseo.spawn({
           // A managed group name is not a Claude model id the thinking flag can address: the level is left unset and says so in the PR.
           title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model, thinking: isGroupModel(model) ? undefined : def.thinking,
@@ -1972,7 +1974,10 @@ export class Dispatcher {
       } catch (error) {
         const message = (error as Error).message;
         this.log(`spawn ${inst.id} failed: ${message}`);
-        if (externalAttempt) throw error; // Keep lease, instance and barrier; no next-def fallback.
+        // Keep lease, instance and barrier; no next-def fallback. The one exception is a spawn our plugin refused
+        // before any session existed: it delivered nothing, so it is settled and released like a pre-call failure.
+        if (externalAttempt && !(attemptId && isOpenRefused(error) && await wf.rejectDispatchAttempt(attemptId, message)
+          .then(() => true, (rejectError: unknown) => { this.log(`settle refused spawn ${attemptId} failed: ${(rejectError as Error).message}`); return false; }))) throw error;
         if (workspace) await sidecar?.releaseWorkspace?.(inst);
         if (claim) await sidecar!.releaseClaim(inst.id, task!.id, `spawn failed: ${message.slice(0, 120)}`);
         if (await this.retireGated(inst, `spawn failed: ${message.slice(0, 200)}`, 'failure', report)) report.retired.push(inst.id);

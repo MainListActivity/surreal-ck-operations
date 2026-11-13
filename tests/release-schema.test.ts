@@ -84,7 +84,9 @@ describe('the schema a target version must have reached', () => {
     expect(schemaRequirementFor('0.11.6').tables).toContain('agent_activity');
     expect(schemaRequirementFor('0.11.23').schema).toBe(66);
     expect(schemaRequirementFor('0.11.24').tables).toContain('reply_translation');
-    expect(CLOUD_SCHEMA_VERSION).toBe(67);
+    expect(schemaRequirementFor('0.13.2').schema).toBe(67);
+    expect(schemaRequirementFor('0.13.3').schema).toBe(68);
+    expect(CLOUD_SCHEMA_VERSION).toBe(68);
   });
 
   test('the version in package.json needs the schema this code applies', () => {

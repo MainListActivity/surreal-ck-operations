@@ -1,12 +1,14 @@
 {
-  "version": "0.13.2",
-  "title": "Paseo 员工沙箱放行 factory-paseo / grok / muse",
+  "version": "0.13.3",
+  "title": "拒绝启动的派工结案",
   "changes": [
-    "插件员工沙箱门禁的包装脚本表加入 factory-paseo（droid）、grok、muse：0.13.0 新增的 Paseo 模式员工此前被拒绝启动（「provider factory-paseo 无法放进员工沙箱」）。门禁仍要求 Paseo 配置的启动命令指向 sandbox/bin 包装脚本。"
+    "派工时 Paseo 报 AGENT_CREATE_FAILED 且原因是公司插件 agent.open.before 拒绝（会话从未创建），派工记录结案为 rejected：解除任务/员工/消息屏障，消息保持草稿，按普通 spawn 失败收回租约、退休实例并计入定义失败。",
+    "此前这类失败被当作结果不确定：租约被无限续期，节点更新器因“有进行中的租约”一直暂缓，修复版本无法上线（0.13.0→0.13.2 实际发生）。",
+    "其他 spawn 失败（超时、非插件原因的 AGENT_CREATE_FAILED、响应丢失）仍按不确定处理，不重派。"
   ],
   "impact": [
-    "派工与执行：factory-paseo、grok、muse 员工可经 Paseo 在员工沙箱中启动；其他 provider 不变。"
+    "派工与执行：被员工沙箱门禁等插件规则拒绝的 spawn 不再卡住任务与节点更新；任务回到就绪，由下一位可用员工领取。"
   ],
-  "migration": "无 schema 变更（沿用 schema 067）；需已按 0.13.0 说明重跑 scripts/sandbox/install.sh。",
-  "rollback": "回退至 v0.13.1（这三类 Paseo 员工会再次被拒绝启动）。"
+  "migration": "schema 068：重定义 065 的三个派工屏障事件，允许 rejected 状态解除屏障；合入 main 后由 CI 迁移云端库。",
+  "rollback": "回退至 v0.13.2（schema 068 向后兼容，旧代码不会写 rejected）。"
 }
