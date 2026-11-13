@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runLane, type LaneDeps, type LaneInput } from '../src/runner/cloud-lane/lane.ts';
+import { runLane, taskMaterial, vendorPrompt, type LaneDeps, type LaneInput } from '../src/runner/cloud-lane/lane.ts';
 import { laneDigest, readLaneState, writeLaneState } from '../src/runner/cloud-lane/state.ts';
 import { julesUsageCount, julesUsageEntry, whamToUsageEntry } from '../src/runner/cloud-lane/quota.ts';
 import { recordJulesUsage } from '../src/runner/cloud-lane/jules.ts';
@@ -120,14 +120,43 @@ describe('codex-cloud 通道', () => {
       return undefined;
     }});
     const input = w.input();
+    const repo = { slug: 'acme/widget', owner: 'acme', repo: 'widget', branch: 'sck/task-1', defaultBranch: 'main' };
+    const digest = laneDigest('codex-cloud', vendorPrompt(input, repo, taskMaterial(w.commDir, input.prompt)));
     writeLaneState(w.commDir, { sessionId: 'lane-old', taskId: 'task_b_prev',
       taskUrl: 'https://chatgpt.com/codex/tasks/task_b_prev',
-      digest: laneDigest('codex-cloud', input.prompt), branch: 'sck/task-1', submittedAt: Date.now() });
+      digest, branch: 'sck/task-1', submittedAt: Date.now() });
     const out = await runLane(input, w.deps);
     expect(out.status).toBe('success');
     expect(w.callsOf(c => c.cmd === 'codex' && c.args[1] === 'exec')).toHaveLength(0);
     expect(w.callsOf(c => c.cmd === 'codex' && c.args[1] === 'status')).toHaveLength(1);
     expect(out.sessionId).toBe('lane-old');
+  });
+
+  test('在途任务摘要随 task.md 变化：错误回合留下的旧任务不会被新任务重连', async () => {
+    // 第一轮的派工消息与第二轮逐字相同（复用 comm 目录时本就如此），只有 task.md 不同。
+    const w = world({ extra: call => {
+      const [a, b] = call.args;
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'exec') return ok('https://chatgpt.com/codex/tasks/task_b_new\n');
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'status') return ok('[READY] t\nenv  •  now\nno diff\n');
+      if (call.cmd === 'codex' && a === 'cloud' && b === 'diff') return ok('');
+      return undefined;
+    }});
+    // 上一轮错误收尾：state 里留下旧云端任务与旧摘要（摘要当时覆盖旧 task.md 内容）。
+    const input = w.input();
+    writeLaneState(w.commDir, { sessionId: 'lane-old', taskId: 'task_b_stale',
+      taskUrl: 'https://chatgpt.com/codex/tasks/task_b_stale',
+      digest: 'digest-of-old-task-md', branch: 'sck/task-1', submittedAt: Date.now() });
+    const out = await runLane(input, w.deps);
+    expect(out.status).toBe('success');
+    // 新内容 → 新提交，不轮询旧任务状态
+    expect(w.callsOf(c => c.cmd === 'codex' && c.args[1] === 'exec')).toHaveLength(1);
+    expect(w.callsOf(c => c.cmd === 'codex' && c.args.includes('task_b_stale'))).toHaveLength(0);
+    // 对照：摘要不变时在途任务应重连（上面用例已覆盖，这里验证摘要确实随内容走）。
+    writeLaneState(w.commDir, { sessionId: 'lane-old', taskId: 'task_b_same',
+      digest: readLaneState(w.commDir)!.digest, branch: 'sck/task-1' });
+    const again = await runLane(input, w.deps);
+    expect(again.sessionId).toBe('lane-old');
+    expect(w.callsOf(c => c.cmd === 'codex' && c.args[1] === 'exec')).toHaveLength(1);
   });
 
   test('轮询超时 → 错误回合，文案含任务 ID 与“可能仍在运行”', async () => {
@@ -172,19 +201,36 @@ describe('codex-cloud 通道', () => {
 
 describe('devin-cloud 通道', () => {
   const devinOk: Route = call => {
-    const [a, b] = call.args;
+    const [a] = call.args;
     if (call.cmd === 'devin' && a === '--cloud') return ok('完成。已推送并开 PR。\nPR: https://github.com/acme/widget/pull/9\nSHA: cafecafe\n');
     if (call.cmd === 'git' && a === 'fetch') return ok('');
     if (call.cmd === 'git' && a === 'merge') return ok('');
     return undefined;
   };
 
-  test('同步会话输出答复；快进成功后透传 PR/SHA', async () => {
+  test('同步会话输出答复；快进成功后透传 PR，声明 SHA 与实际 HEAD 一致', async () => {
+    // 本地 HEAD 是 deadbeef…：Devin 声明 cafecafe 与之不符时改写为实际 HEAD 并注明。
     const w = world({ extra: devinOk });
     const out = await runLane(w.input({ provider: 'devin-cloud' }), w.deps);
     expect(out.status).toBe('success');
     expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
+    expect(out.text).toContain(`SHA: ${'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'}`);
+    expect(out.text).toContain('声明的 SHA cafecafe 与远端分支实际 HEAD 不一致');
+    expect(out.text).not.toContain('SHA: cafecafe');
     expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'merge')).toHaveLength(1);
+  });
+
+  test('Devin 答复缺 SHA 行时补实际 HEAD', async () => {
+    const w = world({ extra: call => {
+      const [a] = call.args;
+      if (call.cmd === 'devin' && a === '--cloud') return ok('完成。\nPR: https://github.com/acme/widget/pull/9\n');
+      if (call.cmd === 'git' && a === 'fetch') return ok('');
+      if (call.cmd === 'git' && a === 'merge') return ok('');
+      return undefined;
+    }});
+    const out = await runLane(w.input({ provider: 'devin-cloud' }), w.deps);
+    expect(out.status).toBe('success');
+    expect(out.text).toContain('SHA: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef');
   });
 
   test('非快进合并 → 错误回合且不 reset', async () => {

@@ -22,6 +22,7 @@ import { HASH, REQUIRED_TRACKS } from './core.ts';
 import { getRoute, listRoutes, saveRoute, disableRoute } from './routes.ts';
 import { defaultAcceptanceCriteria } from './acceptance.ts';
 import { readTaskCost, COST_LIST_SQL } from './task-cost.ts';
+import { QUOTA_ROWS } from './dispatcher/quota-store.ts';
 import { hostIOOrUndefined } from './host-io.ts';
 
 export type OwnerVia = string;
@@ -297,8 +298,9 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     }
     case 'def.list': return { defs: await ctx.workforce.defs() };
     case 'quota.list': {
-      const [quotas] = await db.query<[unknown[]]>(
-        `SELECT * FROM company_meta WHERE string::starts_with(<string>id, 'company_meta:quota_');`);
+      // 与 quota-store 同一谓词：连字符 provider 的 id 打印为 company_meta:⟨quota_codex-cloud⟩，
+      // 对整行字符串做前缀测试会漏掉这些行，必须只取记录名比较。
+      const [quotas] = await db.query<[unknown[]]>(`SELECT * FROM company_meta WHERE ${QUOTA_ROWS};`);
       const [exhausted] = await db.query<[unknown[]]>(
         `SELECT * FROM provider_health WHERE state = 'exhausted';`);
       return { quotas: quotas ?? [], exhausted: exhausted ?? [] };

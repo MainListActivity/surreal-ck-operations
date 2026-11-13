@@ -80,9 +80,13 @@ export function taskMaterial(commDir: string, prompt: string): { task: string; f
 export function vendorPrompt(input: LaneInput, repo: RepoInfo, material: ReturnType<typeof taskMaterial>): string {
   const parts: string[] = [];
   if (material.review) {
-    parts.push(`你在复核仓库 ${repo.slug} 分支 ${repo.branch} 上已提交的改动（PR 目标分支 ${repo.defaultBranch}）。`,
-      '只做只读复核：不要修改文件、不要提交、不要推送。',
-      '按下面的验收标准逐条独立复验，最终答复首行必须是「复核结论：通过」或「复核结论：退回」，随后逐条给出证据。');
+    parts.push(`你在复核仓库 ${repo.slug} 分支 ${repo.branch} 上已提交的改动（PR 目标分支 ${repo.defaultBranch}）。`);
+    if (input.provider === 'codex-cloud')
+      parts.push('只做只读复核：除新建 `.sck/review.md` 写入复核结论外不改动任何文件，也不需要提交或推送。',
+        '按下面的验收标准逐条独立复验，最终答复首行必须是「复核结论：通过」或「复核结论：退回」，随后逐条给出证据。');
+    else
+      parts.push('只做只读复核：不要修改文件、不要提交、不要推送。',
+        '按下面的验收标准逐条独立复验，最终答复首行必须是「复核结论：通过」或「复核结论：退回」，随后逐条给出证据。');
   } else {
     parts.push(`在 GitHub 仓库 ${repo.slug} 的分支 ${repo.branch} 上完成下面的工作，并把全部改动提交推送到该分支（PR 目标分支 ${repo.defaultBranch}）。`);
     if (input.provider === 'devin-cloud')
@@ -122,7 +126,9 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
 
   const material = taskMaterial(input.commDir, input.prompt);
   const prompt = vendorPrompt(input, repo, material);
-  const digest = laneDigest(input.provider, input.prompt);
+  // 摘要必须覆盖定义本轮的全部输入：供应商 prompt 已含 task.md 与内联的复核意见，
+  // 不能只取派工消息（复用 comm 目录时不同任务的派工消息可能逐字相同）。
+  const digest = laneDigest(input.provider, prompt);
   const deadline = deps.now() + (input.config.maxMinutes ?? 180) * 60_000;
 
   // 相同 prompt 摘要重连在途云端任务；新回合清空 taskId 但保留可复用的供应商会话（vendorSession）。

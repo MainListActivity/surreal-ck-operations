@@ -20,8 +20,9 @@ export interface LaneState {
   submittedAt?: number;
 }
 
-export function laneDigest(provider: string, prompt: string): string {
-  return createHash('sha256').update(`${provider}\n${prompt}`).digest('hex');
+/** 回合摘要：provider + 交给供应商的完整 prompt（含 task.md 与 findings），不是外层派工消息。 */
+export function laneDigest(provider: string, vendorPrompt: string): string {
+  return createHash('sha256').update(`${provider}\n${vendorPrompt}`).digest('hex');
 }
 
 export function readLaneState(commDir: string): LaneState | undefined {

@@ -45,7 +45,11 @@ export async function driveDevin(ctx: Ctx): Promise<{ kind: 'done' | 'blocked' |
   try {
     const head = await fetchAndFastForward(deps.exec, input.cwd, repo.branch);
     if (!pr) return { kind: 'blocked', text: `Devin 已把改动推上分支（本地已快进至 ${head.slice(0, 12)}），但答复里没有 PR 行：${text.slice(0, 300)}` };
-    return { kind: 'done', text: sha ? text : `${text}\nSHA: ${head}` };
+    // 公司收尾以远端分支实际 HEAD 为准：Devin 声明的 SHA 不一致时改写并注明。
+    if (!sha) return { kind: 'done', text: `${text}\nSHA: ${head}` };
+    if (head.startsWith(sha)) return { kind: 'done', text };
+    return { kind: 'done',
+      text: `${text.replace(/^SHA:\s*\S+/im, `SHA: ${head}`)}\n（Devin 声明的 SHA ${sha} 与远端分支实际 HEAD 不一致，以实际 HEAD 为准）` };
   } catch (error) {
     if (!pr && !sha) return { kind: 'blocked', text: `Devin 未在分支 ${repo.branch} 上留下可快取的改动：${text.slice(0, 300)}` };
     return { kind: 'error', text: (error as Error).message };
