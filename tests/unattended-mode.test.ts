@@ -8,6 +8,7 @@ test('every staffable provider maps to its unattended Paseo mode', () => {
   expect(UNATTENDED_MODE.claude).toBe('bypassPermissions');
   expect(UNATTENDED_MODE.devin).toBe('bypass');
   expect(UNATTENDED_MODE['factory-droid']).toBe('auto-high');
+  expect(UNATTENDED_MODE['devin-paseo']).toBe('bypass');
   // grok 无 mode 概念，刻意缺席。
   expect('grok' in UNATTENDED_MODE).toBe(false);
 });

@@ -94,4 +94,6 @@
 - **Muse Code（provider `muse`）**：Paseo 内置 provider。安装并登录后重跑 install.sh，脚本会把包装脚本写进其 command 并启用；未安装则跳过。
 - **Factory 双模式（provider `factory-paseo`）**：与原生 `factory-droid` 并存的 Paseo ACP 入口（同一 droid 包装脚本、`exec --output-format acp-daemon`），install.sh 自动创建。两个 provider id 走同一份订阅：额度窗口、耗尽冷却与「优先订阅」判定都按订阅合并，任一侧耗尽另一侧同步冷却；`preferredProvider` 设任一个，另一个也算优先候选。
 
-`factory-paseo`、`grok`、`muse` 不路由（不在 runtime-routes.json 出现），由 Paseo 直接派工。
+- **Devin（provider `devin-paseo`）**：老板自己的 `devin` provider 保持原样；公司员工用独立的 `devin-paseo`（`sandbox/bin/devin acp`），install.sh 自动创建，与 `devin` 共用订阅额度与耗尽冷却。Devin 不走云端模式。
+
+`factory-paseo`、`grok`、`muse`、`devin-paseo` 不路由（不在 runtime-routes.json 出现），由 Paseo 直接派工。

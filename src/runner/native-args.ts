@@ -18,7 +18,7 @@ export const NATIVE_PROVIDERS: readonly NativeProvider[] = ['claude', 'factory-d
 export const isNativeProvider = (provider: string): provider is NativeProvider => (NATIVE_PROVIDERS as readonly string[]).includes(provider);
 
 /** Paseo mode needed for unattended work; grok exposes no modes. 原生启动沿用同一模式。 */
-export const UNATTENDED_MODE: Record<string, string | undefined> = { codex: 'full-access', claude: 'bypassPermissions', devin: 'bypass', 'factory-droid': 'auto-high', 'factory-paseo': 'auto-high' };
+export const UNATTENDED_MODE: Record<string, string | undefined> = { codex: 'full-access', claude: 'bypassPermissions', devin: 'bypass', 'factory-droid': 'auto-high', 'factory-paseo': 'auto-high', 'devin-paseo': 'bypass' };
 
 /** CLI 参数来自原生非交互入口，不经 ACP，不把 prompt 放在进程参数中。 */
 export function nativeArgs(s: { provider: NativeProvider; nativeSessionId?: string; model: string; thinking?: string; mode?: string }): string[] {

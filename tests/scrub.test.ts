@@ -302,6 +302,13 @@ describe('employee sandbox gate', () => {
     expect(sandboxGap('muse', file, wrappers)).toContain('install.sh');
   });
 
+  test('devin-paseo needs the sandbox wrapper; the owner\'s own devin provider is not a company provider', () => {
+    const wrapped = config({ 'devin-paseo': { command: ['/svc/sandbox/bin/devin', 'acp'] } });
+    expect(sandboxGap('devin-paseo', wrapped, wrappers)).toBeUndefined();
+    const plain = config({ 'devin-paseo': { command: ['devin', 'acp'] } });
+    expect(sandboxGap('devin-paseo', plain, wrappers)).toContain('install.sh');
+  });
+
   test('an interactive company session the sandbox does not cover is refused; history and other agents are not', async () => {
     const h = hook({}, { sandbox: provider => provider === 'claude' ? undefined : 'not covered' });
     await expect(h.open({ ...base, provider: 'codex', reason: 'create', env: { SCK_COMM_DIR: '/c' } })).rejects.toThrow('员工沙箱');
