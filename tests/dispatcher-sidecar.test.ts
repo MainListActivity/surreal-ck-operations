@@ -1,3 +1,4 @@
+import { PaseoCliError } from '../src/dispatcher/paseo.ts';
 import { NativeRuntime } from '../src/runner/native.ts';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
@@ -59,6 +60,7 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
       attempt.activation_state = 'calling';
     },
     confirmDispatchActivation: async (id: string) => { attempts.get(id)!.activation_state = 'activated'; },
+    rejectDispatchAttempt: async (id: string) => { attempts.delete(id); },
     finishDispatchAttempt: async (id: string, agent: string) => {
       const attempt = attempts.get(id)!;
       await messages.markSent(attempt.message ?? 'fixture');
@@ -1041,6 +1043,33 @@ describe('派工外部副作用不确定状态', () => {
     expect(w.spawnBodies).toHaveLength(1);
     expect(failureResult).toBeInstanceOf(Error);
     expect(failureResult.message).toContain('reply lost');
+  });
+  const refusal = (message: string) => new PaseoCliError('paseo run failed (exit 1): …',
+    `Warning: --background (-d) is deprecated. Use --no-wait instead.\nUsing workspace wks_x\n${JSON.stringify({ error: { code: 'AGENT_CREATE_FAILED', message } }, null, 2)}\n`, false);
+  test('插件 agent.open.before 拒绝建会话：派工记录结案，按普通 spawn 失败收回并退休', async () => {
+    const w = world(); w.addTask('open-refused');
+    w.paseo.spawn = async () => { throw refusal('Failed to create agent: Plugin sck-company agent.open.before failed: 公司会话必须在员工沙箱中启动：provider factory-paseo 无法放进员工沙箱'); };
+    await w.dispatcher().tick();
+    expect(w.attempts.size).toBe(0);
+    expect(w.events.some(e => e.startsWith('release:'))).toBe(true);
+    expect(w.events.some(e => e.startsWith('retire:'))).toBe(true);
+  });
+  test('非插件原因的 AGENT_CREATE_FAILED（会话可能已建）仍按不确定保留', async () => {
+    const w = world(); w.addTask('create-failed-other');
+    w.paseo.spawn = async () => { throw refusal('Failed to create agent: socket closed'); };
+    const failureResult = await w.dispatcher().tick().then(() => undefined, error => error);
+    expect(failureResult).toBeInstanceOf(Error);
+    expect(w.attempts.size).toBe(1);
+    expect(w.events.some(e => /^(release|retire|revoke|performance-failure):/.test(e))).toBe(false);
+  });
+  test('结案写入失败时仍按不确定保留，不释放', async () => {
+    const w = world(); w.addTask('open-refused-settle-lost');
+    w.paseo.spawn = async () => { throw refusal('Failed to create agent: Plugin sck-company agent.open.before failed: denied'); };
+    w.wf.rejectDispatchAttempt = async () => { throw new Error('rejection write lost'); };
+    const failureResult = await w.dispatcher().tick().then(() => undefined, error => error);
+    expect(failureResult).toBeInstanceOf(Error);
+    expect(w.attempts.size).toBe(1);
+    expect(w.events.some(e => /^(release|retire|revoke|performance-failure):/.test(e))).toBe(false);
   });
   test('写前日志失败不得调用运行端；日志查询失败不得开始派工', async () => {
     const w = world(); w.addTask('journal-failure');

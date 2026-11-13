@@ -685,6 +685,30 @@ export class Workforce {
     await this.db.query(`BEGIN; ${dispatchFinalizationSql} COMMIT;`, { attempt: id('dispatch_attempt', attempt), agent });
   }
 
+  /**
+   * The runtime refused a spawn before any session existed (see isOpenRefused): nothing was delivered, so the
+   * barrier is lifted without a delivery. Only an unacknowledged spawn (no agent, revision 0) qualifies; the
+   * message stays a draft and the lease is left for the caller's normal claim release.
+   */
+  async rejectDispatchAttempt(attempt: string, reason: string): Promise<void> {
+    await this.db.query(`BEGIN;
+      LET $a = SELECT * FROM ONLY $attempt;
+      IF $a = NONE OR $a.state != 'pending' OR $a.kind != 'spawn' OR $a.agent != NONE OR $a.revision != 0 OR $a.result_confirmed = true { THROW 'dispatch rejection conflict' };
+      LET $task = type::record('task', $a.task);
+      LET $employee = type::record('employee', $a.employee);
+      LET $message = type::record('outbound_message', $a.message);
+      LET $t = SELECT * FROM ONLY $task;
+      LET $e = SELECT * FROM ONLY $employee;
+      LET $msg = SELECT * FROM ONLY $message;
+      IF $t.dispatch_attempt != $attempt OR $e.dispatch_attempt != $attempt OR $msg.dispatch_attempt != $attempt { THROW 'dispatch rejection generation changed' };
+      IF $e.paseo_agent_id != NONE { THROW 'dispatch rejection agent bound' };
+      UPDATE ONLY $attempt SET state = 'rejected', revision += 1, rejected_at = time::now(), rejected_reason = $reason;
+      UPDATE ONLY $message SET dispatch_body = NONE, dispatch_attempt = NONE;
+      UPDATE ONLY $employee SET dispatch_attempt = NONE;
+      UPDATE ONLY $task SET dispatch_attempt = NONE;
+      COMMIT;`, { attempt: id('dispatch_attempt', attempt), reason: reason.slice(0, 500) });
+  }
+
   async pendingDispatchAttempts(): Promise<Array<{ id: string; employee: string; task?: string; kind: string; agent?: string; revision?: number; result_confirmed?: boolean; activationRequired?: boolean; activation_state?: string }>> {
     const [rows] = await this.db.query<[Array<{ id: RecordId; employee: string; task?: string; kind: string; agent?: string; revision?: number; result_confirmed?: boolean; activationRequired?: boolean; activation_state?: string }>]>(
       "SELECT * FROM dispatch_attempt WHERE state = 'pending';");
