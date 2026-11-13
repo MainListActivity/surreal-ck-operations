@@ -10,11 +10,22 @@ test('独立服务离线安装支持含空格和引号的路径，不改变路�
   try {
     mkdirSync(join(home,'current/server/vendor/src/runner'),{recursive:true});mkdirSync(join(home,'bin'));
     writeFileSync(join(home,'current/server/vendor/src/runner/run.ts'),'');writeFileSync(join(home,'bin/bun-runtime.sh'),'');
-    const config=join(home,'config.json');writeFileSync(config,JSON.stringify({commands:{claude:['/fixture/claude']}}));
+    const config=join(home,'config.json');writeFileSync(config,JSON.stringify({
+      commands:{claude:['/fixture/claude','/extra/bun'],'codex-cloud':['/fixture/launch.sh','/extra/bun']},
+      lanes:{'codex-cloud':{bin:{codex:'/Users/y/node/bin/codex',gh:'/fixture/gh'}}},
+    }));
     for(const platform of ['darwin','linux']){
       const path=installNativeService({home,userHome:home,id:'fixture',config,platform,load:false});
       const text=readFileSync(path,'utf8');expect(text).not.toContain('StartInterval');expect(text).not.toContain('[Timer]');
       execFileSync('/bin/sh',['-n',join(home,'bin/native-fixture.sh')]);
+      // commands 与 lanes.*.bin 里绝对路径的目录追加进服务 PATH（去重、既有条目在前）。
+      const launcher=readFileSync(join(home,'bin/native-fixture.sh'),'utf8');
+      expect(launcher).toContain('/Users/y/node/bin');
+      expect(launcher.split('/fixture').length-1).toBeGreaterThan(0);
+      expect(launcher.split(':/extra').length-1).toBe(1);   // dedupe：/extra 只出现一次
+      // 既有条目在前：最后一个标准目录 /sbin 仍在所有新增目录之前。
+      const pathLine=(launcher.match(/^export PATH='(.+)'$/m)??[])[1]!;
+      expect(pathLine.indexOf('/sbin')).toBeLessThan(pathLine.indexOf('/Users/y/node/bin'));
     }
     expect(existsSync(join(home,'private/runtime-routes.json'))).toBe(false);
     expect(()=>installNativeService({home,userHome:home,id:'../bad',config,platform:'darwin',load:false})).toThrow();

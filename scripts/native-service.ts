@@ -1,6 +1,6 @@
 // Install the independent runtime as a supervised service (no scheduler). Configuration contains paths, never credentials.
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
-import { join, isAbsolute } from 'node:path';
+import { dirname, join, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { serviceHome } from '../src/runner/env.ts';
@@ -17,8 +17,18 @@ export function installNativeService(options: {home: string; userHome: string; i
   const dir = join(home,'native',id); mkdirSync(dir,{recursive:true,mode:0o700});
   mkdirSync(join(home,'logs'),{recursive:true,mode:0o700});
   // The employee sandbox forbids writes to bin; launchd must never execute an employee-writable file.
+  // Configured absolute commands (native-runner.json commands / lanes.*.bin) may sit outside the stock
+  // PATH (the codex CLI at ~/node/bin was the case in production), so their directories join the service
+  // PATH after the stock entries, keeping the existing resolution order first.
+  const basePath = [join(userHome,'.local/bin'), join(userHome,'.bun/bin'), '/opt/homebrew/bin','/usr/local/bin','/usr/bin','/bin','/usr/sbin','/sbin'];
+  const binDirs = new Set<string>();
+  for (const command of Object.values((parsed.commands ?? {}) as Record<string, string[]>))
+    for (const part of command ?? []) if (typeof part === 'string' && isAbsolute(part)) binDirs.add(dirname(part));
+  for (const lane of Object.values((parsed.lanes ?? {}) as Record<string, {bin?: Record<string,string>}>))
+    for (const path of Object.values(lane?.bin ?? {})) if (typeof path === 'string' && isAbsolute(path)) binDirs.add(dirname(path));
+  const servicePath = [...basePath, ...[...binDirs].filter(dir => !basePath.includes(dir))].join(':');
   const launcher = join(home,'bin',`native-${id}.sh`);
-  writeFileSync(launcher, `#!/bin/sh\nset -eu\nexport SCK_SERVICE_HOME=${quote(home)}\nexport SCK_RUNNER_ID=${quote(id)}\nexport SCK_NATIVE_CONFIG=${quote(config)}\nexport SCK_NATIVE_FOLLOW_CURRENT=1\nexport PATH=${quote(join(userHome,'.local/bin') + ':' + join(userHome,'.bun/bin') + ':/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin')}\n. ${quote(join(home,'bin/bun-runtime.sh'))}\nresolve_bun "$SCK_SERVICE_HOME"\ncd "$SCK_SERVICE_HOME/current"\nexec "$BUN" "$SCK_SERVICE_HOME/current/server/vendor/src/runner/run.ts"\n`, {mode:0o700});
+  writeFileSync(launcher, `#!/bin/sh\nset -eu\nexport SCK_SERVICE_HOME=${quote(home)}\nexport SCK_RUNNER_ID=${quote(id)}\nexport SCK_NATIVE_CONFIG=${quote(config)}\nexport SCK_NATIVE_FOLLOW_CURRENT=1\nexport PATH=${quote(servicePath)}\n. ${quote(join(home,'bin/bun-runtime.sh'))}\nresolve_bun "$SCK_SERVICE_HOME"\ncd "$SCK_SERVICE_HOME/current"\nexec "$BUN" "$SCK_SERVICE_HOME/current/server/vendor/src/runner/run.ts"\n`, {mode:0o700});
   if (platform === 'darwin') {
     const label = `org.surrealck.native.${id}`;
     const parent = join(userHome,'Library/LaunchAgents'); mkdirSync(parent,{recursive:true});

@@ -4,7 +4,7 @@
  * 测试可以完全不触网不碰 git 跑通各分支。
  */
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { isLaneProvider, type LaneProvider } from '../native-args.ts';
 import { laneDigest, readLaneState, writeLaneState, type LaneState } from './state.ts';
 import { repoInfo, type ExecFn, type RepoInfo } from './repo.ts';
@@ -25,6 +25,28 @@ export interface LaneConfig {
   maxMinutes?: number;
   /** 测试用：轮询间隔毫秒，默认 25000。 */
   pollMs?: number;
+  /** 命令名 → 绝对路径（codex、devin、gh、git 等）；配置后按此路径执行，其所在目录前置进子进程 PATH。 */
+  bin?: Record<string, string>;
+}
+
+/** native-runner.json 的 lanes 段校验；执行端启动时调用，配置非法直接拒绝启动。 */
+export function validateLanes(lanes: unknown): asserts lanes is Partial<Record<LaneProvider, LaneConfig>> {
+  for (const [provider, lane] of Object.entries((lanes ?? {}) as Record<string, unknown>)) {
+    if (!isLaneProvider(provider) || !lane || typeof lane !== 'object')
+      throw new Error('原生执行端 lanes 配置无效：只允许 codex-cloud、devin-cloud、jules');
+    for (const [key, value] of Object.entries(lane as Record<string, unknown>)) {
+      if (key === 'environments') {
+        if (!value || typeof value !== 'object' || Array.isArray(value) ||
+          Object.entries(value as Record<string, unknown>).some(([repo, env]) => !/^[\w.-]+\/[\w.-]+$/.test(repo) || typeof env !== 'string' || !env))
+          throw new Error(`lanes.${provider}.environments 必须是 "owner/repo" → 环境 ID/标签 的映射`);
+      } else if (key === 'bin') {
+        if (!value || typeof value !== 'object' || Array.isArray(value) ||
+          Object.entries(value as Record<string, unknown>).some(([name, path]) => !/^[a-zA-Z0-9._-]+$/.test(name) || typeof path !== 'string' || !isAbsolute(path)))
+          throw new Error(`lanes.${provider}.bin 必须是命令名 → 绝对路径 的映射`);
+      } else if (!['dailyLimit', 'maxConcurrent', 'maxMinutes', 'pollMs'].includes(key) || typeof value !== 'number' || !(value > 0))
+        throw new Error(`lanes.${provider}.${key} 必须是正数`);
+    }
+  }
 }
 
 export interface LaneDeps {

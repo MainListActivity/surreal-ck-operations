@@ -1,16 +1,15 @@
 {
-  "version": "0.12.1",
-  "title": "优先订阅可配置（preferred_provider）",
+  "version": "0.12.2",
+  "title": "云端通道可执行文件定位与失败原因（lanes.bin）",
   "changes": [
-    "派工的「Factory 优先」改为公司配置 preferred_provider（company_meta:config，camel preferredProvider）：该订阅还有合格候选时新任务保留等待（沿用 factory_wait 与 3 个等待名额），额度耗尽或健康冷却自动回退按权重分流。",
-    "preferred_provider 设为 \"\" 表示不设优先：没有保留队列、没有 factory_wait 门槛、没有优先挑选，所有合格候选纯按派工权重竞争；缺省仍为 factory-droid，旧行为不变。",
-    "保留等待与分流说明的文案改为指名实际优先订阅（如「优先订阅 codex-cloud …」），阻塞码 factory_wait 保持不变。",
-    "老板命令新增 dispatch.preference（group 员工与权限，provider? 参数）：不传读当前值，传入合法供应商编号或 \"\" 则写入并记审计；admin config preferred_provider 增加取值校验；员工页「职能」面板新增「优先订阅」下拉。"
+    "native-runner.json 的 lanes.<通道> 新增 bin 配置：命令名 → 绝对路径（codex、devin、gh、git 等），不在服务 PATH 里的 CLI 按此路径执行，其所在目录前置进子进程 PATH，node shim 找得到同目录 node。",
+    "通道子进程拿不到退出码时（ENOENT、EACCES、超时/被终止）把可读原因写进 stderr，「Codex Cloud 提交失败」等错误文案不再空白。",
+    "重装服务脚本（scripts/native-service.ts）把 commands 与 lanes.*.bin 里绝对路径的目录并入服务 PATH（追加在既有条目之后、去重）。",
+    "云端通道文档补充 bin 配置示例与「找不到可执行文件」排查项。"
   ],
   "impact": [
-    "派工与执行：等待队列、候选门槛、挑选与开新顺序全部按配置的优先订阅判定；roster 预览文案随配置变化。",
-    "老板端：员工页新增优先订阅下拉；命令目录新增 dispatch.preference。"
+    "执行端：服务 PATH 与通道子进程环境包含配置的二进制目录；通道失败文本带原因，不再因空原因重复失败自动停用员工定义。"
   ],
-  "migration": "无 schema 变更（沿用 schema 067）。存量部署不写 preferred_provider 即维持原「Factory 优先」；要改用云端通道优先可执行 admin config preferred_provider '\"codex-cloud\"' 或在员工页选择。",
-  "rollback": "回退至 v0.12.0；或先把 preferred_provider 设回 \"factory-droid\"（或删除该键）再回退，行为与旧版一致。"
+  "migration": "无 schema 变更（沿用 schema 067）。已按 0.12.x 部署的节点在 native-runner.json 给缺失的 CLI 配置 lanes.<通道>.bin 并重装服务即可；不配则行为同 0.12.1。",
+  "rollback": "回退至 v0.12.1；lanes.*.bin 配置在旧版校验中会被拒绝，回退前先从 native-runner.json 移除该键并重装服务。"
 }

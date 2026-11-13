@@ -7,7 +7,7 @@ import { loadNativeOwnerCredential, loadServiceEnv, serviceHome } from './env.ts
 import { NativeRuntime, type NativeProvider } from './native.ts';
 import { isLaneProvider, LANE_PROVIDERS, type LaneProvider } from './native-args.ts';
 import { julesUsageEntry, readCodexCloudUsage } from './cloud-lane/quota.ts';
-import type { LaneConfig } from './cloud-lane/lane.ts';
+import { validateLanes, type LaneConfig } from './cloud-lane/lane.ts';
 import { RuntimeEventsBus } from './events.ts';
 import type { RuntimeHost } from './host.ts';
 import { scrubEnv, SANDBOX_MARKER, installZdot, userZshDir, externalPatterns } from './launch-env.ts';
@@ -33,18 +33,7 @@ for (const [provider, command] of Object.entries(config.commands ?? {})) {
     throw new Error('原生执行端 commands 配置无效；每个命令必须是以绝对路径开头的参数数组');
   }
 }
-for (const [provider, lane] of Object.entries(config.lanes ?? {})) {
-  if (!isLaneProvider(provider) || !lane || typeof lane !== 'object')
-    throw new Error('原生执行端 lanes 配置无效：只允许 codex-cloud、devin-cloud、jules');
-  for (const [key, value] of Object.entries(lane)) {
-    if (key === 'environments') {
-      if (!value || typeof value !== 'object' || Array.isArray(value) ||
-        Object.entries(value as Record<string, unknown>).some(([repo, env]) => !/^[\w.-]+\/[\w.-]+$/.test(repo) || typeof env !== 'string' || !env))
-        throw new Error(`lanes.${provider}.environments 必须是 "owner/repo" → 环境 ID/标签 的映射`);
-    } else if (!['dailyLimit', 'maxConcurrent', 'maxMinutes', 'pollMs'].includes(key) || typeof value !== 'number' || !(value > 0))
-      throw new Error(`lanes.${provider}.${key} 必须是正数`);
-  }
-}
+validateLanes(config.lanes);
 // 通道级状态目录：桥接进程（沙箱内可写）与额度读取（沙箱外可读）共用。
 const laneStateRoot = join(serviceHome(), 'native', hostId, 'lanes');
 /** 通道供应商的私密环境变量：沙箱外由执行端读取 private/lanes/<provider>.env（KEY=VALUE），桥接进程只继承变量不读文件。 */
