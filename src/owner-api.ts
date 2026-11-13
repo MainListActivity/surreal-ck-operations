@@ -306,7 +306,8 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       }
       return { policy: (await ctx.workforce.config()).sessionPolicy };
     }
-    case 'def.list': return { defs: await ctx.workforce.defs() };
+    // 老板端看全量编制：defs() 被 company.ts 按路由过滤后只剩本端可见的 provider。
+    case 'def.list': return { defs: await ctx.workforce.allDefs() };
     case 'quota.list': {
       // 与 quota-store 同一谓词：连字符 provider 的 id 打印为 company_meta:⟨quota_codex-cloud⟩，
       // 对整行字符串做前缀测试会漏掉这些行，必须只取记录名比较。
@@ -320,7 +321,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       const role = text(input.role, 'role') as Role;
       if (!ROLES.includes(role)) throw new CompanyError('invalid', 'unknown role');
       // 修改已有定义时，没有给出的字段保持原值（thinking 传 null 才清空）；启用状态只经 enabled 或 def.enable/def.disable 改变。
-      const existing = (await ctx.workforce.defs()).find((def) => def.id === defId);
+      const existing = (await ctx.workforce.allDefs()).find((def) => def.id === defId);
       const count = (value: unknown, field: string): number | undefined => {
         if (value === undefined) return undefined;
         if (typeof value !== 'number' || !Number.isInteger(value)) throw new CompanyError('invalid', `${field} invalid`);

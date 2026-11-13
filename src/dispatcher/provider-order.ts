@@ -1,3 +1,5 @@
+import { sameSubscription } from '../provider-admission.ts';
+
 /** Factory runs its native agent first; this orders only candidates already admitted by staffing rules. */
 export const FACTORY_PROVIDER = 'factory-droid';
 
@@ -9,7 +11,8 @@ export const FACTORY_PROVIDER = 'factory-droid';
 export type PreferredProvider = string;
 
 export function factoryFirst<T extends {provider?: string}>(rows: readonly T[], provider: PreferredProvider = FACTORY_PROVIDER): T[] {
-  return [...rows].sort((a,b)=>Number(b.provider===provider)-Number(a.provider===provider));
+  // 优先订阅按订阅合并：factory-paseo 与 factory-droid 同一订阅，谁优先两边都算优先。
+  return [...rows].sort((a,b)=>Number(sameSubscription(b.provider,provider))-Number(sameSubscription(a.provider,provider)));
 }
 
 /** Owner-facing text for a task held back while the preferred subscription still has quota. */

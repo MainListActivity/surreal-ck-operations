@@ -34,6 +34,10 @@ const PROVIDERS: ReadonlyArray<{ value: string; label: string }> = [
   { value: 'codex-cloud', label: 'Codex Cloud（ChatGPT 云端）' },
   { value: 'devin-cloud', label: 'Devin Cloud（云端）' },
   { value: 'jules', label: 'Jules（Google AI Pro 云端）' },
+  { value: 'factory-paseo', label: 'Factory Droid（Paseo 模式）' },
+  { value: 'warp', label: 'Warp Build（原生执行端）' },
+  { value: 'grok', label: 'Grok Build（经 Paseo）' },
+  { value: 'muse', label: 'Muse Code（经 Paseo）' },
 ];
 
 const CLAUDE_MODELS = ['claude-fable-5-2', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'];
@@ -46,6 +50,10 @@ const MODELS: Record<string, string[]> = {
   'codex-cloud': ['default'],
   'devin-cloud': ['default'],
   jules: ['default'],
+  'factory-paseo': CLAUDE_MODELS,
+  warp: ['default'],
+  grok: ['grok-4.6'],
+  muse: ['default'],
 };
 
 const EFFORTS: ReadonlyArray<{ value: string; label: string }> = [

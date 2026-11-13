@@ -33,7 +33,7 @@ export interface LaneConfig {
 export function validateLanes(lanes: unknown): asserts lanes is Partial<Record<LaneProvider, LaneConfig>> {
   for (const [provider, lane] of Object.entries((lanes ?? {}) as Record<string, unknown>)) {
     if (!isLaneProvider(provider) || !lane || typeof lane !== 'object')
-      throw new Error('原生执行端 lanes 配置无效：只允许 codex-cloud、devin-cloud、jules');
+      throw new Error('原生执行端 lanes 配置无效：只允许 codex-cloud、devin-cloud、jules、warp');
     for (const [key, value] of Object.entries(lane as Record<string, unknown>)) {
       if (key === 'environments') {
         if (!value || typeof value !== 'object' || Array.isArray(value) ||
@@ -45,6 +45,8 @@ export function validateLanes(lanes: unknown): asserts lanes is Partial<Record<L
           throw new Error(`lanes.${provider}.bin 必须是命令名 → 绝对路径 的映射`);
       } else if (!['dailyLimit', 'maxConcurrent', 'maxMinutes', 'pollMs'].includes(key) || typeof value !== 'number' || !(value > 0))
         throw new Error(`lanes.${provider}.${key} 必须是正数`);
+      if (provider === 'warp' && !['bin', 'maxMinutes'].includes(key))
+        throw new Error(`lanes.warp 只接受 bin 与 maxMinutes，收到 ${key}`);
     }
   }
 }
@@ -144,8 +146,9 @@ async function drive(ctx: {
 /**
  * 通道的任务工作树：claim.json 里派工分配的 worktree（code 任务是独立 task/<id8> 分支工作树）。
  * 会话 cwd 可能是共享主 checkout（老板可能在用），通道绝不在那上面执行 git/供应商命令。
+ * warp 等本地通道也复用：有 claim 工作树就用它，没有则退回会话 cwd（本地 agent 不代公司做提交）。
  */
-function claimWorktree(commDir: string): { path: string; branch: string } | { blocked: string } {
+export function claimWorktree(commDir: string): { path: string; branch: string } | { blocked: string } {
   let claim: { worktree?: { worktreePath?: unknown; branch?: unknown } } | undefined;
   try { claim = JSON.parse(readFileSync(join(commDir, 'claim.json'), 'utf8')); } catch { /* 缺 claim.json */ }
   const worktree = claim?.worktree;
@@ -163,6 +166,7 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
   const fail = (text: string): LaneOutcome => ({ sessionId, status: 'error', text });
   const blocked = (text: string): LaneOutcome => ({ sessionId, status: 'success', text: `${BLOCKED}：${text}` });
   if (!isLaneProvider(input.provider)) return fail(`未知云端通道：${input.provider}`);
+  if (input.provider === 'warp') return fail('warp 走本地桥接进程（src/runner/warp/main.ts），不经云端通道');
 
   // 云端命令只允许在派工分配的任务工作树里执行；没有可用工作树时一个 git/供应商命令都不发。
   const worktree = claimWorktree(input.commDir);

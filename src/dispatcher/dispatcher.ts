@@ -97,7 +97,7 @@ export type InstState = 'busy' | 'idle' | 'sleeping' | 'down' | 'exhausted' | 'u
 
 // Provider admission (quota floors + health window) lives in src/provider-admission.ts so the FV06
 // both readers of this pool read the exact same gate — the faces cannot drift.
-import { availabilityOf, quotaBlockedProviders } from '../provider-admission.ts';
+import { availabilityOf, quotaBlockedProviders, sameSubscription, subscriptionPeers } from '../provider-admission.ts';
 export { availabilityOf, quotaBlockedProviders };
 
 /** Per role: how many enabled seats can take work right now (provider quota and health), and why the rest cannot. */
@@ -122,10 +122,11 @@ export function providerCapacity(provider: string, providerMax: Record<string, n
   // An exempt def opts out of the quota/health gates but never out of the seat cap: seats are
   // physical, and unbounded concurrency would starve every other def on the same provider.
   if (quotaExempt) return busy < (providerMax[provider] ?? 1);
-  if (quotaBlocked?.has(provider)) return false;
-  const availability = availabilityOf(health.get(provider), now);
-  if (availability === 'down') return false;
-  return availability === 'probe' ? busy === 0 : busy < (providerMax[provider] ?? 1);
+  // Quota windows and exhaustion bill the subscription: any peer's block or cooldown cools them all.
+  for (const peer of subscriptionPeers(provider))
+    if (quotaBlocked?.has(peer) || availabilityOf(health.get(peer), now) === 'down') return false;
+  const probing = subscriptionPeers(provider).some(peer => availabilityOf(health.get(peer), now) === 'probe');
+  return probing ? busy === 0 : busy < (providerMax[provider] ?? 1);
 }
 
 /** A candidate's block: its stable code, the owner-facing text, and the recovery time (ISO 8601) when one is provable. */
@@ -212,7 +213,7 @@ export function factoryWorkKey(role: string, task: SupervisedTask, review = fals
 }
 
 export function factoryConfigured(defs: readonly EmployeeDef[], role: string, task?: SupervisedTask, provider = FACTORY_PROVIDER): boolean {
-  return defs.some(def => def.enabled && def.provider === provider && def.role === role && trackOkFor(role as Role,task,def.tracks));
+  return defs.some(def => def.enabled && sameSubscription(def.provider, provider) && def.role === role && trackOkFor(role as Role,task,def.tracks));
 }
 
 /**
@@ -233,12 +234,17 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
    */
   const quotaOf = (provider: string, exempt = false): Block | undefined => {
     if (exempt) return undefined;
-    const floor = p.quotaBlocked.get(provider);
-    if (floor) return ['quota', floor];
-    const health = p.health.get(provider);
-    if (availabilityOf(health, p.now) !== 'down') return undefined;
-    const until = new Date((health?.until ?? 0) * 1000).toISOString();
-    return ['quota', `${BLOCK_TEXT.quota}，恢复时间 ${until}`, until];
+    for (const peer of subscriptionPeers(provider)) {
+      const floor = p.quotaBlocked.get(peer);
+      if (floor) return ['quota', floor];
+    }
+    for (const peer of subscriptionPeers(provider)) {
+      const health = p.health.get(peer);
+      if (availabilityOf(health, p.now) !== 'down') continue;
+      const until = new Date((health?.until ?? 0) * 1000).toISOString();
+      return ['quota', `${BLOCK_TEXT.quota}，恢复时间 ${until}`, until];
+    }
+    return undefined;
   };
   /** A session that is not ready: unknown, quota-exhausted, or busy/abnormal. Each one is a different owner action. */
   const notReady = (state: InstState | undefined, provider: string): Block => {
@@ -269,7 +275,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       const quota = quotaOf(provider);
       if (quota) return quota;
       if (p.qualificationOnly) return undefined;
-      if (availabilityOf(p.health.get(provider), p.now) === 'probe') {
+      if (subscriptionPeers(provider).some(peer => availabilityOf(p.health.get(peer), p.now) === 'probe')) {
         return (p.busyBy.get(provider) ?? 0) === 0 ? undefined : ['probe_busy', BLOCK_TEXT.probe_busy];
       }
     }
@@ -337,15 +343,15 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
   const position = p.task ? p.factoryQueue?.get(factoryWorkKey(p.role,p.task,!!p.excludeSubmitter)) : undefined;
   const factoryOnly = !!preferred && !p.qualificationOnly &&
     (!p.task || !p.factoryQueue || (position !== undefined && position <= FACTORY_WAIT_LIMIT)) &&
-    factoryConfigured(p.defs,p.role,p.task,preferred) && staffingPool({...p,qualificationOnly:true}).some(entry=>entry.provider===preferred && entry.eligible);
+    factoryConfigured(p.defs,p.role,p.task,preferred) && staffingPool({...p,qualificationOnly:true}).some(entry=>sameSubscription(entry.provider,preferred) && entry.eligible);
   if(factoryOnly) for(const entry of entries) {
-    if(entry.provider === preferred || !entry.eligible) continue;
+    if(sameSubscription(entry.provider,preferred) || !entry.eligible) continue;
     entry.eligible=false;
     entry.code='factory_wait';
     entry.reason=position === undefined ? preferredWaitText(preferred) : `${preferredWaitText(preferred)}（第 ${position}/${FACTORY_WAIT_LIMIT} 个保留等待名额）`;
   }
   if(!!preferred && !p.qualificationOnly && position!==undefined && position>FACTORY_WAIT_LIMIT && !quotaOf(preferred)) {
-    for(const entry of entries) if(entry.provider!==preferred && entry.eligible) {
+    for(const entry of entries) if(!sameSubscription(entry.provider,preferred) && entry.eligible) {
       entry.note=[entry.note,`优先订阅 ${preferred} 已保留 ${FACTORY_WAIT_LIMIT} 个等待项，本任务第 ${position} 项允许分流`].filter(Boolean).join('；');
     }
   }
@@ -1514,7 +1520,7 @@ export class Dispatcher {
     const activeOwnerTasks = new Set<string>();
     // no owner wake ownership: owner-blocked work stays in the owner inbox
     const preferred = cfg.preferredProvider;
-    const factoryCanRoute = !!preferred && availabilityOf(health.get(preferred),now) !== 'down' && !quotaBlocked.has(preferred);
+    const factoryCanRoute = !!preferred && subscriptionPeers(preferred).every(peer => availabilityOf(health.get(peer),now) !== 'down' && !quotaBlocked.has(peer));
     const poolBase = { providerAllowed: this.deps.providerAllowed, factoryQueue:undefined as Map<string,number>|undefined, defs, states, holding, health, quotaBlocked, busyBy,
       providerMax: cfg.providerMax, preferredProvider: preferred, slots: slotMap, runtimeModels, opsRepo: this.deps.env.opsRepo,
       sidecar: !!this.deps.sidecar, now };
@@ -1530,7 +1536,7 @@ export class Dispatcher {
       staffingPool({...poolBase,qualificationOnly:true,insts,role:item.role,home:item.task.repoPath??this.deps.env.opsRepo,task:item.task,
         excludeSubmitter:item.review,exclusion:item.review?queueExclusions.get(item.task.id):undefined,
                 })
-        .some(entry=>entry.provider===preferred && entry.eligible))
+        .some(entry=>sameSubscription(entry.provider,preferred) && entry.eligible))
       .map((item,rank)=>({key:factoryWorkKey(item.role,item.task,item.review),rank})));
     this.passInputs.factoryQueue=factoryWaiting;
     poolBase.factoryQueue=factoryWaiting;
@@ -1566,7 +1572,7 @@ export class Dispatcher {
       const eligible = eligibleInsts(role, home, task, excludeSubmitter, exclusion);
       // Oneshot: a task never lands on an unrelated session's context. No continuing session means a new one.
       if (cfg.sessionPolicy === 'oneshot' && task) return continuitySession(eligible, states, task, excludeSubmitter);
-      const factory = preferred ? eligible.filter(i => i.provider === preferred) : [];
+      const factory = preferred ? eligible.filter(i => sameSubscription(i.provider, preferred)) : [];
       const candidates = factory.length ? factory : eligible;
       // A prior hand is demoted in the weighted pick (PRIOR_HAND_WEIGHT_FACTOR), exactly as in the pool.
       const weight = (inst: EmployeeInst) => effectiveWeight(defs.find(d => d.id === inst.def))
@@ -1779,7 +1785,7 @@ export class Dispatcher {
     // reuse or spawn candidate (quota, health, capacity, exclusion), ordinary fallback takes over.
     // A session continuing its own work keeps it: its context is why it was picked.
     const continuing = candidate !== undefined && assignCfg.sessionPolicy === 'oneshot';
-    const picked = !continuing && !!preferredProvider && candidate?.provider !== preferredProvider && defsOrdered.some(d=>d.provider===preferredProvider) ? undefined : candidate;
+    const picked = !continuing && !!preferredProvider && !sameSubscription(candidate?.provider, preferredProvider) && defsOrdered.some(d=>sameSubscription(d.provider,preferredProvider)) ? undefined : candidate;
     const pending = picked && !picked.paseoAgentId ? picked : undefined;
     if (pending) defsOrdered = (await wf.defs()).filter(d => d.id === pending.def && d.enabled && inWorkHours(d.workHours, new Date()));
     const existing = picked?.paseoAgentId && sidecar.canReuse(picked) ? picked : undefined;

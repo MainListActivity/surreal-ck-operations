@@ -111,3 +111,5 @@ SIGINT/SIGTERM 停止派工循环，再停止本执行器拥有的进程组并�
 路由、命令校验、额度熔断与 provider_health 与本地 CLI 完全同构：`runtime-routes.json` 可指派云端 provider；`native-runner.json` 新增可选 `lanes` 配置（环境映射、轮询上限），`private/lanes/<provider>.env` 的私密变量由执行端在沙箱外读出后注入，沙箱内桥接进程不读 private。云端额度经 `listUsage` 上报（codex-cloud 读 wham/usage，jules 按本地记录的 24 小时会话数），读取失败不造数。
 
 回合语义：task.md 与最新复核意见内联进云端 prompt；复核轮强制首行复核结论；非 GitHub 工作树按受阻收尾；在途云端任务按 prompt 摘要重连不重复提交。详见 [cloud-lanes.md](cloud-lanes.md)。
+
+`warp`（Warp Build 的 oz agent）是同构的本地桥接：命令是 `sandbox/launch.sh bun <服务目录>/current/server/vendor/src/runner/warp/main.ts warp`，事件流同为 system/lane_status/result。与云端通道不同的是它在本地工作树里干活（提交/推送由 agent 按公司协议自己在任务分支完成），prompt 正文写进 commDir 的 `.warp/turn-<时间戳>.md`（0600），进程参数只带一句短指令；续轮用 `--conversation <conversation_id>`。`lanes.warp` 只接受 `bin`（如 `{"oz": "/Applications/Warp.app/Contents/Resources/bin/oz"}`）与 `maxMinutes`（默认 120）。Warp 无可读额度端点，保持 unknown。

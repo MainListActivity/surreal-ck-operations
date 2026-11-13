@@ -20,6 +20,8 @@ test('显式原生归属阻止 Paseo 与另一原生节点新派工，不按节�
     const laneRoutes = readProviderRoutes(home);
     expect(ownsProvider(laneRoutes,'jules','native:mac')).toBe(true);
     expect(ownsProvider(laneRoutes,'jules','paseo:legacy')).toBe(false);
+    writeFileSync(join(home,'private/runtime-routes.json'), JSON.stringify({version:1,routes:{warp:'native:mac'}}));
+    expect(ownsProvider(readProviderRoutes(home),'warp','native:mac')).toBe(true);
     writeFileSync(join(home,'private/runtime-routes.json'), '{invalid');
     expect(() => readProviderRoutes(home)).toThrow();
   } finally { rmSync(home,{recursive:true,force:true}); }

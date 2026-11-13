@@ -98,6 +98,9 @@ export class ActivityCollector {
     } else if (provider === 'codex-cloud' || provider === 'devin-cloud' || provider === 'jules') {
       // 云端通道桥接进程的进展行：只取状态短语，不取供应商转录。
       if (e.type === 'lane_status' && typeof e.status === 'string') this.append('status', `云端运行中：${e.status}`, at);
+    } else if (provider === 'warp') {
+      // warp 本地通道桥接的进展行（run_url 等），同样只取状态短语。
+      if (e.type === 'lane_status' && typeof e.status === 'string') this.append('status', e.status, at);
     } else if (provider === 'codex') {
       if (e.type === 'item.completed' && e.item?.type === 'agent_message' && typeof e.item.text === 'string') this.append('output', e.item.text, at);
       if (e.type === 'item.started' && e.item?.type === 'command_execution') this.start(e.item.id, '命令执行', at);
