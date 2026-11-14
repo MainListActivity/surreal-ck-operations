@@ -82,26 +82,45 @@ export interface WebTarget { site: WebSite; botId?: string; threadUrl?: string }
 const LABEL: Record<WebSite, string> = { 'grok-bot': 'Grok Bot', 'muse-web': 'Muse' };
 const LOGIN_HINT: Record<WebSite, string> = { 'grok-bot': 'grok.com', 'muse-web': 'muse.ai' };
 
+const INPUT_SELECTOR: Record<WebSite, string> = {
+  'grok-bot': '[contenteditable=true][role=textbox][aria-label^="Message"]',
+  'muse-web': 'textarea[aria-label="Message"]',
+};
+
 function prelude(t: WebTarget): string {
   const url = t.site === 'grok-bot' ? `https://grok.com/bot/${t.botId}` : (t.threadUrl ?? 'https://muse.ai/');
   const space = t.site === 'grok-bot' ? `sck-grok-bot-${(t.botId ?? '').slice(0, 8)}` : 'sck-muse-web';
   // working：grok 主区末尾 Working / status；muse 有「Stop task」按钮或「is working / typing」状态。
   const working = t.site === 'grok-bot'
-    ? `/(^|\\n)\\s*Working\\s*$/.test((document.querySelector('main') ?? document.body).innerText || '') || [...(document.querySelector('main') ?? document.body).querySelectorAll('[role=status]')].some(e => /Working/.test(e.innerText || ''))`
+    ? `[...document.querySelectorAll('[role=status]')].some(e => /Working/.test((e.innerText || '') + (e.getAttribute('aria-label') || ''))) || [...document.querySelectorAll('body *')].some(e => e.childElementCount === 0 && (e.innerText || '').trim() === 'Working')`
     : `!!document.querySelector('button[aria-label="Stop task"]') || [...document.querySelectorAll('[role=status]')].some(e => /typing|working/i.test((e.innerText || '') + (e.getAttribute('aria-label') || '')))`;
   const login = t.site === 'grok-bot'
-    ? `!location.pathname.startsWith('/bot/') || (/\\b(Sign in|Log in|Sign up)\\b/.test(document.body.innerText.slice(0, 600)) && !document.querySelector('main [contenteditable=true]'))`
+    ? `!location.pathname.startsWith('/bot/') || (/\\b(Sign in|Log in|Sign up)\\b/.test(document.body.innerText.slice(0, 600)) && !document.querySelector('[contenteditable=true][role=textbox]'))`
     : `/Log in or create an account/.test(document.body.innerText.slice(0, 2000)) || !!document.querySelector('input[autocomplete="username"],input[type="tel"]')`;
+  const inputSel = INPUT_SELECTOR[t.site];
+  // grok：输入框比消息先出现（实测先有约 200 字的页面框架，消息节点随后以 visibility:hidden 挂上、再变可见），
+  // 要等到有可见的消息操作按钮；
+  // 全新、还没有任何消息的对话等满 10 轮后按就绪处理。
+  const messageSel = t.site === 'grok-bot' ? 'button[aria-label="More message actions"]' : '';
   return `
 const emit = (r) => { console.log('__RESULT__' + JSON.stringify(r)); };
 const space = await taskSpace(${JSON.stringify(space)});
 const p = (await space.pages())[0] ?? await space.newPage();
 await p.goto(${JSON.stringify(url)});
-await p.waitForTimeout(5000);
+await p.waitForTimeout(3000);
+// 页面就绪：输入框在、消息已渲染、对话文本连续两次读数不变才算加载完；半渲染的页面会被误判成「空闲、没发过」。
+let ready = false, prevLen = -1;
+for (let i = 0; i < 14 && !ready; i++) {
+  const r = await p.evaluate(([sel, msg]) => ({ input: !!document.querySelector(sel), messages: !msg || [...document.querySelectorAll(msg)].some(e => e.checkVisibility({ visibilityProperty: true })), len: (document.body.innerText || '').length }), [${JSON.stringify(inputSel)}, ${JSON.stringify(messageSel)}]);
+  ready = r.input && (r.messages || i >= 10) && r.len > 0 && r.len === prevLen;
+  prevLen = r.input ? r.len : -1;
+  if (!ready) await p.waitForTimeout(1500);
+}
 const read = () => p.evaluate(() => {
   const text = (document.querySelector('main') ?? document.body).innerText || '';
   const all = document.body.innerText || '';
-  const question = [...document.querySelectorAll('main button')].some(b => b.innerText.trim() === 'Skip') && [...document.querySelectorAll('main button')].some(b => /^Submit/.test(b.innerText.trim()));
+  const buttons = [...document.querySelectorAll('button')].map(b => (b.innerText || '').trim());
+  const question = buttons.includes('Skip') && buttons.some(b => /^Submit/.test(b));
   return { text, all, url: location.href, working: ${working}, question, login: ${login} };
 });
 `;
@@ -111,25 +130,36 @@ export function stateScript(t: WebTarget, marker: string): string {
   return `${prelude(t)}
 const s = await read();
 if (s.login) { emit({ ok: false, code: 'login_required' }); process.exit(0); }
+if (!ready) { emit({ ok: false, code: 'not_ready' }); process.exit(0); }
 const TASK = ${JSON.stringify(`[SCK-TASK ${marker}]`)}, DONE = ${JSON.stringify(`[SCK-DONE ${marker}]`)};
 const task = s.all.lastIndexOf(TASK);
-// 终稿：以本轮 DONE 标记开头的最大元素（整条消息气泡），去掉末尾时间戳。
+// 长回复会被折叠成「Show more」：先展开含本轮 DONE 标记的消息，再取终稿。
+const expanded = await p.evaluate((D) => {
+  let n = 0;
+  for (const b of document.querySelectorAll('button')) {
+    if ((b.innerText || '').trim() !== 'Show more') continue;
+    let x = b.parentElement;
+    for (let i = 0; i < 6 && x; i++, x = x.parentElement) if ((x.innerText || '').includes(D)) { b.click(); n++; break; }
+  }
+  return n;
+}, DONE);
+if (expanded) await p.waitForTimeout(1500);
+// 终稿：以本轮 DONE 标记开头的最大元素（整条消息气泡），去掉末尾时间戳和展开/收起按钮字样。
 const done = await p.evaluate((D) => {
   const els = [...document.querySelectorAll('body *')].filter(e => (e.innerText || '').trimStart().startsWith(D));
   if (!els.length) return null;
   const best = els.reduce((a, b) => ((b.innerText || '').length > (a.innerText || '').length ? b : a));
   return (best.innerText || '').trimStart().slice(D.length)
-    .replace(/(\\n\\s*\\d{1,2}:\\d{2}(\\s*[AP]M)?\\s*)+$/i, '').replace(/\\n\\s*Working\\s*$/, '').trim();
+    .replace(/(\\n\\s*(Show (more|less)|\\d{1,2}:\\d{2}(\\s*[AP]M)?)\\s*)+$/i, '').replace(/\\n\\s*Working\\s*$/, '').trim();
 }, DONE);
-emit({ ok: true, sent: task >= 0, working: s.working, question: task >= 0 && s.question, done: task >= 0 ? done : null, tail: task >= 0 ? s.all.slice(task).slice(-600) : '' });
+// 终稿只认本轮 DONE 标记（标记含本轮摘要，唯一），不要求本轮任务消息还在页面上：长对话里旧消息会被移出页面。
+emit({ ok: true, sent: task >= 0, working: s.working, question: task >= 0 && s.question, done, tail: s.all.slice(task >= 0 ? task : -600).slice(-600) });
 `;
 }
 
 export function sendScript(t: WebTarget, marker: string, message: string): string {
   const TASK = JSON.stringify(`[SCK-TASK ${marker}]`);
-  const input = t.site === 'grok-bot'
-    ? `'css:main [contenteditable=true][role=textbox][aria-label^="Message"]'`
-    : `'css:textarea[aria-label="Message"]'`;
+  const input = JSON.stringify(INPUT_SELECTOR[t.site]);
   const open = t.site === 'muse-web' && !t.threadUrl
     // muse：每轮一个新侧聊，不进老板的主对话。
     ? `await p.click('css:button[aria-label="New side chat"]', { label: 'new side chat' });\nawait p.waitForTimeout(3000);\n`
@@ -138,13 +168,16 @@ export function sendScript(t: WebTarget, marker: string, message: string): strin
 const MSG = ${JSON.stringify(message)};
 let s = await read();
 if (s.login) { emit({ ok: false, code: 'login_required' }); process.exit(0); }
+if (!ready) { emit({ ok: false, code: 'not_ready' }); process.exit(0); }
 if (s.all.includes(${TASK})) { emit({ ok: true, already: true, url: s.url }); process.exit(0); }
 if (s.working) { emit({ ok: false, code: 'busy' }); process.exit(0); }
-${open}const target = ${input};
+${open}const target = 'css:' + ${input};
 const found = await p.evaluate((sel) => !!document.querySelector(sel.slice(4)), target);
 if (!found) { emit({ ok: false, code: 'no_input' }); process.exit(0); }
 await p.fill(target, MSG);
 await p.waitForTimeout(500);
+// 按下发送前先打标：脚本之后若超时或崩溃，执行端据此知道「可能已发出」，不再重发。
+console.log('${PRESSED}');
 await p.press(target, 'Enter');
 let url = '';
 for (let i = 0; i < 8; i++) {
@@ -157,18 +190,23 @@ emit({ ok: s.all.includes(${TASK}), code: 'not_echoed', url });
 `;
 }
 
+/** 发送脚本按下 Enter 前打印的标记行：脚本中途失败时据此判断消息可能已发出。 */
+export const PRESSED = '__PRESSED__';
 const THREAD_URL = /^https:\/\/muse\.ai\/thread\/[0-9a-f-]{36}$/;
 function threadFile(commDir: string, marker: string): string { return join(commDir, '.webchat', `${marker}.json`); }
 function readThread(commDir: string, marker: string): string | undefined {
-  try {
-    const url = (JSON.parse(readFileSync(threadFile(commDir, marker), 'utf8')) as { url?: unknown }).url;
-    return typeof url === 'string' && THREAD_URL.test(url) ? url : undefined;
-  } catch { return undefined; }
+  const url = readRecord(commDir, marker).url;
+  return typeof url === 'string' && THREAD_URL.test(url) ? url : undefined;
 }
-function writeThread(commDir: string, marker: string, url: string): void {
+function readRecord(commDir: string, marker: string): { url?: unknown; sent?: unknown; attempt?: unknown } {
+  try { return JSON.parse(readFileSync(threadFile(commDir, marker), 'utf8')) as { url?: unknown; sent?: unknown; attempt?: unknown }; }
+  catch { return {}; }
+}
+function writeRecord(commDir: string, marker: string, patch: { url?: string; sent?: true; attempt?: boolean }): void {
   mkdirSync(join(commDir, '.webchat'), { recursive: true, mode: 0o700 });
-  writeFileSync(threadFile(commDir, marker), JSON.stringify({ url }), { mode: 0o600 });
+  writeFileSync(threadFile(commDir, marker), JSON.stringify({ ...readRecord(commDir, marker), ...patch }), { mode: 0o600 });
 }
+function writeThread(commDir: string, marker: string, url: string): void { writeRecord(commDir, marker, { url }); }
 
 /** 一轮网页 agent 执行：确认可接 → 发送（或识别已发送）→ 轮询到终稿/提问/超时。 */
 export async function runGrokBotTurn(input: GrokBotInput, deps: GrokBotDeps): Promise<GrokBotOutcome> {
@@ -194,29 +232,43 @@ export async function runGrokBotTurn(input: GrokBotInput, deps: GrokBotDeps): Pr
   const loginFail = () => fail(`${LOGIN_HINT[site]} 未登录或登录已过期（需要老板在 ego-browser 里重新登录 ${LOGIN_HINT[site]}）`);
 
   // 发送：对方正忙（老板或上一轮在用）就等它空下来；已有本轮标记则不重发。
-  for (;;) {
+  // 最多发一次：按下发送前先在本地记「已尝试」，之后无论回显是否确认、脚本是否中途失败、执行端是否重启，
+  // 都只等终稿不再发（老板的 bot 里出现重复任务比一轮受阻更糟）。真没发出去时等不到终稿，按受阻收尾。
+  const record = readRecord(input.commDir, marker);
+  const alreadySent = record.sent === true || record.attempt === true;
+  if (alreadySent) deps.progress(`${label} 本轮任务已发出（${marker}），继续等待`);
+  for (; !alreadySent;) {
+    writeRecord(input.commDir, marker, { attempt: true });
     const sent = await deps.browse(sendScript(target, marker, message), 120_000);
+    // 没按下发送（对方忙、页面未就绪、没登录、找不到输入框、浏览器没跑起来）才撤销「已尝试」。
+    const pressed = sent?.ok === true || sent?.code === 'not_echoed' || sent?.code === 'pressed';
+    if (!pressed) writeRecord(input.commDir, marker, { attempt: false });
     if (site === 'muse-web' && typeof sent?.url === 'string' && THREAD_URL.test(sent.url) && !target.threadUrl) {
       // 先记下侧聊地址再看结果：发出去但回显未确认时，重试回到同一侧聊，不另开新侧聊重复发送。
       target.threadUrl = sent.url;
       writeThread(input.commDir, marker, sent.url);
     }
-    if (sent?.ok === true) { deps.progress(sent.already ? `${label} 已有本轮任务 ${marker}，继续等待` : `已发给 ${label}（${marker}）`); break; }
+    if (sent?.ok === true) { writeRecord(input.commDir, marker, { sent: true }); deps.progress(sent.already ? `${label} 已有本轮任务 ${marker}，继续等待` : `已发给 ${label}（${marker}）`); break; }
+    if (pressed) { deps.progress(`${label} 已按下发送但未确认回显（${marker}），不重发，等待终稿`); break; }
     if (sent?.code === 'login_required') return loginFail();
-    if (sent?.code !== 'busy' && sent?.code !== undefined && sent?.code !== 'not_echoed') return fail(`${label} 发送失败：${String(sent.code)}`);
-    if (deps.now() > deadline) return fail(`${label} 在 ${maxMinutes} 分钟内一直没能接收任务（${sent?.code === 'busy' ? '一直在忙' : '发送未成功'}）`);
-    deps.progress(sent?.code === 'busy' ? `${label} 正在忙，等待空闲后发送` : `${label} 发送未确认，稍后重试`);
+    if (sent?.code !== 'busy' && sent?.code !== 'not_ready' && sent?.code !== undefined) return fail(`${label} 发送失败：${String(sent.code)}`);
+    // bot 一直在忙（老板在用它）是外部情况，不算通道故障：按受阻收尾，不累计编制的异常次数。
+    if (deps.now() > deadline) return sent?.code === 'busy'
+      ? blocked(`${label} 在 ${maxMinutes} 分钟内一直在忙（可能在处理老板的事），本轮任务没有发出，空闲后可直接恢复本任务`)
+      : fail(`${label} 在 ${maxMinutes} 分钟内页面一直没准备好或浏览器不可用`);
+    deps.progress(sent?.code === 'busy' ? `${label} 正在忙，等待空闲后发送` : `${label} 页面未就绪，稍后重试`);
     await deps.sleep(pollMs);
   }
 
   // 轮询：要求连续两次看到「不在工作中且有同一份终稿」，避免取到还在续写的半截答复。
-  let idleWithoutDone = 0, settledDone: string | undefined;
+  let idleWithoutDone = 0, settledDone: string | undefined, lastWorking = false, lastTail = '';
   for (;;) {
     await deps.sleep(pollMs);
     const s = await deps.browse(stateScript(target, marker), 90_000);
     if (s?.code === 'login_required') return loginFail();
     if (s?.ok === true) {
       const working = s.working === true;
+      lastWorking = working; lastTail = String(s.tail ?? '');
       const done = typeof s.done === 'string' && s.done.trim() ? s.done.trim() : undefined;
       if (!working && done) {
         if (settledDone === done) {
@@ -233,6 +285,7 @@ export async function runGrokBotTurn(input: GrokBotInput, deps: GrokBotDeps): Pr
       } else idleWithoutDone = 0;
       deps.progress(working ? `${label} 工作中（${marker}）` : done ? `${label} 已给出终稿，确认中` : `${label} 空闲，等待终稿`);
     }
-    if (deps.now() > deadline) return fail(`${label} 单轮超过 ${maxMinutes} 分钟上限（可能仍在工作，标记 ${marker}）`);
+    // 已发出但超时：bot 可能还在做或卡住了。按受阻收尾并带回现场，恢复本任务时只等终稿、不会重发。
+    if (deps.now() > deadline) return blocked(`${label} 单轮超过 ${maxMinutes} 分钟上限仍未给出终稿（标记 ${marker}，${lastWorking ? '页面仍显示工作中' : '页面空闲'}）。现场：${lastTail.slice(-300)}`);
   }
 }

@@ -5,7 +5,7 @@
  */
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
-import { runGrokBotTurn, type Browse, type GrokBotConfig } from './turn.ts';
+import { PRESSED, runGrokBotTurn, type Browse, type GrokBotConfig } from './turn.ts';
 
 function emit(value: unknown): void { process.stdout.write(`${JSON.stringify(value)}\n`); }
 
@@ -22,15 +22,16 @@ export const egoBrowse = (bin: string): Browse => (script, timeoutMs) => new Pro
   let out = '';
   let settled = false;
   const settle = (value: Record<string, unknown> | undefined) => { if (!settled) { settled = true; clearTimeout(timer); resolve(value); } };
-  const timer = setTimeout(() => { child.kill('SIGKILL'); settle(undefined); }, timeoutMs);
+  // 脚本没给结果就结束（超时、崩溃）：若已打出「按下发送」标记，报 pressed，执行端不再重发。
+  const unfinished = () => (out.includes(PRESSED) ? { ok: false, code: 'pressed' } : undefined);
+  const timer = setTimeout(() => { child.kill('SIGKILL'); settle(unfinished()); }, timeoutMs);
   child.stdout.on('data', chunk => { out += chunk; });
   child.stderr.on('data', chunk => { out += chunk; });
   child.on('error', () => settle(undefined));
-  child.on('close', (code) => {
-    if (code !== 0) { settle(undefined); return; }
+  child.on('close', () => {
     const line = out.split('\n').filter(l => l.startsWith('__RESULT__')).pop();
-    try { settle(line ? JSON.parse(line.slice('__RESULT__'.length)) as Record<string, unknown> : undefined); }
-    catch { settle(undefined); }
+    try { settle(line ? JSON.parse(line.slice('__RESULT__'.length)) as Record<string, unknown> : unfinished()); }
+    catch { settle(unfinished()); }
   });
 });
 

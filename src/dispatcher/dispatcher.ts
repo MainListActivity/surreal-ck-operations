@@ -12,7 +12,7 @@ import { dispatchText } from '../outbound-render.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
 import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, RetirementKind, Role, WriteScopeHolder } from '../contracts.ts';
-import { REQUIRED_TRACKS } from '../core.ts';
+import { REQUIRED_TRACKS, isDedicatedTrack } from '../core.ts';
 import { MAINTENANCE_WORKSPACE, UNATTENDED_MODE, goneSceneError, isOpenRefused, workspaceTitleOf, type PaseoGateway, type PaseoWorkspaceInfo } from './paseo.ts';
 import { latestFindings } from './brief.ts';
 import type { PromptEnv } from './prompts.ts';
@@ -201,10 +201,19 @@ const offHours = (def: EmployeeDef): Block => ['off_hours', `${BLOCK_TEXT.off_ho
 // Empty/absent tracks accept every discipline; untracked tasks keep plain role matching.
 // Required-track roles (REQUIRED_TRACKS, e.g. screenwriter) are stricter: their tasks must
 // carry exactly the required track and the def must list it — empty tracks grants nothing.
-function trackOkFor(role: Role, task: SupervisedTask | undefined, tracks: string[] | undefined) {
+// Dedicated tracks (「专属:<名>」, e.g. one specific Grok bot) pin work both ways: a def that
+// lists any dedicated track only takes tasks addressed to one of its tracks, and a task
+// addressed to a dedicated track only goes to a def of the executor role that lists it. Other
+// roles (a reviewer role, a blocker owner) see a dedicated task as untracked.
+export function trackOkFor(role: Role, task: Pick<SupervisedTask, 'discipline' | 'executorRole'> | undefined, tracks: string[] | undefined) {
   const required = REQUIRED_TRACKS[role];
   if (required !== undefined) return task?.discipline === required && (tracks ?? []).includes(required);
-  return !task?.discipline || !tracks?.length || tracks.includes(task.discipline);
+  const own = tracks ?? [];
+  const discipline = typeof task?.discipline === 'string' ? task.discipline : undefined;
+  const pinned = isDedicatedTrack(discipline) && task?.executorRole === role;
+  if (own.some(isDedicatedTrack) || pinned) return discipline !== undefined && own.includes(discipline);
+  if (isDedicatedTrack(discipline)) return true;
+  return !discipline || !own.length || own.includes(discipline);
 }
 
 export function factoryWorkKey(role: string, task: SupervisedTask, review = false): string {
