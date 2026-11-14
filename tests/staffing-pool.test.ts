@@ -410,3 +410,22 @@ test('订阅别名：preferredProvider=factory-droid 时 factory-paseo 也算优
  expect(swapped.find(e=>e.provider==='factory-droid')?.eligible).toBe(true);
  expect(swapped.find(e=>e.provider==='codex')).toMatchObject({eligible:false,code:'factory_wait'});
 });
+
+test('专属编制：点名任务只给列了该轨道的 bot，普通任务永远不给它，Factory 优先不卡点名任务', () => {
+  const ARCH = '专属:架构师';
+  const factory = def('factory', { role: 'ai-content', provider: 'factory-droid', maxInstances: 1 });
+  const staffBot = def('staff-bot', { role: 'ai-content', provider: 'grok-bot', model: 'ca9861d7-41ce-47a6-bd3e-b5d8efc5eea4', maxInstances: 1, quotaLimited: false });
+  const archBot = def('arch-bot', { role: 'ai-content', provider: 'grok-bot', model: '4c083c65-35d7-4b3d-8896-31fb342fb5fa', maxInstances: 1, quotaLimited: false, tracks: [ARCH] });
+  const defs = [factory, staffBot, archBot];
+  const task = (discipline?: string) => ({ id: 't', state: 'ready', executorRole: 'ai-content', discipline } as unknown as SupervisedTask);
+  const providerMax = { 'factory-droid': 2, 'grok-bot': 2 };
+  for (const preferredProvider of [undefined, 'factory-droid', 'grok-bot', '']) {
+    const pinned = staffingPool(base({ role: 'ai-content', defs, task: task(ARCH), providerMax, preferredProvider }));
+    expect(pinned.filter(e => e.eligible).map(e => e.def?.id)).toEqual(['arch-bot']);
+    for (const discipline of [undefined, '文案']) {
+      const ordinary = staffingPool(base({ role: 'ai-content', defs, task: task(discipline), providerMax, preferredProvider }));
+      expect(ordinary.find(e => e.def?.id === 'arch-bot')).toMatchObject({ eligible: false, code: 'track_mismatch' });
+      expect(ordinary.some(e => e.eligible)).toBe(true);
+    }
+  }
+});

@@ -67,8 +67,11 @@ describe('grok-bot turn', () => {
     const t = { site: 'grok-bot' as const, botId: BOT };
     const state = stateScript(t, 'm1');
     const send = sendScript(t, 'm1', 'hi');
-    expect(send).toContain(`'css:[contenteditable=true][role=textbox][aria-label^="Message"]'`);
-    expect(send).not.toContain('css:main ');
+    expect(send).toContain(JSON.stringify('[contenteditable=true][role=textbox][aria-label^="Message"]'));
+    expect(send).not.toContain('main [');
+    expect(state).toContain("code: 'not_ready'");
+    // the press marker is printed before Enter, so a script that dies afterwards is known to have sent
+    expect(send.indexOf('__PRESSED__')).toBeLessThan(send.indexOf("p.press(target, 'Enter')"));
     expect(state).not.toContain("querySelectorAll('main button')");
     expect(state).toContain('Show more');
   });
@@ -82,6 +85,36 @@ describe('grok-bot turn', () => {
     expect(out).toMatchObject({ status: 'success', text: '梗概正文……' });
     expect(browsed.filter(s => s.includes('const MSG ='))).toHaveLength(0);
     expect(progress.some(p => p.includes('已发出'))).toBe(true);
+  });
+
+  test('a send script that died after pressing Enter is not repeated, now or after a restart', async () => {
+    sends = [{ ok: false, code: 'pressed' }];
+    expect(await run()).toMatchObject({ status: 'success' });
+    expect(browsed.filter(s => s.includes('const MSG ='))).toHaveLength(1);
+    browsed = [];
+    await run();
+    expect(browsed.filter(s => s.includes('const MSG ='))).toHaveLength(0);
+  });
+
+  test('a restart while a send was in flight does not send again', async () => {
+    const { mkdirSync } = require('node:fs');
+    mkdirSync(join(dir, '.webchat'), { recursive: true });
+    // the bridge wrote the attempt and was then killed before the browser answered
+    const marker = (await import('../src/runner/grok-bot/turn.ts')).turnMarker('6666cedf-e6f1-4a8c', `先读 notes.md，完成 task.md\n${taskMaterial(dir, 'x').task}\n`);
+    writeFileSync(join(dir, '.webchat', `${marker}.json`), JSON.stringify({ attempt: true }));
+    await run();
+    expect(browsed.filter(s => s.includes('const MSG ='))).toHaveLength(0);
+  });
+
+  test('a page that is not ready yet (or a browser that did not start) is retried without counting as sent', async () => {
+    sends = [{ ok: false, code: 'not_ready' }, undefined as never, { ok: true }];
+    expect(await run()).toMatchObject({ status: 'success' });
+    expect(browsed.filter(s => s.includes('const MSG ='))).toHaveLength(3);
+  });
+
+  test('not-ready polls are not counted as idle without a final answer', async () => {
+    states = [...Array(8).fill({ ok: false, code: 'not_ready' }), { ok: true, sent: true, working: false, done: '梗概正文……' }];
+    expect(await run()).toMatchObject({ status: 'success', text: '梗概正文……' });
   });
 
   test('waits while the bot is busy, then sends', async () => {
@@ -119,8 +152,24 @@ describe('grok-bot turn', () => {
   test('times out while the bot keeps working', async () => {
     states = [{ ok: true, sent: true, working: true, done: null }];
     const out = await run();
-    expect(out.status).toBe('error');
+    expect(out.status).toBe('success');
+    expect(out.text.startsWith('工作结果：受阻')).toBe(true);
     expect(out.text).toContain('上限');
+    expect(out.text).toContain('工作中');
+  });
+
+  test('a bot that stays busy (the owner is using it) blocks the round instead of failing it', async () => {
+    sends = [{ ok: false, code: 'busy' }];
+    const out = await run();
+    expect(out.status).toBe('success');
+    expect(out.text.startsWith('工作结果：受阻')).toBe(true);
+    expect(out.text).toContain('一直在忙');
+    expect(browsed.filter(s => s.includes('const MSG ='))).not.toHaveLength(0);
+  });
+
+  test('a browser that never comes up fails the round', async () => {
+    sends = [{ ok: false, code: 'not_ready' }];
+    expect(await run()).toMatchObject({ status: 'error' });
   });
 
   test('review turns need a 复核结论 first line', async () => {
@@ -157,13 +206,11 @@ describe('muse-web site', () => {
     expect(JSON.parse(readFileSync(join(dir, '.webchat', files[0]), 'utf8')).url).toBe(THREAD);
   });
 
-  test('an unconfirmed send retries in the same side chat instead of opening another', async () => {
-    sends = [{ ok: false, code: 'not_echoed', url: THREAD }, { ok: true, already: true, url: THREAD }];
-    await runMuse();
-    const sendScripts = browsed.filter(s => s.includes('const MSG ='));
-    expect(sendScripts).toHaveLength(2);
-    expect(sendScripts[1]).not.toContain('New side chat');
-    expect(sendScripts[1]).toContain(THREAD);
+  test('an unconfirmed send is never repeated: it waits in the same side chat', async () => {
+    sends = [{ ok: false, code: 'not_echoed', url: THREAD }];
+    expect(await runMuse()).toMatchObject({ status: 'success', text: '梗概正文……' });
+    expect(browsed.filter(s => s.includes('const MSG ='))).toHaveLength(1);
+    expect(browsed.filter(s => !s.includes('const MSG =')).every(s => s.includes(THREAD))).toBe(true);
   });
 
   test('muse does not need a bot UUID and still refuses code tasks', async () => {
