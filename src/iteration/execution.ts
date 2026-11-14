@@ -130,6 +130,22 @@ export async function reconcileIterations(db: Surreal, host: ExecutionHost, now 
   return result;
 }
 
+/**
+ * 需求流水线建一张任务：建单、补齐派工草稿，并把新需求的第一条派工消息扣住等老板看过。
+ * Core 幂等回放后也补齐消息，恢复“建单成功但消息尚未落库”的中断；草稿只在刚建出来时扣一次，回放与老板放行后都不会再扣。
+ */
+export async function createIterationTask(
+  core: { createTask(credential: string, input: CreateTask): Promise<TaskView> },
+  messages: { createTaskDrafts(taskId: string, executorRole: string, reviewerRole: string, code: boolean, bodies: ReturnType<typeof iterationMessages>): Promise<Array<{ id: string; step: string }>>;
+    holdForPolicy(messageId: string, reason: string): Promise<boolean> },
+  credential: string, input: CreateTask): Promise<TaskView> {
+  const task = await core.createTask(credential, input);
+  const drafts = await messages.createTaskDrafts(task.id, task.executorRole, task.reviewerRole, input.workIntent?.kind === 'code', iterationMessages(input));
+  const first = !input.parent ? drafts.find(draft => draft.step === 'execute') : undefined;
+  if (first) await messages.holdForPolicy(first.id, '新需求的首次派工').catch(() => undefined);
+  return task;
+}
+
 /** 先独立复核 PR，再由既有工程岗合并并核验 GitHub 自动部署；QA 在同一收尾任务验收线上效果。 */
 export function iterationMessages(input: CreateTask): { execute: string; review: string; includeSent: true } {
   const release = input.acceptanceEnvironment === 'production';

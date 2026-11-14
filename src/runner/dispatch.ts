@@ -1,6 +1,6 @@
 import { createHostSampler, writeHostTelemetry, writeRuntimeObservation } from './telemetry.ts';
 import { writeAgentActivity, expireAgentActivity } from './activity-store.ts';
-import { reconcileIterations, iterationMessages } from '../iteration/execution.ts';
+import { reconcileIterations, createIterationTask } from '../iteration/execution.ts';
 import { DispatchTimings } from "../diagnostics.ts";
 import { RUNNER_BEAT_MS, writeBoardView, writeRunnerHeartbeat } from "../board.ts";
 import { beatNodeRelease } from "../node-release.ts";
@@ -498,13 +498,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
             create: async input => {
               const credential = process.env.SCK_OWNER_TOKEN;
               if (!credential) throw new Error('owner credential unavailable');
-              const task = await ctx.core.createTask(credential, input);
-              // Core 幂等回放后也补齐消息，恢复创建成功但消息尚未落库的中断。
-              const drafts = await ctx.messages.createTaskDrafts(task.id, task.executorRole, task.reviewerRole, input.workIntent?.kind === 'code', iterationMessages(input));
-              // 新需求的首次派工先扣住等老板看一眼消息；只在草稿刚建出来时扣一次，幂等回放与老板放行后都不会再扣。
-              const first = !input.parent ? drafts.find(draft => draft.step === 'execute') : undefined;
-              if (first) await ctx.messages.holdForPolicy(first.id, '新需求的首次派工').catch(() => undefined);
-              return task;
+              return createIterationTask(ctx.core, ctx.messages, credential, input);
             },
           })).catch(() => console.warn('iteration reconciliation failed'));
         }

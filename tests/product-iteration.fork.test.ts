@@ -189,7 +189,7 @@ run('完整公司 schema 与真实 core：幂等建规划单、真实租约提�
   const {SurrealCompanyCore}=await import('../src/core.ts');
   const {LocalEnrollmentAdmin}=await import('../src/enrollment.ts');
   const {OutboundMessageStore}=await import('../src/outbound-messages.ts');
-  const {reconcileIterations,iterationMessages}=await import('../src/iteration/execution.ts');
+  const {reconcileIterations,createIterationTask}=await import('../src/iteration/execution.ts');
   const {planRequirements}=await import('../src/iteration/planning.ts');
   const database=new CompanyDatabase({url:endpoint,rootUser:'root',rootPassword:'fixture',namespace:'iteration_core',database:'fixture'});
   try{
@@ -203,9 +203,13 @@ run('完整公司 schema 与真实 core：幂等建规划单、真实租约提�
     await requirements.configure('sample',{enabled:true,autoRelease:false,feedbackOrigins:[]},'owner');
     const req=await requirements.create(content,'owner');await requirements.approve(req.id,1,'owner');
     let now=Date.now();await planRequirements(database.db,async()=>({steps:[{title:'实现检索测试',context:'为检索实现增加测试',acceptance:'检索用例通过'}]}),now);
-    const host={create:async(input:import('../src/contracts.ts').CreateTask)=>{const task=await core.createTask(owner,input);await messages.createTaskDrafts(task.id,task.executorRole,task.reviewerRole,input.workIntent?.kind==='code',iterationMessages(input));return task;}};
+    const host={create:(input:import('../src/contracts.ts').CreateTask)=>createIterationTask(core,messages,owner,input)};
     expect((await reconcileIterations(database.db,host,now+=180000)).failed).toBe(0);
     const planning=(await requirements.get(req.id)).root_task!;expect(planning).toBeTruthy();
+    // 新需求的第一条派工消息按规则扣住并写明原因；复核草稿不扣。
+    const firstDrafts=await messages.list(planning,false);
+    expect(firstDrafts.find(m=>m.step==='execute')).toMatchObject({hold:true,holdReason:'新需求的首次派工'});
+    expect(firstDrafts.find(m=>m.step==='review')!.hold).toBe(false);
     const claim=await core.claim(product,planning);
     await core.submit(product,{taskId:planning,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version},{text:'测试 fixture 核对计划符合验收，仓库与测试入口已确认',idempotencyKey:'iteration-plan-submit'});
     const review=await core.claim(qa,planning);

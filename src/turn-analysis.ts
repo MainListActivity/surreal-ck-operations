@@ -71,21 +71,22 @@ interface AuditRow { id: RecordId; task: RecordId; action: string; evidence: str
  */
 export async function analyzeTurns(db: Surreal, analyze: AnalyzeTurn, now = Date.now()): Promise<{ analyzed: number; failed: number }> {
   const result = { analyzed: 0, failed: 0 };
-  const [audits] = await db.query<[AuditRow[]]>(
-    `SELECT id, task, action, evidence, at FROM audit WHERE at > time::now() - ${WINDOW_DAYS}d AND action IN $actions
-      AND type::is_string(evidence) AND evidence != '' ORDER BY at DESC LIMIT 60;`, { actions: [...ANALYSIS_ACTIONS] });
-  // 【通道回滚】是执行端自己的记录，不是员工的工作结果。
-  const candidates = (audits ?? []).filter(row => !row.evidence.startsWith('【通道回滚】'));
-  if (!candidates.length) return result;
+  // 每分钟都跑：先只取编号，选出本轮要分析的再读正文（一条结果最长近三万字）。【通道回滚】是执行端自己的记录，不是员工的工作结果。
+  const [candidates] = await db.query<[Array<{ id: RecordId; at: unknown }>]>(
+    `SELECT id, at FROM audit WHERE at > time::now() - ${WINDOW_DAYS}d AND action IN $actions
+      AND type::is_string(evidence) AND evidence != '' AND !string::starts_with(evidence, '【通道回滚】') ORDER BY at DESC LIMIT 60;`, { actions: [...ANALYSIS_ACTIONS] });
+  if (!candidates?.length) return result;
   const [done] = await db.query<[Array<{ source: RecordId; summary?: string; attempts?: number; failed_at?: unknown }>]>(
     'SELECT source, summary, attempts, failed_at FROM turn_analysis WHERE source IN $ids;', { ids: candidates.map(row => row.id) });
   const prior = new Map((done ?? []).map(row => [String(row.source.id), row]));
-  const failedAt = (row: AuditRow) => { const at = prior.get(String(row.id.id))?.failed_at; return at ? new Date(at as string).getTime() || 0 : 0; };
+  const failedAt = (row: { id: RecordId }) => { const at = prior.get(String(row.id.id))?.failed_at; return at ? new Date(at as string).getTime() || 0 : 0; };
   const pending = candidates.filter(row => {
     const seen = prior.get(String(row.id.id));
     return !seen || (!seen.summary && (seen.attempts ?? 0) < MAX_ATTEMPTS && failedAt(row) < now - RETRY_MS);
   }).sort((a, b) => failedAt(a) - failedAt(b)).slice(0, ANALYSES_PER_RUN);
-  for (const row of pending) {
+  if (!pending.length) return result;
+  const [rows] = await db.query<[AuditRow[]]>('SELECT id, task, action, evidence, at FROM audit WHERE id IN $ids;', { ids: pending.map(row => row.id) });
+  for (const row of rows ?? []) {
     const rid = new RecordId('turn_analysis', String(row.id.id));
     const hash = sha256Hex(row.evidence);
     try {

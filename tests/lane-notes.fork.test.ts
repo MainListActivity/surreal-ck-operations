@@ -406,3 +406,36 @@ run('第 2 步：老板的答复随恢复消息带给员工；第二轮返工先
     "SELECT confidence, low_reason, at FROM turn_analysis WHERE task = $task AND low_reason != NONE;", { task: new RecordId('task', t.id) });
   expect(last).toEqual([expect.objectContaining({ confidence: 'low', low_reason: '结果原文过长，模型只看了前一部分' })]);
 });
+
+run('自定义正文的任务（需求流水线、路线、老板改过的）受阻后重派，也带上老板的答复，再次受阻不叠两段', async () => {
+  const { OwnerDesk } = await import('../src/owner.ts');
+  const store = new OutboundMessageStore(db.db);
+  const desk = new OwnerDesk(db);
+  const t = await core.createTask(gm, { title: '核对实施计划', context: '核对计划', requirement: '核对计划', acceptanceText: '计划可执行',
+    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key() } as never);
+  const custom = '先读 notes.md。按流水线的自定义正文核对计划。';
+  await store.createTaskDrafts(t.id, 'engineering', 'qa', false, { execute: custom, review: custom });
+  const send = async (step: 'execute' | 'review') => { const p = await store.prepareSend(t.id, step, 'lanes-eng'); await store.markSent(p!.message.id, 'lanes-eng', p!.body); return p!.body; };
+  expect(await send('execute')).toBe(custom);
+
+  const c1 = await core.claim(eng, t.id);
+  await core.block(eng, proof(c1), 'owner', { text: '工作结果：受阻\n计划里的仓库地址打不开，无法核对。', idempotencyKey: key() });
+  await desk.decide({ taskId: t.id, decision: 'reply', note: '仓库换成 MainListActivity/surreal_ck。', source: 'web', key: key() });
+  await store.ensureQueuedDrafts([t.id]);
+  const lead1 = '上一轮你报告受阻：计划里的仓库地址打不开，无法核对。\n老板答复：\n仓库换成 MainListActivity/surreal_ck。\n按答复接着做。';
+  expect(await send('execute')).toBe(`${lead1}\n\n${custom}`);
+  // 还没轮到的复核草稿不带执行岗受阻的答复。
+  expect((await store.list(t.id, false)).find(m => m.step === 'review')!.body).toBe(custom);
+
+  // 再次受阻、再次答复：换成新的那段，不叠在旧的后面。
+  const c2 = await core.claim(eng, t.id);
+  await core.block(eng, proof(c2), 'owner', { text: '工作结果：受阻\n新仓库没有读权限，克隆时返回 403，无法继续核对。', idempotencyKey: key() });
+  await desk.decide({ taskId: t.id, decision: 'reply', note: '已加权限，重试。', source: 'web', key: key() });
+  expect(await send('execute')).toBe(`上一轮你报告受阻：新仓库没有读权限，克隆时返回 403，无法继续核对。\n老板答复：\n已加权限，重试。\n按答复接着做。\n\n${custom}`);
+
+  // 有了工作结果之后的重派（退回前的同一步）不再带答复。
+  const c3 = await core.claim(eng, t.id);
+  await core.submit(eng, proof(c3), evidence());
+  await core.release(qa, proof(await core.claim(qa, t.id)), { text: '【通道回滚】fixture：供应商明确失败，保留任务阶段，等待通道恢复后重派。', idempotencyKey: key() });
+  expect(await send('review')).toBe(custom);
+});

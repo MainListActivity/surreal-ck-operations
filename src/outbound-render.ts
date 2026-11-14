@@ -38,7 +38,7 @@ export interface OwnerAnswer { blocker?: string; reply: string }
 export const ANSWER_LIMIT = 2000;
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max)}…` : text;
 /** 恢复受阻任务的开头：员工上轮缺什么、老板怎么答的。 */
-function answerLead(answer: OwnerAnswer | undefined): string | undefined {
+export function answerLead(answer: OwnerAnswer | undefined): string | undefined {
   const reply = answer?.reply.trim();
   if (!reply) return undefined;
   return [answer!.blocker?.trim() ? `上一轮你报告受阻：${clip(answer!.blocker.trim().replace(/\s+/g, ' '), 300)}` : '上一轮你报告受阻。',
