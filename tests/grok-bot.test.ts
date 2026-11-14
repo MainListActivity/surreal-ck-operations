@@ -63,6 +63,27 @@ describe('grok-bot turn', () => {
     expect(turnMarker('6666cedf-x', 'a')).not.toBe(turnMarker('6666cedf-x', 'b'));
   });
 
+  test('page scripts do not depend on a <main> element and expand collapsed replies', () => {
+    const t = { site: 'grok-bot' as const, botId: BOT };
+    const state = stateScript(t, 'm1');
+    const send = sendScript(t, 'm1', 'hi');
+    expect(send).toContain(`'css:[contenteditable=true][role=textbox][aria-label^="Message"]'`);
+    expect(send).not.toContain('css:main ');
+    expect(state).not.toContain("querySelectorAll('main button')");
+    expect(state).toContain('Show more');
+  });
+
+  test('a restart after a confirmed send never sends again, even if the page no longer shows the task', async () => {
+    await run();
+    expect(browsed.filter(s => s.includes('const MSG ='))).toHaveLength(1);
+    browsed = [];
+    sends = [{ ok: true }];
+    const out = await run();
+    expect(out).toMatchObject({ status: 'success', text: '梗概正文……' });
+    expect(browsed.filter(s => s.includes('const MSG ='))).toHaveLength(0);
+    expect(progress.some(p => p.includes('已发出'))).toBe(true);
+  });
+
   test('waits while the bot is busy, then sends', async () => {
     sends = [{ ok: false, code: 'busy' }, { ok: false, code: 'busy' }, { ok: true }];
     expect(await run()).toMatchObject({ status: 'success' });

@@ -1,15 +1,17 @@
 {
-  "version": "0.13.8",
-  "title": "Muse 网页员工",
+  "version": "0.13.9",
+  "title": "专属编制与网页通道加固",
   "changes": [
-    "新增原生执行端通道 muse-web：与 grok-bot 共用网页桥接进程和 [SCK-TASK]/[SCK-DONE] 标记协议，用 ego-browser 驱动老板已登录的 muse.ai。",
-    "Muse 主对话是老板私人的：公司任务每轮新建一个侧聊，侧聊地址记在员工通道目录；重试与重启回到同一侧聊，不重复发送。",
-    "终稿改为取以本轮 DONE 标记开头的整条消息，两个站点通用；桥接首尾报告同一会话 ID。",
-    "老板端编制页新增 Muse 选项；文档与报告更新（Figma Make 因团队 AI 额度用完，等 11 月 30 日重置）。"
+    "派工新增专属轨道：discipline 写「专属:<名>」的任务只派给 tracks 列了它的执行岗位编制；tracks 含专属轨道的编制也只接这类任务，不再抢普通活。审阅与受阻处理岗位照常。",
+    "用途：把老板自己的 Grok bot（如架构师）接成员工时，只接点名给它的任务，与公司专用 bot 互不串活。",
+    "grok-bot 通道适配 Grok 新页面（已无 main 元素）：输入框、工作中、选择题、登录判定都不再依赖 main。",
+    "终稿只认本轮 DONE 标记，不再要求本轮任务消息仍在页面上（长对话会把旧消息移出页面）；被「Show more」折叠的长终稿先展开再取。",
+    "确认发出后在员工通道目录记下「已发出」，重启或重试只等终稿，绝不重复发送。"
   ],
   "impact": [
-    "派工与执行：配置 muse-web 路由与编制后，文本类任务可派给 Muse；未配置时无变化。"
+    "派工：只影响 tracks 含「专属:」的编制和 discipline 为「专属:」的任务；其余匹配不变。",
+    "执行：grok-bot / muse-web 通道的页面判定更新。"
   ],
-  "migration": "无 schema 变更（沿用 schema 068）；启用需在 runtime-routes.json 与 native-runner.json 加 muse-web 条目，并建 quotaLimited:false 的编制。",
-  "rollback": "回退至 v0.13.7（回退前先从 runtime-routes.json 移除 muse-web，旧版会把它判为无效配置）。"
+  "migration": "无 schema 变更（沿用 schema 068）。专属编制须在本版上线后再建（旧版会让它接普通任务）。",
+  "rollback": "回退至 v0.13.8 前先停用 tracks 含「专属:」的编制。"
 }

@@ -61,6 +61,11 @@ export { ROLES };
  * （这些岗位的空 tracks 不再视为全接）。编剧、故事作者、摄影摄像三类专属岗在此登记。
  */
 export const REQUIRED_TRACKS: Partial<Record<Role, string>> = { screenwriter: '编剧', 'story-author': '原著', cinematography: '摄影' };
+/** 专属轨道前缀：「专属:架构师」这类 discipline 只派给在 tracks 里列了它的编制，列了专属轨道的编制也只接这类任务（见 dispatcher trackOkFor）。 */
+export const DEDICATED_TRACK_PREFIX = '专属:';
+export function isDedicatedTrack(track: unknown): boolean {
+  return typeof track === 'string' && track.startsWith(DEDICATED_TRACK_PREFIX) && track.length > DEDICATED_TRACK_PREFIX.length;
+}
 const DEFAULT_LEASE_SECONDS = 600;
 /** Checkpoints cost a full model round trip each; past this many per holder per task the holder should heartbeat/submit instead. */
 const DEFAULT_CHECKPOINT_LIMIT = 6;
