@@ -399,6 +399,11 @@ run('第 2 步：老板的答复随恢复消息带给员工；第二轮返工先
   const c4 = await core.claim(eng, t.id);
   await core.submit(eng, proof(c4), evidence({ text: `很长的结果 ${'x'.repeat(13_000)}` }));
   expect(await analyzeTurns(db.db, (async () => ({ status: 'done', summary: '', confidence: 'sure' })) as never)).toEqual({ analyzed: 0, failed: 1 });
+  // 失败留下诊断：哪一步、什么类别、多久；不含模型正文。
+  const [diag] = await db.db.query<[Array<{ error: string; attempts: number; elapsed_ms: number }>]>(
+    'SELECT error, attempts, elapsed_ms FROM turn_analysis WHERE task = $task AND summary = NONE;', { task: new RecordId('task', t.id) });
+  expect(diag).toEqual([expect.objectContaining({ error: 'validate: invalid 完工分析的完成情况无效', attempts: 1 })]);
+  expect(diag[0]!.elapsed_ms).toBeGreaterThanOrEqual(0);
   // 重试间隔过后再试；这次合格，但原文被截断，把握强制记为不足。
   expect((await analyzeTurns(db.db, good as never)).analyzed).toBe(0);
   expect((await analyzeTurns(db.db, good as never, Date.now() + 11 * 60_000)).analyzed).toBe(1);

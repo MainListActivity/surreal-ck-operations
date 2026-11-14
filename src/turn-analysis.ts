@@ -14,6 +14,7 @@ export const ANALYSIS_ACTIONS = ['submit', 'return', 'owner_reject', 'block'] as
 /** 交给模型的结果正文上限；更长的截断并记为把握不足。 */
 export const ANALYSIS_TEXT_LIMIT = 12_000;
 export const ANALYSES_PER_RUN = 2;
+const SUMMARY_LIMIT = 400, NEXT_LIMIT = 800, NEED_LIMIT = 200, NEEDS_MAX = 5;
 const WINDOW_DAYS = 3;
 const MAX_ATTEMPTS = 3;
 const RETRY_MS = 10 * 60_000;
@@ -41,23 +42,21 @@ export interface TurnAnalysis {
 
 export type AnalyzeTurn = (input: TurnAnalysisInput) => Promise<unknown>;
 
-/** 校验模型输出：字段齐全、取值在枚举内、长度有界。不合格直接抛错，由调用方记失败。 */
+/**
+ * 校验模型输出。完成情况与把握必须在枚举内、摘要必须有，否则抛错由调用方记失败。长度和条数不靠模型自己数：
+ * 超出的截断，needs 里不是文本的丢掉，next 可以为空（已按验收完成时没什么要接着说的）。
+ */
 export function turnAnalysis(value: unknown): TurnAnalysis {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new CompanyError('invalid', '完工分析结果格式错误');
   const v = value as Record<string, unknown>;
   if (!['completed', 'partial', 'blocked', 'rejected'].includes(String(v.status))) throw new CompanyError('invalid', '完工分析的完成情况无效');
   if (!['high', 'low'].includes(String(v.confidence))) throw new CompanyError('invalid', '完工分析的把握无效');
-  const text = (field: string, max: number): string => {
-    const raw = v[field];
-    if (typeof raw !== 'string' || !raw.trim() || raw.length > max) throw new CompanyError('invalid', `完工分析的 ${field} 须为不超过 ${max} 字符的非空文本`);
-    return raw.trim().replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
-  };
-  const needs = v.needs ?? [];
-  if (!Array.isArray(needs) || needs.length > 5 || needs.some(item => typeof item !== 'string' || !item.trim() || item.length > 200)) {
-    throw new CompanyError('invalid', '完工分析的 needs 须为最多 5 条、每条不超过 200 字符的文本');
-  }
-  return { status: v.status as TurnAnalysis['status'], summary: text('summary', 400), needs: (needs as string[]).map(item => item.trim()),
-    next: text('next', 800), confidence: v.confidence as TurnAnalysis['confidence'] };
+  const text = (raw: unknown, max: number): string =>
+    (typeof raw === 'string' ? raw : '').trim().replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '').slice(0, max);
+  const summary = text(v.summary, SUMMARY_LIMIT);
+  if (!summary) throw new CompanyError('invalid', '完工分析缺少摘要');
+  const needs = (Array.isArray(v.needs) ? v.needs : []).map(item => text(item, NEED_LIMIT)).filter(Boolean).slice(0, NEEDS_MAX);
+  return { status: v.status as TurnAnalysis['status'], summary, needs, next: text(v.next, NEXT_LIMIT), confidence: v.confidence as TurnAnalysis['confidence'] };
 }
 
 const clip = (text: string): { text: string; cut: boolean } =>
@@ -89,6 +88,8 @@ export async function analyzeTurns(db: Surreal, analyze: AnalyzeTurn, now = Date
   for (const row of rows ?? []) {
     const rid = new RecordId('turn_analysis', String(row.id.id));
     const hash = sha256Hex(row.evidence);
+    let stage = 'load';
+    const started = Date.now();
     try {
       const [tasks] = await db.query<[Array<{ title?: string; context?: string; requirement?: string; resources?: string; acceptance_text?: string; state?: string }>]>(
         'SELECT title, context, requirement, resources, acceptance_text, state FROM $task;', { task: row.task });
@@ -106,23 +107,28 @@ export async function analyzeTurns(db: Surreal, analyze: AnalyzeTurn, now = Date
           "SELECT evidence, at FROM audit WHERE task = $task AND action IN ['submit', 'owner_submit'] AND at < $at ORDER BY at DESC LIMIT 1;", { task: row.task, at: row.at });
         if (typeof subs?.[0]?.evidence === 'string' && subs[0].evidence) submitted = clip(subs[0].evidence);
       }
-      const parsed = turnAnalysis(await analyze({
+      stage = 'model';
+      const answer = await analyze({
         action: row.action,
         task: { title: String(task.title ?? ''), requirement: clip(task.requirement?.trim() || requirementOf(task.context ?? '')).text,
           ...(task.resources ? { resources: task.resources } : {}), ...(task.acceptance_text ? { acceptance: clip(task.acceptance_text).text } : {}) },
         result: shown.text, ...(submitted ? { submitted: submitted.text } : {}),
-      }));
+      });
+      stage = 'validate';
+      const parsed = turnAnalysis(answer);
+      stage = 'persist';
       // 把握不只听模型自评：它没看全的结果，一律按把握不足。
       const lowReason = shown.cut || submitted?.cut ? '结果原文过长，模型只看了前一部分' : undefined;
       await db.query(`UPSERT $rid SET source = $source, task = $task, action = $action, source_hash = $hash, status = $status, summary = $summary,
-        needs = $needs, next = $next, confidence = $confidence, low_reason = $low_reason, failed_at = NONE, at = time::now();`,
+        needs = $needs, next = $next, confidence = $confidence, low_reason = $low_reason, failed_at = NONE, error = NONE, elapsed_ms = $elapsed, at = time::now();`,
         { rid, source: row.id, task: row.task, action: row.action, hash, status: parsed.status, summary: parsed.summary, needs: parsed.needs,
-          next: parsed.next, confidence: lowReason ? 'low' : parsed.confidence, low_reason: lowReason });
+          next: parsed.next || undefined, confidence: lowReason ? 'low' : parsed.confidence, low_reason: lowReason, elapsed: Date.now() - started });
       result.analyzed++;
-    } catch {
-      // 只记失败与次数；模型正文与员工输出不进日志。
-      await db.query('UPSERT $rid SET source = $source, task = $task, action = $action, source_hash = $hash, attempts = (attempts ?? 0) + 1, failed_at = time::now(), at = time::now();',
-        { rid, source: row.id, task: row.task, action: row.action, hash }).catch(() => undefined);
+    } catch (error) {
+      // 记下哪一步失败、错误类别与耗时；CompanyError 的文字是本模块自己写的形态描述，其它错误只留类别，模型正文与员工输出不进库也不进日志。
+      const reason = `${stage}: ${error instanceof CompanyError ? `${error.code} ${error.message}` : error instanceof SyntaxError ? 'invalid_json' : stage === 'persist' || stage === 'load' ? 'database_error' : 'error'}`.slice(0, 300);
+      await db.query('UPSERT $rid SET source = $source, task = $task, action = $action, source_hash = $hash, attempts = (attempts ?? 0) + 1, failed_at = time::now(), error = $error, elapsed_ms = $elapsed, at = time::now();',
+        { rid, source: row.id, task: row.task, action: row.action, hash, error: reason, elapsed: Date.now() - started }).catch(() => undefined);
       result.failed++;
     }
   }
