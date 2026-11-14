@@ -382,7 +382,7 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
   const tasks = new Map(openRows.map(row => [keyOf(row.id), row] as const));
   const previewIds = [...new Map(unsent.map(row => [keyOf(row.task), row.task])).values()];
   const previewRows = previewIds.length ? await rowsOf(db,
-    'SELECT id, title, context, requirement, acceptance_text FROM task WHERE id IN $ids;', {ids: previewIds}) : [];
+    'SELECT id, title, context, requirement, resources, acceptance_text FROM task WHERE id IN $ids;', {ids: previewIds}) : [];
   const contexts = new Map(previewRows.map(row => [keyOf(row.id), workContext({task: row as never}, 'preview', now)]));
   const holders = openRows.filter(row => row.current_employee && OPEN_STATES.includes(String(row.state)));
 

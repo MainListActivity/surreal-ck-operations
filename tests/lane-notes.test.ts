@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { checkLearned, checkNoteText, isDuplicateNote, laneOf, notesFit, NOTES_MAX_LINES, renderNotes } from '../src/lane-notes.ts';
-import { renderMessage, templateFor } from '../src/outbound-messages.ts';
+import { composeMessage, renderMessage } from '../src/outbound-messages.ts';
 import { continuitySession, finishedSessions, reclaimIdleSessions } from '../src/dispatcher/idle-sessions.ts';
 import { observeRuntimeIdle } from '../src/dispatcher/memory-lru.ts';
 import { RecordId } from 'surrealdb';
@@ -60,12 +60,13 @@ test('a restated note is a duplicate; the lane\'s other notes are not', () => {
 });
 
 test('dispatch messages name notes.md and render it next to task.md', () => {
-  for (const body of [templateFor('execute', true), templateFor('execute'), templateFor('review', true, 'review'), templateFor('review', false, 'review')]) {
+  const card = { title: '导出', requirement: '导出 CSV', acceptance: '列头正确' };
+  for (const body of [composeMessage('execute', card, true), composeMessage('execute', card), composeMessage('review', card, true, 'review'), composeMessage('review', card, false, 'review')]) {
     expect(body).toContain('notes.md');
     expect(body).not.toContain('learned');
     expect(body).toContain('结束本轮');
   }
-  const sent = renderMessage(templateFor('execute'), { sckBin: '/bin/sck', commDir: '/comm/x/', taskId: 't' });
+  const sent = renderMessage(composeMessage('review', card), { sckBin: '/bin/sck', commDir: '/comm/x/', taskId: 't' });
   expect(sent).toContain('/comm/x/notes.md');
   expect(sent).toContain('/comm/x/task.md');
 });

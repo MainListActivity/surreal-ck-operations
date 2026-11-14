@@ -16,30 +16,69 @@ export interface RenderContext {
 /** The deploy-leg machine criterion id every code dispatch may name when the task carries no readable criteria. */
 export const DEFAULT_MACHINE_CRITERION = 'AC-BASE-DEPLOY-1';
 
-/** 表里保存短正文；派工时 renderMessage 才补上真实路径、工具绝对路径与任务 ID。 */
-const NOTES = `先读 notes.md。`;
-/** 工作结果是业务输出；任务生命周期由执行端接管。 */
-const END_TURN = `完成后直接给出最终答复：完成情况、验证结果和产物位置，然后结束本轮。执行端自动保存并送审。`;
-const COMPANY = `需要账号、登录态、带登录链接或远程执行工具时，用 sck call company_cmd_catalog 查询可用工作能力。`;
-const RESULT = `遇到实际前置缺口，最终答复首行写“工作结果：受阻”并说明缺少什么。`;
-const EXECUTE_CODE = `${NOTES}实现 task.md 中的需求，在最终提交上按验收标准逐条自验。最终答复用单独一行“提交：<完整40位SHA>”标明被验证的提交。${COMPANY}${RESULT}${END_TURN}`;
-const EXECUTE_PLAIN = `${NOTES}完成 task.md 中的需求，按验收标准自验。${COMPANY}${RESULT}${END_TURN}`;
-const REVIEW_FIRST = `先查验收标准第 1 条（老板视角的结果）；不成立就说明原因并退回，成立后再逐条复验其余标准。`;
-const REVIEW = `${NOTES}按 task.md 的验收标准独立复验。${REVIEW_FIRST}最终答复首行写“复核结论：通过”或“复核结论：退回”，正文给出逐条证据和发现。${COMPANY}${RESULT}结束本轮，执行端自动记录评审结果。`;
-const REVIEW_CODE = REVIEW.replace('按 task.md 的验收标准独立复验。', '按 task.md 的验收标准独立复验，代码任务在最终合入提交上核对。');
-const REWORK_CODE = `修复 findings/round-NN.md 中的问题后，` + EXECUTE_CODE;
-const REWORK_PLAIN = `修复 findings/round-NN.md 中的问题后，` + EXECUTE_PLAIN;
-const NUDGE = (phase: string) => phase === 'review' ? REVIEW : EXECUTE_PLAIN;
+/** 任务卡上决定派工正文的字段。任务字段是事实来源：没被老板改过的草稿随这些字段重算。 */
+export interface PromptTask {
+  title?: string;
+  /** 做什么。 */
+  requirement?: string;
+  /** 可以用什么：老板在任务卡上写的工具、账号、资料、参考实现。 */
+  resources?: string;
+  /** 如何验证。 */
+  acceptance?: string;
+  /** 这一步必须守的流程约束（如“不要合并 PR”），紧跟在“做什么”后面；需求再长也留在消息里。 */
+  note?: string;
+}
+
+/** 超过这个长度的需求或验收不内联进消息，改为指向 task.md：长文档放文件里，消息只说要点。 */
+export const INLINE_LIMIT = 6000;
+
+const fits = (text?: string): boolean => !!text?.trim() && text.trim().length <= INLINE_LIMIT;
+const titled = (task: PromptTask) => task.title?.trim() ? `《${task.title.trim()}》` : '这项任务';
+
+/** 每条线都有的两样：线的笔记与公司工作能力目录。 */
+const COMMON_RESOURCES = `notes.md 是这条线积累的经验，先读。需要账号、登录态或远程执行工具时，用 sck call company_cmd_catalog 查可用的工作能力。`;
+/** 收尾约定：执行端靠首行结论给任务收尾（runner/lifecycle.ts 的 workResult），完工分析上线前必须留在消息里。 */
+const CLOSE_EXECUTE = `做完后在最终答复里写清完成情况、验证结果和产物位置，然后结束本轮；缺前置条件做不下去时，首行写“工作结果：受阻”并说明缺什么。`;
+const CLOSE_REVIEW = `最终答复首行写“复核结论：通过”或“复核结论：退回”，随后逐条给出证据，然后结束本轮；无法复核时首行写“工作结果：受阻”并说明缺什么。`;
+const REVIEW_FIRST = `先查第 1 条（老板视角的结果），不成立就说明原因并退回；成立后再逐条复验其余标准。`;
+
+/** 资源清单内联的上限：三段都顶格时整条消息仍在补译上限（20000 字）之内。 */
+export const RESOURCES_LIMIT = 3000;
+const resourcesSection = (task: PromptTask): string =>
+  ['可以用：', (task.resources?.trim().length ?? 0) > RESOURCES_LIMIT ? '任务卡列的资源见 task.md 的“可以用”一节。' : task.resources?.trim(),
+    COMMON_RESOURCES].filter(Boolean).join('\n');
+
+function executeMessage(task: PromptTask, code: boolean): string {
+  const what = fits(task.requirement) ? task.requirement!.trim() : `完成${titled(task)}，完整需求在 task.md。`;
+  const verify = ['验证：',
+    fits(task.acceptance) ? task.acceptance!.trim() : task.acceptance?.trim() ? '按 task.md 的验收标准逐条自验。' : '自己验证结果成立，并说明是怎么验证的。',
+    // 提交行留着：上线核验要的是实际合并提交，执行端从工作树取的 HEAD 可能还是合并前的 PR head。
+    code ? '在最终提交上逐条自验，最终答复用单独一行“提交：<完整40位SHA>”标明被验证的提交。' : undefined, CLOSE_EXECUTE].filter(Boolean).join('\n');
+  return [what, task.note?.trim() ? `注意：${task.note.trim()}` : undefined, resourcesSection(task), verify].filter(Boolean).join('\n\n');
+}
+
+function reviewMessage(task: PromptTask, code: boolean): string {
+  const what = [`独立复验${titled(task)}的交付，提交的成果在 task.md 的“待复核成果”一节。`,
+    fits(task.requirement) ? `原需求：\n${task.requirement!.trim()}` : '原需求见 task.md。'].join('\n\n');
+  const verify = ['验证：', fits(task.acceptance) ? task.acceptance!.trim() : '按 task.md 的验收标准逐条复验。',
+    REVIEW_FIRST, code ? '代码任务在最终合入提交上核对。' : undefined, CLOSE_REVIEW].filter(Boolean).join('\n');
+  return [what, task.note?.trim() ? `注意：${task.note.trim()}` : undefined, resourcesSection(task), verify].filter(Boolean).join('\n\n');
+}
+
+/**
+ * 派工正文：做什么、可以用什么、如何验证三段，内容取自任务卡。存进表里的就是完整正文，老板看到、改到的与员工收到的是同一段话。
+ * 返工在前面加一句指向退回意见；催办在前面加一句说明上一轮没有结果。
+ */
+export function composeMessage(step: MessageStep, task: PromptTask, code = false, phase = 'doing'): string {
+  if (step === 'review') return reviewMessage(task, code);
+  if (step === 'rework') return `上一轮被退回，先修复 findings/round-NN.md 里的问题。\n\n${executeMessage(task, code)}`;
+  if (step === 'execute') return executeMessage(task, code);
+  return `上一轮结束时没有给出工作结果，请接着做完。\n\n${phase === 'review' ? reviewMessage(task, code) : executeMessage(task, code)}`;
+}
 
 /** A route's own template still has to point the session at its notes; the stored draft is the full text the owner previews. */
 export const routeBody = (body?: string): string | undefined =>
-  body?.trim() ? (body.includes('notes.md') ? body : `${NOTES}${body}`) : undefined;
-
-export const templateFor = (step: MessageStep, code = false, phase = 'doing'): string =>
-  step === 'execute' ? (code ? EXECUTE_CODE : EXECUTE_PLAIN)
-    : step === 'review' ? (code ? REVIEW_CODE : REVIEW)
-      : step === 'rework' ? (code ? REWORK_CODE : REWORK_PLAIN)
-        : NUDGE(phase);
+  body?.trim() ? (body.includes('notes.md') ? body : `先读 notes.md。${body}`) : undefined;
 
 /**
  * Pure send-time rewriting of the stored short body. The owner edits the short form; the employee receives
@@ -53,8 +92,8 @@ export function renderMessage(body: string, opts: RenderContext): string {
     .replaceAll('{taskId}', taskId)
     .replaceAll('{acId}', acId ?? DEFAULT_MACHINE_CRITERION)
     .replaceAll('sck call', `'${sckBin}' call`)
-    .replaceAll('task.md', taskFile)
-    .replaceAll('notes.md', `${commDir.replace(/\/+$/, '')}/notes.md`)
+    .replaceAll(/(?<![\w./-])task\.md/g, () => taskFile)
+    .replaceAll(/(?<![\w./-])notes\.md/g, () => `${commDir.replace(/\/+$/, '')}/notes.md`)
     .replaceAll(/findings\/round-(?:\d+|NN)\.md/g, findings ?? 'findings/round-NN.md');
 }
 

@@ -3,7 +3,7 @@
  * 按公司收尾协议产出最终答复。所有外部交互（子进程、HTTP、时间）都经 LaneDeps 注入，
  * 测试可以完全不触网不碰 git 跑通各分支。
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { isLaneProvider, type LaneProvider } from '../native-args.ts';
 import { clearInflight, laneDigest, readInflight, readLaneState, recordInflight, writeLaneState, type LaneState } from './state.ts';
@@ -86,17 +86,21 @@ const BLOCKED = '工作结果：受阻';
 const REVIEW_MARKER = '## 待复核成果';
 const REVIEW_PREFIX = /^复核结论：(通过|退回)/;
 
-/** 把 task.md 与派工消息点名的最新 findings 内联进供应商 prompt：云端 agent 读不到本机文件、也调不了 sck。 */
-export function taskMaterial(commDir: string, prompt: string): { task: string; findings?: string; review: boolean; title: string } {
+/**
+ * 把 task.md 与最新 findings 内联进供应商 prompt：云端 agent 读不到本机文件、也调不了 sck。
+ * findings 按通信目录里实际有的文件取，不看派工消息的措辞：领取时旧任务的 findings 已清掉（sidecar stageBrief），
+ * 目录里有文件就是本任务最近一次退回；老板把消息改成什么样，退回意见都不会丢。复核轮不带。
+ */
+export function taskMaterial(commDir: string, _prompt?: string): { task: string; findings?: string; review: boolean; title: string } {
   let task = '';
   try { task = readFileSync(join(commDir, 'task.md'), 'utf8'); } catch { /* 无 task.md：少见，仍按 prompt 执行 */ }
   const review = task.includes(REVIEW_MARKER);
-  const names = [...prompt.matchAll(/findings\/round-(\d+)\.md/g)].map(m => Number(m[1]));
   let findings: string | undefined;
-  if (names.length) {
-    const latest = Math.max(...names);
-    const file = join(commDir, 'findings', `round-${String(latest).padStart(2, '0')}.md`);
-    if (existsSync(file)) findings = readFileSync(file, 'utf8');
+  if (!review) {
+    let names: string[] = [];
+    try { names = readdirSync(join(commDir, 'findings')).filter(name => /^round-\d+\.md$/.test(name)).sort(); } catch { /* 没有退回过 */ }
+    const latest = names.at(-1);
+    if (latest) findings = readFileSync(join(commDir, 'findings', latest), 'utf8');
   }
   const title = (/^#\s+(.+)$/m.exec(task)?.[1] ?? task.split('\n').find(l => l.trim()) ?? '云端任务').trim().slice(0, 80);
   return { task, findings, review, title };

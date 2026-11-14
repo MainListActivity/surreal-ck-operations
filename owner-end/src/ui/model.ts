@@ -376,6 +376,8 @@ export const TASK_STATE_ZH: Record<string, string> = {
 export interface TaskFormValues {
   title: string;
   requirement: string;
+  /** 可以用什么：可空。 */
+  resources: string;
   acceptanceText: string;
   executorRole: string;
   reviewerRole: string;

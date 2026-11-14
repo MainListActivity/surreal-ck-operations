@@ -167,6 +167,8 @@ export interface TaskView {
   context: string;
   /** Owner-edited requirement, staged verbatim as task.md's 需求 section. */
   requirement?: string;
+  /** Owner-written resources (可以用什么): tools, accounts, references; staged as task.md's 可以用 section. */
+  resources?: string;
   /** Owner-edited acceptance criteria, staged verbatim as task.md's 验收标准 section. */
   acceptanceText?: string;
   state: TaskState;
@@ -415,6 +417,8 @@ export interface CreateTask {
   parent?: string;
   /** Owner-edited requirement staged as task.md's 需求 section. */
   requirement?: string;
+  /** Owner-written resources (可以用什么) staged as task.md's 可以用 section and the dispatch message's second part. */
+  resources?: string;
   /** Owner-edited acceptance staged as task.md's 验收标准 section. */
   acceptanceText?: string;
   /** Hold the generated dispatch drafts for owner review before release. */
@@ -559,7 +563,7 @@ export interface Evidence {
   /** Top-level shorthand for acceptance.sha (code deliverables may pass either). */
   sha?: string;
   /** Follow-up proposals, max 20: each creates a planned child typed through the route table. */
-  next?: Array<{ type: string; title: string; requirement?: string; acceptance?: string }>;
+  next?: Array<{ type: string; title: string; requirement?: string; resources?: string; acceptance?: string }>;
   /** Lessons for this lane's long-term notes, max 5: they take effect only once the task is done. */
   learned?: string[];
 }

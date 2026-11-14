@@ -112,10 +112,10 @@ describe('表单解析与校验', () => {
   });
 
   test('新建需求必填项', () => {
-    expect(validateTaskForm({ title: ' ', requirement: '', acceptanceText: '', executorRole: '', reviewerRole: '', type: '' })).toEqual([
+    expect(validateTaskForm({ title: ' ', requirement: '', resources: '', acceptanceText: '', executorRole: '', reviewerRole: '', type: '' })).toEqual([
       '标题必填', '需求原文必填', '验收标准必填', '请选择执行岗', '请选择复核岗',
     ]);
-    expect(validateTaskForm({ title: 't', requirement: 'r', acceptanceText: 'a', executorRole: 'engineering', reviewerRole: 'owner', type: '' })).toEqual([]);
+    expect(validateTaskForm({ title: 't', requirement: 'r', resources: '', acceptanceText: 'a', executorRole: 'engineering', reviewerRole: 'owner', type: '' })).toEqual([]);
   });
 
   test('改派至少改一个岗位并写原因', () => {

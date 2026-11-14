@@ -178,14 +178,31 @@ run('a task approved after two returns keeps only the passing round\'s five note
     expect(body).not.toContain('在生产复验');
     expect(body).not.toContain('在生产逐条自验');
   }
-  expect(execute).toContain('在最终提交上按验收标准逐条自验');
-  expect(execute).toContain('合入 main');
-  expect(execute).toContain('安装到生产由老板侧完成');
-  expect(execute).not.toContain('升级卡');
-  expect(review).toContain('先查验收标准第 1 条');
-  expect(review).toContain('不成立就直接退回');
   expect((await ownerApi({ db, core, owner: {}, workforce: {}, messages: messageStore, opsRepo: '/tmp/ops' } as never,
     { command: 'message.list', taskId: freshTask.id }, 'web') as { messages: { body: string }[] }).messages).toHaveLength(2);
+  // 正文就是任务卡：做什么、可以用、验证三段。
+  expect(execute).toStartWith('实现验收标准\n\n可以用：\n');
+  expect(execute).toContain('验证：\n老板能看到结果\n在最终提交上逐条自验，');
+  expect(execute).not.toContain('升级卡');
+  expect(review).toStartWith('独立复验《新建代码任务》的交付');
+  expect(review).toContain('先查第 1 条（老板视角的结果）');
+  // 任务卡是事实来源：改了说明和资源，没改过的草稿跟着变；老板改过的那条保持原样。
+  const api = (input: Record<string, unknown>) => ownerApi({ db, core, owner: {}, workforce: {}, messages: messageStore, opsRepo: '/tmp/ops' } as never, input, 'web');
+  const reviewDraft = (await messageStore.list(freshTask.id)).find(m => m.step === 'review')!;
+  await messageStore.edit(reviewDraft.id, '老板亲手改的复核消息', 'owner');
+  await api({ command: 'task.update', taskId: freshTask.id, requirement: '实现新的验收标准', resources: '参考 src/export.ts' });
+  const refreshed = await messageStore.list(freshTask.id);
+  expect(refreshed.find(m => m.step === 'execute')!.body).toStartWith('实现新的验收标准\n\n可以用：\n参考 src/export.ts\n');
+  expect(refreshed.find(m => m.step === 'review')!.body).toBe('老板亲手改的复核消息');
+  // 重派：按任务卡组装且没改过的已发正文重新组装；老板改过的已发正文原样沿用。
+  await db.db.query("UPDATE outbound_message SET state = 'sent', sent_at = time::now() WHERE task = $task;", { task: new RecordId('task', freshTask.id) });
+  await api({ command: 'task.update', taskId: freshTask.id, requirement: '第三版说明' });
+  await messageStore.ensureQueuedDrafts([freshTask.id]);
+  const requeued = (await messageStore.list(freshTask.id, false)).find(m => m.step === 'execute')!;
+  expect(requeued.body).toStartWith('第三版说明\n\n可以用：');
+  await db.db.query("UPDATE $task SET state = 'review';", { task: new RecordId('task', freshTask.id) });
+  await messageStore.ensureQueuedDrafts([freshTask.id]);
+  expect((await messageStore.list(freshTask.id, false)).find(m => m.step === 'review')!.body).toBe('老板亲手改的复核消息');
   expect(oldDrafts.map(draft => draft.body)).toEqual([`先读 notes.md。${legacy}`, `先读 notes.md。${legacy}`]);
   expect((await messageStore.list(oldDraftTask.id)).map(draft => draft.body))
     .toEqual([`先读 notes.md。${legacy}`, `先读 notes.md。${legacy}`]);
