@@ -143,8 +143,13 @@ test('完工分析的模型输出要过校验：枚举、长度、条数', async
   const ok = { status: 'partial', summary: '做了导出，没贴测试输出', needs: ['测试账号'], next: '先补单元测试的输出。', confidence: 'low' };
   expect(turnAnalysis(ok)).toEqual(ok as never);
   expect(turnAnalysis({ ...ok, needs: undefined }).needs).toEqual([]);
-  for (const bad of [null, [], { ...ok, status: 'done' }, { ...ok, confidence: 'sure' }, { ...ok, summary: '' }, { ...ok, summary: 'x'.repeat(401) },
-    { ...ok, next: 'x'.repeat(801) }, { ...ok, needs: Array(6).fill('a') }, { ...ok, needs: ['x'.repeat(201)] }, { ...ok, needs: 'none' }]) {
+  for (const bad of [null, [], { ...ok, status: 'done' }, { ...ok, confidence: 'sure' }, { ...ok, summary: '' }, { ...ok, summary: 42 }]) {
     expect(() => turnAnalysis(bad)).toThrow();
   }
+  // 长度和条数不靠模型自己数：超出的截断，不是文本的丢掉，next 可以为空。
+  const loose = turnAnalysis({ ...ok, summary: 'x'.repeat(900), next: '', needs: ['a', 7, '', 'b'.repeat(300), 'c', 'd', 'e', 'f'] });
+  expect(loose.summary).toHaveLength(400);
+  expect(loose.next).toBe('');
+  expect(loose.needs).toEqual(['a', 'b'.repeat(200), 'c', 'd', 'e']);
+  expect(turnAnalysis({ ...ok, needs: 'none' }).needs).toEqual([]);
 });
