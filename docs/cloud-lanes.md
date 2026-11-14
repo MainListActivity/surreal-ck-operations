@@ -91,9 +91,20 @@
 
 - **Warp（provider `warp`）**：Warp Build 的 oz agent 走原生执行端的本地桥接进程（`src/runner/warp/main.ts`），事件流与云端通道相同。配置步骤：在 `runtime-routes.json` 把 `warp` 路由到本节点（`"warp": "native:<节点ID>"`），在 `native-runner.json` 的 `commands` 加 `"warp": ["<服务>/sandbox/launch.sh", "<bun 绝对路径>", "<服务>/current/server/vendor/src/runner/warp/main.ts", "warp"]`，并按需加 `lanes.warp`：`{"bin": {"oz": "/Applications/Warp.app/Contents/Resources/bin/oz"}, "maxMinutes": 120}`。每轮 prompt 正文写进 commDir 的 `.warp/turn-<时间戳>.md`（0600），oz 参数只带文件路径；有 claim 任务工作树就用它，否则用会话 cwd（本地 agent 与普通员工同规则，公司提交由 agent 自己在任务分支完成）。Warp 没有可读额度端点，额度保持 unknown。
 - **Grok（provider `grok`）**：走 Paseo ACP。`scripts/sandbox/install.sh` 会把 `~/.local/bin/grok` 包进员工沙箱并把 provider command 设为 `[<包装脚本>, "agent", "--always-approve", "stdio"]`（`--always-approve` 是无人值守必需）。升级后需重跑 install.sh。
-- **Muse Code（provider `muse`）**：Paseo 内置 provider。安装并登录后重跑 install.sh，脚本会把包装脚本写进其 command 并启用；未安装则跳过。
+- **Muse Code（provider `muse`）**：Paseo 内置 provider。安装并登录后重跑 install.sh，脚本会把包装脚本写进其 command 并启用；未安装则跳过。注意：老板要接的“Muse”是 Meta 的 muse.ai（网页/App 里的通用 agent），不是这个编程 CLI；老板端编制页已不再列出 Muse Code。
 - **Factory 双模式（provider `factory-paseo`）**：与原生 `factory-droid` 并存的 Paseo ACP 入口（同一 droid 包装脚本、`exec --output-format acp-daemon`），install.sh 自动创建。两个 provider id 走同一份订阅：额度窗口、耗尽冷却与「优先订阅」判定都按订阅合并，任一侧耗尽另一侧同步冷却；`preferredProvider` 设任一个，另一个也算优先候选。
 
 - **Devin（provider `devin-paseo`）**：老板自己的 `devin` provider 保持原样；公司员工用独立的 `devin-paseo`（`sandbox/bin/devin acp`），install.sh 自动创建，与 `devin` 共用订阅额度与耗尽冷却。Devin 不走云端模式。
 
 `factory-paseo`、`grok`、`muse`、`devin-paseo` 不路由（不在 runtime-routes.json 出现），由 Paseo 直接派工。
+
+## Grok Bot 网页员工（provider `grok-bot`）
+
+Grok 的 bot（grok.com 左栏 Bots）没有 API，只能在网页或 App 里聊天；每个 bot 是一个常驻 agent（自带云电脑），且只有一条对话。原生执行端的桥接进程（`src/runner/grok-bot/main.ts`）用 ego-browser 驱动老板已登录的 grok.com：
+
+- **用哪个 bot**：员工定义的 `model` 填 bot 的 UUID（`https://grok.com/bot/<UUID>`）。公司用专用 bot「公司员工」，不用老板自己在用的 bot（一个 bot 只有一条对话，混进去会和老板的工作搅在一起）。`maxInstances` 必须是 1。
+- **协议**：建 bot 后先发一条约定消息；之后每轮发 `[SCK-TASK <标记>]` + 内联的 task.md（与复核退回意见），bot 完成后最后一条消息以 `[SCK-DONE <标记>]` 开头给出终稿。标记 = 任务 ID 前 8 位 + 本轮内容摘要：同一轮重启得到同一标记，发送前先查对话里是否已有它，有就只轮询不重发。
+- **判定**：页面主区有 `Working` 状态时视为在忙（发送前也等它空闲，老板正用着就不插话）；连续两次看到「不在 Working 且有同一份终稿」才收稿。bot 停下来出选择题卡片 → 回合按「工作结果：受阻」收尾并带回问题，绝不代答；停下但没给终稿也按受阻收尾。
+- **范围**：bot 读不到本机工作树、没接公司 GitHub，代码改动任务（`intent=code`）直接受阻、不碰浏览器；适合调研、写作、资料整理等文本交付。
+- **配置**：`runtime-routes.json` 加 `"grok-bot": "native:<节点>"`；`native-runner.json` 的 `commands` 加 `"grok-bot": ["<服务>/sandbox/launch.sh", "<bun>", "<服务>/current/server/vendor/src/runner/grok-bot/main.ts", "grok-bot"]`，`models` 加 `"grok-bot": ["<bot UUID>"]`，`lanes["grok-bot"]` 只接受 `bin`（`{"ego-browser": "<绝对路径>"}`）、`maxMinutes`（默认 120）、`pollMs`（默认 20000）。ego-browser 在员工沙箱里可用。没有额度端点，员工定义设 `quotaLimited:false`。
+- **失败**：grok.com 登录过期 → 错误回合，需要老板在 ego-browser 里重新登录；超时只报错不重发（bot 可能仍在工作，标记写在错误里便于人工核对）。

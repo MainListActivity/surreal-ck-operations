@@ -33,7 +33,7 @@ export interface LaneConfig {
 export function validateLanes(lanes: unknown): asserts lanes is Partial<Record<LaneProvider, LaneConfig>> {
   for (const [provider, lane] of Object.entries((lanes ?? {}) as Record<string, unknown>)) {
     if (!isLaneProvider(provider) || !lane || typeof lane !== 'object')
-      throw new Error('原生执行端 lanes 配置无效：只允许 codex-cloud、devin-cloud、jules、warp');
+      throw new Error('原生执行端 lanes 配置无效：只允许 codex-cloud、devin-cloud、jules、warp、grok-bot');
     for (const [key, value] of Object.entries(lane as Record<string, unknown>)) {
       if (key === 'environments') {
         if (!value || typeof value !== 'object' || Array.isArray(value) ||
@@ -47,6 +47,8 @@ export function validateLanes(lanes: unknown): asserts lanes is Partial<Record<L
         throw new Error(`lanes.${provider}.${key} 必须是正数`);
       if (provider === 'warp' && !['bin', 'maxMinutes'].includes(key))
         throw new Error(`lanes.warp 只接受 bin 与 maxMinutes，收到 ${key}`);
+      if (provider === 'grok-bot' && !['bin', 'maxMinutes', 'pollMs'].includes(key))
+        throw new Error(`lanes.grok-bot 只接受 bin、maxMinutes 与 pollMs，收到 ${key}`);
     }
   }
 }
@@ -167,6 +169,7 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
   const blocked = (text: string): LaneOutcome => ({ sessionId, status: 'success', text: `${BLOCKED}：${text}` });
   if (!isLaneProvider(input.provider)) return fail(`未知云端通道：${input.provider}`);
   if (input.provider === 'warp') return fail('warp 走本地桥接进程（src/runner/warp/main.ts），不经云端通道');
+  if (input.provider === 'grok-bot') return fail('grok-bot 走网页桥接进程（src/runner/grok-bot/main.ts），不经云端通道');
 
   // 云端命令只允许在派工分配的任务工作树里执行；没有可用工作树时一个 git/供应商命令都不发。
   const worktree = claimWorktree(input.commDir);

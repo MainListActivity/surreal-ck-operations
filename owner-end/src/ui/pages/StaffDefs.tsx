@@ -36,8 +36,8 @@ const PROVIDERS: ReadonlyArray<{ value: string; label: string }> = [
   { value: 'jules', label: 'Jules（Google AI Pro 云端）' },
   { value: 'factory-paseo', label: 'Factory Droid（Paseo 模式）' },
   { value: 'warp', label: 'Warp Build（原生执行端）' },
+  { value: 'grok-bot', label: 'Grok Bot（网页 bot，模型填 bot UUID）' },
   { value: 'grok', label: 'Grok Build（经 Paseo）' },
-  { value: 'muse', label: 'Muse Code（经 Paseo）' },
   { value: 'devin-paseo', label: 'Devin CLI（Paseo 模式）' },
 ];
 
@@ -53,8 +53,8 @@ const MODELS: Record<string, string[]> = {
   jules: ['default'],
   'factory-paseo': CLAUDE_MODELS,
   warp: ['default'],
+  'grok-bot': [],
   grok: ['grok-4.6'],
-  muse: ['default'],
   'devin-paseo': ['swe-2-high', 'swe-2-flash-medium', 'adaptive'],
 };
 
