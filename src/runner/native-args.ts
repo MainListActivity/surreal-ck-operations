@@ -4,8 +4,8 @@
  */
 
 /** 云端员工通道：本地桥接进程把回合转交给供应商云端 agent（Codex Cloud、Devin Cloud、Jules）。 */
-// 通道桥接进程（bun main.ts 启动）：云端三家 + warp 本地 agent，事件形状相同（system → lane_status → result）。
-export const LANE_PROVIDERS = ['codex-cloud', 'devin-cloud', 'jules', 'warp'] as const;
+// 通道桥接进程（bun main.ts 启动）：云端三家 + warp 本地 agent + grok-bot 网页 bot，事件形状相同（system → lane_status → result）。
+export const LANE_PROVIDERS = ['codex-cloud', 'devin-cloud', 'jules', 'warp', 'grok-bot'] as const;
 export type LaneProvider = (typeof LANE_PROVIDERS)[number];
 export const isLaneProvider = (provider: string): provider is LaneProvider =>
   (LANE_PROVIDERS as readonly string[]).includes(provider);
@@ -43,7 +43,7 @@ export function nativeArgs(s: { provider: NativeProvider; nativeSessionId?: stri
 
 /** 原生 CLI 的可执行文件名（执行端配置里是绝对路径，经员工沙箱脚本启动）。 */
 const NATIVE_BINARY: Record<NativeProvider, string> = { claude: 'claude', 'factory-droid': 'droid', codex: 'codex',
-  'codex-cloud': 'bun', 'devin-cloud': 'bun', jules: 'bun', warp: 'bun' };
+  'codex-cloud': 'bun', 'devin-cloud': 'bun', jules: 'bun', warp: 'bun', 'grok-bot': 'bun' };
 
 export interface LaunchPreview {
   /** native：执行端经员工沙箱直接启动这条命令；paseo：交给 Paseo 按 provider 启动，没有可预览的命令行。 */
@@ -57,7 +57,7 @@ export function launchPreview(def: { provider: string; model: string; thinking?:
   if (!isNativeProvider(def.provider)) return { via: 'paseo', argv: [] };
   if (isLaneProvider(def.provider)) return {
     via: 'native',
-    argv: ['bun', def.provider === 'warp' ? 'src/runner/warp/main.ts' : 'src/runner/cloud-lane/main.ts', def.provider,
+    argv: ['bun', def.provider === 'warp' ? 'src/runner/warp/main.ts' : def.provider === 'grok-bot' ? 'src/runner/grok-bot/main.ts' : 'src/runner/cloud-lane/main.ts', def.provider,
       ...nativeArgs({ provider: def.provider, model: def.model, thinking: def.thinking || undefined, mode: UNATTENDED_MODE[def.provider] })],
   };
   return {

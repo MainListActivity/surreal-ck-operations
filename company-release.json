@@ -1,14 +1,15 @@
 {
-  "version": "0.13.6",
-  "title": "Higgsfield CLI 兜底",
+  "version": "0.13.7",
+  "title": "Grok Bot 网页员工",
   "changes": [
-    "新增付费图片兜底通道 higgsfield-cli：media_image 在 chatgpt、higgsfield 网页、gemini、grok 都失败后才走 Higgsfield CLI，也可显式指定 provider=higgsfield-cli；视频不走此通道。",
-    "CLI 没有无限模式，每张扣套餐 credits：只用白名单便宜模型（gpt_image_2_6 约 0.25、kling_omni_image 约 0.5），生成前先查价，单张超过 0.5 credits 拒绝；按账户流水算近 24 小时花费，超过 20 credits 拒绝；读不到流水也拒绝。",
-    "额度可调：SCK_HIGGSFIELD_DAILY_CREDITS、SCK_HIGGSFIELD_MAX_JOB_CREDITS；SCK_HIGGSFIELD_CLI=0 关闭通道。审计记录每张实际 credits。"
+    "新增原生执行端通道 grok-bot：用 ego-browser 驱动老板已登录的 grok.com，把一轮公司任务发给指定 bot（员工定义 model 填 bot UUID），等 bot 回带标记的终稿后收稿。",
+    "协议：发送 [SCK-TASK 标记] + 内联 task.md，收 [SCK-DONE 标记] 之后的正文；标记含本轮内容摘要，重启时先查对话里已有标记再决定是否发送，绝不重复发送。",
+    "bot 在 Working 时不插话、等空闲再发；终稿需连续两次确认稳定；bot 出选择题或停下不给终稿时按「工作结果：受阻」收尾并带回问题；代码改动任务直接受阻（bot 读不到工作树、未接公司 GitHub）。",
+    "老板端编制页新增 Grok Bot 选项；移除 Muse Code 选项（老板要的是 muse.ai）。文档补 grok-bot 配置，报告更正 Muse/Grok Bot 现状。"
   ],
   "impact": [
-    "媒体生成：免费网页通道全部不可用时，图片仍能产出，每天最多花 20 credits（套餐每月 600，月初清零）。"
+    "派工与执行：配置 grok-bot 路由与编制后，文本类任务可派给 Grok 专用 bot；未配置时无变化。"
   ],
-  "migration": "无 schema 变更（沿用 schema 068）；本机需已安装并登录 Higgsfield CLI（higgsfield auth login）。",
-  "rollback": "回退至 v0.13.5（图片兜底只剩免费网页通道）。"
+  "migration": "无 schema 变更（沿用 schema 068）；启用需在 runtime-routes.json 与 native-runner.json 加 grok-bot 条目，并建 quotaLimited:false、maxInstances 1 的编制。",
+  "rollback": "回退至 v0.13.6（grok-bot 路由会被执行端判为无效配置，回退前先从 runtime-routes.json 移除该条）。"
 }
