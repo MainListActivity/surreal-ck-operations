@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { botMessage, runGrokBotTurn, sendScript, stateScript, turnMarker, type GrokBotDeps } from '../src/runner/grok-bot/turn.ts';
@@ -54,8 +54,8 @@ describe('grok-bot turn', () => {
     expect(message.startsWith(`[SCK-TASK ${marker}]`)).toBe(true);
     expect(message).toContain('写 200 字梗概');
     expect(message).not.toContain(`[SCK-DONE ${marker}]`);
-    expect(stateScript(BOT, marker)).toContain(`[SCK-DONE ${marker}]`);
-    expect(sendScript(BOT, marker, message)).toContain(JSON.stringify(message));
+    expect(stateScript({ site: 'grok-bot', botId: BOT }, marker)).toContain(`[SCK-DONE ${marker}]`);
+    expect(sendScript({ site: 'grok-bot', botId: BOT }, marker, message)).toContain(JSON.stringify(message));
   });
 
   test('same turn after a restart gets the same marker; a new round gets a new one', () => {
@@ -118,5 +118,37 @@ describe('grok-bot wiring', () => {
   test('launch preview runs the grok-bot bridge with the bot id as model', () => {
     expect(launchPreview({ provider: 'grok-bot', model: BOT }).argv).toEqual(['bun', 'src/runner/grok-bot/main.ts', 'grok-bot', '--model', BOT]);
     expect(nativeArgs({ provider: 'grok-bot', model: BOT, nativeSessionId: 's1' })).toEqual(['--resume', 's1', '--model', BOT]);
+  });
+});
+
+describe('muse-web site', () => {
+  const THREAD = 'https://muse.ai/thread/c2508d0b-c3d6-4d71-85b5-924b3dd52e17';
+  const runMuse = () => runGrokBotTurn({ prompt: '完成 task.md', commDir: dir, site: 'muse-web', model: 'default', config: { pollMs: 1000, maxMinutes: 1 } }, deps());
+
+  test('first send opens a new side chat and records its URL; later scripts go straight to it', async () => {
+    sends = [{ ok: true, url: THREAD }];
+    expect(await runMuse()).toMatchObject({ status: 'success', text: '梗概正文……' });
+    const first = browsed.find(s => s.includes('const MSG ='))!;
+    expect(first).toContain('New side chat');
+    expect(first).not.toContain('grok.com');
+    expect(browsed.filter(s => !s.includes('const MSG =')).every(s => s.includes(THREAD))).toBe(true);
+    const files = require('node:fs').readdirSync(join(dir, '.webchat'));
+    expect(JSON.parse(readFileSync(join(dir, '.webchat', files[0]), 'utf8')).url).toBe(THREAD);
+  });
+
+  test('an unconfirmed send retries in the same side chat instead of opening another', async () => {
+    sends = [{ ok: false, code: 'not_echoed', url: THREAD }, { ok: true, already: true, url: THREAD }];
+    await runMuse();
+    const sendScripts = browsed.filter(s => s.includes('const MSG ='));
+    expect(sendScripts).toHaveLength(2);
+    expect(sendScripts[1]).not.toContain('New side chat');
+    expect(sendScripts[1]).toContain(THREAD);
+  });
+
+  test('muse does not need a bot UUID and still refuses code tasks', async () => {
+    claim('code');
+    const out = await runMuse();
+    expect(out.text.startsWith('工作结果：受阻')).toBe(true);
+    expect(existsSync(join(dir, '.webchat'))).toBe(false);
   });
 });
