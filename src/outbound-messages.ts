@@ -101,7 +101,7 @@ export class OutboundMessageStore {
   async refreshDrafts(taskId: string): Promise<number> {
     const card = await this.promptTask(taskId);
     const [rows] = await this.db.query<[Array<{ id: unknown; step: MessageStep; body: string; composed: { code?: boolean; phase?: string } }>]>(
-      "SELECT id, step, body, composed FROM outbound_message WHERE task = $task AND state != 'sent' AND edited_by = NONE AND composed != NONE AND dispatch_attempt = NONE;",
+      "SELECT id, step, body, composed FROM outbound_message WHERE task = $task AND state != 'sent' AND body_edited != true AND composed != NONE AND dispatch_attempt = NONE;",
       { task: this.task(taskId) });
     let changed = 0;
     for (const draft of rows ?? []) {
@@ -109,7 +109,7 @@ export class OutboundMessageStore {
       if (body === draft.body) continue;
       // 条件更新：这期间老板改了正文或消息已发出，就不动它。正在派出的消息（dispatch_attempt）正文已冻结，上面已排除。
       const [done] = await this.db.query<[unknown[]]>(
-        "UPDATE $msg SET body = $body WHERE state != 'sent' AND edited_by = NONE AND body = $expected RETURN AFTER;",
+        "UPDATE $msg SET body = $body WHERE state != 'sent' AND body_edited != true AND body = $expected RETURN AFTER;",
         { msg: draft.id, body, expected: draft.body });
       if (done?.length) changed++;
     }
@@ -196,7 +196,8 @@ export class OutboundMessageStore {
     if (!body.trim()) throw new CompanyError('invalid', 'message body must not be empty');
     const msg = this.message(messageId);
     const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
-      `UPDATE $msg SET body = $body, edited_by = $actor, edited_at = time::now() WHERE state != 'sent' AND ($expected = NONE OR body = $expected) RETURN AFTER;`,
+      // body_edited 只在改正文时写：扣住、放行也会写 edited_by，不能拿它判断正文是否被老板改过。
+      `UPDATE $msg SET body = $body, body_edited = true, edited_by = $actor, edited_at = time::now() WHERE state != 'sent' AND ($expected = NONE OR body = $expected) RETURN AFTER;`,
       { msg, body, actor, expected: expectedBody });
     const row = rows?.[0];
     if (!row && expectedBody !== undefined) {
@@ -379,11 +380,11 @@ export class OutboundMessageStore {
     const role = step === 'review' ? String(row?.reviewer_role ?? 'qa') : String(row?.executor_role ?? 'engineering');
     // A re-dispatch of the same step (lease expired, instance replaced) repeats what was last sent, so an owner edit or a custom
     // body survives. Only a body composed from the task card and never edited is composed again: the card is the source of truth.
-    const [sent] = await this.db.query<[Array<{ body?: string; edited_by?: string; composed?: unknown }>]>(
-      `SELECT body, edited_by, composed, created_at FROM outbound_message WHERE task = $task AND step = $step AND state = 'sent' ORDER BY created_at DESC LIMIT 1;`,
+    const [sent] = await this.db.query<[Array<{ body?: string; body_edited?: boolean; composed?: unknown }>]>(
+      `SELECT body, body_edited, composed, created_at FROM outbound_message WHERE task = $task AND step = $step AND state = 'sent' ORDER BY created_at DESC LIMIT 1;`,
       { task: this.task(taskId), step });
     const last = sent?.[0];
-    return this.createDraft(taskId, step, role, code, step === 'review' ? 'review' : 'doing', last?.composed && !last.edited_by ? undefined : last?.body);
+    return this.createDraft(taskId, step, role, code, step === 'review' ? 'review' : 'doing', last?.composed && last.body_edited !== true ? undefined : last?.body);
   }
 
   async markSent(messageId: string, employeeId: string, body: string): Promise<{ body: string; message: OutboundMessage }> {

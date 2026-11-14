@@ -188,6 +188,8 @@ run('a task approved after two returns keeps only the passing round\'s five note
   expect(review).toContain('先查第 1 条（老板视角的结果）');
   // 任务卡是事实来源：改了说明和资源，没改过的草稿跟着变；老板改过的那条保持原样。
   const api = (input: Record<string, unknown>) => ownerApi({ db, core, owner: {}, workforce: {}, messages: messageStore, opsRepo: '/tmp/ops' } as never, input, 'web');
+  // 扣住、放行不算改正文：被扣住的草稿照样跟着任务卡变（0.13.11 把 edited_by 当成改过正文，扣住后就不再重算）。
+  for (const draft of await messageStore.list(freshTask.id)) await messageStore.setHold(draft.id, true, 'owner');
   const reviewDraft = (await messageStore.list(freshTask.id)).find(m => m.step === 'review')!;
   await messageStore.edit(reviewDraft.id, '老板亲手改的复核消息', 'owner');
   await api({ command: 'task.update', taskId: freshTask.id, requirement: '实现新的验收标准', resources: '参考 src/export.ts' });
