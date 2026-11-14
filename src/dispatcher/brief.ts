@@ -35,9 +35,11 @@ export function requirementOf(context: string): string {
 }
 
 /** task.md includes the current submitted result for review; gathering it is the runner's job. */
-export function taskBrief(claim: Pick<ClaimResult, 'task' | 'project'> & Partial<Pick<ClaimResult, 'history'>> & { task: { requirement?: string; acceptanceText?: string } }): string {
-  const task = claim.task as typeof claim.task & { requirement?: string; acceptance_text?: string; acceptanceText?: string };
+export function taskBrief(claim: Pick<ClaimResult, 'task' | 'project'> & Partial<Pick<ClaimResult, 'history'>> & { task: { requirement?: string; acceptanceText?: string; resources?: string } }): string {
+  const task = claim.task as typeof claim.task & { requirement?: string; acceptance_text?: string; acceptanceText?: string; resources?: string };
   const parts = [`# ${task.title ?? ''}`, '', '## 需求', '', task.requirement?.trim() || requirementOf(task.context ?? '')];
+  // 云端与网页通道只读得到 task.md，“可以用什么”必须也在这里。
+  if (task.resources?.trim()) parts.push('', '## 可以用', '', task.resources.trim());
   const acceptance = task.acceptanceText?.trim() || task.acceptance_text?.trim();
   if (acceptance) parts.push('', '## 验收标准', '', acceptance);
   if (task.state === 'review') {

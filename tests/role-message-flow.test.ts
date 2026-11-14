@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ensureOwnerToken } from '../src/owner-token.ts';
-import { OutboundMessageStore, renderMessage, templateFor, type OutboundMessage } from '../src/outbound-messages.ts';
+import { OutboundMessageStore, composeMessage, renderMessage, type OutboundMessage } from '../src/outbound-messages.ts';
 import { taskBrief } from '../src/dispatcher/brief.ts';
 import { wake } from '../src/dispatcher/prompts.ts';
 import { scrubEnv } from '../plugin/server/scrub.ts';
@@ -53,17 +53,17 @@ test('minimal dispatch message: only what, where, how; no onboarding on first co
 test('默认派工模板只要求工作产出，辅助工具仍可用', () => {
   const opts = { sckBin: '/bin/sck', commDir: '/c', taskId: 't1' };
   for (const step of ['execute', 'review', 'rework', 'nudge'] as const) for (const code of [false, true]) {
-    const body = templateFor(step, code);
-    expect(body).toContain('task.md');
+    const body = composeMessage(step, { title: '导出', requirement: '导出 CSV', acceptance: '列头正确' }, code);
     expect(body).toContain('sck call company_cmd_catalog');
     expect(body).not.toMatch(/call (submit|review|checkpoint|heartbeat|claim_next)/);
     expect(body).not.toContain('idempotencyKey');
     expect(renderMessage(body, opts)).toContain("'/bin/sck' call company_cmd_catalog");
   }
-  expect(templateFor('review', true)).toContain('复核结论：通过');
-  expect(templateFor('review', true)).toContain('最终合入提交上核对');
-  expect(templateFor('review', false)).not.toContain('最终合入提交');
-  expect(templateFor('rework')).toContain('findings/round-NN.md');
+  const card = { title: '导出', requirement: '导出 CSV', acceptance: '列头正确' };
+  expect(composeMessage('review', card, true)).toContain('复核结论：通过');
+  expect(composeMessage('review', card, true)).toContain('最终合入提交上核对');
+  expect(composeMessage('review', card, false)).not.toContain('最终合入提交');
+  expect(composeMessage('rework', card)).toContain('findings/round-NN.md');
 });
 
 test('machineCriterionId reads the first required machine criterion and falls back when absent', async () => {
@@ -102,7 +102,7 @@ test('review drafts and no-draft review sends use the same code flag as execute'
   // 建单草稿：code=true 时执行和复核都按软件线模板。
   await fake({}).createTaskDrafts('t1', 'engineering', 'qa', true);
   expect(created.find(c => c.step === 'execute')!.body).toContain('在最终提交上');
-  expect(created.find(c => c.step === 'review')!.body).toContain('先查验收标准第 1 条');
+  expect(created.find(c => c.step === 'review')!.body).toContain('先查第 1 条（老板视角的结果）');
   // 旧任务没有复核草稿：prepareSend 即时生成时也必须按工作种类选模板。
   created.length = 0;
   const codeSend = await fake({ executor_role: 'engineering', reviewer_role: 'qa', kind: 'task', work_intent: { kind: 'code' } })

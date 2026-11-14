@@ -2,6 +2,7 @@ import { RecordId, type Surreal } from 'surrealdb';
 import { defaultAcceptanceCriteria } from '../acceptance.ts';
 import type { CreateTask, TaskView } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
+import { composeMessage } from '../outbound-render.ts';
 import { Requirements, type Approval } from './requirements.ts';
 import { iterationPlan } from './planning.ts';
 
@@ -133,13 +134,16 @@ export async function reconcileIterations(db: Surreal, host: ExecutionHost, now 
 export function iterationMessages(input: CreateTask): { execute: string; review: string; includeSent: true } {
   const release = input.acceptanceEnvironment === 'production';
   const code = input.workIntent?.kind === 'code';
+  // 正文与其它任务一样由任务卡组装成三段；这一步的流程约束作为“注意”紧跟在做什么后面。
+  const card = { title: input.title, requirement: input.requirement ?? input.context, resources: input.resources, acceptance: input.acceptanceText };
   const scope = release
-    ? '按 task.md 核对独立复核记录、PR head 与必需检查后合并 PR；无需二次老板审批。GitHub CI/CD 自动部署，不得手工构建或部署。记录 production 的真实部署提交和可核验的 GitHub Deployment/Actions 证据；异常停止推进并报告阻塞。'
-    : code ? '按 task.md 实施、自测并提交 PR，保留 PR head 和 CI 证据。不要合并 PR 或发布；独立复核通过后由既有工程岗完成合并，GitHub CI/CD 自动部署。'
-    : '按 task.md 完成当前步骤，记录可验证证据；有前置缺口请报告阻塞。';
+    ? '核对独立复核记录、PR head 与必需检查后合并 PR，无需二次老板审批。GitHub CI/CD 自动部署，不得手工构建或部署。记录 production 的真实部署提交和可核验的 GitHub Deployment/Actions 证据；异常就停止推进，按受阻收尾。'
+    : code ? '自测后提交 PR，保留 PR head 和 CI 证据。不要合并 PR 或发布；独立复核通过后由既有工程岗合并，GitHub CI/CD 自动部署。'
+    : undefined;
+  const check = release ? '在生产独立复测，核对部署 SHA 和生产部署证据。' : code ? '在 PR head 上独立复验需求与 CI，不合并 PR、不发布。' : undefined;
   return {
     includeSent: true,
-    execute: `${scope} 最终答复写明完成情况、验证证据和产物位置；有代码变更时用单独一行“提交：<完整40位SHA>”标明验证提交。遇到前置缺口首行写“工作结果：受阻”。结束本轮，由执行端保存结果并推进任务。`,
-    review: `${release ? '在生产独立复测 task.md 验收，核对部署 SHA 和生产部署证据。' : code ? '在 PR head 上独立复验需求与 CI，不合并 PR、不发布。' : '独立复验 task.md 的验收与证据。'} 最终答复首行写“复核结论：通过”或“复核结论：退回”，正文列出逐条验收结论与证据；遇到前置缺口首行写“工作结果：受阻”。结束本轮，执行端自动记录结果。`,
+    execute: composeMessage('execute', { ...card, note: scope }, code),
+    review: composeMessage('review', { ...card, note: check }, code),
   };
 }

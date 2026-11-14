@@ -4,11 +4,12 @@ import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from './core-errors.ts';
 import { rolePolicyOf } from './command-guard.ts';
 import { langMatches, ownerLangOf } from './owner-lang.ts';
-import { machineCriterionOf, routeBody, stepOfTask, templateFor, type MessageStep } from './outbound-render.ts';
+import { composeMessage, machineCriterionOf, routeBody, stepOfTask, type MessageStep, type PromptTask } from './outbound-render.ts';
+import { requirementOf } from './dispatcher/brief.ts';
 import { deliveryOf, sourceHash } from './outbound-delivery.ts';
-export { DEFAULT_MACHINE_CRITERION, renderMessage, templateFor } from './outbound-render.ts';
+export { DEFAULT_MACHINE_CRITERION, composeMessage, renderMessage } from './outbound-render.ts';
 
-export type { MessageStep } from './outbound-render.ts';
+export type { MessageStep, PromptTask } from './outbound-render.ts';
 export type MessageState = 'draft' | 'held' | 'sent';
 
 export interface OutboundMessage {
@@ -75,10 +76,44 @@ export class OutboundMessageStore {
   async createDraft(taskId: string, step: MessageStep, role: string, code = false, phase = 'doing', body?: string): Promise<OutboundMessage> {
     if (!STEPS.includes(step)) throw new CompanyError('invalid', `unknown message step ${step}`);
     const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
-      `CREATE outbound_message CONTENT { task: $task, step: $step, role: $role, body: $body,
+      `CREATE outbound_message CONTENT { task: $task, step: $step, role: $role, body: $body, composed: $composed,
         state: 'draft', hold: false, created_at: time::now() } RETURN AFTER;`,
-      { task: this.task(taskId), step, role, body: body ?? templateFor(step, code, phase) });
+      // composed 记下这条正文是按任务卡组装的（及组装参数）：任务卡改了它跟着重算，重派时也按任务卡重新组装。
+      // 路线或需求流水线给的自定义正文没有这个标记，保持原样。
+      { task: this.task(taskId), step, role, body: body ?? composeMessage(step, await this.promptTask(taskId), code, phase),
+        composed: body === undefined ? { code, phase } : undefined });
     return rowView(rows[0]!);
+  }
+
+  /** 任务卡上决定派工正文的字段：做什么、可以用什么、如何验证。 */
+  async promptTask(taskId: string): Promise<PromptTask> {
+    const [rows] = await this.db.query<[Array<{ title?: string; context?: string; requirement?: string; resources?: string; acceptance_text?: string }>]>(
+      'SELECT title, context, requirement, resources, acceptance_text FROM $task;', { task: this.task(taskId) });
+    const row = rows?.[0];
+    return { title: row?.title, requirement: row?.requirement?.trim() || requirementOf(row?.context ?? ''),
+      resources: row?.resources ?? undefined, acceptance: row?.acceptance_text ?? undefined };
+  }
+
+  /**
+   * 任务卡改了之后，让还没发出、老板没改过的草稿跟着重算。只动按任务卡组装的草稿（composed 标记）：
+   * 老板改过的、路线或需求流水线自定义正文的草稿保持原样。
+   */
+  async refreshDrafts(taskId: string): Promise<number> {
+    const card = await this.promptTask(taskId);
+    const [rows] = await this.db.query<[Array<{ id: unknown; step: MessageStep; body: string; composed: { code?: boolean; phase?: string } }>]>(
+      "SELECT id, step, body, composed FROM outbound_message WHERE task = $task AND state != 'sent' AND edited_by = NONE AND composed != NONE;",
+      { task: this.task(taskId) });
+    let changed = 0;
+    for (const draft of rows ?? []) {
+      const body = composeMessage(draft.step, card, draft.composed.code === true, draft.composed.phase ?? 'doing');
+      if (body === draft.body) continue;
+      // 条件更新：这期间老板改了正文或消息已发出，就不动它。
+      const [done] = await this.db.query<[unknown[]]>(
+        "UPDATE $msg SET body = $body WHERE state != 'sent' AND edited_by = NONE AND body = $expected RETURN AFTER;",
+        { msg: draft.id, body, expected: draft.body });
+      if (done?.length) changed++;
+    }
+    return changed;
   }
 
   /** 建任务时为执行岗与复核岗各生成一条 draft；幂等：已有 draft 不重复生成。 */
@@ -342,11 +377,13 @@ export class OutboundMessageStore {
     const code = (step === 'execute' || step === 'rework' || step === 'review') &&
       (row?.work_intent?.kind === 'code' || ['release', 'deploy'].includes(String(row?.kind ?? '')));
     const role = step === 'review' ? String(row?.reviewer_role ?? 'qa') : String(row?.executor_role ?? 'engineering');
-    // A re-dispatch of the same step (lease expired, instance replaced) repeats what was last sent, so an owner edit survives.
-    const [sent] = await this.db.query<[Array<{ body?: string }>]>(
-      `SELECT body, created_at FROM outbound_message WHERE task = $task AND step = $step AND state = 'sent' ORDER BY created_at DESC LIMIT 1;`,
+    // A re-dispatch of the same step (lease expired, instance replaced) repeats what was last sent, so an owner edit or a custom
+    // body survives. Only a body composed from the task card and never edited is composed again: the card is the source of truth.
+    const [sent] = await this.db.query<[Array<{ body?: string; edited_by?: string; composed?: unknown }>]>(
+      `SELECT body, edited_by, composed, created_at FROM outbound_message WHERE task = $task AND step = $step AND state = 'sent' ORDER BY created_at DESC LIMIT 1;`,
       { task: this.task(taskId), step });
-    return this.createDraft(taskId, step, role, code, step === 'review' ? 'review' : 'doing', sent?.[0]?.body);
+    const last = sent?.[0];
+    return this.createDraft(taskId, step, role, code, step === 'review' ? 'review' : 'doing', last?.composed && !last.edited_by ? undefined : last?.body);
   }
 
   async markSent(messageId: string, employeeId: string, body: string): Promise<{ body: string; message: OutboundMessage }> {

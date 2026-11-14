@@ -143,6 +143,7 @@ export interface TaskRow {
   requirement?: string;
   /** The owner-edited acceptance section staged into task.md. */
   acceptance_text?: string;
+  resources?: string;
   version: number;
   submitted_by?: string;
   current_employee?: string;
@@ -215,7 +216,7 @@ export interface IdempotencyRow { payload_digest: string; result: TaskRow }
 export function view(row: TaskRow): TaskView {
   return {
     id: asId(row.id), title: row.title, context: row.context, state: row.state,
-    requirement: row.requirement ?? undefined, acceptanceText: row.acceptance_text ?? undefined,
+    requirement: row.requirement ?? undefined, acceptanceText: row.acceptance_text ?? undefined, resources: row.resources ?? undefined,
     executorRole: row.executor_role, reviewerRole: row.reviewer_role,
     discipline: row.discipline ?? undefined,
     kind: row.kind ?? 'task',
@@ -699,7 +700,7 @@ export class SurrealCompanyCore implements CompanyCore {
       reviewer: input.reviewerRole, tag: input.tag,
       type: input.type, parent: input.parent ? id('task', input.parent) : undefined,
       proposed_in: input.proposed_in,
-      requirement: input.requirement, acceptance_text: input.acceptanceText,
+      requirement: input.requirement, acceptance_text: input.acceptanceText, resources: input.resources?.trim() || undefined,
       kind, project: input.project ? id('project', input.project) : undefined,
       discipline: input.discipline, work_intent: input.workIntent, model_tier: input.modelTier,
       acceptance_criteria: acceptanceCriteria,
@@ -719,7 +720,7 @@ export class SurrealCompanyCore implements CompanyCore {
           title: $title, context: $context, executor_role: $executor, reviewer_role: $reviewer,
           discipline: $discipline, work_intent: $work_intent, project: $project, model_tier: $model_tier,
           tag: $tag, type: $type, parent: $parent, proposed_in: $proposed_in,
-          requirement: $requirement, acceptance_text: $acceptance_text,
+          requirement: $requirement, acceptance_text: $acceptance_text, resources: $resources,
           state: IF $parent != NONE AND $parent_state != 'done' THEN 'planned' ELSE 'ready' END,
           version: 1, fence: 0, submitted_by: NONE, current_employee: NONE,
           delivery_id: NONE, lease_expires_at: NONE, resume_role: NONE, resume_state: 'ready', blocked_to: NONE,
@@ -774,7 +775,7 @@ export class SurrealCompanyCore implements CompanyCore {
         title: `${input.title} · ${next.label}`, context: input.context,
         executorRole: next.executor_role, reviewerRole: next.reviewer_role,
         type: nextType, parent: parent.id,
-        requirement: input.requirement, acceptanceText: input.acceptanceText,
+        requirement: input.requirement, acceptanceText: input.acceptanceText, resources: input.resources,
         project: input.project, codeRepoPath: input.codeRepoPath, tag: input.tag,
         workIntent: input.workIntent, discipline: input.discipline, modelTier: input.modelTier,
         hold: input.hold ?? next.hold,
@@ -790,16 +791,16 @@ export class SurrealCompanyCore implements CompanyCore {
    * its execute/review drafts created immediately. proposed_in records the submit audit that proposed it,
    * which is what a later return uses to void exactly this submission's proposals.
    */
-  private async createProposal(parent: TaskView, proposal: { type: string; title: string; requirement?: string; acceptance?: string }, submitAuditId: string): Promise<TaskView> {
+  private async createProposal(parent: TaskView, proposal: { type: string; title: string; requirement?: string; resources?: string; acceptance?: string }, submitAuditId: string): Promise<TaskView> {
     const route = await getRoute(this.db, proposal.type);
     if (!route?.enabled) throw new CompanyError('invalid', `proposal type ${proposal.type} is missing or disabled`);
     const taskId = randomUUID();
     const [rows] = await this.db.query<[TaskRow]>(
-      `CREATE ONLY $task CONTENT { title: $title, context: $context, requirement: $requirement, acceptance_text: $acceptance,
+      `CREATE ONLY $task CONTENT { title: $title, context: $context, requirement: $requirement, acceptance_text: $acceptance, resources: $resources,
         type: $type, parent: $parent, proposed_in: $proposed_in, executor_role: $ex, reviewer_role: $rev,
         state: 'planned', kind: 'task', version: 1, fence: 0, created_at: time::now() } RETURN AFTER;`,
       { task: id('task', taskId), title: proposal.title, context: proposal.requirement ?? '',
-        requirement: proposal.requirement, acceptance: proposal.acceptance,
+        requirement: proposal.requirement, acceptance: proposal.acceptance, resources: proposal.resources?.trim() || undefined,
         type: proposal.type, parent: id('task', parent.id), proposed_in: submitAuditId,
         ex: route.executor_role, rev: route.reviewer_role });
     const child = view(rows!);

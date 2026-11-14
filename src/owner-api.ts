@@ -133,6 +133,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       const type = optionalText(input.type);
       const requirement = text(input.requirement, 'requirement');
       const acceptanceText = input.acceptanceText ?? input.acceptance_text ?? input.acceptance;
+      const resources = optionalText(input.resources);
       const ownerCred = ownerCredential();
       if (type) {
         const route = await getRoute(db, type);
@@ -141,7 +142,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
           title: text(input.title, 'title', 3), context: requirement,
           executorRole: route.executor_role, reviewerRole: route.reviewer_role,
           type, parent: optionalText(input.parent),
-          requirement, acceptanceText: acceptanceText === undefined ? undefined : text(acceptanceText, 'acceptanceText'),
+          requirement, resources, acceptanceText: acceptanceText === undefined ? undefined : text(acceptanceText, 'acceptanceText'),
           project: optionalText(input.project), codeRepoPath: optionalText(input.codeRepoPath),
           tag: optionalText(input.tag), hold: input.hold === true ? true : undefined,
           kind: 'task',
@@ -176,8 +177,8 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
         hold: input.hold === true ? true : undefined,
         idempotencyKey: key(),
       } as never);
-      await db.query('UPDATE ONLY $task SET requirement = $requirement, acceptance_text = $acceptance;',
-        { task: new RecordId('task', task.id), requirement: requirement2, acceptance: acceptanceText });
+      await db.query('UPDATE ONLY $task SET requirement = $requirement, acceptance_text = $acceptance, resources = $resources;',
+        { task: new RecordId('task', task.id), requirement: requirement2, acceptance: acceptanceText, resources });
       const drafts = await ctx.messages.createTaskDrafts(task.id, executor, reviewer, isEngineering);
       // 扣住 = 扣住派工消息（调度器派工前核对 isHeld）；与按路线建单的 hold 语义一致。
       if (input.hold === true) for (const draft of drafts) await ctx.messages.setHold(draft.id, true, 'owner');
@@ -189,12 +190,16 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       if (input.requirement !== undefined) patch.requirement = text(input.requirement, 'requirement');
       if (input.acceptanceText !== undefined || input.acceptance_text !== undefined || input.acceptance !== undefined) patch.acceptance_text = text(input.acceptanceText ?? input.acceptance_text ?? input.acceptance, 'acceptanceText');
       if (input.title !== undefined) patch.title = text(input.title, 'title', 3);
+      // 可以用什么可以清空：空串即没有额外资源。
+      if (input.resources !== undefined) patch.resources = typeof input.resources === 'string' ? input.resources.trim() : text(input.resources, 'resources');
       if (!Object.keys(patch).length) throw new CompanyError('invalid', 'no fields to update');
       const taskRecord = new RecordId('task', taskId);
       const [rows] = await db.query<[unknown[]]>('UPDATE $task MERGE $patch RETURN AFTER;', { task: taskRecord, patch });
       if (!rows?.length) throw new CompanyError('not_found', 'task not found');
       await db.query("CREATE audit CONTENT { task: $task, actor: $actor, action: 'owner_task_update', evidence: $evidence, at: time::now() };",
         { task: taskRecord, actor: a, evidence: Object.keys(patch).join(', ') });
+      // 任务卡是事实来源：还没发出、老板没改过的派工草稿跟着重算。
+      await ctx.messages.refreshDrafts(taskId);
       return rows[0];
     }
     case 'task.delete': return ctx.owner.retire({ taskId: text(input.taskId, 'taskId'), note: text(input.note, 'note', 2), source: a, key: key() });

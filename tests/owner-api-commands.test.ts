@@ -91,10 +91,13 @@ test('task.update writes an audit row with actor owner:<via> and changed fields'
       return [[]];
     },
   };
-  const { ctx } = makeFakeCtx({ db: { db: fakeDb } as any });
+  const refreshed: string[] = [];
+  const { ctx } = makeFakeCtx({ db: { db: fakeDb } as any, messages: { refreshDrafts: async (taskId: string) => { refreshed.push(taskId); return 0; } } as any });
 
   const result = await ownerApi(ctx, { command: 'task.update', taskId: 't1', requirement: 'new req', title: 'new title' }, 'agent1');
   expect(result).toEqual(updatedTask);
+  // 任务卡改了，未发出的派工草稿跟着重算。
+  expect(refreshed).toEqual(['t1']);
 
   expect(queries.length).toBe(2);
   expect(queries[0].sql).toBe('UPDATE $task MERGE $patch RETURN AFTER;');

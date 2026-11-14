@@ -25,7 +25,7 @@ interface TaskDetail { task: TaskRow; audit?: AuditRow[]; messages?: unknown[]; 
 /** 审计编号的键部分（JSON 里是 `audit:xxx` 或 `audit:⟨xxx⟩`），用来找它的译文。 */
 const auditKey = (id: unknown): string => String(id ?? '').replace(/^audit:/, '').replace(/^⟨(.*)⟩$/, '$1');
 
-const EMPTY_FORM: TaskFormValues = { title: '', requirement: '', acceptanceText: '', executorRole: '', reviewerRole: '', type: '' };
+const EMPTY_FORM: TaskFormValues = { title: '', requirement: '', resources: '', acceptanceText: '', executorRole: '', reviewerRole: '', type: '' };
 
 const GROUPS: ReadonlyArray<{ id: string; label: string; states?: string[] }> = [
   { id: 'all', label: '全部' },
@@ -151,6 +151,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
   const t = detail.task;
   const text = (key: string) => (typeof t[key] === 'string' && (t[key] as string).trim() ? t[key] as string : undefined);
   const description = text('requirement');
+  const resources = text('resources');
   const acceptance = text('acceptance_text') ?? text('acceptanceText') ?? text('acceptance');
   const parent = t.parent ? taskIdOf({ id: t.parent }) : undefined;
   const done = (message: string) => { setPanel(null); setNotice(message); setTick(x => x + 1); };
@@ -182,6 +183,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
       <div class="detail-grid">
         <div class="detail-main">
           <Section title="任务说明">{description ? <p class="prose">{description}</p> : <p class="hint">没有填写说明。</p>}</Section>
+          {resources ? <Section title="可以用什么"><p class="prose">{resources}</p></Section> : null}
           <Section title="验收标准">{acceptance ? <p class="prose">{acceptance}</p> : <p class="hint">没有填写验收标准。</p>}</Section>
           <Section title="进展记录" hint="领取、进度、提交与复核，新的在下。">
             {detail.audit?.length ? (
@@ -254,6 +256,7 @@ export function TaskForm({ parent, onDone, onCancel }: { parent?: string; onDone
     void run('task.create', {
       title: form.title.trim(),
       requirement: form.requirement.trim(),
+      ...(form.resources.trim() ? { resources: form.resources.trim() } : {}),
       acceptanceText: form.acceptanceText.trim(),
       executorRole: form.executorRole,
       reviewerRole: form.reviewerRole,
@@ -269,7 +272,8 @@ export function TaskForm({ parent, onDone, onCancel }: { parent?: string; onDone
     <form class="form" onSubmit={submit} noValidate>
       {parent ? <p class="hint">父任务：<code>{parent}</code></p> : null}
       <Field label="标题" required><input value={form.title} disabled={busy} onInput={e => set('title')(e.currentTarget.value)} /></Field>
-      <Field label="任务说明" required><textarea rows={4} value={form.requirement} disabled={busy} onInput={e => set('requirement')(e.currentTarget.value)} /></Field>
+      <Field label="做什么" required><textarea rows={4} value={form.requirement} disabled={busy} onInput={e => set('requirement')(e.currentTarget.value)} /></Field>
+      <Field label="可以用什么" hint="可空；工具、账号、资料、参考实现。原样写进派工消息的“可以用”一段。"><textarea rows={2} value={form.resources} disabled={busy} onInput={e => set('resources')(e.currentTarget.value)} /></Field>
       <Field label="验收标准" required><textarea rows={3} value={form.acceptanceText} disabled={busy} onInput={e => set('acceptanceText')(e.currentTarget.value)} /></Field>
       <div class="grid-2">
         <Field label="执行岗" required><RoleSelect value={form.executorRole} disabled={busy} onChange={set('executorRole')} /></Field>
