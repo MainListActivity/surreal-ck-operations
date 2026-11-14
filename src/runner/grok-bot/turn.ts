@@ -44,6 +44,8 @@ export interface GrokBotDeps {
 export interface GrokBotOutcome { sessionId: string; status: 'success' | 'error'; text: string }
 
 const BLOCKED = '工作结果：受阻';
+/** 不在工作中、也没有本轮终稿，持续这么久才认定 bot 停下了。 */
+export const IDLE_GIVE_UP_MS = 5 * 60_000;
 const BOT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const REVIEW_PREFIX = /^复核结论：(通过|退回)/;
 
@@ -92,7 +94,9 @@ function prelude(t: WebTarget): string {
   const space = t.site === 'grok-bot' ? `sck-grok-bot-${(t.botId ?? '').slice(0, 8)}` : 'sck-muse-web';
   // working：grok 主区末尾 Working / status；muse 有「Stop task」按钮或「is working / typing」状态。
   const working = t.site === 'grok-bot'
-    ? `[...document.querySelectorAll('[role=status]')].some(e => /Working/.test((e.innerText || '') + (e.getAttribute('aria-label') || ''))) || [...document.querySelectorAll('body *')].some(e => e.childElementCount === 0 && (e.innerText || '').trim() === 'Working')`
+    // grok：工作中会挂一个有文字的状态（实测「Working」「On its computer」，以后可能还有别的说法）；
+    // 空的状态节点和「已复制」之类的提示不算。
+    ? `[...document.querySelectorAll('[role=status]')].some(e => { const t = ((e.innerText || '') + ' ' + (e.getAttribute('aria-label') || '')).trim(); return !!t && !/^(Copied|Saved|Notifications)/i.test(t); }) || [...document.querySelectorAll('body *')].some(e => e.childElementCount === 0 && (e.innerText || '').trim() === 'Working')`
     : `!!document.querySelector('button[aria-label="Stop task"]') || [...document.querySelectorAll('[role=status]')].some(e => /typing|working/i.test((e.innerText || '') + (e.getAttribute('aria-label') || '')))`;
   const login = t.site === 'grok-bot'
     ? `!location.pathname.startsWith('/bot/') || (/\\b(Sign in|Log in|Sign up)\\b/.test(document.body.innerText.slice(0, 600)) && !document.querySelector('[contenteditable=true][role=textbox]'))`
@@ -111,8 +115,8 @@ await p.waitForTimeout(3000);
 // 页面就绪：输入框在、消息已渲染、对话文本连续两次读数不变才算加载完；半渲染的页面会被误判成「空闲、没发过」。
 let ready = false, prevLen = -1;
 for (let i = 0; i < 14 && !ready; i++) {
-  const r = await p.evaluate(([sel, msg]) => ({ input: !!document.querySelector(sel), messages: !msg || [...document.querySelectorAll(msg)].some(e => e.checkVisibility({ visibilityProperty: true })), len: (document.body.innerText || '').length }), [${JSON.stringify(inputSel)}, ${JSON.stringify(messageSel)}]);
-  ready = r.input && (r.messages || i >= 10) && r.len > 0 && r.len === prevLen;
+  const r = await p.evaluate(([sel, msg]) => ({ input: !!document.querySelector(sel), messages: !msg || [...document.querySelectorAll(msg)].some(e => e.checkVisibility({ visibilityProperty: true })), len: (document.body.innerText || '').length, loading: /Loading conversation/i.test(document.body.innerText || '') }), [${JSON.stringify(inputSel)}, ${JSON.stringify(messageSel)}]);
+  ready = r.input && !r.loading && (r.messages || i >= 10) && r.len > 0 && r.len === prevLen;
   prevLen = r.input ? r.len : -1;
   if (!ready) await p.waitForTimeout(1500);
 }
@@ -261,7 +265,7 @@ export async function runGrokBotTurn(input: GrokBotInput, deps: GrokBotDeps): Pr
   }
 
   // 轮询：要求连续两次看到「不在工作中且有同一份终稿」，避免取到还在续写的半截答复。
-  let idleWithoutDone = 0, settledDone: string | undefined, lastWorking = false, lastTail = '';
+  let idleSince: number | undefined, settledDone: string | undefined, lastWorking = false, lastTail = '';
   for (;;) {
     await deps.sleep(pollMs);
     const s = await deps.browse(stateScript(target, marker), 90_000);
@@ -279,10 +283,11 @@ export async function runGrokBotTurn(input: GrokBotInput, deps: GrokBotDeps): Pr
         settledDone = done;
       } else settledDone = undefined;
       if (!working && !done) {
-        idleWithoutDone += 1;
+        idleSince ??= deps.now();
         if (s.question === true) return blocked(`${label} 停下来提问，需要人工回答：${String(s.tail ?? '').slice(-400)}`);
-        if (idleWithoutDone >= 6) return blocked(`${label} 已停止但没有按约定给出 SCK-DONE 终稿：${String(s.tail ?? '').slice(-400)}`);
-      } else idleWithoutDone = 0;
+        // 多步工作的 bot 会在步骤之间短暂空闲：连续空闲满 IDLE_GIVE_UP_MS 仍没有终稿才按受阻收尾。
+        if (deps.now() - idleSince >= IDLE_GIVE_UP_MS) return blocked(`${label} 已停止但没有按约定给出 SCK-DONE 终稿：${String(s.tail ?? '').slice(-400)}`);
+      } else idleSince = undefined;
       deps.progress(working ? `${label} 工作中（${marker}）` : done ? `${label} 已给出终稿，确认中` : `${label} 空闲，等待终稿`);
     }
     // 已发出但超时：bot 可能还在做或卡住了。按受阻收尾并带回现场，恢复本任务时只等终稿、不会重发。

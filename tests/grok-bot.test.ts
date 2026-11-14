@@ -117,6 +117,25 @@ describe('grok-bot turn', () => {
     expect(await run()).toMatchObject({ status: 'success', text: '梗概正文……' });
   });
 
+  test('short idle gaps between steps do not block; five idle minutes without a final answer do', async () => {
+    const idle = { ok: true, sent: true, working: false, done: null };
+    const busy = { ok: true, sent: true, working: true, done: null };
+    // 1 s polls: 4 idle minutes, then work again, then the final answer
+    states = [...Array(240).fill(idle), busy, { ok: true, sent: true, working: false, done: '梗概正文……' }];
+    expect(await run({ config: { pollMs: 1000, maxMinutes: 30 } })).toMatchObject({ status: 'success', text: '梗概正文……' });
+    states = [idle];
+    const out = await run({ config: { pollMs: 1000, maxMinutes: 30 } });
+    expect(out.text.startsWith('工作结果：受阻')).toBe(true);
+    expect(clock).toBeGreaterThanOrEqual(5 * 60_000);
+  });
+
+  test('grok working detection counts any non-empty status (e.g. "On its computer") and waits out "Loading conversation"', () => {
+    const state = stateScript({ site: 'grok-bot', botId: BOT }, 'm1');
+    expect(state).toContain("[role=status]");
+    expect(state).toContain('Copied|Saved|Notifications');
+    expect(state).toContain('Loading conversation');
+  });
+
   test('waits while the bot is busy, then sends', async () => {
     sends = [{ ok: false, code: 'busy' }, { ok: false, code: 'busy' }, { ok: true }];
     expect(await run()).toMatchObject({ status: 'success' });
