@@ -42,14 +42,18 @@ const CLOSE_EXECUTE = `做完后在最终答复里写清完成情况、验证结
 const CLOSE_REVIEW = `最终答复首行写“复核结论：通过”或“复核结论：退回”，随后逐条给出证据，然后结束本轮；无法复核时首行写“工作结果：受阻”并说明缺什么。`;
 const REVIEW_FIRST = `先查第 1 条（老板视角的结果），不成立就说明原因并退回；成立后再逐条复验其余标准。`;
 
+/** 资源清单内联的上限：三段都顶格时整条消息仍在补译上限（20000 字）之内。 */
+export const RESOURCES_LIMIT = 3000;
 const resourcesSection = (task: PromptTask): string =>
-  ['可以用：', task.resources?.trim(), COMMON_RESOURCES].filter(Boolean).join('\n');
+  ['可以用：', (task.resources?.trim().length ?? 0) > RESOURCES_LIMIT ? '任务卡列的资源见 task.md 的“可以用”一节。' : task.resources?.trim(),
+    COMMON_RESOURCES].filter(Boolean).join('\n');
 
 function executeMessage(task: PromptTask, code: boolean): string {
   const what = fits(task.requirement) ? task.requirement!.trim() : `完成${titled(task)}，完整需求在 task.md。`;
   const verify = ['验证：',
     fits(task.acceptance) ? task.acceptance!.trim() : task.acceptance?.trim() ? '按 task.md 的验收标准逐条自验。' : '自己验证结果成立，并说明是怎么验证的。',
-    code ? '在最终提交上逐条自验。' : undefined, CLOSE_EXECUTE].filter(Boolean).join('\n');
+    // 提交行留着：上线核验要的是实际合并提交，执行端从工作树取的 HEAD 可能还是合并前的 PR head。
+    code ? '在最终提交上逐条自验，最终答复用单独一行“提交：<完整40位SHA>”标明被验证的提交。' : undefined, CLOSE_EXECUTE].filter(Boolean).join('\n');
   return [what, task.note?.trim() ? `注意：${task.note.trim()}` : undefined, resourcesSection(task), verify].filter(Boolean).join('\n\n');
 }
 

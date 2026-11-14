@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { taskBrief } from '../src/dispatcher/brief.ts';
-import { composeMessage, INLINE_LIMIT, renderMessage, unrenderMessage } from '../src/outbound-render.ts';
+import { composeMessage, INLINE_LIMIT, RESOURCES_LIMIT, renderMessage, unrenderMessage } from '../src/outbound-render.ts';
 import { taskMaterial } from '../src/runner/cloud-lane/lane.ts';
 import { workResult } from '../src/runner/lifecycle.ts';
 
@@ -24,11 +24,12 @@ test('执行消息就是任务卡的三段：做什么、可以用、验证', ()
   ].join('\n'));
 });
 
-test('代码任务只多一句在最终提交上自验，不再要求写提交 SHA', () => {
+test('代码任务只多一句：在最终提交上自验并写明提交，执行端认得这一行', () => {
   const body = composeMessage('execute', card, true);
-  expect(body).toContain('在最终提交上逐条自验。');
-  expect(body).not.toContain('提交：');
-  expect(body).not.toContain('SHA');
+  expect(body).toContain('在最终提交上逐条自验，最终答复用单独一行“提交：<完整40位SHA>”标明被验证的提交。');
+  expect(composeMessage('execute', card)).not.toContain('提交：');
+  const sha = 'a'.repeat(40);
+  expect(workResult(`已完成\n提交：${sha}`, 'doing').evidence.sha).toBe(sha);
 });
 
 test('复核、返工、催办都带着任务卡原文，收尾约定仍能被执行端判定', () => {
@@ -59,6 +60,10 @@ test('超长的需求或验收不内联，改为指向 task.md', () => {
   expect(body).toContain('按 task.md 的验收标准逐条自验。');
   expect(body.length).toBeLessThan(600);
   expect(composeMessage('review', { title: '大需求', requirement: long, acceptance: long })).toContain('原需求见 task.md。');
+  // 三段都顶格时仍在补译上限 20000 字之内；资源清单超长同样改为指向 task.md。
+  const edge = '长'.repeat(INLINE_LIMIT);
+  expect(composeMessage('review', { title: 't', requirement: edge, resources: '资'.repeat(RESOURCES_LIMIT), acceptance: edge, note: '注'.repeat(200) }, true).length).toBeLessThan(20_000);
+  expect(composeMessage('execute', { title: 't', requirement: 'x', resources: '资'.repeat(RESOURCES_LIMIT + 1) })).toContain('任务卡列的资源见 task.md 的“可以用”一节。');
 });
 
 test('老板文字里的路径、任务号和命令渲染后逐字不变，改完能原样存回', () => {

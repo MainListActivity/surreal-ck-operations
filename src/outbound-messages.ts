@@ -101,13 +101,13 @@ export class OutboundMessageStore {
   async refreshDrafts(taskId: string): Promise<number> {
     const card = await this.promptTask(taskId);
     const [rows] = await this.db.query<[Array<{ id: unknown; step: MessageStep; body: string; composed: { code?: boolean; phase?: string } }>]>(
-      "SELECT id, step, body, composed FROM outbound_message WHERE task = $task AND state != 'sent' AND edited_by = NONE AND composed != NONE;",
+      "SELECT id, step, body, composed FROM outbound_message WHERE task = $task AND state != 'sent' AND edited_by = NONE AND composed != NONE AND dispatch_attempt = NONE;",
       { task: this.task(taskId) });
     let changed = 0;
     for (const draft of rows ?? []) {
       const body = composeMessage(draft.step, card, draft.composed.code === true, draft.composed.phase ?? 'doing');
       if (body === draft.body) continue;
-      // 条件更新：这期间老板改了正文或消息已发出，就不动它。
+      // 条件更新：这期间老板改了正文或消息已发出，就不动它。正在派出的消息（dispatch_attempt）正文已冻结，上面已排除。
       const [done] = await this.db.query<[unknown[]]>(
         "UPDATE $msg SET body = $body WHERE state != 'sent' AND edited_by = NONE AND body = $expected RETURN AFTER;",
         { msg: draft.id, body, expected: draft.body });

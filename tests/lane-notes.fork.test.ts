@@ -182,7 +182,7 @@ run('a task approved after two returns keeps only the passing round\'s five note
     { command: 'message.list', taskId: freshTask.id }, 'web') as { messages: { body: string }[] }).messages).toHaveLength(2);
   // 正文就是任务卡：做什么、可以用、验证三段。
   expect(execute).toStartWith('实现验收标准\n\n可以用：\n');
-  expect(execute).toContain('验证：\n老板能看到结果\n在最终提交上逐条自验。');
+  expect(execute).toContain('验证：\n老板能看到结果\n在最终提交上逐条自验，');
   expect(execute).not.toContain('升级卡');
   expect(review).toStartWith('独立复验《新建代码任务》的交付');
   expect(review).toContain('先查第 1 条（老板视角的结果）');

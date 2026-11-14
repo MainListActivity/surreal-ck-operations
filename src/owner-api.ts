@@ -199,7 +199,8 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       await db.query("CREATE audit CONTENT { task: $task, actor: $actor, action: 'owner_task_update', evidence: $evidence, at: time::now() };",
         { task: taskRecord, actor: a, evidence: Object.keys(patch).join(', ') });
       // 任务卡是事实来源：还没发出、老板没改过的派工草稿跟着重算。
-      await ctx.messages.refreshDrafts(taskId);
+      // 重算失败不能让已经落库并写了审计的任务修改报错：记日志，草稿留到重派时按任务卡重新组装。
+      await ctx.messages.refreshDrafts(taskId).catch(error => console.warn(`draft refresh failed for ${taskId}: ${(error as Error).message}`));
       return rows[0];
     }
     case 'task.delete': return ctx.owner.retire({ taskId: text(input.taskId, 'taskId'), note: text(input.note, 'note', 2), source: a, key: key() });
