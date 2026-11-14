@@ -12,5 +12,10 @@ next：不超过 800 字符，是老板会对下一个接手的人说的话：�
 confidence：结果里的证据足以支持你的判断写 high；结果含糊、互相矛盾、只有结论没有证据、或你需要猜，写 low。
 不虚构事实，结果里没写的不要补。`;
 
-export const analyzeTurnWith = (config: Magpie, fetchImpl: typeof fetch = fetch): AnalyzeTurn => async input =>
-  modelJson(await chatText(config, [{ role: 'system', content: SYSTEM }, { role: 'user', content: JSON.stringify(input) }], fetchImpl));
+/** 缺省的分析模型：公司网关密钥本来就允许的 haiku 档路由组。 */
+export const DEFAULT_ANALYSIS_MODEL = 'group/sck-haiku';
+/** 分析模型会先推理再作答，实测一条 8 到 18 秒：上限比译文的 20 秒宽。 */
+export const ANALYSIS_TIMEOUT_MS = 40_000;
+
+export const analyzeTurnWith = (config: Magpie, fetchImpl: typeof fetch = fetch, model: string = DEFAULT_ANALYSIS_MODEL): AnalyzeTurn => async input =>
+  modelJson(await chatText({ ...config, model }, [{ role: 'system', content: SYSTEM }, { role: 'user', content: JSON.stringify(input) }], fetchImpl, ANALYSIS_TIMEOUT_MS));

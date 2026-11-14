@@ -17,6 +17,7 @@ export async function chatText(
   cfg: Magpie,
   messages: Array<{ role: 'system' | 'user'; content: string }>,
   fetchImpl: typeof fetch = fetch,
+  timeoutMs = 20_000,
 ): Promise<string> {
   let response: Response;
   try {
@@ -24,7 +25,7 @@ export async function chatText(
       method: 'POST',
       headers: { authorization: `Bearer ${cfg.apiKey}`, 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify({ model: cfg.model, temperature: 0, messages }),
-      signal: AbortSignal.timeout(20_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch {
     throw new CompanyError('upstream_error', '译文服务不可达');

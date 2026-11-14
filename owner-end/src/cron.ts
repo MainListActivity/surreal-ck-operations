@@ -178,7 +178,7 @@ export async function runScheduled(cfg: Config, sessions: Sessions, cron: string
       : { skipped: 'not_configured' };
     const planning = cfg.magpie ? await planRequirements(db, planRequirementWith(cfg.magpie, options.fetch), now.getTime()).catch(() => ({ failed: true })) : { skipped: 'not_configured' };
     // 完工分析排在最后：补译和规划先用这一分钟，分析每轮最多两条，只记录不改消息。
-    const analyses = cfg.magpie ? await analyzeTurns(db, analyzeTurnWith(cfg.magpie, options.fetch), now.getTime()).catch(() => ({ failed: true })) : { skipped: 'not_configured' };
+    const analyses = cfg.magpie ? await analyzeTurns(db, analyzeTurnWith(cfg.magpie, options.fetch, cfg.analysisModel), now.getTime()).catch(() => ({ failed: true })) : { skipped: 'not_configured' };
     return { identities, translations, replies, feedback, planning, analyses };
   });
 }

@@ -97,6 +97,7 @@ describe('the schema a target version must have reached', () => {
     expect(schemaRequirementFor('0.13.12').schema).toBe(69);
     expect(schemaRequirementFor('0.13.13').schema).toBe(70);
     expect(schemaRequirementFor('0.13.14').schema).toBe(71);
+    expect(schemaRequirementFor('0.13.15').schema).toBe(71);
     expect(CLOUD_SCHEMA_VERSION).toBe(71);
   });
 
