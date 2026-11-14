@@ -33,6 +33,8 @@ export interface Env {
   MAGPIE_BASE_URL?: string;
   MAGPIE_MODEL?: string;
   MAGPIE_API_KEY?: string;
+  /** 完工分析用的模型；缺省为公司的 haiku 档路由组。分析要读懂任务卡与结果，和译文不是同一档活。 */
+  MAGPIE_ANALYSIS_MODEL?: string;
   /** 仅本地开发（.dev.vars）：用 root 连本机 SurrealDB；readConfig 只在库地址为本机时接受。生产配置里不存在这两项。 */
   DEV_DB_ROOT_USER?: string;
   DEV_DB_ROOT_PASS?: string;
@@ -77,6 +79,8 @@ export interface Config {
   cf?: { accountId: string; token: string };
   /** 译文服务（magpie，OpenAI 兼容 chat completions）。 */
   magpie?: { baseUrl: string; model: string; apiKey: string };
+  /** 完工分析用的模型（MAGPIE_ANALYSIS_MODEL，缺省 group/sck-haiku）。 */
+  analysisModel?: string;
   /** 仅本地开发。 */
   devRoot?: { username: string; password: string };
 }
@@ -157,6 +161,7 @@ export function readConfig(env: Env): Config {
       apiKey: text(env.MAGPIE_API_KEY),
     };
   }
+  if (text(env.MAGPIE_ANALYSIS_MODEL)) config.analysisModel = text(env.MAGPIE_ANALYSIS_MODEL);
   if (text(env.DEV_DB_ROOT_USER) && text(env.DEV_DB_ROOT_PASS)) {
     // root 口令会让每个会话都以 root 连接（见 db.ts），只许指向本机库；误配到生产库时直接拒绝，不悄悄放开权限。
     if (!LOCAL_HOSTS.has(new URL(db.url).hostname)) {

@@ -373,3 +373,17 @@ describe('runScheduled 按 cron 表达式分派', () => {
     expect(calls.some((c) => c.sql.includes('lane_note'))).toBe(false);
   });
 });
+
+test('完工分析用公司网关允许的模型组，不跟译文的 MAGPIE_MODEL，调用上限 40 秒', async () => {
+  const { analyzeTurnWith, DEFAULT_ANALYSIS_MODEL, ANALYSIS_TIMEOUT_MS } = await import('../src/turn-analyst.ts');
+  const seen: string[] = [];
+  const reply = { choices: [{ message: { content: '{"status":"partial","summary":"s","needs":[],"next":"","confidence":"low"}' } }] };
+  const fakeFetch = (async (_url: unknown, init?: { body?: unknown }) => { seen.push(JSON.parse(String(init?.body)).model); return Response.json(reply); }) as unknown as typeof fetch;
+  const magpie = { baseUrl: 'https://magpie.test/v1', model: 'auto/translate-only', apiKey: 'k' };
+  const input = { action: 'submit', task: { title: 't', requirement: 'r' }, result: 'x' };
+  expect(await analyzeTurnWith(magpie, fakeFetch)(input)).toMatchObject({ status: 'partial' });
+  await analyzeTurnWith(magpie, fakeFetch, 'group/custom')(input);
+  expect(seen).toEqual([DEFAULT_ANALYSIS_MODEL, 'group/custom']);
+  expect(DEFAULT_ANALYSIS_MODEL).toBe('group/sck-haiku');
+  expect(ANALYSIS_TIMEOUT_MS).toBe(40_000);
+});
