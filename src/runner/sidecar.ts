@@ -12,7 +12,7 @@ import type { TurnEnded } from './contracts.ts';
 import { OpsCircuit } from "./ops-circuit.ts";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readdirSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { latestFindings, taskBrief } from "../dispatcher/brief.ts";
+import { answerFile, latestAnswer, latestFindings, taskBrief } from "../dispatcher/brief.ts";
 import { basename, dirname, join } from "node:path";
 import {
   blockerPath, commDir, ensureCommDirs, readJsonFile, readTextFile, reportPath, reqDir, resDir,
@@ -221,6 +221,9 @@ function writeBrief(dir: string, claim: ClaimResult): void {
   rmSync(join(dir, "findings"), { recursive: true, force: true });
   writeFileAtomic(join(dir, "task.md"), taskBrief(claim));
   writeFileAtomic(join(dir, "notes.md"), claim.laneNotes ?? "（这条线的笔记暂时读不到，直接按 task.md 干活）\n");
+  // 老板对上次受阻的答复：太长时消息指向这个文件，云端与网页通道把它内联进提示词。
+  const answer = latestAnswer(claim.history);
+  if (answer) writeFileAtomic(join(dir, "answer.md"), answerFile(answer)); else rmSync(join(dir, "answer.md"), { force: true });
   const findings = latestFindings(claim.history);
   if (!findings) return;
   mkdirSync(join(dir, "findings"), { recursive: true, mode: 0o700 });

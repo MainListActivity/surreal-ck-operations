@@ -100,7 +100,7 @@ const pause = (ms: number): Promise<void> => new Promise(resolve => {
 });
 
 /** 本版本 applySchema 的最后一个结构版本；云端 bootstrap 只核对库内版本不低于它。 */
-export const CLOUD_SCHEMA_VERSION = 69;
+export const CLOUD_SCHEMA_VERSION = 70;
 
 export class CompanyDatabase {
   /** 当前会话的客户端；云端续期或重连时整体替换（见 rebuildNow）。 */
@@ -439,7 +439,7 @@ export class CompanyDatabase {
   }
 
   /**
-   * 按序应用全部 schema（001 至 069；055 按配置渲染）。fresh 时写入归属标记。本机 bootstrap 与云端 company-migrate 共用；
+   * 按序应用全部 schema（001 至 070；055 按配置渲染）。fresh 时写入归属标记。本机 bootstrap 与云端 company-migrate 共用；
    * 云端只有 migrator 能应用。
    */
   async applySchema(fresh: boolean): Promise<void> {
@@ -619,6 +619,9 @@ export class CompanyDatabase {
     // 069：任务卡的“可以用什么”（task.resources），派工正文第二段的来源。
     await this.db.query(loadSchema('069-task-resources.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 69 WHERE schema_version < 69;');
+    // 070：完工分析表（turn_analysis），只记录与展示。
+    await this.db.query(loadSchema('070-turn-analysis.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 70 WHERE schema_version < 70;');
   }
 
   /** Selects the configured namespace/database without touching schema (runtimes that only query). */

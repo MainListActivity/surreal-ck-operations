@@ -182,6 +182,8 @@ export interface BoardOutboxRow {
    */
   workdirPending: boolean;
   hold: boolean;
+  /** Why the system held it by rule (a second rework round, a new requirement's first dispatch); absent on the owner's own hold. */
+  holdReason?: string;
   /** The language the stored body is written in: the owner's language (company_meta:config.owner_lang, zh by default). */
   lang: string;
   editable: true;
@@ -198,6 +200,7 @@ export interface BoardMessageRow {
   step: MessageStep;
   state: 'draft' | 'held';
   hold: boolean;
+  holdReason?: string;
   /** The stored body (原文). Not rendered: a queued task names no employee, and the owner edits the stored text. */
   body: string;
   /**
@@ -454,6 +457,7 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
     return {
       messageId: keyOf(row.id), taskId, title: titleOf(taskId), step: String(row.step) as MessageStep,
       state: row.state === 'held' ? 'held' : 'draft', hold: row.hold === true, body: message.body,
+      ...(typeof row.hold_reason === 'string' && row.hold === true ? { holdReason: row.hold_reason } : {}),
       context: contexts.get(taskId),
       ...(translation ? { lang: translation.lang, translation } : {}),
       ...(employeeId ? { employeeId } : {}),
@@ -498,6 +502,7 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
     return { messageId: keyOf(draft.id), taskId, title: String(row.title ?? ''), step,
       context: contexts.get(taskId),
       body: dispatchText(renderMessage(message.body, ctx), workdir), workdirPending: workdir === undefined, hold: heldAt(taskId), lang: ownerLang, editable: true,
+      ...(typeof draft.hold_reason === 'string' && heldAt(taskId) ? { holdReason: draft.hold_reason } : {}),
       ...(translation ? { translation } : {}) };
   };
 

@@ -500,7 +500,10 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
               if (!credential) throw new Error('owner credential unavailable');
               const task = await ctx.core.createTask(credential, input);
               // Core 幂等回放后也补齐消息，恢复创建成功但消息尚未落库的中断。
-              await ctx.messages.createTaskDrafts(task.id, task.executorRole, task.reviewerRole, input.workIntent?.kind === 'code', iterationMessages(input));
+              const drafts = await ctx.messages.createTaskDrafts(task.id, task.executorRole, task.reviewerRole, input.workIntent?.kind === 'code', iterationMessages(input));
+              // 新需求的首次派工先扣住等老板看一眼消息；只在草稿刚建出来时扣一次，幂等回放与老板放行后都不会再扣。
+              const first = !input.parent ? drafts.find(draft => draft.step === 'execute') : undefined;
+              if (first) await ctx.messages.holdForPolicy(first.id, '新需求的首次派工').catch(() => undefined);
               return task;
             },
           })).catch(() => console.warn('iteration reconciliation failed'));

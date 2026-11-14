@@ -121,6 +121,8 @@ export interface MessageView {
   stepText: string;
   body: string;
   hold: boolean;
+  /** 系统按规则扣住时的原因；老板自己扣住的没有。 */
+  holdReason?: string;
   taskId?: string;
 }
 
@@ -155,6 +157,7 @@ export function messageView(row: BoardMessageRow): MessageView {
     body: row.body,
     context: row.context,
     hold: row.hold === true,
+    holdReason: row.holdReason,
     taskId: row.taskId,
   };
 }
@@ -167,6 +170,7 @@ export function outboxView(row: BoardOutboxRow): OutboxView {
     body: row.body,
     context: row.context,
     hold: row.hold === true,
+    holdReason: row.holdReason,
     taskId: row.taskId,
     workdirPending: row.workdirPending === true,
     translation: translationView(row.translation),

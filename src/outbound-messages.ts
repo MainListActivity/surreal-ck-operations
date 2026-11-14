@@ -5,7 +5,7 @@ import { CompanyError } from './core-errors.ts';
 import { rolePolicyOf } from './command-guard.ts';
 import { langMatches, ownerLangOf } from './owner-lang.ts';
 import { composeMessage, machineCriterionOf, routeBody, stepOfTask, type MessageStep, type PromptTask } from './outbound-render.ts';
-import { requirementOf } from './dispatcher/brief.ts';
+import { latestAnswer, requirementOf } from './dispatcher/brief.ts';
 import { deliveryOf, sourceHash } from './outbound-delivery.ts';
 export { DEFAULT_MACHINE_CRITERION, composeMessage, renderMessage } from './outbound-render.ts';
 
@@ -20,6 +20,8 @@ export interface OutboundMessage {
   body: string;
   state: MessageState;
   hold: boolean;
+  /** 系统按规则扣住时的原因（第二轮返工、新需求首次派工）；老板自己扣住的没有。 */
+  holdReason?: string;
   editedBy?: string;
   editedAt?: string;
   sentTo?: string;
@@ -53,6 +55,7 @@ const rowView = (row: Record<string, unknown>): OutboundMessage => ({
   id: String((row.id as RecordId).id ?? row.id), taskId: String((row.task as RecordId)?.id ?? row.task ?? ''),
   step: String(row.step) as MessageStep, role: String(row.role ?? ''), body: String(row.body ?? ''),
   state: (String(row.state ?? 'draft')) as MessageState, hold: row.hold === true,
+  holdReason: textOf(row.hold_reason),
   editedBy: row.edited_by === undefined || row.edited_by === null ? undefined : String(row.edited_by),
   editedAt: timestamp(row.edited_at),
   sentTo: row.sent_to === undefined || row.sent_to === null ? undefined : String(row.sent_to),
@@ -90,8 +93,38 @@ export class OutboundMessageStore {
     const [rows] = await this.db.query<[Array<{ title?: string; context?: string; requirement?: string; resources?: string; acceptance_text?: string }>]>(
       'SELECT title, context, requirement, resources, acceptance_text FROM $task;', { task: this.task(taskId) });
     const row = rows?.[0];
+    // 老板对上次受阻的答复：只要还没有新的工作结果跟上，就随下一条消息带给员工。
+    const [events] = await this.db.query<[Array<{ action: string; evidence?: unknown; at: unknown }>]>(
+      `SELECT action, evidence, at FROM audit WHERE task = $task AND action IN ['block', 'owner_reply', 'submit', 'owner_submit', 'return', 'accept', 'owner_reject', 'owner_approve']
+        ORDER BY at DESC LIMIT 8;`, { task: this.task(taskId) });
+    const answer = latestAnswer((events ?? []).reverse().map(event => ({ action: event.action, actor: '', at: String(event.at),
+      evidence: typeof event.evidence === 'string' ? event.evidence : undefined })));
     return { title: row?.title, requirement: row?.requirement?.trim() || requirementOf(row?.context ?? ''),
-      resources: row?.resources ?? undefined, acceptance: row?.acceptance_text ?? undefined };
+      resources: row?.resources ?? undefined, acceptance: row?.acceptance_text ?? undefined, ...(answer ? { answer } : {}) };
+  }
+
+  /** 公司配置 auto_hold：false 时关闭系统自动扣住（第二轮返工、新需求首次派工）；缺省开启。 */
+  private async autoHold(): Promise<boolean> {
+    const [rows] = await this.db.query<[Array<{ auto_hold?: unknown }>]>('SELECT auto_hold FROM company_meta:config;');
+    return rows?.[0]?.auto_hold !== false;
+  }
+
+  /**
+   * 系统按规则扣住一条草稿，等老板看过再放行。不写 edited_by：这不是老板的操作，也不算改过正文。
+   * 已发出或正在派出的消息不动；老板放行时原因一并清掉。
+   */
+  async holdForPolicy(messageId: string, reason: string): Promise<boolean> {
+    if (!await this.autoHold()) return false;
+    const [rows] = await this.db.query<[unknown[]]>(
+      "UPDATE $msg SET hold = true, state = 'held', hold_reason = $reason WHERE state = 'draft' AND dispatch_attempt = NONE RETURN AFTER;",
+      { msg: this.message(messageId), reason });
+    return Boolean(rows?.length);
+  }
+
+  /** 这一步的草稿被扣住的原因：系统规则扣住时有，老板自己扣住的没有。 */
+  async holdReason(taskId: string, step: MessageStep): Promise<string | undefined> {
+    const draft = await this.latestDraft(taskId, step);
+    return draft?.hold ? draft.holdReason : undefined;
   }
 
   /**
@@ -211,7 +244,7 @@ export class OutboundMessageStore {
   async setHold(messageId: string, hold: boolean, actor: string): Promise<OutboundMessage> {
     const msg = this.message(messageId);
     const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
-      `UPDATE $msg SET hold = $hold, state = IF $hold THEN 'held' ELSE 'draft' END,
+      `UPDATE $msg SET hold = $hold, state = IF $hold THEN 'held' ELSE 'draft' END, hold_reason = NONE,
         edited_by = $actor, edited_at = time::now() WHERE state != 'sent' RETURN AFTER;`,
       { msg, hold, actor });
     const row = rows?.[0];
@@ -274,6 +307,8 @@ export class OutboundMessageStore {
    */
   async prepareSend(taskId: string, step: MessageStep, employeeId: string): Promise<{ body: string; message: OutboundMessage } | null> {
     const employeeLang = await this.langOf(employeeId);
+    // 发出前按任务卡与最新进展（如老板刚答复了受阻）重算一次没改过的草稿：发出去的永远是当前事实。失败不挡派工。
+    await this.refreshDrafts(taskId).catch(error => console.warn(`draft refresh before send failed for ${taskId}: ${(error as Error).message}`));
     // 旧任务没有草稿：按模板即时生成一条，保证派工正文永远来自这张表。
     let draft = await this.latestDraft(taskId, step) ?? await this.seedDraft(taskId, step);
     if (draft.hold || draft.state === 'held') return null;
@@ -384,7 +419,20 @@ export class OutboundMessageStore {
       `SELECT body, body_edited, composed, created_at FROM outbound_message WHERE task = $task AND step = $step AND state = 'sent' ORDER BY created_at DESC LIMIT 1;`,
       { task: this.task(taskId), step });
     const last = sent?.[0];
-    return this.createDraft(taskId, step, role, code, step === 'review' ? 'review' : 'doing', last?.composed && last.body_edited !== true ? undefined : last?.body);
+    const draft = await this.createDraft(taskId, step, role, code, step === 'review' ? 'review' : 'doing', last?.composed && last.body_edited !== true ? undefined : last?.body);
+    // 第二轮及以上返工先扣住等老板看：反复退回多半是需求或验收有分歧，继续自动派只会空转。
+    // 同一轮返工的重派（租约过期、换实例）不再扣：最近一次退回之后已经发过返工消息。
+    if (step === 'rework') {
+      const [returns] = await this.db.query<[Array<{ at: unknown }>]>(
+        "SELECT at FROM audit WHERE task = $task AND action IN ['return', 'owner_reject'] ORDER BY at DESC;", { task: this.task(taskId) });
+      const [resent] = await this.db.query<[unknown[]]>(
+        "SELECT id FROM outbound_message WHERE task = $task AND step = 'rework' AND state = 'sent' AND sent_at > $since LIMIT 1;",
+        { task: this.task(taskId), since: returns?.[0]?.at });
+      if ((returns?.length ?? 0) >= 2 && !resent?.length && await this.holdForPolicy(draft.id, `第 ${returns!.length} 轮返工`)) {
+        return { ...draft, hold: true, state: 'held', holdReason: `第 ${returns!.length} 轮返工` };
+      }
+    }
+    return draft;
   }
 
   async markSent(messageId: string, employeeId: string, body: string): Promise<{ body: string; message: OutboundMessage }> {

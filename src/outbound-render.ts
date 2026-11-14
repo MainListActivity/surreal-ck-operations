@@ -27,6 +27,22 @@ export interface PromptTask {
   acceptance?: string;
   /** 这一步必须守的流程约束（如“不要合并 PR”），紧跟在“做什么”后面；需求再长也留在消息里。 */
   note?: string;
+  /** 上一轮受阻后老板给的答复，还没被下一次工作结果消化：放在消息最前面，原话带给员工。 */
+  answer?: OwnerAnswer;
+}
+
+/** 一次受阻与老板的答复。 */
+export interface OwnerAnswer { blocker?: string; reply: string }
+
+/** 答复内联进消息的上限；更长的指向 answer.md（执行端领取时落盘，云端与网页通道内联）。 */
+export const ANSWER_LIMIT = 2000;
+const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max)}…` : text;
+/** 恢复受阻任务的开头：员工上轮缺什么、老板怎么答的。 */
+function answerLead(answer: OwnerAnswer | undefined): string | undefined {
+  const reply = answer?.reply.trim();
+  if (!reply) return undefined;
+  return [answer!.blocker?.trim() ? `上一轮你报告受阻：${clip(answer!.blocker.trim().replace(/\s+/g, ' '), 300)}` : '上一轮你报告受阻。',
+    reply.length <= ANSWER_LIMIT ? `老板答复：\n${reply}` : '老板已答复，答复较长，全文在 answer.md，先读。', '按答复接着做。'].join('\n');
 }
 
 /** 超过这个长度的需求或验收不内联进消息，改为指向 task.md：长文档放文件里，消息只说要点。 */
@@ -70,10 +86,11 @@ function reviewMessage(task: PromptTask, code: boolean): string {
  * 返工在前面加一句指向退回意见；催办在前面加一句说明上一轮没有结果。
  */
 export function composeMessage(step: MessageStep, task: PromptTask, code = false, phase = 'doing'): string {
-  if (step === 'review') return reviewMessage(task, code);
-  if (step === 'rework') return `上一轮被退回，先修复 findings/round-NN.md 里的问题。\n\n${executeMessage(task, code)}`;
-  if (step === 'execute') return executeMessage(task, code);
-  return `上一轮结束时没有给出工作结果，请接着做完。\n\n${phase === 'review' ? reviewMessage(task, code) : executeMessage(task, code)}`;
+  const body = step === 'review' ? reviewMessage(task, code)
+    : step === 'rework' ? `上一轮被退回，先修复 findings/round-NN.md 里的问题。\n\n${executeMessage(task, code)}`
+      : step === 'execute' ? executeMessage(task, code)
+        : `上一轮结束时没有给出工作结果，请接着做完。\n\n${phase === 'review' ? reviewMessage(task, code) : executeMessage(task, code)}`;
+  return [answerLead(task.answer), body].filter(Boolean).join('\n\n');
 }
 
 /** A route's own template still has to point the session at its notes; the stored draft is the full text the owner previews. */
@@ -94,6 +111,7 @@ export function renderMessage(body: string, opts: RenderContext): string {
     .replaceAll('sck call', `'${sckBin}' call`)
     .replaceAll(/(?<![\w./-])task\.md/g, () => taskFile)
     .replaceAll(/(?<![\w./-])notes\.md/g, () => `${commDir.replace(/\/+$/, '')}/notes.md`)
+    .replaceAll(/(?<![\w./-])answer\.md/g, () => `${commDir.replace(/\/+$/, '')}/answer.md`)
     .replaceAll(/findings\/round-(?:\d+|NN)\.md/g, findings ?? 'findings/round-NN.md');
 }
 
@@ -149,6 +167,7 @@ export function unrenderMessage(rendered: string, ctx: RenderContext): string | 
   if (ctx.findingsFile) body = swap(body, `${commDir}/${ctx.findingsFile.replace(/^\/+/, '')}`, 'findings/round-NN.md');
   body = swap(body, `'${ctx.sckBin}' call`, 'sck call');
   body = swap(body, `${commDir}/notes.md`, 'notes.md');
+  body = swap(body, `${commDir}/answer.md`, 'answer.md');
   body = swap(body, `${commDir}/task.md`, 'task.md');
   body = swap(body, ctx.taskId, '{taskId}');
   body = swap(body, ctx.acId ?? DEFAULT_MACHINE_CRITERION, '{acId}');

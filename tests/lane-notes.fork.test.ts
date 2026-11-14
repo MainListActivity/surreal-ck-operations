@@ -318,3 +318,91 @@ run('progress reads a real chain out of the audit trail', async () => {
   expect(chain.defects[0]!.problem.length).toBeGreaterThan(0);
   expect(chain.defects[0]!.fix!.length).toBeGreaterThan(0);
 });
+
+run('第 2 步：老板的答复随恢复消息带给员工；第二轮返工先扣住；完工分析只记录', async () => {
+  const { OwnerDesk } = await import('../src/owner.ts');
+  const { analyzeTurns, turnAnalysesOf } = await import('../src/turn-analysis.ts');
+  const { latestAnswer } = await import('../src/dispatcher/brief.ts');
+  const store = new OutboundMessageStore(db.db);
+  const desk = new OwnerDesk(db);
+  const t = await core.createTask(gm, { title: '导出订单', context: '给订单列表加导出', requirement: '给订单列表加导出', acceptanceText: '老板能下载到 CSV',
+    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key() } as never);
+  await store.createTaskDrafts(t.id, 'engineering', 'qa', true);
+  const draftOf = async (step: string) => (await store.list(t.id, false)).find(m => m.step === step)!;
+  expect((await draftOf('execute')).body).toStartWith('给订单列表加导出\n\n可以用：');
+
+  // 受阻 → 老板答复：以前答复只进审计，员工收到的还是原来那条消息。
+  const c1 = await core.claim(eng, t.id);
+  await core.block(eng, proof(c1), 'owner', { text: '执行端自动收集的工作结果：\n工作结果：受阻\n缺演示环境的管理员账号，登录不了后台。', idempotencyKey: key() });
+  await desk.decide({ taskId: t.id, decision: 'reply', note: '账号用 test_kit 领，角色选 admin。', source: 'web', key: key() });
+  const resumed = await core.claim(eng, t.id);
+  expect(latestAnswer(resumed.history)).toEqual({ blocker: '缺演示环境的管理员账号，登录不了后台。', reply: '账号用 test_kit 领，角色选 admin。' });
+  await core.release(eng, proof(resumed), { text: '【通道回滚】fixture：供应商明确失败，保留任务阶段，等待通道恢复后重派。', idempotencyKey: key() });
+  // 发出前重算：草稿开头带上受阻原因和老板原话。
+  const sent = await store.prepareSend(t.id, 'execute', 'lanes-eng');
+  expect(sent!.body).toStartWith('上一轮你报告受阻：缺演示环境的管理员账号，登录不了后台。\n老板答复：\n账号用 test_kit 领，角色选 admin。\n按答复接着做。\n\n给订单列表加导出');
+  await store.markSent(sent!.message.id, 'lanes-eng', sent!.body);
+
+  // 提交之后答复已被消化：复核消息不带它。
+  const c2 = await core.claim(eng, t.id);
+  await core.submit(eng, proof(c2), evidence());
+  await store.refreshDrafts(t.id);
+  expect((await draftOf('review')).body).toStartWith('独立复验《导出订单》的交付');
+
+  // 第一轮退回：返工草稿不扣。
+  await core.returnTask(qa, proof(await core.claim(qa, t.id)), evidence({ text: '第 1 条不成立：导出按钮点了没有下载，控制台报 500。' }));
+  await store.ensureQueuedDrafts([t.id]);
+  expect((await draftOf('rework')).hold).toBe(false);
+  const rework1 = await store.prepareSend(t.id, 'rework', 'lanes-eng');
+  await store.markSent(rework1!.message.id, 'lanes-eng', rework1!.body);
+  // 同一轮的重派（租约过期）也不扣。
+  await store.ensureQueuedDrafts([t.id]);
+  expect((await draftOf('rework')).hold).toBe(false);
+  await db.db.query("UPDATE outbound_message SET state = 'sent', sent_at = time::now() WHERE task = $task AND step = 'rework';", { task: new RecordId('task', t.id) });
+
+  // 第二轮退回：返工草稿按规则扣住并写明原因；老板放行后原因清掉。
+  const c3 = await core.claim(eng, t.id);
+  await core.submit(eng, proof(c3), evidence());
+  await core.returnTask(qa, proof(await core.claim(qa, t.id)), evidence({ text: '仍然不成立：CSV 下载到了，但列头是英文，与页面不一致。' }));
+  await store.ensureQueuedDrafts([t.id]);
+  const held = await draftOf('rework');
+  expect(held).toMatchObject({ hold: true, state: 'held', holdReason: '第 2 轮返工' });
+  expect(held.editedBy).toBeUndefined();
+  expect(await store.holdReason(t.id, 'rework')).toBe('第 2 轮返工');
+  expect(await store.prepareSend(t.id, 'rework', 'lanes-eng')).toBeNull();
+  expect((await store.setHold(held.id, false, 'owner')).holdReason).toBeUndefined();
+  // auto_hold = false 关掉系统扣住。
+  await db.db.query('UPSERT company_meta:config MERGE { auto_hold: false };');
+  expect(await store.holdForPolicy(held.id, 'x')).toBe(false);
+  await db.db.query('UPSERT company_meta:config MERGE { auto_hold: true };');
+
+  // 完工分析：每轮最多两条，一条结果一条分析；不合格的模型输出记失败，三次后放弃；不改任何草稿。
+  const before = (await store.list(t.id)).map(m => `${m.id}:${m.body}`);
+  const seen: Array<{ action: string; result: string; submitted?: string }> = [];
+  const good = async (input: { action: string; result: string; submitted?: string }) => { seen.push(input);
+    return { status: input.action === 'block' ? 'blocked' : input.action === 'submit' ? 'partial' : 'rejected', summary: '列头与页面不一致', needs: ['页面列名的中文对照'], next: '上一轮列头是英文。先把列头改成页面上的中文列名。', confidence: 'high' }; };
+  let total = 0;
+  for (let round = 0; round < 12; round++) { const r = await analyzeTurns(db.db, good as never); total += r.analyzed; expect(r.analyzed).toBeLessThanOrEqual(2); if (!r.analyzed) break; }
+  expect(total).toBeGreaterThanOrEqual(5); // 本任务：block、submit×2、return×2（库里别的任务的结果也会被分析）。
+  expect(seen.some(s => s.result.startsWith('【通道回滚】'))).toBe(false);
+  const mine = seen.filter(s => s.action === 'return' && s.result.includes('列头是英文'));
+  expect(mine).toHaveLength(1);
+  expect(mine[0]!.submitted).toContain('fixture evidence');
+  const [audits] = await db.db.query<[Array<{ id: RecordId; action: string }>]>('SELECT id, action, at FROM audit WHERE task = $task ORDER BY at;', { task: new RecordId('task', t.id) });
+  const analyses = await turnAnalysesOf(db.db, audits);
+  expect(Object.keys(analyses)).toHaveLength(audits.filter(a => ['submit', 'return', 'block'].includes(a.action)).length);
+  expect(Object.values(analyses)[0]).toMatchObject({ summary: '列头与页面不一致', needs: ['页面列名的中文对照'], confidence: 'high' });
+  expect((await analyzeTurns(db.db, good as never)).analyzed).toBe(0); // 已分析的不重复。
+  expect((await store.list(t.id)).map(m => `${m.id}:${m.body}`)).toEqual(before);
+
+  // 新结果 + 不合格输出：记失败，不产生结论。
+  const c4 = await core.claim(eng, t.id);
+  await core.submit(eng, proof(c4), evidence({ text: `很长的结果 ${'x'.repeat(13_000)}` }));
+  expect(await analyzeTurns(db.db, (async () => ({ status: 'done', summary: '', confidence: 'sure' })) as never)).toEqual({ analyzed: 0, failed: 1 });
+  // 重试间隔过后再试；这次合格，但原文被截断，把握强制记为不足。
+  expect((await analyzeTurns(db.db, good as never)).analyzed).toBe(0);
+  expect((await analyzeTurns(db.db, good as never, Date.now() + 11 * 60_000)).analyzed).toBe(1);
+  const [last] = await db.db.query<[Array<{ confidence: string; low_reason: string }>]>(
+    "SELECT confidence, low_reason, at FROM turn_analysis WHERE task = $task AND low_reason != NONE;", { task: new RecordId('task', t.id) });
+  expect(last).toEqual([expect.objectContaining({ confidence: 'low', low_reason: '结果原文过长，模型只看了前一部分' })]);
+});

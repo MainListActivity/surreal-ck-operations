@@ -2,6 +2,8 @@ import { planRequirements } from '../../src/iteration/planning.ts';
 import { planRequirementWith } from './iteration-planner.ts';
 import { triageFeedback } from '../../src/iteration/triage.ts';
 import { classifyFeedbackWith } from './feedback-triage.ts';
+import { analyzeTurns } from '../../src/turn-analysis.ts';
+import { analyzeTurnWith } from './turn-analyst.ts';
 /**
  * 定时任务（Worker 的 scheduled 入口，按 cron 表达式分派）：
  * - 每分钟：为在岗员工补齐 agent 身份（ma_hono 的 kind=agent 用户，记入 agent_identity）；
@@ -175,6 +177,8 @@ export async function runScheduled(cfg: Config, sessions: Sessions, cron: string
       ? await triageFeedback(db, classifyFeedbackWith(cfg.magpie, options.fetch), now.getTime()).catch(() => ({ failed: true }))
       : { skipped: 'not_configured' };
     const planning = cfg.magpie ? await planRequirements(db, planRequirementWith(cfg.magpie, options.fetch), now.getTime()).catch(() => ({ failed: true })) : { skipped: 'not_configured' };
-    return { identities, translations, replies, feedback, planning };
+    // 完工分析排在最后：补译和规划先用这一分钟，分析每轮最多两条，只记录不改消息。
+    const analyses = cfg.magpie ? await analyzeTurns(db, analyzeTurnWith(cfg.magpie, options.fetch), now.getTime()).catch(() => ({ failed: true })) : { skipped: 'not_configured' };
+    return { identities, translations, replies, feedback, planning, analyses };
   });
 }

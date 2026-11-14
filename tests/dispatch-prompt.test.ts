@@ -102,3 +102,49 @@ test('退回意见按通信目录里的文件取，不看派工消息怎么写�
     expect(taskMaterial(dir, '先修复 findings/round-02.md').findings).toBeUndefined();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('老板对受阻的答复放在消息最前面；太长时指向 answer.md，云端与网页通道内联它', async () => {
+  const { answerFile, latestAnswer } = await import('../src/dispatcher/brief.ts');
+  const { ANSWER_LIMIT } = await import('../src/outbound-render.ts');
+  const { vendorPrompt } = await import('../src/runner/cloud-lane/lane.ts');
+  const entry = (action: string, evidence: string) => ({ action, actor: 'x', at: '2026-11-14T00:00:00Z', evidence });
+  const history = [entry('submit', '旧结果'), entry('block', '执行端自动收集的工作结果：\n工作结果：受阻\n缺支付沙箱的密钥。'),
+    entry('owner_reply', '来源：web\n决定：reply\n密钥在 1Password 的“沙箱”库，条目名 pay-sandbox。'), entry('claim', '')];
+  const answer = latestAnswer(history);
+  expect(answer).toEqual({ blocker: '缺支付沙箱的密钥。', reply: '密钥在 1Password 的“沙箱”库，条目名 pay-sandbox。' });
+  // 答复之后有了新的工作结果，或又受阻但还没答复：没有待转达的答复。
+  expect(latestAnswer([...history, entry('submit', '新结果')])).toBeUndefined();
+  expect(latestAnswer([...history, entry('block', '工作结果：受阻\n又缺别的')])).toBeUndefined();
+  expect(latestAnswer([entry('owner_reply', '来源：web\n决定：reply\n没有受阻记录的答复也带上')])).toEqual({ blocker: undefined, reply: '没有受阻记录的答复也带上' });
+
+  const body = composeMessage('rework', { ...card, answer }, true);
+  expect(body).toStartWith('上一轮你报告受阻：缺支付沙箱的密钥。\n老板答复：\n密钥在 1Password 的“沙箱”库，条目名 pay-sandbox。\n按答复接着做。\n\n上一轮被退回，先修复 findings/round-NN.md 里的问题。\n\n给订单列表');
+  const long = composeMessage('execute', { ...card, answer: { reply: '答'.repeat(ANSWER_LIMIT + 1) } });
+  expect(long).toStartWith('上一轮你报告受阻。\n老板已答复，答复较长，全文在 answer.md，先读。\n按答复接着做。\n\n');
+  const ctx = { sckBin: '/bin/sck', commDir: '/comm/e1', taskId: 't1' };
+  const shown = renderMessage(long, ctx);
+  expect(shown).toContain('全文在 /comm/e1/answer.md，先读。');
+  expect(renderMessage(unrenderMessage(shown, ctx)!, ctx)).toBe(shown);
+
+  const dir = mkdtempSync(join(tmpdir(), 'sck-answer-'));
+  try {
+    writeFileSync(join(dir, 'task.md'), '# 导出\n\n## 需求\n\n导出 CSV\n');
+    expect(taskMaterial(dir).answer).toBeUndefined();
+    writeFileSync(join(dir, 'answer.md'), answerFile(answer!));
+    const material = taskMaterial(dir);
+    expect(material.answer).toBe('## 上一轮受阻\n\n缺支付沙箱的密钥。\n\n## 老板答复\n\n密钥在 1Password 的“沙箱”库，条目名 pay-sandbox。\n');
+    const prompt = vendorPrompt({ provider: 'jules', prompt: 'x' } as never, { slug: 'o/r', branch: 'b', defaultBranch: 'main' } as never, material);
+    expect(prompt).toContain('## 上次受阻与老板的答复（按答复接着做）\n## 上一轮受阻');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('完工分析的模型输出要过校验：枚举、长度、条数', async () => {
+  const { turnAnalysis } = await import('../src/turn-analysis.ts');
+  const ok = { status: 'partial', summary: '做了导出，没贴测试输出', needs: ['测试账号'], next: '先补单元测试的输出。', confidence: 'low' };
+  expect(turnAnalysis(ok)).toEqual(ok as never);
+  expect(turnAnalysis({ ...ok, needs: undefined }).needs).toEqual([]);
+  for (const bad of [null, [], { ...ok, status: 'done' }, { ...ok, confidence: 'sure' }, { ...ok, summary: '' }, { ...ok, summary: 'x'.repeat(401) },
+    { ...ok, next: 'x'.repeat(801) }, { ...ok, needs: Array(6).fill('a') }, { ...ok, needs: ['x'.repeat(201)] }, { ...ok, needs: 'none' }]) {
+    expect(() => turnAnalysis(bad)).toThrow();
+  }
+});
