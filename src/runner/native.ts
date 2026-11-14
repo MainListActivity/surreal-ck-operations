@@ -30,7 +30,7 @@ export interface NativeOptions {
   stopGraceMs?: number;
 }
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code !== 'ESRCH'; } };
-const supported = (provider: string): provider is NativeProvider => ['factory-droid', 'claude', 'codex', 'codex-cloud', 'devin-cloud', 'jules', 'warp', 'grok-bot'].includes(provider);
+const supported = (provider: string): provider is NativeProvider => ['factory-droid', 'claude', 'codex', 'codex-cloud', 'devin-cloud', 'jules', 'warp', 'grok-bot', 'muse-web'].includes(provider);
 
 export interface NativeResult { sessionId?: string; completed: boolean; error?: string; text: string; inputTokens?: number }
 /** 只识别正式终态；空输出、任意 stdout、只有 assistant 文本均不能算完成。 */

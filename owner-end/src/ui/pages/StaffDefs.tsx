@@ -37,6 +37,7 @@ const PROVIDERS: ReadonlyArray<{ value: string; label: string }> = [
   { value: 'factory-paseo', label: 'Factory Droid（Paseo 模式）' },
   { value: 'warp', label: 'Warp Build（原生执行端）' },
   { value: 'grok-bot', label: 'Grok Bot（网页 bot，模型填 bot UUID）' },
+  { value: 'muse-web', label: 'Muse（muse.ai 网页，每任务一个侧聊）' },
   { value: 'grok', label: 'Grok Build（经 Paseo）' },
   { value: 'devin-paseo', label: 'Devin CLI（Paseo 模式）' },
 ];
@@ -54,6 +55,7 @@ const MODELS: Record<string, string[]> = {
   'factory-paseo': CLAUDE_MODELS,
   warp: ['default'],
   'grok-bot': [],
+  'muse-web': ['default'],
   grok: ['grok-4.6'],
   'devin-paseo': ['swe-2-high', 'swe-2-flash-medium', 'adaptive'],
 };
