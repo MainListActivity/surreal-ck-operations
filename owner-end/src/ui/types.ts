@@ -23,6 +23,7 @@ export interface BoardMessageRow {
   step: string;
   state: 'draft' | 'held';
   hold: boolean;
+  holdReason?: string;
   /** 存储原文（原文）。 */
   body: string;
   /** 译文的语言（若有译文）。 */
@@ -67,6 +68,7 @@ export interface BoardOutboxRow {
   body: string;
   workdirPending: boolean;
   hold: boolean;
+  holdReason?: string;
   lang: string;
   editable: true;
   translation?: BoardTranslation;

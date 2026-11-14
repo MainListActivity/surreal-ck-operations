@@ -22,6 +22,31 @@ export function latestFindings(history: readonly HistoryEntry[] | undefined): Fi
   return { round, file: `findings/round-${String(round).padStart(2, '0')}.md`, text: `${last.evidence!.trim()}${cut}\n` };
 }
 
+/** Results that consume an owner answer: once the work moved on, the answer is history, not something to hand over again. */
+const ANSWER_CONSUMED = new Set(['submit', 'owner_submit', 'return', 'accept', 'owner_reject', 'owner_approve']);
+/** The runner's and the owner desk's fixed heads on stored evidence; the employee and the owner wrote what follows. */
+const stripHead = (text: string) => text.replace(/^执行端自动收集的工作结果：\n/, '').replace(/^工作结果[:：]\s*受阻\s*\n?/, '')
+  .replace(/^来源：[^\n]*\n决定：reply\n?/, '').trim();
+
+/**
+ * The owner's answer to the newest block, while no work result has followed it. Before this, an owner reply only put the task back
+ * in its phase: the employee was sent the same message again and never read the answer. Pure, over the handover history.
+ */
+export function latestAnswer(history: readonly HistoryEntry[] | undefined): { blocker?: string; reply: string } | undefined {
+  let blocker: string | undefined, answer: { blocker?: string; reply: string } | undefined;
+  for (const entry of history ?? []) {
+    if (entry.action === 'block') { blocker = stripHead(entry.evidence ?? '') || undefined; answer = undefined; }
+    else if (entry.action === 'owner_reply') { const reply = stripHead(entry.evidence ?? ''); answer = reply ? { blocker, reply } : undefined; }
+    else if (ANSWER_CONSUMED.has(entry.action)) { blocker = undefined; answer = undefined; }
+  }
+  return answer;
+}
+
+/** answer.md: the block and the owner's answer verbatim, for an answer too long to inline and for lanes that only read files. */
+export function answerFile(answer: { blocker?: string; reply: string }): string {
+  return `${answer.blocker ? `## 上一轮受阻\n\n${answer.blocker}\n\n` : ''}## 老板答复\n\n${answer.reply}\n`;
+}
+
 /** Acceptance amendments are appended to the end of a task's context (core.taskAcceptanceAmend). */
 const AMENDMENT_HEAD = '【验收要求修订';
 

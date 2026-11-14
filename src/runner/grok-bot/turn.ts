@@ -58,6 +58,7 @@ export function turnMarker(taskId: string, message: string): string {
 export function botMessage(marker: string, material: ReturnType<typeof taskMaterial>): string {
   const parts = [`[SCK-TASK ${marker}]`, ''];
   if (material.review) parts.push('这是复核任务：只读复核，不改动任何东西。最终答复首行必须是「复核结论：通过」或「复核结论：退回」，随后逐条给出证据。', '');
+  if (material.answer !== undefined) parts.push('## 上次受阻与老板的答复（按答复接着做）', material.answer.trim(), '');
   if (material.findings !== undefined) parts.push('## 上一轮的退回意见（逐条修复）', material.findings.trim(), '');
   parts.push(material.task.trim(), '',
     '你读不到公司本机文件、也调不了公司命令；需要的信息都在上面。产物请直接写在最终答复里，或给出可公开访问的链接。',

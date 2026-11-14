@@ -44,6 +44,7 @@ interface MessageBlockProps {
   meta: string;
   body: string;
   hold: boolean;
+  holdReason?: string;
   draft: string | undefined;
   dirty: boolean;
   busy: boolean;
@@ -57,7 +58,7 @@ interface MessageBlockProps {
 }
 
 /** 每条消息都共用的字段；保存函数由卡片所在位置决定（员工待发用 edit_rendered，其它用 edit）。 */
-type CommonMessageProps = Pick<MessageBlockProps, 'context' | 'messageId' | 'title' | 'body' | 'hold' | 'draft' | 'dirty' | 'busy' | 'flash' | 'onDraft' | 'onHold'>;
+type CommonMessageProps = Pick<MessageBlockProps, 'context' | 'messageId' | 'title' | 'body' | 'hold' | 'holdReason' | 'draft' | 'dirty' | 'busy' | 'flash' | 'onDraft' | 'onHold'>;
 
 /**
  * 有未保存修改的消息卡片在刷新时不重绘：草稿与忙碌状态都没变时直接跳过渲染，
@@ -74,7 +75,7 @@ const MessageBlock = memo(function MessageBlock(p: MessageBlockProps) {
       <h4>
         {p.title}
         {p.meta ? <span class="hint"> · {p.meta}</span> : null}
-        {p.hold ? <span class="tag warn">已扣住</span> : null}
+        {p.hold ? <span class="tag warn">{p.holdReason ? `系统扣住：${p.holdReason}` : '已扣住'}</span> : null}
       </h4>
       <label class="field">
         <span>
@@ -307,6 +308,7 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
     body: m.body,
     context: m.context,
     hold: m.hold,
+    holdReason: m.holdReason,
     draft: draftOf(drafts, m.messageId),
     dirty: isDirty(drafts, m.messageId, m.body),
     busy,

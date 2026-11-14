@@ -15,6 +15,7 @@ import type { CompanyCore } from './contracts.ts';
 import { preferredProviderValue, Workforce } from './workforce.ts';
 import { OutboundMessageStore, type OutboundMessage } from './outbound-messages.ts';
 import { bodyOfDispatch, unrenderMessage } from './outbound-render.ts';
+import { turnAnalysesOf } from './turn-analysis.ts';
 import { findingsFileOf, readBoard, readBoardView, renderContextFor } from './board.ts';
 import { CompanyError } from './core-errors.ts';
 import { ROLES, type CreateTask, type Role } from './contracts.ts';
@@ -213,7 +214,9 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       // 员工回报的译文（audit 编号 → 老板常用语言的译文）；没有译文的回报照原文显示。
       const translations = Object.fromEntries(await replyTranslationsOf(db,
         (audit ?? []) as Array<{ id?: unknown; evidence?: unknown; action?: unknown }>, await ownerLangOf(db)));
-      return { task: rows[0], audit, messages, translations };
+      // 完工分析（审计编号 → 分析）：只展示，不参与派工。
+      const analyses = await turnAnalysesOf(db, (audit ?? []) as Array<{ id?: unknown }>).catch(() => ({}));
+      return { task: rows[0], audit, messages, translations, analyses };
     }
     case 'progress': return readProgress(db);
     case 'task.list': { const [rows] = await db.query<[unknown[]]>('SELECT * FROM task ORDER BY created_at DESC LIMIT 300;'); return { tasks: rows }; }

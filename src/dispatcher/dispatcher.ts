@@ -816,8 +816,7 @@ export class Dispatcher {
       if (!prepared) {
         // Waiting for a translation is not an owner hold: no notice, and the hold and state stay as they are.
         if (await this.translationPending(taskId, step, employeeId)) return null;
-        await this.notice(`message-hold:${taskId}:${step}`,
-          `任务 ${taskId} 的 ${step} 消息被标记「需要我放行」；请在消息流里放行后再派工。`,
+        await this.notice(`message-hold:${taskId}:${step}`, await this.holdNotice(store, taskId, step),
           { commands: 0, revoked: [], extended: [], woke: [], retired: [], exhausted: [], notices: [], decisions: [] });
         return null;
       }
@@ -837,14 +836,21 @@ export class Dispatcher {
     }
   }
 
+  /** The owner notice of a held message; a hold the system made by rule says why. */
+  private async holdNotice(store: OutboundMessageStore, taskId: string, step: MessageStep): Promise<string> {
+    const reason = await store.holdReason(taskId, step).catch(() => undefined);
+    return reason
+      ? `任务 ${taskId} 的 ${step} 消息已按规则扣住（${reason}）；请在消息流里看过后放行。`
+      : `任务 ${taskId} 的 ${step} 消息被标记「需要我放行」；请在消息流里放行后再派工。`;
+  }
+
   /** The pre-claim hold check: the same draft the send path would read, without touching a lease. */
   private async heldMessage(taskId: string, step: MessageStep, report: TickReport): Promise<boolean> {
     const store = this.messageStore();
     if (!store) return false;
     try {
       if (!await store.isHeld(taskId, step)) return false;
-      await this.notice(`message-hold:${taskId}:${step}`,
-        `任务 ${taskId} 的 ${step} 消息被标记「需要我放行」；请在消息流里放行后再派工。`, report);
+      await this.notice(`message-hold:${taskId}:${step}`, await this.holdNotice(store, taskId, step), report);
       return true;
     } catch (error) {
       this.log(`outbound hold read failed for ${taskId}: ${(error as Error).message}`);

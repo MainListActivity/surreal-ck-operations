@@ -20,7 +20,9 @@ interface TaskRow {
 }
 
 interface AuditRow { id?: unknown; action?: string; actor?: unknown; at?: unknown; evidence?: string }
-interface TaskDetail { task: TaskRow; audit?: AuditRow[]; messages?: unknown[]; translations?: Record<string, string> }
+interface AnalysisRow { status: string; summary: string; needs: string[]; next: string; confidence: string; lowReason?: string }
+interface TaskDetail { task: TaskRow; audit?: AuditRow[]; messages?: unknown[]; translations?: Record<string, string>; analyses?: Record<string, AnalysisRow> }
+const ANALYSIS_STATUS_ZH: Record<string, string> = { completed: '已按验收完成', partial: '部分完成', blocked: '受阻', rejected: '被退回' };
 
 /** 审计编号的键部分（JSON 里是 `audit:xxx` 或 `audit:⟨xxx⟩`），用来找它的译文。 */
 const auditKey = (id: unknown): string => String(id ?? '').replace(/^audit:/, '').replace(/^⟨(.*)⟩$/, '$1');
@@ -191,7 +193,8 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                 {detail.audit.map((a, i) => (
                   <li key={i}>
                     <time>{timeText(a.at)}</time>
-                    <span><strong>{ACTION_ZH[a.action ?? ''] ?? a.action ?? '—'}</strong> · {String(a.actor ?? '')}{a.evidence ? <Evidence text={a.evidence} translated={detail.translations?.[auditKey(a.id)]} /> : null}</span>
+                    <span><strong>{ACTION_ZH[a.action ?? ''] ?? a.action ?? '—'}</strong> · {String(a.actor ?? '')}{a.evidence ? <Evidence text={a.evidence} translated={detail.translations?.[auditKey(a.id)]} /> : null}
+                      <Analysis value={detail.analyses?.[auditKey(a.id)]} /></span>
                   </li>
                 ))}
               </ol>
@@ -344,6 +347,19 @@ function VoidForm({ taskId, onDone, onCancel }: { taskId: string; onDone(): void
 }
 
 /** 员工回报：有老板语言的译文时显示译文，原文折叠在下面。 */
+/** 完工分析：模型读任务卡与这次结果写的判断。只供老板参考，不改派工消息，也不决定任务流转。 */
+function Analysis({ value }: { value?: AnalysisRow }) {
+  if (!value) return null;
+  return (
+    <details class="original" open={value.status !== 'completed' || value.confidence !== 'high'}>
+      <summary>完工分析 · {ANALYSIS_STATUS_ZH[value.status] ?? value.status}{value.confidence === 'high' ? '' : ` · 把握不足${value.lowReason ? `（${value.lowReason}）` : ''}`}</summary>
+      <span>{value.summary}</span>
+      {value.needs.length ? <span><br />还缺：{value.needs.join('；')}</span> : null}
+      {value.next ? <span><br />建议下一条消息的开头：{value.next}</span> : null}
+    </details>
+  );
+}
+
 function Evidence({ text, translated }: { text: string; translated?: string }) {
   if (!translated) return <span class="timeline-note">{text}</span>;
   return (

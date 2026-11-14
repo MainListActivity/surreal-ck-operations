@@ -91,7 +91,7 @@ const REVIEW_PREFIX = /^复核结论：(通过|退回)/;
  * findings 按通信目录里实际有的文件取，不看派工消息的措辞：领取时旧任务的 findings 已清掉（sidecar stageBrief），
  * 目录里有文件就是本任务最近一次退回；老板把消息改成什么样，退回意见都不会丢。复核轮不带。
  */
-export function taskMaterial(commDir: string, _prompt?: string): { task: string; findings?: string; review: boolean; title: string } {
+export function taskMaterial(commDir: string, _prompt?: string): { task: string; findings?: string; answer?: string; review: boolean; title: string } {
   let task = '';
   try { task = readFileSync(join(commDir, 'task.md'), 'utf8'); } catch { /* 无 task.md：少见，仍按 prompt 执行 */ }
   const review = task.includes(REVIEW_MARKER);
@@ -103,7 +103,10 @@ export function taskMaterial(commDir: string, _prompt?: string): { task: string;
     if (latest) findings = readFileSync(join(commDir, 'findings', latest), 'utf8');
   }
   const title = (/^#\s+(.+)$/m.exec(task)?.[1] ?? task.split('\n').find(l => l.trim()) ?? '云端任务').trim().slice(0, 80);
-  return { task, findings, review, title };
+  // 老板对上次受阻的答复（sidecar stageBrief 落盘；已被消化的答复领取时会删掉）。
+  let answer: string | undefined;
+  try { answer = readFileSync(join(commDir, 'answer.md'), 'utf8'); } catch { /* 没有待转达的答复 */ }
+  return { task, findings, answer, review, title };
 }
 
 /** 交给云端 agent 的完整 prompt。 */
@@ -124,6 +127,8 @@ export function vendorPrompt(input: LaneInput, repo: RepoInfo, material: ReturnT
     if (input.provider === 'codex-cloud')
       parts.push('工作结果由本地桥接进程应用与提交；只需把改动做完整。没有可交付的代码改动时，在最终消息里说明原因。');
   }
+  if (material.answer !== undefined)
+    parts.push('', '## 上次受阻与老板的答复（按答复接着做）', material.answer.trim());
   if (material.findings !== undefined)
     parts.push('', '## 复核退回意见（逐条修复）', material.findings.trim());
   parts.push('', material.task.trim() || input.prompt.trim());
