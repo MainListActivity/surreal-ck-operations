@@ -304,7 +304,7 @@ run('owner board: an edit of the shown text is saved as the stored body, and the
     const stored = (await unsentDraft(w, s.second.task, 'execute'))!.body;
 
     // A path the stored body cannot carry is refused, and the stored body stays as it was.
-    await expect(edit(shown.messageId, s.second.employee, shown.body.replace(`${commDir}/task.md`, 'task.md'))).rejects.toThrow(/invalid/);
+    await expect(edit(shown.messageId, s.second.employee, shown.body.replace(`${commDir}/notes.md`, 'notes.md'))).rejects.toThrow(/invalid/);
     expect((await unsentDraft(w, s.second.task, 'execute'))!.body).toBe(stored);
     // An unknown employee and an unknown message are refused.
     await expect(edit(shown.messageId, 'nobody', shown.body)).rejects.toThrow(/not found/);

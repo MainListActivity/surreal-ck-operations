@@ -38,6 +38,23 @@ export async function stopRequested(ctx: Pick<Company, "db" | "runtime" | "sidec
   }
 }
 
+/** 多久读一次中止请求。 */
+export const STOP_WATCH_MS = 15_000;
+
+/**
+ * 中止请求不能跟着派工循环读：原生执行端的一轮 tick 要等会话跑完才返回（生产实测一轮 426 秒），
+ * 跟着循环读就等于会话自己结束后才“中止”。这里用独立计时器，上一次还没读完就跳过这一次。
+ */
+export function watchStops(run: () => Promise<void>, intervalMs = STOP_WATCH_MS): () => void {
+  let busy = false;
+  const timer = setInterval(() => {
+    if (busy) return;
+    busy = true;
+    void run().catch(error => console.warn(`stop requests unread: ${(error as Error).message}`)).finally(() => { busy = false; });
+  }, Math.round(intervalMs));
+  return () => clearInterval(timer);
+}
+
 // Runs the company dispatcher tick loop inside the plugin subprocess and wakes it early on
 // Paseo lifecycle events, replacing the org.surrealck.company-dispatcher launchd service.
 import type { RuntimeEventSource as PluginServerContext } from "./host.ts";
@@ -523,7 +540,6 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
           gcRefreshedAt = Date.now();
           await timing.measure("gc", () => runLifecycleGc(ctx)).catch((error) => console.warn(`lifecycle gc failed: ${(error as Error).message}`));
         }
-        await stopRequested(ctx).catch(error => console.warn(`stop requests unread: ${(error as Error).message}`));
         if (!(await ctx.workforce.config()).paused) {
           await timing.measure("iterations", () => reconcileIterations(ctx.db.db, {
             create: async (input, planned) => {
@@ -563,6 +579,8 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
   // The runner beats on its own timer, not on the tick: a long pass must not make the runner read as offline.
   beatRunner();
   const runnerBeat = setInterval(beatRunner, RUNNER_BEAT_MS);
+  // 中止请求同样走自己的计时器：tick 在原生会话跑完前不返回。
+  const stopWatch = watchStops(async () => stopRequested(await company()));
 
   // A finished turn usually means a checkpoint/submit/review landed; dispatch immediately
   // instead of waiting out the poll interval.
@@ -650,6 +668,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
   const stop = () => {
     stopped = true;
     clearInterval(runnerBeat);
+    stopWatch();
     interruptions.stop();
     wake?.();
     cloudWake?.stop();

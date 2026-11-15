@@ -77,7 +77,7 @@ async function editRenderedMessage(ctx: OwnerApiContext,
 
 /** Every command is a flat JSON object: { command, ...args }. */
 /**
- * 收回租约，并给持有它的员工记一个“停掉会话”的请求：老板端碰不到执行端的进程，执行端每轮循环读到请求后停掉正在跑的会话
+ * 收回租约，并给持有它的员工记一个“停掉会话”的请求：老板端碰不到执行端的进程，执行端按独立计时器（15 秒）读到请求后停掉正在跑的会话
  *（runner/dispatch.ts 的 stopRequested）。不记这个请求的话，租约收回了，会话还会跑到自己结束。
  */
 async function stopTask(ctx: OwnerApiContext, db: import('surrealdb').Surreal, taskId: string, note: string, actor: string): Promise<{ ok: boolean; employee?: string }> {
