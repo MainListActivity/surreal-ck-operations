@@ -815,7 +815,8 @@ export class Dispatcher {
       const prepared = await store.prepareSend(taskId, step, employeeId);
       if (!prepared) {
         // Waiting for a translation is not an owner hold: no notice, and the hold and state stay as they are.
-        if (await this.translationPending(taskId, step, employeeId)) return null;
+        // Nor is waiting (a bounded few minutes) for the analysis of the last return.
+        if (await this.translationPending(taskId, step, employeeId) || await this.analysisPending(taskId, step)) return null;
         await this.notice(`message-hold:${taskId}:${step}`, await this.holdNotice(store, taskId, step),
           { commands: 0, revoked: [], extended: [], woke: [], retired: [], exhausted: [], notices: [], decisions: [] });
         return null;
@@ -888,11 +889,23 @@ export class Dispatcher {
     }
   }
 
-  /** The reason a claim is released when the message is not sent this pass: a hold for the owner, or a translation still to come. */
+  /**
+   * Read-only: a rework message waits for the analysis of the return it answers (OutboundMessageStore.awaitingAnalysis). The wait ends
+   * by itself after a few minutes; it is not an owner hold and raises no notice. An unreadable check does not wait.
+   */
+  private async analysisPending(taskId: string, step: MessageStep): Promise<boolean> {
+    const store = this.messageStore();
+    if (!store) return false;
+    try { return await store.awaitingAnalysis(taskId, step); }
+    catch { return false; }
+  }
+
+  /** The reason a claim is released when the message is not sent this pass: a hold for the owner, or a translation or an analysis still to come. */
   private async skipReason(taskId: string, step: MessageStep, employeeId: string): Promise<string> {
     return await this.translationPending(taskId, step, employeeId)
       ? '派工消息等待译文，已收回本次预领租约，译文就绪后再派工'
-      : '派工消息需要老板放行，已收回本次预领租约并等待放行';
+      : await this.analysisPending(taskId, step) ? '返工消息等待上一轮的完工分析，已收回本次预领租约，几分钟内自动再派'
+        : '派工消息需要老板放行，已收回本次预领租约并等待放行';
   }
 
   /** Render the table body with the workdir line. No write: the row stays draft until the external send landed. */
@@ -1794,6 +1807,8 @@ export class Dispatcher {
     // Both the reuse and spawn paths share this gate; the post-claim read stays as a backstop.
     const preStep = await nextStep(undefined);
     if (task && await this.heldMessage(task.id, preStep, report)) return undefined;
+    // A rework message waits a bounded time for the analysis of the last return: no lease, no notice.
+    if (task && await this.analysisPending(task.id, preStep)) return undefined;
     if (task) {
       const deny = this.taskDeny.get(task.id);
       if (deny && deny.version === task.version && Date.now() - deny.at < CLAIM_DENY_COOLDOWN_MS) return undefined;

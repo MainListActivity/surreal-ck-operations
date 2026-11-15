@@ -1,7 +1,7 @@
 /**
  * 完工分析：员工每次交出结果后，读任务卡与这次结果，写下完成情况、还缺什么、建议下一条消息的开头一段和把握。
  *
- * 本版只记录、只展示：不改派工消息，不决定任务流转（流转仍只认首行结论，见 runner/lifecycle.ts 的 workResult）。
+ * 分析只记录、展示，并由派工消息表把退回的分析写进返工消息的开头（见 outbound-messages.ts 的 attachAnalysis）：不决定任务流转（流转仍只认首行结论，见 runner/lifecycle.ts 的 workResult）。
  * 模型没有工具；员工的输出是待分析的数据，不能改变这里的规则。把握不只听模型自评：证据被截断时一律记为把握不足。
  */
 import { RecordId, type Surreal } from 'surrealdb';
@@ -59,7 +59,10 @@ export function turnAnalysis(value: unknown): TurnAnalysis {
   return { status: v.status as TurnAnalysis['status'], summary, needs, next: text(v.next, NEXT_LIMIT), confidence: v.confidence as TurnAnalysis['confidence'] };
 }
 
-const clip = (text: string): { text: string; cut: boolean } =>
+/** 执行端代收结果时加在最前面的说明行：不是员工写的，交给模型前去掉，免得被当成交付格式的疑点。 */
+const RUNNER_PREFIX = /^\s*执行端自动收集的工作结果[:：]?[ \t]*\n*/;
+const clip = (raw: string): { text: string; cut: boolean } => clipped(raw.replace(RUNNER_PREFIX, ''));
+const clipped = (text: string): { text: string; cut: boolean } =>
   text.length > ANALYSIS_TEXT_LIMIT ? { text: text.slice(0, ANALYSIS_TEXT_LIMIT), cut: true } : { text, cut: false };
 
 interface AuditRow { id: RecordId; task: RecordId; action: string; evidence: string; at: unknown }
@@ -70,6 +73,8 @@ interface AuditRow { id: RecordId; task: RecordId; action: string; evidence: str
  */
 export async function analyzeTurns(db: Surreal, analyze: AnalyzeTurn, now = Date.now()): Promise<{ analyzed: number; failed: number }> {
   const result = { analyzed: 0, failed: 0 };
+  // 心跳：返工消息只在分析任务确实在跑时才等分析（见 OutboundMessageStore.awaitingAnalysis）。
+  await db.query('UPSERT company_meta:analysis SET at = time::now();').catch(() => undefined);
   // 每分钟都跑：先只取编号，选出本轮要分析的再读正文（一条结果最长近三万字）。【通道回滚】是执行端自己的记录，不是员工的工作结果。
   const [candidates] = await db.query<[Array<{ id: RecordId; at: unknown }>]>(
     `SELECT id, at FROM audit WHERE at > time::now() - ${WINDOW_DAYS}d AND action IN $actions

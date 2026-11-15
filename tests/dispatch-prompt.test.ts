@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { taskBrief } from '../src/dispatcher/brief.ts';
-import { composeMessage, INLINE_LIMIT, RESOURCES_LIMIT, renderMessage, unrenderMessage } from '../src/outbound-render.ts';
+import { analysisLead, composeMessage, INLINE_LIMIT, RESOURCES_LIMIT, renderMessage, unrenderMessage } from '../src/outbound-render.ts';
 import { taskMaterial } from '../src/runner/cloud-lane/lane.ts';
 import { workResult } from '../src/runner/lifecycle.ts';
 
@@ -152,4 +152,14 @@ test('完工分析的模型输出要过校验：枚举、长度、条数', async
   expect(loose.next).toBe('');
   expect(loose.needs).toEqual(['a', 'b'.repeat(200), 'c', 'd', 'e']);
   expect(turnAnalysis({ ...ok, needs: 'none' }).needs).toEqual([]);
+});
+
+test('返工消息的复盘段：在“先修复退回意见”之后、任务说明之前；只有返工带', () => {
+  const lead = analysisLead('上一轮导出报 500。先修接口。')!;
+  expect(lead).toBe('上一轮的情况（系统读退回意见后整理的，与退回意见原文不一致时以原文为准）：\n上一轮导出报 500。先修接口。');
+  expect(analysisLead('  ')).toBeUndefined();
+  const task = { title: '导出', requirement: '给订单列表加导出', acceptance: '能下载', analysisLead: lead };
+  expect(composeMessage('rework', task)).toStartWith(`上一轮被退回，先修复 findings/round-NN.md 里的问题。\n\n${lead}\n\n给订单列表加导出`);
+  expect(composeMessage('execute', task)).not.toContain('上一轮的情况');
+  expect(composeMessage('review', task)).not.toContain('上一轮的情况');
 });
