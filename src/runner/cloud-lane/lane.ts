@@ -6,6 +6,7 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { isLaneProvider, type LaneProvider } from '../native-args.ts';
+import { bodyOfDispatch } from '../../outbound-render.ts';
 import { clearInflight, laneDigest, readInflight, readLaneState, recordInflight, writeLaneState, type LaneState } from './state.ts';
 import { repoInfo, type ExecFn, type RepoInfo } from './repo.ts';
 import { driveCodex } from './codex.ts';
@@ -21,6 +22,8 @@ export interface LaneConfig {
   dailyLimit?: number;
   /** jules：同时在途会话上限，超出按受阻处理。 */
   maxConcurrent?: number;
+  /** devin-cloud：云端会话用的模型，默认 free（每个用户有免费会话额度；公司派工只用它）。 */
+  model?: string;
   /** 单轮云端任务最长等待分钟数，默认 180。 */
   maxMinutes?: number;
   /** 测试用：轮询间隔毫秒，默认 25000。 */
@@ -43,6 +46,9 @@ export function validateLanes(lanes: unknown): asserts lanes is Partial<Record<L
         if (!value || typeof value !== 'object' || Array.isArray(value) ||
           Object.entries(value as Record<string, unknown>).some(([name, path]) => !/^[a-zA-Z0-9._-]+$/.test(name) || typeof path !== 'string' || !isAbsolute(path)))
           throw new Error(`lanes.${provider}.bin 必须是命令名 → 绝对路径 的映射`);
+      } else if (key === 'model') {
+        if (provider !== 'devin-cloud' || typeof value !== 'string' || !/^[\w.-]{1,60}$/.test(value))
+          throw new Error('lanes.devin-cloud.model 必须是模型名');
       } else if (!['dailyLimit', 'maxConcurrent', 'maxMinutes', 'pollMs'].includes(key) || typeof value !== 'number' || !(value > 0))
         throw new Error(`lanes.${provider}.${key} 必须是正数`);
       if (provider === 'warp' && !['bin', 'maxMinutes'].includes(key))
@@ -64,7 +70,7 @@ export interface LaneDeps {
 
 export interface LaneInput {
   provider: LaneProvider;
-  /** 派工消息原文（指向 task.md / findings 的三句话）。 */
+  /** 派工消息原文：老板在派工消息页看到、改过的那条，路径已渲染成本机绝对路径。 */
   prompt: string;
   cwd: string;
   /** 员工通道目录：task.md、findings/、.lane/state.json 都在这里。 */
@@ -87,11 +93,13 @@ const REVIEW_MARKER = '## 待复核成果';
 const REVIEW_PREFIX = /^复核结论：(通过|退回)/;
 
 /**
- * 把 task.md 与最新 findings 内联进供应商 prompt：云端 agent 读不到本机文件、也调不了 sck。
+ * 云端与网页通道的 agent 读不到本机文件、也调不了 sck：把派工消息里指向的文件内容附在消息后面。
  * findings 按通信目录里实际有的文件取，不看派工消息的措辞：领取时旧任务的 findings 已清掉（sidecar stageBrief），
  * 目录里有文件就是本任务最近一次退回；老板把消息改成什么样，退回意见都不会丢。复核轮不带。
+ * message 是发给 agent 的正文：就是老板在派工消息页看到、改过的那条消息，文件路径换成“下文《…》”，后面附上文件内容。
+ * 没有派工消息（少见）时为空，调用方退回到整份 task.md。
  */
-export function taskMaterial(commDir: string, _prompt?: string): { task: string; findings?: string; answer?: string; review: boolean; title: string } {
+export function taskMaterial(commDir: string, prompt?: string): { task: string; findings?: string; answer?: string; review: boolean; title: string; message?: string } {
   let task = '';
   try { task = readFileSync(join(commDir, 'task.md'), 'utf8'); } catch { /* 无 task.md：少见，仍按 prompt 执行 */ }
   const review = task.includes(REVIEW_MARKER);
@@ -106,7 +114,38 @@ export function taskMaterial(commDir: string, _prompt?: string): { task: string;
   // 老板对上次受阻的答复（sidecar stageBrief 落盘；已被消化的答复领取时会删掉）。
   let answer: string | undefined;
   try { answer = readFileSync(join(commDir, 'answer.md'), 'utf8'); } catch { /* 没有待转达的答复 */ }
-  return { task, findings, answer, review, title };
+  const message = laneMessage(prompt, commDir, { task, findings, answer, review });
+  return { task, findings, answer, review, title, ...(message ? { message } : {}) };
+}
+
+const escapeRe = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** 派工消息 → 发给读不到本机文件的 agent 的正文（见 taskMaterial）。 */
+export function laneMessage(prompt: string | undefined, commDir: string,
+  material: { task: string; findings?: string; answer?: string; review: boolean }): string | undefined {
+  let body = bodyOfDispatch(prompt ?? '').trim();
+  if (!body) return undefined;
+  const dir = commDir.replace(/\/+$/, '');
+  const attachments: string[] = [];
+  const attach = (pattern: RegExp, title: string, content: string | undefined, always: boolean) => {
+    const mentioned = pattern.test(body);
+    if (mentioned) body = body.replace(new RegExp(pattern.source, 'g'), `下文《${title}》`);
+    if (content?.trim() && (mentioned || always)) attachments.push(`## ${title}\n\n${content.trim()}`);
+  };
+  let notes: string | undefined;
+  try { notes = readFileSync(join(commDir, 'notes.md'), 'utf8'); } catch { /* 这条线还没有笔记 */ }
+  // 答复较短时消息正文里已经有老板的原话，不再附一遍；较长时正文指向 answer.md，这里附全文。
+  attach(new RegExp(`${escapeRe(dir)}/answer\\.md`), '老板答复全文', material.answer, !body.includes('老板答复'));
+  // 退回意见一定附上（返工轮）：老板把消息改成什么样都不会丢。
+  attach(new RegExp(`${escapeRe(dir)}/findings/round-(?:\\d+|NN)\\.md|findings/round-(?:\\d+|NN)\\.md`), '上一轮的退回意见', material.findings, true);
+  // 复核轮的待复核成果只在 task.md 里，一定附上；执行轮在消息指向它时附（需求或验收太长）。
+  // 按任务卡组装的三段式正文（有“可以用：”“验证：”两段）自己就是完整的；其它正文（路线模板、旧模板、老板整段改写）可能靠 task.md 才完整，也附上。
+  const selfContained = body.includes('\n可以用：') && body.includes('\n验证：');
+  attach(new RegExp(`${escapeRe(dir)}/task\\.md`), '任务全文', material.task, material.review || !selfContained);
+  attach(new RegExp(`${escapeRe(dir)}/notes\\.md`), '这条线的笔记', notes, false);
+  // 公司命令这类 agent 调不了：去掉那句指引，免得它去找一个不存在的工具。
+  body = body.replace(/需要账号、登录态或远程执行工具时，用 .{1,400}? call company_cmd_catalog 查可用的工作能力。/g, '').replace(/\n{3,}/g, '\n\n').trim();
+  return [body, ...attachments].join('\n\n');
 }
 
 /** 交给云端 agent 的完整 prompt。 */
@@ -127,6 +166,8 @@ export function vendorPrompt(input: LaneInput, repo: RepoInfo, material: ReturnT
     if (input.provider === 'codex-cloud')
       parts.push('工作结果由本地桥接进程应用与提交；只需把改动做完整。没有可交付的代码改动时，在最终消息里说明原因。');
   }
+  // 正文就是派工消息（老板看到、改过的那条），指向的文件内容附在后面；没有派工消息时退回到整份任务材料。
+  if (material.message) { parts.push('', material.message); return parts.join('\n'); }
   if (material.answer !== undefined)
     parts.push('', '## 上次受阻与老板的答复（按答复接着做）', material.answer.trim());
   if (material.findings !== undefined)
