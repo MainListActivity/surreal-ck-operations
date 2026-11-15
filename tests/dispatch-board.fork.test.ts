@@ -378,6 +378,10 @@ run('lane preference: the preferred lane is spawned first, and the sent message 
     const other = reasons.find(r => !r.includes('有空位'))!;
     expect(other).toContain('这几条通道现在都用不了，改用 codex');
     expect(other).toContain('没用 claude（编制席位已满）');
+    // 老板把偏好清空：真库里要整份替换，不能留下旧条目（0.13.23 用 MERGE，清不掉）。
+    const desk = { db: w.database, core: w.core as never, owner: w.owner, workforce: w.wf, messages: new OutboundMessageStore(w.surreal), opsRepo: w.dir };
+    expect(await ownerApi(desk, { command: 'dispatch.preference', lanePreference: {} }, 'test')).toMatchObject({ lanePreference: {} });
+    expect(await ownerApi(desk, { command: 'dispatch.preference', lanePreference: { 'role:qa': ['codex'] } }, 'test')).toMatchObject({ lanePreference: { 'role:qa': ['codex'] } });
   } finally {
     await w.close();
   }
