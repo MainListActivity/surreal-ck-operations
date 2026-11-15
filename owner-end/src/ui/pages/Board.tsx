@@ -5,7 +5,8 @@ import { OBSERVATION_TTL, useObservationClock } from '../runtime-state.ts';
 import type { ComponentChildren } from 'preact';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { memo } from 'preact/compat';
-import { readBoard, outcomeText } from '../api.ts';
+import { readBoard, readChains, outcomeText } from '../api.ts';
+import type { ChainRow, MessageChain } from '../../../../src/message-chain.ts';
 import { Empty, NoticeLine, PageHeader, Panel, roleText, useAction } from '../common.tsx';
 import {
   buildBoardView, clockText, draftOf, isDirty, translationView, type BoardViewModel, type Drafts, type EmployeeView, type MessageView,
@@ -20,6 +21,8 @@ export const FLASH_MS = 2_500;
 
 interface BoardState {
   board?: OwnerBoard;
+  /** 消息链：读不出时保留上一次的，不影响看板其余部分。 */
+  chains?: MessageChain[];
   error?: string;
   loadedAt?: number;
   /** 最近变化的消息编号（高亮用）。 */
@@ -56,6 +59,15 @@ interface MessageBlockProps {
   onSave(messageId: string, text: string): void;
   onHold(messageId: string, hold: boolean): void;
 }
+
+const CHAIN_STATUS: Record<ChainRow['status'], string> = { sent: '已发出', next: '下一条', held: '已扣住', later: '稍后', waiting: '等前一张任务', planned: '预排' };
+const STEP_TEXT: Record<string, string> = { execute: '执行', rework: '返工', review: '复核', nudge: '催办', notice: '通知' };
+const stepText = (step: string): string => STEP_TEXT[step] ?? step;
+/**
+ * 消息链一行的草稿键，与页面其它位置分开：员工卡片里同一条消息编辑的是按员工渲染后的文本（绝对路径），
+ * 这里编辑的是存储的原文，两处共用草稿会把渲染后的路径存成原文。
+ */
+const chainKey = (row: ChainRow): string => row.messageId ? `chain:${row.messageId}` : `plan:${row.plan!.requirement}:${row.plan!.revision}:${row.plan!.index}:${row.plan!.step}`;
 
 /** 每条消息都共用的字段；保存函数由卡片所在位置决定（员工待发用 edit_rendered，其它用 edit）。 */
 type CommonMessageProps = Pick<MessageBlockProps, 'context' | 'messageId' | 'title' | 'body' | 'hold' | 'holdReason' | 'draft' | 'dirty' | 'busy' | 'flash' | 'onDraft' | 'onHold'>;
@@ -176,7 +188,8 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
     try {
       do {
       pendingLoad.current = false;
-      const out = await readBoard();
+      const [out, chainsOut] = await Promise.all([readBoard(), readChains()]);
+      if (chainsOut.kind === 'ok') setState(prev => ({ ...prev, chains: chainsOut.result }));
       if (out.kind !== 'ok') {
         setState(prev => ({ ...prev, error: outcomeText(out, '') }));
         return;
@@ -185,6 +198,7 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
       const changed = changedIds(sigs.current, next);
       sigs.current = next;
       setState(prev => ({
+        ...prev,
         board: out.result,
         loadedAt: Date.now(),
         flash: changed.length ? new Set([...prev.flash, ...changed]) : prev.flash,
@@ -217,7 +231,7 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
     };
   }, [load]);
 
-  useLiveRefresh(['task','employee','audit','outbound_message','company_meta','runner_heartbeat'], load);
+  useLiveRefresh(['task','employee','audit','outbound_message','company_meta','runner_heartbeat','product_requirement','requirement_execution'], load);
 
   /** 员工待发消息：按员工渲染后的原文保存（message.edit_rendered）。 */
   const saveRendered = (employeeId: string, messageId: string, text: string) =>
@@ -235,6 +249,13 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
 
   const setHold = (messageId: string, on: boolean) =>
     void run(on ? 'message.hold' : 'message.release', { messageId }, on ? '已扣住，等待放行' : '已放行', () => load());
+
+  /** 流水线里还没建任务的步骤：安排存在 planned_message，建出任务时套用。 */
+  const savePlan = (row: ChainRow, patch: { body?: string | null; hold?: boolean }, done: string) =>
+    void run('message.plan', { ...row.plan!, ...patch }, done, () => {
+      onDraftSaved(chainKey(row));
+      return load();
+    });
 
   const board = state.board;
   const observedNow = useObservationClock([board?.runner.at]);
@@ -337,6 +358,63 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
       {state.error ? <p class="notice err" role="alert"><span class="notice-text">看板读取失败：{state.error}</span></p> : null}
       <NoticeLine notice={notice} />
       {!board && !state.error ? <p class="hint" role="status">正在读取员工动态…</p> : null}
+
+      {state.chains ? (
+        <Panel title="消息链" hint="每条任务链上已经发出的、接下来要发的、以及后面步骤的消息，按发送顺序排好。后面步骤的消息可以提前改写或先扣住。">
+          {state.chains.length === 0 ? <Empty>没有进行中的任务链</Empty> : (
+            <div class="stack">
+              {state.chains.map(chain => (
+                <section key={chain.id} class="chain">
+                  <h3>{chain.title || '（未命名）'}{chain.requirement ? <span class="hint"> · 需求流水线</span> : null}</h3>
+                  <ol class="next-list">
+                    {chain.rows.map((row, index) => {
+                      const key = chainKey(row);
+                      const head = (
+                        <>
+                          <span class={`tag${row.status === 'held' || row.hold ? ' warn' : ''}`}>{CHAIN_STATUS[row.status]}</span> {row.title}（{stepText(row.step)} · {roleText(row.role)}）
+                          <span class="hint"> · {row.status === 'sent' ? `${row.sentAt ? clockText(Date.parse(row.sentAt)) : ''} 发给 ${row.sentTo ?? '—'}` : row.when}{row.status !== 'sent' && row.fixed ? ' · 正文已由你写定' : ''}</span>
+                        </>
+                      );
+                      if (row.status === 'sent') return <li key={`${key}:${index}`}>{head}</li>;
+                      const body = row.body ?? '';
+                      return (
+                        <li key={`${key}:${index}`}>
+                          <details>
+                            <summary>{head}</summary>
+                            <MessageBlock
+                              messageId={key}
+                              title={row.title}
+                              meta={stepText(row.step)}
+                              body={body}
+                              hold={row.hold}
+                              holdReason={row.holdReason}
+                              draft={draftOf(drafts, key)}
+                              dirty={isDirty(drafts, key, body)}
+                              busy={busy}
+                              flash={false}
+                              onDraft={onDraft}
+                              note={row.plan ? '任务还没建，按规划预排；{前置任务} 等占位在建任务时换成真实编号' : row.fixed ? '消息原文' : '消息原文，发出前按任务卡和最新进展重算'}
+                              onSave={(_id, text) => row.plan ? savePlan(row, { body: text }, '已保存，建出任务时按这段发')
+                                : void run('message.edit', { messageId: row.messageId!, body: text, expectedBody: body }, '已保存', () => { onDraftSaved(key); return load(); })}
+                              onHold={(_id, on) => row.plan ? savePlan(row, { hold: on }, on ? '已安排：建出后先扣住' : '已取消扣住') : setHold(row.messageId!, on)}
+                              extra={row.plan && row.fixed ? (
+                                <div class="button-row">
+                                  <button type="button" disabled={busy} onClick={() => savePlan(row, { body: null }, '已恢复按规划生成')}>恢复按规划生成</button>
+                                </div>
+                              ) : undefined}
+                            />
+                          </details>
+                        </li>
+                      );
+                    })}
+                  </ol>
+                  <p class="hint">被退回时会生成返工消息（带上一轮的情况；第二轮起先扣住），员工一轮没给结果时会发催办：这两类到时才生成，不在这里预排。云端与网页通道的员工按任务卡自己拼提示词，改这里的正文对它们不生效，改任务卡才生效。</p>
+                </section>
+              ))}
+            </div>
+          )}
+        </Panel>
+      ) : null}
 
       {view ? (
         <>

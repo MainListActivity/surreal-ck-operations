@@ -550,3 +550,32 @@ run('第 2 步后半：退回的完工分析写进返工消息；把握不足扣
   expect(second.body).toContain('老板补充：时间用北京时间。');
   expect(second.hold).toBe(true); // 第二轮返工照旧扣住。
 });
+
+run('第 3 步：消息链按父子关系排出已发、下一条、稍后与等前一张任务的消息；只读', async () => {
+  const { readMessageChains } = await import('../src/message-chain.ts');
+  const store = new OutboundMessageStore(db.db);
+  const mk = async (title: string, parent?: string) => { const t = await core.createTask(gm, { title, context: '消息链夹具任务', requirement: '消息链夹具任务',
+    acceptanceText: '能看到结果', executorRole: 'engineering', reviewerRole: 'qa', parent, idempotencyKey: key() } as never);
+    await store.createTaskDrafts(t.id, 'engineering', 'qa', false); return t; };
+  const root = await mk('消息链根任务'), child = await mk('消息链后继任务', root.id);
+  const count = async () => (await db.db.query<[Array<{ n: number }>]>('SELECT count() AS n FROM outbound_message GROUP ALL;'))[0]![0]!.n;
+  const before = await count();
+  const chainOf = async () => (await readMessageChains(db.db)).find(c => c.id === root.id)!;
+  expect((await chainOf()).rows.map(r => `${r.status}:${r.title}:${r.step}`)).toEqual([
+    'next:消息链根任务:execute', 'later:消息链根任务:review', 'waiting:消息链后继任务:execute', 'waiting:消息链后继任务:review']);
+  expect((await chainOf()).rows[2]!.when).toBe('等《消息链根任务》完成后发');
+  expect((await chainOf()).rows[0]).toMatchObject({ fixed: false, hold: false, role: 'engineering' });
+  // 发出执行消息、老板扣住并改写复核消息：链上如实反映，已发的不带正文。
+  const sent = await store.prepareSend(root.id, 'execute', 'lanes-eng');
+  await store.markSent(sent!.message.id, 'lanes-eng', sent!.body);
+  const review = (await store.list(root.id, false)).find(m => m.step === 'review')!;
+  await store.edit(review.id, '老板写定的复核消息', 'owner');
+  await store.setHold(review.id, true, 'owner');
+  const chain = await chainOf();
+  expect(chain.rows.slice(0, 2).map(r => `${r.status}:${r.step}`)).toEqual(['sent:execute', 'held:review']);
+  expect(chain.rows[0]).toMatchObject({ sentTo: 'lanes-eng', when: '已发出' });
+  expect(chain.rows[0]!.body).toBeUndefined();
+  expect(chain.rows[1]).toMatchObject({ fixed: true, body: '老板写定的复核消息', when: '已扣住，等你放行' });
+  expect(await count()).toBe(before); // 读消息链不写库。
+  expect(child.state).toBe('planned');
+});

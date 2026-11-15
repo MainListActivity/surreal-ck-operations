@@ -7,6 +7,7 @@
  */
 import { AuthenticationError, InvalidSessionError, NotAllowedError, Surreal, Table } from 'surrealdb';
 import { readBoard } from '../../../src/board.ts';
+import { readMessageChains, type MessageChain } from '../../../src/message-chain.ts';
 import { readRuntimeDashboard, type RuntimeDashboard } from '../../../src/runtime-dashboard.ts';
 import { BACKEND_OWNER_COMMANDS } from '../command-routing.ts';
 import { LIVE_TABLES } from '../live-tables.ts';
@@ -188,6 +189,15 @@ export async function runOwnerCommand(command: string, input: Record<string, unk
 export async function readBoardData(): Promise<OwnerBoard> {
   try {
     return plain(await withSession(readBoard)) as unknown as OwnerBoard;
+  } catch (error) {
+    throw classify(error);
+  }
+}
+
+/** 消息链与看板一样直接读库：页面每次实时刷新都会读，不走命令通道（那里每次调用都记一条审计）。 */
+export async function readChainsData(): Promise<MessageChain[]> {
+  try {
+    return plain(await withSession(readMessageChains));
   } catch (error) {
     throw classify(error);
   }

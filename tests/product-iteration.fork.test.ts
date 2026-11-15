@@ -23,6 +23,7 @@ beforeAll(async()=>{
   await db.query('DEFINE NAMESPACE iteration; USE NS iteration; DEFINE DATABASE fixture;');await db.use({namespace:'iteration',database:'fixture'});
   await db.query('DEFINE TABLE project SCHEMALESS; CREATE project:sample SET name="测试产品";');
   await db.query(readFileSync(join(import.meta.dir,'../schema/063-product-iteration.surql'),'utf8'));
+  await db.query(readFileSync(join(import.meta.dir,'../schema/072-planned-message.surql'),'utf8'));
   for(const access of ['owner','gateway','runner','automation'])await db.query(`DEFINE ACCESS ${access} ON DATABASE TYPE JWT ALGORITHM HS512 KEY '${secret}';`);
   store=new Requirements(db);
 },20000);
@@ -203,9 +204,25 @@ run('完整公司 schema 与真实 core：幂等建规划单、真实租约提�
     await requirements.configure('sample',{enabled:true,autoRelease:false,feedbackOrigins:[]},'owner');
     const req=await requirements.create(content,'owner');await requirements.approve(req.id,1,'owner');
     let now=Date.now();await planRequirements(database.db,async()=>({steps:[{title:'实现检索测试',context:'为检索实现增加测试',acceptance:'检索用例通过'}]}),now);
-    const host={create:(input:import('../src/contracts.ts').CreateTask)=>createIterationTask(core,messages,owner,input)};
+    const host={create:(input:import('../src/contracts.ts').CreateTask,planned?:import('../src/iteration/execution.ts').PlannedStep)=>createIterationTask(core,messages,owner,input,planned)};
+    // 消息链预排：一张任务都还没建时，三步（核对计划、实施、合并上线）的执行与复核消息已经按规划排好。
+    const {readMessageChains,planMessage}=await import('../src/message-chain.ts');
+    const before=(await readMessageChains(database.db)).find(c=>c.requirement===req.id)!;
+    expect(before.id).toBe(`requirement:${req.id}`);
+    expect(before.rows.map(r=>`${r.status}:${r.plan!.index}:${r.step}:${r.role}`)).toEqual(['planned:0:execute:product','planned:0:review:qa','planned:1:execute:engineering','planned:1:review:qa','planned:2:execute:engineering','planned:2:review:qa']);
+    expect(before.rows[2]!.body).toContain('前置任务：{前置任务}');expect(before.rows[2]!.fixed).toBe(false);
+    // 老板提前改写第 2 步的执行消息并要求建出后先扣住；规划里没有的步骤拒绝。
+    await planMessage(database.db,{requirement:req.id,revision:1,index:1,step:'execute',body:'老板改写：先看前置任务 {前置任务} 的结论再动手，不要合并 PR。',hold:true},'owner');
+    await denied(planMessage(database.db,{requirement:req.id,revision:1,index:3,step:'execute',hold:true},'owner'),'规划里没有这一步');
     expect((await reconcileIterations(database.db,host,now+=180000)).failed).toBe(0);
     const planning=(await requirements.get(req.id)).root_task!;expect(planning).toBeTruthy();
+    // 第 1 步的任务建出后：链以它为根，它的两条草稿在前（执行被扣住、复核靠后），后两步仍是预排，老板的改写带着。
+    const mid=(await readMessageChains(database.db)).find(c=>c.requirement===req.id)!;
+    expect(mid.id).toBe(planning);
+    expect(mid.rows.map(r=>`${r.status}:${r.step}`)).toEqual(['held:execute','later:review','planned:execute','planned:review','planned:execute','planned:review']);
+    expect(mid.rows[0]).toMatchObject({holdReason:'新需求的首次派工',when:'系统扣住：新需求的首次派工'});
+    expect(mid.rows[2]).toMatchObject({fixed:true,hold:true,body:'老板改写：先看前置任务 {前置任务} 的结论再动手，不要合并 PR。'});
+    await denied(planMessage(database.db,{requirement:req.id,revision:1,index:0,step:'execute',hold:true},'owner'),'这一步的任务已经建出');
     // 新需求的第一条派工消息按规则扣住并写明原因；复核草稿不扣。
     const firstDrafts=await messages.list(planning,false);
     expect(firstDrafts.find(m=>m.step==='execute')).toMatchObject({hold:true,holdReason:'新需求的首次派工'});
@@ -218,6 +235,20 @@ run('完整公司 schema 与真实 core：幂等建规划单、真实租约提�
     const tasks=await core.listTasks(owner);expect(tasks.length).toBe(1);expect((await core.getTask(owner,planning)).state).toBe('done');
     const engineering=tasks.find(t=>t.executorRole==='engineering')!;expect(engineering.parent).toBe(planning);expect(engineering.workIntent?.kind).toBe('code');expect(engineering.projectOverlay).toBe('sample');
     const drafts=await messages.list(engineering.id);expect(drafts).toHaveLength(2);expect(drafts.find(m=>m.step==='execute')?.body).toContain('不要合并 PR');
+    // 老板提前的安排落在刚建出的草稿上：占位换成真实编号、算老板改过的正文、先扣住；复核消息没安排，照规划生成。
+    expect(drafts.find(m=>m.step==='execute')).toMatchObject({body:`老板改写：先看前置任务 ${planning} 的结论再动手，不要合并 PR。`,hold:true,state:'held'});
+    expect(drafts.find(m=>m.step==='review')!.hold).toBe(false);
+    // 套用后记下已套用；建单成功但套用中断（没记上）时，同一业务键回放会补套，已套过的不重复。
+    const {RecordId:Rid}=await import('surrealdb');
+    const [stamp]=await database.db.query<[Array<{applied_at?:unknown}>]>('SELECT applied_at FROM $id;',{id:new Rid('planned_message',`${req.id}:1:1:execute`)});expect(stamp[0]!.applied_at).toBeTruthy();
+    const heldDraft=drafts.find(m=>m.step==='execute')!;await messages.setHold(heldDraft.id,false,'owner');
+    const replayInput=(await import('../src/iteration/execution.ts')).iterationStep(JSON.parse((await database.db.query<[Array<{snapshot:string}>]>('SELECT snapshot FROM $id;',{id:new Rid('requirement_approval',`${req.id}:1`)}))[0][0]!.snapshot),{steps:[{title:'实现检索测试',context:'为检索实现增加测试',acceptance:'检索用例通过'}]},1,[planning]).input;
+    let stamped=0;
+    await createIterationTask(core,messages,owner,replayInput,{execute:{hold:true},applied:async()=>{stamped++;}});
+    expect((await messages.list(engineering.id,false)).find(m=>m.step==='execute')!.hold).toBe(true);expect(stamped).toBe(1);expect((await core.listTasks(owner)).length).toBe(1);
+    const after=(await readMessageChains(database.db)).find(c=>c.requirement===req.id)!;
+    expect(after.rows.filter(r=>r.taskId===engineering.id).map(r=>`${r.status}:${r.step}:${r.fixed}`)).toEqual(['held:execute:true','later:review:false']);
+    expect(after.rows.filter(r=>r.status==='planned').map(r=>r.plan!.index)).toEqual([2,2]);
     await database.db.query("UPDATE outbound_message SET state='sent' WHERE task=$task;",{task:new (await import('surrealdb')).RecordId('task',engineering.id)});
     await messages.createTaskDrafts(engineering.id,'engineering','qa',true,{includeSent:true});expect(await messages.list(engineering.id)).toHaveLength(2);
   }finally{await database.close();}

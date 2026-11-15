@@ -6,7 +6,7 @@ import type { RuntimeDashboard } from '../../../src/runtime-dashboard.ts';
 import { accessToken, clearSession, signOutLocal, type Fetcher } from './auth.ts';
 import { errorText } from './model.ts';
 import type { OwnerBoard } from './types.ts';
-import { readBoardData, readDashboardData, runOwnerCommand, runsInPage, SourceError } from './source.ts';
+import { readBoardData, readChainsData, readDashboardData, runOwnerCommand, runsInPage, SourceError } from './source.ts';
 
 export type Outcome<T> =
   | { kind: 'ok'; result: T }
@@ -133,6 +133,7 @@ async function fromSource<T>(read: () => Promise<T>): Promise<Outcome<T>> {
 }
 
 export const readBoard = (): Promise<Outcome<OwnerBoard>> => fromSource(readBoardData);
+export const readChains = () => fromSource(readChainsData);
 
 /**
  * 当前登录的老板。令牌无效返回 undefined；非老板（403）抛出可显示的中文原因；其它失败同样抛出。

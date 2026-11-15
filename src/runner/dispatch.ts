@@ -495,10 +495,10 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
         }
         if (!(await ctx.workforce.config()).paused) {
           await timing.measure("iterations", () => reconcileIterations(ctx.db.db, {
-            create: async input => {
+            create: async (input, planned) => {
               const credential = process.env.SCK_OWNER_TOKEN;
               if (!credential) throw new Error('owner credential unavailable');
-              return createIterationTask(ctx.core, ctx.messages, credential, input);
+              return createIterationTask(ctx.core, ctx.messages, credential, input, planned);
             },
           })).catch(() => console.warn('iteration reconciliation failed'));
         }

@@ -25,6 +25,7 @@ import { defaultAcceptanceCriteria } from './acceptance.ts';
 import { readTaskCost, COST_LIST_SQL } from './task-cost.ts';
 import { QUOTA_ROWS } from './dispatcher/quota-store.ts';
 import { hostIOOrUndefined } from './host-io.ts';
+import { planMessage, readMessageChains } from './message-chain.ts';
 
 export type OwnerVia = string;
 export interface OwnerApiContext { db: CompanyDatabase; core: CompanyCore & {
@@ -267,6 +268,14 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     case 'message.send': {
       // 放行：清 hold 后由调度器在下一轮实际派工（正文仍来自表里）。
       return ctx.messages.setHold(text(input.messageId, 'messageId'), false, a);
+    }
+    case 'message.chains': return { chains: await readMessageChains(db) };
+    case 'message.plan': {
+      const step = text(input.step, 'step');
+      if (step !== 'execute' && step !== 'review') throw new CompanyError('invalid', 'step 只能是 execute 或 review');
+      if (input.body !== undefined && input.body !== null && (typeof input.body !== 'string' || input.body.length > 20000)) throw new CompanyError('invalid', '正文无效或过长');
+      return planMessage(db, { requirement: text(input.requirement, 'requirement'), revision: Number(input.revision), index: Number(input.index), step,
+        ...(input.body !== undefined ? { body: input.body as string | null } : {}), ...(typeof input.hold === 'boolean' ? { hold: input.hold } : {}) }, a);
     }
     case 'message.records': {
       const [rows] = await db.query<[unknown[]]>("SELECT * FROM outbound_message WHERE state = 'sent' ORDER BY sent_at DESC LIMIT 300;");
