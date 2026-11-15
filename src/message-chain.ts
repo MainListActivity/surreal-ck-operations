@@ -40,6 +40,8 @@ export interface ChainRow {
   fixed: boolean;
   sentTo?: string;
   sentAt?: string;
+  /** 派出去那一刻记下的“为什么派给它”。 */
+  reason?: string;
 }
 
 export interface MessageChain {
@@ -90,7 +92,7 @@ export async function readMessageChains(db: Surreal): Promise<MessageChain[]> {
   const taskIds = chainRoots.flatMap(([, ids]) => ids).map(id => tasks.get(id)!.id);
   const [messages, returns, planned] = await Promise.all([
     taskIds.length ? db.query<[Row[]]>(
-      `SELECT id, task, step, role, state, hold, hold_reason, body_edited, sent_to, sent_at, created_at, (IF state = 'sent' THEN NONE ELSE body END) AS body
+      `SELECT id, task, step, role, state, hold, hold_reason, body_edited, sent_to, sent_at, dispatch_reason, created_at, (IF state = 'sent' THEN NONE ELSE body END) AS body
         FROM outbound_message WHERE task IN $ids ORDER BY created_at;`, { ids: taskIds }).then(r => r[0] ?? []) : Promise.resolve([] as Row[]),
     taskIds.length ? db.query<[Row[]]>("SELECT task FROM audit WHERE task IN $ids AND action IN ['return', 'owner_reject'];", { ids: taskIds }).then(r => r[0] ?? []) : Promise.resolve([] as Row[]),
     pipelines.length ? db.query<[Row[]]>('SELECT requirement, revision, index, step, body, hold FROM planned_message WHERE requirement IN $ids;', { ids: pipelines.map(p => p.requirement) })
@@ -108,7 +110,8 @@ export async function readMessageChains(db: Surreal): Promise<MessageChain[]> {
     const parent = tasks.get(keyOf(task.parent));
     const sent = all.filter(row => row.state === 'sent').sort((a, b) => String(iso(a.sent_at)).localeCompare(String(iso(b.sent_at))))
       .map((row): ChainRow => ({ status: 'sent', when: '已发出', taskId: id, title, step: String(row.step) as MessageStep, role: String(row.role ?? ''),
-        messageId: keyOf(row.id), hold: false, fixed: true, ...(row.sent_to ? { sentTo: String(row.sent_to) } : {}), ...(iso(row.sent_at) ? { sentAt: iso(row.sent_at) } : {}) }));
+        messageId: keyOf(row.id), hold: false, fixed: true, ...(row.sent_to ? { sentTo: String(row.sent_to) } : {}), ...(iso(row.sent_at) ? { sentAt: iso(row.sent_at) } : {}),
+        ...(typeof row.dispatch_reason === 'string' && row.dispatch_reason ? { reason: row.dispatch_reason } : {}) }));
     if (!open(task)) return sent;
     const latest = new Map<string, Row>();
     for (const row of all) if (row.state !== 'sent') latest.set(String(row.step), row);

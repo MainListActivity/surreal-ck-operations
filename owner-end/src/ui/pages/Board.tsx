@@ -375,7 +375,7 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
                           <span class="hint"> · {row.status === 'sent' ? `${row.sentAt ? clockText(Date.parse(row.sentAt)) : ''} 发给 ${row.sentTo ?? '—'}` : row.when}{row.status !== 'sent' && row.fixed ? ' · 正文已由你写定' : ''}</span>
                         </>
                       );
-                      if (row.status === 'sent') return <li key={`${key}:${index}`}>{head}</li>;
+                      if (row.status === 'sent') return <li key={`${key}:${index}`}>{head}{row.reason ? <p class="hint">为什么派给它：{row.reason}</p> : null}</li>;
                       const body = row.body ?? '';
                       return (
                         <li key={`${key}:${index}`}>

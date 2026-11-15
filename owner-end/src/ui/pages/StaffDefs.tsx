@@ -116,6 +116,60 @@ export function ProviderPreference({ defs }: { defs: DefRow[] }) {
   );
 }
 
+const LANE_KINDS = [['discipline', '工种'], ['type', '路线类型'], ['role', '岗位']] as const;
+type LaneRow = { kind: string; name: string; providers: string };
+
+/**
+ * 通道偏好：按工种、路线类型或岗位定“先用哪条通道”。只排顺序——排在前面的通道有空位就先用，没空位照常用别的。
+ * 命中偏好的任务不再套用上面的优先订阅。写入 company_meta:config.lane_preference。
+ */
+export function LanePreferenceEditor() {
+  const [rows, setRows] = useState<LaneRow[]>();
+  const [problem, setProblem] = useState('');
+  const { busy, notice, run } = useAction();
+  const toRows = (value: Record<string, string[]> | undefined): LaneRow[] => Object.entries(value ?? {}).map(([key, providers]) => {
+    const at = key.indexOf(':');
+    return { kind: key.slice(0, at), name: key.slice(at + 1), providers: providers.join('、') };
+  });
+  useEffect(() => {
+    void runCommand<{ lanePreference?: Record<string, string[]> }>('dispatch.preference').then(out => {
+      if (out.kind === 'ok') setRows(toRows(out.result.lanePreference));
+      else setProblem(`通道偏好读取失败：${outcomeText(out, '')}`);
+    });
+  }, []);
+  const edit = (index: number, patch: Partial<LaneRow>) => setRows(list => (list ?? []).map((row, i) => (i === index ? { ...row, ...patch } : row)));
+  const save = () => {
+    const lanePreference: Record<string, string[]> = {};
+    for (const row of rows ?? []) {
+      const providers = row.providers.split(/[、,，\s]+/).map(v => v.trim()).filter(Boolean);
+      if (row.name.trim() && providers.length) lanePreference[`${row.kind}:${row.name.trim()}`] = providers;
+    }
+    void run('dispatch.preference', { lanePreference }, '通道偏好已保存', () => setRows(toRows(lanePreference)));
+  };
+  return (
+    <div class="field preference">
+      <span class="field-label"><span>通道偏好</span></span>
+      {(rows ?? []).map((row, index) => (
+        <div class="row-main" key={index}>
+          <select value={row.kind} disabled={busy} onChange={e => edit(index, { kind: e.currentTarget.value })}>
+            {LANE_KINDS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          </select>
+          <input value={row.name} placeholder="例如 文案" disabled={busy} onInput={e => edit(index, { name: e.currentTarget.value })} />
+          <input value={row.providers} placeholder="先后顺序，例如 gemini-web、chatgpt-web" disabled={busy} onInput={e => edit(index, { providers: e.currentTarget.value })} />
+          <button type="button" class="link" disabled={busy} onClick={() => setRows(list => (list ?? []).filter((_, i) => i !== index))}>删除</button>
+        </div>
+      ))}
+      <div class="row-main">
+        <button type="button" disabled={busy || rows === undefined} onClick={() => setRows(list => [...(list ?? []), { kind: 'discipline', name: '', providers: '' }])}>加一条</button>
+        <button type="button" disabled={busy || rows === undefined} onClick={save}>保存</button>
+      </div>
+      <span class="field-hint">某类工作先用哪条通道：排在前面的有空位就先用，没空位照常用别的，不会为它等待。命中的任务不再套用优先订阅。派出后在派工消息页能看到“为什么派给它”。</span>
+      {problem ? <p class="notice err">{problem}</p> : null}
+      <NoticeLine notice={notice} />
+    </div>
+  );
+}
+
 /** 职能卡片里的员工定义列表：状态、启动方式，以及编辑、启用/停用、新增。 */
 export function DefList({ role, defs, allDefs, onChanged }: { role: string; defs: DefRow[]; allDefs: DefRow[]; onChanged(): void }) {
   const [editing, setEditing] = useState<DefRow | 'new'>();
