@@ -381,12 +381,13 @@ function VoidForm({ taskId, onDone, onCancel }: { taskId: string; onDone(): void
 function InterjectForm({ taskId, running, onDone, onCancel }: { taskId: string; running: boolean; onDone(text: string): void; onCancel(): void }) {
   const [text, setText] = useState('');
   const { busy, notice, run } = useAction();
-  const send = (interrupt: boolean) => void run('task.interject', { taskId, text: text.trim(), interrupt }, '已记下', () => {
-    setText(''); onDone(interrupt ? '已插话并中止这一轮，带着这句话重新派工' : '已插话，随下一条消息带给员工');
+  const send = (interrupt: boolean) => void run<{ interrupted?: boolean }>('task.interject', { taskId, text: text.trim(), interrupt }, '已记下', result => {
+    setText(''); onDone(result?.interrupted ? '已插话并中止这一轮，带着这句话重新派工'
+      : interrupt ? '已插话；这一轮刚好已经结束，没有打断，随下一条执行消息带给员工' : '已插话，随下一条执行消息带给员工');
   });
   return (
     <div class="form">
-      <p>你的话会原样放在这张任务下一条消息的最前面。{running ? '这一轮正在进行：可以等它结束后随下一条消息带上，也可以立即打断、带着这句话重新派工（这一轮已做的工作留在工作目录里，由下一轮接着做）。' : '任务现在没有人在做，下一次派工时带上。'}</p>
+      <p>你的话会原样放在这张任务下一条执行或返工消息的最前面。{running ? '这一轮正在进行：可以等它结束后随下一条消息带上，也可以立即打断、带着这句话重新派工（这一轮已做的工作留在工作目录里，由下一轮接着做）。' : '任务现在没有人在做，下一次派工时带上。'}</p>
       <Field label="要说的话" required><textarea rows={3} value={text} disabled={busy} onInput={e => setText(e.currentTarget.value)} /></Field>
       <NoticeLine notice={notice} />
       <div class="button-row end">

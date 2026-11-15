@@ -24,6 +24,10 @@ test('动作摘要：命令、读写改文件、搜索、网址、子任务各�
   expect(actionSummary('Edit', { file_path: '/repo/src/a.ts', old_string: 'SECRET_OLD', new_string: 'SECRET_NEW' })).toBe('改文件：/repo/src/a.ts');
   expect(actionSummary('Write', { file_path: '/repo/b.md', content: 'SECRET' })).toBe('写文件：/repo/b.md');
   expect(actionSummary('Grep', { pattern: 'TODO' })).toBe('搜索：TODO');
+  expect(actionSummary('Grep', { pattern: 'TODO', path: 'src' })).toBe('搜索：TODO');
+  expect(actionSummary('Bash', { command: 'mysql --password hunter2 -u root' })).toBe('执行命令：mysql --password [已隐藏] -u root');
+  expect(actionSummary('Bash', { command: 'tool --token=abc123 --api-key "k v" run' })).toBe('执行命令：tool --token=[已隐藏] --api-key [已隐藏] run');
+  expect(actionSummary('Bash', { command: 'curl -u admin:s3cret https://x.test' })).toBe('执行命令：curl -u [已隐藏] https://x.test');
   expect(actionSummary('WebFetch', { url: 'https://docs.test/page?key=abc' })).toBe('打开网址：https://docs.test/page?[参数已隐藏]');
   expect(actionSummary('Task', { description: '查三处引用', prompt: 'SECRET_PROMPT' })).toBe('派子任务：查三处引用');
   expect(actionSummary('mcp__x__do', { payload: { a: 1 } })).toBe('调用 mcp__x__do');

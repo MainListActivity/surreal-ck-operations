@@ -259,9 +259,10 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     // 中止这一轮：收回租约并让执行端停掉正在跑的会话；任务回到队列，下一次派工带上交接。hold=true 即暂停：下一条消息先扣住，放行才继续。
     case 'task.stop': {
       const taskId = text(input.taskId, 'taskId');
+      // 暂停先扣住下一条消息再收回租约：反过来的话，两步之间的一次派工循环会把任务不带扣住地重新派出去。
+      const held = input.hold === true ? (await ctx.messages.holdNext(taskId, a)).id : undefined;
       const stopped = await stopTask(ctx, db, taskId, text(input.note ?? (input.hold === true ? '老板暂停了任务' : '老板中止了这一轮'), 'note'), a);
       if (!stopped.ok && input.hold !== true) throw new CompanyError('conflict', '任务当前没有在途执行');
-      const held = input.hold === true ? (await ctx.messages.holdNext(taskId, a)).id : undefined;
       return { ...stopped, ...(held ? { heldMessage: held } : {}) };
     }
     // 插话：老板的话随这张任务的下一条消息带给员工。interrupt=true 时同时中止这一轮，带着这句话立刻重派。

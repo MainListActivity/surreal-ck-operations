@@ -534,7 +534,8 @@ export async function readRuntimeDashboard(db: Surreal): Promise<RuntimeDashboar
       read(
         'SELECT id, task, sha, attempt, environment, source, verified, verifier, at FROM acceptance_evidence WHERE verified = true AND verifier = "github-actions" ORDER BY at DESC LIMIT 100;',
       ),
-      read('SELECT employee, agent, task, activity, observed_at FROM agent_activity WHERE expires_at > time::now() ORDER BY observed_at DESC LIMIT 400;'),
+      // 总览只看近一天的当前动态：动作记录保留 7 天，不按天数限定的话每次实时刷新都会把一周的记录读回来。
+      read(`SELECT employee, agent, task, activity, observed_at FROM agent_activity WHERE expires_at > time::now() AND observed_at > ${Date.now() - 86_400_000} ORDER BY observed_at DESC LIMIT 400;`),
       read(`SELECT task, actor, action, phase, at, task.kind AS kind,
         task.project AS project_ref,
         IF phase = 'review' THEN task.reviewer_role ELSE task.executor_role END AS role

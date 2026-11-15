@@ -21,6 +21,13 @@ export async function stopRequested(ctx: Pick<Company, "db" | "runtime" | "sidec
     if (ctx.runnerId && row.runner_id && row.runner_id !== ctx.runnerId) continue;
     const instId = String(row.id.id);
     try {
+      // 请求记的是员工不是哪一轮：读到请求时这位员工已经领了新任务的话，正在跑的是新的一轮，不能停。
+      const [leases] = await ctx.db.db.query<[unknown[]]>('SELECT id FROM task WHERE current_employee = $employee LIMIT 1;', { employee: instId });
+      if (leases?.length) {
+        await ctx.db.db.query('UPDATE $employee SET stop_requested = NONE;', { employee: row.id });
+        console.log(`owner stop: ${instId} already holds a new lease, request dropped`);
+        continue;
+      }
       if (row.paseo_agent_id) await ctx.runtime.stop(row.paseo_agent_id);
       ctx.sidecar.dropLease?.(instId, row.stop_requested?.task);
       await ctx.db.db.query('UPDATE $employee SET stop_requested = NONE;', { employee: row.id });
