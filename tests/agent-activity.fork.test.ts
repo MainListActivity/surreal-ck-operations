@@ -48,3 +48,20 @@ run('进度更新通过真实 Live Query 推送，无轮询读取', async () => 
     expect(events.length).toBeGreaterThan(0);
   } finally {off();await sub.kill();}
 });
+
+run('任务详情读到各轮的动作记录：按开始时间排，只带动作不带输出文本；保留 7 天', async () => {
+  const { taskTurns } = await import('../src/owner-api.ts');
+  // 前面的用例给同一回合写过当前时刻的快照，旧快照不覆盖新快照：这里用更晚的时刻。
+  const T = Date.now() + 60_000;
+  const c = new ActivityCollector('a', 't', T);
+  c.ingest('claude', { type: 'assistant', message: { content: [{ type: 'text', text: 'PUBLIC_OUTPUT' }, { type: 'tool_use', id: 'u', name: 'Bash', input: { command: 'bun test' } }] } }, T + 100);
+  c.ingest('claude', { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'u', content: 'x' }] } }, T + 200);
+  await writeAgentActivity(db, 'native:test', [c.snapshot(T + 300)]);
+  const turns = await taskTurns(db, 'right');
+  expect(turns).toEqual([{ employee: 'e', runtime: 'native', state: 'running', startedAt: T, lastActivityAt: T + 200,
+    actions: [{ at: T + 100, tool: 'Bash', text: '执行命令：bun test', state: 'ok', endedAt: T + 200 }] }]);
+  expect(JSON.stringify(turns)).not.toContain('PUBLIC_OUTPUT');
+  const [rows] = await db.query<any[]>('SELECT expires_at > time::now() + 6d AS kept FROM agent_activity;');
+  expect(rows[0].kept).toBe(true);
+  expect(await taskTurns(db, 'wrong')).toEqual([]);
+});

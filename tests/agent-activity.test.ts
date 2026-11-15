@@ -2,11 +2,11 @@ import { expect, test } from 'bun:test';
 import { ActivityCollector, activityText } from '../src/agent-activity.ts';
 import { parseNativeResult } from '../src/runner/native.ts';
 
-test('只采集公开文本与工具状态，不保存思考、用户资料、参数或工具结果', () => {
+test('只采集公开文本、工具状态和每个动作的一行摘要；不保存思考、用户资料、文件内容或工具结果', () => {
   const c = new ActivityCollector('a', 't', 1);
   c.ingest('claude', {type: 'assistant', message: {content: [
     {type: 'thinking', thinking: 'PRIVATE_THOUGHT'}, {type: 'text', text: '检查接口'},
-    {type: 'tool_use', id: 'u', name: 'Read', input: {path: 'PRIVATE_ARG'}},
+    {type: 'tool_use', id: 'u', name: 'Read', input: {path: 'src/app.ts', content: 'PRIVATE_CONTENT', old_string: 'PRIVATE_OLD'}},
   ]}}, 2);
   expect(c.snapshot(2)).toMatchObject({tool: 'Read', toolsCompleted: 0});
   c.ingest('claude', {type: 'user', message: {content: [{type: 'tool_result', tool_use_id: 'u', content: 'PRIVATE_RESULT'}]}}, 3);
@@ -14,6 +14,62 @@ test('只采集公开文本与工具状态，不保存思考、用户资料、�
   expect(c.snapshot(4).toolsCompleted).toBe(1);
   expect(JSON.stringify(c.snapshot(4))).not.toContain('PRIVATE_');
   expect(c.snapshot(4).tool).toBeUndefined();
+  expect(c.snapshot(4).actions).toEqual([{ at: 2, tool: 'Read', text: '读文件：src/app.ts', state: 'ok', endedAt: 3 }]);
+});
+
+test('动作摘要：命令、读写改文件、搜索、网址、子任务各一行；凭证脱敏；认不出的只留工具名', async () => {
+  const { actionSummary, paseoActionSummary, ACTION_LIMIT } = await import('../src/agent-activity.ts');
+  expect(actionSummary('Bash', { command: 'git status\n  && bun test' })).toBe('执行命令：git status && bun test');
+  expect(actionSummary('Bash', { command: 'curl -H "Authorization: Bearer abcdefghijklmnop123456" https://x.test/a?token=zzz' })).not.toContain('abcdefghijklmnop');
+  expect(actionSummary('Edit', { file_path: '/repo/src/a.ts', old_string: 'SECRET_OLD', new_string: 'SECRET_NEW' })).toBe('改文件：/repo/src/a.ts');
+  expect(actionSummary('Write', { file_path: '/repo/b.md', content: 'SECRET' })).toBe('写文件：/repo/b.md');
+  expect(actionSummary('Grep', { pattern: 'TODO' })).toBe('搜索：TODO');
+  expect(actionSummary('WebFetch', { url: 'https://docs.test/page?key=abc' })).toBe('打开网址：https://docs.test/page?[参数已隐藏]');
+  expect(actionSummary('Task', { description: '查三处引用', prompt: 'SECRET_PROMPT' })).toBe('派子任务：查三处引用');
+  expect(actionSummary('mcp__x__do', { payload: { a: 1 } })).toBe('调用 mcp__x__do');
+  expect(actionSummary('Bash', { command: 'x'.repeat(500) }).length).toBeLessThanOrEqual(166);
+  expect(paseoActionSummary('shell', { type: 'shell', command: 'ls -la', output: 'SECRET_OUT' })).toBe('执行命令：ls -la');
+  expect(paseoActionSummary('edit', { type: 'edit', filePath: 'a.ts', unifiedDiff: 'SECRET' })).toBe('改文件：a.ts');
+  // 各家事件都进同一条动作流：codex 的命令、通道的进展；一轮超过上限丢最早的并计数。
+  const c = new ActivityCollector('a', 't', 1);
+  c.ingest('codex', { type: 'item.started', item: { id: 'c1', type: 'command_execution', command: 'npm test' } }, 2);
+  c.ingest('codex', { type: 'item.completed', item: { id: 'c1', type: 'command_execution', exit_code: 1 } }, 3);
+  c.ingest('muse-web', { type: 'lane_status', status: '已发给 Muse（abc）' }, 4);
+  expect(c.snapshot(5).actions).toEqual([
+    { at: 2, tool: '命令执行', text: '执行命令：npm test', state: 'failed', endedAt: 3 }, { at: 4, tool: '通道', text: '已发给 Muse（abc）', state: 'ok' }]);
+  for (let i = 0; i < ACTION_LIMIT + 5; i++) c.ingest('warp', { type: 'lane_status', status: `步骤 ${i}` }, 10 + i);
+  expect(c.snapshot(999).actions).toHaveLength(ACTION_LIMIT);
+  expect(c.snapshot(999).actionsDropped).toBe(7);
+  // 待办清单的内容不存。
+  const t = new ActivityCollector('a', 't2', 1);
+  t.ingest('claude', { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'w', name: 'TodoWrite', input: { todos: [{ status: 'pending', content: 'SECRET_TODO' }] } }] } }, 2);
+  expect(JSON.stringify(t.snapshot(3))).not.toContain('SECRET_TODO');
+  expect(t.snapshot(3).actions![0]!.text).toBe('更新待办清单');
+});
+
+test('Paseo 时间线投影成同一形状的动作流：同一工具调用的 running 与 completed 合并，推理和工具输出不取', async () => {
+  const { activityFromTimeline } = await import('../src/runner/paseo-activity.ts');
+  const e = (seqEnd: number, item: Record<string, unknown>) => ({ seqEnd, turnId: 't', timestamp: new Date(1000 * seqEnd).toISOString(), item: item as never });
+  const entries = [
+    e(1, { type: 'reasoning', text: 'PRIVATE_THOUGHT' }),
+    e(2, { type: 'tool_call', callId: 'k1', name: 'shell', status: 'running', detail: { type: 'shell', command: 'bun test' } }),
+    e(3, { type: 'tool_call', callId: 'k1', name: 'shell', status: 'completed', detail: { type: 'shell', command: 'bun test', output: 'PRIVATE_OUT' } }),
+    e(4, { type: 'tool_call', callId: 'k2', name: 'edit', status: 'failed', detail: { type: 'edit', filePath: 'src/a.ts', newString: 'PRIVATE_NEW' } }),
+    e(5, { type: 'tool_call', callId: 'k3', name: 'read', status: 'running', detail: { type: 'read', filePath: 'src/b.ts' } }),
+    e(6, { type: 'assistant_message', text: '测试通过，正在改 b.ts' }),
+  ];
+  const running = activityFromTimeline('agent-1', 't', entries, true, 9000)!;
+  expect(running).toMatchObject({ agent: 'agent-1', turn: 't', runtime: 'paseo', state: 'running', tool: 'read', toolsCompleted: 2, startedAt: 1000 });
+  expect(running.actions).toEqual([
+    { at: 2000, tool: 'shell', text: '执行命令：bun test', state: 'ok', endedAt: 3000 },
+    { at: 4000, tool: 'edit', text: '改文件：src/a.ts', state: 'failed', endedAt: 4000 },
+    { at: 5000, tool: 'read', text: '读文件：src/b.ts', state: 'running' }]);
+  expect(running.events.map(x => x.kind)).toEqual(['tool_start', 'tool_start', 'tool_start', 'output']);
+  expect(JSON.stringify(running)).not.toContain('PRIVATE_');
+  const ended = activityFromTimeline('agent-1', 't', entries, false, 9000)!;
+  expect(ended.state).toBe('completed');
+  expect(ended.actions!.at(-1)).toMatchObject({ state: 'failed', endedAt: 6000 });
+  expect(activityFromTimeline('agent-1', 't', [], true, 1)).toBeUndefined();
 });
 
 test('已恢复的工具错误不作为回合失败；正式失败事件不能被 completion 覆盖', () => {

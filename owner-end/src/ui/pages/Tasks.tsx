@@ -21,7 +21,9 @@ interface TaskRow {
 
 interface AuditRow { id?: unknown; action?: string; actor?: unknown; at?: unknown; evidence?: string }
 interface AnalysisRow { status: string; summary: string; needs: string[]; next: string; confidence: string; lowReason?: string }
-interface TaskDetail { task: TaskRow; audit?: AuditRow[]; messages?: unknown[]; translations?: Record<string, string>; analyses?: Record<string, AnalysisRow> }
+interface TaskDetail { task: TaskRow; audit?: AuditRow[]; messages?: unknown[]; translations?: Record<string, string>; analyses?: Record<string, AnalysisRow>; turns?: TurnRow[] }
+interface TurnRow { employee: string; runtime: string; state: string; startedAt: number; lastActivityAt: number; actionsDropped?: number;
+  actions: Array<{ at: number; tool: string; text: string; state: 'running' | 'ok' | 'failed'; endedAt?: number }> }
 const ANALYSIS_STATUS_ZH: Record<string, string> = { completed: '已按验收完成', partial: '部分完成', blocked: '受阻', rejected: '被退回' };
 
 /** 审计编号的键部分（JSON 里是 `audit:xxx` 或 `audit:⟨xxx⟩`），用来找它的译文。 */
@@ -200,6 +202,23 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
               </ol>
             ) : <p class="hint">还没有进展记录。</p>}
           </Section>
+          <Section title="动作记录" hint="每一轮里员工做了什么：执行的命令、读写的文件、搜索和通道的每一步。只留一行摘要，不存文件内容和命令输出；保留 7 天。">
+            {detail.turns?.length ? detail.turns.map((turn, n) => (
+              <details key={n} class="original" open={turn.state === 'running' || n === detail.turns!.length - 1}>
+                <summary>第 {n + 1} 轮 · {turn.employee} · {TURN_STATE_ZH[turn.state] ?? turn.state} · {timeText(turn.startedAt)} 开始 · {turn.actions.length} 个动作{turn.actionsDropped ? `（更早的 ${turn.actionsDropped} 个未保留）` : ''}</summary>
+                {turn.actions.length ? (
+                  <ol class="timeline">
+                    {turn.actions.map((action, i) => (
+                      <li key={i}>
+                        <time>{timeText(action.at)}</time>
+                        <span>{action.text}{action.state === 'failed' ? <strong> · 失败</strong> : action.state === 'running' ? ' · 进行中' : ''}</span>
+                      </li>
+                    ))}
+                  </ol>
+                ) : <p class="hint">这一轮没有记录到动作。</p>}
+              </details>
+            )) : <p class="hint">还没有动作记录（任务还没开始，或已超过 7 天）。</p>}
+          </Section>
           <details class="raw-details">
             <summary>原始数据（排障用）</summary>
             <Pre value={detail} />
@@ -345,6 +364,8 @@ function VoidForm({ taskId, onDone, onCancel }: { taskId: string; onDone(): void
     </div>
   );
 }
+
+const TURN_STATE_ZH: Record<string, string> = { running: '进行中', completed: '已结束', failed: '失败', canceled: '已取消' };
 
 /** 员工回报：有老板语言的译文时显示译文，原文折叠在下面。 */
 /** 完工分析：模型读任务卡与这次结果写的判断。只供老板参考，不改派工消息，也不决定任务流转。 */

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Surreal } from 'surrealdb';
 import type { AgentActivity } from '../agent-activity.ts';
 
-/** Latest 40 public events per turn, retained for 24h. Replayed snapshots overwrite the same row. */
+/** Latest 40 public events and up to ACTION_LIMIT actions per turn, retained for 7 days so a finished task still shows what was done. Replayed snapshots overwrite the same row. */
 export async function writeAgentActivity(db: Surreal, runner: string, values: AgentActivity[]) {
   const saved: Array<{agent: string; turn: string}> = [];
   for (const value of values) {
@@ -14,7 +14,7 @@ export async function writeAgentActivity(db: Surreal, runner: string, values: Ag
         UPSERT type::record('agent_activity', $key) CONTENT {
           runner: $runner, employee: <string>record::id($employee.id), task: $task,
           agent: $agent, turn: $turn, observed_at: $at, activity: $activity,
-          expires_at: time::now() + 1d
+          expires_at: time::now() + 7d
         } WHERE observed_at = NONE OR observed_at <= $at;
       };`, {key, runner, agent: value.agent, turn: value.turn, at: value.observedAt, activity: value});
     if (Array.isArray(result.at(-1)) && (result.at(-1) as unknown[]).length) saved.push({agent: value.agent, turn: value.turn});
