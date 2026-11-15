@@ -12,10 +12,12 @@ next：不超过 800 字符，是老板会对下一个接手的人说的话：�
 confidence：结果里的证据足以支持你的判断写 high；结果含糊、互相矛盾、只有结论没有证据、或你需要猜，写 low。
 不虚构事实，结果里没写的不要补。`;
 
-/** 缺省的分析模型：公司网关密钥本来就允许的 haiku 档路由组。 */
-export const DEFAULT_ANALYSIS_MODEL = 'group/sck-haiku';
-/** 分析模型会先推理再作答，实测一条 8 到 18 秒：上限比译文的 20 秒宽。 */
+/** 单次调用上限：比译文的 20 秒宽，留给先推理再作答的模型。 */
 export const ANALYSIS_TIMEOUT_MS = 40_000;
 
-export const analyzeTurnWith = (config: Magpie, fetchImpl: typeof fetch = fetch, model: string = DEFAULT_ANALYSIS_MODEL): AnalyzeTurn => async input =>
+/**
+ * 缺省跟老板端的 MAGPIE_MODEL（与规划、补译同一个模型）；MAGPIE_ANALYSIS_MODEL 可单独指定。
+ * 2026-11-15 实测同一条退回：auto/deepseek-v4.1-flash 4 次 2 到 9 秒全成，group/sck-haiku 4 次里 3 次超过 40 秒。
+ */
+export const analyzeTurnWith = (config: Magpie, fetchImpl: typeof fetch = fetch, model: string = config.model): AnalyzeTurn => async input =>
   modelJson(await chatText({ ...config, model }, [{ role: 'system', content: SYSTEM }, { role: 'user', content: JSON.stringify(input) }], fetchImpl, ANALYSIS_TIMEOUT_MS));

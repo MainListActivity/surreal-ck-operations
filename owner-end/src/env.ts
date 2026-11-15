@@ -79,7 +79,7 @@ export interface Config {
   cf?: { accountId: string; token: string };
   /** 译文服务（magpie，OpenAI 兼容 chat completions）。 */
   magpie?: { baseUrl: string; model: string; apiKey: string };
-  /** 完工分析用的模型（MAGPIE_ANALYSIS_MODEL，缺省 group/sck-haiku）。 */
+  /** 完工分析用的模型（MAGPIE_ANALYSIS_MODEL，缺省跟 MAGPIE_MODEL）。 */
   analysisModel?: string;
   /** 仅本地开发。 */
   devRoot?: { username: string; password: string };
