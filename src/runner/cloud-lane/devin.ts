@@ -10,6 +10,9 @@ import { join } from 'node:path';
 import { ensureBranchOnOrigin, fetchAndFastForward, type RepoInfo } from './repo.ts';
 import type { LaneDeps, LaneInput } from './lane.ts';
 
+/** Devin 云模式的免费模型。 */
+export const DEVIN_CLOUD_MODEL = 'free';
+
 interface Ctx {
   input: LaneInput; deps: LaneDeps; repo: RepoInfo;
   material: { task: string; findings?: string; review: boolean; title: string };
@@ -31,7 +34,8 @@ export async function driveDevin(ctx: Ctx): Promise<{ kind: 'done' | 'blocked' |
   writeFileSync(file, `${prompt}${followUp}\n`);
   deps.progress('已提交 Devin Cloud 会话（同步等待）');
   const timeoutMs = Math.max(60_000, ctx.deadline - deps.now());
-  const r = await deps.exec('devin', ['--cloud', '-p', '--prompt-file', file], { cwd: input.cwd, timeoutMs });
+  // 公司派工只用云模式的 free 模型（老板 2026-11-15 定）：不传模型的话云端会按账号默认模型计费。
+  const r = await deps.exec('devin', ['--cloud', '--model', input.config.model ?? DEVIN_CLOUD_MODEL, '-p', '--prompt-file', file], { cwd: input.cwd, timeoutMs });
   rmSync(dir, { recursive: true, force: true });
   if (r.code !== 0)
     return { kind: 'error', text: `Devin Cloud 会话失败：${(r.stderr || r.stdout).trim().slice(0, 500)}` };

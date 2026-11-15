@@ -308,6 +308,15 @@ describe('devin-cloud 通道', () => {
     return undefined;
   };
 
+  test('云端会话只用 free 模型；lanes.devin-cloud.model 可改，其它通道不接受 model', async () => {
+    const calls: string[][] = [];
+    const w = world({ extra: call => { if (call.cmd === 'devin') calls.push(call.args); return devinOk(call); } });
+    await runLane(w.input({ provider: 'devin-cloud' }), w.deps);
+    expect(calls[0]!.slice(0, 3)).toEqual(['--cloud', '--model', 'free']);
+    const { validateLanes } = await import('../src/runner/cloud-lane/lane.ts');
+    expect(() => validateLanes({ 'devin-cloud': { model: 'free' } })).not.toThrow();
+    expect(() => validateLanes({ jules: { model: 'free' } })).toThrow();
+  });
   test('同步会话输出答复；快进成功后透传 PR，声明 SHA 与实际 HEAD 一致', async () => {
     // 本地 HEAD 是 deadbeef…：Devin 声明 cafecafe 与之不符时改写为实际 HEAD 并注明。
     const w = world({ extra: devinOk });

@@ -163,3 +163,52 @@ test('返工消息的复盘段：在“先修复退回意见”之后、任务�
   expect(composeMessage('execute', task)).not.toContain('上一轮的情况');
   expect(composeMessage('review', task)).not.toContain('上一轮的情况');
 });
+
+test('云端与网页通道收到的正文就是派工消息：路径换成“下文《…》”，文件内容附在后面', async () => {
+  const { laneMessage, vendorPrompt } = await import('../src/runner/cloud-lane/lane.ts');
+  const { botMessage } = await import('../src/runner/grok-bot/turn.ts');
+  const dir = mkdtempSync(join(tmpdir(), 'sck-lane-message-'));
+  try {
+    writeFileSync(join(dir, 'task.md'), '# 写三条口号\n\n完整任务卡正文\n');
+    writeFileSync(join(dir, 'notes.md'), '口号不要用感叹号。\n');
+    const ctx = { sckBin: '/Users/x/Application Support/bin/sck', commDir: dir, taskId: 't1' };
+    const body = composeMessage('execute', { title: '写三条口号', requirement: '给新品写三条口号，每条不超过 8 个字。', resources: '品牌手册在官网“关于”页。', acceptance: '三条，各不超过 8 个字。' });
+    // 老板在页面上改过的消息：改成什么，agent 收到的就是什么。
+    const edited = renderMessage(`${body}\n\n老板补充：语气要克制。`, ctx);
+    const execute = taskMaterial(dir, `${edited}\n工作目录：/repo/worktree`);
+    expect(execute.message).toStartWith('给新品写三条口号，每条不超过 8 个字。\n\n可以用：\n品牌手册在官网“关于”页。\n下文《这条线的笔记》 是这条线积累的经验，先读。');
+    expect(execute.message).toContain('老板补充：语气要克制。');
+    expect(execute.message).toContain('## 这条线的笔记\n\n口号不要用感叹号。');
+    // 本机才有的东西不带：绝对路径、工作目录行、公司命令的指引；没指向 task.md 就不附整份任务卡。
+    expect(execute.message).not.toContain(dir);
+    expect(execute.message).not.toContain('工作目录：');
+    expect(execute.message).not.toContain('company_cmd_catalog');
+    expect(execute.message).not.toContain('完整任务卡正文');
+    expect(botMessage('m1', execute)).toContain(execute.message!);
+    expect(vendorPrompt({ provider: 'jules', prompt: 'x' } as never, { slug: 'o/r', branch: 'b', defaultBranch: 'main' } as never, execute)).toEndWith(execute.message!);
+
+    // 返工：退回意见一定附上，即使老板把那句话删了；老板的答复较短时正文里已有原话，不再附一遍。
+    mkdirSync(join(dir, 'findings'), { recursive: true });
+    writeFileSync(join(dir, 'findings', 'round-01.md'), '第 2 条超过 8 个字。\n');
+    writeFileSync(join(dir, 'answer.md'), '## 老板答复\n\n可以用“轻”字。\n');
+    const rework = renderMessage(composeMessage('rework', { requirement: '给新品写三条口号。', acceptance: '三条。', answer: { blocker: '不知道能不能用“轻”字', reply: '可以用“轻”字。' } }), { ...ctx, findingsFile: 'findings/round-01.md' });
+    const reworked = laneMessage(rework, dir, taskMaterial(dir))!;
+    expect(reworked).toContain('先修复 下文《上一轮的退回意见》 里的问题。');
+    expect(reworked).toContain('## 上一轮的退回意见\n\n第 2 条超过 8 个字。');
+    expect(reworked).toContain('老板答复：\n可以用“轻”字。');
+    expect(reworked).not.toContain('## 老板答复全文');
+    // 老板整段改写成一句话：答复、退回意见和整份任务卡都附上，一样不丢。
+    expect(laneMessage('老板把消息改成了别的话', dir, taskMaterial(dir))).toBe('老板把消息改成了别的话\n\n## 老板答复全文\n\n## 老板答复\n\n可以用“轻”字。\n\n## 上一轮的退回意见\n\n第 2 条超过 8 个字。\n\n## 任务全文\n\n# 写三条口号\n\n完整任务卡正文');
+
+    // 复核：待复核成果只在 task.md 里，一定附上。
+    rmSync(join(dir, 'findings'), { recursive: true }); rmSync(join(dir, 'answer.md'));
+    writeFileSync(join(dir, 'task.md'), '# 写三条口号\n\n## 待复核成果\n\n轻一点 / 再轻一点 / 轻到刚好\n');
+    const review = taskMaterial(dir, renderMessage(composeMessage('review', { title: '写三条口号', requirement: '给新品写三条口号。', acceptance: '三条。' }), ctx));
+    expect(review.review).toBe(true);
+    expect(review.message).toContain('提交的成果在 下文《任务全文》 的“待复核成果”一节。');
+    expect(review.message).toContain('## 任务全文\n\n# 写三条口号\n\n## 待复核成果\n\n轻一点 / 再轻一点 / 轻到刚好');
+    // 没有派工消息时退回到整份任务材料。
+    expect(taskMaterial(dir).message).toBeUndefined();
+    expect(botMessage('m2', taskMaterial(dir))).toContain('轻一点 / 再轻一点 / 轻到刚好');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

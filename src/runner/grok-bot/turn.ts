@@ -58,9 +58,14 @@ export function turnMarker(taskId: string, message: string): string {
 export function botMessage(marker: string, material: ReturnType<typeof taskMaterial>): string {
   const parts = [`[SCK-TASK ${marker}]`, ''];
   if (material.review) parts.push('这是复核任务：只读复核，不改动任何东西。最终答复首行必须是「复核结论：通过」或「复核结论：退回」，随后逐条给出证据。', '');
-  if (material.answer !== undefined) parts.push('## 上次受阻与老板的答复（按答复接着做）', material.answer.trim(), '');
-  if (material.findings !== undefined) parts.push('## 上一轮的退回意见（逐条修复）', material.findings.trim(), '');
-  parts.push(material.task.trim(), '',
+  // 正文就是派工消息（老板看到、改过的那条），指向的文件内容附在后面；没有派工消息时退回到整份任务材料。
+  if (material.message) parts.push(material.message, '');
+  else {
+    if (material.answer !== undefined) parts.push('## 上次受阻与老板的答复（按答复接着做）', material.answer.trim(), '');
+    if (material.findings !== undefined) parts.push('## 上一轮的退回意见（逐条修复）', material.findings.trim(), '');
+    parts.push(material.task.trim(), '');
+  }
+  parts.push(
     '你读不到公司本机文件、也调不了公司命令；需要的信息都在上面。产物请直接写在最终答复里，或给出可公开访问的链接。',
     '完成后按约定：最后一条消息以「[SCK-DONE 编号]」开头（编号与本条开头的相同），后面是完整最终答复；无法继续时首行写「工作结果：受阻」并说明缺什么。不要提选择题。');
   return parts.join('\n');
