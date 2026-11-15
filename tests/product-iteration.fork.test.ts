@@ -23,6 +23,7 @@ beforeAll(async()=>{
   await db.query('DEFINE NAMESPACE iteration; USE NS iteration; DEFINE DATABASE fixture;');await db.use({namespace:'iteration',database:'fixture'});
   await db.query('DEFINE TABLE project SCHEMALESS; CREATE project:sample SET name="测试产品";');
   await db.query(readFileSync(join(import.meta.dir,'../schema/063-product-iteration.surql'),'utf8'));
+  await db.query(readFileSync(join(import.meta.dir,'../schema/072-planned-message.surql'),'utf8'));
   for(const access of ['owner','gateway','runner','automation'])await db.query(`DEFINE ACCESS ${access} ON DATABASE TYPE JWT ALGORITHM HS512 KEY '${secret}';`);
   store=new Requirements(db);
 },20000);
@@ -237,6 +238,14 @@ run('完整公司 schema 与真实 core：幂等建规划单、真实租约提�
     // 老板提前的安排落在刚建出的草稿上：占位换成真实编号、算老板改过的正文、先扣住；复核消息没安排，照规划生成。
     expect(drafts.find(m=>m.step==='execute')).toMatchObject({body:`老板改写：先看前置任务 ${planning} 的结论再动手，不要合并 PR。`,hold:true,state:'held'});
     expect(drafts.find(m=>m.step==='review')!.hold).toBe(false);
+    // 套用后记下已套用；建单成功但套用中断（没记上）时，同一业务键回放会补套，已套过的不重复。
+    const {RecordId:Rid}=await import('surrealdb');
+    const [stamp]=await database.db.query<[Array<{applied_at?:unknown}>]>('SELECT applied_at FROM $id;',{id:new Rid('planned_message',`${req.id}:1:1:execute`)});expect(stamp[0]!.applied_at).toBeTruthy();
+    const heldDraft=drafts.find(m=>m.step==='execute')!;await messages.setHold(heldDraft.id,false,'owner');
+    const replayInput=(await import('../src/iteration/execution.ts')).iterationStep(JSON.parse((await database.db.query<[Array<{snapshot:string}>]>('SELECT snapshot FROM $id;',{id:new Rid('requirement_approval',`${req.id}:1`)}))[0][0]!.snapshot),{steps:[{title:'实现检索测试',context:'为检索实现增加测试',acceptance:'检索用例通过'}]},1,[planning]).input;
+    let stamped=0;
+    await createIterationTask(core,messages,owner,replayInput,{execute:{hold:true},applied:async()=>{stamped++;}});
+    expect((await messages.list(engineering.id,false)).find(m=>m.step==='execute')!.hold).toBe(true);expect(stamped).toBe(1);expect((await core.listTasks(owner)).length).toBe(1);
     const after=(await readMessageChains(database.db)).find(c=>c.requirement===req.id)!;
     expect(after.rows.filter(r=>r.taskId===engineering.id).map(r=>`${r.status}:${r.step}:${r.fixed}`)).toEqual(['held:execute:true','later:review:false']);
     expect(after.rows.filter(r=>r.status==='planned').map(r=>r.plan!.index)).toEqual([2,2]);

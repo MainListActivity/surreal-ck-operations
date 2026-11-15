@@ -39,6 +39,8 @@ export async function runOwnerCommand(): Promise<never> {
 
 export const readDashboardData = (): Promise<RuntimeDashboard> => read<RuntimeDashboard>('/api/dashboard');
 export const readBoardData = (): Promise<OwnerBoard> => read<OwnerBoard>('/api/board');
+/** 演示模式没有任务链数据：消息链区块显示为空。 */
+export const readChainsData = async (): Promise<never[]> => [];
 
 export function openLive(handlers: LiveHandlers): () => void {
   const abort = new AbortController();

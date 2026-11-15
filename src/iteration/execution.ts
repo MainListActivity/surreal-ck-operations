@@ -9,7 +9,8 @@ import { iterationPlan, type IterationPlan } from './planning.ts';
 export interface Execution { id: string; tasks: string[]; stage: string; note?: string; released_sha?: string }
 /** 老板提前给流水线某一步的消息做的安排：改写的正文、建出后先扣住。 */
 export interface PlannedMessage { body?: string; hold?: boolean }
-export type PlannedStep = { execute?: PlannedMessage; review?: PlannedMessage };
+/** applied：安排套用到草稿之后调用，记下已套用（建单回放时不再重复）。 */
+export type PlannedStep = { execute?: PlannedMessage; review?: PlannedMessage; applied?: () => Promise<void> };
 export interface ExecutionHost { create(input: CreateTask, planned?: PlannedStep): Promise<Pick<TaskView, 'id'>> }
 /** 预排时还不知道的任务编号：消息里先写占位，建任务时换成真实编号。 */
 export const PRIOR_TASK = '{前置任务}', DONE_TASKS = '{实施任务}';
@@ -154,19 +155,22 @@ export function iterationStep(approval: Approval, plan: IterationPlan, index: nu
 export const plannedId = (requirement: string, revision: number, index: number, step: 'execute' | 'review') =>
   new RecordId('planned_message', `${requirement}:${revision}:${index}:${step}`);
 
-/** 读出老板给这一步提前做的安排，并把占位换成真实任务编号。读不出不挡建单。 */
+/**
+ * 读出老板给这一步提前做的、还没套用的安排，并把占位换成真实任务编号。
+ * 读不出就抛错，让这一轮不建单：安排里可能有“先扣住”，读不到就建单等于把该扣的消息放了出去。
+ */
 async function plannedFor(db: Surreal, requirement: string, revision: number, index: number, tasks: string[]): Promise<PlannedStep | undefined> {
-  try {
-    const [rows] = await db.query<[Array<{ step: string; body?: string; hold?: boolean }>]>(
-      'SELECT step, body, hold FROM planned_message WHERE requirement = $requirement AND revision = $revision AND index = $index;', { requirement, revision, index });
-    const out: PlannedStep = {};
-    for (const row of rows ?? []) {
-      if (row.step !== 'execute' && row.step !== 'review') continue;
-      const body = row.body?.replaceAll(PRIOR_TASK, tasks.at(-1) ?? '').replaceAll(DONE_TASKS, tasks.join('、'));
-      out[row.step] = { ...(body?.trim() ? { body } : {}), ...(row.hold === true ? { hold: true } : {}) };
-    }
-    return Object.keys(out).length ? out : undefined;
-  } catch { return undefined; }
+  const [rows] = await db.query<[Array<{ id: RecordId; step: string; body?: string; hold?: boolean }>]>(
+    'SELECT id, step, body, hold FROM planned_message WHERE requirement = $requirement AND revision = $revision AND index = $index AND applied_at = NONE;', { requirement, revision, index });
+  const out: PlannedStep = {};
+  for (const row of rows ?? []) {
+    if (row.step !== 'execute' && row.step !== 'review') continue;
+    const body = row.body?.replaceAll(PRIOR_TASK, tasks.at(-1) ?? '').replaceAll(DONE_TASKS, tasks.join('、'));
+    out[row.step] = { ...(body?.trim() ? { body } : {}), ...(row.hold === true ? { hold: true } : {}) };
+  }
+  if (!out.execute && !out.review) return undefined;
+  out.applied = async () => { await db.query('UPDATE $ids SET applied_at = time::now();', { ids: (rows ?? []).map(row => row.id) }); };
+  return out;
 }
 
 /**
@@ -177,17 +181,25 @@ export async function createIterationTask(
   core: { createTask(credential: string, input: CreateTask): Promise<TaskView> },
   messages: { createTaskDrafts(taskId: string, executorRole: string, reviewerRole: string, code: boolean, bodies: ReturnType<typeof iterationMessages>): Promise<Array<{ id: string; step: string }>>;
     holdForPolicy(messageId: string, reason: string): Promise<boolean>;
+    list?(taskId: string, includeSent: boolean): Promise<Array<{ id: string; step: string; body: string; hold: boolean }>>;
     edit?(messageId: string, body: string, actor: string): Promise<unknown>; setHold?(messageId: string, hold: boolean, actor: string): Promise<unknown> },
   credential: string, input: CreateTask, planned?: PlannedStep): Promise<TaskView> {
   const task = await core.createTask(credential, input);
   const drafts = await messages.createTaskDrafts(task.id, task.executorRole, task.reviewerRole, input.workIntent?.kind === 'code', iterationMessages(input));
   const first = !input.parent ? drafts.find(draft => draft.step === 'execute') : undefined;
   if (first) await messages.holdForPolicy(first.id, '新需求的首次派工').catch(() => undefined);
-  // 老板提前做的安排只落在刚建出来的草稿上（回放时 drafts 为空）：改写的正文按老板改过的对待，不再随任务卡重算。
-  for (const draft of drafts) {
-    const plan = draft.step === 'execute' ? planned?.execute : draft.step === 'review' ? planned?.review : undefined;
-    if (plan?.body) await messages.edit?.(draft.id, plan.body, 'owner').catch(() => undefined);
-    if (plan?.hold) await messages.setHold?.(draft.id, true, 'owner').catch(() => undefined);
+  // 老板提前做的安排套在这张任务还没发出的草稿上，先扣住再改正文；出错就抛，由流水线下一轮用同一个业务键回放补套。
+  // 套完才记“已套用”：建单成功但套用中断时，回放会再来一次（已发出的消息不动）。
+  if (planned?.execute || planned?.review) {
+    if (!messages.list || !messages.edit || !messages.setHold) throw new CompanyError('invalid', '消息表不支持套用提前安排');
+    const unsent = await messages.list(task.id, false);
+    for (const step of ['execute', 'review'] as const) {
+      const plan = planned[step], draft = unsent.find(message => message.step === step);
+      if (!plan || !draft) continue;
+      if (plan.hold && !draft.hold) await messages.setHold(draft.id, true, 'owner');
+      if (plan.body && draft.body !== plan.body) await messages.edit(draft.id, plan.body, 'owner');
+    }
+    await planned.applied?.();
   }
   return task;
 }

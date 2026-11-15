@@ -8,6 +8,8 @@ DEFINE FIELD IF NOT EXISTS index ON planned_message TYPE int;
 DEFINE FIELD IF NOT EXISTS step ON planned_message TYPE string ASSERT $value IN ['execute', 'review'];
 DEFINE FIELD IF NOT EXISTS body ON planned_message TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS hold ON planned_message TYPE bool DEFAULT false;
+-- 套用到建出的草稿之后记下时间：建单回放时不再重复套用，没记上的会在回放里补套。
+DEFINE FIELD IF NOT EXISTS applied_at ON planned_message TYPE option<datetime>;
 DEFINE FIELD IF NOT EXISTS actor ON planned_message TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS updated_at ON planned_message TYPE datetime DEFAULT time::now();
 DEFINE INDEX IF NOT EXISTS planned_message_requirement ON planned_message FIELDS requirement, revision, index;

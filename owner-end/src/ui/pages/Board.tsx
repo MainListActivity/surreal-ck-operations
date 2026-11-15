@@ -5,7 +5,7 @@ import { OBSERVATION_TTL, useObservationClock } from '../runtime-state.ts';
 import type { ComponentChildren } from 'preact';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { memo } from 'preact/compat';
-import { readBoard, outcomeText, runCommand } from '../api.ts';
+import { readBoard, readChains, outcomeText } from '../api.ts';
 import type { ChainRow, MessageChain } from '../../../../src/message-chain.ts';
 import { Empty, NoticeLine, PageHeader, Panel, roleText, useAction } from '../common.tsx';
 import {
@@ -63,8 +63,11 @@ interface MessageBlockProps {
 const CHAIN_STATUS: Record<ChainRow['status'], string> = { sent: '已发出', next: '下一条', held: '已扣住', later: '稍后', waiting: '等前一张任务', planned: '预排' };
 const STEP_TEXT: Record<string, string> = { execute: '执行', rework: '返工', review: '复核', nudge: '催办', notice: '通知' };
 const stepText = (step: string): string => STEP_TEXT[step] ?? step;
-/** 消息链一行的草稿键：已建草稿用消息编号（与页面其它位置共用未保存的修改），预排的步骤用需求、修订、第几步、哪一条。 */
-const chainKey = (row: ChainRow): string => row.messageId ?? `plan:${row.plan!.requirement}:${row.plan!.revision}:${row.plan!.index}:${row.plan!.step}`;
+/**
+ * 消息链一行的草稿键，与页面其它位置分开：员工卡片里同一条消息编辑的是按员工渲染后的文本（绝对路径），
+ * 这里编辑的是存储的原文，两处共用草稿会把渲染后的路径存成原文。
+ */
+const chainKey = (row: ChainRow): string => row.messageId ? `chain:${row.messageId}` : `plan:${row.plan!.requirement}:${row.plan!.revision}:${row.plan!.index}:${row.plan!.step}`;
 
 /** 每条消息都共用的字段；保存函数由卡片所在位置决定（员工待发用 edit_rendered，其它用 edit）。 */
 type CommonMessageProps = Pick<MessageBlockProps, 'context' | 'messageId' | 'title' | 'body' | 'hold' | 'holdReason' | 'draft' | 'dirty' | 'busy' | 'flash' | 'onDraft' | 'onHold'>;
@@ -185,8 +188,8 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
     try {
       do {
       pendingLoad.current = false;
-      const [out, chainsOut] = await Promise.all([readBoard(), runCommand<{ chains: MessageChain[] }>('message.chains')]);
-      if (chainsOut.kind === 'ok') setState(prev => ({ ...prev, chains: chainsOut.result.chains }));
+      const [out, chainsOut] = await Promise.all([readBoard(), readChains()]);
+      if (chainsOut.kind === 'ok') setState(prev => ({ ...prev, chains: chainsOut.result }));
       if (out.kind !== 'ok') {
         setState(prev => ({ ...prev, error: outcomeText(out, '') }));
         return;
@@ -391,7 +394,8 @@ export function BoardPage({ drafts, onDraft, onDraftSaved }: BoardPageProps) {
                               flash={false}
                               onDraft={onDraft}
                               note={row.plan ? '任务还没建，按规划预排；{前置任务} 等占位在建任务时换成真实编号' : row.fixed ? '消息原文' : '消息原文，发出前按任务卡和最新进展重算'}
-                              onSave={(_id, text) => row.plan ? savePlan(row, { body: text }, '已保存，建出任务时按这段发') : saveBody(row.messageId!, text)}
+                              onSave={(_id, text) => row.plan ? savePlan(row, { body: text }, '已保存，建出任务时按这段发')
+                                : void run('message.edit', { messageId: row.messageId!, body: text, expectedBody: body }, '已保存', () => { onDraftSaved(key); return load(); })}
                               onHold={(_id, on) => row.plan ? savePlan(row, { hold: on }, on ? '已安排：建出后先扣住' : '已取消扣住') : setHold(row.messageId!, on)}
                               extra={row.plan && row.fixed ? (
                                 <div class="button-row">
