@@ -360,3 +360,25 @@ run('owner board: a task gets a session of its own, and an idle session of anoth
     await w.close();
   }
 }, TIMEOUT_MS);
+
+run('lane preference: the preferred lane is spawned first, and the sent message records why it went there', async () => {
+  const w = await startFork('lane-pref');
+  try {
+    await w.wf.upsertDef(ENGINEERING, { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 2, enabled: true, weight: 1000 });
+    await w.wf.upsertDef('fixture-engineering-claude', { role: 'engineering', provider: 'claude', model: 'fixture', maxInstances: 1, enabled: true, weight: 1 });
+    await w.rawQuery('UPSERT company_meta:config MERGE { lane_preference: { "role:engineering": ["claude"] } };');
+    for (const index of [0, 1]) await w.core.createTask(w.gm, { title: `通道偏好任务${index}`, context: '合成数据：仅用于通道偏好回归测试',
+      executorRole: 'engineering', reviewerRole: 'owner', idempotencyKey: `lane-pref-${index}` });
+    await w.newDispatcher().tick();
+    const sent = await rowsOf<{ sent_to: unknown; dispatch_reason?: string }>(w, "SELECT sent_to, dispatch_reason, sent_at FROM outbound_message WHERE state = 'sent' ORDER BY sent_at;");
+    expect(sent.length).toBe(2);
+    const reasons = sent.map(row => String(row.dispatch_reason ?? ''));
+    // 偏好通道只有一个席位：一张任务用上它（权重再低也排第一），另一张照常派给别的通道并说明偏好通道为什么没用上。
+    expect(reasons.filter(r => r === '岗位“engineering”先用 claude，claude 排第 1 位且有空位').length).toBe(1);
+    const other = reasons.find(r => !r.includes('有空位'))!;
+    expect(other).toContain('这几条通道现在都用不了，改用 codex');
+    expect(other).toContain('没用 claude（编制席位已满）');
+  } finally {
+    await w.close();
+  }
+}, TIMEOUT_MS);

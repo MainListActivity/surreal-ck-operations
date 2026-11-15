@@ -1,3 +1,4 @@
+import { lanePreferenceValue } from './dispatcher/lane-preference.ts';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -186,7 +187,8 @@ try {
     case 'config': {
       const [key, value] = args;
       if (!key || value === undefined || !/^[a-z_]+$/.test(key)) throw new Error(usage);
-      const parsed = key === 'preferred_provider' ? preferredProviderValue(JSON.parse(value)) : JSON.parse(value) as unknown;
+      const parsed = key === 'preferred_provider' ? preferredProviderValue(JSON.parse(value))
+        : key === 'lane_preference' ? lanePreferenceValue(JSON.parse(value)) : JSON.parse(value) as unknown;
       await database.db.query('UPSERT company_meta:config MERGE $patch;', { patch: { [key]: parsed } });
       print(await workforce.config());
       break;

@@ -13,6 +13,7 @@ import type { CompanyDatabase } from './database.ts';
 import { OwnerDesk } from './owner.ts';
 import type { CompanyCore } from './contracts.ts';
 import { preferredProviderValue, Workforce } from './workforce.ts';
+import { lanePreferenceValue } from './dispatcher/lane-preference.ts';
 import { OutboundMessageStore, type OutboundMessage } from './outbound-messages.ts';
 import { bodyOfDispatch, unrenderMessage } from './outbound-render.ts';
 import { turnAnalysesOf } from './turn-analysis.ts';
@@ -358,7 +359,14 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
         await db.query("CREATE audit CONTENT { actor: $actor, action: 'owner_dispatch_preference', evidence: $evidence, at: time::now() };",
           { actor: a, evidence: `preferred_provider=${input.provider === '' ? '（不设优先）' : input.provider}` });
       }
-      return { preferredProvider: (await ctx.workforce.config()).preferredProvider };
+      if (input.lanePreference !== undefined) {
+        const lanePreference = lanePreferenceValue(input.lanePreference);
+        await db.query('UPSERT company_meta:config MERGE $patch;', { patch: { lane_preference: lanePreference } });
+        await db.query("CREATE audit CONTENT { actor: $actor, action: 'owner_dispatch_preference', evidence: $evidence, at: time::now() };",
+          { actor: a, evidence: `lane_preference=${JSON.stringify(lanePreference).slice(0, 900)}` });
+      }
+      const config = await ctx.workforce.config();
+      return { preferredProvider: config.preferredProvider, lanePreference: config.lanePreference };
     }
     // ---- 会话策略 ----
     case 'session.policy': {

@@ -11,6 +11,7 @@ import { OutboundMessageStore, renderMessage, type MessageStep, type OutboundMes
 import { dispatchText } from '../outbound-render.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
+import { byLanePreference, dispatchReason, laneChoiceText, lanePreferenceFor, laneRank, type LanePreference } from './lane-preference.ts';
 import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, RetirementKind, Role, WriteScopeHolder } from '../contracts.ts';
 import { REQUIRED_TRACKS, isDedicatedTrack } from '../core.ts';
 import { MAINTENANCE_WORKSPACE, UNATTENDED_MODE, goneSceneError, isOpenRefused, workspaceTitleOf, type PaseoGateway, type PaseoWorkspaceInfo } from './paseo.ts';
@@ -167,6 +168,8 @@ export interface StaffingInput {
   factoryQueue?: ReadonlyMap<string, number>;
   /** The subscription work is reserved for; '' disables reservation entirely. Absent = FACTORY_PROVIDER. */
   preferredProvider?: string;
+  /** 通道偏好（company_meta:config.lane_preference）：命中的任务只按偏好排顺序，不套用优先订阅的保留等待。 */
+  lanePreference?: LanePreference;
   role: string;
   home: string;
   task?: SupervisedTask;
@@ -214,6 +217,14 @@ export function trackOkFor(role: Role, task: Pick<SupervisedTask, 'discipline' |
   if (own.some(isDedicatedTrack) || pinned) return discipline !== undefined && own.includes(discipline);
   if (isDedicatedTrack(discipline)) return true;
   return !discipline || !own.length || own.includes(discipline);
+}
+
+/** 通道偏好认的任务事实：工种、路线类型、执行岗位。 */
+export function laneFacts(task: SupervisedTask | undefined): { discipline?: string; executorRole?: string; type?: string } | undefined {
+  if (!task) return undefined;
+  const type = (task.row as { type?: unknown } | undefined)?.type;
+  return { discipline: typeof task.discipline === 'string' ? task.discipline : undefined, executorRole: task.executorRole,
+    type: typeof type === 'string' ? type : undefined };
 }
 
 export function factoryWorkKey(role: string, task: SupervisedTask, review = false): string {
@@ -348,7 +359,13 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       provider: def.provider, model: resolved ?? def.model, def,
       weight: managedModel(def) ? 1 : effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2] });
   }
-  const preferred = p.preferredProvider ?? FACTORY_PROVIDER;
+  // 通道偏好只对执行工作生效；命中后这张任务不再为全公司的优先订阅保留等待，候选只按偏好排先后。
+  const lane = p.excludeSubmitter ? undefined : lanePreferenceFor(p.lanePreference, p.role, laneFacts(p.task));
+  if (lane) for (const entry of entries) {
+    const rank = laneRank(entry.provider, lane);
+    if (rank >= 0) entry.note = [entry.note, `通道偏好：${laneChoiceText(lane)}，排第 ${rank + 1} 位`].filter(Boolean).join('；');
+  }
+  const preferred = lane ? '' : p.preferredProvider ?? FACTORY_PROVIDER;
   const position = p.task ? p.factoryQueue?.get(factoryWorkKey(p.role,p.task,!!p.excludeSubmitter)) : undefined;
   const factoryOnly = !!preferred && !p.qualificationOnly &&
     (!p.task || !p.factoryQueue || (position !== undefined && position <= FACTORY_WAIT_LIMIT)) &&
@@ -649,7 +666,7 @@ export async function snapshotOf(p: PassInputs, opts: SnapshotOpts,
   }
   const holding = new Set(p.tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
   const poolBase = { providerAllowed: p.providerAllowed, defs: p.defs, insts: p.insts, states: p.states, holding, health: p.health, quotaBlocked: p.quotaBlocked,
-    factoryQueue:p.factoryQueue, busyBy, providerMax: p.cfg.providerMax, preferredProvider: p.cfg.preferredProvider, slots: p.slots, runtimeModels: p.runtimeModels,
+    factoryQueue:p.factoryQueue, busyBy, providerMax: p.cfg.providerMax, preferredProvider: p.cfg.preferredProvider, lanePreference: p.cfg.lanePreference, slots: p.slots, runtimeModels: p.runtimeModels,
     opsRepo: opts.opsRepo, sidecar: opts.sidecar, now: p.now };
   const homes = [...new Set([opts.opsRepo, ...p.insts.map(i => i.repoHome ?? i.cwd ?? opts.opsRepo), ...p.tasks.map(t => t.repoPath ?? opts.opsRepo)])];
   const roles = [...new Set([...p.defs.map(d => d.role), ...p.insts.map(i => i.role)])];
@@ -807,6 +824,13 @@ export class Dispatcher {
    * A held message raises the owner notice and returns null; no claim should be taken for it.
    * The store keeps the message in draft until the caller confirms the external send succeeded.
    */
+  /** “为什么派给它”记在刚发出的那条消息上；记不上只少一句说明，不影响已经发出的派工。 */
+  private async recordReason(messageId: string | undefined, reason: string): Promise<void> {
+    if (!messageId || !reason) return;
+    try { await this.messageStore()?.setReason(messageId, reason); }
+    catch (error) { this.log(`dispatch reason not recorded: ${(error as Error).message}`); }
+  }
+
   private async prepareOutbound(taskId: string, step: MessageStep, employeeId: string,
     workdir?: string, history?: ClaimResult['history']): Promise<PreparedOutbound | null | undefined> {
     const store = this.messageStore();
@@ -1550,7 +1574,7 @@ export class Dispatcher {
     const preferred = cfg.preferredProvider;
     const factoryCanRoute = !!preferred && subscriptionPeers(preferred).every(peer => availabilityOf(health.get(peer),now) !== 'down' && !quotaBlocked.has(peer));
     const poolBase = { providerAllowed: this.deps.providerAllowed, factoryQueue:undefined as Map<string,number>|undefined, defs, states, holding, health, quotaBlocked, busyBy,
-      providerMax: cfg.providerMax, preferredProvider: preferred, slots: slotMap, runtimeModels, opsRepo: this.deps.env.opsRepo,
+      providerMax: cfg.providerMax, preferredProvider: preferred, lanePreference: cfg.lanePreference, slots: slotMap, runtimeModels, opsRepo: this.deps.env.opsRepo,
       sidecar: !!this.deps.sidecar, now };
     const queueExclusions = new Map<string,ReviewExclusion|undefined>();
     for(const item of work.filter(item=>item.purpose==='review')) queueExclusions.set(item.task.id,await readReviewExclusion(wf,item.task,message=>this.log(message)));
@@ -1662,8 +1686,11 @@ export class Dispatcher {
         }
         const pickItem = (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter = false,
           pickExclusion?: ReviewExclusion, anchorHome?: string) => pick(role, task, avoid, excludeSubmitter, pickExclusion, anchorHome);
-        const spawnItem = (role: string, home: string, task?: SupervisedTask, forReview = false) =>
-          spawnable(role, home, task, forReview);
+        const spawnItem = Object.assign((role: string, home: string, task?: SupervisedTask, forReview = false) =>
+          spawnable(role, home, task, forReview), {
+          skipped: (role: string, home: string, task: SupervisedTask, forReview: boolean, skipExclusion?: ReviewExclusion) =>
+            poolFor(role, home, task, forReview, skipExclusion).filter(e => e.kind === 'spawn' && !e.eligible).map(e => ({ provider: e.provider, reason: e.reason })),
+        });
         this.scopeDenied.delete(item.task.id);
         const result = await this.assign(item.role, item.task, last?.employee, pickItem, spawnItem,
           report, insts, item.purpose === 'review', slotMap, exclusion, undefined, undefined);
@@ -1789,7 +1816,10 @@ export class Dispatcher {
   private async assign(
     role: string, task: SupervisedTask | undefined, avoid: string | undefined,
     pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean, exclusion?: ReviewExclusion, anchorHome?: string) => EmployeeInst | undefined,
-    spawnable: (role: string, home: string, task?: SupervisedTask, forReview?: boolean) => EmployeeDef[],
+    spawnable: ((role: string, home: string, task?: SupervisedTask, forReview?: boolean) => EmployeeDef[]) & {
+      /** 同岗位这次不能新开会话的编制和原因，只用来写“为什么派给它”。 */
+      skipped?: (role: string, home: string, task: SupervisedTask, forReview: boolean, exclusion?: ReviewExclusion) => Array<{ provider: string; reason?: string }>;
+    },
     report: TickReport, insts: EmployeeInst[], forReview = false,
     slots?: Map<string, string>, exclusion?: ReviewExclusion, anchor?: DispatchAnchor,
     hooks?: AssignHooks,
@@ -1816,11 +1846,19 @@ export class Dispatcher {
     const scopeTask = task ?? anchor?.task;
     const repoHome = scopeTask?.repoPath ?? anchor?.home ?? env.opsRepo;
     const assignCfg = await wf.config();
-    const preferredProvider = assignCfg.preferredProvider;
+    // 通道偏好命中的执行工作：只按偏好排新开会话的先后，不套用优先订阅。
+    const lane = forReview ? undefined : lanePreferenceFor(assignCfg.lanePreference, role, laneFacts(scopeTask));
+    const preferredProvider = lane ? '' : assignCfg.preferredProvider;
     // '' means no preferred subscription: spawn order stays purely weight-ranked.
-    let defsOrdered = preferredProvider
+    let defsOrdered = lane ? byLanePreference(spawnable(role, repoHome, scopeTask, forReview), lane)
+      : preferredProvider
       ? factoryFirst(spawnable(role, repoHome, scopeTask, forReview), preferredProvider)
       : spawnable(role, repoHome, scopeTask, forReview);
+    // 派出去那一刻记下“为什么派给它”：同一份候选数据，不事后重算。
+    const reasonFor = (provider: string, continuing: boolean) => dispatchReason({
+      provider, continuing, choice: lane, preferredProvider, ordered: defsOrdered.map(d => ({ id: d.id, provider: d.provider })),
+      skipped: scopeTask ? spawnable.skipped?.(role, repoHome, scopeTask, forReview, exclusion) ?? [] : [],
+    });
     const candidate = pick(role, scopeTask, avoid, forReview, exclusion, anchor?.home);
     // A free preferred-provider seat is used before another provider's idle session. Once it has no admitted
     // reuse or spawn candidate (quota, health, capacity, exclusion), ordinary fallback takes over.
@@ -1901,6 +1939,7 @@ export class Dispatcher {
           this.onboarded.add(existing.id);
           this.lastStatus.set(existing.paseoAgentId!, 'running');
           await wf.finishDispatchAttempt(attempt, existing.paseoAgentId!);
+          await this.recordReason(prepared?.message.id, reasonFor(existing.provider ?? '', true));
           this.log(`woke ${existing.id} for ${task?.id ?? `dispatch:${role}`}`);
           return { ...existing, spawned: false };
         }
@@ -2004,6 +2043,7 @@ export class Dispatcher {
           await wf.confirmDispatchActivation(attempt, agentId);
         }
         await wf.finishDispatchAttempt(attempt, agentId);
+        await this.recordReason(prepared?.message.id, reasonFor(def.provider, !!pending));
         sidecar?.bindAgent(inst.id, agentId);
         const bound = { ...inst, paseoAgentId: agentId, cwd, repoHome, model, workspaceScope, paseoWorkspace: container.workspaceId };
         const prior = insts.findIndex(row => row.id === inst.id);

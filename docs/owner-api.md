@@ -67,5 +67,5 @@
 | 附件链接 | `sck owner attachment.url '{"taskId":"t1","file":"report.md"}'` |
 | 审计 | `sck owner audit.list '{}'` |
 | 订阅额度（各供应商快照与耗尽冷却） | `sck owner quota.list '{}'` |
-| 优先订阅（不带 provider 只读；`""` 不设优先按权重派工） | `sck owner dispatch.preference '{"provider":"codex-cloud"}'` |
+| 优先订阅（不带参数只读；`""` 不设优先按权重派工）与通道偏好（`lanePreference`：按工种 `discipline:`、路线类型 `type:`、岗位 `role:` 定先用哪条通道，只排顺序不保留等待，`{}` 清空） | `sck owner dispatch.preference '{"provider":"codex-cloud","lanePreference":{"discipline:文案":["gemini-web","chatgpt-web"]}}'` |
 | 概况 | `sck owner status '{}'` |

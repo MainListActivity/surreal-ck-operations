@@ -84,6 +84,7 @@
 - 0.13.20 起：统一动作流。`agent_activity` 的每轮记录多了 `actions`（一行一个动作，`actionSummary`：命令、读写改文件、搜索、网址、子任务；上限 200 条，保留 7 天）。原生执行端由 `ActivityCollector` 收集，通道的 `lane_status` 也算动作；Paseo 里运行的员工由 `src/runner/paseo-activity.ts` 从时间线投影。老板定的深度是“每个工具动作一行脱敏摘要，推理过程不存”：文件内容、编辑文本、命令输出不进库。任务详情用 `taskTurns` 读。
 - 0.13.21 起：运行中控制。老板端碰不到执行端的进程，所以中止分两半：`owner-api` 的 `stopTask` 收回租约并在 `employee.stop_requested` 记一个请求，执行端的 `stopRequested`（`src/runner/dispatch.ts`）停掉会话、清掉本机领取残留；那位员工已领了新任务就只清请求不停。暂停是“先 `holdNext` 扣住下一条消息，再中止”，顺序不能反。插话是审计动作 `owner_note`：`promptTask` 把最近一次执行或返工消息发出之后的插话放进 `notes`，`ownerLead` 把它和对受阻的答复一起放在消息最前面；自定义正文由 `attachOwnerLead` 就地换。云端与网页通道中止只停本机桥接进程。
 - 0.13.22 起：`stopRequested` 由独立计时器 `watchStops`（15 秒）调用，不在派工循环里。原生执行端的 tick 要等会话跑完才返回（生产实测一轮 426 秒），0.13.21 把它放在循环里，结果是租约收回了、消息扣住了，会话却一直跑到自己结束。
+- 0.13.23 起：通道偏好（`src/dispatcher/lane-preference.ts`，配置 `company_meta:config.lane_preference`）。键是 `discipline:`、`type:`、`role:`，值是供应商先后顺序；只认任务上明确的事实。命中后候选池不再套用优先订阅的保留等待（`staffingPool` 里 `preferred` 置空），新开会话的顺序由 `byLanePreference` 排。派出成功后调度器把 `dispatchReason` 写到那条消息的 `dispatch_reason`，消息链读它，不事后重算。图片走 ChatGPT 网页、长文走 Gemini 网页是员工调用的工具（`src/media/browser.ts` 的 `media_image` 与 `notebook_*`），不经通道偏好。
 - `renderMessage` 把 `notes.md` 补成绝对路径。
 - 控制台新增“线的笔记”页：按线浏览、编辑、置顶、删除，并显示待生效条目。任务抽屉里显示这个任务的会话将读到的笔记。
 

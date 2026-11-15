@@ -1,3 +1,4 @@
+import { lanePreferenceValue } from './dispatcher/lane-preference.ts';
 import { parseWorkHours, type WorkHours } from './work-hours.ts';
 import { PROVIDER_FAILURE_WINDOW_SECONDS, type ProviderFailure } from './dispatcher/provider-failover.ts';
 import type { SchedulingFact, SchedulingDecision } from './dispatcher/scheduling.ts';
@@ -99,12 +100,20 @@ export interface ProviderHealth {
   lastError?: string;
 }
 
+/** 库里的 lane_preference：结构不对的整份忽略（按不设偏好处理），不让一条坏配置停掉派工。 */
+function lanePreferenceOf(raw: unknown): Record<string, string[]> {
+  if (raw === undefined || raw === null) return {};
+  try { return lanePreferenceValue(raw); } catch { return {}; }
+}
+
 export interface CompanyConfig {
   paused: boolean;
   maxRunning: number;
   providerMax: Record<string, number>;
   /** 优先订阅：该 CLI 还有合格候选时其他供应商保留等待（factory_wait）；'' = 不设优先，全部按权重竞争。 */
   preferredProvider: string;
+  /** 通道偏好：按工种、路线类型或岗位定先用哪条通道（dispatcher/lane-preference.ts）；只排顺序，不保留等待。 */
+  lanePreference: Record<string, string[]>;
   pollSeconds: number;
   stallMinutes: number;
   redispatchMinutes: number;
@@ -166,7 +175,7 @@ export function preferredProviderValue(raw: unknown): string {
 }
 
 export const DEFAULT_CONFIG: CompanyConfig = {
-  paused: false, maxRunning: 4, providerMax: { codex: 3, grok: 2, devin: 2 }, preferredProvider: 'factory-droid',
+  paused: false, maxRunning: 4, providerMax: { codex: 3, grok: 2, devin: 2 }, preferredProvider: 'factory-droid', lanePreference: {},
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   jevNotifyTriage: true,
 
@@ -350,6 +359,7 @@ export class Workforce {
       maxRunning: pick('maxRunning', 'max_running'),
       providerMax: { ...DEFAULT_CONFIG.providerMax, ...(pick('providerMax', 'provider_max') as Record<string, number>) },
       preferredProvider: pick('preferredProvider', 'preferred_provider'),
+      lanePreference: lanePreferenceOf(row?.lane_preference),
       pollSeconds: pick('pollSeconds', 'poll_seconds'),
       stallMinutes: pick('stallMinutes', 'stall_minutes'),
       redispatchMinutes: pick('redispatchMinutes', 'redispatch_minutes'),

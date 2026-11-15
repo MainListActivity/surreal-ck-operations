@@ -22,6 +22,8 @@ export interface OutboundMessage {
   hold: boolean;
   /** 系统按规则扣住时的原因（第二轮返工、新需求首次派工）；老板自己扣住的没有。 */
   holdReason?: string;
+  /** 派出去那一刻记下的“为什么派给它”（调度器写，见 dispatcher/lane-preference.ts 的 dispatchReason）。 */
+  dispatchReason?: string;
   editedBy?: string;
   editedAt?: string;
   sentTo?: string;
@@ -61,6 +63,7 @@ const rowView = (row: Record<string, unknown>): OutboundMessage => ({
   step: String(row.step) as MessageStep, role: String(row.role ?? ''), body: String(row.body ?? ''),
   state: (String(row.state ?? 'draft')) as MessageState, hold: row.hold === true,
   holdReason: textOf(row.hold_reason),
+  dispatchReason: textOf(row.dispatch_reason),
   editedBy: row.edited_by === undefined || row.edited_by === null ? undefined : String(row.edited_by),
   editedAt: timestamp(row.edited_at),
   sentTo: row.sent_to === undefined || row.sent_to === null ? undefined : String(row.sent_to),
@@ -190,6 +193,11 @@ export class OutboundMessageStore {
   }
 
   /** 这一步的草稿被扣住的原因：系统规则扣住时有，老板自己扣住的没有。 */
+  /** 记下这条消息为什么派给了收到它的那位员工。 */
+  async setReason(messageId: string, reason: string): Promise<void> {
+    await this.db.query('UPDATE $msg SET dispatch_reason = $reason;', { msg: new RecordId('outbound_message', messageId), reason: reason.slice(0, 300) });
+  }
+
   async holdReason(taskId: string, step: MessageStep): Promise<string | undefined> {
     const draft = await this.latestDraft(taskId, step);
     return draft?.hold ? draft.holdReason : undefined;
