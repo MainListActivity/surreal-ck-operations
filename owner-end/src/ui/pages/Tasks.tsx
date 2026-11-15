@@ -45,7 +45,7 @@ const inGroup = (state: string | undefined, group: string) => {
 };
 
 const ACTION_ZH: Record<string, string> = {
-  create: '创建', claim: '领取', checkpoint: '更新进度', submit: '提交交付', review: '复核', return: '退回返工', block: '报告受阻', approve: '通过', accept: '验收通过', reject: '退回', reassign: '改派', void: '作废', release: '释放',
+  create: '创建', claim: '领取', checkpoint: '更新进度', submit: '提交交付', review: '复核', return: '退回返工', block: '报告受阻', approve: '通过', accept: '验收通过', reject: '退回', reassign: '改派', void: '作废', release: '释放', revoked: '中止这一轮', owner_note: '老板插话', owner_reply: '老板答复',
 };
 
 export function TasksPage({ route }: { route: Route }) {
@@ -133,7 +133,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
   const [detail, setDetail] = useState<TaskDetail>();
   const [error, setError] = useState('');
   const [tick, setTick] = useState(0);
-  const [panel, setPanel] = useState<'subtask' | 'reassign' | 'void' | null>(null);
+  const [panel, setPanel] = useState<'subtask' | 'reassign' | 'void' | 'stop' | 'interject' | null>(null);
   const [notice, setNotice] = useState<string>('');
 
   useEffect(() => {
@@ -237,6 +237,8 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
           </Section>
           <Section title="操作">
             <div class="action-stack">
+              <button type="button" disabled={t.state === 'void' || t.state === 'done'} onClick={() => setPanel('interject')}>插话…</button>
+              <button type="button" disabled={t.state === 'void' || t.state === 'done'} onClick={() => setPanel('stop')}>中止或暂停…</button>
               <button type="button" onClick={() => setPanel('subtask')}>加子任务</button>
               <button type="button" onClick={() => setPanel('reassign')}>改派岗位</button>
               <button type="button" class="danger" disabled={t.state === 'void'} onClick={() => setPanel('void')}>作废任务…</button>
@@ -253,6 +255,16 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
       {panel === 'reassign' ? (
         <Dialog title="改派岗位" onClose={() => setPanel(null)}>
           <ReassignForm taskId={taskId} current={t} onDone={() => done('已改派')} onCancel={() => setPanel(null)} />
+        </Dialog>
+      ) : null}
+      {panel === 'interject' ? (
+        <Dialog title="插话" onClose={() => setPanel(null)}>
+          <InterjectForm taskId={taskId} running={Boolean((t as { current_employee?: unknown }).current_employee)} onDone={text => done(text)} onCancel={() => setPanel(null)} />
+        </Dialog>
+      ) : null}
+      {panel === 'stop' ? (
+        <Dialog title="中止或暂停" onClose={() => setPanel(null)}>
+          <StopForm taskId={taskId} running={Boolean((t as { current_employee?: unknown }).current_employee)} onDone={text => done(text)} onCancel={() => setPanel(null)} />
         </Dialog>
       ) : null}
       {panel === 'void' ? (
@@ -360,6 +372,48 @@ function VoidForm({ taskId, onDone, onCancel }: { taskId: string; onDone(): void
       <div class="button-row end">
         <button type="button" disabled={busy} onClick={onCancel}>取消</button>
         <button type="button" class="danger" disabled={busy || note.trim().length < 2} onClick={() => void run('task.void', { taskId, note: note.trim() }, '已作废', () => { setNote(''); onDone(); })}>确认作废</button>
+      </div>
+    </div>
+  );
+}
+
+/** 插话：老板的话随这张任务的下一条消息带给员工；也可以立即打断正在进行的这一轮。 */
+function InterjectForm({ taskId, running, onDone, onCancel }: { taskId: string; running: boolean; onDone(text: string): void; onCancel(): void }) {
+  const [text, setText] = useState('');
+  const { busy, notice, run } = useAction();
+  const send = (interrupt: boolean) => void run('task.interject', { taskId, text: text.trim(), interrupt }, '已记下', () => {
+    setText(''); onDone(interrupt ? '已插话并中止这一轮，带着这句话重新派工' : '已插话，随下一条消息带给员工');
+  });
+  return (
+    <div class="form">
+      <p>你的话会原样放在这张任务下一条消息的最前面。{running ? '这一轮正在进行：可以等它结束后随下一条消息带上，也可以立即打断、带着这句话重新派工（这一轮已做的工作留在工作目录里，由下一轮接着做）。' : '任务现在没有人在做，下一次派工时带上。'}</p>
+      <Field label="要说的话" required><textarea rows={3} value={text} disabled={busy} onInput={e => setText(e.currentTarget.value)} /></Field>
+      <NoticeLine notice={notice} />
+      <div class="button-row end">
+        <button type="button" disabled={busy} onClick={onCancel}>取消</button>
+        <button type="button" class="primary" disabled={busy || text.trim().length < 2} onClick={() => send(false)}>随下一条消息带上</button>
+        {running ? <button type="button" class="danger" disabled={busy || text.trim().length < 2} onClick={() => send(true)}>立即打断并重派</button> : null}
+      </div>
+    </div>
+  );
+}
+
+/** 中止：停掉这一轮，任务回到队列重新派工。暂停：停掉这一轮，并把下一条消息扣住，放行才继续。 */
+function StopForm({ taskId, running, onDone, onCancel }: { taskId: string; running: boolean; onDone(text: string): void; onCancel(): void }) {
+  const [note, setNote] = useState('');
+  const { busy, notice, run } = useAction();
+  const stop = (hold: boolean) => void run('task.stop', { taskId, hold, ...(note.trim() ? { note: note.trim() } : {}) }, '已处理', () => {
+    setNote(''); onDone(hold ? '已暂停：下一条消息已扣住，在派工消息页放行即恢复' : '已中止这一轮，任务回到队列');
+  });
+  return (
+    <div class="form">
+      <p>{running ? '这一轮正在进行。' : '任务现在没有人在做。'}<strong>中止</strong>会停掉这一轮，任务回到队列、由调度器重新派工。<strong>暂停</strong>在此基础上把下一条消息扣住，你在派工消息页放行后才继续。已做的工作留在工作目录里。</p>
+      <Field label="原因（可不填）"><textarea rows={2} value={note} disabled={busy} onInput={e => setNote(e.currentTarget.value)} /></Field>
+      <NoticeLine notice={notice} />
+      <div class="button-row end">
+        <button type="button" disabled={busy} onClick={onCancel}>取消</button>
+        <button type="button" disabled={busy || !running} onClick={() => stop(false)}>中止这一轮</button>
+        <button type="button" class="primary" disabled={busy} onClick={() => stop(true)}>暂停</button>
       </div>
     </div>
   );

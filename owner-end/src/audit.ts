@@ -14,6 +14,8 @@ const FIELDS: ReadonlyMap<string, ReadonlyArray<readonly [label: string, key: st
   ['task.void', [['任务', 'taskId']]],
   ['task.delete', [['任务', 'taskId']]],
   ['task.revoke', [['任务', 'taskId']]],
+  ['task.stop', [['任务', 'taskId']]],
+  ['task.interject', [['任务', 'taskId']]],
   ['decide', [['任务', 'taskId'], ['决定', 'decision']]],
   ['approve', [['任务', 'taskId']]],
   ['reject', [['任务', 'taskId']]],

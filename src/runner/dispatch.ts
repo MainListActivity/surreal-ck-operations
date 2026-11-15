@@ -10,6 +10,27 @@ import { pruneOperationalData } from "../data-retention.ts";
 import { magpieSessionRows, recordPendingTaskCosts } from "../task-cost.ts";
 import { consolidateDue } from "../lane-notes-consolidate.ts";
 import { settleCompanyTurn, TurnInterruptions } from "./turn-closeout.ts";
+/**
+ * 老板中止或暂停了任务（owner-api 的 stopTask）：租约已经收回，这里把还在跑的会话停掉，并清掉本机的领取残留。
+ * 请求按员工记在 employee.stop_requested 上；只处理本执行端自己的员工，停完才清掉请求，停失败的下一轮再试。
+ */
+export async function stopRequested(ctx: Pick<Company, "db" | "runtime" | "sidecar" | "runnerId">): Promise<void> {
+  const [rows] = await ctx.db.db.query<[Array<{ id: { id: unknown }; paseo_agent_id?: string; runner_id?: string; stop_requested?: { task?: string } }>]>(
+    'SELECT id, paseo_agent_id, runner_id, stop_requested FROM employee WHERE stop_requested != NONE;');
+  for (const row of rows ?? []) {
+    if (ctx.runnerId && row.runner_id && row.runner_id !== ctx.runnerId) continue;
+    const instId = String(row.id.id);
+    try {
+      if (row.paseo_agent_id) await ctx.runtime.stop(row.paseo_agent_id);
+      ctx.sidecar.dropLease?.(instId, row.stop_requested?.task);
+      await ctx.db.db.query('UPDATE $employee SET stop_requested = NONE;', { employee: row.id });
+      console.log(`owner stop: stopped ${instId}${row.stop_requested?.task ? ` on ${row.stop_requested.task}` : ''}`);
+    } catch (error) {
+      console.warn(`owner stop failed for ${instId}: ${(error as Error).message}`);
+    }
+  }
+}
+
 // Runs the company dispatcher tick loop inside the plugin subprocess and wakes it early on
 // Paseo lifecycle events, replacing the org.surrealck.company-dispatcher launchd service.
 import type { RuntimeEventSource as PluginServerContext } from "./host.ts";
@@ -495,6 +516,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
           gcRefreshedAt = Date.now();
           await timing.measure("gc", () => runLifecycleGc(ctx)).catch((error) => console.warn(`lifecycle gc failed: ${(error as Error).message}`));
         }
+        await stopRequested(ctx).catch(error => console.warn(`stop requests unread: ${(error as Error).message}`));
         if (!(await ctx.workforce.config()).paused) {
           await timing.measure("iterations", () => reconcileIterations(ctx.db.db, {
             create: async (input, planned) => {

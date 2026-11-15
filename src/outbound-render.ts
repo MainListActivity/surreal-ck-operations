@@ -29,6 +29,8 @@ export interface PromptTask {
   note?: string;
   /** 上一轮受阻后老板给的答复，还没被下一次工作结果消化：放在消息最前面，原话带给员工。 */
   answer?: OwnerAnswer;
+  /** 老板在上一轮进行中插的话，还没有随任何消息发出：放在消息最前面（老板答复之后），原话带给员工。 */
+  notes?: string[];
   /** 返工消息里的上一轮复盘（完工分析起草，已带说明行）：跟在“先修复退回意见”之后。只有返工用。 */
   analysisLead?: string;
 }
@@ -55,6 +57,17 @@ export function analysisLead(next: string | undefined): string | undefined {
   const text = next?.trim();
   return text ? `上一轮的情况（系统读退回意见后整理的，与退回意见原文不一致时以原文为准）：\n${text}` : undefined;
 }
+
+/** 老板插话的开头：原话逐条列出。 */
+export function noteLead(notes: readonly string[] | undefined): string | undefined {
+  const lines = (notes ?? []).map(note => note.trim()).filter(Boolean);
+  if (!lines.length) return undefined;
+  return ['老板补充（上一轮进行中说的，按这个调整）：', ...lines.map(note => clip(note, ANSWER_LIMIT))].join('\n');
+}
+
+/** 消息最前面由老板的话组成的那一段：对受阻的答复，加上进行中的插话。存下原文，重派照抄时据此去掉旧的。 */
+export const ownerLead = (task: Pick<PromptTask, 'answer' | 'notes'>): string | undefined =>
+  [answerLead(task.answer), noteLead(task.notes)].filter(Boolean).join('\n\n') || undefined;
 
 /** 超过这个长度的需求或验收不内联进消息，改为指向 task.md：长文档放文件里，消息只说要点。 */
 export const INLINE_LIMIT = 6000;
@@ -101,7 +114,7 @@ export function composeMessage(step: MessageStep, task: PromptTask, code = false
     : step === 'rework' ? ['上一轮被退回，先修复 findings/round-NN.md 里的问题。', task.analysisLead?.trim(), executeMessage(task, code)].filter(Boolean).join('\n\n')
       : step === 'execute' ? executeMessage(task, code)
         : `上一轮结束时没有给出工作结果，请接着做完。\n\n${phase === 'review' ? reviewMessage(task, code) : executeMessage(task, code)}`;
-  return [answerLead(task.answer), body].filter(Boolean).join('\n\n');
+  return [ownerLead(task), body].filter(Boolean).join('\n\n');
 }
 
 /** A route's own template still has to point the session at its notes; the stored draft is the full text the owner previews. */
