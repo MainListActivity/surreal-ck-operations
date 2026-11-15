@@ -100,7 +100,7 @@ const pause = (ms: number): Promise<void> => new Promise(resolve => {
 });
 
 /** 本版本 applySchema 的最后一个结构版本；云端 bootstrap 只核对库内版本不低于它。 */
-export const CLOUD_SCHEMA_VERSION = 71;
+export const CLOUD_SCHEMA_VERSION = 72;
 
 export class CompanyDatabase {
   /** 当前会话的客户端；云端续期或重连时整体替换（见 rebuildNow）。 */
@@ -622,9 +622,12 @@ export class CompanyDatabase {
     // 070：完工分析表（turn_analysis），只记录与展示。
     await this.db.query(loadSchema('070-turn-analysis.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 70 WHERE schema_version < 70;');
-    // 071：完工分析的失败诊断字段，并让还没有结论的行重试。
+    // 071：完工分析的失败诊断字段。
     await this.db.query(loadSchema('071-turn-analysis-diagnostic.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 71 WHERE schema_version < 71;');
+    // 072：消息链预排——老板提前给流水线后续步骤的消息做的安排（planned_message）。
+    await this.db.query(loadSchema('072-planned-message.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 72 WHERE schema_version < 72;');
   }
 
   /** Selects the configured namespace/database without touching schema (runtimes that only query). */

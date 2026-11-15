@@ -84,6 +84,8 @@ export const COMMAND_CATALOG: readonly CommandSpec[] = [
   c('direction.add', '决策与消息', '记入公司方向', 'text', { risk: 'high' }),
   c('message.list', '决策与消息', '待发消息（可按任务筛选）', 'taskId?, includeSent?', { readOnly: true }),
   c('message.records', '决策与消息', '已发送消息记录', '无', { readOnly: true }),
+  c('message.chains', '决策与消息', '消息链：按任务链排好的已发、待发与后续步骤的派工消息', '无', { readOnly: true }),
+  c('message.plan', '决策与消息', '提前安排流水线后续步骤的消息（改写或先扣住）', 'requirement, revision, index, step, body?, hold?'),
   c('message.edit', '决策与消息', '修改待发消息的正文', 'messageId, body'),
   c('message.edit_rendered', '决策与消息', '按员工看到的样子修改待发消息', 'messageId, employeeId, rendered'),
   c('message.hold', '决策与消息', '暂存待发消息', 'messageId'),

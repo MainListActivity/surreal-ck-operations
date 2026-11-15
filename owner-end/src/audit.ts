@@ -23,6 +23,7 @@ const FIELDS: ReadonlyMap<string, ReadonlyArray<readonly [label: string, key: st
   ['message.edit', [['消息', 'messageId']]],
   ['message.edit_rendered', [['消息', 'messageId'], ['员工', 'employeeId']]],
   ['message.hold', [['消息', 'messageId']]],
+  ['message.plan', [['需求', 'requirement'], ['步骤', 'index']]],
   ['message.release', [['消息', 'messageId']]],
   ['message.send', [['消息', 'messageId']]],
   ['translate.message', [['消息', 'messageId'], ['语言', 'lang']]],
