@@ -239,3 +239,60 @@ describe('muse-web site', () => {
     expect(existsSync(join(dir, '.webchat'))).toBe(false);
   });
 });
+
+describe('chatgpt-web and gemini-web sites', () => {
+  const CHAT = 'https://chatgpt.com/c/6af92449-5490-83ea-baff-29b7b5efb9e1';
+  const runSite = (site: 'chatgpt-web' | 'gemini-web') =>
+    runGrokBotTurn({ prompt: '完成 task.md', commDir: dir, site, model: 'default', config: { pollMs: 1000, maxMinutes: 1 } }, deps());
+
+  test('each round is a new chat: the home page is opened, the chat URL is recorded, later reads go to that chat', async () => {
+    sends = [{ ok: true, url: CHAT }];
+    expect(await runSite('chatgpt-web')).toMatchObject({ status: 'success', text: '梗概正文……' });
+    const first = browsed.find(s => s.includes('const MSG ='))!;
+    expect(first).toContain('"https://chatgpt.com/"');
+    expect(first).toContain('sck-chatgpt-web');
+    expect(first).not.toContain('New side chat');
+    expect(first).not.toContain('muse.ai');
+    expect(browsed.filter(s => !s.includes('const MSG =')).every(s => s.includes(CHAT))).toBe(true);
+  });
+
+  test('page text is read from the conversation area only, never the whole page with its private sidebar', () => {
+    for (const site of ['chatgpt-web', 'gemini-web'] as const) {
+      const script = stateScript({ site }, 'abc-123456');
+      expect(script).not.toContain('const all = document.body.innerText');
+      expect(script).not.toContain(`querySelectorAll("body *")`);
+    }
+    expect(stateScript({ site: 'chatgpt-web' }, 'abc-123456')).toContain(`document.querySelector('main')`);
+    // 原有站点的读法不变。
+    expect(stateScript({ site: 'grok-bot', botId: BOT }, 'abc-123456')).toContain('const all = ((document.body)');
+  });
+
+  test('a navigation timeout does not fail the script; readiness decides', () => {
+    expect(sendScript({ site: 'gemini-web' }, 'abc-123456', 'hi')).toContain('.catch(() => {})');
+  });
+
+  test('ChatGPT: a lingering Stop button does not count as working once the last turn is complete', () => {
+    const script = stateScript({ site: 'chatgpt-web' }, 'abc-123456');
+    expect(script).toContain('data-talvt-turn-state');
+    expect(script).toContain(`!== 'complete'`);
+  });
+
+  test('a usage-limit banner fails the round with quota wording, so the lane is cooled down instead of retried', async () => {
+    states = [{ ok: false, code: 'limit_reached', tail: "You've hit your limit. Try again after 3:42 PM." }];
+    const out = await runSite('chatgpt-web');
+    expect(out.status).toBe('error');
+    expect(out.text).toContain('usage limit');
+    expect(out.text).toContain('ChatGPT 网页版额度已用完');
+    const { quotaFailure } = await import('../src/dispatcher/quota-failure.ts');
+    expect(quotaFailure({ kind: 'failed', error: { message: out.text } }, [])).toBeDefined();
+  });
+
+  test('wiring: lane config, launch command and login hint name the new sites', async () => {
+    expect(() => validateLanes({ 'chatgpt-web': { maxMinutes: 30 }, 'gemini-web': { pollMs: 5000 } })).not.toThrow();
+    expect(() => validateLanes({ 'chatgpt-web': { environments: {} } })).toThrow();
+    sends = [{ ok: false, code: 'login_required' }];
+    expect((await runSite('gemini-web')).text).toContain('gemini.google.com 未登录');
+    claim('code');
+    expect((await runSite('chatgpt-web')).text.startsWith('工作结果：受阻')).toBe(true);
+  });
+});

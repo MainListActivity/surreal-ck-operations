@@ -1,11 +1,11 @@
 /**
- * 网页 agent 员工通道桥接入口（Grok Bot、muse.ai）：执行端以 `bun …/grok-bot/main.ts <grok-bot|muse-web> [--resume <id>] [--model <m>]` 启动，
+ * 网页 agent 员工通道桥接入口（Grok Bot、muse.ai、ChatGPT、Gemini）：执行端以 `bun …/grok-bot/main.ts <站点> [--resume <id>] [--model <m>]` 启动，
  * prompt 走 stdin，事件输出与其它通道一致：system(session_id) → lane_status* → result。
  * 浏览器脚本经 `ego-browser nodejs -e` 执行；脚本只回 `__RESULT__{json}` 一行，失败信息不回显页面内容。
  */
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
-import { PRESSED, runGrokBotTurn, type Browse, type GrokBotConfig } from './turn.ts';
+import { isWebSite, PRESSED, runGrokBotTurn, WEB_SITES, type Browse, type GrokBotConfig } from './turn.ts';
 
 function emit(value: unknown): void { process.stdout.write(`${JSON.stringify(value)}\n`); }
 
@@ -37,9 +37,9 @@ export const egoBrowse = (bin: string): Browse => (script, timeoutMs) => new Pro
 
 async function main(): Promise<number> {
   const [provider, ...rest] = process.argv.slice(2);
-  if (provider !== 'grok-bot' && provider !== 'muse-web') {
+  if (!isWebSite(provider)) {
     emit({ type: 'result', subtype: 'error', is_error: true, session_id: `web-agent-${crypto.randomUUID()}`,
-      result: '用法：main.ts <grok-bot|muse-web> [--resume <id>] [--model <botUUID|default>]' });
+      result: `用法：main.ts <${WEB_SITES.join('|')}> [--resume <id>] [--model <botUUID|default>]` });
     return 0;
   }
   let resumeId: string | undefined, model: string | undefined;

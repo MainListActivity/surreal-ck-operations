@@ -24,8 +24,8 @@ export interface GrokBotInput {
   prompt: string;
   /** 员工通道目录：task.md、claim.json 都在这里。 */
   commDir: string;
-  /** 站点：grok-bot（默认，固定 bot 对话）或 muse-web（每轮新建 muse.ai 侧聊）。 */
-  site?: 'grok-bot' | 'muse-web';
+  /** 站点：grok-bot（默认，固定 bot 对话）；muse-web、chatgpt-web、gemini-web 每轮新建一个对话。 */
+  site?: WebSite;
   /** 员工定义的 model：grok-bot 为 bot 的 UUID（grok.com/bot/<UUID>）；muse-web 用 default。 */
   model?: string;
   resumeId?: string;
@@ -83,40 +83,105 @@ function readClaim(commDir: string): { taskId?: string; intent?: string } {
 
 // ---- 页面脚本（ego-browser nodejs）。只回状态与终稿文本，不回页面其它内容。 ----
 
-export type WebSite = 'grok-bot' | 'muse-web';
-/** 一个站点里本轮对话的位置：grok 是固定 bot 页；muse 是本轮专属的侧聊（首轮前为空，发送时新建）。 */
+export const WEB_SITES = ['grok-bot', 'muse-web', 'chatgpt-web', 'gemini-web'] as const;
+export type WebSite = typeof WEB_SITES[number];
+export const isWebSite = (value: unknown): value is WebSite => (WEB_SITES as readonly unknown[]).includes(value);
+/** 一个站点里本轮对话的位置：grok 是固定 bot 页；其余站点每轮一个新对话（首轮前为空，发送后记下地址）。 */
 export interface WebTarget { site: WebSite; botId?: string; threadUrl?: string }
 
-const LABEL: Record<WebSite, string> = { 'grok-bot': 'Grok Bot', 'muse-web': 'Muse' };
-const LOGIN_HINT: Record<WebSite, string> = { 'grok-bot': 'grok.com', 'muse-web': 'muse.ai' };
+/**
+ * 每个站点一份完整的页面说明。新增站点必须把每一项都写出来：以前按「是不是 grok」二选一，
+ * 新站点会悄悄拿到 Muse 的选择器、登录判断和对话地址格式。
+ */
+interface SiteSpec {
+  label: string;
+  /** 登录失效时告诉老板去哪个域名重新登录。 */
+  loginHint: string;
+  input: string;
+  /** 没有本轮对话地址时打开的页面。 */
+  home(t: WebTarget): string;
+  space(t: WebTarget): string;
+  /** 页面内表达式：对方还在生成。 */
+  working: string;
+  /** 页面内表达式：登录墙。 */
+  login: string;
+  /** 页面就绪还要等到出现的可见元素；空串表示不等。 */
+  messageSel: string;
+  /** 页面内表达式：读对话文本的根元素。有私人侧栏的站点必须只读对话区，侧栏里的聊天标题不能进入回传的现场文本。 */
+  scope: string;
+  /** 找终稿元素用的选择器。 */
+  doneSel: string;
+  /** 每轮新对话的地址格式；固定对话的站点没有。 */
+  thread?: RegExp;
+  /** 发送前要点的「新建对话」按钮；打开首页就是新对话的站点不需要。 */
+  open?: string;
+  /** 页面用自己的话说额度用完了（只在对话区文本里找）。 */
+  limit?: string;
+}
 
-const INPUT_SELECTOR: Record<WebSite, string> = {
-  'grok-bot': '[contenteditable=true][role=textbox][aria-label^="Message"]',
-  'muse-web': 'textarea[aria-label="Message"]',
+const SITES: Record<WebSite, SiteSpec> = {
+  'grok-bot': {
+    label: 'Grok Bot', loginHint: 'grok.com',
+    input: '[contenteditable=true][role=textbox][aria-label^="Message"]',
+    home: t => `https://grok.com/bot/${t.botId}`,
+    space: t => `sck-grok-bot-${(t.botId ?? '').slice(0, 8)}`,
+    // grok：工作中会挂一个有文字的状态（实测「Working」「On its computer」，以后可能还有别的说法）；
+    // 空的状态节点和「已复制」之类的提示不算。
+    working: `[...document.querySelectorAll('[role=status]')].some(e => { const t = ((e.innerText || '') + ' ' + (e.getAttribute('aria-label') || '')).trim(); return !!t && !/^(Copied|Saved|Notifications)/i.test(t); }) || [...document.querySelectorAll('body *')].some(e => e.childElementCount === 0 && (e.innerText || '').trim() === 'Working')`,
+    login: `!location.pathname.startsWith('/bot/') || (/\\b(Sign in|Log in|Sign up)\\b/.test(document.body.innerText.slice(0, 600)) && !document.querySelector('[contenteditable=true][role=textbox]'))`,
+    // grok：输入框比消息先出现（实测先有约 200 字的页面框架，消息节点随后以 visibility:hidden 挂上、再变可见），
+    // 要等到有可见的消息操作按钮；全新、还没有任何消息的对话等满 10 轮后按就绪处理。
+    messageSel: 'button[aria-label="More message actions"]',
+    scope: 'document.body', doneSel: 'body *',
+  },
+  'muse-web': {
+    label: 'Muse', loginHint: 'muse.ai',
+    input: 'textarea[aria-label="Message"]',
+    home: () => 'https://muse.ai/', space: () => 'sck-muse-web',
+    // muse 有「Stop task」按钮或「is working / typing」状态。
+    working: `!!document.querySelector('button[aria-label="Stop task"]') || [...document.querySelectorAll('[role=status]')].some(e => /typing|working/i.test((e.innerText || '') + (e.getAttribute('aria-label') || '')))`,
+    login: `/Log in or create an account/.test(document.body.innerText.slice(0, 2000)) || !!document.querySelector('input[autocomplete="username"],input[type="tel"]')`,
+    messageSel: '', scope: 'document.body', doneSel: 'body *',
+    thread: /^https:\/\/muse\.ai\/thread\/[0-9a-f-]{36}$/,
+    // muse：每轮一个新侧聊，不进老板的主对话。
+    open: 'button[aria-label="New side chat"]',
+  },
+  'chatgpt-web': {
+    // 2026-11-14 实测（文字任务一轮约 30 秒）：首页即新对话，发出后地址变成 /c/<uuid>；对话在 <main> 里，侧栏在外面。
+    label: 'ChatGPT', loginHint: 'chatgpt.com',
+    input: 'div.ProseMirror[role=textbox]',
+    home: () => 'https://chatgpt.com/', space: () => 'sck-chatgpt-web',
+    // 「Stop」按钮在答完后还会留十几秒（实测与「Response complete」并存），所以最后一轮标成 complete 就算停了。
+    working: `(() => { const m = document.querySelector('main'); if (!m || !m.querySelector('button[aria-label="Stop"]')) return false; const turns = m.querySelectorAll('[data-talvt-turn-state]'); return !turns.length || turns[turns.length - 1].getAttribute('data-talvt-turn-state') !== 'complete'; })()`,
+    login: `!document.querySelector('div.ProseMirror[role=textbox]') && /\\b(Log in|Sign up)\\b/.test(document.body.innerText.slice(0, 1500))`,
+    messageSel: '', scope: `document.querySelector('main')`, doneSel: 'main *',
+    thread: /^https:\/\/chatgpt\.com\/c\/[0-9a-f-]{36}$/,
+    limit: String.raw`You(?:’|')ve (?:hit|reached) (?:your|the)[^.\n]{0,80}limit|reached (?:the|your) (?:message|usage) (?:cap|limit)|limit resets`,
+  },
+  'gemini-web': {
+    // 选择器取自写作通道（src/media/browser-scripts.ts）里已在用的 Gemini 页面结构；聊天员工这条路的发送与取回还没有实测过。
+    label: 'Gemini', loginHint: 'gemini.google.com',
+    input: 'div.ql-editor[role=textbox]',
+    home: () => 'https://gemini.google.com/app', space: () => 'sck-gemini-web',
+    working: `[...document.querySelectorAll('button')].some(b => /^Stop/i.test(b.getAttribute('aria-label') || '') && b.offsetParent !== null)`,
+    login: `!document.querySelector('div.ql-editor[role=textbox]') && /\\bSign in\\b/.test(document.body.innerText.slice(0, 1500))`,
+    messageSel: '', scope: `(document.querySelector('chat-window') ?? document.querySelector('main'))`, doneSel: 'model-response, model-response *',
+    thread: /^https:\/\/gemini\.google\.com\/app\/[0-9a-f]{8,40}$/,
+    limit: String.raw`reached your[^.\n]{0,40}limit|limit resets|try again (?:later|tomorrow)`,
+  },
 };
 
 function prelude(t: WebTarget): string {
-  const url = t.site === 'grok-bot' ? `https://grok.com/bot/${t.botId}` : (t.threadUrl ?? 'https://muse.ai/');
-  const space = t.site === 'grok-bot' ? `sck-grok-bot-${(t.botId ?? '').slice(0, 8)}` : 'sck-muse-web';
-  // working：grok 主区末尾 Working / status；muse 有「Stop task」按钮或「is working / typing」状态。
-  const working = t.site === 'grok-bot'
-    // grok：工作中会挂一个有文字的状态（实测「Working」「On its computer」，以后可能还有别的说法）；
-    // 空的状态节点和「已复制」之类的提示不算。
-    ? `[...document.querySelectorAll('[role=status]')].some(e => { const t = ((e.innerText || '') + ' ' + (e.getAttribute('aria-label') || '')).trim(); return !!t && !/^(Copied|Saved|Notifications)/i.test(t); }) || [...document.querySelectorAll('body *')].some(e => e.childElementCount === 0 && (e.innerText || '').trim() === 'Working')`
-    : `!!document.querySelector('button[aria-label="Stop task"]') || [...document.querySelectorAll('[role=status]')].some(e => /typing|working/i.test((e.innerText || '') + (e.getAttribute('aria-label') || '')))`;
-  const login = t.site === 'grok-bot'
-    ? `!location.pathname.startsWith('/bot/') || (/\\b(Sign in|Log in|Sign up)\\b/.test(document.body.innerText.slice(0, 600)) && !document.querySelector('[contenteditable=true][role=textbox]'))`
-    : `/Log in or create an account/.test(document.body.innerText.slice(0, 2000)) || !!document.querySelector('input[autocomplete="username"],input[type="tel"]')`;
-  const inputSel = INPUT_SELECTOR[t.site];
-  // grok：输入框比消息先出现（实测先有约 200 字的页面框架，消息节点随后以 visibility:hidden 挂上、再变可见），
-  // 要等到有可见的消息操作按钮；
-  // 全新、还没有任何消息的对话等满 10 轮后按就绪处理。
-  const messageSel = t.site === 'grok-bot' ? 'button[aria-label="More message actions"]' : '';
+  const spec = SITES[t.site];
+  const url = t.threadUrl ?? spec.home(t);
+  const space = spec.space(t);
+  const { working, login, input: inputSel, messageSel } = spec;
   return `
 const emit = (r) => { console.log('__RESULT__' + JSON.stringify(r)); };
 const space = await taskSpace(${JSON.stringify(space)});
 const p = (await space.pages())[0] ?? await space.newPage();
-await p.goto(${JSON.stringify(url)});
+// 有的站点（Gemini）load 事件 15 秒内等不到，页面其实已可用：导航超时不算失败，后面的就绪判断说了算。
+await p.goto(${JSON.stringify(url)}).catch(() => {});
 await p.waitForTimeout(3000);
 // 页面就绪：输入框在、消息已渲染、对话文本连续两次读数不变才算加载完；半渲染的页面会被误判成「空闲、没发过」。
 let ready = false, prevLen = -1;
@@ -128,7 +193,7 @@ for (let i = 0; i < 14 && !ready; i++) {
 }
 const read = () => p.evaluate(() => {
   const text = (document.querySelector('main') ?? document.body).innerText || '';
-  const all = document.body.innerText || '';
+  const all = ((${spec.scope}) ?? { innerText: '' }).innerText || '';
   const buttons = [...document.querySelectorAll('button')].map(b => (b.innerText || '').trim());
   const question = buttons.includes('Skip') && buttons.some(b => /^Submit/.test(b));
   return { text, all, url: location.href, working: ${working}, question, login: ${login} };
@@ -156,12 +221,15 @@ const expanded = await p.evaluate((D) => {
 if (expanded) await p.waitForTimeout(1500);
 // 终稿：以本轮 DONE 标记开头的最大元素（整条消息气泡），去掉末尾时间戳和展开/收起按钮字样。
 const done = await p.evaluate((D) => {
-  const els = [...document.querySelectorAll('body *')].filter(e => (e.innerText || '').trimStart().startsWith(D));
+  const els = [...document.querySelectorAll(${JSON.stringify(SITES[t.site].doneSel)})].filter(e => (e.innerText || '').trimStart().startsWith(D));
   if (!els.length) return null;
   const best = els.reduce((a, b) => ((b.innerText || '').length > (a.innerText || '').length ? b : a));
   return (best.innerText || '').trimStart().slice(D.length)
     .replace(/(\\n\\s*(Show (more|less)|\\d{1,2}:\\d{2}(\\s*[AP]M)?)\\s*)+$/i, '').replace(/\\n\\s*Working\\s*$/, '').trim();
 }, DONE);
+// 页面用自己的话说额度用完了：只看本轮任务消息之后的对话文本，且还没有终稿。
+const LIMIT = ${JSON.stringify(SITES[t.site].limit ?? '')};
+if (LIMIT && !done && task >= 0 && new RegExp(LIMIT, 'i').test(s.all.slice(-600))) { emit({ ok: false, code: 'limit_reached', tail: s.all.slice(-300) }); process.exit(0); }
 // 终稿只认本轮 DONE 标记（标记含本轮摘要，唯一），不要求本轮任务消息还在页面上：长对话里旧消息会被移出页面。
 emit({ ok: true, sent: task >= 0, working: s.working, question: task >= 0 && s.question, done, tail: s.all.slice(task >= 0 ? task : -600).slice(-600) });
 `;
@@ -169,11 +237,13 @@ emit({ ok: true, sent: task >= 0, working: s.working, question: task >= 0 && s.q
 
 export function sendScript(t: WebTarget, marker: string, message: string): string {
   const TASK = JSON.stringify(`[SCK-TASK ${marker}]`);
-  const input = JSON.stringify(INPUT_SELECTOR[t.site]);
-  const open = t.site === 'muse-web' && !t.threadUrl
-    // muse：每轮一个新侧聊，不进老板的主对话。
-    ? `await p.click('css:button[aria-label="New side chat"]', { label: 'new side chat' });\nawait p.waitForTimeout(3000);\n`
+  const spec = SITES[t.site];
+  const input = JSON.stringify(spec.input);
+  const open = spec.open && !t.threadUrl
+    ? `await p.click('css:${spec.open}', { label: 'new chat' });\nawait p.waitForTimeout(3000);\n`
     : '';
+  // 每轮新对话的站点：等地址变成对话地址再算发出，执行端据此记下本轮对话在哪。
+  const THREAD = JSON.stringify(spec.thread?.source ?? '');
   return `${prelude(t)}
 const MSG = ${JSON.stringify(message)};
 let s = await read();
@@ -194,7 +264,7 @@ for (let i = 0; i < 8; i++) {
   await p.waitForTimeout(2000);
   s = await read();
   url = s.url;
-  if (s.all.includes(${TASK}) && !/\\/thread\\/new$/.test(url)) break;
+  if (s.all.includes(${TASK}) && (!${THREAD} || new RegExp(${THREAD}).test(url))) break;
 }
 emit({ ok: s.all.includes(${TASK}), code: 'not_echoed', url });
 `;
@@ -202,11 +272,10 @@ emit({ ok: s.all.includes(${TASK}), code: 'not_echoed', url });
 
 /** 发送脚本按下 Enter 前打印的标记行：脚本中途失败时据此判断消息可能已发出。 */
 export const PRESSED = '__PRESSED__';
-const THREAD_URL = /^https:\/\/muse\.ai\/thread\/[0-9a-f-]{36}$/;
 function threadFile(commDir: string, marker: string): string { return join(commDir, '.webchat', `${marker}.json`); }
-function readThread(commDir: string, marker: string): string | undefined {
+function readThread(commDir: string, marker: string, site: WebSite): string | undefined {
   const url = readRecord(commDir, marker).url;
-  return typeof url === 'string' && THREAD_URL.test(url) ? url : undefined;
+  return typeof url === 'string' && SITES[site].thread?.test(url) ? url : undefined;
 }
 function readRecord(commDir: string, marker: string): { url?: unknown; sent?: unknown; attempt?: unknown } {
   try { return JSON.parse(readFileSync(threadFile(commDir, marker), 'utf8')) as { url?: unknown; sent?: unknown; attempt?: unknown }; }
@@ -221,9 +290,10 @@ function writeThread(commDir: string, marker: string, url: string): void { write
 /** 一轮网页 agent 执行：确认可接 → 发送（或识别已发送）→ 轮询到终稿/提问/超时。 */
 export async function runGrokBotTurn(input: GrokBotInput, deps: GrokBotDeps): Promise<GrokBotOutcome> {
   const site: WebSite = input.site ?? 'grok-bot';
-  const label = LABEL[site];
+  const spec = SITES[site];
+  const label = spec.label;
   const botId = (input.model ?? '').trim().toLowerCase();
-  const sessionId = input.resumeId ?? (site === 'grok-bot' ? `grok-bot-${botId.slice(0, 8) || 'unset'}` : `muse-web-${crypto.randomUUID()}`);
+  const sessionId = input.resumeId ?? (site === 'grok-bot' ? `grok-bot-${botId.slice(0, 8) || 'unset'}` : `${site}-${crypto.randomUUID()}`);
   const fail = (text: string): GrokBotOutcome => ({ sessionId, status: 'error', text });
   const blocked = (text: string): GrokBotOutcome => ({ sessionId, status: 'success', text: `${BLOCKED}：${text}` });
   if (site === 'grok-bot' && !BOT_ID.test(botId)) return fail('grok-bot 员工定义的 model 必须是 bot 的 UUID（grok.com/bot/<UUID>）');
@@ -238,8 +308,8 @@ export async function runGrokBotTurn(input: GrokBotInput, deps: GrokBotDeps): Pr
   const pollMs = input.config?.pollMs ?? 20_000;
   const maxMinutes = input.config?.maxMinutes ?? 120;
   const deadline = deps.now() + maxMinutes * 60_000;
-  const target: WebTarget = { site, botId, threadUrl: site === 'muse-web' ? readThread(input.commDir, marker) : undefined };
-  const loginFail = () => fail(`${LOGIN_HINT[site]} 未登录或登录已过期（需要老板在 ego-browser 里重新登录 ${LOGIN_HINT[site]}）`);
+  const target: WebTarget = { site, botId, threadUrl: spec.thread ? readThread(input.commDir, marker, site) : undefined };
+  const loginFail = () => fail(`${spec.loginHint} 未登录或登录已过期（需要老板在 ego-browser 里重新登录 ${spec.loginHint}）`);
 
   // 发送：对方正忙（老板或上一轮在用）就等它空下来；已有本轮标记则不重发。
   // 最多发一次：按下发送前先在本地记「已尝试」，之后无论回显是否确认、脚本是否中途失败、执行端是否重启，
@@ -253,7 +323,7 @@ export async function runGrokBotTurn(input: GrokBotInput, deps: GrokBotDeps): Pr
     // 没按下发送（对方忙、页面未就绪、没登录、找不到输入框、浏览器没跑起来）才撤销「已尝试」。
     const pressed = sent?.ok === true || sent?.code === 'not_echoed' || sent?.code === 'pressed';
     if (!pressed) writeRecord(input.commDir, marker, { attempt: false });
-    if (site === 'muse-web' && typeof sent?.url === 'string' && THREAD_URL.test(sent.url) && !target.threadUrl) {
+    if (spec.thread && typeof sent?.url === 'string' && spec.thread.test(sent.url) && !target.threadUrl) {
       // 先记下侧聊地址再看结果：发出去但回显未确认时，重试回到同一侧聊，不另开新侧聊重复发送。
       target.threadUrl = sent.url;
       writeThread(input.commDir, marker, sent.url);
@@ -276,6 +346,8 @@ export async function runGrokBotTurn(input: GrokBotInput, deps: GrokBotDeps): Pr
     await deps.sleep(pollMs);
     const s = await deps.browse(stateScript(target, marker), 90_000);
     if (s?.code === 'login_required') return loginFail();
+    // 页面自己说额度用完了：按失败收尾，文案里带 usage limit，执行端据此给这条通道记额度冷却（quota-failure.ts），不再往里派。
+    if (s?.code === 'limit_reached') return fail(`${label} 网页版额度已用完（usage limit）。页面提示：${String(s.tail ?? '').slice(-200)}`);
     if (s?.ok === true) {
       const working = s.working === true;
       lastWorking = working; lastTail = String(s.tail ?? '');
