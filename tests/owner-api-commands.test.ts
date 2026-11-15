@@ -336,6 +336,15 @@ test('dispatch.preference 读当前值、写入合法编号并记审计、拒绝
   await ownerApi(ctx, { command: 'dispatch.preference', provider: '' }, 'owner');
   expect(queries.find(q => q.sql.includes('MERGE $patch'))!.params.patch).toEqual({ preferred_provider: '' });
 
+  // 通道偏好整份替换（SET），不用 MERGE：MERGE 逐键合并对象，传 {} 清不掉。
+  queries.length = 0;
+  await ownerApi(ctx, { command: 'dispatch.preference', lanePreference: {} }, 'owner');
+  const lane = queries.find(q => q.sql.includes('lane_preference'))!;
+  expect(lane.sql).toContain('SET lane_preference = $value');
+  expect(lane.sql).not.toContain('MERGE');
+  expect(lane.params.value).toEqual({});
+  await expect(ownerApi(ctx, { command: 'dispatch.preference', lanePreference: { 文案: ['gemini-web'] } }, 'owner') as Promise<unknown>).rejects.toMatchObject({ code: 'invalid' });
+
   for (const provider of ['Factory Droid', 'a b', '../x', 42, null]) {
     await expect(ownerApi(ctx, { command: 'dispatch.preference', provider }, 'owner') as Promise<unknown>)
       .rejects.toMatchObject({ code: 'invalid' });

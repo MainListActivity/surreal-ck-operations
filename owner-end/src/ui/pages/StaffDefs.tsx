@@ -38,6 +38,8 @@ const PROVIDERS: ReadonlyArray<{ value: string; label: string }> = [
   { value: 'warp', label: 'Warp Build（原生执行端）' },
   { value: 'grok-bot', label: 'Grok Bot（网页 bot，模型填 bot UUID）' },
   { value: 'muse-web', label: 'Muse（muse.ai 网页，每任务一个侧聊）' },
+  { value: 'chatgpt-web', label: 'ChatGPT（网页版聊天，文字任务，每任务一个新对话）' },
+  { value: 'gemini-web', label: 'Gemini（网页版聊天，文字任务，每任务一个新对话）' },
   { value: 'grok', label: 'Grok Build（经 Paseo）' },
   { value: 'devin-paseo', label: 'Devin CLI（Paseo 模式）' },
 ];
@@ -56,6 +58,8 @@ const MODELS: Record<string, string[]> = {
   warp: ['default'],
   'grok-bot': [],
   'muse-web': ['default'],
+  'chatgpt-web': ['default'],
+  'gemini-web': ['default'],
   grok: ['grok-4.6'],
   'devin-paseo': ['swe-2-high', 'swe-2-flash-medium', 'adaptive'],
 };

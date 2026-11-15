@@ -177,7 +177,7 @@ export class ActivityCollector {
     } else if (provider === 'codex-cloud' || provider === 'devin-cloud' || provider === 'jules') {
       // 云端通道桥接进程的进展行：只取状态短语，不取供应商转录。
       if (e.type === 'lane_status' && typeof e.status === 'string') { this.append('status', `云端运行中：${e.status}`, at); this.act('通道', e.status, 'ok', at); }
-    } else if (provider === 'warp' || provider === 'grok-bot' || provider === 'muse-web') {
+    } else if (provider === 'warp' || provider === 'grok-bot' || provider === 'muse-web' || provider === 'chatgpt-web' || provider === 'gemini-web') {
       // warp 本地通道 / grok-bot 网页通道桥接的进展行，同样只取状态短语。
       if (e.type === 'lane_status' && typeof e.status === 'string') { this.append('status', e.status, at); this.act('通道', e.status, 'ok', at); }
     } else if (provider === 'codex') {

@@ -361,7 +361,8 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       }
       if (input.lanePreference !== undefined) {
         const lanePreference = lanePreferenceValue(input.lanePreference);
-        await db.query('UPSERT company_meta:config MERGE $patch;', { patch: { lane_preference: lanePreference } });
+        // 整份替换：MERGE 会把对象逐键合并，传 {} 清不掉已有的键（0.13.23 生产实测清不掉）。
+        await db.query('UPSERT company_meta:config SET lane_preference = $value;', { value: lanePreference });
         await db.query("CREATE audit CONTENT { actor: $actor, action: 'owner_dispatch_preference', evidence: $evidence, at: time::now() };",
           { actor: a, evidence: `lane_preference=${JSON.stringify(lanePreference).slice(0, 900)}` });
       }

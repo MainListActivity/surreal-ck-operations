@@ -189,7 +189,9 @@ try {
       if (!key || value === undefined || !/^[a-z_]+$/.test(key)) throw new Error(usage);
       const parsed = key === 'preferred_provider' ? preferredProviderValue(JSON.parse(value))
         : key === 'lane_preference' ? lanePreferenceValue(JSON.parse(value)) : JSON.parse(value) as unknown;
-      await database.db.query('UPSERT company_meta:config MERGE $patch;', { patch: { [key]: parsed } });
+      // lane_preference 整份替换：MERGE 会逐键合并对象，删不掉键。
+      if (key === 'lane_preference') await database.db.query('UPSERT company_meta:config SET lane_preference = $value;', { value: parsed });
+      else await database.db.query('UPSERT company_meta:config MERGE $patch;', { patch: { [key]: parsed } });
       print(await workforce.config());
       break;
     }
