@@ -520,6 +520,15 @@ run('第 2 步后半：退回的完工分析写进返工消息；把握不足扣
   await store.ensureQueuedDrafts([d.id]);
   expect((await draftOf(d.id)).body).toBe(sentD);
 
+  // 等过了时限（退回已超过 4 分钟）：不等。
+  const f = await mk('导出订单 F');
+  await returned(f.id, '第 1 条不成立：导出的文件名是乱码，打不开。');
+  await store.ensureQueuedDrafts([f.id]);
+  expect(await store.awaitingAnalysis(f.id, 'rework')).toBe(true);
+  await db.db.query("UPDATE audit SET at = time::now() - 5m WHERE task = $task AND action = 'return';", { task: new RecordId('task', f.id) });
+  expect(await store.awaitingAnalysis(f.id, 'rework')).toBe(false);
+  expect(await store.prepareSend(f.id, 'rework', 'lanes-eng')).not.toBeNull();
+
   // 分析任务没在跑（没有心跳）：不等。
   const e = await mk('导出订单 E');
   await returned(e.id, '第 1 条不成立：导出的时间是 UTC，页面上是北京时间。');

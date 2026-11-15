@@ -163,6 +163,13 @@ export class OutboundMessageStore {
     if (!last?.analyzable) return;
     const [rows] = await this.db.query<[Array<{ summary?: string; next?: string; confidence?: string }>]>(
       'SELECT summary, next, confidence FROM $rid;', { rid: new RecordId('turn_analysis', String(last.id.id)) });
+    // 同一轮返工已经发过（重派），草稿却没定过——旧版本留下的草稿：照上次发的来，不再加分析也不再扣。
+    const [resent] = await this.db.query<[unknown[]]>(
+      "SELECT id FROM outbound_message WHERE task = $task AND step = 'rework' AND state = 'sent' AND sent_at > $since LIMIT 1;", { task: this.task(taskId), since: last.at });
+    if (resent?.length) {
+      await this.db.query("UPDATE $ids SET analysis_source = 'none' WHERE state != 'sent' AND analysis_source = NONE;", { ids: drafts.map(draft => draft.id) });
+      return;
+    }
     const analysis = rows?.[0];
     if (!analysis?.summary) return;
     const lead = analysisLead(analysis.next);
@@ -402,7 +409,7 @@ export class OutboundMessageStore {
     let draft = await this.latestDraft(taskId, step) ?? await this.seedDraft(taskId, step);
     if (draft.hold || draft.state === 'held') return null;
     // 返工消息在时限内等一等上一轮的完工分析（催办不等）；等不到就照常发。
-    if (await this.awaitingAnalysis(taskId, step)) return null;
+    if (await this.awaitingAnalysis(taskId, step).catch(() => false)) return null;
     draft = await this.stampLang(draft, employeeLang);
     // Re-read payload + database-computed revision together after language alignment.
     const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(

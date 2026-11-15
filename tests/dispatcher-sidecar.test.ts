@@ -166,6 +166,8 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
   let quotaRows: ProviderQuota[] = [];
   // Translation gate (Dispatcher.translationPending): a task in `waiting` has no ready translation; `aligned` logs each alignment.
   const waiting = new Set<string>(), aligned: string[] = [];
+  // Analysis gate (Dispatcher.analysisPending): a task in `analysing` waits for the analysis of its last return.
+  const analysing = new Set<string>();
   const messages = {
     prepareSend: async (taskId: string, step: string, employeeId: string) => ({
       body: `fixture ${step} body for ${taskId}`,
@@ -180,6 +182,7 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
     isHeld: async () => false,
     alignLanguage: async (taskId: string, step: string, employeeId: string) => { aligned.push(`${taskId}:${step}:${employeeId}`); },
     awaitingTranslation: async (taskId: string) => waiting.has(taskId),
+    awaitingAnalysis: async (taskId: string) => analysing.has(taskId),
     markSent: async (messageId: string) => { events.push(`markSent:${messageId}`); },
     latestDraft: async () => undefined,
     machineCriterionId: async () => 'AC-1',
@@ -199,7 +202,7 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
     const r = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(dir), name)); if (!r) throw new Error('relay timeout'); return r;
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
-  return { wf, messages, attempts, addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, logs, views, relay, denied, held, scopeUnreadable, sentBodies, spawnBodies, waiting, aligned,
+  return { wf, messages, attempts, addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, logs, views, relay, denied, held, scopeUnreadable, sentBodies, spawnBodies, waiting, analysing, aligned,
     holdAssets: (paths: string[], holder: WriteScopeHolder) => { assetHolds.push({ paths, holder }); }, freeAssets: () => { assetHolds.splice(0); },
     authorsOf, unreadable, paseo, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
@@ -421,6 +424,20 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     expect(w.instances).toHaveLength(1);
     expect(w.events).toContain(`claim:${w.instances[0]!.id}:t2`);
     expect(w.spawnBodies[0]).toContain('t2');
+  });
+  test('a rework message waiting for the analysis of its return creates no employee, takes no lease and raises no notice; it dispatches once the wait ends', async () => {
+    const w = world();
+    w.addTask('t3', { state: 'ready' });
+    w.analysing.add('t3');
+    const d = w.dispatcher();
+    await d.tick();
+    expect(w.instances).toHaveLength(0);
+    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('spawn:'))).toBe(false);
+    expect(w.notices.size).toBe(0);
+    w.analysing.delete('t3');
+    await d.tick();
+    expect(w.instances).toHaveLength(1);
+    expect(w.events).toContain(`claim:${w.instances[0]!.id}:t3`);
   });
   test('a spawned instance binds the repository root as cwd and keeps private comm separately', async () => {
     const w = world();
