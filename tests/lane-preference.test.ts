@@ -50,7 +50,7 @@ const pool = (extra: Partial<StaffingInput>) => staffingPool({
   health: new Map(), quotaBlocked: new Map(), busyBy: new Map(), providerMax: {}, slots: new Map(), opsRepo: '/ops', sidecar: true, now: 1_700_000_000,
   preferredProvider: 'factory-droid', ...extra,
 });
-const task = (discipline?: string) => ({ id: 't1', executorRole: 'ai-content', reviewerRole: 'owner', discipline, state: 'ready', row: {} }) as never;
+const task = (discipline?: string, row: Record<string, unknown> = {}) => ({ id: 't1', executorRole: 'ai-content', reviewerRole: 'owner', discipline, state: 'ready', row }) as never;
 
 test('候选池：命中通道偏好的任务不再为优先订阅保留等待，偏好通道带说明；没命中的照旧', () => {
   const plain = pool({ task: task() });
@@ -65,4 +65,12 @@ test('候选池：命中通道偏好的任务不再为优先订阅保留等待�
   // 复核工作不套用通道偏好。
   const review = pool({ task: task('文案'), lanePreference: prefs, excludeSubmitter: true });
   expect(review.find(e => e.provider === 'gemini-web')?.code).toBe('factory_wait');
+});
+
+test('路线类型取自任务行的 type：命中后同样不保留等待', () => {
+  const hit = pool({ task: task(undefined, { type: 'product' }), lanePreference: { 'type:product': ['claude'] } });
+  expect(hit.find(e => e.provider === 'claude')?.note).toContain('路线“product”先用 claude，排第 1 位');
+  expect(hit.find(e => e.provider === 'gemini-web')?.eligible).toBe(true);
+  const miss = pool({ task: task(undefined, { type: 'software' }), lanePreference: { 'type:product': ['claude'] } });
+  expect(miss.find(e => e.provider === 'gemini-web')?.code).toBe('factory_wait');
 });

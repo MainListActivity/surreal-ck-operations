@@ -222,7 +222,7 @@ export function trackOkFor(role: Role, task: Pick<SupervisedTask, 'discipline' |
 /** 通道偏好认的任务事实：工种、路线类型、执行岗位。 */
 export function laneFacts(task: SupervisedTask | undefined): { discipline?: string; executorRole?: string; type?: string } | undefined {
   if (!task) return undefined;
-  const type = (task.row as { type?: unknown } | undefined)?.type;
+  const type = task.row?.type;
   return { discipline: typeof task.discipline === 'string' ? task.discipline : undefined, executorRole: task.executorRole,
     type: typeof type === 'string' ? type : undefined };
 }
@@ -1689,7 +1689,7 @@ export class Dispatcher {
         const spawnItem = Object.assign((role: string, home: string, task?: SupervisedTask, forReview = false) =>
           spawnable(role, home, task, forReview), {
           skipped: (role: string, home: string, task: SupervisedTask, forReview: boolean, skipExclusion?: ReviewExclusion) =>
-            poolFor(role, home, task, forReview, skipExclusion).filter(e => e.kind === 'spawn' && !e.eligible).map(e => ({ provider: e.provider, reason: e.reason })),
+            poolFor(role, home, task, forReview, skipExclusion).filter(e => e.kind === 'spawn' && !e.eligible && this.deps.providerAllowed?.(e.provider) !== false).map(e => ({ provider: e.provider, reason: e.reason })),
         });
         this.scopeDenied.delete(item.task.id);
         const result = await this.assign(item.role, item.task, last?.employee, pickItem, spawnItem,
@@ -1929,6 +1929,8 @@ export class Dispatcher {
             return undefined;
           }
           await hooks?.beforeExternal?.(existing, 'send');
+          // 原因在外部调用之前写：原生执行端的调用要等会话跑完才返回，事后写的话进行中的一轮看不到。只有发出的消息才显示它。
+          await this.recordReason(prepared?.message.id, reasonFor(existing.provider ?? '', assignCfg.sessionPolicy === 'oneshot'));
           externalAttempt = true;
           const attempt = await wf.beginDispatchAttempt({ request: randomUUID(), message: prepared?.message.id,
             messageRevision: prepared?.message.dispatchRevision, body: body!, bodyHash: createHash('sha256').update(body!).digest('hex'), employee: existing.id, task: task?.id, kind: 'send',
@@ -1939,7 +1941,6 @@ export class Dispatcher {
           this.onboarded.add(existing.id);
           this.lastStatus.set(existing.paseoAgentId!, 'running');
           await wf.finishDispatchAttempt(attempt, existing.paseoAgentId!);
-          await this.recordReason(prepared?.message.id, reasonFor(existing.provider ?? '', true));
           this.log(`woke ${existing.id} for ${task?.id ?? `dispatch:${role}`}`);
           return { ...existing, spawned: false };
         }
@@ -2015,6 +2016,7 @@ export class Dispatcher {
           return undefined;
         }
         await hooks?.beforeExternal?.(inst, 'spawn');
+        await this.recordReason(prepared?.message.id, reasonFor(def.provider, !!pending));
         const container = await this.sessionWorkspace(task ?? anchor?.task, spawnCwd, repoHome);
         externalAttempt = true;
         const attempt = await wf.beginDispatchAttempt({ request: randomUUID(), message: prepared?.message.id,
@@ -2043,7 +2045,6 @@ export class Dispatcher {
           await wf.confirmDispatchActivation(attempt, agentId);
         }
         await wf.finishDispatchAttempt(attempt, agentId);
-        await this.recordReason(prepared?.message.id, reasonFor(def.provider, !!pending));
         sidecar?.bindAgent(inst.id, agentId);
         const bound = { ...inst, paseoAgentId: agentId, cwd, repoHome, model, workspaceScope, paseoWorkspace: container.workspaceId };
         const prior = insts.findIndex(row => row.id === inst.id);
