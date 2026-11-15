@@ -444,3 +444,100 @@ run('自定义正文的任务（需求流水线、路线、老板改过的）受
   await core.release(qa, proof(await core.claim(qa, t.id)), { text: '【通道回滚】fixture：供应商明确失败，保留任务阶段，等待通道恢复后重派。', idempotencyKey: key() });
   expect(await send('review')).toBe(custom);
 });
+
+run('第 2 步后半：退回的完工分析写进返工消息；把握不足扣住一次；限时等分析；同一轮重派照上次发的来', async () => {
+  const { analyzeTurns } = await import('../src/turn-analysis.ts');
+  const store = new OutboundMessageStore(db.db);
+  const mk = async (title: string) => { const t = await core.createTask(gm, { title, context: '给订单列表加导出', requirement: '给订单列表加导出', acceptanceText: '老板能下载到 CSV',
+    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key() } as never); await store.createTaskDrafts(t.id, 'engineering', 'qa', false); return t; };
+  const draftOf = async (id: string, step = 'rework') => (await store.list(id, false)).find(m => m.step === step)!;
+  const send = async (id: string) => { const p = await store.prepareSend(id, 'rework', 'lanes-eng'); await store.markSent(p!.message.id, 'lanes-eng', p!.body); return p!.body; };
+  const returned = async (id: string, text: string) => { await core.submit(eng, proof(await core.claim(eng, id)), evidence({ text: '执行端自动收集的工作结果：\n导出做完了，页面上点导出可以下载。' }));
+    await core.returnTask(qa, proof(await core.claim(qa, id)), evidence({ text })); };
+  const seen: Array<{ action: string; result: string; submitted?: string }> = [];
+  const model = (confidence: string, next = '上一轮导出报 500。先修接口，再在页面上点一次导出确认能下载。') => (async (input: { action: string; result: string; submitted?: string }) => {
+    seen.push(input); return { status: input.action === 'return' ? 'rejected' : 'partial', summary: '导出报 500', needs: [], next, confidence }; }) as never;
+  const drain = async (analyze: never) => { for (let i = 0; i < 20; i++) if (!(await analyzeTurns(db.db, analyze)).analyzed) break; };
+  const LEAD = '上一轮的情况（系统读退回意见后整理的，与退回意见原文不一致时以原文为准）：\n上一轮导出报 500。先修接口，再在页面上点一次导出确认能下载。';
+  await drain(model('high')); // 清掉库里别的任务的待分析结果，并留下心跳。
+
+  // 分析任务在跑、退回刚发生、分析还没出来：返工消息等着，不发，也不是扣住。
+  const a = await mk('导出订单 A');
+  await returned(a.id, '第 1 条不成立：导出按钮点了没有下载，控制台报 500。');
+  await store.ensureQueuedDrafts([a.id]);
+  expect(await store.awaitingAnalysis(a.id, 'rework')).toBe(true);
+  expect(await store.awaitingAnalysis(a.id, 'review')).toBe(false);
+  expect(await store.prepareSend(a.id, 'rework', 'lanes-eng')).toBeNull();
+  expect(await store.isHeld(a.id, 'rework')).toBe(false);
+  // 把握足的分析出来：写进返工消息，直接发；交给模型的结果不带执行端的说明行。
+  await drain(model('high'));
+  expect(seen.filter(s => s.action === 'return' && s.result.includes('控制台报 500')).at(-1)!.submitted).toBe('导出做完了，页面上点导出可以下载。');
+  await store.ensureQueuedDrafts([a.id]);
+  expect((await draftOf(a.id)).body).toBe(`上一轮被退回，先修复 findings/round-NN.md 里的问题。\n\n${LEAD}\n\n${(await draftOf(a.id, 'execute')).body}`);
+  expect(await store.awaitingAnalysis(a.id, 'rework')).toBe(false);
+  const sentA = await send(a.id);
+  expect(sentA).toContain(LEAD);
+  // 同一轮重派：照上次发的来。
+  await store.ensureQueuedDrafts([a.id]);
+  expect((await draftOf(a.id)).body).toBe(sentA);
+
+  // 把握不足：写进正文并扣住等老板看；老板放行后不再因同一份分析扣住。
+  const b = await mk('导出订单 B');
+  await returned(b.id, '第 1 条不成立：下载到的文件是空的，一行数据都没有。');
+  await drain(model('low'));
+  await store.ensureQueuedDrafts([b.id]);
+  const heldB = await draftOf(b.id);
+  expect(heldB).toMatchObject({ hold: true, state: 'held', holdReason: '完工分析把握不足' });
+  expect(heldB.body).toContain(LEAD);
+  expect(await store.prepareSend(b.id, 'rework', 'lanes-eng')).toBeNull();
+  await store.setHold(heldB.id, false, 'owner');
+  await store.ensureQueuedDrafts([b.id]);
+  expect(await send(b.id)).toContain(LEAD);
+
+  // 关了自动扣住：把握不足的分析不写进正文，照常发。
+  const c = await mk('导出订单 C');
+  await returned(c.id, '第 1 条不成立：导出的列少了金额，和页面列表对不上。');
+  await drain(model('low'));
+  await db.db.query('UPSERT company_meta:config MERGE { auto_hold: false };');
+  await store.ensureQueuedDrafts([c.id]);
+  await db.db.query('UPSERT company_meta:config MERGE { auto_hold: true };');
+  expect(await draftOf(c.id)).toMatchObject({ hold: false });
+  expect((await draftOf(c.id)).body).not.toContain('上一轮的情况');
+  await store.ensureQueuedDrafts([c.id]);
+  expect(await send(c.id)).not.toContain('上一轮的情况');
+
+  // 等不到：分析失败过一次就不等；发出之后迟到的分析不再加进同一轮的重派。
+  const d = await mk('导出订单 D');
+  await returned(d.id, '第 1 条不成立：导出超时，等了一分钟没有任何下载。');
+  await store.ensureQueuedDrafts([d.id]);
+  expect(await store.awaitingAnalysis(d.id, 'rework')).toBe(true);
+  for (let i = 0; i < 6; i++) await analyzeTurns(db.db, (async () => ({ status: 'bad' })) as never);
+  expect(await store.awaitingAnalysis(d.id, 'rework')).toBe(false);
+  const sentD = await send(d.id);
+  expect(sentD).not.toContain('上一轮的情况');
+  await drain(model('high'));
+  for (let i = 0; i < 4; i++) await analyzeTurns(db.db, model('high'), Date.now() + 11 * 60_000);
+  await store.ensureQueuedDrafts([d.id]);
+  expect((await draftOf(d.id)).body).toBe(sentD);
+
+  // 分析任务没在跑（没有心跳）：不等。
+  const e = await mk('导出订单 E');
+  await returned(e.id, '第 1 条不成立：导出的时间是 UTC，页面上是北京时间。');
+  await db.db.query('DELETE company_meta:analysis;');
+  await store.ensureQueuedDrafts([e.id]);
+  expect(await store.awaitingAnalysis(e.id, 'rework')).toBe(false);
+  // 老板改过正文并发出；下一轮退回照抄老板的正文，旧的复盘去掉，换成新一轮的。
+  await drain(model('high'));
+  await store.ensureQueuedDrafts([e.id]);
+  const edited = await store.edit((await draftOf(e.id)).id, `${(await draftOf(e.id)).body}\n\n老板补充：时间用北京时间。`, 'owner');
+  expect(edited.body).toContain(LEAD);
+  await send(e.id);
+  await returned(e.id, '仍不成立：文件名里的日期还是 UTC，和文件内容不一致。');
+  await drain(model('high', '上一轮文件名日期仍是 UTC。先改文件名的日期。'));
+  await store.ensureQueuedDrafts([e.id]);
+  const second = await draftOf(e.id);
+  expect(second.body).toContain('上一轮文件名日期仍是 UTC。先改文件名的日期。');
+  expect(second.body).not.toContain('上一轮导出报 500');
+  expect(second.body).toContain('老板补充：时间用北京时间。');
+  expect(second.hold).toBe(true); // 第二轮返工照旧扣住。
+});

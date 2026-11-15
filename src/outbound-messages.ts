@@ -4,7 +4,7 @@ import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from './core-errors.ts';
 import { rolePolicyOf } from './command-guard.ts';
 import { langMatches, ownerLangOf } from './owner-lang.ts';
-import { answerLead, composeMessage, machineCriterionOf, routeBody, stepOfTask, type MessageStep, type PromptTask } from './outbound-render.ts';
+import { analysisLead, answerLead, composeMessage, machineCriterionOf, routeBody, stepOfTask, type MessageStep, type PromptTask } from './outbound-render.ts';
 import { latestAnswer, requirementOf } from './dispatcher/brief.ts';
 import { deliveryOf, sourceHash } from './outbound-delivery.ts';
 export { DEFAULT_MACHINE_CRITERION, composeMessage, renderMessage } from './outbound-render.ts';
@@ -41,6 +41,11 @@ export interface OutboundMessage {
   translateFailedAt?: string;
 }
 
+/** 返工消息最多等完工分析这么久（从退回那一刻算，按库的时钟）；过了就不带分析照常派工。 */
+export const ANALYSIS_WAIT = '4m';
+/** 老板端的分析任务每分钟跑一次并留下心跳；这么久没有心跳就当它没在跑，返工不等分析。 */
+const ANALYSIS_BEAT = '3m';
+
 const STEPS: readonly MessageStep[] = ['execute', 'review', 'rework', 'nudge', 'notice'];
 
 /** A record id's key; a plain value stands for itself. */
@@ -76,15 +81,22 @@ export class OutboundMessageStore {
   private task(taskId: string) { return new RecordId('task', taskId); }
   private message(messageId: string) { return new RecordId('outbound_message', messageId); }
 
-  async createDraft(taskId: string, step: MessageStep, role: string, code = false, phase = 'doing', body?: string, answerLeadText?: string): Promise<OutboundMessage> {
+  /**
+   * body 给了就原样存（路线、需求流水线的自定义正文，或照抄上一次发出的正文）；没给就按任务卡组装。
+   * leads 记下正文里带的两段开头（老板答复、上一轮复盘）和复盘已经按哪条退回定过：重派照抄时据此去掉旧段，不会叠两段。
+   */
+  async createDraft(taskId: string, step: MessageStep, role: string, code = false, phase = 'doing', body?: string,
+    leads: { answer?: string; analysis?: string; analysisSource?: string } = {}): Promise<OutboundMessage> {
     if (!STEPS.includes(step)) throw new CompanyError('invalid', `unknown message step ${step}`);
+    const card = body === undefined ? { ...await this.promptTask(taskId), analysisLead: leads.analysis } : undefined;
     const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
       `CREATE outbound_message CONTENT { task: $task, step: $step, role: $role, body: $body, composed: $composed, answer_lead: $answer_lead,
-        state: 'draft', hold: false, created_at: time::now() } RETURN AFTER;`,
+        analysis_lead: $analysis_lead, analysis_source: $analysis_source, state: 'draft', hold: false, created_at: time::now() } RETURN AFTER;`,
       // composed 记下这条正文是按任务卡组装的（及组装参数）：任务卡改了它跟着重算，重派时也按任务卡重新组装。
       // 路线或需求流水线给的自定义正文没有这个标记，保持原样。
-      { task: this.task(taskId), step, role, body: body ?? composeMessage(step, await this.promptTask(taskId), code, phase),
-        composed: body === undefined ? { code, phase } : undefined, answer_lead: answerLeadText });
+      { task: this.task(taskId), step, role, body: body ?? composeMessage(step, card!, code, phase),
+        composed: card ? { code, phase } : undefined, answer_lead: card ? answerLead(card.answer) : leads.answer,
+        analysis_lead: leads.analysis, analysis_source: leads.analysisSource });
     return rowView(rows[0]!);
   }
 
@@ -127,27 +139,100 @@ export class OutboundMessageStore {
     return draft?.hold ? draft.holdReason : undefined;
   }
 
+  /** 最近一次退回或老板驳回：编号、是否还在等分析的时限内（按库的时钟）、有没有可分析的退回意见（【通道回滚】是执行端自己的记录，不算）。 */
+  private async latestReturn(taskId: string): Promise<{ id: RecordId; at: unknown; fresh: boolean; analyzable: boolean } | undefined> {
+    const [rows] = await this.db.query<[Array<{ id: RecordId; at: unknown; fresh: boolean; analyzable: boolean }>]>(
+      `SELECT id, at, at > time::now() - ${ANALYSIS_WAIT} AS fresh,
+        (type::is_string(evidence) AND evidence != '' AND !string::starts_with(evidence, '【通道回滚】')) AS analyzable
+        FROM audit WHERE task = $task AND action IN ['return', 'owner_reject'] ORDER BY at DESC LIMIT 1;`, { task: this.task(taskId) });
+    return rows?.[0];
+  }
+
+  /**
+   * 把最近一次退回的完工分析定到还没发出的返工草稿上，每条草稿对每次退回只定一次（analysis_source 记下定过）：
+   * 老板放行之后不会因为同一份分析再被扣住。把握足的直接写进正文；把握不足的同一次更新里扣住等老板看，
+   * 扣不了（公司关了自动扣住）就不写进正文——模型没把握的话不能没人看过就发给员工。
+   * 老板改过正文的、正在派出的草稿不动。按任务卡组装的草稿只记下这段，正文由 refreshDrafts 重算；照抄的正文在这里直接加。
+   */
+  private async attachAnalysis(taskId: string): Promise<void> {
+    const [drafts] = await this.db.query<[Array<{ id: RecordId; body: string; composed?: unknown; answer_lead?: string; hold?: boolean; state?: string }>]>(
+      `SELECT id, body, composed, answer_lead, hold, state FROM outbound_message WHERE task = $task AND step = 'rework' AND state != 'sent'
+        AND body_edited != true AND dispatch_attempt = NONE AND analysis_source = NONE;`, { task: this.task(taskId) });
+    if (!drafts?.length) return;
+    const last = await this.latestReturn(taskId);
+    if (!last?.analyzable) return;
+    const [rows] = await this.db.query<[Array<{ summary?: string; next?: string; confidence?: string }>]>(
+      'SELECT summary, next, confidence FROM $rid;', { rid: new RecordId('turn_analysis', String(last.id.id)) });
+    const analysis = rows?.[0];
+    if (!analysis?.summary) return;
+    const lead = analysisLead(analysis.next);
+    const low = analysis.confidence !== 'high';
+    const source = String(last.id.id);
+    for (const draft of drafts) {
+      const held = draft.hold === true || draft.state === 'held';
+      const hold = Boolean(lead) && low && !held && await this.autoHold();
+      const use = lead && (!low || held || hold) ? lead : undefined;
+      let body = draft.body;
+      if (use && !draft.composed) {
+        const answer = draft.answer_lead && body.startsWith(`${draft.answer_lead}\n\n`) ? `${draft.answer_lead}\n\n` : '';
+        body = `${answer}${use}\n\n${body.slice(answer.length)}`;
+      }
+      await this.db.query(
+        `UPDATE $msg SET analysis_source = $source, analysis_lead = $lead, body = $body${hold ? ", hold = true, state = 'held', hold_reason = $reason" : ''}
+          WHERE state ${hold ? "= 'draft'" : "!= 'sent'"} AND body_edited != true AND dispatch_attempt = NONE AND analysis_source = NONE AND body = $expected;`,
+        { msg: draft.id, source, lead: use, body, expected: draft.body, reason: '完工分析把握不足' });
+    }
+  }
+
+  /**
+   * 返工消息在等最近一次退回的完工分析：退回后 ANALYSIS_WAIT 内、分析还没出来也没失败过、老板端的分析任务在跑（有心跳）。
+   * 过了时限、分析失败过一次、或分析任务没在跑，都不等，照常派工。扣住的、老板改过的、已经定过的草稿不等。只读。
+   */
+  async awaitingAnalysis(taskId: string, step: MessageStep): Promise<boolean> {
+    if (step !== 'rework') return false;
+    const [drafts] = await this.db.query<[Array<{ hold?: boolean; state?: string; body_edited?: boolean; analysis_source?: string; dispatch_attempt?: unknown }>]>(
+      `SELECT hold, state, body_edited, analysis_source, dispatch_attempt, created_at FROM outbound_message
+        WHERE task = $task AND step = 'rework' AND state != 'sent' ORDER BY created_at DESC LIMIT 1;`, { task: this.task(taskId) });
+    const draft = drafts?.[0];
+    if (draft && (draft.hold === true || draft.state === 'held' || draft.body_edited === true || draft.analysis_source || draft.dispatch_attempt)) return false;
+    const last = await this.latestReturn(taskId);
+    if (!last?.analyzable || !last.fresh) return false;
+    // 没有草稿时，同一轮返工已经发过的（重派）照上次发的来，不等。
+    if (!draft) {
+      const [resent] = await this.db.query<[unknown[]]>(
+        "SELECT id FROM outbound_message WHERE task = $task AND step = 'rework' AND state = 'sent' AND sent_at > $since LIMIT 1;", { task: this.task(taskId), since: last.at });
+      if (resent?.length) return false;
+    }
+    const [[beat], [row]] = await this.db.query<[Array<{ alive?: boolean }>, Array<{ summary?: string; attempts?: number }>]>(
+      `SELECT at > time::now() - ${ANALYSIS_BEAT} AS alive FROM company_meta:analysis; SELECT summary, attempts FROM $rid;`,
+      { rid: new RecordId('turn_analysis', String(last.id.id)) });
+    if (beat?.alive !== true) return false;
+    return !row?.summary && !((row?.attempts ?? 0) > 0);
+  }
+
   /**
    * 任务卡改了之后，让还没发出、老板没改过的草稿跟着重算。只动按任务卡组装的草稿（composed 标记）：
    * 老板改过的、路线或需求流水线自定义正文的草稿保持原样。
    */
   async refreshDrafts(taskId: string): Promise<number> {
+    // 先把刚出来的完工分析定到返工草稿上（含把握不足时扣住），下面再按它重算正文。失败不挡重算。
+    await this.attachAnalysis(taskId).catch(error => console.warn(`analysis attach failed for ${taskId}: ${(error as Error).message}`));
     const full = await this.promptTask(taskId);
     // 老板的答复只给下一步要发的那条（和它的催办）：还没轮到的复核草稿不带执行岗受阻的答复。
     const next = full.answer ? await this.nextStep(taskId) : undefined;
     const { answer: _answer, ...plain } = full;
-    const [rows] = await this.db.query<[Array<{ id: unknown; step: MessageStep; body: string; composed: { code?: boolean; phase?: string } }>]>(
-      "SELECT id, step, body, composed FROM outbound_message WHERE task = $task AND state != 'sent' AND body_edited != true AND composed != NONE AND dispatch_attempt = NONE;",
+    const [rows] = await this.db.query<[Array<{ id: unknown; step: MessageStep; body: string; composed: { code?: boolean; phase?: string }; analysis_lead?: string }>]>(
+      "SELECT id, step, body, composed, analysis_lead FROM outbound_message WHERE task = $task AND state != 'sent' AND body_edited != true AND composed != NONE AND dispatch_attempt = NONE;",
       { task: this.task(taskId) });
     let changed = 0;
     for (const draft of rows ?? []) {
-      const card = draft.step === next || draft.step === 'nudge' ? full : plain;
+      const card = { ...(draft.step === next || draft.step === 'nudge' ? full : plain), analysisLead: draft.analysis_lead };
       const body = composeMessage(draft.step, card, draft.composed.code === true, draft.composed.phase ?? 'doing');
       if (body === draft.body) continue;
       // 条件更新：这期间老板改了正文或消息已发出，就不动它。正在派出的消息（dispatch_attempt）正文已冻结，上面已排除。
       const [done] = await this.db.query<[unknown[]]>(
-        "UPDATE $msg SET body = $body WHERE state != 'sent' AND body_edited != true AND body = $expected RETURN AFTER;",
-        { msg: draft.id, body, expected: draft.body });
+        "UPDATE $msg SET body = $body, answer_lead = $answer_lead WHERE state != 'sent' AND body_edited != true AND body = $expected RETURN AFTER;",
+        { msg: draft.id, body, expected: draft.body, answer_lead: answerLead((card as PromptTask).answer) });
       if (done?.length) changed++;
     }
     return changed;
@@ -316,6 +401,8 @@ export class OutboundMessageStore {
     // 旧任务没有草稿：按模板即时生成一条，保证派工正文永远来自这张表。
     let draft = await this.latestDraft(taskId, step) ?? await this.seedDraft(taskId, step);
     if (draft.hold || draft.state === 'held') return null;
+    // 返工消息在时限内等一等上一轮的完工分析（催办不等）；等不到就照常发。
+    if (await this.awaitingAnalysis(taskId, step)) return null;
     draft = await this.stampLang(draft, employeeLang);
     // Re-read payload + database-computed revision together after language alignment.
     const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
@@ -393,8 +480,8 @@ export class OutboundMessageStore {
       this.db.query<[Array<{ id: unknown; state: string }>]>('SELECT id, state FROM task WHERE id IN $ids;', { ids }).then(r => r[0] ?? []),
       this.db.query<[Array<{ task: unknown }>]>("SELECT task FROM audit WHERE task IN $ids AND action IN ['return', 'owner_reject'];", { ids })
         .then(r => r[0] ?? []),
-      this.db.query<[Array<{ task: unknown; step: string }>]>("SELECT task, step FROM outbound_message WHERE task IN $ids AND state != 'sent';", { ids })
-        .then(r => r[0] ?? []),
+      this.db.query<[Array<{ task: unknown; step: string; analysis_source?: string; body_edited?: boolean }>]>(
+        "SELECT task, step, analysis_source, body_edited FROM outbound_message WHERE task IN $ids AND state != 'sent';", { ids }).then(r => r[0] ?? []),
     ]);
     const returned = new Set(returns.map(row => keyOf(row.task)));
     const have = new Set(drafts.map(row => `${keyOf(row.task)}:${row.step}`));
@@ -402,6 +489,16 @@ export class OutboundMessageStore {
       const taskId = keyOf(task.id);
       const step = stepOfTask(task.state, returned.has(taskId));
       if (!have.has(`${taskId}:${step}`)) await this.seedDraft(taskId, step);
+    }
+    // 返工草稿还没按完工分析定过的：分析出来了就在领租约之前定上（把握不足的此时扣住，派工循环随后看到的就是扣住的草稿）。
+    const open = new Set(drafts.filter(row => row.step === 'rework' && !row.analysis_source && row.body_edited !== true).map(row => keyOf(row.task)));
+    const waiting = tasks.filter(task => stepOfTask(task.state, returned.has(keyOf(task.id))) === 'rework').map(task => keyOf(task.id))
+      .filter(taskId => open.has(taskId) || !have.has(`${taskId}:rework`));
+    if (waiting.length === 0) return;
+    const [ready] = await this.db.query<[Array<{ task: unknown }>]>(
+      "SELECT task FROM turn_analysis WHERE task IN $ids AND action IN ['return', 'owner_reject'] AND summary != NONE;", { ids: waiting.map(id => this.task(id)) });
+    for (const taskId of new Set((ready ?? []).map(row => keyOf(row.task)))) {
+      await this.refreshDrafts(taskId).catch(error => console.warn(`analysis attach failed for ${taskId}: ${(error as Error).message}`));
     }
   }
 
@@ -419,23 +516,13 @@ export class OutboundMessageStore {
     const role = step === 'review' ? String(row?.reviewer_role ?? 'qa') : String(row?.executor_role ?? 'engineering');
     // A re-dispatch of the same step (lease expired, instance replaced) repeats what was last sent, so an owner edit or a custom
     // body survives. Only a body composed from the task card and never edited is composed again: the card is the source of truth.
-    const [sent] = await this.db.query<[Array<{ body?: string; body_edited?: boolean; composed?: unknown; answer_lead?: string }>]>(
-      `SELECT body, body_edited, composed, answer_lead, created_at FROM outbound_message WHERE task = $task AND step = $step AND state = 'sent' ORDER BY created_at DESC LIMIT 1;`,
+    const [sent] = await this.db.query<[Array<{ body?: string; body_edited?: boolean; composed?: unknown; answer_lead?: string; analysis_lead?: string; analysis_source?: string }>]>(
+      `SELECT body, body_edited, composed, answer_lead, analysis_lead, analysis_source, created_at FROM outbound_message WHERE task = $task AND step = $step AND state = 'sent' ORDER BY created_at DESC LIMIT 1;`,
       { task: this.task(taskId), step });
     const last = sent?.[0];
     const recompose = !last?.body || (last.composed && last.body_edited !== true);
-    // 照抄旧正文（老板改过的、路线或需求流水线自定义的、旧模板的）时，待转达的老板答复加在最前面，并记下加了哪一段：
-    // 下次再受阻、再答复时先去掉旧的那段，不会叠两段。按任务卡重新组装的正文自己会带上答复。
-    let body: string | undefined, lead: string | undefined;
-    if (!recompose) {
-      const prior = last!.answer_lead ? `${last!.answer_lead}\n\n` : '';
-      const base = prior && last!.body!.startsWith(prior) ? last!.body!.slice(prior.length) : last!.body!;
-      lead = answerLead((await this.promptTask(taskId)).answer);
-      body = lead ? `${lead}\n\n${base}` : base;
-    }
-    const draft = await this.createDraft(taskId, step, role, code, step === 'review' ? 'review' : 'doing', body, lead);
-    // 第二轮及以上返工先扣住等老板看：反复退回多半是需求或验收有分歧，继续自动派只会空转。
-    // 同一轮返工的重派（租约过期、换实例）不再扣：最近一次退回之后已经发过返工消息。
+    // 返工：数一数是第几轮，以及最近一次退回之后是否已经发过返工消息（同一轮的重派：租约过期、换实例）。
+    let rounds = 0, sameRound = false;
     if (step === 'rework') {
       const [returns] = await this.db.query<[Array<{ at: unknown }>]>(
         // 【通道回滚】不是谁发现的缺陷，不算一轮（与 task-progress 的缺陷口径一致）。
@@ -443,9 +530,28 @@ export class OutboundMessageStore {
       const [resent] = await this.db.query<[unknown[]]>(
         "SELECT id FROM outbound_message WHERE task = $task AND step = 'rework' AND state = 'sent' AND sent_at > $since LIMIT 1;",
         { task: this.task(taskId), since: returns?.[0]?.at });
-      if ((returns?.length ?? 0) >= 2 && !resent?.length && await this.holdForPolicy(draft.id, `第 ${returns!.length} 轮返工`)) {
-        return { ...draft, hold: true, state: 'held', holdReason: `第 ${returns!.length} 轮返工` };
-      }
+      rounds = returns?.length ?? 0;
+      sameRound = Boolean(resent?.length);
+    }
+    // 上一轮复盘：同一轮的重派照上次发的来（带过就带、没带过就不带，迟到的分析不再加）；新一轮先不带，等这一轮的分析出来再定。
+    const analysis = sameRound ? { analysis: last?.analysis_lead, analysisSource: last?.analysis_source ?? 'none' } : {};
+    // 照抄旧正文（老板改过的、路线或需求流水线自定义的、旧模板的）时，先去掉里面旧的老板答复和旧的复盘（存的是当时加进去的原文），
+    // 再把待转达的老板答复加在最前面：下次再受阻、再答复、再退回时不会叠两段。按任务卡重新组装的正文自己会带上这两段。
+    let body: string | undefined, lead: string | undefined;
+    if (!recompose) {
+      const cut = (text: string, part?: string): string => {
+        const at = part ? text.indexOf(`${part}\n\n`) : -1;
+        return at >= 0 ? text.slice(0, at) + text.slice(at + part!.length + 2) : text;
+      };
+      let base = cut(last!.body!, last!.answer_lead);
+      if (!sameRound) base = cut(base, last!.analysis_lead);
+      lead = answerLead((await this.promptTask(taskId)).answer);
+      body = lead ? `${lead}\n\n${base}` : base;
+    }
+    const draft = await this.createDraft(taskId, step, role, code, step === 'review' ? 'review' : 'doing', body, { answer: lead, ...analysis });
+    // 第二轮及以上返工先扣住等老板看：反复退回多半是需求或验收有分歧，继续自动派只会空转。同一轮返工的重派不再扣。
+    if (step === 'rework' && rounds >= 2 && !sameRound && await this.holdForPolicy(draft.id, `第 ${rounds} 轮返工`)) {
+      return { ...draft, hold: true, state: 'held', holdReason: `第 ${rounds} 轮返工` };
     }
     return draft;
   }

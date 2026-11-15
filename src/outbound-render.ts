@@ -29,6 +29,8 @@ export interface PromptTask {
   note?: string;
   /** 上一轮受阻后老板给的答复，还没被下一次工作结果消化：放在消息最前面，原话带给员工。 */
   answer?: OwnerAnswer;
+  /** 返工消息里的上一轮复盘（完工分析起草，已带说明行）：跟在“先修复退回意见”之后。只有返工用。 */
+  analysisLead?: string;
 }
 
 /** 一次受阻与老板的答复。 */
@@ -43,6 +45,15 @@ export function answerLead(answer: OwnerAnswer | undefined): string | undefined 
   if (!reply) return undefined;
   return [answer!.blocker?.trim() ? `上一轮你报告受阻：${clip(answer!.blocker.trim().replace(/\s+/g, ' '), 300)}` : '上一轮你报告受阻。',
     reply.length <= ANSWER_LIMIT ? `老板答复：\n${reply}` : '老板已答复，答复较长，全文在 answer.md，先读。', '按答复接着做。'].join('\n');
+}
+
+/**
+ * 返工消息里的复盘段。文字是模型读退回意见后起草的，不是老板的原话：写明来源，并以退回意见原文为准。
+ * 没有建议就没有这一段。
+ */
+export function analysisLead(next: string | undefined): string | undefined {
+  const text = next?.trim();
+  return text ? `上一轮的情况（系统读退回意见后整理的，与退回意见原文不一致时以原文为准）：\n${text}` : undefined;
 }
 
 /** 超过这个长度的需求或验收不内联进消息，改为指向 task.md：长文档放文件里，消息只说要点。 */
@@ -87,7 +98,7 @@ function reviewMessage(task: PromptTask, code: boolean): string {
  */
 export function composeMessage(step: MessageStep, task: PromptTask, code = false, phase = 'doing'): string {
   const body = step === 'review' ? reviewMessage(task, code)
-    : step === 'rework' ? `上一轮被退回，先修复 findings/round-NN.md 里的问题。\n\n${executeMessage(task, code)}`
+    : step === 'rework' ? ['上一轮被退回，先修复 findings/round-NN.md 里的问题。', task.analysisLead?.trim(), executeMessage(task, code)].filter(Boolean).join('\n\n')
       : step === 'execute' ? executeMessage(task, code)
         : `上一轮结束时没有给出工作结果，请接着做完。\n\n${phase === 'review' ? reviewMessage(task, code) : executeMessage(task, code)}`;
   return [answerLead(task.answer), body].filter(Boolean).join('\n\n');

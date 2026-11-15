@@ -11,6 +11,7 @@ import { workContext, type WorkContext } from './work-context.ts';
 import { latestFindings } from './dispatcher/brief.ts';
 import { HANDOVER_ROWS } from './handover-window.ts';
 import { deliveryOf, effectiveLangOf, translationStateOf, type DeliveryMessage } from './outbound-delivery.ts';
+import { OutboundMessageStore } from './outbound-messages.ts';
 import { acIdOf, dispatchText, renderMessage, stepOfTask, type MessageStep, type RenderContext } from './outbound-render.ts';
 
 export type BoardPhase = 'execute' | 'review';
@@ -103,6 +104,7 @@ export const BOARD_RECENT_ROWS = 20;
 const HELD_TEXT = '消息待老板放行';
 /** What the board says about a queued item whose message waits for its translation in the employee's language. */
 const AWAITING_TRANSLATION_TEXT = '消息待译文';
+const AWAITING_ANALYSIS_TEXT = '等上一轮的完工分析（几分钟内自动派出）';
 const OPEN_STATES = ['ready', 'doing', 'review'];
 
 /** Writes the runner's heartbeat. One row for the local runner, replaced on every beat. */
@@ -478,6 +480,13 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
     return !deliveryOf(deliveryFieldsOf(draft), employeeLang).ok;
   };
 
+  // A rework message waits a bounded time for the analysis of the return it answers, judged as the dispatch judges it.
+  const analysing = new Set<string>();
+  const store = new OutboundMessageStore(db);
+  await Promise.all([...focus.keys()].filter(taskId => stepOf(taskId) === 'rework').map(async taskId => {
+    if (await store.awaitingAnalysis(taskId, 'rework').catch(() => false)) analysing.add(taskId);
+  }));
+
   // A rework message names the findings file of the newest return.
   const findingsFile = new Map<string, string>();
   await Promise.all([...focus.keys()].filter(taskId => returned.has(taskId)).map(async taskId => {
@@ -526,9 +535,10 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
       if (position === undefined) return [];
       const held = heldAt(entry.taskId);
       const awaiting = awaitingAt(entry.taskId, langOf.get(id));
-      const eligible = entry.eligible && !held && !awaiting;
+      const analysis = analysing.has(entry.taskId);
+      const eligible = entry.eligible && !held && !awaiting && !analysis;
       return [{ taskId: entry.taskId, title: String(tasks.get(entry.taskId)?.title ?? ''), phase: entry.phase, position, eligible,
-        reason: boardReason(position, eligible, held ? HELD_TEXT : awaiting ? AWAITING_TRANSLATION_TEXT : entry.body) }];
+        reason: boardReason(position, eligible, held ? HELD_TEXT : awaiting ? AWAITING_TRANSLATION_TEXT : analysis ? AWAITING_ANALYSIS_TEXT : entry.body) }];
     });
     // The holder's message went out at its claim, so the outbox holds only what would go to this employee next.
     const outbox = next.flatMap(entry => {
@@ -551,10 +561,11 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
     const held = heldAt(item.taskId);
     // A queued item has no holder yet: the instance spawned for it takes its role's language.
     const awaiting = awaitingAt(item.taskId, langByRole.get(String(item.role ?? '')));
-    const eligible = item.eligible && !held && !awaiting;
+    const analysis = analysing.has(item.taskId);
+    const eligible = item.eligible && !held && !awaiting && !analysis;
     const draft = draftOf.get(`${item.taskId}:${stepOf(item.taskId)}`);
     return { taskId: item.taskId, title: String(tasks.get(item.taskId)?.title ?? item.title), phase: item.phase, position,
-      blocked: item.blocked || held || awaiting, eligible, reason: boardReason(position, eligible, held ? HELD_TEXT : awaiting ? AWAITING_TRANSLATION_TEXT : item.body),
+      blocked: item.blocked || held || awaiting || analysis, eligible, reason: boardReason(position, eligible, held ? HELD_TEXT : awaiting ? AWAITING_TRANSLATION_TEXT : analysis ? AWAITING_ANALYSIS_TEXT : item.body),
       ...(draft ? { message: messageOf(draft) } : {}) };
   });
 
