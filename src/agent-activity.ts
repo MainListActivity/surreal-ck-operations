@@ -48,6 +48,9 @@ export function activityText(text: string): string {
     .replace(/\b(?:Bearer\s+\S+|(?:sk-|fk-|ghp_|github_pat_)[A-Za-z0-9_-]{12,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/gi, '[凭证已隐藏]')
     .replace(/((?:\b[a-z0-9_-]{0,80}(?:api[_-]?key|token|secret|password)|\bauthorization)["']?\s*[=:]\s*["']?)[^\s,"'}]+/gi, '$1[已隐藏]')
     .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, '$1[凭证已隐藏]@')
+    // 命令行里的凭证：--password x、--token=x、-p x 之外的常见写法，以及 curl -u 用户:口令。
+    .replace(/(--?(?:password|passwd|pass|token|secret|api[-_]?key|access[-_]?key|key)(?:=|\s+))("[^"]*"|'[^']*'|\S+)/gi, '$1[已隐藏]')
+    .replace(/((?:^|\s)-u\s+)\S+:\S+/g, '$1[已隐藏]')
     .replace(/(https?:\/\/[^\s?#]+)\?[^\s]+/g, '$1?[参数已隐藏]')
     .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '').slice(0, 1200);
 }
@@ -66,6 +69,9 @@ const pick = (input: unknown, ...keys: string[]): string | undefined => {
  */
 export function actionSummary(name: string, input?: unknown): string {
   const tool = name.replace(/[^\p{L}\p{N}_.:/-]/gu, '').slice(0, 100) || '工具';
+  // 搜索类工具常带一个 path（搜索范围），要记的是搜什么。
+  const searching = /grep|glob|search|find/i.test(tool) ? pick(input, 'pattern', 'query', 'glob', 'regex') : undefined;
+  if (searching) return `搜索：${line(searching)}`;
   const command = pick(input, 'command', 'cmd', 'script');
   if (command) return `执行命令：${line(command)}`;
   const file = pick(input, 'file_path', 'filePath', 'path', 'notebook_path', 'target_file');

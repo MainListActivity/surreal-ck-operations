@@ -32,6 +32,8 @@
 | 改派 | `sck owner task.reassign '{"taskId":"t1","executorRole":"engineering","reviewerRole":"qa","note":"换人"}'` |
 | 作废 | `sck owner task.void '{"taskId":"t1","note":"重复"}'` |
 | 撤销租约 | `sck owner task.revoke '{"taskId":"t1","note":"终止在途"}'` |
+| 中止这一轮（hold 为 true 即暂停，下一条消息先扣住） | `sck owner task.stop '{"taskId":"t1","hold":true}'` |
+| 插话（interrupt 为 true 时立即中止并重派） | `sck owner task.interject '{"taskId":"t1","text":"列头用中文","interrupt":false}'` |
 | 暂停派工 | `sck owner task.pause '{}'` |
 | 恢复派工 | `sck owner task.resume '{}'` |
 | 任务成本 | `sck owner task.cost '{"taskId":"t1"}'` |

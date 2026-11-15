@@ -212,3 +212,12 @@ test('云端与网页通道收到的正文就是派工消息：路径换成“�
     expect(botMessage('m2', taskMaterial(dir))).toContain('轻一点 / 再轻一点 / 轻到刚好');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('老板插话的开头：在老板答复之后、正文之前，逐条原话', async () => {
+  const { noteLead, ownerLead } = await import('../src/outbound-render.ts');
+  expect(noteLead([])).toBeUndefined();
+  expect(noteLead(['列头用中文。', ' 金额两位小数。 '])).toBe('老板补充（上一轮进行中说的，按这个调整）：\n列头用中文。\n金额两位小数。');
+  const task = { requirement: '给订单列表加导出', answer: { blocker: '缺账号', reply: '用 test_kit 领。' }, notes: ['列头用中文。'] };
+  expect(composeMessage('execute', task)).toStartWith(`${ownerLead(task)}\n\n给订单列表加导出`);
+  expect(ownerLead(task)).toBe('上一轮你报告受阻：缺账号\n老板答复：\n用 test_kit 领。\n按答复接着做。\n\n老板补充（上一轮进行中说的，按这个调整）：\n列头用中文。');
+});

@@ -68,6 +68,8 @@ export const COMMAND_CATALOG: readonly CommandSpec[] = [
   c('task.update', '任务', '修改任务的标题、需求、可用资源或验收文本；未发出且未改过的派工草稿随之重算', 'taskId, title?, requirement?, resources?, acceptanceText?'),
   c('task.reassign', '任务', '改派执行或复核角色', 'taskId, executorRole?, reviewerRole?, note'),
   c('task.revoke', '任务', '终止在途执行（收回当前租约）', 'taskId, note?'),
+  c('task.stop', '任务', '中止这一轮（收回租约并停掉会话）；hold=true 即暂停，下一条消息先扣住', 'taskId, note?, hold?'),
+  c('task.interject', '任务', '插话：随下一条消息带给员工；interrupt=true 时立即中止并重派', 'taskId, text, interrupt?'),
   c('task.void', '任务', '作废任务', 'taskId, note'),
   c('task.delete', '任务', '删除（退役）任务', 'taskId, note'),
   c('task.pause', '任务', '暂停全部派工', '无'),

@@ -579,3 +579,76 @@ run('第 3 步：消息链按父子关系排出已发、下一条、稍后与等
   expect(await count()).toBe(before); // 读消息链不写库。
   expect(child.state).toBe('planned');
 });
+
+run('第 5 步：中止收回租约并请执行端停会话；暂停再把下一条消息扣住；插话随下一条消息带出一次', async () => {
+  const { ownerApi } = await import('../src/owner-api.ts');
+  const store = new OutboundMessageStore(db.db);
+  const api = (input: Record<string, unknown>) => ownerApi({ db, core, owner: {}, workforce: new Workforce(db), messages: store, opsRepo: '/tmp/ops' } as never, input, 'web') as Promise<Record<string, unknown>>;
+  const t = await core.createTask(gm, { title: '运行中控制', context: '给订单列表加导出', requirement: '给订单列表加导出', acceptanceText: '老板能下载到 CSV',
+    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key() } as never);
+  await store.createTaskDrafts(t.id, 'engineering', 'qa', false);
+  const send = async (step: 'execute' | 'review') => { const p = await store.prepareSend(t.id, step, 'lanes-eng'); await store.markSent(p!.message.id, 'lanes-eng', p!.body); return p!.body; };
+  const stateOf = async () => (await db.db.query<[Array<{ state: string; current_employee?: string }>]>('SELECT state, current_employee FROM $t;', { t: new RecordId('task', t.id) }))[0]![0]!;
+  const stopFlag = async () => (await db.db.query<[Array<{ stop_requested?: { task?: string } }>]>('SELECT stop_requested FROM $e;', { e: new RecordId('employee', 'lanes-eng') }))[0]![0]?.stop_requested;
+  await db.db.query("UPSERT $e SET role = 'engineering';", { e: new RecordId('employee', 'lanes-eng') });
+
+  // 没有人在做：中止拒绝；插话先记下，下一条消息最前面带上老板的原话。
+  await expect(api({ command: 'task.stop', taskId: t.id })).rejects.toThrow('任务当前没有在途执行');
+  expect(await api({ command: 'task.interject', taskId: t.id, text: '列头用中文。' })).toEqual({ ok: true, interrupted: false });
+  const first = await send('execute');
+  expect(first).toStartWith('老板补充（上一轮进行中说的，按这个调整）：\n列头用中文。\n\n给订单列表加导出');
+  // 还没轮到的复核草稿不带；带出一次即算送达，之后的消息不再带。
+  expect((await store.list(t.id, false)).find(m => m.step === 'review')!.body).not.toContain('老板补充');
+
+  // 进行中插话并立即打断：租约收回、任务回到队列、给执行端留下停会话的请求；重派的消息带着这句话，旧的那句不叠。
+  await core.claim(eng, t.id);
+  expect(await api({ command: 'task.interject', taskId: t.id, text: '金额保留两位小数。', interrupt: true })).toEqual({ ok: true, interrupted: true });
+  expect(await stateOf()).toMatchObject({ state: 'ready' });
+  expect((await stateOf()).current_employee).toBeUndefined();
+  expect(await stopFlag()).toMatchObject({ task: t.id });
+  await store.ensureQueuedDrafts([t.id]);
+  const second = await send('execute');
+  expect(second).toStartWith('老板补充（上一轮进行中说的，按这个调整）：\n金额保留两位小数。\n\n给订单列表加导出');
+  expect(second).not.toContain('列头用中文');
+
+  // 暂停：停掉这一轮，并把下一条消息扣住；放行即恢复，恢复的消息不再带已送达的插话。
+  await core.claim(eng, t.id);
+  const paused = await api({ command: 'task.stop', taskId: t.id, hold: true, note: '先等设计稿' });
+  expect(paused).toMatchObject({ ok: true, employee: 'lanes-eng' });
+  expect(await stateOf()).toMatchObject({ state: 'ready' });
+  const held = (await store.list(t.id, false)).find(m => m.step === 'execute')!;
+  expect(held).toMatchObject({ id: paused.heldMessage, hold: true, state: 'held' });
+  expect(await store.prepareSend(t.id, 'execute', 'lanes-eng')).toBeNull();
+  await api({ command: 'message.release', messageId: held.id });
+  expect(await send('execute')).toStartWith('给订单列表加导出');
+  // 员工先交了：复核消息不带插话也不算送达，之后被退回时返工消息带上。
+  const working = await core.claim(eng, t.id);
+  await api({ command: 'task.interject', taskId: t.id, text: '文件名带日期。' });
+  await core.submit(eng, proof(working), evidence());
+  expect(await send('review')).not.toContain('老板补充');
+  await core.returnTask(qa, proof(await core.claim(qa, t.id)), evidence({ text: '【通道回滚】之外的真实退回：第 1 条不成立，下载的文件是空的。' }));
+  await store.ensureQueuedDrafts([t.id]);
+  const rework = await store.prepareSend(t.id, 'rework', 'lanes-eng');
+  expect(rework!.body).toStartWith('老板补充（上一轮进行中说的，按这个调整）：\n文件名带日期。\n\n上一轮被退回');
+  await store.markSent(rework!.message.id, 'lanes-eng', rework!.body);
+
+  // 自定义正文（需求流水线、路线）的草稿不随任务卡重算，插话就地加在最前面；再插一句是换掉那一段，不叠。
+  const custom = await core.createTask(gm, { title: '自定义正文任务', context: '核对计划', requirement: '核对计划', acceptanceText: '计划可执行',
+    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key() } as never);
+  await store.createTaskDrafts(custom.id, 'engineering', 'qa', false, { execute: '先读 notes.md。流水线的自定义正文。', review: '先读 notes.md。流水线的复核正文。' });
+  await api({ command: 'task.interject', taskId: custom.id, text: '只看前两步。' });
+  const draftsOf = async () => await store.list(custom.id, false);
+  expect((await draftsOf()).find(m => m.step === 'execute')!.body).toBe('老板补充（上一轮进行中说的，按这个调整）：\n只看前两步。\n\n先读 notes.md。流水线的自定义正文。');
+  expect((await draftsOf()).find(m => m.step === 'review')!.body).toBe('先读 notes.md。流水线的复核正文。');
+  await api({ command: 'task.interject', taskId: custom.id, text: '第三步先不做。' });
+  expect((await draftsOf()).find(m => m.step === 'execute')!.body).toBe('老板补充（上一轮进行中说的，按这个调整）：\n只看前两步。\n第三步先不做。\n\n先读 notes.md。流水线的自定义正文。');
+  // 暂停一张没人在做的任务：只扣住下一条。
+  expect(await api({ command: 'task.stop', taskId: custom.id, hold: true })).toMatchObject({ ok: false });
+  expect((await draftsOf()).find(m => m.step === 'execute')!.hold).toBe(true);
+
+  // 已结束的任务不能插话。
+  const [audits] = await db.db.query<[Array<{ action: string }>]>("SELECT action, at FROM audit WHERE task = $t AND action IN ['revoked', 'owner_note'] ORDER BY at;", { t: new RecordId('task', t.id) });
+  expect(audits.map(a => a.action)).toEqual(['owner_note', 'owner_note', 'revoked', 'revoked', 'owner_note']);
+  await db.db.query("UPDATE $t SET state = 'done';", { t: new RecordId('task', t.id) });
+  await expect(api({ command: 'task.interject', taskId: t.id, text: '再改一下' })).rejects.toThrow('任务已结束');
+});

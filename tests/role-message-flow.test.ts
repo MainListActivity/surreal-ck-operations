@@ -162,6 +162,7 @@ test('hold refuses to send; sent locks editing; the sent body is the table body'
         row.body = vars.body; row.edited_by = vars.actor;
         return [[row]];
       }
+      if (sql.startsWith('SELECT sent_at FROM outbound_message')) return [[]];
       if (sql.includes('state = ') && sql.includes('sent')) {
         const row = rows.find(r => (r.id as { id: string }).id === (vars.msg as { id: string }).id)!;
         if (!row || row.state === 'sent') return [[]];

@@ -26,7 +26,7 @@ export const OWNER_API_COMMANDS: readonly string[] = [
   'note.activate', 'note.add', 'note.consolidate', 'note.consolidation.undo', 'note.consolidations', 'note.edit', 'note.list', 'note.pin', 'note.preview', 'note.remove', 'notice.list',
   'notice.resolve', 'dispatch.preference', 'progress', 'quota.list', 'reject', 'reply', 'route.disable', 'route.list', 'route.save', 'session.policy', 'status',
   'task.cost', 'task.create', 'task.delete', 'task.detail', 'task.list', 'task.pause', 'task.plan', 'task.reassign',
-  'task.resume', 'task.revoke', 'task.update', 'task.void',
+  'task.interject', 'task.resume', 'task.revoke', 'task.stop', 'task.update', 'task.void',
 ];
 
 export interface GuardRequest {

@@ -76,6 +76,19 @@ async function editRenderedMessage(ctx: OwnerApiContext,
 }
 
 /** Every command is a flat JSON object: { command, ...args }. */
+/**
+ * 收回租约，并给持有它的员工记一个“停掉会话”的请求：老板端碰不到执行端的进程，执行端每轮循环读到请求后停掉正在跑的会话
+ *（runner/dispatch.ts 的 stopRequested）。不记这个请求的话，租约收回了，会话还会跑到自己结束。
+ */
+async function stopTask(ctx: OwnerApiContext, db: import('surrealdb').Surreal, taskId: string, note: string, actor: string): Promise<{ ok: boolean; employee?: string }> {
+  const result = await ctx.workforce.revokeTaskLease(taskId, note, '【交接包】老板终止了上一棒的在途执行。', actor);
+  if (result.ok && result.employee) {
+    await db.query('UPDATE $employee SET stop_requested = { task: $task, at: time::now() };', { employee: new RecordId('employee', result.employee), task: taskId })
+      .catch(error => console.warn(`stop request not recorded for ${result.employee}: ${(error as Error).message}`));
+  }
+  return result;
+}
+
 /** 一张任务各轮的动作记录，按开始时间排。只带动作与状态，不带输出文本。 */
 export async function taskTurns(db: import('surrealdb').Surreal, taskId: string): Promise<Array<{ employee: string; runtime: string; state: string; startedAt: number; lastActivityAt: number;
   actions: AgentAction[]; actionsDropped?: number }>> {
@@ -242,8 +255,23 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       reviewerRole: optionalText(input.reviewerRole) as Role | 'owner' | undefined,
       note: text(input.note, 'note'), source: a, key: key() });
     case 'task.void': return ctx.owner.retire({ taskId: text(input.taskId, 'taskId'), note: text(input.note, 'note', 2), source: a, key: key() });
-    case 'task.revoke': return ctx.workforce.revokeTaskLease(text(input.taskId, 'taskId'), text(input.note ?? '老板终止在途执行', 'note'),
-      '【交接包】老板终止了上一棒的在途执行。', a);
+    case 'task.revoke': return stopTask(ctx, db, text(input.taskId, 'taskId'), text(input.note ?? '老板终止在途执行', 'note'), a);
+    // 中止这一轮：收回租约并让执行端停掉正在跑的会话；任务回到队列，下一次派工带上交接。hold=true 即暂停：下一条消息先扣住，放行才继续。
+    case 'task.stop': {
+      const taskId = text(input.taskId, 'taskId');
+      // 暂停先扣住下一条消息再收回租约：反过来的话，两步之间的一次派工循环会把任务不带扣住地重新派出去。
+      const held = input.hold === true ? (await ctx.messages.holdNext(taskId, a)).id : undefined;
+      const stopped = await stopTask(ctx, db, taskId, text(input.note ?? (input.hold === true ? '老板暂停了任务' : '老板中止了这一轮'), 'note'), a);
+      if (!stopped.ok && input.hold !== true) throw new CompanyError('conflict', '任务当前没有在途执行');
+      return { ...stopped, ...(held ? { heldMessage: held } : {}) };
+    }
+    // 插话：老板的话随这张任务的下一条消息带给员工。interrupt=true 时同时中止这一轮，带着这句话立刻重派。
+    case 'task.interject': {
+      const taskId = text(input.taskId, 'taskId');
+      await ctx.messages.addNote(taskId, text(input.text, 'text', 2, 4000), a);
+      const stopped = input.interrupt === true ? await stopTask(ctx, db, taskId, '老板插话并要求立即按新要求重做', a) : { ok: false };
+      return { ok: true, interrupted: stopped.ok };
+    }
     case 'task.pause': await ctx.owner.setPaused(true); return { paused: true };
     case 'task.resume': await ctx.owner.setPaused(false); return { paused: false };
     case 'task.cost': {

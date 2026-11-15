@@ -82,6 +82,7 @@
 - 0.13.16 起：退回或老板驳回的完工分析写进返工消息（`attachAnalysis`）：草稿上的 `analysis_source` 记下已按哪次退回定过，`analysis_lead` 存加进去的原文。把握不足时同一次更新里扣住草稿，只扣一次；扣不了就不写。返工消息最多等分析 4 分钟（`awaitingAnalysis`：按库的时钟、分析失败过一次或 `company_meta:analysis` 心跳超过 3 分钟就不等）。同一轮重派照上次发出的来。复核消息与恢复受阻的消息不加分析：复核要独立，受阻的分析写在老板答复之前，以老板答复为准。
 - 0.13.18 起：消息链预排（`src/message-chain.ts`，命令 `message.chains`）。只读，按任务链的父子关系和需求流水线的规划，把已发、待发和后续步骤的消息排成一列。流水线后面的步骤还没有任务：消息由 `iterationStep` 提前算出（建任务用的同一个函数，未知的任务编号写成 `{前置任务}`、`{实施任务}` 占位），老板的提前安排存 `planned_message`（命令 `message.plan`），`createIterationTask` 在草稿刚建出时套用。返工与催办不预建：第二轮扣住与完工分析都依赖它们在触发时才生成。
 - 0.13.20 起：统一动作流。`agent_activity` 的每轮记录多了 `actions`（一行一个动作，`actionSummary`：命令、读写改文件、搜索、网址、子任务；上限 200 条，保留 7 天）。原生执行端由 `ActivityCollector` 收集，通道的 `lane_status` 也算动作；Paseo 里运行的员工由 `src/runner/paseo-activity.ts` 从时间线投影。老板定的深度是“每个工具动作一行脱敏摘要，推理过程不存”：文件内容、编辑文本、命令输出不进库。任务详情用 `taskTurns` 读。
+- 0.13.21 起：运行中控制。老板端碰不到执行端的进程，所以中止分两半：`owner-api` 的 `stopTask` 收回租约并在 `employee.stop_requested` 记一个请求，执行端每轮循环的 `stopRequested`（`src/runner/dispatch.ts`）停掉会话、清掉本机领取残留；那位员工已领了新任务就只清请求不停。暂停是“先 `holdNext` 扣住下一条消息，再中止”，顺序不能反。插话是审计动作 `owner_note`：`promptTask` 把最近一次执行或返工消息发出之后的插话放进 `notes`，`ownerLead` 把它和对受阻的答复一起放在消息最前面；自定义正文由 `attachOwnerLead` 就地换。云端与网页通道中止只停本机桥接进程。
 - `renderMessage` 把 `notes.md` 补成绝对路径。
 - 控制台新增“线的笔记”页：按线浏览、编辑、置顶、删除，并显示待生效条目。任务抽屉里显示这个任务的会话将读到的笔记。
 
