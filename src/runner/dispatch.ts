@@ -1,5 +1,6 @@
 import { createHostSampler, writeHostTelemetry, writeRuntimeObservation } from './telemetry.ts';
 import { writeAgentActivity, expireAgentActivity } from './activity-store.ts';
+import { paseoActivities } from './paseo-activity.ts';
 import { reconcileIterations, createIterationTask } from '../iteration/execution.ts';
 import { DispatchTimings } from "../diagnostics.ts";
 import { RUNNER_BEAT_MS, writeBoardView, writeRunnerHeartbeat } from "../board.ts";
@@ -350,7 +351,8 @@ function beatRunner(): void {
         await Promise.all([...agents.values()].map(a => writeRuntimeObservation(ctx.db.db, a.id, a.status, observedAt, a.model)));
       } catch { console.warn('agent telemetry unavailable'); }
       try {
-        const activities = ctx.runtime.activity?.() ?? [];
+        // 原生执行端自己收集动作流；Paseo 里运行的员工从 Paseo 的时间线投影。
+        const activities = ctx.runtime.activity?.() ?? (ctx.native ? [] : await paseoActivities(ctx.db.db, currentHost()));
         const saved = await writeAgentActivity(ctx.db.db, ctx.runnerId ?? `plugin:${process.pid}`, activities);
         for (const a of saved) ctx.runtime.acknowledgeActivity?.(a.agent, a.turn);
         await expireAgentActivity(ctx.db.db);

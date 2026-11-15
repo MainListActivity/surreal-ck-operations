@@ -26,6 +26,7 @@ import { readTaskCost, COST_LIST_SQL } from './task-cost.ts';
 import { QUOTA_ROWS } from './dispatcher/quota-store.ts';
 import { hostIOOrUndefined } from './host-io.ts';
 import { planMessage, readMessageChains } from './message-chain.ts';
+import type { AgentAction, AgentActivity } from './agent-activity.ts';
 
 export type OwnerVia = string;
 export interface OwnerApiContext { db: CompanyDatabase; core: CompanyCore & {
@@ -75,6 +76,19 @@ async function editRenderedMessage(ctx: OwnerApiContext,
 }
 
 /** Every command is a flat JSON object: { command, ...args }. */
+/** 一张任务各轮的动作记录，按开始时间排。只带动作与状态，不带输出文本。 */
+export async function taskTurns(db: import('surrealdb').Surreal, taskId: string): Promise<Array<{ employee: string; runtime: string; state: string; startedAt: number; lastActivityAt: number;
+  actions: AgentAction[]; actionsDropped?: number }>> {
+  const [rows] = await db.query<[Array<{ employee?: string; activity?: Partial<AgentActivity> }>]>(
+    'SELECT employee, activity FROM agent_activity WHERE task = $task AND expires_at > time::now() LIMIT 100;', { task: new RecordId('task', taskId) });
+  return (rows ?? []).filter(row => row.activity).map(row => ({
+    employee: String(row.employee ?? ''), runtime: String(row.activity!.runtime ?? 'native'), state: String(row.activity!.state ?? ''),
+    startedAt: Number(row.activity!.startedAt ?? 0), lastActivityAt: Number(row.activity!.lastActivityAt ?? 0),
+    actions: Array.isArray(row.activity!.actions) ? row.activity!.actions : [],
+    ...(row.activity!.actionsDropped ? { actionsDropped: row.activity!.actionsDropped } : {}),
+  })).sort((a, b) => a.startedAt - b.startedAt);
+}
+
 export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unknown>, via: OwnerVia): Promise<unknown> {
   const command = String(input.command ?? '');
   if (RUNNER_ONLY_COMMANDS.has(command) && hostIOOrUndefined() === undefined) {
@@ -217,7 +231,9 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
         (audit ?? []) as Array<{ id?: unknown; evidence?: unknown; action?: unknown }>, await ownerLangOf(db)));
       // 完工分析（审计编号 → 分析）：只展示，不参与派工。
       const analyses = await turnAnalysesOf(db, (audit ?? []) as Array<{ id?: unknown }>).catch(() => ({}));
-      return { task: rows[0], audit, messages, translations, analyses };
+      // 动作记录：每一轮里员工做了什么（一行一个动作），保留 7 天。读不出不影响任务详情。
+      const turns = await taskTurns(db, taskId).catch(() => []);
+      return { task: rows[0], audit, messages, translations, analyses, turns };
     }
     case 'progress': return readProgress(db);
     case 'task.list': { const [rows] = await db.query<[unknown[]]>('SELECT * FROM task ORDER BY created_at DESC LIMIT 300;'); return { tasks: rows }; }
