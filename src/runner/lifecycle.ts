@@ -30,6 +30,10 @@ export interface ExecutionAttempt {
   tries: number;
   nextRetry: number;
   error?: string;
+  /** When the first CI wait of this result began. A wait past the executor's limit blocks the result instead of retrying forever. */
+  ciWaitSince?: number;
+  /** The last refusal text the core gave for this result; it is carried into the block reason when the result is blocked. */
+  lastRefusal?: string;
   at: number;
 }
 const key = (value: string) => createHash('sha256').update(value).digest('hex');

@@ -39,6 +39,7 @@ const CODE_OF: Readonly<Record<string, ApiErrorCode>> = {
   temporarily_unavailable: 'unavailable',
   not_configured: 'unavailable',
   unavailable: 'unavailable',
+  ci_pending: 'unavailable',
   upstream_error: 'upstream_error',
 };
 

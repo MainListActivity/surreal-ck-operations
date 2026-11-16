@@ -1,7 +1,11 @@
 export type CompanyErrorCode =
   'unauthorized' | 'forbidden' | 'not_found' | 'conflict' | 'invalid' |
   'worktree_busy' | 'already_claimed' | 'lease_expired' | 'self_review' | 'temporarily_unavailable' | 'checkpoint_limit' |
-  'not_configured' | 'unavailable' | 'payment_approval_required' | 'upstream_error' | 'login_failed' | 'limit_reached' | 'response_too_large' | 'snapshot_gone' | 'retire_refused';
+  'not_configured' | 'unavailable' | 'payment_approval_required' | 'upstream_error' | 'login_failed' | 'limit_reached' | 'response_too_large' | 'snapshot_gone' | 'retire_refused' |
+  // A submit waits on CI that has not finished (queued, running, or not started yet): a normal wait, retryable.
+  'ci_pending' |
+  // CI ran for the submitted sha and no run succeeded: the work cannot be verified as it stands.
+  'ci_failed';
 
 /**
  * 全部公司错误码的运行时列表。执行端把作业失败写成 `${code}: ${message}`，网关与老板端据此还原错误类别，
@@ -11,6 +15,7 @@ export const CORE_ERROR_CODES = [
   'unauthorized', 'forbidden', 'not_found', 'conflict', 'invalid', 'worktree_busy', 'already_claimed', 'lease_expired',
   'self_review', 'temporarily_unavailable', 'checkpoint_limit', 'not_configured', 'unavailable', 'payment_approval_required',
   'upstream_error', 'login_failed', 'limit_reached', 'response_too_large', 'snapshot_gone', 'retire_refused',
+  'ci_pending', 'ci_failed',
 ] as const satisfies readonly CompanyErrorCode[];
 
 /** 编译期检查：联合类型里的每个码都在上面的列表里；少列一个，这一行就是类型错误。 */
