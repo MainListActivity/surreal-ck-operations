@@ -8,6 +8,7 @@ import { laneDigest, readInflight, readLaneState, writeLaneState } from '../src/
 import { julesUsageCount, julesUsageEntry, whamToUsageEntry } from '../src/runner/cloud-lane/quota.ts';
 import { recordJulesUsage } from '../src/runner/cloud-lane/jules.ts';
 import type { ExecResult } from '../src/runner/cloud-lane/repo.ts';
+import { egoBrowse } from '../src/runner/grok-bot/main.ts';
 
 type Call = { cmd: string; args: string[]; cwd?: string };
 type Route = (call: Call) => ExecResult | undefined;
@@ -451,6 +452,31 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(b.calls).toHaveLength(0);
     expect(readLaneState(w.commDir)?.taskId).toBe('SCK-old-marker');
     expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'push')).toHaveLength(0);
+  });
+
+  test('发送中途进程中断（attempt 残留、没有 taskId）后换 prompt → 受阻，不另建会话，attempt 保留', async () => {
+    const w = world({ extra: gitOk });
+    writeLaneState(w.commDir, { sessionId: 'lane-1', digest: 'old-digest', devin: { attempt: 'SCK-old-marker', attemptAt: Date.now() },
+      branch: 'sck/task-1' });
+    const b = devinBrowse({ send: [{ ok: true, url: SESSION }], session: [idleDone('完成。\nPR: https://github.com/acme/widget/pull/9')] });
+    const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1 } }), { ...w.deps, browse: b.browse });
+    expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+    expect(b.calls).toHaveLength(0);
+    expect(readLaneState(w.commDir)?.devin?.attempt).toBe('SCK-old-marker');
+  });
+
+  test('egoBrowse：超时被杀但已打出按下标记 → pressed；静默退出且无标记 → undefined（未按下）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sck-ego-fake-'));
+    dirs.push(dir);
+    const pressed = join(dir, 'ego-pressed');
+    writeFileSync(pressed, '#!/bin/sh\necho __PRESSED__\nexec sleep 30\n');
+    chmodSync(pressed, 0o755);
+    // 超时要给 sh 足够的启动时间，让它先打出按下标记再被杀（启动慢于超时时输出还没到，那时本来就无从判断）。
+    expect(await egoBrowse(pressed)('x', 1_500)).toEqual({ ok: false, code: 'pressed' });
+    const silent = join(dir, 'ego-silent');
+    writeFileSync(silent, '#!/bin/sh\nexit 1\n');
+    chmodSync(silent, 0o755);
+    expect(await egoBrowse(silent)('x', 5_000)).toBeUndefined();
   });
 
   test('超时后同一轮只回执核对不重发：状态留在途，下轮直接轮询原会话', async () => {
