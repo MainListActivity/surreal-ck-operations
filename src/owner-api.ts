@@ -10,7 +10,7 @@ import { readProgress } from './task-progress.ts';
 import { randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import { OwnerDesk } from './owner.ts';
+import { OwnerDesk, withSessionCheck } from './owner.ts';
 import type { CompanyCore } from './contracts.ts';
 import { preferredProviderValue, Workforce } from './workforce.ts';
 import { lanePreferenceValue } from './dispatcher/lane-preference.ts';
@@ -101,6 +101,25 @@ export async function taskTurns(db: import('surrealdb').Surreal, taskId: string)
     actions: Array.isArray(row.activity!.actions) ? row.activity!.actions : [],
     ...(row.activity!.actionsDropped ? { actionsDropped: row.activity!.actionsDropped } : {}),
   })).sort((a, b) => a.startedAt - b.startedAt);
+}
+
+/**
+ * One task as the owner reads it: the row, its audit and messages, and what the board needs to show them. A missing row is not_found
+ * here; withSessionCheck decides whether that absence can be trusted.
+ */
+async function taskDetail(db: import('surrealdb').Surreal, taskId: string): Promise<unknown> {
+  const [rows] = await db.query<[Array<Record<string, unknown>>]>('SELECT * FROM $task;', { task: new RecordId('task', taskId) });
+  if (!rows?.length) throw new CompanyError('not_found', 'task not found');
+  const [audit] = await db.query<[unknown[]]>('SELECT * FROM audit WHERE task = $task ORDER BY at;', { task: new RecordId('task', taskId) });
+  const [messages] = await db.query<[unknown[]]>('SELECT * FROM outbound_message WHERE task = $task ORDER BY created_at;', { task: new RecordId('task', taskId) });
+  // 员工回报的译文（audit 编号 → 老板常用语言的译文）；没有译文的回报照原文显示。
+  const translations = Object.fromEntries(await replyTranslationsOf(db,
+    (audit ?? []) as Array<{ id?: unknown; evidence?: unknown; action?: unknown }>, await ownerLangOf(db)));
+  // 完工分析（审计编号 → 分析）：只展示，不参与派工。
+  const analyses = await turnAnalysesOf(db, (audit ?? []) as Array<{ id?: unknown }>).catch(() => ({}));
+  // 动作记录：每一轮里员工做了什么（一行一个动作），保留 7 天。读不出不影响任务详情。
+  const turns = await taskTurns(db, taskId).catch(() => []);
+  return { task: rows[0], audit, messages, translations, analyses, turns };
 }
 
 export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unknown>, via: OwnerVia): Promise<unknown> {
@@ -236,18 +255,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     case 'task.delete': return ctx.owner.retire({ taskId: text(input.taskId, 'taskId'), note: text(input.note, 'note', 2), source: a, key: key() });
     case 'task.detail': {
       const taskId = text(input.taskId, 'taskId');
-      const [rows] = await db.query<[Array<Record<string, unknown>>]>('SELECT * FROM $task;', { task: new RecordId('task', taskId) });
-      if (!rows?.length) throw new CompanyError('not_found', 'task not found');
-      const [audit] = await db.query<[unknown[]]>('SELECT * FROM audit WHERE task = $task ORDER BY at;', { task: new RecordId('task', taskId) });
-      const [messages] = await db.query<[unknown[]]>('SELECT * FROM outbound_message WHERE task = $task ORDER BY created_at;', { task: new RecordId('task', taskId) });
-      // 员工回报的译文（audit 编号 → 老板常用语言的译文）；没有译文的回报照原文显示。
-      const translations = Object.fromEntries(await replyTranslationsOf(db,
-        (audit ?? []) as Array<{ id?: unknown; evidence?: unknown; action?: unknown }>, await ownerLangOf(db)));
-      // 完工分析（审计编号 → 分析）：只展示，不参与派工。
-      const analyses = await turnAnalysesOf(db, (audit ?? []) as Array<{ id?: unknown }>).catch(() => ({}));
-      // 动作记录：每一轮里员工做了什么（一行一个动作），保留 7 天。读不出不影响任务详情。
-      const turns = await taskTurns(db, taskId).catch(() => []);
-      return { task: rows[0], audit, messages, translations, analyses, turns };
+      return withSessionCheck(ctx.db, () => taskDetail(db, taskId));
     }
     case 'progress': return readProgress(db);
     case 'task.list': { const [rows] = await db.query<[unknown[]]>('SELECT * FROM task ORDER BY created_at DESC LIMIT 300;'); return { tasks: rows }; }
