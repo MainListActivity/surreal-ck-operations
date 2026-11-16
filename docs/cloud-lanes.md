@@ -62,7 +62,7 @@
 - 云端 agent 读不到本机文件也调不了 `sck`。0.13.19 起发给它的正文就是派工消息（老板在派工消息页看到、改过的那条，`laneMessage`）：消息里指向的文件路径换成“下文《…》”，文件内容附在后面（笔记、最新的 `findings/round-NN.md`、较长的老板答复、复核轮的 `task.md`）；工作目录行和公司命令的指引不带。退回意见按文件取、返工轮一定附上，不看派工消息的措辞；正文不是三段式时整份 `task.md` 也附上；没有派工消息时退回到整份任务材料。网页通道（Grok Bot、muse-web）同样。Devin 云模式固定 `--model free`：`lanes.devin-cloud.model` 只能缺省或写 `free`，其它值（含空白、空串）在 `validateLanes` 配置校验时拒绝；执行入口（`driveDevin`）在推送分支、发会话之前再校验一次，所以绕过配置也不会发出非 free 的云端会话，失败也不回退到账号默认或其它模型。这条约束只适用于 devin-cloud，本地 Devin/Paseo 的模型名不受它限制。复核轮（task.md 含「## 待复核成果」）要求只读复核，最终答复首行必须是「复核结论：通过/退回」，缺了按错误回合处理。
 - 代码任务要求 cwd 是关联 GitHub origin 的工作树；任务分支缺远端时先推送。非代码任务或仓库未映射 → 回合按「工作结果：受阻」收尾（成功回合，不记供应商故障）。
 - **codex-cloud**：`codex cloud exec --env <环境> --branch <分支>` → `codex cloud status` 轮询 → READY 后 `codex cloud apply` 到本地、`git add -A`、提交「<任务标题> (Codex Cloud <id>)」、推送、`gh pr list/create` 保证有 PR；空 diff 按受阻收尾。Codex Cloud 的最终消息 CLI 取不到：复核轮要求供应商把结论写进 `.sck/review.md`，桥接从 `codex cloud diff` 的补丁行提取。
-- **devin-cloud**：`devin --cloud --model free -p --prompt-file` 同步等待答复（模型只能是 free，见上）；prompt 要求在 `<owner>/<repo>` 的分支上工作、推送、开/更新 PR 并以 `PR:`/`SHA:` 行结尾；随后 `git fetch + git merge --ff-only FETCH_HEAD`，非快进只报错不 reset。
+- **devin-cloud**：`devin --cloud --model free -p --prompt-file` 同步等待答复（模型只能是 free，配置校验与执行入口都拒绝其它值）；prompt 要求在 `<owner>/<repo>` 的分支上工作、推送、开/更新 PR 并以 `PR:`/`SHA:` 行结尾；随后 `git fetch + git merge --ff-only FETCH_HEAD`，非快进只报错不 reset。
 - **jules**：REST 会话状态机 QUEUED/PLANNING/IN_PROGRESS → COMPLETED/FAILED；`AWAITING_USER_FEEDBACK`/`AWAITING_PLAN_APPROVAL` 按受阻收尾并把 Jules 的问题带回来；续轮 `:sendMessage` 复用同一会话。
 - **幂等**：提交前把云端任务 ID、prompt 摘要、分支原子写入 `$SCK_COMM_DIR/.lane/state.json`；同摘要重启重连轮询不重复提交。提交结果不明绝不重发，报错误回合并带任务 ID/URL。
 - **超时**：`lanes.<provider>.maxMinutes`（默认 180 分钟），约 25 秒轮询一次；超时按错误回合处理，文案说明云端任务可能仍在运行。
