@@ -14,9 +14,10 @@ import { OwnerDesk } from '../src/owner.ts';
 // 不用 invalidate() 或客户端计时代替：
 //   1. 令牌 exp 先到、续期被拒：服务端把会话降为匿名。允许访客的服务端上，读表为空、INFO FOR DB 报 IAM 错误，
 //      这正是生产日志里的形态。撤销身份的时刻晚于 exp 约 0.2 至 0.6 秒（有抖动），测试等它真的撤销后才回复。
-//      回复报“暂时不可用”（可重试），不报“任务不存在”，且不写入。身份恢复后同一回复落地一次。
-//   2. 服务端会话到期（DURATION FOR SESSION 4s，令牌 600 秒）：到期后明确报 “The session has expired”，不是空读。
-//      回复重建会话后同一答复落地一次。
+//      到期前先断言身份、读与写都正常。回复报“暂时不可用”（可重试），不报“任务不存在”，且不写入。
+//      身份恢复后同一回复落地一次。
+//   2. 服务端会话到期（DURATION FOR SESSION 4s，令牌 600 秒）：到期前先断言身份、读与写都正常。到期后明确报
+//      “The session has expired”，不是空读；拒绝以服务端返回为准，应出现在连接后约 4 秒。回复重建会话后同一答复落地一次。
 //   3. 会话健康、任务确实不存在：报“任务不存在”，且不重建会话。
 // fork 以 --allow-guests 启动：生产日志里只见 “IAM error: Not enough permissions”，从未见 “Anonymous access not allowed”，
 // 与允许访客一致（由日志推断，生产配置未直接核实）。身份服务是本地 Bun.serve，签发 HS512 替身令牌（与
@@ -127,6 +128,22 @@ async function untilRefused(db: CompanyDatabase, refusal: RegExp, timeoutMs: num
   }
 }
 
+/**
+ * 到期前的断言：会话仍有身份（INFO FOR DB 成功）、能读到 readId 这条任务、回复能写入 writeId 这条任务并落库。
+ * 三项都须在 beforeMs（令牌或会话的到期时刻）之前完成；超过即失败，不把到期后的结果当作到期前的证据。
+ */
+async function expectUsableBefore(db: CompanyDatabase, readId: string, writeId: string, beforeMs: number): Promise<void> {
+  expect(Date.now()).toBeLessThan(beforeMs);
+  expect(await rawOutcome(db, 'INFO FOR DB;')).toEqual({ rows: expect.anything() });
+  expect(await rawOutcome(db, 'SELECT * FROM $task;', { task: new RecordId('task', readId) }))
+    .toEqual({ rows: [expect.objectContaining({ state: 'blocked', version: 3 })] });
+  const landed = await ownerApi(contextOf(db), { command: 'reply', taskId: writeId, note: NOTE, idempotencyKey: key() }, 'owner-cli');
+  expect(landed).toMatchObject({ state: 'doing', version: 4 });
+  expect(await stored(writeId)).toMatchObject({ state: 'doing', version: 4 });
+  expect(await ownerReplies(writeId)).toHaveLength(1);
+  expect(Date.now()).toBeLessThan(beforeMs);
+}
+
 /** 拦截 console 输出，记录会话探测与重建的日志；restore 还原。 */
 function captureConsole(): { messages: string[]; restore: () => void } {
   const messages: string[] = [];
@@ -211,8 +228,11 @@ run('令牌到期且续期被拒：会话失去身份，回复报暂时不可用
   try {
     await db.connect();
     const inUseExpMs = lastExpMs;
-    const taskId = await seed('blocked');
     idpDown = true;
+    const taskId = await seed('blocked');
+    const earlyId = await seed('blocked');
+    // 到期前：身份、读、写都正常。写入的是另一条任务 earlyId，taskId 留给下面的失效用例。
+    await expectUsableBefore(db, taskId, earlyId, inUseExpMs);
 
     // 服务端把过期令牌的会话降为匿名：等它真的撤销（晚于 exp）。读表为空，INFO FOR DB 报 IAM 错误（与生产日志同一形态）。
     const lostAt = await untilRefused(db, /Not enough permissions/, 10_000);
@@ -247,16 +267,25 @@ run('令牌到期且续期被拒：会话失去身份，回复报暂时不可用
   }
 });
 
-run('服务端会话到期（DURATION FOR SESSION 4s，令牌 600 秒）：到期后明确报会话已过期；回复重建会话后落地一次，不报任务不存在', async () => {
+run('服务端会话到期（DURATION FOR SESSION 4s，令牌 600 秒）：到期前身份、读与写正常；到期后明确报会话已过期，拒绝约在连接后 4 秒；回复重建会话后落地一次，不报任务不存在', async () => {
   idpAccess = 'runner_short';
   lifetimeSec = 600;
   const db = cloudDb();
   const logs = captureConsole();
   try {
+    const connectStart = Date.now();
     await db.connect();
     const taskId = await seed('blocked');
-    // 服务端在 4 秒后结束会话（令牌仍然有效）：等到期真的发生。到期是明确的错误，不是空读。
-    await untilRefused(db, /session has expired/, 15_000);
+    const earlyId = await seed('blocked');
+    // 会话自登录起 4 秒到期（令牌仍然有效）。在到期前约 2 秒检查身份、读与写，且检查须在连接后 3 秒内完成。
+    await delay(Math.max(0, connectStart + 2000 - Date.now()));
+    await expectUsableBefore(db, taskId, earlyId, connectStart + 3000);
+
+    // 拒绝以服务端返回为准：到期是明确的错误，不是空读，也不由客户端配置推算。服务端撤销会话有约 1 秒的抖动（实测在连接后
+    // 4 至 5 秒之间），窗口取 3.5 至 6 秒：早于它说明会话提前失效，晚于它说明会话没有按 4 秒到期。
+    const refusedAt = await untilRefused(db, /session has expired/, 15_000);
+    expect(refusedAt - connectStart).toBeGreaterThanOrEqual(3500);
+    expect(refusedAt - connectStart).toBeLessThanOrEqual(6000);
     expect(await rawOutcome(db, 'INFO FOR DB;')).toMatchObject({ thrown: expect.stringContaining('The session has expired') });
 
     const landed = await ownerApi(contextOf(db), { command: 'reply', taskId, note: NOTE }, 'owner-cli');
