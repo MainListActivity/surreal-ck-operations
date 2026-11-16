@@ -54,6 +54,8 @@ try {
     'tests/session-history.test.ts', 'tests/factory-queue.test.ts', 'tests/dispatcher-sidecar.test.ts', 'tests/sidecar.test.ts', 'tests/sidecar-quota-gate.fork.test.ts',
     'tests/sidecar-late-lease.test.ts', 'tests/worktrees.test.ts',
     'tests/owner-aging.fork.test.ts', 'tests/story-author.fork.test.ts', 'tests/cinematography.fork.test.ts', 'tests/owner-reassign.fork.test.ts', 'tests/pr-gate.fork.test.ts', 'tests/owner-commands.fork.test.ts',
+    // 老板回复受阻任务：经真实接口与 OwnerDesk 事务；会话失去身份后恢复或明确暂时不可用，不把权限失败报成任务不存在（自建隔离库，RUN_SCK_OWNER_REPLY_TESTS）。
+    'tests/owner-reply.fork.test.ts',
     'tests/query-paging.integration.test.ts', 'tests/acceptance-gate.fork.test.ts',
     'tests/deployment-source.fork.test.ts',
     'tests/input-bounds.integration.test.ts',

@@ -14,6 +14,7 @@ import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { Workforce } from '../src/workforce.ts';
 import type { AcceptanceSourceAdapter, AcceptanceSourceInput, AcceptanceVerifyResult } from '../src/acceptance.ts';
 import type { ClaimResult, TaskView } from '../src/contracts.ts';
+import { CompanyError } from '../src/core-errors.ts';
 
 setDefaultTimeout(120_000);
 const fork = process.env.RUN_SCK_WORKTREE_FORK_TESTS === '1' ? test : test.skip;
@@ -41,9 +42,11 @@ class FakeAdapter implements AcceptanceSourceAdapter {
 }
 const adapter = new FakeAdapter();
 let listed: string[] = [];
+let listedWaiting = 0;
+let listedFailed: string[] = [];
 let listedCalls: Array<{ slug: string; sha: string }> = [];
 const core = new SurrealCompanyCore(database, { acceptance: {
-  adapter, runs: async (slug, sha) => { listedCalls.push({ slug, sha }); return listed; } } });
+  adapter, runs: async (slug, sha) => { listedCalls.push({ slug, sha }); return { success: listed, waiting: listedWaiting, failed: listedFailed }; } } });
 const proofOf = (c: ClaimResult) => ({ taskId: c.task.id, deliveryId: c.deliveryId, fence: c.fence, expectedVersion: c.task.version });
 const machine = (id: string) => ({ id, kind: 'machine' as const, required: true, layer: 'ci' as const, evidence: 'ci-run' as const, verify: 'ci' as const, risk: 'code' as const });
 
@@ -65,6 +68,7 @@ beforeEach(async () => {
   await database.db.query('UPDATE employee SET active_task = NONE;');
   adapter.runs.clear(); adapter.runs.set('11', { ok: true });
   listed = ['https://github.com/MainListActivity/sha-fixture/actions/runs/11'];
+  listedWaiting = 0; listedFailed = [];
   listedCalls = [];
   const gate = await core.acceptanceGate(tokens.owner);
   if (!gate.enabled) await core.setAcceptanceGate(tokens.owner, { enabled: true, reason: 'sha 测试启用门禁', expectedVersion: gate.version, idempotencyKey: key() });
@@ -83,6 +87,28 @@ fork('submit sha: a successful completed run records evidence for every required
   const [rows] = await database.db.query<[Array<{ ac_id: string; sha: string }>]>('SELECT ac_id, sha FROM acceptance_evidence WHERE task = $t;', { t: new RecordId('task', task.id) });
   expect(rows.map(r => r.ac_id).sort()).toEqual(['AC-CI-1', 'AC-CI-2']);
   expect(rows.every(r => r.sha === SHA)).toBe(true);
+});
+
+fork('submit sha: CI still running is a typed wait (ci_pending); CI that finished without success is ci_failed; a later green CI submits to review', async () => {
+  const task = await codeTask();
+  const claim = await core.claim(tokens['eng-a'], task.id);
+  const refusal = async (text: string) => {
+    try { await core.submit(tokens['eng-a'], proofOf(claim), { text, sha: SHA, idempotencyKey: key() }); }
+    catch (error) { return error as CompanyError; }
+    throw new Error('submit must reject');
+  };
+  listed = []; listedWaiting = 1;
+  const waiting = await refusal('CI 仍在排队或运行中，提交应返回可识别的等待，而不是泛化的校验失败。');
+  expect(waiting.code).toBe('ci_pending'); expect(waiting.retryable).toBe(true);
+  expect(waiting.message).toContain('GitHub Actions run');
+  listedWaiting = 0; listedFailed = ['https://github.com/MainListActivity/sha-fixture/actions/runs/44'];
+  const failed = await refusal('CI 已完成但失败，提交应返回 ci_failed 并给出失败的 run。');
+  expect(failed.code).toBe('ci_failed'); expect(failed.retryable).toBe(false);
+  expect(failed.message).toContain('runs/44');
+  expect((await core.getTask(tokens['eng-a'], task.id)).state).toBe('doing');
+  listedFailed = []; listed = ['https://github.com/MainListActivity/sha-fixture/actions/runs/11'];
+  const submitted = await core.submit(tokens['eng-a'], proofOf(claim), { text: 'CI 通过后同一提交送审，只进入一次复核。', sha: SHA, idempotencyKey: key() });
+  expect(submitted.state).toBe('review');
 });
 
 fork('submit sha: no run, unfinished run or a failed run is rejected with the reason; manual record_acceptance_evidence still works', async () => {

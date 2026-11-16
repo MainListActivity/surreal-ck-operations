@@ -48,14 +48,73 @@ const briefDispatch = (verdicts: DispatchVerdict[]): BriefData['dispatchBlocked'
   return { total: list.bound.total, rows: list.items };
 };
 
+type DecideInput = { taskId: TaskId; decision: OwnerDecision; note: string; source: string; key: string; expectedVersion?: number };
+/** What a desk writes through. A bare owner-end session cannot rebuild itself, so only a CompanyDatabase offers `ensureConnected`. */
+type DeskDatabase = Pick<CompanyDatabase, 'db'> & Partial<Pick<CompanyDatabase, 'ensureConnected'>>;
+
+/** The database's refusal for a session without an identity: its token ran out, its session ended, or it fell back to anonymous. */
+const SESSION_DENIED = /not enough permissions|anonymous access not allowed|session has expired|iam error/i;
+
+/**
+ * Failures a session without its identity produces: the rows it may not see read as absent (not_found), and its other reads and
+ * writes are refused with the database's IAM or expiry error. Only these are checked against the session; any other failure is
+ * reported as it is.
+ */
+const sessionRefusal = (error: unknown): boolean => error instanceof CompanyError
+  ? error.code === 'not_found' || error.code === 'temporarily_unavailable'
+  : error instanceof Error && SESSION_DENIED.test(error.message);
+
+/** The message keeps its code first: the owner API maps HTTP status by the text, and a retryable refusal must read as 409. */
+const SESSION_RETRY = 'temporarily_unavailable: owner session cannot read the database; retry shortly';
+/** A session that may read but not write sees its update as nothing. That is a permission failure, not a missing task. */
+const WRITE_REFUSED = 'forbidden: owner session may not write the task; the database refused the update';
+
+/** Rejects when the work does not settle in time, so a dead socket cannot hold an owner's reply. */
+const bounded = <T>(work: Promise<T>, ms: number): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('owner session probe timed out')), ms); });
+  return Promise.race([work, expired]).finally(() => clearTimeout(timer));
+};
+
 export class OwnerDesk {
-  constructor(private readonly database: CompanyDatabase, private readonly opsRepo?: string) {
+  constructor(private readonly database: DeskDatabase, private readonly opsRepo?: string) {
   }
   private get db() { return this.database.db; }
 
 
   /** approve/reject an owner-reviewed gate, or reply to a task blocked to the owner. */
-  async decide(input: { taskId: TaskId; decision: OwnerDecision; note: string; source: string; key: string; expectedVersion?:number }): Promise<TaskView> {
+  async decide(input: DecideInput): Promise<TaskView> {
+    try {
+      return await this.decideOnce(input);
+    } catch (error) {
+      if (!sessionRefusal(error) || await this.sessionReadable()) throw error;
+      // The session cannot read the database, so the task may only look missing. Rebuild the connection when this desk owns one,
+      // then decide once more. A failed transaction wrote nothing, and the idempotency key still guards a repeat.
+      await this.database.ensureConnected?.().catch(() => undefined);
+      try {
+        return await this.decideOnce(input);
+      } catch (retry) {
+        if (!sessionRefusal(retry) || await this.sessionReadable()) throw retry;
+        throw new CompanyError('temporarily_unavailable', SESSION_RETRY, true);
+      }
+    }
+  }
+
+  /**
+   * Whether this session can still run the probe the keepalive uses. A session that cannot has lost its identity (anonymous, or
+   * expired), and table permissions may then hide the task, so the caller must not report it as absent. A session that can is
+   * authenticated; its token role makes it a system user, which table permissions do not limit, so a row it cannot see is absent.
+   */
+  private async sessionReadable(): Promise<boolean> {
+    try {
+      await bounded(this.db.query('INFO FOR DB;'), 10_000);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async decideOnce(input: DecideInput): Promise<TaskView> {
     if (!['approve', 'reject', 'reply'].includes(input.decision)) throw new CompanyError('invalid', 'Invalid decision');
     requireText(input.note ?? '', 'note', input.decision === 'approve' ? 0 : 2, 20000);
     const idem = id('idempotency', HASH(`owner\0decide\0${input.key}`));
@@ -68,12 +127,10 @@ export class OwnerDesk {
     const evidence = `来源：${input.source}\n决定：${input.decision}\n${input.note ?? ''}`.trim();
     // SYS02 AC03/AC06: an owner approval calls the same evaluator. Machine evidence must be server-verified; the owner
     // signs required human criteria here, in the same transaction that closes the gate. The owner gate is never auto-approved.
-    // 事务外先读一次，走的是 task.detail 同一条会话：读不到才是“任务不存在”。事务内读不到而这里读得到，是事务内的
-    // 身份或可见性问题，由事务内的 THROW 与 run() 报成冲突，不能报成“任务不存在”。
-    const taskRow = await this.db.select<AcceptanceTaskRow>(id('task', input.taskId));
-    if (!taskRow) throw new CompanyError('not_found', 'task not found');
     let humanEvidence: HumanSignoff[] = [];
     if (input.decision === 'approve') {
+      const taskRow = await this.db.select<AcceptanceTaskRow>(id('task', input.taskId));
+      if (!taskRow) throw new CompanyError('not_found', 'task not found');
       const gate = await loadAcceptanceGate(this.db);
       const verdict = evaluateAcceptance({
         subject: acceptanceSubject(taskRow), evidence: await loadAcceptanceEvidence(this.db, input.taskId),
@@ -84,7 +141,7 @@ export class OwnerDesk {
     }
     const rows = await this.run(`BEGIN;
       LET $t = SELECT * FROM ONLY $task;
-      IF $t = NONE { THROW 'task not visible in transaction' };
+      IF $t = NONE { THROW 'task not found' };
       IF $t.dispatch_attempt != NONE { THROW 'dispatch outcome uncertain' };
       IF $expected_version != NONE AND $t.version != $expected_version { THROW 'task version moved' };
       IF $decision IN ['approve', 'reject'] AND ($t.state != 'review' OR $t.reviewer_role != 'owner') { THROW 'task is not awaiting owner review' };
@@ -97,6 +154,7 @@ export class OwnerDesk {
         blocked_to = NONE, resume_role = NONE, resume_state = NONE, current_employee = NONE,
         delivery_id = NONE, lease_expires_at = NONE, version = $t.version + 1
         RETURN AFTER;
+      IF $next = NONE { THROW 'owner session cannot write the task' };
       CREATE audit CONTENT { task: $task, actor: $actor, action: 'owner_' + $decision, evidence: $evidence, version: $next.version, at: time::now() };
       IF $decision = 'approve' {
         FOR $e IN $human_evidence {
@@ -480,10 +538,12 @@ export class OwnerDesk {
     const responses = await this.db.query<unknown[]>(query, vars).responses();
     const failure = responses.find(r => !r.success && !r.error.message.includes('not executed due to') && !r.error.message.startsWith('Cannot COMMIT'));
     if (failure && !failure.success) {
-      const message = failure.error.message;
-      if (/not visible in transaction/i.test(message)) throw new CompanyError('conflict', '任务在事务内读不到（未写入）：请重试；反复出现时核对执行端会话的身份与数据库');
+      // THROW reaches the client as "An error occurred: <message>"; the message itself is ours.
+      const message = failure.error.message.replace(/^An error occurred: /, '');
       if (/not found/i.test(message)) throw new CompanyError('not_found', message);
       if (/not awaiting|not waiting|task version moved|dispatch outcome uncertain/i.test(message)) throw new CompanyError('conflict', message);
+      if (SESSION_DENIED.test(message)) throw new CompanyError('temporarily_unavailable', SESSION_RETRY, true);
+      if (/cannot write the task/i.test(message)) throw new CompanyError('forbidden', WRITE_REFUSED);
       throw new CompanyError('conflict', 'Owner operation conflicted; retry');
     }
     return responses.map(r => r.success ? r.result : undefined);

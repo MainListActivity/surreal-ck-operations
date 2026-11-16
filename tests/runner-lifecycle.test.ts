@@ -40,29 +40,36 @@ import type { LeaseProof, ClaimResult } from '../src/contracts.ts';
 
 function fixture(readTurnResult?: (agent: string, turn: string) => Promise<string>) {
   const root = mkdtempSync(join(tmpdir(), 'sck-runner-flow-'));
-  const calls: Array<{ action: string; proof: LeaseProof; key: string }> = [];
+  const calls: Array<{ action: string; proof: LeaseProof; key: string; text?: string }> = [];
   let delivery = 'delivery-a', version = 2, phase: 'doing' | 'review' = 'doing', submitted = false;
   let fail = false, loseReply = false, failRead = false;
+  let refusal: { code: string; message: string; times: number } | undefined;
+  let accepted = 0;
+  const mirror: Array<{ state: string; error?: string; attempts: number }> = [];
   const inst = { id: 'worker', role: 'engineering' as const, credential: 'synthetic', paseoAgentId: undefined as string | undefined };
   const task = () => ({ id: 'task', state: phase, version, fence: 1, deliveryId: delivery, currentEmployee: 'worker',
     leaseExpiresAt: new Date(Date.now() + 600000).toISOString() });
   const result = () => ({ task: task(), fence: 1, deliveryId: delivery, leaseExpiresAt: task().leaseExpiresAt, history: [] }) as unknown as ClaimResult;
   const committed = new Set<string>();
-  const transition = (action: string) => async (_cred: string, proof: LeaseProof, evidence: { idempotencyKey: string }) => {
-    calls.push({ action, proof: { ...proof }, key: evidence.idempotencyKey });
+  const transition = (action: string) => async (_cred: string, proof: LeaseProof, evidence: { idempotencyKey: string; text?: string }) => {
+    calls.push({ action, proof: { ...proof }, key: evidence.idempotencyKey, text: evidence.text });
     if (committed.has(evidence.idempotencyKey)) return task();
+    if (action === 'submit' && refusal && refusal.times > 0) { refusal.times--; throw Object.assign(new Error(refusal.message), { code: refusal.code }); }
     if (fail) throw new Error('synthetic network failure');
     if (proof.deliveryId !== delivery || proof.expectedVersion !== version) throw Object.assign(new Error('stale version'), { code: 'conflict' });
     committed.add(evidence.idempotencyKey); submitted = true;
+    if (action === 'submit') accepted++;
     if (loseReply) { loseReply = false; throw new Error('synthetic response lost after commit'); }
     return task();
   };
   const core = { claim: async () => result(), heartbeat: async () => { if (failRead) throw new Error('network'); return result(); },
     getTask: async () => { if (failRead) throw new Error('network'); return task(); },
     activeLeases: async () => submitted ? [] : [{ ...task(), taskId: 'task' }],
-    submit: transition('submit'), accept: transition('accept'), returnTask: transition('return'), block: transition('block') };
+    submit: transition('submit'), accept: transition('accept'), returnTask: transition('return'),
+    block: (cred: string, proof: LeaseProof, _to: 'owner', evidence: { idempotencyKey: string; text?: string }) => transition('block')(cred, proof, evidence) };
   const workforce = { rotate: async () => 'synthetic', insts: async () => [inst] };
-  const options = { core: core as never, workforce: workforce as never, runDir: join(root, 'comm'), managedLifecycle: true, readTurnResult, heartbeatMs: 15 };
+  const options = { core: core as never, workforce: workforce as never, runDir: join(root, 'comm'), managedLifecycle: true, readTurnResult, heartbeatMs: 15,
+    executionChanged: async (row: { state: string; error?: string; tries: number }) => { mirror.push({ state: row.state, error: row.error, attempts: row.tries }); } };
   let pool = new SidecarPool(options);
   const event = (turn = 'turn-a', text = '工作已完成，全部只读检查通过，证据已生成。', kind = 'completed') =>
     ({ agent: { id: 'agent' }, turnId: turn, outcome: { kind }, timeline: [{ type: 'assistant_message', text }] });
@@ -71,6 +78,8 @@ function fixture(readTurnResult?: (agent: string, turn: string) => Promise<strin
     settle: (value = event(), interruptions?: TurnInterruptions) => settleCompanyTurn({sidecar: pool, workforce} as never, {} as never, value as never, interruptions),
     get pool() { return pool; },
     fail(value: boolean) { fail = value; }, loseReply() { loseReply = true; }, failRead(value: boolean) { failRead = value; },
+    refuse(code: string, times: number, message: string) { refusal = { code, message, times }; },
+    accepted: () => accepted, mirror: () => mirror,
     async claim(review = false) { phase = review ? 'review' : 'doing'; pool.env(inst); inst.paseoAgentId = 'agent'; pool.bindAgent(inst.id, 'agent'); await pool.claim(inst, { id: 'task' } as never); },
     async restart() { pool.close(); pool = new SidecarPool(options); await pool.adopt([inst]); },
     async retry() { for (const row of journal().rows()) { row.nextRetry = 0; journal().save(row); } await pool.retryExecutions(); },
@@ -194,7 +203,7 @@ test('重复结束恢复同一 collecting 快照，不重新读取被覆盖的�
 });
 
 
-test('宿主结束事件没有正文时按回合读取，读取失败由执行端持久重试而非报告业务阻塞', async () => {
+test('宿主结束事件没有正文时按回合读取，短暂读取失败后仍自动提交', async () => {
   let available = false;
   const f = fixture(async (agent, turn) => { expect([agent,turn]).toEqual(['agent','turn-a']); if (!available) throw new Error('history unavailable'); return '真实会话最终成果已读取，计算与验证均已完成。'; });
   try {
@@ -208,7 +217,67 @@ test('宿主结束事件没有正文时按回合读取，读取失败由执行�
     expect(f.calls.map(c=>c.action)).toEqual(['submit']);expect(f.journal().rows()[0]?.state).toBe('settled');
   } finally { f.close(); }
 });
-import { readTurnResult } from '../src/runner/turn-result.ts';
+test('取不到最终答复时有限次读取，窗口耗尽后以可恢复受阻提交，不推断成功', async () => {
+  let reads = 0;
+  const f = fixture(async () => { reads++; throw new RuntimeResultError('not_yet_available', 'runtime final result not yet available'); });
+  try {
+    await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
+    await f.pool.settleExecution({ ...f.event(), timeline: [] });
+    const firstDelay = (f.journal().rows()[0]?.nextRetry ?? 0) - Date.now();
+    expect(firstDelay).toBeGreaterThan(9000);
+    expect(firstDelay).toBeLessThanOrEqual(10000);
+    for (let i = 0; i < 5; i++) await f.pool.settleExecution({ ...f.event(), timeline: [] });
+    expect(reads).toBe(1);
+    for (let i = 0; i < 10; i++) await f.retry();
+    await f.restart();
+    for (let i = 0; i < 8; i++) await f.retry();
+    expect(reads).toBe(19);
+    expect(f.journal().rows()[0]?.state).toBe('collecting');
+    expect(f.calls).toHaveLength(0);
+    await f.retry();
+    expect(reads).toBe(20);
+    expect(f.calls.map(c => c.action)).toEqual(['block']);
+    expect(f.calls[0]?.text).toContain('连续 20 次');
+    expect(f.calls[0]?.text).toContain('runtime_result_unavailable:not_yet_available');
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+    expect(f.pool.holdsLease('worker', 'task')).toBe(false);
+    await f.retry();
+    expect(reads).toBe(20);
+    expect(f.calls.map(c => c.action)).toEqual(['block']);
+  } finally { f.close(); }
+});
+test('最终答复迟到几轮后仍按正常结果自动提交，不因前几次读取失败而阻塞', async () => {
+  let reads = 0;
+  const f = fixture(async () => {
+    reads++;
+    if (reads < 6) throw new RuntimeResultError('not_yet_available', 'runtime final result not yet available');
+    return '迟到的最终成果已可读取，验证全部通过。';
+  });
+  try {
+    await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
+    await f.pool.settleExecution({ ...f.event(), timeline: [] });
+    for (let i = 0; i < 5; i++) await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['submit']);
+    expect(f.calls[0]?.text).toContain('迟到的最终成果');
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+  } finally { f.close(); }
+});
+test('受阻结果提交失败时保留同一幂等键，恢复后重放，不重复变更任务', async () => {
+  const f = fixture(async () => { throw new RuntimeResultError('timeline_unavailable', 'runtime timeline unavailable'); });
+  try {
+    await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
+    f.fail(true);
+    await f.pool.settleExecution({ ...f.event(), timeline: [] });
+    for (let i = 0; i < 19; i++) await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['block']);
+    expect(f.journal().rows()[0]?.state).toBe('pending');
+    f.fail(false); await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['block', 'block']);
+    expect(f.calls[1]?.key).toBe(f.calls[0]?.key);
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+  } finally { f.close(); }
+});
+import { readTurnResult, RuntimeResultError } from '../src/runner/turn-result.ts';
 test('宿主读取只接受目标回合的最终答复，不串新回合也不把进度当成果', async () => {
   const host = (entries: unknown[]) => ({agents:{ref:()=>({timeline:{refetch:async()=>({epoch:'e',hasOlder:false,entries})}})}}) as never;
   expect(await readTurnResult(host([
@@ -217,6 +286,18 @@ test('宿主读取只接受目标回合的最终答复，不串新回合也不�
   ]),'agent','a')).toBe('正确成果');
   await expect(readTurnResult(host([{turnId:'b',seqEnd:1,item:{type:'assistant_message',text:'旧结果'}}]),'agent','a')).rejects.toThrow('unavailable');
   await expect(readTurnResult(host([{turnId:'a',seqEnd:1,item:{type:'assistant_message',text:'正在检查'}},{turnId:'a',seqEnd:2,item:{type:'tool_call'}}]),'agent','a')).rejects.toThrow('not yet');
+});
+test('投影中工具条目晚于最终答复结束时，仍按首次出现的位置读取答复；答复之后新开的工具仍视为未完成', async () => {
+  const host = (entries: unknown[]) => ({agents:{ref:()=>({timeline:{refetch:async()=>({epoch:'e',hasOlder:false,entries})}})}}) as never;
+  // Paseo keeps a tool call at its first position (seqStart); a later completion only moves seqEnd past the answer.
+  expect(await readTurnResult(host([
+    {turnId:'a',seqStart:1,seqEnd:5,item:{type:'tool_call'}},
+    {turnId:'a',seqStart:3,seqEnd:4,item:{type:'assistant_message',text:'全部检查已通过'}},
+  ]),'agent','a')).toBe('全部检查已通过');
+  await expect(readTurnResult(host([
+    {turnId:'a',seqStart:3,seqEnd:4,item:{type:'assistant_message',text:'正在检查'}},
+    {turnId:'a',seqStart:5,seqEnd:6,item:{type:'tool_call'}},
+  ]),'agent','a')).rejects.toMatchObject({ reason: 'not_yet_available' });
 });
 
 
@@ -293,5 +374,130 @@ test('明确供应商失败先保存预算；保存失败保留租约，同回�
     expect(f.pool.hasPendingResult('worker','task','delivery-a')).toBe(false);
     await f.settle(event as never);
     expect(actions).toEqual(['budget','budget','release']);
+  } finally { f.close(); }
+});
+
+const CI_WAIT = 'submit sha 0123456789012345678901234567890123456789: CI 尚未成功，GitHub Actions run 完成后自动接续送审';
+test('CI 排队或运行中：成果保持待收尾，不计失败次数、不 block；CI 成功后同一成果恰好送审一次', async () => {
+  const f = fixture(); try {
+    await f.claim(); f.refuse('ci_pending', 13, CI_WAIT);
+    await f.settle(f.event());
+    for (let i = 0; i < 12; i++) await f.retry();
+    const row = f.journal().rows()[0]!;
+    expect(row.state).toBe('pending'); expect(row.tries).toBe(0); expect(row.error).toBe('ci_pending');
+    expect(f.pool.holdsLease('worker', 'task')).toBe(true);
+    expect(f.mirror().at(-1)).toEqual({ state: 'pending', error: 'ci_pending', attempts: 0 });
+    expect(f.calls.map(c => c.action)).toEqual(Array(13).fill('submit'));
+    expect(f.accepted()).toBe(0);
+    await f.retry();
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+    expect(f.accepted()).toBe(1);
+    expect(f.calls.map(c => c.action)).toEqual(Array(14).fill('submit'));
+    expect(new Set(f.calls.map(c => c.key)).size).toBe(1);
+    expect(f.pool.holdsLease('worker', 'task')).toBe(false);
+    expect(f.mirror().at(-1)?.error).toBeUndefined();
+  } finally { f.close(); }
+});
+test('最终答复迟到后再等待 CI：重启不重读结果、不额外消耗重试、同一成果只送审一次', async () => {
+  let reads = 0;
+  const f = fixture(async () => {
+    if (++reads < 3) throw new Error('result not yet visible');
+    return '工作已完成，延迟取回的完整成果与验证证据保持不变。';
+  });
+  try {
+    await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
+    f.refuse('ci_pending', 3, CI_WAIT);
+    await f.settle(f.event('turn-a', ''));
+    await f.retry(); await f.retry();
+    const row = f.journal().rows()[0]!;
+    expect(row.state).toBe('pending'); expect(row.error).toBe('ci_pending'); expect(row.tries).toBe(2);
+    await f.restart(); await f.retry(); await f.retry(); await f.retry();
+    expect(reads).toBe(3);
+    expect(f.accepted()).toBe(1);
+    expect(f.calls.map(call => call.action)).toEqual(Array(4).fill('submit'));
+    expect(new Set(f.calls.map(call => call.key)).size).toBe(1);
+    expect(new Set(f.calls.map(call => call.text)).size).toBe(1);
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+  } finally { f.close(); }
+});
+
+test('CI 等待期间执行端重启：从执行批次恢复等待，CI 成功后仍只送审一次', async () => {
+  const f = fixture(); try {
+    await f.claim(); f.refuse('ci_pending', 1, CI_WAIT);
+    await f.settle(f.event());
+    await f.restart();
+    expect(f.pool.hasPendingResult('worker', 'task', 'delivery-a')).toBe(true);
+    await f.retry();
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+    expect(f.accepted()).toBe(1);
+    expect(f.calls.map(c => c.action)).toEqual(['submit', 'submit']);
+  } finally { f.close(); }
+});
+test('CI 等待期间任务版本被推进：刷新 proof 后同一成果补交一次，不重新唤醒', async () => {
+  const f = fixture(); try {
+    await f.claim(); f.refuse('ci_pending', 1, CI_WAIT);
+    await f.settle(f.event()); f.nextVersion();
+    await f.retry();
+    expect(f.journal().rows()[0]?.state).toBe('pending');
+    await f.retry();
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+    expect(f.accepted()).toBe(1);
+    expect(f.calls.map(c => c.proof.expectedVersion)).toEqual([2, 2, 3]);
+  } finally { f.close(); }
+});
+test('CI 等待期间租约已转给别人：不再等待也不提交，成果标记为已被接手', async () => {
+  const f = fixture(); try {
+    await f.claim(); f.refuse('ci_pending', 1000, CI_WAIT);
+    await f.settle(f.event());
+    f.nextDelivery();
+    await f.retry();
+    expect(f.journal().rows()[0]?.state).toBe('superseded');
+    // One more attempt reaches core before the ownership read; core's lease check refuses it, so nothing is committed.
+    expect(f.calls.map(c => c.action)).toEqual(['submit', 'submit']);
+    expect(f.accepted()).toBe(0);
+    await f.retry();
+    expect(f.calls).toHaveLength(2);
+  } finally { f.close(); }
+});
+test('CI 等待超过上限仍无成功运行：明确 block 并写明等待超时，不再无限重试', async () => {
+  const f = fixture(); try {
+    await f.claim(); f.refuse('ci_pending', 1000, CI_WAIT);
+    await f.settle(f.event());
+    const row = f.journal().rows()[0]!;
+    row.ciWaitSince = Date.now() - 7 * 3_600_000; f.journal().save(row);
+    await f.retry();
+    const waiting = f.journal().rows()[0]!;
+    expect(waiting.result?.action).toBe('block');
+    expect(waiting.result?.evidence.text).toContain('CI 等待超时');
+    expect(waiting.originalResult?.action).toBe('submit');
+    await f.retry();
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+    expect(f.calls.map(c => c.action)).toEqual(['submit', 'submit', 'block']);
+    expect(f.accepted()).toBe(0);
+  } finally { f.close(); }
+});
+test('CI 真正失败：不等待、不无限重试，立即 block 并写明 CI 失败原因', async () => {
+  const f = fixture(); try {
+    await f.claim(); f.refuse('ci_failed', 1000, 'submit sha 0123456789012345678901234567890123456789: CI 失败，没有成功的 GitHub Actions run');
+    await f.settle(f.event());
+    expect(f.journal().rows()[0]?.result?.action).toBe('block');
+    expect(f.journal().rows()[0]?.error).toBe('ci_failed');
+    await f.retry();
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+    expect(f.calls.map(c => c.action)).toEqual(['submit', 'block']);
+    expect(f.accepted()).toBe(0);
+  } finally { f.close(); }
+});
+test('确定性非法成果仍有界重试，阻塞说明写入真实拒绝原因', async () => {
+  const f = fixture(); try {
+    await f.claim(); f.refuse('invalid', 1000, 'submit sha 0123456789012345678901234567890123456789: 环境不符');
+    await f.settle(f.event());
+    let attempts = 1;
+    while (f.journal().rows()[0]?.result?.action !== 'block' && attempts < 20) { await f.retry(); attempts++; }
+    expect(attempts).toBe(10);
+    expect(f.journal().rows()[0]?.result?.evidence.text).toContain('环境不符');
+    await f.retry();
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+    expect(f.accepted()).toBe(0);
   } finally { f.close(); }
 });
