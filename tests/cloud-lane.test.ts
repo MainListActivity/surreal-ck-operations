@@ -479,6 +479,16 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(await egoBrowse(silent)('x', 5_000)).toBeUndefined();
   });
 
+  test('egoBrowse：孙进程占着管道、close 迟迟不来 → 兜底后保守报 pressed（只核对，不重发）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sck-ego-hold-'));
+    dirs.push(dir);
+    const hold = join(dir, 'ego-hold');
+    // 后台 sleep 继承了 stdout：SIGKILL 只杀 sh，管道要等 sleep 结束才关闭。
+    writeFileSync(hold, '#!/bin/sh\n(sleep 8) &\nexec sleep 30\n');
+    chmodSync(hold, 0o755);
+    expect(await egoBrowse(hold)('x', 1_000)).toEqual({ ok: false, code: 'pressed' });
+  }, 20_000);
+
   test('超时后同一轮只回执核对不重发：状态留在途，下轮直接轮询原会话', async () => {
     const working = { ok: true, markerSeen: true, status: 'working', done: null, tail: '' };
     const w1 = world({ extra: gitOk });

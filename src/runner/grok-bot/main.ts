@@ -34,9 +34,10 @@ export const egoBrowse = (bin: string): Browse => (script, timeoutMs) => new Pro
     catch { return unfinished(); }
   };
   // 超时：杀掉子进程后等 close 把管道里剩下的输出读完再判定，否则「已按下发送」的标记可能还没读到就丢了。
+  // 兜底：子进程的孙进程若仍占着管道，close 迟迟不来；此时拿不到结果就保守报 pressed（只核对，不重发）。
   const timer = setTimeout(() => {
     child.kill('SIGKILL');
-    fallback = setTimeout(() => settle(finish()), 5_000);
+    fallback = setTimeout(() => settle(finish() ?? { ok: false, code: 'pressed' }), 5_000);
   }, timeoutMs);
   child.stdout.on('data', chunk => { out += chunk; });
   child.stderr.on('data', chunk => { out += chunk; });
