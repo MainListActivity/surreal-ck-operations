@@ -11,7 +11,7 @@ import { bodyOfDispatch } from '../../outbound-render.ts';
 import { clearInflight, laneDigest, readInflight, readLaneState, recordInflight, writeLaneState, type LaneState } from './state.ts';
 import { repoInfo, type ExecFn, type RepoInfo } from './repo.ts';
 import { driveCodex } from './codex.ts';
-import { driveDevin } from './devin.ts';
+import { devinCloudModel, driveDevin } from './devin.ts';
 import { driveJules } from './jules.ts';
 
 export { isLaneProvider, type LaneProvider };
@@ -23,8 +23,8 @@ export interface LaneConfig {
   dailyLimit?: number;
   /** jules：同时在途会话上限，超出按受阻处理。 */
   maxConcurrent?: number;
-  /** devin-cloud：云端会话用的模型，默认 free（每个用户有免费会话额度；公司派工只用它）。 */
-  model?: string;
+  /** devin-cloud：云端会话的模型，只能缺省或为 free（每个用户有免费会话额度；公司派工只用它，其它值配置校验与执行入口都拒绝）。 */
+  model?: 'free';
   /** 单轮云端任务最长等待分钟数，默认 180。 */
   maxMinutes?: number;
   /** 测试用：轮询间隔毫秒，默认 25000。 */
@@ -48,8 +48,8 @@ export function validateLanes(lanes: unknown): asserts lanes is Partial<Record<L
           Object.entries(value as Record<string, unknown>).some(([name, path]) => !/^[a-zA-Z0-9._-]+$/.test(name) || typeof path !== 'string' || !isAbsolute(path)))
           throw new Error(`lanes.${provider}.bin 必须是命令名 → 绝对路径 的映射`);
       } else if (key === 'model') {
-        if (provider !== 'devin-cloud' || typeof value !== 'string' || !/^[\w.-]{1,60}$/.test(value))
-          throw new Error('lanes.devin-cloud.model 必须是模型名');
+        if (provider !== 'devin-cloud') throw new Error(`lanes.${provider} 不接受 model`);
+        devinCloudModel(value);
       } else if (!['dailyLimit', 'maxConcurrent', 'maxMinutes', 'pollMs'].includes(key) || typeof value !== 'number' || !(value > 0))
         throw new Error(`lanes.${provider}.${key} 必须是正数`);
       if (provider === 'warp' && !['bin', 'maxMinutes'].includes(key))

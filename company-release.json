@@ -1,18 +1,16 @@
 {
-  "version": "0.13.24",
-  "title": "ChatGPT 与 Gemini 网页版聊天通道；修复通道偏好清不掉",
+  "version": "0.13.26",
+  "title": "Devin 云端派工只用 free 模型，配置不可覆盖",
   "changes": [
-    "新增两条网页版聊天员工通道：chatgpt-web 和 gemini-web。只接文字任务（文案、梗概、说明这类），每张任务开一个新对话，用的是老板已登录的网页版额度。代码改动任务不接。",
-    "这两个站点左侧是老板的私人聊天列表，通道只读对话区的文字，侧栏内容不会被带回公司系统。",
-    "页面提示额度用完时，这一轮按失败收尾并给这条通道记额度冷却，冷却期间不再往里派，任务改派别的通道。",
-    "图片不走聊天通道：出图仍由员工调用 media_image（先 ChatGPT 网页，再 Higgsfield、Gemini、Grok），长文写作仍用 Gemini 写作工具。",
-    "修复：0.13.23 的通道偏好保存空内容时清不掉已有的条目（库里按键合并了）。现在保存即整份替换。",
-    "网页桥接改成每个站点一份完整配置，新增站点不会再悄悄沿用别的站点的选择器和登录判断。"
+    "修复：Devin 云端通道原来允许 lanes.devin-cloud.model 覆盖模型，现在只能是 free；缺省也按 free 执行。",
+    "配置里 lanes.devin-cloud.model 写成 free 以外的值（含空白、空串）时，执行端启动即拒绝。",
+    "执行入口再校验一次：即使绕过配置，非 free 也不推分支、不发云端会话，本回合按错误收尾，不回退到账号默认模型。",
+    "续轮与复核轮同样只用 free；会话失败不切换到其它模型。"
   ],
   "impact": [
-    "老板：员工页可以新建供应商为 chatgpt-web 或 gemini-web 的编制；配合通道偏好可以让某类文字工作先用它们。",
-    "gemini-web 的发送与取回还没有用真实页面跑通过，启用前需要先实测。"
+    "老板：若 native-runner.json 的 lanes.devin-cloud 里写过 model 且不是 free，升级后执行端会拒绝启动，删掉该项即可。",
+    "真实 Devin 云模式的端到端验证尚未完成，本版只有假 CLI 的回归测试。"
   ],
-  "migration": "无 schema 变更（沿用 schema 072）。启用新通道要在执行端配置 native-runner.json 的 commands 与 models 里加上对应条目并重启执行端。",
-  "rollback": "回退至 v0.13.23；回退前先停用 chatgpt-web、gemini-web 编制，旧版本执行端不认识这两个供应商。"
+  "migration": "无 schema 变更（沿用 schema 072）。",
+  "rollback": "回退至 v0.13.24；旧版本允许 lanes.devin-cloud.model 覆盖，回退后请确认该项仍为 free 或未配置。"
 }
