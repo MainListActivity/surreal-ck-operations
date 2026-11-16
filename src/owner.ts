@@ -68,10 +68,12 @@ export class OwnerDesk {
     const evidence = `来源：${input.source}\n决定：${input.decision}\n${input.note ?? ''}`.trim();
     // SYS02 AC03/AC06: an owner approval calls the same evaluator. Machine evidence must be server-verified; the owner
     // signs required human criteria here, in the same transaction that closes the gate. The owner gate is never auto-approved.
+    // 事务外先读一次，走的是 task.detail 同一条会话：读不到才是“任务不存在”。事务内读不到而这里读得到，是事务内的
+    // 身份或可见性问题，由事务内的 THROW 与 run() 报成冲突，不能报成“任务不存在”。
+    const taskRow = await this.db.select<AcceptanceTaskRow>(id('task', input.taskId));
+    if (!taskRow) throw new CompanyError('not_found', 'task not found');
     let humanEvidence: HumanSignoff[] = [];
     if (input.decision === 'approve') {
-      const taskRow = await this.db.select<AcceptanceTaskRow>(id('task', input.taskId));
-      if (!taskRow) throw new CompanyError('not_found', 'task not found');
       const gate = await loadAcceptanceGate(this.db);
       const verdict = evaluateAcceptance({
         subject: acceptanceSubject(taskRow), evidence: await loadAcceptanceEvidence(this.db, input.taskId),
@@ -82,7 +84,7 @@ export class OwnerDesk {
     }
     const rows = await this.run(`BEGIN;
       LET $t = SELECT * FROM ONLY $task;
-      IF $t = NONE { THROW 'task not found' };
+      IF $t = NONE { THROW 'task not visible in transaction' };
       IF $t.dispatch_attempt != NONE { THROW 'dispatch outcome uncertain' };
       IF $expected_version != NONE AND $t.version != $expected_version { THROW 'task version moved' };
       IF $decision IN ['approve', 'reject'] AND ($t.state != 'review' OR $t.reviewer_role != 'owner') { THROW 'task is not awaiting owner review' };
@@ -479,8 +481,9 @@ export class OwnerDesk {
     const failure = responses.find(r => !r.success && !r.error.message.includes('not executed due to') && !r.error.message.startsWith('Cannot COMMIT'));
     if (failure && !failure.success) {
       const message = failure.error.message;
+      if (/not visible in transaction/i.test(message)) throw new CompanyError('conflict', '任务在事务内读不到（未写入）：请重试；反复出现时核对执行端会话的身份与数据库');
       if (/not found/i.test(message)) throw new CompanyError('not_found', message);
-      if (/not awaiting|not waiting/i.test(message)) throw new CompanyError('conflict', message);
+      if (/not awaiting|not waiting|task version moved|dispatch outcome uncertain/i.test(message)) throw new CompanyError('conflict', message);
       throw new CompanyError('conflict', 'Owner operation conflicted; retry');
     }
     return responses.map(r => r.success ? r.result : undefined);
