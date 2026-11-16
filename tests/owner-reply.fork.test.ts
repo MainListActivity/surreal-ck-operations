@@ -70,6 +70,11 @@ async function stored(id: string): Promise<{ state: string; version: number; blo
     'SELECT state, version, blocked_to FROM $t;', { t: new RecordId('task', id) });
   return task!;
 }
+/** Clears a task and its audit rows, then seeds it again under the same id (for the production UUID, which the first test creates). */
+async function reseed(id: ReturnType<typeof crypto.randomUUID>): Promise<void> {
+  await company.db.query('DELETE audit WHERE task = $task; DELETE $task;', { task: new RecordId('task', id) });
+  await seed('blocked', 'owner', id);
+}
 async function ownerReplies(id: string): Promise<Array<{ action: string; evidence: string }>> {
   const [rows] = await company.db.query<[Array<{ action: string; evidence: string }>]>(
     "SELECT action, evidence FROM audit WHERE task = $t AND action = 'owner_reply';", { t: new RecordId('task', id) });
@@ -129,6 +134,8 @@ run('根库会话：受阻任务被 reply 恢复，原话入审计，同一幂�
 run('根库会话：不存在的 UUID 报任务不存在；非阻塞或阻塞给员工的任务报冲突，且不写入', async () => {
   await expect(ownerApi(ctx, { command: 'reply', taskId: crypto.randomUUID(), note: NOTE }, 'owner-cli'))
     .rejects.toMatchObject({ code: 'not_found', message: 'task not found' });
+  await expect(ownerApi(ctx, { command: 'task.detail', taskId: crypto.randomUUID() }, 'owner-cli'))
+    .rejects.toMatchObject({ code: 'not_found', message: 'task not found' });
   const ready = await seed('ready');
   await expect(ownerApi(ctx, { command: 'reply', taskId: ready, note: NOTE }, 'owner-cli')).rejects.toMatchObject({ code: 'conflict' });
   const employee = await seed('blocked', 'employee');
@@ -165,6 +172,69 @@ run('根库会话失去身份且无法重建：reply 报暂时不可用，不报
   expect(await ownerReplies(id)).toHaveLength(0);
 });
 
+run('根库会话失去身份：task.detail 重建连接后读到原任务，不报任务不存在', async () => {
+  const id = await seed('blocked');
+  await company.db.invalidate();
+  const detail = await ownerApi(ctx, { command: 'task.detail', taskId: id }, 'owner-cli') as { task: { state: string; version: number } };
+  expect(detail.task).toMatchObject({ state: 'blocked', version: 3 });
+});
+
+run('根库会话失去身份且无法重建：task.detail 报暂时不可用，连真不存在的任务也不报不存在', async () => {
+  const id = await seed('blocked');
+  const rebuild = company.ensureConnected.bind(company);
+  company.ensureConnected = async () => undefined; // a rebuild that does not restore the identity
+  let detailError: CompanyError | undefined;
+  let absentError: CompanyError | undefined;
+  try {
+    await company.db.invalidate();
+    detailError = await failure(ownerApi(ctx, { command: 'task.detail', taskId: id }, 'owner-cli'));
+    absentError = await failure(ownerApi(ctx, { command: 'task.detail', taskId: crypto.randomUUID() }, 'owner-cli'));
+  } finally {
+    company.ensureConnected = rebuild;
+    await rebuild();
+  }
+  expect(detailError).toMatchObject({ code: 'temporarily_unavailable', retryable: true });
+  expect(detailError!.message).not.toContain('not found');
+  expect(absentError).toMatchObject({ code: 'temporarily_unavailable', retryable: true });
+  expect(absentError!.message).not.toContain('not found');
+});
+
+run('原 UUID 的受阻任务：根库会话失去身份后，任务详情与回复重建后恢复，回复只落地一次', async () => {
+  await reseed(TASK);
+  await company.db.invalidate();
+  const detail = await ownerApi(ctx, { command: 'task.detail', taskId: TASK }, 'owner-cli') as { task: { state: string; version: number } };
+  expect(detail.task).toMatchObject({ state: 'blocked', version: 3 });
+  const k = key();
+  const landed = await ownerApi(ctx, { command: 'reply', taskId: TASK, note: NOTE, idempotencyKey: k }, 'owner-cli');
+  expect(landed).toMatchObject({ state: 'doing', version: 4 });
+  const replay = await ownerApi(ctx, { command: 'reply', taskId: TASK, note: NOTE, idempotencyKey: k }, 'owner-cli');
+  expect(replay).toMatchObject({ state: 'doing', version: 4 });
+  expect(await stored(TASK)).toMatchObject({ state: 'doing', version: 4 });
+  expect(await ownerReplies(TASK)).toHaveLength(1);
+});
+
+run('原 UUID 的受阻任务：根库会话失去身份且无法重建时，任务详情与回复都报暂时不可用，且不写入', async () => {
+  await reseed(TASK);
+  const rebuild = company.ensureConnected.bind(company);
+  company.ensureConnected = async () => undefined; // a rebuild that does not restore the identity
+  let detailError: CompanyError | undefined;
+  let replyError: CompanyError | undefined;
+  try {
+    await company.db.invalidate();
+    detailError = await failure(ownerApi(ctx, { command: 'task.detail', taskId: TASK }, 'owner-cli'));
+    replyError = await failure(ownerApi(ctx, { command: 'reply', taskId: TASK, note: '不应写入的回复' }, 'owner-cli'));
+  } finally {
+    company.ensureConnected = rebuild;
+    await rebuild();
+  }
+  expect(detailError).toMatchObject({ code: 'temporarily_unavailable', retryable: true });
+  expect(replyError).toMatchObject({ code: 'temporarily_unavailable', retryable: true });
+  expect(detailError!.message).not.toContain('not found');
+  expect(replyError!.message).not.toContain('not found');
+  expect(await stored(TASK)).toMatchObject({ state: 'blocked', version: 3 });
+  expect(await ownerReplies(TASK)).toHaveLength(0);
+});
+
 run('老板令牌：同一 UUID 的阻塞任务，task.detail 可见，reply 恢复，原话入审计', async () => {
   const owner = sessionContext(await session(tokenFor('owner', 'reply-owner', ['Owner'])));
   const taskId = await seed('blocked');
@@ -194,6 +264,8 @@ run('老板令牌：不存在的 UUID 报任务不存在；非阻塞任务报不
   const owner = sessionContext(await session(tokenFor('owner', 'reject-owner', ['Owner'])));
   const missing = await failure(ownerApi(owner, { command: 'reply', taskId: crypto.randomUUID(), note: NOTE }, 'owner-test'));
   expect(missing).toMatchObject({ code: 'not_found', message: 'task not found' });
+  const missingDetail = await failure(ownerApi(owner, { command: 'task.detail', taskId: crypto.randomUUID() }, 'owner-test'));
+  expect(missingDetail).toMatchObject({ code: 'not_found', message: 'task not found' });
   const ready = await seed('ready');
   const notWaiting = await failure(ownerApi(owner, { command: 'reply', taskId: ready, note: NOTE }, 'owner-test'));
   expect(notWaiting.code).toBe('conflict');
@@ -231,4 +303,10 @@ run('只读令牌（Viewer）：能读到任务但不能写，回复报无写权
   expect(error.message).not.toContain('not found');
   expect(await stored(taskId)).toMatchObject({ state: 'blocked', version: 3 });
   expect(await ownerReplies(taskId)).toHaveLength(0);
+  // The read path asks the session whether it can still read before it reports absence: a read-only session must get a
+  // real answer both for a task it can see and for one that does not exist.
+  const detail = await ownerApi(viewer, { command: 'task.detail', taskId }, 'owner-test') as { task: { state: string; version: number } };
+  expect(detail.task).toMatchObject({ state: 'blocked', version: 3 });
+  expect(await failure(ownerApi(viewer, { command: 'task.detail', taskId: crypto.randomUUID() }, 'owner-test')))
+    .toMatchObject({ code: 'not_found', message: 'task not found' });
 });

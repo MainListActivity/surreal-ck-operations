@@ -19,6 +19,7 @@ import { OwnerDesk } from '../src/owner.ts';
 //   2. 服务端会话到期（DURATION FOR SESSION 4s，令牌 600 秒）：到期前先断言身份、读与写都正常。到期后明确报
 //      “The session has expired”，不是空读；拒绝以服务端返回为准，应出现在连接后约 4 秒。回复重建会话后同一答复落地一次。
 //   3. 会话健康、任务确实不存在：报“任务不存在”，且不重建会话。
+// 任务详情（task.detail）与回复走同一套判断：会话不可读时空结果不等于不存在，只报“暂时不可用”；到期的读取经重建后再读到原任务。
 // fork 以 --allow-guests 启动：生产日志里只见 “IAM error: Not enough permissions”，从未见 “Anonymous access not allowed”，
 // 与允许访客一致（由日志推断，生产配置未直接核实）。身份服务是本地 Bun.serve，签发 HS512 替身令牌（与
 // cloud-session.fork.test.ts 相同做法）；令牌寿命与服务端会话时长分别设置，两者不互相代替。
@@ -249,9 +250,18 @@ run('令牌到期且续期被拒：会话失去身份，回复报暂时不可用
     expect(await stored(taskId)).toMatchObject({ state: 'blocked', version: 3 });
     expect(await ownerReplies(taskId)).toHaveLength(0);
 
-    // 身份服务恢复：同一回复（同一幂等键）落地一次；重放返回原结果。
+    // 读取同样：会话不可读时任务详情报暂时不可用，连真不存在的任务也不报“任务不存在”。
+    const unreadable = await failure(ownerApi(contextOf(db), { command: 'task.detail', taskId }, 'owner-cli'));
+    expect(unreadable).toMatchObject({ code: 'temporarily_unavailable', retryable: true });
+    expect(unreadable.message).not.toContain('not found');
+    expect(await failure(ownerApi(contextOf(db), { command: 'task.detail', taskId: crypto.randomUUID() }, 'owner-cli')))
+      .toMatchObject({ code: 'temporarily_unavailable', retryable: true });
+
+    // 身份服务恢复：任务详情先读到原任务（版本 3）；同一回复（同一幂等键）落地一次；重放返回原结果。
     idpDown = false;
     lifetimeSec = 600;
+    const detail = await ownerApi(contextOf(db), { command: 'task.detail', taskId }, 'owner-cli') as { task: { state: string; version: number } };
+    expect(detail.task).toMatchObject({ state: 'blocked', version: 3 });
     const landed = await ownerApi(contextOf(db), { command: 'reply', taskId, note: NOTE, idempotencyKey: k }, 'owner-cli');
     expect(landed).toMatchObject({ state: 'doing', version: 4 });
     const replay = await ownerApi(contextOf(db), { command: 'reply', taskId, note: NOTE, idempotencyKey: k }, 'owner-cli');
@@ -288,6 +298,9 @@ run('服务端会话到期（DURATION FOR SESSION 4s，令牌 600 秒）：到�
     expect(refusedAt - connectStart).toBeLessThanOrEqual(6000);
     expect(await rawOutcome(db, 'INFO FOR DB;')).toMatchObject({ thrown: expect.stringContaining('The session has expired') });
 
+    // 读取经由同一条重建路径：到期的读取被服务端明确拒绝，重建后读到原任务（版本 3）。
+    const detail = await ownerApi(contextOf(db), { command: 'task.detail', taskId }, 'owner-cli') as { task: { state: string; version: number } };
+    expect(detail.task).toMatchObject({ state: 'blocked', version: 3 });
     const landed = await ownerApi(contextOf(db), { command: 'reply', taskId, note: NOTE }, 'owner-cli');
     expect(landed).toMatchObject({ state: 'doing', version: 4 });
     // 重建走的是“会话到期”这条路：探测报到期，然后重建连接。
@@ -299,7 +312,7 @@ run('服务端会话到期（DURATION FOR SESSION 4s，令牌 600 秒）：到�
   }
 });
 
-run('会话健康、任务确实不存在：报任务不存在，且不重建会话', async () => {
+run('会话健康：任务确实不存在时报任务不存在（回复与任务详情都是），存在时读到原任务，且不重建会话', async () => {
   idpAccess = 'runner';
   lifetimeSec = 600;
   const db = cloudDb();
@@ -308,6 +321,11 @@ run('会话健康、任务确实不存在：报任务不存在，且不重建会
     await db.connect();
     const error = await failure(ownerApi(contextOf(db), { command: 'reply', taskId: crypto.randomUUID(), note: NOTE }, 'owner-cli'));
     expect(error).toMatchObject({ code: 'not_found', message: 'task not found' });
+    expect(await failure(ownerApi(contextOf(db), { command: 'task.detail', taskId: crypto.randomUUID() }, 'owner-cli')))
+      .toMatchObject({ code: 'not_found', message: 'task not found' });
+    const taskId = await seed('blocked');
+    const detail = await ownerApi(contextOf(db), { command: 'task.detail', taskId }, 'owner-cli') as { task: { state: string; version: number } };
+    expect(detail.task).toMatchObject({ state: 'blocked', version: 3 });
     expect(logs.messages.some(message => message.includes('re-established') || message.includes('reconnect failed'))).toBe(false);
   } finally {
     logs.restore();

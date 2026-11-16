@@ -50,7 +50,7 @@ const briefDispatch = (verdicts: DispatchVerdict[]): BriefData['dispatchBlocked'
 
 type DecideInput = { taskId: TaskId; decision: OwnerDecision; note: string; source: string; key: string; expectedVersion?: number };
 /** What a desk writes through. A bare owner-end session cannot rebuild itself, so only a CompanyDatabase offers `ensureConnected`. */
-type DeskDatabase = Pick<CompanyDatabase, 'db'> & Partial<Pick<CompanyDatabase, 'ensureConnected'>>;
+export type DeskDatabase = Pick<CompanyDatabase, 'db'> & Partial<Pick<CompanyDatabase, 'ensureConnected'>>;
 
 /** The database's refusal for a session without an identity: its token ran out, its session ended, or it fell back to anonymous. */
 const SESSION_DENIED = /not enough permissions|anonymous access not allowed|session has expired|iam error/i;
@@ -76,6 +76,43 @@ const bounded = <T>(work: Promise<T>, ms: number): Promise<T> => {
   return Promise.race([work, expired]).finally(() => clearTimeout(timer));
 };
 
+/**
+ * Whether this session can still run the probe the keepalive uses. A session that cannot has lost its identity (anonymous, or
+ * expired), and table permissions may then hide the task, so the caller must not report it as absent. A session that can is
+ * authenticated; its token role makes it a system user, which table permissions do not limit, so a row it cannot see is absent.
+ */
+const sessionReadable = async (database: DeskDatabase): Promise<boolean> => {
+  try {
+    await bounded(database.db.query('INFO FOR DB;'), 10_000);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Runs an owner operation that reads or writes a task through table permissions. A session without its identity sees the rows it may
+ * not read as absent, so a refusal counts as absence only while the session can still read the database. When it cannot, the connection
+ * is rebuilt (if this desk owns one) and the operation runs once more. Still unreadable is temporarily_unavailable (retryable), never
+ * "task not found". The operation must be safe to repeat after a refusal that wrote nothing.
+ */
+export async function withSessionCheck<T>(database: DeskDatabase, operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (!sessionRefusal(error) || await sessionReadable(database)) throw error;
+    // The session cannot read the database, so the task may only look missing. Rebuild the connection when this desk owns one,
+    // then try once more. A refused operation wrote nothing, and the idempotency key still guards a repeat.
+    await database.ensureConnected?.().catch(() => undefined);
+    try {
+      return await operation();
+    } catch (retry) {
+      if (!sessionRefusal(retry) || await sessionReadable(database)) throw retry;
+      throw new CompanyError('temporarily_unavailable', SESSION_RETRY, true);
+    }
+  }
+}
+
 export class OwnerDesk {
   constructor(private readonly database: DeskDatabase, private readonly opsRepo?: string) {
   }
@@ -84,34 +121,7 @@ export class OwnerDesk {
 
   /** approve/reject an owner-reviewed gate, or reply to a task blocked to the owner. */
   async decide(input: DecideInput): Promise<TaskView> {
-    try {
-      return await this.decideOnce(input);
-    } catch (error) {
-      if (!sessionRefusal(error) || await this.sessionReadable()) throw error;
-      // The session cannot read the database, so the task may only look missing. Rebuild the connection when this desk owns one,
-      // then decide once more. A failed transaction wrote nothing, and the idempotency key still guards a repeat.
-      await this.database.ensureConnected?.().catch(() => undefined);
-      try {
-        return await this.decideOnce(input);
-      } catch (retry) {
-        if (!sessionRefusal(retry) || await this.sessionReadable()) throw retry;
-        throw new CompanyError('temporarily_unavailable', SESSION_RETRY, true);
-      }
-    }
-  }
-
-  /**
-   * Whether this session can still run the probe the keepalive uses. A session that cannot has lost its identity (anonymous, or
-   * expired), and table permissions may then hide the task, so the caller must not report it as absent. A session that can is
-   * authenticated; its token role makes it a system user, which table permissions do not limit, so a row it cannot see is absent.
-   */
-  private async sessionReadable(): Promise<boolean> {
-    try {
-      await bounded(this.db.query('INFO FOR DB;'), 10_000);
-      return true;
-    } catch {
-      return false;
-    }
+    return withSessionCheck(this.database, () => this.decideOnce(input));
   }
 
   private async decideOnce(input: DecideInput): Promise<TaskView> {
