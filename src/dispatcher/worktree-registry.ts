@@ -476,6 +476,8 @@ export class WorktreeRegistry {
             const recovery = live.filter(r => refState(r) === 'recovery');
             // The task table is the owner: read under this repo lock, before any decision on this tree. A released reference
             // is not a release while a non-terminal task still names the tree, so the release clock waits for the task.
+            // This one read decides the tree below. Only a claim binds a task to a tree, and it does so under this same lock;
+            // no transition returns a done or void task to work. So the open count cannot rise before the delete decision.
             const authority = await this.authorityOf(row.id);
             if (!active.length && !recovery.length && live.length && !authority.open && !authority.unreadable) {
               const latest = live.map(r => this.asDate(r.at)).filter((d): d is Date => !!d).sort((a, b) => b.getTime() - a.getTime())[0];
@@ -491,14 +493,13 @@ export class WorktreeRegistry {
             }
             const dirty = !!(tree && meaningfulChanges(await git(row.path, ['status', '--porcelain']).catch(() => 'unavailable')));
             const status: WorktreeView['status'] = !tree ? 'missing' : tree.branch !== row.branch ? 'drift' : 'present';
-            // Re-read refs and the task table inside the lock immediately before any delete decision.
+            // Re-read refs inside the lock immediately before any delete decision.
             const freshRefs = (await this.refs(repo)).filter(r => String(r.tree.id) === String(row.id.id));
-            const freshAuthority = await this.authorityOf(row.id);
             // A row whose tree is gone, whose task ended (refs released) and whose branch no open
             // task needs is pure litter: drop it instead of keeping a permanent "missing" alert.
             // Exclusive task trees only — shared/protected rows stay so a human can explain them.
             const anyLiveRef = freshRefs.some(r => refState(r) !== 'released');
-            if (status === 'missing' && row.mode === 'exclusive' && !anyLiveRef && !freshAuthority.open && !freshAuthority.unreadable
+            if (status === 'missing' && row.mode === 'exclusive' && !anyLiveRef && !authority.open && !authority.unreadable
               && !(await this.branchStillNeeded(row.branch))) {
               if (input.dryRun || !policy.enabled) {
                 result.kept.push({ path: row.path, reason: input.dryRun ? 'dry-run:stale-row' : 'reclaim-disabled' });
@@ -529,7 +530,7 @@ export class WorktreeRegistry {
               status, dirty,
               effectiveRefs: freshRefs.filter(r => refState(r) === 'active').length,
               recoveryRefs: freshRefs.filter(r => refState(r) === 'recovery').length,
-              authority: freshAuthority,
+              authority,
               createdAt: this.asDate(row.created_at), lastUsedAt: this.asDate(row.last_used_at),
               lastReleasedAt: this.asDate(row.last_released_at),
             }, policy);
