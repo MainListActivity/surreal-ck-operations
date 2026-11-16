@@ -26,6 +26,18 @@ export interface ReclaimPolicy {
   now: Date;
 }
 
+/**
+ * What the task table says about one tree. The non-terminal tasks that name the tree in task.worktree own it, whether or
+ * not a worktree_ref still records them. A failed read is `unreadable`, and the tree stays until it can be read.
+ */
+export interface TreeAuthority {
+  /** Non-terminal tasks whose task.worktree names this tree. */
+  open: number;
+  /** Of those, tasks whose current lease is still live. */
+  leased: number;
+  unreadable?: string;
+}
+
 export interface TreeVerdictInput {
   path: string;
   branch?: string;
@@ -38,6 +50,8 @@ export interface TreeVerdictInput {
   recoveryRefs: number;
   /** Non-terminal tasks of the tree's lane: a lane tree outlives every single task and dies with the last one. */
   laneOpen?: number;
+  /** The task table's view of the tree. Absent means the caller read no task facts (pure unit input). */
+  authority?: TreeAuthority;
   createdAt?: Date;
   lastUsedAt?: Date;
   lastReleasedAt?: Date;
@@ -89,6 +103,18 @@ export function decideReclaim(input: TreeVerdictInput, policy: ReclaimPolicy): R
   }
   if (input.recoveryRefs > 0) {
     return { action: 'skip', deletable: false, reasons: ['unfinished-scene'], companyManaged };
+  }
+  const authority = input.authority;
+  if (authority?.unreadable) {
+    return { action: 'skip', deletable: false, reasons: [authority.unreadable], companyManaged };
+  }
+  // No effective or recovery reference is left at this point, so a live lease here means the reference disagrees with
+  // the task. The scene is still the task's: keep it and flag the registry fault for follow-up.
+  if (authority?.leased) {
+    return { action: 'skip', deletable: false, reasons: ['authority-leased', 'lease-ref-mismatch'], companyManaged };
+  }
+  if (authority?.open) {
+    return { action: 'skip', deletable: false, reasons: ['authority-open'], companyManaged };
   }
   if (input.laneOpen) {
     return { action: 'skip', deletable: false, reasons: ['lane-open'], companyManaged };

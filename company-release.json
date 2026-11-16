@@ -1,18 +1,19 @@
 {
-  "version": "0.13.33",
-  "title": "修复 zsh 垫片：用户改写 ZDOTDIR 后仍剥离服务端预览签名密钥与 Cloudflare 令牌",
+  "version": "0.13.36",
+  "title": "回收先核对任务租约：引用丢失或读取失败时，不删除仍被任务持有的工作树",
   "changes": [
-    "修复：用户 ~/.zshenv 用 export 改写或 unset ZDOTDIR 时，.zprofile、.zshrc、.zlogin 会绕过垫片，SCK_PREVIEW_SECRET 与 CLOUDFLARE_API_TOKEN 重新出现在员工 shell 中。现在每个启动文件读完即剥离，并把 ZDOTDIR 导回垫片。",
-    "修复：CLOUDFLARE_API_TOKEN 在同一布局下，主线版本（0.13.28）就会经启动文件泄漏，本次与 SCK_PREVIEW_SECRET 由同一份名单一并覆盖。",
-    "原生执行端环境改由 nativeEmployeeEnv 统一生成，run.ts 与回归测试调用同一函数；ZDOTDIR 最后设置，继承值、通道值与模型路由都改不了它。",
-    "回归：真实 zsh 的 -c、-lc、-ic、-lic 四种启动，覆盖用户改写与取消 ZDOTDIR 两种布局，并覆盖原生与 Paseo 端到端；断言均使用合成值。",
-    "文档：agent-operations 垫片与边界段同步，剥离名单含 SCK_PREVIEW_SECRET，边界提到 ZDOTDIR 改写与 ZDOTDIR= zsh -i 绕过。",
-    "CI：quality 与 channel 两个作业都显式安装 zsh；CI 环境中缺少 zsh 时真实 zsh 回归判为失败，不再静默跳过。"
+    "修复：工作树回收此前只按引用判定。QA 审阅中的场景若 worktree_ref 丢失或晚到，清扫会删除仍有效租约的工作树。现在删除前同时读取任务表，任务仍指向该树即保留。",
+    "引用与有效租约不一致（引用缺失、错配或已释放）时保留该树，审计原因为 authority-leased 与 lease-ref-mismatch，并写入 cleanup_todo 待办；不再写 release 审计。",
+    "任务仍在就绪、进行、审阅或阻塞时，即使引用丢失、租约被撤销或已过期，该树都保留给任务续用（authority-open），接手人回到同一棵树。",
+    "任务表读取失败或归属无法判定时保留该树（authority-unreadable）。事件点读取失败不回收，并写 fail 审计，下一次扫描可见。",
+    "done 与 void 仍是终态：干净且无引用的树照常回收，脏树继续保留并写待办。",
+    "删除前在仓库锁内重新读取引用与任务表，与并发认领互斥；不延长固定宽限，也不关闭回收。"
   ],
   "impact": [
-    "老板：服务端预览签名密钥与 Cloudflare 令牌不再经用户启动文件进入员工 shell。已发生的真实事件仍按既有流程另行轮换与记录，本变更不替代轮换，也不触碰生产密钥文件。",
-    "员工：环境与 shell 中不再出现服务端预览签名密钥；SCK_COMM_* 通道变量与供应商登录（如 OPENAI_API_KEY）照旧保留。"
+    "老板：审阅中的工作树不会因引用丢失被清扫删除。出现 lease-ref-mismatch 的树会带 cleanup_todo 待办，需对照该任务租约核对。",
+    "员工：审阅与退回续做的工作树保持原位，接手人沿用同一棵树；验收或作废后，干净的树仍会回收。",
+    "运维：worktree_audit 新增 authority-* 的 skip 原因与 event-reclaim-unreadable 的 fail 记录，可按原因定位。"
   ],
-  "migration": "无 schema 变更（沿用 schema 072）。无需迁移数据。执行端插件与原生执行端重启后生效；垫片目录随启动重写，无需人工操作。",
-  "rollback": "回退至 v0.13.28。回退后 SCK_PREVIEW_SECRET 恢复随父环境继承给员工，用户启动文件可再次导出它；其余遮蔽口径不变。"
+  "migration": "无 schema 变更（沿用 schema 072）。不需要迁移数据。插件升级后，回收在下一次事件点或 10 分钟扫描时采用新规则。",
+  "rollback": "回退至 v0.13.33。回退后回收只按引用判定，引用丢失的审阅树可能再次被清扫删除；回退前应先在 list_worktrees 中核对 authority-leased 的树。登记与审计保留。0.13.33 已含 SCK_PREVIEW_SECRET 与 zsh 垫片修复，回退到该版不会让该密钥重新继承给员工。"
 }
