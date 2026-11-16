@@ -135,7 +135,7 @@ describe('GatewayClient 轮询老板端作业（真实 ops.job.get 回执）', (
     for (const call of calls) expect(authOf(call)).toBe(`Bearer ${TOKEN}`);
   });
 
-  const CATEGORIES = ['forbidden', 'conflict', 'lease_expired', 'login_failed'] as const;
+  const CATEGORIES = ['forbidden', 'conflict', 'lease_expired', 'login_failed', 'ci_pending', 'ci_failed'] as const;
   test.each([...CATEGORIES])('作业失败：错误类别 %s 原样保留，说明写明原因，业务命令只提交一次', async code => {
     const store = createOwnerJobStore();
     const { fn, calls } = bossGateway(store, (poll, id) => {

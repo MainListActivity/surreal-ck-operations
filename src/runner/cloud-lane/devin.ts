@@ -10,8 +10,17 @@ import { join } from 'node:path';
 import { ensureBranchOnOrigin, fetchAndFastForward, type RepoInfo } from './repo.ts';
 import type { LaneDeps, LaneInput } from './lane.ts';
 
-/** Devin 云模式的免费模型。 */
+/** Devin 云模式的免费模型。公司派工只允许它（老板 2026-11-15 定），不是可覆盖的默认值。 */
 export const DEVIN_CLOUD_MODEL = 'free';
+
+/**
+ * 云端会话的模型：缺省或字面 `free` 才放行，其它值（含空白、空串、null）一律抛错。
+ * 配置校验与执行入口共用这一处：入口即使绕过配置校验也不会发出非 free 的云端会话，也不回退到账号默认或其它模型。
+ */
+export function devinCloudModel(configured: unknown): typeof DEVIN_CLOUD_MODEL {
+  if (configured === undefined || configured === DEVIN_CLOUD_MODEL) return DEVIN_CLOUD_MODEL;
+  throw new Error(`lanes.devin-cloud.model 只能是 "${DEVIN_CLOUD_MODEL}"（云端会话只用免费模型），收到 ${JSON.stringify(configured)}`);
+}
 
 interface Ctx {
   input: LaneInput; deps: LaneDeps; repo: RepoInfo;
@@ -22,6 +31,10 @@ interface Ctx {
 
 export async function driveDevin(ctx: Ctx): Promise<{ kind: 'done' | 'blocked' | 'error'; text: string; vendorTerminal?: boolean }> {
   const { input, deps, repo, material, prompt } = ctx;
+  // 执行入口的硬约束：在推送分支、发会话之前校验，非 free 直接按错误回合收尾。
+  let model: typeof DEVIN_CLOUD_MODEL;
+  try { model = devinCloudModel(input.config.model); }
+  catch (error) { return { kind: 'error', text: (error as Error).message }; }
   const continuing = Boolean(ctx.state.taskId) || Boolean(input.resumeId);
   try { await ensureBranchOnOrigin(deps.exec, input.cwd, repo.branch); }
   catch (error) { return { kind: 'error', text: (error as Error).message }; }
@@ -35,7 +48,7 @@ export async function driveDevin(ctx: Ctx): Promise<{ kind: 'done' | 'blocked' |
   deps.progress('已提交 Devin Cloud 会话（同步等待）');
   const timeoutMs = Math.max(60_000, ctx.deadline - deps.now());
   // 公司派工只用云模式的 free 模型（老板 2026-11-15 定）：不传模型的话云端会按账号默认模型计费。
-  const r = await deps.exec('devin', ['--cloud', '--model', input.config.model ?? DEVIN_CLOUD_MODEL, '-p', '--prompt-file', file], { cwd: input.cwd, timeoutMs });
+  const r = await deps.exec('devin', ['--cloud', '--model', model, '-p', '--prompt-file', file], { cwd: input.cwd, timeoutMs });
   rmSync(dir, { recursive: true, force: true });
   if (r.code !== 0)
     return { kind: 'error', text: `Devin Cloud 会话失败：${(r.stderr || r.stdout).trim().slice(0, 500)}` };

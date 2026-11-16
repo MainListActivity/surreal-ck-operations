@@ -308,14 +308,75 @@ describe('devin-cloud 通道', () => {
     return undefined;
   };
 
-  test('云端会话只用 free 模型；lanes.devin-cloud.model 可改，其它通道不接受 model', async () => {
-    const calls: string[][] = [];
-    const w = world({ extra: call => { if (call.cmd === 'devin') calls.push(call.args); return devinOk(call); } });
+  test('缺省或显式 free：实际 CLI 参数固定含 --cloud --model free', async () => {
+    const w = world({ extra: devinOk });
     await runLane(w.input({ provider: 'devin-cloud' }), w.deps);
-    expect(calls[0]!.slice(0, 3)).toEqual(['--cloud', '--model', 'free']);
+    const dflt = w.callsOf(c => c.cmd === 'devin');
+    expect(dflt).toHaveLength(1);
+    expect(dflt[0]!.args.slice(0, 4)).toEqual(['--cloud', '--model', 'free', '-p']);
+
+    const e = world({ extra: devinOk });
+    await runLane(e.input({ provider: 'devin-cloud', config: { model: 'free', pollMs: 1 } }), e.deps);
+    const explicit = e.callsOf(c => c.cmd === 'devin');
+    expect(explicit).toHaveLength(1);
+    expect(explicit[0]!.args.slice(0, 4)).toEqual(['--cloud', '--model', 'free', '-p']);
+  });
+
+  test('配置校验：devin-cloud 只接受 free；其它值、空白、空串与其它通道的 model 一律拒绝', async () => {
     const { validateLanes } = await import('../src/runner/cloud-lane/lane.ts');
+    expect(() => validateLanes({ 'devin-cloud': {} })).not.toThrow();
     expect(() => validateLanes({ 'devin-cloud': { model: 'free' } })).not.toThrow();
-    expect(() => validateLanes({ jules: { model: 'free' } })).toThrow();
+    for (const bad of ['default', 'adaptive', 'gpt-5', '', ' ', ' free', 'free ', 'FREE', 'free\n', null, 1]) {
+      expect(() => validateLanes({ 'devin-cloud': { model: bad } })).toThrow(/只能是 "free"/);
+    }
+    expect(() => validateLanes({ jules: { model: 'free' } })).toThrow(/不接受 model/);
+    expect(() => validateLanes({ 'codex-cloud': { model: 'free' } })).toThrow(/不接受 model/);
+  });
+
+  test('绕过配置校验直接进执行入口：非 free 不发任何 devin/推送命令，回合报错', async () => {
+    for (const model of ['gpt-5', '', ' free', null]) {
+      const w = world({ extra: devinOk });
+      const out = await runLane(w.input({ provider: 'devin-cloud', config: { model: model as unknown as 'free', pollMs: 1 } }), w.deps);
+      expect(out.status).toBe('error');
+      expect(out.text).toContain('只能是 "free"');
+      expect(w.callsOf(c => c.cmd === 'devin')).toHaveLength(0);
+      expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'push')).toHaveLength(0);
+      expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'merge')).toHaveLength(0);
+    }
+  });
+
+  test('续轮与复核轮同样只用 free；非 free 的复核轮也不发会话', async () => {
+    // 续轮：同一 commDir 第二次执行，仍是 free。
+    const w = world({ extra: devinOk });
+    await runLane(w.input({ provider: 'devin-cloud' }), w.deps);
+    await runLane(w.input({ provider: 'devin-cloud', prompt: '继续实现。' }), w.deps);
+    const devin = w.callsOf(c => c.cmd === 'devin');
+    expect(devin.length).toBeGreaterThanOrEqual(2);
+    for (const c of devin) expect(c.args.slice(0, 3)).toEqual(['--cloud', '--model', 'free']);
+
+    // 复核轮（task.md 含待复核成果）：只读复核，仍固定 free。
+    const review = '# 复核\n\n## 待复核成果\n\n已提交 abc123。\n\n## 验收标准\n\n- 逐条复验\n';
+    const r = world({ task: review, extra: call => call.cmd === 'devin' ? ok('复核结论：通过\n逐条证据。\n') : undefined });
+    const rout = await runLane(r.input({ provider: 'devin-cloud' }), r.deps);
+    expect(rout.status).toBe('success');
+    expect(rout.text).toMatch(/^复核结论：通过/);
+    const rdevin = r.callsOf(c => c.cmd === 'devin');
+    expect(rdevin).toHaveLength(1);
+    expect(rdevin[0]!.args.slice(0, 3)).toEqual(['--cloud', '--model', 'free']);
+
+    const bad = world({ task: review, extra: call => call.cmd === 'devin' ? ok('复核结论：通过\n') : undefined });
+    const bout = await runLane(bad.input({ provider: 'devin-cloud', config: { model: 'gpt-5' as unknown as 'free', pollMs: 1 } }), bad.deps);
+    expect(bout.status).toBe('error');
+    expect(bad.callsOf(c => c.cmd === 'devin')).toHaveLength(0);
+  });
+
+  test('会话失败不切换到其它模型：只发一次 free 会话，失败按错误回合', async () => {
+    const w = world({ extra: call => call.cmd === 'devin' ? bad('quota exhausted') : undefined });
+    const out = await runLane(w.input({ provider: 'devin-cloud' }), w.deps);
+    expect(out.status).toBe('error');
+    const devin = w.callsOf(c => c.cmd === 'devin');
+    expect(devin).toHaveLength(1);
+    expect(devin[0]!.args.slice(0, 3)).toEqual(['--cloud', '--model', 'free']);
   });
   test('同步会话输出答复；快进成功后透传 PR，声明 SHA 与实际 HEAD 一致', async () => {
     // 本地 HEAD 是 deadbeef…：Devin 声明 cafecafe 与之不符时改写为实际 HEAD 并注明。

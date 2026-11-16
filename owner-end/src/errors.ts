@@ -40,6 +40,7 @@ const CODE_OF: Readonly<Record<string, ApiErrorCode>> = {
   not_configured: 'unavailable',
   unavailable: 'unavailable',
   ci_pending: 'unavailable',
+  ci_failed: 'conflict',
   upstream_error: 'upstream_error',
 };
 
