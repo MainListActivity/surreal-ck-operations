@@ -53,6 +53,16 @@ function stageOf(text: string): string | undefined {
   return STAGE_MARK.exec(text)?.[1];
 }
 
+/** 回执正文的 JSON 类型。只说类型，不回显内容，便于排查又不泄露。 */
+function kindOf(value: unknown): string {
+  if (value === null || value === undefined) return '空值';
+  if (Array.isArray(value)) return '数组';
+  if (typeof value === 'string') return '字符串';
+  if (typeof value === 'number') return '数字';
+  if (typeof value === 'boolean') return '布尔值';
+  return '对象';
+}
+
 type Outcome =
   | { ok: true; result: unknown }
   | { ok: false; code: string; message: string; jobId?: string; stage?: string };
@@ -147,13 +157,14 @@ export class GatewayClient {
       throw new GatewayError('upstream_error', `${label}（HTTP ${res.status}），没有可读的回执`);
     }
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
-      throw new GatewayError('upstream_error', `网关响应不是对象（HTTP ${res.status}）`);
+      throw new GatewayError('upstream_error', `网关响应不是对象（HTTP ${res.status}，正文为${kindOf(body)}）`);
     }
     const envelope = body as { ok?: unknown; result?: unknown; error?: unknown };
     if (envelope.ok === true) return { ok: true, result: envelope.result };
     if (envelope.ok !== false) throw new GatewayError('upstream_error', `网关响应缺少 ok 字段（HTTP ${res.status}）`);
-    if (!envelope.error || typeof envelope.error !== 'object') {
-      throw new GatewayError('upstream_error', `网关返回的错误格式不标准（HTTP ${res.status}）`);
+    // 数组也不是错误对象：否则会得到没有码、没有说明的失败。
+    if (!envelope.error || typeof envelope.error !== 'object' || Array.isArray(envelope.error)) {
+      throw new GatewayError('upstream_error', `网关返回的错误格式不标准（HTTP ${res.status}，error 为${kindOf(envelope.error)}）`);
     }
     const err = envelope.error as { code?: unknown; message?: unknown; jobId?: unknown; jobCode?: unknown };
     const jobId = typeof err.jobId === 'string' && err.jobId !== '' && err.jobId.length <= 200 ? err.jobId : undefined;
@@ -189,19 +200,23 @@ function isJobState(value: unknown): value is JobState {
   return value === 'queued' || value === 'running' || value === 'done' || value === 'error';
 }
 
-function malformedJob(id: string): GatewayError {
-  return new GatewayError('upstream_error', '作业视图格式错误', false, { jobId: id });
+function malformedJob(id: string, reason: string): GatewayError {
+  return new GatewayError('upstream_error', `作业视图格式错误：${reason}`, false, { jobId: id });
 }
 
 /**
  * ops.job.get 的结果是 {job: 作业视图}（owner-end/src/commands.ts）。id 必须与所查的作业一致，state 必须是四种之一；
- * 其它形状（包括没有包装的旧作业视图）一律按格式错误处理，不猜测。
+ * 其它形状（包括没有包装的旧作业视图）一律按格式错误处理，不猜测。说明写明是哪一项不符，不回显内容。
  */
 function parseJob(value: unknown, id: string): JobView {
-  const job = typeof value === 'object' && value !== null ? (value as { job?: unknown }).job : undefined;
-  if (typeof job !== 'object' || job === null || Array.isArray(job)) throw malformedJob(id);
+  const wrapper = typeof value === 'object' && value !== null && !Array.isArray(value) ? value as { job?: unknown } : undefined;
+  if (wrapper === undefined || !('job' in wrapper)) throw malformedJob(id, '缺少 job 包装');
+  const job = wrapper.job;
+  if (typeof job !== 'object' || job === null || Array.isArray(job)) throw malformedJob(id, 'job 不是对象');
   const view = job as Partial<JobView>;
-  if (view.id !== id || !isJobState(view.state)) throw malformedJob(id);
+  if (view.id === undefined) throw malformedJob(id, '缺少作业号');
+  if (view.id !== id) throw malformedJob(id, '作业号与所查的作业不一致');
+  if (!isJobState(view.state)) throw malformedJob(id, '作业状态不认识');
   return view as JobView;
 }
 

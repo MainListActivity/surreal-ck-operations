@@ -107,10 +107,11 @@ describe('GatewayClient.call', () => {
   });
 
   const BAD_SHAPES: Array<[string, () => Response, string]> = [
-    ['错误字段是字符串', () => json({ ok: false, error: 'boom' }, 500), '网关返回的错误格式不标准（HTTP 500）'],
+    ['错误字段是字符串', () => json({ ok: false, error: 'boom' }, 500), '网关返回的错误格式不标准（HTTP 500，error 为字符串）'],
+    ['错误字段是数组', () => json({ ok: false, error: [] }, 500), '网关返回的错误格式不标准（HTTP 500，error 为数组）'],
     ['缺少 ok 字段', () => json({ result: 1 }, 200), '网关响应缺少 ok 字段（HTTP 200）'],
-    ['回执是数组', () => json([1, 2], 200), '网关响应不是对象（HTTP 200）'],
-    ['回执是 null', () => json(null, 200), '网关响应不是对象（HTTP 200）'],
+    ['回执是数组', () => json([1, 2], 200), '网关响应不是对象（HTTP 200，正文为数组）'],
+    ['回执是 null', () => json(null, 200), '网关响应不是对象（HTTP 200，正文为空值）'],
   ];
   test.each(BAD_SHAPES)('回执形状不对（%s）：明确失败，未受理，业务命令只提交一次', async (_label, respond, message) => {
     const { fn, calls } = fakeFetch(respond);
@@ -296,18 +297,18 @@ describe('GatewayClient 轮询老板端作业（真实 ops.job.get 回执）', (
     expect(calls.map(call => call.body.command)).toEqual(['ops_login']);
   });
 
-  const MALFORMED: Array<[string, unknown]> = [
-    ['旧的裸作业视图', { id: 'job-m', state: 'done', result: { value: 1 } }],
-    ['缺少 job', {}],
-    ['job 为 null', { job: null }],
-    ['job 是字符串', { job: 'job-m' }],
-    ['job 是数组', { job: [] }],
-    ['state 不认识', { job: { id: 'job-m', state: 'paused' } }],
-    ['缺少 id', { job: { state: 'done', result: { value: 1 } } }],
-    ['id 与所查作业不一致', { job: { id: 'job-other', state: 'done', result: { value: 1 } } }],
-    ['结果缺失（只有 ok）', undefined],
+  const MALFORMED: Array<[string, unknown, string]> = [
+    ['旧的裸作业视图', { id: 'job-m', state: 'done', result: { value: 1 } }, '作业视图格式错误：缺少 job 包装'],
+    ['缺少 job', {}, '作业视图格式错误：缺少 job 包装'],
+    ['job 为 null', { job: null }, '作业视图格式错误：job 不是对象'],
+    ['job 是字符串', { job: 'job-m' }, '作业视图格式错误：job 不是对象'],
+    ['job 是数组', { job: [] }, '作业视图格式错误：job 不是对象'],
+    ['state 不认识', { job: { id: 'job-m', state: 'paused' } }, '作业视图格式错误：作业状态不认识'],
+    ['缺少 id', { job: { state: 'done', result: { value: 1 } } }, '作业视图格式错误：缺少作业号'],
+    ['id 与所查作业不一致', { job: { id: 'job-other', state: 'done', result: { value: 1 } } }, '作业视图格式错误：作业号与所查的作业不一致'],
+    ['结果缺失（只有 ok）', undefined, '作业视图格式错误：缺少 job 包装'],
   ];
-  test.each(MALFORMED)('ops.job.get 回执畸形（%s）：明确失败，不重提交', async (_label, result) => {
+  test.each(MALFORMED)('ops.job.get 回执畸形（%s）：写明哪一项不符，明确失败，不重提交', async (_label, result, message) => {
     const { fn, calls } = fakeFetch(call =>
       call.body.command === 'ops.job.get'
         ? ok(result)
@@ -318,9 +319,43 @@ describe('GatewayClient 轮询老板端作业（真实 ops.job.get 回执）', (
     const error = await catchError(client.call(TOKEN, 'ops_login', { alias: 'QA1' }));
     expect(error).toBeInstanceOf(GatewayError);
     expect((error as GatewayError).code).toBe('upstream_error');
-    expect((error as GatewayError).message).toBe('作业视图格式错误');
+    expect((error as GatewayError).message).toBe(message);
     expect((error as GatewayError).accepted).toBe(true);
+    expect((error as GatewayError).jobId).toBe('job-m');
     expect(calls.map(call => call.body.command)).toEqual(['ops_login', 'ops.job.get']);
+  });
+
+  test('轮询时网关返回非 JSON 超时（HTTP 524）：已受理，作业号保留，正文不回显，不重提交', async () => {
+    const { fn, calls } = fakeFetch(call =>
+      call.body.command === 'ops.job.get'
+        ? new Response('<html>edge timeout secret-page</html>', { status: 524 })
+        : json({ ok: false, error: { code: 'pending', message: 'job-t1' } }, 202),
+    );
+    const client = new GatewayClient({ url: URL_BASE, fetch: fn, pollMs: 0, sleep: noSleep });
+
+    const error = await catchError(client.call(TOKEN, 'ops_login', { alias: 'QA1' })) as GatewayError;
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toBe('网关超时（HTTP 524），没有可读的回执');
+    expect(error.message).not.toContain('secret-page');
+    expect(error.accepted).toBe(true);
+    expect(error.jobId).toBe('job-t1');
+    expect(calls.map(call => call.body.command)).toEqual(['ops_login', 'ops.job.get']);
+  });
+
+  test('作业因恢复窗口已过被拒：截止时刻随说明保留，已受理，作业号保留，业务命令只提交一次', async () => {
+    const store = createOwnerJobStore();
+    const deadline = '2026-11-16T07:01:22.859Z';
+    const { fn, calls } = bossGateway(store, (poll, id) => {
+      if (poll === 1) store.fail(id, new CompanyError('upstream_error', `the recovery deadline for this operation has passed at ${deadline}`));
+    });
+    const client = new GatewayClient({ url: URL_BASE, fetch: fn, pollMs: 0, sleep: noSleep });
+
+    const error = await catchError(client.call(TOKEN, 'ops_login', { alias: 'QA1' })) as GatewayError;
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toBe(`作业执行失败：the recovery deadline for this operation has passed at ${deadline}`);
+    expect(error.accepted).toBe(true);
+    expect(error.jobId).toBe((calls[1]!.body.input as { id: string }).id);
+    expect(calls.filter(call => call.body.command === 'ops_login')).toHaveLength(1);
   });
 });
 
