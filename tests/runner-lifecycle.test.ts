@@ -40,7 +40,7 @@ import type { LeaseProof, ClaimResult } from '../src/contracts.ts';
 
 function fixture(readTurnResult?: (agent: string, turn: string) => Promise<string>) {
   const root = mkdtempSync(join(tmpdir(), 'sck-runner-flow-'));
-  const calls: Array<{ action: string; proof: LeaseProof; key: string }> = [];
+  const calls: Array<{ action: string; proof: LeaseProof; key: string; text?: string }> = [];
   let delivery = 'delivery-a', version = 2, phase: 'doing' | 'review' = 'doing', submitted = false;
   let fail = false, loseReply = false, failRead = false;
   const inst = { id: 'worker', role: 'engineering' as const, credential: 'synthetic', paseoAgentId: undefined as string | undefined };
@@ -48,8 +48,8 @@ function fixture(readTurnResult?: (agent: string, turn: string) => Promise<strin
     leaseExpiresAt: new Date(Date.now() + 600000).toISOString() });
   const result = () => ({ task: task(), fence: 1, deliveryId: delivery, leaseExpiresAt: task().leaseExpiresAt, history: [] }) as unknown as ClaimResult;
   const committed = new Set<string>();
-  const transition = (action: string) => async (_cred: string, proof: LeaseProof, evidence: { idempotencyKey: string }) => {
-    calls.push({ action, proof: { ...proof }, key: evidence.idempotencyKey });
+  const transition = (action: string) => async (_cred: string, proof: LeaseProof, evidence: { idempotencyKey: string; text?: string }) => {
+    calls.push({ action, proof: { ...proof }, key: evidence.idempotencyKey, text: evidence.text });
     if (committed.has(evidence.idempotencyKey)) return task();
     if (fail) throw new Error('synthetic network failure');
     if (proof.deliveryId !== delivery || proof.expectedVersion !== version) throw Object.assign(new Error('stale version'), { code: 'conflict' });
@@ -60,7 +60,8 @@ function fixture(readTurnResult?: (agent: string, turn: string) => Promise<strin
   const core = { claim: async () => result(), heartbeat: async () => { if (failRead) throw new Error('network'); return result(); },
     getTask: async () => { if (failRead) throw new Error('network'); return task(); },
     activeLeases: async () => submitted ? [] : [{ ...task(), taskId: 'task' }],
-    submit: transition('submit'), accept: transition('accept'), returnTask: transition('return'), block: transition('block') };
+    submit: transition('submit'), accept: transition('accept'), returnTask: transition('return'),
+    block: (cred: string, proof: LeaseProof, _to: 'owner', evidence: { idempotencyKey: string; text?: string }) => transition('block')(cred, proof, evidence) };
   const workforce = { rotate: async () => 'synthetic', insts: async () => [inst] };
   const options = { core: core as never, workforce: workforce as never, runDir: join(root, 'comm'), managedLifecycle: true, readTurnResult, heartbeatMs: 15 };
   let pool = new SidecarPool(options);
@@ -194,7 +195,7 @@ test('重复结束恢复同一 collecting 快照，不重新读取被覆盖的�
 });
 
 
-test('宿主结束事件没有正文时按回合读取，读取失败由执行端持久重试而非报告业务阻塞', async () => {
+test('宿主结束事件没有正文时按回合读取，短暂读取失败后仍自动提交', async () => {
   let available = false;
   const f = fixture(async (agent, turn) => { expect([agent,turn]).toEqual(['agent','turn-a']); if (!available) throw new Error('history unavailable'); return '真实会话最终成果已读取，计算与验证均已完成。'; });
   try {
@@ -208,7 +209,67 @@ test('宿主结束事件没有正文时按回合读取，读取失败由执行�
     expect(f.calls.map(c=>c.action)).toEqual(['submit']);expect(f.journal().rows()[0]?.state).toBe('settled');
   } finally { f.close(); }
 });
-import { readTurnResult } from '../src/runner/turn-result.ts';
+test('取不到最终答复时有限次读取，窗口耗尽后以可恢复受阻提交，不推断成功', async () => {
+  let reads = 0;
+  const f = fixture(async () => { reads++; throw new RuntimeResultError('not_yet_available', 'runtime final result not yet available'); });
+  try {
+    await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
+    await f.pool.settleExecution({ ...f.event(), timeline: [] });
+    const firstDelay = (f.journal().rows()[0]?.nextRetry ?? 0) - Date.now();
+    expect(firstDelay).toBeGreaterThan(9000);
+    expect(firstDelay).toBeLessThanOrEqual(10000);
+    for (let i = 0; i < 5; i++) await f.pool.settleExecution({ ...f.event(), timeline: [] });
+    expect(reads).toBe(1);
+    for (let i = 0; i < 10; i++) await f.retry();
+    await f.restart();
+    for (let i = 0; i < 8; i++) await f.retry();
+    expect(reads).toBe(19);
+    expect(f.journal().rows()[0]?.state).toBe('collecting');
+    expect(f.calls).toHaveLength(0);
+    await f.retry();
+    expect(reads).toBe(20);
+    expect(f.calls.map(c => c.action)).toEqual(['block']);
+    expect(f.calls[0]?.text).toContain('连续 20 次');
+    expect(f.calls[0]?.text).toContain('runtime_result_unavailable:not_yet_available');
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+    expect(f.pool.holdsLease('worker', 'task')).toBe(false);
+    await f.retry();
+    expect(reads).toBe(20);
+    expect(f.calls.map(c => c.action)).toEqual(['block']);
+  } finally { f.close(); }
+});
+test('最终答复迟到几轮后仍按正常结果自动提交，不因前几次读取失败而阻塞', async () => {
+  let reads = 0;
+  const f = fixture(async () => {
+    reads++;
+    if (reads < 6) throw new RuntimeResultError('not_yet_available', 'runtime final result not yet available');
+    return '迟到的最终成果已可读取，验证全部通过。';
+  });
+  try {
+    await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
+    await f.pool.settleExecution({ ...f.event(), timeline: [] });
+    for (let i = 0; i < 5; i++) await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['submit']);
+    expect(f.calls[0]?.text).toContain('迟到的最终成果');
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+  } finally { f.close(); }
+});
+test('受阻结果提交失败时保留同一幂等键，恢复后重放，不重复变更任务', async () => {
+  const f = fixture(async () => { throw new RuntimeResultError('timeline_unavailable', 'runtime timeline unavailable'); });
+  try {
+    await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
+    f.fail(true);
+    await f.pool.settleExecution({ ...f.event(), timeline: [] });
+    for (let i = 0; i < 19; i++) await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['block']);
+    expect(f.journal().rows()[0]?.state).toBe('pending');
+    f.fail(false); await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['block', 'block']);
+    expect(f.calls[1]?.key).toBe(f.calls[0]?.key);
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+  } finally { f.close(); }
+});
+import { readTurnResult, RuntimeResultError } from '../src/runner/turn-result.ts';
 test('宿主读取只接受目标回合的最终答复，不串新回合也不把进度当成果', async () => {
   const host = (entries: unknown[]) => ({agents:{ref:()=>({timeline:{refetch:async()=>({epoch:'e',hasOlder:false,entries})}})}}) as never;
   expect(await readTurnResult(host([
@@ -217,6 +278,18 @@ test('宿主读取只接受目标回合的最终答复，不串新回合也不�
   ]),'agent','a')).toBe('正确成果');
   await expect(readTurnResult(host([{turnId:'b',seqEnd:1,item:{type:'assistant_message',text:'旧结果'}}]),'agent','a')).rejects.toThrow('unavailable');
   await expect(readTurnResult(host([{turnId:'a',seqEnd:1,item:{type:'assistant_message',text:'正在检查'}},{turnId:'a',seqEnd:2,item:{type:'tool_call'}}]),'agent','a')).rejects.toThrow('not yet');
+});
+test('投影中工具条目晚于最终答复结束时，仍按首次出现的位置读取答复；答复之后新开的工具仍视为未完成', async () => {
+  const host = (entries: unknown[]) => ({agents:{ref:()=>({timeline:{refetch:async()=>({epoch:'e',hasOlder:false,entries})}})}}) as never;
+  // Paseo keeps a tool call at its first position (seqStart); a later completion only moves seqEnd past the answer.
+  expect(await readTurnResult(host([
+    {turnId:'a',seqStart:1,seqEnd:5,item:{type:'tool_call'}},
+    {turnId:'a',seqStart:3,seqEnd:4,item:{type:'assistant_message',text:'全部检查已通过'}},
+  ]),'agent','a')).toBe('全部检查已通过');
+  await expect(readTurnResult(host([
+    {turnId:'a',seqStart:3,seqEnd:4,item:{type:'assistant_message',text:'正在检查'}},
+    {turnId:'a',seqStart:5,seqEnd:6,item:{type:'tool_call'}},
+  ]),'agent','a')).rejects.toMatchObject({ reason: 'not_yet_available' });
 });
 
 
