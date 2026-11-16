@@ -17,7 +17,7 @@ import { lanePreferenceValue } from './dispatcher/lane-preference.ts';
 import { OutboundMessageStore, type OutboundMessage } from './outbound-messages.ts';
 import { bodyOfDispatch, unrenderMessage } from './outbound-render.ts';
 import { turnAnalysesOf } from './turn-analysis.ts';
-import { findingsFileOf, readBoard, readBoardView, renderContextFor } from './board.ts';
+import { findingsFileOf, readBoard, readBoardTask, readBoardView, renderContextFor } from './board.ts';
 import { CompanyError } from './core-errors.ts';
 import { ROLES, type CreateTask, type Role } from './contracts.ts';
 import { HASH, REQUIRED_TRACKS } from './core.ts';
@@ -332,6 +332,13 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
 
     // ---- 老板看板 ----
     case 'board.snapshot': return readBoard(db, { now: typeof input.now === 'number' ? input.now : undefined });
+    // 按任务的有界派工状态：队列位置、阻塞分类、责任方与下一触发、候选原因；不带消息正文与审计原文（员工经 company_cmd 也可调用）。
+    case 'board.task': {
+      const status = await readBoardTask(db, text(input.taskId, 'taskId'),
+        { now: typeof input.now === 'number' ? input.now : undefined });
+      if (!status) throw new CompanyError('not_found', 'task not found');
+      return status;
+    }
 
     // ---- 编制 ----
     // ---- 线的笔记 ----

@@ -270,15 +270,18 @@ export function fitAttachedNotices(data: unknown, notices: unknown[], limit: num
  * Last line of defence on the relay path. A successful answer over the budget, measured as the sidecar tool path measures it
  * (answerBytes of its data, and the whole reply line when attached notices ride along with it), is replaced by a
  * recoverable, JSON-legal error with its code, so an oversize value can never reach the caller as a cut byte stream.
+ * `narrow` names the narrowing the failed command actually supports: the sidecar tools' pageSize/cursor by default,
+ * a company_cmd command's own bounded read when the caller relays one. Never name a parameter the command refuses.
  */
-export function guardRelayResponse<T extends { ok: boolean; data?: unknown; error?: string; notices?: unknown[]; noticesTruncated?: unknown }>(res: T):
+export function guardRelayResponse<T extends { ok: boolean; data?: unknown; error?: string; notices?: unknown[]; noticesTruncated?: unknown }>(res: T,
+  narrow: string = 'pageSize or a cursor'):
   T | { ok: false; code: 'response_too_large'; retryable: false; error: string } {
   if (!res.ok) return res;
   const bytes = relayReplyBytes(res);
   if (bytes <= RESPONSE_BUDGET_BYTES) return res;
   return {
     ok: false, code: 'response_too_large', retryable: false,
-    error: `response_too_large: ${bytes} bytes exceed the ${RESPONSE_BUDGET_BYTES}-byte budget; narrow the query with pageSize or a cursor`,
+    error: `response_too_large: ${bytes} bytes exceed the ${RESPONSE_BUDGET_BYTES}-byte budget; narrow the query with ${narrow}`,
   };
 }
 

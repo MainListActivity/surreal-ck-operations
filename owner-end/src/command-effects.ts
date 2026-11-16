@@ -5,6 +5,7 @@ const READ_ONLY = new Set([
   'brief',
   'inbox',
   'board.snapshot',
+  'board.task',
   'db.read',
   'translate.preview',
   'idp.status',
