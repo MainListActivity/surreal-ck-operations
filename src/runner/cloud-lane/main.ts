@@ -43,7 +43,7 @@ async function main(): Promise<number> {
   try { config = JSON.parse(process.env.SCK_LANE_CONFIG ?? '{}') as LaneConfig; }
   catch { config = {}; }
   const deps: LaneDeps = { exec: laneExecFile(config.bin), fetch, sleep: ms => new Promise(r => setTimeout(r, ms)), now: () => Date.now(),
-    progress: status => emit({ type: 'lane_status', status }),
+    progress: (status, phase) => emit({ type: 'lane_status', status, ...(phase ? { phase } : {}) }),
     // devin-cloud 的网页入口需要 ego-browser；其它通道不会调用 browse。
     browse: egoBrowse(config.bin?.['ego-browser'] ?? join(process.env.HOME ?? '/nonexistent', '.local/bin/ego-browser')) };
   emit({ type: 'system', session_id: resumeId ?? sessionStart });

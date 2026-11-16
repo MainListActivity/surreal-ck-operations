@@ -59,12 +59,12 @@
 ## 回合怎么跑
 
 - 桥接进程（`src/runner/cloud-lane/main.ts`）被当成普通原生 CLI 启动：prompt 走 stdin，逐行输出 `system`(session_id) → `lane_status`（老板端活动流显示「云端运行中：…」）→ `result` 事件。
-- 云端 agent 读不到本机文件也调不了 `sck`。0.13.19 起发给它的正文就是派工消息（老板在派工消息页看到、改过的那条，`laneMessage`）：消息里指向的文件路径换成“下文《…》”，文件内容附在后面（笔记、最新的 `findings/round-NN.md`、较长的老板答复、复核轮的 `task.md`）；工作目录行和公司命令的指引不带。退回意见按文件取、返工轮一定附上，不看派工消息的措辞；正文不是三段式时整份 `task.md` 也附上；没有派工消息时退回到整份任务材料。网页通道（Grok Bot、muse-web）同样。Devin 云模式固定网页 Free 档位：`lanes.devin-cloud.model` 只能缺省或写 `free`，其它值（含空白、空串）在 `validateLanes` 配置校验时拒绝；执行入口（`driveDevin`）在推送分支、发会话之前再校验一次，所以绕过配置也不会发出非 free 的云端会话，失败也不回退到账号默认或其它模型。发送脚本每次先在页面核验 Capability 菜单选中 Free 且档位详情是 `Free (powered by SWE-2)`，核验失败整轮不发、不降级到 Normal/Ultra/Lite/Fusion 任何付费档。这条约束只适用于 devin-cloud，本地 Devin/Paseo 的模型名不受它限制。复核轮（task.md 含「## 待复核成果」）要求只读复核，最终答复首行必须是「复核结论：通过/退回」，缺了按错误回合处理。
+- 云端 agent 读不到本机文件也调不了 `sck`。0.13.19 起发给它的正文就是派工消息（老板在派工消息页看到、改过的那条，`laneMessage`）：消息里指向的文件路径换成“下文《…》”，文件内容附在后面（笔记、最新的 `findings/round-NN.md`、较长的老板答复、复核轮的 `task.md`）；工作目录行和公司命令的指引不带。退回意见按文件取、返工轮一定附上，不看派工消息的措辞；正文不是三段式时整份 `task.md` 也附上；没有派工消息时退回到整份任务材料。网页通道（Grok Bot、muse-web）同样。Devin 云模式固定网页 Free 档位：`lanes.devin-cloud.model` 只能缺省或写 `free`，其它值（含空白、空串）在 `validateLanes` 配置校验时拒绝；执行入口（`driveDevin`）在推送分支、发会话之前再校验一次，所以绕过配置也不会发出非 free 的云端会话，失败也不回退到账号默认或其它模型。新会话、续轮与复核发送前都在页面核验 Capability 选中 Free、档位详情为 `Free (powered by SWE-2)` 且读得到席位 `N/M in use`，核验失败整轮不发、不降级到 Normal/Ultra/Lite/Fusion 任何付费档。这条约束只适用于 devin-cloud，本地 Devin/Paseo 的模型名不受它限制。复核轮（task.md 含「## 待复核成果」）要求只读复核，最终答复首行必须是「复核结论：通过/退回」，缺了按错误回合处理。
 - 代码任务要求 cwd 是关联 GitHub origin 的工作树；任务分支缺远端时先推送。非代码任务或仓库未映射 → 回合按「工作结果：受阻」收尾（成功回合，不记供应商故障）。
 - **codex-cloud**：`codex cloud exec --env <环境> --branch <分支>` → `codex cloud status` 轮询 → READY 后 `codex cloud apply` 到本地、`git add -A`、提交「<任务标题> (Codex Cloud <id>)」、推送、`gh pr list/create` 保证有 PR；空 diff 按受阻收尾。Codex Cloud 的最终消息 CLI 取不到：复核轮要求供应商把结论写进 `.sck/review.md`，桥接从 `codex cloud diff` 的补丁行提取。
-- **devin-cloud**：ego-browser 执行 `src/runner/cloud-lane/devin-web.ts` 里的页面脚本（`main.ts` 经 `LaneDeps.browse` 注入 `egoBrowse`），不再调用 `devin` CLI、不带任何 `--model` 参数。首次发送前脚本在 app.devin.ai 首页核验 Capability=Free、`Free (powered by SWE-2)` 字样与席位计数 `N/M in use`：已占用席位达到上限时在 `maxMinutes` 内持续等待，仍满则按「工作结果：受阻」收尾（成功回合，不算供应商故障），绝不切付费档、绝不回退。消息带 `[SCK-ROUND <标记>]` 行；发出去后把 `app.devin.ai/sessions/<id>` 记入 lane 状态。按下发送但回显/地址丢失时，先入「已受理核对」：在会话列表和最近会话里找本轮标记，找到就接管该会话，确认未受理才允许重发一次，绝不盲目重发。续轮/返工/复核读同一 session 地址发跟进消息（不占新席位）。随后轮询会话页：看到本轮标记 + 非 working + 连续两次读数一致才收终稿；Devin 停下等用户（blocked on the user）按受阻收尾并带回现场。非复核回合取 `PR:`/`SHA:` 行后 `git fetch + git merge --ff-only FETCH_HEAD`，非快进只报错不 reset；声明 SHA 与实际远端 HEAD 不符时按实际 HEAD 注明。
+- **devin-cloud**：ego-browser 执行 `src/runner/cloud-lane/devin-web.ts` 里的页面脚本（`main.ts` 经 `LaneDeps.browse` 注入 `egoBrowse`），不再调用 `devin` CLI、不带任何 `--model` 参数（CLI 3000.x 拒绝 `--model free`，云免费能力只在网页）。新会话前脚本在 app.devin.ai 组织页核验 Capability 选中 Free、`Free (powered by SWE-2)` 与席位计数 `N/M in use`：席位满则在 `maxMinutes` 内等待，仍满按「工作结果：受阻」收尾；档位或席位读不到有界重试后同样受阻，不切付费档、不改用其它模型。消息带 `[SCK-ROUND <标记>]` 行；按下发送前执行端先在 lane 状态里落盘 attempt 标记（与 grok-bot 同一做法），会话地址记入 `taskUrl`/`vendorSession`。续轮、返工与复核读同一会话地址发跟进消息，同样先核验 Free 与席位，不新建会话、不占新席位。按下发送之后绝不重发：会话地址或回执丢失时只做受理核对（会话列表与最近会话里找本轮标记）；核对仍不确定，或空闲的转录里连续看不到本轮标记，都按「工作结果：受阻」收尾并保留在途状态，交人工核对后恢复本任务即可，不会另建会话或另开 PR。终稿只认本轮收尾约定之后、会话已 idle 的 `[SCK-DONE <标记>]` 行：派工消息、旧轮次残留的 DONE 或状态短语、用户提示词里的例子都不算；状态 unknown 不收尾；两次读数一致才收尾。空闲却没有终稿连续确认后受阻。Devin 停下等用户（blocked on the user）按受阻收尾并带回现场。非复核回合取 `PR:`/`SHA:` 行后 `git fetch + git merge --ff-only FETCH_HEAD`，非快进只报错不 reset；声明 SHA 与实际远端 HEAD 不符时按实际 HEAD 注明。活动流分开报「尝试」与「已受理」：尝试显示为运行中；转录里出现本轮标记或会话地址后才是已受理，之前不报已派。受阻文本首行单独成行「工作结果：受阻」，原因写在下一行起。
 - **jules**：REST 会话状态机 QUEUED/PLANNING/IN_PROGRESS → COMPLETED/FAILED；`AWAITING_USER_FEEDBACK`/`AWAITING_PLAN_APPROVAL` 按受阻收尾并把 Jules 的问题带回来；续轮 `:sendMessage` 复用同一会话。
-- **幂等**：提交前把云端任务 ID、prompt 摘要、分支原子写入 `$SCK_COMM_DIR/.lane/state.json`；同摘要重启重连轮询不重复提交。提交结果不明绝不重发，报错误回合并带任务 ID/URL。
+- **幂等**：提交前把云端任务 ID、prompt 摘要、分支原子写入 `$SCK_COMM_DIR/.lane/state.json`；同摘要重启重连轮询不重复提交。提交结果不明绝不重发，报错误回合并带任务 ID/URL。Devin 网页入口同样：按下发送之后不重发，只核对受理（见上）。
 - **超时**：`lanes.<provider>.maxMinutes`（默认 180 分钟），约 25 秒轮询一次；超时按错误回合处理，文案说明云端任务可能仍在运行。
 
 ## 额度
@@ -73,7 +73,7 @@
 
 - `codex-cloud`：`GET https://chatgpt.com/backend-api/wham/usage`，用 `~/.codex/auth.json` 的 `tokens.access_token` / `tokens.account_id`；`primary_window`/`secondary_window` 映射成 5 小时/周窗口。
 - `jules`：桥接进程在 `<native根>/lanes/jules-usage.json` 记录每次创建会话的时间，按滚动 24 小时计数对照 `lanes.jules.dailyLimit`（默认 100）。
-- `devin-cloud`：没有独立额度端点；Free 档位的并发席位（`N/M in use`）在每次发送前由页面实时核验，满座等待到时限按受阻收尾，不记供应商故障。
+- `devin-cloud`：没有独立额度端点；Free 档位的并发席位（`N/M in use`）在每次新会话、续轮与复核发送前由页面实时核验，读数记入 lane 状态 `devin.seats`。满座等待到时限按受阻收尾，不记供应商故障。
 
 读取失败一律 fail open：不报这行，绝不当成额度为 0。老板端运维页「订阅额度」与 `sck owner quota.list '{}'` 展示全部快照和耗尽中的 provider。
 

@@ -18,6 +18,17 @@ export interface LaneState {
   digest?: string;
   branch?: string;
   submittedAt?: number;
+  /** devin-cloud 网页入口的记录：发送前落盘的 attempt 标记，以及最近一次核验到的档位与席位读数。 */
+  devin?: DevinLaneState;
+}
+
+export interface DevinSeatReading { step: 'send' | 'follow'; cap: string; used: number; total: number; at: number }
+export interface DevinLaneState {
+  /** 按下发送前落盘的本轮标记：进程在按下之后、拿到回执之前中断时，重启只做受理核对，不重发。 */
+  attempt?: string;
+  attemptAt?: number;
+  /** 最近一次发送前核验的 Capability 与 N/M in use 席位读数（审计用，不含页面原文）。 */
+  seats?: DevinSeatReading;
 }
 
 /** 回合摘要：provider + 交给供应商的完整 prompt（含 task.md 与 findings），不是外层派工消息。 */

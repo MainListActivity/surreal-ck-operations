@@ -9,6 +9,9 @@
  * - 会话页转录里发言人行是 "Devin:"、"<用户名>:"、"Automation:"；状态行有
  *   "Devin is working"、"Devin is awaiting instructions"、"Devin chose to stop working"、
  *   "blocked on the user"。会话页 Capability 按钮显示该会话的档位（Free）。
+ *
+ * 终稿与状态只看「本轮收尾约定之后」的文字：约定里的「[SCK-DONE 标记]」只出现在本轮用户消息中，
+ * 它之后才是本轮 Devin 的回答区。派工消息、旧轮次残留的 DONE 或状态短语、用户例子都在它之前，不参与判定。
  * 发送不是幂等的：按下 Send 前打印 __PRESSED__，脚本中途死掉时执行端知道「可能已发出」，绝不重发，
  * 而是回会话列表/原会话按本轮标记核对是否已受理。
  */
@@ -35,11 +38,20 @@ export function parseSeats(text: string): DevinSeats | undefined {
 
 /** 会话状态：working 还在干活；blocked 停下来等用户；idle 一轮结束；unknown 读不出。 */
 export type DevinStatus = 'working' | 'idle' | 'blocked' | 'unknown';
+/** 纯文本版状态判定（与页面内 read() 同规则：取最后出现的状态短语）。 */
 export function devinStatus(text: string): DevinStatus {
-  if (/Devin is working/i.test(text)) return 'working';
-  if (/blocked on the user/i.test(text)) return 'blocked';
-  if (/Devin is awaiting instructions|Devin chose to stop working/i.test(text)) return 'idle';
-  return 'unknown';
+  const hits: Array<[DevinStatus, number]> = [];
+  const at = (re: RegExp, status: DevinStatus) => {
+    const g = new RegExp(re.source, 'gi');
+    let idx = -1, m: RegExpExecArray | null;
+    while ((m = g.exec(text))) idx = m.index;
+    if (idx >= 0) hits.push([status, idx]);
+  };
+  at(/Devin is working/, 'working');
+  at(/blocked on the user/, 'blocked');
+  at(/Devin is awaiting instructions|Devin chose to stop working/, 'idle');
+  hits.sort((a, b) => b[1] - a[1]);
+  return hits[0]?.[0] ?? 'unknown';
 }
 
 /** 页面内 read() 共用的表达式串：状态、席位、选中档位、本轮标记与终稿。DOM 只在 p.evaluate 里访问。 */
@@ -49,14 +61,25 @@ const read = () => p.evaluate(() => {
   const mainText = ((document.querySelector('main') ?? document.body).innerText || '');
   const body = document.body.innerText || '';
   const TASK = ${JSON.stringify(`[SCK-ROUND ${marker}]`)}, DONE = ${JSON.stringify(`[SCK-DONE ${marker}]`)};
+  const QUOTED = ${JSON.stringify(`「[SCK-DONE ${marker}]」`)};
   const capButton = [...document.querySelectorAll('button')].find(e => /^(${CAPS.join('|')})$/.test((e.innerText || '').trim()));
+  // 收尾约定里引用的「[SCK-DONE 标记]」只在本轮用户消息中出现：取它之后的文字作为本轮 Devin 的回答区。
+  const at = mainText.lastIndexOf(QUOTED);
+  const region = at >= 0 ? mainText.slice(at + QUOTED.length) : '';
+  const lines = region.split('\\n');
+  const strip = (l) => l.trim().replace(/^Devin:\\s*/, '');
+  let di = -1;
+  for (let i = lines.length - 1; i >= 0; i--) { if (strip(lines[i]).startsWith(DONE)) { di = i; break; } }
   let done = null;
-  const d = mainText.lastIndexOf(DONE);
-  if (d >= 0) {
-    done = mainText.slice(d + DONE.length)
-      .split(/\\n/).filter(l => !/^(Worked|Thought) for |^Devin (is|chose|s)|^Automation:|^Ask Devin|^Computer$|^Free$/.test(l.trim()))
+  if (di >= 0) {
+    done = [strip(lines[di]).slice(DONE.length), ...lines.slice(di + 1)]
+      .filter(l => !/^(Worked|Thought) for |^Devin (is|chose|s)|^Automation:|^Ask Devin|^Computer$|^Free$|^Devin:?$/.test(l.trim()))
       .join('\\n').trim();
   }
+  // 状态短语只取回答区里最后出现的那一个；回答区外（旧轮次）的状态短语不算。
+  const lastAt = (re) => { let idx = -1, m; const g = new RegExp(re.source, 'gi'); while ((m = g.exec(region))) idx = m.index; return idx; };
+  const hits = [['working', lastAt(/Devin is working/)], ['blocked', lastAt(/blocked on the user/)], ['idle', lastAt(/Devin is awaiting instructions|Devin chose to stop working/)]]
+    .filter(h => h[1] >= 0).sort((a, b) => b[1] - a[1]);
   const seats = (body.match(/(\\d+)\\s*\\/\\s*(\\d+)\\s*in use/i) || []).slice(1, 3).map(Number);
   return {
     url: location.href,
@@ -67,17 +90,18 @@ const read = () => p.evaluate(() => {
     powered: /powered by SWE-2/i.test(body),
     seats: seats.length === 2 ? { used: seats[0], total: seats[1] } : null,
     markerSeen: mainText.includes(TASK),
-    status: /Devin is working/i.test(mainText) ? 'working'
-      : /blocked on the user/i.test(mainText) ? 'blocked'
-      : /Devin is awaiting instructions|Devin chose to stop working/i.test(mainText) ? 'idle' : 'unknown',
+    convSeen: at >= 0,
+    status: hits.length ? hits[0][0] : 'unknown',
     done,
-    tail: mainText.slice(-1500),
+    tail: (region.trim() || mainText).slice(-1500),
   };
 });`;
 }
 
-function prelude(url: string): string {
+/** 脚本模式：测试与执行端据此区分发送/跟进/受理核对/轮询脚本。 */
+function prelude(url: string, mode: string): string {
   return `
+const MODE = ${JSON.stringify(mode)};
 const emit = (r) => { console.log('__RESULT__' + JSON.stringify(r)); };
 const space = await taskSpace(${JSON.stringify(DEVIN_SPACE)});
 const p = (await space.pages())[0] ?? await space.newPage();
@@ -98,26 +122,32 @@ function withMarker(script: string, marker: string): string {
   return script.replaceAll('__MARKER__', marker);
 }
 
-/** 打开会话页读状态：登录、本轮标记、工作状态与 SCK-DONE 终稿。 */
+/** 打开会话页读状态：登录、本轮标记、工作状态、席位与 SCK-DONE 终稿（只取本轮收尾约定之后的文字）。 */
 export function devinSessionScript(sessionUrl: string, marker: string): string {
-  return withMarker(`${prelude(sessionUrl)}
+  return withMarker(`${prelude(sessionUrl, 'session')}
 const s = await read();
 if (s.login) { emit({ ok: false, code: 'login_required' }); process.exit(0); }
 if (!ready) { emit({ ok: false, code: 'not_ready' }); process.exit(0); }
-emit({ ok: true, url: s.url, cap: s.cap, markerSeen: s.markerSeen, status: s.status, done: s.done, tail: s.tail });
+emit({ ok: true, url: s.url, cap: s.cap, seats: s.seats, markerSeen: s.markerSeen, convSeen: s.convSeen, status: s.status, done: s.done, tail: s.tail });
 `, marker);
 }
 
-/** 续轮：在原会话里发下一条消息；会话正忙时回 busy，由执行端等待空闲后重试。 */
+/**
+ * 续轮：在原会话里发下一条消息。发送前核验 Capability 仍是 Free 且读得到席位、未满（与新会话同一标准）。
+ * 会话正忙回 busy；席位满回 quota_full；核验不过回 capability；两者都不会碰发送按钮。
+ */
 export function devinFollowScript(sessionUrl: string, marker: string, message: string): string {
-  return withMarker(`${prelude(sessionUrl)}
+  return withMarker(`${prelude(sessionUrl, 'follow')}
 const MSG = ${JSON.stringify(message)};
 let s = await read();
 if (s.login) { emit({ ok: false, code: 'login_required' }); process.exit(0); }
 if (!ready) { emit({ ok: false, code: 'not_ready' }); process.exit(0); }
 if (s.cap !== 'Free') { emit({ ok: false, code: 'capability', detail: '会话 Capability 显示 ' + String(s.cap) + '，不是 Free' }); process.exit(0); }
-if (s.markerSeen) { emit({ ok: true, already: true, url: s.url }); process.exit(0); }
+if (s.markerSeen) { emit({ ok: true, already: true, url: s.url, cap: 'Free', seats: s.seats }); process.exit(0); }
 if (s.status === 'working') { emit({ ok: false, code: 'busy' }); process.exit(0); }
+if (!s.seats) { emit({ ok: false, code: 'capability', detail: '会话页读不到 N/M in use 席位计数，无法核验容量' }); process.exit(0); }
+if (s.seats.used >= s.seats.total) { emit({ ok: false, code: 'quota_full', seats: s.seats.used + '/' + s.seats.total, cap: 'Free' }); process.exit(0); }
+const pre = s.seats;
 const target = 'css:' + ${JSON.stringify(INPUT)};
 await p.fill(target, MSG);
 await p.waitForTimeout(500);
@@ -128,16 +158,17 @@ for (let i = 0; i < 8; i++) {
   s = await read();
   if (s.markerSeen) break;
 }
-emit({ ok: s.markerSeen, code: s.markerSeen ? undefined : 'not_echoed', url: s.url });
+emit(s.markerSeen ? { ok: true, url: s.url, cap: 'Free', seats: pre, echoed: true } : { ok: false, code: 'not_echoed', url: s.url, cap: 'Free', seats: pre });
 `, marker);
 }
 
 /**
  * 新会话：先按标记查会话列表（中断后已发出的不再重发），再核验 Free 与席位，然后才发送。
  * 席位满回 quota_full；档位无法确认回 capability；两者都不会碰发送按钮。
+ * 回执语义：ok 且带会话地址 = 已受理（转录里看到本轮标记）；not_echoed/pressed = 已按下发送但未受理证据，执行端只核对不重发。
  */
 export function devinSendScript(home: string, marker: string, message: string): string {
-  return withMarker(`${prelude(home)}
+  return withMarker(`${prelude(home, 'send')}
 const MSG = ${JSON.stringify(message)};
 let s = await read();
 if (s.login) { emit({ ok: false, code: 'login_required' }); process.exit(0); }
@@ -150,7 +181,7 @@ const found = await p.evaluate((T) => {
   }
   return null;
 }, TASK);
-if (found) { emit({ ok: true, recovered: found }); process.exit(0); }
+if (found) { emit({ ok: true, recovered: found, cap: 'Free' }); process.exit(0); }
 // 选中 Free：触发按钮不是 Free 时打开 Capability 菜单点 Free 行，然后回读页面文字核验。
 if (s.cap !== 'Free') {
   await p.evaluate(() => { const b = [...document.querySelectorAll('button')].find(e => /^(Fusion|Ultra|Normal|Lite|Free)$/.test((e.innerText || '').trim())); if (b) b.click(); });
@@ -165,7 +196,8 @@ if (s.cap !== 'Free') {
 }
 if (s.cap !== 'Free' || !s.powered) { emit({ ok: false, code: 'capability', detail: 'Capability 未能确认选中 Free（按钮=' + String(s.cap) + '，powered=' + String(s.powered) + '）' }); process.exit(0); }
 if (!s.seats) { emit({ ok: false, code: 'capability', detail: '页面读不到 Free 席位计数，无法审计容量' }); process.exit(0); }
-if (s.seats.used >= s.seats.total) { emit({ ok: false, code: 'quota_full', seats: s.seats.used + '/' + s.seats.total }); process.exit(0); }
+if (s.seats.used >= s.seats.total) { emit({ ok: false, code: 'quota_full', seats: s.seats.used + '/' + s.seats.total, cap: 'Free' }); process.exit(0); }
+const pre = s.seats;
 const target = 'css:' + ${JSON.stringify(INPUT)};
 await p.fill(target, MSG);
 await p.waitForTimeout(500);
@@ -178,16 +210,19 @@ for (let i = 0; i < 15; i++) {
   url = s.url;
   if (${DEVIN_SESSION_RE}.test(url) && s.markerSeen) break;
 }
-emit(${DEVIN_SESSION_RE}.test(url) ? { ok: true, url, echoed: s.markerSeen } : { ok: false, code: 'pressed', url });
+const onSession = ${DEVIN_SESSION_RE}.test(url);
+if (onSession && s.markerSeen) emit({ ok: true, url, cap: 'Free', seats: pre, echoed: true });
+else if (onSession) emit({ ok: false, code: 'not_echoed', url, cap: 'Free', seats: pre });
+else emit({ ok: false, code: 'pressed', cap: 'Free', seats: pre });
 `, marker);
 }
 
 /**
- * 已按下发送但会话地址丢失时的受理核对：会话列表里按本轮标记找，找不到再逐个打开
- * 最近几条会话看转录里有没有标记。只在「可能已发出」后使用，绝不发送。
+ * 已按下发送但受理未确认时的核对：会话列表里按本轮标记找，找不到再逐个打开最近几条会话看转录。
+ * 只读、绝不发送。列表可能截断，所以「没找到」只是未受理证据不足，执行端据此受阻交人工核对，不重发。
  */
 export function devinRecoverScript(home: string, marker: string, probe = 6): string {
-  return withMarker(`${prelude(home)}
+  return withMarker(`${prelude(home, 'recover')}
 const TASK = ${JSON.stringify(`[SCK-ROUND ${marker}]`)};
 let s = await read();
 if (s.login) { emit({ ok: false, code: 'login_required' }); process.exit(0); }
@@ -206,6 +241,6 @@ for (const url of links.slice(0, ${probe})) {
   const seen = await p.evaluate((T) => ((document.querySelector('main') ?? document.body).innerText || '').includes(T), TASK);
   if (seen) { emit({ ok: true, found: url }); process.exit(0); }
 }
-emit({ ok: true, found: null, probed: Math.min(links.length, ${probe}) });
+emit({ ok: true, found: null, listed: links.length, probed: Math.min(links.length, ${probe}) });
 `, marker);
 }

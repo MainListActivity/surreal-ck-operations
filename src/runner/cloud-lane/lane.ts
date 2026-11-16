@@ -60,13 +60,16 @@ export function validateLanes(lanes: unknown): asserts lanes is Partial<Record<L
   }
 }
 
+/** 进展所处的阶段：尝试（还没有受理证据）、已受理、未取得受理证据。只有 accepted 才能写成“已派”。 */
+export type LaneProgressPhase = 'attempt' | 'accepted' | 'failed';
+
 export interface LaneDeps {
   exec: ExecFn;
   fetch: typeof fetch;
   sleep(ms: number): Promise<void>;
   now(): number;
   /** 每步进展以 lane_status 事件输出给执行端活动流。 */
-  progress(status: string): void;
+  progress(status: string, phase?: LaneProgressPhase): void;
   /**
    * ego-browser 页面脚本执行器（与 grok-bot 通道同签名）：devin-cloud 经网页入口执行时需要；
    * 其它通道不调用。脚本只回 `__RESULT__{json}`，已按下发送后中断回 `{code:'pressed'}`。
@@ -92,6 +95,7 @@ export interface LaneInput {
 /** 云端回合终态：success 也可能是「工作结果：受阻」文本（执行端按受阻收尾，不记供应商故障）。 */
 export interface LaneOutcome { sessionId: string; status: 'success' | 'error'; text: string }
 
+/** 受阻文本的首行必须整行就是它（执行端按首行判定）；原因写在下一行起。 */
 const BLOCKED = '工作结果：受阻';
 
 /** 复核轮：task.md 含待复核成果段。最终答复首行必须是复核结论，缺了按错误回合处理。 */
@@ -187,6 +191,8 @@ interface VendorOutcome {
   text: string;
   /** error 且为供应商明确报告的终态失败（如 codex [ERROR]、Jules FAILED）：清除在途登记，允许重新提交。 */
   vendorTerminal?: boolean;
+  /** blocked 且供应商会话仍在途（已按下发送）：保留在途登记，恢复时只核对，不再提交。 */
+  inflight?: boolean;
 }
 
 /** 按供应商分派；返回该轮最终答复文本与性质。 */
@@ -222,7 +228,7 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
   const state = readLaneState(input.commDir) ?? { sessionId: `lane-${crypto.randomUUID()}` };
   const sessionId = input.resumeId ?? state.sessionId;
   const fail = (text: string): LaneOutcome => ({ sessionId, status: 'error', text });
-  const blocked = (text: string): LaneOutcome => ({ sessionId, status: 'success', text: `${BLOCKED}：${text}` });
+  const blocked = (text: string): LaneOutcome => ({ sessionId, status: 'success', text: `${BLOCKED}\n${text}` });
   if (!isLaneProvider(input.provider)) return fail(`未知云端通道：${input.provider}`);
   if (input.provider === 'warp') return fail('warp 走本地桥接进程（src/runner/warp/main.ts），不经云端通道');
   if ((WEB_CHAT_PROVIDERS as readonly string[]).includes(input.provider)) return fail(`${input.provider} 走网页桥接进程（src/runner/grok-bot/main.ts），不经云端通道`);
@@ -261,8 +267,9 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
   }
   try {
     const outcome = await drive({ input, deps, repo, material, prompt, state: next, digest, deadline });
-    if (outcome.kind !== 'error' || outcome.vendorTerminal) {
+    if (!outcome.inflight && (outcome.kind !== 'error' || outcome.vendorTerminal)) {
       // 完成、受阻、供应商终态失败：回合有了定论，清除登记并清掉在途任务标记（失败可重新提交）。
+      // 仍在途的受阻（供应商会话已发出、等待核对）保留标记，恢复时不再发送。
       clearInflight(input.stateRoot, input.provider, digest);
       writeLaneState(input.commDir, { ...next, taskId: undefined, taskUrl: undefined, submittedAt: undefined,
         ...(outcome.vendorTerminal ? { vendorSession: undefined } : {}) });
@@ -271,7 +278,7 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
       recordInflight(input.stateRoot, input.provider, digest, next);
     }
     if (outcome.kind === 'error') return fail(outcome.text);
-    if (outcome.kind === 'blocked') return { sessionId, status: 'success', text: outcome.text.startsWith(BLOCKED) ? outcome.text : `${BLOCKED}：${outcome.text}` };
+    if (outcome.kind === 'blocked') return { sessionId, status: 'success', text: outcome.text.startsWith(BLOCKED) ? outcome.text : `${BLOCKED}\n${outcome.text}` };
     if (material.review && !REVIEW_PREFIX.test(outcome.text.trimStart()))
       return fail('云端复核答复首行不是「复核结论：通过/退回」，按协议不计为复核结果');
     return { sessionId, status: 'success', text: outcome.text };
