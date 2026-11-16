@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -594,16 +595,18 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     const dir = mkdtempSync(join(tmpdir(), 'sck-ego-fake-'));
     dirs.push(dir);
     const pressed = join(dir, 'ego-pressed');
-    writeFileSync(pressed, '#!/bin/sh\necho __PRESSED__\nexec sleep 30\n');
+    // 脚本带 warm 分支，计时前先空跑一次：macOS 对新写出的可执行文件首次执行要做安全扫描（实测 0.5–2 秒），
+    // 这段时间不该算进超时窗口；之后再执行只要约 20 毫秒。超时只用来杀进程，标记必须在被杀之前写进管道。
+    writeFileSync(pressed, '#!/bin/sh\n[ "$1" = warm ] && exit 0\necho __PRESSED__\nexec sleep 30\n');
     chmodSync(pressed, 0o755);
-    // 超时只用来杀进程，不参与「是否已按下」的判定；标记必须在被杀之前写进管道，所以窗口要留足给 /bin/sh 启动
-    // 与 echo（CI 并行加载时 1.5 秒会偶发来不及，4 秒也不稳）。这里用 6 秒窗口，测试预算 15 秒。
+    spawnSync(pressed, ['warm']);
     expect(await egoBrowse(pressed)('x', 6_000)).toEqual({ ok: false, code: 'pressed' });
     const silent = join(dir, 'ego-silent');
     writeFileSync(silent, '#!/bin/sh\nexit 1\n');
     chmodSync(silent, 0o755);
+    spawnSync(silent);
     expect(await egoBrowse(silent)('x', 5_000)).toBeUndefined();
-  }, 15_000);
+  }, 20_000);
 
   test('egoBrowse：孙进程占着管道、close 迟迟不来 → 5 秒兜底后保守报 pressed（去掉宽限就会超时）', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'sck-ego-hold-'));
@@ -612,8 +615,9 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     // 后台 sleep 继承了 stdout；exec 之后的前台 sleep 被 SIGKILL 杀掉，但后台那个仍占着管道，close 要等 60 秒。
     // 窗口给 3 秒，确保 kill 时后台子进程已经起来（否则管道立即关闭，用例就没有测到兜底）。
     // 兜底约 5 秒；若去掉它，这个用例要等后台的 sleep 60 结束才 close，远超 25 秒的测试预算而失败。
-    writeFileSync(hold, '#!/bin/sh\n(sleep 60) &\nexec sleep 60\n');
+    writeFileSync(hold, '#!/bin/sh\n[ "$1" = warm ] && exit 0\n(sleep 60) &\nexec sleep 60\n');
     chmodSync(hold, 0o755);
+    spawnSync(hold, ['warm']);
     const started = Date.now();
     expect(await egoBrowse(hold)('x', 3_000)).toEqual({ ok: false, code: 'pressed' });
     expect(Date.now() - started).toBeLessThan(20_000);
