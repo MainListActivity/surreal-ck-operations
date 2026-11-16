@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Surreal } from 'surrealdb';
@@ -24,6 +24,8 @@ run('真实公司 fork：读取长期阻塞员工及原因，不依赖近期事�
     await db.signin({username:'root',password:'runtime-room-fixture'});
     await db.query('DEFINE NAMESPACE rooms; USE NS rooms; DEFINE DATABASE fixture;');
     await db.use({namespace:'rooms',database:'fixture'});
+    // schema 067: the dashboard reads reply_translation for blocked audits (runtime-dashboard.ts).
+    await db.query(readFileSync(join(import.meta.dir,'../schema/067-reply-translation.surql'),'utf8'));
     await db.query(`
       DEFINE TABLE company_meta SCHEMALESS;
       DEFINE TABLE outbound_message SCHEMALESS;
