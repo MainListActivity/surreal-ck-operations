@@ -60,13 +60,16 @@ export function validateLanes(lanes: unknown): asserts lanes is Partial<Record<L
   }
 }
 
+/** 进展所处的阶段：尝试（还没有受理证据）、已受理、未取得受理证据。只有 accepted 才能写成“已提交”。 */
+export type LaneProgressPhase = 'attempt' | 'accepted' | 'failed';
+
 export interface LaneDeps {
   exec: ExecFn;
   fetch: typeof fetch;
   sleep(ms: number): Promise<void>;
   now(): number;
-  /** 每步进展以 lane_status 事件输出给执行端活动流。 */
-  progress(status: string): void;
+  /** 每步进展以 lane_status 事件输出给执行端活动流；没有 phase 的进展不涉及受理判断。 */
+  progress(status: string, phase?: LaneProgressPhase): void;
 }
 
 export interface LaneInput {
@@ -87,6 +90,7 @@ export interface LaneInput {
 /** 云端回合终态：success 也可能是「工作结果：受阻」文本（执行端按受阻收尾，不记供应商故障）。 */
 export interface LaneOutcome { sessionId: string; status: 'success' | 'error'; text: string }
 
+/** 受阻文本的首行必须整行就是它（执行端 workResult 按首行判定）；原因写在下一行起。 */
 const BLOCKED = '工作结果：受阻';
 
 /** 复核轮：task.md 含待复核成果段。最终答复首行必须是复核结论，缺了按错误回合处理。 */
@@ -217,7 +221,7 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
   const state = readLaneState(input.commDir) ?? { sessionId: `lane-${crypto.randomUUID()}` };
   const sessionId = input.resumeId ?? state.sessionId;
   const fail = (text: string): LaneOutcome => ({ sessionId, status: 'error', text });
-  const blocked = (text: string): LaneOutcome => ({ sessionId, status: 'success', text: `${BLOCKED}：${text}` });
+  const blocked = (text: string): LaneOutcome => ({ sessionId, status: 'success', text: `${BLOCKED}\n${text}` });
   if (!isLaneProvider(input.provider)) return fail(`未知云端通道：${input.provider}`);
   if (input.provider === 'warp') return fail('warp 走本地桥接进程（src/runner/warp/main.ts），不经云端通道');
   if ((WEB_CHAT_PROVIDERS as readonly string[]).includes(input.provider)) return fail(`${input.provider} 走网页桥接进程（src/runner/grok-bot/main.ts），不经云端通道`);
@@ -266,7 +270,7 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
       recordInflight(input.stateRoot, input.provider, digest, next);
     }
     if (outcome.kind === 'error') return fail(outcome.text);
-    if (outcome.kind === 'blocked') return { sessionId, status: 'success', text: outcome.text.startsWith(BLOCKED) ? outcome.text : `${BLOCKED}：${outcome.text}` };
+    if (outcome.kind === 'blocked') return { sessionId, status: 'success', text: outcome.text.startsWith(BLOCKED) ? outcome.text : `${BLOCKED}\n${outcome.text}` };
     if (material.review && !REVIEW_PREFIX.test(outcome.text.trimStart()))
       return fail('云端复核答复首行不是「复核结论：通过/退回」，按协议不计为复核结果');
     return { sessionId, status: 'success', text: outcome.text };

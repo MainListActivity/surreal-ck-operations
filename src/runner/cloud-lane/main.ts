@@ -41,7 +41,7 @@ async function main(): Promise<number> {
   try { config = JSON.parse(process.env.SCK_LANE_CONFIG ?? '{}') as LaneConfig; }
   catch { config = {}; }
   const deps: LaneDeps = { exec: laneExecFile(config.bin), fetch, sleep: ms => new Promise(r => setTimeout(r, ms)), now: () => Date.now(),
-    progress: status => emit({ type: 'lane_status', status }) };
+    progress: (status, phase) => emit({ type: 'lane_status', status, ...(phase ? { phase } : {}) }) };
   emit({ type: 'system', session_id: resumeId ?? sessionStart });
   let outcome: { sessionId: string; status: 'success' | 'error'; text: string };
   try {

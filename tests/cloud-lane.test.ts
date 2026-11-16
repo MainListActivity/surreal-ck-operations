@@ -2,12 +2,17 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runLane, taskMaterial, validateLanes, vendorPrompt, type LaneDeps, type LaneInput } from '../src/runner/cloud-lane/lane.ts';
+import { runLane, taskMaterial, validateLanes, vendorPrompt, type LaneDeps, type LaneInput, type LaneOutcome, type LaneProgressPhase } from '../src/runner/cloud-lane/lane.ts';
+import { devinDeterministicRefusal } from '../src/runner/cloud-lane/devin.ts';
 import { laneExecFile } from '../src/runner/cloud-lane/exec.ts';
 import { laneDigest, readInflight, readLaneState, writeLaneState } from '../src/runner/cloud-lane/state.ts';
 import { julesUsageCount, julesUsageEntry, whamToUsageEntry } from '../src/runner/cloud-lane/quota.ts';
 import { recordJulesUsage } from '../src/runner/cloud-lane/jules.ts';
 import type { ExecResult } from '../src/runner/cloud-lane/repo.ts';
+import { parseNativeResult } from '../src/runner/native.ts';
+import { workResult } from '../src/runner/lifecycle.ts';
+import { quotaFailure } from '../src/dispatcher/quota-failure.ts';
+import { unavailableProvider } from '../src/dispatcher/provider-failover.ts';
 
 type Call = { cmd: string; args: string[]; cwd?: string };
 type Route = (call: Call) => ExecResult | undefined;
@@ -32,6 +37,7 @@ function world(opts: { task?: string; prompt?: string; git?: Route; extra?: Rout
   }
   const calls: Call[] = [];
   const progress: string[] = [];
+  const phases: Array<LaneProgressPhase | undefined> = [];
   const git: Route = call => {
     const [a, b] = call.args;
     if (call.cmd === 'git' && a === 'rev-parse' && b === '--is-inside-work-tree') return ok('true\n');
@@ -54,7 +60,7 @@ function world(opts: { task?: string; prompt?: string; git?: Route; extra?: Rout
     fetch: Object.assign(async () => { throw new Error('unstubbed fetch'); }, { preconnect: () => {} }) as unknown as typeof fetch,
     sleep: async () => {},
     now: () => t,
-    progress: s => progress.push(s),
+    progress: (s, phase) => { progress.push(s); phases.push(phase); },
   };
   let t = Date.now();
   const input = (over: Partial<LaneInput> = {}): LaneInput => ({
@@ -63,7 +69,7 @@ function world(opts: { task?: string; prompt?: string; git?: Route; extra?: Rout
     cwd, commDir, stateRoot, config: { pollMs: 1 }, env: {}, ...over,
   });
   const callsOf = (pred: (c: Call) => boolean) => calls.filter(pred);
-  return { commDir, cwd, stateRoot, calls, callsOf, progress, deps, input,
+  return { commDir, cwd, stateRoot, calls, callsOf, progress, phases, deps, input,
     advance: (ms: number) => { t += ms; } };
 }
 
@@ -424,6 +430,105 @@ describe('devin-cloud 通道', () => {
     const out = await runLane(w.input({ provider: 'devin-cloud' }), w.deps);
     expect(out.status).toBe('success');
     expect(out.text).toMatch(/^工作结果：受阻/);
+  });
+
+  // 真实失败样本的文案：vendor 首行是错误，随后是可用模型清单（样本里清单在此截断）。它是确定性拒绝，不是会话异常。
+  const UNKNOWN_FREE = "Error: Unknown model: 'free'\nAvailable: adaptive, swe-2, swe-2-flash, claude-fable-5.2, claude-opus-5.5, gpt-6-astra, gpt-6-sol, gpt-6-luna, gemini-4-carbon, kimi-k3.1-pro, glm-5.3";
+  const refusedRoute: Route = call => call.cmd === 'devin' ? { code: 1, stdout: '', stderr: UNKNOWN_FREE } : undefined;
+
+  test('确定性拒绝的判定：模型不被识别或无权限算拒绝；额度、限流与网络瞬时错误不算', () => {
+    for (const text of [UNKNOWN_FREE, 'model "free" not found', 'permission denied for model free', 'HTTP 403 Forbidden', 'Error 401: unauthorized', 'you have no permission to use this model'])
+      expect(devinDeterministicRefusal(text)).toBe(true);
+    // 同时带额度字样的仍按额度处理（走既有 quota 路径），不改判为受阻。
+    for (const text of ["Unknown model: 'free' (rate limit exceeded)", 'quota exhausted', 'rate limit exceeded', 'HTTP 429', 'usage limit reached', 'connection reset by peer', 'ETIMEDOUT', 'HTTP 503 service unavailable', ''])
+      expect(devinDeterministicRefusal(text)).toBe(false);
+  });
+
+  test('真实文案 Unknown model: free → 受阻成功回合：只发一次 free 会话，不推送、不合并、不重试', async () => {
+    const w = world({ extra: refusedRoute });
+    const out = await runLane(w.input({ provider: 'devin-cloud' }), w.deps);
+    // 受阻是成功回合：执行端按受阻收尾，不记成会话异常（会话异常会退役员工并重派）。
+    expect(out.status).toBe('success');
+    expect(out.text.startsWith('工作结果：受阻\n')).toBe(true);
+    expect(out.text).toContain("Unknown model: 'free'");
+    expect(out.text).toContain('执行端不会自动重派');
+    expect(out.text).toContain('不会换用其它模型');
+    const devin = w.callsOf(c => c.cmd === 'devin');
+    expect(devin).toHaveLength(1);
+    expect(devin[0]!.args.slice(0, 3)).toEqual(['--cloud', '--model', 'free']);
+    // 派工前只把任务分支放上 origin（远端还没有时），这不是成果推送；拒绝后不拉取、不快进、不合并。
+    expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'push').map(c => c.args)).toEqual([['push', '-u', 'origin', 'sck/task-1']]);
+    expect(w.callsOf(c => c.cmd === 'git' && (c.args[0] === 'fetch' || c.args[0] === 'merge'))).toHaveLength(0);
+    // 尝试过但没有受理：记未受理，不记已受理。
+    expect(w.phases).toEqual(['attempt', 'failed']);
+    // 执行端的判定：首行就是受阻（不当成提交），额度与不可用判定都不命中。
+    expect(workResult(out.text, 'doing').action).toBe('block');
+    expect(quotaFailure({ kind: 'failed', error: { message: out.text } }, [])).toBeUndefined();
+    expect(unavailableProvider({ kind: 'failed', error: { message: out.text } })).toBe(false);
+  });
+
+  test('运行时判定：受阻回合是成功完成（会话回到空闲）；瞬时错误是失败回合，走既有会话异常处理', async () => {
+    const turn = (out: LaneOutcome) => [
+      JSON.stringify({ type: 'system', session_id: out.sessionId }),
+      JSON.stringify({ type: 'result', subtype: out.status === 'success' ? 'success' : 'error', is_error: out.status !== 'success', result: out.text, session_id: out.sessionId }),
+    ].join('\n');
+    const refused = world({ extra: refusedRoute });
+    const refusedTurn = parseNativeResult('devin-cloud', turn(await runLane(refused.input({ provider: 'devin-cloud' }), refused.deps)));
+    expect(refusedTurn.completed).toBe(true);
+    const flaky = world({ extra: call => call.cmd === 'devin' ? bad('Error: connection reset by peer') : undefined });
+    const flakyTurn = parseNativeResult('devin-cloud', turn(await runLane(flaky.input({ provider: 'devin-cloud' }), flaky.deps)));
+    expect(flakyTurn.completed).toBe(false);
+    expect(flakyTurn.error).toContain('connection reset by peer');
+  });
+
+  test('瞬时错误仍是错误回合：不当成受阻，不记已受理，续接状态照旧保留', async () => {
+    for (const stderr of ['Error: connection reset by peer', '503 Service Unavailable', 'rate limit exceeded (429)', 'quota exhausted']) {
+      const w = world({ extra: call => call.cmd === 'devin' ? bad(stderr) : undefined });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), w.deps);
+      expect(out.status).toBe('error');
+      expect(out.text).not.toMatch(/^工作结果：受阻/);
+      expect(w.callsOf(c => c.cmd === 'devin')).toHaveLength(1);
+      expect(w.phases).toEqual(['attempt', 'failed']);
+      expect(readLaneState(w.commDir)?.digest).toBeDefined();
+    }
+  });
+
+  test('受理只认成功答复：退出码 0 但答复为空，记未取得受理证据，不记已受理', async () => {
+    const w = world({ extra: call => call.cmd === 'devin' ? ok('') : undefined });
+    const out = await runLane(w.input({ provider: 'devin-cloud' }), w.deps);
+    expect(out.status).toBe('error');
+    expect(w.phases).toEqual(['attempt', 'failed']);
+  });
+
+  test('正常派工：先记尝试，取得答复后才记已受理', async () => {
+    const w = world({ extra: devinOk });
+    const out = await runLane(w.input({ provider: 'devin-cloud' }), w.deps);
+    expect(out.status).toBe('success');
+    expect(w.progress[0]).toBe('尝试提交 Devin Cloud 会话（同步等待）');
+    expect(w.phases).toEqual(['attempt', 'accepted']);
+  });
+
+  test('受阻后老板修好 Devin 侧配置并答复，再派工：答复带进提示词，仍只用 free，恢复为成功', async () => {
+    let fixed = false;
+    const prompts: string[] = [];
+    const w = world({ extra: call => {
+      if (call.cmd !== 'devin') return devinOk(call);
+      prompts.push(readFileSync(call.args[call.args.indexOf('--prompt-file') + 1]!, 'utf8'));
+      return fixed ? devinOk(call) : { code: 1, stdout: '', stderr: UNKNOWN_FREE };
+    }});
+    const first = await runLane(w.input({ provider: 'devin-cloud' }), w.deps);
+    expect(workResult(first.text, 'doing').action).toBe('block');
+    // 老板在 Devin 侧开通模型权限后答复；执行端把答复放进 answer.md，下一次派工带给员工。
+    fixed = true;
+    writeFileSync(join(w.commDir, 'answer.md'), 'Devin 侧已开通模型权限，按任务继续。\n');
+    const second = await runLane(w.input({ provider: 'devin-cloud' }), w.deps);
+    expect(second.status).toBe('success');
+    expect(workResult(second.text, 'doing').action).toBe('submit');
+    expect(second.text).toContain('PR: https://github.com/acme/widget/pull/9');
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain('Devin 侧已开通模型权限，按任务继续。');
+    expect(w.callsOf(c => c.cmd === 'devin').map(c => c.args.slice(0, 3))).toEqual([['--cloud', '--model', 'free'], ['--cloud', '--model', 'free']]);
+    expect(w.phases).toEqual(['attempt', 'failed', 'attempt', 'accepted']);
   });
 });
 

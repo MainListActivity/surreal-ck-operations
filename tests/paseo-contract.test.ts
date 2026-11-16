@@ -130,8 +130,8 @@ test('B4d: empty stdout, or a reply without a Status field, reads as unknown', a
 // The dispatcher-level check: one real tick with a single instance, read back through the dispatcher's own state mapping.
 const DEF: EmployeeDef = { id: 'test', role: 'engineering', provider: 'codex', model: 'fixture', enabled: true, maxInstances: 1, priority: 0, weight: 1, errorStreak: 0 };
 
-async function observe(body: string) {
-  const bin = fakeCli({ [AGENT]: body }, 'echo []');
+async function observe(body: string, logs = "echo ''", streak = 1) {
+  const bin = fakeCli({ [AGENT]: body }, 'echo []', logs);
   // Generous enough for a shell spawn on a loaded machine; only the SLEEP body is meant to hit it.
   const cli = createPaseoCli(bin, { timeoutMs: 2000 });
   const events: string[] = [];
@@ -148,7 +148,8 @@ async function observe(body: string) {
     config: async () => ({ ...DEFAULT_CONFIG, quotaFloorPct: 0, quotaWeeklyFloorPct: 0, sessionMaxWakes: 0, sessionMaxInputK: 0, jevDecisions: false }),
     defs: async () => [DEF], serverNow: async () => 1000, insts: async () => [inst], tasks: async () => [], providerHealth: async () => new Map(),
     retire: async (id: string, _reason: string, kind: string) => { events.push(`retire:${id}:${kind}`); },
-    defFailure: async () => { events.push('defFailure'); return 1; },
+    defFailure: async () => { events.push('defFailure'); return streak; },
+    disableDef: async (id: string) => { events.push(`disable:${id}`); },
   };
   const owner = { applyPending: async () => [], openNotices: async () => [], triagePending: async () => [], resolveNotice: async () => {}, raiseNotice: async () => true };
   const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/fixture', sckBin: '/bin/sck', paseoBin: bin }, rand: () => 0 } as unknown as DispatcherDeps);
@@ -182,6 +183,20 @@ test('B4 dispatcher control: idle, running and archived keep their states', asyn
   const archived = await observe(`cat '${archivedPath}'`);
   expect(archived.state).toBe('down');
   expect(archived.events).toContain('retire:employee-1:archive');
+}, DISPATCHER_TEST_MS);
+
+// A transient session error (not a vendor refusal) keeps the bounded path: the instance retires, the definition is counted
+// once per retirement, and only the third consecutive count disables the definition.
+test('a transient session error still retires and counts toward the definition; the third consecutive count disables it', async () => {
+  const body = `echo '{"Id":"${AGENT}","Status":"error","Archived":false,"PendingPermissions":[]}'`;
+  const transient = "echo 'Error: connection reset by peer'";
+  const first = await observe(body, transient, 1);
+  expect(first.state).toBe('down');
+  expect(first.retired).toEqual(['employee-1']);
+  expect(first.events).toEqual(expect.arrayContaining(['retire:employee-1:failure', 'defFailure']));
+  expect(first.events.some(e => e.startsWith('disable:'))).toBe(false);
+  const third = await observe(body, transient, 3);
+  expect(third.events).toContain('disable:test');
 }, DISPATCHER_TEST_MS);
 
 // The failure entry Paseo really writes does not start with the marker: it is a timeline line

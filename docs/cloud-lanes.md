@@ -62,7 +62,7 @@
 - 云端 agent 读不到本机文件也调不了 `sck`。0.13.19 起发给它的正文就是派工消息（老板在派工消息页看到、改过的那条，`laneMessage`）：消息里指向的文件路径换成“下文《…》”，文件内容附在后面（笔记、最新的 `findings/round-NN.md`、较长的老板答复、复核轮的 `task.md`）；工作目录行和公司命令的指引不带。退回意见按文件取、返工轮一定附上，不看派工消息的措辞；正文不是三段式时整份 `task.md` 也附上；没有派工消息时退回到整份任务材料。网页通道（Grok Bot、muse-web）同样。Devin 云模式固定 `--model free`：`lanes.devin-cloud.model` 只能缺省或写 `free`，其它值（含空白、空串）在 `validateLanes` 配置校验时拒绝；执行入口（`driveDevin`）在推送分支、发会话之前再校验一次，所以绕过配置也不会发出非 free 的云端会话，失败也不回退到账号默认或其它模型。这条约束只适用于 devin-cloud，本地 Devin/Paseo 的模型名不受它限制。复核轮（task.md 含「## 待复核成果」）要求只读复核，最终答复首行必须是「复核结论：通过/退回」，缺了按错误回合处理。
 - 代码任务要求 cwd 是关联 GitHub origin 的工作树；任务分支缺远端时先推送。非代码任务或仓库未映射 → 回合按「工作结果：受阻」收尾（成功回合，不记供应商故障）。
 - **codex-cloud**：`codex cloud exec --env <环境> --branch <分支>` → `codex cloud status` 轮询 → READY 后 `codex cloud apply` 到本地、`git add -A`、提交「<任务标题> (Codex Cloud <id>)」、推送、`gh pr list/create` 保证有 PR；空 diff 按受阻收尾。Codex Cloud 的最终消息 CLI 取不到：复核轮要求供应商把结论写进 `.sck/review.md`，桥接从 `codex cloud diff` 的补丁行提取。
-- **devin-cloud**：`devin --cloud --model free -p --prompt-file` 同步等待答复（模型只能是 free，配置校验与执行入口都拒绝其它值）；prompt 要求在 `<owner>/<repo>` 的分支上工作、推送、开/更新 PR 并以 `PR:`/`SHA:` 行结尾；随后 `git fetch + git merge --ff-only FETCH_HEAD`，非快进只报错不 reset。
+- **devin-cloud**：`devin --cloud --model free -p --prompt-file` 同步等待答复（模型只能是 free，配置校验与执行入口都拒绝其它值）；prompt 要求在 `<owner>/<repo>` 的分支上工作、推送、开/更新 PR 并以 `PR:`/`SHA:` 行结尾；随后 `git fetch + git merge --ff-only FETCH_HEAD`，非快进只报错不 reset。活动流分开报「尝试提交」和「已受理」：启动调用只是尝试（显示为运行中）；退出码 0 且拿到答复文本才算已受理（显示为完成）；退出码非零或答复为空记为失败，不记成提交成功。
 - **jules**：REST 会话状态机 QUEUED/PLANNING/IN_PROGRESS → COMPLETED/FAILED；`AWAITING_USER_FEEDBACK`/`AWAITING_PLAN_APPROVAL` 按受阻收尾并把 Jules 的问题带回来；续轮 `:sendMessage` 复用同一会话。
 - **幂等**：提交前把云端任务 ID、prompt 摘要、分支原子写入 `$SCK_COMM_DIR/.lane/state.json`；同摘要重启重连轮询不重复提交。提交结果不明绝不重发，报错误回合并带任务 ID/URL。
 - **超时**：`lanes.<provider>.maxMinutes`（默认 180 分钟），约 25 秒轮询一次；超时按错误回合处理，文案说明云端任务可能仍在运行。
@@ -81,6 +81,8 @@
 
 - 回合报「<供应商> 提交失败：找不到可执行文件 <命令>」：服务 PATH 里没有该 CLI。把它的绝对路径配进 `lanes.<通道>.bin`（见上）并重装服务，或直接修好服务脚本 PATH；同一原因重复三次会自动停用该员工定义，修好后重新启用。
 - 供应商额度耗尽的报错（Devin「weekly usage quota has been exhausted」、Codex 限流、Jules 429）走既有 quota-failure 链：记入 `provider_health` 冷却，任务留在原员工名下。
+- Devin 确定性拒绝：模型名不被识别或账号无权限（`Unknown model`、`permission denied`、`unauthorized`、`forbidden`、401/403 等，判定见 `devinDeterministicRefusal`，同时带额度字样的按额度处理）时，回合按「工作结果：受阻」收尾，任务转入阻塞等老板，员工不退役。同一请求再发结果不变，所以不自动重派，不换用其它模型或账号默认模型，也不记作额度不足。修好 Devin 侧的模型名或账号权限后，老板在该任务里答复，答复会随下一次派工交给员工。`free` 限制不变，不做付费回退。这是对供应商报错文案的判定，没覆盖到的新文案仍按下一条处理。
+- Devin 其它失败（网络、5xx 等）仍是错误回合，走既有会话异常处理：员工退役，并计入员工定义的连续异常次数，同一定义连续 3 次自动停用（见 `agent-operations.md`）。
 - 执行目录边界：通道只在 `claim.json` 指定的任务工作树里执行，会话 cwd（可能是共享主 checkout）不是回退。缺 claim、无 worktree、路径无效、工作树分支与派工要求不一致或在默认分支上时，回合安全受阻且一个 git/供应商命令都不发。codex 通道只暂存 `codex cloud diff` 补丁覆盖的路径（`git add -A -- <paths>`），暂存后出现补丁外路径只取消暂存不动文件，因此工作树里的无关未跟踪文件（error.log、.wrangler 状态等）不会被提交。
 - 云端任务可能仍在运行时只报错误回合，不自动取消、不重发；老板可凭任务 URL 人工核对。
 - 回退：停用对应员工定义、从 `runtime-routes.json` 移除路由、从 `native-runner.json` 移除 commands 条目即可；在途云端任务按上文人工核对，通道不自动接管。

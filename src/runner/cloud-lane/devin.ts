@@ -7,6 +7,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { QUOTA_ERROR } from '../../dispatcher/quota-failure.ts';
 import { ensureBranchOnOrigin, fetchAndFastForward, type RepoInfo } from './repo.ts';
 import type { LaneDeps, LaneInput } from './lane.ts';
 
@@ -20,6 +21,15 @@ export const DEVIN_CLOUD_MODEL = 'free';
 export function devinCloudModel(configured: unknown): typeof DEVIN_CLOUD_MODEL {
   if (configured === undefined || configured === DEVIN_CLOUD_MODEL) return DEVIN_CLOUD_MODEL;
   throw new Error(`lanes.devin-cloud.model 只能是 "${DEVIN_CLOUD_MODEL}"（云端会话只用免费模型），收到 ${JSON.stringify(configured)}`);
+}
+
+/**
+ * 供应商确定性拒绝这次请求：模型名不被识别，或账号无权使用它。同一请求再发一次结果不变，
+ * 所以不能当会话异常处理（那会退役员工、重派任务，每次都撞同一个错误）。额度类报错不算，仍走 quota-failure。
+ */
+const DETERMINISTIC_REFUSAL = /unknown model|model\b[^\n]{0,60}?\b(?:not (?:found|supported)|unsupported)|not entitled|permission denied|no permission|insufficient permissions?|access denied|unauthori[sz]ed|forbidden|\b40[13]\b/i;
+export function devinDeterministicRefusal(text: string): boolean {
+  return DETERMINISTIC_REFUSAL.test(text) && !QUOTA_ERROR.test(text);
 }
 
 interface Ctx {
@@ -45,15 +55,28 @@ export async function driveDevin(ctx: Ctx): Promise<{ kind: 'done' | 'blocked' |
     ? '\n这是同一任务的后续轮次：该分支上可能已有你的云端会话推送过改动并开过 PR，请先拉取远端分支现状，在既有 PR 上继续更新，不要另开重复 PR。'
     : '';
   writeFileSync(file, `${prompt}${followUp}\n`);
-  deps.progress('已提交 Devin Cloud 会话（同步等待）');
+  // 尝试与受理分开报：启动调用本身不是受理证据，只有拿到云端答复（退出码 0）才算已受理。
+  deps.progress('尝试提交 Devin Cloud 会话（同步等待）', 'attempt');
   const timeoutMs = Math.max(60_000, ctx.deadline - deps.now());
   // 公司派工只用云模式的 free 模型（老板 2026-11-15 定）：不传模型的话云端会按账号默认模型计费。
-  const r = await deps.exec('devin', ['--cloud', '--model', model, '-p', '--prompt-file', file], { cwd: input.cwd, timeoutMs });
-  rmSync(dir, { recursive: true, force: true });
-  if (r.code !== 0)
-    return { kind: 'error', text: `Devin Cloud 会话失败：${(r.stderr || r.stdout).trim().slice(0, 500)}` };
+  const r = await deps.exec('devin', ['--cloud', '--model', model, '-p', '--prompt-file', file], { cwd: input.cwd, timeoutMs })
+    .finally(() => rmSync(dir, { recursive: true, force: true }));
+  if (r.code !== 0) {
+    const detail = (r.stderr || r.stdout).trim().slice(0, 500);
+    // 模型或账号权限被供应商确定性拒绝：重派结果不变，按受阻收尾等配置修复（不是会话异常，不退役员工）。
+    if (devinDeterministicRefusal(`${r.stderr}\n${r.stdout}`)) {
+      deps.progress('Devin Cloud 拒绝本次会话（模型或账号权限不符），等待配置修复', 'failed');
+      return { kind: 'blocked', text: `Devin Cloud 拒绝了本次会话，模型或账号权限不符：${detail}\n这类错误重试不会好转：执行端不会自动重派，也不会换用其它模型或账号默认模型，也不计为额度不足。修复 Devin 侧的模型名或账号权限后再派工。` };
+    }
+    deps.progress(`Devin Cloud 会话未取得受理证据（退出码 ${r.code}）`, 'failed');
+    return { kind: 'error', text: `Devin Cloud 会话失败：${detail}` };
+  }
   const text = r.stdout.trim();
-  if (!text) return { kind: 'error', text: 'Devin Cloud 会话结束但没有答复文本' };
+  if (!text) {
+    deps.progress('Devin Cloud 没有返回答复，未取得受理证据', 'failed');
+    return { kind: 'error', text: 'Devin Cloud 会话结束但没有答复文本' };
+  }
+  deps.progress('Devin Cloud 已受理并返回答复', 'accepted');
 
   if (material.review) return { kind: 'done', text };
 
