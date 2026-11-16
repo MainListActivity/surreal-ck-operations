@@ -7,7 +7,7 @@
     "原生执行端环境改由 nativeEmployeeEnv 统一生成，run.ts 与回归测试调用同一函数；ZDOTDIR 最后设置，继承值、通道值与模型路由都改不了它。",
     "回归：真实 zsh 的 -c、-lc、-ic、-lic 四种启动，覆盖用户改写与取消 ZDOTDIR 两种布局，并覆盖原生与 Paseo 端到端；断言均使用合成值。",
     "文档：agent-operations 垫片与边界段同步，剥离名单含 SCK_PREVIEW_SECRET，边界提到 ZDOTDIR 改写与 ZDOTDIR= zsh -i 绕过。",
-    "CI：quality 作业显式安装 zsh；CI 环境中缺少 zsh 时真实 zsh 回归判为失败，不再静默跳过。"
+    "CI：quality 与 channel 两个作业都显式安装 zsh；CI 环境中缺少 zsh 时真实 zsh 回归判为失败，不再静默跳过。"
   ],
   "impact": [
     "老板：服务端预览签名密钥与 Cloudflare 令牌不再经用户启动文件进入员工 shell。已发生的真实事件仍按既有流程另行轮换与记录，本变更不替代轮换，也不触碰生产密钥文件。",
