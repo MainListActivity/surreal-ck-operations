@@ -10,7 +10,8 @@ import { julesUsageEntry, readCodexCloudUsage } from './cloud-lane/quota.ts';
 import { validateLanes, type LaneConfig } from './cloud-lane/lane.ts';
 import { RuntimeEventsBus } from './events.ts';
 import type { RuntimeHost } from './host.ts';
-import { scrubEnv, SANDBOX_MARKER, installZdot, userZshDir, externalPatterns } from './launch-env.ts';
+import { installZdot, userZshDir, externalPatterns } from './launch-env.ts';
+import { nativeEmployeeEnv } from './native-env.ts';
 import { employeeModelEnv } from './model-env.ts';
 import { writeAgentActivity } from './activity-store.ts';
 
@@ -91,13 +92,12 @@ const runtime = new NativeRuntime({ root: join(serviceHome(), 'native', hostId),
     if (!inst || !ctx.sidecar.canReuse(inst)) throw new Error('员工身份或 sidecar 通道不可用');
     const channel = ctx.sidecar.env(inst);
     const modelEnv = employeeModelEnv({ agentId: session.id, provider: session.provider, env: channel, runtime: 'native' }, ctx.sidecar, serviceHome());
-    const inherited = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
     const lane = isLaneProvider(session.provider) ? {
       SCK_LANE_CONFIG: JSON.stringify(config.lanes?.[session.provider as LaneProvider] ?? {}),
       SCK_LANE_STATE_ROOT: laneStateRoot,
       ...laneSecretEnv(session.provider),
     } : {};
-    return { ...inherited, ...scrubEnv(channel), ...SANDBOX_MARKER, ...modelEnv, ...lane, PASEO_AGENT_ID: "", ZDOTDIR: zdotdir };
+    return nativeEmployeeEnv({ inherited: process.env, channel, modelEnv, lane, zdotdir });
   },
   onStarted: async session => { await bus.emit('agent.turn_started', { agent: session, turnId: session.turnId }); await uploadActivity(); },
   onEnded: async event => { await uploadActivity(); await bus.emit('agent.turn_ended', event); },
