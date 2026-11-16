@@ -254,6 +254,9 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
 
   // 相同 prompt 摘要重连在途云端任务；新回合清空 taskId 但保留可复用的供应商会话（vendorSession）。
   const next: LaneState = { ...state, sessionId, digest, branch: repo.branch };
+  // Devin 上一轮已按下发送、受理未确认且没有会话地址可核对：换了 prompt 也不能另建会话（可能与在途会话重复），受阻交人工。
+  if (state.digest !== digest && input.provider === 'devin-cloud' && state.taskId && !state.taskUrl && !state.vendorSession)
+    return blocked(`上一轮 Devin Cloud 已按下发送但未确认受理，且没有会话地址可核对；为避免另建重复会话，本轮未发出。在途登记已保留，请人工核对 app.devin.ai 会话列表后再决定是否重派。`);
   if (state.digest !== digest) { delete next.taskId; delete next.taskUrl; delete next.submittedAt; }
   // 本 comm 目录没有在途任务时查共享登记：同一公司任务换员工实例也能重连，而不是重复提交云端任务。
   if (!next.taskId) {

@@ -439,6 +439,20 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(0);
   });
 
+  test('上一轮按下发送且受理未确认、无会话地址时换 prompt → 受阻，不另建会话，在途登记保留', async () => {
+    const w = world({ extra: gitOk });
+    writeLaneState(w.commDir, { sessionId: 'lane-1', digest: 'old-digest', taskId: 'SCK-old-marker', branch: 'sck/task-1',
+      submittedAt: Date.now() });
+    const b = devinBrowse({ send: [{ ok: true, url: SESSION }], session: [idleDone('完成。\nPR: https://github.com/acme/widget/pull/9')] });
+    const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1 } }), { ...w.deps, browse: b.browse });
+    expect(out.status).toBe('success');
+    expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+    expect(out.text).toContain('未发出');
+    expect(b.calls).toHaveLength(0);
+    expect(readLaneState(w.commDir)?.taskId).toBe('SCK-old-marker');
+    expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'push')).toHaveLength(0);
+  });
+
   test('超时后同一轮只回执核对不重发：状态留在途，下轮直接轮询原会话', async () => {
     const working = { ok: true, markerSeen: true, status: 'working', done: null, tail: '' };
     const w1 = world({ extra: gitOk });
