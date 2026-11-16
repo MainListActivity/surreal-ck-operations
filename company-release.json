@@ -4,8 +4,8 @@
   "changes": [
     "devin-cloud 不再执行 devin --cloud --model free（Devin CLI 3000.x 拒绝该参数，云免费只在网页）。新入口 devin-web.ts 用 ego-browser 驱动 app.devin.ai。",
     "新会话、续轮与复核发送前都核验 Capability 选中 Free、字样 Free (powered by SWE-2) 与 N/M in use 席位。席位满等待；读不到或不是 Free 有界重试后受阻，绝不切付费档。读数记入 lane 状态 devin.seats。",
-    "发送前落盘 attempt 标记，按下发送后绝不重发。会话地址或回执丢失只做受理核对（会话列表与最近会话）；仍不确定则受阻并保留在途状态，交人工核对后恢复本任务。",
-    "终稿只认本轮收尾约定之后、会话已 idle 的 SCK-DONE 行；派工消息、旧轮次残留与用户例子不算。状态 unknown 不收尾；空闲无终稿连续确认后受阻。",
+    "发送意图在按下 Send 前同时写入本目录与共享登记 inflight/<digest>.json；换员工目录或重启只核对是否已受理，绝不重发。会话地址或回执丢失只做有界核对，仍不确定则受阻并保留在途。",
+    "终稿只认本轮用户消息之后的 Devin 发言块（data-message-author=devin）；工具输出、用户例子、旧轮次残留的 DONE/PR 都不算。找不到作者块时终稿为空。unknown 与空闲无终稿都不收尾。",
     "活动流分开报尝试与受理：尝试显示为运行中，转录出现本轮标记或会话地址后才显示已受理。受阻文本首行单独成行「工作结果：受阻」。",
     "保留 0.13.28 的结果读取有界、PR2269 的 CI 排队等待与网关防重放；free-only 配置与执行入口保护保留。"
   ],
