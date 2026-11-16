@@ -17,14 +17,17 @@ const run = process.env.RUN_SCK_CLOUD_RUNNER_TESTS === '1' ? test : test.skip;
 let dir: string, server: ReturnType<typeof Bun.spawn>, db: CompanyDatabase, core: SurrealCompanyCore, owner: string, wf: Workforce;
 const pools: SidecarPool[] = [];
 // Same read-only fact source the production runner injects: task lease identity, employee identity, and the
-// idempotency record that proves this delivery's write already committed server-side.
+// idempotency record that proves this delivery's write already committed server-side. A failed read throws and
+// stays unknown, exactly like production; tests inject transient failures through failIdempotencyReads.
+let failIdempotencyReads = 0;
 const resultFacts = async (taskId: string, employeeId: string, delivery?: { action: string; idempotencyKey: string }) => {
   const [tasks] = await db.db.query<[Array<{ state: string; current_employee?: string; delivery_id?: string; fence?: number }>]>(
     'SELECT state, current_employee, delivery_id, fence FROM $task;', { task: new RecordId('task', taskId) });
   const [employees] = await db.db.query<[Array<{ retired?: boolean; revoked?: boolean }>]>(
     'SELECT retired, revoked FROM $employee;', { employee: new RecordId('employee', employeeId) });
+  if (delivery && failIdempotencyReads > 0) { failIdempotencyReads--; throw new Error('synthetic idempotency read failure'); }
   const stored = delivery
-    ? await db.db.select(new RecordId('idempotency', HASH(`${employeeId}\0${delivery.action}\0${delivery.idempotencyKey}`))).catch(() => undefined)
+    ? await db.db.select(new RecordId('idempotency', HASH(`${employeeId}\0${delivery.action}\0${delivery.idempotencyKey}`)))
     : undefined;
   return {
     ...(tasks?.[0] ? { task: { state: tasks[0].state, currentEmployee: tasks[0].current_employee, deliveryId: tasks[0].delivery_id, fence: tasks[0].fence } } : {}),
@@ -256,5 +259,49 @@ run('真实 fork：成果落库、回复连续丢失且写入被拒后，权威�
   await pool.retryExecutions();
   expect(journal.read(inst.id, proof.deliveryId)?.state).toBe('settled');
   expect(calls).toBe(2);
+  expect((await core.history(owner, task.id)).filter(h => h.action === 'submit')).toHaveLength(1);
+});
+
+run('真实 fork：成果落库、员工退休且判定时幂等读取瞬时失败，先 pending 后 settled 且核心只记一次提交', async () => {
+  const task = await core.createTask(owner, { type: 'lifecycle-fixture', title: '判定时读取失败', context: '验证读取失败不误判失效', idempotencyKey: crypto.randomUUID() } as never);
+  await wf.upsertDef('fixture-readfail', { role: 'engineering', provider: 'claude', model: 'fixture' });
+  const def = (await wf.defs()).find(d => d.id === 'fixture-readfail')!;
+  const inst = await wf.spawnInst(def);
+  let calls = 0;
+  const losing = Object.create(core) as SurrealCompanyCore;
+  // The write commits, the identity is retired while its reply is in flight, and every later call is refused at
+  // authentication. The stored idempotency record is the only fact that can prove the delivery landed.
+  losing.submit = async (cred, proof, evidence) => {
+    calls++;
+    if (calls === 1) {
+      const view = await core.submit(cred, proof, evidence);
+      await wf.retire(inst.id, 'fixture：落库后退休', 'rotation');
+      throw new Error('synthetic reply lost after commit');
+    }
+    return core.submit(cred, proof, evidence);
+  };
+  const runDir = join(dir, 'readfail', 'comm');
+  const pool = new SidecarPool({ runDir, core: losing, workforce: wf, managedLifecycle: true, resultFacts });
+  pools.push(pool);
+  pool.env(inst); inst.paseoAgentId = 'readfail'; pool.bindAgent(inst.id, 'readfail');
+  const claim = await pool.claim(inst, { id: task.id } as never);
+  const proof = { taskId: task.id, deliveryId: claim!.deliveryId!, fence: claim!.fence, expectedVersion: claim!.task.version };
+  await pool.turnStarted('readfail', 'readfail-turn');
+  failIdempotencyReads = 1;
+  const result = await pool.settleExecution({ agent: { id: 'readfail' }, turnId: 'readfail-turn', outcome: { kind: 'completed' },
+    timeline: [{ type: 'assistant_message', text: '工作结果：完成\n成果已交付服务端，回复与幂等读取同时抖动。' }] });
+  expect(result?.status).toBe('pending');
+  const journal = journalFor(runDir);
+  const row = journal.read(inst.id, proof.deliveryId)!;
+  // A failed read is unknown, never "not landed": the delivered result waits instead of being superseded.
+  expect(row.state).toBe('pending');
+  expect(row.supersededCause).toBeUndefined();
+  for (const pending of journal.rows()) { pending.nextRetry = 0; journal.save(pending); }
+  await pool.retryExecutions();
+  expect(journal.read(inst.id, proof.deliveryId)?.state).toBe('settled');
+  expect((await core.getTask(owner, task.id)).state).toBe('review');
+  expect((await core.history(owner, task.id)).filter(h => h.action === 'submit')).toHaveLength(1);
+  for (const pending of journal.rows()) { pending.nextRetry = 0; journal.save(pending); }
+  await pool.retryExecutions();
   expect((await core.history(owner, task.id)).filter(h => h.action === 'submit')).toHaveLength(1);
 });

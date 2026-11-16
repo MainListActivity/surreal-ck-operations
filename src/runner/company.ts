@@ -253,7 +253,7 @@ export function company(): Promise<Company> {
         const [employees] = await db.db.query<[Array<{ retired?: boolean; revoked?: boolean }>]>(
           'SELECT retired, revoked FROM $employee;', { employee: new RecordId('employee', employeeId) });
         const stored = delivery
-          ? await db.db.select(new RecordId('idempotency', HASH(`${employeeId}\0${delivery.action}\0${delivery.idempotencyKey}`))).catch(() => undefined)
+          ? await db.db.select(new RecordId('idempotency', HASH(`${employeeId}\0${delivery.action}\0${delivery.idempotencyKey}`)))
           : undefined;
         return {
           ...(tasks?.[0] ? { task: { state: tasks[0].state, currentEmployee: tasks[0].current_employee,
