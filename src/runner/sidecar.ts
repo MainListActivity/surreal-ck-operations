@@ -36,6 +36,10 @@ const withQaRelease = <T extends { meta: object }>(value: T): T => {
 };
 
 const HEARTBEAT_MS = 60_000;
+/** A submit that waits on unfinished CI re-checks on this cadence; the wait does not spend the retry budget. */
+const CI_WAIT_RETRY_MS = 60_000;
+/** Past this wait a result whose CI never succeeded is blocked with the reason, never retried indefinitely. */
+const CI_WAIT_LIMIT_MS = 6 * 3_600_000;
 const SWEEP_MS = 400;
 const BASE_TOOLS = [
   "get_context", "get_task_history", "list_worktrees", "reclaim_worktrees", "list_worktree_audits", "checkpoint", "submit", "review", "report_blocker",
@@ -426,6 +430,38 @@ export class SidecarPool {
       this.log(`runner ${row.result.action} ${row.task} for ${row.employee}`);
     } catch (error) {
       const code = String((error as { code?: string }).code ?? 'unavailable');
+      const message = String((error as Error).message ?? '').slice(0, 300);
+      row.lastRefusal = message || undefined;
+      // A submit that waits on unfinished CI is not a refusal of the work: the retry budget is not spent. The result
+      // stays pending with the same proof and evidence until CI succeeds, the lease ends, or the wait limit is reached.
+      if (code === 'ci_pending') {
+        // The lease can move while CI runs. Only the holder of this delivery keeps waiting; an unreadable task is unknown, not proof.
+        const task = await this.callWithCred(row.employee, cred => this.deps.core.getTask(cred, row.task)).catch(() => undefined);
+        if (task && (task.currentEmployee !== row.employee || task.deliveryId !== row.proof.deliveryId || task.fence !== row.proof.fence)) {
+          row.state = 'superseded';
+          await this.changed(row);
+          this.log(`runner result superseded while waiting for CI ${row.task}`);
+          return;
+        }
+        if (task) row.proof.expectedVersion = task.version;
+        row.ciWaitSince ??= Date.now();
+        row.error = code; row.nextRetry = Date.now() + CI_WAIT_RETRY_MS;
+        if (Date.now() - row.ciWaitSince >= CI_WAIT_LIMIT_MS) {
+          row.error = 'ci_wait_limit';
+          this.blockResult(row, `CI 等待超时（超过 ${CI_WAIT_LIMIT_MS / 3_600_000} 小时仍无成功的 GitHub Actions run）：${message || '原因未知'}`);
+        }
+        await this.changed(row);
+        this.log(`runner result waiting for CI ${row.task}: ${message || code}`);
+        return;
+      }
+      // CI ran for this sha and nothing succeeded: waiting cannot change that, so the result is blocked with the reason at once.
+      if (code === 'ci_failed') {
+        row.error = code;
+        this.blockResult(row, `CI 失败，成果未进入独立复核：${message || '原因未知'}`);
+        await this.changed(row);
+        this.log(`runner result blocked by failed CI ${row.task}: ${message || code}`);
+        return;
+      }
       row.tries++; row.error = code; row.nextRetry = Date.now() + Math.min(60000, 2000 * 2 ** Math.min(row.tries, 5));
       // Only a definitive version refusal permits changing the request; transport errors keep the original request.
       if (code === 'conflict' || code === 'lease_expired') {
@@ -436,13 +472,18 @@ export class SidecarPool {
         } catch { /* unknown is not proof that the lease disappeared */ }
       }
       if (row.state === 'pending' && row.tries >= 10 && row.result.action !== 'block' && ['invalid', 'acceptance_failed', 'conflict'].includes(code)) {
-        row.originalResult = row.result;
-        row.result = workResult('', row.phase, { outcome: 'blocked', summary: `执行端自动收尾持续未通过校验（${code}）。原始工作成果已经保存在执行记录，需检查验收或环境条件后恢复。` });
-        row.prepared = true;
+        this.blockResult(row, `执行端自动收尾持续未通过校验（${code}）：${message || '原因未知'}`);
       }
       await this.changed(row);
       this.log(`runner result pending ${row.task}: ${code}, attempt ${row.tries}`);
     } finally { this.flushing.delete(row.employee); }
+  }
+  /** Replaces a result that cannot be submitted with a blocked one that states the reason. The original work stays in the journal. */
+  private blockResult(row: ExecutionAttempt, reason: string): void {
+    row.originalResult = row.originalResult ?? row.result;
+    row.result = workResult('', row.phase, { outcome: 'blocked', summary: `${reason}。原始工作成果已经保存在执行记录，需检查后恢复。` });
+    row.prepared = true;
+    row.nextRetry = 0;
   }
   private log(message: string) { this.deps.log?.(message); }
 
