@@ -6,7 +6,7 @@ import { CompanyError } from '../core-errors.ts';
 import { hostIO } from '../host-io.ts';
 import { MAX_ASSET_PATHS, MAX_ASSET_PATH_CHARS } from '../input-bounds.ts';
 import {
-  decideReclaim, parseGraceDays, reclaimEnabledFrom, type ReclaimTrigger,
+  decideReclaim, parseGraceDays, reclaimEnabledFrom, type ReclaimTrigger, type TreeAuthority,
 } from './worktree-reclaim.ts';
 import { junkPathsFromPorcelain, meaningfulChanges } from './lifecycle-gc.ts';
 
@@ -272,9 +272,10 @@ export class WorktreeRegistry {
   }
   async releaseWorkspace(employeeId: string) {
     await this.db.query('UPDATE ONLY $holder SET workspace_read_active = false;', { holder: record('employee', employeeId) });
-    // Event point: the released session ref may have been the tree's last reference.
-    const ref = await this.db.select<{ tree?: RecordId }>(record('worktree_session_ref', employeeId)).catch(() => undefined);
-    if (ref?.tree) await this.reclaimEvent(String(ref.tree.id), 'release').catch(() => undefined);
+    // Event point: the released session ref may have been the tree's last reference. A failed read keeps every tree and is audited.
+    const ref = await this.db.select<{ tree?: RecordId }>(record('worktree_session_ref', employeeId))
+      .catch(async (error: unknown) => { await this.readFailure('release', error); return undefined; });
+    if (ref?.tree) await this.reclaimEvent(String(ref.tree.id), 'release');
   }
 
   private async policy(): Promise<{ enabled: boolean; orphanGraceMs: number; now: Date }> {
@@ -363,6 +364,37 @@ export class WorktreeRegistry {
     return (rows?.length ?? 0) > 0;
   }
 
+  /**
+   * The task table's view of one tree: the non-terminal tasks that name it in task.worktree, and which of them hold a live
+   * lease. It is read from the tasks, never from worktree_ref, so a reference that is missing, stale or late cannot release
+   * a scene its task still owns. A failed or malformed read is reported as unreadable, never as "no owner".
+   */
+  private async authorityOf(tree: RecordId): Promise<TreeAuthority> {
+    let rows: Array<{ tree?: unknown; leased?: boolean }>;
+    try {
+      [rows] = await this.db.query<[Array<{ tree?: unknown; leased?: boolean }>]>(`SELECT worktree.id AS tree,
+        (current_employee != NONE AND (lease_expires_at ?? 0) > time::unix(time::now())) AS leased
+        FROM task WHERE state NOT IN ['done', 'void'] AND worktree != NONE;`);
+    } catch (error) {
+      return { open: 0, leased: 0, unreadable: `authority-unreadable:${(error instanceof Error ? error.message : String(error)).slice(0, 160)}` };
+    }
+    let open = 0, leased = 0;
+    for (const row of rows ?? []) {
+      // A task whose worktree names no tree cannot be attributed, so no tree in this scan can be called unowned.
+      if (typeof row.tree !== 'string') return { open: 0, leased: 0, unreadable: 'authority-unreadable:malformed-task-worktree' };
+      if (row.tree !== String(tree.id)) continue;
+      open++;
+      if (row.leased) leased++;
+    }
+    return { open, leased };
+  }
+
+  /** A scan or event point whose facts cannot be read reclaims nothing and keeps the scene. The failure is written, not only logged. */
+  private async readFailure(trigger: ReclaimTrigger, error: unknown): Promise<void> {
+    const reason = `reclaim-unreadable:${(error instanceof Error ? error.message : String(error)).slice(0, 180)}`;
+    await this.audit({ repo: '*', path: '*', event: 'fail', trigger, decision: 'scan', result: 'failed', reason }).catch(() => undefined);
+  }
+
   async inventory(repo?: string): Promise<WorktreeView[]> {
     const known = await this.rows(repo);
     const seeds = repo ? [repo] : [...new Set([this.options.opsRepo, ...known.map(r => r.repo)])];
@@ -382,11 +414,13 @@ export class WorktreeRegistry {
       }));
       const dirty = !!(tree && meaningfulChanges(await git(row.path, ['status', '--porcelain']).catch(() => 'unavailable')));
       const status: WorktreeView['status'] = !tree ? 'missing' : tree.branch !== row.branch ? 'drift' : 'present';
+      const authority = await this.authorityOf(row.id);
       const decision = decideReclaim({
         path: row.path, branch: row.branch, mode: row.mode, protection: row.protection, main: tree?.main,
         status, dirty,
         effectiveRefs: references.filter(r => r.state === 'active').length,
         recoveryRefs: references.filter(r => r.state === 'recovery').length,
+        authority,
         createdAt: this.asDate(row.created_at), lastUsedAt: this.asDate(row.last_used_at),
         lastReleasedAt: this.asDate(row.last_released_at),
       }, policy);
@@ -413,8 +447,11 @@ export class WorktreeRegistry {
   async reclaimAll(input: { trigger: ReclaimTrigger; dryRun?: boolean; repos?: string[]; treeId?: string } = { trigger: 'sweep' }): Promise<ReclaimResult> {
     const scanId = randomUUID();
     const result: ReclaimResult = { scanId, removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 };
-    const policy = await this.policy();
-    const known = await this.rows();
+    // The scan's first reads. A failure deletes nothing; it is audited, then rethrown for the caller to log or report.
+    const [policy, known] = await Promise.all([this.policy(), this.rows()]).catch(async (error: unknown) => {
+      await this.readFailure(input.trigger, error);
+      throw error;
+    });
     const repos = [...new Set(input.repos ?? [this.options.opsRepo, ...known.map(r => r.repo)])];
     const routine = input.trigger === 'sweep' && !input.dryRun;
     const header = () => this.audit({
@@ -437,7 +474,12 @@ export class WorktreeRegistry {
             const live = refs.filter(r => String(r.tree.id) === String(row.id.id));
             const active = live.filter(r => refState(r) === 'active');
             const recovery = live.filter(r => refState(r) === 'recovery');
-            if (!active.length && !recovery.length && live.length) {
+            // The task table is the owner: read under this repo lock, before any decision on this tree. A released reference
+            // is not a release while a non-terminal task still names the tree, so the release clock waits for the task.
+            // This one read decides the tree below. Only a claim binds a task to a tree, and it does so under this same lock;
+            // no transition returns a done or void task to work. So the open count cannot rise before the delete decision.
+            const authority = await this.authorityOf(row.id);
+            if (!active.length && !recovery.length && live.length && !authority.open && !authority.unreadable) {
               const latest = live.map(r => this.asDate(r.at)).filter((d): d is Date => !!d).sort((a, b) => b.getTime() - a.getTime())[0];
               if (await this.markReleased(row.id, latest)) {
                 row.last_released_at = latest ?? new Date();
@@ -457,7 +499,8 @@ export class WorktreeRegistry {
             // task needs is pure litter: drop it instead of keeping a permanent "missing" alert.
             // Exclusive task trees only — shared/protected rows stay so a human can explain them.
             const anyLiveRef = freshRefs.some(r => refState(r) !== 'released');
-            if (status === 'missing' && row.mode === 'exclusive' && !anyLiveRef && !(await this.branchStillNeeded(row.branch))) {
+            if (status === 'missing' && row.mode === 'exclusive' && !anyLiveRef && !authority.open && !authority.unreadable
+              && !(await this.branchStillNeeded(row.branch))) {
               if (input.dryRun || !policy.enabled) {
                 result.kept.push({ path: row.path, reason: input.dryRun ? 'dry-run:stale-row' : 'reclaim-disabled' });
                 await this.audit({
@@ -487,7 +530,8 @@ export class WorktreeRegistry {
               status, dirty,
               effectiveRefs: freshRefs.filter(r => refState(r) === 'active').length,
               recoveryRefs: freshRefs.filter(r => refState(r) === 'recovery').length,
-                    createdAt: this.asDate(row.created_at), lastUsedAt: this.asDate(row.last_used_at),
+              authority,
+              createdAt: this.asDate(row.created_at), lastUsedAt: this.asDate(row.last_used_at),
               lastReleasedAt: this.asDate(row.last_released_at),
             }, policy);
 
@@ -495,9 +539,10 @@ export class WorktreeRegistry {
               const reason = decision.reasons.join(',');
               result.kept.push({ path: row.path, reason });
               if (!input.dryRun) {
-                // Abnormal retention (dirty/drift/missing/prior failures) becomes a durable follow-up;
-                // expected retention (refs, grace, protection) clears any stale todo.
-                const todo = /dirty|drift|missing|fail|unmerged/i.test(reason) ? reason.slice(0, 200) : undefined;
+                // Abnormal retention (dirty/drift/missing/prior failures, a lease that disagrees with its reference,
+                // an unreadable task table) becomes a durable follow-up; expected retention (refs, grace, protection,
+                // an open task) clears any stale todo.
+                const todo = /dirty|drift|missing|fail|unmerged|lease-ref-mismatch|unreadable/i.test(reason) ? reason.slice(0, 200) : undefined;
                 if ((row.cleanup_todo ?? undefined) !== todo) {
                   await this.db.query('UPDATE ONLY $tree SET cleanup_todo = $todo;', { tree: row.id, todo });
                   row.cleanup_todo = todo;
@@ -626,8 +671,16 @@ export class WorktreeRegistry {
   /** Single-tree reclaim at a reference-release event point; resolves the tree's repo itself. */
   async reclaimEvent(treeId: string | undefined, trigger: ReclaimTrigger): Promise<ReclaimResult | undefined> {
     if (!treeId) return undefined;
-    const row = await this.db.select<{ repo?: string }>(record('worktree', treeId)).catch(() => undefined);
-    return this.reclaimAll({ trigger, treeId, repos: [row?.repo ?? this.options.opsRepo] });
+    let repo: string | undefined;
+    try {
+      repo = (await this.db.select<{ repo?: string }>(record('worktree', treeId)))?.repo;
+    } catch (error) {
+      // An event point whose reads fail reclaims nothing. The failure is audited for the next sweep and for operators.
+      await this.readFailure(trigger, error);
+      return undefined;
+    }
+    // reclaimAll audits its own failed reads before it rethrows, so the event point does not audit them a second time.
+    return this.reclaimAll({ trigger, treeId, repos: [repo ?? this.options.opsRepo] }).catch(() => undefined);
   }
 
   /** Event-triggered reclaim for a task that just reached a terminal done state. */
