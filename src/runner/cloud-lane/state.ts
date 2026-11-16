@@ -60,18 +60,47 @@ export function writeLaneState(commDir: string, state: LaneState): void {
  * 凭 provider + 回合摘要找到已提交的云端任务并重连，而不是重复提交。
  * 存放于 <stateRoot>/<provider>/inflight/<digest>.json（原子写，0600）。
  */
-export interface InflightEntry { taskId?: string; taskUrl?: string; submittedAt?: number; vendorSession?: string }
+export interface InflightEntry {
+  taskId?: string; taskUrl?: string; submittedAt?: number; vendorSession?: string;
+  /** 已按下发送但尚无 taskId 的发送意图：在碰发送按钮之前落盘，换员工目录也能看到，只核对不重发。 */
+  attempt?: string; attemptAt?: number;
+}
 
 function inflightPath(stateRoot: string, provider: string, digest: string): string {
   return join(stateRoot, provider, 'inflight', `${digest}.json`);
 }
 
-export function readInflight(stateRoot: string | undefined, provider: string, digest: string): InflightEntry | undefined {
+/** 原样读出登记项（含只有 attempt、还没有 taskId 的发送中间态）。 */
+function readInflightRaw(stateRoot: string | undefined, provider: string, digest: string): InflightEntry | undefined {
   if (!stateRoot) return undefined;
   try {
     const value = JSON.parse(readFileSync(inflightPath(stateRoot, provider, digest), 'utf8')) as InflightEntry;
-    return value && typeof value.taskId === 'string' ? value : undefined;
+    return value && (typeof value.taskId === 'string' || typeof value.attempt === 'string') ? value : undefined;
   } catch { return undefined; }
+}
+
+export function readInflight(stateRoot: string | undefined, provider: string, digest: string): InflightEntry | undefined {
+  return readInflightRaw(stateRoot, provider, digest);
+}
+
+/**
+ * 发送意图的共享登记：必须在可能按下发送之前调用。换员工目录（不同 comm 目录、同一 stateRoot）
+ * 或重启后按同一摘要读到它，就只核对是否已受理，绝不再次按下发送。
+ */
+export function recordInflightAttempt(stateRoot: string | undefined, provider: string, digest: string | undefined, attempt: string, at: number): void {
+  if (!stateRoot || !digest) return;
+  const prev = readInflightRaw(stateRoot, provider, digest) ?? {};
+  writeInflight(stateRoot, provider, digest, { ...prev, attempt, attemptAt: at });
+}
+
+/** 撤销发送意图（确认没有按下发送时）。已有 taskId 的登记只去掉 attempt，不能误删在途任务。 */
+export function clearInflightAttempt(stateRoot: string | undefined, provider: string, digest: string | undefined): void {
+  if (!stateRoot || !digest) return;
+  const prev = readInflightRaw(stateRoot, provider, digest);
+  if (!prev?.attempt) return;
+  const { attempt: _attempt, attemptAt: _attemptAt, ...rest } = prev;
+  if (rest.taskId) writeInflight(stateRoot, provider, digest, rest);
+  else clearInflight(stateRoot, provider, digest);
 }
 
 export function writeInflight(stateRoot: string | undefined, provider: string, digest: string, entry: InflightEntry): void {

@@ -263,11 +263,15 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
   // 本 comm 目录没有在途任务时查共享登记：同一公司任务换员工实例也能重连，而不是重复提交云端任务。
   if (!next.taskId) {
     const reg = readInflight(input.stateRoot, input.provider, digest);
-    if (reg) {
+    if (reg?.taskId) {
       next.taskId = reg.taskId;
       next.taskUrl = reg.taskUrl;
       next.submittedAt = reg.submittedAt;
       next.vendorSession ??= reg.vendorSession;
+    } else if (reg?.attempt && input.provider === 'devin-cloud') {
+      // 另一个员工目录已落下发送意图但还没有任务 ID：按在途处理，只核对是否已受理，绝不再次按发送。
+      next.taskId = reg.attempt;
+      next.submittedAt ??= reg.attemptAt;
     }
   }
   try {

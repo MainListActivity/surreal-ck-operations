@@ -6,12 +6,16 @@
  *   弹出层是 [role=menu]，里面 "Capability" 分组下有同名行；选中 Free 后页面出现
  *   "Free (powered by SWE-2)"、"The plan includes 2 concurrent sessions"、"N/M in use"。
  * - 会话地址 https://app.devin.ai/sessions/<32hex>；侧栏 a[href^="/sessions/"] 列出会话。
- * - 会话页转录里发言人行是 "Devin:"、"<用户名>:"、"Automation:"；状态行有
- *   "Devin is working"、"Devin is awaiting instructions"、"Devin chose to stop working"、
+ * - 会话页转录的发言角色按 2026-11-16 真实只读实测：Devin 回答块是
+ *   [data-testid="transcript-agent-message"]，文字在 [data-message-author="devin"]；
+ *   用户/自动化消息是 [data-testid="transcript-user-message"]，文字在 [data-message-author="user"]。
+ *   工具输出与状态是独立的 [data-testid="transcript-worklog-row"]、PR 卡片等，没有作者属性。
+ *   状态行有 "Devin is working"、"Devin is awaiting instructions"、"Devin chose to stop working"、
  *   "blocked on the user"。会话页 Capability 按钮显示该会话的档位（Free）。
  *
- * 终稿与状态只看「本轮收尾约定之后」的文字：约定里的「[SCK-DONE 标记]」只出现在本轮用户消息中，
- * 它之后才是本轮 Devin 的回答区。派工消息、旧轮次残留的 DONE 或状态短语、用户例子都在它之前，不参与判定。
+ * 终稿与状态只看「本轮收尾约定之后」的内容，且终稿只认 Devin 的发言块：用户消息、收尾约定本身的例子、
+ * 工具输出里的 DONE/PR 都不算。派工消息、旧轮次残留的 DONE 或状态短语、用户例子都在本轮用户消息之前或
+ * 属于无作者块，不参与判定。找不到作者块时终稿保持 null（不拿整段 main 文本冒充助手回复）。
  * 发送不是幂等的：按下 Send 前打印 __PRESSED__，脚本中途死掉时执行端知道「可能已发出」，绝不重发，
  * 而是回会话列表/原会话按本轮标记核对是否已受理。
  */
@@ -63,20 +67,33 @@ const read = () => p.evaluate(() => {
   const TASK = ${JSON.stringify(`[SCK-ROUND ${marker}]`)}, DONE = ${JSON.stringify(`[SCK-DONE ${marker}]`)};
   const QUOTED = ${JSON.stringify(`「[SCK-DONE ${marker}]」`)};
   const capButton = [...document.querySelectorAll('button')].find(e => /^(${CAPS.join('|')})$/.test((e.innerText || '').trim()));
-  // 收尾约定里引用的「[SCK-DONE 标记]」只在本轮用户消息中出现：取它之后的文字作为本轮 Devin 的回答区。
+  // 发言人只能按页面给出的角色块判定：Devin 回答是 [data-message-author="devin"]，用户消息是
+  // [data-message-author="user"]。工具输出、worklog、PR 卡片没有作者属性，永远不参与终稿判定。
+  const blocks = [...document.querySelectorAll('[data-message-author]')]
+    .map(e => ({ author: String((e.getAttribute && e.getAttribute('data-message-author')) || '').toLowerCase(), text: (e.innerText || '') }))
+    .filter(b => b.author !== '');
+  let roundStart = -1;
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    if (blocks[i].author === 'user' && blocks[i].text.includes(TASK)) { roundStart = i; break; }
+  }
+  // 终稿只从本轮用户消息之后的 Devin 发言块里取，并且只认以收尾标记单独成行开头的那条。
+  let done = null;
+  if (roundStart >= 0) {
+    const agents = blocks.slice(roundStart + 1).filter(b => b.author === 'devin');
+    for (let i = agents.length - 1; i >= 0 && done === null; i--) {
+      const lines = agents[i].text.split('\\n');
+      let first = -1;
+      for (let j = 0; j < lines.length; j++) { if (lines[j].trim()) { first = j; break; } }
+      if (first >= 0 && lines[first].trim().startsWith(DONE)) {
+        done = [lines[first].trim().slice(DONE.length), ...lines.slice(first + 1)]
+          .filter(l => !/^(Worked|Thought) for /.test(l.trim()))
+          .join('\\n').trim();
+      }
+    }
+  }
+  // 状态短语只取本轮收尾约定之后的文字；回答区之前的旧轮次状态短语不算。
   const at = mainText.lastIndexOf(QUOTED);
   const region = at >= 0 ? mainText.slice(at + QUOTED.length) : '';
-  const lines = region.split('\\n');
-  const strip = (l) => l.trim().replace(/^Devin:\\s*/, '');
-  let di = -1;
-  for (let i = lines.length - 1; i >= 0; i--) { if (strip(lines[i]).startsWith(DONE)) { di = i; break; } }
-  let done = null;
-  if (di >= 0) {
-    done = [strip(lines[di]).slice(DONE.length), ...lines.slice(di + 1)]
-      .filter(l => !/^(Worked|Thought) for |^Devin (is|chose|s)|^Automation:|^Ask Devin|^Computer$|^Free$|^Devin:?$/.test(l.trim()))
-      .join('\\n').trim();
-  }
-  // 状态短语只取回答区里最后出现的那一个；回答区外（旧轮次）的状态短语不算。
   const lastAt = (re) => { let idx = -1, m; const g = new RegExp(re.source, 'gi'); while ((m = g.exec(region))) idx = m.index; return idx; };
   const hits = [['working', lastAt(/Devin is working/)], ['blocked', lastAt(/blocked on the user/)], ['idle', lastAt(/Devin is awaiting instructions|Devin chose to stop working/)]]
     .filter(h => h[1] >= 0).sort((a, b) => b[1] - a[1]);
@@ -89,8 +106,10 @@ const read = () => p.evaluate(() => {
     cap: capButton ? (capButton.innerText || '').trim() : null,
     powered: /powered by SWE-2/i.test(body),
     seats: seats.length === 2 ? { used: seats[0], total: seats[1] } : null,
-    markerSeen: mainText.includes(TASK),
-    convSeen: at >= 0,
+    // 没有作者块就无法可靠区分谁说了什么：标记可见性照报，但终稿保持 null，绝不拿整段 main 文本冒充助手回答。
+    source: blocks.length ? 'roles' : 'text-only',
+    markerSeen: roundStart >= 0 || (blocks.length === 0 && mainText.includes(TASK)),
+    convSeen: roundStart >= 0 ? blocks[roundStart].text.includes(QUOTED) : at >= 0,
     status: hits.length ? hits[0][0] : 'unknown',
     done,
     tail: (region.trim() || mainText).slice(-1500),
@@ -128,7 +147,7 @@ export function devinSessionScript(sessionUrl: string, marker: string): string {
 const s = await read();
 if (s.login) { emit({ ok: false, code: 'login_required' }); process.exit(0); }
 if (!ready) { emit({ ok: false, code: 'not_ready' }); process.exit(0); }
-emit({ ok: true, url: s.url, cap: s.cap, seats: s.seats, markerSeen: s.markerSeen, convSeen: s.convSeen, status: s.status, done: s.done, tail: s.tail });
+emit({ ok: true, url: s.url, cap: s.cap, seats: s.seats, source: s.source, markerSeen: s.markerSeen, convSeen: s.convSeen, status: s.status, done: s.done, tail: s.tail });
 `, marker);
 }
 

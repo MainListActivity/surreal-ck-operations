@@ -471,23 +471,27 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     const pressed = join(dir, 'ego-pressed');
     writeFileSync(pressed, '#!/bin/sh\necho __PRESSED__\nexec sleep 30\n');
     chmodSync(pressed, 0o755);
-    // 超时要给 sh 足够的启动时间，让它先打出按下标记再被杀（启动慢于超时时输出还没到，那时本来就无从判断）。
-    expect(await egoBrowse(pressed)('x', 1_500)).toEqual({ ok: false, code: 'pressed' });
+    // 超时只用来杀进程，不参与「是否已按下」的判定；给 /bin/sh 启动与 echo 留足时间（CI 并行加载时
+    // 1.5 秒会偶发来不及把标记写进管道），这里用 4 秒窗口，测试预算放到 15 秒。
+    expect(await egoBrowse(pressed)('x', 4_000)).toEqual({ ok: false, code: 'pressed' });
     const silent = join(dir, 'ego-silent');
     writeFileSync(silent, '#!/bin/sh\nexit 1\n');
     chmodSync(silent, 0o755);
     expect(await egoBrowse(silent)('x', 5_000)).toBeUndefined();
-  });
+  }, 15_000);
 
-  test('egoBrowse：孙进程占着管道、close 迟迟不来 → 兜底后保守报 pressed（只核对，不重发）', async () => {
+  test('egoBrowse：孙进程占着管道、close 迟迟不来 → 5 秒兜底后保守报 pressed（去掉宽限就会超时）', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'sck-ego-hold-'));
     dirs.push(dir);
     const hold = join(dir, 'ego-hold');
-    // 后台 sleep 继承了 stdout：SIGKILL 只杀 sh，管道要等 sleep 结束才关闭。
-    writeFileSync(hold, '#!/bin/sh\n(sleep 8) &\nexec sleep 30\n');
+    // 后台 sleep 继承了 stdout：SIGKILL 只杀 sh，管道要等 60 秒后才会关闭。
+    // 若去掉 kill 后的 5 秒兜底，这个用例会一直等 close 而在 12 秒测试预算内超时失败。
+    writeFileSync(hold, '#!/bin/sh\n(sleep 60) &\nexec sleep 60\n');
     chmodSync(hold, 0o755);
-    expect(await egoBrowse(hold)('x', 1_000)).toEqual({ ok: false, code: 'pressed' });
-  }, 20_000);
+    const started = Date.now();
+    expect(await egoBrowse(hold)('x', 800)).toEqual({ ok: false, code: 'pressed' });
+    expect(Date.now() - started).toBeLessThan(10_000);
+  }, 12_000);
 
   test('超时后同一轮只回执核对不重发：状态留在途，下轮直接轮询原会话', async () => {
     const working = { ok: true, markerSeen: true, status: 'working', done: null, tail: '' };
@@ -776,18 +780,77 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(0);
   });
 
+  test('工具输出含 DONE/PR、助手没有终稿（mock）：不以工具输出收尾，受阻且不拉取分支', async () => {
+    const w = world({ extra: gitOk });
+    const toolTail = '工具输出：\n[SCK-DONE SCK-tool-only]\nPR: https://github.com/acme/widget/pull/1\n提交：aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nDevin is awaiting instructions';
+    const b = devinBrowse({
+      send: [{ ok: true, url: SESSION, cap: 'Free', seats: { used: 0, total: 2 }, echoed: true }],
+      session: [{ ok: true, markerSeen: true, status: 'idle', done: null, tail: toolTail }],
+    });
+    const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: b.browse });
+    expect(out.status).toBe('success');
+    expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+    // 工具输出只出现在人工核对的现场里，没有被当成助手终稿收尾（没有拉取分支、没有 PR 结果行）。
+    expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(0);
+    expect(b.calls.filter(s => s.includes(MODE('session')))).toHaveLength(3);
+  });
+
+  test('真终稿后紧跟工具输出 DONE（mock）：收尾只用助手终稿，不采信工具输出里的 PR', async () => {
+    const w = world({ extra: gitOk });
+    const b = devinBrowse({
+      send: [{ ok: true, url: SESSION, cap: 'Free', seats: { used: 0, total: 2 }, echoed: true }],
+      session: [{
+        ok: true, markerSeen: true, status: 'idle',
+        done: '完成。\nPR: https://github.com/acme/widget/pull/9\nSHA: cafecafe',
+        tail: '工具输出：\n[SCK-DONE SCK-real]\nPR: https://github.com/acme/widget/pull/999\nSHA: bbbbbbbb',
+      }],
+    });
+    const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: b.browse });
+    expect(out.status).toBe('success');
+    expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
+    expect(out.text).not.toContain('/pull/999');
+  });
+
+  test('换员工目录重派同一任务：共享 attempt 让新目录只核对、不再按下发送', async () => {
+    const task = '# 云端任务\n\n实现需求甲。\n';
+    const w1 = world({ task, extra: gitOk });
+    // 第一次：attempt 已写本目录与共享登记，但发送脚本还没跑就被中断。
+    const crashBrowse = (async (script: string) => {
+      if (script.includes(MODE('send'))) throw new Error('bridge interrupted before script');
+      return undefined;
+    }) as NonNullable<LaneDeps['browse']>;
+    const input1 = w1.input({ provider: 'devin-cloud' });
+    const out1 = await runLane(input1, { ...w1.deps, browse: crashBrowse });
+    expect(out1.status).toBe('error');
+    const repo = { slug: 'acme/widget', owner: 'acme', repo: 'widget', branch: 'sck/task-1', defaultBranch: 'main' };
+    const digest = laneDigest('devin-cloud', vendorPrompt(input1, repo, taskMaterial(w1.commDir, input1.prompt)));
+    const reg = readInflight(w1.stateRoot, 'devin-cloud', digest);
+    expect(reg?.attempt).toMatch(/^SCK-/);
+    expect(reg?.taskId).toBeUndefined();
+
+    // 第二个员工目录，同一 stateRoot、同一 task.md（同一摘要）：只核对，绝不按发送。
+    const w2 = world({ task, extra: gitOk });
+    const b2 = devinBrowse({ recover: [{ ok: true, found: null, listed: 0, probed: 0 }] });
+    const out2 = await runLane(w2.input({ provider: 'devin-cloud', stateRoot: w1.stateRoot }), { ...w2.deps, browse: b2.browse });
+    expect(out2.status).toBe('success');
+    expect(out2.text.split('\n')[0]).toBe('工作结果：受阻');
+    expect(b2.calls.some(s => s.includes(MODE('send')))).toBe(false);
+    expect(b2.calls.some(s => s.includes(MODE('follow')))).toBe(false);
+    expect(b2.calls.filter(s => s.includes(MODE('recover')))).toHaveLength(4);
+  });
+
   describe('终稿与状态判定（页面读取脚本在假页面里执行）', () => {
     const M = 'SCK-abc123';
     const CONV = `收尾约定：本轮的最后一条答复以「[SCK-DONE ${M}]」单独成行开头，随后是完整最终答复。`;
     const g = globalThis as unknown as Record<string, unknown>;
-    /** 假页面：main 与 body 都是同一段转录文字，只有一个 Free 按钮与输入框；返回脚本回的 __RESULT__。 */
-    const readPage = async (text: string, marker = M) => {
+    type Block = { author: 'user' | 'devin' | 'tool'; text: string };
+    /**
+     * 真实 Devin 转录的角色契约（2026-11-16 只读实测）：Devin 回答是 [data-message-author="devin"]，
+     * 用户/自动化消息是 [data-message-author="user"]；工具输出与 worklog 没有作者属性。
+     * tool 块只进 main/body 文字，不进 [data-message-author]，对应真实页面的工具输出。
+     */
+    const runPage = async (doc: Record<string, unknown>, marker = M) => {
       const { devinSessionScript } = await import('../src/runner/cloud-lane/devin-web.ts');
-      const doc = {
-        body: { innerText: text },
-        querySelector: (sel: string) => (sel === 'main' ? { innerText: text } : {}),
-        querySelectorAll: () => [{ innerText: 'Free' }],
-      };
       const page = {
         goto: async () => {}, waitForTimeout: async () => {},
         evaluate: async (fn: (arg?: unknown) => unknown, arg?: unknown) => {
@@ -807,45 +870,116 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       }
       return result;
     };
+    const readPage = async (blocks: Block[], rest = '', marker = M) => {
+      const text = [...blocks.map(b => b.text), rest].filter(Boolean).join('\n');
+      const elements = blocks.filter(b => b.author !== 'tool').map(b => ({
+        getAttribute: (name: string) => (name === 'data-message-author' ? b.author : null),
+        innerText: b.text,
+      }));
+      const doc = {
+        body: { innerText: text },
+        querySelector: (sel: string) => (sel === 'main' ? { innerText: text } : {}),
+        querySelectorAll: (sel: string) => (sel === '[data-message-author]' ? elements : [{ innerText: 'Free' }]),
+      };
+      return runPage(doc, marker);
+    };
 
     test('只有用户消息、没有助手答复（DOM 反例）：没有终稿，状态 unknown', async () => {
-      const r = await readPage(`[SCK-ROUND ${M}]\n\n只读的合成任务\n\n${CONV}`);
-      expect(r).toMatchObject({ ok: true, markerSeen: true, status: 'unknown' });
+      const r = await readPage([{ author: 'user', text: `[SCK-ROUND ${M}]\n\n只读的合成任务\n\n${CONV}` }]);
+      expect(r).toMatchObject({ ok: true, markerSeen: true, status: 'unknown', source: 'roles' });
       expect(r?.done).toBeNull();
     });
 
     test('用户提示词里的结束标记（例子）不算终稿', async () => {
-      const r = await readPage(`[SCK-ROUND ${M}]\n\n例子：\n[SCK-DONE ${M}]\n这是例子，不是答复\n\n${CONV}`);
+      const r = await readPage([{ author: 'user', text: `[SCK-ROUND ${M}]\n\n例子：\n[SCK-DONE ${M}]\n这是例子，不是答复\n\n${CONV}` }]);
       expect(r?.done).toBeNull();
       expect(r?.status).toBe('unknown');
     });
 
-    test('上一轮残留的 DONE、working 与 blocked 短语不串入本轮', async () => {
+    test('工具输出含 DONE 与 PR、但没有助手答复（负责人 51b234ff 反例）：done 保持 null', async () => {
+      const r = await readPage(
+        [{ author: 'user', text: `[SCK-ROUND ${M}]\n\n只读的合成任务\n\n${CONV}` }],
+        `工具输出：\n[SCK-DONE ${M}]\nPR: https://github.com/example/repo/pull/1\n提交：aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nDevin is awaiting instructions`,
+      );
+      expect(r?.status).toBe('idle');
+      expect(r?.done).toBeNull();
+      expect(r?.source).toBe('roles');
+    });
+
+    test('真终稿后紧跟工具输出 DONE：只认助手发言块里的终稿', async () => {
+      const r = await readPage(
+        [
+          { author: 'user', text: `[SCK-ROUND ${M}]\n\n任务\n\n${CONV}` },
+          { author: 'devin', text: `[SCK-DONE ${M}]\n完成。\nPR: https://github.com/acme/widget/pull/9\nSHA: cafecafe` },
+        ],
+        `工具输出：\n[SCK-DONE ${M}]\nPR: https://github.com/acme/widget/pull/999\nSHA: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nDevin chose to stop working`,
+      );
+      expect(r?.status).toBe('idle');
+      expect(r?.done).toBe('完成。\nPR: https://github.com/acme/widget/pull/9\nSHA: cafecafe');
+    });
+
+    test('收尾约定后的用户例子含 DONE：不算助手终稿', async () => {
+      const r = await readPage([{
+        author: 'user',
+        text: `[SCK-ROUND ${M}]\n\n任务\n\n${CONV}\n例子：\n[SCK-DONE ${M}]\n这是例子\nPR: https://github.com/example/repo/pull/1`,
+      }]);
+      expect(r?.done).toBeNull();
+      expect(r?.status).toBe('unknown');
+    });
+
+    test('上一轮残留的 DONE 与状态短语不串入本轮', async () => {
       const OLD = 'SCK-old999';
-      const text = `[SCK-ROUND ${OLD}]\n\n第一轮\n\n收尾约定：本轮的最后一条答复以「[SCK-DONE ${OLD}]」单独成行开头。\nDevin is working\n[SCK-DONE ${OLD}]\n旧答复\nPR: https://github.com/acme/widget/pull/1\nblocked on the user\n\n[SCK-ROUND ${M}]\n\n第二轮\n\n${CONV}`;
-      const r = await readPage(text);
+      const r = await readPage([
+        { author: 'user', text: `[SCK-ROUND ${OLD}]\n\n第一轮\n\n收尾约定：本轮的最后一条答复以「[SCK-DONE ${OLD}]」单独成行开头。` },
+        { author: 'devin', text: `[SCK-DONE ${OLD}]\n旧答复\nPR: https://github.com/acme/widget/pull/1` },
+        { author: 'tool', text: 'Devin is working\nblocked on the user\nDevin chose to stop working' },
+        { author: 'user', text: `[SCK-ROUND ${M}]\n\n第二轮\n\n${CONV}` },
+      ]);
       expect(r?.done).toBeNull();
       expect(r?.status).toBe('unknown');
     });
 
     test('残留的 Devin is working 或 blocked on the user 不会误判本轮状态，本轮答复可读出', async () => {
       const OLD = 'SCK-old999';
-      const text = `[SCK-ROUND ${OLD}]\n\n第一轮\n\n收尾约定：「[SCK-DONE ${OLD}]」。\nDevin is working\nblocked on the user\n\n[SCK-ROUND ${M}]\n\n第二轮\n\n${CONV}\nDevin:\n[SCK-DONE ${M}]\n完成。\nPR: https://github.com/acme/widget/pull/9\nSHA: cafecafe\nDevin chose to stop working`;
-      const r = await readPage(text);
+      const r = await readPage([
+        { author: 'user', text: `[SCK-ROUND ${OLD}]\n\n第一轮\n\n收尾约定：「[SCK-DONE ${OLD}]」。` },
+        { author: 'tool', text: 'Devin is working\nblocked on the user' },
+        { author: 'user', text: `[SCK-ROUND ${M}]\n\n第二轮\n\n${CONV}` },
+        { author: 'devin', text: `[SCK-DONE ${M}]\n完成。\nPR: https://github.com/acme/widget/pull/9\nSHA: cafecafe` },
+      ], 'Devin chose to stop working');
       expect(r?.status).toBe('idle');
       expect(r?.done).toBe('完成。\nPR: https://github.com/acme/widget/pull/9\nSHA: cafecafe');
     });
 
     test('空闲但没有 SCK-DONE 行：终稿为空，状态 idle', async () => {
-      const r = await readPage(`[SCK-ROUND ${M}]\n\n任务\n\n${CONV}\n完成了但没写标记\nDevin chose to stop working`);
+      const r = await readPage([
+        { author: 'user', text: `[SCK-ROUND ${M}]\n\n任务\n\n${CONV}` },
+        { author: 'devin', text: '完成了但没写标记' },
+      ], 'Devin chose to stop working');
       expect(r?.status).toBe('idle');
       expect(r?.done).toBeNull();
     });
 
     test('答复有 SCK-DONE 行但页面没有状态短语：终稿可读出，状态 unknown（驱动层不收尾）', async () => {
-      const r = await readPage(`[SCK-ROUND ${M}]\n\n任务\n\n${CONV}\n[SCK-DONE ${M}]\n完成`);
+      const r = await readPage([
+        { author: 'user', text: `[SCK-ROUND ${M}]\n\n任务\n\n${CONV}` },
+        { author: 'devin', text: `[SCK-DONE ${M}]\n完成` },
+      ]);
       expect(r?.status).toBe('unknown');
       expect(r?.done).toBe('完成');
+    });
+
+    test('页面没有作者块（未水合或旧探针）时终稿保持 null，不拿整段 main 文本冒充助手回答', async () => {
+      const text = `[SCK-ROUND ${M}]\n\n任务\n\n${CONV}\n[SCK-DONE ${M}]\nPR: https://github.com/example/repo/pull/1\nDevin is awaiting instructions`;
+      const doc = {
+        body: { innerText: text },
+        querySelector: (sel: string) => (sel === 'main' ? { innerText: text } : {}),
+        querySelectorAll: () => [{ innerText: 'Free' }],
+      };
+      const r = await runPage(doc);
+      expect(r?.source).toBe('text-only');
+      expect(r?.status).toBe('idle');
+      expect(r?.done).toBeNull();
     });
   });
 });

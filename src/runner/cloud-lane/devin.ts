@@ -9,7 +9,7 @@
  * 完成后 git fetch + --ff-only 快进本地工作树；非快进报错回合，绝不 reset。
  */
 import { ensureBranchOnOrigin, fetchAndFastForward, type RepoInfo } from './repo.ts';
-import { recordInflight, writeLaneState, type DevinSeatReading, type LaneState } from './state.ts';
+import { clearInflightAttempt, recordInflight, recordInflightAttempt, writeLaneState, type DevinSeatReading, type LaneState } from './state.ts';
 import { devinFollowScript, devinRecoverScript, devinSendScript, devinSessionScript, DEVIN_HOME, DEVIN_SESSION_RE } from './devin-web.ts';
 import type { LaneDeps, LaneInput } from './lane.ts';
 
@@ -79,10 +79,16 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
     writeLaneState(input.commDir, state);
     recordInflight(input.stateRoot, input.provider, ctx.digest, state);
   };
-  const clearAttempt = () => {
+  /** 只清本目录的 attempt；共享登记交给 persist()（已有 taskId 时）或 abandonAttempt() 处理。 */
+  const dropLocalAttempt = () => {
     if (!state.devin) return;
     delete state.devin.attempt;
     delete state.devin.attemptAt;
+  };
+  /** 确认没有按下发送：本目录与共享登记里的发送意图一起撤销，之后才允许再试。 */
+  const abandonAttempt = () => {
+    dropLocalAttempt();
+    clearInflightAttempt(input.stateRoot, input.provider, ctx.digest);
   };
   const loginFail = () => fail('app.devin.ai 未登录或登录已过期（需要老板在 ego-browser 里重新登录 Devin）');
   const over = () => deps.now() > ctx.deadline;
@@ -96,11 +102,15 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
   };
 
   // 上一轮残留的发送标记：同一摘要说明按下过发送却没有定论（进程中断），只核对不重发；旧摘要的残留直接清掉。
-  if (state.devin?.attempt && state.devin.attempt !== marker) clearAttempt();
+  if (state.devin?.attempt && state.devin.attempt !== marker) {
+    clearInflightAttempt(input.stateRoot, input.provider, state.digest);
+    dropLocalAttempt();
+  }
   if (state.devin?.attempt === marker && !state.taskId) {
     state.taskId = marker;
     state.submittedAt ??= deps.now();
-    clearAttempt();
+    // 保留共享 attempt 直到 persist() 用 taskId 覆盖它：中间崩溃时别的目录仍只会核对，不会重发。
+    dropLocalAttempt();
     persist();
     deps.progress('上次按下发送后没有拿到结果，先核对是否已受理（不重发）', 'failed');
   }
@@ -111,8 +121,11 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
   while (!sessionUrl) {
     if (!state.taskId) {
       const follow = sessionOf(state.vendorSession);
-      // 按下发送前先落盘 attempt：之后无论脚本如何结束，重启都只核对、不再发送。
-      state.devin = { ...state.devin, attempt: marker, attemptAt: deps.now() };
+      // 按下发送前先落盘 attempt：本目录写 .lane/state.json，共享根写 inflight/<digest>.json。
+      // 之后无论脚本如何结束、换到哪个员工目录，都只核对是否已受理，绝不再按发送。
+      const at = deps.now();
+      state.devin = { ...state.devin, attempt: marker, attemptAt: at };
+      recordInflightAttempt(input.stateRoot, input.provider, ctx.digest, marker, at);
       persist();
       deps.progress(follow ? `尝试在原 Devin 会话发送本轮消息（${marker}）` : `尝试新建 Devin Cloud 会话（${marker}）`, 'attempt');
       const r = await browse(follow ? devinFollowScript(follow, marker, message) : devinSendScript(home, marker, message), 150_000) as Reply;
@@ -120,8 +133,8 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
       const accepted = r?.ok === true && url !== undefined;
       // ok 即脚本已越过按下发送；拿不到会话地址也只能核对，绝不当成未发出而重发。
       const pressed = r?.ok === true || r?.code === 'pressed' || r?.code === 'not_echoed';
-      // 没有按下发送（登录、页面、档位、席位、浏览器）：撤销 attempt，之后才允许再试。
-      if (!pressed) { clearAttempt(); persist(); }
+      // 没有按下发送（登录、页面、档位、席位、浏览器）：撤销本目录与共享的 attempt，之后才允许再试。
+      if (!pressed) { abandonAttempt(); persist(); }
       if (r?.code === 'login_required') return loginFail();
       if (r?.code === 'capability') {
         const detail = String(r.detail ?? '').slice(0, 300);
@@ -147,7 +160,7 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
         // 受理证据：转录里看到本轮标记（或会话列表/原会话已有它）。只有这时才算已派。
         sessionUrl = url;
         state.taskId = marker; state.taskUrl = url; state.vendorSession = url; state.submittedAt = deps.now();
-        clearAttempt();
+        dropLocalAttempt();
         readSeats(follow ? 'follow' : 'send', r);
         persist();
         const seat = state.devin?.seats;
@@ -162,7 +175,7 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
         sessionUrl = url;
         state.taskId = marker; state.submittedAt = deps.now();
         if (url) { state.taskUrl = url; state.vendorSession = url; }
-        clearAttempt();
+        dropLocalAttempt();
         persist();
         deps.progress(`Devin Cloud 已按下发送但未确认受理（${marker}），转入核对，不重发`, 'failed');
         continue;
