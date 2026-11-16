@@ -407,26 +407,32 @@ test('代码任务窗口内收到声明提交行的迟到终稿：按声明 SHA 
   } finally { f.close(); }
 });
 
-test('事件携带的进度消息与重读走同一门禁，复核阶段未声明结论同样等待迟到终稿', async () => {
+test('事件携带文本不旁路持久时间线：携带提交行的进度事件在工具仍运行时不送审，工具结束后按真实终稿提交一次', async () => {
+  // 82c5672 负例：completed 事件携带“进度…后台验证工具仍在运行。\n提交：<sha>”，
+  // row.finalText || readTurnResult 跳过持久时间线读直接 submit（reads=0）。
   const sha = 'd'.repeat(40);
-  const f = fixture(async () => `逐条自验完成。\n提交：${sha}`);
+  let live = true, reads = 0;
+  const f = fixture(async () => { reads++;
+    if (live) throw new RuntimeResultError('still_active', 'synthetic running tool');
+    return `逐条自验完成，CI 全绿。\n提交：${sha}`; });
   try {
     f.code();
     await f.claim(); await f.pool.turnStarted('agent','turn-a');
-    await f.settle(f.event('turn-a', '独立 QA 已启动，报告回来后给出最终答复。'));
+    await f.settle(f.event('turn-a', `进度：提交已推送，后台验证工具仍在运行。\n提交：${'a'.repeat(40)}`));
+    expect(reads).toBeGreaterThan(0);
     expect(f.calls).toHaveLength(0);
     expect(f.journal().rows()[0]?.state).toBe('collecting');
+    expect(f.journal().rows()[0]?.error).toBe('runtime_result_unavailable:still_active');
+    live = false;
     await f.retry();
     expect(f.calls.map(c => c.action)).toEqual(['submit']);
-    expect(f.calls[0]?.sha).toBe(sha);
+    expect(f.calls[0]?.sha).toBe(sha); // 按持久时间线的真实终稿 SHA，而非事件携带的 SHA。
   } finally { f.close(); }
+  // 复核阶段同样以持久时间线为准：事件携带的进度消息不产生受阻，真实结论到达后一次送审。
   const g = fixture(async () => '复核结论：通过\n逐项复验全部符合要求');
   try {
     await g.claim(true); await g.pool.turnStarted('agent','turn-a');
     await g.settle(g.event('turn-a', '复核还在进行，稍后给出结论。'));
-    expect(g.calls).toHaveLength(0);
-    expect(g.journal().rows()[0]?.error).toBe('runtime_result_unavailable:not_yet_available');
-    await g.retry();
     expect(g.calls.map(c => c.action)).toEqual(['accept']);
   } finally { g.close(); }
 });

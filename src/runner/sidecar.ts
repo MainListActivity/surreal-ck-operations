@@ -353,11 +353,13 @@ export class SidecarPool {
     if (!row.artifacts?.raw && !row.artifacts?.report && !row.artifacts?.blocker && this.deps.readTurnResult) {
       try {
         if (!row.agent || !row.turn) throw new Error('missing turn identity');
-        // Text carried by the end event and text re-read from the durable timeline are both runtime
-        // output. A progress message that does not declare the delivery contract (verified commit line,
-        // review verdict or blocked heading) is dropped, and the durable timeline decides the real
-        // verdict within the bounded window — never the worktree HEAD.
-        const text = row.finalText || await this.deps.readTurnResult(row.agent, row.turn, row.startedAt ?? row.createdAt ?? 0);
+        // The durable timeline is the only trusted turn state: an end event can carry a text that
+        // declares a commit while turn-fenced tools are still running, so the read always happens —
+        // it both checks in-flight rows and returns the turn's real last answer. A read text that
+        // does not declare the delivery contract (verified commit line, review verdict or blocked
+        // heading) is dropped and the timeline decides the real verdict within the bounded window —
+        // never the worktree HEAD. Event-carried text is trusted only where no timeline read exists.
+        const text = await this.deps.readTurnResult(row.agent, row.turn, row.startedAt ?? row.createdAt ?? 0);
         if (!text.trim()) throw new Error('empty runtime result');
         if (await this.undeclaredDelivery(row, text)) {
           row.finalText = undefined;
