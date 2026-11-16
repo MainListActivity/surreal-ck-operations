@@ -342,6 +342,28 @@ describe('GatewayClient 轮询老板端作业（真实 ops.job.get 回执）', (
     expect(calls.map(call => call.body.command)).toEqual(['ops_login', 'ops.job.get']);
   });
 
+  const ENTRANCE_REPLIES: Array<[number, string]> = [
+    [503, 'Unavailable'],
+    [500, 'Internal Server Error'],
+    [403, 'Forbidden'],
+    [404, 'Not Found'],
+  ];
+  test.each(ENTRANCE_REPLIES)('轮询时入口返回旧式 {error} 回执（HTTP %s，没有 ok 字段）：已受理，作业号保留，业务命令不重提交', async (status, text) => {
+    const { fn, calls } = fakeFetch(call =>
+      call.body.command === 'ops.job.get'
+        ? json({ error: text }, status)
+        : json({ ok: false, error: { code: 'pending', message: 'job-t1' } }, 202),
+    );
+    const client = new GatewayClient({ url: URL_BASE, fetch: fn, pollMs: 0, sleep: noSleep });
+
+    const failure = await catchError(client.call(TOKEN, 'ops_login', { alias: 'QA1' })) as GatewayError;
+    expect(failure.code).toBe('upstream_error');
+    expect(failure.message).toBe(`网关响应缺少 ok 字段（HTTP ${status}）`);
+    expect(failure.accepted).toBe(true);
+    expect(failure.jobId).toBe('job-t1');
+    expect(calls.map(call => call.body.command)).toEqual(['ops_login', 'ops.job.get']);
+  });
+
   test('作业因恢复窗口已过被拒：截止时刻随说明保留，已受理，作业号保留，业务命令只提交一次', async () => {
     const store = createOwnerJobStore();
     const deadline = '2026-11-16T07:01:22.859Z';
