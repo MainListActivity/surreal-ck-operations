@@ -27,7 +27,7 @@ export function devinCloudModel(configured: unknown): typeof DEVIN_CLOUD_MODEL {
  * 供应商确定性拒绝这次请求：模型名不被识别，或账号无权使用它。同一请求再发一次结果不变，
  * 所以不能当会话异常处理（那会退役员工、重派任务，每次都撞同一个错误）。额度类报错不算，仍走 quota-failure。
  */
-const DETERMINISTIC_REFUSAL = /unknown model|model\b[^\n]{0,60}?\b(?:not (?:found|supported)|unsupported)|not entitled|permission denied|no permission|insufficient permissions?|access denied|unauthori[sz]ed|forbidden|\b40[13]\b/i;
+const DETERMINISTIC_REFUSAL = /unknown model|model\b[^\n]{0,60}?\b(?:not (?:found|supported)|unsupported)|not entitled|permission denied|no permission|insufficient permissions?|access denied|unauthori[sz]ed|forbidden|\b(?:HTTP(?:\/[\d.]+)?(?:\s+status)?|status(?:\s+code)?)\s*[:=]?\s*40[13]\b/i;
 export function devinDeterministicRefusal(text: string): boolean {
   return DETERMINISTIC_REFUSAL.test(text) && !QUOTA_ERROR.test(text);
 }

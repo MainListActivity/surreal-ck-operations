@@ -437,10 +437,10 @@ describe('devin-cloud 通道', () => {
   const refusedRoute: Route = call => call.cmd === 'devin' ? { code: 1, stdout: '', stderr: UNKNOWN_FREE } : undefined;
 
   test('确定性拒绝的判定：模型不被识别或无权限算拒绝；额度、限流与网络瞬时错误不算', () => {
-    for (const text of [UNKNOWN_FREE, 'model "free" not found', 'permission denied for model free', 'HTTP 403 Forbidden', 'Error 401: unauthorized', 'you have no permission to use this model'])
+    for (const text of [UNKNOWN_FREE, 'model "free" not found', 'permission denied for model free', 'HTTP 403 Forbidden', 'Error 401: unauthorized', 'HTTP/2 401', 'status code: 403', 'you have no permission to use this model'])
       expect(devinDeterministicRefusal(text)).toBe(true);
     // 同时带额度字样的仍按额度处理（走既有 quota 路径），不改判为受阻。
-    for (const text of ["Unknown model: 'free' (rate limit exceeded)", 'quota exhausted', 'rate limit exceeded', 'HTTP 429', 'usage limit reached', 'connection reset by peer', 'ETIMEDOUT', 'HTTP 503 service unavailable', ''])
+    for (const text of ["Unknown model: 'free' (rate limit exceeded)", 'quota exhausted', 'rate limit exceeded', 'HTTP 429', 'usage limit reached', 'connection reset by peer', 'ETIMEDOUT', 'HTTP 503 service unavailable', 'request 403 failed: connection reset', 'trace 401 interrupted', ''])
       expect(devinDeterministicRefusal(text)).toBe(false);
   });
 
