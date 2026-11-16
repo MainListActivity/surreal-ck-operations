@@ -1,16 +1,18 @@
 {
-  "version": "0.13.31",
-  "title": "服务端预览签名密钥不再进入员工进程环境：启动遮蔽与 zsh 启动文件再导出双口径",
+  "version": "0.13.33",
+  "title": "修复 zsh 垫片：用户改写 ZDOTDIR 后仍剥离服务端预览签名密钥与 Cloudflare 令牌",
   "changes": [
-    "修复：SCK_PREVIEW_SECRET（交付预览签名面 HMAC 密钥）此前不在遮蔽清单，Paseo 插件宿主与原生执行端把它随父进程环境完整继承给员工；真实任务曾报告其在员工环境可见。现在列入服务端私密配置，启动时一律置空。",
-    "修复：该密钥存于 shell 形态的 private/service.env，用户启动文件一旦再导出即绕过一次性的启动遮蔽；zsh 启动 shim 现在在 source 用户 .zshenv/.zprofile/.zshrc/.zlogin 后再 unset 它，覆盖原生与 Paseo 启动/恢复全部入口。",
-    "区分服务端私密配置与按任务授予的通道凭据：SCK_COMM_DIR/SCK_COMM_KEY 等 sidecar 工作通道变量不受影响，供应商登录态（如 OPENAI_API_KEY）照旧保留。",
-    "合成值回归：遮蔽清单、session_open 钩子（create/resume）、真实 zsh 四种启动旗标与原生执行端继承合并路径均断言该密钥不进入员工环境。"
+    "修复：用户 ~/.zshenv 用 export 改写或 unset ZDOTDIR 时，.zprofile、.zshrc、.zlogin 会绕过垫片，SCK_PREVIEW_SECRET 与 CLOUDFLARE_API_TOKEN 重新出现在员工 shell 中。现在每个启动文件读完即剥离，并把 ZDOTDIR 导回垫片。",
+    "修复：CLOUDFLARE_API_TOKEN 在同一布局下，主线版本（0.13.28）就会经启动文件泄漏，本次与 SCK_PREVIEW_SECRET 由同一份名单一并覆盖。",
+    "原生执行端环境改由 nativeEmployeeEnv 统一生成，run.ts 与回归测试调用同一函数；ZDOTDIR 最后设置，继承值、通道值与模型路由都改不了它。",
+    "回归：真实 zsh 的 -c、-lc、-ic、-lic 四种启动，覆盖用户改写与取消 ZDOTDIR 两种布局，并覆盖原生与 Paseo 端到端；断言均使用合成值。",
+    "文档：agent-operations 垫片与边界段同步，剥离名单含 SCK_PREVIEW_SECRET，边界提到 ZDOTDIR 改写与 ZDOTDIR= zsh -i 绕过。",
+    "CI：quality 作业显式安装 zsh；CI 环境中缺少 zsh 时真实 zsh 回归判为失败，不再静默跳过。"
   ],
   "impact": [
-    "老板：签名面密钥不再出现在员工进程环境或可被其读取的 shell 再导出中；已发生的真实泄露事件按既有流程另行轮换与记录，本变更不触碰生产密钥文件。",
-    "员工：环境不再携带服务端预览签名密钥；sidecar 工作通道（SCK_COMM_*）与供应商登录不受影响。"
+    "老板：服务端预览签名密钥与 Cloudflare 令牌不再经用户启动文件进入员工 shell。已发生的真实事件仍按既有流程另行轮换与记录，本变更不替代轮换，也不触碰生产密钥文件。",
+    "员工：环境与 shell 中不再出现服务端预览签名密钥；SCK_COMM_* 通道变量与供应商登录（如 OPENAI_API_KEY）照旧保留。"
   ],
-  "migration": "无 schema 变更（沿用 schema 072）。不需要迁移数据。执行端插件与原生执行端重启后生效；shim 目录随启动重写，无需人工操作。",
-  "rollback": "回退至 v0.13.28。回退后 SCK_PREVIEW_SECRET 恢复随父环境继承给员工，zsh 启动文件可再导出；其余遮蔽口径不变。"
+  "migration": "无 schema 变更（沿用 schema 072）。无需迁移数据。执行端插件与原生执行端重启后生效；垫片目录随启动重写，无需人工操作。",
+  "rollback": "回退至 v0.13.28。回退后 SCK_PREVIEW_SECRET 恢复随父环境继承给员工，用户启动文件可再次导出它；其余遮蔽口径不变。"
 }
