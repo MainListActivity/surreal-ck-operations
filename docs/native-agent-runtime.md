@@ -106,7 +106,7 @@ SIGINT/SIGTERM 停止派工循环，再停止本执行器拥有的进程组并�
 
 ## 0.12.0：云端员工通道
 
-`codex-cloud`、`devin-cloud`、`jules` 三个 provider 走同一原生执行面：命令是 `sandbox/launch.sh bun <服务目录>/current/server/vendor/src/runner/cloud-lane/main.ts <provider>`，桥接进程把回合转交给供应商云端 agent（Codex Cloud / Devin Cloud / Jules），输出与非 codex 原生 CLI 相同的 system/lane_status/result 事件流。员工定义的模型只用 `default`（devin-cloud 的云端会话固定 `free`，见 [cloud-lanes.md](cloud-lanes.md)）；续轮参数只有 `--resume <逻辑会话ID>`（云端任务凭任务 ID 重连，逻辑会话 ID 只是会话标识）。
+`codex-cloud`、`devin-cloud`、`jules` 三个 provider 走同一原生执行面：命令是 `sandbox/launch.sh bun <服务目录>/current/server/vendor/src/runner/cloud-lane/main.ts <provider>`，桥接进程把回合转交给供应商云端 agent（Codex Cloud / Devin Cloud / Jules），输出与非 codex 原生 CLI 相同的 system/lane_status/result 事件流。员工定义的模型只用 `default`（devin-cloud 的云端会话经 ego-browser 走 app.devin.ai 的 Free 档位，不再调用 devin CLI，见 [cloud-lanes.md](cloud-lanes.md)）；续轮参数只有 `--resume <逻辑会话ID>`（云端任务凭任务 ID 重连，逻辑会话 ID 只是会话标识）。
 
 路由、命令校验、额度熔断与 provider_health 与本地 CLI 完全同构：`runtime-routes.json` 可指派云端 provider；`native-runner.json` 新增可选 `lanes` 配置（环境映射、轮询上限），`private/lanes/<provider>.env` 的私密变量由执行端在沙箱外读出后注入，沙箱内桥接进程不读 private。云端额度经 `listUsage` 上报（codex-cloud 读 wham/usage，jules 按本地记录的 24 小时会话数），读取失败不造数。
 

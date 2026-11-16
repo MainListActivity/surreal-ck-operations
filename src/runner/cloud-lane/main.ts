@@ -3,8 +3,10 @@
  * prompt 走 stdin，逐行输出 Claude 格式事件：system(session_id) → lane_status* → result。
  * 不打印凭证与供应商原始转录；Jules key 等私密经 run.ts 在沙箱外注入环境变量。
  */
+import { join } from 'node:path';
 import { runLane, type LaneConfig, type LaneDeps } from './lane.ts';
 import { laneExecFile } from './exec.ts';
+import { egoBrowse } from '../grok-bot/main.ts';
 import { isLaneProvider } from '../native-args.ts';
 
 function emit(value: unknown): void { process.stdout.write(`${JSON.stringify(value)}\n`); }
@@ -41,7 +43,9 @@ async function main(): Promise<number> {
   try { config = JSON.parse(process.env.SCK_LANE_CONFIG ?? '{}') as LaneConfig; }
   catch { config = {}; }
   const deps: LaneDeps = { exec: laneExecFile(config.bin), fetch, sleep: ms => new Promise(r => setTimeout(r, ms)), now: () => Date.now(),
-    progress: status => emit({ type: 'lane_status', status }) };
+    progress: status => emit({ type: 'lane_status', status }),
+    // devin-cloud 的网页入口需要 ego-browser；其它通道不会调用 browse。
+    browse: egoBrowse(config.bin?.['ego-browser'] ?? join(process.env.HOME ?? '/nonexistent', '.local/bin/ego-browser')) };
   emit({ type: 'system', session_id: resumeId ?? sessionStart });
   let outcome: { sessionId: string; status: 'success' | 'error'; text: string };
   try {

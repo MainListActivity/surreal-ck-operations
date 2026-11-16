@@ -7,7 +7,7 @@
 | provider | 供应商 | 老板订阅 | 工作方式 |
 | --- | --- | --- | --- |
 | `codex-cloud` | Codex Cloud | ChatGPT 套餐 | 云端任务在指定环境对远端分支跑；结束后执行端把 diff 应用到本地工作树、提交、推送并自动建 PR |
-| `devin-cloud` | Devin Cloud | Devin | `devin --cloud -p` 同步跑一个云端会话，让 Devin 自己在远端分支上推送并开 PR，本地随后快进 |
+| `devin-cloud` | Devin Cloud | Devin | ego-browser 驱动 app.devin.ai 的 Free 档位会话（SWE-2），让 Devin 自己在远端分支上推送并开 PR，本地随后快进 |
 | `jules` | Jules | Google AI Pro | Jules REST API 建会话（AUTO_CREATE_PR），轮询到 COMPLETED 后本地快进 |
 
 三种 provider 的 `model` 只用 `default`（云端任务不解析本地模型槽位）。
@@ -15,7 +15,7 @@
 ## 一次性准备（老板）
 
 - **codex-cloud**：在 chatgpt.com 的 Codex 里为目标仓库建好云端环境，并在 `native-runner.json` 的 `lanes["codex-cloud"].environments` 里登记 `"owner/repo": "<环境ID>"`；没有登记的仓库退化为把仓库名当环境标签传给 `codex cloud exec`。
-- **devin-cloud**：Devin 组织里已连接目标 GitHub 仓库；本机 `devin` 已登录。`devin --cloud -p` 不暴露云端会话 ID，通道自己生成逻辑会话 ID，续轮开新会话并在 prompt 里说明在同一分支/PR 上继续。
+- **devin-cloud**：Devin 组织里已连接目标 GitHub 仓库；老板的 ego-browser 里已登录 app.devin.ai，且账号有 Free 档位（Free 菜单项选中后显示 `Free (powered by SWE-2)` 与 `N/M in use` 席位计数）。通道不再调用 `devin` CLI：CLI `3000.x` 的 `--cloud --model free` 会被 CLI 拒成 `Unknown model`，云免费能力只存在于网页。会话地址（`app.devin.ai/sessions/<id>`）由页面返回并写进 lane 状态，续轮/返工/复核都回到同一 Devin 会话发跟进消息，不另开新会话。
 - **jules**：在 jules.google 安装 Jules GitHub App（覆盖目标仓库），在设置页创建 API key，写入 `<服务目录>/private/lanes/jules.env` 一行 `JULES_API_KEY=<key>`。桥接进程在员工沙箱里读不到 private，key 由执行端进程在沙箱外读出后注入子进程环境；没有 key 时回合立即失败并提示配置方法。
 
 ## 配置
@@ -34,13 +34,13 @@
   "lanes": {
     "codex-cloud": { "environments": { "MainListActivity/surreal_ck": "surreal_ck" }, "maxMinutes": 180,
       "bin": { "codex": "/Users/y/node/bin/codex", "gh": "/opt/homebrew/bin/gh" } },
-    "devin-cloud": { "maxMinutes": 180, "bin": { "devin": "/Users/y/.local/bin/devin" } },
+    "devin-cloud": { "maxMinutes": 180, "bin": { "ego-browser": "/Users/y/.local/bin/ego-browser" } },
     "jules": { "dailyLimit": 100, "maxConcurrent": 3, "maxMinutes": 180 }
   }
 }
 ```
 
-`lanes.<通道>.bin`：命令名 → 绝对路径（`codex`、`devin`、`gh`、`git` 等），给不在服务 PATH 里的 CLI 指路；配置后该命令按此路径执行，其所在目录（不是 realpath）前置进子进程 PATH，node shim 形式的 CLI 因此找得到同目录的 `node`。重装服务（`bun scripts/native-service.ts`）时这些目录连同 `commands` 里的绝对路径一并并入服务脚本 PATH。
+`lanes.<通道>.bin`：命令名 → 绝对路径（`codex`、`ego-browser`、`gh`、`git` 等），给不在服务 PATH 里的 CLI 指路；配置后该命令按此路径执行，其所在目录（不是 realpath）前置进子进程 PATH，node shim 形式的 CLI 因此找得到同目录的 `node`。重装服务（`bun scripts/native-service.ts`）时这些目录连同 `commands` 里的绝对路径一并并入服务脚本 PATH。
 
 `private/runtime-routes.json` 与本地 CLI 一样写：`{"version":1,"routes":{"codex-cloud":"native:<节点>","devin-cloud":"native:<节点>","jules":"native:<节点>"}}`。不改文件就不启用通道，行为与旧版一致。
 
@@ -59,10 +59,10 @@
 ## 回合怎么跑
 
 - 桥接进程（`src/runner/cloud-lane/main.ts`）被当成普通原生 CLI 启动：prompt 走 stdin，逐行输出 `system`(session_id) → `lane_status`（老板端活动流显示「云端运行中：…」）→ `result` 事件。
-- 云端 agent 读不到本机文件也调不了 `sck`。0.13.19 起发给它的正文就是派工消息（老板在派工消息页看到、改过的那条，`laneMessage`）：消息里指向的文件路径换成“下文《…》”，文件内容附在后面（笔记、最新的 `findings/round-NN.md`、较长的老板答复、复核轮的 `task.md`）；工作目录行和公司命令的指引不带。退回意见按文件取、返工轮一定附上，不看派工消息的措辞；正文不是三段式时整份 `task.md` 也附上；没有派工消息时退回到整份任务材料。网页通道（Grok Bot、muse-web）同样。Devin 云模式固定 `--model free`：`lanes.devin-cloud.model` 只能缺省或写 `free`，其它值（含空白、空串）在 `validateLanes` 配置校验时拒绝；执行入口（`driveDevin`）在推送分支、发会话之前再校验一次，所以绕过配置也不会发出非 free 的云端会话，失败也不回退到账号默认或其它模型。这条约束只适用于 devin-cloud，本地 Devin/Paseo 的模型名不受它限制。复核轮（task.md 含「## 待复核成果」）要求只读复核，最终答复首行必须是「复核结论：通过/退回」，缺了按错误回合处理。
+- 云端 agent 读不到本机文件也调不了 `sck`。0.13.19 起发给它的正文就是派工消息（老板在派工消息页看到、改过的那条，`laneMessage`）：消息里指向的文件路径换成“下文《…》”，文件内容附在后面（笔记、最新的 `findings/round-NN.md`、较长的老板答复、复核轮的 `task.md`）；工作目录行和公司命令的指引不带。退回意见按文件取、返工轮一定附上，不看派工消息的措辞；正文不是三段式时整份 `task.md` 也附上；没有派工消息时退回到整份任务材料。网页通道（Grok Bot、muse-web）同样。Devin 云模式固定网页 Free 档位：`lanes.devin-cloud.model` 只能缺省或写 `free`，其它值（含空白、空串）在 `validateLanes` 配置校验时拒绝；执行入口（`driveDevin`）在推送分支、发会话之前再校验一次，所以绕过配置也不会发出非 free 的云端会话，失败也不回退到账号默认或其它模型。发送脚本每次先在页面核验 Capability 菜单选中 Free 且档位详情是 `Free (powered by SWE-2)`，核验失败整轮不发、不降级到 Normal/Ultra/Lite/Fusion 任何付费档。这条约束只适用于 devin-cloud，本地 Devin/Paseo 的模型名不受它限制。复核轮（task.md 含「## 待复核成果」）要求只读复核，最终答复首行必须是「复核结论：通过/退回」，缺了按错误回合处理。
 - 代码任务要求 cwd 是关联 GitHub origin 的工作树；任务分支缺远端时先推送。非代码任务或仓库未映射 → 回合按「工作结果：受阻」收尾（成功回合，不记供应商故障）。
 - **codex-cloud**：`codex cloud exec --env <环境> --branch <分支>` → `codex cloud status` 轮询 → READY 后 `codex cloud apply` 到本地、`git add -A`、提交「<任务标题> (Codex Cloud <id>)」、推送、`gh pr list/create` 保证有 PR；空 diff 按受阻收尾。Codex Cloud 的最终消息 CLI 取不到：复核轮要求供应商把结论写进 `.sck/review.md`，桥接从 `codex cloud diff` 的补丁行提取。
-- **devin-cloud**：`devin --cloud --model free -p --prompt-file` 同步等待答复（模型只能是 free，配置校验与执行入口都拒绝其它值）；prompt 要求在 `<owner>/<repo>` 的分支上工作、推送、开/更新 PR 并以 `PR:`/`SHA:` 行结尾；随后 `git fetch + git merge --ff-only FETCH_HEAD`，非快进只报错不 reset。
+- **devin-cloud**：ego-browser 执行 `src/runner/cloud-lane/devin-web.ts` 里的页面脚本（`main.ts` 经 `LaneDeps.browse` 注入 `egoBrowse`），不再调用 `devin` CLI、不带任何 `--model` 参数。首次发送前脚本在 app.devin.ai 首页核验 Capability=Free、`Free (powered by SWE-2)` 字样与席位计数 `N/M in use`：已占用席位达到上限时在 `maxMinutes` 内持续等待，仍满则按「工作结果：受阻」收尾（成功回合，不算供应商故障），绝不切付费档、绝不回退。消息带 `[SCK-ROUND <标记>]` 行；发出去后把 `app.devin.ai/sessions/<id>` 记入 lane 状态。按下发送但回显/地址丢失时，先入「已受理核对」：在会话列表和最近会话里找本轮标记，找到就接管该会话，确认未受理才允许重发一次，绝不盲目重发。续轮/返工/复核读同一 session 地址发跟进消息（不占新席位）。随后轮询会话页：看到本轮标记 + 非 working + 连续两次读数一致才收终稿；Devin 停下等用户（blocked on the user）按受阻收尾并带回现场。非复核回合取 `PR:`/`SHA:` 行后 `git fetch + git merge --ff-only FETCH_HEAD`，非快进只报错不 reset；声明 SHA 与实际远端 HEAD 不符时按实际 HEAD 注明。
 - **jules**：REST 会话状态机 QUEUED/PLANNING/IN_PROGRESS → COMPLETED/FAILED；`AWAITING_USER_FEEDBACK`/`AWAITING_PLAN_APPROVAL` 按受阻收尾并把 Jules 的问题带回来；续轮 `:sendMessage` 复用同一会话。
 - **幂等**：提交前把云端任务 ID、prompt 摘要、分支原子写入 `$SCK_COMM_DIR/.lane/state.json`；同摘要重启重连轮询不重复提交。提交结果不明绝不重发，报错误回合并带任务 ID/URL。
 - **超时**：`lanes.<provider>.maxMinutes`（默认 180 分钟），约 25 秒轮询一次；超时按错误回合处理，文案说明云端任务可能仍在运行。
@@ -73,14 +73,14 @@
 
 - `codex-cloud`：`GET https://chatgpt.com/backend-api/wham/usage`，用 `~/.codex/auth.json` 的 `tokens.access_token` / `tokens.account_id`；`primary_window`/`secondary_window` 映射成 5 小时/周窗口。
 - `jules`：桥接进程在 `<native根>/lanes/jules-usage.json` 记录每次创建会话的时间，按滚动 24 小时计数对照 `lanes.jules.dailyLimit`（默认 100）。
-- `devin-cloud`：没有可读端点，靠 `provider_health` 耗尽冷却（供应商的额度报错会被 quota-failure 模式接住并记入冷却）。
+- `devin-cloud`：没有独立额度端点；Free 档位的并发席位（`N/M in use`）在每次发送前由页面实时核验，满座等待到时限按受阻收尾，不记供应商故障。
 
 读取失败一律 fail open：不报这行，绝不当成额度为 0。老板端运维页「订阅额度」与 `sck owner quota.list '{}'` 展示全部快照和耗尽中的 provider。
 
 ## 失败与回退
 
 - 回合报「<供应商> 提交失败：找不到可执行文件 <命令>」：服务 PATH 里没有该 CLI。把它的绝对路径配进 `lanes.<通道>.bin`（见上）并重装服务，或直接修好服务脚本 PATH；同一原因重复三次会自动停用该员工定义，修好后重新启用。
-- 供应商额度耗尽的报错（Devin「weekly usage quota has been exhausted」、Codex 限流、Jules 429）走既有 quota-failure 链：记入 `provider_health` 冷却，任务留在原员工名下。
+- 供应商额度耗尽的报错（Codex 限流、Jules 429）走既有 quota-failure 链：记入 `provider_health` 冷却，任务留在原员工名下。Devin Free 席位在发送前由页面核验，满座等待/受阻不经过这条链。
 - 执行目录边界：通道只在 `claim.json` 指定的任务工作树里执行，会话 cwd（可能是共享主 checkout）不是回退。缺 claim、无 worktree、路径无效、工作树分支与派工要求不一致或在默认分支上时，回合安全受阻且一个 git/供应商命令都不发。codex 通道只暂存 `codex cloud diff` 补丁覆盖的路径（`git add -A -- <paths>`），暂存后出现补丁外路径只取消暂存不动文件，因此工作树里的无关未跟踪文件（error.log、.wrangler 状态等）不会被提交。
 - 云端任务可能仍在运行时只报错误回合，不自动取消、不重发；老板可凭任务 URL 人工核对。
 - 回退：停用对应员工定义、从 `runtime-routes.json` 移除路由、从 `native-runner.json` 移除 commands 条目即可；在途云端任务按上文人工核对，通道不自动接管。

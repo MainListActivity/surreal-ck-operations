@@ -1,22 +1,22 @@
 {
-  "version": "0.13.27",
-  "title": "CI 等待不再误判失败，网关作业不重发，Devin 云端固定免费模型",
+  "version": "0.13.30",
+  "title": "Devin 云端改走网页 Free 档位（ego-browser），不再调用无效 CLI 模型参数",
   "changes": [
-    "修复（0.13.25）：云端运维命令超过 25 秒转为排队后，员工端取回结果时按真实回执解析，不再误报“作业视图格式错误”；作业失败保留执行端的错误类别。",
-    "作业已排队之后的失败标为 accepted：看起来像鉴权失败的错误也不整段重发业务命令，轮询被拒时同一命令不会执行两次。",
-    "公司错误码的列表与类型都在 src/core-errors.ts，网关与老板端共用；ci_pending、ci_failed 也登记在此，漏列的码会在类型检查时报错。",
-    "提交时 CI 排队或运行中（ci_pending）不再被当成校验失败：成果保持待送审，约每分钟重查，CI 成功后同一成果送审，不占重试次数。",
-    "CI 已完成但没有成功的运行（ci_failed）立即阻塞并写明失败运行；超过 6 小时仍无成功运行则阻塞并写明超时（ci_wait_limit）。",
-    "租约在等待 CI 时转给他人，原成果标记为 superseded，不再等待。执行记录的 error 区分 ci_pending、ci_failed 与 ci_wait_limit。",
-    "devin-cloud 的云端会话模型固定为 free：lanes.devin-cloud.model 只能缺省或写 free，其它值（含空白、空串）在配置校验时拒绝。",
-    "执行入口在推送分支、发会话之前再校验一次，绕过配置也不会发出非 free 的云端会话；续轮与复核轮同样固定 --model free，失败不回退到账号默认模型。"
+    "devin-cloud 通道不再执行 devin --cloud --model free：该参数在 Devin CLI 3000.x 上被拒成 Unknown model，云免费能力只存在于网页。新入口用 ego-browser 驱动 app.devin.ai 的会话页，发送脚本在 src/runner/cloud-lane/devin-web.ts，桥接进程经 LaneDeps.browse 注入 egoBrowse。",
+    "每次发出新会话前，页面脚本先核验 Capability 菜单选中 Free、档位详情为 Free (powered by SWE-2)，并解析 N/M in use 席位计数；核验不过整轮不发，绝不切 Normal/Ultra/Lite/Fusion 任何付费档。",
+    "席位已占满时在 maxMinutes 内等待空位，到期仍满按「工作结果：受阻」收尾（成功回合，不记供应商故障），不付费回退、不改档位。",
+    "按下发送但回显或会话地址丢失时，先入已受理核对：在会话列表与最近会话里找本轮标记，找到就接管该会话；确认未受理才允许重发一次，绝不盲目重发，不新建重复会话。",
+    "续轮、返工与复核轮复用 lane 状态里记录的 app.devin.ai/sessions/<id> 地址发跟进消息，不占新席位、不新建会话；同摘要重启凭标记重连轮询不重复提交。",
+    "终稿判定要求看到本轮标记、会话非 working、连续两次读数一致；Devin 停下等用户（blocked on the user）按受阻收尾并带回现场。",
+    "free-only 安全约束保留并延伸到执行入口：lanes.devin-cloud.model 只能缺省或写 free，绕过配置校验的非 free 值在任何页面动作或推送之前即被拒绝。",
+    "PR2269 的网关作业防重放与 CI 排队/失败等待行为原样保留，本版本只替换 devin-cloud 的传输路径。"
   ],
   "impact": [
-    "员工：云端运维命令超过 25 秒时不再误报失败，能拿到执行结果；成果遇到 CI 未完成会自动等待，不再直接被判为校验失败。",
-    "老板：CI 未通过的成果会阻塞并写明失败运行，修复后需重新跑通 CI 才能送审。升级前报过“作业视图格式错误”的命令，作业可能已经执行完成，需先按执行记录核对，不会自动重做。",
-    "Devin 云端派工只用 free 模型，计费不再随账号默认模型。真实 Devin 云模式端到端未在本次验证，本次只有假 CLI 回归。",
-    "已知限制：25 秒内就失败的命令仍显示为“执行端任务失败”（上游失败）；错误类别只在超过 25 秒才结束的作业上保留。"
+    "员工：devin-cloud 派工走 Devin 网页 Free 档位（SWE-2），Free 席位满时任务等待或受阻而不是失败，续轮回原会话继续。",
+    "老板：需要 ego-browser 里保持 app.devin.ai 登录；会话地址记在任务证据里可人工核对。升级前由 CLI 发出的旧会话不受影响，本通道不再接管。",
+    "真实 Devin 云发送未在本次验证中执行（不消耗席位）：本次验证为页面脚本 DOM 契约与 browse mock 单元测试、类型检查；真实任务由老板在候选验证通过后经常规调度复验。",
+    "已知限制：页面结构（Capability 菜单、Prompt 输入框、Send 按钮、N/M in use 席位计数）若改版会导致核验失败而拒发，不会降级到付费档。"
   ],
-  "migration": "无 schema 变更（沿用 schema 072），不需要迁移数据。员工侧插件升级后生效；老板端随 main 一并部署（新增 ci_pending、ci_failed 映射），作业回执格式未变。",
-  "rollback": "回退至 v0.13.25。回退后：CI 未成功的成果恢复旧行为，排队中的 CI 会按校验失败有界重试；Devin 云端模型恢复可配置。作业取回与不重发保护保留，作业本身不受影响。"
+  "migration": "无 schema 变更（沿用 schema 072）。员工侧插件升级后生效；需要服务 PATH 或 lanes.devin-cloud.bin 里能解析 ego-browser（默认取 ~/.local/bin/ego-browser）。bin.devin 配置可留可删，不再被读取。",
+  "rollback": "回退至 v0.13.27。回退后 devin-cloud 恢复 devin --cloud --model free 的 CLI 调用（在 Devin CLI 3000.x 上会报 Unknown model 而失败）；网关防重放与 CI 等待行为不受影响。"
 }

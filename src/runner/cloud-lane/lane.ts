@@ -67,6 +67,11 @@ export interface LaneDeps {
   now(): number;
   /** 每步进展以 lane_status 事件输出给执行端活动流。 */
   progress(status: string): void;
+  /**
+   * ego-browser 页面脚本执行器（与 grok-bot 通道同签名）：devin-cloud 经网页入口执行时需要；
+   * 其它通道不调用。脚本只回 `__RESULT__{json}`，已按下发送后中断回 `{code:'pressed'}`。
+   */
+  browse?(script: string, timeoutMs: number): Promise<Record<string, unknown> | undefined>;
 }
 
 export interface LaneInput {
