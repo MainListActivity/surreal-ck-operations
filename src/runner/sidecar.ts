@@ -268,6 +268,8 @@ export class SidecarPool {
   private readonly opsCircuit: OpsCircuit;
   private readonly journal?: ExecutionJournal;
   private readonly flushing = new Set<string>();
+  /** Single-flight closeout per employee: one pass reads and writes back an execution row at a time. */
+  private readonly collecting = new Set<string>();
   private readonly starts = new Map<string, string | undefined>();
   // Host turn IDs can be reused after a canceled execution or a new delivery.
   // Count accepted starts, rather than timestamps (two starts may share a millisecond).
@@ -349,48 +351,65 @@ export class SidecarPool {
     row.state = 'collecting'; await this.changed(row);
     return this.collectExecution(row);
   }
+  /** Disk truth mid-collection: a concurrent settle/retry works on a stale copy, so before writing back
+   *  the pass re-reads the row and stops when it is no longer 'collecting' (settled, interrupted, superseded). */
+  private stillCollecting(row: ExecutionAttempt): boolean {
+    return this.journal?.read(row.employee, row.proof.deliveryId)?.state === 'collecting';
+  }
   private async collectExecution(row: ExecutionAttempt): Promise<SettleResult> {
-    if (!row.artifacts?.raw && !row.artifacts?.report && !row.artifacts?.blocker && this.deps.readTurnResult) {
-      try {
-        if (!row.agent || !row.turn) throw new Error('missing turn identity');
-        // The durable timeline is the only trusted turn state: an end event can carry a text that
-        // declares a commit while turn-fenced tools are still running, so the read always happens —
-        // it both checks in-flight rows and returns the turn's real last answer. A read text that
-        // does not declare the delivery contract (verified commit line, review verdict or blocked
-        // heading) is dropped and the timeline decides the real verdict within the bounded window —
-        // never the worktree HEAD. Event-carried text is trusted only where no timeline read exists.
-        const text = await this.deps.readTurnResult(row.agent, row.turn, row.startedAt ?? row.createdAt ?? 0);
-        if (!text.trim()) throw new Error('empty runtime result');
-        if (await this.undeclaredDelivery(row, text)) {
-          row.finalText = undefined;
-          throw new RuntimeResultError('not_yet_available', 'runtime final result not yet available');
-        }
-        row.finalText = text;
-        row.error = undefined;
-        await this.changed(row);
-      } catch (error) {
-        // A late answer is normal, so each failure is retried. Only the bounded window decides that it never arrives.
-        row.tries++; row.error = `runtime_result_unavailable:${error instanceof RuntimeResultError ? error.reason : 'read_failed'}`;
-        if (row.tries >= RESULT_READ_ATTEMPTS) return this.blockUnreadableResult(row);
-        row.nextRetry = Date.now() + resultReadDelay(row.tries);
-        await this.changed(row);
-        return {status: 'pending'};
-      }
-    }
+    // Single-flight: without this a settle event and a scheduled retry can both read the same turn and
+    // submit the same result — the in-memory copy each holds stays 'pending' even after the other settles.
+    if (this.collecting.has(row.employee)) return { status: 'pending' };
+    this.collecting.add(row.employee);
     try {
-      const { raw, blocker, report } = row.artifacts ?? {}; // Never read a later delivery's shared files during recovery.
-      row.result = blocker !== undefined ? workResult('', row.phase, { summary: blocker, outcome: 'blocked' })
-        : workResult(report || row.finalText || '', row.phase, raw === undefined ? undefined : JSON.parse(raw));
-      row.state = 'pending'; row.nextRetry = 0;
-    } catch {
-      row.state = 'attention'; row.error = '工作结果缺失或复核结论不明确';
-      // Missing business output is a genuine work gap; the runner records it, no protocol troubleshooting is assigned.
-      row.result = workResult('', row.phase, { outcome: 'blocked', summary: '本轮已结束，但工作结果缺失或复核结论不明确，需要补充工作结论。' });
-      row.state = 'pending';
-    }
-    await this.changed(row);
-    await this.flushExecution(row);
-    return { status: (row as ExecutionAttempt).state === 'settled' ? 'ingested' : 'pending' };
+      if (!row.artifacts?.raw && !row.artifacts?.report && !row.artifacts?.blocker && (this.deps.readTurnResult || row.finalText?.trim())) {
+        try {
+          if (this.deps.readTurnResult) {
+            if (!row.agent || !row.turn) throw new Error('missing turn identity');
+            // The durable timeline is the only trusted turn state: an end event can carry a text that
+            // declares a commit while turn-fenced tools are still running, so the read always happens —
+            // it both checks in-flight rows and returns the turn's real last answer.
+            const text = await this.deps.readTurnResult(row.agent, row.turn, row.startedAt ?? row.createdAt ?? 0);
+            if (!text.trim()) throw new Error('empty runtime result');
+            if (!this.stillCollecting(row)) return { status: 'pending' };
+            row.finalText = text;
+            row.error = undefined;
+            await this.changed(row);
+          }
+          // Every runtime text source is gated the same way — a timeline-read answer or the event-carried
+          // text a native host reports directly. A progress message that does not declare the delivery
+          // contract (verified commit line, review verdict or blocked heading) is not a delivery: the
+          // bounded window keeps waiting, and the worktree HEAD never stands in for an undeclared commit.
+          if (row.finalText?.trim() && await this.undeclaredDelivery(row, row.finalText)) {
+            if (this.deps.readTurnResult) row.finalText = undefined;
+            throw new RuntimeResultError('not_yet_available', 'runtime final result not yet available');
+          }
+        } catch (error) {
+          if (!this.stillCollecting(row)) return { status: 'pending' };
+          // A late answer is normal, so each failure is retried. Only the bounded window decides that it never arrives.
+          row.tries++; row.error = `runtime_result_unavailable:${error instanceof RuntimeResultError ? error.reason : 'read_failed'}`;
+          if (row.tries >= RESULT_READ_ATTEMPTS) return this.blockUnreadableResult(row);
+          row.nextRetry = Date.now() + resultReadDelay(row.tries);
+          await this.changed(row);
+          return {status: 'pending'};
+        }
+      }
+      if (!this.stillCollecting(row)) return { status: 'pending' };
+      try {
+        const { raw, blocker, report } = row.artifacts ?? {}; // Never read a later delivery's shared files during recovery.
+        row.result = blocker !== undefined ? workResult('', row.phase, { summary: blocker, outcome: 'blocked' })
+          : workResult(report || row.finalText || '', row.phase, raw === undefined ? undefined : JSON.parse(raw));
+        row.state = 'pending'; row.nextRetry = 0;
+      } catch {
+        row.state = 'attention'; row.error = '工作结果缺失或复核结论不明确';
+        // Missing business output is a genuine work gap; the runner records it, no protocol troubleshooting is assigned.
+        row.result = workResult('', row.phase, { outcome: 'blocked', summary: '本轮已结束，但工作结果缺失或复核结论不明确，需要补充工作结论。' });
+        row.state = 'pending';
+      }
+      await this.changed(row);
+      await this.flushExecution(row);
+      return { status: (row as ExecutionAttempt).state === 'settled' ? 'ingested' : 'pending' };
+    } finally { this.collecting.delete(row.employee); }
   }
   /**
    * A review answer must declare its verdict （复核结论：通过/退回） or a blocked heading; a doing answer
@@ -454,6 +473,10 @@ export class SidecarPool {
     if (!this.launched.has(row.employee) || this.quarantined.has(row.employee)) return;
     this.flushing.add(row.employee);
     try {
+      // The in-memory row may be a stale copy of a pass that already committed on disk — only a row
+      // still pending with a result may reach the core call.
+      const disk = this.journal.read(row.employee, row.proof.deliveryId);
+      if (!disk || disk.state !== 'pending' || !disk.result) return;
       // Frozen proof + evidence: retry an uncertain commit exactly, before reading/updating its version.
       const core = this.deps.core;
       if (!row.prepared && row.result.action === 'submit') {

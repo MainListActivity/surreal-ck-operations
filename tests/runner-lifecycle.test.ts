@@ -36,6 +36,7 @@ test('执行批次与结果重启后保持，重放使用同一幂等键', () =>
 import { SidecarPool } from '../src/runner/sidecar.ts';
 import { settleCompanyTurn, TurnInterruptions } from '../src/runner/turn-closeout.ts';
 import { writeFileSync, existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import type { LeaseProof, ClaimResult } from '../src/contracts.ts';
 
 function fixture(readTurnResult?: (agent: string, turn: string, startedAt?: number) => Promise<string>) {
@@ -43,12 +44,14 @@ function fixture(readTurnResult?: (agent: string, turn: string, startedAt?: numb
   const calls: Array<{ action: string; proof: LeaseProof; key: string; text?: string; sha?: string }> = [];
   let delivery = 'delivery-a', version = 2, phase: 'doing' | 'review' = 'doing', submitted = false;
   let fail = false, loseReply = false, failRead = false, codeIntent = false;
+  let worktreePath: string | undefined;
   let refusal: { code: string; message: string; times: number } | undefined;
   let accepted = 0;
   const mirror: Array<{ state: string; error?: string; attempts: number }> = [];
   const inst = { id: 'worker', role: 'engineering' as const, credential: 'synthetic', paseoAgentId: undefined as string | undefined };
   const task = () => ({ id: 'task', state: phase, version, fence: 1, deliveryId: delivery, currentEmployee: 'worker',
     ...(codeIntent ? { workIntent: { kind: 'code' as const } } : {}),
+    ...(worktreePath ? { worktree: { worktreePath } } : {}),
     leaseExpiresAt: new Date(Date.now() + 600000).toISOString() });
   const result = () => ({ task: task(), fence: 1, deliveryId: delivery, leaseExpiresAt: task().leaseExpiresAt, history: [] }) as unknown as ClaimResult;
   const committed = new Set<string>();
@@ -79,6 +82,7 @@ function fixture(readTurnResult?: (agent: string, turn: string, startedAt?: numb
     settle: (value = event(), interruptions?: TurnInterruptions) => settleCompanyTurn({sidecar: pool, workforce} as never, {} as never, value as never, interruptions),
     get pool() { return pool; },
     fail(value: boolean) { fail = value; }, loseReply() { loseReply = true; }, failRead(value: boolean) { failRead = value; }, code(value = true) { codeIntent = value; },
+    worktree(path: string) { worktreePath = path; },
     refuse(code: string, times: number, message: string) { refusal = { code, message, times }; },
     accepted: () => accepted, mirror: () => mirror,
     async claim(review = false) { phase = review ? 'review' : 'doing'; pool.env(inst); inst.paseoAgentId = 'agent'; pool.bindAgent(inst.id, 'agent'); await pool.claim(inst, { id: 'task' } as never); },
@@ -435,6 +439,99 @@ test('事件携带文本不旁路持久时间线：携带提交行的进度事�
     await g.settle(g.event('turn-a', '复核还在进行，稍后给出结论。'));
     expect(g.calls.map(c => c.action)).toEqual(['accept']);
   } finally { g.close(); }
+});
+
+test('收尾单飞：结束事件与重试并发读取同一回合只送审一次', async () => {
+  const sha = 'e'.repeat(40);
+  const f = fixture(async () => { await new Promise(r => setTimeout(r, 10)); return `完成。\n提交：${sha}`; });
+  try {
+    f.code();
+    await f.claim(); await f.pool.turnStarted('agent','turn-a');
+    await Promise.all([
+      f.pool.settleExecution({ ...f.event(), timeline: [] }),
+      f.pool.retryExecutions(), f.pool.retryExecutions(),
+    ]);
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]?.action).toBe('submit');
+    expect(f.calls[0]?.sha).toBe(sha);
+  } finally { f.close(); }
+  // 并发重复结束事件同样只送审一次。
+  const g = fixture(async () => { await new Promise(r => setTimeout(r, 10)); return `完成。\n提交：${'f'.repeat(40)}`; });
+  try {
+    g.code(); await g.claim(); await g.pool.turnStarted('agent','turn-a');
+    await Promise.all([g.settle(g.event()), g.settle(g.event()), g.settle(g.event())]);
+    expect(g.calls).toHaveLength(1);
+  } finally { g.close(); }
+});
+
+test('原生路径同一门禁：未声明提交行的进度文本不借工作树 HEAD 送审，声明 SHA 优先于前进的 HEAD', async () => {
+  // 原生宿主没有 readTurnResult，事件文本是唯一结果来源：同样要过声明门禁。
+  const repo = mkdtempSync(join(tmpdir(), 'sck-wt-'));
+  execFileSync('git', ['init', '-q', repo]); writeFileSync(join(repo, 'a.txt'), 'x');
+  execFileSync('git', ['-C', repo, 'add', '.']);
+  execFileSync('git', ['-C', repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'x']);
+  const head = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD']).toString().trim();
+  try {
+    const f = fixture();
+    try {
+      f.code(); f.worktree(repo);
+      await f.claim(); await f.pool.turnStarted('agent','turn-a');
+      await f.settle(f.event('turn-a', '独立 QA 已启动，报告回来后给出最终答复。'));
+      expect(f.calls).toHaveLength(0);
+      expect(f.journal().rows()[0]?.error).toBe('runtime_result_unavailable:not_yet_available');
+      for (let i = 0; i < 19; i++) await f.retry();
+      // 窗口耗尽明确受阻：不把未声明的进度按工作树 HEAD 补成已完成。
+      expect(f.calls.map(c => c.action)).toEqual(['block']);
+      expect(f.journal().rows()[0]?.state).toBe('settled');
+    } finally { f.close(); }
+    const declared = 'b'.repeat(40);
+    const g = fixture();
+    try {
+      g.code(); g.worktree(repo);
+      await g.claim(); await g.pool.turnStarted('agent','turn-a');
+      await g.settle(g.event('turn-a', `完成。\n提交：${declared}`));
+      expect(g.calls.map(c => c.action)).toEqual(['submit']);
+      expect(g.calls[0]?.sha).toBe(declared); // PR 头可以前进：送审 SHA 绑定声明值，不回读 HEAD。
+      expect(g.calls[0]?.sha).not.toBe(head);
+    } finally { g.close(); }
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('复核阶段进度消息不产生结论：等待真实结论到达后一次送审', async () => {
+  let answer = '复核还在进行，稍后给出结论。';
+  const f = fixture(async () => answer);
+  try {
+    await f.claim(true); await f.pool.turnStarted('agent','turn-a');
+    await f.settle(f.event());
+    expect(f.calls).toHaveLength(0);
+    expect(f.journal().rows()[0]?.error).toBe('runtime_result_unavailable:not_yet_available');
+    answer = '复核结论：退回\n第二条验收未满足。';
+    await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['return']);
+    await f.retry();
+    expect(f.calls).toHaveLength(1);
+  } finally { f.close(); }
+});
+
+test('运行中工具时执行端重启：恢复后继续有界等待，终稿只提交一次', async () => {
+  const sha = '9'.repeat(40);
+  let live = true;
+  const f = fixture(async () => { if (live) throw new RuntimeResultError('still_active', 'running tool'); return `完成。\n提交：${sha}`; });
+  try {
+    f.code(); await f.claim(); await f.pool.turnStarted('agent','turn-a');
+    await f.settle(f.event());
+    expect(f.journal().rows()[0]?.state).toBe('collecting');
+    await f.restart();
+    await f.retry();
+    expect(f.calls).toHaveLength(0);
+    expect(f.journal().rows()[0]?.state).toBe('collecting');
+    live = false;
+    await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['submit']);
+    expect(f.calls[0]?.sha).toBe(sha);
+    await f.retry();
+    expect(f.calls).toHaveLength(1);
+  } finally { f.close(); }
 });
 
 test('代码任务首行受阻结论按受阻契约提交，非代码任务散文答复按原契约送审', async () => {
