@@ -1,6 +1,38 @@
 import { expect, test } from 'bun:test';
 import { createSubmitCheck, extractPrUrls, judgePr, type PrInfo } from '../src/pr-gate.ts';
-import { assertEmployeeCiBlockAllowed, createCiBillingCheck } from '../src/github-ci-control.ts';
+import { assertEmployeeCiBlockAllowed, createCiBillingCheck, isCiBlockCause } from '../src/github-ci-control.ts';
+import { referenceReport, referenceSentence } from './fixtures/ci-reference-report.ts';
+
+test.each([referenceSentence, referenceReport])('研究旁证不是当前 CI 原因：%s', text => {
+  expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
+  expect(isCiBlockCause([text])).toBe(false);
+});
+
+test('网页引用与已完成CI背景不启动当前CI原因检查', () => {
+  for (const text of [
+    '已核对 GitHub release 与 billing/self-serve.md，等待内部元数据处置确认。',
+    'GitHub CI 已完成，当前等待老板确认客户账单。',
+    'GitHub CI 已通过；等待内部元数据处置，计费文档仅为旁证。']) {
+    expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
+    expect(isCiBlockCause([text])).toBe(false);
+  }
+});
+
+test('当前 CI 原因不能通过附加旁证声明或已完成背景逃逸', () => {
+  for (const text of [
+    'GitHub CI 因账户付款失败未启动，等待老板付款。',
+    'GitHub CI 因账户付款失败未启动，引用仅为旁证。',
+    'GitHub CI 已完成，但当前 CI 因付款失败未启动。',
+    'GitHub CI 计费阻塞，等待老板付款；本报告不申请豁免。',
+    'CI 等待账户问题解决后执行。',
+  ]) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+  expect(isCiBlockCause(['检查未启动，需老板处理'])).toBe(true);
+  expect(isCiBlockCause(['GitHub CI 断言测试失败'])).toBe(true);
+  expect(isCiBlockCause(['CI 等待检查结果'])).toBe(true);
+});
 
 test('CI billing blockers are system-owned; ordinary invoices and real test failures remain separate', () => {
   for (const text of ['GitHub CI 账单失败，要求付款', 'CI 因计费未启动', 'GitHub Actions spending limit reached',

@@ -10,6 +10,12 @@ function ciCauseClauses(fields: Array<string | undefined>): string[] {
   return fields.filter(field => typeof field === 'string').flatMap(field => field!.split(/[\n;；。]/)).filter(text => {
     const unstarted = /(?:检查|作业).{0,30}(?:未启动|没有启动|未执行|没有执行|未通过|没有通过)/.test(text);
     if (!CI.test(text) && !unstarted) return false;
+    // Naming GitHub and a billing document is not an execution problem. Require a problem predicate,
+    // not an employee assertion that the text is "only a reference" (which must never bypass the gate).
+    // Keep terse billing labels conservative for callers that supply a title rather than a sentence.
+    const billingLabel = /^\s*(?:GitHub(?:\s+Actions|\s+CI)?|CI|workflow)\s*[:：-]?\s*(?:Billing(?:\s*&\s*plans)?|spending[\s_-]*limit|支出上限|消费上限|账单|计费)\s*$/i.test(text);
+    const problem = unstarted || /失败|阻塞|受阻|未启动|没有启动|未执行|没有执行|未通过|没有通过|无法|不能|(?:\bCI\b|Actions|workflow|检查|作业).{0,30}(?:等待|排队)|等待.{0,30}(?:\bCI\b|Actions|workflow|付款|支付|计费)|\b(?:blocked|pending|failed|failure|not started|not run|not executed)\b|spending[\s_-]*limit.{0,15}(?:reached|exceeded)/i.test(text);
+    if (!problem && !billingLabel) return false;
     const completed = /已(?:由系统)?(?:完成|通过|豁免|记录|判定)|already (?:passed|completed|waived)/i.test(text);
     return !completed || unstarted || /仍.{0,10}(?:失败|阻塞)|(?:未|没有)(?:通过|启动|执行)|\b(?:blocked|pending)\b/i.test(text);
   });

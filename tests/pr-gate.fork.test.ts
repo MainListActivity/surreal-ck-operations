@@ -6,6 +6,12 @@ import { CompanyDatabase } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import type { ClaimResult, LeaseProof } from '../src/contracts.ts';
+import { createHash } from 'node:crypto';
+import { RecordId } from 'surrealdb';
+import { SidecarPool } from '../src/runner/sidecar.ts';
+import { ExecutionJournal } from '../src/runner/lifecycle.ts';
+import { refuseEmployeeCiBlock } from '../src/github-ci-control.ts';
+import { referenceReport, referenceSentence } from './fixtures/ci-reference-report.ts';
 
 setDefaultTimeout(60000);
 // Isolated company fork on a private RocksDB store: no production data, credentials, dispatcher or GitHub.
@@ -54,4 +60,121 @@ run('a core without a check behaves exactly as before', async () => {
   const plain = new SurrealCompanyCore(db);
   const claim = await plain.claim(eng, (await make('engineering')).id);
   expect((await plain.submit(eng, proofOf(claim), evidence('PR https://github.com/o/r/pull/8 CONFLICT'))).state).toBe('review');
+});
+
+const ciCriteria = [{ id: 'AC-CI', kind: 'machine', required: true, layer: 'ci', evidence: 'ci-run', verify: 'ci' }];
+
+run('旁证报告经真实 Core.block 正常受阻、一次审计、owner恢复与重放幂等', async () => {
+  let sourceReads = 0;
+  const guarded = new SurrealCompanyCore(db, { ciBillingCheck: async () => {
+    sourceReads++;
+    return { runUrl: 'https://github.com/o/r/actions/runs/9', sha: 'a'.repeat(40) };
+  } });
+  for (const text of [referenceSentence, referenceReport, 'GitHub CI 已完成，当前等待老板确认客户账单，未申请任何 CI 豁免。']) {
+    const claim = await guarded.claim(eng, (await make('engineering', { acceptanceCriteria: ciCriteria })).id);
+    expect(claim.task.acceptanceCriteria).toHaveLength(1);
+    const proof = proofOf(claim), ev = evidence(text);
+    const blocked = await guarded.block(eng, proof, 'owner', ev);
+    expect(blocked.state).toBe('blocked');
+    expect(blocked.version).toBe(claim.task.version + 1);
+    expect(blocked.currentEmployee).toBeUndefined();
+    expect(blocked.deliveryId).toBeUndefined();
+    expect(await guarded.block(eng, proof, 'owner', ev)).toEqual(blocked);
+    expect((await guarded.activeLeases(eng)).filter(l => l.taskId === claim.task.id)).toHaveLength(0);
+    const resumeEv = evidence('内部元数据处置已由测试owner确认，恢复正常工作');
+    const resumed = await guarded.resume(gm, claim.task.id, resumeEv);
+    expect(resumed.state).toBe('ready');
+    expect(resumed.version).toBe(blocked.version + 1);
+    expect(await guarded.resume(gm, claim.task.id, resumeEv)).toEqual(resumed);
+    await guarded.block(eng, proof, 'owner', ev);
+    expect((await guarded.getTask(gm, claim.task.id)).state).toBe('ready');
+    const history = await guarded.history(gm, claim.task.id);
+    expect(history.filter(h => h.action === 'block')).toHaveLength(1);
+    expect(history.find(h => h.action === 'block')?.evidence).toBe(ev.text);
+    expect(history.filter(h => h.action === 'resume')).toHaveLength(1);
+  }
+  expect(sourceReads).toBe(0);
+});
+
+run('真实Core拒绝当前CI计费阻塞/等待，省略计费词仍核验来源且拒绝前零副作用', async () => {
+  let sourceReads = 0;
+  const guarded = new SurrealCompanyCore(db, { ciBillingCheck: async () => {
+    sourceReads++;
+    return { runUrl: 'https://github.com/o/r/actions/runs/9', sha: 'a'.repeat(40) };
+  } });
+  for (const text of ['GitHub CI 因账户付款失败未启动，等待老板付款。',
+    'CI 等待账户问题解决后执行，本报告仅为旁证，不申请豁免。',
+    '检查未启动，需老板处理后才能继续。']) {
+    const claim = await guarded.claim(eng, (await make('engineering', { acceptanceCriteria: ciCriteria })).id);
+    const before = await guarded.getTask(gm, claim.task.id);
+    const history = await guarded.history(gm, claim.task.id);
+    await expect(guarded.block(eng, proofOf(claim), 'owner', evidence(text))).rejects.toMatchObject({ code: 'invalid' });
+    expect(await guarded.getTask(gm, claim.task.id)).toEqual(before);
+    expect(await guarded.history(gm, claim.task.id)).toEqual(history);
+    await guarded.release(eng, proofOf(claim), evidence('测试拒绝校验完成，释放隔离测试租约'));
+  }
+  expect(sourceReads).toBe(1);
+});
+
+run('执行端invalid block超过十次仍pending，同一请求恢复后真实Core仅阻塞一次且可恢复', async () => {
+  const claimTask = await make('engineering', { acceptanceCriteria: ciCriteria });
+  const runDir = join(dir, 'reference-pending', 'comm');
+  const journal = new ExecutionJournal(join(dir, 'reference-pending', 'private', 'executions', createHash('sha256').update(runDir).digest('hex')));
+  const inst = { id: 'gate-eng', role: 'engineering' as const, credential: eng, paseoAgentId: undefined as string | undefined };
+  const requests: Array<{ proof: LeaseProof; key: string; text: string }> = [];
+  let oldRefusal = true, loseReply = true;
+  const guarded = new SurrealCompanyCore(db, { ciBillingCheck: async () => { throw Error('unrelated report must not read CI'); } });
+  const boundary = new Proxy(guarded, { get(target, prop) {
+    if (prop === 'block') return async (cred: string, proof: LeaseProof, to: 'owner', ev: { text: string; idempotencyKey: string }) => {
+      requests.push({ proof: { ...proof }, key: ev.idempotencyKey, text: ev.text });
+      // Simulate the old service's exact refusal; never read or edit a production journal.
+      if (oldRefusal) refuseEmployeeCiBlock();
+      const result = await target.block(cred, proof, to, ev);
+      if (loseReply) { loseReply = false; throw Error('synthetic lost reply after commit'); }
+      return result;
+    };
+    const value = Reflect.get(target, prop);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  const options = { runDir, core: boundary, workforce: { rotate: async () => eng } as never,
+    managedLifecycle: true, heartbeatMs: 600000 };
+  let pool = new SidecarPool(options);
+  const retry = async () => {
+    const row = journal.rows()[0]!;
+    row.nextRetry = 0; journal.save(row); await pool.retryExecutions();
+  };
+  try {
+    pool.env(inst); inst.paseoAgentId = 'fixture-reference-session'; pool.bindAgent(inst.id, inst.paseoAgentId);
+    await pool.claim(inst, { id: claimTask.id } as never);
+    await pool.turnStarted(inst.paseoAgentId, 'fixture-reference-turn');
+    expect((await pool.settleExecution({ agent: { id: inst.paseoAgentId }, turnId: 'fixture-reference-turn',
+      outcome: { kind: 'completed' }, timeline: [{ type: 'assistant_message', text: referenceReport }] }))?.status).toBe('pending');
+    for (let n = 0; n < 11; n++) await retry();
+    expect(journal.rows()[0]).toMatchObject({ state: 'pending', tries: 12, error: 'invalid' });
+    expect(journal.rows()[0]?.lastRefusal).toContain('系统判定');
+    expect((await guarded.getTask(gm, claimTask.id)).state).toBe('doing');
+    expect((await guarded.history(gm, claimTask.id)).filter(h => h.action === 'block')).toHaveLength(0);
+    const original = journal.rows()[0]!.result;
+    pool.close();
+    pool = new SidecarPool(options);
+    await pool.adopt([inst] as never);
+    oldRefusal = false;
+    await retry(); // Real transaction commits; the reply is deliberately lost.
+    expect(journal.rows()[0]?.state).toBe('pending');
+    expect((await guarded.getTask(gm, claimTask.id)).state).toBe('blocked');
+    await retry(); await retry();
+    expect(journal.rows()[0]?.state).toBe('settled');
+    expect(journal.rows()[0]?.result).toEqual(original);
+    expect(requests).toHaveLength(14);
+    expect(requests.every(r => JSON.stringify(r) === JSON.stringify(requests[0]))).toBe(true);
+    expect(pool.holdsLease(inst.id, claimTask.id)).toBe(false);
+    expect((await guarded.history(gm, claimTask.id)).filter(h => h.action === 'block')).toHaveLength(1);
+    expect((await guarded.resume(gm, claimTask.id, evidence('隔离测试确认内部元数据处置完成后恢复'))).state).toBe('ready');
+    const next = await guarded.claim(eng, claimTask.id);
+    expect(next.deliveryId).not.toBe(requests[0]!.proof.deliveryId);
+    expect(next.fence).toBeGreaterThan(requests[0]!.proof.fence);
+    await guarded.release(eng, proofOf(next), evidence('恢复后已取得新租约，结束本隔离测试'));
+    const row = await db.db.select<{ state: string }>(new RecordId('task', claimTask.id));
+    expect(row?.state).toBe('ready');
+  } finally { pool.close(); }
 });
