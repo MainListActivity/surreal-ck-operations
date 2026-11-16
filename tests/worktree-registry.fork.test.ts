@@ -670,6 +670,8 @@ run('a QA review scene whose worktree_ref is lost keeps its live lease through e
   expect(swept.removed).not.toContain(scene);
   expect(existsSync(scene)).toBe(true);
   expect(swept.kept.find(k => k.path === scene)?.reason).toBe('authority-leased,lease-ref-mismatch');
+  const branch = review.worktree!.branch!;
+  expect(git(path, 'branch', '--list', branch)).toContain(branch);
   expect((await core.reclaimWorktrees(gm, { repos: [path] })).removed).not.toContain(scene);
   const audits = await core.listWorktreeAudits(gm, 50);
   expect(audits.some(a => a.event === 'skip' && String(a.path) === scene && String(a.reason).includes('authority-leased'))).toBe(true);
@@ -684,6 +686,8 @@ run('a QA review scene whose worktree_ref is lost keeps its live lease through e
   // Done ends the scene's life; the clean tree is then reclaimed at the accept event point.
   await core.accept(qa, proof(review), { text: 'Accept after a lost reference', idempotencyKey: `lost-ref-accept-${++count}` });
   expect(existsSync(scene)).toBe(false);
+  // The branch holds the unmerged QA-reviewed commit, so removing its clean tree keeps the branch.
+  expect(git(path, 'branch', '--list', branch)).toContain(branch);
   const after = await core.listWorktreeAudits(gm, 100);
   expect(after.some(a => a.event === 'delete' && a.result === 'success' && String(a.path) === scene && a.reason === 'last-effective-ref-released')).toBe(true);
 }, 30000);
@@ -721,6 +725,7 @@ run('a lost reference on a live, revoked or expired scene keeps the tree for its
   await lapseLease(t.id);
   expect(await sweep()).toBe('authority-open');
   expect(existsSync(scene)).toBe(true);
+  expect(git(path, 'branch', '--list', claim.worktree!.branch!)).toContain(claim.worktree!.branch!);
 }, 30000);
 
 run('a blocked scene keeps its tree while its reference is lost; retiring the task then reclaims the clean tree', async () => {
@@ -733,6 +738,7 @@ run('a blocked scene keeps its tree while its reference is lost; retiring the ta
   expect(swept.removed).not.toContain(scene);
   expect(swept.kept.find(k => k.path === scene)?.reason).toBe('authority-open');
   expect(existsSync(scene)).toBe(true);
+  expect(git(path, 'branch', '--list', claim.worktree!.branch!)).toContain(claim.worktree!.branch!);
   const retired = await core.retireTask(gm, { taskId: t.id, text: '作废已阻塞的干净树：终态后回收', idempotencyKey: `blocked-void-${++count}` });
   expect(retired.state).toBe('void');
   expect(existsSync(scene)).toBe(false);
