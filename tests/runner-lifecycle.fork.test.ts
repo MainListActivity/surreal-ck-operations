@@ -1,13 +1,15 @@
 import { afterAll, beforeAll, expect, test, setDefaultTimeout } from 'bun:test';
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { CompanyDatabase, CLOUD_SCHEMA_VERSION } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { Workforce } from '../src/workforce.ts';
 import { SidecarPool } from '../src/runner/sidecar.ts';
+import { ExecutionJournal, workResult } from '../src/runner/lifecycle.ts';
 import { saveRoute } from '../src/routes.ts';
 import { HANDOVER_ROWS } from '../src/handover-window.ts';
 setDefaultTimeout(60000);
@@ -60,6 +62,57 @@ run('真实 fork：模型零生命周期命令，从领取、自动送审到独�
   const history = await core.history(owner, task.id);
   expect(history.filter(h => h.action === 'submit')).toHaveLength(1);
   expect(history.filter(h => h.action === 'accept')).toHaveLength(1);
+});
+
+run('真实 fork：撤租约并退休的旧员工结果终态 superseded，保留成果且不再重复提交', async () => {
+  const task = await core.createTask(owner, { type: 'lifecycle-fixture', title: '旧结果生命周期', context: '验证撤租约后旧投递不再重放', idempotencyKey: crypto.randomUUID() } as never);
+  await wf.upsertDef('fixture-legacy', { role: 'engineering', provider: 'claude', model: 'fixture' });
+  const def = (await wf.defs()).find(d => d.id === 'fixture-legacy')!;
+  const inst = await wf.spawnInst(def);
+  const runDir = join(dir, 'legacy', 'comm');
+  const pool = new SidecarPool({
+    runDir, core, workforce: wf, managedLifecycle: true,
+    // Same read-only fact source the production runner injects: task lease identity and employee identity.
+    resultFacts: async (taskId, employeeId) => {
+      const [tasks] = await db.db.query<[Array<{ state: string; current_employee?: string; delivery_id?: string; fence?: number }>]>(
+        'SELECT state, current_employee, delivery_id, fence FROM $task;', { task: new RecordId('task', taskId) });
+      const [employees] = await db.db.query<[Array<{ retired?: boolean; revoked?: boolean }>]>(
+        'SELECT retired, revoked FROM $employee;', { employee: new RecordId('employee', employeeId) });
+      return {
+        ...(tasks?.[0] ? { task: { state: tasks[0].state, currentEmployee: tasks[0].current_employee, deliveryId: tasks[0].delivery_id, fence: tasks[0].fence } } : {}),
+        ...(employees?.[0] ? { employee: { retired: employees[0].retired === true, revoked: employees[0].revoked === true } } : { employee: { missing: true } }),
+      };
+    },
+  });
+  pools.push(pool);
+  pool.env(inst); inst.paseoAgentId = 'legacy'; pool.bindAgent(inst.id, 'legacy');
+  const claim = await pool.claim(inst, { id: task.id } as never);
+  expect(claim).toBeDefined();
+  const proof = { taskId: task.id, deliveryId: claim!.deliveryId!, fence: claim!.fence, expectedVersion: claim!.task.version };
+  // A captured result that never reached the core: the exact state the real journal kept for the retired reviewer.
+  const journal = new ExecutionJournal(join(dirname(runDir), 'private', 'executions', createHash('sha256').update(runDir).digest('hex')));
+  const text = '工作结果：完成\n旧投递的成果与验证证据已经保存在执行记录，等待自动送审。';
+  const row = journal.reserve(inst.id, 'doing', proof);
+  row.state = 'pending'; row.finalText = text;
+  row.result = workResult(text, 'doing');
+  journal.save(row);
+  // The lease is withdrawn server-side without a verdict, then the identity is retired; both are authoritative facts.
+  await core.release(inst.credential!, proof, { text: 'fixture：撤租约以验证旧投递不再重放', idempotencyKey: crypto.randomUUID() });
+  await wf.retire(inst.id, 'fixture：会话轮换', 'rotation');
+  pool.dropLease(inst.id, task.id);
+  for (const pending of journal.rows()) { pending.nextRetry = 0; journal.save(pending); }
+  await pool.retryExecutions();
+  const after = journal.read(inst.id, proof.deliveryId)!;
+  expect(after.state).toBe('superseded');
+  expect(['employee_gone', 'task_not_active'].includes(after.supersededCause!)).toBe(true);
+  expect(after.result?.action).toBe('submit');
+  expect(after.result?.evidence.text).toContain('旧投递的成果与验证证据');
+  const refused = (await core.history(owner, task.id)).filter(h => h.action === 'submit' || h.action === 'block');
+  expect(refused).toHaveLength(0);
+  for (const pending of journal.rows()) { pending.nextRetry = 0; journal.save(pending); }
+  await pool.retryExecutions();
+  expect(journal.read(inst.id, proof.deliveryId)?.state).toBe('superseded');
+  expect((await core.history(owner, task.id)).filter(h => h.action === 'submit' || h.action === 'block')).toHaveLength(0);
 });
 
 run('模板迁移可重复执行，保留老板修改的正文与已发送记录', async () => {

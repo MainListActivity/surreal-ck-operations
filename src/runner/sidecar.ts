@@ -7,7 +7,7 @@ import { LIFECYCLE_COMMANDS } from '../lifecycle-policy.ts';
 // The sidecar claims tasks on the instance's behalf (dispatcher calls claim()),
 // keeps the lease alive while a turn runs, relays `sck call` requests through
 // req/res files, and ingests report.md/blocker.md when a turn ends.
-import { ExecutionJournal, workResult, finalAnswer, type ExecutionAttempt } from './lifecycle.ts';
+import { ExecutionJournal, workResult, finalAnswer, type ExecutionAttempt, type ResultFacts, type SupersededCause } from './lifecycle.ts';
 import type { TurnEnded } from './contracts.ts';
 import { RuntimeResultError } from './turn-result.ts';
 import { OpsCircuit } from "./ops-circuit.ts";
@@ -164,6 +164,12 @@ export interface SidecarDeps {
   managedLifecycle?: boolean;
   readTurnResult?: (agent: string, turn: string, startedAt: number) => Promise<string>;
   executionChanged?: (row: ExecutionAttempt) => Promise<void>;
+  /**
+   * Read-only authoritative facts (task lease identity and employee identity) used to retire a captured result
+   * whose delivery no longer exists. Optional: without it a failed write is always treated as recoverable, never
+   * as proof that the result is invalid.
+   */
+  resultFacts?: (taskId: string, employee: string) => Promise<ResultFacts | undefined>;
   nativeExecution?: boolean;
   core: CompanyCore;
   workforce: Workforce;
@@ -397,7 +403,13 @@ export class SidecarPool {
   async retryExecutions(): Promise<void> {
     if (!this.journal || this.closed) return;
     for (const row of this.journal.rows()) {
-      if (row.state === 'interrupted' && row.providerFailure && row.nextRetry <= Date.now()) {
+      // A channel that cannot deliver (process restart quarantined it, or the agent is gone) never reaches the
+      // write attempt that would expose a stale delivery. The same authoritative facts still retire the result.
+      if (row.state === 'pending' && (!this.launched.has(row.employee) || this.quarantined.has(row.employee))) {
+        if (row.nextRetry > Date.now()) continue;
+        const cause = await this.staleResultCause(row).catch(() => undefined);
+        if (cause) await this.expireResult(row, cause, 'channel_unavailable');
+      } else if (row.state === 'interrupted' && row.providerFailure && row.nextRetry <= Date.now()) {
         await this.releaseProviderFailure(row).catch(() => undefined);
       } else if (row.state === 'collecting' && row.nextRetry <= Date.now()) {
         await this.collectExecution(row);
@@ -459,6 +471,11 @@ export class SidecarPool {
       const code = String((error as { code?: string }).code ?? 'unavailable');
       const message = String((error as Error).message ?? '').slice(0, 300);
       row.lastRefusal = message || undefined;
+      // Before spending another write on this result, ask the authoritative task/employee facts. A delivery the
+      // task no longer names, a finished task or a retired identity can never accept it again; a still-current
+      // lease, an unreadable fact, a transient auth loss or a network error must keep the result and its retries.
+      const stale = await this.staleResultCause(row).catch(() => undefined);
+      if (stale) { await this.expireResult(row, stale, code); return; }
       // A submit that waits on unfinished CI is not a refusal of the work: the retry budget is not spent. The result
       // stays pending with the same proof and evidence until CI succeeds, the lease ends, or the wait limit is reached.
       if (code === 'ci_pending') {
@@ -511,6 +528,36 @@ export class SidecarPool {
     row.result = workResult('', row.phase, { outcome: 'blocked', summary: `${reason}。原始工作成果已经保存在执行记录，需检查后恢复。` });
     row.prepared = true;
     row.nextRetry = 0;
+  }
+  /**
+   * Why this captured result can no longer be delivered, from authoritative task and employee facts.
+   * `undefined` means either the delivery is still the task's lease or the facts could not be read: an
+   * unreadable fact, like a temporary auth loss, is never proof that the work is invalid.
+   */
+  private async staleResultCause(row: ExecutionAttempt): Promise<SupersededCause | undefined> {
+    const facts = await this.deps.resultFacts?.(row.task, row.employee);
+    if (!facts) return undefined;
+    const task = facts.task;
+    if (!task) return 'task_missing';
+    if (task.state === 'done' || task.state === 'void') return 'task_finished';
+    if (facts.employee?.missing || facts.employee?.retired || facts.employee?.revoked) return 'employee_gone';
+    if (task.state !== 'doing' && task.state !== 'review') return 'task_not_active';
+    if (task.currentEmployee !== row.employee || task.deliveryId !== row.proof.deliveryId || task.fence !== row.proof.fence) return 'lease_replaced';
+    return undefined;
+  }
+  /**
+   * Terminal record for a result whose delivery is gone. The work product, the captured artifacts and the
+   * core's last refusal stay in the journal; only delivery stops, so no duplicate submit or block follows.
+   */
+  private async expireResult(row: ExecutionAttempt, cause: SupersededCause, detail?: string): Promise<void> {
+    row.state = 'superseded';
+    row.supersededCause = cause;
+    row.supersededAt = Date.now();
+    row.error = `superseded:${cause}`;
+    row.nextRetry = 0;
+    await this.changed(row);
+    if (this.claims.get(row.employee)?.proof.deliveryId === row.proof.deliveryId) this.endLease(row.employee);
+    this.log(`runner result superseded ${row.task} for ${row.employee}: ${cause}${detail ? ` (${detail})` : ''}`);
   }
   private log(message: string) { this.deps.log?.(message); }
 

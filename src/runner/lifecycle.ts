@@ -34,7 +34,24 @@ export interface ExecutionAttempt {
   ciWaitSince?: number;
   /** The last refusal text the core gave for this result; it is carried into the block reason when the result is blocked. */
   lastRefusal?: string;
+  /** Why a result that can no longer be delivered was retired: the authoritative task/employee fact that disproved its lease. */
+  supersededCause?: SupersededCause;
+  supersededAt?: number;
   at: number;
+}
+
+/**
+ * A pending result whose delivery no longer names the task's lease. The work itself is kept; only delivery stops.
+ * These are facts about the task or the employee, never the text of a failed call: a transient auth or network
+ * failure is not proof that the work is invalid.
+ */
+export type SupersededCause = 'task_finished' | 'task_missing' | 'task_not_active' | 'lease_replaced' | 'employee_gone';
+
+/** Read-only facts used to decide whether a pending result can still be delivered. Absent fields are unknown. */
+export interface ResultFacts {
+  task?: { state: string; currentEmployee?: string; deliveryId?: string; fence?: number };
+  /** `missing` means the employee row is gone, which is as final as retired or revoked. */
+  employee?: { retired?: boolean; revoked?: boolean; missing?: boolean };
 }
 const key = (value: string) => createHash('sha256').update(value).digest('hex');
 const fail = (message: string): never => { throw new Error(message); };

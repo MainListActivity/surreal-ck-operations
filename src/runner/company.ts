@@ -241,6 +241,21 @@ export function company(): Promise<Company> {
       },
       nativeExecution: runtimeOptions.native,
       managedLifecycle: true,
+      // Read-only facts for retiring a captured result whose delivery no longer exists. The task row is the lease
+      // authority and the employee row is the identity authority; a failed read throws and stays "unknown".
+      resultFacts: async (taskId, employeeId) => {
+        const { RecordId } = await import('surrealdb');
+        const [tasks] = await db.db.query<[Array<{ state: string; current_employee?: string; delivery_id?: string; fence?: number }>]>(
+          'SELECT state, current_employee, delivery_id, fence FROM $task;', { task: new RecordId('task', taskId) });
+        const [employees] = await db.db.query<[Array<{ retired?: boolean; revoked?: boolean }>]>(
+          'SELECT retired, revoked FROM $employee;', { employee: new RecordId('employee', employeeId) });
+        return {
+          ...(tasks?.[0] ? { task: { state: tasks[0].state, currentEmployee: tasks[0].current_employee,
+            deliveryId: tasks[0].delivery_id, fence: tasks[0].fence } } : {}),
+          ...(employees?.[0] ? { employee: { retired: employees[0].retired === true, revoked: employees[0].revoked === true } }
+            : { employee: { missing: true } }),
+        };
+      },
       readTurnResult: runtimeOptions.native ? undefined : (agent, turn, startedAt) => readTurnResult(currentHost(), agent, turn, startedAt),
       executionChanged: async row => {
         const { RecordId } = await import('surrealdb');

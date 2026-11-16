@@ -1,18 +1,19 @@
 {
-  "version": "0.13.33",
-  "title": "修复 zsh 垫片：用户改写 ZDOTDIR 后仍剥离服务端预览签名密钥与 Cloudflare 令牌",
+  "version": "0.13.40",
+  "title": "修复撤租约后的旧结果无限重放：按权威事实终态记录 superseded",
   "changes": [
-    "修复：用户 ~/.zshenv 用 export 改写或 unset ZDOTDIR 时，.zprofile、.zshrc、.zlogin 会绕过垫片，SCK_PREVIEW_SECRET 与 CLOUDFLARE_API_TOKEN 重新出现在员工 shell 中。现在每个启动文件读完即剥离，并把 ZDOTDIR 导回垫片。",
-    "修复：CLOUDFLARE_API_TOKEN 在同一布局下，主线版本（0.13.28）就会经启动文件泄漏，本次与 SCK_PREVIEW_SECRET 由同一份名单一并覆盖。",
-    "原生执行端环境改由 nativeEmployeeEnv 统一生成，run.ts 与回归测试调用同一函数；ZDOTDIR 最后设置，继承值、通道值与模型路由都改不了它。",
-    "回归：真实 zsh 的 -c、-lc、-ic、-lic 四种启动，覆盖用户改写与取消 ZDOTDIR 两种布局，并覆盖原生与 Paseo 端到端；断言均使用合成值。",
-    "文档：agent-operations 垫片与边界段同步，剥离名单含 SCK_PREVIEW_SECRET，边界提到 ZDOTDIR 改写与 ZDOTDIR= zsh -i 绕过。",
-    "CI：quality 与 channel 两个作业都显式安装 zsh；CI 环境中缺少 zsh 时真实 zsh 回归判为失败，不再静默跳过。"
+    "执行端收尾失败时先读任务与员工的权威事实：任务已 done/void、投递已被新租约或 fence 取代、员工已退休或撤销时，原结果终态记录为 superseded，保留原成果与最后一次拒收信息，不再重复 submit/block。",
+    "仍有效的租约遇到暂时 unauthorized 或网络失败时继续按原退避重试；事实读不到同样视为未知，不据此丢弃成果。",
+    "进程重启后通道被隔离的 pending 结果也走同一判定，不会永远停在 pending。",
+    "新增只读事实源 resultFacts（任务 state/current_employee/delivery_id/fence，员工 retired/revoked），由执行端从本地公司库读取；不写任务、不清计数。",
+    "回归：单元覆盖退休加任务完成停止重放、活租约暂时 unauthorized 恢复、事实不可读可恢复、新 fence 取代、重启隔离；真实公司 fork 覆盖撤租约并退休后旧结果 superseded 且零 submit/block。",
+    "生产上已完成的旧任务，其旧执行记录在更新后的下一轮巡检转为 superseded；不修改原任务、历史或计数。"
   ],
   "impact": [
-    "老板：服务端预览签名密钥与 Cloudflare 令牌不再经用户启动文件进入员工 shell。已发生的真实事件仍按既有流程另行轮换与记录，本变更不替代轮换，也不触碰生产密钥文件。",
-    "员工：环境与 shell 中不再出现服务端预览签名密钥；SCK_COMM_* 通道变量与供应商登录（如 OPENAI_API_KEY）照旧保留。"
+    "老板：已完成的旧任务不再每分钟出现重复收尾告警；旧成果仍保留在执行记录中可查。",
+    "员工：有效租约内的认证抖动不再丢成果；身份失效后才停止投递。",
+    "未上线前生产行为不变；本变更不修改任何现有任务、审计或计数。"
   ],
-  "migration": "无 schema 变更（沿用 schema 072）。无需迁移数据。执行端插件与原生执行端重启后生效；垫片目录随启动重写，无需人工操作。",
-  "rollback": "回退至 v0.13.28。回退后 SCK_PREVIEW_SECRET 恢复随父环境继承给员工，用户启动文件可再次导出它；其余遮蔽口径不变。"
+  "migration": "无 schema 变更（沿用 072）。无需迁移数据。执行端更新并重启后，下一轮巡检按新规则处理 pending 记录。",
+  "rollback": "回退至 v0.13.33。回退后撤租约或退休员工的旧 pending 结果仍会按旧逻辑每分钟重试。"
 }
