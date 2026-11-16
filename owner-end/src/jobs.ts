@@ -4,8 +4,8 @@
  * 执行端把 state 改为 running，完成后写 result（done）或 error（error）。input、result、error 按 058 存 JSON 文本。
  */
 import { RecordId, type Surreal } from 'surrealdb';
-import { CompanyError } from '../../src/core-errors.ts';
-import { boundedInt, isoOf, keyOf, parsedJson, type Row } from './rows.ts';
+import { CompanyError, CORE_ERROR_CODES } from '../../src/core-errors.ts';
+import { boundedInt, isoOf, keyOf, parsedJson, textOf, type Row } from './rows.ts';
 
 export const JOB_WAIT_MS = 25_000;
 const POLL_MS = 500;
@@ -88,19 +88,8 @@ export async function readJob(db: Surreal, id: string): Promise<JobRecord | unde
 
 type ErrorCode = ConstructorParameters<typeof CompanyError>[0];
 
-/**
- * 全部 CompanyError 错误码（与 src/core-errors.ts 的联合类型一致）。执行端记录的错误码都来自 CompanyError，
- * 漏掉的码会被当成上游失败（502），所以下面的类型断言保证这份列表与联合类型同步。
- */
-export const CORE_ERROR_CODES = [
-  'unauthorized', 'forbidden', 'not_found', 'conflict', 'invalid', 'worktree_busy', 'already_claimed', 'lease_expired',
-  'self_review', 'temporarily_unavailable', 'checkpoint_limit', 'not_configured', 'unavailable', 'payment_approval_required',
-  'upstream_error', 'login_failed', 'limit_reached', 'response_too_large', 'snapshot_gone', 'retire_refused',
-] as const satisfies readonly ErrorCode[];
-
-/** 编译期检查：联合类型里的每个码都在上面的列表里；少列一个，这一行就是类型错误。 */
-type AssertNever<T extends never> = T;
-export type UnlistedErrorCode = AssertNever<Exclude<ErrorCode, (typeof CORE_ERROR_CODES)[number]>>;
+// 全部错误码的列表与编译期检查都在 src/core-errors.ts，网关客户端共用同一份。
+export { CORE_ERROR_CODES };
 
 const KNOWN_CODES: ReadonlySet<string> = new Set<string>(CORE_ERROR_CODES);
 
@@ -198,4 +187,12 @@ export async function jobDetail(db: Surreal, id: string): Promise<JobView> {
   const row = rows?.[0];
   if (!row) throw new CompanyError('not_found', 'job not found');
   return viewOf(row, true);
+}
+
+/**
+ * ops.job.get 的结果：{ job: 作业详情 }。老板端命令（commands.ts）与网关测试替身共用这一个函数，
+ * 网关客户端按这个包装解析，形状只在这里定义。
+ */
+export async function jobGet(db: Surreal, input: Row): Promise<{ job: JobView }> {
+  return { job: await jobDetail(db, textOf(input.id, 'id', 200)) };
 }

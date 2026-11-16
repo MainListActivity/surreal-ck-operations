@@ -141,7 +141,7 @@ function hostExecInput(value: unknown): HostExecInput {
  * 把任意错误转为作业 error 字符串：`${code}: ${message}`。
  * code 为字符串时沿用，否则为 upstream_error；message 先脱敏再截断到 200 字符，整体再脱敏并截断到 500 字符。
  */
-function failure(err: unknown): string {
+export function failure(err: unknown): string {
   const code = (err as { code?: unknown } | null | undefined)?.code;
   const raw = err instanceof Error ? err.message : String(err);
   const name = typeof code === 'string' ? code : 'upstream_error';

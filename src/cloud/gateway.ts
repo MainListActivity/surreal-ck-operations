@@ -1,14 +1,18 @@
 // 公司网关 HTTP 客户端。pending 表示作业已入队，按作业 id 轮询 ops.job.get 直到结束或超时。
+import { CORE_ERROR_CODES } from '../core-errors.ts';
 import { clip, redactText } from '../ops/redact.ts';
 import { isSecureBaseUrl } from './idp.ts';
 
 export class GatewayError extends Error {
   readonly code: string;
+  /** 业务命令已被网关接受（作业已排队）之后的失败：命令可能已在执行，调用方不得据此自动重新提交。 */
+  readonly accepted: boolean;
 
-  constructor(code: string, message: string) {
+  constructor(code: string, message: string, accepted = false) {
     super(message);
     this.name = 'GatewayError';
     this.code = code;
+    this.accepted = accepted;
   }
 }
 
@@ -63,7 +67,7 @@ export class GatewayClient {
     this.now = options.now ?? Date.now;
   }
 
-  /** 调用网关命令；pending 时轮询作业直到 done / error / 超时。 */
+  /** 调用网关命令；pending 时轮询同一个作业直到 done / error / 超时。业务命令只提交一次，作业入队后的失败都标为 accepted。 */
   async call(token: string, command: string, input?: unknown): Promise<unknown> {
     if (typeof command !== 'string' || command.trim() === '' || command.length > 128) {
       throw new GatewayError('invalid', '命令名不合法');
@@ -71,7 +75,9 @@ export class GatewayClient {
     const first = await this.send(token, command, input);
     if (first.ok) return first.result;
     if (first.code !== 'pending') throw new GatewayError(first.code, first.message);
-    return this.poll(token, first.message);
+    return this.poll(token, first.message).catch((error: unknown) => {
+      throw acceptedError(error);
+    });
   }
 
   private async poll(token: string, id: string): Promise<unknown> {
@@ -82,11 +88,12 @@ export class GatewayClient {
       if (!out.ok) {
         if (out.code !== 'pending') throw new GatewayError(out.code, out.message);
       } else {
-        const job = parseJob(out.result);
+        const job = parseJob(out.result, id);
         if (job.state === 'done') return job.result;
         if (job.state === 'error') {
-          const detail = safeMessage(job.error?.message);
-          throw new GatewayError(normalizeCode(job.error?.code), detail ? `作业执行失败：${detail}` : '作业执行失败');
+          const failed = jobFailureOf(job.error);
+          const detail = safeMessage(failed.detail);
+          throw new GatewayError(failed.code, detail ? `作业执行失败：${detail}` : '作业执行失败');
         }
       }
       if (this.now() - started >= this.pollTimeoutMs) {
@@ -132,18 +139,51 @@ export class GatewayClient {
   }
 }
 
-interface JobView {
-  id: string;
-  state: 'queued' | 'running' | 'done' | 'error';
-  result?: unknown;
-  error?: { code?: unknown; message?: unknown };
+/** 作业已排队之后的任何失败，都以 accepted 形式交给调用方；未知的内部错误按上游失败处理，不回显原文。 */
+function acceptedError(error: unknown): GatewayError {
+  if (error instanceof GatewayError) return new GatewayError(error.code, error.message, true);
+  return new GatewayError('upstream_error', '作业取回失败', true);
 }
 
-function parseJob(value: unknown): JobView {
-  if (!value || typeof value !== 'object') throw new GatewayError('upstream_error', '作业视图格式错误');
-  const job = value as Partial<JobView>;
-  if (job.state !== 'queued' && job.state !== 'running' && job.state !== 'done' && job.state !== 'error') {
-    throw new GatewayError('upstream_error', '作业视图格式错误');
-  }
-  return job as JobView;
+type JobState = 'queued' | 'running' | 'done' | 'error';
+
+interface JobView {
+  id: string;
+  state: JobState;
+  result?: unknown;
+  error?: unknown;
+}
+
+function isJobState(value: unknown): value is JobState {
+  return value === 'queued' || value === 'running' || value === 'done' || value === 'error';
+}
+
+function malformedJob(): GatewayError {
+  return new GatewayError('upstream_error', '作业视图格式错误');
+}
+
+/**
+ * ops.job.get 的结果是 {job: 作业视图}（owner-end/src/commands.ts）。id 必须与所查的作业一致，state 必须是四种之一；
+ * 其它形状（包括没有包装的旧作业视图）一律按格式错误处理，不猜测。
+ */
+function parseJob(value: unknown, id: string): JobView {
+  const job = typeof value === 'object' && value !== null ? (value as { job?: unknown }).job : undefined;
+  if (typeof job !== 'object' || job === null || Array.isArray(job)) throw malformedJob();
+  const view = job as Partial<JobView>;
+  if (view.id !== id || !isJobState(view.state)) throw malformedJob();
+  return view as JobView;
+}
+
+/** 执行端把失败写成 `${code}: ${message}` 一句话（src/cloud/ops-jobs.ts 的 failure）。 */
+const JOB_FAILURE = /^([A-Za-z_][A-Za-z0-9_]*): ([\s\S]*)$/;
+
+/**
+ * 还原作业失败的类别与说明。码在公司错误码之内则原样保留；不认识的码按上游失败，说明保留。
+ * 不是这一句话格式的（例如存成了 JSON）不猜测类别，也不回显原文。
+ */
+function jobFailureOf(error: unknown): { code: string; detail: string } {
+  const match = typeof error === 'string' ? JOB_FAILURE.exec(error) : null;
+  if (!match) return { code: 'upstream_error', detail: '' };
+  const [, token = '', detail = ''] = match;
+  return { code: (CORE_ERROR_CODES as readonly string[]).includes(token) ? token : 'upstream_error', detail };
 }
