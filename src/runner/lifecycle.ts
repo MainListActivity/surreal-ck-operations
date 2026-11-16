@@ -52,6 +52,17 @@ export interface ResultFacts {
   task?: { state: string; currentEmployee?: string; deliveryId?: string; fence?: number };
   /** `missing` means the employee row is gone, which is as final as retired or revoked. */
   employee?: { retired?: boolean; revoked?: boolean; missing?: boolean };
+  /** The core already recorded this delivery's result under its idempotency key: the write committed even
+   * though its reply was lost. Such a result was delivered; it is settled, never superseded. */
+  landed?: boolean;
+}
+
+/** The frozen write whose fate a fact source is asked about: enough to find the exact stored transition. */
+export interface ResultDeliveryRef {
+  deliveryId: string;
+  fence: number;
+  action: ResultAction;
+  idempotencyKey: string;
 }
 const key = (value: string) => createHash('sha256').update(value).digest('hex');
 const fail = (message: string): never => { throw new Error(message); };

@@ -46,9 +46,11 @@ function fixture(readTurnResult?: (agent: string, turn: string) => Promise<strin
   let fail = false, loseReply = false, failRead = false;
   let refusal: { code: string; message: string; times: number } | undefined;
   let accepted = 0;
-  let factsFn: ((taskId: string, employee: string) => Promise<ResultFacts>) | undefined;
+  let factsFn: ((taskId: string, employee: string, delivery?: { idempotencyKey: string }) => Promise<ResultFacts>) | undefined;
   let authRefusals = 0;
   let rotateError: Error | undefined;
+  // Identity dies after the next committed write: models a worker retired while its reply was in flight.
+  let goneAfterCommit = false, gone = false;
   const mirror: Array<{ state: string; error?: string; attempts: number }> = [];
   const inst = { id: 'worker', role: 'engineering' as const, credential: 'synthetic', paseoAgentId: undefined as string | undefined };
   const task = () => ({ id: 'task', state: phase, version, fence: 1, deliveryId: delivery, currentEmployee: 'worker',
@@ -57,12 +59,14 @@ function fixture(readTurnResult?: (agent: string, turn: string) => Promise<strin
   const committed = new Set<string>();
   const transition = (action: string) => async (_cred: string, proof: LeaseProof, evidence: { idempotencyKey: string; text?: string }) => {
     calls.push({ action, proof: { ...proof }, key: evidence.idempotencyKey, text: evidence.text });
+    // The real core authenticates before its idempotent replay, so a retired identity is refused either way.
+    if (gone || authRefusals > 0) { if (!gone) authRefusals--; throw Object.assign(new Error('invalid credential'), { code: 'unauthorized' }); }
     if (committed.has(evidence.idempotencyKey)) return task();
-    if (authRefusals > 0) { authRefusals--; throw Object.assign(new Error('invalid credential'), { code: 'unauthorized' }); }
     if (action === 'submit' && refusal && refusal.times > 0) { refusal.times--; throw Object.assign(new Error(refusal.message), { code: refusal.code }); }
     if (fail) throw new Error('synthetic network failure');
     if (proof.deliveryId !== delivery || proof.expectedVersion !== version) throw Object.assign(new Error('stale version'), { code: 'conflict' });
     committed.add(evidence.idempotencyKey); submitted = true;
+    if (goneAfterCommit) { goneAfterCommit = false; gone = true; }
     if (action === 'submit') accepted++;
     if (loseReply) { loseReply = false; throw new Error('synthetic response lost after commit'); }
     return task();
@@ -72,9 +76,13 @@ function fixture(readTurnResult?: (agent: string, turn: string) => Promise<strin
     activeLeases: async () => submitted ? [] : [{ ...task(), taskId: 'task' }],
     submit: transition('submit'), accept: transition('accept'), returnTask: transition('return'),
     block: (cred: string, proof: LeaseProof, _to: 'owner', evidence: { idempotencyKey: string; text?: string }) => transition('block')(cred, proof, evidence) };
-  const workforce = { rotate: async () => { if (rotateError) throw rotateError; return 'synthetic'; }, insts: async () => [inst] };
+  const workforce = { rotate: async () => { if (gone) { const e = rotateError ?? Object.assign(new Error('Employee retired or revoked'), { code: 'unauthorized' }); throw e; } if (rotateError) throw rotateError; return 'synthetic'; }, insts: async () => [inst] };
   const options = { core: core as never, workforce: workforce as never, runDir: join(root, 'comm'), managedLifecycle: true, readTurnResult, heartbeatMs: 15,
-    resultFacts: async (taskId: string, employee: string) => factsFn ? factsFn(taskId, employee) : undefined,
+    resultFacts: async (taskId: string, employee: string, delivery?: { idempotencyKey: string }) => {
+      const base = factsFn ? await factsFn(taskId, employee, delivery) : undefined;
+      // Like the real store: the idempotency record exists exactly when the write committed.
+      return base ? { landed: committed.has(delivery?.idempotencyKey ?? ''), ...base } : undefined;
+    },
     executionChanged: async (row: { state: string; error?: string; tries: number }) => { mirror.push({ state: row.state, error: row.error, attempts: row.tries }); } };
   let pool = new SidecarPool(options);
   const event = (turn = 'turn-a', text = '工作已完成，全部只读检查通过，证据已生成。', kind = 'completed') =>
@@ -85,10 +93,12 @@ function fixture(readTurnResult?: (agent: string, turn: string) => Promise<strin
     get pool() { return pool; },
     fail(value: boolean) { fail = value; }, loseReply() { loseReply = true; }, failRead(value: boolean) { failRead = value; },
     refuse(code: string, times: number, message: string) { refusal = { code, message, times }; },
-    facts(fn: (taskId: string, employee: string) => Promise<ResultFacts>) { factsFn = fn; },
+    facts(fn: (taskId: string, employee: string, delivery?: { idempotencyKey: string }) => Promise<ResultFacts>) { factsFn = fn; },
     authFailures(times: number) { authRefusals = times; },
     rotateFails(error: Error) { rotateError = error; },
-    accepted: () => accepted, mirror: () => mirror,
+    /** The next committed write retires this identity: lands the result, then every call is unauthorized. */
+    retireAfterCommit() { goneAfterCommit = true; },
+    accepted: () => accepted, committed: () => committed, mirror: () => mirror,
     async claim(review = false) { phase = review ? 'review' : 'doing'; pool.env(inst); inst.paseoAgentId = 'agent'; pool.bindAgent(inst.id, 'agent'); await pool.claim(inst, { id: 'task' } as never); },
     async restart() { pool.close(); pool = new SidecarPool(options); await pool.adopt([inst]); },
     async retry() { for (const row of journal().rows()) { row.nextRetry = 0; journal().save(row); } await pool.retryExecutions(); },
@@ -278,10 +288,12 @@ test('受阻结果提交失败时保留同一幂等键，恢复后重放，不�
     f.fail(true);
     await f.pool.settleExecution({ ...f.event(), timeline: [] });
     for (let i = 0; i < 19; i++) await f.retry();
-    expect(f.calls.map(c => c.action)).toEqual(['block']);
+    // The failed write is replayed once in the same attempt before judging: two calls, one frozen key, zero commits.
+    expect(f.calls.map(c => c.action)).toEqual(['block', 'block']);
+    expect(f.committed().size).toBe(0);
     expect(f.journal().rows()[0]?.state).toBe('pending');
     f.fail(false); await f.retry();
-    expect(f.calls.map(c => c.action)).toEqual(['block', 'block']);
+    expect(f.calls.map(c => c.action)).toEqual(['block', 'block', 'block']);
     expect(f.calls[1]?.key).toBe(f.calls[0]?.key);
     expect(f.journal().rows()[0]?.state).toBe('settled');
   } finally { f.close(); }
@@ -586,6 +598,56 @@ test('员工身份已退休或撤销：终态 superseded(employee_gone)，记录
     expect(row.supersededAt).toBeGreaterThan(0);
     await f.retry();
     expect(f.calls.map(c => c.action)).toEqual(['submit']);
+  } finally { f.close(); }
+});
+test('提交已落库但回复丢失：同键重放确认交付后结算，核心只记一次提交，不判 superseded', async () => {
+  const f = fixture(); try {
+    // Facts describe the post-submit world: the task moved to review and cleared the lease fields.
+    f.facts(async () => ({ task: { state: 'review' }, employee: { retired: false, revoked: false } }));
+    await f.claim(); f.loseReply(); await f.settle(f.event());
+    const row = f.journal().rows()[0]!;
+    expect(row.state).toBe('settled');
+    expect(row.supersededCause).toBeUndefined();
+    expect(row.error).toBeUndefined();
+    expect(f.calls.map(c => c.action)).toEqual(['submit', 'submit']);
+    expect(new Set(f.calls.map(c => c.key)).size).toBe(1);
+    expect(f.committed().size).toBe(1);
+    await f.retry(); await f.restart(); await f.retry();
+    expect(f.calls).toHaveLength(2);
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+  } finally { f.close(); }
+});
+test('复核通过已落库但回复丢失：accept 同键重放结算，不判 task_finished', async () => {
+  const f = fixture(); try {
+    f.facts(async () => ({ task: { state: 'done' }, employee: { retired: false, revoked: false } }));
+    await f.claim(true); f.loseReply();
+    await f.settle(f.event('turn-a', '复核结论：通过\n已独立核对全部验收要求，成果与证据一致。'));
+    const row = f.journal().rows()[0]!;
+    expect(row.state).toBe('settled');
+    expect(row.supersededCause).toBeUndefined();
+    expect(f.calls.map(c => c.action)).toEqual(['accept', 'accept']);
+    expect(new Set(f.calls.map(c => c.key)).size).toBe(1);
+    expect(f.committed().size).toBe(1);
+    await f.retry();
+    expect(f.calls).toHaveLength(2);
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+  } finally { f.close(); }
+});
+test('成果落库后员工才退休且回复丢失：权威幂等记录确认已交付，结算而不判 employee_gone', async () => {
+  const f = fixture(); try {
+    f.facts(async () => ({ task: { state: 'done' }, employee: { retired: true, revoked: true } }));
+    await f.claim(); f.loseReply(); f.retireAfterCommit();
+    await f.settle(f.event());
+    const row = f.journal().rows()[0]!;
+    expect(row.state).toBe('settled');
+    expect(row.supersededCause).toBeUndefined();
+    expect(row.error).toBeUndefined();
+    expect(row.lastRefusal).toBe('Employee retired or revoked');
+    expect(f.calls.map(c => c.action)).toEqual(['submit', 'submit']);
+    expect(f.committed().size).toBe(1);
+    await f.retry(); await f.restart(); await f.retry();
+    expect(f.calls).toHaveLength(2);
+    expect(f.journal().rows()[0]?.state).toBe('settled');
   } finally { f.close(); }
 });
 test('重启后通道被隔离的旧结果仍按权威事实终态记录，不会永远停在 pending', async () => {
