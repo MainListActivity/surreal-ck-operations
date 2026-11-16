@@ -8,6 +8,7 @@ const daemonEnv = {
   PATH: '/usr/bin', HOME: '/Users/x', SSH_AUTH_SOCK: '/tmp/agent.sock', OPENAI_API_KEY: 'provider-login',
   CLOUDFLARE_API_TOKEN: 'cf-secret', CLOUDFLARE_ACCOUNT_ID: 'acct', JEV_API_KEY: 'jev-secret',
   SURREAL_ROOT_PASS: 'root-pass', SCK_PRODUCT_ENV: '/p/.env', ELEVENLABS_API_KEY: 'el-secret', XI_API_KEY: 'xi-secret',
+  SCK_PREVIEW_SECRET: 'synthetic-preview-secret',
 };
 
 const scratch = mkdtempSync(join(tmpdir(), 'sck-scrub-test-'));
@@ -23,7 +24,7 @@ describe('scrubEnv', () => {
   test('blanks inherited infrastructure credentials and leaves everything else alone', () => {
     const env = scrubEnv({ SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'k' }, daemonEnv);
     expect(env).toEqual({
-      CLOUDFLARE_API_TOKEN: '', CLOUDFLARE_ACCOUNT_ID: '', JEV_API_KEY: '', SURREAL_ROOT_PASS: '', SCK_PRODUCT_ENV: '', ELEVENLABS_API_KEY: '', XI_API_KEY: '',
+      CLOUDFLARE_API_TOKEN: '', CLOUDFLARE_ACCOUNT_ID: '', JEV_API_KEY: '', SURREAL_ROOT_PASS: '', SCK_PRODUCT_ENV: '', ELEVENLABS_API_KEY: '', XI_API_KEY: '', SCK_PREVIEW_SECRET: '',
       SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'k',
     });
     expect(env.PATH).toBeUndefined();
@@ -47,11 +48,13 @@ describe('scrubEnv', () => {
     expect(env).toEqual({ MY_VENDOR_KEY: '', NPM_TOKEN: '' });
   });
 
-  test('the shell-startup patterns leave out the company\'s own plumbing variables but keep the extras', () => {
+  test('the shell-startup patterns leave out the company\'s own plumbing variables but keep server secrets and the extras', () => {
     const external = externalPatterns('NPM_TOKEN');
     expect(external).toContain('CLOUDFLARE_');
     expect(external).toContain('NPM_TOKEN');
-    expect(external.some(pattern => pattern.startsWith('SCK_'))).toBe(false);
+    // service.env is shell-shaped, so a startup file can re-export the preview signing secret; it is the
+    // only SCK_ name the shim strips. Task channel variables (SCK_COMM_*) stay granted, never blocked.
+    expect(external.filter(pattern => pattern.startsWith('SCK_'))).toEqual(['SCK_PREVIEW_SECRET']);
     expect(blockedPatterns('NPM_TOKEN')).toEqual(expect.arrayContaining([...external, 'SCK_OPS_', 'SCK_PRODUCT_ENV']));
   });
 });
@@ -100,7 +103,7 @@ describe('zsh startup shim files', () => {
 });
 
 const zsh = Bun.which('zsh');
-const FIELDS = ['CLOUDFLARE_API_TOKEN', 'CF_API_SHELLVAR', 'SURREAL_PASS', 'TYPESAFE_X', 'JEV_API_KEY', 'ELEVENLABS_API_KEY'] as const;
+const FIELDS = ['CLOUDFLARE_API_TOKEN', 'CF_API_SHELLVAR', 'SURREAL_PASS', 'TYPESAFE_X', 'JEV_API_KEY', 'ELEVENLABS_API_KEY', 'SCK_PREVIEW_SECRET'] as const;
 const KEPT = ['KEEP_RC', 'KEEP_ENV', 'KEEP_PROFILE'] as const;
 
 describe.skipIf(!zsh)('zsh startup shim in a real zsh', () => {
@@ -108,7 +111,7 @@ describe.skipIf(!zsh)('zsh startup shim in a real zsh', () => {
     const home = fresh(name);
     writeFileSync(join(home, '.zshenv'), 'export TYPESAFE_X=leak-env KEEP_ENV=env\n');
     writeFileSync(join(home, '.zprofile'), 'export SURREAL_PASS=leak-profile KEEP_PROFILE=profile\n');
-    writeFileSync(join(home, '.zshrc'), 'export CLOUDFLARE_API_TOKEN=leak-rc JEV_API_KEY=leak-rc ELEVENLABS_API_KEY=leak-rc KEEP_RC=rc\nCF_API_SHELLVAR=leak-unexported\n');
+    writeFileSync(join(home, '.zshrc'), 'export CLOUDFLARE_API_TOKEN=leak-rc JEV_API_KEY=leak-rc ELEVENLABS_API_KEY=leak-rc SCK_PREVIEW_SECRET=leak-rc KEEP_RC=rc\nCF_API_SHELLVAR=leak-unexported\n');
     return home;
   }
 
@@ -191,7 +194,7 @@ describe('agent.session_open hook', () => {
   test('a marked company launch is scrubbed without asking the daemon anything', async () => {
     const h = hook();
     const out = await h.open({ ...base, reason: 'create', env: { SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'k' } });
-    expect(out?.env).toMatchObject({ SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'k', CLOUDFLARE_API_TOKEN: '', JEV_API_KEY: '', SCK_SANDBOX: 'employee' });
+    expect(out?.env).toMatchObject({ SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'k', CLOUDFLARE_API_TOKEN: '', JEV_API_KEY: '', SCK_PREVIEW_SECRET: '', SCK_SANDBOX: 'employee' });
     expect(h.lookups()).toBe(0);
   });
 
@@ -205,6 +208,7 @@ describe('agent.session_open hook', () => {
     const h = hook({ company: 'surreal-ck' });
     const first = await h.open({ ...base, reason: 'resume', env: {} });
     expect(first?.env.CLOUDFLARE_API_TOKEN).toBe('');
+    expect(first?.env.SCK_PREVIEW_SECRET).toBe('');
     // The resumed session carries no channel variable, so the sandbox marker is what keeps it sandboxed.
     expect(first?.env.SCK_SANDBOX).toBe('employee');
     await h.open({ ...base, reason: 'refresh', env: {} });
@@ -239,7 +243,7 @@ describe('agent.session_open hook with the zsh startup shim', () => {
     const out = await hook({}, { zdotdir }).open({ ...base, reason: 'create', env: launch });
     expect(out?.env.ZDOTDIR).toBe(zdotdir);
     expect(readFileSync(join(zdotdir, '.zshrc'), 'utf8')).toContain(`'/Users/x/.zshrc'`);
-    expect(readFileSync(join(zdotdir, '.zshrc'), 'utf8')).toContain('(CLOUDFLARE_|CF_API_|SURREAL|JEV_|TYPESAFE_|ELEVENLABS_|XI_API_KEY|COMPANY_|RUNNER_|IDP_|GATEWAY_)*');
+    expect(readFileSync(join(zdotdir, '.zshrc'), 'utf8')).toContain('(CLOUDFLARE_|CF_API_|SURREAL|JEV_|TYPESAFE_|ELEVENLABS_|XI_API_KEY|COMPANY_|RUNNER_|IDP_|GATEWAY_|SCK_PREVIEW_SECRET)*');
   });
 
   test('the shim sources the user\'s ZDOTDIR when they have one, and never itself', async () => {
@@ -327,10 +331,12 @@ test('archived history never requires a live model route, while an interactive r
  }finally{stop();}
 });
 
-test('原生执行端不向员工继承云端公司连接和执行端凭证环境', () => {
-  const inherited = { COMPANY_DB_TOKEN: 'fixture', RUNNER_CLIENT_SECRET: 'fixture', IDP_SECRET: 'fixture', GATEWAY_TOKEN: 'fixture', OPENAI_API_KEY: 'provider-login' };
-  const env = { ...inherited, ...scrubEnv({}, inherited) };
+test('原生执行端不向员工继承云端公司连接、执行端凭证与服务端预览签名密钥环境', () => {
+  const inherited = { COMPANY_DB_TOKEN: 'fixture', RUNNER_CLIENT_SECRET: 'fixture', IDP_SECRET: 'fixture', GATEWAY_TOKEN: 'fixture', SCK_PREVIEW_SECRET: 'fixture', OPENAI_API_KEY: 'provider-login' };
+  const env: Record<string, string> = { ...inherited, ...scrubEnv({ SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'channel-key' }, inherited) };
   expect(env.COMPANY_DB_TOKEN).toBe(''); expect(env.RUNNER_CLIENT_SECRET).toBe('');
   expect(env.IDP_SECRET).toBe(''); expect(env.GATEWAY_TOKEN).toBe('');
+  expect(env.SCK_PREVIEW_SECRET).toBe('');
+  expect(env.SCK_COMM_KEY).toBe('channel-key');
   expect(env.OPENAI_API_KEY).toBe('provider-login');
 });

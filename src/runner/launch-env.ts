@@ -10,6 +10,9 @@ import { join, resolve } from "node:path";
 const EXTERNAL = ["CLOUDFLARE_", "CF_API_", "SURREAL", "JEV_", "TYPESAFE_", "ELEVENLABS_", "XI_API_KEY", "COMPANY_", "RUNNER_", "IDP_", "GATEWAY_"];
 /** Plumbing variables only the company itself sets; a shell startup file never exports these. */
 const INTERNAL = ["SCK_OPS_", "SCK_PRODUCT_ENV", "SCK_MCP_TOKEN", "SCK_OWNER_TOKEN", "SCK_SERVICE_GATE", "SCK_EMPLOYEE_CREDENTIAL"];
+/** Server-side secrets kept in shell-shaped config (private/service.env is sourceable): blanked at
+ *  launch and stripped again after the user's shell startup files, which can re-export them. */
+const SERVER_PRIVATE = ["SCK_PREVIEW_SECRET"];
 
 export const SANDBOX_MARKER = { SCK_SANDBOX: "employee" } as const;
 const ZSH_STARTUP = [".zshenv", ".zprofile", ".zshrc", ".zlogin"];
@@ -19,12 +22,13 @@ type Env = Record<string, string | undefined>;
 const extras = (extra: string | undefined) => (extra ?? "").split(",").map(item => item.trim()).filter(Boolean);
 
 export function blockedPatterns(extra: string | undefined = process.env.SCK_SCRUB_ENV): string[] {
-  return [...EXTERNAL, ...INTERNAL, ...extras(extra)];
+  return [...EXTERNAL, ...INTERNAL, ...SERVER_PRIVATE, ...extras(extra)];
 }
 
-/** What a shell startup file could plausibly export: the plumbing variables are the company's own and are left out. */
+/** What a shell startup file could plausibly export: the plumbing variables are the company's own and are
+ *  left out, except the server-side secrets service.env holds, which a startup file can re-export. */
 export function externalPatterns(extra: string | undefined = process.env.SCK_SCRUB_ENV): string[] {
-  return [...EXTERNAL, ...extras(extra)];
+  return [...EXTERNAL, ...SERVER_PRIVATE, ...extras(extra)];
 }
 
 /**
