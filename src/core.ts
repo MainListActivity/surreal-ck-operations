@@ -2335,23 +2335,27 @@ export class SurrealCompanyCore implements CompanyCore {
   // ---------------------------------------------------------------- SYS05: typed waits
 
   private async assertCiBlockAllowed(proof: LeaseProof, employeeId: string, causes: string[], background: string[] = [], row?: TaskRow): Promise<void> {
+    if (isCiBlockCause(causes)) {
+      const taskId = proof.taskId;
+      const task = row ?? await this.db.select<TaskRow>(id('task',taskId));
+      // Do not expose source references, or spend GitHub reads, for a foreign/stale lease. The transition owns its error.
+      if (task && task.current_employee === employeeId && task.delivery_id === proof.deliveryId &&
+          task.fence === proof.fence && task.version === proof.expectedVersion && (task.lease_expires_at ?? 0) > Date.now()/1000 &&
+          task.acceptance_criteria?.some(ac => ac.required && ac.kind === 'machine' && ac.evidence === 'ci-run')) {
+        // Read the task's own sources, not just the employee's latest wording. The CI adapter decides from GitHub.
+        const [history] = await this.db.query<[Array<{evidence?: string}>]>(
+          "SELECT at,string::slice(evidence ?? '',0,10000) AS evidence FROM audit WHERE task=$task AND action IN ['checkpoint','submit','block','acceptance_evidence'] ORDER BY at DESC LIMIT 5;",
+          {task:id('task',taskId)});
+        const opsRepo = this.companyReleaseRepo ?? this.worktrees?.options.opsRepo ?? process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
+        const repo = task.code_repo_path ?? (task.context?.includes(opsRepo) ? opsRepo : task.worktree?.repo);
+        const source = await this.ciBillingCheck({head:task.acceptance_head,repo,
+          text:[...causes,...background,...(history ?? []).map(item => item.evidence ?? ''),task.context ?? ''].join('\n')});
+        if (source) refuseEmployeeCiBlock(source);
+      }
+    }
+    // The capability restriction applies whether or not a source could be read: billing co-occurrence
+    // in a cause clause never becomes an employee-owned blocker, and no wording exempts it.
     assertEmployeeCiBlockAllowed(...causes);
-    if (!isCiBlockCause(causes)) return;
-    const taskId = proof.taskId;
-    const task = row ?? await this.db.select<TaskRow>(id('task',taskId));
-    // Do not expose source references, or spend GitHub reads, for a foreign/stale lease. The transition owns its error.
-    if (!task || task.current_employee !== employeeId || task.delivery_id !== proof.deliveryId ||
-        task.fence !== proof.fence || task.version !== proof.expectedVersion || (task.lease_expires_at ?? 0) <= Date.now()/1000) return;
-    if (!task?.acceptance_criteria?.some(ac => ac.required && ac.kind === 'machine' && ac.evidence === 'ci-run')) return;
-    // Read the task's own sources, not just the employee's latest wording. The CI adapter decides from GitHub.
-    const [history] = await this.db.query<[Array<{evidence?: string}>]>(
-      "SELECT at,string::slice(evidence ?? '',0,10000) AS evidence FROM audit WHERE task=$task AND action IN ['checkpoint','submit','block','acceptance_evidence'] ORDER BY at DESC LIMIT 5;",
-      {task:id('task',taskId)});
-    const opsRepo = this.companyReleaseRepo ?? this.worktrees?.options.opsRepo ?? process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
-    const repo = task.code_repo_path ?? (task.context?.includes(opsRepo) ? opsRepo : task.worktree?.repo);
-    const source = await this.ciBillingCheck({head:task.acceptance_head,repo,
-      text:[...causes,...background,...(history ?? []).map(item => item.evidence ?? ''),task.context ?? ''].join('\n')});
-    if (source) refuseEmployeeCiBlock(source);
   }
 
   /**

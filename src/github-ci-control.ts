@@ -5,19 +5,32 @@ import { git } from './company-release.ts';
 import { githubRepoSlug } from './external-actions.ts';
 
 const CI = /github|git\s*hub|\bCI\b|github-actions|actions\/runs\/|workflow/i;
-const BILLING = /billing|account payments|spending[\s_-]*limit|账单|计费|付款|支付失败|支出上限|消费上限|账户问题/i;
+const BILLING = /billing|account payments?|payments?|spending[\s_-]*limit|unpaid|overdue|delinquent|账单|计费|付款|支付失败|支出上限|消费上限|账户问题|欠费|逾期/i;
+// Acts and objects that name a fetched document, quotation or side citation. A citation clause is the
+// only wording that is not a CI cause on its own; the label can never exempt an attached state claim.
+const CITATION = /抓取|引文|引述|引用|旁证|核对|核查|摘自|摘录|仅作|仅供|详见|参阅|查阅|文档内容|页面内容|资料内容|页内容|self-serve|\.md\b|release\s*页|fetch|cited|quotation|for reference|reference only/i;
+// Negated mentions and purely evidentiary phrases never assert a current CI or billing state. Paid-word
+// negations are listed first so a bare 未付/逾期 below stays affirmative.
+const NON_CLAIM = /(?:无需|不需要|不要求|不用)[\u4e00-\u9fff]{0,4}(?:付款|支付|缴费|提高[\u4e00-\u9fff]{0,4}上限)|(?:无法|不能|不可|难以|不足以)作为|仅(?:作|为|供)[\u4e00-\u9fff]{0,6}旁证|仅供参考|引文与报告一致|(?:未|无|没有|没|不|并未|并无|未曾|从未|不含|未见)[\u4e00-\u9fff]{0,4}(?:失败|阻塞|受阻|停滞|异常|错误|问题|逾期|欠费|故障|障碍)/g;
+// An affirmative claim about the current CI or billing state. Plain waits count only via WAIT_CLAIM,
+// whose awaited object must be the CI, the account or its recovery.
+const STATE_CLAIM = /失败|阻塞|受阻|停滞|暂停|未启动|没启动|未执行|没执行|未通过|没通过|未运行|没运行|未解决|没解决|未恢复|没恢复|未付|没付|逾期|欠费|已达上限|达到上限|超出上限|超过上限|提高上限|需[\u4e00-\u9fff]{0,6}付款|需[\u4e00-\u9fff]{0,6}支付|要求付款|要求支付|无法|不能|不可|难以|未能|没能|issues?\b|failed|failure|reached|exceeded|raised|unpaid|overdue|delinquent|suspended|disabled|not started/i;
+const WAIT_CLAIM = /(?:\bCI\b|Actions|workflow|检查|作业|账户|账单|billing|payment).{0,6}(?:等待|排队|等候|waiting|pending)|(?:等待|排队|等候|waiting|wait\s+for|pending|on\s+hold).{0,12}(?:\bCI\b|Actions|workflow|检查|作业|账户|账单|付款|支付|计费|billing|payment|恢复|解除)/i;
 function ciCauseClauses(fields: Array<string | undefined>): string[] {
   return fields.filter(field => typeof field === 'string').flatMap(field => field!.split(/[\n;；。]/)).filter(text => {
     const unstarted = /(?:检查|作业).{0,30}(?:未启动|没有启动|未执行|没有执行|未通过|没有通过)/.test(text);
     if (!CI.test(text) && !unstarted) return false;
-    // Naming GitHub and a billing document is not an execution problem. Require a problem predicate,
-    // not an employee assertion that the text is "only a reference" (which must never bypass the gate).
+    // CI and billing words sharing a clause enter adjudication regardless of phrasing — a fixed problem
+    // vocabulary must never be the toll. The only exclusion is a pure citation clause: it names fetched
+    // or quoted material and asserts no current state once negated and evidentiary mentions are removed.
     // Keep terse billing labels conservative for callers that supply a title rather than a sentence.
     const billingLabel = /^\s*(?:GitHub(?:\s+Actions|\s+CI)?|CI|workflow)\s*[:：-]?\s*(?:Billing(?:\s*&\s*plans)?|spending[\s_-]*limit|支出上限|消费上限|账单|计费)\s*$/i.test(text);
-    const problem = unstarted || /失败|阻塞|受阻|未启动|没有启动|未执行|没有执行|未通过|没有通过|无法|不能|(?:\bCI\b|Actions|workflow|检查|作业).{0,30}(?:等待|排队)|等待.{0,30}(?:\bCI\b|Actions|workflow|付款|支付|计费)|\b(?:blocked|pending|failed|failure|not started|not run|not executed)\b|spending[\s_-]*limit.{0,15}(?:reached|exceeded)/i.test(text);
-    if (!problem && !billingLabel) return false;
+    if (!billingLabel && CITATION.test(text)) {
+      const residual = text.replace(NON_CLAIM, '');
+      if (!STATE_CLAIM.test(residual) && !WAIT_CLAIM.test(residual)) return false;
+    }
     const completed = /已(?:由系统)?(?:完成|通过|豁免|记录|判定)|already (?:passed|completed|waived)/i.test(text);
-    return !completed || unstarted || /仍.{0,10}(?:失败|阻塞)|(?:未|没有)(?:通过|启动|执行)|\b(?:blocked|pending)\b/i.test(text);
+    return !completed || unstarted || /仍.{0,10}(?:失败|阻塞|受阻)|(?:未|没有|没|尚未)(?:通过|启动|执行|运行|解决|恢复|付|付款|支付|结清)|(?:已|仍)(?:逾期|欠费)|已达上限|达到上限|超出上限|超过上限|\b(?:blocked|pending|unpaid|overdue|delinquent|still failing)\b/i.test(text);
   });
 }
 /** Only the current CI cause triggers adjudication, not a completed CI item beside an unrelated business wait. */

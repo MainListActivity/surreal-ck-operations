@@ -34,6 +34,43 @@ test('当前 CI 原因不能通过附加旁证声明或已完成背景逃逸', (
   expect(isCiBlockCause(['CI 等待检查结果'])).toBe(true);
 });
 
+// A billing blocker owes no fixed problem vocabulary: every phrasing of a current CI billing
+// obstruction is a CI cause and refuses, even dressed as a citation or a completed-CI report.
+test('真实 CI 计费阻塞与等待的全部写法仍被拒绝', () => {
+  for (const text of [
+    'GitHub CI 账单未付，需老板处理。',
+    'GitHub CI 账单需老板付款，才能跑 workflow。',
+    'GitHub CI billing issue; waiting for owner payment.',
+    'GitHub Actions spending limit needs to be raised before jobs can run.',
+    'GitHub CI 账单已逾期，需老板付款后才能继续。',
+    'GitHub CI 账单需付款，老板付款后再运行。',
+    'GitHub Actions 因账单问题未运行，需老板付款。',
+    'GitHub CI 暂停，原因是账户付款问题，需老板付款。',
+    'GitHub CI 显示 spending limit 已达上限，需老板提高上限。',
+    'CI 账户问题未解决，需老板处理。',
+    'GitHub CI 已通过（计费页已核对）；但 CI 账单未付，需老板付款。',
+    'GitHub CI 已通过，但账单未付需老板付款。',
+    'GitHub CI 账单未付，以上摘自计费文档。',
+    '引文核对无误；GitHub CI 账单需付款。',
+  ]) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+});
+
+// The mirror image of the rejections above: citation clauses that only describe fetched or quoted
+// material, including negated and evidentiary mentions, assert no current CI state at all.
+test('参考段落变体只描述资料内容，不是当前 CI 原因', () => {
+  for (const text of [
+    '本轮重新抓取计费页和 GitHub release 页，引文与报告一致，未发现失败。',
+    '本轮核对计费文档；GitHub release 页无法作为 CI 判定依据，仅作研究旁证。',
+    '已抓取 GitHub 计费页面，页面内容无阻塞说明，等待内部元数据处置。',
+  ]) {
+    expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
+    expect(isCiBlockCause([text])).toBe(false);
+  }
+});
+
 test('CI billing blockers are system-owned; ordinary invoices and real test failures remain separate', () => {
   for (const text of ['GitHub CI 账单失败，要求付款', 'CI 因计费未启动', 'GitHub Actions spending limit reached',
     'CI: account payments have failed', 'GitHub Billing & plans', 'workflow 支出上限']) {

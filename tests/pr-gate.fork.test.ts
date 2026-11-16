@@ -70,7 +70,11 @@ run('旁证报告经真实 Core.block 正常受阻、一次审计、owner恢复�
     sourceReads++;
     return { runUrl: 'https://github.com/o/r/actions/runs/9', sha: 'a'.repeat(40) };
   } });
-  for (const text of [referenceSentence, referenceReport, 'GitHub CI 已完成，当前等待老板确认客户账单，未申请任何 CI 豁免。']) {
+  for (const text of [referenceSentence, referenceReport,
+    'GitHub CI 已完成，当前等待老板确认客户账单，未申请任何 CI 豁免。',
+    '本轮重新抓取计费页和 GitHub release 页，引文与报告一致，未发现失败。',
+    '本轮核对计费文档；GitHub release 页无法作为 CI 判定依据，仅作研究旁证。',
+    '已抓取 GitHub 计费页面，页面内容无阻塞说明，等待内部元数据处置。']) {
     const claim = await guarded.claim(eng, (await make('engineering', { acceptanceCriteria: ciCriteria })).id);
     expect(claim.task.acceptanceCriteria).toHaveLength(1);
     const proof = proofOf(claim), ev = evidence(text);
@@ -96,7 +100,7 @@ run('旁证报告经真实 Core.block 正常受阻、一次审计、owner恢复�
   expect(sourceReads).toBe(0);
 });
 
-run('真实Core拒绝当前CI计费阻塞/等待，省略计费词仍核验来源且拒绝前零副作用', async () => {
+run('真实Core拒绝当前CI计费阻塞/等待，每条写法都经来源核验且拒绝前零副作用', async () => {
   let sourceReads = 0;
   const guarded = new SurrealCompanyCore(db, { ciBillingCheck: async () => {
     sourceReads++;
@@ -104,16 +108,42 @@ run('真实Core拒绝当前CI计费阻塞/等待，省略计费词仍核验来�
   } });
   for (const text of ['GitHub CI 因账户付款失败未启动，等待老板付款。',
     'CI 等待账户问题解决后执行，本报告仅为旁证，不申请豁免。',
-    '检查未启动，需老板处理后才能继续。']) {
+    '检查未启动，需老板处理后才能继续。',
+    'GitHub CI 账单未付，需老板处理。',
+    'GitHub CI 账单需老板付款，才能跑 workflow。',
+    'GitHub CI billing issue; waiting for owner payment.',
+    'GitHub Actions spending limit needs to be raised before jobs can run.',
+    'GitHub CI 账单已逾期，需老板付款后才能继续。',
+    'GitHub CI 账单需付款，老板付款后再运行。',
+    'GitHub Actions 因账单问题未运行，需老板付款。',
+    'GitHub CI 暂停，原因是账户付款问题，需老板付款。',
+    'GitHub CI 显示 spending limit 已达上限，需老板提高上限。',
+    'CI 账户问题未解决，需老板处理。',
+    'GitHub CI 已通过（计费页已核对）；但 CI 账单未付，需老板付款。']) {
     const claim = await guarded.claim(eng, (await make('engineering', { acceptanceCriteria: ciCriteria })).id);
     const before = await guarded.getTask(gm, claim.task.id);
     const history = await guarded.history(gm, claim.task.id);
+    const reads = sourceReads;
     await expect(guarded.block(eng, proofOf(claim), 'owner', evidence(text))).rejects.toMatchObject({ code: 'invalid' });
+    // Every cause phrasing enters trusted-source verification before the refusal lands.
+    expect(sourceReads).toBe(reads + 1);
     expect(await guarded.getTask(gm, claim.task.id)).toEqual(before);
     expect(await guarded.history(gm, claim.task.id)).toEqual(history);
     await guarded.release(eng, proofOf(claim), evidence('测试拒绝校验完成，释放隔离测试租约'));
   }
+  expect(sourceReads).toBe(14);
+});
+
+run('真实Core对非计费CI失败仍正常受阻：核验通过且无豁免时接受普通阻塞', async () => {
+  let sourceReads = 0;
+  const guarded = new SurrealCompanyCore(db, { ciBillingCheck: async () => { sourceReads++; return undefined; } });
+  const claim = await guarded.claim(eng, (await make('engineering', { acceptanceCriteria: ciCriteria })).id);
+  const proof = proofOf(claim), ev = evidence('GitHub CI 断言测试失败，需修复后重跑。');
+  const blocked = await guarded.block(eng, proof, 'owner', ev);
+  expect(blocked.state).toBe('blocked');
   expect(sourceReads).toBe(1);
+  expect(await guarded.block(eng, proof, 'owner', ev)).toEqual(blocked);
+  expect((await guarded.history(gm, claim.task.id)).filter(h => h.action === 'block')).toHaveLength(1);
 });
 
 run('执行端invalid block超过十次仍pending，同一请求恢复后真实Core仅阻塞一次且可恢复', async () => {
