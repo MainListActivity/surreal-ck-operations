@@ -2419,10 +2419,12 @@ export class SurrealCompanyCore implements CompanyCore {
   /** The refusal text of a budget decision. It says what to do next, in fixed words, and never quotes the upstream. */
   private faultRefusalMessage(phase: FaultPhase, reason: string | undefined, nextAllowedAt: number | undefined,
     diagnostic: FaultDiagnostic | undefined): string {
+    // 截止时间写成绝对时间：员工与老板据此知道恢复窗口何时结束，不必猜。
+    const passedAt = nextAllowedAt === undefined ? '' : ` at ${new Date(nextAllowedAt).toISOString()}`;
     const text = reason === 'attempts_exhausted'
       ? 'the recovery budget for this operation is spent'
       : reason === 'deadline_passed'
-        ? 'the recovery deadline for this operation has passed'
+        ? `the recovery deadline for this operation has passed${passedAt}`
         : reason === 'min_interval'
           ? `the next attempt is allowed after ${new Date(nextAllowedAt ?? 0).toISOString()}`
           : reason === 'lease_expired'

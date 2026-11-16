@@ -46,15 +46,21 @@ test('真实 HTTP：健康检查只有发布状态，非法路径及错误代理
     expect(backend.server.hostname).toBe('127.0.0.1');
     const health = await fetch(new URL('/healthz', backend.server.url));
     expect(await health.json()).toEqual({ ok: true, ready: true, version: source.OWNER_RELEASE_VERSION, sha: source.OWNER_RELEASE_SHA });
-    for (const path of ['/', '/api-other', '/cron'])
-      expect((await fetch(new URL(path, backend.server.url))).status).toBe(404);
+    for (const path of ['/', '/api-other', '/cron']) {
+      const response = await fetch(new URL(path, backend.server.url));
+      expect(response.status).toBe(404);
+      // The entry's own refusals use the same envelope as the business errors, so a client reads one shape.
+      expect(await response.json()).toEqual({ ok: false, error: { code: 'not_found', message: '接口不存在' } });
+    }
     for (const key of [undefined, '', proxyKey.slice(1), proxyKey.slice(0, -1) + 'x']) {
       const response = await fetch(new URL('/api/check', backend.server.url), {
         method: 'POST', body: 'fixture body must not reach business',
         headers: key === undefined ? {} : { 'x-company-proxy-key': key },
       });
       expect(response.status).toBe(403);
-      expect(await response.text()).not.toContain(proxyKey);
+      const text = await response.text();
+      expect(text).not.toContain(proxyKey);
+      expect(JSON.parse(text)).toEqual({ ok: false, error: { code: 'forbidden', message: '禁止访问' } });
       expect(response.headers.get('x-company-proxy-key')).toBeNull();
     }
     expect(calls).toBe(0);
@@ -118,7 +124,7 @@ test('异常响应不泄露业务异常或代理密钥', async () => {
   try {
     const response = await fetch(new URL('/api/check', backend.server.url), { headers });
     expect(response.status).toBe(500);
-    expect(await response.json()).toEqual({ error: 'Internal Server Error' });
+    expect(await response.json()).toEqual({ ok: false, error: { code: 'upstream_error', message: '服务暂时出错，请稍后重试' } });
   } finally { await backend.stop(); }
 });
 

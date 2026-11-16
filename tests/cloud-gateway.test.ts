@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { CompanyError } from '../src/core-errors.ts';
 import { GatewayClient, GatewayError } from '../src/cloud/gateway.ts';
+import { failureOf } from '../owner-end/src/errors.ts';
+import { jobFailure } from '../owner-end/src/jobs.ts';
 import { createOwnerJobStore, pendingReply, type OwnerJobStore, type Reply } from './support/owner-job-contract.ts';
 
 const URL_BASE = 'https://gw.example.test';
@@ -85,12 +87,39 @@ describe('GatewayClient.call', () => {
     expect(((await catchError(client.call(TOKEN, 'x.y'))) as GatewayError).code).toBe('upstream_error');
   });
 
-  test('非 JSON 响应抛 upstream_error', async () => {
-    const { fn } = fakeFetch(() => new Response('<html>bad gateway</html>', { status: 502 }));
+  test('非 JSON 响应抛 upstream_error：说明没有可读的回执，未受理，正文不回显', async () => {
+    const { fn } = fakeFetch(() => new Response('<html>bad gateway secret-page</html>', { status: 502 }));
     const client = new GatewayClient({ url: URL_BASE, fetch: fn });
-    const error = await catchError(client.call(TOKEN, 'x.y'));
-    expect((error as GatewayError).code).toBe('upstream_error');
-    expect((error as GatewayError).message).toBe('HTTP 502');
+    const error = await catchError(client.call(TOKEN, 'x.y')) as GatewayError;
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toBe('网关返回了非 JSON 响应（HTTP 502），没有可读的回执');
+    expect(error.message).not.toContain('secret-page');
+    expect(error.accepted).toBe(false);
+  });
+
+  test.each([408, 504, 524])('超时类的非 JSON 响应（HTTP %i）说明为网关超时，仍没有回执，业务命令只提交一次', async status => {
+    const { fn, calls } = fakeFetch(() => new Response('<html>timeout</html>', { status }));
+    const client = new GatewayClient({ url: URL_BASE, fetch: fn });
+    const error = await catchError(client.call(TOKEN, 'ops_login', { alias: 'QA1' })) as GatewayError;
+    expect(error.message).toBe(`网关超时（HTTP ${status}），没有可读的回执`);
+    expect(error.accepted).toBe(false);
+    expect(calls.map(call => call.body.command)).toEqual(['ops_login']);
+  });
+
+  const BAD_SHAPES: Array<[string, () => Response, string]> = [
+    ['错误字段是字符串', () => json({ ok: false, error: 'boom' }, 500), '网关返回的错误格式不标准（HTTP 500）'],
+    ['缺少 ok 字段', () => json({ result: 1 }, 200), '网关响应缺少 ok 字段（HTTP 200）'],
+    ['回执是数组', () => json([1, 2], 200), '网关响应不是对象（HTTP 200）'],
+    ['回执是 null', () => json(null, 200), '网关响应不是对象（HTTP 200）'],
+  ];
+  test.each(BAD_SHAPES)('回执形状不对（%s）：明确失败，未受理，业务命令只提交一次', async (_label, respond, message) => {
+    const { fn, calls } = fakeFetch(respond);
+    const client = new GatewayClient({ url: URL_BASE, fetch: fn });
+    const error = await catchError(client.call(TOKEN, 'x.y')) as GatewayError;
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toBe(message);
+    expect(error.accepted).toBe(false);
+    expect(calls).toHaveLength(1);
   });
 
   test('错误信息中的令牌被脱敏', async () => {
@@ -292,5 +321,81 @@ describe('GatewayClient 轮询老板端作业（真实 ops.job.get 回执）', (
     expect((error as GatewayError).message).toBe('作业视图格式错误');
     expect((error as GatewayError).accepted).toBe(true);
     expect(calls.map(call => call.body.command)).toEqual(['ops_login', 'ops.job.get']);
+  });
+});
+
+describe('GatewayClient 回执：作业号、类别与阶段', () => {
+  test('同步失败的老板端真实回执（等待时限内作业已失败）：已受理，作业号、类别与阶段都保留，业务命令只提交一次', async () => {
+    const { fn, calls } = fakeFetch(() => reply(failureOf(jobFailure({
+      code: 'login_failed', jobId: 'job-sync-1', message: 'IdP rejected the login (invalid_credentials); stage=login',
+    }))));
+    const client = new GatewayClient({ url: URL_BASE, fetch: fn, pollMs: 0, sleep: noSleep });
+
+    const error = await catchError(client.call(TOKEN, 'ops_login', { alias: 'QA1' })) as GatewayError;
+    expect(error.code).toBe('login_failed');
+    expect(error.accepted).toBe(true);
+    expect(error.jobId).toBe('job-sync-1');
+    expect(error.stage).toBe('login');
+    expect(error.message).toContain('IdP rejected the login');
+    expect(calls.map(call => call.body.command)).toEqual(['ops_login']);
+  });
+
+  test('同步失败且没有作业号（入队前被拒）：未受理，没有作业号与阶段', async () => {
+    const { fn } = fakeFetch(() => fail('forbidden', '没有权限', 403));
+    const client = new GatewayClient({ url: URL_BASE, fetch: fn });
+    const error = await catchError(client.call(TOKEN, 'x.y')) as GatewayError;
+    expect(error.code).toBe('forbidden');
+    expect(error.accepted).toBe(false);
+    expect(error.jobId).toBeUndefined();
+    expect(error.stage).toBeUndefined();
+  });
+
+  test('作业类别取 jobCode：接口码 upstream_error 不覆盖作业原来的类别', async () => {
+    const { fn } = fakeFetch(() => json({ ok: false, error: { code: 'upstream_error', jobCode: 'forbidden', message: '拒绝', jobId: 'job-c1' } }, 502));
+    const client = new GatewayClient({ url: URL_BASE, fetch: fn });
+    const error = await catchError(client.call(TOKEN, 'x.y')) as GatewayError;
+    expect(error.code).toBe('forbidden');
+    expect(error.accepted).toBe(true);
+  });
+
+  test('作业类别是 unauthorized（老板端映射为 502）：类别保留给调用方，但已受理，不当作网关鉴权失败重提', async () => {
+    const { fn, calls } = fakeFetch(() => reply(failureOf(jobFailure({ code: 'unauthorized', jobId: 'job-u1', message: '登录令牌已失效' }))));
+    const client = new GatewayClient({ url: URL_BASE, fetch: fn });
+    const error = await catchError(client.call(TOKEN, 'ops_authfail', {})) as GatewayError;
+    expect(error.code).toBe('unauthorized');
+    expect(error.accepted).toBe(true);
+    expect(error.jobId).toBe('job-u1');
+    expect(calls).toHaveLength(1);
+  });
+
+  test('jobCode 不认识：按上游失败，说明保留', async () => {
+    const { fn } = fakeFetch(() => json({ ok: false, error: { code: 'upstream_error', jobCode: 'weird_code', message: '奇怪', jobId: 'job-c2' } }, 502));
+    const client = new GatewayClient({ url: URL_BASE, fetch: fn });
+    const error = await catchError(client.call(TOKEN, 'x.y')) as GatewayError;
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toBe('奇怪');
+  });
+
+  test('阶段从截断前的原文取：同步失败的说明超过 200 字时，阶段仍在，说明正文被截断', async () => {
+    const message = `${'x'.repeat(260)}; stage=exchange`;
+    const { fn } = fakeFetch(() => reply(failureOf(jobFailure({ code: 'login_failed', jobId: 'job-long', message }))));
+    const client = new GatewayClient({ url: URL_BASE, fetch: fn });
+    const error = await catchError(client.call(TOKEN, 'ops_login', { alias: 'QA1' })) as GatewayError;
+    expect(error.stage).toBe('exchange');
+    expect(error.message).not.toContain('stage=');
+  });
+
+  test('执行端写回的失败说明超过 200 字：阶段仍由执行端记录取得，作业号与轮询的作业一致', async () => {
+    const store = createOwnerJobStore();
+    const { fn, calls } = bossGateway(store, (poll, id) => {
+      if (poll === 1) store.fail(id, new CompanyError('login_failed', `${'y'.repeat(260)}; stage=consent`));
+    });
+    const client = new GatewayClient({ url: URL_BASE, fetch: fn, pollMs: 0, sleep: noSleep });
+
+    const error = await catchError(client.call(TOKEN, 'ops_login', { alias: 'QA1' })) as GatewayError;
+    expect(error.code).toBe('login_failed');
+    expect(error.accepted).toBe(true);
+    expect(error.stage).toBe('consent');
+    expect(error.jobId).toBe((calls[1]!.body.input as { id: string }).id);
   });
 });

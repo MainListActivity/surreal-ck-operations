@@ -20,15 +20,33 @@ function writeStdout(text: string): void {
 /** Codes a repeat of the same call may clear. Every other refusal needs the caller to change something. */
 const RETRYABLE = new Set(['temporarily_unavailable', 'comm_timeout', 'comm_unavailable', 'upstream_unavailable', 'upstream_error']);
 
+/** Where a cloud job stands when the call failed: its id, whether the command was accepted, and the login stage. */
+interface Receipt {
+  jobId?: string;
+  accepted?: boolean;
+  stage?: string;
+}
+
+/** Only the job facts reach the caller; the rest of the sidecar reply stays inside the client. */
+function receiptOf(res: CommResponse): Receipt {
+  return {
+    ...(typeof res.jobId === 'string' ? { jobId: res.jobId } : {}),
+    ...(typeof res.accepted === 'boolean' ? { accepted: res.accepted } : {}),
+    ...(typeof res.stage === 'string' ? { stage: res.stage } : {}),
+  };
+}
+
 /**
  * Every outcome is one line of JSON on stdout, so a caller can always JSON.parse it (SYS01 AC03). The reason also
  * goes to stderr, and the exit status is 1. `code` is the recoverable error class.
  */
-function fail(code: string, message: string): never {
+function fail(code: string, message: string, receipt: Receipt = {}): never {
   // A sidecar refusal already reads "code: reason"; keep that text once rather than repeating the code.
   const error = message.startsWith(`${code}:`) ? message : `${code}: ${message}`;
+  // An accepted command may already be running: the caller reads its job by id and does not submit it again.
+  const retryable = RETRYABLE.has(code) && receipt.accepted !== true;
   try {
-    writeStdout(`${JSON.stringify({ ok: false, code, error, retryable: RETRYABLE.has(code) })}\n`);
+    writeStdout(`${JSON.stringify({ ok: false, code, error, retryable, ...receipt })}\n`);
   } catch {
     // The reader has gone away; the exit status still reports the failure.
   }
@@ -105,7 +123,7 @@ async function main(): Promise<void> {
     const res = readJsonFile<CommResponse>(resFile);
     if (res) {
       try { unlinkSync(resFile); } catch { /* consumed race */ }
-      if (!res.ok) fail(codeOf(res.error), res.error ?? 'comm request failed');
+      if (!res.ok) fail(codeOf(res.error), res.error ?? 'comm request failed', receiptOf(res));
       // The sidecar attaches the employee's unacked holder notices to a successful reply, fitted to the reply's
       // budget. Keep the plain data shape when there are none (one JSON line, unchanged), and surface them as a
       // top-level `notices` key otherwise, with the cut when some did not fit the budget (those stay unacked and

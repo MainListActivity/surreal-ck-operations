@@ -7,12 +7,18 @@ export class GatewayError extends Error {
   readonly code: string;
   /** 业务命令已被网关接受（作业已排队）之后的失败：命令可能已在执行，调用方不得据此自动重新提交。 */
   readonly accepted: boolean;
+  /** 作业编号。作业已排队时带上，调用方凭它用 ops.job.get 查询，不必重新提交。 */
+  readonly jobId?: string;
+  /** 登录流程中失败的阶段（authorize、login、consent、exchange），执行端说明里有才带上。 */
+  readonly stage?: string;
 
-  constructor(code: string, message: string, accepted = false) {
+  constructor(code: string, message: string, accepted = false, facts: { jobId?: string; stage?: string } = {}) {
     super(message);
     this.name = 'GatewayError';
     this.code = code;
     this.accepted = accepted;
+    this.jobId = facts.jobId;
+    this.stage = facts.stage;
   }
 }
 
@@ -25,16 +31,11 @@ export interface GatewayOptions {
   now?: () => number;
 }
 
-const KNOWN_CODES = new Set([
-  'unauthorized',
-  'forbidden',
-  'invalid',
-  'not_found',
-  'conflict',
-  'unavailable',
-  'pending',
-  'upstream_error',
-]);
+/** 回执里认识的错误码：接口码，加上执行端作业失败时保留的公司错误码（如 login_failed）。 */
+const KNOWN_CODES: ReadonlySet<string> = new Set<string>([...CORE_ERROR_CODES, 'pending']);
+
+/** 超时类的 HTTP 状态：这类响应没有回执，无法判断作业是否已排队。 */
+const TIMEOUT_STATUS: ReadonlySet<number> = new Set([408, 504, 524]);
 
 function normalizeCode(code: unknown): string {
   return typeof code === 'string' && KNOWN_CODES.has(code) ? code : 'upstream_error';
@@ -45,7 +46,16 @@ function safeMessage(message: unknown): string {
   return typeof message === 'string' ? redactText(clip(message, 200)) : '';
 }
 
-type Outcome = { ok: true; result: unknown } | { ok: false; code: string; message: string };
+/** 登录流程的阶段标记 stage=…（src/ops/idp.ts 写入）。阶段只会是这四个之一；说明被截断时仍从原文取。 */
+const STAGE_MARK = /\bstage=(authorize|login|consent|exchange)\b/;
+
+function stageOf(text: string): string | undefined {
+  return STAGE_MARK.exec(text)?.[1];
+}
+
+type Outcome =
+  | { ok: true; result: unknown }
+  | { ok: false; code: string; message: string; jobId?: string; stage?: string };
 
 const defaultSleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
@@ -74,10 +84,17 @@ export class GatewayClient {
     }
     const first = await this.send(token, command, input);
     if (first.ok) return first.result;
-    if (first.code !== 'pending') throw new GatewayError(first.code, first.message);
-    return this.poll(token, first.message).catch((error: unknown) => {
-      throw acceptedError(error);
-    });
+    if (first.code === 'pending') {
+      const jobId = first.jobId ?? first.message;
+      return this.poll(token, jobId).catch((error: unknown) => {
+        throw acceptedError(error, jobId);
+      });
+    }
+    // 同步路径：执行端在等待时限内就结束了作业。回执带 jobId 即表示作业已排队，按已受理处理，调用方不得重提。
+    if (first.jobId !== undefined) {
+      throw new GatewayError(first.code, first.message, true, { jobId: first.jobId, stage: first.stage });
+    }
+    throw new GatewayError(first.code, first.message);
   }
 
   private async poll(token: string, id: string): Promise<unknown> {
@@ -86,18 +103,19 @@ export class GatewayClient {
     for (;;) {
       const out = await this.send(token, 'ops.job.get', { id });
       if (!out.ok) {
-        if (out.code !== 'pending') throw new GatewayError(out.code, out.message);
+        if (out.code !== 'pending') throw new GatewayError(out.code, out.message, false, { jobId: id });
       } else {
         const job = parseJob(out.result, id);
         if (job.state === 'done') return job.result;
         if (job.state === 'error') {
           const failed = jobFailureOf(job.error);
           const detail = safeMessage(failed.detail);
-          throw new GatewayError(failed.code, detail ? `作业执行失败：${detail}` : '作业执行失败');
+          throw new GatewayError(failed.code, detail ? `作业执行失败：${detail}` : '作业执行失败', false,
+            { jobId: id, stage: stageOf(failed.detail) });
         }
       }
       if (this.now() - started >= this.pollTimeoutMs) {
-        throw new GatewayError('pending', '作业仍在执行，稍后再取');
+        throw new GatewayError('pending', '作业仍在执行，稍后再取', false, { jobId: id });
       }
       await this.sleep(this.pollMs);
     }
@@ -124,25 +142,38 @@ export class GatewayClient {
     try {
       body = JSON.parse(text);
     } catch {
-      throw new GatewayError('upstream_error', `HTTP ${res.status}`);
+      // 超时或上游的错误页：没有回执，不能说明作业是否已排队。正文不回显。
+      const label = TIMEOUT_STATUS.has(res.status) ? '网关超时' : '网关返回了非 JSON 响应';
+      throw new GatewayError('upstream_error', `${label}（HTTP ${res.status}），没有可读的回执`);
     }
-    if (!body || typeof body !== 'object') throw new GatewayError('upstream_error', '网关响应格式错误');
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      throw new GatewayError('upstream_error', `网关响应不是对象（HTTP ${res.status}）`);
+    }
     const envelope = body as { ok?: unknown; result?: unknown; error?: unknown };
     if (envelope.ok === true) return { ok: true, result: envelope.result };
-    if (envelope.ok === false && envelope.error && typeof envelope.error === 'object') {
-      const err = envelope.error as { code?: unknown; message?: unknown };
-      // pending 时 message 即作业 id，不做脱敏截断。
-      const message = normalizeCode(err.code) === 'pending' ? String(err.message ?? '') : safeMessage(err.message);
-      return { ok: false, code: normalizeCode(err.code), message };
+    if (envelope.ok !== false) throw new GatewayError('upstream_error', `网关响应缺少 ok 字段（HTTP ${res.status}）`);
+    if (!envelope.error || typeof envelope.error !== 'object') {
+      throw new GatewayError('upstream_error', `网关返回的错误格式不标准（HTTP ${res.status}）`);
     }
-    throw new GatewayError('upstream_error', '网关响应格式错误');
+    const err = envelope.error as { code?: unknown; message?: unknown; jobId?: unknown; jobCode?: unknown };
+    const jobId = typeof err.jobId === 'string' && err.jobId !== '' && err.jobId.length <= 200 ? err.jobId : undefined;
+    // 执行端作业失败时 jobCode 是作业的公司错误码（如 login_failed），按它还原类别；code 只是接口码。
+    const code = normalizeCode(err.jobCode ?? err.code);
+    const raw = typeof err.message === 'string' ? err.message : '';
+    // pending 时 message 即作业 id，不做脱敏截断。
+    if (code === 'pending') return { ok: false, code, message: raw, jobId };
+    // 阶段从截断前的原文取，截断只影响说明文字。
+    const stage = jobId === undefined ? undefined : stageOf(raw);
+    return { ok: false, code, message: safeMessage(raw), jobId, stage };
   }
 }
 
 /** 作业已排队之后的任何失败，都以 accepted 形式交给调用方；未知的内部错误按上游失败处理，不回显原文。 */
-function acceptedError(error: unknown): GatewayError {
-  if (error instanceof GatewayError) return new GatewayError(error.code, error.message, true);
-  return new GatewayError('upstream_error', '作业取回失败', true);
+function acceptedError(error: unknown, jobId: string): GatewayError {
+  if (error instanceof GatewayError) {
+    return new GatewayError(error.code, error.message, true, { jobId: error.jobId ?? jobId, stage: error.stage });
+  }
+  return new GatewayError('upstream_error', '作业取回失败', true, { jobId });
 }
 
 type JobState = 'queued' | 'running' | 'done' | 'error';
@@ -158,8 +189,8 @@ function isJobState(value: unknown): value is JobState {
   return value === 'queued' || value === 'running' || value === 'done' || value === 'error';
 }
 
-function malformedJob(): GatewayError {
-  return new GatewayError('upstream_error', '作业视图格式错误');
+function malformedJob(id: string): GatewayError {
+  return new GatewayError('upstream_error', '作业视图格式错误', false, { jobId: id });
 }
 
 /**
@@ -168,9 +199,9 @@ function malformedJob(): GatewayError {
  */
 function parseJob(value: unknown, id: string): JobView {
   const job = typeof value === 'object' && value !== null ? (value as { job?: unknown }).job : undefined;
-  if (typeof job !== 'object' || job === null || Array.isArray(job)) throw malformedJob();
+  if (typeof job !== 'object' || job === null || Array.isArray(job)) throw malformedJob(id);
   const view = job as Partial<JobView>;
-  if (view.id !== id || !isJobState(view.state)) throw malformedJob();
+  if (view.id !== id || !isJobState(view.state)) throw malformedJob(id);
   return view as JobView;
 }
 

@@ -39,7 +39,7 @@
 | `report.md` | 员工 | 交付说明；回合结束（`agent.turn_ended`）时 sidecar 将其内容作为 submit 证据提交 |
 | `blocker.md` | 员工 | 阻塞说明；同上时机作为 `report_blocker`（固定 to=owner）提交，优先级高于 report.md。订阅额度/限流阻塞时**首行**写 `quotaResetsAt: <ISO 8601 带偏移>`，等价于 `report_blocker` 的 `quotaResetsAt` |
 
-调用路径：员工执行 `sck call <tool> '<json>'`（`bin/sck` → `current/server/vendor/src/sck-cli.ts`）→ 存在 `SCK_COMM_DIR` 时进入 comm 模式：原子写 `req/<时间戳>-<随机>.json`（`writeFileAtomic`，先写 `.tmp-<pid>` 再 rename），然后每 200ms 轮询 `res/` 同名文件，读到即把 `data` 同步写完整个 stdout 再退出 0；`ok:false`（远端拒绝）与本地错误（参数非法、缺 `SCK_COMM_KEY`、comm 目录不可写、超时）都在 stdout 输出一行 JSON `{"ok":false,"code":…,"error":…,"retryable":…}`，原因写 stderr，退出 1；默认 120 秒无响应报 `comm_timeout`（媒体等长任务按工具放宽）。`sck list` 等价于 `call __list__`，返回基础工具加当前可用的 `ops_*` 清单。
+调用路径：员工执行 `sck call <tool> '<json>'`（`bin/sck` → `current/server/vendor/src/sck-cli.ts`）→ 存在 `SCK_COMM_DIR` 时进入 comm 模式：原子写 `req/<时间戳>-<随机>.json`（`writeFileAtomic`，先写 `.tmp-<pid>` 再 rename），然后每 200ms 轮询 `res/` 同名文件，读到即把 `data` 同步写完整个 stdout 再退出 0；`ok:false`（远端拒绝）与本地错误（参数非法、缺 `SCK_COMM_KEY`、comm 目录不可写、超时）都在 stdout 输出一行 JSON `{"ok":false,"code":…,"error":…,"retryable":…}`，原因写 stderr，退出 1；云端调用失败时这行 JSON 还附 `accepted`（作业是否已受理）。已受理（`accepted: true`）时另附 `jobId`，`retryable` 恒为 `false`，员工凭 `jobId` 用 `ops.job.get` 查结果，不得重新提交；登录流程失败时附 `stage`（`authorize`、`login`、`consent`、`exchange` 之一）。默认 120 秒无响应报 `comm_timeout`（媒体等长任务按工具放宽）。`sck list` 等价于 `call __list__`，返回基础工具加当前可用的 `ops_*` 清单。
 
 sidecar 侧每 400ms（`SWEEP_MS`）扫一遍活跃实例的 `req/`：读到的请求文件立即删除（一次性消费），校验 `key` 与本次 spawn 签发的 `SCK_COMM_KEY` 一致——不一致回 `stale comm key; this session predates a plugin restart`（key 只在本进程内存，插件重启 adopt 后没有可比对的旧 key，该校验自然放开），然后按工具名分发：
 

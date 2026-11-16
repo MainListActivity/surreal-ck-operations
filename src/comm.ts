@@ -15,6 +15,11 @@ export interface CommResponse {
   ok: boolean;
   data?: unknown;
   error?: string;
+  /** A cloud failure's job facts: the job id to read it by (ops.job.get), whether the command was accepted (queued,
+   *  so it must not be submitted again), and the login stage the failure came from. Never the reply body. */
+  jobId?: string;
+  accepted?: boolean;
+  stage?: string;
   /** Unacked holder notices the sidecar attached to a successful call (SYS-INT acceptance amendments), so an
    *  in-lease holder sees an amendment on its next sck call instead of waiting for the dispatcher's idle pass.
    *  They share the reply's budget: notices that did not fit are left unacked and attach again on the next call. */

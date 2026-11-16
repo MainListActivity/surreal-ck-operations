@@ -131,7 +131,7 @@ const until = async (fn: () => boolean, ms = 3000) => {
   throw new Error('condition not met');
 };
 
-interface Reply { ok: boolean; data?: unknown; error?: string }
+interface Reply { ok: boolean; data?: unknown; error?: string; accepted?: boolean; jobId?: string; stage?: string }
 
 let root: string;
 let runDir: string;
@@ -205,6 +205,12 @@ async function send(dir: string, key: string, name: string, tool: string, args: 
   await until(() => existsSync(path));
   replies.push(readFileSync(path, 'utf8'));
   return readJsonFile<Reply>(path)!;
+}
+
+/** The job id the gateway polled: the reply's jobId must name the same job, and the business command is not sent again. */
+function polledJobId(): string {
+  const poll = gwCalls.find(call => call.command === 'ops.job.get');
+  return String((poll?.input as { id?: unknown } | undefined)?.id ?? '');
 }
 
 function walk(dir: string): string[] {
@@ -383,14 +389,17 @@ describe('有租约的网关调用', () => {
     expect((reply.error ?? '').startsWith('forbidden: 作业执行失败：')).toBe(true);
     expect(reply.error).toContain('[已隐藏]');
     for (const token of issued) expect(reply.error ?? '').not.toContain(token);
+    // The job id survives the token replacement: the employee reads the job by it, and does not submit it again.
+    expect(reply.accepted).toBe(true);
+    expect(reply.jobId).toBe(polledJobId());
     expect(gwCalls.filter(call => call.command === 'ops_failjob')).toHaveLength(1);
   });
 
-  test('作业入队后轮询被拒（401）：不自动重提交业务命令，错误以 unauthorized 返回', async () => {
+  test('作业入队后轮询被拒（401）：不自动重提交业务命令，错误以 unauthorized 返回，作业号与已受理保留', async () => {
     pool = makePool({ cloud: makeCloud() });
     const { dir, key } = await claimFor(pool, 'eng-1', 'task-pollauth');
     const reply = await send(dir, key, 'r1', 'ops_pollauth', {});
-    expect(reply).toEqual({ ok: false, error: 'unauthorized: 令牌已失效' });
+    expect(reply).toEqual({ ok: false, error: 'unauthorized: 令牌已失效', accepted: true, jobId: polledJobId() });
     expect(gwCalls.filter(call => call.command === 'ops_pollauth')).toHaveLength(1);
   });
 
@@ -401,11 +410,11 @@ describe('有租约的网关调用', () => {
     pool = makePool({ cloud: makeCloud() });
     const { dir, key } = await claimFor(pool, 'eng-1', `task-${command}`);
     const reply = await send(dir, key, 'r1', command, {});
-    expect(reply).toEqual({ ok: false, error });
+    expect(reply).toEqual({ ok: false, error, accepted: true, jobId: polledJobId() });
     expect(gwCalls.filter(call => call.command === command)).toHaveLength(1);
   });
 
-  test('网关错误文本回显令牌时，返回给员工的内容已脱敏', async () => {
+  test('网关错误文本回显令牌时，返回给员工的内容已脱敏；入队前的拒绝不算已受理，没有作业号', async () => {
     pool = makePool({ cloud: makeCloud() });
     const { dir, key } = await claimFor(pool, 'eng-1', 'task-leak');
     const reply = await send(dir, key, 'r1', 'ops_leak', {});
@@ -413,6 +422,8 @@ describe('有租约的网关调用', () => {
     expect(reply.error).toContain('forbidden');
     expect(reply.error).toContain('[已隐藏]');
     for (const token of issued) expect(reply.error ?? '').not.toContain(token);
+    expect(reply.accepted).toBe(false);
+    expect(reply.jobId).toBeUndefined();
   });
 
   test('owner 级工具 def_list 以网关命令 def.list 转发', async () => {

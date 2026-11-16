@@ -96,7 +96,7 @@
 所有接口在 `/api` 下，只认 `Authorization: Bearer <访问令牌>`，不用 cookie。
 
 - 成功：`{"ok": true, "result": ...}`。
-- 失败：`{"ok": false, "error": {"code": "...", "message": "...", "jobId": "..."}}`。`jobId` 只在执行端作业相关的错误中出现。
+- 失败：`{"ok": false, "error": {"code": "...", "message": "...", "jobId": "...", "jobCode": "..."}}`。`jobId` 只在执行端作业相关的错误中出现；`jobCode` 与之同时出现，是作业的公司错误码（如 `login_failed`），`code` 仍是接口码。入口自己拒绝的请求（404、403、503）与 500 也用同一信封，`message` 为固定的中文提示。
 - 只有 `GET /api/config` 是裸 JSON。它在登录前读取，不包在 `ok` 里。
 
 | 方法与路径 | 身份 | 说明 |
@@ -113,13 +113,13 @@
 
 | `error.code` | HTTP | 含义 |
 | --- | --- | --- |
-| `unauthorized` | 401 | 没有令牌、令牌格式不对或验签失败（含 `login_failed`） |
+| `unauthorized` | 401 | 没有令牌、令牌格式不对或验签失败（含 `login_failed`）。执行端作业的失败不返回 401：接口码为 `upstream_error`，原类别在 `jobCode`，避免网页把老板登出 |
 | `forbidden` | 403 | 不是老板、员工无权调用、来源不同源、系统身份调用老板命令 |
 | `invalid` | 400 | 请求不合法（含 `response_too_large`） |
 | `not_found` | 404 | 接口或资源不存在 |
 | `conflict` | 409 | `worktree_busy`、`already_claimed`、`lease_expired`、`self_review`、`checkpoint_limit`、`payment_approval_required`、`limit_reached`、`snapshot_gone`、`retire_refused`、`ci_failed`（CI 已跑完且没有成功运行）。其它未列出的业务错误也归为这里 |
 | `pending` | 202 | 执行端作业超过 25 秒仍未完成。`error.message` 和 `error.jobId` 都是任务号，之后用 `ops.job.get` 取结果 |
-| `upstream_error` | 502 | 数据库、身份服务或译文服务失败（含占位标记丢失）。未知的内部错误也归入这里，只返回“服务暂时出错，请稍后重试” |
+| `upstream_error` | 502 | 数据库、身份服务或译文服务失败（含占位标记丢失）。未知的内部错误也归入这里，只返回“服务暂时出错，请稍后重试”。执行端作业失败时，具体类别见 `jobCode` |
 | `unavailable` | 503 | `temporarily_unavailable`、`not_configured`、`unavailable`、`ci_pending`（CI 尚未成功，等待后可再试） |
 
 ### 执行端作业

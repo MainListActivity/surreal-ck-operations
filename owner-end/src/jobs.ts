@@ -36,7 +36,7 @@ export interface JobRecord {
 
 export type JobOutcome =
   | { state: 'done'; result: unknown }
-  | { state: 'error'; code: string; message: string }
+  | { state: 'error'; code: string; message: string; jobId: string }
   | { state: 'pending' };
 
 /** 等待超时：任务仍在队列或执行中，调用方应返回 202 并附 jobId。 */
@@ -46,6 +46,17 @@ export class PendingJob extends Error {
   constructor(jobId: string) {
     super('执行端尚未完成，请稍后用 ops.job.get 取结果');
     this.name = 'PendingJob';
+    this.jobId = jobId;
+  }
+}
+
+/** 执行端作业失败：类别是公司错误码（未知的按上游失败），jobId 供调用方用 ops.job.get 定位这次作业。 */
+export class JobFailure extends CompanyError {
+  readonly jobId: string | undefined;
+
+  constructor(code: ErrorCode, message: string, jobId?: string) {
+    super(code, message);
+    this.name = 'JobFailure';
     this.jobId = jobId;
   }
 }
@@ -93,7 +104,17 @@ export { CORE_ERROR_CODES };
 
 const KNOWN_CODES: ReadonlySet<string> = new Set<string>(CORE_ERROR_CODES);
 
+/** 执行端把失败写成一句话 `${code}: ${message}`（src/cloud/ops-jobs.ts 的 failure），与网关客户端的读法一致。 */
+const JOB_ERROR_TEXT = /^([A-Za-z_][A-Za-z0-9_]*): ([\s\S]*)$/;
+
 function errorFields(value: unknown): { code: string; message: string } {
+  if (typeof value === 'string') {
+    // 一句话形式：类别与说明都从这句话还原。不是这种形式的，不猜类别，只给通用说明。
+    const match = JOB_ERROR_TEXT.exec(value);
+    if (!match) return { code: 'upstream_error', message: '执行端任务失败' };
+    const [, token = '', text = ''] = match;
+    return { code: KNOWN_CODES.has(token) ? token : 'upstream_error', message: text || '执行端任务失败' };
+  }
   const record = typeof value === 'object' && value !== null ? value as { code?: unknown; message?: unknown } : {};
   return {
     code: typeof record.code === 'string' ? record.code : 'upstream_error',
@@ -101,10 +122,10 @@ function errorFields(value: unknown): { code: string; message: string } {
   };
 }
 
-/** 把执行端记录的失败还原为 CompanyError，供接口统一映射。未知错误码按上游失败处理。 */
-export function jobFailure(outcome: { code: string; message: string }): CompanyError {
+/** 把执行端记录的失败还原为 JobFailure（仍是 CompanyError），供接口统一映射。未知错误码按上游失败处理。 */
+export function jobFailure(outcome: { code: string; message: string; jobId?: string }): JobFailure {
   const code = KNOWN_CODES.has(outcome.code) ? outcome.code as ErrorCode : 'upstream_error';
-  return new CompanyError(code, outcome.message);
+  return new JobFailure(code, outcome.message, outcome.jobId);
 }
 
 /** 等待任务结束，最多 waitMs 毫秒。 */
@@ -113,7 +134,7 @@ export async function waitForJob(db: Surreal, id: string, waitMs = JOB_WAIT_MS):
   for (;;) {
     const job = await readJob(db, id);
     if (job?.state === 'done') return { state: 'done', result: job.result };
-    if (job?.state === 'error') return { state: 'error', ...errorFields(job.error) };
+    if (job?.state === 'error') return { state: 'error', ...errorFields(job.error), jobId: id };
     if (Date.now() >= deadline) return { state: 'pending' };
     await sleep(POLL_MS);
   }
