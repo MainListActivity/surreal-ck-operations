@@ -274,7 +274,7 @@ export class WorktreeRegistry {
     await this.db.query('UPDATE ONLY $holder SET workspace_read_active = false;', { holder: record('employee', employeeId) });
     // Event point: the released session ref may have been the tree's last reference. A failed read keeps every tree and is audited.
     const ref = await this.db.select<{ tree?: RecordId }>(record('worktree_session_ref', employeeId))
-      .catch(async (error: unknown) => { await this.eventFailure('release', error); return undefined; });
+      .catch(async (error: unknown) => { await this.readFailure('release', error); return undefined; });
     if (ref?.tree) await this.reclaimEvent(String(ref.tree.id), 'release');
   }
 
@@ -389,9 +389,9 @@ export class WorktreeRegistry {
     return { open, leased };
   }
 
-  /** An event point whose reads fail reclaims nothing and keeps the scene. The failure is still written, not only logged. */
-  private async eventFailure(trigger: ReclaimTrigger, error: unknown): Promise<void> {
-    const reason = `event-reclaim-unreadable:${(error instanceof Error ? error.message : String(error)).slice(0, 180)}`;
+  /** A scan or event point whose facts cannot be read reclaims nothing and keeps the scene. The failure is written, not only logged. */
+  private async readFailure(trigger: ReclaimTrigger, error: unknown): Promise<void> {
+    const reason = `reclaim-unreadable:${(error instanceof Error ? error.message : String(error)).slice(0, 180)}`;
     await this.audit({ repo: '*', path: '*', event: 'fail', trigger, decision: 'scan', result: 'failed', reason }).catch(() => undefined);
   }
 
@@ -447,8 +447,11 @@ export class WorktreeRegistry {
   async reclaimAll(input: { trigger: ReclaimTrigger; dryRun?: boolean; repos?: string[]; treeId?: string } = { trigger: 'sweep' }): Promise<ReclaimResult> {
     const scanId = randomUUID();
     const result: ReclaimResult = { scanId, removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 };
-    const policy = await this.policy();
-    const known = await this.rows();
+    // The scan's first reads. A failure deletes nothing; it is audited, then rethrown for the caller to log or report.
+    const [policy, known] = await Promise.all([this.policy(), this.rows()]).catch(async (error: unknown) => {
+      await this.readFailure(input.trigger, error);
+      throw error;
+    });
     const repos = [...new Set(input.repos ?? [this.options.opsRepo, ...known.map(r => r.repo)])];
     const routine = input.trigger === 'sweep' && !input.dryRun;
     const header = () => this.audit({
@@ -667,14 +670,16 @@ export class WorktreeRegistry {
   /** Single-tree reclaim at a reference-release event point; resolves the tree's repo itself. */
   async reclaimEvent(treeId: string | undefined, trigger: ReclaimTrigger): Promise<ReclaimResult | undefined> {
     if (!treeId) return undefined;
+    let repo: string | undefined;
     try {
-      const row = await this.db.select<{ repo?: string }>(record('worktree', treeId));
-      return await this.reclaimAll({ trigger, treeId, repos: [row?.repo ?? this.options.opsRepo] });
+      repo = (await this.db.select<{ repo?: string }>(record('worktree', treeId)))?.repo;
     } catch (error) {
       // An event point whose reads fail reclaims nothing. The failure is audited for the next sweep and for operators.
-      await this.eventFailure(trigger, error);
+      await this.readFailure(trigger, error);
       return undefined;
     }
+    // reclaimAll audits its own failed reads before it rethrows, so the event point does not audit them a second time.
+    return this.reclaimAll({ trigger, treeId, repos: [repo ?? this.options.opsRepo] }).catch(() => undefined);
   }
 
   /** Event-triggered reclaim for a task that just reached a terminal done state. */

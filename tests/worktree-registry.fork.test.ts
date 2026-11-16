@@ -799,24 +799,26 @@ run('an event point whose facts cannot be read reclaims nothing and leaves a fai
   expect(await failing.reclaimEvent(row.id, 'release')).toBeUndefined();
   expect(existsSync(legacyPath)).toBe(true);
   const audits = await core.listWorktreeAudits(gm, 50);
-  expect(audits.some(a => a.event === 'fail' && a.trigger === 'release' && String(a.reason).startsWith('event-reclaim-unreadable:'))).toBe(true);
+  expect(audits.some(a => a.event === 'fail' && a.trigger === 'release' && String(a.reason).startsWith('reclaim-unreadable:'))).toBe(true);
   // Once the facts read again, the sweep reclaims the same aged tree.
   expect((await core.reclaimWorktrees(gm, { repos: [path] })).removed).toContain(legacyReal);
   expect(existsSync(legacyPath)).toBe(false);
 }, 30000);
 
-run('a sweep racing a QA review claim never removes the leased scene, in either order', async () => {
+run('a sweep racing a QA review claim never removes the leased scene, whichever call starts first', async () => {
   const path = repo(), core = coreFor(path), eng = await employee('engineering'), qa = await employee('qa');
-  for (let n = 0; n < 3; n++) {
+  const sweep = () => core.worktrees!.reclaimAll({ trigger: 'sweep', repos: [path] });
+  for (let n = 0; n < 4; n++) {
     const t = await task(core, 'engineering'), claim = await core.claim(eng, t.id);
     const scene = claim.worktree!.worktreePath;
     writeFileSync(join(scene, 'source.txt'), `race change ${n}`);
     git(scene, 'add', '.'); git(scene, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', `race change ${n}`);
     const submitted = await submit(core, eng, claim);
-    const [swept, review] = await Promise.all([
-      core.worktrees!.reclaimAll({ trigger: 'sweep', repos: [path] }),
-      core.claim(qa, submitted.id),
-    ]);
+    // Both calls start in the same tick. The object literal starts its first property first, so the start order alternates.
+    const started = n % 2 === 0
+      ? { swept: sweep(), review: core.claim(qa, submitted.id) }
+      : { review: core.claim(qa, submitted.id), swept: sweep() };
+    const [swept, review] = await Promise.all([started.swept, started.review]);
     expect(swept.removed).not.toContain(scene);
     expect(existsSync(scene)).toBe(true);
     expect(review.worktree!.worktreePath).toBe(scene);
@@ -824,4 +826,40 @@ run('a sweep racing a QA review claim never removes the leased scene, in either 
     expect(existsSync(scene)).toBe(false);
   }
 }, 60000);
+
+run('a QA review whose lease lapses while its reference is lost keeps the scene; the next reviewer reuses it and accept reclaims it', async () => {
+  const path = repo(), core = coreFor(path), eng = await employee('engineering'), qa = await employee('qa'), next = await employee('qa');
+  const { taskId, scene } = await reviewHeld(core, eng, qa, 'lapsed-review');
+  await db.db.query('DELETE ONLY $ref;', { ref: new RecordId('worktree_ref', taskId) });
+  await lapseLease(taskId);
+  const swept = await core.worktrees!.reclaimAll({ trigger: 'sweep', repos: [path] });
+  expect(swept.removed).not.toContain(scene);
+  expect(swept.kept.find(k => k.path === scene)?.reason).toBe('authority-open');
+  expect(existsSync(scene)).toBe(true);
+  // The task is still in review and still names the scene, so the next reviewer takes over the same tree.
+  const takenOver = await core.claim(next, taskId);
+  expect(takenOver.worktree!.worktreePath).toBe(scene);
+  await core.accept(next, proof(takenOver), { text: 'Accept after a lapsed review lease', idempotencyKey: `lapsed-accept-${++count}` });
+  expect(existsSync(scene)).toBe(false);
+}, 30000);
+
+run('a sweep whose policy read fails deletes nothing, audits the failure and rethrows; the next sweep reclaims the aged tree', async () => {
+  const path = repo();
+  const clock = { now: new Date('2026-10-10T12:00:00.000Z') };
+  const legacyPath = join(dir, 'legacy-task-5ca0f00d');
+  git(path, 'worktree', 'add', '-b', 'task/5ca0f00d', legacyPath);
+  const core = new SurrealCompanyCore(db, { worktrees: { opsRepo: path, orphanGraceDays: 7, now: () => clock.now } });
+  const legacyReal = realpathSync(legacyPath);
+  const row = (await core.listWorktrees(gm)).find(w => w.worktreePath === legacyReal)!;
+  await db.db.query('UPDATE ONLY $tree SET last_released_at = type::datetime($at), last_used_at = type::datetime($at);', {
+    tree: new RecordId('worktree', row.id), at: new Date(clock.now.getTime() - 8 * 86_400_000).toISOString(),
+  });
+  const failing = new WorktreeRegistry(refusing(db.db, /FROM company_meta:config/, 'fixture: config refused'), { opsRepo: path, orphanGraceDays: 7, now: () => clock.now });
+  await expect(failing.reclaimAll({ trigger: 'sweep', repos: [path] })).rejects.toThrow('fixture: config refused');
+  expect(existsSync(legacyPath)).toBe(true);
+  const audits = await core.listWorktreeAudits(gm, 50);
+  expect(audits.some(a => a.event === 'fail' && a.trigger === 'sweep' && String(a.reason).startsWith('reclaim-unreadable:'))).toBe(true);
+  expect((await core.reclaimWorktrees(gm, { repos: [path] })).removed).toContain(legacyReal);
+  expect(existsSync(legacyPath)).toBe(false);
+}, 30000);
 

@@ -15,7 +15,7 @@
 | 未合并任务分支 | 树可删 | 本地分支仅 `git branch -d`；失败则 `branch_retain` 审计 |
 | 孤儿宽限 N（默认 7 天） | 无 active/recovery 引用 | 仅公司管理任务树；时钟=last_released_at → last_used_at → created_at |
 
-删除依据：持久 `worktree` / `worktree_ref` / `worktree_session_ref` 的登记与实时对账，并且任务表（`task.worktree`、状态、租约）不再指向该树；任一读取失败即保留。accept、return、release、retire、revoke、expire 等事件点与定时扫描共用同一判定。事件点读取失败不回收，写 `fail` 审计（`event-reclaim-unreadable:*`）。不用文件 mtime，不用 `git worktree remove --force` / `branch -D`，不借 `git prune` 扩大删除面。
+删除依据：持久 `worktree` / `worktree_ref` / `worktree_session_ref` 的登记与实时对账，并且任务表（`task.worktree`、状态、租约）不再指向该树；任一读取失败即保留。accept、return、release、retire、revoke、expire 等事件点与定时扫描共用同一判定。事件点或定时扫描的首批读取（策略、登记行）失败都不回收，并写 `fail` 审计（`reclaim-unreadable:*`）：事件点静默返回，定时扫描抛给调用方记日志；扫描中单棵树的读取失败只保留该树。不用文件 mtime，不用 `git worktree remove --force` / `branch -D`，不借 `git prune` 扩大删除面。
 
 ## 本地受控演练（QA 无需公司凭证）
 
