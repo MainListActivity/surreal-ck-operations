@@ -7,7 +7,7 @@ import { LIFECYCLE_COMMANDS } from '../lifecycle-policy.ts';
 // The sidecar claims tasks on the instance's behalf (dispatcher calls claim()),
 // keeps the lease alive while a turn runs, relays `sck call` requests through
 // req/res files, and ingests report.md/blocker.md when a turn ends.
-import { ExecutionJournal, workResult, finalAnswer, type ExecutionAttempt } from './lifecycle.ts';
+import { ExecutionJournal, workResult, finalAnswer, codeDeliveryDeclared, type ExecutionAttempt } from './lifecycle.ts';
 import type { TurnEnded } from './contracts.ts';
 import { RuntimeResultError } from './turn-result.ts';
 import { OpsCircuit } from "./ops-circuit.ts";
@@ -350,11 +350,20 @@ export class SidecarPool {
     return this.collectExecution(row);
   }
   private async collectExecution(row: ExecutionAttempt): Promise<SettleResult> {
-    if (!row.finalText && !row.artifacts?.raw && !row.artifacts?.report && !row.artifacts?.blocker && this.deps.readTurnResult) {
+    if (!row.artifacts?.raw && !row.artifacts?.report && !row.artifacts?.blocker && this.deps.readTurnResult) {
       try {
         if (!row.agent || !row.turn) throw new Error('missing turn identity');
-        row.finalText = await this.deps.readTurnResult(row.agent, row.turn, row.startedAt ?? row.createdAt ?? 0);
-        if (!row.finalText.trim()) throw new Error('empty runtime result');
+        // Text carried by the end event and text re-read from the durable timeline are both runtime
+        // output. A progress message that does not declare the delivery contract (verified commit line,
+        // review verdict or blocked heading) is dropped, and the durable timeline decides the real
+        // verdict within the bounded window — never the worktree HEAD.
+        const text = row.finalText || await this.deps.readTurnResult(row.agent, row.turn, row.startedAt ?? row.createdAt ?? 0);
+        if (!text.trim()) throw new Error('empty runtime result');
+        if (await this.undeclaredDelivery(row, text)) {
+          row.finalText = undefined;
+          throw new RuntimeResultError('not_yet_available', 'runtime final result not yet available');
+        }
+        row.finalText = text;
         row.error = undefined;
         await this.changed(row);
       } catch (error) {
@@ -380,6 +389,20 @@ export class SidecarPool {
     await this.changed(row);
     await this.flushExecution(row);
     return { status: (row as ExecutionAttempt).state === 'settled' ? 'ingested' : 'pending' };
+  }
+  /**
+   * A review answer must declare its verdict （复核结论：通过/退回） or a blocked heading; a doing answer
+   * on a code task must declare the verified commit line or a blocked heading. Anything else is a progress
+   * message, not a delivery — the read keeps waiting instead of closing out on it, and the worktree HEAD
+   * must not stand in for a commit the employee never declared.
+   */
+  private async undeclaredDelivery(row: ExecutionAttempt, text: string): Promise<boolean> {
+    if (row.phase === 'review') {
+      const heading = text.trim().split(/\r?\n/, 1)[0]!.replace(/[*#]/g, '').trim();
+      return !/^(复核结论[:：]\s*(通过|退回)|工作结果[:：]\s*受阻)\s*$/.test(heading);
+    }
+    const task = await this.callWithCred(row.employee, cred => this.deps.core.getTask(cred, row.task));
+    return task.workIntent?.kind === 'code' && !codeDeliveryDeclared(text);
   }
   /**
    * The read window ended without a final answer. Submit an explicit block instead of collecting forever: the owner

@@ -80,6 +80,17 @@ export function workResult(text: string, phase: 'doing' | 'review', structured?:
   return { action, evidence };
 }
 
+/**
+ * What a runtime-read final answer must declare before a code task may treat it as the delivery:
+ * the verified-commit line the dispatch requires, or a leading blocked verdict. A progress message
+ * has neither, so it never becomes a result — and never borrows the worktree HEAD as its sha.
+ */
+export function codeDeliveryDeclared(text: string): boolean {
+  if (/^提交[:：]\s*[a-f0-9]{40}\s*$/im.test(text)) return true;
+  const heading = text.trim().split(/\r?\n/, 1)[0]!.replace(/[*#]/g, '').trim();
+  return /^工作结果[:：]\s*受阻\s*$/.test(heading);
+}
+
 export function finalAnswer(event: TurnEnded): string {
   // Paseo may include intermediate assistant messages; only the last non-empty assistant response is a result.
   let lastUser = -1;
