@@ -17,5 +17,5 @@
     "已知限制：页面结构（Capability 菜单、输入框、Send 按钮、N/M in use）改版会导致核验失败而拒发，不会降级到付费档。满座时页面显示 2/2 in use 尚未实测。续轮比直接回会话多一次首页访问。"
   ],
   "migration": "无 schema 变更（沿用 schema 072）。执行端插件升级后生效；需要服务 PATH 或 lanes.devin-cloud.bin 里能解析 ego-browser（默认 ~/.local/bin/ego-browser）。旧 lane 状态没有 devin 字段也可直接读取。共享登记新增 task 字段，旧登记没有它，不参与换摘要的判定。",
-  "rollback": "回退至 v0.13.28。回退后 devin-cloud 恢复 CLI 调用（Devin CLI 3000.x 上会报 Unknown model 而失败）。回退前在途的网页会话按人工核对。"
+  "rollback": "回退至 v0.13.33。回退后 devin-cloud 恢复 CLI 调用（Devin CLI 3000.x 上会报 Unknown model 而失败）；SCK_PREVIEW_SECRET 遮蔽等 0.13.31/0.13.33 修复不受影响。回退前在途的网页会话按人工核对。"
 }
