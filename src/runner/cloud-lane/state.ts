@@ -3,7 +3,7 @@
  * 文件放在 $SCK_COMM_DIR/.lane/state.json（原子写），员工沙箱可写。
  */
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 export interface LaneState {
@@ -18,6 +18,8 @@ export interface LaneState {
   digest?: string;
   branch?: string;
   submittedAt?: number;
+  /** 派工 claim.json 里的公司任务 ID：换员工目录、换摘要重派时，凭它认出同一任务的在途发送。 */
+  task?: string;
   /** devin-cloud 网页入口的记录：发送前落盘的 attempt 标记，以及最近一次核验到的档位与席位读数。 */
   devin?: DevinLaneState;
 }
@@ -71,6 +73,8 @@ export interface InflightEntry {
   attempt?: string; attemptAt?: number;
   /** 未确认受理的续轮落点会话：换员工目录核对时只看这个会话，不退回别的会话、也不按标记乱找。 */
   attemptSession?: string;
+  /** 所属公司任务 ID：摘要变了（返工改了 findings）的重派也要认出是同一任务。 */
+  task?: string;
 }
 
 function inflightPath(stateRoot: string, provider: string, digest: string): string {
@@ -90,16 +94,50 @@ export function readInflight(stateRoot: string | undefined, provider: string, di
   return readInflightRaw(stateRoot, provider, digest);
 }
 
+/** 登记项里这次发送落在哪个会话：已拿到地址用地址，否则是续轮的原会话；都没有就是新会话、还没有地址可核对。 */
+export function inflightSession(entry: InflightEntry): string | undefined {
+  return entry.taskUrl ?? entry.attemptSession ?? entry.vendorSession;
+}
+
+/** 派工 claim.json 里的公司任务 ID（task.id）；读不到就是 undefined，跨目录只能靠摘要认出同一回合。 */
+export function readClaimTask(commDir: string): string | undefined {
+  try {
+    const id = (JSON.parse(readFileSync(join(commDir, 'claim.json'), 'utf8')) as { task?: { id?: unknown } }).task?.id;
+    return typeof id === 'string' && id.trim() ? id.trim() : undefined;
+  } catch { return undefined; }
+}
+
+/**
+ * 同一公司任务、摘要不同的其它在途登记（换摘要重派，比如返工改了 findings）。摘要变了，共享登记的键就变了，
+ * 只能按任务 ID 找回同一任务的发送，免得在别的目录另建会话。按提交时间从新到旧。
+ */
+export function readInflightOfTask(stateRoot: string | undefined, provider: string, task: string | undefined, digest: string): InflightEntry[] {
+  if (!stateRoot || !task) return [];
+  const dir = join(stateRoot, provider, 'inflight');
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return []; }
+  const found: InflightEntry[] = [];
+  for (const name of names) {
+    if (!name.endsWith('.json') || name === `${digest}.json`) continue;
+    try {
+      const value = JSON.parse(readFileSync(join(dir, name), 'utf8')) as InflightEntry;
+      if (value?.task === task && (typeof value.taskId === 'string' || typeof value.attempt === 'string')) found.push(value);
+    } catch { /* 损坏的登记不参与判定 */ }
+  }
+  return found.sort((a, b) => (b.submittedAt ?? b.attemptAt ?? 0) - (a.submittedAt ?? a.attemptAt ?? 0));
+}
+
 /**
  * 发送意图的共享登记：必须在可能按下发送之前调用。换员工目录（不同 comm 目录、同一 stateRoot）
- * 或重启后按同一摘要读到它，就只核对是否已受理，绝不再次按下发送。attemptSession 是续轮的原会话地址（新会话不传）。
+ * 或重启后按同一摘要读到它，就只核对是否已受理，绝不再次按下发送。attemptSession 是续轮的原会话地址（新会话不传）；
+ * task 是公司任务 ID，换摘要重派时据此认出同一任务。
  */
 export function recordInflightAttempt(stateRoot: string | undefined, provider: string, digest: string | undefined,
-  attempt: string, at: number, attemptSession?: string): void {
+  attempt: string, at: number, attemptSession?: string, task?: string): void {
   if (!stateRoot || !digest) return;
   const { attemptSession: _previous, ...prev } = readInflightRaw(stateRoot, provider, digest) ?? {};
   writeInflight(stateRoot, provider, digest,
-    { ...prev, attempt, attemptAt: at, ...(attemptSession ? { attemptSession } : {}) });
+    { ...prev, attempt, attemptAt: at, ...(attemptSession ? { attemptSession } : {}), ...(task ? { task } : {}) });
 }
 
 /** 撤销发送意图（确认没有按下发送时）。已有 taskId 的登记只去掉 attempt，不能误删在途任务。 */
@@ -132,5 +170,5 @@ export function recordInflight(stateRoot: string | undefined, provider: string, 
   const session = state.devin?.attemptSession;
   writeInflight(stateRoot, provider, digest,
     { taskId: state.taskId, taskUrl: state.taskUrl, submittedAt: state.submittedAt, vendorSession: state.vendorSession,
-      ...(session ? { attemptSession: session } : {}) });
+      ...(session ? { attemptSession: session } : {}), ...(state.task ? { task: state.task } : {}) });
 }

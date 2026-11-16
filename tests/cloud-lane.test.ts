@@ -30,7 +30,8 @@ function world(opts: { task?: string; prompt?: string; git?: Route; extra?: Rout
   writeFileSync(join(commDir, 'task.md'), opts.task ?? '# 云端任务\n\n实现需求甲。\n');
   if (opts.claim !== 'none') {
     const wt = opts.claim ?? { worktreePath: cwd, branch: 'sck/task-1' };
-    writeFileSync(join(commDir, 'claim.json'), JSON.stringify({ worktree: { worktreePath: wt.worktreePath, branch: wt.branch, intent: { kind: 'code' }, mode: 'exclusive' } }));
+    // task.id 与真实 claim.json 一样：同一公司任务换员工目录时靠它认出同一任务（换摘要重派）。
+    writeFileSync(join(commDir, 'claim.json'), JSON.stringify({ task: { id: 'task-1' }, worktree: { worktreePath: wt.worktreePath, branch: wt.branch, intent: { kind: 'code' }, mode: 'exclusive' } }));
   }
   const calls: Call[] = [];
   const progress: string[] = [];
@@ -447,8 +448,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     return { st, sessions, browse: (script: string) => run(script) };
   };
   /** 每次脚本调用推进 30 秒：让「席位满/忙」这类有时限的等待能在测试里结束。 */
-  const advancing = (w: { advance(ms: number): void }, browse: (script: string) => Promise<Record<string, unknown> | undefined>) =>
-    (script: string) => { w.advance(30_000); return browse(script); };
+  const advancing = (w: { advance(ms: number): void }, browse: NonNullable<LaneDeps['browse']>) =>
+    (script: string, timeoutMs: number) => { w.advance(30_000); return browse(script, timeoutMs); };
 
   test('发送脚本先核验 Capability Free 与席位再发送；全程不调用 devin CLI', async () => {
     const w = world({ extra: gitOk });
@@ -595,9 +596,9 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     const pressed = join(dir, 'ego-pressed');
     writeFileSync(pressed, '#!/bin/sh\necho __PRESSED__\nexec sleep 30\n');
     chmodSync(pressed, 0o755);
-    // 超时只用来杀进程，不参与「是否已按下」的判定；给 /bin/sh 启动与 echo 留足时间（CI 并行加载时
-    // 1.5 秒会偶发来不及把标记写进管道），这里用 4 秒窗口，测试预算放到 15 秒。
-    expect(await egoBrowse(pressed)('x', 4_000)).toEqual({ ok: false, code: 'pressed' });
+    // 超时只用来杀进程，不参与「是否已按下」的判定；标记必须在被杀之前写进管道，所以窗口要留足给 /bin/sh 启动
+    // 与 echo（CI 并行加载时 1.5 秒会偶发来不及，4 秒也不稳）。这里用 6 秒窗口，测试预算 15 秒。
+    expect(await egoBrowse(pressed)('x', 6_000)).toEqual({ ok: false, code: 'pressed' });
     const silent = join(dir, 'ego-silent');
     writeFileSync(silent, '#!/bin/sh\nexit 1\n');
     chmodSync(silent, 0o755);
@@ -609,14 +610,14 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     dirs.push(dir);
     const hold = join(dir, 'ego-hold');
     // 后台 sleep 继承了 stdout；exec 之后的前台 sleep 被 SIGKILL 杀掉，但后台那个仍占着管道，close 要等 60 秒。
-    // 窗口给 2 秒，确保 kill 时后台子进程已经起来（否则管道立即关闭，用例就没有测到兜底）。
-    // 若去掉 kill 后的 5 秒兜底，这个用例会一直等 close 而在 12 秒测试预算内超时失败。
+    // 窗口给 3 秒，确保 kill 时后台子进程已经起来（否则管道立即关闭，用例就没有测到兜底）。
+    // 兜底约 5 秒；若去掉它，这个用例要等后台的 sleep 60 结束才 close，远超 25 秒的测试预算而失败。
     writeFileSync(hold, '#!/bin/sh\n(sleep 60) &\nexec sleep 60\n');
     chmodSync(hold, 0o755);
     const started = Date.now();
-    expect(await egoBrowse(hold)('x', 2_000)).toEqual({ ok: false, code: 'pressed' });
-    expect(Date.now() - started).toBeLessThan(10_000);
-  }, 12_000);
+    expect(await egoBrowse(hold)('x', 3_000)).toEqual({ ok: false, code: 'pressed' });
+    expect(Date.now() - started).toBeLessThan(20_000);
+  }, 25_000);
 
   test('超时后同一轮只回执核对不重发：状态留在途，下轮直接轮询原会话', async () => {
     const working = { ok: true, markerSeen: true, status: 'working', done: null, tail: '' };
@@ -1219,6 +1220,46 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(b.calls.every(s => s.includes(SESSION))).toBe(true);
       expect(readLaneState(w.commDir)?.devin?.attempt).toBeUndefined();
     });
+
+    test('换摘要重派（返工改了 findings）：同一任务在另一目录有未确认受理的新会话发送 → 受阻，不发送、不另建，登记保留', async () => {
+      const w1 = world({ task, extra: gitOk });
+      await runLane(w1.input({ provider: 'devin-cloud', prompt: FOLLOW }), { ...w1.deps, browse: killedBefore('send') });
+      const d1 = digestOf(w1, FOLLOW);
+      expect(readInflight(w1.stateRoot, 'devin-cloud', d1)).toMatchObject({ task: 'task-1' });
+
+      const w2 = world({ task, extra: gitOk });
+      const b2 = devinBrowse({ send: [{ ok: true, url: NEW_SESSION }], recover: [{ ok: true, found: NEW_SESSION }] });
+      // 回归时（没有这条判定）会去新建会话，页面不就绪就会一直重试；advancing 让假时钟走到时限，测试快速失败而不挂起。
+      const out2 = await runLane(w2.input({ provider: 'devin-cloud', prompt: `${FOLLOW}\n返工：补上失败用例。`, stateRoot: w1.stateRoot }),
+        { ...w2.deps, browse: advancing(w2, b2.browse) });
+      expect(out2.status).toBe('success');
+      expect(out2.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(b2.calls).toHaveLength(0);
+      expect(readInflight(w1.stateRoot, 'devin-cloud', d1)?.attempt).toMatch(/^SCK-/);
+    });
+
+    test('换摘要重派：同一任务在另一目录的会话仍在途（已受理、未收尾）→ 跟进同一会话并标明是后续轮次，不另建会话', async () => {
+      const w1 = world({ task, extra: gitOk });
+      const a = (async (script: string) => {
+        if (script.includes(MODE('send'))) return { ok: true, url: SESSION, cap: 'Free', seats: { used: 0, total: 2 }, echoed: true };
+        throw new Error('bridge killed while polling');
+      }) as NonNullable<LaneDeps['browse']>;
+      await runLane(w1.input({ provider: 'devin-cloud', prompt: FOLLOW }), { ...w1.deps, browse: a });
+      expect(readInflight(w1.stateRoot, 'devin-cloud', digestOf(w1, FOLLOW))?.taskUrl).toBe(SESSION);
+
+      const w2 = world({ task, extra: gitOk });
+      const b2 = devinBrowse({
+        follow: [{ ok: true, url: SESSION, cap: 'Free', seats: { used: 1, total: 2 }, echoed: true }],
+        session: [idleDone(PR9)],
+      });
+      const out2 = await runLane(w2.input({ provider: 'devin-cloud', prompt: `${FOLLOW}\n返工：补上失败用例。`, stateRoot: w1.stateRoot }),
+        { ...w2.deps, browse: advancing(w2, b2.browse) });
+      expect(out2.status).toBe('success');
+      expect(out2.text).toContain('PR: https://github.com/acme/widget/pull/9');
+      expect(b2.calls.some(s => s.includes(MODE('send')))).toBe(false);
+      expect(b2.calls.some(s => s.includes(MODE('follow')) && s.includes('这是同一任务的后续轮次'))).toBe(true);
+      expect(b2.calls.every(s => s.includes(SESSION))).toBe(true);
+    });
   });
 
   describe('终稿与状态判定（页面读取脚本在假页面里执行）', () => {
@@ -1339,6 +1380,24 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
         { author: 'devin', text: '正在改代码' },
       ], 'Devin is working');
       expect(r).toMatchObject({ ok: true, markerSeen: false, status: 'working' });
+    });
+
+    test('真实转录结构：sr-only 的 Devin 标签与 Worked for 行在作者块之外，终稿仍从助手作者块首行读出', async () => {
+      const userText = `[SCK-ROUND ${M}]\n\n只读的合成任务\n\n${CONV}`;
+      const reply = `[SCK-DONE ${M}]\n完成。\nPR: https://github.com/acme/widget/pull/9`;
+      // 页面正文里有 "Devin:" 标签与 worklog 行，但它们不在 data-message-author 元素里（2026-11-16 实测结构）。
+      const main = [userText, `Worked for 1m 16s\nDevin:\n\n${reply}`, 'Devin chose to stop working'].join('\n');
+      const authors = [{ author: 'user', text: userText }, { author: 'devin', text: reply }];
+      const doc = {
+        body: { innerText: main },
+        querySelector: (sel: string) => (sel === 'main' ? { innerText: main } : {}),
+        querySelectorAll: (sel: string) => (sel === '[data-message-author]'
+          ? authors.map(b => ({ getAttribute: (name: string) => (name === 'data-message-author' ? b.author : null), innerText: b.text }))
+          : [{ innerText: 'Free' }]),
+      };
+      const r = await runPage(doc);
+      expect(r).toMatchObject({ ok: true, markerSeen: true, status: 'idle', source: 'roles' });
+      expect(r?.done).toBe('完成。\nPR: https://github.com/acme/widget/pull/9');
     });
 
     test('续轮前更早轮次残留的 Devin is working 在上一轮收尾约定之前：不把空闲的会话判忙', async () => {

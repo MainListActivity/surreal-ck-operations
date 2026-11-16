@@ -15,7 +15,7 @@
 ## 一次性准备（老板）
 
 - **codex-cloud**：在 chatgpt.com 的 Codex 里为目标仓库建好云端环境，并在 `native-runner.json` 的 `lanes["codex-cloud"].environments` 里登记 `"owner/repo": "<环境ID>"`；没有登记的仓库退化为把仓库名当环境标签传给 `codex cloud exec`。
-- **devin-cloud**：Devin 组织里已连接目标 GitHub 仓库；老板的 ego-browser 里已登录 app.devin.ai，且账号有 Free 档位（Free 菜单项选中后显示 `Free (powered by SWE-2)` 与 `N/M in use` 席位计数）。通道不再调用 `devin` CLI：CLI `3000.x` 的 `--cloud --model free` 会被 CLI 拒成 `Unknown model`，云免费能力只存在于网页。会话地址（`app.devin.ai/sessions/<id>`）由页面返回并写进 lane 状态，续轮/返工/复核都回到同一 Devin 会话发跟进消息，不另开新会话；会话页读不到席位，续轮先到组织首页读席位，再回原会话发送。
+- **devin-cloud**：Devin 组织里已连接目标 GitHub 仓库；老板的 ego-browser 里已登录 app.devin.ai，且账号有 Free 档位（Free 菜单项选中后显示 `Free (powered by SWE-2)` 与 `N/M in use` 席位计数）。通道不再调用 `devin` CLI：CLI `3000.x` 的 `--cloud --model free` 会被 CLI 拒成 `Unknown model`，云免费能力只存在于网页。通道不依据 CLI 报错文字判定，页面核验不过就有界重试后受阻。会话地址（`app.devin.ai/sessions/<id>`）由页面返回并写进 lane 状态，续轮/返工/复核都回到同一 Devin 会话发跟进消息，不另开新会话；会话页读不到席位，续轮先到组织首页读席位，再回原会话发送。
 - **jules**：在 jules.google 安装 Jules GitHub App（覆盖目标仓库），在设置页创建 API key，写入 `<服务目录>/private/lanes/jules.env` 一行 `JULES_API_KEY=<key>`。桥接进程在员工沙箱里读不到 private，key 由执行端进程在沙箱外读出后注入子进程环境；没有 key 时回合立即失败并提示配置方法。
 
 ## 配置
@@ -64,7 +64,7 @@
 - **codex-cloud**：`codex cloud exec --env <环境> --branch <分支>` → `codex cloud status` 轮询 → READY 后 `codex cloud apply` 到本地、`git add -A`、提交「<任务标题> (Codex Cloud <id>)」、推送、`gh pr list/create` 保证有 PR；空 diff 按受阻收尾。Codex Cloud 的最终消息 CLI 取不到：复核轮要求供应商把结论写进 `.sck/review.md`，桥接从 `codex cloud diff` 的补丁行提取。
 - **devin-cloud**：ego-browser 执行 `src/runner/cloud-lane/devin-web.ts` 里的页面脚本（`main.ts` 经 `LaneDeps.browse` 注入 `egoBrowse`），不再调用 `devin` CLI、不带任何 `--model` 参数（CLI 3000.x 拒绝 `--model free`，云免费能力只在网页）。新会话前脚本在 app.devin.ai 组织页核验 Capability 选中 Free、`Free (powered by SWE-2)` 与席位计数 `N/M in use`：席位满则在 `maxMinutes` 内等待，仍满按「工作结果：受阻」收尾；档位或席位读不到有界重试后同样受阻，不切付费档、不改用其它模型。消息带 `[SCK-ROUND <标记>]` 行；按下发送前执行端先在 lane 状态里落盘 attempt 标记（与 grok-bot 同一做法），会话地址记入 `taskUrl`/`vendorSession`。续轮、返工与复核回到同一会话地址发跟进消息：会话页的 Capability 按钮是禁用的、读不到席位，所以先到组织首页选中 Free 读席位（满座直接等待或受阻），再回原会话复核一次并发送，不新建会话、不占新席位。按下发送之后绝不重发：会话地址或回执丢失时只做受理核对：续轮只看原会话转录里有没有本轮标记，新会话在会话列表与最近会话里找；核对仍不确定，或空闲的转录里连续看不到本轮标记，都按「工作结果：受阻」收尾并保留在途状态，交人工核对后恢复本任务即可，不会另建会话或另开 PR。终稿只认本轮收尾约定之后、Devin 发言块里的 `[SCK-DONE <标记>]` 行：工具输出里的 DONE/PR、派工消息、用户提示词里的例子都不算。状态短语只看最近一次收尾约定之后的文字：续轮前上一轮还在工作就等它空下来、不发送；更早轮次残留的状态不算。状态 unknown 不收尾；两次读数一致才收尾。空闲却没有终稿连续确认后受阻。Devin 停下等用户（blocked on the user）按受阻收尾并带回现场。非复核回合取 `PR:`/`SHA:` 行后 `git fetch + git merge --ff-only FETCH_HEAD`，非快进只报错不 reset；声明 SHA 与实际远端 HEAD 不符时按实际 HEAD 注明。活动流分开报「尝试」与「已受理」：尝试显示为运行中；转录里出现本轮标记或会话地址后才是已受理，之前不报已派。受阻文本首行单独成行「工作结果：受阻」，原因写在下一行起。
 - **jules**：REST 会话状态机 QUEUED/PLANNING/IN_PROGRESS → COMPLETED/FAILED；`AWAITING_USER_FEEDBACK`/`AWAITING_PLAN_APPROVAL` 按受阻收尾并把 Jules 的问题带回来；续轮 `:sendMessage` 复用同一会话。
-- **幂等**：提交前把云端任务 ID、prompt 摘要、分支原子写入 `$SCK_COMM_DIR/.lane/state.json`；同摘要重启重连轮询不重复提交。提交结果不明绝不重发，报错误回合并带任务 ID/URL。Devin 网页入口同样：按下发送之后不重发，只核对受理（见上）。
+- **幂等**：提交前把云端任务 ID、prompt 摘要、分支原子写入 `$SCK_COMM_DIR/.lane/state.json`；同摘要重启重连轮询不重复提交。提交结果不明绝不重发，报错误回合并带任务 ID/URL。Devin 网页入口同样：按下发送之后不重发，只核对受理（见上）。返工改了摘要（findings 等）时登记键跟着变，所以共享登记另记公司任务号（`claim.json` 的 `task.id`），换摘要重派也按它找到同一任务在别的员工目录里的在途发送：未确认受理且没有会话地址的，受阻交人工核对，不发送、不另建会话，登记保留；已有会话地址的，沿用该会话发跟进消息（标明是同一任务的后续轮次），不另开会话。
 - **超时**：`lanes.<provider>.maxMinutes`（默认 180 分钟），约 25 秒轮询一次；超时按错误回合处理，文案说明云端任务可能仍在运行。
 
 ## 额度

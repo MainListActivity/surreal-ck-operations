@@ -130,7 +130,7 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
       // 之后无论脚本如何结束、换到哪个员工目录，都只核对是否已受理，绝不再按发送。
       const at = deps.now();
       state.devin = { ...state.devin, attempt: marker, attemptAt: at, attemptSession: follow };
-      recordInflightAttempt(input.stateRoot, input.provider, ctx.digest, marker, at, follow);
+      recordInflightAttempt(input.stateRoot, input.provider, ctx.digest, marker, at, follow, state.task);
       persist();
       deps.progress(follow ? `尝试在原 Devin 会话发送本轮消息（${marker}）` : `尝试新建 Devin Cloud 会话（${marker}）`, 'attempt');
       const r = await browse(follow ? devinFollowScript(follow, marker, message, home) : devinSendScript(home, marker, message), 150_000) as Reply;
