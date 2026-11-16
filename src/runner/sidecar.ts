@@ -1441,8 +1441,9 @@ export class SidecarPool {
     try {
       token = await cloud.tokens.tokenFor({ employee: instId, agentUserId, taskId: claim.taskId, leaseRemainingMs: remainingMs });
       const result = await cloud.gateway.call(token, command, input);
+      // 网关已执行并回了结果，只是结果里带着凭证：命令已经跑过，标为已受理，员工不得据此重提。
       if (token && JSON.stringify(result ?? null).includes(token)) {
-        throw Object.assign(new Error("网关返回内容含有凭证，已拒绝转交"), { code: "upstream_error" });
+        throw Object.assign(new Error("网关返回内容含有凭证，已拒绝转交"), { code: "upstream_error", accepted: true });
       }
       return result;
     } catch (error) {

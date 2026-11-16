@@ -35,12 +35,13 @@ const jobCommands = new Map<string, string>();
 /** 老板端作业存储：入队与 ops.job.get 都是真实代码，每个测试重建。 */
 let jobs: OwnerJobStore;
 /** 这些命令走执行端作业：网关先回 202 待取，之后由 ops.job.get 取结果。 */
-const ASYNC_COMMANDS = new Set(['ops_slow', 'ops_failjob', 'ops_authfail', 'ops_authword', 'ops_pollauth']);
+const ASYNC_COMMANDS = new Set(['ops_slow', 'ops_failjob', 'ops_authfail', 'ops_authword', 'ops_pollauth', 'ops_authtimeout']);
 
 /**
  * 执行端进度脚本，写回用真实的 storeResult / failure（见 tests/support/owner-job-contract.ts）：
  * ops_slow 第 1 次轮询 running，第 3 次 done；ops_failjob 第 1 次写回 forbidden，说明里回显了令牌（客户端须隐藏）；
  * ops_authfail 写回类别 unauthorized；ops_authword 写回一句像鉴权失败的说明但类别是上游失败；
+ * ops_authtimeout 第 1 次轮询写回 IdP 授权超时（上游失败，说明末尾带 stage=authorize，与 06:59 事故同形）；
  * ops_pollauth 每次轮询都被网关拒绝（401）。ops.job.get 本身走老板端真实命令。
  */
 async function jobReply(bearer: string, input: Record<string, unknown>): Promise<JobReply> {
@@ -56,6 +57,7 @@ async function jobReply(bearer: string, input: Record<string, unknown>): Promise
   if (polls === 1 && command === 'ops_failjob') jobs.fail(id, new CompanyError('forbidden', `denied for ${bearer}`));
   if (polls === 1 && command === 'ops_authfail') jobs.fail(id, new CompanyError('unauthorized', '登录令牌已失效'));
   if (polls === 1 && command === 'ops_authword') jobs.fail(id, new Error('invalid credential from upstream'));
+  if (polls === 1 && command === 'ops_authtimeout') jobs.fail(id, new CompanyError('upstream_error', 'IdP authorize 请求超时（TimeoutError）; stage=authorize'));
   return jobs.getJob(input);
 }
 
@@ -106,6 +108,18 @@ beforeAll(() => {
         return json(pending.body, pending.status);
       }
       if (body.command === 'ops_leak') return json({ ok: false, error: { code: 'forbidden', message: `refused for ${bearer}` } }, 403);
+      // 等待时限内作业已失败：同步回执带作业号（老板端 queueJob 的同步段）。
+      if (body.command === 'ops_syncfail') {
+        const id = await jobs.enqueue(body.command, body.input ?? {});
+        jobCommands.set(id, body.command);
+        jobs.fail(id, new CompanyError('login_failed', 'IdP rejected the login (invalid_credentials); stage=login'));
+        const reply = await jobs.settle(id);
+        return json(reply.body, reply.status);
+      }
+      // 上游超时且没有回执：正文是网关的错误页，不是 JSON。
+      if (body.command === 'ops_gwtimeout') return new Response('<html>gateway timeout secret-page</html>', { status: 504 });
+      // 网关已执行并返回结果，但结果里带着凭证。
+      if (body.command === 'ops_echotoken') return json({ ok: true, result: { leaked: bearer } });
       return json({ ok: true, result: { echoed: body.command } });
     },
   });
@@ -211,6 +225,11 @@ async function send(dir: string, key: string, name: string, tool: string, args: 
 function polledJobId(): string {
   const poll = gwCalls.find(call => call.command === 'ops.job.get');
   return String((poll?.input as { id?: unknown } | undefined)?.id ?? '');
+}
+
+/** The job id the gateway queued for a command: the reply's jobId must name the job that was queued. */
+function queuedJobId(command: string): string {
+  return [...jobCommands].find(([, name]) => name === command)?.[0] ?? '';
 }
 
 function walk(dir: string): string[] {
@@ -414,6 +433,17 @@ describe('有租约的网关调用', () => {
     expect(gwCalls.filter(call => call.command === command)).toHaveLength(1);
   });
 
+  test('IdP 授权超时在轮询时才失败（与事故同形）：回执带作业号、类别与阶段（authorize），已受理，不重提', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-authtimeout');
+    const reply = await send(dir, key, 'r1', 'ops_authtimeout', {});
+    expect(reply).toEqual({
+      ok: false, error: 'upstream_error: 作业执行失败：IdP authorize 请求超时（TimeoutError）; stage=authorize',
+      accepted: true, jobId: polledJobId(), stage: 'authorize',
+    });
+    expect(gwCalls.filter(call => call.command === 'ops_authtimeout')).toHaveLength(1);
+  });
+
   test('网关错误文本回显令牌时，返回给员工的内容已脱敏；入队前的拒绝不算已受理，没有作业号', async () => {
     pool = makePool({ cloud: makeCloud() });
     const { dir, key } = await claimFor(pool, 'eng-1', 'task-leak');
@@ -424,6 +454,37 @@ describe('有租约的网关调用', () => {
     for (const token of issued) expect(reply.error ?? '').not.toContain(token);
     expect(reply.accepted).toBe(false);
     expect(reply.jobId).toBeUndefined();
+  });
+
+  test('同步失败（等待时限内作业已失败）：回执带作业号、类别与阶段，已受理，不轮询也不重提', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-syncfail');
+    const reply = await send(dir, key, 'r1', 'ops_syncfail', {});
+    expect(reply).toEqual({
+      ok: false, error: 'login_failed: IdP rejected the login (invalid_credentials); stage=login',
+      accepted: true, jobId: queuedJobId('ops_syncfail'), stage: 'login',
+    });
+    expect(queuedJobId('ops_syncfail')).not.toBe('');
+    expect(gwCalls.filter(call => call.command === 'ops_syncfail')).toHaveLength(1);
+    expect(gwCalls.filter(call => call.command === 'ops.job.get')).toHaveLength(0);
+  });
+
+  test('网关超时且没有回执（HTTP 504）：说明为超时，未受理，正文不回显，业务命令只提交一次', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-gwtimeout');
+    const reply = await send(dir, key, 'r1', 'ops_gwtimeout', {});
+    expect(reply).toEqual({ ok: false, error: 'upstream_error: 网关超时（HTTP 504），没有可读的回执', accepted: false });
+    expect(replies.at(-1)).not.toContain('secret-page');
+    expect(gwCalls.filter(call => call.command === 'ops_gwtimeout')).toHaveLength(1);
+  });
+
+  test('网关已执行但结果里带有凭证：拒绝转交，回执标为已受理（命令已经跑过），凭证不外露，业务命令只提交一次', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-echotoken');
+    const reply = await send(dir, key, 'r1', 'ops_echotoken', {});
+    expect(reply).toEqual({ ok: false, error: 'upstream_error: 网关返回内容含有凭证，已拒绝转交', accepted: true });
+    for (const token of issued) expect(replies.at(-1)).not.toContain(token);
+    expect(gwCalls.filter(call => call.command === 'ops_echotoken')).toHaveLength(1);
   });
 
   test('owner 级工具 def_list 以网关命令 def.list 转发', async () => {

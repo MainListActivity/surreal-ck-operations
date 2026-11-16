@@ -2390,8 +2390,9 @@ export class SurrealCompanyCore implements CompanyCore {
   }): Promise<{ allowed: boolean; attempt: number; charged: boolean; reason?: string; message: string; evidence: Record<string, unknown>; refund?: FaultRefund } | undefined> {
     const controlledTarget = input.target ?? 'none';
     const now = this.faultClock();
-    // SYS04 AC02: the attempt runs inside the lease, so it may not outlive the lock. The lease window caps the
-    // recovery deadline; the budget itself stays persisted, so a re-claimed lease keeps the same counters.
+    // SYS04 AC02: the attempt runs inside the lease, so it may not outlive the lock. A lease that ends first is a
+    // refusal of its own (lease_expired), not a spent budget. The lease does not set the recovery deadline: that is
+    // the persisted window of the first charged failure, and a re-claimed lease keeps the same counters.
     const task = await this.db.select<{ lease_expires_at?: number }>(id('task', scope.taskId));
     // The lease window is stored in unix seconds; the budget clock is in milliseconds.
     const leaseExpiresAt = task?.lease_expires_at === undefined || task?.lease_expires_at === null

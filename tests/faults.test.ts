@@ -225,7 +225,7 @@ describe('budget arithmetic', () => {
     expect(decideAttempt(later, limits, first.deadline).reason).toBe('deadline_passed');
   });
 
-  test('the lease window caps the recovery deadline: an attempt may not outlive its lock', () => {
+  test('the lease window refuses an attempt that would outlive its lock; the refusal is the lease, not the deadline', () => {
     const state = spendBudget(undefined, limits, 1_000, fault, 0);
     expect(decideAttempt(state, limits, 10_000).allowed).toBe(true);
     const capped = decideAttempt(state, limits, 10_000, 5_000);

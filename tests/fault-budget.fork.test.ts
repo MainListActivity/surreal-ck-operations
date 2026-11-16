@@ -336,6 +336,27 @@ describe('the budget is spent before the attempt', () => {
     expect(refused?.reason).toBe('lease_expired');
     expect(refused?.message).not.toContain('recovery budget');
   });
+
+  test('the deadline is the window of the first charged failure: a long lease does not move it, and the refusal says when it passed', async () => {
+    const taskId = await makeTask('预算：截止时刻只来自首次失败');
+    const scope = { taskId, employeeId: 't-eng' };
+    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
+    const opened = clock;
+    const before = await budgetRow(taskId);
+    expect(before?.deadline).toBe(opened + limits.totalDeadlineMs);
+    // The lease outlives the window by an hour. It does not extend the deadline, and it is not the reason for the refusal.
+    await database.db.query('UPDATE $t SET lease_expires_at = $far;', {
+      t: new RecordId('task', taskId), far: Math.floor(clock / 1000) + 3_600,
+    });
+    clock += limits.totalDeadlineMs + 10_000;
+    const refused = await core.reserveFault!(scope, RESERVE);
+    expect(refused?.allowed).toBe(false);
+    expect(refused?.reason).toBe('deadline_passed');
+    expect(refused?.message).toContain(`the recovery deadline for this operation has passed at ${new Date(opened + limits.totalDeadlineMs).toISOString()}`);
+    const after = await budgetRow(taskId);
+    expect(after?.deadline).toBe(before?.deadline);
+    expect(after?.attempts).toBe(before?.attempts);
+  });
 });
 
 describe('concurrent calls', () => {
