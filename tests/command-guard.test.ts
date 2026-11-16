@@ -27,6 +27,12 @@ describe('命令守卫：员工租约', () => {
     expect(agent('submit').allow).toBe(true);
   });
 
+  test('board.task 是员工的只读命令：有效租约放行，判定与 board.snapshot 相同，没有租约拒绝', () => {
+    expect(agent('board.task').allow).toBe(true);
+    expect(agent('board.task').allow).toBe(agent('board.snapshot').allow);
+    expect(agent('board.task', {}).allow).toBe(false);
+  });
+
   test('没有带任务、没有租约、租约属于别人，都拒绝', () => {
     expect(agent('submit', leased, { task: undefined }).allow).toBe(false);
     expect(agent('submit', {}).allow).toBe(false);
@@ -115,7 +121,7 @@ describe('命令守卫：模式与清单', () => {
   test('HARD_OWNER_ONLY 的清单固定为 6 类：保护开关、员工身份与策略、登录方式、老板设置、能力定义、任意写入', () => {
     expect([...HARD_OWNER_ONLY]).toEqual(['guard.*', 'agent.*', 'owner.login.*', 'owner.settings.*', 'def.*', 'db.write']);
     // 只读命令与员工可按租约和清单调用的写命令都不在硬清单里（后者由 protected_command、allow/deny 与租约判定）。
-    for (const command of ['board.snapshot', 'brief', 'inbox', 'status', 'task.list', 'task.detail', 'task.cost', 'progress', 'message.list',
+    for (const command of ['board.snapshot', 'board.task', 'brief', 'inbox', 'status', 'task.list', 'task.detail', 'task.cost', 'progress', 'message.list',
       'task.void', 'message.send', 'idp.client.create', 'cf.api', 'route.save']) {
       expect(HARD_OWNER_ONLY.some(pattern => matchesCommand(pattern, command))).toBe(false);
     }

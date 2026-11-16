@@ -60,6 +60,12 @@ test('tool wiring names sidecar tools missing from dispatch and test lists namin
   expect(wiringProblems(root)).toContain('sidecar 分发了未列入工具表的工具：beta');
 });
 
+// The real repository must pass its own wiring check: a helper switch inside the sidecar (for example a narrowing hint with
+// its own `case "progress":`) must not read as a dispatched tool, or every submit is refused for a defect that is not there.
+test('the real repository passes the wiring check', () => {
+  expect(wiringProblems(join(import.meta.dir, '..'))).toEqual([]);
+});
+
 test('the sidecar tool table is read from the text, never by importing the employee sidecar', () => {
   expect(sidecarToolTable('const BASE_TOOLS = ["get_context", "heartbeat"];\nconst X = ["not_a_tool"];')).toEqual(['get_context', 'heartbeat']);
   expect(sidecarToolTable('no table here')).toEqual([]);

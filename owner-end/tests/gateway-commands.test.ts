@@ -78,13 +78,18 @@ function agentGateway(rows: {
   jobOwner?: unknown[];
   /** 消息记录（读取与更新 $msg 时返回）。 */
   message?: unknown[];
+  /** 按任务号返回任务行（给出时 FROM $task 只看这张表，缺的任务返回空）；否则所有任务都返回 task。 */
+  tasks?: Record<string, unknown[]>;
 }) {
-  return fakeDb((sql) => {
+  return fakeDb((sql, vars) => {
     if (sql.includes('FROM agent_identity')) return rows.identity ?? [];
     if (sql.includes('FROM agent_policy')) return rows.policy ?? [];
     if (sql.includes('FROM protected_command')) return rows.protectedRows ?? [];
     if (sql.includes('FROM $msg') || sql.startsWith('UPDATE $msg')) return rows.message ?? [];
-    if (sql.includes('FROM $task')) return rows.task ?? [];
+    if (sql.includes('FROM $task')) {
+      if (rows.tasks) return rows.tasks[String((vars.task as RecordId | undefined)?.id)] ?? [];
+      return rows.task ?? [];
+    }
     if (sql.startsWith('SELECT actor_kind, actor FROM $job')) return rows.jobOwner ?? [];
     if (sql.includes('FROM $job')) return rows.job ?? [];
     return [];
@@ -499,4 +504,58 @@ describe('命令目录（cmd.catalog）与员工的任务范围', () => {
     expect(gateway.calls.some(call => call.sql.startsWith('UPDATE $msg'))).toBe(false);
   });
 
+});
+
+describe('board.task：员工与老板的读取范围与审计', () => {
+  // 看板内容由根目录的 board-task 与 cloud-sidecar-route 测试覆盖；这里只核对守卫、审计与读取范围。
+  // 时间用 input.now 固定，与网关判定租约的时钟一致。
+  const at = NOW.getTime();
+
+  test('员工持有有效租约：可读本任务的派工状态，写 ok 审计（actor 为员工、带任务）', async () => {
+    const gateway = agentGateway({ identity: IDENTITY_ALICE, tasks: { t1: VALID_LEASE } });
+    const result = await runCommand(depsWith(fakeSessions(gateway.db)), agentCaller, 'board.task', { taskId: 't1', now: at });
+    expect(result).toMatchObject({ taskId: 't1', holder: { employeeId: 'alice', leaseActive: true }, waiting: { on: 'employee', kind: 'lease' } });
+    const audits = auditsOf(gateway.calls);
+    expect(audits).toHaveLength(1);
+    expect(audits[0]!.vars).toMatchObject({ outcome: 'ok', actor: 'alice', actorKind: 'agent', command: 'board.task' });
+    expect((audits[0]!.vars.task as RecordId).id).toBe('t1');
+  });
+
+  test('员工持有任一有效租约即可读其他任务的派工状态（与 message.list 同一读取范围）', async () => {
+    const gateway = agentGateway({
+      identity: IDENTITY_ALICE,
+      tasks: { t1: VALID_LEASE, t2: [{ current_employee: 'bob', lease_expires_at: NOW_SEC + 3600 }] },
+    });
+    const result = await runCommand(depsWith(fakeSessions(gateway.db)), agentCaller, 'board.task', { taskId: 't2', now: at });
+    expect(result).toMatchObject({ taskId: 't2', holder: { employeeId: 'bob', leaseActive: true } });
+    expect(auditsOf(gateway.calls)[0]!.vars.outcome).toBe('ok');
+  });
+
+  test('员工没有有效租约（任务由别人持有，或租约已过期）：forbidden，denied 审计，且不读派工状态', async () => {
+    const otherHolder = agentGateway({ identity: IDENTITY_ALICE, task: [{ current_employee: 'bob', lease_expires_at: NOW_SEC + 3600 }] });
+    const expired = agentGateway({ identity: IDENTITY_ALICE, task: [{ current_employee: 'alice', lease_expires_at: NOW_SEC - 1 }] });
+    for (const gateway of [otherHolder, expired]) {
+      const error = await errorOf(() => runCommand(depsWith(fakeSessions(gateway.db)), agentCaller, 'board.task', { taskId: 't1', now: at }));
+      expect((error as CompanyError).code).toBe('forbidden');
+      expect((error as CompanyError).message).toBe('没有该任务的有效租约');
+      const audits = auditsOf(gateway.calls);
+      expect(audits).toHaveLength(1);
+      expect(audits[0]!.vars).toMatchObject({ outcome: 'denied', command: 'board.task' });
+      expect(gateway.calls.some(call => call.sql.includes('FROM task WHERE state IN'))).toBe(false);
+    }
+  });
+
+  test('老板读取派工状态：只读，不写审计', async () => {
+    const owner = fakeDb((sql) => (sql.includes('FROM $task') ? [{ id: new RecordId('task', 't1'), title: '任务一', state: 'doing' }] : []));
+    const result = await runCommand(depsWith(fakeSessions(owner.db)), ownerCaller, 'board.task', { taskId: 't1', now: at });
+    expect(result).toMatchObject({ taskId: 't1', title: '任务一', state: 'doing', waiting: { on: 'scheduler', kind: 'not_queued' } });
+    expect(auditsOf(owner.calls)).toHaveLength(0);
+  });
+
+  test('员工目录列出 board.task（只读），老板观测命令不在员工目录里', async () => {
+    const gateway = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE });
+    const result = await runCommand(depsWith(fakeSessions(gateway.db)), agentCaller, 'cmd.catalog', {}) as { commands: Array<{ command: string; readOnly?: boolean }> };
+    expect(result.commands.find(item => item.command === 'board.task')).toMatchObject({ readOnly: true });
+    expect(result.commands.map(item => item.command)).not.toContain('ops.job.list');
+  });
 });

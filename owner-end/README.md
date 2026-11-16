@@ -165,7 +165,7 @@
 ### 审计
 
 - 写操作、员工的全部调用（含被拒绝的和只读的），以及老板的非只读命令，都写入 `ops_audit`。审计只存参数摘要（`args_digest`）和一句摘要（`summary`，不超过 500 字符），不存原文。
-- 老板的只读命令不审计，否则看板的反复刷新会淹没真正的操作。只读判定是：`status`、`progress`、`brief`、`inbox`、`board.snapshot`、`cmd.catalog`、`db.read`、`translate.preview`、`idp.status`、`idp.user.list_agents`，以及以 `.list`、`.get`、`.detail`、`.preview`、`.plan`、`.consolidations`、`.records` 结尾的命令。
+- 老板的只读命令不审计，否则看板的反复刷新会淹没真正的操作。只读判定是：`status`、`progress`、`brief`、`inbox`、`board.snapshot`、`board.task`、`cmd.catalog`、`requirement.execution`、`db.read`、`translate.preview`、`idp.status`、`idp.user.list_agents`，以及以 `.list`、`.get`、`.detail`、`.preview`、`.plan`、`.consolidations`、`.records` 结尾的命令。
 
 ## 译文与投递
 

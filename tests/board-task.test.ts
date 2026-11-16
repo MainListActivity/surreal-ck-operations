@@ -1,100 +1,14 @@
 import { describe, expect, test } from 'bun:test';
-import { RecordId } from 'surrealdb';
-import { ownerApi, type OwnerApiContext } from '../src/owner-api.ts';
-import type { BoardTaskStatus, BoardView, OwnerBoard } from '../src/board.ts';
+import { ownerApi } from '../src/owner-api.ts';
+import type { BoardTaskStatus } from '../src/board.ts';
 import { answerBytes, guardRelayResponse, RESPONSE_BUDGET_BYTES } from '../src/response-budget.ts';
-import { companyCmdNarrowHint } from '../plugin/server/sidecar.ts';
+import { companyCmdNarrowHint } from '../src/runner/narrow-hint.ts';
+import { boardContext, boardFixtureDb, largeBoardFixture, NOW, SEC, smallBoardFixture } from './support/board-task-fixture.ts';
 
-// board.task：老板看板同一份判定的按任务有界读取。假库按 SQL 片段应答，覆盖排队、扣住、门槛、租约、
-// 老板复核、阻塞、终态与缺任务各一种，外加 relay 预算的夹具回归（大看板被拒、单任务状态通过）。
-const NOW = 1_800_000_000_000;
-const SEC = Math.floor(NOW / 1000);
-const rid = (table: string, id: string) => new RecordId(table, id);
-
-const VIEW: BoardView = {
-  at: NOW - 5_000,
-  env: { sckBin: '/sck', opsRepo: '/ops' },
-  queue: [
-    { taskId: 't-queue', title: '队列任务', phase: 'execute', role: 'engineering', blocked: false, eligible: true, body: '依赖已解锁，等待派工' },
-    { taskId: 't-held', title: '扣住任务', phase: 'execute', role: 'engineering', blocked: false, eligible: true, body: '依赖已解锁，等待派工' },
-    { taskId: 't-gate', title: '门槛任务', phase: 'execute', role: 'engineering', blocked: true, eligible: false, body: '全员配额耗尽' },
-  ],
-  employees: {
-    e1: {
-      commDir: '/comm/e1',
-      next: [
-        { taskId: 't-queue', title: '队列任务', phase: 'execute', eligible: true, body: '可接' },
-        { taskId: 't-gate', title: '门槛任务', phase: 'execute', eligible: false, body: '配额耗尽' },
-      ],
-    },
-  },
-};
-
-const TASKS: Record<string, Record<string, unknown>> = {
-  't-doing': { id: rid('task', 't-doing'), title: '在途任务', state: 'doing', reviewer_role: 'qa', current_employee: rid('employee', 'e1'), lease_expires_at: SEC + 600 },
-  't-queue': { id: rid('task', 't-queue'), title: '队列任务', state: 'ready', reviewer_role: 'qa' },
-  't-held': { id: rid('task', 't-held'), title: '扣住任务', state: 'ready', reviewer_role: 'qa' },
-  't-gate': { id: rid('task', 't-gate'), title: '门槛任务', state: 'ready', reviewer_role: 'qa' },
-  't-owner': { id: rid('task', 't-owner'), title: '老板复核任务', state: 'review', reviewer_role: 'owner' },
-  't-blocked': { id: rid('task', 't-blocked'), title: '阻塞任务', state: 'blocked', blocked_to: 'owner', reviewer_role: 'qa' },
-  't-wait': { id: rid('task', 't-wait'), title: '等待恢复任务', state: 'blocked', resume_state: 'ready', reviewer_role: 'qa' },
-  't-done': { id: rid('task', 't-done'), title: '完成任务', state: 'done', reviewer_role: 'qa' },
-  't-lapsed': { id: rid('task', 't-lapsed'), title: '租约过期任务', state: 'doing', reviewer_role: 'qa', current_employee: rid('employee', 'e2'), lease_expires_at: SEC - 60 },
-};
-
-const UNSENT = [
-  { id: rid('outbound_message', 'm-held'), task: rid('task', 't-held'), step: 'execute', state: 'draft', hold: true, body: '老板没放行的派工正文', created_at: new Date(NOW - 60_000) },
-];
-
-const EMPLOYEES = [
-  { id: rid('employee', 'e1'), role: 'engineering', def: rid('employee_def', 'eng-1'), provider: 'codex', model: 'auto' },
-  { id: rid('employee', 'e2'), role: 'qa', def: rid('employee_def', 'qa-1'), provider: 'codex', model: 'auto' },
-];
-
-function fakeDb() {
-  const queries: string[] = [];
-  const db = {
-    query: async (sql: string, vars?: Record<string, unknown>) => {
-      const s = sql.replace(/\s+/g, ' ');
-      queries.push(s);
-      if (s.includes('company_meta:board_view') || s.includes('runner_board')) return [[{ json: JSON.stringify(VIEW), at: VIEW.at }]];
-      if (s.includes('FROM runner_heartbeat')) return [[{ runner: 'r1', host: 'host-1', version: '0.13.35', at: new Date(NOW - 10_000) }]];
-      if (s.includes('FROM employee WHERE revoked')) return [EMPLOYEES];
-      if (s.includes('FROM task WHERE state IN')) {
-        return [Object.values(TASKS).filter(row => ['ready', 'doing', 'review'].includes(String(row.state)) || row.current_employee)];
-      }
-      if (s.includes("SELECT task, actor, action, at FROM audit")) return [[]];
-      if (s.includes('FROM agent_policy')) return [[]];
-      if (s.includes("FROM outbound_message WHERE state != 'sent'")) return [UNSENT];
-      if (s.includes('VALUE owner_lang')) return [['zh']];
-      if (s.includes("action IN ['return', 'owner_reject']")) return [[]];
-      if (s.includes('FROM task WHERE id IN $ids')) return [[{ id: rid('task', 't-held'), title: '扣住任务' }]];
-      if (s.includes('FROM $employee')) {
-        const id = String((vars?.employee as RecordId).id);
-        return [EMPLOYEES.filter(row => String((row.id as RecordId).id) === id)];
-      }
-      if (s.includes('FROM $task')) {
-        const id = String((vars?.task as RecordId).id);
-        return [TASKS[id] ? [TASKS[id]] : []];
-      }
-      if (s.includes('FROM audit') && s.includes('LIMIT 1')) {
-        if (String((vars?.task as RecordId).id) === 't-doing' && s.includes("action = 'claim'")) return [[{ at: new Date(NOW - 120_000) }]];
-        if (String((vars?.task as RecordId).id) === 't-doing') return [[{ action: 'checkpoint', evidence: '已完成一半', at: new Date(NOW - 60_000) }]];
-        return [[]];
-      }
-      return [[]];
-    },
-    select: async () => undefined,
-  };
-  return { db, queries };
-}
-
-function ctxOf(db: unknown) {
-  return { db: { db } as never, core: {} as never, owner: {} as never, workforce: {} as never, messages: {} as never,
-    opsRepo: '/ops' } as OwnerApiContext;
-}
-
-const boardTask = (taskId: string) => ownerApi(ctxOf(fakeDb().db), { command: 'board.task', taskId, now: NOW }, 'agent') as Promise<BoardTaskStatus>;
+// board.task：老板看板同一份判定的按任务有界读取。假库按 SQL 片段应答（tests/support/board-task-fixture.ts），
+// 覆盖排队、扣住、门槛、租约、老板复核、阻塞、终态与缺任务各一种；大看板夹具覆盖 relay 预算的拒绝与按任务通过。
+const boardTask = (taskId: string) => ownerApi(boardContext(boardFixtureDb(smallBoardFixture()).db),
+  { command: 'board.task', taskId, now: NOW }, 'agent') as Promise<BoardTaskStatus>;
 
 describe('board.task：与看板一致的按任务有界派工状态', () => {
   test('排队任务给出真实位置、原因、快照时效与候选原因', async () => {
@@ -131,7 +45,9 @@ describe('board.task：与看板一致的按任务有界派工状态', () => {
       employeeId: 'e1', name: 'eng-1', role: 'engineering', phase: 'execute',
       leaseActive: true, leaseStartedAt: NOW - 120_000, leaseExpiresAt: (SEC + 600) * 1000,
     });
-    expect(status.holder?.progress).toMatchObject({ action: 'checkpoint', summary: '已完成一半' });
+    // 最近进展只给动作名、中文标签与时间；审计里记的证据原文不带出（同一条审计在老板看板里仍可见）。
+    expect(status.holder?.progress).toEqual({ at: NOW - 60_000, action: 'checkpoint', label: '记录进展' });
+    expect(JSON.stringify(status)).not.toContain('已完成一半');
     expect(status.waiting).toMatchObject({ on: 'employee', kind: 'lease' });
     expect(status.queue).toBeUndefined();
   });
@@ -154,39 +70,39 @@ describe('board.task：与看板一致的按任务有界派工状态', () => {
   test('终态与缺任务', async () => {
     expect((await boardTask('t-done')).waiting).toMatchObject({ on: 'none', kind: 'terminal' });
     await expect(boardTask('t-missing')).rejects.toMatchObject({ code: 'not_found' });
-    await expect(ownerApi(ctxOf(fakeDb().db), { command: 'board.task' }, 'agent')).rejects.toMatchObject({ code: 'invalid' });
+    await expect(ownerApi(boardContext(boardFixtureDb().db), { command: 'board.task' }, 'agent')).rejects.toMatchObject({ code: 'invalid' });
   });
 
   test('调度快照过期时标 stale', async () => {
     const status = await boardTask('t-queue');
     expect(status.scheduler?.stale).toBe(false);
-    const stale = await ownerApi(ctxOf(fakeDb().db), { command: 'board.task', taskId: 't-queue', now: NOW + 200_000 }, 'agent') as BoardTaskStatus;
+    const stale = await ownerApi(boardContext(boardFixtureDb().db), { command: 'board.task', taskId: 't-queue', now: NOW + 200_000 }, 'agent') as BoardTaskStatus;
     expect(stale.scheduler?.stale).toBe(true);
   });
 });
 
 describe('relay 预算：大看板被拒、按任务状态通过', () => {
-  test('真实等价大回执经 guardRelayResponse 失败，错误指到 board.task 而不是 pageSize', () => {
-    // 复刻 /tmp/sck-devin-cloud-check-20261115/board-relay-budget-repro.json：整板回执远超预算。
-    const bigBoard: OwnerBoard = {
-      at: NOW, runner: { state: 'online' }, employees: [
-        { id: 'e1', name: 'eng-1', role: 'engineering', now: { state: 'idle' }, next: [], outbox: [] },
-      ], unassigned: [], recent: [],
-      messages: Array.from({ length: 40 }, (_, index) => ({
-        messageId: `m${index}`, taskId: `t${index}`, title: `任务${index}`, step: 'execute' as const,
-        state: 'draft' as const, hold: false, body: '派工正文'.repeat(1500), editable: true as const,
-      })),
-    };
-    const res = { ok: true as const, data: bigBoard };
-    expect(answerBytes(bigBoard)).toBeGreaterThan(RESPONSE_BUDGET_BYTES);
-    const guarded = guardRelayResponse(res, companyCmdNarrowHint({ command: 'board.snapshot' }));
+  test('真实等价大看板经 guardRelayResponse 失败，错误指到 board.task 而不是 pageSize', async () => {
+    // 合成的 300 个排队任务与 40 条消息，经真实 readBoard 读出：整板回执远超预算，形状同 /tmp 复现的整板回执。
+    const board = await ownerApi(boardContext(boardFixtureDb(largeBoardFixture()).db), { command: 'board.snapshot', now: NOW }, 'agent');
+    expect(answerBytes(board)).toBeGreaterThan(RESPONSE_BUDGET_BYTES);
+    const guarded = guardRelayResponse({ ok: true as const, data: board }, companyCmdNarrowHint({ command: 'board.snapshot' }));
     expect(guarded).toMatchObject({ ok: false, code: 'response_too_large', retryable: false });
     const error = String((guarded as { error: string }).error);
     expect(error).toContain('board.task');
     expect(error).not.toContain('pageSize');
   });
 
-  test('board.task 的单任务答复在预算内；未知命令的错误不暗示无效参数', async () => {
+  test('同一大看板里，单任务的 board.task 答复在预算内，并保留真实队列位置与等待原因', async () => {
+    const status = await ownerApi(boardContext(boardFixtureDb(largeBoardFixture()).db),
+      { command: 'board.task', taskId: 'q-007', now: NOW }, 'agent') as BoardTaskStatus;
+    expect(status.queue).toMatchObject({ position: 8, of: 300, blocked: false, eligible: false });
+    expect(status.waiting).toMatchObject({ on: 'system', kind: 'no_candidate' });
+    expect(answerBytes(status)).toBeLessThan(RESPONSE_BUDGET_BYTES);
+    expect(guardRelayResponse({ ok: true as const, data: status }, companyCmdNarrowHint({ command: 'board.task' }))).toMatchObject({ ok: true });
+  });
+
+  test('单任务答复在预算内；本机工具之外的未知命令错误不暗示 pageSize', async () => {
     const status = await boardTask('t-queue');
     expect(answerBytes(status)).toBeLessThan(RESPONSE_BUDGET_BYTES);
     const guarded = guardRelayResponse({ ok: true as const, data: status }, companyCmdNarrowHint({ command: 'board.task' }));

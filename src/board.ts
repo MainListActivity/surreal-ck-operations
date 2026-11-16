@@ -640,7 +640,8 @@ export interface BoardTaskHolder {
   elapsedSeconds?: number;
   /** Unix milliseconds when the lease runs out. */
   leaseExpiresAt?: number;
-  progress?: BoardProgress;
+  /** The holder's latest action and when it happened. The text that action recorded is not carried here. */
+  progress?: Omit<BoardProgress, 'summary'>;
 }
 
 /** The per-task dispatch status `board.task` answers: queue position, block class, holder, freshness and candidate rows. */
@@ -691,7 +692,7 @@ export async function readBoardTask(db: Surreal, taskId: string, opts: { now?: n
   if (holderId) {
     const [claimRows, lastRows, employeeRows] = await Promise.all([
       rowsOf(db, "SELECT at FROM audit WHERE task = $task AND action = 'claim' ORDER BY at DESC LIMIT 1;", { task: row.id }),
-      rowsOf(db, `SELECT action, evidence, at FROM audit
+      rowsOf(db, `SELECT action, at FROM audit
         WHERE task = $task AND action != 'claim' AND !string::starts_with(action, 'ops_') ORDER BY at DESC LIMIT 1;`, { task: row.id }),
       rowsOf(db, 'SELECT id, role, def FROM $employee;', { employee: new RecordId('employee', holderId) }),
     ]);
@@ -707,7 +708,7 @@ export async function readBoardTask(db: Surreal, taskId: string, opts: { now?: n
       leaseActive: expires !== undefined && expires > nowSec,
       ...(claimAt !== undefined ? { leaseStartedAt: claimAt, elapsedSeconds: Math.max(0, Math.floor((now - claimAt) / 1000)) } : {}),
       ...(expires !== undefined ? { leaseExpiresAt: expires * 1000 } : {}),
-      ...(last ? { progress: { at: dateMs(last.at) ?? 0, action: String(last.action), label: labelOf(String(last.action)), summary: summaryOf(last.evidence) } } : {}),
+      ...(last ? { progress: { at: dateMs(last.at) ?? 0, action: String(last.action), label: labelOf(String(last.action)) } } : {}),
     };
   }
 
