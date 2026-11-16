@@ -259,7 +259,11 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
   if (state.digest !== digest && input.provider === 'devin-cloud' && (state.taskId || state.devin?.attempt)
     && !state.taskUrl && !state.vendorSession)
     return blocked(`上一轮 Devin Cloud 已按下发送（或发送中途中断）但未确认受理，且没有会话地址可核对；为避免另建重复会话，本轮未发出。在途登记已保留，请人工核对 app.devin.ai 会话列表后再决定是否重派。`);
-  if (state.digest !== digest) { delete next.taskId; delete next.taskUrl; delete next.submittedAt; }
+  if (state.digest !== digest) {
+    delete next.taskId; delete next.taskUrl; delete next.submittedAt;
+    // 落点会话属于旧摘要的发送，新摘要不沿用；仍在途的旧发送由共享登记另行决定。
+    if (next.devin) next.devin = { ...next.devin, attemptSession: undefined };
+  }
   // 本 comm 目录没有在途任务时查共享登记：同一公司任务换员工实例也能重连，而不是重复提交云端任务。
   if (!next.taskId) {
     const reg = readInflight(input.stateRoot, input.provider, digest);
@@ -268,10 +272,13 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
       next.taskUrl = reg.taskUrl;
       next.submittedAt = reg.submittedAt;
       next.vendorSession ??= reg.vendorSession;
+      if (input.provider === 'devin-cloud') next.devin = { ...next.devin, attemptSession: reg.attemptSession };
     } else if (reg?.attempt && input.provider === 'devin-cloud') {
       // 另一个员工目录已落下发送意图但还没有任务 ID：按在途处理，只核对是否已受理，绝不再次按发送。
+      // 登记里的落点会话（续轮的原会话）决定核对哪个会话，本目录的旧值不沿用。
       next.taskId = reg.attempt;
       next.submittedAt ??= reg.attemptAt;
+      next.devin = { ...next.devin, attemptSession: reg.attemptSession };
     }
   }
   try {

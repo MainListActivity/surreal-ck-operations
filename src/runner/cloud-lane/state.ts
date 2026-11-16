@@ -27,6 +27,11 @@ export interface DevinLaneState {
   /** 按下发送前落盘的本轮标记：进程在按下之后、拿到回执之前中断时，重启只做受理核对，不重发。 */
   attempt?: string;
   attemptAt?: number;
+  /**
+   * 未确认受理的这次发送落在哪个已有会话里（续轮的原会话）；受理或拿到会话地址后清掉（地址已由 taskUrl 记录）。
+   * 核对时只看这个会话；新会话发送没有，只能按标记在会话列表里找。
+   */
+  attemptSession?: string;
   /** 最近一次发送前核验的 Capability 与 N/M in use 席位读数（审计用，不含页面原文）。 */
   seats?: DevinSeatReading;
 }
@@ -64,6 +69,8 @@ export interface InflightEntry {
   taskId?: string; taskUrl?: string; submittedAt?: number; vendorSession?: string;
   /** 已按下发送但尚无 taskId 的发送意图：在碰发送按钮之前落盘，换员工目录也能看到，只核对不重发。 */
   attempt?: string; attemptAt?: number;
+  /** 未确认受理的续轮落点会话：换员工目录核对时只看这个会话，不退回别的会话、也不按标记乱找。 */
+  attemptSession?: string;
 }
 
 function inflightPath(stateRoot: string, provider: string, digest: string): string {
@@ -85,12 +92,14 @@ export function readInflight(stateRoot: string | undefined, provider: string, di
 
 /**
  * 发送意图的共享登记：必须在可能按下发送之前调用。换员工目录（不同 comm 目录、同一 stateRoot）
- * 或重启后按同一摘要读到它，就只核对是否已受理，绝不再次按下发送。
+ * 或重启后按同一摘要读到它，就只核对是否已受理，绝不再次按下发送。attemptSession 是续轮的原会话地址（新会话不传）。
  */
-export function recordInflightAttempt(stateRoot: string | undefined, provider: string, digest: string | undefined, attempt: string, at: number): void {
+export function recordInflightAttempt(stateRoot: string | undefined, provider: string, digest: string | undefined,
+  attempt: string, at: number, attemptSession?: string): void {
   if (!stateRoot || !digest) return;
-  const prev = readInflightRaw(stateRoot, provider, digest) ?? {};
-  writeInflight(stateRoot, provider, digest, { ...prev, attempt, attemptAt: at });
+  const { attemptSession: _previous, ...prev } = readInflightRaw(stateRoot, provider, digest) ?? {};
+  writeInflight(stateRoot, provider, digest,
+    { ...prev, attempt, attemptAt: at, ...(attemptSession ? { attemptSession } : {}) });
 }
 
 /** 撤销发送意图（确认没有按下发送时）。已有 taskId 的登记只去掉 attempt，不能误删在途任务。 */
@@ -98,7 +107,7 @@ export function clearInflightAttempt(stateRoot: string | undefined, provider: st
   if (!stateRoot || !digest) return;
   const prev = readInflightRaw(stateRoot, provider, digest);
   if (!prev?.attempt) return;
-  const { attempt: _attempt, attemptAt: _attemptAt, ...rest } = prev;
+  const { attempt: _attempt, attemptAt: _attemptAt, attemptSession: _session, ...rest } = prev;
   if (rest.taskId) writeInflight(stateRoot, provider, digest, rest);
   else clearInflight(stateRoot, provider, digest);
 }
@@ -120,6 +129,8 @@ export function clearInflight(stateRoot: string | undefined, provider: string, d
 /** 驱动提交到云端任务后落登记；没有 taskId（如 devin-cloud 拿不到云端会话 ID）时无登记可写。 */
 export function recordInflight(stateRoot: string | undefined, provider: string, digest: string | undefined, state: LaneState): void {
   if (!stateRoot || !digest || !state.taskId) return;
+  const session = state.devin?.attemptSession;
   writeInflight(stateRoot, provider, digest,
-    { taskId: state.taskId, taskUrl: state.taskUrl, submittedAt: state.submittedAt, vendorSession: state.vendorSession });
+    { taskId: state.taskId, taskUrl: state.taskUrl, submittedAt: state.submittedAt, vendorSession: state.vendorSession,
+      ...(session ? { attemptSession: session } : {}) });
 }

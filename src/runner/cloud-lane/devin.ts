@@ -85,9 +85,14 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
     delete state.devin.attempt;
     delete state.devin.attemptAt;
   };
+  /** 受理或拿到会话地址后，落点会话由 taskUrl 记录，不再单独保留。 */
+  const forgetAttemptSession = () => {
+    if (state.devin) delete state.devin.attemptSession;
+  };
   /** 确认没有按下发送：本目录与共享登记里的发送意图一起撤销，之后才允许再试。 */
   const abandonAttempt = () => {
     dropLocalAttempt();
+    forgetAttemptSession();
     clearInflightAttempt(input.stateRoot, input.provider, ctx.digest);
   };
   const loginFail = () => fail('app.devin.ai 未登录或登录已过期（需要老板在 ego-browser 里重新登录 Devin）');
@@ -101,11 +106,9 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
     state.devin = { ...state.devin, seats: { step, cap: reply.cap, used: seats.used, total: seats.total, at: deps.now() } };
   };
 
-  // 上一轮残留的发送标记：同一摘要说明按下过发送却没有定论（进程中断），只核对不重发；旧摘要的残留直接清掉。
-  if (state.devin?.attempt && state.devin.attempt !== marker) {
-    clearInflightAttempt(input.stateRoot, input.provider, state.digest);
-    dropLocalAttempt();
-  }
+  // 本目录残留的旧摘要发送标记：只丢掉本目录这一份。旧摘要的共享登记保留（无法确定它是否已按下，只核对不重发）；
+  // 本摘要的共享登记可能正属于别的员工目录的在途发送，这里绝不能清。
+  if (state.devin?.attempt && state.devin.attempt !== marker) { dropLocalAttempt(); forgetAttemptSession(); }
   if (state.devin?.attempt === marker && !state.taskId) {
     state.taskId = marker;
     state.submittedAt ??= deps.now();
@@ -116,7 +119,9 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
   }
 
   // ---- 阶段一：确定本轮会话地址。只有这里会按下发送，且只在「尚未按下」时发送。 ----
-  let sessionUrl = state.taskId ? (sessionOf(state.taskUrl) ?? sessionOf(state.vendorSession)) : undefined;
+  // 只认本轮自己记下的会话地址。vendorSession 是之前回合的会话，不能拿来核对当前的在途发送：
+  // 未确认受理的发送看 attemptSession（续轮原会话）或会话列表（新会话），见下方恢复分支。
+  let sessionUrl = state.taskId ? sessionOf(state.taskUrl) : undefined;
   let recoverMisses = 0, capabilityMisses = 0;
   while (!sessionUrl) {
     if (!state.taskId) {
@@ -124,11 +129,11 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
       // 按下发送前先落盘 attempt：本目录写 .lane/state.json，共享根写 inflight/<digest>.json。
       // 之后无论脚本如何结束、换到哪个员工目录，都只核对是否已受理，绝不再按发送。
       const at = deps.now();
-      state.devin = { ...state.devin, attempt: marker, attemptAt: at };
-      recordInflightAttempt(input.stateRoot, input.provider, ctx.digest, marker, at);
+      state.devin = { ...state.devin, attempt: marker, attemptAt: at, attemptSession: follow };
+      recordInflightAttempt(input.stateRoot, input.provider, ctx.digest, marker, at, follow);
       persist();
       deps.progress(follow ? `尝试在原 Devin 会话发送本轮消息（${marker}）` : `尝试新建 Devin Cloud 会话（${marker}）`, 'attempt');
-      const r = await browse(follow ? devinFollowScript(follow, marker, message) : devinSendScript(home, marker, message), 150_000) as Reply;
+      const r = await browse(follow ? devinFollowScript(follow, marker, message, home) : devinSendScript(home, marker, message), 150_000) as Reply;
       const url = sessionOf(r?.url) ?? sessionOf(r?.recovered);
       const accepted = r?.ok === true && url !== undefined;
       // ok 即脚本已越过按下发送；拿不到会话地址也只能核对，绝不当成未发出而重发。
@@ -161,6 +166,7 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
         sessionUrl = url;
         state.taskId = marker; state.taskUrl = url; state.vendorSession = url; state.submittedAt = deps.now();
         dropLocalAttempt();
+        forgetAttemptSession();
         readSeats(follow ? 'follow' : 'send', r);
         persist();
         const seat = state.devin?.seats;
@@ -174,7 +180,8 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
         // 已按下发送但拿不到受理证据：记为本轮在途，接下来只做核对，绝不重发。
         sessionUrl = url;
         state.taskId = marker; state.submittedAt = deps.now();
-        if (url) { state.taskUrl = url; state.vendorSession = url; }
+        // 没拿到会话地址时保留落点会话（续轮的原会话），之后的核对只看它；拿到地址后由 taskUrl 记录。
+        if (url) { state.taskUrl = url; state.vendorSession = url; forgetAttemptSession(); }
         dropLocalAttempt();
         persist();
         deps.progress(`Devin Cloud 已按下发送但未确认受理（${marker}），转入核对，不重发`, 'failed');
@@ -186,19 +193,28 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
       await deps.sleep(pollMs);
       continue;
     }
-    // 在途但会话地址未知：只核对受理，绝不再发送。
-    const r = await browse(devinRecoverScript(home, marker), 150_000) as Reply;
+    // 在途但会话地址未知：只核对受理，绝不再发送。续轮的落点会话只看它的转录（有本轮标记才算受理）；
+    // 新会话的落点未知，才在会话列表与最近会话里按标记找。
+    const pending = state.devin?.attemptSession;
+    const r = pending
+      ? await browse(devinSessionScript(pending, marker), 90_000) as Reply
+      : await browse(devinRecoverScript(home, marker), 150_000) as Reply;
     if (r?.code === 'login_required') return loginFail();
-    const found = sessionOf(r?.found);
+    const found = pending ? (r?.ok === true && r?.markerSeen === true ? pending : undefined) : sessionOf(r?.found);
     if (found) {
       sessionUrl = found;
       state.taskUrl = found; state.vendorSession = found;
+      dropLocalAttempt(); forgetAttemptSession();
       persist();
       deps.progress(`Devin Cloud 会话已核对受理：${found}`, 'accepted');
       break;
     }
-    if (++recoverMisses >= RECOVERY_LIMIT || over())
-      return blocked(`Devin Cloud 已按下发送，但会话列表与最近会话里都没有找到本轮标记（${marker}；列表 ${String(r?.listed ?? '?')} 条，核对 ${String(r?.probed ?? '?')} 条）。无法确认是否已受理，所以未自动重发（避免重复会话与席位）。请人工核对 app.devin.ai 会话列表：已受理则在原会话里看结果，未受理再由老板决定是否重派。在途状态已保留。`);
+    if (++recoverMisses >= RECOVERY_LIMIT || over()) {
+      const scope = pending
+        ? `原会话 ${pending} 里都没有找到本轮标记（${marker}）`
+        : `会话列表与最近会话里都没有找到本轮标记（${marker}；列表 ${String(r?.listed ?? '?')} 条，核对 ${String(r?.probed ?? '?')} 条）`;
+      return blocked(`Devin Cloud 上一轮发送可能已按下，但${scope}。无法确认是否已受理，所以未自动重发（避免重复会话与席位）。请人工核对 app.devin.ai ${pending ? '原会话' : '会话列表'}：已受理则在原会话里看结果，未受理再由老板决定是否重派。在途状态已保留。`);
+    }
     deps.progress(`Devin Cloud 受理核对中（${marker}），暂未见本轮标记`, 'failed');
     await deps.sleep(pollMs);
   }

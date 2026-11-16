@@ -5,17 +5,21 @@
  * - Capability 触发按钮：innerText 正好是 Fusion/Ultra/Normal/Lite/Free 之一的 button；
  *   弹出层是 [role=menu]，里面 "Capability" 分组下有同名行；选中 Free 后页面出现
  *   "Free (powered by SWE-2)"、"The plan includes 2 concurrent sessions"、"N/M in use"。
+ * - 席位文字只在首页 Capability 菜单打开、选中 Free 时出现；按 Escape 后文字消失（菜单元素仍在），
+ *   所以必须在点选 Free 之后、菜单仍打开时回读。会话页的 Capability 按钮是 disabled，菜单打不开，读不到席位，
+ *   续轮因此先到组织首页读席位，再回原会话发送。
  * - 会话地址 https://app.devin.ai/sessions/<32hex>；侧栏 a[href^="/sessions/"] 列出会话。
  * - 会话页转录的发言角色按 2026-11-16 真实只读实测：Devin 回答块是
  *   [data-testid="transcript-agent-message"]，文字在 [data-message-author="devin"]；
  *   用户/自动化消息是 [data-testid="transcript-user-message"]，文字在 [data-message-author="user"]。
- *   工具输出与状态是独立的 [data-testid="transcript-worklog-row"]、PR 卡片等，没有作者属性。
+ *   工具输出与状态是独立的 [data-testid="transcript-worklog-row"]、PR 卡片等，没有作者属性；
+ *   只读核实的一个会话里，worklog 行既不在作者块内，也不在 transcript-agent-message 容器内。
  *   状态行有 "Devin is working"、"Devin is awaiting instructions"、"Devin chose to stop working"、
  *   "blocked on the user"。会话页 Capability 按钮显示该会话的档位（Free）。
  *
- * 终稿与状态只看「本轮收尾约定之后」的内容，且终稿只认 Devin 的发言块：用户消息、收尾约定本身的例子、
- * 工具输出里的 DONE/PR 都不算。派工消息、旧轮次残留的 DONE 或状态短语、用户例子都在本轮用户消息之前或
- * 属于无作者块，不参与判定。找不到作者块时终稿保持 null（不拿整段 main 文本冒充助手回复）。
+ * 终稿只看「本轮收尾约定之后」的 Devin 发言块：用户消息、收尾约定本身的例子、工具输出里的 DONE/PR 都不算。
+ * 状态短语只看「最近一次收尾约定之后」的文字：发送前是上一轮之后，发送后是本轮之后；更早轮次残留的状态不算。
+ * 找不到作者块时终稿保持 null（不拿整段 main 文本冒充助手回复）。
  * 发送不是幂等的：按下 Send 前打印 __PRESSED__，脚本中途死掉时执行端知道「可能已发出」，绝不重发，
  * 而是回会话列表/原会话按本轮标记核对是否已受理。
  */
@@ -65,7 +69,7 @@ const read = () => p.evaluate(() => {
   const mainText = ((document.querySelector('main') ?? document.body).innerText || '');
   const body = document.body.innerText || '';
   const TASK = ${JSON.stringify(`[SCK-ROUND ${marker}]`)}, DONE = ${JSON.stringify(`[SCK-DONE ${marker}]`)};
-  const QUOTED = ${JSON.stringify(`「[SCK-DONE ${marker}]」`)};
+  const QUOTED = ${JSON.stringify(`「[SCK-DONE ${marker}]」`)}, CONV_OPEN = ${JSON.stringify('「[SCK-DONE ')};
   const capButton = [...document.querySelectorAll('button')].find(e => /^(${CAPS.join('|')})$/.test((e.innerText || '').trim()));
   // 发言人只能按页面给出的角色块判定：Devin 回答是 [data-message-author="devin"]，用户消息是
   // [data-message-author="user"]。工具输出、worklog、PR 卡片没有作者属性，永远不参与终稿判定。
@@ -91,9 +95,11 @@ const read = () => p.evaluate(() => {
       }
     }
   }
-  // 状态短语只取本轮收尾约定之后的文字；回答区之前的旧轮次状态短语不算。
+  // 状态短语只看「最近一次收尾约定」之后的文字：发送前这条约定属于上一轮（上一轮还在跑时状态就在它之后），
+  // 发送后就是本轮之后。更早轮次残留的状态短语不算；页面上一条收尾约定都没有时区域为空，状态 unknown。
   const at = mainText.lastIndexOf(QUOTED);
-  const region = at >= 0 ? mainText.slice(at + QUOTED.length) : '';
+  const lastConv = mainText.lastIndexOf(CONV_OPEN);
+  const region = lastConv >= 0 ? mainText.slice(lastConv) : '';
   const lastAt = (re) => { let idx = -1, m; const g = new RegExp(re.source, 'gi'); while ((m = g.exec(region))) idx = m.index; return idx; };
   const hits = [['working', lastAt(/Devin is working/)], ['blocked', lastAt(/blocked on the user/)], ['idle', lastAt(/Devin is awaiting instructions|Devin chose to stop working/)]]
     .filter(h => h[1] >= 0).sort((a, b) => b[1] - a[1]);
@@ -117,25 +123,76 @@ const read = () => p.evaluate(() => {
 });`;
 }
 
-/** 脚本模式：测试与执行端据此区分发送/跟进/受理核对/轮询脚本。 */
+/**
+ * 脚本模式：测试与执行端据此区分发送/跟进/受理核对/轮询脚本。
+ * openPage 在同一个标签页里换地址并等它就绪：续轮要先到组织首页读席位，再回原会话发送。
+ */
 function prelude(url: string, mode: string): string {
   return `
 const MODE = ${JSON.stringify(mode)};
 const emit = (r) => { console.log('__RESULT__' + JSON.stringify(r)); };
 const space = await taskSpace(${JSON.stringify(DEVIN_SPACE)});
 const p = (await space.pages())[0] ?? await space.newPage();
-await p.goto(${JSON.stringify(url)}).catch(() => {});
-await p.waitForTimeout(3000);
 ${readBody('__MARKER__')}
-let ready = false, prevLen = -1;
-for (let i = 0; i < 14 && !ready; i++) {
-  const r = await p.evaluate(() => ({ input: !!document.querySelector(${JSON.stringify(INPUT)}), len: (document.body.innerText || '').length }));
-  ready = r.input && r.len > 0 && r.len === prevLen;
-  prevLen = r.input ? r.len : -1;
-  if (!ready) await p.waitForTimeout(1500);
-}
+let ready = false;
+// 输入框在，且正文长度连续两次读数一致，才算就绪。
+const waitReady = async () => {
+  let ok = false, prevLen = -1;
+  for (let i = 0; i < 14 && !ok; i++) {
+    const r = await p.evaluate(() => ({ input: !!document.querySelector(${JSON.stringify(INPUT)}), len: (document.body.innerText || '').length }));
+    ok = r.input && r.len > 0 && r.len === prevLen;
+    prevLen = r.input ? r.len : -1;
+    if (!ok) await p.waitForTimeout(1500);
+  }
+  return ok;
+};
+const openPage = async (target) => {
+  await p.goto(target).catch(() => {});
+  await p.waitForTimeout(3000);
+  ready = await waitReady();
+};
+await openPage(${JSON.stringify(url)});
 `;
 }
+
+/** 会话页核验（续轮）：登录、就绪、档位必须是 Free、没有本轮标记、不在忙。返回 null 表示可以继续。 */
+const SESSION_GATE = `
+const sessionGate = (x) => {
+  if (x.login) return { ok: false, code: 'login_required' };
+  if (!ready) return { ok: false, code: 'not_ready' };
+  if (x.cap !== 'Free') return { ok: false, code: 'capability', detail: '会话 Capability 显示 ' + String(x.cap) + '，不是 Free' };
+  if (x.markerSeen) return { ok: true, already: true, url: x.url, cap: 'Free', seats: x.seats };
+  if (x.status === 'working') return { ok: false, code: 'busy' };
+  return null;
+};`;
+
+/**
+ * 组织首页选中 Free 并回读席位。席位文字只在 Capability 菜单打开、选中 Free 时出现（按 Escape 后消失，实测），
+ * 所以不管当前显示什么档位都打开菜单点 Free 行，然后在菜单仍打开时读页面。
+ */
+const PICK_FREE = `
+const pickFree = async () => {
+  await p.evaluate(() => { const b = [...document.querySelectorAll('button')].find(e => /^(Fusion|Ultra|Normal|Lite|Free)$/.test((e.innerText || '').trim())); if (b) b.click(); });
+  await p.waitForTimeout(1200);
+  await p.evaluate(() => {
+    const menu = document.querySelector('[role=menu]');
+    const row = menu && [...menu.querySelectorAll('div,button,[role=menuitemradio],[role=option]')].find(e => (e.innerText || '').trim() === 'Free');
+    if (row) row.click();
+  });
+  await p.waitForTimeout(1500);
+  s = await read();
+};`;
+
+/** 组织首页核验（新会话与续轮共用）：选中 Free 且 powered、读得到席位、未满。都不通过就不碰发送按钮。 */
+const HOME_GATE = `
+const homeGate = (x) => {
+  if (x.login) return { ok: false, code: 'login_required' };
+  if (!ready) return { ok: false, code: 'not_ready' };
+  if (x.cap !== 'Free' || !x.powered) return { ok: false, code: 'capability', detail: 'Capability 未能确认选中 Free（按钮=' + String(x.cap) + '，powered=' + String(x.powered) + '）' };
+  if (!x.seats) return { ok: false, code: 'capability', detail: '页面读不到 Free 席位计数，无法核验容量' };
+  if (x.seats.used >= x.seats.total) return { ok: false, code: 'quota_full', seats: x.seats.used + '/' + x.seats.total, cap: 'Free' };
+  return null;
+};`;
 
 function withMarker(script: string, marker: string): string {
   return script.replaceAll('__MARKER__', marker);
@@ -152,21 +209,28 @@ emit({ ok: true, url: s.url, cap: s.cap, seats: s.seats, source: s.source, marke
 }
 
 /**
- * 续轮：在原会话里发下一条消息。发送前核验 Capability 仍是 Free 且读得到席位、未满（与新会话同一标准）。
- * 会话正忙回 busy；席位满回 quota_full；核验不过回 capability；两者都不会碰发送按钮。
+ * 续轮：在原会话里发下一条消息。会话页的 Capability 按钮是 disabled、菜单打不开，读不到席位，
+ * 所以先看原会话（Free、没有本轮标记、不在忙），再到组织首页选中 Free 读席位（同新会话的标准），
+ * 最后回原会话核验一次才按下发送。会话忙回 busy；席位满回 quota_full；核验不过回 capability；都不碰发送按钮。
  */
-export function devinFollowScript(sessionUrl: string, marker: string, message: string): string {
+export function devinFollowScript(sessionUrl: string, marker: string, message: string, home: string = DEVIN_HOME): string {
   return withMarker(`${prelude(sessionUrl, 'follow')}
 const MSG = ${JSON.stringify(message)};
+${SESSION_GATE}
+${PICK_FREE}
+${HOME_GATE}
 let s = await read();
-if (s.login) { emit({ ok: false, code: 'login_required' }); process.exit(0); }
-if (!ready) { emit({ ok: false, code: 'not_ready' }); process.exit(0); }
-if (s.cap !== 'Free') { emit({ ok: false, code: 'capability', detail: '会话 Capability 显示 ' + String(s.cap) + '，不是 Free' }); process.exit(0); }
-if (s.markerSeen) { emit({ ok: true, already: true, url: s.url, cap: 'Free', seats: s.seats }); process.exit(0); }
-if (s.status === 'working') { emit({ ok: false, code: 'busy' }); process.exit(0); }
-if (!s.seats) { emit({ ok: false, code: 'capability', detail: '会话页读不到 N/M in use 席位计数，无法核验容量' }); process.exit(0); }
-if (s.seats.used >= s.seats.total) { emit({ ok: false, code: 'quota_full', seats: s.seats.used + '/' + s.seats.total, cap: 'Free' }); process.exit(0); }
+const firstStop = sessionGate(s);
+if (firstStop) { emit(firstStop); process.exit(0); }
+await openPage(${JSON.stringify(home)});
+await pickFree();
+const homeStop = homeGate(s);
+if (homeStop) { emit(homeStop); process.exit(0); }
 const pre = s.seats;
+await openPage(${JSON.stringify(sessionUrl)});
+s = await read();
+const againStop = sessionGate(s);
+if (againStop) { emit(againStop); process.exit(0); }
 const target = 'css:' + ${JSON.stringify(INPUT)};
 await p.fill(target, MSG);
 await p.waitForTimeout(500);
@@ -189,6 +253,8 @@ emit(s.markerSeen ? { ok: true, url: s.url, cap: 'Free', seats: pre, echoed: tru
 export function devinSendScript(home: string, marker: string, message: string): string {
   return withMarker(`${prelude(home, 'send')}
 const MSG = ${JSON.stringify(message)};
+${PICK_FREE}
+${HOME_GATE}
 let s = await read();
 if (s.login) { emit({ ok: false, code: 'login_required' }); process.exit(0); }
 if (!ready) { emit({ ok: false, code: 'not_ready' }); process.exit(0); }
@@ -201,21 +267,10 @@ const found = await p.evaluate((T) => {
   return null;
 }, TASK);
 if (found) { emit({ ok: true, recovered: found, cap: 'Free' }); process.exit(0); }
-// 选中 Free：触发按钮不是 Free 时打开 Capability 菜单点 Free 行，然后回读页面文字核验。
-if (s.cap !== 'Free') {
-  await p.evaluate(() => { const b = [...document.querySelectorAll('button')].find(e => /^(Fusion|Ultra|Normal|Lite|Free)$/.test((e.innerText || '').trim())); if (b) b.click(); });
-  await p.waitForTimeout(1200);
-  await p.evaluate(() => {
-    const menu = document.querySelector('[role=menu]');
-    const row = menu && [...menu.querySelectorAll('div,button,[role=menuitemradio],[role=option]')].find(e => (e.innerText || '').trim() === 'Free');
-    if (row) row.click();
-  });
-  await p.waitForTimeout(1500);
-  s = await read();
-}
-if (s.cap !== 'Free' || !s.powered) { emit({ ok: false, code: 'capability', detail: 'Capability 未能确认选中 Free（按钮=' + String(s.cap) + '，powered=' + String(s.powered) + '）' }); process.exit(0); }
-if (!s.seats) { emit({ ok: false, code: 'capability', detail: '页面读不到 Free 席位计数，无法审计容量' }); process.exit(0); }
-if (s.seats.used >= s.seats.total) { emit({ ok: false, code: 'quota_full', seats: s.seats.used + '/' + s.seats.total, cap: 'Free' }); process.exit(0); }
+// 选中 Free 并在菜单打开时回读席位，然后核验；都不过就不碰发送按钮。
+await pickFree();
+const stop = homeGate(s);
+if (stop) { emit(stop); process.exit(0); }
 const pre = s.seats;
 const target = 'css:' + ${JSON.stringify(INPUT)};
 await p.fill(target, MSG);
