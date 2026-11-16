@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { employeeModelEnv } from '../src/runner/model-env.ts';
 import { NativeRuntime } from '../src/runner/native.ts';
-import { scrubEnv, SANDBOX_MARKER } from '../src/runner/launch-env.ts';
+import { nativeEmployeeEnv } from '../src/runner/native-env.ts';
 import type { TurnEnded } from '../src/runner/contracts.ts';
 
 const switches = { CLAUDE_CODE_ENABLE_TODO_TOOLS: '1', CLAUDE_CODE_ENABLE_TASKS: '0' };
@@ -95,7 +95,7 @@ test.skipIf(process.platform !== 'darwin')('原生子进程穿过员工沙盒后
         const channel = {SCK_COMM_DIR:f.comm};
         const inherited = {PATH:'/usr/bin:/bin',HOME:process.env.HOME??'/tmp',...opposite};
         const modelEnv = employeeModelEnv({agentId:session.id,provider:session.provider,env:channel,runtime:'native'},f.sidecar,f.root);
-        return {...inherited,...scrubEnv(channel,inherited),...SANDBOX_MARKER,...modelEnv,INSPECTION_FILE:inspectionFile};
+        return nativeEmployeeEnv({inherited,channel,modelEnv,lane:{INSPECTION_FILE:inspectionFile},zdotdir:join(f.root,'zdot')});
       },onEnded:async event=>{events.push(event);},
     });
     const id = await runtime.spawn({provider:'claude',title:'fixture',model:'group/sck-sonnet',cwd:f.root,workspaceTitle:'fixture',labels:{employee_id:'employee'},env:{},prompt:'fixture only'});
