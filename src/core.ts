@@ -10,6 +10,7 @@ import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateTask, C
 import { OwnerDesk } from './owner.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
 import { ghCli, type GhRunner, type SubmitCheck } from './pr-gate.ts';
+import { parseActionRuns, type ActionRuns } from './ci-runs.ts';
 import { githubRepoSlug } from './external-actions.ts';
 import type { SystemCheck } from './submit-checks.ts';
 import { ProjectStore } from './projects.ts';
@@ -396,13 +397,14 @@ function historyEntry(row: AuditHistoryRow, limit?: number): HistoryEntry {
   return entry(longestFittingPrefix(full, text => dualBytes(entry(text, true)) <= limit), true);
 }
 
-/** The workflow runs found for one submitted sha: each is verified by the acceptance adapter before evidence lands. */
-export type AcceptanceRunLister = (slug: string, sha: string, run?: GhRunner) => Promise<string[]>;
+/** The workflow runs of one submitted sha, grouped as success, waiting and failed: successful ones are verified by the acceptance adapter before evidence lands. */
+export type AcceptanceRunLister = (slug: string, sha: string, run?: GhRunner) => Promise<ActionRuns>;
 const defaultRunLister: AcceptanceRunLister = async (slug, sha, run = ghCli) => {
   // The same gh invocation family pr-gate/github-ci-control use: read-only `gh api` against the Actions runs API.
-  const out = await run(['api', `repos/${slug}/actions/runs?head_sha=${sha}&status=completed&per_page=10`, '--jq',
-    '.workflow_runs[] | select(.conclusion == "success") | .html_url']);
-  return out.split(/\r?\n/).map(line => line.trim()).filter(line => /^https:\/\/github\.com\//.test(line)).slice(0, 5);
+  // Every run of the sha is read, not only completed ones, so a queued or running CI can be told apart from a failed one.
+  const out = await run(['api', `repos/${slug}/actions/runs?head_sha=${sha}&per_page=30`, '--jq',
+    '.workflow_runs[] | [.status, (.conclusion // ""), .html_url] | @tsv']);
+  return parseActionRuns(out);
 };
 
 export class SurrealCompanyCore implements CompanyCore {
@@ -2037,12 +2039,19 @@ export class SurrealCompanyCore implements CompanyCore {
           if (!slug) {
             throw new CompanyError('invalid', `submit sha ${head}: the task's code repository has no GitHub remote; record the acceptance evidence with record_acceptance_evidence or fix the remote`);
           }
-          let urls: string[] = [];
-          try { urls = await this.acceptanceRuns(slug, head); } catch (error) {
-            throw new CompanyError('invalid', `submit sha ${head}: GitHub run lookup failed (${(error as Error).message}); retry after the CI run completes`);
+          let runs: ActionRuns;
+          try { runs = await this.acceptanceRuns(slug, head); } catch (error) {
+            // CI state that cannot be read yet is a wait, bounded by the executor's wait limit; it is no verdict on the work.
+            throw new CompanyError('ci_pending', `submit sha ${head}: CI 状态查询失败（${(error as Error).message}），稍后自动重试`, true);
           }
+          const urls = runs.success;
           if (!urls.length) {
-            throw new CompanyError('invalid', `submit sha ${head}: no successful completed GitHub Actions run found for this sha in ${slug}; retry after CI completes successfully`);
+            if (runs.failed.length && runs.waiting === 0) {
+              throw new CompanyError('ci_failed',
+                `submit sha ${head}: CI 失败，${slug} 中该提交没有成功的 GitHub Actions run（失败：${runs.failed.slice(0, 3).join('、')}）；修复后重新跑通 CI 才能送审`);
+            }
+            throw new CompanyError('ci_pending',
+              `submit sha ${head}: CI 尚未成功，${slug} 中该提交的 GitHub Actions run ${runs.waiting ? `有 ${runs.waiting} 个排队或运行中` : '尚未出现'}；完成后自动接续送审`, true);
           }
           let covered = 0; const reasons: string[] = [];
           for (const criterion of needed) {

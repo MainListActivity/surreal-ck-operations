@@ -29,9 +29,9 @@
 
 `CompanyError.code` 为错误码的权威来源（`src/core-errors.ts`）。完整列表包括：
 
-`unauthorized`、`forbidden`、`not_found`、`conflict`、`invalid`、`worktree_busy`、`already_claimed`、`lease_expired`、`self_review`、`temporarily_unavailable`、`checkpoint_limit`、`not_configured`、`unavailable`、`payment_approval_required`、`upstream_error`、`login_failed`、`limit_reached`、`response_too_large`、`snapshot_gone`、`retire_refused`。
+`unauthorized`、`forbidden`、`not_found`、`conflict`、`invalid`、`worktree_busy`、`already_claimed`、`lease_expired`、`self_review`、`temporarily_unavailable`、`checkpoint_limit`、`not_configured`、`unavailable`、`payment_approval_required`、`upstream_error`、`login_failed`、`limit_reached`、`response_too_large`、`snapshot_gone`、`retire_refused`、`ci_pending`、`ci_failed`。
 
-`retryable` 为 true 的只有 `temporarily_unavailable`，表示数据库争用已在内部有限次重试后仍失败。其他错误需要调用方改变请求或状态后再试。
+`retryable` 为 true 的有两个：`temporarily_unavailable` 表示数据库争用已在内部有限次重试后仍失败；`ci_pending` 表示提交的成果对应的 CI 尚未成功（排队、运行中或尚未出现），等待后同一成果可以再送审。其他错误需要调用方改变请求或状态后再试。`ci_failed` 表示 CI 已跑完且该提交没有成功的运行，需要修复后重新跑通 CI 才能送审。
 
 ## 数据库访问
 

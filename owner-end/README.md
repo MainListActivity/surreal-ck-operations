@@ -117,10 +117,10 @@
 | `forbidden` | 403 | 不是老板、员工无权调用、来源不同源、系统身份调用老板命令 |
 | `invalid` | 400 | 请求不合法（含 `response_too_large`） |
 | `not_found` | 404 | 接口或资源不存在 |
-| `conflict` | 409 | `worktree_busy`、`already_claimed`、`lease_expired`、`self_review`、`checkpoint_limit`、`payment_approval_required`、`limit_reached`、`snapshot_gone`、`retire_refused`。其它未列出的业务错误也归为这里 |
+| `conflict` | 409 | `worktree_busy`、`already_claimed`、`lease_expired`、`self_review`、`checkpoint_limit`、`payment_approval_required`、`limit_reached`、`snapshot_gone`、`retire_refused`、`ci_failed`（CI 已跑完且没有成功运行）。其它未列出的业务错误也归为这里 |
 | `pending` | 202 | 执行端作业超过 25 秒仍未完成。`error.message` 和 `error.jobId` 都是任务号，之后用 `ops.job.get` 取结果 |
 | `upstream_error` | 502 | 数据库、身份服务或译文服务失败（含占位标记丢失）。未知的内部错误也归入这里，只返回“服务暂时出错，请稍后重试” |
-| `unavailable` | 503 | `temporarily_unavailable`、`not_configured`、`unavailable` |
+| `unavailable` | 503 | `temporarily_unavailable`、`not_configured`、`unavailable`、`ci_pending`（CI 尚未成功，等待后可再试） |
 
 ### 执行端作业
 
