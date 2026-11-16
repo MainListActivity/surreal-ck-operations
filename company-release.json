@@ -1,5 +1,5 @@
 {
-  "version": "0.13.30",
+  "version": "0.13.41",
   "title": "Devin 云端改走网页 Free 档位：有界受理核对，不重发，终稿只认本轮",
   "changes": [
     "devin-cloud 不再执行 devin --cloud --model free（Devin CLI 3000.x 拒绝该参数，云免费只在网页）。新入口 devin-web.ts 用 ego-browser 驱动 app.devin.ai。",
