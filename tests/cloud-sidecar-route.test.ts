@@ -11,6 +11,8 @@ import { GatewayClient } from '../src/cloud/gateway.ts';
 import { IdpClient, type IssuedToken } from '../src/cloud/idp.ts';
 import { AgentTokenCache } from '../src/cloud/agent-tokens.ts';
 import { HARD_OWNER_ONLY, OWNER_API_COMMANDS, matchesCommand } from '../src/command-guard.ts';
+import { CompanyError } from '../src/core-errors.ts';
+import { createOwnerJobStore, pendingReply, type OwnerJobStore, type Reply as JobReply } from './support/owner-job-contract.ts';
 
 // ma_hono（身份服务）与公司网关都用本地 mock，不连真实服务。
 const CLIENT_ID = 'runner-client';
@@ -28,6 +30,34 @@ const gwCalls: GwCall[] = [];
 /** 本测试进程里 ma_hono mock 发出过的全部令牌；用来做"不出现"扫描。 */
 const issued = new Set<string>();
 const jobPolls = new Map<string, number>();
+/** 每个作业由哪条命令入队，执行进度脚本据此推进（见 jobReply）。 */
+const jobCommands = new Map<string, string>();
+/** 老板端作业存储：入队与 ops.job.get 都是真实代码，每个测试重建。 */
+let jobs: OwnerJobStore;
+/** 这些命令走执行端作业：网关先回 202 待取，之后由 ops.job.get 取结果。 */
+const ASYNC_COMMANDS = new Set(['ops_slow', 'ops_failjob', 'ops_authfail', 'ops_authword', 'ops_pollauth']);
+
+/**
+ * 执行端进度脚本，写回用真实的 storeResult / failure（见 tests/support/owner-job-contract.ts）：
+ * ops_slow 第 1 次轮询 running，第 3 次 done；ops_failjob 第 1 次写回 forbidden，说明里回显了令牌（客户端须隐藏）；
+ * ops_authfail 写回类别 unauthorized；ops_authword 写回一句像鉴权失败的说明但类别是上游失败；
+ * ops_pollauth 每次轮询都被网关拒绝（401）。ops.job.get 本身走老板端真实命令。
+ */
+async function jobReply(bearer: string, input: Record<string, unknown>): Promise<JobReply> {
+  const id = String(input.id ?? '');
+  const command = jobCommands.get(id);
+  const polls = (jobPolls.get(id) ?? 0) + 1;
+  jobPolls.set(id, polls);
+  if (command === 'ops_pollauth') return { status: 401, body: { ok: false, error: { code: 'unauthorized', message: '令牌已失效' } } };
+  if (command === 'ops_slow') {
+    if (polls === 1) jobs.start(id);
+    if (polls === 3) jobs.succeed(id, { value: 42 });
+  }
+  if (polls === 1 && command === 'ops_failjob') jobs.fail(id, new CompanyError('forbidden', `denied for ${bearer}`));
+  if (polls === 1 && command === 'ops_authfail') jobs.fail(id, new CompanyError('unauthorized', '登录令牌已失效'));
+  if (polls === 1 && command === 'ops_authword') jobs.fail(id, new Error('invalid credential from upstream'));
+  return jobs.getJob(input);
+}
 
 let idpServer: ReturnType<typeof Bun.serve>;
 let gwServer: ReturnType<typeof Bun.serve>;
@@ -61,23 +91,21 @@ beforeAll(() => {
     async fetch(req) {
       if (req.method !== 'POST' || new URL(req.url).pathname !== '/api/cmd') return json({ ok: false, error: { code: 'not_found', message: 'x' } }, 404);
       const auth = req.headers.get('authorization') ?? '';
-      const body = (await req.json()) as { command: string; input?: { id?: string } };
+      const body = (await req.json()) as { command: string; input?: Record<string, unknown> };
       gwCalls.push({ auth, command: body.command, input: body.input });
       const bearer = auth.replace(/^Bearer /, '');
       if (!issued.has(bearer)) return json({ ok: false, error: { code: 'unauthorized', message: 'invalid token' } }, 401);
-      if (body.command === 'ops_slow') return json({ ok: false, error: { code: 'pending', message: 'job-1' } }, 202);
-      if (body.command === 'ops_failjob') return json({ ok: false, error: { code: 'pending', message: 'job-2' } }, 202);
-      if (body.command === 'ops_leak') return json({ ok: false, error: { code: 'forbidden', message: `refused for ${bearer}` } }, 403);
       if (body.command === 'ops.job.get') {
-        const id = body.input?.id ?? '';
-        const polls = (jobPolls.get(id) ?? 0) + 1;
-        jobPolls.set(id, polls);
-        if (id === 'job-1') {
-          const job = polls < 3 ? { id, state: 'running' } : { id, state: 'done', result: { value: 42 } };
-          return json({ ok: true, result: job });
-        }
-        if (id === 'job-2') return json({ ok: true, result: { id, state: 'error', error: { code: 'forbidden', message: `denied for ${bearer}` } } });
+        const reply = await jobReply(bearer, body.input ?? {});
+        return json(reply.body, reply.status);
       }
+      if (ASYNC_COMMANDS.has(body.command)) {
+        const id = await jobs.enqueue(body.command, body.input ?? {});
+        jobCommands.set(id, body.command);
+        const pending = pendingReply(id);
+        return json(pending.body, pending.status);
+      }
+      if (body.command === 'ops_leak') return json({ ok: false, error: { code: 'forbidden', message: `refused for ${bearer}` } }, 403);
       return json({ ok: true, result: { echoed: body.command } });
     },
   });
@@ -221,6 +249,8 @@ beforeEach(() => {
   gwCalls.length = 0;
   issued.clear();
   jobPolls.clear();
+  jobCommands.clear();
+  jobs = createOwnerJobStore();
   localCalls = [];
   exchangeCalls = [];
   identityLookups = [];
@@ -339,17 +369,40 @@ describe('有租约的网关调用', () => {
     expect(reply).toEqual({ ok: true, data: { value: 42 } });
     const polls = gwCalls.filter(call => call.command === 'ops.job.get');
     expect(polls).toHaveLength(3);
-    for (const poll of polls) expect(poll.input).toEqual({ id: 'job-1' });
+    // 业务命令只提交一次，之后每次都查同一个作业。
+    expect(gwCalls.filter(call => call.command === 'ops_slow')).toHaveLength(1);
+    expect(new Set(polls.map(poll => (poll.input as { id: string }).id)).size).toBe(1);
     expect(polls.every(poll => poll.auth === gwCalls[0]!.auth)).toBe(true);
   });
 
-  test('作业失败时以中文返回，错误文本不含令牌', async () => {
+  test('作业失败时以中文返回，错误类别保留，错误文本不含令牌', async () => {
     pool = makePool({ cloud: makeCloud() });
     const { dir, key } = await claimFor(pool, 'eng-1', 'task-jobfail');
     const reply = await send(dir, key, 'r1', 'ops_failjob', {});
     expect(reply.ok).toBe(false);
-    expect(reply.error).toContain('作业执行失败');
+    expect((reply.error ?? '').startsWith('forbidden: 作业执行失败：')).toBe(true);
+    expect(reply.error).toContain('[已隐藏]');
     for (const token of issued) expect(reply.error ?? '').not.toContain(token);
+    expect(gwCalls.filter(call => call.command === 'ops_failjob')).toHaveLength(1);
+  });
+
+  test('作业入队后轮询被拒（401）：不自动重提交业务命令，错误以 unauthorized 返回', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-pollauth');
+    const reply = await send(dir, key, 'r1', 'ops_pollauth', {});
+    expect(reply).toEqual({ ok: false, error: 'unauthorized: 令牌已失效' });
+    expect(gwCalls.filter(call => call.command === 'ops_pollauth')).toHaveLength(1);
+  });
+
+  test.each([
+    ['作业失败的类别是 unauthorized', 'ops_authfail', 'unauthorized: 作业执行失败：登录令牌已失效'],
+    ['作业失败的说明文字像鉴权失败', 'ops_authword', 'upstream_error: 作业执行失败：invalid credential from upstream'],
+  ])('%s：不因此自动重提交业务命令', async (_label, command, error) => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', `task-${command}`);
+    const reply = await send(dir, key, 'r1', command, {});
+    expect(reply).toEqual({ ok: false, error });
+    expect(gwCalls.filter(call => call.command === command)).toHaveLength(1);
   });
 
   test('网关错误文本回显令牌时，返回给员工的内容已脱敏', async () => {
@@ -556,7 +609,8 @@ describe('公司命令 company_cmd 与 company_cmd_catalog', () => {
     expect(reply).toEqual({ ok: true, data: { value: 42 } });
     const polls = gwCalls.filter(call => call.command === 'ops.job.get');
     expect(polls).toHaveLength(3);
-    for (const poll of polls) expect(poll.input).toEqual({ id: 'job-1' });
+    expect(gwCalls.filter(call => call.command === 'ops_slow')).toHaveLength(1);
+    expect(new Set(polls.map(poll => (poll.input as { id: string }).id)).size).toBe(1);
   });
 
   test('参数不合法（缺命令名、input 不是对象）：以 invalid 拒绝，不换令牌、不请求网关', async () => {

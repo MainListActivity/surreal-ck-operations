@@ -25,7 +25,7 @@ import { withSession, type Sessions } from './db.ts';
 import type { Config } from './env.ts';
 import { cloudflareApi } from './cf.ts';
 import { identityCommand, IDENTITY_COMMANDS } from './idp-commands.ts';
-import { enqueueJob, jobDetail, jobFailure, jobOwnedBy, listJobs, PendingJob, waitForJob } from './jobs.ts';
+import { enqueueJob, jobFailure, jobGet, jobOwnedBy, listJobs, PendingJob, waitForJob } from './jobs.ts';
 import { OWNER_ONLY_FOR_AGENTS, hardTargetOwnerOnly } from './owner-locks.ts';
 import { POLICY_COMMANDS, policyCommand } from './policy-commands.ts';
 import { LANG_CODE, ownerLangOf } from '../../src/owner-lang.ts';
@@ -196,7 +196,7 @@ async function dispatch(deps: DispatchDeps, db: Surreal, who: Who, command: stri
     case 'db.write': return dbWrite(db, input);
     case 'cf.api': return cloudflareApi(cfg(), { method: String(input.method ?? ''), path: String(input.path ?? ''), body: input.body }, deps.fetch);
     case 'ops.job.list': return { jobs: await listJobs(db, input) };
-    case 'ops.job.get': return { job: await jobDetail(db, textOf(input.id, 'id', 200)) };
+    case 'ops.job.get': return jobGet(db, input);
     case 'audit.list': return listAudit(db, input);
     case 'cmd.catalog': return commandCatalogOf(db, who.actorKind === 'agent' ? { owner: false, employee: who.actor } : { owner: true });
     case 'owner.settings.get': return { lang: await ownerLangOf(db) };

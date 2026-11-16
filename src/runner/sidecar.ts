@@ -566,6 +566,8 @@ export class SidecarPool {
   }
 
   private static isAuthError(error: unknown): boolean {
+    // 业务命令已被网关接受（作业已排队）：之后的失败即使文本像鉴权失败，也不能整段重发，否则同一命令会执行两次。
+    if ((error as { accepted?: unknown })?.accepted === true) return false;
     return (error as {code?:string})?.code === 'unauthorized' || error instanceof Error && /invalid credential|unauthorized/i.test(error.message);
   }
 
@@ -1366,11 +1368,14 @@ export class SidecarPool {
       }
       return result;
     } catch (error) {
-      const raw = error as { code?: unknown; message?: unknown };
+      const raw = error as { code?: unknown; message?: unknown; accepted?: unknown };
       const text = typeof raw?.message === "string" ? raw.message : "网关调用失败";
       // 错误文本里若回显了令牌，整段替换为占位符。
       const message = token ? text.split(token).join("[已隐藏]") : text;
-      throw Object.assign(new Error(message), { code: typeof raw?.code === "string" ? raw.code : "upstream_error" });
+      throw Object.assign(new Error(message), {
+        code: typeof raw?.code === "string" ? raw.code : "upstream_error",
+        accepted: raw?.accepted === true,
+      });
     }
   }
 
