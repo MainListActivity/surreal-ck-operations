@@ -23,7 +23,7 @@
 - **轮换**：插件重启或 `adopt` 重建时内存凭证丢失，`credentialFor` 经 `workforce.rotate` 重签——库中 digest 被换掉，旧 token 立即作废（`retired`/`revoked` 实例在此处失败）。
 - **重载恢复**：`adopt` 重签通道后，用 `core.activeLeases` 的完整凭证域查询（不是 `listTasks` 的受限预览/分页）按服务端当前 `taskId`/`deliveryId`/`fence`/`version`/持有人/到期时间重建当前员工的 `doing` 与 `review` 租约，并刷新 `claim.json`；过期、撤销、他人、角色不符、租约歧义或不可读一律 fail closed（不新建 claim、不改作者/实现者、不伪造评审结论）。review 租约的 `report.md` 不是收尾，归档而不 submit；review 仍通过 `review` 或 `report_blocker` 收尾。
 - **撤销**：实例退役或凭证撤销后所有调用 401。0.7.0 已删除凭证文件模式（`SCK_EMPLOYEE_CREDENTIAL_FILE`），员工通道不再有其它凭证来源。
-- **环境清场**：员工进程是 Paseo 守护进程的子进程，会继承其环境。`agent.session_open` 钩子（`plugin/server/scrub.ts`）把继承来的基础设施凭证变量清空（`CLOUDFLARE_*`、`CF_API_*`、`SURREAL*`、`JEV_*`、`TYPESAFE_*`、`SCK_OPS_*`、`SCK_PRODUCT_ENV` 等，`SCK_SCRUB_ENV` 可加名），并把公司员工会话的 `ZDOTDIR` 指向垫片目录，使交互式 zsh 重读启动文件后再 `unset` 同名变量。provider 登录变量（`OPENAI_API_KEY` 等）、`SSH_AUTH_SOCK`、`gh` 登录不动。
+- **环境清场**：员工进程是 Paseo 守护进程的子进程，会继承其环境。`agent.session_open` 钩子（`plugin/server/scrub.ts`）把继承来的基础设施凭证变量清空（`CLOUDFLARE_*`、`CF_API_*`、`SURREAL*`、`JEV_*`、`TYPESAFE_*`、`SCK_OPS_*`、`SCK_PRODUCT_ENV`、服务端预览签名密钥 `SCK_PREVIEW_SECRET` 等，`SCK_SCRUB_ENV` 可加名），并把公司员工会话的 `ZDOTDIR` 指向垫片目录，使交互式 zsh 重读启动文件后再 `unset` 同名变量；垫片每读完一个启动文件就剥离一次，并把 `ZDOTDIR` 导回垫片，用户启动文件改写 `ZDOTDIR` 也不会绕过。provider 登录变量（`OPENAI_API_KEY` 等）、`SSH_AUTH_SOCK`、`gh` 登录不动。
 - **边界**：这套机制去掉的是「交到员工手里的凭证」和「继承进员工环境的变量」，不是沙箱——员工与插件、老板命令行跑在同一系统用户下，仍能读同用户可读的文件；越界读取靠协议约束与会话日志留痕。要硬隔离需独立系统用户或容器。详见 [运行手册](agent-operations.md#项目环境与凭证) 的安全边界段。
 
 ## comm 文件协议

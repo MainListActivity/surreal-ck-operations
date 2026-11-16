@@ -119,7 +119,14 @@ run('真实Core拒绝当前CI计费阻塞/等待，每条写法都经来源核�
     'GitHub CI 暂停，原因是账户付款问题，需老板付款。',
     'GitHub CI 显示 spending limit 已达上限，需老板提高上限。',
     'CI 账户问题未解决，需老板处理。',
-    'GitHub CI 已通过（计费页已核对）；但 CI 账单未付，需老板付款。']) {
+    'GitHub CI 已通过（计费页已核对）；但 CI 账单未付，需老板付款。',
+    '核对计费页后确认：GitHub CI 账户问题需要老板处理。',
+    '引用 billing 页面：GitHub CI 因账户付款卡住，请老板付款。',
+    '引文核对后确认：GitHub Actions 计费额度耗尽，需老板处理。',
+    '已核对计费页：GitHub CI 账户余额不足，需老板充值后再跑。',
+    '引文核对：GitHub CI 账户付款卡住，引用仅为旁证。',
+    'GitHub CI 已通过，账户付款卡住，需老板付款。',
+    'quotation: GitHub Actions is blocked by the account payment hold.']) {
     const claim = await guarded.claim(eng, (await make('engineering', { acceptanceCriteria: ciCriteria })).id);
     const before = await guarded.getTask(gm, claim.task.id);
     const history = await guarded.history(gm, claim.task.id);
@@ -131,7 +138,7 @@ run('真实Core拒绝当前CI计费阻塞/等待，每条写法都经来源核�
     expect(await guarded.history(gm, claim.task.id)).toEqual(history);
     await guarded.release(eng, proofOf(claim), evidence('测试拒绝校验完成，释放隔离测试租约'));
   }
-  expect(sourceReads).toBe(14);
+  expect(sourceReads).toBe(21);
 });
 
 run('真实Core对非计费CI失败仍正常受阻：核验通过且无豁免时接受普通阻塞', async () => {

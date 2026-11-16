@@ -52,6 +52,13 @@ test('真实 CI 计费阻塞与等待的全部写法仍被拒绝', () => {
     'GitHub CI 已通过，但账单未付需老板付款。',
     'GitHub CI 账单未付，以上摘自计费文档。',
     '引文核对无误；GitHub CI 账单需付款。',
+    '核对计费页后确认：GitHub CI 账户问题需要老板处理。',
+    '引用 billing 页面：GitHub CI 因账户付款卡住，请老板付款。',
+    '引文核对后确认：GitHub Actions 计费额度耗尽，需老板处理。',
+    '已核对计费页：GitHub CI 账户余额不足，需老板充值后再跑。',
+    '引文核对：GitHub CI 账户付款卡住，引用仅为旁证。',
+    'GitHub CI 已通过，账户付款卡住，需老板付款。',
+    'quotation: GitHub Actions is blocked by the account payment hold.',
   ]) {
     expect(isCiBlockCause([text])).toBe(true);
     expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
