@@ -12,12 +12,12 @@ import { SidecarPool } from '../src/runner/sidecar.ts';
 import { ExecutionJournal } from '../src/runner/lifecycle.ts';
 import { refuseEmployeeCiBlock } from '../src/github-ci-control.ts';
 import { referenceReport, referenceSentence } from './fixtures/ci-reference-report.ts';
-import { citationWordBypassBlockers, customerBillingWaits, existingGapBlockers } from './fixtures/ci-billing-boundary.ts';
+import { citationLinksAllowed, citationSentenceBreakBlockers, citationWordBypassBlockers, customerBillingPositives, customerBillingWaits, customerContinuationBlockers, descriptiveHidesStateBlockers, disclaimerKeepsStateBlockers, existingGapBlockers, invisibleSpellingBlockers, noPunctuationBypassBlockers, reportShapedDescriptiveBilling, silentSentenceBlockers, urlGluedBypassBlockers } from './fixtures/ci-billing-boundary.ts';
 
 setDefaultTimeout(60000);
 // Isolated company fork on a private RocksDB store: no production data, credentials, dispatcher or GitHub.
 const run = process.env.RUN_SCK_PR_GATE_TESTS === '1' ? test : test.skip;
-let dir: string, server: ReturnType<typeof Bun.spawn>, db: CompanyDatabase, core: SurrealCompanyCore, gm: string, eng: string, qa: string, count = 0;
+let dir: string, server: ReturnType<typeof Bun.spawn>, db: CompanyDatabase, core: SurrealCompanyCore, gm: string, qa: string, admin: LocalEnrollmentAdmin, count = 0;
 const asked: Array<{ branch?: string; text: string }> = [];
 
 beforeAll(async () => {
@@ -30,18 +30,26 @@ beforeAll(async () => {
   db = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: 'fixture-only', namespace: 'pr_gate_fixture', database: 'control_plane' });
   await db.connect(); await db.bootstrap();
   core = new SurrealCompanyCore(db, { submitCheck: async input => { asked.push(input); return input.text.includes('CONFLICT') ? { reason: 'PR 与主干有冲突：先解决冲突再提交。' } : undefined; } });
-  const admin = new LocalEnrollmentAdmin(db);
+  admin = new LocalEnrollmentAdmin(db);
   gm = await admin.enroll('gate-gm', 'owner', ['execute', 'review', 'manage']);
-  eng = await admin.enroll('gate-eng', 'engineering', ['execute', 'review']);
   qa = await admin.enroll('gate-qa', 'qa', ['execute', 'review']);
 });
 afterAll(async () => { if (!dir) return; await db.close(); server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true }); });
 
 const proofOf = (c: ClaimResult): LeaseProof => ({ taskId: c.task.id, deliveryId: c.deliveryId, fence: c.fence, expectedVersion: c.task.version });
 const make = (executorRole: string, extra: Record<string, unknown> = {}) => core.createTask(gm, { title: `Gate task ${++count}`, context: 'fixture', executorRole, reviewerRole: 'qa', idempotencyKey: `gate-task-${++count}-${crypto.randomUUID()}`, ...extra } as never);
-const evidence = (text: string) => ({ text: `${text} — padded so the evidence is long enough`, idempotencyKey: `gate-ev-${++count}-${crypto.randomUUID()}` });
+// Evidence needs 20 trimmed characters (requireText). Only a shorter sample gets a neutral tail; a longer sample reaches
+// Core.block exactly as written, which is the same text the classifier unit tests read.
+const evidence = (text: string) => ({ text: text.trim().length < 20 ? `${text} — padded so the evidence is long enough` : text, idempotencyKey: `gate-ev-${++count}-${crypto.randomUUID()}` });
+// Each sample takes its own engineer. A failed expectation then strands only that employee's lease, so the next sample
+// and the next test never inherit "already leased" and the first real failure stays the only failure.
+const engineer = async (): Promise<{ id: string; credential: string }> => {
+  const id = `gate-eng-${++count}`;
+  return { id, credential: await admin.enroll(id, 'engineering', ['execute', 'review']) };
+};
 
 run('an implementation submit that the check refuses never reaches review, and can be resubmitted once fixed', async () => {
+  const { credential: eng } = await engineer();
   const claim = await core.claim(eng, (await make('engineering')).id);
   await expect(core.submit(eng, proofOf(claim), evidence('PR https://github.com/o/r/pull/7 CONFLICT'))).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('提交被退回（未进入验收）') });
   expect((await core.getTask(gm, claim.task.id)).state).toBe('doing');
@@ -58,6 +66,7 @@ run('other roles are not checked', async () => {
 });
 
 run('a core without a check behaves exactly as before', async () => {
+  const { credential: eng } = await engineer();
   const plain = new SurrealCompanyCore(db);
   const claim = await plain.claim(eng, (await make('engineering')).id);
   expect((await plain.submit(eng, proofOf(claim), evidence('PR https://github.com/o/r/pull/8 CONFLICT'))).state).toBe('review');
@@ -75,7 +84,9 @@ run('旁证报告经真实 Core.block 正常受阻、一次审计、owner恢复�
     'GitHub CI 已完成，当前等待老板确认客户账单，未申请任何 CI 豁免。',
     '本轮重新抓取计费页和 GitHub release 页，引文与报告一致，未发现失败。',
     '本轮核对计费文档；GitHub release 页无法作为 CI 判定依据，仅作研究旁证。',
-    '已抓取 GitHub 计费页面，页面内容无阻塞说明，等待内部元数据处置。']) {
+    '已抓取 GitHub 计费页面，页面内容无阻塞说明，等待内部元数据处置。',
+    reportShapedDescriptiveBilling, ...citationLinksAllowed]) {
+    const { credential: eng } = await engineer();
     const claim = await guarded.claim(eng, (await make('engineering', { acceptanceCriteria: ciCriteria })).id);
     expect(claim.task.acceptanceCriteria).toHaveLength(1);
     const proof = proofOf(claim), ev = evidence(text);
@@ -128,6 +139,7 @@ run('真实Core拒绝当前CI计费阻塞/等待，每条写法都经来源核�
     '引文核对：GitHub CI 账户付款卡住，引用仅为旁证。',
     'GitHub CI 已通过，账户付款卡住，需老板付款。',
     'quotation: GitHub Actions is blocked by the account payment hold.']) {
+    const { credential: eng } = await engineer();
     const claim = await guarded.claim(eng, (await make('engineering', { acceptanceCriteria: ciCriteria })).id);
     const before = await guarded.getTask(gm, claim.task.id);
     const history = await guarded.history(gm, claim.task.id);
@@ -143,6 +155,7 @@ run('真实Core拒绝当前CI计费阻塞/等待，每条写法都经来源核�
 });
 
 run('真实Core对非计费CI失败仍正常受阻：核验通过且无豁免时接受普通阻塞', async () => {
+  const { credential: eng } = await engineer();
   let sourceReads = 0;
   const guarded = new SurrealCompanyCore(db, { ciBillingCheck: async () => { sourceReads++; return undefined; } });
   const claim = await guarded.claim(eng, (await make('engineering', { acceptanceCriteria: ciCriteria })).id);
@@ -155,10 +168,11 @@ run('真实Core对非计费CI失败仍正常受阻：核验通过且无豁免时
 });
 
 run('执行端invalid block超过十次仍pending，同一请求恢复后真实Core仅阻塞一次且可恢复', async () => {
+  const { id: engId, credential: eng } = await engineer();
   const claimTask = await make('engineering', { acceptanceCriteria: ciCriteria });
   const runDir = join(dir, 'reference-pending', 'comm');
   const journal = new ExecutionJournal(join(dir, 'reference-pending', 'private', 'executions', createHash('sha256').update(runDir).digest('hex')));
-  const inst = { id: 'gate-eng', role: 'engineering' as const, credential: eng, paseoAgentId: undefined as string | undefined };
+  const inst = { id: engId, role: 'engineering' as const, credential: eng, paseoAgentId: undefined as string | undefined };
   const requests: Array<{ proof: LeaseProof; key: string; text: string }> = [];
   let oldRefusal = true, loseReply = true;
   const guarded = new SurrealCompanyCore(db, { ciBillingCheck: async () => { throw Error('unrelated report must not read CI'); } });
@@ -217,12 +231,16 @@ run('执行端invalid block超过十次仍pending，同一请求恢复后真实C
   } finally { pool.close(); }
 });
 
-run('真实Core拒绝引文包裹、无标点与既有缺口中的当前CI计费状态：有无来源核验都不放行，拒绝前零副作用', async () => {
+run('真实Core拒绝引文包裹、无标点、紧贴链接、引文句与空行切断、零宽字符及既有缺口中的当前CI计费状态：有无来源核验都不放行，拒绝前零副作用', async () => {
   let sourceReads = 0, verified: { runUrl: string; sha: string } | undefined;
   const guarded = new SurrealCompanyCore(db, { ciBillingCheck: async () => { sourceReads++; return verified; } });
   for (const source of [{ runUrl: 'https://github.com/o/r/actions/runs/9', sha: 'a'.repeat(40) }, undefined]) {
     verified = source;
-    for (const text of [...citationWordBypassBlockers, ...existingGapBlockers]) {
+    for (const text of [...citationWordBypassBlockers, ...existingGapBlockers, ...noPunctuationBypassBlockers,
+      ...urlGluedBypassBlockers, ...citationSentenceBreakBlockers, ...invisibleSpellingBlockers,
+      ...silentSentenceBlockers, ...customerContinuationBlockers, ...disclaimerKeepsStateBlockers,
+      ...descriptiveHidesStateBlockers]) {
+      const { credential: eng } = await engineer();
       const claim = await guarded.claim(eng, (await make('engineering', { acceptanceCriteria: ciCriteria })).id);
       const before = await guarded.getTask(gm, claim.task.id);
       const history = await guarded.history(gm, claim.task.id);
@@ -237,13 +255,14 @@ run('真实Core拒绝引文包裹、无标点与既有缺口中的当前CI计费
   }
 });
 
-run('CI已完成旁的客户账单付款等待是无关业务：真实Core正常受阻、重放幂等，且不读取CI来源', async () => {
+run('客户账单付款等待（含CI已完成旁的续句）是无关业务：真实Core正常受阻、重放幂等，且不读取CI来源', async () => {
   let sourceReads = 0;
   const guarded = new SurrealCompanyCore(db, { ciBillingCheck: async () => {
     sourceReads++;
     return { runUrl: 'https://github.com/o/r/actions/runs/9', sha: 'a'.repeat(40) };
   } });
-  for (const text of customerBillingWaits) {
+  for (const text of [...customerBillingWaits, ...customerBillingPositives]) {
+    const { credential: eng } = await engineer();
     const claim = await guarded.claim(eng, (await make('engineering', { acceptanceCriteria: ciCriteria })).id);
     const proof = proofOf(claim), ev = evidence(text);
     const blocked = await guarded.block(eng, proof, 'owner', ev);

@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { createSubmitCheck, extractPrUrls, judgePr, type PrInfo } from '../src/pr-gate.ts';
 import { assertEmployeeCiBlockAllowed, createCiBillingCheck, isCiBlockCause } from '../src/github-ci-control.ts';
 import { referenceReport, referenceSentence } from './fixtures/ci-reference-report.ts';
-import { citationWordBypassBlockers, customerBillingWaits, existingGapBlockers } from './fixtures/ci-billing-boundary.ts';
+import { citationLinksAllowed, citationSentenceBreakBlockers, citationWordBypassBlockers, customerBillingPositives, customerBillingWaits, customerContinuationBlockers, descriptiveBillingAllowed, descriptiveHidesStateBlockers, disclaimerKeepsStateBlockers, existingGapBlockers, invisibleSpellingBlockers, noPunctuationBypassBlockers, reportShapedDescriptiveBilling, silentSentenceBlockers, urlGluedBypassBlockers } from './fixtures/ci-billing-boundary.ts';
 
 test.each([referenceSentence, referenceReport])('研究旁证不是当前 CI 原因：%s', text => {
   expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
@@ -159,6 +159,76 @@ test('变体扫描：引文包裹的CI计费状态全部拒绝，纯引文与客
   expect(citationOnly).toBeGreaterThan(150);
   expect(bypasses).toEqual([]);
   expect(falseRefusals).toEqual([]);
+});
+
+// Reported false refusal: a descriptive billing sentence in a report that also names GitHub is business text. CI
+// context never spreads across the report; only a payment state beside a CI word is a cause.
+test('描述性计费句与同报告中的 GitHub 字样不构成 CI 原因', () => {
+  for (const text of [...descriptiveBillingAllowed, reportShapedDescriptiveBilling]) {
+    expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
+  }
+  expect(isCiBlockCause([reportShapedDescriptiveBilling])).toBe(false);
+});
+
+// Citation links and literature references are side evidence, even when the link path names billing.
+test('URL与文献引用是旁证，链接路径中的计费词不构成 CI 原因', () => {
+  for (const text of citationLinksAllowed) {
+    expect(isCiBlockCause([text])).toBe(false);
+    expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
+  }
+});
+
+// A disclaimer or a descriptive pricing phrase never removes a payment state that sits beside a CI word.
+test('免责声明与描述性计费语不能遮住 CI 旁的付款状态', () => {
+  for (const text of [...disclaimerKeepsStateBlockers, ...descriptiveHidesStateBlockers]) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+});
+
+// A customer invoice and its continuation are business waits, unless the same sentence names an account, a document
+// or a CI cause; then the payment state stays attached to CI.
+test('客户账单及其续句是业务等待；同句带账户、文档或 CI 原因时付款状态归 CI', () => {
+  for (const text of customerBillingPositives) {
+    expect(isCiBlockCause([text])).toBe(false);
+    expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
+  }
+  for (const text of customerContinuationBlockers) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+});
+
+// No punctuation, and no space after a link, never hides a current CI billing state inside a citation or billing word.
+test('无标点与紧贴链接的写法不能把当前CI计费状态藏进引文', () => {
+  for (const text of [...noPunctuationBypassBlockers, ...urlGluedBypassBlockers]) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+});
+
+// A citation sentence between CI and a payment state never breaks adjacency, and full-width spelling names the same CI.
+test('引文句不能切断CI与付款状态，全角写法同样是CI原因', () => {
+  for (const text of citationSentenceBreakBlockers) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+});
+
+// A zero-width character inside a CI word must not split the word, since the reader sees one word.
+test('零宽字符不能把CI词拆开藏起来', () => {
+  for (const text of invisibleSpellingBlockers) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+});
+
+// A blank line, stray punctuation or a bare link between CI and a payment state states nothing and cannot separate them.
+test('空行、纯标点与裸链接分句不能切断CI与付款状态', () => {
+  for (const text of silentSentenceBlockers) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
 });
 
 test('CI billing control reads PR/run sources even when the blocker omits all billing words', async () => {
