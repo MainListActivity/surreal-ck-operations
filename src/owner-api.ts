@@ -17,8 +17,9 @@ import { lanePreferenceValue } from './dispatcher/lane-preference.ts';
 import { OutboundMessageStore, type OutboundMessage } from './outbound-messages.ts';
 import { bodyOfDispatch, unrenderMessage } from './outbound-render.ts';
 import { turnAnalysesOf } from './turn-analysis.ts';
-import { findingsFileOf, readBoard, readBoardTask, readBoardView, renderContextFor } from './board.ts';
+import { findingsFileOf, readBoard, readBoardTask, readBoardView, renderContextFor, type BoardTaskStatus } from './board.ts';
 import { CompanyError } from './core-errors.ts';
+import { answerBytes, fitCount, RESPONSE_BUDGET_BYTES } from './response-budget.ts';
 import { ROLES, type CreateTask, type Role } from './contracts.ts';
 import { HASH, REQUIRED_TRACKS } from './core.ts';
 import { getRoute, listRoutes, saveRoute, disableRoute } from './routes.ts';
@@ -101,6 +102,19 @@ export async function taskTurns(db: import('surrealdb').Surreal, taskId: string)
     actions: Array.isArray(row.activity!.actions) ? row.activity!.actions : [],
     ...(row.activity!.actionsDropped ? { actionsDropped: row.activity!.actionsDropped } : {}),
   })).sort((a, b) => a.startedAt - b.startedAt);
+}
+
+/**
+ * The board.task answer as the relay sends it. readBoardTask bounds the candidate rows and the texts, but the widest text that passes
+ * those bounds (control characters, which the JSON text escapes to six bytes each) can still take the answer past the relay budget.
+ * So the candidate rows keep only the longest prefix whose whole answer fits, and the rest count in candidatesOmitted, as the row cap does.
+ */
+function fitBoardTask(status: BoardTaskStatus): BoardTaskStatus {
+  const withRows = (keep: number): BoardTaskStatus => {
+    const omitted = (status.candidatesOmitted ?? 0) + status.candidates.length - keep;
+    return omitted > 0 ? { ...status, candidates: status.candidates.slice(0, keep), candidatesOmitted: omitted } : status;
+  };
+  return withRows(fitCount(status.candidates, kept => answerBytes(withRows(kept.length)), RESPONSE_BUDGET_BYTES));
 }
 
 export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unknown>, via: OwnerVia): Promise<unknown> {
@@ -337,7 +351,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       const status = await readBoardTask(db, text(input.taskId, 'taskId'),
         { now: typeof input.now === 'number' ? input.now : undefined });
       if (!status) throw new CompanyError('not_found', 'task not found');
-      return status;
+      return fitBoardTask(status);
     }
 
     // ---- 编制 ----

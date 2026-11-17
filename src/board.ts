@@ -668,12 +668,15 @@ export interface BoardTaskStatus {
    * Reachable rows come first, then queue order, at most BOARD_TASK_CANDIDATE_ROWS of them.
    */
   candidates: Array<{ employeeId: string; position: number; eligible: boolean; reason: string }>;
-  /** How many candidate rows the bound left out; absent when none were left out. The rows left out are not sent. */
+  /**
+   * How many candidate rows were left out, by the row cap or to keep the answer inside the relay budget; absent when none were left
+   * out. The rows left out are not sent.
+   */
   candidatesOmitted?: number;
 }
 
 /**
- * Bounds on one task's status, so the answer fits the relay budget whatever the board holds. A text cut to its bound ends in
+ * Bounds on one task's status, so the answer stays small whatever the board holds. A text cut to its bound ends in
  * an ellipsis, the same convention as the progress summary; a row cut from the candidate list is counted in candidatesOmitted.
  */
 export const BOARD_TASK_TITLE_CHARS = 200;
@@ -690,8 +693,8 @@ const clipText = (text: string, limit: number): string => {
 /**
  * One task's bounded dispatch status: the same queue, gate and lease judgement the owner board makes, without
  * any message body, task text or audit evidence. A task the board does not show (planned, blocked, decided by the
- * owner, done or void) still answers from its row state. Texts and candidate rows are bounded (BOARD_TASK_*), so the
- * answer stays inside the relay budget for any board. Undefined when the task does not exist.
+ * owner, done or void) still answers from its row state. Texts and candidate rows are bounded (BOARD_TASK_*); the owner API
+ * then keeps only the candidate rows that fit the relay budget. Undefined when the task does not exist.
  */
 export async function readBoardTask(db: Surreal, taskId: string, opts: { now?: number } = {}): Promise<BoardTaskStatus | undefined> {
   const now = opts.now ?? Date.now();

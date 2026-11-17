@@ -100,10 +100,11 @@ export function largeBoardFixture(queued = 300): BoardFixture {
 /**
  * The widest single-task answer a board can give: `w-target` is a candidate of every one of `employees` employees, and its title,
  * queue reason and each candidate reason are `textChars` characters long. board.task must still fit the relay budget for it.
+ * `filler` is the unit the reasons repeat: a control character costs six JSON bytes a character, the widest case the budget must hold.
  */
-export function wideBoardFixture(employees = 60, textChars = 300): BoardFixture {
+export function wideBoardFixture(employees = 60, textChars = 300, filler = '说明'): BoardFixture {
   const title = `宽任务${'标题'.repeat(textChars)}`;
-  const body = `等待派工条件：${'说明'.repeat(textChars)}`;
+  const body = `等待派工条件：${filler.repeat(textChars)}`;
   const ids = Array.from({ length: employees }, (_, index) => `w${String(index).padStart(3, '0')}`);
   return {
     view: {

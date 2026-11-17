@@ -146,6 +146,16 @@ describe('relay 预算：大看板被拒、按任务状态通过', () => {
     expect(guardRelayResponse({ ok: true as const, data: status }, companyCmdNarrowHint({ command: 'board.task' }))).toMatchObject({ ok: true });
   });
 
+  test('转义字符很多的宽看板：答复仍在预算内，放不下的候选行计入 candidatesOmitted，候选与省略合计不变', async () => {
+    // Every character of the long reasons is a control character, which the JSON text escapes to six bytes: 40 rows alone pass the budget.
+    const status = await ownerApi(boardContext(boardFixtureDb(wideBoardFixture(60, 300, '\u0001')).db),
+      { command: 'board.task', taskId: 'w-target', now: NOW }, 'agent') as BoardTaskStatus;
+    expect(answerBytes(status)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    expect(status.candidates.length + (status.candidatesOmitted ?? 0)).toBe(60);
+    expect(status.candidatesOmitted ?? 0).toBeGreaterThan(60 - BOARD_TASK_CANDIDATE_ROWS);
+    expect(guardRelayResponse({ ok: true as const, data: status }, companyCmdNarrowHint({ command: 'board.task' }))).toMatchObject({ ok: true });
+  });
+
   test('候选不超过上限时不写 candidatesOmitted，文本不带省略号', async () => {
     const status = await boardTask('t-queue');
     expect(status.candidatesOmitted).toBeUndefined();

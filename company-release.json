@@ -7,7 +7,7 @@
     "老板看板未派行新增 gate 字段，区分扣住消息、待译文、待完工分析与派工门槛；看板显示不受影响。",
     "修复 response_too_large 提示：company_cmd 转发的老板命令没有统一分页，错误逐命令给出真实支持的缩小方式（board.snapshot/progress 指到 board.task），不再提示无效的 pageSize/cursor；没有参数可缩小的命令明说没有。",
     "company_cmd 的顶层只认 command 与 input：顶层的 taskId 等其它键不再被静默丢弃，报 invalid 并写出 input 的正确写法（此前网关只报 taskId 无效，员工看不出原因）。",
-    "board.task 的答复有上界：候选最多 40 条（超出的写入 candidatesOmitted），标题与理由超过字数上限时截断并以 … 结尾，单任务答复恒在 48 KiB 预算内。",
+    "board.task 的答复有上界：候选最多 40 条，超出或放不进 48 KiB 预算的写入 candidatesOmitted；标题与理由超过字数上限时截断并以 … 结尾，单任务答复恒在预算内。",
     "顺带修正命令守卫测试与六类写死仅老板清单不一致的既有断言。"
   ],
   "impact": [
