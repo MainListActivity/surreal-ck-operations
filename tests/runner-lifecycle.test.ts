@@ -111,6 +111,45 @@ test('复核结果由执行端记录，失败回合即使留下报告也不提�
     expect(g.journal().rows()[0]?.state).toBe('interrupted');
   } finally { g.close(); }
 });
+/**
+ * devin-cloud（以及任何云端通道）超时仍受理的受阻回合，在 main.ts 事件映射与 native.ts 的真实
+ * parseNativeResult 之后是 outcome.kind:'completed'（tests/cloud-lane.test.ts 的"近真实 main→native
+ * 链路验证"已经单独证实这一段，并且明确写了它到此为止、不替 sidecar.ts 的结论背书）。这里接着那段没走到的
+ * 下一环：同一个 completed TurnEnded 事件，经真实（未打桩）的 settleExecution → collectExecution →
+ * workResult 之后，必须是业务 block（不是静默回合，不是供应商额度或协议故障的记录），且会话地址不丢在评审
+ * 证据之外。对照组证明两条路没有被改成同一条：outcome.kind 不是 completed 时仍然按既有行为走静默分支。
+ */
+test('云端受阻回合（如 devin-cloud 已受理超时）经真实 settleExecution 收尾为 block，不是静默回合也不记供应商故障；对照 outcome 非 completed 仍走静默分支（需求 3：main→native 之后接到真实 sidecar.ts 收尾）', async () => {
+  const SESSION = 'https://app.devin.ai/sessions/abcd1234abcd1234abcd1234abcd1234';
+  const BLOCKED_TEXT = `工作结果：受阻\nDevin Cloud 会话 ${SESSION} 超过配置时限仍未给出终稿（标记 SCK-abc1234567），会话可能仍在运行；恢复本任务将回到原会话继续等待，不会重发`;
+  const f = fixture();
+  try {
+    await f.claim(); await f.pool.turnStarted('agent', 'turn-devin-1');
+    const settled = await f.pool.settleExecution(f.event('turn-devin-1', BLOCKED_TEXT, 'completed'));
+    // 不是静默回合：有真实的业务结论产出，不是「本回合没有可用产物」。
+    expect(settled?.status).not.toBe('silent');
+    expect(f.calls.map(c => c.action)).toEqual(['block']);
+    expect(f.calls[0]?.text).toContain('超过配置时限仍未给出终稿');
+    expect(f.calls[0]?.text).toContain(SESSION);
+    const row = f.journal().rows()[0];
+    expect(row?.state).toBe('settled');
+    expect(row?.result?.action).toBe('block');
+    // 不靠供应商额度/协议故障通道记这次受阻：那条通道只由 releaseClaim({ providerFailure }) 显式写入，
+    // 这里全程没有调用过它。
+    expect(row?.providerFailure).toBeUndefined();
+  } finally { f.close(); }
+
+  const g = fixture();
+  try {
+    await g.claim(); await g.pool.turnStarted('agent', 'turn-devin-2');
+    const settled = await g.pool.settleExecution(g.event('turn-devin-2', '页面协议错误：wrong_session，未能确认是否受理', 'failed'));
+    expect(settled).toMatchObject({ status: 'silent', silent: { instId: 'worker', taskId: 'task', phase: 'doing' } });
+    expect(g.calls).toHaveLength(0);
+    const row = g.journal().rows()[0];
+    expect(row?.state).toBe('interrupted');
+    expect(row?.providerFailure).toBeUndefined();
+  } finally { g.close(); }
+});
 test('网络失败不丢结果不清租约，重启后自动重试，agent 无需补交', async () => {
   const f = fixture(); try {
     await f.claim(); f.fail(true);

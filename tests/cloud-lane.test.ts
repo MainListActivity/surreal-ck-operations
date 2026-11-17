@@ -852,6 +852,12 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     // 会直接进「回收重派」分支——真实事故 15eaf1b8 正落在这条分支。这两处都不在本次改动范围内、源码未变更，这里
     // 只引用它们既有、未改动的判定逻辑作为同一条链路的下一环证据，不重复声称本 PR 测试或修改了 native.ts/turn-closeout.ts
     // 本身；report.md/blocker.md 是否被写出属于外层回合编排，同样不在本次改动范围。
+    // 这条用例到 parseNativeResult 为止：completed:true 之后还要再经 sidecar.ts 的 settleExecution →
+    // collectExecution → workResult 才是真正的收尾（提交 block、落盘、不记供应商故障）。那一段不在这个文件里，
+    // 在 tests/runner-lifecycle.test.ts 的「云端受阻回合（如 devin-cloud 已受理超时）经真实 settleExecution
+    // 收尾为 block...」用例：用同一个 outcome.kind:'completed' 的 TurnEnded 形态，驱动真实（未打桩）的
+    // SidecarPool.settleExecution，断言不是 silent、不记 providerFailure、journal 落盘的结果是 block；并有
+    // 对照组证明 outcome.kind 不是 completed 时仍然走既有的静默分支，两条路没有被改成同一条。
 
     // 对照：修前 fail() 会让 main.ts 打 is_error:true/subtype:'error'，parseNativeResult 解出 completed:false——
     // 这正是真实事故「明确超时却被当成失败终态、进而回收成 silent-turn」的那一步；这里只作同一条链路的对照参照。
@@ -1737,7 +1743,9 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
         const scroller = { scrollHeight: 2107, clientHeight: 713, _top: 1394,
           get scrollTop() { return this._top; }, set scrollTop(v: number) { this._top = v; scrolledTop = v === 0; } };
         const current = () => (scrolledTop ? atTopBlocks : mounted);
-        const text = () => [...current().map(b => b.text), 'Devin is awaiting instructions'].join('\n');
+        // 状态短语只挂在滚动前（自然/常驻）那次快照上，和「本轮用户消息被虚拟化滚出 DOM」描述块里 readScrolled
+        // 的默认约定一致：恢复阶段临时滚到顶那次快照不带它，判定不会错误地采用那次快照。
+        const text = () => [...current().map(b => b.text), ...(scrolledTop ? [] : ['Devin is awaiting instructions'])].join('\n');
         const mkEl = (b: Blk) => ({ getAttribute: (n: string) => (n === 'data-message-author' ? b.author : null), innerText: b.text, parentElement: scroller });
         const doc = {
           documentElement: {},
@@ -1774,6 +1782,83 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(out2.text).toContain('PR: https://github.com/acme/widget/pull/9');
       expect(out2.text).toContain('SHA: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef');
       expect(sendLikeCalls).toHaveLength(0);
+    });
+
+    test('已受理后转录很长，本轮用户锚点是最新内容、不在顶部：滚到顶的恢复只会露出更早的轮次，找不到本轮锚点时不误判已受理，有界重试耗尽后保持受阻并保留会话地址（需求 2：真实采样只证实过"本轮是会话第一轮、锚点在顶部"这一种虚拟化形态，这里补上结构上必然存在、但未经真实采样的续轮形态——本轮锚点是转录里最新内容，物理上在底部，滚到顶只会远离它，不会找到它）', async () => {
+      const w1 = world({ task, extra: gitOk });
+      writeLaneState(w1.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
+      const a = (async (script: string) => {
+        if (script.includes(MODE('follow'))) return { ok: true, url: SESSION, cap: 'Free', seats: { used: 0, total: 2 }, echoed: true };
+        throw new Error('bridge killed while polling');
+      }) as NonNullable<LaneDeps['browse']>;
+      await runLane(w1.input({ provider: 'devin-cloud', prompt: FOLLOW }), { ...w1.deps, browse: a });
+      expect(readInflight(w1.stateRoot, 'devin-cloud', digestOf(w1, FOLLOW))?.taskUrl).toBe(SESSION);
+
+      // devin-web.ts 头部注释的已知限制：有界恢复只把容器滚到绝对顶部一次，只找得到「滚到顶就会挂载」的锚点。
+      // 这里构造的是文档里点名的反例：本轮是第 N 轮续轮，本轮用户消息是转录里最新内容，自然位置停在更早的
+      // 第二轮（不是本轮），滚到顶只会露出更早的第一轮（更不是本轮）——两次 collect() 都找不到本轮标记，
+      // 不是"滚一次就找到"的已证实事故形态。断言的是安全兜底：不静默、不误判已受理、不重发，受阻文本保留
+      // 会话地址，与 devin.ts 里已有的"转录里一直看不到本轮标记"驱动层测试（纯状态 mock）同一结论，这里
+      // 走的是真实 devin-web.ts 生成脚本在假页面里执行的那条路径，不是另一套纯状态 mock。
+      type Blk = { author: 'user' | 'devin' | 'tool'; text: string };
+      const sendLikeCalls: string[] = [];
+      const b2 = (async (script: string) => {
+        if (script.includes(MODE('send')) || script.includes(MODE('follow')) || script.includes(MODE('recover'))) {
+          sendLikeCalls.push(script);
+          throw new Error('不该走到这里：找不到本轮锚点时只受阻，绝不重发或新建会话');
+        }
+        const round2User: Blk = { author: 'user', text: '[SCK-ROUND SCK-old222]\n\n第二轮\n\n收尾约定：「[SCK-DONE SCK-old222]」。' };
+        const round2Devin: Blk = { author: 'devin', text: '[SCK-DONE SCK-old222]\n第二轮完成。' };
+        const round1User: Blk = { author: 'user', text: '[SCK-ROUND SCK-old111]\n\n第一轮\n\n收尾约定：「[SCK-DONE SCK-old111]」。' };
+        const round1Devin: Blk = { author: 'devin', text: '[SCK-DONE SCK-old111]\n第一轮完成。' };
+        // 自然（常驻）位置停在第二轮；滚到顶只会露出第一轮——本轮（marker）两处都不在，模拟锚点在底部/中段。
+        const mounted: Blk[] = [round2User, round2Devin];
+        const atTopBlocks: Blk[] = [round1User, round1Devin];
+        let scrolledTop = false;
+        const scroller = { scrollHeight: 2107, clientHeight: 713, _top: 1394,
+          get scrollTop() { return this._top; }, set scrollTop(v: number) { this._top = v; scrolledTop = v === 0; } };
+        const current = () => (scrolledTop ? atTopBlocks : mounted);
+        const text = () => current().map(b => b.text).join('\n');
+        const mkEl = (b: Blk) => ({ getAttribute: (n: string) => (n === 'data-message-author' ? b.author : null), innerText: b.text, parentElement: scroller });
+        const doc = {
+          documentElement: {},
+          get body() { return { innerText: text() }; },
+          querySelector: (sel: string) => (sel === 'main' ? { innerText: text() }
+            : sel === '[data-sck-cap-trigger]' ? null
+            : sel === '[data-message-author]' ? (current().filter(x => x.author !== 'tool').map(mkEl)[0] ?? null)
+            : {}),
+          querySelectorAll: (sel: string) => (sel === '[data-message-author]' ? current().filter(x => x.author !== 'tool').map(mkEl) : sel === '[role=menu]' ? [] : [{ innerText: 'Free' }]),
+        };
+        const page = {
+          goto: async () => {}, waitForTimeout: async () => {},
+          evaluate: async (fn: (arg?: unknown) => unknown, arg?: unknown) => {
+            g.document = doc; g.location = { href: SESSION, hostname: 'app.devin.ai' };
+            return fn(arg);
+          },
+        };
+        let result: Record<string, unknown> | undefined;
+        const fakeConsole = { log: (line: string) => { if (line.startsWith('__RESULT__')) result = JSON.parse(line.slice('__RESULT__'.length)); } };
+        const run = new Function('taskSpace', 'console', 'process', `return (async () => {${script}})()`);
+        try {
+          await run(async () => ({ pages: async () => [page] }), fakeConsole, { exit() { throw new Error('unexpected exit'); } });
+        } catch (error) {
+          if (result === undefined) throw error;
+        } finally {
+          delete g.document; delete g.location;
+        }
+        return result;
+      }) as NonNullable<LaneDeps['browse']>;
+
+      const w2 = world({ task, extra: gitOk });
+      const out2 = await runLane(w2.input({ provider: 'devin-cloud', prompt: FOLLOW, stateRoot: w1.stateRoot }), { ...w2.deps, browse: b2 });
+      expect(out2.status).toBe('success');
+      expect(out2.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out2.text).toContain('一直找不到本轮消息');
+      expect(out2.text).toContain('未重发');
+      expect(out2.text).toContain(SESSION);
+      expect(sendLikeCalls).toHaveLength(0);
+      const st = readLaneState(w2.commDir);
+      expect(st?.taskUrl).toBe(SESSION);
     });
 
     test('新会话的发送意图未确认：B 本地残留的旧会话地址不用来核对，只按标记在会话列表里找', async () => {
@@ -1994,13 +2079,27 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const allBlocks: Block[] = [REAL_USER, REAL_DEVIN_1, REAL_DEVIN_2];
       const STATUS_TEXT = 'Devin is awaiting instructions';
 
-      const readScrolled = async (mounted: Block[], atTopBlocks: Block[], opts: { withScroller?: boolean } = {}, marker = REAL_MARKER) => {
+      /**
+       * statusAt 默认 'natural'：状态短语只挂在滚动前（自然/常驻）那次快照上，恢复阶段临时滚到顶那次快照
+       * 完全没有它——这才是与常驻采样一致的形态（devinAuthorBlocks 常驻就有，状态短语是页面持续渲染的 chrome，
+       * 不是虚拟化列表项，没有证据证明它会随「滚到顶」这个临时动作消失或出现在别处）。不论滚动到哪里都无条件
+       * 附带状态短语的旧版 text()，结构上测不出「如果判定错误地采用了恢复循环最后一次留下的快照」这种回归：
+       * default 改成只在自然位置出现后，下面三个既有用例若改回从恢复循环的快照取状态就会读错，才具备这道
+       * 回归检测能力。'top' 用于下面专门验证「不会误读那次临时快照」的反向用例。
+       */
+      const readScrolled = async (
+        mounted: Block[], atTopBlocks: Block[],
+        opts: { withScroller?: boolean; statusAt?: 'natural' | 'top' | 'none' } = {},
+        marker = REAL_MARKER,
+      ) => {
         const withScroller = opts.withScroller ?? true;
+        const statusAt = opts.statusAt ?? 'natural';
         let atTop = false;
         const scroller = { scrollHeight: 2107, clientHeight: 713, _top: 1394,
           get scrollTop() { return this._top; }, set scrollTop(v: number) { this._top = v; atTop = v === 0; } };
         const current = () => (atTop ? atTopBlocks : mounted);
-        const text = () => [...current().map(b => b.text), STATUS_TEXT].filter(Boolean).join('\n');
+        const showStatus = () => (statusAt === 'natural' ? !atTop : statusAt === 'top' ? atTop : false);
+        const text = () => [...current().map(b => b.text), ...(showStatus() ? [STATUS_TEXT] : [])].filter(Boolean).join('\n');
         const mkAuthorEl = (b: Block) => ({
           getAttribute: (name: string) => (name === 'data-message-author' ? b.author : null),
           innerText: b.text,
@@ -2031,6 +2130,17 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
         expect(after).toMatchObject({ ok: true, markerSeen: true, status: 'idle', source: 'roles' });
         expect(after?.done).toContain('SHA: 107222e536d1a7a678e2d23314569ee732be63ff');
         expect(after?.done).toContain('surreal_ck#255');
+      });
+
+      test('状态短语只认滚动前的自然快照：即使那次临时滚到顶的快照里才有状态短语，判定也不会借用它（覆盖"顶部快照是否连带挂载状态短语未经验证"这道结构性漏判）', async () => {
+        // 和上一个用例反过来：状态短语只挂在"滚到顶"之后的快照上（statusAt: 'top'），自然（未滚动）快照完全
+        // 没有它。如果判定错误地采用了恢复循环最后一次留下的快照（而不是滚动前的自然快照），这里就会错误地
+        // 读出 status:'idle'；真实只读采样从未证实状态短语会出现在那次临时滚动的快照里，所以正确答案是 unknown——
+        // 锚点恢复（markerSeen、done）不受影响，只有状态判定必须保持不采信那次快照。
+        const r = await readScrolled(mountedAtRest, allBlocks, { withScroller: true, statusAt: 'top' });
+        expect(r?.markerSeen).toBe(true);
+        expect(r?.done).toContain('SHA: 107222e536d1a7a678e2d23314569ee732be63ff');
+        expect(r?.status).toBe('unknown');
       });
 
       test('滚动恢复出的用户块若是旧轮（标记不同），仍不算本轮锚点：不把旧轮当本轮，重试耗尽后照样拒绝终稿', async () => {

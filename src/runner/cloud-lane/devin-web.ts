@@ -33,9 +33,18 @@
  * 挂载——把转录的可滚动容器滚到顶部，该用户块与收尾约定引述会重新出现在 DOM 里；滚回原位置又会把它滚没，
  * 来回可逆。因此找不到锚点时不改判定规则本身，而是有界地恢复可见范围：定位承载作者块的最近可滚动祖先、
  * 滚到顶、等它重渲染、按原算法（用户块含本轮 SCK-ROUND 标记 → 其后的 Devin 发言块）重找锚点，几次仍找不到
- * 就还原滚动位置后放弃。终稿与状态短语的锚点来源不变，仍然只认恢复出来的真实用户块与其后的 Devin 作者块；
+ * 就还原滚动位置后放弃。终稿的锚点来源不变，仍然只认恢复出来的真实用户块与其后的 Devin 作者块；
  * 不靠「本轮标记在页面别处出现过」或「存在某条 DONE 文本」替代这道校验——恢复不出本轮用户锚点时，done 与
  * markerSeen 和没有这道恢复时一样保持拒绝，绝不整页瞎猜，也绝不把旧轮或别的会话的锚点当成本轮的。
+ * 状态短语只认滚动前（自然/当前位置）的那次快照，不认上面恢复阶段临时滚到顶那次的快照——顶部窗口是否连带
+ * 挂载了状态短语未经真实验证，不能当判定依据；终稿已判出时优先锚定本轮 DONE 标记本身的位置（真实事故的
+ * 常驻快照证实它和 Devin 作者块本就在自然位置可读，不需要用户块在场），没有终稿时才退回收尾约定本身的位置。
+ * 已知限制：这道恢复只把容器滚到绝对顶部一次，只找得到「滚到顶就会挂载」的锚点，与目前唯一证实过的事故
+ * 形态（本轮是会话里的第一轮，顶部就是本轮）相符。续轮转录积累了更早的轮次后，本轮用户消息是最新内容，
+ * 物理上更接近底部而不是顶部，滚到顶只会露出更早的轮次，找不回本轮锚点；这种中段/底部锚点本版本不会去搜，
+ * 没有可靠证据证明某个具体滚动位置就会挂载出它，宁可不恢复也不去赌一个位置。找不到时仍然安全：按「转录里
+ * 一直看不到本轮标记」有界重试几轮后受阻、保留会话地址与在途标记，不会被当成无输出的空交付丢成静默回合，
+ * 也不会误判成供应商额度或协议故障，只是不能像顶部锚点那样及时收尾。
  * openPage 的 p.goto 失败会被 catch 吞掉（页面可能留在上一个地址上），所以转录判定之外还有一道独立的地址
  * 核验：session/follow 模式读完 DOM 之后，一律核对 location.href（query/hash 可规范化去掉）是否正是本次
  * 传入的会话地址；留在另一个合法会话上即使凑巧也有本轮同标记作者块，也按 wrong_session 拒绝，绝不采信，
@@ -123,11 +132,22 @@ const read = () => p.evaluate(async () => {
     return { mainText, blocks, roundStart };
   };
   let { mainText, blocks, roundStart } = collect();
+  // 这次 collect() 是滚动前（自然/当前位置）的快照。下面状态短语判定只认它：承载作者块的最近可滚动祖先若
+  // 要滚到顶找回本轮用户锚点，那次临时滚动的快照是否连带挂载了状态短语未经真实验证，不能当判定依据——
+  // 这与「终稿只认恢复出来的真实用户块与其后的 Devin 作者块」是分别判定、互不借用快照的两件事。
+  const naturalText = mainText;
   // 转录是虚拟化长列表，本轮用户消息（收尾约定所在那条）可能已经滚出 DOM（真实事故：只剩 Devin 作者块与
   // 本轮 DONE，没有用户块）。真实滚动探针证实内容还在只是没挂载：把承载作者块的最近可滚动祖先滚到顶，
   // 该用户块会重新出现；读完再滚回原位置，不留在别处。有界重试几次仍找不到锚点就放弃——判定规则本身不变，
   // 不靠标记在别处出现过或存在某条 DONE 文本替代这道校验，恢复不出锚点时 done/markerSeen 和没有这道恢复时
   // 一样保持拒绝。
+  // 已知限制（不是静默失败）：这道恢复只把容器滚到绝对顶部一次，只找得到「滚到顶就会挂载」的锚点（与目前
+  // 唯一证实过的事故形态相符：本轮是会话里的第一轮，顶部就是本轮）。续轮转录积累了更早的轮次后，本轮用户
+  // 消息是最新内容，物理上更接近底部而不是顶部——滚到顶只会露出更早的轮次，找不回本轮锚点。这种中段/底部
+  // 锚点本版本不会去搜：没有可靠证据证明某个具体滚动位置就会挂载出它，宁可不恢复也不去赌一个位置。找不到时
+  // 仍然安全：done/markerSeen 保持和没有这道恢复时一样的拒绝，驱动层（devin.ts）按「转录里一直看不到本轮
+  // 标记」有界重试几轮后受阻、保留会话地址与在途标记，不会被当成无输出的空交付丢成静默回合，也不会误判成
+  // 供应商额度或协议故障；只是不能像顶部锚点那样及时收尾，要等到有界重试耗尽或整轮超时。
   if (roundStart < 0) {
     const probe = blocks.length ? document.querySelector('[data-message-author]') : (document.querySelector('main') ?? document.body);
     let node = probe, scroller = null;
@@ -163,13 +183,15 @@ const read = () => p.evaluate(async () => {
       }
     }
   }
-  // 状态短语只看「最近一次收尾约定」之后的文字：发送前这条约定属于上一轮（上一轮还在跑时状态就在它之后），
-  // 发送后就是本轮之后。更早轮次残留的状态短语不算；页面上一条收尾约定都没有时区域为空，状态 unknown。
-  // mainText 取自上面恢复后的那次快照，和 blocks/roundStart 是同一时刻的 DOM，用户消息里引述收尾约定的
-  // 文字（CONV_OPEN）若也刚被恢复出来，这里天然就能扫到，不需要另立锚点。
+  // 状态短语只看锚点之后的文字，且只从滚动前的自然快照（naturalText）里找，绝不借用上面恢复阶段临时滚到
+  // 顶那次的快照。终稿已经判出来时，优先锚定本轮 DONE 标记本身的位置——真实事故的常驻快照证实了「Devin
+  // 作者块与本轮 DONE 文本」本就在自然位置可读，不需要用户块也在场。DONE 还没出现时（working/blocked，
+  // 终稿为空）才退回收尾约定本身的位置：那种情况下用户块本来就在自然位置，还没被挤出虚拟化窗口。
   const at = mainText.lastIndexOf(QUOTED);
-  const lastConv = mainText.lastIndexOf(CONV_OPEN);
-  const region = lastConv >= 0 ? mainText.slice(lastConv) : '';
+  const doneAt = done !== null ? naturalText.lastIndexOf(DONE) : -1;
+  const lastConv = naturalText.lastIndexOf(CONV_OPEN);
+  const regionStart = doneAt >= 0 ? doneAt : lastConv;
+  const region = regionStart >= 0 ? naturalText.slice(regionStart) : '';
   const lastAt = (re) => { let idx = -1, m; const g = new RegExp(re.source, 'gi'); while ((m = g.exec(region))) idx = m.index; return idx; };
   const hits = [['working', lastAt(/Devin is working/)], ['blocked', lastAt(/blocked on the user/)], ['idle', lastAt(/Devin is awaiting instructions|Devin chose to stop working/)]]
     .filter(h => h[1] >= 0).sort((a, b) => b[1] - a[1]);
@@ -188,7 +210,7 @@ const read = () => p.evaluate(async () => {
     convSeen: roundStart >= 0 ? blocks[roundStart].text.includes(QUOTED) : at >= 0,
     status: hits.length ? hits[0][0] : 'unknown',
     done,
-    tail: (region.trim() || mainText).slice(-1500),
+    tail: (region.trim() || naturalText).slice(-1500),
   };
 });`;
 }
