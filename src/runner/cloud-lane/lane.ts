@@ -8,7 +8,7 @@ import { isAbsolute, join } from 'node:path';
 import { isLaneProvider, type LaneProvider } from '../native-args.ts';
 import { WEB_CHAT_PROVIDERS } from '../native-args.ts';
 import { bodyOfDispatch } from '../../outbound-render.ts';
-import { clearInflight, laneDigest, readInflight, readLaneState, recordInflight, writeLaneState, type LaneState } from './state.ts';
+import { clearInflight, inflightSession, laneDigest, readClaimTask, readInflight, readInflightOfTask, readLaneState, recordInflight, writeLaneState, type LaneState } from './state.ts';
 import { repoInfo, type ExecFn, type RepoInfo } from './repo.ts';
 import { driveCodex } from './codex.ts';
 import { devinCloudModel, driveDevin } from './devin.ts';
@@ -60,13 +60,21 @@ export function validateLanes(lanes: unknown): asserts lanes is Partial<Record<L
   }
 }
 
+/** 进展所处的阶段：尝试（还没有受理证据）、已受理、未取得受理证据。只有 accepted 才能写成“已派”。 */
+export type LaneProgressPhase = 'attempt' | 'accepted' | 'failed';
+
 export interface LaneDeps {
   exec: ExecFn;
   fetch: typeof fetch;
   sleep(ms: number): Promise<void>;
   now(): number;
   /** 每步进展以 lane_status 事件输出给执行端活动流。 */
-  progress(status: string): void;
+  progress(status: string, phase?: LaneProgressPhase): void;
+  /**
+   * ego-browser 页面脚本执行器（与 grok-bot 通道同签名）：devin-cloud 经网页入口执行时需要；
+   * 其它通道不调用。脚本只回 `__RESULT__{json}`，已按下发送后中断回 `{code:'pressed'}`。
+   */
+  browse?(script: string, timeoutMs: number): Promise<Record<string, unknown> | undefined>;
 }
 
 export interface LaneInput {
@@ -87,6 +95,7 @@ export interface LaneInput {
 /** 云端回合终态：success 也可能是「工作结果：受阻」文本（执行端按受阻收尾，不记供应商故障）。 */
 export interface LaneOutcome { sessionId: string; status: 'success' | 'error'; text: string }
 
+/** 受阻文本的首行必须整行就是它（执行端按首行判定）；原因写在下一行起。 */
 const BLOCKED = '工作结果：受阻';
 
 /** 复核轮：task.md 含待复核成果段。最终答复首行必须是复核结论，缺了按错误回合处理。 */
@@ -182,6 +191,8 @@ interface VendorOutcome {
   text: string;
   /** error 且为供应商明确报告的终态失败（如 codex [ERROR]、Jules FAILED）：清除在途登记，允许重新提交。 */
   vendorTerminal?: boolean;
+  /** blocked 且供应商会话仍在途（已按下发送）：保留在途登记，恢复时只核对，不再提交。 */
+  inflight?: boolean;
 }
 
 /** 按供应商分派；返回该轮最终答复文本与性质。 */
@@ -217,7 +228,7 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
   const state = readLaneState(input.commDir) ?? { sessionId: `lane-${crypto.randomUUID()}` };
   const sessionId = input.resumeId ?? state.sessionId;
   const fail = (text: string): LaneOutcome => ({ sessionId, status: 'error', text });
-  const blocked = (text: string): LaneOutcome => ({ sessionId, status: 'success', text: `${BLOCKED}：${text}` });
+  const blocked = (text: string): LaneOutcome => ({ sessionId, status: 'success', text: `${BLOCKED}\n${text}` });
   if (!isLaneProvider(input.provider)) return fail(`未知云端通道：${input.provider}`);
   if (input.provider === 'warp') return fail('warp 走本地桥接进程（src/runner/warp/main.ts），不经云端通道');
   if ((WEB_CHAT_PROVIDERS as readonly string[]).includes(input.provider)) return fail(`${input.provider} 走网页桥接进程（src/runner/grok-bot/main.ts），不经云端通道`);
@@ -242,22 +253,47 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
   const deadline = deps.now() + (input.config.maxMinutes ?? 180) * 60_000;
 
   // 相同 prompt 摘要重连在途云端任务；新回合清空 taskId 但保留可复用的供应商会话（vendorSession）。
-  const next: LaneState = { ...state, sessionId, digest, branch: repo.branch };
-  if (state.digest !== digest) { delete next.taskId; delete next.taskUrl; delete next.submittedAt; }
+  const next: LaneState = { ...state, sessionId, digest, branch: repo.branch, task: readClaimTask(input.commDir) };
+  // Devin 上一轮已按下发送（或发送中途进程中断，attempt 残留）且受理未确认、没有会话地址可核对：
+  // 换了 prompt 也不能另建会话（可能与在途会话重复），受阻交人工。在途登记与 attempt 原样保留。
+  if (state.digest !== digest && input.provider === 'devin-cloud' && (state.taskId || state.devin?.attempt)
+    && !state.taskUrl && !state.vendorSession)
+    return blocked(`上一轮 Devin Cloud 已按下发送（或发送中途中断）但未确认受理，且没有会话地址可核对；为避免另建重复会话，本轮未发出。在途登记已保留，请人工核对 app.devin.ai 会话列表后再决定是否重派。`);
+  if (state.digest !== digest) {
+    delete next.taskId; delete next.taskUrl; delete next.submittedAt;
+    // 落点会话属于旧摘要的发送，新摘要不沿用；仍在途的旧发送由共享登记另行决定。
+    if (next.devin) next.devin = { ...next.devin, attemptSession: undefined };
+  }
   // 本 comm 目录没有在途任务时查共享登记：同一公司任务换员工实例也能重连，而不是重复提交云端任务。
   if (!next.taskId) {
     const reg = readInflight(input.stateRoot, input.provider, digest);
-    if (reg) {
+    if (reg?.taskId) {
       next.taskId = reg.taskId;
       next.taskUrl = reg.taskUrl;
       next.submittedAt = reg.submittedAt;
       next.vendorSession ??= reg.vendorSession;
+      if (input.provider === 'devin-cloud') next.devin = { ...next.devin, attemptSession: reg.attemptSession };
+    } else if (reg?.attempt && input.provider === 'devin-cloud') {
+      // 另一个员工目录已落下发送意图但还没有任务 ID：按在途处理，只核对是否已受理，绝不再次按发送。
+      // 登记里的落点会话（续轮的原会话）决定核对哪个会话，本目录的旧值不沿用。
+      next.taskId = reg.attempt;
+      next.submittedAt ??= reg.attemptAt;
+      next.devin = { ...next.devin, attemptSession: reg.attemptSession };
+    } else if (input.provider === 'devin-cloud' && next.task) {
+      // 摘要变了（返工改了 findings 等）：同一公司任务在别的目录里的登记仍代表已发出的会话，不能当成新任务另建。
+      // 未确认受理且没有会话地址的只能受阻交人工核对；有会话地址的沿用它做跟进（同一会话，不另建）。
+      const others = readInflightOfTask(input.stateRoot, input.provider, next.task, digest);
+      if (others.some(entry => !inflightSession(entry)))
+        return blocked(`同一任务上一轮 Devin Cloud 已按下发送（或发送中途中断）但未确认受理，且没有会话地址可核对；换了摘要也不能另建会话（避免重复）。本轮未发出，在途登记已保留，请人工核对 app.devin.ai 后再决定是否重派。`);
+      const session = others.map(inflightSession).find(Boolean);
+      if (session) next.vendorSession ??= session;
     }
   }
   try {
     const outcome = await drive({ input, deps, repo, material, prompt, state: next, digest, deadline });
-    if (outcome.kind !== 'error' || outcome.vendorTerminal) {
+    if (!outcome.inflight && (outcome.kind !== 'error' || outcome.vendorTerminal)) {
       // 完成、受阻、供应商终态失败：回合有了定论，清除登记并清掉在途任务标记（失败可重新提交）。
+      // 仍在途的受阻（供应商会话已发出、等待核对）保留标记，恢复时不再发送。
       clearInflight(input.stateRoot, input.provider, digest);
       writeLaneState(input.commDir, { ...next, taskId: undefined, taskUrl: undefined, submittedAt: undefined,
         ...(outcome.vendorTerminal ? { vendorSession: undefined } : {}) });
@@ -266,7 +302,7 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
       recordInflight(input.stateRoot, input.provider, digest, next);
     }
     if (outcome.kind === 'error') return fail(outcome.text);
-    if (outcome.kind === 'blocked') return { sessionId, status: 'success', text: outcome.text.startsWith(BLOCKED) ? outcome.text : `${BLOCKED}：${outcome.text}` };
+    if (outcome.kind === 'blocked') return { sessionId, status: 'success', text: outcome.text.startsWith(BLOCKED) ? outcome.text : `${BLOCKED}\n${outcome.text}` };
     if (material.review && !REVIEW_PREFIX.test(outcome.text.trimStart()))
       return fail('云端复核答复首行不是「复核结论：通过/退回」，按协议不计为复核结果');
     return { sessionId, status: 'success', text: outcome.text };

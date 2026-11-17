@@ -21,18 +21,28 @@ export const egoBrowse = (bin: string): Browse => (script, timeoutMs) => new Pro
   const child = spawn(bin, ['nodejs', '-e', script], { stdio: ['ignore', 'pipe', 'pipe'] });
   let out = '';
   let settled = false;
-  const settle = (value: Record<string, unknown> | undefined) => { if (!settled) { settled = true; clearTimeout(timer); resolve(value); } };
+  let fallback: ReturnType<typeof setTimeout> | undefined;
+  const settle = (value: Record<string, unknown> | undefined) => {
+    if (settled) return;
+    settled = true; clearTimeout(timer); clearTimeout(fallback); resolve(value);
+  };
   // 脚本没给结果就结束（超时、崩溃）：若已打出「按下发送」标记，报 pressed，执行端不再重发。
   const unfinished = () => (out.includes(PRESSED) ? { ok: false, code: 'pressed' } : undefined);
-  const timer = setTimeout(() => { child.kill('SIGKILL'); settle(unfinished()); }, timeoutMs);
+  const finish = () => {
+    const line = out.split('\n').filter(l => l.startsWith('__RESULT__')).pop();
+    try { return line ? JSON.parse(line.slice('__RESULT__'.length)) as Record<string, unknown> : unfinished(); }
+    catch { return unfinished(); }
+  };
+  // 超时：杀掉子进程后等 close 把管道里剩下的输出读完再判定，否则「已按下发送」的标记可能还没读到就丢了。
+  // 兜底：子进程的孙进程若仍占着管道，close 迟迟不来；此时拿不到结果就保守报 pressed（只核对，不重发）。
+  const timer = setTimeout(() => {
+    child.kill('SIGKILL');
+    fallback = setTimeout(() => settle(finish() ?? { ok: false, code: 'pressed' }), 5_000);
+  }, timeoutMs);
   child.stdout.on('data', chunk => { out += chunk; });
   child.stderr.on('data', chunk => { out += chunk; });
   child.on('error', () => settle(undefined));
-  child.on('close', () => {
-    const line = out.split('\n').filter(l => l.startsWith('__RESULT__')).pop();
-    try { settle(line ? JSON.parse(line.slice('__RESULT__'.length)) as Record<string, unknown> : unfinished()); }
-    catch { settle(unfinished()); }
-  });
+  child.on('close', () => settle(finish()));
 });
 
 async function main(): Promise<number> {
