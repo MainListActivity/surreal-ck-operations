@@ -1426,23 +1426,22 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(fake.st.sent).toHaveLength(1);
     });
 
-    test('假设 B（程序化点击能开菜单，未证实）+ 旧选择器能认出的普通 Free 行（对照）：选中 Free 并发送', async () => {
+    // 下面两条只看结果，不检查点击方式（点击方式由假设 A 那条负责）：它们用来分开「点击开不开菜单」与「行定位漏 Free」。
+    test('假设 B（程序化点击能开菜单，未证实）+ 旧选择器认得的普通 Free 行（对照）：选中 Free 并发送', async () => {
       const w = world({ extra: gitOk });
       const fake = fakeDevin({ programmaticCapOpens: true, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
       const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
       expect(out.status).toBe('success');
-      expect(pickOf(fake.st.events)).toEqual(PICK);
-      expect(fake.st.events.filter(e => e.startsWith('js'))).toEqual([]);
+      expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
       expect(fake.st.sent).toHaveLength(1);
     });
 
-    test('假设 B（程序化点击能开菜单，未证实）+ 行定位（合成兼容：Free 行只有 role=menuitem，标签未知，span 只是代表）：旧选择器认不出这一行，新版按 role 认出、指针点中、回读并发送', async () => {
+    test('假设 B（程序化点击能开菜单，未证实）+ 行定位（合成兼容：Free 行只有 role=menuitem，标签未知，span 只是代表）：旧选择器认不出这一行，新版按 role 认出、指针点中并发送', async () => {
       const w = world({ extra: gitOk });
       const fake = fakeDevin({ programmaticCapOpens: true, menuItemRows: true, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
       const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
       expect(out.status).toBe('success');
-      expect(pickOf(fake.st.events)).toEqual(PICK);
-      expect(fake.st.events.filter(e => e.startsWith('js'))).toEqual([]);
+      expect(fake.st.events).toContain('pointer Free');
       expect(fake.st.sent).toHaveLength(1);
     });
 
