@@ -1,6 +1,83 @@
 import { expect, test } from 'bun:test';
 import { createSubmitCheck, extractPrUrls, judgePr, type PrInfo } from '../src/pr-gate.ts';
-import { assertEmployeeCiBlockAllowed, createCiBillingCheck } from '../src/github-ci-control.ts';
+import { assertEmployeeCiBlockAllowed, createCiBillingCheck, isCiBlockCause } from '../src/github-ci-control.ts';
+import { referenceReport, referenceSentence } from './fixtures/ci-reference-report.ts';
+import { citationLinksAllowed, citationSentenceBreakBlockers, citationWordBypassBlockers, customerBillingPositives, customerBillingWaits, customerContinuationBlockers, descriptiveBillingAllowed, descriptiveHidesStateBlockers, disclaimerKeepsStateBlockers, existingGapBlockers, invisibleSpellingBlockers, noPunctuationBypassBlockers, reportShapedDescriptiveBilling, silentSentenceBlockers, urlGluedBypassBlockers } from './fixtures/ci-billing-boundary.ts';
+
+test.each([referenceSentence, referenceReport])('研究旁证不是当前 CI 原因：%s', text => {
+  expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
+  expect(isCiBlockCause([text])).toBe(false);
+});
+
+test('网页引用与已完成CI背景不启动当前CI原因检查', () => {
+  for (const text of [
+    '已核对 GitHub release 与 billing/self-serve.md，等待内部元数据处置确认。',
+    'GitHub CI 已完成，当前等待老板确认客户账单。',
+    'GitHub CI 已通过；等待内部元数据处置，计费文档仅为旁证。']) {
+    expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
+    expect(isCiBlockCause([text])).toBe(false);
+  }
+});
+
+test('当前 CI 原因不能通过附加旁证声明或已完成背景逃逸', () => {
+  for (const text of [
+    'GitHub CI 因账户付款失败未启动，等待老板付款。',
+    'GitHub CI 因账户付款失败未启动，引用仅为旁证。',
+    'GitHub CI 已完成，但当前 CI 因付款失败未启动。',
+    'GitHub CI 计费阻塞，等待老板付款；本报告不申请豁免。',
+    'CI 等待账户问题解决后执行。',
+  ]) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+  expect(isCiBlockCause(['检查未启动，需老板处理'])).toBe(true);
+  expect(isCiBlockCause(['GitHub CI 断言测试失败'])).toBe(true);
+  expect(isCiBlockCause(['CI 等待检查结果'])).toBe(true);
+});
+
+// A billing blocker owes no fixed problem vocabulary: every phrasing of a current CI billing
+// obstruction is a CI cause and refuses, even dressed as a citation or a completed-CI report.
+test('真实 CI 计费阻塞与等待的全部写法仍被拒绝', () => {
+  for (const text of [
+    'GitHub CI 账单未付，需老板处理。',
+    'GitHub CI 账单需老板付款，才能跑 workflow。',
+    'GitHub CI billing issue; waiting for owner payment.',
+    'GitHub Actions spending limit needs to be raised before jobs can run.',
+    'GitHub CI 账单已逾期，需老板付款后才能继续。',
+    'GitHub CI 账单需付款，老板付款后再运行。',
+    'GitHub Actions 因账单问题未运行，需老板付款。',
+    'GitHub CI 暂停，原因是账户付款问题，需老板付款。',
+    'GitHub CI 显示 spending limit 已达上限，需老板提高上限。',
+    'CI 账户问题未解决，需老板处理。',
+    'GitHub CI 已通过（计费页已核对）；但 CI 账单未付，需老板付款。',
+    'GitHub CI 已通过，但账单未付需老板付款。',
+    'GitHub CI 账单未付，以上摘自计费文档。',
+    '引文核对无误；GitHub CI 账单需付款。',
+    '核对计费页后确认：GitHub CI 账户问题需要老板处理。',
+    '引用 billing 页面：GitHub CI 因账户付款卡住，请老板付款。',
+    '引文核对后确认：GitHub Actions 计费额度耗尽，需老板处理。',
+    '已核对计费页：GitHub CI 账户余额不足，需老板充值后再跑。',
+    '引文核对：GitHub CI 账户付款卡住，引用仅为旁证。',
+    'GitHub CI 已通过，账户付款卡住，需老板付款。',
+    'quotation: GitHub Actions is blocked by the account payment hold.',
+  ]) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+});
+
+// The mirror image of the rejections above: citation clauses that only describe fetched or quoted
+// material, including negated and evidentiary mentions, assert no current CI state at all.
+test('参考段落变体只描述资料内容，不是当前 CI 原因', () => {
+  for (const text of [
+    '本轮重新抓取计费页和 GitHub release 页，引文与报告一致，未发现失败。',
+    '本轮核对计费文档；GitHub release 页无法作为 CI 判定依据，仅作研究旁证。',
+    '已抓取 GitHub 计费页面，页面内容无阻塞说明，等待内部元数据处置。',
+  ]) {
+    expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
+    expect(isCiBlockCause([text])).toBe(false);
+  }
+});
 
 test('CI billing blockers are system-owned; ordinary invoices and real test failures remain separate', () => {
   for (const text of ['GitHub CI 账单失败，要求付款', 'CI 因计费未启动', 'GitHub Actions spending limit reached',
@@ -12,6 +89,146 @@ test('CI billing blockers are system-owned; ordinary invoices and real test fail
     expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
   }
   expect(() => assertEmployeeCiBlockAllowed('GitHub CI 已完成', '请老板批准客户账单')).not.toThrow();
+});
+
+// Citation wording and missing punctuation never move a current CI billing state out of the CI cause.
+test('引文词与无标点写法不能包住当前CI计费状态', () => {
+  for (const text of citationWordBypassBlockers) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+});
+
+// Sentence or semicolon breaks, completed-CI conjunctions and Actions minute quota are the same CI billing cause.
+test('既有缺口：句号、分号、并列与分钟额度不能切开CI与付款', () => {
+  for (const text of existingGapBlockers) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+});
+
+// A customer invoice beside a completed CI is an unrelated business wait, not a CI cause.
+test('CI已完成旁的客户账单付款等待不是CI原因', () => {
+  for (const text of customerBillingWaits) {
+    expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
+    expect(isCiBlockCause([text])).toBe(false);
+  }
+});
+
+const refused = (text: string): boolean => {
+  try { assertEmployeeCiBlockAllowed(text); return false; } catch { return true; }
+};
+
+// Deterministic sweep over CI billing wording. A current CI billing state refuses under every citation wrapper, joint
+// and tail; citation-only CI sentences and customer invoices beside a completed CI stay open.
+test('变体扫描：引文包裹的CI计费状态全部拒绝，纯引文与客户账单全部放行', () => {
+  const subjects = ['GitHub CI', 'GitHub Actions', 'CI', 'workflow'];
+  const wrappers = ['', '已核对计费页', '引文核对', '核对计费说明', '引用 billing 页面', '已抓取账单页', '摘自计费文档', '仅作旁证：'];
+  const joints = ['', ' ', '，', '。'];
+  const states = ['未付款逾期', '付款卡住了问题', '未付款', '账户问题', '欠费', '余额不足', '需老板付款', '额度耗尽',
+    '免费分钟用尽', 'spending limit 已达上限', '支付失败', '账单未付', 'billing issue', 'payment failed'];
+  const billingTails = ['', '，需老板处理', '，引文与报告一致', '，仅为旁证', '；引用仅为旁证', '。以上摘自计费文档',
+    '，未对任何 CI 作出豁免或成功判定'];
+  // A citation-only sentence keeps its marker beside the CI word; a bare CI word with no marker is a CI cause by design.
+  const citationTails = ['', '，引文与报告一致', '，仅为旁证', '，未对任何 CI 作出豁免或成功判定', '，仅供参考', '。以上摘自计费文档'];
+  const doneCi = ['GitHub CI 已完成，', 'GitHub CI 已通过；', 'GitHub PR 已完成，'];
+  const customerWaits = ['客户付款卡住，等待老板处理', '客户账单需老板付款', '当前等待老板确认客户账单', '客户欠费，需老板处理'];
+  const bypasses: string[] = [];
+  const falseRefusals: string[] = [];
+  let billingClaims = 0, citationOnly = 0;
+  for (const wrapper of wrappers) for (const subject of subjects) {
+    for (const joint of joints) for (const state of states) for (const tail of billingTails) {
+      const text = `${wrapper}${subject}${joint}${state}${tail}`;
+      billingClaims++;
+      if (!refused(text) || !isCiBlockCause([text])) bypasses.push(text);
+    }
+    for (const tail of citationTails) {
+      // Without a wrapper, the tail must stay in the CI word's sentence, so a bare CI word or a sentence break has no marker.
+      if (wrapper === '' && (tail === '' || tail.startsWith('。'))) continue;
+      const text = `${wrapper}${subject}${tail}`;
+      citationOnly++;
+      if (refused(text) || isCiBlockCause([text])) falseRefusals.push(text);
+    }
+  }
+  for (const opening of doneCi) for (const wait of customerWaits) {
+    const text = `${opening}${wait}`;
+    citationOnly++;
+    if (refused(text) || isCiBlockCause([text])) falseRefusals.push(text);
+  }
+  expect(billingClaims).toBeGreaterThan(10_000);
+  expect(citationOnly).toBeGreaterThan(150);
+  expect(bypasses).toEqual([]);
+  expect(falseRefusals).toEqual([]);
+});
+
+// Reported false refusal: a descriptive billing sentence in a report that also names GitHub is business text. CI
+// context never spreads across the report; only a payment state beside a CI word is a cause.
+test('描述性计费句与同报告中的 GitHub 字样不构成 CI 原因', () => {
+  for (const text of [...descriptiveBillingAllowed, reportShapedDescriptiveBilling]) {
+    expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
+  }
+  expect(isCiBlockCause([reportShapedDescriptiveBilling])).toBe(false);
+});
+
+// Citation links and literature references are side evidence, even when the link path names billing.
+test('URL与文献引用是旁证，链接路径中的计费词不构成 CI 原因', () => {
+  for (const text of citationLinksAllowed) {
+    expect(isCiBlockCause([text])).toBe(false);
+    expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
+  }
+});
+
+// A disclaimer or a descriptive pricing phrase never removes a payment state that sits beside a CI word.
+test('免责声明与描述性计费语不能遮住 CI 旁的付款状态', () => {
+  for (const text of [...disclaimerKeepsStateBlockers, ...descriptiveHidesStateBlockers]) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+});
+
+// A customer invoice and its continuation are business waits, unless the same sentence names an account, a document
+// or a CI cause; then the payment state stays attached to CI.
+test('客户账单及其续句是业务等待；同句带账户、文档或 CI 原因时付款状态归 CI', () => {
+  for (const text of customerBillingPositives) {
+    expect(isCiBlockCause([text])).toBe(false);
+    expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
+  }
+  for (const text of customerContinuationBlockers) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+});
+
+// No punctuation, and no space after a link, never hides a current CI billing state inside a citation or billing word.
+test('无标点与紧贴链接的写法不能把当前CI计费状态藏进引文', () => {
+  for (const text of [...noPunctuationBypassBlockers, ...urlGluedBypassBlockers]) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+});
+
+// A citation sentence between CI and a payment state never breaks adjacency, and full-width spelling names the same CI.
+test('引文句不能切断CI与付款状态，全角写法同样是CI原因', () => {
+  for (const text of citationSentenceBreakBlockers) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+});
+
+// A zero-width character inside a CI word must not split the word, since the reader sees one word.
+test('零宽字符不能把CI词拆开藏起来', () => {
+  for (const text of invisibleSpellingBlockers) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+});
+
+// A blank line, stray punctuation or a bare link between CI and a payment state states nothing and cannot separate them.
+test('空行、纯标点与裸链接分句不能切断CI与付款状态', () => {
+  for (const text of silentSentenceBlockers) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
 });
 
 test('CI billing control reads PR/run sources even when the blocker omits all billing words', async () => {
