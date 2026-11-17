@@ -35,3 +35,23 @@ export class CompanyError extends Error {
     this.name = 'CompanyError';
   }
 }
+
+export type RepoLockState = 'busy' | 'unavailable' | 'lost';
+
+/**
+ * The repository allocation lock was not taken, or was lost before the action ran. Nothing was allocated or written, and the
+ * cause is the host's lock rather than an employee or a provider, so the caller retries on a later pass. `lock` says which:
+ * 'busy' (not taken within the acquire limit), 'unavailable' (the lock helper could not start, or ended before taking the
+ * lock) or 'lost' (the helper ended after taking the lock, before the action started). See host-node.ts withRepoLock.
+ */
+export class RepoLockError extends CompanyError {
+  constructor(readonly lock: RepoLockState, message: string) {
+    super('conflict', message, true);
+    this.name = 'RepoLockError';
+  }
+}
+
+/** True for a RepoLockError, also when it was made by another copy of this module (the plugin bundle vendors its own). */
+export function isRepoLockError(error: unknown): error is RepoLockError {
+  return error instanceof RepoLockError || (error instanceof Error && error.name === 'RepoLockError');
+}

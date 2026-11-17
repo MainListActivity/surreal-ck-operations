@@ -29,6 +29,7 @@ import type { ArtifactTrigger } from './artifact-reclaim.ts';
 import type { ArtifactReclaimResult } from './artifact-sweeper.ts';
 import { summarizeReclaim } from './artifact-sweeper.ts';
 import { isRetireRefused } from '../retirement.ts';
+import { isRepoLockError } from '../core-errors.ts';
 import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, repoName, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
 export type { BlockCode, DispatchPhase, DispatchVerdict } from './dispatch-blocked.ts';
 import type { BoardEmployeeView, BoardNextEntry, BoardPhase, BoardQueueItem, BoardView } from '../board.ts';
@@ -942,6 +943,8 @@ export class Dispatcher {
   private readonly verdicts = new Map<string, DispatchVerdict>();
   /** Tasks whose claim lost the write scope to another writer in this pass: settled as write_scope, never as a wake failure. */
   private readonly scopeDenied = new Set<string>();
+  /** Tasks whose repository allocation lock was busy in this pass: settled as repo_lock_busy, never as a wake failure. */
+  private readonly repoLockBusy = new Set<string>();
 
   /** Server-side dispatch-blocked conclusions from the latest pass; the roster, task cards and brief read these. */
   dispatchVerdicts(): DispatchVerdict[] {
@@ -1692,13 +1695,18 @@ export class Dispatcher {
             poolFor(role, home, task, forReview, skipExclusion).filter(e => e.kind === 'spawn' && !e.eligible && this.deps.providerAllowed?.(e.provider) !== false).map(e => ({ provider: e.provider, reason: e.reason })),
         });
         this.scopeDenied.delete(item.task.id);
+        this.repoLockBusy.delete(item.task.id);
         const result = await this.assign(item.role, item.task, last?.employee, pickItem, spawnItem,
           report, insts, item.purpose === 'review', slotMap, exclusion, undefined, undefined);
         if (!result) {
           // Eligible candidates that still failed to wake or spawn are a runtime failure, not an empty pool. Entries held for
           // non-eligible entries keep their own reason: they were never candidates, so they are not a wake failure.
+          // A busy repository lock is a queue on the host: no candidate failed, so it is settled as repo_lock_busy instead.
+          const blocked = this.repoLockBusy.has(item.task.id)
+            ? { code: 'repo_lock_busy' as const }
+            : { code: 'wake_failed' as const, reason: '唤醒或创建失败，下一轮重试' };
           const entries = poolFor(item.role, home, item.task, item.purpose === 'review', exclusion).map(entry => entry.eligible
-            ? { ...entry, eligible: false, code: 'wake_failed' as const, reason: '唤醒或创建失败，下一轮重试' }
+            ? { ...entry, eligible: false, ...blocked }
             : entry);
           if (entries.length === 0 && await ownedElsewhere(item.role)) continue;
           await this.settleBlocked(item.task, item.purpose, home, entries, now, report, [],
@@ -1945,8 +1953,11 @@ export class Dispatcher {
           return { ...existing, spawned: false };
         }
       } catch (error) {
-        this.log(`wake ${existing.id} failed: ${(error as Error).message}`);
+        // A busy repository lock is a queue on the host, not a failed wake: nothing was sent, and the task waits for a later pass.
+        const lockBusy = isRepoLockError(error);
+        this.log(lockBusy ? `wake ${existing.id} waiting: ${(error as Error).message}` : `wake ${existing.id} failed: ${(error as Error).message}`);
         if (externalAttempt) throw error; // Never release or redispatch an uncertain external call.
+        if (lockBusy && task) this.repoLockBusy.add(task.id);
         if (workspace) await sidecar?.releaseWorkspace?.(existing);
         if (claim && task) await sidecar!.releaseClaim(existing.id, task.id, `wake failed: ${(error as Error).message.slice(0, 120)}`);
         return undefined;
@@ -1974,7 +1985,12 @@ export class Dispatcher {
         if (!task) workspace = await sidecar.readWorkspace?.(inst, anchor?.task?.id, anchor?.project);
       }
       catch (error) {
-        if (await this.retireGated(inst, 'allocation unavailable', 'failure', report)) {
+        // A busy repository lock queues the task on the host: no session was opened and no employee failed. The unbound seat is
+        // retired as a normal rotation (never a failure) and the task waits for a later pass, which spawns a fresh seat if needed.
+        const lockBusy = isRepoLockError(error);
+        if (lockBusy && task) this.repoLockBusy.add(task.id);
+        if (await this.retireGated(inst, lockBusy ? '仓库分配锁忙，未开会话，下一轮重新分配' : 'allocation unavailable',
+          lockBusy ? 'rotation' : 'failure', report)) {
           sidecar?.detachAgent(inst.paseoAgentId ?? '');
           report.retired.push(inst.id);
         }
