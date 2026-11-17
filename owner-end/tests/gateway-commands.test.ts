@@ -314,8 +314,8 @@ describe('员工调用的命令守卫与审计', () => {
     expect(audits[0]!.vars.actorKind).toBe('agent');
   });
 
-  test('h. 有有效租约，但老板观测命令在员工拒绝清单里（ops.job.list、audit.list）：forbidden 只能由老板调用，denied 审计', async () => {
-    for (const command of ['ops.job.list', 'audit.list', ...ITERATION_COMMANDS, ...LIFECYCLE_COMMANDS]) {
+  test('h. 有有效租约，但老板命令在员工拒绝清单里（ops.job.list、audit.list、fault.lift）：forbidden 只能由老板调用，denied 审计', async () => {
+    for (const command of ['ops.job.list', 'audit.list', 'fault.lift', ...ITERATION_COMMANDS, ...LIFECYCLE_COMMANDS]) {
       const gateway = agentGateway({ identity: IDENTITY_ALICE, task: VALID_LEASE });
       const deps = depsWith(fakeSessions(gateway.db));
       const error = await errorOf(() => runCommand(deps, agentCaller, command, {}));
@@ -448,7 +448,7 @@ describe('员工调用的命令守卫与审计', () => {
     const deps = { ...depsWith(fakeSessions(owner.db)), cfg: testConfig({ IDP_TENANT_ID: '46aa29a6-9ee8-4052-bccd-7923f98220d7' }) };
     const result = await runCommand(deps, ownerCaller, 'guard.list', {}) as Record<string, unknown>;
     expect(result.hardOwnerOnly).toEqual(['guard.*', 'agent.*', 'owner.login.*', 'owner.settings.*', 'def.*', 'db.write']);
-    expect(result.ownerOnlyForAgents).toEqual(['ops.job.list', 'audit.list', ...ITERATION_COMMANDS, ...LIFECYCLE_COMMANDS]);
+    expect(result.ownerOnlyForAgents).toEqual(['ops.job.list', 'audit.list', 'fault.lift', ...ITERATION_COMMANDS, ...LIFECYCLE_COMMANDS]);
     expect(result.lockedTargets).toMatchObject({
       companyTenantId: '46aa29a6-9ee8-4052-bccd-7923f98220d7',
       companyHost: 'company.maplayer.top',

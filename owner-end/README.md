@@ -142,7 +142,7 @@
   7. 命中按目标的硬锁（`src/owner-locks.ts`，只看命令与输入里的目标，不看调用方）：
      - `idp.*`：公司租户（`IDP_TENANT_ID` 或 slug `company`）的写操作，以及 ma_hono 服务主体（`/admin/service-principals`）与其它管理路径的写入。读取和其它租户不受限；
      - `cf.api`：老板端与 ma_hono 的 Worker（脚本及其子资源）、ma_hono 的 D1、API 令牌的管理、自定义域名的写入，以及请求内容提到 `company.maplayer.top` 或这些资源的调用。其它账号资源不受限；
-  8. 员工拒绝清单（`OWNER_ONLY_FOR_AGENTS`：`ops.job.list`、`audit.list`，它们记录其它员工和老板的操作）；
+  8. 员工拒绝清单（`OWNER_ONLY_FOR_AGENTS`：`ops.job.list`、`audit.list`，它们记录其它员工和老板的操作；`fault.lift` 解除故障恢复预算，员工不能给自己解除）；
   9. `ops.job.get` 只能取本员工发起的作业。
 
   通过后：执行端命令（`RUNNER_ONLY_COMMANDS`、`ops_*`、`host.exec`）以员工身份排队到 `ops_job`；`db.read` 用查看者令牌执行（只读）；其余命令用网关令牌执行。员工不再有只读白名单，写命令同样按上面的判定放行。

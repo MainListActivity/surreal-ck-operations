@@ -28,6 +28,8 @@ import { QUOTA_ROWS } from './dispatcher/quota-store.ts';
 import { hostIOOrUndefined } from './host-io.ts';
 import { planMessage, readMessageChains } from './message-chain.ts';
 import type { AgentAction, AgentActivity } from './agent-activity.ts';
+import { FaultStore } from './fault-store.ts';
+import { budgetKey, DEFAULT_FAULT_BUDGET } from './faults.ts';
 
 export type OwnerVia = string;
 export interface OwnerApiContext { db: CompanyDatabase; core: CompanyCore & {
@@ -420,6 +422,27 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       { def: new RecordId('employee_def', defId), reason: text(input.reason ?? '老板停用', 'reason') }); return { ok: true }; }
     case 'def.enable': { await db.query('UPDATE $def SET enabled = true, error_streak = 0, disabled_reason = NONE;',
       { def: new RecordId('employee_def', text(input.id, 'id')) }); return { ok: true }; }
+
+    // ---- 故障恢复：老板解除一个操作已耗尽或已停住的恢复 ----
+    case 'fault.lift': {
+      // 只解除一个操作（任务、目标、阶段）的恢复：窗口与本窗口已用次数从头计，累计次数留给审计。不新建预算，不改租约。
+      const taskId = text(input.taskId, 'taskId', 1, 200);
+      const target = text(input.target, 'target', 1, 100);
+      const phase = text(input.phase, 'phase', 1, 100);
+      const reason = text(input.reason, 'reason', 4, 2000);
+      const { outcome, prior } = await new FaultStore(db).liftScope({
+        key: budgetKey(taskId, target, phase), taskId, now: Date.now(), limits: DEFAULT_FAULT_BUDGET,
+      });
+      if (outcome === 'absent') throw new CompanyError('not_found', `no recovery budget for ${phase} on ${target} of this task`);
+      if (outcome === 'clear') throw new CompanyError('conflict', `the recovery of ${phase} on ${target} is not open: nothing to lift`);
+      if (outcome === 'conflict') throw new CompanyError('conflict', 'the recovery budget changed while it was read; read it again and retry');
+      const evidence = `target=${target} phase=${phase} attempts=${prior!.attempts} totalAttempts=${prior!.totalAttempts} `
+        + `deadline=${new Date(prior!.deadline).toISOString()} reason=${reason}`;
+      await db.query("CREATE audit CONTENT { task: $task, actor: $actor, action: 'fault_lift', evidence: $evidence, at: time::now() };", {
+        task: new RecordId('task', taskId), actor: a, evidence: evidence.slice(0, 900),
+      });
+      return { lifted: true, taskId, target, phase, attempts: prior!.attempts, totalAttempts: prior!.totalAttempts };
+    }
 
     // ---- 审计 ----
     case 'audit.list': { const [rows] = await db.query<[unknown[]]>(

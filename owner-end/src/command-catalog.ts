@@ -71,6 +71,7 @@ export const COMMAND_CATALOG: readonly CommandSpec[] = [
   c('task.stop', '任务', '中止这一轮（收回租约并停掉会话）；hold=true 即暂停，下一条消息先扣住', 'taskId, note?, hold?'),
   c('task.interject', '任务', '插话：随下一条消息带给员工；interrupt=true 时立即中止并重派', 'taskId, text, interrupt?'),
   c('task.void', '任务', '作废任务', 'taskId, note'),
+  c('fault.lift', '任务', '解除一个操作已耗尽或已停住的故障恢复预算（仅老板；窗口从头计，写明理由并写审计）', 'taskId, target, phase, reason', { risk: 'high' }),
   c('task.delete', '任务', '删除（退役）任务', 'taskId, note'),
   c('task.pause', '任务', '暂停全部派工', '无'),
   c('task.resume', '任务', '恢复派工', '无'),

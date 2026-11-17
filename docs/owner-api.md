@@ -32,6 +32,7 @@
 | 改派 | `sck owner task.reassign '{"taskId":"t1","executorRole":"engineering","reviewerRole":"qa","note":"换人"}'` |
 | 作废 | `sck owner task.void '{"taskId":"t1","note":"重复"}'` |
 | 撤销租约 | `sck owner task.revoke '{"taskId":"t1","note":"终止在途"}'` |
+| 解除故障恢复（仅老板，员工不能调用；只解除这一个操作，窗口与本窗口次数从头计，写审计；租约变化不会重开窗口） | `sck owner fault.lift '{"taskId":"t1","target":"idp_login","phase":"login","reason":"已核对 IdP 恢复，允许重试一次登录"}'` |
 | 中止这一轮（hold 为 true 即暂停，下一条消息先扣住） | `sck owner task.stop '{"taskId":"t1","hold":true}'` |
 | 插话（interrupt 为 true 时立即中止并重派） | `sck owner task.interject '{"taskId":"t1","text":"列头用中文","interrupt":false}'` |
 | 暂停派工 | `sck owner task.pause '{}'` |
