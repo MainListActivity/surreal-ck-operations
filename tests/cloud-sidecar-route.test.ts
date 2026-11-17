@@ -35,14 +35,17 @@ const jobCommands = new Map<string, string>();
 /** 老板端作业存储：入队与 ops.job.get 都是真实代码，每个测试重建。 */
 let jobs: OwnerJobStore;
 /** 这些命令走执行端作业：网关先回 202 待取，之后由 ops.job.get 取结果。 */
-const ASYNC_COMMANDS = new Set(['ops_slow', 'ops_failjob', 'ops_authfail', 'ops_authword', 'ops_pollauth', 'ops_authtimeout']);
+const ASYNC_COMMANDS = new Set(['ops_slow', 'ops_failjob', 'ops_authfail', 'ops_authword', 'ops_pollauth', 'ops_authtimeout', 'ops_deadline']);
+/** 执行端截止拒绝的原文（与 src/core.ts 的 refusal、src/faults.ts 的 stop 指导语同形）：阶段只写在 refused (login) 里。 */
+const DEADLINE_REFUSAL = 'operation refused (login): the recovery deadline for this operation has passed at 2026-11-16T07:01:22.862Z. Every recovery attempt for this object failed and the recovery budget is spent. The repair is tracked as one incident with one repair task.';
 
 /**
  * 执行端进度脚本，写回用真实的 storeResult / failure（见 tests/support/owner-job-contract.ts）：
  * ops_slow 第 1 次轮询 running，第 3 次 done；ops_failjob 第 1 次写回 forbidden，说明里回显了令牌（客户端须隐藏）；
  * ops_authfail 写回类别 unauthorized；ops_authword 写回一句像鉴权失败的说明但类别是上游失败；
  * ops_authtimeout 第 1 次轮询写回 IdP 授权超时（上游失败，说明末尾带 stage=authorize，与 06:59 事故同形）；
- * ops_pollauth 每次轮询都被网关拒绝（401）。ops.job.get 本身走老板端真实命令。
+ * ops_pollauth 每次轮询都被网关拒绝（401）；ops_deadline 第 1 次轮询写回截止拒绝（恢复窗口已过，与 07:06 事故同形）。
+ * ops.job.get 本身走老板端真实命令。
  */
 async function jobReply(bearer: string, input: Record<string, unknown>): Promise<JobReply> {
   const id = String(input.id ?? '');
@@ -58,6 +61,7 @@ async function jobReply(bearer: string, input: Record<string, unknown>): Promise
   if (polls === 1 && command === 'ops_authfail') jobs.fail(id, new CompanyError('unauthorized', '登录令牌已失效'));
   if (polls === 1 && command === 'ops_authword') jobs.fail(id, new Error('invalid credential from upstream'));
   if (polls === 1 && command === 'ops_authtimeout') jobs.fail(id, new CompanyError('upstream_error', 'IdP authorize 请求超时（TimeoutError）; stage=authorize'));
+  if (polls === 1 && command === 'ops_deadline') jobs.fail(id, new CompanyError('upstream_error', DEADLINE_REFUSAL));
   return jobs.getJob(input);
 }
 
@@ -113,6 +117,14 @@ beforeAll(() => {
         const id = await jobs.enqueue(body.command, body.input ?? {});
         jobCommands.set(id, body.command);
         jobs.fail(id, new CompanyError('login_failed', 'IdP rejected the login (invalid_credentials); stage=login'));
+        const reply = await jobs.settle(id);
+        return json(reply.body, reply.status);
+      }
+      // 截止拒绝在等待时限内同步结束（与 07:06 事故同形：阶段只在 refused (login) 里）。
+      if (body.command === 'ops_deadline_sync') {
+        const id = await jobs.enqueue(body.command, body.input ?? {});
+        jobCommands.set(id, body.command);
+        jobs.fail(id, new CompanyError('upstream_error', DEADLINE_REFUSAL));
         const reply = await jobs.settle(id);
         return json(reply.body, reply.status);
       }
@@ -444,6 +456,17 @@ describe('有租约的网关调用', () => {
     expect(gwCalls.filter(call => call.command === 'ops_authtimeout')).toHaveLength(1);
   });
 
+  test('截止拒绝（异步，执行端真实写回，与 07:06 事故同形）：阶段取 login，作业号与截止时刻保留，已受理，业务命令只提交一次', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-deadline');
+    const reply = await send(dir, key, 'r1', 'ops_deadline', {});
+    // 说明按 200 字截断（ops-jobs 的 failure），阶段与截止时刻都在截断之前，保留在回执里。
+    expect(reply).toMatchObject({ ok: false, accepted: true, jobId: polledJobId(), stage: 'login' });
+    expect(reply.error).toMatch(/^upstream_error: .*operation refused \(login\)/);
+    expect(reply.error).toContain('2026-11-16T07:01:22.862Z');
+    expect(gwCalls.filter(call => call.command === 'ops_deadline')).toHaveLength(1);
+  });
+
   test('网关错误文本回显令牌时，返回给员工的内容已脱敏；入队前的拒绝不算已受理，没有作业号', async () => {
     pool = makePool({ cloud: makeCloud() });
     const { dir, key } = await claimFor(pool, 'eng-1', 'task-leak');
@@ -466,6 +489,18 @@ describe('有租约的网关调用', () => {
     });
     expect(queuedJobId('ops_syncfail')).not.toBe('');
     expect(gwCalls.filter(call => call.command === 'ops_syncfail')).toHaveLength(1);
+    expect(gwCalls.filter(call => call.command === 'ops.job.get')).toHaveLength(0);
+  });
+
+  test('截止拒绝在等待时限内同步结束：回执带作业号、阶段 login，已受理，不轮询也不重提', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-deadline-sync');
+    const reply = await send(dir, key, 'r1', 'ops_deadline_sync', {});
+    expect(reply).toMatchObject({ ok: false, accepted: true, jobId: queuedJobId('ops_deadline_sync'), stage: 'login' });
+    expect(reply.error).toMatch(/^upstream_error: operation refused \(login\)/);
+    expect(reply.error).toContain('2026-11-16T07:01:22.862Z');
+    expect(queuedJobId('ops_deadline_sync')).not.toBe('');
+    expect(gwCalls.filter(call => call.command === 'ops_deadline_sync')).toHaveLength(1);
     expect(gwCalls.filter(call => call.command === 'ops.job.get')).toHaveLength(0);
   });
 
