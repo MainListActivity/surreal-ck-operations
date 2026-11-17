@@ -9,6 +9,8 @@ const URL_BASE = 'https://gw.example.test';
 const TOKEN = 'tok-gateway-1';
 // 与 src/ops/redact.ts 的 JWT 形状一致的合成值，不是真实凭证。
 const JWT = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl';
+// 执行端截止拒绝的原文（src/core.ts 的 refusal 与 src/faults.ts 的 stop 指导语）：阶段只写在 refused (login) 里。
+const DEADLINE_REFUSAL = 'operation refused (login): the recovery deadline for this operation has passed at 2026-11-16T07:01:22.862Z. Every recovery attempt for this object failed and the recovery budget is spent. The repair is tracked as one incident with one repair task.';
 
 type Call = { url: string; init: RequestInit; body: { command: string; input: unknown } };
 
@@ -364,17 +366,17 @@ describe('GatewayClient 轮询老板端作业（真实 ops.job.get 回执）', (
     expect(calls.map(call => call.body.command)).toEqual(['ops_login', 'ops.job.get']);
   });
 
-  test('作业因恢复窗口已过被拒：截止时刻随说明保留，已受理，作业号保留，业务命令只提交一次', async () => {
+  test('作业因恢复窗口已过被拒（异步，执行端真实写回）：阶段取 login，截止时刻保留，已受理，作业号保留，业务命令只提交一次', async () => {
     const store = createOwnerJobStore();
-    const deadline = '2026-11-16T07:01:22.859Z';
     const { fn, calls } = bossGateway(store, (poll, id) => {
-      if (poll === 1) store.fail(id, new CompanyError('upstream_error', `the recovery deadline for this operation has passed at ${deadline}`));
+      if (poll === 1) store.fail(id, new CompanyError('upstream_error', DEADLINE_REFUSAL));
     });
     const client = new GatewayClient({ url: URL_BASE, fetch: fn, pollMs: 0, sleep: noSleep });
 
     const error = await catchError(client.call(TOKEN, 'ops_login', { alias: 'QA1' })) as GatewayError;
     expect(error.code).toBe('upstream_error');
-    expect(error.message).toBe(`作业执行失败：the recovery deadline for this operation has passed at ${deadline}`);
+    expect(error.message).toContain('operation refused (login): the recovery deadline for this operation has passed at 2026-11-16T07:01:22.862Z');
+    expect(error.stage).toBe('login');
     expect(error.accepted).toBe(true);
     expect(error.jobId).toBe((calls[1]!.body.input as { id: string }).id);
     expect(calls.filter(call => call.body.command === 'ops_login')).toHaveLength(1);
@@ -405,6 +407,25 @@ describe('GatewayClient 回执：作业号、类别与阶段', () => {
     expect(error.accepted).toBe(false);
     expect(error.jobId).toBeUndefined();
     expect(error.stage).toBeUndefined();
+  });
+
+  test('截止拒绝在等待时限内同步结束（执行端真实写回与老板端信封）：阶段取 login，已受理，作业号保留，业务命令只提交一次', async () => {
+    const store = createOwnerJobStore();
+    let queued = '';
+    const { fn, calls } = fakeFetch(async call => {
+      queued = await store.enqueue(call.body.command, call.body.input as Record<string, unknown>);
+      store.fail(queued, new CompanyError('upstream_error', DEADLINE_REFUSAL));
+      return reply(await store.settle(queued));
+    });
+    const client = new GatewayClient({ url: URL_BASE, fetch: fn, pollMs: 0, sleep: noSleep });
+
+    const error = await catchError(client.call(TOKEN, 'ops_login', { alias: 'QA1' })) as GatewayError;
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toContain('operation refused (login):');
+    expect(error.stage).toBe('login');
+    expect(error.accepted).toBe(true);
+    expect(error.jobId).toBe(queued);
+    expect(calls.map(call => call.body.command)).toEqual(['ops_login']);
   });
 
   test('作业类别取 jobCode：接口码 upstream_error 不覆盖作业原来的类别', async () => {

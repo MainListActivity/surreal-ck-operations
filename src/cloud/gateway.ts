@@ -46,8 +46,11 @@ function safeMessage(message: unknown): string {
   return typeof message === 'string' ? redactText(clip(message, 200)) : '';
 }
 
-/** 登录流程的阶段标记 stage=…（src/ops/idp.ts 写入）。阶段只会是这四个之一；说明被截断时仍从原文取。 */
-const STAGE_MARK = /\bstage=(authorize|login|consent|exchange)\b/;
+/**
+ * 登录流程的阶段：stage=…（src/ops/idp.ts 写入），或预算拒绝说明的 refused (login)（src/core.ts 写入；截止、次数、
+ * 间隔、租约的拒绝都用这个前缀）。阶段只会是这四个之一；说明被截断时仍从原文取。
+ */
+const STAGE_MARK = /\b(?:stage=|refused \()(authorize|login|consent|exchange)\b/;
 
 function stageOf(text: string): string | undefined {
   return STAGE_MARK.exec(text)?.[1];
