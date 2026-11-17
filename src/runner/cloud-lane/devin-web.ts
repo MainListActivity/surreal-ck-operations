@@ -5,14 +5,15 @@
  * - Capability 触发按钮：菜单外、innerText 正好是 Fusion/Ultra/Normal/Lite/Free 之一的 button；
  *   弹出层是 [role=menu]，里面 "Capability" 分组下有同名行（2026-11-16 只读实测）。
  * - 选中 Free 后菜单是两层（2026-11-17 负责人真实页面实测）：第一层 Capability 列表仍开；第二层 Free 详情里有
- *   "Free (powered by SWE-2)"、"The plan includes 2 concurrent sessions"、"N/M in use"。Free 项是 role=menuitem。
- *   第一次 Escape 只收详情，列表仍在；第二次才收起列表。
+ *   "Free (powered by SWE-2)"、"The plan includes 2 concurrent sessions"、"N/M in use"。Free 项的角色是 role=menuitem
+ *   （负责人证据，标签未知）。第一次 Escape 只收详情，列表仍在；第二次才收起列表。
  * - 首页选 Free 用 ego-browser 真实指针点击（page.click，按本次页面里打的 data-sck-* 标记定位）；真实指针选中 Free
- *   已由负责人 2026-11-17 实测确认。推断（未在页面上单独验证）：页内 element.click() 只派发 click 事件、不走指针
- *   按下/抬起，不能当作用户点击；2026-11-17 正式派工的失败签名（按钮停在 Normal、powered=false，Free 行从未被选中）与此一致。
+ *   已由负责人 2026-11-17 实测确认。旧版（0.13.41，页内 element.click() 选 Free）选不中的具体机制未证实：程序化点击
+ *   是否能打开 Capability 菜单、旧行选择器是否漏掉 Free 行、还是读数时序，都没有在页面上验证。本版不依赖其中任何一个，
+ *   只用指针点击。2026-11-17 正式派工的失败签名（按钮停在 Normal、powered=false）与其中任一情形都相容，无法据此区分。
  *   流程（新会话与续轮共用 pickFree）：指针点 Capability（只点唯一的档位名按钮）→ 有界等待可见的 [role=menu]
  *   里恰好一个精确的 Free 行 → 指针点它 → 菜单仍打开时有界回读 Free、powered、N/M in use → 逐层 Escape，
- *   直到可见菜单为 0（最多 4 次，不盲多按）。任何一步不成立都不发送。
+ *   直到可见菜单为 0（只在可见菜单仍在时按，最多 4 次）。任何一步不成立都不发送。
  * - 席位文字只在首页 Capability 菜单打开、选中 Free 时出现（收起 Free 详情后消失），所以必须在点选 Free 之后、
  *   菜单仍打开时回读。会话页的 Capability 按钮是 disabled，菜单打不开，读不到席位，续轮因此先到组织首页读席位，再回原会话发送。
  * - 会话地址 https://app.devin.ai/sessions/<32hex>；侧栏 a[href^="/sessions/"] 列出会话。

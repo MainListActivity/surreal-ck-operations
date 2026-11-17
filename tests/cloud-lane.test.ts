@@ -363,8 +363,16 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     singleLayer?: boolean;
     /** Escape 生效要等这么多毫秒（虚拟时钟，由 waitForTimeout 推进）：模拟 DOM 更新慢。 */
     escapeLagMs?: number;
-    /** 菜单项改成 role=menuitem 的链接（真实页面 Free 项的角色；标签不是 button）。 */
+    /**
+     * 合成兼容用例（非真实页面）：Free 行的角色是 role=menuitem（负责人证据），标签未知。这里用 span 代表一个不在旧选择器
+     * （标签 div/button，角色 menuitemradio/option）之内的标签，只验证新选择器按 role 认出 Free 行。span 不代表真实页面标签。
+     */
     menuItemRows?: boolean;
+    /**
+     * 假设 B（未证实）：程序化 element.click() 能打开 Capability 菜单。默认 false，即假设 A：程序化点击不开菜单（同样未证实）。
+     * 只影响旧版（0.13.41）的 element.click()；新版从不调用程序化点击，所以这个开关对新版没有影响。
+     */
+    programmaticCapOpens?: boolean;
     /** 点 Free 后档位与席位晚这么多毫秒才显示（虚拟时钟，由 waitForTimeout 推进）。 */
     capLagMs?: number;
     /** 选中 Free 后详情里没有 "powered by SWE-2"（档位是 Free，但没有 SWE-2 的 powered 文字）。 */
@@ -390,8 +398,9 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
   ] };
   /**
    * 假 Devin 网页：ego-browser 脚本真的在 new Function 里执行，页面结构按只读实测（见 devin-web.ts 文件头）。
-   * 首页 Capability 菜单只响应真实指针点击（p.click）：程序化 element.click() 只派发 click 事件，不开菜单、不改档位
-   * （推断，与 2026-11-17 失败签名一致）。菜单在指针点击后按 menuDelayMs 渲染（虚拟时钟由 waitForTimeout 推进）。
+   * 首页 Capability 菜单在指针点击（p.click）后打开，按 menuDelayMs 渲染（虚拟时钟由 waitForTimeout 推进）。
+   * 两类未证实假设分开建模：程序化点击开不开菜单（programmaticCapOpens：默认假设 A 不开，只记 js cap；假设 B 开），
+   * 只影响旧版的 element.click()；Free 行能否被旧选择器命中（menuItemRows）则两版都会遇到。二者各有独立用例，互不依赖。
    * 选中 Free 后菜单是两层（负责人 2026-11-17 真实页面实测）：第一层 Capability 列表仍开，第二层 Free 详情才有
    * "Free (powered by SWE-2)" 与 "N/M in use"。Escape 每次只收一层：第一次收详情，第二次收列表；singleLayer 时一次全收；
    * escapeLagMs 时收起要等 DOM 更新。escLog 记录每次 Escape 生效后仍可见的菜单层数。
@@ -474,12 +483,16 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     const rowNames = [...CAP_ROWS.filter(name => !(opts.noFreeRow && name === 'Free')), ...(opts.duplicateFreeRow ? ['Free'] : [])];
     const trigger = mkEl({ tag: 'button', text: () => capShown(), rect: () => ({ width: 90, height: 28 }),
       disabled: () => isSession(st.url), expanded: () => st.menuOpen,
-      onClick: () => { st.events.push('js cap'); } });
+      onClick: () => {
+        st.events.push('js cap');
+        // 程序化点击：只有假设 B（未证实）才打开菜单；假设 A 下它什么也不做。
+        if (opts.programmaticCapOpens && !isSession(st.url)) { st.menuOpen = true; st.detailOpen = false; st.menuReadyAt = st.clock + (opts.menuDelayMs ?? 0); }
+      } });
     const outside = opts.outsideFree ? mkEl({ tag: 'button', text: () => 'Free', rect: () => ({ width: 60, height: 24 }) }) : undefined;
     const menuRows: FakeEl[] = [];
     const capMenu = mkEl({ tag: 'div', attrs: { role: 'menu' }, text: () => rowNames.join('\n'),
       rect: () => ({ width: 200, height: 300 }), children: () => menuRows });
-    for (const name of rowNames) menuRows.push(mkEl({ tag: opts.menuItemRows ? 'a' : 'button',
+    for (const name of rowNames) menuRows.push(mkEl({ tag: opts.menuItemRows ? 'span' : 'button',
       attrs: { role: opts.menuItemRows ? 'menuitem' : 'menuitemradio' }, parent: capMenu,
       text: () => name, rect: () => (menuShown() ? { width: 160, height: 32 } : { width: 0, height: 0 }),
       onClick: () => { st.events.push(`js ${name}`); if (name === 'Free' && menuShown() && !opts.freeRowInert) selectFree(); } }));
@@ -1270,7 +1283,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       return at < 0 ? [] : events.slice(at, at + PICK.length);
     };
 
-    test('新会话：指针打开 Capability、指针点 Free、回读后 Escape 收起，再填写与发送；没有程序化点击', async () => {
+    test('假设 A（程序化点击不开菜单，未证实）下新会话：指针打开 Capability、指针点 Free、回读后两次 Escape 收起，再填写与发送；没有程序化点击', async () => {
       const w = world({ extra: gitOk });
       const fake = fakeDevin({ seats: { used: 0, total: 2 }, onSend: answer(PR9) });
       const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
@@ -1413,9 +1426,19 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(fake.st.sent).toHaveLength(1);
     });
 
-    test('Free 项是 role=menuitem 的链接（真实页面的菜单项角色，标签不是 button）：照样认出、指针点中、回读并发送', async () => {
+    test('假设 B（程序化点击能开菜单，未证实）+ 旧选择器能认出的普通 Free 行（对照）：选中 Free 并发送', async () => {
       const w = world({ extra: gitOk });
-      const fake = fakeDevin({ menuItemRows: true, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      const fake = fakeDevin({ programmaticCapOpens: true, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.status).toBe('success');
+      expect(pickOf(fake.st.events)).toEqual(PICK);
+      expect(fake.st.events.filter(e => e.startsWith('js'))).toEqual([]);
+      expect(fake.st.sent).toHaveLength(1);
+    });
+
+    test('假设 B（程序化点击能开菜单，未证实）+ 行定位（合成兼容：Free 行只有 role=menuitem，标签未知，span 只是代表）：旧选择器认不出这一行，新版按 role 认出、指针点中、回读并发送', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ programmaticCapOpens: true, menuItemRows: true, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
       const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
       expect(out.status).toBe('success');
       expect(pickOf(fake.st.events)).toEqual(PICK);
@@ -1437,7 +1460,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
 
     test('新会话：选中 Free 但详情没有 powered by SWE-2（不是 SWE-2 Free）→ 零填写零发送，受阻', async () => {
       const w = world({ extra: gitOk });
-      const fake = fakeDevin({ noPowered: true, seats: { used: 0, total: 2 } });
+      const fake = fakeDevin({ noPowered: true, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
       const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1, maxMinutes: 1 } }),
         { ...w.deps, browse: advancing(w, fake.browse) });
       expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
@@ -1450,7 +1473,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
 
     test('新会话：选中 Free、powered 都有，但读不到席位计数 → 零填写零发送，受阻', async () => {
       const w = world({ extra: gitOk });
-      const fake = fakeDevin({ noSeats: true, seats: { used: 0, total: 2 } });
+      const fake = fakeDevin({ noSeats: true, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
       const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1, maxMinutes: 1 } }),
         { ...w.deps, browse: advancing(w, fake.browse) });
       expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
@@ -1464,7 +1487,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       for (const [flag, why] of [[{ noPowered: true }, 'powered=false'], [{ noSeats: true }, '读不到 Free 席位计数']] as const) {
         const w = world({ extra: gitOk });
         writeLaneState(w.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
-        const fake = fakeDevin({ ...flag, seats: { used: 1, total: 2 }, sessions: { [SESSION]: OLD_ROUND } });
+        const fake = fakeDevin({ ...flag, seats: { used: 1, total: 2 }, sessions: { [SESSION]: OLD_ROUND }, onSend: answer(PR9) });
         const out = await runLane(w.input({ provider: 'devin-cloud', prompt: '继续修复。', config: { pollMs: 1, maxMinutes: 1 } }),
           { ...w.deps, browse: advancing(w, fake.browse) });
         const home = fake.st.events.indexOf(`visit ${HOME}`);
@@ -1476,6 +1499,29 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
         expect(fake.st.sent).toHaveLength(0);
       }
     });
+  });
+
+  test('派工提示：devin-cloud 代码轮写明同会话可换仓库、以本轮仓库与分支为准；不一致时先找到或复用本轮仓库的正确工作树，取不到才受阻；PR 只开在本轮仓库；复核轮与其它通道不带这一段', () => {
+    const repo = { slug: 'acme/widget', branch: 'sck/task-1', defaultBranch: 'main' } as never;
+    const code = vendorPrompt({ provider: 'devin-cloud', prompt: '做事' } as never, repo, { task: '实现需求甲。', review: false } as never);
+    expect(code).toContain('同一个供应商会话可以先后处理不同仓库，但以本轮为准：仓库 acme/widget、分支 sck/task-1。');
+    expect(code).toContain('写文件或提交前，核对当前工作树的 origin 远端与当前分支是否与本轮一致');
+    expect(code).toContain('不一致时，先找到、克隆或复用本轮仓库 acme/widget 的正确任务工作树，核对它的 origin 与分支 sck/task-1 一致后再继续；只有取不到正确工作树时，才以「工作结果：受阻」收尾');
+    expect(code).not.toContain('不一致就停下');
+    expect(code).toContain('最终 PR 只开在本轮仓库 acme/widget，head 为本轮分支 sck/task-1，目标分支 main。');
+    // 仓库、分支、目标分支都从本轮字段取值，换一组字段就换一组文字，不写死任何仓库名。
+    const other = vendorPrompt({ provider: 'devin-cloud', prompt: '做事' } as never,
+      { slug: 'other-org/other-repo', branch: 'feat/x', defaultBranch: 'dev' } as never, { task: '实现需求甲。', review: false } as never);
+    expect(other).toContain('仓库 other-org/other-repo、分支 feat/x。');
+    expect(other).toContain('最终 PR 只开在本轮仓库 other-org/other-repo，head 为本轮分支 feat/x，目标分支 dev。');
+    expect(other).not.toContain('acme/widget');
+    expect(code.indexOf('同一个供应商会话')).toBeLessThan(code.indexOf('实现需求甲。'));
+    expect(code.endsWith('实现需求甲。')).toBe(true);
+    expect(vendorPrompt({ provider: 'devin-cloud', prompt: '做事' } as never, repo, { task: '复核', review: true } as never))
+      .not.toContain('同一个供应商会话');
+    for (const provider of ['codex-cloud', 'jules'] as const)
+      expect(vendorPrompt({ provider, prompt: '做事' } as never, repo, { task: '实现需求甲。', review: false } as never))
+        .not.toContain('同一个供应商会话');
   });
 
   describe('跨员工目录的发送意图（同一 stateRoot、同一任务）', () => {
