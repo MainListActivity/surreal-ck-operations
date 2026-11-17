@@ -99,6 +99,11 @@ export function paseoActionSummary(name: string, detail: unknown): string {
   }
 }
 
+/** 通道进展的阶段（桥接进程的 lane_status.phase）：认不出的按没有阶段处理。 */
+type LanePhase = 'attempt' | 'accepted' | 'failed';
+const lanePhase = (value: unknown): LanePhase | undefined =>
+  value === 'attempt' || value === 'accepted' || value === 'failed' ? value : undefined;
+
 /** Provider-native todo formats. Count status markers only; never persist todo descriptions. */
 function checklistCounts(todos: unknown): {done: number; total: number} | undefined {
   const statuses = Array.isArray(todos) ? todos.map(t => t?.status) :
@@ -114,6 +119,8 @@ export class ActivityCollector {
   private seq = 0;
   private checklistSequence = -1;
   private tools = new Map<string, {name: string; at: number; sequence: number; updatesChecklist: boolean; checklist?: {done: number; total: number}; action: AgentAction}>();
+  /** 通道当前这一次尝试的动作：受理结论出来之前一直是运行中。 */
+  private lane?: AgentAction;
   constructor(agent: string, turn: string, now: number) {
     this.value = { agent, turn, runtime: 'native', state: 'running', startedAt: now,
       observedAt: now, lastActivityAt: now, toolsCompleted: 0, events: [], actions: [] };
@@ -132,6 +139,25 @@ export class ActivityCollector {
     actions.push(action);
     if (actions.length > ACTION_LIMIT) { actions.splice(0, actions.length - ACTION_LIMIT); this.value.actionsDropped = (this.value.actionsDropped ?? 0) + 1; }
     return action;
+  }
+  /**
+   * 通道进展动作：attempt（尝试提交，还没有受理证据）记运行中；accepted（取得受理证据）记已完成；
+   * failed（未取得受理证据）记失败。没有阶段的进展（其它通道）直接按已完成记，与之前一致。
+   */
+  private laneStep(status: string, phase: LanePhase | undefined, at: number) {
+    if (phase === 'attempt') {
+      this.closeLane('failed', at); // 上一次尝试还没有结论：按未受理记，不算作这一次。
+      this.lane = this.act('通道', status, 'running', at);
+      return;
+    }
+    const state: AgentAction['state'] = phase === 'failed' ? 'failed' : 'ok';
+    if (!this.lane) { this.act('通道', status, state, at); return; }
+    this.lane.text = line(status) || this.lane.tool;
+    this.closeLane(state, at);
+  }
+  private closeLane(state: AgentAction['state'], at: number) {
+    if (!this.lane) return;
+    this.lane.state = state; this.lane.endedAt = at; this.lane = undefined;
   }
   private start(id: unknown, name: unknown, at: number, input?: unknown) {
     if (typeof id !== 'string' || typeof name !== 'string' || this.tools.has(id)) return;
@@ -176,10 +202,10 @@ export class ActivityCollector {
       if (e.type === 'tool_result') this.end(e.toolId ?? e.toolCallId ?? e.id, e.isError === true, at);
     } else if (provider === 'codex-cloud' || provider === 'devin-cloud' || provider === 'jules') {
       // 云端通道桥接进程的进展行：只取状态短语，不取供应商转录。
-      if (e.type === 'lane_status' && typeof e.status === 'string') { this.append('status', `云端运行中：${e.status}`, at); this.act('通道', e.status, 'ok', at); }
+      if (e.type === 'lane_status' && typeof e.status === 'string') { this.append('status', `云端运行中：${e.status}`, at); this.laneStep(e.status, lanePhase(e.phase), at); }
     } else if (provider === 'warp' || provider === 'grok-bot' || provider === 'muse-web' || provider === 'chatgpt-web' || provider === 'gemini-web') {
       // warp 本地通道 / grok-bot 网页通道桥接的进展行，同样只取状态短语。
-      if (e.type === 'lane_status' && typeof e.status === 'string') { this.append('status', e.status, at); this.act('通道', e.status, 'ok', at); }
+      if (e.type === 'lane_status' && typeof e.status === 'string') { this.append('status', e.status, at); this.laneStep(e.status, lanePhase(e.phase), at); }
     } else if (provider === 'codex') {
       if (e.type === 'item.completed' && e.item?.type === 'agent_message' && typeof e.item.text === 'string') this.append('output', e.item.text, at);
       if (e.type === 'item.started' && e.item?.type === 'command_execution') this.start(e.item.id, '命令执行', at, { command: e.item.command });
@@ -191,6 +217,8 @@ export class ActivityCollector {
     // 一轮结束时还没收到结果的工具调用：成功结束的按完成记，其余按失败记。
     for (const tool of this.tools.values()) { tool.action.state = state === 'completed' ? 'ok' : 'failed'; tool.action.endedAt = at; }
     this.tools.clear();
+    // 通道尝试一直没有受理结论：没有受理证据，按未受理记。
+    this.closeLane('failed', at);
     if (text && this.value.events.at(-1)?.text !== activityText(text)) this.append('output', text, at);
     this.append('status', state === 'completed' ? '本轮已结束，执行端正在收集成果' : state === 'canceled' ? '本轮已取消' : '本轮运行失败', at);
   }

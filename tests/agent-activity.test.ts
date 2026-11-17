@@ -152,3 +152,23 @@ test('Factory 原生带状态的文本清单可量化，混入未知格式时整
   update('two','1. [completed] PRIVATE_A\n2. unknown');
   expect(c.snapshot(3).checklist).toBeUndefined();
 });
+
+test('云端通道动作：尝试提交记运行中，只有取得受理证据才记完成；未受理或没有结论的尝试记失败', () => {
+  const c = new ActivityCollector('a', 't', 1);
+  const lane = (status: string, phase: 'attempt' | 'accepted' | 'failed', at: number) => c.ingest('devin-cloud', { type: 'lane_status', status, phase }, at);
+  lane('尝试提交 Devin Cloud 会话（同步等待）', 'attempt', 2);
+  expect(c.snapshot(2).actions).toEqual([{ at: 2, tool: '通道', text: '尝试提交 Devin Cloud 会话（同步等待）', state: 'running' }]);
+  // 退出码非零：没有受理证据，不能记成提交成功。
+  lane('Devin Cloud 会话未取得受理证据（退出码 1）', 'failed', 3);
+  expect(c.snapshot(3).actions).toEqual([{ at: 2, tool: '通道', text: 'Devin Cloud 会话未取得受理证据（退出码 1）', state: 'failed', endedAt: 3 }]);
+  lane('尝试提交 Devin Cloud 会话（同步等待）', 'attempt', 4);
+  lane('Devin Cloud 已受理并返回答复', 'accepted', 5);
+  expect(c.snapshot(5).actions!.at(-1)).toEqual({ at: 4, tool: '通道', text: 'Devin Cloud 已受理并返回答复', state: 'ok', endedAt: 5 });
+  // 尝试之后一直没有结论（进程中断）：一轮结束时按未受理记。
+  lane('尝试提交 Devin Cloud 会话（同步等待）', 'attempt', 6);
+  c.finish('failed', '', 7);
+  expect(c.snapshot(7).actions!.at(-1)).toMatchObject({ state: 'failed', endedAt: 7 });
+  // 没有阶段的进展（其它通道）照旧按已完成记。
+  c.ingest('muse-web', { type: 'lane_status', status: '已发给 Muse（abc）' }, 8);
+  expect(c.snapshot(8).actions!.at(-1)).toEqual({ at: 8, tool: '通道', text: '已发给 Muse（abc）', state: 'ok' });
+});
