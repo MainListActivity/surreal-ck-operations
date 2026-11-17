@@ -1177,7 +1177,8 @@ for (const lostReply of [false, true]) {
       };
       if (lostReply) await expect(w.dispatcher().tick()).rejects.toThrow('activation reply lost');
       else await w.dispatcher().tick();
-      for (let i = 0; i < 100 && !existsSync(received); i++) await Bun.sleep(10);
+      // The fixture writes the file after it appears, so wait for the payload itself rather than the file's existence.
+      for (let i = 0; i < 500 && !(existsSync(received) && readFileSync(received, 'utf8').includes('native-activation')); i++) await Bun.sleep(10);
       expect(readFileSync(received, 'utf8')).toContain('native-activation');
       expect(calls).toBe(1);
       if (lostReply) {

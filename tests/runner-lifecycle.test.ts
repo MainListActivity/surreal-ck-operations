@@ -441,6 +441,55 @@ test('事件携带文本不旁路持久时间线：携带提交行的进度事�
   } finally { g.close(); }
 });
 
+test('产物不旁路在途工具：result.json 已写出但工具仍运行时不送审，工具结束后按产物提交一次', async () => {
+  const sha = '1'.repeat(40);
+  let live = true;
+  const f = fixture(async () => { if (live) throw new RuntimeResultError('still_active', 'synthetic running tool'); return '逐条自验完成，CI 全绿。'; });
+  try {
+    f.code();
+    await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
+    writeFileSync(join(f.pool.commDirFor('worker'), 'result.json'), JSON.stringify({ summary: '产物已写出，后台工具仍在运行。', sha }));
+    await f.settle(f.event('turn-a', '进度：后台工具仍在运行。'));
+    expect(f.calls).toHaveLength(0);
+    expect(f.journal().rows()[0]?.state).toBe('collecting');
+    expect(f.journal().rows()[0]?.error).toBe('runtime_result_unavailable:still_active');
+    live = false;
+    await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['submit']);
+    expect(f.calls[0]?.sha).toBe(sha);
+    expect(f.calls[0]?.text).toContain('产物已写出');
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+  } finally { f.close(); }
+});
+test('代码产物不补工作树 HEAD：result.json 与最终答复都未声明提交时直接受阻；report.md 声明的提交行才送审', async () => {
+  const repo = mkdtempSync(join(tmpdir(), 'sck-wt-'));
+  execFileSync('git', ['init', '-q', repo]); writeFileSync(join(repo, 'a.txt'), 'x');
+  execFileSync('git', ['-C', repo, 'add', '.']);
+  execFileSync('git', ['-C', repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'x']);
+  try {
+    const f = fixture(async () => '代码已完成并通过本地验证。');
+    try {
+      f.code(); f.worktree(repo);
+      await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
+      writeFileSync(join(f.pool.commDirFor('worker'), 'result.json'), JSON.stringify({ summary: '代码已完成，但没有声明提交。' }));
+      await f.settle(f.event('turn-a', '代码已完成并通过本地验证。'));
+      expect(f.calls.map(c => c.action)).toEqual(['block']);
+      expect(f.calls[0]?.sha).toBeUndefined();
+      expect(f.calls[0]?.text).toContain('未声明完整提交 SHA');
+      expect(f.journal().rows()[0]?.state).toBe('settled');
+    } finally { f.close(); }
+    const declared = 'd'.repeat(40);
+    const g = fixture(async () => '全部完成。');
+    try {
+      g.code(); g.worktree(repo);
+      await g.claim(); await g.pool.turnStarted('agent', 'turn-a');
+      writeFileSync(join(g.pool.commDirFor('worker'), 'report.md'), `自验完成，报告已写入。\n提交：${declared}`);
+      await g.settle(g.event('turn-a', '全部完成。'));
+      expect(g.calls.map(c => c.action)).toEqual(['submit']);
+      expect(g.calls[0]?.sha).toBe(declared);
+    } finally { g.close(); }
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
 test('收尾单飞：结束事件与重试并发读取同一回合只送审一次', async () => {
   const sha = 'e'.repeat(40);
   const f = fixture(async () => { await new Promise(r => setTimeout(r, 10)); return `完成。\n提交：${sha}`; });

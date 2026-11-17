@@ -1,5 +1,4 @@
 import type { ProviderFailure } from '../dispatcher/provider-failover.ts';
-import { execFile } from 'node:child_process';
 import { LIFECYCLE_COMMANDS } from '../lifecycle-policy.ts';
 // Per-agent sidecar pool. Each company employee instance gets a private comm
 // directory and an in-memory credential held by the plugin; agents receive only
@@ -7,7 +6,7 @@ import { LIFECYCLE_COMMANDS } from '../lifecycle-policy.ts';
 // The sidecar claims tasks on the instance's behalf (dispatcher calls claim()),
 // keeps the lease alive while a turn runs, relays `sck call` requests through
 // req/res files, and ingests report.md/blocker.md when a turn ends.
-import { ExecutionJournal, workResult, finalAnswer, codeDeliveryDeclared, type ExecutionAttempt } from './lifecycle.ts';
+import { ExecutionJournal, workResult, finalAnswer, codeDeliveryDeclared, declaredCommit, type ExecutionAttempt } from './lifecycle.ts';
 import type { TurnEnded } from './contracts.ts';
 import { RuntimeResultError } from './turn-result.ts';
 import { OpsCircuit } from "./ops-circuit.ts";
@@ -344,12 +343,20 @@ export class SidecarPool {
       // Failed/canceled output is never treated as a successful business result.
       return { status: 'silent', silent: { deliveryId: row.proof.deliveryId, instId: employee, taskId: row.task, nudges: 3, phase: row.phase } };
     }
-    const dir = this.commDirFor(employee);
     // Snapshot artifacts with this delivery before any asynchronous cloud mirror can yield to a new claim.
-    row.artifacts = live?.proof.deliveryId === row.proof.deliveryId
-      ? { raw: readTextFile(join(dir, 'result.json')), blocker: readTextFile(blockerPath(dir)), report: readTextFile(reportPath(dir)) } : {};
+    // With a timeline reader, collection reads them again once the turn is confirmed finished.
+    row.artifacts = this.leasedArtifacts(row) ?? {};
     row.state = 'collecting'; await this.changed(row);
     return this.collectExecution(row);
+  }
+  /** This delivery's comm files, read only while its lease is still held: undefined once another claim owns the directory. */
+  private leasedArtifacts(row: ExecutionAttempt): NonNullable<ExecutionAttempt['artifacts']> | undefined {
+    if (this.claims.get(row.employee)?.proof.deliveryId !== row.proof.deliveryId) return undefined;
+    const dir = this.commDirFor(row.employee);
+    return { raw: readTextFile(join(dir, 'result.json')), blocker: readTextFile(blockerPath(dir)), report: readTextFile(reportPath(dir)) };
+  }
+  private hasArtifacts(row: ExecutionAttempt): boolean {
+    return !!(row.artifacts?.raw || row.artifacts?.report || row.artifacts?.blocker);
   }
   /** Disk truth mid-collection: a concurrent settle/retry works on a stale copy, so before writing back
    *  the pass re-reads the row and stops when it is no longer 'collecting' (settled, interrupted, superseded). */
@@ -362,25 +369,27 @@ export class SidecarPool {
     if (this.collecting.has(row.employee)) return { status: 'pending' };
     this.collecting.add(row.employee);
     try {
-      if (!row.artifacts?.raw && !row.artifacts?.report && !row.artifacts?.blocker && (this.deps.readTurnResult || row.finalText?.trim())) {
+      if (this.deps.readTurnResult || row.finalText?.trim()) {
         try {
           if (this.deps.readTurnResult) {
             if (!row.agent || !row.turn) throw new Error('missing turn identity');
             // The durable timeline is the only trusted turn state: an end event can carry a text that
             // declares a commit while turn-fenced tools are still running, so the read always happens —
-            // it both checks in-flight rows and returns the turn's real last answer.
+            // it both checks in-flight rows and returns the turn's real last answer. Files already on disk
+            // do not skip it, because a tool still running may be the one writing them.
             const text = await this.deps.readTurnResult(row.agent, row.turn, row.startedAt ?? row.createdAt ?? 0);
             if (!text.trim()) throw new Error('empty runtime result');
             if (!this.stillCollecting(row)) return { status: 'pending' };
             row.finalText = text;
+            // Files are read only after the in-flight check passed, while this delivery still holds its lease.
+            row.artifacts = this.leasedArtifacts(row) ?? row.artifacts;
             row.error = undefined;
             await this.changed(row);
           }
-          // Every runtime text source is gated the same way — a timeline-read answer or the event-carried
-          // text a native host reports directly. A progress message that does not declare the delivery
-          // contract (verified commit line, review verdict or blocked heading) is not a delivery: the
-          // bounded window keeps waiting, and the worktree HEAD never stands in for an undeclared commit.
-          if (row.finalText?.trim() && await this.undeclaredDelivery(row, row.finalText)) {
+          // Files this turn wrote are the explicit deliverable, and their commit is checked before submit. Text alone
+          // must declare the contract (verified commit line, review verdict or blocked heading): a progress message is not
+          // a delivery, so the bounded window keeps waiting. The worktree HEAD never stands in for an undeclared commit.
+          if (!this.hasArtifacts(row) && row.finalText?.trim() && await this.undeclaredDelivery(row, row.finalText)) {
             if (this.deps.readTurnResult) row.finalText = undefined;
             throw new RuntimeResultError('not_yet_available', 'runtime final result not yet available');
           }
@@ -399,6 +408,9 @@ export class SidecarPool {
         const { raw, blocker, report } = row.artifacts ?? {}; // Never read a later delivery's shared files during recovery.
         row.result = blocker !== undefined ? workResult('', row.phase, { summary: blocker, outcome: 'blocked' })
           : workResult(report || row.finalText || '', row.phase, raw === undefined ? undefined : JSON.parse(raw));
+        // A result.json without sha takes the commit the report or the final answer declares; the worktree HEAD never does.
+        const declared = declaredCommit(report) ?? declaredCommit(row.finalText);
+        if (row.result.action === 'submit' && declared && !row.result.evidence.sha) row.result.evidence.sha = declared;
         row.state = 'pending'; row.nextRetry = 0;
       } catch {
         row.state = 'attention'; row.error = '工作结果缺失或复核结论不明确';
@@ -481,12 +493,10 @@ export class SidecarPool {
       const core = this.deps.core;
       if (!row.prepared && row.result.action === 'submit') {
         const task = await this.callWithCred(row.employee, cred => core.getTask(cred, row.task));
-        if (!row.result.evidence.sha && task.workIntent?.kind === 'code' && task.worktree?.worktreePath) {
-          const head = await new Promise<string | undefined>(resolve => execFile('git', ['-C', task.worktree!.worktreePath, 'rev-parse', 'HEAD'],
-            { timeout: 10000, maxBuffer: 1024 * 1024 }, (error, stdout) => resolve(!error && /^[a-f0-9]{40}$/i.test(stdout.trim()) ? stdout.trim() : undefined)));
-          if (head) row.result.evidence.sha = head;
-        }
         if (task.acceptanceEnvironment) row.result.evidence.acceptance = { ...row.result.evidence.acceptance, environment: task.acceptanceEnvironment };
+        // A code delivery names its commit explicitly. The worktree HEAD never stands in for one: an undeclared commit is
+        // blocked with its reason, and the original work stays in the journal.
+        if (task.workIntent?.kind === 'code' && !row.result.evidence.sha) this.blockResult(row, '代码成果未声明完整提交 SHA（结构化结果无 sha，成果正文与最终答复也没有“提交：<完整40位SHA>”行）');
         row.prepared = true;
         this.journal.save(row);
       }
