@@ -11,6 +11,7 @@ import { recordJulesUsage } from '../src/runner/cloud-lane/jules.ts';
 import type { ExecResult } from '../src/runner/cloud-lane/repo.ts';
 import { egoBrowse } from '../src/runner/grok-bot/main.ts';
 import { DEVIN_HOME } from '../src/runner/cloud-lane/devin-web.ts';
+import { parseNativeResult } from '../src/runner/native.ts';
 
 type Call = { cmd: string; args: string[]; cwd?: string };
 type Route = (call: Call) => ExecResult | undefined;
@@ -789,14 +790,17 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(Date.now() - started).toBeLessThan(20_000);
   }, 25_000);
 
-  test('超时后同一轮只回执核对不重发：状态留在途，下轮直接轮询原会话', async () => {
+  test('超时后同一轮只回执核对不重发：受阻保留会话地址，不丢成无输出错误回合；下轮直接轮询原会话', async () => {
     const working = { ok: true, markerSeen: true, status: 'working', done: null, tail: '' };
     const w1 = world({ extra: gitOk });
     const b1 = devinBrowse({ send: [{ ok: true, url: SESSION }], session: [working] });
     const input1 = w1.input({ provider: 'devin-cloud', config: { pollMs: 1, maxMinutes: 1 } });
     const browse1 = (async (script: string, t: number) => { const r = await b1.browse(script, t); if (!script.includes('const MSG =')) w1.advance(30_000); return r; }) as typeof b1.browse;
     const out1 = await runLane(input1, { ...w1.deps, browse: browse1 });
-    expect(out1.status).toBe('error');
+    // 会话已受理（taskId 已定），超时不是供应商崩溃：按受阻收尾（成功回合、首行「工作结果：受阻」），
+    // 带原会话地址与说明，不是裸错误回合——避免执行端把它当空交付回收成 silent-turn，不送审。
+    expect(out1.status).toBe('success');
+    expect(out1.text.split('\n')[0]).toBe('工作结果：受阻');
     expect(out1.text).toContain(SESSION);
     expect(out1.text).toContain('仍在运行');
     expect(readLaneState(w1.commDir)?.taskUrl).toBe(SESSION);
@@ -808,6 +812,71 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(b2.calls.some(s => s.includes('const MSG ='))).toBe(false);
     expect(b2.calls.length).toBeGreaterThan(0);
     expect(b2.calls.every(s => s.includes(SESSION))).toBe(true);
+  });
+
+  test('近真实 main→native 链路验证：已受理超时的受阻回合经 main.ts 事件映射与 native.ts 真实 parseNativeResult 解析后是 completed，不是 failed（需求 3：不丢成 silent-turn 的关键一环）', async () => {
+    // 复用与上一条用例相同的「已受理、超时」场景，拿到真实 LaneOutcome（status:'success'，首行「工作结果：受阻」）。
+    const working = { ok: true, markerSeen: true, status: 'working', done: null, tail: '' };
+    const w = world({ extra: gitOk });
+    const b = devinBrowse({ send: [{ ok: true, url: SESSION }], session: [working] });
+    const input = w.input({ provider: 'devin-cloud', config: { pollMs: 1, maxMinutes: 1 } });
+    const browse = (async (script: string, t: number) => { const r = await b.browse(script, t); if (!script.includes('const MSG =')) w.advance(30_000); return r; }) as typeof b.browse;
+    const outcome = await runLane(input, { ...w.deps, browse });
+    expect(outcome.status).toBe('success');
+    // runner/cloud-lane/main.ts 收到这个 LaneOutcome 后，原样按它自己的映射打印 Claude 形态事件流（逐行抄自
+    // main.ts 现有源码，不是另一套逻辑）：
+    //   emit({ type: 'result', subtype: outcome.status === 'success' ? 'success' : 'error',
+    //     is_error: outcome.status !== 'success', result: outcome.text, session_id: outcome.sessionId });
+    // 下面把这两行事件喂给真实、未改动的 runner/native.ts 的 parseNativeResult，验证受阻回合走的是
+    // is_error:false/subtype:'success'，不是修前 fail() 会产生的 is_error:true/subtype:'error'。
+    const stdout = [
+      JSON.stringify({ type: 'system', session_id: `lane-${crypto.randomUUID()}` }),
+      JSON.stringify({
+        type: 'result',
+        subtype: outcome.status === 'success' ? 'success' : 'error',
+        is_error: outcome.status !== 'success',
+        result: outcome.text,
+        session_id: outcome.sessionId,
+      }),
+    ].join('\n');
+    const native = parseNativeResult('devin-cloud', stdout);
+    expect(native.completed).toBe(true);
+    expect(native.error).toBeUndefined();
+    expect(native.text.split('\n')[0]).toBe('工作结果：受阻');
+    expect(native.text).toContain(SESSION);
+    expect(native.sessionId).toBe(outcome.sessionId);
+    // native.ts 的 result.completed 正是 NativeRuntime.launch() 用来算 outcome.kind 的那个布尔量：
+    //   const success = ... && result.completed && !!s.nativeSessionId;
+    //   outcome: canceled ? { kind: 'canceled' } : success ? { kind: 'completed' } : { kind: 'failed', error: {...} }
+    // turn-closeout.ts 的 settleTurn 只在 kind==='completed' 时才走「静默回合给有界唤醒重试」分支；kind!=='completed'
+    // 会直接进「回收重派」分支——真实事故 15eaf1b8 正落在这条分支。这两处都不在本次改动范围内、源码未变更，这里
+    // 只引用它们既有、未改动的判定逻辑作为同一条链路的下一环证据，不重复声称本 PR 测试或修改了 native.ts/turn-closeout.ts
+    // 本身；report.md/blocker.md 是否被写出属于外层回合编排，同样不在本次改动范围。
+
+    // 对照：修前 fail() 会让 main.ts 打 is_error:true/subtype:'error'，parseNativeResult 解出 completed:false——
+    // 这正是真实事故「明确超时却被当成失败终态、进而回收成 silent-turn」的那一步；这里只作同一条链路的对照参照。
+    const failedStdout = [
+      JSON.stringify({ type: 'system', session_id: `lane-${crypto.randomUUID()}` }),
+      JSON.stringify({ type: 'result', subtype: 'error', is_error: true, result: outcome.text, session_id: outcome.sessionId }),
+    ].join('\n');
+    expect(parseNativeResult('devin-cloud', failedStdout).completed).toBe(false);
+  });
+
+  test('轮询回执页面停在另一个会话（wrong_session，发布前复核新发现的负例，非生产事故）：不采信该页内容，累计到上限后受阻，不重发、不拉取分支', async () => {
+    const w = world({ extra: gitOk });
+    // 脚本自己的地址核验会拦下这种情况（见 devin-web.ts），这里直接从驱动层角度构造脚本已经回执 wrong_session
+    // 的场景：goto 失败被吞、页面停在另一个合法会话 OTHER 上，驱动层必须不把它当本轮受理证据，也不重发。
+    const wrongSession = { ok: false, code: 'wrong_session', url: OTHER };
+    const b = devinBrowse({ send: [{ ok: true, url: SESSION }], session: [wrongSession] });
+    const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1 } }), { ...w.deps, browse: b.browse });
+    expect(out.status).toBe('success');
+    expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+    expect(out.text).toContain('没能停在本轮轮询的会话地址上');
+    expect(out.text).toContain(SESSION);
+    // 只发过一次；受阻之后在途状态保留（taskId 仍有），没有第二次发送、没有拉取分支（没走到收尾）
+    expect(b.calls.filter(s => s.includes('const MSG ='))).toHaveLength(1);
+    expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(0);
+    expect(readLaneState(w.commDir)?.taskId).toBeDefined();
   });
 
   test('按下发送后脚本中断：先回会话列表核对受理，找到了就接管该会话', async () => {
@@ -864,6 +933,27 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     const follow = b.calls.find(s => s.includes(MODE('follow')))!;
     expect(follow).toContain(SESSION);
     expect(follow).toContain("'Free'");
+  });
+
+  test('续轮跟进脚本回执页面停在另一个会话（wrong_session，发布前复核新发现的负例，非生产事故）：没碰发送按钮，不当已按下、不重发，超时受阻', async () => {
+    const w = world({ extra: gitOk });
+    writeLaneState(w.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
+    const b = devinBrowse({ follow: [{ ok: false, code: 'wrong_session', url: OTHER }] });
+    // 跟进脚本自己就会在填写/发送之前拦下（sessionGate 排在最前核验地址），这里站在驱动层角度断言它拿到
+    // wrong_session 回执后的反应：当「页面未就绪」一样有界重试，不当已按下发送，超时后报错回合而非受阻
+    // （此时还没有 state.taskId，不存在"已受理但未终稿"的在途语义）。
+    const browse = (async (script: string, t: number) => { const r = await b.browse(script, t); w.advance(10 * 60_000); return r; }) as typeof b.browse;
+    const out = await runLane(w.input({ provider: 'devin-cloud', prompt: '继续修复。', config: { pollMs: 1, maxMinutes: 1 } }), { ...w.deps, browse });
+    expect(out.status).toBe('error');
+    expect(out.text).toContain('没能停在原会话地址上');
+    expect(out.text).toContain(OTHER);
+    // 跟进脚本只跑过一次（第一次回执后时限已到，直接报错，不重试多次、不重发）
+    expect(b.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(1);
+    expect(b.calls.some(s => s.includes(MODE('send')))).toBe(false);
+    // 没有按下发送：没有登记在途 attempt 或 taskId
+    const st = readLaneState(w.commDir);
+    expect(st?.devin?.attempt).toBeUndefined();
+    expect(st?.taskId).toBeUndefined();
   });
 
   test('复核轮要求复核结论首行；非 free 的复核轮也不做任何页面动作', async () => {
@@ -1062,7 +1152,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(readLaneState(w.commDir)?.taskId).toMatch(/^SCK-/);
   });
 
-  test('状态 unknown 的答复不收尾：超时按错误回合，不拉取分支', async () => {
+  test('状态 unknown 的答复不收尾：超时按受阻回合（保留会话地址，不丢成无输出错误），不拉取分支', async () => {
     const w = world({ extra: gitOk });
     const b = devinBrowse({
       send: [{ ok: true, url: SESSION, cap: 'Free', seats: { used: 0, total: 2 }, echoed: true }],
@@ -1070,7 +1160,9 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     });
     const browse = (async (script: string, t: number) => { const r = await b.browse(script, t); w.advance(30_000); return r; }) as typeof b.browse;
     const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1, maxMinutes: 1 } }), { ...w.deps, browse });
-    expect(out.status).toBe('error');
+    // status 一直不是 idle：即使 done 有残留文字也不收尾（不拉分支）；但会话已受理，超时按受阻收尾，不是裸错误。
+    expect(out.status).toBe('success');
+    expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
     expect(out.text).toContain('超过配置时限');
     expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(0);
   });
@@ -1609,6 +1701,81 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(b2.calls.every(s => s.includes(SESSION))).toBe(true);
     });
 
+    test('已受理后重启/换员工目录，真实虚拟化 DOM 下仍零重发取回终稿（需求 2：续接走的是这次修复影响的同一条真实读取路径，不是另一套纯状态 mock）', async () => {
+      const w1 = world({ task, extra: gitOk });
+      writeLaneState(w1.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
+      const a = (async (script: string) => {
+        if (script.includes(MODE('follow'))) return { ok: true, url: SESSION, cap: 'Free', seats: { used: 0, total: 2 }, echoed: true };
+        throw new Error('bridge killed while polling');
+      }) as NonNullable<LaneDeps['browse']>;
+      await runLane(w1.input({ provider: 'devin-cloud', prompt: FOLLOW }), { ...w1.deps, browse: a });
+      expect(readInflight(w1.stateRoot, 'devin-cloud', digestOf(w1, FOLLOW))?.taskUrl).toBe(SESSION);
+
+      // 换员工目录/进程重启后的第二个驱动：不是 devinBrowse 纯状态 mock，而是真的执行 devin-web.ts 生成的脚本，
+      // 对着一个与「本轮用户消息被虚拟化滚出 DOM」描述块同构的假页面（常驻只剩 Devin 作者块，本轮用户锚点要
+      // 滚动到顶才挂载得出来）——证明续接复用走的正是这次有界滚动恢复修复影响的那条真实读取路径，不是另一条
+      // 从来不受虚拟化影响的假路径；且全程只跑会话轮询脚本，一次发送/续轮/找回脚本都不该跑到。
+      type Blk = { author: 'user' | 'devin' | 'tool'; text: string };
+      // SHA 用 gitOk 假路由里 `git rev-parse HEAD` 会报的那个真实值：收尾会拿 Devin 自报的 SHA 核对实际
+      // git HEAD，不一致时改写成实际值并附注说明——这里让两者一致，专注验证虚拟化 DOM 读取与零重发，不节外生枝
+      // 到 SHA 核对这条无关分支。
+      const DONE_TEXT = '完成。\nPR: https://github.com/acme/widget/pull/9\nSHA: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+      const g = globalThis as unknown as Record<string, unknown>;
+      const sendLikeCalls: string[] = [];
+      const b2 = (async (script: string) => {
+        if (script.includes(MODE('send')) || script.includes(MODE('follow')) || script.includes(MODE('recover'))) {
+          sendLikeCalls.push(script);
+          throw new Error('不该走到这里：已受理会话续接不应该再发送/再找新会话');
+        }
+        const marker = /\[SCK-ROUND (SCK-[0-9a-f]+)\]/.exec(script)?.[1] ?? 'SCK-none';
+        const userBlock: Blk = { author: 'user', text: `[SCK-ROUND ${marker}]\n\n任务\n\n收尾约定：本轮的最后一条答复以「[SCK-DONE ${marker}]」单独成行开头，随后是完整最终答复。` };
+        const devinBlock1: Blk = { author: 'devin', text: '已读取仓库现状，开始核对工单。' };
+        const devinBlock2: Blk = { author: 'devin', text: `[SCK-DONE ${marker}]\n${DONE_TEXT}` };
+        const mounted: Blk[] = [devinBlock1, devinBlock2];
+        const atTopBlocks: Blk[] = [userBlock, devinBlock1, devinBlock2];
+        let scrolledTop = false;
+        const scroller = { scrollHeight: 2107, clientHeight: 713, _top: 1394,
+          get scrollTop() { return this._top; }, set scrollTop(v: number) { this._top = v; scrolledTop = v === 0; } };
+        const current = () => (scrolledTop ? atTopBlocks : mounted);
+        const text = () => [...current().map(b => b.text), 'Devin is awaiting instructions'].join('\n');
+        const mkEl = (b: Blk) => ({ getAttribute: (n: string) => (n === 'data-message-author' ? b.author : null), innerText: b.text, parentElement: scroller });
+        const doc = {
+          documentElement: {},
+          get body() { return { innerText: text() }; },
+          querySelector: (sel: string) => (sel === 'main' ? { innerText: text() }
+            : sel === '[data-sck-cap-trigger]' ? null
+            : sel === '[data-message-author]' ? (current().filter(x => x.author !== 'tool').map(mkEl)[0] ?? null)
+            : {}),
+          querySelectorAll: (sel: string) => (sel === '[data-message-author]' ? current().filter(x => x.author !== 'tool').map(mkEl) : sel === '[role=menu]' ? [] : [{ innerText: 'Free' }]),
+        };
+        const page = {
+          goto: async () => {}, waitForTimeout: async () => {},
+          evaluate: async (fn: (arg?: unknown) => unknown, arg?: unknown) => {
+            g.document = doc; g.location = { href: SESSION, hostname: 'app.devin.ai' };
+            return fn(arg);
+          },
+        };
+        let result: Record<string, unknown> | undefined;
+        const fakeConsole = { log: (line: string) => { if (line.startsWith('__RESULT__')) result = JSON.parse(line.slice('__RESULT__'.length)); } };
+        const run = new Function('taskSpace', 'console', 'process', `return (async () => {${script}})()`);
+        try {
+          await run(async () => ({ pages: async () => [page] }), fakeConsole, { exit() { throw new Error('unexpected exit'); } });
+        } catch (error) {
+          if (result === undefined) throw error;
+        } finally {
+          delete g.document; delete g.location;
+        }
+        return result;
+      }) as NonNullable<LaneDeps['browse']>;
+
+      const w2 = world({ task, extra: gitOk });
+      const out2 = await runLane(w2.input({ provider: 'devin-cloud', prompt: FOLLOW, stateRoot: w1.stateRoot }), { ...w2.deps, browse: b2 });
+      expect(out2.status).toBe('success');
+      expect(out2.text).toContain('PR: https://github.com/acme/widget/pull/9');
+      expect(out2.text).toContain('SHA: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef');
+      expect(sendLikeCalls).toHaveLength(0);
+    });
+
     test('新会话的发送意图未确认：B 本地残留的旧会话地址不用来核对，只按标记在会话列表里找', async () => {
       const w1 = world({ task, extra: gitOk });
       await runLane(w1.input({ provider: 'devin-cloud', prompt: FOLLOW }), { ...w1.deps, browse: killedBefore('send') });
@@ -1691,13 +1858,14 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
      * 用户/自动化消息是 [data-message-author="user"]；工具输出与 worklog 没有作者属性。
      * tool 块只进 main/body 文字，不进 [data-message-author]，对应真实页面的工具输出。
      */
-    const runPage = async (doc: Record<string, unknown>, marker = M) => {
+    /** href 默认等于 devinSessionScript 轮询的目标会话（SESSION）；传别的地址用于模拟 goto 失败被吞、停在另一个会话。 */
+    const runPage = async (doc: Record<string, unknown>, marker = M, href = SESSION) => {
       const { devinSessionScript } = await import('../src/runner/cloud-lane/devin-web.ts');
       const page = {
         goto: async () => {}, waitForTimeout: async () => {},
         evaluate: async (fn: (arg?: unknown) => unknown, arg?: unknown) => {
           g.document = doc;
-          g.location = { href: SESSION, hostname: 'app.devin.ai' };
+          g.location = { href, hostname: 'app.devin.ai' };
           return fn(arg);
         },
       };
@@ -1705,14 +1873,19 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const fakeConsole = { log: (line: string) => { if (line.startsWith('__RESULT__')) result = JSON.parse(line.slice('__RESULT__'.length)); } };
       const run = new Function('taskSpace', 'console', 'process', `return (async () => {${devinSessionScript(SESSION, marker)}})()`);
       try {
+        // emit() 后紧跟 process.exit(0) 是真实脚本里每条早退码（login_required/not_ready/wrong_session……）
+        // 共用的正常收尾写法：已经拿到回执（result 已被 emit 写入）时的 exit 不算测试异常，按正常提前返回处理；
+        // 没有任何回执就退出才是真的「意外退出」，继续往外抛，不吞掉。
         await run(async () => ({ pages: async () => [page] }), fakeConsole, { exit() { throw new Error('unexpected exit'); } });
+      } catch (error) {
+        if (result === undefined) throw error;
       } finally {
         delete g.document;
         delete g.location;
       }
       return result;
     };
-    const readPage = async (blocks: Block[], rest = '', marker = M) => {
+    const readPage = async (blocks: Block[], rest = '', marker = M, href = SESSION) => {
       const text = [...blocks.map(b => b.text), rest].filter(Boolean).join('\n');
       const elements = blocks.filter(b => b.author !== 'tool').map(b => ({
         getAttribute: (name: string) => (name === 'data-message-author' ? b.author : null),
@@ -1724,7 +1897,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
         // 终稿与状态判定不涉及 Capability 菜单：页面上没有可见菜单。
         querySelectorAll: (sel: string) => (sel === '[data-message-author]' ? elements : sel === '[role=menu]' ? [] : [{ innerText: 'Free' }]),
       };
-      return runPage(doc, marker);
+      return runPage(doc, marker, href);
     };
 
     test('只有用户消息、没有助手答复（DOM 反例）：没有终稿，状态 unknown', async () => {
@@ -1792,6 +1965,126 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       ], 'Devin chose to stop working');
       expect(r?.status).toBe('idle');
       expect(r?.done).toBe('完成。\nPR: https://github.com/acme/widget/pull/9\nSHA: cafecafe');
+    });
+
+    describe('本轮用户消息被虚拟化滚出 DOM（15eaf1b8 真实事故回归：有界滚动恢复转录上下文）', () => {
+      /**
+       * DOM 形态与数值取自负责人 2026-11-17 的真实只读采样（非本任务采集，路径见下）：
+       * - free-delivery-closeout-dom-structure.json：常驻（未滚动）状态下 devinAuthorBlocks=2、userAuthorBlocks=0。
+       * - free-delivery-closeout-scroll-probe.json：同一会话把转录容器 scrollTop 设为 0 后
+       *   userAuthorBlocks=1、devinAuthorBlocks 仍是 2；还原 scrollTop 后又变回 userAuthorBlocks=0——证明内容
+       *   还在只是没挂载，且这个过程可逆。
+       * - free-delivery-closeout-dom-evidence.json 的 lastDevinBlockText：真实业务 15eaf1b8 的终稿
+       *   （会话 51eb95d7616a41a081da5648192a1c7d、标记 SCK-b7c92fe64c、PR255、SHA 107222e5...）。
+       *   REAL_DONE_BODY 是这段终稿的压缩摘录（保留标记行、PR、SHA 等判定要用到的字段），不是逐字原文。
+       * 用户块（REAL_USER）的具体文字是合成重建：证据文件只采样了它在/不在 DOM 里的计数，没有采样其原文，
+       * 这里按已知的标记与收尾约定格式重建，足以驱动 roundStart 的锚点匹配。
+       * readScrolled 模拟这套虚拟化：mountedAtRest 是常驻（底部）时渲染的作者块，allBlocks 是滚动容器
+       * scrollTop 归零后真实挂载出来的完整作者块集合；withScroller=false 时不给任何元素挂可滚动的
+       * parentElement，等价于「找不到可滚动祖先」——这时 devin-web.ts 的恢复分支整段跳过，落回与本次修复前
+       * （以及任何更早版本，因为它们从未尝试过这道恢复）完全相同的公式，可以直接当「修前」对照用，不需要
+       * 另外跑一份旧代码。
+       */
+      const REAL_MARKER = 'SCK-b7c92fe64c';
+      const REAL_DONE_BODY = '[SCK-DONE SCK-b7c92fe64c]\n\n工作结果：完成。改动仅 TODOS.md。\n\nPR: \u2060surreal_ck#255\nSHA: 107222e536d1a7a678e2d23314569ee732be63ff';
+      const REAL_USER: Block = { author: 'user', text: `[SCK-ROUND ${REAL_MARKER}]\n\n更新 surreal_ck TODO 索引\n\n收尾约定：本轮的最后一条答复以「[SCK-DONE ${REAL_MARKER}]」单独成行开头，随后是完整最终答复。` };
+      const REAL_DEVIN_1: Block = { author: 'devin', text: '已读取仓库现状，开始核对工单。' };
+      const REAL_DEVIN_2: Block = { author: 'devin', text: REAL_DONE_BODY };
+      const mountedAtRest: Block[] = [REAL_DEVIN_1, REAL_DEVIN_2];
+      const allBlocks: Block[] = [REAL_USER, REAL_DEVIN_1, REAL_DEVIN_2];
+      const STATUS_TEXT = 'Devin is awaiting instructions';
+
+      const readScrolled = async (mounted: Block[], atTopBlocks: Block[], opts: { withScroller?: boolean } = {}, marker = REAL_MARKER) => {
+        const withScroller = opts.withScroller ?? true;
+        let atTop = false;
+        const scroller = { scrollHeight: 2107, clientHeight: 713, _top: 1394,
+          get scrollTop() { return this._top; }, set scrollTop(v: number) { this._top = v; atTop = v === 0; } };
+        const current = () => (atTop ? atTopBlocks : mounted);
+        const text = () => [...current().map(b => b.text), STATUS_TEXT].filter(Boolean).join('\n');
+        const mkAuthorEl = (b: Block) => ({
+          getAttribute: (name: string) => (name === 'data-message-author' ? b.author : null),
+          innerText: b.text,
+          parentElement: withScroller ? scroller : undefined,
+        });
+        const authorEls = () => current().filter(b => b.author !== 'tool').map(mkAuthorEl);
+        const doc = {
+          documentElement: {},
+          // 取值要跟 main 一样实时反映当前挂载状态（真实 document.body.innerText 本就是活的），
+          // 否则 waitReady() 的两次连续读数一致检查永远通不过（len 会一直是冻结的空字符串长度）。
+          get body() { return { innerText: text() }; },
+          querySelector: (sel: string) => (sel === 'main' ? { innerText: text() }
+            : sel === '[data-sck-cap-trigger]' ? null
+            : sel === '[data-message-author]' ? (authorEls()[0] ?? null)
+            : {}),
+          querySelectorAll: (sel: string) => (sel === '[data-message-author]' ? authorEls() : sel === '[role=menu]' ? [] : [{ innerText: 'Free' }]),
+        };
+        return runPage(doc, marker);
+      };
+
+      test('真实事故形态：常驻只剩 Devin 作者块与本轮 DONE；找不到可滚动祖先时保持修前的误判，可滚动恢复时读出修后的正确终稿与状态', async () => {
+        // 对照（等价于修前/任何更早版本）：同一份常驻 DOM，没有可滚动祖先可恢复 —— 和没有这道恢复时一样误判。
+        const before = await readScrolled(mountedAtRest, allBlocks, { withScroller: false });
+        expect(before?.done).toBeNull();
+        expect(before).toMatchObject({ markerSeen: false, status: 'unknown', source: 'roles' });
+        // 本修复：同一份常驻 DOM，承载作者块的最近可滚动祖先滚到顶后能恢复出本轮用户锚点。
+        const after = await readScrolled(mountedAtRest, allBlocks, { withScroller: true });
+        expect(after).toMatchObject({ ok: true, markerSeen: true, status: 'idle', source: 'roles' });
+        expect(after?.done).toContain('SHA: 107222e536d1a7a678e2d23314569ee732be63ff');
+        expect(after?.done).toContain('surreal_ck#255');
+      });
+
+      test('滚动恢复出的用户块若是旧轮（标记不同），仍不算本轮锚点：不把旧轮当本轮，重试耗尽后照样拒绝终稿', async () => {
+        const oldRoundUser: Block = { author: 'user', text: '[SCK-ROUND SCK-old999]\n\n旧任务\n\n收尾约定：「[SCK-DONE SCK-old999]」。' };
+        const r = await readScrolled(mountedAtRest, [oldRoundUser, REAL_DEVIN_1, REAL_DEVIN_2], { withScroller: true });
+        // done 与 markerSeen 是收尾判定实际依赖的两道门（devin.ts 收尾要求 status===idle && seen && answer 三者皆真），
+        // 旧轮标记不等于本轮标记，这两道门必须保持拒绝——这里不断言 status，因为 CONV_OPEN 锚点本身不分标记
+        // （只认「最近一次收尾约定」的位置，不检查它引述的是哪个标记），这是基线既有行为，不是本次改动引入的。
+        expect(r?.done).toBeNull();
+        expect(r?.markerSeen).toBe(false);
+      });
+
+      test('滚动恢复出的仍然只是工具/旧轮文本、没有本轮用户块时：不靠标记在别处出现过或存在某条 DONE 文本冒充已受理', async () => {
+        const unrelatedTop: Block[] = [REAL_DEVIN_1, REAL_DEVIN_2];
+        const r = await readScrolled(mountedAtRest, unrelatedTop, { withScroller: true });
+        expect(r?.done).toBeNull();
+        expect(r).toMatchObject({ markerSeen: false, status: 'unknown' });
+      });
+    });
+
+    describe('错误会话：goto 失败被自己的 catch 吞掉，页面留在另一个合法会话上（发布前复核新发现的负例，非生产事故）', () => {
+      /**
+       * openPage 的 `await p.goto(target).catch(() => {})` 会吞掉导航失败：页面可能还留在上一个地址上。
+       * 这里构造的「另一个会话」是合成场景（给 location.href 换一个不同的、同样合法形态的 app.devin.ai/sessions/
+       * 地址），不是生产里真的发生过的事故；验证的是脚本自己的地址核验，不依赖它凑巧没有同标记内容——下面特意让
+       * 这个「错误会话」页面仍带着本轮同标记的用户/Devin 作者块，证明光靠转录内容分不出这是不是本轮轮询的那个
+       * 会话，必须另外核对 location.href。
+       */
+      const OTHER_SESSION = 'https://app.devin.ai/sessions/ffffffffffffffffffffffffffffffff';
+      const DONE_TEXT = '完成。\nPR: https://github.com/acme/widget/pull/9\nSHA: cafecafe';
+      const sameRoundBlocks: Block[] = [
+        { author: 'user', text: `[SCK-ROUND ${M}]\n\n任务\n\n${CONV}` },
+        { author: 'devin', text: `[SCK-DONE ${M}]\n${DONE_TEXT}` },
+      ];
+
+      test('页面停在另一个合法会话（同标记用户/Devin 块仍在）：按 wrong_session 拒绝，不把它当本轮受理或终稿', async () => {
+        const r = await readPage(sameRoundBlocks, 'Devin chose to stop working', M, OTHER_SESSION);
+        expect(r).toMatchObject({ ok: false, code: 'wrong_session', url: OTHER_SESSION });
+        // ok:false 回执不带 done/markerSeen/status：不能被当成已受理或终稿读出。
+        expect(r?.done).toBeUndefined();
+        expect(r?.markerSeen).toBeUndefined();
+      });
+
+      test('页面确实停在目标会话上：地址核验通过，照常读出受理与终稿（对照组，证明核验不是误拦所有读数）', async () => {
+        const r = await readPage(sameRoundBlocks, 'Devin chose to stop working', M, SESSION);
+        expect(r).toMatchObject({ ok: true, markerSeen: true, status: 'idle' });
+        expect(r?.done).toBe(DONE_TEXT);
+      });
+
+      test('会话地址的 query/hash 不参与核验：带查询串或锚点的同一会话地址仍算命中（"可规范化 query/hash"）', async () => {
+        const r = await readPage(sameRoundBlocks, 'Devin chose to stop working', M, `${SESSION}?tab=files#latest`);
+        expect(r).toMatchObject({ ok: true, markerSeen: true, status: 'idle' });
+        expect(r?.done).toBe(DONE_TEXT);
+      });
     });
 
     test('续轮前上一轮还在工作（它的收尾约定之后是 Devin is working）：状态 working，会话判忙', async () => {

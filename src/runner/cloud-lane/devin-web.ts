@@ -28,6 +28,18 @@
  * 终稿只看「本轮收尾约定之后」的 Devin 发言块：用户消息、收尾约定本身的例子、工具输出里的 DONE/PR 都不算。
  * 状态短语只看「最近一次收尾约定之后」的文字：发送前是上一轮之后，发送后是本轮之后；更早轮次残留的状态不算。
  * 找不到作者块时终稿保持 null（不拿整段 main 文本冒充助手回复）。
+ * 转录是虚拟化长列表，本轮用户消息（收尾约定所在那条）可能已经滚出 DOM（2026-11-17 真实事故：只剩 Devin
+ * 作者块与本轮 DONE，没有用户块，判「本轮用户消息之后」这个锚点落空）。同日滚动探针证实：内容还在只是没
+ * 挂载——把转录的可滚动容器滚到顶部，该用户块与收尾约定引述会重新出现在 DOM 里；滚回原位置又会把它滚没，
+ * 来回可逆。因此找不到锚点时不改判定规则本身，而是有界地恢复可见范围：定位承载作者块的最近可滚动祖先、
+ * 滚到顶、等它重渲染、按原算法（用户块含本轮 SCK-ROUND 标记 → 其后的 Devin 发言块）重找锚点，几次仍找不到
+ * 就还原滚动位置后放弃。终稿与状态短语的锚点来源不变，仍然只认恢复出来的真实用户块与其后的 Devin 作者块；
+ * 不靠「本轮标记在页面别处出现过」或「存在某条 DONE 文本」替代这道校验——恢复不出本轮用户锚点时，done 与
+ * markerSeen 和没有这道恢复时一样保持拒绝，绝不整页瞎猜，也绝不把旧轮或别的会话的锚点当成本轮的。
+ * openPage 的 p.goto 失败会被 catch 吞掉（页面可能留在上一个地址上），所以转录判定之外还有一道独立的地址
+ * 核验：session/follow 模式读完 DOM 之后，一律核对 location.href（query/hash 可规范化去掉）是否正是本次
+ * 传入的会话地址；留在另一个合法会话上即使凑巧也有本轮同标记作者块，也按 wrong_session 拒绝，绝不采信，
+ * 绝不重发——这与「只认本轮用户锚点」是同一条「不拿别处内容冒充本轮终稿」边界的两个必要条件，缺一不可。
  * 发送不是幂等的：按下 Send 前打印 __PRESSED__，脚本中途死掉时执行端知道「可能已发出」，绝不重发，
  * 而是回会话列表/原会话按本轮标记核对是否已受理。
  */
@@ -44,6 +56,10 @@ export const PRESSED = '__PRESSED__';
 const CAPS = ['Fusion', 'Ultra', 'Normal', 'Lite', 'Free'];
 /** 选中 Free 后逐层 Escape 的上限：真实页面两层只需两次，多留余量；仍收不起就受阻、零发送。 */
 const FREE_ESC_MAX = 4;
+/** 本轮用户锚点找不到时，有界把转录滚到顶等重渲染、重找锚点的最多次数（真实滚动探针显示一次即可命中，多留余量）。 */
+const SCROLL_RECOVER_MAX = 5;
+/** 恢复重试之间的等待：给虚拟化列表一点时间重渲染，与 Escape 检测用的间隔同量级。 */
+const SCROLL_RECOVER_WAIT_MS = 300;
 /** 页面内表达式用的可见性判断：有尺寸且未 hidden。 */
 const SHOWN_JS = `(e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; }`;
 /**
@@ -90,22 +106,48 @@ export function devinStatus(text: string): DevinStatus {
 /** 页面内 read() 共用的表达式串：状态、席位、选中档位、本轮标记与终稿。DOM 只在 p.evaluate 里访问。 */
 function readBody(marker: string): string {
   return `
-const read = () => p.evaluate(() => {
-  const mainText = ((document.querySelector('main') ?? document.body).innerText || '');
-  const body = document.body.innerText || '';
+const read = () => p.evaluate(async () => {
   const TASK = ${JSON.stringify(`[SCK-ROUND ${marker}]`)}, DONE = ${JSON.stringify(`[SCK-DONE ${marker}]`)};
   const QUOTED = ${JSON.stringify(`「[SCK-DONE ${marker}]」`)}, CONV_OPEN = ${JSON.stringify('「[SCK-DONE ')};
-  // 选中 Free 时点的那个按钮（已打标记）优先；没有标记才按档位名找，与点击用的是同一个元素。
-  const capButton = document.querySelector('[data-sck-cap-trigger]') || [...document.querySelectorAll('button')].find(e => /^(${CAPS.join('|')})$/.test((e.innerText || '').trim()));
   // 发言人只能按页面给出的角色块判定：Devin 回答是 [data-message-author="devin"]，用户消息是
   // [data-message-author="user"]。工具输出、worklog、PR 卡片没有作者属性，永远不参与终稿判定。
-  const blocks = [...document.querySelectorAll('[data-message-author]')]
-    .map(e => ({ author: String((e.getAttribute && e.getAttribute('data-message-author')) || '').toLowerCase(), text: (e.innerText || '') }))
-    .filter(b => b.author !== '');
-  let roundStart = -1;
-  for (let i = blocks.length - 1; i >= 0; i--) {
-    if (blocks[i].author === 'user' && blocks[i].text.includes(TASK)) { roundStart = i; break; }
+  const collect = () => {
+    const mainText = ((document.querySelector('main') ?? document.body).innerText || '');
+    const blocks = [...document.querySelectorAll('[data-message-author]')]
+      .map(e => ({ author: String((e.getAttribute && e.getAttribute('data-message-author')) || '').toLowerCase(), text: (e.innerText || '') }))
+      .filter(b => b.author !== '');
+    let roundStart = -1;
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      if (blocks[i].author === 'user' && blocks[i].text.includes(TASK)) { roundStart = i; break; }
+    }
+    return { mainText, blocks, roundStart };
+  };
+  let { mainText, blocks, roundStart } = collect();
+  // 转录是虚拟化长列表，本轮用户消息（收尾约定所在那条）可能已经滚出 DOM（真实事故：只剩 Devin 作者块与
+  // 本轮 DONE，没有用户块）。真实滚动探针证实内容还在只是没挂载：把承载作者块的最近可滚动祖先滚到顶，
+  // 该用户块会重新出现；读完再滚回原位置，不留在别处。有界重试几次仍找不到锚点就放弃——判定规则本身不变，
+  // 不靠标记在别处出现过或存在某条 DONE 文本替代这道校验，恢复不出锚点时 done/markerSeen 和没有这道恢复时
+  // 一样保持拒绝。
+  if (roundStart < 0) {
+    const probe = blocks.length ? document.querySelector('[data-message-author]') : (document.querySelector('main') ?? document.body);
+    let node = probe, scroller = null;
+    while (node && node !== document.documentElement) {
+      if (node.scrollHeight > node.clientHeight + 4) { scroller = node; break; }
+      node = node.parentElement;
+    }
+    if (scroller) {
+      const original = scroller.scrollTop;
+      scroller.scrollTop = 0;
+      for (let i = 0; i < ${SCROLL_RECOVER_MAX} && roundStart < 0; i++) {
+        await new Promise(r => setTimeout(r, ${SCROLL_RECOVER_WAIT_MS}));
+        ({ mainText, blocks, roundStart } = collect());
+      }
+      scroller.scrollTop = original;
+    }
   }
+  const body = document.body.innerText || '';
+  // 选中 Free 时点的那个按钮（已打标记）优先；没有标记才按档位名找，与点击用的是同一个元素。
+  const capButton = document.querySelector('[data-sck-cap-trigger]') || [...document.querySelectorAll('button')].find(e => /^(${CAPS.join('|')})$/.test((e.innerText || '').trim()));
   // 终稿只从本轮用户消息之后的 Devin 发言块里取，并且只认以收尾标记单独成行开头的那条。
   let done = null;
   if (roundStart >= 0) {
@@ -123,6 +165,8 @@ const read = () => p.evaluate(() => {
   }
   // 状态短语只看「最近一次收尾约定」之后的文字：发送前这条约定属于上一轮（上一轮还在跑时状态就在它之后），
   // 发送后就是本轮之后。更早轮次残留的状态短语不算；页面上一条收尾约定都没有时区域为空，状态 unknown。
+  // mainText 取自上面恢复后的那次快照，和 blocks/roundStart 是同一时刻的 DOM，用户消息里引述收尾约定的
+  // 文字（CONV_OPEN）若也刚被恢复出来，这里天然就能扫到，不需要另立锚点。
   const at = mainText.lastIndexOf(QUOTED);
   const lastConv = mainText.lastIndexOf(CONV_OPEN);
   const region = lastConv >= 0 ? mainText.slice(lastConv) : '';
@@ -156,6 +200,10 @@ const read = () => p.evaluate(() => {
 function prelude(url: string, mode: string): string {
   return `
 const MODE = ${JSON.stringify(mode)};
+// 本次调用意图落点的地址：session/follow 模式读完 DOM 后要核对 location.href 确实停在这里，
+// 不是 goto 失败被 catch 吞掉后留在的别的合法会话上。query/hash 不参与比较（可规范化去掉）。
+const TARGET_URL = ${JSON.stringify(url)};
+const sameSession = (a, b) => { const strip = (u) => String(u || '').split(/[?#]/)[0]; return strip(a) === strip(b); };
 const emit = (r) => { console.log('__RESULT__' + JSON.stringify(r)); };
 const space = await taskSpace(${JSON.stringify(DEVIN_SPACE)});
 const p = (await space.pages())[0] ?? await space.newPage();
@@ -181,11 +229,16 @@ await openPage(${JSON.stringify(url)});
 `;
 }
 
-/** 会话页核验（续轮）：登录、就绪、档位必须是 Free、没有本轮标记、不在忙。返回 null 表示可以继续。 */
+/**
+ * 会话页核验（续轮）：登录、就绪、确实停在本次目标会话地址上（goto 失败被吞时可能还留在另一个合法会话）、
+ * 档位必须是 Free、没有本轮标记、不在忙。地址核验排在档位/标记之前：不在目标会话上时，既不能把它的
+ * markerSeen 当「已受理」，也不能把它当「可以继续发送」——都按 wrong_session 拒绝。返回 null 表示可以继续。
+ */
 const SESSION_GATE = `
 const sessionGate = (x) => {
   if (x.login) return { ok: false, code: 'login_required' };
   if (!ready) return { ok: false, code: 'not_ready' };
+  if (!sameSession(x.url, TARGET_URL)) return { ok: false, code: 'wrong_session', url: x.url };
   if (x.cap !== 'Free') return { ok: false, code: 'capability', detail: '会话 Capability 显示 ' + String(x.cap) + '，不是 Free' };
   if (x.markerSeen) return { ok: true, already: true, url: x.url, cap: 'Free', seats: x.seats };
   if (x.status === 'working') return { ok: false, code: 'busy' };
@@ -262,12 +315,17 @@ function withMarker(script: string, marker: string): string {
   return script.replaceAll('__MARKER__', marker);
 }
 
-/** 打开会话页读状态：登录、本轮标记、工作状态、席位与 SCK-DONE 终稿（只取本轮收尾约定之后的文字）。 */
+/**
+ * 打开会话页读状态：登录、确实停在本次轮询的会话地址上（goto 失败被吞时可能还留在另一个合法会话——那页
+ * 即使凑巧也有同标记作者块，也不能当本轮受理证据）、本轮标记、工作状态、席位与 SCK-DONE 终稿（只取本轮
+ * 收尾约定之后的文字）。
+ */
 export function devinSessionScript(sessionUrl: string, marker: string): string {
   return withMarker(`${prelude(sessionUrl, 'session')}
 const s = await read();
 if (s.login) { emit({ ok: false, code: 'login_required' }); process.exit(0); }
 if (!ready) { emit({ ok: false, code: 'not_ready' }); process.exit(0); }
+if (!sameSession(s.url, TARGET_URL)) { emit({ ok: false, code: 'wrong_session', url: s.url }); process.exit(0); }
 emit({ ok: true, url: s.url, cap: s.cap, seats: s.seats, source: s.source, markerSeen: s.markerSeen, convSeen: s.convSeen, status: s.status, done: s.done, tail: s.tail });
 `, marker);
 }
