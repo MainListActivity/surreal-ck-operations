@@ -31,7 +31,8 @@ beforeAll(async () => {
   await db.connect(); await db.bootstrap();
   core = new SurrealCompanyCore(db);
   gm = await new LocalEnrollmentAdmin(db).enroll('board-task-gm', 'owner', ['execute', 'review', 'manage']);
-  ctx = { db, core: core as never, owner: new OwnerDesk(db), workforce: new Workforce(db), messages: new OutboundMessageStore(db.db), opsRepo: dir };
+  ctx = { db, core: core as never, owner: new OwnerDesk(db), workforce: new Workforce(db), messages: new OutboundMessageStore(db.db), opsRepo: dir,
+    now: () => NOW };
 });
 afterAll(async () => { if (!dir) return; await db.close(); server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true }); });
 
@@ -79,9 +80,10 @@ run('board.task reads a queued task with its real position and a leased task wit
   expect(leased!.holder).toMatchObject({ employeeId: 'fixture-eng', leaseActive: true, phase: 'execute' });
   expect(leased!.waiting).toMatchObject({ on: 'employee', kind: 'lease' });
 
-  // The owner API answers the same status, inside the relay's 48 KiB budget, with no task text or message body.
-  const viaApi = await ownerApi(ctx, { command: 'board.task', taskId: queued.id, now: NOW }, 'agent') as Record<string, unknown>;
-  expect(viaApi).toMatchObject({ taskId: queued.id, state: 'ready' });
+  // The owner API answers the same status, inside the relay's 48 KiB budget, with no task text or message body. Its clock is the
+  // server's (ctx.now); a caller cannot set it.
+  const viaApi = await ownerApi(ctx, { command: 'board.task', taskId: queued.id, now: NOW + 3_600_000 }, 'agent') as Record<string, unknown>;
+  expect(viaApi).toMatchObject({ taskId: queued.id, state: 'ready', scheduler: { at: NOW - 10_000, ageMs: 10_000, stale: false } });
   expect(answerBytes(viaApi)).toBeLessThan(RESPONSE_BUDGET_BYTES);
   await expect(ownerApi(ctx, { command: 'board.task', taskId: 'missing' }, 'agent')).rejects.toMatchObject({ code: 'not_found' });
 });

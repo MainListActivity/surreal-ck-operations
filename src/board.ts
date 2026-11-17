@@ -736,6 +736,19 @@ export async function readBoardTask(db: Surreal, taskId: string, opts: { now?: n
     };
   }
 
+  // The candidate rows the scheduler's view keeps for this task, reachable first, then queue order.
+  const rows = board.employees.flatMap(employee =>
+    employee.next.filter(entry => entry.taskId === taskId)
+      .map(entry => ({ employeeId: employee.id, position: entry.position, eligible: entry.eligible,
+        reason: clipText(entry.reason, BOARD_TASK_CANDIDATE_REASON_CHARS) })));
+  rows.sort((a, b) => Number(b.eligible) - Number(a.eligible) || a.position - b.position || byText(a.employeeId, b.employeeId));
+  const candidates = rows.slice(0, BOARD_TASK_CANDIDATE_ROWS);
+  const omitted = rows.length - candidates.length;
+  // A candidate row is a session bound to this task. The board never lists a row that can never take the task (BOARD_NEVER) or
+  // the row of a revoked or retired employee, so with no row here no listed session can take it. The wait names the candidate
+  // reasons only when a row is listed.
+  const noCandidate = candidates.length > 0 ? '等有候选可接（原因见各 candidates[].reason）' : '等有候选可接；调度视图中没有可接此任务的员工会话';
+
   const waiting: BoardTaskWaiting = (() => {
     if (holder?.leaseActive) {
       return { on: 'employee', kind: 'lease', recovery: '员工回报后进入下一步；不回报则租约到期自动回收', nextTrigger: '员工回报或租约到期' };
@@ -752,7 +765,7 @@ export async function readBoardTask(db: Surreal, taskId: string, opts: { now?: n
       }
       return queued.eligible
         ? { on: 'scheduler', kind: 'queued', recovery: '无需操作，轮到即派出', nextTrigger: '下一轮派工' }
-        : { on: 'system', kind: 'no_candidate', recovery: '等有候选可接（原因见各 candidates[].reason）', nextTrigger: '配额或容量恢复后的下一轮派工' };
+        : { on: 'system', kind: 'no_candidate', recovery: noCandidate, nextTrigger: '配额或容量恢复后的下一轮派工' };
     }
     if (state === 'review' && String(row.reviewer_role ?? '') === 'owner') {
       return { on: 'owner', kind: 'owner_decision', recovery: '老板在收件箱验收或退回', nextTrigger: '老板 decide/approve/reject' };
@@ -770,13 +783,6 @@ export async function readBoardTask(db: Surreal, taskId: string, opts: { now?: n
   const phase: BoardPhase | undefined = queued?.phase
     ?? (state === 'review' || (state === 'blocked' && row.resume_state === 'review') ? 'review'
       : state === 'ready' || state === 'doing' || state === 'blocked' ? 'execute' : undefined);
-  const rows = board.employees.flatMap(employee =>
-    employee.next.filter(entry => entry.taskId === taskId)
-      .map(entry => ({ employeeId: employee.id, position: entry.position, eligible: entry.eligible,
-        reason: clipText(entry.reason, BOARD_TASK_CANDIDATE_REASON_CHARS) })));
-  rows.sort((a, b) => Number(b.eligible) - Number(a.eligible) || a.position - b.position || byText(a.employeeId, b.employeeId));
-  const candidates = rows.slice(0, BOARD_TASK_CANDIDATE_ROWS);
-  const omitted = rows.length - candidates.length;
 
   return {
     at: board.at, taskId, title: clipText(String(row.title ?? ''), BOARD_TASK_TITLE_CHARS), state,

@@ -2,6 +2,7 @@
 // fragment, so the real readBoard, readBoardTask and ownerApi run unchanged. Nothing here is production data.
 import { RecordId } from 'surrealdb';
 import type { BoardView } from '../../src/board.ts';
+import { snapshotOf, type PassInputs } from '../../src/dispatcher/dispatcher.ts';
 import type { OwnerApiContext } from '../../src/owner-api.ts';
 
 export const NOW = 1_800_000_000_000;
@@ -98,6 +99,27 @@ export function largeBoardFixture(queued = 300): BoardFixture {
 }
 
 /**
+ * The board the scheduler writes for `queued` ready tasks, with one busy employee `e1` bound to the task `bound` and no spare seat.
+ * Only the bound task has a candidate row for e1; the other queued tasks have none. The view comes from snapshotOf, the function the
+ * scheduler's tick uses. The rest of the fixture is the largeBoardFixture rows.
+ */
+export async function dispatchedBoardFixture(queued = 300, bound = 'q-007'): Promise<BoardFixture> {
+  const defs: PassInputs['defs'] = [{ id: 'eng-def', role: 'engineering', provider: 'codex', model: 'm1', enabled: true,
+    maxInstances: 1, priority: 100, weight: 10, errorStreak: 0 }];
+  const insts: PassInputs['insts'] = [{ id: 'e1', role: 'engineering', def: 'eng-def', provider: 'codex', model: 'm1',
+    paseoAgentId: 'e1', cwd: '/ops', workspaceScope: 'maintenance', sessionTask: bound }];
+  const tasks = Array.from({ length: queued }, (_, index) => ({ id: `q-${String(index).padStart(3, '0')}`,
+    title: `排队任务 q-${String(index).padStart(3, '0')}`, state: 'ready', executorRole: 'engineering', reviewerRole: 'qa', repoPath: '/ops' }));
+  const snapshot = await snapshotOf({
+    now: Math.floor(NOW / 1000), cfg: { providerMax: { codex: 3 } } as unknown as PassInputs['cfg'], defs, insts,
+    states: new Map([['e1', 'busy']]), health: new Map(), quotaBlocked: new Map(), tasks: tasks as unknown as PassInputs['tasks'], slots: new Map(),
+  }, { opsRepo: '/ops', sidecar: true }, [],
+  { contributors: async () => ({ authors: [], excluded: [], hands: [] }), readySince: async () => new Map() }, NOW);
+  if (!snapshot.board) throw new Error('the scheduler wrote no board view');
+  return { ...largeBoardFixture(queued), view: snapshot.board, unsent: [] };
+}
+
+/**
  * The widest single-task answer a board can give: `w-target` is a candidate of every one of `employees` employees, and its title,
  * queue reason and each candidate reason are `textChars` characters long. board.task must still fit the relay budget for it.
  * `filler` is the unit the reasons repeat: a control character costs six JSON bytes a character, the widest case the budget must hold.
@@ -166,8 +188,11 @@ export function boardFixtureDb(fixture: BoardFixture = smallBoardFixture()) {
   return { db, queries };
 }
 
-/** The owner API context the board commands need: only the database is read. */
-export function boardContext(db: unknown): OwnerApiContext {
+/**
+ * The owner API context the board commands need: only the database is read. `now` is the server's clock, the one board.task
+ * judges staleness and leases by; it defaults to the fixture's NOW.
+ */
+export function boardContext(db: unknown, now: () => number = () => NOW): OwnerApiContext {
   return { db: { db } as never, core: {} as never, owner: {} as never, workforce: {} as never, messages: {} as never,
-    opsRepo: '/ops' } as OwnerApiContext;
+    opsRepo: '/ops', now } as OwnerApiContext;
 }

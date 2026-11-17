@@ -696,7 +696,10 @@ const BOARD_NEVER = new Set<BlockCode>(['prior_submitter', 'track_mismatch', 'de
 const BOARD_GATES = new Set<BlockCode>(['paused', 'budget', 'resources', 'memory_pressure', 'disk_space', 'max_running']);
 /** Codes a holder meets because its own lease is still open: the item is ready and waits for that lease to end. */
 const BOARD_LEASE = new Set<BlockCode>(['held', 'session_busy']);
-/** Rows per employee on the board. */
+/**
+ * Rows per employee on the board. A session serves one task (its sessionTask), so an employee has at most one row per pass and this
+ * cap never cuts a row. If a session could serve several tasks, the rows past the cap would need a count on their queue item.
+ */
 export const BOARD_NEXT_ROWS = 5;
 
 /**

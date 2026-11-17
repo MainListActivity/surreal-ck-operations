@@ -68,12 +68,12 @@ async function jobReply(bearer: string, input: Record<string, unknown>): Promise
 let boardFixtureOf: () => BoardFixture = () => largeBoardFixture();
 
 /**
- * 看板命令的网关回包：真实 ownerApi 读合成的看板。错误按网关信封回包，
- * 由网关客户端还原成与线上相同的错误码与原文。
+ * 看板命令的网关回包：真实 ownerApi 读合成的看板，员工的 input 原样传入（与网关 runOwnerApi 一致），
+ * 服务端时钟是 BOARD_NOW。错误按网关信封回包，由网关客户端还原成与线上相同的错误码与原文。
  */
 async function boardReply(command: string, input: Record<string, unknown>): Promise<Response> {
   try {
-    const result = await ownerApi(boardContext(boardFixtureDb(boardFixtureOf()).db), { ...input, command, now: BOARD_NOW }, 'agent');
+    const result = await ownerApi(boardContext(boardFixtureDb(boardFixtureOf()).db, () => BOARD_NOW), { ...input, command }, 'agent');
     return json({ ok: true, result });
   } catch (error) {
     const code = error instanceof CompanyError ? error.code : 'upstream_error';

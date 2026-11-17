@@ -33,7 +33,9 @@ import type { AgentAction, AgentActivity } from './agent-activity.ts';
 export type OwnerVia = string;
 export interface OwnerApiContext { db: CompanyDatabase; core: CompanyCore & {
   contributorDryRun(credential: string, input: { taskIds: string[] }): Promise<unknown>;
-}; owner: OwnerDesk; workforce: Workforce; messages: OutboundMessageStore; opsRepo: string }
+}; owner: OwnerDesk; workforce: Workforce; messages: OutboundMessageStore; opsRepo: string;
+  /** The server's clock in Unix milliseconds. board.task judges staleness and leases by it; a caller's input never sets it. Defaults to Date.now(). */
+  now?: () => number }
 
 const actor = (via: string) => `owner:${via || 'web'}`;
 const text = (value: unknown, field: string, min = 1, max = 20000): string => {
@@ -127,6 +129,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     ? input.idempotencyKey : undefined;
   const key = () => idemp ? `owner:${via}:${command}:${idemp}` : `owner:${via}:${command}:${randomUUID()}`;
   const db = ctx.db.db;
+  const clock = ctx.now ?? Date.now;
   const notes = () => new LaneNoteStore(db);
   const ownerCredential = (): string => {
     const token = process.env.SCK_OWNER_TOKEN;
@@ -345,11 +348,11 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       employeeId: text(input.employeeId, 'employeeId'), rendered: text(input.rendered, 'rendered', 1, 20000), actor: a });
 
     // ---- 老板看板 ----
-    case 'board.snapshot': return readBoard(db, { now: typeof input.now === 'number' ? input.now : undefined });
+    case 'board.snapshot': return readBoard(db, { now: typeof input.now === 'number' ? input.now : clock() });
     // 按任务的有界派工状态：队列位置、阻塞分类、责任方与下一触发、候选原因；不带消息正文与审计原文（员工经 company_cmd 也可调用）。
+    // 时效与租约只按服务端时钟判断，不读调用方的 now：员工能调用它，不能自己把快照说成新鲜、把过期的租约说成有效。
     case 'board.task': {
-      const status = await readBoardTask(db, text(input.taskId, 'taskId'),
-        { now: typeof input.now === 'number' ? input.now : undefined });
+      const status = await readBoardTask(db, text(input.taskId, 'taskId'), { now: clock() });
       if (!status) throw new CompanyError('not_found', 'task not found');
       return fitBoardTask(status);
     }
