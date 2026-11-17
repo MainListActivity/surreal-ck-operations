@@ -77,9 +77,33 @@ export interface HostKeychain {
   write(service: string, account: string, value: string): void;
 }
 
+/** How one attempt at the repository allocation lock ended. */
+export type RepoLockResult = 'ok' | 'error' | 'busy' | 'unavailable' | 'lost';
+
+/** The host's timing of one attempt at the repository allocation lock. Measured by the host, never inferred by the caller. */
+export interface RepoLockTiming {
+  /** Time queued before the lock was taken, or before the attempt gave up (ms). */
+  waitMs: number;
+  /** Time the lock was held, from acquisition to release (ms). Undefined when the lock was never taken. */
+  heldMs?: number;
+  /** ok: the action completed. error: the action threw. busy: not taken in time. unavailable: the lock helper could not run.
+   * lost: the helper ended while the lock was supposed to be held. */
+  result: RepoLockResult;
+}
+
+export interface RepoLockOptions {
+  /** How long to wait for the lock before giving up with RepoLockError 'busy'. Defaults to the host's limit. */
+  acquireMs?: number;
+  /** Receives the timing once the attempt is over and the lock is released. Observation only: it never changes the outcome. */
+  observe?: (timing: RepoLockTiming) => void;
+}
+
 export interface HostLock {
-  /** Runs `action` while holding the repository's allocation lock (a kernel flock, released when the holder exits). */
-  withRepoLock<T>(commonDir: string, action: () => Promise<T>): Promise<T>;
+  /**
+   * Runs `action` while holding the repository's allocation lock (a kernel flock, released when the holder exits). Throws
+   * RepoLockError when the lock is not taken; an action that has started is never interrupted.
+   */
+  withRepoLock<T>(commonDir: string, action: () => Promise<T>, options?: RepoLockOptions): Promise<T>;
 }
 
 export interface HostPassword {
