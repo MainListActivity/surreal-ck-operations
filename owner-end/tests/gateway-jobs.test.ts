@@ -110,12 +110,30 @@ describe('等待结果（waitForJob）', () => {
     expect(reads).toBe(2);
   });
 
-  test('state 为 error：返回 error 与 code、message', async () => {
+  test('state 为 error：返回 error 与 code、message，并带上作业号', async () => {
     const { db } = fakeDb(() => [
       { id: 'j2', command: 'x', state: 'error', error: JSON.stringify({ code: 'forbidden', message: '不允许' }) },
     ]);
     const outcome = await waitForJob(db, 'j2', 5_000);
-    expect(outcome).toEqual({ state: 'error', code: 'forbidden', message: '不允许' });
+    expect(outcome).toEqual({ state: 'error', code: 'forbidden', message: '不允许', jobId: 'j2' });
+  });
+
+  test('执行端写回的一句话失败（src/cloud/ops-jobs.ts 的写法）：类别与说明从这句话还原', async () => {
+    const { db } = fakeDb(() => [
+      { id: 'j4', command: 'ops_login', state: 'error', error: 'login_failed: IdP rejected the login; stage=login' },
+    ]);
+    const outcome = await waitForJob(db, 'j4', 5_000);
+    expect(outcome).toEqual({ state: 'error', code: 'login_failed', message: 'IdP rejected the login; stage=login', jobId: 'j4' });
+  });
+
+  test('一句话失败的类别不认识：按上游失败，说明保留', async () => {
+    const { db } = fakeDb(() => [{ id: 'j5', command: 'x', state: 'error', error: 'weird: 奇怪的错误' }]);
+    expect(await waitForJob(db, 'j5', 5_000)).toEqual({ state: 'error', code: 'upstream_error', message: '奇怪的错误', jobId: 'j5' });
+  });
+
+  test('失败文本不是一句话形式：只给通用说明，不猜测类别', async () => {
+    const { db } = fakeDb(() => [{ id: 'j6', command: 'x', state: 'error', error: 'boom' }]);
+    expect(await waitForJob(db, 'j6', 5_000)).toEqual({ state: 'error', code: 'upstream_error', message: '执行端任务失败', jobId: 'j6' });
   });
 
   test('一直排队且等待 0 毫秒：立即返回 pending', async () => {
@@ -152,6 +170,11 @@ describe('失败还原（jobFailure）', () => {
       expect(jobFailure({ code, message: '原样保留' }).code).toBe(code);
     }
   });
+
+  test('作业号随失败一起带上，调用方凭它用 ops.job.get 定位', () => {
+    expect(jobFailure({ code: 'login_failed', message: 'x', jobId: 'j7' }).jobId).toBe('j7');
+    expect(jobFailure({ code: 'login_failed', message: 'x' }).jobId).toBeUndefined();
+  });
 });
 
 describe('错误映射（failureOf，见 errors.ts）', () => {
@@ -175,6 +198,42 @@ describe('错误映射（failureOf，见 errors.ts）', () => {
     expect(body.error.code).toBe('upstream_error');
     expect(body.error.message).toBe('服务暂时出错，请稍后重试');
     expect(JSON.stringify(body)).not.toContain('secret detail');
+  });
+
+  test('作业失败返回 502：接口码 upstream_error，作业类别放在 jobCode，作业号放在 jobId', () => {
+    const { status, body } = failureOf(jobFailure({ code: 'login_failed', message: 'IdP rejected the login', jobId: 'j9' }));
+    expect(status).toBe(502);
+    expect(body).toEqual({
+      ok: false,
+      error: { code: 'upstream_error', message: 'IdP rejected the login', jobId: 'j9', jobCode: 'login_failed' },
+    });
+  });
+
+  test('作业失败永远不返回 401：网页据此不会把老板登出，每个核心错误码都是这样', () => {
+    for (const code of CORE_ERROR_CODES) {
+      const { status, body } = failureOf(jobFailure({ code, message: '原样保留', jobId: 'j-all' }));
+      expect(status, code).not.toBe(401);
+      expect(body.error.code, code).not.toBe('unauthorized');
+      expect(body.error.jobCode, code).toBe(code);
+    }
+  });
+
+  test('作业失败的接口码与普通错误一致：拒绝为 403，冲突为 409，其余照常', () => {
+    expect(failureOf(jobFailure({ code: 'forbidden', message: '不允许', jobId: 'j1' })).status).toBe(403);
+    expect(failureOf(jobFailure({ code: 'forbidden', message: '不允许', jobId: 'j1' })).body.error.code).toBe('forbidden');
+    expect(failureOf(jobFailure({ code: 'lease_expired', message: '租约已过', jobId: 'j2' })).status).toBe(409);
+  });
+
+  test('作业没有作业号时不带 jobId 字段', () => {
+    const { body } = failureOf(jobFailure({ code: 'forbidden', message: '不允许' }));
+    expect(body.error).toEqual({ code: 'forbidden', message: '不允许', jobCode: 'forbidden' });
+    expect('jobId' in body.error).toBe(false);
+  });
+
+  test('普通错误的接口信封不附作业字段：没有 jobCode，也没有 jobId', () => {
+    const { body } = failureOf(new CompanyError('not_found', 'job not found'));
+    expect('jobCode' in body.error).toBe(false);
+    expect('jobId' in body.error).toBe(false);
   });
 });
 

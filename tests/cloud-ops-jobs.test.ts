@@ -298,6 +298,22 @@ describe('结果体积与脱敏', () => {
     await runner.drain();
     expect(find(rows, 'e2').error).toBe('upstream_error: boom');
   });
+
+  test('登录阶段标记在说明超过 200 字被截断后仍保留，网关据此定位阶段', async () => {
+    const rows = [job('e3', 'ops_info')];
+    const trace = ' a1:authorize@idp.example:TimeoutError 25000ms |'.repeat(8);
+    const runner = new OpsJobRunner(deps({
+      db: fakeDb(rows).db,
+      opsCall: async () => {
+        throw new Error(`IdP authorize failed (timed out after 25s)${trace}; stage=authorize; runtime bun@1.3.11`);
+      },
+    }));
+    await runner.drain();
+    const error = find(rows, 'e3').error as string;
+    expect(error.startsWith('upstream_error: IdP authorize failed (timed out after 25s)')).toBe(true);
+    expect(error.endsWith('; stage=authorize')).toBe(true);
+    expect(error.length).toBeLessThanOrEqual(500);
+  });
 });
 
 describe('drain 行为', () => {

@@ -12,6 +12,7 @@ const FIELDS: ReadonlyMap<string, ReadonlyArray<readonly [label: string, key: st
   ['task.update', [['任务', 'taskId'], ['标题', 'title']]],
   ['task.reassign', [['任务', 'taskId'], ['指派', 'executorRole'], ['复核', 'reviewerRole']]],
   ['task.void', [['任务', 'taskId']]],
+  ['fault.lift', [['任务', 'taskId'], ['操作', 'target'], ['阶段', 'phase'], ['理由', 'reason']]],
   ['task.delete', [['任务', 'taskId']]],
   ['task.revoke', [['任务', 'taskId']]],
   ['task.stop', [['任务', 'taskId']]],

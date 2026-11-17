@@ -639,6 +639,16 @@ export class SidecarPool {
     return (error as {code?:string})?.code === 'unauthorized' || error instanceof Error && /invalid credential|unauthorized/i.test(error.message);
   }
 
+  /** 云端失败的作业回执：作业号、是否已受理、阶段。只带这三项，错误对象上的其它字段不外露。 */
+  private static receiptOf(error: unknown): Pick<CommResponse, "jobId" | "accepted" | "stage"> {
+    const raw = error as { jobId?: unknown; accepted?: unknown; stage?: unknown } | undefined;
+    return {
+      ...(typeof raw?.jobId === "string" ? { jobId: raw.jobId } : {}),
+      ...(typeof raw?.accepted === "boolean" ? { accepted: raw.accepted } : {}),
+      ...(typeof raw?.stage === "string" ? { stage: raw.stage } : {}),
+    };
+  }
+
   /** Retry once with a re-issued credential when a call rejects auth — a concurrent adopter may have rotated it. */
   private async callWithCred<T>(instId: string, fn: (cred: string) => Promise<T>): Promise<T> {
     const cred = await this.credentialFor(instId);
@@ -1431,18 +1441,21 @@ export class SidecarPool {
     try {
       token = await cloud.tokens.tokenFor({ employee: instId, agentUserId, taskId: claim.taskId, leaseRemainingMs: remainingMs });
       const result = await cloud.gateway.call(token, command, input);
+      // 网关已执行并回了结果，只是结果里带着凭证：命令已经跑过，标为已受理，员工不得据此重提。
       if (token && JSON.stringify(result ?? null).includes(token)) {
-        throw Object.assign(new Error("网关返回内容含有凭证，已拒绝转交"), { code: "upstream_error" });
+        throw Object.assign(new Error("网关返回内容含有凭证，已拒绝转交"), { code: "upstream_error", accepted: true });
       }
       return result;
     } catch (error) {
-      const raw = error as { code?: unknown; message?: unknown; accepted?: unknown };
+      const raw = error as { code?: unknown; message?: unknown; accepted?: unknown; jobId?: unknown; stage?: unknown };
       const text = typeof raw?.message === "string" ? raw.message : "网关调用失败";
-      // 错误文本里若回显了令牌，整段替换为占位符。
+      // 错误文本里若回显了令牌，整段替换为占位符。作业号与阶段不是凭证，原样保留，员工凭作业号核对，不重提。
       const message = token ? text.split(token).join("[已隐藏]") : text;
       throw Object.assign(new Error(message), {
         code: typeof raw?.code === "string" ? raw.code : "upstream_error",
         accepted: raw?.accepted === true,
+        ...(typeof raw?.jobId === "string" ? { jobId: raw.jobId } : {}),
+        ...(typeof raw?.stage === "string" ? { stage: raw.stage } : {}),
       });
     }
   }
@@ -1543,7 +1556,7 @@ export class SidecarPool {
               ? arriving(() => this.dispatch(instId, req.tool, req.args ?? {}, true, request), arrival)
               : Promise.reject(error))
             .then(data => ({ ok: true as const, data }))
-            .catch((error: Error & { code?: string }) => ({ ok: false as const, error: `${error.code ?? "error"}: ${error.message}` }));
+            .catch((error: Error & { code?: string }) => ({ ok: false as const, error: `${error.code ?? "error"}: ${error.message}`, ...SidecarPool.receiptOf(error) }));
     // Last-line budget check: an over-budget success becomes a recoverable, JSON-legal error (SYS01).
     const guarded = guardRelayResponse(res);
     writeFileAtomic(join(resDir(dir), file), JSON.stringify(guarded));

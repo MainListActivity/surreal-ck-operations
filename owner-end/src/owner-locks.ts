@@ -5,7 +5,7 @@ import { ITERATION_COMMANDS } from './iteration-commands.ts';
  * - hardTargetOwnerOnly：按目标判定。命中即写死仅老板，员工调用被拒并写审计。覆盖：
  *   公司租户（IDP_TENANT_ID）的写操作；ma_hono 管理接口的服务主体、登录与其它管理路径的写入；
  *   老板端与 ma_hono 的 Cloudflare 资源（Worker 脚本、D1、API 令牌、自定义域名），以及请求内容里提到的公司域名。
- * - OWNER_ONLY_FOR_AGENTS：员工调用即拒绝的老板观测命令（作业与审计记录其它员工与老板的操作）。
+ * - OWNER_ONLY_FOR_AGENTS：员工调用即拒绝的老板命令（作业与审计记录其它员工与老板的操作；故障恢复的解除）。
  * 规则只看命令与输入里的目标，不看调用方身份。纯函数，不访问网络与数据库。
  */
 
@@ -64,8 +64,11 @@ export const TARGET_LOCKS: ReadonlyArray<{ command: string; target: string }> = 
   },
 ];
 
-/** 员工调用即拒绝的老板命令（网关规则，不属于 HARD_OWNER_ONLY）：作业与审计记录其它员工与老板的操作，只给老板看。 */
-export const OWNER_ONLY_FOR_AGENTS: readonly string[] = ['ops.job.list', 'audit.list', ...ITERATION_COMMANDS, ...LIFECYCLE_COMMANDS];
+/**
+ * 员工调用即拒绝的老板命令（网关规则，不属于 HARD_OWNER_ONLY）：作业与审计记录其它员工与老板的操作，只给老板看；
+ * fault.lift 解除故障恢复预算，员工持有租约也不能给自己的操作解除预算。
+ */
+export const OWNER_ONLY_FOR_AGENTS: readonly string[] = ['ops.job.list', 'audit.list', 'fault.lift', ...ITERATION_COMMANDS, ...LIFECYCLE_COMMANDS];
 
 /**
  * 按目标的硬锁。命中时返回拒绝理由（调用方据此拒绝并写审计），否则返回 undefined。

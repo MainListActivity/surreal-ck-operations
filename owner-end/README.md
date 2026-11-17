@@ -96,7 +96,7 @@
 所有接口在 `/api` 下，只认 `Authorization: Bearer <访问令牌>`，不用 cookie。
 
 - 成功：`{"ok": true, "result": ...}`。
-- 失败：`{"ok": false, "error": {"code": "...", "message": "...", "jobId": "..."}}`。`jobId` 只在执行端作业相关的错误中出现。
+- 失败：`{"ok": false, "error": {"code": "...", "message": "...", "jobId": "...", "jobCode": "..."}}`。`jobId` 只在执行端作业相关的错误中出现；`jobCode` 与之同时出现，是作业的公司错误码（如 `login_failed`），`code` 仍是接口码。入口自己拒绝的请求（404、403、503）与 500 也用同一信封，`message` 为固定的中文提示。
 - 只有 `GET /api/config` 是裸 JSON。它在登录前读取，不包在 `ok` 里。
 
 | 方法与路径 | 身份 | 说明 |
@@ -113,13 +113,13 @@
 
 | `error.code` | HTTP | 含义 |
 | --- | --- | --- |
-| `unauthorized` | 401 | 没有令牌、令牌格式不对或验签失败（含 `login_failed`） |
+| `unauthorized` | 401 | 没有令牌、令牌格式不对或验签失败（含 `login_failed`）。执行端作业的失败不返回 401：接口码为 `upstream_error`，原类别在 `jobCode`，避免网页把老板登出 |
 | `forbidden` | 403 | 不是老板、员工无权调用、来源不同源、系统身份调用老板命令 |
 | `invalid` | 400 | 请求不合法（含 `response_too_large`） |
 | `not_found` | 404 | 接口或资源不存在 |
 | `conflict` | 409 | `worktree_busy`、`already_claimed`、`lease_expired`、`self_review`、`checkpoint_limit`、`payment_approval_required`、`limit_reached`、`snapshot_gone`、`retire_refused`、`ci_failed`（CI 已跑完且没有成功运行）。其它未列出的业务错误也归为这里 |
 | `pending` | 202 | 执行端作业超过 25 秒仍未完成。`error.message` 和 `error.jobId` 都是任务号，之后用 `ops.job.get` 取结果 |
-| `upstream_error` | 502 | 数据库、身份服务或译文服务失败（含占位标记丢失）。未知的内部错误也归入这里，只返回“服务暂时出错，请稍后重试” |
+| `upstream_error` | 502 | 数据库、身份服务或译文服务失败（含占位标记丢失）。未知的内部错误也归入这里，只返回“服务暂时出错，请稍后重试”。执行端作业失败时，具体类别见 `jobCode` |
 | `unavailable` | 503 | `temporarily_unavailable`、`not_configured`、`unavailable`、`ci_pending`（CI 尚未成功，等待后可再试） |
 
 ### 执行端作业
@@ -142,7 +142,7 @@
   7. 命中按目标的硬锁（`src/owner-locks.ts`，只看命令与输入里的目标，不看调用方）：
      - `idp.*`：公司租户（`IDP_TENANT_ID` 或 slug `company`）的写操作，以及 ma_hono 服务主体（`/admin/service-principals`）与其它管理路径的写入。读取和其它租户不受限；
      - `cf.api`：老板端与 ma_hono 的 Worker（脚本及其子资源）、ma_hono 的 D1、API 令牌的管理、自定义域名的写入，以及请求内容提到 `company.maplayer.top` 或这些资源的调用。其它账号资源不受限；
-  8. 员工拒绝清单（`OWNER_ONLY_FOR_AGENTS`：`ops.job.list`、`audit.list`，它们记录其它员工和老板的操作）；
+  8. 员工拒绝清单（`OWNER_ONLY_FOR_AGENTS`：`ops.job.list`、`audit.list`，它们记录其它员工和老板的操作；`fault.lift` 解除故障恢复预算，员工不能给自己解除）；
   9. `ops.job.get` 只能取本员工发起的作业。
 
   通过后：执行端命令（`RUNNER_ONLY_COMMANDS`、`ops_*`、`host.exec`）以员工身份排队到 `ops_job`；`db.read` 用查看者令牌执行（只读）；其余命令用网关令牌执行。员工不再有只读白名单，写命令同样按上面的判定放行。

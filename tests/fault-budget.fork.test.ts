@@ -27,6 +27,7 @@ import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { FaultStore } from '../src/fault-store.ts';
 import { budgetKey, classifyFault, faultFingerprint, incidentKey, type FaultBudgetLimits, type FaultPhase, type FaultTargetKind } from '../src/faults.ts';
 import type { ClaimResult, CreateTask, Evidence, LeaseProof } from '../src/contracts.ts';
+import { ownerApi, type OwnerApiContext } from '../src/owner-api.ts';
 
 const NS = 'sck_agent_company_test_fault_budget';
 const database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
@@ -336,6 +337,27 @@ describe('the budget is spent before the attempt', () => {
     expect(refused?.reason).toBe('lease_expired');
     expect(refused?.message).not.toContain('recovery budget');
   });
+
+  test('the deadline is the window of the first charged failure: a long lease does not move it, and the refusal says when it passed', async () => {
+    const taskId = await makeTask('预算：截止时刻只来自首次失败');
+    const scope = { taskId, employeeId: 't-eng' };
+    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
+    const opened = clock;
+    const before = await budgetRow(taskId);
+    expect(before?.deadline).toBe(opened + limits.totalDeadlineMs);
+    // The lease outlives the window by an hour. It does not extend the deadline, and it is not the reason for the refusal.
+    await database.db.query('UPDATE $t SET lease_expires_at = $far;', {
+      t: new RecordId('task', taskId), far: Math.floor(clock / 1000) + 3_600,
+    });
+    clock += limits.totalDeadlineMs + 10_000;
+    const refused = await core.reserveFault!(scope, RESERVE);
+    expect(refused?.allowed).toBe(false);
+    expect(refused?.reason).toBe('deadline_passed');
+    expect(refused?.message).toContain(`the recovery deadline for this operation has passed at ${new Date(opened + limits.totalDeadlineMs).toISOString()}`);
+    const after = await budgetRow(taskId);
+    expect(after?.deadline).toBe(before?.deadline);
+    expect(after?.attempts).toBe(before?.attempts);
+  });
 });
 
 describe('concurrent calls', () => {
@@ -584,5 +606,105 @@ describe('an unexecuted reservation is refunded, never settled healthy', () => {
     expect(refused?.charged).toBe(false);
     expect(refused?.refund).toBeUndefined();
     expect((await budgetRow(taskId))?.stopped).toBe(true);
+  });
+});
+
+describe('the owner lift', () => {
+  test('a lift opens a fresh window for one operation; the cumulative count stays for the audit', async () => {
+    const taskId = await makeTask('解除：窗口与次数从头计');
+    const scope = { taskId, employeeId: 't-eng' };
+    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
+    const opened = await budgetRow(taskId);
+    clock += limits.totalDeadlineMs + 10_000;
+    expect((await core.reserveFault!(scope, RESERVE))?.reason).toBe('deadline_passed');
+    const lifted = await new FaultStore(database.db).liftScope({ key: budgetKey(taskId, TARGET, PHASE), taskId, now: clock, limits });
+    expect(lifted.outcome).toBe('lifted');
+    const after = await budgetRow(taskId);
+    expect(after?.failed).toBe(false);
+    expect(after?.stopped).toBe(false);
+    expect(after?.attempts).toBe(0);
+    expect(after?.totalAttempts).toBe(opened?.totalAttempts);
+    expect(after?.deadline).toBe(clock + limits.totalDeadlineMs);
+    // The first call after a lift runs free, as the first attempt of any operation does; its failure opens the new window.
+    const retry = await core.reserveFault!(scope, RESERVE);
+    expect(retry?.allowed).toBe(true);
+    expect(retry?.charged).toBe(false);
+    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
+    const reopened = await budgetRow(taskId);
+    expect(reopened?.attempts).toBe(1);
+    expect(reopened?.deadline).toBe(clock + limits.totalDeadlineMs);
+  });
+
+  test('a lift changes no other operation of the task and no other task', async () => {
+    const taskId = await makeTask('解除：只解除这一个操作');
+    const other = await makeTask('解除：另一任务不受影响');
+    const scope = { taskId, employeeId: 't-eng' };
+    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
+    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT', target: 'idp_token' });
+    await attempt({ taskId: other, employeeId: 't-eng' }, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
+    const sameTaskBefore = await budgetRow(taskId, 'idp_token');
+    const otherTaskBefore = await budgetRow(other);
+    clock += limits.totalDeadlineMs + 10_000;
+    await new FaultStore(database.db).liftScope({ key: budgetKey(taskId, TARGET, PHASE), taskId, now: clock, limits });
+    const sameTaskAfter = await budgetRow(taskId, 'idp_token');
+    expect(sameTaskAfter?.failed).toBe(true);
+    expect(sameTaskAfter?.attempts).toBe(sameTaskBefore?.attempts);
+    expect(sameTaskAfter?.deadline).toBe(sameTaskBefore?.deadline);
+    const otherTaskAfter = await budgetRow(other);
+    expect(otherTaskAfter?.failed).toBe(true);
+    expect(otherTaskAfter?.deadline).toBe(otherTaskBefore?.deadline);
+  });
+
+  test('a lift with nothing to lift creates no budget and changes none', async () => {
+    const taskId = await makeTask('解除：无可解除时不动');
+    const scope = { taskId, employeeId: 't-eng' };
+    const store = new FaultStore(database.db);
+    const key = budgetKey(taskId, TARGET, PHASE);
+    expect((await store.liftScope({ key, taskId, now: clock, limits })).outcome).toBe('absent');
+    expect(await budgetRow(taskId)).toBeUndefined();
+    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
+    await core.settleFault!(scope, RESERVE);
+    const settled = await budgetRow(taskId);
+    expect(settled?.failed).toBe(false);
+    expect((await store.liftScope({ key, taskId, now: clock, limits })).outcome).toBe('clear');
+    const again = await budgetRow(taskId);
+    expect(again?.attempts).toBe(settled?.attempts);
+    expect(again?.deadline).toBe(settled?.deadline);
+    expect(again?.failed).toBe(false);
+  });
+
+  test('a lift closes the open episode of the cause, so the next exhaustion is reported as a new stage', async () => {
+    const taskId = await makeTask('解除：关闭已耗尽的收敛单');
+    const scope = { taskId, employeeId: 't-eng' };
+    await exhaust(scope);
+    const store = new FaultStore(database.db);
+    const [exhausted] = await store.episodesOfTask(taskId);
+    expect(exhausted?.state).toBe('exhausted');
+    expect((await store.liftScope({ key: budgetKey(taskId, TARGET, PHASE), taskId, now: clock, limits })).outcome).toBe('lifted');
+    const [resolved] = await store.episodesOfTask(taskId);
+    expect(resolved?.state).toBe('resolved');
+  });
+
+  test('the owner command needs a reason, names one operation, and writes the audit with the reason', async () => {
+    const taskId = await makeTask('解除：老板命令与审计');
+    const scope = { taskId, employeeId: 't-eng' };
+    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
+    clock += limits.totalDeadlineMs + 10_000;
+    const ctx = { db: database, core, owner: {}, workforce: {}, messages: {}, opsRepo: '' } as unknown as OwnerApiContext;
+    const call = (input: Record<string, unknown>) => ownerApi(ctx, { command: 'fault.lift', ...input }, 'web');
+    await expect(call({ taskId, target: TARGET, phase: PHASE, reason: '短' })).rejects.toMatchObject({ code: 'invalid' });
+    await expect(call({ taskId, target: TARGET, phase: PHASE })).rejects.toMatchObject({ code: 'invalid' });
+    const lifted = await call({ taskId, target: TARGET, phase: PHASE, reason: '已核对 IdP 恢复，允许重试一次登录' });
+    expect(lifted).toMatchObject({ lifted: true, taskId, target: TARGET, phase: PHASE, attempts: 1 });
+    const audits = async () => (await database.db.query<[Array<{ actor?: string; evidence?: string }>]>(
+      "SELECT actor, evidence FROM audit WHERE action = 'fault_lift' AND task = $task;", { task: new RecordId('task', taskId) }))[0] ?? [];
+    const [written] = await audits();
+    expect(written?.actor).toBe('owner:web');
+    expect(written?.evidence).toContain('target=idp_login phase=login');
+    expect(written?.evidence).toContain('reason=已核对 IdP 恢复，允许重试一次登录');
+    // Nothing is open any more: a second lift is refused and writes no second audit row.
+    await expect(call({ taskId, target: TARGET, phase: PHASE, reason: '再次解除这一操作' })).rejects.toMatchObject({ code: 'conflict' });
+    await expect(call({ taskId, target: 'product_api', phase: PHASE, reason: '不存在的操作' })).rejects.toMatchObject({ code: 'not_found' });
+    expect(await audits()).toHaveLength(1);
   });
 });

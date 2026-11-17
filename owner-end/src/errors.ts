@@ -2,8 +2,8 @@
  * 接口错误：把内部错误映射为 {ok:false, error:{code,message}} 与 HTTP 状态。
  * 错误码与状态的对应见 README。未知错误不回显细节，只给通用中文提示。
  */
-import { CompanyError } from '../../src/core-errors.ts';
-import { PendingJob } from './jobs.ts';
+import { CompanyError, type CompanyErrorCode } from '../../src/core-errors.ts';
+import { JobFailure, PendingJob } from './jobs.ts';
 
 export type ApiErrorCode =
   | 'unauthorized' | 'forbidden' | 'invalid' | 'not_found' | 'conflict' | 'pending' | 'upstream_error' | 'unavailable';
@@ -52,7 +52,17 @@ export function apiCodeOf(error: unknown): ApiErrorCode {
 
 export interface FailureBody {
   ok: false;
-  error: { code: ApiErrorCode; message: string; jobId?: string };
+  /** 执行端作业失败时 jobId 定位作业，jobCode 是作业的公司错误码（如 login_failed）；code 仍是接口码。 */
+  error: { code: ApiErrorCode; message: string; jobId?: string; jobCode?: CompanyErrorCode };
+}
+
+/**
+ * 作业失败的接口码：与 apiCodeOf 相同，但不返回 unauthorized。作业里的鉴权失败说的是员工或上游的凭证，
+ * 不是老板的会话；返回 401 会让网页把老板登出。原类别放在 jobCode。
+ */
+function jobApiCodeOf(error: JobFailure): ApiErrorCode {
+  const code = apiCodeOf(error);
+  return code === 'unauthorized' ? 'upstream_error' : code;
 }
 
 /**
@@ -64,6 +74,21 @@ export function failureOf(error: unknown): { status: number; body: FailureBody }
     return {
       status: STATUS_OF.pending,
       body: { ok: false, error: { code: 'pending', message: error.jobId, jobId: error.jobId } },
+    };
+  }
+  if (error instanceof JobFailure) {
+    const code = jobApiCodeOf(error);
+    return {
+      status: STATUS_OF[code],
+      body: {
+        ok: false,
+        error: {
+          code,
+          message: error.message,
+          ...(error.jobId === undefined ? {} : { jobId: error.jobId }),
+          jobCode: error.code,
+        },
+      },
     };
   }
   const code = apiCodeOf(error);

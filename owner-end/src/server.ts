@@ -21,6 +21,8 @@ const digest = (value: string) => createHash('sha256').update(value).digest();
 const reply = (status: number, body: unknown) => Response.json(body, {
   status, headers: { 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' },
 });
+/** 入口自己拒绝的请求也用接口信封 {ok:false,error:{code,message}}，客户端不必区分它与业务错误。 */
+const failure = (status: number, code: string, message: string) => reply(status, { ok: false, error: { code, message } });
 
 function publicOriginOf(value: string): string {
   const url = new URL(value);
@@ -54,11 +56,11 @@ export function createOwnerServer(options: OwnerServerOptions) {
           sha: options.env.OWNER_RELEASE_SHA ?? null,
         });
       if (incoming.pathname !== '/api' && !incoming.pathname.startsWith('/api/'))
-        return reply(404, { error: 'Not Found' });
+        return failure(404, 'not_found', '接口不存在');
       // 对固定长度摘要恒时比较；不按输入密钥长度提前返回，也不将密钥送入业务处理器。
       if (!timingSafeEqual(expectedKey, digest(request.headers.get('x-company-proxy-key') ?? '')))
-        return reply(403, { error: 'Forbidden' });
-      if (stopping) return reply(503, { error: 'Unavailable' });
+        return failure(403, 'forbidden', '禁止访问');
+      if (stopping) return failure(503, 'unavailable', '服务正在停止，请稍后重试');
 
       const headers = new Headers(request.headers);
       const clientIp = headers.get('x-company-client-ip');
@@ -82,7 +84,7 @@ export function createOwnerServer(options: OwnerServerOptions) {
       return handle(forwarded, options.env);
     },
     error() {
-      return reply(500, { error: 'Internal Server Error' });
+      return failure(500, 'upstream_error', '服务暂时出错，请稍后重试');
     },
   });
   const stop = (): Promise<void> => stopping ??= (async () => {

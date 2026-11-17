@@ -7,7 +7,7 @@
  */
 import { RecordId, type Surreal } from 'surrealdb';
 import { failureOf } from '../../owner-end/src/errors.ts';
-import { enqueueJob, jobGet, PendingJob } from '../../owner-end/src/jobs.ts';
+import { enqueueJob, jobFailure, jobGet, PendingJob, waitForJob } from '../../owner-end/src/jobs.ts';
 import { failure, storeResult } from '../../src/cloud/ops-jobs.ts';
 
 /** 固定的时刻（与事故时间相同），让测试不依赖当前时间。 */
@@ -39,6 +39,11 @@ export interface OwnerJobStore {
   remove(id: string): void;
   /** 老板端 ops.job.get：真实的 jobGet；错误经真实的 failureOf 映射为 HTTP 状态与正文。 */
   getJob(input: unknown): Promise<Reply>;
+  /**
+   * 老板端入队命令的同步段（commands.ts 的 queueJob）：等待时限内已结束的作业，按真实的 waitForJob、jobFailure 与
+   * failureOf 回执；仍未结束则 202 待取。这里等待时限为 0，只看作业当前状态。
+   */
+  settle(id: string): Promise<Reply>;
 }
 
 export function createOwnerJobStore(): OwnerJobStore {
@@ -79,6 +84,12 @@ export function createOwnerJobStore(): OwnerJobStore {
       } catch (error) {
         return failureOf(error);
       }
+    },
+    async settle(id) {
+      const outcome = await waitForJob(db, id, 0);
+      if (outcome.state === 'done') return { status: 200, body: { ok: true, result: outcome.result } };
+      if (outcome.state === 'error') return failureOf(jobFailure(outcome));
+      return pendingReply(id);
     },
   };
 }

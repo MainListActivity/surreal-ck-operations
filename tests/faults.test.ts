@@ -208,7 +208,24 @@ describe('budget arithmetic', () => {
     expect(decision.reason).toBe('deadline_passed');
   });
 
-  test('the lease window caps the recovery deadline: an attempt may not outlive its lock', () => {
+  test('a long lease does not extend a passed deadline: the refusal is the deadline, not the lease', () => {
+    const state = spendBudget(undefined, limits, 1_000, fault, 0);
+    // The lease outlives the budget by ten minutes. The deadline is checked first, so it still decides.
+    const decision = decideAttempt(state, limits, 200_000, 1_000 + 600_000);
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toBe('deadline_passed');
+    expect(decision.nextAllowedAt).toBe(state.deadline);
+  });
+
+  test('the first charged failure opens the window: its deadline is 120 seconds later, and a later holder keeps it', () => {
+    const first = spendBudget(undefined, limits, 1_000, fault, 0);
+    expect(first.deadline).toBe(1_000 + 120_000);
+    const later = spendBudget(first, limits, 100_000, fault, 0);
+    expect(later.deadline).toBe(first.deadline);
+    expect(decideAttempt(later, limits, first.deadline).reason).toBe('deadline_passed');
+  });
+
+  test('the lease window refuses an attempt that would outlive its lock; the refusal is the lease, not the deadline', () => {
     const state = spendBudget(undefined, limits, 1_000, fault, 0);
     expect(decideAttempt(state, limits, 10_000).allowed).toBe(true);
     const capped = decideAttempt(state, limits, 10_000, 5_000);

@@ -52,6 +52,8 @@ const BEARER_TOKEN = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
 // 协议名不设长度上限（超长协议名里的凭证也要脱敏）。每段字母数字串只从边界开始尝试一次，且整段捕获后不回溯
 // （前瞻 + 回溯引用模拟原子组）。旧写法在长字母数字串上每个起点都回溯到串尾，整体 O(n²)，70 KB 约 2.5 秒。
 const URL_CREDENTIAL = /(?<![a-z0-9+.-])(?=([a-z0-9+.-]*[a-z][a-z0-9+.-]*))\1:\/\/[^\s/?#@"']+@/gi;
+// 登录流程的阶段标记（src/ops/idp.ts 写入，src/cloud/gateway.ts 读取）：只有这四个阶段。
+const STAGE_MARK = /\bstage=(authorize|login|consent|exchange)\b/;
 
 // 认领仅在行仍为 queued 时成功；写回仅在本执行端仍持有 running 行时成功。两者都用 RETURN AFTER 检查是否真的更新到了行。
 const CLAIM_SQL = "UPDATE $job SET state = 'running', runner = $runner, started_at = time::now() WHERE state = 'queued' RETURN AFTER;";
@@ -145,7 +147,10 @@ export function failure(err: unknown): string {
   const code = (err as { code?: unknown } | null | undefined)?.code;
   const raw = err instanceof Error ? err.message : String(err);
   const name = typeof code === 'string' ? code : 'upstream_error';
-  const message = scrub(clipChars(scrub(raw), MESSAGE_LIMIT_CHARS));
+  const clipped = scrub(clipChars(scrub(raw), MESSAGE_LIMIT_CHARS));
+  // 登录流程的阶段标记（src/ops/idp.ts 写入）是排查的关键。说明超过 200 字时它可能落在截断之后，补在末尾保留。
+  const stage = STAGE_MARK.exec(raw)?.[0];
+  const message = stage && !clipped.includes(stage) ? `${clipped}; ${stage}` : clipped;
   return clipChars(scrub(`${name}: ${message}`), ERROR_LIMIT_CHARS);
 }
 

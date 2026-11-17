@@ -123,6 +123,46 @@ test('a sidecar refusal keeps its code and reason, as JSON on stdout', async () 
   rmSync(dir, { recursive: true, force: true });
 });
 
+test('a cloud job failure keeps its job id, its stage and whether it was accepted; an accepted command is not retryable', async () => {
+  const dir = commDir();
+  const child = Bun.spawn([process.execPath, CLIENT, 'call', 'ops_login', '{"alias":"QA1"}'], {
+    cwd: ROOT, stdout: 'pipe', stderr: 'pipe', env: cleanEnv({ SCK_COMM_DIR: dir, SCK_COMM_KEY: 'comm-client-key' }),
+  });
+  const file = await waitForRequest(dir);
+  const error = 'login_failed: IdP rejected the login (invalid_credentials); stage=login';
+  writeFileAtomic(join(resDir(dir), file), JSON.stringify({ ok: false, error, accepted: true, jobId: 'job-cli-1', stage: 'login' }));
+  const out = await new Response(child.stdout).text();
+  expect(await child.exited).toBe(1);
+  expect(oneJsonLine(out)).toEqual({ ok: false, code: 'login_failed', error, retryable: false, accepted: true, jobId: 'job-cli-1', stage: 'login' });
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('a cloud failure with no job receipt stays retryable and names no job; an accepted upstream error is not retryable', async () => {
+  const dir = commDir();
+  const child = Bun.spawn([process.execPath, CLIENT, 'call', 'ops_info', '{}'], {
+    cwd: ROOT, stdout: 'pipe', stderr: 'pipe', env: cleanEnv({ SCK_COMM_DIR: dir, SCK_COMM_KEY: 'comm-client-key' }),
+  });
+  const file = await waitForRequest(dir);
+  const timeout = 'upstream_error: 网关超时（HTTP 504），没有可读的回执';
+  writeFileAtomic(join(resDir(dir), file), JSON.stringify({ ok: false, error: timeout, accepted: false }));
+  const out = await new Response(child.stdout).text();
+  expect(await child.exited).toBe(1);
+  expect(oneJsonLine(out)).toEqual({ ok: false, code: 'upstream_error', error: timeout, retryable: true, accepted: false });
+  rmSync(dir, { recursive: true, force: true });
+
+  const acceptedDir = commDir();
+  const accepted = Bun.spawn([process.execPath, CLIENT, 'call', 'ops_info', '{}'], {
+    cwd: ROOT, stdout: 'pipe', stderr: 'pipe', env: cleanEnv({ SCK_COMM_DIR: acceptedDir, SCK_COMM_KEY: 'comm-client-key' }),
+  });
+  const acceptedFile = await waitForRequest(acceptedDir);
+  const failed = 'upstream_error: 作业执行失败：IdP authorize failed; stage=authorize';
+  writeFileAtomic(join(resDir(acceptedDir), acceptedFile), JSON.stringify({ ok: false, error: failed, accepted: true, jobId: 'job-cli-2', stage: 'authorize' }));
+  const acceptedOut = await new Response(accepted.stdout).text();
+  expect(await accepted.exited).toBe(1);
+  expect(oneJsonLine(acceptedOut)).toEqual({ ok: false, code: 'upstream_error', error: failed, retryable: false, accepted: true, jobId: 'job-cli-2', stage: 'authorize' });
+  rmSync(acceptedDir, { recursive: true, force: true });
+});
+
 test('a sidecar answer passes through as one JSON line, Chinese and emoji intact', async () => {
   const dir = commDir();
   const child = Bun.spawn([process.execPath, CLIENT, 'call', 'get_context', '{}'], {

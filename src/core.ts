@@ -2390,8 +2390,9 @@ export class SurrealCompanyCore implements CompanyCore {
   }): Promise<{ allowed: boolean; attempt: number; charged: boolean; reason?: string; message: string; evidence: Record<string, unknown>; refund?: FaultRefund } | undefined> {
     const controlledTarget = input.target ?? 'none';
     const now = this.faultClock();
-    // SYS04 AC02: the attempt runs inside the lease, so it may not outlive the lock. The lease window caps the
-    // recovery deadline; the budget itself stays persisted, so a re-claimed lease keeps the same counters.
+    // SYS04 AC02: the attempt runs inside the lease, so it may not outlive the lock. A lease that ends first is a
+    // refusal of its own (lease_expired), not a spent budget. The lease does not set the recovery deadline: that is
+    // the persisted window of the first charged failure, and a re-claimed lease keeps the same counters.
     const task = await this.db.select<{ lease_expires_at?: number }>(id('task', scope.taskId));
     // The lease window is stored in unix seconds; the budget clock is in milliseconds.
     const leaseExpiresAt = task?.lease_expires_at === undefined || task?.lease_expires_at === null
@@ -2419,10 +2420,12 @@ export class SurrealCompanyCore implements CompanyCore {
   /** The refusal text of a budget decision. It says what to do next, in fixed words, and never quotes the upstream. */
   private faultRefusalMessage(phase: FaultPhase, reason: string | undefined, nextAllowedAt: number | undefined,
     diagnostic: FaultDiagnostic | undefined): string {
+    // 截止时间写成绝对时间：员工与老板据此知道恢复窗口何时结束，不必猜。
+    const passedAt = nextAllowedAt === undefined ? '' : ` at ${new Date(nextAllowedAt).toISOString()}`;
     const text = reason === 'attempts_exhausted'
       ? 'the recovery budget for this operation is spent'
       : reason === 'deadline_passed'
-        ? 'the recovery deadline for this operation has passed'
+        ? `the recovery deadline for this operation has passed${passedAt}`
         : reason === 'min_interval'
           ? `the next attempt is allowed after ${new Date(nextAllowedAt ?? 0).toISOString()}`
           : reason === 'lease_expired'

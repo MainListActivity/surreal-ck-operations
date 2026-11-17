@@ -808,6 +808,36 @@ export class FaultStore {
   }
 
   /**
+   * Lift the recovery of one fault object by hand. The owner decides and the caller writes the audit with the reason.
+   *
+   * The object starts over: a new window opens from now, the attempts of the old window are cleared, and a stop is
+   * lifted with the rest. The cumulative count stays in `total_attempts` for the audit. The episodes of its last cause
+   * close, so the next exhaustion is reported again. An object with no recovery in progress is left as it is.
+   *
+   * The update is a CAS on the attempt count that was read: a charge that lands in between makes the lift a conflict,
+   * and the owner reads the budget again. Nothing here creates a budget or moves a lease.
+   */
+  async liftScope(input: { key: string; taskId: string; now: number; limits: FaultBudgetLimits }):
+    Promise<{ outcome: 'lifted' | 'clear' | 'absent' | 'conflict'; prior?: FaultScopeRow }> {
+    const row = await this.scope(input.key);
+    if (!row) return { outcome: 'absent' };
+    if (!row.failed && !row.stopped) return { outcome: 'clear', prior: row };
+    const [rows] = await this.db.query<[Array<{ key?: string }>]>(`UPDATE $row SET attempts = 0, deadline = $deadline,
+      next_allowed_at = $now, stopped = false, stop_reason = NONE, stop_fingerprint = NONE, stop_diagnostic = NONE,
+      failed = false, updated_at = time::now() WHERE attempts = $expected RETURN AFTER;`, {
+      row: scopeId(input.key), deadline: input.now + input.limits.totalDeadlineMs, now: input.now, expected: row.attempts,
+    });
+    if (!rows?.length) return { outcome: 'conflict', prior: row };
+    if (row.lastIncident) {
+      await this.db.query(`UPDATE fault_episode SET state = 'resolved', resolved_at = time::now(), updated_at = time::now()
+        WHERE task = $task AND incident = $incident AND state != 'resolved';`, {
+        task: new RecordId('task', input.taskId), incident: row.lastIncident,
+      });
+    }
+    return { outcome: 'lifted', prior: row };
+  }
+
+  /**
    * Create or link the repair task of an incident and return its id (AC04).
    *
    * The chain has rounds. While the current round is open, a second exhaustion of the same cause links that round
