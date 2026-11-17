@@ -359,6 +359,12 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     freeRowInert?: boolean;
     /** Escape 收不起菜单（它仍挡着输入区）。 */
     escapeInert?: boolean;
+    /** 选中 Free 后菜单只有一层：一次 Escape 就全部收起（对照真实页面的两层）。 */
+    singleLayer?: boolean;
+    /** Escape 生效要等这么多毫秒（虚拟时钟，由 waitForTimeout 推进）：模拟 DOM 更新慢。 */
+    escapeLagMs?: number;
+    /** 菜单项改成 role=menuitem 的链接（真实页面 Free 项的角色；标签不是 button）。 */
+    menuItemRows?: boolean;
     /** 点 Free 后档位与席位晚这么多毫秒才显示（虚拟时钟，由 waitForTimeout 推进）。 */
     capLagMs?: number;
     onVisit?: (url: string, sessions: Record<string, FakeSession>) => void;
@@ -381,8 +387,10 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
   /**
    * 假 Devin 网页：ego-browser 脚本真的在 new Function 里执行，页面结构按只读实测（见 devin-web.ts 文件头）。
    * 首页 Capability 菜单只响应真实指针点击（p.click）：程序化 element.click() 只派发 click 事件，不开菜单、不改档位
-   * （2026-11-17 失败签名即按钮停在 Normal、powered=false）。菜单在指针点击后按 menuDelayMs 渲染（虚拟时钟由
-   * waitForTimeout 推进）。选中 Free 且菜单渲染时正文才有 "Free (powered by SWE-2)" 与 "N/M in use"；Escape 收起菜单。
+   * （推断，与 2026-11-17 失败签名一致）。菜单在指针点击后按 menuDelayMs 渲染（虚拟时钟由 waitForTimeout 推进）。
+   * 选中 Free 后菜单是两层（负责人 2026-11-17 真实页面实测）：第一层 Capability 列表仍开，第二层 Free 详情才有
+   * "Free (powered by SWE-2)" 与 "N/M in use"。Escape 每次只收一层：第一次收详情，第二次收列表；singleLayer 时一次全收；
+   * escapeLagMs 时收起要等 DOM 更新。escLog 记录每次 Escape 生效后仍可见的菜单层数。
    * 会话页：Capability 按钮 disabled、菜单打不开，正文没有席位文字。
    * events 按顺序记录导航、指针点击（pointer）、程序化点击（js）、Escape、填写、按下与发送。
    */
@@ -401,6 +409,11 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     getBoundingClientRect(): { width: number; height: number };
     querySelectorAll(selector: string): FakeEl[];
   }
+  /** 假页面只认两种简单选择器：标签名与 [role=x]（子元素查询按逗号分隔的选择器表过滤）。 */
+  const simpleMatch = (e: FakeEl, sel: string): boolean => {
+    const role = /^\[role=([\w-]+)\]$/.exec(sel)?.[1];
+    return role !== undefined ? e.attrs.role === role : e.tagName === sel;
+  };
   const mkEl = (o: { tag: string; text: () => string; rect: () => { width: number; height: number };
     attrs?: Record<string, string>; parent?: FakeEl; disabled?: () => boolean; expanded?: () => boolean;
     children?: () => FakeEl[]; onClick?: () => void }): FakeEl => {
@@ -426,7 +439,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
         return false;
       },
       getBoundingClientRect: () => o.rect(),
-      querySelectorAll: () => o.children?.() ?? [],
+      querySelectorAll: (selector: string) => (o.children?.() ?? []).filter(c => selector.split(',').some(s => simpleMatch(c, s.trim()))),
     };
     return el;
   };
@@ -436,6 +449,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     for (const [url, s] of Object.entries(opts.sessions ?? {}))
       sessions[url] = { cap: 'Free', status: 'Devin is awaiting instructions', ...s, blocks: (s.blocks ?? []).map(b => ({ ...b })) };
     const st = { url: HOME, cap: 'Normal', capBefore: 'Normal', capAt: 0, draft: '', clock: 0, menuOpen: false, menuReadyAt: 0,
+      detailOpen: false, pending: [] as Array<{ at: number; run: () => void }>, escLog: [] as number[],
       events: [] as string[], sent: [] as Array<{ url: string; text: string }> };
     const isSession = (url: string) => /\/sessions\//.test(url);
     const current = () => sessions[st.url]!;
@@ -443,12 +457,15 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     const menuShown = () => !isSession(st.url) && st.menuOpen && st.clock >= st.menuReadyAt;
     /** 页面上显示的档位：选中 Free 后可能还要等 capLagMs 才变。 */
     const capShown = () => (st.clock >= st.capAt ? st.cap : st.capBefore);
-    const selectFree = () => { st.capBefore = capShown(); st.cap = 'Free'; st.capAt = st.clock + (opts.capLagMs ?? 0); };
+    /** 第二层 Free 详情：菜单开着、页面档位已是 Free，且它还没被 Escape 收掉。 */
+    const detailShown = () => menuShown() && st.detailOpen && capShown() === 'Free';
+    /** 当前可见的菜单层数（列表 + 详情），即 DOM 里可见 [role=menu] 的个数。 */
+    const visibleMenus = () => (menuShown() ? 1 : 0) + (detailShown() ? 1 : 0);
+    const selectFree = () => { st.capBefore = capShown(); st.cap = 'Free'; st.capAt = st.clock + (opts.capLagMs ?? 0); st.detailOpen = true; };
+    const detailText = () => `Free (powered by SWE-2)\nThe plan includes ${seats.total} concurrent sessions\n${seats.used}/${seats.total} in use`;
     const bodyText = (): string => isSession(st.url)
       ? [...current().blocks.map(b => b.text), current().status].join('\n')
-      : ['Organization', capShown() === 'Free' ? 'Free (powered by SWE-2)' : '',
-          menuShown() && capShown() === 'Free' ? `The plan includes ${seats.total} concurrent sessions\n${seats.used}/${seats.total} in use` : '']
-        .filter(Boolean).join('\n');
+      : ['Organization', detailShown() ? detailText() : ''].filter(Boolean).join('\n');
     const rowNames = [...CAP_ROWS.filter(name => !(opts.noFreeRow && name === 'Free')), ...(opts.duplicateFreeRow ? ['Free'] : [])];
     const trigger = mkEl({ tag: 'button', text: () => capShown(), rect: () => ({ width: 90, height: 28 }),
       disabled: () => isSession(st.url), expanded: () => st.menuOpen,
@@ -457,9 +474,11 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     const menuRows: FakeEl[] = [];
     const capMenu = mkEl({ tag: 'div', attrs: { role: 'menu' }, text: () => rowNames.join('\n'),
       rect: () => ({ width: 200, height: 300 }), children: () => menuRows });
-    for (const name of rowNames) menuRows.push(mkEl({ tag: 'button', attrs: { role: 'menuitemradio' }, parent: capMenu,
+    for (const name of rowNames) menuRows.push(mkEl({ tag: opts.menuItemRows ? 'a' : 'button',
+      attrs: { role: opts.menuItemRows ? 'menuitem' : 'menuitemradio' }, parent: capMenu,
       text: () => name, rect: () => (menuShown() ? { width: 160, height: 32 } : { width: 0, height: 0 }),
       onClick: () => { st.events.push(`js ${name}`); if (name === 'Free' && menuShown() && !opts.freeRowInert) selectFree(); } }));
+    const detailMenu = mkEl({ tag: 'div', attrs: { role: 'menu' }, text: detailText, rect: () => ({ width: 220, height: 64 }), children: () => [] });
     const staleRows: FakeEl[] = [];
     const staleMenu = opts.staleMenu ? mkEl({ tag: 'div', attrs: { role: 'menu' }, text: () => 'Account\nLog out',
       rect: () => ({ width: 0, height: 0 }), children: () => staleRows }) : undefined;
@@ -469,6 +488,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       ...(outside ? [outside] : []), trigger,
       ...(staleMenu ? [staleMenu, ...staleRows] : []),
       ...(menuShown() ? [capMenu, ...menuRows] : []),
+      ...(detailShown() ? [detailMenu] : []),
     ];
     const known = (): FakeEl[] => [trigger, capMenu, ...menuRows, ...staleRows, ...(outside ? [outside] : []), ...(staleMenu ? [staleMenu] : [])];
     const matches = (e: FakeEl, sel: string): boolean => {
@@ -496,18 +516,31 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     };
     const page = {
       goto: async (url: string) => {
-        st.url = url; st.menuOpen = false; st.events.push(`visit ${url}`);
+        st.url = url; st.menuOpen = false; st.detailOpen = false; st.pending = []; st.events.push(`visit ${url}`);
         st.cap = isSession(url) ? (sessions[url]?.cap ?? 'Free') : 'Normal';
         st.capAt = 0;
         // 导航重建页面：上一页写进 DOM 的标记随之消失。
         for (const e of known()) { delete e.attrs['data-sck-cap-trigger']; delete e.attrs['data-sck-free-row']; }
         opts.onVisit?.(url, sessions);
       },
-      waitForTimeout: async (ms = 0) => { st.clock += ms; },
+      waitForTimeout: async (ms = 0) => {
+        st.clock += ms;
+        const due = st.pending.filter(j => j.at <= st.clock);
+        st.pending = st.pending.filter(j => j.at > st.clock);
+        for (const j of due) j.run();
+      },
       keyboard: {
         press: async (key: string) => {
           st.events.push(`press ${key}`);
-          if (key === 'Escape' && !opts.escapeInert) st.menuOpen = false;
+          if (key !== 'Escape' || opts.escapeInert) return;
+          // 两层：第一次只收 Free 详情（列表仍开），第二次收列表；singleLayer 时一次全收。
+          const close = () => {
+            if (!opts.singleLayer && detailShown()) st.detailOpen = false;
+            else { st.menuOpen = false; st.detailOpen = false; }
+            st.escLog.push(visibleMenus());
+          };
+          if (opts.escapeLagMs) st.pending.push({ at: st.clock + opts.escapeLagMs, run: close });
+          else close();
         },
       },
       evaluate: async (fn: (arg?: unknown) => unknown, arg?: unknown) => {
@@ -537,7 +570,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
         if (target === trigger) {
           if (trigger.disabled) throw new Error('element is disabled');
           st.events.push('pointer cap');
-          if (!opts.noMenu) { st.menuOpen = true; st.menuReadyAt = st.clock + (opts.menuDelayMs ?? 0); }
+          if (!opts.noMenu) { st.menuOpen = true; st.detailOpen = false; st.menuReadyAt = st.clock + (opts.menuDelayMs ?? 0); }
           return;
         }
         if (target === outside) { st.events.push('pointer outside'); return; }
@@ -1104,8 +1137,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const out = await runLane(w.input({ provider: 'devin-cloud', prompt: '继续修复。' }), { ...w.deps, browse: fake.browse });
       expect(out.status).toBe('success');
       expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
-      expect(fake.st.events.slice(0, 9)).toEqual([
-        `visit ${SESSION}`, `visit ${HOME}`, 'pointer cap', 'pointer Free', 'press Escape', `visit ${SESSION}`, 'fill', '__PRESSED__', `send ${SESSION}`,
+      expect(fake.st.events.slice(0, 10)).toEqual([
+        `visit ${SESSION}`, `visit ${HOME}`, 'pointer cap', 'pointer Free', 'press Escape', 'press Escape', `visit ${SESSION}`, 'fill', '__PRESSED__', `send ${SESSION}`,
       ]);
       expect(fake.st.events).not.toContain('js cap');
       expect(fake.st.events.filter(e => e.startsWith('send'))).toHaveLength(1);
@@ -1182,7 +1215,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const fake = fakeDevin({ seats: { used: 2, total: 2 } });
       const r = await fake.browse(devinSendScript(HOME, 'SCK-abc123', 'msg'));
       expect(r).toEqual({ ok: false, code: 'quota_full', seats: '2/2', cap: 'Free' });
-      expect(fake.st.events).toEqual([`visit ${HOME}`, 'pointer cap', 'pointer Free', 'press Escape']);
+      expect(fake.st.events).toEqual([`visit ${HOME}`, 'pointer cap', 'pointer Free', 'press Escape', 'press Escape']);
       expect(fake.st.sent).toHaveLength(0);
     });
 
@@ -1225,11 +1258,11 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
   });
 
   describe('首页选中 Free：指针点击、有界等待与回读（假页面区分指针点击与程序化点击）', () => {
-    const PICK = ['pointer cap', 'pointer Free', 'press Escape'];
-    /** 选 Free 的三步在事件里的位置：指针打开 Capability、指针点 Free、Escape 收起。 */
+    /** 选 Free 的步骤：指针打开 Capability、指针点 Free、两次 Escape 逐层收起（真实页面是两层）。 */
+    const PICK = ['pointer cap', 'pointer Free', 'press Escape', 'press Escape'];
     const pickOf = (events: string[]) => {
       const at = events.indexOf('pointer cap');
-      return at < 0 ? [] : events.slice(at, at + 3);
+      return at < 0 ? [] : events.slice(at, at + PICK.length);
     };
 
     test('新会话：指针打开 Capability、指针点 Free、回读后 Escape 收起，再填写与发送；没有程序化点击', async () => {
@@ -1238,7 +1271,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
       expect(out.status).toBe('success');
       expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
-      expect(fake.st.events.slice(0, 7)).toEqual([`visit ${HOME}`, ...PICK, 'fill', '__PRESSED__', `send ${NEW_SESSION}`]);
+      expect(fake.st.events.slice(0, 8)).toEqual([`visit ${HOME}`, ...PICK, 'fill', '__PRESSED__', `send ${NEW_SESSION}`]);
       expect(fake.st.events.filter(e => e.startsWith('js'))).toEqual([]);
       expect(fake.st.sent).toHaveLength(1);
     });
@@ -1271,7 +1304,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const fake = fakeDevin({ capLagMs: 1500, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
       const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
       expect(out.status).toBe('success');
-      expect(fake.st.events.slice(0, 7)).toEqual([`visit ${HOME}`, ...PICK, 'fill', '__PRESSED__', `send ${NEW_SESSION}`]);
+      expect(fake.st.events.slice(0, 8)).toEqual([`visit ${HOME}`, ...PICK, 'fill', '__PRESSED__', `send ${NEW_SESSION}`]);
     });
 
     test('点 Free 后档位一直不变（回读超时）：零发送，受阻', async () => {
@@ -1324,15 +1357,65 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(fake.st.sent).toHaveLength(0);
     });
 
-    test('Escape 收不起菜单（仍挡着输入区）：不填写、不发送，受阻', async () => {
+    test('Escape 一直收不起菜单（两层都挡着输入区）：按有界次数后受阻，不填写、不发送', async () => {
       const w = world({ extra: gitOk });
       const fake = fakeDevin({ escapeInert: true, seats: { used: 0, total: 2 } });
       const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
       expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
       expect(out.text).toContain('按 Escape 后仍挡着页面');
-      expect(fake.st.events).toContain('press Escape');
+      // 驱动层会整段重试；每次重试都从首页重新开始，单次尝试里的 Escape 次数都必须有界。
+      const perAttempt: number[] = [];
+      for (const e of fake.st.events) {
+        if (e === `visit ${HOME}`) perAttempt.push(0);
+        else if (e === 'press Escape' && perAttempt.length > 0) perAttempt[perAttempt.length - 1]!++;
+      }
+      expect(perAttempt.length).toBeGreaterThan(0);
+      expect(perAttempt.every(n => n > 0 && n <= 4)).toBe(true);
       expect(fake.st.events).not.toContain('fill');
+      expect(fake.st.events).not.toContain('__PRESSED__');
       expect(fake.st.sent).toHaveLength(0);
+    });
+
+    test('选中 Free 后菜单是两层：第一次 Escape 只收 Free 详情、列表仍开；第二次收起列表后才填写并发送（修前单次 Escape 会误拦发送）', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.status).toBe('success');
+      expect(fake.st.escLog).toEqual([1, 0]);
+      expect(pickOf(fake.st.events)).toEqual(PICK);
+      expect(fake.st.events.indexOf('fill')).toBeGreaterThan(fake.st.events.lastIndexOf('press Escape'));
+      expect(fake.st.sent).toHaveLength(1);
+    });
+
+    test('菜单只有一层：一次 Escape 就全部收起，收起后即停，不再多按', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ singleLayer: true, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.status).toBe('success');
+      expect(fake.st.escLog).toEqual([0]);
+      expect(fake.st.events.slice(fake.st.events.indexOf('pointer cap'), fake.st.events.indexOf('fill')))
+        .toEqual(['pointer cap', 'pointer Free', 'press Escape']);
+      expect(fake.st.sent).toHaveLength(1);
+    });
+
+    test('Escape 生效慢一拍（DOM 500ms 后才更新）：等它变化再决定，菜单还在时不重复按', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ escapeLagMs: 500, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.status).toBe('success');
+      expect(fake.st.escLog).toEqual([1, 0]);
+      expect(pickOf(fake.st.events)).toEqual(PICK);
+      expect(fake.st.sent).toHaveLength(1);
+    });
+
+    test('Free 项是 role=menuitem 的链接（真实页面的菜单项角色，标签不是 button）：照样认出、指针点中、回读并发送', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ menuItemRows: true, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.status).toBe('success');
+      expect(pickOf(fake.st.events)).toEqual(PICK);
+      expect(fake.st.events.filter(e => e.startsWith('js'))).toEqual([]);
+      expect(fake.st.sent).toHaveLength(1);
     });
 
     test('指针点 Capability 也打不开菜单：不点 Free、不改用程序化点击、零发送，受阻', async () => {

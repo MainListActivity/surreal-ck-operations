@@ -1,19 +1,20 @@
 /**
  * Devin Cloud 网页入口的页面脚本（ego-browser nodejs）与文本解析。
- * DOM 契约按 2026-11-16 只读实测：
- * - 首页/会话页的输入框都是 div[role=textbox][aria-label="Prompt"]，发送是 button[aria-label="Send"]。
+ * DOM 契约：
+ * - 首页/会话页的输入框都是 div[role=textbox][aria-label="Prompt"]，发送是 button[aria-label="Send"]（2026-11-16 只读实测）。
  * - Capability 触发按钮：菜单外、innerText 正好是 Fusion/Ultra/Normal/Lite/Free 之一的 button；
- *   弹出层是 [role=menu]，里面 "Capability" 分组下有同名行；选中 Free 后页面出现
- *   "Free (powered by SWE-2)"、"The plan includes 2 concurrent sessions"、"N/M in use"。
- * - 首页选 Free 用 ego-browser 真实指针点击（page.click，按本次页面里打的 data-sck-* 标记定位）。页面内 element.click()
- *   只派发 click 事件，不走指针按下/抬起，不能当作用户点击。2026-11-17 正式派工的失败签名（按钮停在 Normal、
- *   powered=false，Free 行从未被选中）与此一致。仓库里没有该页面的实时 DOM 快照，菜单结构仍按 2026-11-16 只读实测；
- *   本次改的是点击方式，并增加有界等待、唯一性核对、回读与收起。
+ *   弹出层是 [role=menu]，里面 "Capability" 分组下有同名行（2026-11-16 只读实测）。
+ * - 选中 Free 后菜单是两层（2026-11-17 负责人真实页面实测）：第一层 Capability 列表仍开；第二层 Free 详情里有
+ *   "Free (powered by SWE-2)"、"The plan includes 2 concurrent sessions"、"N/M in use"。Free 项是 role=menuitem。
+ *   第一次 Escape 只收详情，列表仍在；第二次才收起列表。
+ * - 首页选 Free 用 ego-browser 真实指针点击（page.click，按本次页面里打的 data-sck-* 标记定位）；真实指针选中 Free
+ *   已由负责人 2026-11-17 实测确认。推断（未在页面上单独验证）：页内 element.click() 只派发 click 事件、不走指针
+ *   按下/抬起，不能当作用户点击；2026-11-17 正式派工的失败签名（按钮停在 Normal、powered=false，Free 行从未被选中）与此一致。
  *   流程（新会话与续轮共用 pickFree）：指针点 Capability（只点唯一的档位名按钮）→ 有界等待可见的 [role=menu]
- *   里恰好一个精确的 Free 行 → 指针点它 → 菜单仍打开时有界回读 Free、powered、N/M in use → Escape 收起并确认收起。
- *   任何一步不成立都不发送。
- * - 席位文字只在首页 Capability 菜单打开、选中 Free 时出现（按 Escape 后消失），所以必须在点选 Free 之后、菜单仍打开时回读。
- *   会话页的 Capability 按钮是 disabled，菜单打不开，读不到席位，续轮因此先到组织首页读席位，再回原会话发送。
+ *   里恰好一个精确的 Free 行 → 指针点它 → 菜单仍打开时有界回读 Free、powered、N/M in use → 逐层 Escape，
+ *   直到可见菜单为 0（最多 4 次，不盲多按）。任何一步不成立都不发送。
+ * - 席位文字只在首页 Capability 菜单打开、选中 Free 时出现（收起 Free 详情后消失），所以必须在点选 Free 之后、
+ *   菜单仍打开时回读。会话页的 Capability 按钮是 disabled，菜单打不开，读不到席位，续轮因此先到组织首页读席位，再回原会话发送。
  * - 会话地址 https://app.devin.ai/sessions/<32hex>；侧栏 a[href^="/sessions/"] 列出会话。
  * - 会话页转录的发言角色按 2026-11-16 真实只读实测：Devin 回答块是
  *   [data-testid="transcript-agent-message"]，文字在 [data-message-author="devin"]；
@@ -40,17 +41,23 @@ const SEND = 'button[aria-label="Send"]';
 export const PRESSED = '__PRESSED__';
 /** Capability 档位名：触发按钮与菜单行都按精确文本匹配。 */
 const CAPS = ['Fusion', 'Ultra', 'Normal', 'Lite', 'Free'];
+/** 选中 Free 后逐层 Escape 的上限：真实页面两层只需两次，多留余量；仍收不起就受阻、零发送。 */
+const FREE_ESC_MAX = 4;
+/** 页面内表达式用的可见性判断：有尺寸且未 hidden。 */
+const SHOWN_JS = `(e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; }`;
 /**
  * 页面内表达式：可见的 Capability 菜单里文字恰好是 Free 的行。嵌套时只留最内层，同一行不数两次；
  * 只有恰好一行才算可点。页面内只用 DOM 只读，点击在 Node 侧用 page.click 完成。
  */
 const FREE_ROWS_JS = `(() => {
-  const shown = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; };
+  const shown = ${SHOWN_JS};
   const rows = [...document.querySelectorAll('[role=menu]')].filter(shown)
-    .flatMap(m => [...m.querySelectorAll('div,button,[role=menuitemradio],[role=option]')])
+    .flatMap(m => [...m.querySelectorAll('div,button,[role=menuitem],[role=menuitemradio],[role=option]')])
     .filter(e => (e.innerText || '').trim() === 'Free');
   return rows.filter(e => !rows.some(o => o !== e && e.contains(o)));
 })()`;
+/** 页面内表达式：当前可见的 [role=menu] 个数。两层菜单要逐层收起，数到 0 才算收起。 */
+const MENUS_JS = `[...document.querySelectorAll('[role=menu]')].filter(${SHOWN_JS}).length`;
 
 export interface DevinSeats { used: number; total: number }
 /** "The plan includes 2 concurrent sessions / 1/2 in use" 这类席位文字 → 用量。 */
@@ -129,7 +136,6 @@ const read = () => p.evaluate(() => {
       || (!document.querySelector(${JSON.stringify(INPUT)}) && /\\b(Log in|Sign in|Sign up|Get started)\\b/i.test(body.slice(0, 2500))),
     cap: capButton ? (capButton.innerText || '').trim() : null,
     powered: /powered by SWE-2/i.test(body),
-    freeMenu: ${FREE_ROWS_JS}.length > 0,
     seats: seats.length === 2 ? { used: seats[0], total: seats[1] } : null,
     // 没有作者块就无法可靠区分谁说了什么：标记可见性照报，但终稿保持 null，绝不拿整段 main 文本冒充助手回答。
     source: blocks.length ? 'roles' : 'text-only',
@@ -187,8 +193,8 @@ const sessionGate = (x) => {
 
 /**
  * 组织首页选中 Free 并回读（新会话与续轮共用）。顺序：指针点 Capability（只点唯一的档位名按钮）→ 有界等待可见菜单里
- * 恰好一个 Free 行 → 指针点它 → 菜单仍打开时有界回读（席位文字只在此时出现）→ Escape 收起并确认收起。
- * 结果写进 s：picked 表示点到了 Free 行，menuStuck 表示收不起菜单，pickWhy 写没点到的原因。门禁据此决定发不发。
+ * 恰好一个 Free 行 → 指针点它 → 菜单仍打开时有界回读（席位文字只在此时出现）→ 逐层 Escape 直到可见菜单为 0。
+ * 结果写进 s：picked 表示点到了 Free 行，menuStuck 表示有界次数后仍有菜单挡着，pickWhy 写没点到的原因。门禁据此决定发不发。
  */
 const PICK_FREE = `
 const markCap = () => p.evaluate(() => {
@@ -203,6 +209,7 @@ const markFree = () => p.evaluate(() => {
   if (rows.length === 1) rows[0].setAttribute('data-sck-free-row', '1');
   return rows.length;
 });
+const menuCount = () => p.evaluate(() => ${MENUS_JS});
 const pickFree = async () => {
   const caps = await markCap();
   let rows = 0;
@@ -220,10 +227,18 @@ const pickFree = async () => {
   } else s = await read();
   s.picked = rows === 1;
   if (caps === 1) {
-    await p.keyboard.press('Escape');
-    let open = true;
-    for (let i = 0; i < 6 && open; i++) { await p.waitForTimeout(300); open = (await read()).freeMenu; }
-    s.menuStuck = open;
+    // 选中 Free 后是两层：第一次 Escape 只收详情，第二次才收列表。只在可见菜单仍在时按一次，按完等 DOM 更新
+    // （菜单数变了或超时）再数；数到 0 即停，不盲多按。有界次数后仍有菜单挡着，判为收不起。
+    let open = await menuCount();
+    for (let i = 0; i < ${FREE_ESC_MAX} && open > 0; i++) {
+      await p.keyboard.press('Escape');
+      for (let j = 0; j < 6; j++) {
+        await p.waitForTimeout(300);
+        const now = await menuCount();
+        if (now !== open) { open = now; break; }
+      }
+    }
+    s.menuStuck = open > 0;
   }
   s.pickWhy = caps !== 1 ? (caps === 0 ? '页面上找不到唯一的 Capability 按钮' : '页面上有 ' + caps + ' 个档位名按钮，无法确定哪个是 Capability')
     : rows === 0 ? '点开 Capability 后菜单里没有可见的 Free 行'
