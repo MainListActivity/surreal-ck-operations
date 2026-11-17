@@ -367,6 +367,10 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     menuItemRows?: boolean;
     /** 点 Free 后档位与席位晚这么多毫秒才显示（虚拟时钟，由 waitForTimeout 推进）。 */
     capLagMs?: number;
+    /** 选中 Free 后详情里没有 "powered by SWE-2"（档位是 Free，但没有 SWE-2 的 powered 文字）。 */
+    noPowered?: boolean;
+    /** 选中 Free 后详情里没有席位计数 "N/M in use"（读不到席位）。 */
+    noSeats?: boolean;
     onVisit?: (url: string, sessions: Record<string, FakeSession>) => void;
     onSend?: (url: string, text: string, sessions: Record<string, FakeSession>) => void;
   }
@@ -462,7 +466,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     /** 当前可见的菜单层数（列表 + 详情），即 DOM 里可见 [role=menu] 的个数。 */
     const visibleMenus = () => (menuShown() ? 1 : 0) + (detailShown() ? 1 : 0);
     const selectFree = () => { st.capBefore = capShown(); st.cap = 'Free'; st.capAt = st.clock + (opts.capLagMs ?? 0); st.detailOpen = true; };
-    const detailText = () => `Free (powered by SWE-2)\nThe plan includes ${seats.total} concurrent sessions\n${seats.used}/${seats.total} in use`;
+    const detailText = () => [opts.noPowered ? 'Free' : 'Free (powered by SWE-2)', `The plan includes ${seats.total} concurrent sessions`,
+      ...(opts.noSeats ? [] : [`${seats.used}/${seats.total} in use`])].join('\n');
     const bodyText = (): string => isSession(st.url)
       ? [...current().blocks.map(b => b.text), current().status].join('\n')
       : ['Organization', detailShown() ? detailText() : ''].filter(Boolean).join('\n');
@@ -1428,6 +1433,48 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(fake.st.events.filter(e => e.startsWith('js'))).toEqual([]);
       expect(fake.st.events).not.toContain('fill');
       expect(fake.st.sent).toHaveLength(0);
+    });
+
+    test('新会话：选中 Free 但详情没有 powered by SWE-2（不是 SWE-2 Free）→ 零填写零发送，受阻', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ noPowered: true, seats: { used: 0, total: 2 } });
+      const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1, maxMinutes: 1 } }),
+        { ...w.deps, browse: advancing(w, fake.browse) });
+      expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out.text).toContain('powered=false');
+      expect(fake.st.events).toContain('pointer Free');
+      expect(fake.st.events).not.toContain('fill');
+      expect(fake.st.events).not.toContain('__PRESSED__');
+      expect(fake.st.sent).toHaveLength(0);
+    });
+
+    test('新会话：选中 Free、powered 都有，但读不到席位计数 → 零填写零发送，受阻', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ noSeats: true, seats: { used: 0, total: 2 } });
+      const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1, maxMinutes: 1 } }),
+        { ...w.deps, browse: advancing(w, fake.browse) });
+      expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out.text).toContain('读不到 Free 席位计数');
+      expect(fake.st.events).not.toContain('fill');
+      expect(fake.st.events).not.toContain('__PRESSED__');
+      expect(fake.st.sent).toHaveLength(0);
+    });
+
+    test('续轮：首页选中 Free 后 powered 或席位读不到 → 不填写、不发送，受阻', async () => {
+      for (const [flag, why] of [[{ noPowered: true }, 'powered=false'], [{ noSeats: true }, '读不到 Free 席位计数']] as const) {
+        const w = world({ extra: gitOk });
+        writeLaneState(w.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
+        const fake = fakeDevin({ ...flag, seats: { used: 1, total: 2 }, sessions: { [SESSION]: OLD_ROUND } });
+        const out = await runLane(w.input({ provider: 'devin-cloud', prompt: '继续修复。', config: { pollMs: 1, maxMinutes: 1 } }),
+          { ...w.deps, browse: advancing(w, fake.browse) });
+        const home = fake.st.events.indexOf(`visit ${HOME}`);
+        expect(home).toBeGreaterThan(-1);
+        expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+        expect(out.text).toContain(why);
+        expect(fake.st.events.slice(home)).toContain('pointer Free');
+        expect(fake.st.events).not.toContain('fill');
+        expect(fake.st.sent).toHaveLength(0);
+      }
     });
   });
 
