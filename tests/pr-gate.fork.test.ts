@@ -12,6 +12,7 @@ import { SidecarPool } from '../src/runner/sidecar.ts';
 import { ExecutionJournal } from '../src/runner/lifecycle.ts';
 import { refuseEmployeeCiBlock } from '../src/github-ci-control.ts';
 import { referenceReport, referenceSentence } from './fixtures/ci-reference-report.ts';
+import { citationWordBypassBlockers, customerBillingWaits, existingGapBlockers } from './fixtures/ci-billing-boundary.ts';
 
 setDefaultTimeout(60000);
 // Isolated company fork on a private RocksDB store: no production data, credentials, dispatcher or GitHub.
@@ -214,4 +215,42 @@ run('执行端invalid block超过十次仍pending，同一请求恢复后真实C
     const row = await db.db.select<{ state: string }>(new RecordId('task', claimTask.id));
     expect(row?.state).toBe('ready');
   } finally { pool.close(); }
+});
+
+run('真实Core拒绝引文包裹、无标点与既有缺口中的当前CI计费状态：有无来源核验都不放行，拒绝前零副作用', async () => {
+  let sourceReads = 0, verified: { runUrl: string; sha: string } | undefined;
+  const guarded = new SurrealCompanyCore(db, { ciBillingCheck: async () => { sourceReads++; return verified; } });
+  for (const source of [{ runUrl: 'https://github.com/o/r/actions/runs/9', sha: 'a'.repeat(40) }, undefined]) {
+    verified = source;
+    for (const text of [...citationWordBypassBlockers, ...existingGapBlockers]) {
+      const claim = await guarded.claim(eng, (await make('engineering', { acceptanceCriteria: ciCriteria })).id);
+      const before = await guarded.getTask(gm, claim.task.id);
+      const history = await guarded.history(gm, claim.task.id);
+      const reads = sourceReads;
+      await expect(guarded.block(eng, proofOf(claim), 'owner', evidence(text)))
+        .rejects.toMatchObject({ code: 'invalid', details: { reason: 'github_ci_system_owned' } });
+      expect(sourceReads).toBe(reads + 1);
+      expect(await guarded.getTask(gm, claim.task.id)).toEqual(before);
+      expect(await guarded.history(gm, claim.task.id)).toEqual(history);
+      await guarded.release(eng, proofOf(claim), evidence('测试拒绝校验完成，释放隔离测试租约'));
+    }
+  }
+});
+
+run('CI已完成旁的客户账单付款等待是无关业务：真实Core正常受阻、重放幂等，且不读取CI来源', async () => {
+  let sourceReads = 0;
+  const guarded = new SurrealCompanyCore(db, { ciBillingCheck: async () => {
+    sourceReads++;
+    return { runUrl: 'https://github.com/o/r/actions/runs/9', sha: 'a'.repeat(40) };
+  } });
+  for (const text of customerBillingWaits) {
+    const claim = await guarded.claim(eng, (await make('engineering', { acceptanceCriteria: ciCriteria })).id);
+    const proof = proofOf(claim), ev = evidence(text);
+    const blocked = await guarded.block(eng, proof, 'owner', ev);
+    expect(blocked.state).toBe('blocked');
+    expect(await guarded.block(eng, proof, 'owner', ev)).toEqual(blocked);
+    expect((await guarded.history(gm, claim.task.id)).filter(h => h.action === 'block')).toHaveLength(1);
+    expect((await guarded.resume(gm, claim.task.id, evidence('客户账单已由测试owner确认，恢复正常工作'))).state).toBe('ready');
+  }
+  expect(sourceReads).toBe(0);
 });

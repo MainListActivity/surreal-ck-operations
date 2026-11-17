@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test';
 import { createSubmitCheck, extractPrUrls, judgePr, type PrInfo } from '../src/pr-gate.ts';
 import { assertEmployeeCiBlockAllowed, createCiBillingCheck, isCiBlockCause } from '../src/github-ci-control.ts';
 import { referenceReport, referenceSentence } from './fixtures/ci-reference-report.ts';
+import { citationWordBypassBlockers, customerBillingWaits, existingGapBlockers } from './fixtures/ci-billing-boundary.ts';
 
 test.each([referenceSentence, referenceReport])('研究旁证不是当前 CI 原因：%s', text => {
   expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
@@ -88,6 +89,76 @@ test('CI billing blockers are system-owned; ordinary invoices and real test fail
     expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
   }
   expect(() => assertEmployeeCiBlockAllowed('GitHub CI 已完成', '请老板批准客户账单')).not.toThrow();
+});
+
+// Citation wording and missing punctuation never move a current CI billing state out of the CI cause.
+test('引文词与无标点写法不能包住当前CI计费状态', () => {
+  for (const text of citationWordBypassBlockers) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+});
+
+// Sentence or semicolon breaks, completed-CI conjunctions and Actions minute quota are the same CI billing cause.
+test('既有缺口：句号、分号、并列与分钟额度不能切开CI与付款', () => {
+  for (const text of existingGapBlockers) {
+    expect(isCiBlockCause([text])).toBe(true);
+    expect(() => assertEmployeeCiBlockAllowed(text)).toThrow();
+  }
+});
+
+// A customer invoice beside a completed CI is an unrelated business wait, not a CI cause.
+test('CI已完成旁的客户账单付款等待不是CI原因', () => {
+  for (const text of customerBillingWaits) {
+    expect(() => assertEmployeeCiBlockAllowed(text)).not.toThrow();
+    expect(isCiBlockCause([text])).toBe(false);
+  }
+});
+
+const refused = (text: string): boolean => {
+  try { assertEmployeeCiBlockAllowed(text); return false; } catch { return true; }
+};
+
+// Deterministic sweep over CI billing wording. A current CI billing state refuses under every citation wrapper, joint
+// and tail; citation-only CI sentences and customer invoices beside a completed CI stay open.
+test('变体扫描：引文包裹的CI计费状态全部拒绝，纯引文与客户账单全部放行', () => {
+  const subjects = ['GitHub CI', 'GitHub Actions', 'CI', 'workflow'];
+  const wrappers = ['', '已核对计费页', '引文核对', '核对计费说明', '引用 billing 页面', '已抓取账单页', '摘自计费文档', '仅作旁证：'];
+  const joints = ['', ' ', '，', '。'];
+  const states = ['未付款逾期', '付款卡住了问题', '未付款', '账户问题', '欠费', '余额不足', '需老板付款', '额度耗尽',
+    '免费分钟用尽', 'spending limit 已达上限', '支付失败', '账单未付', 'billing issue', 'payment failed'];
+  const billingTails = ['', '，需老板处理', '，引文与报告一致', '，仅为旁证', '；引用仅为旁证', '。以上摘自计费文档',
+    '，未对任何 CI 作出豁免或成功判定'];
+  // A citation-only sentence keeps its marker beside the CI word; a bare CI word with no marker is a CI cause by design.
+  const citationTails = ['', '，引文与报告一致', '，仅为旁证', '，未对任何 CI 作出豁免或成功判定', '，仅供参考', '。以上摘自计费文档'];
+  const doneCi = ['GitHub CI 已完成，', 'GitHub CI 已通过；', 'GitHub PR 已完成，'];
+  const customerWaits = ['客户付款卡住，等待老板处理', '客户账单需老板付款', '当前等待老板确认客户账单', '客户欠费，需老板处理'];
+  const bypasses: string[] = [];
+  const falseRefusals: string[] = [];
+  let billingClaims = 0, citationOnly = 0;
+  for (const wrapper of wrappers) for (const subject of subjects) {
+    for (const joint of joints) for (const state of states) for (const tail of billingTails) {
+      const text = `${wrapper}${subject}${joint}${state}${tail}`;
+      billingClaims++;
+      if (!refused(text) || !isCiBlockCause([text])) bypasses.push(text);
+    }
+    for (const tail of citationTails) {
+      // Without a wrapper, the tail must stay in the CI word's sentence, so a bare CI word or a sentence break has no marker.
+      if (wrapper === '' && (tail === '' || tail.startsWith('。'))) continue;
+      const text = `${wrapper}${subject}${tail}`;
+      citationOnly++;
+      if (refused(text) || isCiBlockCause([text])) falseRefusals.push(text);
+    }
+  }
+  for (const opening of doneCi) for (const wait of customerWaits) {
+    const text = `${opening}${wait}`;
+    citationOnly++;
+    if (refused(text) || isCiBlockCause([text])) falseRefusals.push(text);
+  }
+  expect(billingClaims).toBeGreaterThan(10_000);
+  expect(citationOnly).toBeGreaterThan(150);
+  expect(bypasses).toEqual([]);
+  expect(falseRefusals).toEqual([]);
 });
 
 test('CI billing control reads PR/run sources even when the blocker omits all billing words', async () => {

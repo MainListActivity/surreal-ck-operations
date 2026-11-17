@@ -4,46 +4,59 @@ import { extractPrUrls, ghCli, type GhRunner } from './pr-gate.ts';
 import { git } from './company-release.ts';
 import { githubRepoSlug } from './external-actions.ts';
 
-const CI = /github|git\s*hub|\bCI\b|github-actions|actions\/runs\/|workflow/i;
-const BILLING = /billing|account payments?|payments?|spending[\s_-]*limit|unpaid|overdue|delinquent|账单|计费|付款|支付失败|支出上限|消费上限|账户问题|欠费|逾期|余额|充值|额度|缴费/i;
+// The CI word names the GitHub or Actions run that a clause is about. As a token, CI is matched case-sensitively so a
+// lowercase word run (CIbilling, ci_payment) still counts while a capitalised word (CIO, CIDS) does not.
+const CI = /github|git\s*hub|\bActions\b|github-actions|actions\/runs\/|workflow|工作流/i;
+const CI_TOKEN = /(?<![A-Za-z0-9])(?:CI(?![A-Z0-9])|ci(?![a-z0-9]))/;
+// Billing words are read from the whole clause, citation objects included. A billing word beside a CI word is
+// never an employee's block reason; only a pure citation, or a customer's invoice without a CI word, escapes.
+const BILLING = /billing|account payments?|payments?|not\s+paid|spend(?:ing)?[\s_-]*limit|insufficient\s+(?:funds|balance)|unpaid|overdue|delinquent|账单|计费|付款|支付|未付|欠款|欠费|逾期|余额|充值|额度|缴费|免费分钟|购买分钟|分钟[^，,。；;]{0,4}(?:用尽|用完|用光|耗尽|不足|配额|额度)|minutes?\s*(?:quota|exhausted|used up|ran out|run out)|账户问题|支出上限|消费上限/i;
 // Acts and handles that mark fetched or quoted material. They only qualify a segment for the citation
 // exemption; they never by themselves remove content from the verdict.
 const CITATION = /抓取|引文|引述|引用|旁证|核对|核查|摘自|摘录|节选|仅作|仅供|详见|参阅|查阅|豁免|判定|认定|结论|fetch(?:ed)?|cit(?:e|ed|ation)|quot(?:e|ed|ation)|referenc(?:e|ed)|self-serve|\.md\b|release\s*页|文档内容|页面内容|资料内容|页内容/i;
 const CITATION_STRIP = new RegExp(CITATION.source, 'gi');
-// Negated mentions and purely evidentiary phrases assert no current state. Paid-word negations come
-// first so a bare 未付/逾期 stays affirmative.
-const NON_CLAIM = /(?:无需|不需要|不要求|不用)[\u4e00-\u9fff]{0,4}(?:付款|支付|缴费|充值|提高[\u4e00-\u9fff]{0,4}上限)|(?:无法|不能|不可|难以|不足以|未)作为|仅(?:作|为|供)[\u4e00-\u9fff]{0,6}旁证|仅供.{0,4}参考|引文与报告一致|作出[^，,]{0,8}(?:豁免|判定|认定|结论)|(?:未|无|没有|没|不|并未|并无|未曾|从未|不含|未见|不曾)[^，,]{0,8}(?:失败|阻塞|受阻|停滞|异常|错误|问题|逾期|欠费|故障|障碍|豁免|判定|认定|结论)/g;
-// Document and source names allowed inside a citation segment: file paths, URLs, doc nouns and the
-// platform names being cited. Account and payment words are absent on purpose — they carry claims.
+// Fixed disclaimers about the cited material. Each phrase is closed, so a payment or overdue state written beside
+// a citation always survives the strip. Negated obstruction words are limited to failure and blocked wording about
+// the material; a negated payment or overdue state (未付款逾期) is a claim and is never removed.
+const CITATION_DISCLAIMER = /(?:无法|不能|不可|难以|不足以|未)作为|引文与报告一致|(?:未|不)(?:对|申请|请求|获得)?(?:任何|该|本|其)?\s*(?:CI|GitHub\s*CI|GitHub|Actions|workflow)?\s*(?:作出|申请|请求|获得)?(?:任何)?(?:豁免|判定|认定|结论)(?:或(?:成功)?(?:判定|豁免))?|仅(?:作为|作|为|供)(?:研究)?(?:旁证|参考)|(?:未|无|没有|没|不|并未|并无|未见|未发现|未曾|从未|不曾)(?:发现|见|显示|出现)?(?:任何)?(?:失败|阻塞|受阻|异常|错误|问题|故障|障碍)/gi;
+// Document and source names allowed inside a citation: file paths, URLs, doc nouns and the platform names being
+// cited. Bare account and payment words are absent on purpose: they carry claims. A document name that contains
+// one (计费页) stands only for that document.
 const OBJECTS = /https?:\/\/\S+|[\w./~@-]+\.(?:md|markdown|txt|log|json|sha256|csv|ya?ml|html?|pdf|ts|js)|支出上限说明|消费上限说明|官方文档|文档内容|页面内容|资料内容|页内容|判定依据|计费页面|计费文档|计费说明|计费页|账单文档|账单页|模型页|说明页|release\s*页|文档|页面|网页|资料|内容|说明|报告|正文|副本|出处|来源|链接|地址|官网|手册|指南|页|github-actions|github|git\s*hub|actions|workflow|devin|release|billing|self-serve|page|docs?|document|report|source|url|link|citation|quote|evidence|annotation|(?<![a-z0-9])ci(?![a-z0-9])|(?<![a-z0-9])cli(?![a-z0-9])/gi;
 // Function words that carry no claim on their own; state verbs and request verbs are never filler.
 const FILLER = /本轮|本次|目前|当前|现在|此前|之前|之后|随后|一致|无误|如下|如上|以上|以下|其中|确认|核实|重新|再次|等等|以及|已经|曾经|尚未|依然|仍然|进行|作出|做出|得到|获得|the|a|an|of|to|in|on|for|and|or|is|are|was|were|be|been|with|by|from|as|at|it|its|this|that|these|those|after|before|during|per|via|against|according|only|just|also|same|consistent|matches?|performed|checked|verified|reviewed|[已未无没不对向为作与和及或并将了的地得后前中内里上下间时仍尚再又也都仅只就才该本其此各某任何所有等则且而但然因由从到于把被让使按照依据随]/gi;
-/** A segment is a pure citation when citation markers are present and nothing survives the whitelist. */
+/** A sentence or clause is a pure citation when a citation marker is present and nothing survives the whitelist. */
 const pureCitation = (text: string): boolean => {
   if (!CITATION.test(text)) return false;
-  const residual = text.replace(NON_CLAIM, '').replace(OBJECTS, '').replace(CITATION_STRIP, '').replace(FILLER, '');
+  const residual = text.replace(CITATION_DISCLAIMER, '').replace(OBJECTS, '').replace(CITATION_STRIP, '').replace(FILLER, '');
   return residual.replace(/[\s\p{P}\p{S}]/gu, '').length === 0;
 };
+const unstarted = /(?:检查|作业).{0,30}(?:未启动|没有启动|未执行|没有执行|未通过|没有通过)/;
+const COMPLETED = /已(?:由系统)?(?:完成|通过|豁免|记录|判定)|already (?:passed|completed|waived)/i;
+// States that keep a CI item from being complete: stuck, exhausted, unpaid, waiting on payment, blocked.
+const REVIVAL = /仍.{0,10}(?:失败|阻塞|受阻)|(?:未|没有|没|尚未)(?:通过|启动|执行|运行|解决|恢复|付|付款|支付|结清)|需[\u4e00-\u9fff]{0,6}(?:付款|支付|充值|缴费)|请[\u4e00-\u9fff]{0,6}付款|要求[\u4e00-\u9fff]{0,4}付款|卡住|耗尽|余额不足|不足|(?:已|仍)(?:逾期|欠费)|已达上限|达到上限|超出上限|超过上限|\b(?:blocked|pending|unpaid|overdue|delinquent|still failing|stuck|on\s+hold)\b/i;
+// A customer's own invoice or payment wait is business, not a CI cause, when its clause names no CI.
+const CUSTOMER = /客户|customer/i;
+const ciWord = (text: string): boolean => CI.test(text) || CI_TOKEN.test(text) || unstarted.test(text);
+/**
+ * The clauses that state a current CI cause. Sentences split at newlines and 。；; clauses split at ，,：:
+ * - a pure-citation sentence or clause states nothing, but its CI word still counts as the field's CI context;
+ * - a clause with a CI word is a cause unless it only says CI is completed (the exemption never spans clauses);
+ * - a clause without a CI word is a cause when it carries a billing or stuck state and the field names CI somewhere,
+ *   so a sentence break or comma cannot split a CI payment state from its CI, while a customer's wait stays business.
+ */
 function ciCauseClauses(fields: Array<string | undefined>): string[] {
-  return fields.filter(field => typeof field === 'string').flatMap(field => field!.split(/[\n;；。]/)).filter(text => {
-    const segments = text.split(/[,，：:]/);
-    const unstarted = /(?:检查|作业).{0,30}(?:未启动|没有启动|未执行|没有执行|未通过|没有通过)/;
-    // Keep terse billing labels conservative for callers that supply a title rather than a sentence.
-    const billingLabel = /^\s*(?:GitHub(?:\s+Actions|\s+CI)?|CI|workflow)\s*[:：-]?\s*(?:Billing(?:\s*&\s*plans)?|billing|spending[\s_-]*limit|支出上限|消费上限|账单|计费)(?:页|页面|文档|说明|page|doc)?\s*$/i;
-    const ci = (seg: string) => CI.test(seg) || unstarted.test(seg) || billingLabel.test(seg);
-    if (!segments.some(ci)) return false;
-    // The exemption is a whitelist on content, not a word list: every segment must be a pure citation
-    // or carry neither CI nor billing material. Citation phrasing around a state claim still fails —
-    // the claim survives the strip and keeps the segment, and so does a billing request beside CI.
-    const current = segments.filter(seg => {
-      if (billingLabel.test(seg)) return true;
-      if (pureCitation(seg)) return false;
-      return ci(seg) || BILLING.test(seg);
-    });
-    if (current.length === 0) return false;
-    const completed = /已(?:由系统)?(?:完成|通过|豁免|记录|判定)|already (?:passed|completed|waived)/i.test(text);
-    return !completed || segments.some(seg => unstarted.test(seg)) ||
-      /仍.{0,10}(?:失败|阻塞|受阻)|(?:未|没有|没|尚未)(?:通过|启动|执行|运行|解决|恢复|付|付款|支付|结清)|需[\u4e00-\u9fff]{0,6}(?:付款|支付|充值|缴费)|请[\u4e00-\u9fff]{0,6}付款|要求[\u4e00-\u9fff]{0,4}付款|卡住|耗尽|余额不足|不足|(?:已|仍)(?:逾期|欠费)|已达上限|达到上限|超出上限|超过上限|\b(?:blocked|pending|unpaid|overdue|delinquent|still failing|stuck|on\s+hold)\b/i.test(text);
+  return fields.filter((field): field is string => typeof field === 'string').flatMap(field => {
+    const fieldHasCi = ciWord(field);
+    return field.split(/[\n;；。]/).filter(sentence => !pureCitation(sentence)).flatMap(sentence =>
+      sentence.split(/[,，：:]/).filter(clause => {
+        if (!clause.trim() || pureCitation(clause)) return false;
+        if (ciWord(clause)) {
+          const completedOnly = COMPLETED.test(clause) && !BILLING.test(clause) && !REVIVAL.test(clause) && !unstarted.test(clause);
+          return !completedOnly;
+        }
+        return fieldHasCi && !CUSTOMER.test(clause) && (BILLING.test(clause) || REVIVAL.test(clause));
+      }));
   });
 }
 /** Only the current CI cause triggers adjudication, not a completed CI item beside an unrelated business wait. */
