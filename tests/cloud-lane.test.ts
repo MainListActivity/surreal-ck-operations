@@ -1784,7 +1784,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(sendLikeCalls).toHaveLength(0);
     });
 
-    test('已受理后转录很长，本轮用户锚点是最新内容、不在顶部：滚到顶的恢复只会露出更早的轮次，找不到本轮锚点时不误判已受理，有界重试耗尽后保持受阻并保留会话地址（需求 2：真实采样只证实过"本轮是会话第一轮、锚点在顶部"这一种虚拟化形态，这里补上结构上必然存在、但未经真实采样的续轮形态——本轮锚点是转录里最新内容，物理上在底部，滚到顶只会远离它，不会找到它）', async () => {
+    test('已受理后转录很长，本轮用户锚点要滚到中段检查点才挂载：有界多检查点遍历命中中段、零重发取回终稿（需求 2 的合成正例——顶部挂载的是更早轮次、自然位置只有本轮 Devin 回复没有用户块，与下面"一直找不到"反例同构；只有算出来的那个中段检查点才挂载本轮用户锚点，证明多检查点遍历真的会系统地试到中段并在那里命中，不是只有顶部命中才算数。真实 DOM 从未采样过中段命中，这里用标明为合成的夹具证明算法本身确有这个能力，不是文档空话）', async () => {
       const w1 = world({ task, extra: gitOk });
       writeLaneState(w1.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
       const a = (async (script: string) => {
@@ -1794,12 +1794,92 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       await runLane(w1.input({ provider: 'devin-cloud', prompt: FOLLOW }), { ...w1.deps, browse: a });
       expect(readInflight(w1.stateRoot, 'devin-cloud', digestOf(w1, FOLLOW))?.taskUrl).toBe(SESSION);
 
-      // devin-web.ts 头部注释的已知限制：有界恢复只把容器滚到绝对顶部一次，只找得到「滚到顶就会挂载」的锚点。
-      // 这里构造的是文档里点名的反例：本轮是第 N 轮续轮，本轮用户消息是转录里最新内容，自然位置停在更早的
-      // 第二轮（不是本轮），滚到顶只会露出更早的第一轮（更不是本轮）——两次 collect() 都找不到本轮标记，
-      // 不是"滚一次就找到"的已证实事故形态。断言的是安全兜底：不静默、不误判已受理、不重发，受阻文本保留
-      // 会话地址，与 devin.ts 里已有的"转录里一直看不到本轮标记"驱动层测试（纯状态 mock）同一结论，这里
-      // 走的是真实 devin-web.ts 生成脚本在假页面里执行的那条路径，不是另一套纯状态 mock。
+      type Blk = { author: 'user' | 'devin' | 'tool'; text: string };
+      const DONE_TEXT = '完成。\nPR: https://github.com/acme/widget/pull/42\nSHA: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+      const sendLikeCalls: string[] = [];
+      // 和 devin-web.ts 的 SCROLL_RECOVER_POINTS=5 公式算同一个中段检查点的 scrollTop 值：0、
+      // maxTop/4、maxTop*2/4（中段，即这里要命中的那个）、maxTop*3/4、maxTop。写死在测试里而不是导入
+      // 实现常量——这正是要白盒验证"算法确实会滚到这个具体位置"；公式一旦改了检查点间距，这里会因为
+      // 再也滚不到 MID_TOP 而失败，不会假装通过。
+      const SCROLL_HEIGHT = 2107, CLIENT_HEIGHT = 713, POINTS = 5;
+      const MAX_TOP = SCROLL_HEIGHT - CLIENT_HEIGHT;
+      const MID_TOP = Math.round((MAX_TOP * 2) / (POINTS - 1));
+      const b2 = (async (script: string) => {
+        if (script.includes(MODE('send')) || script.includes(MODE('follow')) || script.includes(MODE('recover'))) {
+          sendLikeCalls.push(script);
+          throw new Error('不该走到这里：已受理会话续接不应该再发送/再找新会话');
+        }
+        const marker = /\[SCK-ROUND (SCK-[0-9a-f]+)\]/.exec(script)?.[1] ?? 'SCK-none';
+        const round1User: Blk = { author: 'user', text: '[SCK-ROUND SCK-old111]\n\n第一轮\n\n收尾约定：「[SCK-DONE SCK-old111]」。' };
+        const round1Devin: Blk = { author: 'devin', text: '[SCK-DONE SCK-old111]\n第一轮完成。' };
+        const myUser: Blk = { author: 'user', text: `[SCK-ROUND ${marker}]\n\n本轮\n\n收尾约定：本轮的最后一条答复以「[SCK-DONE ${marker}]」单独成行开头，随后是完整最终答复。` };
+        const myDevin: Blk = { author: 'devin', text: `[SCK-DONE ${marker}]\n${DONE_TEXT}` };
+        // 自然（常驻）位置只挂载本轮 Devin 回复、没有用户块——与"15eaf1b8 真实事故"同一种虚拟化缺口
+        // （真实采样证实过的那种形态），只是这里嵌在更长的转录里；绝对顶部挂载的是更早的第一轮（不是
+        // 本轮）；只有 MID_TOP 这一个中段检查点才挂载本轮用户块。
+        const bucketAt = (top: number): Blk[] => (top === 0 ? [round1User, round1Devin]
+          : top === MID_TOP ? [myUser, myDevin]
+          : [myDevin]);
+        const scroller = { scrollHeight: SCROLL_HEIGHT, clientHeight: CLIENT_HEIGHT, _top: MAX_TOP,
+          get scrollTop() { return this._top; }, set scrollTop(v: number) { this._top = v; } };
+        const current = () => bucketAt(scroller.scrollTop);
+        // 状态短语只挂在自然/常驻快照上（与"本轮用户消息被虚拟化滚出 DOM"描述块同一约定）：恢复阶段任何
+        // 检查点临时滚动的快照都不带它，判定不会错误地借用它们。
+        const text = () => [...current().map(b => b.text), ...(scroller.scrollTop === MAX_TOP ? ['Devin is awaiting instructions'] : [])].join('\n');
+        const mkEl = (b: Blk) => ({ getAttribute: (n: string) => (n === 'data-message-author' ? b.author : null), innerText: b.text, parentElement: scroller });
+        const doc = {
+          documentElement: {},
+          get body() { return { innerText: text() }; },
+          querySelector: (sel: string) => (sel === 'main' ? { innerText: text() }
+            : sel === '[data-sck-cap-trigger]' ? null
+            : sel === '[data-message-author]' ? (current().filter(x => x.author !== 'tool').map(mkEl)[0] ?? null)
+            : {}),
+          querySelectorAll: (sel: string) => (sel === '[data-message-author]' ? current().filter(x => x.author !== 'tool').map(mkEl) : sel === '[role=menu]' ? [] : [{ innerText: 'Free' }]),
+        };
+        const page = {
+          goto: async () => {}, waitForTimeout: async () => {},
+          evaluate: async (fn: (arg?: unknown) => unknown, arg?: unknown) => {
+            g.document = doc; g.location = { href: SESSION, hostname: 'app.devin.ai' };
+            return fn(arg);
+          },
+        };
+        let result: Record<string, unknown> | undefined;
+        const fakeConsole = { log: (line: string) => { if (line.startsWith('__RESULT__')) result = JSON.parse(line.slice('__RESULT__'.length)); } };
+        const run = new Function('taskSpace', 'console', 'process', `return (async () => {${script}})()`);
+        try {
+          await run(async () => ({ pages: async () => [page] }), fakeConsole, { exit() { throw new Error('unexpected exit'); } });
+        } catch (error) {
+          if (result === undefined) throw error;
+        } finally {
+          delete g.document; delete g.location;
+        }
+        return result;
+      }) as NonNullable<LaneDeps['browse']>;
+
+      const w2 = world({ task, extra: gitOk });
+      const out2 = await runLane(w2.input({ provider: 'devin-cloud', prompt: FOLLOW, stateRoot: w1.stateRoot }), { ...w2.deps, browse: b2 });
+      expect(out2.status).toBe('success');
+      expect(out2.text).toContain('PR: https://github.com/acme/widget/pull/42');
+      expect(out2.text).toContain('SHA: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef');
+      expect(sendLikeCalls).toHaveLength(0);
+    });
+
+    test('已受理后转录很长，本轮用户锚点真的不在任何检查点上：多检查点遍历全部落空仍不误判已受理，保持受阻并保留会话地址（需求 2 的反例对照——证明上面那条"中段检查点命中"的正例不是把"找不到就放弃"放宽成"随便找到点什么就算数"，遍历确实耗尽、安全兜底依然成立）', async () => {
+      const w1 = world({ task, extra: gitOk });
+      writeLaneState(w1.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
+      const a = (async (script: string) => {
+        if (script.includes(MODE('follow'))) return { ok: true, url: SESSION, cap: 'Free', seats: { used: 0, total: 2 }, echoed: true };
+        throw new Error('bridge killed while polling');
+      }) as NonNullable<LaneDeps['browse']>;
+      await runLane(w1.input({ provider: 'devin-cloud', prompt: FOLLOW }), { ...w1.deps, browse: a });
+      expect(readInflight(w1.stateRoot, 'devin-cloud', digestOf(w1, FOLLOW))?.taskUrl).toBe(SESSION);
+
+      // 本轮是第 N 轮续轮，本轮用户消息是转录里最新内容，自然位置停在更早的第二轮（不是本轮），绝对顶部
+      // 只露出更早的第一轮（更不是本轮）——这个二值 mock（只分顶部/非顶部两种内容）意味着 SCROLL_RECOVER_POINTS
+      // 个检查点里，除了 p=0（顶部）之外全部落在"非顶部"桶，统统是第二轮，全程找不到本轮标记，是真的遍历
+      // 耗尽，不是只试了一次就放弃。断言的是安全兜底：不静默、不误判已受理、不重发，受阻文本保留会话地址，
+      // 与 devin.ts 里已有的"转录里一直看不到本轮标记"驱动层测试（纯状态 mock）同一结论，这里走的是真实
+      // devin-web.ts 生成脚本在假页面里执行的那条路径，不是另一套纯状态 mock。
       type Blk = { author: 'user' | 'devin' | 'tool'; text: string };
       const sendLikeCalls: string[] = [];
       const b2 = (async (script: string) => {
