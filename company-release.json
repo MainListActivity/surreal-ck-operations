@@ -1,21 +1,20 @@
 {
-  "version": "0.13.41",
-  "title": "Devin 云端改走网页 Free 档位：有界受理核对，不重发，终稿只认本轮",
+  "version": "0.13.50",
+  "title": "修复 Devin 网页 Free 选择：改用指针点击，选不中就零发送",
   "changes": [
-    "devin-cloud 不再执行 devin --cloud --model free（Devin CLI 3000.x 拒绝该参数，云免费只在网页）。新入口 devin-web.ts 用 ego-browser 驱动 app.devin.ai。",
-    "新会话、续轮与复核发送前都核验 Capability 选中 Free 与 N/M in use 席位。席位只在首页 Capability 菜单里可读，所以续轮先到组织首页读席位，再回原会话复核并发送。满座等待；读不到或不是 Free 有界重试后受阻，绝不切付费档。读数记入 lane 状态 devin.seats。",
-    "发送意图在按下 Send 前写入本目录与共享登记 inflight/<digest>.json，续轮连同原会话地址与公司任务号一并登记；换员工目录或重启只核对是否已受理，绝不重发。返工改了摘要也按任务号认出在途发送：未确认受理的受阻、不另建会话；已有会话地址的沿用它跟进。",
-    "终稿只认本轮收尾约定之后的 Devin 发言块（data-message-author=devin）；工具输出、用户例子、旧轮次残留的 DONE/PR 都不算。状态短语只看最近一次收尾约定之后的文字，上一轮仍在工作时续轮等待。unknown 与空闲无终稿都不收尾。",
-    "活动流分开报尝试与受理：尝试显示为运行中，转录出现本轮标记或会话地址后才显示已受理。受阻文本首行单独成行「工作结果：受阻」。",
-    "旧 CLI 的模型错误分类（PR2271 的确定性拒绝：Unknown model 首次即受阻）不并入本版，网页入口的档位与席位核验替代了它：核验不过有界重试后受阻，满座等待，不依据 CLI 报错文字判断。",
-    "保留 0.13.28 的结果读取有界、PR2269 的 CI 排队等待与网关防重放；free-only 配置与执行入口保护保留。"
+    "修复 0.13.41 选不中 Free 的根因：页面内 element.click() 只派发 click 事件，不会打开 Capability 菜单，Free 从未被选中，生产上停在 Normal 而零发送。",
+    "选 Free 改为 ego-browser 指针点击（page.click）：只点页面上唯一的档位名按钮，有界等待菜单里恰好一个 Free 行后点它，菜单仍开时回读 Free、powered、N/M in use，再按 Escape 收起并确认收起。",
+    "新会话与续轮共用这一流程，门禁不弱化：未选中 Free、非 powered、读不到席位、满座、菜单收不起或页面不稳，一律零发送。续轮仍先在首页选 Free 读席位，再回原会话发送。",
+    "选择器统一为 ego-browser 文档支持的 loc=css: 形式（输入框、发送按钮、Capability 按钮与 Free 行）。",
+    "终稿判定、发送前落盘 attempt、防跨目录重复发送与满座有界等待保持 0.13.41 的行为。",
+    "新增回归测试：假 Devin 页面区分指针点击与程序化点击；覆盖菜单延迟与档位晚显示（等待后照常发送），以及重复 Free 行、收不起菜单、回读超时（零发送）。"
   ],
   "impact": [
-    "员工：devin-cloud 派工走 Devin 网页 Free 档位（SWE-2）。席位满时任务等待或受阻，续轮回原会话继续。",
-    "老板：需要 ego-browser 里保持 app.devin.ai 登录。受阻结果首行为「工作结果：受阻」，正文写明要核对的会话地址与标记。",
-    "真实 Devin 云发送未执行（不消耗席位）。只读核实了首页 Capability 菜单、一个会话页的转录结构（助手发言块与 worklog 行分开）与侧栏会话列表；侧栏会话里没有本轮标记，真实的 SCK-DONE 收尾样本尚未实测。其余验证为页面脚本 DOM 契约、假页面脚本真实执行、browse mock 与类型检查。真实任务由老板在候选验证通过后经常规调度复验。",
-    "已知限制：页面结构（Capability 菜单、输入框、Send 按钮、N/M in use）改版会导致核验失败而拒发，不会降级到付费档。满座时页面显示 2/2 in use 尚未实测。续轮比直接回会话多一次首页访问。"
+    "员工：devin-cloud 派工选 Free 改为真实指针点击并回读确认。选不中、菜单收不起或席位读不到时零发送，任务等待或按「工作结果：受阻」收尾。",
+    "老板：本版尚未在生产页面上发送过真实会话。真实 Free 派工由老板经常规调度复验，结果以复验为准。",
+    "已知限制：Capability 菜单结构与 Escape 收起行为按 2026-11-16 只读实测，仓库里没有该页面的实时快照。页面改版会导致核验失败而拒发，不会降级到付费档。",
+    "满座等待与受阻目前只由假页面测试覆盖，真实页面未验证；满座按 maxMinutes 等待，超时按受阻收尾。"
   ],
-  "migration": "无 schema 变更（沿用 schema 072）。执行端插件升级后生效；需要服务 PATH 或 lanes.devin-cloud.bin 里能解析 ego-browser（默认 ~/.local/bin/ego-browser）。旧 lane 状态没有 devin 字段也可直接读取。共享登记新增 task 字段，旧登记没有它，不参与换摘要的判定。",
-  "rollback": "回退至 v0.13.33。回退后 devin-cloud 恢复 CLI 调用（Devin CLI 3000.x 上会报 Unknown model 而失败）；SCK_PREVIEW_SECRET 遮蔽等 0.13.31/0.13.33 修复不受影响。回退前在途的网页会话按人工核对。"
+  "migration": "无 schema 变更（沿用 schema 072），无需迁移数据。执行端插件升级后生效；需要服务 PATH 或 lanes.devin-cloud.bin 里能解析 ego-browser（默认 ~/.local/bin/ego-browser）。",
+  "rollback": "回退至 v0.13.41。回退后选 Free 又回到程序化点击，生产上会停在 Normal 而零发送（不耗席位）。回退前在途的网页会话按人工核对。"
 }
