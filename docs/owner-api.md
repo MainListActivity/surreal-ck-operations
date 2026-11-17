@@ -57,7 +57,7 @@
 | 提前安排流水线后续步骤的消息 | `sck owner message.plan '{"requirement":"r1","revision":1,"index":1,"step":"execute","body":"…","hold":true}'` |
 | 按员工看到的原文编辑待发消息 | `sck owner message.edit_rendered '{"messageId":"m1","employeeId":"e1","rendered":"先读 …/notes.md。完成 …/task.md 中的需求…"}'` |
 | 老板看板：每人现在、接下来、待发消息原文，未派员工的排队，最近动态，执行端心跳 | `sck owner board.snapshot '{}'` |
-| 按任务的有界派工状态：真实队列位置、阻塞分类（held/译文/分析/门槛/租约/老板决定/恢复/终态）、责任方与恢复动作、下一触发、调度快照时效、各员工候选原因；不带消息正文与审计原文 | `sck owner board.task '{"taskId":"t1"}'` |
+| 按任务的有界派工状态：真实队列位置、阻塞分类（held/译文/分析/门槛/租约/老板决定/恢复/终态）、责任方与恢复动作、下一触发、调度快照时效、各员工候选原因；不带消息正文与审计原文；候选最多 40 条（超出写入 `candidatesOmitted`），标题与理由超长时截断并以 `…` 结尾 | `sck owner board.task '{"taskId":"t1"}'` |
 | 列出编制 | `sck owner def.list '{}'` |
 | 新建/修改编制 | `sck owner def.ensure '{"id":"eng-1","role":"engineering","provider":"codex","model":"auto:sol"}'` |
 | 停用编制 | `sck owner def.disable '{"id":"eng-1","reason":"缩编"}'` |

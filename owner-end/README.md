@@ -138,7 +138,7 @@
   3. 命中 `protected_command` 中标记为 `owner_only` 的命令。老板可以在「仅老板」清单里增删；
   4. 不在员工的允许清单（`agent_policy.allow`）内，或命中禁止清单（`agent_policy.deny`）；
   5. 没有该任务的有效租约（持有人是本员工且未过期）；
-  6. 参数里点名的 `taskId`（可带 `task:` 前缀）与 `messageId` 必须属于该租约任务。`messageId` 按消息所属的任务核对，消息不存在也视为不符；
+  6. 参数里点名的 `taskId`（可带 `task:` 前缀）与 `messageId` 不核对是否属于该租约任务（老板决定，见 `owner-end/src/commands.ts`）：持有任意任务的有效租约后，未被本节其它规则拒绝的老板命令都可以调用，包括别的任务与消息；限制靠「仅老板」保护清单与员工策略；
   7. 命中按目标的硬锁（`src/owner-locks.ts`，只看命令与输入里的目标，不看调用方）：
      - `idp.*`：公司租户（`IDP_TENANT_ID` 或 slug `company`）的写操作，以及 ma_hono 服务主体（`/admin/service-principals`）与其它管理路径的写入。读取和其它租户不受限；
      - `cf.api`：老板端与 ma_hono 的 Worker（脚本及其子资源）、ma_hono 的 D1、API 令牌的管理、自定义域名的写入，以及请求内容提到 `company.maplayer.top` 或这些资源的调用。其它账号资源不受限；

@@ -1,5 +1,6 @@
 /**
  * response_too_large 的缩小建议：company_cmd 转发的老板端命令没有统一分页，逐命令给出真实支持的缩小方式。
+ * 只写员工能调用的命令（owner 专属与被守卫拒绝的命令到不了这里）。没有参数可缩小的，明说没有，不指向不存在的参数。
  * 本机工具不在此列：它们的 pageSize/cursor 提示由 guardRelayResponse 的默认值承担。
  *
  * Kept out of the sidecar on purpose: the submit wiring check reads every `case "…":` in sidecar.ts as a dispatched
@@ -9,20 +10,25 @@ export function companyCmdNarrowHint(args: unknown): string {
   const command = typeof (args as { command?: unknown })?.command === "string" ? (args as { command: string }).command : "";
   switch (command) {
     case "board.snapshot":
-      return "board.task with taskId (a bounded per-task dispatch status); board.snapshot is the whole owner board and has no paging";
     case "progress":
-      return "board.task with taskId for one task's queue position and block status; progress has no paging";
+      return "board.task with taskId, the bounded dispatch status of one task (board.snapshot and progress have no paging)";
     case "task.list":
-      return "task.detail with taskId for one task, or board.task with taskId for its dispatch status";
+      return "task.detail with taskId for one task (task.list has no paging)";
     case "task.detail":
+      return "read_task_text for a long text field, message.list with taskId for the task's messages, or board.task with taskId for its dispatch status (task.detail has no paging)";
     case "task.plan":
-      return "board.task with taskId for a bounded status, or read_task_text for long fields";
+      return "task.detail with taskId for one task of the chain (task.plan has no paging)";
+    case "task.cost":
+      return "task.cost with taskId for one task; without taskId, a smaller days (1 to 60, 7 by default)";
     case "message.list":
-    case "message.records":
-      return "message.list with taskId";
-    case "audit.list":
-      return "audit.list with task, agent or command filters, or a smaller limit";
+      return "message.list with taskId for one task, or includeSent false to leave out the sent messages";
+    case "note.list":
+      return "note.list with lane for one lane's notes";
+    case "note.consolidations":
+      return "note.consolidations with a smaller limit";
+    case "db.read":
+      return "a narrower SELECT in sql, with a WHERE clause or a LIMIT";
     default:
-      return "the command's own filters (company_cmd_catalog lists them); board.task with taskId gives a bounded dispatch status";
+      return "no paging or filter parameter for this command (company_cmd_catalog lists its parameters); ask for one item by its id if the command takes one";
   }
 }

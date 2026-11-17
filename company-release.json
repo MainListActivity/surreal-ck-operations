@@ -5,14 +5,17 @@
     "新增 owner 命令 board.task：按任务返回有界派工状态——真实队列位置、阻塞分类（held/译文/分析/门槛/租约/老板决定/恢复/终态）、责任方与恢复动作、下一触发、调度快照时效与每位员工的候选原因，不带消息正文、任务原文与审计证据。",
     "员工经 company_cmd、老板经网页与 CLI 都可调用；只读命令，守卫分类与审计口径和既有只读命令一致，权限仍由租约、保护清单与员工策略判定。",
     "老板看板未派行新增 gate 字段，区分扣住消息、待译文、待完工分析与派工门槛；看板显示不受影响。",
-    "修复 response_too_large 提示：company_cmd 转发的老板命令没有统一分页，错误逐命令给出真实支持的缩小方式（board.snapshot/progress 指到 board.task），不再提示无效的 pageSize/cursor。",
+    "修复 response_too_large 提示：company_cmd 转发的老板命令没有统一分页，错误逐命令给出真实支持的缩小方式（board.snapshot/progress 指到 board.task），不再提示无效的 pageSize/cursor；没有参数可缩小的命令明说没有。",
+    "company_cmd 的顶层只认 command 与 input：顶层的 taskId 等其它键不再被静默丢弃，报 invalid 并写出 input 的正确写法（此前网关只报 taskId 无效，员工看不出原因）。",
+    "board.task 的答复有上界：候选最多 40 条（超出的写入 candidatesOmitted），标题与理由超过字数上限时截断并以 … 结尾，单任务答复恒在 48 KiB 预算内。",
     "顺带修正命令守卫测试与六类写死仅老板清单不一致的既有断言。"
   ],
   "impact": [
     "员工：board.snapshot 或 progress 超预算时按提示改用 board.task 带 taskId，即可拿到真实队列位置与阻塞原因。",
+    "员工：company_cmd 的参数写在 input 里；顶层的 taskId 会收到明确的 invalid 提示与正确写法。",
     "老板：命令目录与命令面板多一条 board.task 只读命令，看板原样可用。",
-    "升级后旧调用行为不变；无 schema 变更（沿用 schema 072）。"
+    "升级后，只有顶层带 command、input 以外键的 company_cmd 调用会改为报 invalid（这些键此前被静默丢弃）；其余旧调用行为不变。无 schema 变更（沿用 schema 072）。"
   ],
   "migration": "无 schema 变更（沿用 schema 072）。不需要迁移数据；新命令随老板端与执行端升级生效。",
-  "rollback": "回退至 v0.13.33。回退后 board.task 不可用，过大看板回执恢复旧的笼统提示，看板行不再带 gate 字段。"
+  "rollback": "回退至 v0.13.33。回退后 board.task 不可用，过大看板回执恢复旧的笼统提示，看板行不再带 gate 字段，company_cmd 顶层键恢复静默丢弃。"
 }

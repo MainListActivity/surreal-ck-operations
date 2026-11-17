@@ -97,6 +97,28 @@ export function largeBoardFixture(queued = 300): BoardFixture {
   };
 }
 
+/**
+ * The widest single-task answer a board can give: `w-target` is a candidate of every one of `employees` employees, and its title,
+ * queue reason and each candidate reason are `textChars` characters long. board.task must still fit the relay budget for it.
+ */
+export function wideBoardFixture(employees = 60, textChars = 300): BoardFixture {
+  const title = `宽任务${'标题'.repeat(textChars)}`;
+  const body = `等待派工条件：${'说明'.repeat(textChars)}`;
+  const ids = Array.from({ length: employees }, (_, index) => `w${String(index).padStart(3, '0')}`);
+  return {
+    view: {
+      at: NOW - 5_000,
+      env: { sckBin: '/sck', opsRepo: '/ops' },
+      queue: [{ taskId: 'w-target', title, phase: 'execute', role: 'engineering', blocked: true, eligible: false, body }],
+      employees: Object.fromEntries(ids.map(id => [id, { commDir: `/comm/${id}`, next: [{ taskId: 'w-target', title, phase: 'execute', eligible: false, body }] }])),
+    },
+    tasks: { 'w-target': { id: rid('task', 'w-target'), title, state: 'ready', reviewer_role: 'qa' } },
+    unsent: [],
+    employees: ids.map(id => ({ id: rid('employee', id), role: 'engineering', def: rid('employee_def', `eng-${id}`), provider: 'codex', model: 'auto' })),
+    progress: {},
+  };
+}
+
 function answer(fixture: BoardFixture, sql: string, vars: Record<string, unknown>): unknown[] {
   if (sql.includes('company_meta:board_view') || sql.includes('runner_board')) return [[{ json: JSON.stringify(fixture.view), at: fixture.view.at }]];
   if (sql.includes('FROM runner_heartbeat')) return [[{ runner: 'r1', host: 'host-1', version: '0.13.35', at: new Date(NOW - 10_000) }]];

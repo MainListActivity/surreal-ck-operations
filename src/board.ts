@@ -663,14 +663,35 @@ export interface BoardTaskStatus {
   holder?: BoardTaskHolder;
   /** The block classification: the responsible party, the recovery action and the next trigger. */
   waiting: BoardTaskWaiting;
-  /** The scheduler's per-employee candidate rows that name this task (each employee keeps only its first rows, as the board does). */
+  /**
+   * The scheduler's per-employee candidate rows that name this task (each employee keeps only its first rows, as the board does).
+   * Reachable rows come first, then queue order, at most BOARD_TASK_CANDIDATE_ROWS of them.
+   */
   candidates: Array<{ employeeId: string; position: number; eligible: boolean; reason: string }>;
+  /** How many candidate rows the bound left out; absent when none were left out. The rows left out are not sent. */
+  candidatesOmitted?: number;
 }
+
+/**
+ * Bounds on one task's status, so the answer fits the relay budget whatever the board holds. A text cut to its bound ends in
+ * an ellipsis, the same convention as the progress summary; a row cut from the candidate list is counted in candidatesOmitted.
+ */
+export const BOARD_TASK_TITLE_CHARS = 200;
+export const BOARD_TASK_REASON_CHARS = 200;
+export const BOARD_TASK_CANDIDATE_ROWS = 40;
+export const BOARD_TASK_CANDIDATE_REASON_CHARS = 100;
+
+/** The text cut to `limit` code points, with an ellipsis when it was cut. */
+const clipText = (text: string, limit: number): string => {
+  const chars = Array.from(text);
+  return chars.length > limit ? `${chars.slice(0, limit).join('')}…` : text;
+};
 
 /**
  * One task's bounded dispatch status: the same queue, gate and lease judgement the owner board makes, without
  * any message body, task text or audit evidence. A task the board does not show (planned, blocked, decided by the
- * owner, done or void) still answers from its row state. Undefined when the task does not exist.
+ * owner, done or void) still answers from its row state. Texts and candidate rows are bounded (BOARD_TASK_*), so the
+ * answer stays inside the relay budget for any board. Undefined when the task does not exist.
  */
 export async function readBoardTask(db: Surreal, taskId: string, opts: { now?: number } = {}): Promise<BoardTaskStatus | undefined> {
   const now = opts.now ?? Date.now();
@@ -746,17 +767,23 @@ export async function readBoardTask(db: Surreal, taskId: string, opts: { now?: n
   const phase: BoardPhase | undefined = queued?.phase
     ?? (state === 'review' || (state === 'blocked' && row.resume_state === 'review') ? 'review'
       : state === 'ready' || state === 'doing' || state === 'blocked' ? 'execute' : undefined);
-  const candidates = board.employees.flatMap(employee =>
+  const rows = board.employees.flatMap(employee =>
     employee.next.filter(entry => entry.taskId === taskId)
-      .map(entry => ({ employeeId: employee.id, position: entry.position, eligible: entry.eligible, reason: entry.reason })));
+      .map(entry => ({ employeeId: employee.id, position: entry.position, eligible: entry.eligible,
+        reason: clipText(entry.reason, BOARD_TASK_CANDIDATE_REASON_CHARS) })));
+  rows.sort((a, b) => Number(b.eligible) - Number(a.eligible) || a.position - b.position || byText(a.employeeId, b.employeeId));
+  const candidates = rows.slice(0, BOARD_TASK_CANDIDATE_ROWS);
+  const omitted = rows.length - candidates.length;
 
   return {
-    at: board.at, taskId, title: String(row.title ?? ''), state,
+    at: board.at, taskId, title: clipText(String(row.title ?? ''), BOARD_TASK_TITLE_CHARS), state,
     ...(phase ? { phase } : {}),
     ...(board.scheduler ? { scheduler: { ...board.scheduler, stale: board.scheduler.ageMs > RUNNER_STALE_MS } } : {}),
     runner: board.runner,
-    ...(queued ? { queue: { position: queued.position, of: board.unassigned.length, blocked: queued.blocked, eligible: queued.eligible, reason: queued.reason } } : {}),
+    ...(queued ? { queue: { position: queued.position, of: board.unassigned.length, blocked: queued.blocked, eligible: queued.eligible,
+      reason: clipText(queued.reason, BOARD_TASK_REASON_CHARS) } } : {}),
     ...(holder ? { holder } : {}),
     waiting, candidates,
+    ...(omitted > 0 ? { candidatesOmitted: omitted } : {}),
   };
 }

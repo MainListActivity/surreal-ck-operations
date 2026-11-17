@@ -143,18 +143,25 @@ export function routesToGateway(tool: string): boolean {
 }
 
 /**
- * 工具调用对应的网关命令与输入（taskId 已由调用方丢弃，只作用于当前租约任务）。
- * ops_* 保留原名，其余 owner 级工具把 `_` 换成 `.`；company_cmd 原样转发参数里的命令名与 input；company_cmd_catalog 固定为 cmd.catalog。
+ * 工具调用对应的网关命令与输入。请求里的 taskId 被丢弃，只作用于当前租约任务（与本机网关一样）。
+ * company_cmd 的顶层只认 command 与 input：其它键（典型是把 taskId 写在顶层）不转发，也不静默丢弃，直接报 invalid 并给出正确写法。
+ * 静默丢弃时网关只会报 taskId 无效，员工看不出原因。ops_* 保留原名，其余 owner 级工具把 `_` 换成 `.`；company_cmd_catalog 固定为 cmd.catalog。
  */
 export function cloudRequestOf(tool: string, args: Record<string, unknown>): { command: string; input: Record<string, unknown> } {
   if (tool === "company_cmd") {
-    const input = args.input ?? {};
     if (typeof args.command !== "string") throw Object.assign(new Error("company_cmd 需要 command：网关命令名（字符串）"), { code: "invalid" });
+    const extra = Object.keys(args).filter(key => key !== "command" && key !== "input");
+    if (extra.length > 0) {
+      const example = extra.map(key => `"${key}":"<值>"`).join(",");
+      throw Object.assign(new Error(`company_cmd 不转发顶层的 ${extra.join("、")}：请放进 input，写成 {"command":"${args.command}","input":{${example}}}`), { code: "invalid" });
+    }
+    const input = args.input ?? {};
     if (typeof input !== "object" || Array.isArray(input)) throw Object.assign(new Error("company_cmd 的 input 必须是对象"), { code: "invalid" });
     return { command: args.command, input: input as Record<string, unknown> };
   }
   if (tool === "company_cmd_catalog") return { command: "cmd.catalog", input: {} };
-  return { command: tool.startsWith("ops_") ? tool : tool.replace(/_/g, "."), input: args };
+  const { taskId: _requested, ...input } = args;
+  return { command: tool.startsWith("ops_") ? tool : tool.replace(/_/g, "."), input };
 }
 
 /** 本机没有公司网关：company_cmd 与 company_cmd_catalog 只能在云端执行端使用。 */
@@ -1182,9 +1189,8 @@ export class SidecarPool {
     if (cloud && routesToGateway(tool)) {
       const claim = this.claims.get(instId);
       if (!claim || claim !== requestLease) throw Object.assign(new Error("no matching active lease for this request"), { code: "no_lease" });
-      // 与本机网关一样：请求里的 taskId 被丢弃，只作用于当前租约任务。
-      const { taskId: _requested, ...rest } = args;
-      const request = cloudRequestOf(tool, rest);
+      // taskId 的丢弃（只作用于当前租约任务）与 company_cmd 顶层键的检查都在 cloudRequestOf 里。
+      const request = cloudRequestOf(tool, args);
       return this.callCloud(cloud, instId, claim, request.command, request.input);
     }
     // SYS01 M1: for a snapshot-backed listing the reply ceiling covers the credential phase too, counted from the same

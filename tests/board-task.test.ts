@@ -1,9 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import { ownerApi } from '../src/owner-api.ts';
-import type { BoardTaskStatus } from '../src/board.ts';
+import {
+  BOARD_TASK_CANDIDATE_REASON_CHARS, BOARD_TASK_CANDIDATE_ROWS, BOARD_TASK_REASON_CHARS, BOARD_TASK_TITLE_CHARS, type BoardTaskStatus,
+} from '../src/board.ts';
 import { answerBytes, guardRelayResponse, RESPONSE_BUDGET_BYTES } from '../src/response-budget.ts';
 import { companyCmdNarrowHint } from '../src/runner/narrow-hint.ts';
-import { boardContext, boardFixtureDb, largeBoardFixture, NOW, SEC, smallBoardFixture } from './support/board-task-fixture.ts';
+import { boardContext, boardFixtureDb, largeBoardFixture, NOW, SEC, smallBoardFixture, wideBoardFixture } from './support/board-task-fixture.ts';
 
 // board.task：老板看板同一份判定的按任务有界读取。假库按 SQL 片段应答（tests/support/board-task-fixture.ts），
 // 覆盖排队、扣住、门槛、租约、老板复核、阻塞、终态与缺任务各一种；大看板夹具覆盖 relay 预算的拒绝与按任务通过。
@@ -114,11 +116,39 @@ describe('relay 预算：大看板被拒、按任务状态通过', () => {
     expect(String((toolError as { error: string }).error)).toContain('pageSize');
   });
 
-  test('companyCmdNarrowHint 给出各命令真实支持的缩小方式', () => {
+  test('companyCmdNarrowHint 只指向命令真实支持的参数；没有参数的命令明说没有', () => {
     expect(companyCmdNarrowHint({ command: 'board.snapshot' })).toContain('board.task with taskId');
     expect(companyCmdNarrowHint({ command: 'progress' })).toContain('board.task with taskId');
-    expect(companyCmdNarrowHint({ command: 'audit.list' })).toContain('filters');
-    expect(companyCmdNarrowHint({ command: 'note.consolidate' })).toContain('company_cmd_catalog');
-    expect(companyCmdNarrowHint(null)).toContain('company_cmd_catalog');
+    expect(companyCmdNarrowHint({ command: 'task.cost' })).toContain('taskId');
+    expect(companyCmdNarrowHint({ command: 'message.list' })).toContain('includeSent');
+    expect(companyCmdNarrowHint({ command: 'note.consolidations' })).toContain('limit');
+    expect(companyCmdNarrowHint({ command: 'message.records' })).toContain('no paging or filter parameter');
+    expect(companyCmdNarrowHint({ command: 'brief' })).toContain('no paging or filter parameter');
+    expect(companyCmdNarrowHint(null)).toContain('no paging or filter parameter');
+    // 没有分页的命令从不指向 pageSize、cursor 或不存在的过滤参数。
+    for (const command of ['board.snapshot', 'progress', 'task.list', 'task.detail', 'task.plan', 'task.cost', 'message.list', 'message.records', 'brief']) {
+      expect(companyCmdNarrowHint({ command })).not.toMatch(/pageSize|cursor|filters/);
+    }
+  });
+
+  test('宽看板：一个任务有很多候选、标题与理由都很长，单任务答复仍在预算内，省略的候选写明条数', async () => {
+    const status = await ownerApi(boardContext(boardFixtureDb(wideBoardFixture(60, 300)).db),
+      { command: 'board.task', taskId: 'w-target', now: NOW }, 'agent') as BoardTaskStatus;
+    expect(status.candidates).toHaveLength(BOARD_TASK_CANDIDATE_ROWS);
+    expect(status.candidatesOmitted).toBe(60 - BOARD_TASK_CANDIDATE_ROWS);
+    expect(status.candidates[0]!.employeeId).toBe('w000');
+    // 被截断的文本以省略号结尾，长度是上限加一个字符。
+    expect(Array.from(status.title).length).toBe(BOARD_TASK_TITLE_CHARS + 1);
+    expect(Array.from(status.queue!.reason).length).toBe(BOARD_TASK_REASON_CHARS + 1);
+    expect(Array.from(status.candidates[0]!.reason).length).toBe(BOARD_TASK_CANDIDATE_REASON_CHARS + 1);
+    expect(status.candidates[0]!.reason.endsWith('…')).toBe(true);
+    expect(answerBytes(status)).toBeLessThan(RESPONSE_BUDGET_BYTES);
+    expect(guardRelayResponse({ ok: true as const, data: status }, companyCmdNarrowHint({ command: 'board.task' }))).toMatchObject({ ok: true });
+  });
+
+  test('候选不超过上限时不写 candidatesOmitted，文本不带省略号', async () => {
+    const status = await boardTask('t-queue');
+    expect(status.candidatesOmitted).toBeUndefined();
+    expect(status.title.endsWith('…')).toBe(false);
   });
 });
