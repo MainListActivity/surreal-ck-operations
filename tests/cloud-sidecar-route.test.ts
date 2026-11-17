@@ -12,7 +12,10 @@ import { IdpClient, type IssuedToken } from '../src/cloud/idp.ts';
 import { AgentTokenCache } from '../src/cloud/agent-tokens.ts';
 import { HARD_OWNER_ONLY, OWNER_API_COMMANDS, matchesCommand } from '../src/command-guard.ts';
 import { CompanyError } from '../src/core-errors.ts';
+import { ownerApi } from '../src/owner-api.ts';
+import { answerBytes, RESPONSE_BUDGET_BYTES } from '../src/response-budget.ts';
 import { createOwnerJobStore, pendingReply, type OwnerJobStore, type Reply as JobReply } from './support/owner-job-contract.ts';
+import { boardContext, boardFixtureDb, largeBoardFixture, NOW as BOARD_NOW, wideBoardFixture, type BoardFixture } from './support/board-task-fixture.ts';
 
 // ma_hono（身份服务）与公司网关都用本地 mock，不连真实服务。
 const CLIENT_ID = 'runner-client';
@@ -36,6 +39,8 @@ const jobCommands = new Map<string, string>();
 let jobs: OwnerJobStore;
 /** 这些命令走执行端作业：网关先回 202 待取，之后由 ops.job.get 取结果。 */
 const ASYNC_COMMANDS = new Set(['ops_slow', 'ops_failjob', 'ops_authfail', 'ops_authword', 'ops_pollauth']);
+/** 老板端看板命令：网关桩用真实的 ownerApi 回答（见 boardReply），与网关 runOwnerApi 走同一条路径。 */
+const BOARD_COMMANDS = new Set(['board.snapshot', 'board.task']);
 
 /**
  * 执行端进度脚本，写回用真实的 storeResult / failure（见 tests/support/owner-job-contract.ts）：
@@ -57,6 +62,23 @@ async function jobReply(bearer: string, input: Record<string, unknown>): Promise
   if (polls === 1 && command === 'ops_authfail') jobs.fail(id, new CompanyError('unauthorized', '登录令牌已失效'));
   if (polls === 1 && command === 'ops_authword') jobs.fail(id, new Error('invalid credential from upstream'));
   return jobs.getJob(input);
+}
+
+/** 看板命令读的合成看板；缺省是大看板（300 个排队任务，整板远超预算），个别用例换成别的夹具。 */
+let boardFixtureOf: () => BoardFixture = () => largeBoardFixture();
+
+/**
+ * 看板命令的网关回包：真实 ownerApi 读合成的看板，员工的 input 原样传入（与网关 runOwnerApi 一致），
+ * 服务端时钟是 BOARD_NOW。错误按网关信封回包，由网关客户端还原成与线上相同的错误码与原文。
+ */
+async function boardReply(command: string, input: Record<string, unknown>): Promise<Response> {
+  try {
+    const result = await ownerApi(boardContext(boardFixtureDb(boardFixtureOf()).db, () => BOARD_NOW), { ...input, command }, 'agent');
+    return json({ ok: true, result });
+  } catch (error) {
+    const code = error instanceof CompanyError ? error.code : 'upstream_error';
+    return json({ ok: false, error: { code, message: (error as Error).message } }, 400);
+  }
 }
 
 let idpServer: ReturnType<typeof Bun.serve>;
@@ -105,6 +127,9 @@ beforeAll(() => {
         const pending = pendingReply(id);
         return json(pending.body, pending.status);
       }
+      if (BOARD_COMMANDS.has(body.command)) return boardReply(body.command, body.input ?? {});
+      // progress 没有分页，回执超预算；这里只要一个超预算的回执，用来核对它的缩小提示。
+      if (body.command === 'progress') return json({ ok: true, result: { blob: 'p'.repeat(60_000) } });
       if (body.command === 'ops_leak') return json({ ok: false, error: { code: 'forbidden', message: `refused for ${bearer}` } }, 403);
       return json({ ok: true, result: { echoed: body.command } });
     },
@@ -558,15 +583,20 @@ describe('公司命令 company_cmd 与 company_cmd_catalog', () => {
     expect((reply.data as { tools: string[] }).tools).toEqual(expect.arrayContaining(['company_cmd', 'company_cmd_catalog']));
   });
 
-  test('请求映射：company_cmd 原样取命令与输入；catalog 固定为 cmd.catalog；ops_ 与 owner 工具的命名不变', () => {
+  test('请求映射：company_cmd 原样取命令与输入；catalog 固定为 cmd.catalog；ops_ 与 owner 工具的命名不变，它们的 taskId 被丢弃', () => {
     expect(cloudRequestOf('company_cmd', { command: 'task.detail', input: { taskId: 'task:a', q: 1 } }))
       .toEqual({ command: 'task.detail', input: { taskId: 'task:a', q: 1 } });
     expect(cloudRequestOf('company_cmd', { command: 'message.list' })).toEqual({ command: 'message.list', input: {} });
     expect(cloudRequestOf('company_cmd_catalog', { anything: 1 })).toEqual({ command: 'cmd.catalog', input: {} });
-    expect(cloudRequestOf('ops_info', { q: 1 })).toEqual({ command: 'ops_info', input: { q: 1 } });
+    expect(cloudRequestOf('ops_info', { q: 1, taskId: 'other' })).toEqual({ command: 'ops_info', input: { q: 1 } });
     expect(cloudRequestOf('def_ensure', { id: 'x' })).toEqual({ command: 'def.ensure', input: { id: 'x' } });
     expect(codeOf(() => cloudRequestOf('company_cmd', {}))).toBe('invalid');
     expect(codeOf(() => cloudRequestOf('company_cmd', { command: 'task.list', input: ['x'] }))).toBe('invalid');
+    // company_cmd 的顶层 taskId 不转发：报 invalid，并写出 input 的正确写法，不静默丢弃。
+    expect(codeOf(() => cloudRequestOf('company_cmd', { command: 'board.task', taskId: 'q-007' }))).toBe('invalid');
+    expect(() => cloudRequestOf('company_cmd', { command: 'board.task', taskId: 'q-007' }))
+      .toThrow('{"command":"board.task","input":{"taskId":"<值>"}}');
+    expect(() => cloudRequestOf('company_cmd', { command: 'task.list', input: {}, q: 1 })).toThrow('q');
   });
 
   test('无租约：直接拒绝，不查身份、不换令牌、不请求网关', async () => {
@@ -580,10 +610,10 @@ describe('公司命令 company_cmd 与 company_cmd_catalog', () => {
     expect(gwCalls).toHaveLength(0);
   });
 
-  test('有租约：命令与输入原样转发，换令牌带当前任务号；请求顶层的 taskId 被丢弃', async () => {
+  test('有租约：命令与输入原样转发，换令牌带当前任务号', async () => {
     pool = makePool({ cloud: makeCloud() });
     const { dir, key } = await claimFor(pool, 'eng-1', 'task-cmd-1');
-    const reply = await send(dir, key, 'r1', 'company_cmd', { command: 'task.detail', input: { taskId: 'task:other', q: 1 }, taskId: 'someone-else' });
+    const reply = await send(dir, key, 'r1', 'company_cmd', { command: 'task.detail', input: { taskId: 'task:other', q: 1 } });
     expect(reply).toEqual({ ok: true, data: { echoed: 'task.detail' } });
     expect(idpCalls).toHaveLength(1);
     expect(idpCalls[0]!.taskId).toBe('task-cmd-1');
@@ -624,6 +654,21 @@ describe('公司命令 company_cmd 与 company_cmd_catalog', () => {
     expect(gwCalls).toHaveLength(0);
   });
 
+  test('顶层的 taskId 不转发：员工经真实中继收到 invalid 与 input 的写法，不换令牌、不请求网关', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-cmd-flat');
+    const flat = await send(dir, key, 'r1', 'company_cmd', { command: 'board.task', taskId: 'q-007' });
+    const both = await send(dir, key, 'r2', 'company_cmd', { command: 'board.task', input: { taskId: 'q-007' }, taskId: 'q-007' });
+    for (const reply of [flat, both]) {
+      expect(reply.ok).toBe(false);
+      expect(reply.error).toContain('invalid');
+      expect(reply.error).toContain('{"command":"board.task","input":{"taskId":"<值>"}}');
+    }
+    expect(idpCalls).toHaveLength(0);
+    expect(exchangeCalls).toHaveLength(0);
+    expect(gwCalls).toHaveLength(0);
+  });
+
   test('网关错误文本回显令牌时，返回给员工的内容已脱敏', async () => {
     pool = makePool({ cloud: makeCloud() });
     const { dir, key } = await claimFor(pool, 'eng-1', 'task-cmd-leak');
@@ -644,6 +689,61 @@ describe('公司命令 company_cmd 与 company_cmd_catalog', () => {
     expect(issued.size).toBeGreaterThan(0);
     expect(replies.length).toBe(5);
     expect(sensitiveHits()).toEqual([]);
+  });
+
+  test('board.snapshot 超预算：员工经真实中继收到 response_too_large，提示指到 board.task，不提 pageSize', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-board-snapshot');
+    const reply = await send(dir, key, 'r1', 'company_cmd', { command: 'board.snapshot', input: {} });
+    expect(reply.ok).toBe(false);
+    expect(reply.error).toContain('response_too_large');
+    expect(reply.error).toContain('board.task');
+    expect(reply.error).not.toContain('pageSize');
+    expect(gwCalls.map(call => call.command)).toEqual(['board.snapshot']);
+  });
+
+  test('progress 超预算：提示同样指到 board.task，不提 pageSize 或 cursor', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-progress-big');
+    const reply = await send(dir, key, 'r1', 'company_cmd', { command: 'progress', input: {} });
+    expect(reply.ok).toBe(false);
+    expect(reply.error).toContain('board.task');
+    expect(reply.error).not.toMatch(/pageSize|cursor/);
+  });
+
+  test('board.task 单任务：员工经真实中继拿到该任务的队列位置与等待原因，回包在预算内', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-board-one');
+    const reply = await send(dir, key, 'r1', 'company_cmd', { command: 'board.task', input: { taskId: 'q-007' } });
+    expect(reply.ok).toBe(true);
+    expect(reply.data).toMatchObject({
+      taskId: 'q-007', queue: { position: 8, of: 300, eligible: false }, waiting: { on: 'system', kind: 'no_candidate' },
+    });
+    expect(answerBytes(reply.data)).toBeLessThan(RESPONSE_BUDGET_BYTES);
+    expect(Buffer.byteLength(replies.at(-1)!)).toBeLessThan(RESPONSE_BUDGET_BYTES);
+    expect(gwCalls.map(call => [call.command, call.input])).toEqual([['board.task', { taskId: 'q-007' }]]);
+  });
+
+  test('board.task 宽看板：员工经真实中继拿到的单任务答复在预算内，省略的候选写明条数', async () => {
+    boardFixtureOf = () => wideBoardFixture(60, 300);
+    try {
+      pool = makePool({ cloud: makeCloud() });
+      const { dir, key } = await claimFor(pool, 'eng-1', 'task-board-wide');
+      const reply = await send(dir, key, 'r1', 'company_cmd', { command: 'board.task', input: { taskId: 'w-target' } });
+      expect(reply.ok).toBe(true);
+      expect(reply.data).toMatchObject({ taskId: 'w-target', candidatesOmitted: 20, waiting: { on: 'system', kind: 'gate' } });
+      expect(Buffer.byteLength(replies.at(-1)!)).toBeLessThan(RESPONSE_BUDGET_BYTES);
+    } finally {
+      boardFixtureOf = () => largeBoardFixture();
+    }
+  });
+
+  test('board.task 找不到任务：网关的 not_found 原样到达员工', async () => {
+    pool = makePool({ cloud: makeCloud() });
+    const { dir, key } = await claimFor(pool, 'eng-1', 'task-board-missing');
+    const reply = await send(dir, key, 'r1', 'company_cmd', { command: 'board.task', input: { taskId: 'no-such-task' } });
+    expect(reply.ok).toBe(false);
+    expect(reply.error).toContain('task not found');
   });
 
   test('本机模式：两个工具都返回“需要云端执行端”，不查身份、不换令牌、不请求网关', async () => {

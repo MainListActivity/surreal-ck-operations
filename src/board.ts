@@ -6,7 +6,7 @@ import { langMatches, ownerLangOf } from './owner-lang.ts';
  * 排队与候选判定来自本机调度器：它每轮用同一个 staffingPool 算出排队与每位员工的候选，写进 company_meta:board_view。
  * 这里读回来后与数据库现状对齐：已派走、已完成、已作废的不再显示；租约、交接与放行门按数据库现状计算。
  */
-import type { RecordId, Surreal } from 'surrealdb';
+import { RecordId, type Surreal } from 'surrealdb';
 import { workContext, type WorkContext } from './work-context.ts';
 import { latestFindings } from './dispatcher/brief.ts';
 import { HANDOVER_ROWS } from './handover-window.ts';
@@ -239,6 +239,11 @@ export interface BoardUnassignedRow {
   blocked: boolean;
   eligible: boolean;
   reason: string;
+  /**
+   * What keeps this item from being dispatched: a held message, a missing translation, a pending turn analysis,
+   * or the pass's own gate (a pass-wide gate or a not-dispatchable verdict). Absent when nothing blocks it.
+   */
+  gate?: 'held' | 'awaiting_translation' | 'awaiting_analysis' | 'dispatch';
   /** The draft of this queued item's next step; absent when it has none. Stored body, no employee, no translation. */
   message?: BoardMessageRow;
 }
@@ -566,6 +571,7 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
     const draft = draftOf.get(`${item.taskId}:${stepOf(item.taskId)}`);
     return { taskId: item.taskId, title: String(tasks.get(item.taskId)?.title ?? item.title), phase: item.phase, position,
       blocked: item.blocked || held || awaiting || analysis, eligible, reason: boardReason(position, eligible, held ? HELD_TEXT : awaiting ? AWAITING_TRANSLATION_TEXT : analysis ? AWAITING_ANALYSIS_TEXT : item.body),
+      ...(held ? { gate: 'held' as const } : awaiting ? { gate: 'awaiting_translation' as const } : analysis ? { gate: 'awaiting_analysis' as const } : item.blocked ? { gate: 'dispatch' as const } : {}),
       ...(draft ? { message: messageOf(draft) } : {}) };
   });
 
@@ -600,5 +606,193 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
     at: now,
     ...(view ? { scheduler: { at: view.at, ageMs: Math.max(0, now - view.at) } } : {}),
     runner, employees, unassigned, recent, messages,
+  };
+}
+
+// ---- board.task：按任务的有界派工状态，与老板看板同一份判定 ----
+
+/** Who can move the task next: the owner, the leased employee, the scheduler itself, a system condition, or nobody (terminal). */
+export type BoardWaitOn = 'owner' | 'employee' | 'scheduler' | 'system' | 'none';
+
+export interface BoardTaskWaiting {
+  on: BoardWaitOn;
+  /**
+   * The block classification: a held message, a missing translation, a pending turn analysis, the pass's gate,
+   * no reachable candidate, a live or lapsed lease, an owner decision or resume, plain queueing, absent from
+   * the queue, still being planned, or a terminal state.
+   */
+  kind: 'held' | 'awaiting_translation' | 'awaiting_analysis' | 'gate' | 'no_candidate' | 'lease' | 'lease_lapsed'
+    | 'owner_decision' | 'resume' | 'queued' | 'not_queued' | 'planned' | 'terminal';
+  /** What moves the task forward again. */
+  recovery: string;
+  /** The next event that changes its state. */
+  nextTrigger: string;
+}
+
+export interface BoardTaskHolder {
+  employeeId: string;
+  name: string;
+  role: string;
+  phase: BoardPhase;
+  leaseActive: boolean;
+  /** Unix milliseconds of the claim that started this lease. */
+  leaseStartedAt?: number;
+  elapsedSeconds?: number;
+  /** Unix milliseconds when the lease runs out. */
+  leaseExpiresAt?: number;
+  /** The holder's latest action and when it happened. The text that action recorded is not carried here. */
+  progress?: Omit<BoardProgress, 'summary'>;
+}
+
+/** The per-task dispatch status `board.task` answers: queue position, block class, holder, freshness and candidate rows. */
+export interface BoardTaskStatus {
+  /** Unix milliseconds when this status was read. */
+  at: number;
+  taskId: string;
+  title: string;
+  /** The task row's state, as stored. */
+  state: string;
+  phase?: BoardPhase;
+  /** When the scheduler last wrote its queue view, and how old that view is; absent before its first pass. */
+  scheduler?: { at: number; ageMs: number; stale: boolean };
+  /** The execution end's heartbeat, so a stale snapshot has an explanation beside it. */
+  runner: BoardRunner;
+  /** The task's real queue row, the same position and reason the owner board shows; absent when it is not queued. */
+  queue?: { position: number; of: number; blocked: boolean; eligible: boolean; reason: string };
+  /** The lease holder and its latest reported progress; present while the task is bound to an employee. */
+  holder?: BoardTaskHolder;
+  /** The block classification: the responsible party, the recovery action and the next trigger. */
+  waiting: BoardTaskWaiting;
+  /**
+   * The scheduler's per-employee candidate rows that name this task (each employee keeps only its first rows, as the board does).
+   * Reachable rows come first, then queue order, at most BOARD_TASK_CANDIDATE_ROWS of them.
+   */
+  candidates: Array<{ employeeId: string; position: number; eligible: boolean; reason: string }>;
+  /**
+   * How many candidate rows were left out, by the row cap or to keep the answer inside the relay budget; absent when none were left
+   * out. The rows left out are not sent.
+   */
+  candidatesOmitted?: number;
+}
+
+/**
+ * Bounds on one task's status, so the answer stays small whatever the board holds. A text cut to its bound ends in
+ * an ellipsis, the same convention as the progress summary; a row cut from the candidate list is counted in candidatesOmitted.
+ */
+export const BOARD_TASK_TITLE_CHARS = 200;
+export const BOARD_TASK_REASON_CHARS = 200;
+export const BOARD_TASK_CANDIDATE_ROWS = 40;
+export const BOARD_TASK_CANDIDATE_REASON_CHARS = 100;
+
+/** The text cut to `limit` code points, with an ellipsis when it was cut. */
+const clipText = (text: string, limit: number): string => {
+  const chars = Array.from(text);
+  return chars.length > limit ? `${chars.slice(0, limit).join('')}…` : text;
+};
+
+/**
+ * One task's bounded dispatch status: the same queue, gate and lease judgement the owner board makes, without
+ * any message body, task text or audit evidence. A task the board does not show (planned, blocked, decided by the
+ * owner, done or void) still answers from its row state. Texts and candidate rows are bounded (BOARD_TASK_*); the owner API
+ * then keeps only the candidate rows that fit the relay budget. Undefined when the task does not exist.
+ */
+export async function readBoardTask(db: Surreal, taskId: string, opts: { now?: number } = {}): Promise<BoardTaskStatus | undefined> {
+  const now = opts.now ?? Date.now();
+  const nowSec = Math.floor(now / 1000);
+  const [board, taskRows] = await Promise.all([
+    readBoard(db, { now }),
+    rowsOf(db, `SELECT id, title, state, reviewer_role, current_employee, lease_expires_at, blocked_to, resume_state
+      FROM $task;`, { task: new RecordId('task', taskId) }),
+  ]);
+  const row = taskRows[0];
+  if (!row) return undefined;
+  const state = String(row.state ?? '');
+  const queued = board.unassigned.find(item => item.taskId === taskId);
+  const holderId = row.current_employee ? keyOf(row.current_employee) : undefined;
+
+  // The holder the board names plus the lease facts it reads; queried here so a holder whose employee row is
+  // already revoked or retired is still reported.
+  let holder: BoardTaskHolder | undefined;
+  if (holderId) {
+    const [claimRows, lastRows, employeeRows] = await Promise.all([
+      rowsOf(db, "SELECT at FROM audit WHERE task = $task AND action = 'claim' ORDER BY at DESC LIMIT 1;", { task: row.id }),
+      rowsOf(db, `SELECT action, at FROM audit
+        WHERE task = $task AND action != 'claim' AND !string::starts_with(action, 'ops_') ORDER BY at DESC LIMIT 1;`, { task: row.id }),
+      rowsOf(db, 'SELECT id, role, def FROM $employee;', { employee: new RecordId('employee', holderId) }),
+    ]);
+    const claimAt = dateMs(claimRows[0]?.at);
+    const last = lastRows[0];
+    const expires = typeof row.lease_expires_at === 'number' ? row.lease_expires_at : undefined;
+    const employee = employeeRows[0];
+    holder = {
+      employeeId: holderId,
+      name: employee?.def ? keyOf(employee.def) : String(employee?.role ?? holderId),
+      role: String(employee?.role ?? ''),
+      phase: state === 'review' ? 'review' : 'execute',
+      leaseActive: expires !== undefined && expires > nowSec,
+      ...(claimAt !== undefined ? { leaseStartedAt: claimAt, elapsedSeconds: Math.max(0, Math.floor((now - claimAt) / 1000)) } : {}),
+      ...(expires !== undefined ? { leaseExpiresAt: expires * 1000 } : {}),
+      ...(last ? { progress: { at: dateMs(last.at) ?? 0, action: String(last.action), label: labelOf(String(last.action)) } } : {}),
+    };
+  }
+
+  // The candidate rows the scheduler's view keeps for this task, reachable first, then queue order.
+  const rows = board.employees.flatMap(employee =>
+    employee.next.filter(entry => entry.taskId === taskId)
+      .map(entry => ({ employeeId: employee.id, position: entry.position, eligible: entry.eligible,
+        reason: clipText(entry.reason, BOARD_TASK_CANDIDATE_REASON_CHARS) })));
+  rows.sort((a, b) => Number(b.eligible) - Number(a.eligible) || a.position - b.position || byText(a.employeeId, b.employeeId));
+  const candidates = rows.slice(0, BOARD_TASK_CANDIDATE_ROWS);
+  const omitted = rows.length - candidates.length;
+  // A candidate row is a session bound to this task. The board never lists a row that can never take the task (BOARD_NEVER) or
+  // the row of a revoked or retired employee, so with no row here no listed session can take it. The wait names the candidate
+  // reasons only when a row is listed.
+  const noCandidate = candidates.length > 0 ? '等有候选可接（原因见各 candidates[].reason）' : '等有候选可接；调度视图中没有可接此任务的员工会话';
+
+  const waiting: BoardTaskWaiting = (() => {
+    if (holder?.leaseActive) {
+      return { on: 'employee', kind: 'lease', recovery: '员工回报后进入下一步；不回报则租约到期自动回收', nextTrigger: '员工回报或租约到期' };
+    }
+    if (holder) {
+      return { on: 'scheduler', kind: 'lease_lapsed', recovery: '租约已到期，等调度器或老板收回后重派', nextTrigger: '租约回收' };
+    }
+    if (queued) {
+      switch (queued.gate) {
+        case 'held': return { on: 'owner', kind: 'held', recovery: '老板放行待发消息后恢复派工', nextTrigger: '老板放行消息' };
+        case 'awaiting_translation': return { on: 'system', kind: 'awaiting_translation', recovery: '待发消息译文补齐后自动放行', nextTrigger: '译文就绪' };
+        case 'awaiting_analysis': return { on: 'system', kind: 'awaiting_analysis', recovery: '上一轮的完工分析完成后自动派出', nextTrigger: '完工分析落库' };
+        case 'dispatch': return { on: 'system', kind: 'gate', recovery: '派工门槛解除后自动恢复（原因见 queue.reason）', nextTrigger: '下一轮派工' };
+      }
+      return queued.eligible
+        ? { on: 'scheduler', kind: 'queued', recovery: '无需操作，轮到即派出', nextTrigger: '下一轮派工' }
+        : { on: 'system', kind: 'no_candidate', recovery: noCandidate, nextTrigger: '配额或容量恢复后的下一轮派工' };
+    }
+    if (state === 'review' && String(row.reviewer_role ?? '') === 'owner') {
+      return { on: 'owner', kind: 'owner_decision', recovery: '老板在收件箱验收或退回', nextTrigger: '老板 decide/approve/reject' };
+    }
+    if (state === 'blocked') {
+      return row.blocked_to === 'owner'
+        ? { on: 'owner', kind: 'owner_decision', recovery: '老板在收件箱作决定', nextTrigger: '老板 decide/approve/reject' }
+        : { on: 'owner', kind: 'resume', recovery: '老板恢复（resume）后回到阻塞前状态', nextTrigger: '老板 resume' };
+    }
+    if (state === 'planned') return { on: 'scheduler', kind: 'planned', recovery: '路线规划完成后自动进入队列', nextTrigger: '规划完成' };
+    if (state === 'done' || state === 'void') return { on: 'none', kind: 'terminal', recovery: '终态，无需操作', nextTrigger: '—' };
+    return { on: 'scheduler', kind: 'not_queued', recovery: '等调度器下一轮重判；快照时效见 scheduler.ageMs', nextTrigger: '下一轮派工' };
+  })();
+
+  const phase: BoardPhase | undefined = queued?.phase
+    ?? (state === 'review' || (state === 'blocked' && row.resume_state === 'review') ? 'review'
+      : state === 'ready' || state === 'doing' || state === 'blocked' ? 'execute' : undefined);
+
+  return {
+    at: board.at, taskId, title: clipText(String(row.title ?? ''), BOARD_TASK_TITLE_CHARS), state,
+    ...(phase ? { phase } : {}),
+    ...(board.scheduler ? { scheduler: { ...board.scheduler, stale: board.scheduler.ageMs > RUNNER_STALE_MS } } : {}),
+    runner: board.runner,
+    ...(queued ? { queue: { position: queued.position, of: board.unassigned.length, blocked: queued.blocked, eligible: queued.eligible,
+      reason: clipText(queued.reason, BOARD_TASK_REASON_CHARS) } } : {}),
+    ...(holder ? { holder } : {}),
+    waiting, candidates,
+    ...(omitted > 0 ? { candidatesOmitted: omitted } : {}),
   };
 }

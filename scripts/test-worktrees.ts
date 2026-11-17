@@ -53,7 +53,7 @@ try {
     'tests/quota-turn.test.ts', 'tests/turn-closeout.test.ts',
     'tests/session-history.test.ts', 'tests/factory-queue.test.ts', 'tests/dispatcher-sidecar.test.ts', 'tests/sidecar.test.ts', 'tests/sidecar-quota-gate.fork.test.ts',
     'tests/sidecar-late-lease.test.ts', 'tests/worktrees.test.ts',
-    'tests/owner-aging.fork.test.ts', 'tests/story-author.fork.test.ts', 'tests/cinematography.fork.test.ts', 'tests/owner-reassign.fork.test.ts', 'tests/pr-gate.fork.test.ts', 'tests/owner-commands.fork.test.ts',
+    'tests/owner-aging.fork.test.ts', 'tests/story-author.fork.test.ts', 'tests/cinematography.fork.test.ts', 'tests/owner-reassign.fork.test.ts', 'tests/pr-gate.fork.test.ts', 'tests/owner-commands.fork.test.ts', 'tests/board-task.fork.test.ts',
     'tests/query-paging.integration.test.ts', 'tests/acceptance-gate.fork.test.ts',
     'tests/deployment-source.fork.test.ts',
     'tests/input-bounds.integration.test.ts',

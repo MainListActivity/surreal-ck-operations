@@ -104,8 +104,8 @@ export function requireOwner(caller: Caller): OwnerCaller {
  */
 const NO_CORE = {} as OwnerApiContext['core'];
 
-/** 老板接口（src/owner-api.ts）在 Worker 里的上下文。 */
-export function ownerContextOf(db: Surreal): OwnerApiContext {
+/** 老板接口（src/owner-api.ts）在 Worker 里的上下文。now 是服务端时钟，缺省读系统时钟。 */
+export function ownerContextOf(db: Surreal, now?: () => Date): OwnerApiContext {
   const database = { db } as unknown as CompanyDatabase;
   return {
     db: database,
@@ -114,11 +114,12 @@ export function ownerContextOf(db: Surreal): OwnerApiContext {
     workforce: new Workforce(database),
     messages: new OutboundMessageStore(db),
     opsRepo: '',
+    ...(now ? { now: () => now().getTime() } : {}),
   };
 }
 
-function runOwnerApi(db: Surreal, command: string, input: Input, via = 'web'): Promise<unknown> {
-  return ownerApi(ownerContextOf(db), { ...input, command }, via);
+function runOwnerApi(db: Surreal, command: string, input: Input, via = 'web', now?: () => Date): Promise<unknown> {
+  return ownerApi(ownerContextOf(db, now), { ...input, command }, via);
 }
 
 /** 员工令牌的 sub 是 ma_hono 的 agent 用户 id；对应的员工见 agent_identity。 */
@@ -209,10 +210,10 @@ async function dispatch(deps: DispatchDeps, db: Surreal, who: Who, command: stri
       return { lang };
     }
     case 'message.edit':
-    case 'message.edit_rendered': return translateSaved(deps, db, await runOwnerApi(db, command, input, who.via), who.actor);
+    case 'message.edit_rendered': return translateSaved(deps, db, await runOwnerApi(db, command, input, who.via, deps.now), who.actor);
     case 'message.release':
     case 'message.send': return release(deps, db, command, input, who);
-    default: return runOwnerApi(db, command, input, who.via);
+    default: return runOwnerApi(db, command, input, who.via, deps.now);
   }
 }
 
@@ -252,7 +253,7 @@ async function release(deps: DispatchDeps, db: Surreal, command: string, input: 
     const translated = await translateChecked(configOf(deps), message.body, message.lang, deps.fetch);
     await store.setTranslation(message.id, message.lang, translated, message.body, who.actor);
   }
-  return runOwnerApi(db, command, { ...input, messageId }, who.via);
+  return runOwnerApi(db, command, { ...input, messageId }, who.via, deps.now);
 }
 
 async function agentCall(deps: GatewayDeps, caller: AgentCaller, command: string, input: Input): Promise<unknown> {

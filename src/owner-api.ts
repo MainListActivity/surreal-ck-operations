@@ -17,8 +17,9 @@ import { lanePreferenceValue } from './dispatcher/lane-preference.ts';
 import { OutboundMessageStore, type OutboundMessage } from './outbound-messages.ts';
 import { bodyOfDispatch, unrenderMessage } from './outbound-render.ts';
 import { turnAnalysesOf } from './turn-analysis.ts';
-import { findingsFileOf, readBoard, readBoardView, renderContextFor } from './board.ts';
+import { findingsFileOf, readBoard, readBoardTask, readBoardView, renderContextFor, type BoardTaskStatus } from './board.ts';
 import { CompanyError } from './core-errors.ts';
+import { answerBytes, fitCount, RESPONSE_BUDGET_BYTES } from './response-budget.ts';
 import { ROLES, type CreateTask, type Role } from './contracts.ts';
 import { HASH, REQUIRED_TRACKS } from './core.ts';
 import { getRoute, listRoutes, saveRoute, disableRoute } from './routes.ts';
@@ -32,7 +33,9 @@ import type { AgentAction, AgentActivity } from './agent-activity.ts';
 export type OwnerVia = string;
 export interface OwnerApiContext { db: CompanyDatabase; core: CompanyCore & {
   contributorDryRun(credential: string, input: { taskIds: string[] }): Promise<unknown>;
-}; owner: OwnerDesk; workforce: Workforce; messages: OutboundMessageStore; opsRepo: string }
+}; owner: OwnerDesk; workforce: Workforce; messages: OutboundMessageStore; opsRepo: string;
+  /** The server's clock in Unix milliseconds. board.task judges staleness and leases by it; a caller's input never sets it. Defaults to Date.now(). */
+  now?: () => number }
 
 const actor = (via: string) => `owner:${via || 'web'}`;
 const text = (value: unknown, field: string, min = 1, max = 20000): string => {
@@ -103,6 +106,19 @@ export async function taskTurns(db: import('surrealdb').Surreal, taskId: string)
   })).sort((a, b) => a.startedAt - b.startedAt);
 }
 
+/**
+ * The board.task answer as the relay sends it. readBoardTask bounds the candidate rows and the texts, but the widest text that passes
+ * those bounds (control characters, which the JSON text escapes to six bytes each) can still take the answer past the relay budget.
+ * So the candidate rows keep only the longest prefix whose whole answer fits, and the rest count in candidatesOmitted, as the row cap does.
+ */
+function fitBoardTask(status: BoardTaskStatus): BoardTaskStatus {
+  const withRows = (keep: number): BoardTaskStatus => {
+    const omitted = (status.candidatesOmitted ?? 0) + status.candidates.length - keep;
+    return omitted > 0 ? { ...status, candidates: status.candidates.slice(0, keep), candidatesOmitted: omitted } : status;
+  };
+  return withRows(fitCount(status.candidates, kept => answerBytes(withRows(kept.length)), RESPONSE_BUDGET_BYTES));
+}
+
 export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unknown>, via: OwnerVia): Promise<unknown> {
   const command = String(input.command ?? '');
   if (RUNNER_ONLY_COMMANDS.has(command) && hostIOOrUndefined() === undefined) {
@@ -113,6 +129,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     ? input.idempotencyKey : undefined;
   const key = () => idemp ? `owner:${via}:${command}:${idemp}` : `owner:${via}:${command}:${randomUUID()}`;
   const db = ctx.db.db;
+  const clock = ctx.now ?? Date.now;
   const notes = () => new LaneNoteStore(db);
   const ownerCredential = (): string => {
     const token = process.env.SCK_OWNER_TOKEN;
@@ -331,7 +348,14 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       employeeId: text(input.employeeId, 'employeeId'), rendered: text(input.rendered, 'rendered', 1, 20000), actor: a });
 
     // ---- 老板看板 ----
-    case 'board.snapshot': return readBoard(db, { now: typeof input.now === 'number' ? input.now : undefined });
+    case 'board.snapshot': return readBoard(db, { now: typeof input.now === 'number' ? input.now : clock() });
+    // 按任务的有界派工状态：队列位置、阻塞分类、责任方与下一触发、候选原因；不带消息正文与审计原文（员工经 company_cmd 也可调用）。
+    // 时效与租约只按服务端时钟判断，不读调用方的 now：员工能调用它，不能自己把快照说成新鲜、把过期的租约说成有效。
+    case 'board.task': {
+      const status = await readBoardTask(db, text(input.taskId, 'taskId'), { now: clock() });
+      if (!status) throw new CompanyError('not_found', 'task not found');
+      return fitBoardTask(status);
+    }
 
     // ---- 编制 ----
     // ---- 线的笔记 ----

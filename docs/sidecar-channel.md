@@ -86,7 +86,7 @@ sidecar 侧每 400ms（`SWEEP_MS`）扫一遍活跃实例的 `req/`：读到的�
 `company_cmd` 把员工的命令与参数原样转给公司网关（`POST /api/cmd`），`company_cmd_catalog` 转为网关的 `cmd.catalog`。两者与 `ops_*` 走同一条云端路径，只在 `SidecarPool` 注入了网关（云端执行端）时可用。
 
 - 链路：`sck call company_cmd` → sidecar 核对在手租约（无租约直接 `no_lease`，不换令牌）→ 以员工身份与当前租约任务换取网关令牌 → `GatewayClient.call`（`src/cloud/gateway.ts`）发起调用 → 网关返回 pending 时轮询 `ops.job.get` 直到结束或超时（默认 15 分钟）→ 结果或错误原路返回。
-- 请求顶层的 `taskId` 与 `ops_*` 一样被丢弃。`input` 里的任务号与消息号由网关核对，必须属于当前租约任务。
+- `ops_*` 与 owner 工具的请求顶层 `taskId` 被丢弃，只作用于当前租约任务。`company_cmd` 的顶层只认 `command` 与 `input`，其它键（含 `taskId`）报 `invalid` 并写出 `input` 的正确写法。`input` 里的任务号与消息号由网关按守卫判定：守卫要求调用人持有当前任务的有效租约，`input` 里的任务号与消息号不要求属于当前租约任务，能否调用由保护清单与员工策略决定（见 [owner-end 权限模型](../owner-end/README.md#权限模型)）。
 - 令牌只在 `callCloud` 的局部变量里存在：错误文本与返回内容中出现的令牌一律替换，不写会话、comm 目录、证据或日志。`tests/cloud-sidecar-route.test.ts` 对此做了扫描断言。
 - 判定、目录过滤与审计在网关侧，见 [运行手册 · 公司命令](agent-operations.md#公司命令)。
 
