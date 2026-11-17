@@ -171,8 +171,11 @@ export function vendorPrompt(input: LaneInput, repo: RepoInfo, material: ReturnT
         '按下面的验收标准逐条独立复验，最终答复首行必须是「复核结论：通过」或「复核结论：退回」，随后逐条给出证据。');
   } else {
     parts.push(`在 GitHub 仓库 ${repo.slug} 的分支 ${repo.branch} 上完成下面的工作，并把全部改动提交推送到该分支（PR 目标分支 ${repo.defaultBranch}）。`);
-    if (input.provider === 'devin-cloud')
-      parts.push('完成后确保远端分支上有提交、已开或更新一条到目标分支的 PR，最终答复末尾单独成行给出 `PR: <url>` 和 `SHA: <提交sha>`。');
+    if (input.provider === 'devin-cloud') {
+      parts.push(`同一个供应商会话可以先后处理不同仓库，但以本轮为准：仓库 ${repo.slug}、分支 ${repo.branch}。会话里之前轮次用过的仓库或分支不作数。写文件或提交前，核对当前工作树的 origin 远端与当前分支是否与本轮一致（工作目录路径可以和本机不同，只看仓库与分支）。不一致时，先找到、克隆或复用本轮仓库 ${repo.slug} 的正确任务工作树，核对它的 origin 与分支 ${repo.branch} 一致后再继续；只有取不到正确工作树时，才以「工作结果：受阻」收尾并说明原因，不在别的仓库或分支上改动或提交。`,
+        `最终 PR 只开在本轮仓库 ${repo.slug}，head 为本轮分支 ${repo.branch}，目标分支 ${repo.defaultBranch}。`,
+        '完成后确保远端分支上有提交、已开或更新一条到目标分支的 PR，最终答复末尾单独成行给出 `PR: <url>` 和 `SHA: <提交sha>`。');
+    }
     if (input.provider === 'codex-cloud')
       parts.push('工作结果由本地桥接进程应用与提交；只需把改动做完整。没有可交付的代码改动时，在最终消息里说明原因。');
   }

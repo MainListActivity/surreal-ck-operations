@@ -1,13 +1,21 @@
 /**
  * Devin Cloud 网页入口的页面脚本（ego-browser nodejs）与文本解析。
- * DOM 契约按 2026-11-16 只读实测：
- * - 首页/会话页的输入框都是 div[role=textbox][aria-label="Prompt"]，发送是 button[aria-label="Send"]。
- * - Capability 触发按钮：innerText 正好是 Fusion/Ultra/Normal/Lite/Free 之一的 button；
- *   弹出层是 [role=menu]，里面 "Capability" 分组下有同名行；选中 Free 后页面出现
- *   "Free (powered by SWE-2)"、"The plan includes 2 concurrent sessions"、"N/M in use"。
- * - 席位文字只在首页 Capability 菜单打开、选中 Free 时出现；按 Escape 后文字消失（菜单元素仍在），
- *   所以必须在点选 Free 之后、菜单仍打开时回读。会话页的 Capability 按钮是 disabled，菜单打不开，读不到席位，
- *   续轮因此先到组织首页读席位，再回原会话发送。
+ * DOM 契约：
+ * - 首页/会话页的输入框都是 div[role=textbox][aria-label="Prompt"]，发送是 button[aria-label="Send"]（2026-11-16 只读实测）。
+ * - Capability 触发按钮：菜单外、innerText 正好是 Fusion/Ultra/Normal/Lite/Free 之一的 button；
+ *   弹出层是 [role=menu]，里面 "Capability" 分组下有同名行（2026-11-16 只读实测）。
+ * - 选中 Free 后菜单是两层（2026-11-17 负责人真实页面实测）：第一层 Capability 列表仍开；第二层 Free 详情里有
+ *   "Free (powered by SWE-2)"、"The plan includes 2 concurrent sessions"、"N/M in use"。Free 项的角色是 role=menuitem
+ *   （负责人证据，标签未知）。第一次 Escape 只收详情，列表仍在；第二次才收起列表。
+ * - 首页选 Free 用 ego-browser 真实指针点击（page.click，按本次页面里打的 data-sck-* 标记定位）；真实指针选中 Free
+ *   已由负责人 2026-11-17 实测确认。旧版（0.13.41，页内 element.click() 选 Free）选不中的具体机制未证实：程序化点击
+ *   是否能打开 Capability 菜单、旧行选择器是否漏掉 Free 行、还是读数时序，都没有在页面上验证。本版不依赖其中任何一个，
+ *   只用指针点击。2026-11-17 正式派工的失败签名（按钮停在 Normal、powered=false）与其中任一情形都相容，无法据此区分。
+ *   流程（新会话与续轮共用 pickFree）：指针点 Capability（只点唯一的档位名按钮）→ 有界等待可见的 [role=menu]
+ *   里恰好一个精确的 Free 行 → 指针点它 → 菜单仍打开时有界回读 Free、powered、N/M in use → 逐层 Escape，
+ *   直到可见菜单为 0（只在可见菜单仍在时按，最多 4 次）。任何一步不成立都不发送。
+ * - 席位文字只在首页 Capability 菜单打开、选中 Free 时出现（收起 Free 详情后消失），所以必须在点选 Free 之后、
+ *   菜单仍打开时回读。会话页的 Capability 按钮是 disabled，菜单打不开，读不到席位，续轮因此先到组织首页读席位，再回原会话发送。
  * - 会话地址 https://app.devin.ai/sessions/<32hex>；侧栏 a[href^="/sessions/"] 列出会话。
  * - 会话页转录的发言角色按 2026-11-16 真实只读实测：Devin 回答块是
  *   [data-testid="transcript-agent-message"]，文字在 [data-message-author="devin"]；
@@ -34,6 +42,23 @@ const SEND = 'button[aria-label="Send"]';
 export const PRESSED = '__PRESSED__';
 /** Capability 档位名：触发按钮与菜单行都按精确文本匹配。 */
 const CAPS = ['Fusion', 'Ultra', 'Normal', 'Lite', 'Free'];
+/** 选中 Free 后逐层 Escape 的上限：真实页面两层只需两次，多留余量；仍收不起就受阻、零发送。 */
+const FREE_ESC_MAX = 4;
+/** 页面内表达式用的可见性判断：有尺寸且未 hidden。 */
+const SHOWN_JS = `(e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; }`;
+/**
+ * 页面内表达式：可见的 Capability 菜单里文字恰好是 Free 的行。嵌套时只留最内层，同一行不数两次；
+ * 只有恰好一行才算可点。页面内只用 DOM 只读，点击在 Node 侧用 page.click 完成。
+ */
+const FREE_ROWS_JS = `(() => {
+  const shown = ${SHOWN_JS};
+  const rows = [...document.querySelectorAll('[role=menu]')].filter(shown)
+    .flatMap(m => [...m.querySelectorAll('div,button,[role=menuitem],[role=menuitemradio],[role=option]')])
+    .filter(e => (e.innerText || '').trim() === 'Free');
+  return rows.filter(e => !rows.some(o => o !== e && e.contains(o)));
+})()`;
+/** 页面内表达式：当前可见的 [role=menu] 个数。两层菜单要逐层收起，数到 0 才算收起。 */
+const MENUS_JS = `[...document.querySelectorAll('[role=menu]')].filter(${SHOWN_JS}).length`;
 
 export interface DevinSeats { used: number; total: number }
 /** "The plan includes 2 concurrent sessions / 1/2 in use" 这类席位文字 → 用量。 */
@@ -70,7 +95,8 @@ const read = () => p.evaluate(() => {
   const body = document.body.innerText || '';
   const TASK = ${JSON.stringify(`[SCK-ROUND ${marker}]`)}, DONE = ${JSON.stringify(`[SCK-DONE ${marker}]`)};
   const QUOTED = ${JSON.stringify(`「[SCK-DONE ${marker}]」`)}, CONV_OPEN = ${JSON.stringify('「[SCK-DONE ')};
-  const capButton = [...document.querySelectorAll('button')].find(e => /^(${CAPS.join('|')})$/.test((e.innerText || '').trim()));
+  // 选中 Free 时点的那个按钮（已打标记）优先；没有标记才按档位名找，与点击用的是同一个元素。
+  const capButton = document.querySelector('[data-sck-cap-trigger]') || [...document.querySelectorAll('button')].find(e => /^(${CAPS.join('|')})$/.test((e.innerText || '').trim()));
   // 发言人只能按页面给出的角色块判定：Devin 回答是 [data-message-author="devin"]，用户消息是
   // [data-message-author="user"]。工具输出、worklog、PR 卡片没有作者属性，永远不参与终稿判定。
   const blocks = [...document.querySelectorAll('[data-message-author]')]
@@ -167,28 +193,66 @@ const sessionGate = (x) => {
 };`;
 
 /**
- * 组织首页选中 Free 并回读席位。席位文字只在 Capability 菜单打开、选中 Free 时出现（按 Escape 后消失，实测），
- * 所以不管当前显示什么档位都打开菜单点 Free 行，然后在菜单仍打开时读页面。
+ * 组织首页选中 Free 并回读（新会话与续轮共用）。顺序：指针点 Capability（只点唯一的档位名按钮）→ 有界等待可见菜单里
+ * 恰好一个 Free 行 → 指针点它 → 菜单仍打开时有界回读（席位文字只在此时出现）→ 逐层 Escape 直到可见菜单为 0。
+ * 结果写进 s：picked 表示点到了 Free 行，menuStuck 表示有界次数后仍有菜单挡着，pickWhy 写没点到的原因。门禁据此决定发不发。
  */
 const PICK_FREE = `
+const markCap = () => p.evaluate(() => {
+  document.querySelectorAll('[data-sck-cap-trigger]').forEach(e => e.removeAttribute('data-sck-cap-trigger'));
+  const caps = [...document.querySelectorAll('button')].filter(e => /^(${CAPS.join('|')})$/.test((e.innerText || '').trim()) && !e.closest('[role=menu]'));
+  if (caps.length === 1) caps[0].setAttribute('data-sck-cap-trigger', '1');
+  return caps.length;
+});
+const markFree = () => p.evaluate(() => {
+  document.querySelectorAll('[data-sck-free-row]').forEach(e => e.removeAttribute('data-sck-free-row'));
+  const rows = ${FREE_ROWS_JS};
+  if (rows.length === 1) rows[0].setAttribute('data-sck-free-row', '1');
+  return rows.length;
+});
+const menuCount = () => p.evaluate(() => ${MENUS_JS});
 const pickFree = async () => {
-  await p.evaluate(() => { const b = [...document.querySelectorAll('button')].find(e => /^(Fusion|Ultra|Normal|Lite|Free)$/.test((e.innerText || '').trim())); if (b) b.click(); });
-  await p.waitForTimeout(1200);
-  await p.evaluate(() => {
-    const menu = document.querySelector('[role=menu]');
-    const row = menu && [...menu.querySelectorAll('div,button,[role=menuitemradio],[role=option]')].find(e => (e.innerText || '').trim() === 'Free');
-    if (row) row.click();
-  });
-  await p.waitForTimeout(1500);
-  s = await read();
+  const caps = await markCap();
+  let rows = 0;
+  if (caps === 1) {
+    await p.click('loc=css:[data-sck-cap-trigger]', { label: 'open capability menu' });
+    for (let i = 0; i < 10 && rows !== 1; i++) {
+      if (i) await p.waitForTimeout(500);
+      rows = await markFree();
+    }
+  }
+  if (rows === 1) {
+    await p.click('loc=css:[data-sck-free-row]', { label: 'pick free capability' });
+    s = await read();
+    for (let i = 0; i < 6 && !(s.cap === 'Free' && s.powered && s.seats); i++) { await p.waitForTimeout(500); s = await read(); }
+  } else s = await read();
+  s.picked = rows === 1;
+  if (caps === 1) {
+    // 选中 Free 后是两层：第一次 Escape 只收详情，第二次才收列表。只在可见菜单仍在时按一次，按完等 DOM 更新
+    // （菜单数变了或超时）再数；数到 0 即停，不盲多按。有界次数后仍有菜单挡着，判为收不起。
+    let open = await menuCount();
+    for (let i = 0; i < ${FREE_ESC_MAX} && open > 0; i++) {
+      await p.keyboard.press('Escape');
+      for (let j = 0; j < 6; j++) {
+        await p.waitForTimeout(300);
+        const now = await menuCount();
+        if (now !== open) { open = now; break; }
+      }
+    }
+    s.menuStuck = open > 0;
+  }
+  s.pickWhy = caps !== 1 ? (caps === 0 ? '页面上找不到唯一的 Capability 按钮' : '页面上有 ' + caps + ' 个档位名按钮，无法确定哪个是 Capability')
+    : rows === 0 ? '点开 Capability 后菜单里没有可见的 Free 行'
+    : rows > 1 ? '菜单里有 ' + rows + ' 个 Free 行，无法确定' : '';
 };`;
 
-/** 组织首页核验（新会话与续轮共用）：选中 Free 且 powered、读得到席位、未满。都不通过就不碰发送按钮。 */
+/** 组织首页核验（新会话与续轮共用）：点到了 Free 行、选中 Free 且 powered、读得到席位、未满。都不通过就不碰发送按钮。 */
 const HOME_GATE = `
 const homeGate = (x) => {
   if (x.login) return { ok: false, code: 'login_required' };
   if (!ready) return { ok: false, code: 'not_ready' };
-  if (x.cap !== 'Free' || !x.powered) return { ok: false, code: 'capability', detail: 'Capability 未能确认选中 Free（按钮=' + String(x.cap) + '，powered=' + String(x.powered) + '）' };
+  if (x.menuStuck) return { ok: false, code: 'capability', detail: 'Capability 菜单按 Escape 后仍挡着页面，未发送' };
+  if (!x.picked || x.cap !== 'Free' || !x.powered) return { ok: false, code: 'capability', detail: 'Capability 未能确认选中 Free（' + (x.pickWhy || '按钮=' + String(x.cap) + '，powered=' + String(x.powered)) + '）' };
   if (!x.seats) return { ok: false, code: 'capability', detail: '页面读不到 Free 席位计数，无法核验容量' };
   if (x.seats.used >= x.seats.total) return { ok: false, code: 'quota_full', seats: x.seats.used + '/' + x.seats.total, cap: 'Free' };
   return null;
@@ -231,11 +295,11 @@ await openPage(${JSON.stringify(sessionUrl)});
 s = await read();
 const againStop = sessionGate(s);
 if (againStop) { emit(againStop); process.exit(0); }
-const target = 'css:' + ${JSON.stringify(INPUT)};
+const target = 'loc=css:' + ${JSON.stringify(INPUT)};
 await p.fill(target, MSG);
 await p.waitForTimeout(500);
 console.log('${PRESSED}');
-await p.click('css:' + ${JSON.stringify(SEND)}, { label: 'send message' });
+await p.click('loc=css:' + ${JSON.stringify(SEND)}, { label: 'send message' });
 for (let i = 0; i < 8; i++) {
   await p.waitForTimeout(2000);
   s = await read();
@@ -272,11 +336,11 @@ await pickFree();
 const stop = homeGate(s);
 if (stop) { emit(stop); process.exit(0); }
 const pre = s.seats;
-const target = 'css:' + ${JSON.stringify(INPUT)};
+const target = 'loc=css:' + ${JSON.stringify(INPUT)};
 await p.fill(target, MSG);
 await p.waitForTimeout(500);
 console.log('${PRESSED}');
-await p.click('css:' + ${JSON.stringify(SEND)}, { label: 'send message' });
+await p.click('loc=css:' + ${JSON.stringify(SEND)}, { label: 'send message' });
 let url = '';
 for (let i = 0; i < 15; i++) {
   await p.waitForTimeout(2000);
