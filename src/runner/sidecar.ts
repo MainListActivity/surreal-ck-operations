@@ -1,5 +1,4 @@
 import type { ProviderFailure } from '../dispatcher/provider-failover.ts';
-import { execFile } from 'node:child_process';
 import { LIFECYCLE_COMMANDS } from '../lifecycle-policy.ts';
 // Per-agent sidecar pool. Each company employee instance gets a private comm
 // directory and an in-memory credential held by the plugin; agents receive only
@@ -7,7 +6,7 @@ import { LIFECYCLE_COMMANDS } from '../lifecycle-policy.ts';
 // The sidecar claims tasks on the instance's behalf (dispatcher calls claim()),
 // keeps the lease alive while a turn runs, relays `sck call` requests through
 // req/res files, and ingests report.md/blocker.md when a turn ends.
-import { ExecutionJournal, workResult, finalAnswer, type ExecutionAttempt } from './lifecycle.ts';
+import { ExecutionJournal, workResult, finalAnswer, codeDeliveryDeclared, declaredCommit, type ExecutionAttempt } from './lifecycle.ts';
 import type { TurnEnded } from './contracts.ts';
 import { RuntimeResultError } from './turn-result.ts';
 import { OpsCircuit } from "./ops-circuit.ts";
@@ -268,6 +267,8 @@ export class SidecarPool {
   private readonly opsCircuit: OpsCircuit;
   private readonly journal?: ExecutionJournal;
   private readonly flushing = new Set<string>();
+  /** Single-flight closeout per employee: one pass reads and writes back an execution row at a time. */
+  private readonly collecting = new Set<string>();
   private readonly starts = new Map<string, string | undefined>();
   // Host turn IDs can be reused after a canceled execution or a new delivery.
   // Count accepted starts, rather than timestamps (two starts may share a millisecond).
@@ -342,44 +343,99 @@ export class SidecarPool {
       // Failed/canceled output is never treated as a successful business result.
       return { status: 'silent', silent: { deliveryId: row.proof.deliveryId, instId: employee, taskId: row.task, nudges: 3, phase: row.phase } };
     }
-    const dir = this.commDirFor(employee);
     // Snapshot artifacts with this delivery before any asynchronous cloud mirror can yield to a new claim.
-    row.artifacts = live?.proof.deliveryId === row.proof.deliveryId
-      ? { raw: readTextFile(join(dir, 'result.json')), blocker: readTextFile(blockerPath(dir)), report: readTextFile(reportPath(dir)) } : {};
+    // With a timeline reader, collection reads them again once the turn is confirmed finished.
+    row.artifacts = this.leasedArtifacts(row) ?? {};
     row.state = 'collecting'; await this.changed(row);
     return this.collectExecution(row);
   }
+  /** This delivery's comm files, read only while its lease is still held: undefined once another claim owns the directory. */
+  private leasedArtifacts(row: ExecutionAttempt): NonNullable<ExecutionAttempt['artifacts']> | undefined {
+    if (this.claims.get(row.employee)?.proof.deliveryId !== row.proof.deliveryId) return undefined;
+    const dir = this.commDirFor(row.employee);
+    return { raw: readTextFile(join(dir, 'result.json')), blocker: readTextFile(blockerPath(dir)), report: readTextFile(reportPath(dir)) };
+  }
+  private hasArtifacts(row: ExecutionAttempt): boolean {
+    return !!(row.artifacts?.raw || row.artifacts?.report || row.artifacts?.blocker);
+  }
+  /** Disk truth mid-collection: a concurrent settle/retry works on a stale copy, so before writing back
+   *  the pass re-reads the row and stops when it is no longer 'collecting' (settled, interrupted, superseded). */
+  private stillCollecting(row: ExecutionAttempt): boolean {
+    return this.journal?.read(row.employee, row.proof.deliveryId)?.state === 'collecting';
+  }
   private async collectExecution(row: ExecutionAttempt): Promise<SettleResult> {
-    if (!row.finalText && !row.artifacts?.raw && !row.artifacts?.report && !row.artifacts?.blocker && this.deps.readTurnResult) {
-      try {
-        if (!row.agent || !row.turn) throw new Error('missing turn identity');
-        row.finalText = await this.deps.readTurnResult(row.agent, row.turn, row.startedAt ?? row.createdAt ?? 0);
-        if (!row.finalText.trim()) throw new Error('empty runtime result');
-        row.error = undefined;
-        await this.changed(row);
-      } catch (error) {
-        // A late answer is normal, so each failure is retried. Only the bounded window decides that it never arrives.
-        row.tries++; row.error = `runtime_result_unavailable:${error instanceof RuntimeResultError ? error.reason : 'read_failed'}`;
-        if (row.tries >= RESULT_READ_ATTEMPTS) return this.blockUnreadableResult(row);
-        row.nextRetry = Date.now() + resultReadDelay(row.tries);
-        await this.changed(row);
-        return {status: 'pending'};
-      }
-    }
+    // Single-flight: without this a settle event and a scheduled retry can both read the same turn and
+    // submit the same result — the in-memory copy each holds stays 'pending' even after the other settles.
+    if (this.collecting.has(row.employee)) return { status: 'pending' };
+    this.collecting.add(row.employee);
     try {
-      const { raw, blocker, report } = row.artifacts ?? {}; // Never read a later delivery's shared files during recovery.
-      row.result = blocker !== undefined ? workResult('', row.phase, { summary: blocker, outcome: 'blocked' })
-        : workResult(report || row.finalText || '', row.phase, raw === undefined ? undefined : JSON.parse(raw));
-      row.state = 'pending'; row.nextRetry = 0;
-    } catch {
-      row.state = 'attention'; row.error = '工作结果缺失或复核结论不明确';
-      // Missing business output is a genuine work gap; the runner records it, no protocol troubleshooting is assigned.
-      row.result = workResult('', row.phase, { outcome: 'blocked', summary: '本轮已结束，但工作结果缺失或复核结论不明确，需要补充工作结论。' });
-      row.state = 'pending';
+      if (this.deps.readTurnResult || row.finalText?.trim()) {
+        try {
+          if (this.deps.readTurnResult) {
+            if (!row.agent || !row.turn) throw new Error('missing turn identity');
+            // The durable timeline is the only trusted turn state: an end event can carry a text that
+            // declares a commit while turn-fenced tools are still running, so the read always happens —
+            // it both checks in-flight rows and returns the turn's real last answer. Files already on disk
+            // do not skip it, because a tool still running may be the one writing them.
+            const text = await this.deps.readTurnResult(row.agent, row.turn, row.startedAt ?? row.createdAt ?? 0);
+            if (!text.trim()) throw new Error('empty runtime result');
+            if (!this.stillCollecting(row)) return { status: 'pending' };
+            row.finalText = text;
+            // Files are read only after the in-flight check passed, while this delivery still holds its lease.
+            row.artifacts = this.leasedArtifacts(row) ?? row.artifacts;
+            row.error = undefined;
+            await this.changed(row);
+          }
+          // Files this turn wrote are the explicit deliverable, and their commit is checked before submit. Text alone
+          // must declare the contract (verified commit line, review verdict or blocked heading): a progress message is not
+          // a delivery, so the bounded window keeps waiting. The worktree HEAD never stands in for an undeclared commit.
+          if (!this.hasArtifacts(row) && row.finalText?.trim() && await this.undeclaredDelivery(row, row.finalText)) {
+            if (this.deps.readTurnResult) row.finalText = undefined;
+            throw new RuntimeResultError('not_yet_available', 'runtime final result not yet available');
+          }
+        } catch (error) {
+          if (!this.stillCollecting(row)) return { status: 'pending' };
+          // A late answer is normal, so each failure is retried. Only the bounded window decides that it never arrives.
+          row.tries++; row.error = `runtime_result_unavailable:${error instanceof RuntimeResultError ? error.reason : 'read_failed'}`;
+          if (row.tries >= RESULT_READ_ATTEMPTS) return this.blockUnreadableResult(row);
+          row.nextRetry = Date.now() + resultReadDelay(row.tries);
+          await this.changed(row);
+          return {status: 'pending'};
+        }
+      }
+      if (!this.stillCollecting(row)) return { status: 'pending' };
+      try {
+        const { raw, blocker, report } = row.artifacts ?? {}; // Never read a later delivery's shared files during recovery.
+        row.result = blocker !== undefined ? workResult('', row.phase, { summary: blocker, outcome: 'blocked' })
+          : workResult(report || row.finalText || '', row.phase, raw === undefined ? undefined : JSON.parse(raw));
+        // A result.json without sha takes the commit the report or the final answer declares; the worktree HEAD never does.
+        const declared = declaredCommit(report) ?? declaredCommit(row.finalText);
+        if (row.result.action === 'submit' && declared && !row.result.evidence.sha) row.result.evidence.sha = declared;
+        row.state = 'pending'; row.nextRetry = 0;
+      } catch {
+        row.state = 'attention'; row.error = '工作结果缺失或复核结论不明确';
+        // Missing business output is a genuine work gap; the runner records it, no protocol troubleshooting is assigned.
+        row.result = workResult('', row.phase, { outcome: 'blocked', summary: '本轮已结束，但工作结果缺失或复核结论不明确，需要补充工作结论。' });
+        row.state = 'pending';
+      }
+      await this.changed(row);
+      await this.flushExecution(row);
+      return { status: (row as ExecutionAttempt).state === 'settled' ? 'ingested' : 'pending' };
+    } finally { this.collecting.delete(row.employee); }
+  }
+  /**
+   * A review answer must declare its verdict （复核结论：通过/退回） or a blocked heading; a doing answer
+   * on a code task must declare the verified commit line or a blocked heading. Anything else is a progress
+   * message, not a delivery — the read keeps waiting instead of closing out on it, and the worktree HEAD
+   * must not stand in for a commit the employee never declared.
+   */
+  private async undeclaredDelivery(row: ExecutionAttempt, text: string): Promise<boolean> {
+    if (row.phase === 'review') {
+      const heading = text.trim().split(/\r?\n/, 1)[0]!.replace(/[*#]/g, '').trim();
+      return !/^(复核结论[:：]\s*(通过|退回)|工作结果[:：]\s*受阻)\s*$/.test(heading);
     }
-    await this.changed(row);
-    await this.flushExecution(row);
-    return { status: (row as ExecutionAttempt).state === 'settled' ? 'ingested' : 'pending' };
+    const task = await this.callWithCred(row.employee, cred => this.deps.core.getTask(cred, row.task));
+    return task.workIntent?.kind === 'code' && !codeDeliveryDeclared(text);
   }
   /**
    * The read window ended without a final answer. Submit an explicit block instead of collecting forever: the owner
@@ -429,16 +485,18 @@ export class SidecarPool {
     if (!this.launched.has(row.employee) || this.quarantined.has(row.employee)) return;
     this.flushing.add(row.employee);
     try {
+      // The in-memory row may be a stale copy of a pass that already committed on disk — only a row
+      // still pending with a result may reach the core call.
+      const disk = this.journal.read(row.employee, row.proof.deliveryId);
+      if (!disk || disk.state !== 'pending' || !disk.result) return;
       // Frozen proof + evidence: retry an uncertain commit exactly, before reading/updating its version.
       const core = this.deps.core;
       if (!row.prepared && row.result.action === 'submit') {
         const task = await this.callWithCred(row.employee, cred => core.getTask(cred, row.task));
-        if (!row.result.evidence.sha && task.workIntent?.kind === 'code' && task.worktree?.worktreePath) {
-          const head = await new Promise<string | undefined>(resolve => execFile('git', ['-C', task.worktree!.worktreePath, 'rev-parse', 'HEAD'],
-            { timeout: 10000, maxBuffer: 1024 * 1024 }, (error, stdout) => resolve(!error && /^[a-f0-9]{40}$/i.test(stdout.trim()) ? stdout.trim() : undefined)));
-          if (head) row.result.evidence.sha = head;
-        }
         if (task.acceptanceEnvironment) row.result.evidence.acceptance = { ...row.result.evidence.acceptance, environment: task.acceptanceEnvironment };
+        // A code delivery names its commit explicitly. The worktree HEAD never stands in for one: an undeclared commit is
+        // blocked with its reason, and the original work stays in the journal.
+        if (task.workIntent?.kind === 'code' && !row.result.evidence.sha) this.blockResult(row, '代码成果未声明完整提交 SHA（结构化结果无 sha，成果正文与最终答复也没有“提交：<完整40位SHA>”行）');
         row.prepared = true;
         this.journal.save(row);
       }

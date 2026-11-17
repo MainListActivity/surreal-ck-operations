@@ -11,8 +11,19 @@ test('老板端的启动命令预览与执行端实际参数同源：可执行�
   });
   expect(launchPreview({ provider: 'claude', model: 'm', thinking: 'max' }).argv.join(' '))
     .toBe('claude -p --output-format stream-json --verbose --model m --effort max --permission-mode bypassPermissions');
-  expect(launchPreview({ provider: 'factory-droid', model: 'm' }).argv.join(' ')).toBe('droid exec --output-format stream-json --model m --auto high');
+  expect(launchPreview({ provider: 'factory-droid', model: 'm' }).argv.join(' ')).toBe('droid exec --output-format stream-json --model m --remove-tools task-cli,task-output-cli,task-stop-cli --auto high');
   expect(launchPreview({ provider: 'codex', model: 'auto:sol', thinking: 'high' }).argv).toContain('--dangerously-bypass-approvals-and-sandbox');
+});
+
+test('factory-droid exec/stream-json 固定移除子代理工具：task-cli、task-output-cli、task-stop-cli；其它 provider 与正常工作工具不受影响', () => {
+  const argv = nativeArgs({ provider: 'factory-droid', model: 'm', mode: 'auto-high' });
+  expect(argv).toContain('--output-format');
+  expect(argv).toContain('stream-json'); // stream-jsonrpc 忽略此选项，只在 exec/stream-json 入口收紧
+  const at = argv.indexOf('--remove-tools');
+  expect(at).toBeGreaterThan(-1);
+  expect(argv[at + 1]?.split(',').sort()).toEqual(['task-cli', 'task-output-cli', 'task-stop-cli']);
+  for (const provider of ['claude', 'codex', 'devin-cloud'] as const)
+    expect(nativeArgs({ provider, model: 'm', mode: provider === 'claude' ? 'bypassPermissions' : provider === 'codex' ? 'full-access' : undefined })).not.toContain('--remove-tools');
 });
 
 test('经 Paseo 启动的 provider 没有命令行可预览；空的思考强度不出现 --effort', () => {

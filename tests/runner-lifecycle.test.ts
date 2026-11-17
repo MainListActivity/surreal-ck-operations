@@ -36,23 +36,27 @@ test('执行批次与结果重启后保持，重放使用同一幂等键', () =>
 import { SidecarPool } from '../src/runner/sidecar.ts';
 import { settleCompanyTurn, TurnInterruptions } from '../src/runner/turn-closeout.ts';
 import { writeFileSync, existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import type { LeaseProof, ClaimResult } from '../src/contracts.ts';
 
-function fixture(readTurnResult?: (agent: string, turn: string) => Promise<string>) {
+function fixture(readTurnResult?: (agent: string, turn: string, startedAt?: number) => Promise<string>) {
   const root = mkdtempSync(join(tmpdir(), 'sck-runner-flow-'));
-  const calls: Array<{ action: string; proof: LeaseProof; key: string; text?: string }> = [];
+  const calls: Array<{ action: string; proof: LeaseProof; key: string; text?: string; sha?: string }> = [];
   let delivery = 'delivery-a', version = 2, phase: 'doing' | 'review' = 'doing', submitted = false;
-  let fail = false, loseReply = false, failRead = false;
+  let fail = false, loseReply = false, failRead = false, codeIntent = false;
+  let worktreePath: string | undefined;
   let refusal: { code: string; message: string; times: number } | undefined;
   let accepted = 0;
   const mirror: Array<{ state: string; error?: string; attempts: number }> = [];
   const inst = { id: 'worker', role: 'engineering' as const, credential: 'synthetic', paseoAgentId: undefined as string | undefined };
   const task = () => ({ id: 'task', state: phase, version, fence: 1, deliveryId: delivery, currentEmployee: 'worker',
+    ...(codeIntent ? { workIntent: { kind: 'code' as const } } : {}),
+    ...(worktreePath ? { worktree: { worktreePath } } : {}),
     leaseExpiresAt: new Date(Date.now() + 600000).toISOString() });
   const result = () => ({ task: task(), fence: 1, deliveryId: delivery, leaseExpiresAt: task().leaseExpiresAt, history: [] }) as unknown as ClaimResult;
   const committed = new Set<string>();
-  const transition = (action: string) => async (_cred: string, proof: LeaseProof, evidence: { idempotencyKey: string; text?: string }) => {
-    calls.push({ action, proof: { ...proof }, key: evidence.idempotencyKey, text: evidence.text });
+  const transition = (action: string) => async (_cred: string, proof: LeaseProof, evidence: { idempotencyKey: string; text?: string; sha?: string }) => {
+    calls.push({ action, proof: { ...proof }, key: evidence.idempotencyKey, text: evidence.text, sha: evidence.sha });
     if (committed.has(evidence.idempotencyKey)) return task();
     if (action === 'submit' && refusal && refusal.times > 0) { refusal.times--; throw Object.assign(new Error(refusal.message), { code: refusal.code }); }
     if (fail) throw new Error('synthetic network failure');
@@ -77,7 +81,8 @@ function fixture(readTurnResult?: (agent: string, turn: string) => Promise<strin
   return { core, workforce, root, calls, inst, event, journal,
     settle: (value = event(), interruptions?: TurnInterruptions) => settleCompanyTurn({sidecar: pool, workforce} as never, {} as never, value as never, interruptions),
     get pool() { return pool; },
-    fail(value: boolean) { fail = value; }, loseReply() { loseReply = true; }, failRead(value: boolean) { failRead = value; },
+    fail(value: boolean) { fail = value; }, loseReply() { loseReply = true; }, failRead(value: boolean) { failRead = value; }, code(value = true) { codeIntent = value; },
+    worktree(path: string) { worktreePath = path; },
     refuse(code: string, times: number, message: string) { refusal = { code, message, times }; },
     accepted: () => accepted, mirror: () => mirror,
     async claim(review = false) { phase = review ? 'review' : 'doing'; pool.env(inst); inst.paseoAgentId = 'agent'; pool.bindAgent(inst.id, 'agent'); await pool.claim(inst, { id: 'task' } as never); },
@@ -298,6 +303,300 @@ test('投影中工具条目晚于最终答复结束时，仍按首次出现的�
     {turnId:'a',seqStart:3,seqEnd:4,item:{type:'assistant_message',text:'正在检查'}},
     {turnId:'a',seqStart:5,seqEnd:6,item:{type:'tool_call'}},
   ]),'agent','a')).rejects.toMatchObject({ reason: 'not_yet_available' });
+});
+
+test('快照显示空闲但回合内工具仍在运行：最后一条进度消息不当终稿，工具结束后读到同一回合的答复', async () => {
+  const host = (entries: unknown[], agent?: unknown) => ({agents:{ref:()=>({timeline:{refetch:async()=>({epoch:'e',hasOlder:false,agent,entries})}})}}) as never;
+  // 真实模式：投影 idle/activeTurn null，工具行按 seqStart 排在答复之前，答复本身只是进度。
+  await expect(readTurnResult(host([
+    {turnId:'a',seqStart:1,seqEnd:5,item:{type:'tool_call',status:'running'}},
+    {turnId:'a',seqStart:3,seqEnd:4,item:{type:'assistant_message',text:'独立 QA 已启动，报告回来后给出最终答复。'}},
+  ],{status:'idle',activeTurn:null}),'agent','a')).rejects.toMatchObject({ reason: 'still_active' });
+  // 声明了提交行的答复之后仍有工具在跑，同样不算终稿。
+  await expect(readTurnResult(host([
+    {turnId:'a',seqStart:3,seqEnd:4,item:{type:'assistant_message',text:'提交：' + 'a'.repeat(40)}},
+    {turnId:'a',seqStart:1,seqEnd:6,item:{type:'tool_call',status:'running'}},
+  ]),'agent','a')).rejects.toMatchObject({ reason: 'still_active' });
+  // 进行中的压缩同样是回合内未完成的供应方工作。
+  await expect(readTurnResult(host([
+    {turnId:'a',seqStart:3,seqEnd:4,item:{type:'assistant_message',text:'看似终稿'}},
+    {turnId:'a',seqStart:1,seqEnd:6,item:{type:'compaction',status:'loading'}},
+  ]),'agent','a')).rejects.toMatchObject({ reason: 'still_active' });
+  // 工具完成后读到同一回合里迟到的答复。
+  expect(await readTurnResult(host([
+    {turnId:'a',seqStart:1,seqEnd:5,item:{type:'tool_call',status:'completed'}},
+    {turnId:'a',seqStart:3,seqEnd:4,item:{type:'assistant_message',text:'进度'}},
+    {turnId:'a',seqStart:6,seqEnd:7,item:{type:'assistant_message',text:'终稿'}},
+  ]),'agent','a')).toBe('终稿');
+});
+
+test('运行中工具按 seqStart 固定到靠前页时，分页扫到仍判为回合未结束', async () => {
+  const pages = [
+    {epoch:'e',hasOlder:true,startCursor:{epoch:'e',seq:100},entries:[
+      {turnId:'a',seqStart:200,seqEnd:201,item:{type:'assistant_message',text:'看似终稿'}},
+      {turnId:'b',seqStart:210,seqEnd:211,item:{type:'assistant_message',text:'另一回合'}}]},
+    {epoch:'e',hasOlder:false,entries:[
+      {turnId:'a',seqStart:50,seqEnd:60,item:{type:'tool_call',status:'running'}},
+      {turnId:'a',seqStart:70,seqEnd:80,item:{type:'assistant_message',text:'更早的进度'}}]},
+  ];
+  let i = 0;
+  const host = {agents:{ref:()=>({timeline:{refetch:async()=>pages[i++]}})}} as never;
+  await expect(readTurnResult(host,'agent','a')).rejects.toMatchObject({ reason: 'still_active' });
+});
+
+test('收尾竞态复现：空闲快照+进度消息+运行中工具不提前送审，迟到终稿按声明 SHA 只提交一次', async () => {
+  const sha = 'b'.repeat(40);
+  const at = () => new Date().toISOString();
+  let entries: unknown[] = [
+    {turnId:'turn-a',timestamp:at(),seqStart:1,seqEnd:5,item:{type:'tool_call',status:'running'}},
+    {turnId:'turn-a',timestamp:at(),seqStart:3,seqEnd:4,item:{type:'assistant_message',text:'独立 QA 已启动，报告回来后给出最终答复。'}},
+  ];
+  const host = {agents:{ref:()=>({timeline:{refetch:async()=>({epoch:'e',hasOlder:false,agent:{status:'idle',activeTurn:null},entries})}})}};
+  const f = fixture((agent, turn, startedAt) => readTurnResult(host as never, agent, turn, startedAt));
+  try {
+    f.code();
+    await f.claim(); await f.pool.turnStarted('agent','turn-a');
+    await f.pool.settleExecution({ ...f.event(), timeline: [] });
+    expect(f.calls).toHaveLength(0);
+    expect(f.journal().rows()[0]?.state).toBe('collecting');
+    expect(f.journal().rows()[0]?.error).toBe('runtime_result_unavailable:still_active');
+    expect(f.pool.holdsLease('worker','task')).toBe(true);
+    // 工具结束，同一回合补出真正的终稿：按声明的 SHA 送审，收尾只发生一次。
+    entries = [
+      {turnId:'turn-a',timestamp:at(),seqStart:1,seqEnd:5,item:{type:'tool_call',status:'completed'}},
+      {turnId:'turn-a',timestamp:at(),seqStart:3,seqEnd:4,item:{type:'assistant_message',text:'独立 QA 已启动，报告回来后给出最终答复。'}},
+      {turnId:'turn-a',timestamp:at(),seqStart:6,seqEnd:7,item:{type:'assistant_message',text:`逐条自验完成，CI 全绿。\n提交：${sha}`}},
+    ];
+    await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['submit']);
+    expect(f.calls[0]?.sha).toBe(sha);
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+    expect(f.pool.holdsLease('worker','task')).toBe(false);
+    await f.retry();
+    expect(f.calls).toHaveLength(1);
+  } finally { f.close(); }
+});
+
+test('代码任务未声明提交行的进度消息不按 HEAD 补齐送审，窗口耗尽转为可恢复受阻', async () => {
+  const f = fixture(async () => '独立 QA 已启动，报告回来后给出最终答复。');
+  try {
+    f.code();
+    await f.claim(); await f.pool.turnStarted('agent','turn-a');
+    await f.pool.settleExecution({ ...f.event(), timeline: [] });
+    expect(f.calls).toHaveLength(0);
+    expect(f.journal().rows()[0]?.state).toBe('collecting');
+    expect(f.journal().rows()[0]?.error).toBe('runtime_result_unavailable:not_yet_available');
+    for (let i = 0; i < 18; i++) await f.retry();
+    expect(f.calls).toHaveLength(0);
+    await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['block']);
+    expect(f.calls[0]?.text).toContain('连续 20 次');
+    expect(f.calls[0]?.text).toContain('not_yet_available');
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+  } finally { f.close(); }
+});
+
+test('代码任务窗口内收到声明提交行的迟到终稿：按声明 SHA 提交一次，不消耗受阻路径', async () => {
+  const sha = 'c'.repeat(40);
+  let answer = '正在复验，稍后给出结论。';
+  const f = fixture(async () => answer);
+  try {
+    f.code();
+    await f.claim(); await f.pool.turnStarted('agent','turn-a');
+    await f.pool.settleExecution({ ...f.event(), timeline: [] });
+    answer = `全部完成。\n提交：${sha}`;
+    await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['submit']);
+    expect(f.calls[0]?.sha).toBe(sha);
+  } finally { f.close(); }
+});
+
+test('事件携带文本不旁路持久时间线：携带提交行的进度事件在工具仍运行时不送审，工具结束后按真实终稿提交一次', async () => {
+  // 82c5672 负例：completed 事件携带“进度…后台验证工具仍在运行。\n提交：<sha>”，
+  // row.finalText || readTurnResult 跳过持久时间线读直接 submit（reads=0）。
+  const sha = 'd'.repeat(40);
+  let live = true, reads = 0;
+  const f = fixture(async () => { reads++;
+    if (live) throw new RuntimeResultError('still_active', 'synthetic running tool');
+    return `逐条自验完成，CI 全绿。\n提交：${sha}`; });
+  try {
+    f.code();
+    await f.claim(); await f.pool.turnStarted('agent','turn-a');
+    await f.settle(f.event('turn-a', `进度：提交已推送，后台验证工具仍在运行。\n提交：${'a'.repeat(40)}`));
+    expect(reads).toBeGreaterThan(0);
+    expect(f.calls).toHaveLength(0);
+    expect(f.journal().rows()[0]?.state).toBe('collecting');
+    expect(f.journal().rows()[0]?.error).toBe('runtime_result_unavailable:still_active');
+    live = false;
+    await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['submit']);
+    expect(f.calls[0]?.sha).toBe(sha); // 按持久时间线的真实终稿 SHA，而非事件携带的 SHA。
+  } finally { f.close(); }
+  // 复核阶段同样以持久时间线为准：事件携带的进度消息不产生受阻，真实结论到达后一次送审。
+  const g = fixture(async () => '复核结论：通过\n逐项复验全部符合要求');
+  try {
+    await g.claim(true); await g.pool.turnStarted('agent','turn-a');
+    await g.settle(g.event('turn-a', '复核还在进行，稍后给出结论。'));
+    expect(g.calls.map(c => c.action)).toEqual(['accept']);
+  } finally { g.close(); }
+});
+
+test('产物不旁路在途工具：result.json 已写出但工具仍运行时不送审，工具结束后按产物提交一次', async () => {
+  const sha = '1'.repeat(40);
+  let live = true;
+  const f = fixture(async () => { if (live) throw new RuntimeResultError('still_active', 'synthetic running tool'); return '逐条自验完成，CI 全绿。'; });
+  try {
+    f.code();
+    await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
+    writeFileSync(join(f.pool.commDirFor('worker'), 'result.json'), JSON.stringify({ summary: '产物已写出，后台工具仍在运行。', sha }));
+    await f.settle(f.event('turn-a', '进度：后台工具仍在运行。'));
+    expect(f.calls).toHaveLength(0);
+    expect(f.journal().rows()[0]?.state).toBe('collecting');
+    expect(f.journal().rows()[0]?.error).toBe('runtime_result_unavailable:still_active');
+    live = false;
+    await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['submit']);
+    expect(f.calls[0]?.sha).toBe(sha);
+    expect(f.calls[0]?.text).toContain('产物已写出');
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+  } finally { f.close(); }
+});
+test('代码产物不补工作树 HEAD：result.json 与最终答复都未声明提交时直接受阻；report.md 声明的提交行才送审', async () => {
+  const repo = mkdtempSync(join(tmpdir(), 'sck-wt-'));
+  execFileSync('git', ['init', '-q', repo]); writeFileSync(join(repo, 'a.txt'), 'x');
+  execFileSync('git', ['-C', repo, 'add', '.']);
+  execFileSync('git', ['-C', repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'x']);
+  try {
+    const f = fixture(async () => '代码已完成并通过本地验证。');
+    try {
+      f.code(); f.worktree(repo);
+      await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
+      writeFileSync(join(f.pool.commDirFor('worker'), 'result.json'), JSON.stringify({ summary: '代码已完成，但没有声明提交。' }));
+      await f.settle(f.event('turn-a', '代码已完成并通过本地验证。'));
+      expect(f.calls.map(c => c.action)).toEqual(['block']);
+      expect(f.calls[0]?.sha).toBeUndefined();
+      expect(f.calls[0]?.text).toContain('未声明完整提交 SHA');
+      expect(f.journal().rows()[0]?.state).toBe('settled');
+    } finally { f.close(); }
+    const declared = 'd'.repeat(40);
+    const g = fixture(async () => '全部完成。');
+    try {
+      g.code(); g.worktree(repo);
+      await g.claim(); await g.pool.turnStarted('agent', 'turn-a');
+      writeFileSync(join(g.pool.commDirFor('worker'), 'report.md'), `自验完成，报告已写入。\n提交：${declared}`);
+      await g.settle(g.event('turn-a', '全部完成。'));
+      expect(g.calls.map(c => c.action)).toEqual(['submit']);
+      expect(g.calls[0]?.sha).toBe(declared);
+    } finally { g.close(); }
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+test('收尾单飞：结束事件与重试并发读取同一回合只送审一次', async () => {
+  const sha = 'e'.repeat(40);
+  const f = fixture(async () => { await new Promise(r => setTimeout(r, 10)); return `完成。\n提交：${sha}`; });
+  try {
+    f.code();
+    await f.claim(); await f.pool.turnStarted('agent','turn-a');
+    await Promise.all([
+      f.pool.settleExecution({ ...f.event(), timeline: [] }),
+      f.pool.retryExecutions(), f.pool.retryExecutions(),
+    ]);
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]?.action).toBe('submit');
+    expect(f.calls[0]?.sha).toBe(sha);
+  } finally { f.close(); }
+  // 并发重复结束事件同样只送审一次。
+  const g = fixture(async () => { await new Promise(r => setTimeout(r, 10)); return `完成。\n提交：${'f'.repeat(40)}`; });
+  try {
+    g.code(); await g.claim(); await g.pool.turnStarted('agent','turn-a');
+    await Promise.all([g.settle(g.event()), g.settle(g.event()), g.settle(g.event())]);
+    expect(g.calls).toHaveLength(1);
+  } finally { g.close(); }
+});
+
+test('原生路径同一门禁：未声明提交行的进度文本不借工作树 HEAD 送审，声明 SHA 优先于前进的 HEAD', async () => {
+  // 原生宿主没有 readTurnResult，事件文本是唯一结果来源：同样要过声明门禁。
+  const repo = mkdtempSync(join(tmpdir(), 'sck-wt-'));
+  execFileSync('git', ['init', '-q', repo]); writeFileSync(join(repo, 'a.txt'), 'x');
+  execFileSync('git', ['-C', repo, 'add', '.']);
+  execFileSync('git', ['-C', repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'x']);
+  const head = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD']).toString().trim();
+  try {
+    const f = fixture();
+    try {
+      f.code(); f.worktree(repo);
+      await f.claim(); await f.pool.turnStarted('agent','turn-a');
+      await f.settle(f.event('turn-a', '独立 QA 已启动，报告回来后给出最终答复。'));
+      expect(f.calls).toHaveLength(0);
+      expect(f.journal().rows()[0]?.error).toBe('runtime_result_unavailable:not_yet_available');
+      for (let i = 0; i < 19; i++) await f.retry();
+      // 窗口耗尽明确受阻：不把未声明的进度按工作树 HEAD 补成已完成。
+      expect(f.calls.map(c => c.action)).toEqual(['block']);
+      expect(f.journal().rows()[0]?.state).toBe('settled');
+    } finally { f.close(); }
+    const declared = 'b'.repeat(40);
+    const g = fixture();
+    try {
+      g.code(); g.worktree(repo);
+      await g.claim(); await g.pool.turnStarted('agent','turn-a');
+      await g.settle(g.event('turn-a', `完成。\n提交：${declared}`));
+      expect(g.calls.map(c => c.action)).toEqual(['submit']);
+      expect(g.calls[0]?.sha).toBe(declared); // PR 头可以前进：送审 SHA 绑定声明值，不回读 HEAD。
+      expect(g.calls[0]?.sha).not.toBe(head);
+    } finally { g.close(); }
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('复核阶段进度消息不产生结论：等待真实结论到达后一次送审', async () => {
+  let answer = '复核还在进行，稍后给出结论。';
+  const f = fixture(async () => answer);
+  try {
+    await f.claim(true); await f.pool.turnStarted('agent','turn-a');
+    await f.settle(f.event());
+    expect(f.calls).toHaveLength(0);
+    expect(f.journal().rows()[0]?.error).toBe('runtime_result_unavailable:not_yet_available');
+    answer = '复核结论：退回\n第二条验收未满足。';
+    await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['return']);
+    await f.retry();
+    expect(f.calls).toHaveLength(1);
+  } finally { f.close(); }
+});
+
+test('运行中工具时执行端重启：恢复后继续有界等待，终稿只提交一次', async () => {
+  const sha = '9'.repeat(40);
+  let live = true;
+  const f = fixture(async () => { if (live) throw new RuntimeResultError('still_active', 'running tool'); return `完成。\n提交：${sha}`; });
+  try {
+    f.code(); await f.claim(); await f.pool.turnStarted('agent','turn-a');
+    await f.settle(f.event());
+    expect(f.journal().rows()[0]?.state).toBe('collecting');
+    await f.restart();
+    await f.retry();
+    expect(f.calls).toHaveLength(0);
+    expect(f.journal().rows()[0]?.state).toBe('collecting');
+    live = false;
+    await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['submit']);
+    expect(f.calls[0]?.sha).toBe(sha);
+    await f.retry();
+    expect(f.calls).toHaveLength(1);
+  } finally { f.close(); }
+});
+
+test('代码任务首行受阻结论按受阻契约提交，非代码任务散文答复按原契约送审', async () => {
+  const f = fixture(async () => '工作结果：受阻\n缺少已授权的账号，无法继续。');
+  try {
+    f.code();
+    await f.claim(); await f.pool.turnStarted('agent','turn-a');
+    await f.pool.settleExecution({ ...f.event(), timeline: [] });
+    expect(f.calls.map(c => c.action)).toEqual(['block']);
+  } finally { f.close(); }
+  const g = fixture(async () => '完成情况、验证证据与产物位置均已给出。');
+  try {
+    await g.claim(); await g.pool.turnStarted('agent','turn-a');
+    await g.pool.settleExecution({ ...g.event(), timeline: [] });
+    expect(g.calls.map(c => c.action)).toEqual(['submit']);
+  } finally { g.close(); }
 });
 
 

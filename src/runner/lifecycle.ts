@@ -71,13 +71,29 @@ export function workResult(text: string, phase: 'doing' | 'review', structured?:
       else if (/^复核结论[:：]\s*退回\s*$/.test(heading)) action = 'return';
       else fail('复核结果缺少明确的通过或退回结论');
     }
-    const sha = /^提交[:：]\s*([a-f0-9]{40})\s*$/im.exec(summary)?.[1];
+    const sha = declaredCommit(summary);
     if (sha) evidence.sha = sha;
   }
   if (!summary) fail('没有工作结果');
   // Full output remains in the private journal. The company evidence has a bounded summary.
   evidence.text = `执行端自动收集的工作结果：\n${summary}`.slice(0, 29000);
   return { action, evidence };
+}
+
+/** The verified-commit line a code delivery declares: `提交：<完整40位SHA>`. This is the only explicit SHA source besides result.json `sha`. */
+export function declaredCommit(text: string | undefined): string | undefined {
+  return /^提交[:：]\s*([a-f0-9]{40})\s*$/im.exec(text ?? '')?.[1];
+}
+
+/**
+ * What a runtime-read final answer must declare before a code task may treat it as the delivery:
+ * the verified-commit line the dispatch requires, or a leading blocked verdict. A progress message
+ * has neither, so it never becomes a result — and never borrows the worktree HEAD as its sha.
+ */
+export function codeDeliveryDeclared(text: string): boolean {
+  if (declaredCommit(text)) return true;
+  const heading = text.trim().split(/\r?\n/, 1)[0]!.replace(/[*#]/g, '').trim();
+  return /^工作结果[:：]\s*受阻\s*$/.test(heading);
 }
 
 export function finalAnswer(event: TurnEnded): string {

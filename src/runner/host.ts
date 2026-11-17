@@ -16,7 +16,7 @@ export interface RuntimeHost {
       agent?: {status?: string; activeTurn?: {turnId: string} | null} | null;
       error?: string | null; gap?: boolean; staleCursor?: boolean; epoch: string; hasOlder: boolean;
       startCursor?: {epoch: string; seq: number} | null;
-      entries: Array<{ timestamp?: string; turnId?: string; seqStart?: number; seqEnd: number; item: { type: string; text?: string } }>;
+      entries: Array<{ timestamp?: string; turnId?: string; seqStart?: number; seqEnd: number; item: { type: string; text?: string; status?: string } }>;
     }> };
     send(prompt: string): Promise<unknown>;
     refresh(): Promise<{ agent?: { labels?: Record<string, string> } } | null>;

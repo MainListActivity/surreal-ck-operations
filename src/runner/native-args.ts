@@ -30,6 +30,10 @@ export function nativeArgs(s: { provider: NativeProvider; nativeSessionId?: stri
     ...(s.model && s.model !== 'default' ? ['--model', s.model] : [])];
   const model = s.model ? ['--model', s.model] : [];
   if (s.provider === 'factory-droid') return ['exec', '--output-format', 'stream-json', ...model,
+    // Company employees must not spawn sub-agents: exec/stream-json honors --remove-tools for these
+    // IDs (stream-jsonrpc ignores the flag, so it is only set on this entry). This narrows the CLI
+    // surface; it does not claim to block every shell-level bypass.
+    '--remove-tools', 'task-cli,task-output-cli,task-stop-cli',
     ...(s.mode === 'auto-high' ? ['--auto', 'high'] : []),
     ...(s.thinking ? ['--reasoning-effort', s.thinking] : []),
     ...(s.nativeSessionId ? ['--session-id', s.nativeSessionId] : [])];
