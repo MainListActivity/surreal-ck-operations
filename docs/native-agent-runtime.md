@@ -57,7 +57,7 @@ Mac 配置示意（替换为本机实际绝对路径）：
 
 Mac 强制使用 service home 中已安装的 `sandbox/launch.sh` 与 `employee.sb`，启动时缺失就拒绝。Claude 仍由员工 settings 注入直接 Magpie 路由；恢复会话每轮重取 sidecar 通道。公司凭证环境会被清除，provider 原生登录沿用现有配置。
 
-Linux 远程节点必须配置 `isolation: "external"`，commands 指向已提供员工隔离的容器/沙箱启动命令。这里不自动安装 Linux 沙箱、不假装 macOS sandbox-exec 可以在 Linux 使用。仓库路径、云端凭证、sck CLI 和 provider 登录必须已在目标节点配置；当前版本不自动把 Mac 的项目路径映射为远程路径。
+Linux 远程节点必须配置 `isolation: "external"`，commands 指向已提供员工隔离的容器/沙箱启动命令。这里不自动安装 Linux 沙箱、不假装 macOS sandbox-exec 可以在 Linux 使用。仓库路径、云端凭证、sck CLI 和 provider 登录必须已在目标节点配置；当前版本不自动把 Mac 的项目路径映射为远程路径。第二节点上线前按 `docs/operations/dual-node-checklist.md` 勾选隔离、路径策略、证据脱敏与心跳；真实 VPS 心跳进 `node_release` 之前保持 unknown。
 
 ## 停止、恢复与回退
 

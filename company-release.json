@@ -1,21 +1,17 @@
 {
-  "version": "0.13.56",
-  "title": "本地 owner API 接通 Steward；云端 Mode 1 绿区代跑中继与自动脱困",
+  "version": "0.13.58",
+  "title": "双节点接力：第二节点清单与离线租约负例",
   "changes": [
-    "本地 owner HTTP API 组装 ctx 时补传 c.steward，修复 sck owner message.draft 报「NodeSteward 需要执行端」。",
-    "NodeSteward 新增 STEWARD_RELAY_OPS_ALLOWLIST 与 assistLane：显式 [OPS-REQUEST] 白名单代跑，非白名单硬拦截；无显式请求时模型只许只读 tool_relay 或 escalate。",
-    "来源门禁：代跑只取已核验会话中本轮用户锚点之后的 Devin 作者块（agentTail）；旧轮、用户正文、工具输出、缺锚点一律不触发 ops。",
-    "权限门禁：sidecar 以真实租约阶段为准并拒绝不一致的 phase 参数；复核轮禁止写操作；写/建类只认显式 [OPS-REQUEST]，模型推断不得授权。",
-    "sidecar steward_lane_assist：校验 1..3 轮与租约，二次硬核白名单后经 opsCircuit 代跑；出站按工具字段投影，句柄/激活链接/凭证/日志原文与上游错误原文均不出站。",
-    "出站投影按工具与嵌套字段类型逐层筛选：services/accounts 等允许对象只保留安全子字段，未知嵌套字段、detail、账号整条记录与上游错误正文均丢弃；上游错误也不写进普通执行日志。",
-    "cloud-lane：devin-cloud 执行轮提示 OPS-REQUEST；blocked 时同会话回传（Free 档）；发送前落盘 attempt 与轮数，未确认时恢复只追踪不重发、不再代跑，3 轮硬熔断。"
+    "新增第二原生节点上线清单：Linux external 隔离、节点本地 clone/显式路径、日志证据脱敏、第二节点心跳与 VPS 待验项。",
+    "同目录 writer.lock 独立测试：第二写者失败、host 不匹配拒绝、多进程仅一写者，与跨节点租约证据分离。",
+    "跨目录共库 fork 负例：两 runner/node、有效租约唯一写者、跨节点接手拒绝、旧租约不可写、过期后可接手。",
+    "路由 N3：指定节点离线时 ownsProvider 不回退到其他 native 或 paseo，避免双执行。"
   ],
   "impact": [
-    "老板：本机 sck owner message.draft 可正常起草；云端 blocked 的绿区查询可自动脱困最多 3 轮。",
-    "员工：desktop relay 只提供本地代跑工具结果；ops_login 只证明本机代理会话已登录，不等于 Devin 云端获得远程登录能力或能完成 CK 登录验证。",
-    "运维：跨目录恢复保留 attempt 与已用轮数，零重发；上游错误只回错误码，细节留在本机日志。",
-    "限制：复核轮禁写；非白名单工具、提示词注入、切付费档、模型推断的写操作一律 escalate；第 4 次 blocked 硬熔断。"
+    "运维：上线第二节点前可按清单勾选；真实 VPS 心跳前仍标 unknown。",
+    "工程：租约与写锁负例可离线回归，不依赖生产第二节点。",
+    "限制：本版不安装生产 VPS runner、不改生产 runtime-routes、不迁移在途会话。"
   ],
-  "migration": "无新增 schema：沿用 0.13.55 的 073（owner_style_memory）。升级并重启执行端，沿用既有 Magpie 凭证与 ops 配置。",
-  "rollback": "回退至 0.13.55；云端通道恢复为 blocked 即交老板，本地 message.draft 需执行端 steward 接线后的版本。回退前核对在途云端登记，旧版恢复可能再次发出代跑跟进。"
+  "migration": "无新 schema；沿用 073（owner_style_memory）。合入后重启执行端即可加载清单与测试；不改历史任务。",
+  "rollback": "回退至 0.13.56；删除清单与新增测试不影响运行时。回退后勿宣称双节点负例已固化。"
 }
