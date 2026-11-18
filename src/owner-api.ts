@@ -21,6 +21,8 @@ import { findingsFileOf, readBoard, readBoardView, renderContextFor } from './bo
 import { CompanyError } from './core-errors.ts';
 import { ROLES, type CreateTask, type Role } from './contracts.ts';
 import { HASH, REQUIRED_TRACKS } from './core.ts';
+import { DEFAULT_FAULT_BUDGET } from './faults.ts';
+import { FaultGrantRefusal, FaultStore, type FaultRecoveryGrantReceipt } from './fault-store.ts';
 import { getRoute, listRoutes, saveRoute, disableRoute } from './routes.ts';
 import { defaultAcceptanceCriteria } from './acceptance.ts';
 import { readTaskCost, COST_LIST_SQL } from './task-cost.ts';
@@ -101,6 +103,23 @@ export async function taskTurns(db: import('surrealdb').Surreal, taskId: string)
     actions: Array.isArray(row.activity!.actions) ? row.activity!.actions : [],
     ...(row.activity!.actionsDropped ? { actionsDropped: row.activity!.actionsDropped } : {}),
   })).sort((a, b) => a.startedAt - b.startedAt);
+}
+
+/**
+ * The owner's receipt of a recovery grant: what was granted, whether this request only replayed it, and where the window
+ * opens. The window is not opened by the grant; the employee's next real attempt opens it.
+ */
+function faultGrantReceipt(receipt: FaultRecoveryGrantReceipt): unknown {
+  return {
+    replayed: receipt.replayed,
+    grant: receipt.grant,
+    window: {
+      maxAttempts: DEFAULT_FAULT_BUDGET.maxAttempts,
+      totalDeadlineMs: DEFAULT_FAULT_BUDGET.totalDeadlineMs,
+      opensAt: '员工的下一次真实恢复尝试消费授权时开始计时',
+    },
+    next: '员工重新领取任务后的下一次真实尝试即消费本授权。窗口内仍失败而耗尽时，同一事件不再授权，只能走修复链。',
+  };
 }
 
 export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unknown>, via: OwnerVia): Promise<unknown> {
@@ -303,6 +322,30 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       return { ok: true };
     case 'notice.list':
       return { notices: await ctx.owner.openNotices() };
+
+    // ---- 故障恢复授权 ----
+    // 给一条已耗尽的恢复预算授权一次新窗口。授权只记下决定，预算不动：窗口在员工的下一次真实尝试消费授权时才开始。
+    case 'fault.grant': {
+      const idempotencyKey = input.idempotencyKey;
+      if (typeof idempotencyKey !== 'string' || !/^[A-Za-z0-9_:.-]{8,120}$/.test(idempotencyKey)) {
+        throw new CompanyError('invalid', 'idempotencyKey invalid: 8-120 characters of letters, digits, _ : . -');
+      }
+      const grantInput = {
+        taskId: text(input.taskId, 'taskId'), target: text(input.target, 'target'), phase: text(input.phase, 'phase'),
+        incident: text(input.incident, 'incident', 1, 500), evidence: text(input.note, 'note', 2, 2000),
+      };
+      try {
+        return faultGrantReceipt(await new FaultStore(db).grantRecovery({
+          ...grantInput, now: Date.now(), limits: DEFAULT_FAULT_BUDGET, grantedBy: a, idempotencyKey,
+          payloadDigest: HASH(JSON.stringify(grantInput)),
+        }));
+      } catch (error) {
+        if (error instanceof FaultGrantRefusal) {
+          throw new CompanyError(error.reason === 'not_found' ? 'not_found' : 'conflict', error.message);
+        }
+        throw error;
+      }
+    }
 
     // ---- 待发消息 ----
     case 'message.list': return { messages: await ctx.messages.list(optionalText(input.taskId), input.includeSent !== false) };

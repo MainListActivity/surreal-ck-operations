@@ -74,6 +74,7 @@ export const COMMAND_CATALOG: readonly CommandSpec[] = [
   c('task.delete', '任务', '删除（退役）任务', 'taskId, note'),
   c('task.pause', '任务', '暂停全部派工', '无'),
   c('task.resume', '任务', '恢复派工', '无'),
+  c('fault.grant', '任务', '为已耗尽的恢复预算授权一次新窗口（窗口从员工的下一次真实尝试开始计时；同一事件只授权一次）', 'taskId, target, phase, incident, note, idempotencyKey', { risk: 'high' }),
 
   c('decide', '决策与消息', '对任务作决定（decision 为 approve、reject 或 reply）', 'taskId, decision, note?', { risk: 'high' }),
   c('approve', '决策与消息', '通过（验收或决定）', 'taskId, note?', { risk: 'high' }),

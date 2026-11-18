@@ -188,6 +188,68 @@ export interface FaultReportInput {
   charge?: boolean;
 }
 
+/**
+ * The state of an owner's recovery grant: pending until a real attempt spends it, consumed once that attempt opened the
+ * window, void once the recovery it was given for has ended (a success, or a repair or a manual reset lifted it).
+ */
+export type FaultRecoveryGrantState = 'pending' | 'consumed' | 'void';
+
+/** The owner's grant of one new recovery window for one incident of one budget (fault_recovery_grant). */
+export interface FaultRecoveryGrantRow {
+  /** The grant key: the budget key and the incident. One grant per budget and incident. */
+  key: string;
+  /** The budget key the grant belongs to (taskId|target|phase). */
+  budget: string;
+  taskId: string;
+  target: string;
+  phase: string;
+  incident: string;
+  state: FaultRecoveryGrantState;
+  grantedBy: string;
+  evidence: string;
+  idempotencyKey: string;
+  payloadDigest: string;
+  grantedAt: string;
+  consumedAt?: string;
+  /** The budget's cumulative attempts at the moment the window opened, the audit's own count. */
+  consumedTotalAttempts?: number;
+  /** The end of the window the grant opened, unix milliseconds. */
+  windowDeadline?: number;
+}
+
+/** The input of an owner's recovery grant. */
+export interface FaultRecoveryGrantInput {
+  taskId: string;
+  target: string;
+  phase: string;
+  /** The incident the grant is for: it must be the incident the budget recorded last. */
+  incident: string;
+  now: number;
+  limits: FaultBudgetLimits;
+  grantedBy: string;
+  evidence: string;
+  idempotencyKey: string;
+  /** The digest of the request content: the same key with other content is refused. */
+  payloadDigest: string;
+}
+
+export type FaultGrantRefusalReason =
+  | 'not_found' | 'stopped' | 'not_in_recovery' | 'not_exhausted' | 'incident_mismatch' | 'already_granted' | 'idempotency_conflict';
+
+/** A grant the store refuses. The reason is fixed; the message says in words what the owner can do next. */
+export class FaultGrantRefusal extends Error {
+  constructor(readonly reason: FaultGrantRefusalReason, message: string) {
+    super(message);
+    this.name = 'FaultGrantRefusal';
+  }
+}
+
+/** The result of a grant request: the grant as stored, and whether this request was a replay of the stored one. */
+export interface FaultRecoveryGrantReceipt {
+  grant: FaultRecoveryGrantRow;
+  replayed: boolean;
+}
+
 const asText = (value: unknown): string => {
   const raw = value && typeof value === 'object' && 'id' in value ? (value as { id: unknown }).id : value;
   const text = String(raw ?? '');
@@ -211,12 +273,20 @@ const consumptionId = (key: string) => new RecordId('fault_repair_consumption', 
 /** The id of the episode row (one per cause and task). */
 const episodeId = (episode: string) => new RecordId('fault_episode', episode);
 
+/** The id of the recovery grant row (one per budget and incident). */
+const grantId = (key: string) => new RecordId('fault_recovery_grant', key);
+
 export class FaultStore {
   constructor(private readonly db: FaultStoreDb) {}
 
   /** The episode key of a cause and a task. It is derived, so a retry of the same report lands on the same episode. */
   static episodeKey(fingerprint: string, taskId: string): string {
     return `${fingerprint}#${taskId}`;
+  }
+
+  /** The key of the recovery grant of one incident of one budget. It is derived, so one event has one grant. */
+  static grantKey(budget: string, incident: string): string {
+    return `${budget}#${incident}`;
   }
 
   /** The key of a credential spent on one incident of one task. It is the record id, so a second spend hits the same record. */
@@ -376,6 +446,34 @@ export class FaultStore {
     };
   }
 
+  /** The owner's recovery grant of one incident of one budget, or undefined when none was given. */
+  async recoveryGrant(key: string): Promise<FaultRecoveryGrantRow | undefined> {
+    const row = await this.db.select<{
+      key?: string; budget?: string; task?: unknown; target?: string; phase?: string; incident?: string; state?: string;
+      granted_by?: string; evidence?: string; idempotency_key?: string; payload_digest?: string; granted_at?: unknown;
+      consumed_at?: unknown; consumed_total_attempts?: number; window_deadline?: number;
+    }>(grantId(key));
+    if (!row) return undefined;
+    return {
+      key: row.key ?? key,
+      budget: row.budget ?? '',
+      taskId: asText(row.task),
+      target: row.target ?? '',
+      phase: row.phase ?? '',
+      incident: row.incident ?? '',
+      state: (row.state ?? 'pending') as FaultRecoveryGrantState,
+      grantedBy: row.granted_by ?? '',
+      evidence: row.evidence ?? '',
+      idempotencyKey: row.idempotency_key ?? '',
+      payloadDigest: row.payload_digest ?? '',
+      grantedAt: asIso(row.granted_at),
+      ...(row.consumed_at === undefined || row.consumed_at === null ? {} : { consumedAt: asIso(row.consumed_at) }),
+      ...(row.consumed_total_attempts === undefined || row.consumed_total_attempts === null
+        ? {} : { consumedTotalAttempts: row.consumed_total_attempts }),
+      ...(row.window_deadline === undefined || row.window_deadline === null ? {} : { windowDeadline: row.window_deadline }),
+    };
+  }
+
   // ------------------------------------------------------------- the write
 
   /**
@@ -410,6 +508,12 @@ export class FaultStore {
       if (!decision.allowed) {
         // A refused lease or a minimum interval is not a spent budget: only the budget itself opens the diagnosis.
         const spent = decision.reason === 'attempts_exhausted' || decision.reason === 'deadline_passed';
+        if (spent && row.lastIncident) {
+          // The owner's grant for this incident, when one was given, opens one new window for this attempt.
+          const reopened = await this.reopenByGrant(key, row, input, decision);
+          if (reopened === 'lost') continue;
+          if (reopened) return reopened;
+        }
         const diagnostic = spent ? await this.noteExhaustion(row, input) : undefined;
         return {
           allowed: false, attempt: decision.attempt, charged: false, reason: decision.reason, waitMs: decision.waitMs,
@@ -441,6 +545,153 @@ export class FaultStore {
       // The race was lost: read the row again and decide once more.
     }
     return { allowed: false, attempt: 0, charged: false, reason: 'attempts_exhausted', waitMs: 0 };
+  }
+
+  /**
+   * Write the owner's grant of one new window for one incident of an exhausted budget.
+   *
+   * The grant records the decision and nothing else: the budget is not touched here. The window opens when the first
+   * real attempt spends the grant (see reopenByGrant), so a queue that delays that attempt past the old deadline does
+   * not cost the window. One grant per budget and incident, ever: the same request replayed returns the grant it made,
+   * another request for the same incident is refused, and a window that runs out again goes to the repair chain.
+   */
+  async grantRecovery(input: FaultRecoveryGrantInput): Promise<FaultRecoveryGrantReceipt> {
+    const budget = budgetKey(input.taskId, input.target, input.phase);
+    const key = FaultStore.grantKey(budget, input.incident);
+    // A replay is answered before the budget is read: the window that grant opened may already be spent.
+    const existing = await this.recoveryGrant(key);
+    if (existing) return FaultStore.sameGrantOrRefuse(existing, input);
+    const row = await this.scope(budget);
+    if (!row) throw new FaultGrantRefusal('not_found', '这项任务在该目标与阶段上没有恢复预算，无法授权');
+    if (row.stopped) throw new FaultGrantRefusal('stopped', '这项恢复已因不可重试的原因停止，授权不能解除停止，先处理原因');
+    if (!row.failed) throw new FaultGrantRefusal('not_in_recovery', '这项预算没有在恢复中，无需授权');
+    if (row.lastIncident !== input.incident) {
+      throw new FaultGrantRefusal('incident_mismatch', `授权的事件与预算最近记录的事件不一致（最近事件：${row.lastIncident ?? '无'}）`);
+    }
+    const spent = decideAttempt(FaultStore.stateOf(row), input.limits, input.now);
+    if (spent.allowed || (spent.reason !== 'attempts_exhausted' && spent.reason !== 'deadline_passed')) {
+      throw new FaultGrantRefusal('not_exhausted', '预算还在窗口之内、尚未耗尽，不需要授权');
+    }
+    try {
+      // The grant and its audit row land together, or neither does.
+      await this.db.query(`BEGIN TRANSACTION;
+        CREATE $grant CONTENT { key: $key, budget: $budget, task: $task, target: $target, phase: $phase,
+          incident: $incident, state: 'pending', granted_by: $actor, evidence: $evidence,
+          idempotency_key: $idempotency_key, payload_digest: $digest, granted_at: time::now(), updated_at: time::now() };
+        CREATE audit CONTENT { task: $task, actor: $actor, action: 'owner_fault_grant', evidence: $audit, at: time::now() };
+        COMMIT TRANSACTION;`, {
+        grant: grantId(key), key, budget, task: new RecordId('task', input.taskId), target: input.target, phase: input.phase,
+        incident: input.incident, actor: input.grantedBy, evidence: input.evidence,
+        idempotency_key: input.idempotencyKey, digest: input.payloadDigest, audit: `${key} ${input.evidence}`,
+      });
+    } catch (error) {
+      // A request that wrote the grant first makes this CREATE fail, and takes its audit row with it: the stored grant decides.
+      const raced = await this.recoveryGrant(key);
+      if (!raced) throw error;
+      return FaultStore.sameGrantOrRefuse(raced, input);
+    }
+    const created = await this.recoveryGrant(key);
+    if (!created) throw new Error(`the recovery grant ${key} was not written`);
+    return { grant: created, replayed: false };
+  }
+
+  /** A stored grant answers the request: the same request gets it back, any other request for the same event is refused. */
+  private static sameGrantOrRefuse(stored: FaultRecoveryGrantRow, input: FaultRecoveryGrantInput): FaultRecoveryGrantReceipt {
+    if (stored.idempotencyKey === input.idempotencyKey && stored.payloadDigest === input.payloadDigest) {
+      return { grant: stored, replayed: true };
+    }
+    if (stored.idempotencyKey === input.idempotencyKey) {
+      throw new FaultGrantRefusal('idempotency_conflict', '这个幂等键已用于另一份授权内容，请换一个幂等键');
+    }
+    throw new FaultGrantRefusal('already_granted', stored.state === 'consumed'
+      ? `这一事件已经授权过，窗口已经开过（授权 ${stored.key}）；同一事件只授权一次，窗口耗尽后走修复链`
+      : stored.state === 'void'
+        ? `这一事件已经授权过，授权已作废（恢复已结束，或已由修复链、手工重置解除）（授权 ${stored.key}）；同一事件只授权一次`
+        : `这一事件已经授权过，等待员工的下一次真实尝试来消费（授权 ${stored.key}）`);
+  }
+
+  /**
+   * Spend the owner's grant of this incident on the attempt that found the budget spent.
+   *
+   * The attempt is the first of a new window: the attempts start over, the window runs for the total duration from
+   * now, and the episodes of this task and incident close. The grant is spent and the attempt charged in one
+   * transaction, so a window never opens without the attempt it is for. The cumulative count stays for the audit.
+   * Two compare-and-set conditions guard it: the grant is still pending, and the budget still reads the state this
+   * refusal was decided on. A concurrent caller that wins makes this one decide again.
+   *
+   * Returns undefined when no pending grant applies, 'lost' when the state moved (decide again), and a refusal when
+   * the window cannot open for this attempt (only a lease can refuse it). It never throws: a failure here is a refusal,
+   * never a way past the budget.
+   */
+  private async reopenByGrant(key: string, row: FaultScopeRow, input: FaultReserveInput, decision: BudgetDecision)
+    : Promise<FaultReserveResult | 'lost' | undefined> {
+    const incident = row.lastIncident ?? '';
+    const grantKey = FaultStore.grantKey(key, incident);
+    const refused: FaultReserveResult = { allowed: false, attempt: decision.attempt, charged: false, reason: decision.reason, waitMs: 0 };
+    let grant: FaultRecoveryGrantRow | undefined;
+    try {
+      grant = await this.recoveryGrant(grantKey);
+    } catch {
+      return refused;
+    }
+    if (grant?.state !== 'pending') return undefined;
+    const window = input.now + input.limits.totalDeadlineMs;
+    const opened: FaultBudgetState = {
+      attempts: 0, deadline: window, nextAllowedAt: input.now, failed: true, fingerprint: row.lastFingerprint ?? '', incident,
+    };
+    // Only the lease can refuse the opened window: the grant is not spent on an attempt that may not run.
+    const runnable = decideAttempt(opened, input.limits, input.now, input.leaseExpiresAt);
+    if (!runnable.allowed) {
+      return {
+        allowed: false, attempt: runnable.attempt, charged: false, reason: runnable.reason, waitMs: 0,
+        ...(runnable.nextAllowedAt === undefined ? {} : { nextAllowedAt: runnable.nextAllowedAt }),
+      };
+    }
+    const nextAllowedAt = input.now + backoffWaitMs(input.limits, 1, input.jitterFactor ?? 0) + input.limits.minIntervalMs;
+    const totalAttempts = (row.totalAttempts ?? 0) + 1;
+    const holderSet = input.holder === undefined ? '' : ', last_holder = $holder';
+    try {
+      await this.db.query(`BEGIN TRANSACTION;
+        LET $won = (UPDATE $grant SET state = 'consumed', consumed_at = $at, consumed_total_attempts = $total,
+          window_deadline = $deadline, updated_at = time::now() WHERE state = 'pending' RETURN AFTER);
+        IF array::len($won) = 0 { THROW 'fault recovery grant or budget moved'; };
+        LET $charged = (UPDATE $row SET attempts = 1, total_attempts = total_attempts + 1, deadline = $deadline,
+          next_allowed_at = $next_allowed_at, last_attempt_at = $now, failed = true, updated_at = time::now()${holderSet}
+          WHERE key = $key AND attempts = $expected AND total_attempts = $expected_total AND failed = true
+            AND stopped = false AND last_incident = $incident RETURN AFTER);
+        IF array::len($charged) = 0 { THROW 'fault recovery grant or budget moved'; };
+        UPDATE fault_episode SET state = 'resolved', resolved_at = $at, updated_at = time::now()
+          WHERE task = $task AND incident = $incident AND state != 'resolved';
+        COMMIT TRANSACTION;`, {
+        grant: grantId(grantKey), at: new Date(input.now), total: totalAttempts, deadline: window,
+        row: scopeId(key), next_allowed_at: nextAllowedAt, now: input.now, key,
+        expected: row.attempts, expected_total: row.totalAttempts ?? 0, incident, task: new RecordId('task', input.taskId),
+        ...(input.holder === undefined ? {} : { holder: input.holder }),
+      });
+    } catch (error) {
+      const message = (error as Error)?.message ?? '';
+      const current = await this.recoveryGrant(grantKey).catch(() => undefined);
+      // The state moved under this attempt, so it is decided again. Any other failure refuses: it never opens a window.
+      if (current?.state === 'consumed' || /budget moved|conflict|busy|failed transaction/i.test(message)) return 'lost';
+      return refused;
+    }
+    return {
+      allowed: true, attempt: 1, charged: true, waitMs: 0,
+      budget: {
+        attempts: 1, deadline: window, nextAllowedAt, lastAttemptAt: input.now, failed: true,
+        fingerprint: row.lastFingerprint ?? '', incident,
+      },
+      refund: {
+        key, taskId: input.taskId, target: input.target, phase: input.phase,
+        chargedAttempts: 1, chargedTotalAttempts: totalAttempts, chargedDeadline: window,
+        chargedNextAllowedAt: nextAllowedAt, chargedLastAttemptAt: input.now,
+        priorAttempts: row.attempts, priorTotalAttempts: row.totalAttempts ?? 0, priorDeadline: row.deadline,
+        priorNextAllowedAt: row.nextAllowedAt,
+        ...(row.lastAttemptAt === undefined ? {} : { priorLastAttemptAt: row.lastAttemptAt }),
+        priorFailed: row.failed,
+        grant: { key: grantKey, incident, at: input.now },
+      },
+    };
   }
 
   /**
@@ -562,8 +813,12 @@ export class FaultStore {
    * fresh recovery with a fresh deadline. The cumulative count stays in `total_attempts` for the audit.
    */
   async settle(key: string, now: number): Promise<void> {
-    await this.db.query(`UPDATE $row SET failed = false, attempts = 0, next_allowed_at = $now,
-      updated_at = time::now() WHERE key = $key AND failed = true;`, { row: scopeId(key), key, now });
+    // The recovery is over, so an owner's grant that no attempt spent yet no longer applies. Both writes land together.
+    await this.db.query(`BEGIN TRANSACTION;
+      UPDATE $row SET failed = false, attempts = 0, next_allowed_at = $now,
+        updated_at = time::now() WHERE key = $key AND failed = true;
+      UPDATE fault_recovery_grant SET state = 'void', updated_at = time::now() WHERE budget = $key AND state = 'pending';
+      COMMIT TRANSACTION;`, { row: scopeId(key), key, now });
   }
 
   /**
@@ -581,13 +836,13 @@ export class FaultStore {
     const last = refund.priorLastAttemptAt === undefined
       ? 'last_attempt_at = NONE'
       : 'last_attempt_at = $prior_last';
-    const [rows] = await this.db.query<[Array<{ attempts?: number }>]>(`UPDATE $row SET
+    const restore = `UPDATE $row SET
       attempts = $prior_attempts, total_attempts = $prior_total, deadline = $prior_deadline,
       next_allowed_at = $prior_next, failed = $prior_failed, ${last}, updated_at = time::now()
       WHERE key = $key AND failed = true AND attempts = $charged_attempts
         AND total_attempts = $charged_total AND deadline = $charged_deadline
-        AND next_allowed_at = $charged_next AND last_attempt_at = $charged_last
-      RETURN AFTER;`, {
+        AND next_allowed_at = $charged_next AND last_attempt_at = $charged_last`;
+    const vars = {
       row: scopeId(refund.key), key: refund.key,
       prior_attempts: refund.priorAttempts, prior_total: refund.priorTotalAttempts,
       prior_deadline: refund.priorDeadline, prior_next: refund.priorNextAllowedAt,
@@ -595,8 +850,34 @@ export class FaultStore {
       charged_attempts: refund.chargedAttempts, charged_total: refund.chargedTotalAttempts,
       charged_deadline: refund.chargedDeadline, charged_next: refund.chargedNextAllowedAt,
       charged_last: refund.chargedLastAttemptAt,
-    });
-    return rows?.length ? 'refunded' : 'superseded';
+    };
+    if (refund.grant === undefined) {
+      const [rows] = await this.db.query<[Array<{ attempts?: number }>]>(`${restore} RETURN AFTER;`, vars);
+      return rows?.length ? 'refunded' : 'superseded';
+    }
+    // The reservation opened an owner's window: the restore, the grant's return to pending and the reopened episodes
+    // are one transaction. When the restore finds the state moved, or the grant is no longer the one this window
+    // consumed, the transaction throws and rolls back: nothing changes, and the newer state wins.
+    try {
+      await this.db.query(`BEGIN TRANSACTION;
+        LET $back = (${restore} RETURN AFTER);
+        IF array::len($back) = 0 { THROW 'fault refund superseded'; };
+        LET $regrant = (UPDATE $grant SET state = 'pending', consumed_at = NONE, consumed_total_attempts = NONE,
+          window_deadline = NONE, updated_at = time::now()
+          WHERE state = 'consumed' AND window_deadline = $charged_deadline RETURN AFTER);
+        IF array::len($regrant) = 0 { THROW 'fault refund superseded'; };
+        UPDATE fault_episode SET state = 'exhausted', resolved_at = NONE, updated_at = time::now()
+          WHERE task = $task AND incident = $incident AND state = 'resolved' AND resolved_at = $at;
+        COMMIT TRANSACTION;`, {
+        ...vars,
+        grant: grantId(refund.grant.key), task: new RecordId('task', refund.taskId),
+        incident: refund.grant.incident, at: new Date(refund.grant.at),
+      });
+      return 'refunded';
+    } catch (error) {
+      if (/fault refund superseded/.test((error as Error)?.message ?? '')) return 'superseded';
+      throw error;
+    }
   }
 
   /** Record the cause on the scope row: the last fingerprint, the last incident and the machine facts. */
@@ -774,6 +1055,9 @@ export class FaultStore {
     statements.push(`UPDATE fault_budget SET attempts = 0, deadline = $deadline, next_allowed_at = $now,
       stopped = false, stop_reason = NONE, stop_fingerprint = NONE, stop_diagnostic = NONE, failed = false,
       updated_at = time::now() WHERE task = $task AND last_incident = $incident;`);
+    // The repair lifted the recovery: an owner's grant that no attempt spent yet is void with it.
+    statements.push(`UPDATE fault_recovery_grant SET state = 'void', updated_at = time::now()
+      WHERE task = $task AND incident = $incident AND state = 'pending';`);
     statements.push('COMMIT TRANSACTION;');
     const spent = await this.retrying(async () => {
       try {
@@ -798,11 +1082,16 @@ export class FaultStore {
    */
   async resetRecovery(input: { taskId: string; incident: string; now: number; limits: FaultBudgetLimits }): Promise<void> {
     const task = new RecordId('task', input.taskId);
-    await this.db.query(`UPDATE fault_episode SET state = 'resolved', resolved_at = time::now(), updated_at = time::now()
-      WHERE task = $task AND incident = $incident AND state != 'resolved';`, { task, incident: input.incident });
-    await this.db.query(`UPDATE fault_budget SET attempts = 0, deadline = $deadline, next_allowed_at = $now,
-      stopped = false, stop_reason = NONE, stop_fingerprint = NONE, stop_diagnostic = NONE, failed = false,
-      updated_at = time::now() WHERE task = $task AND last_incident = $incident;`, {
+    // One transaction: the episodes close, the budgets start over and an unspent owner's grant is void, all or nothing.
+    await this.db.query(`BEGIN TRANSACTION;
+      UPDATE fault_episode SET state = 'resolved', resolved_at = time::now(), updated_at = time::now()
+        WHERE task = $task AND incident = $incident AND state != 'resolved';
+      UPDATE fault_budget SET attempts = 0, deadline = $deadline, next_allowed_at = $now,
+        stopped = false, stop_reason = NONE, stop_fingerprint = NONE, stop_diagnostic = NONE, failed = false,
+        updated_at = time::now() WHERE task = $task AND last_incident = $incident;
+      UPDATE fault_recovery_grant SET state = 'void', updated_at = time::now()
+        WHERE task = $task AND incident = $incident AND state = 'pending';
+      COMMIT TRANSACTION;`, {
       task, incident: input.incident, deadline: input.now + input.limits.totalDeadlineMs, now: input.now,
     });
   }
