@@ -89,6 +89,7 @@ export const COMMAND_CATALOG: readonly CommandSpec[] = [
   c('message.chains', '决策与消息', '消息链：按任务链排好的已发、待发与后续步骤的派工消息', '无', { readOnly: true }),
   c('message.plan', '决策与消息', '提前安排流水线后续步骤的消息（改写或先扣住）', 'requirement, revision, index, step, body?, hold?'),
   c('message.edit', '决策与消息', '修改待发消息的正文', 'messageId, body'),
+  c('message.draft', '决策与消息', '参考老板最近改稿偏好起草派工消息，保留原扣住状态', 'taskId, step?, channel?', { runner: true }),
   c('message.edit_rendered', '决策与消息', '按员工看到的样子修改待发消息', 'messageId, employeeId, rendered'),
   c('message.hold', '决策与消息', '暂存待发消息', 'messageId'),
   c('message.release', '决策与消息', '放行待发消息（取消暂存）', 'messageId', { risk: 'high' }),

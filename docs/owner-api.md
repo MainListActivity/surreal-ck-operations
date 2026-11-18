@@ -49,6 +49,7 @@
 | 列出提醒 | `sck owner notice.list '{}'` |
 | 列出待发消息 | `sck owner message.list '{"taskId":"t1"}'` |
 | 编辑待发消息 | `sck owner message.edit '{"messageId":"m1","body":"实现 task.md 中的需求…"}'` |
+| 参考老板改稿偏好起草派工消息（保留原扣住状态） | `sck owner message.draft '{"taskId":"t1","step":"execute","channel":"devin-cloud"}'` |
 | 需要我放行 | `sck owner message.hold '{"messageId":"m1"}'` |
 | 取消放行标记 | `sck owner message.release '{"messageId":"m1"}'` |
 | 放行 | `sck owner message.send '{"messageId":"m1"}'` |

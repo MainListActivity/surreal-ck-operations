@@ -29,6 +29,21 @@ export interface LaneState {
   devin?: DevinLaneState;
 }
 
+/** 仅移除已结清的同一个供应商任务；同公司任务上别的在途发送不可误删。 */
+export function clearSettledInflight(stateRoot: string | undefined, provider: string, task: string | undefined, taskId: string | undefined): void {
+  if (!stateRoot || !task || !taskId) return;
+  const dir = join(stateRoot, provider, 'inflight');
+  try {
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith('.json')) continue;
+      try {
+        const row = JSON.parse(readFileSync(join(dir, name), 'utf8')) as InflightEntry;
+        if (row.task === task && row.taskId === taskId) rmSync(join(dir, name), { force: true });
+      } catch { /* 损坏或并发清理的记录不影响收尾 */ }
+    }
+  } catch { /* 没有共享目录 */ }
+}
+
 export interface DevinSeatReading { step: 'send' | 'follow'; cap: string; used: number; total: number; at: number }
 export interface DevinLaneState {
   /** 按下发送前落盘的本轮标记：进程在按下之后、拿到回执之前中断时，重启只做受理核对，不重发。 */
