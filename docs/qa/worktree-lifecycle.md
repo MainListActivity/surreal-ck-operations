@@ -6,15 +6,16 @@
 
 | 事件 | 引用 | 物理树 |
 |---|---|---|
+| 任务权威：`task.worktree` 指向该树的非终态任务（ready/doing/review/blocked） | 引用缺失、错配或已释放都不构成释放。有效租约且引用不一致 → 保留，reason=`authority-leased,lease-ref-mismatch`，写 cleanup_todo；无有效租约 → 保留，reason=`authority-open`；任务表读取失败 → 保留，reason=`authority-unreadable:*` | 不删；续用时接手人回到同一棵树 |
 | 提交待验收（review）/ 退回待续（ready）/ blocked / 租约过期 / 撤回交接 | 释放旧员工/fence；非终态任务在其 assigned_tree（非 shared）上的引用一律计 recovery | 不删现场，接手续用 |
 | shared 树上的任务引用 | 非终态也计 released（shared 硬保护，不依赖引用保留） | 不删；shared 只给只读/资产任务，代码任务从不进入，分支也不会被切换（漂移的会被调度自动挪回） |
-| 线（lane）的树 | 同一目标下 `workIntent.lane` 相同的任务共用一棵 exclusive 树；线内任一未终态（非 done/void）任务都让该树保持 `lane-open` | 线内最后一个任务终态且无引用、干净 → 回收树，已合入的 lane 分支一并删除 |
+| 线（lane）的树 | 设计：`workIntent.lane` 相同的任务共用一棵 exclusive 树，线内任一未终态（非 done/void）任务都让该树保持。现状：分配尚未写入 lane，各任务仍各自一棵树；保持由下一行的任务权威计数承担，`laneOpen` 输入未由注册表计算 | 线内最后一个任务终态且无引用、干净 → 回收树，已合入的 lane 分支一并删除（待线分配接线后生效） |
 | 任务 done（验收通过） | 任务保留引用结束，sweep/accept 观测到全量释放时写持久 `release` 审计 | exclusive 干净且无有效引用则立即回收；shared 保留 |
 | 脏树 / 未跟踪改动 | 不变 | 保留，审计 reason=`dirty-or-untracked` 并写 `cleanup_todo` 待办 |
 | 未合并任务分支 | 树可删 | 本地分支仅 `git branch -d`；失败则 `branch_retain` 审计 |
 | 孤儿宽限 N（默认 7 天） | 无 active/recovery 引用 | 仅公司管理任务树；时钟=last_released_at → last_used_at → created_at |
 
-删除唯一依据：持久 `worktree` / `worktree_ref` / `worktree_session_ref` 与实时对账。不用文件 mtime，不用 `git worktree remove --force` / `branch -D`，不借 `git prune` 扩大删除面。
+删除依据：持久 `worktree` / `worktree_ref` / `worktree_session_ref` 的登记与实时对账，并且任务表（`task.worktree`、状态、租约）不再指向该树；任一读取失败即保留。accept、return、release、retire、revoke、expire 等事件点与定时扫描共用同一判定。事件点或定时扫描的首批读取（策略、登记行）失败都不回收，并写 `fail` 审计（`reclaim-unreadable:*`）：事件点静默返回，定时扫描抛给调用方记日志；扫描中单棵树的读取失败只保留该树。不用文件 mtime，不用 `git worktree remove --force` / `branch -D`，不借 `git prune` 扩大删除面。
 
 ## 本地受控演练（QA 无需公司凭证）
 
@@ -27,7 +28,7 @@ rtk proxy pnpm --dir plugin exec tsc --noEmit
 rtk proxy pnpm run test:worktrees
 ```
 
-`scripts/test-worktrees.ts` 启动公司 fork SurrealDB 临时实例，覆盖 WT01 分配回归 + WT02 回收/宽限/禁用开关/审计。可设 `SCK_WORKTREE_EVIDENCE=<evidenceDir/json>` 导出本地 before/after。`production=false`。
+`scripts/test-worktrees.ts` 启动公司 fork SurrealDB 临时实例，覆盖 WT01 分配回归 + WT02 回收/宽限/禁用开关/审计，以及任务权威：丢引用的 QA 审阅树、引用错配、撤销与过期、void 干净与脏树、任务表与事件点读取失败、扫描与并发认领竞争。可设 `SCK_WORKTREE_EVIDENCE=<evidenceDir/json>` 导出本地 before/after。`production=false`。
 
 ## 开关与配置
 
@@ -76,5 +77,6 @@ sck call list_worktree_audits '{"limit":100}'
 3. fixture：dirty exclusive 保留；租约过期交接、submit→review、return→ready 窗口 recovery 保留；把 fixture `last_released_at` 拨到 N 前，经真实 sweep 删除；N 内与保护树仍在；`list_worktree_audits` 可见 release/delete/skip/fail
 4. 至少 10 个同仓串行任务后 shared 数不增加（代码任务不进 shared）；同一线的多个任务始终落在同一路径同一分支，线结束后树消失；并行峰值与写手数相关；结束后收敛到共享/受保护基线加明确保留例外
 5. `SCK_WORKTREE_RECLAIM=0` 验证可关闭；回滚后登记/审计仍在
+6. 只读核对：`list_worktrees` 中任务处于 ready/doing/review/blocked 的树不得出现 `deletable=true`；出现 `authority-leased,lease-ref-mismatch` 的树按 cleanup_todo 人工核对该任务的租约与引用，不手工删除，也不手工改任务状态
 
 证据写 `evidenceDir`，老板可打开的手册与摘要用 `deliverable_publish`。

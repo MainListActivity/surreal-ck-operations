@@ -229,7 +229,7 @@ sck call company_cmd '{"command":"<命令名>","input":{...}}'
 - **订阅额度从哪读**：Paseo 的用量列表只覆盖它自己驱动的订阅（本机是 claude/codex/grok）。0.5.0 起额度补充默认读取 VPS magpie（`https://data.maplayer.top/ofm`，带员工专用密钥）；配置了 `MAGPIE_ADDR` 时改读该地址。调度器读取 `GET <magpie 地址>/v1/magpie/quotas`，把 Paseo 没报的订阅补进来（`factory` → `factory-droid`），两边都报时以 Paseo 为准。读取失败、超时或 magpie 未运行，一律按“没有答案”处理，绝不当成“额度为 0”。该端点在 0.5.0 上线后需确认，见下文上线记录。
 - **员工实例什么时候退役**：只有“这个会话不可能再接任何任务”才退役——凭证文件实例在 sidecar 模式下不可复用（通道轮换）、派工轮次或上下文超过 `session_max_wakes` / `session_max_input_k`（会话轮换）、Paseo 报会话已归档（正常结束）、启动绑定失效且会话还活着（通道隔离）、spawn 失败且不是额度类错误、claim 被拒或写权被占且未绑定实现人、任务现场销毁（场景回收），以及老板手工退役。
 - **不因额度耗尽退役**：额度失败只把 provider 记进 `provider_health`（冷却按指数退避：30 分钟起、最长 6 小时），任务留在原实现人名下等待恢复，不再记员工定义的违规次数。长时间耗尽由额度下限熔断挡住派工（额度来源见上文“订阅额度从哪读”），不靠冷却时长兜底。
-- **老板待办路由**：基础设施原因（配额、探测忙、席位满、主机资源、唤醒失败、候选为空、先前提交人、未知）导致的无法派工记为持久待办并升级成老板通知（同一 task+阶段+episode+reason 去重，理由变化或派工成功时收口并保留审计）。需要老板决定的问题走 `blocked_to='owner'` 进收件箱，由 `sck owner decide`/`task.reassign`/`task.void` 处置。
+- **老板待办路由**：基础设施原因（配额、探测忙、席位满、主机资源、唤醒失败、仓库分配锁忙、候选为空、先前提交人、未知）导致的无法派工记为持久待办并升级成老板通知（同一 task+阶段+episode+reason 去重，理由变化或派工成功时收口并保留审计）。需要老板决定的问题走 `blocked_to='owner'` 进收件箱，由 `sck owner decide`/`task.reassign`/`task.void` 处置。
 
 - **复核回避**：唯一排除规则是先前提交人——任务 `submit` 审计里的 actor 不能领该任务的复核；读不出按 `unknown` 等待。返工时上一轮提交人优先续做，claim-only 经手人按 `PRIOR_HAND_WEIGHT_FACTOR` 降权。没有自动接替：候选为空按 `no_candidate` 记无法派工。
 

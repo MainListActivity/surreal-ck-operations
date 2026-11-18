@@ -10,6 +10,7 @@ import { homedir } from "node:os";
 import { readProviderQuotas } from "../dispatcher/quota-store.ts";
 
 import { dispatcherLogSink } from "../dispatcher/log-sink.ts";
+import { repoLockLogLine, type RepoLockEvent } from "../dispatcher/worktree-registry.ts";
 import { OutboundMessageStore } from "../outbound-messages.ts";
 import { installNodeHost } from "../host-node.ts";
 import { IdpClient } from "../cloud/idp.ts";
@@ -135,8 +136,15 @@ export function company(): Promise<Company> {
     // Workforce also powers the manage-only def_* tools exposed through the sidecar.
     if (!runtimeOptions) throw new Error("执行后端尚未配置");
     const paseo = runtimeOptions.gateway;
+    // One sink for the dispatcher's lifetime: it opens the logs directory once and appends from then on.
+    const dispatcherLog = dispatcherLogSink(serviceHome());
     const worktreeOpts = {
       opsRepo: process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations',
+      // Slow or failed allocation-lock attempts reach the dispatcher log: the operation, an anonymous repo id, the result and the timings.
+      onRepoLock: (event: RepoLockEvent) => {
+        const line = repoLockLogLine(event);
+        if (line) { console.log(line); dispatcherLog(line); }
+      },
       // Three-layer same-death: a task worktree's Paseo workspaces/project die with the tree.
       // Employee agents inside those workspaces are retired with an honest reason first —
       // otherwise the workspace cascade archives them and the tick misreports 通道隔离.
@@ -241,6 +249,28 @@ export function company(): Promise<Company> {
       },
       nativeExecution: runtimeOptions.native,
       managedLifecycle: true,
+      // Read-only facts for retiring a captured result whose delivery no longer exists. The task row is the lease
+      // authority and the employee row is the identity authority; the idempotency row is the delivery authority —
+      // it exists only inside the committed transition, so it proves the write landed even when its reply was lost.
+      // A failed read throws and stays "unknown".
+      resultFacts: async (taskId, employeeId, delivery) => {
+        const { RecordId } = await import('surrealdb');
+        const { HASH } = await import('../core.ts');
+        const [tasks] = await db.db.query<[Array<{ state: string; current_employee?: string; delivery_id?: string; fence?: number }>]>(
+          'SELECT state, current_employee, delivery_id, fence FROM $task;', { task: new RecordId('task', taskId) });
+        const [employees] = await db.db.query<[Array<{ retired?: boolean; revoked?: boolean }>]>(
+          'SELECT retired, revoked FROM $employee;', { employee: new RecordId('employee', employeeId) });
+        const stored = delivery
+          ? await db.db.select(new RecordId('idempotency', HASH(`${employeeId}\0${delivery.action}\0${delivery.idempotencyKey}`)))
+          : undefined;
+        return {
+          ...(tasks?.[0] ? { task: { state: tasks[0].state, currentEmployee: tasks[0].current_employee,
+            deliveryId: tasks[0].delivery_id, fence: tasks[0].fence } } : {}),
+          ...(employees?.[0] ? { employee: { retired: employees[0].retired === true, revoked: employees[0].revoked === true } }
+            : { employee: { missing: true } }),
+          ...(stored ? { landed: true } : {}),
+        };
+      },
       readTurnResult: runtimeOptions.native ? undefined : (agent, turn, startedAt) => readTurnResult(currentHost(), agent, turn, startedAt),
       executionChanged: async row => {
         const { RecordId } = await import('surrealdb');
@@ -266,8 +296,6 @@ export function company(): Promise<Company> {
       },
       log: message => console.log(message),
     });
-    // One sink for the dispatcher's lifetime: it opens the logs directory once and appends from then on.
-    const dispatcherLog = dispatcherLogSink(serviceHome());
     const messages = new OutboundMessageStore(db.db);
     const sckBin = process.env.SCK_TOOL_BIN ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/bin/sck`;
     const dispatcher = new Dispatcher({

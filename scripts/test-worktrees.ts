@@ -45,7 +45,7 @@ try {
   if (!ready) throw new Error('Company fork fixture did not become healthy');
   const explicit = process.argv.slice(2).filter(arg => arg.endsWith('.test.ts'));
   const targets = explicit.length ? explicit : process.argv.includes('--all') ? [] : [
-    'tests/worktree-lock.test.ts', 'tests/worktree-reclaim.test.ts', 'tests/worktree-registry.fork.test.ts',
+    'tests/worktree-lock.test.ts', 'tests/worktree-reclaim.test.ts', 'tests/worktree-registry.fork.test.ts', 'tests/repo-lock-busy.fork.test.ts',
     'tests/artifact-reclaim.test.ts', 'tests/artifact-sweeper.test.ts', 'tests/artifact-reclaim.fork.test.ts',
     'tests/magpie-quota.test.ts', 'tests/agent-model.test.ts', 'tests/quota-store.fork.test.ts',
     'tests/paseo-dead-paths.test.ts',
@@ -54,6 +54,10 @@ try {
     'tests/session-history.test.ts', 'tests/factory-queue.test.ts', 'tests/dispatcher-sidecar.test.ts', 'tests/sidecar.test.ts', 'tests/sidecar-quota-gate.fork.test.ts',
     'tests/sidecar-late-lease.test.ts', 'tests/worktrees.test.ts',
     'tests/owner-aging.fork.test.ts', 'tests/story-author.fork.test.ts', 'tests/cinematography.fork.test.ts', 'tests/owner-reassign.fork.test.ts', 'tests/pr-gate.fork.test.ts', 'tests/owner-commands.fork.test.ts',
+    // 老板回复受阻任务：经真实接口与 OwnerDesk 事务；会话失去身份后恢复或明确暂时不可用，不把权限失败报成任务不存在（自建隔离库，RUN_SCK_OWNER_REPLY_TESTS）。
+    'tests/owner-reply.fork.test.ts',
+    // 同一组：令牌过期降为匿名、服务端会话到期（4 秒会话）两种真实服务端行为，并与“任务确实不存在”对照。
+    'tests/owner-session-identity.fork.test.ts',
     'tests/query-paging.integration.test.ts', 'tests/acceptance-gate.fork.test.ts',
     'tests/deployment-source.fork.test.ts',
     'tests/input-bounds.integration.test.ts',
@@ -82,7 +86,7 @@ try {
     ...process.env, SCK_PRODUCT_ENV: '/dev/null', SURREAL_URL: `ws://127.0.0.1:${port}/rpc`, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: rootPassword,
     // 隔离运行一律连本次自建的 fork：清掉调用方带来的云端地址（例如云端模式下调用的安装脚本）。
     COMPANY_DB_URL: '',
-    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_NODE_RELEASE_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_TASK_ROUTES_TESTS: '1', RUN_SCK_DB_CONNECTION_TESTS: '1', RUN_SCK_COMPANY_ACCESS_TESTS: '1', RUN_SCK_OWNER_END_TESTS: '1', RUN_SCK_CLOUD_RUNNER_TESTS: '1',
+    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_NODE_RELEASE_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_TASK_ROUTES_TESTS: '1', RUN_SCK_DB_CONNECTION_TESTS: '1', RUN_SCK_COMPANY_ACCESS_TESTS: '1', RUN_SCK_OWNER_END_TESTS: '1', RUN_SCK_CLOUD_RUNNER_TESTS: '1', RUN_SCK_OWNER_REPLY_TESTS: '1',
   } });
   groups.push(test.pid); save();
   exit = await test.exited;
