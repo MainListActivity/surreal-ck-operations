@@ -327,6 +327,11 @@ export interface FaultRefund {
   priorNextAllowedAt: number;
   priorLastAttemptAt?: number;
   priorFailed: boolean;
+  /**
+   * The owner's recovery grant this reservation spent, when the reservation opened a new window. A refund of this
+   * reservation hands the grant back: a window that carried no real attempt is not an opened window.
+   */
+  grant?: { key: string; incident: string; at: number };
 }
 
 /** The limits a caller applies to a fault object. */

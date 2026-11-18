@@ -67,7 +67,7 @@ beforeEach(async () => {
   clock = 1_700_000_000_000;
   // A repair chain is keyed by its incident, and that key is an idempotency key: the records of the previous test go
   // too, or a new chain would link to a repair task that the previous test already finished.
-  await database.db.query('DELETE fault_budget; DELETE fault_episode; DELETE fault_incident; DELETE fault_repair; DELETE fault_repair_consumption; DELETE idempotency;');
+  await database.db.query('DELETE fault_budget; DELETE fault_episode; DELETE fault_incident; DELETE fault_repair; DELETE fault_repair_consumption; DELETE fault_recovery_grant; DELETE idempotency;');
   // The fixture leases one task per employee at a time: the leases of the previous test are released.
   await database.db.query(`UPDATE task SET current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE
     WHERE current_employee != NONE; UPDATE employee SET active_task = NONE WHERE active_task != NONE;`);

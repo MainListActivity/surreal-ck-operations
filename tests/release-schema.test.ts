@@ -110,7 +110,9 @@ describe('the schema a target version must have reached', () => {
     expect(schemaRequirementFor('0.13.54').schema).toBe(72);
     expect(schemaRequirementFor('0.13.55').schema).toBe(73);
     expect(schemaRequirementFor('0.13.55').tables).toContain('owner_style_memory');
-    expect(CLOUD_SCHEMA_VERSION).toBe(73);
+    expect(schemaRequirementFor('0.13.57').schema).toBe(74);
+    expect(schemaRequirementFor('0.13.57').tables).toContain('fault_recovery_grant');
+    expect(CLOUD_SCHEMA_VERSION).toBe(74);
   });
 
   test('the version in package.json needs the schema this code applies', () => {

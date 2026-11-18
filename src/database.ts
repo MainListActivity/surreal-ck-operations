@@ -100,7 +100,7 @@ const pause = (ms: number): Promise<void> => new Promise(resolve => {
 });
 
 /** 本版本 applySchema 的最后一个结构版本；云端 bootstrap 只核对库内版本不低于它。 */
-export const CLOUD_SCHEMA_VERSION = 73;
+export const CLOUD_SCHEMA_VERSION = 74;
 
 export class CompanyDatabase {
   /** 当前会话的客户端；云端续期或重连时整体替换（见 rebuildNow）。 */
@@ -628,8 +628,12 @@ export class CompanyDatabase {
     // 072：消息链预排——老板提前给流水线后续步骤的消息做的安排（planned_message）。
     await this.db.query(loadSchema('072-planned-message.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 72 WHERE schema_version < 72;');
+    // 073：老板风格记忆（owner-style-memory）。
     await this.db.query(loadSchema('073-owner-style-memory.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 73 WHERE schema_version < 73;');
+    // 074：事件恢复授权（fault_recovery_grant），只记授权，窗口在首次真实尝试时才开始。
+    await this.db.query(loadSchema('074-fault-recovery-grant.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 74 WHERE schema_version < 74;');
   }
 
   /** Selects the configured namespace/database without touching schema (runtimes that only query). */
