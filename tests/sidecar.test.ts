@@ -811,4 +811,76 @@ describe('deliverable_publish 工具', () => {
       expect(elapsed).toBeLessThan(15_000);
     } finally { stalling.close(); }
   }, 30_000);
+
+  test('steward_lane_assist 校验租约、代跑脱敏截断；无租约拒绝；非白名单 escalate', async () => {
+    const assists: unknown[] = [];
+    const secret = 'sk-ant-fixture-secret-value-abcdef';
+    pool.close();
+    pool = new SidecarPool({
+      core: core as never, workforce: workforce as never,
+      ops: {
+        tools: ['ops_info', 'ops_login', 'ops_health', 'ops_d1_exec'] as const,
+        call: async (credential: string, taskId: string, tool: string, args: Record<string, unknown>) => {
+          opsCalls.push({ credential, taskId, tool, args });
+          return { ok: true, tool, token: secret, detail: 'x'.repeat(5000) };
+        },
+        release: (employeeId: string) => { released.push(employeeId); },
+      },
+      media, runDir, heartbeatMs: 10_000, sweepMs: 20,
+      log: message => { logs.push(message); },
+      laneAssist: async input => {
+        assists.push(input);
+        if (String(input.transcriptTail).includes('ops_d1_exec')) {
+          return { kind: 'tool_relay', tool: 'ops_d1_exec' as never, args: {} };
+        }
+        if (String(input.transcriptTail).includes('OPS-REQUEST')) {
+          return { kind: 'tool_relay', tool: 'ops_health', args: { env: 'staging', taskId: 'spoof' } };
+        }
+        return { kind: 'escalate', reason: '无可用协助' };
+      },
+    });
+
+    // 无租约
+    const bare = pool.env(inst('assist-bare'));
+    const noLease = await relay(bare.SCK_COMM_DIR, bare.SCK_COMM_KEY!, 'a0', 'steward_lane_assist', {
+      provider: 'devin-cloud', phase: 'doing', transcriptTail: 'x', round: 1,
+    });
+    expect(noLease.ok).toBe(false);
+    expect(noLease.error).toMatch(/no_lease|租约/);
+
+    const i = inst('assist-1');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-assist'));
+
+    // round 越界
+    const capped = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'a1', 'steward_lane_assist', {
+      provider: 'devin-cloud', phase: 'doing', transcriptTail: 'x', round: 4,
+    });
+    expect(capped.ok).toBe(true);
+    expect(capped.data).toMatchObject({ decision: 'escalate' });
+
+    // 白名单代跑：剔除 taskId、脱敏、截断
+    const ok = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'a2', 'steward_lane_assist', {
+      provider: 'devin-cloud', phase: 'doing', round: 1,
+      transcriptTail: '[OPS-REQUEST] {"tool":"ops_health","args":{"env":"staging"}}',
+    });
+    expect(ok.ok).toBe(true);
+    expect(ok.data).toMatchObject({ decision: 'reply', toolExecuted: 'ops_health' });
+    const message = String((ok.data as { message: string }).message);
+    expect(message).not.toContain(secret);
+    expect(message.length).toBeLessThanOrEqual(4100);
+    expect(opsCalls.at(-1)).toMatchObject({ tool: 'ops_health', taskId: 'task-assist', args: { env: 'staging' } });
+    expect(opsCalls.at(-1)!.args.taskId).toBeUndefined();
+
+    // 非白名单（即便 laneAssist 返回）被二次硬核拦截
+    const denied = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'a3', 'steward_lane_assist', {
+      provider: 'devin-cloud', phase: 'doing', round: 1,
+      transcriptTail: 'please ops_d1_exec',
+    });
+    expect(denied.ok).toBe(true);
+    expect(denied.data).toMatchObject({ decision: 'escalate' });
+    expect(opsCalls.filter(c => c.tool === 'ops_d1_exec')).toHaveLength(0);
+
+    expect(assists.length).toBeGreaterThanOrEqual(2);
+  });
 });

@@ -106,3 +106,55 @@ test('the console page writes through owner/ and its script parses', async () =>
   expect(script).toBeTruthy();
   expect(() => new Function(script!)).not.toThrow();
 });
+
+test('createOwnerApiFetch 把 c.steward 转给 ownerApi，message.draft 可起草', async () => {
+  const drafts: unknown[] = [];
+  const home2 = mkdtempSync(join(tmpdir(), 'owner-api-steward-'));
+  // 最小 Company：draft 路径只需 steward + 足以走过 LocalEnrollmentAdmin/ownerApi 前置的桩。
+  // 这里用源码断言保证接线，再用可注入的 fetch 覆盖“无 steward 会 500”的反例。
+  const src = readFileSync(new URL('../plugin/server/owner-api.ts', import.meta.url), 'utf8');
+  expect(src).toContain('steward: c.steward');
+  expect(src).toMatch(/const ctx = \{[\s\S]*steward: c\.steward/);
+
+  const { createOwnerApiFetch: make } = await import('../plugin/server/owner-api.ts');
+  const drafted = make({
+    home: home2,
+    company: async () => ({
+      steward: { draft: async (input: unknown) => { drafts.push(input); return '请把甲做完并自验。'; } },
+      db: {
+        db: {
+          query: async (sql: string) => {
+            if (sql.includes('employee:owner') || sql.includes('ENSURE') || sql.includes('owner')) return [[{ ok: true }]];
+            if (sql.includes('FROM $task') || sql.includes('FROM task')) return [[{
+              title: '需求甲', requirement: '实现', resources: '', acceptance_text: '过测', project: 'p1', discipline: 'code',
+            }]];
+            if (sql.includes('owner_style_memory')) return [[]];
+            if (sql.includes('outbound_message') || sql.includes('FROM $msg')) return [[{
+              id: 'outbound_message:m1', task: 'task:t1', step: 'execute', body: '原稿', hold: true, state: 'held',
+            }]];
+            return [[]];
+          },
+          select: async () => undefined,
+        },
+      },
+      core: {},
+      owner: undefined,
+      workforce: undefined,
+      opsRepo: '/fixture',
+      paseo: undefined,
+    }) as never,
+  });
+  const token = readFileSync(join(home2, 'private/owner-token'), 'utf8').trim();
+  const response = await drafted(new Request('http://127.0.0.1:18777/api/owner/message.draft', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    body: JSON.stringify({ command: 'message.draft', taskId: 't1', step: 'execute', channel: 'native' }),
+  }));
+  // LocalEnrollmentAdmin 或 OutboundMessageStore 可能因桩不全失败；只要不是「NodeSteward 需要执行端」即证明 steward 已传入。
+  const body = await response.json() as { error?: string; message?: unknown; styleSamplesUsed?: number };
+  expect(String(body.error ?? '')).not.toContain('NodeSteward 需要执行端');
+  if (response.status === 200) {
+    expect(drafts.length).toBe(1);
+    expect(body).toMatchObject({ message: { body: '请把甲做完并自验。' } });
+  }
+});

@@ -1140,6 +1140,65 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(out.text).toContain('要不要删除旧表');
   });
 
+  test('vendorPrompt 对 devin-cloud 执行轮提示 OPS-REQUEST 代跑约定', () => {
+    const repo = { slug: 'acme/widget', owner: 'acme', repo: 'widget', branch: 'sck/task-1', defaultBranch: 'main' };
+    const text = vendorPrompt({ provider: 'devin-cloud', prompt: '做事' } as never, repo, { task: '实现需求甲。', review: false } as never);
+    expect(text).toContain('[OPS-REQUEST]');
+    expect(text).toContain('ops_health');
+    expect(text).toContain('最多 3 轮');
+    const review = vendorPrompt({ provider: 'devin-cloud', prompt: '复核' } as never, repo, { task: '复核', review: true } as never);
+    expect(review).not.toContain('[OPS-REQUEST]');
+  });
+
+  test('blocked 时 assist 回传同一 sessionUrl 后完成收尾；第 4 次硬熔断', async () => {
+    const w = world({ extra: gitOk });
+    const assists: Array<{ round: number; transcriptTail: string }> = [];
+    const b = devinBrowse({
+      send: [{ ok: true, url: SESSION }],
+      follow: [{ ok: true, url: SESSION }],
+      session: [
+        { ok: true, markerSeen: true, status: 'blocked', done: null, tail: '[OPS-REQUEST] {"tool":"ops_health","args":{}}' },
+        idleDone(PR9),
+        idleDone(PR9),
+      ],
+    });
+    const out = await runLane(w.input({ provider: 'devin-cloud' }), {
+      ...w.deps, browse: b.browse,
+      assist: async input => {
+        assists.push({ round: input.round, transcriptTail: input.transcriptTail });
+        return { decision: 'reply', message: 'staging healthy', toolExecuted: 'ops_health' };
+      },
+    });
+    expect(out.status).toBe('success');
+    expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
+    expect(assists).toHaveLength(1);
+    expect(assists[0]!.round).toBe(1);
+    expect(b.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(1);
+    expect(b.calls.filter(s => s.includes(MODE('follow')))[0]).toContain(SESSION);
+    expect(readLaneState(w.commDir)?.devin?.assistRounds).toBe(1);
+    // 重新跑：assistRounds 已到 3 时第 4 次 blocked 硬熔断
+    const w2 = world({ extra: gitOk });
+    writeLaneState(w2.commDir, { sessionId: 'lane-1', digest: 'x', vendorSession: SESSION, branch: 'sck/task-1',
+      taskId: 'SCK-aaaaaaaaaa', taskUrl: SESSION, submittedAt: Date.now(),
+      delivery: 'delivery-assist-cap',
+      devin: { assistRounds: 3 } });
+    // 让 sameRound：用 delivery 对齐
+    const b2 = devinBrowse({
+      session: [{ ok: true, markerSeen: true, status: 'blocked', done: null, tail: '还要帮助' }],
+    });
+    let assistCalls = 0;
+    const out2 = await runLane(w2.input({ provider: 'devin-cloud', env: { SCK_DELIVERY_ID: 'delivery-assist-cap' } }), {
+      ...w2.deps, browse: b2.browse,
+      assist: async () => { assistCalls++; return { decision: 'reply', message: 'should not run' }; },
+    });
+    expect(out2.status).toBe('success');
+    expect(out2.text).toMatch(/^工作结果：受阻/);
+    expect(out2.text).toContain('老板');
+    expect(assistCalls).toBe(0);
+    expect(b2.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(0);
+  });
+
+
   test('转录里一直看不到本轮标记 → 不补发、不另建会话，明确受阻并保留在途状态', async () => {
     const w = world({ extra: gitOk });
     const missing = { ok: true, markerSeen: false, status: 'idle', done: null, tail: '' };

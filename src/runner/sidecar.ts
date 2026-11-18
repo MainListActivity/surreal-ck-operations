@@ -25,6 +25,8 @@ import type { EmployeeInst, SupervisedTask, Workforce } from "../workforce.ts";
 import { guardRelayResponse } from "../response-budget.ts";
 import { isPaged, parseReclaimInput, parseWorktreeInput, taskIdOf } from "../query-input.ts";
 import { arriving, SNAPSHOT_TOOLS, withinReplyCeiling } from "../reply-clock.ts";
+import { STEWARD_RELAY_OPS_ALLOWLIST, type StewardAssistOutcome } from "../steward/steward.ts";
+import { clip, redactSecrets } from "../ops/redact.ts";
 
 /** The release the node updater made live (the `current` symlink to plugin-releases/<sha>/plugin); undefined when it cannot be read. */
 const qaRuntimeRelease = (): string | undefined => {
@@ -57,6 +59,8 @@ const BASE_TOOLS = [
   // SYS04: what the plugin process is actually running. Answered in the plugin host's own context, never from
   // a client-side tree or the `active` symlink, so it can serve as evidence of the loaded version.
   "plugin_runtime_diagnostics",
+  // Mode 1 云端通道本地工具代跑中继：云端 agent 经此请求本地驻场管理员代跑绿区只读/幂等 ops。
+  "steward_lane_assist",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -168,6 +172,14 @@ export interface SidecarDeps {
    * 不注入即保持原行为。代码层硬约束判读器不得越过独立复核直接 accept 执行轮，且同任务连续自动跟进不超过 3 轮。
    */
   verdictResolver?: StewardVerdictResolver;
+  /**
+   * 云端通道 Mode 1 代跑中继：解析转录里的 OPS-REQUEST 或由 Steward 给出绿区协助结论。
+   * 不注入时 steward_lane_assist 返回 escalate。
+   */
+  laneAssist?: (input: {
+    taskId: string; taskSummary?: unknown; provider: string; phase: 'doing' | 'review';
+    transcriptTail: string; round: number;
+  }) => Promise<StewardAssistOutcome>;
   executionChanged?: (row: ExecutionAttempt) => Promise<void>;
   /**
    * Read-only authoritative facts (task lease identity, employee identity, and whether the delivery's write
@@ -1509,6 +1521,58 @@ export class SidecarPool {
           return { ...sample, channel: "plugin-sidecar", instanceId: instId };
         });
       });
+      case "steward_lane_assist": {
+        const claim = live();
+        const round = args.round;
+        if (!Number.isInteger(round) || (round as number) < 1 || (round as number) > 3) {
+          return { decision: 'escalate', reason: '已达云端自动协助上限（3 轮），转交老板裁决' };
+        }
+        if (typeof args.provider !== 'string' || !args.provider.trim()) {
+          throw Object.assign(new Error('steward_lane_assist 需要 provider'), { code: 'invalid' });
+        }
+        if (args.phase !== 'doing' && args.phase !== 'review') {
+          throw Object.assign(new Error('steward_lane_assist 的 phase 必须是 doing 或 review'), { code: 'invalid' });
+        }
+        if (typeof args.transcriptTail !== 'string') {
+          throw Object.assign(new Error('steward_lane_assist 需要 transcriptTail'), { code: 'invalid' });
+        }
+        const assist = this.deps.laneAssist;
+        if (!assist) return { decision: 'escalate', reason: '本执行端未配置云端代跑协助，转交老板裁决' };
+        const outcome = await assist({
+          taskId: claim.taskId,
+          taskSummary: args.taskSummary,
+          provider: args.provider.trim(),
+          phase: args.phase,
+          transcriptTail: args.transcriptTail,
+          round: round as number,
+        });
+        if (outcome.kind === 'tool_relay') {
+          const relayTool = outcome.tool;
+          if (!(STEWARD_RELAY_OPS_ALLOWLIST as readonly string[]).includes(relayTool)
+            || !ops?.tools.includes(relayTool)) {
+            return { decision: 'escalate', reason: `工具 ${relayTool} 不在代跑白名单或本机未启用，转交老板裁决` };
+          }
+          const { taskId: _drop, ...cleanArgs } = outcome.args;
+          try {
+            const raw = await this.opsCircuit.run({
+              employee: instId, task: claim.taskId, delivery: claim.proof.deliveryId, tool: relayTool,
+              check: () => { live(); },
+              invoke: () => ops.call(cred, claim.taskId, relayTool, cleanArgs),
+              block: text => writeOp(proof => core.block(cred, proof, 'owner', {
+                text, idempotencyKey: `ops-circuit:${claim.proof.deliveryId}:${relayTool}`,
+              }), true),
+            });
+            const message = clip(String(redactSecrets(typeof raw === 'string' ? raw : JSON.stringify(raw))), 4000);
+            return { decision: 'reply', toolExecuted: relayTool, message };
+          } catch (error) {
+            return { decision: 'escalate', reason: `代跑 ${relayTool} 失败：${(error as Error).message}`.slice(0, 500) };
+          }
+        }
+        if (outcome.kind === 'reply') {
+          return { decision: 'reply', message: String(redactSecrets(outcome.message)) };
+        }
+        return { decision: 'escalate', reason: outcome.kind === 'escalate' ? outcome.reason : '协助结论无法处理，转交老板裁决' };
+      }
       default: throw Object.assign(new Error(RETIRED_TOOLS.has(tool)
         ? `${tool} 已下线：凭证不再交给员工，需要账号、workspace、登录请用运维工具（sck call ops_info '{}' 查看）`
         : `unknown tool: ${tool}`), { code: "unknown_tool" });

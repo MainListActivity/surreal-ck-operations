@@ -1,20 +1,19 @@
 {
-  "version": "0.13.55",
-  "title": "NodeSteward 判读与模仿起草、老板风格记忆、云通道跨租约零重发",
+  "version": "0.13.56",
+  "title": "本地 owner API 接通 Steward；云端 Mode 1 绿区代跑中继与自动脱困",
   "changes": [
-    "执行端常驻 NodeSteward 经既有 Magpie Anthropic 接口判读无首行口令的答复；严格 JSON、30 秒超时、输入输出脱敏，失败安全回退。",
-    "继续执行 0.13.54 独立复核与连续自动跟进上限护栏：doing 只能 submit/block，review 只能 accept/return/block。",
-    "老板改稿：message.edit 与 message.edit_rendered 保存成功且正文变化时，把脱敏差分写入 owner_style_memory，记忆写入失败不阻塞改稿。",
-    "message.draft：读取任务卡与最近最多 5 条风格样本，区分本机和云端/网页能力起草自然派工消息，只更新未发草稿，保留 hold 并防并发覆盖。",
-    "云通道：无 findings 的执行轮跨租约重派同一任务时领养旧在途任务，纯轮询不再发送；结清后清理同一供应商任务的旧登记。",
-    "Devin 收尾：缺 PR 行时查询真实 OPEN PR；idle 漏写 DONE 时，只有远端分支确有新提交且有 OPEN PR 才按真实 HEAD 收尾。"
+    "本地 owner HTTP API 组装 ctx 时补传 c.steward，修复 sck owner message.draft 报「NodeSteward 需要执行端」。",
+    "NodeSteward 新增 STEWARD_RELAY_OPS_ALLOWLIST 与 assistLane：显式 [OPS-REQUEST] 白名单代跑，非白名单硬拦截；无显式请求时模型只许绿区 tool_relay/reply 或 escalate。",
+    "sidecar 新增 steward_lane_assist：校验租约与 1..3 轮，二次硬核白名单后经 opsCircuit 代跑，输出脱敏截断；无租约拒绝。",
+    "cloud-lane：devin-cloud 执行轮提示 OPS-REQUEST；blocked 时经 assist 回传同一 sessionUrl（Free 档），assistRounds 达 3 硬熔断转老板裁决。",
+    "main.ts 在配置了 SCK_COMM_DIR 与 SCK_COMM_KEY 时经 comm 发起 steward_lane_assist，带超时，不触碰 private/。"
   ],
   "impact": [
-    "老板：可按最近改稿偏好一键起草，原扣住状态不变，不会自动放行。",
-    "员工：自然答复可由管理员判读，但执行轮不能跳过独立复核。",
-    "运维：跨租约恢复不重复发送；Devin 漏标记可用真实远端证据收尾。",
-    "限制：起草依赖执行端 Magpie 授权；未知通道按远程能力保守处理，模型失败不覆盖草稿。"
+    "老板：本机 sck owner message.draft 可正常起草。",
+    "员工：devin-cloud 在绿区健康度/日志/测试账号查询上可自动脱困最多 3 轮，越权与付费档请求仍交老板。",
+    "运维：代跑只走白名单只读/幂等 ops，结果脱敏截断；协助失败安全降级。",
+    "限制：非白名单工具、提示词注入、切付费档一律 escalate；第 4 次 blocked 硬熔断。"
   ],
-  "migration": "新增 schema 073，由 migrator/bootstrap 幂等建立 SCHEMALESS owner_style_memory 表及时间索引，不改历史任务。升级并重启执行端，沿用既有 Magpie 凭证文件，默认模型 group/sck-sonnet。",
-  "rollback": "回退至 0.13.54，保留风格记忆表而不再使用；停止新起草命令，判读恢复原可选接缝。回退前核对在途云端登记，旧版跨租约恢复可能再次发出跟进消息。"
+  "migration": "升级并重启执行端即可；无 schema 变更。沿用既有 Magpie 凭证与 ops 配置。",
+  "rollback": "回退至 0.13.55；云端通道恢复为 blocked 即交老板，本地 message.draft 需执行端 steward 接线后的版本。"
 }
