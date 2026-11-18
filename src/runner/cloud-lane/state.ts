@@ -56,6 +56,8 @@ export interface DevinLaneState {
   attemptSession?: string;
   /** 最近一次发送前核验的 Capability 与 N/M in use 席位读数（审计用，不含页面原文）。 */
   seats?: DevinSeatReading;
+  /** Mode 1 本地代跑协助已用轮数（上限 3）；达到上限后 blocked 交老板裁决。 */
+  assistRounds?: number;
 }
 
 /** 回合摘要：provider + 交给供应商的完整 prompt（含 task.md 与 findings），不是外层派工消息。 */
@@ -95,6 +97,8 @@ export interface InflightEntry {
   attemptSession?: string;
   /** 所属公司任务 ID：摘要变了（返工改了 findings）的重派也要认出是同一任务。 */
   task?: string;
+  /** 该 attempt 是本轮第几次本地代跑回传：换员工目录恢复时据此保持 3 轮上限。 */
+  assistRounds?: number;
 }
 
 function inflightPath(stateRoot: string, provider: string, digest: string): string {
@@ -161,11 +165,12 @@ export function readInflightOfTask(stateRoot: string | undefined, provider: stri
  * task 是公司任务 ID，换摘要重派时据此认出同一任务。
  */
 export function recordInflightAttempt(stateRoot: string | undefined, provider: string, digest: string | undefined,
-  attempt: string, at: number, attemptSession?: string, task?: string): void {
+  attempt: string, at: number, attemptSession?: string, task?: string, assistRounds?: number): void {
   if (!stateRoot || !digest) return;
   const { attemptSession: _previous, ...prev } = readInflightRaw(stateRoot, provider, digest) ?? {};
   writeInflight(stateRoot, provider, digest,
-    { ...prev, attempt, attemptAt: at, ...(attemptSession ? { attemptSession } : {}), ...(task ? { task } : {}) });
+    { ...prev, attempt, attemptAt: at, ...(attemptSession ? { attemptSession } : {}), ...(task ? { task } : {}),
+      ...(assistRounds !== undefined ? { assistRounds } : {}) });
 }
 
 /** 撤销发送意图（确认没有按下发送时）。已有 taskId 的登记只去掉 attempt，不能误删在途任务。 */
