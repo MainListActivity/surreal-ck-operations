@@ -12,7 +12,7 @@ import { latestFindings } from './dispatcher/brief.ts';
 import { HANDOVER_ROWS } from './handover-window.ts';
 import { deliveryOf, effectiveLangOf, translationStateOf, type DeliveryMessage } from './outbound-delivery.ts';
 import { OutboundMessageStore } from './outbound-messages.ts';
-import { acIdOf, dispatchText, renderMessage, stepOfTask, type MessageStep, type RenderContext } from './outbound-render.ts';
+import { acIdOf, dispatchText, renderDispatchBody, renderMessage, stepOfTask, type MessageStep, type RenderContext } from './outbound-render.ts';
 
 export type BoardPhase = 'execute' | 'review';
 
@@ -506,11 +506,12 @@ export async function readBoard(db: Surreal, opts: { now?: number } = {}): Promi
     if (!ctx) return undefined;
     const workdir = workdirOf(row.worktree);
     const message = deliveryFieldsOf(draft);
+    const edited = { bodyVerbatim: draft.body_verbatim === true };
     // The translation rendered the same way: a translated dispatch names the same paths, workdir line included.
-    const translation = translationOf(message, langOf.get(employeeId), text => dispatchText(renderMessage(text, ctx), workdir));
+    const translation = translationOf(message, langOf.get(employeeId), text => dispatchText(renderDispatchBody(text, edited, ctx), workdir));
     return { messageId: keyOf(draft.id), taskId, title: String(row.title ?? ''), step,
       context: contexts.get(taskId),
-      body: dispatchText(renderMessage(message.body, ctx), workdir), workdirPending: workdir === undefined, hold: heldAt(taskId), lang: ownerLang, editable: true,
+      body: dispatchText(renderDispatchBody(message.body, edited, ctx), workdir), workdirPending: workdir === undefined, hold: heldAt(taskId), lang: ownerLang, editable: true,
       ...(typeof draft.hold_reason === 'string' && heldAt(taskId) ? { holdReason: draft.hold_reason } : {}),
       ...(translation ? { translation } : {}) };
   };

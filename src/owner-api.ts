@@ -15,7 +15,7 @@ import type { CompanyCore } from './contracts.ts';
 import { preferredProviderValue, Workforce } from './workforce.ts';
 import { lanePreferenceValue } from './dispatcher/lane-preference.ts';
 import { OutboundMessageStore, type OutboundMessage } from './outbound-messages.ts';
-import { bodyOfDispatch, unrenderMessage } from './outbound-render.ts';
+import { bodyOfDispatch } from './outbound-render.ts';
 import { turnAnalysesOf } from './turn-analysis.ts';
 import { findingsFileOf, readBoard, readBoardView, renderContextFor } from './board.ts';
 import { CompanyError } from './core-errors.ts';
@@ -40,6 +40,11 @@ const text = (value: unknown, field: string, min = 1, max = 20000): string => {
   return value.trim();
 };
 const optionalText = (value: unknown): string | undefined => typeof value === 'string' && value.trim() ? value.trim() : undefined;
+/** 正文校验与其他文本相同，但不裁掉老板有意保留的空格、缩进和换行。 */
+const messageText = (value: unknown, field: string): string => {
+  text(value, field);
+  return value as string;
+};
 const strArray = (value: unknown): string[] => Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
 
 /**
@@ -51,8 +56,8 @@ export const RUNNER_ONLY_COMMANDS: ReadonlySet<string> = new Set(['task.create']
 
 /**
  * The owner edits the text an employee would receive: the board's outbox text, which is the stored body rendered with that employee's
- * paths. The edit is reversed to the stored body and saved only when that body renders back to the edited text, so the employee never
- * reads a path or tool name the owner did not see on the board. The workdir line belongs to the claim and is not part of the edit.
+ * paths. Owner edits are literal, even when a path cannot be reversed to a placeholder.
+ * The workdir line belongs to the claim and is not part of the edit.
  */
 async function editRenderedMessage(ctx: OwnerApiContext,
   input: { messageId: string; employeeId: string; rendered: string; actor: string }): Promise<OutboundMessage> {
@@ -71,9 +76,10 @@ async function editRenderedMessage(ctx: OwnerApiContext,
   const renderCtx = renderContextFor(view, input.employeeId, { taskId: message.taskId, step: message.step,
     acceptanceCriteria: rows[0].acceptance_criteria, findingsFile: await findingsFileOf(db, task) });
   if (!renderCtx) throw new CompanyError('not_found', 'employee not found on the owner board');
-  const body = unrenderMessage(bodyOfDispatch(input.rendered), renderCtx);
-  if (body === undefined) throw new CompanyError('invalid', 'rendered text invalid: a path or tool name differs from what the board shows');
-  return ctx.messages.edit(input.messageId, body, input.actor);
+  // 只有未编辑模板才替换路径；老板改过的正文按原文存储和投递，不要求能逆向还原占位符。
+  const stripped = bodyOfDispatch(input.rendered);
+  if (!stripped.trim()) throw new CompanyError('invalid', 'rendered text invalid: 正文不能为空');
+  return ctx.messages.edit(input.messageId, stripped, input.actor);
 }
 
 /** Every command is a flat JSON object: { command, ...args }. */
@@ -314,7 +320,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
 
     // ---- 待发消息 ----
     case 'message.list': return { messages: await ctx.messages.list(optionalText(input.taskId), input.includeSent !== false) };
-    case 'message.edit': return ctx.messages.edit(text(input.messageId, 'messageId'), text(input.body, 'body'), a,
+    case 'message.edit': return ctx.messages.edit(text(input.messageId, 'messageId'), bodyOfDispatch(messageText(input.body, 'body')), a,
       typeof input.expectedBody === 'string' ? input.expectedBody : undefined);
     case 'message.hold': return ctx.messages.setHold(text(input.messageId, 'messageId'), true, a);
     case 'message.release': return ctx.messages.setHold(text(input.messageId, 'messageId'), false, a);
@@ -336,7 +342,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     }
 
     case 'message.edit_rendered': return editRenderedMessage(ctx, { messageId: text(input.messageId, 'messageId'),
-      employeeId: text(input.employeeId, 'employeeId'), rendered: text(input.rendered, 'rendered', 1, 20000), actor: a });
+      employeeId: text(input.employeeId, 'employeeId'), rendered: messageText(input.rendered, 'rendered'), actor: a });
 
     // ---- 老板看板 ----
     case 'board.snapshot': return readBoard(db, { now: typeof input.now === 'number' ? input.now : undefined });

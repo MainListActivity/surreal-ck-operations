@@ -131,8 +131,8 @@ run('模板迁移可重复执行，保留老板修改的正文与已发送记录
   const old = '先读 notes.md。按 task.md 完成当前步骤，记录可验证证据；有前置缺口请报告阻塞。 使用派工消息中的 sck 命令记录 checkpoint / submit。不要创建后继任务，由迭代流程统一推进。提交后结束本轮。';
   const store = new OutboundMessageStore(db.db);
   const one = await store.createDraft('fixture-template', 'execute', 'product', false, 'doing', old);
-  const edited = await store.createDraft('fixture-template', 'execute', 'product', false, 'doing', old + '老板补充：只读核对。');
-  const sent = await store.createDraft('fixture-template', 'execute', 'product', false, 'doing', old);
+  const edited = await store.createDraft('fixture-template-edited', 'execute', 'product', false, 'doing', old + '老板补充：只读核对。');
+  const sent = await store.createDraft('fixture-template-sent', 'execute', 'product', false, 'doing', old);
   await db.db.query('UPDATE $id SET state="sent";', { id: new RecordId('outbound_message', sent.id) });
   await db.db.query(migration); await db.db.query(migration);
   expect((await store.get(one.id))?.body).not.toContain('checkpoint / submit');

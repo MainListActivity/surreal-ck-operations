@@ -7,7 +7,7 @@ import { LIFECYCLE_COMMANDS } from '../lifecycle-policy.ts';
 // The sidecar claims tasks on the instance's behalf (dispatcher calls claim()),
 // keeps the lease alive while a turn runs, relays `sck call` requests through
 // req/res files, and ingests report.md/blocker.md when a turn ends.
-import { ExecutionJournal, workResult, finalAnswer, type ExecutionAttempt, type ResultDeliveryRef, type ResultFacts, type SupersededCause } from './lifecycle.ts';
+import { advancedWorktreeHead, ExecutionJournal, stewardWorkResult, workResult, finalAnswer, type ExecutionAttempt, type ResultDeliveryRef, type ResultFacts, type StewardVerdictResolver, type SupersededCause } from './lifecycle.ts';
 import type { TurnEnded } from './contracts.ts';
 import { RuntimeResultError } from './turn-result.ts';
 import { OpsCircuit } from "./ops-circuit.ts";
@@ -163,6 +163,11 @@ export interface SidecarDeps {
   briefStaged?: (employee: string, claim: ClaimResult) => Promise<void>;
   managedLifecycle?: boolean;
   readTurnResult?: (agent: string, turn: string, startedAt: number) => Promise<string>;
+  /**
+   * 总管判读接缝：答复没有手写首行口令时，由可注入的判读器给出结构化结论（submit/accept/return/block）。
+   * 不注入即保持原行为。代码层硬约束判读器不得越过独立复核直接 accept 执行轮，且同任务连续自动跟进不超过 3 轮。
+   */
+  verdictResolver?: StewardVerdictResolver;
   executionChanged?: (row: ExecutionAttempt) => Promise<void>;
   /**
    * Read-only authoritative facts (task lease identity, employee identity, and whether the delivery's write
@@ -355,6 +360,14 @@ export class SidecarPool {
     row.state = 'collecting'; await this.changed(row);
     return this.collectExecution(row);
   }
+  /** 本任务上一条投递留下的连续自动跟进轮数；同一行的结论已定过就沿用它，重复收集不会重复加一。 */
+  private priorAutoFollowups(row: ExecutionAttempt): number {
+    if (row.autoFollowups !== undefined) return row.autoFollowups;
+    const prior = this.journal?.rows().filter(other => other.task === row.task && other.proof.deliveryId !== row.proof.deliveryId)
+      .filter(other => other.proof.expectedVersion < row.proof.expectedVersion)
+      .sort((a, b) => b.proof.expectedVersion - a.proof.expectedVersion)[0];
+    return prior?.autoFollowups ?? 0;
+  }
   private async collectExecution(row: ExecutionAttempt): Promise<SettleResult> {
     if (!row.finalText && !row.artifacts?.raw && !row.artifacts?.report && !row.artifacts?.blocker && this.deps.readTurnResult) {
       try {
@@ -374,8 +387,17 @@ export class SidecarPool {
     }
     try {
       const { raw, blocker, report } = row.artifacts ?? {}; // Never read a later delivery's shared files during recovery.
-      row.result = blocker !== undefined ? workResult('', row.phase, { summary: blocker, outcome: 'blocked' })
-        : workResult(report || row.finalText || '', row.phase, raw === undefined ? undefined : JSON.parse(raw));
+      if (blocker !== undefined) {
+        row.result = workResult('', row.phase, { summary: blocker, outcome: 'blocked' });
+        row.verdictVia = 'written'; row.autoFollowups = 0;
+      } else {
+        // 首行口令是首选；没有口令时交给注入的判读器，熔断与越权限制在 stewardWorkResult 内硬执行。
+        const verdict = await stewardWorkResult(report || row.finalText || '', row.phase, raw === undefined ? undefined : JSON.parse(raw), {
+          resolver: this.deps.verdictResolver, task: row.task, employee: row.employee, deliveryId: row.proof.deliveryId,
+          autoFollowups: this.priorAutoFollowups(row),
+        });
+        row.result = verdict.result; row.verdictVia = verdict.via; row.autoFollowups = verdict.autoFollowups;
+      }
       row.state = 'pending'; row.nextRetry = 0;
     } catch {
       row.state = 'attention'; row.error = '工作结果缺失或复核结论不明确';
@@ -447,8 +469,10 @@ export class SidecarPool {
       if (!row.prepared && row.result.action === 'submit') {
         const task = await this.callWithCred(row.employee, cred => core.getTask(cred, row.task));
         if (!row.result.evidence.sha && task.workIntent?.kind === 'code' && task.worktree?.worktreePath) {
-          const head = await new Promise<string | undefined>(resolve => execFile('git', ['-C', task.worktree!.worktreePath, 'rev-parse', 'HEAD'],
-            { timeout: 10000, maxBuffer: 1024 * 1024 }, (error, stdout) => resolve(!error && /^[a-f0-9]{40}$/i.test(stdout.trim()) ? stdout.trim() : undefined)));
+          const path = task.worktree.worktreePath;
+          const head = await advancedWorktreeHead((cmd, args, cwd) => new Promise(resolve =>
+            execFile(cmd, args, { cwd, timeout: 10000, maxBuffer: 1024 * 1024 }, (error, stdout) =>
+              resolve({ code: error ? 1 : 0, stdout: String(stdout ?? '') }))), path, task.worktree.branch);
           if (head) row.result.evidence.sha = head;
         }
         if (task.acceptanceEnvironment) row.result.evidence.acceptance = { ...row.result.evidence.acceptance, environment: task.acceptanceEnvironment };

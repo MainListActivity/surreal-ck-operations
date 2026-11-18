@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { ownerApi, type OwnerApiContext } from '../src/owner-api.ts';
 import { renderContextFor, type BoardView, type OwnerBoard } from '../src/board.ts';
-import { DEFAULT_MACHINE_CRITERION, bodyOfDispatch, dispatchText, renderMessage, unrenderMessage } from '../src/outbound-render.ts';
+import { DEFAULT_MACHINE_CRITERION, bodyOfDispatch, dispatchText, renderDispatchBody, renderMessage, unrenderMessage } from '../src/outbound-render.ts';
 
 // The owner board commands over a database that holds nothing: the read answers empty, and a malformed edit fails before any read.
 // The full edit path (a stored message, a claimed employee, a sent message) runs against a real fork in dispatch-board.fork.test.ts.
@@ -22,6 +22,15 @@ test('board.snapshot reads the board through the owner API at the time the owner
   expect(queries.filter(sql => /\b(CREATE|UPDATE|UPSERT|DELETE|INSERT|RELATE)\b/.test(sql))).toEqual([]);
 });
 
+test('message.edit 保留任意正文缩进和换行，只剥离末尾工作目录行', async () => {
+  const { ctx } = emptyCtx();
+  let saved: unknown[];
+  ctx.messages = { edit: async (...args: unknown[]) => { saved = args; return {}; } } as never;
+  const body = '  原样保留 task.md、{taskId}、sck call\n    第二行  ';
+  await ownerApi(ctx, { command: 'message.edit', messageId: 'm1', body: `${body}\n工作目录：/wt/task\n` }, 'test');
+  expect(saved![1]).toBe(body);
+});
+
 test('message.edit_rendered rejects a malformed request before it reads anything', async () => {
   const { ctx, queries } = emptyCtx();
   await expect(ownerApi(ctx, { command: 'message.edit_rendered', employeeId: 'e1', rendered: '实现' }, 'cli')).rejects.toThrow('messageId invalid');
@@ -35,6 +44,7 @@ test('bodyOfDispatch takes off only the workdir line a dispatch appends', () => 
   const body = renderMessage('先读 notes.md。完成 task.md 中的需求。', { sckBin: '/bin/sck', commDir: '/comm/e1', taskId: 't1' });
   expect(bodyOfDispatch(dispatchText(body, '/wt/t1'))).toBe(body);
   expect(bodyOfDispatch(body)).toBe(body);
+  expect(bodyOfDispatch(`${body}\r\n工作目录：/wt/t1\r\n`)).toBe(body);
   // A workdir-looking line that is not the last line is text the owner wrote, so it stays for the reverse check to judge.
   const middle = `${body}\n工作目录：/wt/t1\n补充`;
   expect(bodyOfDispatch(middle)).toBe(middle);
@@ -46,6 +56,16 @@ test('an edit that swaps a rendered path for a bare file name cannot be reversed
   expect(shown).toBe('完成 /comm/e1/task.md 中的需求。');
   expect(unrenderMessage(shown, ctx)).toBe('完成 task.md 中的需求。');
   expect(unrenderMessage(shown.replace('/comm/e1/task.md', 'task.md'), ctx)).toBeUndefined();
+});
+
+test('字面正文原样投递；可还原模板仍替换路径变量', () => {
+  const ctx = { sckBin: '/bin/sck', commDir: '/comm/e1', taskId: 't1' };
+  // 老板写的是任意正文：即使碰巧含 task.md 或 sck call，也不再被替换。
+  expect(renderDispatchBody('先读 task.md，再 sck call checkpoint。', { bodyVerbatim: true }, ctx))
+    .toBe('先读 task.md，再 sck call checkpoint。');
+  // 未编辑或可还原模板：路径照常渲染成员工可用的绝对路径。
+  expect(renderDispatchBody('先读 task.md，再 sck call checkpoint。', {}, ctx))
+    .toBe("先读 /comm/e1/task.md，再 '/bin/sck' call checkpoint。");
 });
 
 test('renderContextFor renders for an employee the view saw, with the view paths and the step criterion only', () => {

@@ -8,7 +8,7 @@ import { isAbsolute, join } from 'node:path';
 import { isLaneProvider, type LaneProvider } from '../native-args.ts';
 import { WEB_CHAT_PROVIDERS } from '../native-args.ts';
 import { bodyOfDispatch } from '../../outbound-render.ts';
-import { clearInflight, inflightSession, laneDigest, readClaimTask, readInflight, readInflightOfTask, readLaneState, recordInflight, writeLaneState, type LaneState } from './state.ts';
+import { clearInflight, inflightSession, laneDigest, readClaimDelivery, readClaimTask, readInflight, readInflightOfTask, readLaneState, recordInflight, writeLaneState, type LaneState } from './state.ts';
 import { repoInfo, type ExecFn, type RepoInfo } from './repo.ts';
 import { driveCodex } from './codex.ts';
 import { devinCloudModel, driveDevin } from './devin.ts';
@@ -202,7 +202,7 @@ interface VendorOutcome {
 async function drive(ctx: {
   input: LaneInput; deps: LaneDeps; repo: RepoInfo;
   material: ReturnType<typeof taskMaterial>; prompt: string;
-  state: LaneState; digest: string; deadline: number;
+  state: LaneState; digest: string; key: string; deadline: number;
 }): Promise<VendorOutcome> {
   const { input } = ctx;
   if (input.provider === 'codex-cloud') return driveCodex(ctx);
@@ -253,23 +253,29 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
   // 摘要必须覆盖定义本轮的全部输入：供应商 prompt 已含 task.md 与内联的复核意见，
   // 不能只取派工消息（复用 comm 目录时不同任务的派工消息可能逐字相同）。
   const digest = laneDigest(input.provider, prompt);
+  // 当轮稳定投递键：claim.json 的 deliveryId 或环境变量传入；同一投递内正文重排/目录变化仍按同一回合恢复。
+  const delivery = input.env.SCK_DELIVERY_ID?.trim() || input.env.SCK_DELIVERY_KEY?.trim() || readClaimDelivery(input.commDir) || undefined;
+  const registryKey = delivery ?? digest;
+  const sameRound = delivery !== undefined && state.delivery !== undefined ? state.delivery === delivery : state.digest === digest;
   const deadline = deps.now() + (input.config.maxMinutes ?? 180) * 60_000;
 
-  // 相同 prompt 摘要重连在途云端任务；新回合清空 taskId 但保留可复用的供应商会话（vendorSession）。
-  const next: LaneState = { ...state, sessionId, digest, branch: repo.branch, task: readClaimTask(input.commDir) };
+  // 相同投递（或旧状态没有投递键时的相同摘要）重连在途云端任务；新回合清空 taskId 但保留可复用的供应商会话（vendorSession）。
+  const next: LaneState = { ...state, sessionId, digest, delivery, branch: repo.branch, task: readClaimTask(input.commDir) };
   // Devin 上一轮已按下发送（或发送中途进程中断，attempt 残留）且受理未确认、没有会话地址可核对：
-  // 换了 prompt 也不能另建会话（可能与在途会话重复），受阻交人工。在途登记与 attempt 原样保留。
-  if (state.digest !== digest && input.provider === 'devin-cloud' && (state.taskId || state.devin?.attempt)
+  // 换了投递也不能另建会话（可能与在途会话重复），受阻交人工。在途登记与 attempt 原样保留。
+  if (!sameRound && input.provider === 'devin-cloud' && (state.taskId || state.devin?.attempt)
     && !state.taskUrl && !state.vendorSession)
     return blocked(`上一轮 Devin Cloud 已按下发送（或发送中途中断）但未确认受理，且没有会话地址可核对；为避免另建重复会话，本轮未发出。在途登记已保留，请人工核对 app.devin.ai 会话列表后再决定是否重派。`);
-  if (state.digest !== digest) {
+  if (!sameRound) {
     delete next.taskId; delete next.taskUrl; delete next.submittedAt;
-    // 落点会话属于旧摘要的发送，新摘要不沿用；仍在途的旧发送由共享登记另行决定。
+    // 落点会话属于旧回合的发送，新回合不沿用；仍在途的旧发送由共享登记另行决定。
     if (next.devin) next.devin = { ...next.devin, attemptSession: undefined };
   }
-  // 本 comm 目录没有在途任务时查共享登记：同一公司任务换员工实例也能重连，而不是重复提交云端任务。
+  // 本 comm 目录没有在途任务时查共享登记：同一投递换员工实例也能重连，而不是重复提交云端任务。
   if (!next.taskId) {
-    const reg = readInflight(input.stateRoot, input.provider, digest);
+    // 新键（投递）优先；升级前的登记仍按摘要查找。
+    const reg = readInflight(input.stateRoot, input.provider, registryKey)
+      ?? (registryKey !== digest ? readInflight(input.stateRoot, input.provider, digest) : undefined);
     if (reg?.taskId) {
       next.taskId = reg.taskId;
       next.taskUrl = reg.taskUrl;
@@ -293,16 +299,17 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
     }
   }
   try {
-    const outcome = await drive({ input, deps, repo, material, prompt, state: next, digest, deadline });
+    const outcome = await drive({ input, deps, repo, material, prompt, state: next, digest, key: registryKey, deadline });
     if (!outcome.inflight && (outcome.kind !== 'error' || outcome.vendorTerminal)) {
       // 完成、受阻、供应商终态失败：回合有了定论，清除登记并清掉在途任务标记（失败可重新提交）。
       // 仍在途的受阻（供应商会话已发出、等待核对）保留标记，恢复时不再发送。
-      clearInflight(input.stateRoot, input.provider, digest);
+      clearInflight(input.stateRoot, input.provider, registryKey);
+      if (registryKey !== digest) clearInflight(input.stateRoot, input.provider, digest);
       writeLaneState(input.commDir, { ...next, taskId: undefined, taskUrl: undefined, submittedAt: undefined,
         ...(outcome.vendorTerminal ? { vendorSession: undefined } : {}) });
     } else {
       writeLaneState(input.commDir, next);
-      recordInflight(input.stateRoot, input.provider, digest, next);
+      recordInflight(input.stateRoot, input.provider, registryKey, next);
     }
     if (outcome.kind === 'error') return fail(outcome.text);
     if (outcome.kind === 'blocked') return { sessionId, status: 'success', text: outcome.text.startsWith(BLOCKED) ? outcome.text : `${BLOCKED}\n${outcome.text}` };
@@ -311,7 +318,7 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
     return { sessionId, status: 'success', text: outcome.text };
   } catch (error) {
     writeLaneState(input.commDir, next);
-    recordInflight(input.stateRoot, input.provider, digest, next);
+    recordInflight(input.stateRoot, input.provider, registryKey, next);
     return fail((error as Error).message);
   }
 }

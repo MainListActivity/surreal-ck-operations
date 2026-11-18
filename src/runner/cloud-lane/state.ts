@@ -14,8 +14,13 @@ export interface LaneState {
   taskUrl?: string;
   /** 可跨回合复用的供应商会话（Jules session name）；回合结束后保留供续轮 sendMessage。 */
   vendorSession?: string;
-  /** 提交时的 prompt 摘要：相同摘要重连，不同摘要说明是新回合。 */
+  /** 提交时的 prompt 摘要：无投递键时相同摘要重连；有投递键时只作新旧回合的辅助判据。 */
   digest?: string;
+  /**
+   * 当轮稳定投递标识（claim.json 的 deliveryId 或环境变量传入的投递键）。
+   * 同一投递内正文重排、目录变化都仍要重连在途云会话，不得重复发送。
+   */
+  delivery?: string;
   branch?: string;
   submittedAt?: number;
   /** 派工 claim.json 里的公司任务 ID：换员工目录、换摘要重派时，凭它认出同一任务的在途发送。 */
@@ -78,7 +83,7 @@ export interface InflightEntry {
 }
 
 function inflightPath(stateRoot: string, provider: string, digest: string): string {
-  return join(stateRoot, provider, 'inflight', `${digest}.json`);
+  return join(stateRoot, provider, 'inflight', `${encodeURIComponent(digest)}.json`);
 }
 
 /** 原样读出登记项（含只有 attempt、还没有 taskId 的发送中间态）。 */
@@ -107,6 +112,14 @@ export function readClaimTask(commDir: string): string | undefined {
   } catch { return undefined; }
 }
 
+/** 派工 claim.json 里的稳定投递标识（deliveryId）：同一投递的恢复不应因措辞或目录变化而重发。 */
+export function readClaimDelivery(commDir: string): string | undefined {
+  try {
+    const delivery = (JSON.parse(readFileSync(join(commDir, 'claim.json'), 'utf8')) as { deliveryId?: unknown }).deliveryId;
+    return typeof delivery === 'string' && delivery.trim() ? delivery.trim() : undefined;
+  } catch { return undefined; }
+}
+
 /**
  * 同一公司任务、摘要不同的其它在途登记（换摘要重派，比如返工改了 findings）。摘要变了，共享登记的键就变了，
  * 只能按任务 ID 找回同一任务的发送，免得在别的目录另建会话。按提交时间从新到旧。
@@ -118,7 +131,7 @@ export function readInflightOfTask(stateRoot: string | undefined, provider: stri
   try { names = readdirSync(dir); } catch { return []; }
   const found: InflightEntry[] = [];
   for (const name of names) {
-    if (!name.endsWith('.json') || name === `${digest}.json`) continue;
+    if (!name.endsWith('.json') || name === `${encodeURIComponent(digest)}.json`) continue;
     try {
       const value = JSON.parse(readFileSync(join(dir, name), 'utf8')) as InflightEntry;
       if (value?.task === task && (typeof value.taskId === 'string' || typeof value.attempt === 'string')) found.push(value);

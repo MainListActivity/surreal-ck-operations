@@ -7,7 +7,7 @@ import { employeeTier, managedModel, taskTier } from "../model-routing/policy.ts
 import { groupModel, isGroupModel } from "../model-routing/magpie-contract.ts";
 import type { OwnerDesk } from '../owner.ts';
 import { LaneNoteStore } from '../lane-notes.ts';
-import { OutboundMessageStore, renderMessage, type MessageStep, type OutboundMessage } from '../outbound-messages.ts';
+import { OutboundMessageStore, renderDispatchBody, renderMessage, type MessageStep, type OutboundMessage } from '../outbound-messages.ts';
 import { dispatchText } from '../outbound-render.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
@@ -849,7 +849,8 @@ export class Dispatcher {
       const findings = latestFindings(history);
       // Code dispatches name the task's own machine criterion id; plain steps carry no {acId} placeholder.
       const acId = step === 'execute' || step === 'rework' ? await store.machineCriterionId(taskId) : undefined;
-      const body = renderMessage(prepared.body, {
+      // 老板改过的正文原样投递：只有未编辑的模板才替换路径变量。
+      const body = renderDispatchBody(prepared.body, prepared.message, {
         sckBin: this.deps.env.sckBin, commDir: this.deps.sidecar?.commDirFor(employeeId) ?? '$SCK_COMM_DIR',
         ...(findings ? { findingsFile: findings.file } : {}), taskId,
         ...(acId ? { acId } : {}),

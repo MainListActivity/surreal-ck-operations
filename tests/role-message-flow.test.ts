@@ -88,6 +88,16 @@ test('review drafts and no-draft review sends use the same code flag as execute'
   let latest: Record<string, unknown> | undefined;
   const fake = (task: Record<string, unknown>) => new OutboundMessageStore({
     query: async (sql: string, vars: Record<string, any>) => {
+      if (sql.includes('CREATE $msg CONTENT')) {
+        const id = (vars.msg as { id?: string } | undefined)?.id ?? `m${created.length + 1}`;
+        created.push({ step: vars.step, body: vars.body });
+        latest = { id: { id }, task: { id: 't1' }, step: vars.step, role: vars.role,
+          body: vars.body, state: 'draft', hold: false, created_at: 'now' }; return [[]];
+      }
+      if (sql.includes('SELECT * FROM $msg')) {
+        const id = (vars.msg as { id?: string } | undefined)?.id;
+        return [latest && (latest.id as { id: string }).id === id ? [latest] : []];
+      }
       if (sql.includes('CREATE outbound_message')) {
         created.push({ step: vars.step, body: vars.body });
         latest = { id: { id: `m${created.length}` }, task: { id: 't1' }, step: vars.step, role: vars.role,
@@ -139,6 +149,16 @@ test('hold refuses to send; sent locks editing; the sent body is the table body'
   const rows: Array<Record<string, unknown>> = [];
   const db = {
     query: async (sql: string, vars: Record<string, unknown>) => {
+      if (sql.includes('CREATE $msg CONTENT')) {
+        const id = (vars.msg as { id?: string } | undefined)?.id ?? 'm1';
+        const row = { id: { id }, task: { id: 't1' }, step: vars.step, role: vars.role,
+          body: vars.body, state: 'draft', hold: false, created_at: 'now' };
+        rows.push(row); return [[]];
+      }
+      if (sql.includes('SELECT * FROM $msg')) {
+        const id = (vars.msg as { id?: string } | undefined)?.id;
+        return [rows.filter(r => (r.id as { id: string }).id === id)];
+      }
       if (sql.includes('CREATE outbound_message')) {
         const row = { id: { id: 'm1' }, task: { id: 't1' }, step: vars.step, role: vars.role,
           body: vars.body, state: 'draft', hold: false, created_at: 'now' };
