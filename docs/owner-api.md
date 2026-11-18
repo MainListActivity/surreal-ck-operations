@@ -47,6 +47,7 @@
 | 老板指示 | `sck owner instruct '{"text":"清查近期阻塞任务"}'` |
 | 解决提醒 | `sck owner notice.resolve '{"key":"n1"}'` |
 | 列出提醒 | `sck owner notice.list '{}'` |
+| 事件恢复授权（仅老板；绑定原 task/target/phase/incident；窗口从员工下一次真实恢复尝试消费时开始；同一事件只授权一次；受阻原卡需正常回复后重派） | `sck owner fault.grant '{"taskId":"b6f3b212-0051-49c3-8af3-405d0fa11c39","target":"idp_login","phase":"login","incident":"login|UND_ERR_CONNECT_TIMEOUT|none|-|idp_login|production","note":"IdP 修复已上线，授权一次新窗口","idempotencyKey":"fault-grant-b6f3b212-001"}'` |
 | 列出待发消息 | `sck owner message.list '{"taskId":"t1"}'` |
 | 编辑待发消息 | `sck owner message.edit '{"messageId":"m1","body":"实现 task.md 中的需求…"}'` |
 | 参考老板改稿偏好起草派工消息（保留原扣住状态） | `sck owner message.draft '{"taskId":"t1","step":"execute","channel":"devin-cloud"}'` |
