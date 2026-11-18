@@ -23,6 +23,7 @@ import { egoBrowserInjector, oidcUserEntry, type BrowserInjector } from './brows
 import { controlPlaneEnv, parseBrokerConfig, type BrokerConfig, type ControlPlaneEnv } from './config.ts';
 import { cloudflareD1, type D1Client } from './d1.ts';
 import { opsFetch, type Fetcher } from './fetcher.ts';
+import { FUNNEL_PULSE_EVENTS, isFunnelPulseEvent, isUtcDay, parseFunnelPulse } from './funnel-pulse.ts';
 import { originLogsRequest, sshOriginAgent, type OriginAgent, type OriginRequest } from './origin.ts';
 import {
   originEvidence, readGithubRelease, readPublicRuntimeVersion, RELEASE_RUNTIME_VERSION_PATH, summarizeRelease,
@@ -77,7 +78,7 @@ export const OPS_TOOLS = [
   'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_principal_list', 'ops_idp_admin_request',
   'ops_idp_provision_rotate', 'ops_invitation_issue',
   'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_approval_diagnose', 'ops_internal_ai_deliver', 'ops_internal_ai_revoke', 'ops_internal_ai_trust', 'ops_internal_ai_rotate_key',
-  'ops_supplier_plan_sample', 'ops_product_magpie_observe', 'ops_product_magpie_candidate', 'ops_magpie_route_sample', 'ops_magpie_route_restore', 'ops_magpie_window_prepare', 'ops_product_magpie_price_approve', 'ops_platform_operator_list', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs', 'ops_release_diagnose',
+  'ops_supplier_plan_sample', 'ops_product_magpie_observe', 'ops_product_magpie_candidate', 'ops_magpie_route_sample', 'ops_magpie_route_restore', 'ops_magpie_window_prepare', 'ops_product_magpie_price_approve', 'ops_platform_operator_list', 'ops_product_pulse', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs', 'ops_release_diagnose',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
 
@@ -412,6 +413,7 @@ export class OpsBroker {
       ops_magpie_window_prepare: (ctx, args) => this.magpieWindowPrepare(ctx, args),
       ops_product_magpie_price_approve: (ctx, args) => this.productMagpiePriceApprove(ctx, args),
       ops_platform_operator_list: (ctx, args) => this.platformOperatorList(ctx, args),
+      ops_product_pulse: (ctx, args) => this.productPulse(ctx, args),
       ops_origin_status: (ctx) => this.origin(ctx, { op: 'status' }),
       ops_origin_health: (ctx) => this.origin(ctx, { op: 'health' }),
       ops_origin_logs: (ctx, args) => this.origin(ctx, originLogsRequest(args)),
@@ -1826,6 +1828,39 @@ export class OpsBroker {
     return {
       value: view,
       audit: { action: 'ops_call', evidence: `ops_platform_operator_list → ${res.status} operators=${view.operators.length} current=${view.operators.filter(o => o.isCurrent).length}` },
+    };
+  }
+
+  /**
+   * `ops_product_pulse {session, event, day}`: one fixed event on one UTC day from the product's aggregated funnel
+   * summary (`GET /api/ops/funnel-summary`, CK #258). It reuses the operator session and the product's `funnel.read`
+   * capability — authorization failures stay distinct from an empty window or a suppressed sample — and only the
+   * validated summary state, public aggregates and coverage marker are projected. The row-level `funnel-counts`
+   * endpoint is never called, and no session handle, workspace key, raw body or error text is returned.
+   */
+  private async productPulse(ctx: Ctx, args: Args): Promise<Outcome> {
+    if (ctx.scope.project !== 'surreal_ck' || ctx.env !== 'production') throw new CompanyError('forbidden', '产品漏斗脉冲只对 surreal_ck 生产环境开放');
+    if (!['engineering', 'product', 'qa'].includes(ctx.scope.actor.role)) throw new CompanyError('forbidden', `role ${ctx.scope.actor.role} may not read the product pulse`);
+    const extra = Object.keys(args).filter(key => key !== 'session' && key !== 'event' && key !== 'day' && key !== 'env');
+    if (extra.length) throw invalid(`ops_product_pulse 只接受 session、event 与 day（rejected: ${extra.join(', ')}）`);
+    if (!isFunnelPulseEvent(args.event)) throw invalid(`event 须为已定义的漏斗事件：${FUNNEL_PULSE_EVENTS.join(', ')}`);
+    if (!isUtcDay(args.day)) throw invalid('day 须为合法 UTC 日期（YYYY-MM-DD）');
+    const session = this.session(ctx, args);
+    if (session.kind !== 'operator') throw invalid('产品漏斗脉冲需要运营会话；请先用 ops_operator_login');
+    const event = args.event;
+    const day = args.day;
+    const res = await this.product(ctx, session,
+      'GET', `/api/ops/funnel-summary?event=${encodeURIComponent(event)}&day=${encodeURIComponent(day)}`);
+    if (!res.ok) {
+      // Only the machine status is relayed: the product's body and error text never reach the employee.
+      if (res.status === 401) throw new CompanyError('login_failed', '产品漏斗汇总拒绝该运营会话（HTTP 401）', false);
+      if (res.status === 403) throw new CompanyError('forbidden', '产品漏斗汇总需要 funnel.read 运营能力（HTTP 403）', false);
+      throw new CompanyError('upstream_error', `产品漏斗汇总请求失败（HTTP ${res.status}）`, res.status >= 500);
+    }
+    const report = parseFunnelPulse(event, day, res.body);
+    return {
+      value: report,
+      audit: { action: 'ops_call', evidence: `ops_product_pulse event=${event} day=${day} state=${report.state} coverage=${report.coverage.state}` },
     };
   }
 
