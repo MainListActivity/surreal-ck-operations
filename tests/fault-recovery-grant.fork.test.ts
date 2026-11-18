@@ -533,7 +533,11 @@ describe('the grant touches only its own task, target, phase and episode', () =>
     clock += 600_000;
     expect((await core.reserveFault!(scope, RESERVE))?.allowed).toBe(true);
 
-    expect(await episodeStates(taskId)).toEqual(['resolved']);
+    // The grant closes only the episode of this task and this incident. The exchange episode of the same task stays open.
+    const states = await episodeStates(taskId);
+    expect(states).toContain('resolved');
+    expect(states).toContain('opened');
+    expect(states).toHaveLength(2);
     expect(await episodeStates(other)).toEqual(['exhausted']);
     expect((await core.reserveFault!(otherScope, RESERVE))?.allowed).toBe(false);
     expect(await budgetRow(other)).toMatchObject({ attempts: 3, totalAttempts: 3 });

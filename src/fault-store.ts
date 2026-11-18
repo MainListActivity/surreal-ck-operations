@@ -875,7 +875,11 @@ export class FaultStore {
       });
       return 'refunded';
     } catch (error) {
-      if (/fault refund superseded/.test((error as Error)?.message ?? '')) return 'superseded';
+      // SurrealDB wraps a THROW inside a transaction as "failed transaction" / NotExecuted; the THROW text itself is
+      // not always on the message. Either way the transaction rolled back, so the newer state won and this refund is
+      // superseded. Any other failure is the caller's to see.
+      const message = (error as Error)?.message ?? '';
+      if (/fault refund superseded|failed transaction|NotExecuted/i.test(message)) return 'superseded';
       throw error;
     }
   }
