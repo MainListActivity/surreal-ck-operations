@@ -1,14 +1,22 @@
 // Everything the broker returns or logs passes through here: employees must never see
 // tokens or passwords, even when an upstream response echoes one.
-const SECRET_KEY = /^(access_?token|refresh_?token|id_?token|token|password|passwd|secret|client_?secret|authorization|code_?verifier|login_?challenge|activation_?url|activation_?token|invitation_?token|token_?hash)$/i;
+const SECRET_KEY = /^(?:.*[_-])?(access_?token|refresh_?token|id_?token|token|password|passwd|secret|client_?secret|api_?key|private_?key|authorization|code_?verifier|login_?challenge|activation_?url|activation_?token|invitation_?token|token_?hash)$/i;
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b/g;
 const MASK = '[redacted]';
 
 /** Replaces known secret values and anything shaped like a JWT inside free text. */
 export function redactText(text: string, known: readonly string[] = []): string {
   let out = text.replace(JWT, MASK);
+  out = out.replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, `Bearer ${MASK}`)
+    .replace(/\b(?:sk-(?:ant-)?|gh[pousr]_)[A-Za-z0-9_-]{10,}/g, MASK)
+    .replace(/(\b["']?(?:[\w-]{0,80}(?:token|password|passwd|secret|api[_-]?key)|authorization)["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;}]+)/gi, `$1${MASK}`);
   for (const secret of known) if (secret.length >= 6) out = out.split(secret).join(MASK);
   return out;
+}
+
+/** Steward 与风格记忆的统一边界：字段、自由文本及已知凭证均脱敏。 */
+export function redactSecrets(value: unknown, known: readonly string[] = []): unknown {
+  return redactJson(value, known);
 }
 
 /** Deep copy of a JSON value with secret-named fields masked and secret-shaped strings scrubbed. */

@@ -1,6 +1,7 @@
 // 公司执行栈：由 Paseo 兼容宿主或独立原生执行端提供执行器。
 
 import { readTurnResult } from './turn-result.ts';
+import { createStewardVerdictResolver, NodeSteward } from '../steward/steward.ts';
 import { workContext } from '../work-context.ts';
 import { readProviderRoutes, ownsProvider } from './provider-routing.ts';
 import { loadServiceEnv, serviceHome } from "./env.ts";
@@ -44,6 +45,7 @@ export interface Company {
   opsRepo: string;
   ops: import("../ops/broker").OpsBroker;
   messages: OutboundMessageStore;
+  steward?: NodeSteward;
   /** Absolute path of the sck CLI, as the dispatcher resolves it. */
   sckBin: string;
   /**
@@ -239,7 +241,16 @@ export function company(): Promise<Company> {
         },
       };
     }
+    const steward = new NodeSteward();
     const sidecar = new SidecarPool({
+      verdictResolver: createStewardVerdictResolver({
+        taskSummary: async taskId => {
+          const { RecordId } = await import('surrealdb');
+          const [rows] = await db.db.query<[unknown[]]>(
+            'SELECT title, requirement, resources, acceptance_text FROM $task;', { task: new RecordId('task', taskId) });
+          return rows?.[0];
+        },
+      }),
       briefStaged: async (employee, claim) => {
         const { RecordId } = await import('surrealdb');
         await db.db.query('UPDATE $task SET runtime_context = $context WHERE current_employee = $employee AND delivery_id = $delivery AND fence = $fence;', {
@@ -366,11 +377,11 @@ export function company(): Promise<Company> {
         try { return sidecar.holdsLease(await employeeOf(job.actor), job.task); } catch { return false; }
       },
       opsCall: async job => sidecar.runCloudOps({ employee: await employeeOf(job.actor), taskId: job.task, tool: job.tool, args: job.args }),
-      runnerOnly: job => ownerApi({ db, core: core as never, owner, workforce, messages, opsRepo }, { ...job.input, command: job.command }, "runner"),
+      runnerOnly: job => ownerApi({ db, core: core as never, owner, workforce, messages, opsRepo, steward }, { ...job.input, command: job.command }, "runner"),
       hostExec: input => hostExec(input, { keyPath: join(serviceHome(), "private", "cloud", "sck-agent-ed25519") }),
       log: message => console.log(message),
     }) : undefined;
-    return readyCompany={ runtime: paseo, native: runtimeOptions?.native, runnerId: runtimeOptions?.runner?.id, nodeId, runnerVersion: async () => runtimeOptions?.release?.version ?? "dev", runnerSha: runtimeOptions?.release?.sha ?? "dev", messages, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops, sckBin, opsJobs,
+    return readyCompany={ runtime: paseo, native: runtimeOptions?.native, runnerId: runtimeOptions?.runner?.id, nodeId, runnerVersion: async () => runtimeOptions?.release?.version ?? "dev", runnerSha: runtimeOptions?.release?.sha ?? "dev", messages, steward, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops, sckBin, opsJobs,
       get paseo(){ return currentHost(); } };
   })();
   boot.catch(() => { boot = undefined; }); // a failed boot must not poison later calls

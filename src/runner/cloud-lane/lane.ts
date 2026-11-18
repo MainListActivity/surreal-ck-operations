@@ -8,7 +8,7 @@ import { isAbsolute, join } from 'node:path';
 import { isLaneProvider, type LaneProvider } from '../native-args.ts';
 import { WEB_CHAT_PROVIDERS } from '../native-args.ts';
 import { bodyOfDispatch } from '../../outbound-render.ts';
-import { clearInflight, inflightSession, laneDigest, readClaimDelivery, readClaimTask, readInflight, readInflightOfTask, readLaneState, recordInflight, writeLaneState, type LaneState } from './state.ts';
+import { clearInflight, clearSettledInflight, inflightSession, laneDigest, readClaimDelivery, readClaimTask, readInflight, readInflightOfTask, readLaneState, recordInflight, writeLaneState, type LaneState } from './state.ts';
 import { repoInfo, type ExecFn, type RepoInfo } from './repo.ts';
 import { driveCodex } from './codex.ts';
 import { devinCloudModel, driveDevin } from './devin.ts';
@@ -288,14 +288,23 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
       next.taskId = reg.attempt;
       next.submittedAt ??= reg.attemptAt;
       next.devin = { ...next.devin, attemptSession: reg.attemptSession };
-    } else if (input.provider === 'devin-cloud' && next.task) {
+    } else if (next.task) {
       // 摘要变了（返工改了 findings 等）：同一公司任务在别的目录里的登记仍代表已发出的会话，不能当成新任务另建。
       // 未确认受理且没有会话地址的只能受阻交人工核对；有会话地址的沿用它做跟进（同一会话，不另建）。
       const others = readInflightOfTask(input.stateRoot, input.provider, next.task, digest);
-      if (others.some(entry => !inflightSession(entry)))
-        return blocked(`同一任务上一轮 Devin Cloud 已按下发送（或发送中途中断）但未确认受理，且没有会话地址可核对；换了摘要也不能另建会话（避免重复）。本轮未发出，在途登记已保留，请人工核对 app.devin.ai 后再决定是否重派。`);
-      const session = others.map(inflightSession).find(Boolean);
-      if (session) next.vendorSession ??= session;
+      const pending = !material.review && !material.findings
+        ? others.find(entry => entry.taskId && inflightSession(entry)) : undefined;
+      if (pending) {
+        next.taskId = pending.taskId;
+        next.taskUrl = pending.taskUrl ?? inflightSession(pending);
+        next.submittedAt = pending.submittedAt;
+        next.vendorSession = pending.vendorSession;
+      } else if (input.provider === 'devin-cloud') {
+        if (others.some(entry => !inflightSession(entry)))
+          return blocked(`同一任务上一轮 Devin Cloud 已按下发送（或发送中途中断）但未确认受理，且没有会话地址可核对；换了摘要也不能另建会话（避免重复）。本轮未发出，在途登记已保留，请人工核对 app.devin.ai 后再决定是否重派。`);
+        const session = others.map(inflightSession).find(Boolean);
+        if (session) next.vendorSession ??= session;
+      }
     }
   }
   try {
@@ -305,6 +314,7 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
       // 仍在途的受阻（供应商会话已发出、等待核对）保留标记，恢复时不再发送。
       clearInflight(input.stateRoot, input.provider, registryKey);
       if (registryKey !== digest) clearInflight(input.stateRoot, input.provider, digest);
+      clearSettledInflight(input.stateRoot, input.provider, next.task, next.taskId);
       writeLaneState(input.commDir, { ...next, taskId: undefined, taskUrl: undefined, submittedAt: undefined,
         ...(outcome.vendorTerminal ? { vendorSession: undefined } : {}) });
     } else {

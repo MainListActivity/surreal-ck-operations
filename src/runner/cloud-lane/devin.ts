@@ -29,6 +29,37 @@ export function devinCloudModel(configured: unknown): typeof DEVIN_CLOUD_MODEL {
   throw new Error(`lanes.devin-cloud.model 只能是 "${DEVIN_CLOUD_MODEL}"（云端会话只用免费模型），收到 ${JSON.stringify(configured)}`);
 }
 
+async function openPullRequest({ deps, input, repo }: Ctx): Promise<string | undefined> {
+  try {
+    const result = await deps.exec('gh', ['pr', 'list', '--repo', repo.slug, '--head', repo.branch,
+      '--state', 'open', '--json', 'url'], { cwd: input.cwd });
+    if (result.code !== 0) return undefined;
+    const rows = JSON.parse(result.stdout) as Array<{ url?: unknown }>;
+    return rows.map(row => row.url).find((url): url is string =>
+      typeof url === 'string' && url.startsWith(`https://github.com/${repo.slug}/pull/`) && /\/\d+$/.test(url));
+  } catch { return undefined; }
+}
+
+/** 漏标记时只信远端客观交付：不能用已有本地提交或其它分支 PR 冒充本轮完成。 */
+async function objectiveCloseout(ctx: Ctx, tail: string): Promise<VendorOutcome | undefined> {
+  const { deps, input, repo } = ctx;
+  try {
+    const head = await fetchAndFastForward(deps.exec, input.cwd, repo.branch);
+    if (!/^[a-f0-9]{40}$/i.test(head)) return undefined;
+    const remote = await deps.exec('git', ['rev-parse', 'FETCH_HEAD'], { cwd: input.cwd });
+    if (remote.code !== 0 || remote.stdout.trim() !== head) return undefined;
+    const base = await deps.exec('git', ['fetch', 'origin', repo.defaultBranch], { cwd: input.cwd });
+    if (base.code !== 0) return undefined;
+    const count = await deps.exec('git', ['rev-list', '--count', `FETCH_HEAD..${head}`], { cwd: input.cwd });
+    if (count.code !== 0 || !/^\d+$/.test(count.stdout.trim()) || Number(count.stdout.trim()) <= 0) return undefined;
+    const pr = await openPullRequest(ctx);
+    if (!pr) return undefined;
+    // 页面尾段仅作摘要，不采信其中的手写 SHA/PR 或首行口令。
+    const summary = tail.replace(/^(?:PR|SHA|提交|工作结果|复核结论)\s*[:：].*$/gim, '').trim();
+    return { kind: 'done', text: `Devin 会话已空闲，依据远端分支新提交与 OPEN PR 收尾。\n${summary}\nPR: ${pr}\nSHA: ${head}` };
+  } catch { return undefined; }
+}
+
 interface Ctx {
   input: LaneInput; deps: LaneDeps; repo: RepoInfo;
   material: { task: string; findings?: string; review: boolean; title: string };
@@ -289,8 +320,13 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
       } else {
         settled = undefined;
         idleNoDone = status === 'idle' && seen && !answer ? idleNoDone + 1 : 0;
-        if (idleNoDone >= IDLE_NO_DONE_LIMIT)
+        if (idleNoDone >= IDLE_NO_DONE_LIMIT) {
+          if (!material.review) {
+            const objective = await objectiveCloseout(ctx, String(s.tail ?? '').slice(-2000));
+            if (objective) return objective;
+          }
           return blocked(`Devin 已停止但没有按约定以「[SCK-DONE ${marker}]」开头给出终稿，请人工核对会话：${String(s.tail ?? '').slice(-400)}`);
+        }
       }
       deps.progress(status === 'working' ? `Devin Cloud 工作中（${marker}）`
         : answer && status === 'idle' ? 'Devin Cloud 已给出终稿，确认中'
@@ -308,14 +344,18 @@ async function closeout(ctx: Ctx, text: string): Promise<VendorOutcome> {
   const { input, deps, repo, material } = ctx;
   if (material.review) return { kind: 'done', text };
 
-  const pr = /^PR:\s*(\S+)/m.exec(text)?.[1];
+  let pr = /^PR:\s*(\S+)/m.exec(text)?.[1];
   const sha = /^SHA:\s*([0-9a-f]{7,40})/im.exec(text)?.[1];
   try {
     const head = await fetchAndFastForward(deps.exec, input.cwd, repo.branch);
+    if (!pr) {
+      pr = await openPullRequest(ctx);
+      if (pr) text += `\nPR: ${pr}`;
+    }
     if (!pr) return { kind: 'blocked', text: `Devin 已把改动推上分支（本地已快进至 ${head.slice(0, 12)}），但答复里没有 PR 行：${text.slice(0, 300)}` };
     // 公司收尾以远端分支实际 HEAD 为准：Devin 声明的 SHA 不一致时改写并注明。
     if (!sha) return { kind: 'done', text: `${text}\nSHA: ${head}` };
-    if (head.startsWith(sha)) return { kind: 'done', text };
+    if (head.startsWith(sha)) return { kind: 'done', text: text.replace(/^SHA:\s*\S+/im, `SHA: ${head}`) };
     return { kind: 'done',
       text: `${text.replace(/^SHA:\s*\S+/im, `SHA: ${head}`)}\n（Devin 声明的 SHA ${sha} 与远端分支实际 HEAD 不一致，以实际 HEAD 为准）` };
   } catch (error) {

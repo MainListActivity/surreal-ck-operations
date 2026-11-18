@@ -25,7 +25,8 @@ test('board.snapshot reads the board through the owner API at the time the owner
 test('message.edit 保留任意正文缩进和换行，只剥离末尾工作目录行', async () => {
   const { ctx } = emptyCtx();
   let saved: unknown[];
-  ctx.messages = { edit: async (...args: unknown[]) => { saved = args; return {}; } } as never;
+  ctx.messages = { get: async () => ({ body: '旧正文' }),
+    edit: async (...args: unknown[]) => { saved = args; return {}; } } as never;
   const body = '  原样保留 task.md、{taskId}、sck call\n    第二行  ';
   await ownerApi(ctx, { command: 'message.edit', messageId: 'm1', body: `${body}\n工作目录：/wt/task\n` }, 'test');
   expect(saved![1]).toBe(body);

@@ -1172,6 +1172,77 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(out.text).toContain('SHA: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef');
   });
 
+  test('有 DONE 但无 PR 行：查询真实 OPEN PR 补齐 URL', async () => {
+    const w = world({ extra: call => {
+      if (call.cmd === 'gh' && call.args[0] === 'pr') return ok('[{"url":"https://github.com/acme/widget/pull/9"}]');
+      return gitOk(call);
+    } });
+    const b = devinBrowse({ send: [{ ok: true, url: SESSION }], session: [idleDone('已经实现并测试。')] });
+    const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: b.browse });
+    expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
+    expect(out.text).toContain('SHA: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef');
+    expect(w.callsOf(c => c.cmd === 'gh' && c.args[0] === 'pr')[0]?.args)
+      .toEqual(['pr', 'list', '--repo', 'acme/widget', '--head', 'sck/task-1', '--state', 'open', '--json', 'url']);
+  });
+
+  test('idle 无 DONE/PR 行：仅远端确有新提交且有 OPEN PR 时按真实 HEAD 收尾', async () => {
+    for (const scenario of ['done', 'no-commits', 'no-pr', 'local-ahead', 'fetch-failed', 'wrong-pr']) {
+      const w = world({ extra: call => {
+        if (call.cmd === 'git' && call.args[0] === 'rev-parse' && call.args[1] === 'FETCH_HEAD')
+          return ok(scenario === 'local-ahead' ? 'a'.repeat(40) : 'deadbeef'.repeat(5));
+        if (call.cmd === 'git' && call.args[0] === 'rev-list') return ok(scenario === 'no-commits' ? '0' : '2');
+        if (call.cmd === 'git' && call.args[0] === 'fetch' && scenario === 'fetch-failed') return bad('offline');
+        if (call.cmd === 'gh' && call.args[0] === 'pr')
+          return ok(JSON.stringify(scenario === 'no-pr' ? [] : [{ url: `https://github.com/${scenario === 'wrong-pr' ? 'other/repo' : 'acme/widget'}/pull/9` }]));
+        return gitOk(call);
+      } });
+      const b = devinBrowse({ send: [{ ok: true, url: SESSION }],
+        session: [{ ok: true, markerSeen: true, status: 'idle', done: null, tail: '实现需求甲，测试通过。' }] });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: b.browse });
+      expect(out.status).toBe('success');
+      if (scenario === 'done') {
+        expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
+        expect(out.text).toContain(`SHA: ${'deadbeef'.repeat(5)}`);
+        expect(out.text).toContain('实现需求甲');
+        expect(readLaneState(w.commDir)?.taskId).toBeUndefined();
+      } else {
+        expect(out.text).toStartWith('工作结果：受阻');
+        expect(readLaneState(w.commDir)?.taskId).toBeDefined();
+      }
+      expect(b.calls.filter(s => s.includes(MODE('session')))).toHaveLength(3);
+    }
+  });
+
+  test('超时受阻后新 delivery/新目录重派：领养旧 taskId/taskUrl/submittedAt，零发送且结清旧登记', async () => {
+    const first = world({ extra: gitOk });
+    const a = devinBrowse({ send: [{ ok: true, url: SESSION }],
+      session: [{ ok: true, markerSeen: true, status: 'working', done: null }] });
+    const out1 = await runLane(first.input({ provider: 'devin-cloud', env: { SCK_DELIVERY_ID: 'lease-old' }, config: { maxMinutes: 1, pollMs: 1 } }),
+      { ...first.deps, browse: async (script, timeout) => { const r = await a.browse(script, timeout); first.advance(40_000); return r; } });
+    expect(out1.text).toStartWith('工作结果：受阻');
+    const prior = readInflight(first.stateRoot, 'devin-cloud', 'lease-old')!;
+    expect(prior.taskId).toBeDefined();
+    expect(prior.taskUrl).toBe(SESSION);
+    // 不同供应商发送不能被同任务结清清理误删。
+    writeInflight(first.stateRoot, 'devin-cloud', 'unrelated-send',
+      { ...prior, taskId: 'SCK-eeeeeeeeee', submittedAt: prior.submittedAt! - 1000 });
+    const second = world({ extra: gitOk });
+    const b = devinBrowse({ session: [idleDone(PR9)] });
+    const out2 = await runLane(second.input({ provider: 'devin-cloud', stateRoot: first.stateRoot,
+      env: { SCK_DELIVERY_ID: 'lease-new' }, prompt: '重派同一任务，取回成果。' }), {
+      ...second.deps, browse: async (script, timeout) => {
+        expect(script).toContain(prior.taskId!);
+        expect(script).toContain(SESSION);
+        return b.browse(script, timeout);
+      },
+    });
+    expect(out2.text).toContain('PR: https://github.com/acme/widget/pull/9');
+    expect(b.calls.every(s => s.includes(MODE('session')))).toBe(true);
+    expect(readInflight(first.stateRoot, 'devin-cloud', 'lease-old')).toBeUndefined();
+    expect(readInflight(first.stateRoot, 'devin-cloud', 'lease-new')).toBeUndefined();
+    expect(readInflight(first.stateRoot, 'devin-cloud', 'unrelated-send')?.taskId).toBe('SCK-eeeeeeeeee');
+  });
+
   test('非快进合并 → 错误回合且不 reset', async () => {
     const w = world({ extra: call => {
       if (call.cmd === 'git' && call.args[0] === 'merge') return bad('Not possible to fast-forward');
@@ -1314,7 +1385,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(0);
   });
 
-  test('空闲却没有本轮 SCK-DONE 终稿：连续确认后受阻交人工核对，不收尾', async () => {
+  test('空闲却没有本轮 SCK-DONE 终稿：客观证据不足仍受阻', async () => {
     const w = world({ extra: gitOk });
     const b = devinBrowse({
       send: [{ ok: true, url: SESSION, cap: 'Free', seats: { used: 0, total: 2 }, echoed: true }],
@@ -1324,10 +1395,11 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(out.status).toBe('success');
     expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
     expect(b.calls.filter(s => s.includes(MODE('session')))).toHaveLength(3);
-    expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(0);
+    expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(1);
+    expect(readLaneState(w.commDir)?.taskId).toBeDefined();
   });
 
-  test('工具输出含 DONE/PR、助手没有终稿（mock）：不以工具输出收尾，受阻且不拉取分支', async () => {
+  test('工具输出含 DONE/PR、助手没有终稿（mock）：不以工具输出代替客观证据', async () => {
     const w = world({ extra: gitOk });
     const toolTail = '工具输出：\n[SCK-DONE SCK-tool-only]\nPR: https://github.com/acme/widget/pull/1\n提交：aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nDevin is awaiting instructions';
     const b = devinBrowse({
@@ -1337,8 +1409,9 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: b.browse });
     expect(out.status).toBe('success');
     expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
-    // 工具输出只出现在人工核对的现场里，没有被当成助手终稿收尾（没有拉取分支、没有 PR 结果行）。
-    expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(0);
+    // 可以探测远端，但工具输出中的 PR 不足以代替真实远端 HEAD 与 OPEN PR。
+    expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(1);
+    expect(readLaneState(w.commDir)?.taskId).toBeDefined();
     expect(b.calls.filter(s => s.includes(MODE('session')))).toHaveLength(3);
   });
 
@@ -1515,7 +1588,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(fake.st.events).not.toContain('__PRESSED__');
     });
 
-    test('真实页面脚本 + 驱动层负例：工具输出含 DONE 与 PR、助手没有发言块 → 受阻，不拉取分支、不合并，只发送一次', async () => {
+    test('真实页面脚本 + 驱动层负例：工具输出含 DONE 与 PR 但客观证据不足 → 仍受阻，只发送一次', async () => {
       const w = world({ extra: gitOk });
       const fake = fakeDevin({
         seats: { used: 0, total: 2 },
@@ -1527,7 +1600,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
       expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
       expect(fake.st.sent).toHaveLength(1);
-      expect(w.callsOf(c => c.cmd === 'git' && (c.args[0] === 'fetch' || c.args[0] === 'merge'))).toHaveLength(0);
+      expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(1);
+      expect(readLaneState(w.commDir)?.taskId).toBeDefined();
     });
 
     test('真实页面脚本 + 驱动层正例：助手终稿后紧跟工具输出的 DONE 与 PR → 收尾只用助手终稿', async () => {
@@ -2160,7 +2234,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(readInflight(w1.stateRoot, 'devin-cloud', d1)?.attempt).toMatch(/^SCK-/);
     });
 
-    test('换摘要重派：同一任务在另一目录的会话仍在途（已受理、未收尾）→ 跟进同一会话并标明是后续轮次，不另建会话', async () => {
+    test('有 findings 的返工重派：仍在途的旧会话只复用地址，发返工跟进而非领养旧终稿', async () => {
       const w1 = world({ task, extra: gitOk });
       const a = (async (script: string) => {
         if (script.includes(MODE('send'))) return { ok: true, url: SESSION, cap: 'Free', seats: { used: 0, total: 2 }, echoed: true };
@@ -2170,6 +2244,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(readInflight(w1.stateRoot, 'devin-cloud', digestOf(w1, FOLLOW))?.taskUrl).toBe(SESSION);
 
       const w2 = world({ task, extra: gitOk });
+      mkdirSync(join(w2.commDir, 'findings'));
+      writeFileSync(join(w2.commDir, 'findings', 'round-01.md'), '补上失败用例。');
       const b2 = devinBrowse({
         follow: [{ ok: true, url: SESSION, cap: 'Free', seats: { used: 1, total: 2 }, echoed: true }],
         session: [idleDone(PR9)],

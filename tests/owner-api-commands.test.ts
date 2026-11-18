@@ -179,7 +179,7 @@ test('runner-only commands fail as unavailable without an execution host; other 
   const { ctx } = makeFakeCtx();
   installHost(undefined);
   try {
-    expect([...RUNNER_ONLY_COMMANDS].sort()).toEqual(['task.create']);
+    expect([...RUNNER_ONLY_COMMANDS].sort()).toEqual(['message.draft', 'task.create']);
     for (const command of RUNNER_ONLY_COMMANDS) {
       const error: unknown = await ownerApi(ctx, { command, taskId: 't1', taskVersion: 1, digest: 'd1', enabled: true }, 'cli').then(() => undefined, e => e);
       expect(error).toMatchObject({ name: 'CompanyError', code: 'unavailable' });
