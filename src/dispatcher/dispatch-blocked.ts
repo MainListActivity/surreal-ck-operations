@@ -25,7 +25,8 @@ export type WorkflowState = 'ready' | 'doing' | 'review';
 export type BlockCode =
   | 'paused' | 'budget' | 'resources' | 'memory_pressure' | 'disk_space' | 'max_running'
   | 'prior_submitter' | 'no_candidate' | 'session_busy' | 'held' | 'assigned' | 'track_mismatch' | 'model_slot'
-  | 'provider_retry' | 'quota' | 'probe_busy' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'off_hours' | 'wake_failed' | 'unknown' | 'factory_wait';
+  | 'provider_retry' | 'quota' | 'probe_busy' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'off_hours' | 'wake_failed'
+  | 'repo_lock_busy' | 'unknown' | 'factory_wait';
 
 /** One staffing entry, reduced to what the evaluator reads. `key` is the employee id or `spawn:<def>`. */
 export interface EvaluatedEntry {
@@ -127,7 +128,7 @@ const PERMANENT: ReadonlySet<BlockCode> = new Set<BlockCode>([
 ]);
 
 /** Codes meaning a qualified candidate exists and is only occupied right now; they clear without anyone acting. */
-const OCCUPIED: ReadonlySet<BlockCode> = new Set<BlockCode>(['held', 'assigned', 'provider_capacity', 'probe_busy', 'wake_failed']);
+const OCCUPIED: ReadonlySet<BlockCode> = new Set<BlockCode>(['held', 'assigned', 'provider_capacity', 'probe_busy', 'wake_failed', 'repo_lock_busy']);
 
 export interface StaffingShortage {
   /** True while the gate only waits for an occupied worker: a queue, not something the owner must fix. */
@@ -176,6 +177,7 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
   def_disabled: '编制已停用',
   off_hours: '不在员工定义的工作时间',
   wake_failed: '派工未能唤醒或创建会话，下一轮重试',
+  repo_lock_busy: '仓库分配锁忙：未能在限时内取得仓库锁（清扫或另一轮分配占用，或取锁进程暂不可用）；不是员工或供应商故障，下一轮自动重试',
   unknown: '状态或贡献者历史读取失败，不能判定（不视为忙），恢复后自动重判',
   probe_busy: '单次探测会话占用中（冷却已过，探测结束前不派其他会话）',
 };
@@ -184,7 +186,7 @@ const OWNER: Record<BlockCode, RecoveryAuthority> = {
   provider_retry: 'system',
   factory_wait: 'system',
   paused: 'owner', budget: 'owner', resources: 'owner', memory_pressure: 'system', disk_space: 'owner', max_running: 'owner', prior_submitter: 'owner', no_candidate: 'owner',  session_busy: 'owner', held: 'owner', assigned: 'owner', track_mismatch: 'owner', model_slot: 'owner',
-  quota: 'owner', provider_capacity: 'owner', seat_full: 'owner', def_disabled: 'owner', off_hours: 'system', wake_failed: 'owner', unknown: 'owner', probe_busy: 'owner',
+  quota: 'owner', provider_capacity: 'owner', seat_full: 'owner', def_disabled: 'owner', off_hours: 'system', wake_failed: 'owner', repo_lock_busy: 'system', unknown: 'owner', probe_busy: 'owner',
 };
 
 const RECOVERY: Record<BlockCode, string> = {
@@ -209,6 +211,7 @@ const RECOVERY: Record<BlockCode, string> = {
   def_disabled: '老板重新启用编制或更换编制',
   off_hours: '到工作时间后自动派工，或老板调整工作时间',
   wake_failed: '检查 Paseo 会话与插件日志，下一轮自动重试',
+  repo_lock_busy: '仓库分配锁释放或清扫结束后下一轮自动重试；无需老板处理，不记员工或供应商失败。取锁进程持续无法启动时，查看 dispatcher.log 的 repo lock 行',
   unknown: '检查 Paseo 插件、运行时日志与审计读取，恢复后自动重判',
   probe_busy: '等待单次探测会话结束，探测结果决定恢复或再次冷却',
 };
@@ -235,6 +238,7 @@ const NEXT: Record<BlockCode, string> = {
   def_disabled: '编制重新启用',
   off_hours: '进入工作时间',
   wake_failed: '下一轮唤醒成功',
+  repo_lock_busy: '仓库分配锁释放或清扫结束',
   unknown: '状态与审计读取恢复',
   probe_busy: '探测会话结束',
 };
@@ -246,7 +250,7 @@ const BASIS: Record<BlockCode, string> = {
   paused: 'tick:global-gate', budget: 'tick:global-gate', resources: 'tick:global-gate', memory_pressure: 'host:memory', disk_space: 'host:disk', max_running: 'tick:global-gate', prior_submitter: 'contribution-audit',  no_candidate: 'tick:staffing-pool', session_busy: 'paseo:session-status', held: 'tick:staffing-pool', assigned: 'tick:staffing-pool',
   track_mismatch: 'tick:staffing-pool', model_slot: 'tick:model-slots',
   quota: 'tick:quota-rows', provider_capacity: 'tick:quota-rows', seat_full: 'tick:staffing-pool',
-  def_disabled: 'tick:workforce-defs', off_hours: 'tick:workforce-defs', wake_failed: 'tick:wake', unknown: 'read:state-or-audit', probe_busy: 'tick:provider-health',
+  def_disabled: 'tick:workforce-defs', off_hours: 'tick:workforce-defs', wake_failed: 'tick:wake', repo_lock_busy: 'tick:repo-lock', unknown: 'read:state-or-audit', probe_busy: 'tick:provider-health',
 };
 
 /** Recovery actions per code. Only the ones with a tool are executable; the rest name who must act outside the system. */
@@ -272,6 +276,7 @@ const ACTIONS: Record<BlockCode, RecoveryAction[]> = {
   def_disabled: [{ authority: 'owner', label: '老板用 def_ensure 重新启用编制', tool: 'def_ensure', executable: true }],
   off_hours: [{ authority: 'system', label: '到工作时间后自动派工', executable: false }, { authority: 'owner', label: '老板在员工定义里调整工作时间', tool: 'def_ensure', executable: true }],
   wake_failed: [{ authority: 'owner', label: '检查 Paseo 会话与插件日志，下一轮自动重试', executable: false }],
+  repo_lock_busy: [{ authority: 'system', label: '仓库分配锁释放后自动重试', executable: false }],
   unknown: [{ authority: 'owner', label: '检查 Paseo 插件、运行时日志与审计读取，恢复后自动重判', executable: false }],
   probe_busy: [{ authority: 'owner', label: '等待单次探测会话结束', executable: false }],
 };

@@ -8,8 +8,10 @@ import {
 import { lstat, readdir, readFile, realpath, rm } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
-import { CompanyError } from './core-errors.ts';
-import { hostIOOrUndefined, installHost, type HostIO, type HostProcOptions, type HostProcResult } from './host-io.ts';
+import { RepoLockError } from './core-errors.ts';
+import {
+  hostIOOrUndefined, installHost, type HostIO, type HostProcOptions, type HostProcResult, type RepoLockOptions, type RepoLockResult,
+} from './host-io.ts';
 
 /** Runs a program without a shell; output is collected per stream, and the program is killed at the timeout or past the byte limit. */
 function runProcess(file: string, args: readonly string[], options: HostProcOptions = {}): Promise<HostProcResult> {
@@ -33,25 +35,59 @@ function runProcess(file: string, args: readonly string[], options: HostProcOpti
   });
 }
 
-/** Kernel flock spans every plugin process and is released on crash/EOF, with no stale lease timeout.
+/** How long an attempt waits for the repository allocation lock before it gives up. */
+const REPO_LOCK_ACQUIRE_MS = 35_000;
+
+/**
+ * Kernel flock spans every plugin process and is released on crash/EOF, with no stale lease timeout.
  * The helper reads only its lock file. Its stdin is closed even when the caller dies.
+ * Failing to take the lock throws RepoLockError: 'busy' past the acquire limit, 'unavailable' when the helper cannot run, and
+ * 'lost' when the helper ends after taking the lock but before the action starts. The action is never raced against the
+ * acquire timer. `options.observe` receives the timing after the release: waitMs is the queue, heldMs runs from acquisition to
+ * release, not the helper's lifetime.
  */
-async function withRepoLock<T>(commonDir: string, action: () => Promise<T>): Promise<T> {
+async function withRepoLock<T>(commonDir: string, action: () => Promise<T>, options: RepoLockOptions = {}): Promise<T> {
+  const requested = performance.now();
   const helper = spawn('/usr/bin/python3', ['-c',
     'import fcntl,sys; f=open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); print("locked", flush=True); sys.stdin.buffer.read()',
     join(commonDir, 'sck-worktree-allocation.lock')], { stdio: ['pipe', 'pipe', 'pipe'] });
   let exited = false;
   const closed = new Promise<void>(done => helper.once('close', () => { exited = true; done(); }));
+  let queued: number | undefined; // When the wait ended: the lock was taken, the attempt gave up, or the helper failed.
+  let acquired: number | undefined;
+  let gaveUp = false;
+  let result: RepoLockResult = 'unavailable';
   try {
     await new Promise<void>((done, reject) => {
-      const timer = setTimeout(() => { helper.kill(); reject(new CompanyError('conflict', 'Repository allocation lock busy')); }, 35_000);
-      helper.once('error', error => { clearTimeout(timer); reject(error); });
-      helper.once('close', () => { clearTimeout(timer); reject(new CompanyError('conflict', 'Repository allocation lock unavailable')); });
-      helper.stdout.once('data', () => { clearTimeout(timer); done(); });
+      const timer = setTimeout(() => {
+        gaveUp = true; result = 'busy'; queued = performance.now();
+        helper.kill();
+        reject(new RepoLockError('busy', 'Repository allocation lock busy'));
+      }, options.acquireMs ?? REPO_LOCK_ACQUIRE_MS);
+      helper.once('error', () => { clearTimeout(timer); queued ??= performance.now(); reject(new RepoLockError('unavailable', 'Repository allocation lock unavailable')); });
+      helper.once('close', () => { clearTimeout(timer); queued ??= performance.now(); reject(new RepoLockError('unavailable', 'Repository allocation lock unavailable')); });
+      helper.stdout.once('data', () => {
+        if (gaveUp) return;
+        clearTimeout(timer); acquired = queued = performance.now(); done();
+      });
     });
-    if (exited) throw new CompanyError('conflict', 'Repository allocation lock lost');
-    return await action();
-  } finally { helper.stdin.end(); await closed; }
+    if (exited) { result = 'lost'; throw new RepoLockError('lost', 'Repository allocation lock lost'); }
+    result = 'error';
+    const value = await action();
+    result = exited ? 'lost' : 'ok';
+    return value;
+  } finally {
+    helper.stdin.end();
+    await closed;
+    const released = performance.now();
+    try {
+      options.observe?.({
+        waitMs: (queued ?? released) - requested,
+        ...(acquired === undefined ? {} : { heldMs: released - acquired }),
+        result,
+      });
+    } catch { /* observation never changes the outcome */ }
+  }
 }
 
 const nodeHost: HostIO = {

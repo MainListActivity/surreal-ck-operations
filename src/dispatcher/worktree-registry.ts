@@ -3,7 +3,7 @@ import { RecordId } from 'surrealdb';
 import type { Surreal } from 'surrealdb';
 import type { Principal, ProjectView, Role, TaskView, WorkIntent, WorktreeAssignment, WorktreeView } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
-import { hostIO } from '../host-io.ts';
+import { hostIO, type RepoLockOptions, type RepoLockTiming } from '../host-io.ts';
 import { MAX_ASSET_PATHS, MAX_ASSET_PATH_CHARS } from '../input-bounds.ts';
 import {
   decideReclaim, parseGraceDays, reclaimEnabledFrom, type ReclaimTrigger, type TreeAuthority,
@@ -18,6 +18,20 @@ const siblingPath = (repo: string, suffix: string): string => {
   return io.path.join(io.path.dirname(repo), `${io.path.basename(repo)}-sck-${hash(repo).slice(0, 8)}-${suffix}`);
 };
 export const worktreeId = (repo: string, path: string) => hash(`${repo}\0${path}`);
+/** An attempt at a repository's allocation lock: the caller's operation, an anonymous repository id, and the host's timing. */
+export interface RepoLockEvent extends RepoLockTiming { operation: string; repo: string }
+/** An attempt that queued or held the lock this long is logged even when it succeeded. */
+export const REPO_LOCK_SLOW_MS = 2_000;
+/**
+ * The log line for one lock attempt, or undefined for a routine take (succeeded, neither queued nor held for long). The line names
+ * no path, task or command: only the operation, the anonymous repository id, the result and the two durations.
+ */
+export function repoLockLogLine(event: RepoLockEvent): string | undefined {
+  const slow = event.waitMs >= REPO_LOCK_SLOW_MS || (event.heldMs ?? 0) >= REPO_LOCK_SLOW_MS;
+  if (event.result === 'ok' && !slow) return undefined;
+  const held = event.heldMs === undefined ? '' : ` held=${Math.round(event.heldMs)}ms`;
+  return `repo lock ${event.operation} ${event.repo} ${event.result} wait=${Math.round(event.waitMs)}ms${held}`;
+}
 export interface SceneCleanupResult { workspacesArchived?: number; projectsDeleted?: number; employeesRetired?: number }
 export interface RegistryOptions {
   opsRepo: string;
@@ -32,6 +46,10 @@ export interface RegistryOptions {
    * recorded and the next event point or sweep retries the whole point idempotently.
    */
   sceneCleaner?: (treePath: string) => Promise<SceneCleanupResult | void>;
+  /** Receives every attempt at a repository's allocation lock once it ends. Observation only: it never changes the outcome. */
+  onRepoLock?: (event: RepoLockEvent) => void;
+  /** How long an allocation waits for its repository lock before it gives up (RepoLockError 'busy'). Default: the host's limit. */
+  lockAcquireMs?: number;
 }
 export interface ReclaimResult {
   scanId: string;
@@ -70,11 +88,14 @@ async function trees(repo: string): Promise<Tree[]> {
 
 /**
  * Runs `action` under the repository's allocation lock. The host holds a kernel flock (released on crash/EOF, with no stale
- * lease timeout); see HostLock and host-node.ts.
+ * lease timeout); see HostLock and host-node.ts. Failing to take it throws RepoLockError.
  */
-export async function withRepoLock<T>(commonDir: string, action: () => Promise<T>): Promise<T> {
-  return hostIO().lock.withRepoLock(commonDir, action);
+export async function withRepoLock<T>(commonDir: string, action: () => Promise<T>, options?: RepoLockOptions): Promise<T> {
+  return hostIO().lock.withRepoLock(commonDir, action, options);
 }
+
+/** The anonymous id of a repository in lock events: a short hash of its common git directory, never the path itself. */
+const repoLockId = (commonDir: string) => hash(commonDir).slice(0, 8);
 
 export function validateIntent(intent: WorkIntent | undefined): void {
   if (intent === undefined) return;
@@ -148,9 +169,12 @@ export class WorktreeRegistry {
     const list = await trees(path);
     return { repo: list[0]!.path, common, list };
   }
-  async locked<T>(repoPath: string, action: (repo: string, list: Tree[]) => Promise<T>) {
+  /** Runs `action` under the repository's allocation lock; `operation` names the caller in lock events. */
+  async locked<T>(repoPath: string, action: (repo: string, list: Tree[]) => Promise<T>, operation = 'lock') {
     const { repo, common } = await this.identity(repoPath);
-    return withRepoLock(common, async () => action(repo, await trees(repo)));
+    const { onRepoLock, lockAcquireMs } = this.options;
+    const observe = onRepoLock && ((timing: RepoLockTiming) => onRepoLock({ ...timing, operation, repo: repoLockId(common) }));
+    return withRepoLock(common, async () => action(repo, await trees(repo)), { acquireMs: lockAcquireMs, observe });
   }
   private async rows(repo?: string): Promise<Row[]> {
     const [rows] = await this.db.query<[Row[]]>('SELECT * FROM worktree WHERE $repo = NONE OR repo = $repo;', { repo });
@@ -268,7 +292,7 @@ export class WorktreeRegistry {
         COMMIT;`, { holder: record('employee', actor.employeeId), employee: actor.employeeId,
           tree: record('worktree', assignment.id), reference: record('worktree_session_ref', actor.employeeId) });
       return assignment;
-    });
+    }, 'workspace');
   }
   async releaseWorkspace(employeeId: string) {
     await this.db.query('UPDATE ONLY $holder SET workspace_read_active = false;', { holder: record('employee', employeeId) });
@@ -399,7 +423,7 @@ export class WorktreeRegistry {
     const known = await this.rows(repo);
     const seeds = repo ? [repo] : [...new Set([this.options.opsRepo, ...known.map(r => r.repo)])];
     for (const path of seeds) {
-      await this.locked(path, (canonical, list) => this.reconcile(canonical, list)).catch(() => undefined);
+      await this.locked(path, (canonical, list) => this.reconcile(canonical, list), 'inventory').catch(() => undefined);
     }
     const rows = await this.rows(repo), refs = await this.refs(repo);
     const policy = await this.policy();
@@ -653,7 +677,7 @@ export class WorktreeRegistry {
           if (result.removed.some(p => hostIO().path.dirname(p) === parent || p.startsWith(parent))) {
             await git(repo, ['worktree', 'prune']).catch(() => undefined);
           }
-        });
+        }, 'reclaim');
       } catch (error) {
         const reason = error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200);
         result.kept.push({ path: repoPath, reason: `repo-lock-or-scan-failed:${reason}` });

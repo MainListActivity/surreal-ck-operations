@@ -10,6 +10,7 @@ import { homedir } from "node:os";
 import { readProviderQuotas } from "../dispatcher/quota-store.ts";
 
 import { dispatcherLogSink } from "../dispatcher/log-sink.ts";
+import { repoLockLogLine, type RepoLockEvent } from "../dispatcher/worktree-registry.ts";
 import { OutboundMessageStore } from "../outbound-messages.ts";
 import { installNodeHost } from "../host-node.ts";
 import { IdpClient } from "../cloud/idp.ts";
@@ -135,8 +136,15 @@ export function company(): Promise<Company> {
     // Workforce also powers the manage-only def_* tools exposed through the sidecar.
     if (!runtimeOptions) throw new Error("执行后端尚未配置");
     const paseo = runtimeOptions.gateway;
+    // One sink for the dispatcher's lifetime: it opens the logs directory once and appends from then on.
+    const dispatcherLog = dispatcherLogSink(serviceHome());
     const worktreeOpts = {
       opsRepo: process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations',
+      // Slow or failed allocation-lock attempts reach the dispatcher log: the operation, an anonymous repo id, the result and the timings.
+      onRepoLock: (event: RepoLockEvent) => {
+        const line = repoLockLogLine(event);
+        if (line) { console.log(line); dispatcherLog(line); }
+      },
       // Three-layer same-death: a task worktree's Paseo workspaces/project die with the tree.
       // Employee agents inside those workspaces are retired with an honest reason first —
       // otherwise the workspace cascade archives them and the tick misreports 通道隔离.
@@ -288,8 +296,6 @@ export function company(): Promise<Company> {
       },
       log: message => console.log(message),
     });
-    // One sink for the dispatcher's lifetime: it opens the logs directory once and appends from then on.
-    const dispatcherLog = dispatcherLogSink(serviceHome());
     const messages = new OutboundMessageStore(db.db);
     const sckBin = process.env.SCK_TOOL_BIN ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/bin/sck`;
     const dispatcher = new Dispatcher({
