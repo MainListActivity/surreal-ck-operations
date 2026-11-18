@@ -6,6 +6,10 @@
  * 发送不是幂等的：按下发送前先在 lane 状态里落盘 attempt 标记（参照 grok-bot/turn.ts）。按下之后
  * 只做受理核对（会话列表与原会话里找本轮标记），绝不重发；不确定就明确受阻交人工核对。
  * 终稿只认本轮收尾约定之后、会话已 idle 的 SCK-DONE 回答，且连续两次读数一致。
+ * 页面脚本的 goto 失败会被自己的 catch 吞掉，可能停在另一个合法会话上；驱动侧据脚本回的
+ * wrong_session 识别这种情况（跟进发送按未就绪重试，轮询按未见本轮标记累计计次），并对每份回执再按
+ * 回执里的 s.url 与目标会话独立比对一次（query/hash 规范化）——即使回执误报 ok:true，别的会话的
+ * 内容也不当本轮受理或终稿，绝不重发。
  * 完成后 git fetch + --ff-only 快进本地工作树；非快进报错回合，绝不 reset。
  */
 import { ensureBranchOnOrigin, fetchAndFastForward, type RepoInfo } from './repo.ts';
@@ -99,6 +103,18 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
   const over = () => deps.now() > ctx.deadline;
   const sessionOf = (value: unknown): string | undefined =>
     typeof value === 'string' && DEVIN_SESSION_RE.test(value) ? value.split('?')[0]!.split('#')[0] : undefined;
+  /** 会话地址比较：query/hash 规范化去掉（与页面脚本 sameSession 同规则）。 */
+  const sameSession = (a: unknown, b: unknown): boolean => {
+    const strip = (u: unknown) => String(u ?? '').split(/[?#]/)[0];
+    return strip(a) === strip(b);
+  };
+  /**
+   * 回执带了实际地址却不是本次目标会话：即使脚本回了 ok:true、即使那一页凑巧也有本轮同标记作者块，
+   * 驱动层也不采信——这是脚本侧 sameSession 核验之外的独立第二道，防止导航/吞错让读数落在别的会话上。
+   * 回执没带地址时交给脚本自己的 wrong_session 判定（真实脚本总会带 location.href）。
+   */
+  const offSession = (reply: Reply, target: string | undefined): boolean =>
+    target !== undefined && typeof reply?.url === 'string' && reply.url !== '' && !sameSession(reply.url, target);
   /** 记下发送前核验到的档位与席位（审计用）：只保留 Capability 文字与用量数字。 */
   const readSeats = (step: DevinSeatReading['step'], reply: Reply) => {
     const seats = reply?.seats as { used?: unknown; total?: unknown } | null | undefined;
@@ -135,7 +151,10 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
       deps.progress(follow ? `尝试在原 Devin 会话发送本轮消息（${marker}）` : `尝试新建 Devin Cloud 会话（${marker}）`, 'attempt');
       const r = await browse(follow ? devinFollowScript(follow, marker, message, home) : devinSendScript(home, marker, message), 150_000) as Reply;
       const url = sessionOf(r?.url) ?? sessionOf(r?.recovered);
-      const accepted = r?.ok === true && url !== undefined;
+      // 续轮的目标就是原会话：回执带地址时必须与它一致。脚本在发送前已核验 location.href，驱动层再按回执
+      // 地址独立核对一次；送入后页面若跳到别的合法会话，那页即便有同标记块也不当受理证据、不采信其终稿。
+      const offTarget = follow !== undefined && url !== undefined && !sameSession(url, follow);
+      const accepted = r?.ok === true && url !== undefined && !offTarget;
       // ok 即脚本已越过按下发送；拿不到会话地址也只能核对，绝不当成未发出而重发。
       const pressed = r?.ok === true || r?.code === 'pressed' || r?.code === 'not_echoed';
       // 没有按下发送（登录、页面、档位、席位、浏览器）：撤销本目录与共享的 attempt，之后才允许再试。
@@ -161,6 +180,14 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
         await deps.sleep(pollMs);
         continue;
       }
+      if (r?.code === 'wrong_session') {
+        // goto 失败被页面脚本自己的 catch 吞掉，没能停在原会话地址上：没碰发送按钮（pressed 已为 false，
+        // 上面已撤销 attempt），单纯当页面未就绪重试，绝不把停错的那个会话当成本轮结果。
+        if (over()) return fail(`Devin 网页反复没能停在原会话地址上（当前 ${String(r.url ?? '未知')}，目标 ${follow}），${maxMinutes} 分钟内未能发出续轮消息`);
+        deps.progress(`Devin 页面没有停在原会话，稍后重试（当前 ${String(r.url ?? '未知')}）`, 'failed');
+        await deps.sleep(pollMs);
+        continue;
+      }
       if (accepted) {
         // 受理证据：转录里看到本轮标记（或会话列表/原会话已有它）。只有这时才算已派。
         sessionUrl = url;
@@ -177,11 +204,13 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
         break;
       }
       if (pressed) {
-        // 已按下发送但拿不到受理证据：记为本轮在途，接下来只做核对，绝不重发。
-        sessionUrl = url;
+        // 已按下发送但拿不到可信的受理证据：记为本轮在途，接下来只做核对，绝不重发。续轮回执若带着别的
+        // 会话地址（发送后导航/tab 漂移），落点仍记原会话——只在原会话里按本轮标记确认受理，不去轮询那页。
+        const landing = offTarget ? follow : url;
+        sessionUrl = landing;
         state.taskId = marker; state.submittedAt = deps.now();
         // 没拿到会话地址时保留落点会话（续轮的原会话），之后的核对只看它；拿到地址后由 taskUrl 记录。
-        if (url) { state.taskUrl = url; state.vendorSession = url; forgetAttemptSession(); }
+        if (landing) { state.taskUrl = landing; state.vendorSession = landing; forgetAttemptSession(); }
         dropLocalAttempt();
         persist();
         deps.progress(`Devin Cloud 已按下发送但未确认受理（${marker}），转入核对，不重发`, 'failed');
@@ -200,7 +229,10 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
       ? await browse(devinSessionScript(pending, marker), 90_000) as Reply
       : await browse(devinRecoverScript(home, marker), 150_000) as Reply;
     if (r?.code === 'login_required') return loginFail();
-    const found = pending ? (r?.ok === true && r?.markerSeen === true ? pending : undefined) : sessionOf(r?.found);
+    // 核对的落点是已知的原会话时必须停在它上面；回执带着别的会话地址时，那页的 markerSeen 不算受理证据。
+    const found = pending
+      ? (r?.ok === true && r?.markerSeen === true && !offSession(r, pending) ? pending : undefined)
+      : sessionOf(r?.found);
     if (found) {
       sessionUrl = found;
       state.taskUrl = found; state.vendorSession = found;
@@ -228,7 +260,14 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
     await deps.sleep(pollMs);
     const s = await browse(devinSessionScript(sessionUrl, marker), 90_000) as Reply;
     if (s?.code === 'login_required') return loginFail();
-    if (s?.ok === true) {
+    if (s?.code === 'wrong_session' || offSession(s, sessionUrl)) {
+      // 页面没能停在本轮轮询的会话地址上（goto 失败被脚本自己的 catch 吞掉，留在另一个合法会话；或回执里
+      // 的 location.href 与目标不一致）：不采信这次读数，按「没看到本轮标记」累计未受理计次，绝不把停错的
+      // 那个会话内容当本轮终稿，也绝不重发。
+      if (++misses >= MARKER_MISS_LIMIT)
+        return blocked(`Devin 页面没能停在本轮轮询的会话地址上（当前 ${String(s?.url ?? '未知')}，目标 ${sessionUrl}），无法确认是否受理。未重发（避免重复发送），在途状态已保留。请人工核对会话 ${sessionUrl}，确认后恢复本任务即可。`);
+      deps.progress(`Devin Cloud 页面不在预期会话，重试中（当前 ${String(s?.url ?? '未知')}）`, 'failed');
+    } else if (s?.ok === true) {
       const status = String(s.status ?? 'unknown');
       const answer = typeof s.done === 'string' && s.done.trim() ? s.done.trim() : undefined;
       const seen = s.markerSeen === true;
@@ -257,7 +296,9 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
         : `Devin Cloud 等待终稿（${marker}，页面状态 ${status}）`);
     }
     if (over())
-      return fail(`Devin Cloud 会话 ${sessionUrl} 超过配置时限仍未给出终稿（标记 ${marker}），会话可能仍在运行；恢复本任务将回到原会话继续等待，不会重发`);
+      // 会话早已受理（state.taskId 已定），超时不是供应商崩溃或额度故障：按受阻收尾并保留会话地址与在途
+      // 标记，恢复时只回原会话继续轮询，绝不重发；不按硬错误收尾，避免被上层当成空交付回收成 silent-turn。
+      return blocked(`Devin Cloud 会话 ${sessionUrl} 超过配置时限仍未给出终稿（标记 ${marker}），会话可能仍在运行；恢复本任务将回到原会话继续等待，不会重发`);
   }
 }
 
