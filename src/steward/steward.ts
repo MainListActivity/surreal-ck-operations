@@ -41,18 +41,77 @@ export const STEWARD_RELAY_WRITE_OPS = [
 ] as const;
 
 /**
- * 出站字段投影：按工具只放行这些顶层字段，其余（含会话句柄、激活链接、凭证、原始日志行）
- * 一律不出站。ops_origin_logs 只回元数据，日志原文可能含客户资料。
+ * 出站字段投影：按工具只放行下列字段与类型，逐层筛选固定结构；未知顶层、未知嵌套字段、
+ * 数量超限的数组、非对象/非标量值一律丢弃。会话句柄、激活链接、凭证、日志原文和上游
+ * 错误正文都不在 schema 里。ops_origin_logs 只回元数据。
  */
-export const STEWARD_RELAY_FIELDS: Record<StewardRelayOpsTool, readonly string[]> = {
-  ops_info: ['project', 'env', 'productUrl', 'roles', 'tools', 'accounts', 'workspacePrefix', 'limits', 'clients', 'can', 'preview'],
-  ops_health: ['url', 'reachable', 'status', 'ok', 'ms', 'error'],
-  ops_origin_status: ['host', 'status', 'uptime', 'version', 'service', 'services', 'jobs', 'units', 'disk', 'memory', 'load', 'checkedAt', 'updatedAt', 'error', 'detail'],
-  ops_origin_health: ['host', 'status', 'uptime', 'version', 'service', 'reachable', 'ms', 'checkedAt', 'updatedAt', 'error', 'detail'],
-  ops_origin_logs: ['service', 'since', 'grep', 'matched', 'truncated', 'error', 'detail'],
-  ops_account_ensure: ['alias', 'username', 'email', 'created', 'repaired', 'status', 'state', 'action', 'ok'],
-  ops_login: ['alias', 'username', 'ok', 'loggedIn', 'state', 'loginState', 'status'],
-  ops_workspace_ensure: ['alias', 'workspace', 'workspacePrefix', 'ok', 'created', 'reused', 'state', 'status'],
+export type RelayFieldSpec =
+  | 'string'
+  | 'number'
+  | 'boolean'
+  | { readonly array: RelayFieldSpec; readonly max?: number }
+  | { readonly record: RelayFieldSpec; readonly max?: number }
+  | { readonly fields: Readonly<Record<string, RelayFieldSpec>> };
+
+export const STEWARD_RELAY_SCHEMA: Record<StewardRelayOpsTool, Readonly<Record<string, RelayFieldSpec>>> = {
+  ops_info: {
+    project: 'string',
+    env: 'string',
+    productUrl: 'string',
+    roles: { array: 'string', max: 20 },
+    tools: { array: 'string', max: 200 },
+    // 账号只出 alias/username 两项，不是整条原始账号记录。
+    accounts: { array: { fields: { alias: 'string', username: 'string' } }, max: 50 },
+    workspacePrefix: 'string',
+    limits: { fields: { workspacesPerDay: 'number', accountsPerDay: 'number' } },
+    clients: {
+      fields: {
+        customer: { fields: { clientId: 'string', redirectUri: 'string' } },
+        operator: { fields: { clientId: 'string', redirectUri: 'string', resource: 'string' } },
+        opsAudience: { fields: { clientId: 'string', audience: 'string', redirectUri: 'string' } },
+      },
+    },
+    can: {
+      fields: {
+        createAccounts: 'boolean', queryWorkspaceData: 'boolean', browserLogin: 'boolean',
+        operatorLogin: 'boolean', opsAudienceLogin: 'boolean', idpPrincipals: 'boolean',
+        idpProvisionRotate: 'boolean', originHost: 'boolean',
+      },
+    },
+    // 预览只回存活/端口/uptime；lastError 与 roots 可能带本机路径或上游文本，不出站。
+    preview: {
+      fields: {
+        lan: { fields: { running: 'boolean', port: 'number', uptime: 'number' } },
+        signed: { fields: { configured: 'boolean', running: 'boolean', port: 'number', uptime: 'number' } },
+      },
+    },
+  },
+  ops_health: { url: 'string', reachable: 'boolean', status: 'number', ok: 'boolean', ms: 'number', error: 'string' },
+  ops_origin_status: {
+    // services 是动态服务名映射，逐项只取 systemd 的五个安全字段。
+    services: {
+      record: { fields: { active: 'string', sub: 'string', since: 'string', restarts: 'number', memoryMB: 'number' } },
+      max: 20,
+    },
+    disk: { fields: { path: 'string', usedPct: 'number', freeGB: 'number' } },
+    memory: { fields: { totalMB: 'number', availableMB: 'number' } },
+    load: { array: 'number', max: 3 },
+    uptimeHours: 'number',
+  },
+  // 健康检查的 body 是上游任意正文，不出站。
+  ops_origin_health: {
+    checks: {
+      record: { fields: { reachable: 'boolean', status: 'number', ms: 'number', error: 'string' } },
+      max: 20,
+    },
+  },
+  // 日志原文、returned 计数之外的任何 detail 都不出站。
+  ops_origin_logs: {
+    service: 'string', since: 'string', matched: 'number', returned: 'number', truncated: 'boolean',
+  },
+  ops_account_ensure: { alias: 'string', username: 'string', email: 'string', result: 'string' },
+  ops_login: { alias: 'string', username: 'string', kind: 'string', ok: 'boolean' },
+  ops_workspace_ensure: { slug: 'string', name: 'string', role: 'string', created: 'boolean' },
 };
 
 export const STEWARD_RELAY_NOTE = '本地驻场管理员代跑；只返回允许出站的字段（会话句柄、激活链接、凭证与日志原文不出站）。ops_login 只证明本机代理会话已登录，不代表云端会话获得远程登录能力。';
@@ -60,24 +119,50 @@ export const STEWARD_RELAY_NOTE = '本地驻场管理员代跑；只返回允许
 const READONLY = new Set<string>(STEWARD_RELAY_READONLY_OPS);
 const WRITE = new Set<string>(STEWARD_RELAY_WRITE_OPS);
 const OUTBOUND_LINK = /https?:\/\/\S*(?:activ|invit|token|session|login)[^\s]*/gi;
+const RELAY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/;
+const RELAY_STRING_LIMIT = 600;
+const RELAY_DEPTH_LIMIT = 8;
 
-/** 按工具投影允许出站的字段，再深扫激活/登录链接；凭证类字段由 redactSecrets 另行遮蔽。 */
-export function stewardRelayOutbound(tool: StewardRelayOpsTool, value: unknown): Record<string, unknown> {
-  const fields = STEWARD_RELAY_FIELDS[tool];
-  const out: Record<string, unknown> = {};
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    const row = value as Record<string, unknown>;
-    for (const key of fields) if (row[key] !== undefined) out[key] = row[key];
+function projectField(spec: RelayFieldSpec, value: unknown, depth: number): unknown {
+  if (depth > RELAY_DEPTH_LIMIT) return undefined;
+  if (spec === 'string') {
+    if (typeof value !== 'string') return undefined;
+    const scrubbed = value.replace(OUTBOUND_LINK, '[link withheld]');
+    return scrubbed.length > RELAY_STRING_LIMIT ? `${scrubbed.slice(0, RELAY_STRING_LIMIT)}…` : scrubbed;
   }
-  const scrub = (item: unknown): unknown => {
-    if (typeof item === 'string') return item.replace(OUTBOUND_LINK, '[link withheld]');
-    if (Array.isArray(item)) return item.map(scrub);
-    if (item && typeof item === 'object') {
-      return Object.fromEntries(Object.entries(item as Record<string, unknown>).map(([k, v]) => [k, scrub(v)]));
+  if (spec === 'number') return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  if (spec === 'boolean') return typeof value === 'boolean' ? value : undefined;
+  if ('array' in spec) {
+    if (!Array.isArray(value)) return undefined;
+    const out: unknown[] = [];
+    for (const item of value.slice(0, spec.max ?? 50)) {
+      const projected = projectField(spec.array, item, depth + 1);
+      if (projected !== undefined) out.push(projected);
     }
-    return item;
-  };
-  return { ...(scrub(out) as Record<string, unknown>), localRelay: true, note: STEWARD_RELAY_NOTE };
+    return out;
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const row = value as Record<string, unknown>;
+  const out: Record<string, unknown> = Object.create(null);
+  if ('record' in spec) {
+    for (const [key, item] of Object.entries(row).slice(0, spec.max ?? 50)) {
+      if (!RELAY_KEY.test(key)) continue;
+      const projected = projectField(spec.record, item, depth + 1);
+      if (projected !== undefined) out[key] = projected;
+    }
+    return out;
+  }
+  for (const [key, child] of Object.entries(spec.fields)) {
+    const projected = projectField(child, row[key], depth + 1);
+    if (projected !== undefined) out[key] = projected;
+  }
+  return out;
+}
+
+/** 按工具 schema 逐层投影允许出站的字段与类型；之后由调用方做凭证脱敏与限长序列化。 */
+export function stewardRelayOutbound(tool: StewardRelayOpsTool, value: unknown): Record<string, unknown> {
+  const projected = projectField({ fields: STEWARD_RELAY_SCHEMA[tool] }, value, 0) as Record<string, unknown> | undefined;
+  return { ...(projected ?? {}), localRelay: true, note: STEWARD_RELAY_NOTE };
 }
 
 const RELAY_SET = new Set<string>(STEWARD_RELAY_OPS_ALLOWLIST);

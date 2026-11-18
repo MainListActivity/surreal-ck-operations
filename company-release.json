@@ -7,6 +7,7 @@
     "来源门禁：代跑只取已核验会话中本轮用户锚点之后的 Devin 作者块（agentTail）；旧轮、用户正文、工具输出、缺锚点一律不触发 ops。",
     "权限门禁：sidecar 以真实租约阶段为准并拒绝不一致的 phase 参数；复核轮禁止写操作；写/建类只认显式 [OPS-REQUEST]，模型推断不得授权。",
     "sidecar steward_lane_assist：校验 1..3 轮与租约，二次硬核白名单后经 opsCircuit 代跑；出站按工具字段投影，句柄/激活链接/凭证/日志原文与上游错误原文均不出站。",
+    "出站投影按工具与嵌套字段类型逐层筛选：services/accounts 等允许对象只保留安全子字段，未知嵌套字段、detail、账号整条记录与上游错误正文均丢弃；上游错误也不写进普通执行日志。",
     "cloud-lane：devin-cloud 执行轮提示 OPS-REQUEST；blocked 时同会话回传（Free 档）；发送前落盘 attempt 与轮数，未确认时恢复只追踪不重发、不再代跑，3 轮硬熔断。"
   ],
   "impact": [

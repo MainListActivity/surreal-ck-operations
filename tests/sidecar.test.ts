@@ -958,6 +958,7 @@ describe('deliverable_publish 工具', () => {
 
   test('steward_lane_assist 门禁：出站按字段投影，句柄/激活链接/凭证/上游错误原文不出站', async () => {
     const secrets = ['sk-ant-fixture-secret', 'sess_handle_hidden', 'activate?token'];
+    const logs: string[] = [];
     const project = new SidecarPool({
       core: { ...core, claim: async (_c: string, taskId: string) => claimResult(taskId) } as never,
       workforce: workforce as never,
@@ -970,7 +971,7 @@ describe('deliverable_publish 工具', () => {
         },
         release: () => {},
       },
-      runDir, heartbeatMs: 10_000, sweepMs: 20, log: () => {},
+      runDir, heartbeatMs: 10_000, sweepMs: 20, log: message => { logs.push(message); },
       laneAssist: async input => String(input.transcriptTail).includes('login')
         ? { kind: 'tool_relay', tool: 'ops_login', args: { alias: 'QA1' }, explicit: true }
         : { kind: 'tool_relay', tool: 'ops_health', args: {}, explicit: true },
@@ -994,6 +995,85 @@ describe('deliverable_publish 工具', () => {
     expect(reason).toContain('upstream_error');
     expect(reason).not.toContain('upstream boom');
     expect(reason).not.toContain('sk-ant-fixture-secret');
+    // 原始上游错误正文也不写进普通执行日志，只留工具名与错误码。
+    const logged = logs.join('\n');
+    expect(logged).toContain('upstream_error');
+    expect(logged).not.toContain('upstream boom');
+    expect(logged).not.toContain('sk-ant-fixture-secret');
     project.close();
+  });
+
+  test('steward_lane_assist 回放：未知嵌套字段与账号整条记录不出站，安全字段保留', async () => {
+    const logs: string[] = [];
+    const replay = new SidecarPool({
+      core: { ...core, claim: async (_c: string, taskId: string) => claimResult(taskId) } as never,
+      workforce: workforce as never,
+      ops: {
+        tools: ['ops_origin_status', 'ops_info', 'ops_health'] as const,
+        call: async (_credential: string, _taskId: string, tool: string) => {
+          if (tool === 'ops_origin_status') return {
+            services: {
+              'surreal-ck-hono': {
+                active: 'active', sub: 'running', restarts: 2, memoryMB: 128,
+                sessionHandle: 'sess_nested_hidden', activationUrl: 'https://idp.example/activate?token=abc',
+                unknownNested: { deep: 'nested-leak' },
+              },
+            },
+            disk: { path: '/', usedPct: 42.5, freeGB: 10.2 },
+            memory: { totalMB: 16384, availableMB: 8192 },
+            load: [0.5, 0.4, 0.3],
+            uptimeHours: 120.5,
+            detail: 'upstream boom: connection refused',
+            unknownTop: 'top-leak',
+          };
+          if (tool === 'ops_info') return {
+            project: 'surreal_ck', env: 'production',
+            accounts: [{ alias: 'QA1', username: 'qa1', password: 'pw-leak', sessionHandle: 'sess_item_hidden' }],
+            unknownTop: 'top-leak',
+          };
+          return { url: 'https://app.example/health', reachable: true, status: 200, ok: true, ms: 12, body: 'body-leak', detail: 'detail-leak' };
+        },
+        release: () => {},
+      },
+      runDir, heartbeatMs: 10_000, sweepMs: 20, log: message => { logs.push(message); },
+      laneAssist: async input => {
+        const tool = String(input.transcriptTail).includes('info') ? 'ops_info'
+          : String(input.transcriptTail).includes('health') ? 'ops_health' : 'ops_origin_status';
+        return { kind: 'tool_relay', tool: tool as never, args: {}, explicit: true };
+      },
+    });
+    const ask = async (name: string, tail: string) => {
+      const env = replay.env(inst(`replay-${name}`));
+      await replay.claim(inst(`replay-${name}`), task(`task-replay-${name}`));
+      const res = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, name, 'steward_lane_assist',
+        { provider: 'devin-cloud', phase: 'doing', transcriptTail: tail, round: 1 });
+      return String((res.data as { message?: string }).message);
+    };
+
+    const status = await ask('status', 'status');
+    const statusOut = JSON.parse(status) as Record<string, unknown>;
+    expect(statusOut.localRelay).toBe(true);
+    expect(JSON.stringify(statusOut.services)).toContain('"active":"active"');
+    expect(JSON.stringify(statusOut.services)).toContain('"restarts":2');
+    expect(JSON.stringify(statusOut.disk)).toContain('"usedPct":42.5');
+    expect(JSON.stringify(statusOut)).toContain('"availableMB":8192');
+    expect(JSON.stringify(statusOut)).toContain('"uptimeHours":120.5');
+    for (const hidden of ['sess_nested_hidden', 'activate?token', 'nested-leak', 'nested', 'top-leak', 'upstream boom', 'unknownTop'])
+      expect(status).not.toContain(hidden);
+
+    const info = await ask('info', 'info');
+    expect(info).toContain('"alias":"QA1"');
+    expect(info).toContain('"username":"qa1"');
+    for (const hidden of ['pw-leak', 'sess_item_hidden', 'top-leak', 'sessionHandle'])
+      expect(info).not.toContain(hidden);
+
+    const health = await ask('health', 'health');
+    expect(health).toContain('"status":200');
+    expect(health).toContain('"ms":12');
+    for (const hidden of ['body-leak', 'detail-leak', 'detail']) expect(health).not.toContain(hidden);
+
+    // 成功代跑不应写任何错误日志
+    expect(logs.join('\n')).not.toContain('leak');
+    replay.close();
   });
 });

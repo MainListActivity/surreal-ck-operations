@@ -1575,9 +1575,9 @@ export class SidecarPool {
             const message = clip(JSON.stringify(redactSecrets(projected)), 4000);
             return { decision: 'reply', toolExecuted: relayTool, message };
           } catch (error) {
-            // 上游错误原文不出站：只回错误码，细节留在本机日志。
+            // 上游错误原文不出站，也不进普通执行日志：只留工具名与错误码。
             const code = (error as { code?: unknown })?.code;
-            this.log(`steward lane relay ${relayTool} failed: ${(error as Error).message}`);
+            this.log(`steward lane relay ${relayTool} failed: ${typeof code === 'string' ? code : 'error'}`);
             return { decision: 'escalate', reason: `代跑 ${relayTool} 失败（${typeof code === 'string' ? code : 'error'}），本地已记录，转交老板裁决` };
           }
         }

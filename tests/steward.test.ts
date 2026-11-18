@@ -304,3 +304,82 @@ test('门禁：出站字段按工具投影，激活链接/会话句柄/凭证/�
   expect(logText).not.toContain('alice@example.com');
   expect(logText).not.toContain('raw customer data');
 });
+
+test('门禁：结构化回放逐层投影——未知嵌套字段、账号整条记录与上游错误正文不出站', async () => {
+  const { stewardRelayOutbound } = await import('../src/steward/steward.ts');
+
+  // 固定提交 28bedca1 的缺口：services 下未知嵌套字段曾随整对象外发。合成回放必须只留安全字段。
+  const status = stewardRelayOutbound('ops_origin_status', {
+    services: {
+      'surreal-ck-hono': {
+        active: 'active', sub: 'running', restarts: 2, memoryMB: 128,
+        sessionHandle: 'sess_nested_hidden', activationUrl: 'https://idp.example/activate?token=abc',
+        unknownNested: { deep: 'nested-leak' },
+      },
+      'surrealdb': { active: 'active', sub: 'running', restarts: 'many', nestedLeak: 'leak' },
+    },
+    disk: { path: '/', usedPct: 42.5, freeGB: 10.2, inodeLeak: 'leak' },
+    memory: { totalMB: 16384, availableMB: 8192 },
+    load: [0.5, 0.4, 0.3],
+    uptimeHours: 120.5,
+    detail: 'upstream boom: connection refused',
+    unknownTop: 'top-leak',
+  });
+  const statusText = JSON.stringify(status);
+  expect(statusText).toContain('"active":"active"');
+  expect(statusText).toContain('"restarts":2');
+  expect(statusText).toContain('"usedPct":42.5');
+  expect(statusText).toContain('"availableMB":8192');
+  expect(statusText).toContain('"uptimeHours":120.5');
+  expect(statusText).not.toContain('"restarts":"many"'); // 类型不符的嵌套值同样丢弃
+  for (const hidden of [
+    'sess_nested_hidden', 'activate?token', 'nested-leak', 'nested', 'leak',
+    'inodeLeak', 'top-leak', 'unknownTop', 'upstream boom', '"detail"', '[object Object]',
+  ]) expect(statusText).not.toContain(hidden);
+
+  // accounts 不是整坨对象，只留 alias/username；未知顶层对象与带路径的 preview 细节不出站。
+  const info = stewardRelayOutbound('ops_info', {
+    project: 'surreal_ck',
+    accounts: [{ alias: 'QA1', username: 'qa1', password: 'pw-leak', sessionHandle: 'sess_item_hidden' }],
+    can: { createAccounts: true, secretFlag: true },
+    preview: { lan: { running: true, port: 18777, lastError: '/Users/y/private leak' }, roots: { e: '/Users/y/evidence' } },
+    internalAiProof: { issuer: 'urn:leak' },
+  });
+  const infoText = JSON.stringify(info);
+  expect(infoText).toContain('"alias":"QA1"');
+  expect(infoText).toContain('"username":"qa1"');
+  expect(infoText).toContain('"createAccounts":true');
+  expect(infoText).toContain('"port":18777');
+  for (const hidden of ['pw-leak', 'sess_item_hidden', 'secretFlag', 'lastError', '/Users/y', 'internalAiProof', 'urn:leak'])
+    expect(infoText).not.toContain(hidden);
+
+  // ops_health 保留可用的安全字段，body 里的上游正文不出站。
+  const health = stewardRelayOutbound('ops_health', {
+    url: 'https://app.example/health', reachable: true, status: 200, ok: true, ms: 12,
+    body: 'internal body leak', detail: 'detail leak',
+  });
+  const healthText = JSON.stringify(health);
+  expect(healthText).toContain('"url":"https://app.example/health"');
+  expect(healthText).toContain('"reachable":true');
+  expect(healthText).toContain('"status":200');
+  expect(healthText).toContain('"ms":12');
+  expect(healthText).not.toContain('internal body leak');
+  expect(healthText).not.toContain('detail leak');
+
+  // 日志只回元数据，不整坨回传 lines/detail。
+  const logs = stewardRelayOutbound('ops_origin_logs', {
+    service: 'api', since: '30m', matched: 3, returned: 2, truncated: true,
+    lines: ['customer alice@example.com login'], grep: 'cust', detail: 'detail-leak',
+  });
+  const logsText = JSON.stringify(logs);
+  expect(logsText).toContain('"matched":3');
+  expect(logsText).toContain('"truncated":true');
+  for (const hidden of ['alice@example.com', 'detail-leak', '"grep"', '"lines"']) expect(logsText).not.toContain(hidden);
+
+  // 动态键里的原型污染式键名不进结果。
+  const polluted = stewardRelayOutbound('ops_origin_status',
+    JSON.parse('{"services":{"__proto__":{"active":"proto-leak"},"surrealdb":{"active":"active"}},"__proto__":{"detail":"proto-leak"}}'));
+  const pollutedText = JSON.stringify(polluted);
+  expect(pollutedText).not.toContain('proto-leak');
+  expect(pollutedText).toContain('"surrealdb":{"active":"active"}');
+});
