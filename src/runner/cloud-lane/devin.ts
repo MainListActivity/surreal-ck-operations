@@ -13,7 +13,7 @@
  * 完成后 git fetch + --ff-only 快进本地工作树；非快进报错回合，绝不 reset。
  */
 import { ensureBranchOnOrigin, fetchAndFastForward, type RepoInfo } from './repo.ts';
-import { clearInflightAttempt, recordInflight, recordInflightAttempt, writeLaneState, type DevinSeatReading, type LaneState } from './state.ts';
+import { clearInflightAttempt, laneDigest, recordInflight, recordInflightAttempt, writeLaneState, type DevinSeatReading, type LaneState } from './state.ts';
 import { devinFollowScript, devinRecoverScript, devinSendScript, devinSessionScript, DEVIN_HOME, DEVIN_SESSION_RE } from './devin-web.ts';
 import type { LaneDeps, LaneInput } from './lane.ts';
 
@@ -33,7 +33,7 @@ interface Ctx {
   input: LaneInput; deps: LaneDeps; repo: RepoInfo;
   material: { task: string; findings?: string; review: boolean; title: string };
   prompt: string; state: LaneState;
-  digest: string; deadline: number;
+  digest: string; key: string; deadline: number;
 }
 
 interface VendorOutcome {
@@ -71,8 +71,9 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
   const pollMs = input.config.pollMs ?? 25_000;
   const maxMinutes = input.config.maxMinutes ?? 180;
   const home = input.env.SCK_DEVIN_HOME?.trim() || DEVIN_HOME;
-  // 本轮标记由 prompt 摘要决定：同一轮重启/重连得到同一标记，新一轮换新标记。
-  const marker = `SCK-${ctx.digest.slice(0, 10)}`;
+  // 本轮标记由稳定投递键决定：同一投递内正文重排/换目录仍得到同一标记，只有新一轮才换标记。
+  const marker = /^SCK-[a-f0-9]+$/.test(state.taskId ?? '') ? state.taskId!
+    : `SCK-${(state.delivery ? laneDigest(input.provider, state.delivery) : ctx.digest).slice(0, 10)}`;
   const continuing = Boolean(state.vendorSession) || Boolean(state.taskId) || Boolean(input.resumeId);
   const followUp = continuing && !material.review
     ? '\n这是同一任务的后续轮次：该分支上可能已有你的云端会话推送过改动并开过 PR，请先拉取远端分支现状，在既有 PR 上继续更新，不要另开重复 PR。'
@@ -81,7 +82,7 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
 
   const persist = () => {
     writeLaneState(input.commDir, state);
-    recordInflight(input.stateRoot, input.provider, ctx.digest, state);
+    recordInflight(input.stateRoot, input.provider, ctx.key, state);
   };
   /** 只清本目录的 attempt；共享登记交给 persist()（已有 taskId 时）或 abandonAttempt() 处理。 */
   const dropLocalAttempt = () => {
@@ -97,7 +98,7 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
   const abandonAttempt = () => {
     dropLocalAttempt();
     forgetAttemptSession();
-    clearInflightAttempt(input.stateRoot, input.provider, ctx.digest);
+    clearInflightAttempt(input.stateRoot, input.provider, ctx.key);
   };
   const loginFail = () => fail('app.devin.ai 未登录或登录已过期（需要老板在 ego-browser 里重新登录 Devin）');
   const over = () => deps.now() > ctx.deadline;
@@ -142,11 +143,11 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
   while (!sessionUrl) {
     if (!state.taskId) {
       const follow = sessionOf(state.vendorSession);
-      // 按下发送前先落盘 attempt：本目录写 .lane/state.json，共享根写 inflight/<digest>.json。
+      // 按下发送前先落盘 attempt：本目录写 .lane/state.json，共享根写 inflight/<投递键>.json。
       // 之后无论脚本如何结束、换到哪个员工目录，都只核对是否已受理，绝不再按发送。
       const at = deps.now();
       state.devin = { ...state.devin, attempt: marker, attemptAt: at, attemptSession: follow };
-      recordInflightAttempt(input.stateRoot, input.provider, ctx.digest, marker, at, follow, state.task);
+      recordInflightAttempt(input.stateRoot, input.provider, ctx.key, marker, at, follow, state.task);
       persist();
       deps.progress(follow ? `尝试在原 Devin 会话发送本轮消息（${marker}）` : `尝试新建 Devin Cloud 会话（${marker}）`, 'attempt');
       const r = await browse(follow ? devinFollowScript(follow, marker, message, home) : devinSendScript(home, marker, message), 150_000) as Reply;

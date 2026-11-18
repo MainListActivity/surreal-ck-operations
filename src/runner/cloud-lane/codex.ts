@@ -14,7 +14,7 @@ interface Ctx {
   input: LaneInput; deps: LaneDeps; repo: RepoInfo;
   material: { task: string; findings?: string; review: boolean; title: string };
   prompt: string; state: { taskId?: string; taskUrl?: string; sessionId: string; digest?: string; branch?: string; submittedAt?: number };
-  digest: string; deadline: number;
+  digest: string; key: string; deadline: number;
 }
 
 const TERMINAL: Record<string, 'done' | 'failed'> = { READY: 'done', APPLIED: 'done', ERROR: 'failed', FAILED: 'failed' };
@@ -66,7 +66,7 @@ export async function driveCodex(ctx: Ctx): Promise<{ kind: 'done' | 'blocked' |
   const env = input.config.environments?.[repo.slug] ?? repo.repo;
   const save = () => {
     writeLaneState(input.commDir, { ...state, submittedAt: state.submittedAt ?? deps.now() });
-    recordInflight(input.stateRoot, input.provider, ctx.digest, state);
+    recordInflight(input.stateRoot, input.provider, ctx.key, state);
   };
 
   let taskId = state.taskId;

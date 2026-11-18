@@ -7,7 +7,7 @@ import { langMatches, ownerLangOf } from './owner-lang.ts';
 import { analysisLead, composeMessage, ownerLead, machineCriterionOf, routeBody, stepOfTask, type MessageStep, type PromptTask } from './outbound-render.ts';
 import { latestAnswer, requirementOf } from './dispatcher/brief.ts';
 import { deliveryOf, sourceHash } from './outbound-delivery.ts';
-export { DEFAULT_MACHINE_CRITERION, composeMessage, renderMessage } from './outbound-render.ts';
+export { DEFAULT_MACHINE_CRITERION, composeMessage, renderMessage, renderDispatchBody } from './outbound-render.ts';
 
 export type { MessageStep, PromptTask } from './outbound-render.ts';
 export type MessageState = 'draft' | 'held' | 'sent';
@@ -26,6 +26,10 @@ export interface OutboundMessage {
   dispatchReason?: string;
   editedBy?: string;
   editedAt?: string;
+  /** 老板改过正文：投递时原样保留，不再做路径变量替换。 */
+  bodyEdited?: boolean;
+  /** 正文是老板写的字面文本：投递与看板都不再做路径替换。 */
+  bodyVerbatim?: boolean;
   sentTo?: string;
   sentAt?: string;
   createdAt: string;
@@ -66,6 +70,8 @@ const rowView = (row: Record<string, unknown>): OutboundMessage => ({
   dispatchReason: textOf(row.dispatch_reason),
   editedBy: row.edited_by === undefined || row.edited_by === null ? undefined : String(row.edited_by),
   editedAt: timestamp(row.edited_at),
+  ...(row.body_edited === true ? { bodyEdited: true } : {}),
+  ...(row.body_verbatim === true ? { bodyVerbatim: true } : {}),
   sentTo: row.sent_to === undefined || row.sent_to === null ? undefined : String(row.sent_to),
   sentAt: timestamp(row.sent_at),
   createdAt: timestamp(row.created_at) ?? '',
@@ -89,7 +95,7 @@ export class OutboundMessageStore {
    * leads 记下正文里带的两段开头（老板答复、上一轮复盘）和复盘已经按哪条退回定过：重派照抄时据此去掉旧段，不会叠两段。
    */
   async createDraft(taskId: string, step: MessageStep, role: string, code = false, phase = 'doing', body?: string,
-    leads: { answer?: string; analysis?: string; analysisSource?: string } = {}): Promise<OutboundMessage> {
+    leads: { answer?: string; analysis?: string; analysisSource?: string } = {}, verbatim = false): Promise<OutboundMessage> {
     if (!STEPS.includes(step)) throw new CompanyError('invalid', `unknown message step ${step}`);
     let card: PromptTask | undefined;
     if (body === undefined) {
@@ -97,15 +103,28 @@ export class OutboundMessageStore {
       const { answer: _answer, notes: _notes, ...plain } = full;
       card = { ...this.leadsFor(step, step, full, plain), analysisLead: leads.analysis };
     }
-    const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
-      `CREATE outbound_message CONTENT { task: $task, step: $step, role: $role, body: $body, composed: $composed, answer_lead: $answer_lead,
-        analysis_lead: $analysis_lead, analysis_source: $analysis_source, state: 'draft', hold: false, created_at: time::now() } RETURN AFTER;`,
-      // composed 记下这条正文是按任务卡组装的（及组装参数）：任务卡改了它跟着重算，重派时也按任务卡重新组装。
-      // 路线或需求流水线给的自定义正文没有这个标记，保持原样。
-      { task: this.task(taskId), step, role, body: body ?? composeMessage(step, card!, code, phase),
-        composed: card ? { code, phase } : undefined, answer_lead: card ? ownerLead(card) : leads.answer,
-        analysis_lead: leads.analysis, analysis_source: leads.analysisSource });
-    return rowView(rows[0]!);
+    const params = { task: this.task(taskId), step, role, body: body ?? composeMessage(step, card!, code, phase),
+      composed: card ? { code, phase } : undefined, answer_lead: card ? ownerLead(card) : leads.answer,
+      analysis_lead: leads.analysis, analysis_source: leads.analysisSource, ...(verbatim ? { body_verbatim: true } : {}) };
+    // 同任务同阶段只允许一条未发送的活动草稿：并发补稿在一个事务里先查后建，不会出现平行草稿。
+    {
+      const msg = new RecordId('outbound_message', crypto.randomUUID());
+      try {
+        await this.db.query(`BEGIN;
+          LET $open = SELECT id FROM outbound_message WHERE task = $task AND step = $step AND state != 'sent' LIMIT 1;
+          IF array::len($open) > 0 { THROW 'draft already open'; };
+          CREATE $msg CONTENT { task: $task, step: $step, role: $role, body: $body, composed: $composed, answer_lead: $answer_lead,
+            analysis_lead: $analysis_lead, analysis_source: $analysis_source, body_verbatim: $body_verbatim, body_edited: $body_verbatim, state: 'draft', hold: false, created_at: time::now() };
+          COMMIT;`, { ...params, msg });
+      } catch (error) {
+        // 事务内 THROW 或被并发写打断都意味着同阶段已有活动草稿：统一按冲突交给补稿方读回那一条。
+        if (/draft already open|failed transaction/i.test((error as Error).message)) throw new CompanyError('conflict', 'draft already open');
+        throw error;
+      }
+      const [created] = await this.db.query<[Array<Record<string, unknown>>]>('SELECT * FROM $msg;', { msg });
+      if (!created?.[0]) throw new CompanyError('conflict', 'draft creation lost');
+      return rowView(created[0]);
+    }
   }
 
   /** 任务卡上决定派工正文的字段：做什么、可以用什么、如何验证。 */
@@ -303,7 +322,7 @@ export class OutboundMessageStore {
       if (body === draft.body) continue;
       // 条件更新：这期间老板改了正文或消息已发出，就不动它。正在派出的消息（dispatch_attempt）正文已冻结，上面已排除。
       const [done] = await this.db.query<[unknown[]]>(
-        "UPDATE $msg SET body = $body, answer_lead = $answer_lead WHERE state != 'sent' AND body_edited != true AND body = $expected RETURN AFTER;",
+        "UPDATE $msg SET body = $body, answer_lead = $answer_lead WHERE state != 'sent' AND body_edited != true AND body = $expected AND dispatch_attempt = NONE RETURN AFTER;",
         { msg: draft.id, body, expected: draft.body, answer_lead: ownerLead(card as PromptTask) });
       if (done?.length) changed++;
     }
@@ -318,9 +337,21 @@ export class OutboundMessageStore {
       { task: this.task(taskId) });
     const have = new Set((existing ?? []).map(row => String(row.step)));
     const out: OutboundMessage[] = [];
-    if (!have.has('execute')) out.push(await this.createDraft(taskId, 'execute', executorRole, code, 'doing', routeBody(bodies.execute)));
+    const once = async (step: MessageStep, role: string, phase: string, body?: string): Promise<OutboundMessage> => {
+      try {
+        return await this.createDraft(taskId, step, role, code, phase, routeBody(body));
+      } catch (error) {
+        // 另一路并发已经补上了同阶段草稿：用它，绝不并行再建一条。
+        if ((error as CompanyError).code === 'conflict') {
+          const open = await this.latestDraft(taskId, step);
+          if (open) return open;
+        }
+        throw error;
+      }
+    };
+    if (!have.has('execute')) out.push(await once('execute', executorRole, 'doing', bodies.execute));
     // 复核草稿与执行草稿用同一个 code 标记：软件线的复核才需要写明最终合入提交与不检查生产版本。
-    if (!have.has('review')) out.push(await this.createDraft(taskId, 'review', reviewerRole, code, 'review', routeBody(bodies.review)));
+    if (!have.has('review')) out.push(await once('review', reviewerRole, 'review', bodies.review));
     return out;
   }
 
@@ -386,13 +417,14 @@ export class OutboundMessageStore {
     return !deliveryOf(draft, employeeLang).ok;
   }
 
-  async edit(messageId: string, body: string, actor: string, expectedBody?: string): Promise<OutboundMessage> {
+  async edit(messageId: string, body: string, actor: string, expectedBody?: string, verbatim = true): Promise<OutboundMessage> {
     if (!body.trim()) throw new CompanyError('invalid', 'message body must not be empty');
     const msg = this.message(messageId);
     const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
       // body_edited 只在改正文时写：扣住、放行也会写 edited_by，不能拿它判断正文是否被老板改过。
-      `UPDATE $msg SET body = $body, body_edited = true, edited_by = $actor, edited_at = time::now() WHERE state != 'sent' AND ($expected = NONE OR body = $expected) RETURN AFTER;`,
-      { msg, body, actor, expected: expectedBody });
+      // body_verbatim 区分字面正文与可还原模板：字面正文投递时不再替换路径变量。
+      `UPDATE $msg SET body = $body, body_edited = true, body_verbatim = $verbatim, edited_by = $actor, edited_at = time::now() WHERE state != 'sent' AND ($expected = NONE OR body = $expected) RETURN AFTER;`,
+      { msg, body, actor, verbatim, expected: expectedBody });
     const row = rows?.[0];
     if (!row && expectedBody !== undefined) {
       const current = await this.get(messageId);
@@ -588,8 +620,8 @@ export class OutboundMessageStore {
     const role = step === 'review' ? String(row?.reviewer_role ?? 'qa') : String(row?.executor_role ?? 'engineering');
     // A re-dispatch of the same step (lease expired, instance replaced) repeats what was last sent, so an owner edit or a custom
     // body survives. Only a body composed from the task card and never edited is composed again: the card is the source of truth.
-    const [sent] = await this.db.query<[Array<{ body?: string; body_edited?: boolean; composed?: unknown; answer_lead?: string; analysis_lead?: string; analysis_source?: string }>]>(
-      `SELECT body, body_edited, composed, answer_lead, analysis_lead, analysis_source, created_at FROM outbound_message WHERE task = $task AND step = $step AND state = 'sent' ORDER BY created_at DESC LIMIT 1;`,
+    const [sent] = await this.db.query<[Array<{ body?: string; body_edited?: boolean; body_verbatim?: boolean; composed?: unknown; answer_lead?: string; analysis_lead?: string; analysis_source?: string }>]>(
+      `SELECT body, body_edited, body_verbatim, composed, answer_lead, analysis_lead, analysis_source, created_at FROM outbound_message WHERE task = $task AND step = $step AND state = 'sent' ORDER BY created_at DESC LIMIT 1;`,
       { task: this.task(taskId), step });
     const last = sent?.[0];
     const recompose = !last?.body || (last.composed && last.body_edited !== true);
@@ -610,7 +642,10 @@ export class OutboundMessageStore {
     // 照抄旧正文（老板改过的、路线或需求流水线自定义的、旧模板的）时，先去掉里面旧的老板答复和旧的复盘（存的是当时加进去的原文），
     // 再把待转达的老板答复加在最前面：下次再受阻、再答复、再退回时不会叠两段。按任务卡重新组装的正文自己会带上这两段。
     let body: string | undefined, lead: string | undefined;
-    if (!recompose) {
+    if (!recompose && last?.body_verbatim === true) {
+      // 老板的字面正文不是可更新模板，跨回合重派也不能删改或插入系统复盘段。
+      body = last.body;
+    } else if (!recompose) {
       const cut = (text: string, part?: string): string => {
         const at = part ? text.indexOf(`${part}\n\n`) : -1;
         return at >= 0 ? text.slice(0, at) + text.slice(at + part!.length + 2) : text;
@@ -622,7 +657,17 @@ export class OutboundMessageStore {
       lead = ownerLead(this.leadsFor(step, step, full, plain));
       body = lead ? `${lead}\n\n${base}` : base;
     }
-    const draft = await this.createDraft(taskId, step, role, code, step === 'review' ? 'review' : 'doing', body, { answer: lead, ...analysis });
+    let draft: OutboundMessage;
+    try {
+      draft = await this.createDraft(taskId, step, role, code, step === 'review' ? 'review' : 'doing', body, { answer: lead, ...analysis }, !recompose && last?.body_verbatim === true);
+    } catch (error) {
+      // 同一阶段已经有一条未发送草稿（含老板扣住或改过正文的）：补稿任务到此为止，返回那一条，绝不平行新建。
+      if ((error as CompanyError).code === 'conflict') {
+        const open = await this.latestDraft(taskId, step);
+        if (open) return open;
+      }
+      throw error;
+    }
     // 第二轮及以上返工先扣住等老板看：反复退回多半是需求或验收有分歧，继续自动派只会空转。同一轮返工的重派不再扣。
     if (step === 'rework' && rounds >= 2 && !sameRound && await this.holdForPolicy(draft.id, `第 ${rounds} 轮返工`)) {
       return { ...draft, hold: true, state: 'held', holdReason: `第 ${rounds} 轮返工` };
@@ -656,6 +701,15 @@ export class OutboundMessageStore {
   /** 返工/催办触发时追加 draft（幂等：同一任务同一阶段已有未发草稿则不重复）。 */
   async ensureDraft(taskId: string, step: MessageStep, role: string, code = false, phase = 'doing'): Promise<OutboundMessage> {
     const found = await this.latestDraft(taskId, step);
-    return found ?? this.createDraft(taskId, step, role, code, phase);
+    if (found) return found;
+    try {
+      return await this.createDraft(taskId, step, role, code, phase);
+    } catch (error) {
+      if ((error as CompanyError).code === 'conflict') {
+        const open = await this.latestDraft(taskId, step);
+        if (open) return open;
+      }
+      throw error;
+    }
   }
 }

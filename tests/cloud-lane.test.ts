@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runLane, taskMaterial, validateLanes, vendorPrompt, type LaneDeps, type LaneInput } from '../src/runner/cloud-lane/lane.ts';
 import { laneExecFile } from '../src/runner/cloud-lane/exec.ts';
-import { laneDigest, readInflight, readLaneState, writeLaneState } from '../src/runner/cloud-lane/state.ts';
+import { laneDigest, readInflight, readLaneState, writeInflight, writeLaneState } from '../src/runner/cloud-lane/state.ts';
 import { julesUsageCount, julesUsageEntry, whamToUsageEntry } from '../src/runner/cloud-lane/quota.ts';
 import { recordJulesUsage } from '../src/runner/cloud-lane/jules.ts';
 import type { ExecResult } from '../src/runner/cloud-lane/repo.ts';
@@ -24,7 +24,7 @@ afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, for
 
 function world(opts: { task?: string; prompt?: string; git?: Route; extra?: Route;
     /** 默认把 cwd 当任务工作树写进 claim.json（分支 sck/task-1）；'none' 不写，对象自定义。 */
-    claim?: 'none' | { worktreePath: string; branch: string } } = {}) {
+    claim?: 'none' | { worktreePath: string; branch: string; deliveryId?: string } } = {}) {
   const commDir = mkdtempSync(join(tmpdir(), 'sck-lane-comm-'));
   const cwd = mkdtempSync(join(tmpdir(), 'sck-lane-wt-'));
   const stateRoot = mkdtempSync(join(tmpdir(), 'sck-lane-state-'));
@@ -32,8 +32,9 @@ function world(opts: { task?: string; prompt?: string; git?: Route; extra?: Rout
   writeFileSync(join(commDir, 'task.md'), opts.task ?? '# 云端任务\n\n实现需求甲。\n');
   if (opts.claim !== 'none') {
     const wt = opts.claim ?? { worktreePath: cwd, branch: 'sck/task-1' };
+    const worktreePath = wt.worktreePath || cwd;
     // task.id 与真实 claim.json 一样：同一公司任务换员工目录时靠它认出同一任务（换摘要重派）。
-    writeFileSync(join(commDir, 'claim.json'), JSON.stringify({ task: { id: 'task-1' }, worktree: { worktreePath: wt.worktreePath, branch: wt.branch, intent: { kind: 'code' }, mode: 'exclusive' } }));
+    writeFileSync(join(commDir, 'claim.json'), JSON.stringify({ task: { id: 'task-1' }, ...(wt.deliveryId ? { deliveryId: wt.deliveryId } : {}), worktree: { worktreePath, branch: wt.branch, intent: { kind: 'code' }, mode: 'exclusive' } }));
   }
   const calls: Call[] = [];
   const progress: string[] = [];
@@ -288,6 +289,68 @@ describe('codex-cloud 状态判定与在途登记', () => {
     const out2 = await runLane(w2.input({ stateRoot: w1.stateRoot }), w2.deps);
     expect(out2.status).toBe('success');
     expect(w2.callsOf(c => c.args[0] === 'cloud' && c.args[1] === 'exec')).toHaveLength(1);
+  });
+
+  test('同一投递键下正文重排：仍恢复在途云会话，不重复提交', async () => {
+    const w = world({ claim: { worktreePath: '', branch: 'sck/task-1', deliveryId: 'delivery-stable-1' },
+      extra: call => {
+        const [a, b] = call.args;
+        if (call.cmd === 'codex' && a === 'cloud' && b === 'status') return ok('[READY] t\nenv  •  now\nno diff\n');
+        if (call.cmd === 'codex' && a === 'cloud' && b === 'diff') return ok('');
+        if (call.cmd === 'codex' && a === 'cloud' && b === 'exec') return ok('https://chatgpt.com/codex/tasks/task_b_unexpected\n');
+        return undefined;
+      }});
+    // 上一轮落下的本目录状态：同一投递、旧摘要，在途任务还在。
+    writeLaneState(w.commDir, { sessionId: 'lane-stable', taskId: 'task_b_prev',
+      taskUrl: 'https://chatgpt.com/codex/tasks/task_b_prev', digest: 'digest-of-old-wording',
+      delivery: 'delivery-stable-1', branch: 'sck/task-1', submittedAt: Date.now() });
+    const out = await runLane(w.input({ prompt: '重排过的措辞：仍然完成同一件事。' }), w.deps);
+    expect(out.status).toBe('success');
+    expect(w.callsOf(c => c.cmd === 'codex' && c.args[1] === 'exec')).toHaveLength(0);
+    expect(w.callsOf(c => c.cmd === 'codex' && c.args[1] === 'status')).toHaveLength(1);
+    expect(out.sessionId).toBe('lane-stable');
+  });
+
+  test('同一投递键跨员工目录：只按共享登记恢复，不另建提交', async () => {
+    const w1 = world();
+    const w2 = world({ claim: { worktreePath: '', branch: 'sck/task-1', deliveryId: 'delivery-stable-2' },
+      extra: call => {
+        const [a, b] = call.args;
+        if (call.cmd === 'codex' && a === 'cloud' && b === 'status') return ok('[READY] t\nenv  •  now\nno diff\n');
+        if (call.cmd === 'codex' && a === 'cloud' && b === 'diff') return ok('');
+        if (call.cmd === 'codex' && a === 'cloud' && b === 'exec') return ok('https://chatgpt.com/codex/tasks/task_b_unexpected\n');
+        return undefined;
+      }});
+    writeInflight(w1.stateRoot, 'codex-cloud', 'delivery-stable-2', { taskId: 'task_b_shared',
+      taskUrl: 'https://chatgpt.com/codex/tasks/task_b_shared', submittedAt: Date.now(), task: 'task-1' });
+    const out = await runLane(w2.input({ stateRoot: w1.stateRoot, prompt: '换目录后的产物路径变了。' }), w2.deps);
+    expect(out.status).toBe('success');
+    expect(w2.callsOf(c => c.cmd === 'codex' && c.args[1] === 'exec')).toHaveLength(0);
+    expect(w2.callsOf(c => c.cmd === 'codex' && c.args[1] === 'status')).toHaveLength(1);
+    expect(out.sessionId).toBeDefined();
+  });
+
+  test('环境投递键优先于 claim，登记安全编码并在正文变化后跨目录恢复', async () => {
+    for (const variable of ['SCK_DELIVERY_ID', 'SCK_DELIVERY_KEY']) {
+      const key = `delivery/${variable}/../stable`;
+      const w1 = world({ extra: call => {
+        if (call.cmd === 'codex' && call.args[1] === 'exec') return ok('https://chatgpt.com/codex/tasks/task_b_env\n');
+        if (call.cmd === 'codex' && call.args[1] === 'status') return bad('transient');
+        return undefined;
+      } });
+      await runLane(w1.input({ env: { [variable]: key } }), w1.deps);
+      expect(readInflight(w1.stateRoot, 'codex-cloud', key)?.taskId).toBe('task_b_env');
+      const w2 = world({ task: '# 改写过的正文\n', claim: { worktreePath: '', branch: 'sck/task-1', deliveryId: 'stale-claim' },
+        extra: call => {
+          if (call.cmd === 'codex' && call.args[1] === 'status') return ok('[READY] t\n');
+          if (call.cmd === 'codex' && call.args[1] === 'diff') return ok('');
+          return undefined;
+        } });
+      const result = await runLane(w2.input({ stateRoot: w1.stateRoot, env: { [variable]: key } }), w2.deps);
+      expect(result.status).toBe('success');
+      expect(w2.callsOf(call => call.cmd === 'codex' && call.args[1] === 'exec')).toHaveLength(0);
+      expect(w2.callsOf(call => call.cmd === 'codex' && call.args[1] === 'status')[0]?.args).toContain('task_b_env');
+    }
   });
 
   test('任务完成后登记被清除', async () => {
@@ -618,6 +681,24 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
   /** 每次脚本调用推进 30 秒：让「席位满/忙」这类有时限的等待能在测试里结束。 */
   const advancing = (w: { advance(ms: number): void }, browse: NonNullable<LaneDeps['browse']>) =>
     (script: string, timeoutMs: number) => { w.advance(30_000); return browse(script, timeoutMs); };
+
+  test('Devin 投递键摘要标记稳定且为十六进制，同键正文改写后只轮询不再发送', async () => {
+    const w = world({ extra: gitOk });
+    const key = 'delivery/same-prefix-001';
+    const b = devinBrowse({ send: [{ ok: true, url: SESSION }],
+      session: [{ ok: true, markerSeen: true, status: 'blocked', done: null, tail: '' }] });
+    await runLane(w.input({ provider: 'devin-cloud', env: { SCK_DELIVERY_ID: key } }), { ...w.deps, browse: b.browse });
+    const marker = readLaneState(w.commDir)?.taskId;
+    expect(marker).toMatch(/^SCK-[a-f0-9]{10}$/);
+    expect(marker).toBe(`SCK-${laneDigest('devin-cloud', key).slice(0, 10)}`);
+    const recovered = devinBrowse({ session: [idleDone(PR9)] });
+    const out = await runLane(w.input({ provider: 'devin-cloud', prompt: '同一次投递的措辞重排',
+      env: { SCK_DELIVERY_ID: key } }), { ...w.deps, browse: recovered.browse });
+    expect(out.status).toBe('success');
+    expect(recovered.calls.some(script => script.includes(MODE('send')) || script.includes(MODE('follow')))).toBe(false);
+    expect(recovered.calls.every(script => script.includes(marker!))).toBe(true);
+    expect(laneDigest('devin-cloud', 'delivery/same-prefix-002').slice(0, 10)).not.toBe(marker!.slice(4));
+  });
 
   test('发送脚本先核验 Capability Free 与席位再发送；全程不调用 devin CLI', async () => {
     const w = world({ extra: gitOk });

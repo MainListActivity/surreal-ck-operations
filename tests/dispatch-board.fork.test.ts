@@ -13,7 +13,7 @@ import { BLOCK_TEXT } from '../src/dispatcher/dispatch-blocked.ts';
 import { RUNNER_BEAT_MS, readBoard, writeBoardView, writeRunnerHeartbeat } from '../src/board.ts';
 import { OutboundMessageStore } from '../src/outbound-messages.ts';
 import { ownerApi } from '../src/owner-api.ts';
-import { DEFAULT_MACHINE_CRITERION, dispatchText, renderMessage } from '../src/outbound-render.ts';
+import { DEFAULT_MACHINE_CRITERION, dispatchText, renderDispatchBody } from '../src/outbound-render.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
 
@@ -100,7 +100,8 @@ const currentEmployeeOf = async (w: Fork, taskId: string): Promise<string | unde
 /** The text a real dispatch of this task to this employee sends: the same render and join the send path makes. */
 const dispatchedText = async (w: Fork, employeeId: string, taskId: string, body?: string): Promise<string> => {
   const stored = body ?? (await unsentDraft(w, taskId, 'execute'))!.body;
-  return dispatchText(renderMessage(stored, { sckBin: SCK, commDir: w.pool.commDirFor(employeeId), taskId, acId: DEFAULT_MACHINE_CRITERION }));
+  const draft = await new OutboundMessageStore(w.surreal).latestDraft(taskId, 'execute');
+  return dispatchText(renderDispatchBody(stored, draft ?? {}, { sckBin: SCK, commDir: w.pool.commDirFor(employeeId), taskId, acId: DEFAULT_MACHINE_CRITERION }));
 };
 
 /**
@@ -301,21 +302,26 @@ run('owner board: an edit of the shown text is saved as the stored body, and the
       ownerApi(desk, { command: 'message.edit_rendered', messageId, employeeId, rendered }, 'test');
     const commDir = w.pool.commDirFor(s.second.employee);
     const shown = (await readBoard(w.surreal, { now: Date.now() })).employees.find(row => row.id === s.second.employee)!.outbox.find(row => row.taskId === s.second.task)!;
-    const stored = (await unsentDraft(w, s.second.task, 'execute'))!.body;
 
-    // A path the stored body cannot carry is refused, and the stored body stays as it was.
-    await expect(edit(shown.messageId, s.second.employee, shown.body.replace(`${commDir}/notes.md`, 'notes.md'))).rejects.toThrow(/invalid/);
-    expect((await unsentDraft(w, s.second.task, 'execute'))!.body).toBe(stored);
-    // An unknown employee and an unknown message are refused.
+    // 老板自由编辑：还原不了占位符也原样保存（剥掉工作目录行），标记 body_edited，投递保留老板正文。
+    const free = shown.body.replace(`${commDir}/notes.md`, 'notes.md');
+    await edit(shown.messageId, s.second.employee, free);
+    const freeDraft = (await unsentDraft(w, s.second.task, 'execute'))!;
+    expect(freeDraft.body).toBe(free);
+    expect((await desk.messages.get(shown.messageId))?.bodyVerbatim).toBe(true);
+    // 字面正文不再替换路径：看板显示的就是老板写的那段，派工走同一个渲染入口。
+    const freeBoard = (await readBoard(w.surreal, { now: Date.now() })).employees.find(row => row.id === s.second.employee)!.outbox.find(row => row.taskId === s.second.task)!;
+    expect(freeBoard.body).toBe(free);
+    // 未知员工与未知消息仍被拒绝。
     await expect(edit(shown.messageId, 'nobody', shown.body)).rejects.toThrow(/not found/);
     await expect(edit('missing', s.second.employee, shown.body)).rejects.toThrow(/not found/);
 
-    // The owner adds a line to the text the board shows. The stored body keeps placeholders, not this employee's paths.
+    // 可还原的编辑同样按原文保存：换目录也不能再替换老板的字面路径。
     const edited = `${shown.body}\n老板补充：先核对验收标准第 3 条。`;
     await edit(shown.messageId, s.second.employee, edited);
     const next = (await unsentDraft(w, s.second.task, 'execute'))!.body;
     expect(next).toContain('老板补充：先核对验收标准第 3 条。');
-    expect(next).not.toContain(commDir);
+    expect(next).toBe(edited);
     // The board shows the edited text, and a dispatch would send exactly that text.
     const after = (await readBoard(w.surreal, { now: Date.now() })).employees.find(row => row.id === s.second.employee)!.outbox.find(row => row.taskId === s.second.task)!;
     expect(after.body).toBe(edited);

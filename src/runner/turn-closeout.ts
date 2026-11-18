@@ -7,7 +7,7 @@ import type { OutboundMessageStore } from '../outbound-messages.ts';
 interface TurnContext { sidecar: SidecarPool; workforce: Workforce; messages: OutboundMessageStore; sckBin: string }
 
 import { quotaFailure, QUOTA_RELEASE } from "../dispatcher/quota-failure.ts";
-import { renderMessage } from "../outbound-messages.ts";
+import { renderDispatchBody } from "../outbound-messages.ts";
 import { latestFindings } from "../dispatcher/brief.ts";
 import { readJsonFile } from "../comm.ts";
 import { join } from "node:path";
@@ -86,7 +86,7 @@ async function settleTurn(ctx: TurnContext, runtime: Pick<AgentRuntime, "send">,
           const commDir = ctx.sidecar.commDirFor(instId);
           const claim = readJsonFile<{ history?: Parameters<typeof latestFindings>[0] }>(join(commDir, "claim.json"));
           const findings = latestFindings(claim?.history);
-          const body = renderMessage(prepared.body, {
+          const body = renderDispatchBody(prepared.body, prepared.message, {
             sckBin: ctx.sckBin, commDir, taskId, ...(findings ? { findingsFile: findings.file } : {}),
           });
           await runtime.send(event.agent.id, body);

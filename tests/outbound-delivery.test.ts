@@ -53,6 +53,13 @@ test('deliveryBody sends the source text when there is no lang (NONE or empty)',
 function fakeStore(draft: Record<string, unknown> | undefined, created: Array<Record<string, unknown>> = [], employeeLang?: string) {
   return new OutboundMessageStore({
     query: async (sql: string, vars: Record<string, any>) => {
+      // 单草稿守卫：事务里先查后建，再按预生成的记录 ID 读回同一行。
+      if (sql.includes('CREATE $msg CONTENT')) {
+        const row = { id: { id: 'fresh' }, task: { id: 't1' }, step: vars.step, role: vars.role, body: vars.body,
+          state: 'draft', hold: false, created_at: 'now', ...(created[0] ?? {}) };
+        draft = row; return [[row]];
+      }
+      if (sql.includes('SELECT * FROM $msg')) return [draft ? [draft] : []];
       if (sql.includes('CREATE outbound_message')) {
         // 模拟库里带有 lang 字段的新建草稿（例如 schema 默认值）。
         const row = { id: { id: 'fresh' }, task: { id: 't1' }, step: vars.step, role: vars.role, body: vars.body,

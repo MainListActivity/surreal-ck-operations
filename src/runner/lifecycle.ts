@@ -23,6 +23,10 @@ export interface ExecutionAttempt {
   turns: string[];
   result?: WorkResult;
   finalText?: string;
+  /** 最近一次工作结论的取得方式：written 是员工按协议手写的首行口令，steward 是判读器给出的结构化结论。 */
+  verdictVia?: 'written' | 'steward';
+  /** 本任务已连续自动跟进的轮数：手写口令清零，判读器每次加一。 */
+  autoFollowups?: number;
   providerFailure?: import('../dispatcher/provider-failover.ts').ProviderFailure['cause'];
   artifacts?: { raw?: string; blocker?: string; report?: string };
   prepared?: boolean;
@@ -106,6 +110,119 @@ export function workResult(text: string, phase: 'doing' | 'review', structured?:
   // Full output remains in the private journal. The company evidence has a bounded summary.
   evidence.text = `执行端自动收集的工作结果：\n${summary}`.slice(0, 29000);
   return { action, evidence };
+}
+
+/**
+ * 代码回合的提交 SHA：优先取答复里手写的「提交：<40位SHA>」；没有时从任务工作树读取分支相对基线真实前进的 HEAD。
+ * 基线取远端默认分支（origin/HEAD，退而 origin/main、origin/master）的 merge-base：与基线相同或不在同一祖先链上的
+ * HEAD 都不算前进，不能拿它冒充交付提交。基线不可判时不填 SHA。
+ */
+export interface WorktreeHeadProbe {
+  (command: string, args: string[], cwd: string): Promise<{ code: number; stdout: string }>;
+}
+
+const validSha = (text: string): boolean => /^[a-f0-9]{40}$/i.test(text);
+
+export async function advancedWorktreeHead(probe: WorktreeHeadProbe, dir: string, branch?: string): Promise<string | undefined> {
+  const head = await probe('git', ['rev-parse', 'HEAD'], dir);
+  if (head.code !== 0 || !validSha(head.stdout.trim())) return undefined;
+  const sha = head.stdout.trim().toLowerCase();
+  if (branch) {
+    const current = await probe('git', ['rev-parse', '--abbrev-ref', 'HEAD'], dir);
+    if (current.code !== 0 || current.stdout.trim() !== branch) return undefined;
+  }
+  let base: string | undefined;
+  const originHead = await probe('git', ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], dir);
+  if (originHead.code === 0) {
+    const ref = originHead.stdout.trim();
+    base = /^origin\//.test(ref) ? ref.slice('origin/'.length) : undefined;
+  }
+  if (!base) {
+    for (const candidate of ['refs/remotes/origin/main', 'refs/remotes/origin/master']) {
+      const probed = await probe('git', ['rev-parse', '--verify', candidate], dir);
+      if (probed.code === 0 && validSha(probed.stdout.trim())) { base = candidate.slice('refs/remotes/origin/'.length); break; }
+    }
+  }
+  if (!base) return undefined;
+  const mergeBase = await probe('git', ['merge-base', 'HEAD', `origin/${base}`], dir);
+  if (mergeBase.code !== 0 || !validSha(mergeBase.stdout.trim())) return undefined;
+  const baseSha = mergeBase.stdout.trim().toLowerCase();
+  if (baseSha === sha) return undefined;
+  const ancestor = await probe('git', ['merge-base', '--is-ancestor', baseSha, 'HEAD'], dir);
+  return ancestor.code === 0 ? sha : undefined;
+}
+
+/** 同一任务连续自动跟进的上限：超过后执行端强制转受阻交老板，不再让判读器代为自动继续。 */
+export const AUTO_FOLLOWUP_LIMIT = 3;
+
+/** 判读器（总管）对没有首行口令的最终答复给出的结构化结论。 */
+export interface StewardVerdict {
+  action: ResultAction;
+  /** 结论摘要；缺省取答复首段。 */
+  summary?: string;
+  /** 代码回合的交付提交（与答复里手写 SHA 同规则）。 */
+  sha?: string;
+  /** 发布环境（发布任务的结构化证据）。 */
+  environment?: string;
+}
+
+/** 判读器输入：答复原文、阶段、任务/员工/投递身份，以及本任务当前已连续自动跟进的轮数。 */
+export interface StewardVerdictInput {
+  text: string;
+  phase: 'doing' | 'review';
+  task: string;
+  employee: string;
+  deliveryId: string;
+  autoFollowups: number;
+}
+
+export type StewardVerdictResolver = (input: StewardVerdictInput) => Promise<StewardVerdict | undefined> | StewardVerdict | undefined;
+
+export interface StewardVerdictResult {
+  result: WorkResult;
+  via: 'written' | 'steward';
+  autoFollowups: number;
+}
+
+/** 结论口令已写明就照用；没有口令时交给判读器，但硬约束两件：执行轮不得由判读器直接判 accept，连续自动跟进不超过上限。 */
+export async function stewardWorkResult(text: string, phase: 'doing' | 'review', structured: unknown, opts: {
+  resolver?: StewardVerdictResolver;
+  task: string;
+  employee: string;
+  deliveryId: string;
+  autoFollowups: number;
+}): Promise<StewardVerdictResult> {
+  if (structured !== undefined || !opts.resolver) return { result: workResult(text, phase, structured), via: 'written', autoFollowups: 0 };
+  const heading = text.trim().split(/\r?\n/, 1)[0]?.replace(/[*#]/g, '').trim() ?? '';
+  const explicit = /^工作结果[:：]\s*受阻\s*$/.test(heading) || (phase === 'review'
+    ? /^复核结论[:：]\s*(通过|退回)\s*$/.test(heading)
+    : /^提交[:：]\s*[a-f0-9]{40}\s*$/im.test(text));
+  if (explicit) return { result: workResult(text, phase, structured), via: 'written', autoFollowups: 0 };
+  const next = opts.autoFollowups + 1;
+  if (next > AUTO_FOLLOWUP_LIMIT) {
+    return { result: workResult('', phase, { outcome: 'blocked', summary: `同一任务已连续自动跟进 ${AUTO_FOLLOWUP_LIMIT} 轮，判读器不再自动继续；执行端强制转受阻交老板核对，请确认任务方向后再恢复。` }),
+      via: 'steward', autoFollowups: next };
+  }
+  const verdict = await opts.resolver({ text, phase, task: opts.task, employee: opts.employee, deliveryId: opts.deliveryId,
+    autoFollowups: opts.autoFollowups });
+  if (!verdict) return { result: workResult(text, phase), via: 'written', autoFollowups: opts.autoFollowups };
+  if (verdict.action !== 'submit' && verdict.action !== 'accept' && verdict.action !== 'return' && verdict.action !== 'block')
+    throw new Error('判读器结论无效：需要 submit、accept、return 或 block');
+  // 独立复核是 accept 的唯一来源：执行轮只能 submit/block，复核轮只能 accept/return/block。
+  if (phase === 'doing' && verdict.action !== 'submit' && verdict.action !== 'block')
+    throw new Error('判读器不能越过独立复核直接将执行轮判为 accept');
+  if (phase === 'review' && verdict.action !== 'accept' && verdict.action !== 'return' && verdict.action !== 'block')
+    throw new Error('复核轮判读器只能给出 accept、return 或 block');
+  const summary = verdict.summary?.trim() || text.split(/\r?\n/).find(line => line.trim())?.slice(0, 500) || text.trim();
+  const value: Record<string, unknown> = { summary };
+  if (verdict.action === 'block') value.outcome = 'blocked';
+  else if (phase === 'review') {
+    if (verdict.action === 'accept') value.review = 'accept';
+    else if (verdict.action === 'return') value.review = 'return';
+  }
+  if (verdict.sha !== undefined) value.sha = verdict.sha;
+  if (verdict.environment !== undefined) value.environment = verdict.environment;
+  return { result: workResult('', phase, value), via: 'steward', autoFollowups: next };
 }
 
 export function finalAnswer(event: TurnEnded): string {

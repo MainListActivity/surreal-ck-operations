@@ -2,7 +2,8 @@ import { expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ExecutionJournal, workResult, finalAnswer } from '../src/runner/lifecycle.ts';
+import { spawnSync } from 'node:child_process';
+import { AUTO_FOLLOWUP_LIMIT, ExecutionJournal, advancedWorktreeHead, stewardWorkResult, workResult, finalAnswer } from '../src/runner/lifecycle.ts';
 
 test('工作结论不等于任务完成，复核只接受显式业务结论', () => {
   expect(workResult('完成了功能并通过了本地测试', 'doing').action).toBe('submit');
@@ -33,13 +34,82 @@ test('执行批次与结果重启后保持，重放使用同一幂等键', () =>
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('判读器回退：没有首行口令时给出结构化结论，执行轮不能越权 accept，连续自动跟进 3 轮熔断', async () => {
+  const base = { task: 'task', employee: 'worker', deliveryId: 'delivery', autoFollowups: 0 };
+  // 执行轮答复没写口令：判读器判 submit，自动跟进计 1 轮。
+  const submit = await stewardWorkResult('功能已实现并通过本地测试，产物在 src/x.ts。', 'doing', undefined,
+    { ...base, resolver: () => ({ action: 'submit', summary: '实现完成并自验' }) });
+  expect(submit.via).toBe('steward');
+  expect(submit.autoFollowups).toBe(1);
+  expect(submit.result.action).toBe('submit');
+  expect(submit.result.evidence.text).toContain('实现完成并自验');
+  // 判读器不能越过独立复核把执行轮判为 accept。
+  await expect(stewardWorkResult('看起来都对了。', 'doing', undefined,
+    { ...base, resolver: () => ({ action: 'accept', summary: '直接通过' }) })).rejects.toThrow('越过独立复核');
+  // 复核轮没有手写复核结论：判读器可以判 accept。
+  const review = await stewardWorkResult('逐条复验均符合验收标准。', 'review', undefined,
+    { ...base, resolver: () => ({ action: 'accept', summary: '复验通过' }) });
+  expect(review.result.action).toBe('accept');
+  // 已经连续自动跟进 3 轮：第 4 轮强制转受阻，不再自动继续。
+  const capped = await stewardWorkResult('继续做完了。', 'doing', undefined,
+    { ...base, autoFollowups: AUTO_FOLLOWUP_LIMIT, resolver: () => ({ action: 'submit', summary: '又完成一轮' }) });
+  expect(capped.result.action).toBe('block');
+  expect(capped.result.evidence.text).toContain(`连续自动跟进 ${AUTO_FOLLOWUP_LIMIT} 轮`);
+  const cappedWithoutResolverCall = await stewardWorkResult('继续做完了。', 'doing', undefined,
+    { ...base, autoFollowups: AUTO_FOLLOWUP_LIMIT, resolver: () => { throw new Error('熔断后不得再调用判读器'); } });
+  expect(cappedWithoutResolverCall.result.action).toBe('block');
+  const blockedReview = await stewardWorkResult('工作结果：受阻\n缺少验收环境', 'review', undefined,
+    { ...base, resolver: () => { throw new Error('明确受阻不需要判读器'); } });
+  expect(blockedReview.result.action).toBe('block');
+  // 员工手写口令时不计自动跟进，链条清零。
+  const written = await stewardWorkResult(`完成。\n提交：${'a'.repeat(40)}`, 'doing', undefined,
+    { ...base, autoFollowups: 2, resolver: () => ({ action: 'submit' }) });
+  expect(written.via).toBe('written');
+  expect(written.autoFollowups).toBe(0);
+  expect(written.result.evidence.sha).toBe('a'.repeat(40));
+  // 没有判读器：未写口令的复核答复仍按原规则拒绝，不推断结论。
+  await expect(stewardWorkResult('看起来不错', 'review', undefined, base)).rejects.toThrow('明确');
+});
+
+test('代码回合自动采集任务分支相对基线前进的 HEAD；未前进或分支不符不冒充交付提交', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sck-advance-head-'));
+  const git = (...args: string[]) => {
+    const r = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+    if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+    return r.stdout.trim();
+  };
+  const probe = async (cmd: string, args: string[], cwd: string) => {
+    const r = spawnSync(cmd, args, { cwd, encoding: 'utf8' });
+    return { code: r.status ?? 1, stdout: String(r.stdout ?? '') };
+  };
+  try {
+    git('init', '-q', '-b', 'main'); git('config', 'user.email', 'fixture@example.com'); git('config', 'user.name', 'fixture');
+    spawnSync('git', ['commit', '-q', '--allow-empty', '-m', 'base'], { cwd: root });
+    const base = git('rev-parse', 'HEAD');
+    // 远端默认分支指向基线（合成 ref），任务分支从基线出发。
+    git('update-ref', 'refs/remotes/origin/main', base);
+    git('symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main');
+    git('checkout', '-q', '-b', 'task/abc12345');
+    expect(await advancedWorktreeHead(probe, root, 'task/abc12345')).toBeUndefined();
+    spawnSync('git', ['commit', '-q', '--allow-empty', '-m', 'advance'], { cwd: root });
+    const advanced = git('rev-parse', 'HEAD');
+    expect(advanced).not.toBe(base);
+    expect(await advancedWorktreeHead(probe, root, 'task/abc12345')).toBe(advanced);
+    // 分支不符：不拿别的分支 HEAD 冒充本任务交付。
+    expect(await advancedWorktreeHead(probe, root, 'task/other')).toBeUndefined();
+    // 基线完全不可判定时不得把任意 HEAD 作为“相对基线前进”的证据。
+    git('symbolic-ref', '--delete', 'refs/remotes/origin/HEAD');
+    git('update-ref', '-d', 'refs/remotes/origin/main');
+    expect(await advancedWorktreeHead(probe, root, 'task/abc12345')).toBeUndefined();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 import { SidecarPool } from '../src/runner/sidecar.ts';
 import { settleCompanyTurn, TurnInterruptions } from '../src/runner/turn-closeout.ts';
 import { writeFileSync, existsSync } from 'node:fs';
 import type { LeaseProof, ClaimResult } from '../src/contracts.ts';
-import type { ResultFacts } from '../src/runner/lifecycle.ts';
+import type { ResultFacts, StewardVerdictResolver } from '../src/runner/lifecycle.ts';
 
-function fixture(readTurnResult?: (agent: string, turn: string) => Promise<string>) {
+function fixture(readTurnResult?: (agent: string, turn: string) => Promise<string>, verdictResolver?: StewardVerdictResolver) {
   const root = mkdtempSync(join(tmpdir(), 'sck-runner-flow-'));
   const calls: Array<{ action: string; proof: LeaseProof; key: string; text?: string }> = [];
   let delivery = 'delivery-a', version = 2, phase: 'doing' | 'review' = 'doing', submitted = false;
@@ -77,7 +147,7 @@ function fixture(readTurnResult?: (agent: string, turn: string) => Promise<strin
     submit: transition('submit'), accept: transition('accept'), returnTask: transition('return'),
     block: (cred: string, proof: LeaseProof, _to: 'owner', evidence: { idempotencyKey: string; text?: string }) => transition('block')(cred, proof, evidence) };
   const workforce = { rotate: async () => { if (gone) { const e = rotateError ?? Object.assign(new Error('Employee retired or revoked'), { code: 'unauthorized' }); throw e; } if (rotateError) throw rotateError; return 'synthetic'; }, insts: async () => [inst] };
-  const options = { core: core as never, workforce: workforce as never, runDir: join(root, 'comm'), managedLifecycle: true, readTurnResult, heartbeatMs: 15,
+  const options = { core: core as never, workforce: workforce as never, runDir: join(root, 'comm'), managedLifecycle: true, readTurnResult, verdictResolver, heartbeatMs: 15,
     resultFacts: async (taskId: string, employee: string, delivery?: { idempotencyKey: string }) => {
       const base = factsFn ? await factsFn(taskId, employee, delivery) : undefined;
       // Like the real store: the idempotency record exists exactly when the write committed.
@@ -102,10 +172,54 @@ function fixture(readTurnResult?: (agent: string, turn: string) => Promise<strin
     async claim(review = false) { phase = review ? 'review' : 'doing'; pool.env(inst); inst.paseoAgentId = 'agent'; pool.bindAgent(inst.id, 'agent'); await pool.claim(inst, { id: 'task' } as never); },
     async restart() { pool.close(); pool = new SidecarPool(options); await pool.adopt([inst]); },
     async retry() { for (const row of journal().rows()) { row.nextRetry = 0; journal().save(row); } await pool.retryExecutions(); },
-    nextVersion() { version++; }, nextDelivery() { delivery = 'delivery-b'; submitted = false; },
+    nextVersion() { version++; }, nextDelivery(id = 'delivery-b') { delivery = id; submitted = false; },
     close() { pool.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 import { createHash } from 'node:crypto';
+
+test('执行端在无手写 SHA 的代码答复中采集真实任务分支 HEAD 并冻结到提交证据', async () => {
+  const f = fixture();
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: f.root, encoding: 'utf8' });
+    expect(result.status).toBe(0);
+    return result.stdout.trim();
+  };
+  try {
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 'fixture@example.com'); git('config', 'user.name', 'fixture');
+    git('commit', '-q', '--allow-empty', '-m', 'base');
+    git('update-ref', 'refs/remotes/origin/main', git('rev-parse', 'HEAD'));
+    git('checkout', '-q', '-b', 'task/abc12345');
+    git('commit', '-q', '--allow-empty', '-m', 'implementation');
+    const sha = git('rev-parse', 'HEAD');
+    const getTask = f.core.getTask;
+    f.core.getTask = async () => ({ ...await getTask(), workIntent: { kind: 'code' },
+      worktree: { worktreePath: f.root, branch: 'task/abc12345' } });
+    await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
+    await f.settle(f.event('turn-a', '实现完成并逐条自验，未手写提交行。'));
+    expect(f.journal().rows()[0]?.result?.evidence.sha).toBe(sha);
+    expect(f.calls.map(call => call.action)).toEqual(['submit']);
+  } finally { f.close(); }
+});
+
+test('判读器计数跨投递与重启持久化，重复收尾不累加，第四轮不再调用判读器并转交老板', async () => {
+  const seen: number[] = [];
+  const f = fixture(undefined, input => { seen.push(input.autoFollowups); return { action: 'submit' }; });
+  try {
+    for (let round = 1; round <= 4; round++) {
+      if (round > 1) { f.nextVersion(); f.nextDelivery(`delivery-${round}`); }
+      await f.claim(); await f.pool.turnStarted('agent', `turn-${round}`);
+      await f.settle(f.event(`turn-${round}`, `完成第 ${round} 轮工作。`));
+      await f.settle(f.event(`turn-${round}`, `完成第 ${round} 轮工作。`));
+      const row = f.journal().rows().find(row => row.turn === `turn-${round}`)!;
+      expect(row.autoFollowups).toBe(round);
+      expect(row.result?.action).toBe(round <= 3 ? 'submit' : 'block');
+      await f.restart();
+    }
+    expect(seen).toEqual([0, 1, 2]);
+    expect(f.calls.map(call => call.action)).toEqual(['submit', 'submit', 'submit', 'block']);
+  } finally { f.close(); }
+});
 
 test('执行 agent 不调用命令，最终答复自动送审；重复结束只提交一次', async () => {
   const f = fixture(); try {

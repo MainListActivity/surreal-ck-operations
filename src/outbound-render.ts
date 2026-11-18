@@ -139,6 +139,14 @@ export function renderMessage(body: string, opts: RenderContext): string {
     .replaceAll(/findings\/round-(?:\d+|NN)\.md/g, findings ?? 'findings/round-NN.md');
 }
 
+/**
+ * The body to send: an unedited template still gets its path variables substituted; a body the owner wrote
+ * (body_edited) is sent verbatim, exactly as the board showed it.
+ */
+export function renderDispatchBody(body: string, message: { bodyVerbatim?: boolean }, ctx: RenderContext): string {
+  return message.bodyVerbatim ? body : renderMessage(body, ctx);
+}
+
 /** Head of the workdir line a dispatch appends after the rendered body. The line is absent when the claim names no worktree. */
 const WORKDIR_HEAD = '工作目录：';
 
@@ -152,8 +160,7 @@ export function dispatchText(body: string, workdir?: string): string {
  * is the claim's to name, so an edit takes it off before the body is reversed, and the dispatch appends it again.
  */
 export function bodyOfDispatch(text: string): string {
-  const at = text.lastIndexOf(`\n${WORKDIR_HEAD}`);
-  return at >= 0 && !text.slice(at + 1).includes('\n') ? text.slice(0, at) : text;
+  return text.replace(/\r?\n工作目录：[^\r\n]*(?:\r?\n)*$/, '');
 }
 
 /** The step a task's next dispatch sends: review while the task is in review, rework after any return, otherwise execute. */

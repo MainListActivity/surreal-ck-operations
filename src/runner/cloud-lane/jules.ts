@@ -19,7 +19,7 @@ interface Ctx {
   input: LaneInput; deps: LaneDeps; repo: RepoInfo;
   material: { task: string; findings?: string; review: boolean; title: string };
   prompt: string; state: LaneState;
-  digest: string; deadline: number;
+  digest: string; key: string; deadline: number;
 }
 
 async function api(deps: LaneDeps, key: string, path: string, init?: RequestInit): Promise<any> {
@@ -85,7 +85,7 @@ export async function driveJules(ctx: Ctx): Promise<{ kind: 'done' | 'blocked' |
   state.taskUrl = `https://jules.google.com/session/${name!.split('/').pop()}`;
   state.submittedAt = state.submittedAt ?? deps.now();
   writeLaneState(input.commDir, state);
-  recordInflight(input.stateRoot, input.provider, ctx.digest, state);
+  recordInflight(input.stateRoot, input.provider, ctx.key, state);
 
   const sessionName = name!.replace(/^sessions\//, '');
   let session: any;
