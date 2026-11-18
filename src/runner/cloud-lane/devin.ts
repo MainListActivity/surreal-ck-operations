@@ -103,8 +103,11 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
   const maxMinutes = input.config.maxMinutes ?? 180;
   const home = input.env.SCK_DEVIN_HOME?.trim() || DEVIN_HOME;
   // 本轮标记由稳定投递键决定：同一投递内正文重排/换目录仍得到同一标记，只有新一轮才换标记。
-  const marker = /^SCK-[a-f0-9]+$/.test(state.taskId ?? '') ? state.taskId!
-    : `SCK-${(state.delivery ? laneDigest(input.provider, state.delivery) : ctx.digest).slice(0, 10)}`;
+  // 上一轮本地代跑回传已按下但未确认：优先追踪这条 attempt 与已用轮数，只核对、不再代跑或重发。
+  const pendingAssist = state.taskId && /^SCK-[a-f0-9]+$/.test(state.devin?.attempt ?? '')
+    ? state.devin!.attempt : undefined;
+  let marker = pendingAssist ?? (/^SCK-[a-f0-9]+$/.test(state.taskId ?? '') ? state.taskId!
+    : `SCK-${(state.delivery ? laneDigest(input.provider, state.delivery) : ctx.digest).slice(0, 10)}`);
   const continuing = Boolean(state.vendorSession) || Boolean(state.taskId) || Boolean(input.resumeId);
   const followUp = continuing && !material.review
     ? '\n这是同一任务的后续轮次：该分支上可能已有你的云端会话推送过改动并开过 PR，请先拉取远端分支现状，在既有 PR 上继续更新，不要另开重复 PR。'
@@ -164,6 +167,13 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
     dropLocalAttempt();
     persist();
     deps.progress('上次按下发送后没有拿到结果，先核对是否已受理（不重发）', 'failed');
+  }
+  if (pendingAssist) {
+    // 代跑回传的 attempt 已在发送前落盘（含轮数）：这里只把它当本轮标记核对，绝不再次调用代跑或发送。
+    state.taskId = pendingAssist;
+    state.submittedAt ??= state.devin?.attemptAt ?? deps.now();
+    persist();
+    deps.progress('上次本地代跑回传未确认，先核对原会话（不重发、不再代跑）', 'failed');
   }
 
   // ---- 阶段一：确定本轮会话地址。只有这里会按下发送，且只在「尚未按下」时发送。 ----
@@ -303,7 +313,64 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
       const status = String(s.status ?? 'unknown');
       const answer = typeof s.done === 'string' && s.done.trim() ? s.done.trim() : undefined;
       const seen = s.markerSeen === true;
-      if (status === 'blocked') return blocked(`Devin 停下来等待人工输入，需要老板在会话里答复：${String(s.tail ?? '').slice(-400)}`);
+      // 只有已核验本轮用户锚点（seen）后的 blocked 才可能代跑；来源只取本轮锚点之后的 Devin 作者块。
+      if (status === 'blocked' && seen) {
+        const tail = String(s.tail ?? '').slice(-400);
+        const used = state.devin?.assistRounds ?? 0;
+        const pending = state.devin?.attempt;
+        if (pending)
+          return blocked(`Devin 停下来等待人工输入；上一轮本地代跑回传（${pending}）尚未确认，本轮只核对不重发、不再代跑，需老板裁决：${tail}`);
+        const agentTail = typeof s.agentTail === 'string' ? s.agentTail : '';
+        if (used < 3 && deps.assist && agentTail.trim()) {
+          deps.progress(`Devin 等待输入，尝试本地代跑协助（第 ${used + 1}/3 轮）`);
+          const assist = await deps.assist({
+            provider: input.provider,
+            phase: material.review ? 'review' : 'doing',
+            transcriptTail: agentTail,
+            round: used + 1,
+          });
+          if (assist.decision === 'reply' && typeof assist.message === 'string' && assist.message.trim()) {
+            const nextRound = used + 1;
+            const followMarker = `SCK-${laneDigest(input.provider, `${ctx.key}:assist:${nextRound}`).slice(0, 10)}`;
+            const followText = `[SCK-ROUND ${followMarker}]\n\n本地驻场管理员代跑结果（第 ${nextRound}/3 轮`
+              + `${assist.toolExecuted ? `，工具 ${assist.toolExecuted}` : ''}；仅为本地代跑，不代表云端获得账号或远程登录能力）：\n${assist.message.trim()}\n\n`
+              + `请依据上述结果继续本轮工作。收尾约定：本轮的最后一条答复以「[SCK-DONE ${followMarker}]」单独成行开头，随后是完整最终答复。\n`;
+            const at = deps.now();
+            // 发送前先落盘：轮数与 attempt 一起持久化（本目录 + 共享登记），未确认时恢复只核对、零重发。
+            state.devin = { ...state.devin, assistRounds: nextRound, attempt: followMarker, attemptAt: at, attemptSession: sessionUrl };
+            recordInflightAttempt(input.stateRoot, input.provider, ctx.key, followMarker, at, sessionUrl, state.task, nextRound);
+            persist();
+            const r = await browse(devinFollowScript(sessionUrl, followMarker, followText, home), 150_000) as Reply;
+            const url = sessionOf(r?.url) ?? sessionOf(r?.recovered);
+            const offTarget = url !== undefined && !sameSession(url, sessionUrl);
+            const accepted = r?.ok === true && url !== undefined && !offTarget;
+            const pressed = r?.ok === true || r?.code === 'pressed' || r?.code === 'not_echoed';
+            if (accepted) {
+              marker = followMarker;
+              state.taskId = followMarker;
+              state.submittedAt = at;
+              state.taskUrl = url!;
+              state.vendorSession = url!;
+              dropLocalAttempt(); forgetAttemptSession();
+              persist();
+              settled = undefined; misses = 0; idleNoDone = 0;
+              deps.progress(`本地代跑结果已回传原会话（${followMarker}），继续轮询`, 'accepted');
+              continue;
+            }
+            // 未回显：attempt 与轮数保持落盘，恢复时只核对这条 attempt，绝不重发或再次代跑。
+            if (pressed) persist();
+            else { abandonAttempt(); persist(); }
+            return blocked(`Devin 停下来等待人工输入，本地代跑结果未能确认回传原会话（第 ${nextRound} 轮，未重发）：${tail}`);
+          }
+          // escalate 或无可用回复：落盘已用轮数后交老板
+          if (assist.decision === 'escalate') {
+            state.devin = { ...state.devin, assistRounds: used + 1 };
+            persist();
+            return blocked(`Devin 停下来等待人工输入，本地协助转交老板（${assist.reason ?? '无可用协助'}）：${tail}`);
+          }
+        }
+        return blocked(`Devin 停下来等待人工输入，需要老板在会话里答复：${tail}`);
+      }
       // 不工作时看不到本轮标记：转录里没有受理。连续确认后受阻交人工核对；绝不重发，在途状态保留。
       if (status !== 'working' && !seen) {
         if (++misses >= MARKER_MISS_LIMIT)

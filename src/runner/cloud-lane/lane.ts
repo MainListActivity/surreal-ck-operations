@@ -75,6 +75,13 @@ export interface LaneDeps {
    * 其它通道不调用。脚本只回 `__RESULT__{json}`，已按下发送后中断回 `{code:'pressed'}`。
    */
   browse?(script: string, timeoutMs: number): Promise<Record<string, unknown> | undefined>;
+  /**
+   * Mode 1 本地工具代跑协助：云端会话 blocked 时由本地驻场管理员代跑绿区 ops 或给出技术澄清。
+   * 不注入则按原逻辑受阻交老板。
+   */
+  assist?(input: {
+    provider: string; phase: 'doing' | 'review'; transcriptTail: string; round: number;
+  }): Promise<{ decision: 'reply' | 'escalate'; message?: string; reason?: string; toolExecuted?: string }>;
 }
 
 export interface LaneInput {
@@ -174,7 +181,8 @@ export function vendorPrompt(input: LaneInput, repo: RepoInfo, material: ReturnT
     if (input.provider === 'devin-cloud') {
       parts.push(`同一个供应商会话可以先后处理不同仓库，但以本轮为准：仓库 ${repo.slug}、分支 ${repo.branch}。会话里之前轮次用过的仓库或分支不作数。写文件或提交前，核对当前工作树的 origin 远端与当前分支是否与本轮一致（工作目录路径可以和本机不同，只看仓库与分支）。不一致时，先找到、克隆或复用本轮仓库 ${repo.slug} 的正确任务工作树，核对它的 origin 与分支 ${repo.branch} 一致后再继续；只有取不到正确工作树时，才以「工作结果：受阻」收尾并说明原因，不在别的仓库或分支上改动或提交。`,
         `最终 PR 只开在本轮仓库 ${repo.slug}，head 为本轮分支 ${repo.branch}，目标分支 ${repo.defaultBranch}。`,
-        '完成后确保远端分支上有提交、已开或更新一条到目标分支的 PR，最终答复末尾单独成行给出 `PR: <url>` 和 `SHA: <提交sha>`。');
+        '完成后确保远端分支上有提交、已开或更新一条到目标分支的 PR，最终答复末尾单独成行给出 `PR: <url>` 和 `SHA: <提交sha>`。',
+        '如需查询受控测试/运行环境健康度、日志或测试账号（限 ops_info/ops_health/ops_origin_status/ops_origin_health/ops_origin_logs/ops_account_ensure/ops_login/ops_workspace_ensure），可输出单行 `[OPS-REQUEST] {"tool":"ops_health","args":{...}}` 并暂停等待，本地驻场管理员会代跑并将脱敏结果回传同一会话（最多 3 轮）。');
     }
     if (input.provider === 'codex-cloud')
       parts.push('工作结果由本地桥接进程应用与提交；只需把改动做完整。没有可交付的代码改动时，在最终消息里说明原因。');
@@ -287,7 +295,10 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
       // 登记里的落点会话（续轮的原会话）决定核对哪个会话，本目录的旧值不沿用。
       next.taskId = reg.attempt;
       next.submittedAt ??= reg.attemptAt;
-      next.devin = { ...next.devin, attemptSession: reg.attemptSession };
+      // 换员工目录也把待确认的 attempt 与轮数带过来：之后只核对这条 attempt，零重发、不再代跑。
+      next.devin = { ...next.devin, attempt: reg.attempt, attemptAt: reg.attemptAt,
+        attemptSession: reg.attemptSession,
+        ...(reg.assistRounds !== undefined ? { assistRounds: reg.assistRounds } : {}) };
     } else if (next.task) {
       // 摘要变了（返工改了 findings 等）：同一公司任务在别的目录里的登记仍代表已发出的会话，不能当成新任务另建。
       // 未确认受理且没有会话地址的只能受阻交人工核对；有会话地址的沿用它做跟进（同一会话，不另建）。
@@ -299,6 +310,8 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
         next.taskUrl = pending.taskUrl ?? inflightSession(pending);
         next.submittedAt = pending.submittedAt;
         next.vendorSession = pending.vendorSession;
+        if (pending.assistRounds !== undefined)
+          next.devin = { ...next.devin, assistRounds: pending.assistRounds };
       } else if (input.provider === 'devin-cloud') {
         if (others.some(entry => !inflightSession(entry)))
           return blocked(`同一任务上一轮 Devin Cloud 已按下发送（或发送中途中断）但未确认受理，且没有会话地址可核对；换了摘要也不能另建会话（避免重复）。本轮未发出，在途登记已保留，请人工核对 app.devin.ai 后再决定是否重派。`);

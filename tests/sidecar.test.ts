@@ -811,4 +811,269 @@ describe('deliverable_publish 工具', () => {
       expect(elapsed).toBeLessThan(15_000);
     } finally { stalling.close(); }
   }, 30_000);
+
+  test('steward_lane_assist 校验租约、代跑脱敏截断；无租约拒绝；非白名单 escalate', async () => {
+    const assists: unknown[] = [];
+    const secret = 'sk-ant-fixture-secret-value-abcdef';
+    pool.close();
+    pool = new SidecarPool({
+      core: core as never, workforce: workforce as never,
+      ops: {
+        tools: ['ops_info', 'ops_login', 'ops_health', 'ops_d1_exec'] as const,
+        call: async (credential: string, taskId: string, tool: string, args: Record<string, unknown>) => {
+          opsCalls.push({ credential, taskId, tool, args });
+          return { ok: true, tool, token: secret, detail: 'x'.repeat(5000) };
+        },
+        release: (employeeId: string) => { released.push(employeeId); },
+      },
+      media, runDir, heartbeatMs: 10_000, sweepMs: 20,
+      log: message => { logs.push(message); },
+      laneAssist: async input => {
+        assists.push(input);
+        if (String(input.transcriptTail).includes('ops_d1_exec')) {
+          return { kind: 'tool_relay', tool: 'ops_d1_exec' as never, args: {} };
+        }
+        if (String(input.transcriptTail).includes('OPS-REQUEST')) {
+          return { kind: 'tool_relay', tool: 'ops_health', args: { env: 'staging', taskId: 'spoof' } };
+        }
+        return { kind: 'escalate', reason: '无可用协助' };
+      },
+    });
+
+    // 无租约
+    const bare = pool.env(inst('assist-bare'));
+    const noLease = await relay(bare.SCK_COMM_DIR, bare.SCK_COMM_KEY!, 'a0', 'steward_lane_assist', {
+      provider: 'devin-cloud', phase: 'doing', transcriptTail: 'x', round: 1,
+    });
+    expect(noLease.ok).toBe(false);
+    expect(noLease.error).toMatch(/no_lease|租约/);
+
+    const i = inst('assist-1');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-assist'));
+
+    // round 越界
+    const capped = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'a1', 'steward_lane_assist', {
+      provider: 'devin-cloud', phase: 'doing', transcriptTail: 'x', round: 4,
+    });
+    expect(capped.ok).toBe(true);
+    expect(capped.data).toMatchObject({ decision: 'escalate' });
+
+    // 白名单代跑：剔除 taskId、脱敏、截断
+    const ok = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'a2', 'steward_lane_assist', {
+      provider: 'devin-cloud', phase: 'doing', round: 1,
+      transcriptTail: '[OPS-REQUEST] {"tool":"ops_health","args":{"env":"staging"}}',
+    });
+    expect(ok.ok).toBe(true);
+    expect(ok.data).toMatchObject({ decision: 'reply', toolExecuted: 'ops_health' });
+    const message = String((ok.data as { message: string }).message);
+    expect(message).not.toContain(secret);
+    expect(message.length).toBeLessThanOrEqual(4100);
+    expect(opsCalls.at(-1)).toMatchObject({ tool: 'ops_health', taskId: 'task-assist', args: { env: 'staging' } });
+    expect(opsCalls.at(-1)!.args.taskId).toBeUndefined();
+
+    // 非白名单（即便 laneAssist 返回）被二次硬核拦截
+    const denied = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'a3', 'steward_lane_assist', {
+      provider: 'devin-cloud', phase: 'doing', round: 1,
+      transcriptTail: 'please ops_d1_exec',
+    });
+    expect(denied.ok).toBe(true);
+    expect(denied.data).toMatchObject({ decision: 'escalate' });
+    expect(opsCalls.filter(c => c.tool === 'ops_d1_exec')).toHaveLength(0);
+
+    expect(assists.length).toBeGreaterThanOrEqual(2);
+  });
+  test('steward_lane_assist 门禁：阶段以真实租约为准，复核轮禁写，模型推断不得授权写操作', async () => {
+    const calls2: OpsCall[] = [];
+    const lane = (opts: { phase: 'doing' | 'review'; outcome: unknown }) => {
+      const c = {
+        ...core,
+        claim: async (_cred: string, taskId: string) => ({
+          ...claimResult(taskId),
+          task: { ...taskView(taskId), state: opts.phase === 'review' ? 'review' : 'doing' },
+        }),
+      };
+      return new SidecarPool({
+        core: c as never, workforce: workforce as never,
+        ops: {
+          tools: ['ops_info', 'ops_health', 'ops_account_ensure', 'ops_login', 'ops_workspace_ensure'] as const,
+          call: async (credential: string, taskId: string, tool: string, args: Record<string, unknown>) => {
+            calls2.push({ credential, taskId, tool, args });
+            if (tool === 'ops_login') return {
+              ok: true, alias: 'QA1', username: 'qa1', loggedIn: true,
+              sessionHandle: 'sess_handle_hidden', token: 'sk-ant-fixture-secret',
+              activationUrl: 'https://idp.example/activate?token=abc',
+            };
+            if (tool === 'ops_health') throw Object.assign(new Error(`upstream boom ${'sk-ant-fixture-secret'}`), { code: 'upstream_error' });
+            return { ok: true, tool };
+          },
+          release: () => {},
+        },
+        runDir, heartbeatMs: 10_000, sweepMs: 20, log: () => {},
+        laneAssist: async () => opts.outcome as never,
+      });
+    };
+    const relayAs = async (pool2: SidecarPool, name: string, args: Record<string, unknown>) => {
+      const env2 = pool2.env(inst(`gate-${name}`));
+      await pool2.claim(inst(`gate-${name}`), task(`task-${name}`));
+      return relay(env2.SCK_COMM_DIR, env2.SCK_COMM_KEY!, name, 'steward_lane_assist', args);
+    };
+
+    // 1) 调用方 phase 与真实租约不一致：拒绝（不能借参数扩大权限）
+    const spoofer = lane({ phase: 'doing', outcome: { kind: 'reply', message: 'x' } });
+    const spoof = await relayAs(spoofer, 'spoof', { provider: 'devin-cloud', phase: 'review', transcriptTail: 'x', round: 1 });
+    expect(spoof.ok).toBe(false);
+    expect(spoof.error).toMatch(/phase/);
+    spoofer.close();
+
+    // 2) review 租约 + 显式写请求：仍拒绝，ops 不被调用
+    for (const tool of ['ops_account_ensure', 'ops_login', 'ops_workspace_ensure']) {
+      const reviewPool = lane({ phase: 'review', outcome: { kind: 'tool_relay', tool, args: { alias: 'QA1' }, explicit: true } });
+      const denied = await relayAs(reviewPool, `review-${tool}`, { provider: 'devin-cloud', phase: 'review', transcriptTail: 'x', round: 1 });
+      expect(denied.ok).toBe(true);
+      expect(denied.data).toMatchObject({ decision: 'escalate' });
+      expect(calls2.filter(c => c.tool === tool)).toHaveLength(0);
+      reviewPool.close();
+    }
+
+    // 3) review 租约 + 只读：允许
+    const reviewRead = lane({ phase: 'review', outcome: { kind: 'tool_relay', tool: 'ops_info', args: {}, explicit: true } });
+    const readOk = await relayAs(reviewRead, 'review-read', { provider: 'devin-cloud', phase: 'review', transcriptTail: 'x', round: 1 });
+    expect(readOk.ok).toBe(true);
+    expect(readOk.data).toMatchObject({ decision: 'reply', toolExecuted: 'ops_info' });
+    reviewRead.close();
+
+    // 4) doing 租约：模型推断（无 explicit）的写操作拒绝；显式写请求允许
+    const inferred = lane({ phase: 'doing', outcome: { kind: 'tool_relay', tool: 'ops_account_ensure', args: { alias: 'QA1' } } });
+    const inferredOut = await relayAs(inferred, 'inferred-write', { provider: 'devin-cloud', phase: 'doing', transcriptTail: 'x', round: 1 });
+    expect(inferredOut.data).toMatchObject({ decision: 'escalate' });
+    expect(calls2.filter(c => c.tool === 'ops_account_ensure')).toHaveLength(0);
+    inferred.close();
+
+    const explicit = lane({ phase: 'doing', outcome: { kind: 'tool_relay', tool: 'ops_account_ensure', args: { alias: 'QA1' }, explicit: true } });
+    const explicitOut = await relayAs(explicit, 'explicit-write', { provider: 'devin-cloud', phase: 'doing', transcriptTail: 'x', round: 1 });
+    expect(explicitOut.data).toMatchObject({ decision: 'reply', toolExecuted: 'ops_account_ensure' });
+    explicit.close();
+  });
+
+  test('steward_lane_assist 门禁：出站按字段投影，句柄/激活链接/凭证/上游错误原文不出站', async () => {
+    const secrets = ['sk-ant-fixture-secret', 'sess_handle_hidden', 'activate?token'];
+    const logs: string[] = [];
+    const project = new SidecarPool({
+      core: { ...core, claim: async (_c: string, taskId: string) => claimResult(taskId) } as never,
+      workforce: workforce as never,
+      ops: {
+        tools: ['ops_login', 'ops_health'] as const,
+        call: async (_credential: string, _taskId: string, tool: string) => {
+          if (tool === 'ops_login') return { ok: true, alias: 'QA1', username: 'qa1', loggedIn: true,
+            sessionHandle: 'sess_handle_hidden', token: 'sk-ant-fixture-secret', activationUrl: 'https://idp.example/activate?token=abc' };
+          throw Object.assign(new Error('upstream boom sk-ant-fixture-secret'), { code: 'upstream_error' });
+        },
+        release: () => {},
+      },
+      runDir, heartbeatMs: 10_000, sweepMs: 20, log: message => { logs.push(message); },
+      laneAssist: async input => String(input.transcriptTail).includes('login')
+        ? { kind: 'tool_relay', tool: 'ops_login', args: { alias: 'QA1' }, explicit: true }
+        : { kind: 'tool_relay', tool: 'ops_health', args: {}, explicit: true },
+    });
+    const loginEnv = project.env(inst('proj-login'));
+    await project.claim(inst('proj-login'), task('task-proj-login'));
+    const login = await relay(loginEnv.SCK_COMM_DIR, loginEnv.SCK_COMM_KEY!, 'p1', 'steward_lane_assist',
+      { provider: 'devin-cloud', phase: 'doing', transcriptTail: 'login please', round: 1 });
+    const message = String((login.data as { message?: string }).message);
+    expect(message).toContain('qa1');
+    for (const secret of secrets) expect(message).not.toContain(secret);
+    expect(message).toContain('localRelay');
+    expect(message).toContain('不代表云端会话获得远程登录能力');
+
+    const healthEnv = project.env(inst('proj-health'));
+    await project.claim(inst('proj-health'), task('task-proj-health'));
+    const failed = await relay(healthEnv.SCK_COMM_DIR, healthEnv.SCK_COMM_KEY!, 'p2', 'steward_lane_assist',
+      { provider: 'devin-cloud', phase: 'doing', transcriptTail: 'health', round: 1 });
+    expect(failed.data).toMatchObject({ decision: 'escalate' });
+    const reason = String((failed.data as { reason?: string }).reason);
+    expect(reason).toContain('upstream_error');
+    expect(reason).not.toContain('upstream boom');
+    expect(reason).not.toContain('sk-ant-fixture-secret');
+    // 原始上游错误正文也不写进普通执行日志，只留工具名与错误码。
+    const logged = logs.join('\n');
+    expect(logged).toContain('upstream_error');
+    expect(logged).not.toContain('upstream boom');
+    expect(logged).not.toContain('sk-ant-fixture-secret');
+    project.close();
+  });
+
+  test('steward_lane_assist 回放：未知嵌套字段与账号整条记录不出站，安全字段保留', async () => {
+    const logs: string[] = [];
+    const replay = new SidecarPool({
+      core: { ...core, claim: async (_c: string, taskId: string) => claimResult(taskId) } as never,
+      workforce: workforce as never,
+      ops: {
+        tools: ['ops_origin_status', 'ops_info', 'ops_health'] as const,
+        call: async (_credential: string, _taskId: string, tool: string) => {
+          if (tool === 'ops_origin_status') return {
+            services: {
+              'surreal-ck-hono': {
+                active: 'active', sub: 'running', restarts: 2, memoryMB: 128,
+                sessionHandle: 'sess_nested_hidden', activationUrl: 'https://idp.example/activate?token=abc',
+                unknownNested: { deep: 'nested-leak' },
+              },
+            },
+            disk: { path: '/', usedPct: 42.5, freeGB: 10.2 },
+            memory: { totalMB: 16384, availableMB: 8192 },
+            load: [0.5, 0.4, 0.3],
+            uptimeHours: 120.5,
+            detail: 'upstream boom: connection refused',
+            unknownTop: 'top-leak',
+          };
+          if (tool === 'ops_info') return {
+            project: 'surreal_ck', env: 'production',
+            accounts: [{ alias: 'QA1', username: 'qa1', password: 'pw-leak', sessionHandle: 'sess_item_hidden' }],
+            unknownTop: 'top-leak',
+          };
+          return { url: 'https://app.example/health', reachable: true, status: 200, ok: true, ms: 12, body: 'body-leak', detail: 'detail-leak' };
+        },
+        release: () => {},
+      },
+      runDir, heartbeatMs: 10_000, sweepMs: 20, log: message => { logs.push(message); },
+      laneAssist: async input => {
+        const tool = String(input.transcriptTail).includes('info') ? 'ops_info'
+          : String(input.transcriptTail).includes('health') ? 'ops_health' : 'ops_origin_status';
+        return { kind: 'tool_relay', tool: tool as never, args: {}, explicit: true };
+      },
+    });
+    const ask = async (name: string, tail: string) => {
+      const env = replay.env(inst(`replay-${name}`));
+      await replay.claim(inst(`replay-${name}`), task(`task-replay-${name}`));
+      const res = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, name, 'steward_lane_assist',
+        { provider: 'devin-cloud', phase: 'doing', transcriptTail: tail, round: 1 });
+      return String((res.data as { message?: string }).message);
+    };
+
+    const status = await ask('status', 'status');
+    const statusOut = JSON.parse(status) as Record<string, unknown>;
+    expect(statusOut.localRelay).toBe(true);
+    expect(JSON.stringify(statusOut.services)).toContain('"active":"active"');
+    expect(JSON.stringify(statusOut.services)).toContain('"restarts":2');
+    expect(JSON.stringify(statusOut.disk)).toContain('"usedPct":42.5');
+    expect(JSON.stringify(statusOut)).toContain('"availableMB":8192');
+    expect(JSON.stringify(statusOut)).toContain('"uptimeHours":120.5');
+    for (const hidden of ['sess_nested_hidden', 'activate?token', 'nested-leak', 'nested', 'top-leak', 'upstream boom', 'unknownTop'])
+      expect(status).not.toContain(hidden);
+
+    const info = await ask('info', 'info');
+    expect(info).toContain('"alias":"QA1"');
+    expect(info).toContain('"username":"qa1"');
+    for (const hidden of ['pw-leak', 'sess_item_hidden', 'top-leak', 'sessionHandle'])
+      expect(info).not.toContain(hidden);
+
+    const health = await ask('health', 'health');
+    expect(health).toContain('"status":200');
+    expect(health).toContain('"ms":12');
+    for (const hidden of ['body-leak', 'detail-leak', 'detail']) expect(health).not.toContain(hidden);
+
+    // 成功代跑不应写任何错误日志
+    expect(logs.join('\n')).not.toContain('leak');
+    replay.close();
+  });
 });
