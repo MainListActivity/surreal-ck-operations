@@ -1,20 +1,19 @@
 {
-  "version": "0.13.55",
-  "title": "NodeSteward 判读与模仿起草、老板风格记忆、云通道跨租约零重发",
+  "version": "0.13.58",
+  "title": "只读发布诊断：CK 检查/部署分步、公开运行版本与源站证据",
   "changes": [
-    "执行端常驻 NodeSteward 经既有 Magpie Anthropic 接口判读无首行口令的答复；严格 JSON、30 秒超时、输入输出脱敏，失败安全回退。",
-    "继续执行 0.13.54 独立复核与连续自动跟进上限护栏：doing 只能 submit/block，review 只能 accept/return/block。",
-    "老板改稿：message.edit 与 message.edit_rendered 保存成功且正文变化时，把脱敏差分写入 owner_style_memory，记忆写入失败不阻塞改稿。",
-    "message.draft：读取任务卡与最近最多 5 条风格样本，区分本机和云端/网页能力起草自然派工消息，只更新未发草稿，保留 hold 并防并发覆盖。",
-    "云通道：无 findings 的执行轮跨租约重派同一任务时领养旧在途任务，纯轮询不再发送；结清后清理同一供应商任务的旧登记。",
-    "Devin 收尾：缺 PR 行时查询真实 OPEN PR；idle 漏写 DONE 时，只有远端分支确有新提交且有 OPEN PR 才按真实 HEAD 收尾。"
+    "新增只读 ops_release_diagnose：按任务项目的仓库与完整 40 位 SHA 聚合 GitHub Actions 运行、每次尝试、作业与步骤结论，并读取公开 runtime-version.json。",
+    "复用既有受限源站 status/health 边界，只返回服务与探针状态；不读日志正文、不读用户资料、不触发重跑、部署、重启或回滚。",
+    "绝不把 workflow success 或阶段 skipped 当部署成功：只有公开运行版本指向同一 SHA 与该部署运行的对应尝试，且全部部署阶段 success 才标 verified。",
+    "公开运行版本读不到或指向别的提交时明确 unknown/not_deployed；源站状态只证明存活，不证明运行版本，始终保持 unknown。",
+    "仓库与公开源站来自任务项目与环境授权配置；调用方传入 repo、URL、host、命令、凭证等参数会在任何读取前被拒绝。",
+    "输出状态、完整 SHA、失败阶段/步骤与时间、可复核运行/作业/公开版本链接，并明确 rootCause=not_inferred、logsRead=false。"
   ],
   "impact": [
-    "老板：可按最近改稿偏好一键起草，原扣住状态不变，不会自动放行。",
-    "员工：自然答复可由管理员判读，但执行轮不能跳过独立复核。",
-    "运维：跨租约恢复不重复发送；Devin 漏标记可用真实远端证据收尾。",
-    "限制：起草依赖执行端 Magpie 授权；未知通道按远程能力保守处理，模型失败不覆盖草稿。"
+    "员工与 QA：不持凭证、不读日志即可定位发布卡点，并能逐条复核运行与阶段结论。",
+    "老板：发布结论只认公开运行版本与部署阶段的对应关系；源站版本未知时如实标 unknown。",
+    "限制：任务必须属于已绑定代码仓库的项目环境；当前只识别 CK 的公开 runtime-version.json 路径。"
   ],
-  "migration": "新增 schema 073，由 migrator/bootstrap 幂等建立 SCHEMALESS owner_style_memory 表及时间索引，不改历史任务。升级并重启执行端，沿用既有 Magpie 凭证文件，默认模型 group/sck-sonnet。",
-  "rollback": "回退至 0.13.54，保留风格记忆表而不再使用；停止新起草命令，判读恢复原可选接缝。回退前核对在途云端登记，旧版跨租约恢复可能再次发出跟进消息。"
+  "migration": "无 schema 变更，沿用 schema 073；升级并重启执行端插件即可。项目仓库由 project.repo_path 的 origin 远程解析，公开地址取环境的 url。",
+  "rollback": "回退至 0.13.57（若尚未发布则 0.13.55）；工具随版本消失，无数据迁移。"
 }

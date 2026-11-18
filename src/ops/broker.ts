@@ -24,6 +24,11 @@ import { controlPlaneEnv, parseBrokerConfig, type BrokerConfig, type ControlPlan
 import { cloudflareD1, type D1Client } from './d1.ts';
 import { opsFetch, type Fetcher } from './fetcher.ts';
 import { originLogsRequest, sshOriginAgent, type OriginAgent, type OriginRequest } from './origin.ts';
+import {
+  originEvidence, readGithubRelease, readPublicRuntimeVersion, RELEASE_RUNTIME_VERSION_PATH, summarizeRelease,
+  type OriginEvidence,
+} from './release-diagnosis.ts';
+import { ghCli, type GhRunner } from '../pr-gate.ts';
 import { surrealQueryAsUser, type QueryAsUser } from './data.ts';
 import { jwtExpiry, jwtSubject, LoginError, passwordLogin, type LoginTokens } from './idp.ts';
 import { audienceUrl, clientId, describeSpaClient, redirectUriList, registerSpaClient, spaClientName } from './idp-clients.ts';
@@ -72,7 +77,7 @@ export const OPS_TOOLS = [
   'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_principal_list', 'ops_idp_admin_request',
   'ops_idp_provision_rotate', 'ops_invitation_issue',
   'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_approval_diagnose', 'ops_internal_ai_deliver', 'ops_internal_ai_revoke', 'ops_internal_ai_trust', 'ops_internal_ai_rotate_key',
-  'ops_supplier_plan_sample', 'ops_product_magpie_observe', 'ops_product_magpie_candidate', 'ops_magpie_route_sample', 'ops_magpie_route_restore', 'ops_magpie_window_prepare', 'ops_product_magpie_price_approve', 'ops_platform_operator_list', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs',
+  'ops_supplier_plan_sample', 'ops_product_magpie_observe', 'ops_product_magpie_candidate', 'ops_magpie_route_sample', 'ops_magpie_route_restore', 'ops_magpie_window_prepare', 'ops_product_magpie_price_approve', 'ops_platform_operator_list', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs', 'ops_release_diagnose',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
 
@@ -98,6 +103,10 @@ export interface OpsDeps {
   queryAsUser?: QueryAsUser;
   browser?: BrowserInjector;
   originAgent?: OriginAgent;
+  /** Read-only GitHub metadata for ops_release_diagnose; production uses the same gh CLI as the submit gate. */
+  gh?: GhRunner;
+  /** The task project's own repository, resolved from project configuration; never from a tool argument. */
+  projectRepoSlug?: (project: string) => Promise<string | undefined>;
   /**
    * Trusted Magpie wiring. Production leaves this unset and the sampler resolves the owner's
    * loopback gateway (MAGPIE_ADDR / stash / default); tests inject the fake gateway and config.
@@ -406,6 +415,7 @@ export class OpsBroker {
       ops_origin_status: (ctx) => this.origin(ctx, { op: 'status' }),
       ops_origin_health: (ctx) => this.origin(ctx, { op: 'health' }),
       ops_origin_logs: (ctx, args) => this.origin(ctx, originLogsRequest(args)),
+      ops_release_diagnose: (ctx, args) => this.releaseDiagnose(ctx, args),
       ...Object.fromEntries(Object.keys(proofToolSchemas).map(tool => [tool, (ctx: Ctx, args: Args) => this.internalProof(ctx, tool as ProofTool, args)])) as Record<ProofTool, Handler>,
     };
   }
@@ -807,6 +817,52 @@ export class OpsBroker {
     const value = redactJson(reply, this.sessions.secrets(ctx.scope.actor.employeeId));
     const detail = request.op === 'logs' ? ` service=${request.service} since=${request.since} matched=${String(reply.matched)}${request.grep ? ` grep=${request.grep}` : ''}` : '';
     return { value, audit: { action: 'ops_call', evidence: `ops_origin_${request.op} host=${ctx.cfg.origin.host}${detail}` } };
+  }
+
+  /**
+   * Read-only CK release diagnosis. The repository is the task project's own binding and the public origin comes
+   * from this environment's configuration; a tool argument can name neither. Only commit ids, check/deploy metadata,
+   * the public runtime-version artifact and the restricted origin status/health are read — never logs or payloads.
+   */
+  private async releaseDiagnose(ctx: Ctx, args: Args): Promise<Outcome> {
+    for (const key of Object.keys(args)) {
+      if (key !== 'sha' && key !== 'env') throw invalid(`${key} is not accepted: repository, URL, host, command and credentials come from configuration`);
+    }
+    const sha = args.sha;
+    if (typeof sha !== 'string' || !/^[a-f0-9]{40}$/.test(sha)) throw invalid('sha must be the full 40-character lowercase commit id');
+    if (!this.deps.projectRepoSlug) throw new CompanyError('not_configured', 'the task project has no code repository bound for release diagnosis');
+    const repo = await this.deps.projectRepoSlug(ctx.scope.project);
+    if (!repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) throw new CompanyError('not_configured', `project ${ctx.scope.project} has no readable GitHub repository binding`);
+    const base = ctx.row.url ?? ctx.cfg.product.url;
+    let runtimeVersionUrl: string;
+    try { runtimeVersionUrl = new URL(RELEASE_RUNTIME_VERSION_PATH, base).toString(); }
+    catch { throw new CompanyError('not_configured', `${ctx.env} has no valid public URL for the runtime version`); }
+    const github = await readGithubRelease(repo, sha, this.deps.gh ?? ghCli);
+    const runtime = await readPublicRuntimeVersion({ url: runtimeVersionUrl, fetch: this.deps.fetch ?? opsFetch, now: this.now });
+    const [statusRead, healthRead] = ctx.cfg.origin
+      ? await Promise.allSettled([this.origin(ctx, { op: 'status' }), this.origin(ctx, { op: 'health' })])
+      : [{ status: 'rejected' as const, reason: new Error('not configured') }, { status: 'rejected' as const, reason: new Error('not configured') }];
+    const known = this.sessions.secrets(ctx.scope.actor.employeeId);
+    const originFrom = (settled: PromiseSettledResult<Outcome>): { value?: Record<string, unknown>; error?: string } => {
+      if (settled.status === 'fulfilled') {
+        const value = settled.value.value;
+        return value && typeof value === 'object' ? { value: value as Record<string, unknown> } : {};
+      }
+      const error = settled.reason;
+      const message = error instanceof CompanyError ? `${error.code}: ${error.message}` : String((error as Error)?.message ?? error);
+      return { error: clip(redactText(message, known), 160) };
+    };
+    const status = originFrom(statusRead);
+    const health = originFrom(healthRead);
+    const origin = originEvidence({
+      configured: !!ctx.cfg.origin, status: status.value, health: health.value,
+      statusError: status.error, healthError: health.error, now: this.now,
+    });
+    const report = summarizeRelease({ repo, sha, github, runtime, origin, now: this.now });
+    return {
+      value: report,
+      audit: { action: 'ops_call', evidence: `ops_release_diagnose repo=${repo} sha=${sha} ci=${report.ci.state} deploy=${report.deploy.state} status=${report.status}` },
+    };
   }
 
   // ---------- accounts ----------
