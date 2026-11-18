@@ -1,20 +1,17 @@
 {
-  "version": "0.13.55",
-  "title": "NodeSteward 判读与模仿起草、老板风格记忆、云通道跨租约零重发",
+  "version": "0.13.58",
+  "title": "双节点接力：第二节点清单与离线租约负例",
   "changes": [
-    "执行端常驻 NodeSteward 经既有 Magpie Anthropic 接口判读无首行口令的答复；严格 JSON、30 秒超时、输入输出脱敏，失败安全回退。",
-    "继续执行 0.13.54 独立复核与连续自动跟进上限护栏：doing 只能 submit/block，review 只能 accept/return/block。",
-    "老板改稿：message.edit 与 message.edit_rendered 保存成功且正文变化时，把脱敏差分写入 owner_style_memory，记忆写入失败不阻塞改稿。",
-    "message.draft：读取任务卡与最近最多 5 条风格样本，区分本机和云端/网页能力起草自然派工消息，只更新未发草稿，保留 hold 并防并发覆盖。",
-    "云通道：无 findings 的执行轮跨租约重派同一任务时领养旧在途任务，纯轮询不再发送；结清后清理同一供应商任务的旧登记。",
-    "Devin 收尾：缺 PR 行时查询真实 OPEN PR；idle 漏写 DONE 时，只有远端分支确有新提交且有 OPEN PR 才按真实 HEAD 收尾。"
+    "新增第二原生节点上线清单：Linux external 隔离、节点本地 clone/显式路径、日志证据脱敏、第二节点心跳与 VPS 待验项。",
+    "同目录 writer.lock 独立测试：第二写者失败、host 不匹配拒绝、多进程仅一写者，与跨节点租约证据分离。",
+    "跨目录共库 fork 负例：两 runner/node、有效租约唯一写者、跨节点接手拒绝、旧租约不可写、过期后可接手。",
+    "路由 N3：指定节点离线时 ownsProvider 不回退到其他 native 或 paseo，避免双执行。"
   ],
   "impact": [
-    "老板：可按最近改稿偏好一键起草，原扣住状态不变，不会自动放行。",
-    "员工：自然答复可由管理员判读，但执行轮不能跳过独立复核。",
-    "运维：跨租约恢复不重复发送；Devin 漏标记可用真实远端证据收尾。",
-    "限制：起草依赖执行端 Magpie 授权；未知通道按远程能力保守处理，模型失败不覆盖草稿。"
+    "运维：上线第二节点前可按清单勾选；真实 VPS 心跳前仍标 unknown。",
+    "工程：租约与写锁负例可离线回归，不依赖生产第二节点。",
+    "限制：本版不安装生产 VPS runner、不改生产 runtime-routes、不迁移在途会话。"
   ],
-  "migration": "新增 schema 073，由 migrator/bootstrap 幂等建立 SCHEMALESS owner_style_memory 表及时间索引，不改历史任务。升级并重启执行端，沿用既有 Magpie 凭证文件，默认模型 group/sck-sonnet。",
-  "rollback": "回退至 0.13.54，保留风格记忆表而不再使用；停止新起草命令，判读恢复原可选接缝。回退前核对在途云端登记，旧版跨租约恢复可能再次发出跟进消息。"
+  "migration": "无新 schema；沿用 073（owner_style_memory）。合入后重启执行端即可加载清单与测试；不改历史任务。",
+  "rollback": "回退至 0.13.55 或其后已合入的中间版；删除清单与新增测试不影响运行时。回退后勿宣称双节点负例已固化。"
 }
