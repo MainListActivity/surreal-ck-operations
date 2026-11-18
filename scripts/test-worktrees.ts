@@ -64,6 +64,8 @@ try {
     'tests/null-absent.fork.test.ts',
     // SYS04：故障分类与持久预算、真实 TLS 传输的回归。
     'tests/faults.test.ts', 'tests/fault-budget.fork.test.ts', // SYS05：时间/外部事件等待状态机、调度零派工与租约结束回收；fork 用例在隔离库验证原子进入、一次释放与版本锁。
+    // SYS04：负责人对已耗尽恢复预算的一次性事件恢复授权（窗口从首次真实尝试消费时开始；隔离库验证幂等、并发、越权与审计）。
+    'tests/fault-recovery-grant.fork.test.ts',
     // SYS07：目标终验图、成果证据、只读看板/指标与最终验收阻断；隔离库验证 CAS、分页、权限与历史不回写。
     'tests/null-absent.fork.test.ts',
     'tests/snapshot-quota.fork.test.ts',

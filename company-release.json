@@ -14,6 +14,6 @@
     "老板：发布结论只认公开运行版本与部署阶段的对应关系；源站版本未知时如实标 unknown。",
     "限制：任务必须属于已绑定代码仓库的项目环境；当前只识别 CK 的公开 runtime-version.json 路径。"
   ],
-  "migration": "无 schema 变更，沿用 schema 073；升级并重启执行端插件即可。项目仓库由 project.repo_path 的 origin 远程解析，公开地址取环境的 url。",
-  "rollback": "回退至 0.13.56；工具随版本消失，无数据迁移。"
+  "migration": "无 schema 变更，沿用 schema 074（0.13.57 的 fault_recovery_grant）；升级并重启执行端插件即可。项目仓库由 project.repo_path 的 origin 远程解析，公开地址取环境的 url。",
+  "rollback": "回退至 0.13.57；工具随版本消失，无数据迁移。"
 }
