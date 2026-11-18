@@ -163,6 +163,55 @@ describe('ops release diagnosis', () => {
     expect(r.company.audits.map(a => a.evidence)).toContain(`ops_release_diagnose repo=${REPO} sha=${SHA} ci=success deploy=verified status=deployed`);
   });
 
+  test('the CK PR256 sample keeps attempt history, ignores the skipped deploy, and verifies only the matching run', async () => {
+    // Real metadata shape for 72de7f919f351b063bbe040d45341f9f2c7974ef: Quality gate 44266682999
+    // attempt1 failed / attempt2 passed; Deploy 44267127836 success-with-skipped stages; Deploy 44276693580 all stages success.
+    const r = rig({
+      runs: [
+        {
+          id: '44266682999', workflow: 'Quality gate', runAttempt: 2,
+          jobs: {
+            1: [job('Quality gate', 'failure', [{ name: 'Lint', conclusion: 'success' }, { name: 'Test', conclusion: 'failure' }])],
+            2: [job('Quality gate', 'success', [{ name: 'Lint', conclusion: 'success' }, { name: 'Test', conclusion: 'success' }])],
+          },
+        },
+        {
+          id: '44267127836', workflow: 'Deploy production', conclusion: 'success', createdAt: '2026-11-18T08:27:26Z', jobs: {
+            1: [job('Validate production configuration', 'success'), job('Hono origin', 'skipped'), job('Cloudflare production', 'skipped')],
+          },
+        },
+        {
+          id: '44276693580', workflow: 'Deploy production', conclusion: 'success', createdAt: '2026-11-18T09:31:20Z', jobs: {
+            1: [
+              job('Validate production configuration', 'success'),
+              job('Hono origin / Hono origin (systemd)', 'success'),
+              job('Cloudflare production', 'success'),
+            ],
+          },
+        },
+      ],
+      runtime: runtimeFetch(JSON.stringify({ sha: SHA, deploymentId: '44276693580-1' })),
+    });
+    const report = await call(r, { sha: SHA });
+    expect(report.status).toBe('deployed');
+    expect(report.sha).toBe(SHA);
+    expect(report.ci.state).toBe('success');
+    expect(report.ci.runs[0].attempts.map((attempt: any) => ({
+      attempt: attempt.attempt, conclusion: attempt.conclusion, failedStage: attempt.failedStage, failedStep: attempt.failedStep,
+    }))).toEqual([
+      { attempt: 1, conclusion: 'failure', failedStage: 'Quality gate', failedStep: 'Test' },
+      { attempt: 2, conclusion: 'success', failedStage: undefined, failedStep: undefined },
+    ]);
+    expect(report.deploy.state).toBe('verified');
+    expect(report.deploy.verifiedRun?.id).toBe('44276693580');
+    // The skipped deploy remains visible for review, but it never becomes the verified run.
+    const skipped = report.deploy.runs.find((run: any) => run.id === '44267127836');
+    expect(skipped.conclusion).toBe('success');
+    expect(skipped.attempts[0].skippedStages).toEqual(['Hono origin', 'Cloudflare production']);
+    expect(report.deploy.verifiedRun?.id).not.toBe('44267127836');
+    expect(report.limits).toMatchObject({ readOnly: true, logsRead: false, rootCause: 'not_inferred' });
+  });
+
   test('a successful deploy workflow whose stages were skipped is not a deployment', async () => {
     const r = rig({
       runs: [
