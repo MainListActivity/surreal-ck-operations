@@ -64,6 +64,9 @@
  * 核验：session/follow 模式读完 DOM 之后，一律核对 location.href（query/hash 可规范化去掉）是否正是本次
  * 传入的会话地址；留在另一个合法会话上即使凑巧也有本轮同标记作者块，也按 wrong_session 拒绝，绝不采信，
  * 绝不重发——这与「只认本轮用户锚点」是同一条「不拿别处内容冒充本轮终稿」边界的两个必要条件，缺一不可。
+ * follow 发送之后读受理回执时同样核验地址：页面在发送后漂到别的合法会话上时，回 not_echoed（已按下、
+ * 未确认），由驱动层回原会话核对，不把那一页的标记当受理。驱动层对每一份回执再独立比对一次回执里的
+ * s.url 与目标会话（query/hash 规范化），即使回执误报 ok:true 也不采信别的会话的终稿。
  * 发送不是幂等的：按下 Send 前打印 __PRESSED__，脚本中途死掉时执行端知道「可能已发出」，绝不重发，
  * 而是回会话列表/原会话按本轮标记核对是否已受理。
  */
@@ -410,7 +413,10 @@ for (let i = 0; i < 8; i++) {
   s = await read();
   if (s.markerSeen) break;
 }
-emit(s.markerSeen ? { ok: true, url: s.url, cap: 'Free', seats: pre, echoed: true } : { ok: false, code: 'not_echoed', url: s.url, cap: 'Free', seats: pre });
+// 受理回执同样要求实际地址仍是原会话：发送后若页面跳到/tab 停在别的合法会话上，即使那页凑巧有本轮
+// 标记，也不能报「已受理」——按 not_echoed（已按下、未确认）交驱动层回原会话核对，绝不重发。
+const onTarget = sameSession(s.url, TARGET_URL);
+emit(s.markerSeen && onTarget ? { ok: true, url: s.url, cap: 'Free', seats: pre, echoed: true } : { ok: false, code: 'not_echoed', url: s.url, cap: 'Free', seats: pre });
 `, marker);
 }
 

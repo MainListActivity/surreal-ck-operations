@@ -885,6 +885,66 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(readLaneState(w.commDir)?.taskId).toBeDefined();
   });
 
+  test('轮询回执误报 ok:true 却带着另一个会话地址（驱动层地址核验，合成负例）：不采信那份终稿、不拉分支，累计后受阻并保留在途', async () => {
+    const w = world({ extra: gitOk });
+    // 比上一条更强的负例：回执本身 ok:true，done 里甚至有像样的 PR/SHA，但 location.href 是另一个合法会话。
+    // 脚本侧本会按 wrong_session 拒绝，这里验证驱动层自己也按 s.url 与目标会话再核一次，不靠脚本自觉。
+    const b = devinBrowse({ send: [{ ok: true, url: SESSION }], session: [{ ...idleDone(PR9), url: OTHER }] });
+    const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1 } }), { ...w.deps, browse: b.browse });
+    expect(out.status).toBe('success');
+    expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+    expect(out.text).toContain('没能停在本轮轮询的会话地址上');
+    expect(out.text).toContain(SESSION);
+    // 没有把那个会话的 PR 当终稿：没有快进/拉分支，也没有第二次发送
+    expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(0);
+    expect(b.calls.filter(s => s.includes('const MSG ='))).toHaveLength(1);
+    expect(readLaneState(w.commDir)?.vendorSession).toBe(SESSION);
+  });
+
+  test('续轮回执误报 ok:true 但地址是别的会话（驱动层地址核验，合成负例）：不在那页取终稿，回原会话核对后零重发取回', async () => {
+    const w = world({ extra: gitOk });
+    writeLaneState(w.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
+    const b = devinBrowse({
+      follow: [{ ok: true, url: OTHER, cap: 'Free', seats: { used: 0, total: 2 }, echoed: true }],
+      session: [idleDone(PR9)],
+    });
+    const out = await runLane(w.input({ provider: 'devin-cloud', prompt: '继续修复。' }), { ...w.deps, browse: b.browse });
+    expect(out.status).toBe('success');
+    expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
+    // 受理落点仍是原会话（不是回执里那个别的会话），也没有第二次发送/新建会话
+    expect(readLaneState(w.commDir)?.vendorSession).toBe(SESSION);
+    const sessionCalls = b.calls.filter(s => s.includes(MODE('session')));
+    expect(sessionCalls.length).toBeGreaterThan(0);
+    expect(sessionCalls.every(s => s.includes(`const TARGET_URL = "${SESSION}"`))).toBe(true);
+    expect(b.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(1);
+    expect(b.calls.some(s => s.includes(MODE('send')))).toBe(false);
+  });
+
+  test('受理核对的回执带着别的会话地址（驱动层地址核验，合成负例）：不认那页的本轮标记，核对耗尽后受阻并保留在途', async () => {
+    const TASK = '# 云端任务\n\n实现需求甲。\n';
+    const REPO = { slug: 'acme/widget', owner: 'acme', repo: 'widget', branch: 'sck/task-1', defaultBranch: 'main' };
+    const PROMPT = '继续修复。';
+    const digestOf = (w: ReturnType<typeof world>, prompt: string) =>
+      laneDigest('devin-cloud', vendorPrompt(w.input({ provider: 'devin-cloud', prompt }), REPO, taskMaterial(w.commDir, prompt)));
+    const w1 = world({ task: TASK, extra: gitOk });
+    writeLaneState(w1.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
+    const a = devinBrowse({ follow: [{ ok: false, code: 'pressed' }], session: [unseen] });
+    await runLane(w1.input({ provider: 'devin-cloud', prompt: PROMPT, config: { pollMs: 1 } }), { ...w1.deps, browse: a.browse });
+    expect(readInflight(w1.stateRoot, 'devin-cloud', digestOf(w1, PROMPT))?.attemptSession).toBe(SESSION);
+
+    const w2 = world({ task: TASK, extra: gitOk });
+    const b2 = devinBrowse({ session: [{ ...idleDone(PR9), url: OTHER }] });
+    const out2 = await runLane(w2.input({ provider: 'devin-cloud', prompt: PROMPT, stateRoot: w1.stateRoot }), { ...w2.deps, browse: b2.browse });
+    expect(out2.status).toBe('success');
+    expect(out2.text.split('\n')[0]).toBe('工作结果：受阻');
+    expect(out2.text).toContain('原会话');
+    expect(out2.text).toContain(SESSION);
+    expect(b2.calls.some(s => s.includes(MODE('send')))).toBe(false);
+    expect(b2.calls.some(s => s.includes(MODE('follow')))).toBe(false);
+    expect(b2.calls.filter(s => s.includes(MODE('session')))).toHaveLength(4);
+    expect(readInflight(w1.stateRoot, 'devin-cloud', digestOf(w1, PROMPT))?.attemptSession).toBe(SESSION);
+  });
+
   test('按下发送后脚本中断：先回会话列表核对受理，找到了就接管该会话', async () => {
     const w = world({ extra: gitOk });
     const b = devinBrowse({
@@ -1260,6 +1320,36 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(fake.st.events.filter(e => e.startsWith('send'))).toHaveLength(1);
       expect(readLaneState(w.commDir)?.devin?.seats).toMatchObject({ step: 'follow', cap: 'Free', used: 1, total: 2 });
       expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'merge')).toHaveLength(1);
+    });
+
+    test('续轮发送后页面停在另一个合法会话（同一轮标记块仍在）：受理回执核验地址，回 not_echoed 而不误报已受理（脚本真实执行，合成负例）', async () => {
+      const { devinFollowScript } = await import('../src/runner/cloud-lane/devin-web.ts');
+      const marker = 'SCK-abc123';
+      const msg = `[SCK-ROUND ${marker}]\n\n继续修复。\n\n收尾约定：本轮的最后一条答复以「[SCK-DONE ${marker}]」单独成行开头，随后是完整最终答复。`;
+      // 发送本身落在原会话；发送后把页面挪到另一个合法会话，并在那页也摆上本轮同标记的用户/Devin 块——
+      // 光看转录内容分不出这不是本轮轮询的会话，必须靠地址核验。
+      let fake: ReturnType<typeof fakeDevin>;
+      fake = fakeDevin({
+        seats: { used: 0, total: 2 },
+        sessions: {
+          [SESSION]: OLD_ROUND,
+          [OTHER]: { cap: 'Free', status: 'Devin is awaiting instructions', blocks: [
+            { role: 'user', text: msg },
+            { role: 'devin', text: `[SCK-DONE ${marker}]\n${PR9}` },
+          ] },
+        },
+        onSend: () => { fake.st.url = OTHER; },
+      });
+      const r = await fake.browse(devinFollowScript(SESSION, marker, msg));
+      expect(r).toMatchObject({ ok: false, code: 'not_echoed', url: OTHER });
+      expect(r?.done).toBeUndefined();
+      expect(fake.st.sent).toHaveLength(1);
+      expect(fake.st.sent[0]!.url).toBe(SESSION);
+
+      // 对照组：同样发送后仍停在原会话时，照常回 ok 与已受理（证明地址核验不是把所有续轮回执都拒掉）。
+      const okFake = fakeDevin({ seats: { used: 0, total: 2 }, sessions: { [SESSION]: OLD_ROUND }, onSend: answer(PR9) });
+      const r2 = await okFake.browse(devinFollowScript(SESSION, marker, msg));
+      expect(r2).toMatchObject({ ok: true, url: SESSION, echoed: true });
     });
 
     test('续轮席位满：首页读到 2/2 就不回原会话、不填写、不按下发送，有界等待后受阻', async () => {
