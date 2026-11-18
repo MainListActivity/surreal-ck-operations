@@ -1,21 +1,19 @@
 {
-  "version": "0.13.56",
-  "title": "本地 owner API 接通 Steward；云端 Mode 1 绿区代跑中继与自动脱困",
+  "version": "0.13.57",
+  "title": "负责人一次性事件恢复授权：窗口从首次真实尝试消费时开始",
   "changes": [
-    "本地 owner HTTP API 组装 ctx 时补传 c.steward，修复 sck owner message.draft 报「NodeSteward 需要执行端」。",
-    "NodeSteward 新增 STEWARD_RELAY_OPS_ALLOWLIST 与 assistLane：显式 [OPS-REQUEST] 白名单代跑，非白名单硬拦截；无显式请求时模型只许只读 tool_relay 或 escalate。",
-    "来源门禁：代跑只取已核验会话中本轮用户锚点之后的 Devin 作者块（agentTail）；旧轮、用户正文、工具输出、缺锚点一律不触发 ops。",
-    "权限门禁：sidecar 以真实租约阶段为准并拒绝不一致的 phase 参数；复核轮禁止写操作；写/建类只认显式 [OPS-REQUEST]，模型推断不得授权。",
-    "sidecar steward_lane_assist：校验 1..3 轮与租约，二次硬核白名单后经 opsCircuit 代跑；出站按工具字段投影，句柄/激活链接/凭证/日志原文与上游错误原文均不出站。",
-    "出站投影按工具与嵌套字段类型逐层筛选：services/accounts 等允许对象只保留安全子字段，未知嵌套字段、detail、账号整条记录与上游错误正文均丢弃；上游错误也不写进普通执行日志。",
-    "cloud-lane：devin-cloud 执行轮提示 OPS-REQUEST；blocked 时同会话回传（Free 档）；发送前落盘 attempt 与轮数，未确认时恢复只追踪不重发、不再代跑，3 轮硬熔断。"
+    "新增 owner 命令 fault.grant：对已耗尽的恢复预算按原 task|target|phase 与 incident 授权一次新窗口；授权只记决定，不清计数、不延长默认窗口。",
+    "窗口从员工的下一次真实恢复尝试消费授权时才开出；排队延迟超过旧窗口不影响新窗口时长；total_attempts 保留累计审计，只关闭本任务本事件的 episode。",
+    "同授权重放/同事件再请求/重启/并发只生效一次；租约已过不消费授权；未真实执行的预留退款归还授权；成功、修复链或手工重置作废未消费授权。",
+    "授权耗尽后同一事件不能再开窗，只能走修复链；员工与只读令牌经生命周期清单与网关拒绝；命令目录、审计摘要与权限守卫同步。",
+    "schema 074 新增 fault_recovery_grant 表（记录 id 即唯一键）；CLOUD_SCHEMA_VERSION=74；真实 fork 回归覆盖正反例。"
   ],
   "impact": [
-    "老板：本机 sck owner message.draft 可正常起草；云端 blocked 的绿区查询可自动脱困最多 3 轮。",
-    "员工：desktop relay 只提供本地代跑工具结果；ops_login 只证明本机代理会话已登录，不等于 Devin 云端获得远程登录能力或能完成 CK 登录验证。",
-    "运维：跨目录恢复保留 attempt 与已用轮数，零重发；上游错误只回错误码，细节留在本机日志。",
-    "限制：复核轮禁写；非白名单工具、提示词注入、切付费档、模型推断的写操作一律 escalate；第 4 次 blocked 硬熔断。"
+    "老板：对 IdP 等已修复但仍被 deadline_passed 挡住的原任务，可用 fault.grant 授权一次新窗口，无需换任务/账号/租约重开账。",
+    "员工：领取后的下一次真实尝试即消费授权；窗口内仍失败而耗尽时，同一事件不再授权。",
+    "运维：不改生产故障数据、不清预算、不提前重试登录；发布前由独立 QA 固定最终 SHA。",
+    "限制：同一事件只授权一次；授权不能解除 not_retryable 停止；故障未修复不会自动恢复。"
   ],
-  "migration": "无新增 schema：沿用 0.13.55 的 073（owner_style_memory）。升级并重启执行端，沿用既有 Magpie 凭证与 ops 配置。",
-  "rollback": "回退至 0.13.55；云端通道恢复为 blocked 即交老板，本地 message.draft 需执行端 steward 接线后的版本。回退前核对在途云端登记，旧版恢复可能再次发出代跑跟进。"
+  "migration": "新增 schema 074，由 migrator/bootstrap 幂等建立 SCHEMAFULL fault_recovery_grant 表及唯一键/任务索引，不改写既有 fault_budget/episode/repair 行。升级并重启执行端后生效。",
+  "rollback": "回退至 0.13.56，保留 fault_recovery_grant 表而不再使用；停止 fault.grant 命令。回退前若有 pending 授权，回退后不会被消费，需人工核对原任务预算状态。"
 }
