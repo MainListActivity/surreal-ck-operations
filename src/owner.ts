@@ -48,14 +48,83 @@ const briefDispatch = (verdicts: DispatchVerdict[]): BriefData['dispatchBlocked'
   return { total: list.bound.total, rows: list.items };
 };
 
+type DecideInput = { taskId: TaskId; decision: OwnerDecision; note: string; source: string; key: string; expectedVersion?: number };
+/** What a desk writes through. A bare owner-end session cannot rebuild itself, so only a CompanyDatabase offers `ensureConnected`. */
+export type DeskDatabase = Pick<CompanyDatabase, 'db'> & Partial<Pick<CompanyDatabase, 'ensureConnected'>>;
+
+/** The database's refusal for a session without an identity: its token ran out, its session ended, or it fell back to anonymous. */
+const SESSION_DENIED = /not enough permissions|anonymous access not allowed|session has expired|iam error/i;
+
+/**
+ * Failures a session without its identity produces: the rows it may not see read as absent (not_found), and its other reads and
+ * writes are refused with the database's IAM or expiry error. Only these are checked against the session; any other failure is
+ * reported as it is.
+ */
+const sessionRefusal = (error: unknown): boolean => error instanceof CompanyError
+  ? error.code === 'not_found' || error.code === 'temporarily_unavailable'
+  : error instanceof Error && SESSION_DENIED.test(error.message);
+
+/** The message keeps its code first: the owner API maps HTTP status by the text, and a retryable refusal must read as 409. */
+const SESSION_RETRY = 'temporarily_unavailable: owner session cannot read the database; retry shortly';
+/** A session that may read but not write sees its update as nothing. That is a permission failure, not a missing task. */
+const WRITE_REFUSED = 'forbidden: owner session may not write the task; the database refused the update';
+
+/** Rejects when the work does not settle in time, so a dead socket cannot hold an owner's reply. */
+const bounded = <T>(work: Promise<T>, ms: number): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('owner session probe timed out')), ms); });
+  return Promise.race([work, expired]).finally(() => clearTimeout(timer));
+};
+
+/**
+ * Whether this session can still run the probe the keepalive uses. A session that cannot has lost its identity (anonymous, or
+ * expired), and table permissions may then hide the task, so the caller must not report it as absent. A session that can is
+ * authenticated; its token role makes it a system user, which table permissions do not limit, so a row it cannot see is absent.
+ */
+const sessionReadable = async (database: DeskDatabase): Promise<boolean> => {
+  try {
+    await bounded(database.db.query('INFO FOR DB;'), 10_000);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Runs an owner operation that reads or writes a task through table permissions. A session without its identity sees the rows it may
+ * not read as absent, so a refusal counts as absence only while the session can still read the database. When it cannot, the connection
+ * is rebuilt (if this desk owns one) and the operation runs once more. Still unreadable is temporarily_unavailable (retryable), never
+ * "task not found". The operation must be safe to repeat after a refusal that wrote nothing.
+ */
+export async function withSessionCheck<T>(database: DeskDatabase, operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (!sessionRefusal(error) || await sessionReadable(database)) throw error;
+    // The session cannot read the database, so the task may only look missing. Rebuild the connection when this desk owns one,
+    // then try once more. A refused operation wrote nothing, and the idempotency key still guards a repeat.
+    await database.ensureConnected?.().catch(() => undefined);
+    try {
+      return await operation();
+    } catch (retry) {
+      if (!sessionRefusal(retry) || await sessionReadable(database)) throw retry;
+      throw new CompanyError('temporarily_unavailable', SESSION_RETRY, true);
+    }
+  }
+}
+
 export class OwnerDesk {
-  constructor(private readonly database: CompanyDatabase, private readonly opsRepo?: string) {
+  constructor(private readonly database: DeskDatabase, private readonly opsRepo?: string) {
   }
   private get db() { return this.database.db; }
 
 
   /** approve/reject an owner-reviewed gate, or reply to a task blocked to the owner. */
-  async decide(input: { taskId: TaskId; decision: OwnerDecision; note: string; source: string; key: string; expectedVersion?:number }): Promise<TaskView> {
+  async decide(input: DecideInput): Promise<TaskView> {
+    return withSessionCheck(this.database, () => this.decideOnce(input));
+  }
+
+  private async decideOnce(input: DecideInput): Promise<TaskView> {
     if (!['approve', 'reject', 'reply'].includes(input.decision)) throw new CompanyError('invalid', 'Invalid decision');
     requireText(input.note ?? '', 'note', input.decision === 'approve' ? 0 : 2, 20000);
     const idem = id('idempotency', HASH(`owner\0decide\0${input.key}`));
@@ -95,6 +164,7 @@ export class OwnerDesk {
         blocked_to = NONE, resume_role = NONE, resume_state = NONE, current_employee = NONE,
         delivery_id = NONE, lease_expires_at = NONE, version = $t.version + 1
         RETURN AFTER;
+      IF $next = NONE { THROW 'owner session cannot write the task' };
       CREATE audit CONTENT { task: $task, actor: $actor, action: 'owner_' + $decision, evidence: $evidence, version: $next.version, at: time::now() };
       IF $decision = 'approve' {
         FOR $e IN $human_evidence {
@@ -478,9 +548,12 @@ export class OwnerDesk {
     const responses = await this.db.query<unknown[]>(query, vars).responses();
     const failure = responses.find(r => !r.success && !r.error.message.includes('not executed due to') && !r.error.message.startsWith('Cannot COMMIT'));
     if (failure && !failure.success) {
-      const message = failure.error.message;
+      // THROW reaches the client as "An error occurred: <message>"; the message itself is ours.
+      const message = failure.error.message.replace(/^An error occurred: /, '');
       if (/not found/i.test(message)) throw new CompanyError('not_found', message);
-      if (/not awaiting|not waiting/i.test(message)) throw new CompanyError('conflict', message);
+      if (/not awaiting|not waiting|task version moved|dispatch outcome uncertain/i.test(message)) throw new CompanyError('conflict', message);
+      if (SESSION_DENIED.test(message)) throw new CompanyError('temporarily_unavailable', SESSION_RETRY, true);
+      if (/cannot write the task/i.test(message)) throw new CompanyError('forbidden', WRITE_REFUSED);
       throw new CompanyError('conflict', 'Owner operation conflicted; retry');
     }
     return responses.map(r => r.success ? r.result : undefined);
