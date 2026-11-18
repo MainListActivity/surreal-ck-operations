@@ -883,4 +883,117 @@ describe('deliverable_publish 工具', () => {
 
     expect(assists.length).toBeGreaterThanOrEqual(2);
   });
+  test('steward_lane_assist 门禁：阶段以真实租约为准，复核轮禁写，模型推断不得授权写操作', async () => {
+    const calls2: OpsCall[] = [];
+    const lane = (opts: { phase: 'doing' | 'review'; outcome: unknown }) => {
+      const c = {
+        ...core,
+        claim: async (_cred: string, taskId: string) => ({
+          ...claimResult(taskId),
+          task: { ...taskView(taskId), state: opts.phase === 'review' ? 'review' : 'doing' },
+        }),
+      };
+      return new SidecarPool({
+        core: c as never, workforce: workforce as never,
+        ops: {
+          tools: ['ops_info', 'ops_health', 'ops_account_ensure', 'ops_login', 'ops_workspace_ensure'] as const,
+          call: async (credential: string, taskId: string, tool: string, args: Record<string, unknown>) => {
+            calls2.push({ credential, taskId, tool, args });
+            if (tool === 'ops_login') return {
+              ok: true, alias: 'QA1', username: 'qa1', loggedIn: true,
+              sessionHandle: 'sess_handle_hidden', token: 'sk-ant-fixture-secret',
+              activationUrl: 'https://idp.example/activate?token=abc',
+            };
+            if (tool === 'ops_health') throw Object.assign(new Error(`upstream boom ${'sk-ant-fixture-secret'}`), { code: 'upstream_error' });
+            return { ok: true, tool };
+          },
+          release: () => {},
+        },
+        runDir, heartbeatMs: 10_000, sweepMs: 20, log: () => {},
+        laneAssist: async () => opts.outcome as never,
+      });
+    };
+    const relayAs = async (pool2: SidecarPool, name: string, args: Record<string, unknown>) => {
+      const env2 = pool2.env(inst(`gate-${name}`));
+      await pool2.claim(inst(`gate-${name}`), task(`task-${name}`));
+      return relay(env2.SCK_COMM_DIR, env2.SCK_COMM_KEY!, name, 'steward_lane_assist', args);
+    };
+
+    // 1) 调用方 phase 与真实租约不一致：拒绝（不能借参数扩大权限）
+    const spoofer = lane({ phase: 'doing', outcome: { kind: 'reply', message: 'x' } });
+    const spoof = await relayAs(spoofer, 'spoof', { provider: 'devin-cloud', phase: 'review', transcriptTail: 'x', round: 1 });
+    expect(spoof.ok).toBe(false);
+    expect(spoof.error).toMatch(/phase/);
+    spoofer.close();
+
+    // 2) review 租约 + 显式写请求：仍拒绝，ops 不被调用
+    for (const tool of ['ops_account_ensure', 'ops_login', 'ops_workspace_ensure']) {
+      const reviewPool = lane({ phase: 'review', outcome: { kind: 'tool_relay', tool, args: { alias: 'QA1' }, explicit: true } });
+      const denied = await relayAs(reviewPool, `review-${tool}`, { provider: 'devin-cloud', phase: 'review', transcriptTail: 'x', round: 1 });
+      expect(denied.ok).toBe(true);
+      expect(denied.data).toMatchObject({ decision: 'escalate' });
+      expect(calls2.filter(c => c.tool === tool)).toHaveLength(0);
+      reviewPool.close();
+    }
+
+    // 3) review 租约 + 只读：允许
+    const reviewRead = lane({ phase: 'review', outcome: { kind: 'tool_relay', tool: 'ops_info', args: {}, explicit: true } });
+    const readOk = await relayAs(reviewRead, 'review-read', { provider: 'devin-cloud', phase: 'review', transcriptTail: 'x', round: 1 });
+    expect(readOk.ok).toBe(true);
+    expect(readOk.data).toMatchObject({ decision: 'reply', toolExecuted: 'ops_info' });
+    reviewRead.close();
+
+    // 4) doing 租约：模型推断（无 explicit）的写操作拒绝；显式写请求允许
+    const inferred = lane({ phase: 'doing', outcome: { kind: 'tool_relay', tool: 'ops_account_ensure', args: { alias: 'QA1' } } });
+    const inferredOut = await relayAs(inferred, 'inferred-write', { provider: 'devin-cloud', phase: 'doing', transcriptTail: 'x', round: 1 });
+    expect(inferredOut.data).toMatchObject({ decision: 'escalate' });
+    expect(calls2.filter(c => c.tool === 'ops_account_ensure')).toHaveLength(0);
+    inferred.close();
+
+    const explicit = lane({ phase: 'doing', outcome: { kind: 'tool_relay', tool: 'ops_account_ensure', args: { alias: 'QA1' }, explicit: true } });
+    const explicitOut = await relayAs(explicit, 'explicit-write', { provider: 'devin-cloud', phase: 'doing', transcriptTail: 'x', round: 1 });
+    expect(explicitOut.data).toMatchObject({ decision: 'reply', toolExecuted: 'ops_account_ensure' });
+    explicit.close();
+  });
+
+  test('steward_lane_assist 门禁：出站按字段投影，句柄/激活链接/凭证/上游错误原文不出站', async () => {
+    const secrets = ['sk-ant-fixture-secret', 'sess_handle_hidden', 'activate?token'];
+    const project = new SidecarPool({
+      core: { ...core, claim: async (_c: string, taskId: string) => claimResult(taskId) } as never,
+      workforce: workforce as never,
+      ops: {
+        tools: ['ops_login', 'ops_health'] as const,
+        call: async (_credential: string, _taskId: string, tool: string) => {
+          if (tool === 'ops_login') return { ok: true, alias: 'QA1', username: 'qa1', loggedIn: true,
+            sessionHandle: 'sess_handle_hidden', token: 'sk-ant-fixture-secret', activationUrl: 'https://idp.example/activate?token=abc' };
+          throw Object.assign(new Error('upstream boom sk-ant-fixture-secret'), { code: 'upstream_error' });
+        },
+        release: () => {},
+      },
+      runDir, heartbeatMs: 10_000, sweepMs: 20, log: () => {},
+      laneAssist: async input => String(input.transcriptTail).includes('login')
+        ? { kind: 'tool_relay', tool: 'ops_login', args: { alias: 'QA1' }, explicit: true }
+        : { kind: 'tool_relay', tool: 'ops_health', args: {}, explicit: true },
+    });
+    const loginEnv = project.env(inst('proj-login'));
+    await project.claim(inst('proj-login'), task('task-proj-login'));
+    const login = await relay(loginEnv.SCK_COMM_DIR, loginEnv.SCK_COMM_KEY!, 'p1', 'steward_lane_assist',
+      { provider: 'devin-cloud', phase: 'doing', transcriptTail: 'login please', round: 1 });
+    const message = String((login.data as { message?: string }).message);
+    expect(message).toContain('qa1');
+    for (const secret of secrets) expect(message).not.toContain(secret);
+    expect(message).toContain('localRelay');
+    expect(message).toContain('不代表云端会话获得远程登录能力');
+
+    const healthEnv = project.env(inst('proj-health'));
+    await project.claim(inst('proj-health'), task('task-proj-health'));
+    const failed = await relay(healthEnv.SCK_COMM_DIR, healthEnv.SCK_COMM_KEY!, 'p2', 'steward_lane_assist',
+      { provider: 'devin-cloud', phase: 'doing', transcriptTail: 'health', round: 1 });
+    expect(failed.data).toMatchObject({ decision: 'escalate' });
+    const reason = String((failed.data as { reason?: string }).reason);
+    expect(reason).toContain('upstream_error');
+    expect(reason).not.toContain('upstream boom');
+    expect(reason).not.toContain('sk-ant-fixture-secret');
+    project.close();
+  });
 });

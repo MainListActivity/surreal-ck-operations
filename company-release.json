@@ -3,17 +3,18 @@
   "title": "本地 owner API 接通 Steward；云端 Mode 1 绿区代跑中继与自动脱困",
   "changes": [
     "本地 owner HTTP API 组装 ctx 时补传 c.steward，修复 sck owner message.draft 报「NodeSteward 需要执行端」。",
-    "NodeSteward 新增 STEWARD_RELAY_OPS_ALLOWLIST 与 assistLane：显式 [OPS-REQUEST] 白名单代跑，非白名单硬拦截；无显式请求时模型只许绿区 tool_relay/reply 或 escalate。",
-    "sidecar 新增 steward_lane_assist：校验租约与 1..3 轮，二次硬核白名单后经 opsCircuit 代跑，输出脱敏截断；无租约拒绝。",
-    "cloud-lane：devin-cloud 执行轮提示 OPS-REQUEST；blocked 时经 assist 回传同一 sessionUrl（Free 档），assistRounds 达 3 硬熔断转老板裁决。",
-    "main.ts 在配置了 SCK_COMM_DIR 与 SCK_COMM_KEY 时经 comm 发起 steward_lane_assist，带超时，不触碰 private/。"
+    "NodeSteward 新增 STEWARD_RELAY_OPS_ALLOWLIST 与 assistLane：显式 [OPS-REQUEST] 白名单代跑，非白名单硬拦截；无显式请求时模型只许只读 tool_relay 或 escalate。",
+    "来源门禁：代跑只取已核验会话中本轮用户锚点之后的 Devin 作者块（agentTail）；旧轮、用户正文、工具输出、缺锚点一律不触发 ops。",
+    "权限门禁：sidecar 以真实租约阶段为准并拒绝不一致的 phase 参数；复核轮禁止写操作；写/建类只认显式 [OPS-REQUEST]，模型推断不得授权。",
+    "sidecar steward_lane_assist：校验 1..3 轮与租约，二次硬核白名单后经 opsCircuit 代跑；出站按工具字段投影，句柄/激活链接/凭证/日志原文与上游错误原文均不出站。",
+    "cloud-lane：devin-cloud 执行轮提示 OPS-REQUEST；blocked 时同会话回传（Free 档）；发送前落盘 attempt 与轮数，未确认时恢复只追踪不重发、不再代跑，3 轮硬熔断。"
   ],
   "impact": [
-    "老板：本机 sck owner message.draft 可正常起草。",
-    "员工：devin-cloud 在绿区健康度/日志/测试账号查询上可自动脱困最多 3 轮，越权与付费档请求仍交老板。",
-    "运维：代跑只走白名单只读/幂等 ops，结果脱敏截断；协助失败安全降级。",
-    "限制：非白名单工具、提示词注入、切付费档一律 escalate；第 4 次 blocked 硬熔断。"
+    "老板：本机 sck owner message.draft 可正常起草；云端 blocked 的绿区查询可自动脱困最多 3 轮。",
+    "员工：desktop relay 只提供本地代跑工具结果；ops_login 只证明本机代理会话已登录，不等于 Devin 云端获得远程登录能力或能完成 CK 登录验证。",
+    "运维：跨目录恢复保留 attempt 与已用轮数，零重发；上游错误只回错误码，细节留在本机日志。",
+    "限制：复核轮禁写；非白名单工具、提示词注入、切付费档、模型推断的写操作一律 escalate；第 4 次 blocked 硬熔断。"
   ],
-  "migration": "升级并重启执行端即可；无 schema 变更。沿用既有 Magpie 凭证与 ops 配置。",
-  "rollback": "回退至 0.13.55；云端通道恢复为 blocked 即交老板，本地 message.draft 需执行端 steward 接线后的版本。"
+  "migration": "无新增 schema：沿用 0.13.55 的 073（owner_style_memory）。升级并重启执行端，沿用既有 Magpie 凭证与 ops 配置。",
+  "rollback": "回退至 0.13.55；云端通道恢复为 blocked 即交老板，本地 message.draft 需执行端 steward 接线后的版本。回退前核对在途云端登记，旧版恢复可能再次发出代跑跟进。"
 }

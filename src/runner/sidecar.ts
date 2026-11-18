@@ -25,7 +25,7 @@ import type { EmployeeInst, SupervisedTask, Workforce } from "../workforce.ts";
 import { guardRelayResponse } from "../response-budget.ts";
 import { isPaged, parseReclaimInput, parseWorktreeInput, taskIdOf } from "../query-input.ts";
 import { arriving, SNAPSHOT_TOOLS, withinReplyCeiling } from "../reply-clock.ts";
-import { STEWARD_RELAY_OPS_ALLOWLIST, type StewardAssistOutcome } from "../steward/steward.ts";
+import { STEWARD_RELAY_OPS_ALLOWLIST, STEWARD_RELAY_WRITE_OPS, stewardRelayOutbound, type StewardAssistOutcome } from "../steward/steward.ts";
 import { clip, redactSecrets } from "../ops/redact.ts";
 
 /** The release the node updater made live (the `current` symlink to plugin-releases/<sha>/plugin); undefined when it cannot be read. */
@@ -1522,7 +1522,9 @@ export class SidecarPool {
         });
       });
       case "steward_lane_assist": {
+        // 阶段以真实租约为准：调用方提供的 phase 只能与租约一致，不能借参数扩大权限。
         const claim = live();
+        const phase = claim.phase;
         const round = args.round;
         if (!Number.isInteger(round) || (round as number) < 1 || (round as number) > 3) {
           return { decision: 'escalate', reason: '已达云端自动协助上限（3 轮），转交老板裁决' };
@@ -1530,8 +1532,8 @@ export class SidecarPool {
         if (typeof args.provider !== 'string' || !args.provider.trim()) {
           throw Object.assign(new Error('steward_lane_assist 需要 provider'), { code: 'invalid' });
         }
-        if (args.phase !== 'doing' && args.phase !== 'review') {
-          throw Object.assign(new Error('steward_lane_assist 的 phase 必须是 doing 或 review'), { code: 'invalid' });
+        if (args.phase !== undefined && args.phase !== phase) {
+          throw Object.assign(new Error('steward_lane_assist 的 phase 与真实租约阶段不一致'), { code: 'invalid' });
         }
         if (typeof args.transcriptTail !== 'string') {
           throw Object.assign(new Error('steward_lane_assist 需要 transcriptTail'), { code: 'invalid' });
@@ -1542,7 +1544,7 @@ export class SidecarPool {
           taskId: claim.taskId,
           taskSummary: args.taskSummary,
           provider: args.provider.trim(),
-          phase: args.phase,
+          phase,
           transcriptTail: args.transcriptTail,
           round: round as number,
         });
@@ -1551,6 +1553,13 @@ export class SidecarPool {
           if (!(STEWARD_RELAY_OPS_ALLOWLIST as readonly string[]).includes(relayTool)
             || !ops?.tools.includes(relayTool)) {
             return { decision: 'escalate', reason: `工具 ${relayTool} 不在代跑白名单或本机未启用，转交老板裁决` };
+          }
+          // 复核轮禁止写入；写/建类只认本轮显式 [OPS-REQUEST]，模型推断不得授权。
+          if (phase !== 'doing' && (STEWARD_RELAY_WRITE_OPS as readonly string[]).includes(relayTool)) {
+            return { decision: 'escalate', reason: `复核轮禁止写操作：${relayTool} 转交老板裁决` };
+          }
+          if ((STEWARD_RELAY_WRITE_OPS as readonly string[]).includes(relayTool) && outcome.explicit !== true) {
+            return { decision: 'escalate', reason: `写操作 ${relayTool} 缺少本轮显式 [OPS-REQUEST]，转交老板裁决` };
           }
           const { taskId: _drop, ...cleanArgs } = outcome.args;
           try {
@@ -1562,10 +1571,14 @@ export class SidecarPool {
                 text, idempotencyKey: `ops-circuit:${claim.proof.deliveryId}:${relayTool}`,
               }), true),
             });
-            const message = clip(String(redactSecrets(typeof raw === 'string' ? raw : JSON.stringify(raw))), 4000);
+            const projected = stewardRelayOutbound(relayTool, raw);
+            const message = clip(JSON.stringify(redactSecrets(projected)), 4000);
             return { decision: 'reply', toolExecuted: relayTool, message };
           } catch (error) {
-            return { decision: 'escalate', reason: `代跑 ${relayTool} 失败：${(error as Error).message}`.slice(0, 500) };
+            // 上游错误原文不出站：只回错误码，细节留在本机日志。
+            const code = (error as { code?: unknown })?.code;
+            this.log(`steward lane relay ${relayTool} failed: ${(error as Error).message}`);
+            return { decision: 'escalate', reason: `代跑 ${relayTool} 失败（${typeof code === 'string' ? code : 'error'}），本地已记录，转交老板裁决` };
           }
         }
         if (outcome.kind === 'reply') {

@@ -185,14 +185,14 @@ test('assistLane 显式 OPS-REQUEST 白名单确定性代跑；非白名单硬�
     provider: 'devin-cloud', phase: 'doing', round: 1,
     transcriptTail: '先查一下\n[OPS-REQUEST] {"tool":"ops_health","args":{"env":"staging"}}\n等结果',
   });
-  expect(ok).toEqual({ kind: 'tool_relay', tool: 'ops_health', args: { env: 'staging' } });
+  expect(ok).toMatchObject({ kind: 'tool_relay', tool: 'ops_health', args: { env: 'staging' }, explicit: true });
   expect(m.requests).toHaveLength(0);
 
   const lastWins = await m.steward.assistLane({
     provider: 'devin-cloud', phase: 'doing', round: 1,
     transcriptTail: '[OPS-REQUEST] {"tool":"ops_info","args":{}}\n[OPS-REQUEST] {"tool":"ops_login","args":{"alias":"QA1"}}',
   });
-  expect(lastWins).toEqual({ kind: 'tool_relay', tool: 'ops_login', args: { alias: 'QA1' } });
+  expect(lastWins).toMatchObject({ kind: 'tool_relay', tool: 'ops_login', args: { alias: 'QA1' }, explicit: true });
 
   for (const tool of ['ops_d1_exec', 'company_cmd', 'ops_magpie_list', 'ops_supplier_run', 'ops_idp_principal_list']) {
     const denied = await m.steward.assistLane({
@@ -251,4 +251,56 @@ test('STEWARD_RELAY_OPS_ALLOWLIST 覆盖绿区八项且不含写/敏感工具', 
   for (const denied of ['ops_d1_exec', 'company_cmd', 'ops_supplier_run', 'ops_magpie_list', 'ops_idp_client_claims_delete']) {
     expect(STEWARD_RELAY_OPS_ALLOWLIST.includes(denied as never)).toBe(false);
   }
+});
+
+test('门禁：复核轮显式写请求也拒绝；模型推断的写操作一律拒绝，只读仍可', async () => {
+  const m = model('{}');
+  for (const tool of ['ops_account_ensure', 'ops_login', 'ops_workspace_ensure']) {
+    const out = await m.steward.assistLane({
+      provider: 'devin-cloud', phase: 'review', round: 1,
+      transcriptTail: `[OPS-REQUEST] {"tool":"${tool}","args":{"alias":"QA1"}}`,
+    });
+    expect(out.kind).toBe('escalate');
+    expect((out as { reason: string }).reason).toContain('复核轮禁止写操作');
+  }
+  // doing 轮的显式写请求仍按白名单代跑（由 sidecar 再核真实租约阶段）
+  const doing = await m.steward.assistLane({
+    provider: 'devin-cloud', phase: 'doing', round: 1,
+    transcriptTail: '[OPS-REQUEST] {"tool":"ops_account_ensure","args":{"alias":"QA1"}}',
+  });
+  expect(doing).toMatchObject({ kind: 'tool_relay', tool: 'ops_account_ensure', explicit: true });
+
+  // 模型推断只可授权只读；推断写/建 → 拒绝
+  for (const tool of ['ops_account_ensure', 'ops_workspace_ensure', 'ops_login']) {
+    const inferred = await model(JSON.stringify({ kind: 'tool_relay', tool, args: { alias: 'QA1' } })).steward.assistLane({
+      provider: 'devin-cloud', phase: 'doing', round: 1, transcriptTail: '请帮忙处理测试账号',
+    });
+    expect(inferred.kind).toBe('escalate');
+  }
+  const read = await model(JSON.stringify({ kind: 'tool_relay', tool: 'ops_origin_logs', args: { service: 'api' } }))
+    .steward.assistLane({ provider: 'devin-cloud', phase: 'review', round: 1, transcriptTail: '查一下日志' });
+  expect(read).toMatchObject({ kind: 'tool_relay', tool: 'ops_origin_logs' });
+  expect((read as { explicit?: boolean }).explicit).not.toBe(true);
+});
+
+test('门禁：出站字段按工具投影，激活链接/会话句柄/凭证/日志原文不出站', async () => {
+  const { stewardRelayOutbound } = await import('../src/steward/steward.ts');
+  const login = stewardRelayOutbound('ops_login', {
+    ok: true, alias: 'QA1', username: 'qa1', loggedIn: true,
+    sessionHandle: 'sess_7f3a-hidden', token: 'sk-ant-fixture-secret', activationUrl: 'https://idp.example/activate?token=abc',
+    cookies: 'session=abc', note: 'https://app.devin.ai/sessions/abc',
+  });
+  const text = JSON.stringify(login);
+  expect(text).toContain('qa1');
+  expect(text).not.toContain('sess_7f3a');
+  expect(text).not.toContain('sk-ant');
+  expect(text).not.toContain('activate?token');
+  expect(text).not.toContain('session=abc');
+  const logs = stewardRelayOutbound('ops_origin_logs', {
+    service: 'api', matched: 3, lines: ['customer alice@example.com login'], tail: 'raw customer data',
+  });
+  const logText = JSON.stringify(logs);
+  expect(logText).toContain('"matched":3');
+  expect(logText).not.toContain('alice@example.com');
+  expect(logText).not.toContain('raw customer data');
 });
