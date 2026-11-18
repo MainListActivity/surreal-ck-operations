@@ -79,6 +79,7 @@ export function createOwnerApiFetch(opts: OwnerHttpOptions): (req: Request) => P
         workforce: c.workforce ?? new Workforce(c.db),
         messages: new OutboundMessageStore(c.db.db),
         opsRepo: opts.opsRepo ?? c.opsRepo,
+        steward: c.steward,
       };
       const result = await ownerApi(ctx, body, via);
       return json(result);

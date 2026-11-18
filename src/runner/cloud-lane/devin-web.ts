@@ -223,6 +223,10 @@ const read = () => p.evaluate(async () => {
   const lastAt = (re) => { let idx = -1, m; const g = new RegExp(re.source, 'gi'); while ((m = g.exec(region))) idx = m.index; return idx; };
   const hits = [['working', lastAt(/Devin is working/)], ['blocked', lastAt(/blocked on the user/)], ['idle', lastAt(/Devin is awaiting instructions|Devin chose to stop working/)]]
     .filter(h => h[1] >= 0).sort((a, b) => b[1] - a[1]);
+  // 只把「本轮用户锚点之后的 Devin 作者块」作为可代跑来源：旧轮、用户正文、工具输出与无锚点时一律为空。
+  const agentTail = roundStart >= 0
+    ? blocks.slice(roundStart + 1).filter(b => b.author === 'devin').map(b => b.text).join('\\n\\n')
+    : '';
   const seats = (body.match(/(\\d+)\\s*\\/\\s*(\\d+)\\s*in use/i) || []).slice(1, 3).map(Number);
   return {
     url: location.href,
@@ -234,7 +238,8 @@ const read = () => p.evaluate(async () => {
     seats: seats.length === 2 ? { used: seats[0], total: seats[1] } : null,
     // 没有作者块就无法可靠区分谁说了什么：标记可见性照报，但终稿保持 null，绝不拿整段 main 文本冒充助手回答。
     source: blocks.length ? 'roles' : 'text-only',
-    markerSeen: roundStart >= 0 || (blocks.length === 0 && mainText.includes(TASK)),
+    markerSeen: roundStart >= 0,
+    agentTail: agentTail.slice(-4000),
     convSeen: roundStart >= 0 ? blocks[roundStart].text.includes(QUOTED) : at >= 0,
     status: hits.length ? hits[0][0] : 'unknown',
     done,
@@ -376,7 +381,7 @@ const s = await read();
 if (s.login) { emit({ ok: false, code: 'login_required' }); process.exit(0); }
 if (!ready) { emit({ ok: false, code: 'not_ready' }); process.exit(0); }
 if (!sameSession(s.url, TARGET_URL)) { emit({ ok: false, code: 'wrong_session', url: s.url }); process.exit(0); }
-emit({ ok: true, url: s.url, cap: s.cap, seats: s.seats, source: s.source, markerSeen: s.markerSeen, convSeen: s.convSeen, status: s.status, done: s.done, tail: s.tail });
+emit({ ok: true, url: s.url, cap: s.cap, seats: s.seats, source: s.source, markerSeen: s.markerSeen, convSeen: s.convSeen, status: s.status, done: s.done, tail: s.tail, agentTail: s.agentTail });
 `, marker);
 }
 

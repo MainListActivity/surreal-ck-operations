@@ -255,14 +255,16 @@ export function company(): Promise<Company> {
       };
     }
     const steward = new NodeSteward();
+    const taskSummaryOf = async (taskId: string) => {
+      const { RecordId } = await import('surrealdb');
+      const [rows] = await db.db.query<[unknown[]]>(
+        'SELECT title, requirement, resources, acceptance_text FROM $task;', { task: new RecordId('task', taskId) });
+      return rows?.[0];
+    };
     const sidecar = new SidecarPool({
-      verdictResolver: createStewardVerdictResolver({
-        taskSummary: async taskId => {
-          const { RecordId } = await import('surrealdb');
-          const [rows] = await db.db.query<[unknown[]]>(
-            'SELECT title, requirement, resources, acceptance_text FROM $task;', { task: new RecordId('task', taskId) });
-          return rows?.[0];
-        },
+      verdictResolver: createStewardVerdictResolver({ taskSummary: taskSummaryOf }),
+      laneAssist: async input => steward.assistLane({
+        ...input, taskSummary: input.taskSummary ?? await taskSummaryOf(input.taskId),
       }),
       briefStaged: async (employee, claim) => {
         const { RecordId } = await import('surrealdb');
