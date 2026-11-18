@@ -103,6 +103,8 @@ export function company(): Promise<Company> {
     const { ProjectStore, loadSecretKey } = await import("../projects.ts");
     const { CompanyProofStore } = await import("../ops/proof-store.ts");
     const { OpsBroker } = await import("../ops/broker.ts");
+    const { hostIO } = await import("../host-io.ts");
+    const { githubRepoSlug } = await import("../external-actions.ts");
     const { egoBrowserSpaceCloser } = await import("../ops/browser.ts");
     const { SidecarPool } = await import("./sidecar.ts");
     const { MediaStudio } = await import("../media/elevenlabs.ts");
@@ -173,6 +175,17 @@ export function company(): Promise<Company> {
     // reach them through the sidecar relay as named, audited, lease-gated operations.
     const ops = new OpsBroker({
       core, projects: new ProjectStore(db.db), secretKey: loadSecretKey, proofStore: new CompanyProofStore(db.db),
+      // M3 release diagnosis reads the task project's own repository binding, never a caller-named repo.
+      projectRepoSlug: async (project: string) => {
+        const view = await new ProjectStore(db.db).get(project).catch(() => undefined);
+        if (!view?.repoPath) return undefined;
+        try {
+          const remote = await hostIO().proc.run('git', ['-C', view.repoPath, 'config', '--get', 'remote.origin.url'], {
+            timeoutMs: 10_000, maxBytes: 4_000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+          });
+          return remote.code === 0 ? githubRepoSlug(remote.stdout.trim()) : undefined;
+        } catch { return undefined; }
+      },
       // SYS05: lease-end cleanup bounded-closes the spaces this broker injected, and never a
       // user-owned space. Without this wiring every space was only counted as pending.
       closeBrowserSpace: egoBrowserSpaceCloser,

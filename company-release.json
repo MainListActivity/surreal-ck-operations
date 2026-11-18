@@ -1,19 +1,19 @@
 {
-  "version": "0.13.57",
-  "title": "负责人一次性事件恢复授权：窗口从首次真实尝试消费时开始",
+  "version": "0.13.58",
+  "title": "只读发布诊断：CK 检查/部署分步、公开运行版本与源站证据",
   "changes": [
-    "新增 owner 命令 fault.grant：对已耗尽的恢复预算按原 task|target|phase 与 incident 授权一次新窗口；授权只记决定，不清计数、不延长默认窗口。",
-    "窗口从员工的下一次真实恢复尝试消费授权时才开出；排队延迟超过旧窗口不影响新窗口时长；total_attempts 保留累计审计，只关闭本任务本事件的 episode。",
-    "同授权重放/同事件再请求/重启/并发只生效一次；租约已过不消费授权；未真实执行的预留退款归还授权；成功、修复链或手工重置作废未消费授权。",
-    "授权耗尽后同一事件不能再开窗，只能走修复链；员工与只读令牌经生命周期清单与网关拒绝；命令目录、审计摘要与权限守卫同步。",
-    "schema 074 新增 fault_recovery_grant 表（记录 id 即唯一键）；CLOUD_SCHEMA_VERSION=74；真实 fork 回归覆盖正反例。"
+    "新增只读 ops_release_diagnose：按任务项目的仓库与完整 40 位 SHA 聚合 GitHub Actions 运行、每次尝试、作业与步骤结论，并读取公开 runtime-version.json。",
+    "复用既有受限源站 status/health 边界，只返回服务与探针状态；不读日志正文、不读用户资料、不触发重跑、部署、重启或回滚。",
+    "绝不把 workflow success 或阶段 skipped 当部署成功：只有公开运行版本指向同一 SHA 与该部署运行的对应尝试，且全部部署阶段 success 才标 verified。",
+    "公开运行版本读不到或指向别的提交时明确 unknown/not_deployed；源站状态只证明存活，不证明运行版本，始终保持 unknown。",
+    "仓库与公开源站来自任务项目与环境授权配置；调用方传入 repo、URL、host、命令、凭证等参数会在任何读取前被拒绝。",
+    "输出状态、完整 SHA、失败阶段/步骤与时间、可复核运行/作业/公开版本链接，并明确 rootCause=not_inferred、logsRead=false。"
   ],
   "impact": [
-    "老板：对 IdP 等已修复但仍被 deadline_passed 挡住的原任务，可用 fault.grant 授权一次新窗口，无需换任务/账号/租约重开账。",
-    "员工：领取后的下一次真实尝试即消费授权；窗口内仍失败而耗尽时，同一事件不再授权。",
-    "运维：不改生产故障数据、不清预算、不提前重试登录；发布前由独立 QA 固定最终 SHA。",
-    "限制：同一事件只授权一次；授权不能解除 not_retryable 停止；故障未修复不会自动恢复。"
+    "员工与 QA：不持凭证、不读日志即可定位发布卡点，并能逐条复核运行与阶段结论。",
+    "老板：发布结论只认公开运行版本与部署阶段的对应关系；源站版本未知时如实标 unknown。",
+    "限制：任务必须属于已绑定代码仓库的项目环境；当前只识别 CK 的公开 runtime-version.json 路径。"
   ],
-  "migration": "新增 schema 074，由 migrator/bootstrap 幂等建立 SCHEMAFULL fault_recovery_grant 表及唯一键/任务索引，不改写既有 fault_budget/episode/repair 行。升级并重启执行端后生效。",
-  "rollback": "回退至 0.13.56，保留 fault_recovery_grant 表而不再使用；停止 fault.grant 命令。回退前若有 pending 授权，回退后不会被消费，需人工核对原任务预算状态。"
+  "migration": "无 schema 变更，沿用 schema 074（0.13.57 的 fault_recovery_grant）；升级并重启执行端插件即可。项目仓库由 project.repo_path 的 origin 远程解析，公开地址取环境的 url。",
+  "rollback": "回退至 0.13.57；工具随版本消失，无数据迁移。"
 }
