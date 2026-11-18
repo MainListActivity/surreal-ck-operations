@@ -5,12 +5,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runLane, taskMaterial, validateLanes, vendorPrompt, type LaneDeps, type LaneInput } from '../src/runner/cloud-lane/lane.ts';
 import { laneExecFile } from '../src/runner/cloud-lane/exec.ts';
-import { laneDigest, readInflight, readLaneState, writeLaneState } from '../src/runner/cloud-lane/state.ts';
+import { laneDigest, readInflight, readLaneState, writeInflight, writeLaneState } from '../src/runner/cloud-lane/state.ts';
 import { julesUsageCount, julesUsageEntry, whamToUsageEntry } from '../src/runner/cloud-lane/quota.ts';
 import { recordJulesUsage } from '../src/runner/cloud-lane/jules.ts';
 import type { ExecResult } from '../src/runner/cloud-lane/repo.ts';
 import { egoBrowse } from '../src/runner/grok-bot/main.ts';
 import { DEVIN_HOME } from '../src/runner/cloud-lane/devin-web.ts';
+import { parseNativeResult } from '../src/runner/native.ts';
 
 type Call = { cmd: string; args: string[]; cwd?: string };
 type Route = (call: Call) => ExecResult | undefined;
@@ -23,7 +24,7 @@ afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, for
 
 function world(opts: { task?: string; prompt?: string; git?: Route; extra?: Route;
     /** 默认把 cwd 当任务工作树写进 claim.json（分支 sck/task-1）；'none' 不写，对象自定义。 */
-    claim?: 'none' | { worktreePath: string; branch: string } } = {}) {
+    claim?: 'none' | { worktreePath: string; branch: string; deliveryId?: string } } = {}) {
   const commDir = mkdtempSync(join(tmpdir(), 'sck-lane-comm-'));
   const cwd = mkdtempSync(join(tmpdir(), 'sck-lane-wt-'));
   const stateRoot = mkdtempSync(join(tmpdir(), 'sck-lane-state-'));
@@ -31,8 +32,9 @@ function world(opts: { task?: string; prompt?: string; git?: Route; extra?: Rout
   writeFileSync(join(commDir, 'task.md'), opts.task ?? '# 云端任务\n\n实现需求甲。\n');
   if (opts.claim !== 'none') {
     const wt = opts.claim ?? { worktreePath: cwd, branch: 'sck/task-1' };
+    const worktreePath = wt.worktreePath || cwd;
     // task.id 与真实 claim.json 一样：同一公司任务换员工目录时靠它认出同一任务（换摘要重派）。
-    writeFileSync(join(commDir, 'claim.json'), JSON.stringify({ task: { id: 'task-1' }, worktree: { worktreePath: wt.worktreePath, branch: wt.branch, intent: { kind: 'code' }, mode: 'exclusive' } }));
+    writeFileSync(join(commDir, 'claim.json'), JSON.stringify({ task: { id: 'task-1' }, ...(wt.deliveryId ? { deliveryId: wt.deliveryId } : {}), worktree: { worktreePath, branch: wt.branch, intent: { kind: 'code' }, mode: 'exclusive' } }));
   }
   const calls: Call[] = [];
   const progress: string[] = [];
@@ -289,6 +291,68 @@ describe('codex-cloud 状态判定与在途登记', () => {
     expect(w2.callsOf(c => c.args[0] === 'cloud' && c.args[1] === 'exec')).toHaveLength(1);
   });
 
+  test('同一投递键下正文重排：仍恢复在途云会话，不重复提交', async () => {
+    const w = world({ claim: { worktreePath: '', branch: 'sck/task-1', deliveryId: 'delivery-stable-1' },
+      extra: call => {
+        const [a, b] = call.args;
+        if (call.cmd === 'codex' && a === 'cloud' && b === 'status') return ok('[READY] t\nenv  •  now\nno diff\n');
+        if (call.cmd === 'codex' && a === 'cloud' && b === 'diff') return ok('');
+        if (call.cmd === 'codex' && a === 'cloud' && b === 'exec') return ok('https://chatgpt.com/codex/tasks/task_b_unexpected\n');
+        return undefined;
+      }});
+    // 上一轮落下的本目录状态：同一投递、旧摘要，在途任务还在。
+    writeLaneState(w.commDir, { sessionId: 'lane-stable', taskId: 'task_b_prev',
+      taskUrl: 'https://chatgpt.com/codex/tasks/task_b_prev', digest: 'digest-of-old-wording',
+      delivery: 'delivery-stable-1', branch: 'sck/task-1', submittedAt: Date.now() });
+    const out = await runLane(w.input({ prompt: '重排过的措辞：仍然完成同一件事。' }), w.deps);
+    expect(out.status).toBe('success');
+    expect(w.callsOf(c => c.cmd === 'codex' && c.args[1] === 'exec')).toHaveLength(0);
+    expect(w.callsOf(c => c.cmd === 'codex' && c.args[1] === 'status')).toHaveLength(1);
+    expect(out.sessionId).toBe('lane-stable');
+  });
+
+  test('同一投递键跨员工目录：只按共享登记恢复，不另建提交', async () => {
+    const w1 = world();
+    const w2 = world({ claim: { worktreePath: '', branch: 'sck/task-1', deliveryId: 'delivery-stable-2' },
+      extra: call => {
+        const [a, b] = call.args;
+        if (call.cmd === 'codex' && a === 'cloud' && b === 'status') return ok('[READY] t\nenv  •  now\nno diff\n');
+        if (call.cmd === 'codex' && a === 'cloud' && b === 'diff') return ok('');
+        if (call.cmd === 'codex' && a === 'cloud' && b === 'exec') return ok('https://chatgpt.com/codex/tasks/task_b_unexpected\n');
+        return undefined;
+      }});
+    writeInflight(w1.stateRoot, 'codex-cloud', 'delivery-stable-2', { taskId: 'task_b_shared',
+      taskUrl: 'https://chatgpt.com/codex/tasks/task_b_shared', submittedAt: Date.now(), task: 'task-1' });
+    const out = await runLane(w2.input({ stateRoot: w1.stateRoot, prompt: '换目录后的产物路径变了。' }), w2.deps);
+    expect(out.status).toBe('success');
+    expect(w2.callsOf(c => c.cmd === 'codex' && c.args[1] === 'exec')).toHaveLength(0);
+    expect(w2.callsOf(c => c.cmd === 'codex' && c.args[1] === 'status')).toHaveLength(1);
+    expect(out.sessionId).toBeDefined();
+  });
+
+  test('环境投递键优先于 claim，登记安全编码并在正文变化后跨目录恢复', async () => {
+    for (const variable of ['SCK_DELIVERY_ID', 'SCK_DELIVERY_KEY']) {
+      const key = `delivery/${variable}/../stable`;
+      const w1 = world({ extra: call => {
+        if (call.cmd === 'codex' && call.args[1] === 'exec') return ok('https://chatgpt.com/codex/tasks/task_b_env\n');
+        if (call.cmd === 'codex' && call.args[1] === 'status') return bad('transient');
+        return undefined;
+      } });
+      await runLane(w1.input({ env: { [variable]: key } }), w1.deps);
+      expect(readInflight(w1.stateRoot, 'codex-cloud', key)?.taskId).toBe('task_b_env');
+      const w2 = world({ task: '# 改写过的正文\n', claim: { worktreePath: '', branch: 'sck/task-1', deliveryId: 'stale-claim' },
+        extra: call => {
+          if (call.cmd === 'codex' && call.args[1] === 'status') return ok('[READY] t\n');
+          if (call.cmd === 'codex' && call.args[1] === 'diff') return ok('');
+          return undefined;
+        } });
+      const result = await runLane(w2.input({ stateRoot: w1.stateRoot, env: { [variable]: key } }), w2.deps);
+      expect(result.status).toBe('success');
+      expect(w2.callsOf(call => call.cmd === 'codex' && call.args[1] === 'exec')).toHaveLength(0);
+      expect(w2.callsOf(call => call.cmd === 'codex' && call.args[1] === 'status')[0]?.args).toContain('task_b_env');
+    }
+  });
+
   test('任务完成后登记被清除', async () => {
     const w = world({ extra: call => {
       const [a, b] = call.args;
@@ -345,6 +409,40 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     newSession?: string;
     /** 首页 Capability 菜单里没有 Free 行（页面改版等）。 */
     noFreeRow?: boolean;
+    /** 指针点击 Capability 按钮也打不开菜单（页面改版等）。 */
+    noMenu?: boolean;
+    /** 菜单在指针点击后这么多毫秒才渲染（虚拟时钟，由 waitForTimeout 推进）。 */
+    menuDelayMs?: number;
+    /** 文档里排在前面的第一个 [role=menu] 是隐藏的账户菜单。 */
+    staleMenu?: boolean;
+    /** 页头另有一个文字为 Free 的按钮（第二个 Capability 候选）。 */
+    outsideFree?: boolean;
+    /** 菜单里出现两个 Free 行。 */
+    duplicateFreeRow?: boolean;
+    /** 指针点 Free 行没有生效（按钮仍是 Normal）。 */
+    freeRowInert?: boolean;
+    /** Escape 收不起菜单（它仍挡着输入区）。 */
+    escapeInert?: boolean;
+    /** 选中 Free 后菜单只有一层：一次 Escape 就全部收起（对照真实页面的两层）。 */
+    singleLayer?: boolean;
+    /** Escape 生效要等这么多毫秒（虚拟时钟，由 waitForTimeout 推进）：模拟 DOM 更新慢。 */
+    escapeLagMs?: number;
+    /**
+     * 合成兼容用例（非真实页面）：Free 行的角色是 role=menuitem（负责人证据），标签未知。这里用 span 代表一个不在旧选择器
+     * （标签 div/button，角色 menuitemradio/option）之内的标签，只验证新选择器按 role 认出 Free 行。span 不代表真实页面标签。
+     */
+    menuItemRows?: boolean;
+    /**
+     * 假设 B（未证实）：程序化 element.click() 能打开 Capability 菜单。默认 false，即假设 A：程序化点击不开菜单（同样未证实）。
+     * 只影响旧版（0.13.41）的 element.click()；新版从不调用程序化点击，所以这个开关对新版没有影响。
+     */
+    programmaticCapOpens?: boolean;
+    /** 点 Free 后档位与席位晚这么多毫秒才显示（虚拟时钟，由 waitForTimeout 推进）。 */
+    capLagMs?: number;
+    /** 选中 Free 后详情里没有 "powered by SWE-2"（档位是 Free，但没有 SWE-2 的 powered 文字）。 */
+    noPowered?: boolean;
+    /** 选中 Free 后详情里没有席位计数 "N/M in use"（读不到席位）。 */
+    noSeats?: boolean;
     onVisit?: (url: string, sessions: Record<string, FakeSession>) => void;
     onSend?: (url: string, text: string, sessions: Record<string, FakeSession>) => void;
   }
@@ -364,70 +462,202 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
   ] };
   /**
    * 假 Devin 网页：ego-browser 脚本真的在 new Function 里执行，页面结构按只读实测（见 devin-web.ts 文件头）。
-   * 首页：Capability 按钮点开 [role=menu]；选中 Free 且菜单打开时正文才有 "Free (powered by SWE-2)" 与 "N/M in use"。
-   * 会话页：Capability 按钮 disabled、菜单打不开，正文没有席位文字。events 按顺序记录导航、点击、填写、按下与发送。
+   * 首页 Capability 菜单在指针点击（p.click）后打开，按 menuDelayMs 渲染（虚拟时钟由 waitForTimeout 推进）。
+   * 两类未证实假设分开建模：程序化点击开不开菜单（programmaticCapOpens：默认假设 A 不开，只记 js cap；假设 B 开），
+   * 只影响旧版的 element.click()；Free 行能否被旧选择器命中（menuItemRows）则两版都会遇到。二者各有独立用例，互不依赖。
+   * 选中 Free 后菜单是两层（负责人 2026-11-17 真实页面实测）：第一层 Capability 列表仍开，第二层 Free 详情才有
+   * "Free (powered by SWE-2)" 与 "N/M in use"。Escape 每次只收一层：第一次收详情，第二次收列表；singleLayer 时一次全收；
+   * escapeLagMs 时收起要等 DOM 更新。escLog 记录每次 Escape 生效后仍可见的菜单层数。
+   * 会话页：Capability 按钮 disabled、菜单打不开，正文没有席位文字。
+   * events 按顺序记录导航、指针点击（pointer）、程序化点击（js）、Escape、填写、按下与发送。
    */
+  interface FakeEl {
+    readonly innerText: string;
+    readonly disabled: boolean;
+    readonly tagName: string;
+    readonly attrs: Record<string, string>;
+    readonly parent: FakeEl | undefined;
+    click(): void;
+    getAttribute(name: string): string | null;
+    setAttribute(name: string, value: string): void;
+    removeAttribute(name: string): void;
+    closest(selector: string): FakeEl | null;
+    contains(other: FakeEl): boolean;
+    getBoundingClientRect(): { width: number; height: number };
+    querySelectorAll(selector: string): FakeEl[];
+  }
+  /** 假页面只认两种简单选择器：标签名与 [role=x]（子元素查询按逗号分隔的选择器表过滤）。 */
+  const simpleMatch = (e: FakeEl, sel: string): boolean => {
+    const role = /^\[role=([\w-]+)\]$/.exec(sel)?.[1];
+    return role !== undefined ? e.attrs.role === role : e.tagName === sel;
+  };
+  const mkEl = (o: { tag: string; text: () => string; rect: () => { width: number; height: number };
+    attrs?: Record<string, string>; parent?: FakeEl; disabled?: () => boolean; expanded?: () => boolean;
+    children?: () => FakeEl[]; onClick?: () => void }): FakeEl => {
+    const attrs: Record<string, string> = { ...o.attrs };
+    const el: FakeEl = {
+      tagName: o.tag, attrs, parent: o.parent,
+      get innerText() { return o.text(); },
+      get disabled() { return o.disabled?.() ?? false; },
+      click: () => o.onClick?.(),
+      getAttribute: (name) => {
+        if (name === 'aria-expanded' && o.expanded) return String(o.expanded());
+        if (name === 'aria-disabled' && o.disabled?.()) return 'true';
+        return name in attrs ? attrs[name]! : null;
+      },
+      setAttribute: (name, value) => { attrs[name] = value; },
+      removeAttribute: (name) => { delete attrs[name]; },
+      closest: (selector) => {
+        for (let x: FakeEl | undefined = el; x; x = x.parent) if (selector === '[role=menu]' && x.attrs.role === 'menu') return x;
+        return null;
+      },
+      contains: (other) => {
+        for (let x: FakeEl | undefined = other; x; x = x.parent) if (x === el) return true;
+        return false;
+      },
+      getBoundingClientRect: () => o.rect(),
+      querySelectorAll: (selector: string) => (o.children?.() ?? []).filter(c => selector.split(',').some(s => simpleMatch(c, s.trim()))),
+    };
+    return el;
+  };
   const fakeDevin = (opts: FakeOpts = {}) => {
     const seats = opts.seats ?? { used: 0, total: 2 };
     const sessions: Record<string, FakeSession> = {};
     for (const [url, s] of Object.entries(opts.sessions ?? {}))
       sessions[url] = { cap: 'Free', status: 'Devin is awaiting instructions', ...s, blocks: (s.blocks ?? []).map(b => ({ ...b })) };
-    const st = { url: HOME, menu: false, cap: 'Normal', draft: '', events: [] as string[], sent: [] as Array<{ url: string; text: string }> };
+    const st = { url: HOME, cap: 'Normal', capBefore: 'Normal', capAt: 0, draft: '', clock: 0, menuOpen: false, menuReadyAt: 0,
+      detailOpen: false, pending: [] as Array<{ at: number; run: () => void }>, escLog: [] as number[],
+      events: [] as string[], sent: [] as Array<{ url: string; text: string }> };
     const isSession = (url: string) => /\/sessions\//.test(url);
     const current = () => sessions[st.url]!;
+    /** 首页 Capability 菜单此刻可见：已被指针打开，并过了渲染延迟。会话页没有这个菜单。 */
+    const menuShown = () => !isSession(st.url) && st.menuOpen && st.clock >= st.menuReadyAt;
+    /** 页面上显示的档位：选中 Free 后可能还要等 capLagMs 才变。 */
+    const capShown = () => (st.clock >= st.capAt ? st.cap : st.capBefore);
+    /** 第二层 Free 详情：菜单开着、页面档位已是 Free，且它还没被 Escape 收掉。 */
+    const detailShown = () => menuShown() && st.detailOpen && capShown() === 'Free';
+    /** 当前可见的菜单层数（列表 + 详情），即 DOM 里可见 [role=menu] 的个数。 */
+    const visibleMenus = () => (menuShown() ? 1 : 0) + (detailShown() ? 1 : 0);
+    const selectFree = () => { st.capBefore = capShown(); st.cap = 'Free'; st.capAt = st.clock + (opts.capLagMs ?? 0); st.detailOpen = true; };
+    const detailText = () => [opts.noPowered ? 'Free' : 'Free (powered by SWE-2)', `The plan includes ${seats.total} concurrent sessions`,
+      ...(opts.noSeats ? [] : [`${seats.used}/${seats.total} in use`])].join('\n');
     const bodyText = (): string => isSession(st.url)
       ? [...current().blocks.map(b => b.text), current().status].join('\n')
-      : ['Organization', st.cap === 'Free' ? 'Free (powered by SWE-2)' : '',
-          st.menu && st.cap === 'Free' ? `The plan includes ${seats.total} concurrent sessions\n${seats.used}/${seats.total} in use` : '']
-        .filter(Boolean).join('\n');
+      : ['Organization', detailShown() ? detailText() : ''].filter(Boolean).join('\n');
+    const rowNames = [...CAP_ROWS.filter(name => !(opts.noFreeRow && name === 'Free')), ...(opts.duplicateFreeRow ? ['Free'] : [])];
+    const trigger = mkEl({ tag: 'button', text: () => capShown(), rect: () => ({ width: 90, height: 28 }),
+      disabled: () => isSession(st.url), expanded: () => st.menuOpen,
+      onClick: () => {
+        st.events.push('js cap');
+        // 程序化点击：只有假设 B（未证实）才打开菜单；假设 A 下它什么也不做。
+        if (opts.programmaticCapOpens && !isSession(st.url)) { st.menuOpen = true; st.detailOpen = false; st.menuReadyAt = st.clock + (opts.menuDelayMs ?? 0); }
+      } });
+    const outside = opts.outsideFree ? mkEl({ tag: 'button', text: () => 'Free', rect: () => ({ width: 60, height: 24 }) }) : undefined;
+    const menuRows: FakeEl[] = [];
+    const capMenu = mkEl({ tag: 'div', attrs: { role: 'menu' }, text: () => rowNames.join('\n'),
+      rect: () => ({ width: 200, height: 300 }), children: () => menuRows });
+    for (const name of rowNames) menuRows.push(mkEl({ tag: opts.menuItemRows ? 'span' : 'button',
+      attrs: { role: opts.menuItemRows ? 'menuitem' : 'menuitemradio' }, parent: capMenu,
+      text: () => name, rect: () => (menuShown() ? { width: 160, height: 32 } : { width: 0, height: 0 }),
+      onClick: () => { st.events.push(`js ${name}`); if (name === 'Free' && menuShown() && !opts.freeRowInert) selectFree(); } }));
+    const detailMenu = mkEl({ tag: 'div', attrs: { role: 'menu' }, text: detailText, rect: () => ({ width: 220, height: 64 }), children: () => [] });
+    const staleRows: FakeEl[] = [];
+    const staleMenu = opts.staleMenu ? mkEl({ tag: 'div', attrs: { role: 'menu' }, text: () => 'Account\nLog out',
+      rect: () => ({ width: 0, height: 0 }), children: () => staleRows }) : undefined;
+    if (staleMenu) staleRows.push(mkEl({ tag: 'div', parent: staleMenu, text: () => 'Log out', rect: () => ({ width: 0, height: 0 }) }));
+    /** 文档顺序：头部按钮、触发按钮、隐藏菜单，最后是渲染出来的 Capability 菜单。 */
+    const inDom = (): FakeEl[] => [
+      ...(outside ? [outside] : []), trigger,
+      ...(staleMenu ? [staleMenu, ...staleRows] : []),
+      ...(menuShown() ? [capMenu, ...menuRows] : []),
+      ...(detailShown() ? [detailMenu] : []),
+    ];
+    const known = (): FakeEl[] => [trigger, capMenu, ...menuRows, ...staleRows, ...(outside ? [outside] : []), ...(staleMenu ? [staleMenu] : [])];
+    const matches = (e: FakeEl, sel: string): boolean => {
+      if (sel === 'button') return e.tagName === 'button';
+      if (sel === '[role=menu]') return e.attrs.role === 'menu';
+      const name = /^\[([\w-]+)\]$/.exec(sel)?.[1];
+      return name !== undefined && e.attrs[name] !== undefined;
+    };
     const docFor = () => {
       const session = isSession(st.url);
-      const capButton = session
-        ? { innerText: st.cap, disabled: true, click: () => {} }
-        : { innerText: st.cap, click: () => { st.events.push('click cap'); st.menu = !st.menu; } };
-      const rows = st.menu && !session
-        ? CAP_ROWS.filter(name => !(opts.noFreeRow && name === 'Free')).map(name => ({
-            innerText: name,
-            click: () => { st.events.push(`click ${name}`); if (name === 'Free') st.cap = 'Free'; },
-          }))
-        : undefined;
-      const menu = rows ? { querySelectorAll: () => rows } : null;
       const text = bodyText();
       const authors = session ? current().blocks.filter(b => b.role !== 'tool').map(b => ({
         getAttribute: (name: string) => (name === 'data-message-author' ? b.role : null),
         innerText: b.text,
       })) : [];
       const links = (opts.sidebar ?? []).map(l => ({ href: l.href, innerText: l.title }));
+      const queryAll = (sel: string): unknown[] => (sel === 'a[href^="/sessions/"]' ? links
+        : sel === '[data-message-author]' ? authors : inDom().filter(e => matches(e, sel)));
       return {
         body: { innerText: text },
         querySelector: (sel: string) => (sel === 'div[role=textbox][aria-label="Prompt"]' ? { innerText: '' }
-          : sel === 'main' ? { innerText: text } : sel === '[role=menu]' ? menu : null),
-        querySelectorAll: (sel: string) => (sel === 'button' ? [capButton]
-          : sel === '[data-message-author]' ? authors : sel === 'a[href^="/sessions/"]' ? links : []),
+          : sel === 'main' ? { innerText: text } : (queryAll(sel)[0] ?? null)),
+        querySelectorAll: queryAll,
       };
     };
     const page = {
       goto: async (url: string) => {
-        st.url = url; st.menu = false; st.events.push(`visit ${url}`);
+        st.url = url; st.menuOpen = false; st.detailOpen = false; st.pending = []; st.events.push(`visit ${url}`);
         st.cap = isSession(url) ? (sessions[url]?.cap ?? 'Free') : 'Normal';
+        st.capAt = 0;
+        // 导航重建页面：上一页写进 DOM 的标记随之消失。
+        for (const e of known()) { delete e.attrs['data-sck-cap-trigger']; delete e.attrs['data-sck-free-row']; }
         opts.onVisit?.(url, sessions);
       },
-      waitForTimeout: async () => {},
+      waitForTimeout: async (ms = 0) => {
+        st.clock += ms;
+        const due = st.pending.filter(j => j.at <= st.clock);
+        st.pending = st.pending.filter(j => j.at > st.clock);
+        for (const j of due) j.run();
+      },
+      keyboard: {
+        press: async (key: string) => {
+          st.events.push(`press ${key}`);
+          if (key !== 'Escape' || opts.escapeInert) return;
+          // 两层：第一次只收 Free 详情（列表仍开），第二次收列表；singleLayer 时一次全收。
+          const close = () => {
+            if (!opts.singleLayer && detailShown()) st.detailOpen = false;
+            else { st.menuOpen = false; st.detailOpen = false; }
+            st.escLog.push(visibleMenus());
+          };
+          if (opts.escapeLagMs) st.pending.push({ at: st.clock + opts.escapeLagMs, run: close });
+          else close();
+        },
+      },
       evaluate: async (fn: (arg?: unknown) => unknown, arg?: unknown) => {
         g.document = docFor(); g.location = { href: st.url, hostname: 'app.devin.ai' };
+        g.getComputedStyle = () => ({ visibility: 'visible' });
         return fn(arg);
       },
       fill: async (_selector: string, text: string) => { st.draft = text; st.events.push('fill'); },
       click: async (selector: string) => {
-        if (selector.replace(/^css:/, '') !== 'button[aria-label="Send"]') { st.events.push(`click ${selector}`); return; }
-        const created = !isSession(st.url);
-        const url = created ? (opts.newSession ?? NEW_SESSION) : st.url;
-        if (created) { sessions[url] = { cap: 'Free', status: 'Devin is working', blocks: [] }; }
-        sessions[url]!.blocks.push({ role: 'user', text: st.draft });
-        sessions[url]!.status = 'Devin is working';
-        st.sent.push({ url, text: st.draft }); st.events.push(`send ${url}`);
-        if (created) { st.url = url; st.cap = 'Free'; st.menu = false; }
-        opts.onSend?.(url, st.draft, sessions);
+        const sel = selector.replace(/^(loc=)?css:/, '');
+        if (sel === 'button[aria-label="Send"]') {
+          const created = !isSession(st.url);
+          const url = created ? (opts.newSession ?? NEW_SESSION) : st.url;
+          if (created) { sessions[url] = { cap: 'Free', status: 'Devin is working', blocks: [] }; }
+          sessions[url]!.blocks.push({ role: 'user', text: st.draft });
+          sessions[url]!.status = 'Devin is working';
+          st.sent.push({ url, text: st.draft }); st.events.push(`send ${url}`);
+          if (created) { st.url = url; st.cap = 'Free'; st.capAt = 0; st.menuOpen = false; }
+          opts.onSend?.(url, st.draft, sessions);
+          return;
+        }
+        const marker = /^\[(data-sck-[\w-]+)\]$/.exec(sel);
+        if (!marker) { st.events.push(`click ${sel}`); return; }
+        // 指针点击只作用于此刻 DOM 里的元素：标记不存在或菜单未渲染，真实页面也点不到。
+        const target = inDom().find(e => e.attrs[marker[1]!] !== undefined);
+        if (!target) throw new Error(`no element matches ${selector}`);
+        if (target === trigger) {
+          if (trigger.disabled) throw new Error('element is disabled');
+          st.events.push('pointer cap');
+          if (!opts.noMenu) { st.menuOpen = true; st.detailOpen = false; st.menuReadyAt = st.clock + (opts.menuDelayMs ?? 0); }
+          return;
+        }
+        if (target === outside) { st.events.push('pointer outside'); return; }
+        st.events.push(`pointer ${target.innerText}`);
+        if (target.innerText === 'Free' && !opts.freeRowInert) selectFree();
       },
     };
     const run = async (script: string): Promise<Record<string, unknown> | undefined> => {
@@ -442,7 +672,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       } catch (error) {
         if (!(error instanceof FakeExit)) throw error;
       } finally {
-        delete g.document; delete g.location;
+        delete g.document; delete g.location; delete g.getComputedStyle;
       }
       return result;
     };
@@ -451,6 +681,24 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
   /** 每次脚本调用推进 30 秒：让「席位满/忙」这类有时限的等待能在测试里结束。 */
   const advancing = (w: { advance(ms: number): void }, browse: NonNullable<LaneDeps['browse']>) =>
     (script: string, timeoutMs: number) => { w.advance(30_000); return browse(script, timeoutMs); };
+
+  test('Devin 投递键摘要标记稳定且为十六进制，同键正文改写后只轮询不再发送', async () => {
+    const w = world({ extra: gitOk });
+    const key = 'delivery/same-prefix-001';
+    const b = devinBrowse({ send: [{ ok: true, url: SESSION }],
+      session: [{ ok: true, markerSeen: true, status: 'blocked', done: null, tail: '' }] });
+    await runLane(w.input({ provider: 'devin-cloud', env: { SCK_DELIVERY_ID: key } }), { ...w.deps, browse: b.browse });
+    const marker = readLaneState(w.commDir)?.taskId;
+    expect(marker).toMatch(/^SCK-[a-f0-9]{10}$/);
+    expect(marker).toBe(`SCK-${laneDigest('devin-cloud', key).slice(0, 10)}`);
+    const recovered = devinBrowse({ session: [idleDone(PR9)] });
+    const out = await runLane(w.input({ provider: 'devin-cloud', prompt: '同一次投递的措辞重排',
+      env: { SCK_DELIVERY_ID: key } }), { ...w.deps, browse: recovered.browse });
+    expect(out.status).toBe('success');
+    expect(recovered.calls.some(script => script.includes(MODE('send')) || script.includes(MODE('follow')))).toBe(false);
+    expect(recovered.calls.every(script => script.includes(marker!))).toBe(true);
+    expect(laneDigest('devin-cloud', 'delivery/same-prefix-002').slice(0, 10)).not.toBe(marker!.slice(4));
+  });
 
   test('发送脚本先核验 Capability Free 与席位再发送；全程不调用 devin CLI', async () => {
     const w = world({ extra: gitOk });
@@ -623,14 +871,17 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(Date.now() - started).toBeLessThan(20_000);
   }, 25_000);
 
-  test('超时后同一轮只回执核对不重发：状态留在途，下轮直接轮询原会话', async () => {
+  test('超时后同一轮只回执核对不重发：受阻保留会话地址，不丢成无输出错误回合；下轮直接轮询原会话', async () => {
     const working = { ok: true, markerSeen: true, status: 'working', done: null, tail: '' };
     const w1 = world({ extra: gitOk });
     const b1 = devinBrowse({ send: [{ ok: true, url: SESSION }], session: [working] });
     const input1 = w1.input({ provider: 'devin-cloud', config: { pollMs: 1, maxMinutes: 1 } });
     const browse1 = (async (script: string, t: number) => { const r = await b1.browse(script, t); if (!script.includes('const MSG =')) w1.advance(30_000); return r; }) as typeof b1.browse;
     const out1 = await runLane(input1, { ...w1.deps, browse: browse1 });
-    expect(out1.status).toBe('error');
+    // 会话已受理（taskId 已定），超时不是供应商崩溃：按受阻收尾（成功回合、首行「工作结果：受阻」），
+    // 带原会话地址与说明，不是裸错误回合——避免执行端把它当空交付回收成 silent-turn，不送审。
+    expect(out1.status).toBe('success');
+    expect(out1.text.split('\n')[0]).toBe('工作结果：受阻');
     expect(out1.text).toContain(SESSION);
     expect(out1.text).toContain('仍在运行');
     expect(readLaneState(w1.commDir)?.taskUrl).toBe(SESSION);
@@ -642,6 +893,137 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(b2.calls.some(s => s.includes('const MSG ='))).toBe(false);
     expect(b2.calls.length).toBeGreaterThan(0);
     expect(b2.calls.every(s => s.includes(SESSION))).toBe(true);
+  });
+
+  test('近真实 main→native 链路验证：已受理超时的受阻回合经 main.ts 事件映射与 native.ts 真实 parseNativeResult 解析后是 completed，不是 failed（需求 3：不丢成 silent-turn 的关键一环）', async () => {
+    // 复用与上一条用例相同的「已受理、超时」场景，拿到真实 LaneOutcome（status:'success'，首行「工作结果：受阻」）。
+    const working = { ok: true, markerSeen: true, status: 'working', done: null, tail: '' };
+    const w = world({ extra: gitOk });
+    const b = devinBrowse({ send: [{ ok: true, url: SESSION }], session: [working] });
+    const input = w.input({ provider: 'devin-cloud', config: { pollMs: 1, maxMinutes: 1 } });
+    const browse = (async (script: string, t: number) => { const r = await b.browse(script, t); if (!script.includes('const MSG =')) w.advance(30_000); return r; }) as typeof b.browse;
+    const outcome = await runLane(input, { ...w.deps, browse });
+    expect(outcome.status).toBe('success');
+    // runner/cloud-lane/main.ts 收到这个 LaneOutcome 后，原样按它自己的映射打印 Claude 形态事件流（逐行抄自
+    // main.ts 现有源码，不是另一套逻辑）：
+    //   emit({ type: 'result', subtype: outcome.status === 'success' ? 'success' : 'error',
+    //     is_error: outcome.status !== 'success', result: outcome.text, session_id: outcome.sessionId });
+    // 下面把这两行事件喂给真实、未改动的 runner/native.ts 的 parseNativeResult，验证受阻回合走的是
+    // is_error:false/subtype:'success'，不是修前 fail() 会产生的 is_error:true/subtype:'error'。
+    const stdout = [
+      JSON.stringify({ type: 'system', session_id: `lane-${crypto.randomUUID()}` }),
+      JSON.stringify({
+        type: 'result',
+        subtype: outcome.status === 'success' ? 'success' : 'error',
+        is_error: outcome.status !== 'success',
+        result: outcome.text,
+        session_id: outcome.sessionId,
+      }),
+    ].join('\n');
+    const native = parseNativeResult('devin-cloud', stdout);
+    expect(native.completed).toBe(true);
+    expect(native.error).toBeUndefined();
+    expect(native.text.split('\n')[0]).toBe('工作结果：受阻');
+    expect(native.text).toContain(SESSION);
+    expect(native.sessionId).toBe(outcome.sessionId);
+    // native.ts 的 result.completed 正是 NativeRuntime.launch() 用来算 outcome.kind 的那个布尔量：
+    //   const success = ... && result.completed && !!s.nativeSessionId;
+    //   outcome: canceled ? { kind: 'canceled' } : success ? { kind: 'completed' } : { kind: 'failed', error: {...} }
+    // turn-closeout.ts 的 settleTurn 只在 kind==='completed' 时才走「静默回合给有界唤醒重试」分支；kind!=='completed'
+    // 会直接进「回收重派」分支——真实事故 15eaf1b8 正落在这条分支。这两处都不在本次改动范围内、源码未变更，这里
+    // 只引用它们既有、未改动的判定逻辑作为同一条链路的下一环证据，不重复声称本 PR 测试或修改了 native.ts/turn-closeout.ts
+    // 本身；report.md/blocker.md 是否被写出属于外层回合编排，同样不在本次改动范围。
+    // 这条用例到 parseNativeResult 为止：completed:true 之后还要再经 sidecar.ts 的 settleExecution →
+    // collectExecution → workResult 才是真正的收尾（提交 block、落盘、不记供应商故障）。那一段不在这个文件里，
+    // 在 tests/runner-lifecycle.test.ts 的「云端受阻回合（如 devin-cloud 已受理超时）经真实 settleExecution
+    // 收尾为 block...」用例：用同一个 outcome.kind:'completed' 的 TurnEnded 形态，驱动真实（未打桩）的
+    // SidecarPool.settleExecution，断言不是 silent、不记 providerFailure、journal 落盘的结果是 block；并有
+    // 对照组证明 outcome.kind 不是 completed 时仍然走既有的静默分支，两条路没有被改成同一条。
+
+    // 对照：修前 fail() 会让 main.ts 打 is_error:true/subtype:'error'，parseNativeResult 解出 completed:false——
+    // 这正是真实事故「明确超时却被当成失败终态、进而回收成 silent-turn」的那一步；这里只作同一条链路的对照参照。
+    const failedStdout = [
+      JSON.stringify({ type: 'system', session_id: `lane-${crypto.randomUUID()}` }),
+      JSON.stringify({ type: 'result', subtype: 'error', is_error: true, result: outcome.text, session_id: outcome.sessionId }),
+    ].join('\n');
+    expect(parseNativeResult('devin-cloud', failedStdout).completed).toBe(false);
+  });
+
+  test('轮询回执页面停在另一个会话（wrong_session，发布前复核新发现的负例，非生产事故）：不采信该页内容，累计到上限后受阻，不重发、不拉取分支', async () => {
+    const w = world({ extra: gitOk });
+    // 脚本自己的地址核验会拦下这种情况（见 devin-web.ts），这里直接从驱动层角度构造脚本已经回执 wrong_session
+    // 的场景：goto 失败被吞、页面停在另一个合法会话 OTHER 上，驱动层必须不把它当本轮受理证据，也不重发。
+    const wrongSession = { ok: false, code: 'wrong_session', url: OTHER };
+    const b = devinBrowse({ send: [{ ok: true, url: SESSION }], session: [wrongSession] });
+    const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1 } }), { ...w.deps, browse: b.browse });
+    expect(out.status).toBe('success');
+    expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+    expect(out.text).toContain('没能停在本轮轮询的会话地址上');
+    expect(out.text).toContain(SESSION);
+    // 只发过一次；受阻之后在途状态保留（taskId 仍有），没有第二次发送、没有拉取分支（没走到收尾）
+    expect(b.calls.filter(s => s.includes('const MSG ='))).toHaveLength(1);
+    expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(0);
+    expect(readLaneState(w.commDir)?.taskId).toBeDefined();
+  });
+
+  test('轮询回执误报 ok:true 却带着另一个会话地址（驱动层地址核验，合成负例）：不采信那份终稿、不拉分支，累计后受阻并保留在途', async () => {
+    const w = world({ extra: gitOk });
+    // 比上一条更强的负例：回执本身 ok:true，done 里甚至有像样的 PR/SHA，但 location.href 是另一个合法会话。
+    // 脚本侧本会按 wrong_session 拒绝，这里验证驱动层自己也按 s.url 与目标会话再核一次，不靠脚本自觉。
+    const b = devinBrowse({ send: [{ ok: true, url: SESSION }], session: [{ ...idleDone(PR9), url: OTHER }] });
+    const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1 } }), { ...w.deps, browse: b.browse });
+    expect(out.status).toBe('success');
+    expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+    expect(out.text).toContain('没能停在本轮轮询的会话地址上');
+    expect(out.text).toContain(SESSION);
+    // 没有把那个会话的 PR 当终稿：没有快进/拉分支，也没有第二次发送
+    expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(0);
+    expect(b.calls.filter(s => s.includes('const MSG ='))).toHaveLength(1);
+    expect(readLaneState(w.commDir)?.vendorSession).toBe(SESSION);
+  });
+
+  test('续轮回执误报 ok:true 但地址是别的会话（驱动层地址核验，合成负例）：不在那页取终稿，回原会话核对后零重发取回', async () => {
+    const w = world({ extra: gitOk });
+    writeLaneState(w.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
+    const b = devinBrowse({
+      follow: [{ ok: true, url: OTHER, cap: 'Free', seats: { used: 0, total: 2 }, echoed: true }],
+      session: [idleDone(PR9)],
+    });
+    const out = await runLane(w.input({ provider: 'devin-cloud', prompt: '继续修复。' }), { ...w.deps, browse: b.browse });
+    expect(out.status).toBe('success');
+    expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
+    // 受理落点仍是原会话（不是回执里那个别的会话），也没有第二次发送/新建会话
+    expect(readLaneState(w.commDir)?.vendorSession).toBe(SESSION);
+    const sessionCalls = b.calls.filter(s => s.includes(MODE('session')));
+    expect(sessionCalls.length).toBeGreaterThan(0);
+    expect(sessionCalls.every(s => s.includes(`const TARGET_URL = "${SESSION}"`))).toBe(true);
+    expect(b.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(1);
+    expect(b.calls.some(s => s.includes(MODE('send')))).toBe(false);
+  });
+
+  test('受理核对的回执带着别的会话地址（驱动层地址核验，合成负例）：不认那页的本轮标记，核对耗尽后受阻并保留在途', async () => {
+    const TASK = '# 云端任务\n\n实现需求甲。\n';
+    const REPO = { slug: 'acme/widget', owner: 'acme', repo: 'widget', branch: 'sck/task-1', defaultBranch: 'main' };
+    const PROMPT = '继续修复。';
+    const digestOf = (w: ReturnType<typeof world>, prompt: string) =>
+      laneDigest('devin-cloud', vendorPrompt(w.input({ provider: 'devin-cloud', prompt }), REPO, taskMaterial(w.commDir, prompt)));
+    const w1 = world({ task: TASK, extra: gitOk });
+    writeLaneState(w1.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
+    const a = devinBrowse({ follow: [{ ok: false, code: 'pressed' }], session: [unseen] });
+    await runLane(w1.input({ provider: 'devin-cloud', prompt: PROMPT, config: { pollMs: 1 } }), { ...w1.deps, browse: a.browse });
+    expect(readInflight(w1.stateRoot, 'devin-cloud', digestOf(w1, PROMPT))?.attemptSession).toBe(SESSION);
+
+    const w2 = world({ task: TASK, extra: gitOk });
+    const b2 = devinBrowse({ session: [{ ...idleDone(PR9), url: OTHER }] });
+    const out2 = await runLane(w2.input({ provider: 'devin-cloud', prompt: PROMPT, stateRoot: w1.stateRoot }), { ...w2.deps, browse: b2.browse });
+    expect(out2.status).toBe('success');
+    expect(out2.text.split('\n')[0]).toBe('工作结果：受阻');
+    expect(out2.text).toContain('原会话');
+    expect(out2.text).toContain(SESSION);
+    expect(b2.calls.some(s => s.includes(MODE('send')))).toBe(false);
+    expect(b2.calls.some(s => s.includes(MODE('follow')))).toBe(false);
+    expect(b2.calls.filter(s => s.includes(MODE('session')))).toHaveLength(4);
+    expect(readInflight(w1.stateRoot, 'devin-cloud', digestOf(w1, PROMPT))?.attemptSession).toBe(SESSION);
   });
 
   test('按下发送后脚本中断：先回会话列表核对受理，找到了就接管该会话', async () => {
@@ -698,6 +1080,27 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     const follow = b.calls.find(s => s.includes(MODE('follow')))!;
     expect(follow).toContain(SESSION);
     expect(follow).toContain("'Free'");
+  });
+
+  test('续轮跟进脚本回执页面停在另一个会话（wrong_session，发布前复核新发现的负例，非生产事故）：没碰发送按钮，不当已按下、不重发，超时受阻', async () => {
+    const w = world({ extra: gitOk });
+    writeLaneState(w.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
+    const b = devinBrowse({ follow: [{ ok: false, code: 'wrong_session', url: OTHER }] });
+    // 跟进脚本自己就会在填写/发送之前拦下（sessionGate 排在最前核验地址），这里站在驱动层角度断言它拿到
+    // wrong_session 回执后的反应：当「页面未就绪」一样有界重试，不当已按下发送，超时后报错回合而非受阻
+    // （此时还没有 state.taskId，不存在"已受理但未终稿"的在途语义）。
+    const browse = (async (script: string, t: number) => { const r = await b.browse(script, t); w.advance(10 * 60_000); return r; }) as typeof b.browse;
+    const out = await runLane(w.input({ provider: 'devin-cloud', prompt: '继续修复。', config: { pollMs: 1, maxMinutes: 1 } }), { ...w.deps, browse });
+    expect(out.status).toBe('error');
+    expect(out.text).toContain('没能停在原会话地址上');
+    expect(out.text).toContain(OTHER);
+    // 跟进脚本只跑过一次（第一次回执后时限已到，直接报错，不重试多次、不重发）
+    expect(b.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(1);
+    expect(b.calls.some(s => s.includes(MODE('send')))).toBe(false);
+    // 没有按下发送：没有登记在途 attempt 或 taskId
+    const st = readLaneState(w.commDir);
+    expect(st?.devin?.attempt).toBeUndefined();
+    expect(st?.taskId).toBeUndefined();
   });
 
   test('复核轮要求复核结论首行；非 free 的复核轮也不做任何页面动作', async () => {
@@ -769,6 +1172,77 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(out.text).toContain('SHA: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef');
   });
 
+  test('有 DONE 但无 PR 行：查询真实 OPEN PR 补齐 URL', async () => {
+    const w = world({ extra: call => {
+      if (call.cmd === 'gh' && call.args[0] === 'pr') return ok('[{"url":"https://github.com/acme/widget/pull/9"}]');
+      return gitOk(call);
+    } });
+    const b = devinBrowse({ send: [{ ok: true, url: SESSION }], session: [idleDone('已经实现并测试。')] });
+    const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: b.browse });
+    expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
+    expect(out.text).toContain('SHA: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef');
+    expect(w.callsOf(c => c.cmd === 'gh' && c.args[0] === 'pr')[0]?.args)
+      .toEqual(['pr', 'list', '--repo', 'acme/widget', '--head', 'sck/task-1', '--state', 'open', '--json', 'url']);
+  });
+
+  test('idle 无 DONE/PR 行：仅远端确有新提交且有 OPEN PR 时按真实 HEAD 收尾', async () => {
+    for (const scenario of ['done', 'no-commits', 'no-pr', 'local-ahead', 'fetch-failed', 'wrong-pr']) {
+      const w = world({ extra: call => {
+        if (call.cmd === 'git' && call.args[0] === 'rev-parse' && call.args[1] === 'FETCH_HEAD')
+          return ok(scenario === 'local-ahead' ? 'a'.repeat(40) : 'deadbeef'.repeat(5));
+        if (call.cmd === 'git' && call.args[0] === 'rev-list') return ok(scenario === 'no-commits' ? '0' : '2');
+        if (call.cmd === 'git' && call.args[0] === 'fetch' && scenario === 'fetch-failed') return bad('offline');
+        if (call.cmd === 'gh' && call.args[0] === 'pr')
+          return ok(JSON.stringify(scenario === 'no-pr' ? [] : [{ url: `https://github.com/${scenario === 'wrong-pr' ? 'other/repo' : 'acme/widget'}/pull/9` }]));
+        return gitOk(call);
+      } });
+      const b = devinBrowse({ send: [{ ok: true, url: SESSION }],
+        session: [{ ok: true, markerSeen: true, status: 'idle', done: null, tail: '实现需求甲，测试通过。' }] });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: b.browse });
+      expect(out.status).toBe('success');
+      if (scenario === 'done') {
+        expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
+        expect(out.text).toContain(`SHA: ${'deadbeef'.repeat(5)}`);
+        expect(out.text).toContain('实现需求甲');
+        expect(readLaneState(w.commDir)?.taskId).toBeUndefined();
+      } else {
+        expect(out.text).toStartWith('工作结果：受阻');
+        expect(readLaneState(w.commDir)?.taskId).toBeDefined();
+      }
+      expect(b.calls.filter(s => s.includes(MODE('session')))).toHaveLength(3);
+    }
+  });
+
+  test('超时受阻后新 delivery/新目录重派：领养旧 taskId/taskUrl/submittedAt，零发送且结清旧登记', async () => {
+    const first = world({ extra: gitOk });
+    const a = devinBrowse({ send: [{ ok: true, url: SESSION }],
+      session: [{ ok: true, markerSeen: true, status: 'working', done: null }] });
+    const out1 = await runLane(first.input({ provider: 'devin-cloud', env: { SCK_DELIVERY_ID: 'lease-old' }, config: { maxMinutes: 1, pollMs: 1 } }),
+      { ...first.deps, browse: async (script, timeout) => { const r = await a.browse(script, timeout); first.advance(40_000); return r; } });
+    expect(out1.text).toStartWith('工作结果：受阻');
+    const prior = readInflight(first.stateRoot, 'devin-cloud', 'lease-old')!;
+    expect(prior.taskId).toBeDefined();
+    expect(prior.taskUrl).toBe(SESSION);
+    // 不同供应商发送不能被同任务结清清理误删。
+    writeInflight(first.stateRoot, 'devin-cloud', 'unrelated-send',
+      { ...prior, taskId: 'SCK-eeeeeeeeee', submittedAt: prior.submittedAt! - 1000 });
+    const second = world({ extra: gitOk });
+    const b = devinBrowse({ session: [idleDone(PR9)] });
+    const out2 = await runLane(second.input({ provider: 'devin-cloud', stateRoot: first.stateRoot,
+      env: { SCK_DELIVERY_ID: 'lease-new' }, prompt: '重派同一任务，取回成果。' }), {
+      ...second.deps, browse: async (script, timeout) => {
+        expect(script).toContain(prior.taskId!);
+        expect(script).toContain(SESSION);
+        return b.browse(script, timeout);
+      },
+    });
+    expect(out2.text).toContain('PR: https://github.com/acme/widget/pull/9');
+    expect(b.calls.every(s => s.includes(MODE('session')))).toBe(true);
+    expect(readInflight(first.stateRoot, 'devin-cloud', 'lease-old')).toBeUndefined();
+    expect(readInflight(first.stateRoot, 'devin-cloud', 'lease-new')).toBeUndefined();
+    expect(readInflight(first.stateRoot, 'devin-cloud', 'unrelated-send')?.taskId).toBe('SCK-eeeeeeeeee');
+  });
+
   test('非快进合并 → 错误回合且不 reset', async () => {
     const w = world({ extra: call => {
       if (call.cmd === 'git' && call.args[0] === 'merge') return bad('Not possible to fast-forward');
@@ -837,7 +1311,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     const gate2 = at('const againStop = sessionGate(s)', back);
     const fill = at('await p.fill(target, MSG)', gate2);
     const pressed = at("console.log('__PRESSED__')", fill);
-    expect(at("await p.click('css:' + ", pressed)).toBeGreaterThan(pressed);
+    expect(at("await p.click('loc=css:' + ", pressed)).toBeGreaterThan(pressed);
   });
 
   test('进展阶段：先报尝试，真正受理后才报已受理，不把尝试写成已派', async () => {
@@ -896,7 +1370,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(readLaneState(w.commDir)?.taskId).toMatch(/^SCK-/);
   });
 
-  test('状态 unknown 的答复不收尾：超时按错误回合，不拉取分支', async () => {
+  test('状态 unknown 的答复不收尾：超时按受阻回合（保留会话地址，不丢成无输出错误），不拉取分支', async () => {
     const w = world({ extra: gitOk });
     const b = devinBrowse({
       send: [{ ok: true, url: SESSION, cap: 'Free', seats: { used: 0, total: 2 }, echoed: true }],
@@ -904,12 +1378,14 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     });
     const browse = (async (script: string, t: number) => { const r = await b.browse(script, t); w.advance(30_000); return r; }) as typeof b.browse;
     const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1, maxMinutes: 1 } }), { ...w.deps, browse });
-    expect(out.status).toBe('error');
+    // status 一直不是 idle：即使 done 有残留文字也不收尾（不拉分支）；但会话已受理，超时按受阻收尾，不是裸错误。
+    expect(out.status).toBe('success');
+    expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
     expect(out.text).toContain('超过配置时限');
     expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(0);
   });
 
-  test('空闲却没有本轮 SCK-DONE 终稿：连续确认后受阻交人工核对，不收尾', async () => {
+  test('空闲却没有本轮 SCK-DONE 终稿：客观证据不足仍受阻', async () => {
     const w = world({ extra: gitOk });
     const b = devinBrowse({
       send: [{ ok: true, url: SESSION, cap: 'Free', seats: { used: 0, total: 2 }, echoed: true }],
@@ -919,10 +1395,11 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(out.status).toBe('success');
     expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
     expect(b.calls.filter(s => s.includes(MODE('session')))).toHaveLength(3);
-    expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(0);
+    expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(1);
+    expect(readLaneState(w.commDir)?.taskId).toBeDefined();
   });
 
-  test('工具输出含 DONE/PR、助手没有终稿（mock）：不以工具输出收尾，受阻且不拉取分支', async () => {
+  test('工具输出含 DONE/PR、助手没有终稿（mock）：不以工具输出代替客观证据', async () => {
     const w = world({ extra: gitOk });
     const toolTail = '工具输出：\n[SCK-DONE SCK-tool-only]\nPR: https://github.com/acme/widget/pull/1\n提交：aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nDevin is awaiting instructions';
     const b = devinBrowse({
@@ -932,8 +1409,9 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: b.browse });
     expect(out.status).toBe('success');
     expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
-    // 工具输出只出现在人工核对的现场里，没有被当成助手终稿收尾（没有拉取分支、没有 PR 结果行）。
-    expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(0);
+    // 可以探测远端，但工具输出中的 PR 不足以代替真实远端 HEAD 与 OPEN PR。
+    expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(1);
+    expect(readLaneState(w.commDir)?.taskId).toBeDefined();
     expect(b.calls.filter(s => s.includes(MODE('session')))).toHaveLength(3);
   });
 
@@ -989,12 +1467,43 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const out = await runLane(w.input({ provider: 'devin-cloud', prompt: '继续修复。' }), { ...w.deps, browse: fake.browse });
       expect(out.status).toBe('success');
       expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
-      expect(fake.st.events.slice(0, 8)).toEqual([
-        `visit ${SESSION}`, `visit ${HOME}`, 'click cap', 'click Free', `visit ${SESSION}`, 'fill', '__PRESSED__', `send ${SESSION}`,
+      expect(fake.st.events.slice(0, 10)).toEqual([
+        `visit ${SESSION}`, `visit ${HOME}`, 'pointer cap', 'pointer Free', 'press Escape', 'press Escape', `visit ${SESSION}`, 'fill', '__PRESSED__', `send ${SESSION}`,
       ]);
+      expect(fake.st.events).not.toContain('js cap');
       expect(fake.st.events.filter(e => e.startsWith('send'))).toHaveLength(1);
       expect(readLaneState(w.commDir)?.devin?.seats).toMatchObject({ step: 'follow', cap: 'Free', used: 1, total: 2 });
       expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'merge')).toHaveLength(1);
+    });
+
+    test('续轮发送后页面停在另一个合法会话（同一轮标记块仍在）：受理回执核验地址，回 not_echoed 而不误报已受理（脚本真实执行，合成负例）', async () => {
+      const { devinFollowScript } = await import('../src/runner/cloud-lane/devin-web.ts');
+      const marker = 'SCK-abc123';
+      const msg = `[SCK-ROUND ${marker}]\n\n继续修复。\n\n收尾约定：本轮的最后一条答复以「[SCK-DONE ${marker}]」单独成行开头，随后是完整最终答复。`;
+      // 发送本身落在原会话；发送后把页面挪到另一个合法会话，并在那页也摆上本轮同标记的用户/Devin 块——
+      // 光看转录内容分不出这不是本轮轮询的会话，必须靠地址核验。
+      let fake: ReturnType<typeof fakeDevin>;
+      fake = fakeDevin({
+        seats: { used: 0, total: 2 },
+        sessions: {
+          [SESSION]: OLD_ROUND,
+          [OTHER]: { cap: 'Free', status: 'Devin is awaiting instructions', blocks: [
+            { role: 'user', text: msg },
+            { role: 'devin', text: `[SCK-DONE ${marker}]\n${PR9}` },
+          ] },
+        },
+        onSend: () => { fake.st.url = OTHER; },
+      });
+      const r = await fake.browse(devinFollowScript(SESSION, marker, msg));
+      expect(r).toMatchObject({ ok: false, code: 'not_echoed', url: OTHER });
+      expect(r?.done).toBeUndefined();
+      expect(fake.st.sent).toHaveLength(1);
+      expect(fake.st.sent[0]!.url).toBe(SESSION);
+
+      // 对照组：同样发送后仍停在原会话时，照常回 ok 与已受理（证明地址核验不是把所有续轮回执都拒掉）。
+      const okFake = fakeDevin({ seats: { used: 0, total: 2 }, sessions: { [SESSION]: OLD_ROUND }, onSend: answer(PR9) });
+      const r2 = await okFake.browse(devinFollowScript(SESSION, marker, msg));
+      expect(r2).toMatchObject({ ok: true, url: SESSION, echoed: true });
     });
 
     test('续轮席位满：首页读到 2/2 就不回原会话、不填写、不按下发送，有界等待后受阻', async () => {
@@ -1034,7 +1543,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
         { ...w.deps, browse: advancing(w, fake.browse) });
       const home = fake.st.events.indexOf(`visit ${HOME}`);
       expect(home).toBeGreaterThan(-1);
-      expect(fake.st.events.slice(home)).toContain('click Free');
+      expect(fake.st.events.slice(home)).toContain('pointer Free');
       expect(fake.st.events.slice(home)).toContain(`visit ${SESSION}`);
       expect(fake.st.events).not.toContain('fill');
       expect(fake.st.sent).toHaveLength(0);
@@ -1048,7 +1557,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const out = await runLane(w.input({ provider: 'devin-cloud', prompt: '继续修复。' }), { ...w.deps, browse: fake.browse });
       expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
       expect(out.text).toContain('Free');
-      expect(fake.st.events.filter(e => e.startsWith('click') && e !== 'click cap')).toEqual([]);
+      expect(fake.st.events.filter(e => e.startsWith('pointer') && e !== 'pointer cap')).toEqual([]);
       expect(fake.st.sent).toHaveLength(0);
     });
 
@@ -1066,7 +1575,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const fake = fakeDevin({ seats: { used: 2, total: 2 } });
       const r = await fake.browse(devinSendScript(HOME, 'SCK-abc123', 'msg'));
       expect(r).toEqual({ ok: false, code: 'quota_full', seats: '2/2', cap: 'Free' });
-      expect(fake.st.events).toEqual([`visit ${HOME}`, 'click cap', 'click Free']);
+      expect(fake.st.events).toEqual([`visit ${HOME}`, 'pointer cap', 'pointer Free', 'press Escape', 'press Escape']);
       expect(fake.st.sent).toHaveLength(0);
     });
 
@@ -1079,7 +1588,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(fake.st.events).not.toContain('__PRESSED__');
     });
 
-    test('真实页面脚本 + 驱动层负例：工具输出含 DONE 与 PR、助手没有发言块 → 受阻，不拉取分支、不合并，只发送一次', async () => {
+    test('真实页面脚本 + 驱动层负例：工具输出含 DONE 与 PR 但客观证据不足 → 仍受阻，只发送一次', async () => {
       const w = world({ extra: gitOk });
       const fake = fakeDevin({
         seats: { used: 0, total: 2 },
@@ -1091,7 +1600,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
       expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
       expect(fake.st.sent).toHaveLength(1);
-      expect(w.callsOf(c => c.cmd === 'git' && (c.args[0] === 'fetch' || c.args[0] === 'merge'))).toHaveLength(0);
+      expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(1);
+      expect(readLaneState(w.commDir)?.taskId).toBeDefined();
     });
 
     test('真实页面脚本 + 驱动层正例：助手终稿后紧跟工具输出的 DONE 与 PR → 收尾只用助手终稿', async () => {
@@ -1106,6 +1616,254 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(out.text).not.toContain('/pull/999');
       expect(fake.st.sent).toHaveLength(1);
     });
+  });
+
+  describe('首页选中 Free：指针点击、有界等待与回读（假页面区分指针点击与程序化点击）', () => {
+    /** 选 Free 的步骤：指针打开 Capability、指针点 Free、两次 Escape 逐层收起（真实页面是两层）。 */
+    const PICK = ['pointer cap', 'pointer Free', 'press Escape', 'press Escape'];
+    const pickOf = (events: string[]) => {
+      const at = events.indexOf('pointer cap');
+      return at < 0 ? [] : events.slice(at, at + PICK.length);
+    };
+
+    test('假设 A（程序化点击不开菜单，未证实）下新会话：指针打开 Capability、指针点 Free、回读后两次 Escape 收起，再填写与发送；没有程序化点击', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.status).toBe('success');
+      expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
+      expect(fake.st.events.slice(0, 8)).toEqual([`visit ${HOME}`, ...PICK, 'fill', '__PRESSED__', `send ${NEW_SESSION}`]);
+      expect(fake.st.events.filter(e => e.startsWith('js'))).toEqual([]);
+      expect(fake.st.sent).toHaveLength(1);
+    });
+
+    test('初次与续轮选中 Free 的步骤一致：同样是指针打开、指针点 Free、Escape 收起', async () => {
+      const newW = world({ extra: gitOk });
+      const newFake = fakeDevin({ seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      await runLane(newW.input({ provider: 'devin-cloud' }), { ...newW.deps, browse: newFake.browse });
+      const followW = world({ extra: gitOk });
+      writeLaneState(followW.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
+      const followFake = fakeDevin({ seats: { used: 1, total: 2 }, sessions: { [SESSION]: OLD_ROUND }, onSend: answer(PR9) });
+      await runLane(followW.input({ provider: 'devin-cloud', prompt: '继续修复。' }), { ...followW.deps, browse: followFake.browse });
+      expect(pickOf(newFake.st.events)).toEqual(PICK);
+      expect(pickOf(followFake.st.events)).toEqual(PICK);
+      expect(newFake.st.sent).toHaveLength(1);
+      expect(followFake.st.sent).toHaveLength(1);
+    });
+
+    test('菜单渲染晚于固定等待：有界轮询到唯一的 Free 行出现后再点，不误报受阻', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ menuDelayMs: 4000, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.status).toBe('success');
+      expect(pickOf(fake.st.events)).toEqual(PICK);
+      expect(fake.st.sent).toHaveLength(1);
+    });
+
+    test('点 Free 后档位与席位晚一点才显示：有界轮询读到，再收起菜单并发送', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ capLagMs: 1500, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.status).toBe('success');
+      expect(fake.st.events.slice(0, 8)).toEqual([`visit ${HOME}`, ...PICK, 'fill', '__PRESSED__', `send ${NEW_SESSION}`]);
+    });
+
+    test('点 Free 后档位一直不变（回读超时）：零发送，受阻', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ capLagMs: 600_000, seats: { used: 0, total: 2 } });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(fake.st.events).not.toContain('fill');
+      expect(fake.st.sent).toHaveLength(0);
+    });
+
+    test('页面先有一个隐藏的账户菜单（文档靠前）：只认可见的 Capability 菜单', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ staleMenu: true, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.status).toBe('success');
+      expect(pickOf(fake.st.events)).toEqual(PICK);
+    });
+
+    test('页头另有一个文字为 Free 的按钮：分不清哪个是 Capability，不点任何按钮，有界重试后受阻，零发送', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ outsideFree: true, seats: { used: 0, total: 2 } });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out.text).toContain('无法确定哪个是 Capability');
+      expect(fake.st.events.filter(e => e.startsWith('pointer') || e.startsWith('js'))).toEqual([]);
+      expect(fake.st.events).not.toContain('fill');
+      expect(fake.st.sent).toHaveLength(0);
+    });
+
+    test('菜单里有两个 Free 行：无法确定点哪个，不点 Free，有界重试后受阻，零发送', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ duplicateFreeRow: true, seats: { used: 0, total: 2 } });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out.text).toContain('2 个 Free 行');
+      expect(fake.st.events.filter(e => e.startsWith('pointer') && e !== 'pointer cap')).toEqual([]);
+      expect(fake.st.events.filter(e => e.startsWith('js'))).toEqual([]);
+      expect(fake.st.sent).toHaveLength(0);
+    });
+
+    test('指针点 Free 行没有生效（按钮仍是 Normal）：回读确认不了 Free，零发送', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ freeRowInert: true, seats: { used: 0, total: 2 } });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out.text).toContain('按钮=Normal');
+      expect(fake.st.events).toContain('pointer Free');
+      expect(fake.st.events).not.toContain('fill');
+      expect(fake.st.sent).toHaveLength(0);
+    });
+
+    test('Escape 一直收不起菜单（两层都挡着输入区）：按有界次数后受阻，不填写、不发送', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ escapeInert: true, seats: { used: 0, total: 2 } });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out.text).toContain('按 Escape 后仍挡着页面');
+      // 驱动层会整段重试；每次重试都从首页重新开始，单次尝试里的 Escape 次数都必须有界。
+      const perAttempt: number[] = [];
+      for (const e of fake.st.events) {
+        if (e === `visit ${HOME}`) perAttempt.push(0);
+        else if (e === 'press Escape' && perAttempt.length > 0) perAttempt[perAttempt.length - 1]!++;
+      }
+      expect(perAttempt.length).toBeGreaterThan(0);
+      expect(perAttempt.every(n => n > 0 && n <= 4)).toBe(true);
+      expect(fake.st.events).not.toContain('fill');
+      expect(fake.st.events).not.toContain('__PRESSED__');
+      expect(fake.st.sent).toHaveLength(0);
+    });
+
+    test('选中 Free 后菜单是两层：第一次 Escape 只收 Free 详情、列表仍开；第二次收起列表后才填写并发送（修前单次 Escape 会误拦发送）', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.status).toBe('success');
+      expect(fake.st.escLog).toEqual([1, 0]);
+      expect(pickOf(fake.st.events)).toEqual(PICK);
+      expect(fake.st.events.indexOf('fill')).toBeGreaterThan(fake.st.events.lastIndexOf('press Escape'));
+      expect(fake.st.sent).toHaveLength(1);
+    });
+
+    test('菜单只有一层：一次 Escape 就全部收起，收起后即停，不再多按', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ singleLayer: true, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.status).toBe('success');
+      expect(fake.st.escLog).toEqual([0]);
+      expect(fake.st.events.slice(fake.st.events.indexOf('pointer cap'), fake.st.events.indexOf('fill')))
+        .toEqual(['pointer cap', 'pointer Free', 'press Escape']);
+      expect(fake.st.sent).toHaveLength(1);
+    });
+
+    test('Escape 生效慢一拍（DOM 500ms 后才更新）：等它变化再决定，菜单还在时不重复按', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ escapeLagMs: 500, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.status).toBe('success');
+      expect(fake.st.escLog).toEqual([1, 0]);
+      expect(pickOf(fake.st.events)).toEqual(PICK);
+      expect(fake.st.sent).toHaveLength(1);
+    });
+
+    // 下面两条只看结果，不检查点击方式（点击方式由假设 A 那条负责）：它们用来分开「点击开不开菜单」与「行定位漏 Free」。
+    test('假设 B（程序化点击能开菜单，未证实）+ 旧选择器认得的普通 Free 行（对照）：选中 Free 并发送', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ programmaticCapOpens: true, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.status).toBe('success');
+      expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
+      expect(fake.st.sent).toHaveLength(1);
+    });
+
+    test('假设 B（程序化点击能开菜单，未证实）+ 行定位（合成兼容：Free 行只有 role=menuitem，标签未知，span 只是代表）：旧选择器认不出这一行，新版按 role 认出、指针点中并发送', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ programmaticCapOpens: true, menuItemRows: true, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.status).toBe('success');
+      expect(fake.st.events).toContain('pointer Free');
+      expect(fake.st.sent).toHaveLength(1);
+    });
+
+    test('指针点 Capability 也打不开菜单：不点 Free、不改用程序化点击、零发送，受阻', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ noMenu: true, seats: { used: 0, total: 2 } });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
+      expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out.text).toContain('菜单里没有可见的 Free 行');
+      expect(fake.st.events.filter(e => e.startsWith('pointer') && e !== 'pointer cap')).toEqual([]);
+      expect(fake.st.events.filter(e => e.startsWith('js'))).toEqual([]);
+      expect(fake.st.events).not.toContain('fill');
+      expect(fake.st.sent).toHaveLength(0);
+    });
+
+    test('新会话：选中 Free 但详情没有 powered by SWE-2（不是 SWE-2 Free）→ 零填写零发送，受阻', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ noPowered: true, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1, maxMinutes: 1 } }),
+        { ...w.deps, browse: advancing(w, fake.browse) });
+      expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out.text).toContain('powered=false');
+      expect(fake.st.events).toContain('pointer Free');
+      expect(fake.st.events).not.toContain('fill');
+      expect(fake.st.events).not.toContain('__PRESSED__');
+      expect(fake.st.sent).toHaveLength(0);
+    });
+
+    test('新会话：选中 Free、powered 都有，但读不到席位计数 → 零填写零发送，受阻', async () => {
+      const w = world({ extra: gitOk });
+      const fake = fakeDevin({ noSeats: true, seats: { used: 0, total: 2 }, onSend: answer(PR9) });
+      const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1, maxMinutes: 1 } }),
+        { ...w.deps, browse: advancing(w, fake.browse) });
+      expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out.text).toContain('读不到 Free 席位计数');
+      expect(fake.st.events).not.toContain('fill');
+      expect(fake.st.events).not.toContain('__PRESSED__');
+      expect(fake.st.sent).toHaveLength(0);
+    });
+
+    test('续轮：首页选中 Free 后 powered 或席位读不到 → 不填写、不发送，受阻', async () => {
+      for (const [flag, why] of [[{ noPowered: true }, 'powered=false'], [{ noSeats: true }, '读不到 Free 席位计数']] as const) {
+        const w = world({ extra: gitOk });
+        writeLaneState(w.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
+        const fake = fakeDevin({ ...flag, seats: { used: 1, total: 2 }, sessions: { [SESSION]: OLD_ROUND }, onSend: answer(PR9) });
+        const out = await runLane(w.input({ provider: 'devin-cloud', prompt: '继续修复。', config: { pollMs: 1, maxMinutes: 1 } }),
+          { ...w.deps, browse: advancing(w, fake.browse) });
+        const home = fake.st.events.indexOf(`visit ${HOME}`);
+        expect(home).toBeGreaterThan(-1);
+        expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+        expect(out.text).toContain(why);
+        expect(fake.st.events.slice(home)).toContain('pointer Free');
+        expect(fake.st.events).not.toContain('fill');
+        expect(fake.st.sent).toHaveLength(0);
+      }
+    });
+  });
+
+  test('派工提示：devin-cloud 代码轮写明同会话可换仓库、以本轮仓库与分支为准；不一致时先找到或复用本轮仓库的正确工作树，取不到才受阻；PR 只开在本轮仓库；复核轮与其它通道不带这一段', () => {
+    const repo = { slug: 'acme/widget', branch: 'sck/task-1', defaultBranch: 'main' } as never;
+    const code = vendorPrompt({ provider: 'devin-cloud', prompt: '做事' } as never, repo, { task: '实现需求甲。', review: false } as never);
+    expect(code).toContain('同一个供应商会话可以先后处理不同仓库，但以本轮为准：仓库 acme/widget、分支 sck/task-1。');
+    expect(code).toContain('写文件或提交前，核对当前工作树的 origin 远端与当前分支是否与本轮一致');
+    expect(code).toContain('不一致时，先找到、克隆或复用本轮仓库 acme/widget 的正确任务工作树，核对它的 origin 与分支 sck/task-1 一致后再继续；只有取不到正确工作树时，才以「工作结果：受阻」收尾');
+    expect(code).not.toContain('不一致就停下');
+    expect(code).toContain('最终 PR 只开在本轮仓库 acme/widget，head 为本轮分支 sck/task-1，目标分支 main。');
+    // 仓库、分支、目标分支都从本轮字段取值，换一组字段就换一组文字，不写死任何仓库名。
+    const other = vendorPrompt({ provider: 'devin-cloud', prompt: '做事' } as never,
+      { slug: 'other-org/other-repo', branch: 'feat/x', defaultBranch: 'dev' } as never, { task: '实现需求甲。', review: false } as never);
+    expect(other).toContain('仓库 other-org/other-repo、分支 feat/x。');
+    expect(other).toContain('最终 PR 只开在本轮仓库 other-org/other-repo，head 为本轮分支 feat/x，目标分支 dev。');
+    expect(other).not.toContain('acme/widget');
+    expect(code.indexOf('同一个供应商会话')).toBeLessThan(code.indexOf('实现需求甲。'));
+    expect(code.endsWith('实现需求甲。')).toBe(true);
+    expect(vendorPrompt({ provider: 'devin-cloud', prompt: '做事' } as never, repo, { task: '复核', review: true } as never))
+      .not.toContain('同一个供应商会话');
+    for (const provider of ['codex-cloud', 'jules'] as const)
+      expect(vendorPrompt({ provider, prompt: '做事' } as never, repo, { task: '实现需求甲。', review: false } as never))
+        .not.toContain('同一个供应商会话');
   });
 
   describe('跨员工目录的发送意图（同一 stateRoot、同一任务）', () => {
@@ -1194,6 +1952,240 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(b2.calls.every(s => s.includes(SESSION))).toBe(true);
     });
 
+    test('已受理后重启/换员工目录，真实虚拟化 DOM 下仍零重发取回终稿（需求 2：续接走的是这次修复影响的同一条真实读取路径，不是另一套纯状态 mock）', async () => {
+      const w1 = world({ task, extra: gitOk });
+      writeLaneState(w1.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
+      const a = (async (script: string) => {
+        if (script.includes(MODE('follow'))) return { ok: true, url: SESSION, cap: 'Free', seats: { used: 0, total: 2 }, echoed: true };
+        throw new Error('bridge killed while polling');
+      }) as NonNullable<LaneDeps['browse']>;
+      await runLane(w1.input({ provider: 'devin-cloud', prompt: FOLLOW }), { ...w1.deps, browse: a });
+      expect(readInflight(w1.stateRoot, 'devin-cloud', digestOf(w1, FOLLOW))?.taskUrl).toBe(SESSION);
+
+      // 换员工目录/进程重启后的第二个驱动：不是 devinBrowse 纯状态 mock，而是真的执行 devin-web.ts 生成的脚本，
+      // 对着一个与「本轮用户消息被虚拟化滚出 DOM」描述块同构的假页面（常驻只剩 Devin 作者块，本轮用户锚点要
+      // 滚动到顶才挂载得出来）——证明续接复用走的正是这次有界滚动恢复修复影响的那条真实读取路径，不是另一条
+      // 从来不受虚拟化影响的假路径；且全程只跑会话轮询脚本，一次发送/续轮/找回脚本都不该跑到。
+      type Blk = { author: 'user' | 'devin' | 'tool'; text: string };
+      // SHA 用 gitOk 假路由里 `git rev-parse HEAD` 会报的那个真实值：收尾会拿 Devin 自报的 SHA 核对实际
+      // git HEAD，不一致时改写成实际值并附注说明——这里让两者一致，专注验证虚拟化 DOM 读取与零重发，不节外生枝
+      // 到 SHA 核对这条无关分支。
+      const DONE_TEXT = '完成。\nPR: https://github.com/acme/widget/pull/9\nSHA: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+      const g = globalThis as unknown as Record<string, unknown>;
+      const sendLikeCalls: string[] = [];
+      const b2 = (async (script: string) => {
+        if (script.includes(MODE('send')) || script.includes(MODE('follow')) || script.includes(MODE('recover'))) {
+          sendLikeCalls.push(script);
+          throw new Error('不该走到这里：已受理会话续接不应该再发送/再找新会话');
+        }
+        const marker = /\[SCK-ROUND (SCK-[0-9a-f]+)\]/.exec(script)?.[1] ?? 'SCK-none';
+        const userBlock: Blk = { author: 'user', text: `[SCK-ROUND ${marker}]\n\n任务\n\n收尾约定：本轮的最后一条答复以「[SCK-DONE ${marker}]」单独成行开头，随后是完整最终答复。` };
+        const devinBlock1: Blk = { author: 'devin', text: '已读取仓库现状，开始核对工单。' };
+        const devinBlock2: Blk = { author: 'devin', text: `[SCK-DONE ${marker}]\n${DONE_TEXT}` };
+        const mounted: Blk[] = [devinBlock1, devinBlock2];
+        const atTopBlocks: Blk[] = [userBlock, devinBlock1, devinBlock2];
+        let scrolledTop = false;
+        const scroller = { scrollHeight: 2107, clientHeight: 713, _top: 1394,
+          get scrollTop() { return this._top; }, set scrollTop(v: number) { this._top = v; scrolledTop = v === 0; } };
+        const current = () => (scrolledTop ? atTopBlocks : mounted);
+        // 状态短语只挂在滚动前（自然/常驻）那次快照上，和「本轮用户消息被虚拟化滚出 DOM」描述块里 readScrolled
+        // 的默认约定一致：恢复阶段临时滚到顶那次快照不带它，判定不会错误地采用那次快照。
+        const text = () => [...current().map(b => b.text), ...(scrolledTop ? [] : ['Devin is awaiting instructions'])].join('\n');
+        const mkEl = (b: Blk) => ({ getAttribute: (n: string) => (n === 'data-message-author' ? b.author : null), innerText: b.text, parentElement: scroller });
+        const doc = {
+          documentElement: {},
+          get body() { return { innerText: text() }; },
+          querySelector: (sel: string) => (sel === 'main' ? { innerText: text() }
+            : sel === '[data-sck-cap-trigger]' ? null
+            : sel === '[data-message-author]' ? (current().filter(x => x.author !== 'tool').map(mkEl)[0] ?? null)
+            : {}),
+          querySelectorAll: (sel: string) => (sel === '[data-message-author]' ? current().filter(x => x.author !== 'tool').map(mkEl) : sel === '[role=menu]' ? [] : [{ innerText: 'Free' }]),
+        };
+        const page = {
+          goto: async () => {}, waitForTimeout: async () => {},
+          evaluate: async (fn: (arg?: unknown) => unknown, arg?: unknown) => {
+            g.document = doc; g.location = { href: SESSION, hostname: 'app.devin.ai' };
+            return fn(arg);
+          },
+        };
+        let result: Record<string, unknown> | undefined;
+        const fakeConsole = { log: (line: string) => { if (line.startsWith('__RESULT__')) result = JSON.parse(line.slice('__RESULT__'.length)); } };
+        const run = new Function('taskSpace', 'console', 'process', `return (async () => {${script}})()`);
+        try {
+          await run(async () => ({ pages: async () => [page] }), fakeConsole, { exit() { throw new Error('unexpected exit'); } });
+        } catch (error) {
+          if (result === undefined) throw error;
+        } finally {
+          delete g.document; delete g.location;
+        }
+        return result;
+      }) as NonNullable<LaneDeps['browse']>;
+
+      const w2 = world({ task, extra: gitOk });
+      const out2 = await runLane(w2.input({ provider: 'devin-cloud', prompt: FOLLOW, stateRoot: w1.stateRoot }), { ...w2.deps, browse: b2 });
+      expect(out2.status).toBe('success');
+      expect(out2.text).toContain('PR: https://github.com/acme/widget/pull/9');
+      expect(out2.text).toContain('SHA: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef');
+      expect(sendLikeCalls).toHaveLength(0);
+    });
+
+    test('已受理后转录很长，本轮用户锚点要滚到中段检查点才挂载：有界多检查点遍历命中中段、零重发取回终稿（需求 2 的合成正例——顶部挂载的是更早轮次、自然位置只有本轮 Devin 回复没有用户块，与下面"一直找不到"反例同构；只有算出来的那个中段检查点才挂载本轮用户锚点，证明多检查点遍历真的会系统地试到中段并在那里命中，不是只有顶部命中才算数。真实 DOM 从未采样过中段命中，这里用标明为合成的夹具证明算法本身确有这个能力，不是文档空话）', async () => {
+      const w1 = world({ task, extra: gitOk });
+      writeLaneState(w1.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
+      const a = (async (script: string) => {
+        if (script.includes(MODE('follow'))) return { ok: true, url: SESSION, cap: 'Free', seats: { used: 0, total: 2 }, echoed: true };
+        throw new Error('bridge killed while polling');
+      }) as NonNullable<LaneDeps['browse']>;
+      await runLane(w1.input({ provider: 'devin-cloud', prompt: FOLLOW }), { ...w1.deps, browse: a });
+      expect(readInflight(w1.stateRoot, 'devin-cloud', digestOf(w1, FOLLOW))?.taskUrl).toBe(SESSION);
+
+      type Blk = { author: 'user' | 'devin' | 'tool'; text: string };
+      const DONE_TEXT = '完成。\nPR: https://github.com/acme/widget/pull/42\nSHA: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+      const sendLikeCalls: string[] = [];
+      // 和 devin-web.ts 的 SCROLL_RECOVER_POINTS=5 公式算同一个中段检查点的 scrollTop 值：0、
+      // maxTop/4、maxTop*2/4（中段，即这里要命中的那个）、maxTop*3/4、maxTop。写死在测试里而不是导入
+      // 实现常量——这正是要白盒验证"算法确实会滚到这个具体位置"；公式一旦改了检查点间距，这里会因为
+      // 再也滚不到 MID_TOP 而失败，不会假装通过。
+      const SCROLL_HEIGHT = 2107, CLIENT_HEIGHT = 713, POINTS = 5;
+      const MAX_TOP = SCROLL_HEIGHT - CLIENT_HEIGHT;
+      const MID_TOP = Math.round((MAX_TOP * 2) / (POINTS - 1));
+      const b2 = (async (script: string) => {
+        if (script.includes(MODE('send')) || script.includes(MODE('follow')) || script.includes(MODE('recover'))) {
+          sendLikeCalls.push(script);
+          throw new Error('不该走到这里：已受理会话续接不应该再发送/再找新会话');
+        }
+        const marker = /\[SCK-ROUND (SCK-[0-9a-f]+)\]/.exec(script)?.[1] ?? 'SCK-none';
+        const round1User: Blk = { author: 'user', text: '[SCK-ROUND SCK-old111]\n\n第一轮\n\n收尾约定：「[SCK-DONE SCK-old111]」。' };
+        const round1Devin: Blk = { author: 'devin', text: '[SCK-DONE SCK-old111]\n第一轮完成。' };
+        const myUser: Blk = { author: 'user', text: `[SCK-ROUND ${marker}]\n\n本轮\n\n收尾约定：本轮的最后一条答复以「[SCK-DONE ${marker}]」单独成行开头，随后是完整最终答复。` };
+        const myDevin: Blk = { author: 'devin', text: `[SCK-DONE ${marker}]\n${DONE_TEXT}` };
+        // 自然（常驻）位置只挂载本轮 Devin 回复、没有用户块——与"15eaf1b8 真实事故"同一种虚拟化缺口
+        // （真实采样证实过的那种形态），只是这里嵌在更长的转录里；绝对顶部挂载的是更早的第一轮（不是
+        // 本轮）；只有 MID_TOP 这一个中段检查点才挂载本轮用户块。
+        const bucketAt = (top: number): Blk[] => (top === 0 ? [round1User, round1Devin]
+          : top === MID_TOP ? [myUser, myDevin]
+          : [myDevin]);
+        const scroller = { scrollHeight: SCROLL_HEIGHT, clientHeight: CLIENT_HEIGHT, _top: MAX_TOP,
+          get scrollTop() { return this._top; }, set scrollTop(v: number) { this._top = v; } };
+        const current = () => bucketAt(scroller.scrollTop);
+        // 状态短语只挂在自然/常驻快照上（与"本轮用户消息被虚拟化滚出 DOM"描述块同一约定）：恢复阶段任何
+        // 检查点临时滚动的快照都不带它，判定不会错误地借用它们。
+        const text = () => [...current().map(b => b.text), ...(scroller.scrollTop === MAX_TOP ? ['Devin is awaiting instructions'] : [])].join('\n');
+        const mkEl = (b: Blk) => ({ getAttribute: (n: string) => (n === 'data-message-author' ? b.author : null), innerText: b.text, parentElement: scroller });
+        const doc = {
+          documentElement: {},
+          get body() { return { innerText: text() }; },
+          querySelector: (sel: string) => (sel === 'main' ? { innerText: text() }
+            : sel === '[data-sck-cap-trigger]' ? null
+            : sel === '[data-message-author]' ? (current().filter(x => x.author !== 'tool').map(mkEl)[0] ?? null)
+            : {}),
+          querySelectorAll: (sel: string) => (sel === '[data-message-author]' ? current().filter(x => x.author !== 'tool').map(mkEl) : sel === '[role=menu]' ? [] : [{ innerText: 'Free' }]),
+        };
+        const page = {
+          goto: async () => {}, waitForTimeout: async () => {},
+          evaluate: async (fn: (arg?: unknown) => unknown, arg?: unknown) => {
+            g.document = doc; g.location = { href: SESSION, hostname: 'app.devin.ai' };
+            return fn(arg);
+          },
+        };
+        let result: Record<string, unknown> | undefined;
+        const fakeConsole = { log: (line: string) => { if (line.startsWith('__RESULT__')) result = JSON.parse(line.slice('__RESULT__'.length)); } };
+        const run = new Function('taskSpace', 'console', 'process', `return (async () => {${script}})()`);
+        try {
+          await run(async () => ({ pages: async () => [page] }), fakeConsole, { exit() { throw new Error('unexpected exit'); } });
+        } catch (error) {
+          if (result === undefined) throw error;
+        } finally {
+          delete g.document; delete g.location;
+        }
+        return result;
+      }) as NonNullable<LaneDeps['browse']>;
+
+      const w2 = world({ task, extra: gitOk });
+      const out2 = await runLane(w2.input({ provider: 'devin-cloud', prompt: FOLLOW, stateRoot: w1.stateRoot }), { ...w2.deps, browse: b2 });
+      expect(out2.status).toBe('success');
+      expect(out2.text).toContain('PR: https://github.com/acme/widget/pull/42');
+      expect(out2.text).toContain('SHA: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef');
+      expect(sendLikeCalls).toHaveLength(0);
+    });
+
+    test('已受理后转录很长，本轮用户锚点真的不在任何检查点上：多检查点遍历全部落空仍不误判已受理，保持受阻并保留会话地址（需求 2 的反例对照——证明上面那条"中段检查点命中"的正例不是把"找不到就放弃"放宽成"随便找到点什么就算数"，遍历确实耗尽、安全兜底依然成立）', async () => {
+      const w1 = world({ task, extra: gitOk });
+      writeLaneState(w1.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
+      const a = (async (script: string) => {
+        if (script.includes(MODE('follow'))) return { ok: true, url: SESSION, cap: 'Free', seats: { used: 0, total: 2 }, echoed: true };
+        throw new Error('bridge killed while polling');
+      }) as NonNullable<LaneDeps['browse']>;
+      await runLane(w1.input({ provider: 'devin-cloud', prompt: FOLLOW }), { ...w1.deps, browse: a });
+      expect(readInflight(w1.stateRoot, 'devin-cloud', digestOf(w1, FOLLOW))?.taskUrl).toBe(SESSION);
+
+      // 本轮是第 N 轮续轮，本轮用户消息是转录里最新内容，自然位置停在更早的第二轮（不是本轮），绝对顶部
+      // 只露出更早的第一轮（更不是本轮）——这个二值 mock（只分顶部/非顶部两种内容）意味着 SCROLL_RECOVER_POINTS
+      // 个检查点里，除了 p=0（顶部）之外全部落在"非顶部"桶，统统是第二轮，全程找不到本轮标记，是真的遍历
+      // 耗尽，不是只试了一次就放弃。断言的是安全兜底：不静默、不误判已受理、不重发，受阻文本保留会话地址，
+      // 与 devin.ts 里已有的"转录里一直看不到本轮标记"驱动层测试（纯状态 mock）同一结论，这里走的是真实
+      // devin-web.ts 生成脚本在假页面里执行的那条路径，不是另一套纯状态 mock。
+      type Blk = { author: 'user' | 'devin' | 'tool'; text: string };
+      const sendLikeCalls: string[] = [];
+      const b2 = (async (script: string) => {
+        if (script.includes(MODE('send')) || script.includes(MODE('follow')) || script.includes(MODE('recover'))) {
+          sendLikeCalls.push(script);
+          throw new Error('不该走到这里：找不到本轮锚点时只受阻，绝不重发或新建会话');
+        }
+        const round2User: Blk = { author: 'user', text: '[SCK-ROUND SCK-old222]\n\n第二轮\n\n收尾约定：「[SCK-DONE SCK-old222]」。' };
+        const round2Devin: Blk = { author: 'devin', text: '[SCK-DONE SCK-old222]\n第二轮完成。' };
+        const round1User: Blk = { author: 'user', text: '[SCK-ROUND SCK-old111]\n\n第一轮\n\n收尾约定：「[SCK-DONE SCK-old111]」。' };
+        const round1Devin: Blk = { author: 'devin', text: '[SCK-DONE SCK-old111]\n第一轮完成。' };
+        // 自然（常驻）位置停在第二轮；滚到顶只会露出第一轮——本轮（marker）两处都不在，模拟锚点在底部/中段。
+        const mounted: Blk[] = [round2User, round2Devin];
+        const atTopBlocks: Blk[] = [round1User, round1Devin];
+        let scrolledTop = false;
+        const scroller = { scrollHeight: 2107, clientHeight: 713, _top: 1394,
+          get scrollTop() { return this._top; }, set scrollTop(v: number) { this._top = v; scrolledTop = v === 0; } };
+        const current = () => (scrolledTop ? atTopBlocks : mounted);
+        const text = () => current().map(b => b.text).join('\n');
+        const mkEl = (b: Blk) => ({ getAttribute: (n: string) => (n === 'data-message-author' ? b.author : null), innerText: b.text, parentElement: scroller });
+        const doc = {
+          documentElement: {},
+          get body() { return { innerText: text() }; },
+          querySelector: (sel: string) => (sel === 'main' ? { innerText: text() }
+            : sel === '[data-sck-cap-trigger]' ? null
+            : sel === '[data-message-author]' ? (current().filter(x => x.author !== 'tool').map(mkEl)[0] ?? null)
+            : {}),
+          querySelectorAll: (sel: string) => (sel === '[data-message-author]' ? current().filter(x => x.author !== 'tool').map(mkEl) : sel === '[role=menu]' ? [] : [{ innerText: 'Free' }]),
+        };
+        const page = {
+          goto: async () => {}, waitForTimeout: async () => {},
+          evaluate: async (fn: (arg?: unknown) => unknown, arg?: unknown) => {
+            g.document = doc; g.location = { href: SESSION, hostname: 'app.devin.ai' };
+            return fn(arg);
+          },
+        };
+        let result: Record<string, unknown> | undefined;
+        const fakeConsole = { log: (line: string) => { if (line.startsWith('__RESULT__')) result = JSON.parse(line.slice('__RESULT__'.length)); } };
+        const run = new Function('taskSpace', 'console', 'process', `return (async () => {${script}})()`);
+        try {
+          await run(async () => ({ pages: async () => [page] }), fakeConsole, { exit() { throw new Error('unexpected exit'); } });
+        } catch (error) {
+          if (result === undefined) throw error;
+        } finally {
+          delete g.document; delete g.location;
+        }
+        return result;
+      }) as NonNullable<LaneDeps['browse']>;
+
+      const w2 = world({ task, extra: gitOk });
+      const out2 = await runLane(w2.input({ provider: 'devin-cloud', prompt: FOLLOW, stateRoot: w1.stateRoot }), { ...w2.deps, browse: b2 });
+      expect(out2.status).toBe('success');
+      expect(out2.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out2.text).toContain('一直找不到本轮消息');
+      expect(out2.text).toContain('未重发');
+      expect(out2.text).toContain(SESSION);
+      expect(sendLikeCalls).toHaveLength(0);
+      const st = readLaneState(w2.commDir);
+      expect(st?.taskUrl).toBe(SESSION);
+    });
+
     test('新会话的发送意图未确认：B 本地残留的旧会话地址不用来核对，只按标记在会话列表里找', async () => {
       const w1 = world({ task, extra: gitOk });
       await runLane(w1.input({ provider: 'devin-cloud', prompt: FOLLOW }), { ...w1.deps, browse: killedBefore('send') });
@@ -1242,7 +2234,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(readInflight(w1.stateRoot, 'devin-cloud', d1)?.attempt).toMatch(/^SCK-/);
     });
 
-    test('换摘要重派：同一任务在另一目录的会话仍在途（已受理、未收尾）→ 跟进同一会话并标明是后续轮次，不另建会话', async () => {
+    test('有 findings 的返工重派：仍在途的旧会话只复用地址，发返工跟进而非领养旧终稿', async () => {
       const w1 = world({ task, extra: gitOk });
       const a = (async (script: string) => {
         if (script.includes(MODE('send'))) return { ok: true, url: SESSION, cap: 'Free', seats: { used: 0, total: 2 }, echoed: true };
@@ -1252,6 +2244,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(readInflight(w1.stateRoot, 'devin-cloud', digestOf(w1, FOLLOW))?.taskUrl).toBe(SESSION);
 
       const w2 = world({ task, extra: gitOk });
+      mkdirSync(join(w2.commDir, 'findings'));
+      writeFileSync(join(w2.commDir, 'findings', 'round-01.md'), '补上失败用例。');
       const b2 = devinBrowse({
         follow: [{ ok: true, url: SESSION, cap: 'Free', seats: { used: 1, total: 2 }, echoed: true }],
         session: [idleDone(PR9)],
@@ -1276,13 +2270,14 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
      * 用户/自动化消息是 [data-message-author="user"]；工具输出与 worklog 没有作者属性。
      * tool 块只进 main/body 文字，不进 [data-message-author]，对应真实页面的工具输出。
      */
-    const runPage = async (doc: Record<string, unknown>, marker = M) => {
+    /** href 默认等于 devinSessionScript 轮询的目标会话（SESSION）；传别的地址用于模拟 goto 失败被吞、停在另一个会话。 */
+    const runPage = async (doc: Record<string, unknown>, marker = M, href = SESSION) => {
       const { devinSessionScript } = await import('../src/runner/cloud-lane/devin-web.ts');
       const page = {
         goto: async () => {}, waitForTimeout: async () => {},
         evaluate: async (fn: (arg?: unknown) => unknown, arg?: unknown) => {
           g.document = doc;
-          g.location = { href: SESSION, hostname: 'app.devin.ai' };
+          g.location = { href, hostname: 'app.devin.ai' };
           return fn(arg);
         },
       };
@@ -1290,14 +2285,19 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const fakeConsole = { log: (line: string) => { if (line.startsWith('__RESULT__')) result = JSON.parse(line.slice('__RESULT__'.length)); } };
       const run = new Function('taskSpace', 'console', 'process', `return (async () => {${devinSessionScript(SESSION, marker)}})()`);
       try {
+        // emit() 后紧跟 process.exit(0) 是真实脚本里每条早退码（login_required/not_ready/wrong_session……）
+        // 共用的正常收尾写法：已经拿到回执（result 已被 emit 写入）时的 exit 不算测试异常，按正常提前返回处理；
+        // 没有任何回执就退出才是真的「意外退出」，继续往外抛，不吞掉。
         await run(async () => ({ pages: async () => [page] }), fakeConsole, { exit() { throw new Error('unexpected exit'); } });
+      } catch (error) {
+        if (result === undefined) throw error;
       } finally {
         delete g.document;
         delete g.location;
       }
       return result;
     };
-    const readPage = async (blocks: Block[], rest = '', marker = M) => {
+    const readPage = async (blocks: Block[], rest = '', marker = M, href = SESSION) => {
       const text = [...blocks.map(b => b.text), rest].filter(Boolean).join('\n');
       const elements = blocks.filter(b => b.author !== 'tool').map(b => ({
         getAttribute: (name: string) => (name === 'data-message-author' ? b.author : null),
@@ -1305,10 +2305,11 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       }));
       const doc = {
         body: { innerText: text },
-        querySelector: (sel: string) => (sel === 'main' ? { innerText: text } : {}),
-        querySelectorAll: (sel: string) => (sel === '[data-message-author]' ? elements : [{ innerText: 'Free' }]),
+        querySelector: (sel: string) => (sel === 'main' ? { innerText: text } : sel === '[data-sck-cap-trigger]' ? null : {}),
+        // 终稿与状态判定不涉及 Capability 菜单：页面上没有可见菜单。
+        querySelectorAll: (sel: string) => (sel === '[data-message-author]' ? elements : sel === '[role=menu]' ? [] : [{ innerText: 'Free' }]),
       };
-      return runPage(doc, marker);
+      return runPage(doc, marker, href);
     };
 
     test('只有用户消息、没有助手答复（DOM 反例）：没有终稿，状态 unknown', async () => {
@@ -1378,6 +2379,151 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(r?.done).toBe('完成。\nPR: https://github.com/acme/widget/pull/9\nSHA: cafecafe');
     });
 
+    describe('本轮用户消息被虚拟化滚出 DOM（15eaf1b8 真实事故回归：有界滚动恢复转录上下文）', () => {
+      /**
+       * DOM 形态与数值取自负责人 2026-11-17 的真实只读采样（非本任务采集，路径见下）：
+       * - free-delivery-closeout-dom-structure.json：常驻（未滚动）状态下 devinAuthorBlocks=2、userAuthorBlocks=0。
+       * - free-delivery-closeout-scroll-probe.json：同一会话把转录容器 scrollTop 设为 0 后
+       *   userAuthorBlocks=1、devinAuthorBlocks 仍是 2；还原 scrollTop 后又变回 userAuthorBlocks=0——证明内容
+       *   还在只是没挂载，且这个过程可逆。
+       * - free-delivery-closeout-dom-evidence.json 的 lastDevinBlockText：真实业务 15eaf1b8 的终稿
+       *   （会话 51eb95d7616a41a081da5648192a1c7d、标记 SCK-b7c92fe64c、PR255、SHA 107222e5...）。
+       *   REAL_DONE_BODY 是这段终稿的压缩摘录（保留标记行、PR、SHA 等判定要用到的字段），不是逐字原文。
+       * 用户块（REAL_USER）的具体文字是合成重建：证据文件只采样了它在/不在 DOM 里的计数，没有采样其原文，
+       * 这里按已知的标记与收尾约定格式重建，足以驱动 roundStart 的锚点匹配。
+       * readScrolled 模拟这套虚拟化：mountedAtRest 是常驻（底部）时渲染的作者块，allBlocks 是滚动容器
+       * scrollTop 归零后真实挂载出来的完整作者块集合；withScroller=false 时不给任何元素挂可滚动的
+       * parentElement，等价于「找不到可滚动祖先」——这时 devin-web.ts 的恢复分支整段跳过，落回与本次修复前
+       * （以及任何更早版本，因为它们从未尝试过这道恢复）完全相同的公式，可以直接当「修前」对照用，不需要
+       * 另外跑一份旧代码。
+       */
+      const REAL_MARKER = 'SCK-b7c92fe64c';
+      const REAL_DONE_BODY = '[SCK-DONE SCK-b7c92fe64c]\n\n工作结果：完成。改动仅 TODOS.md。\n\nPR: \u2060surreal_ck#255\nSHA: 107222e536d1a7a678e2d23314569ee732be63ff';
+      const REAL_USER: Block = { author: 'user', text: `[SCK-ROUND ${REAL_MARKER}]\n\n更新 surreal_ck TODO 索引\n\n收尾约定：本轮的最后一条答复以「[SCK-DONE ${REAL_MARKER}]」单独成行开头，随后是完整最终答复。` };
+      const REAL_DEVIN_1: Block = { author: 'devin', text: '已读取仓库现状，开始核对工单。' };
+      const REAL_DEVIN_2: Block = { author: 'devin', text: REAL_DONE_BODY };
+      const mountedAtRest: Block[] = [REAL_DEVIN_1, REAL_DEVIN_2];
+      const allBlocks: Block[] = [REAL_USER, REAL_DEVIN_1, REAL_DEVIN_2];
+      const STATUS_TEXT = 'Devin is awaiting instructions';
+
+      /**
+       * statusAt 默认 'natural'：状态短语只挂在滚动前（自然/常驻）那次快照上，恢复阶段临时滚到顶那次快照
+       * 完全没有它——这才是与常驻采样一致的形态（devinAuthorBlocks 常驻就有，状态短语是页面持续渲染的 chrome，
+       * 不是虚拟化列表项，没有证据证明它会随「滚到顶」这个临时动作消失或出现在别处）。不论滚动到哪里都无条件
+       * 附带状态短语的旧版 text()，结构上测不出「如果判定错误地采用了恢复循环最后一次留下的快照」这种回归：
+       * default 改成只在自然位置出现后，下面三个既有用例若改回从恢复循环的快照取状态就会读错，才具备这道
+       * 回归检测能力。'top' 用于下面专门验证「不会误读那次临时快照」的反向用例。
+       */
+      const readScrolled = async (
+        mounted: Block[], atTopBlocks: Block[],
+        opts: { withScroller?: boolean; statusAt?: 'natural' | 'top' | 'none' } = {},
+        marker = REAL_MARKER,
+      ) => {
+        const withScroller = opts.withScroller ?? true;
+        const statusAt = opts.statusAt ?? 'natural';
+        let atTop = false;
+        const scroller = { scrollHeight: 2107, clientHeight: 713, _top: 1394,
+          get scrollTop() { return this._top; }, set scrollTop(v: number) { this._top = v; atTop = v === 0; } };
+        const current = () => (atTop ? atTopBlocks : mounted);
+        const showStatus = () => (statusAt === 'natural' ? !atTop : statusAt === 'top' ? atTop : false);
+        const text = () => [...current().map(b => b.text), ...(showStatus() ? [STATUS_TEXT] : [])].filter(Boolean).join('\n');
+        const mkAuthorEl = (b: Block) => ({
+          getAttribute: (name: string) => (name === 'data-message-author' ? b.author : null),
+          innerText: b.text,
+          parentElement: withScroller ? scroller : undefined,
+        });
+        const authorEls = () => current().filter(b => b.author !== 'tool').map(mkAuthorEl);
+        const doc = {
+          documentElement: {},
+          // 取值要跟 main 一样实时反映当前挂载状态（真实 document.body.innerText 本就是活的），
+          // 否则 waitReady() 的两次连续读数一致检查永远通不过（len 会一直是冻结的空字符串长度）。
+          get body() { return { innerText: text() }; },
+          querySelector: (sel: string) => (sel === 'main' ? { innerText: text() }
+            : sel === '[data-sck-cap-trigger]' ? null
+            : sel === '[data-message-author]' ? (authorEls()[0] ?? null)
+            : {}),
+          querySelectorAll: (sel: string) => (sel === '[data-message-author]' ? authorEls() : sel === '[role=menu]' ? [] : [{ innerText: 'Free' }]),
+        };
+        return runPage(doc, marker);
+      };
+
+      test('真实事故形态：常驻只剩 Devin 作者块与本轮 DONE；找不到可滚动祖先时保持修前的误判，可滚动恢复时读出修后的正确终稿与状态', async () => {
+        // 对照（等价于修前/任何更早版本）：同一份常驻 DOM，没有可滚动祖先可恢复 —— 和没有这道恢复时一样误判。
+        const before = await readScrolled(mountedAtRest, allBlocks, { withScroller: false });
+        expect(before?.done).toBeNull();
+        expect(before).toMatchObject({ markerSeen: false, status: 'unknown', source: 'roles' });
+        // 本修复：同一份常驻 DOM，承载作者块的最近可滚动祖先滚到顶后能恢复出本轮用户锚点。
+        const after = await readScrolled(mountedAtRest, allBlocks, { withScroller: true });
+        expect(after).toMatchObject({ ok: true, markerSeen: true, status: 'idle', source: 'roles' });
+        expect(after?.done).toContain('SHA: 107222e536d1a7a678e2d23314569ee732be63ff');
+        expect(after?.done).toContain('surreal_ck#255');
+      });
+
+      test('状态短语只认滚动前的自然快照：即使那次临时滚到顶的快照里才有状态短语，判定也不会借用它（覆盖"顶部快照是否连带挂载状态短语未经验证"这道结构性漏判）', async () => {
+        // 和上一个用例反过来：状态短语只挂在"滚到顶"之后的快照上（statusAt: 'top'），自然（未滚动）快照完全
+        // 没有它。如果判定错误地采用了恢复循环最后一次留下的快照（而不是滚动前的自然快照），这里就会错误地
+        // 读出 status:'idle'；真实只读采样从未证实状态短语会出现在那次临时滚动的快照里，所以正确答案是 unknown——
+        // 锚点恢复（markerSeen、done）不受影响，只有状态判定必须保持不采信那次快照。
+        const r = await readScrolled(mountedAtRest, allBlocks, { withScroller: true, statusAt: 'top' });
+        expect(r?.markerSeen).toBe(true);
+        expect(r?.done).toContain('SHA: 107222e536d1a7a678e2d23314569ee732be63ff');
+        expect(r?.status).toBe('unknown');
+      });
+
+      test('滚动恢复出的用户块若是旧轮（标记不同），仍不算本轮锚点：不把旧轮当本轮，重试耗尽后照样拒绝终稿', async () => {
+        const oldRoundUser: Block = { author: 'user', text: '[SCK-ROUND SCK-old999]\n\n旧任务\n\n收尾约定：「[SCK-DONE SCK-old999]」。' };
+        const r = await readScrolled(mountedAtRest, [oldRoundUser, REAL_DEVIN_1, REAL_DEVIN_2], { withScroller: true });
+        // done 与 markerSeen 是收尾判定实际依赖的两道门（devin.ts 收尾要求 status===idle && seen && answer 三者皆真），
+        // 旧轮标记不等于本轮标记，这两道门必须保持拒绝——这里不断言 status，因为 CONV_OPEN 锚点本身不分标记
+        // （只认「最近一次收尾约定」的位置，不检查它引述的是哪个标记），这是基线既有行为，不是本次改动引入的。
+        expect(r?.done).toBeNull();
+        expect(r?.markerSeen).toBe(false);
+      });
+
+      test('滚动恢复出的仍然只是工具/旧轮文本、没有本轮用户块时：不靠标记在别处出现过或存在某条 DONE 文本冒充已受理', async () => {
+        const unrelatedTop: Block[] = [REAL_DEVIN_1, REAL_DEVIN_2];
+        const r = await readScrolled(mountedAtRest, unrelatedTop, { withScroller: true });
+        expect(r?.done).toBeNull();
+        expect(r).toMatchObject({ markerSeen: false, status: 'unknown' });
+      });
+    });
+
+    describe('错误会话：goto 失败被自己的 catch 吞掉，页面留在另一个合法会话上（发布前复核新发现的负例，非生产事故）', () => {
+      /**
+       * openPage 的 `await p.goto(target).catch(() => {})` 会吞掉导航失败：页面可能还留在上一个地址上。
+       * 这里构造的「另一个会话」是合成场景（给 location.href 换一个不同的、同样合法形态的 app.devin.ai/sessions/
+       * 地址），不是生产里真的发生过的事故；验证的是脚本自己的地址核验，不依赖它凑巧没有同标记内容——下面特意让
+       * 这个「错误会话」页面仍带着本轮同标记的用户/Devin 作者块，证明光靠转录内容分不出这是不是本轮轮询的那个
+       * 会话，必须另外核对 location.href。
+       */
+      const OTHER_SESSION = 'https://app.devin.ai/sessions/ffffffffffffffffffffffffffffffff';
+      const DONE_TEXT = '完成。\nPR: https://github.com/acme/widget/pull/9\nSHA: cafecafe';
+      const sameRoundBlocks: Block[] = [
+        { author: 'user', text: `[SCK-ROUND ${M}]\n\n任务\n\n${CONV}` },
+        { author: 'devin', text: `[SCK-DONE ${M}]\n${DONE_TEXT}` },
+      ];
+
+      test('页面停在另一个合法会话（同标记用户/Devin 块仍在）：按 wrong_session 拒绝，不把它当本轮受理或终稿', async () => {
+        const r = await readPage(sameRoundBlocks, 'Devin chose to stop working', M, OTHER_SESSION);
+        expect(r).toMatchObject({ ok: false, code: 'wrong_session', url: OTHER_SESSION });
+        // ok:false 回执不带 done/markerSeen/status：不能被当成已受理或终稿读出。
+        expect(r?.done).toBeUndefined();
+        expect(r?.markerSeen).toBeUndefined();
+      });
+
+      test('页面确实停在目标会话上：地址核验通过，照常读出受理与终稿（对照组，证明核验不是误拦所有读数）', async () => {
+        const r = await readPage(sameRoundBlocks, 'Devin chose to stop working', M, SESSION);
+        expect(r).toMatchObject({ ok: true, markerSeen: true, status: 'idle' });
+        expect(r?.done).toBe(DONE_TEXT);
+      });
+
+      test('会话地址的 query/hash 不参与核验：带查询串或锚点的同一会话地址仍算命中（"可规范化 query/hash"）', async () => {
+        const r = await readPage(sameRoundBlocks, 'Devin chose to stop working', M, `${SESSION}?tab=files#latest`);
+        expect(r).toMatchObject({ ok: true, markerSeen: true, status: 'idle' });
+        expect(r?.done).toBe(DONE_TEXT);
+      });
+    });
+
     test('续轮前上一轮还在工作（它的收尾约定之后是 Devin is working）：状态 working，会话判忙', async () => {
       const r = await readPage([
         { author: 'user', text: `[SCK-ROUND SCK-old999]\n\n第一轮\n\n收尾约定：本轮的最后一条答复以「[SCK-DONE SCK-old999]」单独成行开头。` },
@@ -1394,10 +2540,10 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const authors = [{ author: 'user', text: userText }, { author: 'devin', text: reply }];
       const doc = {
         body: { innerText: main },
-        querySelector: (sel: string) => (sel === 'main' ? { innerText: main } : {}),
+        querySelector: (sel: string) => (sel === 'main' ? { innerText: main } : sel === '[data-sck-cap-trigger]' ? null : {}),
         querySelectorAll: (sel: string) => (sel === '[data-message-author]'
           ? authors.map(b => ({ getAttribute: (name: string) => (name === 'data-message-author' ? b.author : null), innerText: b.text }))
-          : [{ innerText: 'Free' }]),
+          : sel === '[role=menu]' ? [] : [{ innerText: 'Free' }]),
       };
       const r = await runPage(doc);
       expect(r).toMatchObject({ ok: true, markerSeen: true, status: 'idle', source: 'roles' });
@@ -1436,7 +2582,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const doc = {
         body: { innerText: text },
         querySelector: (sel: string) => (sel === 'main' ? { innerText: text } : {}),
-        querySelectorAll: () => [{ innerText: 'Free' }],
+        querySelectorAll: (sel: string) => (sel === '[role=menu]' ? [] : [{ innerText: 'Free' }]),
       };
       const r = await runPage(doc);
       expect(r?.source).toBe('text-only');

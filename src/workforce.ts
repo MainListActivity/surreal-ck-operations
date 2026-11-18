@@ -640,7 +640,10 @@ export class Workforce {
       IF $t.current_employee != $key OR $t.delivery_id != $delivery OR $t.fence != $fence OR $t.lease_expires_at <= time::unix(time::now()) { THROW 'dispatch lease changed' };
       IF $t.dispatch_attempt != NONE OR $e.dispatch_attempt != NONE { THROW 'dispatch already isolated' };
       LET $msg = SELECT * FROM ONLY $message;
-      IF $msg = NONE OR $msg.task != $task OR $msg.state = 'sent' OR $msg.hold = true OR $msg.dispatch_attempt != NONE { THROW 'dispatch message changed' };
+      IF $msg = NONE OR $msg.task != $task OR $msg.state != 'draft' OR $msg.hold = true OR $msg.dispatch_attempt != NONE { THROW 'dispatch message changed' };
+      LET $rival = SELECT id FROM outbound_message WHERE task = $task AND step = $msg.step AND id != $message
+        AND state != 'sent' AND (hold = true OR state = 'held' OR body_edited = true) LIMIT 1;
+      IF array::len($rival) > 0 { THROW 'dispatch draft conflict' };
       IF $input.messageRevision != NONE AND ${outboundRevisionSql('$msg.')} != $input.messageRevision { THROW 'dispatch message revision changed' };
       CREATE $attempt CONTENT $input;
       UPDATE ONLY $message SET dispatch_attempt = $attempt, dispatch_body = $body;

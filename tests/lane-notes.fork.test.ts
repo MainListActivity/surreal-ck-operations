@@ -535,7 +535,7 @@ run('第 2 步后半：退回的完工分析写进返工消息；把握不足扣
   await db.db.query('DELETE company_meta:analysis;');
   await store.ensureQueuedDrafts([e.id]);
   expect(await store.awaitingAnalysis(e.id, 'rework')).toBe(false);
-  // 老板改过正文并发出；下一轮退回照抄老板的正文，旧的复盘去掉，换成新一轮的。
+  // 老板改过的字面正文跨回合原样保留，不能再自动删改其中的复盘段。
   await drain(model('high'));
   await store.ensureQueuedDrafts([e.id]);
   const edited = await store.edit((await draftOf(e.id)).id, `${(await draftOf(e.id)).body}\n\n老板补充：时间用北京时间。`, 'owner');
@@ -545,8 +545,9 @@ run('第 2 步后半：退回的完工分析写进返工消息；把握不足扣
   await drain(model('high', '上一轮文件名日期仍是 UTC。先改文件名的日期。'));
   await store.ensureQueuedDrafts([e.id]);
   const second = await draftOf(e.id);
-  expect(second.body).toContain('上一轮文件名日期仍是 UTC。先改文件名的日期。');
-  expect(second.body).not.toContain('上一轮导出报 500');
+  expect(second.body).toBe(edited.body);
+  expect(second.bodyVerbatim).toBe(true);
+  expect(second.bodyEdited).toBe(true);
   expect(second.body).toContain('老板补充：时间用北京时间。');
   expect(second.hold).toBe(true); // 第二轮返工照旧扣住。
 });

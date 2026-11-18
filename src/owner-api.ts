@@ -10,12 +10,12 @@ import { readProgress } from './task-progress.ts';
 import { randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import { OwnerDesk } from './owner.ts';
+import { OwnerDesk, withSessionCheck } from './owner.ts';
 import type { CompanyCore } from './contracts.ts';
 import { preferredProviderValue, Workforce } from './workforce.ts';
 import { lanePreferenceValue } from './dispatcher/lane-preference.ts';
 import { OutboundMessageStore, type OutboundMessage } from './outbound-messages.ts';
-import { bodyOfDispatch, unrenderMessage } from './outbound-render.ts';
+import { bodyOfDispatch } from './outbound-render.ts';
 import { turnAnalysesOf } from './turn-analysis.ts';
 import { findingsFileOf, readBoard, readBoardView, renderContextFor } from './board.ts';
 import { CompanyError } from './core-errors.ts';
@@ -30,11 +30,14 @@ import { QUOTA_ROWS } from './dispatcher/quota-store.ts';
 import { hostIOOrUndefined } from './host-io.ts';
 import { planMessage, readMessageChains } from './message-chain.ts';
 import type { AgentAction, AgentActivity } from './agent-activity.ts';
+import { redactSecrets } from './ops/redact.ts';
+import type { NodeSteward } from './steward/steward.ts';
 
 export type OwnerVia = string;
 export interface OwnerApiContext { db: CompanyDatabase; core: CompanyCore & {
   contributorDryRun(credential: string, input: { taskIds: string[] }): Promise<unknown>;
-}; owner: OwnerDesk; workforce: Workforce; messages: OutboundMessageStore; opsRepo: string }
+}; owner: OwnerDesk; workforce: Workforce; messages: OutboundMessageStore; opsRepo: string;
+  steward?: Pick<NodeSteward, 'draft'> }
 
 const actor = (via: string) => `owner:${via || 'web'}`;
 const text = (value: unknown, field: string, min = 1, max = 20000): string => {
@@ -42,6 +45,11 @@ const text = (value: unknown, field: string, min = 1, max = 20000): string => {
   return value.trim();
 };
 const optionalText = (value: unknown): string | undefined => typeof value === 'string' && value.trim() ? value.trim() : undefined;
+/** 正文校验与其他文本相同，但不裁掉老板有意保留的空格、缩进和换行。 */
+const messageText = (value: unknown, field: string): string => {
+  text(value, field);
+  return value as string;
+};
 const strArray = (value: unknown): string[] => Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
 
 /**
@@ -49,12 +57,35 @@ const strArray = (value: unknown): string[] => Array.isArray(value) ? value.filt
  * A process without an execution host (a Worker, for one) answers them with CompanyError('unavailable'); the owner gateway
  * queues them as ops_job records for the execution end instead.
  */
-export const RUNNER_ONLY_COMMANDS: ReadonlySet<string> = new Set(['task.create']);
+export const RUNNER_ONLY_COMMANDS: ReadonlySet<string> = new Set(['task.create', 'message.draft']);
+
+async function rememberStyle(ctx: OwnerApiContext, before: OutboundMessage, after: OutboundMessage): Promise<void> {
+  if (before.body === after.body) return;
+  try {
+    const [rows] = await ctx.db.db.query<[Array<{ project?: unknown }>]>(
+      'SELECT project FROM $task;', { task: new RecordId('task', after.taskId) });
+    await ctx.db.db.query(`CREATE owner_style_memory CONTENT {
+      task: $task, project: $project, step: $step, before_body: $before_body, after_body: $after_body, at: time::now()
+    };`, {
+      task: new RecordId('task', after.taskId),
+      project: rows?.[0]?.project == null ? undefined : redactSecrets(String(rows[0].project)), step: after.step,
+      before_body: redactSecrets(before.body), after_body: redactSecrets(after.body),
+    });
+  } catch { console.warn('owner_style_memory write failed'); }
+}
+
+async function editMessage(ctx: OwnerApiContext, id: string, body: string, actor: string, expected?: string): Promise<OutboundMessage> {
+  const before = await ctx.messages.get(id);
+  if (!before) throw new CompanyError('not_found', 'message not found');
+  const after = await ctx.messages.edit(id, body, actor, expected ?? before.body);
+  await rememberStyle(ctx, before, after);
+  return after;
+}
 
 /**
  * The owner edits the text an employee would receive: the board's outbox text, which is the stored body rendered with that employee's
- * paths. The edit is reversed to the stored body and saved only when that body renders back to the edited text, so the employee never
- * reads a path or tool name the owner did not see on the board. The workdir line belongs to the claim and is not part of the edit.
+ * paths. Owner edits are literal, even when a path cannot be reversed to a placeholder.
+ * The workdir line belongs to the claim and is not part of the edit.
  */
 async function editRenderedMessage(ctx: OwnerApiContext,
   input: { messageId: string; employeeId: string; rendered: string; actor: string }): Promise<OutboundMessage> {
@@ -73,9 +104,10 @@ async function editRenderedMessage(ctx: OwnerApiContext,
   const renderCtx = renderContextFor(view, input.employeeId, { taskId: message.taskId, step: message.step,
     acceptanceCriteria: rows[0].acceptance_criteria, findingsFile: await findingsFileOf(db, task) });
   if (!renderCtx) throw new CompanyError('not_found', 'employee not found on the owner board');
-  const body = unrenderMessage(bodyOfDispatch(input.rendered), renderCtx);
-  if (body === undefined) throw new CompanyError('invalid', 'rendered text invalid: a path or tool name differs from what the board shows');
-  return ctx.messages.edit(input.messageId, body, input.actor);
+  // 只有未编辑模板才替换路径；老板改过的正文按原文存储和投递，不要求能逆向还原占位符。
+  const stripped = bodyOfDispatch(input.rendered);
+  if (!stripped.trim()) throw new CompanyError('invalid', 'rendered text invalid: 正文不能为空');
+  return editMessage(ctx, input.messageId, stripped, input.actor, message.body);
 }
 
 /** Every command is a flat JSON object: { command, ...args }. */
@@ -120,6 +152,25 @@ function faultGrantReceipt(receipt: FaultRecoveryGrantReceipt): unknown {
     },
     next: '员工重新领取任务后的下一次真实尝试即消费本授权。窗口内仍失败而耗尽时，同一事件不再授权，只能走修复链。',
   };
+}
+
+/**
+ * One task as the owner reads it: the row, its audit and messages, and what the board needs to show them. A missing row is not_found
+ * here; withSessionCheck decides whether that absence can be trusted.
+ */
+async function taskDetail(db: import('surrealdb').Surreal, taskId: string): Promise<unknown> {
+  const [rows] = await db.query<[Array<Record<string, unknown>>]>('SELECT * FROM $task;', { task: new RecordId('task', taskId) });
+  if (!rows?.length) throw new CompanyError('not_found', 'task not found');
+  const [audit] = await db.query<[unknown[]]>('SELECT * FROM audit WHERE task = $task ORDER BY at;', { task: new RecordId('task', taskId) });
+  const [messages] = await db.query<[unknown[]]>('SELECT * FROM outbound_message WHERE task = $task ORDER BY created_at;', { task: new RecordId('task', taskId) });
+  // 员工回报的译文（audit 编号 → 老板常用语言的译文）；没有译文的回报照原文显示。
+  const translations = Object.fromEntries(await replyTranslationsOf(db,
+    (audit ?? []) as Array<{ id?: unknown; evidence?: unknown; action?: unknown }>, await ownerLangOf(db)));
+  // 完工分析（审计编号 → 分析）：只展示，不参与派工。
+  const analyses = await turnAnalysesOf(db, (audit ?? []) as Array<{ id?: unknown }>).catch(() => ({}));
+  // 动作记录：每一轮里员工做了什么（一行一个动作），保留 7 天。读不出不影响任务详情。
+  const turns = await taskTurns(db, taskId).catch(() => []);
+  return { task: rows[0], audit, messages, translations, analyses, turns };
 }
 
 export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unknown>, via: OwnerVia): Promise<unknown> {
@@ -255,18 +306,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     case 'task.delete': return ctx.owner.retire({ taskId: text(input.taskId, 'taskId'), note: text(input.note, 'note', 2), source: a, key: key() });
     case 'task.detail': {
       const taskId = text(input.taskId, 'taskId');
-      const [rows] = await db.query<[Array<Record<string, unknown>>]>('SELECT * FROM $task;', { task: new RecordId('task', taskId) });
-      if (!rows?.length) throw new CompanyError('not_found', 'task not found');
-      const [audit] = await db.query<[unknown[]]>('SELECT * FROM audit WHERE task = $task ORDER BY at;', { task: new RecordId('task', taskId) });
-      const [messages] = await db.query<[unknown[]]>('SELECT * FROM outbound_message WHERE task = $task ORDER BY created_at;', { task: new RecordId('task', taskId) });
-      // 员工回报的译文（audit 编号 → 老板常用语言的译文）；没有译文的回报照原文显示。
-      const translations = Object.fromEntries(await replyTranslationsOf(db,
-        (audit ?? []) as Array<{ id?: unknown; evidence?: unknown; action?: unknown }>, await ownerLangOf(db)));
-      // 完工分析（审计编号 → 分析）：只展示，不参与派工。
-      const analyses = await turnAnalysesOf(db, (audit ?? []) as Array<{ id?: unknown }>).catch(() => ({}));
-      // 动作记录：每一轮里员工做了什么（一行一个动作），保留 7 天。读不出不影响任务详情。
-      const turns = await taskTurns(db, taskId).catch(() => []);
-      return { task: rows[0], audit, messages, translations, analyses, turns };
+      return withSessionCheck(ctx.db, () => taskDetail(db, taskId));
     }
     case 'progress': return readProgress(db);
     case 'task.list': { const [rows] = await db.query<[unknown[]]>('SELECT * FROM task ORDER BY created_at DESC LIMIT 300;'); return { tasks: rows }; }
@@ -349,8 +389,30 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
 
     // ---- 待发消息 ----
     case 'message.list': return { messages: await ctx.messages.list(optionalText(input.taskId), input.includeSent !== false) };
-    case 'message.edit': return ctx.messages.edit(text(input.messageId, 'messageId'), text(input.body, 'body'), a,
+    case 'message.edit': return editMessage(ctx, text(input.messageId, 'messageId'), bodyOfDispatch(messageText(input.body, 'body')), a,
       typeof input.expectedBody === 'string' ? input.expectedBody : undefined);
+    case 'message.draft': {
+      const taskId = text(input.taskId, 'taskId');
+      const step = optionalText(input.step) ?? await ctx.messages.nextStep(taskId);
+      if (!step || !['execute', 'review', 'rework', 'nudge', 'notice'].includes(step))
+        throw new CompanyError('invalid', 'step invalid');
+      const draft = await ctx.messages.latestDraft(taskId, step as OutboundMessage['step']);
+      if (!draft || draft.state === 'sent') throw new CompanyError('not_found', 'unsent draft not found');
+      const [tasks] = await db.query<[Array<Record<string, unknown>>]>(
+        'SELECT title, requirement, resources, acceptance_text, project, discipline FROM $task;', { task: new RecordId('task', taskId) });
+      if (!tasks?.[0]) throw new CompanyError('not_found', 'task not found');
+      const [samples] = await db.query<[unknown[]]>(
+        'SELECT before_body, after_body, at FROM owner_style_memory ORDER BY at DESC LIMIT 5;');
+      const styleSamples = (samples ?? []).slice(0, 5);
+      const steward = ctx.steward;
+      if (!steward) throw new CompanyError('unavailable', 'NodeSteward 需要执行端');
+      const body = await steward.draft({ task: redactSecrets(tasks[0]) as Record<string, unknown>, step,
+        channel: optionalText(input.channel), styleSamples: redactSecrets(styleSamples) as unknown[] });
+      if (!body) throw new CompanyError('temporarily_unavailable', 'NodeSteward 无法安全起草，请稍后重试');
+      // 起草不是老板改稿，不能把模型自己的输出学成老板偏好；edit 不改变 hold/state。
+      const message = await ctx.messages.edit(draft.id, messageText(body, 'draft'), a, draft.body);
+      return { message, styleSamplesUsed: styleSamples.length };
+    }
     case 'message.hold': return ctx.messages.setHold(text(input.messageId, 'messageId'), true, a);
     case 'message.release': return ctx.messages.setHold(text(input.messageId, 'messageId'), false, a);
     case 'message.send': {
@@ -371,7 +433,7 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     }
 
     case 'message.edit_rendered': return editRenderedMessage(ctx, { messageId: text(input.messageId, 'messageId'),
-      employeeId: text(input.employeeId, 'employeeId'), rendered: text(input.rendered, 'rendered', 1, 20000), actor: a });
+      employeeId: text(input.employeeId, 'employeeId'), rendered: messageText(input.rendered, 'rendered'), actor: a });
 
     // ---- 老板看板 ----
     case 'board.snapshot': return readBoard(db, { now: typeof input.now === 'number' ? input.now : undefined });

@@ -855,7 +855,7 @@ export class SurrealCompanyCore implements CompanyCore {
       const allocProject = fresh.codeRepoPath ? await this.projectForRepo(repo) : project;
       const worktree = await this.worktrees!.allocate(repo, list, fresh, actor, allocProject);
       return this.claimLease(actor, taskId, worktree);
-    });
+    }, 'claim');
   }
 
   

@@ -11,6 +11,7 @@ export const BACKEND_OWNER_COMMANDS: ReadonlySet<string> = new Set([
   'agent.list', 'agent.policy.list', 'agent.policy.set', 'guard.list', 'guard.protect', 'guard.unprotect', 'guard.set',
   // 译文（magpie）
   'translate.preview', 'translate.message',
+  'message.draft',
   // Cloudflare
   'cf.api',
   // 保存或放行前要补译的消息命令

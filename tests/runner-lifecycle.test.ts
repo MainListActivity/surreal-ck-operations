@@ -2,7 +2,8 @@ import { expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ExecutionJournal, workResult, finalAnswer } from '../src/runner/lifecycle.ts';
+import { spawnSync } from 'node:child_process';
+import { AUTO_FOLLOWUP_LIMIT, ExecutionJournal, advancedWorktreeHead, stewardWorkResult, workResult, finalAnswer } from '../src/runner/lifecycle.ts';
 
 test('工作结论不等于任务完成，复核只接受显式业务结论', () => {
   expect(workResult('完成了功能并通过了本地测试', 'doing').action).toBe('submit');
@@ -33,18 +34,93 @@ test('执行批次与结果重启后保持，重放使用同一幂等键', () =>
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('判读器回退：没有首行口令时给出结构化结论，执行轮不能越权 accept，连续自动跟进 3 轮熔断', async () => {
+  const base = { task: 'task', employee: 'worker', deliveryId: 'delivery', autoFollowups: 0 };
+  // 执行轮答复没写口令：判读器判 submit，自动跟进计 1 轮。
+  const submit = await stewardWorkResult('功能已实现并通过本地测试，产物在 src/x.ts。', 'doing', undefined,
+    { ...base, resolver: () => ({ action: 'submit', summary: '实现完成并自验' }) });
+  expect(submit.via).toBe('steward');
+  expect(submit.autoFollowups).toBe(1);
+  expect(submit.result.action).toBe('submit');
+  expect(submit.result.evidence.text).toContain('实现完成并自验');
+  // 判读器不能越过独立复核把执行轮判为 accept。
+  await expect(stewardWorkResult('看起来都对了。', 'doing', undefined,
+    { ...base, resolver: () => ({ action: 'accept', summary: '直接通过' }) })).rejects.toThrow('越过独立复核');
+  // 复核轮没有手写复核结论：判读器可以判 accept。
+  const review = await stewardWorkResult('逐条复验均符合验收标准。', 'review', undefined,
+    { ...base, resolver: () => ({ action: 'accept', summary: '复验通过' }) });
+  expect(review.result.action).toBe('accept');
+  // 已经连续自动跟进 3 轮：第 4 轮强制转受阻，不再自动继续。
+  const capped = await stewardWorkResult('继续做完了。', 'doing', undefined,
+    { ...base, autoFollowups: AUTO_FOLLOWUP_LIMIT, resolver: () => ({ action: 'submit', summary: '又完成一轮' }) });
+  expect(capped.result.action).toBe('block');
+  expect(capped.result.evidence.text).toContain(`连续自动跟进 ${AUTO_FOLLOWUP_LIMIT} 轮`);
+  const cappedWithoutResolverCall = await stewardWorkResult('继续做完了。', 'doing', undefined,
+    { ...base, autoFollowups: AUTO_FOLLOWUP_LIMIT, resolver: () => { throw new Error('熔断后不得再调用判读器'); } });
+  expect(cappedWithoutResolverCall.result.action).toBe('block');
+  const blockedReview = await stewardWorkResult('工作结果：受阻\n缺少验收环境', 'review', undefined,
+    { ...base, resolver: () => { throw new Error('明确受阻不需要判读器'); } });
+  expect(blockedReview.result.action).toBe('block');
+  // 员工手写口令时不计自动跟进，链条清零。
+  const written = await stewardWorkResult(`完成。\n提交：${'a'.repeat(40)}`, 'doing', undefined,
+    { ...base, autoFollowups: 2, resolver: () => ({ action: 'submit' }) });
+  expect(written.via).toBe('written');
+  expect(written.autoFollowups).toBe(0);
+  expect(written.result.evidence.sha).toBe('a'.repeat(40));
+  // 没有判读器：未写口令的复核答复仍按原规则拒绝，不推断结论。
+  await expect(stewardWorkResult('看起来不错', 'review', undefined, base)).rejects.toThrow('明确');
+});
+
+test('代码回合自动采集任务分支相对基线前进的 HEAD；未前进或分支不符不冒充交付提交', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sck-advance-head-'));
+  const git = (...args: string[]) => {
+    const r = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+    if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+    return r.stdout.trim();
+  };
+  const probe = async (cmd: string, args: string[], cwd: string) => {
+    const r = spawnSync(cmd, args, { cwd, encoding: 'utf8' });
+    return { code: r.status ?? 1, stdout: String(r.stdout ?? '') };
+  };
+  try {
+    git('init', '-q', '-b', 'main'); git('config', 'user.email', 'fixture@example.com'); git('config', 'user.name', 'fixture');
+    spawnSync('git', ['commit', '-q', '--allow-empty', '-m', 'base'], { cwd: root });
+    const base = git('rev-parse', 'HEAD');
+    // 远端默认分支指向基线（合成 ref），任务分支从基线出发。
+    git('update-ref', 'refs/remotes/origin/main', base);
+    git('symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main');
+    git('checkout', '-q', '-b', 'task/abc12345');
+    expect(await advancedWorktreeHead(probe, root, 'task/abc12345')).toBeUndefined();
+    spawnSync('git', ['commit', '-q', '--allow-empty', '-m', 'advance'], { cwd: root });
+    const advanced = git('rev-parse', 'HEAD');
+    expect(advanced).not.toBe(base);
+    expect(await advancedWorktreeHead(probe, root, 'task/abc12345')).toBe(advanced);
+    // 分支不符：不拿别的分支 HEAD 冒充本任务交付。
+    expect(await advancedWorktreeHead(probe, root, 'task/other')).toBeUndefined();
+    // 基线完全不可判定时不得把任意 HEAD 作为“相对基线前进”的证据。
+    git('symbolic-ref', '--delete', 'refs/remotes/origin/HEAD');
+    git('update-ref', '-d', 'refs/remotes/origin/main');
+    expect(await advancedWorktreeHead(probe, root, 'task/abc12345')).toBeUndefined();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 import { SidecarPool } from '../src/runner/sidecar.ts';
 import { settleCompanyTurn, TurnInterruptions } from '../src/runner/turn-closeout.ts';
 import { writeFileSync, existsSync } from 'node:fs';
 import type { LeaseProof, ClaimResult } from '../src/contracts.ts';
+import type { ResultFacts, StewardVerdictResolver } from '../src/runner/lifecycle.ts';
 
-function fixture(readTurnResult?: (agent: string, turn: string) => Promise<string>) {
+function fixture(readTurnResult?: (agent: string, turn: string) => Promise<string>, verdictResolver?: StewardVerdictResolver) {
   const root = mkdtempSync(join(tmpdir(), 'sck-runner-flow-'));
   const calls: Array<{ action: string; proof: LeaseProof; key: string; text?: string }> = [];
   let delivery = 'delivery-a', version = 2, phase: 'doing' | 'review' = 'doing', submitted = false;
   let fail = false, loseReply = false, failRead = false;
   let refusal: { code: string; message: string; times: number } | undefined;
   let accepted = 0;
+  let factsFn: ((taskId: string, employee: string, delivery?: { idempotencyKey: string }) => Promise<ResultFacts>) | undefined;
+  let authRefusals = 0;
+  let rotateError: Error | undefined;
+  // Identity dies after the next committed write: models a worker retired while its reply was in flight.
+  let goneAfterCommit = false, gone = false;
   const mirror: Array<{ state: string; error?: string; attempts: number }> = [];
   const inst = { id: 'worker', role: 'engineering' as const, credential: 'synthetic', paseoAgentId: undefined as string | undefined };
   const task = () => ({ id: 'task', state: phase, version, fence: 1, deliveryId: delivery, currentEmployee: 'worker',
@@ -53,11 +129,14 @@ function fixture(readTurnResult?: (agent: string, turn: string) => Promise<strin
   const committed = new Set<string>();
   const transition = (action: string) => async (_cred: string, proof: LeaseProof, evidence: { idempotencyKey: string; text?: string }) => {
     calls.push({ action, proof: { ...proof }, key: evidence.idempotencyKey, text: evidence.text });
+    // The real core authenticates before its idempotent replay, so a retired identity is refused either way.
+    if (gone || authRefusals > 0) { if (!gone) authRefusals--; throw Object.assign(new Error('invalid credential'), { code: 'unauthorized' }); }
     if (committed.has(evidence.idempotencyKey)) return task();
     if (action === 'submit' && refusal && refusal.times > 0) { refusal.times--; throw Object.assign(new Error(refusal.message), { code: refusal.code }); }
     if (fail) throw new Error('synthetic network failure');
     if (proof.deliveryId !== delivery || proof.expectedVersion !== version) throw Object.assign(new Error('stale version'), { code: 'conflict' });
     committed.add(evidence.idempotencyKey); submitted = true;
+    if (goneAfterCommit) { goneAfterCommit = false; gone = true; }
     if (action === 'submit') accepted++;
     if (loseReply) { loseReply = false; throw new Error('synthetic response lost after commit'); }
     return task();
@@ -67,8 +146,13 @@ function fixture(readTurnResult?: (agent: string, turn: string) => Promise<strin
     activeLeases: async () => submitted ? [] : [{ ...task(), taskId: 'task' }],
     submit: transition('submit'), accept: transition('accept'), returnTask: transition('return'),
     block: (cred: string, proof: LeaseProof, _to: 'owner', evidence: { idempotencyKey: string; text?: string }) => transition('block')(cred, proof, evidence) };
-  const workforce = { rotate: async () => 'synthetic', insts: async () => [inst] };
-  const options = { core: core as never, workforce: workforce as never, runDir: join(root, 'comm'), managedLifecycle: true, readTurnResult, heartbeatMs: 15,
+  const workforce = { rotate: async () => { if (gone) { const e = rotateError ?? Object.assign(new Error('Employee retired or revoked'), { code: 'unauthorized' }); throw e; } if (rotateError) throw rotateError; return 'synthetic'; }, insts: async () => [inst] };
+  const options = { core: core as never, workforce: workforce as never, runDir: join(root, 'comm'), managedLifecycle: true, readTurnResult, verdictResolver, heartbeatMs: 15,
+    resultFacts: async (taskId: string, employee: string, delivery?: { idempotencyKey: string }) => {
+      const base = factsFn ? await factsFn(taskId, employee, delivery) : undefined;
+      // Like the real store: the idempotency record exists exactly when the write committed.
+      return base ? { landed: committed.has(delivery?.idempotencyKey ?? ''), ...base } : undefined;
+    },
     executionChanged: async (row: { state: string; error?: string; tries: number }) => { mirror.push({ state: row.state, error: row.error, attempts: row.tries }); } };
   let pool = new SidecarPool(options);
   const event = (turn = 'turn-a', text = '工作已完成，全部只读检查通过，证据已生成。', kind = 'completed') =>
@@ -79,14 +163,63 @@ function fixture(readTurnResult?: (agent: string, turn: string) => Promise<strin
     get pool() { return pool; },
     fail(value: boolean) { fail = value; }, loseReply() { loseReply = true; }, failRead(value: boolean) { failRead = value; },
     refuse(code: string, times: number, message: string) { refusal = { code, message, times }; },
-    accepted: () => accepted, mirror: () => mirror,
+    facts(fn: (taskId: string, employee: string, delivery?: { idempotencyKey: string }) => Promise<ResultFacts>) { factsFn = fn; },
+    authFailures(times: number) { authRefusals = times; },
+    rotateFails(error: Error) { rotateError = error; },
+    /** The next committed write retires this identity: lands the result, then every call is unauthorized. */
+    retireAfterCommit() { goneAfterCommit = true; },
+    accepted: () => accepted, committed: () => committed, mirror: () => mirror,
     async claim(review = false) { phase = review ? 'review' : 'doing'; pool.env(inst); inst.paseoAgentId = 'agent'; pool.bindAgent(inst.id, 'agent'); await pool.claim(inst, { id: 'task' } as never); },
     async restart() { pool.close(); pool = new SidecarPool(options); await pool.adopt([inst]); },
     async retry() { for (const row of journal().rows()) { row.nextRetry = 0; journal().save(row); } await pool.retryExecutions(); },
-    nextVersion() { version++; }, nextDelivery() { delivery = 'delivery-b'; submitted = false; },
+    nextVersion() { version++; }, nextDelivery(id = 'delivery-b') { delivery = id; submitted = false; },
     close() { pool.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 import { createHash } from 'node:crypto';
+
+test('执行端在无手写 SHA 的代码答复中采集真实任务分支 HEAD 并冻结到提交证据', async () => {
+  const f = fixture();
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: f.root, encoding: 'utf8' });
+    expect(result.status).toBe(0);
+    return result.stdout.trim();
+  };
+  try {
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 'fixture@example.com'); git('config', 'user.name', 'fixture');
+    git('commit', '-q', '--allow-empty', '-m', 'base');
+    git('update-ref', 'refs/remotes/origin/main', git('rev-parse', 'HEAD'));
+    git('checkout', '-q', '-b', 'task/abc12345');
+    git('commit', '-q', '--allow-empty', '-m', 'implementation');
+    const sha = git('rev-parse', 'HEAD');
+    const getTask = f.core.getTask;
+    f.core.getTask = async () => ({ ...await getTask(), workIntent: { kind: 'code' },
+      worktree: { worktreePath: f.root, branch: 'task/abc12345' } });
+    await f.claim(); await f.pool.turnStarted('agent', 'turn-a');
+    await f.settle(f.event('turn-a', '实现完成并逐条自验，未手写提交行。'));
+    expect(f.journal().rows()[0]?.result?.evidence.sha).toBe(sha);
+    expect(f.calls.map(call => call.action)).toEqual(['submit']);
+  } finally { f.close(); }
+});
+
+test('判读器计数跨投递与重启持久化，重复收尾不累加，第四轮不再调用判读器并转交老板', async () => {
+  const seen: number[] = [];
+  const f = fixture(undefined, input => { seen.push(input.autoFollowups); return { action: 'submit' }; });
+  try {
+    for (let round = 1; round <= 4; round++) {
+      if (round > 1) { f.nextVersion(); f.nextDelivery(`delivery-${round}`); }
+      await f.claim(); await f.pool.turnStarted('agent', `turn-${round}`);
+      await f.settle(f.event(`turn-${round}`, `完成第 ${round} 轮工作。`));
+      await f.settle(f.event(`turn-${round}`, `完成第 ${round} 轮工作。`));
+      const row = f.journal().rows().find(row => row.turn === `turn-${round}`)!;
+      expect(row.autoFollowups).toBe(round);
+      expect(row.result?.action).toBe(round <= 3 ? 'submit' : 'block');
+      await f.restart();
+    }
+    expect(seen).toEqual([0, 1, 2]);
+    expect(f.calls.map(call => call.action)).toEqual(['submit', 'submit', 'submit', 'block']);
+  } finally { f.close(); }
+});
 
 test('执行 agent 不调用命令，最终答复自动送审；重复结束只提交一次', async () => {
   const f = fixture(); try {
@@ -109,6 +242,45 @@ test('复核结果由执行端记录，失败回合即使留下报告也不提�
     await g.pool.settleExecution(g.event('turn-a', '暂时完成了部分工作', 'failed'));
     expect(g.calls).toHaveLength(0);
     expect(g.journal().rows()[0]?.state).toBe('interrupted');
+  } finally { g.close(); }
+});
+/**
+ * devin-cloud（以及任何云端通道）超时仍受理的受阻回合，在 main.ts 事件映射与 native.ts 的真实
+ * parseNativeResult 之后是 outcome.kind:'completed'（tests/cloud-lane.test.ts 的"近真实 main→native
+ * 链路验证"已经单独证实这一段，并且明确写了它到此为止、不替 sidecar.ts 的结论背书）。这里接着那段没走到的
+ * 下一环：同一个 completed TurnEnded 事件，经真实（未打桩）的 settleExecution → collectExecution →
+ * workResult 之后，必须是业务 block（不是静默回合，不是供应商额度或协议故障的记录），且会话地址不丢在评审
+ * 证据之外。对照组证明两条路没有被改成同一条：outcome.kind 不是 completed 时仍然按既有行为走静默分支。
+ */
+test('云端受阻回合（如 devin-cloud 已受理超时）经真实 settleExecution 收尾为 block，不是静默回合也不记供应商故障；对照 outcome 非 completed 仍走静默分支（需求 3：main→native 之后接到真实 sidecar.ts 收尾）', async () => {
+  const SESSION = 'https://app.devin.ai/sessions/abcd1234abcd1234abcd1234abcd1234';
+  const BLOCKED_TEXT = `工作结果：受阻\nDevin Cloud 会话 ${SESSION} 超过配置时限仍未给出终稿（标记 SCK-abc1234567），会话可能仍在运行；恢复本任务将回到原会话继续等待，不会重发`;
+  const f = fixture();
+  try {
+    await f.claim(); await f.pool.turnStarted('agent', 'turn-devin-1');
+    const settled = await f.pool.settleExecution(f.event('turn-devin-1', BLOCKED_TEXT, 'completed'));
+    // 不是静默回合：有真实的业务结论产出，不是「本回合没有可用产物」。
+    expect(settled?.status).not.toBe('silent');
+    expect(f.calls.map(c => c.action)).toEqual(['block']);
+    expect(f.calls[0]?.text).toContain('超过配置时限仍未给出终稿');
+    expect(f.calls[0]?.text).toContain(SESSION);
+    const row = f.journal().rows()[0];
+    expect(row?.state).toBe('settled');
+    expect(row?.result?.action).toBe('block');
+    // 不靠供应商额度/协议故障通道记这次受阻：那条通道只由 releaseClaim({ providerFailure }) 显式写入，
+    // 这里全程没有调用过它。
+    expect(row?.providerFailure).toBeUndefined();
+  } finally { f.close(); }
+
+  const g = fixture();
+  try {
+    await g.claim(); await g.pool.turnStarted('agent', 'turn-devin-2');
+    const settled = await g.pool.settleExecution(g.event('turn-devin-2', '页面协议错误：wrong_session，未能确认是否受理', 'failed'));
+    expect(settled).toMatchObject({ status: 'silent', silent: { instId: 'worker', taskId: 'task', phase: 'doing' } });
+    expect(g.calls).toHaveLength(0);
+    const row = g.journal().rows()[0];
+    expect(row?.state).toBe('interrupted');
+    expect(row?.providerFailure).toBeUndefined();
   } finally { g.close(); }
 });
 test('网络失败不丢结果不清租约，重启后自动重试，agent 无需补交', async () => {
@@ -269,10 +441,12 @@ test('受阻结果提交失败时保留同一幂等键，恢复后重放，不�
     f.fail(true);
     await f.pool.settleExecution({ ...f.event(), timeline: [] });
     for (let i = 0; i < 19; i++) await f.retry();
-    expect(f.calls.map(c => c.action)).toEqual(['block']);
+    // The failed write is replayed once in the same attempt before judging: two calls, one frozen key, zero commits.
+    expect(f.calls.map(c => c.action)).toEqual(['block', 'block']);
+    expect(f.committed().size).toBe(0);
     expect(f.journal().rows()[0]?.state).toBe('pending');
     f.fail(false); await f.retry();
-    expect(f.calls.map(c => c.action)).toEqual(['block', 'block']);
+    expect(f.calls.map(c => c.action)).toEqual(['block', 'block', 'block']);
     expect(f.calls[1]?.key).toBe(f.calls[0]?.key);
     expect(f.journal().rows()[0]?.state).toBe('settled');
   } finally { f.close(); }
@@ -499,5 +673,149 @@ test('确定性非法成果仍有界重试，阻塞说明写入真实拒绝原�
     await f.retry();
     expect(f.journal().rows()[0]?.state).toBe('settled');
     expect(f.accepted()).toBe(0);
+  } finally { f.close(); }
+});
+const CURRENT_FACTS: ResultFacts = { task: { state: 'doing', currentEmployee: 'worker', deliveryId: 'delivery-a', fence: 1 }, employee: { retired: false, revoked: false } };
+test('旧员工已退休且任务已完成：旧结果终态 superseded，保留原成果与拒收信息，不再重放', async () => {
+  const f = fixture(); try {
+    f.facts(async () => ({ task: { state: 'done' }, employee: { retired: true, revoked: true } }));
+    f.authFailures(1000);
+    f.rotateFails(Object.assign(new Error('Employee retired or revoked'), { code: 'unauthorized' }));
+    await f.claim(); await f.settle(f.event());
+    const row = f.journal().rows()[0]!;
+    expect(row.state).toBe('superseded');
+    expect(row.supersededCause).toBe('task_finished');
+    expect(row.error).toBe('superseded:task_finished');
+    expect(row.result?.action).toBe('submit');
+    expect(row.result?.evidence.text).toContain('工作已完成');
+    expect(row.lastRefusal).toBe('Employee retired or revoked');
+    expect(f.calls.map(c => c.action)).toEqual(['submit']);
+    expect(f.pool.holdsLease('worker', 'task')).toBe(false);
+    await f.retry(); await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['submit']);
+    await f.restart(); await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['submit']);
+    expect(f.journal().rows()[0]?.state).toBe('superseded');
+  } finally { f.close(); }
+});
+test('活租约的暂时 unauthorized 可恢复：轮换凭证后同一成果只送审一次', async () => {
+  const f = fixture(); try {
+    f.facts(async () => CURRENT_FACTS);
+    f.authFailures(1);
+    await f.claim(); await f.settle(f.event());
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+    expect(f.accepted()).toBe(1);
+    expect(f.calls.map(c => c.action)).toEqual(['submit', 'submit']);
+    expect(new Set(f.calls.map(c => c.key)).size).toBe(1);
+    expect(f.journal().rows()[0]?.supersededCause).toBeUndefined();
+  } finally { f.close(); }
+});
+test('事实暂时读不到或网络失败不误判成果无效：结果保留并继续重试到成功', async () => {
+  const f = fixture(); try {
+    f.facts(async () => { throw new Error('database unavailable'); });
+    f.fail(true);
+    await f.claim(); await f.settle(f.event());
+    expect(f.journal().rows()[0]?.state).toBe('pending');
+    expect(f.journal().rows()[0]?.result?.action).toBe('submit');
+    expect(f.mirror().at(-1)).toEqual({ state: 'pending', error: 'unavailable', attempts: 1 });
+    f.fail(false); await f.retry();
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+    expect(f.accepted()).toBe(1);
+  } finally { f.close(); }
+});
+test('新租约或新 fence 取代旧投递：旧结果标记 superseded，不再重复 submit 或 block', async () => {
+  const f = fixture(); try {
+    f.facts(async () => ({ task: { state: 'doing', currentEmployee: 'other', deliveryId: 'delivery-b', fence: 2 }, employee: { retired: false } }));
+    f.refuse('conflict', 1000, 'stale lease or version');
+    await f.claim(); await f.settle(f.event());
+    const row = f.journal().rows()[0]!;
+    expect(row.state).toBe('superseded');
+    expect(row.supersededCause).toBe('lease_replaced');
+    expect(row.result?.action).toBe('submit');
+    expect(row.lastRefusal).toBe('stale lease or version');
+    await f.retry(); await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['submit']);
+    expect(f.accepted()).toBe(0);
+  } finally { f.close(); }
+});
+test('员工身份已退休或撤销：终态 superseded(employee_gone)，记录死因后停止重试', async () => {
+  const f = fixture(); try {
+    f.facts(async () => ({ task: { state: 'doing', currentEmployee: 'worker', deliveryId: 'delivery-a', fence: 1 }, employee: { retired: true } }));
+    f.authFailures(1000);
+    f.rotateFails(Object.assign(new Error('Employee retired or revoked'), { code: 'unauthorized' }));
+    await f.claim(); await f.settle(f.event());
+    const row = f.journal().rows()[0]!;
+    expect(row.state).toBe('superseded');
+    expect(row.supersededCause).toBe('employee_gone');
+    expect(row.lastRefusal).toBe('Employee retired or revoked');
+    expect(row.supersededAt).toBeGreaterThan(0);
+    await f.retry();
+    expect(f.calls.map(c => c.action)).toEqual(['submit']);
+  } finally { f.close(); }
+});
+test('提交已落库但回复丢失：同键重放确认交付后结算，核心只记一次提交，不判 superseded', async () => {
+  const f = fixture(); try {
+    // Facts describe the post-submit world: the task moved to review and cleared the lease fields.
+    f.facts(async () => ({ task: { state: 'review' }, employee: { retired: false, revoked: false } }));
+    await f.claim(); f.loseReply(); await f.settle(f.event());
+    const row = f.journal().rows()[0]!;
+    expect(row.state).toBe('settled');
+    expect(row.supersededCause).toBeUndefined();
+    expect(row.error).toBeUndefined();
+    expect(f.calls.map(c => c.action)).toEqual(['submit', 'submit']);
+    expect(new Set(f.calls.map(c => c.key)).size).toBe(1);
+    expect(f.committed().size).toBe(1);
+    await f.retry(); await f.restart(); await f.retry();
+    expect(f.calls).toHaveLength(2);
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+  } finally { f.close(); }
+});
+test('复核通过已落库但回复丢失：accept 同键重放结算，不判 task_finished', async () => {
+  const f = fixture(); try {
+    f.facts(async () => ({ task: { state: 'done' }, employee: { retired: false, revoked: false } }));
+    await f.claim(true); f.loseReply();
+    await f.settle(f.event('turn-a', '复核结论：通过\n已独立核对全部验收要求，成果与证据一致。'));
+    const row = f.journal().rows()[0]!;
+    expect(row.state).toBe('settled');
+    expect(row.supersededCause).toBeUndefined();
+    expect(f.calls.map(c => c.action)).toEqual(['accept', 'accept']);
+    expect(new Set(f.calls.map(c => c.key)).size).toBe(1);
+    expect(f.committed().size).toBe(1);
+    await f.retry();
+    expect(f.calls).toHaveLength(2);
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+  } finally { f.close(); }
+});
+test('成果落库后员工才退休且回复丢失：权威幂等记录确认已交付，结算而不判 employee_gone', async () => {
+  const f = fixture(); try {
+    f.facts(async () => ({ task: { state: 'done' }, employee: { retired: true, revoked: true } }));
+    await f.claim(); f.loseReply(); f.retireAfterCommit();
+    await f.settle(f.event());
+    const row = f.journal().rows()[0]!;
+    expect(row.state).toBe('settled');
+    expect(row.supersededCause).toBeUndefined();
+    expect(row.error).toBeUndefined();
+    expect(row.lastRefusal).toBe('Employee retired or revoked');
+    expect(f.calls.map(c => c.action)).toEqual(['submit', 'submit']);
+    expect(f.committed().size).toBe(1);
+    await f.retry(); await f.restart(); await f.retry();
+    expect(f.calls).toHaveLength(2);
+    expect(f.journal().rows()[0]?.state).toBe('settled');
+  } finally { f.close(); }
+});
+test('重启后通道被隔离的旧结果仍按权威事实终态记录，不会永远停在 pending', async () => {
+  const f = fixture(); try {
+    f.authFailures(1000);
+    f.rotateFails(Object.assign(new Error('Employee retired or revoked'), { code: 'unauthorized' }));
+    await f.claim(); await f.settle(f.event());
+    expect(f.journal().rows()[0]?.state).toBe('pending');
+    f.facts(async () => ({ task: { state: 'void' }, employee: { retired: true } }));
+    await f.restart();
+    await f.retry();
+    const row = f.journal().rows()[0]!;
+    expect(row.state).toBe('superseded');
+    expect(row.supersededCause).toBe('task_finished');
+    expect(row.result?.action).toBe('submit');
+    expect(f.calls.map(c => c.action)).toEqual(['submit']);
   } finally { f.close(); }
 });

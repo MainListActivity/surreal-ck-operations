@@ -112,13 +112,21 @@ interface FakeOptions {
 function fakeDb(opts: FakeOptions = {}) {
   const writes: Array<{ sql: string; vars: Record<string, unknown> }> = [];
   const statements: string[] = [];
+  let created: Record<string, unknown> | undefined;
   const db = {
     statements,
     writes,
     query: async (sql: string, vars: Record<string, unknown> = {}) => {
       statements.push(sql);
       if (sql.includes('FROM agent_policy')) return [opts.lang ? [{ lang: opts.lang }] : []];
-      if (sql.includes("AND step = $step AND state != 'sent' ORDER BY created_at DESC LIMIT 1")) return [opts.draft ? [opts.draft] : []];
+      if (sql.includes("AND step = $step AND state != 'sent' ORDER BY created_at DESC LIMIT 1")) {
+        const row = opts.draft ?? created;
+        return [row ? [row] : []];
+      }
+      if (sql.includes('AS dispatch_revision')) {
+        const row = opts.draft ?? created;
+        return [row ? [{ ...row, dispatch_revision: 'fixture-token' }] : []];
+      }
       if (sql.includes('SELECT executor_role')) return [[{ executor_role: 'engineering', reviewer_role: 'qa', kind: 'task' }]];
       if (sql.includes("state = 'sent' ORDER BY created_at DESC")) return [[]];
       if (sql.includes('UPDATE $msg SET lang')) {
@@ -126,6 +134,13 @@ function fakeDb(opts: FakeOptions = {}) {
         return [opts.matches ? [messageRow({ lang: vars.lang, translated_text: vars.text, translated_from_hash: vars.hash, translated_at: 'now' })] : []];
       }
       if (sql.includes('SELECT state FROM $msg')) return [opts.state === undefined ? [] : [{ state: opts.state }]];
+      // 单草稿守卫：事务里先查后建；随后按预生成的记录 ID 读回同一行。
+      if (sql.includes('CREATE $msg CONTENT')) {
+        writes.push({ sql, vars });
+        created = messageRow({ step: vars.step, role: vars.role, body: vars.body });
+        return [[]];
+      }
+      if (sql.includes('SELECT * FROM $msg')) return [created ? [created] : []];
       if (sql.includes('CREATE outbound_message')) {
         writes.push({ sql, vars });
         return [[messageRow({ step: vars.step, role: vars.role, body: vars.body })]];
@@ -309,7 +324,7 @@ describe('OutboundMessageStore.alignLanguage：派工前把语言对齐到员工
   test('没有草稿：先补一条（模板），再对齐语言', async () => {
     const db = fakeDb({ lang: 'ja' });
     await new OutboundMessageStore(db as never).alignLanguage('t1', 'execute', 'e1');
-    expect(db.statements.some(sql => sql.includes('CREATE outbound_message'))).toBe(true);
+    expect(db.statements.some(sql => sql.includes('CREATE $msg CONTENT'))).toBe(true);
     expect(db.writes.some(write => write.sql.includes('SET lang = $lang'))).toBe(true);
   });
 });

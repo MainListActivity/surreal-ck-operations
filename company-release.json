@@ -1,21 +1,20 @@
 {
-  "version": "0.13.41",
-  "title": "Devin 云端改走网页 Free 档位：有界受理核对，不重发，终稿只认本轮",
+  "version": "0.13.55",
+  "title": "NodeSteward 判读与模仿起草、老板风格记忆、云通道跨租约零重发",
   "changes": [
-    "devin-cloud 不再执行 devin --cloud --model free（Devin CLI 3000.x 拒绝该参数，云免费只在网页）。新入口 devin-web.ts 用 ego-browser 驱动 app.devin.ai。",
-    "新会话、续轮与复核发送前都核验 Capability 选中 Free 与 N/M in use 席位。席位只在首页 Capability 菜单里可读，所以续轮先到组织首页读席位，再回原会话复核并发送。满座等待；读不到或不是 Free 有界重试后受阻，绝不切付费档。读数记入 lane 状态 devin.seats。",
-    "发送意图在按下 Send 前写入本目录与共享登记 inflight/<digest>.json，续轮连同原会话地址与公司任务号一并登记；换员工目录或重启只核对是否已受理，绝不重发。返工改了摘要也按任务号认出在途发送：未确认受理的受阻、不另建会话；已有会话地址的沿用它跟进。",
-    "终稿只认本轮收尾约定之后的 Devin 发言块（data-message-author=devin）；工具输出、用户例子、旧轮次残留的 DONE/PR 都不算。状态短语只看最近一次收尾约定之后的文字，上一轮仍在工作时续轮等待。unknown 与空闲无终稿都不收尾。",
-    "活动流分开报尝试与受理：尝试显示为运行中，转录出现本轮标记或会话地址后才显示已受理。受阻文本首行单独成行「工作结果：受阻」。",
-    "旧 CLI 的模型错误分类（PR2271 的确定性拒绝：Unknown model 首次即受阻）不并入本版，网页入口的档位与席位核验替代了它：核验不过有界重试后受阻，满座等待，不依据 CLI 报错文字判断。",
-    "保留 0.13.28 的结果读取有界、PR2269 的 CI 排队等待与网关防重放；free-only 配置与执行入口保护保留。"
+    "执行端常驻 NodeSteward 经既有 Magpie Anthropic 接口判读无首行口令的答复；严格 JSON、30 秒超时、输入输出脱敏，失败安全回退。",
+    "继续执行 0.13.54 独立复核与连续自动跟进上限护栏：doing 只能 submit/block，review 只能 accept/return/block。",
+    "老板改稿：message.edit 与 message.edit_rendered 保存成功且正文变化时，把脱敏差分写入 owner_style_memory，记忆写入失败不阻塞改稿。",
+    "message.draft：读取任务卡与最近最多 5 条风格样本，区分本机和云端/网页能力起草自然派工消息，只更新未发草稿，保留 hold 并防并发覆盖。",
+    "云通道：无 findings 的执行轮跨租约重派同一任务时领养旧在途任务，纯轮询不再发送；结清后清理同一供应商任务的旧登记。",
+    "Devin 收尾：缺 PR 行时查询真实 OPEN PR；idle 漏写 DONE 时，只有远端分支确有新提交且有 OPEN PR 才按真实 HEAD 收尾。"
   ],
   "impact": [
-    "员工：devin-cloud 派工走 Devin 网页 Free 档位（SWE-2）。席位满时任务等待或受阻，续轮回原会话继续。",
-    "老板：需要 ego-browser 里保持 app.devin.ai 登录。受阻结果首行为「工作结果：受阻」，正文写明要核对的会话地址与标记。",
-    "真实 Devin 云发送未执行（不消耗席位）。只读核实了首页 Capability 菜单、一个会话页的转录结构（助手发言块与 worklog 行分开）与侧栏会话列表；侧栏会话里没有本轮标记，真实的 SCK-DONE 收尾样本尚未实测。其余验证为页面脚本 DOM 契约、假页面脚本真实执行、browse mock 与类型检查。真实任务由老板在候选验证通过后经常规调度复验。",
-    "已知限制：页面结构（Capability 菜单、输入框、Send 按钮、N/M in use）改版会导致核验失败而拒发，不会降级到付费档。满座时页面显示 2/2 in use 尚未实测。续轮比直接回会话多一次首页访问。"
+    "老板：可按最近改稿偏好一键起草，原扣住状态不变，不会自动放行。",
+    "员工：自然答复可由管理员判读，但执行轮不能跳过独立复核。",
+    "运维：跨租约恢复不重复发送；Devin 漏标记可用真实远端证据收尾。",
+    "限制：起草依赖执行端 Magpie 授权；未知通道按远程能力保守处理，模型失败不覆盖草稿。"
   ],
-  "migration": "无 schema 变更（沿用 schema 072）。执行端插件升级后生效；需要服务 PATH 或 lanes.devin-cloud.bin 里能解析 ego-browser（默认 ~/.local/bin/ego-browser）。旧 lane 状态没有 devin 字段也可直接读取。共享登记新增 task 字段，旧登记没有它，不参与换摘要的判定。",
-  "rollback": "回退至 v0.13.33。回退后 devin-cloud 恢复 CLI 调用（Devin CLI 3000.x 上会报 Unknown model 而失败）；SCK_PREVIEW_SECRET 遮蔽等 0.13.31/0.13.33 修复不受影响。回退前在途的网页会话按人工核对。"
+  "migration": "新增 schema 073，由 migrator/bootstrap 幂等建立 SCHEMALESS owner_style_memory 表及时间索引，不改历史任务。升级并重启执行端，沿用既有 Magpie 凭证文件，默认模型 group/sck-sonnet。",
+  "rollback": "回退至 0.13.54，保留风格记忆表而不再使用；停止新起草命令，判读恢复原可选接缝。回退前核对在途云端登记，旧版跨租约恢复可能再次发出跟进消息。"
 }

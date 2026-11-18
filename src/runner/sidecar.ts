@@ -7,7 +7,7 @@ import { LIFECYCLE_COMMANDS } from '../lifecycle-policy.ts';
 // The sidecar claims tasks on the instance's behalf (dispatcher calls claim()),
 // keeps the lease alive while a turn runs, relays `sck call` requests through
 // req/res files, and ingests report.md/blocker.md when a turn ends.
-import { ExecutionJournal, workResult, finalAnswer, type ExecutionAttempt } from './lifecycle.ts';
+import { advancedWorktreeHead, ExecutionJournal, stewardWorkResult, workResult, finalAnswer, type ExecutionAttempt, type ResultDeliveryRef, type ResultFacts, type StewardVerdictResolver, type SupersededCause } from './lifecycle.ts';
 import type { TurnEnded } from './contracts.ts';
 import { RuntimeResultError } from './turn-result.ts';
 import { OpsCircuit } from "./ops-circuit.ts";
@@ -163,7 +163,18 @@ export interface SidecarDeps {
   briefStaged?: (employee: string, claim: ClaimResult) => Promise<void>;
   managedLifecycle?: boolean;
   readTurnResult?: (agent: string, turn: string, startedAt: number) => Promise<string>;
+  /**
+   * 总管判读接缝：答复没有手写首行口令时，由可注入的判读器给出结构化结论（submit/accept/return/block）。
+   * 不注入即保持原行为。代码层硬约束判读器不得越过独立复核直接 accept 执行轮，且同任务连续自动跟进不超过 3 轮。
+   */
+  verdictResolver?: StewardVerdictResolver;
   executionChanged?: (row: ExecutionAttempt) => Promise<void>;
+  /**
+   * Read-only authoritative facts (task lease identity, employee identity, and whether the delivery's write
+   * already committed) used to retire a captured result whose delivery no longer exists. Optional: without
+   * it a failed write is always treated as recoverable, never as proof that the result is invalid.
+   */
+  resultFacts?: (taskId: string, employee: string, delivery?: ResultDeliveryRef) => Promise<ResultFacts | undefined>;
   nativeExecution?: boolean;
   core: CompanyCore;
   workforce: Workforce;
@@ -349,6 +360,14 @@ export class SidecarPool {
     row.state = 'collecting'; await this.changed(row);
     return this.collectExecution(row);
   }
+  /** 本任务上一条投递留下的连续自动跟进轮数；同一行的结论已定过就沿用它，重复收集不会重复加一。 */
+  private priorAutoFollowups(row: ExecutionAttempt): number {
+    if (row.autoFollowups !== undefined) return row.autoFollowups;
+    const prior = this.journal?.rows().filter(other => other.task === row.task && other.proof.deliveryId !== row.proof.deliveryId)
+      .filter(other => other.proof.expectedVersion < row.proof.expectedVersion)
+      .sort((a, b) => b.proof.expectedVersion - a.proof.expectedVersion)[0];
+    return prior?.autoFollowups ?? 0;
+  }
   private async collectExecution(row: ExecutionAttempt): Promise<SettleResult> {
     if (!row.finalText && !row.artifacts?.raw && !row.artifacts?.report && !row.artifacts?.blocker && this.deps.readTurnResult) {
       try {
@@ -368,8 +387,17 @@ export class SidecarPool {
     }
     try {
       const { raw, blocker, report } = row.artifacts ?? {}; // Never read a later delivery's shared files during recovery.
-      row.result = blocker !== undefined ? workResult('', row.phase, { summary: blocker, outcome: 'blocked' })
-        : workResult(report || row.finalText || '', row.phase, raw === undefined ? undefined : JSON.parse(raw));
+      if (blocker !== undefined) {
+        row.result = workResult('', row.phase, { summary: blocker, outcome: 'blocked' });
+        row.verdictVia = 'written'; row.autoFollowups = 0;
+      } else {
+        // 首行口令是首选；没有口令时交给注入的判读器，熔断与越权限制在 stewardWorkResult 内硬执行。
+        const verdict = await stewardWorkResult(report || row.finalText || '', row.phase, raw === undefined ? undefined : JSON.parse(raw), {
+          resolver: this.deps.verdictResolver, task: row.task, employee: row.employee, deliveryId: row.proof.deliveryId,
+          autoFollowups: this.priorAutoFollowups(row),
+        });
+        row.result = verdict.result; row.verdictVia = verdict.via; row.autoFollowups = verdict.autoFollowups;
+      }
       row.state = 'pending'; row.nextRetry = 0;
     } catch {
       row.state = 'attention'; row.error = '工作结果缺失或复核结论不明确';
@@ -397,7 +425,14 @@ export class SidecarPool {
   async retryExecutions(): Promise<void> {
     if (!this.journal || this.closed) return;
     for (const row of this.journal.rows()) {
-      if (row.state === 'interrupted' && row.providerFailure && row.nextRetry <= Date.now()) {
+      // A channel that cannot deliver (process restart quarantined it, or the agent is gone) never reaches the
+      // write attempt that would expose a stale delivery. The same authoritative facts still retire the result.
+      if (row.state === 'pending' && (!this.launched.has(row.employee) || this.quarantined.has(row.employee))) {
+        if (row.nextRetry > Date.now()) continue;
+        const verdict = await this.staleResultCause(row).catch(() => undefined);
+        if (verdict === 'landed') await this.markResultSettled(row, 'recorded');
+        else if (verdict) await this.expireResult(row, verdict, 'channel_unavailable');
+      } else if (row.state === 'interrupted' && row.providerFailure && row.nextRetry <= Date.now()) {
         await this.releaseProviderFailure(row).catch(() => undefined);
       } else if (row.state === 'collecting' && row.nextRetry <= Date.now()) {
         await this.collectExecution(row);
@@ -434,31 +469,44 @@ export class SidecarPool {
       if (!row.prepared && row.result.action === 'submit') {
         const task = await this.callWithCred(row.employee, cred => core.getTask(cred, row.task));
         if (!row.result.evidence.sha && task.workIntent?.kind === 'code' && task.worktree?.worktreePath) {
-          const head = await new Promise<string | undefined>(resolve => execFile('git', ['-C', task.worktree!.worktreePath, 'rev-parse', 'HEAD'],
-            { timeout: 10000, maxBuffer: 1024 * 1024 }, (error, stdout) => resolve(!error && /^[a-f0-9]{40}$/i.test(stdout.trim()) ? stdout.trim() : undefined)));
+          const path = task.worktree.worktreePath;
+          const head = await advancedWorktreeHead((cmd, args, cwd) => new Promise(resolve =>
+            execFile(cmd, args, { cwd, timeout: 10000, maxBuffer: 1024 * 1024 }, (error, stdout) =>
+              resolve({ code: error ? 1 : 0, stdout: String(stdout ?? '') }))), path, task.worktree.branch);
           if (head) row.result.evidence.sha = head;
         }
         if (task.acceptanceEnvironment) row.result.evidence.acceptance = { ...row.result.evidence.acceptance, environment: task.acceptanceEnvironment };
         row.prepared = true;
         this.journal.save(row);
       }
-      const evidence = this.journal.evidence(row);
-      await this.callWithCred(row.employee, cred => row.result!.action === 'submit' ? core.submit(cred, row.proof, evidence)
-        : row.result!.action === 'accept' ? core.accept(cred, row.proof, evidence)
-        : row.result!.action === 'return' ? core.returnTask(cred, row.proof, evidence)
-        : core.block(cred, row.proof, 'owner', evidence));
-      row.state = 'settled'; row.error = undefined;
-      await this.changed(row);
-      const live = this.claims.get(row.employee);
-      if (live?.proof.deliveryId === row.proof.deliveryId) {
-        for (const path of [reportPath(this.commDirFor(row.employee)), blockerPath(this.commDirFor(row.employee)), join(this.commDirFor(row.employee), 'result.json')]) this.archive(path, 'done');
-        this.endLease(row.employee);
-      }
-      this.log(`runner ${row.result.action} ${row.task} for ${row.employee}`);
+      await this.deliverResult(row);
+      await this.markResultSettled(row);
     } catch (error) {
-      const code = String((error as { code?: string }).code ?? 'unavailable');
-      const message = String((error as Error).message ?? '').slice(0, 300);
+      let code = String((error as { code?: string }).code ?? 'unavailable');
+      let message = String((error as Error).message ?? '').slice(0, 300);
       row.lastRefusal = message || undefined;
+      // A failure with no server code is transport loss: the write may have committed while its reply was
+      // lost. Replay the identical frozen write once before judging; the core answers a stored transition
+      // for this idempotency key, so a delivered result settles. A coded refusal already proved the write
+      // did not commit (the core replays its idempotency record before refusing), so replaying is skipped.
+      if ((error as { code?: string }).code === undefined) {
+        try {
+          await this.deliverResult(row);
+          await this.markResultSettled(row, 'replay');
+          return;
+        } catch (replayError) {
+          code = String((replayError as { code?: string }).code ?? 'unavailable');
+          message = String((replayError as Error).message ?? '').slice(0, 300);
+          if (message) row.lastRefusal = message;
+        }
+      }
+      // Before spending another write on this result, ask the authoritative task/employee facts. A delivery the
+      // task no longer names, a finished task or a retired identity can never accept it again; a still-current
+      // lease, an unreadable fact, a transient auth loss or a network error must keep the result and its retries.
+      // A result the core already recorded is settled, never superseded: its delivery succeeded.
+      const stale = await this.staleResultCause(row).catch(() => undefined);
+      if (stale === 'landed') { await this.markResultSettled(row, 'recorded'); return; }
+      if (stale) { await this.expireResult(row, stale, code); return; }
       // A submit that waits on unfinished CI is not a refusal of the work: the retry budget is not spent. The result
       // stays pending with the same proof and evidence until CI succeeds, the lease ends, or the wait limit is reached.
       if (code === 'ci_pending') {
@@ -505,12 +553,69 @@ export class SidecarPool {
       this.log(`runner result pending ${row.task}: ${code}, attempt ${row.tries}`);
     } finally { this.flushing.delete(row.employee); }
   }
+  /** The row's frozen write: same proof, same evidence, same idempotency key, so a replay is safe. */
+  private deliverResult(row: ExecutionAttempt): Promise<unknown> {
+    const core = this.deps.core;
+    const evidence = this.journal!.evidence(row);
+    return this.callWithCred(row.employee, cred => row.result!.action === 'submit' ? core.submit(cred, row.proof, evidence)
+      : row.result!.action === 'accept' ? core.accept(cred, row.proof, evidence)
+      : row.result!.action === 'return' ? core.returnTask(cred, row.proof, evidence)
+      : core.block(cred, row.proof, 'owner', evidence));
+  }
+  /** Terminal record for a delivered result: the work is committed server-side, the live lease can end. */
+  private async markResultSettled(row: ExecutionAttempt, via?: string): Promise<void> {
+    row.state = 'settled'; row.error = undefined;
+    await this.changed(row);
+    const live = this.claims.get(row.employee);
+    if (live?.proof.deliveryId === row.proof.deliveryId) {
+      for (const path of [reportPath(this.commDirFor(row.employee)), blockerPath(this.commDirFor(row.employee)), join(this.commDirFor(row.employee), 'result.json')]) this.archive(path, 'done');
+      this.endLease(row.employee);
+    }
+    this.log(`runner ${row.result!.action} ${row.task} for ${row.employee}${via ? ` (${via})` : ''}`);
+  }
   /** Replaces a result that cannot be submitted with a blocked one that states the reason. The original work stays in the journal. */
   private blockResult(row: ExecutionAttempt, reason: string): void {
     row.originalResult = row.originalResult ?? row.result;
     row.result = workResult('', row.phase, { outcome: 'blocked', summary: `${reason}。原始工作成果已经保存在执行记录，需检查后恢复。` });
     row.prepared = true;
     row.nextRetry = 0;
+  }
+  /**
+   * Why this captured result can no longer be delivered, from authoritative task and employee facts.
+   * `undefined` means either the delivery is still the task's lease or the facts could not be read: an
+   * unreadable fact, like a temporary auth loss, is never proof that the work is invalid. `landed` means
+   * the core already recorded this delivery's write under its idempotency key — the result was delivered
+   * even though its reply was lost, so it settles rather than being judged stale.
+   */
+  private async staleResultCause(row: ExecutionAttempt): Promise<SupersededCause | 'landed' | undefined> {
+    if (!this.journal || !row.result) return undefined;
+    const facts = await this.deps.resultFacts?.(row.task, row.employee, {
+      deliveryId: row.proof.deliveryId, fence: row.proof.fence,
+      action: row.result.action, idempotencyKey: this.journal.evidence(row).idempotencyKey,
+    });
+    if (!facts) return undefined;
+    if (facts.landed) return 'landed';
+    const task = facts.task;
+    if (!task) return 'task_missing';
+    if (task.state === 'done' || task.state === 'void') return 'task_finished';
+    if (facts.employee?.missing || facts.employee?.retired || facts.employee?.revoked) return 'employee_gone';
+    if (task.state !== 'doing' && task.state !== 'review') return 'task_not_active';
+    if (task.currentEmployee !== row.employee || task.deliveryId !== row.proof.deliveryId || task.fence !== row.proof.fence) return 'lease_replaced';
+    return undefined;
+  }
+  /**
+   * Terminal record for a result whose delivery is gone. The work product, the captured artifacts and the
+   * core's last refusal stay in the journal; only delivery stops, so no duplicate submit or block follows.
+   */
+  private async expireResult(row: ExecutionAttempt, cause: SupersededCause, detail?: string): Promise<void> {
+    row.state = 'superseded';
+    row.supersededCause = cause;
+    row.supersededAt = Date.now();
+    row.error = `superseded:${cause}`;
+    row.nextRetry = 0;
+    await this.changed(row);
+    if (this.claims.get(row.employee)?.proof.deliveryId === row.proof.deliveryId) this.endLease(row.employee);
+    this.log(`runner result superseded ${row.task} for ${row.employee}: ${cause}${detail ? ` (${detail})` : ''}`);
   }
   private log(message: string) { this.deps.log?.(message); }
 

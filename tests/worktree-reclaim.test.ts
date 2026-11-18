@@ -105,6 +105,21 @@ test('env and config switches', () => {
   expect(parseGraceDays('nope')).toBe(7);
 });
 
+test('task authority outranks the reference: a live lease, an open task or unreadable facts keep the tree', () => {
+  const tree = { path: '/tmp/repo-task-dddddddd', branch: 'task/dddddddd', mode: 'exclusive' as const, status: 'present' as const, dirty: false, effectiveRefs: 0, recoveryRefs: 0, lastUsedAt: now };
+  expect(decideReclaim({ ...tree, authority: { open: 1, leased: 1 } }, policy))
+    .toMatchObject({ action: 'skip', deletable: false, reasons: ['authority-leased', 'lease-ref-mismatch'] });
+  expect(decideReclaim({ ...tree, authority: { open: 1, leased: 0 } }, policy))
+    .toMatchObject({ action: 'skip', deletable: false, reasons: ['authority-open'] });
+  expect(decideReclaim({ ...tree, authority: { open: 0, leased: 0, unreadable: 'authority-unreadable:refused' } }, policy))
+    .toMatchObject({ action: 'skip', deletable: false, reasons: ['authority-unreadable:refused'] });
+  // Terminal or unassigned trees with clean authority are still reclaimed.
+  expect(decideReclaim({ ...tree, authority: { open: 0, leased: 0 } }, policy)).toMatchObject({ action: 'delete', deletable: true });
+  // Earlier reference and switch reasons keep their order.
+  expect(decideReclaim({ ...tree, effectiveRefs: 1, authority: { open: 1, leased: 1 } }, policy).reasons).toEqual(['active-reference']);
+  expect(decideReclaim({ ...tree, authority: { open: 1, leased: 1 } }, { ...policy, enabled: false }).reasons).toEqual(['reclaim-disabled']);
+});
+
 test('a lane tree outlives every single task and dies with the last open one', () => {
   const tree = { path: '/tmp/repo-sck-aaa-bbbbbbbb', branch: 'lane/bbbbbbbb-billing', mode: 'exclusive' as const, status: 'present' as const, dirty: false, effectiveRefs: 0, recoveryRefs: 0, lastUsedAt: now };
   expect(isCompanyManagedPath(tree.path, tree.branch)).toBe(true);
