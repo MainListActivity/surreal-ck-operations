@@ -83,12 +83,14 @@ try {
     'owner-end/tests/gateway-access.fork.test.ts',
     // 节点记录、升级结果、回退记录与租约计数（自建隔离库，RUN_SCK_NODE_RELEASE_TESTS）。
     'tests/node-release.test.ts',
+    // 双节点跨目录共库租约负例与第二节点心跳（自建隔离库，RUN_SCK_DUAL_NODE_LEASE_TESTS）。
+    'tests/dual-node-lease.fork.test.ts',
     ];
   const test = Bun.spawn([process.execPath, 'test', ...targets], { detached: true, stdout: 'inherit', stderr: 'inherit', env: {
     ...process.env, SCK_PRODUCT_ENV: '/dev/null', SURREAL_URL: `ws://127.0.0.1:${port}/rpc`, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: rootPassword,
     // 隔离运行一律连本次自建的 fork：清掉调用方带来的云端地址（例如云端模式下调用的安装脚本）。
     COMPANY_DB_URL: '',
-    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_NODE_RELEASE_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_TASK_ROUTES_TESTS: '1', RUN_SCK_DB_CONNECTION_TESTS: '1', RUN_SCK_COMPANY_ACCESS_TESTS: '1', RUN_SCK_OWNER_END_TESTS: '1', RUN_SCK_CLOUD_RUNNER_TESTS: '1', RUN_SCK_OWNER_REPLY_TESTS: '1',
+    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_NODE_RELEASE_TESTS: '1', RUN_SCK_DUAL_NODE_LEASE_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_TASK_ROUTES_TESTS: '1', RUN_SCK_DB_CONNECTION_TESTS: '1', RUN_SCK_COMPANY_ACCESS_TESTS: '1', RUN_SCK_OWNER_END_TESTS: '1', RUN_SCK_CLOUD_RUNNER_TESTS: '1', RUN_SCK_OWNER_REPLY_TESTS: '1',
   } });
   groups.push(test.pid); save();
   exit = await test.exited;
