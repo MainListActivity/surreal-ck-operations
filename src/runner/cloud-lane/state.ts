@@ -58,6 +58,11 @@ export interface DevinLaneState {
   seats?: DevinSeatReading;
   /** Mode 1 本地代跑协助已用轮数（上限 3）；达到上限后 blocked 交老板裁决。 */
   assistRounds?: number;
+  /**
+   * 已产出但尚未确认回传原会话的代跑结果（含完整回传正文与标记）。恢复时先核可发条件再发这份结果，
+   * 不再次调用只读工具；anchor 绑定触发它的请求内容，请求变了就丢弃。
+   */
+  assistRelay?: { anchor: string; marker: string; round: number; text: string; tool?: string; at: number };
 }
 
 /** 回合摘要：provider + 交给供应商的完整 prompt（含 task.md 与 findings），不是外层派工消息。 */
