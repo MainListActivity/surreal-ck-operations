@@ -2190,6 +2190,80 @@ describe('ops 测试夹具', () => {
     for (const secret of [...r.world.tokens, ...r.company.sealed.values()]) expect(error.message).not.toContain(secret);
   });
 
+  test('workspace 403 已证明未写入：不记 uncertain_write，权限恢复后同租约继续', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    r.world.fault((method, url) => method === 'POST' && url.pathname === '/api/workspaces', 403, { times: 1 });
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(error.code).toBe('forbidden');
+    expect(error.message).toContain('阶段=workspace');
+    // 403 是上游明确拒绝：没有落地，不能报成不确定写。
+    expect(error.message).toContain('workspace=not_created');
+    expect(error.message).not.toContain('workspace=uncertain_write');
+    expect(existsSync(sampleFile(r, id))).toBe(false);
+    const journal = JSON.parse(readFileSync(join(r.dir, 'journal.json'), 'utf8'));
+    expect(journal.fixtures[id.key].created.workspace).toBe(false);
+    expect(journal.fixtures[id.key].uncertain).toBeUndefined();
+
+    // 权限恢复后同一租约（同一 fence）直接继续，不需要人工核对未确认写。
+    const ok = await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    expect(ok.status).toBe('ready');
+    expect(ok.fixture.workspace.created).toBe(true);
+    expect(r.world.workspaces.size).toBe(1);
+    expect(existsSync(sampleFile(r, id))).toBe(true);
+  });
+
+  test('workspace 5xx 结果不明：保留 uncertain，后续只按列表核对而不重发', async () => {
+    const r = fixtureRig();
+    r.world.fault((method, url) => method === 'POST' && url.pathname === '/api/workspaces', 500, { times: 2 });
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(error.message).toContain('workspace=uncertain_write');
+    // 第二次调用：登录列表仍未见该 workspace 时拒绝盲重试，不发出新的 POST。
+    const again = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(again.code).toBe('conflict');
+    expect(again.message).toContain('uncertain=workspace');
+    expect(r.world.requests.filter(q => q.method === 'POST' && new URL(q.url).pathname === '/api/workspaces')).toHaveLength(2);
+  });
+
+  test('授权复查耗尽 workspace 阶段期限：零新 workspace 写，样本与浏览器不运行', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    let clock = 0;
+    let scopeCalls = 0;
+    const core = {
+      ...r.company.core,
+      opsScope: async (credential: string, taskId: string) => {
+        const scope = await r.company.core.opsScope(credential, taskId);
+        scopeCalls++;
+        // 调用入口(1)、account(2)、login(3) 之后，第 4 次是 workspace 阶段入口的授权复查。
+        if (scopeCalls === 4) clock += FIXTURE_STAGE_BUDGET_MS.workspace;
+        return scope;
+      },
+    };
+    r.broker = new OpsBroker({
+      core: core as never, projects: r.company.projects as never, secretKey: () => Buffer.alloc(32),
+      controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
+      fetch: r.world.fetch, now: r.world.now, monoNow: () => clock,
+      d1: () => r.world.d1, queryAsUser: r.world.queryAsUser, browser: r.world.browser,
+      sleep: async ms => { clock += ms; }, ...r.paths,
+    });
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo', browser: { spaceId: 42, page: 'p2' } }));
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toContain('阶段=workspace');
+    expect(error.message).toContain('elapsed=');
+    expect(error.message).toContain('workspace=not_created');
+    // 复查已耗尽期限：不能再进入 work，workspace POST 计数为 0。
+    expect(scopeCalls).toBe(4);
+    expect(r.world.requests.filter(q => q.method === 'POST' && new URL(q.url).pathname === '/api/workspaces')).toHaveLength(0);
+    expect(r.world.workspaces.size).toBe(0);
+    expect(existsSync(sampleFile(r, id))).toBe(false);
+    expect(r.world.browserLogins).toHaveLength(0);
+    expect(r.world.user(id.username)).toBeDefined(); // account 阶段此前已完成
+    const journal = JSON.parse(readFileSync(join(r.dir, 'journal.json'), 'utf8'));
+    expect(journal.fixtures[id.key].created.workspace).toBe(false);
+    expect(journal.fixtures[id.key].uncertain).toBeUndefined();
+  });
+
   test('租约结束后不再运行，也不删除已有样本', async () => {
     const r = fixtureRig();
     const id = identityFor();
@@ -2342,6 +2416,70 @@ describe('ops 测试夹具', () => {
     if (outcome.status !== 'timed_out') throw new Error('expected timed_out');
     expect(outcome.error.timedOut).toBe(true);
     expect(outcome.elapsedMs).toBeGreaterThanOrEqual(FIXTURE_STAGE_BUDGET_MS.workspace);
+    // 已完成但已过期：写可能落地，必须保留“结果不明”。
+    expect(outcome.unconfirmed).toBe(true);
+  });
+
+  test('授权复查耗尽阶段期限：复查后过期，work 零调用且不记未确认写', async () => {
+    let clock = 0;
+    let workCalls = 0;
+    const outcome = await runFixtureStage('workspace', async () => {
+      workCalls++;
+      return 'worked';
+    }, { now: () => clock, sleep: async ms => { clock += ms; } }, {
+      beforeAttempt: async () => { clock += FIXTURE_STAGE_BUDGET_MS.workspace; },
+    });
+    expect(outcome.status).toBe('timed_out');
+    if (outcome.status !== 'timed_out') throw new Error('expected timed_out');
+    expect(workCalls).toBe(0);
+    expect(outcome.unconfirmed).toBe(false);
+  });
+
+  test('授权复查等待超时：work 零调用，阶段判 timed_out', async () => {
+    let clock = 0;
+    let workCalls = 0;
+    const outcome = await runFixtureStage('workspace', async () => {
+      workCalls++;
+      return 'worked';
+    }, { now: () => clock, sleep: async ms => { clock += ms; } }, {
+      // 复查自己把时钟推过期限再成功返回：等待与返回后都必须挡住 work。
+      beforeAttempt: async () => { clock += FIXTURE_STAGE_BUDGET_MS.workspace + 1; },
+    });
+    expect(outcome.status).toBe('timed_out');
+    if (outcome.status !== 'timed_out') throw new Error('expected timed_out');
+    expect(workCalls).toBe(0);
+    expect(outcome.unconfirmed).toBe(false);
+  });
+
+  test('确定性拒绝才证明未写入；conflict 与“先不明后拒绝”都保留未确认', async () => {
+    let clock = 0;
+    let forbiddenCalls = 0;
+    const denied = await runFixtureStage('workspace', async () => {
+      forbiddenCalls++;
+      throw new CompanyError('forbidden', 'workspace-create-forbidden');
+    }, { now: () => clock, sleep: async ms => { clock += ms; } });
+    expect(denied.status).toBe('failed');
+    if (denied.status !== 'failed') throw new Error('expected failed');
+    expect(denied.unconfirmed).toBe(false);
+    expect(forbiddenCalls).toBe(1); // 确定性拒绝不再重试
+
+    const conflict = await runFixtureStage('workspace', async () => {
+      throw new CompanyError('conflict', 'creating workspace failed: HTTP 409');
+    }, { now: () => clock, sleep: async ms => { clock += ms; } });
+    if (conflict.status !== 'failed') throw new Error('expected failed');
+    expect(conflict.unconfirmed).toBe(true); // 409 可能表示另一笔创建刚完成
+
+    let calls = 0;
+    const overwritten = await runFixtureStage('workspace', async () => {
+      calls++;
+      if (calls === 1) throw new CompanyError('upstream_error', 'workspace create response lost', true);
+      throw new CompanyError('forbidden', 'workspace-create-forbidden');
+    }, { now: () => clock, sleep: async ms => { clock += ms; } });
+    expect(overwritten.status).toBe('failed');
+    if (overwritten.status !== 'failed') throw new Error('expected failed');
+    expect(calls).toBe(2);
+    // 第一次已发出且结果不明；最终错误码不能把这次事实覆盖成“未写入”。
+    expect(overwritten.unconfirmed).toBe(true);
   });
 
   test('执行中撤权：workspace 成功后撤租约，sample/browser 不再执行', async () => {

@@ -197,83 +197,111 @@ const transientFailure = (error: unknown): boolean => {
   return error.retryable && (error.code === 'upstream_error' || error.code === 'login_failed');
 };
 
+/**
+ * 调用被上游明确拒绝、请求没有落地（403/401/400 与本地前置门禁）。只有这些码能证明“未写入”；
+ * `conflict` 不在内：409 可能表示另一笔创建刚刚完成，结果仍不确定。
+ */
+const DEFINITE_NO_WRITE = new Set(['forbidden', 'unauthorized', 'invalid', 'not_configured', 'limit_reached']);
+const definiteNoWrite = (error: unknown): boolean => error instanceof CompanyError && DEFINITE_NO_WRITE.has(error.code);
+
+export interface FixtureStageHooks {
+  /**
+   * 每次尝试（含退避后的重试）在 work 前执行，其耗时计入阶段期限。撤权/换代际在此拦下，
+   * 不再发起新的外部写。
+   */
+  beforeAttempt?: () => Promise<void>;
+  /** work 调用前执行，调用方在此把“已发出”记进台账；它抛错即代表没有写发生。 */
+  beforeWork?: () => void;
+  /** 期限起点；缺省在进入本函数时取 now。调用方应传入授权复查开始的那一刻。 */
+  startedAt?: number;
+}
+
 export type FixtureStageOutcome<T> =
   | { status: 'ok'; value: T; elapsedMs: number; attempts: number }
-  | { status: 'timed_out'; elapsedMs: number; attempts: number; error: FixtureStageError }
-  | { status: 'failed'; elapsedMs: number; attempts: number; error: FixtureStageError };
+  | { status: 'timed_out'; elapsedMs: number; attempts: number; error: FixtureStageError; unconfirmed: boolean }
+  | { status: 'failed'; elapsedMs: number; attempts: number; error: FixtureStageError; unconfirmed: boolean };
 
 /**
- * 固定次数的阶段执行器：`work()` 本身受预算限制。
+ * 固定次数的阶段执行器：`work()` 与每次授权复查都受同一份阶段预算限制。
  * - 真实挂起：用原生定时器在期限到达时停止等待（不取消已发出的外部写）。
- * - 假时钟：work 自己把 now 推过期限再返回时，完成后的 elapsed 检查仍判为 timed_out。
- * - `beforeAttempt`：每一次尝试（含退避后的重试）在调用 work 前执行；撤权/换代际在此拦下，
- *   不得再发新的外部写。权限未变时，既有可安全重试流程与期限保持不变。
- * 超时不得等同“未写入”：调用方必须按事实核对并在台账上标记 uncertain，禁止盲重试。
+ * - 假时钟：work/复查自己把 now 推过期限再返回时，完成后的 elapsed 检查仍判为 timed_out。
+ * - `beforeAttempt` 在每次尝试（含退避后的重试）调用 work 前执行，且与 work 共用剩余时间：
+ *   复查等待超时、或复查返回时预算已耗尽，都不再进入 work（零新外部写）。
+ * - `beforeWork` 在 work 前执行一次，供调用方登记“已发出”。
+ * `unconfirmed` 汇总本次阶段里是否有过“已发出但结果不明”的尝试：只有确定性拒绝才算未写入；
+ * 之前某次尝试结果不明时，后续的确定性拒绝不得把它清掉。超时不得等同“未写入”。
  * 故障预算仍在 OpsBroker 外层。
  */
 export async function runFixtureStage<T>(
   stage: FixtureStage,
   work: () => Promise<T>,
   clocks: { now: () => number; sleep: (ms: number) => Promise<void> },
-  beforeAttempt?: () => Promise<void>,
+  hooks: FixtureStageHooks = {},
 ): Promise<FixtureStageOutcome<T>> {
   const budget = FIXTURE_STAGE_BUDGET_MS[stage];
-  const started = clocks.now();
+  const started = hooks.startedAt ?? clocks.now();
+  const elapsed = () => Math.max(0, Math.round(clocks.now() - started));
+  const timeoutCause = () => new CompanyError('upstream_error', `${stage} 阶段超过 ${budget}ms 期限`, true);
   let attempts = 0;
   let last: unknown;
+  // 任何一次尝试可能已经落地，就必须保留“未写入不明”的事实，后续拒绝码不能覆盖它。
+  let unconfirmed = false;
 
-  for (let attempt = 1; attempt <= FIXTURE_STAGE_ATTEMPTS; attempt++) {
-    attempts = attempt;
-    if (clocks.now() - started >= budget) break;
+  const timedOut = (): FixtureStageOutcome<T> => {
+    const error = new FixtureStageError(stage, elapsed(), timeoutCause(), true);
+    return { status: 'timed_out', elapsedMs: error.elapsedMs, attempts, error, unconfirmed };
+  };
 
-    try {
-      if (beforeAttempt) await beforeAttempt();
-    } catch (error) {
-      // 撤权/换代际：不再发起本轮及后续 work()；已发出且结果不明的写由调用方按 uncertain 收尾。
-      last = error;
-      break;
-    }
-
+  const withinDeadline = async <V>(value: Promise<V>): Promise<V> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const remaining = Math.max(1, budget - (clocks.now() - started));
     const deadline = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        reject(Object.assign(
-          new CompanyError('upstream_error', `${stage} 阶段超过 ${budget}ms 期限`, true),
-          { timedOut: true as const },
-        ));
-      }, remaining);
+        reject(Object.assign(timeoutCause(), { timedOut: true as const }));
+      }, Math.max(1, budget - elapsed()));
     });
+    try {
+      return await Promise.race([value, deadline]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
+  for (let attempt = 1; attempt <= FIXTURE_STAGE_ATTEMPTS; attempt++) {
+    if (elapsed() >= budget) return timedOut();
+    attempts = attempt;
+
+    if (hooks.beforeAttempt) {
+      try {
+        await withinDeadline(hooks.beforeAttempt());
+      } catch (error) {
+        if ((error as { timedOut?: boolean }).timedOut) return timedOut();
+        // 撤权/换代际：不再发起本轮及后续 work()；已发出且结果不明的写由此前的 unconfirmed 保留。
+        last = error;
+        break;
+      }
+      // 授权复查计入了阶段期限：复查返回时已过期就不得再调用 work()。
+      if (elapsed() >= budget) return timedOut();
+    }
+
+    hooks.beforeWork?.();
 
     try {
-      const value = await Promise.race([work(), deadline]);
-      if (timer) clearTimeout(timer);
-      const elapsedMs = Math.max(0, Math.round(clocks.now() - started));
-      if (elapsedMs >= budget) {
-        return {
-          status: 'timed_out', elapsedMs, attempts,
-          error: new FixtureStageError(stage, elapsedMs,
-            new CompanyError('upstream_error', `${stage} 阶段超过 ${budget}ms 期限`, true), true),
-        };
+      const value = await withinDeadline(work());
+      if (elapsed() >= budget) {
+        // 调用已完成但阶段已过期：写可能已落地，不能按“未写入”处理。
+        unconfirmed = true;
+        return timedOut();
       }
-      return { status: 'ok', value, elapsedMs, attempts };
+      return { status: 'ok', value, elapsedMs: elapsed(), attempts };
     } catch (error) {
-      if (timer) clearTimeout(timer);
       last = error;
-      const timedOut = !!(error as { timedOut?: boolean }).timedOut;
-      if (timedOut) {
-        const elapsedMs = Math.max(0, Math.round(clocks.now() - started));
-        const cause = error instanceof CompanyError
-          ? error
-          : new CompanyError('upstream_error', `${stage} 阶段超过 ${budget}ms 期限`, true);
-        return {
-          status: 'timed_out', elapsedMs, attempts,
-          error: new FixtureStageError(stage, elapsedMs, cause, true),
-        };
+      if ((error as { timedOut?: boolean }).timedOut) {
+        unconfirmed = true;
+        return timedOut();
       }
-      const elapsed = clocks.now() - started;
+      if (!definiteNoWrite(error)) unconfirmed = true;
       if (!transientFailure(error) || attempt === FIXTURE_STAGE_ATTEMPTS) break;
-      if (elapsed + FIXTURE_STAGE_BACKOFF_MS >= budget) break;
+      if (elapsed() + FIXTURE_STAGE_BACKOFF_MS >= budget) break;
       await clocks.sleep(FIXTURE_STAGE_BACKOFF_MS);
     }
   }
@@ -281,9 +309,44 @@ export async function runFixtureStage<T>(
   const cause = last instanceof CompanyError
     ? last
     : new CompanyError('upstream_error', `${(last as Error)?.name ?? 'Error'}: ${String((last as Error)?.message ?? last).slice(0, 160)}`, true);
-  const elapsedMs = Math.max(0, Math.round(clocks.now() - started));
+  const elapsedMs = elapsed();
   return {
-    status: 'failed', elapsedMs, attempts,
+    status: 'failed', elapsedMs, attempts, unconfirmed,
     error: new FixtureStageError(stage, elapsedMs, cause, false),
   };
+}
+
+/**
+ * 阶段内的一次性检查（例如非写路径前的授权复查）：同样受该阶段预算限制。
+ * 等待超时或返回时已过期都抛 timed_out，调用方不得再继续后续外部写。
+ */
+export async function runFixtureCheck(
+  stage: FixtureStage,
+  check: () => Promise<void>,
+  clocks: { now: () => number; sleep: (ms: number) => Promise<void> },
+  startedAt?: number,
+): Promise<number> {
+  const budget = FIXTURE_STAGE_BUDGET_MS[stage];
+  const started = startedAt ?? clocks.now();
+  const elapsed = () => Math.max(0, Math.round(clocks.now() - started));
+  const timedOut = () => new FixtureStageError(stage, elapsed(),
+    new CompanyError('upstream_error', `${stage} 阶段超过 ${budget}ms 期限`, true), true);
+  if (elapsed() >= budget) throw timedOut();
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(Object.assign(new CompanyError('upstream_error', `${stage} 阶段超过 ${budget}ms 期限`, true), { timedOut: true as const }));
+    }, Math.max(1, budget - elapsed()));
+  });
+  try {
+    await Promise.race([check(), deadline]);
+  } catch (error) {
+    if ((error as { timedOut?: boolean }).timedOut) throw timedOut();
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  if (elapsed() >= budget) throw timedOut();
+  return elapsed();
 }

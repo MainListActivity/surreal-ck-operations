@@ -50,7 +50,7 @@ import { MAGPIE_RESTORE_ALIAS, planMagpieRouteRestore } from './magpie-restore.t
 import { loadProofFiles, readProofFile } from './proof-files.ts';
 import {
   FixtureJournal, FixtureStageError, fixtureIdentity, fixtureSample, fixtureSampleCsv, fixtureSamplePath, FIXTURE_ROLES,
-  runFixtureStage, type FixtureIdentity, type FixtureRecord, type FixtureStage,
+  runFixtureCheck, runFixtureStage, type FixtureIdentity, type FixtureRecord, type FixtureStage,
 } from './test-fixture.ts';
 import { MAGPIE_EXECUTION_HEADROOM_SECONDS, MAGPIE_SNAPSHOT_MAX_AGE_SECONDS } from './proof-contract.ts';
 import { clip, redactJson, redactText } from './redact.ts';
@@ -2231,42 +2231,51 @@ export class OpsBroker {
     let sampleWritten = false;
     const credential = ctx.credential;
 
-    const stage = async <T>(name: FixtureStage, work: () => Promise<T>, opts: { write?: 'account' | 'workspace' | 'sample' } = {}): Promise<T> => {
+    const stage = async <T>(name: FixtureStage, work: () => Promise<T>, opts: { write?: 'account' | 'workspace' | 'sample'; startedAt?: number } = {}): Promise<T> => {
       currentStage = name;
-      await this.assertFixtureLive(ctx, credential, fence, name);
-      if (opts.write && live.uncertain?.[opts.write]) {
-        throw new CompanyError('conflict',
-          `${opts.write} 阶段此前有一笔未确认的外部写；只允许按幂等接口核对，禁止盲重试（阶段=${name}；可清理状态：uncertain=${opts.write}）`);
-      }
-      if (opts.write) {
+      // 期限从本阶段入口（含首次授权复查）开始算，复查耗时不得游离在预算之外。
+      const startedAt = opts.startedAt ?? this.monoNow();
+      let marked = false;
+      const outcome = await runFixtureStage(
+        name, work, { now: this.monoNow, sleep: this.sleep },
+        {
+          startedAt,
+          // 每一次尝试（含退避后的重试）在 work 前复查租约/代际；撤权后不得再发新的外部写。
+          beforeAttempt: () => this.assertFixtureLive(ctx, credential, fence, name),
+          // 只有授权复查通过、即将发出写时才登记 uncertain；复查被拒时不留“未确认写”。
+          beforeWork: opts.write ? () => {
+            if (marked) return;
+            if (live.uncertain?.[opts.write!]) {
+              throw new CompanyError('conflict',
+                `${opts.write} 阶段此前有一笔未确认的外部写；只允许按幂等接口核对，禁止盲重试（阶段=${name}；可清理状态：uncertain=${opts.write}）`);
+            }
+            marked = true;
+            live = {
+              ...live,
+              uncertain: { ...(live.uncertain ?? {}), [opts.write!]: true },
+              updatedAt: new Date(this.now()).toISOString(),
+            };
+            journal.put(live);
+          } : undefined,
+        },
+      );
+      if (opts.write && (outcome.status === 'ok' || !outcome.unconfirmed)) {
+        // 成功，或没有任何一次“已发出且结果不明”的尝试（确定性拒绝）：清掉未确认标记，允许同租约继续。
+        const uncertain = { ...(live.uncertain ?? {}) };
+        delete uncertain[opts.write];
         live = {
           ...live,
-          uncertain: { ...(live.uncertain ?? {}), [opts.write]: true },
+          uncertain: Object.keys(uncertain).length ? uncertain : undefined,
           updatedAt: new Date(this.now()).toISOString(),
         };
         journal.put(live);
       }
-      // 每一次尝试（含退避后的重试）在 work 前复查租约/代际；撤权后不得再发新的外部写。
-      const outcome = await runFixtureStage(
-        name, work, { now: this.monoNow, sleep: this.sleep },
-        () => this.assertFixtureLive(ctx, credential, fence, name),
-      );
-      if (outcome.status === 'ok') {
-        if (opts.write) {
-          const uncertain = { ...(live.uncertain ?? {}) };
-          delete uncertain[opts.write];
-          live = {
-            ...live,
-            uncertain: Object.keys(uncertain).length ? uncertain : undefined,
-            updatedAt: new Date(this.now()).toISOString(),
-          };
-          journal.put(live);
-        }
-        stages.push({ stage: name, status: 'ok', elapsedMs: outcome.elapsedMs });
-        return outcome.value;
+      if (outcome.status !== 'ok') {
+        // 仍有未确认写时保留 uncertain：外部状态只按幂等接口核对，禁止盲重试。
+        throw outcome.error;
       }
-      // 超时：外部写可能已落地，保留 uncertain，禁止后续盲重试；失败消息由外层 fixtureFailure 收尾。
-      throw outcome.error;
+      stages.push({ stage: name, status: 'ok', elapsedMs: outcome.elapsedMs });
+      return outcome.value;
     };
 
     try {
@@ -2276,8 +2285,8 @@ export class OpsBroker {
         live = { ...live, created: { ...live.created, account: true }, updatedAt: new Date(this.now()).toISOString() };
         journal.put(live);
       } else if (live.uncertain?.account) {
-        // 上一轮超时留下的未知写：只核对，不重写。
-        await this.assertFixtureLive(ctx, credential, fence, 'account');
+        // 上一轮超时留下的未知写：只核对，不重写；核对也受 account 阶段期限约束。
+        await runFixtureCheck('account', () => this.assertFixtureLive(ctx, credential, fence, 'account'), { now: this.monoNow, sleep: this.sleep });
         const password = await this.sealedPassword(ctx, id.alias);
         if (!password) {
           throw new CompanyError('conflict',
@@ -2309,7 +2318,9 @@ export class OpsBroker {
       });
 
       currentStage = 'workspace';
-      await this.assertFixtureLive(ctx, credential, fence, 'workspace');
+      // 本阶段的授权复查计入 workspace 期限：等待超时或复查后过期都不再发出 workspace 写。
+      const workspaceStarted = this.monoNow();
+      await runFixtureCheck('workspace', () => this.assertFixtureLive(ctx, credential, fence, 'workspace'), { now: this.monoNow, sleep: this.sleep }, workspaceStarted);
       const listed = login.workspaces.find(item => item.slug === id.workspaceSlug);
       if (listed && !live.created.workspace && !live.intent.workspace && !live.uncertain?.workspace) {
         throw new CompanyError('conflict',
@@ -2328,14 +2339,14 @@ export class OpsBroker {
           };
           journal.put(live);
         }
-        await stage('workspace', () => this.workspaceEnsure(ctx, { session: login.session, slug: id.workspaceSlug, name: id.workspaceName }));
+        await stage('workspace', () => this.workspaceEnsure(ctx, { session: login.session, slug: id.workspaceSlug, name: id.workspaceName }), { startedAt: workspaceStarted });
       } else if (live.uncertain?.workspace) {
         throw new CompanyError('conflict',
           `workspace 阶段有未确认写，且当前列表仍未见 ${id.workspaceSlug}；无法判定落地状态，拒绝盲重试（阶段=workspace；可清理状态：uncertain=workspace）`);
       } else {
         live = { ...live, intent: { ...live.intent, workspace: true }, updatedAt: new Date(this.now()).toISOString() };
         journal.put(live);
-        const outcome = await stage('workspace', () => this.workspaceEnsure(ctx, { session: login.session, slug: id.workspaceSlug, name: id.workspaceName }), { write: 'workspace' });
+        const outcome = await stage('workspace', () => this.workspaceEnsure(ctx, { session: login.session, slug: id.workspaceSlug, name: id.workspaceName }), { write: 'workspace', startedAt: workspaceStarted });
         const value = outcome.value as { created?: boolean };
         if (value.created === true) workspaceMade = true;
         live = { ...live, created: { ...live.created, workspace: true }, updatedAt: new Date(this.now()).toISOString() };
@@ -2343,7 +2354,8 @@ export class OpsBroker {
       }
 
       currentStage = 'sample';
-      await this.assertFixtureLive(ctx, credential, fence, 'sample');
+      const sampleStarted = this.monoNow();
+      await runFixtureCheck('sample', () => this.assertFixtureLive(ctx, credential, fence, 'sample'), { now: this.monoNow, sleep: this.sleep }, sampleStarted);
       const existingSample = this.readFixtureSample(samplePath);
       if (existingSample !== undefined && !live.created.sample) {
         if ((!live.intent.sample && !live.uncertain?.sample) || existingSample !== sample.body) {
@@ -2384,7 +2396,7 @@ export class OpsBroker {
             }
           }
           sampleWritten = true;
-        }, { write: 'sample' });
+        }, { write: 'sample', startedAt: sampleStarted });
         live = { ...live, created: { ...live.created, sample: true }, samplePath, sampleHandle: sample.handle, sampleDigest: sample.digest, updatedAt: new Date(this.now()).toISOString() };
         journal.put(live);
       }

@@ -139,6 +139,8 @@ export const RELEASE_SCHEMA_REQUIREMENTS: ReleaseSchemaRequirement[] = [
   { version: '0.13.64', schema: 74, tables: ['task', 'outbound_message', 'route', 'runner_heartbeat', 'company_meta', 'dispatch_attempt', 'dispatch_recovery_approval', 'dispatch_recovery_receipt', 'agent_activity', 'reply_translation', 'turn_analysis', 'planned_message', 'owner_style_memory', 'fault_recovery_grant'] },
   // 本卡修同阶段重试门禁，不新增表；沿用 schema 074。
   { version: '0.13.65', schema: 74, tables: ['task', 'outbound_message', 'route', 'runner_heartbeat', 'company_meta', 'dispatch_attempt', 'dispatch_recovery_approval', 'dispatch_recovery_receipt', 'agent_activity', 'reply_translation', 'turn_analysis', 'planned_message', 'owner_style_memory', 'fault_recovery_grant'] },
+  // 本卡让阶段期限覆盖授权复查，并按写事实区分确定性拒绝与结果不明；不新增表，沿用 schema 074。
+  { version: '0.13.66', schema: 74, tables: ['task', 'outbound_message', 'route', 'runner_heartbeat', 'company_meta', 'dispatch_attempt', 'dispatch_recovery_approval', 'dispatch_recovery_receipt', 'agent_activity', 'reply_translation', 'turn_analysis', 'planned_message', 'owner_style_memory', 'fault_recovery_grant'] },
 ];
 /** The requirement that applies to a target version: the newest one that is not newer than the target. */
 export function schemaRequirementFor(version: string): { schema: number; tables: string[] } {
