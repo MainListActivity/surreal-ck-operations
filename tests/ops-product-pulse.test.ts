@@ -174,6 +174,13 @@ test('counts that contradict the state or thresholds are refused instead of gues
     .toContain('抑制态返回了精确计数');
   r.world.funnelSummary.body = summary({ state: 'reported', totalCount: 4, workspaceCount: 7 });
   expect((await failure(r.call('ops_product_pulse', { session: login.session, event: EVENT, day: DAY }))).message)
+    .toContain('低于公司固定下限');
+  // A stricter upstream threshold (above the company floor) is still honoured.
+  r.world.funnelSummary.body = summary({
+    state: 'reported', totalCount: 7, workspaceCount: 7,
+    thresholds: { minTotalCount: 10, minWorkspaceCount: 3 },
+  });
+  expect((await failure(r.call('ops_product_pulse', { session: login.session, event: EVENT, day: DAY }))).message)
     .toContain('低于上游抑制阈值');
   r.world.funnelSummary.body = summary({ state: 'empty', totalCount: 1, workspaceCount: 0 });
   expect((await failure(r.call('ops_product_pulse', { session: login.session, event: EVENT, day: DAY }))).message)
@@ -191,6 +198,46 @@ test('an unknown or confident coverage marker is refused: coverage may only be u
   r.world.funnelSummary.body = withoutCoverage;
   expect((await failure(r.call('ops_product_pulse', { session: login.session, event: EVENT, day: DAY }))).message)
     .toContain('缺少覆盖标记');
+});
+
+test('an upstream that lowers the suppression threshold is refused, not trusted', async () => {
+  const r = rig();
+  const login = await operatorSession(r);
+  // CK #258 fixes 5/3. A response claiming reported 1/1 with thresholds 1/1 must not become an exact projection.
+  r.world.funnelSummary.body = summary({
+    totalCount: 1, workspaceCount: 1,
+    thresholds: { minTotalCount: 1, minWorkspaceCount: 1 },
+    marker: 'LOW-SAMPLE-MARKER',
+  });
+  const lowered = await failure(r.call('ops_product_pulse', { session: login.session, event: EVENT, day: DAY }));
+  expect(lowered.code).toBe('upstream_error');
+  expect(lowered.message).toContain('低于公司固定下限');
+  expect(lowered.message).not.toContain('LOW-SAMPLE-MARKER');
+
+  // Lowered thresholds with counts 2/2 are refused for the same reason: the floor is the company's, not upstream's.
+  r.world.funnelSummary.body = summary({
+    totalCount: 2, workspaceCount: 2,
+    thresholds: { minTotalCount: 1, minWorkspaceCount: 1 },
+  });
+  const loweredAgain = await failure(r.call('ops_product_pulse', { session: login.session, event: EVENT, day: DAY }));
+  expect(loweredAgain.message).toContain('低于公司固定下限');
+
+  // Even with unchanged 5/3 thresholds, a reported sample below the floor is refused.
+  r.world.funnelSummary.body = summary({ totalCount: 2, workspaceCount: 2 });
+  const belowFloor = await failure(r.call('ops_product_pulse', { session: login.session, event: EVENT, day: DAY }));
+  expect(belowFloor.message).toContain('reported 低样本低于公司固定下限');
+});
+
+test('an unknown coverage reason is refused instead of being relayed', async () => {
+  const r = rig();
+  const login = await operatorSession(r);
+  r.world.funnelSummary.body = summary({
+    coverage: { state: 'unknown', complete: false, reason: 'synthetic_marker', source: 'funnel_event_count' },
+  });
+  const error = await failure(r.call('ops_product_pulse', { session: login.session, event: EVENT, day: DAY }));
+  expect(error.code).toBe('upstream_error');
+  expect(error.message).toContain('覆盖原因不是契约字面量');
+  expect(error.message).not.toContain('synthetic_marker');
 });
 
 test('a malformed or failing upstream is surfaced without its code, message or body', async () => {

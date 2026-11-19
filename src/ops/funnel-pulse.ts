@@ -3,9 +3,10 @@
  *
  * The upstream contract fixes one known event and one UTC day per call and aggregates inside the database, so no
  * row-level workspace key is ever returned. This module re-checks that contract on the company side: only the
- * declared summary state, the public aggregates (already suppressed by upstream thresholds) and the coverage marker
- * are projected. Unknown fields are ignored; a response that contradicts the request or its own state is refused
- * instead of being passed through.
+ * declared summary state, the public aggregates and the coverage marker are projected. Unknown fields are ignored;
+ * a response that contradicts the request or its own state is refused instead of being passed through. The 5/3
+ * suppression floor and the single coverage reason are fixed here too, so a weakened upstream cannot leak
+ * low-sample counts or introduce free-form coverage text.
  */
 import { CompanyError } from '../core-errors.ts';
 
@@ -23,6 +24,17 @@ export const FUNNEL_PULSE_EVENTS = [
 export type FunnelPulseEvent = typeof FUNNEL_PULSE_EVENTS[number];
 
 export type FunnelPulseState = 'empty' | 'suppressed' | 'reported';
+
+/**
+ * Company-side suppression floor, fixed independently of the upstream response (CK #258 declares the same 5/3).
+ * An upstream that reports a lower threshold, or a `reported` sample below this floor, is refused rather than
+ * trusted — otherwise a lowered threshold would leak precise low-sample counts.
+ */
+export const FUNNEL_PULSE_MIN_TOTAL_COUNT = 5;
+export const FUNNEL_PULSE_MIN_WORKSPACE_COUNT = 3;
+
+/** The only coverage reason the contract defines; anything else is refused, never relayed. */
+export const FUNNEL_PULSE_COVERAGE_REASON = 'no_collection_coverage_signal';
 
 export interface FunnelPulseReport {
   event: FunnelPulseEvent;
@@ -60,8 +72,9 @@ function readThresholds(value: unknown): { minTotalCount: number; minWorkspaceCo
   if (!isRecord(value)) throw inconsistent('缺少阈值');
   const minTotalCount = value.minTotalCount;
   const minWorkspaceCount = value.minWorkspaceCount;
-  if (!isCount(minTotalCount) || minTotalCount < 1 || !isCount(minWorkspaceCount) || minWorkspaceCount < 1) {
-    throw inconsistent('阈值非法');
+  if (!isCount(minTotalCount) || !isCount(minWorkspaceCount)) throw inconsistent('阈值非法');
+  if (minTotalCount < FUNNEL_PULSE_MIN_TOTAL_COUNT || minWorkspaceCount < FUNNEL_PULSE_MIN_WORKSPACE_COUNT) {
+    throw inconsistent('上游阈值低于公司固定下限');
   }
   return { minTotalCount, minWorkspaceCount };
 }
@@ -70,9 +83,8 @@ function readCoverage(value: unknown): FunnelPulseReport['coverage'] {
   if (!isRecord(value)) throw inconsistent('缺少覆盖标记');
   if (value.state !== 'unknown' || value.complete !== false) throw inconsistent('覆盖标记不是 unknown');
   if (value.source !== 'funnel_event_count') throw inconsistent('覆盖来源非法');
-  const reason = value.reason;
-  if (typeof reason !== 'string' || !/^[a-z0-9_]{1,120}$/.test(reason)) throw inconsistent('覆盖原因非法');
-  return { state: 'unknown', complete: false, reason, source: 'funnel_event_count' };
+  if (value.reason !== FUNNEL_PULSE_COVERAGE_REASON) throw inconsistent('覆盖原因不是契约字面量');
+  return { state: 'unknown', complete: false, reason: FUNNEL_PULSE_COVERAGE_REASON, source: 'funnel_event_count' };
 }
 
 /**
@@ -102,6 +114,9 @@ export function parseFunnelPulse(event: FunnelPulseEvent, day: string, body: unk
     workspaceCount = null;
   } else {
     if (!isCount(body.totalCount) || !isCount(body.workspaceCount)) throw inconsistent('汇总计数非法');
+    if (body.totalCount < FUNNEL_PULSE_MIN_TOTAL_COUNT || body.workspaceCount < FUNNEL_PULSE_MIN_WORKSPACE_COUNT) {
+      throw inconsistent('reported 低样本低于公司固定下限');
+    }
     if (body.totalCount < thresholds.minTotalCount || body.workspaceCount < thresholds.minWorkspaceCount) {
       throw inconsistent('reported 低于上游抑制阈值');
     }
