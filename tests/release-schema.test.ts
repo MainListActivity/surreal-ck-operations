@@ -118,6 +118,10 @@ expect(schemaRequirementFor('0.13.56').schema).toBe(73);
     expect(schemaRequirementFor('0.13.58').tables).toContain('fault_recovery_grant');
     expect(schemaRequirementFor('0.13.59').schema).toBe(74);
     expect(schemaRequirementFor('0.13.59').tables).toContain('fault_recovery_grant');
+    expect(schemaRequirementFor('0.13.60').schema).toBe(74);
+    expect(schemaRequirementFor('0.13.60').tables).toContain('fault_recovery_grant');
+    expect(schemaRequirementFor('0.13.61').schema).toBe(74);
+    expect(schemaRequirementFor('0.13.61').tables).toContain('fault_recovery_grant');
     expect(CLOUD_SCHEMA_VERSION).toBe(74);
   });
 
