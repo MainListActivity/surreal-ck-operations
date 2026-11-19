@@ -45,6 +45,25 @@ export function clearSettledInflight(stateRoot: string | undefined, provider: st
 }
 
 export interface DevinSeatReading { step: 'send' | 'follow'; cap: string; used: number; total: number; at: number }
+
+/**
+ * 已产出但尚未确认回传原会话的代跑结果：完整回传正文、标记与轮数，以及它绑定的原任务、阶段与原会话。
+ * 恢复时先核对 binding 与请求锚点，一致才复用这份正文（零工具零重发）；请求或阶段变了就丢弃重做。
+ * 只含发送这份回传所需的字段，不含浏览器页面原文、会话列表或其它诊断。
+ */
+export interface DevinAssistRelay {
+  /** 绑定摘要：公司任务 + 阶段 + 规范化原会话 + 当前可信 Devin 请求（工具/规范化参数）。 */
+  anchor: string;
+  marker: string;
+  round: number;
+  text: string;
+  tool?: string;
+  at: number;
+  /** 以下三项与 anchor 同源，驱动层显式再核对一次，拒绝拿错任务/错阶段/错会话的回执。 */
+  task?: string;
+  phase?: 'doing' | 'review';
+  session?: string;
+}
 export interface DevinLaneState {
   /** 按下发送前落盘的本轮标记：进程在按下之后、拿到回执之前中断时，重启只做受理核对，不重发。 */
   attempt?: string;
@@ -58,6 +77,11 @@ export interface DevinLaneState {
   seats?: DevinSeatReading;
   /** Mode 1 本地代跑协助已用轮数（上限 3）；达到上限后 blocked 交老板裁决。 */
   assistRounds?: number;
+  /**
+   * 已产出但尚未确认回传原会话的代跑结果（含完整回传正文与标记）。恢复时先核可发条件再发这份结果，
+   * 不再次调用只读工具；binding 与请求锚点绑定原任务、阶段、原会话与当前请求，变了的回执不采信。
+   */
+  assistRelay?: DevinAssistRelay;
 }
 
 /** 回合摘要：provider + 交给供应商的完整 prompt（含 task.md 与 findings），不是外层派工消息。 */
@@ -99,6 +123,11 @@ export interface InflightEntry {
   task?: string;
   /** 该 attempt 是本轮第几次本地代跑回传：换员工目录恢复时据此保持 3 轮上限。 */
   assistRounds?: number;
+  /**
+   * 已产出但未确认回传的代跑正文（换员工目录恢复时直接复用，零工具零重发）。绑定的任务/阶段/会话/请求
+   * 在恢复时再核对，不一致就丢弃。只在仍有待确认回传意图、或回合仍可能在途时保留。
+   */
+  assistRelay?: DevinAssistRelay;
 }
 
 function inflightPath(stateRoot: string, provider: string, digest: string): string {
@@ -197,11 +226,25 @@ export function clearInflight(stateRoot: string | undefined, provider: string, d
   try { rmSync(inflightPath(stateRoot, provider, digest), { force: true }); } catch { /* 登记清理失败不影响回合收尾 */ }
 }
 
-/** 驱动提交到云端任务后落登记；没有 taskId（如 devin-cloud 拿不到云端会话 ID）时无登记可写。 */
+/**
+ * 驱动提交到云端任务后落登记；没有 taskId（如 devin-cloud 拿不到云端会话 ID）时无登记可写。
+ * 已受理的 taskId 与「已产出/已按下但未确认」的代跑回传意图可以同时存在，这里按本目录状态完整重写：
+ * 普通在途写（persist()）不能把待确认的 attempt 或已落盘的回传正文从共享登记里抹掉，否则换目录恢复时
+ * 看不到它们，会再执行一次同一工具或漏掉零重发核对。
+ */
 export function recordInflight(stateRoot: string | undefined, provider: string, digest: string | undefined, state: LaneState): void {
   if (!stateRoot || !digest || !state.taskId) return;
-  const session = state.devin?.attemptSession;
-  writeInflight(stateRoot, provider, digest,
-    { taskId: state.taskId, taskUrl: state.taskUrl, submittedAt: state.submittedAt, vendorSession: state.vendorSession,
-      ...(session ? { attemptSession: session } : {}), ...(state.task ? { task: state.task } : {}) });
+  const devin = state.devin;
+  const session = devin?.attemptSession;
+  const entry: InflightEntry = {
+    taskId: state.taskId, taskUrl: state.taskUrl, submittedAt: state.submittedAt, vendorSession: state.vendorSession,
+    ...(session ? { attemptSession: session } : {}), ...(state.task ? { task: state.task } : {}),
+  };
+  if (devin?.attempt) {
+    entry.attempt = devin.attempt;
+    if (devin.attemptAt !== undefined) entry.attemptAt = devin.attemptAt;
+  }
+  if (devin?.assistRounds !== undefined) entry.assistRounds = devin.assistRounds;
+  if (devin?.assistRelay) entry.assistRelay = devin.assistRelay;
+  writeInflight(stateRoot, provider, digest, entry);
 }

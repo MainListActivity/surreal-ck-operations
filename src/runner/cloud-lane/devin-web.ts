@@ -16,6 +16,8 @@
  *   直到可见菜单为 0（只在可见菜单仍在时按，最多 4 次）。任何一步不成立都不发送。
  * - 席位文字只在首页 Capability 菜单打开、选中 Free 时出现（收起 Free 详情后消失），所以必须在点选 Free 之后、
  *   菜单仍打开时回读。会话页的 Capability 按钮是 disabled，菜单打不开，读不到席位，续轮因此先到组织首页读席位，再回原会话发送。
+ *   devinRelayGateScript 用同一套门禁做「只读探测」：核验原会话 Free、未忙、地址正确，再到首页选 Free 读席位；
+ *   不填写、不按发送。公开文档没有说明满席时仍可续用已有会话，因此满席按不可发处理（见 devin.ts 文件头）。
  * - 会话地址 https://app.devin.ai/sessions/<32hex>；侧栏 a[href^="/sessions/"] 列出会话。
  * - 会话页转录的发言角色按 2026-11-16 真实只读实测：Devin 回答块是
  *   [data-testid="transcript-agent-message"]，文字在 [data-message-author="devin"]；
@@ -285,18 +287,26 @@ await openPage(${JSON.stringify(url)});
 }
 
 /**
- * 会话页核验（续轮）：登录、就绪、确实停在本次目标会话地址上（goto 失败被吞时可能还留在另一个合法会话）、
- * 档位必须是 Free、没有本轮标记、不在忙。地址核验排在档位/标记之前：不在目标会话上时，既不能把它的
- * markerSeen 当「已受理」，也不能把它当「可以继续发送」——都按 wrong_session 拒绝。返回 null 表示可以继续。
+ * 续轮的基础可发条件（不含本轮标记）：登录、就绪、确实停在本次目标会话地址上（goto 失败被吞时可能还留在
+ * 另一个合法会话）、档位必须是 Free、不在忙。地址核验排在档位之前：不在目标会话上时，既不能把它的
+ * markerSeen 当「已受理」，也不能把它当「可以继续发送」——都按 wrong_session 拒绝。返回 null 表示通过。
  */
-const SESSION_GATE = `
-const sessionGate = (x) => {
+const BASE_GATE = `
+const baseGate = (x) => {
   if (x.login) return { ok: false, code: 'login_required' };
   if (!ready) return { ok: false, code: 'not_ready' };
   if (!sameSession(x.url, TARGET_URL)) return { ok: false, code: 'wrong_session', url: x.url };
   if (x.cap !== 'Free') return { ok: false, code: 'capability', detail: '会话 Capability 显示 ' + String(x.cap) + '，不是 Free' };
-  if (x.markerSeen) return { ok: true, already: true, url: x.url, cap: 'Free', seats: x.seats };
   if (x.status === 'working') return { ok: false, code: 'busy' };
+  return null;
+};`;
+
+/** 会话页核验（续轮发送）：基础条件之后再按本轮标记判断是否已受理。 */
+const SESSION_GATE = `${BASE_GATE}
+const sessionGate = (x) => {
+  const stop = baseGate(x);
+  if (stop) return stop;
+  if (x.markerSeen) return { ok: true, already: true, url: x.url, cap: 'Free', seats: x.seats };
   return null;
 };`;
 
@@ -422,6 +432,29 @@ for (let i = 0; i < 8; i++) {
 // 标记，也不能报「已受理」——按 not_echoed（已按下、未确认）交驱动层回原会话核对，绝不重发。
 const onTarget = sameSession(s.url, TARGET_URL);
 emit(s.markerSeen && onTarget ? { ok: true, url: s.url, cap: 'Free', seats: pre, echoed: true } : { ok: false, code: 'not_echoed', url: s.url, cap: 'Free', seats: pre });
+`, marker);
+}
+
+/**
+ * 本地代跑回传前的可发条件探测（只读、绝不填写或按发送）：先核验原会话仍是 Free、未在忙、地址正确，再到组织首页
+ * 选中 Free 读席位并核验未满。回执 ok/true、cap 与 seats 表示现在能发出；quota_full / capability / busy /
+ * wrong_session / login_required / not_ready 与 devinFollowScript 的发送前拒绝同义，驱动层据此在调用只读工具
+ * 之前就放弃本轮代跑。续轮沿用组织首页的席位计数门禁：公开文档没有说明满席时续用已有会话仍可发送，因此满席
+ * 一律不发送（详见 devin.ts 文件头的供应商语义核对）。
+ */
+export function devinRelayGateScript(sessionUrl: string, marker: string, home: string = DEVIN_HOME): string {
+  return withMarker(`${prelude(sessionUrl, 'relay-gate')}
+${BASE_GATE}
+${PICK_FREE}
+${HOME_GATE}
+let s = await read();
+const baseStop = baseGate(s);
+if (baseStop) { emit(baseStop); process.exit(0); }
+await openPage(${JSON.stringify(home)});
+await pickFree();
+const homeStop = homeGate(s);
+if (homeStop) { emit(homeStop); process.exit(0); }
+emit({ ok: true, code: 'sendable', cap: 'Free', seats: s.seats });
 `, marker);
 }
 
