@@ -26,3 +26,20 @@ test('显式原生归属阻止 Paseo 与另一原生节点新派工，不按节�
     expect(() => readProviderRoutes(home)).toThrow();
   } finally { rmSync(home,{recursive:true,force:true}); }
 });
+
+test('N3：路由指定节点离线时仍无自动旁路——ownsProvider 不读在线状态', () => {
+  // provider-routing 故意不查询心跳：离线不得回退到其他 native 或 paseo，以免双执行。
+  const home = mkdtempSync(join(tmpdir(), 'sck-routes-offline-'));
+  try {
+    mkdirSync(join(home, 'private'));
+    writeFileSync(join(home, 'private/runtime-routes.json'), JSON.stringify({
+      version: 1, routes: { claude: 'native:mac-native', warp: 'native:mac-native' },
+    }));
+    const routes = readProviderRoutes(home);
+    expect(ownsProvider(routes, 'claude', 'native:mac-native')).toBe(true);
+    expect(ownsProvider(routes, 'claude', 'native:vps-1')).toBe(false);
+    expect(ownsProvider(routes, 'claude', 'paseo:legacy')).toBe(false);
+    expect(ownsProvider(routes, 'warp', 'native:vps-1')).toBe(false);
+    expect(ownsProvider(routes, 'codex', 'paseo:legacy')).toBe(true); // 未路由的 provider 仍兼容
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
