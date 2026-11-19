@@ -8,7 +8,7 @@ import { isAbsolute, join } from 'node:path';
 import { isLaneProvider, type LaneProvider } from '../native-args.ts';
 import { WEB_CHAT_PROVIDERS } from '../native-args.ts';
 import { bodyOfDispatch } from '../../outbound-render.ts';
-import { clearInflight, clearSettledInflight, inflightSession, laneDigest, readClaimDelivery, readClaimTask, readInflight, readInflightOfTask, readLaneState, recordInflight, writeLaneState, type LaneState } from './state.ts';
+import { clearInflight, clearSettledInflight, inflightSession, laneDigest, readClaimDelivery, readClaimTask, readInflight, readInflightOfTask, readLaneState, recordInflight, writeLaneState, type InflightEntry, type LaneState } from './state.ts';
 import { repoInfo, type ExecFn, type RepoInfo } from './repo.ts';
 import { driveCodex } from './codex.ts';
 import { devinCloudModel, driveDevin } from './devin.ts';
@@ -281,6 +281,13 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
   }
   // 本 comm 目录没有在途任务时查共享登记：同一投递换员工实例也能重连，而不是重复提交云端任务。
   if (!next.taskId) {
+    // 已受理与「已按下/已产出但未确认」的代跑回传意图可以共存（taskId 指原会话，attempt 指回传那一发）：
+    // 恢复时两者都要带过来，只核对零重发，并复用已落盘的回传正文，不再次执行工具。
+    const pendingDevin = (entry: Pick<InflightEntry, 'attempt' | 'attemptAt' | 'assistRounds' | 'assistRelay'>) => ({
+      ...(entry.attempt ? { attempt: entry.attempt, attemptAt: entry.attemptAt } : {}),
+      ...(entry.assistRounds !== undefined ? { assistRounds: entry.assistRounds } : {}),
+      ...(entry.assistRelay ? { assistRelay: entry.assistRelay } : {}),
+    });
     // 新键（投递）优先；升级前的登记仍按摘要查找。
     const reg = readInflight(input.stateRoot, input.provider, registryKey)
       ?? (registryKey !== digest ? readInflight(input.stateRoot, input.provider, digest) : undefined);
@@ -289,16 +296,17 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
       next.taskUrl = reg.taskUrl;
       next.submittedAt = reg.submittedAt;
       next.vendorSession ??= reg.vendorSession;
-      if (input.provider === 'devin-cloud') next.devin = { ...next.devin, attemptSession: reg.attemptSession };
+      if (input.provider === 'devin-cloud')
+        next.devin = { ...next.devin, attemptSession: reg.attemptSession, ...pendingDevin(reg) };
     } else if (reg?.attempt && input.provider === 'devin-cloud') {
       // 另一个员工目录已落下发送意图但还没有任务 ID：按在途处理，只核对是否已受理，绝不再次按发送。
       // 登记里的落点会话（续轮的原会话）决定核对哪个会话，本目录的旧值不沿用。
       next.taskId = reg.attempt;
       next.submittedAt ??= reg.attemptAt;
-      // 换员工目录也把待确认的 attempt 与轮数带过来：之后只核对这条 attempt，零重发、不再代跑。
+      // 换员工目录也把待确认的 attempt、轮数与已落盘的回传正文带过来：之后只核对这条 attempt，
+      // 零重发、不再代跑。
       next.devin = { ...next.devin, attempt: reg.attempt, attemptAt: reg.attemptAt,
-        attemptSession: reg.attemptSession,
-        ...(reg.assistRounds !== undefined ? { assistRounds: reg.assistRounds } : {}) };
+        attemptSession: reg.attemptSession, ...pendingDevin(reg) };
     } else if (next.task) {
       // 摘要变了（返工改了 findings 等）：同一公司任务在别的目录里的登记仍代表已发出的会话，不能当成新任务另建。
       // 未确认受理且没有会话地址的只能受阻交人工核对；有会话地址的沿用它做跟进（同一会话，不另建）。
@@ -310,8 +318,8 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
         next.taskUrl = pending.taskUrl ?? inflightSession(pending);
         next.submittedAt = pending.submittedAt;
         next.vendorSession = pending.vendorSession;
-        if (pending.assistRounds !== undefined)
-          next.devin = { ...next.devin, assistRounds: pending.assistRounds };
+        if (pending.assistRounds !== undefined || pending.attempt || pending.assistRelay)
+          next.devin = { ...next.devin, ...pendingDevin(pending) };
       } else if (input.provider === 'devin-cloud') {
         if (others.some(entry => !inflightSession(entry)))
           return blocked(`同一任务上一轮 Devin Cloud 已按下发送（或发送中途中断）但未确认受理，且没有会话地址可核对；换了摘要也不能另建会话（避免重复）。本轮未发出，在途登记已保留，请人工核对 app.devin.ai 后再决定是否重派。`);
@@ -325,11 +333,16 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
     if (!outcome.inflight && (outcome.kind !== 'error' || outcome.vendorTerminal)) {
       // 完成、受阻、供应商终态失败：回合有了定论，清除登记并清掉在途任务标记（失败可重新提交）。
       // 仍在途的受阻（供应商会话已发出、等待核对）保留标记，恢复时不再发送。
+      // 终态也清掉未确认的代跑回传意图与已产出正文，不把上一回合的发送意图带进下一回合。
       clearInflight(input.stateRoot, input.provider, registryKey);
       if (registryKey !== digest) clearInflight(input.stateRoot, input.provider, digest);
       clearSettledInflight(input.stateRoot, input.provider, next.task, next.taskId);
+      const terminalDevin = next.devin
+        ? { ...next.devin, attempt: undefined, attemptAt: undefined, attemptSession: undefined, assistRelay: undefined }
+        : undefined;
       writeLaneState(input.commDir, { ...next, taskId: undefined, taskUrl: undefined, submittedAt: undefined,
-        ...(outcome.vendorTerminal ? { vendorSession: undefined } : {}) });
+        ...(outcome.vendorTerminal ? { vendorSession: undefined } : {}),
+        ...(terminalDevin ? { devin: terminalDevin } : {}) });
     } else {
       writeLaneState(input.commDir, next);
       recordInflight(input.stateRoot, input.provider, registryKey, next);

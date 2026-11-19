@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runLane, taskMaterial, validateLanes, vendorPrompt, type LaneDeps, type LaneInput } from '../src/runner/cloud-lane/lane.ts';
@@ -10,7 +10,7 @@ import { julesUsageCount, julesUsageEntry, whamToUsageEntry } from '../src/runne
 import { recordJulesUsage } from '../src/runner/cloud-lane/jules.ts';
 import type { ExecResult } from '../src/runner/cloud-lane/repo.ts';
 import { egoBrowse } from '../src/runner/grok-bot/main.ts';
-import { DEVIN_HOME } from '../src/runner/cloud-lane/devin-web.ts';
+import { DEVIN_HOME, devinRelayGateScript } from '../src/runner/cloud-lane/devin-web.ts';
 import { parseNativeResult } from '../src/runner/native.ts';
 
 type Call = { cmd: string; args: string[]; cwd?: string };
@@ -371,14 +371,18 @@ describe('codex-cloud 状态判定与在途登记', () => {
 describe('devin-cloud 通道（网页 Free 入口）', () => {
   const SESSION = 'https://app.devin.ai/sessions/abcd1234abcd1234abcd1234abcd1234';
   type Resp = Record<string, unknown> | undefined;
-  type Queues = { send?: Resp[]; follow?: Resp[]; recover?: Resp[]; session?: Resp[] };
-  /** 按脚本特征分流：新会话发送 / 续轮跟进 / 受理核对 / 会话轮询。 */
+  type Queues = { send?: Resp[]; follow?: Resp[]; recover?: Resp[]; session?: Resp[]; gate?: Resp[] };
+  /** 按脚本特征分流：新会话发送 / 续轮跟进 / 代跑前置可发条件探测 / 受理核对 / 会话轮询。 */
   const MODE = (m: string) => `const MODE = "${m}"`;
   const devinBrowse = (q: Queues) => {
     const calls: string[] = [];
     const pick = (list: Resp[] | undefined): Resp => list && list.length > 1 ? list.shift() : list?.[0];
+    // 未指定 gate 队列时默认「现在可发、0/2」：既有中继用例不因新增前置探测而改变语义；
+    // 满座/错会话等路径由用例显式给 gate 队列。
+    const gateDefault: Resp = { ok: true, code: 'sendable', cap: 'Free', seats: { used: 0, total: 2 } };
     const browse = async (script: string): Promise<Resp> => {
       calls.push(script);
+      if (script.includes(MODE('relay-gate'))) return pick(q.gate) ?? gateDefault;
       if (script.includes(MODE('send'))) return pick(q.send);
       if (script.includes(MODE('recover'))) return pick(q.recover);
       if (script.includes(MODE('follow'))) return pick(q.follow);
@@ -1434,15 +1438,16 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(b.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(1);
     });
 
-    test('代跑回执丢失：只核对不重发（发送一次），attempt 与轮数保留', async () => {
+    test('代跑回执丢失：只核对不重发（发送一次），attempt 与轮数保留；恢复零工具零重发', async () => {
       const w = world({ extra: gitOk });
+      let assistCalls = 0;
       const b = devinBrowse({
         send: [{ ok: true, url: SESSION }],
         follow: [{ ok: false, code: 'not_echoed' }],
         session: [waiting(REQUEST)],
       });
       const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: b.browse,
-        assist: async () => ({ decision: 'reply', message: '{}', toolExecuted: 'ops_health' }) });
+        assist: async () => { assistCalls++; return { decision: 'reply', message: '{}', toolExecuted: 'ops_health' }; } });
       expect(out.status).toBe('success');
       expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
       expect(out.text).toContain('未能确认回传原会话');
@@ -1452,6 +1457,20 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(st?.devin?.assistRounds).toBe(1);
       expect(st?.devin?.attempt).toMatch(/^SCK-/);
       expect(st?.devin?.attemptSession).toBe(SESSION);
+      const attempt = st!.devin!.attempt!;
+
+      // 恢复：只追踪这条 attempt 与原会话，绝不再执行工具或重发；在途登记保留。
+      const unseen = { ok: true, markerSeen: false, status: 'blocked', done: null, tail: 'still waiting', agentTail: 'still waiting' };
+      const resume = devinBrowse({ session: [unseen, unseen, unseen, unseen] });
+      const out2 = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: resume.browse,
+        assist: async () => { assistCalls++; return { decision: 'reply', message: '不应调用' }; } });
+      expect(out2.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(assistCalls).toBe(1);
+      expect(resume.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(0);
+      expect(resume.calls.filter(s => s.includes(MODE('send')))).toHaveLength(0);
+      expect(resume.calls.every(s => s.includes(SESSION))).toBe(true);
+      expect(resume.calls.some(s => s.includes(MODE('session')) && s.includes(attempt))).toBe(true);
+      expect(readLaneState(w.commDir)?.devin?.attempt).toBe(attempt);
     });
 
     test('跨租约重派（新投递键、新员工目录）：领养旧受理会话，旧锚点后的只读请求照常进入中继，零发送', async () => {
@@ -1495,6 +1514,429 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       // 旧投递键的共享登记只按当前 taskId 精确结清；代跑换标记后它作为已受理地址保留（移植前既有行为），
       // 不影响本轮零发送与独立复验，也不会让后续同任务重派再发一条用户消息。
       expect(readInflight(first.stateRoot, 'devin-cloud', 'lease-old')?.taskUrl).toBe(SESSION);
+    });
+
+    test('前置探测脚本本身零填写零发送：原会话 Free、idle、组织首页 2/2 时给出 quota_full', async () => {
+      const fake = fakeDevin({
+        seats: { used: 2, total: 2 },
+        sessions: { [SESSION]: { cap: 'Free', status: 'Devin is awaiting instructions', blocks: [] } },
+      });
+      const full = await fake.browse(devinRelayGateScript(SESSION, 'SCK-aaaaaaaaaa'));
+      expect(full).toMatchObject({ ok: false, code: 'quota_full', seats: '2/2', cap: 'Free' });
+      expect(fake.st.sent).toHaveLength(0);
+      expect(fake.st.events).not.toContain('fill');
+      expect(fake.st.events.some(e => e.startsWith('send '))).toBe(false);
+      expect(fake.st.events.some(e => e.startsWith('visit '))).toBe(true);
+
+      // 同一脚本在空位时只报可发，仍不填写、不按发送；档位选择只走 Free，不碰付费档。
+      const free = fakeDevin({
+        seats: { used: 0, total: 2 },
+        sessions: { [SESSION]: { cap: 'Free', status: 'Devin is awaiting instructions', blocks: [] } },
+      });
+      const sendable = await free.browse(devinRelayGateScript(SESSION, 'SCK-aaaaaaaaaa'));
+      expect(sendable).toMatchObject({ ok: true, code: 'sendable', cap: 'Free', seats: { used: 0, total: 2 } });
+      expect(free.st.sent).toHaveLength(0);
+      expect(free.st.events).not.toContain('fill');
+      expect(free.st.events.some(e => e.startsWith('send '))).toBe(false);
+    });
+
+    test('已知满座：先探测再决定，零工具调用、零发送；席位空出后恢复只回传一次并正常收尾', async () => {
+      const w = world({ extra: gitOk });
+      let assistCalls = 0;
+      const assist = async () => { assistCalls++; return { decision: 'reply' as const, message: '{"reachable":true}', toolExecuted: 'ops_health' }; };
+      const first = devinBrowse({
+        send: [{ ok: true, url: SESSION }],
+        gate: [{ ok: false, code: 'quota_full', seats: '2/2', cap: 'Free' }],
+        session: [waiting(REQUEST)],
+      });
+      const out1 = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: first.browse, assist });
+      expect(out1.status).toBe('success');
+      expect(out1.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out1.text).toContain('席位已满（2/2 in use）');
+      expect(out1.text).toContain('未代跑、未发送');
+      // 满座时既不执行只读工具，也不碰发送按钮，也不新建会话。
+      expect(assistCalls).toBe(0);
+      expect(first.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(0);
+      expect(first.calls.filter(s => s.includes(MODE('send')))).toHaveLength(1); // 只有建立会话的那一次
+      expect(first.calls.filter(s => s.includes(MODE('relay-gate')))).toHaveLength(1);
+      const blockedState = readLaneState(w.commDir);
+      expect(blockedState?.devin?.assistRounds).toBeUndefined();
+      expect(blockedState?.devin?.attempt).toBeUndefined();
+      expect(blockedState?.taskUrl).toBe(SESSION);
+      // 未按下发送，共享登记里也不能留下发送意图。
+      expect(readInflight(w.stateRoot, 'devin-cloud', blockedState!.digest!)?.attempt).toBeUndefined();
+
+      // 席位空出后恢复：先探测可发，再执行一次工具、只回传一次；之后回到正常 DONE 收尾。
+      const second = devinBrowse({
+        gate: [{ ok: true, code: 'sendable', cap: 'Free', seats: { used: 0, total: 2 } }],
+        follow: [{ ok: true, url: SESSION }],
+        session: [waiting(REQUEST), idleDone(PR9), idleDone(PR9)],
+      });
+      const out2 = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: second.browse, assist });
+      expect(out2.status).toBe('success');
+      expect(out2.text).toContain('PR: https://github.com/acme/widget/pull/9');
+      expect(assistCalls).toBe(1);
+      expect(second.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(1);
+      expect(second.calls.filter(s => s.includes(MODE('send')))).toHaveLength(0);
+      expect(second.calls.filter(s => s.includes(MODE('relay-gate')))).toHaveLength(1);
+      expect(readLaneState(w.commDir)?.devin?.assistRounds).toBe(1);
+    });
+
+    test('检查与发送之间席位被占：回传正文落盘，恢复零工具、只补发一次；满席恢复仍不执行工具', async () => {
+      const w = world({ extra: gitOk });
+      let assistCalls = 0;
+      const assist = async () => { assistCalls++; return { decision: 'reply' as const, message: '{"reachable":true}', toolExecuted: 'ops_health' }; };
+      const first = devinBrowse({
+        send: [{ ok: true, url: SESSION }],
+        gate: [{ ok: true, code: 'sendable', cap: 'Free', seats: { used: 1, total: 2 } }],
+        follow: [{ ok: false, code: 'quota_full', seats: '2/2', cap: 'Free' }],
+        session: [waiting(REQUEST)],
+      });
+      const out1 = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: first.browse, assist });
+      expect(out1.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(assistCalls).toBe(1);
+      expect(first.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(1);
+      const relay = readLaneState(w.commDir)?.devin?.assistRelay;
+      expect(relay?.marker).toMatch(/^SCK-/);
+      expect(relay?.text).toContain('本地驻场管理员代跑结果');
+      expect(readLaneState(w.commDir)?.devin?.attempt).toBeUndefined();
+
+      // 仍满座：复用已产出的回传正文，等下一个可发窗口；零工具、零发送。
+      const second = devinBrowse({
+        gate: [{ ok: false, code: 'quota_full', seats: '2/2', cap: 'Free' }],
+        session: [waiting(REQUEST)],
+      });
+      const out2 = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: second.browse, assist });
+      expect(out2.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(assistCalls).toBe(1);
+      expect(second.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(0);
+      expect(readLaneState(w.commDir)?.devin?.assistRelay?.marker).toBe(relay!.marker);
+
+      // 空位：直接复用这份正文补发一次（不再执行工具），随后回到正常 DONE 收尾。
+      const third = devinBrowse({
+        gate: [{ ok: true, code: 'sendable', cap: 'Free', seats: { used: 0, total: 2 } }],
+        follow: [{ ok: true, url: SESSION }],
+        session: [waiting(REQUEST), idleDone(PR9), idleDone(PR9)],
+      });
+      const out3 = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: third.browse, assist });
+      expect(out3.status).toBe('success');
+      expect(out3.text).toContain('PR: https://github.com/acme/widget/pull/9');
+      expect(assistCalls).toBe(1);
+      expect(third.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(1);
+      expect(third.calls.filter(s => s.includes(MODE('relay-gate')))).toHaveLength(1);
+      // 补发用的是同一份已落盘正文与同一标记：不会生成第二条回执。
+      const sent = third.calls.filter(s => s.includes(MODE('follow')))[0]!;
+      expect(sent).toContain(relay!.marker);
+      expect(readLaneState(w.commDir)?.devin?.assistRelay).toBeUndefined();
+    });
+
+    test('跨租约恢复（新 commDir、共享原 stateRoot、新投递键）：检查与发送之间席位被占后空位恢复，同一工具全程只执行一次、只回传一次、零新会话', async () => {
+      // 负责人独立反例：前两段与「检查与发送之间席位被占」相同；第三段换新 world（新 commDir）但共享原 stateRoot，
+      // 用新的 SCK_DELIVERY_ID 恢复同一公司任务、原 Free 会话与只读请求。回传正文只写 commDir 时，新租约看不到
+      // 已执行的工具结果，会再执行一次同一工具（assistCalls 期待 1、实测 2）。
+      const first = world({ extra: gitOk });
+      let assistCalls = 0;
+      const assist = async () => { assistCalls++; return { decision: 'reply' as const, message: '{"reachable":true}', toolExecuted: 'ops_health' }; };
+      const a = devinBrowse({
+        send: [{ ok: true, url: SESSION }],
+        gate: [{ ok: true, code: 'sendable', cap: 'Free', seats: { used: 1, total: 2 } }],
+        follow: [{ ok: false, code: 'quota_full', seats: '2/2', cap: 'Free' }],
+        session: [waiting(REQUEST)],
+      });
+      const out1 = await runLane(first.input({ provider: 'devin-cloud' }), { ...first.deps, browse: a.browse, assist });
+      expect(out1.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(assistCalls).toBe(1);
+      const relay = readLaneState(first.commDir)?.devin?.assistRelay;
+      expect(relay?.marker).toMatch(/^SCK-/);
+      // 工具回执的持久数据：只保留发送所需的最小字段（工具名、正文、轮数与绑定摘要），权限 0600。
+      expect(relay?.tool).toBe('ops_health');
+      expect(relay?.round).toBe(1);
+      expect(relay?.text).toContain('{"reachable":true}');
+      expect(relay?.anchor).toMatch(/^[a-f0-9]{16}$/);
+      expect(relay?.task).toBe('task-1');
+      expect(relay?.phase).toBe('doing');
+      expect(relay?.session).toBe(SESSION);
+      const firstDigest = readLaneState(first.commDir)!.digest!;
+      const inflightPath = join(first.stateRoot, 'devin-cloud', 'inflight', `${encodeURIComponent(firstDigest)}.json`);
+      expect(statSync(join(first.commDir, '.lane', 'state.json')).mode & 0o777).toBe(0o600);
+      expect(statSync(inflightPath).mode & 0o777).toBe(0o600);
+      const shared = JSON.parse(readFileSync(inflightPath, 'utf8'));
+      expect(shared.assistRelay.marker).toBe(relay!.marker);
+      expect(shared.taskId).toBeDefined();
+
+      // 第二段：同一 world 仍满座，零工具、零发送；回传正文继续保留。
+      const b = devinBrowse({
+        gate: [{ ok: false, code: 'quota_full', seats: '2/2', cap: 'Free' }],
+        session: [waiting(REQUEST)],
+      });
+      const out2 = await runLane(first.input({ provider: 'devin-cloud' }), { ...first.deps, browse: b.browse, assist });
+      expect(out2.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(assistCalls).toBe(1);
+
+      // 第三段：新世界（新 commDir），共享 first.stateRoot，新投递键恢复。空位后必须复用已落盘的回传正文：
+      // 不再执行同一工具，只补发一次原标记；不新建会话、不产生额外付费会话。
+      const second = world({ extra: gitOk });
+      const c = devinBrowse({
+        gate: [{ ok: true, code: 'sendable', cap: 'Free', seats: { used: 0, total: 2 } }],
+        follow: [{ ok: true, url: SESSION }],
+        session: [waiting(REQUEST), idleDone(PR9), idleDone(PR9)],
+      });
+      const out3 = await runLane(second.input({ provider: 'devin-cloud', stateRoot: first.stateRoot,
+        env: { SCK_DELIVERY_ID: 'lease-new' } }), { ...second.deps, browse: c.browse, assist });
+      expect(out3.status).toBe('success');
+      expect(out3.text).toContain('PR: https://github.com/acme/widget/pull/9');
+      expect(assistCalls).toBe(1);
+      expect(c.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(1);
+      expect(c.calls.filter(s => s.includes(MODE('send')))).toHaveLength(0);
+      // 补发用同一份已落盘正文与同一标记：原会话只回显一次。
+      expect(c.calls.filter(s => s.includes(MODE('follow')))[0]).toContain(relay!.marker);
+      expect(readLaneState(second.commDir)?.devin?.assistRelay).toBeUndefined();
+      // 回合终态清理：共享在途登记与代跑发送意图都不留到下一回合。
+      expect(existsSync(inflightPath)).toBe(false);
+    });
+
+    test('跨租约恢复：请求语义一致但页面尾串变化（键序/空白/附加渲染文字）仍复用同一份回传正文，工具不再执行', async () => {
+      const first = world({ extra: gitOk });
+      let assistCalls = 0;
+      const assist = async () => { assistCalls++; return { decision: 'reply' as const, message: '{"reachable":true}', toolExecuted: 'ops_health' }; };
+      const a = devinBrowse({
+        send: [{ ok: true, url: SESSION }],
+        gate: [{ ok: true, code: 'sendable', cap: 'Free', seats: { used: 1, total: 2 } }],
+        follow: [{ ok: false, code: 'quota_full', seats: '2/2', cap: 'Free' }],
+        session: [waiting(`需要先确认环境健康度：\n${REQUEST}`)],
+      });
+      await runLane(first.input({ provider: 'devin-cloud' }), { ...first.deps, browse: a.browse, assist });
+      const relay = readLaneState(first.commDir)!.devin!.assistRelay!;
+
+      const second = world({ extra: gitOk });
+      const volatile = '我再确认一次（页面渲染于 10:00）：\n\n[OPS-REQUEST] {"args":{},"tool":"ops_health"}\n（页面尾部的新渲染文字，不是请求本身）';
+      const c = devinBrowse({
+        gate: [{ ok: true, code: 'sendable', cap: 'Free', seats: { used: 0, total: 2 } }],
+        follow: [{ ok: true, url: SESSION }],
+        session: [waiting(volatile), idleDone(PR9), idleDone(PR9)],
+      });
+      const out = await runLane(second.input({ provider: 'devin-cloud', stateRoot: first.stateRoot,
+        env: { SCK_DELIVERY_ID: 'lease-tail-changed' } }), { ...second.deps, browse: c.browse, assist });
+      expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
+      expect(assistCalls).toBe(1);
+      expect(c.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(1);
+      expect(c.calls.filter(s => s.includes(MODE('follow')))[0]).toContain(relay.marker);
+    });
+
+    test('跨租约恢复：工具或参数变化不采信旧回执，重新代跑一次且用新标记回传', async () => {
+      const first = world({ extra: gitOk });
+      let assistCalls = 0;
+      const assist = async () => { assistCalls++; return { decision: 'reply' as const, message: '{"reachable":true}', toolExecuted: 'ops_health' }; };
+      const a = devinBrowse({
+        send: [{ ok: true, url: SESSION }],
+        gate: [{ ok: true, code: 'sendable', cap: 'Free', seats: { used: 1, total: 2 } }],
+        follow: [{ ok: false, code: 'quota_full', seats: '2/2', cap: 'Free' }],
+        session: [waiting(REQUEST)],
+      });
+      await runLane(first.input({ provider: 'devin-cloud' }), { ...first.deps, browse: a.browse, assist });
+      const relay = readLaneState(first.commDir)!.devin!.assistRelay!;
+
+      const second = world({ extra: gitOk });
+      const changed = '[OPS-REQUEST] {"tool":"ops_info","args":{"scope":"prod"}}';
+      const c = devinBrowse({
+        gate: [{ ok: true, code: 'sendable', cap: 'Free', seats: { used: 0, total: 2 } }],
+        follow: [{ ok: true, url: SESSION }],
+        session: [waiting(changed), idleDone(PR9), idleDone(PR9)],
+      });
+      const out = await runLane(second.input({ provider: 'devin-cloud', stateRoot: first.stateRoot,
+        env: { SCK_DELIVERY_ID: 'lease-request-changed' } }), { ...second.deps, browse: c.browse, assist });
+      expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
+      // 请求变了是新的代跑：旧正文不采信，工具按新请求重新执行一次。
+      expect(assistCalls).toBe(2);
+      const follows = c.calls.filter(s => s.includes(MODE('follow')));
+      expect(follows).toHaveLength(1);
+      expect(follows[0]).not.toContain(relay.marker);
+    });
+
+    test('跨租约恢复：旧租约 doing 阶段的回传正文不能被复核阶段复用（错阶段不采信）', async () => {
+      const first = world({ extra: gitOk });
+      const assist = async () => ({ decision: 'reply' as const, message: '{"reachable":true}', toolExecuted: 'ops_health' });
+      const a = devinBrowse({
+        send: [{ ok: true, url: SESSION }],
+        gate: [{ ok: true, code: 'sendable', cap: 'Free', seats: { used: 1, total: 2 } }],
+        follow: [{ ok: false, code: 'quota_full', seats: '2/2', cap: 'Free' }],
+        session: [waiting(REQUEST)],
+      });
+      await runLane(first.input({ provider: 'devin-cloud' }), { ...first.deps, browse: a.browse, assist });
+      const relay = readLaneState(first.commDir)!.devin!.assistRelay!;
+
+      // 复核轮（阶段不同）：共享登记里残留的 doing 回传正文不能拿来发送，必须按复核请求重做一份。
+      const review = world({ task: '# 复核\n\n## 待复核成果\n\n已提交。\n', extra: gitOk });
+      writeInflight(first.stateRoot, 'devin-cloud', 'lease-review', {
+        taskId: relay.marker, taskUrl: SESSION, submittedAt: Date.now(), vendorSession: SESSION, task: 'task-1',
+        assistRounds: relay.round, assistRelay: { ...relay, phase: 'doing' },
+      });
+      let assistCalls = 0;
+      const c = devinBrowse({
+        gate: [{ ok: true, code: 'sendable', cap: 'Free', seats: { used: 0, total: 2 } }],
+        follow: [{ ok: true, url: SESSION }],
+        session: [waiting(REQUEST), idleDone('复核结论：通过\n逐条证据。'), idleDone('复核结论：通过\n逐条证据。')],
+      });
+      const out = await runLane(review.input({ provider: 'devin-cloud', stateRoot: first.stateRoot,
+        env: { SCK_DELIVERY_ID: 'lease-review' } }), { ...review.deps, browse: c.browse,
+        assist: async input => { assistCalls++; return { decision: 'reply', message: `复核说明（${input.phase}）`, toolExecuted: 'ops_health' }; } });
+      expect(out.text).toMatch(/^复核结论：通过/);
+      expect(assistCalls).toBe(1);
+      const follows = c.calls.filter(s => s.includes(MODE('follow')));
+      expect(follows).toHaveLength(1);
+      expect(follows[0]).not.toContain(relay.marker);
+    });
+
+    test('跨租约恢复不采信绑定到别的任务/别的会话的旧回执：重新代跑并按本会话回传', async () => {
+      const cases = [
+        { name: '别的任务', tamper: (relay: Record<string, unknown>) => ({ ...relay, task: 'task-other' }) },
+        { name: '别的会话', tamper: (relay: Record<string, unknown>) => ({ ...relay, session: OTHER }) },
+      ];
+      for (const item of cases) {
+        const first = world({ extra: gitOk });
+        const a = devinBrowse({
+          send: [{ ok: true, url: SESSION }],
+          gate: [{ ok: true, code: 'sendable', cap: 'Free', seats: { used: 1, total: 2 } }],
+          follow: [{ ok: false, code: 'quota_full', seats: '2/2', cap: 'Free' }],
+          session: [waiting(REQUEST)],
+        });
+        await runLane(first.input({ provider: 'devin-cloud' }), { ...first.deps, browse: a.browse,
+          assist: async () => ({ decision: 'reply', message: '{"reachable":true}', toolExecuted: 'ops_health' }) });
+        const relay = readLaneState(first.commDir)!.devin!.assistRelay!;
+
+        const second = world({ extra: gitOk });
+        writeInflight(first.stateRoot, 'devin-cloud', 'lease-tampered', {
+          taskId: relay.marker, taskUrl: SESSION, submittedAt: Date.now(), vendorSession: SESSION, task: 'task-1',
+          assistRounds: relay.round, assistRelay: item.tamper({ ...relay }) as typeof relay,
+        });
+        let assistCalls = 0;
+        const c = devinBrowse({
+          gate: [{ ok: true, code: 'sendable', cap: 'Free', seats: { used: 0, total: 2 } }],
+          follow: [{ ok: true, url: SESSION }],
+          session: [waiting(REQUEST), idleDone(PR9), idleDone(PR9)],
+        });
+        const out = await runLane(second.input({ provider: 'devin-cloud', stateRoot: first.stateRoot,
+          env: { SCK_DELIVERY_ID: 'lease-tampered' } }), { ...second.deps, browse: c.browse,
+          assist: async () => { assistCalls++; return { decision: 'reply', message: 'ok', toolExecuted: 'ops_health' }; } });
+        expect(out.text, item.name).toContain('PR: https://github.com/acme/widget/pull/9');
+        expect(assistCalls, item.name).toBe(1);
+        const follows = c.calls.filter(s => s.includes(MODE('follow')));
+        expect(follows, item.name).toHaveLength(1);
+        expect(follows[0], item.name).not.toContain(relay.marker);
+      }
+    });
+
+    test('跨租约恢复：新租约探测确认满额时零工具零发送，已落盘的回传正文保留待下次恢复', async () => {
+      const first = world({ extra: gitOk });
+      let assistCalls = 0;
+      const assist = async () => { assistCalls++; return { decision: 'reply' as const, message: '{"reachable":true}', toolExecuted: 'ops_health' }; };
+      const a = devinBrowse({
+        send: [{ ok: true, url: SESSION }],
+        gate: [{ ok: true, code: 'sendable', cap: 'Free', seats: { used: 1, total: 2 } }],
+        follow: [{ ok: false, code: 'quota_full', seats: '2/2', cap: 'Free' }],
+        session: [waiting(REQUEST)],
+      });
+      await runLane(first.input({ provider: 'devin-cloud' }), { ...first.deps, browse: a.browse, assist });
+      const relay = readLaneState(first.commDir)!.devin!.assistRelay!;
+
+      const second = world({ extra: gitOk });
+      const c = devinBrowse({
+        gate: [{ ok: false, code: 'quota_full', seats: '2/2', cap: 'Free' }],
+        session: [waiting(REQUEST)],
+      });
+      const out = await runLane(second.input({ provider: 'devin-cloud', stateRoot: first.stateRoot,
+        env: { SCK_DELIVERY_ID: 'lease-still-full' } }), { ...second.deps, browse: c.browse, assist });
+      expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out.text).toContain('席位已满（2/2 in use）');
+      expect(out.text).toContain('未代跑、未发送');
+      expect(assistCalls).toBe(1);
+      expect(c.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(0);
+      expect(c.calls.filter(s => s.includes(MODE('send')))).toHaveLength(0);
+      // 正文已从共享登记恢复并继续保留；下次空位恢复可直接补发。
+      expect(readLaneState(second.commDir)?.devin?.assistRelay?.marker).toBe(relay.marker);
+      expect(readInflight(first.stateRoot, 'devin-cloud', readLaneState(second.commDir)!.digest!)?.assistRelay?.marker).toBe(relay.marker);
+    });
+
+    test('跨租约恢复：补发结果不确定时保留 attempt 与回传正文；再恢复只核对零重发零工具（已受理与待确认意图共存）', async () => {
+      const first = world({ extra: gitOk });
+      let assistCalls = 0;
+      const assist = async () => { assistCalls++; return { decision: 'reply' as const, message: '{"reachable":true}', toolExecuted: 'ops_health' }; };
+      const a = devinBrowse({
+        send: [{ ok: true, url: SESSION }],
+        gate: [{ ok: true, code: 'sendable', cap: 'Free', seats: { used: 1, total: 2 } }],
+        follow: [{ ok: false, code: 'quota_full', seats: '2/2', cap: 'Free' }],
+        session: [waiting(REQUEST)],
+      });
+      await runLane(first.input({ provider: 'devin-cloud' }), { ...first.deps, browse: a.browse, assist });
+      const relay = readLaneState(first.commDir)!.devin!.assistRelay!;
+
+      // 空位后补发一次，但回执不可判读：不能当成未发出，attempt 与正文都保留。
+      const second = world({ extra: gitOk });
+      const b = devinBrowse({
+        gate: [{ ok: true, code: 'sendable', cap: 'Free', seats: { used: 0, total: 2 } }],
+        follow: [{ ok: false, code: 'not_echoed' }],
+        session: [waiting(REQUEST)],
+      });
+      const out2 = await runLane(second.input({ provider: 'devin-cloud', stateRoot: first.stateRoot }), {
+        ...second.deps, browse: b.browse, assist });
+      expect(out2.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out2.text).toContain('未能确认回传原会话');
+      expect(assistCalls).toBe(1);
+      expect(b.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(1);
+      const pending = readLaneState(second.commDir)!;
+      expect(pending.devin?.attempt).toBe(relay.marker);
+      expect(pending.taskId).toBeDefined();
+      // 已受理的 taskId 与待确认的代跑 attempt 在共享登记里共存，普通在途写不能抹掉 attempt。
+      const shared = readInflight(first.stateRoot, 'devin-cloud', pending.digest!)!;
+      expect(shared.taskId).toBeDefined();
+      expect(shared.attempt).toBe(relay.marker);
+      expect(shared.assistRelay?.marker).toBe(relay.marker);
+
+      // 再换一个租约（新 commDir）恢复：只核对这条 attempt，零重发、零工具。
+      const third = world({ extra: gitOk });
+      const seenBlocked = { ok: true, markerSeen: true, cap: 'Free', status: 'blocked', done: null, tail: '还在等', agentTail: REQUEST };
+      const c = devinBrowse({ session: [seenBlocked, seenBlocked] });
+      const out3 = await runLane(third.input({ provider: 'devin-cloud', stateRoot: first.stateRoot }), {
+        ...third.deps, browse: c.browse, assist });
+      expect(out3.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out3.text).toContain('上一轮本地代跑回传');
+      expect(assistCalls).toBe(1);
+      expect(c.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(0);
+      expect(c.calls.filter(s => s.includes(MODE('send')))).toHaveLength(0);
+      expect(readLaneState(third.commDir)?.taskId).toBe(relay.marker);
+      expect(readInflight(first.stateRoot, 'devin-cloud', pending.digest!)?.attempt).toBe(relay.marker);
+    });
+
+    test('探测拒绝的其它路径：错会话、非 Free、忙、未就绪、未登录都不代跑、不发送、不另建会话', async () => {
+      const cases: Array<{ name: string; gate: Record<string, unknown>; login?: boolean }> = [
+        { name: '错会话', gate: { ok: false, code: 'wrong_session', url: OTHER } },
+        { name: '非 Free 档位', gate: { ok: false, code: 'capability', detail: '会话 Capability 显示 Normal，不是 Free' } },
+        { name: '忙', gate: { ok: false, code: 'busy' } },
+        { name: '未就绪', gate: { ok: false, code: 'not_ready' } },
+        { name: '未登录', gate: { ok: false, code: 'login_required' }, login: true },
+      ];
+      for (const item of cases) {
+        const w = world({ extra: gitOk });
+        let assistCalls = 0;
+        const b = devinBrowse({
+          send: [{ ok: true, url: SESSION }],
+          gate: [item.gate],
+          session: [waiting(REQUEST)],
+        });
+        const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: b.browse,
+          assist: async () => { assistCalls++; return { decision: 'reply', message: '不应调用' }; } });
+        expect(out.status, item.name).toBe(item.login ? 'error' : 'success');
+        if (item.login) expect(out.text, item.name).toContain('未登录');
+        else {
+          expect(out.text.split('\n')[0], item.name).toBe('工作结果：受阻');
+          expect(out.text, item.name).toContain('本轮未代跑、未发送');
+        }
+        expect(assistCalls, item.name).toBe(0);
+        expect(b.calls.filter(s => s.includes(MODE('follow'))).length, item.name).toBe(0);
+        expect(b.calls.filter(s => s.includes(MODE('send'))).length, item.name).toBe(1);
+        expect(readLaneState(w.commDir)?.devin?.assistRounds, item.name).toBeUndefined();
+        expect(readLaneState(w.commDir)?.devin?.attempt, item.name).toBeUndefined();
+      }
     });
   });
 
