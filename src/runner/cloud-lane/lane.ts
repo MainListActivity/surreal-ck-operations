@@ -288,31 +288,65 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
       ...(entry.assistRounds !== undefined ? { assistRounds: entry.assistRounds } : {}),
       ...(entry.assistRelay ? { assistRelay: entry.assistRelay } : {}),
     });
+    /** 明确写了别的公司任务的登记不属于本任务：绑定原任务是恢复的第一道。 */
+    const bindsTask = (entry: InflightEntry) => entry.task === undefined || next.task === undefined || entry.task === next.task;
+    const distinctBy = <T,>(rows: T[], key: (row: T) => string): T[] => {
+      const seen = new Set<string>();
+      return rows.filter(row => { const k = key(row); if (seen.has(k)) return false; seen.add(k); return true; });
+    };
+    // 摘要变了（返工改了 findings 等）时，同一公司任务的其它登记也要找：按任务与内容找，不看目录顺序。
+    const others = next.task ? readInflightOfTask(input.stateRoot, input.provider, next.task, digest) : [];
     // 新键（投递）优先；升级前的登记仍按摘要查找。
     const reg = readInflight(input.stateRoot, input.provider, registryKey)
       ?? (registryKey !== digest ? readInflight(input.stateRoot, input.provider, digest) : undefined);
-    if (reg?.taskId) {
+    // 未确认的发送意图（attempt）可能已经按下，优先级高于任何已受理快照。只按内容去重，不按文件顺序或
+    // 提交时间挑：恰好一条可核对的意图才接管，多条互相冲突就受阻塞、零发送。
+    const intents = input.provider === 'devin-cloud'
+      ? distinctBy([...(reg?.attempt && bindsTask(reg) ? [reg] : []), ...others.filter(bindsTask)]
+          .filter(entry => entry.attempt), entry => `${entry.attempt!}\n${entry.attemptSession ?? ''}`)
+      : [];
+    if (intents.length > 1)
+      return blocked('同一任务存在多条互不相同的 Devin Cloud 未确认发送意图，无法判定哪一条属于当前会话；为避免重复发送，本轮未发出、未代跑。在途登记已保留，请人工核对后再决定是否重派。');
+    const intent = intents[0];
+    if (intent) {
+      // 已落下发送意图但受理未确认：按在途处理，只核对是否已受理，绝不再次按发送。
+      // 落点会话（续轮的原会话 / attemptSession）决定核对哪个会话；本目录其它会话地址不沿用。
+      // 没有会话地址时：同一投递键仍可按标记在会话列表里找；跨投递/换摘要则直接受阻（避免另建）。
+      const sameKey = Boolean(reg?.attempt && reg.attempt === intent.attempt
+        && (reg.attemptSession ?? '') === (intent.attemptSession ?? ''));
+      if (!intent.attemptSession && !intent.taskUrl && !intent.vendorSession && !sameKey)
+        return blocked(`同一任务上一轮 Devin Cloud 已按下发送（或发送中途中断）但未确认受理，且没有会话地址可核对；换了摘要也不能另建会话（避免重复）。本轮未发出，在途登记已保留，请人工核对 app.devin.ai 后再决定是否重派。`);
+      // 已有 taskId（原会话已受理）或带代跑轮数/回传正文 → 这是代跑回传的未确认意图：把原会话地址
+      // 一并带上，跳过会话列表搜寻，直接在原会话轮询并保留 attempt（只核对、零重发、不再代跑）。
+      // 单纯的首发/续轮发送意图（只有 attempt、没有代跑痕迹）仍走会话列表/原会话核对，找到后继续。
+      const assistPending = intent.assistRelay !== undefined || intent.assistRounds !== undefined
+        || intent.taskId !== undefined;
+      next.taskId = intent.taskId ?? intent.attempt!;
+      next.submittedAt = intent.attemptAt ?? intent.submittedAt ?? next.submittedAt;
+      if (assistPending) {
+        const session = intent.attemptSession ?? intent.taskUrl ?? intent.vendorSession;
+        if (session) { next.taskUrl = session; next.vendorSession = session; }
+      }
+      next.devin = { ...next.devin, attempt: intent.attempt!, attemptAt: intent.attemptAt,
+        attemptSession: intent.attemptSession, ...pendingDevin(intent) };
+    } else if (reg?.taskId && bindsTask(reg)) {
       next.taskId = reg.taskId;
       next.taskUrl = reg.taskUrl;
       next.submittedAt = reg.submittedAt;
       next.vendorSession ??= reg.vendorSession;
       if (input.provider === 'devin-cloud')
         next.devin = { ...next.devin, attemptSession: reg.attemptSession, ...pendingDevin(reg) };
-    } else if (reg?.attempt && input.provider === 'devin-cloud') {
-      // 另一个员工目录已落下发送意图但还没有任务 ID：按在途处理，只核对是否已受理，绝不再次按发送。
-      // 登记里的落点会话（续轮的原会话）决定核对哪个会话，本目录的旧值不沿用。
-      next.taskId = reg.attempt;
-      next.submittedAt ??= reg.attemptAt;
-      // 换员工目录也把待确认的 attempt、轮数与已落盘的回传正文带过来：之后只核对这条 attempt，
-      // 零重发、不再代跑。
-      next.devin = { ...next.devin, attempt: reg.attempt, attemptAt: reg.attemptAt,
-        attemptSession: reg.attemptSession, ...pendingDevin(reg) };
     } else if (next.task) {
       // 摘要变了（返工改了 findings 等）：同一公司任务在别的目录里的登记仍代表已发出的会话，不能当成新任务另建。
       // 未确认受理且没有会话地址的只能受阻交人工核对；有会话地址的沿用它做跟进（同一会话，不另建）。
-      const others = readInflightOfTask(input.stateRoot, input.provider, next.task, digest);
-      const pending = !material.review && !material.findings
-        ? others.find(entry => entry.taskId && inflightSession(entry)) : undefined;
+      const accepted = others.filter(entry => bindsTask(entry) && entry.taskId && inflightSession(entry));
+      const sessions = new Set(accepted.map(entry => inflightSession(entry)!));
+      if (sessions.size > 1)
+        return blocked('同一任务存在多条 Devin Cloud 已受理记录且落点会话不一致，无法判定当前会话；为避免错发或另建重复会话，本轮未发出。在途登记已保留，请人工核对后再决定是否重派。');
+      // 提交时间相同也要确定：先按提交时间，再按标记字符串，绝不依赖目录遍历顺序。
+      const ordered = [...accepted].sort((a, b) =>
+        (b.submittedAt ?? 0) - (a.submittedAt ?? 0) || (a.taskId! < b.taskId! ? -1 : a.taskId! > b.taskId! ? 1 : 0));
+      const pending = !material.review && !material.findings ? ordered[0] : undefined;
       if (pending) {
         next.taskId = pending.taskId;
         next.taskUrl = pending.taskUrl ?? inflightSession(pending);
