@@ -61,6 +61,16 @@ export class FakeWorld {
   readonly browserLogins: Array<{ spaceId: number; page: string; token: string; probeUrl: string; landingUrl: string; oidcUser?: { key: string; value: string } }> = [];
   /** IdP subject → active platform-operator capabilities, like the product's capability table. */
   readonly operatorCaps = new Map<string, string[]>();
+  /**
+   * `GET /api/ops/funnel-summary` fixture (CK #258): an aggregate is turned into the upstream summary contract by
+   * default; `body` overrides it verbatim for malformed-response cases, and `status` replaces the answer entirely.
+   */
+  readonly funnelSummary = {
+    status: 200,
+    body: null as unknown,
+    aggregate: { totalCount: 0, workspaceCount: 0 },
+    calls: [] as Array<{ event: string | null; day: string | null; keys: string[] }>,
+  };
   /** The provision token hash the fake product sealed at the last rotate call (null = env fallback). */
   liveProvisionToken: { hash: string; principalId: string } | null = null;
 readonly issuedInvites = new Map<string, Record<string, unknown>>();
@@ -803,6 +813,29 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
         return json(200, { format_version: 1, operators: rows.map(r => ({
           subject_hash: hash(r.subject), kind: r.kind, status: r.status, capabilities: r.capabilities, isCurrent: r.subject === grant.userId,
         })) });
+      }
+      // Mirrors GET /api/ops/funnel-summary (CK #258): one known event on one UTC day, aggregated in the
+      // database, fixed low-sample suppression and an always-unknown coverage marker. Row-level counts are
+      // a different endpoint and deliberately not modelled here.
+      if (method === 'GET' && url.pathname === '/api/ops/funnel-summary') {
+        if (!caps.includes('funnel.read')) return apiError(403, 'platform-operator-capability-missing');
+        const event = url.searchParams.get('event');
+        const day = url.searchParams.get('day');
+        this.funnelSummary.calls.push({ event, day, keys: [...url.searchParams.keys()] });
+        if (this.funnelSummary.status !== 200) {
+          return json(this.funnelSummary.status, { error: { code: 'funnel-summary-upstream-unavailable', message: '汇总源暂不可用' } });
+        }
+        if (this.funnelSummary.body !== null) return json(200, this.funnelSummary.body);
+        const { totalCount, workspaceCount } = this.funnelSummary.aggregate;
+        const state = totalCount === 0 && workspaceCount === 0 ? 'empty'
+          : totalCount < 5 || workspaceCount < 3 ? 'suppressed' : 'reported';
+        return json(200, {
+          event, day, state,
+          totalCount: state === 'suppressed' ? null : totalCount,
+          workspaceCount: state === 'suppressed' ? null : workspaceCount,
+          thresholds: { minTotalCount: 5, minWorkspaceCount: 3 },
+          coverage: { state: 'unknown', complete: false, reason: 'no_collection_coverage_signal', source: 'funnel_event_count' },
+        });
       }
       const entitlement = /^\/api\/ops\/product-entitlements\/workspaces\/[^/]+$/.exec(url.pathname);
       if (method === 'GET' && entitlement) {

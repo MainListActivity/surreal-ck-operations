@@ -1,17 +1,18 @@
 {
-  "version": "0.13.59",
-  "title": "双节点接力：第二节点清单与离线租约负例",
+  "version": "0.13.60",
+  "title": "只读产品脉冲：CK 漏斗汇总的状态、公开聚合与覆盖标记",
   "changes": [
-    "新增第二原生节点上线清单：Linux external 隔离、节点本地 clone/显式路径、日志证据脱敏、第二节点心跳与 VPS 待验项。",
-    "同目录 writer.lock 独立测试：第二写者失败、host 不匹配拒绝、多进程仅一写者，与跨节点租约证据分离。",
-    "跨目录共库 fork 负例：两 runner/node、有效租约唯一写者、跨节点接手拒绝、旧租约不可写、过期后可接手。",
-    "路由 N3：指定节点离线时 ownsProvider 不回退到其他 native 或 paseo，避免双执行。"
+    "新增只读 ops_product_pulse：用运营会话读取 CK 固定事件与固定 UTC 日的 /api/ops/funnel-summary 汇总，沿用 funnel.read 与真实租约。",
+    "只投影经类型校验的 state、允许公开的聚合数与 coverage；未知字段忽略，事件/日期/计数/覆盖不一致或畸形响应一律拒绝且不回显原文。",
+    "空窗、低样本抑制、覆盖未知与授权失败分别可辨；抑制窗口不返回精确低值。",
+    "不调用逐行 funnel-counts，不返回会话句柄、工作区标识、原始错误或正文；不做身份/权限变更与自动派工。",
+    "固定 surreal_ck/production 与 engineering/product/qa 岗位；越权参数在任何读取前拒绝。"
   ],
   "impact": [
-    "运维：上线第二节点前可按清单勾选；真实 VPS 心跳前仍标 unknown。",
-    "工程：租约与写锁负例可离线回归，不依赖生产第二节点。",
-    "限制：本版不安装生产 VPS runner、不改生产 runtime-routes、不迁移在途会话。"
+    "员工与 QA：无需持有运营凭证即可按固定事件与日期读取已抑制的漏斗汇总，并能区分空窗、样本不足与授权缺口。",
+    "老板：运营脉冲只来自产品聚合端点与公开字段，不暴露工作区级明细。",
+    "限制：仅 surreal_ck 生产环境；采集覆盖仍为 unknown，生产授权与真实覆盖留给后续受控冒烟。"
   ],
-  "migration": "无新 schema；沿用 074（fault_recovery_grant，0.13.57）。合入后重启执行端即可加载清单与测试；不改历史任务。",
-  "rollback": "回退至 0.13.58；删除清单与新增测试不影响运行时。回退后勿宣称双节点负例已固化。"
+  "migration": "无 schema 变更，沿用 schema 074（0.13.57 的 fault_recovery_grant）；升级并重启执行端插件即可。产品侧需已部署 CK #258（caa6ec9f）的 /api/ops/funnel-summary，且运营主体持有 funnel.read。",
+  "rollback": "回退至 0.13.58；工具随版本消失，无数据迁移。"
 }
