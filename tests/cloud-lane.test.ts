@@ -886,7 +886,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     // 带原会话地址与说明，不是裸错误回合——避免执行端把它当空交付回收成 silent-turn，不送审。
     expect(out1.status).toBe('success');
     expect(out1.text.split('\n')[0]).toBe('工作结果：受阻');
-    expect(out1.text).toContain(SESSION);
+    // 回执只带固定原因：不在出站文本回显会话地址，地址只留在内部在途状态。
+    expect(out1.text).not.toContain(SESSION);
     expect(out1.text).toContain('仍在运行');
     expect(readLaneState(w1.commDir)?.taskUrl).toBe(SESSION);
     // 第二轮：同 prompt 同摘要 → 不再跑发送脚本，直接轮询原会话地址
@@ -928,7 +929,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(native.completed).toBe(true);
     expect(native.error).toBeUndefined();
     expect(native.text.split('\n')[0]).toBe('工作结果：受阻');
-    expect(native.text).toContain(SESSION);
+    expect(native.text).not.toContain(SESSION);
     expect(native.sessionId).toBe(outcome.sessionId);
     // native.ts 的 result.completed 正是 NativeRuntime.launch() 用来算 outcome.kind 的那个布尔量：
     //   const success = ... && result.completed && !!s.nativeSessionId;
@@ -963,7 +964,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(out.status).toBe('success');
     expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
     expect(out.text).toContain('没能停在本轮轮询的会话地址上');
-    expect(out.text).toContain(SESSION);
+    expect(out.text).not.toContain(SESSION);
+    expect(out.text).not.toContain(OTHER);
     // 只发过一次；受阻之后在途状态保留（taskId 仍有），没有第二次发送、没有拉取分支（没走到收尾）
     expect(b.calls.filter(s => s.includes('const MSG ='))).toHaveLength(1);
     expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(0);
@@ -979,7 +981,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(out.status).toBe('success');
     expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
     expect(out.text).toContain('没能停在本轮轮询的会话地址上');
-    expect(out.text).toContain(SESSION);
+    expect(out.text).not.toContain(SESSION);
+    expect(out.text).not.toContain(OTHER);
     // 没有把那个会话的 PR 当终稿：没有快进/拉分支，也没有第二次发送
     expect(w.callsOf(c => c.cmd === 'git' && c.args[0] === 'fetch')).toHaveLength(0);
     expect(b.calls.filter(s => s.includes('const MSG ='))).toHaveLength(1);
@@ -1023,7 +1026,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(out2.status).toBe('success');
     expect(out2.text.split('\n')[0]).toBe('工作结果：受阻');
     expect(out2.text).toContain('原会话');
-    expect(out2.text).toContain(SESSION);
+    expect(out2.text).not.toContain(SESSION);
+    expect(out2.text).not.toContain(OTHER);
     expect(b2.calls.some(s => s.includes(MODE('send')))).toBe(false);
     expect(b2.calls.some(s => s.includes(MODE('follow')))).toBe(false);
     expect(b2.calls.filter(s => s.includes(MODE('session')))).toHaveLength(4);
@@ -1097,7 +1101,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     const out = await runLane(w.input({ provider: 'devin-cloud', prompt: '继续修复。', config: { pollMs: 1, maxMinutes: 1 } }), { ...w.deps, browse });
     expect(out.status).toBe('error');
     expect(out.text).toContain('没能停在原会话地址上');
-    expect(out.text).toContain(OTHER);
+    expect(out.text).not.toContain(OTHER);
+    expect(out.text).not.toContain(SESSION);
     // 跟进脚本只跑过一次（第一次回执后时限已到，直接报错，不重试多次、不重发）
     expect(b.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(1);
     expect(b.calls.some(s => s.includes(MODE('send')))).toBe(false);
@@ -1132,7 +1137,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(out.text).toContain('复核结论');
   });
 
-  test('Devin 停下来等用户 → 受阻并带回答复现场', async () => {
+  test('Devin 停下来等用户 → 受阻并只给固定现场，不回显页面正文', async () => {
     const w = world({ extra: gitOk });
     const b = devinBrowse({
       send: [{ ok: true, url: SESSION }],
@@ -1141,7 +1146,9 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: b.browse });
     expect(out.status).toBe('success');
     expect(out.text).toMatch(/^工作结果：受阻/);
-    expect(out.text).toContain('要不要删除旧表');
+    expect(out.text).toContain('需要老板在会话里答复');
+    expect(out.text).not.toContain('要不要删除旧表');
+    expect(out.text).not.toContain(SESSION);
   });
 
   test('vendorPrompt 对 devin-cloud 执行轮提示 OPS-REQUEST 代跑约定', () => {
@@ -1886,6 +1893,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
           ...second.deps, browse: b.browse, assist });
         expect(out2.text.split('\n')[0], uncertain.name).toBe('工作结果：受阻');
         expect(out2.text, uncertain.name).toContain('未能确认回传原会话');
+        expect(out2.text, uncertain.name).not.toContain('app.devin.ai');
         expect(assistCalls, uncertain.name).toBe(1);
         expect(b.calls.filter(s => s.includes(MODE('follow'))).length, uncertain.name).toBe(1);
         const pending = readLaneState(second.commDir)!;
@@ -1899,12 +1907,15 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
 
         // 同投递键再恢复：只核对这条 attempt，零重发、零工具、零新会话。
         const sameKey = world({ extra: gitOk });
-        const seenBlocked = { ok: true, markerSeen: true, cap: 'Free', status: 'blocked', done: null, tail: '还在等', agentTail: REQUEST };
+        const seenBlocked = { ok: true, markerSeen: true, cap: 'Free', status: 'blocked', done: null,
+          tail: 'BROWSER_TAIL_SENTINEL', url: SESSION, agentTail: REQUEST };
         const same = devinBrowse({ session: [seenBlocked, seenBlocked] });
         const outSame = await runLane(sameKey.input({ provider: 'devin-cloud', stateRoot: first.stateRoot,
           env: { SCK_DELIVERY_ID: pending.delivery } }), { ...sameKey.deps, browse: same.browse, assist });
         expect(outSame.text.split('\n')[0], uncertain.name).toBe('工作结果：受阻');
         expect(outSame.text, uncertain.name).toContain('上一轮本地代跑回传');
+        expect(outSame.text, uncertain.name).not.toContain('app.devin.ai');
+        expect(outSame.text, uncertain.name).not.toContain('BROWSER_TAIL_SENTINEL');
         expect(assistCalls, uncertain.name).toBe(1);
         expect(same.calls.filter(s => s.includes(MODE('follow'))).length, uncertain.name).toBe(0);
         expect(same.calls.filter(s => s.includes(MODE('send'))).length, uncertain.name).toBe(0);
@@ -1917,6 +1928,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
           ...third.deps, browse: c.browse, assist });
         expect(out3.text.split('\n')[0], uncertain.name).toBe('工作结果：受阻');
         expect(out3.text, uncertain.name).toContain('上一轮本地代跑回传');
+        expect(out3.text, uncertain.name).not.toContain('app.devin.ai');
+        expect(out3.text, uncertain.name).not.toContain('BROWSER_TAIL_SENTINEL');
         expect(assistCalls, uncertain.name).toBe(1);
         expect(c.calls.filter(s => s.includes(MODE('follow'))).length, uncertain.name).toBe(0);
         expect(c.calls.filter(s => s.includes(MODE('send'))).length, uncertain.name).toBe(0);
@@ -2023,6 +2036,107 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
         expect(b.calls.filter(s => s.includes(MODE('send'))).length, item.name).toBe(1);
         expect(readLaneState(w.commDir)?.devin?.assistRounds, item.name).toBeUndefined();
         expect(readLaneState(w.commDir)?.devin?.attempt, item.name).toBeUndefined();
+      }
+    });
+
+    test('中继后续核对与收尾的出站受阻只含固定原因和确认标记：无标记、地址不符、到时、无终稿、转人工都不回显会话 URL、页面正文或协助原因', async () => {
+      const TAIL = 'BROWSER_TAIL_SENTINEL 页面正文';
+      const REASON = 'FREE_TEXT_ASSIST_REASON_SENTINEL';
+      const SESSION_URLS = (text: string) => text.includes(SESSION) || text.includes(OTHER) || text.includes('app.devin.ai');
+      /** 走完「首发受理 → 轮询」到指定收尾，返回本轮最终答复。 */
+      const pollTo = async (session: Array<Record<string, unknown>>, over: {
+        assist?: LaneDeps['assist']; config?: Record<string, number>; advance?: number;
+      } = {}) => {
+        const w = world({ extra: gitOk });
+        const b = devinBrowse({ send: [{ ok: true, url: SESSION }], session });
+        const run = (script: string, timeout: number) => {
+          if (over.advance) w.advance(over.advance);
+          return b.browse(script, timeout);
+        };
+        const out = await runLane(w.input({ provider: 'devin-cloud', config: over.config ?? { pollMs: 1 } }),
+          { ...w.deps, browse: run, ...(over.assist ? { assist: over.assist } : {}) });
+        return { out, calls: b.calls };
+      };
+
+      // 1) 无标记：待确认中继后换租约恢复，只轮询到 MARKER_MISS_LIMIT。
+      {
+        const first = world({ extra: gitOk });
+        let assistCalls = 0;
+        const assist = async () => { assistCalls++; return { decision: 'reply' as const, message: '{"reachable":true}', toolExecuted: 'ops_health' }; };
+        const a = devinBrowse({
+          send: [{ ok: true, url: SESSION }],
+          gate: [{ ok: true, code: 'sendable', cap: 'Free', seats: { used: 0, total: 2 } }],
+          follow: [undefined],
+          session: [waiting(REQUEST)],
+        });
+        await runLane(first.input({ provider: 'devin-cloud' }), { ...first.deps, browse: a.browse, assist });
+        const relay = readLaneState(first.commDir)!.devin!.assistRelay!;
+        const second = world({ extra: gitOk });
+        const unseenTail = { ok: true, markerSeen: false, status: 'idle', done: null, tail: TAIL, url: SESSION, cap: 'Free' };
+        const b = devinBrowse({ session: [unseenTail, unseenTail, unseenTail, unseenTail] });
+        const out = await runLane(second.input({ provider: 'devin-cloud', stateRoot: first.stateRoot,
+          env: { SCK_DELIVERY_ID: 'lease-marker-miss' } }), { ...second.deps, browse: b.browse, assist });
+        expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+        expect(out.text).toContain('一直找不到本轮消息');
+        expect(out.text).toContain(relay.marker);
+        expect(assistCalls).toBe(1);
+        expect(b.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(0);
+        expect(b.calls.filter(s => s.includes(MODE('send')))).toHaveLength(0);
+        expect(SESSION_URLS(out.text)).toBe(false);
+        expect(out.text).not.toContain(TAIL);
+      }
+
+      // 2) 地址不符：轮询回到别的合法会话，累计 wrong_session 后受阻。
+      {
+        const wrong = { ok: true, markerSeen: true, status: 'idle', done: null, tail: TAIL, url: OTHER, cap: 'Free' };
+        const { out } = await pollTo([wrong, wrong, wrong, wrong]);
+        expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+        expect(out.text).toContain('没能停在本轮轮询的会话地址上');
+        expect(SESSION_URLS(out.text)).toBe(false);
+        expect(out.text).not.toContain(TAIL);
+      }
+
+      // 3) 到时：会话一直在忙，超过配置时限。
+      {
+        const working = { ok: true, markerSeen: true, status: 'working', done: null, tail: TAIL, url: SESSION, cap: 'Free' };
+        const { out } = await pollTo([working, working, working, working],
+          { config: { maxMinutes: 1, pollMs: 1 }, advance: 30_000 });
+        expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+        expect(out.text).toContain('超过配置时限');
+        expect(SESSION_URLS(out.text)).toBe(false);
+        expect(out.text).not.toContain(TAIL);
+      }
+
+      // 4) 无终稿：一直 idle 且带本轮标记却没有 SCK-DONE 终稿。
+      {
+        const noDone = { ok: true, markerSeen: true, status: 'idle', done: null, tail: TAIL, agentTail: TAIL, url: SESSION, cap: 'Free' };
+        const { out } = await pollTo([noDone, noDone, noDone, noDone]);
+        expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+        expect(out.text).toContain('没有按约定');
+        expect(SESSION_URLS(out.text)).toBe(false);
+        expect(out.text).not.toContain(TAIL);
+      }
+
+      // 5) 转人工：协助判定交老板，自由文本原因与页面尾部都不得出现在答复里。
+      {
+        const blockedSeen = { ok: true, markerSeen: true, status: 'blocked', done: null, tail: TAIL, agentTail: REQUEST, url: SESSION, cap: 'Free' };
+        const { out } = await pollTo([blockedSeen, blockedSeen],
+          { assist: async () => ({ decision: 'escalate' as const, reason: REASON }) });
+        expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+        expect(out.text).toContain('本地协助转交老板裁决');
+        expect(out.text).not.toContain(REASON);
+        expect(SESSION_URLS(out.text)).toBe(false);
+        expect(out.text).not.toContain(TAIL);
+      }
+
+      // 6) 转人工（无代跑能力）：只能请老板答复，不带会话 URL 与页面正文。
+      {
+        const blockedSeen = { ok: true, markerSeen: true, status: 'blocked', done: null, tail: TAIL, url: SESSION, cap: 'Free' };
+        const { out } = await pollTo([blockedSeen, blockedSeen]);
+        expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+        expect(out.text).toContain('需要老板在会话里答复');
+        expect(SESSION_URLS(out.text)).toBe(false);
+        expect(out.text).not.toContain(TAIL);
       }
     });
   });
@@ -2580,7 +2694,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const fake = fakeDevin({ outsideFree: true, seats: { used: 0, total: 2 } });
       const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
       expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
-      expect(out.text).toContain('无法确定哪个是 Capability');
+      expect(out.text).toContain('Devin 页面未能确认选中 Free 档位或席位计数');
+      expect(out.text).not.toContain('无法确定哪个是 Capability');
       expect(fake.st.events.filter(e => e.startsWith('pointer') || e.startsWith('js'))).toEqual([]);
       expect(fake.st.events).not.toContain('fill');
       expect(fake.st.sent).toHaveLength(0);
@@ -2591,7 +2706,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const fake = fakeDevin({ duplicateFreeRow: true, seats: { used: 0, total: 2 } });
       const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
       expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
-      expect(out.text).toContain('2 个 Free 行');
+      expect(out.text).toContain('Devin 页面未能确认选中 Free 档位或席位计数');
+      expect(out.text).not.toContain('2 个 Free 行');
       expect(fake.st.events.filter(e => e.startsWith('pointer') && e !== 'pointer cap')).toEqual([]);
       expect(fake.st.events.filter(e => e.startsWith('js'))).toEqual([]);
       expect(fake.st.sent).toHaveLength(0);
@@ -2602,7 +2718,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const fake = fakeDevin({ freeRowInert: true, seats: { used: 0, total: 2 } });
       const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
       expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
-      expect(out.text).toContain('按钮=Normal');
+      expect(out.text).toContain('Devin 页面未能确认选中 Free 档位或席位计数');
+      expect(out.text).not.toContain('按钮=Normal');
       expect(fake.st.events).toContain('pointer Free');
       expect(fake.st.events).not.toContain('fill');
       expect(fake.st.sent).toHaveLength(0);
@@ -2613,7 +2730,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const fake = fakeDevin({ escapeInert: true, seats: { used: 0, total: 2 } });
       const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
       expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
-      expect(out.text).toContain('按 Escape 后仍挡着页面');
+      expect(out.text).toContain('Devin 页面未能确认选中 Free 档位或席位计数');
+      expect(out.text).not.toContain('按 Escape 后仍挡着页面');
       // 驱动层会整段重试；每次重试都从首页重新开始，单次尝试里的 Escape 次数都必须有界。
       const perAttempt: number[] = [];
       for (const e of fake.st.events) {
@@ -2683,7 +2801,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const fake = fakeDevin({ noMenu: true, seats: { used: 0, total: 2 } });
       const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: fake.browse });
       expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
-      expect(out.text).toContain('菜单里没有可见的 Free 行');
+      expect(out.text).toContain('Devin 页面未能确认选中 Free 档位或席位计数');
+      expect(out.text).not.toContain('菜单里没有可见的 Free 行');
       expect(fake.st.events.filter(e => e.startsWith('pointer') && e !== 'pointer cap')).toEqual([]);
       expect(fake.st.events.filter(e => e.startsWith('js'))).toEqual([]);
       expect(fake.st.events).not.toContain('fill');
@@ -2696,7 +2815,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1, maxMinutes: 1 } }),
         { ...w.deps, browse: advancing(w, fake.browse) });
       expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
-      expect(out.text).toContain('powered=false');
+      expect(out.text).toContain('Devin 页面未能确认选中 Free 档位或席位计数');
+      expect(out.text).not.toContain('powered=false');
       expect(fake.st.events).toContain('pointer Free');
       expect(fake.st.events).not.toContain('fill');
       expect(fake.st.events).not.toContain('__PRESSED__');
@@ -2709,14 +2829,15 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1, maxMinutes: 1 } }),
         { ...w.deps, browse: advancing(w, fake.browse) });
       expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
-      expect(out.text).toContain('读不到 Free 席位计数');
+      expect(out.text).toContain('Devin 页面未能确认选中 Free 档位或席位计数');
+      expect(out.text).not.toContain('读不到 Free 席位计数');
       expect(fake.st.events).not.toContain('fill');
       expect(fake.st.events).not.toContain('__PRESSED__');
       expect(fake.st.sent).toHaveLength(0);
     });
 
     test('续轮：首页选中 Free 后 powered 或席位读不到 → 不填写、不发送，受阻', async () => {
-      for (const [flag, why] of [[{ noPowered: true }, 'powered=false'], [{ noSeats: true }, '读不到 Free 席位计数']] as const) {
+      for (const flag of [{ noPowered: true }, { noSeats: true }] as const) {
         const w = world({ extra: gitOk });
         writeLaneState(w.commDir, { sessionId: 'lane-1', digest: 'old-digest', vendorSession: SESSION, branch: 'sck/task-1' });
         const fake = fakeDevin({ ...flag, seats: { used: 1, total: 2 }, sessions: { [SESSION]: OLD_ROUND }, onSend: answer(PR9) });
@@ -2725,7 +2846,9 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
         const home = fake.st.events.indexOf(`visit ${HOME}`);
         expect(home).toBeGreaterThan(-1);
         expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
-        expect(out.text).toContain(why);
+        expect(out.text).toContain('Devin 页面未能确认选中 Free 档位或席位计数');
+        expect(out.text).not.toContain('powered=false');
+        expect(out.text).not.toContain('读不到 Free 席位计数');
         expect(fake.st.events.slice(home)).toContain('pointer Free');
         expect(fake.st.events).not.toContain('fill');
         expect(fake.st.sent).toHaveLength(0);
@@ -3070,7 +3193,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(out2.text.split('\n')[0]).toBe('工作结果：受阻');
       expect(out2.text).toContain('一直找不到本轮消息');
       expect(out2.text).toContain('未重发');
-      expect(out2.text).toContain(SESSION);
+      expect(out2.text).not.toContain(SESSION);
       expect(sendLikeCalls).toHaveLength(0);
       const st = readLaneState(w2.commDir);
       expect(st?.taskUrl).toBe(SESSION);

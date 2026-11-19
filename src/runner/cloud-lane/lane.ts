@@ -273,7 +273,7 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
   // 换了投递也不能另建会话（可能与在途会话重复），受阻交人工。在途登记与 attempt 原样保留。
   if (!sameRound && input.provider === 'devin-cloud' && (state.taskId || state.devin?.attempt)
     && !state.taskUrl && !state.vendorSession)
-    return blocked(`上一轮 Devin Cloud 已按下发送（或发送中途中断）但未确认受理，且没有会话地址可核对；为避免另建重复会话，本轮未发出。在途登记已保留，请人工核对 app.devin.ai 会话列表后再决定是否重派。`);
+    return blocked(`上一轮 Devin Cloud 已按下发送（或发送中途中断）但未确认受理，且没有会话地址可核对；为避免另建重复会话，本轮未发出。在途登记已保留，请人工核对会话列表后再决定是否重派。`);
   if (!sameRound) {
     delete next.taskId; delete next.taskUrl; delete next.submittedAt;
     // 落点会话属于旧回合的发送，新回合不沿用；仍在途的旧发送由共享登记另行决定。
@@ -315,7 +315,7 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
       const sameKey = Boolean(reg?.attempt && reg.attempt === intent.attempt
         && (reg.attemptSession ?? '') === (intent.attemptSession ?? ''));
       if (!intent.attemptSession && !intent.taskUrl && !intent.vendorSession && !sameKey)
-        return blocked(`同一任务上一轮 Devin Cloud 已按下发送（或发送中途中断）但未确认受理，且没有会话地址可核对；换了摘要也不能另建会话（避免重复）。本轮未发出，在途登记已保留，请人工核对 app.devin.ai 后再决定是否重派。`);
+        return blocked(`同一任务上一轮 Devin Cloud 已按下发送（或发送中途中断）但未确认受理，且没有会话地址可核对；换了摘要也不能另建会话（避免重复）。本轮未发出，在途登记已保留，请人工核对在途登记后再决定是否重派。`);
       // 已有 taskId（原会话已受理）或带代跑轮数/回传正文 → 这是代跑回传的未确认意图：把原会话地址
       // 一并带上，跳过会话列表搜寻，直接在原会话轮询并保留 attempt（只核对、零重发、不再代跑）。
       // 单纯的首发/续轮发送意图（只有 attempt、没有代跑痕迹）仍走会话列表/原会话核对，找到后继续。
@@ -356,7 +356,7 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
           next.devin = { ...next.devin, ...pendingDevin(pending) };
       } else if (input.provider === 'devin-cloud') {
         if (others.some(entry => !inflightSession(entry)))
-          return blocked(`同一任务上一轮 Devin Cloud 已按下发送（或发送中途中断）但未确认受理，且没有会话地址可核对；换了摘要也不能另建会话（避免重复）。本轮未发出，在途登记已保留，请人工核对 app.devin.ai 后再决定是否重派。`);
+          return blocked(`同一任务上一轮 Devin Cloud 已按下发送（或发送中途中断）但未确认受理，且没有会话地址可核对；换了摘要也不能另建会话（避免重复）。本轮未发出，在途登记已保留，请人工核对在途登记后再决定是否重派。`);
         const session = others.map(inflightSession).find(Boolean);
         if (session) next.vendorSession ??= session;
       }
