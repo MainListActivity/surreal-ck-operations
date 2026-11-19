@@ -11,15 +11,87 @@
  * 回执里的 s.url 与目标会话独立比对一次（query/hash 规范化）——即使回执误报 ok:true，别的会话的
  * 内容也不当本轮受理或终稿，绝不重发。
  * 完成后 git fetch + --ff-only 快进本地工作树；非快进报错回合，绝不 reset。
+ *
+ * 席位语义（2026-11-18 公开文档核对；未运行任何真实新会话）：厂商文档只说明并发会话数随套餐而定
+ * （"The number of sessions you can run at once depends on your plan"）、闲置会话可用消息唤醒
+ * （"You can wake the session up at any time by sending another message."），v3 发消息接口称会话挂起时会
+ * 自动恢复（"The session will be automatically resumed if suspended."），并把 total_session_limit_exceeded
+ * 列为挂起原因之一。没有任何公开文档明确说明「并发席位用满时仍可续用已有会话」，也没有定义 "N/M in use"
+ * 的统计口径（是否含本会话/闲置会话）。因此续轮（含本地代跑回传）继续沿用组织首页的席位门禁：满席不发送，
+ * 等席位可用后再安全恢复；不据此实现满席续轮，也不改选付费档。
+ * 本地代跑会消耗真实只读工具调用，所以回传前先在原会话与组织首页核可发条件（devinRelayGateScript）：
+ * 已知满座/未就绪/错会话/非 Free/未登录时不执行工具；已产出的回传正文落盘复用，避免检查与发送之间席位
+ * 变化导致同一工具被反复执行。
  */
 import { ensureBranchOnOrigin, fetchAndFastForward, type RepoInfo } from './repo.ts';
-import { clearInflightAttempt, laneDigest, recordInflight, recordInflightAttempt, writeLaneState, type DevinSeatReading, type LaneState } from './state.ts';
-import { devinFollowScript, devinRecoverScript, devinSendScript, devinSessionScript, DEVIN_HOME, DEVIN_SESSION_RE } from './devin-web.ts';
+import { clearInflightAttempt, laneDigest, recordInflight, recordInflightAttempt, writeLaneState, type DevinAssistRelay, type DevinSeatReading, type LaneState } from './state.ts';
+import { devinFollowScript, devinRecoverScript, devinRelayGateScript, devinSendScript, devinSessionScript, DEVIN_HOME, DEVIN_SESSION_RE } from './devin-web.ts';
 import { explicitReadonlyOpsRequest } from '../../steward/steward.ts';
 import type { LaneDeps, LaneInput } from './lane.ts';
 
 /** Devin 云模式的免费模型。公司派工只允许它（老板 2026-11-15 定），不是可覆盖的默认值。 */
 export const DEVIN_CLOUD_MODEL = 'free';
+
+/** 稳定的 JSON 规范化（对象键排序、数组保序）：同一工具与参数得到同一请求身份，不受页面尾串顺序/空白影响。 */
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object')
+    return `{${Object.keys(value as Record<string, unknown>).sort()
+      .map(key => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`).join(',')}}`;
+  return JSON.stringify(value) ?? 'null';
+}
+
+/**
+ * 代跑回传的请求身份：绑定公司任务、阶段、原会话，以及当前可信 Devin 作者块里的请求语义——有显式只读
+ * [OPS-REQUEST] 时只看工具与规范化参数（页面尾串变化不影响复用）；没有结构化请求时才退回到规范化尾串摘要。
+ * 不能拿完整作者尾部的易变文本当唯一身份，否则同一请求在页面渲染变化后会被误判成新请求、再执行一次工具。
+ */
+function relayAnchor(input: { task?: string; phase: 'doing' | 'review'; session: string }, requestKey: string): string {
+  return laneDigest('devin-relay', `v1\n${input.task ?? ''}\n${input.phase}\n${input.session}\n${requestKey}`).slice(0, 16);
+}
+
+/** 已落盘的回传正文只有在绑定与当前任务/阶段/会话一致时才能复用；否则一律丢弃重做。 */
+function relayBoundTo(relay: DevinAssistRelay | undefined, binding: { task?: string; phase: 'doing' | 'review'; session: string; anchor: string }): boolean {
+  return Boolean(relay) && relay!.anchor === binding.anchor && relay!.task === binding.task
+    && relay!.phase === binding.phase && relay!.session === binding.session;
+}
+
+/**
+ * 只有这些固定回执是「发送前就已拒绝」的证明（脚本在按下发送之前 return）：未登录、页面未就绪、没停在原会话、
+ * 档位/席位读不出、会话在忙、席位已满。只有它们可以撤销待确认的发送意图；无回执、不可解析、未知返回码、
+ * pressed / not_echoed 都可能已经按下，必须保留意图只核对。
+ */
+const PRE_SEND_REFUSALS = new Set(['login_required', 'not_ready', 'wrong_session', 'capability', 'busy', 'quota_full']);
+
+/** 校验后的席位数字：只接受 "N/M" 或 {used,total} 数字；其它（未知字符串、对象）一律不展示。 */
+function seatNumber(value: unknown): string | undefined {
+  if (typeof value === 'string' && /^\d+\/\d+$/.test(value)) return value;
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const { used, total } = value as { used?: unknown; total?: unknown };
+    if (typeof used === 'number' && typeof total === 'number' && Number.isFinite(used) && Number.isFinite(total))
+      return `${used}/${total}`;
+  }
+  return undefined;
+}
+
+/**
+ * 中继受阻只写固定原因与校验后的席位数字：不带会话网址、页面文字（Capability 详情、会话尾部）或未知返回码。
+ * 未知/缺失的返回码一律折叠成同一句固定原因。
+ */
+function relayReason(code: unknown, seats: unknown): string {
+  switch (code) {
+    case 'quota_full': {
+      const number = seatNumber(seats);
+      return `Devin Free 席位已满${number ? `（${number} in use）` : ''}`;
+    }
+    case 'capability': return 'Devin 页面未能确认 Free 档位或席位计数';
+    case 'busy': return 'Devin 会话还在处理上一轮';
+    case 'wrong_session': return 'Devin 页面没有停在原会话';
+    case 'not_ready': return 'Devin 页面未就绪';
+    case 'login_required': return 'Devin 页面未登录';
+    default: return '页面核对未通过';
+  }
+}
 
 /**
  * 云端会话的模型：缺省或字面 `free` 才放行，其它值（含空白、空串、null）一律抛错。
@@ -135,7 +207,7 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
     forgetAttemptSession();
     clearInflightAttempt(input.stateRoot, input.provider, ctx.key);
   };
-  const loginFail = () => fail('app.devin.ai 未登录或登录已过期（需要老板在 ego-browser 里重新登录 Devin）');
+  const loginFail = () => fail('Devin 页面未登录或登录已过期（需要老板在 ego-browser 里重新登录 Devin）');
   const over = () => deps.now() > ctx.deadline;
   const sessionOf = (value: unknown): string | undefined =>
     typeof value === 'string' && DEVIN_SESSION_RE.test(value) ? value.split('?')[0]!.split('#')[0] : undefined;
@@ -204,16 +276,16 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
       if (!pressed) { abandonAttempt(); persist(); }
       if (r?.code === 'login_required') return loginFail();
       if (r?.code === 'capability') {
-        const detail = String(r.detail ?? '').slice(0, 300);
         if (++capabilityMisses >= CAPABILITY_LIMIT)
-          return blocked(`Devin 页面未能确认选中 Free 档位或席位计数，本轮未发出（已重试 ${CAPABILITY_LIMIT} 次）：${detail}。不切付费档、不改用其它模型，也不回退到账号默认；页面恢复后恢复本任务即可。`);
+          return blocked(`Devin 页面未能确认选中 Free 档位或席位计数，本轮未发出（已重试 ${CAPABILITY_LIMIT} 次）。不切付费档、不改用其它模型，也不回退到账号默认；页面恢复后恢复本任务即可。`);
         deps.progress(`Devin 页面未确认 Free 档位，稍后重试（${capabilityMisses}/${CAPABILITY_LIMIT}）`, 'failed');
         await deps.sleep(pollMs);
         continue;
       }
       if (r?.code === 'quota_full') {
-        if (over()) return blocked(`Devin Free 席位持续已满（${String(r.seats ?? '?/?')} in use），本轮未发出；席位空出后恢复本任务即可，不会另建重复会话`);
-        deps.progress(`Devin Free 席位已满（${String(r.seats ?? '?/?')} in use），等待空位`, 'failed');
+        const seats = seatNumber(r.seats);
+        if (over()) return blocked(`Devin Free 席位持续已满${seats ? `（${seats} in use）` : ''}，本轮未发出；席位空出后恢复本任务即可，不会另建重复会话`);
+        deps.progress(`Devin Free 席位已满${seats ? `（${seats} in use）` : ''}，等待空位`, 'failed');
         await deps.sleep(pollMs);
         continue;
       }
@@ -226,8 +298,8 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
       if (r?.code === 'wrong_session') {
         // goto 失败被页面脚本自己的 catch 吞掉，没能停在原会话地址上：没碰发送按钮（pressed 已为 false，
         // 上面已撤销 attempt），单纯当页面未就绪重试，绝不把停错的那个会话当成本轮结果。
-        if (over()) return fail(`Devin 网页反复没能停在原会话地址上（当前 ${String(r.url ?? '未知')}，目标 ${follow}），${maxMinutes} 分钟内未能发出续轮消息`);
-        deps.progress(`Devin 页面没有停在原会话，稍后重试（当前 ${String(r.url ?? '未知')}）`, 'failed');
+        if (over()) return fail(`Devin 网页反复没能停在原会话地址上，${maxMinutes} 分钟内未能发出续轮消息（未发送）`);
+        deps.progress('Devin 页面没有停在原会话，稍后重试', 'failed');
         await deps.sleep(pollMs);
         continue;
       }
@@ -285,10 +357,7 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
       break;
     }
     if (++recoverMisses >= RECOVERY_LIMIT || over()) {
-      const scope = pending
-        ? `原会话 ${pending} 里都没有找到本轮标记（${marker}）`
-        : `会话列表与最近会话里都没有找到本轮标记（${marker}；列表 ${String(r?.listed ?? '?')} 条，核对 ${String(r?.probed ?? '?')} 条）`;
-      return blocked(`Devin Cloud 上一轮发送可能已按下，但${scope}。无法确认是否已受理，所以未自动重发（避免重复会话与席位）。请人工核对 app.devin.ai ${pending ? '原会话' : '会话列表'}：已受理则在原会话里看结果，未受理再由老板决定是否重派。在途状态已保留。`);
+      return blocked(`Devin Cloud 上一轮发送可能已按下，但没能核对到本轮标记（${marker}）。无法确认是否已受理，所以未自动重发（避免重复会话与席位）。请人工核对${pending ? '原会话' : '会话列表'}：已受理则在原会话里看结果，未受理再由老板决定是否重派。在途状态已保留。`);
     }
     deps.progress(`Devin Cloud 受理核对中（${marker}），暂未见本轮标记`, 'failed');
     await deps.sleep(pollMs);
@@ -308,8 +377,8 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
       // 的 location.href 与目标不一致）：不采信这次读数，按「没看到本轮标记」累计未受理计次，绝不把停错的
       // 那个会话内容当本轮终稿，也绝不重发。
       if (++misses >= MARKER_MISS_LIMIT)
-        return blocked(`Devin 页面没能停在本轮轮询的会话地址上（当前 ${String(s?.url ?? '未知')}，目标 ${sessionUrl}），无法确认是否受理。未重发（避免重复发送），在途状态已保留。请人工核对会话 ${sessionUrl}，确认后恢复本任务即可。`);
-      deps.progress(`Devin Cloud 页面不在预期会话，重试中（当前 ${String(s?.url ?? '未知')}）`, 'failed');
+        return blocked(`Devin 页面没能停在本轮轮询的会话地址上，无法确认是否受理。未重发（避免重复发送），在途状态已保留。请人工核对原会话，确认后恢复本任务即可。`);
+      deps.progress('Devin Cloud 页面不在预期会话，重试中', 'failed');
     } else if (s?.ok === true) {
       const status = String(s.status ?? 'unknown');
       const answer = typeof s.done === 'string' && s.done.trim() ? s.done.trim() : undefined;
@@ -325,15 +394,43 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
       // 只有已核验本轮用户锚点（seen）后的 blocked，或上述等待指示里的显式只读请求，才可能代跑；
       // 来源只取本轮锚点之后的 Devin 作者块。
       if ((status === 'blocked' && seen) || idleRelay) {
-        const tail = String(s.tail ?? '').slice(-400);
         const waiting = status === 'idle' ? 'Devin 等待指示' : 'Devin 停下来等待人工输入';
         const used = state.devin?.assistRounds ?? 0;
         const pending = state.devin?.attempt;
         if (pending)
-          return blocked(`${waiting}；上一轮本地代跑回传（${pending}）尚未确认，本轮只核对不重发、不再代跑，需老板裁决：${tail}`);
-        if (used < 3 && deps.assist && agentTail.trim()) {
+          return blocked(`${waiting}；上一轮本地代跑回传（${pending}）尚未确认，本轮只核对不重发、不再代跑，需老板裁决。`);
+        // 回传正文的请求身份：绑定公司任务、阶段、原会话与当前可信 Devin 请求；请求语义一致但页面尾串变化
+        // 仍复用同一份正文，工具或参数变了才丢弃重做。恢复（含换员工目录/新投递键）后不会再次执行同一工具。
+        const phase: 'doing' | 'review' = material.review ? 'review' : 'doing';
+        const sessionKey = String(sessionUrl).split(/[?#]/)[0];
+        const trusted = idleRelay ?? explicitReadonlyOpsRequest(agentTail);
+        const requestKey = trusted
+          ? `ops ${trusted.tool} ${stableJson(trusted.args)}`
+          : `tail ${agentTail.replace(/\s+/g, ' ').trim()}`;
+        const binding = { task: state.task, phase, session: sessionKey,
+          anchor: relayAnchor({ task: state.task, phase, session: sessionKey }, requestKey) };
+        if (state.devin?.assistRelay && !relayBoundTo(state.devin.assistRelay, binding)) {
+          delete state.devin.assistRelay;
+          persist();
+        }
+        const saved = relayBoundTo(state.devin?.assistRelay, binding) ? state.devin!.assistRelay : undefined;
+        const canProduce = used < 3 && deps.assist !== undefined && agentTail.trim() !== '';
+        if (!saved && !canProduce) return blocked(`${waiting}，需要老板在会话里答复（本轮未代跑、未发送）。`);
+        // 发送不是幂等的，代跑还会消耗真实只读工具调用：先在原 Free 会话与组织首页核可发条件（只读、不填写、
+        // 不按发送）。已知满座/未就绪/错会话/非 Free/未登录时不执行任何代跑工具，也不发送。
+        const gate = await browse(devinRelayGateScript(sessionUrl, saved?.marker ?? marker, home), 150_000) as Reply;
+        if (gate?.code === 'login_required') return loginFail();
+        if (gate?.ok !== true) {
+          readSeats('follow', gate);
+          persist();
+          return blocked(`${waiting}，本轮未代跑、未发送：${relayReason(gate?.code, gate?.seats)}。已在调用只读工具之前核对可发条件；席位或页面恢复后恢复本任务即可，会先核对原会话再回执，不会重复执行同一工具，也不另建会话。`);
+        }
+        readSeats('follow', gate);
+        persist();
+        let relay = saved;
+        if (!relay) {
           deps.progress(`Devin 等待输入，尝试本地代跑协助（第 ${used + 1}/3 轮）`);
-          const assist = await deps.assist({
+          const assist = await deps.assist!({
             provider: input.provider,
             phase: material.review ? 'review' : 'doing',
             transcriptTail: agentTail,
@@ -346,45 +443,62 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
               + `${assist.toolExecuted ? `，工具 ${assist.toolExecuted}` : ''}；仅为本地代跑，不代表云端获得账号或远程登录能力）：\n${assist.message.trim()}\n\n`
               + `请依据上述结果继续本轮工作。收尾约定：本轮的最后一条答复以「[SCK-DONE ${followMarker}]」单独成行开头，随后是完整最终答复。\n`;
             const at = deps.now();
-            // 发送前先落盘：轮数与 attempt 一起持久化（本目录 + 共享登记），未确认时恢复只核对、零重发。
-            state.devin = { ...state.devin, assistRounds: nextRound, attempt: followMarker, attemptAt: at, attemptSession: sessionUrl };
-            recordInflightAttempt(input.stateRoot, input.provider, ctx.key, followMarker, at, sessionUrl, state.task, nextRound);
+            // 回传正文先落盘：即使检查与发送之间席位被占、这次发不出去，恢复（含换员工目录/新投递键）时
+            // 也复用这份结果，不再次执行工具。binding 记录原任务、阶段与原会话，恢复时再核对。
+            relay = { anchor: binding.anchor, marker: followMarker, round: nextRound, text: followText,
+              ...(assist.toolExecuted ? { tool: assist.toolExecuted } : {}), at,
+              task: binding.task, phase: binding.phase, session: binding.session };
+            state.devin = { ...state.devin, assistRounds: nextRound, assistRelay: relay };
             persist();
-            const r = await browse(devinFollowScript(sessionUrl, followMarker, followText, home), 150_000) as Reply;
-            const url = sessionOf(r?.url) ?? sessionOf(r?.recovered);
-            const offTarget = url !== undefined && !sameSession(url, sessionUrl);
-            const accepted = r?.ok === true && url !== undefined && !offTarget;
-            const pressed = r?.ok === true || r?.code === 'pressed' || r?.code === 'not_echoed';
-            if (accepted) {
-              marker = followMarker;
-              state.taskId = followMarker;
-              state.submittedAt = at;
-              state.taskUrl = url!;
-              state.vendorSession = url!;
-              dropLocalAttempt(); forgetAttemptSession();
-              persist();
-              settled = undefined; misses = 0; idleNoDone = 0;
-              deps.progress(`本地代跑结果已回传原会话（${followMarker}），继续轮询`, 'accepted');
-              continue;
-            }
-            // 未回显：attempt 与轮数保持落盘，恢复时只核对这条 attempt，绝不重发或再次代跑。
-            if (pressed) persist();
-            else { abandonAttempt(); persist(); }
-            return blocked(`${waiting}，本地代跑结果未能确认回传原会话（第 ${nextRound} 轮，未重发）：${tail}`);
-          }
-          // escalate 或无可用回复：落盘已用轮数后交老板
-          if (assist.decision === 'escalate') {
+          } else if (assist.decision === 'escalate') {
             state.devin = { ...state.devin, assistRounds: used + 1 };
             persist();
-            return blocked(`${waiting}，本地协助转交老板（${assist.reason ?? '无可用协助'}）：${tail}`);
+            return blocked(`${waiting}，本地协助转交老板裁决（本轮未代跑、未发送）。`);
           }
         }
-        return blocked(`${waiting}，需要老板在会话里答复：${tail}`);
+        if (relay) {
+          const at = deps.now();
+          // 发送前先落盘：attempt、轮数与回传正文一起持久化（本目录 + 共享登记），未确认时恢复只核对、
+          // 零重发、不再执行工具。
+          state.devin = { ...state.devin, attempt: relay.marker, attemptAt: at, attemptSession: sessionUrl, assistRelay: relay };
+          recordInflightAttempt(input.stateRoot, input.provider, ctx.key, relay.marker, at, sessionUrl, state.task, relay.round);
+          persist();
+          const r = await browse(devinFollowScript(sessionUrl, relay.marker, relay.text, home), 150_000) as Reply;
+          const url = sessionOf(r?.url) ?? sessionOf(r?.recovered);
+          const offTarget = url !== undefined && !sameSession(url, sessionUrl);
+          const accepted = r?.ok === true && url !== undefined && !offTarget;
+          // 只有发送前固定拒绝码能证明没碰发送按钮；其余（无回执、不可解析、未知 code、pressed/not_echoed）
+          // 都可能已经按下，不能撤销意图。
+          const refusedBeforeSend = r?.ok !== true && typeof r?.code === 'string' && PRE_SEND_REFUSALS.has(r.code);
+          if (accepted) {
+            marker = relay.marker;
+            state.taskId = relay.marker;
+            state.submittedAt = at;
+            state.taskUrl = url!;
+            state.vendorSession = url!;
+            if (state.devin) delete state.devin.assistRelay;
+            dropLocalAttempt(); forgetAttemptSession();
+            persist();
+            settled = undefined; misses = 0; idleNoDone = 0;
+            deps.progress(`本地代跑结果已回传原会话（${relay.marker}），继续轮询`, 'accepted');
+            continue;
+          }
+          if (refusedBeforeSend) {
+            // 已证明发送前拒绝：撤销发送意图（回传正文保留，恢复后核对可发条件即可重试），不重复执行工具。
+            abandonAttempt(); persist();
+            return blocked(`${waiting}，本地代跑结果未发出（第 ${relay.round} 轮）：${relayReason(r?.code, r?.seats)}。恢复本任务会重新核对原会话后再回传，不重复执行同一工具。`);
+          }
+          // 结果不可判读：可能已按下。attempt、轮数与回传正文保持落盘（本目录与共享登记），恢复时只核对这条
+          // attempt，绝不重发、不再执行工具。
+          persist();
+          return blocked(`${waiting}，本地代跑结果未能确认回传原会话（第 ${relay.round} 轮）；发送意图已保留，恢复时只核对不重发、不再执行工具。`);
+        }
+        return blocked(`${waiting}，需要老板在会话里答复（本轮未代跑、未发送）。`);
       }
       // 不工作时看不到本轮标记：转录里没有受理。连续确认后受阻交人工核对；绝不重发，在途状态保留。
       if (status !== 'working' && !seen) {
         if (++misses >= MARKER_MISS_LIMIT)
-          return blocked(`Devin 会话的转录里一直找不到本轮消息（${marker}），无法确认是否受理。未重发（避免重复发送），在途状态已保留。请人工核对会话 ${sessionUrl}，确认后恢复本任务即可。`);
+          return blocked(`Devin 会话的转录里一直找不到本轮消息（${marker}），无法确认是否受理。未重发（避免重复发送），在途状态已保留。请人工核对原会话，确认后恢复本任务即可。`);
       } else misses = 0;
       // 终稿只认「会话已 idle 且本轮标记可见」的回答；unknown 状态不收尾。连续两次读数一致才收尾，防半截答复。
       if (status === 'idle' && seen && answer) {
@@ -402,7 +516,7 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
             const objective = await objectiveCloseout(ctx, String(s.tail ?? '').slice(-2000));
             if (objective) return objective;
           }
-          return blocked(`Devin 已停止但没有按约定以「[SCK-DONE ${marker}]」开头给出终稿，请人工核对会话：${String(s.tail ?? '').slice(-400)}`);
+          return blocked(`Devin 已停止但没有按约定以「[SCK-DONE ${marker}]」开头给出终稿，请人工核对原会话。`);
         }
       }
       deps.progress(status === 'working' ? `Devin Cloud 工作中（${marker}）`
@@ -412,7 +526,7 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
     if (over())
       // 会话早已受理（state.taskId 已定），超时不是供应商崩溃或额度故障：按受阻收尾并保留会话地址与在途
       // 标记，恢复时只回原会话继续轮询，绝不重发；不按硬错误收尾，避免被上层当成空交付回收成 silent-turn。
-      return blocked(`Devin Cloud 会话 ${sessionUrl} 超过配置时限仍未给出终稿（标记 ${marker}），会话可能仍在运行；恢复本任务将回到原会话继续等待，不会重发`);
+      return blocked(`Devin Cloud 会话超过配置时限仍未给出终稿（标记 ${marker}），会话可能仍在运行；恢复本任务将回到原会话继续等待，不会重发`);
   }
 }
 
