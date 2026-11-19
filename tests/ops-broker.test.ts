@@ -2448,4 +2448,100 @@ describe('ops 测试夹具', () => {
     expect(JSON.stringify(csv)).not.toContain(sampleFile(r, id));
     expectNoLeaks(r);
   });
+
+  test('同阶段 retryable 退避期间撤权：第二次外部写不得发出', async () => {
+    const r = fixtureRig();
+    let firstPostSeen = false;
+    let sleepEntered!: () => void;
+    const sleepGate = new Promise<void>(resolve => { sleepEntered = resolve; });
+    const sleepHold: Array<() => void> = [];
+    const original = r.world.fetch;
+    r.broker = new OpsBroker({
+      core: r.company.core, projects: r.company.projects as never, secretKey: () => Buffer.alloc(32),
+      controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
+      fetch: async (input, init) => {
+        const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url);
+        const method = (init?.method ?? 'GET').toUpperCase();
+        if (method === 'POST' && url.pathname === '/api/workspaces') {
+          if (!firstPostSeen) {
+            firstPostSeen = true;
+            r.world.requests.push({ method, url: url.toString() });
+            throw new CompanyError('upstream_error', 'workspace create temporarily unavailable', true);
+          }
+        }
+        return original(input as never, init);
+      },
+      now: r.world.now, d1: () => r.world.d1, queryAsUser: r.world.queryAsUser, browser: r.world.browser,
+      sleep: async ms => {
+        if (sleepHold.length === 0) {
+          await new Promise<void>(resolve => {
+            sleepHold.push(resolve);
+            sleepEntered();
+          });
+        }
+        r.world.clock += ms;
+      },
+      ...r.paths,
+    });
+    const callPromise = call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    await sleepGate;
+    const postsBefore = r.world.requests.filter(q => q.method === 'POST' && new URL(q.url).pathname === '/api/workspaces').length;
+    expect(postsBefore).toBe(1);
+    r.company.endLease('qa-1');
+    sleepHold[0]!();
+    const error = await failure(callPromise);
+    const postsAfter = r.world.requests.filter(q => q.method === 'POST' && new URL(q.url).pathname === '/api/workspaces').length;
+    expect(postsAfter).toBe(1);
+    expect(error.code).toBe('forbidden');
+    expect(error.message).toMatch(/复查租约失败|阶段=workspace/);
+    expect(r.world.browserLogins).toHaveLength(0);
+    expect(existsSync(sampleFile(r))).toBe(false);
+  });
+
+  test('同阶段 retryable 退避期间 fence 变化：第二次外部写不得发出', async () => {
+    const r = fixtureRig();
+    let firstPostSeen = false;
+    let sleepEntered!: () => void;
+    const sleepGate = new Promise<void>(resolve => { sleepEntered = resolve; });
+    const sleepHold: Array<() => void> = [];
+    const original = r.world.fetch;
+    r.broker = new OpsBroker({
+      core: r.company.core, projects: r.company.projects as never, secretKey: () => Buffer.alloc(32),
+      controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
+      fetch: async (input, init) => {
+        const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url);
+        const method = (init?.method ?? 'GET').toUpperCase();
+        if (method === 'POST' && url.pathname === '/api/workspaces') {
+          if (!firstPostSeen) {
+            firstPostSeen = true;
+            r.world.requests.push({ method, url: url.toString() });
+            throw new CompanyError('upstream_error', 'workspace create temporarily unavailable', true);
+          }
+        }
+        return original(input as never, init);
+      },
+      now: r.world.now, d1: () => r.world.d1, queryAsUser: r.world.queryAsUser, browser: r.world.browser,
+      sleep: async ms => {
+        if (sleepHold.length === 0) {
+          await new Promise<void>(resolve => {
+            sleepHold.push(resolve);
+            sleepEntered();
+          });
+        }
+        r.world.clock += ms;
+      },
+      ...r.paths,
+    });
+    const callPromise = call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    await sleepGate;
+    // 同员工同任务重新认领 → fence 递增，旧调用的 beforeAttempt 必须拦下第二次写。
+    r.company.endLease('qa-1');
+    r.company.lease('qa-1', 'qa', 'task-1');
+    sleepHold[0]!();
+    const error = await failure(callPromise);
+    const postsAfter = r.world.requests.filter(q => q.method === 'POST' && new URL(q.url).pathname === '/api/workspaces').length;
+    expect(postsAfter).toBe(1);
+    expect(error.code).toBe('forbidden');
+    expect(error.message).toMatch(/租约代际已变化|复查租约失败/);
+  });
 });

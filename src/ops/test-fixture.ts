@@ -206,6 +206,8 @@ export type FixtureStageOutcome<T> =
  * 固定次数的阶段执行器：`work()` 本身受预算限制。
  * - 真实挂起：用原生定时器在期限到达时停止等待（不取消已发出的外部写）。
  * - 假时钟：work 自己把 now 推过期限再返回时，完成后的 elapsed 检查仍判为 timed_out。
+ * - `beforeAttempt`：每一次尝试（含退避后的重试）在调用 work 前执行；撤权/换代际在此拦下，
+ *   不得再发新的外部写。权限未变时，既有可安全重试流程与期限保持不变。
  * 超时不得等同“未写入”：调用方必须按事实核对并在台账上标记 uncertain，禁止盲重试。
  * 故障预算仍在 OpsBroker 外层。
  */
@@ -213,6 +215,7 @@ export async function runFixtureStage<T>(
   stage: FixtureStage,
   work: () => Promise<T>,
   clocks: { now: () => number; sleep: (ms: number) => Promise<void> },
+  beforeAttempt?: () => Promise<void>,
 ): Promise<FixtureStageOutcome<T>> {
   const budget = FIXTURE_STAGE_BUDGET_MS[stage];
   const started = clocks.now();
@@ -222,6 +225,14 @@ export async function runFixtureStage<T>(
   for (let attempt = 1; attempt <= FIXTURE_STAGE_ATTEMPTS; attempt++) {
     attempts = attempt;
     if (clocks.now() - started >= budget) break;
+
+    try {
+      if (beforeAttempt) await beforeAttempt();
+    } catch (error) {
+      // 撤权/换代际：不再发起本轮及后续 work()；已发出且结果不明的写由调用方按 uncertain 收尾。
+      last = error;
+      break;
+    }
 
     let timer: ReturnType<typeof setTimeout> | undefined;
     const remaining = Math.max(1, budget - (clocks.now() - started));

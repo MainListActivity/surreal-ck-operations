@@ -2246,7 +2246,11 @@ export class OpsBroker {
         };
         journal.put(live);
       }
-      const outcome = await runFixtureStage(name, work, { now: this.monoNow, sleep: this.sleep });
+      // 每一次尝试（含退避后的重试）在 work 前复查租约/代际；撤权后不得再发新的外部写。
+      const outcome = await runFixtureStage(
+        name, work, { now: this.monoNow, sleep: this.sleep },
+        () => this.assertFixtureLive(ctx, credential, fence, name),
+      );
       if (outcome.status === 'ok') {
         if (opts.write) {
           const uncertain = { ...(live.uncertain ?? {}) };
