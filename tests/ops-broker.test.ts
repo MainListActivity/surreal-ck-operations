@@ -2182,6 +2182,8 @@ describe('ops 测试夹具', () => {
     expect(error.message).toContain('account=retained');
     expect(error.message).toContain('sample=not_created');
     expect(error.message).toContain('session=1 个已丢弃');
+    expect(error.message).toContain('elapsed=');
+    expect(r.world.requests.filter(q => q.method === 'POST' && new URL(q.url).pathname === '/api/workspaces')).toHaveLength(2);
     expect(r.world.user(id.username)).toBeDefined();
     expect(r.world.workspaces.size).toBe(0);
     expect(existsSync(sampleFile(r, id))).toBe(false);
@@ -2204,6 +2206,19 @@ describe('ops 测试夹具', () => {
     const r = fixtureRig({ roles: ['engineering'] });
     const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }));
     expect(error.code).toBe('forbidden');
+    expect(r.world.requests).toHaveLength(0);
+    expect(userCount(r)).toBe(0);
+  });
+
+  test('工具不接受项目、任务、workspace 或路径覆盖，不能借一次调用扩大授权', async () => {
+    const r = fixtureRig();
+    for (const args of [
+      { alias: 'demo', project: 'other' },
+      { alias: 'demo', taskId: 'other-task' },
+      { alias: 'demo', workspace: 'someone-else' },
+      { alias: 'demo', slug: 'real-space' },
+      { alias: 'demo', path: '/tmp/elsewhere' },
+    ]) expect((await failure(call(r, 'ops_test_fixture_ready', args))).code).toBe('invalid');
     expect(r.world.requests).toHaveLength(0);
     expect(userCount(r)).toBe(0);
   });
