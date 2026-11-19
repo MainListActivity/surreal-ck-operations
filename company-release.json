@@ -1,5 +1,5 @@
 {
-  "version": "0.13.62",
+  "version": "0.13.63",
   "title": "测试夹具就绪：按任务隔离的账号、workspace 与合成样本",
   "changes": [
     "新增只读准备入口 ops_test_fixture_ready：仅工程/QA 在真实任务租约内可调用，按 project/env/task/alias 派生测试专用账号、workspace 与三条本机合成样本。",
