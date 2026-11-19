@@ -192,6 +192,18 @@ function parseExplicitOpsRequest(transcriptTail: string, phase: 'doing' | 'revie
   return { kind: 'tool_relay', tool: tool as StewardRelayOpsTool, args: (last.args as Record<string, unknown> | undefined) ?? {}, explicit: true };
 }
 
+/**
+ * 本轮可信作者块里最后一条显式 [OPS-REQUEST] 是否为允许自动代跑的只读请求。
+ * 云端「等待指示」只有在作者块里出现这种请求时才进入既有中继：写/建类、非白名单、损坏 JSON、
+ * 缺 tool 或 args 非对象一律返回 undefined，交回原有判定（不在无授权时扩大代跑面）。
+ */
+export function explicitReadonlyOpsRequest(transcriptTail: string):
+  { tool: StewardRelayOpsTool; args: Record<string, unknown> } | undefined {
+  const parsed = parseExplicitOpsRequest(transcriptTail, 'doing');
+  if (parsed?.kind !== 'tool_relay' || parsed.explicit !== true || !READONLY.has(parsed.tool)) return undefined;
+  return { tool: parsed.tool, args: parsed.args };
+}
+
 function parseAssistJson(raw: string): StewardAssistOutcome | undefined {
   try {
     const value = JSON.parse(raw.replace(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i, '$1')) as Record<string, unknown>;

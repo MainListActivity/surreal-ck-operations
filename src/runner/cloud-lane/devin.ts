@@ -15,6 +15,7 @@
 import { ensureBranchOnOrigin, fetchAndFastForward, type RepoInfo } from './repo.ts';
 import { clearInflightAttempt, laneDigest, recordInflight, recordInflightAttempt, writeLaneState, type DevinSeatReading, type LaneState } from './state.ts';
 import { devinFollowScript, devinRecoverScript, devinSendScript, devinSessionScript, DEVIN_HOME, DEVIN_SESSION_RE } from './devin-web.ts';
+import { explicitReadonlyOpsRequest } from '../../steward/steward.ts';
 import type { LaneDeps, LaneInput } from './lane.ts';
 
 /** Devin 云模式的免费模型。公司派工只允许它（老板 2026-11-15 定），不是可覆盖的默认值。 */
@@ -313,14 +314,23 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
       const status = String(s.status ?? 'unknown');
       const answer = typeof s.done === 'string' && s.done.trim() ? s.done.trim() : undefined;
       const seen = s.markerSeen === true;
-      // 只有已核验本轮用户锚点（seen）后的 blocked 才可能代跑；来源只取本轮锚点之后的 Devin 作者块。
-      if (status === 'blocked' && seen) {
+      const agentTail = typeof s.agentTail === 'string' ? s.agentTail : '';
+      // 等待指示（idle）且还没有终稿：只有本轮锚点之后的可信 Devin 作者块里带显式、语法正确且明确允许的
+      // 只读 OPS-REQUEST 时才进入既有本地代跑中继（真实任务 504de3c3：发出结构化请求后页面显示 awaiting
+      // instructions，原先按 idle 判终稿缺失、中继从未触发）。普通 idle、请求只在正文/工具输出、旧轮、
+      // 缺锚点、错会话（上面已拦）、非 Free 档位、写/建类越权与已达轮数上限都不触发，维持原判定；
+      // 已判出终稿时终稿优先，不代跑。判定只读 agentTail，不拿网页整段 tail 判作者。
+      const idleRelay = status === 'idle' && !answer && seen && s.cap === 'Free'
+        ? explicitReadonlyOpsRequest(agentTail) : undefined;
+      // 只有已核验本轮用户锚点（seen）后的 blocked，或上述等待指示里的显式只读请求，才可能代跑；
+      // 来源只取本轮锚点之后的 Devin 作者块。
+      if ((status === 'blocked' && seen) || idleRelay) {
         const tail = String(s.tail ?? '').slice(-400);
+        const waiting = status === 'idle' ? 'Devin 等待指示' : 'Devin 停下来等待人工输入';
         const used = state.devin?.assistRounds ?? 0;
         const pending = state.devin?.attempt;
         if (pending)
-          return blocked(`Devin 停下来等待人工输入；上一轮本地代跑回传（${pending}）尚未确认，本轮只核对不重发、不再代跑，需老板裁决：${tail}`);
-        const agentTail = typeof s.agentTail === 'string' ? s.agentTail : '';
+          return blocked(`${waiting}；上一轮本地代跑回传（${pending}）尚未确认，本轮只核对不重发、不再代跑，需老板裁决：${tail}`);
         if (used < 3 && deps.assist && agentTail.trim()) {
           deps.progress(`Devin 等待输入，尝试本地代跑协助（第 ${used + 1}/3 轮）`);
           const assist = await deps.assist({
@@ -360,16 +370,16 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
             // 未回显：attempt 与轮数保持落盘，恢复时只核对这条 attempt，绝不重发或再次代跑。
             if (pressed) persist();
             else { abandonAttempt(); persist(); }
-            return blocked(`Devin 停下来等待人工输入，本地代跑结果未能确认回传原会话（第 ${nextRound} 轮，未重发）：${tail}`);
+            return blocked(`${waiting}，本地代跑结果未能确认回传原会话（第 ${nextRound} 轮，未重发）：${tail}`);
           }
           // escalate 或无可用回复：落盘已用轮数后交老板
           if (assist.decision === 'escalate') {
             state.devin = { ...state.devin, assistRounds: used + 1 };
             persist();
-            return blocked(`Devin 停下来等待人工输入，本地协助转交老板（${assist.reason ?? '无可用协助'}）：${tail}`);
+            return blocked(`${waiting}，本地协助转交老板（${assist.reason ?? '无可用协助'}）：${tail}`);
           }
         }
-        return blocked(`Devin 停下来等待人工输入，需要老板在会话里答复：${tail}`);
+        return blocked(`${waiting}，需要老板在会话里答复：${tail}`);
       }
       // 不工作时看不到本轮标记：转录里没有受理。连续确认后受阻交人工核对；绝不重发，在途状态保留。
       if (status !== 'working' && !seen) {

@@ -179,6 +179,22 @@ test('message.draft 将任务/样本传给 Steward，只更新未发草稿且保
   await expect(ownerApi(w.ctx, { command: 'message.draft', taskId: 't1', step: 'execute' }, 'test')).rejects.toThrow('unsent draft');
 });
 
+test('explicitReadonlyOpsRequest 只放行显式且白名单内的只读请求', async () => {
+  const { explicitReadonlyOpsRequest } = await import('../src/steward/steward.ts');
+  expect(explicitReadonlyOpsRequest('先查一下\n[OPS-REQUEST] {"tool":"ops_health","args":{"env":"staging"}}\n等结果'))
+    .toEqual({ tool: 'ops_health', args: { env: 'staging' } });
+  // 写/建类、非白名单、损坏 JSON、缺 tool、args 非对象都不算可自动代跑的只读请求
+  for (const bad of [
+    '[OPS-REQUEST] {"tool":"ops_account_ensure","args":{"alias":"A"}}',
+    '[OPS-REQUEST] {"tool":"ops_d1_exec","args":{}}',
+    '[OPS-REQUEST] {"tool":',
+    '[OPS-REQUEST] {"args":{}}',
+    '[OPS-REQUEST] {"tool":"ops_health","args":[]}',
+    '[OPS-REQUEST] {"tool":"ops_health","args":{}}\n[OPS-REQUEST] {"tool":"ops_login","args":{"alias":"A"}}',
+  ]) expect(explicitReadonlyOpsRequest(bad)).toBeUndefined();
+  expect(explicitReadonlyOpsRequest('没有任何请求')).toBeUndefined();
+});
+
 test('assistLane 显式 OPS-REQUEST 白名单确定性代跑；非白名单硬拦截', async () => {
   const m = model('{}');
   const ok = await m.steward.assistLane({
