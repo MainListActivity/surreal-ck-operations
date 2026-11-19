@@ -1908,8 +1908,8 @@ export class SurrealCompanyCore implements CompanyCore {
   async opsScope(credential: Credential, taskId: TaskId, proof?: { grantId: string; grantFence: number }): Promise<OpsScope> {
     const actor = await this.authorized(credential);
     requireText(taskId, 'task', 1, 200);
-    const [rows] = await this.db.query<[Array<{ current_employee?: string; state: TaskState; lease_expires_at?: number; project?: RecordId }>]>(
-      'SELECT current_employee, state, lease_expires_at, project FROM $task;', { task: id('task', taskId) });
+    const [rows] = await this.db.query<[Array<{ current_employee?: string; state: TaskState; lease_expires_at?: number; fence?: number; project?: RecordId }>]>(
+      'SELECT current_employee, state, lease_expires_at, fence, project FROM $task;', { task: id('task', taskId) });
     const task = rows[0];
     if (!task) throw new CompanyError('not_found', 'Task not found');
     const project = task.project;
@@ -1918,7 +1918,7 @@ export class SurrealCompanyCore implements CompanyCore {
       (task.lease_expires_at ?? 0) <= Date.now() / 1000) {
       throw new CompanyError('forbidden', 'Ops tools are only available to the current lease holder of the task');
     }
-    return { actor, taskId, project: String(project.id) };
+    return { actor, taskId, project: String(project.id), leaseFence: Number(task.fence ?? 0) };
   }
 
   async auditOps(scope: OpsScope, action: string, evidence: string): Promise<void> {

@@ -7,9 +7,9 @@ import {parsePlatformOperatorsView} from './platform-operators.ts';
 // Cloudflare token) performs it, and only a secret-free result goes back. Every call is gated
 // on the caller's live task lease, role-checked against the project environment, and audited.
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import type { CompanyCore, OpsScope } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
 import { faultFactsOf, type FaultPhase, type FaultRefund, type FaultTargetKind } from '../faults.ts';
@@ -48,6 +48,10 @@ import { SUPPLIER_ADAPTER, SUPPLIER_PROVIDER, SUPPLIER_SERVICE, sampleSupplierPl
 import { MAGPIE_ADAPTER, MAGPIE_PROVIDER, magpieWindowFromEvidence, sampleMagpieRoute } from './magpie.ts';
 import { MAGPIE_RESTORE_ALIAS, planMagpieRouteRestore } from './magpie-restore.ts';
 import { loadProofFiles, readProofFile } from './proof-files.ts';
+import {
+  FixtureJournal, FixtureStageError, fixtureIdentity, fixtureSample, fixtureSampleCsv, fixtureSamplePath, FIXTURE_ROLES,
+  runFixtureCheck, runFixtureStage, type FixtureIdentity, type FixtureRecord, type FixtureStage,
+} from './test-fixture.ts';
 import { MAGPIE_EXECUTION_HEADROOM_SECONDS, MAGPIE_SNAPSHOT_MAX_AGE_SECONDS } from './proof-contract.ts';
 import { clip, redactJson, redactText } from './redact.ts';
 import { SessionStore, type OpsSession } from './sessions.ts';
@@ -78,7 +82,7 @@ export const OPS_TOOLS = [
   'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_principal_list', 'ops_idp_admin_request',
   'ops_idp_provision_rotate', 'ops_invitation_issue',
   'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_approval_diagnose', 'ops_internal_ai_deliver', 'ops_internal_ai_revoke', 'ops_internal_ai_trust', 'ops_internal_ai_rotate_key',
-  'ops_supplier_plan_sample', 'ops_product_magpie_observe', 'ops_product_magpie_candidate', 'ops_magpie_route_sample', 'ops_magpie_route_restore', 'ops_magpie_window_prepare', 'ops_product_magpie_price_approve', 'ops_platform_operator_list', 'ops_product_pulse', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs', 'ops_release_diagnose',
+  'ops_supplier_plan_sample', 'ops_product_magpie_observe', 'ops_product_magpie_candidate', 'ops_magpie_route_sample', 'ops_magpie_route_restore', 'ops_magpie_window_prepare', 'ops_product_magpie_price_approve', 'ops_platform_operator_list', 'ops_product_pulse', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs', 'ops_release_diagnose', 'ops_test_fixture_ready',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
 
@@ -132,6 +136,10 @@ export interface OpsDeps {
    * pending cleanup — never claimed as closed. The closer must not expose a token.
    */
   closeBrowserSpace?: (input: { employeeId: string; spaceId: number }) => Promise<void>;
+  /** Test seam: the local test-fixture journal. Production keeps it next to the other broker state. */
+  fixtureJournalPath?: string;
+  /** Test seam: the directory synthetic fixture samples are written into. */
+  fixtureDir?: string;
 }
 
 /** What a lease-end cleanup actually did. Counts only, never a token or a URL. */
@@ -352,6 +360,10 @@ export class OpsBroker {
   private readonly remoteObservations = new Map<string, TrustedRecord>();
   /** Price approvals this broker process recorded. The window trusts only these, never the evidence files. */
   private readonly remotePriceApprovalRecords: PriceApproval[] = [];
+  /** 测试夹具在同一进程内的串行锁：同名夹具的并发调用只有一条创建链。 */
+  private readonly fixtureLocks = new Map<string, Promise<unknown>>();
+  /** 每个夹具本次进程打开的会话句柄，只用于回收本夹具自己开的会话（不是远端注销）。 */
+  private readonly fixtureSessions = new Map<string, { employeeId: string; sessions: Set<string> }>();
 
   constructor(private readonly deps: OpsDeps) {
     this.now = deps.now ?? Date.now;
@@ -418,6 +430,7 @@ export class OpsBroker {
       ops_origin_health: (ctx) => this.origin(ctx, { op: 'health' }),
       ops_origin_logs: (ctx, args) => this.origin(ctx, originLogsRequest(args)),
       ops_release_diagnose: (ctx, args) => this.releaseDiagnose(ctx, args),
+      ops_test_fixture_ready: (ctx, args) => this.testFixtureReady(ctx, args),
       ...Object.fromEntries(Object.keys(proofToolSchemas).map(tool => [tool, (ctx: Ctx, args: Args) => this.internalProof(ctx, tool as ProofTool, args)])) as Record<ProofTool, Handler>,
     };
   }
@@ -517,6 +530,9 @@ export class OpsBroker {
    */
   release(employeeId: string): OpsCleanupReport {
     const sessions = this.sessions.dropEmployee(employeeId);
+    for (const [key, entry] of this.fixtureSessions) {
+      if (entry.employeeId === employeeId) this.fixtureSessions.delete(key);
+    }
     const spaces = [...(this.browserSpaces.get(employeeId) ?? [])];
     this.browserSpaces.delete(employeeId);
     const scope = this.lastScope.get(employeeId);
@@ -2043,6 +2059,523 @@ export class OpsBroker {
       audit: {
         action: 'ops_magpie_window',
         evidence: `ops_magpie_window_prepare → ${result.eligible ? 'window-ready' : `blocked(${result.blockedReasons.join(',')})`} headroom=${result.headroomSeconds}s`,
+      },
+    };
+  }
+
+  // ---------- test fixtures ----------
+
+  private fixtureJournal(): FixtureJournal {
+    return new FixtureJournal(this.deps.fixtureJournalPath ?? join(this.serviceHome(), 'ops-fixtures.json'));
+  }
+
+  private fixtureRoot(): string {
+    return this.deps.fixtureDir ?? join(this.serviceHome(), 'fixtures');
+  }
+
+  /** 同一夹具的并发调用在进程内串行；名字确定，跨进程/重启由台账与产品自身的幂等承接。 */
+  private withFixtureLock<T>(key: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.fixtureLocks.get(key) ?? Promise.resolve();
+    const started = previous.catch(() => undefined).then(work);
+    this.fixtureLocks.set(key, started.catch(() => undefined));
+    return started;
+  }
+
+  private leaseFenceOf(scope: OpsScope): number {
+    return Number.isSafeInteger(scope.leaseFence) && (scope.leaseFence as number) >= 0 ? scope.leaseFence as number : 0;
+  }
+
+  /**
+   * 每个有副作用阶段前重新核验：租约仍活、角色仍被环境授权、fence 仍是本调用开始时的那一代。
+   * 覆盖执行中与排队期间的撤权；不确定写入不在此处重试。
+   */
+  private async assertFixtureLive(ctx: Ctx, credential: string | undefined, fence: number, stage: FixtureStage | 'preflight'): Promise<void> {
+    if (!credential) throw new CompanyError('forbidden', `测试夹具缺少凭证，无法复查租约（阶段=${stage}；可清理状态：未继续后续阶段）`);
+    let live: OpsScope;
+    try { live = await this.deps.core.opsScope(credential, ctx.scope.taskId); }
+    catch (error) {
+      const source = error instanceof CompanyError ? error : new CompanyError('forbidden', String((error as Error)?.message ?? error));
+      throw new CompanyError(source.code,
+        `${source.message}；测试夹具在阶段=${stage} 复查租约失败，停止后续阶段（可清理状态：已发出且落地状态不明的外部写只按幂等核对，不盲重试）`,
+        source.retryable);
+    }
+    if (live.actor.employeeId !== ctx.scope.actor.employeeId || live.project !== ctx.scope.project) {
+      throw new CompanyError('forbidden', `测试夹具租约主体已变化（阶段=${stage}；可清理状态：未继续后续阶段）`);
+    }
+    if (this.leaseFenceOf(live) !== fence) {
+      throw new CompanyError('forbidden', `测试夹具租约代际已变化（期望 fence=${fence}，当前=${this.leaseFenceOf(live)}；阶段=${stage}；可清理状态：未继续后续阶段，不回收旧租约资产）`);
+    }
+    if (!FIXTURE_ROLES.includes(live.actor.role)) {
+      throw new CompanyError('forbidden', `测试夹具角色 ${live.actor.role} 不再被授权（阶段=${stage}；可清理状态：未继续后续阶段）`);
+    }
+    // 环境角色列表仍是外层门禁：刷新 cfg 以防配置侧撤回。
+    const refreshed = await this.context(live, ctx.env);
+    if (!refreshed.cfg.roles.includes(live.actor.role)) {
+      throw new CompanyError('forbidden', `role ${live.actor.role} may not use ops tools on ${live.project}/${ctx.env}（阶段=${stage}；可清理状态：未继续后续阶段）`);
+    }
+    ctx.scope = live;
+    ctx.cfg = refreshed.cfg;
+    ctx.row = refreshed.row;
+  }
+
+  /**
+   * `ops_test_fixture_ready {alias, env?, browser?, action?, format?}`：为当前真实任务租约准备一套**测试专用**资产
+   * （账号登录、测试 workspace、小型合成样本，可选受控浏览器登录）；`action:"reclaim"` 只回收本租约代际台账里
+   * 由自己创建、且现在仍能确认归属的资产；`action:"read"` 经授权返回本租约样本内容（json/csv），不暴露本机路径。
+   *
+   * 只对工程/QA 开放；环境角色列表仍是外层门禁。资产名由 project/env/task/fence/alias 派生，台账是认领既有资产的
+   * 唯一依据：台账里没有的同名账号、空间或文件一律不认领、不覆盖、不删除。返回只有状态、不透明会话/样本句柄
+   * 与脱敏后的测试标识，任何 token 与密码都不离开 broker。
+   */
+  private async testFixtureReady(ctx: Ctx, args: Args): Promise<Outcome> {
+    const allowed = new Set(['env', 'alias', 'browser', 'action', 'format', 'handle']);
+    const extra = Object.keys(args).filter(key => !allowed.has(key));
+    if (extra.length) throw invalid(`ops_test_fixture_ready 不接受这些参数：${extra.join(', ')}`);
+    if (!FIXTURE_ROLES.includes(ctx.scope.actor.role)) {
+      throw new CompanyError('forbidden', `测试夹具只对工程/QA 开放（当前角色 ${ctx.scope.actor.role}）`);
+    }
+    const action = args.action === undefined ? 'ready' : args.action;
+    if (action !== 'ready' && action !== 'reclaim' && action !== 'read') throw invalid('action 只能是 ready、reclaim 或 read');
+    const requested = canonicalAlias(args.alias);
+    const browser = this.fixtureBrowserRequest(args.browser);
+    const fence = this.leaseFenceOf(ctx.scope);
+    const id = fixtureIdentity({
+      project: ctx.scope.project, env: ctx.env, taskId: ctx.scope.taskId, alias: requested,
+      accountPrefix: ctx.cfg.accounts.prefix, workspacePrefix: ctx.cfg.accounts.workspacePrefix,
+      leaseFence: fence,
+    });
+    return this.withFixtureLock(id.key, async () => {
+      if (action === 'reclaim') return this.reclaimFixture(ctx, id, fence);
+      if (action === 'read') return this.readFixture(ctx, id, fence, args);
+      return this.readyFixture(ctx, id, browser, fence);
+    });
+  }
+
+  private fixtureBrowserRequest(raw: unknown): { spaceId: number; page?: string } | undefined {
+    if (raw === undefined) return undefined;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw invalid('browser 必须是 {spaceId, page?} 对象');
+    const input = raw as Record<string, unknown>;
+    const extra = Object.keys(input).filter(key => key !== 'spaceId' && key !== 'page');
+    if (extra.length) throw invalid(`browser 不接受这些参数：${extra.join(', ')}`);
+    const spaceId = Number(input.spaceId);
+    if (!Number.isInteger(spaceId) || spaceId < 0) throw invalid('browser.spaceId 必须是你 ego-browser 任务空间的数字 id');
+    const page = input.page;
+    if (page !== undefined && (typeof page !== 'string' || !/^p\d{1,3}$/.test(page))) throw invalid('browser.page 必须是 p1 这样的页标签');
+    return { spaceId, ...(page === undefined ? {} : { page }) };
+  }
+
+  private fixtureOwnedBy(ctx: Ctx, record: FixtureRecord | undefined, fence: number): boolean {
+    return !!record && record.taskId === ctx.scope.taskId && record.employeeId === ctx.scope.actor.employeeId
+      && record.project === ctx.scope.project && record.env === ctx.env && record.leaseFence === fence;
+  }
+
+  /**
+   * 台账没有记录时，确认派生名在 IdP 里确实无人占用：已有密封密码或已有同名用户都说明这可能不是测试资产，
+   * 拒绝认领（不生成密码、不“修复”真实账号）。
+   */
+  private async fixtureNamesFree(ctx: Ctx, id: FixtureIdentity): Promise<void> {
+    if (await this.sealedPassword(ctx, id.alias)) {
+      throw new CompanyError('conflict',
+        `别名 ${id.alias} 已有密封凭据，但台账没有本任务的记录；拒绝把既有账号当测试账号（阶段=account；可清理状态：未创建任何资产）`);
+    }
+    if (!ctx.cfg.d1) {
+      throw new CompanyError('not_configured', `本环境没有 IdP 数据库配置，无法准备测试账号（阶段=account；可清理状态：未创建任何资产）`);
+    }
+    let d1: D1Client;
+    try { d1 = this.d1(ctx); }
+    catch (error) {
+      const source = error as CompanyError;
+      throw new CompanyError(source.code, `${source.message}（阶段=account；可清理状态：未创建任何资产）`, source.retryable);
+    }
+    const [existing] = await d1.query<{ id: string }>(
+      'SELECT id FROM users WHERE tenant_id = ? AND username = ? LIMIT 1', [ctx.cfg.d1.tenantId, id.username]);
+    if (existing) {
+      throw new CompanyError('conflict',
+        `用户名 ${id.username} 已存在，但台账没有本任务的记录；无法判定是测试资产，拒绝混用（阶段=account；可清理状态：未创建任何资产）`);
+    }
+  }
+
+  private newFixtureRecord(ctx: Ctx, id: FixtureIdentity, samplePath: string, fence: number): FixtureRecord {
+    const sample = fixtureSample(id);
+    return {
+      taskId: ctx.scope.taskId, employeeId: ctx.scope.actor.employeeId, project: ctx.scope.project, env: ctx.env,
+      leaseFence: fence, alias: id.alias, username: id.username, workspaceSlug: id.workspaceSlug, workspaceName: id.workspaceName,
+      samplePath, sampleHandle: sample.handle, sampleDigest: sample.digest,
+      created: { account: false, workspace: false, sample: false },
+      intent: { account: true, workspace: false, sample: false },
+      status: 'failed', updatedAt: new Date(this.now()).toISOString(),
+    };
+  }
+
+  private async readyFixture(ctx: Ctx, id: FixtureIdentity, browser: { spaceId: number; page?: string } | undefined, fence: number): Promise<Outcome> {
+    const journal = this.fixtureJournal();
+    let record = journal.get(id.key);
+    if (record && !this.fixtureOwnedBy(ctx, record, fence)) {
+      throw new CompanyError('forbidden',
+        `夹具 ${id.alias} 的台账属于另一租约（task ${record.taskId} / employee ${record.employeeId} / fence ${record.leaseFence}）；拒绝跨租约复用（阶段=preflight；可清理状态：未删除任何资产）`);
+    }
+    const sample = fixtureSample(id);
+    const samplePath = fixtureSamplePath(this.fixtureRoot(), id);
+    if (!record) {
+      await this.fixtureNamesFree(ctx, id);
+      record = this.newFixtureRecord(ctx, id, samplePath, fence);
+      journal.put(record);
+    }
+    let live: FixtureRecord = record;
+
+    const opened: string[] = [];
+    const stages: Array<{ stage: FixtureStage; status: 'ok' | 'timed_out'; elapsedMs: number }> = [];
+    let currentStage: FixtureStage | 'preflight' = 'preflight';
+    let accountMade = false;
+    let workspaceMade = false;
+    let sampleWritten = false;
+    const credential = ctx.credential;
+
+    const stage = async <T>(name: FixtureStage, work: () => Promise<T>, opts: { write?: 'account' | 'workspace' | 'sample'; startedAt?: number } = {}): Promise<T> => {
+      currentStage = name;
+      // 期限从本阶段入口（含首次授权复查）开始算，复查耗时不得游离在预算之外。
+      const startedAt = opts.startedAt ?? this.monoNow();
+      let marked = false;
+      const outcome = await runFixtureStage(
+        name, work, { now: this.monoNow, sleep: this.sleep },
+        {
+          startedAt,
+          // 每一次尝试（含退避后的重试）在 work 前复查租约/代际；撤权后不得再发新的外部写。
+          beforeAttempt: () => this.assertFixtureLive(ctx, credential, fence, name),
+          // 只有授权复查通过、即将发出写时才登记 uncertain；复查被拒时不留“未确认写”。
+          beforeWork: opts.write ? () => {
+            if (marked) return;
+            if (live.uncertain?.[opts.write!]) {
+              throw new CompanyError('conflict',
+                `${opts.write} 阶段此前有一笔未确认的外部写；只允许按幂等接口核对，禁止盲重试（阶段=${name}；可清理状态：uncertain=${opts.write}）`);
+            }
+            marked = true;
+            live = {
+              ...live,
+              uncertain: { ...(live.uncertain ?? {}), [opts.write!]: true },
+              updatedAt: new Date(this.now()).toISOString(),
+            };
+            journal.put(live);
+          } : undefined,
+        },
+      );
+      if (opts.write && (outcome.status === 'ok' || !outcome.unconfirmed)) {
+        // 成功，或没有任何一次“已发出且结果不明”的尝试（确定性拒绝）：清掉未确认标记，允许同租约继续。
+        const uncertain = { ...(live.uncertain ?? {}) };
+        delete uncertain[opts.write];
+        live = {
+          ...live,
+          uncertain: Object.keys(uncertain).length ? uncertain : undefined,
+          updatedAt: new Date(this.now()).toISOString(),
+        };
+        journal.put(live);
+      }
+      if (outcome.status !== 'ok') {
+        // 仍有未确认写时保留 uncertain：外部状态只按幂等接口核对，禁止盲重试。
+        throw outcome.error;
+      }
+      stages.push({ stage: name, status: 'ok', elapsedMs: outcome.elapsedMs });
+      return outcome.value;
+    };
+
+    try {
+      if (!live.created.account) {
+        const ensured = await stage('account', () => this.ensure(ctx, id.alias), { write: 'account' });
+        if (ensured.result === 'created') accountMade = true;
+        live = { ...live, created: { ...live.created, account: true }, updatedAt: new Date(this.now()).toISOString() };
+        journal.put(live);
+      } else if (live.uncertain?.account) {
+        // 上一轮超时留下的未知写：只核对，不重写；核对也受 account 阶段期限约束。
+        await runFixtureCheck('account', () => this.assertFixtureLive(ctx, credential, fence, 'account'), { now: this.monoNow, sleep: this.sleep });
+        const password = await this.sealedPassword(ctx, id.alias);
+        if (!password) {
+          throw new CompanyError('conflict',
+            `账号阶段有未确认写，但密封凭据仍缺失；无法判定落地状态，拒绝盲重试（阶段=account；可清理状态：uncertain=account）`);
+        }
+        const uncertain = { ...(live.uncertain ?? {}) };
+        delete uncertain.account;
+        live = {
+          ...live,
+          created: { ...live.created, account: true },
+          uncertain: Object.keys(uncertain).length ? uncertain : undefined,
+          updatedAt: new Date(this.now()).toISOString(),
+        };
+        journal.put(live);
+      }
+
+      const login = await stage('login', async () => {
+        const outcome = await this.login(ctx, { alias: id.alias });
+        const value = outcome.value as {
+          session: string; accountResult?: string;
+          workspaces: Array<{ slug: string; name: string; role?: string }>;
+        };
+        opened.push(value.session);
+        const entry = this.fixtureSessions.get(id.key)
+          ?? { employeeId: ctx.scope.actor.employeeId, sessions: new Set<string>() };
+        entry.sessions.add(value.session);
+        this.fixtureSessions.set(id.key, entry);
+        return value;
+      });
+
+      currentStage = 'workspace';
+      // 本阶段的授权复查计入 workspace 期限：等待超时或复查后过期都不再发出 workspace 写。
+      const workspaceStarted = this.monoNow();
+      await runFixtureCheck('workspace', () => this.assertFixtureLive(ctx, credential, fence, 'workspace'), { now: this.monoNow, sleep: this.sleep }, workspaceStarted);
+      const listed = login.workspaces.find(item => item.slug === id.workspaceSlug);
+      if (listed && !live.created.workspace && !live.intent.workspace && !live.uncertain?.workspace) {
+        throw new CompanyError('conflict',
+          `workspace ${id.workspaceSlug} 已存在，但台账没有本任务的创建记录；拒绝把既有空间当测试空间（阶段=workspace；可清理状态：会话 ${opened.length} 个可丢弃，账号已保留，workspace 未创建/未改动）`);
+      }
+      if (listed) {
+        if (!live.created.workspace) {
+          // 创建中途崩溃或上一轮超时：确定性名字 + 同租约的创建意图/uncertain，允许接续认领。
+          const uncertain = { ...(live.uncertain ?? {}) };
+          delete uncertain.workspace;
+          live = {
+            ...live,
+            created: { ...live.created, workspace: true },
+            uncertain: Object.keys(uncertain).length ? uncertain : undefined,
+            updatedAt: new Date(this.now()).toISOString(),
+          };
+          journal.put(live);
+        }
+        await stage('workspace', () => this.workspaceEnsure(ctx, { session: login.session, slug: id.workspaceSlug, name: id.workspaceName }), { startedAt: workspaceStarted });
+      } else if (live.uncertain?.workspace) {
+        throw new CompanyError('conflict',
+          `workspace 阶段有未确认写，且当前列表仍未见 ${id.workspaceSlug}；无法判定落地状态，拒绝盲重试（阶段=workspace；可清理状态：uncertain=workspace）`);
+      } else {
+        live = { ...live, intent: { ...live.intent, workspace: true }, updatedAt: new Date(this.now()).toISOString() };
+        journal.put(live);
+        const outcome = await stage('workspace', () => this.workspaceEnsure(ctx, { session: login.session, slug: id.workspaceSlug, name: id.workspaceName }), { write: 'workspace', startedAt: workspaceStarted });
+        const value = outcome.value as { created?: boolean };
+        if (value.created === true) workspaceMade = true;
+        live = { ...live, created: { ...live.created, workspace: true }, updatedAt: new Date(this.now()).toISOString() };
+        journal.put(live);
+      }
+
+      currentStage = 'sample';
+      const sampleStarted = this.monoNow();
+      await runFixtureCheck('sample', () => this.assertFixtureLive(ctx, credential, fence, 'sample'), { now: this.monoNow, sleep: this.sleep }, sampleStarted);
+      const existingSample = this.readFixtureSample(samplePath);
+      if (existingSample !== undefined && !live.created.sample) {
+        if ((!live.intent.sample && !live.uncertain?.sample) || existingSample !== sample.body) {
+          throw new CompanyError('conflict',
+            `样本位置已有非本任务资产，拒绝覆盖或删除（阶段=sample；可清理状态：会话 ${opened.length} 个可丢弃，账号与 workspace 已保留，样本未改动）`);
+        }
+        const uncertain = { ...(live.uncertain ?? {}) };
+        delete uncertain.sample;
+        live = {
+          ...live,
+          created: { ...live.created, sample: true },
+          uncertain: Object.keys(uncertain).length ? uncertain : undefined,
+          samplePath, sampleHandle: sample.handle, sampleDigest: sample.digest,
+          updatedAt: new Date(this.now()).toISOString(),
+        };
+        journal.put(live);
+      } else if (existingSample !== undefined && existingSample !== sample.body) {
+        throw new CompanyError('conflict',
+          `本任务登记的样本文件已被改动；无法确认归属，拒绝覆盖或删除（阶段=sample；可清理状态：会话 ${opened.length} 个可丢弃，样本保留）`);
+      }
+      if (existingSample === undefined) {
+        if (live.uncertain?.sample) {
+          throw new CompanyError('conflict',
+            `样本阶段有未确认写，且文件仍不存在；无法判定落地状态，拒绝盲重试（阶段=sample；可清理状态：uncertain=sample）`);
+        }
+        if (!live.created.sample) {
+          live = { ...live, intent: { ...live.intent, sample: true }, updatedAt: new Date(this.now()).toISOString() };
+          journal.put(live);
+        }
+        await stage('sample', async () => {
+          mkdirSync(dirname(samplePath), { recursive: true, mode: 0o700 });
+          try {
+            writeFileSync(samplePath, sample.body, { mode: 0o600, flag: 'wx' });
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+            if (this.readFixtureSample(samplePath) !== sample.body) {
+              throw new CompanyError('conflict', '样本文件在创建时被另一写入者占用，且内容不相同；拒绝覆盖');
+            }
+          }
+          sampleWritten = true;
+        }, { write: 'sample', startedAt: sampleStarted });
+        live = { ...live, created: { ...live.created, sample: true }, samplePath, sampleHandle: sample.handle, sampleDigest: sample.digest, updatedAt: new Date(this.now()).toISOString() };
+        journal.put(live);
+      }
+
+      let browserResult: { signedInAs: string; spaceId: number; page: string } | undefined;
+      if (browser) {
+        const outcome = await stage('browser', () => this.browserLogin(ctx, {
+          session: login.session, spaceId: browser.spaceId, ...(browser.page === undefined ? {} : { page: browser.page }),
+        }));
+        const value = outcome.value as { signedInAs?: unknown };
+        browserResult = {
+          signedInAs: typeof value.signedInAs === 'string' ? value.signedInAs : id.username,
+          spaceId: browser.spaceId, page: browser.page ?? 'p1',
+        };
+      }
+
+      live = { ...live, status: 'ready', updatedAt: new Date(this.now()).toISOString() };
+      journal.put(live);
+      return {
+        value: {
+          status: 'ready',
+          fixture: {
+            alias: id.alias,
+            username: id.username,
+            workspace: { slug: id.workspaceSlug, name: id.workspaceName, role: 'admin', created: workspaceMade },
+            account: { result: accountMade ? 'created' : 'exists' },
+            session: login.session,
+            sample: { handle: sample.handle, records: sample.records, digest: sample.digest.slice(0, 16) },
+            ...(browserResult ? { browser: browserResult } : {}),
+          },
+          stages,
+        },
+        audit: {
+          action: 'ops_test_fixture',
+          evidence: `ops_test_fixture_ready ${id.alias} workspace=${id.workspaceSlug} account=${accountMade ? 'created' : 'exists'} sample=${sample.handle} browser=${browser ? 'yes' : 'no'} fence=${fence}`,
+        },
+      };
+    } catch (error) {
+      const failedStage = error instanceof FixtureStageError ? error.stage : currentStage;
+      throw await this.fixtureFailure(ctx, id, journal, live, failedStage, error, {
+        opened, sampleWritten, sampleCreatedBefore: live.created.sample, accountMade, workspaceMade,
+      });
+    }
+  }
+
+  private readFixtureSample(path: string): string | undefined {
+    try { return readFileSync(path, 'utf8'); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+  }
+
+  /**
+   * 经授权读取本租约创建的合成样本。只回内容与摘要，不暴露本机绝对路径；句柄必须与台账一致。
+   */
+  private async readFixture(ctx: Ctx, id: FixtureIdentity, fence: number, args: Args): Promise<Outcome> {
+    await this.assertFixtureLive(ctx, ctx.credential, fence, 'sample');
+    const format = args.format === undefined ? 'json' : args.format;
+    if (format !== 'json' && format !== 'csv') throw invalid('format 只能是 json 或 csv');
+    const journal = this.fixtureJournal();
+    const record = journal.get(id.key);
+    if (!record || !this.fixtureOwnedBy(ctx, record, fence) || !record.created.sample) {
+      throw new CompanyError('not_found', `本租约没有可读取的合成样本（阶段=sample；可清理状态：未读任何文件）`);
+    }
+    if (args.handle !== undefined && args.handle !== record.sampleHandle) {
+      throw new CompanyError('not_found', `样本句柄与本租约台账不一致（阶段=sample；可清理状态：未读任何文件）`);
+    }
+    const expected = fixtureSample(id);
+    const body = this.readFixtureSample(record.samplePath);
+    if (body === undefined || body !== expected.body || sha256(body) !== record.sampleDigest) {
+      throw new CompanyError('conflict',
+        `样本文件无法确认归属或内容已改动；拒绝读取（阶段=sample；可清理状态：未返回内容）`);
+    }
+    const content = format === 'csv' ? fixtureSampleCsv(id) : body;
+    return {
+      value: {
+        status: 'ready',
+        sample: {
+          handle: record.sampleHandle,
+          format,
+          records: expected.records,
+          digest: record.sampleDigest.slice(0, 16),
+          content,
+        },
+      },
+      audit: {
+        action: 'ops_test_fixture',
+        evidence: `ops_test_fixture_read ${id.alias} format=${format} sample=${record.sampleHandle} fence=${fence}`,
+      },
+    };
+  }
+
+  /**
+   * 失败收尾：只丢弃本次调用打开的会话，只删除本次调用写入且内容仍与预期一致的样本；账号与 workspace
+   * 没有受支持的删除入口，明确保留。超时留下的 uncertain 写入台账，禁止后续盲重试。错误消息带准确阶段
+   * 与可清理状态，不含任何 token。
+   */
+  private async fixtureFailure(
+    ctx: Ctx, id: FixtureIdentity, journal: FixtureJournal, record: FixtureRecord,
+    stage: FixtureStage | 'preflight', error: unknown,
+    state: { opened: string[]; sampleWritten: boolean; sampleCreatedBefore: boolean; accountMade: boolean; workspaceMade: boolean },
+  ): Promise<CompanyError> {
+    // 先取在存 token 做脱敏，再丢弃本次会话：之后的通用失败收尾看不到这些 token 了。
+    const known = this.sessions.secrets(ctx.scope.actor.employeeId);
+    for (const handle of state.opened) this.sessions.drop(handle);
+    const entry = this.fixtureSessions.get(id.key);
+    if (entry) for (const handle of state.opened) entry.sessions.delete(handle);
+    let sampleState = 'not_created';
+    if (state.sampleWritten) {
+      const sample = fixtureSample(id);
+      try {
+        if (readFileSync(record.samplePath, 'utf8') === sample.body) { unlinkSync(record.samplePath); sampleState = 'deleted'; }
+        else sampleState = 'uncertain_kept';
+      } catch (readError) {
+        sampleState = (readError as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'uncertain_kept';
+      }
+    } else if (state.sampleCreatedBefore) sampleState = 'retained_created_earlier';
+    else if (record.uncertain?.sample) sampleState = 'uncertain_write';
+    try {
+      journal.put({ ...record, status: 'failed', updatedAt: new Date(this.now()).toISOString() });
+    } catch { /* 台账写失败不能盖住真正的阶段失败 */ }
+    const accountState = state.accountMade ? 'retained_no_delete_route'
+      : record.uncertain?.account ? 'uncertain_write'
+        : record.created.account ? 'retained_existing_test_account' : 'not_created';
+    const workspaceState = state.workspaceMade ? 'retained_no_delete_route'
+      : record.uncertain?.workspace ? 'uncertain_write'
+        : record.created.workspace ? 'retained_existing_test_workspace' : 'not_created';
+    const cause = error instanceof CompanyError
+      ? error
+      : new CompanyError('upstream_error', `${(error as Error)?.name ?? 'Error'}: ${String((error as Error)?.message ?? error).slice(0, 160)}`, true);
+    const timedOut = error instanceof FixtureStageError && error.timedOut;
+    const elapsed = error instanceof FixtureStageError ? ` elapsed=${error.elapsedMs}ms` : '';
+    const timeoutNote = timedOut ? '；超时不等于未写入，已发出的外部写只按幂等核对' : '';
+    return new CompanyError(cause.code,
+      `${redactText(cause.message, known)}；测试夹具失败阶段=${stage}${elapsed}${timeoutNote}；可清理状态：session=${state.opened.length} 个已丢弃, sample=${sampleState}, account=${accountState}, workspace=${workspaceState}`,
+      cause.retryable);
+  }
+
+  /** 回收：只处理台账里由本租约代际（同员工/同 fence）创建、且内容仍可确认的资产；其他情况一律不删除。 */
+  private async reclaimFixture(ctx: Ctx, id: FixtureIdentity, fence: number): Promise<Outcome> {
+    await this.assertFixtureLive(ctx, ctx.credential, fence, 'sample');
+    const journal = this.fixtureJournal();
+    const record = journal.get(id.key);
+    if (!record || !this.fixtureOwnedBy(ctx, record, fence)) {
+      return {
+        value: { status: 'not_owned', reclaimed: false, reason: '台账里没有本租约代际拥有的夹具；未删除任何资产' },
+        audit: { action: 'ops_test_fixture', evidence: `ops_test_fixture_reclaim ${id.alias} → not_owned（未删除） fence=${fence}` },
+      };
+    }
+    const sample = fixtureSample(id);
+    let sampleState: string;
+    if (!record.created.sample) {
+      sampleState = record.uncertain?.sample ? 'uncertain_write_kept' : 'not_created';
+    } else {
+      try {
+        if (readFileSync(record.samplePath, 'utf8') === sample.body && sha256(sample.body) === record.sampleDigest) {
+          unlinkSync(record.samplePath);
+          sampleState = 'deleted';
+        } else sampleState = 'uncertain_kept';
+      } catch (error) {
+        sampleState = (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'uncertain_kept';
+      }
+    }
+    const entry = this.fixtureSessions.get(id.key);
+    let dropped = 0;
+    if (entry) {
+      for (const handle of entry.sessions) { this.sessions.drop(handle); dropped++; }
+      entry.sessions.clear();
+    }
+    journal.put({ ...record, status: 'retained', updatedAt: new Date(this.now()).toISOString() });
+    return {
+      value: {
+        status: 'reclaimed', sample: sampleState, sessionsDropped: dropped,
+        retained: ['account', 'workspace'],
+        note: '账号与 workspace 没有受支持的删除入口，保留；样本只在台账记录由本租约代际创建且摘要仍一致时删除',
+      },
+      audit: {
+        action: 'ops_test_fixture',
+        evidence: `ops_test_fixture_reclaim ${id.alias} sample=${sampleState} sessions=${dropped} retained=account,workspace fence=${fence}`,
       },
     };
   }

@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { OPS_TOOLS, OpsBroker, proofDeliverErrorCode, type OpsDeps } from '../src/ops/broker.ts';
 import { browserInjectFailure } from '../src/ops/browser.ts';
 import { CompanyError } from '../src/core-errors.ts';
@@ -10,6 +10,7 @@ import type { OpsScope } from '../src/contracts.ts';
 import type { OriginRequest } from '../src/ops/origin.ts';
 import { parseBrokerConfig } from '../src/ops/config.ts';
 import { verifyPassword } from '../src/ops/password.ts';
+import { fixtureIdentity, fixtureSampleCsv, fixtureSamplePath, FIXTURE_STAGE_BUDGET_MS, runFixtureStage } from '../src/ops/test-fixture.ts';
 import { brokerConfig, FakeCompany, FakeWorld, OPS_CLIENT, OPS_DIRECT_CLIENT, OPS_DIRECT_REDIRECT, OPS_REDIRECT, OPS_RESOURCE, TENANT } from './support/ops-world.ts';
 
 interface Rig { world: FakeWorld; company: FakeCompany; broker: OpsBroker; qa: string; outputs: unknown[] }
@@ -59,7 +60,7 @@ describe('ops gate', () => {
       'ops_idp_provision_rotate',
       'ops_info', 'ops_internal_ai_approval_diagnose', 'ops_internal_ai_deliver', 'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_revoke', 'ops_internal_ai_rotate_key', 'ops_internal_ai_trust',
       'ops_invitation_issue', 'ops_login', 'ops_logout', 'ops_magpie_route_restore', 'ops_magpie_route_sample', 'ops_magpie_window_prepare', 'ops_member_add', 'ops_member_list', 'ops_member_remove',
-      'ops_operator_login', 'ops_origin_health', 'ops_origin_logs', 'ops_origin_status', 'ops_platform_operator_list', 'ops_product_magpie_candidate', 'ops_product_magpie_observe', 'ops_product_magpie_price_approve', 'ops_product_pulse', 'ops_query', 'ops_release_diagnose', 'ops_request', 'ops_supplier_plan_sample', 'ops_workspace_ensure',
+      'ops_operator_login', 'ops_origin_health', 'ops_origin_logs', 'ops_origin_status', 'ops_platform_operator_list', 'ops_product_magpie_candidate', 'ops_product_magpie_observe', 'ops_product_magpie_price_approve', 'ops_product_pulse', 'ops_query', 'ops_release_diagnose', 'ops_request', 'ops_supplier_plan_sample', 'ops_test_fixture_ready', 'ops_workspace_ensure',
     ]);
   });
 
@@ -2074,5 +2075,611 @@ describe('ops_internal_ai_deliver 产品错误码透传', () => {
       'unauthorized', null, undefined, 42,
     ]) expect(code(body)).toBeUndefined();
     expect(code({ error: { code: 'company-status-unavailable' } }, true, 200)).toBeUndefined();
+  });
+});
+
+describe('ops 测试夹具', () => {
+  const cleanups: Array<() => void> = [];
+  afterEach(() => { while (cleanups.length) cleanups.pop()!(); });
+
+  const identityFor = (task = 'task-1', alias = 'DEMO', leaseFence = 1) =>
+    fixtureIdentity({ project: 'demo', env: 'production', taskId: task, alias, accountPrefix: 'sck-', workspacePrefix: 'sck-', leaseFence });
+
+  function fixtureRig(patch: Record<string, unknown> = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'ops-fixture-'));
+    const paths = { fixtureJournalPath: join(dir, 'journal.json'), fixtureDir: join(dir, 'samples') };
+    const base = rig(patch, true, paths);
+    const rebuild = () => new OpsBroker({
+      core: base.company.core, projects: base.company.projects as never, secretKey: () => Buffer.alloc(32),
+      controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
+      fetch: base.world.fetch, now: base.world.now, d1: () => base.world.d1,
+      queryAsUser: base.world.queryAsUser, browser: base.world.browser,
+      sleep: async ms => { base.world.clock += ms; }, ...paths,
+    });
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    return { ...base, dir, paths, rebuild };
+  }
+
+  const sampleFile = (r: { paths: { fixtureDir: string } }, id = identityFor()) =>
+    fixtureSamplePath(r.paths.fixtureDir, id);
+
+  const userCount = (r: ReturnType<typeof fixtureRig>) =>
+    (r.world.sqlite.query('SELECT COUNT(*) AS n FROM users').get() as { n: number }).n;
+
+  test('命名按账号/workspace 前缀分开，长前缀也不会截掉任务摘要', () => {
+    const id = fixtureIdentity({
+      project: 'demo', env: 'production', taskId: 'task-long', alias: 'A'.repeat(40),
+      accountPrefix: 'acct-', workspacePrefix: 'w'.repeat(21), leaseFence: 1,
+    });
+    expect(id.username.startsWith('acct-test-')).toBe(true);
+    expect(id.alias.length).toBeLessThanOrEqual(40);
+    expect(id.workspaceSlug.length).toBeLessThanOrEqual(40);
+    expect(id.workspaceSlug.endsWith(id.alias.slice(-8))).toBe(true);
+  });
+
+  test('成功准备：测试专用别名、workspace、合成样本与不透明句柄', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    const result = await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    expect(result.status).toBe('ready');
+    expect(result.fixture.alias).toBe(id.alias);
+    expect(result.fixture.username).toBe(id.username);
+    expect(result.fixture.workspace).toEqual({ slug: id.workspaceSlug, name: id.workspaceName, role: 'admin', created: true });
+    expect(result.fixture.account).toEqual({ result: 'created' });
+    expect(result.fixture.session).toMatch(/^s_[0-9a-f]{16}$/);
+    expect(result.fixture.sample).toMatchObject({ records: 3 });
+    expect(result.stages.map((s: { stage: string }) => s.stage)).toEqual(['account', 'login', 'workspace', 'sample']);
+    expect(r.world.user(id.username)).toMatchObject({ status: 'active' });
+    expect([...r.world.workspaces.keys()]).toEqual([id.workspaceSlug]);
+    const sample = readFileSync(sampleFile(r, id), 'utf8');
+    expect(sample).toContain('"synthetic": true');
+    expect(r.company.audits.some(a => a.action === 'ops_account_create')).toBe(true);
+    expectNoLeaks(r);
+    const journal = readFileSync(join(r.dir, 'journal.json'), 'utf8');
+    for (const secret of [...r.world.tokens, ...r.company.sealed.values(), 'cf-token-value']) {
+      expect(journal).not.toContain(secret);
+      expect(sample).not.toContain(secret);
+    }
+  });
+
+  test('重启幂等：同一台账的第二个 broker 复用账号、workspace 与样本', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    const first = await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    expect(first.fixture.account.result).toBe('created');
+    const second = await r.rebuild().call(r.qa, 'task-1', 'ops_test_fixture_ready', { alias: 'demo' }) as Record<string, any>;
+    r.outputs.push(second);
+    expect(second.fixture.account.result).toBe('exists');
+    expect(second.fixture.workspace.created).toBe(false);
+    expect(second.fixture.sample.handle).toBe(first.fixture.sample.handle);
+    expect(userCount(r)).toBe(1);
+    expect(r.world.workspaces.size).toBe(1);
+    expect(r.world.requests.filter(q => q.method === 'POST' && new URL(q.url).pathname === '/api/workspaces')).toHaveLength(1);
+    expect(id.alias.length).toBeLessThanOrEqual(40);
+    expectNoLeaks(r);
+  });
+
+  test('并发调用串行化，只创建一个账号与一个 workspace', async () => {
+    const r = fixtureRig();
+    const [a, b] = await Promise.all([
+      call(r, 'ops_test_fixture_ready', { alias: 'demo' }),
+      call(r, 'ops_test_fixture_ready', { alias: 'demo' }),
+    ]);
+    expect([a.fixture.account.result, b.fixture.account.result].sort()).toEqual(['created', 'exists']);
+    expect(userCount(r)).toBe(1);
+    expect(r.world.workspaces.size).toBe(1);
+    expect(r.world.requests.filter(q => q.method === 'POST' && new URL(q.url).pathname === '/api/workspaces')).toHaveLength(1);
+  });
+
+  test('workspace 阶段失败：报准确阶段与可清理状态，账号保留、样本未创建', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    r.world.fault((method, url) => method === 'POST' && url.pathname === '/api/workspaces', 500, { times: 2 });
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toContain('阶段=workspace');
+    expect(error.message).toContain('可清理状态');
+    expect(error.message).toContain('account=retained');
+    expect(error.message).toContain('sample=not_created');
+    expect(error.message).toContain('session=1 个已丢弃');
+    expect(error.message).toContain('elapsed=');
+    expect(r.world.requests.filter(q => q.method === 'POST' && new URL(q.url).pathname === '/api/workspaces')).toHaveLength(2);
+    expect(r.world.user(id.username)).toBeDefined();
+    expect(r.world.workspaces.size).toBe(0);
+    expect(existsSync(sampleFile(r, id))).toBe(false);
+    for (const secret of [...r.world.tokens, ...r.company.sealed.values()]) expect(error.message).not.toContain(secret);
+  });
+
+  test('workspace 403 已证明未写入：不记 uncertain_write，权限恢复后同租约继续', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    r.world.fault((method, url) => method === 'POST' && url.pathname === '/api/workspaces', 403, { times: 1 });
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(error.code).toBe('forbidden');
+    expect(error.message).toContain('阶段=workspace');
+    // 403 是上游明确拒绝：没有落地，不能报成不确定写。
+    expect(error.message).toContain('workspace=not_created');
+    expect(error.message).not.toContain('workspace=uncertain_write');
+    expect(existsSync(sampleFile(r, id))).toBe(false);
+    const journal = JSON.parse(readFileSync(join(r.dir, 'journal.json'), 'utf8'));
+    expect(journal.fixtures[id.key].created.workspace).toBe(false);
+    expect(journal.fixtures[id.key].uncertain).toBeUndefined();
+
+    // 权限恢复后同一租约（同一 fence）直接继续，不需要人工核对未确认写。
+    const ok = await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    expect(ok.status).toBe('ready');
+    expect(ok.fixture.workspace.created).toBe(true);
+    expect(r.world.workspaces.size).toBe(1);
+    expect(existsSync(sampleFile(r, id))).toBe(true);
+  });
+
+  test('workspace 5xx 结果不明：保留 uncertain，后续只按列表核对而不重发', async () => {
+    const r = fixtureRig();
+    r.world.fault((method, url) => method === 'POST' && url.pathname === '/api/workspaces', 500, { times: 2 });
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(error.message).toContain('workspace=uncertain_write');
+    // 第二次调用：登录列表仍未见该 workspace 时拒绝盲重试，不发出新的 POST。
+    const again = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(again.code).toBe('conflict');
+    expect(again.message).toContain('uncertain=workspace');
+    expect(r.world.requests.filter(q => q.method === 'POST' && new URL(q.url).pathname === '/api/workspaces')).toHaveLength(2);
+  });
+
+  test('授权复查耗尽 workspace 阶段期限：零新 workspace 写，样本与浏览器不运行', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    let clock = 0;
+    let scopeCalls = 0;
+    const core = {
+      ...r.company.core,
+      opsScope: async (credential: string, taskId: string) => {
+        const scope = await r.company.core.opsScope(credential, taskId);
+        scopeCalls++;
+        // 调用入口(1)、account(2)、login(3) 之后，第 4 次是 workspace 阶段入口的授权复查。
+        if (scopeCalls === 4) clock += FIXTURE_STAGE_BUDGET_MS.workspace;
+        return scope;
+      },
+    };
+    r.broker = new OpsBroker({
+      core: core as never, projects: r.company.projects as never, secretKey: () => Buffer.alloc(32),
+      controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
+      fetch: r.world.fetch, now: r.world.now, monoNow: () => clock,
+      d1: () => r.world.d1, queryAsUser: r.world.queryAsUser, browser: r.world.browser,
+      sleep: async ms => { clock += ms; }, ...r.paths,
+    });
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo', browser: { spaceId: 42, page: 'p2' } }));
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toContain('阶段=workspace');
+    expect(error.message).toContain('elapsed=');
+    expect(error.message).toContain('workspace=not_created');
+    // 复查已耗尽期限：不能再进入 work，workspace POST 计数为 0。
+    expect(scopeCalls).toBe(4);
+    expect(r.world.requests.filter(q => q.method === 'POST' && new URL(q.url).pathname === '/api/workspaces')).toHaveLength(0);
+    expect(r.world.workspaces.size).toBe(0);
+    expect(existsSync(sampleFile(r, id))).toBe(false);
+    expect(r.world.browserLogins).toHaveLength(0);
+    expect(r.world.user(id.username)).toBeDefined(); // account 阶段此前已完成
+    const journal = JSON.parse(readFileSync(join(r.dir, 'journal.json'), 'utf8'));
+    expect(journal.fixtures[id.key].created.workspace).toBe(false);
+    expect(journal.fixtures[id.key].uncertain).toBeUndefined();
+  });
+
+  test('租约结束后不再运行，也不删除已有样本', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    const before = readFileSync(sampleFile(r, id), 'utf8');
+    r.company.endLease('qa-1');
+    const denied = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'reclaim' }));
+    expect(denied.code).toBe('forbidden');
+    expect(readFileSync(sampleFile(r, id), 'utf8')).toBe(before);
+    expect(r.world.workspaces.size).toBe(1);
+  });
+
+  test('角色被环境授权撤回后拒绝执行', async () => {
+    const r = fixtureRig({ roles: ['engineering'] });
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(error.code).toBe('forbidden');
+    expect(r.world.requests).toHaveLength(0);
+    expect(userCount(r)).toBe(0);
+  });
+
+  test('工具不接受项目、任务、workspace 或路径覆盖，不能借一次调用扩大授权', async () => {
+    const r = fixtureRig();
+    for (const args of [
+      { alias: 'demo', project: 'other' },
+      { alias: 'demo', taskId: 'other-task' },
+      { alias: 'demo', workspace: 'someone-else' },
+      { alias: 'demo', slug: 'real-space' },
+      { alias: 'demo', path: '/tmp/elsewhere' },
+    ]) expect((await failure(call(r, 'ops_test_fixture_ready', args))).code).toBe('invalid');
+    expect(r.world.requests).toHaveLength(0);
+    expect(userCount(r)).toBe(0);
+  });
+
+  test('同名非测试账号：既有 IdP 用户或密封凭据都拒绝认领且不生成密码', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    r.world.insertUser(id.username, `${id.username}@example.test`);
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(error.code).toBe('conflict');
+    expect(error.message).toContain('阶段=account');
+    expect(error.message).toContain('未创建任何资产');
+    expect(r.company.sealed.size).toBe(0);
+    expect(r.world.requests).toHaveLength(0);
+
+    const sealed = fixtureRig();
+    sealed.company.sealed.set(`demo/production/${id.alias}_PASSWORD`, 'existing-secret-value');
+    const sealedError = await failure(call(sealed, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(sealedError.code).toBe('conflict');
+    expect(sealedError.message).not.toContain('existing-secret-value');
+    expect(sealed.world.requests).toHaveLength(0);
+  });
+
+  test('同名非测试 workspace：已存在但无台账时拒绝认领且不改动/删除', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    r.world.workspaces.set(id.workspaceSlug, {
+      slug: id.workspaceSlug, name: '真实空间', dbName: 'ws_real',
+      members: [{ id: 'm-real', email: `${id.username}@example.test`, displayName: 'real', isAdmin: true, disabled: false }],
+    });
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(error.code).toBe('conflict');
+    expect(error.message).toContain('阶段=workspace');
+    expect(r.world.workspaces.get(id.workspaceSlug)!.name).toBe('真实空间');
+    expect(r.world.requests.filter(q => q.method === 'DELETE')).toHaveLength(0);
+    expect(existsSync(sampleFile(r, id))).toBe(false);
+    const reclaimed = await call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'reclaim' });
+    expect(reclaimed.retained).toEqual(['account', 'workspace']);
+    expect(r.world.workspaces.get(id.workspaceSlug)!.name).toBe('真实空间');
+  });
+
+  test('同名非测试样本文件：拒绝覆盖，回收时也不删除', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    const path = sampleFile(r, id);
+    mkdirSync(join(r.paths.fixtureDir, 'task-1'), { recursive: true });
+    writeFileSync(path, 'not ours');
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(error.code).toBe('conflict');
+    expect(error.message).toContain('阶段=sample');
+    expect(readFileSync(path, 'utf8')).toBe('not ours');
+    const reclaimed = await call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'reclaim' });
+    expect(reclaimed.sample).toBe('not_created');
+    expect(readFileSync(path, 'utf8')).toBe('not ours');
+  });
+
+  test('浏览器阶段可选，并受角色与参数限制', async () => {
+    const r = fixtureRig({ roles: ['qa', 'engineering', 'product'] });
+    const id = identityFor();
+    const product = r.company.lease('prod-1', 'product', 'task-prod');
+    const denied = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo', browser: { spaceId: 7 } }, { cred: product, task: 'task-prod' }));
+    expect(denied.code).toBe('forbidden');
+    expect(denied.message).toContain('工程/QA');
+    expect(r.world.browserLogins).toHaveLength(0);
+    expect((await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo', browser: { spaceId: 'x' } }))).code).toBe('invalid');
+    expect((await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo', browser: { spaceId: 7, page: 'nope' } }))).code).toBe('invalid');
+    expect(r.world.browserLogins).toHaveLength(0);
+    const ok = await call(r, 'ops_test_fixture_ready', { alias: 'demo', browser: { spaceId: 42, page: 'p2' } });
+    expect(ok.fixture.browser).toEqual({ signedInAs: id.username, spaceId: 42, page: 'p2' });
+    expect(r.world.browserLogins).toHaveLength(1);
+    expect(JSON.stringify(ok)).not.toContain(r.world.browserLogins[0]!.token);
+    expectNoLeaks(r);
+  });
+
+  test('回收只删除本次创建且摘要仍一致的样本，账号与 workspace 保留', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    const path = sampleFile(r, id);
+    expect(existsSync(path)).toBe(true);
+    const reclaimed = await call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'reclaim' });
+    expect(reclaimed).toMatchObject({ status: 'reclaimed', sample: 'deleted', sessionsDropped: 1, retained: ['account', 'workspace'] });
+    expect(existsSync(path)).toBe(false);
+    expect(r.world.workspaces.size).toBe(1);
+
+    await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    writeFileSync(path, 'tampered');
+    const again = await call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'reclaim' });
+    expect(again.sample).toBe('uncertain_kept');
+    expect(readFileSync(path, 'utf8')).toBe('tampered');
+  });
+
+  test('跨租约不复用：另一员工同一任务的准备与回收都被拒，不同任务得到不同资产名', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    const other = r.company.lease('qa-2', 'qa', 'task-1');
+    const reused = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }, { cred: other, task: 'task-1' }));
+    expect(reused.code).toBe('forbidden');
+    expect(reused.message).toContain('跨租约');
+    const reclaimed = await call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'reclaim' }, { cred: other, task: 'task-1' });
+    expect(reclaimed).toMatchObject({ status: 'not_owned', reclaimed: false });
+    expect(existsSync(sampleFile(r, id))).toBe(true);
+
+    const otherTask = r.company.lease('qa-3', 'qa', 'task-2');
+    const second = await call(r, 'ops_test_fixture_ready', { alias: 'demo' }, { cred: otherTask, task: 'task-2' });
+    const id2 = identityFor('task-2');
+    expect(second.fixture.alias).toBe(id2.alias);
+    expect(second.fixture.alias).not.toBe(id.alias);
+    expect(second.fixture.workspace.slug).not.toBe(id.workspaceSlug);
+    expect(r.world.user(id2.username)).toBeDefined();
+  });
+
+  test('阶段内超时：work 本身超预算时判 timed_out，不把超时当未写入', async () => {
+    let clock = 0;
+    const outcome = await runFixtureStage('workspace', async () => {
+      clock += FIXTURE_STAGE_BUDGET_MS.workspace + 1;
+      return 'worked';
+    }, { now: () => clock, sleep: async ms => { clock += ms; } });
+    expect(outcome.status).toBe('timed_out');
+    if (outcome.status !== 'timed_out') throw new Error('expected timed_out');
+    expect(outcome.error.timedOut).toBe(true);
+    expect(outcome.elapsedMs).toBeGreaterThanOrEqual(FIXTURE_STAGE_BUDGET_MS.workspace);
+    // 已完成但已过期：写可能落地，必须保留“结果不明”。
+    expect(outcome.unconfirmed).toBe(true);
+  });
+
+  test('授权复查耗尽阶段期限：复查后过期，work 零调用且不记未确认写', async () => {
+    let clock = 0;
+    let workCalls = 0;
+    const outcome = await runFixtureStage('workspace', async () => {
+      workCalls++;
+      return 'worked';
+    }, { now: () => clock, sleep: async ms => { clock += ms; } }, {
+      beforeAttempt: async () => { clock += FIXTURE_STAGE_BUDGET_MS.workspace; },
+    });
+    expect(outcome.status).toBe('timed_out');
+    if (outcome.status !== 'timed_out') throw new Error('expected timed_out');
+    expect(workCalls).toBe(0);
+    expect(outcome.unconfirmed).toBe(false);
+  });
+
+  test('授权复查等待超时：work 零调用，阶段判 timed_out', async () => {
+    let clock = 0;
+    let workCalls = 0;
+    const outcome = await runFixtureStage('workspace', async () => {
+      workCalls++;
+      return 'worked';
+    }, { now: () => clock, sleep: async ms => { clock += ms; } }, {
+      // 复查自己把时钟推过期限再成功返回：等待与返回后都必须挡住 work。
+      beforeAttempt: async () => { clock += FIXTURE_STAGE_BUDGET_MS.workspace + 1; },
+    });
+    expect(outcome.status).toBe('timed_out');
+    if (outcome.status !== 'timed_out') throw new Error('expected timed_out');
+    expect(workCalls).toBe(0);
+    expect(outcome.unconfirmed).toBe(false);
+  });
+
+  test('确定性拒绝才证明未写入；conflict 与“先不明后拒绝”都保留未确认', async () => {
+    let clock = 0;
+    let forbiddenCalls = 0;
+    const denied = await runFixtureStage('workspace', async () => {
+      forbiddenCalls++;
+      throw new CompanyError('forbidden', 'workspace-create-forbidden');
+    }, { now: () => clock, sleep: async ms => { clock += ms; } });
+    expect(denied.status).toBe('failed');
+    if (denied.status !== 'failed') throw new Error('expected failed');
+    expect(denied.unconfirmed).toBe(false);
+    expect(forbiddenCalls).toBe(1); // 确定性拒绝不再重试
+
+    const conflict = await runFixtureStage('workspace', async () => {
+      throw new CompanyError('conflict', 'creating workspace failed: HTTP 409');
+    }, { now: () => clock, sleep: async ms => { clock += ms; } });
+    if (conflict.status !== 'failed') throw new Error('expected failed');
+    expect(conflict.unconfirmed).toBe(true); // 409 可能表示另一笔创建刚完成
+
+    let calls = 0;
+    const overwritten = await runFixtureStage('workspace', async () => {
+      calls++;
+      if (calls === 1) throw new CompanyError('upstream_error', 'workspace create response lost', true);
+      throw new CompanyError('forbidden', 'workspace-create-forbidden');
+    }, { now: () => clock, sleep: async ms => { clock += ms; } });
+    expect(overwritten.status).toBe('failed');
+    if (overwritten.status !== 'failed') throw new Error('expected failed');
+    expect(calls).toBe(2);
+    // 第一次已发出且结果不明；最终错误码不能把这次事实覆盖成“未写入”。
+    expect(overwritten.unconfirmed).toBe(true);
+  });
+
+  test('执行中撤权：workspace 成功后撤租约，sample/browser 不再执行', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    let revokedAt: string | undefined;
+    const original = r.world.fetch;
+    r.broker = new OpsBroker({
+      core: r.company.core, projects: r.company.projects as never, secretKey: () => Buffer.alloc(32),
+      controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
+      fetch: async (input, init) => {
+        const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url);
+        const method = (init?.method ?? 'GET').toUpperCase();
+        const response = await original(input as never, init);
+        if (!revokedAt && method === 'POST' && url.pathname === '/api/workspaces') {
+          r.company.endLease('qa-1');
+          revokedAt = `${method} ${url.pathname}`;
+        }
+        return response;
+      },
+      now: r.world.now, d1: () => r.world.d1, queryAsUser: r.world.queryAsUser, browser: r.world.browser,
+      sleep: async ms => { r.world.clock += ms; }, ...r.paths,
+    });
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo', browser: { spaceId: 42, page: 'p2' } }));
+    expect(revokedAt).toBe('POST /api/workspaces');
+    expect(error.code).toBe('forbidden');
+    expect(error.message).toMatch(/阶段=sample|复查租约失败/);
+    expect(existsSync(sampleFile(r, id))).toBe(false);
+    expect(r.world.browserLogins).toHaveLength(0);
+    expect(r.world.workspaces.size).toBe(1);
+  });
+
+  test('排队期间撤权：第二个调用在副作用前被拒', async () => {
+    const r = fixtureRig();
+    let releaseWorkspace!: () => void;
+    const workspaceGate = new Promise<void>(resolve => { releaseWorkspace = resolve; });
+    let markStarted!: () => void;
+    const workspaceStarted = new Promise<void>(resolve => { markStarted = resolve; });
+    const original = r.world.fetch;
+    r.broker = new OpsBroker({
+      core: r.company.core, projects: r.company.projects as never, secretKey: () => Buffer.alloc(32),
+      controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
+      fetch: async (input, init) => {
+        const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url);
+        const method = (init?.method ?? 'GET').toUpperCase();
+        if (method === 'POST' && url.pathname === '/api/workspaces') {
+          markStarted();
+          await workspaceGate;
+        }
+        return original(input as never, init);
+      },
+      now: r.world.now, d1: () => r.world.d1, queryAsUser: r.world.queryAsUser, browser: r.world.browser,
+      sleep: async ms => { r.world.clock += ms; }, ...r.paths,
+    });
+    const first = call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    await workspaceStarted;
+    const queued = call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    r.company.endLease('qa-1');
+    releaseWorkspace();
+    const firstOutcome = await failure(first);
+    const queuedError = await failure(queued);
+    expect(firstOutcome.code).toBe('forbidden');
+    expect(firstOutcome.message).toMatch(/阶段=sample|复查租约失败/);
+    expect(queuedError.code).toBe('forbidden');
+    expect(r.world.browserLogins).toHaveLength(0);
+  });
+
+  test('同员工同任务的新租约拒绝读取与回收旧租约资产', async () => {
+    const r = fixtureRig();
+    const id = identityFor('task-1', 'DEMO', 1);
+    await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    expect(existsSync(sampleFile(r, id))).toBe(true);
+    r.company.endLease('qa-1');
+    const revived = r.company.lease('qa-1', 'qa', 'task-1');
+    const reclaimed = await call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'reclaim' }, { cred: revived, task: 'task-1' });
+    expect(reclaimed).toMatchObject({ status: 'not_owned', reclaimed: false });
+    expect(existsSync(sampleFile(r, id))).toBe(true);
+    const readDenied = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'read' }, { cred: revived, task: 'task-1' }));
+    expect(readDenied.code).toBe('not_found');
+    // 新租约准备得到另一套资产名，不继承旧账号/workspace。
+    const next = await call(r, 'ops_test_fixture_ready', { alias: 'demo' }, { cred: revived, task: 'task-1' });
+    const id2 = identityFor('task-1', 'DEMO', 2);
+    expect(next.fixture.alias).toBe(id2.alias);
+    expect(next.fixture.alias).not.toBe(id.alias);
+    expect(next.fixture.workspace.slug).not.toBe(id.workspaceSlug);
+    expect(existsSync(sampleFile(r, id))).toBe(true);
+    expect(existsSync(sampleFile(r, id2))).toBe(true);
+  });
+
+  test('活租约经官方工具读取合成样本（json/csv），不暴露本机路径', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    const ready = await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    const json = await call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'read', handle: ready.fixture.sample.handle });
+    expect(json.sample.format).toBe('json');
+    expect(json.sample.handle).toBe(ready.fixture.sample.handle);
+    expect(json.sample.content).toContain('"synthetic": true');
+    expect(JSON.stringify(json)).not.toContain(sampleFile(r, id));
+    const csv = await call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'read', format: 'csv', handle: ready.fixture.sample.handle });
+    expect(csv.sample.format).toBe('csv');
+    expect(csv.sample.content).toBe(fixtureSampleCsv(id));
+    expect(csv.sample.content.split('\n')[0]).toBe('id,name,email,amount,status');
+    expect(JSON.stringify(csv)).not.toContain(sampleFile(r, id));
+    expectNoLeaks(r);
+  });
+
+  test('同阶段 retryable 退避期间撤权：第二次外部写不得发出', async () => {
+    const r = fixtureRig();
+    let firstPostSeen = false;
+    let sleepEntered!: () => void;
+    const sleepGate = new Promise<void>(resolve => { sleepEntered = resolve; });
+    const sleepHold: Array<() => void> = [];
+    const original = r.world.fetch;
+    r.broker = new OpsBroker({
+      core: r.company.core, projects: r.company.projects as never, secretKey: () => Buffer.alloc(32),
+      controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
+      fetch: async (input, init) => {
+        const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url);
+        const method = (init?.method ?? 'GET').toUpperCase();
+        if (method === 'POST' && url.pathname === '/api/workspaces') {
+          if (!firstPostSeen) {
+            firstPostSeen = true;
+            r.world.requests.push({ method, url: url.toString() });
+            throw new CompanyError('upstream_error', 'workspace create temporarily unavailable', true);
+          }
+        }
+        return original(input as never, init);
+      },
+      now: r.world.now, d1: () => r.world.d1, queryAsUser: r.world.queryAsUser, browser: r.world.browser,
+      sleep: async ms => {
+        if (sleepHold.length === 0) {
+          await new Promise<void>(resolve => {
+            sleepHold.push(resolve);
+            sleepEntered();
+          });
+        }
+        r.world.clock += ms;
+      },
+      ...r.paths,
+    });
+    const callPromise = call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    await sleepGate;
+    const postsBefore = r.world.requests.filter(q => q.method === 'POST' && new URL(q.url).pathname === '/api/workspaces').length;
+    expect(postsBefore).toBe(1);
+    r.company.endLease('qa-1');
+    sleepHold[0]!();
+    const error = await failure(callPromise);
+    const postsAfter = r.world.requests.filter(q => q.method === 'POST' && new URL(q.url).pathname === '/api/workspaces').length;
+    expect(postsAfter).toBe(1);
+    expect(error.code).toBe('forbidden');
+    expect(error.message).toMatch(/复查租约失败|阶段=workspace/);
+    expect(r.world.browserLogins).toHaveLength(0);
+    expect(existsSync(sampleFile(r))).toBe(false);
+  });
+
+  test('同阶段 retryable 退避期间 fence 变化：第二次外部写不得发出', async () => {
+    const r = fixtureRig();
+    let firstPostSeen = false;
+    let sleepEntered!: () => void;
+    const sleepGate = new Promise<void>(resolve => { sleepEntered = resolve; });
+    const sleepHold: Array<() => void> = [];
+    const original = r.world.fetch;
+    r.broker = new OpsBroker({
+      core: r.company.core, projects: r.company.projects as never, secretKey: () => Buffer.alloc(32),
+      controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
+      fetch: async (input, init) => {
+        const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url);
+        const method = (init?.method ?? 'GET').toUpperCase();
+        if (method === 'POST' && url.pathname === '/api/workspaces') {
+          if (!firstPostSeen) {
+            firstPostSeen = true;
+            r.world.requests.push({ method, url: url.toString() });
+            throw new CompanyError('upstream_error', 'workspace create temporarily unavailable', true);
+          }
+        }
+        return original(input as never, init);
+      },
+      now: r.world.now, d1: () => r.world.d1, queryAsUser: r.world.queryAsUser, browser: r.world.browser,
+      sleep: async ms => {
+        if (sleepHold.length === 0) {
+          await new Promise<void>(resolve => {
+            sleepHold.push(resolve);
+            sleepEntered();
+          });
+        }
+        r.world.clock += ms;
+      },
+      ...r.paths,
+    });
+    const callPromise = call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    await sleepGate;
+    // 同员工同任务重新认领 → fence 递增，旧调用的 beforeAttempt 必须拦下第二次写。
+    r.company.endLease('qa-1');
+    r.company.lease('qa-1', 'qa', 'task-1');
+    sleepHold[0]!();
+    const error = await failure(callPromise);
+    const postsAfter = r.world.requests.filter(q => q.method === 'POST' && new URL(q.url).pathname === '/api/workspaces').length;
+    expect(postsAfter).toBe(1);
+    expect(error.code).toBe('forbidden');
+    expect(error.message).toMatch(/租约代际已变化|复查租约失败/);
   });
 });

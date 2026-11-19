@@ -505,6 +505,11 @@ export interface OpsScope {
   actor: Principal;
   taskId: TaskId;
   project: string;
+  /**
+   * 租约代际：同一员工/同一任务重新取得租约时由 claim 递增（task.fence）。工具在每个有副作用阶段前
+   * 重新核对此值，旧租约的台账资产不能由新租约读取或回收。缺省视为 0，供没有 fence 的实现兼容。
+   */
+  leaseFence?: number;
 }
 
 /** The restricted authorization a recovery read grant carries into one ops call. */
