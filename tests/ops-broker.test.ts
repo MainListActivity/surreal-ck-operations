@@ -10,7 +10,7 @@ import type { OpsScope } from '../src/contracts.ts';
 import type { OriginRequest } from '../src/ops/origin.ts';
 import { parseBrokerConfig } from '../src/ops/config.ts';
 import { verifyPassword } from '../src/ops/password.ts';
-import { fixtureIdentity, fixtureSamplePath } from '../src/ops/test-fixture.ts';
+import { fixtureIdentity, fixtureSampleCsv, fixtureSamplePath, FIXTURE_STAGE_BUDGET_MS, runFixtureStage } from '../src/ops/test-fixture.ts';
 import { brokerConfig, FakeCompany, FakeWorld, OPS_CLIENT, OPS_DIRECT_CLIENT, OPS_DIRECT_REDIRECT, OPS_REDIRECT, OPS_RESOURCE, TENANT } from './support/ops-world.ts';
 
 interface Rig { world: FakeWorld; company: FakeCompany; broker: OpsBroker; qa: string; outputs: unknown[] }
@@ -2082,8 +2082,8 @@ describe('ops 测试夹具', () => {
   const cleanups: Array<() => void> = [];
   afterEach(() => { while (cleanups.length) cleanups.pop()!(); });
 
-  const identityFor = (task = 'task-1', alias = 'DEMO') =>
-    fixtureIdentity({ project: 'demo', env: 'production', taskId: task, alias, accountPrefix: 'sck-', workspacePrefix: 'sck-' });
+  const identityFor = (task = 'task-1', alias = 'DEMO', leaseFence = 1) =>
+    fixtureIdentity({ project: 'demo', env: 'production', taskId: task, alias, accountPrefix: 'sck-', workspacePrefix: 'sck-', leaseFence });
 
   function fixtureRig(patch: Record<string, unknown> = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'ops-fixture-'));
@@ -2109,7 +2109,7 @@ describe('ops 测试夹具', () => {
   test('命名按账号/workspace 前缀分开，长前缀也不会截掉任务摘要', () => {
     const id = fixtureIdentity({
       project: 'demo', env: 'production', taskId: 'task-long', alias: 'A'.repeat(40),
-      accountPrefix: 'acct-', workspacePrefix: 'w'.repeat(21),
+      accountPrefix: 'acct-', workspacePrefix: 'w'.repeat(21), leaseFence: 1,
     });
     expect(id.username.startsWith('acct-test-')).toBe(true);
     expect(id.alias.length).toBeLessThanOrEqual(40);
@@ -2330,5 +2330,122 @@ describe('ops 测试夹具', () => {
     expect(second.fixture.alias).not.toBe(id.alias);
     expect(second.fixture.workspace.slug).not.toBe(id.workspaceSlug);
     expect(r.world.user(id2.username)).toBeDefined();
+  });
+
+  test('阶段内超时：work 本身超预算时判 timed_out，不把超时当未写入', async () => {
+    let clock = 0;
+    const outcome = await runFixtureStage('workspace', async () => {
+      clock += FIXTURE_STAGE_BUDGET_MS.workspace + 1;
+      return 'worked';
+    }, { now: () => clock, sleep: async ms => { clock += ms; } });
+    expect(outcome.status).toBe('timed_out');
+    if (outcome.status !== 'timed_out') throw new Error('expected timed_out');
+    expect(outcome.error.timedOut).toBe(true);
+    expect(outcome.elapsedMs).toBeGreaterThanOrEqual(FIXTURE_STAGE_BUDGET_MS.workspace);
+  });
+
+  test('执行中撤权：workspace 成功后撤租约，sample/browser 不再执行', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    let revokedAt: string | undefined;
+    const original = r.world.fetch;
+    r.broker = new OpsBroker({
+      core: r.company.core, projects: r.company.projects as never, secretKey: () => Buffer.alloc(32),
+      controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
+      fetch: async (input, init) => {
+        const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url);
+        const method = (init?.method ?? 'GET').toUpperCase();
+        const response = await original(input as never, init);
+        if (!revokedAt && method === 'POST' && url.pathname === '/api/workspaces') {
+          r.company.endLease('qa-1');
+          revokedAt = `${method} ${url.pathname}`;
+        }
+        return response;
+      },
+      now: r.world.now, d1: () => r.world.d1, queryAsUser: r.world.queryAsUser, browser: r.world.browser,
+      sleep: async ms => { r.world.clock += ms; }, ...r.paths,
+    });
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo', browser: { spaceId: 42, page: 'p2' } }));
+    expect(revokedAt).toBe('POST /api/workspaces');
+    expect(error.code).toBe('forbidden');
+    expect(error.message).toMatch(/阶段=sample|复查租约失败/);
+    expect(existsSync(sampleFile(r, id))).toBe(false);
+    expect(r.world.browserLogins).toHaveLength(0);
+    expect(r.world.workspaces.size).toBe(1);
+  });
+
+  test('排队期间撤权：第二个调用在副作用前被拒', async () => {
+    const r = fixtureRig();
+    let releaseWorkspace!: () => void;
+    const workspaceGate = new Promise<void>(resolve => { releaseWorkspace = resolve; });
+    let markStarted!: () => void;
+    const workspaceStarted = new Promise<void>(resolve => { markStarted = resolve; });
+    const original = r.world.fetch;
+    r.broker = new OpsBroker({
+      core: r.company.core, projects: r.company.projects as never, secretKey: () => Buffer.alloc(32),
+      controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
+      fetch: async (input, init) => {
+        const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url);
+        const method = (init?.method ?? 'GET').toUpperCase();
+        if (method === 'POST' && url.pathname === '/api/workspaces') {
+          markStarted();
+          await workspaceGate;
+        }
+        return original(input as never, init);
+      },
+      now: r.world.now, d1: () => r.world.d1, queryAsUser: r.world.queryAsUser, browser: r.world.browser,
+      sleep: async ms => { r.world.clock += ms; }, ...r.paths,
+    });
+    const first = call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    await workspaceStarted;
+    const queued = call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    r.company.endLease('qa-1');
+    releaseWorkspace();
+    const firstOutcome = await failure(first);
+    const queuedError = await failure(queued);
+    expect(firstOutcome.code).toBe('forbidden');
+    expect(firstOutcome.message).toMatch(/阶段=sample|复查租约失败/);
+    expect(queuedError.code).toBe('forbidden');
+    expect(r.world.browserLogins).toHaveLength(0);
+  });
+
+  test('同员工同任务的新租约拒绝读取与回收旧租约资产', async () => {
+    const r = fixtureRig();
+    const id = identityFor('task-1', 'DEMO', 1);
+    await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    expect(existsSync(sampleFile(r, id))).toBe(true);
+    r.company.endLease('qa-1');
+    const revived = r.company.lease('qa-1', 'qa', 'task-1');
+    const reclaimed = await call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'reclaim' }, { cred: revived, task: 'task-1' });
+    expect(reclaimed).toMatchObject({ status: 'not_owned', reclaimed: false });
+    expect(existsSync(sampleFile(r, id))).toBe(true);
+    const readDenied = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'read' }, { cred: revived, task: 'task-1' }));
+    expect(readDenied.code).toBe('not_found');
+    // 新租约准备得到另一套资产名，不继承旧账号/workspace。
+    const next = await call(r, 'ops_test_fixture_ready', { alias: 'demo' }, { cred: revived, task: 'task-1' });
+    const id2 = identityFor('task-1', 'DEMO', 2);
+    expect(next.fixture.alias).toBe(id2.alias);
+    expect(next.fixture.alias).not.toBe(id.alias);
+    expect(next.fixture.workspace.slug).not.toBe(id.workspaceSlug);
+    expect(existsSync(sampleFile(r, id))).toBe(true);
+    expect(existsSync(sampleFile(r, id2))).toBe(true);
+  });
+
+  test('活租约经官方工具读取合成样本（json/csv），不暴露本机路径', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    const ready = await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    const json = await call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'read', handle: ready.fixture.sample.handle });
+    expect(json.sample.format).toBe('json');
+    expect(json.sample.handle).toBe(ready.fixture.sample.handle);
+    expect(json.sample.content).toContain('"synthetic": true');
+    expect(JSON.stringify(json)).not.toContain(sampleFile(r, id));
+    const csv = await call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'read', format: 'csv', handle: ready.fixture.sample.handle });
+    expect(csv.sample.format).toBe('csv');
+    expect(csv.sample.content).toBe(fixtureSampleCsv(id));
+    expect(csv.sample.content.split('\n')[0]).toBe('id,name,email,amount,status');
+    expect(JSON.stringify(csv)).not.toContain(sampleFile(r, id));
+    expectNoLeaks(r);
   });
 });

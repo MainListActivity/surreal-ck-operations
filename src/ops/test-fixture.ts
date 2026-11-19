@@ -48,14 +48,17 @@ function slugPart(value: string, max: number): string {
 }
 
 /**
- * 由租约派生确定性名字。`ref` 取 project/env/task/alias 的摘要，既把不同租约分开，也让同一租约
- * 在重启后得到同一套名字 —— 这是跨重启幂等的基础。
+ * 由租约派生确定性名字。`ref` 取 project/env/task/fence/alias 的摘要：同一员工/任务重新取得租约时
+ * fence 变化，得到一套全新的资产名，旧租约的账号、workspace 与样本不会被新租约继承或回收。
  */
 export function fixtureIdentity(input: {
   project: string; env: string; taskId: string; alias: string; accountPrefix: string; workspacePrefix: string;
+  /** 租约代际；缺省 0，兼容没有 fence 的调用方。 */
+  leaseFence?: number;
 }): FixtureIdentity {
   const requestedAlias = input.alias;
-  const ref = sha256(`${input.project}\n${input.env}\n${input.taskId}\n${requestedAlias}`).slice(0, 8);
+  const fence = Number.isSafeInteger(input.leaseFence) && (input.leaseFence as number) >= 0 ? input.leaseFence as number : 0;
+  const ref = sha256(`${input.project}\n${input.env}\n${input.taskId}\n${fence}\n${requestedAlias}`).slice(0, 8);
   const base = requestedAlias.slice(0, 26);
   const alias = `${FIXTURE_ALIAS_PREFIX}${base}_${ref}`;
   const username = `${input.accountPrefix}${alias.toLowerCase().replaceAll('_', '-')}`;
@@ -64,7 +67,7 @@ export function fixtureIdentity(input: {
   const part = slugPart(base, Math.min(18, room));
   const workspaceSlug = `${input.workspacePrefix}test-${part ? `${part}-` : ''}${ref}`.slice(0, 40);
   return {
-    key: `${input.project}/${input.env}/${input.taskId}/${alias}`,
+    key: `${input.project}/${input.env}/${input.taskId}/${fence}/${alias}`,
     alias, username, workspaceSlug,
     workspaceName: `QA fixture ${alias}`.slice(0, 80),
     requestedAlias,
@@ -98,11 +101,24 @@ export function fixtureSamplePath(root: string, id: FixtureIdentity): string {
   return join(root, task, `${id.alias.toLowerCase().replaceAll('_', '-')}.json`);
 }
 
+/** 同一份合成样本的 CSV 投影，供 CK CSV 复验；内容仍只来自固定合成记录。 */
+export function fixtureSampleCsv(id: FixtureIdentity): string {
+  const records = JSON.parse(fixtureSample(id).body).records as Array<Record<string, unknown>>;
+  const columns = ['id', 'name', 'email', 'amount', 'status'];
+  const cell = (value: unknown) => {
+    const raw = value === null || value === undefined ? '' : String(value);
+    return /[",\n]/.test(raw) ? `"${raw.replaceAll('"', '""')}"` : raw;
+  };
+  return `${columns.join(',')}\n${records.map(record => columns.map(column => cell(record[column])).join(',')).join('\n')}\n`;
+}
+
 export interface FixtureRecord {
   taskId: string;
   employeeId: string;
   project: string;
   env: string;
+  /** 创建本记录时的租约 fence；新租约（更大 fence）一律视为非本卡资产。 */
+  leaseFence: number;
   alias: string;
   username: string;
   workspaceSlug: string;
@@ -114,6 +130,11 @@ export interface FixtureRecord {
   created: { account: boolean; workspace: boolean; sample: boolean };
   /** 已发出的创建意图：只有它存在时，创建中途崩溃留下的同名资产才可被同一租约接续。 */
   intent: { account: boolean; workspace: boolean; sample: boolean };
+  /**
+   * 写入结果未知：外部调用已经发出，但响应未在期限内返回。再次准备时只按幂等核对，禁止盲重试。
+   * 键是阶段名，值为 true 表示该阶段有一笔未确认的写。
+   */
+  uncertain?: Partial<Record<'account' | 'workspace' | 'sample', true>>;
   status: 'ready' | 'failed' | 'retained';
   updatedAt: string;
 }
@@ -160,11 +181,11 @@ export class FixtureJournal {
 }
 
 const recordKey = (record: FixtureRecord) =>
-  `${record.project}/${record.env}/${record.taskId}/${record.alias}`;
+  `${record.project}/${record.env}/${record.taskId}/${record.leaseFence}/${record.alias}`;
 
 /** 阶段失败：只携带固定阶段名、耗时与错误码，消息由调用方补充可清理状态。 */
 export class FixtureStageError extends CompanyError {
-  constructor(readonly stage: FixtureStage, readonly elapsedMs: number, cause: CompanyError) {
+  constructor(readonly stage: FixtureStage, readonly elapsedMs: number, cause: CompanyError, readonly timedOut = false) {
     super(cause.code, cause.message, cause.retryable);
     this.name = 'FixtureStageError';
   }
@@ -176,31 +197,82 @@ const transientFailure = (error: unknown): boolean => {
   return error.retryable && (error.code === 'upstream_error' || error.code === 'login_failed');
 };
 
+export type FixtureStageOutcome<T> =
+  | { status: 'ok'; value: T; elapsedMs: number; attempts: number }
+  | { status: 'timed_out'; elapsedMs: number; attempts: number; error: FixtureStageError }
+  | { status: 'failed'; elapsedMs: number; attempts: number; error: FixtureStageError };
+
 /**
- * 固定次数的阶段执行器：每次失败之间退避一次，超过阶段期限就不再发起新的尝试。
- * 故障预算仍在 OpsBroker 的外层（reserve/report），这里只控制单个阶段的形状。
+ * 固定次数的阶段执行器：`work()` 本身受预算限制。
+ * - 真实挂起：用原生定时器在期限到达时停止等待（不取消已发出的外部写）。
+ * - 假时钟：work 自己把 now 推过期限再返回时，完成后的 elapsed 检查仍判为 timed_out。
+ * 超时不得等同“未写入”：调用方必须按事实核对并在台账上标记 uncertain，禁止盲重试。
+ * 故障预算仍在 OpsBroker 外层。
  */
 export async function runFixtureStage<T>(
   stage: FixtureStage,
   work: () => Promise<T>,
   clocks: { now: () => number; sleep: (ms: number) => Promise<void> },
-): Promise<T> {
+): Promise<FixtureStageOutcome<T>> {
   const budget = FIXTURE_STAGE_BUDGET_MS[stage];
   const started = clocks.now();
+  let attempts = 0;
   let last: unknown;
+
   for (let attempt = 1; attempt <= FIXTURE_STAGE_ATTEMPTS; attempt++) {
+    attempts = attempt;
+    if (clocks.now() - started >= budget) break;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const remaining = Math.max(1, budget - (clocks.now() - started));
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(Object.assign(
+          new CompanyError('upstream_error', `${stage} 阶段超过 ${budget}ms 期限`, true),
+          { timedOut: true as const },
+        ));
+      }, remaining);
+    });
+
     try {
-      return await work();
+      const value = await Promise.race([work(), deadline]);
+      if (timer) clearTimeout(timer);
+      const elapsedMs = Math.max(0, Math.round(clocks.now() - started));
+      if (elapsedMs >= budget) {
+        return {
+          status: 'timed_out', elapsedMs, attempts,
+          error: new FixtureStageError(stage, elapsedMs,
+            new CompanyError('upstream_error', `${stage} 阶段超过 ${budget}ms 期限`, true), true),
+        };
+      }
+      return { status: 'ok', value, elapsedMs, attempts };
     } catch (error) {
+      if (timer) clearTimeout(timer);
       last = error;
+      const timedOut = !!(error as { timedOut?: boolean }).timedOut;
+      if (timedOut) {
+        const elapsedMs = Math.max(0, Math.round(clocks.now() - started));
+        const cause = error instanceof CompanyError
+          ? error
+          : new CompanyError('upstream_error', `${stage} 阶段超过 ${budget}ms 期限`, true);
+        return {
+          status: 'timed_out', elapsedMs, attempts,
+          error: new FixtureStageError(stage, elapsedMs, cause, true),
+        };
+      }
       const elapsed = clocks.now() - started;
       if (!transientFailure(error) || attempt === FIXTURE_STAGE_ATTEMPTS) break;
       if (elapsed + FIXTURE_STAGE_BACKOFF_MS >= budget) break;
       await clocks.sleep(FIXTURE_STAGE_BACKOFF_MS);
     }
   }
+
   const cause = last instanceof CompanyError
     ? last
     : new CompanyError('upstream_error', `${(last as Error)?.name ?? 'Error'}: ${String((last as Error)?.message ?? last).slice(0, 160)}`, true);
-  throw new FixtureStageError(stage, Math.max(0, Math.round(clocks.now() - started)), cause);
+  const elapsedMs = Math.max(0, Math.round(clocks.now() - started));
+  return {
+    status: 'failed', elapsedMs, attempts,
+    error: new FixtureStageError(stage, elapsedMs, cause, false),
+  };
 }

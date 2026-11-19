@@ -1023,12 +1023,17 @@ export class FakeCompany {
   readonly audits: Audit[] = [];
   readonly sealed = new Map<string, string>();
   envs: Record<string, EnvBrokerRow[]> = {};
-  private readonly leases = new Map<string, { employeeId: string; role: Role; taskId: string; project: string; live: boolean }>();
+  private readonly leases = new Map<string, { employeeId: string; role: Role; taskId: string; project: string; live: boolean; fence: number }>();
+  /** 同一员工/任务的每一次重新认领都递增，和 core.claim 的 task.fence 语义一致。 */
+  private readonly leaseFences = new Map<string, number>();
 
   /** Registers a lease holder and returns the credential the sidecar would hold for it. */
   lease(employeeId: string, role: Role, taskId: string, project = 'demo'): string {
     const credential = `cred-${employeeId}`;
-    this.leases.set(credential, { employeeId, role, taskId, project, live: true });
+    const key = `${employeeId}/${taskId}`;
+    const fence = (this.leaseFences.get(key) ?? 0) + 1;
+    this.leaseFences.set(key, fence);
+    this.leases.set(credential, { employeeId, role, taskId, project, live: true, fence });
     return credential;
   }
 
@@ -1061,7 +1066,7 @@ export class FakeCompany {
       const lease = this.leases.get(credential);
       if (!lease) throw new CompanyError('forbidden', 'unknown credential');
       if (!lease.live || lease.taskId !== taskId) throw new CompanyError('forbidden', 'ops tools need the live lease of the task');
-      return { actor: { employeeId: lease.employeeId, role: lease.role, capabilities: ['execute'] }, taskId, project: lease.project };
+      return { actor: { employeeId: lease.employeeId, role: lease.role, capabilities: ['execute'] }, taskId, project: lease.project, leaseFence: lease.fence };
     },
     auditOps: async (scope: OpsScope, action: string, evidence: string) => {
       this.audits.push({ employeeId: scope.actor.employeeId, taskId: scope.taskId, project: scope.project, action, evidence });
