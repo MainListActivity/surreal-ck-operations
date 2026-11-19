@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { OPS_TOOLS, OpsBroker, proofDeliverErrorCode, type OpsDeps } from '../src/ops/broker.ts';
 import { browserInjectFailure } from '../src/ops/browser.ts';
 import { CompanyError } from '../src/core-errors.ts';
@@ -10,6 +10,7 @@ import type { OpsScope } from '../src/contracts.ts';
 import type { OriginRequest } from '../src/ops/origin.ts';
 import { parseBrokerConfig } from '../src/ops/config.ts';
 import { verifyPassword } from '../src/ops/password.ts';
+import { fixtureIdentity, fixtureSamplePath } from '../src/ops/test-fixture.ts';
 import { brokerConfig, FakeCompany, FakeWorld, OPS_CLIENT, OPS_DIRECT_CLIENT, OPS_DIRECT_REDIRECT, OPS_REDIRECT, OPS_RESOURCE, TENANT } from './support/ops-world.ts';
 
 interface Rig { world: FakeWorld; company: FakeCompany; broker: OpsBroker; qa: string; outputs: unknown[] }
@@ -59,7 +60,7 @@ describe('ops gate', () => {
       'ops_idp_provision_rotate',
       'ops_info', 'ops_internal_ai_approval_diagnose', 'ops_internal_ai_deliver', 'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_revoke', 'ops_internal_ai_rotate_key', 'ops_internal_ai_trust',
       'ops_invitation_issue', 'ops_login', 'ops_logout', 'ops_magpie_route_restore', 'ops_magpie_route_sample', 'ops_magpie_window_prepare', 'ops_member_add', 'ops_member_list', 'ops_member_remove',
-      'ops_operator_login', 'ops_origin_health', 'ops_origin_logs', 'ops_origin_status', 'ops_platform_operator_list', 'ops_product_magpie_candidate', 'ops_product_magpie_observe', 'ops_product_magpie_price_approve', 'ops_product_pulse', 'ops_query', 'ops_release_diagnose', 'ops_request', 'ops_supplier_plan_sample', 'ops_workspace_ensure',
+      'ops_operator_login', 'ops_origin_health', 'ops_origin_logs', 'ops_origin_status', 'ops_platform_operator_list', 'ops_product_magpie_candidate', 'ops_product_magpie_observe', 'ops_product_magpie_price_approve', 'ops_product_pulse', 'ops_query', 'ops_release_diagnose', 'ops_request', 'ops_supplier_plan_sample', 'ops_test_fixture_ready', 'ops_workspace_ensure',
     ]);
   });
 
@@ -2074,5 +2075,245 @@ describe('ops_internal_ai_deliver 产品错误码透传', () => {
       'unauthorized', null, undefined, 42,
     ]) expect(code(body)).toBeUndefined();
     expect(code({ error: { code: 'company-status-unavailable' } }, true, 200)).toBeUndefined();
+  });
+});
+
+describe('ops 测试夹具', () => {
+  const cleanups: Array<() => void> = [];
+  afterEach(() => { while (cleanups.length) cleanups.pop()!(); });
+
+  const identityFor = (task = 'task-1', alias = 'DEMO') =>
+    fixtureIdentity({ project: 'demo', env: 'production', taskId: task, alias, accountPrefix: 'sck-', workspacePrefix: 'sck-' });
+
+  function fixtureRig(patch: Record<string, unknown> = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'ops-fixture-'));
+    const paths = { fixtureJournalPath: join(dir, 'journal.json'), fixtureDir: join(dir, 'samples') };
+    const base = rig(patch, true, paths);
+    const rebuild = () => new OpsBroker({
+      core: base.company.core, projects: base.company.projects as never, secretKey: () => Buffer.alloc(32),
+      controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
+      fetch: base.world.fetch, now: base.world.now, d1: () => base.world.d1,
+      queryAsUser: base.world.queryAsUser, browser: base.world.browser,
+      sleep: async ms => { base.world.clock += ms; }, ...paths,
+    });
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    return { ...base, dir, paths, rebuild };
+  }
+
+  const sampleFile = (r: { paths: { fixtureDir: string } }, id = identityFor()) =>
+    fixtureSamplePath(r.paths.fixtureDir, id);
+
+  const userCount = (r: ReturnType<typeof fixtureRig>) =>
+    (r.world.sqlite.query('SELECT COUNT(*) AS n FROM users').get() as { n: number }).n;
+
+  test('命名按账号/workspace 前缀分开，长前缀也不会截掉任务摘要', () => {
+    const id = fixtureIdentity({
+      project: 'demo', env: 'production', taskId: 'task-long', alias: 'A'.repeat(40),
+      accountPrefix: 'acct-', workspacePrefix: 'w'.repeat(21),
+    });
+    expect(id.username.startsWith('acct-test-')).toBe(true);
+    expect(id.alias.length).toBeLessThanOrEqual(40);
+    expect(id.workspaceSlug.length).toBeLessThanOrEqual(40);
+    expect(id.workspaceSlug.endsWith(id.alias.slice(-8))).toBe(true);
+  });
+
+  test('成功准备：测试专用别名、workspace、合成样本与不透明句柄', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    const result = await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    expect(result.status).toBe('ready');
+    expect(result.fixture.alias).toBe(id.alias);
+    expect(result.fixture.username).toBe(id.username);
+    expect(result.fixture.workspace).toEqual({ slug: id.workspaceSlug, name: id.workspaceName, role: 'admin', created: true });
+    expect(result.fixture.account).toEqual({ result: 'created' });
+    expect(result.fixture.session).toMatch(/^s_[0-9a-f]{16}$/);
+    expect(result.fixture.sample).toMatchObject({ records: 3 });
+    expect(result.stages.map((s: { stage: string }) => s.stage)).toEqual(['account', 'login', 'workspace', 'sample']);
+    expect(r.world.user(id.username)).toMatchObject({ status: 'active' });
+    expect([...r.world.workspaces.keys()]).toEqual([id.workspaceSlug]);
+    const sample = readFileSync(sampleFile(r, id), 'utf8');
+    expect(sample).toContain('"synthetic": true');
+    expect(r.company.audits.some(a => a.action === 'ops_account_create')).toBe(true);
+    expectNoLeaks(r);
+    const journal = readFileSync(join(r.dir, 'journal.json'), 'utf8');
+    for (const secret of [...r.world.tokens, ...r.company.sealed.values(), 'cf-token-value']) {
+      expect(journal).not.toContain(secret);
+      expect(sample).not.toContain(secret);
+    }
+  });
+
+  test('重启幂等：同一台账的第二个 broker 复用账号、workspace 与样本', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    const first = await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    expect(first.fixture.account.result).toBe('created');
+    const second = await r.rebuild().call(r.qa, 'task-1', 'ops_test_fixture_ready', { alias: 'demo' }) as Record<string, any>;
+    r.outputs.push(second);
+    expect(second.fixture.account.result).toBe('exists');
+    expect(second.fixture.workspace.created).toBe(false);
+    expect(second.fixture.sample.handle).toBe(first.fixture.sample.handle);
+    expect(userCount(r)).toBe(1);
+    expect(r.world.workspaces.size).toBe(1);
+    expect(r.world.requests.filter(q => q.method === 'POST' && new URL(q.url).pathname === '/api/workspaces')).toHaveLength(1);
+    expect(id.alias.length).toBeLessThanOrEqual(40);
+    expectNoLeaks(r);
+  });
+
+  test('并发调用串行化，只创建一个账号与一个 workspace', async () => {
+    const r = fixtureRig();
+    const [a, b] = await Promise.all([
+      call(r, 'ops_test_fixture_ready', { alias: 'demo' }),
+      call(r, 'ops_test_fixture_ready', { alias: 'demo' }),
+    ]);
+    expect([a.fixture.account.result, b.fixture.account.result].sort()).toEqual(['created', 'exists']);
+    expect(userCount(r)).toBe(1);
+    expect(r.world.workspaces.size).toBe(1);
+    expect(r.world.requests.filter(q => q.method === 'POST' && new URL(q.url).pathname === '/api/workspaces')).toHaveLength(1);
+  });
+
+  test('workspace 阶段失败：报准确阶段与可清理状态，账号保留、样本未创建', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    r.world.fault((method, url) => method === 'POST' && url.pathname === '/api/workspaces', 500, { times: 2 });
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toContain('阶段=workspace');
+    expect(error.message).toContain('可清理状态');
+    expect(error.message).toContain('account=retained');
+    expect(error.message).toContain('sample=not_created');
+    expect(error.message).toContain('session=1 个已丢弃');
+    expect(r.world.user(id.username)).toBeDefined();
+    expect(r.world.workspaces.size).toBe(0);
+    expect(existsSync(sampleFile(r, id))).toBe(false);
+    for (const secret of [...r.world.tokens, ...r.company.sealed.values()]) expect(error.message).not.toContain(secret);
+  });
+
+  test('租约结束后不再运行，也不删除已有样本', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    const before = readFileSync(sampleFile(r, id), 'utf8');
+    r.company.endLease('qa-1');
+    const denied = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'reclaim' }));
+    expect(denied.code).toBe('forbidden');
+    expect(readFileSync(sampleFile(r, id), 'utf8')).toBe(before);
+    expect(r.world.workspaces.size).toBe(1);
+  });
+
+  test('角色被环境授权撤回后拒绝执行', async () => {
+    const r = fixtureRig({ roles: ['engineering'] });
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(error.code).toBe('forbidden');
+    expect(r.world.requests).toHaveLength(0);
+    expect(userCount(r)).toBe(0);
+  });
+
+  test('同名非测试账号：既有 IdP 用户或密封凭据都拒绝认领且不生成密码', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    r.world.insertUser(id.username, `${id.username}@example.test`);
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(error.code).toBe('conflict');
+    expect(error.message).toContain('阶段=account');
+    expect(error.message).toContain('未创建任何资产');
+    expect(r.company.sealed.size).toBe(0);
+    expect(r.world.requests).toHaveLength(0);
+
+    const sealed = fixtureRig();
+    sealed.company.sealed.set(`demo/production/${id.alias}_PASSWORD`, 'existing-secret-value');
+    const sealedError = await failure(call(sealed, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(sealedError.code).toBe('conflict');
+    expect(sealedError.message).not.toContain('existing-secret-value');
+    expect(sealed.world.requests).toHaveLength(0);
+  });
+
+  test('同名非测试 workspace：已存在但无台账时拒绝认领且不改动/删除', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    r.world.workspaces.set(id.workspaceSlug, {
+      slug: id.workspaceSlug, name: '真实空间', dbName: 'ws_real',
+      members: [{ id: 'm-real', email: `${id.username}@example.test`, displayName: 'real', isAdmin: true, disabled: false }],
+    });
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(error.code).toBe('conflict');
+    expect(error.message).toContain('阶段=workspace');
+    expect(r.world.workspaces.get(id.workspaceSlug)!.name).toBe('真实空间');
+    expect(r.world.requests.filter(q => q.method === 'DELETE')).toHaveLength(0);
+    expect(existsSync(sampleFile(r, id))).toBe(false);
+    const reclaimed = await call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'reclaim' });
+    expect(reclaimed.retained).toEqual(['account', 'workspace']);
+    expect(r.world.workspaces.get(id.workspaceSlug)!.name).toBe('真实空间');
+  });
+
+  test('同名非测试样本文件：拒绝覆盖，回收时也不删除', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    const path = sampleFile(r, id);
+    mkdirSync(join(r.paths.fixtureDir, 'task-1'), { recursive: true });
+    writeFileSync(path, 'not ours');
+    const error = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }));
+    expect(error.code).toBe('conflict');
+    expect(error.message).toContain('阶段=sample');
+    expect(readFileSync(path, 'utf8')).toBe('not ours');
+    const reclaimed = await call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'reclaim' });
+    expect(reclaimed.sample).toBe('not_created');
+    expect(readFileSync(path, 'utf8')).toBe('not ours');
+  });
+
+  test('浏览器阶段可选，并受角色与参数限制', async () => {
+    const r = fixtureRig({ roles: ['qa', 'engineering', 'product'] });
+    const id = identityFor();
+    const product = r.company.lease('prod-1', 'product', 'task-prod');
+    const denied = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo', browser: { spaceId: 7 } }, { cred: product, task: 'task-prod' }));
+    expect(denied.code).toBe('forbidden');
+    expect(denied.message).toContain('工程/QA');
+    expect(r.world.browserLogins).toHaveLength(0);
+    expect((await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo', browser: { spaceId: 'x' } }))).code).toBe('invalid');
+    expect((await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo', browser: { spaceId: 7, page: 'nope' } }))).code).toBe('invalid');
+    expect(r.world.browserLogins).toHaveLength(0);
+    const ok = await call(r, 'ops_test_fixture_ready', { alias: 'demo', browser: { spaceId: 42, page: 'p2' } });
+    expect(ok.fixture.browser).toEqual({ signedInAs: id.username, spaceId: 42, page: 'p2' });
+    expect(r.world.browserLogins).toHaveLength(1);
+    expect(JSON.stringify(ok)).not.toContain(r.world.browserLogins[0]!.token);
+    expectNoLeaks(r);
+  });
+
+  test('回收只删除本次创建且摘要仍一致的样本，账号与 workspace 保留', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    const path = sampleFile(r, id);
+    expect(existsSync(path)).toBe(true);
+    const reclaimed = await call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'reclaim' });
+    expect(reclaimed).toMatchObject({ status: 'reclaimed', sample: 'deleted', sessionsDropped: 1, retained: ['account', 'workspace'] });
+    expect(existsSync(path)).toBe(false);
+    expect(r.world.workspaces.size).toBe(1);
+
+    await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    writeFileSync(path, 'tampered');
+    const again = await call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'reclaim' });
+    expect(again.sample).toBe('uncertain_kept');
+    expect(readFileSync(path, 'utf8')).toBe('tampered');
+  });
+
+  test('跨租约不复用：另一员工同一任务的准备与回收都被拒，不同任务得到不同资产名', async () => {
+    const r = fixtureRig();
+    const id = identityFor();
+    await call(r, 'ops_test_fixture_ready', { alias: 'demo' });
+    const other = r.company.lease('qa-2', 'qa', 'task-1');
+    const reused = await failure(call(r, 'ops_test_fixture_ready', { alias: 'demo' }, { cred: other, task: 'task-1' }));
+    expect(reused.code).toBe('forbidden');
+    expect(reused.message).toContain('跨租约');
+    const reclaimed = await call(r, 'ops_test_fixture_ready', { alias: 'demo', action: 'reclaim' }, { cred: other, task: 'task-1' });
+    expect(reclaimed).toMatchObject({ status: 'not_owned', reclaimed: false });
+    expect(existsSync(sampleFile(r, id))).toBe(true);
+
+    const otherTask = r.company.lease('qa-3', 'qa', 'task-2');
+    const second = await call(r, 'ops_test_fixture_ready', { alias: 'demo' }, { cred: otherTask, task: 'task-2' });
+    const id2 = identityFor('task-2');
+    expect(second.fixture.alias).toBe(id2.alias);
+    expect(second.fixture.alias).not.toBe(id.alias);
+    expect(second.fixture.workspace.slug).not.toBe(id.workspaceSlug);
+    expect(r.world.user(id2.username)).toBeDefined();
   });
 });

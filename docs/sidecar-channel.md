@@ -76,6 +76,7 @@ sidecar 侧每 400ms（`SWEEP_MS`）扫一遍活跃实例的 `req/`：读到的�
 | `ops_origin_status` / `ops_origin_health` / `ops_origin_logs` | 源站只读：环境配置的受限 SSH 强制命令，服务名白名单；不读用户资料，写操作不在此通道 |
 | `ops_release_diagnose {sha}` | 只读发布诊断：仓库与公开源站来自任务项目/环境配置，只接受完整 40 位 SHA；聚合 GitHub Actions 检查/部署分步与公开 `runtime-version.json`，复用受限源站 status/health；不读日志、不重跑、不部署；workflow success 或阶段 skipped 不算部署成功，源站不足则明确 unknown |
 | `ops_product_pulse {session,event,day}` | 只读产品漏斗脉冲：固定 `surreal_ck`/`production` 与 `engineering`/`product`/`qa` 岗位，用运营会话调 `GET /api/ops/funnel-summary`（CK #258），沿用 `funnel.read`；只接受一个已知事件与一个合法 UTC 日。只投影经类型校验的 state、公开聚合数与 coverage；未知字段忽略，事件/日期/计数/覆盖不一致或畸形响应一律拒绝且不回显原文。空窗、低样本抑制、覆盖未知与授权失败分别可辨；不调逐行 `funnel-counts`，不返回会话句柄、工作区标识、原始错误或正文 |
+| `ops_test_fixture_ready {alias, browser?, action?}` | 仅工程/QA、仅在真实任务租约内可用的测试夹具：按 project/env/task/alias 派生 `TEST_` 账号、测试 workspace 与三条本机合成样本（服务私有目录 `fixtures/<task>/`，只回 `fx_` 句柄），可选 `browser {spaceId,page?}` 注入客户会话。返回只有状态、`s_` 会话句柄、`fx_` 样本句柄与脱敏测试标识。本机台账（0600）是认领既有资产的唯一依据：无台账的同名账号/workspace/样本文件不认领、不覆盖、不删除，跨任务或跨员工台账直接拒绝复用；失败回执列准确阶段（account/login/workspace/sample/browser）与可清理状态。`action:"reclaim"` 只删本任务创建且摘要仍一致的样本并丢弃本夹具会话；账号与 workspace 无受支持删除入口，明确保留 |
 
 - **会话**：仅存内存，按（员工、项目、环境）隔离，每员工最多 8 个、最长 6 小时；token 临过期自动重登。租约结束、会话归档、插件重启即全部失效，跨任务不复用。代理没有删除账号/workspace 的能力。
 - **配额**：项目内按审计行统计最近 24h 新建数，超限回 `limit_reached`。
