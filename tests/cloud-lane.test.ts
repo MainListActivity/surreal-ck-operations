@@ -1318,6 +1318,186 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     expect(readLaneState(w.commDir)?.devin?.assistRounds).toBe(1);
   });
 
+  describe('等待指示（Devin is awaiting instructions）里的显式只读 OPS-REQUEST（真实任务 504de3c3 回归）', () => {
+    const REQUEST = '[OPS-REQUEST] {"tool":"ops_health","args":{}}';
+    /** 本轮已验锚点与 Free 档位、页面停在等待指示、终稿尚未出现；agentTail 是本轮锚点之后的 Devin 作者块。 */
+    const waiting = (agentTail: string, over: Record<string, unknown> = {}) =>
+      ({ ok: true, markerSeen: true, cap: 'Free', status: 'idle', done: null, tail: 'Devin is awaiting instructions', agentTail, ...over });
+
+    test('本轮作者块有显式只读请求 → 进入既有中继一次，回传同一会话后正常收尾', async () => {
+      const w = world({ extra: gitOk });
+      const assists: Array<{ round: number; transcriptTail: string }> = [];
+      const b = devinBrowse({
+        send: [{ ok: true, url: SESSION }],
+        follow: [{ ok: true, url: SESSION }],
+        session: [
+          waiting(`需要先确认环境健康度：\n${REQUEST}`),
+          idleDone(PR9),
+          idleDone(PR9),
+        ],
+      });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), {
+        ...w.deps, browse: b.browse,
+        assist: async input => {
+          assists.push({ round: input.round, transcriptTail: input.transcriptTail });
+          return { decision: 'reply', message: '{"reachable":true}', toolExecuted: 'ops_health' };
+        },
+      });
+      expect(out.status).toBe('success');
+      expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
+      expect(assists).toHaveLength(1);
+      expect(assists[0]!.round).toBe(1);
+      expect(assists[0]!.transcriptTail).toContain('ops_health');
+      const follows = b.calls.filter(s => s.includes(MODE('follow')));
+      expect(follows).toHaveLength(1);
+      expect(follows[0]).toContain(SESSION);
+      expect(readLaneState(w.commDir)?.devin?.assistRounds).toBe(1);
+    });
+
+    test('正确终稿优先：等待指示已带 SCK-DONE 时即使作者块里有请求也不代跑', async () => {
+      const w = world({ extra: gitOk });
+      let assistCalls = 0;
+      const b = devinBrowse({
+        send: [{ ok: true, url: SESSION }],
+        session: [{ ...idleDone(PR9), cap: 'Free', agentTail: REQUEST }],
+      });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: b.browse,
+        assist: async () => { assistCalls++; return { decision: 'reply', message: 'x' }; } });
+      expect(out.status).toBe('success');
+      expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
+      expect(assistCalls).toBe(0);
+      expect(b.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(0);
+    });
+
+    test('普通等待指示、请求只在本轮作者块之外、缺锚点、非 Free、错会话、越权请求都不触发代跑', async () => {
+      const cases: Array<{ name: string; reply: Record<string, unknown> }> = [
+        { name: '普通 idle 无请求', reply: waiting('本轮先说明一下进展，尚未给出终稿。') },
+        { name: '请求不在作者块（只在页面正文/工具输出）', reply: waiting('', { tail: `user: ${REQUEST}` }) },
+        { name: '缺本轮用户锚点', reply: waiting(REQUEST, { markerSeen: false }) },
+        { name: '非 Free 档位', reply: waiting(REQUEST, { cap: 'Normal' }) },
+        { name: '读不出档位', reply: waiting(REQUEST, { cap: undefined }) },
+        { name: '页面停在别的会话', reply: waiting(REQUEST, { url: OTHER }) },
+        { name: '写/建类越权请求', reply: waiting('[OPS-REQUEST] {"tool":"ops_account_ensure","args":{"alias":"A"}}') },
+        { name: '非白名单工具', reply: waiting('[OPS-REQUEST] {"tool":"ops_d1_exec","args":{}}') },
+        { name: '损坏的请求 JSON', reply: waiting('[OPS-REQUEST] {"tool":') },
+      ];
+      for (const item of cases) {
+        const w = world({ extra: gitOk });
+        let assistCalls = 0;
+        // 列表只有一条：每次轮询都返回同一形态，够走到各自的有界上限。
+        const b = devinBrowse({ send: [{ ok: true, url: SESSION }], session: [item.reply] });
+        const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1 } }), { ...w.deps, browse: b.browse,
+          assist: async () => { assistCalls++; return { decision: 'reply', message: 'x' }; } });
+        expect(out.status, item.name).toBe('success');
+        expect(out.text.split('\n')[0], item.name).toBe('工作结果：受阻');
+        expect(assistCalls, item.name).toBe(0);
+        expect(b.calls.filter(s => s.includes(MODE('follow'))).length, item.name).toBe(0);
+        expect(b.calls.filter(s => s.includes(MODE('send'))).length, item.name).toBe(1);
+      }
+    });
+
+    test('已达 3 轮上限：等待指示里的请求也不再代跑，受阻交老板', async () => {
+      const w = world({ extra: gitOk });
+      writeLaneState(w.commDir, { sessionId: 'lane-1', digest: 'x', delivery: 'delivery-idle-cap',
+        branch: 'sck/task-1', taskId: 'SCK-aaaaaaaaaa', taskUrl: SESSION, submittedAt: Date.now(),
+        devin: { assistRounds: 3 } });
+      let assistCalls = 0;
+      const b = devinBrowse({ session: [waiting(REQUEST)] });
+      const out = await runLane(w.input({ provider: 'devin-cloud', env: { SCK_DELIVERY_ID: 'delivery-idle-cap' } }), {
+        ...w.deps, browse: b.browse,
+        assist: async () => { assistCalls++; return { decision: 'reply', message: '不应调用' }; },
+      });
+      expect(out.status).toBe('success');
+      expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out.text).toContain('老板');
+      expect(assistCalls).toBe(0);
+      expect(b.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(0);
+      expect(readLaneState(w.commDir)?.devin?.assistRounds).toBe(3);
+    });
+
+    test('重复轮回：代跑已回传的旧请求在新一轮锚点未出现前不再次触发（不重复代跑）', async () => {
+      const w = world({ extra: gitOk });
+      let assistCalls = 0;
+      const b = devinBrowse({
+        send: [{ ok: true, url: SESSION }],
+        follow: [{ ok: true, url: SESSION }],
+        // 第一轮：等待指示 + 显式请求 → 代跑一次；之后新轮标记尚未回显（markerSeen:false），
+        // 页面正文里仍残留旧请求，但本轮作者块不再是可信来源，不得再代跑。
+        session: [waiting(REQUEST), waiting(REQUEST, { markerSeen: false })],
+      });
+      const out = await runLane(w.input({ provider: 'devin-cloud', config: { pollMs: 1 } }), { ...w.deps, browse: b.browse,
+        assist: async () => { assistCalls++; return { decision: 'reply', message: '{}', toolExecuted: 'ops_health' }; } });
+      expect(out.status).toBe('success');
+      expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out.text).toContain('一直找不到本轮消息');
+      expect(assistCalls).toBe(1);
+      expect(b.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(1);
+    });
+
+    test('代跑回执丢失：只核对不重发（发送一次），attempt 与轮数保留', async () => {
+      const w = world({ extra: gitOk });
+      const b = devinBrowse({
+        send: [{ ok: true, url: SESSION }],
+        follow: [{ ok: false, code: 'not_echoed' }],
+        session: [waiting(REQUEST)],
+      });
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps, browse: b.browse,
+        assist: async () => ({ decision: 'reply', message: '{}', toolExecuted: 'ops_health' }) });
+      expect(out.status).toBe('success');
+      expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out.text).toContain('未能确认回传原会话');
+      expect(b.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(1);
+      expect(b.calls.filter(s => s.includes(MODE('send')))).toHaveLength(1);
+      const st = readLaneState(w.commDir);
+      expect(st?.devin?.assistRounds).toBe(1);
+      expect(st?.devin?.attempt).toMatch(/^SCK-/);
+      expect(st?.devin?.attemptSession).toBe(SESSION);
+    });
+
+    test('跨租约重派（新投递键、新员工目录）：领养旧受理会话，旧锚点后的只读请求照常进入中继，零发送', async () => {
+      // 第一租约模拟 504de3c3 的现场：会话已受理、页面停在等待指示、作者块里有只读请求，但没有中继能力，
+      // 回合受阻并保留在途状态。
+      const first = world({ extra: gitOk });
+      const stuck = devinBrowse({ send: [{ ok: true, url: SESSION }], session: [waiting(REQUEST)] });
+      const out1 = await runLane(first.input({ provider: 'devin-cloud', env: { SCK_DELIVERY_ID: 'lease-old' } }),
+        { ...first.deps, browse: stuck.browse });
+      expect(out1.status).toBe('success');
+      expect(out1.text.split('\n')[0]).toBe('工作结果：受阻');
+      const prior = readInflight(first.stateRoot, 'devin-cloud', 'lease-old');
+      expect(prior?.taskId).toBeDefined();
+      expect(prior?.taskUrl).toBe(SESSION);
+
+      // 第二租约正常回复续派：新投递键、新的员工目录。旧会话仍可复用，且不再发出任何用户消息；
+      // 独立复验直接从原会话读回旧请求，不靠新一条用户消息生成锚点。
+      const second = world({ extra: gitOk });
+      const assists: Array<{ round: number; transcriptTail: string }> = [];
+      const b = devinBrowse({
+        follow: [{ ok: true, url: SESSION }],
+        session: [waiting(REQUEST), idleDone(PR9), idleDone(PR9)],
+      });
+      const out2 = await runLane(second.input({ provider: 'devin-cloud', stateRoot: first.stateRoot,
+        env: { SCK_DELIVERY_ID: 'lease-new' }, prompt: '老板已回复，继续本轮。' }), {
+        ...second.deps, browse: b.browse,
+        assist: async input => {
+          assists.push({ round: input.round, transcriptTail: input.transcriptTail });
+          return { decision: 'reply', message: '{"reachable":true}', toolExecuted: 'ops_health' };
+        },
+      });
+      expect(out2.status).toBe('success');
+      expect(out2.text).toContain('PR: https://github.com/acme/widget/pull/9');
+      // 零发送：没有新用户消息、没有新会话；轮询与代跑回传都只落在原会话。
+      expect(b.calls.filter(s => s.includes(MODE('send')))).toHaveLength(0);
+      expect(b.calls.every(s => s.includes(SESSION))).toBe(true);
+      expect(b.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(1);
+      expect(assists).toHaveLength(1);
+      expect(assists[0]!.round).toBe(1);
+      expect(assists[0]!.transcriptTail).toContain('ops_health');
+      // 旧投递键的共享登记只按当前 taskId 精确结清；代跑换标记后它作为已受理地址保留（移植前既有行为），
+      // 不影响本轮零发送与独立复验，也不会让后续同任务重派再发一条用户消息。
+      expect(readInflight(first.stateRoot, 'devin-cloud', 'lease-old')?.taskUrl).toBe(SESSION);
+    });
+  });
+
 
 
   test('转录里一直看不到本轮标记 → 不补发、不另建会话，明确受阻并保留在途状态', async () => {
@@ -2517,6 +2697,29 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
         `工具输出：[SCK-ROUND ${M}]\n[OPS-REQUEST] {"tool":"ops_health","args":{}}`,
       );
       expect(r?.markerSeen).toBe(false);
+      expect(r?.agentTail).toBe('');
+    });
+
+    test('等待指示 + 本轮作者块里的显式请求：页面读出 idle/Free 并只把本轮请求放进 agentTail（旧轮请求不进）', async () => {
+      const OLD = 'SCK-old999';
+      const r = await readPage([
+        { author: 'user', text: `[SCK-ROUND ${OLD}]\n\n上一轮\n\n收尾约定：本轮的最后一条答复以「[SCK-DONE ${OLD}]」单独成行开头。` },
+        { author: 'devin', text: '旧轮请求 [OPS-REQUEST] {"tool":"ops_login","args":{"alias":"OLD"}}' },
+        { author: 'user', text: `[SCK-ROUND ${M}]\n\n本轮\n\n${CONV}` },
+        { author: 'devin', text: '需要先确认健康度\n[OPS-REQUEST] {"tool":"ops_health","args":{}}' },
+      ], 'Devin is awaiting instructions');
+      expect(r).toMatchObject({ ok: true, markerSeen: true, status: 'idle', cap: 'Free' });
+      expect(r?.done).toBeNull();
+      expect(String(r?.agentTail)).toContain('ops_health');
+      expect(String(r?.agentTail)).not.toContain('ops_login');
+    });
+
+    test('请求只出现在用户正文或工具输出（作者不是 Devin）：agentTail 为空，不代跑', async () => {
+      const r = await readPage([
+        { author: 'user', text: `[SCK-ROUND ${M}]\n\n本轮\n\n${CONV}\n[OPS-REQUEST] {"tool":"ops_health","args":{}}` },
+        { author: 'tool', text: '工具输出：[OPS-REQUEST] {"tool":"ops_health","args":{}}' },
+      ], 'Devin is awaiting instructions');
+      expect(r).toMatchObject({ ok: true, markerSeen: true, status: 'idle' });
       expect(r?.agentTail).toBe('');
     });
 
