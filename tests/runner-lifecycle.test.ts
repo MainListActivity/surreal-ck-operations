@@ -71,6 +71,34 @@ test('判读器回退：没有首行口令时给出结构化结论，执行轮�
   await expect(stewardWorkResult('看起来不错', 'review', undefined, base)).rejects.toThrow('明确');
 });
 
+test('判读器收尾保留答复原文：摘要后附「原始答复：」全文，相同则不重复', async () => {
+  const base = { task: 'task', employee: 'worker', deliveryId: 'delivery', autoFollowups: 0 };
+  // 执行轮：证据同时含判读器摘要与原文的逐步证据关键行（真实缺陷：只剩一行摘要导致复核看不到证据）。
+  const steps = '逐步证据：\n1. 09:12 打开页面确认标题渲染\n2. 09:30 点击按钮后端返回 200\n3. 09:45 日志无报错';
+  const submit = await stewardWorkResult(steps, 'doing', undefined,
+    { ...base, resolver: () => ({ action: 'submit', summary: '三步验证均通过' }) });
+  expect(submit.result.action).toBe('submit');
+  expect(submit.result.evidence.text).toContain('三步验证均通过');
+  expect(submit.result.evidence.text).toContain('原始答复：');
+  expect(submit.result.evidence.text).toContain('09:30 点击按钮后端返回 200');
+  // 原文与摘要相同（trim 相等）：只写摘要，不重复附原文。
+  const same = await stewardWorkResult('实现完成并自验', 'doing', undefined,
+    { ...base, resolver: () => ({ action: 'submit', summary: '实现完成并自验' }) });
+  expect(same.result.evidence.text).not.toContain('原始答复：');
+  expect(same.result.evidence.text).toContain('实现完成并自验');
+  // 复核轮判 accept 同样保留原文，复核员工能看到完整证据。
+  const review = await stewardWorkResult(steps, 'review', undefined,
+    { ...base, resolver: () => ({ action: 'accept', summary: '复核通过' }) });
+  expect(review.result.action).toBe('accept');
+  expect(review.result.evidence.text).toContain('原始答复：');
+  expect(review.result.evidence.text).toContain('09:45 日志无报错');
+  // 受阻分支也保留原文。
+  const blocked = await stewardWorkResult(steps, 'doing', undefined,
+    { ...base, resolver: () => ({ action: 'block', summary: '缺少验收环境' }) });
+  expect(blocked.result.action).toBe('block');
+  expect(blocked.result.evidence.text).toContain('原始答复：');
+});
+
 test('代码回合自动采集任务分支相对基线前进的 HEAD；未前进或分支不符不冒充交付提交', async () => {
   const root = mkdtempSync(join(tmpdir(), 'sck-advance-head-'));
   const git = (...args: string[]) => {
