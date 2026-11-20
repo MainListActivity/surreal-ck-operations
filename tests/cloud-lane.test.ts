@@ -1480,9 +1480,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(readLaneState(w.commDir)?.devin?.attempt).toBe(attempt);
     });
 
-    test('跨租约重派（新投递键、新员工目录）：领养旧受理会话，旧锚点后的只读请求照常进入中继，零发送', async () => {
-      // 第一租约模拟 504de3c3 的现场：会话已受理、页面停在等待指示、作者块里有只读请求，但没有中继能力，
-      // 回合受阻并保留在途状态。
+    test('跨租约重派（新投递键、新员工目录）：开新一轮发跟进进旧会话，含老板答复、不重跑旧请求（6f05139e 回归）', async () => {
+      // 第一租约模拟受阻现场：会话已受理、页面停在等待指示、作者块里留着只读请求，回合受阻并保留在途状态。
       const first = world({ extra: gitOk });
       const stuck = devinBrowse({ send: [{ ok: true, url: SESSION }], session: [waiting(REQUEST)] });
       const out1 = await runLane(first.input({ provider: 'devin-cloud', env: { SCK_DELIVERY_ID: 'lease-old' } }),
@@ -1493,34 +1492,33 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(prior?.taskId).toBeDefined();
       expect(prior?.taskUrl).toBe(SESSION);
 
-      // 第二租约正常回复续派：新投递键、新的员工目录。旧会话仍可复用，且不再发出任何用户消息；
-      // 独立复验直接从原会话读回旧请求，不靠新一条用户消息生成锚点。
+      // 老板 reply 生成新投递：必须把新派工消息（含老板答复）作为跟进发进同一会话、开新一轮标记，
+      // 绝不能轮询旧锚点把页面里残留的旧 OPS-REQUEST 当成新请求重跑（真实任务 6f05139e：老板答复两次都
+      // 进不了会话，旧请求被重跑两次、两次同样 invalid）。
       const second = world({ extra: gitOk });
-      const assists: Array<{ round: number; transcriptTail: string }> = [];
+      let assistCalls = 0;
       const b = devinBrowse({
         follow: [{ ok: true, url: SESSION }],
-        session: [waiting(REQUEST), idleDone(PR9), idleDone(PR9)],
+        session: [idleDone(PR9)],
       });
       const out2 = await runLane(second.input({ provider: 'devin-cloud', stateRoot: first.stateRoot,
-        env: { SCK_DELIVERY_ID: 'lease-new' }, prompt: '老板已回复，继续本轮。' }), {
+        env: { SCK_DELIVERY_ID: 'lease-new' }, prompt: '老板已回复：补 service 参数后继续。' }), {
         ...second.deps, browse: b.browse,
-        assist: async input => {
-          assists.push({ round: input.round, transcriptTail: input.transcriptTail });
-          return { decision: 'reply', message: '{"reachable":true}', toolExecuted: 'ops_health' };
-        },
+        assist: async () => { assistCalls++; return { decision: 'reply', message: '不应调用' }; },
       });
       expect(out2.status).toBe('success');
       expect(out2.text).toContain('PR: https://github.com/acme/widget/pull/9');
-      // 零发送：没有新用户消息、没有新会话；轮询与代跑回传都只落在原会话。
+      // 一轮跟进发进同一会话（不开新会话），正文是新一轮派工（含老板答复），标记已换；旧请求零执行。
+      const follows = b.calls.filter(s => s.includes(MODE('follow')));
+      expect(follows).toHaveLength(1);
+      expect(follows[0]).toContain(SESSION);
+      expect(follows[0]).toContain('补 service 参数');
       expect(b.calls.filter(s => s.includes(MODE('send')))).toHaveLength(0);
-      expect(b.calls.every(s => s.includes(SESSION))).toBe(true);
-      expect(b.calls.filter(s => s.includes(MODE('follow')))).toHaveLength(1);
-      expect(assists).toHaveLength(1);
-      expect(assists[0]!.round).toBe(1);
-      expect(assists[0]!.transcriptTail).toContain('ops_health');
-      // 旧投递键的共享登记只按当前 taskId 精确结清；代跑换标记后它作为已受理地址保留（移植前既有行为），
-      // 不影响本轮零发送与独立复验，也不会让后续同任务重派再发一条用户消息。
-      expect(readInflight(first.stateRoot, 'devin-cloud', 'lease-old')?.taskUrl).toBe(SESSION);
+      expect(assistCalls).toBe(0);
+      // 跟进正文带的是新一轮标记（不是旧轮 taskId）；回合收尾后 taskId 已按惯例清空。
+      expect(follows[0]).toMatch(/SCK-[a-f0-9]+/);
+      expect(follows[0]).not.toContain(prior!.taskId!);
+      expect(readLaneState(second.commDir)?.devin?.attempt).toBeUndefined();
     });
 
     test('前置探测脚本本身零填写零发送：原会话 Free、idle、组织首页 2/2 时给出 quota_full', async () => {
@@ -2217,7 +2215,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     }
   });
 
-  test('超时受阻后新 delivery/新目录重派：领养旧 taskId/taskUrl/submittedAt，零发送且结清旧登记', async () => {
+  test('超时受阻后新 delivery/新目录重派：新轮跟进发进旧会话（含老板答复），结清旧登记', async () => {
     const first = world({ extra: gitOk });
     const a = devinBrowse({ send: [{ ok: true, url: SESSION }],
       session: [{ ok: true, markerSeen: true, status: 'working', done: null }] });
@@ -2230,19 +2228,23 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     // 不同供应商发送不能被同任务结清清理误删。
     writeInflight(first.stateRoot, 'devin-cloud', 'unrelated-send',
       { ...prior, taskId: 'SCK-eeeeeeeeee', submittedAt: prior.submittedAt! - 1000 });
+    // 新投递：不再回带旧 taskId 轮询旧锚点（否则老板答复进不了会话、旧轮残留被当新请求处理），
+    // 而是把新派工消息作为跟进发进同一会话、开新一轮标记。
     const second = world({ extra: gitOk });
-    const b = devinBrowse({ session: [idleDone(PR9)] });
+    const b = devinBrowse({ follow: [{ ok: true, url: SESSION }], session: [idleDone(PR9)] });
     const out2 = await runLane(second.input({ provider: 'devin-cloud', stateRoot: first.stateRoot,
       env: { SCK_DELIVERY_ID: 'lease-new' }, prompt: '重派同一任务，取回成果。' }), {
-      ...second.deps, browse: async (script, timeout) => {
-        expect(script).toContain(prior.taskId!);
-        expect(script).toContain(SESSION);
-        return b.browse(script, timeout);
-      },
+      ...second.deps, browse: b.browse,
     });
     expect(out2.text).toContain('PR: https://github.com/acme/widget/pull/9');
-    expect(b.calls.every(s => s.includes(MODE('session')))).toBe(true);
-    expect(readInflight(first.stateRoot, 'devin-cloud', 'lease-old')).toBeUndefined();
+    const follows = b.calls.filter(s => s.includes(MODE('follow')));
+    expect(follows).toHaveLength(1);
+    expect(follows[0]).toContain(SESSION);
+    expect(follows[0]).toMatch(/SCK-[a-f0-9]+/);
+    expect(follows[0]).not.toContain(prior.taskId!);
+    expect(b.calls.filter(s => s.includes(MODE('send')))).toHaveLength(0);
+    // 结清按「同任务 + 同标记」精确匹配：旧投递键留下的是旧标记的已受理记录，不误删也不再被回带。
+    expect(readInflight(first.stateRoot, 'devin-cloud', 'lease-old')?.taskId).toBe(prior.taskId);
     expect(readInflight(first.stateRoot, 'devin-cloud', 'lease-new')).toBeUndefined();
     expect(readInflight(first.stateRoot, 'devin-cloud', 'unrelated-send')?.taskId).toBe('SCK-eeeeeeeeee');
   });

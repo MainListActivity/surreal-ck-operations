@@ -1621,6 +1621,13 @@ export class SidecarPool {
             // 上游错误原文不出站，也不进普通执行日志：只留工具名与错误码。
             const code = (error as { code?: unknown })?.code;
             this.log(`steward lane relay ${relayTool} failed: ${typeof code === 'string' ? code : 'error'}`);
+            // 我方参数校验错误（invalid）：校验信息可回传给云端执行者修正参数后重发请求，
+            // 不转交老板——老板答复进不了会话，只会把任务卡在同一请求上反复重跑。
+            if (code === 'invalid') {
+              const detail = clip(String(redactSecrets((error as { message?: unknown })?.message ?? '参数无效')), 300);
+              return { decision: 'reply', toolExecuted: relayTool,
+                message: `参数无效：${detail}；请修正参数后重新发出 [OPS-REQUEST]，或改用 sck-company MCP 的 company_ops` };
+            }
             return { decision: 'escalate', reason: `代跑 ${relayTool} 失败（${typeof code === 'string' ? code : 'error'}），本地已记录，转交老板裁决` };
           }
         }

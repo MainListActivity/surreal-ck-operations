@@ -1,14 +1,15 @@
 {
-  "version": "0.13.78",
-  "title": "公司 MCP company_ops 白名单加 ops_origin_logs 与 ops_health",
+  "version": "0.13.79",
+  "title": "Devin 中继环路修复：invalid 回传执行者、老板答复进新轮跟进",
   "changes": [
-    "MCP_OPS_ALLOW 加入 ops_origin_logs 与 ops_health（均为只读，已在 steward 代跑白名单与执行端作业工具注册表内）：云端员工可直接查源站日志与健康检查，不必退回 [OPS-REQUEST] 网页中继（该中继会多发一轮跟进消息，曾被 Free 席位满拦住）。",
-    "company_ops 的工具描述由白名单动态拼出、次数预算默认 3 次且 mcp.budget.set 自动支持新键，均无需额外改动；执行端作业路径对 ops 工具名原样执行，无需登记。"
+    "steward_lane_assist 代跑命中我方参数校验错误（code=invalid）时不再转交老板，校验信息经脱敏、截到 300 字后按原 reply 通道回传给 Devin，提示修正参数重发 [OPS-REQUEST] 或改用 sck-company MCP 的 company_ops，并计入代跑轮数；上游或其它错误码仍不外泄原文、照旧转交老板。",
+    "新投递（delivery 变化）不再把上一轮的 taskId/代跑轮数从共享在途登记回带：新派工消息（含老板答复）作为跟进发进同一 Devin 会话、开新一轮标记，页面里残留的旧 OPS-REQUEST 不会被当成新请求重跑；已按下未确认的发送意图与同投递内已落盘回传正文的零重发语义不变。"
   ],
   "impact": [
-    "云端 Devin 等 MCP 员工排障时可直接读源站日志，少一跳中继、少占一轮席位。",
+    "老板 reply 之后答复能真正到达 Devin 会话，不再卡在同一条旧请求上反复 invalid（真实任务 6f05139e）。",
+    "参数填错的代跑请求由执行者自纠，不再惊动老板。",
     "沿用 schema 074，无迁移。"
   ],
   "migration": "无 schema 变化（沿用 schema 074），升级 owner-backend 即可。",
-  "rollback": "回退至 0.13.77；两条工具恢复为白名单外（forbidden 不入队）。"
+  "rollback": "回退至 0.13.78；invalid 恢复为转交老板，新投递恢复领养旧轮标记。"
 }
