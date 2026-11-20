@@ -1,16 +1,18 @@
 {
-  "version": "0.13.66",
-  "title": "测试夹具：阶段期限覆盖授权复查，确定性拒绝不记不确定写",
+  "version": "0.13.67",
+  "title": "公司服务全景：仓库/服务/主机/部署与回滚登记可查，未登记服务自动发现",
   "changes": [
-    "runFixtureStage 的授权复查与 work 共用阶段期限：复查等待超时或返回时已过期都不再进入 work，零新外部写。",
-    "只有确定性拒绝（forbidden/invalid 等）视为未写入；conflict、超时与 5xx 仍保留 uncertain，禁止盲重试。",
-    "已发出且结果不明的尝试不会被后续错误码覆盖；权限恢复后同租约可继续，未确认写只按幂等接口核对。",
-    "外置的 workspace/sample/account 授权复查同样计入对应阶段期限；回归断言实际调用次数与台账状态。"
+    "新增 landscape/company-landscape.json 作为公司服务唯一登记处（hosts/repos/services），src/landscape.ts 启动即校验：枚举、id 唯一、repo/host 引用、repo.project 不重复。",
+    "只读命令 landscape.get（sck owner 与员工 company_cmd 均可调，host 可选过滤）返回登记表与各主机最近一次实机核对及 drift。",
+    "VPS 实机核对挂进 sck-owner-minute 分钟任务（systemctl 单元、ss 监听、Caddyfile 路由摘要，只读），Mac 核对挂进插件派工循环（launchctl + LaunchAgents plist），均 60 分钟一轮。",
+    "比对出的未登记在跑/登记缺失/应退役仍在写入观测并按 host 发老板提示 landscape-drift:<hostId>，一致自动关闭，采集失败只留观测。",
+    "project.services 随任务下发：经 repo.project 关联出该项目的部署服务与回滚说明。",
+    "门禁测试：owner-end/deploy 全部 systemd 单元与 wrangler Worker name 必须已登记，新增未登记服务会被测试挡住。"
   ],
   "impact": [
-    "工程/QA：403 等明确拒绝不再被记成不确定写，权限恢复后无需人工核对即可继续；复查拖到期限后不再补发一笔。",
-    "公司：结果不明的外部写仍按 uncertain 收尾，真实资产与旧租约不会被混用。"
+    "老板与员工都能查询公司服务全景与其不一致项；有人新增未登记服务会在一小时内成为老板提示。",
+    "不新增服务、端口、定时器、环境变量与 schema：核对挂在既有分钟任务与派工循环里，通知复用 owner_notice，观测复用 company_meta。"
   ],
-  "migration": "无 schema 变更，沿用 schema 074；升级并重启执行端插件即可。",
-  "rollback": "回退至 0.13.65；授权复查恢复为不计入阶段期限，且确定性拒绝会重新留下 uncertain。"
+  "migration": "无 schema 变化（沿用 schema 074），只新增 company_meta 记录与 owner_notice",
+  "rollback": "回退至 0.13.66：landscape.get 不再可用，实机核对停止；已写入的 company_meta 观测记录与已关闭的提示不受影响，打开的 landscape-drift 提示可经 notice.resolve 手动关闭。"
 }

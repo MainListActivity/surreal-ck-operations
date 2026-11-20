@@ -3,6 +3,7 @@ import { RecordId, type Surreal } from 'surrealdb';
 import { ROLES, type ProjectView, type Role } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
 import { hostIO } from './host-io.ts';
+import { COMPANY_LANDSCAPE, servicesForProject } from './landscape.ts';
 
 import { parseBrokerConfig } from './ops/config.ts';
 import { projectTextLengths, validateProjectTexts, type ProjectTextExisting, type ProjectTextLengths } from './input-bounds.ts';
@@ -191,6 +192,7 @@ export class ProjectStore {
       disciplines: row.disciplines?.map(d => ({ name: d.name, description: d.description, roles: d.roles })),
       pipeline: row.pipeline,
       runbooks: row.runbooks ?? [], notes: row.notes,
+      services: servicesForProject(COMPANY_LANDSCAPE, String(row.id.id)),
       envs: envs.map(e => ({
         name: e.name, url: e.url, healthUrl: e.health_url, verify: e.verify,
         secrets: secrets.filter(s => s.env === e.name).map(s => ({ name: s.name, roles: s.roles as Role[] })),

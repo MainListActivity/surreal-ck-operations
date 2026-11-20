@@ -8,6 +8,7 @@ rm -rf server/vendor
 mkdir -p server/vendor
 cp -R ../src server/vendor/src
 cp -R ../schema server/vendor/schema
+cp -R ../landscape server/vendor/landscape
 find server/vendor -name '*.ts' -exec sh -c 'printf "// @ts-nocheck\n" | cat - "$1" > "$1.tmp" && mv "$1.tmp" "$1"' _ {} \;
 
 # preview-core 在仓库根的 src/ 里用 ../plugin/shared 取唯一设计变量源；vendored 副本位于

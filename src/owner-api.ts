@@ -31,6 +31,8 @@ import { hostIOOrUndefined } from './host-io.ts';
 import { planMessage, readMessageChains } from './message-chain.ts';
 import type { AgentAction, AgentActivity } from './agent-activity.ts';
 import { redactSecrets } from './ops/redact.ts';
+import { COMPANY_LANDSCAPE } from './landscape.ts';
+import { observationRecordId } from './landscape-report.ts';
 import type { NodeSteward } from './steward/steward.ts';
 
 export type OwnerVia = string;
@@ -362,6 +364,25 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
       return { ok: true };
     case 'notice.list':
       return { notices: await ctx.owner.openNotices() };
+
+    // ---- 公司服务全景 ----
+    // 登记表 + 最近一次实机核对（company_meta:⟨landscape_observed:<hostId>⟩）。host 过滤只看该主机的服务与观测。
+    case 'landscape.get': {
+      const host = optionalText(input.host);
+      if (host && !COMPANY_LANDSCAPE.hosts.some((item) => item.id === host)) {
+        throw new CompanyError('invalid', `host invalid: ${host}`);
+      }
+      const [rows] = await db.query<[Array<Record<string, unknown>>]>(
+        'SELECT * FROM company_meta WHERE id IN $ids;',
+        { ids: COMPANY_LANDSCAPE.hosts.map((item) => observationRecordId(item.id)) });
+      const observations = (rows ?? []).filter((row) => !host || row.host === host);
+      return {
+        landscape: host
+          ? { ...COMPANY_LANDSCAPE, services: COMPANY_LANDSCAPE.services.filter((service) => service.host === host) }
+          : COMPANY_LANDSCAPE,
+        observations,
+      };
+    }
 
     // ---- 故障恢复授权 ----
     // 给一条已耗尽的恢复预算授权一次新窗口。授权只记下决定，预算不动：窗口在员工的下一次真实尝试消费授权时才开始。
