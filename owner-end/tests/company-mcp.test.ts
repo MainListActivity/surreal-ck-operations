@@ -252,6 +252,18 @@ describe('公司 MCP 工具', () => {
     expect(enqueue?.vars.content).toMatchObject({ command: 'ops_origin_status', actor_kind: 'agent', actor: EMPLOYEE });
   });
 
+  test('company_ops 白名单扩展：ops_origin_logs 与 ops_health 可入队作业', async () => {
+    const token = await mcpToken();
+    for (const tool of ['ops_origin_logs', 'ops_health']) {
+      const { db, calls } = boundDb();
+      const { body } = await callTool(token, db, 'company_ops', { taskId: 't1', tool, args: {} });
+      const value = resultOf(body)?.structuredContent as { pending?: boolean; jobId?: string };
+      expect(value.pending, tool).toBe(true);
+      const enqueue = calls.find((call) => call.sql.includes('CREATE $job'));
+      expect(enqueue?.vars.content).toMatchObject({ command: tool, actor_kind: 'agent', actor: EMPLOYEE });
+    }
+  });
+
   test('未登记 sub 与 enabled=false → forbidden（令牌有效）', async () => {
     const token = await mcpToken();
     for (const principals of [[], [{ ...PRINCIPAL, enabled: false }]]) {
@@ -473,6 +485,21 @@ describe('公司 MCP 工具', () => {
       const spend = fresh.calls.find((call) => call.sql.includes('SET mcp_ops_used'))!;
       expect((spend.vars.next as { counts: Record<string, number> }).counts.ops_origin_status).toBe(1);
       expect((spend.vars.next as { delivery: string }).delivery).toBe('del-1');
+    });
+
+    test('新白名单工具受预算约束：ops_origin_logs 预算 1，第二次调用 forbidden 且不入队', async () => {
+      const token = await mcpToken();
+      const { db, calls } = boundDb({
+        task: { ...LEASED_TASK, mcp_budget: { ops_origin_logs: 1 } },
+      });
+      const first = resultOf((await callTool(token, db, 'company_ops', { taskId: 't1', tool: 'ops_origin_logs', args: {} })).body);
+      expect((first?.structuredContent as { pending?: boolean }).pending).toBe(true);
+      const second = resultOf((await callTool(token, db, 'company_ops', { taskId: 't1', tool: 'ops_origin_logs', args: {} })).body);
+      expect(second?.isError).toBe(true);
+      expect((second?.structuredContent as { error: { code: string; message: string } }).error.code).toBe('forbidden');
+      expect((second?.structuredContent as { error: { code: string; message: string } }).error.message).toContain('1/1');
+      // 只有第一次入了队。
+      expect(calls.filter((call) => call.sql.includes('CREATE $job'))).toHaveLength(1);
     });
 
     test('扣次条件 UPDATE 连续未命中 → conflict；命中即计次（含 pending）', async () => {
