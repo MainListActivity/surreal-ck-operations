@@ -1,15 +1,15 @@
 {
-  "version": "0.13.79",
-  "title": "Devin 中继环路修复：invalid 回传执行者、老板答复进新轮跟进",
+  "version": "0.13.80",
+  "title": "MCP 结构化受阻补 awaitingOwner：老板答复不再采信服务端旧结论",
   "changes": [
-    "steward_lane_assist 代跑命中我方参数校验错误（code=invalid）时不再转交老板，校验信息经脱敏、截到 300 字后按原 reply 通道回传给 Devin，提示修正参数重发 [OPS-REQUEST] 或改用 sck-company MCP 的 company_ops，并计入代跑轮数；上游或其它错误码仍不外泄原文、照旧转交老板。",
-    "在途登记新增 awaitingOwner：仅当上一轮停在「Devin 等老板答复」（中继 escalate、中继门禁不可发、无代跑能力）时置位。新投递只对带该标记的旧登记开新一轮——把新派工消息（含老板答复）作为跟进发进同一 Devin 会话、换标记，不重跑页面残留的旧 OPS-REQUEST；超时/在途/未确认意图的旧登记照旧接回轮询、零发送。"
+    "Devin 通道 mcpVerdict 里所有由 MCP 结构化结论得出的受阻收尾（task_block 直出、submit/review 经 closeout 判 blocked、结论与本轮阶段不符）在返回前写入 devin.awaitingOwner 并持久化到在途登记，语义与页面 blocked/等待指示分支一致；inflight 仍保留会话地址。",
+    "老板 reply 产生新投递时，带 awaitingOwner 的旧在途登记不被接回（沿用 0.13.79 的采纳规则，无改动）：新派工消息（含老板答复）作为跟进发进同一 Devin 会话、开新一轮标记并重新 mcpRoundOpen 开闸，服务端残留的旧 MCP 结论不会被当成本轮结果。"
   ],
   "impact": [
-    "老板 reply 之后答复能真正到达 Devin 会话，不再卡在同一条旧请求上反复 invalid（真实任务 6f05139e）。",
-    "参数填错的代跑请求由执行者自纠，不再惊动老板。",
+    "修复真实任务 6f05139e 的二次卡死：MCP task_block 收尾后老板 reply 曾在一分钟内被旧 task_block 结论顶替收尾，答复从未进入会话；现在答复作为新轮跟进正常发出。",
+    "同投递恢复不变：awaitingOwner 登记仍按投递键接回、零发送。",
     "沿用 schema 074，无迁移。"
   ],
   "migration": "无 schema 变化（沿用 schema 074），升级 owner-backend 即可。",
-  "rollback": "回退至 0.13.78；invalid 恢复为转交老板，新投递恢复领养旧轮标记。"
+  "rollback": "回退至 0.13.79；MCP 受阻收尾恢复不写 awaitingOwner，新投递可能采信服务端未清旧结论。"
 }

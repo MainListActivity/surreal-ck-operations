@@ -392,18 +392,26 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
       outcome = await deps.mcpOutcome();
     } catch { return undefined; }
     if (!outcome) return undefined;
+    // MCP 结论得出的受阻收尾与页面 blocked/等待指示同语义：本轮已停在「等老板答复」。
+    // 必须写入 awaitingOwner（真实任务 6f05139e：MCP task_block 收尾后老板 reply 产生新投递，
+    // 不带标记的旧在途登记被采纳接回，旧标记下 mcpOutcome 仍读到未清的旧结论，答复从未发出）。
+    const ownerBlocked = <T extends VendorOutcome>(out: T): T => {
+      state.devin = { ...state.devin, awaitingOwner: true };
+      persist();
+      return out;
+    };
     if (outcome.kind === 'submit' && !material.review) {
       const text = outcome.text + (outcome.pr ? `\nPR: ${outcome.pr}` : '') + (outcome.sha ? `\nSHA: ${outcome.sha}` : '');
       const out = await closeout(ctx, text);
-      return out.kind === 'blocked' ? { ...out, inflight: true } : out;
+      return out.kind === 'blocked' ? ownerBlocked({ ...out, inflight: true }) : out;
     }
     if (outcome.kind === 'review' && material.review) {
-      if (outcome.verdict !== 'pass' && outcome.verdict !== 'return') return blocked('MCP 结论与本轮阶段不符');
+      if (outcome.verdict !== 'pass' && outcome.verdict !== 'return') return ownerBlocked(blocked('MCP 结论与本轮阶段不符'));
       const out = await closeout(ctx, `复核结论：${outcome.verdict === 'pass' ? '通过' : '退回'}\n${outcome.text}`);
-      return out.kind === 'blocked' ? { ...out, inflight: true } : out;
+      return out.kind === 'blocked' ? ownerBlocked({ ...out, inflight: true }) : out;
     }
-    if (outcome.kind === 'block') return blocked(`工作结果：受阻\n${outcome.text}`);
-    return blocked('MCP 结论与本轮阶段不符');
+    if (outcome.kind === 'block') return ownerBlocked(blocked(`工作结果：受阻\n${outcome.text}`));
+    return ownerBlocked(blocked('MCP 结论与本轮阶段不符'));
   };
   for (;;) {
     await deps.sleep(pollMs);
