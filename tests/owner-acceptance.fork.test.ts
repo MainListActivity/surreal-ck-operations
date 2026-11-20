@@ -87,3 +87,22 @@ run('owner task.create for read-only engineering work does not get the deploy te
   const [rows] = await db.db.query<[Array<{ acceptance_criteria?: Array<{ verify: string }> }>]>('SELECT acceptance_criteria FROM type::record("task", $id);', { id });
   expect((rows[0]?.acceptance_criteria ?? []).some(c => c.verify === 'deploy-run')).toBe(false);
 });
+
+run('owner task.create for read-only engineering work drafts carry no code submit lines', async () => {
+  const mk = async (intent?: { kind: string }) => {
+    const out = await ownerApi(apiCtx(), { command: 'task.create', executorRole: 'engineering', reviewerRole: 'engineering', workIntent: intent,
+      title: `草稿文案-${++count}`, requirement: '需求原文', acceptanceText: '验收原文' }, 'web') as { task?: { id: string }; id?: string };
+    const id = out.task?.id ?? out.id!;
+    const [rows] = await db.db.query<[Array<{ step: string; body: string }>]>(
+      'SELECT step, body FROM outbound_message WHERE task = type::record("task", $id) AND step IN ["execute","review"];', { id });
+    return rows ?? [];
+  };
+  const readRows = await mk({ kind: 'read' });
+  for (const row of readRows) {
+    expect(row.body).not.toContain('完整 40 位提交');
+    expect(row.body).not.toContain('代码任务在最终合入提交上核对');
+  }
+  const codeRows = await mk();
+  expect(codeRows.find(r => r.step === 'execute')?.body).toContain('完整 40 位提交');
+  expect(codeRows.find(r => r.step === 'review')?.body).toContain('代码任务在最终合入提交上核对');
+});
