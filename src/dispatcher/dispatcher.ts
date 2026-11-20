@@ -18,7 +18,7 @@ import { MAINTENANCE_WORKSPACE, UNATTENDED_MODE, goneSceneError, isOpenRefused, 
 import { latestFindings } from './brief.ts';
 import type { PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
-import { isActivationRefused } from '../runner/native.ts';
+import { isActivationRefused } from '../runner/activation-refused.ts';
 import { agingLevel, agingText, localDate, renderBrief, type RoleCapacity } from '../owner-brief.ts';
 import type { ReclaimResult } from './worktree-registry.ts';
 import type { ReclaimTrigger } from './worktree-reclaim.ts';

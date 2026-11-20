@@ -82,13 +82,8 @@ export function parseNativeResult(provider: NativeProvider, output: string): Nat
   return result;
 }
 
-/** 子进程尚未创建即被拒的启动失败：会话落盘为 error + notStarted，派工器据此回收派工屏障。 */
-export class ActivationRefusedError extends Error {
-  readonly code = 'activation_refused';
-  constructor(message: string) { super(message); this.name = 'ActivationRefusedError'; }
-}
-export const isActivationRefused = (error: unknown): error is ActivationRefusedError =>
-  error instanceof ActivationRefusedError || (error instanceof Error && (error as { code?: string }).code === 'activation_refused');
+import { ActivationRefusedError } from './activation-refused.ts';
+export { ActivationRefusedError, isActivationRefused } from './activation-refused.ts';
 /** 这些文本只会出现在子进程创建之前；历史记录按它们补记 notStarted，其他错误一律不补。 */
 const PRE_START_ERROR_TEXTS = new Set(['员工身份或 sidecar 通道不可用', '原生启动命令必须使用绝对路径', '执行端正在关闭']);
 const isPreStartError = (error: unknown): error is string =>
