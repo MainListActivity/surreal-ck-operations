@@ -1,15 +1,17 @@
 {
-  "version": "0.13.68",
-  "title": "VPS 核对改读 Caddy 管理接口；登记表补全首轮实机发现的 VPS 服务",
+  "version": "0.13.69",
+  "title": "显式领域复用：同项目同域工程任务复用会话，水位轮换带 2–4KB 交班",
   "changes": [
-    "VPS 实机核对的 Caddy 路由采集改为读管理接口 http://127.0.0.1:2019/config/apps/http/servers（sck-owner 用户读不了 /etc/caddy/Caddyfile），5 秒超时，失败只记脱敏原因。",
-    "登记表按首轮实机核对补全 VPS 服务：TiKV/PD、监控组件（prometheus/grafana/node_exporter/blackbox_exporter）、shadowsocks、podman 均登记为 review；主机基线同步扩充。",
-    "旧 sck-company-mcp 标记 retire 待退役；podman-auto-update 计时器及其隐含 service 一并登记。"
+    "同项目、同域、同仓库且上一任务已结束的工程执行任务，可复用空闲会话；任务仓库/分支仍每轮重新领取与校验。",
+    "跨域、换仓库、空白域与复核候选默认不匹配；复核始终与原执行人隔离，旧会话不会取得复核签署权。",
+    "可配置输入水位（默认 120K）：达到或用量不可读时，生成 2–4KB 有界交班材料后换新会话；材料按项目+域+角色+仓库匹配。",
+    "复用只改会话归属；旧租约、工作树写权与凭证不随会话继承，旧租约下写入的通道请求按 no_lease 失效。",
+    "新增配置 session_domain_reuse 与 session_domain_input_watermark_k；交班材料只投给同域新会话，发送成功后才消费。"
   ],
   "impact": [
-    "分钟任务不再因 EACCES 报 Caddyfile 读取失败，路由摘要恢复为实机真实配置。",
-    "已补登的服务不再反复出现在漂移提示里；仍未登记的单元继续按未登记告警。"
+    "工程：同域连续任务减少冷启动；跨域或换仓库仍开新会话，不会串用上一个任务的上下文。",
+    "公司：水位或用量未知时自动交班轮换，上下文有界；复核仍由独立会话完成。"
   ],
-  "migration": "无 schema 变化（沿用 schema 074）",
-  "rollback": "回退至 0.13.67：Caddy 采集回到读 /etc/caddy/Caddyfile（对 sck-owner 不可读，路由项将再次为 null）；新补登的服务条目随之移除，实机核对会重新把它们报为未登记。"
+  "migration": "无 schema 文件变更，沿用 schema 074；employee 为 SCHEMALESS，新增的 session_domain/session_project/session_handoff* 字段按需写入，旧版读不到即忽略。升级并重启执行端插件即可。",
+  "rollback": "回退至 0.13.68；领域复用停止，会话恢复按任务一一绑定，新增字段旧版忽略，无数据迁移。"
 }

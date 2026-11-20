@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
-import { managedRecencyOrder, PRIOR_HAND_WEIGHT_FACTOR, quotaBlockedProviders, staffingPool, type StaffingInput } from '../src/dispatcher/dispatcher.ts';
+import { domainReuseAllowed, managedRecencyOrder, PRIOR_HAND_WEIGHT_FACTOR, quotaBlockedProviders, staffingPool, type StaffingInput } from '../src/dispatcher/dispatcher.ts';
 import { BLOCK_TEXT } from '../src/dispatcher/dispatch-blocked.ts';
-import type { CompanyConfig, EmployeeDef, EmployeeInst, SupervisedTask } from '../src/workforce.ts';
+import { buildSessionHandoff, SESSION_HANDOFF_MAX_BYTES, SESSION_HANDOFF_MIN_BYTES, type CompanyConfig, type EmployeeDef, type EmployeeInst, type SupervisedTask } from '../src/workforce.ts';
 import type { ProviderQuota } from '../src/contracts.ts';
 
 const OPS = '/ops/repo';
@@ -428,4 +428,52 @@ test('专属编制：点名任务只给列了该轨道的 bot，普通任务永�
       expect(ordinary.some(e => e.eligible)).toBe(true);
     }
   }
+});
+
+test('显式领域复用：同项目同域、上一任务已结束的执行会话才匹配', () => {
+  const finished = new Set(['t1']);
+  const task = { id: 't2', state: 'ready', executorRole: 'engineering', discipline: '后端', projectId: 'proj-ck' } as unknown as SupervisedTask;
+  const reuse = inst('i1', { repoHome: PRODUCT, sessionTask: 't1', sessionDomain: '后端', sessionProject: 'proj-ck', lastPhase: 'execute' });
+  const p = { role: 'engineering', task, excludeSubmitter: false, domainReuse: { enabled: true, finished } };
+  expect(domainReuseAllowed(p, reuse)).toBe(true);
+  // 域、项目、上一阶段任一不符都不复用。
+  expect(domainReuseAllowed(p, { ...reuse, sessionDomain: '前端' })).toBe(false);
+  expect(domainReuseAllowed(p, { ...reuse, sessionProject: 'other' })).toBe(false);
+  expect(domainReuseAllowed(p, { ...reuse, lastPhase: 'review' })).toBe(false);
+  expect(domainReuseAllowed(p, { ...reuse, sessionTask: undefined })).toBe(false);
+  // 上一任务没结束、复核候选、空白域、开关关闭都不复用。
+  expect(domainReuseAllowed({ ...p, domainReuse: { enabled: true, finished: new Set() } }, reuse)).toBe(false);
+  expect(domainReuseAllowed({ ...p, excludeSubmitter: true }, reuse)).toBe(false);
+  expect(domainReuseAllowed(p, { ...reuse, sessionDomain: undefined })).toBe(false);
+  expect(domainReuseAllowed({ ...p, task: { ...task, discipline: '' } }, reuse)).toBe(false);
+  expect(domainReuseAllowed({ ...p, domainReuse: { enabled: false, finished } }, reuse)).toBe(false);
+});
+
+test('显式领域复用：池按 home 隔离，跨仓库同域会话不进入候选', () => {
+  const finished = new Set(['t1']);
+  const reuse = inst('i1', { repoHome: PRODUCT, sessionTask: 't1', sessionDomain: '后端', sessionProject: 'proj-ck', lastPhase: 'execute' });
+  const task = { id: 't2', state: 'ready', executorRole: 'engineering', discipline: '后端', projectId: 'proj-ck' } as unknown as SupervisedTask;
+  const pool = staffingPool(base({ home: OPS, task, role: 'engineering', insts: [reuse], states: new Map([['i1', 'idle']]),
+    defs: [def('d1')], domainReuse: { enabled: true, finished } }));
+  expect(pool.some(entry => entry.kind === 'reuse')).toBe(false);
+  const sameRepo = staffingPool(base({ home: PRODUCT, task, role: 'engineering', insts: [reuse], states: new Map([['i1', 'idle']]),
+    defs: [def('d1')], domainReuse: { enabled: true, finished } }));
+  expect(sameRepo.find(entry => entry.kind === 'reuse')).toMatchObject({ eligible: true });
+  expect(sameRepo.find(entry => entry.kind === 'reuse')?.note).toContain('同项目同域复用');
+});
+
+test('交班材料按 UTF-8 字节有界：2–4KB 且始终带上权限不继承声明', () => {
+  const rich = buildSessionHandoff({ taskId: 't1', title: '同域后续任务', state: 'done', discipline: '后端', project: 'proj-ck',
+    role: 'engineering', branch: 'task/abc', worktreePath: '/repo-sck-abc',
+    submission: '实现与验证记录。'.repeat(400), acceptance: '验收要求：逐条核对。'.repeat(200),
+    checkpoints: Array.from({ length: 8 }, (_, i) => `检查点 ${i}：完成一段可验证的工作。`.repeat(30)) });
+  const bytes = Buffer.byteLength(rich, 'utf8');
+  expect(bytes).toBeGreaterThanOrEqual(SESSION_HANDOFF_MIN_BYTES);
+  expect(bytes).toBeLessThanOrEqual(SESSION_HANDOFF_MAX_BYTES);
+  expect(rich).toContain('【交班材料·上一会话轮换前交接】');
+  expect(rich).toContain('不得沿用上一会话的任何权限、凭据或复核签署权');
+  // 空事实也不越界，并且仍然说明权限不继承。
+  const sparse = buildSessionHandoff({ taskId: 't2', title: '', checkpoints: [] });
+  expect(Buffer.byteLength(sparse, 'utf8')).toBeLessThanOrEqual(SESSION_HANDOFF_MAX_BYTES);
+  expect(sparse).toContain('不得沿用上一会话');
 });

@@ -157,6 +157,8 @@ export interface TaskRow {
   kind?: TaskKind;
   /** Task-level project override (registered project id). */
   project?: RecordId;
+  /** Read-only projection of `goal.project` for dispatch (effective project when no override). */
+  goal_project?: RecordId;
   /** Explicit code-repo binding (schema 017); workspace/dispatch routing only, never business project resolution. */
   code_repo_path?: string;
   model_tier?: 'fable' | 'opus' | 'sonnet' | 'haiku' | 'high' | 'medium' | 'low';

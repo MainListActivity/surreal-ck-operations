@@ -9,7 +9,7 @@ import type { OwnerDesk } from '../owner.ts';
 import { LaneNoteStore } from '../lane-notes.ts';
 import { OutboundMessageStore, renderDispatchBody, renderMessage, type MessageStep, type OutboundMessage } from '../outbound-messages.ts';
 import { dispatchText } from '../outbound-render.ts';
-import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
+import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SessionTaskFacts, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
 import { byLanePreference, dispatchReason, laneChoiceText, lanePreferenceFor, laneRank, type LanePreference } from './lane-preference.ts';
 import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, RetirementKind, Role, WriteScopeHolder } from '../contracts.ts';
@@ -197,6 +197,17 @@ export interface StaffingInput {
   opsRepo: string;
   sidecar: boolean;
   now: number;
+  /**
+   * 显式领域复用的事实：开关，以及“上一任务已结束”的会话任务集合。缺省或读取失败 = 不跨任务复用。
+   * 复核（excludeSubmitter）永远不参与，空白域沿用原策略。
+   */
+  domainReuse?: DomainReuseFacts;
+}
+
+export interface DomainReuseFacts {
+  enabled: boolean;
+  /** Session task ids that are done/void: the only prior tasks a reusable session may hold. */
+  finished: ReadonlySet<string>;
 }
 
 /** A def outside its working hours takes no new work (no spawn, no wake); a running turn is left alone. Judged in the Mac's local time. */
@@ -235,6 +246,21 @@ export function factoryWorkKey(role: string, task: SupervisedTask, review = fals
 
 export function factoryConfigured(defs: readonly EmployeeDef[], role: string, task?: SupervisedTask, provider = FACTORY_PROVIDER): boolean {
   return defs.some(def => def.enabled && sameSubscription(def.provider, provider) && def.role === role && trackOkFor(role as Role,task,def.tracks));
+}
+
+/**
+ * 显式领域复用判定：只有工程执行任务参与；任务域与项目都必须非空，且与这个会话登记的域/项目完全一致；
+ * 该会话上一任务必须已经结束（done/void），上一阶段必须是执行；复核候选（excludeSubmitter）一律不参与。
+ * 仓库/home 的过滤在 staffingPool 里先行完成，所以不同仓库的同域会话也不会匹配。
+ */
+export function domainReuseAllowed(p: Pick<StaffingInput, 'role' | 'task' | 'excludeSubmitter' | 'domainReuse'>, inst: EmployeeInst): boolean {
+  if (!p.domainReuse?.enabled || p.excludeSubmitter || !p.task) return false;
+  if (p.role !== 'engineering' || p.task.executorRole !== 'engineering') return false;
+  const domain = typeof p.task.discipline === 'string' ? p.task.discipline.trim() : '';
+  if (!domain || !p.task.projectId) return false;
+  if (!inst.sessionTask || inst.sessionDomain !== domain || inst.sessionProject !== p.task.projectId) return false;
+  if (inst.lastPhase !== 'execute') return false;
+  return p.domainReuse.finished.has(inst.sessionTask);
 }
 
 /**
@@ -317,8 +343,11 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     if (inst.role !== p.role) continue;
     if ((inst.repoHome ?? inst.cwd ?? p.opsRepo) !== p.home) continue;
     if (!inWorkspace(inst)) continue;
-    // A session serves one task: one bound to another task, or to none, is never a candidate for this one.
-    if (p.task && inst.sessionTask !== p.task.id) continue;
+    // A session serves one task, except an explicit same-project/same-domain continuation
+    // whose previous task has ended; otherwise a session bound to another task (or none) is not a candidate.
+    const sameTask = !p.task || inst.sessionTask === p.task.id;
+    const domainReused = !sameTask && domainReuseAllowed(p, inst);
+    if (p.task && !sameTask && !domainReused) continue;
     const def = p.defs.find(d => d.id === inst.def);
     // Prior-submitter exclusion comes first: a candidate that can never take the task must not be reported as merely busy.
     const hit: Block | undefined =
@@ -339,7 +368,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       provider: inst.provider ?? '', model: inst.model ?? def?.model, def, inst,
       weight: (managedModel(def) ? 1 : effectiveWeight(def)) * (priorHand ? PRIOR_HAND_WEIGHT_FACTOR : 1),
       share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2],
-      note: priorHand ? '经手过本任务（未写码），降权兜底' : undefined });
+      note: priorHand ? '经手过本任务（未写码），降权兜底' : (domainReused ? '同项目同域复用上一任务的空闲会话' : undefined) });
   }
   for (const def of p.defs) {
     if (def.role !== p.role) continue;
@@ -537,6 +566,11 @@ export interface SidecarBridge {
   readWorkspace?(inst: EmployeeInst, taskId?: string, project?: string): Promise<WorktreeAssignment | undefined>;
   releaseWorkspace?(inst: EmployeeInst): Promise<void>;
   bindAgent(instId: string, agentId: string): void;
+  /**
+   * 领域复用：把会话的任务归属改绑到本轮任务，使下一次 session_open 的模型用量归因跟随新任务。
+   * 只改登记，不改凭证、租约或工作树写权。缺省时复用仍进行，但模型用量留在原任务名下。
+   */
+  setSessionTask?(instId: string, taskId: string): void;
   /** Absolute path of the instance's comm dir, for prompts (agents must not resolve env vars). */
   commDirFor(instId: string): string;
   /** Absolute path of the instance's scratch dir (temp clones/builds); spawn env alone is lost on resume. */
@@ -619,6 +653,8 @@ export interface PassInputs {
   exclusions?: Map<string, ReviewExclusion | undefined>;
   /** Instances this pass assigned work to. The board reads them as taken, as the dispatch loop did. */
   assigned?: ReadonlySet<string>;
+  /** 显式领域复用的事实（同域空闲会话 + 上一任务已结束）；读取失败时缺省，等价于不跨任务复用。 */
+  domainReuse?: DomainReuseFacts;
 }
 
 export interface TickReport {
@@ -668,7 +704,7 @@ export async function snapshotOf(p: PassInputs, opts: SnapshotOpts,
   const holding = new Set(p.tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
   const poolBase = { providerAllowed: p.providerAllowed, defs: p.defs, insts: p.insts, states: p.states, holding, health: p.health, quotaBlocked: p.quotaBlocked,
     factoryQueue:p.factoryQueue, busyBy, providerMax: p.cfg.providerMax, preferredProvider: p.cfg.preferredProvider, lanePreference: p.cfg.lanePreference, slots: p.slots, runtimeModels: p.runtimeModels,
-    opsRepo: opts.opsRepo, sidecar: opts.sidecar, now: p.now };
+    opsRepo: opts.opsRepo, sidecar: opts.sidecar, now: p.now, domainReuse: p.domainReuse };
   const homes = [...new Set([opts.opsRepo, ...p.insts.map(i => i.repoHome ?? i.cwd ?? opts.opsRepo), ...p.tasks.map(t => t.repoPath ?? opts.opsRepo)])];
   const roles = [...new Set([...p.defs.map(d => d.role), ...p.insts.map(i => i.role)])];
   const pools = roles.flatMap(role => homes.map(home => ({ role, home, entries: staffingPool({ ...poolBase, role, home }) })))
@@ -833,7 +869,7 @@ export class Dispatcher {
   }
 
   private async prepareOutbound(taskId: string, step: MessageStep, employeeId: string,
-    workdir?: string, history?: ClaimResult['history']): Promise<PreparedOutbound | null | undefined> {
+    workdir?: string, history?: ClaimResult['history'], handoff?: string): Promise<PreparedOutbound | null | undefined> {
     const store = this.messageStore();
     if (!store) return undefined;
     try {
@@ -855,7 +891,8 @@ export class Dispatcher {
         ...(findings ? { findingsFile: findings.file } : {}), taskId,
         ...(acId ? { acId } : {}),
       });
-      return { ...prepared, body, workdir };
+      // 交班材料只随这一条派工发给新会话，不写进消息草稿（老板预览与消息链保持任务卡原文）。
+      return { ...prepared, body: handoff ? `${handoff.trimEnd()}\n\n${body}` : body, workdir };
     } catch (error) {
       // Fail closed: a legacy prompt here would bypass the owner's edit and hold.
       this.log(`outbound message read failed for ${taskId}: ${(error as Error).message}`);
@@ -1363,11 +1400,20 @@ export class Dispatcher {
     // 2c. Session rotation: a session that has run many turns carries an ever-growing context,
     // so every further turn costs more input tokens. Retire idle instances past the configured
     // size/count and let the next task spawn a fresh, cheap session.
+    let domainFacts: SessionTaskFacts | undefined;
     {
       const holding = new Set(tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
       const bound = new Set<string>();
       const rotationHost = this.hostResources();
       const rotationSafe = !(rotationHost && memoryBlocked(rotationHost,cfg.minFreeMemMb));
+      // 显式领域复用的上一任务状态：只有 done/void 的会话才可跨任务复用，也只有它们按领域水位换新。
+      const domainWatermark = cfg.sessionDomainReuse ? cfg.sessionDomainInputWatermarkK : 0;
+      const domainSessions = cfg.sessionDomainReuse && typeof wf.sessionTaskFacts === 'function'
+        ? insts.filter(inst => inst.sessionDomain && inst.sessionTask && !inst.activeTask) : [];
+      domainFacts = domainSessions.length
+        ? await wf.sessionTaskFacts([...new Set(domainSessions.map(inst => inst.sessionTask!))])
+          .catch(error => { this.log(`domain session facts unread: ${(error as Error).message}`); return undefined; })
+        : undefined;
       if (rotationSafe) {
         const idleRetired = await reclaimIdleSessions({ instances: insts, states, held: holding, bound, now,
           minutes: cfg.sessionIdleMinutes ?? 120, workforce: wf, paseo,
@@ -1380,6 +1426,9 @@ export class Dispatcher {
         const facts = live.length ? await wf.sessionTaskFacts([...new Set(live.map(inst => inst.lastTask!))])
           .catch(error => { this.log(`finished sessions unread: ${(error as Error).message}`); return undefined; }) : undefined;
         for (const inst of facts ? finishedSessions({ instances: live, states, held: holding, facts }) : []) {
+          // 显式领域复用的会话是 oneshot 的唯一例外：留着等同一项目/域的下一个任务，或由水位轮换带交班材料换新。
+          if (cfg.sessionDomainReuse && inst.role === 'engineering' && inst.lastPhase === 'execute'
+            && inst.sessionDomain && inst.sessionProject) continue;
           if (!await this.retireGated(inst, '一次性会话：任务已结束', 'rotation', report)) continue;
           await paseo.archive(inst.paseoAgentId!).catch(() => undefined);
           await this.archiveInstScene(inst);
@@ -1395,10 +1444,17 @@ export class Dispatcher {
         if (report.retired.includes(inst.id) || states.get(inst.id) !== 'idle' || holding.has(inst.id) || bound.has(inst.id) || !inst.paseoAgentId) continue;
         const maxWakes = cfg.sessionMaxWakesByRole?.[inst.role] ?? cfg.sessionMaxWakes;
         const overWakes = maxWakes > 0 && (inst.wakeCount ?? 0) >= maxWakes;
+        const priorState = inst.sessionTask ? domainFacts?.states.get(inst.sessionTask) : undefined;
+        const domainReady = cfg.sessionDomainReuse && inst.role === 'engineering' && inst.lastPhase === 'execute'
+          && !!inst.sessionDomain && !!inst.sessionProject && (priorState === 'done' || priorState === 'void');
+        let usage: number | undefined;
+        let usageRead = false;
         let inputK = 0;
-        if (!overWakes && cfg.sessionMaxInputK > 0 && (inst.wakeCount ?? 0) >= 3 && inspected < 8) {
+        if (!overWakes && inspected < 8 && ((cfg.sessionMaxInputK > 0 && (inst.wakeCount ?? 0) >= 3) || domainReady)) {
           inspected++;
-          inputK = ((await paseo.lastInputTokens(inst.paseoAgentId!).catch(() => undefined)) ?? 0) / 1000;
+          usageRead = true;
+          usage = await paseo.lastInputTokens(inst.paseoAgentId!).catch(() => undefined);
+          inputK = (usage ?? 0) / 1000;
         }
         // Model drift is not a reason to retire anyone. A provider can switch the model under a
         // live subscription (Factory falls back to a cheaper model once the standard allowance is
@@ -1439,8 +1495,27 @@ export class Dispatcher {
           }
           continue;
         }
-        if (!overWakes && !(cfg.sessionMaxInputK > 0 && inputK > cfg.sessionMaxInputK)) continue;
-        const reason = overWakes ? `会话轮换：已派工 ${inst.wakeCount} 轮` : `会话轮换：上一轮 input ${Math.round(inputK)}k tokens`;
+        const usageUnknown = usageRead && (usage === undefined || !Number.isFinite(usage));
+        const overDomainWatermark = domainReady && (usageUnknown || (domainWatermark > 0 && inputK >= domainWatermark));
+        const overInput = cfg.sessionMaxInputK > 0 && inputK > cfg.sessionMaxInputK;
+        if (!overWakes && !overDomainWatermark && !overInput) continue;
+        const reason = overDomainWatermark
+          ? usageUnknown ? '会话轮换：上一轮用量未知，按保守路径生成交班材料后换新'
+            : `会话轮换：上一轮 input ${Math.round(inputK)}k 达领域交班水位 ${domainWatermark}k`
+          : overWakes ? `会话轮换：已派工 ${inst.wakeCount} 轮` : `会话轮换：上一轮 input ${Math.round(inputK)}k tokens`;
+        // 领域会话换新必须先落一份 2–4KB 的交班材料。生成失败时，只有轮次/200K 上限可以强制换新；
+        // 仅因水位换新的会话保留到下一轮重试，避免把上下文丢在空中。
+        if (domainReady) {
+          const stored = typeof wf.storeSessionHandoff === 'function'
+            ? await wf.storeSessionHandoff(inst, { project: inst.sessionProject, domain: inst.sessionDomain, role: inst.role,
+              repo: inst.repoHome ?? inst.cwd ?? this.deps.env.opsRepo, reason })
+              .catch(error => { this.log(`handoff build failed for ${inst.id}: ${(error as Error).message}`); return undefined; })
+            : undefined;
+          if (!stored && !(overWakes || overInput)) {
+            this.log(`rotation ${inst.id} deferred: handoff material unavailable`);
+            continue;
+          }
+        }
         if (!await this.retireGated(inst, reason, 'rotation', report)) continue;
         await paseo.archive(inst.paseoAgentId!).catch(() => undefined);
         await this.archiveInstScene(inst);
@@ -1452,7 +1527,10 @@ export class Dispatcher {
     }
 
     // What this pass has read before it decides. The snapshot and the daily brief are taken from these at the end of the tick.
-    this.passInputs = { providerAllowed: this.deps.providerAllowed, now, cfg, defs, insts, states, health, quotaBlocked, tasks, slots: slotMap, runtimeModels };
+    const domainReuse: DomainReuseFacts | undefined = domainFacts
+      ? { enabled: true, finished: new Set([...domainFacts.states].filter(([, state]) => state === 'done' || state === 'void').map(([id]) => id)) }
+      : undefined;
+    this.passInputs = { providerAllowed: this.deps.providerAllowed, now, cfg, defs, insts, states, health, quotaBlocked, tasks, slots: slotMap, runtimeModels, domainReuse };
 
     // 3. Owner inbox notices (gates, questions) and staffing gaps.
     await this.ownerNotices(tasks, report, now);
@@ -1579,7 +1657,7 @@ export class Dispatcher {
     const factoryCanRoute = !!preferred && subscriptionPeers(preferred).every(peer => availabilityOf(health.get(peer),now) !== 'down' && !quotaBlocked.has(peer));
     const poolBase = { providerAllowed: this.deps.providerAllowed, factoryQueue:undefined as Map<string,number>|undefined, defs, states, holding, health, quotaBlocked, busyBy,
       providerMax: cfg.providerMax, preferredProvider: preferred, lanePreference: cfg.lanePreference, slots: slotMap, runtimeModels, opsRepo: this.deps.env.opsRepo,
-      sidecar: !!this.deps.sidecar, now };
+      sidecar: !!this.deps.sidecar, now, domainReuse };
     const queueExclusions = new Map<string,ReviewExclusion|undefined>();
     for(const item of work.filter(item=>item.purpose==='review')) queueExclusions.set(item.task.id,await readReviewExclusion(wf,item.task,message=>this.log(message)));
     this.passInputs.exclusions=queueExclusions;
@@ -1626,8 +1704,17 @@ export class Dispatcher {
       exclusion?: ReviewExclusion, anchorHome?: string) => {
       const home = task?.repoPath ?? anchorHome ?? this.deps.env.opsRepo;
       const eligible = eligibleInsts(role, home, task, excludeSubmitter, exclusion);
-      // Oneshot: a task never lands on an unrelated session's context. No continuing session means a new one.
-      if (cfg.sessionPolicy === 'oneshot' && task) return continuitySession(eligible, states, task, excludeSubmitter);
+      // Oneshot: a task never lands on an unrelated session's context. No continuing session means a new one,
+      // except an explicit same-project/same-domain continuation the pool already admitted.
+      if (cfg.sessionPolicy === 'oneshot' && task) {
+        const continuity = continuitySession(eligible, states, task, excludeSubmitter);
+        if (continuity) return continuity;
+        if (cfg.sessionDomainReuse && domainReuse?.enabled && !excludeSubmitter) {
+          const reused = eligible.filter(inst => inst.sessionTask !== task.id);
+          if (reused.length) return [...reused].sort((a, b) => (b.lastWakeAt ?? 0) - (a.lastWakeAt ?? 0) || a.id.localeCompare(b.id))[0];
+        }
+        return undefined;
+      }
       const factory = preferred ? eligible.filter(i => sameSubscription(i.provider, preferred)) : [];
       const candidates = factory.length ? factory : eligible;
       // A prior hand is demoted in the weighted pick (PRIOR_HAND_WEIGHT_FACTOR), exactly as in the pool.
@@ -1822,6 +1909,28 @@ export class Dispatcher {
     this.taskDeny.set(task.id, { at: now, version: task.version });
   }
 
+  /**
+   * 领域会话换新：先落 2–4KB 交班材料，再走共享退休门禁。材料生成失败或退休被拒时返回 false，
+   * 调用方必须放弃本轮复用/派工；绝不在没有材料的情况下把超水位上下文带进新任务。
+   */
+  private async rotateDomainSession(inst: EmployeeInst,
+    input: { project?: string; domain?: string; role: string; repo: string; reason: string },
+    report: TickReport, insts: EmployeeInst[]): Promise<boolean> {
+    const stored = typeof this.deps.workforce.storeSessionHandoff === 'function'
+      ? await this.deps.workforce.storeSessionHandoff(inst, input)
+        .catch(error => { this.log(`handoff build failed for ${inst.id}: ${(error as Error).message}`); return undefined; })
+      : undefined;
+    if (!stored) { this.log(`rotation ${inst.id} deferred: handoff material unavailable`); return false; }
+    if (!await this.retireGated(inst, input.reason, 'rotation', report)) return false;
+    await this.deps.paseo.archive(inst.paseoAgentId!).catch(() => undefined);
+    await this.archiveInstScene(inst);
+    const at = insts.indexOf(inst);
+    if (at >= 0) insts.splice(at, 1);
+    report.retired.push(inst.id);
+    this.log(`retired ${inst.id}: ${input.reason}`);
+    return true;
+  }
+
   private async assign(
     role: string, task: SupervisedTask | undefined, avoid: string | undefined,
     pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean, exclusion?: ReviewExclusion, anchorHome?: string) => EmployeeInst | undefined,
@@ -1871,12 +1980,31 @@ export class Dispatcher {
     const candidate = pick(role, scopeTask, avoid, forReview, exclusion, anchor?.home);
     // A free preferred-provider seat is used before another provider's idle session. Once it has no admitted
     // reuse or spawn candidate (quota, health, capacity, exclusion), ordinary fallback takes over.
-    // A session continuing its own work keeps it: its context is why it was picked.
-    const continuing = candidate !== undefined && assignCfg.sessionPolicy === 'oneshot';
+    // A session continuing its own work keeps it: its context is why it was picked. An explicit
+    // same-project/same-domain continuation is the same case for a new task.
+    const crossTaskReuse = candidate !== undefined && !!task && candidate.sessionTask !== task.id;
+    const continuing = candidate !== undefined && (crossTaskReuse
+      || (assignCfg.sessionPolicy === 'oneshot' && (candidate.sessionTask === undefined || candidate.sessionTask === scopeTask?.id)));
     const picked = !continuing && !!preferredProvider && !sameSubscription(candidate?.provider, preferredProvider) && defsOrdered.some(d=>sameSubscription(d.provider,preferredProvider)) ? undefined : candidate;
     const pending = picked && !picked.paseoAgentId ? picked : undefined;
     if (pending) defsOrdered = (await wf.defs()).filter(d => d.id === pending.def && d.enabled && inWorkHours(d.workHours, new Date()));
-    const existing = picked?.paseoAgentId && sidecar.canReuse(picked) ? picked : undefined;
+    let existing = picked?.paseoAgentId && sidecar.canReuse(picked) ? picked : undefined;
+    // 显式领域复用的水位闸：本轮复用的是上一任务的会话时，重新核对真实用量。达到水位或用量未知，
+    // 先落交班材料再换新；材料无法生成或退休被拒时放弃本轮复用，不把超水位上下文带进新任务。
+    if (existing && task && existing.sessionTask !== task.id && assignCfg.sessionDomainReuse) {
+      const usage = await paseo.lastInputTokens(existing.paseoAgentId!).catch(() => undefined);
+      const usageUnknown = usage === undefined || !Number.isFinite(usage);
+      const inputK = (usage ?? 0) / 1000;
+      const watermark = assignCfg.sessionDomainInputWatermarkK;
+      if (usageUnknown || (watermark > 0 && inputK >= watermark)) {
+        const reason = usageUnknown
+          ? '会话轮换：上一轮用量未知，按保守路径生成交班材料后换新'
+          : `会话轮换：上一轮 input ${Math.round(inputK)}k 达领域交班水位 ${watermark}k`;
+        if (!await this.rotateDomainSession(existing, { project: task.projectId, domain: task.discipline, role: task.executorRole,
+          repo: repoHome, reason }, report, insts)) return undefined;
+        existing = undefined;
+      }
+    }
     // A message still waiting for its translation is skipped before any lease: no claim churn, no notice. The employee's language is
     // aligned first: a message that never had one queues no translation, so the wait would never end.
     if (task && existing) {
@@ -1899,6 +2027,16 @@ export class Dispatcher {
             this.log(`claim ${task.id} as ${existing.id} lost; skipping`);
             return undefined;
           }
+        }
+        // 领域复用成功：把会话任务/域/项目改绑到本轮。老租约、老工作树引用与老请求都已在 claim 中失效/替换，
+        // 会话只继承对话上下文，不继承任何写权、凭证或复核签署权。
+        if (task && existing.sessionTask !== task.id) {
+          await wf.recordSessionBinding(existing.id, { task: task.id, domain: task.discipline, project: task.projectId })
+            .catch(error => this.log(`session binding for ${existing!.id} not recorded: ${(error as Error).message}`));
+          sidecar.setSessionTask?.(existing.id, task.id);
+          existing.sessionTask = task.id;
+          existing.sessionDomain = task.discipline;
+          existing.sessionProject = task.projectId;
         }
         // Home-bound insts park their session on a private comm dir outside any
         // task scene, so a worktree move is their normal case — wake, never
@@ -1939,7 +2077,9 @@ export class Dispatcher {
           }
           await hooks?.beforeExternal?.(existing, 'send');
           // 原因在外部调用之前写：原生执行端的调用要等会话跑完才返回，事后写的话进行中的一轮看不到。只有发出的消息才显示它。
-          await this.recordReason(prepared?.message.id, reasonFor(existing.provider ?? '', assignCfg.sessionPolicy === 'oneshot'));
+          await this.recordReason(prepared?.message.id, crossTaskReuse
+            ? `同项目同域复用上一任务的空闲会话（${existing.id}）`
+            : reasonFor(existing.provider ?? '', assignCfg.sessionPolicy === 'oneshot'));
           externalAttempt = true;
           const attempt = await wf.beginDispatchAttempt({ request: randomUUID(), message: prepared?.message.id,
             messageRevision: prepared?.message.dispatchRevision, body: body!, bodyHash: createHash('sha256').update(body!).digest('hex'), employee: existing.id, task: task?.id, kind: 'send',
@@ -1950,6 +2090,11 @@ export class Dispatcher {
           this.onboarded.add(existing.id);
           this.lastStatus.set(existing.paseoAgentId!, 'running');
           await wf.finishDispatchAttempt(attempt, existing.paseoAgentId!);
+          // 本行已由一个暖会话接续，之前轮换留下的同 scope 交班材料不再投给未来的任务。
+          if (task && crossTaskReuse && typeof wf.pendingSessionHandoff === 'function') {
+            const stale = await wf.pendingSessionHandoff({ project: task.projectId, domain: task.discipline, role: task.executorRole, repo: repoHome }).catch(() => undefined);
+            if (stale) await wf.consumeSessionHandoff?.(stale.employee, stale.key, existing.id).catch(() => undefined);
+          }
           this.log(`woke ${existing.id} for ${task?.id ?? `dispatch:${role}`}`);
           return { ...existing, spawned: false };
         }
@@ -1975,7 +2120,8 @@ export class Dispatcher {
       const model = this.resolveModel(def, slots ?? new Map(), task);
       if (!model) continue;
       // The task is written onto the new session before its env is built: model traffic is attributed by it from the first request.
-      const inst = pending ?? await wf.spawnInst(def, repoHome, sidecar ? 'maintenance' : undefined, task?.id);
+      const inst = pending ?? await wf.spawnInst(def, repoHome, sidecar ? 'maintenance' : undefined, task?.id,
+        { domain: task?.discipline, project: task?.projectId });
       let spawnEnv: Record<string, string>;
       let claim: ClaimResult | undefined;
       let workspace: WorktreeAssignment | undefined;
@@ -2016,8 +2162,13 @@ export class Dispatcher {
         const spawnCwd = workspaceScope ? repoHome : instHome ?? (claim?.worktree ?? workspace)?.worktreePath ?? repoHome;
         // A workspace-scoped session keeps its repo-root cwd, but the workdir line must still name the claim's tree.
         const workdir = (claim?.worktree ?? workspace)?.worktreePath ?? spawnCwd;
+        // 轮换时落库的交班材料只投给同项目、同域、同仓库的新会话；跨域或换仓库不匹配，不会被带过去。
+        const handoff = task && !forReview && assignCfg.sessionDomainReuse && typeof wf.pendingSessionHandoff === 'function'
+          ? await wf.pendingSessionHandoff({ project: task.projectId, domain: task.discipline, role: task.executorRole, repo: repoHome })
+            .catch(error => { this.log(`session handoff unread for ${task.id}: ${(error as Error).message}`); return undefined; })
+          : undefined;
         const prepared = task ? await this.prepareOutbound(task.id, await nextStep(claim), inst.id,
-          workdir, claim?.history) : null;
+          workdir, claim?.history, handoff?.text) : null;
         if (task && prepared === null) {
           if (claim) await sidecar!.releaseClaim(inst.id, task.id, await this.skipReason(task.id, await nextStep(claim), inst.id));
           return undefined;
@@ -2062,6 +2213,9 @@ export class Dispatcher {
           await wf.confirmDispatchActivation(attempt, agentId);
         }
         await wf.finishDispatchAttempt(attempt, agentId);
+        // 交班材料只在新会话真正收到消息后消费；发送失败时保留给下一轮重试。
+        if (handoff) await wf.consumeSessionHandoff?.(handoff.employee, handoff.key, inst.id)
+          .catch(error => this.log(`session handoff not consumed: ${(error as Error).message}`));
         sidecar?.bindAgent(inst.id, agentId);
         const bound = { ...inst, paseoAgentId: agentId, cwd, repoHome, model, workspaceScope, paseoWorkspace: container.workspaceId };
         const prior = insts.findIndex(row => row.id === inst.id);

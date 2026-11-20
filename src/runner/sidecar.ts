@@ -644,6 +644,12 @@ export class SidecarPool {
     return this.roles.get(instId)?.role;
   }
 
+  /** 领域复用：同一会话接续下一任务时只改登记的归属，使下一次 session_open 的模型用量归因跟随新任务。 */
+  setSessionTask(instId: string, taskId: string): void {
+    const known = this.roles.get(instId);
+    if (known) this.roles.set(instId, { ...known, task: taskId });
+  }
+
   /** Spawn env for a fresh instance: comm channel only. Minted credential stays in memory. */
   env(inst: EmployeeInst): Record<string, string> {
     this.roles.set(inst.id,{role:inst.role,task:inst.sessionTask});
