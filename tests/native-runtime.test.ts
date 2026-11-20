@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { NativeRuntime, nativeArgs, parseNativeResult, type NativeOptions } from '../src/runner/native.ts';
+import { ActivationRefusedError, isActivationRefused, NativeRuntime, nativeArgs, parseNativeResult, type NativeOptions, type NativeSession } from '../src/runner/native.ts';
 import type { SpawnInput, TurnEnded } from '../src/runner/contracts.ts';
 
 const input = (provider = 'factory-droid'): SpawnInput => ({ title: 'SCK · fixture', provider, model: 'fixture-model',
@@ -333,4 +333,55 @@ test('公司工具 MCP 注入：droid 与云端通道不注入；不传 companyM
     .toEqual(['-p', '--output-format', 'stream-json', '--verbose', '--model', 'm', '--resume', 'session']);
   expect(nativeArgs({ provider: 'codex', model: '', mode: 'full-access' }))
     .toEqual(['exec', '--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', '-']);
+});
+
+test('启动前 environment 抛错：activate 抛 ActivationRefusedError、activationRefused 为真、子进程未启动', async () => {
+  const f = fixture(success, { environment: async () => { throw new Error('员工身份或 sidecar 通道不可用'); } });
+  try {
+    const id = await f.runtime.spawn(input());
+    const err = await f.runtime.activate(id).then(() => { throw new Error('should reject'); }, e => e as Error);
+    expect(err).toBeInstanceOf(ActivationRefusedError);
+    expect(isActivationRefused(err)).toBe(true);
+    expect(err.message).toBe('员工身份或 sidecar 通道不可用');
+    expect(f.runtime.activationRefused(id)).toBe(true);
+    expect(existsSync(join(f.root, 'received.json'))).toBe(false);
+    const persisted = JSON.parse(readFileSync(join(f.root, 'sessions.json'), 'utf8')) as { sessions: NativeSession[] };
+    expect(persisted.sessions[0]?.status).toBe('error');
+    expect(persisted.sessions[0]?.notStarted).toBe(true);
+    expect(persisted.sessions[0]?.pid).toBeUndefined();
+  } finally { await f.close(); }
+});
+
+test('正常启动后 activationRefused 为假；不存在的会话也为假', async () => {
+  const f = fixture(success);
+  try {
+    const id = await f.runtime.spawn(input());
+    await f.runtime.activate(id);
+    await until(() => f.events.length === 1);
+    expect(f.runtime.activationRefused(id)).toBe(false);
+    expect(f.runtime.activationRefused('native:test:missing')).toBe(false);
+  } finally { await f.close(); }
+});
+
+test('旧 sessions.json 迁移：只为启动前错误文本补 notStarted', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sck-native-'));
+  const session = (id: string, error: string, extra: Partial<NativeSession> = {}): NativeSession =>
+    ({ id, host: 'test', provider: 'claude', title: 't', cwd: tmpdir(), model: 'm', labels: {}, status: 'error', error, ...extra });
+  writeFileSync(join(root, 'sessions.json'), JSON.stringify({ version: 1, host: 'test', workspaces: [], sessions: [
+    session('a', '员工身份或 sidecar 通道不可用'),
+    session('b', '原生启动命令必须使用绝对路径'),
+    session('c', '执行端正在关闭'),
+    session('d', '本节点没有配置 claude 的员工沙箱命令'),
+    session('e', '原生回合未完整结束：缺少终态'),
+    session('f', '回合收尾失败：onEnded 抛错'),
+    session('g', '员工身份或 sidecar 通道不可用', { pid: 99999999 }),
+    session('h', '员工身份或 sidecar 通道不可用', { nativeSessionId: 'n1' }),
+  ] }));
+  let runtime: NativeRuntime | undefined;
+  try {
+    runtime = new NativeRuntime({ root, host: 'test', command: () => [process.execPath],
+      environment: async () => ({}), stopGraceMs: 25 });
+    for (const id of ['a', 'b', 'c', 'd']) { expect(runtime.describe(id)?.notStarted).toBe(true); expect(runtime.activationRefused(id)).toBe(true); }
+    for (const id of ['e', 'f', 'g', 'h']) { expect(runtime.describe(id)?.notStarted).toBeUndefined(); expect(runtime.activationRefused(id)).toBe(false); }
+  } finally { await runtime?.close(); rmSync(root, { recursive: true, force: true }); }
 });

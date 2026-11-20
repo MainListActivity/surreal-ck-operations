@@ -18,6 +18,7 @@ import { MAINTENANCE_WORKSPACE, UNATTENDED_MODE, goneSceneError, isOpenRefused, 
 import { latestFindings } from './brief.ts';
 import type { PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
+import { isActivationRefused } from '../runner/native.ts';
 import { agingLevel, agingText, localDate, renderBrief, type RoleCapacity } from '../owner-brief.ts';
 import type { ReclaimResult } from './worktree-registry.ts';
 import type { ReclaimTrigger } from './worktree-reclaim.ts';
@@ -1108,6 +1109,24 @@ export class Dispatcher {
     const isolatedEmployees = new Set(uncertain.map(a => a.employee));
     const isolatedTasks = new Set(uncertain.map(a => a.task).filter((id): id is string => !!id));
     if (uncertain.length) {
+      // A native activation refused before the child started leaves the barrier in 'calling' forever (real case:
+      // sidecar channel unavailable at paseo.activate). The runtime's persisted notStarted is the only authority;
+      // absent method / false / error all fail closed and keep the barrier.
+      for (const attempt of uncertain) {
+        if (attempt.activation_state !== 'calling' || !attempt.agent) continue;
+        const refused = await Promise.resolve(paseo.activationRefused?.(attempt.agent)).catch(() => undefined);
+        if (refused !== true) continue;
+        try {
+          await wf.rejectActivationAttempt(attempt.id, attempt.agent, 'activation refused before start');
+          this.log(`dispatch activation refused before start: ${attempt.id} (${attempt.employee})`);
+          const inst = (await wf.insts()).find(i => i.id === attempt.employee);
+          if (inst) {
+            await this.deps.sidecar?.releaseWorkspace?.(inst);
+            if (attempt.task) await this.deps.sidecar?.releaseClaim?.(inst.id, attempt.task, '激活在子进程启动前被拒，派工屏障已回收');
+            if (await this.retireGated(inst, 'activation refused before start', 'failure', report)) report.retired.push(inst.id);
+          }
+        } catch (error) { this.log(`reject refused activation ${attempt.id} failed: ${(error as Error).message}`); }
+      }
       for (const error of await wf.recoverDispatchBindings()) this.log(`dispatch recovery retained: ${error}`);
       await this.deps.sidecar?.adopt?.((await wf.insts()).filter(i => isolatedEmployees.has(i.id)));
       await this.notice('dispatch-uncertain',
@@ -2153,6 +2172,7 @@ export class Dispatcher {
       }
       let externalAttempt = false;
       let attemptId: string | undefined;
+      let agentId: string | undefined;
       try {
         // Goal conversations live at the repository root; private comm remains per employee.
         // Worktree allocation stays in claim.json and never changes the Paseo workspace.
@@ -2192,7 +2212,7 @@ export class Dispatcher {
           activationRequired: !!paseo.activate, binding: { cwd: spawnCwd, repoHome, model, workspaceScope, paseoWorkspace: container.workspaceId }, employee: inst.id, task: task?.id, kind: 'spawn',
           delivery: claim?.deliveryId, fence: claim?.fence });
         attemptId = attempt;
-        const agentId = await paseo.spawn({
+        agentId = await paseo.spawn({
           // A managed group name is not a Claude model id the thinking flag can address: the level is left unset and says so in the PR.
           title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model, thinking: isGroupModel(model) ? undefined : def.thinking,
           mode: UNATTENDED_MODE[def.provider], cwd: spawnCwd,
@@ -2227,16 +2247,24 @@ export class Dispatcher {
       } catch (error) {
         const message = (error as Error).message;
         this.log(`spawn ${inst.id} failed: ${message}`);
-        // Keep lease, instance and barrier; no next-def fallback. The one exception is a spawn our plugin refused
-        // before any session existed: it delivered nothing, so it is settled and released like a pre-call failure.
-        if (externalAttempt && !(attemptId && isOpenRefused(error) && await wf.rejectDispatchAttempt(attemptId, message)
-          .then(() => true, (rejectError: unknown) => { this.log(`settle refused spawn ${attemptId} failed: ${(rejectError as Error).message}`); return false; }))) throw error;
+        // Keep lease, instance and barrier; no next-def fallback. The exceptions are deliveries that provably
+        // never happened: a spawn our plugin refused before any session existed (open refused), and a native
+        // activation refused before the child process started (activation refused, session recorded notStarted).
+        const settled = !!attemptId && (
+          (isOpenRefused(error) && await wf.rejectDispatchAttempt(attemptId, message)
+            .then(() => true, (rejectError: unknown) => { this.log(`settle refused spawn ${attemptId} failed: ${(rejectError as Error).message}`); return false; }))
+          || (!!agentId && isActivationRefused(error) && await wf.rejectActivationAttempt(attemptId, agentId, message)
+            .then(() => true, (rejectError: unknown) => { this.log(`settle refused activation ${attemptId} failed: ${(rejectError as Error).message}`); return false; })));
+        if (externalAttempt && !settled) throw error;
         if (workspace) await sidecar?.releaseWorkspace?.(inst);
         if (claim) await sidecar!.releaseClaim(inst.id, task!.id, `spawn failed: ${message.slice(0, 120)}`);
         if (await this.retireGated(inst, `spawn failed: ${message.slice(0, 200)}`, 'failure', report)) report.retired.push(inst.id);
         // A quota-flavored spawn failure is the provider's problem, not the def's:
         // cool the provider down instead of eating a strike toward auto-disable.
-        if (EXHAUSTED_PATTERN.test(message)) {
+        // An activation refused before start is executor infrastructure, not the employee def either.
+        if (isActivationRefused(error)) {
+          // no definition-failure accounting: nothing reached the employee
+        } else if (EXHAUSTED_PATTERN.test(message)) {
           await wf.markExhausted(def.provider, message);
           if (!report.exhausted.includes(def.provider)) report.exhausted.push(def.provider);
         } else {

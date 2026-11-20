@@ -1,5 +1,5 @@
 import { PaseoCliError } from '../src/dispatcher/paseo.ts';
-import { NativeRuntime } from '../src/runner/native.ts';
+import { ActivationRefusedError, NativeRuntime } from '../src/runner/native.ts';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -63,6 +63,7 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
     },
     confirmDispatchActivation: async (id: string) => { attempts.get(id)!.activation_state = 'activated'; },
     rejectDispatchAttempt: async (id: string) => { attempts.delete(id); },
+    rejectActivationAttempt: async (id: string) => { attempts.delete(id); },
     finishDispatchAttempt: async (id: string, agent: string) => {
       const attempt = attempts.get(id)!;
       await messages.markSent(attempt.message ?? 'fixture');
@@ -1317,6 +1318,53 @@ describe('派工外部副作用不确定状态', () => {
     expect(w.attempts.size).toBe(1);
     expect(w.events.some(e => /^(release|retire|revoke|performance-failure):/.test(e))).toBe(false);
   });
+  test('activate 在启动前被拒：派工结案、释放并退休，不计员工定义失败', async () => {
+    const w = world(); w.addTask('activation-refused');
+    w.paseo.activate = async () => { throw new ActivationRefusedError('员工身份或 sidecar 通道不可用'); };
+    await w.dispatcher().tick();
+    expect(w.attempts.size).toBe(0);
+    expect(w.events.some(e => e.startsWith('release:'))).toBe(true);
+    expect(w.events.some(e => e.startsWith('retire:'))).toBe(true);
+    expect(w.events.some(e => e === 'performance-failure' || e.startsWith('exhausted:'))).toBe(false);
+  });
+  test('activate 拒案写入失败时仍按不确定保留，不释放', async () => {
+    const w = world(); w.addTask('activation-refused-settle-lost');
+    w.paseo.activate = async () => { throw new ActivationRefusedError('员工身份或 sidecar 通道不可用'); };
+    w.wf.rejectActivationAttempt = async () => { throw new Error('rejection write lost'); };
+    const failureResult = await w.dispatcher().tick().then(() => undefined, error => error);
+    expect(failureResult).toBeInstanceOf(Error);
+    expect(w.attempts.size).toBe(1);
+    expect(w.events.some(e => /^(release|retire|revoke|performance-failure):/.test(e))).toBe(false);
+  });
+  test('恢复路径：calling 屏障 + 运行端证实未启动 → 结案、释放并退休', async () => {
+    const w = world(); w.addTask('held-task'); await w.dispatcher().tick();
+    const employee = w.rows[0]!.currentEmployee!;
+    const retiredBefore = w.events.filter(e => e.startsWith('retire:')).length;
+    w.attempts.set('attempt-stuck', { id: 'attempt-stuck', employee, task: 'held-task', kind: 'spawn',
+      agent: 'agent-stuck', activationRequired: true, activation_state: 'calling' });
+    w.paseo.activationRefused = async () => true;
+    await w.dispatcher().tick();
+    expect(w.attempts.size).toBe(0);
+    expect(w.logs.some(l => l.includes('dispatch activation refused before start: attempt-stuck'))).toBe(true);
+    expect(w.events.some(e => e.startsWith('release:'))).toBe(true);
+    expect(w.events.filter(e => e.startsWith('retire:')).length).toBeGreaterThan(retiredBefore);
+    expect(w.events.some(e => e === 'performance-failure' || e.startsWith('exhausted:'))).toBe(false);
+  });
+  for (const [label, probe] of [['返回 false', async () => false], ['抛错', async () => { throw new Error('sessions lost'); }]] as const) {
+    test(`恢复路径 fail-closed：activationRefused ${label} → calling 屏障保留`, async () => {
+      const w = world(); w.addTask('held'); await w.dispatcher().tick();
+      const employee = w.rows[0]!.currentEmployee!;
+      const retiredBefore = w.events.filter(e => e.startsWith('retire:')).length;
+      w.attempts.set('attempt-stuck', { id: 'attempt-stuck', employee, task: 'held', kind: 'spawn',
+        agent: 'agent-stuck', activationRequired: true, activation_state: 'calling' });
+      w.paseo.activationRefused = probe;
+      let rejectCalls = 0; w.wf.rejectActivationAttempt = async () => { rejectCalls++; };
+      await w.dispatcher().tick();
+      expect(w.attempts.size).toBe(1);
+      expect(rejectCalls).toBe(0);
+      expect(w.events.filter(e => e.startsWith('retire:')).length).toBe(retiredBefore);
+    });
+  }
   test('写前日志失败不得调用运行端；日志查询失败不得开始派工', async () => {
     const w = world(); w.addTask('journal-failure');
     w.wf.beginDispatchAttempt = async () => { throw new Error('journal write lost'); };
