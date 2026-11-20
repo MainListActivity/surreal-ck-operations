@@ -182,7 +182,7 @@ function summaryOf(plan: LanePlan, changes: readonly ConsolidationChange[]): Lan
 /** Throws the cause of a failed transaction: the first statement that failed on its own, not the ones it cancelled. */
 function settle(responses: ReadonlyArray<{ success: boolean; error?: { message: string } }>): void {
   const failed = responses.filter(response => !response.success).map(response => response.error?.message ?? 'transaction failed');
-  const cause = failed.find(message => !/not executed due to|Cannot COMMIT/.test(message)) ?? failed[0];
+  const cause = failed.find(message => !/not executed due to/.test(message)) ?? failed[0];
   if (cause === undefined) return;
   const conflict = CONFLICTS.find(message => cause.includes(message));
   throw conflict ? new CompanyError('conflict', conflict) : new Error(cause);

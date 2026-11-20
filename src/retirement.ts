@@ -148,6 +148,6 @@ async function writeGuarded(db: Surreal, employeeId: string, candidates: readonl
     // A THROW of the decision's facts names its cause. A commit that lost to a concurrent write names none: it is a moved decision too,
     // so the caller re-decides (and refuses with the stable code if a relation now exists) instead of surfacing a generic failure.
     throw new Error(failures.map(response => response.error.message)
-      .find(message => !message.includes('not executed due to') && !message.startsWith('Cannot COMMIT')) ?? 'retire moved: transaction did not commit');
+      .find(message => !message.includes('not executed due to')) ?? 'retire moved: transaction did not commit');
   }
 }

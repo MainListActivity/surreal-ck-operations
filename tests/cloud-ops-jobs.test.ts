@@ -69,7 +69,7 @@ function deps(over: Partial<OpsJobDeps> & { db: Surreal }): OpsJobDeps {
   };
 }
 
-const find = (rows: Row[], key: string) => rows.find(row => String(row.id) === `ops_job:${key}`)!;
+const find = (rows: Row[], key: string) => rows.find(row => String(row.id.id) === key)!;
 /** 作业 result 为 JSON 文本，解析回对象便于断言。 */
 const parsedResult = (rows: Row[], key: string): unknown => JSON.parse(String(find(rows, key).result));
 

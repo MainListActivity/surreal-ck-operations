@@ -1377,7 +1377,7 @@ export class Workforce {
     const failures = responses.filter(response => !response.success);
     if (failures.length) {
       const cause = failures.map(response => response.error.message).find(message =>
-        !message.includes('not executed due to') && !message.startsWith('Cannot COMMIT')) ?? 'pending wake transaction failed';
+        !message.includes('not executed due to')) ?? 'pending wake transaction failed';
       throw new Error(cause);
     }
     return responses.map(response => response.success ? response.result : undefined).at(-2) as T | undefined;

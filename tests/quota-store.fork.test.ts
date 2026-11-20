@@ -20,7 +20,7 @@ run('quota rows are read by record name, including hyphenated provider ids', asy
   const port = reservation.port!; reservation.stop(true);
   const password = 'isolated-quota-store-test-only';
   const server = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root',
-    '--pass', password, '--log', 'error', `rocksdb:${dir}/database`], { stdout: 'ignore', stderr: 'ignore' });
+    '--pass', password, '--log', 'error', `surrealkv:${dir}/database`], { stdout: 'ignore', stderr: 'ignore' });
   const db = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: password,
     namespace: 'quota_store_fixture', database: 'control_plane' });
   try {
@@ -70,7 +70,7 @@ run('a def row without quota_limited stays writable', async () => {
   const port = reservation.port!; reservation.stop(true);
   const password = 'isolated-quota-store-def-test-only';
   const server = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root',
-    '--pass', password, '--log', 'error', `rocksdb:${dir}/database`], { stdout: 'ignore', stderr: 'ignore' });
+    '--pass', password, '--log', 'error', `surrealkv:${dir}/database`], { stdout: 'ignore', stderr: 'ignore' });
   const db = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: password,
     namespace: 'quota_store_def_fixture', database: 'control_plane' });
   try {

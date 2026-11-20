@@ -583,7 +583,7 @@ export class SurrealCompanyCore implements CompanyCore {
         const failures = responses.filter(response => !response.success);
         if (failures.length) {
           const cause = failures.map(response => response.error.message).find(message =>
-            !message.includes('not executed due to') && !message.startsWith('Cannot COMMIT')) ?? '';
+            !message.includes('not executed due to')) ?? '';
           if (/conflict/i.test(cause) && attempt < 4) {
             await new Promise(done => setTimeout(done, 10 * (attempt + 1)));
             continue;

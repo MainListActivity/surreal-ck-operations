@@ -118,7 +118,7 @@ export class OutboundMessageStore {
           COMMIT;`, { ...params, msg });
       } catch (error) {
         // 事务内 THROW 或被并发写打断都意味着同阶段已有活动草稿：统一按冲突交给补稿方读回那一条。
-        if (/draft already open|failed transaction/i.test((error as Error).message)) throw new CompanyError('conflict', 'draft already open');
+        if (/draft already open|failed transaction|transaction conflict/i.test((error as Error).message)) throw new CompanyError('conflict', 'draft already open');
         throw error;
       }
       const [created] = await this.db.query<[Array<Record<string, unknown>>]>('SELECT * FROM $msg;', { msg });

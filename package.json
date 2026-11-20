@@ -1,6 +1,6 @@
 {
   "name": "@surreal-ck/company-control-plane",
-  "version": "0.13.70",
+  "version": "0.13.71",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@10.32.1",
@@ -22,7 +22,7 @@
   "dependencies": {
     "@modelcontextprotocol/client": "2.1.0",
     "zod": "^4.6.5",
-    "surrealdb": "2.0.8",
+    "surrealdb": "2.2.2",
     "undici": "7.30.1"
   },
   "devDependencies": {

@@ -1,15 +1,18 @@
 {
-  "version": "0.13.70",
-  "title": "公司 MCP 第一期（只读工具）：Devin Cloud 经原生 MCP 使用公司只读工具",
+  "version": "0.13.71",
+  "title": "升级公司 SurrealDB 4.0.1 与 JS 客户端 2.2.2",
   "changes": [
     "新增 /api/mcp 端点（挂在现有 owner-end）：ma_hono company 租户令牌验签（audience=company.<root>/api/mcp、scope company.work），无状态 StreamableHTTP 传输。",
     "新增只读工具 company_landscape、task_current、task_context、company_ops（白名单四个运维命令）、company_job；需要任务的工具按任务租约绑定员工身份并经命令守卫判定。",
-    "主体登记默认拒绝：company_meta:mcp_principals 记录可用主体与允许的员工 provider，老板用新命令 mcp.principal.list / mcp.principal.set（仅老板）管理。"
+    "主体登记默认拒绝：company_meta:mcp_principals 记录可用主体与允许的员工 provider，老板用新命令 mcp.principal.list / mcp.principal.set（仅老板）管理。",
+    "控制面与插件的 surrealdb JS 客户端升级到 2.2.2；保留 0.13.70 公司 MCP 只读工具。",
+    "本地隔离测试使用公司 fork 4.0.1-native-quota.1，持久化测试夹具切换到 SurrealKV，兼容 COMMIT 返回的事务冲突。"
   ],
   "impact": [
     "云端执行者可用原生 MCP 查公司服务全景、本身份任务上下文与只读运维状态；未登记主体、跨身份任务、非白名单命令一律拒绝并写审计。",
-    "控制台与员工令牌不能调 MCP 端点，MCP 令牌也不能调 /api/cmd，两条路互不相通。"
+    "控制台与员工令牌不能调 MCP 端点，MCP 令牌也不能调 /api/cmd，两条路互不相通。",
+    "沿用 schema 074，不转换既有生产存储目录。"
   ],
-  "migration": "无 schema 变化（沿用 schema 074）；新增 company_meta:mcp_principals 记录（缺省为空清单=全部拒绝）。升级并重启 owner-backend 即可。",
-  "rollback": "回退至 0.13.69；MCP 端点与工具消失，mcp_principals 记录旧版忽略，无数据迁移。"
+  "migration": "无 schema 变化（沿用 schema 074）；新增 company_meta:mcp_principals 记录（缺省为空清单=全部拒绝）。升级并重启 owner-backend 即可。 SurrealKV 仅用于新建的本地测试目录；生产服务端升级与存储迁移需另行安排。",
+  "rollback": "应用可回退至 0.13.70，保留公司 MCP 只读工具；服务端数据格式回退不在本次变更范围内，禁止把新存储目录交给旧二进制。"
 }

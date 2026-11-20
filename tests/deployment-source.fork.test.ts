@@ -73,7 +73,7 @@ beforeAll(async () => {
   const port = reservation.port!; reservation.stop(true);
   const rootPassword = 'isolated-n1r-fork-only';
   server = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root', '--pass', rootPassword,
-    '--log', 'error', `rocksdb:${dir}/db`], { stdout: 'ignore', stderr: 'ignore' });
+    '--log', 'error', `surrealkv:${dir}/db`], { stdout: 'ignore', stderr: 'ignore' });
   let ready = false;
   for (let n = 0; n < 160; n++) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) { ready = true; break; } } catch {} await Bun.sleep(25); }
   if (!ready) throw new Error('the N1-R fork fixture did not become healthy');
