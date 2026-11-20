@@ -27,6 +27,7 @@ import { isPaged, parseReclaimInput, parseWorktreeInput, taskIdOf } from "../que
 import { arriving, SNAPSHOT_TOOLS, withinReplyCeiling } from "../reply-clock.ts";
 import { STEWARD_RELAY_OPS_ALLOWLIST, STEWARD_RELAY_WRITE_OPS, stewardRelayOutbound, type StewardAssistOutcome } from "../steward/steward.ts";
 import { clip, redactSecrets } from "../ops/redact.ts";
+import { runCompanyTool, type CompanyToolFace } from "./company-tools.ts";
 
 /** The release the node updater made live (the `current` symlink to plugin-releases/<sha>/plugin); undefined when it cannot be read. */
 const qaRuntimeRelease = (): string | undefined => {
@@ -1306,11 +1307,10 @@ export class SidecarPool {
     // 本机公司工具：绑定、校验、错误映射全在 src/runner/company-tools.ts；内层工具调用递归回本
     // dispatch（同一 request 租约），company_tool 自身不可递归。租约取本次请求对应的 claim，与 live() 同义。
     if (tool === "company_tool") {
-      const { runCompanyTool } = await import("./company-tools.ts");
       const claim = this.claims.get(instId);
       const name = typeof args.name === "string" ? args.name : "";
       const inner = args.args !== undefined ? args.args : args.arguments;
-      const face: import("./company-tools.ts").CompanyToolFace = {
+      const face: CompanyToolFace = {
         lease: () => claim && claim === requestLease
           ? { taskId: claim.taskId, phase: claim.phase, leaseExpiresAt: claim.leaseExpiresAt }
           : undefined,
@@ -1319,6 +1319,8 @@ export class SidecarPool {
           try {
             return { ok: true, data: await this.dispatch(instId, innerTool, innerArgs, forceRotate, request) };
           } catch (error) {
+            // 鉴权失败交给外层 respond() 换凭证重试一次，不在这里吞掉。
+            if (SidecarPool.isAuthError(error)) throw error;
             const e = error as Error & { code?: string };
             return { ok: false, error: `${e.code ?? "error"}: ${e.message}` };
           }
