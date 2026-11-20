@@ -588,7 +588,7 @@ export class Workforce {
     source.role = input.role;
     const text = buildSessionHandoff(source);
     const bytes = Buffer.byteLength(text, 'utf8');
-    const key = HASH(`${inst.id}\0${sourceTask}\0${input.project}\0${input.domain}\0${Date.now()}`).slice(0, 32);
+    const key = HASH(`${inst.id}\0${sourceTask}\0${input.project}\0${input.domain}\0${randomBytes(6).toString('hex')}`).slice(0, 32);
     await this.db.query(`UPDATE $e SET session_handoff = $text, session_handoff_bytes = $bytes, session_handoff_key = $key,
       session_handoff_task = $task, session_handoff_project = $project, session_handoff_domain = $domain,
       session_handoff_role = $role, session_handoff_repo = $repo, session_handoff_reason = $reason,
