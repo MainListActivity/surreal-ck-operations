@@ -72,3 +72,5 @@
 | 优先订阅（不带参数只读；`""` 不设优先按权重派工）与通道偏好（`lanePreference`：按工种 `discipline:`、路线类型 `type:`、岗位 `role:` 定先用哪条通道，只排顺序不保留等待，`{}` 清空） | `sck owner dispatch.preference '{"provider":"codex-cloud","lanePreference":{"discipline:文案":["gemini-web","chatgpt-web"]}}'` |
 | 概况 | `sck owner status '{}'` |
 | 公司服务全景（登记表 + 最近一次实机核对；host 过滤只看该主机） | `sck owner landscape.get '{"host":"vps-data"}'` |
+| 公司 MCP 主体登记清单（仅老板） | `sck owner mcp.principal.list '{}'` |
+| 登记或更新一个 MCP 主体（仅老板；providers 为允许的员工 provider 列表，enabled=false 即停用） | `sck owner mcp.principal.set '{"sub":"devin-cloud-user","providers":["devin-cloud"],"label":"Devin Cloud","enabled":true}'` |

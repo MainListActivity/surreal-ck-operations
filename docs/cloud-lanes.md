@@ -112,3 +112,13 @@ Grok 的 bot（grok.com 左栏 Bots）没有 API，只能在网页或 App 里聊
 - **muse.ai（`muse-web`）**：同一个桥接进程（`src/runner/grok-bot/main.ts muse-web`），同一套标记协议。区别：Muse 的主对话是老板私人的，公司任务**每轮新建一个侧聊**（左栏 Side chats 的「New side chat」），侧聊地址写进 commDir 的 `.webchat/<标记>.json`；重试与重启回到同一侧聊，不另开新侧聊重复发送。工作中判定为「Stop task」按钮或「is working / typing」状态。`model` 用 `default`，`maxInstances` 可大于 1（侧聊互相独立）。Muse 在发邮件、付款等动作前会向老板要批准，这类停顿按受阻收尾。配置与 grok-bot 相同，只把 provider 换成 `muse-web`、`models` 写 `["default"]`。
 - **ChatGPT（`chatgpt-web`）与 Gemini（`gemini-web`）网页版聊天**：同一个桥接进程、同一套标记协议，只接文字任务（代码改动任务按受阻退回）。每轮打开首页即新对话，发出后把对话地址（`chatgpt.com/c/<id>`、`gemini.google.com/app/<id>`）记进 `.webchat/<标记>.json`，之后只读那一个对话。这两个站点的页面左侧是老板的私人聊天列表，所以页面文本只从对话区读（`SiteSpec.scope`），侧栏内容不会进入回传的现场文本。页面用自己的话提示额度用完时，本轮按失败收尾、文案带 `usage limit`，执行端据此给这条通道记额度冷却（`quota-failure.ts`），所以这两个编制要保持默认的“受额度限制”。ChatGPT 的「Stop」按钮在答完后还会留十几秒，判断是否还在生成要同时看最后一轮的 `data-talvt-turn-state`。图片不走这条通道：出图由员工调用 `media_image`（`src/media/browser.ts`，顺序 ChatGPT→Higgsfield→Gemini→Grok）。站点配置都在 `src/runner/grok-bot/turn.ts` 的 `SITES` 里，新增站点要把每一项都写出来。`chatgpt-web` 于 2026-11-14 用真实页面跑通一轮；`gemini-web` 的选择器取自写作通道已在用的页面结构，聊天员工这条路还没有实测。
 - **Figma Make**：已查过网页（Make 文件里有「Make prompt」输入框），但老板的 Education 团队 AI 额度已用完、11 月 30 日重置，届时再做通道。
+
+## 公司 MCP（第一期，只读工具）
+
+云端执行者（先 Devin Cloud）经原生 MCP 使用公司工具。端点挂在现有 owner-end（`https://company.maplayer.top/api/mcp`，由 VPS `sck-owner-backend` 承载；edge 原样转发，没有新增服务、端口或 Worker）。
+
+- **OAuth**：授权服务器是 ma_hono company 租户（issuer `https://o.maplayer.top/t/company`）。`GET /api/mcp/.well-known/oauth-protected-resource`（无需登录）公布资源与 `['openid','company.work']` scope；客户端走 OIDC discovery → `/t/company/connect/mcp/register` 动态注册 → authorize（resource=`https://company.maplayer.top/api/mcp`，scope `openid company.work`）。MCP 令牌只在本端点有效；控制台/员工令牌调 `/api/mcp` 返回 401（带 `WWW-Authenticate: Bearer resource_metadata=…`），MCP 令牌调 `/api/cmd` 同样 401。
+- **主体登记（默认拒绝）**：哪些授权主体（token `sub`）能用工具、各自允许哪些员工 provider，存在 `company_meta:mcp_principals`。未登记或 `enabled=false` 的主体调任何工具都是 forbidden（令牌本身有效）；每次请求重读，停用立即生效。老板用 `sck owner mcp.principal.list` / `mcp.principal.set`（仅老板）管理。
+- **任务绑定**：需要任务的工具带 `taskId`，必须全部满足才放行：任务存在、`current_employee` 非空、`lease_expires_at` 未过期、该员工实例的 `provider` ∈ 主体的 providers。放行后以 `current_employee` 为 actor 过命令守卫 `decide`（员工策略、停用、保护清单照旧），每次调用（含被拒）写 `ops_audit`。
+- **工具（固定 5 个，第一期只读）**：`company_landscape`（同 `landscape.get`）、`task_current`（本身份在租任务，最多 20）、`task_context`（任务投影：需求/验收/分支/项目档案，无本机路径与密钥，整体 ≤64KB）、`company_ops`（白名单 `ops_origin_status`/`ops_origin_health`/`ops_release_diagnose`/`ops_product_pulse`，走执行端作业，超时返回 `{pending,jobId}`）、`company_job`（只能查本身份员工的作业）。
+- **第二期待办**：`task_submit`/`task_block`/`task_ask`（要和云通道收尾逻辑整合）与次数预算。

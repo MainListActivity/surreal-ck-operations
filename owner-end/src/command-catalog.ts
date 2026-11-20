@@ -58,6 +58,8 @@ export const COMMAND_CATALOG: readonly CommandSpec[] = [
   c('cmd.catalog', '看板与状态', '列出可调用的命令（员工只看到自己能用的）', '无', { readOnly: true }),
   c('quota.list', '看板与状态', '各订阅额度快照与耗尽冷却（含云端通道）', '无', { readOnly: true }),
   c('landscape.get', '看板与状态', '公司服务全景：仓库、服务、主机、部署与回滚，以及最近一次实机核对', 'host?', { readOnly: true }),
+  c('mcp.principal.list', '员工与权限', '公司 MCP 主体登记清单（哪些授权主体可用 MCP 工具及允许的员工 provider）', '无', { readOnly: true }),
+  c('mcp.principal.set', '员工与权限', '登记或更新一个 MCP 主体（默认拒绝：未登记的主体不能用任何 MCP 工具）', 'sub, providers, label, enabled', { risk: 'high' }),
   c('owner.settings.get', '翻译', '老板设置：常用语言', '无', { readOnly: true }),
   c('owner.settings.set', '翻译', '设置老板常用语言（员工回报译成这种语言）', 'lang'),
 

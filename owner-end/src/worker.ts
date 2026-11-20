@@ -15,6 +15,7 @@ import { sessionsOf, withSession } from './db.ts';
 import { readConfig, type Env } from './env.ts';
 import { failureOf } from './errors.ts';
 import { runScheduled } from './cron.ts';
+import { handleCompanyMcp, mcpResourceOf } from './mcp.ts';
 
 const MAX_BODY_BYTES = 256 * 1024;
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
@@ -108,6 +109,32 @@ app.post('/api/cmd', (c) => respond(async () => {
 }));
 
 app.on(['POST', 'OPTIONS'], '/api/feedback/:project', c => feedbackEndpoint(c.req.raw, c.env, c.req.param('project')));
+
+/** 公司 MCP 的受保护资源元数据（无需登录）：MCP 客户端据此找授权服务器。 */
+app.get('/api/mcp/.well-known/oauth-protected-resource', (c) => {
+  try {
+    const cfg = readConfig(c.env);
+    const resource = mcpResourceOf(c.req.url);
+    return json(200, {
+      resource,
+      authorization_servers: [cfg.idp.issuer],
+      scopes_supported: ['openid', 'company.work'],
+      bearer_methods_supported: ['header'],
+    });
+  } catch (error) {
+    return failed(error);
+  }
+});
+
+/** 公司 MCP 端点：MCP 令牌验签 + 无状态 SDK 传输；工具内做主体登记与任务绑定。 */
+app.all('/api/mcp', async (c) => {
+  try {
+    const cfg = readConfig(c.env);
+    return await handleCompanyMcp(c.req.raw, { cfg, sessions: sessionsOf(cfg) });
+  } catch (error) {
+    return failed(error);
+  }
+});
 
 app.all('/api/*', () => json(404, { ok: false, error: { code: 'not_found', message: '接口不存在' } }));
 
