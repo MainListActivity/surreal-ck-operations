@@ -3954,6 +3954,23 @@ describe('devin-cloud 的 MCP 收尾通道（MCP-2）', () => {
     expect(out.text).not.toContain('不应被采信');
   });
 
+  test('残留 mcpOpen + 本轮 open 失败：MCP 结论不采信且残留标记被清除', async () => {
+    const w = world({ extra: gitOk2 });
+    // 上一轮留下的开闸标记：本轮新发送若开闸失败，它绝不能继续生效。
+    writeLaneState(w.commDir, { sessionId: 'lane-mcp-stale', devin: { mcpOpen: 'SCK-deadbeef' } } as never);
+    let reads = 0;
+    const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps,
+      browse: browseOf({ send: [{ ok: true, url: SESSION2 }],
+        session: [{ ok: true, markerSeen: true, status: 'idle', done: '页面收尾路径。\nPR: https://github.com/acme/widget/pull/9\nSHA: deadbeef', tail: '' }] }) as NonNullable<LaneDeps['browse']>,
+      mcpRoundOpen: async () => undefined,
+      mcpOutcome: async (): Promise<McpOutcome> => { reads++; return { kind: 'submit', text: '不应被采信' }; },
+    });
+    expect(reads).toBe(0);
+    expect(out.status).toBe('success');
+    expect(out.text).toContain('页面收尾路径');
+    expect(readLaneState(w.commDir)?.devin?.mcpOpen).toBeUndefined();
+  });
+
   test('mcpOutcome 抛错回落页面逻辑', async () => {
     const w = world({ extra: gitOk2 });
     const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps,

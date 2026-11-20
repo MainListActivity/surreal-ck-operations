@@ -202,7 +202,7 @@ export function vendorPrompt(input: LaneInput, repo: RepoInfo, material: ReturnT
   if (input.provider === 'devin-cloud') {
     const mcpTask = readClaimTask(input.commDir);
     if (mcpTask) {
-      parts.push(`本轮公司任务 ID 是 ${mcpTask}。若本会话可用 sck-company MCP：先用 task_context 读任务；需要只读运维信息直接 company_ops（不必再写 [OPS-REQUEST]）；完成后用 ${material.review ? 'task_review' : 'task_submit'}（受阻用 task_block）交卷——这是首选收尾方式；原「[SCK-DONE]」收尾约定保留作兜底。`);
+      parts.push(`本轮公司任务 ID 是 ${mcpTask}。若本会话可用 sck-company MCP：先用 task_context 读任务；需要只读运维信息直接 company_ops（不必再写 [OPS-REQUEST]）；${material.review ? '复核完成后用 task_review' : '改动已推送到本轮分支、PR 已开或更新之后用 task_submit'}（受阻用 task_block）交卷——这是首选收尾方式；原「[SCK-DONE]」收尾约定保留作兜底。`);
     }
   }
   // 正文就是派工消息（老板看到、改过的那条），指向的文件内容附在后面；没有派工消息时退回到整份任务材料。

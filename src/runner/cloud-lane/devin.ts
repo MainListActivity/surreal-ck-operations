@@ -262,10 +262,10 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
       const follow = sessionOf(state.vendorSession);
       // MCP-2：只在新发送（!state.taskId）时、按下发送之前对服务端 mcp_outcome 开闸（清上一轮旧结论）。
       // 开闸失败不阻塞发送，只是本轮不采信 MCP 结论（mcpOpen 不落盘）；代跑回传不再开闸。
-      try {
-        const opened = await deps.mcpRoundOpen?.();
-        if (opened?.opened === true) state.devin = { ...state.devin, mcpOpen: marker };
-      } catch { /* 开闸失败：本轮忽略 MCP 结论 */ }
+      let opened: { opened: true } | undefined;
+      try { opened = await deps.mcpRoundOpen?.(); } catch { /* 开闸失败：本轮忽略 MCP 结论 */ }
+      if (opened?.opened === true) state.devin = { ...state.devin, mcpOpen: marker };
+      else if (state.devin) delete state.devin.mcpOpen;
       // 按下发送前先落盘 attempt：本目录写 .lane/state.json，共享根写 inflight/<投递键>.json。
       // 之后无论脚本如何结束、换到哪个员工目录，都只核对是否已受理，绝不再按发送。
       const at = deps.now();
