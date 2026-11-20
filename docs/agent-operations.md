@@ -308,3 +308,26 @@ pnpm run admin remote-grant list [--task <taskId>]
 
 - 链接只发给老板独占的 VPS；码一次性，泄露即失效但也等于让渡该测试账号权限到 TTL。
 - 派工调度目前不支持远程主机 Paseo 会话（`src/dispatcher/host.ts` 仅本机资源、`src/dispatcher/paseo.ts` 仅本机插件），故不做自动 issue + wake 注入，用 `--attach` 显式写入任务 context。
+
+## 公司服务全景
+
+公司有哪些仓库、每个仓库部署成哪些服务、跑在哪台主机、怎么部署和回滚，唯一登记处是 `landscape/company-landscape.json`（版本化进仓库）。解析与比对在 `src/landscape.ts`，加载即校验，登记表不合法进程直接拒绝启动。
+
+### 怎么查
+
+- 命令 `landscape.get`（只读）：`sck owner landscape.get '{}'` 或员工 `company_cmd` 同名命令；`host` 可选过滤主机。返回 `landscape`（登记表）与 `observations`（各主机最近一次实机核对，含 drift 比对结果）。
+- 任务的 `project.services` 随任务下发：经 `repo.project` 关联，员工据此知道改了哪个服务、跑在哪台主机、怎么部署和回滚。
+
+### 怎么改
+
+改 `landscape/company-landscape.json` 走 PR：登记服务先写条目再上线；退役先把 `status` 改 `retire`，实机核对确认消失后再删条目。校验规则（id 唯一、repo/host 引用存在、`repo.project` 不重复）由 `parseLandscape` 与 `tests/landscape.test.ts` 把关；该测试同时要求 `owner-end/deploy/` 的每个 systemd 单元与 `wrangler.jsonc` 的 Worker name 都已登记——新增而未登记的服务会被测试挡住。
+
+### 核对与通知
+
+- VPS：`sck-owner-minute` 分钟任务里做只读采集（`systemctl list-units`、`ss -ltnH`、Caddy 管理接口 `127.0.0.1:2019` 路由摘要），距上次观测不足 60 分钟跳过；实现见 `owner-end/src/landscape-observe.ts`。
+- Mac：插件派工循环每 60 分钟采集一次（`launchctl list` 的 `org.surrealck.*` + `~/Library/LaunchAgents` 已安装 plist + 插件自身 `sck-company`），见 `src/landscape-mac.ts`。
+- 观测写 `company_meta:⟨landscape_observed:<hostId>⟩`（含 drift）；三类差异（未登记在跑、登记缺失、应退役仍在）任一非空发老板提示 `landscape-drift:<hostId>`，一致时关闭；采集失败（unknown）只留观测不发提示。
+
+### 红线
+
+不新增服务、进程、端口、域名、systemd 单元、launchd 任务、定时器或 Worker；新能力放进已登记的现有服务。确需新增须任务卡明确授权，并在同一 PR 先登记。核对本身也是这条红线：采集只读、不新开端口与计时器（挂在既有分钟任务与派工循环里）。

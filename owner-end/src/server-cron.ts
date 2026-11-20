@@ -1,13 +1,24 @@
+import { execFile } from 'node:child_process';
 import { DAILY_CRON, MINUTE_CRON, runScheduled } from './cron.ts';
 import { sessionsOf } from './db.ts';
 import { readConfig, type Env } from './env.ts';
 import { readServerEnvironment } from './server-env.ts';
+import type { ExecFn } from './landscape-observe.ts';
+
+/** 本机命令执行（公司服务全景核对用）：只读命令，非零退出码返回 code 而不是抛错。 */
+const hostExec: ExecFn = (command, args) => new Promise((resolve, reject) => {
+  execFile(command, args, { timeout: 20_000, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
+    const code = (error as { code?: unknown } | null)?.code;
+    if (error && typeof code !== 'number') reject(error);
+    else resolve({ code: typeof code === 'number' ? code : 0, stdout: String(stdout), stderr: String(stderr) });
+  });
+});
 
 /** 仅供服务管理器单次调用，不开放定时任务 HTTP 入口。 */
 export async function runServerCron(cron: string, env: Env, run: typeof runScheduled = runScheduled): Promise<unknown> {
   if (cron !== MINUTE_CRON && cron !== DAILY_CRON) throw Error('仅支持已配置的分钟和每日 cron');
   const config = readConfig(env);
-  return run(config, sessionsOf(config), cron);
+  return run(config, sessionsOf(config), cron, { exec: hostExec, fetch });
 }
 
 if (import.meta.main) {

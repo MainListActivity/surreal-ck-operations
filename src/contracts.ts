@@ -535,6 +535,14 @@ export interface ProjectView {
   pipeline?: string;
   runbooks: string[];
   notes?: string;
+  /**
+   * 该项目登记仓库部署出的服务（公司服务全景 landscape/company-landscape.json 经 repo.project 关联）：
+   * 主机、单元、部署与回滚随任务下发，员工据此知道改了哪个服务、怎么回滚。
+   */
+  services?: Array<{
+    id: string; host: string; kind: string; unit: string;
+    listen?: string; route?: string; deploy: string; rollback: string; status: string;
+  }>;
   envs: Array<{ name: string; url?: string; healthUrl?: string; verify?: string; secrets: Array<{ name: string; roles: Role[] }> }>;
   /**
    * Set on a company block read by someone who may not see the environments (SYS01 M3): `envs` is then empty, not the project's

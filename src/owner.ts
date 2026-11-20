@@ -9,6 +9,7 @@ import { assertRoleContract, loadContract } from './role-contract.ts';
 import type { DispatchVerdict } from './dispatcher/dispatch-blocked.ts';
 import { dispatchBlockedList } from './dispatcher/dispatch-list.ts';
 import { acceptanceError, acceptanceSubject, evaluateAcceptance, humanSignoffs, loadAcceptanceEvidence, loadAcceptanceGate, type AcceptanceTaskRow, type HumanSignoff } from './acceptance.ts';
+import { noticeRecordId, raiseOwnerNotice, resolveOwnerNotice } from './owner-notice.ts';
 
 export type OwnerCommandKind = 'approve' | 'reject' | 'reply' | 'direction' | 'instruct' | 'pause' | 'resume';
 export interface OwnerCommandRow {
@@ -301,11 +302,7 @@ export class OwnerDesk {
   }
 
   async raiseNotice(key: string, text: string): Promise<boolean> {
-    const record = id('owner_notice', HASH(key).slice(0, 24));
-    const existing = await this.db.select<{ resolved_at?: unknown; text: string }>(record);
-    if (existing && !existing.resolved_at && existing.text === text) return false;
-    await this.db.query('UPSERT $record CONTENT { key: $key, text: $text, at: time::now(), resolved_at: NONE };', { record, key, text });
-    return !existing || Boolean(existing.resolved_at);
+    return raiseOwnerNotice(this.db, key, text);
   }
 
   /**
@@ -313,11 +310,11 @@ export class OwnerDesk {
    * this call actually closed the notice, so repeated ends (ticks, restarts) write nothing further (SYS-DISP AC03).
    */
   async resolveNotice(key: string, audit?: { task: string; evidence: string }): Promise<void> {
-    const record = id('owner_notice', HASH(key).slice(0, 24));
     if (!audit) {
-      await this.db.query('UPDATE $record SET resolved_at = time::now() WHERE resolved_at = NONE;', { record });
+      await resolveOwnerNotice(this.db, key);
       return;
     }
+    const record = noticeRecordId(key);
     await this.db.query(`BEGIN TRANSACTION;
       LET $closed = (UPDATE $record SET resolved_at = time::now() WHERE resolved_at = NONE RETURN AFTER);
       IF array::len($closed) > 0 { CREATE audit CONTENT { task: $task, actor: 'system:dispatcher', action: 'dispatch_unblocked', evidence: $evidence, at: time::now() } };

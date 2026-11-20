@@ -307,6 +307,7 @@ describe('runScheduled 按 cron 表达式分派', () => {
       translations: { translated: 0, failed: 0, skipped: 'not_configured' },
       replies: { translated: 0, failed: 0, skipped: 'not_configured' },
       feedback: { skipped: 'not_configured' }, planning: { skipped: 'not_configured' }, analyses: { skipped: 'not_configured' },
+      landscape: { skipped: 'no_host_exec' },
     });
     expect(requests).toHaveLength(0);
     expect(calls).toHaveLength(0);
@@ -335,6 +336,7 @@ describe('runScheduled 按 cron 表达式分派', () => {
       translations: { translated: 1, failed: 0 },
       replies: { translated: 0, failed: 0 },
       feedback: {linked:0,dismissed:0,failed:0}, planning:{planned:0,failed:0}, analyses:{analyzed:0,failed:0},
+      landscape: { skipped: 'no_host_exec' },
     });
     expect(requests.map((r) => `${r.method} ${r.url}`)).toEqual([
       `GET ${USERS_URL}?kind=agent`,

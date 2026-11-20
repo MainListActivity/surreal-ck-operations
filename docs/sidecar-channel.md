@@ -93,6 +93,7 @@ sidecar 侧每 400ms（`SWEEP_MS`）扫一遍活跃实例的 `req/`：读到的�
 - 请求顶层的 `taskId` 与 `ops_*` 一样被丢弃。`input` 里的任务号与消息号由网关核对，必须属于当前租约任务。
 - 令牌只在 `callCloud` 的局部变量里存在：错误文本与返回内容中出现的令牌一律替换，不写会话、comm 目录、证据或日志。`tests/cloud-sidecar-route.test.ts` 对此做了扫描断言。
 - 判定、目录过滤与审计在网关侧，见 [运行手册 · 公司命令](agent-operations.md#公司命令)。
+- 员工可查 `landscape.get` 看公司服务全景：各仓库部署成哪些服务、跑在哪台主机、怎么部署和回滚，以及最近一次实机核对（host 可选过滤）。
 
 ## deliverables/ 交付包约定
 

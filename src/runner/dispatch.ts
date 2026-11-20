@@ -9,6 +9,7 @@ import { openUserPaths, scratchKeepReason } from "../dispatcher/scratch-gc.ts";
 import { pruneOperationalData } from "../data-retention.ts";
 import { magpieSessionRows, recordPendingTaskCosts } from "../task-cost.ts";
 import { consolidateDue } from "../lane-notes-consolidate.ts";
+import { checkMacLandscape } from "../landscape-mac.ts";
 import { settleCompanyTurn, TurnInterruptions } from "./turn-closeout.ts";
 /**
  * 老板中止或暂停了任务（owner-api 的 stopTask）：租约已经收回，这里把还在跑的会话停掉，并清掉本机的领取残留。
@@ -554,6 +555,8 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
         if (uncertainWorkers.size) await ctx.sidecar.adopt((await ctx.workforce.insts()).filter(i => uncertainWorkers.has(i.id)));
         await ctx.sidecar.retryExecutions();
         const report = await timing.measure("tick", () => ctx.dispatcher.tick());
+        // 公司服务全景（Mac 实机核对）：跟现有循环走，不新开计时器；内部距上次观测不足 60 分钟即跳过。
+        await timing.measure("landscape", () => checkMacLandscape(ctx.db.db)).catch((error) => console.warn(`landscape check failed: ${(error as Error).message}`));
         await timing.measure("observation", () => persistDispatchObservation(ctx)).catch((error) => console.warn(`dispatch observation write failed: ${(error as Error).message}`));
         await timing.measure("board", () => persistBoardView(ctx)).catch((error) => console.warn(`board view write failed: ${(error as Error).message}`));
         failures = 0;
