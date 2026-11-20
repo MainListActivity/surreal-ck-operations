@@ -172,12 +172,14 @@ export function laneMessage(prompt: string | undefined, commDir: string,
   attach(new RegExp(`${escapeRe(dir)}/task\\.md`), '任务全文', material.task, material.review || !selfContained);
   attach(new RegExp(`${escapeRe(dir)}/notes\\.md`), '这条线的笔记', notes, false);
   // 公司命令这类 agent 调不了：去掉那句指引，免得它去找一个不存在的工具。
-  body = body.replace(/需要账号、登录态或远程执行工具时，用 .{1,400}? call company_cmd_catalog 查可用的工作能力。/g, '').replace(/\n{3,}/g, '\n\n').trim();
+  body = body.replace(/需要账号、登录态或远程执行工具时，用 .{1,400}? call company_cmd_catalog 查可用的工作能力。/g, '')
+    .replace(/公司工具直接调用：.{1,400}?sck list 查看。/g, '')
+    .replace(/\n{3,}/g, '\n\n').trim();
   return [body, ...attachments].join('\n\n');
 }
 
 /** 交给云端 agent 的完整 prompt。 */
-export function vendorPrompt(input: LaneInput, repo: RepoInfo, material: ReturnType<typeof taskMaterial>): string {
+export function vendorPrompt(input: LaneInput, repo: RepoInfo, material: ReturnType<typeof taskMaterial>, readOnly = false): string {
   const parts: string[] = [];
   if (material.review) {
     parts.push(`你在复核仓库 ${repo.slug} 分支 ${repo.branch} 上已提交的改动（PR 目标分支 ${repo.defaultBranch}）。`);
@@ -202,7 +204,10 @@ export function vendorPrompt(input: LaneInput, repo: RepoInfo, material: ReturnT
   if (input.provider === 'devin-cloud') {
     const mcpTask = readClaimTask(input.commDir);
     if (mcpTask) {
-      parts.push(`本轮公司任务 ID 是 ${mcpTask}。若本会话可用 sck-company MCP：先用 task_context 读任务；需要只读运维信息直接 company_ops（不必再写 [OPS-REQUEST]）；${material.review ? '复核完成后用 task_review' : '改动已推送到本轮分支、PR 已开或更新之后用 task_submit'}（受阻用 task_block）交卷——这是首选收尾方式；原「[SCK-DONE]」收尾约定保留作兜底。`);
+      const submitHint = material.review ? '复核完成后用 task_review'
+        : readOnly ? '完成后用 task_submit（本任务是只读任务：不提交代码、不开 PR）'
+        : '改动已推送到本轮分支、PR 已开或更新之后用 task_submit';
+      parts.push(`本轮公司任务 ID 是 ${mcpTask}。若本会话可用 sck-company MCP：先用 task_context 读任务；需要只读运维信息直接 company_ops（不必再写 [OPS-REQUEST]）；${submitHint}（受阻用 task_block）交卷——这是首选收尾方式；原「[SCK-DONE]」收尾约定保留作兜底。`);
     }
   }
   // 正文就是派工消息（老板看到、改过的那条），指向的文件内容附在后面；没有派工消息时退回到整份任务材料。
@@ -226,7 +231,7 @@ interface VendorOutcome {
 
 /** 按供应商分派；返回该轮最终答复文本与性质。 */
 async function drive(ctx: {
-  input: LaneInput; deps: LaneDeps; repo: RepoInfo;
+  input: LaneInput; deps: LaneDeps; repo: RepoInfo; readOnly?: boolean;
   material: ReturnType<typeof taskMaterial>; prompt: string;
   state: LaneState; digest: string; key: string; deadline: number;
 }): Promise<VendorOutcome> {
@@ -241,15 +246,18 @@ async function drive(ctx: {
  * 会话 cwd 可能是共享主 checkout（老板可能在用），通道绝不在那上面执行 git/供应商命令。
  * warp 等本地通道也复用：有 claim 工作树就用它，没有则退回会话 cwd（本地 agent 不代公司做提交）。
  */
-export function claimWorktree(commDir: string): { path: string; branch: string } | { blocked: string } {
-  let claim: { worktree?: { worktreePath?: unknown; branch?: unknown } } | undefined;
+export function claimWorktree(commDir: string): { path: string; branch: string; readOnly: boolean } | { blocked: string } {
+  let claim: { worktree?: { worktreePath?: unknown; branch?: unknown; intent?: unknown } } | undefined;
   try { claim = JSON.parse(readFileSync(join(commDir, 'claim.json'), 'utf8')); } catch { /* 缺 claim.json */ }
   const worktree = claim?.worktree;
   const path = typeof worktree?.worktreePath === 'string' ? worktree.worktreePath : undefined;
   const branch = typeof worktree?.branch === 'string' && worktree.branch.trim() ? worktree.branch.trim() : undefined;
   if (!path || !isAbsolute(path) || !existsSync(path) || !branch)
     return { blocked: '本次派工没有可用的任务工作树（claim.json 未给出存在的 worktreePath 与分支）' };
-  return { path, branch };
+  // 只读任务工作树（work_intent 'read'）：intent 见过字符串与对象两种形状，都按只读认。
+  const intent = typeof worktree?.intent === 'string' ? worktree.intent
+    : (worktree?.intent && typeof worktree.intent === 'object' ? (worktree.intent as { kind?: unknown }).kind : undefined);
+  return { path, branch, readOnly: intent === 'read' };
 }
 
 /** 一轮云端执行：识别仓库 → 组装 prompt → 提交或重连 → 收尾成公司协议文本。 */
@@ -275,7 +283,7 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
   input = { ...input, cwd: worktree.path };
 
   const material = taskMaterial(input.commDir, input.prompt);
-  const prompt = vendorPrompt(input, repo, material);
+  const prompt = vendorPrompt(input, repo, material, worktree.readOnly);
   // 摘要必须覆盖定义本轮的全部输入：供应商 prompt 已含 task.md 与内联的复核意见，
   // 不能只取派工消息（复用 comm 目录时不同任务的派工消息可能逐字相同）。
   const digest = laneDigest(input.provider, prompt);
@@ -381,7 +389,7 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
     }
   }
   try {
-    const outcome = await drive({ input, deps, repo, material, prompt, state: next, digest, key: registryKey, deadline });
+    const outcome = await drive({ input, deps, repo, material, prompt, state: next, digest, key: registryKey, deadline, readOnly: worktree.readOnly });
     if (!outcome.inflight && (outcome.kind !== 'error' || outcome.vendorTerminal)) {
       // 完成、受阻、供应商终态失败：回合有了定论，清除登记并清掉在途任务标记（失败可重新提交）。
       // 仍在途的受阻（供应商会话已发出、等待核对）保留标记，恢复时不再发送。

@@ -54,10 +54,11 @@ test('默认派工模板只要求工作产出，辅助工具仍可用', () => {
   const opts = { sckBin: '/bin/sck', commDir: '/c', taskId: 't1' };
   for (const step of ['execute', 'review', 'rework', 'nudge'] as const) for (const code of [false, true]) {
     const body = composeMessage(step, { title: '导出', requirement: '导出 CSV', acceptance: '列头正确' }, code);
-    expect(body).toContain('sck call company_cmd_catalog');
+    expect(body).toContain('公司工具直接调用');
+    expect(body).toContain('sck list 查看');
     expect(body).not.toMatch(/call (submit|review|checkpoint|heartbeat|claim_next)/);
     expect(body).not.toContain('idempotencyKey');
-    expect(renderMessage(body, opts)).toContain("'/bin/sck' call company_cmd_catalog");
+    expect(renderMessage(body, opts)).toContain('sck list 查看');
   }
   const card = { title: '导出', requirement: '导出 CSV', acceptance: '列头正确' };
   expect(composeMessage('review', card, true)).toContain('复核结论：通过');

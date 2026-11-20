@@ -13,6 +13,8 @@ import { loadServiceEnv, serviceHome } from "./server/env";
 import { employeeModelEnv } from "./server/model-env";
 import { startPreview, type PreviewHandle } from "./server/preview";
 import { registerScrub, sandboxGap } from "./server/scrub";
+import { companyAgentTools } from "./server/company-tools";
+import { ownerApi } from "./server/vendor/src/owner-api.ts";
 
 // The company DB lives on a remote WSS; when it drops, the SDK rejects every
 // in-flight call. A stray floating promise becoming an unhandled rejection would
@@ -40,7 +42,13 @@ export default function contribute(server: PluginServerContext) {
   const stopScrub = registerScrub(server, process.env, { zdotdir: join(serviceHome(), "zdot"),
     employee: identifyEmployee, rememberEmployee: identifyEmployee.remember,
     sandbox: provider => sandboxGap(provider, paseoConfig, join(serviceHome(), "sandbox", "bin")),
-    modelEnv: async request => employeeModelEnv(request, (await company()).sidecar, serviceHome()) });
+    modelEnv: async request => employeeModelEnv(request, (await company()).sidecar, serviceHome()),
+    tools: () => companyAgentTools({
+      sidecar: async () => (await company()).sidecar,
+      // landscape.get 只读 ctx.db：与 sck owner landscape.get 同一条 ownerApi 路径。
+      landscape: async args => ownerApi({ db: (await company()).db } as never,
+        { command: 'landscape.get', input: args }, 'agent-tool') as Promise<unknown>,
+    }) });
   const stopDispatch = startDispatch(server);
   let preview!: PreviewHandle;
   const consoleFetch = createConsoleFetch({ home: serviceHome(), company, lanBase: () => preview.lanUrl });

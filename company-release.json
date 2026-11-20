@@ -1,18 +1,18 @@
 {
-  "version": "0.13.73",
-  "title": "公司 MCP 第二期：交卷/复核/受阻写工具、服务端次数预算、Devin 通道 MCP 收尾",
+  "version": "0.13.74",
+  "title": "本地 Paseo 员工注入同名公司工具、派工正文改工具交卷优先、Devin 只读任务收尾修复",
   "changes": [
-    "公司 MCP 新增三个写工具：task_submit（执行态交卷，可带 PR/SHA）、task_review（复核态通过/退回）、task_block（执行或复核态受阻）；一律经主体登记、任务租约绑定与命令守卫判定后，用带 current_employee/delivery_id/fence/lease_expires_at 条件的 UPDATE 只写 task.mcp_outcome，任务状态机字段一律不碰。",
-    "company_ops 引入服务端次数预算：按（任务, delivery_id, 工具）计数，默认每工具 3 次；任务行 mcp_budget 可覆盖（0..20，0 即禁用），扣次用条件 UPDATE 防并发，新租约 delivery 自动清零，超限直接 forbidden 不入队。",
-    "新增老板专属命令 mcp.budget.set（设置/清除任务预算覆盖）与 mcp.principal.pending（聚合近 7 天未登记主体的 MCP 尝试）；mcp.* 前缀整体并入 HARD_OWNER_ONLY。",
-    "core 新增 mcpOutcome(open/read)：开闸清空上一轮结论，读取只回本租约（员工×delivery×fence）的结论；sidecar 提供 lane_mcp_open/lane_mcp_outcome 通道工具。",
-    "devin-cloud 通道接入结构化收尾：新回合发送前开闸并记录开闸标记，轮询时优先采信 MCP 结论（submit→closeout、review→复核结论、block→受阻），失败一律回落原页面 SCK-DONE 逻辑；vendor prompt 引导云端执行者用 task_context/company_ops/task_submit。"
+    "本机 Paseo 员工会话在 session_open 时注入 7 个与云端公司 MCP 同名同参数的工具（company_landscape、task_current、task_context、company_ops、task_submit、task_review、task_block），身份来自 Paseo agentId，经 sidecar 走与 sck call 相同的 dispatch。",
+    "与云端差异：无 company_job（本机同步返回）、无白名单与次数预算（本机员工经 sck 本就可调）、sha 需完整 40 位。",
+    "派工正文改为工具交卷优先：task_submit/task_review/task_block；首行口令保留为无工具时的兜底。",
+    "Devin 通道只读任务（worktree.intent 'read'）执行轮不再要求远端提交与 PR，直接按答复收尾；代码任务不变。",
+    "云端 prompt 继续剥离本机指引（旧 company_cmd_catalog 句与新本机工具句都剥掉）。插件要求 Paseo >=0.16.0。"
   ],
   "impact": [
-    "Devin Cloud 等云端执行者可用公司 MCP 工具直接回写结构化结论，不再只能依赖页面收尾标记；结论绑定任务租约，旧租约写不进。",
-    "运维工具调用有服务端硬上限，防止云端主体把只读运维命令打爆；预算与主体登记都由老板专属命令管理。",
-    "沿用 schema 074，任务行新增 mcp_outcome/mcp_budget/mcp_ops_used 均为 SCHEMALESS 字段，无迁移。"
+    "本机员工像云端一样用同名原生工具读写公司数据与交卷，不再依赖消息里的格式约定；权限与租约判定与 sck call 一致。",
+    "Devin 执行只读调研类任务不再因没有 PR 被误判受阻。",
+    "沿用 schema 074，无迁移。"
   ],
-  "migration": "无 schema 变化（沿用 schema 074）；task 行新增的 mcp_outcome、mcp_budget、mcp_ops_used 都是 SCHEMALESS 字段，缺省即未使用。升级并重启 owner-backend 与插件即可。",
-  "rollback": "回退至 0.13.72；写工具与预算随之关闭，云端收尾回到页面 SCK-DONE 标记路径，已落库的 mcp_* 字段被旧版忽略。"
+  "migration": "无 schema 变化（沿用 schema 074）。插件要求 Paseo >=0.16.0（requirements.paseo 已声明）；升级 owner-backend 与插件即可。",
+  "rollback": "回退至 0.13.73；本机会话退回 sck call 路径，Devin 只读任务恢复为需要 PR 收尾。"
 }

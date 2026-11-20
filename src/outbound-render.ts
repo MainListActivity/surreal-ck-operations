@@ -76,10 +76,10 @@ const fits = (text?: string): boolean => !!text?.trim() && text.trim().length <=
 const titled = (task: PromptTask) => task.title?.trim() ? `《${task.title.trim()}》` : '这项任务';
 
 /** 每条线都有的两样：线的笔记与公司工作能力目录。 */
-const COMMON_RESOURCES = `notes.md 是这条线积累的经验，先读。需要账号、登录态或远程执行工具时，用 sck call company_cmd_catalog 查可用的工作能力。`;
+const COMMON_RESOURCES = `notes.md 是这条线积累的经验，先读。公司工具直接调用：task_context 读任务全貌，company_landscape 查仓库、服务与部署方式，company_ops 调运维能力；其余能力用 sck list 查看。`;
 /** 收尾约定：执行端靠首行结论给任务收尾（runner/lifecycle.ts 的 workResult），完工分析上线前必须留在消息里。 */
-const CLOSE_EXECUTE = `做完后在最终答复里写清完成情况、验证结果和产物位置，然后结束本轮；缺前置条件做不下去时，首行写“工作结果：受阻”并说明缺什么。`;
-const CLOSE_REVIEW = `最终答复首行写“复核结论：通过”或“复核结论：退回”，随后逐条给出证据，然后结束本轮；无法复核时首行写“工作结果：受阻”并说明缺什么。`;
+const CLOSE_EXECUTE = `做完后用 task_submit 交卷，写清完成情况、验证结果和产物位置，然后结束本轮；缺前置条件做不下去时用 task_block 说明缺什么。没有这些工具时，在最终答复里写清同样内容，受阻时首行写“工作结果：受阻”。`;
+const CLOSE_REVIEW = `复核完用 task_review 给出结论（verdict：pass 通过、return 退回），findings 逐条写证据，然后结束本轮；无法复核时用 task_block 说明缺什么。没有这些工具时，最终答复首行写“复核结论：通过”或“复核结论：退回”（受阻写“工作结果：受阻”），随后逐条给出证据。`;
 const REVIEW_FIRST = `先查第 1 条（老板视角的结果），不成立就说明原因并退回；成立后再逐条复验其余标准。`;
 
 /** 资源清单内联的上限：三段都顶格时整条消息仍在补译上限（20000 字）之内。 */
@@ -93,7 +93,7 @@ function executeMessage(task: PromptTask, code: boolean): string {
   const verify = ['验证：',
     fits(task.acceptance) ? task.acceptance!.trim() : task.acceptance?.trim() ? '按 task.md 的验收标准逐条自验。' : '自己验证结果成立，并说明是怎么验证的。',
     // 提交行留着：上线核验要的是实际合并提交，执行端从工作树取的 HEAD 可能还是合并前的 PR head。
-    code ? '在最终提交上逐条自验，最终答复用单独一行“提交：<完整40位SHA>”标明被验证的提交。' : undefined, CLOSE_EXECUTE].filter(Boolean).join('\n');
+    code ? '在最终提交上逐条自验，交卷时在 sha 填被验证的完整 40 位提交（不用工具时在最终答复单独一行写“提交：<完整40位SHA>”）。' : undefined, CLOSE_EXECUTE].filter(Boolean).join('\n');
   return [what, task.note?.trim() ? `注意：${task.note.trim()}` : undefined, resourcesSection(task), verify].filter(Boolean).join('\n\n');
 }
 

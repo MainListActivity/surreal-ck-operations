@@ -353,6 +353,24 @@ describe('agent.session_open hook', () => {
     await expect(hook('hangs').open({ ...base, reason: 'import', env: {} })).rejects.toThrow('身份登记');
     expect(Date.now() - started).toBeLessThan(4_000);
   }, 6_000);
+
+  test('公司员工 interactive 会话注入公司工具并保留已有 tools；history 用途不注入', async () => {
+    const mine = { name: 'task_submit', description: '公司交卷' };
+    const h = hook({}, { tools: () => [mine] });
+    const interactive = await h.open({ ...base, reason: 'create',
+      env: { SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'k' }, tools: [{ name: 'existing' }] });
+    expect((interactive as { tools?: unknown[] } | undefined)?.tools).toEqual([{ name: 'existing' }, mine]);
+    const history = await h.open({ ...base, reason: 'create', purpose: 'history',
+      env: { SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'k' }, tools: [{ name: 'existing' }] });
+    expect((history as { tools?: unknown[] } | undefined)?.tools).toEqual([{ name: 'existing' }]);
+  });
+
+  test('没有注入回调时会话 tools 原样透传', async () => {
+    const h = hook();
+    const out = await h.open({ ...base, reason: 'create',
+      env: { SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'k' }, tools: [{ name: 'existing' }] });
+    expect((out as { tools?: unknown[] } | undefined)?.tools).toEqual([{ name: 'existing' }]);
+  });
 });
 
 describe('agent.session_open hook with the zsh startup shim', () => {

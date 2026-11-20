@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runLane, taskMaterial, validateLanes, vendorPrompt, type LaneDeps, type LaneInput } from '../src/runner/cloud-lane/lane.ts';
+import { laneMessage, runLane, taskMaterial, validateLanes, vendorPrompt, type LaneDeps, type LaneInput } from '../src/runner/cloud-lane/lane.ts';
 import { laneExecFile } from '../src/runner/cloud-lane/exec.ts';
 import { laneDigest, readInflight, readLaneState, writeInflight, writeLaneState } from '../src/runner/cloud-lane/state.ts';
 import { julesUsageCount, julesUsageEntry, whamToUsageEntry } from '../src/runner/cloud-lane/quota.ts';
@@ -3991,5 +3991,90 @@ describe('devin-cloud 的 MCP 收尾通道（MCP-2）', () => {
     expect(prompt).toContain('task-1');
     expect(prompt).toContain('task_submit');
     expect(prompt).toContain('task_context');
+  });
+});
+
+describe('devin-cloud 只读任务收尾与派工正文剥离（0.13.74）', () => {
+  const SESSION3 = 'https://app.devin.ai/sessions/abcd1234abcd1234abcd1234abcd1234';
+  type Resp = Record<string, unknown> | undefined;
+  const MODE3 = (m: string) => `const MODE = "${m}"`;
+  const browseOf3 = (q: { send?: Resp[]; session?: Resp[] }) => async (script: string): Promise<Resp> => {
+    const pick = (l?: Resp[]): Resp => l && l.length > 1 ? l.shift() : l?.[0];
+    if (script.includes(MODE3('send')) || script.includes(MODE3('recover')) || script.includes(MODE3('follow'))) return pick(q.send);
+    return pick(q.session);
+  };
+  const working3 = () => ({ ok: true, markerSeen: true, status: 'working', done: null, tail: '' });
+  /** 把 claim.json 的 worktree.intent 改成指定形状（字符串 'read' 或对象 {kind:'read'}）。 */
+  const makeReadOnly = (commDir: string, intent: unknown) => {
+    const path = join(commDir, 'claim.json');
+    const claim = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    (claim.worktree as Record<string, unknown>).intent = intent;
+    writeFileSync(path, JSON.stringify(claim));
+  };
+  const noGit = (w: ReturnType<typeof world>, names: string[]) =>
+    w.callsOf(c => c.cmd === 'git' && names.includes(c.args[0]!)).length;
+
+  test('readOnly（字符串与对象两种 intent）：MCP submit 无 PR 也 done，不 fetch 不找 PR', async () => {
+    for (const intent of ['read', { kind: 'read' }]) {
+      const w = world();
+      makeReadOnly(w.commDir, intent);
+      const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps,
+        browse: browseOf3({ send: [{ ok: true, url: SESSION3 }], session: [working3()] }) as NonNullable<LaneDeps['browse']>,
+        mcpRoundOpen: async () => ({ opened: true }),
+        mcpOutcome: async () => ({ kind: 'submit' as const, text: '只读任务调研完成，结论与证据都在正文' }),
+      });
+      expect(out.status).toBe('success');
+      expect(out.text).toContain('只读任务调研完成');
+      expect(noGit(w, ['fetch', 'merge'])).toBe(0);
+      // gh repo view 是 repoInfo 的常规探测；不能有的是 PR 查找/创建。
+      expect(w.callsOf(c => c.cmd === 'gh' && c.args[0] === 'pr')).toHaveLength(0);
+    }
+  });
+
+  test('readOnly：页面 SCK-DONE 终稿也直接 done；代码任务（非 readOnly）照旧走代码收尾', async () => {
+    const w = world();
+    makeReadOnly(w.commDir, 'read');
+    const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps,
+      browse: browseOf3({ send: [{ ok: true, url: SESSION3 }],
+        session: [{ ok: true, markerSeen: true, status: 'idle', done: '只读分析完成，结论如下。', tail: '' }] }) as NonNullable<LaneDeps['browse']>,
+    });
+    expect(out.status).toBe('success');
+    expect(out.text).toContain('只读分析完成');
+    expect(noGit(w, ['fetch', 'merge'])).toBe(0);
+
+    // 对照：代码任务页面终稿仍走 fetch/merge 的代码收尾。
+    const w2 = world({ extra: call => {
+      if (call.cmd === 'git' && ['fetch', 'merge', 'push'].includes(call.args[0]!)) return ok('');
+      if (call.cmd === 'git' && call.args[0] === 'ls-remote') return ok('');
+      return undefined;
+    } });
+    const out2 = await runLane(w2.input({ provider: 'devin-cloud' }), { ...w2.deps,
+      browse: browseOf3({ send: [{ ok: true, url: SESSION3 }],
+        session: [{ ok: true, markerSeen: true, status: 'idle', done: '完成。\nPR: https://github.com/acme/widget/pull/9\nSHA: deadbeef', tail: '' }] }) as NonNullable<LaneDeps['browse']>,
+    });
+    expect(out2.status).toBe('success');
+    expect(noGit(w2, ['fetch'])).toBeGreaterThan(0);
+  });
+
+  test('readOnly 执行轮的 vendorPrompt：task_submit 只读措辞，不要 PR 推送要求', () => {
+    const w = world();
+    makeReadOnly(w.commDir, 'read');
+    const prompt = vendorPrompt(w.input({ provider: 'devin-cloud' }), { slug: 'acme/widget', branch: 'sck/task-1', defaultBranch: 'main' } as never,
+      taskMaterial(w.commDir), true);
+    expect(prompt).toContain('完成后用 task_submit（本任务是只读任务：不提交代码、不开 PR）');
+  });
+
+  test('派工正文剥离：旧的 company_cmd_catalog 指引与新的本机工具指引都被剥掉', () => {
+    const w = world();
+    const prompt = [
+      '做一件事。',
+      'notes.md 是这条线积累的经验，先读。需要账号、登录态或远程执行工具时，用 \'/bin/sck\' call company_cmd_catalog 查可用的工作能力。',
+      'notes.md 是这条线积累的经验，先读。公司工具直接调用：task_context 读任务全貌，company_landscape 查仓库、服务与部署方式，company_ops 调运维能力；其余能力用 sck list 查看。',
+      '验证：自己验证。',
+    ].join('\n');
+    const body = laneMessage(prompt, w.commDir, { task: '# 任务\n需求。', review: false })!;
+    expect(body).not.toContain('company_cmd_catalog');
+    expect(body).not.toContain('公司工具直接调用');
+    expect(body).not.toContain('sck list 查看');
   });
 });
