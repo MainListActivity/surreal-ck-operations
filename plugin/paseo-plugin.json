@@ -1,7 +1,7 @@
 {
   "id": "sck-company",
   "requirements": {
-    "paseo": ">=0.10.1"
+    "paseo": ">=0.16.0"
   },
   "build": [
     [

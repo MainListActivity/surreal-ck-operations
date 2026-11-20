@@ -61,6 +61,11 @@ export interface ScrubOptions {
   modelEnv?: (request: {agentId:string;env:Record<string,string>;provider?:string}) => Promise<Record<string,string>>;
   /** Refuses an interactive company session the sandbox would not cover; history views stay readable. */
   sandbox?: (provider: string) => string | undefined;
+  /**
+   * 公司工具（与云端公司 MCP 同名）：interactive 会话注入给 agent 的 Paseo 内置 MCP。
+   * 0.16.2 的 SDK 才有 tools 字段；插件锁 0.10.1，结构类型在 server/company-tools.ts 本地定义。
+   */
+  tools?: () => unknown[];
 }
 
 /**
@@ -99,6 +104,10 @@ export function registerScrub(server: PluginServerContext, inherited: Env = proc
     const blanked = Object.keys(env).filter(name => env[name] === "" && request.env?.[name] === undefined);
     if (zdotdir && env.ZDOTDIR === undefined) env.ZDOTDIR = zdotdir;
     console.log(`scrub ${request.agentId} (${request.reason}): blanked ${blanked.length} credential variable(s)${blanked.length ? ` [${blanked.join(", ")}]` : ""}${env.ZDOTDIR === zdotdir && zdotdir ? "; zsh startup shimmed" : ""}`);
-    return { ...request, env };
+    // 公司员工 interactive 会话注入同名公司工具（history 用途与保留的 request.tools 原样处理）。
+    const existing = (request as { tools?: unknown[] }).tools ?? [];
+    const tools = request.purpose !== "history" && options.tools
+      ? [...existing, ...options.tools()] : existing;
+    return { ...request, env, tools };
   });
 }

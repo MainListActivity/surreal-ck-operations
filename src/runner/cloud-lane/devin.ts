@@ -117,6 +117,8 @@ async function openPullRequest({ deps, input, repo }: Ctx): Promise<string | und
 /** 漏标记时只信远端客观交付：不能用已有本地提交或其它分支 PR 冒充本轮完成。 */
 async function objectiveCloseout(ctx: Ctx, tail: string): Promise<VendorOutcome | undefined> {
   const { deps, input, repo } = ctx;
+  // 只读任务没有远端提交可核对：空闲无终稿仍走原受阻提示，不做客观收尾。
+  if (ctx.readOnly) return undefined;
   try {
     const head = await fetchAndFastForward(deps.exec, input.cwd, repo.branch);
     if (!/^[a-f0-9]{40}$/i.test(head)) return undefined;
@@ -139,6 +141,8 @@ interface Ctx {
   material: { task: string; findings?: string; review: boolean; title: string };
   prompt: string; state: LaneState;
   digest: string; key: string; deadline: number;
+  /** 只读任务工作树（work_intent 'read'）：不提交不建 PR，执行轮直接按答复文本收尾。 */
+  readOnly?: boolean;
 }
 
 interface VendorOutcome {
@@ -569,6 +573,8 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
 async function closeout(ctx: Ctx, text: string): Promise<VendorOutcome> {
   const { input, deps, repo, material } = ctx;
   if (material.review) return { kind: 'done', text };
+  // 只读任务：不 fetch、不找 PR，执行轮直接按答复文本收尾（含 MCP task_submit 无 PR 的交卷）。
+  if (ctx.readOnly) return { kind: 'done', text };
 
   let pr = /^PR:\s*(\S+)/m.exec(text)?.[1];
   const sha = /^SHA:\s*([0-9a-f]{7,40})/im.exec(text)?.[1];

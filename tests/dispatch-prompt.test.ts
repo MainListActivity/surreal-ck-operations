@@ -15,18 +15,18 @@ test('执行消息就是任务卡的三段：做什么、可以用、验证', ()
     '',
     '可以用：',
     '参考 src/export/users.ts 的做法；测试账号在 1Password 的“演示”库。',
-    'notes.md 是这条线积累的经验，先读。需要账号、登录态或远程执行工具时，用 sck call company_cmd_catalog 查可用的工作能力。',
+    'notes.md 是这条线积累的经验，先读。公司工具直接调用：task_context 读任务全貌，company_landscape 查仓库、服务与部署方式，company_ops 调运维能力；其余能力用 sck list 查看。',
     '',
     '验证：',
     '1. 老板点导出能下载到 CSV。',
     '2. 列头与页面一致。',
-    '做完后在最终答复里写清完成情况、验证结果和产物位置，然后结束本轮；缺前置条件做不下去时，首行写“工作结果：受阻”并说明缺什么。',
+    '做完后用 task_submit 交卷，写清完成情况、验证结果和产物位置，然后结束本轮；缺前置条件做不下去时用 task_block 说明缺什么。没有这些工具时，在最终答复里写清同样内容，受阻时首行写“工作结果：受阻”。',
   ].join('\n'));
 });
 
 test('代码任务只多一句：在最终提交上自验并写明提交，执行端认得这一行', () => {
   const body = composeMessage('execute', card, true);
-  expect(body).toContain('在最终提交上逐条自验，最终答复用单独一行“提交：<完整40位SHA>”标明被验证的提交。');
+  expect(body).toContain('在最终提交上逐条自验，交卷时在 sha 填被验证的完整 40 位提交（不用工具时在最终答复单独一行写“提交：<完整40位SHA>”）。');
   expect(composeMessage('execute', card)).not.toContain('提交：');
   const sha = 'a'.repeat(40);
   expect(workResult(`已完成\n提交：${sha}`, 'doing').evidence.sha).toBe(sha);

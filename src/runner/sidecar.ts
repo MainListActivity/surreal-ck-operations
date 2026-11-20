@@ -1729,7 +1729,6 @@ export class SidecarPool {
     const dir = commDir(this.deps.runDir, instId);
     const reqPath = join(reqDir(dir), file);
     const req = readJsonFile<CommRequest>(reqPath);
-    const request = { lease: this.claims.get(instId) };
     const arrival = Date.now();
     try { unlinkSync(reqPath); } catch { /* already consumed */ }
     const res: CommResponse = !req
@@ -1740,15 +1739,48 @@ export class SidecarPool {
         : req.tool === "reclaim_worktrees" && req.args === null
           ? { ok: false, error: "invalid: reclaim arguments must be one object" }
           // The request's arrival (stamped above) is kept for the retry too: a listing answer counts its reply ceiling from it (SYS01 M1).
-          : await arriving(() => this.dispatch(instId, req.tool, req.args ?? {}, false, request), arrival)
-            .catch((error: unknown) => SidecarPool.isAuthError(error)
-              // A concurrent adopter may have rotated the credential out from under us; retry once on a fresh one.
-              ? arriving(() => this.dispatch(instId, req.tool, req.args ?? {}, true, request), arrival)
-              : Promise.reject(error))
-            .then(data => ({ ok: true as const, data }))
-            .catch((error: Error & { code?: string }) => ({ ok: false as const, error: `${error.code ?? "error"}: ${error.message}` }));
+          : await this.respond(instId, req.tool, req.args ?? {}, arrival);
     // Last-line budget check: an over-budget success becomes a recoverable, JSON-legal error (SYS01).
     const guarded = guardRelayResponse(res);
     writeFileAtomic(join(resDir(dir), file), JSON.stringify(guarded));
+  }
+
+  /** dispatch + 鉴权失败换凭证重试一次 + 错误映射 + 响应预算检查：sck call 与 Paseo 会话内工具共用的执行路径。 */
+  private async respond(instId: string, tool: string, args: Record<string, unknown>, arrival: number): Promise<CommResponse> {
+    const request = { lease: this.claims.get(instId) };
+    const res: CommResponse = await arriving(() => this.dispatch(instId, tool, args, false, request), arrival)
+      .catch((error: unknown) => SidecarPool.isAuthError(error)
+        // A concurrent adopter may have rotated the credential out from under us; retry once on a fresh one.
+        ? arriving(() => this.dispatch(instId, tool, args, true, request), arrival)
+        : Promise.reject(error))
+      .then(data => ({ ok: true as const, data }))
+      .catch((error: Error & { code?: string }) => ({ ok: false as const, error: `${error.code ?? "error"}: ${error.message}` }));
+    // Last-line budget check: an over-budget success becomes a recoverable, JSON-legal error (SYS01).
+    return guardRelayResponse(res);
+  }
+
+  /** Paseo 会话内公司工具的入口：按 Paseo agentId 找到在岗员工实例，走与 sck call 相同的 dispatch（不需要 comm key，身份来自 daemon）。 */
+  async callForAgent(agentId: string, tool: string, args: Record<string, unknown>): Promise<CommResponse> {
+    const instId = this.instByAgent.get(agentId);
+    if (!instId || !this.launched.has(instId) || this.quarantined.has(instId)) {
+      return { ok: false, error: 'forbidden: 该会话不是在岗公司员工' };
+    }
+    return this.respond(instId, tool, args, Date.now());
+  }
+
+  /** 该会话员工当前的在租任务；没有返回 undefined。 */
+  leaseForAgent(agentId: string): { employee: string; taskId: string; phase: 'doing' | 'review'; leaseExpiresAt?: number } | undefined {
+    const instId = this.instByAgent.get(agentId);
+    const live = instId ? this.claims.get(instId) : undefined;
+    if (!instId || !live) return undefined;
+    return { employee: instId, taskId: live.taskId, phase: live.phase, leaseExpiresAt: live.leaseExpiresAt };
+  }
+
+  /** 本机运维/媒体/浏览器/同步能力工具名（ops、media、browser、sync 四个 gateway 的 tools 并集）。 */
+  capabilityTools(): string[] {
+    return [...new Set([
+      ...(this.deps.ops?.tools ?? []), ...(this.deps.media?.tools ?? []),
+      ...(this.deps.browser?.tools ?? []), ...(this.deps.sync?.tools ?? []),
+    ])];
   }
 }
