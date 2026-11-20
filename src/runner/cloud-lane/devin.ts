@@ -454,13 +454,18 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
         }
         const saved = relayBoundTo(state.devin?.assistRelay, binding) ? state.devin!.assistRelay : undefined;
         const canProduce = used < 3 && deps.assist !== undefined && agentTail.trim() !== '';
-        if (!saved && !canProduce) return blocked(`${waiting}，需要老板在会话里答复（本轮未代跑、未发送）。`);
+        if (!saved && !canProduce) {
+          state.devin = { ...state.devin, awaitingOwner: true };
+          persist();
+          return blocked(`${waiting}，需要老板在会话里答复（本轮未代跑、未发送）。`);
+        }
         // 发送不是幂等的，代跑还会消耗真实只读工具调用：先在原 Free 会话与组织首页核可发条件（只读、不填写、
         // 不按发送）。已知满座/未就绪/错会话/非 Free/未登录时不执行任何代跑工具，也不发送。
         const gate = await browse(devinRelayGateScript(sessionUrl, saved?.marker ?? marker, home), 150_000) as Reply;
         if (gate?.code === 'login_required') return loginFail();
         if (gate?.ok !== true) {
           readSeats('follow', gate);
+          state.devin = { ...state.devin, awaitingOwner: true };
           persist();
           return blocked(`${waiting}，本轮未代跑、未发送：${relayReason(gate?.code, gate?.seats)}。已在调用只读工具之前核对可发条件；席位或页面恢复后恢复本任务即可，会先核对原会话再回执，不会重复执行同一工具，也不另建会话。`);
         }
@@ -490,7 +495,7 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
             state.devin = { ...state.devin, assistRounds: nextRound, assistRelay: relay };
             persist();
           } else if (assist.decision === 'escalate') {
-            state.devin = { ...state.devin, assistRounds: used + 1 };
+            state.devin = { ...state.devin, assistRounds: used + 1, awaitingOwner: true };
             persist();
             return blocked(`${waiting}，本地协助转交老板裁决（本轮未代跑、未发送）。`);
           }
@@ -515,7 +520,7 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
             state.submittedAt = at;
             state.taskUrl = url!;
             state.vendorSession = url!;
-            if (state.devin) delete state.devin.assistRelay;
+            if (state.devin) { delete state.devin.assistRelay; delete state.devin.awaitingOwner; }
             dropLocalAttempt(); forgetAttemptSession();
             persist();
             settled = undefined; misses = 0; idleNoDone = 0;
@@ -532,6 +537,8 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
           persist();
           return blocked(`${waiting}，本地代跑结果未能确认回传原会话（第 ${relay.round} 轮）；发送意图已保留，恢复时只核对不重发、不再执行工具。`);
         }
+        state.devin = { ...state.devin, awaitingOwner: true };
+        persist();
         return blocked(`${waiting}，需要老板在会话里答复（本轮未代跑、未发送）。`);
       }
       // 不工作时看不到本轮标记：转录里没有受理。连续确认后受阻交人工核对；绝不重发，在途状态保留。

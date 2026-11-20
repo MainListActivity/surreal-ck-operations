@@ -910,6 +910,55 @@ describe('deliverable_publish 工具', () => {
 
     expect(assists.length).toBeGreaterThanOrEqual(2);
   });
+
+  test('steward_lane_assist 代跑 invalid → 校验信息回传 Devin；上游错误仍 escalate', async () => {
+    pool.close();
+    pool = new SidecarPool({
+      core: core as never, workforce: workforce as never,
+      ops: {
+        tools: ['ops_health', 'ops_origin_logs'] as const,
+        call: async (_c: string, _t: string, tool: string, args: Record<string, unknown>) => {
+          if (args.service === undefined) throw Object.assign(
+            new Error('service must be one of surreal-ck-hono, surrealdb, caddy'), { code: 'invalid' });
+          if (args.boom) throw Object.assign(new Error('上游网关 502'), { code: 'upstream_error' });
+          return { ok: true, tool };
+        },
+        release: (_employeeId: string) => {},
+      },
+      media, runDir, heartbeatMs: 10_000, sweepMs: 20,
+      log: message => { logs.push(message); },
+      laneAssist: async input => ({
+        kind: 'tool_relay', tool: 'ops_origin_logs',
+        args: String(input.transcriptTail).includes('boom')
+          ? { service: 'caddy', boom: true }
+          : { lines: 300 },
+      }),
+    });
+    const i = inst('assist-invalid');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-assist-2'));
+
+    // 我方参数校验错误：回传给执行者修正参数（脱敏 + 300 字上限），不转交老板。
+    const invalid = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'iv1', 'steward_lane_assist', {
+      provider: 'devin-cloud', phase: 'doing', round: 1,
+      transcriptTail: '[OPS-REQUEST] {"tool":"ops_origin_logs","args":{"lines":300}}',
+    });
+    expect(invalid.ok).toBe(true);
+    expect(invalid.data).toMatchObject({ decision: 'reply', toolExecuted: 'ops_origin_logs' });
+    const detail = String((invalid.data as { message: string }).message);
+    expect(detail).toContain('参数无效');
+    expect(detail).toContain('surreal-ck-hono');
+    expect(detail).toContain('company_ops');
+    expect(detail).not.toContain('老板');
+
+    // 上游错误仍然转交老板裁决。
+    const upstream = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'iv2', 'steward_lane_assist', {
+      provider: 'devin-cloud', phase: 'doing', round: 1,
+      transcriptTail: '[OPS-REQUEST] {"tool":"ops_origin_logs","args":{"service":"caddy","boom":true}}',
+    });
+    expect(upstream.ok).toBe(true);
+    expect(upstream.data).toMatchObject({ decision: 'escalate' });
+  });
   test('steward_lane_assist 门禁：阶段以真实租约为准，复核轮禁写，模型推断不得授权写操作', async () => {
     const calls2: OpsCall[] = [];
     const lane = (opts: { phase: 'doing' | 'review'; outcome: unknown }) => {
