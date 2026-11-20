@@ -3880,3 +3880,116 @@ describe('任务工作树边界', () => {
     expect(out.text).toContain('取消暂存');
   });
 });
+
+describe('devin-cloud 的 MCP 收尾通道（MCP-2）', () => {
+  const SESSION2 = 'https://app.devin.ai/sessions/abcd1234abcd1234abcd1234abcd1234';
+  type Resp = Record<string, unknown> | undefined;
+  const MODE2 = (m: string) => `const MODE = "${m}"`;
+  /** 最小假网页：发送回会话地址，轮询按队列回（默认一直 working、看不到收尾标记）。 */
+  const browseOf = (q: { send?: Resp[]; session?: Resp[] }) => async (script: string): Promise<Resp> => {
+    const pick = (l?: Resp[]): Resp => l && l.length > 1 ? l.shift() : l?.[0];
+    if (script.includes(MODE2('send')) || script.includes(MODE2('recover'))) return pick(q.send);
+    if (script.includes(MODE2('follow'))) return pick(q.send);
+    return pick(q.session);
+  };
+  const working = () => ({ ok: true, markerSeen: true, status: 'working', done: null, tail: '' });
+  const gitOk2: Route = call => {
+    if (call.cmd === 'git' && ['fetch', 'merge', 'push'].includes(call.args[0]!)) return ok('');
+    if (call.cmd === 'git' && call.args[0] === 'ls-remote') return ok('');
+    return undefined;
+  };
+  type McpOutcome = { kind: 'submit' | 'review' | 'block'; text: string; pr?: string; sha?: string; verdict?: 'pass' | 'return' };
+
+  test('MCP submit 结论不等页面 SCK-DONE 直接走 closeout（PR/SHA 入最终文本）', async () => {
+    const w = world({ extra: gitOk2 });
+    let opened = 0;
+    const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps,
+      browse: browseOf({ send: [{ ok: true, url: SESSION2 }], session: [working()] }) as NonNullable<LaneDeps['browse']>,
+      mcpRoundOpen: async () => { opened++; return { opened: true }; },
+      mcpOutcome: async (): Promise<McpOutcome> => ({ kind: 'submit', text: 'MCP 结构化交卷完成',
+        pr: 'https://github.com/acme/widget/pull/9', sha: 'deadbeef' }),
+    });
+    expect(opened).toBe(1);
+    expect(out.status).toBe('success');
+    expect(out.text).toContain('MCP 结构化交卷完成');
+    expect(out.text).toContain('PR: https://github.com/acme/widget/pull/9');
+    expect(out.text).toContain('SHA: deadbeef');
+    // 开闸发生在发送前：state 里记录了本轮开闸标记
+    expect(readLaneState(w.commDir)?.devin?.mcpOpen).toMatch(/^SCK-[a-f0-9]{10}$/);
+  });
+
+  test('MCP review 结论生成「复核结论：」首行', async () => {
+    const w = world({ task: '# 任务\n\n## 待复核成果\n\n已提交实现，请复核。\n', extra: gitOk2 });
+    const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps,
+      browse: browseOf({ send: [{ ok: true, url: SESSION2 }], session: [working()] }) as NonNullable<LaneDeps['browse']>,
+      mcpRoundOpen: async () => ({ opened: true }),
+      mcpOutcome: async (): Promise<McpOutcome> => ({ kind: 'review', verdict: 'return', text: '第三条验收缺少证据' }),
+    });
+    expect(out.text.split('\n')[0]).toBe('复核结论：退回');
+    expect(out.text).toContain('第三条验收缺少证据');
+  });
+
+  test('MCP block 结论 → 工作结果：受阻；open 失败则忽略 MCP 走页面逻辑', async () => {
+    const w = world({ extra: gitOk2 });
+    const blocked = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps,
+      browse: browseOf({ send: [{ ok: true, url: SESSION2 }], session: [working()] }) as NonNullable<LaneDeps['browse']>,
+      mcpRoundOpen: async () => ({ opened: true }),
+      mcpOutcome: async (): Promise<McpOutcome> => ({ kind: 'block', text: '供应商测试环境不可用' }),
+    });
+    expect(blocked.status).toBe('success');
+    expect(blocked.text.split('\n')[0]).toBe('工作结果：受阻');
+
+    // open 失败：即使 mcpOutcome 返回结论也不采信，落到页面 SCK-DONE。
+    const w2 = world({ extra: gitOk2 });
+    let reads = 0;
+    const out = await runLane(w2.input({ provider: 'devin-cloud' }), { ...w2.deps,
+      browse: browseOf({ send: [{ ok: true, url: SESSION2 }],
+        session: [{ ok: true, markerSeen: true, status: 'idle', done: '页面路径完成。\nPR: https://github.com/acme/widget/pull/9\nSHA: deadbeef', tail: '' }] }) as NonNullable<LaneDeps['browse']>,
+      mcpRoundOpen: async () => undefined,
+      mcpOutcome: async (): Promise<McpOutcome> => { reads++; return { kind: 'submit', text: '不应被采信' }; },
+    });
+    expect(reads).toBe(0);
+    expect(out.status).toBe('success');
+    expect(out.text).toContain('页面路径完成');
+    expect(out.text).not.toContain('不应被采信');
+  });
+
+  test('残留 mcpOpen + 本轮 open 失败：MCP 结论不采信且残留标记被清除', async () => {
+    const w = world({ extra: gitOk2 });
+    // 上一轮留下的开闸标记：本轮新发送若开闸失败，它绝不能继续生效。
+    writeLaneState(w.commDir, { sessionId: 'lane-mcp-stale', devin: { mcpOpen: 'SCK-deadbeef' } } as never);
+    let reads = 0;
+    const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps,
+      browse: browseOf({ send: [{ ok: true, url: SESSION2 }],
+        session: [{ ok: true, markerSeen: true, status: 'idle', done: '页面收尾路径。\nPR: https://github.com/acme/widget/pull/9\nSHA: deadbeef', tail: '' }] }) as NonNullable<LaneDeps['browse']>,
+      mcpRoundOpen: async () => undefined,
+      mcpOutcome: async (): Promise<McpOutcome> => { reads++; return { kind: 'submit', text: '不应被采信' }; },
+    });
+    expect(reads).toBe(0);
+    expect(out.status).toBe('success');
+    expect(out.text).toContain('页面收尾路径');
+    expect(readLaneState(w.commDir)?.devin?.mcpOpen).toBeUndefined();
+  });
+
+  test('mcpOutcome 抛错回落页面逻辑', async () => {
+    const w = world({ extra: gitOk2 });
+    const out = await runLane(w.input({ provider: 'devin-cloud' }), { ...w.deps,
+      browse: browseOf({ send: [{ ok: true, url: SESSION2 }],
+        session: [{ ok: true, markerSeen: true, status: 'idle', done: '页面收尾兜底。\nPR: https://github.com/acme/widget/pull/9\nSHA: deadbeef', tail: '' }] }) as NonNullable<LaneDeps['browse']>,
+      mcpRoundOpen: async () => ({ opened: true }),
+      mcpOutcome: async (): Promise<McpOutcome> => { throw new Error('mcp read failed'); },
+    });
+    expect(out.status).toBe('success');
+    expect(out.text).toContain('页面收尾兜底');
+  });
+
+  test('vendorPrompt 带公司任务 ID 与 task_submit 指引', () => {
+    const w = world();
+    const input = w.input({ provider: 'devin-cloud' });
+    const material = taskMaterial(w.commDir);
+    const prompt = vendorPrompt(input, { slug: 'acme/widget', branch: 'sck/task-1', defaultBranch: 'main' } as never, material);
+    expect(prompt).toContain('task-1');
+    expect(prompt).toContain('task_submit');
+    expect(prompt).toContain('task_context');
+  });
+});

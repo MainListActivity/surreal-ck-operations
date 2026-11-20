@@ -152,6 +152,8 @@ export const RELEASE_SCHEMA_REQUIREMENTS: ReleaseSchemaRequirement[] = [
   { version: '0.13.70', schema: 74, tables: ['task', 'outbound_message', 'route', 'runner_heartbeat', 'company_meta', 'dispatch_attempt', 'dispatch_recovery_approval', 'dispatch_recovery_receipt', 'agent_activity', 'reply_translation', 'turn_analysis', 'planned_message', 'owner_style_memory', 'fault_recovery_grant'] },
   { version: '0.13.71', schema: 74, tables: ['task', 'outbound_message', 'route', 'runner_heartbeat', 'company_meta', 'dispatch_attempt', 'dispatch_recovery_approval', 'dispatch_recovery_receipt', 'agent_activity', 'reply_translation', 'turn_analysis', 'planned_message', 'owner_style_memory', 'fault_recovery_grant'] },
   { version: '0.13.72', schema: 74, tables: ['task', 'outbound_message', 'route', 'runner_heartbeat', 'company_meta', 'dispatch_attempt', 'dispatch_recovery_approval', 'dispatch_recovery_receipt', 'agent_activity', 'reply_translation', 'turn_analysis', 'planned_message', 'owner_style_memory', 'fault_recovery_grant'] },
+  // 公司 MCP 第二期不新增表：任务结论与预算计数写在 SCHEMALESS 的 task 行内；沿用 schema 074。
+  { version: '0.13.73', schema: 74, tables: ['task', 'outbound_message', 'route', 'runner_heartbeat', 'company_meta', 'dispatch_attempt', 'dispatch_recovery_approval', 'dispatch_recovery_receipt', 'agent_activity', 'reply_translation', 'turn_analysis', 'planned_message', 'owner_style_memory', 'fault_recovery_grant'] },
 ];
 /** The requirement that applies to a target version: the newest one that is not newer than the target. */
 export function schemaRequirementFor(version: string): { schema: number; tables: string[] } {

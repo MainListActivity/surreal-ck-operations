@@ -60,6 +60,8 @@ export const COMMAND_CATALOG: readonly CommandSpec[] = [
   c('landscape.get', '看板与状态', '公司服务全景：仓库、服务、主机、部署与回滚，以及最近一次实机核对', 'host?', { readOnly: true }),
   c('mcp.principal.list', '员工与权限', '公司 MCP 主体登记清单（哪些授权主体可用 MCP 工具及允许的员工 provider）', '无', { readOnly: true }),
   c('mcp.principal.set', '员工与权限', '登记或更新一个 MCP 主体（默认拒绝：未登记的主体不能用任何 MCP 工具）', 'sub, providers, label, enabled', { risk: 'high' }),
+  c('mcp.principal.pending', '员工与权限', '近 7 天令牌有效但主体未登记/已停用的 MCP 尝试（按 sub 聚合，供老板决定是否登记）', '无', { readOnly: true }),
+  c('mcp.budget.set', '员工与权限', '设置某任务的 company_ops 次数预算覆盖（{ <tool>: 0..20 }，空对象清除）', 'taskId, budget', { risk: 'high' }),
   c('owner.settings.get', '翻译', '老板设置：常用语言', '无', { readOnly: true }),
   c('owner.settings.set', '翻译', '设置老板常用语言（员工回报译成这种语言）', 'lang'),
 

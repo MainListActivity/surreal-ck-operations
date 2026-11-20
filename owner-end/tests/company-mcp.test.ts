@@ -12,6 +12,7 @@ import worker from '../src/worker.ts';
 import { handleCompanyMcp, verifyMcpToken, type McpDeps } from '../src/mcp.ts';
 import { authenticate } from '../src/auth/caller.ts';
 import { HARD_OWNER_ONLY, matchesCommand } from '../../src/command-guard.ts';
+import { runOwnerApi } from '../src/commands.ts';
 
 const ORIGIN = 'https://company.test.invalid';
 const RESOURCE = `${ORIGIN}/api/mcp`;
@@ -46,6 +47,19 @@ function mcpDb(shape: DbShape) {
     if (sql.includes('FROM employee WHERE id IN')) return shape.employee ? [{ id: { id: EMPLOYEE }, provider: shape.employee.provider }] : [];
     if (sql.includes('FROM task WHERE')) return shape.responses?.find(([m]) => sql.includes(m))?.[1] ?? [];
     if (sql.includes('FROM $job')) return shape.responses?.find(([m]) => sql.includes('FROM $job'))?.[1] ?? [];
+    // 预算扣次与写结论的条件 UPDATE：默认视作命中（返回任务行并回写计数/结论）；用例可用
+    // 'SET mcp_ops_used' / 'SET mcp_outcome' 响应把它改成未命中（[] → 重试后 conflict/租约已变化）。
+    if (sql.includes('SET mcp_ops_used')) {
+      const hit = shape.responses?.find(([m]) => sql.includes(m))?.[1] ?? [{ ok: true }];
+      // 克隆回写，避免把扣次漏进共享的 LEASED_TASK 夹具。
+      if (hit.length && shape.task) shape.task = { ...shape.task, mcp_ops_used: vars.next };
+      return hit;
+    }
+    if (sql.includes('SET mcp_outcome')) {
+      const hit = shape.responses?.find(([m]) => sql.includes(m))?.[1] ?? [{ ok: true }];
+      if (hit.length && shape.task) shape.task = { ...shape.task, mcp_outcome: vars.o };
+      return hit;
+    }
     for (const [match, rows] of shape.responses ?? []) if (sql.includes(match)) return rows;
     return [];
   });
@@ -94,11 +108,12 @@ function resultOf(body: Record<string, unknown>) {
 }
 
 const LEASED_TASK = {
-  title: '修理公司 MCP', state: 'in_progress', project: { id: 'ops' },
+  title: '修理公司 MCP', state: 'doing', project: { id: 'ops' },
   discipline: 'backend', executor_role: 'engineering',
   requirement: '把公司 MCP 跑通', acceptance_text: '工具可查询',
   worktree: { branch: 'task/t1-mcp', path: '/home/secret/worktree' },
   current_employee: EMPLOYEE, lease_expires_at: LEASE,
+  delivery_id: 'del-1', fence: 3,
 };
 
 const DENIED_AUDITS = (calls: FakeCall[]) =>
@@ -167,14 +182,14 @@ describe('公司 MCP 工具', () => {
     ...overrides,
   });
 
-  test('tools/list 恰好 5 个工具', async () => {
+  test('tools/list 恰好 8 个工具', async () => {
     const token = await mcpToken();
     const { db } = boundDb();
     const response = await handleCompanyMcp(authed(rpc('tools/list'), token), deps(db));
     expect(response.status).toBe(200);
     const body = await response.json() as { result?: { tools?: Array<{ name: string }> } };
     expect(body.result?.tools?.map((tool) => tool.name).sort()).toEqual(
-      ['company_job', 'company_landscape', 'company_ops', 'task_context', 'task_current'].sort());
+      ['company_job', 'company_landscape', 'company_ops', 'task_block', 'task_context', 'task_current', 'task_review', 'task_submit'].sort());
   });
 
   test('task_context 返回投影：分支/仓库/需求，不含本机路径与 secrets', async () => {
@@ -328,5 +343,187 @@ describe('公司 MCP 工具', () => {
     expect(value.actor).toBeUndefined();
     expect(value.input).toBeUndefined();
     expect(value.runner).toBeUndefined();
+  });
+
+  describe('写工具（task_submit / task_review / task_block）', () => {
+    const setClauseOf = (sql: string) => sql.slice(sql.indexOf(' SET ') + 5, sql.indexOf(' WHERE '));
+
+    test('task_submit 写入 mcp_outcome 且只写这一个字段', async () => {
+      const token = await mcpToken();
+      const { db, calls } = boundDb();
+      const { body } = await callTool(token, db, 'task_submit', {
+        taskId: 't1', summary: '完成了公司 MCP 第二期写工具与预算的实现', pr: 'https://github.com/o/r/pull/12', sha: 'ABCDEF1234',
+      });
+      const value = resultOf(body)?.structuredContent as { recorded?: boolean; kind?: string };
+      expect(value).toEqual({ recorded: true, kind: 'submit' });
+      const update = calls.find((call) => call.sql.includes('SET mcp_outcome'))!;
+      // 只写 mcp_outcome（含其 at），不碰 version/fence/state/current_employee/delivery_id。
+      const set = setClauseOf(update.sql);
+      expect(set).toContain('mcp_outcome');
+      for (const field of ['version', 'fence', 'state', 'current_employee', 'delivery_id']) expect(set).not.toContain(field);
+      const outcome = update.vars.o as Record<string, unknown>;
+      expect(outcome.kind).toBe('submit');
+      expect(outcome.employee).toBe(EMPLOYEE);
+      expect(outcome.delivery).toBe('del-1');
+      expect(outcome.fence).toBe(3);
+      expect(outcome.sub).toBe(SUB);
+      expect(outcome.pr).toBe('https://github.com/o/r/pull/12');
+      expect(outcome.sha).toBe('abcdef1234'); // 小写化
+      expect(calls.some((call) => call.sql.includes('CREATE ops_audit') && call.vars.outcome === 'ok' && call.vars.actor === EMPLOYEE)).toBe(true);
+    });
+
+    test('task_submit 在复核任务上 → invalid「复核阶段请用 task_review」', async () => {
+      const token = await mcpToken();
+      const { db } = boundDb({ task: { ...LEASED_TASK, state: 'review' } });
+      const { body } = await callTool(token, db, 'task_submit', { taskId: 't1', summary: '完成了公司 MCP 第二期写工具与预算的实现' });
+      const result = resultOf(body);
+      expect(result?.isError).toBe(true);
+      expect((result?.structuredContent as { error: { code: string; message: string } }).error.code).toBe('invalid');
+      expect((result?.structuredContent as { error: { code: string; message: string } }).error.message).toContain('task_review');
+    });
+
+    test('task_review 在执行任务上 → invalid；复核任务上正例写 verdict', async () => {
+      const token = await mcpToken();
+      const { db: doingDb } = boundDb();
+      const wrongRes = await callTool(token, doingDb, 'task_review', { taskId: 't1', verdict: 'pass', findings: '复核结论与逐条证据都在这里，足够长，足够长' });
+      const wrong = resultOf(wrongRes.body);
+      expect(wrong?.isError).toBe(true);
+      expect((wrong?.structuredContent as { error: { message: string } }).error.message).toContain('task_submit');
+
+      const { db } = boundDb({ task: { ...LEASED_TASK, state: 'review' } });
+      const { body } = await callTool(token, db, 'task_review', { taskId: 't1', verdict: 'return', findings: '退回：第三条验收没有给出证据，需要补上再交' });
+      const value = resultOf(body)?.structuredContent as { recorded?: boolean; kind?: string };
+      expect(value).toEqual({ recorded: true, kind: 'review' });
+    });
+
+    test('task_block 写 kind=block 的结论', async () => {
+      const token = await mcpToken();
+      const { db, calls } = boundDb();
+      const { body } = await callTool(token, db, 'task_block', { taskId: 't1', reason: '供应商测试环境不可用，无法验证，需要等恢复' });
+      const value = resultOf(body)?.structuredContent as { recorded?: boolean; kind?: string };
+      expect(value).toEqual({ recorded: true, kind: 'block' });
+      const outcome = calls.find((call) => call.sql.includes('SET mcp_outcome'))!.vars.o as Record<string, unknown>;
+      expect(outcome.kind).toBe('block');
+      expect(outcome.text).toContain('测试环境不可用');
+    });
+
+    test('写工具：租约过期与别 provider → forbidden 且写 denied 审计；读后租约变化 → 任务租约已变化', async () => {
+      const token = await mcpToken();
+      for (const task of [
+        { ...LEASED_TASK, lease_expires_at: 1 },
+        { ...LEASED_TASK },
+      ]) {
+        const other = task.lease_expires_at === 1
+          ? boundDb({ task })
+          : boundDb({ task, employee: { provider: 'grok-bot' } });
+        const { body } = await callTool(token, other.db, 'task_submit', { taskId: 't1', summary: '完成了公司 MCP 第二期写工具与预算的实现' });
+        const result = resultOf(body);
+        expect(result?.isError).toBe(true);
+        expect((result?.structuredContent as { error: { code: string } }).error.code).toBe('forbidden');
+        expect(DENIED_AUDITS(other.calls).length).toBeGreaterThan(0);
+      }
+      const { db } = boundDb({ responses: [['SET mcp_outcome', []]] });
+      const { body } = await callTool(token, db, 'task_submit', { taskId: 't1', summary: '完成了公司 MCP 第二期写工具与预算的实现' });
+      const result = resultOf(body);
+      expect(result?.isError).toBe(true);
+      expect((result?.structuredContent as { error: { code: string; message: string } }).error.code).toBe('forbidden');
+      expect((result?.structuredContent as { error: { code: string; message: string } }).error.message).toContain('任务租约已变化');
+    });
+  });
+
+  describe('company_ops 次数预算', () => {
+    const opsCall = (token: string, db: Surreal) => callTool(token, db, 'company_ops', { taskId: 't1', tool: 'ops_origin_status', args: {} });
+    const enqueued = (calls: FakeCall[]) => calls.filter((call) => call.sql.includes('CREATE $job'));
+
+    test('默认预算 3：已用 3 次再调 → forbidden 且不入队', async () => {
+      const token = await mcpToken();
+      const { db, calls } = boundDb({
+        task: { ...LEASED_TASK, mcp_ops_used: { delivery: 'del-1', counts: { ops_origin_status: 3 } } },
+      });
+      const { body } = await opsCall(token, db);
+      const result = resultOf(body);
+      expect(result?.isError).toBe(true);
+      expect((result?.structuredContent as { error: { code: string; message: string } }).error.code).toBe('forbidden');
+      expect((result?.structuredContent as { error: { code: string; message: string } }).error.message).toContain('3/3');
+      expect(enqueued(calls)).toHaveLength(0);
+      expect(DENIED_AUDITS(calls).length).toBeGreaterThan(0);
+    });
+
+    test('覆盖预算 1 与 0：用完即拒；新 delivery 视为 0', async () => {
+      const token = await mcpToken();
+      const over1 = boundDb({
+        task: { ...LEASED_TASK, mcp_budget: { ops_origin_status: 1 }, mcp_ops_used: { delivery: 'del-1', counts: { ops_origin_status: 1 } } },
+      });
+      const r1 = resultOf((await opsCall(token, over1.db)).body);
+      expect((r1?.structuredContent as { error: { code: string; message: string } }).error.code).toBe('forbidden');
+      expect((r1?.structuredContent as { error: { code: string; message: string } }).error.message).toContain('1/1');
+
+      const over0 = boundDb({ task: { ...LEASED_TASK, mcp_budget: { ops_origin_status: 0 } } });
+      const r0 = resultOf((await opsCall(token, over0.db)).body);
+      expect((r0?.structuredContent as { error: { code: string; message: string } }).error.code).toBe('forbidden');
+      expect(enqueued(over0.calls)).toHaveLength(0);
+
+      // 旧 delivery 的计数在新租约下重置：正常扣次并入队。
+      const fresh = boundDb({
+        task: { ...LEASED_TASK, mcp_ops_used: { delivery: 'old-delivery', counts: { ops_origin_status: 3 } } },
+      });
+      const { body } = await opsCall(token, fresh.db);
+      const value = resultOf(body)?.structuredContent as { pending?: boolean };
+      expect(value.pending).toBe(true);
+      const spend = fresh.calls.find((call) => call.sql.includes('SET mcp_ops_used'))!;
+      expect((spend.vars.next as { counts: Record<string, number> }).counts.ops_origin_status).toBe(1);
+      expect((spend.vars.next as { delivery: string }).delivery).toBe('del-1');
+    });
+
+    test('扣次条件 UPDATE 连续未命中 → conflict；命中即计次（含 pending）', async () => {
+      const token = await mcpToken();
+      const { db } = boundDb({ responses: [['SET mcp_ops_used', []]] });
+      const result = resultOf((await opsCall(token, db)).body);
+      expect(result?.isError).toBe(true);
+      expect((result?.structuredContent as { error: { code: string } }).error.code).toBe('conflict');
+
+      const ok = boundDb();
+      const { body } = await opsCall(token, ok.db);
+      const value = resultOf(body)?.structuredContent as { pending?: boolean };
+      expect(value.pending).toBe(true);
+      expect((ok.calls.find((call) => call.sql.includes('SET mcp_ops_used'))!.vars.next as { counts: Record<string, number> }).counts.ops_origin_status).toBe(1);
+    });
+  });
+
+  describe('老板命令 mcp.budget.set 与 mcp.principal.pending', () => {
+    test('mcp.budget.set 非白名单工具拒绝；合法值落库；空对象清除', async () => {
+      const { db } = boundDb();
+      await expect(runOwnerApi(db, 'mcp.budget.set', { taskId: 't1', budget: { host_exec: 2 } }, 'test'))
+        .rejects.toMatchObject({ code: 'invalid' });
+      const { db: okDb } = boundDb({ responses: [['UPDATE $task SET mcp_budget', [{ id: 't1' }]]] });
+      const set = await runOwnerApi(okDb, 'mcp.budget.set', { taskId: 't1', budget: { ops_origin_status: 5 } }, 'test') as { taskId: string; budget: Record<string, number> };
+      expect(set.taskId).toBe('t1');
+      expect(set.budget).toEqual({ ops_origin_status: 5 });
+      const cleared = await runOwnerApi(okDb, 'mcp.budget.set', { taskId: 't1', budget: {} }, 'test') as { budget: unknown };
+      expect(cleared.budget).toBeNull();
+    });
+
+    test('mcp.principal.pending 聚合近 7 天未登记尝试，排除已登记主体', async () => {
+      const { db } = boundDb({
+        responses: [['FROM ops_audit', [
+          { actor: 'mcp:new-sub', at: '2030-01-01T00:00:00Z', command: 'task_context' },
+          { actor: 'mcp:new-sub', at: '2030-01-01T00:01:00Z', command: 'company_ops' },
+          { actor: 'mcp:other-sub', at: '2030-01-01T00:02:00Z', command: 'task_current' },
+          { actor: `mcp:${SUB}`, at: '2030-01-01T00:03:00Z', command: 'task_context' },
+        ]]],
+      });
+      const out = await runOwnerApi(db, 'mcp.principal.pending', {}, 'test') as { pending: Array<{ sub: string; attempts: number; lastAt: unknown; lastCommand: string }> };
+      expect(out.pending).toEqual([
+        { sub: 'new-sub', attempts: 2, lastAt: '2030-01-01T00:00:00Z', lastCommand: 'task_context' },
+        { sub: 'other-sub', attempts: 1, lastAt: '2030-01-01T00:02:00Z', lastCommand: 'task_current' },
+      ]);
+    });
+
+    test('员工/自动化不能调 mcp.*（HARD_OWNER_ONLY 命中 mcp.budget.set 与 mcp.principal.*）', () => {
+      for (const command of ['mcp.budget.set', 'mcp.principal.set', 'mcp.principal.pending', 'mcp.principal.list']) {
+        expect(HARD_OWNER_ONLY.some((pattern) => matchesCommand(pattern, command))).toBe(true);
+      }
+      expect(HARD_OWNER_ONLY.some((pattern) => matchesCommand(pattern, 'mcp_tool.task_submit'))).toBe(false);
+    });
   });
 });

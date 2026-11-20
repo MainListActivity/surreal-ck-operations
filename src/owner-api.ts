@@ -33,6 +33,7 @@ import type { AgentAction, AgentActivity } from './agent-activity.ts';
 import { redactSecrets } from './ops/redact.ts';
 import { COMPANY_LANDSCAPE } from './landscape.ts';
 import { mcpPrincipalUpsert, mcpPrincipalsOf, parseMcpPrincipal } from './mcp-principals.ts';
+import { mcpBudgetSet, mcpPendingPrincipals } from './mcp-ops.ts';
 import { observationRecordId } from './landscape-report.ts';
 import type { NodeSteward } from './steward/steward.ts';
 
@@ -389,6 +390,8 @@ export async function ownerApi(ctx: OwnerApiContext, input: Record<string, unkno
     // 哪些授权主体可以用公司 MCP 工具、各自允许的员工 provider；默认拒绝。仅老板（HARD_OWNER_ONLY）。
     case 'mcp.principal.list': return { principals: await mcpPrincipalsOf(db) };
     case 'mcp.principal.set': return { principals: await mcpPrincipalUpsert(db, parseMcpPrincipal(input)) };
+    case 'mcp.principal.pending': return { pending: await mcpPendingPrincipals(db) };
+    case 'mcp.budget.set': return mcpBudgetSet(db, input);
 
     // ---- 故障恢复授权 ----
     // 给一条已耗尽的恢复预算授权一次新窗口。授权只记下决定，预算不动：窗口在员工的下一次真实尝试消费授权时才开始。

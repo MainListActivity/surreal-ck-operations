@@ -568,6 +568,24 @@ export interface LeaseProof {
   expectedVersion: number;
 }
 
+/**
+ * 云端执行者经公司 MCP 写工具落在 task.mcp_outcome 的结构化结论（MCP-2）。
+ * 通道侧只在 kind 与本轮阶段一致时采信；employee/delivery/fence 绑定租约代际。
+ */
+export interface McpOutcome {
+  kind: 'submit' | 'review' | 'block';
+  /** summary / findings / reason（已脱敏截断）。 */
+  text: string;
+  pr?: string;
+  sha?: string;
+  verdict?: 'pass' | 'return';
+  employee?: string;
+  delivery?: string;
+  fence?: number;
+  sub?: string;
+  at?: unknown;
+}
+
 export interface Evidence {
   text: string;
   idempotencyKey: string;
@@ -666,6 +684,14 @@ export interface CompanyCore {
    * let the lease expire, which already leaves review tasks claimable.
    */
   release?(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;
+  /**
+   * 公司 MCP 第二轮写通道（MCP-2）：云端执行者经 MCP 写工具把结构化结论落到 task.mcp_outcome，
+   * 持租约的通道侧在按下发送前 open（清空上一轮旧结论），轮询时 read（只读到本租约代际的结论）。
+   * 只对「credential 员工 = 任务 current_employee 且 delivery_id/fence 与 proof 一致」开放，否则 forbidden。
+   */
+  mcpOutcome?(credential: Credential, proof: LeaseProof, op: 'open' | 'read'): Promise<
+    { opened: true } | { outcome: McpOutcome | null }
+  >;
   block(credential: Credential, proof: LeaseProof, to: 'owner', evidence: Evidence, quotaResetsAt?: string): Promise<TaskView>;
   resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView>;
   /** product: mark a task 'void' (terminal), release any lease on it, and release any planned children. */

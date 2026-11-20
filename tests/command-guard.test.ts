@@ -112,8 +112,8 @@ describe('命令守卫：模式与清单', () => {
     expect(HARD_OWNER_ONLY.some(pattern => matchesCommand(pattern, 'agent.policy.set'))).toBe(true);
   });
 
-  test('HARD_OWNER_ONLY 保持 7 类：保护开关、员工身份与策略、登录方式、老板设置、能力定义、任意写入、MCP 主体登记', () => {
-    expect([...HARD_OWNER_ONLY]).toEqual(['guard.*', 'agent.*', 'owner.login.*', 'owner.settings.*', 'def.*', 'db.write', 'mcp.principal.*']);
+  test('HARD_OWNER_ONLY 保持 7 类：保护开关、员工身份与策略、登录方式、老板设置、能力定义、任意写入、MCP 管理', () => {
+    expect([...HARD_OWNER_ONLY]).toEqual(['guard.*', 'agent.*', 'owner.login.*', 'owner.settings.*', 'def.*', 'db.write', 'mcp.*']);
     // 只读命令与员工可按租约和清单调用的写命令都不在硬清单里（后者由 protected_command、allow/deny 与租约判定）。
     for (const command of ['board.snapshot', 'brief', 'inbox', 'status', 'task.list', 'task.detail', 'task.cost', 'progress', 'message.list',
       'task.void', 'message.send', 'idp.client.create', 'cf.api', 'route.save']) {

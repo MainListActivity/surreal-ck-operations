@@ -8,6 +8,7 @@ import { isAbsolute, join } from 'node:path';
 import { isLaneProvider, type LaneProvider } from '../native-args.ts';
 import { WEB_CHAT_PROVIDERS } from '../native-args.ts';
 import { bodyOfDispatch } from '../../outbound-render.ts';
+import type { McpOutcome } from '../../contracts.ts';
 import { clearInflight, clearSettledInflight, inflightSession, laneDigest, readClaimDelivery, readClaimTask, readInflight, readInflightOfTask, readLaneState, recordInflight, writeLaneState, type InflightEntry, type LaneState } from './state.ts';
 import { repoInfo, type ExecFn, type RepoInfo } from './repo.ts';
 import { driveCodex } from './codex.ts';
@@ -82,6 +83,16 @@ export interface LaneDeps {
   assist?(input: {
     provider: string; phase: 'doing' | 'review'; transcriptTail: string; round: number;
   }): Promise<{ decision: 'reply' | 'escalate'; message?: string; reason?: string; toolExecuted?: string }>;
+  /**
+   * MCP-2：按下发送前对服务端 mcp_outcome 开闸（清上一轮旧结论）。成功返回 {opened:true}，
+   * 失败/超时返回 undefined——本轮不采信任何 MCP 结论，照常发送。
+   */
+  mcpRoundOpen?(): Promise<{ opened: true } | undefined>;
+  /**
+   * MCP-2：轮询时读取本租约代际的 MCP 结构化结论（task.mcp_outcome）。没有结论、租约不符或
+   * 失败返回 undefined，调用方回落原页面判定。
+   */
+  mcpOutcome?(): Promise<McpOutcome | undefined>;
 }
 
 export interface LaneInput {
@@ -186,6 +197,13 @@ export function vendorPrompt(input: LaneInput, repo: RepoInfo, material: ReturnT
     }
     if (input.provider === 'codex-cloud')
       parts.push('工作结果由本地桥接进程应用与提交；只需把改动做完整。没有可交付的代码改动时，在最终消息里说明原因。');
+  }
+  // MCP-2：devin-cloud 执行与复核轮都追加公司 MCP 收尾指引；MCP 交卷是首选，[SCK-DONE] 保留作兜底。
+  if (input.provider === 'devin-cloud') {
+    const mcpTask = readClaimTask(input.commDir);
+    if (mcpTask) {
+      parts.push(`本轮公司任务 ID 是 ${mcpTask}。若本会话可用 sck-company MCP：先用 task_context 读任务；需要只读运维信息直接 company_ops（不必再写 [OPS-REQUEST]）；${material.review ? '复核完成后用 task_review' : '改动已推送到本轮分支、PR 已开或更新之后用 task_submit'}（受阻用 task_block）交卷——这是首选收尾方式；原「[SCK-DONE]」收尾约定保留作兜底。`);
+    }
   }
   // 正文就是派工消息（老板看到、改过的那条），指向的文件内容附在后面；没有派工消息时退回到整份任务材料。
   if (material.message) { parts.push('', material.message); return parts.join('\n'); }

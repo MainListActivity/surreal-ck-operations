@@ -54,6 +54,10 @@ const core = {
   },
   accept: async (_c: string, proof: LeaseProof, ev: { text: string }) => { calls.push({ tool: 'accept', proof: snap(proof), text: ev.text }); return taskView(proof.taskId); },
   returnTask: async (_c: string, proof: LeaseProof, ev: { text: string }) => { calls.push({ tool: 'return', proof: snap(proof), text: ev.text }); return { ...taskView(proof.taskId), version: proof.expectedVersion + 1 }; },
+  mcpOutcome: async (_c: string, proof: LeaseProof, op: string) => {
+    calls.push({ tool: `mcp_${op}`, proof: snap(proof) });
+    return op === 'open' ? { opened: true } : { outcome: { kind: 'submit', text: '结构化交卷' } };
+  },
   authenticate: async () => ({ employeeId: 'eng-x', role: authRole, capabilities: ['execute'] as const }),
   companyBrief: async () => ({ ok: true }),
   listTasks: async () => [],
@@ -429,6 +433,29 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
       expect(res.ok).toBe(false);
       expect(res.error).toContain('unknown_tool');
     }
+  });
+
+  test('lane_mcp_open / lane_mcp_outcome 只在持租约时经 live 凭证路由到 core.mcpOutcome', async () => {
+    const i = inst('e-mcp');
+    const env = pool.env(i);
+    const refused = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'mcp0', 'lane_mcp_open', {});
+    expect(refused.ok).toBe(false);
+    expect(refused.error).toContain('no_lease');
+
+    const listed = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'mcp1', '__list__', {});
+    expect((listed.data as { tools: string[] }).tools).toEqual(expect.arrayContaining(['lane_mcp_open', 'lane_mcp_outcome']));
+
+    await pool.claim(i, task('task-mcp'));
+    const open = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'mcp2', 'lane_mcp_open', {});
+    expect(open).toEqual({ ok: true, data: { opened: true } });
+    const out = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'mcp3', 'lane_mcp_outcome', {});
+    expect(out.ok).toBe(true);
+    expect((out.data as { outcome: { kind: string; text: string } }).outcome.kind).toBe('submit');
+    // 两个调用都以同一活租约的 proof 转发，凭证不出插件
+    const mcpCalls = calls.filter(call => call.tool.startsWith('mcp_'));
+    expect(mcpCalls).toHaveLength(2);
+    expect(mcpCalls[0]!.proof?.taskId).toBe('task-mcp');
+    expect(JSON.stringify(out)).not.toContain('tok-e-mcp');
   });
 
     test('worktree 工具经 sidecar 路由：员工缺省绑当前任务，gm 缺省取全局，回收/审计透传 core', async () => {

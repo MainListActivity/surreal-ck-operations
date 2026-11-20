@@ -74,3 +74,5 @@
 | 公司服务全景（登记表 + 最近一次实机核对；host 过滤只看该主机） | `sck owner landscape.get '{"host":"vps-data"}'` |
 | 公司 MCP 主体登记清单（仅老板） | `sck owner mcp.principal.list '{}'` |
 | 登记或更新一个 MCP 主体（仅老板；providers 为允许的员工 provider 列表，enabled=false 即停用） | `sck owner mcp.principal.set '{"sub":"devin-cloud-user","providers":["devin-cloud"],"label":"Devin Cloud","enabled":true}'` |
+| 近 7 天「令牌有效但主体未登记/已停用」的 MCP 尝试（仅老板；按 sub 聚合，最多 20 条） | `sck owner mcp.principal.pending '{}'` |
+| 设置某任务的 company_ops 次数预算覆盖（仅老板；工具名限白名单，值 0..20 整数，空对象清除） | `sck owner mcp.budget.set '{"taskId":"task-1","budget":{"ops_origin_status":5}}'` |
