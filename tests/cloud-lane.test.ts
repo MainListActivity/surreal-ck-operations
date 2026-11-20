@@ -3960,6 +3960,98 @@ describe('devin-cloud 的 MCP 收尾通道（MCP-2）', () => {
     expect(out.text).not.toContain('不应被采信');
   });
 
+  test('MCP block 受阻落 awaitingOwner；老板 reply 新投递开新一轮发跟进、不重采旧结论（6f05139e MCP 回归）', async () => {
+    // 第一轮 MCP task_block 收尾：受阻，devin 状态与在途登记都带 awaitingOwner。
+    const first = world({ extra: gitOk2 });
+    const out1 = await runLane(first.input({ provider: 'devin-cloud', env: { SCK_DELIVERY_ID: 'mcp-lease-old' } }), { ...first.deps,
+      browse: browseOf({ send: [{ ok: true, url: SESSION2 }], session: [working()] }) as NonNullable<LaneDeps['browse']>,
+      mcpRoundOpen: async () => ({ opened: true }),
+      mcpOutcome: async (): Promise<McpOutcome> => ({ kind: 'block', text: '供应商测试环境不可用' }),
+    });
+    expect(out1.status).toBe('success');
+    expect(out1.text.split('\n')[0]).toBe('工作结果：受阻');
+    expect(readLaneState(first.commDir)?.devin?.awaitingOwner).toBe(true);
+    const prior = readInflight(first.stateRoot, 'devin-cloud', 'mcp-lease-old');
+    expect(prior?.awaitingOwner).toBe(true);
+    const priorMarker = readLaneState(first.commDir)?.devin?.mcpOpen;
+    expect(priorMarker).toMatch(/^SCK-/);
+
+    // 老板 reply 产生新投递：awaitingOwner 旧登记不被采纳——跟进发进同一会话、新标记、
+    // mcpRoundOpen 重新开闸（清掉服务端旧结论）后才采信本轮 submit。
+    const second = world({ extra: gitOk2 });
+    const calls: string[] = [];
+    let opened = 0;
+    const out2 = await runLane(second.input({ provider: 'devin-cloud', stateRoot: first.stateRoot,
+      env: { SCK_DELIVERY_ID: 'mcp-lease-new' }, prompt: '老板答复：测试环境已恢复，继续。' }), { ...second.deps,
+      browse: (async (script: string) => {
+        calls.push(script);
+        return browseOf({ send: [{ ok: true, url: SESSION2 }], session: [working()] })(script);
+      }) as NonNullable<LaneDeps['browse']>,
+      mcpRoundOpen: async () => { opened++; return { opened: true }; },
+      mcpOutcome: async (): Promise<McpOutcome> => {
+        // 开闸前服务端仍是旧 block 结论：若旧标记被采纳，第一轮轮询就会采信它（即缺陷行为）。
+        if (opened === 0) return { kind: 'block', text: '旧结论：供应商测试环境不可用' };
+        return { kind: 'submit', text: '本轮修复完成', pr: 'https://github.com/acme/widget/pull/10', sha: 'cafecafe' };
+      },
+    });
+    expect(out2.status).toBe('success');
+    expect(out2.text).toContain('本轮修复完成');
+    expect(out2.text).not.toContain('旧结论');
+    expect(opened).toBe(1);
+    // 一轮跟进发进同一会话（不重开会话），正文含老板答复与新一轮标记（非旧标记）。
+    const follows = calls.filter(s => s.includes(MODE2('follow')));
+    expect(follows).toHaveLength(1);
+    expect(follows[0]).toContain(SESSION2);
+    expect(follows[0]).toContain('测试环境已恢复');
+    expect(follows[0]).toMatch(/SCK-[a-f0-9]+/);
+    expect(follows[0]).not.toContain(priorMarker!);
+    expect(calls.filter(s => s.includes(MODE2('send')))).toHaveLength(0);
+    expect(readLaneState(second.commDir)?.devin?.mcpOpen).not.toBe(priorMarker);
+  });
+
+  test('MCP block 受阻后同投递恢复：接回在途轮次、零发送（回归）', async () => {
+    const w = world({ extra: gitOk2 });
+    const out1 = await runLane(w.input({ provider: 'devin-cloud', env: { SCK_DELIVERY_ID: 'mcp-resume' } }), { ...w.deps,
+      browse: browseOf({ send: [{ ok: true, url: SESSION2 }], session: [working()] }) as NonNullable<LaneDeps['browse']>,
+      mcpRoundOpen: async () => ({ opened: true }),
+      mcpOutcome: async (): Promise<McpOutcome> => ({ kind: 'block', text: '供应商测试环境不可用' }),
+    });
+    expect(out1.text.split('\n')[0]).toBe('工作结果：受阻');
+
+    // 同一投递键、同一员工目录的恢复（执行端重启）：在途登记连同目录里的 mcpOpen 一起接回，
+    // 继续轮询旧锚点，不发任何 send/follow。
+    const calls: string[] = [];
+    const out2 = await runLane(w.input({ provider: 'devin-cloud',
+      env: { SCK_DELIVERY_ID: 'mcp-resume' } }), { ...w.deps,
+      browse: (async (script: string) => {
+        calls.push(script);
+        return browseOf({ session: [working()] })(script);
+      }) as NonNullable<LaneDeps['browse']>,
+      mcpRoundOpen: async () => { throw new Error('不应再开闸'); },
+      mcpOutcome: async (): Promise<McpOutcome> => ({ kind: 'block', text: '供应商测试环境不可用' }),
+    });
+    expect(out2.text.split('\n')[0]).toBe('工作结果：受阻');
+    expect(calls.filter(s => s.includes(MODE2('send')) || s.includes(MODE2('follow')))).toHaveLength(0);
+  });
+
+  test('MCP submit 经 closeout 返回 blocked → 同样落 awaitingOwner', async () => {
+    // 执行轮 submit 无 PR：closeout 拉远端、找不到 PR → blocked；也要按「等老板答复」落盘。
+    const w = world({ extra: call => {
+      const routed = gitOk2(call);
+      if (routed) return routed;
+      if (call.cmd === 'gh' && call.args[0] === 'pr') return ok('[]');
+      return undefined;
+    } });
+    const out = await runLane(w.input({ provider: 'devin-cloud', env: { SCK_DELIVERY_ID: 'mcp-submit-block' } }), { ...w.deps,
+      browse: browseOf({ send: [{ ok: true, url: SESSION2 }], session: [working()] }) as NonNullable<LaneDeps['browse']>,
+      mcpRoundOpen: async () => ({ opened: true }),
+      mcpOutcome: async (): Promise<McpOutcome> => ({ kind: 'submit', text: '实现完成但没有 PR 行' }),
+    });
+    expect(out.text.split('\n')[0]).toBe('工作结果：受阻');
+    expect(readLaneState(w.commDir)?.devin?.awaitingOwner).toBe(true);
+    expect(readInflight(w.stateRoot, 'devin-cloud', 'mcp-submit-block')?.awaitingOwner).toBe(true);
+  });
+
   test('残留 mcpOpen + 本轮 open 失败：MCP 结论不采信且残留标记被清除', async () => {
     const w = world({ extra: gitOk2 });
     // 上一轮留下的开闸标记：本轮新发送若开闸失败，它绝不能继续生效。
