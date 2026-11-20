@@ -12,5 +12,5 @@
     "沿用 schema 074，无迁移。"
   ],
   "migration": "无 schema 变化（沿用 schema 074），升级 owner-backend、原生节点与插件即可。",
-  "rollback": "回退至 0.13.74；原生执行端员工退回 sck call 路径。"
+  "rollback": "回退至 0.13.75；原生执行端员工退回 sck call 路径。"
 }

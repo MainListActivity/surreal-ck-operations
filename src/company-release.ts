@@ -156,6 +156,8 @@ export const RELEASE_SCHEMA_REQUIREMENTS: ReleaseSchemaRequirement[] = [
   { version: '0.13.73', schema: 74, tables: ['task', 'outbound_message', 'route', 'runner_heartbeat', 'company_meta', 'dispatch_attempt', 'dispatch_recovery_approval', 'dispatch_recovery_receipt', 'agent_activity', 'reply_translation', 'turn_analysis', 'planned_message', 'owner_style_memory', 'fault_recovery_grant'] },
   // 本机公司工具与 Devin 只读收尾不新增表；沿用 schema 074。
   { version: '0.13.74', schema: 74, tables: ['task', 'outbound_message', 'route', 'runner_heartbeat', 'company_meta', 'dispatch_attempt', 'dispatch_recovery_approval', 'dispatch_recovery_receipt', 'agent_activity', 'reply_translation', 'turn_analysis', 'planned_message', 'owner_style_memory', 'fault_recovery_grant'] },
+  // 只读工程任务派工草稿文案修复，不新增表；沿用 schema 074。
+  { version: '0.13.75', schema: 74, tables: ['task', 'outbound_message', 'route', 'runner_heartbeat', 'company_meta', 'dispatch_attempt', 'dispatch_recovery_approval', 'dispatch_recovery_receipt', 'agent_activity', 'reply_translation', 'turn_analysis', 'planned_message', 'owner_style_memory', 'fault_recovery_grant'] },
   // 原生执行端公司工具注入不新增表；沿用 schema 074。
   { version: '0.13.76', schema: 74, tables: ['task', 'outbound_message', 'route', 'runner_heartbeat', 'company_meta', 'dispatch_attempt', 'dispatch_recovery_approval', 'dispatch_recovery_receipt', 'agent_activity', 'reply_translation', 'turn_analysis', 'planned_message', 'owner_style_memory', 'fault_recovery_grant'] },
 ];
