@@ -1,5 +1,4 @@
 import { execFile } from 'node:child_process';
-import { readFile as readTextFile } from 'node:fs/promises';
 import { DAILY_CRON, MINUTE_CRON, runScheduled } from './cron.ts';
 import { sessionsOf } from './db.ts';
 import { readConfig, type Env } from './env.ts';
@@ -19,7 +18,7 @@ const hostExec: ExecFn = (command, args) => new Promise((resolve, reject) => {
 export async function runServerCron(cron: string, env: Env, run: typeof runScheduled = runScheduled): Promise<unknown> {
   if (cron !== MINUTE_CRON && cron !== DAILY_CRON) throw Error('仅支持已配置的分钟和每日 cron');
   const config = readConfig(env);
-  return run(config, sessionsOf(config), cron, { exec: hostExec, readFile: (path) => readTextFile(path, 'utf8') });
+  return run(config, sessionsOf(config), cron, { exec: hostExec, fetch });
 }
 
 if (import.meta.main) {

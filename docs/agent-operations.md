@@ -324,7 +324,7 @@ pnpm run admin remote-grant list [--task <taskId>]
 
 ### 核对与通知
 
-- VPS：`sck-owner-minute` 分钟任务里做只读采集（`systemctl list-units`、`ss -ltnH`、`/etc/caddy/Caddyfile` 摘要），距上次观测不足 60 分钟跳过；实现见 `owner-end/src/landscape-observe.ts`。
+- VPS：`sck-owner-minute` 分钟任务里做只读采集（`systemctl list-units`、`ss -ltnH`、Caddy 管理接口 `127.0.0.1:2019` 路由摘要），距上次观测不足 60 分钟跳过；实现见 `owner-end/src/landscape-observe.ts`。
 - Mac：插件派工循环每 60 分钟采集一次（`launchctl list` 的 `org.surrealck.*` + `~/Library/LaunchAgents` 已安装 plist + 插件自身 `sck-company`），见 `src/landscape-mac.ts`。
 - 观测写 `company_meta:⟨landscape_observed:<hostId>⟩`（含 drift）；三类差异（未登记在跑、登记缺失、应退役仍在）任一非空发老板提示 `landscape-drift:<hostId>`，一致时关闭；采集失败（unknown）只留观测不发提示。
 

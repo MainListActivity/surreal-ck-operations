@@ -25,7 +25,7 @@ import { ensureEmployeeIdentity } from './idp-commands.ts';
 import { translateChecked, translationFresh } from './messages.ts';
 import { rewriteNotesWith } from './translate.ts';
 import { keyOf, type Row } from './rows.ts';
-import { runVpsLandscapeCheck, type ExecFn, type ReadFileFn } from './landscape-observe.ts';
+import { runVpsLandscapeCheck, type ExecFn } from './landscape-observe.ts';
 
 /** 每分钟一次：身份同步与补译。 */
 export const MINUTE_CRON = '* * * * *';
@@ -49,9 +49,8 @@ export interface TranslationSync {
 export interface CronOptions {
   fetch?: typeof fetch;
   now?: Date;
-  /** 实机核对用的本机命令执行与读文件（VPS 的 systemd 任务注入；Worker 等无本机宿主环境不注入）。 */
+  /** 实机核对用的本机命令执行（VPS 的 systemd 任务注入；Worker 等无本机宿主环境不注入）。 */
   exec?: ExecFn;
-  readFile?: ReadFileFn;
 }
 
 const reasonOf = (error: unknown): string => error instanceof CompanyError ? error.message : '服务暂时出错';
@@ -184,8 +183,8 @@ export async function runScheduled(cfg: Config, sessions: Sessions, cron: string
     // 完工分析排在最后：补译和规划先用这一分钟，分析每轮最多两条，只记录不改消息。
     const analyses = cfg.magpie ? await analyzeTurns(db, analyzeTurnWith(cfg.magpie, options.fetch, cfg.analysisModel), now.getTime()).catch(() => ({ failed: true })) : { skipped: 'not_configured' };
     // 公司服务全景核对（VPS 实机）：只读采集，60 分钟一轮；没有本机宿主（Worker）或出错都不影响上面的分钟任务。
-    const landscape = options.exec && options.readFile
-      ? await runVpsLandscapeCheck(db, { exec: options.exec, readFile: options.readFile, now })
+    const landscape = options.exec && options.fetch
+      ? await runVpsLandscapeCheck(db, { exec: options.exec, fetch: options.fetch, now })
         .catch((error) => {
           console.error('owner-end landscape check failed', reasonOf(error));
           return { failed: true };
