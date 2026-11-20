@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
-import { DEFAULT_CONFIG, type EmployeeInst, type EmployeeDef, type ProviderHealth, type SupervisedTask, type Workforce } from '../src/workforce.ts';
+import { DEFAULT_CONFIG, buildSessionHandoff, type EmployeeInst, type EmployeeDef, type ProviderHealth, type SupervisedTask, type Workforce } from '../src/workforce.ts';
 import type { CompanyCore, ProviderQuota, TaskView, LeaseProof, WriteScopeHolder } from '../src/contracts.ts';
 import { overlap } from '../src/dispatcher/worktree-registry.ts';
 import type { OwnerDesk } from '../src/owner.ts';
@@ -35,18 +35,20 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
   // Two seats: an independent reviewer other than the implementer needs a second engineer, so the fixture keeps a spare seat (R1).
   const def: EmployeeDef = { id: 'test', role, provider: 'codex', model: 'fixture', enabled: true, maxInstances: 2, priority: 0, weight: 1, errorStreak: 0 };
   let next = 0, request = 0, now = 1000;
-  const addTask = (id: string, opts: { state?: TaskView['state']; submittedBy?: string; worktreePath?: string; discipline?: string; assets?: string[] } = {}) => {
+  const addTask = (id: string, opts: { state?: TaskView['state']; submittedBy?: string; worktreePath?: string; discipline?: string; assets?: string[]; projectId?: string; repoPath?: string; acceptanceText?: string; context?: string; checkpoints?: string[] } = {}) => {
     if (opts.assets) assetPaths.set(id, opts.assets);
-    const v: TaskView = { id, title: id, context: '', state: opts.state ?? 'ready', executorRole: 'engineering', reviewerRole: 'engineering',
-      kind: 'task', version: 1, fence: 0, submittedBy: opts.submittedBy, discipline: opts.discipline };
+    const v: TaskView = { id, title: id, context: opts.context ?? '', state: opts.state ?? 'ready', executorRole: 'engineering', reviewerRole: 'engineering',
+      kind: 'task', version: 1, fence: 0, submittedBy: opts.submittedBy, discipline: opts.discipline, acceptanceText: opts.acceptanceText };
+    if (opts.checkpoints) (v as TaskView & { checkpoints?: string[] }).checkpoints = opts.checkpoints;
     if (opts.worktreePath) {
       wtPaths.set(id, opts.worktreePath);
       v.worktree = { id: `wt-${id}`, repo: '/repo', worktreePath: opts.worktreePath, mode: 'exclusive', intent: { kind: 'code' }, discipline: '' };
     }
-    views.set(id, v); rows.push({ ...v, row: {}, repoPath: opts.worktreePath ? '/repo' : undefined } as unknown as SupervisedTask); };
+    views.set(id, v); rows.push({ ...v, row: {}, repoPath: opts.repoPath ?? (opts.worktreePath ? '/repo' : undefined), projectId: opts.projectId ?? 'project-ck' } as unknown as SupervisedTask); };
   /** Per-test config overrides; the breaker floors stay 0 unless a test asks for them. */
   let cfgOverride: Partial<typeof DEFAULT_CONFIG> = {};
   const attempts = new Map<string, { id: string; employee: string; task?: string; kind: string; agent?: string; message?: string; activationRequired?: boolean; activation_state?: string; binding?: { cwd: string; repoHome?: string; workspaceScope?: string; model?: string } }>();
+  const handoffs = new Map<string, { employee: string; text: string; bytes: number; task: string; project: string; domain: string; role: string; repo: string; key: string; consumed?: boolean }>();
   const wf = {
     pendingDispatchAttempts: async () => [...attempts.values()],
     recoverDispatchBindings: async () => [] as string[],
@@ -82,7 +84,39 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
       return health.get(provider)!; },
     markHealthy: async (provider: string) => { events.push(`healthy:${provider}`); health = new Map(health).set(provider, { provider, state: 'healthy', failures: 0 }); },
     defFailure: async () => { events.push('performance-failure'); return 1; },
-    spawnInst: async (_def: EmployeeDef, _repoHome?: string, _scope?: string, sessionTask?: string) => { const i: EmployeeInst = { id: `employee-${++next}`, def: def.id, role: def.role, provider: def.provider, model: def.model, credential: `fixture-${next}`, sessionTask }; instances.push(i); return i; },
+    spawnInst: async (_def: EmployeeDef, repoHome?: string, scope?: string, sessionTask?: string,
+      binding?: { domain?: string; project?: string }) => {
+      const i: EmployeeInst = { id: `employee-${++next}`, def: def.id, role: def.role, provider: def.provider, model: def.model,
+        credential: `fixture-${next}`, sessionTask, sessionDomain: binding?.domain, sessionProject: binding?.project,
+        ...(scope ? { workspaceScope: scope } : {}), ...(repoHome ? { repoHome } : {}) };
+      instances.push(i); return i;
+    },
+    recordSessionBinding: async (id: string, input: { task: string; domain?: string; project?: string }) => {
+      Object.assign(instances.find(i => i.id === id)!, { sessionTask: input.task, sessionDomain: input.domain, sessionProject: input.project });
+    },
+    storeSessionHandoff: async (inst: EmployeeInst, input: { project?: string; domain?: string; role: string; repo: string; reason: string }) => {
+      const taskId = inst.sessionTask ?? inst.lastTask;
+      const view = taskId ? views.get(taskId) : undefined;
+      if (!taskId || !view || !input.project || !input.domain) return undefined;
+      const text = buildSessionHandoff({ taskId, title: view.title, state: view.state, discipline: input.domain, project: input.project,
+        role: input.role, submission: view.context, acceptance: view.acceptanceText, checkpoints: (view as { checkpoints?: string[] }).checkpoints ?? [] });
+      const key = `handoff-${taskId}-${input.project}-${input.domain}`;
+      handoffs.set(key, { employee: inst.id, text, bytes: Buffer.byteLength(text), task: taskId, project: input.project,
+        domain: input.domain, role: input.role, repo: input.repo, key });
+      events.push(`handoff:${inst.id}:${taskId}`);
+      return { key, bytes: Buffer.byteLength(text) };
+    },
+    pendingSessionHandoff: async (input: { project?: string; domain?: string; role: string; repo: string }) => {
+      if (!input.project || !input.domain) return undefined;
+      const matches = [...handoffs.values()].filter(h => !h.consumed && retired.has(h.employee) && h.project === input.project
+        && h.domain === input.domain && h.role === input.role && h.repo === input.repo);
+      return matches.at(-1);
+    },
+    consumeSessionHandoff: async (employee: string, key: string) => {
+      const row = handoffs.get(key);
+      if (row?.employee === employee) row.consumed = true;
+      events.push(`handoff-consumed:${key}`);
+    },
     bind: async (id: string, b: { agentId: string; cwd: string; repoHome?: string }) => {
       const { agentId, ...rest } = b;
       Object.assign(instances.find(i => i.id === id)!, { paseoAgentId: agentId, ...rest });
@@ -121,10 +155,11 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
       if (refusal) { events.push(`claim-denied:${i.id}:${id}`); throw Object.assign(new Error(`refused: ${refusal}`), { code: refusal }); }
       events.push(`claim:${i.id}:${id}`); const v = views.get(id)!; Object.assign(v, { state: v.state === 'review' ? 'review' : 'doing', currentEmployee: i.id, version: v.version + 1, fence: v.fence + 1 }); v.deliveryId = `d-${id}-${v.fence}`;
       Object.assign(rows.find(t => t.id === id)!, v, { leaseExpiresAt: 2000 }); rows.find(t => t.id === id)!.row.delivery_id = v.deliveryId; i.activeTask = id;
+      i.lastTask = id; i.lastPhase = v.state === 'review' ? 'review' : 'execute';
       return { task: { ...v }, deliveryId: v.deliveryId, fence: v.fence, leaseExpiresAt: new Date().toISOString(), history: [], worktree: v.worktree }; },
     getTask: async (_c: string, id: string) => ({ ...views.get(id)! }), history: async () => [], authenticate: async () => ({ employeeId: 'fixture', role: 'owner' }),
     companyBrief: async () => ({}), listTasks: async () => [], relayDirection: async () => { events.push('management'); }, heartbeat: async (_c: string, p: LeaseProof) => ({ task: check(p) }),
-    submit: async (_c: string, p: LeaseProof) => { const v = check(p); events.push(`submit:${p.taskId}`); v.state = 'done'; v.currentEmployee = undefined; Object.assign(rows.find(t => t.id === v.id)!, v); return v; },
+    submit: async (_c: string, p: LeaseProof) => { const v = check(p); events.push(`submit:${p.taskId}`); const holder = v.currentEmployee; v.state = 'done'; v.currentEmployee = undefined; Object.assign(rows.find(t => t.id === v.id)!, v); const i = instances.find(x => x.id === holder); if (i) i.activeTask = undefined; return v; },
     block: async (_c: string, p: LeaseProof) => { check(p); events.push(`block:${p.taskId}`); return views.get(p.taskId)!; },
     accept: async (_c: string, p: LeaseProof) => { const v = check(p); events.push(`review:${p.taskId}`); return v; },
     // Channel rollback: lease dropped with no reviewer verdict — review stays review, doing goes ready.
@@ -202,7 +237,7 @@ export function world(role: EmployeeDef['role'] = 'engineering') {
     const r = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(dir), name)); if (!r) throw new Error('relay timeout'); return r;
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
-  return { wf, messages, attempts, addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, logs, views, relay, denied, held, scopeUnreadable, sentBodies, spawnBodies, waiting, analysing, aligned,
+  return { wf, messages, attempts, addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, logs, views, relay, denied, held, scopeUnreadable, sentBodies, spawnBodies, waiting, analysing, aligned, handoffs,
     holdAssets: (paths: string[], holder: WriteScopeHolder) => { assetHolds.push({ paths, holder }); }, freeAssets: () => { assetHolds.splice(0); },
     authorsOf, unreadable, paseo, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
@@ -607,7 +642,181 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     expect(await run('oneshot')).toEqual({ spawned: true });
     expect(await run('reuse')).toEqual({ spawned: true });
   });
-  test('a per-role wake limit rotates that role sooner and leaves the global limit for the rest', async () => {
+  describe('explicit domain reuse', () => {
+  /** Submits the held task through the session's own channel, then leaves that session idle and off the queue. */
+  const finish = async (w: ReturnType<typeof world>, id: string) => {
+    const holder = w.views.get(id)!.currentEmployee!;
+    const inst = w.instances.find(i => i.id === holder)!;
+    const env = w.envs.get(inst.paseoAgentId!)!;
+    const submitted = await w.relay(env, 'submit', { text: `提交 ${id}` });
+    expect(submitted.ok).toBe(true);
+    w.agents.get(inst.paseoAgentId!)!.status = 'idle';
+    const at = w.rows.findIndex(task => task.id === id);
+    if (at >= 0) w.rows.splice(at, 1);
+    return inst;
+  };
+  const rich = (prefix: string) => ({ context: `## 上一轮提交\n${prefix}：${'实现与验证记录。'.repeat(160)}`,
+    acceptanceText: `验收要求：${'逐条核对并留下证据。'.repeat(80)}`,
+    checkpoints: Array.from({ length: 6 }, (_, i) => `检查点 ${i + 1}：${'完成一段可验证的工作。'.repeat(12)}`) });
+
+  test('a finished same-project same-domain session takes the next engineering task without a new seat', async () => {
+    const w = world();
+    w.addTask('domain-a', { discipline: 'backend', projectId: 'proj-ck', worktreePath: '/repo-a' });
+    await w.dispatcher().tick();
+    const first = w.instances[0]!;
+    const finished = await finish(w, 'domain-a');
+    expect(finished.id).toBe(first.id);
+    w.addTask('domain-b', { discipline: 'backend', projectId: 'proj-ck', worktreePath: '/repo-b' });
+    const report = await w.dispatcher().tick();
+    expect(w.instances).toHaveLength(1);
+    expect(report.woke.find(entry => entry.task === 'domain-b')).toMatchObject({ employee: first.id, spawned: false });
+    expect(w.events).toContain(`claim:${first.id}:domain-b`);
+    expect(w.events).toContain(`send:${first.paseoAgentId}`);
+    // 复用只改任务归属；本轮领取重新分配工作树，旧任务仍是已完成状态。
+    expect(w.views.get('domain-a')!.state).toBe('done');
+    expect(w.views.get('domain-b')!.currentEmployee).toBe(first.id);
+    expect(w.instances[0]!.sessionTask).toBe('domain-b');
+    expect(w.events.some(event => event.startsWith('handoff:'))).toBe(false);
+  });
+
+  test('oneshot still honors an explicit same-domain continuation, and blank domains still rotate', async () => {
+    const w = world();
+    w.setConfig({ sessionPolicy: 'oneshot' });
+    w.addTask('domain-a', { discipline: 'backend', projectId: 'proj-ck', worktreePath: '/repo-a' });
+    await w.dispatcher().tick();
+    const first = w.instances[0]!;
+    await finish(w, 'domain-a');
+    w.addTask('domain-b', { discipline: 'backend', projectId: 'proj-ck', worktreePath: '/repo-b' });
+    const report = await w.dispatcher().tick();
+    expect(report.retired).not.toContain(first.id);
+    expect(report.woke.find(entry => entry.task === 'domain-b')).toMatchObject({ employee: first.id, spawned: false });
+    expect(w.events).toContain(`claim:${first.id}:domain-b`);
+  });
+
+  test('a different domain or an incompatible repository never reuses the session', async () => {
+    for (const other of [{ discipline: 'frontend' }, { discipline: 'backend', repoPath: '/other-repo' }]) {
+      const w = world();
+      w.addTask('domain-a', { discipline: 'backend', projectId: 'proj-ck', worktreePath: '/repo-a' });
+      await w.dispatcher().tick();
+      const first = w.instances[0]!;
+      await finish(w, 'domain-a');
+      w.addTask('domain-b', { projectId: 'proj-ck', worktreePath: '/repo-b', ...other });
+      const report = await w.dispatcher().tick();
+      expect(report.woke.find(entry => entry.task === 'domain-b')?.spawned).toBe(true);
+      expect(w.instances).toHaveLength(2);
+      expect(w.events).not.toContain(`claim:${first.id}:domain-b`);
+    }
+  });
+
+  test('blank-domain tasks keep the old policy and never cross tasks', async () => {
+    const w = world();
+    w.addTask('blank-a', { worktreePath: '/repo-a' });
+    await w.dispatcher().tick();
+    const first = w.instances[0]!;
+    await finish(w, 'blank-a');
+    w.addTask('blank-b', { worktreePath: '/repo-b' });
+    const report = await w.dispatcher().tick();
+    expect(report.woke.find(entry => entry.task === 'blank-b')?.spawned).toBe(true);
+    expect(w.instances).toHaveLength(2);
+    expect(w.events).not.toContain(`claim:${first.id}:blank-b`);
+  });
+
+  test('review stays independent: the submitter\'s domain session never takes the review', async () => {
+    const w = world();
+    w.addTask('domain-a', { discipline: 'backend', projectId: 'proj-ck', worktreePath: '/repo-a' });
+    await w.dispatcher().tick();
+    const author = w.instances[0]!;
+    // 复核卡直接落在同一执行人提交的成果上：即使同项目同域，也不得由该会话签署。
+    w.addTask('domain-review', { discipline: 'backend', projectId: 'proj-ck', state: 'review', submittedBy: author.id, worktreePath: '/repo-r' });
+    const report = await w.dispatcher().tick();
+    const reviewer = w.instances.find(inst => inst.id !== author.id)!;
+    expect(reviewer).toBeDefined();
+    expect(report.woke.find(entry => entry.task === 'domain-review')).toMatchObject({ employee: reviewer.id, spawned: true });
+    expect(w.events).not.toContain(`claim:${author.id}:domain-review`);
+    expect(w.events).toContain(`claim:${reviewer.id}:domain-review`);
+  });
+
+  test('reaching the input watermark builds a 2–4KB handoff and rotates before the next task', async () => {
+    const w = world();
+    w.addTask('domain-a', { discipline: 'backend', projectId: 'proj-ck', worktreePath: '/repo-a', ...rich('A') });
+    await w.dispatcher().tick();
+    const first = w.instances[0]!;
+    await finish(w, 'domain-a');
+    w.paseo.lastInputTokens = async () => 150_000;
+    w.addTask('domain-b', { discipline: 'backend', projectId: 'proj-ck', worktreePath: '/repo-b' });
+    const report = await w.dispatcher().tick();
+    expect(report.retired).toContain(first.id);
+    expect(report.woke.find(entry => entry.task === 'domain-b')?.spawned).toBe(true);
+    expect(w.events).not.toContain(`claim:${first.id}:domain-b`);
+    const handoff = [...w.handoffs.values()].at(-1)!;
+    expect(handoff.project).toBe('proj-ck');
+    expect(handoff.domain).toBe('backend');
+    expect(handoff.bytes).toBeGreaterThanOrEqual(2048);
+    expect(handoff.bytes).toBeLessThanOrEqual(4096);
+    const body = w.spawnBodies.at(-1)!;
+    expect(body).toContain('【交班材料·上一会话轮换前交接】');
+    expect(body).toContain('验收要求（原文节选）');
+    expect(body).toContain('不得沿用上一会话的任何权限、凭据或复核签署权');
+    expect(w.events.some(event => event.startsWith('handoff-consumed:'))).toBe(true);
+    expect(handoff.consumed).toBe(true);
+  });
+
+  test('missing usage takes the conservative path: handoff, then a fresh session', async () => {
+    const w = world();
+    w.addTask('domain-a', { discipline: 'backend', projectId: 'proj-ck', worktreePath: '/repo-a', ...rich('A') });
+    await w.dispatcher().tick();
+    const first = w.instances[0]!;
+    await finish(w, 'domain-a');
+    w.paseo.lastInputTokens = async () => undefined;
+    w.addTask('domain-b', { discipline: 'backend', projectId: 'proj-ck', worktreePath: '/repo-b' });
+    const report = await w.dispatcher().tick();
+    expect(report.retired).toContain(first.id);
+    expect(report.woke.find(entry => entry.task === 'domain-b')?.spawned).toBe(true);
+    expect(w.logs.some(line => line.includes('用量未知'))).toBe(true);
+    expect(w.spawnBodies.at(-1)).toContain('【交班材料');
+  });
+
+  test('a handoff left by rotation survives a dispatcher restart and reaches the next same-domain seat', async () => {
+    const w = world();
+    w.addTask('domain-a', { discipline: 'backend', projectId: 'proj-ck', worktreePath: '/repo-a', ...rich('A') });
+    await w.dispatcher().tick();
+    const first = w.instances[0]!;
+    await finish(w, 'domain-a');
+    w.paseo.lastInputTokens = async () => 160_000;
+    // 没有待派任务时也按水位轮换：材料先落库，派工稍后发生。
+    expect((await w.dispatcher().tick()).retired).toContain(first.id);
+    expect(w.handoffs.size).toBe(1);
+    // 进程重启后，未消费的交班材料仍可被同域新会话取走。
+    await w.restart();
+    w.addTask('domain-b', { discipline: 'backend', projectId: 'proj-ck', worktreePath: '/repo-b' });
+    const report = await w.dispatcher().tick();
+    expect(report.woke.find(entry => entry.task === 'domain-b')?.spawned).toBe(true);
+    expect(w.spawnBodies.at(-1)).toContain('【交班材料');
+    expect([...w.handoffs.values()].every(row => row.consumed)).toBe(true);
+  });
+
+  test('the reused session cannot carry the old lease: predated channel requests are refused', async () => {
+    const w = world();
+    w.addTask('domain-a', { discipline: 'backend', projectId: 'proj-ck', worktreePath: '/repo-a' });
+    await w.dispatcher().tick();
+    const first = w.instances[0]!;
+    const env = w.envs.get(first.paseoAgentId!)!;
+    await finish(w, 'domain-a');
+    // 旧租约下写的请求留在通道里；新领取必须先让它失效。
+    writeFileSync(join(reqDir(env.SCK_COMM_DIR!), 'old-lease.json'), JSON.stringify({ key: env.SCK_COMM_KEY, tool: 'submit', args: { text: '旧租约' } }));
+    w.addTask('domain-b', { discipline: 'backend', projectId: 'proj-ck', worktreePath: '/repo-b' });
+    await w.dispatcher().tick();
+    for (let n = 0; n < 100 && !existsSync(join(resDir(env.SCK_COMM_DIR!), 'old-lease.json')); n++) await Bun.sleep(5);
+    const answer = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(env.SCK_COMM_DIR!), 'old-lease.json'))!;
+    expect(answer.ok).not.toBe(true);
+    expect(answer.error).toContain('no_lease');
+    expect(w.events.filter(event => event === 'submit:domain-a')).toHaveLength(1);
+    expect(w.views.get('domain-a')!.state).toBe('done');
+    expect(w.views.get('domain-b')!.currentEmployee).toBe(first.id);
+  });
+});
+
+test('a per-role wake limit rotates that role sooner and leaves the global limit for the rest', async () => {
     const w = world();
     const inst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: 'fixture-9', wakeCount: 4 } as EmployeeInst;
     w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(inst.id, 'agent-9'); inst.paseoAgentId = 'agent-9';

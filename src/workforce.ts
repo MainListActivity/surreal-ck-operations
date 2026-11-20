@@ -15,6 +15,7 @@ import { asId, CompanyError, HASH, id, ROLES, view, type TaskRow } from './core.
 import { LocalEnrollmentAdmin, revokedCredentialDigest } from './enrollment.ts';
 import { gateCredentialChange } from './retirement.ts';
 import { acceptanceSubject, evaluateAcceptance, loadAcceptanceEvidence, loadAcceptanceGate, type AcceptanceTaskRow } from './acceptance.ts';
+import { redactText } from './ops/redact.ts';
 /**
  * Root-level workforce and lease supervision for the local dispatcher and admin CLI.
  * Never hand this object to the employee-facing sidecar tools.
@@ -88,6 +89,12 @@ export interface EmployeeInst {
    * is attributed to it: a session for another task is never reused, and a session without one is never reused.
    */
   sessionTask?: string;
+  /**
+   * 显式领域复用：这个会话当前工作的领域（任务 discipline）与项目。两者都非空、且与本轮任务完全相同时，
+   * 已结束上一任务的空闲会话可以被连续的同域工程任务复用；空白域沿用原策略（不跨任务复用）。
+   */
+  sessionDomain?: string;
+  sessionProject?: string;
 }
 
 export interface SessionTaskFacts { states: Map<string, string> }
@@ -136,6 +143,10 @@ export interface CompanyConfig {
   sessionMaxWakesByRole: Record<string, number>;
   /** 实例上一轮 input token 超过该值（千）即退休换新会话；0 = 不按上下文大小轮换。 */
   sessionMaxInputK: number;
+  /** 显式领域复用：连续同项目、同域、兼容能力的工程任务可复用已结束上一任务的空闲会话；空白域沿用 sessionPolicy。 */
+  sessionDomainReuse: boolean;
+  /** 领域复用的输入水位（千 token）：达到即生成 2–4KB 交班材料后换新会话；0 = 不按水位轮换（用量未知仍按保守路径换新）。 */
+  sessionDomainInputWatermarkK: number;
   /** oneshot：新任务开新会话，任务结束回收会话；reuse：复用空闲会话。切回 reuse 即回滚。 */
   sessionPolicy: 'reuse' | 'oneshot';
   /** 连续观测为空闲的会话在此分钟数后回收；0 = 关闭。 */
@@ -179,7 +190,7 @@ export const DEFAULT_CONFIG: CompanyConfig = {
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   jevNotifyTriage: true,
 
-  quotaFloorPct: 8, quotaWeeklyFloorPct: 6, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxWakesByRole: {}, sessionMaxInputK: 200, sessionPolicy: 'reuse', sessionIdleMinutes: 120, ownerBriefHour: 9, blockLoopLimit: 5,
+  quotaFloorPct: 8, quotaWeeklyFloorPct: 6, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxWakesByRole: {}, sessionMaxInputK: 200, sessionDomainReuse: true, sessionDomainInputWatermarkK: 120, sessionPolicy: 'reuse', sessionIdleMinutes: 120, ownerBriefHour: 9, blockLoopLimit: 5,
   minFreeMemMb: 2048, minFreeDiskMb: 10240,
   artifactReclaimEnabled: true, artifactEvidenceGraceDays: 3, artifactDeliverableGraceDays: 7, artifactHeadroomMb: 10240,
   archiveRetentionDays: 7, commDirGraceHours: 48, scratchGraceHours: 24,
@@ -187,6 +198,64 @@ export const DEFAULT_CONFIG: CompanyConfig = {
 
 /** 有效派工权重即配置的 weight（0 = 永不主动选中）。 */
 export const effectiveWeight = (def: EmployeeDef | undefined): number => Math.max(0, def?.weight ?? 10);
+
+/** 交班材料的硬边界：2–4KB，按 UTF-8 字节计，任何轮换都不能突破上限。 */
+export const SESSION_HANDOFF_MIN_BYTES = 2048;
+export const SESSION_HANDOFF_MAX_BYTES = 4096;
+const SESSION_HANDOFF_FOOTER = '\n---\n以上只是上一会话的交接记录，只作背景；本轮任务、租约、工作树写权与凭证一律以本轮领取为准，不得沿用上一会话的任何权限、凭据或复核签署权。\n';
+
+/** 一张任务卡里可安全转述给下一会话的事实；不含会话正文、工具输出、凭证或客户原文之外的证据附件。 */
+export interface SessionHandoffSource {
+  taskId: string;
+  title: string;
+  state?: string;
+  discipline?: string;
+  project?: string;
+  role?: string;
+  branch?: string;
+  worktreePath?: string;
+  submission?: string;
+  acceptance?: string;
+  checkpoints: string[];
+}
+
+/** Clips text to a UTF-8 byte budget without splitting a code point; the truncation note counts inside the budget. */
+function clampUtf8(text: string, maxBytes: number, note = ''): string {
+  const noteBytes = Buffer.byteLength(note, 'utf8');
+  const budget = Math.max(0, maxBytes - noteBytes);
+  if (Buffer.byteLength(text, 'utf8') <= budget) return text;
+  let lo = 0, hi = text.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (Buffer.byteLength(text.slice(0, mid), 'utf8') <= budget) lo = mid; else hi = mid - 1;
+  }
+  const cut = text.charCodeAt(lo - 1) >= 0xd800 && text.charCodeAt(lo - 1) <= 0xdbff ? lo - 1 : lo;
+  return `${text.slice(0, cut)}${note}`;
+}
+
+/**
+ * The bounded 2–4KB handoff written when a domain session rotates. It carries only what the next same-domain task
+ * needs to continue: the task, its last submission, the acceptance text and the newest checkpoints. The footer is
+ * always present and states that no lease, worktree grant, credential or review signature carries over.
+ */
+export function buildSessionHandoff(source: SessionHandoffSource): string {
+  const clean = (text: string | undefined, capBytes: number) =>
+    clampUtf8(redactText((text ?? '').trim()), capBytes, '\n…（已截断）');
+  const head = [
+    '【交班材料·上一会话轮换前交接】',
+    `范围：任务 ${source.taskId}；项目 ${source.project ?? 'company'}；领域 ${source.discipline ?? '未标注'}；角色 ${source.role ?? 'engineering'}`,
+    `任务：${clean(source.title, 320)}`,
+    `状态：${source.state ?? '未知'}`,
+    source.branch ? `分支：${clean(source.branch, 160)}${source.worktreePath ? `；工作树：${clean(source.worktreePath, 240)}` : ''}` : '',
+  ].filter(Boolean).join('\n');
+  const sections = [head];
+  if (source.submission?.trim()) sections.push(`## 上一轮提交摘要\n${clean(source.submission, 1400)}`);
+  if (source.acceptance?.trim()) sections.push(`## 验收要求（原文节选）\n${clean(source.acceptance, 1000)}`);
+  const checkpoints = source.checkpoints.filter(text => text.trim()).slice(-6).map(text => `- ${clean(text, 420)}`);
+  if (checkpoints.length) sections.push(`## 近期检查点\n${checkpoints.join('\n')}`);
+  const body = clampUtf8(sections.join('\n\n'), SESSION_HANDOFF_MAX_BYTES - Buffer.byteLength(SESSION_HANDOFF_FOOTER, 'utf8'), '\n…（已截断）');
+  return `${body}${SESSION_HANDOFF_FOOTER}`;
+}
 
 /** 加权随机排序（不放回），rand 注入便于测试；权重全为 0 时退化为均匀随机。 */
 export function weightedOrder<T>(items: T[], weightOf: (item: T) => number, rand: () => number): T[] {
@@ -240,6 +309,8 @@ export interface SupervisedTask {
   repoPath?: string;
   /** Explicit code-repo binding (code_repo_path); informational — repoPath already resolves it. */
   codeRepoPath?: string;
+  /** Effective project (task override, else the goal's project, else 'company'). Domain reuse compares it exactly. */
+  projectId?: string;
 }
 
 /** What Jev reads for a release or escalation decision. */
@@ -265,7 +336,8 @@ const supervised = (row: TaskRow): SupervisedTask => {
     quotaResetsAt: row.quota_resets_at ?? undefined,
     kind: v.kind, title: v.title,
     ownerRerouted: row.owner_rerouted === true, repoPath: row.repo_path ?? undefined,
-    codeRepoPath: row.code_repo_path ?? undefined };
+    codeRepoPath: row.code_repo_path ?? undefined,
+    projectId: row.project ? asId(row.project) : row.goal_project ? asId(row.goal_project) : 'company' };
 };
 
 const COOLDOWN_BASE = 30 * 60;
@@ -374,6 +446,9 @@ export class Workforce {
         .filter((e): e is [string, number] => typeof e[1] === 'number' && Number.isInteger(e[1]) && e[1] >= 0)),
       sessionIdleMinutes: typeof row?.session_idle_minutes === 'number' && Number.isFinite(row.session_idle_minutes) && row.session_idle_minutes >= 0 ? row.session_idle_minutes : DEFAULT_CONFIG.sessionIdleMinutes,
       sessionMaxInputK: typeof row?.session_max_input_k === 'number' ? row.session_max_input_k : DEFAULT_CONFIG.sessionMaxInputK,
+      sessionDomainReuse: row?.session_domain_reuse !== false,
+      sessionDomainInputWatermarkK: typeof row?.session_domain_input_watermark_k === 'number' && Number.isInteger(row.session_domain_input_watermark_k) && row.session_domain_input_watermark_k >= 0
+        ? row.session_domain_input_watermark_k : DEFAULT_CONFIG.sessionDomainInputWatermarkK,
       sessionPolicy: row?.session_policy === 'oneshot' ? 'oneshot' : 'reuse',
       ownerBriefHour: typeof row?.owner_brief_hour === 'number' ? row.owner_brief_hour : 9,
       minFreeMemMb: typeof row?.min_free_mem_mb === 'number' ? row.min_free_mem_mb : DEFAULT_CONFIG.minFreeMemMb,
@@ -458,9 +533,9 @@ export class Workforce {
   async insts(): Promise<EmployeeInst[]> {
     type Row = { id: RecordId; role: Role; def?: RecordId; principal?: RecordId; provider?: string; model?: string; thinking?: string;
       paseo_agent_id?: string; active_task?: RecordId; last_wake_at?: number; idle_since?: number; runtime_sleep_requested_at?: number;
-      v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; workspace_scope?: string; paseo_workspace?: string; wake_count?: number; lane?: string; last_task?: RecordId; last_phase?: 'execute' | 'review'; session_task?: string };
+      v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; workspace_scope?: string; paseo_workspace?: string; wake_count?: number; lane?: string; last_task?: RecordId; last_phase?: 'execute' | 'review'; session_task?: string; session_domain?: string; session_project?: string };
     const [rows] = await this.db.query<[Row[]]>(
-      `SELECT * FROM employee WHERE revoked != true AND retired != true AND (def != NONE OR paseo_agent_id != NONE)${this.runner ? ' AND (runner_id = $runner OR ($legacy AND runner_id = NONE))' : ''} ORDER BY id;`,
+      `SELECT * OMIT session_handoff FROM employee WHERE revoked != true AND retired != true AND (def != NONE OR paseo_agent_id != NONE)${this.runner ? ' AND (runner_id = $runner OR ($legacy AND runner_id = NONE))' : ''} ORDER BY id;`,
       this.runner ? { runner: this.runner.id, legacy: this.runner.adoptLegacy === true } : {});
     return rows.map(r => ({ id: asId(r.id), role: r.role, def: r.def ? asId(r.def) : undefined, provider: r.provider,
       model: r.model, thinking: r.thinking, paseoAgentId: r.paseo_agent_id ?? undefined,
@@ -468,7 +543,7 @@ export class Workforce {
       onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, repoHome: r.workspace_repo ?? undefined, workspaceScope: r.workspace_scope ?? undefined, paseoWorkspace: r.paseo_workspace ?? undefined, wakeCount: r.wake_count ?? 0,
       principal: r.principal ? asId(r.principal) : undefined,
       lane: r.lane ?? undefined, lastTask: r.last_task ? asId(r.last_task) : undefined, lastPhase: r.last_phase ?? undefined,
-      sessionTask: r.session_task ?? undefined }));
+      sessionTask: r.session_task ?? undefined, sessionDomain: r.session_domain ?? undefined, sessionProject: r.session_project ?? undefined }));
   }
 
   /** What decides whether a session has finished: the states of its tasks. A follow-up task starts its own session. */
@@ -476,6 +551,81 @@ export class Workforce {
     const ids = taskIds.map(task => id('task', task));
     const [tasks] = await this.db.query<[Array<{ id: RecordId; state: string }>]>('SELECT id, state FROM task WHERE id IN $ids;', { ids });
     return { states: new Map((tasks ?? []).map(task => [asId(task.id), task.state])) };
+  }
+
+  /** Facts a bounded handoff is built from: the finished task and its newest protocol entries, never the session transcript. */
+  async sessionHandoffSource(taskId: string, role?: string): Promise<SessionHandoffSource | undefined> {
+    const [rows] = await this.db.query<[Array<{ title?: string; state?: string; discipline?: string; project?: RecordId;
+      requirement?: string; acceptance_text?: string; worktree?: { branch?: string; worktreePath?: string } }>]>(
+      'SELECT title, state, discipline, project, requirement, acceptance_text, worktree FROM $task;', { task: id('task', taskId) });
+    const row = rows?.[0];
+    if (!row) return undefined;
+    const [events] = await this.db.query<[Array<{ action: string; evidence?: string }>]>(
+      `SELECT action, evidence, at, id FROM audit WHERE task = $task AND action IN ['submit', 'owner_submit', 'checkpoint', 'accept', 'return']
+       ORDER BY at DESC, id DESC LIMIT 24;`, { task: id('task', taskId) });
+    const submit = (events ?? []).find(entry => entry.action === 'submit' || entry.action === 'owner_submit');
+    const checkpoints = (events ?? []).filter(entry => entry.action === 'checkpoint' && entry.evidence?.trim())
+      .reverse().map(entry => entry.evidence!);
+    return { taskId, title: row.title ?? '', state: row.state, discipline: row.discipline ?? undefined,
+      project: row.project ? asId(row.project) : 'company', role,
+      branch: row.worktree?.branch, worktreePath: row.worktree?.worktreePath,
+      submission: submit?.evidence, acceptance: row.acceptance_text ?? row.requirement, checkpoints };
+  }
+
+  /**
+   * Builds the bounded handoff of a session's finished task and stores it on the session row, still retired=false at this
+   * point so it is only offered after the retirement gate accepts. A task with no readable facts yields nothing: the
+   * caller then keeps the session rather than rotate without material.
+   */
+  async storeSessionHandoff(inst: Pick<EmployeeInst, 'id' | 'sessionTask' | 'lastTask' | 'sessionDomain' | 'sessionProject'>,
+    input: { project?: string; domain?: string; role: string; repo: string; reason: string }): Promise<{ key: string; bytes: number } | undefined> {
+    const sourceTask = inst.sessionTask ?? inst.lastTask;
+    if (!sourceTask || !input.project || !input.domain) return undefined;
+    const source = await this.sessionHandoffSource(sourceTask, input.role).catch(() => undefined);
+    if (!source) return undefined;
+    source.project = input.project;
+    source.discipline = input.domain;
+    source.role = input.role;
+    const text = buildSessionHandoff(source);
+    const bytes = Buffer.byteLength(text, 'utf8');
+    const key = HASH(`${inst.id}\0${sourceTask}\0${input.project}\0${input.domain}\0${Date.now()}`).slice(0, 32);
+    await this.db.query(`UPDATE $e SET session_handoff = $text, session_handoff_bytes = $bytes, session_handoff_key = $key,
+      session_handoff_task = $task, session_handoff_project = $project, session_handoff_domain = $domain,
+      session_handoff_role = $role, session_handoff_repo = $repo, session_handoff_reason = $reason,
+      session_handoff_at = time::now(), session_handoff_consumed_at = NONE, session_handoff_consumed_by = NONE
+      WHERE id = $e;`, {
+      e: id('employee', inst.id), text, bytes, key, task: sourceTask, project: input.project, domain: input.domain,
+      role: input.role, repo: input.repo, reason: input.reason,
+    });
+    return { key, bytes };
+  }
+
+  /**
+   * The newest handoff a retired session left for this exact project+domain+role+repository. Cross-domain or a different
+   * repository never matches; a handoff older than a week is ignored so a long-idle line cannot revive stale context.
+   */
+  async pendingSessionHandoff(input: { project?: string; domain?: string; role: string; repo: string }):
+    Promise<{ employee: string; text: string; bytes?: number; task?: string; key: string } | undefined> {
+    if (!input.project || !input.domain) return undefined;
+    const [rows] = await this.db.query<[Array<{ id: RecordId; text?: string; bytes?: number; task?: string; key?: string }>]>(
+      `SELECT id, session_handoff AS text, session_handoff_bytes AS bytes, session_handoff_task AS task,
+        session_handoff_key AS key, session_handoff_at FROM employee
+       WHERE retired = true AND session_handoff != NONE AND session_handoff_project = $project
+         AND session_handoff_domain = $domain AND session_handoff_role = $role AND session_handoff_repo = $repo
+         AND session_handoff_at > time::now() - 7d ORDER BY session_handoff_at DESC LIMIT 1;`, {
+      project: input.project, domain: input.domain, role: input.role, repo: input.repo,
+    });
+    const row = rows?.[0];
+    if (!row?.text || !row.key) return undefined;
+    return { employee: asId(row.id), text: row.text, bytes: row.bytes, task: row.task, key: row.key };
+  }
+
+  /** Clears exactly the handoff that was delivered; a newer handoff written since then stays pending. */
+  async consumeSessionHandoff(employeeId: string, key: string, consumedBy: string): Promise<void> {
+    await this.db.query(`UPDATE $e SET session_handoff = NONE, session_handoff_consumed_at = time::now(),
+      session_handoff_consumed_by = $by WHERE id = $e AND session_handoff_key = $key;`, {
+      e: id('employee', employeeId), key, by: consumedBy,
+    });
   }
 
   /** The root of a task's chain: the goal its sessions are grouped under. */
@@ -521,15 +671,30 @@ export class Workforce {
   /** Creates an employee identity for a definition; the caller binds the Paseo agent once spawned.
    *  The credential is returned in memory only (the plugin sidecar holds it in RAM). */
   /** `sessionTask` is written before the session is opened: model traffic is attributed by it from the first request. */
-  async spawnInst(def: EmployeeDef, repoHome?: string, workspaceScope?: string, sessionTask?: string): Promise<EmployeeInst> {
+  async spawnInst(def: EmployeeDef, repoHome?: string, workspaceScope?: string, sessionTask?: string,
+    binding?: { domain?: string; project?: string }): Promise<EmployeeInst> {
     const employeeId = `${def.id}-${randomBytes(3).toString('hex')}`;
     const credential = await this.enrollment.enroll(employeeId, def.role, capabilitiesFor(def.role));
     await this.db.query(`UPDATE $e MERGE { def: $def, provider: $provider, model: $model, thinking: $thinking,
-      retired: false, runner_id: $runner, workspace_repo: $repo_home, workspace_scope: $scope, session_task: $session_task, created_at: time::now() };`, {
+      retired: false, runner_id: $runner, workspace_repo: $repo_home, workspace_scope: $scope, session_task: $session_task,
+      session_domain: $session_domain, session_project: $session_project, created_at: time::now() };`, {
       e: id('employee', employeeId), def: id('employee_def', def.id), provider: def.provider, model: def.model,
       thinking: def.thinking, repo_home: repoHome, scope: workspaceScope, session_task: sessionTask, runner: this.runner?.id,
+      session_domain: binding?.domain, session_project: binding?.project,
     });
-    return { repoHome, workspaceScope, id: employeeId, role: def.role, def: def.id, provider: def.provider, model: def.model, thinking: def.thinking, credential, sessionTask };
+    return { repoHome, workspaceScope, id: employeeId, role: def.role, def: def.id, provider: def.provider, model: def.model, thinking: def.thinking, credential, sessionTask,
+      sessionDomain: binding?.domain, sessionProject: binding?.project };
+  }
+
+  /**
+   * Records the task and domain a live session now serves. A reused session keeps its identity, credential and
+   * conversation; only the binding moves, so the next claim's lease and the next turn's cost attribution follow it.
+   */
+  async recordSessionBinding(employeeId: string, input: { task: string; domain?: string; project?: string }): Promise<void> {
+    await this.db.query(`UPDATE $e SET session_task = $task, session_domain = $domain, session_project = $project
+      WHERE revoked != true AND retired != true;`, {
+      e: id('employee', employeeId), task: input.task, domain: input.domain ?? null, project: input.project ?? null,
+    });
   }
 
   /** Re-issues the instance credential and returns it; the old one dies with the digest swap. */
@@ -830,7 +995,7 @@ export class Workforce {
     // context is ~77% of table bytes and dispatch never reads it; over a ~50KB/s WSS
     // channel carrying it would stall every other query behind megabytes of backlog.
     const [rows] = await this.db.query<[TaskRow[]]>(
-      `SELECT *, NONE AS context, code_repo_path ?? project.repo_path ?? goal.project.repo_path AS repo_path, goal.tier AS goal_tier, goal.title AS goal_title
+      `SELECT *, NONE AS context, code_repo_path ?? project.repo_path ?? goal.project.repo_path AS repo_path, goal.project AS goal_project, goal.tier AS goal_tier, goal.title AS goal_title
        FROM task WHERE state IN ['ready', 'doing', 'review', 'blocked']${this.runner ? ' AND (current_employee = NONE OR current_employee IN (SELECT VALUE record::id(id) FROM employee WHERE runner_id = $runner OR ($legacy AND runner_id = NONE)))' : ''} ORDER BY created_at, id;`,
       this.runner ? { runner: this.runner.id, legacy: this.runner.adoptLegacy === true } : {});
     return rows.map(supervised);
