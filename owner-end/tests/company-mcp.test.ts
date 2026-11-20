@@ -294,16 +294,39 @@ describe('公司 MCP 工具', () => {
     expect(DENIED_AUDITS(calls).length).toBeGreaterThan(0);
   });
 
-  test('company_job 查本身份员工的作业 → 返回详情', async () => {
+  test('company_job 别 provider 员工即使持有有效租约 → 仍 forbidden 且写 denied 审计', async () => {
+    const token = await mcpToken();
+    const { db, calls } = boundDb({
+      employee: { provider: 'grok-bot' },
+      responses: [
+        ['FROM $job', [{ id: 'job-1', actor_kind: 'agent', actor: 'eng-9', command: 'ops_origin_status', state: 'done' }]],
+        // 若回落到“任意持租约员工”判定，这一行会放行；现在只认 provider，必须仍拒绝。
+        ['current_employee FROM task', [{ current_employee: 'eng-9' }]],
+      ],
+    });
+    const { body } = await callTool(token, db, 'company_job', { jobId: 'job-1' });
+    const result = resultOf(body);
+    expect(result?.isError).toBe(true);
+    expect((result?.structuredContent as { error: { code: string } }).error.code).toBe('forbidden');
+    expect(DENIED_AUDITS(calls).length).toBeGreaterThan(0);
+  });
+
+  test('company_job 查本身份员工的作业 → 只返回投影字段', async () => {
     const token = await mcpToken();
     const { db } = boundDb({
       responses: [['FROM $job', [{
-        id: 'job-1', actor_kind: 'agent', actor: EMPLOYEE, command: 'ops_origin_status', state: 'done', result: '{"ok":true}',
+        id: 'job-1', actor_kind: 'agent', actor: EMPLOYEE, command: 'ops_origin_status', state: 'done',
+        result: '{"ok":true}', input: '{"secret":1}', runner: 'vps-1',
+        task: new RecordId('task', 't1'), created_at: '2030-01-01T00:00:00Z', finished_at: '2030-01-01T00:01:00Z',
       }]]],
     });
     const { body } = await callTool(token, db, 'company_job', { jobId: 'job-1' });
-    const value = resultOf(body)?.structuredContent as { command: string; actor: string };
+    const value = resultOf(body)?.structuredContent as Record<string, unknown>;
+    expect(Object.keys(value).sort()).toEqual(['command', 'created_at', 'finished_at', 'id', 'result', 'state', 'task'].sort());
     expect(value.command).toBe('ops_origin_status');
-    expect(value.actor).toBe(EMPLOYEE);
+    expect(value.task).toBe('task:t1');
+    expect(value.actor).toBeUndefined();
+    expect(value.input).toBeUndefined();
+    expect(value.runner).toBeUndefined();
   });
 });

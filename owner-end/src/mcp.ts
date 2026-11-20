@@ -454,14 +454,18 @@ function buildServer(ctx: ToolContext): McpServer {
         const provider = typeof employee?.provider === 'string' ? employee.provider : '';
         allowed = principal.providers.includes(provider);
       }
-      if (!allowed) {
-        const [leased] = await ctx.db.query<[Array<{ current_employee?: string }>]>(
-          'SELECT current_employee FROM task WHERE current_employee = $actor AND lease_expires_at > $now LIMIT 1;',
-          { actor: holder, now: ctx.nowSeconds });
-        allowed = leased?.[0]?.current_employee === holder && holder.length > 0;
-      }
       if (!allowed) throw forbidden('只能查看本身份任务员工发起的作业');
-      return { actor: holder || `mcp:${ctx.token.sub}`, task: undefined, value: job };
+      const row = job as unknown as Record<string, unknown>;
+      const value: Record<string, unknown> = { id: job.id, state: job.state, command: job.command };
+      if (row.task !== undefined) value.task = String(row.task);
+      if (job.result !== undefined) value.result = job.result;
+      if (job.error !== undefined) {
+        const text = typeof job.error === 'string' ? job.error : JSON.stringify(job.error);
+        value.error = clip(redactText(text), 500);
+      }
+      if (job.created_at !== undefined) value.created_at = job.created_at;
+      if (job.finished_at !== undefined) value.finished_at = job.finished_at;
+      return { actor: holder || `mcp:${ctx.token.sub}`, task: undefined, value };
     }),
   );
 
