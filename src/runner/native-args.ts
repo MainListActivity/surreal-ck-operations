@@ -23,24 +23,40 @@ export const isNativeProvider = (provider: string): provider is NativeProvider =
 export const UNATTENDED_MODE: Record<string, string | undefined> = { codex: 'full-access', claude: 'bypassPermissions', devin: 'bypass', 'factory-droid': 'auto-high', 'factory-paseo': 'auto-high', 'devin-paseo': 'bypass' };
 
 /** CLI 参数来自原生非交互入口，不经 ACP，不把 prompt 放在进程参数中。 */
-export function nativeArgs(s: { provider: NativeProvider; nativeSessionId?: string; model: string; thinking?: string; mode?: string }): string[] {
+export function nativeArgs(s: { provider: NativeProvider; nativeSessionId?: string; model: string; thinking?: string; mode?: string;
+  /** 本机公司工具 MCP（`sck mcp` stdio 服务器）的 sck 绝对路径；不配置则不注入。 */
+  companyMcp?: { command: string } }): string[] {
+  const mcp = s.companyMcp?.command;
   // 云端通道：桥接进程参数（云端任务凭任务 ID 续接，逻辑会话 ID 只标会话）。
   if (isLaneProvider(s.provider)) return [
     ...(s.nativeSessionId ? ['--resume', s.nativeSessionId] : []),
     ...(s.model && s.model !== 'default' ? ['--model', s.model] : [])];
   const model = s.model ? ['--model', s.model] : [];
+  // factory-droid 本期不注入公司工具 MCP（其单进程 MCP 配置方式未核实）；droid 员工仍用 sck CLI。
   if (s.provider === 'factory-droid') return ['exec', '--output-format', 'stream-json', ...model,
     ...(s.mode === 'auto-high' ? ['--auto', 'high'] : []),
     ...(s.thinking ? ['--reasoning-effort', s.thinking] : []),
     ...(s.nativeSessionId ? ['--session-id', s.nativeSessionId] : [])];
-  if (s.provider === 'claude') return ['-p', '--output-format', 'stream-json', '--verbose', ...model,
+  // claude 的 --mcp-config 是变长参数，必须紧跟在 -p 后面、下一个 -- 参数之前。不写 env：
+  // claude 会把完整进程环境传给 stdio MCP 子进程，comm key 不进 argv。
+  if (s.provider === 'claude') return ['-p',
+    ...(mcp ? ['--mcp-config', JSON.stringify({ mcpServers: { 'sck-company': { command: mcp, args: ['mcp'] } } })] : []),
+    '--output-format', 'stream-json', '--verbose', ...model,
     ...(s.thinking ? ['--effort', s.thinking] : []),
     ...(s.mode === 'bypassPermissions' ? ['--permission-mode', 'bypassPermissions'] : []),
     ...(s.nativeSessionId ? ['--resume', s.nativeSessionId] : [])];
   return ['exec', ...(s.nativeSessionId ? ['resume', s.nativeSessionId] : []), '--json', '--skip-git-repo-check', ...model,
     ...(s.thinking ? ['-c', `model_reasoning_effort=${JSON.stringify(s.thinking)}`] : []),
     // 无人值守权限由外层员工沙箱承担，沿用已授权的 full-access 模式。
-    ...(s.mode === 'full-access' ? ['--dangerously-bypass-approvals-and-sandbox'] : []), '-'];
+    ...(s.mode === 'full-access' ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
+    // codex 的 -c 值按 TOML 解析：路径带空格（Application Support）时用 JSON.stringify 转成 TOML 字符串。
+    // env_vars 只透传 comm 与路径变量，凭证本体仍只在 sidecar 进程里。
+    ...(mcp ? [
+      '-c', `mcp_servers.sck-company.command=${JSON.stringify(mcp)}`,
+      '-c', 'mcp_servers.sck-company.args=["mcp"]',
+      '-c', 'mcp_servers.sck-company.env_vars=["SCK_COMM_DIR","SCK_COMM_KEY","SCK_SCRATCH_DIR","SCK_SERVICE_HOME"]',
+    ] : []),
+    '-'];
 }
 
 /** 原生 CLI 的可执行文件名（执行端配置里是绝对路径，经员工沙箱脚本启动）。 */

@@ -297,3 +297,40 @@ test('合法工具事件总量超过缓冲上限仍继续；只保留有界公�
     expect(f.events[0]!.outcome.kind).toBe('completed');expect(JSON.stringify(f.runtime.activity()).length).toBeLessThan(1500);
   } finally {await f.close();}
 });
+
+test('公司工具 MCP 注入：claude 的 --mcp-config 紧跟 -p 且后接 -- 参数', () => {
+  const mcp = { command: '/Users/y/Library/Application Support/SurrealCKCompany/bin/sck' };
+  const args = nativeArgs({ provider: 'claude', model: 'm', mode: 'bypassPermissions', companyMcp: mcp });
+  expect(args[0]).toBe('-p');
+  expect(args[1]).toBe('--mcp-config');
+  // --mcp-config 是变长参数：它的下一个参数必须以 -- 开头。
+  expect(args[3]).toMatch(/^--/);
+  const config = JSON.parse(args[2]!) as { mcpServers: Record<string, { command: string; args: string[]; env?: unknown }> };
+  expect(config.mcpServers['sck-company']).toEqual({ command: mcp.command, args: ['mcp'] });
+  expect(config.mcpServers['sck-company']!.env).toBeUndefined();
+});
+
+test('公司工具 MCP 注入：codex 三条 -c 在末尾 - 之前，带空格路径 TOML 转义', () => {
+  const mcp = { command: '/Users/y/Library/Application Support/SurrealCKCompany/bin/sck' };
+  const args = nativeArgs({ provider: 'codex', model: 'm', mode: 'full-access', companyMcp: mcp });
+  expect(args.at(-1)).toBe('-');
+  const tail = args.slice(0, -1);
+  const mcpFlags = tail.filter((_, i) => tail[i - 1] === '-c' && String(tail[i]).startsWith('mcp_servers.sck-company.'));
+  expect(mcpFlags).toEqual([
+    `mcp_servers.sck-company.command=${JSON.stringify(mcp.command)}`,
+    'mcp_servers.sck-company.args=["mcp"]',
+    'mcp_servers.sck-company.env_vars=["SCK_COMM_DIR","SCK_COMM_KEY","SCK_SCRATCH_DIR","SCK_SERVICE_HOME"]',
+  ]);
+  // JSON.stringify 把带空格的路径转成带引号的合法 TOML 字符串。
+  expect(mcpFlags[0]).toBe(`mcp_servers.sck-company.command="${mcp.command}"`);
+});
+
+test('公司工具 MCP 注入：droid 与云端通道不注入；不传 companyMcp 参数与改动前一致', () => {
+  const mcp = { command: '/x/bin/sck' };
+  expect(nativeArgs({ provider: 'factory-droid', model: 'm', companyMcp: mcp }).join(' ')).not.toContain('mcp');
+  expect(nativeArgs({ provider: 'devin-cloud', model: 'm', companyMcp: mcp }).join(' ')).not.toContain('mcp');
+  expect(nativeArgs({ provider: 'claude', model: 'm', nativeSessionId: 'session' }))
+    .toEqual(['-p', '--output-format', 'stream-json', '--verbose', '--model', 'm', '--resume', 'session']);
+  expect(nativeArgs({ provider: 'codex', model: '', mode: 'full-access' }))
+    .toEqual(['exec', '--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', '-']);
+});

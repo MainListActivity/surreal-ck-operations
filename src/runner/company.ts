@@ -309,6 +309,8 @@ export function company(): Promise<Company> {
       },
       core, workforce, ops, media, browser, sync,
       cloud: cloudRoute,
+      // 本机公司工具的 company_landscape：与 `sck owner landscape.get` 同一条 ownerApi 路径（只读公司库会话）。
+      landscape: async (args) => ownerApi({ db } as never, { command: 'landscape.get', input: args }, 'agent-tool') as Promise<unknown>,
       runDir,
       // SYS04: the plugin host bundles the server code and evaluates it without a module loader, so the
       // diagnostic cannot read its own directory from `__dirname`/`import.meta`. The host's own registry

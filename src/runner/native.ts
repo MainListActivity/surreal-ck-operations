@@ -28,6 +28,8 @@ export interface NativeOptions {
   onEnded?(event: TurnEnded): Promise<void>;
   maxOutputBytes?: number;
   stopGraceMs?: number;
+  /** 本机公司工具 MCP 的 sck 绝对路径（`sck mcp` stdio 子进程）；不配置则 claude/codex 不注入。 */
+  companyMcp?: { command: string };
 }
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code !== 'ESRCH'; } };
 const supported = (provider: string): provider is NativeProvider => ['factory-droid', 'claude', 'codex', 'codex-cloud', 'devin-cloud', 'jules', 'warp', 'grok-bot', 'muse-web', 'chatgpt-web', 'gemini-web'].includes(provider);
@@ -177,7 +179,7 @@ export class NativeRuntime implements AgentRuntime {
       env = await this.options.environment(structuredClone(s));
       if (this.closed) throw new Error('执行端正在关闭');
     } catch (error) { s.status = 'error'; s.error = (error as Error).message; this.save(); throw error; }
-    const child = spawnProcess(command[0]!, [...command.slice(1), ...nativeArgs(s)], {
+    const child = spawnProcess(command[0]!, [...command.slice(1), ...nativeArgs({ ...s, companyMcp: this.options.companyMcp })], {
       cwd: s.cwd, env, stdio: ['pipe', 'pipe', 'pipe'], shell: false, detached: process.platform !== 'win32',
     });
     s.pid = child.pid; this.save();

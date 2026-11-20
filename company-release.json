@@ -1,14 +1,16 @@
 {
-  "version": "0.13.75",
-  "title": "修复只读工程任务的派工草稿混入代码任务交卷句子",
+  "version": "0.13.76",
+  "title": "原生执行端（claude/codex）员工经 sck mcp 拿到同名公司工具",
   "changes": [
-    "task.create 非路线分支的草稿 code 标志改为 isEngineering && workIntent 为 code：只读工程任务（workIntent 'read'）的执行稿不再出现“完整 40 位提交”交卷句，复核稿不再出现“代码任务在最终合入提交上核对”。",
-    "路线分支（route.code）与代码任务行为不变。"
+    "7 个公司工具的绑定与校验统一到 src/runner/company-tools.ts（runCompanyTool），Paseo 插件薄壳与 sck mcp 都经 sidecar 的 company_tool 走与 sck call 相同的 dispatch。",
+    "sck mcp：员工 CLI 的 stdio MCP 子进程（行分隔 JSON-RPC），不新增服务/端口/凭证；SCK_COMM_* 缺失时 tools/list 照答、tools/call 回错。",
+    "原生启动注入：claude 加 --mcp-config（stdio 子进程继承环境）；codex 加三条 -c mcp_servers.sck-company.*（env_vars 透传 comm 变量）。droid 本期不注入，仍用 sck CLI；云端通道与命令预览不注入。",
+    "SidecarDeps 新增可选 landscape（landscape.get 同一条 ownerApi 路径），未注入时 company_landscape 返回 not_configured；插件侧不再单独注入。"
   ],
   "impact": [
-    "只读调研/巡检类任务的派工正文与“没有代码改动，不建 PR”的需求口径一致，不再要求 SHA 与 PR。",
+    "原生执行端的 claude/codex 员工与 Paseo 员工一样拿到同名公司工具，权限与租约判定与 sck call 完全一致。",
     "沿用 schema 074，无迁移。"
   ],
-  "migration": "无 schema 变化（沿用 schema 074），升级 owner-backend 即可。",
-  "rollback": "回退至 0.13.74；只读工程任务的派工草稿恢复混入代码交卷句（需人工改稿）。"
+  "migration": "无 schema 变化（沿用 schema 074），升级 owner-backend、原生节点与插件即可。",
+  "rollback": "回退至 0.13.75；原生执行端员工退回 sck call 路径。"
 }

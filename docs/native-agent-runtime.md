@@ -113,3 +113,11 @@ SIGINT/SIGTERM 停止派工循环，再停止本执行器拥有的进程组并�
 回合语义：task.md 与最新复核意见内联进云端 prompt；复核轮强制首行复核结论；非 GitHub 工作树按受阻收尾；在途云端任务按 prompt 摘要重连不重复提交。详见 [cloud-lanes.md](cloud-lanes.md)。
 
 `warp`（Warp Build 的 oz agent）是同构的本地桥接：命令是 `sandbox/launch.sh bun <服务目录>/current/server/vendor/src/runner/warp/main.ts warp`，事件流同为 system/lane_status/result。与云端通道不同的是它在本地工作树里干活（提交/推送由 agent 按公司协议自己在任务分支完成），prompt 正文写进 commDir 的 `.warp/turn-<时间戳>.md`（0600），进程参数只带一句短指令；续轮用 `--conversation <conversation_id>`。`lanes.warp` 只接受 `bin`（如 `{"oz": "/Applications/Warp.app/Contents/Resources/bin/oz"}`）与 `maxMinutes`（默认 120）。Warp 无可读额度端点，保持 unknown。
+
+## 公司工具注入（0.13.76 起）
+
+原生执行端的 claude / codex 员工在启动参数里挂上 `sck-company` MCP（stdio 子进程 `sck mcp`），拿到与云端公司 MCP 同名同参数的 7 个工具（清单与绑定语义见 docs/cloud-lanes.md「本机员工」）。`sck mcp` 与 `sck call` 一样只经 comm 目录中转，员工不持有凭证；stdout 只写行分隔 JSON-RPC。注入由 `NativeRuntime` 的 `companyMcp.command`（`<service home>/bin/sck`，可用 `SCK_TOOL_BIN` 覆盖）驱动，未配置时参数与改动前完全一致。
+
+- claude：`-p` 后紧跟 `--mcp-config {"mcpServers":{"sck-company":{"command","args":["mcp"]}}}`（不写 env——claude 把完整进程环境传给 stdio 子进程，comm key 不进 argv）。
+- codex：`exec` 选项区末尾（最后的 `-` 之前）加三条 `-c mcp_servers.sck-company.command/args/env_vars`；`env_vars` 只透传 `SCK_COMM_DIR/SCK_COMM_KEY/SCK_SCRATCH_DIR/SCK_SERVICE_HOME`，路径按 TOML 字符串转义。
+- factory-droid 本期不注入（单进程 MCP 配置方式未核实），droid 员工仍用 `sck` CLI；云端通道 provider 与启动命令预览也不注入。
