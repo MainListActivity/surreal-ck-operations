@@ -1,16 +1,15 @@
 {
-  "version": "0.13.76",
-  "title": "原生执行端（claude/codex）员工经 sck mcp 拿到同名公司工具",
+  "version": "0.13.77",
+  "title": "判读器收尾保留答复原文，复核不再只剩一行摘要",
   "changes": [
-    "7 个公司工具的绑定与校验统一到 src/runner/company-tools.ts（runCompanyTool），Paseo 插件薄壳与 sck mcp 都经 sidecar 的 company_tool 走与 sck call 相同的 dispatch。",
-    "sck mcp：员工 CLI 的 stdio MCP 子进程（行分隔 JSON-RPC），不新增服务/端口/凭证；SCK_COMM_* 缺失时 tools/list 照答、tools/call 回错。",
-    "原生启动注入：claude 加 --mcp-config（stdio 子进程继承环境）；codex 加三条 -c mcp_servers.sck-company.*（env_vars 透传 comm 变量）。droid 本期不注入，仍用 sck CLI；云端通道与命令预览不注入。",
-    "SidecarDeps 新增可选 landscape（landscape.get 同一条 ownerApi 路径），未注入时 company_landscape 返回 not_configured；插件侧不再单独注入。"
+    "stewardWorkResult 判读器分支的 summary 改为“判读器摘要 + 空行 + 原始答复： + 原文全文”：云端通道 MCP 交卷的逐步证据（时间点、页面事实）不再被压成一行摘要，复核员工在待复核成果里能看到完整原文。",
+    "原文为空或与摘要相同（trim 相等）时只写摘要；block 与 review 分支同样保留原文；总长仍由 workResult 的 29000 截断兜底。",
+    "其它路径不变：structured 已给出、有显式口令、没有判读器、超出连续自动跟进上限的强制受阻。"
   ],
   "impact": [
-    "原生执行端的 claude/codex 员工与 Paseo 员工一样拿到同名公司工具，权限与租约判定与 sck call 完全一致。",
+    "云端通道经 MCP 交卷的长证据完整进入公司记录，复核不再依赖私有 journal 才能看到原文。",
     "沿用 schema 074，无迁移。"
   ],
-  "migration": "无 schema 变化（沿用 schema 074），升级 owner-backend、原生节点与插件即可。",
-  "rollback": "回退至 0.13.75；原生执行端员工退回 sck call 路径。"
+  "migration": "无 schema 变化（沿用 schema 074），升级 owner-backend 即可。",
+  "rollback": "回退至 0.13.76；判读器收尾恢复为只写一行摘要。"
 }

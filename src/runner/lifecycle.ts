@@ -214,7 +214,11 @@ export async function stewardWorkResult(text: string, phase: 'doing' | 'review',
   if (phase === 'review' && verdict.action !== 'accept' && verdict.action !== 'return' && verdict.action !== 'block')
     throw new Error('复核轮判读器只能给出 accept、return 或 block');
   const summary = verdict.summary?.trim() || text.split(/\r?\n/).find(line => line.trim())?.slice(0, 500) || text.trim();
-  const value: Record<string, unknown> = { summary };
+  // 判读器摘要只是概括，复核要看原文（逐步证据、页面事实）：摘要后附「原始答复：」全文。
+  // 原文为空或与摘要相同（trim 相等）时只写摘要；总长仍由 workResult 的 29000 截断兜底。
+  const original = text.trim();
+  const fullSummary = original && original !== summary ? `${summary}\n\n原始答复：\n${original}` : summary;
+  const value: Record<string, unknown> = { summary: fullSummary };
   if (verdict.action === 'block') value.outcome = 'blocked';
   else if (phase === 'review') {
     if (verdict.action === 'accept') value.review = 'accept';
