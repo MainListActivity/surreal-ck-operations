@@ -117,7 +117,7 @@ export function ownerContextOf(db: Surreal): OwnerApiContext {
   };
 }
 
-function runOwnerApi(db: Surreal, command: string, input: Input, via = 'web'): Promise<unknown> {
+export function runOwnerApi(db: Surreal, command: string, input: Input, via = 'web'): Promise<unknown> {
   return ownerApi(ownerContextOf(db), { ...input, command }, via);
 }
 

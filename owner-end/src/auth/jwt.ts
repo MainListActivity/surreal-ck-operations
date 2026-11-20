@@ -21,7 +21,7 @@ export interface VerifiedToken {
   actClient?: string;
 }
 
-const ALGORITHMS = ['RS256', 'RS384', 'RS512', 'PS256', 'PS384', 'PS512', 'ES256', 'ES384', 'ES512', 'EdDSA'];
+export const ALGORITHMS = ['RS256', 'RS384', 'RS512', 'PS256', 'PS384', 'PS512', 'ES256', 'ES384', 'ES512', 'EdDSA'];
 
 const keySets = new Map<string, JWTVerifyGetKey>();
 
