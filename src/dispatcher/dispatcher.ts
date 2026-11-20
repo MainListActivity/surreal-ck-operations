@@ -2077,7 +2077,9 @@ export class Dispatcher {
           }
           await hooks?.beforeExternal?.(existing, 'send');
           // 原因在外部调用之前写：原生执行端的调用要等会话跑完才返回，事后写的话进行中的一轮看不到。只有发出的消息才显示它。
-          await this.recordReason(prepared?.message.id, reasonFor(existing.provider ?? '', assignCfg.sessionPolicy === 'oneshot' && !crossTaskReuse));
+          await this.recordReason(prepared?.message.id, crossTaskReuse
+            ? `同项目同域复用上一任务的空闲会话（${existing.id}）`
+            : reasonFor(existing.provider ?? '', assignCfg.sessionPolicy === 'oneshot'));
           externalAttempt = true;
           const attempt = await wf.beginDispatchAttempt({ request: randomUUID(), message: prepared?.message.id,
             messageRevision: prepared?.message.dispatchRevision, body: body!, bodyHash: createHash('sha256').update(body!).digest('hex'), employee: existing.id, task: task?.id, kind: 'send',
