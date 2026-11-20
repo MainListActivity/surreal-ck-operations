@@ -1,20 +1,18 @@
 {
-  "version": "0.13.72",
-  "title": "保持数据库事务查询的缓冲响应语义",
+  "version": "0.13.73",
+  "title": "公司 MCP 第二期：交卷/复核/受阻写工具、服务端次数预算、Devin 通道 MCP 收尾",
   "changes": [
-    "新增 /api/mcp 端点（挂在现有 owner-end）：ma_hono company 租户令牌验签（audience=company.<root>/api/mcp、scope company.work），无状态 StreamableHTTP 传输。",
-    "新增只读工具 company_landscape、task_current、task_context、company_ops（白名单四个运维命令）、company_job；需要任务的工具按任务租约绑定员工身份并经命令守卫判定。",
-    "主体登记默认拒绝：company_meta:mcp_principals 记录可用主体与允许的员工 provider，老板用新命令 mcp.principal.list / mcp.principal.set（仅老板）管理。",
-    "控制面与插件的 surrealdb JS 客户端升级到 2.2.2；保留 0.13.70 公司 MCP 只读工具。",
-    "本地隔离测试使用公司 fork 4.0.1-native-quota.1，持久化测试夹具切换到 SurrealKV，兼容 COMMIT 返回的事务冲突。",
-    "公司主会话与重建会话关闭 SDK 默认流式查询，事务拒绝后继续复用连接，撤租约返回失败而不是连接终止。",
-    "兼容公司 fork 3.3 的配额准入并发冲突文本，补稿方按草稿冲突读回已有草稿。"
+    "公司 MCP 新增三个写工具：task_submit（执行态交卷，可带 PR/SHA）、task_review（复核态通过/退回）、task_block（执行或复核态受阻）；一律经主体登记、任务租约绑定与命令守卫判定后，用带 current_employee/delivery_id/fence/lease_expires_at 条件的 UPDATE 只写 task.mcp_outcome，任务状态机字段一律不碰。",
+    "company_ops 引入服务端次数预算：按（任务, delivery_id, 工具）计数，默认每工具 3 次；任务行 mcp_budget 可覆盖（0..20，0 即禁用），扣次用条件 UPDATE 防并发，新租约 delivery 自动清零，超限直接 forbidden 不入队。",
+    "新增老板专属命令 mcp.budget.set（设置/清除任务预算覆盖）与 mcp.principal.pending（聚合近 7 天未登记主体的 MCP 尝试）；mcp.* 前缀整体并入 HARD_OWNER_ONLY。",
+    "core 新增 mcpOutcome(open/read)：开闸清空上一轮结论，读取只回本租约（员工×delivery×fence）的结论；sidecar 提供 lane_mcp_open/lane_mcp_outcome 通道工具。",
+    "devin-cloud 通道接入结构化收尾：新回合发送前开闸并记录开闸标记，轮询时优先采信 MCP 结论（submit→closeout、review→复核结论、block→受阻），失败一律回落原页面 SCK-DONE 逻辑；vendor prompt 引导云端执行者用 task_context/company_ops/task_submit。"
   ],
   "impact": [
-    "云端执行者可用原生 MCP 查公司服务全景、本身份任务上下文与只读运维状态；未登记主体、跨身份任务、非白名单命令一律拒绝并写审计。",
-    "控制台与员工令牌不能调 MCP 端点，MCP 令牌也不能调 /api/cmd，两条路互不相通。",
-    "沿用 schema 074，不转换既有生产存储目录。"
+    "Devin Cloud 等云端执行者可用公司 MCP 工具直接回写结构化结论，不再只能依赖页面收尾标记；结论绑定任务租约，旧租约写不进。",
+    "运维工具调用有服务端硬上限，防止云端主体把只读运维命令打爆；预算与主体登记都由老板专属命令管理。",
+    "沿用 schema 074，任务行新增 mcp_outcome/mcp_budget/mcp_ops_used 均为 SCHEMALESS 字段，无迁移。"
   ],
-  "migration": "无 schema 变化（沿用 schema 074）；新增 company_meta:mcp_principals 记录（缺省为空清单=全部拒绝）。升级并重启 owner-backend 即可。 SurrealKV 仅用于新建的本地测试目录；生产服务端升级与存储迁移需另行安排。",
-  "rollback": "应用可回退至 0.13.70，保留公司 MCP 只读工具；服务端数据格式回退不在本次变更范围内，禁止把新存储目录交给旧二进制。"
+  "migration": "无 schema 变化（沿用 schema 074）；task 行新增的 mcp_outcome、mcp_budget、mcp_ops_used 都是 SCHEMALESS 字段，缺省即未使用。升级并重启 owner-backend 与插件即可。",
+  "rollback": "回退至 0.13.72；写工具与预算随之关闭，云端收尾回到页面 SCK-DONE 标记路径，已落库的 mcp_* 字段被旧版忽略。"
 }

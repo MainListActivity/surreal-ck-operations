@@ -61,6 +61,9 @@ const BASE_TOOLS = [
   "plugin_runtime_diagnostics",
   // Mode 1 云端通道本地工具代跑中继：云端 agent 经此请求本地驻场管理员代跑绿区只读/幂等 ops。
   "steward_lane_assist",
+  // MCP-2 云端通道收尾：桥接进程在按下发送前开闸（清旧 mcp_outcome）、轮询时读本租约代际的 MCP 结论。
+  // 只作用于 live() 租约；agent 直接调也只能碰自己的租约。
+  "lane_mcp_open", "lane_mcp_outcome",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -1591,6 +1594,18 @@ export class SidecarPool {
           return { decision: 'reply', message: String(redactSecrets(outcome.message)) };
         }
         return { decision: 'escalate', reason: outcome.kind === 'escalate' ? outcome.reason : '协助结论无法处理，转交老板裁决' };
+      }
+      case "lane_mcp_open": {
+        // 通道桥接进程在按下发送前开闸：清掉上一轮旧结论，只作用于 live() 租约，不碰状态机。
+        const claim = live();
+        if (!core.mcpOutcome) throw Object.assign(new Error("core does not expose mcpOutcome"), { code: "temporarily_unavailable" });
+        return core.mcpOutcome(cred, claim.proof, 'open');
+      }
+      case "lane_mcp_outcome": {
+        // 轮询读取：只读到本租约代际（employee/delivery/fence 与 proof 一致）的 MCP 结论，只读不清。
+        const claim = live();
+        if (!core.mcpOutcome) throw Object.assign(new Error("core does not expose mcpOutcome"), { code: "temporarily_unavailable" });
+        return core.mcpOutcome(cred, claim.proof, 'read');
       }
       default: throw Object.assign(new Error(RETIRED_TOOLS.has(tool)
         ? `${tool} 已下线：凭证不再交给员工，需要账号、workspace、登录请用运维工具（sck call ops_info '{}' 查看）`

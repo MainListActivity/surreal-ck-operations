@@ -1,5 +1,7 @@
 /**
- * 公司 MCP（第一期，只读工具）：云端执行者（先 Devin Cloud）经原生 MCP 调公司工具。
+ * 公司 MCP（第二期：只读工具 + 结构化交卷/复核/受阻 + company_ops 次数预算）：云端执行者（先 Devin Cloud）经原生 MCP 调公司工具。
+ * 写工具只把结论落到 task.mcp_outcome，状态机仍由持租约的 sidecar 推进；company_ops 入队前按
+ * task.mcp_budget / task.mcp_ops_used 做服务端扣次。
  * 身份是 ma_hono company 租户签发的访问令牌（issuer=cfg.idp.issuer、audience=<origin>/api/mcp、
  * scope 含 company.work）；哪些主体能用、各自允许哪些员工 provider 由 company_meta:mcp_principals
  * 登记（默认拒绝，老板用 mcp.principal.* 管理）。需要任务的工具按任务的 current_employee 绑定员工身份，
@@ -25,8 +27,11 @@ import { enqueueJob, jobFailure, readJob, waitForJob, type JobRecord } from './j
 import { isRecord } from './rows.ts';
 import { runOwnerApi } from './commands.ts';
 
-/** 第一期固定工具清单的白名单：company_ops 只允许这几个只读运维命令。 */
-export const MCP_OPS_ALLOW = ['ops_origin_status', 'ops_origin_health', 'ops_release_diagnose', 'ops_product_pulse'] as const;
+/** 公司 MCP 白名单（唯一权威在 src/mcp-ops.ts，owner-api 的 mcp.budget.set 也要用它）：company_ops 只允许这几个只读运维命令。 */
+export { MCP_OPS_ALLOW } from '../../src/mcp-ops.ts';
+import { MCP_OPS_ALLOW } from '../../src/mcp-ops.ts';
+/** company_ops 每 (task, delivery, tool) 的默认次数上限；任务可用 mcp_budget 覆盖（0=禁止）。 */
+export const MCP_OPS_DEFAULT_BUDGET = 3;
 
 const MAX_BODY_BYTES = 256 * 1024;
 const TASK_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -159,6 +164,10 @@ interface TaskRow extends Record<string, unknown> {
   worktree?: { branch?: string };
   current_employee?: string | null;
   lease_expires_at?: number | null;
+  delivery_id?: string | null;
+  fence?: number;
+  mcp_budget?: unknown;
+  mcp_ops_used?: unknown;
 }
 
 /** 任务绑定判定（全部满足才放行）：任务存在、current_employee 非空、租约未过期、持有者 provider ∈ 主体 providers。 */
@@ -178,6 +187,133 @@ async function bindTask(
   const provider = typeof employee?.provider === 'string' ? employee.provider : '';
   if (!principal.providers.includes(provider)) throw new McpToolRefusal('forbidden', '这不是本身份的任务', holder, taskId);
   return { task, employee: holder };
+}
+
+/**
+ * 绑定 + 命令守卫后的任务操作前提：decide 允许才返回任务与员工。
+ * decide 的命令名用 mcp_tool.<tool> 而不是审计用的 mcp.<tool>：HARD_OWNER_ONLY 的 'mcp.*'
+ * 是给老板命令（mcp.principal.* / mcp.budget.set）的硬锁，员工身份的 MCP 调用不能以它为名，
+ * 否则所有工具都被硬锁拒掉。
+ */
+async function boundAndDecided(
+  ctx: ToolContext,
+  principal: McpPrincipal,
+  taskId: string,
+  command: string,
+): Promise<{ task: TaskRow; employee: string }> {
+  const { task, employee } = await bindTask(ctx.db, principal, taskId, ctx.nowSeconds);
+  const decision = await decide(ctx.db, {
+    actorKind: 'agent', actor: employee, task: taskId, command, now: ctx.nowSeconds,
+  });
+  if (!decision.allow) throw new McpToolRefusal('forbidden', decision.reason, employee, taskId);
+  return { task, employee };
+}
+
+/** 租约身份要素：写工具的条件 UPDATE 只认 current_employee + delivery_id + fence + 未过期。 */
+function leaseFacts(task: TaskRow): { delivery: string; fence: number } | undefined {
+  const delivery = typeof task.delivery_id === 'string' && task.delivery_id ? task.delivery_id : undefined;
+  const fence = typeof task.fence === 'number' && Number.isInteger(task.fence) ? task.fence : undefined;
+  return delivery && fence !== undefined ? { delivery, fence } : undefined;
+}
+
+/**
+ * 写工具只写 task.mcp_outcome，不碰 version/fence/state/current_employee/delivery_id
+ *（schema 065 的 dispatch_task_fence 事件会拦身份变化）。一条条件 UPDATE 竞态安全；
+ * 读后租约变化未命中 → forbidden「任务租约已变化」。本轮内允许覆盖（后写为准）。
+ */
+async function recordMcpOutcome(
+  ctx: ToolContext,
+  task: TaskRow,
+  taskId: string,
+  employee: string,
+  outcome: { kind: 'submit' | 'review' | 'block'; text: string; pr?: string; sha?: string; verdict?: string },
+): Promise<void> {
+  const facts = leaseFacts(task);
+  if (!facts) throw new McpToolRefusal('forbidden', '任务租约信息不完整', employee, taskId);
+  const [rows] = await ctx.db.query<[TaskRow[]]>(
+    `UPDATE $task SET mcp_outcome = $o, mcp_outcome.at = time::now()
+     WHERE current_employee = $emp AND delivery_id = $delivery AND fence = $fence AND lease_expires_at > $now
+     RETURN AFTER;`, {
+      task: new RecordId('task', taskId),
+      emp: employee,
+      delivery: facts.delivery,
+      fence: facts.fence,
+      now: ctx.nowSeconds,
+      o: {
+        kind: outcome.kind, text: outcome.text,
+        ...(outcome.pr ? { pr: outcome.pr } : {}),
+        ...(outcome.sha ? { sha: outcome.sha } : {}),
+        ...(outcome.verdict ? { verdict: outcome.verdict } : {}),
+        employee, delivery: facts.delivery, fence: facts.fence, sub: ctx.token.sub,
+      },
+    });
+  if (!rows?.length) throw new McpToolRefusal('forbidden', '任务租约已变化', employee, taskId);
+}
+
+/** 写工具文本：必填、长度校验，先 redactText 再 clip。 */
+function outcomeText(value: unknown, min: number, max: number, name: string): string {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (text.length < min || text.length > max) throw invalid(`${name} 需要 ${min}..${max} 字符`);
+  return clip(redactText(text), max);
+}
+
+const MCP_PR_RE = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+$/;
+const MCP_SHA_RE = /^[0-9a-f]{7,40}$/;
+
+/** company_ops 单次调用的次数上限：任务 mcp_budget 覆盖（0..20 整数），否则默认 3。 */
+function opsBudgetOf(task: TaskRow, tool: string): number {
+  const raw = task.mcp_budget;
+  if (isRecord(raw)) {
+    const value = raw[tool];
+    if (Number.isInteger(value) && (value as number) >= 0 && (value as number) <= 20) return value as number;
+  }
+  return MCP_OPS_DEFAULT_BUDGET;
+}
+
+/** 已用次数：mcp_ops_used.delivery 与当前 delivery 相同才算；换租约（新 delivery）视为 0。 */
+function opsCountsOf(task: TaskRow, delivery: string): Record<string, number> {
+  const raw = task.mcp_ops_used;
+  if (!isRecord(raw) || raw.delivery !== delivery || !isRecord(raw.counts)) return {};
+  const counts: Record<string, number> = {};
+  for (const [tool, value] of Object.entries(raw.counts)) {
+    if (Number.isInteger(value) && (value as number) > 0) counts[tool] = value as number;
+  }
+  return counts;
+}
+
+/**
+ * 入队前扣次：条件 UPDATE（delivery_id + mcp_ops_used 快照）防并发，未命中重读重试最多 3 次，
+ * 仍冲突 → conflict。已达上限 → forbidden（不入队）；入队即计次（作业失败也算）。
+ */
+async function spendOpsBudget(
+  ctx: ToolContext,
+  task: TaskRow,
+  taskId: string,
+  employee: string,
+  delivery: string,
+  tool: string,
+): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    const counts = opsCountsOf(task, delivery);
+    const used = counts[tool] ?? 0;
+    const limit = opsBudgetOf(task, tool);
+    if (used >= limit) {
+      throw new McpToolRefusal('forbidden', `本任务 ${tool} 调用次数已用完（${used}/${limit}）`, employee, taskId);
+    }
+    const prev = task.mcp_ops_used;
+    const next = { delivery, counts: { ...counts, [tool]: used + 1 } };
+    const where = prev === undefined || prev === null
+      ? 'delivery_id = $delivery AND mcp_ops_used = NONE'
+      : 'delivery_id = $delivery AND mcp_ops_used = $prev';
+    const [rows] = await ctx.db.query<[TaskRow[]]>(
+      `UPDATE $task SET mcp_ops_used = $next WHERE ${where} RETURN AFTER;`,
+      { task: new RecordId('task', taskId), delivery, prev: prev ?? undefined, next });
+    if (rows?.length) return;
+    if (attempt >= 2) throw new McpToolRefusal('conflict', '预算扣次冲突，请重试', employee, taskId);
+    const fresh = await ctx.db.select<TaskRow>(new RecordId('task', taskId));
+    if (!fresh) throw new McpToolRefusal('forbidden', '任务租约已变化', employee, taskId);
+    task = fresh;
+  }
 }
 
 /** 每请求上下文：验签后的主体、库会话与审计帮手。 */
@@ -327,7 +463,7 @@ function buildServer(ctx: ToolContext): McpServer {
     { name: 'sck-company', version: '1.0.0' },
     {
       capabilities: { tools: { listChanged: false } },
-      instructions: '公司只读工具。task_context / company_ops / company_job 需要任务租约绑定：任务必须派给你（员工 provider 在你主体的 providers 内）且租约未过期。',
+      instructions: '读用 task_current / task_context / company_landscape / company_job；交卷用 task_submit（执行阶段）、task_review（复核阶段）、task_block（受阻）；只读运维用 company_ops。需要任务的工具要求任务派给你（员工 provider 在你主体的 providers 内）且租约未过期。',
     },
   );
 
@@ -397,7 +533,7 @@ function buildServer(ctx: ToolContext): McpServer {
       const taskId = taskKeyOf(args.taskId);
       const { task, employee } = await bindTask(ctx.db, principal, taskId, ctx.nowSeconds);
       const decision = await decide(ctx.db, {
-        actorKind: 'agent', actor: employee, task: taskId, command: 'mcp.task_context', now: ctx.nowSeconds,
+        actorKind: 'agent', actor: employee, task: taskId, command: 'mcp_tool.task_context', now: ctx.nowSeconds,
       });
       if (!decision.allow) throw new McpToolRefusal('forbidden', decision.reason, employee, taskId);
       return { actor: employee, task: taskId, value: await taskContextValue(ctx, task, taskId) };
@@ -416,11 +552,11 @@ function buildServer(ctx: ToolContext): McpServer {
       const taskId = taskKeyOf(args.taskId);
       const tool = typeof args.tool === 'string' ? args.tool : '';
       if (!(MCP_OPS_ALLOW as readonly string[]).includes(tool)) throw forbidden('该工具不在公司 MCP 白名单内');
-      const { employee } = await bindTask(ctx.db, principal, taskId, ctx.nowSeconds);
-      const decision = await decide(ctx.db, {
-        actorKind: 'agent', actor: employee, task: taskId, command: tool, now: ctx.nowSeconds,
-      });
-      if (!decision.allow) throw new McpToolRefusal('forbidden', decision.reason, employee, taskId);
+      const { task, employee } = await boundAndDecided(ctx, principal, taskId, tool);
+      const facts = leaseFacts(task);
+      if (!facts) throw new McpToolRefusal('forbidden', '任务租约信息不完整', employee, taskId);
+      // 服务端次数预算：入队前扣次（条件 UPDATE 防并发），达上限不入队。
+      await spendOpsBudget(ctx, task, taskId, employee, facts.delivery, tool);
       const input = isRecord(args.args) ? args.args : {};
       const jobId = await enqueueJob(ctx.db, {
         command: tool, input, actorKind: 'agent', actor: employee, task: taskId,
@@ -466,6 +602,74 @@ function buildServer(ctx: ToolContext): McpServer {
       if (job.created_at !== undefined) value.created_at = job.created_at;
       if (job.finished_at !== undefined) value.finished_at = job.finished_at;
       return { actor: holder || `mcp:${ctx.token.sub}`, task: undefined, value };
+    }),
+  );
+
+  server.registerTool(
+    'task_submit',
+    {
+      title: '任务交卷（执行阶段）',
+      description: '执行阶段（state=doing）交卷：把结构化结论写到任务上，由持租约的执行端按原收尾流程推进。需任务绑定。summary 20..8000 字符。',
+      inputSchema: z.object({ taskId: z.string(), summary: z.string(), pr: z.string().optional(), sha: z.string().optional() }),
+    },
+    guard<Record<string, unknown>>(ctx, 'mcp.task_submit', async (args) => {
+      const principal = await principalOf(ctx);
+      const taskId = taskKeyOf(args.taskId);
+      const summary = outcomeText(args.summary, 20, 8000, 'summary');
+      const pr = args.pr === undefined ? undefined : (() => {
+        const value = String(args.pr);
+        if (!MCP_PR_RE.test(value)) throw invalid('pr 必须是 GitHub PR 链接（https://github.com/<owner>/<repo>/pull/<n>）');
+        return value;
+      })();
+      const sha = args.sha === undefined ? undefined : (() => {
+        const value = String(args.sha).toLowerCase();
+        if (!MCP_SHA_RE.test(value)) throw invalid('sha 必须是 7..40 位十六进制');
+        return value;
+      })();
+      const { task, employee } = await boundAndDecided(ctx, principal, taskId, 'mcp_tool.task_submit');
+      if (task.state !== 'doing') throw new McpToolRefusal('invalid', '复核阶段请用 task_review', employee, taskId);
+      await recordMcpOutcome(ctx, task, taskId, employee, { kind: 'submit', text: summary, pr, sha });
+      return { actor: employee, task: taskId, value: { recorded: true, kind: 'submit' } };
+    }),
+  );
+
+  server.registerTool(
+    'task_review',
+    {
+      title: '任务复核结论（复核阶段）',
+      description: '复核阶段（state=review）提交复核结论：verdict pass/return + findings（20..8000 字符）。需任务绑定。',
+      inputSchema: z.object({ taskId: z.string(), verdict: z.enum(['pass', 'return']), findings: z.string() }),
+    },
+    guard<Record<string, unknown>>(ctx, 'mcp.task_review', async (args) => {
+      const principal = await principalOf(ctx);
+      const taskId = taskKeyOf(args.taskId);
+      const verdict = args.verdict;
+      if (verdict !== 'pass' && verdict !== 'return') throw invalid('verdict 必须是 pass 或 return');
+      const findings = outcomeText(args.findings, 20, 8000, 'findings');
+      const { task, employee } = await boundAndDecided(ctx, principal, taskId, 'mcp_tool.task_review');
+      if (task.state !== 'review') throw new McpToolRefusal('invalid', '执行阶段请用 task_submit', employee, taskId);
+      await recordMcpOutcome(ctx, task, taskId, employee, { kind: 'review', text: findings, verdict });
+      return { actor: employee, task: taskId, value: { recorded: true, kind: 'review' } };
+    }),
+  );
+
+  server.registerTool(
+    'task_block',
+    {
+      title: '任务受阻（执行/复核阶段）',
+      description: '执行或复核阶段声明受阻：reason 20..4000 字符，执行端按受阻收尾。需任务绑定。',
+      inputSchema: z.object({ taskId: z.string(), reason: z.string() }),
+    },
+    guard<Record<string, unknown>>(ctx, 'mcp.task_block', async (args) => {
+      const principal = await principalOf(ctx);
+      const taskId = taskKeyOf(args.taskId);
+      const reason = outcomeText(args.reason, 20, 4000, 'reason');
+      const { task, employee } = await boundAndDecided(ctx, principal, taskId, 'mcp_tool.task_block');
+      if (task.state !== 'doing' && task.state !== 'review') {
+        throw new McpToolRefusal('invalid', '只有执行中或复核中的任务可以声明受阻', employee, taskId);
+      }
+      await recordMcpOutcome(ctx, task, taskId, employee, { kind: 'block', text: reason });
+      return { actor: employee, task: taskId, value: { recorded: true, kind: 'block' } };
     }),
   );
 

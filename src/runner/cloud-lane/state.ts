@@ -82,6 +82,11 @@ export interface DevinLaneState {
    * 不再次调用只读工具；binding 与请求锚点绑定原任务、阶段、原会话与当前请求，变了的回执不采信。
    */
   assistRelay?: DevinAssistRelay;
+  /**
+   * MCP-2：本轮 MCP 写通道开闸时记下的轮标记（开闸那一轮的 marker，不随代跑回传的 marker 变化）。
+   * 轮询时凭它判定「本轮已开闸」才读 MCP 结论；开闸失败没有它，本轮一律回落页面判定。
+   */
+  mcpOpen?: string;
 }
 
 /** 回合摘要：provider + 交给供应商的完整 prompt（含 task.md 与 findings），不是外层派工消息。 */

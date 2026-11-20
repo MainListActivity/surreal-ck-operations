@@ -17,12 +17,12 @@ export function matchesCommand(pattern: string, command: string): boolean {
  * 其余老板命令（任务、决策、消息、笔记、路由、身份、云端）由员工按身份、当前租约、保护清单与允许/禁止清单判定；
  * 老板可以在“仅老板”清单里把它们加入保护。按目标的硬锁（公司租户、老板端 Worker 等）在 owner-end/src/owner-locks.ts。
  */
-export const HARD_OWNER_ONLY: readonly string[] = ['guard.*', 'agent.*', 'owner.login.*', 'owner.settings.*', 'def.*', 'db.write', 'mcp.principal.*'];
+export const HARD_OWNER_ONLY: readonly string[] = ['guard.*', 'agent.*', 'owner.login.*', 'owner.settings.*', 'def.*', 'db.write', 'mcp.*'];
 
 /** 老板接口（owner-api.ts）的全部命令。运行器与自动化不能直接调用；tests/command-guard.test.ts 核对它与 owner-api.ts 一致。 */
 export const OWNER_API_COMMANDS: readonly string[] = [
   'approve', 'audit.list', 'board.snapshot', 'brief', 'decide', 'def.disable', 'def.enable', 'def.ensure', 'def.list', 'direction.add',
-  'fault.grant', 'inbox', 'instruct', 'landscape.get', 'mcp.principal.list', 'mcp.principal.set', 'message.draft', 'message.edit', 'message.edit_rendered', 'message.chains', 'message.hold', 'message.list', 'message.plan', 'message.records', 'message.release', 'message.send',
+  'fault.grant', 'inbox', 'instruct', 'landscape.get', 'mcp.budget.set', 'mcp.principal.list', 'mcp.principal.pending', 'mcp.principal.set', 'message.draft', 'message.edit', 'message.edit_rendered', 'message.chains', 'message.hold', 'message.list', 'message.plan', 'message.records', 'message.release', 'message.send',
   'note.activate', 'note.add', 'note.consolidate', 'note.consolidation.undo', 'note.consolidations', 'note.edit', 'note.list', 'note.pin', 'note.preview', 'note.remove', 'notice.list',
   'notice.resolve', 'dispatch.preference', 'progress', 'quota.list', 'reject', 'reply', 'route.disable', 'route.list', 'route.save', 'session.policy', 'status',
   'task.cost', 'task.create', 'task.delete', 'task.detail', 'task.list', 'task.pause', 'task.plan', 'task.reassign',

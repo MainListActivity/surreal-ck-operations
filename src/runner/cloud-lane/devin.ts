@@ -27,6 +27,7 @@ import { ensureBranchOnOrigin, fetchAndFastForward, type RepoInfo } from './repo
 import { clearInflightAttempt, laneDigest, recordInflight, recordInflightAttempt, writeLaneState, type DevinAssistRelay, type DevinSeatReading, type LaneState } from './state.ts';
 import { devinFollowScript, devinRecoverScript, devinRelayGateScript, devinSendScript, devinSessionScript, DEVIN_HOME, DEVIN_SESSION_RE } from './devin-web.ts';
 import { explicitReadonlyOpsRequest } from '../../steward/steward.ts';
+import type { McpOutcome } from '../../contracts.ts';
 import type { LaneDeps, LaneInput } from './lane.ts';
 
 /** Devin 云模式的免费模型。公司派工只允许它（老板 2026-11-15 定），不是可覆盖的默认值。 */
@@ -181,6 +182,8 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
     ? state.devin!.attempt : undefined;
   let marker = pendingAssist ?? (/^SCK-[a-f0-9]+$/.test(state.taskId ?? '') ? state.taskId!
     : `SCK-${(state.delivery ? laneDigest(input.provider, state.delivery) : ctx.digest).slice(0, 10)}`);
+  // MCP-2：本轮首个标记。开闸记它；代跑回传会把 marker 换成 relay.marker，MCP 判定仍按它，不随回传变化。
+  const roundOpenMarker = marker;
   const continuing = Boolean(state.vendorSession) || Boolean(state.taskId) || Boolean(input.resumeId);
   const followUp = continuing && !material.review
     ? '\n这是同一任务的后续轮次：该分支上可能已有你的云端会话推送过改动并开过 PR，请先拉取远端分支现状，在既有 PR 上继续更新，不要另开重复 PR。'
@@ -257,6 +260,12 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
   while (!sessionUrl) {
     if (!state.taskId) {
       const follow = sessionOf(state.vendorSession);
+      // MCP-2：只在新发送（!state.taskId）时、按下发送之前对服务端 mcp_outcome 开闸（清上一轮旧结论）。
+      // 开闸失败不阻塞发送，只是本轮不采信 MCP 结论（mcpOpen 不落盘）；代跑回传不再开闸。
+      try {
+        const opened = await deps.mcpRoundOpen?.();
+        if (opened?.opened === true) state.devin = { ...state.devin, mcpOpen: marker };
+      } catch { /* 开闸失败：本轮忽略 MCP 结论 */ }
       // 按下发送前先落盘 attempt：本目录写 .lane/state.json，共享根写 inflight/<投递键>.json。
       // 之后无论脚本如何结束、换到哪个员工目录，都只核对是否已受理，绝不再按发送。
       const at = deps.now();
@@ -368,8 +377,34 @@ export async function driveDevin(ctx: Ctx): Promise<VendorOutcome> {
 
   // ---- 阶段二：轮询会话页到终稿/提问/超时。 ----
   let settled: string | undefined, misses = 0, idleNoDone = 0;
+  // MCP-2：本轮开闸过（mcpOpen 是开闸轮的标记，不随 relay 变化；pendingAssist 续核视为同一轮）时，
+  // 每次轮询先读结构化结论——不要求页面 idle，拿到即生效。读取异常/无结论一律回落原页面逻辑。
+  const mcpOpened = () => state.devin?.mcpOpen !== undefined
+    && (state.devin.mcpOpen === roundOpenMarker || pendingAssist !== undefined);
+  const mcpVerdict = async (): Promise<VendorOutcome | undefined> => {
+    if (!mcpOpened() || !deps.mcpOutcome) return undefined;
+    let outcome: McpOutcome | undefined;
+    try {
+      outcome = await deps.mcpOutcome();
+    } catch { return undefined; }
+    if (!outcome) return undefined;
+    if (outcome.kind === 'submit' && !material.review) {
+      const text = outcome.text + (outcome.pr ? `\nPR: ${outcome.pr}` : '') + (outcome.sha ? `\nSHA: ${outcome.sha}` : '');
+      const out = await closeout(ctx, text);
+      return out.kind === 'blocked' ? { ...out, inflight: true } : out;
+    }
+    if (outcome.kind === 'review' && material.review) {
+      if (outcome.verdict !== 'pass' && outcome.verdict !== 'return') return blocked('MCP 结论与本轮阶段不符');
+      const out = await closeout(ctx, `复核结论：${outcome.verdict === 'pass' ? '通过' : '退回'}\n${outcome.text}`);
+      return out.kind === 'blocked' ? { ...out, inflight: true } : out;
+    }
+    if (outcome.kind === 'block') return blocked(`工作结果：受阻\n${outcome.text}`);
+    return blocked('MCP 结论与本轮阶段不符');
+  };
   for (;;) {
     await deps.sleep(pollMs);
+    const mcpDone = await mcpVerdict();
+    if (mcpDone) return mcpDone;
     const s = await browse(devinSessionScript(sessionUrl, marker), 90_000) as Reply;
     if (s?.code === 'login_required') return loginFail();
     if (s?.code === 'wrong_session' || offSession(s, sessionUrl)) {

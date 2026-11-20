@@ -6,7 +6,7 @@ import { authenticationLookup } from './diagnostics.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateTask, Credential, DefView, EnsureDef, ProjectView, Evidence, HistoryEntry, LeaseProof, OpsScope, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
+import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateTask, Credential, DefView, EnsureDef, ProjectView, Evidence, HistoryEntry, LeaseProof, McpOutcome, OpsScope, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
 import { ghCli, type GhRunner, type SubmitCheck } from './pr-gate.ts';
@@ -541,6 +541,42 @@ export class SurrealCompanyCore implements CompanyCore {
         role: role as Role, currentEmployee: actor.employeeId,
       }];
     });
+  }
+
+  /**
+   * 公司 MCP 第二轮写通道：open 在按下发送前清掉上一轮旧结论；read 只读到 employee/delivery/fence
+   * 与本租约 proof 一致的 mcp_outcome（别的代际/别的员工写的视作没有，只读不清）。
+   * 只校验「credential 员工 = 任务 current_employee 且 delivery_id/fence 与 proof 一致」，否则 forbidden；
+   * 不碰 version/state/lease 等任何字段（写工具自身也不写，见 owner-end/src/mcp.ts）。
+   */
+  async mcpOutcome(credential: Credential, proof: LeaseProof, op: 'open' | 'read'): Promise<
+    { opened: true } | { outcome: McpOutcome | null }
+  > {
+    const actor = await this.authorized(credential);
+    if (op !== 'open' && op !== 'read') throw new CompanyError('invalid', 'Invalid mcpOutcome op');
+    if (typeof proof.taskId !== 'string' || !proof.taskId || typeof proof.deliveryId !== 'string' || !proof.deliveryId
+      || !Number.isSafeInteger(proof.fence) || proof.fence < 0) {
+      throw new CompanyError('invalid', 'Invalid lease proof');
+    }
+    const [rows] = await this.db.query<[Array<{ current_employee?: string; delivery_id?: string; fence?: number; mcp_outcome?: unknown }>]>(
+      'SELECT current_employee, delivery_id, fence, mcp_outcome FROM $task;', { task: id('task', proof.taskId) });
+    const task = rows[0];
+    if (!task || task.current_employee !== actor.employeeId
+      || task.delivery_id !== proof.deliveryId || task.fence !== proof.fence) {
+      throw new CompanyError('forbidden', 'MCP 通道只对持本租约的员工开放');
+    }
+    if (op === 'open') {
+      await this.db.query(
+        'UPDATE $task SET mcp_outcome = NONE WHERE current_employee = $employee AND delivery_id = $delivery AND fence = $fence;',
+        { task: id('task', proof.taskId), employee: actor.employeeId, delivery: proof.deliveryId, fence: proof.fence });
+      return { opened: true };
+    }
+    const outcome = task.mcp_outcome;
+    const bound = typeof outcome === 'object' && outcome !== null
+      && (outcome as { employee?: unknown }).employee === actor.employeeId
+      && (outcome as { delivery?: unknown }).delivery === proof.deliveryId
+      && (outcome as { fence?: unknown }).fence === proof.fence;
+    return { outcome: bound ? (outcome as McpOutcome) : null };
   }
 
   async getTask(credential: Credential, taskId: TaskId): Promise<TaskView> {
