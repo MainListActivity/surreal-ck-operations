@@ -448,3 +448,69 @@ run('运行端建会话前拒绝：rejected 结案解除三处屏障，消息仍
     await w.db.db.query('UPDATE employee:synthetic SET retired = true;');
   } finally { await w.db.close(); }
 }, 20000);
+
+run('激活在启动前被拒：calling 屏障可按 rejected 结案，三指针与员工绑定清空，消息仍草稿', async () => {
+  const w = await fixture();
+  try {
+    const attempt = await w.wf.beginDispatchAttempt({ ...w.input, activationRequired: true, request: randomUUID() });
+    await w.wf.acknowledgeDispatchAttempt(attempt, 'native-fixture');
+    await w.wf.prepareDispatchActivation(attempt, 'native-fixture');
+    const attemptRecord = new RecordId('dispatch_attempt', attempt);
+    // wrong agent：拒绝且无副作用
+    await expect(w.wf.rejectActivationAttempt(attempt, 'other-agent', 'synthetic')).rejects.toThrow();
+    // revision 不符：拒绝且无副作用
+    await w.db.db.query('UPDATE $a SET revision = 2;', { a: attemptRecord });
+    await expect(w.wf.rejectActivationAttempt(attempt, 'native-fixture', 'synthetic')).rejects.toThrow();
+    await w.db.db.query('UPDATE $a SET revision = 1;', { a: attemptRecord });
+    // 正确拒绝：attempt 先落 rejected 再清三处屏障
+    await w.wf.rejectActivationAttempt(attempt, 'native-fixture', '员工身份或 sidecar 通道不可用');
+    const [rows] = await w.db.db.query<[Array<{ t: unknown; e: unknown; g: unknown; m: unknown; state: string; body: string; db: unknown; a: string; ph: string; rev: number }>]>(
+      `SELECT (SELECT VALUE dispatch_attempt FROM ONLY $task) AS t, (SELECT VALUE dispatch_attempt FROM ONLY employee:synthetic) AS e,
+        (SELECT VALUE paseo_agent_id FROM ONLY employee:synthetic) AS g,
+        dispatch_attempt AS m, state, body, dispatch_body AS db,
+        (SELECT VALUE state FROM ONLY $attempt) AS a, (SELECT VALUE rejected_phase FROM ONLY $attempt) AS ph,
+        (SELECT VALUE revision FROM ONLY $attempt) AS rev FROM outbound_message:fixture;`,
+      { task: w.record, attempt: attemptRecord });
+    expect(rows[0]).toMatchObject({ state: 'draft', body: 'fixture', a: 'rejected', ph: 'activation', rev: 2 });
+    for (const key of ['t', 'e', 'g', 'm', 'db'] as const) expect(rows[0]![key] ?? null).toBeNull();
+    expect(await w.wf.pendingDispatchAttempts()).toEqual([]);
+    await expect(w.wf.rejectActivationAttempt(attempt, 'native-fixture', 'again')).rejects.toThrow();
+  } finally { await w.db.close(); }
+}, 20000);
+
+run('激活拒绝的 CAS 边界：未 calling 的 attempt 拒绝且屏障保留', async () => {
+  const w = await fixture();
+  try {
+    const attempt = await w.wf.beginDispatchAttempt({ ...w.input, activationRequired: true, request: randomUUID() });
+    await w.wf.acknowledgeDispatchAttempt(attempt, 'native-early');
+    await expect(w.wf.rejectActivationAttempt(attempt, 'native-early', 'synthetic')).rejects.toThrow();
+    expect((await w.wf.pendingDispatchAttempts())[0]!.id).toBe(attempt);
+    const [e] = await w.db.db.query<[unknown]>('SELECT VALUE dispatch_attempt FROM ONLY employee:synthetic;');
+    expect(e).toBeDefined();
+  } finally { await w.db.close(); }
+}, 20000);
+
+run('激活拒绝的 CAS 边界：已 activated 的 attempt 拒绝且屏障保留', async () => {
+  const w = await fixture();
+  try {
+    const attempt = await w.wf.beginDispatchAttempt({ ...w.input, activationRequired: true, request: randomUUID() });
+    await w.wf.acknowledgeDispatchAttempt(attempt, 'native-live');
+    await w.wf.prepareDispatchActivation(attempt, 'native-live');
+    await w.wf.confirmDispatchActivation(attempt, 'native-live');
+    await expect(w.wf.rejectActivationAttempt(attempt, 'native-live', 'synthetic')).rejects.toThrow();
+    const pending = await w.wf.pendingDispatchAttempts();
+    expect(pending[0]!.activation_state).toBe('activated');
+  } finally { await w.db.close(); }
+}, 20000);
+
+run('激活拒绝的 CAS 边界：result_confirmed 的 attempt 拒绝且屏障保留', async () => {
+  const w = await fixture();
+  try {
+    const attempt = await w.wf.beginDispatchAttempt({ ...w.input, activationRequired: true, request: randomUUID() });
+    await w.wf.acknowledgeDispatchAttempt(attempt, 'native-confirmed');
+    await w.wf.prepareDispatchActivation(attempt, 'native-confirmed');
+    await w.db.db.query('UPDATE $a SET result_confirmed = true;', { a: new RecordId('dispatch_attempt', attempt) });
+    await expect(w.wf.rejectActivationAttempt(attempt, 'native-confirmed', 'synthetic')).rejects.toThrow();
+    expect((await w.wf.pendingDispatchAttempts())[0]!.activation_state).toBe('calling');
+  } finally { await w.db.close(); }
+}, 20000);

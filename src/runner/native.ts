@@ -14,7 +14,7 @@ export interface NativeSession {
   labels: Record<string, string>; workspaceId?: string;
   status: 'starting' | 'running' | 'idle' | 'error' | 'unknown' | 'archived';
   pendingEnd?: TurnEnded;
-  turnId?: string; pid?: number; error?: string; inputTokens?: number;
+  turnId?: string; pid?: number; error?: string; inputTokens?: number; notStarted?: true;
 }
 interface State { version: 1; host: string; sessions: NativeSession[]; workspaces: RuntimeWorkspace[] }
 export interface NativeOptions {
@@ -82,6 +82,19 @@ export function parseNativeResult(provider: NativeProvider, output: string): Nat
   return result;
 }
 
+/** 子进程尚未创建即被拒的启动失败：会话落盘为 error + notStarted，派工器据此回收派工屏障。 */
+export class ActivationRefusedError extends Error {
+  readonly code = 'activation_refused';
+  constructor(message: string) { super(message); this.name = 'ActivationRefusedError'; }
+}
+export const isActivationRefused = (error: unknown): error is ActivationRefusedError =>
+  error instanceof ActivationRefusedError || (error instanceof Error && (error as { code?: string }).code === 'activation_refused');
+/** 这些文本只会出现在子进程创建之前；历史记录按它们补记 notStarted，其他错误一律不补。 */
+const PRE_START_ERROR_TEXTS = new Set(['员工身份或 sidecar 通道不可用', '原生启动命令必须使用绝对路径', '执行端正在关闭']);
+const isPreStartError = (error: unknown): error is string =>
+  typeof error === 'string' && (PRE_START_ERROR_TEXTS.has(error)
+    || (error.startsWith('本节点没有配置 ') && error.endsWith(' 的员工沙箱命令')));
+
 /** 一台执行节点一个写者。持久化会话映射；每轮只持有一个原生 CLI 子进程。 */
 export class NativeRuntime implements AgentRuntime {
   async heartbeat(): Promise<void> { await this.options.onHeartbeat?.(); }
@@ -115,7 +128,8 @@ export class NativeRuntime implements AgentRuntime {
           if (session.status === 'running' || session.status === 'starting' || session.status === 'unknown') {
             session.status = session.pid && alive(session.pid) ? 'unknown' : 'error';
             session.error = '执行端中断；先核对原回合，不自动重发';
-          }
+          } else if (session.status === 'error' && session.pid === undefined && session.nativeSessionId === undefined
+            && isPreStartError(session.error)) session.notStarted = true;
           this.sessions.set(session.id, session);
         }
         for (const workspace of state.workspaces) this.workspaces.set(workspace.workspaceId, workspace);
@@ -138,6 +152,7 @@ export class NativeRuntime implements AgentRuntime {
   async list() { return new Map([...this.sessions.values()].filter(s => s.status !== 'archived').map(s => [s.id, { id: s.id, status: s.status === 'starting' || this.settling.has(s.id) ? 'running' : s.status, model: s.model }])); }
   async status(id: string) { const s = this.sessions.get(id); return s && { status: s.status === 'starting' || this.settling.has(s.id) ? 'running' : s.status, pendingPermissions: 0 }; }
   async lastError(id: string) { return this.get(id).error ?? ''; }
+  activationRefused(id: string): boolean { const s = this.sessions.get(id); return !!s && s.status === 'error' && s.notStarted === true; }
   async logsTail(id: string, entries: number) { return (this.logs.get(id) ?? '').split('\n').slice(-Math.max(0, entries)).join('\n'); }
   async lastInputTokens(id: string) { return this.get(id).inputTokens; }
   async spawn(input: SpawnInput): Promise<string> {
@@ -178,11 +193,14 @@ export class NativeRuntime implements AgentRuntime {
       if (!command.length || !command[0]!.startsWith('/')) throw new Error('原生启动命令必须使用绝对路径');
       env = await this.options.environment(structuredClone(s));
       if (this.closed) throw new Error('执行端正在关闭');
-    } catch (error) { s.status = 'error'; s.error = (error as Error).message; this.save(); throw error; }
+    } catch (error) {
+      s.status = 'error'; s.error = (error as Error).message; s.notStarted = true; this.save();
+      throw new ActivationRefusedError(s.error);
+    }
     const child = spawnProcess(command[0]!, [...command.slice(1), ...nativeArgs({ ...s, companyMcp: this.options.companyMcp })], {
       cwd: s.cwd, env, stdio: ['pipe', 'pipe', 'pipe'], shell: false, detached: process.platform !== 'win32',
     });
-    s.pid = child.pid; this.save();
+    s.pid = child.pid; s.notStarted = undefined; this.save();
     const turnId = s.turnId;
     const activity = new ActivityCollector(s.id, turnId!, Date.now());
     this.activities.set(turnId!, activity);

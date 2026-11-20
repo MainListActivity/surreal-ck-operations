@@ -887,6 +887,33 @@ export class Workforce {
       COMMIT;`, { attempt: id('dispatch_attempt', attempt), reason: reason.slice(0, 500) });
   }
 
+  /**
+   * The runtime refused activation before the child process started (native sessions record `notStarted`): the prompt
+   * was never delivered, so the barrier is lifted and the employee's agent binding is cleared without a delivery.
+   * The attempt must still hold the pre-activation barrier exactly (pending, calling, revision 1) — anything else fails.
+   */
+  async rejectActivationAttempt(attempt: string, agent: string, reason: string): Promise<void> {
+    await this.db.query(`BEGIN;
+      LET $a = SELECT * FROM ONLY $attempt;
+      IF $a = NONE OR $a.state != 'pending' OR $a.kind != 'spawn' OR $a.revision != 1 OR $a.agent != $agent
+        OR $a.activationRequired != true OR $a.activation_state != 'calling' OR $a.result_confirmed = true {
+        THROW 'dispatch activation rejection conflict' };
+      LET $task = type::record('task', $a.task);
+      LET $employee = type::record('employee', $a.employee);
+      LET $message = type::record('outbound_message', $a.message);
+      LET $t = SELECT * FROM ONLY $task;
+      LET $e = SELECT * FROM ONLY $employee;
+      LET $msg = SELECT * FROM ONLY $message;
+      IF $t.dispatch_attempt != $attempt OR $e.dispatch_attempt != $attempt OR $msg.dispatch_attempt != $attempt { THROW 'dispatch activation rejection generation changed' };
+      IF $e.retired = true OR $e.revoked = true OR $e.paseo_agent_id != $agent { THROW 'dispatch activation rejection agent changed' };
+      IF $t.current_employee != $a.employee OR $t.delivery_id != $a.delivery OR $t.fence != $a.fence { THROW 'dispatch activation rejection lease changed' };
+      UPDATE ONLY $attempt SET state = 'rejected', revision += 1, rejected_at = time::now(), rejected_reason = $reason, rejected_phase = 'activation';
+      UPDATE ONLY $message SET dispatch_body = NONE, dispatch_attempt = NONE;
+      UPDATE ONLY $employee SET dispatch_attempt = NONE, paseo_agent_id = NONE;
+      UPDATE ONLY $task SET dispatch_attempt = NONE;
+      COMMIT;`, { attempt: id('dispatch_attempt', attempt), agent, reason: reason.slice(0, 500) });
+  }
+
   async pendingDispatchAttempts(): Promise<Array<{ id: string; employee: string; task?: string; kind: string; agent?: string; revision?: number; result_confirmed?: boolean; activationRequired?: boolean; activation_state?: string }>> {
     const [rows] = await this.db.query<[Array<{ id: RecordId; employee: string; task?: string; kind: string; agent?: string; revision?: number; result_confirmed?: boolean; activationRequired?: boolean; activation_state?: string }>]>(
       "SELECT * FROM dispatch_attempt WHERE state = 'pending';");

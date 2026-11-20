@@ -167,6 +167,7 @@ export const RELEASE_SCHEMA_REQUIREMENTS: ReleaseSchemaRequirement[] = [
   // Devin 中继环路修复不新增表；沿用 schema 074。
   { version: '0.13.79', schema: 74, tables: ['task', 'outbound_message', 'route', 'runner_heartbeat', 'company_meta', 'dispatch_attempt', 'dispatch_recovery_approval', 'dispatch_recovery_receipt', 'agent_activity', 'reply_translation', 'turn_analysis', 'planned_message', 'owner_style_memory', 'fault_recovery_grant'] },
   // MCP 受阻收尾补 awaitingOwner 不新增表；沿用 schema 074。
+  { version: '0.13.81', schema: 74, tables: ['task', 'outbound_message', 'route', 'runner_heartbeat', 'company_meta', 'dispatch_attempt', 'dispatch_recovery_approval', 'dispatch_recovery_receipt', 'agent_activity', 'reply_translation', 'turn_analysis', 'planned_message', 'owner_style_memory', 'fault_recovery_grant'] },
   { version: '0.13.80', schema: 74, tables: ['task', 'outbound_message', 'route', 'runner_heartbeat', 'company_meta', 'dispatch_attempt', 'dispatch_recovery_approval', 'dispatch_recovery_receipt', 'agent_activity', 'reply_translation', 'turn_analysis', 'planned_message', 'owner_style_memory', 'fault_recovery_grant'] },
 ];
 /** The requirement that applies to a target version: the newest one that is not newer than the target. */

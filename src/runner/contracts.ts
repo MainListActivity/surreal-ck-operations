@@ -68,6 +68,8 @@ export interface AgentRuntime {
   lastInputTokens(agentId: string): Promise<number | undefined>;
   spawn(input: SpawnInput): Promise<string>;
   activate?(agentId: string): Promise<void>;
+  /** The session's activation was refused before its process ever started (native runtime only; absent means false). */
+  activationRefused?(agentId: string): boolean | Promise<boolean>;
   send(agentId: string, prompt: string): Promise<void>;
   stop(agentId: string): Promise<void>;
   /** Close only the runtime via native MCP; keep agent persistence and archive state. */
