@@ -1,18 +1,15 @@
 {
-  "version": "0.13.67",
-  "title": "公司服务全景：仓库/服务/主机/部署与回滚登记可查，未登记服务自动发现",
+  "version": "0.13.68",
+  "title": "VPS 核对改读 Caddy 管理接口；登记表补全首轮实机发现的 VPS 服务",
   "changes": [
-    "新增 landscape/company-landscape.json 作为公司服务唯一登记处（hosts/repos/services），src/landscape.ts 启动即校验：枚举、id 唯一、repo/host 引用、repo.project 不重复。",
-    "只读命令 landscape.get（sck owner 与员工 company_cmd 均可调，host 可选过滤）返回登记表与各主机最近一次实机核对及 drift。",
-    "VPS 实机核对挂进 sck-owner-minute 分钟任务（systemctl 单元、ss 监听、Caddyfile 路由摘要，只读），Mac 核对挂进插件派工循环（launchctl + LaunchAgents plist），均 60 分钟一轮。",
-    "比对出的未登记在跑/登记缺失/应退役仍在写入观测并按 host 发老板提示 landscape-drift:<hostId>，一致自动关闭，采集失败只留观测。",
-    "project.services 随任务下发：经 repo.project 关联出该项目的部署服务与回滚说明。",
-    "门禁测试：owner-end/deploy 全部 systemd 单元与 wrangler Worker name 必须已登记，新增未登记服务会被测试挡住。"
+    "VPS 实机核对的 Caddy 路由采集改为读管理接口 http://127.0.0.1:2019/config/apps/http/servers（sck-owner 用户读不了 /etc/caddy/Caddyfile），5 秒超时，失败只记脱敏原因。",
+    "登记表按首轮实机核对补全 VPS 服务：TiKV/PD、监控组件（prometheus/grafana/node_exporter/blackbox_exporter）、shadowsocks、podman 均登记为 review；主机基线同步扩充。",
+    "旧 sck-company-mcp 标记 retire 待退役；podman-auto-update 计时器及其隐含 service 一并登记。"
   ],
   "impact": [
-    "老板与员工都能查询公司服务全景与其不一致项；有人新增未登记服务会在一小时内成为老板提示。",
-    "不新增服务、端口、定时器、环境变量与 schema：核对挂在既有分钟任务与派工循环里，通知复用 owner_notice，观测复用 company_meta。"
+    "分钟任务不再因 EACCES 报 Caddyfile 读取失败，路由摘要恢复为实机真实配置。",
+    "已补登的服务不再反复出现在漂移提示里；仍未登记的单元继续按未登记告警。"
   ],
-  "migration": "无 schema 变化（沿用 schema 074），只新增 company_meta 记录与 owner_notice",
-  "rollback": "回退至 0.13.66：landscape.get 不再可用，实机核对停止；已写入的 company_meta 观测记录与已关闭的提示不受影响，打开的 landscape-drift 提示可经 notice.resolve 手动关闭。"
+  "migration": "无 schema 变化（沿用 schema 074）",
+  "rollback": "回退至 0.13.67：Caddy 采集回到读 /etc/caddy/Caddyfile（对 sck-owner 不可读，路由项将再次为 null）；新补登的服务条目随之移除，实机核对会重新把它们报为未登记。"
 }

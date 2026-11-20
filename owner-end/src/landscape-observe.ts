@@ -1,7 +1,8 @@
 /**
- * VPS 实机核对（owner-end 分钟任务）：只读采集 systemctl 单元、ss 监听地址与 /etc/caddy/Caddyfile 路由，
- * 与登记表（COMPANY_LANDSCAPE）比对后落 company_meta 并按需发老板提示。
- * exec 与读文件由调用方注入：生产由 server-cron.ts 给本机实现，测试用假实现；Worker 端不注入即跳过，
+ * VPS 实机核对（owner-end 分钟任务）：只读采集 systemctl 单元、ss 监听地址与 Caddy 管理接口路由
+ * （sck-owner 用户读不了 /etc/caddy/Caddyfile，改读 127.0.0.1:2019），与登记表（COMPANY_LANDSCAPE）
+ * 比对后落 company_meta 并按需发老板提示。
+ * exec 与 fetch 由调用方注入：生产由 server-cron.ts 给本机实现，测试用假实现；Worker 端不注入即跳过，
  * 不在这里写库，避免把云端免费 Worker 的空观测覆盖 VPS 的真实结果。
  */
 import type { Surreal } from 'surrealdb';
@@ -12,20 +13,25 @@ import { clip, redactText } from '../../src/ops/redact.ts';
 
 /** 同一台主机两次实机核对的最小间隔。 */
 export const OBSERVE_INTERVAL_MS = 60 * 60 * 1000;
-/** Caddyfile 摘要最多保留的行数（站点地址行 + handle/reverse_proxy 行）。 */
+/** Caddy 路由摘要最多保留的行数。 */
 export const CADDY_ROUTE_LINES = 100;
-
-export type ReadFileFn = (path: string) => Promise<string>;
+/** Caddy 管理接口地址与超时：读 servers 配置的 GET，不给它拖住分钟任务的时间。 */
+export const CADDY_ADMIN_URL = 'http://127.0.0.1:2019/config/apps/http/servers';
+const CADDY_ADMIN_TIMEOUT_MS = 5_000;
 
 export interface VpsObserveDeps {
   exec: ExecFn;
-  readFile: ReadFileFn;
+  /** Caddy 管理接口的请求实现（server-cron 注入全局 fetch；缺省时退回全局 fetch）。 */
+  fetch?: typeof fetch;
   now?: Date;
 }
 
 export type LandscapeRunSummary =
   | { skipped: 'recent'; host: string; at: string }
   | { host: string; drift: Drift };
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
 
 const failure = (step: string, error: unknown): string =>
   clip(redactText(`${step} 失败：${error instanceof Error ? error.message : String(error)}`), 200);
@@ -43,23 +49,61 @@ export function parseListenAddresses(stdout: string): string[] {
   return stdout.split('\n').map(line => line.trim().split(/\s+/)[3]).filter((addr): addr is string => Boolean(addr));
 }
 
-const TOP_LEVEL = /^\S/;
+interface RouteMatch { hosts: Set<string>; paths: Set<string> }
 
-/** 摘取 Caddyfile 的站点地址行与 handle / handle_path / reverse_proxy 行，最多 maxLines 行。 */
-export function extractCaddyRoutes(content: string, maxLines = CADDY_ROUTE_LINES): string[] {
-  const routes: string[] = [];
-  for (const raw of content.split('\n')) {
-    const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
-    // 顶格非注释行是站点地址或全局块；（ 开头的 import 片段与 } 收尾都不是地址。
-    const isSiteAddress = TOP_LEVEL.test(raw) && !line.startsWith('(') && !line.startsWith('}') && !line.startsWith('import');
-    const isRouteDirective = /^(handle|handle_path|reverse_proxy)\b/.test(line);
-    if (isSiteAddress || isRouteDirective) {
-      routes.push(line);
-      if (routes.length >= maxLines) break;
-    }
+const strings = (value: unknown): string[] =>
+  Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+
+/** 把 route.match 的 host/path 匹配并进 ctx（subroute 的路由继承外层匹配）。 */
+const mergedMatch = (route: Record<string, unknown>, ctx: RouteMatch): RouteMatch => {
+  const merged = { hosts: new Set(ctx.hosts), paths: new Set(ctx.paths) };
+  for (const match of Array.isArray(route.match) ? route.match : []) {
+    if (!isRecord(match)) continue;
+    for (const host of strings(match.host)) merged.hosts.add(host);
+    for (const path of strings(match.path)) merged.paths.add(path);
   }
-  return routes;
+  return merged;
+};
+
+const handlerTarget = (handler: Record<string, unknown>): string => {
+  if (handler.handler === 'reverse_proxy') {
+    const dials = Array.isArray(handler.upstreams)
+      ? handler.upstreams.map(upstream => isRecord(upstream) && typeof upstream.dial === 'string' ? upstream.dial : '?')
+      : [];
+    return dials.join(',') || 'reverse_proxy';
+  }
+  return typeof handler.handler === 'string' ? handler.handler : '?';
+};
+
+const walkRoutes = (routes: unknown, ctx: RouteMatch, out: string[], maxLines: number): void => {
+  if (!Array.isArray(routes)) return;
+  for (const route of routes) {
+    if (out.length >= maxLines) return;
+    if (!isRecord(route)) continue;
+    const match = mergedMatch(route, ctx);
+    const handles = Array.isArray(route.handle) ? route.handle.filter(isRecord) : [];
+    const subroutes = handles.filter(handler => handler.handler === 'subroute');
+    if (subroutes.length) {
+      for (const subroute of subroutes) walkRoutes(subroute.routes, match, out, maxLines);
+      continue;
+    }
+    const targets = handles.map(handlerTarget);
+    out.push(`${[...match.hosts].join(',') || '*'} ${[...match.paths].join(',') || '*'} -> ${targets.join(',') || '?'}`);
+  }
+};
+
+/** 把 Caddy 管理接口 /config/apps/http/servers 的 JSON 摘要成路由行；畸形输入返回空数组，不抛错。 */
+export function extractCaddyAdminRoutes(json: unknown, maxLines = CADDY_ROUTE_LINES): string[] {
+  if (!isRecord(json)) return [];
+  const out: string[] = [];
+  for (const server of Object.values(json)) {
+    if (out.length >= maxLines) break;
+    if (!isRecord(server)) continue;
+    // servers.*.listen 仅用于确认这是 http 服务器对象；路由行本身不输出监听口。
+    if (server.listen !== undefined && !Array.isArray(server.listen)) continue;
+    walkRoutes(server.routes, { hosts: new Set(), paths: new Set() }, out, maxLines);
+  }
+  return out;
 }
 
 /** 采集本机观测；任一采集项失败记 null 并加一条脱敏后的原因（不输出原始 stderr）。 */
@@ -74,17 +118,22 @@ export async function collectVpsObservation(deps: VpsObserveDeps): Promise<HostO
       return null;
     }
   };
-  const execOk = async (name: string, command: string, args: string[]): Promise<string> => {
+  const execOk = async (command: string, args: string[]): Promise<string> => {
     const result = await deps.exec(command, args);
     if (result.code !== 0) throw new Error(`${command} 退出码 ${result.code}`);
     return result.stdout;
   };
   const units = await step('systemctl 单元采集', async () =>
-    parseSystemctlUnits(await execOk('systemctl 单元采集', 'systemctl',
+    parseSystemctlUnits(await execOk('systemctl',
       ['list-units', '--type=service,timer', '--all', '--plain', '--no-legend', '--no-pager'])));
   const listen = await step('ss 监听采集', async () =>
-    parseListenAddresses(await execOk('ss 监听采集', 'ss', ['-ltnH'])));
-  const caddyRoutes = await step('Caddyfile 路由采集', async () => extractCaddyRoutes(await deps.readFile('/etc/caddy/Caddyfile')));
+    parseListenAddresses(await execOk('ss', ['-ltnH'])));
+  const caddyRoutes = await step('Caddy 路由采集', async () => {
+    const fetchFn = deps.fetch ?? fetch;
+    const response = await fetchFn(CADDY_ADMIN_URL, { signal: AbortSignal.timeout(CADDY_ADMIN_TIMEOUT_MS) });
+    if (!response.ok) throw new Error(`Caddy 管理接口 HTTP ${response.status}`);
+    return extractCaddyAdminRoutes(await response.json());
+  });
   return {
     host,
     at: (deps.now ?? new Date()).toISOString(),
