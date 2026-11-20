@@ -104,7 +104,7 @@ export const CLOUD_SCHEMA_VERSION = 74;
 
 export class CompanyDatabase {
   /** 当前会话的客户端；云端续期或重连时整体替换（见 rebuildNow）。 */
-  private session = new Surreal();
+  private session = new Surreal({ streaming: false });
   /** 调用方持有的客户端：转发到当前会话，续期后自动指向新会话。 */
   readonly db: Surreal = forwardTo(() => this.session);
   /** 云端当前采用的会话；本机模式不用。 */
@@ -237,7 +237,7 @@ export class CompanyDatabase {
 
   private async rebuildNow(): Promise<void> {
     if (this.closing) throw new Error('数据库连接已关闭');
-    const client = new Surreal();
+    const client = new Surreal({ streaming: false });
     let expiresAt: number | undefined;
     // 关闭 SDK 自动重连：断线立即发出 'disconnected'，由 onDisconnected 的退避重建接管（SDK 重连不会恢复 ns/db/登录）。
     const opening = openDb(client, this.cloudTarget(issued => {
