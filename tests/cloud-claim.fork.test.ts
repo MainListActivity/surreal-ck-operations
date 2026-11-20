@@ -32,7 +32,7 @@ beforeAll(async () => {
   const listener = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('fixture') });
   const port = listener.port!; listener.stop(true);
   url = `ws://127.0.0.1:${port}/rpc`;
-  server = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root', '--pass', ROOT_PASSWORD, '--log', 'error', `rocksdb:${dir}/db`], { stdout: 'ignore', stderr: 'ignore' });
+  server = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root', '--pass', ROOT_PASSWORD, '--log', 'error', `surrealkv:${dir}/db`], { stdout: 'ignore', stderr: 'ignore' });
   for (let n = 0; n < 160; n++) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break; } catch {} await new Promise(done => setTimeout(done, 25)); }
   // 两个执行端各自一个连接；bootstrap 只做一次。
   dbA = new CompanyDatabase(config());

@@ -230,7 +230,7 @@ run('真实数据库 SIGKILL 重启：持久化 activation calling 隔离，已�
   const config: DatabaseConfig = { url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: 'isolated-crash-fixture', namespace: 'unused', database: 'control_plane' };
   let server: ReturnType<typeof Bun.spawn> | undefined, db: CompanyDatabase | undefined;
   const start = async () => {
-    server = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', config.rootUser, '--pass', config.rootPassword, '--log', 'error', `rocksdb:${dir}/db`], { stdout: 'ignore', stderr: 'ignore' });
+    server = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', config.rootUser, '--pass', config.rootPassword, '--log', 'error', `surrealkv:${dir}/db`], { stdout: 'ignore', stderr: 'ignore' });
     for (let n = 0; n < 160; n++) {
       try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) return; } catch {}
       await Bun.sleep(25);

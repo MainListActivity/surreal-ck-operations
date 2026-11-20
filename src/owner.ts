@@ -543,7 +543,7 @@ export class OwnerDesk {
 
   private async run(query: string, vars: Record<string, unknown>): Promise<unknown[]> {
     const responses = await this.db.query<unknown[]>(query, vars).responses();
-    const failure = responses.find(r => !r.success && !r.error.message.includes('not executed due to') && !r.error.message.startsWith('Cannot COMMIT'));
+    const failure = responses.find(r => !r.success && !r.error.message.includes('not executed due to'));
     if (failure && !failure.success) {
       // THROW reaches the client as "An error occurred: <message>"; the message itself is ours.
       const message = failure.error.message.replace(/^An error occurred: /, '');

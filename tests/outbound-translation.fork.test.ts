@@ -20,7 +20,7 @@ async function startFork(name: string) {
   const reservation = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('fixture') });
   const port = reservation.port!; reservation.stop(true);
   const child = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root', '--pass', ROOT_PASSWORD,
-    '--log', 'error', `rocksdb:${dir}/database`], { stdout: 'ignore', stderr: 'ignore' });
+    '--log', 'error', `surrealkv:${dir}/database`], { stdout: 'ignore', stderr: 'ignore' });
   const db = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: ROOT_PASSWORD,
     namespace: `isolated_translation_${name.replaceAll('-', '_')}`, database: 'control_plane' });
   const close = async () => { await db.close(); child.kill(); await child.exited; rmSync(dir, { recursive: true, force: true }); };

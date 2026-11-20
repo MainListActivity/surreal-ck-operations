@@ -201,7 +201,7 @@ async function startFork(dir: string, password: string): Promise<{ port: number;
   const port = probe.port!;
   probe.stop(true);
   const proc = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root', '--pass', password,
-    '--log', 'error', `rocksdb:${dir}/db`], { stdout: 'ignore', stderr: 'ignore' });
+    '--log', 'error', `surrealkv:${dir}/db`], { stdout: 'ignore', stderr: 'ignore' });
   for (let attempt = 0; attempt < 240; attempt++) {
     try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break; } catch { /* not up yet */ }
     await Bun.sleep(25);

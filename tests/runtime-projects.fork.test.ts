@@ -11,7 +11,7 @@ run('真实公司 fork：读取长期阻塞员工及原因，不依赖近期事�
   const reservation=Bun.serve({hostname:'127.0.0.1',port:0,fetch:()=>new Response('fixture')});
   const port=reservation.port!;reservation.stop(true);
   const child=Bun.spawn([join(homedir(),'.surrealdb/surreal'),'start','--bind',`127.0.0.1:${port}`,
-    '--user','root','--pass','runtime-room-fixture','--log','error',`rocksdb:${dir}/db`],{stdout:'ignore',stderr:'ignore'});
+    '--user','root','--pass','runtime-room-fixture','--log','error',`surrealkv:${dir}/db`],{stdout:'ignore',stderr:'ignore'});
   const db=new Surreal();
   try {
     let ready=false;
@@ -33,6 +33,7 @@ run('真实公司 fork：读取长期阻塞员工及原因，不依赖近期事�
       DEFINE TABLE agent_activity SCHEMALESS;
       DEFINE TABLE product_requirement SCHEMALESS;
       DEFINE TABLE requirement_plan SCHEMALESS;
+      DEFINE TABLE reply_translation SCHEMALESS;
       CREATE project:app SET name='测试项目';
       CREATE task:blocked SET title='缺少权限', state='blocked', project=project:app;
       CREATE outbound_message:execute SET task=task:blocked, state='sent', step='execute', sent_to='dev', sent_at=time::now()-1m;

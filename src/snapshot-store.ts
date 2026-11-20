@@ -765,7 +765,7 @@ export class SnapshotStore {
       const failures = responses.filter(response => !response.success);
       if (failures.length === 0) return { outcome: 'done' };
       const cause = failures.map(response => response.error.message)
-        .find(message => !message.includes('not executed due to') && !message.startsWith('Cannot COMMIT')) ?? '';
+        .find(message => !message.includes('not executed due to')) ?? '';
       if (/snapshot quota moved/.test(cause)) return { outcome: 'moved' };
       if (/snapshot write refused|snapshot commit refused|snapshot absent/.test(cause)) return { outcome: 'refused' };
       if (!/conflict/i.test(cause)) throw unavailable('the listing store refused the statement; retry the read');

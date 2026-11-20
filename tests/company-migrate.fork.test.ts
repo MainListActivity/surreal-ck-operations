@@ -151,7 +151,7 @@ beforeAll(async () => {
   listener.stop(true);
   surrealUrl = `ws://127.0.0.1:${port}/rpc`;
   server = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root',
-    '--pass', ROOT_PASSWORD, '--log', 'error', `rocksdb:${dir}/db`], { stdout: 'ignore', stderr: 'ignore' });
+    '--pass', ROOT_PASSWORD, '--log', 'error', `surrealkv:${dir}/db`], { stdout: 'ignore', stderr: 'ignore' });
   for (let n = 0; n < 160; n++) {
     try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break; } catch { /* 尚未就绪 */ }
     await delay(25);
