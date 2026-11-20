@@ -29,7 +29,9 @@ export interface LaneState {
   devin?: DevinLaneState;
 }
 
-/** 仅移除已结清的同一个供应商任务；同公司任务上别的在途发送不可误删。 */
+/** 仅移除已结清的同一个供应商任务；同公司任务上别的在途发送不可误删。
+ *  例外：awaitingOwner 的登记代表一个已在「等老板答复」处收尾的旧轮，本轮新投递已发进同一会话并结清，
+ *  一并清掉以免下一轮再把它当成在途记录。 */
 export function clearSettledInflight(stateRoot: string | undefined, provider: string, task: string | undefined, taskId: string | undefined): void {
   if (!stateRoot || !task || !taskId) return;
   const dir = join(stateRoot, provider, 'inflight');
@@ -38,7 +40,7 @@ export function clearSettledInflight(stateRoot: string | undefined, provider: st
       if (!name.endsWith('.json')) continue;
       try {
         const row = JSON.parse(readFileSync(join(dir, name), 'utf8')) as InflightEntry;
-        if (row.task === task && row.taskId === taskId) rmSync(join(dir, name), { force: true });
+        if (row.task === task && (row.taskId === taskId || row.awaitingOwner === true)) rmSync(join(dir, name), { force: true });
       } catch { /* 损坏或并发清理的记录不影响收尾 */ }
     }
   } catch { /* 没有共享目录 */ }
@@ -87,6 +89,12 @@ export interface DevinLaneState {
    * 轮询时凭它判定「本轮已开闸」才读 MCP 结论；开闸失败没有它，本轮一律回落页面判定。
    */
   mcpOpen?: string;
+  /**
+   * 本轮以「Devin 停下来等输入、需老板答复」收尾（中继 escalate、中继门禁不可发、或没有任何代跑能力）。
+   * 老板 reply 产生新投递时，凭它决定开新一轮发跟进，而不是把旧轮标记接回来轮询旧锚点。
+   * 超时、错会话、找不到标记、未确认回传意图等其它受阻都不置位——那些轮次会话仍可能在途，恢复时照旧接回。
+   */
+  awaitingOwner?: true;
 }
 
 /** 回合摘要：provider + 交给供应商的完整 prompt（含 task.md 与 findings），不是外层派工消息。 */
@@ -133,6 +141,8 @@ export interface InflightEntry {
    * 在恢复时再核对，不一致就丢弃。只在仍有待确认回传意图、或回合仍可能在途时保留。
    */
   assistRelay?: DevinAssistRelay;
+  /** 与 DevinLaneState.awaitingOwner 同义：本轮在「Devin 等老板答复」处受阻，新投递应开新一轮而不是接回轮询。 */
+  awaitingOwner?: true;
 }
 
 function inflightPath(stateRoot: string, provider: string, digest: string): string {
@@ -251,5 +261,6 @@ export function recordInflight(stateRoot: string | undefined, provider: string, 
   }
   if (devin?.assistRounds !== undefined) entry.assistRounds = devin.assistRounds;
   if (devin?.assistRelay) entry.assistRelay = devin.assistRelay;
+  if (devin?.awaitingOwner === true) entry.awaitingOwner = true;
   writeInflight(stateRoot, provider, digest, entry);
 }

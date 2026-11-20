@@ -302,8 +302,8 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
     return blocked(`上一轮 Devin Cloud 已按下发送（或发送中途中断）但未确认受理，且没有会话地址可核对；为避免另建重复会话，本轮未发出。在途登记已保留，请人工核对会话列表后再决定是否重派。`);
   if (!sameRound) {
     delete next.taskId; delete next.taskUrl; delete next.submittedAt;
-    // 落点会话属于旧回合的发送，新回合不沿用；仍在途的旧发送由共享登记另行决定。
-    if (next.devin) next.devin = { ...next.devin, attemptSession: undefined };
+    // 落点会话与「等老板答复」标记都属于旧回合的发送，新回合不沿用；仍在途的旧发送由共享登记另行决定。
+    if (next.devin) next.devin = { ...next.devin, attemptSession: undefined, awaitingOwner: undefined };
   }
   // 本 comm 目录没有在途任务时查共享登记：同一投递换员工实例也能重连，而不是重复提交云端任务。
   if (!next.taskId) {
@@ -365,11 +365,13 @@ export async function runLane(input: LaneInput, deps: LaneDeps): Promise<LaneOut
     } else if (next.task) {
       // 摘要变了（返工改了 findings 等）：同一公司任务在别的目录里的登记仍代表已发出的会话，不能当成新任务另建。
       // 未确认受理且没有会话地址的只能受阻交人工核对；有会话地址的沿用它做跟进（同一会话，不另建）。
-      // 投递键时代例外：不同键的登记属于上一轮投递。上一轮若以受阻收尾，本轮要把新派工消息（含老板答复）
-      // 作为跟进发进同一会话、开新一轮标记——把旧轮 taskId/代跑轮数带回来会轮询旧锚点，把旧轮留在页面里的
-      // OPS-REQUEST 当成新请求重跑（真实任务 6f05139e：老板的 reply 永远到不了会话）。旧式无投递键
-      // 登记仍按摘要找回，行为不变。
-      const accepted = delivery !== undefined ? [] : others.filter(entry => bindsTask(entry) && entry.taskId && inflightSession(entry));
+      // 例外：awaitingOwner 的旧投递登记代表上一轮已停在「Devin 等老板答复」处——老板的 reply 产生新投递时，
+      // 必须把新派工消息（含老板答复）作为跟进发进同一会话、开新一轮标记；把旧轮 taskId/代跑轮数带回来
+      // 会轮询旧锚点，把旧轮留在页面里的 OPS-REQUEST 当成新请求重跑（真实任务 6f05139e：老板的 reply
+      // 永远到不了会话）。不带 awaitingOwner 的旧登记（超时、仍在工作、未确认意图等）仍照旧接回：
+      // 会话可能还在处理上一轮，绝不能往里再塞一遍同一任务。
+      const accepted = others.filter(entry => bindsTask(entry) && entry.taskId && inflightSession(entry)
+        && !(delivery !== undefined && entry.awaitingOwner === true));
       const sessions = new Set(accepted.map(entry => inflightSession(entry)!));
       if (sessions.size > 1)
         return blocked('同一任务存在多条 Devin Cloud 已受理记录且落点会话不一致，无法判定当前会话；为避免错发或另建重复会话，本轮未发出。在途登记已保留，请人工核对后再决定是否重派。');

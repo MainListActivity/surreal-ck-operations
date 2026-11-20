@@ -1481,16 +1481,20 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     });
 
     test('跨租约重派（新投递键、新员工目录）：开新一轮发跟进进旧会话，含老板答复、不重跑旧请求（6f05139e 回归）', async () => {
-      // 第一租约模拟受阻现场：会话已受理、页面停在等待指示、作者块里留着只读请求，回合受阻并保留在途状态。
+      // 第一租约模拟 6f05139e 的受阻现场：会话已受理、页面停在等待指示、作者块里有只读请求，
+      // 中继代跑被 escalate（真实 invalid→escalate 路径），回合受阻并在在途登记上留下 awaitingOwner。
       const first = world({ extra: gitOk });
       const stuck = devinBrowse({ send: [{ ok: true, url: SESSION }], session: [waiting(REQUEST)] });
       const out1 = await runLane(first.input({ provider: 'devin-cloud', env: { SCK_DELIVERY_ID: 'lease-old' } }),
-        { ...first.deps, browse: stuck.browse });
+        { ...first.deps, browse: stuck.browse,
+          assist: async () => ({ decision: 'escalate', reason: '代跑 ops_health 失败（invalid），本地已记录，转交老板裁决' }) });
       expect(out1.status).toBe('success');
       expect(out1.text.split('\n')[0]).toBe('工作结果：受阻');
+      expect(out1.text).toContain('转交老板');
       const prior = readInflight(first.stateRoot, 'devin-cloud', 'lease-old');
       expect(prior?.taskId).toBeDefined();
       expect(prior?.taskUrl).toBe(SESSION);
+      expect(prior?.awaitingOwner).toBe(true);
 
       // 老板 reply 生成新投递：必须把新派工消息（含老板答复）作为跟进发进同一会话、开新一轮标记，
       // 绝不能轮询旧锚点把页面里残留的旧 OPS-REQUEST 当成新请求重跑（真实任务 6f05139e：老板答复两次都
@@ -1519,6 +1523,8 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
       expect(follows[0]).toMatch(/SCK-[a-f0-9]+/);
       expect(follows[0]).not.toContain(prior!.taskId!);
       expect(readLaneState(second.commDir)?.devin?.attempt).toBeUndefined();
+      // 新轮结清后，旧投递键的 awaitingOwner 登记一并清掉，下一轮不会再把它当成在途记录。
+      expect(readInflight(first.stateRoot, 'devin-cloud', 'lease-old')).toBeUndefined();
     });
 
     test('前置探测脚本本身零填写零发送：原会话 Free、idle、组织首页 2/2 时给出 quota_full', async () => {
@@ -2215,7 +2221,7 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     }
   });
 
-  test('超时受阻后新 delivery/新目录重派：新轮跟进发进旧会话（含老板答复），结清旧登记', async () => {
+  test('超时受阻后新 delivery/新目录重派：领养旧 taskId/taskUrl/submittedAt，零发送且结清旧登记', async () => {
     const first = world({ extra: gitOk });
     const a = devinBrowse({ send: [{ ok: true, url: SESSION }],
       session: [{ ok: true, markerSeen: true, status: 'working', done: null }] });
@@ -2225,26 +2231,24 @@ describe('devin-cloud 通道（网页 Free 入口）', () => {
     const prior = readInflight(first.stateRoot, 'devin-cloud', 'lease-old')!;
     expect(prior.taskId).toBeDefined();
     expect(prior.taskUrl).toBe(SESSION);
+    // 超时受阻不置 awaitingOwner：会话可能仍在处理上一轮，新投递要接回原轮次、零发送。
+    expect(prior.awaitingOwner).toBeUndefined();
     // 不同供应商发送不能被同任务结清清理误删。
     writeInflight(first.stateRoot, 'devin-cloud', 'unrelated-send',
       { ...prior, taskId: 'SCK-eeeeeeeeee', submittedAt: prior.submittedAt! - 1000 });
-    // 新投递：不再回带旧 taskId 轮询旧锚点（否则老板答复进不了会话、旧轮残留被当新请求处理），
-    // 而是把新派工消息作为跟进发进同一会话、开新一轮标记。
     const second = world({ extra: gitOk });
-    const b = devinBrowse({ follow: [{ ok: true, url: SESSION }], session: [idleDone(PR9)] });
+    const b = devinBrowse({ session: [idleDone(PR9)] });
     const out2 = await runLane(second.input({ provider: 'devin-cloud', stateRoot: first.stateRoot,
       env: { SCK_DELIVERY_ID: 'lease-new' }, prompt: '重派同一任务，取回成果。' }), {
-      ...second.deps, browse: b.browse,
+      ...second.deps, browse: async (script, timeout) => {
+        expect(script).toContain(prior.taskId!);
+        expect(script).toContain(SESSION);
+        return b.browse(script, timeout);
+      },
     });
     expect(out2.text).toContain('PR: https://github.com/acme/widget/pull/9');
-    const follows = b.calls.filter(s => s.includes(MODE('follow')));
-    expect(follows).toHaveLength(1);
-    expect(follows[0]).toContain(SESSION);
-    expect(follows[0]).toMatch(/SCK-[a-f0-9]+/);
-    expect(follows[0]).not.toContain(prior.taskId!);
-    expect(b.calls.filter(s => s.includes(MODE('send')))).toHaveLength(0);
-    // 结清按「同任务 + 同标记」精确匹配：旧投递键留下的是旧标记的已受理记录，不误删也不再被回带。
-    expect(readInflight(first.stateRoot, 'devin-cloud', 'lease-old')?.taskId).toBe(prior.taskId);
+    expect(b.calls.every(s => s.includes(MODE('session')))).toBe(true);
+    expect(readInflight(first.stateRoot, 'devin-cloud', 'lease-old')).toBeUndefined();
     expect(readInflight(first.stateRoot, 'devin-cloud', 'lease-new')).toBeUndefined();
     expect(readInflight(first.stateRoot, 'devin-cloud', 'unrelated-send')?.taskId).toBe('SCK-eeeeeeeeee');
   });
