@@ -64,6 +64,9 @@ const BASE_TOOLS = [
   // MCP-2 云端通道收尾：桥接进程在按下发送前开闸（清旧 mcp_outcome）、轮询时读本租约代际的 MCP 结论。
   // 只作用于 live() 租约；agent 直接调也只能碰自己的租约。
   "lane_mcp_open", "lane_mcp_outcome",
+  // 本机公司工具统一入口：Paseo 插件薄壳与 `sck mcp` 都经此转到 src/runner/company-tools.ts 的
+  // runCompanyTool（绑定在租任务、校验、再按内层工具递归回本 dispatch）。
+  "company_tool",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -201,6 +204,8 @@ export interface SidecarDeps {
   browser?: OpsGateway;
   /** sync.so video studio (`sync_*` tools): same gateway shape; spend is approval-gated inside. */
   sync?: OpsGateway;
+  /** 公司全景查询（`landscape.get`，只读公司库会话）；不注入时 company_landscape 返回 not_configured。 */
+  landscape?: (args: { host?: string; repo?: string }) => Promise<unknown>;
   /** 云端执行端：注入后 `ops_*` 与 owner 级工具改走公司网关；不注入即本机模式，行为不变。 */
   cloud?: CloudRoute;
   /** Root under which per-instance comm dirs live. */
@@ -1298,6 +1303,33 @@ export class SidecarPool {
     }
     if (tool === "__list__") return { tools: [...BASE_TOOLS.filter(tool => !this.journal || !lifecycleTools.has(tool)), ...(ops?.tools ?? []), ...(media?.tools ?? []), ...(browser?.tools ?? []), ...(sync?.tools ?? [])] };
     if (tool === "heartbeat") return { ok: true }; // the sidecar owns keepalive
+    // 本机公司工具：绑定、校验、错误映射全在 src/runner/company-tools.ts；内层工具调用递归回本
+    // dispatch（同一 request 租约），company_tool 自身不可递归。租约取本次请求对应的 claim，与 live() 同义。
+    if (tool === "company_tool") {
+      const { runCompanyTool } = await import("./company-tools.ts");
+      const claim = this.claims.get(instId);
+      const name = typeof args.name === "string" ? args.name : "";
+      const inner = args.args !== undefined ? args.args : args.arguments;
+      const face: import("./company-tools.ts").CompanyToolFace = {
+        lease: () => claim && claim === requestLease
+          ? { taskId: claim.taskId, phase: claim.phase, leaseExpiresAt: claim.leaseExpiresAt }
+          : undefined,
+        call: async (innerTool, innerArgs): Promise<CommResponse> => {
+          if (innerTool === "company_tool") return { ok: false, error: "forbidden: 公司工具不能递归调用" };
+          try {
+            return { ok: true, data: await this.dispatch(instId, innerTool, innerArgs, forceRotate, request) };
+          } catch (error) {
+            const e = error as Error & { code?: string };
+            return { ok: false, error: `${e.code ?? "error"}: ${e.message}` };
+          }
+        },
+        capabilityTools: () => this.capabilityTools(),
+        ...(this.deps.landscape ? { landscape: this.deps.landscape } : {}),
+      };
+      const res = await runCompanyTool(name, inner ?? {}, face);
+      if (!res.ok) throw Object.assign(new Error(res.message), { code: res.code });
+      return res.value;
+    }
     if (tool === "claim_next") throw Object.assign(new Error("任务由调度通道代领，无需手动 claim"), { code: "forbidden" });
     // 云端路由（只在注入 cloud 时启用）：先核对租约，再去换令牌；无租约直接拒绝，不碰身份服务。
     if (this.journal && tool === 'company_cmd' && (LIFECYCLE_COMMANDS as readonly string[]).includes(String(args.command))) {

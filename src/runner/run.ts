@@ -71,6 +71,8 @@ let draining = false;
 let endService!: () => void;
 const serviceEnded = new Promise<void>(resolve => { endService = resolve; });
 const runtime = new NativeRuntime({ root: join(serviceHome(), 'native', hostId), host: hostId,
+  // 本机公司工具 MCP：claude/codex 员工经 `sck mcp` stdio 子进程拿到同名工具（droid/lane 不注入）。
+  companyMcp: { command: process.env.SCK_TOOL_BIN ?? join(serviceHome(), 'bin', 'sck') },
   onHeartbeat: async () => {
     if (!installedPath || realpathSync(join(serviceHome(), 'current')) === installedPath) return;
     draining = true;

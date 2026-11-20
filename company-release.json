@@ -1,18 +1,16 @@
 {
-  "version": "0.13.74",
-  "title": "本地 Paseo 员工注入同名公司工具、派工正文改工具交卷优先、Devin 只读任务收尾修复",
+  "version": "0.13.76",
+  "title": "原生执行端（claude/codex）员工经 sck mcp 拿到同名公司工具",
   "changes": [
-    "本机 Paseo 员工会话在 session_open 时注入 7 个与云端公司 MCP 同名同参数的工具（company_landscape、task_current、task_context、company_ops、task_submit、task_review、task_block），身份来自 Paseo agentId，经 sidecar 走与 sck call 相同的 dispatch。",
-    "与云端差异：无 company_job（本机同步返回）、无白名单与次数预算（本机员工经 sck 本就可调）、sha 需完整 40 位。",
-    "派工正文改为工具交卷优先：task_submit/task_review/task_block；首行口令保留为无工具时的兜底。",
-    "Devin 通道只读任务（worktree.intent 'read'）执行轮不再要求远端提交与 PR，直接按答复收尾；代码任务不变。",
-    "云端 prompt 继续剥离本机指引（旧 company_cmd_catalog 句与新本机工具句都剥掉）。插件要求 Paseo >=0.16.0。"
+    "7 个公司工具的绑定与校验统一到 src/runner/company-tools.ts（runCompanyTool），Paseo 插件薄壳与 sck mcp 都经 sidecar 的 company_tool 走与 sck call 相同的 dispatch。",
+    "sck mcp：员工 CLI 的 stdio MCP 子进程（行分隔 JSON-RPC），不新增服务/端口/凭证；SCK_COMM_* 缺失时 tools/list 照答、tools/call 回错。",
+    "原生启动注入：claude 加 --mcp-config（stdio 子进程继承环境）；codex 加三条 -c mcp_servers.sck-company.*（env_vars 透传 comm 变量）。droid 本期不注入，仍用 sck CLI；云端通道与命令预览不注入。",
+    "SidecarDeps 新增可选 landscape（landscape.get 同一条 ownerApi 路径），未注入时 company_landscape 返回 not_configured；插件侧不再单独注入。"
   ],
   "impact": [
-    "本机员工像云端一样用同名原生工具读写公司数据与交卷，不再依赖消息里的格式约定；权限与租约判定与 sck call 一致。",
-    "Devin 执行只读调研类任务不再因没有 PR 被误判受阻。",
+    "原生执行端的 claude/codex 员工与 Paseo 员工一样拿到同名公司工具，权限与租约判定与 sck call 完全一致。",
     "沿用 schema 074，无迁移。"
   ],
-  "migration": "无 schema 变化（沿用 schema 074）。插件要求 Paseo >=0.16.0（requirements.paseo 已声明）；升级 owner-backend 与插件即可。",
-  "rollback": "回退至 0.13.73；本机会话退回 sck call 路径，Devin 只读任务恢复为需要 PR 收尾。"
+  "migration": "无 schema 变化（沿用 schema 074），升级 owner-backend、原生节点与插件即可。",
+  "rollback": "回退至 0.13.74；原生执行端员工退回 sck call 路径。"
 }
