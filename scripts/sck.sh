@@ -1,5 +1,5 @@
 #!/bin/sh
-# Employee tool entry, installed by the node updater as bin/sck: sck call <tool> '<json>' | sck list | sck owner <command> '<json>'
+# Employee tool entry, installed by the node updater as bin/sck: sck call <tool> '<json>' | sck list | sck mcp | sck owner <command> '<json>'
 set -eu
 # The Bun runtime is resolved the same way the node updater resolves it (scripts/bun-runtime.sh, installed beside this
 # file as bin/bun-runtime.sh): SCK_BUN, then the SCK_BUN line of private/service.env, then runtime-bun, then ~/.bun.

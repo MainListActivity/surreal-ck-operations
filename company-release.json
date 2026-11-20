@@ -11,5 +11,5 @@
     "沿用 schema 074，无迁移。"
   ],
   "migration": "无 schema 变化（沿用 schema 074），升级 owner-backend 即可。",
-  "rollback": "回退至 0.13.76（若该版未发则以当时 main 上的最新版本为准）；判读器收尾恢复为只写一行摘要。"
+  "rollback": "回退至 0.13.76；判读器收尾恢复为只写一行摘要。"
 }
