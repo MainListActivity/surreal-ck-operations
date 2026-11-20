@@ -30,9 +30,12 @@ export type LandscapeRunSummary =
 const failure = (step: string, error: unknown): string =>
   clip(redactText(`${step} 失败：${error instanceof Error ? error.message : String(error)}`), 200);
 
-/** 解析 `systemctl list-units --plain --no-legend`：每行第一列是单元名。 */
+/** 解析 `systemctl list-units --plain --no-legend`：每行第一列是单元名，第二列 LOAD 为 not-found 的只是被依赖引用、并不存在，跳过。 */
 export function parseSystemctlUnits(stdout: string): string[] {
-  return stdout.split('\n').map(line => line.trim().split(/\s+/)[0]).filter((unit): unit is string => Boolean(unit));
+  return stdout.split('\n')
+    .map(line => line.trim().split(/\s+/))
+    .filter(([unit, load]) => Boolean(unit) && load !== 'not-found')
+    .map(([unit]) => unit!);
 }
 
 /** 解析 `ss -ltnH`：第四列是本地监听地址。 */

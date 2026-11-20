@@ -65,6 +65,7 @@ describe('采集解析', () => {
   test('systemctl 取第一列单元名，ss 取本地地址列', () => {
     expect(parseSystemctlUnits(SYSTEMCTL_OK)).toContain('sck-owner-backend.service');
     expect(parseSystemctlUnits('  \n')).toEqual([]);
+    expect(parseSystemctlUnits('ghost.service not-found inactive dead ghost.service\nreal.service loaded active running Real\n')).toEqual(['real.service']);
     expect(parseListenAddresses('LISTEN 0 511 127.0.0.1:39125 0.0.0.0:*\n')).toEqual(['127.0.0.1:39125']);
   });
 
