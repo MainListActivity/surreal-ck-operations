@@ -36,7 +36,7 @@ const socket = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Resp
 const port = socket.port!; socket.stop(true);
 const rootPassword = 'isolated-local-regression-only';
 const server = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root', '--pass', rootPassword,
-  '--log', 'error', `surrealkv:${dir}/db`], { detached: true, stdout: 'ignore', stderr: 'ignore' });
+  '--log', 'error', `rocksdb:${dir}/db`], { detached: true, stdout: 'ignore', stderr: 'ignore' });
 groups.push(server.pid); save();
 let exit = 1;
 try {

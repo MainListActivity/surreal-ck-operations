@@ -1,15 +1,15 @@
 {
-  "version": "0.13.82",
-  "title": "MCP 结构化受阻补 awaitingOwner：老板答复不再采信服务端旧结论",
+  "version": "0.13.83",
+  "title": "SurrealDB 4.0.1 对齐：本机 fork 二进制与服务全景登记",
   "changes": [
-    "Devin 通道 mcpVerdict 里所有由 MCP 结构化结论得出的受阻收尾（task_block 直出、submit/review 经 closeout 判 blocked、结论与本轮阶段不符）在返回前写入 devin.awaitingOwner 并持久化到在途登记，语义与页面 blocked/等待指示分支一致；inflight 仍保留会话地址。",
-    "老板 reply 产生新投递时，带 awaitingOwner 的旧在途登记不被接回（沿用 0.13.79 的采纳规则，无改动）：新派工消息（含老板答复）作为跟进发进同一 Devin 会话、开新一轮标记并重新 mcpRoundOpen 开闸，服务端残留的旧 MCP 结论不会被当成本轮结果。"
+    "AGENTS.md 本机 fork 二进制描述由 4.0.1-native-quota.1+sha.3362c137b 改为 +sha.eab8473e4d4e（sck-4.0.1-native-quota.1 正式发行构建，与生产镜像同一提交 eab8473e）。",
+    "landscape/company-landscape.json 的 surrealdb 条目登记当前生产版本与镜像 e68a34a4（rocksdb），2026-11-21 维护运行 44890559131 升级；3.3 镜像与旧数据目录保留作回滚。",
+    "本地 fork 测试夹具统一改用生产同款 rocksdb 引擎（surrealkv 在 4.0 下的并发冲突时序与生产不同，会让并发幂等用例误报）。"
   ],
   "impact": [
-    "修复真实任务 6f05139e 的二次卡死：MCP task_block 收尾后老板 reply 曾在一分钟内被旧 task_block 结论顶替收尾，答复从未进入会话；现在答复作为新轮跟进正常发出。",
-    "同投递恢复不变：awaitingOwner 登记仍按投递键接回、零发送。",
+    "登记表与生产现状一致：全景查询返回的 surrealdb 版本即生产实跑版本，升级与回滚资产可查。",
     "沿用 schema 074，无迁移。"
   ],
   "migration": "无 schema 变化（沿用 schema 074），升级 owner-backend 即可。",
-  "rollback": "回退至 0.13.79；MCP 受阻收尾恢复不写 awaitingOwner，新投递可能采信服务端未清旧结论。"
+  "rollback": "回退至 0.13.82；文档与登记表恢复旧版本描述（生产仍跑 4.0.1，登记表描述与现状不一致）。"
 }
