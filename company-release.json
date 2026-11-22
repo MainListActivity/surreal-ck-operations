@@ -2,8 +2,8 @@
   "version": "0.13.83",
   "title": "SurrealDB 4.0.1 对齐：本机 fork 二进制与服务全景登记",
   "changes": [
-    "AGENTS.md 的本机 fork 二进制描述由 4.0.1-native-quota.1+sha.3362c137b 改为 4.0.1-native-quota.1+sha.eab8473e4d4e（sck-4.0.1-native-quota.1 正式发行构建，与生产镜像同一提交 eab8473e）。",
-    "landscape/company-landscape.json 的 surrealdb 服务条目 notes 登记当前生产状态：版本 4.0.1-native-quota.1+sha.eab8473e4d4e、镜像 ghcr.io/mainlistactivity/surrealdb-native-quota@sha256:e68a34a400c8f8014f1cf1450fd5c4be6ffdf04f73e464d538cc5b9e06ebc66e、rocksdb、2026-11-21 维护运行 44890559131 升级，3.3 镜像与旧数据目录保留作回滚。"
+    "AGENTS.md 本机 fork 二进制描述由 4.0.1-native-quota.1+sha.3362c137b 改为 +sha.eab8473e4d4e（sck-4.0.1-native-quota.1 正式发行构建，与生产镜像同一提交 eab8473e）。",
+    "landscape/company-landscape.json 的 surrealdb 条目登记当前生产版本与镜像 e68a34a4（rocksdb），2026-11-21 维护运行 44890559131 升级；3.3 镜像与旧数据目录保留作回滚。"
   ],
   "impact": [
     "登记表与生产现状一致：全景查询返回的 surrealdb 版本即生产实跑版本，升级与回滚资产可查。",
