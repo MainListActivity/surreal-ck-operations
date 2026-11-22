@@ -254,7 +254,7 @@
       "rollback": "由老板按 runbook 人工处理",
       "status": "active",
       "verified": true,
-      "notes": "生产 SurrealDB：CK 各 workspace 库、_system、platform_content，以及公司库 company/main。红线：不改服务本身、root 凭证和数据目录。"
+      "notes": "生产 SurrealDB：CK 各 workspace 库、_system、platform_content，以及公司库 company/main。红线：不改服务本身、root 凭证和数据目录。 当前版本 4.0.1-native-quota.1+sha.eab8473e4d4e，镜像 ghcr.io/mainlistactivity/surrealdb-native-quota@sha256:e68a34a400c8f8014f1cf1450fd5c4be6ffdf04f73e464d538cc5b9e06ebc66e，rocksdb，2026-11-21 维护运行 44890559131 升级；3.3 镜像与旧数据目录保留作回滚。"
     },
     {
       "id": "magpie-web",

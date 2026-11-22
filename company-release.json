@@ -1,5 +1,5 @@
 {
-  "version": "0.13.82",
+  "version": "0.13.83",
   "title": "MCP 结构化受阻补 awaitingOwner：老板答复不再采信服务端旧结论",
   "changes": [
     "Devin 通道 mcpVerdict 里所有由 MCP 结构化结论得出的受阻收尾（task_block 直出、submit/review 经 closeout 判 blocked、结论与本轮阶段不符）在返回前写入 devin.awaitingOwner 并持久化到在途登记，语义与页面 blocked/等待指示分支一致；inflight 仍保留会话地址。",
