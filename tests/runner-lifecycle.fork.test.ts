@@ -42,7 +42,7 @@ beforeAll(async () => {
   dir = realpathSync(mkdtempSync(join(tmpdir(), 'sck-lifecycle-fork-')));
   const probe = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('ok') });
   const port = probe.port!; probe.stop(true);
-  server = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root', '--pass', 'fixture', '--log', 'error', `surrealkv:${dir}/db`], { stdout: 'ignore', stderr: 'ignore' });
+  server = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root', '--pass', 'fixture', '--log', 'error', `rocksdb:${dir}/db`], { stdout: 'ignore', stderr: 'ignore' });
   for (let i = 0; i < 160; i++) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break; } catch {} await Bun.sleep(25); }
   db = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, namespace: 'lifecycle', database: 'fixture', rootUser: 'root', rootPassword: 'fixture' });
   await db.connect(); await db.bootstrap(); core = new SurrealCompanyCore(db); wf = new Workforce(db);

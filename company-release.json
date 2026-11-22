@@ -3,7 +3,8 @@
   "title": "SurrealDB 4.0.1 对齐：本机 fork 二进制与服务全景登记",
   "changes": [
     "AGENTS.md 本机 fork 二进制描述由 4.0.1-native-quota.1+sha.3362c137b 改为 +sha.eab8473e4d4e（sck-4.0.1-native-quota.1 正式发行构建，与生产镜像同一提交 eab8473e）。",
-    "landscape/company-landscape.json 的 surrealdb 条目登记当前生产版本与镜像 e68a34a4（rocksdb），2026-11-21 维护运行 44890559131 升级；3.3 镜像与旧数据目录保留作回滚。"
+    "landscape/company-landscape.json 的 surrealdb 条目登记当前生产版本与镜像 e68a34a4（rocksdb），2026-11-21 维护运行 44890559131 升级；3.3 镜像与旧数据目录保留作回滚。",
+    "本地 fork 测试夹具统一改用生产同款 rocksdb 引擎（surrealkv 在 4.0 下的并发冲突时序与生产不同，会让并发幂等用例误报）。"
   ],
   "impact": [
     "登记表与生产现状一致：全景查询返回的 surrealdb 版本即生产实跑版本，升级与回滚资产可查。",

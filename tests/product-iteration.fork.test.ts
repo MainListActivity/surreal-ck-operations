@@ -17,7 +17,7 @@ beforeAll(async()=>{
   if(process.env.RUN_SCK_ITERATION_TESTS!=='1')return;
   dir=realpathSync(mkdtempSync(join(tmpdir(),'sck-iteration-')));
   const probe=Bun.serve({hostname:'127.0.0.1',port:0,fetch:()=>new Response('ok')});const port=probe.port!;probe.stop(true);
-  server=Bun.spawn([join(homedir(),'.surrealdb/surreal'),'start','--bind',`127.0.0.1:${port}`,'--user','root','--pass','fixture','--log','error',`surrealkv:${dir}/db`],{stdout:'ignore',stderr:'ignore'});
+  server=Bun.spawn([join(homedir(),'.surrealdb/surreal'),'start','--bind',`127.0.0.1:${port}`,'--user','root','--pass','fixture','--log','error',`rocksdb:${dir}/db`],{stdout:'ignore',stderr:'ignore'});
   for(let i=0;i<160;i++){try{if((await fetch(`http://127.0.0.1:${port}/health`)).ok)break;}catch{}await Bun.sleep(25);}
   endpoint=`ws://127.0.0.1:${port}/rpc`;db=new Surreal();await db.connect(endpoint);await db.signin({username:'root',password:'fixture'});
   await db.query('DEFINE NAMESPACE iteration; USE NS iteration; DEFINE DATABASE fixture;');await db.use({namespace:'iteration',database:'fixture'});

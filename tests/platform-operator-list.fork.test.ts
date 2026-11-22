@@ -28,7 +28,7 @@ let gm: string, author: string, taskId: string;
 
 async function start() {
   const binary = join(homedir(), '.surrealdb/surreal');
-  child = Bun.spawn([binary, 'start', '--no-banner', '--log', 'none', '--bind', url.replace('ws://', ''), '--user', 'root', '--pass', 'root', 'surrealkv:' + join(dir, 'db')], { stdout: 'ignore', stderr: 'ignore' });
+  child = Bun.spawn([binary, 'start', '--no-banner', '--log', 'none', '--bind', url.replace('ws://', ''), '--user', 'root', '--pass', 'root', 'rocksdb:' + join(dir, 'db')], { stdout: 'ignore', stderr: 'ignore' });
   for (let i = 0; i < 100; i++) { const p = Bun.spawn([binary, 'is-ready', '--endpoint', url], { stdout: 'ignore', stderr: 'ignore' }); if (await p.exited === 0) return; await Bun.sleep(50); }
   throw new Error('company fork unavailable');
 }

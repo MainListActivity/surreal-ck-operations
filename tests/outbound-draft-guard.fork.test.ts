@@ -21,7 +21,7 @@ async function startFork() {
   const reservation = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('fixture') });
   const port = reservation.port!; reservation.stop(true);
   const child = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root', '--pass', ROOT_PASSWORD,
-    '--log', 'error', `surrealkv:${dir}/database`], { stdout: 'ignore', stderr: 'ignore' });
+    '--log', 'error', `rocksdb:${dir}/database`], { stdout: 'ignore', stderr: 'ignore' });
   const config = { url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: ROOT_PASSWORD,
     namespace: `outbound_draft_guard_${randomUUID().replaceAll('-', '')}`, database: 'control_plane' };
   const db = new CompanyDatabase(config), peers: CompanyDatabase[] = [];

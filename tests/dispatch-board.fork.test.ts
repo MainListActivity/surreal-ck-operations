@@ -36,7 +36,7 @@ async function startFork(name: string) {
   const dir = mkdtempSync(join(tmpdir(), `board-fork-${name}-`));
   const reservation = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('fixture') });
   const port = reservation.port!; reservation.stop(true);
-  const child = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root', '--pass', ROOT_PASSWORD, '--log', 'error', `surrealkv:${dir}/database`], { stdout: 'ignore', stderr: 'ignore' });
+  const child = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root', '--pass', ROOT_PASSWORD, '--log', 'error', `rocksdb:${dir}/database`], { stdout: 'ignore', stderr: 'ignore' });
   // SurrealDB reads a hyphen in a bare identifier as subtraction, so the namespace uses underscores only.
   const db = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: ROOT_PASSWORD, namespace: `isolated_board_${name.replaceAll('-', '_')}`, database: 'control_plane' });
   let pool: SidecarPool | undefined;

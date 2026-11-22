@@ -19,7 +19,7 @@ run('mcpOutcome：开闸清结论、读取绑租约，别员工/旧 fence/forbid
   const port = reservation.port!; reservation.stop(true);
   const rootPassword = 'isolated-mcp-outcome-test-only';
   const child = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`,
-    '--user', 'root', '--pass', rootPassword, '--log', 'error', `surrealkv:${dir}/database`],
+    '--user', 'root', '--pass', rootPassword, '--log', 'error', `rocksdb:${dir}/database`],
     { stdout: 'ignore', stderr: 'ignore' });
   const db = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword,
     namespace: 'isolated_mcp_outcome', database: 'control_plane' });
