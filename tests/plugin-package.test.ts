@@ -169,7 +169,7 @@ describe('packTarball 与 buildManifest', () => {
       sha256: actual.sha256,
       bytes: actual.bytes,
     });
-    expect(manifest.updater.name).toBe('node-updater.js');
+    expect(manifest.updater?.name).toBe('node-updater.js');
     expect(manifest.format).toBe(1);
     expect(manifest.product).toBe('sck-company');
   });

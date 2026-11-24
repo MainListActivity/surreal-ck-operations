@@ -14,6 +14,11 @@ import { installZdot, userZshDir, externalPatterns } from './launch-env.ts';
 import { nativeEmployeeEnv } from './native-env.ts';
 import { employeeModelEnv } from './model-env.ts';
 import { writeAgentActivity } from './activity-store.ts';
+import { awaitingConfirmation, confirmSwitch, settlePending, type SettleDeps } from '../node-updater.ts';
+import { nodeCloud } from '../node-update-sources.ts';
+import { startSelfUpdate } from './self-update.ts';
+import { startPreviewHost, type PreviewHost } from './preview-host.ts';
+import { createOwnerHttp } from './owner-http.ts';
 
 installNodeHost();
 loadServiceEnv();
@@ -65,6 +70,14 @@ installZdot(zdotdir, userZshDir(zdotdir), externalPatterns());
 let bus: RuntimeEventsBus;
 // Installed services follow the already verified current release; development runs remain pinned to their checkout.
 const installed = process.env.SCK_NATIVE_FOLLOW_CURRENT === '1';
+// 自更新切换后的首次启动：限定时间内没完成确认就退出，交给启动脚本计数，连续失败后由它指回旧版本。
+const CONFIRM_WATCHDOG_MS = 15 * 60_000;
+let awaitingConfirm = installed && awaitingConfirmation(serviceHome());
+const confirmWatchdog = awaitingConfirm ? setTimeout(() => {
+  console.error('新版本未在 15 分钟内完成启动确认，退出交给启动脚本处理');
+  process.exit(1);
+}, CONFIRM_WATCHDOG_MS) : undefined;
+let settleDeps: SettleDeps | undefined;
 const installedPath = installed ? realpathSync(join(serviceHome(), 'current')) : undefined;
 const release = installedPath ? JSON.parse(readFileSync(join(dirname(installedPath), 'release.json'), 'utf8')) : undefined;
 let draining = false;
@@ -74,6 +87,13 @@ const runtime = new NativeRuntime({ root: join(serviceHome(), 'native', hostId),
   // 本机公司工具 MCP：claude/codex 员工经 `sck mcp` stdio 子进程拿到同名工具（droid/lane 不注入）。
   companyMcp: { command: process.env.SCK_TOOL_BIN ?? join(serviceHome(), 'bin', 'sck') },
   onHeartbeat: async () => {
+    // 首个心跳说明已连上云端且派工在跑：确认这次切换（schema 不满足时 confirmSwitch 自己指回旧版本，下面随即排空）。
+    if (awaitingConfirm && settleDeps) {
+      awaitingConfirm = false;
+      const confirmed = await confirmSwitch(settleDeps).catch(error => { console.error(`切换确认失败：${(error as Error).message}`); return 'none' as const; });
+      if (confirmWatchdog) clearTimeout(confirmWatchdog);
+      console.log(`[自更新] 启动确认：${confirmed}`);
+    }
     if (!installedPath || realpathSync(join(serviceHome(), 'current')) === installedPath) return;
     draining = true;
     const agents = await runtime.list();
@@ -136,16 +156,41 @@ configureCompanyRuntime({ gateway: runtime, native: true, release, requireProvid
 noteHost(host);
 let stop: import('./dispatch.ts').RunnerControl | undefined;
 let ctx: Awaited<ReturnType<typeof company>> | undefined;
+let stopSelfUpdate: (() => void) | undefined;
+let preview: PreviewHost | undefined;
+const runtimeIdle = async () => ![...(await runtime.list()).values()].some(a => ['running', 'starting', 'unknown'].includes(a.status));
 try {
   ctx = await company();
   const principal = await ctx.core.authenticate(process.env.SCK_OWNER_TOKEN!);
   if (principal.role !== 'owner') throw new Error('原生执行端老板凭证身份不匹配，拒绝启动');
+  if (installed) {
+    const home = serviceHome();
+    settleDeps = { home, cloud: nodeCloud(ctx.db, ctx.nodeId), now: () => new Date(), log: line => console.log(`[自更新] ${line}`) };
+    const settled = await settlePending(settleDeps);
+    if (settled.kind !== 'confirming') {
+      awaitingConfirm = false;
+      if (confirmWatchdog) clearTimeout(confirmWatchdog);
+    }
+  }
   stop = startDispatch(bus);
+  if (installed && process.env.SCK_SELF_UPDATE !== '0') {
+    const db = ctx.db, nodeId = ctx.nodeId;
+    stopSelfUpdate = startSelfUpdate({ home: serviceHome(), nodeId, db, idle: runtimeIdle,
+      onSwitched: () => { draining = true; }, log: line => console.log(line) });
+  }
+  // 交付预览与老板接口（18777/18778）：sck owner、交付链接与公网隧道都指向这里。
+  if (installed && process.env.SCK_PREVIEW_HOST !== '0') {
+    const owner = createOwnerHttp({ home: serviceHome(), company });
+    preview = startPreviewHost({ home: serviceHome(), ownerFetch: owner,
+      statusFetch: async request => (await company()).ops.proofStatus(request) });
+  }
   await runtime.recoverFinishedTurns();
   console.log(`原生执行端 ${hostId} 已启动；支持 ${Object.keys(config.commands).join(', ')}`);
   process.once('SIGTERM', endService); process.once('SIGINT', endService);
   await serviceEnded;
 } finally {
+  stopSelfUpdate?.();
+  await preview?.stop();
   stop?.();
   await stop?.done;
   await runtime.close();
