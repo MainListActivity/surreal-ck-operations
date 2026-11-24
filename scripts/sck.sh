@@ -54,10 +54,12 @@ if [ -n "${PASEO_AGENT_ID:-}" ] && [ -f "$service_home/comm-agents/$PASEO_AGENT_
   SCK_COMM_KEY=$(/usr/bin/sed -n '2p' "$service_home/comm-agents/$PASEO_AGENT_ID")
   export SCK_COMM_DIR SCK_COMM_KEY
 fi
-# Comm only: the plugin sidecar owns the credential; the agent relays through $SCK_COMM_DIR and carries no auth material.
-# current is the plugin directory the node updater made live, and the client runs from it.
+# Comm only: the runner sidecar owns the credential; the agent relays through $SCK_COMM_DIR and carries no auth material.
+# current is the runtime directory the runner's self-update made live, and the client runs from it. Both release layouts
+# are accepted so this file keeps working while a new layout is being switched in (bin/sck is replaced on confirmation).
 client="$service_home/current/server/vendor/src/sck-cli.ts"
-[ -f "$client" ] || refuse missing_plugin "no live plugin at $service_home/current: the node updater has not switched this node yet"
+[ -f "$client" ] || client="$service_home/current/src/sck-cli.ts"
+[ -f "$client" ] || refuse missing_plugin "no live runtime at $service_home/current: this node has no installed release yet"
 resolve_bun "$service_home"
 [ -x "$BUN" ] || refuse missing_runtime "Bun runtime not found at $BUN: set SCK_BUN or install runtime-bun under $service_home"
 cd "$service_home/current"

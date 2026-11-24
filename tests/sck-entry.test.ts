@@ -35,12 +35,12 @@ interface World { root: string; service: string; user: string; client: string }
  * A service home and a user home. The live plugin client is placed at current/server/vendor/src/sck-cli.ts unless
  * `noCurrent`; there is no active/ directory. `pinned` writes an SCK_BUN line to private/service.env and creates that Bun.
  */
-function world(options: { pinned?: boolean; runtime?: boolean; userBun?: boolean; noCurrent?: boolean } = {}): World {
+function world(options: { pinned?: boolean; runtime?: boolean; userBun?: boolean; noCurrent?: boolean; srcLayout?: boolean } = {}): World {
   const root = mkdtempSync(join(tmpdir(), 'sck-entry-'));
   roots.push(root);
   const service = join(root, 'service');
   const user = join(root, 'user');
-  const client = join(service, 'current', 'server', 'vendor', 'src', 'sck-cli.ts');
+  const client = options.srcLayout ? join(service, 'current', 'src', 'sck-cli.ts') : join(service, 'current', 'server', 'vendor', 'src', 'sck-cli.ts');
   mkdirSync(join(service, 'private'), { recursive: true });
   mkdirSync(user, { recursive: true });
   if (!options.noCurrent) {
@@ -123,6 +123,12 @@ test('an SCK_BUN pin that does not exist is refused as missing_runtime, never re
   const r = run(['call', 'list'], w, { SCK_BUN: join(w.root, 'absent', 'bun') });
   refusedWith(r, 'missing_runtime');
   expect(r.err).toContain('SCK_BUN');
+});
+
+test('a release laid out as runtime/src (no server/vendor) runs current/src/sck-cli.ts', () => {
+  const w = world({ runtime: true, srcLayout: true });
+  const r = run(['call', 'list'], w);
+  expect(answerOf(r)).toMatchObject({ label: 'runtime', argv: `${w.client} call list` });
 });
 
 test('no live plugin under current is refused as missing_plugin before any runtime runs', () => {
