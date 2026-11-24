@@ -5,6 +5,7 @@ import {tmpdir} from 'node:os';
 import {execFileSync} from 'node:child_process';
 import {installNativeService,launcherScript,CONFIRM_ATTEMPTS} from '../scripts/native-service.ts';
 import {loadNativeOwnerCredential} from '../src/runner/env.ts';
+import {remapLegacyRuntimePaths} from '../src/runner/legacy-layout.ts';
 test('独立服务离线安装支持含空格和引号的路径，不改变路由，不添加定时任务',()=>{
   const home=mkdtempSync(join(tmpdir(),"native 'service-"));
   try {
@@ -115,4 +116,20 @@ test('启动脚本：运行目录换成 src/ 布局时仍能找到执行端入�
     symlinkSync(join(home,'plugin-releases','c'.repeat(40),'runtime'),join(home,'current'));
     expect(run()).toBe(join(home,'current/src/runner/run.ts'));
   } finally {rmSync(home,{recursive:true,force:true});}
+});
+
+test('旧发行布局的通道命令路径在新布局下改指 current/src；路径仍存在或新路径不存在时原样保留', () => {
+  const home='/svc';
+  const present=new Set(['/svc/current/src/runner/cloud-lane/main.ts','/svc/current/server/vendor/src/runner/warp/main.ts']);
+  const {commands,remapped}=remapLegacyRuntimePaths({
+    'codex-cloud':['/svc/sandbox/launch.sh','/svc/runtime-bun/bin/bun','/svc/current/server/vendor/src/runner/cloud-lane/main.ts','codex-cloud'],
+    warp:['/svc/sandbox/launch.sh','/b/bun','/svc/current/server/vendor/src/runner/warp/main.ts','warp'],
+    'grok-bot':['/svc/sandbox/launch.sh','/b/bun','/svc/current/server/vendor/src/runner/grok-bot/main.ts','grok-bot'],
+    claude:['/svc/sandbox/launch.sh','/u/claude'],
+  },home,path=>present.has(path));
+  expect(commands['codex-cloud']![2]).toBe('/svc/current/src/runner/cloud-lane/main.ts');
+  expect(commands.warp![2]).toBe('/svc/current/server/vendor/src/runner/warp/main.ts');
+  expect(commands['grok-bot']![2]).toBe('/svc/current/server/vendor/src/runner/grok-bot/main.ts');
+  expect(commands.claude).toEqual(['/svc/sandbox/launch.sh','/u/claude']);
+  expect(remapped).toEqual(['codex-cloud']);
 });

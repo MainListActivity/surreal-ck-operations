@@ -3,8 +3,11 @@ import { timingSafeEqual } from 'node:crypto';
 import { listTaskAttachments, resolveTaskAttachment } from '../attachments.ts';
 import { previewLanBase } from '../deliverables.ts';
 import { LocalEnrollmentAdmin } from '../enrollment.ts';
+import { OutboundMessageStore } from '../outbound-messages.ts';
+import { OwnerDesk } from '../owner.ts';
 import { ownerApi } from '../owner-api.ts';
 import { ensureOwnerToken, OWNER_AGENT_HEADER } from '../owner-token.ts';
+import { Workforce } from '../workforce.ts';
 import type { Company } from './company.ts';
 
 export type OwnerExtraCommand = (c: Company, input: Record<string, unknown>) => Promise<{ handled: true; value: unknown } | { handled: false }>;
@@ -38,13 +41,11 @@ export async function taskAttachmentUrlFor(home: string, taskId: string, name: s
   return { url: `${previewLanBase(home)}/e/${encodeURIComponent(taskId)}/${rel}` };
 }
 
-/** 不依赖宿主的附件命令；Paseo 权限应答只存在于 Paseo 会话，原生执行端没有。 */
-const attachmentCommand = (home: string): OwnerExtraCommand => async (_c, input) => {
+/** 执行端承载的命令：读本机证据目录的附件，其余交给 src/owner-api.ts。 */
+export const hostOwnerCommand = (home: string): OwnerExtraCommand => async (_c, input) => {
   switch (String(input.command ?? '')) {
     case 'task.attachments': return { handled: true, value: await taskAttachmentsFor(home, requiredText(input.taskId, 'taskId')) };
     case 'attachment.url': return { handled: true, value: await taskAttachmentUrlFor(home, requiredText(input.taskId, 'taskId'), requiredText(input.file, 'file')) };
-    case 'permission.list': return { handled: true, value: { items: [] } };
-    case 'permission.answer': throw new Error('invalid 原生执行端没有交互权限请求');
     default: return { handled: false };
   }
 };
@@ -52,7 +53,7 @@ const attachmentCommand = (home: string): OwnerExtraCommand => async (_c, input)
 export function createOwnerHttp(opts: OwnerHttpOptions): (req: Request) => Promise<Response> {
   const token = ensureOwnerToken(opts.home);
   process.env.SCK_OWNER_TOKEN = token; // core.authenticate needs the same token for owner-principal writes
-  const extra = opts.extra ?? attachmentCommand(opts.home);
+  const extra = opts.extra ?? hostOwnerCommand(opts.home);
   // The owner control-plane principal (employee:owner) must exist in this database for core writes under the token.
   let ownerReady: Promise<void> | undefined;
   return async (req: Request): Promise<Response> => {
@@ -74,9 +75,11 @@ export function createOwnerHttp(opts: OwnerHttpOptions): (req: Request) => Promi
       if (hosted.handled) return json(hosted.value);
       ownerReady ??= new LocalEnrollmentAdmin(c.db).ensureOwner(opts.home);
       await ownerReady;
+      const opsRepo = opts.opsRepo ?? c.opsRepo;
       const result = await ownerApi({
-        db: c.db, core: c.core as never, owner: c.owner, workforce: c.workforce, messages: c.messages,
-        opsRepo: opts.opsRepo ?? c.opsRepo, steward: c.steward,
+        db: c.db, core: c.core as never, owner: c.owner ?? new OwnerDesk(c.db, opsRepo),
+        workforce: c.workforce ?? new Workforce(c.db), messages: c.messages ?? new OutboundMessageStore(c.db.db),
+        opsRepo, steward: c.steward,
       }, body, via);
       return json(result);
     } catch (error) {

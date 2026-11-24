@@ -2,8 +2,13 @@ import { expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SidecarPool } from '../plugin/server/sidecar.ts';
-import { settleCompanyTurn, TurnInterruptions } from '../plugin/server/turn-closeout.ts';
+import { SidecarPool } from '../src/runner/sidecar.ts';
+import { settleCompanyTurn as settle, TurnInterruptions } from '../src/runner/turn-closeout.ts';
+
+/** The runtime only needs send(); these cases drive it through a Paseo-shaped stand-in. */
+const settleCompanyTurn = (ctx: Parameters<typeof settle>[0], paseo: { agents?: { ref(id: string): { send(prompt: unknown): Promise<unknown> } } },
+  event: Parameters<typeof settle>[2], interruptions?: TurnInterruptions) =>
+  settle(ctx, { send: (id, prompt) => paseo.agents!.ref(id).send(prompt).then(() => {}) }, event, interruptions);
 import { reportPath } from '../src/comm.ts';
 
 for (const phase of ['doing', 'review'] as const) test(`completed 429: ${phase} releases once, cools provider, refunds wake, never nudges`, async () => {

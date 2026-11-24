@@ -9,7 +9,7 @@ import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { ProjectStore } from '../src/projects.ts';
 import { Workforce } from '../src/workforce.ts';
 import type { ClaimResult, LeaseProof, Role, WorkIntent } from '../src/contracts.ts';
-import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
+import { SidecarPool, type SidecarDeps } from '../src/runner/sidecar.ts';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import { WorktreeRegistry } from '../src/dispatcher/worktree-registry.ts';
 import { OwnerDesk } from '../src/owner.ts';

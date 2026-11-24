@@ -13,7 +13,7 @@ import { ProjectStore } from '../src/projects.ts';
 import { COMPANY_PART_BYTES, companyBlock, reassembleCompany } from '../src/company-context.ts';
 import type { CompanyBrief, CompanyPart } from '../src/contracts.ts';
 import { RESPONSE_BUDGET_BYTES, answerBytes } from '../src/response-budget.ts';
-import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
+import { SidecarPool, type SidecarDeps } from '../src/runner/sidecar.ts';
 import type { EmployeeInst } from '../src/workforce.ts';
 
 // SYS01 AC-A, sample by sample. Each test builds its own fresh namespace on the company fork (scripts/test-worktrees.ts) and

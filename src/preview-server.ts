@@ -1,6 +1,6 @@
 /**
- * 交付预览服务 · 应急桥接。正式宿主是 Paseo 插件（plugin/server/preview.ts），
- * 本脚本只在插件进程不可用时人工兜底，监听面与插件完全一致：
+ * 交付预览服务 · 应急桥接。正式宿主是原生执行端（src/runner/preview-host.ts），
+ * 本脚本只在执行端不可用时人工兜底，监听面与执行端一致：
  *   LAN  面 0.0.0.0:SCK_PREVIEW_PORT（缺省 18777）——无鉴权，老板 Mac 局域网口径
  *   签名面 127.0.0.1:SCK_PREVIEW_SIGNED_PORT（缺省 18778）——需 SCK_PREVIEW_SECRET，
  *        公网经 VPS → SSH 反向隧道打到这里；本机回环绑定，隧道之外不可直连
@@ -18,7 +18,7 @@ import { createPreviewFetch, lanIPv4 } from './preview-core.ts';
 
 const HOME = process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library/Application Support/SurrealCKCompany');
 
-/** 与 plugin/server/env.ts 的 loadServiceEnv 等价：桥接进程自持，避免改 launchd plist。 */
+/** 与 src/runner/env.ts 的 loadServiceEnv 等价：桥接进程自持，避免改 launchd plist。 */
 const loadServiceEnv = () => {
   try {
     for (const line of readFileSync(join(HOME, 'private/service.env'), 'utf8').split(/\r?\n/)) {

@@ -22,12 +22,7 @@ jobs:
           sudo apt-get install -y zsh
           zsh --version
       - run: pnpm install --frozen-lockfile
-      - run: pnpm install --frozen-lockfile --ignore-scripts
-        working-directory: plugin
-      - run: sh plugin/scripts/vendor.sh
       - run: pnpm typecheck
-      - run: pnpm typecheck
-        working-directory: plugin
       - run: pnpm test:bridge
       - run: pnpm test:service
       - run: pnpm install --frozen-lockfile
@@ -70,19 +65,14 @@ jobs:
         run: |
           set -eu
           pnpm install --frozen-lockfile
-      - name: 安装依赖（plugin）
-        working-directory: plugin
-        run: |
-          set -eu
-          pnpm install --frozen-lockfile --ignore-scripts
       - name: 检查版本号未发布
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          VERSION=$(node -p "require('./plugin/package.json').version")
+          VERSION=$(node -p "require('./package.json').version")
           if out=$(gh release view "v$VERSION" 2>&1); then
-            echo "v$VERSION 已发布：请先在 plugin/package.json 与根 package.json 升版本号" >&2
+            echo "v$VERSION 已发布：请先在根 package.json 与 company-release.json 升版本号" >&2
             exit 1
           elif ! printf '%s' "$out" | grep -qi 'not found'; then
             echo "无法确认 v$VERSION 是否已发布：$out" >&2
@@ -108,10 +98,10 @@ jobs:
         run: |
           set -eu
           bun scripts/company-migrate.ts
-      - name: 打包插件发行资产
+      - name: 打包执行端发行资产
         run: |
           set -eu
-          bun scripts/plugin-package.ts --out "$RUNNER_TEMP/dist" --verify-install
+          bun scripts/release-package.ts --out "$RUNNER_TEMP/dist" --verify-install
       - name: 发布 GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -120,7 +110,7 @@ jobs:
           DIST="$RUNNER_TEMP/dist"
           SCHEMA=$(node -p "require(process.argv[1]).requiredSchema" "$DIST/manifest.json")
           gh release create "v$VERSION" \
-            "$DIST/sck-company-$VERSION.tgz" "$DIST/manifest.json" "$DIST/node-updater.js" \
+            "$DIST/sck-company-$VERSION.tgz" "$DIST/manifest.json" \
             --target "$GITHUB_SHA" \
             --title "sck-company $VERSION" \
             --notes "版本 $VERSION；main 提交 $GITHUB_SHA；云端 schema 版本 $SCHEMA。"

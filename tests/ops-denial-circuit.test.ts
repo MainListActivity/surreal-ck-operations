@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
+import { SidecarPool, type SidecarDeps } from '../src/runner/sidecar.ts';
 
 async function fixture(run: (r: { relay: () => Promise<any>; blocks: string[]; upstream: () => number; setReply: (r: unknown) => void; root: string }) => Promise<void>) {
   const root = mkdtempSync(join(tmpdir(), 'ops-denial-'));
@@ -52,7 +52,7 @@ test('repeated thrown contract refusals also block, without persisting raw messa
 }));
 
 test('a replacement circuit keeps refusal counts, and failed blocker persistence retries without another upstream call', async () => {
-  const { OpsCircuit } = await import('../plugin/server/ops-circuit.ts');
+  const { OpsCircuit } = await import('../src/runner/ops-circuit.ts');
   const { mkdirSync } = await import('node:fs');
   const root = mkdtempSync(join(tmpdir(), 'ops-restart-')); mkdirSync(join(root,'qa-fixture'));
   let calls=0, blocks=0;

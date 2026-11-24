@@ -1,11 +1,8 @@
-# 节点运维手册（0.7.0）
+# 节点运维手册（0.13.85）
 
-本文说明执行节点（老板的 Mac 或其他执行端）上需要运维的部分，并记录仍然有效的业务规则与运行约定。0.7.0 起，节点只运行两样东西：
+本文说明执行节点（老板的 Mac 或其他执行端）上需要运维的部分，并记录仍然有效的业务规则与运行约定。节点只运行一个公司进程：**原生执行端**（launchd `org.surrealck.native.<节点ID>`，见 [native-agent-runtime.md](./native-agent-runtime.md)）。派工调度器、员工通道 sidecar、老板接口（端口 18777）、交付预览与运维代理都在这个进程里，版本由它自更新（见 [company-upgrades.md](./company-upgrades.md)）。0.13.85 起没有 Paseo 插件 `sck-company`，0.13.84 起没有 launchd 定时更新器。
 
-1. **Paseo 插件 `sck-company`**：派工调度器、员工通道 sidecar、老板接口（端口 18777）、交付预览与运维代理都在插件进程内。
-2. **节点更新器**：安装为定时任务，按最新正式 Release 把插件切换到新版本。
-
-节点上没有独立的任务服务进程，也没有 MCP 端点。任务、租约与审计都在云端公司库（SurrealDB）。节点只通过插件访问它。升级与回退见 [company-upgrades.md](./company-upgrades.md)。
+节点上没有 MCP 端点。任务、租约与审计都在云端公司库（SurrealDB），节点只通过执行端访问它。下文业务规则里沿用的“插件”字样，指的都是执行端。
 
 ## 服务目录
 
@@ -13,12 +10,13 @@
 
 | 路径 | 内容 | 来源 |
 |---|---|---|
-| `current` | 符号链接，指向现役运行目录 `plugin-releases/<sha>/plugin`。执行端与员工命令从这里运行。 | 执行端自更新（`src/node-updater.ts` 的 `pointCurrent`）；回退时由启动脚本改写 |
-| `plugin-releases/<sha>/` | `release.json`、`plugin/`（含 node_modules）、`scripts/sck.sh`、`scripts/bun-runtime.sh` | 节点更新器从发行包解压 |
-| `bin/sck` | `scripts/sck.sh` 的副本，权限 700 | 节点更新器（切换成功后） |
-| `bin/bun-runtime.sh` | `scripts/bun-runtime.sh` 的副本，权限 700 | 节点更新器 |
+| `current` | 符号链接，指向现役运行目录 `plugin-releases/<sha>/runtime`。执行端与员工命令从这里运行。 | 执行端自更新（`src/node-updater.ts` 的 `pointCurrent`）；回退时由启动脚本改写 |
+| `plugin-releases/<sha>/` | `release.json`、`runtime/`（含 node_modules；0.13.84 及之前是 `plugin/`）、`scripts/sck.sh`、`scripts/bun-runtime.sh` | 执行端自更新从发行包解压 |
+| `bin/sck` | `scripts/sck.sh` 的副本，权限 700 | 执行端自更新（确认新版本时） |
+| `bin/bun-runtime.sh` | `scripts/bun-runtime.sh` 的副本，权限 700 | 执行端自更新 |
+| `bin/native-<节点ID>.sh` | 执行端启动脚本（含自更新回退兜底），不随版本更新 | `scripts/native-service.ts` |
 | `updater/` | 运行锁 `lock`、回退冷却记录 `rolled-back.json`、待确认标记 `pending`（含 `.attempts`/`.rolled-back`）；0.13.84 前的 `node-updater.js`、`run.sh` 已不再使用 | 执行端自更新 |
-| `private/` | `owner-token`（0600，插件启动时生成）、`node-id`、`cloud/`（云端凭证文件）、`company-db.env`（只放云端字段，见「节点组成与首次安装」）、`service.env`（可选，路径与端口配置） | 插件与运维人员 |
+| `private/` | `owner-token`（0600，执行端只读取已有文件）、`node-id`、`cloud/`（云端凭证文件）、`company-db.env`（只放云端字段，见「节点组成与首次安装」）、`service.env`（可选，路径与端口配置） | 运维人员 |
 | `logs/` | `native-<节点ID>.log`（执行端、自更新与预览服务）；旧的 `node-updater.log` 不再写入 | 各组件 |
 | `runtime-bun/` | 可选，服务固定的 Bun 运行时 | 运维人员 |
 
@@ -37,34 +35,34 @@
 
 ## 员工命令 `sck`
 
-员工会话里的工具入口是 `bin/sck`（即 `scripts/sck.sh`）。它把请求交给 `current/server/vendor/src/sck-cli.ts` 运行。
+员工会话里的工具入口是 `bin/sck`（即 `scripts/sck.sh`）。它把请求交给 `current/src/sck-cli.ts` 运行（0.13.84 及之前的布局是 `current/server/vendor/src/sck-cli.ts`，两者都认）。
 
 ```sh
 "$HOME/Library/Application Support/SurrealCKCompany/bin/sck" list
 "$HOME/Library/Application Support/SurrealCKCompany/bin/sck" call get_context '{}'
 ```
 
-- `sck list` 与 `sck call <工具> '<JSON>'` 只走员工通道（comm）。需要环境变量 `SCK_COMM_DIR` 与 `SCK_COMM_KEY`。插件 sidecar 在会话启动时注入这两个变量。`sck.sh` 也会读取 `comm-agents/<PASEO_AGENT_ID>` 指针文件，以便插件重启后找到最新的通道。
+- `sck list` 与 `sck call <工具> '<JSON>'` 只走员工通道（comm）。需要环境变量 `SCK_COMM_DIR` 与 `SCK_COMM_KEY`。执行端 sidecar 在会话启动时注入这两个变量。
 - 缺少 `SCK_COMM_DIR` 时 `sck` 报 `missing_comm_dir` 并退出，不会回退到其他身份。
-- 没有现役插件（`current` 不存在）时报 `missing_plugin`；Bun 运行时缺失时报 `missing_runtime`。
+- 没有现役运行目录（`current` 下找不到 `src/sck-cli.ts` 或旧布局的 `server/vendor/src/sck-cli.ts`）时报 `missing_plugin`；Bun 运行时缺失时报 `missing_runtime`。
 - 每次输出都是一行 JSON。失败时同时在 stderr 给出原因，退出码为 1。
 
-员工的身份由插件通道决定，不能在参数里指定。员工凭证不落盘，也不进入环境变量（见 [sidecar 通道](./sidecar-channel.md)）。
+员工的身份由执行端通道决定，不能在参数里指定。员工凭证不落盘，也不进入环境变量（见 [sidecar 通道](./sidecar-channel.md)）。
 
 ## 老板接口 `sck owner`
 
-老板命令走插件的老板接口，即 LAN 面上的 `/api/owner/<命令>`：
+老板命令走执行端的老板接口，即 LAN 面上的 `/api/owner/<命令>`：
 
 ```sh
 "$HOME/Library/Application Support/SurrealCKCompany/bin/sck" owner <命令> '<JSON>'
 ```
 
-命令名以 `plugin/server/owner-api.ts` 的路由为准，例如 `task.create`。
+命令名以 `src/owner-api.ts` 与 `src/runner/owner-http.ts` 的路由为准，例如 `task.create`。
 
 - 端口读取 `private/service.env` 中的 `SCK_PREVIEW_PORT`，缺省 18777。请求发往 `127.0.0.1`。
-- 鉴权使用 `private/owner-token`（由插件 `ensureOwnerToken` 在启动时生成，权限 0600）。命令行只读取该文件，不打印令牌。
+- 鉴权使用 `private/owner-token`（权限 0600）。命令行只读取该文件，不打印令牌。
 - `X-Owner-Agent` 头取自环境变量 `SCK_OWNER_AGENT`，缺省为 `cli`。
-- 服务端的 `/api/owner/*` 路由由 `plugin/server/owner-api.ts` 处理，要求 Bearer 令牌。
+- 服务端的 `/api/owner/*` 路由由 `src/runner/owner-http.ts` 处理，要求 Bearer 令牌。
 
 ## 健康检查
 
@@ -90,31 +88,31 @@
 
 ## 交付预览
 
-交付预览服务内嵌在插件进程中（`plugin/server/preview.ts`），随插件启动、随 reload 或卸载停止，不另起守护进程。
+交付预览服务在执行端进程里（`src/runner/preview-host.ts`），随执行端启动与停止，不另起守护进程。`SCK_PREVIEW_HOST=0` 可关闭。
 
-- **LAN 面**：`0.0.0.0:SCK_PREVIEW_PORT`（缺省 18777）。提供 `/e/`、`/d/`、`/healthz` 与 `/o/`、`/api/owner/` 等路径。除 `/api/owner/*` 外无鉴权，仅供老板局域网设备访问。
+- **LAN 面**：`0.0.0.0:SCK_PREVIEW_PORT`（缺省 18777）。提供 `/e/`、`/d/`、`/healthz`、`/internal-ai/status` 与 `/api/owner/` 等路径。旧插件的 `/o/<token>/` 网页审核台已删除，老板用云端老板端。除 `/api/owner/*` 外无鉴权，仅供老板局域网设备访问。
 - **签名面**：`127.0.0.1:SCK_PREVIEW_SIGNED_PORT`（缺省 18778），仅在配置了 `SCK_PREVIEW_SECRET` 时启动。所有 `/e/`、`/d/` 请求必须带 `exp` 与 `sig`，未签名返回 401，过期返回 403。
-- 签名面只监听回环地址。若要公网访问，需要自行配置隧道或反向代理，并以签名面为入口。此仓库中的代码不包含隧道配置。待确认：`SCK_PREVIEW_PUBLIC_BASE` 当前代码不读取，原文中的公网基址设置已删除。
-- 绑定失败时每 2 秒重试，直到插件停止。
+- 签名面只监听回环地址。公网访问经 launchd `org.surrealck.status-tunnel`（SSH 反向隧道到 VPS）以签名面为入口；隧道配置不在此仓库。待确认：`SCK_PREVIEW_PUBLIC_BASE` 当前代码不读取，原文中的公网基址设置已删除。
+- 端口被占用时每 5 秒重试，占用期间不改写 `preview-status.json`。
 
 员工交付使用 `deliverable_publish` 工具，把文件复制到 `deliverables/<任务ID>/` 并返回可点击的 `/d/` 链接。
 
 ## 员工沙箱
 
-员工与老板、插件是同一个 macOS 用户 `y`，文件权限挡不住员工读取公司凭证。所以公司会话在 Seatbelt 沙箱（`scripts/sandbox/employee.sb`）中启动，子进程会继承：
+员工与老板、执行端是同一个 macOS 用户 `y`，文件权限挡不住员工读取公司凭证。所以公司会话在 Seatbelt 沙箱（`scripts/sandbox/employee.sb`）中启动，子进程会继承：
 
 - **不可读写**：`<服务目录>/private`、`~/.ssh`（只放行 `config`、`known_hosts`、`id_ed25519.pub`，git 经 ssh-agent 推送）、`~/.paseo`、`~/.config/magpie`、Cloudflare/wrangler 配置。
 - **不可连接**：Paseo daemon `localhost:6767`（员工会话里的 Paseo 自带 MCP 因此失效，公司流程不依赖它）、`~/.ssh` 与 `~/.paseo` 下的 unix socket、`sck-vault` socket。
 - **不可执行**：`launchctl`、`osascript`、`open`、`crontab`/`at`、Paseo CLI；同时禁止 AppleEvents 和 LaunchServices。
-- **不可写**：插件发布与运行时目录、沙箱自身、`~/Library/LaunchAgents`、shell 启动文件、`~/.gitconfig`、`~/.claude` 的全局设置/hooks/skills/plugins、`~/.local/bin`、`~/.local/share/claude`、`~/.bun/bin`、`~/node/bin`、`/Applications`、`/opt/homebrew`。
+- **不可写**：发行与运行时目录、沙箱自身、`~/Library/LaunchAgents`、shell 启动文件、`~/.gitconfig`、`~/.claude` 的全局设置/hooks/skills/plugins、`~/.local/bin`、`~/.local/share/claude`、`~/.bun/bin`、`~/node/bin`、`/Applications`、`/opt/homebrew`。
 
-接线方式：插件在 `agent.session_open` 给公司会话加 `SCK_SANDBOX=employee`（resume 的会话按 label 识别后同样加上）。Paseo 的 `claude`、`factory-droid`、`antigravity` provider 命令替换成 `<服务目录>/sandbox/bin/*` 包装脚本，经 `launch.sh` 处理：有标记或 `SCK_COMM_DIR` 的会话进沙箱，profile 缺失时拒绝启动（exit 78）；老板自己的会话和 Paseo 的版本/登录探测原样运行。安装或更新（幂等，会备份 `~/.paseo/config.json` 并执行 `paseo reload`）：
+接线方式：执行端配置 `private/native-runner.json` 的每条命令都必须是 `<服务目录>/sandbox/launch.sh <CLI 绝对路径>`（启动时校验，缺 `sandbox/employee.sb` 拒绝启动）；`launch.sh` 对带 `SCK_COMM_DIR` 的会话进沙箱，profile 缺失时拒绝启动（exit 78）。安装或更新沙箱文件：
 
 ```sh
 sh scripts/sandbox/install.sh
 ```
 
-插件每次打开公司交互会话时都会重读 `~/.paseo/config.json`。provider 不在 claude、factory-droid、antigravity 之列（codex 由多个 agent 共用同一个 app-server 进程，无法按会话进沙箱），或配置没有指向包装脚本时，直接拒绝打开会话（fail closed）；只读历史不受影响。已在运行的会话会沿用旧的启动方式，要重新打开会话才进沙箱：空闲时执行 `paseo agent reload <id>`。
+`install.sh` 还会改写 `~/.paseo/config.json` 的 provider 命令（Paseo 插件时代的接线）；0.13.85 起公司不经 Paseo 派工，这一步对公司会话没有作用。
 
 沙箱挡不住的同用户风险：埋进共享仓库、留给老板日后运行的代码（`.git/hooks`、依赖脚本），`~/.claude.json` 里的 Claude 自身 MCP 配置（claude 本身要写这个文件），以及钥匙串里允许 `security` 读取的条目。要彻底隔离，只能让员工改用独立的 macOS 用户运行。
 
@@ -205,13 +203,13 @@ pnpm run admin reclaim-artifacts <任务ID> --execute   # 只回收指定任务
 | 动作 | 命令 | 说明 |
 |---|---|---|
 | 停用自更新 | 在 `private/service.env` 写 `SCK_SELF_UPDATE=0`，再 `launchctl kickstart -k gui/$(id -u)/org.surrealck.native.<节点ID>` | 执行端照常派工，但不再检查新版本。 |
-| 停用插件 | `paseo plugin remove sck-company` | 移除插件注册，插件进程随之停止。节点上不再有派工与员工通道。 |
+| 停用执行端 | `launchctl bootout gui/$(id -u)/org.surrealck.native.<节点ID>` | 执行端停止，节点上不再有派工、员工通道、交付预览与老板接口。 |
 | 停用本机库（0.7.0 及更早安装过） | `launchctl bootout gui/$(id -u)/org.surrealck.company-db`、`launchctl bootout gui/$(id -u)/org.surrealck.company-backup`、`launchctl bootout gui/$(id -u)/org.surrealck.company-verify`，再删除 `~/Library/LaunchAgents/` 下的 `org.surrealck.company-db.plist`、`org.surrealck.company-backup.plist`、`org.surrealck.company-verify.plist` | 0.7.1 起仓库没有安装或卸载脚本，只能手工停用。不停用的话，`company-db` 仍在本机运行却无人使用，备份与恢复演练会因入口脚本已删除而失败。`private/db` 数据目录与 R2 备份保留，是否归档由老板决定。 |
 | 停用旧公司 MCP 服务（0.6.x 节点若曾安装） | `launchctl bootout gui/$(id -u)/org.surrealck.company-mcp`，再删除 `~/Library/LaunchAgents/org.surrealck.company-mcp.plist` | 0.7.0 不会自动停用它。它若仍在运行，会继续从旧的 `active` 目录提供旧代码。 |
 | 清理旧版遗留（0.6.x 节点） | 确认旧 MCP 已停用后：`rm "<服务目录>/active"`（只删链接），再 `rm -r "<服务目录>/releases"` | 节点更新器不删除它们，0.7.0 的 `sck` 与插件也不读取它们。`releases/` 只是旧 MCP 的源码快照，`private/` 中的凭证与配置不受影响。 |
 | 停用员工沙箱 | 手工还原 `~/.paseo/config.json` 中 provider 命令（备份文件 `config.json.bak-sandbox-*`） | 之后公司会话不再进入沙箱。 |
 
-停用与卸载都不删除数据库、凭证、日志或插件发行目录。
+停用与卸载都不删除数据库、凭证、日志或发行目录。
 
 ## 业务规则与运行约定
 

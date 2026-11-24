@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { CLOUD_OWNER_TOOLS, SidecarPool, cloudRequestOf, routesToGateway, type CloudRoute, type SidecarDeps } from '../plugin/server/sidecar.ts';
+import { CLOUD_OWNER_TOOLS, SidecarPool, cloudRequestOf, routesToGateway, type CloudRoute, type SidecarDeps } from '../src/runner/sidecar.ts';
 import { reqDir, resDir, readJsonFile } from '../src/comm.ts';
 import type { ClaimResult, LeaseProof, TaskView } from '../src/contracts.ts';
 import type { EmployeeInst, SupervisedTask } from '../src/workforce.ts';

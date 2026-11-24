@@ -1,18 +1,19 @@
 {
-  "version": "0.13.84",
-  "title": "执行端自更新：节点升级不再依赖 Paseo 插件",
+  "version": "0.13.85",
+  "title": "删除 Paseo 插件：发行包只含执行端运行目录",
   "changes": [
-    "原生执行端每 15 分钟检查正式发行版本，空闲且本节点无租约时准备发行目录、核验 schema、写待确认标记并原子切换 current，排空后由 launchd 拉起新版本。",
-    "新版本首个心跳后确认：再核验 schema、安装 sck 工具脚本、回收旧目录并记升级成功；schema 不满足则自己指回旧版本。15 分钟未确认即退出。",
-    "启动脚本（native-service.ts 生成）按待确认标记计数，新版本连续 3 次启动未确认就把 current 指回旧版本，旧版本启动后补记 node_rollback 与 24 小时冷却。",
-    "执行端启动后卸载旧的 launchd 定时更新器（plist 移到 retired/）；node-updater.js 改为只打印接管说明的过渡文件，scripts/node-updater.sh 删除。",
-    "交付预览与老板接口（18777 局域网面、18778 签名面、/api/owner/*）移入执行端，端口被旧插件占用时每 5 秒重试，插件卸载后自动接管。",
-    "发行清单的 updater 资产改为可缺省，发行包运行目录兼容 runtime/ 与 plugin/ 两种布局，为删除 Paseo 插件做准备。"
+    "删除 plugin/ 目录（Paseo 插件入口、页面、RPC、会话钩子、插件版预览与老板控制台）；节点上派工、员工通道、交付预览与老板接口只在原生执行端。",
+    "发行包改为 release.json + runtime/（根 package.json、pnpm-lock.yaml、src/、schema/、landscape/）+ scripts/；不再生成 vendor，也不再发布 node-updater.js。",
+    "scripts/plugin-package.ts 改名 scripts/release-package.ts；--verify-install 在 --prod 依赖下打包执行端与 sck 入口，确认导入可解析。",
+    "版本号只在根 package.json 与 company-release.json 两处维护；CI 去掉 plugin 安装、vendor 与插件 typecheck。",
+    "删除只在 Paseo 插件进程里有意义的 plugin_runtime_diagnostics 工具；老板接口去掉 Paseo 权限应答 permission.list/answer。",
+    "交付预览列表的设计变量移到 src/relay-tokens.ts。"
   ],
   "impact": [
-    "节点升级只依赖执行端、gh 与 pnpm，不再经过 paseo plugin install/remove；Paseo 守护进程未运行不再阻断升级。",
-    "沿用 schema 074，无迁移。本版仍是有效的 Paseo 插件，由旧更新器最后一次切换上线。"
+    "本版由 0.13.84 的执行端自更新切换上线（首次真实走切换、确认与运行目录布局变化）；current 指向 plugin-releases/<sha>/runtime。",
+    "Paseo 侧不再有 sck-company 插件；只能由 Paseo 运行的 antigravity 员工定义不再被派工。",
+    "沿用 schema 074，无迁移。"
   ],
-  "migration": "无 schema 变化（沿用 schema 074）。上线后用本版 scripts/native-service.ts --no-load 重写启动脚本，使回退兜底生效。",
-  "rollback": "手工把 current 指回 0.13.83 的发行目录并重启执行端；如需旧定时更新器，把 retired/org.surrealck.node-updater.plist 移回 LaunchAgents 后 bootstrap。"
+  "migration": "无 schema 变化（沿用 schema 074）。节点上的 sck-company 插件在 0.13.84 上线后已卸载；执行端自更新会把 current 切到 runtime/ 布局，bin/sck 在确认时替换。",
+  "rollback": "执行端启动脚本在新版本连续 3 次启动未确认时自动指回 0.13.84；手工回退见 docs/company-upgrades.md「手动回退到上一版」。"
 }

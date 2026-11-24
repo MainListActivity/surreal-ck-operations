@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync, existsSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SidecarPool, blockerQuotaReset } from '../plugin/server/sidecar.ts';
+import { SidecarPool, blockerQuotaReset } from '../src/runner/sidecar.ts';
 import { RESPONSE_BUDGET_BYTES } from '../src/response-budget.ts';
 import { commDir, reqDir, resDir, reportPath, blockerPath, readJsonFile } from '../src/comm.ts';
 import type { ActiveLease, ClaimResult, LeaseProof, TaskView } from '../src/contracts.ts';

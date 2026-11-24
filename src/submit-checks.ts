@@ -26,7 +26,7 @@ export const runProcess: Runner = (cmd, args, opts) => new Promise(resolve => {
   child.on('close', code => { clearTimeout(timer); resolve({ code: code ?? -1, out }); });
 });
 
-const SOURCE = /^(src|plugin\/server|plugin\/client|scripts)\//;
+const SOURCE = /^(src|scripts)\//;
 /** Sidecar tools answered through its own lease path instead of a dispatch `case`. */
 const SIDECAR_NATIVE = new Set(['claim_next', 'heartbeat']);
 const SIDECAR = 'src/runner/sidecar.ts';
@@ -59,7 +59,7 @@ export async function versionProblems(root: string, run: Runner = runProcess): P
   const problems: string[] = [];
   if (!own) return ['package.json 没有可读的 version'];
   if (mainVersion && !newer(own, mainVersion)) problems.push(`package.json 版本 ${own} 未高于 main 的 ${mainVersion}：改了代码要提高版本号`);
-  for (const rel of ['plugin/package.json', 'company-release.json']) {
+  for (const rel of ['company-release.json']) {
     const v = version(read(root, rel));
     if (v !== undefined && v !== own) problems.push(`${rel} 版本 ${v} 与 package.json ${own} 不一致`);
   }

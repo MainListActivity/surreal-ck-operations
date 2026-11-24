@@ -15,7 +15,7 @@ import { OutboundMessageStore } from '../src/outbound-messages.ts';
 import { ownerApi } from '../src/owner-api.ts';
 import { DEFAULT_MACHINE_CRITERION, dispatchText, renderDispatchBody } from '../src/outbound-render.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
-import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
+import { SidecarPool, type SidecarDeps } from '../src/runner/sidecar.ts';
 
 // W2 owner board on a real company fork: two engineers, one lease each, queued work and unsent messages. Every row the board
 // shows is checked against the scheduler's own candidate check, and every message text against what a real dispatch sends.

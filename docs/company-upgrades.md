@@ -1,10 +1,10 @@
-# 公司系统版本发布与节点升级（0.13.84）
+# 公司系统版本发布与节点升级（0.13.85）
 
-0.13.84 起，节点升级由原生执行端自己完成（自更新），不再经过 Paseo 插件和 launchd 定时更新器。main 合入后，CI 发布发行包；执行端每 15 分钟读取最新正式 Release，核对清单与 sha256，在空闲且无租约时切换 `current`，排空后由 launchd 按新版本重新拉起。新版本健康后确认；起不来时由启动脚本退回旧版本。节点运维见 [company-service-operations.md](./company-service-operations.md)，执行端见 [native-agent-runtime.md](./native-agent-runtime.md)。
+0.13.84 起，节点升级由原生执行端自己完成（自更新），不再经过 Paseo 插件和 launchd 定时更新器。main 合入后，CI 发布发行包；执行端每 15 分钟读取最新正式 Release，核对清单与 sha256，在空闲且无租约时切换 `current`，排空后由 launchd 按新版本重新拉起。新版本健康后确认；起不来时由启动脚本退回旧版本。0.13.85 起仓库里没有 Paseo 插件，发行包只含执行端运行目录。节点运维见 [company-service-operations.md](./company-service-operations.md)，执行端见 [native-agent-runtime.md](./native-agent-runtime.md)。
 
 ## 版本与发布说明
 
-- 版本号采用语义版本。根 `package.json`、`plugin/package.json` 与 `company-release.json` 的 `version` 必须一致。`scripts/plugin-package.ts` 在打包时核对这三处（`plugin-package.ts` 中「版本不一致」的检查）。
+- 版本号采用语义版本。根 `package.json` 与 `company-release.json` 的 `version` 必须一致。`scripts/release-package.ts` 在打包时核对这两处（「版本不一致」的检查）。
 - 每次上线提高版本号，并在同一提交更新 `company-release.json`：
   - `title`：标题，2 到 100 字。
   - `changes`：上线内容，1 到 10 条，每条不超过 240 字。
@@ -19,7 +19,7 @@
 
 | 作业 | 触发条件 | 作用 |
 |---|---|---|
-| `quality` | PR 与 main push | 安装依赖，生成 vendor，根与插件 typecheck，运行 `test:bridge`、`test:service`、`test:comm` |
+| `quality` | PR 与 main push | 安装依赖，typecheck，运行 `test:bridge`、`test:service`、`test:comm` 与老板端测试 |
 | `workflow-lint` | PR 与 main push | 用 actionlint 1.7.12 检查 workflow 语法 |
 | `release` | 仅 main push，且 `quality` 通过 | 迁移云端库，发布 GitHub Release 资产 |
 
@@ -28,7 +28,7 @@
 1. 确认 `v<版本>` 尚未发布（`gh release view`）。已发布则失败，需先提高版本号。
 2. 在临时服务目录写入 migrator 凭证（`private/cloud/migrator-client-secret`），凭证只存在于本次作业。
 3. 运行 `bun scripts/company-migrate.ts`，以 migrator 身份对云端公司库执行 schema 迁移。
-4. 运行 `bun scripts/plugin-package.ts --out <临时目录> --verify-install`，生成发行包与清单，并在临时目录按锁文件安装生产依赖，确认服务端入口可以打包。
+4. 运行 `bun scripts/release-package.ts --out <临时目录> --verify-install`，生成发行包与清单，并在临时目录按锁文件安装生产依赖，确认执行端与 sck 入口可以打包。
 5. 以 main 提交为目标执行 `gh release create v<版本>`，上传资产。
 
 迁移只在 `v<版本>` 尚未发布时执行。若第 4 步或第 5 步失败，重跑作业会再次执行迁移，所以新增 schema 必须可以重复执行。`release-main` 并发组让发布串行执行，且不取消在途发布。main 的 Quality gate 失败时不会发布。
@@ -39,9 +39,8 @@
 
 | 资产 | 内容 |
 |---|---|
-| `sck-company-<版本>.tgz` | `release.json`（product、version、sha、requiredSchema）、运行目录与 `scripts/`。运行目录目前叫 `plugin/`（历史名称；执行端也接受 `runtime/`），含 `package.json`、`pnpm-lock.yaml` 与 `server/vendor`（`src/`、`schema/` 的副本与版本戳），不含 `node_modules`、测试文件与 `tsconfig.json`。`scripts/` 只含 `sck.sh` 与 `bun-runtime.sh`，确认新版本时装到 `bin/`。 |
-| `manifest.json` | 清单：`format`（当前为 1）、`product`（`sck-company`）、`version`、`sha`（main 提交）、`requiredSchema`、`createdAt`、发行包（`package`）的文件名、sha256 和字节数；`updater` 可缺省。 |
-| `node-updater.js` | 过渡文件，只给尚未升级到 0.13.84 的节点用：旧定时更新器切到本版后把它装上，之后它每轮只打印“已由执行端接管”。 |
+| `sck-company-<版本>.tgz` | `release.json`（product、version、sha、requiredSchema）、`runtime/` 与 `scripts/`。`runtime/` 是执行端运行目录：根 `package.json`、`pnpm-lock.yaml`、`src/`、`schema/`、`landscape/`，不含 `node_modules`、测试文件与 `tsconfig.json`；执行端入口 `src/runner/run.ts`，版本从发行目录的 `release.json` 读。`scripts/` 只含 `sck.sh` 与 `bun-runtime.sh`，确认新版本时装到 `bin/`。0.13.84 及之前的发行包运行目录叫 `plugin/`（Paseo 插件 + `server/vendor`），自更新两种都认。 |
+| `manifest.json` | 清单：`format`（当前为 1）、`product`（`sck-company`）、`version`、`sha`（main 提交）、`requiredSchema`、`createdAt`、发行包（`package`）的文件名、sha256 和字节数。0.13.84 及之前还带 `updater`（旧定时更新器），现在可缺省且不读取。 |
 
 节点不下载依赖，而是用包内的 `pnpm-lock.yaml` 执行 `pnpm install --prod --frozen-lockfile --ignore-scripts`。
 
@@ -54,8 +53,8 @@
 服务目录默认是 `~/Library/Application Support/SurrealCKCompany`，可用 `SCK_SERVICE_HOME` 覆盖。自更新使用其中的以下位置：
 
 - `updater/lock`：运行锁（进程号与时间）。`updater/rolled-back.json`：回退冷却记录。`updater/pending`（及 `.attempts`、`.rolled-back`）：待确认标记，见下文。
-- `plugin-releases/<sha>/`：发行目录，包含 `release.json`、运行目录（含依赖）与 `scripts/`。
-- `current`：符号链接，指向现役运行目录 `plugin-releases/<sha>/plugin`。执行端与员工命令都从这里运行。
+- `plugin-releases/<sha>/`：发行目录（目录名沿用历史），包含 `release.json`、运行目录 `runtime/`（含依赖）与 `scripts/`。
+- `current`：符号链接，指向现役运行目录 `plugin-releases/<sha>/runtime`。执行端与员工命令都从这里运行。
 - `bin/sck`、`bin/bun-runtime.sh`：从现役发行目录复制来的工具脚本（权限 700）。`bin/native-<节点ID>.sh`：启动脚本，由 `scripts/native-service.ts` 生成，不随版本更新。
 - `private/node-id`：节点 ID（`src/node-identity.ts`）。
 - 日志：`logs/native-<节点ID>.log`，自更新的行以 `[自更新]` 开头。
@@ -103,7 +102,7 @@ SELECT id, version, sha, seen_at, checked_at, last_status, last_target, last_err
 ## 新节点安装
 
 1. 准备云端连接配置（`private/company-db.env`、`private/cloud/runner-client-secret`）、老板凭证 `private/owner-token`、`private/service.env` 与员工沙箱（`sh scripts/sandbox/install.sh`）。
-2. 第一次手工放置发行目录：下载最新 Release 的发行包，解压到 `plugin-releases/<sha>/`，在运行目录执行 `pnpm install --prod --frozen-lockfile --ignore-scripts`，把 `current` 指向它，并把 `scripts/sck.sh`、`scripts/bun-runtime.sh` 复制为 `bin/sck`、`bin/bun-runtime.sh`（权限 700）。
+2. 第一次手工放置发行目录：下载最新 Release 的发行包，解压到 `plugin-releases/<sha>/`，在 `runtime/` 执行 `pnpm install --prod --frozen-lockfile --ignore-scripts`，把 `current` 指向它，并把 `scripts/sck.sh`、`scripts/bun-runtime.sh` 复制为 `bin/sck`、`bin/bun-runtime.sh`（权限 700）。
 3. 写 `private/native-runner.json`，用 `current` 里那份 `scripts/native-service.ts` 安装服务：`bun scripts/native-service.ts <节点ID> <配置绝对路径>`。
 4. 核对 `native:<节点ID>` 心跳后再写 `private/runtime-routes.json`。之后的升级由自更新完成。
 
@@ -116,7 +115,7 @@ SELECT id, version, sha, seen_at, checked_at, last_status, last_target, last_err
 ### 手动回退到上一版
 
 1. 先关闭自更新，否则它会再次升级：在启动脚本或 `private/service.env` 设置 `SCK_SELF_UPDATE=0`。
-2. 上一版目录保留在 `<服务目录>/plugin-releases/<上一版 SHA>/plugin`（确认时保留回退目标）。
+2. 上一版目录保留在 `<服务目录>/plugin-releases/<上一版 SHA>/runtime`（0.13.84 是 `.../plugin`；确认时保留回退目标）。
 3. `ln -sfn "<上一版运行目录>" "<服务目录>/current"`，用上一版发行包的 `scripts/sck.sh` 与 `scripts/bun-runtime.sh` 覆盖 `bin/sck` 与 `bin/bun-runtime.sh`，删除 `updater/pending*`。
 4. `launchctl kickstart -k gui/$UID/org.surrealck.native.<节点ID>`。
 5. 修复并发布新版本后，再去掉 `SCK_SELF_UPDATE=0`。
@@ -161,7 +160,7 @@ SELECT id, version, sha, seen_at, checked_at, last_status, last_target, last_err
 
 ## 已知限制
 
-- 自更新的完整路径（切换、确认、启动脚本回退）在 0.13.84→下一版本首次真实运行；之前只有单元测试与启动脚本的真实 shell 测试。
+- 启动脚本的回退路径只在真实 shell 测试里验证过，生产上还没有真正触发过。
 - 新节点第一次仍要手工放置发行目录，之后才由自更新接管。
 - 没有正式 Release 时，依赖 `gh` 的错误文字（`release not found`、`no releases found`）识别这种情况。文字变化后，它会被当作失败记录。
 - 陈旧锁的接管不是原子操作；启动脚本用 `ln -sfn` 回退 `current`，不是原子替换。
@@ -177,7 +176,7 @@ SELECT id, version, sha, seen_at, checked_at, last_status, last_target, last_err
 ## 维护者发布前检查
 
 1. 三处版本号一致，`company-release.json` 说明完整；需要时同步登记 schema。
-2. 本地运行 `pnpm test:service` 与 `bun test tests/release-notes-contract.test.ts`，并用 `bun scripts/plugin-package.ts --out <临时目录> --verify-install` 检查产物。
+2. 本地运行 `pnpm test:service` 与 `bun test tests/release-notes-contract.test.ts`，并用 `bun scripts/release-package.ts --out <临时目录> --verify-install` 检查产物。
 3. PR 通过 Quality gate 后合入 main。
 4. 确认 Release 资产齐全，且 `manifest.json` 的 `sha` 与 main 提交一致。
 5. 等待执行端的下一轮（最长 15 分钟，加上排空时间），在云端 `node_release` 核对版本与 `last_status`。

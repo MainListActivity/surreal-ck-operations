@@ -1,7 +1,7 @@
 /**
- * Mac 节点实机核对（插件侧）：采集 launchctl 已加载的 org.surrealck.* label，加上
+ * Mac 节点实机核对（执行端侧）：采集 launchctl 已加载的 org.surrealck.* label，加上
  * ~/Library/LaunchAgents 里已安装但未加载的 org.surrealck.*.plist（.plist.bak-* 备份不算），
- * 再加插件自身单元 sck-company，作为 units 与登记表比对。只读；采集失败只记原因，不影响调度。
+ * 作为 units 与登记表比对（执行端自身就是其中的 org.surrealck.native.*）。只读；采集失败只记原因，不影响调度。
  */
 import { execFile } from 'node:child_process';
 import { readdir } from 'node:fs/promises';
@@ -14,7 +14,6 @@ import { observationFreshUntil, recordObservation } from './landscape-report.ts'
 
 export const MAC_HOST = 'mac-node';
 const LABEL_PREFIX = 'org.surrealck.';
-const PLUGIN_UNIT = 'sck-company';
 
 export interface MacObserveDeps {
   exec?: ExecFn;
@@ -45,7 +44,7 @@ export function plistLabels(entries: readonly string[]): string[] {
     .map(name => name.slice(0, -'.plist'.length));
 }
 
-/** 采集 Mac 观测：units 是已加载与已安装 label 的并集加上插件自身；listen/caddyRoutes 不适用记 null。 */
+/** 采集 Mac 观测：units 是已加载与已安装 label 的并集；listen/caddyRoutes 不适用记 null。 */
 export async function collectMacObservation(deps: MacObserveDeps = {}): Promise<HostObservation> {
   const exec = deps.exec ?? defaultExec;
   const listDir = deps.listDir ?? ((dir: string) => readdir(dir));
@@ -65,7 +64,7 @@ export async function collectMacObservation(deps: MacObserveDeps = {}): Promise<
     });
   const units = loaded === null || installed === null
     ? null
-    : [...new Set([...loaded, ...installed, PLUGIN_UNIT])].sort();
+    : [...new Set([...loaded, ...installed])].sort();
   return {
     host: MAC_HOST,
     at: (deps.now ?? new Date()).toISOString(),

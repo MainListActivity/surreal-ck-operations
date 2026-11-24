@@ -11,7 +11,7 @@ import { Workforce } from '../src/workforce.ts';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import { BLOCK_TEXT } from '../src/dispatcher/dispatch-blocked.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
-import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
+import { SidecarPool, type SidecarDeps } from '../src/runner/sidecar.ts';
 import { readJsonFile, reqDir, resDir, reportPath } from '../src/comm.ts';
 import type { ClaimResult, LeaseProof } from '../src/contracts.ts';
 import { RESPONSE_BUDGET_BYTES, answerBytes, guardRelayResponse } from '../src/response-budget.ts';

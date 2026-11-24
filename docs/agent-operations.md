@@ -4,14 +4,14 @@
 
 | 组件 | 位置 | 作用 |
 |---|---|---|
-| 任务服务 | 云端公司库（0.7.0 起节点上没有 MCP 服务，节点只通过插件访问） | 任务、租约、审计、目标、关口；admin/owner 通道 |
-| 调度器 | Paseo 插件内（`plugin/server/dispatch.ts` tick 循环） | 不消耗模型 token：读队列、叫醒/新开员工、收回并改派、订阅健康、老板通知 |
-| 员工通道 | Paseo 插件内 `plugin/server/sidecar.ts`（每实例一个） | 代持实例凭证、代领任务、自动续租、relay `sck call`、回收 `report.md`/`blocker.md` 为提交/阻塞；把 `ops_*` 转给运维代理。架构与排障详见 [sidecar 通道](sidecar-channel.md) |
-| 运维代理 | Paseo 插件内 `src/ops/`（`OpsBroker`，由通道调用） | 持有密封凭证与 Cloudflare/IdP 权限，替员工建账号、建 workspace、管成员、登录、调产品接口、查 workspace 数据、给浏览器登录；员工只拿会话句柄，见下文「运维代理」 |
+| 任务服务 | 云端公司库（0.7.0 起节点上没有 MCP 服务，节点只通过原生执行端访问） | 任务、租约、审计、目标、关口；admin/owner 通道 |
+| 调度器 | 原生执行端内（`src/runner/dispatch.ts` tick 循环） | 不消耗模型 token：读队列、叫醒/新开员工、收回并改派、订阅健康、老板通知 |
+| 员工通道 | 原生执行端内 `src/runner/sidecar.ts`（每实例一个） | 代持实例凭证、代领任务、自动续租、relay `sck call`、回收 `report.md`/`blocker.md` 为提交/阻塞；把 `ops_*` 转给运维代理。架构与排障详见 [sidecar 通道](sidecar-channel.md) |
+| 运维代理 | 原生执行端内 `src/ops/`（`OpsBroker`，由通道调用） | 持有密封凭证与 Cloudflare/IdP 权限，替员工建账号、建 workspace、管成员、登录、调产品接口、查 workspace 数据、给浏览器登录；员工只拿会话句柄，见下文「运维代理」 |
 | 员工 | Paseo 会话 | 按 [协议](../agents/PROTOCOL.md) 执行、写 `.sck` 交付物；进程内无任何凭证，环境里的凭证变量在 spawn 前被清空 |
 | 数据 | 云端公司库 SurrealDB（生产默认 `company/main`），节点不执行迁移 | 唯一事实来源；0.7.1 起没有本机公司库与备份，见 [节点运维手册](company-service-operations.md#数据库与云端迁移) |
 
-公司库只在云端 SurrealDB，节点连接它的方式见 [company-upgrades.md](company-upgrades.md)。`private/company-db.env` 只放云端字段（`COMPANY_DB_URL` 等）；缺少 `COMPANY_DB_URL` 时插件与节点更新器拒绝启动，不回落到本机。产品数据仍在 129，由产品 `.env` 描述。运营流水按 `src/data-retention.ts` 的保留期由插件生命周期清理删除。
+公司库只在云端 SurrealDB，节点连接它的方式见 [company-upgrades.md](company-upgrades.md)。`private/company-db.env` 只放云端字段（`COMPANY_DB_URL` 等）；缺少 `COMPANY_DB_URL` 时执行端拒绝启动，不回落到本机。产品数据仍在 129，由产品 `.env` 描述。运营流水按 `src/data-retention.ts` 的保留期由插件生命周期清理删除。
 
 服务目录：`~/Library/Application Support/SurrealCKCompany/`，布局与安装见 [节点运维手册](company-service-operations.md)。节点上常驻的是原生执行端（launchd `org.surrealck.native.<节点ID>`）：调度器、员工通道、运维代理、交付预览与老板接口都在这个进程里，版本由它自己按 Release 更新（见 [company-upgrades.md](company-upgrades.md)），不要手工改 `current` 来升级。本机调试用 `bun run runner:native`（不设 `SCK_NATIVE_FOLLOW_CURRENT`，不会自更新）。服务依赖云端公司库、网络与 GitHub 登录；Mac 合盖或关机时公司暂停。
 
@@ -162,8 +162,8 @@ sck call company_cmd '{"command":"<命令名>","input":{...}}'
 
 工程员工在 ops 仓提交 code 任务时，服务先在其工作树上做只读检查，不通过直接退回原员工（租约保留，不派评审），审计记 `submit_check_failed`：
 
-- 改了 `src/`、`plugin/`、`scripts/` 时 `package.json` 版本必须高于 main，`plugin/package.json` 与 `company-release.json` 版本一致；
-- 插件 sidecar（`plugin/server/sidecar.ts`）注册的每个工具都接到分发与工具表；`package.json` 测试脚本里列的文件都存在；
+- 改了 `src/`、`scripts/` 时 `package.json` 版本必须高于 main，`company-release.json` 版本一致；
+- 执行端 sidecar（`src/runner/sidecar.ts`）注册的每个工具都接到分发与工具表；`package.json` 测试脚本里列的文件都存在；
 - `tsc --noEmit` 无类型错误（服务自带编译器，在员工沙箱内运行；工作树缺依赖或编译器无法运行时放行，由评审把关）。
 
 `SCK_SUBMIT_CHECKS=0` 关闭。
@@ -325,7 +325,7 @@ pnpm run admin remote-grant list [--task <taskId>]
 ### 核对与通知
 
 - VPS：`sck-owner-minute` 分钟任务里做只读采集（`systemctl list-units`、`ss -ltnH`、Caddy 管理接口 `127.0.0.1:2019` 路由摘要），距上次观测不足 60 分钟跳过；实现见 `owner-end/src/landscape-observe.ts`。
-- Mac：插件派工循环每 60 分钟采集一次（`launchctl list` 的 `org.surrealck.*` + `~/Library/LaunchAgents` 已安装 plist + 插件自身 `sck-company`），见 `src/landscape-mac.ts`。
+- Mac：执行端派工循环每 60 分钟采集一次（`launchctl list` 的 `org.surrealck.*` + `~/Library/LaunchAgents` 已安装 plist），见 `src/landscape-mac.ts`。
 - 观测写 `company_meta:⟨landscape_observed:<hostId>⟩`（含 drift）；三类差异（未登记在跑、登记缺失、应退役仍在）任一非空发老板提示 `landscape-drift:<hostId>`，一致时关闭；采集失败（unknown）只留观测不发提示。
 
 ### 红线

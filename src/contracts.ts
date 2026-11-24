@@ -600,52 +600,6 @@ export interface Evidence {
 }
 
 /**
- * SYS04: what the plugin process is actually running. Read-only, and read by owner, product and qa only: it names the
- * release the company service is loaded from, so it is an operator fact rather than a general employee read.
- *
- * The view is produced in the plugin host's own execution context (the entry every employee channel reaches),
- * never from another process's view, and never from the `current` symlink: a symlink names what the service
- * points at, which is the claim needing evidence rather than the evidence.
- */
-export interface PluginRuntimeView {
-  /** Which execution context produced this answer. `plugin-host` is the only accepted value. */
-  context: 'plugin-host';
-  /** When the sample was taken, ISO 8601 with a timezone offset. */
-  collectedAt: string;
-  process: { pid: number; nodeVersion: string; execPath: string; bunShim: boolean };
-  loaded: {
-    /**
-     * How the directory was obtained. `registered-plugin-source` is the Paseo host's own plugin registry entry
-     * (`paseo plugin ls --json`): the host bundles the server code and evaluates it without a module loader, so
-     * there is no loaded file path to read; the registered source tree is content-bound instead.
-     */
-    basis: 'module-dir' | 'registered-plugin-source' | 'unavailable';
-    selfPath: string | null;
-    serverDir: string | null;
-    vendorDir: string | null;
-    vendorResolvedBy: 'vendor-child-of-server-dir' | 'unavailable';
-  };
-  /** The release proven from the loaded code's own path; `unavailable` when it could not be proven. */
-  binding: { kind: 'plugin-server-dir' | 'unavailable'; path: string | null; reason?: string };
-  /** The files whose content binds the answer. A file that could not be read is present with a null digest. */
-  modules: Array<{ name: string; path: string | null; sha256: string | null; bytes: number | null }>;
-  /** Paths the diagnostic deliberately did not read, so a reader can see the boundary. */
-  notRead: string[];
-}
-
-/**
- * SYS04: the roles allowed to read the plugin runtime diagnostics.
- *
- * The role check is a core concern because that is where the authoritative identity lives; the sample itself
- * is taken by the plugin host, the only process that can state what it loaded. An unauthorized read must
- * produce no diagnostic at all — not a refused one that still touched the filesystem — so the check runs
- * before any sampling.
- */
-export const PLUGIN_RUNTIME_ROLES: readonly Role[] = ['owner', 'product', 'qa'];
-
-
-
-/**
  * SYS05: typed wait entry. The employee hands over why it stops; the core normalizes, stores the progress and
  * releases the lease in one transaction. Times must carry an explicit offset.
  */
@@ -740,15 +694,6 @@ export interface CompanyCore {
   refundFault?(scope: { taskId: TaskId; employeeId?: string }, input: {
     phase: FaultPhase; target?: FaultTargetKind; refund: FaultRefund;
   }): Promise<{ refunded: boolean }>;
-  /**
-   * SYS04: authorize a read of the plugin runtime diagnostics (owner/product/qa only) and answer it from the
-   * caller's own execution context.
-   *
-   * `sample` is invoked only after the caller is known to be allowed, so an unauthorized read produces no
-   * diagnostic at all rather than a refused one that still touched the filesystem. The core cannot take the
-   * sample itself: only the plugin host can state what it loaded.
-   */
-  pluginRuntimeDiagnostics?(credential: Credential, sample: () => PluginRuntimeView | Promise<PluginRuntimeView>): Promise<PluginRuntimeView>;
 
   history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]>;
   companyBrief(credential: Credential): Promise<CompanyBrief>;

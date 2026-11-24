@@ -10,7 +10,7 @@ import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
 import { ProjectStore } from '../src/projects.ts';
-import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
+import { SidecarPool, type SidecarDeps } from '../src/runner/sidecar.ts';
 import type { EmployeeInst } from '../src/workforce.ts';
 import type { CreateTask } from '../src/contracts.ts';
 import { PROJECT_TEXT_LIMITS } from '../src/input-bounds.ts';

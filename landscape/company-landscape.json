@@ -302,12 +302,12 @@
       "host": "mac-node",
       "kind": "paseo-plugin",
       "unit": "sck-company",
-      "listen": "LAN 18777（预览与 QA 台）、127.0.0.1:18778（交付预览）",
-      "deploy": "main 合入后 Quality gate 发 GitHub Release，节点更新器切换插件；有在途租约时延后",
-      "rollback": "节点更新器切回上一版本，见 docs/company-upgrades.md",
-      "status": "active",
+      "listen": "无（已卸载）",
+      "deploy": "0.13.85 起仓库已删除 plugin/，不再发布",
+      "rollback": "无",
+      "status": "retire",
       "verified": true,
-      "notes": "调度器、员工通道 sidecar、运维代理 OpsBroker、老板接口、管理员 agent 接缝都在插件进程内，跑在 Paseo daemon 里。"
+      "notes": "Paseo 插件已退役：0.13.84 上线后 paseo plugin remove sck-company，派工、通道、运维代理、交付预览与老板接口都在原生执行端 native-runner。"
     },
     {
       "id": "node-updater",
@@ -315,11 +315,11 @@
       "host": "mac-node",
       "kind": "launchd",
       "unit": "org.surrealck.node-updater",
-      "deploy": "scripts/node-updater.sh 安装",
+      "deploy": "已删除（scripts/node-updater.sh 于 0.13.84 删除）",
       "rollback": "无需回滚，随插件版本",
-      "status": "active",
+      "status": "retire",
       "verified": true,
-      "notes": "每 900 秒检查最新 Release 并切换插件。"
+      "notes": "0.13.84 起节点更新由原生执行端自更新完成；执行端启动时 bootout 该定时任务并把 plist 移到服务目录 retired/。"
     },
     {
       "id": "native-runner",
@@ -327,11 +327,12 @@
       "host": "mac-node",
       "kind": "launchd",
       "unit": "org.surrealck.native.mac-native",
-      "deploy": "bun scripts/native-service.ts 安装（bin/native-mac-native.sh）",
-      "rollback": "重装上一版本服务脚本",
+      "deploy": "main 合入后 Quality gate 发 GitHub Release，执行端每 15 分钟自更新：空闲且无租约时切换 current，排空后由 launchd 拉起；启动脚本由 bun scripts/native-service.ts 安装（bin/native-mac-native.sh）",
+      "rollback": "新版本连续 3 次启动未确认时启动脚本自动把 current 指回旧版本；手工回退见 docs/company-upgrades.md",
       "status": "active",
       "verified": true,
-      "notes": "原生执行端：本地 CLI 员工与云端通道桥接进程由它拉起，配置见 native-runner.json。"
+      "notes": "节点上唯一的公司进程：调度器、员工通道 sidecar、运维代理 OpsBroker、交付预览、老板接口与自更新都在这里；本地 CLI 员工与云端通道桥接进程由它拉起，配置见 native-runner.json。",
+      "listen": "LAN 18777（交付预览与老板接口 /api/owner/*）、127.0.0.1:18778（签名交付预览，隧道入口）"
     },
     {
       "id": "sck-vault",
@@ -368,7 +369,7 @@
       "rollback": "无",
       "status": "stale",
       "verified": true,
-      "notes": "2026-11-20 负责人核实：plist 仍在 ~/Library/LaunchAgents，但未加载。交付预览已并入插件（18778），按退役处理。"
+      "notes": "2026-11-20 负责人核实：plist 仍在 ~/Library/LaunchAgents，但未加载。交付预览现由原生执行端承载（18777/18778），按退役处理。"
     },
     {
       "id": "company-owner-end",

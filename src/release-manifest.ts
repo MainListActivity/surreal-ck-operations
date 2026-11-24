@@ -1,4 +1,4 @@
-// 发行清单与发行包校验：CI 打包（scripts/plugin-package.ts）与节点更新器共用同一份格式，不做宽松兼容。
+// 发行清单与发行包校验：CI 打包（scripts/release-package.ts）与执行端自更新共用同一份格式，不做宽松兼容。
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { z } from 'zod';
@@ -6,7 +6,6 @@ import { z } from 'zod';
 export const PRODUCT_ID = 'sck-company';
 export const MANIFEST_FORMAT = 1;
 export const MANIFEST_ASSET = 'manifest.json';
-export const UPDATER_ASSET = 'node-updater.js';
 export const packageAssetName = (version: string): string => `sck-company-${version}.tgz`;
 
 const SHA40 = /^[0-9a-f]{40}$/;
@@ -27,7 +26,7 @@ export const releaseManifestSchema = z.object({
   requiredSchema: z.number().int().positive(),
   createdAt: z.string().min(1),
   package: releaseAssetSchema,
-  /** 旧版定时更新器的单文件包；执行端自更新不再使用，只为尚未升级的节点保留，可缺省。 */
+  /** 0.13.84 及之前发行附带的旧定时更新器单文件包；之后的发行不再带，自更新也不读取。 */
   updater: releaseAssetSchema.optional(),
 }).strict();
 

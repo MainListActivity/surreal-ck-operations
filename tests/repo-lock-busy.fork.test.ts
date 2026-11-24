@@ -12,7 +12,7 @@ import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import { BLOCK_TEXT, dispatchNoticeText } from '../src/dispatcher/dispatch-blocked.ts';
 import { PaseoCliError, type PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { repoLockLogLine, type RepoLockEvent } from '../src/dispatcher/worktree-registry.ts';
-import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
+import { SidecarPool, type SidecarDeps } from '../src/runner/sidecar.ts';
 
 // A busy repository allocation lock is a queue on the host, not a failed employee or provider. Runs on a real company fork with a
 // real git repository. Every outcome is read back from the database: task, audit, dispatch, employee, def and owner notice rows.

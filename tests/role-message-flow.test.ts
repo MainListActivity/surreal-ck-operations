@@ -6,7 +6,7 @@ import { ensureOwnerToken } from '../src/owner-token.ts';
 import { OutboundMessageStore, composeMessage, renderMessage, type OutboundMessage } from '../src/outbound-messages.ts';
 import { taskBrief } from '../src/dispatcher/brief.ts';
 import { wake } from '../src/dispatcher/prompts.ts';
-import { scrubEnv } from '../plugin/server/scrub.ts';
+import { scrubEnv } from '../src/runner/launch-env.ts';
 import { Workforce } from '../src/workforce.ts';
 
 const env = { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' };

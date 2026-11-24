@@ -777,10 +777,10 @@ export class OpsBroker {
   }
 
   /**
-   * 插件内嵌交付预览的运行状态：loopback 探测 127.0.0.1:<port>/healthz 为准（权威存活），
-   * 失败时回读插件写的 <serviceHome>/preview-status.json 取 lastError（如 EADDRINUSE）。
+   * 执行端内交付预览的运行状态：loopback 探测 127.0.0.1:<port>/healthz 为准（权威存活），
+   * 失败时回读执行端写的 <serviceHome>/preview-status.json 取 lastError。
    * 双面结构：lan 面（0.0.0.0:18777 无鉴权）+ signed 面（127.0.0.1:18778 签名门控，
-   * 供 VPS→隧道公网访问）。不 import plugin/server/*（vendor 边界），通道只靠 loopback + 状态文件。
+   * 供 VPS→隧道公网访问）。通道只靠 loopback + 状态文件。
    */
   private async previewStatus(): Promise<Record<string, unknown>> {
     const home = process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library/Application Support/SurrealCKCompany');

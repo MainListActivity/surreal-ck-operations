@@ -4,9 +4,7 @@
 
 ## 模块与兼容策略
 
-`src/runner/` 是公司执行模块。公司初始化、派工循环、sidecar、环境清理和回合收尾不再依赖 Paseo SDK，也不导入插件目录。`plugin/server/` 保留兼容入口，通过 vendor 构建取得同一份实现；Paseo 生命周期事件继续驱动同一套业务。默认安装仍使用 Paseo，不会自动把正在执行的会话切换到原生 CLI。
-
-公司插件不再注册页面、侧边栏、命令中心或会话面板。老板日常使用现有 `owner-end/` 网页。旧 UI 源码暂留作后续页面重设计参考，不在客户端入口中加载。
+`src/runner/` 是公司执行模块。公司初始化、派工循环、sidecar、环境清理、回合收尾、交付预览与老板接口（`preview-host.ts`、`owner-http.ts`）和节点自更新（`self-update.ts`）都在这里，不依赖 Paseo SDK。0.13.85 起仓库删除了 Paseo 插件 `plugin/`，节点上唯一的公司进程就是本执行端；老板日常使用 `owner-end/` 网页。
 
 `AgentRuntime` 是派工器的执行接口。Paseo CLI 与 `NativeRuntime` 实现它。为兼容存量数据库，员工上的 `paseo_agent_id` 暂作为执行器会话引用字段：原生引用以 `native:<节点>:<UUID>` 命名。真正的 provider session ID 只存在节点私有 `sessions.json`，不会把 Paseo ID 当作原生 ID。无需立即迁移所有历史记录。
 
@@ -26,11 +24,11 @@ prompt 通过 stdin 传递，参数用数组，不经 shell 拼接，不使用 A
 
 Paseo 兼容节点默认 ID 为 `paseo:legacy`，接管没有 runner_id 的存量员工。多台 Paseo 节点必须设置不同的 `SCK_RUNNER_ID`，且只有一台设置 `SCK_RUNNER_ADOPT_LEGACY=1`；其他节点设置为 `0`。启用原生节点前，现有 Paseo 节点必须先升级到本实现，否则旧派工器不认识节点归属，可能处理别的节点。
 
-原生节点必须设置唯一、稳定的 `SCK_RUNNER_ID`，只接受字母、数字、下划线和短横线；数据库归属为 `native:<ID>`。每个节点独立保存看板与心跳，网页读取合并后的员工视图。通道位于 `<service home>/native/<ID>/comm`，不与插件共用回收目录。
+原生节点必须设置唯一、稳定的 `SCK_RUNNER_ID`，只接受字母、数字、下划线和短横线；数据库归属为 `native:<ID>`。每个节点独立保存看板与心跳，网页读取合并后的员工视图。通道位于 `<service home>/native/<ID>/comm`。
 
 ## 启动配置
 
-这是独立进程入口，不创建 launchd/systemd 定时器，也不会在安装插件时自动启动。
+这是独立进程入口，不创建 launchd/systemd 定时器。
 
 ```sh
 SCK_RUNNER_ID=mac-native \
@@ -65,7 +63,7 @@ SIGINT/SIGTERM 停止派工循环，再停止本执行器拥有的进程组并�
 
 节点存储使用排他 `writer.lock`，第二个写者拒绝启动。执行端进程退出后内核写锁自动释放，不删除锁文件。旧格式锁须先核对原进程；会话子进程仍存活时保持 unknown，不接管或重复发送。同一会话的原 PID 仍存活时恢复为 unknown，禁止自动重载或重放。会话存储损坏、版本不匹配、节点 ID 不匹配都会拒绝启动。
 
-保留 Paseo 执行适配层是回退手段。回退时先停止新原生节点并处理它的在途任务；不能直接让 Paseo 接管原生 session ID。不要回退到不识别 runner_id 的旧插件并同时保持原生节点运行。
+版本回退由自更新与启动脚本负责（见 [company-upgrades.md](company-upgrades.md#确认与回退)）。0.13.85 起没有 Paseo 插件可回退；`src/dispatcher/paseo.ts` 的 Paseo CLI 运行时仍在，但没有进程装配它。
 
 ## 验证范围
 
@@ -82,7 +80,7 @@ SIGINT/SIGTERM 停止派工循环，再停止本执行器拥有的进程组并�
 
 `bun scripts/native-service.ts <节点ID> <配置绝对路径>` 安装 launchd/systemd 常驻服务；`--no-load` 仅生成配置。服务不是定时任务，不依赖 Paseo 进程。安装需要正式发行的 `current` 和现有 `bin/bun-runtime.sh`，不复制凭证。新服务默认待命，安装不会改变派工路由。
 
-切换顺序：先把本节点 Paseo 插件升级到支持路由的版本，再安装/启动原生服务，核对 `native:<节点ID>` 心跳、命令与模型配置，最后原子写入服务目录 `private/runtime-routes.json`：
+切换顺序：安装/启动原生服务，核对 `native:<节点ID>` 心跳、命令与模型配置，最后原子写入服务目录 `private/runtime-routes.json`：
 
 ```json
 {"version":1,"routes":{"claude":"native:mac-native","factory-droid":"native:mac-native"}}
@@ -106,13 +104,13 @@ SIGINT/SIGTERM 停止派工循环，再停止本执行器拥有的进程组并�
 
 ## 0.12.0：云端员工通道
 
-`codex-cloud`、`devin-cloud`、`jules` 三个 provider 走同一原生执行面：命令是 `sandbox/launch.sh bun <服务目录>/current/server/vendor/src/runner/cloud-lane/main.ts <provider>`，桥接进程把回合转交给供应商云端 agent（Codex Cloud / Devin Cloud / Jules），输出与非 codex 原生 CLI 相同的 system/lane_status/result 事件流。员工定义的模型只用 `default`（devin-cloud 的云端会话经 ego-browser 走 app.devin.ai 的 Free 档位，不再调用 devin CLI，见 [cloud-lanes.md](cloud-lanes.md)）；续轮参数只有 `--resume <逻辑会话ID>`（云端任务凭任务 ID 重连，逻辑会话 ID 只是会话标识）。
+`codex-cloud`、`devin-cloud`、`jules` 三个 provider 走同一原生执行面：命令是 `sandbox/launch.sh bun <服务目录>/current/src/runner/cloud-lane/main.ts <provider>`，桥接进程把回合转交给供应商云端 agent（Codex Cloud / Devin Cloud / Jules），输出与非 codex 原生 CLI 相同的 system/lane_status/result 事件流。员工定义的模型只用 `default`（devin-cloud 的云端会话经 ego-browser 走 app.devin.ai 的 Free 档位，不再调用 devin CLI，见 [cloud-lanes.md](cloud-lanes.md)）；续轮参数只有 `--resume <逻辑会话ID>`（云端任务凭任务 ID 重连，逻辑会话 ID 只是会话标识）。
 
 路由、命令校验、额度熔断与 provider_health 与本地 CLI 完全同构：`runtime-routes.json` 可指派云端 provider；`native-runner.json` 新增可选 `lanes` 配置（环境映射、轮询上限），`private/lanes/<provider>.env` 的私密变量由执行端在沙箱外读出后注入，沙箱内桥接进程不读 private。云端额度经 `listUsage` 上报（codex-cloud 读 wham/usage，jules 按本地记录的 24 小时会话数），读取失败不造数。
 
 回合语义：task.md 与最新复核意见内联进云端 prompt；复核轮强制首行复核结论；非 GitHub 工作树按受阻收尾；在途云端任务按 prompt 摘要重连不重复提交。详见 [cloud-lanes.md](cloud-lanes.md)。
 
-`warp`（Warp Build 的 oz agent）是同构的本地桥接：命令是 `sandbox/launch.sh bun <服务目录>/current/server/vendor/src/runner/warp/main.ts warp`，事件流同为 system/lane_status/result。与云端通道不同的是它在本地工作树里干活（提交/推送由 agent 按公司协议自己在任务分支完成），prompt 正文写进 commDir 的 `.warp/turn-<时间戳>.md`（0600），进程参数只带一句短指令；续轮用 `--conversation <conversation_id>`。`lanes.warp` 只接受 `bin`（如 `{"oz": "/Applications/Warp.app/Contents/Resources/bin/oz"}`）与 `maxMinutes`（默认 120）。Warp 无可读额度端点，保持 unknown。
+`warp`（Warp Build 的 oz agent）是同构的本地桥接：命令是 `sandbox/launch.sh bun <服务目录>/current/src/runner/warp/main.ts warp`，事件流同为 system/lane_status/result。与云端通道不同的是它在本地工作树里干活（提交/推送由 agent 按公司协议自己在任务分支完成），prompt 正文写进 commDir 的 `.warp/turn-<时间戳>.md`（0600），进程参数只带一句短指令；续轮用 `--conversation <conversation_id>`。`lanes.warp` 只接受 `bin`（如 `{"oz": "/Applications/Warp.app/Contents/Resources/bin/oz"}`）与 `maxMinutes`（默认 120）。Warp 无可读额度端点，保持 unknown。
 
 ## 公司工具注入（0.13.76 起）
 

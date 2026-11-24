@@ -18,7 +18,9 @@ import {
   type UpdateOutcome,
   type UpdaterDeps,
 } from '../src/node-updater.ts';
-import { MANIFEST_ASSET, packageAssetName, sha256File, UPDATER_ASSET } from '../src/release-manifest.ts';
+import { MANIFEST_ASSET, packageAssetName, sha256File } from '../src/release-manifest.ts';
+/** 0.13.84 及之前发行附带的旧定时更新器资产；自更新必须忽略它。 */
+const UPDATER_ASSET = 'node-updater.js';
 
 const NOW = new Date('2026-05-01T00:00:00.000Z');
 const SHA_OLD = 'c'.repeat(40);
